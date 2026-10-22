@@ -30,8 +30,12 @@ if(PS3RECOMP_SANITIZE OR PS3RECOMP_SANITIZE_THREAD)
 endif()
 
 if(PS3RECOMP_SANITIZE)
-    add_compile_options(-fsanitize=address,undefined -fno-sanitize-recover=undefined)
-    add_link_options(-fsanitize=address,undefined)
+    # -fno-sanitize=vptr: the vptr check needs RTTI for every polymorphic class
+    # it sees, and glslang ships without RTTI (Homebrew's build on macos-15
+    # leaves `typeinfo for glslang::TShader` undefined at link).
+    add_compile_options(-fsanitize=address,undefined -fno-sanitize=vptr
+        -fno-sanitize-recover=undefined)
+    add_link_options(-fsanitize=address,undefined -fno-sanitize=vptr)
 elseif(PS3RECOMP_SANITIZE_THREAD)
     add_compile_options(-fsanitize=thread)
     add_link_options(-fsanitize=thread)
