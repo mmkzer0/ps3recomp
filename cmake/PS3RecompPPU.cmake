@@ -87,6 +87,13 @@ function(ps3recomp_ppu_lift out_var)
         set(_code_end "${ARG_CODE_END}")
     else()
         ps3recomp_ppu_code_end("${_elf}" _code_end)
+        # The value is read at configure time; a replaced ELF or a change to
+        # the loader's section-header rule must recompute it. The build-time
+        # command still DEPENDS on the ELF, so the lift itself reruns too.
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+                     "${_elf}"
+                     "${PS3RECOMP_DIR}/tools/ppu_loader.py"
+                     "${PS3RECOMP_DIR}/tools/elf_parser.py")
     endif()
 
     get_filename_component(_stem "${_elf}" NAME_WE)
