@@ -34,3 +34,6 @@ endfunction()
 
 gates_probe(probe_stop probe_stop.cpp)
 gates_py_test(stop test_stop.py $<TARGET_FILE:probe_stop>)
+
+gates_probe(probe_sha256 probe_sha256.cpp)
+gates_py_test(sha256 test_sha256.py $<TARGET_FILE:probe_sha256>)
