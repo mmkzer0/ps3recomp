@@ -1,0 +1,114 @@
+/*
+ * ps3recomp - the typed option registry: ONE list, many consumers.
+ *
+ * Every behavioural option of the runtime is declared here, once. include/
+ * ps3emu/config.h expands it into the typed storage and the C accessors,
+ * runtime/config/config.cpp into the metadata, the file/environment parsers and
+ * the effective-config dump. Nothing else may read a behavioural option by name:
+ * call sites use the generated accessor, so a typo is a compile error rather
+ * than a silently ignored string.
+ *
+ *   PS3_CFG_BOOL(section, key, default, doc)
+ *   PS3_CFG_STR(section, key, default, max_length, validator, doc)
+ *   PS3_CFG_LEGACY_ENV(name)
+ *
+ * File key:     [section] key = ...           (docs/CONFIG.md)
+ * Environment:  PS3RECOMP_<SECTION>_<KEY>     (upper case)
+ *
+ * Adding an option: add a line here, add it to the table in docs/CONFIG.md.
+ * Changing or removing one is a schema change: bump PS3_CONFIG_SCHEMA_VERSION in
+ * config.h, because a file written for the old schema must be refused rather than
+ * half-read.
+ *
+ * Section names must not be `hle` or `lv2`: those are the structured sections
+ * ([[hle.stub]], [[lv2.stub]]) the loader parses separately.
+ */
+
+#ifndef PS3_CFG_BOOL
+#  define PS3_CFG_BOOL(section, key, def, doc)
+#  define PS3_CFG_BOOL_DEFAULTED
+#endif
+#ifndef PS3_CFG_STR
+#  define PS3_CFG_STR(section, key, def, max_length, validator, doc)
+#  define PS3_CFG_STR_DEFAULTED
+#endif
+#ifndef PS3_CFG_LEGACY_ENV
+#  define PS3_CFG_LEGACY_ENV(name)
+#  define PS3_CFG_LEGACY_ENV_DEFAULTED
+#endif
+
+/* ---- ppu ---------------------------------------------------------------- */
+
+PS3_CFG_BOOL(ppu, vscr_nj, 1,
+    "Initial VSCR[NJ] (non-Java mode: denormal vector-float inputs and results "
+    "flush to zero) of every guest PPU context, applied when the context is "
+    "created: the main thread, spawned threads and callback contexts. A guest "
+    "mtvscr changes only its own context afterwards. The default is true for "
+    "parity with RPCS3, which starts its PPU threads with NJ set. That is a "
+    "policy, not a hardware fact: what the console's reset state and firmware "
+    "leave in VSCR is not established.")
+
+/* ---- title -------------------------------------------------------------- */
+
+PS3_CFG_STR(title, elf_sha256, "", 64, PS3_CFG_V_SHA256_OR_EMPTY,
+    "Optional pin on the executable ppu_load_elf may load: its SHA-256 as 64 hex "
+    "digits (either case). Checked in addition to the hash the lifter recorded "
+    "in the lifted output, never instead of it. Empty means no pin.")
+
+/* ---- diag --------------------------------------------------------------- */
+
+PS3_CFG_BOOL(diag, dump_config, 0,
+    "Print the effective configuration (every key, its value and where the value "
+    "came from) to stderr once it is loaded.")
+
+/* ---- legacy environment variables --------------------------------------- */
+/*
+ * Existing diagnostic knobs that read PS3RECOMP_* straight from the environment
+ * and are not (yet) options. The environment loader treats every other
+ * PS3RECOMP_* variable as a typo and stops, so each one that is still read
+ * elsewhere has to be listed or running a title with it set would stop. Moving
+ * one into the registry is how it leaves this list.
+ */
+
+/* runtime diagnostics and backends (libs/) */
+PS3_CFG_LEGACY_ENV("PS3RECOMP_ENG_TEXHASH_FULL")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_FFMPEG")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_FFMPEG_AVCODEC")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_FFMPEG_AVUTIL")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_METAL_FIXED_FUNCTION")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_METAL_FPS")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_METAL_FRAME_DUMP")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_METAL_HEADLESS")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_METAL_MRT_MASK")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_METAL_SHADER_DUMP")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_MSL_FAST")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_RSX_ENGINE")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_SPIRV_CACHE")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_VK_DEVICE")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_VK_DUMP")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_VK_DUMP_EVERY")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_VK_FULLSCREEN")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_VK_GUEST_PROGRAMS")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_VK_HOLD")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_VK_WINDOW")
+/* tool-side (tools/): exported in the same shells that run a title */
+PS3_CFG_LEGACY_ENV("PS3RECOMP_DIR")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_ARCHIVE_ROOT")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_PSN_ROOT")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_OUT")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_7ZIP")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_PS3SCE")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_IDA_PYTHON")
+
+#ifdef PS3_CFG_BOOL_DEFAULTED
+#  undef PS3_CFG_BOOL
+#  undef PS3_CFG_BOOL_DEFAULTED
+#endif
+#ifdef PS3_CFG_STR_DEFAULTED
+#  undef PS3_CFG_STR
+#  undef PS3_CFG_STR_DEFAULTED
+#endif
+#ifdef PS3_CFG_LEGACY_ENV_DEFAULTED
+#  undef PS3_CFG_LEGACY_ENV
+#  undef PS3_CFG_LEGACY_ENV_DEFAULTED
+#endif

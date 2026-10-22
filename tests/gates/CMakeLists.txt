@@ -9,7 +9,7 @@
 # The probes link ps3recomp_runtime rather than recompiling the modules under
 # test, so they exercise exactly what a title links.
 #
-#   ctest --test-dir build/dev -L gates --output-on-failure
+#   ctest --test-dir build/dev -L config --output-on-failure
 
 find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
 
@@ -21,7 +21,8 @@ function(gates_probe name)
     set_target_properties(${name} PROPERTIES LINKER_LANGUAGE CXX)
 endfunction()
 
-function(gates_py_test name script)
+# gates_py_test(<name> <area label> <script> <probe args...>)
+function(gates_py_test name area script)
     if(NOT Python3_Interpreter_FOUND)
         message(STATUS "  gates:        no python3; ${name} not registered")
         return()
@@ -29,11 +30,14 @@ function(gates_py_test name script)
     add_test(NAME ${name}
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/${script}" ${ARGN}
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
-    set_tests_properties(${name} PROPERTIES LABELS "gates;t0" TIMEOUT 120)
+    set_tests_properties(${name} PROPERTIES LABELS "${area};t0" TIMEOUT 120)
 endfunction()
 
 gates_probe(probe_stop probe_stop.cpp)
-gates_py_test(stop test_stop.py $<TARGET_FILE:probe_stop>)
+gates_py_test(stop runtime test_stop.py $<TARGET_FILE:probe_stop>)
 
 gates_probe(probe_sha256 probe_sha256.cpp)
-gates_py_test(sha256 test_sha256.py $<TARGET_FILE:probe_sha256>)
+gates_py_test(sha256 runtime test_sha256.py $<TARGET_FILE:probe_sha256>)
+
+gates_probe(probe_config probe_config.cpp)
+gates_py_test(config config test_config.py $<TARGET_FILE:probe_config>)
