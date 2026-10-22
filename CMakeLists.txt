@@ -456,6 +456,10 @@ if(PS3RECOMP_BUILD_TESTS)
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_user_memory_domain.py")
         set_tests_properties(loaded_image_memory loader_memory_domain
             mmapper_hle_heap user_memory_domain PROPERTIES LABELS "memory;t0")
+        add_test(NAME check_hygiene
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_check_hygiene.py")
+        set_tests_properties(check_hygiene PROPERTIES LABELS "tools;t0")
     endif()
 endif()
 
