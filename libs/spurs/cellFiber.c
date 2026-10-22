@@ -384,6 +384,7 @@ s32 cellFiberPpuCreateFiber(CellFiberPpuScheduler* scheduler, CellFiberPpu* fibe
     const ppu_context* parent = g_active_ctx;
     f->ctx.gpr[13]   = parent ? parent->gpr[13] : 0;
     f->ctx.thread_id = parent ? parent->thread_id : FIBER_FALLBACK_THREAD_ID;
+    f->ctx.vscr      = ps3_ppu_initial_vscr();   /* a fiber is a new guest context: ppu.vscr_nj */
 
     if (!host_create(f)) {
         free(f);

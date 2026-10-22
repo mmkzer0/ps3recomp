@@ -12,6 +12,7 @@
 #include "../../include/ps3emu/ps3types.h"
 #include <stdint.h>
 #include <string.h>
+#include "../../include/ps3emu/config.h"   /* ps3_ppu_initial_vscr */
 
 #ifdef __cplusplus
 extern "C" {
@@ -103,9 +104,21 @@ typedef struct ppu_context {
 /* ---------------------------------------------------------------------------
  * Initialization
  * -----------------------------------------------------------------------*/
-static inline void ppu_context_init(ppu_context* ctx)
+
+/* Every register zero, no policy and no link dependency: for harnesses that
+ * exercise one runtime unit and do not link the config module. Anything that
+ * stands in for a guest thread uses ppu_context_init. */
+static inline void ppu_context_clear(ppu_context* ctx)
 {
     memset(ctx, 0, sizeof(*ctx));
+}
+
+/* A new guest thread's context: zeroed, with VSCR[NJ] set per ppu.vscr_nj
+ * (docs/CONFIG.md). Needs the runtime library for the config module. */
+static inline void ppu_context_init(ppu_context* ctx)
+{
+    ppu_context_clear(ctx);
+    ctx->vscr = ps3_ppu_initial_vscr();
     /* r1 (stack pointer) gets set during thread creation.
      * r2 (TOC) gets set from the ELF entry descriptor.
      * r13 (SDA base) gets set from the module loader. */

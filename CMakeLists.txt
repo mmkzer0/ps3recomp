@@ -613,6 +613,22 @@ if(UNIX)
         target_link_libraries(ps3recomp_boot_smoke PRIVATE ps3recomp_runtime)
         set_target_properties(ps3recomp_boot_smoke PROPERTIES LINKER_LANGUAGE CXX)
 
+        # The smoke guest decides its own verdict and the exit code carries it
+        # (see smoke_recomp.c). Run under both values of ppu.vscr_nj: the guest
+        # checks the VSCR of its main thread and of a thread it spawns against
+        # whatever the config says. The Metal backend needs its headless mode
+        # off a display; other hosts take the null backend regardless.
+        if(PS3RECOMP_BUILD_TESTS)
+            add_test(NAME boot_smoke COMMAND ps3recomp_boot_smoke "${SMOKE_GEN}/smoke.elf")
+            add_test(NAME boot_smoke_vscr_nj_off COMMAND ps3recomp_boot_smoke "${SMOKE_GEN}/smoke.elf")
+            set_tests_properties(boot_smoke PROPERTIES
+                ENVIRONMENT "PS3RECOMP_METAL_HEADLESS=1"
+                LABELS "ppu;t0" TIMEOUT 120)
+            set_tests_properties(boot_smoke_vscr_nj_off PROPERTIES
+                ENVIRONMENT "PS3RECOMP_METAL_HEADLESS=1;PS3RECOMP_PPU_VSCR_NJ=0"
+                LABELS "ppu;t0" TIMEOUT 120)
+        endif()
+
         # Where the runnable image lands, so CI and a developer both say
         #   ./build/ps3recomp_boot_smoke build/smoke/smoke.elf
         message(STATUS "  Boot smoke:   ps3recomp_boot_smoke + smoke/smoke.elf")

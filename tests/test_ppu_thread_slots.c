@@ -13,7 +13,18 @@ void ppu_resv_register(ppu_context* c) { (void)c; }
 int ps3_intr_is_handler(unsigned long long tid) { (void)tid; return 0; }
 int ps3_intr_wait(unsigned long long tid) { (void)tid; return 0; }
 
-static void guest_entry(ppu_context* ctx) { ctx->gpr[3] = 0; }   /* the thread body returns at once */
+/* ppu.vscr_nj comes from the runtime's config module, which this fixture does not link. A value no zeroed context
+ * has, so a thread that started with its VSCR unset is caught. */
+#define TEST_INITIAL_VSCR 0x00010000u
+uint32_t ps3_ppu_initial_vscr(void) { return TEST_INITIAL_VSCR; }
+
+static int g_entered, g_vscr_wrong;
+static void guest_entry(ppu_context* ctx)   /* the thread body returns at once */
+{
+    __atomic_fetch_add(&g_entered, 1, __ATOMIC_RELAXED);
+    if (ctx->vscr != TEST_INITIAL_VSCR) __atomic_fetch_add(&g_vscr_wrong, 1, __ATOMIC_RELAXED);
+    ctx->gpr[3] = 0;
+}
 
 static int g_fails;
 #define EXPECT_EQ(got, want) do { long long g_ = (got), w_ = (want); if (g_ != w_) { g_fails++; \
@@ -99,6 +110,11 @@ int main(void)
         EXPECT_EQ(sys_ppu_thread_join(&ctx), 0);
         EXPECT_EQ(create(1, NULL), 0);
     }
+
+    /* 5. Every thread above started with the VSCR the policy gives a new guest context. */
+    settle();
+    EXPECT_EQ(g_entered > 3 * PPU_THREAD_MAX, 1);
+    EXPECT_EQ(g_vscr_wrong, 0);
 
     free(vm_base);
     if (g_fails) { fprintf(stderr, "%d check(s) failed\n", g_fails); return 1; }

@@ -22,6 +22,7 @@
 
 #include "ps3emu/config.h"
 #include "ps3emu/stop.h"
+#include "../ppu/ppu_context.h"   /* PPU_VSCR_NJ */
 
 #include <algorithm>
 #include <atomic>
@@ -684,6 +685,11 @@ const ps3_cfg_lv2_stub* ps3_config_find_lv2_stub(uint32_t num)
     auto it = std::lower_bound(v.begin(), v.end(), num,
                                [](const ps3_cfg_lv2_stub& s, uint32_t n) { return s.num < n; });
     return it != v.end() && it->num == num ? &*it : nullptr;
+}
+
+uint32_t ps3_ppu_initial_vscr(void)
+{
+    return ps3_cfg_ppu_vscr_nj() ? PPU_VSCR_NJ : 0u;
 }
 
 } // extern "C"

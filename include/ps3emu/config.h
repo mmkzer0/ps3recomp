@@ -63,7 +63,7 @@ typedef struct ps3_config {
 #define PS3_CFG_BOOL(section, key, def, doc) bool section##_##key;
 #define PS3_CFG_STR(section, key, def, max_length, validator, doc) \
     char section##_##key[(max_length) + 1];
-#include "ps3emu/config_options.def"
+#include "config_options.def"
 #undef PS3_CFG_BOOL
 #undef PS3_CFG_STR
 } ps3_config;
@@ -76,7 +76,7 @@ const ps3_config* ps3_config_get(void);
     static inline bool ps3_cfg_##section##_##key(void) { return ps3_config_get()->section##_##key; }
 #define PS3_CFG_STR(section, key, def, max_length, validator, doc) \
     static inline const char* ps3_cfg_##section##_##key(void) { return ps3_config_get()->section##_##key; }
-#include "ps3emu/config_options.def"
+#include "config_options.def"
 #undef PS3_CFG_BOOL
 #undef PS3_CFG_STR
 
@@ -149,6 +149,14 @@ typedef struct ps3_cfg_lv2_stub {
 /* The entry for `nid` / `num`, or NULL when it is not allow-listed. */
 const ps3_cfg_hle_stub* ps3_config_find_hle_stub(uint32_t nid);
 const ps3_cfg_lv2_stub* ps3_config_find_lv2_stub(uint32_t num);
+
+/* ---- policy derived from options ----------------------------------------- */
+
+/* The VSCR a new guest PPU context starts with, per ppu.vscr_nj: the one place
+ * the option becomes a register value. ppu_context_init() and every runtime
+ * site that creates a guest context use it, so no context starts with the
+ * policy unapplied. */
+uint32_t ps3_ppu_initial_vscr(void);
 
 #ifdef __cplusplus
 }

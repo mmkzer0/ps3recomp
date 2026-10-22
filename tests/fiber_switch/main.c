@@ -76,6 +76,12 @@ static uint32_t read_be32(uint32_t addr)
  * -----------------------------------------------------------------------*/
 PPU_THREAD_LOCAL ppu_context* g_active_ctx;
 
+/* The VSCR policy comes from the runtime's config module, which this standalone
+ * test does not link. A value no zeroed context has, so the check in case 1
+ * shows the fiber's context took its VSCR from the policy. */
+#define TEST_INITIAL_VSCR 0x00010000u
+uint32_t ps3_ppu_initial_vscr(void) { return TEST_INITIAL_VSCR; }
+
 typedef int32_t (*guest_fn)(uint64_t arg);
 #define ENTRY_BASE 0x1000u
 #define MAX_ENTRIES 16
@@ -153,6 +159,7 @@ static int32_t order_entry(uint64_t arg)
     order_seen[order_n] = (int)(arg & 0xFF);
     /* r1 is inside the guest stack this fiber was created with, 16-byte aligned */
     CHECK(me != NULL && me->gpr[1] > mine.stack && me->gpr[1] <= mine.stack + STACK_SIZE && (me->gpr[1] & 0xF) == 0);
+    CHECK(me != NULL && me->vscr == TEST_INITIAL_VSCR);
     order_n++;
     return (int32_t)(arg & 0xFFFF);
 }

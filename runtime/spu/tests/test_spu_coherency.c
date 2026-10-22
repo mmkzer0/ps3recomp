@@ -236,7 +236,7 @@ static void test_all_store_widths(void)
 static void test_store_conditional(void)
 {
     ppu_context ppu;
-    ppu_context_init(&ppu);
+    ppu_context_clear(&ppu);
 
     /* A successful stwcx on a reserved line notifies. */
     spu_reset(&g_spu_a, 0);

@@ -10,9 +10,12 @@
  *   load-again     ps3_config_load(NULL) after the configuration is in use
  *   race           8 threads read the configuration at once; prints whether
  *                  they all got the same object
+ *   vscr           the VSCR a context made by ppu_context_init() starts with,
+ *                  and ppu_context_clear()'s, which applies no policy
  */
 
 #include "ps3emu/config.h"
+#include "../../runtime/ppu/ppu_context.h"
 
 #include <atomic>
 #include <cstdio>
@@ -64,6 +67,15 @@ int main(int argc, char** argv)
         const ps3_cfg_lv2_stub* s = ps3_config_find_lv2_stub((uint32_t)std::strtoull(argv[a + 1], nullptr, 0));
         if (!s) { std::puts("none"); return 0; }
         std::printf("num=%u ret=0x%08X line=%u reason=%s\n", s->num, s->ret, s->line, s->reason);
+        return 0;
+    }
+    if (!std::strcmp(cmd, "vscr")) {
+        ppu_context init, clear;
+        std::memset(&init, 0xFF, sizeof init);    // stale bytes must not leak into a new context
+        std::memset(&clear, 0xFF, sizeof clear);
+        ppu_context_init(&init);
+        ppu_context_clear(&clear);
+        std::printf("init=0x%08X clear=0x%08X policy=0x%08X\n", init.vscr, clear.vscr, ps3_ppu_initial_vscr());
         return 0;
     }
     if (!std::strcmp(cmd, "load-again")) {

@@ -356,6 +356,38 @@ def test_concurrent_first_readers_share_one_configuration():
         assert p.returncode == 0 and p.stdout.strip() == "distinct=1", p.stdout + p.stderr
 
 
+# ---- ppu.vscr_nj ---------------------------------------------------------------
+
+def vscr(*args, **env):
+    p = probe(*args, "vscr", **env)
+    assert p.returncode == 0, p.stderr
+    return dict(kv.split("=") for kv in p.stdout.split())
+
+
+def test_new_context_starts_with_nj_set_by_default():
+    v = vscr()
+    assert v == {"init": "0x00010000", "clear": "0x00000000", "policy": "0x00010000"}, v
+
+
+def test_new_context_vscr_follows_the_option_whichever_source_sets_it():
+    assert vscr(PS3RECOMP_PPU_VSCR_NJ="0")["init"] == "0x00000000"
+    assert vscr(PS3RECOMP_PPU_VSCR_NJ="1")["init"] == "0x00010000"
+    with Cfg("schema = 1", "[ppu]", "vscr_nj = false") as c:
+        assert vscr("--load", c.path)["init"] == "0x00000000"
+        assert vscr("--load", c.path, PS3RECOMP_PPU_VSCR_NJ="true")["init"] == "0x00010000"   # env beats file
+    with Cfg("schema = 1", "[ppu]", "vscr_nj = true") as c:
+        assert vscr("--load", c.path)["init"] == "0x00010000"
+        assert vscr("--load", c.path, PS3RECOMP_PPU_VSCR_NJ="0")["init"] == "0x00000000"
+
+
+def test_vscr_nj_value_and_source_appear_in_the_dump():
+    for env, value, source in ((None, "true", "default"),
+                               ("0", "false", "env:PS3RECOMP_PPU_VSCR_NJ")):
+        p = probe("dump", **({"PS3RECOMP_PPU_VSCR_NJ": env} if env else {}))
+        assert p.returncode == 0, p.stderr
+        assert f"vscr_nj = {value}  # source: {source}" in p.stdout, p.stdout
+
+
 if __name__ == "__main__":
     PROBE = sys.argv[1]
     sys.exit(g.main([(n, f) for n, f in sorted(globals().items()) if n.startswith("test_")]))

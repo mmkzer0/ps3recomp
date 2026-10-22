@@ -103,7 +103,7 @@ void ppu_dump_guest_stack(ppu_context* ctx, const char* tag)
 /* Build a ppu_context for the calling host thread, tagged with a guest tid. */
 static void ctx_init_for_thread(ppu_context* ctx, uint32_t tid)
 {
-    ppu_context_init(ctx);
+    ppu_context_clear(ctx);
     ctx->thread_id = tid;
 }
 

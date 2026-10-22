@@ -49,6 +49,11 @@
  * directory. */
 #include "win32_compat.h"
 
+/* ppu.vscr_nj: every guest context starts with VSCR[NJ] (bit 16) as the config
+ * says. The guest asks the config itself, so the check holds for either value. */
+#include "ps3emu/config.h"
+#define SMOKE_VSCR_NJ 0x00010000u
+
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -426,6 +431,8 @@ void func_00010100(ppu_context* ctx)
     smoke_mark(ctx, SMOKE_STEP_THREAD_BODY);
 
     smoke_check(ctx->gpr[13] != 0, "the guest thread has no thread pointer in r13");
+    smoke_check(ctx->vscr == (ps3_cfg_ppu_vscr_nj() ? SMOKE_VSCR_NJ : 0u),
+                "the guest thread's VSCR does not follow ppu.vscr_nj");
 
     ctx->gpr[11] = SC_PPU_THREAD_EXIT;
     ctx->gpr[3]  = SMOKE_THREAD_STATUS;
@@ -450,6 +457,8 @@ void func_00010000(ppu_context* ctx)
 
     g_main_host_tid = (unsigned long)GetCurrentThreadId();
     smoke_mark(ctx, SMOKE_STEP_ENTRY);
+    smoke_check(ctx->vscr == (ps3_cfg_ppu_vscr_nj() ? SMOKE_VSCR_NJ : 0u),
+                "the main thread's VSCR does not follow ppu.vscr_nj");
 
     /* The entry state ppu_run built. argv[0] is a big-endian 8-byte slot whose
      * pointer sits in the low word, which is where the PS3 CRT reads it. */
