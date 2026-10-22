@@ -20,6 +20,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Options
 # ---------------------------------------------------------------------------
 option(PS3RECOMP_BUILD_TESTS "Build unit tests" OFF)
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/PS3RecompSanitizers.cmake")
 
 # ---------------------------------------------------------------------------
 # Collect source files

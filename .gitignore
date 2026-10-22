@@ -11,7 +11,7 @@ cmake_install.cmake
 Makefile
 *.cmake
 !CMakeLists.txt
-!cmake/PS3RecompSPU.cmake
+!/cmake/*.cmake
 
 # Compiled objects and libraries
 *.o
