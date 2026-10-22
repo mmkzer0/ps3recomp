@@ -52,8 +52,26 @@ Ids are stable kebab-case; a new gap gets a new kind, never a free-text variant.
 | `unresolved-indirect-call` | an indirect call whose target is no lifted function |
 | `unknown-instruction` | an instruction the lifter did not know |
 
-The first two are raised by the startup gates. The rest are declared so their
-ids are fixed; the guest-execution paths convert to them in their own slice.
+Where each is raised, and what it carries beyond `pc lr tid`:
+
+| Kind | Raised in | Fields |
+|---|---|---|
+| `identity-mismatch` | `ppu_load_elf` | `path size expected actual expected_from [pin_source]` |
+| `config-invalid` | `ps3_config_*` | `file line col key env detail` |
+| `unresolved-nid` | `ps3_hle_call` (`runtime/ppu/ppu_hle.cpp`) | `nid name caller_lr` (`name` is `unknown`: the lift keeps only the NID) |
+| `unimplemented-syscall` | `lv2_syscall` (`ppu_loader.cpp`) | `num caller_lr` |
+| `unlifted-function` | `ppu_unlifted_stub` | `target caller_lr` |
+| `unresolved-indirect-call` | `ps3_indirect_call` | `target caller_lr descriptors target_words hint` |
+| `unknown-instruction` | `ppu_trap_unknown_instruction`, emitted by the lifter | `pc word mnemonic` |
+
+Lifted code does not track a guest pc, so for the first four `pc` is the caller's
+return address (the import stub's caller, the `sc` site, the call site). Only
+`unknown-instruction` knows the exact instruction address.
+
+A stop that has a `[[hle.stub]]` / `[[lv2.stub]]` entry for its NID or syscall
+number returns the entry's `ret` instead, logging it once as `ALLOW-LISTED ...`
+with the reason and config line (`docs/CONFIG.md`). Nothing else continues past a
+gap: no environment variable, no blanket form.
 
 ## Frontier
 

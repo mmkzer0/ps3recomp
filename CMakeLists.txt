@@ -486,6 +486,18 @@ if(PS3RECOMP_BUILD_TESTS)
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_lifter_identity.py")
         set_tests_properties(lifter_identity PROPERTIES LABELS "tools;t0")
+        # Every gap the runtime used to paper over is a named stop (docs/STOPS.md).
+        add_test(NAME hle_unresolved
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_hle_unresolved.py")
+        add_test(NAME loader_gaps
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_loader_gaps.py")
+        set_tests_properties(hle_unresolved loader_gaps PROPERTIES LABELS "ppu;t0" TIMEOUT 300)
+        add_test(NAME game_patchcheck
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_game_patchcheck.py")
+        set_tests_properties(game_patchcheck PROPERTIES LABELS "runtime;t0")
     endif()
 endif()
 

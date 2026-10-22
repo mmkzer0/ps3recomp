@@ -547,8 +547,6 @@ not changed while a title runs.
   `runtime/ppu/ppu_loader.cpp:869`  _(+1 more sites)_
 - **`PPU_KEEP_EA`** — _(no description in source)_
   `runtime/ppu/ppu_loader.cpp:2567`
-- **`PPU_NOOP_BAD_VCALL`** — Opt-in (PPU_NOOP_BAD_VCALL): also no-op MISALIGNED / out-of-code-range targets. A valid entry is 4-aligned in game .text (0x10000..0xFFFFFFF) or PRX (0x30000000..0x3FFFFFFF). This lets the boot proceed PAST bad vcalls (diagnostic band-aid — skipped methods leave state incomplete). Default OFF so the boot takes a clean crash-with-backtrace instead. */
-  `runtime/ppu/ppu_loader.cpp:1885`
 - **`PPU_OPD_RECOVER`** — _(no description in source)_
   `runtime/ppu/ppu_loader.cpp:1734`
 - **`PPU_POKE`** — _(no description in source)_
@@ -579,8 +577,6 @@ not changed while a title runs.
   `libs/video/rsx_live_draw.c:646`
 - **`PPU_SPINBT`** — PPU_SPINBT=<addr>: one-shot host backtrace when the read32 hot spin is on the watched address -- names the guest function containing the spin loop + its callers (resolve RVAs against the linker map). Same mechanism as the read64 variant below; LBP's GPU-ref wait (0x03002008) is a read32 spin. */
   `runtime/ppu/ppu_loader.cpp:1071`  _(+1 more sites)_
-- **`PPU_STUCKMAX`** — _(no description in source)_
-  `runtime/ppu/ppu_loader.cpp:1906`
 - **`PPU_THREADARG`** — _(no description in source)_
   `runtime/syscalls/sys_ppu_thread.c:405`
 - **`PPU_THREADGATE`** — _(no description in source)_
@@ -589,8 +585,6 @@ not changed while a title runs.
   `runtime/ppu/ppu_loader.cpp:1835`
 - **`PPU_TOCWATCH`** — _(no description in source)_
   `runtime/ppu/ppu_loader.cpp:1611`
-- **`PPU_VCALL_BT`** — _(no description in source)_
-  `runtime/ppu/ppu_loader.cpp:1891`
 - **`PPU_WVAL`** — _(no description in source)_
   `runtime/ppu/ppu_loader.cpp:1151`
 - **`PPU_WVAL_HI`** — _(no description in source)_
@@ -713,8 +707,6 @@ not changed while a title runs.
   `runtime/ppu/ppu_hle.cpp:690`
 - **`PS3_HLE_TRACE`** — _(no description in source)_
   `runtime/ppu/ppu_hle.cpp:236`
-- **`PS3_HLE_UNRESOLVED`** — _(no description in source)_
-  `runtime/ppu/ppu_hle.cpp:143`
 - **`PS3_LWMUTEX_TRACE`** — PS3_LWMUTEX_TRACE=1: reconstruct the lwmutex lock-convoy that stalls LBP's loader. Records, per mutex, the acquiring tid + a QPC microsecond timestamp; on a contended block it logs who holds it and for how long; on unlock it flags a long hold. The leaf holder (the one blocked on a non-lwmutex wait) is the convoy root. Default OFF. */
   `runtime/ppu/ppu_sysprx.cpp:162`
 - **`PS3_MEMTRACE`** — _(no description in source)_

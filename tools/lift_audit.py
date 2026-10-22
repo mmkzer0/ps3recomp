@@ -95,6 +95,7 @@ except ImportError as exc:
 DEFAULT_BASELINE = os.path.join(ROOT, "scratch", "lift_audit_baseline.txt")
 
 TODO_RE = re.compile(r"/\* TODO: (\S+)")
+TRAP_RE = re.compile(r'ppu_trap_unknown_instruction\(ctx, 0x[0-9A-Fa-f]+ULL, 0x[0-9A-Fa-f]+U, "([^"]*)"\)')
 UNRESOLVED_RE = re.compile(r"/\* unresolved target 0x([0-9A-Fa-f]+) \*/")
 
 
@@ -126,7 +127,15 @@ def marker_census(recomp_dir: str):
     for path in chunk_paths:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
-                if "/* TODO:" in line:
+                if "ppu_trap_unknown_instruction(" in line:
+                    # What an unhandled instruction lifts to now (it was a TODO
+                    # comment); counted in the same buckets. The per-instruction
+                    # detail is in ppu_lift_report.json.
+                    m = TRAP_RE.search(line)
+                    if m:
+                        mn = m.group(1)
+                        todo_by_mnemonic[mn] = todo_by_mnemonic.get(mn, 0) + 1
+                elif "/* TODO:" in line:
                     m = TODO_RE.search(line)
                     if m:
                         mn = m.group(1)

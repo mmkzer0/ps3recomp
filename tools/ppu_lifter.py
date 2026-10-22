@@ -242,6 +242,15 @@ extern "C" {
 #endif
 extern const func_entry function_table[];
 extern const uint64_t  function_table_count;  /* entries, excluding sentinel */
+/* An instruction the lifter had no lowering for, executed. Stops the process
+ * (kind unknown-instruction) naming its guest address and word; never returns. */
+#if defined(__GNUC__) || defined(__clang__)
+void ppu_trap_unknown_instruction(ppu_context* ctx, uint64_t pc, uint32_t word,
+                                  const char* mnemonic) __attribute__((noreturn));
+#else
+__declspec(noreturn) void ppu_trap_unknown_instruction(ppu_context* ctx, uint64_t pc,
+                                                       uint32_t word, const char* mnemonic);
+#endif
 /* The SHA-256 (64 lower-case hex digits) of the file this output was lifted
  * from, recorded by the lifter. ppu_load_elf hashes the executable it is asked
  * to load and stops, naming both hashes, if they differ: a lift is only valid
@@ -804,6 +813,7 @@ class LiftedFunction:
     body_lines: list[str] = field(default_factory=list)
     calls: list[int] = field(default_factory=list)  # addresses of bl targets
     fallthrough_to: int = 0  # if it falls off the end, the continuation address
+    traps: list = field(default_factory=list)  # [pc, word, text] per instruction with no lowering
 
 
 # Max span (bytes) for a mid-function tail-entry / gap wrapper. A real interior
@@ -911,6 +921,9 @@ class PPULifter:
         # Set by main() from the bytes it read; output cannot be produced
         # without it (see _table_lines), so no lift ships without an identity.
         self.image_sha256: str | None = None
+        # (start, wanted_end, capped_end) of every mid-function tail the
+        # _MAX_MID_TAIL cap truncated; reported in the lift report.
+        self.capped_tails: list[tuple[int, int, int]] = []
 
     def _range_insns(self, instructions: list["Instruction"],
                      start: int, end: int) -> list["Instruction"]:
@@ -1336,8 +1349,22 @@ class PPULifter:
         code2 = self._translate_op(alt, func)
         return code if code2.startswith("/* TODO") else code2
 
+    def _trap(self, insn: Instruction, func: LiftedFunction) -> str:
+        """An instruction the lifter has no lowering for. It used to become a
+        no-op comment, so the guest silently ran on without it; it is now a call
+        that stops the process (kind unknown-instruction) if the instruction is
+        ever EXECUTED, naming its address and word. Code that is never reached
+        (data decoded as instructions, dead paths) costs nothing at run time.
+        The decoded text goes to the lift report, not into the code."""
+        raw = insn.raw or 0
+        func.traps.append([f"0x{insn.addr:08X}", f"0x{raw:08X}", f"{insn.mnemonic} {insn.operands}".strip()])
+        return (f'ppu_trap_unknown_instruction(ctx, 0x{insn.addr:08X}ULL, 0x{raw:08X}U, '
+                f'"{insn.mnemonic}");')
+
     def _translate(self, insn: Instruction, func: LiftedFunction) -> str:
         code = self._oe_wrap(insn, self._translate_xo_base(insn, func))
+        if code.startswith("/* TODO"):
+            return self._trap(insn, func)
         mn = insn.mnemonic
         if (mn.endswith(".") and code and not code.startswith("/*")
                 and mn not in self._CR0_SELF_HANDLED
@@ -3732,6 +3759,8 @@ class PPULifter:
             # mid-function pass grew to 4 GB+ before OOM). Real functions have a
             # short tail from any interior entry; bounding it keeps the common case
             # exact and turns the pathological case into a harmless truncated stub.
+            if target + _MAX_MID_TAIL < fend:
+                self.capped_tails.append((target, fend, target + _MAX_MID_TAIL))
             fend = min(fend, target + _MAX_MID_TAIL)
             tail_func = self.lift_function(_insn_slice(target, fend), target, fend)
             # lift_function already appends to self.functions, so it's included
@@ -3761,6 +3790,8 @@ class PPULifter:
             for target in gap_targets:
                 idx = bisect.bisect_right(boundaries, target)
                 bound = boundaries[idx] if idx < len(boundaries) else text_hi
+                if target + _MAX_MID_TAIL < bound:
+                    self.capped_tails.append((target, bound, target + _MAX_MID_TAIL))
                 bound = min(bound, target + _MAX_MID_TAIL)   # cap span (see above)
                 if bound <= target:
                     continue
@@ -3788,6 +3819,31 @@ class PPULifter:
     # ------------------------------------------------------------------ #
     # Output generation
     # ------------------------------------------------------------------ #
+
+    def lift_report(self) -> dict:
+        """The lift's gaps as plain data (schema 1, see docs/LIFT_REPORT.md)."""
+        defined = {f.start_addr for f in self.functions}
+        traps_total = 0
+        funcs = []
+        for f in self._emit_functions():
+            if f.traps:
+                traps_total += len(f.traps)
+                funcs.append({"name": f.name, "start": f"0x{f.start_addr:08X}",
+                              "end": f"0x{f.end_addr:08X}", "traps": f.traps})
+        unresolved = sorted((self.call_targets | self.branch_targets) - defined)
+        return {
+            "schema": 1,
+            "tool": "ppu_lifter.py",
+            "input_sha256": self.image_sha256,
+            "summary": {"functions": len(self.functions), "functions_with_traps": len(funcs),
+                        "trapped_instructions": traps_total,
+                        "capped_mid_tails": len(self.capped_tails),
+                        "unresolved_targets": len(unresolved)},
+            "functions": funcs,
+            "capped_mid_tails": [{"start": f"0x{s:08X}", "wanted_end": f"0x{w:08X}",
+                                  "capped_end": f"0x{c:08X}"} for s, w, c in self.capped_tails],
+            "unresolved_targets": [f"0x{t:08X}" for t in unresolved],
+        }
 
     def emit_header(self) -> str:
         """Generate the C header file content."""
@@ -5378,6 +5434,17 @@ def main() -> None:
             print(f"  removed stale {os.path.basename(stale)}")
     print(f"  {len(lifter.functions)} functions lifted")
     print(f"  {len(lifter.call_targets)} unique call targets")
+    # Machine-readable account of what the lift could not do, for classifying
+    # real gaps against data (docs/LIFT_REPORT.md): every trapped instruction,
+    # every capped mid-tail, and every call/branch target with no lifted function.
+    report_path = os.path.join(args.output, "ppu_lift_report.json")
+    report = lifter.lift_report()
+    with open(report_path, "w") as rf:
+        json.dump(report, rf, separators=(",", ":"))
+    s = report["summary"]
+    print(f"  lift report: {report_path} ({s['trapped_instructions']} trapped instruction(s) in "
+          f"{s['functions_with_traps']} function(s), {s['capped_mid_tails']} capped tail(s), "
+          f"{s['unresolved_targets']} unresolved target(s))")
 
 
 if __name__ == "__main__":

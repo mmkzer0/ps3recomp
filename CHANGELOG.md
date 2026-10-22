@@ -2,6 +2,9 @@
 
 ### Unreleased
 
+- **Gaps are stops** (`docs/STOPS.md`): an unresolved NID, an unimplemented lv2 syscall, a call into an unlifted function, an unresolved indirect call and an executed instruction the lifter could not translate each end the run with a named stop instead of a fabricated `CELL_OK`/no-op. Per-entry `[[hle.stub]]` / `[[lv2.stub]]` in the title config (with a written reason) is the only way on. Removes `PS3_HLE_UNRESOLVED`, `PPU_STUCKMAX` and `PPU_NOOP_BAD_VCALL`.
+- **Lifter**: unknown instructions lift to `ppu_trap_unknown_instruction(...)` instead of a `/* TODO */` comment, and `ppu_lift_report.json` (`docs/LIFT_REPORT.md`) lists them with capped tails and unresolved targets. Lifted sources need the runtime's new trap function (it is in `ppu_loader.cpp`).
+- **cellGamePatchCheck** is implemented: `CELL_GAME_ERROR_NOTPATCH` (this runtime never boots a title as a patch), `PARAM` for bad arguments. It used to be an unresolved NID answering `CELL_OK`.
 - **Named stops** (`ps3emu/stop.h`, `docs/STOPS.md`): one `PS3STOP v=1 kind=...` line plus a banner, exit status 70.
 - **Typed, versioned config** (`ps3emu/config.h`, `docs/CONFIG.md`): default < TOML file < `PS3RECOMP_<SECTION>_<KEY>`, effective-config dump, unknown keys and unknown `PS3RECOMP_*` variables stop. Vendors toml++ 3.4.0.
 - **`ppu.vscr_nj`** (default true, RPCS3 parity; a policy, not a hardware fact) is applied to every guest PPU context. `ppu_context_init` applies it; `ppu_context_clear` is the raw zeroing.

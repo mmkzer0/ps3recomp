@@ -84,9 +84,13 @@ reason = "a sleep; skipping it only speeds the title up"
 
 Every field is required. `reason` must say something (a blank one is refused). A
 `nid` (0 to 0xFFFFFFFF) or `num` (0 to 1023) may appear once. `ret` is 32 bits:
-`-2147483648` to `0xFFFFFFFF`, a negative value being its two's complement. Entries
-are parsed and validated at load; the stops that honour them look them up with
-`ps3_config_find_hle_stub()` and `ps3_config_find_lv2_stub()`.
+`-2147483648` to `0xFFFFFFFF`, a negative value being its two's complement, returned
+in r3 sign-extended from 32 bits. Entries are parsed and validated at load. An
+`[[hle.stub]]` is consulted when an import has no handler (`unresolved-nid`) and
+an `[[lv2.stub]]` when a syscall has none (`unimplemented-syscall`); a hit returns
+`ret` and logs `ALLOW-LISTED ...` once with the reason and the config line, a miss
+stops. An entry for something that *is* implemented is never consulted.
+Lookup: `ps3_config_find_hle_stub()` and `ps3_config_find_lv2_stub()`.
 
 ## Effective configuration
 
