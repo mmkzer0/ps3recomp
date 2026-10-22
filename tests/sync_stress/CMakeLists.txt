@@ -85,7 +85,7 @@ endif()
 
 add_test(NAME sync_stress COMMAND sync_stress)
 set_tests_properties(sync_stress PROPERTIES
-    LABELS "stress;runtime;sync"
+    LABELS "stress;runtime;sync;tsan"
     TIMEOUT 120
 )
 
@@ -101,6 +101,6 @@ if(WIN32)
     target_compile_definitions(test_cond_semantics PRIVATE _CRT_SECURE_NO_WARNINGS)
     foreach(mode owner recursive spurious)
         add_test(NAME cond_${mode} COMMAND test_cond_semantics ${mode})
-        set_tests_properties(cond_${mode} PROPERTIES TIMEOUT 10)
+        set_tests_properties(cond_${mode} PROPERTIES TIMEOUT 10 LABELS "sync;t0;tsan")
     endforeach()
 endif()

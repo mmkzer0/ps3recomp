@@ -9,6 +9,7 @@ add_executable(test_vdec_stub test_vdec_decode.c)
 target_include_directories(test_vdec_stub PRIVATE "${PROJECT_SOURCE_DIR}/include")
 target_link_libraries(test_vdec_stub PRIVATE ${VDEC_TEST_LIBS})
 add_test(NAME vdec_stub COMMAND test_vdec_stub stub)
+set_tests_properties(vdec_stub PROPERTIES LABELS "codec;t0")
 
 if(NOT PS3RECOMP_FFMPEG_RUNTIME)
     return()
@@ -40,6 +41,7 @@ set_tests_properties(vdec_ffmpeg_disabled PROPERTIES
 add_test(NAME vdec_ffmpeg_missing COMMAND test_vdec_ffmpeg stub)
 set_tests_properties(vdec_ffmpeg_missing PROPERTIES ENVIRONMENT
     "PS3RECOMP_FFMPEG_AVCODEC=${CMAKE_CURRENT_BINARY_DIR}/no-such-libavcodec;${VDEC_LIB_ENV}")
+set_tests_properties(vdec_ffmpeg_disabled vdec_ffmpeg_missing PROPERTIES LABELS "codec;t0")
 
 # Real decode needs streams, made by the ffmpeg CLI at test time.
 find_program(PS3RECOMP_FFMPEG_EXECUTABLE ffmpeg)
@@ -51,7 +53,7 @@ set(VDEC_MEDIA "${CMAKE_CURRENT_BINARY_DIR}/vdec_media")
 add_test(NAME vdec_media_gen COMMAND "${CMAKE_COMMAND}"
     -DFFMPEG=${PS3RECOMP_FFMPEG_EXECUTABLE} -DOUT=${VDEC_MEDIA}
     -P "${CMAKE_CURRENT_SOURCE_DIR}/gen_vdec_media.cmake")
-set_tests_properties(vdec_media_gen PROPERTIES FIXTURES_SETUP vdec_media)
+set_tests_properties(vdec_media_gen PROPERTIES FIXTURES_SETUP vdec_media LABELS "codec;t0")
 
 foreach(c avc mpeg2)
     if(c STREQUAL "avc")
@@ -70,5 +72,5 @@ foreach(c avc mpeg2)
     set_tests_properties(vdec_decode_${c} vdec_rgba_${c} PROPERTIES
         ENVIRONMENT "${VDEC_LIB_ENV}" SKIP_RETURN_CODE 77)
     set_tests_properties(vdec_decode_${c} vdec_rgba_${c} vdec_disabled_${c}
-        PROPERTIES FIXTURES_REQUIRED vdec_media)
+        PROPERTIES FIXTURES_REQUIRED vdec_media LABELS "codec;t0")
 endforeach()

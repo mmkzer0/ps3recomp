@@ -52,6 +52,6 @@ endif()
 
 add_test(NAME fiber_switch COMMAND fiber_switch)
 set_tests_properties(fiber_switch PROPERTIES
-    LABELS "runtime;fiber"
+    LABELS "runtime;fiber;t0"
     TIMEOUT 60
 )

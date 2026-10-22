@@ -45,6 +45,6 @@ endif()
 
 add_test(NAME lock_line COMMAND test_lock_line)
 set_tests_properties(lock_line PROPERTIES
-    LABELS "runtime;syscalls"
+    LABELS "runtime;syscalls;t0"
     TIMEOUT 30
 )

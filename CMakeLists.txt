@@ -378,6 +378,11 @@ endif()
 # ---------------------------------------------------------------------------
 if(PS3RECOMP_BUILD_TESTS)
     include(CTest)
+    # Every test carries an area label and a tier label:
+    #   t0      fast and deterministic: the default set (ctest -L t0)
+    #   stress  long-running or iteration-heavy
+    #   tsan    worth a run under PS3RECOMP_SANITIZE_THREAD
+    # Subdirectories label the tests they add.
     # sync_stress is written directly against the Win32 threading API
     # (WaitForMultipleObjects, joinable HANDLEs, Interlocked*, CRITICAL_SECTION).
     # Off Windows all of that comes from runtime/platform/win32_compat.h, so
@@ -405,6 +410,7 @@ if(PS3RECOMP_BUILD_TESTS)
     add_executable(test_log_first tests/test_log_first.c)
     target_include_directories(test_log_first PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
     add_test(NAME log_first COMMAND test_log_first)
+    set_tests_properties(log_first PROPERTIES LABELS "runtime;t0")
 
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
@@ -420,6 +426,10 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME spu_sdcrz
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_sdcrz.py")
+        set_tests_properties(spinlock_word_width PROPERTIES LABELS "sync;t0")
+        set_tests_properties(spurs_task_exit_code_initialize spurs_taskset_size
+            PROPERTIES LABELS "spurs;t0")
+        set_tests_properties(spu_sdcrz PROPERTIES LABELS "spu;t0")
     endif()
     if(NOT WIN32)
         find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
@@ -427,6 +437,7 @@ if(PS3RECOMP_BUILD_TESTS)
             add_test(NAME spu_fnms_zero_extended
                 COMMAND "${Python3_EXECUTABLE}"
                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_spu_fnms_zero_extended.py")
+            set_tests_properties(spu_fnms_zero_extended PROPERTIES LABELS "spu;t0")
         endif()
     endif()
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
@@ -443,6 +454,8 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME user_memory_domain
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_user_memory_domain.py")
+        set_tests_properties(loaded_image_memory loader_memory_domain
+            mmapper_hle_heap user_memory_domain PROPERTIES LABELS "memory;t0")
     endif()
 endif()
 

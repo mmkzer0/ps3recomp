@@ -23,3 +23,4 @@ target_include_directories(test_gcm_reports PRIVATE
 # The runtime carries C++, so the C++ driver does the final link.
 set_target_properties(test_gcm_reports PROPERTIES LINKER_LANGUAGE CXX)
 add_test(NAME gcm_reports COMMAND test_gcm_reports)
+set_tests_properties(gcm_reports PROPERTIES LABELS "gcm;t0")
