@@ -1,0 +1,25 @@
+# ThreadSanitizer baseline: the races the first TSan run of sync_stress found
+# (2026-10-22, macOS arm64, `ctest --preset tsan`).
+#
+# Each entry is a known data race left for M1 slice A2 (memory ordering). This
+# file only keeps the tsan tier honest until then: a new race fails the run,
+# while these known ones are listed here, not hidden. A2's gate is that this
+# file holds no runtime entries.
+#
+# runtime/syscalls/sys_mutex.c: the owner check before the lock reads
+# owner_tid and lock_count unlocked (:194, :270). The owner writes them under
+# the host lock (:238, :333).
+race:sys_mutex_lock
+race:sys_mutex_trylock
+# runtime/syscalls/sys_event.c: receive's empty fast path reads q->count
+# unlocked (:471); push's first-use diagnostic statics race (:733, :749).
+race:sys_event_queue_receive
+race:event_queue_push
+# runtime/syscalls/sys_semaphore.c:512: the diagnostic counter in post.
+race:sys_semaphore_post
+# tests/sync_stress/main.c: the watchdog and monitor threads read counters
+# with plain loads that the workers update with Interlocked* (test bugs).
+race:t1_watchdog
+race:t1b_watchdog
+race:t3_monitor
+race:t4b_receiver
