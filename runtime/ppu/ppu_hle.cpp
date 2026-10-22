@@ -22,6 +22,8 @@
 #include "ps3emu/nid.h"   /* ps3_nid_table, ps3_nid_entry */
 #include "ps3emu/milestone.h" /* ps3_msf -- boot milestone log */
 #include "ps3emu/stop.h"      /* ps3_stop_register_frontier */
+#include "ps3emu/config.h"    /* ps3_config_find_hle_stub */
+#include <mutex>
 #include <stdlib.h>       /* getenv */
 #include <stdint.h>
 #include <stdio.h>
@@ -136,60 +138,43 @@ extern "C" void flow_spurs_kernel_spawn_postinit(void) {}
 #include "../platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
 #include "ps3emu/log_first.h"
 
-/* An unresolved NID is a firmware import we never registered. Returning
- * CELL_OK "so the game keeps going" is the single biggest source of
- * days-long debugging in this project: the title reads back untouched
- * out-params and proceeds on fabricated state, then deadlocks or crashes
- * far from the actual gap. The unregistered mouse (a phantom device polled
- * forever) and six whole modules whose names never matched a source file
- * all reached the game this way.
- *
- * So: report every DISTINCT unresolved NID exactly once (not a global
- * first-40 cap that hides everything after the 40th unique import), count
- * how often each is hit, and make the fabricated return an explicit CHOICE
- * rather than the silent default.
- *
- * The default stays CELL_OK, because faking is currently LOAD-BEARING: LBP
- * calls cellFsSdataOpen (0xB1840B53, its encrypted data file) and cellHttpsInit
- * (0x522180BC) during early boot and shuts down cleanly if either fails, so
- * PS3_HLE_UNRESOLVED=fail dies at 144 log lines vs ~148,000. The days-long
- * debugging was never caused by the fake per se -- it was caused by the fake
- * being SILENT (a global first-40-line cap hid every import past the 40th). So
- * the fix is visibility: report each DISTINCT unresolved NID once, with a hit
- * count, always. `fail` remains available to A/B which missing import is
- * load-bearing -- run it and read the two or three NIDs it reports.
- *
- *   PS3_HLE_UNRESOLVED = ok   (default): r3 = CELL_OK, reported once per NID.
- *                        = fail: r3 = CELL_ERROR_ERROR, to find load-bearing
- *                                imports (expect an early, clean shutdown).
- */
-static void ps3_hle_unresolved(uint32_t nid, ppu_context* ctx)
+/* A firmware import nothing implements. Carrying on with a made-up return value
+ * is how a title ends up reading untouched out-params and failing thousands of
+ * calls later, so the default is a named stop (kind unresolved-nid). The only way
+ * on is a per-NID [[hle.stub]] entry in the title's config, which carries the
+ * return value and the written reason it is safe; it is reported once per NID,
+ * loudly, with the config line. There is no blanket form and no environment
+ * switch (docs/CONFIG.md). The import's name is not known here: the lift keeps
+ * only the NID, so the stop says so. */
+static void hle_unresolved(uint32_t nid, ppu_context* ctx)
 {
-    enum { CELL_ERROR_ERROR = (int)0x8001003Fu };  /* generic CELL failure */
-    static int s_fake = -1;
-    if (s_fake < 0) {
-        const char* m = getenv("PS3_HLE_UNRESOLVED");
-        s_fake = (m && (m[0]=='f' || m[0]=='F')) ? 0 : 1;   /* "fail" -> error, else fake */
+    char nid_s[16];
+    snprintf(nid_s, sizeof nid_s, "0x%08X", nid);
+    if (const ps3_cfg_hle_stub* s = ps3_config_find_hle_stub(nid)) {
+        static std::mutex lock;
+        static uint32_t reported[256];
+        static unsigned n_reported;
+        bool first = true;
+        {
+            std::lock_guard<std::mutex> g(lock);
+            for (unsigned i = 0; i < n_reported; i++) if (reported[i] == nid) first = false;
+            if (first && n_reported < 256) reported[n_reported++] = nid;
+        }
+        if (first)
+            fprintf(stderr, "[hle] ALLOW-LISTED unresolved import %s returns 0x%08X: %s (%s:%u)\n",
+                    nid_s, s->ret, s->reason, ps3_config_file() ? ps3_config_file() : "?", s->line);
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)s->ret;   /* HLE returns are s32, sign-extended into r3 */
+        return;
     }
-    /* First-seen set: report each NID once, then count silently. Linear scan
-     * over a small array -- the count of DISTINCT unresolved NIDs a title hits
-     * is tens, not thousands (the log-flooders are all the SAME NID). */
-    static uint32_t seen[512];
-    static uint32_t hits[512];
-    static uint32_t n_seen = 0;
-    uint32_t i = 0;
-    for (; i < n_seen; i++) if (seen[i] == nid) break;
-    if (i == n_seen && n_seen < 512) { seen[n_seen] = nid; hits[n_seen] = 0; n_seen++; }
-    uint32_t count = (i < 512) ? ++hits[i] : 0;
-    (void)count;
-    if (count == 1)
-        fprintf(stderr, "[hle] UNRESOLVED NID 0x%08X -> faking %s "
-                        "(unregistered import%s)\n",
-                nid, s_fake ? "CELL_OK" : "CELL_ERROR_ERROR",
-                s_fake ? "; PS3_HLE_UNRESOLVED=fail to find load-bearing ones"
-                       : "");
-
-    ctx->gpr[3] = s_fake ? 0u : (uint64_t)(uint32_t)CELL_ERROR_ERROR;
+    char lr_s[16];
+    snprintf(lr_s, sizeof lr_s, "0x%08X", (uint32_t)ctx->lr);
+    ps3_stop_field f[] = { {"nid", nid_s}, {"name", "unknown"}, {"caller_lr", lr_s} };
+    // The lifted code does not track a pc; the import stub's caller is the best site there is.
+    ps3_stop_site site = { ctx->lr, ctx->lr, ctx->thread_id };
+    ps3_stop(PS3_STOP_UNRESOLVED_NID, "firmware import has no HLE handler",
+             "Implement the import in an HLE library, or allow-list it in the title config with "
+             "[[hle.stub]] nid, ret and a reason (docs/CONFIG.md).",
+             f, 3, &site);
 }
 
 extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
@@ -761,7 +746,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
               ctx->gpr[3] = 0x80010002u; /* generic failure (net unavailable) */
               return;
           } } }
-        ctx->gpr[3] = 0;   /* CELL_OK-ish so the game keeps going */
+        hle_unresolved(nid, ctx);
         return;
     }
     g_last_hle_name = e->name;

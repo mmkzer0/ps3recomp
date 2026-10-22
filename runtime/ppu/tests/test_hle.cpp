@@ -43,11 +43,8 @@ int main()
            (unsigned long long)ctx.gpr[3]);
     CHECK(ctx.gpr[3] == 7089, "ABI adapter marshalled r3..r5 and returned via r3");
 
-    /* Unresolved NID must not crash; returns 0. */
-    memset(&ctx, 0, sizeof(ctx));
-    ctx.gpr[3] = 999;
-    ps3_hle_call(0xDEADBEEFu, &ctx);
-    CHECK(ctx.gpr[3] == 0, "unresolved NID returns 0 (no crash)");
+    /* An unresolved NID is a named stop, not a return value: that path ends the
+     * process, so it is exercised by tools/test_hle_unresolved.py instead. */
 
     printf("\nResults: %s (%d failure(s))\n", fails ? "FAIL" : "OK", fails);
     return fails ? 1 : 0;
