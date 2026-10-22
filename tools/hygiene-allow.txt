@@ -1,0 +1,15 @@
+# Paths that may legitimately carry a hygiene finding, and why.
+#
+# One entry per line:
+#
+#     <glob> <rule-id> -- <reason>
+#
+# <glob> is matched with fnmatch() against the repository-relative POSIX
+# path, so `dist/*.bin` also matches nested paths.  <rule-id> is one of
+# forbidden-name, magic, oversize, symlink.  The reason is mandatory: an
+# allow-list entry without a written reason is how a leak becomes normal.
+# An entry suppresses only its own rule for matching paths.
+#
+# This repository must stay empty here:
+#
+#     python3 tools/check_hygiene.py --tracked
