@@ -14,7 +14,7 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from check_ppu_scaffold import stub_header  # noqa: E402
+from check_ppu_scaffold import loader_support_sources, stub_header  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -33,6 +33,7 @@ def main():
                         '-I' + str(tmp), '-I' + str(ROOT / 'include'), '-I' + str(ROOT / 'runtime/platform'),
                         str(ROOT / 'runtime/ppu/ppu_loader.cpp'),
                         str(ROOT / 'runtime/ppu/tests/test_ppu_dispatch_depth.cpp'),
+                        *loader_support_sources(),
                         *flags, '-o', str(binary)], check=True)
         env = {k: v for k, v in os.environ.items() if not k.startswith(('PPU_', 'PS3_', 'PS3RECOMP_', 'SPU_'))}
         r = subprocess.run([str(binary)], env=env, capture_output=True, text=True, timeout=60)

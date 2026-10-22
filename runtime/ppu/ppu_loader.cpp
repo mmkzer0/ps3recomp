@@ -35,6 +35,7 @@
 #define PPU_NO_INLINE_LOADS   /* this file defines the out-of-line accessors */
 #include "ppu_recomp.h"
 #include "ps3emu/ps3_ftrace.h"   /* PS3_FTRACE timeline */
+#include "ps3emu/stop.h"         /* ps3_stop, ps3_stop_register_frontier */
 #include "ps3emu/milestone.h"   /* ps3_ms / ps3_msf -- boot milestone log */     /* ppu_context, func decls, ppu_recomp_register */
 #include "../memory/vm.h"   /* vm_commit -- sys_mmapper_search_and_map maps for real */
 #include "../platform/win32_compat.h"      /* Win32 types, interlocked ops, Sleep/QPC on POSIX */
@@ -3069,6 +3070,17 @@ extern "C" __attribute__((weak)) void ppu_gcm_pump(void);
  * in lv2_syscall() below. */
 #define PS3_SC_INFLIGHT_MAX 64
 extern "C" uint32_t g_sc_inflight[PS3_SC_INFLIGHT_MAX] = { 0 };
+
+/* A stop names the lv2 syscall the stopping thread is inside, from the table
+ * above rather than a tracer of its own. */
+static void sc_stop_frontier(uint64_t thread_id, ps3_stop_frontier* out)
+{
+    if (thread_id >= PS3_SC_INFLIGHT_MAX || !g_sc_inflight[thread_id]) return;
+    out->has_syscall = 1;
+    out->syscall_num = g_sc_inflight[thread_id];
+}
+[[maybe_unused]] static const int s_sc_frontier_registered =
+    (ps3_stop_register_frontier(sc_stop_frontier), 0);
 
 extern "C" void lv2_syscall(ppu_context* ctx)
 {

@@ -6,7 +6,7 @@ import struct
 import subprocess
 import sys
 import tempfile
-from check_ppu_scaffold import stub_header
+from check_ppu_scaffold import loader_support_sources, stub_header
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -43,6 +43,7 @@ def main():
                         '-I'+str(tmp), '-I'+str(ROOT/'include'), '-I'+str(ROOT/'runtime/platform'),
                         str(ROOT/'runtime/ppu/ppu_loader.cpp'),
                         str(ROOT/'runtime/ppu/tests/test_ppu_entry_arguments.cpp'),
+                        *loader_support_sources(),
                         str(memory), *flags, '-o', str(binary)], check=True)
         env = {k: v for k,v in os.environ.items() if not k.startswith(('PPU_', 'PS3_', 'PS3RECOMP_', 'SPU_'))}
         env['PS3_BOOT_PATH'] = '/dev_bdvd/PS3_GAME/USRDIR/bin/test.self'

@@ -21,6 +21,7 @@
 #include "ppu_recomp.h"   /* ppu_context */
 #include "ps3emu/nid.h"   /* ps3_nid_table, ps3_nid_entry */
 #include "ps3emu/milestone.h" /* ps3_msf -- boot milestone log */
+#include "ps3emu/stop.h"      /* ps3_stop_register_frontier */
 #include <stdlib.h>       /* getenv */
 #include <stdint.h>
 #include <stdio.h>
@@ -93,6 +94,17 @@ extern "C" const char* g_last_hle_name = "";
  * set on entry, cleared on every exit path by the guard below. */
 #define PS3_HLE_INFLIGHT_MAX 64
 extern "C" const char* g_hle_inflight[PS3_HLE_INFLIGHT_MAX] = { nullptr };
+
+/* A stop reports how far the guest got from the same breadcrumb. */
+static void hle_stop_frontier(uint64_t, ps3_stop_frontier* out)
+{
+    if (!g_last_hle_nid) return;
+    out->has_hle  = 1;
+    out->hle_nid  = g_last_hle_nid;
+    out->hle_name = g_last_hle_name;
+}
+[[maybe_unused]] static const int s_hle_frontier_registered =
+    (ps3_stop_register_frontier(hle_stop_frontier), 0);
 
 /* Real-PRX bridge: a loaded system PRX (libsre = cellSpurs/cellSync) may export
  * this NID. If so, dispatch into the REAL recompiled Sony code (its OPD -> our

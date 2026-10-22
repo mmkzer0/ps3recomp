@@ -420,6 +420,9 @@ if(PS3RECOMP_BUILD_TESTS)
     if(UNIX)
         add_subdirectory(tests/gcm_reports)
     endif()
+    # The startup gates (typed config, identity, VSCR policy) and the named stop
+    # they end in: probe executables run per scenario by Python runners.
+    add_subdirectory(tests/gates)
     # PS3_LOG_FIRST, the saturating counter behind the "first n times" log lines.
     add_executable(test_log_first tests/test_log_first.c)
     target_include_directories(test_log_first PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")

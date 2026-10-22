@@ -98,6 +98,19 @@ def stub_header() -> str:
     )
 
 
+# Runtime translation units a bare fixture must link beside ppu_loader.cpp or
+# ppu_hle.cpp. Both are compiled per game, outside the ps3recomp_runtime
+# library, yet call into modules that live in it: a title gets those from the
+# library, and a fixture that compiles the scaffold by hand has to name them.
+LOADER_SUPPORT_SOURCES = [
+    "runtime/diag/stop.cpp",
+]
+
+
+def loader_support_sources() -> list:
+    return [os.path.join(ROOT, p) for p in LOADER_SUPPORT_SOURCES]
+
+
 def compiler_family(cxx: str) -> str:
     """Ask the compiler what it is, rather than guessing from its filename.
 

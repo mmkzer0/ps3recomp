@@ -1,0 +1,144 @@
+/*
+ * ps3recomp - named stop
+ *
+ * The one way the runtime gives up. A gap the runtime cannot honour (a firmware
+ * import with no handler, a syscall nobody implements, code the lifter did not
+ * lift, a rejected configuration, a wrong executable) must not be papered over
+ * with a made-up return value: the guest would carry on from state the real
+ * console never produced, and the divergence would surface thousands of calls
+ * later, nowhere near its cause. A stop ends the process at the cause and says
+ * what the cause was.
+ *
+ * One call prints, on stderr, a banner a human cannot miss followed by ONE
+ * machine-readable line, then flushes and exits with PS3_STOP_EXIT_CODE. It
+ * never returns and never runs atexit handlers: the state it is reporting is
+ * not trustworthy enough for them.
+ *
+ * The machine line is the stable interface (tools, CI and tests match on it;
+ * the banner is prose and may change):
+ *
+ *   PS3STOP v=1 kind=<kind> <key>=<value> ... [pc=0x.. lr=0x.. tid=N]
+ *           [last_hle_nid=0x.. last_hle=<name>] [syscall=N]
+ *
+ * It is a single line (wrapped above only for the comment). A value that is not
+ * made solely of [A-Za-z0-9_.:/+@,-] is double-quoted with \" \\ \n \r \t and
+ * \xNN escapes, so the line splits on spaces the way a shell would.
+ *
+ * Kinds are stable kebab-case ids. A new gap gets a new kind here rather than
+ * a free-text variant of an old one, because the id is what a title's tooling
+ * counts and allow-lists by.
+ *
+ * Threading: any thread may stop at any time. Stops are serialised, so
+ * concurrent stops produce exactly one banner and one machine line (the
+ * first), never interleaved text; every other thread parks until the process
+ * exits. A stop raised from inside a stop (a frontier provider that itself
+ * stops) exits at once with the bare machine line.
+ */
+
+#ifndef PS3EMU_STOP_H
+#define PS3EMU_STOP_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+#  define PS3_NORETURN [[noreturn]]
+extern "C" {
+#else
+#  define PS3_NORETURN _Noreturn
+#endif
+
+/* Process exit status of every stop. 70 is EX_SOFTWARE (sysexits.h): distinct
+ * from success, from the 1/2 a failed test or a usage error returns, from the
+ * shell's 126/127 and from the 128+signal range, so a wrapper can tell "the
+ * runtime refused to continue" from every other way a run ends. */
+#define PS3_STOP_EXIT_CODE 70
+
+/* kind: enumerator suffix, stable id. */
+#define PS3_STOP_KINDS(X)                                                      \
+    /* A1a: raised by the runtime's own startup gates. */                      \
+    X(IDENTITY_MISMATCH,        "identity-mismatch")                           \
+    X(CONFIG_INVALID,           "config-invalid")                              \
+    /* Declared for the guest-execution gaps; raised by their own slice. */    \
+    X(UNRESOLVED_NID,           "unresolved-nid")                              \
+    X(UNIMPLEMENTED_SYSCALL,    "unimplemented-syscall")                       \
+    X(UNLIFTED_FUNCTION,        "unlifted-function")                           \
+    X(UNRESOLVED_INDIRECT_CALL, "unresolved-indirect-call")                    \
+    X(UNKNOWN_INSTRUCTION,      "unknown-instruction")
+
+typedef enum ps3_stop_kind {
+#define PS3_STOP_KIND_ENUM(name, id) PS3_STOP_##name,
+    PS3_STOP_KINDS(PS3_STOP_KIND_ENUM)
+#undef PS3_STOP_KIND_ENUM
+    PS3_STOP_KIND_COUNT
+} ps3_stop_kind;
+
+/* The kebab-case id ("identity-mismatch"), never NULL. */
+const char* ps3_stop_kind_id(ps3_stop_kind kind);
+
+/* One subject fact. `key` is [a-z][a-z0-9_]* (anything else is rewritten to
+ * '_'); a key that collides with a reserved one of the machine line (v, kind,
+ * pc, lr, tid, last_hle_nid, last_hle, syscall) is emitted as f_<key>. `value`
+ * is already formatted by the caller: hex ids as "0x%08X", names verbatim. */
+typedef struct ps3_stop_field {
+    const char* key;
+    const char* value;
+} ps3_stop_field;
+
+/* Where the guest was, when the gap is a guest-execution one. pc is the guest
+ * address of the offending instruction or call target as the caller knows it
+ * (a ppu_context's `cia` is only refreshed at block boundaries); lr and
+ * thread_id come from the ppu_context. */
+typedef struct ps3_stop_site {
+    uint64_t pc;
+    uint64_t lr;
+    uint64_t thread_id;
+} ps3_stop_site;
+
+/* End the process. `what`: one sentence saying what was found. `remedy`: what
+ * the operator can do about it; mandatory, a stop that cannot say is a bug.
+ * `fields`/`nfields`: the subject, in order. `site`: NULL when the stop has no
+ * guest context (startup gates).
+ *
+ * Example, for an import with no handler:
+ *
+ *     char nid[16]; snprintf(nid, sizeof nid, "0x%08X", n);
+ *     ps3_stop_field f[] = { {"nid", nid}, {"name", name} };
+ *     ps3_stop_site s = { pc, ctx->lr, ctx->thread_id };
+ *     ps3_stop(PS3_STOP_UNRESOLVED_NID, "import has no HLE handler",
+ *              "implement it, or allow-list it in [[hle.stub]]",
+ *              f, 2, &s);
+ */
+PS3_NORETURN void ps3_stop(ps3_stop_kind kind, const char* what,
+                           const char* remedy,
+                           const ps3_stop_field* fields, size_t nfields,
+                           const ps3_stop_site* site);
+
+/* ---- frontier ---------------------------------------------------------- */
+
+/* The last thing the guest was seen doing, so a stop says how far the run got.
+ * The runtime already tracks this where it dispatches (the last HLE import,
+ * the lv2 syscall a thread is inside); a stop does not trace anything itself,
+ * it asks whoever owns that state. */
+typedef struct ps3_stop_frontier {
+    int         has_hle;       /* last_hle_nid / last_hle are valid */
+    uint32_t    hle_nid;
+    const char* hle_name;      /* may be NULL or "" when unnamed */
+    int         has_syscall;   /* syscall_num is valid */
+    uint32_t    syscall_num;
+} ps3_stop_frontier;
+
+/* `thread_id` is the stopping thread's guest id when `site` was given, else 0.
+ * A provider fills the parts it owns and leaves the rest alone, must not
+ * block, allocate or stop, and runs on the stopping thread. */
+typedef void (*ps3_stop_frontier_fn)(uint64_t thread_id, ps3_stop_frontier* out);
+
+/* Register a provider (idempotent per function, at most 8). Safe to call from
+ * a static initialiser: the registry needs no prior setup. */
+void ps3_stop_register_frontier(ps3_stop_frontier_fn fn);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* PS3EMU_STOP_H */
