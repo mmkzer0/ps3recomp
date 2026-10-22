@@ -148,6 +148,8 @@ void cellGame_set_content_path(const char* path);
 s32 cellGameBootCheck(u32* type, u32* attributes, CellGameContentSize* size,
                        char* dirName);
 
+s32 cellGamePatchCheck(CellGameContentSize* size, void* reserved);
+
 s32 cellGameContentPermit(char* contentInfoPath, char* usrdirPath);
 
 s32 cellGameDataCheck(u32 type, const char* dirName, CellGameContentSize* size);

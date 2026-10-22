@@ -471,6 +471,20 @@ s32 cellGameDataCheck(u32 type, const char* dirName, CellGameContentSize* size)
     return CELL_GAME_RET_NONE;
 }
 
+/* cellGamePatchCheck (AM-11): a title asks whether it was booted as a patch of
+ * another game. This runtime has no patch boot mode -- a title boots as a disc
+ * or HDD game -- so the answer is NOTPATCH, which is also what a console answers
+ * a non-patch boot. It was unimplemented before, which made it an unresolved NID
+ * that returned CELL_OK, and CELL_OK here tells the title it IS a patch and has
+ * a patch content size to read. `size` (written only on a patch boot) and the
+ * reserved argument are validated first, as the firmware does. No environment
+ * switch: if patch boots are ever supported it is a boot property, not a flag. */
+s32 cellGamePatchCheck(CellGameContentSize* size, void* reserved)
+{
+    if (reserved || !size) return CELL_GAME_ERROR_PARAM;
+    return CELL_GAME_ERROR_NOTPATCH;
+}
+
 /* cellGameDataCheckCreate2 (NID 0xC9645C41) -- check/prepare game data, invoking the
  * title's funcStat callback (CellGameDataStatCallback) exactly like firmware so the
  * save/boot state machine advances. Struct layout + behavior cross-referenced against
