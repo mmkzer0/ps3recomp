@@ -459,7 +459,10 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME check_hygiene
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_check_hygiene.py")
-        set_tests_properties(check_hygiene PROPERTIES LABELS "tools;t0")
+        add_test(NAME check_commit_msg
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_check_commit_msg.py")
+        set_tests_properties(check_hygiene check_commit_msg PROPERTIES LABELS "tools;t0")
     endif()
 endif()
 
