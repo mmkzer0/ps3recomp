@@ -103,10 +103,21 @@ list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/tests/|/runtime/ppu/|/runtime/host/|
 # ---------------------------------------------------------------------------
 # Static library
 # ---------------------------------------------------------------------------
+# The Jq2 command-ring codec is pure C++20 with no runtime dependency, so it is
+# a target of its own: a title can link it without the HLE runtime, and the
+# codec's T0 test links it alone. The runtime also carries it for HLE callers.
+add_library(ps3recomp_spurs_jq2 STATIC
+    libs/spurs/jq2/ring.cpp
+)
+target_include_directories(ps3recomp_spurs_jq2 PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/libs/spurs"
+)
+
 add_library(ps3recomp_runtime STATIC
     ${HLE_SOURCES}
     ${RUNTIME_SOURCES}
 )
+target_link_libraries(ps3recomp_runtime PRIVATE ps3recomp_spurs_jq2)
 
 target_include_directories(ps3recomp_runtime PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
@@ -398,6 +409,9 @@ if(PS3RECOMP_BUILD_TESTS)
     # check is pure, so the test links one runtime translation unit
     # (lv2_lock_line.c) and nothing else.
     add_subdirectory(tests/syscalls)
+    # The JobQueue2 ring-entry codec: synthetic bytes only, linked without the
+    # runtime so the target's standalone contract is exercised too.
+    add_subdirectory(tests/spurs_jq2)
     # cellVdec through its guest API: the callback-only decoder always, and
     # real H.264 / MPEG-2 decode when FFmpeg is on (libs/codec/tests).
     add_subdirectory(libs/codec/tests)
