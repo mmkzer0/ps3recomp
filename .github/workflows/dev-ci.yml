@@ -1,0 +1,97 @@
+# CI for this fork's `dev` branch. It runs only when someone dispatches it:
+#
+#   gh workflow run dev-ci.yml --ref dev [-f stress=true]
+#
+# The upstream workflows inherited by the fork (linux, macos, windows,
+# linux-vulkan, release) trigger on push, pull_request and tags. They are
+# disabled in the fork's Actions settings
+# (`gh workflow disable <name>`), so nothing runs on its own. A workflow_dispatch
+# workflow has to exist on the default branch, which is why `dev` is the
+# default.
+#
+# Tiers come from CTest labels (CMakeLists.txt, "Tests"):
+#   - the dev, release and asan presets run `t0`;
+#   - the tsan preset runs `tsan`;
+#   - `stress` runs on request.
+name: dev-ci
+
+on:
+  workflow_dispatch:
+    inputs:
+      stress:
+        description: Also run the stress tier (release preset)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dev-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hygiene:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: No game or firmware material in the tree
+        run: python3 tools/check_hygiene.py --repo . --tracked
+
+  macos:
+    name: macos-15 arm64 (${{ matrix.preset }})
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [dev, release, asan, tsan]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: brew install ninja sdl2 glslang spirv-cross
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }}
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }}
+      - name: Test
+        # The dev configure preset's tier-filtered test preset is `t0`; every
+        # other preset has a test preset of its own name.
+        run: ctest --preset ${{ matrix.preset == 'dev' && 't0' || matrix.preset }}
+      - name: Stress tier
+        if: inputs.stress && matrix.preset == 'release'
+        run: ctest --test-dir build/release -L '^stress$' --output-on-failure
+
+  tool-suites:
+    name: macos-15 arm64 (tools/test_*.py)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run the tool and lifter suites
+        env:
+          CI: "1"          # a skipped conformance run fails instead of passing
+        run: |
+          set -e
+          for t in tools/test_*.py; do
+            echo "--- $t"
+            python "$t"
+          done
+
+  linux:
+    name: ubuntu-24.04 x86_64 (dev)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libsdl2-dev clang \
+            glslang-dev glslang-tools spirv-tools libspirv-cross-c-shared-dev
+      - name: Configure
+        run: CC=clang CXX=clang++ cmake --preset dev
+      - name: Build
+        run: cmake --build --preset dev
+      - name: Test
+        run: ctest --preset t0
