@@ -66,7 +66,14 @@ extern "C" {
     X(UNRESOLVED_INDIRECT_CALL, "unresolved-indirect-call")                    \
     X(UNKNOWN_INSTRUCTION,      "unknown-instruction")
 
+/* A fixed underlying type in C++ makes a kind outside the list (a caller's bug,
+ * which the stop still reports as "invalid-kind") a well-defined value rather
+ * than undefined behaviour; C enums are int-sized already, so the ABI matches. */
+#ifdef __cplusplus
+typedef enum ps3_stop_kind : int {
+#else
 typedef enum ps3_stop_kind {
+#endif
 #define PS3_STOP_KIND_ENUM(name, id) PS3_STOP_##name,
     PS3_STOP_KINDS(PS3_STOP_KIND_ENUM)
 #undef PS3_STOP_KIND_ENUM

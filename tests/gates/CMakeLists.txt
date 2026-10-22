@@ -34,10 +34,10 @@ function(gates_py_test name area script)
 endfunction()
 
 gates_probe(probe_stop probe_stop.cpp)
-gates_py_test(stop runtime test_stop.py $<TARGET_FILE:probe_stop>)
+gates_py_test(stop "runtime;tsan" test_stop.py $<TARGET_FILE:probe_stop>)
 
 gates_probe(probe_sha256 probe_sha256.cpp)
 gates_py_test(sha256 runtime test_sha256.py $<TARGET_FILE:probe_sha256>)
 
 gates_probe(probe_config probe_config.cpp)
-gates_py_test(config config test_config.py $<TARGET_FILE:probe_config>)
+gates_py_test(config "config;tsan" test_config.py $<TARGET_FILE:probe_config>)
