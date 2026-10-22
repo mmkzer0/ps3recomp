@@ -645,6 +645,35 @@ cmake --build build
 | `config.toml` | Recompiler and runtime configuration |
 | `CMakeLists.txt` | Build configuration — links against ps3recomp_runtime |
 
+### Lifting at Build Time
+
+A title can keep the lift out of its source tree and run it as part of the
+build. `cmake/PS3RecompPPU.cmake` owns the loader/lifter invocation, the HLE
+NID table and the boot-scaffold source list, so a port does not repeat them:
+
+```cmake
+include("${PS3RECOMP_DIR}/cmake/PS3RecompPPU.cmake")
+
+ps3recomp_ppu_lift(LIFTED
+    INPUT       "${CMAKE_CURRENT_SOURCE_DIR}/EBOOT.elf"
+    OUTPUT_DIR  "${CMAKE_CURRENT_BINARY_DIR}/recomp"
+    CHUNKS      64)
+ps3recomp_ppu_hle_nids(HLE_NID_TABLE)
+ps3recomp_ppu_scaffold(SCAFFOLD)
+
+add_executable(my_game main.cpp ${LIFTED} ${HLE_NID_TABLE} ${SCAFFOLD})
+target_include_directories(my_game PRIVATE "${LIFTED_INCLUDE_DIR}" ...)
+```
+
+The lift runs at build time with fixed output names (`--chunks N` cuts by
+guest code bytes), and `--code-end` defaults to the ELF's own executable end
+(the highest `SHF_EXECINSTR` section, or the executable segment when section
+headers are stripped), so a data section inside an R-X segment is not lifted
+as code. Pass `CODE_END <addr>` only when the image needs a stricter bound; a
+relocated PRX, for example. `LIFTER_ARGS` forwards other lifter options.
+The generated translation units still need the title's large-TU flags: `-w`,
+`-ffp-contract=off`, and `-O1` rather than the Release `-O3`.
+
 ### Configuration Reference (config.toml)
 
 See `templates/project/config.toml` for the full reference with comments. Key sections:

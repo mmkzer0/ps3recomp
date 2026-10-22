@@ -81,34 +81,12 @@ add_subdirectory("${PS3RECOMP_DIR}" "${CMAKE_BINARY_DIR}/ps3recomp_sdk"
 # The HLE NID table
 # ---------------------------------------------------------------------------
 # Maps each firmware import NID onto the handler in the runtime that answers
-# it. A port may keep a hand-curated one beside its lift; otherwise generate
-# the canonical every-module table, which is what the toolkit's own boot
-# harness uses.
-if(EXISTS "${RECOMP_DIR}/ppu_hle_nids.cpp")
-    set(HLE_NID_TABLE "${RECOMP_DIR}/ppu_hle_nids.cpp")
-    message(STATUS "HLE NID table:   ${HLE_NID_TABLE}")
-else()
-    find_package(Python3 COMPONENTS Interpreter REQUIRED)
-    set(HLE_NID_TABLE "${CMAKE_CURRENT_BINARY_DIR}/ppu_hle_nids.cpp")
-    # The generator discovers handlers from library definitions. Rebuild when
-    # an existing module changes, and reconfigure when a new module is added.
-    file(GLOB_RECURSE HLE_NID_SOURCES CONFIGURE_DEPENDS
-        "${PS3RECOMP_DIR}/libs/*.c")
-    # A removed input cannot make the output older than a remaining dependency.
-    # Track the list itself so deletions also remove stale handler references.
-    set(HLE_NID_SOURCE_LIST "${CMAKE_CURRENT_BINARY_DIR}/hle_nid_sources.txt")
-    file(GENERATE OUTPUT "${HLE_NID_SOURCE_LIST}" CONTENT "${HLE_NID_SOURCES}\n")
-    add_custom_command(
-        OUTPUT "${HLE_NID_TABLE}"
-        COMMAND "${Python3_EXECUTABLE}"
-                "${PS3RECOMP_DIR}/tools/gen_hle_nids.py"
-                --out "${HLE_NID_TABLE}" --all
-        DEPENDS "${PS3RECOMP_DIR}/tools/gen_hle_nids.py"
-                "${PS3RECOMP_DIR}/tools/nid_database.py"
-                ${HLE_NID_SOURCES} "${HLE_NID_SOURCE_LIST}"
-        COMMENT "Generating the HLE NID -> handler table")
-    message(STATUS "HLE NID table:   generated (every module)")
-endif()
+# it. A port may keep a hand-curated one beside its lift; otherwise the
+# canonical every-module table is generated, which is what the toolkit's own
+# boot harness uses. The helper lives in the toolkit so the template and a
+# real title generate it the same way.
+include("${PS3RECOMP_DIR}/cmake/PS3RecompPPU.cmake")
+ps3recomp_ppu_hle_nids(HLE_NID_TABLE RECOMP_DIR "${RECOMP_DIR}")
 
 # ---------------------------------------------------------------------------
 # The game executable
@@ -116,12 +94,7 @@ endif()
 # The PPU boot scaffold is compiled here rather than taken from the runtime
 # library: every one of these files #includes the lifter's per-game
 # ppu_recomp.h, so they can only be built against a particular lift.
-set(PS3RECOMP_SCAFFOLD
-    "${PS3RECOMP_DIR}/runtime/ppu/ppu_loader.cpp"
-    "${PS3RECOMP_DIR}/runtime/ppu/ppu_hle.cpp"
-    "${PS3RECOMP_DIR}/runtime/ppu/ppu_fs.cpp"
-    "${PS3RECOMP_DIR}/runtime/ppu/ppu_sysprx.cpp"
-)
+ps3recomp_ppu_scaffold(PS3RECOMP_SCAFFOLD)
 
 # ---------------------------------------------------------------------------
 # Lifted SPU images (optional)
