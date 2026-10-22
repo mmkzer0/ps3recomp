@@ -12,6 +12,7 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -241,6 +242,11 @@ extern "C" {
 #endif
 extern const func_entry function_table[];
 extern const uint64_t  function_table_count;  /* entries, excluding sentinel */
+/* The SHA-256 (64 lower-case hex digits) of the file this output was lifted
+ * from, recorded by the lifter. ppu_load_elf hashes the executable it is asked
+ * to load and stops, naming both hashes, if they differ: a lift is only valid
+ * for the exact image it was made from. */
+const char* ppu_lift_image_sha256(void);
 #ifdef __cplusplus
 }
 #endif
@@ -900,6 +906,11 @@ class PPULifter:
         # the instruction-list identity so the FULL list (mid-function / serial
         # lift) is sorted+indexed once, not rescanned per call.
         self._range_cache: tuple | None = None
+        # SHA-256 (hex) of the file being lifted: emitted as
+        # ppu_lift_image_sha256() so the runtime can refuse any other image.
+        # Set by main() from the bytes it read; output cannot be produced
+        # without it (see _table_lines), so no lift ships without an identity.
+        self.image_sha256: str | None = None
 
     def _range_insns(self, instructions: list["Instruction"],
                      start: int, end: int) -> list["Instruction"]:
@@ -3786,6 +3797,8 @@ class PPULifter:
         # replace covers both uniformly.
         preamble = (HEADER_PREAMBLE.replace("function_table",
                                             self.prefix + "function_table")
+                                   .replace("ppu_lift_image_sha256",
+                                            self.prefix + "ppu_lift_image_sha256")
                     if self.prefix else HEADER_PREAMBLE)
         lines = [preamble]
         # Forward declarations
@@ -4017,6 +4030,16 @@ class PPULifter:
         lines.append("    { 0, NULL, NULL }")
         lines.append("};")
         lines.append(f"const uint64_t {self.prefix}function_table_count = {len(funcs)};")
+        lines.append("")
+        # Without the image's hash the runtime cannot tell whether it is
+        # running the executable this was lifted from, so refuse to write
+        # output rather than leave the gate with nothing to compare.
+        if not self.image_sha256 or not re.fullmatch(r"[0-9a-f]{64}", self.image_sha256):
+            raise ValueError("PPULifter.image_sha256 must be the lower-case hex SHA-256 "
+                             "of the lifted file before output is written")
+        lines.append("/* Identity of the file this was lifted from (see ppu_recomp.h). */")
+        lines.append(f'const char* {self.prefix}ppu_lift_image_sha256(void) '
+                     f'{{ return "{self.image_sha256}"; }}')
         lines.append("")
         return lines
 
@@ -5246,6 +5269,10 @@ def main() -> None:
 
     lifter = PPULifter(prefix=args.symbol_prefix, weak_emit=args.weak)
     lifter.header_name = args.header_name
+    # The identity the runtime checks the loaded executable against. The whole
+    # file as read, not the segments lifted from it: any byte that differs is a
+    # different image, whether or not the lifter looked at it.
+    lifter.image_sha256 = hashlib.sha256(file_data).hexdigest()
     # A single-module executable keeps r2 (TOC) constant, so an `ld r2, N(r1)` TOC
     # restore can be lowered to this literal instead of a stack read (the recomp has
     # no glink stub writing the save slot, so the stack read returns garbage -> r2

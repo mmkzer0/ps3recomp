@@ -41,6 +41,9 @@ uint64_t ppu_thread_register_main(void) { return 1; }
 void (*g_ppu_thread_entry_trampoline)(uint32_t, uint64_t, uint32_t, uint64_t);
 const func_entry function_table[1] = {{0, nullptr, nullptr}};   // no lifted program: registered by hand below
 const uint64_t function_table_count = 0;
+// This fixture never loads an image. If it ever did, no hash would match "" and
+// the loader would stop: the identity gate is not something a fixture opts out of.
+const char* ppu_lift_image_sha256(void) { return ""; }
 uint32_t ps3_hle_count(void) { return 0; }
 void ppu_register_function(uint64_t addr, void (*fn)(ppu_context*));
 void ps3_indirect_call(ppu_context* ctx);

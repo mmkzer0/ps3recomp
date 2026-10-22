@@ -24,6 +24,7 @@
 #include <stdarg.h>
 #include "ppu_recomp.h"
 #include "ps3emu/milestone.h"   /* ps3_ms / ps3_ms_kv -- boot milestone log */
+#include "ps3emu/config.h"      /* ps3_config_load */
 /* PPU_THREAD_LOCAL only -- NOT ppu_context.h, which would redefine the struct
  * a generated ppu_recomp.h already declares. Ports generated before the
  * qualifier existed do not define it, so the scaffold must carry its own
@@ -1085,6 +1086,12 @@ static LONG WINAPI vm_commit_veh(EXCEPTION_POINTERS* ep)
 
 int main(int argc, char** argv)
 {
+    /* The configuration is loaded once, before anything reads an option and
+     * before the executable is loaded (ppu_load_elf checks title.elf_sha256).
+     * A port with its own config file passes its path here; PS3RECOMP_CONFIG
+     * names one for this harness. See docs/CONFIG.md. */
+    ps3_config_load(NULL);
+
     /* <PPU ELF> [--username NAME] [--psnr host[:port]], flags in any order. */
     const char* elf = NULL;
     const char* username = NULL;

@@ -480,6 +480,12 @@ if(PS3RECOMP_BUILD_TESTS)
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_check_commit_msg.py")
         set_tests_properties(check_hygiene check_commit_msg PROPERTIES LABELS "tools;t0")
+        # The lifter records the SHA-256 of the file it lifts; the runtime's
+        # identity gate compares the loaded executable against it.
+        add_test(NAME lifter_identity
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_lifter_identity.py")
+        set_tests_properties(lifter_identity PROPERTIES LABELS "tools;t0")
     endif()
 endif()
 
@@ -573,13 +579,15 @@ if(UNIX)
 
         add_custom_command(
             OUTPUT "${SMOKE_GEN}/smoke.elf" "${SMOKE_GEN}/ppu_recomp.h"
+                   "${SMOKE_GEN}/smoke_identity.c"
             COMMAND "${Python3_EXECUTABLE}"
                     "${CMAKE_CURRENT_SOURCE_DIR}/tools/make_smoke_elf.py"
-                    --out    "${SMOKE_GEN}/smoke.elf"
-                    --header "${SMOKE_GEN}/ppu_recomp.h"
+                    --out      "${SMOKE_GEN}/smoke.elf"
+                    --header   "${SMOKE_GEN}/ppu_recomp.h"
+                    --identity "${SMOKE_GEN}/smoke_identity.c"
             DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tools/make_smoke_elf.py"
                     "${CMAKE_CURRENT_SOURCE_DIR}/tools/ppu_lifter.py"
-            COMMENT "Generating the smoke title's image and ppu_recomp.h")
+            COMMENT "Generating the smoke title's image, ppu_recomp.h and identity")
 
         add_custom_command(
             OUTPUT "${SMOKE_GEN}/ppu_hle_nids.cpp"
@@ -598,6 +606,7 @@ if(UNIX)
             runtime/ppu/ppu_fs.cpp
             runtime/ppu/ppu_sysprx.cpp
             "${SMOKE_GEN}/ppu_hle_nids.cpp"
+            "${SMOKE_GEN}/smoke_identity.c"
             "${SMOKE_GEN}/ppu_recomp.h"
         )
         target_include_directories(ps3recomp_boot_smoke PRIVATE
@@ -627,6 +636,13 @@ if(UNIX)
             set_tests_properties(boot_smoke_vscr_nj_off PROPERTIES
                 ENVIRONMENT "PS3RECOMP_METAL_HEADLESS=1;PS3RECOMP_PPU_VSCR_NJ=0"
                 LABELS "ppu;t0" TIMEOUT 120)
+            # The gate itself, end to end: the title boots from its own image,
+            # and from nothing that is not byte-identical to it.
+            add_test(NAME identity_gate
+                COMMAND "${Python3_EXECUTABLE}"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tests/gates/test_identity.py"
+                        $<TARGET_FILE:ps3recomp_boot_smoke> "${SMOKE_GEN}/smoke.elf")
+            set_tests_properties(identity_gate PROPERTIES LABELS "ppu;t0" TIMEOUT 120)
         endif()
 
         # Where the runnable image lands, so CI and a developer both say
@@ -647,15 +663,19 @@ if(UNIX)
             "${CMAKE_CURRENT_SOURCE_DIR}/runtime/ppu/tests/smoke/smoke_recomp.c")
         add_custom_command(
             OUTPUT "${SMOKE_LIFT}/ppu_recomp.h" "${SMOKE_LIFT}/smoke_recomp.c"
+                   "${SMOKE_LIFT}/smoke_identity.c"
             COMMAND "${CMAKE_COMMAND}" -E make_directory "${SMOKE_LIFT}"
             COMMAND "${CMAKE_COMMAND}" -E copy_if_different
                     "${SMOKE_GEN}/ppu_recomp.h" "${SMOKE_LIFT}/ppu_recomp.h"
             COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                    "${SMOKE_GEN}/smoke_identity.c" "${SMOKE_LIFT}/smoke_identity.c"
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
                     "${SMOKE_LIFT_SRC}" "${SMOKE_LIFT}/smoke_recomp.c"
-            DEPENDS "${SMOKE_GEN}/ppu_recomp.h" "${SMOKE_LIFT_SRC}"
+            DEPENDS "${SMOKE_GEN}/ppu_recomp.h" "${SMOKE_GEN}/smoke_identity.c" "${SMOKE_LIFT_SRC}"
             COMMENT "Staging the smoke title's lift as a RECOMP_DIR")
         add_custom_target(ps3recomp_smoke_lift ALL
-            DEPENDS "${SMOKE_LIFT}/ppu_recomp.h" "${SMOKE_LIFT}/smoke_recomp.c")
+            DEPENDS "${SMOKE_LIFT}/ppu_recomp.h" "${SMOKE_LIFT}/smoke_recomp.c"
+                    "${SMOKE_LIFT}/smoke_identity.c")
         message(STATUS "  Smoke lift:   smoke/lift (a RECOMP_DIR for templates/project)")
     endif()
 endif()

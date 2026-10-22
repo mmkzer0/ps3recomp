@@ -28,6 +28,7 @@ N_CHUNKS = 8
 
 def make_lifter(bodies=None, long=False):
     lf = PPULifter()
+    lf.image_sha256 = "5a" * 32   # the lifter will not write output without an image identity
     addr = 0x10000
     for i in range(N_FUNCS):
         size = 0x20 + (i % 7) * 0x40   # uneven guest sizes, as in a real image

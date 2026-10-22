@@ -56,7 +56,10 @@ two parts:
 
 **Runtime (`runtime/ppu/ppu_loader.cpp`)** — provides what the lifted code needs:
 - big-endian guest memory accessors (`vm_read8/16/32/64`, `vm_write*`),
-- `ppu_load_elf(path)` — copies `PT_LOAD` into `vm_base + vaddr`, zeroes BSS,
+- `ppu_load_elf(path)` — first checks the file against the SHA-256 the lifter
+  recorded (`ppu_lift_image_sha256()` in the generated output; any other file
+  stops with `identity-mismatch`, see `docs/STOPS.md`), then copies `PT_LOAD`
+  into `vm_base + vaddr`, zeroes BSS,
 - the address → function registry (populated by `ppu_recomp_register()`),
 - `ps3_indirect_call(ctx)` — dispatches `ctx->ctr` (an already-OPD-resolved code
   address) through the registry,

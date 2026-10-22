@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Loaded ELF data and BSS must survive user and mapper allocations."""
+import hashlib
 import os
 from pathlib import Path
 import struct
@@ -56,7 +57,9 @@ def main():
                         str(obj), *flags, '-o', str(binary)], check=True, timeout=120)
         env = {k: v for k, v in os.environ.items()
                if not k.startswith(('PPU_', 'PS3_', 'PS3RECOMP_', 'SPU_'))}
-        subprocess.run([str(binary), str(elf), str(empty)], env=env, check=True, timeout=20)
+        sha = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()   # not the runtime's own SHA-256
+        subprocess.run([str(binary), str(elf), sha(elf), str(empty), sha(empty)],
+                       env=env, check=True, timeout=20)
 
 
 if __name__ == '__main__':

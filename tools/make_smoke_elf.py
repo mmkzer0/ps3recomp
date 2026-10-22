@@ -35,11 +35,17 @@ header's preamble is imported from ppu_lifter.py rather than copied, the way
 tools/check_ppu_scaffold.py does it, so it is the real lifted ABI and not a
 lookalike that can drift from it.
 
+--identity writes the C source that defines ppu_lift_image_sha256() for the
+image, the function ppu_lifter.py's output carries for a real title and
+ppu_load_elf checks the loaded file against.
+
   python tools/make_smoke_elf.py --out build/smoke/smoke.elf \
-                                 --header build/smoke/ppu_recomp.h
+                                 --header build/smoke/ppu_recomp.h \
+                                 --identity build/smoke/smoke_identity.c
 """
 
 import argparse
+import hashlib
 import importlib.util
 import os
 import struct
@@ -202,17 +208,36 @@ def build_header() -> str:
     return "\n".join(lines)
 
 
+def build_identity(elf: bytes) -> str:
+    """The smoke image's identity, as ppu_lifter.py records it for a real one.
+
+    A lifted title carries ppu_lift_image_sha256() in its generated source;
+    this title's source is hand-written, so the same function is generated here
+    from the image it is loaded with, and ppu_load_elf checks the two against
+    each other exactly as it does for a game.
+    """
+    digest = hashlib.sha256(elf).hexdigest()
+    return ("/* Written by tools/make_smoke_elf.py: the identity of the smoke title's\n"
+            " * image, where a lifted title has the one ppu_lifter.py records. */\n"
+            '#include "ppu_recomp.h"\n'
+            f'const char* ppu_lift_image_sha256(void) {{ return "{digest}"; }}\n')
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", help="write the ELF image here")
     ap.add_argument("--header", help="write the smoke title's ppu_recomp.h here")
+    ap.add_argument("--identity", help="write the C source defining the image's "
+                                       "ppu_lift_image_sha256() here")
     args = ap.parse_args()
 
-    if not args.out and not args.header:
-        ap.error("nothing to do: pass --out, --header or both")
+    if not args.out and not args.header and not args.identity:
+        ap.error("nothing to do: pass --out, --header, --identity or a combination")
 
-    for path, blob in ((args.out, build_elf()),
-                       (args.header, build_header())):
+    elf = build_elf()
+    for path, blob in ((args.out, elf),
+                       (args.header, build_header()),
+                       (args.identity, build_identity(elf))):
         if not path:
             continue
         d = os.path.dirname(os.path.abspath(path))

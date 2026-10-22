@@ -56,6 +56,8 @@
 #include <timeapi.h>
 #endif
 
+#include "ps3emu/config.h"   /* ps3_config_load */
+
 /* ---------------------------------------------------------------------------
  * What the scaffold gives this file
  * -----------------------------------------------------------------------*/
@@ -325,6 +327,13 @@ static void harness_guest_caller(uint32_t opd, uint64_t a0, uint64_t a1,
 
 int main(int argc, char** argv)
 {
+    /* Configuration, loaded once and first: before any option is read and before
+     * the executable is loaded (ppu_load_elf checks title.elf_sha256 against the
+     * hash the lifter recorded). Pass this title's own config file, e.g.
+     * "title.toml", or NULL for none; PS3RECOMP_CONFIG=<path> names one at run
+     * time. See docs/CONFIG.md. */
+    ps3_config_load(NULL);
+
     if (argc < 2) {
         printf("usage: %s <PPU ELF>\n", argv[0]);
         return 2;

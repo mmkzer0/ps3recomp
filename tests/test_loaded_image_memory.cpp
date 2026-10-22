@@ -24,6 +24,12 @@ int64_t sys_mmapper_allocate_memory(ppu_context*);
 struct func_entry { uint32_t addr; void (*func)(ppu_context*); const char* name; };
 extern const func_entry function_table[] = {{0, nullptr, nullptr}};
 extern const uint64_t function_table_count = 0;
+/* The identity a lift records, standing in for the generated function: each
+ * image this fixture loads is announced with the SHA-256 the test computed
+ * independently (hashlib), and the production gate checks the file against it. */
+static char g_image_sha[65];
+extern "C" const char* ppu_lift_image_sha256(void) { return g_image_sha; }
+static void announce(const char* sha) { std::snprintf(g_image_sha, sizeof g_image_sha, "%s", sha); }
 static lv2_syscall_table table;
 static unsigned checks;
 #define CHECK(x) do { ++checks; if (!(x)) { std::fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #x); return 1; } } while (0)
@@ -40,11 +46,12 @@ static int64_t allocate(uint32_t size)
 }
 int main(int argc, char** argv)
 {
-    CHECK(argc == 3);
+    CHECK(argc == 5);   /* <elf> <its sha256> <replacement elf> <its sha256> */
     vm_base = (uint8_t*)mmap(nullptr, 0xE0000000ull, PROT_READ | PROT_WRITE,
                             MAP_PRIVATE | MAP_ANON, -1, 0);
     CHECK(vm_base != MAP_FAILED);
     ppu_vm_size = 0xE0000000u;
+    announce(argv[2]);
     CHECK(ppu_load_elf(argv[1]) == 0x10000);
     /* Match boot_main: syscall initialization follows ELF loading. */
     sys_memory_init(&table);
@@ -82,7 +89,8 @@ int main(int argc, char** argv)
     CHECK(vm_base[0x4020FFFF] == 0x5A);
     CHECK(!std::memcmp(vm_base + 0x40000000, "MAPS", 4));
     /* Replacing the executable replaces the range list, without stale holes. */
-    CHECK(ppu_load_elf(argv[2]) == 0x10000);
+    announce(argv[4]);
+    CHECK(ppu_load_elf(argv[3]) == 0x10000);
     sys_memory_init(&table);
     CHECK(allocate(0x100000) == CELL_OK);
     CHECK(output() == 0x10000000u);

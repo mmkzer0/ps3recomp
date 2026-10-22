@@ -1,5 +1,12 @@
 # Changelog
 
+### Unreleased
+
+- **Named stops** (`ps3emu/stop.h`, `docs/STOPS.md`): one `PS3STOP v=1 kind=...` line plus a banner, exit status 70.
+- **Typed, versioned config** (`ps3emu/config.h`, `docs/CONFIG.md`): default < TOML file < `PS3RECOMP_<SECTION>_<KEY>`, effective-config dump, unknown keys and unknown `PS3RECOMP_*` variables stop. Vendors toml++ 3.4.0.
+- **`ppu.vscr_nj`** (default true, RPCS3 parity; a policy, not a hardware fact) is applied to every guest PPU context. `ppu_context_init` applies it; `ppu_context_clear` is the raw zeroing.
+- **Identity gate**: the lifter records the SHA-256 of its input as `ppu_lift_image_sha256()`; `ppu_load_elf` refuses any other file. Titles must re-lift, call `ps3_config_load()` first in `main()`, and link the runtime library's new modules.
+
 ### v0.14.0 — *"Outside In"* (October 2026)
 
 *This release is mostly community work: 28 pull requests from five

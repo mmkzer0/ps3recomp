@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Run the real PPU ELF loader/entry path against an overlapping synthetic image."""
+import hashlib
 import os
 from pathlib import Path
 import struct
@@ -9,6 +10,10 @@ import tempfile
 from check_ppu_scaffold import loader_support_sources, stub_header
 
 ROOT = Path(__file__).resolve().parents[1]
+
+def sha(path):
+    """The image's SHA-256, computed here rather than by the runtime under test."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 def image(overlap_stack=False):
     # Entry OPD + a PT_LOAD sentinel exactly where the old argv scratch lived.
@@ -51,12 +56,12 @@ def main():
             elf = tmp/(label+'.elf'); elf.write_bytes(image(bad_stack))
             run_env = dict(env)
             if extras: run_env['PS3_ARGV'] = 'alpha;beta'
-            subprocess.run([str(binary), str(elf), 'reject' if bad_stack else 'run'], env=run_env, check=True, timeout=15)
+            subprocess.run([str(binary), str(elf), 'reject' if bad_stack else 'run', sha(elf)], env=run_env, check=True, timeout=15)
         elf = tmp/'single.elf'
         for mode in ['low', 'outside']:
-            subprocess.run([str(binary), str(elf), mode], env=env, check=True, timeout=15)
+            subprocess.run([str(binary), str(elf), mode, sha(elf)], env=env, check=True, timeout=15)
         large_env = dict(env, PS3_BOOT_PATH='x'*65536)
-        subprocess.run([str(binary), str(elf), 'reject'], env=large_env, check=True, timeout=15)
+        subprocess.run([str(binary), str(elf), 'reject', sha(elf)], env=large_env, check=True, timeout=15)
         print('PASS: image/heap preserved, argv/env ABI and frame lifetime, invalid storage rejected')
 
 if __name__ == '__main__':

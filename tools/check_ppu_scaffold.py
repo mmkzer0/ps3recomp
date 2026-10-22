@@ -98,12 +98,15 @@ def stub_header() -> str:
     )
 
 
-# Runtime translation units a bare fixture must link beside ppu_loader.cpp or
-# ppu_hle.cpp. Both are compiled per game, outside the ps3recomp_runtime
-# library, yet call into modules that live in it: a title gets those from the
-# library, and a fixture that compiles the scaffold by hand has to name them.
+# Runtime translation units a bare fixture must link beside ppu_loader.cpp. The
+# loader is compiled per game, outside the ps3recomp_runtime library, yet calls
+# into modules that live in it: a title gets those from the library, and a
+# fixture that compiles the loader by hand has to name them.
 LOADER_SUPPORT_SOURCES = [
     "runtime/diag/stop.cpp",
+    "runtime/diag/sha256.cpp",
+    "runtime/config/config.cpp",
+    "runtime/config/identity.cpp",
 ]
 
 

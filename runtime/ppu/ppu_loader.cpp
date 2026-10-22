@@ -37,6 +37,7 @@
 #include "ps3emu/ps3_ftrace.h"   /* PS3_FTRACE timeline */
 #include "ps3emu/stop.h"         /* ps3_stop, ps3_stop_register_frontier */
 #include "ps3emu/config.h"       /* ps3_ppu_initial_vscr */
+#include "ps3emu/identity.h"     /* ps3_identity_check_image */
 #include "ps3emu/milestone.h"   /* ps3_ms / ps3_msf -- boot milestone log */     /* ppu_context, func decls, ppu_recomp_register */
 #include "../memory/vm.h"   /* vm_commit -- sys_mmapper_search_and_map maps for real */
 #include "../platform/win32_compat.h"      /* Win32 types, interlocked ops, Sleep/QPC on POSIX */
@@ -3420,10 +3421,16 @@ extern "C" uint32_t ppu_load_elf(const char* path)
     if (!f) { fprintf(stderr, "[ppu] cannot open %s\n", path); return 0; }
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
+    if (sz < 0) { fclose(f); fprintf(stderr, "[ppu] cannot size %s\n", path); return 0; }
     fseek(f, 0, SEEK_SET);
-    uint8_t* file = (uint8_t*)malloc(sz);
+    uint8_t* file = (uint8_t*)malloc(sz ? (size_t)sz : 1);   /* an empty file must still reach the identity check */
     if (!file || fread(file, 1, sz, f) != (size_t)sz) { fclose(f); free(file); return 0; }
     fclose(f);
+
+    /* Identity before anything is read as an ELF: the lift this loader is linked
+     * with (ppu_lift_image_sha256) is valid for exactly the file it was made
+     * from, and any other file stops here, naming both hashes. */
+    ps3_identity_check_image(path, file, (size_t)sz, ppu_lift_image_sha256());
 
     if (sz < 64 || memcmp(file, "\x7F""ELF", 4) != 0 || file[4] != 2 /*ELFCLASS64*/ || file[5] != 2 /*MSB*/) {
         fprintf(stderr, "[ppu] not a 64-bit big-endian ELF\n"); free(file); return 0;

@@ -27,6 +27,11 @@ uint64_t ppu_thread_register_main(void) { return 1; }
 void (*g_ppu_thread_entry_trampoline)(uint32_t, uint64_t, uint32_t, uint64_t);
 }
 static unsigned failures;
+// The identity a lift records, standing in for the generated function: the test
+// computes the image's SHA-256 independently and announces it here, and the
+// production gate checks the file ppu_load_elf reads against it.
+static char g_image_sha[65];
+extern "C" const char* ppu_lift_image_sha256(void) { return g_image_sha; }
 static unsigned called;
 static void check(bool ok, const char* what) {
     if (!ok) { std::fprintf(stderr,"FAIL: %s\n",what); ++failures; }
@@ -57,10 +62,11 @@ static void entry(ppu_context* ctx) {
 extern const func_entry function_table[]={{0x10000,entry,"entry"},{0,nullptr,nullptr}};
 extern const uint64_t function_table_count=1;
 int main(int argc,char** argv) {
-    if(argc!=3)return 2;
+    if(argc!=4)return 2;   // <elf> <mode> <the elf's sha256, computed by the test>
     vm_base=(uint8_t*)mmap(nullptr,0xE0000000ull,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0);
     if(vm_base==MAP_FAILED)return 2;
     ppu_vm_size=0xE0000000u;
+    std::snprintf(g_image_sha,sizeof g_image_sha,"%s",argv[3]);
     uint32_t opd=ppu_load_elf(argv[1]);
     if(!opd)return 2;
     ppu_recomp_register();
