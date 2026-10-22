@@ -47,6 +47,22 @@ def code_ranges(elf):
     return rs
 
 
+def code_end(elf):
+    """Exclusive end of executable code.
+
+    Section headers are authoritative when present: the highest end of an
+    SHF_EXECINSTR section is the end of .text, so a data section that happens
+    to sit in an R-X PT_LOAD (retail EBOOTs put .rodata there) is not lifted
+    as code. Section-stripped images fall back to the executable segments'
+    end, which is the same bound `ppu_lifter.py --code-end` needs."""
+    ends = [s.sh_addr + s.sh_size
+            for s in getattr(elf, "section_headers", []) or []
+            if (s.sh_flags & 0x4) and s.sh_size and s.sh_type != 8]
+    if not ends:
+        ends = [hi for _, hi in code_ranges(elf)]
+    return max(ends) if ends else 0
+
+
 def in_ranges(addr, rs):
     return any(lo <= addr < hi for lo, hi in rs)
 
@@ -179,10 +195,17 @@ def main():
     ap = argparse.ArgumentParser(description="PS3 PPU loader (image + OPD + TOC + functions)")
     ap.add_argument("input")
     ap.add_argument("--output", "-o", default="ppu_loader_out")
+    ap.add_argument("--code-end", action="store_true",
+                    help="Print the exclusive end of executable code and exit. "
+                         "Section headers when present, else the executable "
+                         "PT_LOAD end: the value for ppu_lifter.py --code-end.")
     args = ap.parse_args()
 
     elf = ELFFile(args.input)
     elf.load()
+    if args.code_end:
+        print(f"0x{code_end(elf):X}")
+        return
     h = elf.elf_header
     entry = h.e_entry
     crange = code_ranges(elf)
@@ -235,6 +258,7 @@ def main():
               "opd_base": hex(opd_va) if opd_va else None,
               "opd_size": hex(opd_size) if opd_size else None,
               "opd_count": len(opd_entries), "function_count": len(func_addrs),
+              "code_end": hex(code_end(elf)),
               "e_type": h.e_type, "load_segments": len(image)}
     with open(os.path.join(args.output, name + ".loader.json"), "w") as f:
         json.dump(loader, f, indent=1)
@@ -250,6 +274,7 @@ def main():
     print(f"e_type           : {h.e_type} ({'EXEC' if h.e_type==2 else 'DYN' if h.e_type==3 else '?'})")
     print(f"entry (OPD)      : {hex(entry)} -> code {hex(entry_code)}, toc {hex(entry_toc)}")
     print(f"module TOC (r2)  : {hex(module_toc)}")
+    print(f"code end         : {hex(code_end(elf))} (exclusive; ppu_lifter --code-end)")
     print(f"OPD region       : {hex(opd_va) if opd_va else '?'} size {hex(opd_size) if opd_size else '?'}")
     print(f"OPD descriptors  : {len(opd_entries)}")
     print(f"unique functions : {len(func_addrs)}")
