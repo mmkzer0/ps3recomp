@@ -53,10 +53,10 @@ target_link_libraries(test_reservation PRIVATE Threads::Threads m)
 add_test(NAME reservation_contract COMMAND test_reservation contract)
 set_tests_properties(reservation_contract PROPERTIES LABELS "memory;t0;tsan" TIMEOUT 120)
 
-# jq2 is three retry loops on one line: under TSan on a 3-vCPU CI runner its
-# wall time swung from 2 s to over 300 s at 10^6 (dev-ci 40038567537), from
-# contention, not a lost update. The short run is 2 * 10^5; the stress tier
-# keeps 10^8.
+# jq2 is three retry loops on one line: at 10^6 its TSan wall time on a 3-vCPU
+# CI runner went from 130 s to a 300 s timeout (dev-ci 40037474605,
+# 40038567537; 20 s locally, 2 s without TSan), from contention, not a lost
+# update. The short run is 2 * 10^5; the stress tier keeps 10^8.
 add_test(NAME reservation_jq2 COMMAND test_reservation jq2 200000)
 add_test(NAME reservation_aba_ppu COMMAND test_reservation aba_ppu 1000000)
 add_test(NAME reservation_aba_spu COMMAND test_reservation aba_spu 1000000)
