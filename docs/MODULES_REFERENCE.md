@@ -128,6 +128,10 @@ This is the most critical module. It provides:
 - `_sys_memset`, `_sys_memcpy`, `_sys_memmove`
 - `_sys_strlen`, `_sys_strcmp`, `_sys_strncmp`, `_sys_strcpy`, `_sys_strncpy`, `_sys_strcat`
 
+**SPU printf server hooks** (`libs/system/sys_spu_printf.c`):
+- `_sys_spu_printf_initialize` stores four guest callback OPDs; `_sys_spu_printf_attach_group`/`detach_group`/`attach_thread`/`detach_thread` call the matching one through `ppu_guest_call` and return its result, or `CELL_ESTAT` while it is not registered; `_sys_spu_printf_finalize` clears them
+- State is process-global behind one lock; the guest callback runs with the lock released
+
 ### cellSysmodule
 
 **File:** `libs/system/cellSysmodule.c`

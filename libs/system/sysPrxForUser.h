@@ -113,6 +113,20 @@ s32 _sys_toupper(s32 c);
 s32 _sys_tolower(s32 c);
 
 /* ---------------------------------------------------------------------------
+ * SPU printf server hooks (defined in sys_spu_printf.c, which documents the
+ * semantics). The callback arguments are guest OPD addresses, not host
+ * function pointers; attach/detach return CELL_ESTAT while the matching
+ * callback is not registered, else the callback's own result.
+ * -----------------------------------------------------------------------*/
+
+s32 _sys_spu_printf_initialize(u32 agcb, u32 dgcb, u32 atcb, u32 dtcb);
+s32 _sys_spu_printf_finalize(void);
+s32 _sys_spu_printf_attach_group(u32 group);
+s32 _sys_spu_printf_detach_group(u32 group);
+s32 _sys_spu_printf_attach_thread(u32 thread);
+s32 _sys_spu_printf_detach_thread(u32 thread);
+
+/* ---------------------------------------------------------------------------
  * Lightweight mutex
  * -----------------------------------------------------------------------*/
 
