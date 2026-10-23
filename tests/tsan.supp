@@ -23,3 +23,10 @@ race:t1_watchdog
 race:t1b_watchdog
 race:t3_monitor
 race:t4b_receiver
+# runtime/ppu/ppu_hle.cpp: ps3_hle_call stamps its g_last_hle_nid / g_last_hle_name
+# breadcrumbs (plain globals every guest thread writes, read by the watchdog) on
+# entry. Not a lwmutex or lwcond race: tests/lwsync dispatches through
+# ps3_hle_call from several threads, and race_top matches only reports whose
+# top frame is ps3_hle_call itself, so a race inside a handler still fails.
+# Owned by the HLE call ABI slice, which rewrites that function.
+race_top:ps3_hle_call

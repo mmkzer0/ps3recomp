@@ -40,6 +40,10 @@ ppu_loader.cpp against that lift, and runs tests/test_loader_gaps.cpp:
     is released when it exits; a callback that cannot be given a stack (r1 that
     is no stack address, a VM below the host stack window, a host slot nested
     out of room) stops (unresolved-guest-callback, origin stack).
+  - a host thread with no guest context has a guest thread id of its own for its
+    callbacks (kept for life, never reused, outside every real thread id), so two
+    of them running at once are two owners to an lwmutex: one that holds it blocks
+    the other, and the other's trylock is EBUSY and its unlock EPERM;
 
 A line "RETURNED" from the fixture means the runtime carried on; every case that
 must stop treats it as failure.
@@ -100,10 +104,11 @@ def main():
                        check=True, capture_output=True)
         flags = ['-Wl,-dead_strip'] if sys.platform == 'darwin' else ['-Wl,--gc-sections', '-pthread', '-ldl']
         binary = tmp / 'gaps'
-        subprocess.run([os.environ.get('CXX', 'c++'), '-std=c++17', '-O1', '-w', '-ffunction-sections',
+        subprocess.run([os.environ.get('CXX', 'c++'), '-std=c++20', '-O1', '-w', '-ffunction-sections',
                         '-fdata-sections', '-I' + str(lift), '-I' + str(ROOT / 'include'),
                         '-I' + str(ROOT / 'runtime/ppu'), '-I' + str(ROOT / 'runtime/platform'),
                         str(ROOT / 'runtime/ppu/ppu_loader.cpp'), str(ROOT / 'tests/test_loader_gaps.cpp'),
+                        str(ROOT / 'runtime/syscalls/sys_lwsync.cpp'),
                         str(lift / 'ppu_recomp.cpp'), *loader_support_sources(), *flags, '-o', str(binary)],
                        check=True, timeout=300)
 
@@ -283,6 +288,9 @@ def main():
         # Every active host-initiated callback has stack space no other frame uses
         p = run('cbstack', '0')
         assert p.returncode == 0 and 'CBSTACK OK' in p.stdout, (p.stdout, p.stderr)
+        # Two host threads with no guest context: distinct, stable, never-reused thread ids
+        p = run('hostid', '0')
+        assert p.returncode == 0 and 'HOSTID OK' in p.stdout, (p.stdout, p.stderr)
         p = run('cbexhaust', '0')
         assert 'RETURNED' not in p.stdout, (p.stdout, p.stderr)
         f = g.expect_stop(p, 'unresolved-guest-callback')
@@ -306,7 +314,7 @@ def main():
             assert f['origin'] == 'stack' and 'left its host callback stack slot' in f['hint'], (below, f)
     print('PASS: unimplemented syscall, unlifted call, unresolved indirect call, dispatch depth, '
           'OPD swap, unresolved guest callback and unknown instruction all stop; host-initiated '
-          'callbacks get distinct, non-overlapping guest stacks')
+          'callbacks get distinct, non-overlapping guest stacks and their own thread ids')
     return 0
 
 

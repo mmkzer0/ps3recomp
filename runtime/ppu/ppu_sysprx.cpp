@@ -17,10 +17,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-/* win32_compat.h is <windows.h> on Windows (CRITICAL_SECTION for the real
- * lwmutex exclusion) and the POSIX shims elsewhere -- Sleep, DWORD, QPC. */
+/* win32_compat.h is <windows.h> on Windows and the POSIX shims elsewhere --
+ * Sleep, DWORD, QPC. */
 #include "../platform/win32_compat.h"
 #include "../memory/vm.h"   /* VM_HLE_INJECT_BASE -- not platform-specific */
+#include "../syscalls/sys_lwsync.h"   /* ps3_lwsync_register */
 #include "ps3emu/log_first.h"
 
 extern "C" uint8_t* vm_base;
@@ -84,290 +85,6 @@ static void sys_process_is_stack(ppu_context* ctx)
     ctx->gpr[3] = (a >= 0x0E000000u && a < 0x10000000u) ? 1 : 0;
 }
 
-/* ---------------------------------------------------------------------------
- * Lightweight mutex (sys_lwmutex) — sysPrxForUser.
- *
- * The CRT guards global/singleton initialization with lwmutexes. If create is
- * a no-op that never initializes the structure, the guarded init is skipped
- * and the protected registry is left with null function pointers (the early
- * boot then spins calling a null vtable entry). We model the structure for
- * real, and lock it for real (see "REAL mutual exclusion" below).
- *
- * sys_lwmutex_t (big-endian, 24 bytes):
- *   +0x00 owner (u32)   +0x04 waiter (u32)   +0x08 attribute (u32)
- *   +0x0C recursive_count (u32)   +0x10 sleep_queue (u32)   +0x14 pad
- * sys_lwmutex_attribute_t: +0x00 protocol  +0x04 recursive  +0x08 name[8]
- * -----------------------------------------------------------------------*/
-#define LWM_OWNER  0x00
-#define LWM_ATTR   0x08
-#define LWM_RECUR  0x0C
-/* Owner id = ctx->thread_id, which is nonzero for every thread since main
- * registers as id 1 (ppu_thread_register_main). The old 0->1 fallback made
- * main alias the FIRST CREATED thread: each passed the other's recursive
- * re-lock check, both "owned" the lock, and (LBP) main + bringup emitted GCM
- * concurrently -- fences vanished mid-ring. A zero id now means an
- * unregistered context (bug); stamp a sentinel that matches no real thread. */
-#define LWM_SELF(ctx) ((uint32_t)(ctx)->thread_id ? (uint32_t)(ctx)->thread_id : 0x7FFFFFFEu)
-
-static HANDLE lwm_sem(uint32_t addr);   /* fwd (defined below) */
-static void sys_lwmutex_create(ppu_context* ctx)
-{
-    uint32_t lwm  = (uint32_t)ctx->gpr[3];
-    uint32_t attr = (uint32_t)ctx->gpr[4];
-    { static long long _n=0; _n++;
-      if (getenv("LWM_COUNT") && (_n<=24 || (_n%50000)==0))
-        fprintf(stderr, "[LWM] create #%lld lwm=0x%08X attr=0x%08X\n", _n, lwm, attr); }
-    uint32_t protocol = attr ? vm_read32(attr + 0) : 0;
-    vm_write32(lwm + 0x00, 0);          /* owner */
-    vm_write32(lwm + 0x04, 0);          /* waiter */
-    vm_write32(lwm + LWM_ATTR, protocol);
-    vm_write32(lwm + LWM_RECUR, 0);     /* recursive_count */
-    vm_write32(lwm + 0x10, 0);          /* sleep_queue */
-    vm_write32(lwm + 0x14, 0);
-    /* A recreate at a reused address must not inherit a locked slot (e.g. the
-     * previous holder exited while holding). Force the semaphore signaled;
-     * over-release of an already-free sem fails harmlessly at max count 1. */
-    { HANDLE s = lwm_sem(lwm); if (s) ReleaseSemaphore(s, 1, NULL); }
-    ctx->gpr[3] = 0;
-}
-/* REAL mutual exclusion. The old no-op ("boot is single-threaded") corrupted
- * every lwmutex-protected structure once LBP spun up its worker/loader threads --
- * notably the dlmalloc mspace behind the game's big-allocator, whose tree then
- * fell apart and reported OOM on a tiny request with 100+ MB free.
- *
- * The same on every host: on POSIX the semaphore is win32_compat's. This was
- * Windows-only for a while, which left every lwmutex on Linux a bare owner
- * stamp -- Twisted Metal's FIOS layer then freed one block from two threads
- * and its dlmalloc free() aborted on a chunk already merged into top.
- *
- * Backed by a binary SEMAPHORE, not a CRITICAL_SECTION: a CS may only be
- * released by its owning thread, but guest code passes lwmutex ownership
- * between threads (LBP's job system) and threads exit while holding -- one
- * cross-thread unlock silently failed and the still-owned CS parked the next
- * locker forever (the Network-node hang). A semaphore releases from any
- * thread. Recursion is handled explicitly via the guest owner/recur fields
- * we stamp (only the holder ever writes owner=self, so the re-lock check is
- * race-free). Keyed by guest address in an open-addressed table. */
-#define LWM_HASH 65536u
-static struct LwmSlot { volatile long addr; HANDLE sem;
-    volatile long holder; volatile long long acq_us; volatile long long acq_fences;
-    volatile unsigned long long acq_cpu_us; } g_lwm[LWM_HASH];
-extern "C" { extern volatile long long g_gcm_ref_pub_count;    /* cellGcmSys.c */
-             unsigned long long ppu_thread_cpu_us(unsigned tid);   /* sys_ppu_thread.c */
-             unsigned ppu_thread_prof_pc(unsigned tid); }
-static volatile long g_lwm_tab_lock = 0;
-/* PS3_LWMUTEX_TRACE=1: reconstruct the lwmutex lock-convoy that stalls LBP's loader.
- * Records, per mutex, the acquiring tid + a QPC microsecond timestamp; on a
- * contended block it logs who holds it and for how long; on unlock it flags a
- * long hold. The leaf holder (the one blocked on a non-lwmutex wait) is the
- * convoy root. Default OFF. */
-static int lwm_trace(void){ static int v=-1; if(v<0){const char*e=getenv("PS3_LWMUTEX_TRACE"); v=e?1:0;} return v; }
-static long long lwm_now_us(void){
-    static LARGE_INTEGER freq={0}; if(!freq.QuadPart) QueryPerformanceFrequency(&freq);
-    LARGE_INTEGER c; QueryPerformanceCounter(&c);
-    /* Seconds and remainder apart: on POSIX the frequency is 1e9, and the
-     * counter times 1e6 overflows after a few hours of uptime. */
-    return (long long)((c.QuadPart/freq.QuadPart)*1000000ll + (c.QuadPart%freq.QuadPart)*1000000ll/freq.QuadPart);
-}
-/* Find an EXISTING slot (no create) for hold-tracking. */
-static struct LwmSlot* lwm_find(uint32_t addr){
-    if(!addr) return nullptr;
-    uint32_t h=(addr*2654435761u)&(LWM_HASH-1);
-    for(uint32_t i=0;i<LWM_HASH;i++){ uint32_t idx=(h+i)&(LWM_HASH-1);
-        long cur=g_lwm[idx].addr;
-        if((uint32_t)cur==addr) return &g_lwm[idx];
-        if(cur==0) return nullptr; }
-    return nullptr;
-}
-static HANDLE lwm_sem(uint32_t addr)
-{
-    if (!addr) return nullptr;
-    uint32_t h = (addr * 2654435761u) & (LWM_HASH - 1);
-    for (uint32_t i = 0; i < LWM_HASH; i++) {
-        uint32_t idx = (h + i) & (LWM_HASH - 1);
-        long cur = g_lwm[idx].addr;
-        if ((uint32_t)cur == addr) return g_lwm[idx].sem;
-        if (cur == 0) {
-            while (_InterlockedExchange(&g_lwm_tab_lock, 1)) YieldProcessor();
-            HANDLE r = nullptr;
-            if (g_lwm[idx].addr == 0) {
-                g_lwm[idx].sem = CreateSemaphoreA(NULL, 1, 1, NULL); /* free */
-                g_lwm[idx].addr = (long)addr;   /* publish AFTER init (x86 TSO: readers see init) */
-                r = g_lwm[idx].sem;
-            } else if ((uint32_t)g_lwm[idx].addr == addr) {
-                r = g_lwm[idx].sem;
-            }
-            _InterlockedExchange(&g_lwm_tab_lock, 0);
-            if (r) return r;
-            /* someone else claimed this slot for a different addr -> keep probing */
-        }
-    }
-    return nullptr;   /* table full (raise LWM_HASH) */
-}
-/* Contention-probe window flag: 0 by default (prints stay bounded). A title's
- * diagnostic code may set it around a suspect wait to uncap the [LWM-BLOCK]
- * logging during that window only (park hunts: gate on state, not counts). */
-volatile int g_nd_inpump = 0;
-static void sys_lwmutex_lock(ppu_context* ctx)
-{
-    uint32_t lwm = (uint32_t)ctx->gpr[3];
-    uint32_t self = LWM_SELF(ctx);
-    /* lv2 ABI: r4 = timeout in microseconds, 0 = infinite. The real kernel
-     * returns ETIMEDOUT (0x8001000B) when the wait expires; games rely on that
-     * (e.g. LBP's resource loader locks with a 2s timeout in a retry loop so a
-     * contended lock yields to other threads instead of hard-blocking). We had
-     * been ignoring r4 and always waiting INFINITE, which defeats that pattern. */
-    uint64_t timeout_us = ctx->gpr[4];
-    HANDLE s = lwm_sem(lwm);
-    if (s) {
-        /* Recursive re-lock by the current holder: bump the count, no wait.
-         * Only the holder ever stamps owner=self, so this check is race-free. */
-        if (vm_read32(lwm + LWM_OWNER) == self && vm_read32(lwm + LWM_RECUR) > 0) {
-            vm_write32(lwm + LWM_RECUR, vm_read32(lwm + LWM_RECUR) + 1);
-            ctx->gpr[3] = 0;
-            return;
-        }
-        if (WaitForSingleObject(s, 0) != WAIT_OBJECT_0) {
-            /* Contended: log who we're stuck behind (owner stamped at acquire),
-             * then block. Bounded diagnostics for park hunts; uncapped while the
-             * probe window is open (g_nd_inpump). */
-            static long _bl = 0; long _b = ++_bl;
-            if (g_nd_inpump || _b <= 40) fprintf(stderr, "[LWM-BLOCK] tid=%llu lwm=0x%08X owner=%u recur=%u tmo=%lluus\n",
-                (unsigned long long)ctx->thread_id, lwm, vm_read32(lwm + LWM_OWNER), vm_read32(lwm + LWM_RECUR),
-                (unsigned long long)timeout_us);
-            if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm);
-                long h = sl ? sl->holder : 0; long long held = (sl && h) ? (lwm_now_us() - sl->acq_us) : 0;
-                fprintf(stderr, "[LWM-CONVOY] tid=%llu BLOCKs lwm=0x%08X -> held-by-tid=%ld for %lldus (guest-owner=%u)\n",
-                    (unsigned long long)ctx->thread_id, lwm, h, held, vm_read32(lwm + LWM_OWNER)); fflush(stderr); }
-            long long _blk_start = lwm_trace() ? lwm_now_us() : 0;
-            DWORD ms = INFINITE;
-            if (timeout_us) { uint64_t m = (timeout_us + 999) / 1000; ms = m > 0xFFFFFFFEull ? 0xFFFFFFFEu : (DWORD)m; }
-            DWORD wr = WaitForSingleObject(s, ms);
-            if (wr == WAIT_TIMEOUT) {           /* honor the timeout: ETIMEDOUT, no acquire */
-                if (lwm_trace()) fprintf(stderr, "[LWM-CONVOY] tid=%llu TIMED-OUT on lwm=0x%08X after %lldus (ETIMEDOUT, retry)\n",
-                    (unsigned long long)ctx->thread_id, lwm, lwm_now_us() - _blk_start);
-                ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Bu;
-                return;
-            }
-            if (lwm_trace()) fprintf(stderr, "[LWM-CONVOY] tid=%llu ACQUIRED lwm=0x%08X after waiting %lldus\n",
-                (unsigned long long)ctx->thread_id, lwm, lwm_now_us() - _blk_start);
-            if (g_nd_inpump || _b <= 40) fprintf(stderr, "[LWM-GOT] tid=%llu lwm=0x%08X\n", (unsigned long long)ctx->thread_id, lwm);
-        }
-    }
-    if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm); if (sl) { sl->holder = (long)self; sl->acq_us = lwm_now_us(); sl->acq_fences = g_gcm_ref_pub_count; sl->acq_cpu_us = ppu_thread_cpu_us(self); } }
-    vm_write32(lwm + LWM_OWNER, self);
-    vm_write32(lwm + LWM_RECUR, 1);
-    ctx->gpr[3] = 0;   // CELL_OK
-}
-static void sys_lwmutex_trylock(ppu_context* ctx)
-{
-    uint32_t lwm = (uint32_t)ctx->gpr[3];
-    uint32_t self = LWM_SELF(ctx);
-    HANDLE s = lwm_sem(lwm);
-    if (s) {
-        if (vm_read32(lwm + LWM_OWNER) == self && vm_read32(lwm + LWM_RECUR) > 0) {
-            vm_write32(lwm + LWM_RECUR, vm_read32(lwm + LWM_RECUR) + 1);
-            ctx->gpr[3] = 0;
-            return;
-        }
-        if (WaitForSingleObject(s, 0) != WAIT_OBJECT_0) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Bu; return; } // EBUSY
-    }
-    if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm); if (sl) { sl->holder = (long)self; sl->acq_us = lwm_now_us(); sl->acq_fences = g_gcm_ref_pub_count; sl->acq_cpu_us = ppu_thread_cpu_us(self); } }
-    vm_write32(lwm + LWM_OWNER, self);
-    vm_write32(lwm + LWM_RECUR, 1);
-    ctx->gpr[3] = 0;
-}
-static void sys_lwmutex_unlock(ppu_context* ctx)
-{
-    uint32_t lwm = (uint32_t)ctx->gpr[3];
-    uint32_t rc = vm_read32(lwm + LWM_RECUR);
-    if (rc > 1) {                       /* recursive hold: count down, keep the lock */
-        vm_write32(lwm + LWM_RECUR, rc - 1);
-        ctx->gpr[3] = 0;
-        return;
-    }
-    vm_write32(lwm + LWM_RECUR, 0);
-    vm_write32(lwm + LWM_OWNER, 0);
-    if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm);
-        if (sl && sl->holder) { long long held = lwm_now_us() - sl->acq_us;
-            if (held > 100000) {
-                long long fences = g_gcm_ref_pub_count - sl->acq_fences;
-                unsigned long long cpu_now = ppu_thread_cpu_us((unsigned)sl->holder);
-                long long cpu_delta = (cpu_now && sl->acq_cpu_us) ? (long long)(cpu_now - sl->acq_cpu_us) : -1;
-                fprintf(stderr, "[LWM-CONVOY] tid=%ld RELEASES lwm=0x%08X after holding %lldus (LONG HOLD) fences=%lld cpu=%lldus (%.0f%% cpu-bound) last-hle-from=0x%08X\n",
-                    sl->holder, lwm, held, fences, cpu_delta,
-                    cpu_delta >= 0 ? 100.0 * (double)cpu_delta / (double)held : -1.0,
-                    ppu_thread_prof_pc((unsigned)sl->holder));
-                /* Name the critical section: the unlocker IS the holder, so its
-                 * guest stack right now is the exit of the long-held region.
-                 * Back-chain LR slots are 0 under the DRAIN/fragment model, so
-                 * scan the stack for words in the lifted code range instead
-                 * (saved return addresses; a lifted func name IS its guest
-                 * addr). Same idiom as [exit-chain] in ppu_hle.cpp. */
-                uint32_t sp = (uint32_t)ctx->gpr[1];
-                char b[1600]; int p = snprintf(b, sizeof b, "[LWM-CONVOY]   holder-bt sp=0x%08X codeptrs:", sp);
-                uint32_t prev = 0; int found = 0;
-                for (uint32_t a = sp; a < sp + 0x3000 && found < 48; a += 4) {
-                    uint32_t v = vm_read32(a);
-                    if (v >= 0x00010000u && v < 0x00900000u && v != prev) {
-                        p += snprintf(b + p, sizeof(b) - p, " %08X", v); prev = v; found++; }
-                }
-                fprintf(stderr, "%s\n", b); fflush(stderr);
-            }
-            sl->holder = 0; } }
-    HANDLE s = lwm_sem(lwm);
-    /* Semaphore release works from ANY thread (unlike a CS) -- guest code
-     * hands lwmutex ownership across threads. Over-release (unlock of a free
-     * mutex) fails harmlessly at the max count of 1. */
-    if (s) ReleaseSemaphore(s, 1, NULL);
-    ctx->gpr[3] = 0;
-}
-
-/* sys_lwcond (sysPrxForUser) — guest-side condition variable, paired with an
- * lwmutex. The CRT and (newly) libsre's cellSpurs create/wait/signal these. Like
- * sys_lwmutex above, model it directly in guest memory so the args stay GUEST
- * EAs (the generic adapter would pass them raw and the C sysPrxForUser impl
- * deref'd them as host pointers -> AV during cellSpurs init). A no-op wait is
- * adequate here: the CRT/SPURS paths that reach us use these for one-shot init
- * handshakes, not long-term blocking. sys_lwcond_t is 8 bytes: +0x00 u32
- * lwmutex EA, +0x04 u32 lwcond queue id. Titles read +0x00 themselves (an
- * lwcond whose lwmutex reads 0 is treated as invalid). */
-static void sys_lwcond_create(ppu_context* ctx)
-{
-    static uint32_t s_lwcond_id = 0x4C000000u;
-    uint32_t lwcond  = (uint32_t)ctx->gpr[3];
-    uint32_t lwmutex = (uint32_t)ctx->gpr[4];
-    vm_write32(lwcond + 0x00, lwmutex);
-    vm_write32(lwcond + 0x04, ++s_lwcond_id);
-    ctx->gpr[3] = 0;
-}
-static void sys_lwcond_destroy(ppu_context* ctx)    { ctx->gpr[3] = 0; }
-static void sys_lwcond_signal(ppu_context* ctx)     { ctx->gpr[3] = 0; }
-static void sys_lwcond_signal_all(ppu_context* ctx) { ctx->gpr[3] = 0; }
-static void sys_lwcond_signal_to(ppu_context* ctx)  { ctx->gpr[3] = 0; }
-/* Now that the lwmutex is REAL, a no-op wait that keeps holding it deadlocks the
- * signaler. Release the paired lwmutex, wait briefly, reacquire (poll-style: the
- * guest's while(!predicate) loop re-checks; signalers stay no-ops). Handles the
- * common single (non-recursive) hold. */
-static void sys_lwcond_wait(ppu_context* ctx)
-{
-    uint32_t lwcond  = (uint32_t)ctx->gpr[3];
-    uint32_t lwmutex = vm_read32(lwcond + 0x00);
-    HANDLE s = lwm_sem(lwmutex);
-    if (s) {
-        uint32_t own = vm_read32(lwmutex + LWM_OWNER);
-        uint32_t rc  = vm_read32(lwmutex + LWM_RECUR);
-        vm_write32(lwmutex + LWM_RECUR, 0);
-        vm_write32(lwmutex + LWM_OWNER, 0);
-        ReleaseSemaphore(s, 1, NULL);
-        Sleep(1);
-        WaitForSingleObject(s, INFINITE);
-        vm_write32(lwmutex + LWM_OWNER, own);
-        vm_write32(lwmutex + LWM_RECUR, rc ? rc : 1);
-    }
-    ctx->gpr[3] = 0;
-}
-
 /* sys_ppu_thread_get_id(vm::ptr<u64> id) -> *id = calling thread's real id.
  * The old fixed "1" broke every am-I-the-designated-thread check in
  * multithreaded titles (LBP's job system routes work by thread identity, so
@@ -376,8 +93,9 @@ static void sys_ppu_thread_get_id(ppu_context* ctx)
 {
     uint32_t p = (uint32_t)ctx->gpr[3];
     /* Every registered thread has a nonzero id (main = 1 via
-     * ppu_thread_register_main); 0 = unregistered scratch ctx, report the same
-     * never-a-real-thread sentinel the lwmutex owner stamps use. */
+     * ppu_thread_register_main); 0 = unregistered scratch ctx, report a
+     * never-a-real-thread sentinel (outside the host-callback id range of
+     * ppu_loader.cpp's ppu_host_thread_id). */
     if (p) vm_write64(p, ctx->thread_id ? (uint64_t)ctx->thread_id : 0x7FFFFFFEull);
     ctx->gpr[3] = 0;
 }
@@ -430,14 +148,6 @@ static void sys_mmapper_allocate_memory_from_container(ppu_context* ctx)
 
 /* A handful of CRT helpers the early boot tends to hit; accept and continue. */
 static void crt_ok(ppu_context* ctx) { ctx->gpr[3] = 0; }
-static void sys_lwmutex_destroy_counted(ppu_context* ctx)
-{
-    { static long long _n=0; _n++;
-      if (getenv("LWM_COUNT") && (_n<=24 || (_n%50000)==0))
-        fprintf(stderr, "[LWM] destroy #%lld lwm=0x%08X r4=0x%08X r5=0x%08X\n", _n,
-                (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[5]); }
-    ctx->gpr[3] = 0;
-}
 
 /* Real preemptive thread create/exit live in the lv2 syscall layer
  * (syscalls/sys_ppu_thread.c) and spawn a host thread that runs the guest
@@ -891,25 +601,14 @@ extern "C" void ppu_sysprx_register(void)
     ps3_hle_register_ctx(ps3_compute_nid("_sys_process_atexitspawn"), "_sys_process_atexitspawn", crt_ok);
     ps3_hle_register_ctx(ps3_compute_nid("_sys_process_at_Exitspawn"),"_sys_process_at_Exitspawn",crt_ok);
 
-    /* Lightweight mutex family (guards global/singleton init in the CRT). */
-    ps3_hle_register_ctx(ps3_compute_nid("sys_lwmutex_create"),  "sys_lwmutex_create",  sys_lwmutex_create);
-    ps3_hle_register_ctx(ps3_compute_nid("sys_lwmutex_destroy"), "sys_lwmutex_destroy", sys_lwmutex_destroy_counted);
-    ps3_hle_register_ctx(ps3_compute_nid("sys_lwmutex_lock"),    "sys_lwmutex_lock",    sys_lwmutex_lock);
-    ps3_hle_register_ctx(ps3_compute_nid("sys_lwmutex_unlock"),  "sys_lwmutex_unlock",  sys_lwmutex_unlock);
-    ps3_hle_register_ctx(ps3_compute_nid("sys_lwmutex_trylock"), "sys_lwmutex_trylock", sys_lwmutex_trylock);
+    /* Lightweight mutex and condition variable (sys_lwsync.cpp). */
+    ps3_lwsync_register();
 
     /* Spinlocks. One guest word each, no kernel object; see the block above. */
     ps3_hle_register_ctx(ps3_compute_nid("sys_spinlock_initialize"), "sys_spinlock_initialize", sys_spinlock_initialize);
     ps3_hle_register_ctx(ps3_compute_nid("sys_spinlock_lock"),       "sys_spinlock_lock",       sys_spinlock_lock);
     ps3_hle_register_ctx(ps3_compute_nid("sys_spinlock_trylock"),    "sys_spinlock_trylock",    sys_spinlock_trylock);
     ps3_hle_register_ctx(ps3_compute_nid("sys_spinlock_unlock"),     "sys_spinlock_unlock",     sys_spinlock_unlock);
-
-    ps3_hle_register_ctx(ps3_compute_nid("sys_lwcond_create"),     "sys_lwcond_create",     sys_lwcond_create);
-    ps3_hle_register_ctx(ps3_compute_nid("sys_lwcond_destroy"),    "sys_lwcond_destroy",    sys_lwcond_destroy);
-    ps3_hle_register_ctx(ps3_compute_nid("sys_lwcond_signal"),     "sys_lwcond_signal",     sys_lwcond_signal);
-    ps3_hle_register_ctx(ps3_compute_nid("sys_lwcond_signal_all"), "sys_lwcond_signal_all", sys_lwcond_signal_all);
-    ps3_hle_register_ctx(ps3_compute_nid("sys_lwcond_signal_to"),  "sys_lwcond_signal_to",  sys_lwcond_signal_to);
-    ps3_hle_register_ctx(ps3_compute_nid("sys_lwcond_wait"),       "sys_lwcond_wait",       sys_lwcond_wait);
 
     /* Thread id + memory manager (high-frequency boot imports). The flat VM
      * means map/unmap/free are no-ops: the memory already exists everywhere. */

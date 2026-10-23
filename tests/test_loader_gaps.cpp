@@ -34,6 +34,11 @@
  *   test_loader_gaps cbleave <below>    a host-slot callback whose r1 is <below>
  *                                       under its slot (0: at it) re-enters:
  *                                       the nested callback must not run
+ *   test_loader_gaps hostid 0           two host threads with no guest context
+ *                                       run callbacks at once: each has a guest
+ *                                       thread id of its own, kept for life and
+ *                                       never reused, and an lwmutex one holds
+ *                                       blocks the other (ownership by id)
  */
 #include "ppu_recomp.h"
 #include <atomic>
@@ -91,6 +96,12 @@ uint64_t ppu_guest_call(uint32_t opd, uint64_t, uint64_t, uint64_t, uint64_t,
                         uint64_t, uint64_t, uint64_t, uint64_t);
 uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc, uint64_t, uint64_t, uint64_t, uint64_t,
                            uint64_t, uint64_t, uint64_t, uint64_t);
+/* The lwmutex/lwcond handlers register themselves here; hostid calls them by name. */
+typedef void (*hle_ctx_fn)(ppu_context*);
+static struct { const char* name; hle_ctx_fn fn; } g_hle[16];
+static int g_hle_n;
+void ps3_hle_register_ctx(uint32_t, const char* name, hle_ctx_fn fn) { g_hle[g_hle_n].name = name; g_hle[g_hle_n++].fn = fn; }
+void ps3_lwsync_register(void);
 }
 
 extern "C" PPU_THREAD_LOCAL ppu_context* g_active_ctx;
@@ -303,6 +314,100 @@ static int cb_stack_scenarios()
     return 0;
 }
 
+/* ---- host-thread identity ---------------------------------------------------
+ * A callback raised by a host thread with no guest context runs as a guest
+ * thread of its own. The identity lwmutex ownership keys on is ppu_context's
+ * thread_id, so two such threads must not share one: a lock one holds would
+ * read as the other's, and trylock / unlock from it would succeed. The
+ * callbacks below call the real lwmutex handlers on their own context, so the
+ * id they pass is the id the loader gave them. */
+static constexpr uint32_t CB_HOLD = 0x30030, CB_PEER = 0x30040, CB_WHO = 0x30050;
+static constexpr uint32_t LW_ATTR = 0x2000, LW_MUTEX = 0x2100;
+static constexpr int32_t LW_OK = 0, LW_EBUSY = (int32_t)0x8001000A, LW_EPERM = (int32_t)0x80010009;
+static std::atomic<uint64_t> g_who[8];
+static std::atomic<int> g_holds, g_tried, g_unlocking;
+
+static int32_t lw(const char* name, ppu_context* ctx, uint64_t a3, uint64_t a4 = 0)
+{
+    for (int i = 0; i < g_hle_n; i++) {
+        if (std::strcmp(g_hle[i].name, name)) continue;
+        ctx->gpr[3] = a3;
+        ctx->gpr[4] = a4;
+        g_hle[i].fn(ctx);
+        return (int32_t)ctx->gpr[3];
+    }
+    CHECK(!"lwmutex handler not registered");
+    return 0;
+}
+
+static void await(const std::atomic<int>& flag)
+{
+    const auto t0 = std::chrono::steady_clock::now();
+    while (!flag.load()) {
+        CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(20));
+        std::this_thread::yield();
+    }
+}
+
+static void cb_who(ppu_context* ctx)      /* r3: which g_who slot records this thread's id */
+{
+    g_who[ctx->gpr[3] & 7] = ctx->thread_id;
+    ctx->gpr[3] = 0;
+}
+static void cb_hold(ppu_context* ctx)
+{
+    g_who[0] = ctx->thread_id;
+    CHECK(lw("sys_lwmutex_lock", ctx, LW_MUTEX) == LW_OK);
+    g_holds = 1;
+    await(g_tried);
+    g_unlocking = 1;
+    CHECK(lw("sys_lwmutex_unlock", ctx, LW_MUTEX) == LW_OK);
+    ctx->gpr[3] = 0;
+}
+static void cb_peer(ppu_context* ctx)
+{
+    await(g_holds);
+    g_who[1] = ctx->thread_id;
+    CHECK(lw("sys_lwmutex_trylock", ctx, LW_MUTEX) == LW_EBUSY);   /* held by another thread, not by us */
+    CHECK(lw("sys_lwmutex_unlock", ctx, LW_MUTEX) == LW_EPERM);
+    g_tried = 1;
+    CHECK(lw("sys_lwmutex_lock", ctx, LW_MUTEX) == LW_OK);        /* blocks until the holder unlocks */
+    CHECK(g_unlocking == 1);
+    CHECK(lw("sys_lwmutex_unlock", ctx, LW_MUTEX) == LW_OK);
+    ctx->gpr[3] = 0;
+}
+
+static int host_id_scenario()
+{
+    ps3_lwsync_register();
+    vm_write32(LW_ATTR, 1);          /* FIFO */
+    vm_write32(LW_ATTR + 4, 0x20);   /* not recursive */
+    ppu_context main_ctx;
+    std::memset(&main_ctx, 0, sizeof main_ctx);
+    main_ctx.thread_id = 1;
+    CHECK(lw("sys_lwmutex_create", &main_ctx, LW_MUTEX, LW_ATTR) == LW_OK);
+
+    auto host = [](uint32_t cb_addr, uint64_t who_again) {
+        CHECK(g_active_ctx == nullptr);   /* no guest context: a host thread's own identity */
+        ppu_guest_call_ct(cb_addr, CB_TOC, 0, 0, 0, 0, 0, 0, 0, 0);
+        ppu_guest_call_ct(CB_WHO, CB_TOC, who_again, 0, 0, 0, 0, 0, 0, 0);   /* a second callback, same thread */
+    };
+    { std::thread a(host, CB_HOLD, 2), b(host, CB_PEER, 3); a.join(); b.join(); }
+
+    const uint64_t a = g_who[0], b = g_who[1];
+    CHECK(a != b);
+    for (uint64_t id : {a, b}) CHECK(id >= 0x7F000000ull && id < 0x7FFFFFF0ull);
+    CHECK(g_who[2] == a && g_who[3] == b);      /* stable for the life of the thread */
+    /* a thread that starts after both ended does not inherit either id (no reuse: it
+     * could otherwise inherit a lock a dead thread still holds) */
+    { std::thread c([&] { host(CB_WHO, 4); }); c.join(); }
+    CHECK(g_who[4] != a && g_who[4] != b && g_who[4] >= 0x7F000000ull);
+    std::printf("HOSTID OK: host threads 0x%llX and 0x%llX distinct and stable, a later one 0x%llX; "
+                "the lock one held blocked the other\n",
+                (unsigned long long)a, (unsigned long long)b, (unsigned long long)g_who[4].load());
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
     if (argc < 3) return 2;
@@ -317,6 +422,9 @@ int main(int argc, char** argv)
     ppu_register_function(CB_ADDR, cb);
     ppu_register_function(CB_LEAVE, cb_leave);
     ppu_register_function(CB_MARK, cb_mark);
+    ppu_register_function(CB_HOLD, cb_hold);
+    ppu_register_function(CB_PEER, cb_peer);
+    ppu_register_function(CB_WHO, cb_who);
 
     ppu_context ctx;
     std::memset(&ctx, 0, sizeof ctx);
@@ -359,6 +467,8 @@ int main(int argc, char** argv)
         ctx.gpr[3] = ppu_guest_call_ct((uint32_t)arg, toc, 0, 0, 0, 0, 0, 0, 0, 0);
     } else if (!std::strcmp(argv[1], "cbstack")) {
         return cb_stack_scenarios();
+    } else if (!std::strcmp(argv[1], "hostid")) {
+        return host_id_scenario();
     } else if (!std::strcmp(argv[1], "cbexhaust")) {
         /* No guest context: the thread's host slot is the only stack, and 100000 nested
          * activations cannot fit in it. */

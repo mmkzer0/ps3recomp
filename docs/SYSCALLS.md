@@ -264,12 +264,12 @@ Multiple readers can hold the lock simultaneously. Writers get exclusive access.
 
 ## Lightweight Mutex/Condvar
 
-**File:** `runtime/syscalls/sys_ppu_thread.c` (part of sysPrxForUser)
+**File:** `runtime/syscalls/sys_lwsync.cpp` (the sysPrxForUser imports, dispatched as context handlers; see [RUNTIME.md](RUNTIME.md#lwmutex-and-lwcond))
 **Syscall numbers:** 150–160
 
 Lightweight mutexes (`sys_lwmutex`) and condvars (`sys_lwcond`) are the user-space fast path for synchronization. They avoid kernel transitions in the uncontested case.
 
-In ps3recomp, they use the same backing as regular mutexes (`CRITICAL_SECTION`/`pthread_mutex`) since there's no kernel/user boundary.
+In ps3recomp each object is a host object with its own FIFO wait queue, keyed by the id the guest stores in `sleep_queue` / `lwcond_queue`; ownership is by guest thread id. They are not backed by `sys_mutex` / `sys_cond`.
 
 ### Syscalls
 

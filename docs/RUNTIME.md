@@ -732,6 +732,54 @@ Each DMA command is assigned to one of 32 tag groups. The SPU can wait for speci
 
 In synchronous mode, all transfers complete immediately, so tag waits always succeed.
 
+### Memory Ordering
+
+An SPU transfer is a load or store of guest memory by another processor, and arm64 reorders independent loads and stores. `mfc_do_transfer` therefore brackets the copy: an **acquire fence before a GET** reads guest memory, and a **release fence after a PUT** wrote it. They pair with the barriers the lifter emits on the PPU side (`lwsync` lowers to an acq_rel fence, `sync` to seq_cst, `eieio` to a release fence; `PPU_FENCE` in `tools/ppu_lifter.py`): a PPU that stores data, executes `lwsync`, then stores a flag is read correctly by an SPU that GETs the flag and then the data, and an SPU that PUTs data and then a flag is read correctly by a PPU that loads the flag, executes `lwsync`, then loads the data. A PUT that copies under the lock-line lock is additionally released by `spu_lockline_unlock`.
+
+`tools/test_spu_dma_litmus.py` (`runtime/spu/tests/test_dma_litmus_main.c`) runs both directions through the real `mfc_submit`: short in tier `t0` (`spu_dma_litmus`), 10^8 publications per direction in the `stress` tier (`spu_dma_litmus_stress`). With either fence removed, the matching direction fails within a few seconds on arm64.
+
+---
+
+## lwmutex and lwcond
+
+**Files:** `runtime/syscalls/sys_lwsync.cpp`, `sys_lwsync.h`; registered by `ppu_sysprx_register`.
+
+`sys_lwmutex_*` and `sys_lwcond_*` are sysPrxForUser imports, reached through `ps3_hle_call`, which dispatches the context-handler registry (`ps3_hle_register_ctx`) before the generated NID table. There used to be two implementations of the same eleven NIDs:
+
+| | context handlers in `ppu_sysprx.cpp` | host-pointer C functions in `libs/system/sysPrxForUser.c` |
+|---|---|---|
+| Live for a title | **yes**: registered by `ppu_sysprx_register`, found first | no: shadowed by the registry; only reachable through the generated table when a registered NID has no context handler (never, for these eleven) |
+| Thread identity | `ppu_context::thread_id` | none: a host mutex, so owner = the host thread |
+| Guest layout | writes `sys_lwmutex_t` and `sys_lwcond_t` words (`vm_read32`/`vm_write32`) | a host-pointer view, `sleep_queue` an index into a 256-slot pool |
+| `lwcond` | signal, signal_all, signal_to and destroy were no-ops; wait released the mutex, slept 1 ms and re-took it | `pthread_cond_t`; `CELL_OK` for an unsignalled wake |
+| `lock` timeout | honoured (`ETIMEDOUT` after the wait) | ignored |
+| Tests | `tools/test_lwcond_layout.py` (extracted source text, stubbed semaphores) | `libs/system/tests/test_static_lwmutex.c` (host pointers) |
+
+Decision: the context-handler form is the backend, because it is the one a title runs, it is the only one with a guest thread id (lwmutex ownership is by guest thread, and a host-pointer call has no ctx), and its guest layout (`sys_lwcond_t` = `+0x00` lwmutex EA, `+0x04` queue id; `sys_lwmutex_t` owner/recursive-count words) is the one the guest also reads. The semantics it kept: lock timeout returns `CELL_ETIMEDOUT` rather than being ignored, the recursive attribute, the 8-byte `sys_lwcond_t` layout, `EBUSY` for a contended trylock and a held destroy. The C implementation and its header declarations (`sys_lwmutex_*`, `sys_lwcond_*`, `sys_lwmutex_reset_all`, `*_t_hle`) are gone, together with their two tests; the contract they covered is in `tests/lwsync`.
+
+The backend is rewritten in C++20 in `sys_lwsync.cpp` as host objects behind the ids the guest stores in `sleep_queue` / `lwcond_queue` (slot + generation, so a stale id is `CELL_ESRCH`), with the guest words mirrored for any guest code that reads them. Each object has a host mutex and a FIFO queue of waiter nodes; a blocked thread sleeps on its own node, so a wake goes to exactly the thread dequeued, and only a post ends the sleep, so a host-level spurious wakeup is never reported as a signal. Unlock hands the lock to the head waiter. A waiter is queued before the lock that queued it is released, so a signal issued after a waiter is enqueued cannot be lost. Acquire/release comes from the host mutexes; the guest-word mirror is relaxed.
+
+Return codes, with the firmware behaviour they follow (RPCS3's `sys_lwmutex` / `sys_lwcond` / `sysPrxForUser` as semantic oracle, read and not copied):
+
+| Call | Result |
+|---|---|
+| `lwmutex_create` | `EINVAL` for an attribute other than recursive/not-recursive or a protocol other than FIFO/priority/retry; `EFAULT` for a null or unaligned address |
+| `lwmutex_lock` / `trylock` | free: owner = caller. Owner re-locks: counted if recursive, `EDEADLK` otherwise. Held by another: `lock` waits (`ETIMEDOUT` after `timeout` µs, 0 = forever), `trylock` returns `EBUSY`. Destroyed: `EINVAL`; never created: `ESRCH` |
+| `lwmutex_unlock` | `EPERM` unless the caller owns it; a counted re-lock is released first |
+| `lwmutex_destroy` | `EBUSY` while owned, queued on, or waited on through an lwcond; `EINVAL` if destroyed already |
+| `lwcond_wait` | `EPERM` unless the caller owns the lwcond's lwmutex; releases it and queues as one step; on return, whatever ended the wait, the caller owns it again at its saved recursion count; timeout is `ETIMEDOUT`, never `OK` |
+| `lwcond_signal` / `signal_all` | wake one / all waiters in queue order; no waiter is `OK`; a signaller that owns the lwmutex moves the waiters onto its queue instead (as the firmware's mode 1 does) |
+| `lwcond_signal_to` | wakes the named thread id; `EPERM` if it is not waiting |
+| `lwcond_destroy` | `EBUSY` with waiters |
+
+Deliberate differences: queues are FIFO whatever the protocol attribute; object ids are not lv2 ids.
+
+Tests: `tests/lwsync` (`test_lwsync`) drives `ps3_hle_call` with the real NIDs. `lwsync_contract` covers the table above (recursion, `EBUSY`, `EPERM`, destroy with a waiter, timeouts with the mutex re-owned, signal one of two waiters, signal_all, signal_to, FIFO order). `lwsync_mp` (message passing through an lwmutex-protected slot) and `lwsync_lostwake` (a signal racing a waiter entering the wait) are litmus tests: short in `t0` and `tsan`, 10^8 iterations in `lwsync_*_stress` (label `stress`), all with 64-bit monotonic time and a 30 s no-progress watchdog.
+
+### Host-initiated callback thread ids
+
+A callback raised by a host thread with no guest context (`ppu_guest_call` / `ppu_guest_call_ct` with `g_active_ctx == nullptr`: the vblank, audio and timer threads) runs as a guest thread of its own. Its id is allocated once per host thread from a counter in `0x7F000000..0x7FFFFFEF`, kept for the life of the thread and never reused. Real guest thread ids are the thread-table index + 1 (at most `PPU_THREAD_MAX`, 64) and `sys_ppu_thread_get_id`'s "no id" sentinel is `0x7FFFFFFE`, so the ranges cannot meet. Two such threads are therefore two owners to an lwmutex (`tests/test_loader_gaps.cpp hostid`); a callback raised under a guest context still inherits that thread's id.
+
 ---
 
 ## Error Codes

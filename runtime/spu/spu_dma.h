@@ -607,7 +607,19 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                               lsa, (uint32_t)ea, size, (uint32_t)spu->pc, spu->image_id, "\n");
               }
           } }
-        /* GET: main memory -> local store */
+        /* GET: main memory -> local store.
+         *
+         * Acquire, at issue: this copy is the SPU's load of guest memory. The PPU
+         * publishes with a barrier between the data it writes and the flag that
+         * tells a consumer to read it (the lifter lowers lwsync to an acq_rel
+         * fence and sync to seq_cst, ppu_lifter.py PPU_FENCE), so the consumer's
+         * loads of the data must not be satisfied ahead of its loads of the flag.
+         * The flag arrives with an earlier GET (or GETLLAR), the data with this
+         * one, and arm64 reorders independent loads: without this fence an SPU
+         * that saw the flag can read the data it predates. Pairs with the PPU's
+         * release; the PUT fence below is the other direction
+         * (runtime/spu/tests/test_dma_litmus_main.c checks both). */
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
         memcpy(ls_ptr, ea_ptr, size);
         /* SPU_STACKEA_WATCH (b): scan the just-loaded payload for a 0xD00Cxxxx
          * dword = the completion-word EA arriving in a job buffer. */
@@ -711,6 +723,15 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                 }
             }
         }
+        /* Release, at completion: the copy above is the SPU's store to guest
+         * memory. This engine runs a transfer to completion at issue, so the
+         * order of an SPU's PUTs (the data, then the flag the PPU polls) is the
+         * order it promised, and a PPU that reads the flag and then issues its
+         * lwsync (an acquire) must find the data. arm64 may reorder the two
+         * copies' stores unless this fence separates them. A copy under the
+         * lock-line lock is already released by spu_lockline_unlock; this
+         * covers the copies that skip it. */
+        __atomic_thread_fence(__ATOMIC_RELEASE);
         /* Tell whoever is listening where this PUT landed.
          *
          * A title whose SPUs build the RSX command stream never tells libgcm

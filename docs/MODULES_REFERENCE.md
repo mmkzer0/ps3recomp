@@ -101,15 +101,10 @@ DECLARE_PS3_MODULE(cellFoo, "cellFoo")
 
 This is the most critical module. It provides:
 
-**Lightweight Mutexes (lwmutex):**
-- Backed by `CRITICAL_SECTION` (Windows) / `pthread_mutex_t` (POSIX)
-- Up to 256 concurrent lwmutex instances in a static pool
-- Supports recursive and non-recursive modes
-
-**Lightweight Condition Variables (lwcond):**
-- Backed by `CONDITION_VARIABLE` (Windows) / `pthread_cond_t` (POSIX)
-- Associated with a specific lwmutex
-- Signal, broadcast, and timed wait
+**Lightweight Mutexes (lwmutex) and Condition Variables (lwcond):**
+- Implemented in `runtime/syscalls/sys_lwsync.cpp`, not in `sysPrxForUser.c`; see [RUNTIME.md](RUNTIME.md#lwmutex-and-lwcond)
+- Per-object FIFO wait queues; ownership by guest thread id; recursive and non-recursive modes
+- Signal one, signal all, signal to a thread, timed wait (`CELL_ETIMEDOUT`)
 
 **Thread Functions:**
 - `sys_ppu_thread_create` — creates real host threads

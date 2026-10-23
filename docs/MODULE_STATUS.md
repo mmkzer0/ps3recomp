@@ -12,7 +12,7 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 
 | Module | Category | Status | Notes |
 |---|---|---|---|
-| sysPrxForUser | Core Runtime | **Complete** | Real host threads, lwmutex (CRITICAL_SECTION/pthread), lwcond (CV/pthread_cond), heap alloc, printf/snprintf, string/mem ops |
+| sysPrxForUser | Core Runtime | **Complete** | Real host threads, heap alloc, printf/snprintf, string/mem ops (lwmutex/lwcond: `runtime/syscalls/sys_lwsync.cpp`) |
 | cellSysmodule | Module Loader | **Complete** | Load/unload tracking, 55+ module ID constants, name lookup |
 | cellSysutil | System Utility | **Complete** | Callbacks, system params, BGM playback, system cache, disc game check, license area |
 | sys_ppu_thread | Kernel Threading | **Complete** | Real host threads (CreateThread/pthreads), join, detach, priority, rename |

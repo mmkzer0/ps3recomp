@@ -1,9 +1,9 @@
 /*
  * ps3recomp - sysPrxForUser HLE
  *
- * Core PRX runtime: threads, process management, printf, lightweight
- * mutexes/condvars (backed by real host primitives), heap allocation,
- * and TLS support.
+ * Core PRX runtime: threads, process management, printf, heap allocation,
+ * and TLS support. The lightweight mutex and condition variable are not here:
+ * runtime/syscalls/sys_lwsync.cpp implements them behind their HLE imports.
  */
 
 #ifndef PS3RECOMP_SYS_PRX_FOR_USER_H
@@ -28,33 +28,6 @@ typedef struct sys_ppu_thread_attr {
     u32 entry;        /* guest entry address */
     u32 tls_addr;
 } sys_ppu_thread_attr_t;
-
-/* Lightweight mutex attribute */
-typedef struct sys_lwmutex_attribute {
-    u32 protocol;        /* SYS_SYNC_FIFO = 1, SYS_SYNC_PRIORITY = 2 */
-    u32 recursive;       /* SYS_SYNC_RECURSIVE = 0x10, SYS_SYNC_NOT_RECURSIVE = 0x20 */
-    char name[8];
-} sys_lwmutex_attribute_t;
-
-/* Lightweight mutex */
-typedef struct sys_lwmutex {
-    u64 lock_var;
-    u32 attribute;
-    u32 recursive_count;
-    u32 sleep_queue;
-    u32 pad;
-} sys_lwmutex_t_hle;
-
-/* Lightweight condition variable attribute */
-typedef struct sys_lwcond_attribute {
-    char name[8];
-} sys_lwcond_attribute_t;
-
-/* Lightweight condition variable */
-typedef struct sys_lwcond {
-    u32 lwmutex_addr;    /* guest pointer to associated lwmutex */
-    u32 lwcond_queue;
-} sys_lwcond_t_hle;
 
 /* Sync protocol constants */
 #define SYS_SYNC_FIFO              0x00000001
@@ -131,30 +104,6 @@ s64 _sys_spu_printf_attach_group(u32 group);
 s64 _sys_spu_printf_detach_group(u32 group);
 s64 _sys_spu_printf_attach_thread(u32 thread);
 s64 _sys_spu_printf_detach_thread(u32 thread);
-
-/* ---------------------------------------------------------------------------
- * Lightweight mutex
- * -----------------------------------------------------------------------*/
-
-s32 sys_lwmutex_create(sys_lwmutex_t_hle* lwmutex, const sys_lwmutex_attribute_t* attr);
-s32 sys_lwmutex_lock(sys_lwmutex_t_hle* lwmutex, u64 timeout);
-s32 sys_lwmutex_trylock(sys_lwmutex_t_hle* lwmutex);
-s32 sys_lwmutex_unlock(sys_lwmutex_t_hle* lwmutex);
-s32 sys_lwmutex_destroy(sys_lwmutex_t_hle* lwmutex);
-
-/* Reset all lwmutex/lwcond state — call before CRT redirect to game main */
-void sys_lwmutex_reset_all(void);
-
-/* ---------------------------------------------------------------------------
- * Lightweight condition variable
- * -----------------------------------------------------------------------*/
-
-s32 sys_lwcond_create(sys_lwcond_t_hle* lwcond, sys_lwmutex_t_hle* lwmutex,
-                      const sys_lwcond_attribute_t* attr);
-s32 sys_lwcond_signal(sys_lwcond_t_hle* lwcond);
-s32 sys_lwcond_signal_all(sys_lwcond_t_hle* lwcond);
-s32 sys_lwcond_wait(sys_lwcond_t_hle* lwcond, u64 timeout);
-s32 sys_lwcond_destroy(sys_lwcond_t_hle* lwcond);
 
 /* ---------------------------------------------------------------------------
  * Heap management

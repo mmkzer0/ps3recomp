@@ -1597,10 +1597,6 @@ static void gcm_ref_push_at(u32 v, u32 getoff)
     s_ref_qtail = t + 1;
 }
 
-/* Global fence-publication counter: lets the lwmutex convoy trace correlate a
- * long lock hold with the number of paced fence publications inside it (the
- * 200us pacing x hundreds of one-ahead fences = the ~156ms holds). */
-volatile long long g_gcm_ref_pub_count = 0;
 /* Absolute microseconds from the QPC hardware counter -- the SAME origin in every
  * translation unit, so two probes in different files can be compared directly.
  * That is the whole point: every wrong conclusion about this stall came from
@@ -1625,7 +1621,6 @@ static void gcm_ref_publish_one(void)
         fprintf(stderr, "[refpub] t=%lluus #%lu wrote 0x%08X -> readback 0x%08X\n", ps3_qpc_us(), _n,
                 s_ref_q[h % GCM_REF_QLEN], vm_read32(GCM_CONTROL_GUEST_ADDR + 8)); } }
     s_ref_qhead = h + 1;
-    g_gcm_ref_pub_count++;
 }
 
 /* Read-driven fence publication. cellGcmFinish / FIFO-space waits spin-read the

@@ -424,6 +424,12 @@ if(PS3RECOMP_BUILD_TESTS)
     # The startup gates (typed config, identity, VSCR policy) and the named stop
     # they end in: probe executables run per scenario by Python runners.
     add_subdirectory(tests/gates)
+    # sys_lwmutex_* / sys_lwcond_* through ps3_hle_call: the guest-visible
+    # contract, and the message-passing and lost-wakeup litmus tests. They link
+    # the runtime library, so they run the handlers a title links.
+    if(UNIX)
+        add_subdirectory(tests/lwsync)
+    endif()
     # PS3_LOG_FIRST, the saturating counter behind the "first n times" log lines.
     add_executable(test_log_first tests/test_log_first.c)
     target_include_directories(test_log_first PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
@@ -455,6 +461,17 @@ if(PS3RECOMP_BUILD_TESTS)
         set_tests_properties(spurs_task_exit_code_initialize spurs_taskset_size
             PROPERTIES LABELS "spurs;t0")
         set_tests_properties(spu_sdcrz spu_observe spu_dma_repeat PROPERTIES LABELS "spu;t0")
+        # Message passing between a PPU thread and an SPU through the real MFC
+        # engine, both directions: acquire before a GET, release after a PUT.
+        # The same program runs short here and at 10^8 in the stress tier.
+        add_test(NAME spu_dma_litmus
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_dma_litmus.py" 5000000)
+        add_test(NAME spu_dma_litmus_stress
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_dma_litmus.py" 100000000)
+        set_tests_properties(spu_dma_litmus PROPERTIES LABELS "spu;t0" TIMEOUT 300)
+        set_tests_properties(spu_dma_litmus_stress PROPERTIES LABELS "spu;stress" TIMEOUT 7200)
     endif()
     if(NOT WIN32)
         find_package(Python3 3.10 COMPONENTS Interpreter QUIET)

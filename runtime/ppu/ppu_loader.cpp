@@ -3719,6 +3719,37 @@ static uint32_t ppu_cb_entry_sp(const ppu_context* active, bool* on_host_slot)
     return top - 0x80u;   /* the linkage area the callee writes at entry (0x70) stays inside the slot */
 }
 
+/* Guest thread id of a host thread that raises a callback with no guest context
+ * (the vblank, audio and timer threads). It is the identity every owner-tracking
+ * primitive sees -- lwmutex ownership above all -- so it must tell this thread
+ * from every other: each host thread takes the next id from a counter on its
+ * first callback and keeps it for life, and ids are never recycled, so a lock a
+ * dead host thread still holds is not inherited by a later one.
+ *
+ * The range sits above every real guest thread id. Those are the thread-table
+ * index + 1 (1..PPU_THREAD_MAX, sys_ppu_thread.h) and stay far below 0x7F000000;
+ * the top of the range stops short of 0x7FFFFFFE, which sys_ppu_thread_get_id
+ * reports for a context with no id at all, and of the 0xFFFFFFFx words the
+ * lwmutex owner field reserves. The range holds ~16.7 million threads; running
+ * out is a stop, never a wrap onto an id still in use. */
+#define PPU_HOST_TID_BASE   0x7F000000u
+#define PPU_HOST_TID_END    0x7FFFFFF0u
+static uint64_t ppu_host_thread_id(void)
+{
+    static std::atomic<uint32_t> s_next{PPU_HOST_TID_BASE};
+    static thread_local uint64_t t_id = 0;
+    if (!t_id) {
+        const uint32_t n = s_next.fetch_add(1, std::memory_order_relaxed);
+        if (n >= PPU_HOST_TID_END)
+            ppu_guest_call_stop("thread-id", 0, 0, 0,
+                "every synthetic guest thread id for host-initiated callbacks is taken: the "
+                "process has run callbacks from over 16 million distinct host threads, and a "
+                "reused id would let one of them inherit another's lwmutex ownership.");
+        t_id = n;
+    }
+    return t_id;
+}
+
 extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
                                    uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                                    uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
@@ -3767,14 +3798,9 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
     ppu_context* saved_active = g_active_ctx;
     /* Thread identity: a zeroed scratch ctx used to run callbacks as thread_id 0
      * -- aliasing the main thread in every owner-tracking primitive. Inherit the
-     * calling guest thread's id; host-only threads (ticker) get a per-host-thread
-     * sentinel far above the thread table's range. */
-#ifdef _WIN32
-    ctx.thread_id = saved_active ? saved_active->thread_id
-                                 : (0x7FFF0000ull | (GetCurrentThreadId() & 0xFFFFu));
-#else
-    ctx.thread_id = saved_active ? saved_active->thread_id : 0x7FFF0000ull;
-#endif
+     * calling guest thread's id; a host thread with no guest context (ticker)
+     * has an id of its own (ppu_host_thread_id). */
+    ctx.thread_id = saved_active ? saved_active->thread_id : ppu_host_thread_id();
     g_active_ctx = &ctx;
     fn(&ctx);
     while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(&ctx); }
@@ -3821,12 +3847,7 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
      * so a dangling g_active_ctx after return corrupts the crash handler / diagnostics. */
     ppu_context* saved_active = g_active_ctx;
     /* Inherit the caller's thread identity (see ppu_guest_call above). */
-#ifdef _WIN32
-    ctx.thread_id = saved_active ? saved_active->thread_id
-                                 : (0x7FFF0000ull | (GetCurrentThreadId() & 0xFFFFu));
-#else
-    ctx.thread_id = saved_active ? saved_active->thread_id : 0x7FFF0000ull;
-#endif
+    ctx.thread_id = saved_active ? saved_active->thread_id : ppu_host_thread_id();
     g_active_ctx = &ctx;
     fn(&ctx);
     while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(&ctx); }
