@@ -4779,7 +4779,7 @@ def _worker_lift(task):
         insns = disassemble_bytes(blob, start, _WORKER_STATE["be"]) if blob else []
         f = lifter.lift_function(insns, start, end)
         results.append((f.name, f.start_addr, f.end_addr, f.body_lines, f.calls,
-                        f.fallthrough_to))
+                        f.fallthrough_to, f.traps))
     return idx0, results, lifter.call_targets, lifter.branch_targets
 
 
@@ -4822,10 +4822,10 @@ def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
         raise
 
     for idx0 in sorted(results_by_idx):
-        for name, s, e, body, calls, ft in results_by_idx[idx0]:
+        for name, s, e, body, calls, ft, traps in results_by_idx[idx0]:
             lifter.functions.append(LiftedFunction(
                 name=name, start_addr=s, end_addr=e,
-                body_lines=body, calls=calls, fallthrough_to=ft))
+                body_lines=body, calls=calls, fallthrough_to=ft, traps=traps))
 
 
 def main() -> None:

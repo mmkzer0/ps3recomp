@@ -68,6 +68,13 @@ def main():
         fn = report['functions'][0]
         assert fn['name'] == 'func_00010008' and fn['traps'][0][:2] == ['0x0001000C', '0x00000000'], fn
         assert 'word' in fn['traps'][0][2], fn
+        # the parallel lift (the default: --jobs = CPU count) reports the same gaps
+        subprocess.run([sys.executable, str(ROOT / 'tools/ppu_lifter.py'), str(tmp / 'code.bin'), '--raw',
+                        '--base', '0x10000', '--functions', str(tmp / 'fn.json'), '--jobs', '2',
+                        '--single-file', '--source-name', 'ppu_recomp.cpp', '--output', str(tmp / 'lift2')],
+                       check=True, capture_output=True)
+        report2 = json.loads((tmp / 'lift2' / 'ppu_lift_report.json').read_text())
+        assert report2 == report, (report, report2)
 
         # a function that is fine runs; the one with the unknown instruction does not stop before it
         p = run('call', '0x10000')
