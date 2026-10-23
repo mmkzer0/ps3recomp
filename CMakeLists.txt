@@ -515,6 +515,12 @@ if(PS3RECOMP_BUILD_TESTS)
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_lifter_code_window.py")
         set_tests_properties(lifter_code_window PROPERTIES LABELS "tools;t0")
+        # The trace schema contract: event/1 converts losslessly, validation is
+        # strict, and diff reports the first divergence per execution context.
+        add_test(NAME ps3diff
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ps3diff.py")
+        set_tests_properties(ps3diff PROPERTIES LABELS "tools;t0")
         # Every gap the runtime used to paper over is a named stop (docs/STOPS.md).
         add_test(NAME hle_unresolved
             COMMAND "${Python3_EXECUTABLE}"
