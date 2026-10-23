@@ -33,6 +33,12 @@ except ImportError:
     print("Error: ppu_disasm.py must be in the same directory.", file=sys.stderr)
     sys.exit(1)
 
+try:
+    from ppu_loader import code_end
+except ImportError:
+    print("Error: ppu_loader.py must be in the same directory.", file=sys.stderr)
+    sys.exit(1)
+
 # ---------------------------------------------------------------------------
 # Lifter context
 # ---------------------------------------------------------------------------
@@ -3914,12 +3920,16 @@ class PPULifter:
             boundaries = sorted(
                 {f.start_addr for f in self.functions} | set(gap_targets))
             text_hi = max((f.end_addr for f in self.functions), default=0)
+            if self.code_hi is not None:
+                text_hi = min(text_hi, self.code_hi) if text_hi else self.code_hi
             for target in gap_targets:
                 idx = bisect.bisect_right(boundaries, target)
                 bound = boundaries[idx] if idx < len(boundaries) else text_hi
                 if target + _MAX_MID_TAIL < bound:
                     self.capped_tails.append((target, bound, target + _MAX_MID_TAIL))
                 bound = min(bound, target + _MAX_MID_TAIL)   # cap span (see above)
+                if self.code_hi is not None:
+                    bound = min(bound, self.code_hi)
                 if bound <= target:
                     continue
                 gap_func = self.lift_function(_insn_slice(target, bound), target, bound)
@@ -3939,7 +3949,9 @@ class PPULifter:
         cont = func.fallthrough_to
         if not cont:
             return
-        if self.code_hi is not None and not (self.code_lo <= cont < self.code_hi):
+        if cont < self.code_lo:
+            return
+        if self.code_hi is not None and cont >= self.code_hi:
             return
         self.branch_targets.add(cont)
 
@@ -4158,11 +4170,13 @@ class PPULifter:
         clean build.
 
         A stub address is declared callable by definition, so exempt it."""
-        if self.code_hi is None:
-            return False
         if tgt in self.hle_stub_nids:
             return False
-        return not (self.code_lo <= tgt < self.code_hi)
+        if tgt < self.code_lo:
+            return True
+        if self.code_hi is not None and tgt >= self.code_hi:
+            return True
+        return False
 
     def _function_def_lines(self, func, func_by_addr, sorted_addrs,
                             addr_index) -> list[str]:
@@ -5015,9 +5029,10 @@ def main() -> None:
     parser.add_argument("--code-end", type=lambda x: int(x, 0), default=None,
                         help="Highest valid executable address (exclusive). "
                              "Branch/call/jump-table targets at or above this are "
-                             "treated as data, not promoted to functions. Use the "
-                             "end of the last .text section to stop .rodata in the "
-                             "R-X segment from exploding into bogus functions.")
+                             "treated as data, not promoted to functions. Without "
+                             "this, defaults to the end of the highest SHF_EXECINSTR "
+                             "section for ELFs (or executable PT_LOAD segment if "
+                             "stripped), and --base + image length for raw input.")
     parser.add_argument("--toc", type=lambda x: int(x, 0), default=None,
                         help="TOC (r2) value for --raw input. Jump-table "
                              "dispatchers load their table base TOC-relative, so "
@@ -5063,6 +5078,7 @@ def main() -> None:
     # from the lowest SHF_EXECINSTR section below; None = fall back to the
     # first function bound.
     elf_exec_lo: int | None = None
+    elf = None
     if args.raw:
         all_insns = disassemble_bytes(file_data, base_addr, big_endian)
         seg_blobs = [(base_addr, file_data)]
@@ -5099,6 +5115,7 @@ def main() -> None:
             print(f"Warning: ELF parse failed ({exc}), treating as raw", file=sys.stderr)
             all_insns = disassemble_bytes(file_data, base_addr, big_endian)
             seg_blobs = [(base_addr, file_data)]
+            elf = None
 
     # Get function boundaries
     if args.functions:
@@ -5123,6 +5140,19 @@ def main() -> None:
         code_lo = elf_exec_lo
     else:
         code_lo = min(s for s, _ in func_bounds)
+
+    # Without --code-end: ELF input -> code_hi = end of the highest
+    # SHF_EXECINSTR section (fallback: end of the executable PT_LOAD for
+    # section-stripped ELFs), matching ppu_loader.py --code-end; raw input ->
+    # --base + image length. With --code-end given: unchanged.
+    if args.code_end is not None:
+        code_hi = args.code_end
+    elif args.raw or elf is None:
+        code_hi = base_addr + len(file_data)
+    else:
+        code_hi = code_end(elf)
+        if not code_hi:
+            sys.exit(f"ppu_lifter: {args.input} has no executable section or segment; pass --code-end")
 
     # ----- recover merged function boundaries -----------------------------
     # The call-graph-derived function list can merge several real functions into
@@ -5217,7 +5247,8 @@ def main() -> None:
                             or _prev.mnemonic.startswith(".")):
                         break
                     _ent -= 4
-                _func_entries.add(_ent)
+                if code_lo <= _ent < code_hi:
+                    _func_entries.add(_ent)
 
     _recovered = []
     _ncuts = 0
@@ -5296,10 +5327,8 @@ def main() -> None:
         # libsre came out with 0 switches and 72 bare dispatchers that way, which
         # is why cellSpursCreateTask returned success without doing anything.
         # With --toc supplied the same discovery works on raw images.
-        _raw_lo = min(s for s, _ in func_bounds)
-        _raw_hi = max(e for _, e in func_bounds)
-        if args.code_end is not None:
-            _raw_hi = min(_raw_hi, args.code_end)
+        _raw_lo = code_lo
+        _raw_hi = code_hi
 
         def _raw_read_u32(a):
             off = a - base_addr
@@ -5327,10 +5356,8 @@ def main() -> None:
                         return int.from_bytes(d[a - v0:a - v0 + 4],
                                               'big' if big_endian else 'little')
                 return None
-            text_lo = min(s for s, _ in func_bounds)
-            text_hi = max(e for _, e in func_bounds)
-            if args.code_end is not None:
-                text_hi = min(text_hi, args.code_end)
+            text_lo = code_lo
+            text_hi = code_hi
             toc = _read_u32((elf.elf_header.e_entry + 4) & 0xFFFFFFFF) or 0
             # PSL1GHT/GCC ELFs: the entry descriptor's second word is NOT a TOC
             # (it repeats the code address); the real r2 the crt establishes is
@@ -5457,6 +5484,8 @@ def main() -> None:
     _work = list(func_bounds)
     while _work:
         _s, _e = _work.pop()
+        if not (code_lo <= _e < code_hi):
+            continue
         if _e in _fbmap:
             continue                      # contiguous: falls into a known func
         _last = _by_addr.get(_e - 4)
@@ -5468,6 +5497,8 @@ def main() -> None:
         _nxt = _starts[_k] if _k < len(_starts) else None
         if _nxt is None or _nxt <= _e:
             continue
+        if _nxt > code_hi:
+            _nxt = code_hi
         _fbmap[_e] = _nxt
         _starts.insert(_k, _e)
         _work.append((_e, _nxt))
@@ -5481,13 +5512,11 @@ def main() -> None:
     # through here, so a target below .text (the ELF header, padding) or at/after
     # the code end never becomes a lifted function. Ends are clamped to code_hi.
     before = len(func_bounds)
-    if args.code_end is not None:
-        func_bounds = [(s, min(e, args.code_end)) for s, e in func_bounds
-                       if s < args.code_end]
+    func_bounds = [(s, min(e, code_hi)) for s, e in func_bounds
+                   if s < code_hi]
     func_bounds = [(s, e) for s, e in func_bounds if s >= code_lo and e > s]
     if before != len(func_bounds):
-        print(f"  code window [0x{code_lo:08X}, "
-              f"{f'0x{args.code_end:08X}' if args.code_end is not None else 'exec end'}): "
+        print(f"  code window [0x{code_lo:08X}, 0x{code_hi:08X}): "
               f"dropped {before - len(func_bounds)} out-of-window function(s)")
 
     # Firmware-import stub split: the .lib.stub trampolines are usually lumped
@@ -5536,15 +5565,7 @@ def main() -> None:
     # every target below .text was "in code" and a data word misread as a branch
     # could seed a function below the text start (Odin: 0xFD8/0x6664/0xC664).
     lifter.code_lo = code_lo
-    lifter.code_hi = args.code_end
-    # Without --code-end, default the executable window's end to the
-    # function-bounds end so branches into data still get clamped. With no
-    # window at all, a garbage target decoded from data (e.g. dead bytes after a
-    # blrl reached by fallthrough) is emitted as a call to a nonexistent
-    # func_XXXXXXXX and the link fails (LBP: func_FFFFFFEC from a literal pool
-    # misread as a bc).
-    if lifter.code_hi is None and func_bounds:
-        lifter.code_hi = max(e for _, e in func_bounds)
+    lifter.code_hi = code_hi
     lifter.hle_stub_nids = hle_stubs
     lifter.function_entries = _func_entries
     lifter.jump_tables = jt_dispatchers

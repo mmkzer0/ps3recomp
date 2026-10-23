@@ -669,8 +669,10 @@ The lift runs at build time with fixed output names (`--chunks N` cuts by
 guest code bytes), and `--code-end` defaults to the ELF's own executable end
 (the highest `SHF_EXECINSTR` section, or the executable segment when section
 headers are stripped), so a data section inside an R-X segment is not lifted
-as code. Pass `CODE_END <addr>` only when the image needs a stricter bound; a
-relocated PRX, for example. `LIFTER_ARGS` forwards other lifter options.
+as code. Both the CMake wrapper and the standalone `ppu_lifter.py` CLI derive
+this bound automatically (`--base` + image length for raw input). Pass
+`CODE_END <addr>` only when the image needs a stricter bound; a relocated PRX,
+for example. `LIFTER_ARGS` forwards other lifter options.
 The generated translation units still need the title's large-TU flags: `-w`,
 `-ffp-contract=off`, and `-O1` rather than the Release `-O3`.
 

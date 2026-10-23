@@ -70,9 +70,10 @@ itself (a pointer, a string, `0x00000000`) usually says so. A named mnemonic
 lifter lacks and needs a lowering. `unresolved_targets` are registered call or
 branch targets with no lifted function: they reach `ppu_unlifted_stub` (stop
 kind `unlifted-function`) at run time, or fail to link. A branch outside the
-code window or a live goto to an undecoded in-range address stops the same way
-but is not counted there (see `undecoded_targets`). A function list that is
-wrong shows as many `.word` traps in the same functions; fix discovery
-(`--code-end`, a better function list), not the traps.
+executable code window `[code_lo, code_hi)` (derived automatically from the ELF's
+executable sections/segments, or overridden with `--code-end`) or a live goto to
+an undecoded in-range address stops the same way but is not counted there (see
+`undecoded_targets`). A function list that is wrong shows as many `.word` traps in
+the same functions; fix discovery (`--code-end`, a better function list), not the traps.
 
 `tools/lift_audit.py` counts the traps in the generated source as well.

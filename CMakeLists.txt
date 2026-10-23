@@ -494,6 +494,10 @@ if(PS3RECOMP_BUILD_TESTS)
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_lifter_identity.py")
         set_tests_properties(lifter_identity PROPERTIES LABELS "tools;t0")
+        add_test(NAME lifter_code_window
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_lifter_code_window.py")
+        set_tests_properties(lifter_code_window PROPERTIES LABELS "tools;t0")
         # Every gap the runtime used to paper over is a named stop (docs/STOPS.md).
         add_test(NAME hle_unresolved
             COMMAND "${Python3_EXECUTABLE}"
