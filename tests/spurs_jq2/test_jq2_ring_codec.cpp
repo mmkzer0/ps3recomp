@@ -1,10 +1,11 @@
 /*
  * T0: the Jq2 ring-entry codec on synthetic bytes only.
  *
- * Pins the bit layout, every command type, field boundaries, the rejection of
- * values that do not fit, and decode -> encode identity over a fixed-seed
- * sweep. No guest addresses or trace bytes: the evidence for the layout lives
- * in libs/spurs/jq2/ring.hpp.
+ * Pins the bit layout, every command type, field boundaries, the writer-bit
+ * model (w1 bit 0 is the queue phase, OR'ed with flags&1 for JOB/COPY; a SYNC's
+ * w1 is the phase and never the mask), the rejection of values that do not fit,
+ * and decode -> encode identity over a fixed-seed sweep. No guest addresses or
+ * trace bytes: the evidence for the layout lives in libs/spurs/jq2/ring.hpp.
  */
 
 #include <jq2/ring.hpp>
@@ -53,47 +54,146 @@ void dump(const std::array<std::uint8_t, kEntryBytes>& bytes)
     for (std::uint8_t b : bytes) std::fprintf(stderr, "%02x", b);
 }
 
-/* Encode, check the two words, decode back to the same variant value. */
-void expect_encoded(const Entry& entry, std::uint32_t w0, std::uint32_t w1)
+/* Encode, check the two words, decode back to the same entry and the same raw
+ * writer bit. */
+void expect_encoded(const Entry& entry, bool phase, std::uint32_t w0, std::uint32_t w1)
 {
-    const EncodeResult encoded = encode(entry);
+    const EncodeResult encoded = encode(entry, phase);
     CHECK(encoded.ok());
     if (!encoded.ok()) return;
     CHECK(read_word(encoded.bytes, 0) == w0);
     CHECK(read_word(encoded.bytes, 4) == w1);
     const std::array<std::uint8_t, kEntryBytes> expected = make_bytes(w0, w1);
     CHECK(encoded.bytes == expected);
-    CHECK(decode(encoded.bytes) == entry);
+    const Decoded decoded = decode(encoded.bytes);
+    CHECK(decoded.entry == entry);
+    CHECK(decoded.writer_bit == ((w1 & 1u) != 0));
 }
 
 void test_fixed_layouts()
 {
-    /* JOB: port | tag << 3 | 0, descriptor | size 4 | flag 1. */
-    const JobEntry job{0x0BAD0080u, 0xDEADBEE0u, 0x0Au, SizeCode::bytes256, true};
-    expect_encoded(job, 0x0BAD00D0u, 0xDEADBEE5u);
+    /* JOB: port | tag << 3 | 0, descriptor | size 4 | writer bit. */
+    const JobEntry job{0x0BAD0080u, 0xDEADBEE0u, 0x0Au, SizeCode::bytes256};
+    expect_encoded(job, false, 0x0BAD00D0u, 0xDEADBEE4u);
+    expect_encoded(job, true, 0x0BAD00D0u, 0xDEADBEE5u);
 
     /* COPY: type 2 in w0, the pool destination in w1. */
-    const CopyEntry copy{0x12345680u, 0xCAFEBAB0u, 0x0Fu, SizeCode::bytes64, false};
-    expect_encoded(copy, 0x123456FAu, 0xCAFEBAB0u);
+    const CopyEntry copy{0x12345680u, 0xCAFEBAB0u, 0x0Fu, SizeCode::bytes64};
+    expect_encoded(copy, false, 0x123456FAu, 0xCAFEBAB0u);
+    expect_encoded(copy, true, 0x123456FAu, 0xCAFEBAB1u);
 
-    /* SYNC: (mask << 16) | 7, writer word preserved. */
-    const SyncEntry sync{0xBEEFu, 0xBEEFu};
-    expect_encoded(sync, 0xBEEF0007u, 0x0000BEEFu);
+    /* SYNC: (mask << 16) | 7, w1 = phase and nothing else. */
+    expect_encoded(SyncEntry{0xBEEFu}, true, 0xBEEF0007u, 0x00000001u);
+    expect_encoded(SyncEntry{0xBEEFu}, false, 0xBEEF0007u, 0x00000000u);
 
-    /* The writer's low word is not derived from the mask. */
-    const SyncEntry odd_word{0x0000u, 0xFFFFFFFFu};
-    expect_encoded(odd_word, 0x00000007u, 0xFFFFFFFFu);
+    /* Decode split: the typed alternative carries the fields, the writer bit
+     * comes back raw. */
+    const Decoded decoded = decode(make_bytes(0x0BAD00D0u, 0xDEADBEE5u));
+    const auto* typed = std::get_if<JobEntry>(&decoded.entry);
+    CHECK(typed != nullptr);
+    if (typed != nullptr) {
+        CHECK(typed->port_ea == 0x0BAD0080u);
+        CHECK(typed->descriptor_ea == 0xDEADBEE0u);
+        CHECK(typed->tag == 0x0Au);
+        CHECK(typed->size == SizeCode::bytes256);
+    }
+    CHECK(decoded.writer_bit);
+}
 
-    /* Decode split: the typed alternative carries the fields. */
-    const Entry decoded_entry = decode(make_bytes(0x0BAD00D0u, 0xDEADBEE5u));
-    const auto decoded = std::get_if<JobEntry>(&decoded_entry);
-    CHECK(decoded != nullptr);
-    if (decoded != nullptr) {
-        CHECK(decoded->port_ea == 0x0BAD0080u);
-        CHECK(decoded->descriptor_ea == 0xDEADBEE0u);
-        CHECK(decoded->tag == 0x0Au);
-        CHECK(decoded->size == SizeCode::bytes256);
-        CHECK(decoded->flag);
+/* F1 (corrected by m1r-017): w1 bit 0 is the writer's phase bit and nothing
+ * else, for JOB, COPY and SYNC. Identical descriptors differ only by it. */
+void test_writer_bit_jobs()
+{
+    const std::uint32_t port = 0x40000080u;
+    const std::uint32_t desc = 0x80000010u;
+    for (const SizeCode size : {SizeCode::bytes64, SizeCode::bytes128, SizeCode::bytes256}) {
+        const std::uint32_t size_bits = static_cast<std::uint32_t>(size);
+        const JobEntry job{port, desc, 3, size};
+        const CopyEntry copy{port, desc, 3, size};
+        const std::uint32_t job_w0 = port | (3u << 3);
+        const std::uint32_t copy_w0 = job_w0 | 2u;
+
+        expect_encoded(job, false, job_w0, desc | size_bits);
+        expect_encoded(job, true, job_w0, desc | size_bits | 1u);
+        expect_encoded(copy, false, copy_w0, desc | size_bits);
+        expect_encoded(copy, true, copy_w0, desc | size_bits | 1u);
+
+        /* the two encodings differ in exactly bit 0 of w1 */
+        const auto p0 = encode(job, false);
+        const auto p1 = encode(job, true);
+        CHECK(p0.ok() && p1.ok());
+        CHECK(read_word(p0.bytes, 0) == read_word(p1.bytes, 0));
+        CHECK((read_word(p0.bytes, 4) ^ read_word(p1.bytes, 4)) == 1u);
+    }
+
+    /* Decode of the phase-flipped pair: same descriptor, raw writer bit only. */
+    const JobEntry job{port, desc, 7, SizeCode::bytes128};
+    const std::uint32_t job_w0 = port | (7u << 3);
+    const Decoded low = decode(make_bytes(job_w0, desc | 2u));
+    const Decoded high = decode(make_bytes(job_w0, desc | 3u));
+    CHECK(low.entry == Entry(job));
+    CHECK(high.entry == Entry(job));
+    CHECK(!low.writer_bit);
+    CHECK(high.writer_bit);
+}
+
+/* The API flags&1 lives in w0: the port EA is present iff flags&1 (static,
+ * m1r-017), so decode recovers it as port_ea != 0. Independent of the phase. */
+void test_api_flag_port_presence()
+{
+    const std::uint32_t desc = 0x80000010u;
+    for (const bool phase : {false, true}) {
+        const std::uint32_t bit = phase ? 1u : 0u;
+        /* flags&1 = 1: port EA present */
+        const JobEntry with_flag{0x40000080u, desc, 5, SizeCode::bytes256};
+        expect_encoded(with_flag, phase, 0x400000A8u, desc | 4u | bit);
+        CHECK(with_flag.api_flag());
+        /* flags&1 = 0: no port EA in w0 */
+        const JobEntry no_flag{0, desc, 5, SizeCode::bytes256};
+        expect_encoded(no_flag, phase, 0x00000028u, desc | 4u | bit);
+        CHECK(!no_flag.api_flag());
+
+        const CopyEntry copy_flag{0x40000080u, desc, 5, SizeCode::bytes64};
+        const CopyEntry copy_none{0, desc, 5, SizeCode::bytes64};
+        expect_encoded(copy_flag, phase, 0x400000AAu, desc | bit);
+        expect_encoded(copy_none, phase, 0x0000002Au, desc | bit);
+        CHECK(copy_flag.api_flag() && !copy_none.api_flag());
+
+        /* decode recovers the flag from w0 whatever the phase */
+        const Decoded d = decode(make_bytes(0x00000028u, desc | 4u | bit));
+        const auto* typed = std::get_if<JobEntry>(&d.entry);
+        CHECK(typed != nullptr && !typed->api_flag() && d.writer_bit == phase);
+    }
+}
+
+void test_writer_bit_sync()
+{
+    /* SYNC masks with bit 0 clear: the mask is never mirrored into w1. */
+    for (const std::uint16_t mask : {std::uint16_t(0x2), std::uint16_t(0x8), std::uint16_t(0x8000),
+                                     std::uint16_t(0xBEEE), std::uint16_t(0xFFFE)}) {
+        const std::uint32_t w0 = (std::uint32_t(mask) << 16) | 7u;
+        expect_encoded(SyncEntry{mask}, false, w0, 0u);
+        expect_encoded(SyncEntry{mask}, true, w0, 1u);
+
+        /* decode of the phase-flipped pair: same mask, raw writer bit differs */
+        const Decoded d0 = decode(make_bytes(w0, 0u));
+        const Decoded d1 = decode(make_bytes(w0, 1u));
+        CHECK(d0.entry == Entry(SyncEntry{mask}));
+        CHECK(d1.entry == Entry(SyncEntry{mask}));
+        CHECK(!d0.writer_bit);
+        CHECK(d1.writer_bit);
+    }
+
+    /* Mask 1 at phase 1 is the traced shape (w1 == 1 is the phase). */
+    expect_encoded(SyncEntry{0x0001u}, true, 0x00010007u, 0x00000001u);
+    expect_encoded(SyncEntry{0x0001u}, false, 0x00010007u, 0x00000000u);
+
+    /* The old reading, w1 mirroring the mask, is not a SYNC any more. */
+    for (const std::uint32_t w1 : {0x00000002u, 0x0000BEEFu, 0xFFFFFFFFu}) {
+        const auto bytes = make_bytes(0xBEEF0007u, w1);
+        const Decoded d = decode(bytes);
+        CHECK(std::holds_alternative<UnknownEntry>(d.entry));
+        CHECK(encode(d.entry, d.writer_bit).bytes == bytes);
     }
 }
 
@@ -103,41 +203,42 @@ void test_field_boundaries()
     const std::uint32_t desc = 0x80000010u;
 
     /* tag 0 and 15 fit; 16 does not. */
-    expect_encoded(JobEntry{port, desc, 0, SizeCode::bytes64, false}, port, desc);
-    expect_encoded(JobEntry{port, desc, 15, SizeCode::bytes64, false}, port | 0x78u, desc);
-    CHECK(encode(JobEntry{port, desc, 16, SizeCode::bytes64, false}).error ==
+    expect_encoded(JobEntry{port, desc, 0, SizeCode::bytes64}, false, port, desc);
+    expect_encoded(JobEntry{port, desc, 15, SizeCode::bytes64}, false, port | 0x78u, desc);
+    CHECK(encode(JobEntry{port, desc, 16, SizeCode::bytes64}, false).error ==
           EncodeError::tag_out_of_range);
 
-    /* Every size code and both flag values, in w1 bits 2..0. */
-    expect_encoded(JobEntry{port, desc, 1, SizeCode::bytes64, false}, port | 0x08u, desc);
-    expect_encoded(JobEntry{port, desc, 1, SizeCode::bytes64, true}, port | 0x08u, desc | 1u);
-    expect_encoded(JobEntry{port, desc, 1, SizeCode::bytes128, false}, port | 0x08u, desc | 2u);
-    expect_encoded(JobEntry{port, desc, 1, SizeCode::bytes128, true}, port | 0x08u, desc | 3u);
-    expect_encoded(JobEntry{port, desc, 1, SizeCode::bytes256, false}, port | 0x08u, desc | 4u);
-    expect_encoded(JobEntry{port, desc, 1, SizeCode::bytes256, true}, port | 0x08u, desc | 5u);
+    /* Every size code with the writer bit clear and set, in w1 bits 2..0. */
+    expect_encoded(JobEntry{port, desc, 1, SizeCode::bytes64}, false, port | 0x08u, desc);
+    expect_encoded(JobEntry{port, desc, 1, SizeCode::bytes64}, true, port | 0x08u, desc | 1u);
+    expect_encoded(JobEntry{port, desc, 1, SizeCode::bytes128}, false, port | 0x08u, desc | 2u);
+    expect_encoded(JobEntry{port, desc, 1, SizeCode::bytes128}, true, port | 0x08u, desc | 3u);
+    expect_encoded(JobEntry{port, desc, 1, SizeCode::bytes256}, false, port | 0x08u, desc | 4u);
+    expect_encoded(JobEntry{port, desc, 1, SizeCode::bytes256}, true, port | 0x08u, desc | 5u);
     CHECK(size_bytes(SizeCode::bytes64) == 64);
     CHECK(size_bytes(SizeCode::bytes128) == 128);
     CHECK(size_bytes(SizeCode::bytes256) == 256);
 
     /* Port: the 128-byte alignment is the field's low edge. */
-    expect_encoded(JobEntry{0xFFFFFF80u, desc, 0, SizeCode::bytes256, false}, 0xFFFFFF80u,
+    expect_encoded(JobEntry{0xFFFFFF80u, desc, 0, SizeCode::bytes256}, false, 0xFFFFFF80u,
                    desc | 4u);
-    CHECK(encode(JobEntry{0xFFFFFF81u, desc, 0, SizeCode::bytes256, false}).error ==
+    CHECK(encode(JobEntry{0xFFFFFF81u, desc, 0, SizeCode::bytes256}, false).error ==
           EncodeError::port_ea_misaligned);
-    CHECK(encode(JobEntry{0xFFFFFFC0u, desc, 0, SizeCode::bytes256, false}).error ==
+    CHECK(encode(JobEntry{0xFFFFFFC0u, desc, 0, SizeCode::bytes256}, true).error ==
           EncodeError::port_ea_misaligned);
 
     /* Descriptor / pool EA: 16-byte alignment clears w1 bit 3. */
-    expect_encoded(JobEntry{port, 0xFFFFFFF0u, 0, SizeCode::bytes64, false}, port, 0xFFFFFFF0u);
-    CHECK(encode(JobEntry{port, 0xFFFFFFE4u, 0, SizeCode::bytes64, false}).error ==
+    expect_encoded(JobEntry{port, 0xFFFFFFF0u, 0, SizeCode::bytes64}, false, port,
+                   0xFFFFFFF0u);
+    CHECK(encode(JobEntry{port, 0xFFFFFFE4u, 0, SizeCode::bytes64}, false).error ==
           EncodeError::descriptor_ea_misaligned);
-    CHECK(encode(JobEntry{port, 0xFFFFFFF8u, 0, SizeCode::bytes64, false}).error ==
+    CHECK(encode(JobEntry{port, 0xFFFFFFF8u, 0, SizeCode::bytes64}, true).error ==
           EncodeError::descriptor_ea_misaligned);
-    CHECK(encode(CopyEntry{port, 0xFFFFFFE8u, 0, SizeCode::bytes64, false}).error ==
+    CHECK(encode(CopyEntry{port, 0xFFFFFFE8u, 0, SizeCode::bytes64}, false).error ==
           EncodeError::pool_ea_misaligned);
 
     /* A size code outside the three the firmware emits has no wire form. */
-    CHECK(encode(JobEntry{port, desc, 0, static_cast<SizeCode>(6), false}).error ==
+    CHECK(encode(JobEntry{port, desc, 0, static_cast<SizeCode>(6)}, false).error ==
           EncodeError::invalid_size_code);
 }
 
@@ -147,9 +248,9 @@ void test_unknown()
                                     0x00000006u};
     for (std::uint32_t w0 : ports) {
         const auto bytes = make_bytes(w0, 0x11223344u);
-        const Entry entry = decode(bytes);
-        CHECK(std::holds_alternative<UnknownEntry>(entry));
-        const EncodeResult encoded = encode(entry);
+        const Decoded d = decode(bytes);
+        CHECK(std::holds_alternative<UnknownEntry>(d.entry));
+        const EncodeResult encoded = encode(d.entry, d.writer_bit);
         CHECK(encoded.ok());
         CHECK(encoded.bytes == bytes);
     }
@@ -157,25 +258,29 @@ void test_unknown()
     /* SYNC reserved bits 15..3 must be zero. */
     {
         const auto bytes = make_bytes(0x00001217u, 0x00000001u);
-        CHECK(std::holds_alternative<UnknownEntry>(decode(bytes)));
+        CHECK(std::holds_alternative<UnknownEntry>(decode(bytes).entry));
     }
 
     /* JOB/COPY with a size-code field value of 3, or with descriptor bit 3. */
     {
         const auto bytes = make_bytes(0x00000000u, 0x00000006u);
-        const Entry entry = decode(bytes);
-        CHECK(std::holds_alternative<UnknownEntry>(entry));
-        CHECK(encode(entry).bytes == bytes);
+        const Decoded d = decode(bytes);
+        CHECK(std::holds_alternative<UnknownEntry>(d.entry));
+        CHECK(encode(d.entry, d.writer_bit).bytes == bytes);
     }
     {
         const auto bytes = make_bytes(0x00000000u, 0x00000008u);
-        CHECK(std::holds_alternative<UnknownEntry>(decode(bytes)));
+        CHECK(std::holds_alternative<UnknownEntry>(decode(bytes).entry));
     }
 
-    /* Unknown bytes survive exactly, including a zero type word. */
+    /* Unknown bytes survive exactly, including a zero type word, whatever
+     * phase arguments are passed. */
     const auto bytes = make_bytes(0xDEADBEEFu, 0xCAFEBABEu);
-    CHECK(std::holds_alternative<UnknownEntry>(decode(bytes)));
-    CHECK(encode(decode(bytes)).bytes == bytes);
+    const Decoded d = decode(bytes);
+    CHECK(std::holds_alternative<UnknownEntry>(d.entry));
+    CHECK(d.writer_bit == ((0xCAFEBABEu & 1u) != 0));
+    CHECK(encode(d.entry, d.writer_bit).bytes == bytes);
+    CHECK(encode(d.entry, !d.writer_bit).bytes == bytes);
 }
 
 void test_decode_encode_identity()
@@ -189,19 +294,26 @@ void test_decode_encode_identity()
         return z ^ (z >> 31);
     };
 
-    std::size_t typed = 0;
+    std::size_t jobs = 0;
+    std::size_t copies = 0;
+    std::size_t syncs = 0;
     std::size_t unknown = 0;
     constexpr int kIterations = 200000;
     for (int i = 0; i < kIterations; ++i) {
-        std::array<std::uint8_t, kEntryBytes> bytes = make_bytes(
-            static_cast<std::uint32_t>(next()), static_cast<std::uint32_t>(next()));
-        const Entry entry = decode(bytes);
-        if (std::holds_alternative<UnknownEntry>(entry)) {
-            ++unknown;
-        } else {
-            ++typed;
+        std::uint32_t w0 = static_cast<std::uint32_t>(next());
+        std::uint32_t w1 = static_cast<std::uint32_t>(next());
+        /* Random bytes almost never form a SYNC; shape every fourth entry. */
+        if (i % 4 == 3) {
+            w0 = (w0 & 0xFFFF0000u) | 7u;
+            w1 &= 1u;
         }
-        const EncodeResult encoded = encode(entry);
+        const std::array<std::uint8_t, kEntryBytes> bytes = make_bytes(w0, w1);
+        const Decoded decoded = decode(bytes);
+        if (std::holds_alternative<JobEntry>(decoded.entry)) ++jobs;
+        else if (std::holds_alternative<CopyEntry>(decoded.entry)) ++copies;
+        else if (std::holds_alternative<SyncEntry>(decoded.entry)) ++syncs;
+        else ++unknown;
+        const EncodeResult encoded = encode(decoded.entry, decoded.writer_bit);
         if (!encoded.ok() || encoded.bytes != bytes) {
             std::fprintf(stderr, "FAIL identity at iteration %d: ", i);
             dump(bytes);
@@ -209,7 +321,7 @@ void test_decode_encode_identity()
             ++g_failures;
             break;
         }
-        if (!(decode(encoded.bytes) == entry)) {
+        if (!(decode(encoded.bytes) == decoded)) {
             std::fprintf(stderr, "FAIL re-decode at iteration %d: ", i);
             dump(bytes);
             std::fprintf(stderr, "\n");
@@ -217,7 +329,9 @@ void test_decode_encode_identity()
             break;
         }
     }
-    CHECK(typed > 0);
+    CHECK(jobs > 0);
+    CHECK(copies > 0);
+    CHECK(syncs > 0);
     CHECK(unknown > 0);
 }
 
@@ -226,6 +340,9 @@ void test_decode_encode_identity()
 int main()
 {
     test_fixed_layouts();
+    test_writer_bit_jobs();
+    test_api_flag_port_presence();
+    test_writer_bit_sync();
     test_field_boundaries();
     test_unknown();
     test_decode_encode_identity();

@@ -19,10 +19,12 @@ constexpr std::uint32_t kCommandMask = 0x7u;
 constexpr std::uint32_t kTagMask = 0xFu;
 constexpr std::uint32_t kTagShift = 3;
 constexpr std::uint32_t kSizeCodeMask = 0x6u;
-constexpr std::uint32_t kFlagMask = 0x1u;
+constexpr std::uint32_t kWriterBitMask = 0x1u;
 constexpr std::uint32_t kSyncMarker = 0x7u;
 constexpr std::uint32_t kSyncMaskShift = 16;
 constexpr std::uint32_t kSyncReservedMask = 0x0000FFF8u;
+/* SYNC w1 is the phase bit and nothing else. */
+constexpr std::uint32_t kSyncW1ReservedMask = ~kWriterBitMask;
 
 std::uint32_t read_be32(const std::uint8_t* p) noexcept
 {
@@ -57,7 +59,7 @@ struct JobFields {
     std::uint32_t data_ea;
     std::uint8_t tag;
     SizeCode size;
-    bool flag;
+    bool writer_bit;
 };
 
 std::optional<JobFields> decode_job_fields(std::uint32_t w0, std::uint32_t w1) noexcept
@@ -75,13 +77,13 @@ std::optional<JobFields> decode_job_fields(std::uint32_t w0, std::uint32_t w1) n
     fields.data_ea = w1 & ~std::uint32_t(0x7u);
     fields.tag = static_cast<std::uint8_t>((w0 >> kTagShift) & kTagMask);
     fields.size = static_cast<SizeCode>(size_bits << 1);
-    fields.flag = (w1 & kFlagMask) != 0;
+    fields.writer_bit = (w1 & kWriterBitMask) != 0;
     return fields;
 }
 
 EncodeResult encode_job_like(std::uint32_t command, std::uint32_t port_ea,
                              std::uint32_t data_ea, std::uint8_t tag, SizeCode size,
-                             bool flag, EncodeError alignment_error) noexcept
+                             bool writer_bit, EncodeError alignment_error) noexcept
 {
     EncodeResult result;
     if (tag > kTagMask) {
@@ -103,7 +105,7 @@ EncodeResult encode_job_like(std::uint32_t command, std::uint32_t port_ea,
 
     const std::uint32_t w0 =
         port_ea | (std::uint32_t(tag) << kTagShift) | command;
-    const std::uint32_t w1 = data_ea | std::uint32_t(size) | (flag ? 1u : 0u);
+    const std::uint32_t w1 = data_ea | std::uint32_t(size) | (writer_bit ? 1u : 0u);
     write_be32(result.bytes.data(), w0);
     write_be32(result.bytes.data() + 4, w1);
     return result;
@@ -111,37 +113,42 @@ EncodeResult encode_job_like(std::uint32_t command, std::uint32_t port_ea,
 
 }  // namespace
 
-Entry decode(std::span<const std::uint8_t, kEntryBytes> bytes) noexcept
+Decoded decode(std::span<const std::uint8_t, kEntryBytes> bytes) noexcept
 {
     const std::uint32_t w0 = read_be32(bytes.data());
     const std::uint32_t w1 = read_be32(bytes.data() + 4);
+    const bool raw_writer_bit = (w1 & kWriterBitMask) != 0;
 
     switch (w0 & kCommandMask) {
     case static_cast<std::uint32_t>(Command::job):
         if (const auto fields = decode_job_fields(w0, w1))
-            return JobEntry{fields->port_ea, fields->data_ea, fields->tag,
-                            fields->size, fields->flag};
+            return Decoded{JobEntry{fields->port_ea, fields->data_ea, fields->tag,
+                                    fields->size},
+                           fields->writer_bit};
         break;
     case static_cast<std::uint32_t>(Command::copy):
         if (const auto fields = decode_job_fields(w0, w1))
-            return CopyEntry{fields->port_ea, fields->data_ea, fields->tag,
-                             fields->size, fields->flag};
+            return Decoded{CopyEntry{fields->port_ea, fields->data_ea, fields->tag,
+                                     fields->size},
+                           fields->writer_bit};
         break;
     case static_cast<std::uint32_t>(Command::sync):
-        /* SYNC is (mask << 16) | 7; bits 15..3 are written zero. */
-        if ((w0 & kSyncReservedMask) == 0)
-            return SyncEntry{static_cast<std::uint16_t>(w0 >> kSyncMaskShift), w1};
+        /* SYNC is (mask << 16) | 7 with w1 = phase; bits 15..3 and w1 31..1
+         * are written zero. */
+        if ((w0 & kSyncReservedMask) == 0 && (w1 & kSyncW1ReservedMask) == 0)
+            return Decoded{SyncEntry{static_cast<std::uint16_t>(w0 >> kSyncMaskShift)},
+                           raw_writer_bit};
         break;
     default:
         break;
     }
-    return unknown_from(bytes);
+    return Decoded{unknown_from(bytes), raw_writer_bit};
 }
 
-EncodeResult encode(const Entry& entry) noexcept
+EncodeResult encode(const Entry& entry, bool writer_phase) noexcept
 {
     return std::visit(
-        [](const auto& value) -> EncodeResult {
+        [writer_phase](const auto& value) -> EncodeResult {
             using T = std::decay_t<decltype(value)>;
             if constexpr (std::is_same_v<T, UnknownEntry>) {
                 EncodeResult result;
@@ -152,18 +159,18 @@ EncodeResult encode(const Entry& entry) noexcept
                 const std::uint32_t w0 =
                     (std::uint32_t(value.mask) << kSyncMaskShift) | kSyncMarker;
                 write_be32(result.bytes.data(), w0);
-                write_be32(result.bytes.data() + 4, value.word1);
+                write_be32(result.bytes.data() + 4, writer_phase ? 1u : 0u);
                 return result;
             } else if constexpr (std::is_same_v<T, JobEntry>) {
                 return encode_job_like(
                     static_cast<std::uint32_t>(Command::job), value.port_ea,
-                    value.descriptor_ea, value.tag, value.size, value.flag,
+                    value.descriptor_ea, value.tag, value.size, writer_phase,
                     EncodeError::descriptor_ea_misaligned);
             } else {
                 static_assert(std::is_same_v<T, CopyEntry>);
                 return encode_job_like(
                     static_cast<std::uint32_t>(Command::copy), value.port_ea,
-                    value.pool_ea, value.tag, value.size, value.flag,
+                    value.pool_ea, value.tag, value.size, writer_phase,
                     EncodeError::pool_ea_misaligned);
             }
         },
