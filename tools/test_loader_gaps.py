@@ -17,7 +17,12 @@ ppu_loader.cpp against that lift, and runs tests/test_loader_gaps.cpp:
     after a return) is not lowered: no trap, listed as dead, and the code
     around it still runs;
   - a branch out of the lifted code (here: past the image's end) stops
-    (unlifted-function, naming the target) instead of returning.
+    (unlifted-function, naming the target) instead of returning;
+  - a live in-range branch to an address with no decoded instruction stops
+    (unlifted-function, naming the target) and is listed in the report instead
+    of falling off the function;
+  - a branch below the raw image base defines no function and stops naming
+    the target.
 
 A line "RETURNED" from the fixture means the runtime carried on; every case that
 must stop treats it as failure.
@@ -40,11 +45,16 @@ ROOT = Path(__file__).resolve().parents[1]
 # C: b +0x10 ; .word 0xFFFFFFFF, 0, 0 (a literal pool) ; li r3,3 ; blr ; .word 0 (padding)
 # D: li r3,9 ; b 0x20000 (outside the image)
 # E: bctr ; .word 0 ; bl 0x10004 (dead after the computed jump: no trap, no func_00010004)
+# H: li r3,13 ; b 0xFF00 (below the raw image base 0x10000: not a function, stop)
+# G: li r3,11 ; b 0x10054 (in range but past the image bytes: a live path with no
+#    decoded instruction at the target -- its label must stop, not fall off)
 CODE = struct.pack('>IIIII', 0x38600005, 0x4E800020, 0x38600007, 0x00000000, 0x4E800020) + \
     struct.pack('>IIIIIII', 0x48000010, 0xFFFFFFFF, 0x00000000, 0x00000000, 0x38600003, 0x4E800020,
                 0x00000000) + \
     struct.pack('>II', 0x38600009, 0x48000000 | (0x20000 - 0x10034)) + \
-    struct.pack('>III', 0x4E800420, 0x00000000, 0x48000001 | ((0x10004 - 0x10040) & 0x3FFFFFC))
+    struct.pack('>III', 0x4E800420, 0x00000000, 0x48000001 | ((0x10004 - 0x10040) & 0x3FFFFFC)) + \
+    struct.pack('>II', 0x3860000D, 0x4BFFFEB8) + \
+    struct.pack('>II', 0x3860000B, 0x48000004)
 
 
 def main():
@@ -58,7 +68,9 @@ def main():
                                                  {'start': '0x10008', 'end': '0x10014'},
                                                  {'start': '0x10014', 'end': '0x10030'},
                                                  {'start': '0x10030', 'end': '0x10038'},
-                                                 {'start': '0x10038', 'end': '0x10044'}]))
+                                                 {'start': '0x10038', 'end': '0x10044'},
+                                                 {'start': '0x10044', 'end': '0x1004C'},
+                                                 {'start': '0x1004C', 'end': '0x10058'}]))
         lift = tmp / 'lift'
         subprocess.run([sys.executable, str(ROOT / 'tools/ppu_lifter.py'), str(tmp / 'code.bin'), '--raw',
                         '--base', '0x10000', '--functions', str(tmp / 'fn.json'), '--jobs', '1',
@@ -91,8 +103,19 @@ def main():
         fe = report['functions'][2]
         assert fe['name'] == 'func_00010038' and fe['traps'] == [], fe
         assert fe['dead'] == [['0x0001003C', '0x00010040']], fe
-        assert report['summary']['functions'] == 5, report        # no function seeded by dead code
+        # a live branch to an in-range address with no decoded instruction stops
+        # at the target instead of falling off the function; the report lists it
+        fg = report['functions'][3]
+        assert fg['name'] == 'func_0001004C' and fg['traps'] == [] and fg['dead'] == [], fg
+        assert fg['undecoded_targets'] == ['0x00010054'], fg
+        assert report['summary']['functions'] == 7, report        # no function seeded by dead code
         assert report['summary']['dead_instructions'] == 7, report
+        assert report['summary']['undecoded_targets'] == 1, report
+        assert report['summary']['functions_with_undecoded_targets'] == 1, report
+        # a branch below the raw image base never becomes a function
+        src = (lift / 'ppu_recomp.cpp').read_text()
+        assert 'func_0000FF00' not in src, 'below-base target became a function'
+        assert 'func_00010054' not in src, 'undecoded target became a function'
         # the parallel lift (the default: --jobs = CPU count) reports the same gaps
         subprocess.run([sys.executable, str(ROOT / 'tools/ppu_lifter.py'), str(tmp / 'code.bin'), '--raw',
                         '--base', '0x10000', '--functions', str(tmp / 'fn.json'), '--jobs', '2',
@@ -100,6 +123,22 @@ def main():
                        check=True, capture_output=True)
         report2 = json.loads((tmp / 'lift2' / 'ppu_lift_report.json').read_text())
         assert report2 == report, (report, report2)
+
+        # A conditional branch that can fall off the function must reach the
+        # continuation before a tail stop label: only `goto loc_X` may land on
+        # the stop. li r3,21 ; beq 0x0C (0x0C is in [0,0x10) but past the bytes).
+        (tmp / 'tail.bin').write_bytes(bytes.fromhex('3860001541820008'))
+        (tmp / 'tail.json').write_text(json.dumps([{'start': '0x0', 'end': '0x10'}]))
+        subprocess.run([sys.executable, str(ROOT / 'tools/ppu_lifter.py'), str(tmp / 'tail.bin'), '--raw',
+                        '--base', '0', '--functions', str(tmp / 'tail.json'), '--jobs', '1',
+                        '--single-file', '--source-name', 'ppu_recomp.cpp',
+                        '--output', str(tmp / 'tail')],
+                       check=True, capture_output=True)
+        tail_src = (tmp / 'tail' / 'ppu_recomp.cpp').read_text()
+        tail_report = json.loads((tmp / 'tail' / 'ppu_lift_report.json').read_text())
+        assert tail_report['functions'][0]['undecoded_targets'] == ['0x0000000C'], tail_report
+        assert (tail_src.index('missing continuation 0x00000010')
+                < tail_src.index('loc_0000000C: ppu_unlifted_stub')), tail_src
 
         # a function that is fine runs; the one with the unknown instruction does not stop before it
         p = run('call', '0x10000')
@@ -113,6 +152,16 @@ def main():
         assert 'RETURNED' not in p.stdout, (p.stdout, p.stderr)
         f = g.expect_stop(p, 'unlifted-function')
         assert f['target'] == '0x00020000', f
+        # a live goto to an undecoded in-range address stops naming it
+        p = run('call', '0x1004C')
+        assert 'RETURNED' not in p.stdout, (p.stdout, p.stderr)
+        f = g.expect_stop(p, 'unlifted-function')
+        assert f['target'] == '0x00010054', f
+        # a branch below the raw image base stops naming the target
+        p = run('call', '0x10044')
+        assert 'RETURNED' not in p.stdout, (p.stdout, p.stderr)
+        f = g.expect_stop(p, 'unlifted-function')
+        assert f['target'] == '0x0000FF00', f
 
         # unimplemented syscall
         p = run('syscall', '999')

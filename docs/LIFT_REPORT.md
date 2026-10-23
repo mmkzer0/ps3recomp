@@ -21,6 +21,17 @@ the lowerings that certainly end a block (`return`, `goto`, a tail call, a
 jump-table switch, a trap) stop the walk; every other lowering is taken to fall
 through, so an unrecognised one can only keep code, never drop it.
 
+A live `goto loc_X` whose target has no emitted instruction (an in-range
+address inside a too-large boundary, or past the bytes the disassembler saw)
+used to get an empty tail label and fall off the function — a guest path
+returned although it should have stopped. The label now calls
+`ppu_unlifted_stub(0xX, ctx)` (stop kind `unlifted-function`, naming the
+target), and the target is listed under `undecoded_targets`. The same window
+rule applies to discovery: no function entry is created outside
+`[code_lo, code_hi)` (lowest executable section for an ELF, load base for a
+`--raw` image). Import stubs named by `--hle-stubs` stay callable by
+declaration and are exempt, as before.
+
 ```json
 {
   "schema": 1,
@@ -29,15 +40,20 @@ through, so an unrecognised one can only keep code, never drop it.
   "summary": {
     "functions": 0,               "functions_with_traps": 0,
     "trapped_instructions": 0,    "functions_with_dead": 0,
-    "dead_instructions": 0,       "capped_mid_tails": 0,
+    "dead_instructions": 0,       "functions_with_undecoded_targets": 0,
+    "undecoded_targets": 0,       "capped_mid_tails": 0,
     "unresolved_targets": 0
   },
-  "functions": [                  // only functions with a trap or a dead range
+  "functions": [                  // only functions with a trap, a dead range or
+                                  // an undecoded target
     { "name": "func_00010008", "start": "0x00010008", "end": "0x00010014",
       "traps": [ ["0x0001000C", "0x00000000", ".word 0x00000000"] ],
                                   //  [pc, raw word, decoded "mnemonic operands"]
-      "dead": [ ["0x00010010", "0x00010010"] ] }
+      "dead": [ ["0x00010010", "0x00010010"] ],
                                   //  [first, last] address of each unreachable run
+      "undecoded_targets": [ "0x00010054" ] }
+                                  //  live goto targets with no emitted instruction;
+                                  //  the label stops (unlifted-function)
   ],
   "capped_mid_tails": [           // tails truncated at _MAX_MID_TAIL (0x6000 bytes)
     { "start": "0x...", "wanted_end": "0x...", "capped_end": "0x..." } ],
@@ -51,9 +67,12 @@ Classifying a trap: `.word` is the disassembler's "not an instruction" fallback,
 it is almost always data inside a function the discovery pass got wrong; the word
 itself (a pointer, a string, `0x00000000`) usually says so. A named mnemonic
 (`vmx_*`, `op31_*`, `rld??`) with a plausible encoding is a real instruction the
-lifter lacks and needs a lowering. `unresolved_targets` are what would reach
-`ppu_unlifted_stub` (stop kind `unlifted-function`) at run time, or fail to link.
-A function list that is wrong shows as many `.word` traps in the same functions;
-fix discovery (`--code-end`, a better function list), not the traps.
+lifter lacks and needs a lowering. `unresolved_targets` are registered call or
+branch targets with no lifted function: they reach `ppu_unlifted_stub` (stop
+kind `unlifted-function`) at run time, or fail to link. A branch outside the
+code window or a live goto to an undecoded in-range address stops the same way
+but is not counted there (see `undecoded_targets`). A function list that is
+wrong shows as many `.word` traps in the same functions; fix discovery
+(`--code-end`, a better function list), not the traps.
 
 `tools/lift_audit.py` counts the traps in the generated source as well.
