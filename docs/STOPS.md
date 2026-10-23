@@ -64,6 +64,7 @@ Ids are stable kebab-case; a new gap gets a new kind, never a free-text variant.
 | `jq2-ring-entry` | the JobQueue2 command ring holds an entry the executor cannot run: JOBLIST, FLUSH or an unknown command, or a JOB/COPY whose descriptor EA is 0 or outside guest memory. Only the executor's own writer produces entries it models |
 | `jq2-wake` | a credit completed a registered `Port2Sync` waiter the executor cannot signal: a fiber waiter (wait kind 0, fibers are not modelled yet), another wait kind, or an id outside the queue's 128 event-flag bits |
 | `jq2-state` | a JobQueue2 executor invariant broke: a finished job was not in flight in the scheduler, a ring entry named a port EA that is not a port block, the ring writer refused an entry the front end had validated, a port's queue slot was not allocated, or a worker thread could not be started |
+| `jq2-jm-call` | a JobQueue2 job called jm interface word 0 (`0x1500`, the policy module's scheduler switch: "yield this Execute slot to the manager with a request"). No Odin Sphere job image does; the HLE executor runs one job per worker and has no manager to switch to. The job is neither executed nor credited |
 
 Where each is raised, and what it carries beyond `pc lr tid`:
 
@@ -89,6 +90,7 @@ Where each is raised, and what it carries beyond `pc lr tid`:
 | `jq2-ring-entry` | `Queue::worker_loop`, `Queue::admit` | `queue read_index ring_ea` for an entry the scheduler does not model, or `queue reason index descriptor` (`reason=descriptor`) for a descriptor EA that is 0 or outside guest memory |
 | `jq2-wake` | `Queue::wake` | `queue port kind id` (the wait kind from port bits 30:29 and the waiter id from `port+0x04`) |
 | `jq2-state` | the executor | `queue` plus the facts of the broken invariant (`dispatch`, `port`, `slot`, `error encode`, `workers`) |
+| `jq2-jm-call` | `libs/spurs/jq2/executor.cpp` (`require_normal_return`) | `queue job port tag worker request lr status`, with `request` the job's r3 at the call (the request word) and `lr` the caller's link register (also the `lr` of the machine line); `pc` is the stop word's address, `0x1500` |
 
 Lifted code does not track a guest pc, so for the first four `pc` is the caller's
 return address (the import stub's caller, the `sc` site, the call site). Only

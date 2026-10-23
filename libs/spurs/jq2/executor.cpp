@@ -50,7 +50,14 @@ namespace {
 constexpr std::uint32_t kQRing = 0x10;
 constexpr std::uint32_t kQDepth = 0x14;
 constexpr std::uint32_t kQInit16 = 0x16;
+/* queue+0x6C: CreateCommon stores the SPURS EA | the workload id (m1r-004); the
+ * join sets bit 0x20 (kJoined). The workload id is the low 5 bits. The HLE has
+ * no SPURS workload registry, so it gives the queue's workload the id the
+ * firmware gives the first one, 0 (kWorkloadId), and the job staging reads it
+ * back from the word - the kernel view's wklCurrentId/UniqueId (0x1D8/0x1DC). */
 constexpr std::uint32_t kQWorkloadFlags = 0x6C;
+constexpr std::uint32_t kWorkloadIdMask = 0x1F;
+constexpr std::uint32_t kWorkloadId = 0;
 constexpr std::uint32_t kQPortCount = 0x70;
 constexpr std::uint32_t kQEventFlag = 0x80; /* two u32 ids */
 constexpr std::uint32_t kQPortBitmap = 0x580;
@@ -652,6 +659,23 @@ thread_local const JobStart* t_job = nullptr;
               &site);
 }
 
+/* A job that called jm word 0 (SPU_JQ2_JM_CALL_LS), the policy module's
+ * scheduler switch. The HLE runs one job per worker and has no manager to
+ * switch to; the job is neither executed nor credited. */
+[[noreturn]] void jm_call_stop(const spu_context* ctx)
+{
+    const JobStart* js = t_job;
+    const ps3_stop_site site{SPU_JQ2_JM_CALL_LS, ctx->gpr[0]._u32[0] & SPU_LS_MASK, js ? js->worker : 0};
+    stop_with(PS3_STOP_JQ2_JM_CALL,
+              "a JobQueue2 job called jm interface word 0, the policy module's scheduler switch",
+              "No Odin Sphere job image does; the executor runs one job per worker and has no manager to yield an "
+              "Execute slot to. The port was not credited.",
+              {hex("queue", js ? js->queue_ea : 0), hex("job", js ? js->descriptor_ea : 0),
+               hex("port", js ? js->port_ea : 0), dec("tag", js ? js->tag : 0), dec("worker", js ? js->worker : 0),
+               hex("request", ctx->gpr[3]._u32[0]), hex("status", ctx->status)},
+              &site);
+}
+
 /* The one definition of a job's normal return, for every job body. The job
  * returns through the link register the loader plants (kJobReturnLs, 0x3FF00),
  * and the two kinds of body arrive there differently:
@@ -667,6 +691,11 @@ thread_local const JobStart* t_job = nullptr;
 void require_normal_return(const spu_context* ctx)
 {
     const std::uint32_t pc = ctx->pc & SPU_LS_MASK;
+    /* The stop word the loader planted at jm word 0, reached by an interpreted
+     * job or, through the resolver's interpretation of the live bytes, a lifted one. */
+    if (ctx->status == SPU_STATUS_STOPPED_BY_STOP && ctx->stop_code == SPU_JQ2_JM_CALL_STOP &&
+        pc == SPU_JQ2_JM_CALL_LS + 4u)
+        jm_call_stop(ctx);
     if (ctx->status == SPU_STATUS_STOPPED_BY_STOP && ctx->stop_code == 0 && pc == kJobReturnLs + 4u) return;
     if (pc == kJobReturnLs && (ctx->status & (SPU_STATUS_STOPPED_BY_STOP | SPU_STATUS_STOPPED_BY_HALT)) == 0) return;
     const char* reason = ctx->status == SPU_STATUS_STOPPED_BY_HALT   ? "halt"
@@ -677,7 +706,9 @@ void require_normal_return(const spu_context* ctx)
 
 void interpreter_entry(spu_context* ctx)
 {
-    spu_interp_run(ctx, 0);
+    /* From the entry state the loader staged: pc is the image base (0x7C00 in
+     * the JQ2 profile), not LS 0. */
+    spu_interp_run(ctx, ctx->pc);
     require_normal_return(ctx);
 }
 
@@ -689,6 +720,12 @@ void Queue::run_job(const JobStart& js, const std::optional<jq2_job_observer>& o
     if (hooks_.select_body != nullptr) body = hooks_.select_body(hooks_.user, js);
     if (body.entry == nullptr) body = interpreter_body();
 
+    /* What the queue contributes to the PM's staging (spu_workload.h), from the
+     * queue block as the PM reads it: maxDescriptor, the SPURS EA, the
+     * workload id (queue+0x6C); the SPU the job stands on is the worker. */
+    const spu_jq2_env env{max_descriptor_, ld32(ea_ + kQSpurs), ld32(ea_ + kQWorkloadFlags) & kWorkloadIdMask,
+                          js.worker};
+
     t_job = &js;
     int rc;
     if (!obs) {
@@ -696,8 +733,8 @@ void Queue::run_job(const JobStart& js, const std::optional<jq2_job_observer>& o
          * where the job's ending is classified (require_normal_return). */
         spu_job_hooks hooks{};
         hooks.end = [](void*, spu_context* ctx) { require_normal_return(ctx); };
-        rc = spu_run_spurs_job_hooked(body.entry, body.image_id, js.descriptor_ea, js.descriptor.data(), js.size,
-                                      &hooks);
+        rc = spu_run_jq2_job(body.entry, body.image_id, js.descriptor_ea, js.descriptor.data(), js.size, &env,
+                             &hooks);
     } else {
         /* The loader hands the layout it chose to the observer; the job's
          * identity is what this worker admitted. */
@@ -741,8 +778,8 @@ void Queue::run_job(const JobStart& js, const std::optional<jq2_job_observer>& o
             auto& ob = *static_cast<Observed*>(user);
             if (ob.obs->job_end != nullptr) ob.obs->job_end(ob.obs->user, ctx, ctx->gpr[3]._u32[0], &ob.info);
         };
-        rc = spu_run_spurs_job_hooked(body.entry, body.image_id, js.descriptor_ea, js.descriptor.data(), js.size,
-                                      &hooks);
+        rc = spu_run_jq2_job(body.entry, body.image_id, js.descriptor_ea, js.descriptor.data(), js.size, &env,
+                             &hooks);
     }
     t_job = nullptr;
     if (rc != 0) {
@@ -1062,6 +1099,7 @@ int32_t jq2_queue_create(uint32_t revision, uint32_t sdk_version, uint32_t spurs
     st16(queue + kQInit16, 256);
     st32(queue + 0x04, kFlagsInitial);
     st32(queue + kQSpurs, spurs);
+    st32(queue + kQWorkloadFlags, spurs | kWorkloadId);
     st32(queue + kQMaxDescriptor, max_descriptor);
     st32(queue + kQSdk, sdk_version);
     st32(queue + kQRevision, revision);

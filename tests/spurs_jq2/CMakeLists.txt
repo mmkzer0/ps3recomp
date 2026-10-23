@@ -100,7 +100,8 @@ target_include_directories(test_jq2_executor PRIVATE "${PROJECT_SOURCE_DIR}/runt
 target_link_libraries(test_jq2_executor PRIVATE ps3recomp_spurs_jq2 Threads::Threads)
 # The runtime carries C++ and Objective-C, so the C++ driver links.
 set_target_properties(test_jq2_executor PROPERTIES LINKER_LANGUAGE CXX)
-foreach(mode premature copy credit wrap barrier sync join observer validate lifted stop-job stop-halt stop-crt stop-ring)
+foreach(mode premature copy credit wrap barrier sync join observer validate lifted layout layout-896 jm-wait heap-fit
+              stop-job stop-halt stop-jm stop-jm-lifted stop-heap stop-unmodelled stop-crt stop-ring)
     string(REPLACE "-" "_" name "${mode}")
     add_test(NAME jq2_exec_${name} COMMAND test_jq2_executor ${mode})
     set_tests_properties(jq2_exec_${name} PROPERTIES LABELS "spurs;t0;tsan" TIMEOUT 300)

@@ -168,6 +168,7 @@ enum {
 };
 
 #define ALIGN1024(x)  (((uint64_t)(x) + 1023u) & ~(uint64_t)1023u)
+#define ALIGN128(x)   (((uint64_t)(x) + 127u) & ~(uint64_t)127u)
 #define JOB_DMA_TAG   20u          /* "one of: {20,21}" — job_context_types.h */
 #define JOB_STACK_DEFAULT 8192u    /* _cellSpursCheckJob's sizeStack==0 default */
 
@@ -231,6 +232,26 @@ static void job_rt_plant(uint8_t* ls)
     ls32(ls, JOB_JM_IFACE + 4u, JOB_RT_LS + JOB_RT_SWAP);
 }
 
+/* The JobQueue2 profile's jm interface (docs/JQ2.md, "JQ2 job ABI"). The PM
+ * keeps the table at SPU_JQ2_JM_LS = {0x1500, 0x5870, 0, 0} and the CRT copies
+ * those words into the job's bss, so the addresses are part of what the job's
+ * image+bss shows; the code behind them is authored here, not the PM's.
+ *   0x5870  the coroutine swap. A queue worker runs one job, so there is no
+ *           other context to switch to: the same poll loop as s_job_rt_swap
+ *           (it waits for every tag group, clobbers only r3, returns through
+ *           r0, and leaves the tag mask channel at -1) is the swap's whole
+ *           observable effect, as docs/JQ2.md argues from the PM's swap.
+ *   0x1500  the scheduler switch: a `stop` with SPU_JQ2_JM_CALL_STOP. The
+ *           executor names it (jq2-jm-call); no Odin Sphere image calls it. */
+static void job_jq2_plant(uint8_t* ls)
+{
+    ls32(ls, SPU_JQ2_JM_CALL_LS, SPU_JQ2_JM_CALL_STOP);
+    for (uint32_t i = 0; i < sizeof s_job_rt_swap / sizeof s_job_rt_swap[0]; i++)
+        ls32(ls, SPU_JQ2_JM_SWAP_LS + i * 4u, s_job_rt_swap[i]);
+    ls32(ls, SPU_JQ2_JM_LS,      SPU_JQ2_JM_CALL_LS);
+    ls32(ls, SPU_JQ2_JM_LS + 4u, SPU_JQ2_JM_SWAP_LS);
+}
+
 /* Local store of the most recent job, kept alive past the run.
  *
  * A title can poll the SPU that runs a job chain with sys_spu_thread_read_LS,
@@ -284,6 +305,7 @@ typedef struct job_mem {
     uint32_t size_io, size_out;
     uint64_t size_scr, size_stk;
     uint64_t cache;            /* cache entry sizes read so far, the failing one included */
+    uint64_t limit;            /* the lowest address the job's memory must stay below */
 } job_mem;
 
 /* p is the end address of the region that crosses JOB_RT_LS (64-bit, so a huge
@@ -303,7 +325,7 @@ PS3_NORETURN static void job_memory_stop(const job_mem* m, const char* region, u
     snprintf(stk_s, sizeof stk_s, "0x%llX", (unsigned long long)m->size_stk);
     snprintf(cache_s, sizeof cache_s, "0x%llX", (unsigned long long)m->cache);
     snprintf(p_s, sizeof p_s, "0x%llX", (unsigned long long)p);
-    snprintf(lim_s, sizeof lim_s, "0x%X", JOB_RT_LS);
+    snprintf(lim_s, sizeof lim_s, "0x%llX", (unsigned long long)m->limit);
     ps3_stop_field f[] = {
         {"job", job_s}, {"image", img_s}, {"binary", bin_s},
         {"bss", bss_s}, {"memory", mem_s}, {"io", io_s}, {"out", out_s},
@@ -374,14 +396,50 @@ PS3_NORETURN static void job_dma_stop(const job_dma* d, long long index,
              f, sizeof f / sizeof f[0], NULL);
 }
 
+/* The cache-hinted read-only inputs: placed and checked, staged later. `p` is
+ * the running heap pointer on entry and the pointer past the last buffer on
+ * return. Jobchain (q == 0): an entry with no size or no EAL is skipped (no
+ * buffer, pointer 0), buffers are 1024-aligned and must end at or below
+ * `limit`. JobQueue2 (q): the PM allocates A128(size) for every entry and
+ * points cacheBuffer[i] at the running pointer, so an entry with no size has
+ * the pointer and no room, and one with no EAL has its room and nothing copied
+ * into it. */
+static uint64_t job_place_cache(const desc_view* dv, const job_dma* jd, job_mem* jm, int q,
+                                uint32_t n_dma, uint32_t n_cache, uint64_t p,
+                                uint32_t cache_ls[4], job_xfer cache_x[4])
+{
+    for (uint32_t i = 0; i < n_cache; i++) {
+        const uint64_t e   = dv64(dv, (uint32_t)(JH_SIZE + (uint64_t)n_dma * 8u + (uint64_t)i * 8u));
+        const uint32_t sz  = (uint32_t)(e >> 32);
+        const uint32_t eal = (uint32_t)e;
+        if (!q && (!sz || !eal)) continue;
+        if (q && !sz) { cache_ls[i] = (uint32_t)p; continue; }
+        if (eal && !guest_range_ok(eal, sz))
+            job_dma_stop(jd, (long long)i, eal, sz, 0, jm->cache + sz, "cache-range");
+        jm->cache += sz;
+        const uint64_t room = q ? ALIGN128(sz) : sz;
+        if (p + room > jm->limit)
+            job_memory_stop(jm, "cache", p + room);
+        cache_ls[i] = (uint32_t)p;
+        if (eal) { cache_x[i].ls = (uint32_t)p; cache_x[i].ea = eal; cache_x[i].size = sz; }
+        p += q ? ALIGN128(sz) : ALIGN1024(sz);
+    }
+    return p;
+}
+
 /* The loader. `snap` NULL reads the descriptor from guest memory at job_ea;
  * otherwise from the snap_size bytes at `snap`, with job_ea still the EA the job
  * sees as its eaJobDescriptor. `retain_ls` keeps the finished local store for
  * spurs_job_ls_for_handle (a chain job); a queue's job has no chain handle and
- * keeps no shared state, so two of them can run on two threads at once. */
+ * keeps no shared state, so two of them can run on two threads at once.
+ * `jq2` NULL stages the jobchain layout; non-NULL stages the JobQueue2 policy
+ * module's (spu_run_jq2_job). The descriptor, DMA-list and cache validation is
+ * the same for both; only the placement, the context and the entry state
+ * differ, and each place that does is marked `q`. */
 static int run_spurs_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_ea,
                          const uint8_t* snap, uint32_t snap_size,
-                         uint32_t job_desc_size, int retain_ls, const spu_job_hooks* hooks)
+                         uint32_t job_desc_size, int retain_ls, const spu_job_hooks* hooks,
+                         const spu_jq2_env* jq2)
 {
     if (!entry || !job_ea) return -1;
     const desc_view dv = { snap, snap_size, job_ea };
@@ -393,6 +451,7 @@ static int run_spurs_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_e
      * stack and buffers over it. */
     uint64_t ea_bin64 = dv64(&dv, JH_EA_BINARY);
     uint32_t ea_bin   = (uint32_t)(ea_bin64 & ~1ull);
+    const int q       = jq2 != NULL;
     uint64_t bss      = (ea_bin64 >> 32) << 4;
     uint32_t size_bin = (uint32_t)dv16(&dv, JH_SIZE_BINARY) << 4;
     uint32_t n_dma    = (uint32_t)dv16(&dv, JH_SIZE_DMA_LIST) / 8u;
@@ -403,8 +462,28 @@ static int run_spurs_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_e
     uint32_t size_scr = (uint32_t)dv16(&dv, JH_SIZE_SCRATCH) << 4;
     uint32_t n_cache  = dv32(&dv, JH_SIZE_CACHE_DMA_LIST) / 8u;
 
+    const uint32_t n_cache_raw = n_cache;
     if (n_cache > 4) n_cache = 4;                    /* jm2 caps at 4 */
     if (!size_stk) size_stk = JOB_STACK_DEFAULT;
+
+    /* q: the image's base, the end of the heap the PM allocates from, and the
+     * image's size. The PM sizes image+bss as A128((sizeBinary + u16@+2) << 4)
+     * -- only the LOW half of the eaBinary high word counts (that is `bss`),
+     * and the PM copies only sizeBinary << 4 bytes of it, so the rest is bss it
+     * never clears (the job's crt0 does). The 128-byte rounding is the PM's
+     * allocation, not bss: the job's own footprint, image + bss, is what the
+     * image header's word at +0x3C says. The heap runs up from the image base
+     * to the descriptor arena D0 = 0x3F400 - 4 * maxDesc (maxDesc 0 means
+     * 256). */
+    const uint32_t base  = q ? SPU_JQ2_IMAGE_LS : 0u;
+    uint64_t limit = JOB_RT_LS;
+    uint32_t d0 = 0, max_desc = 0;
+    if (q) {
+        max_desc = jq2->max_desc ? jq2->max_desc : 256u;
+        d0 = SPU_JQ2_DESC_TOP - 4u * max_desc;
+        limit = d0;
+        bss = (uint64_t)dv16(&dv, 2) << 4;
+    }
 
     job_dma jd = { job_ea, image_id, size_io };
     /* P3: a job that names no image is a malformed descriptor, never a
@@ -414,6 +493,21 @@ static int run_spurs_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_e
         job_dma_stop(&jd, -1, ea_bin, size_bin, 0, 0, "eaBinary");
     if (!size_bin)
         job_dma_stop(&jd, -1, ea_bin, 0, 0, 0, "sizeBinary");
+    /* q: what the PM's layout evidence does not decode is a stop, never a
+     * guess (docs/JQ2.md, "Unresolved"): the jobType byte's bit 1 shifts the
+     * scratch block and the stack by amounts nobody has decoded (U1), the
+     * eaBinary low word's bit 1 makes the PM hold in a debugger stop (U6), and
+     * the cache count was observed up to 2 only (U5; the PM's loop has no cap
+     * and the context has four slots). */
+    if (q) {
+        const unsigned job_type = (unsigned)(dv16(&dv, JH_JOB_TYPE) >> 8);
+        if (ea_bin64 & 2u)
+            job_dma_stop(&jd, -1, (uint32_t)ea_bin64, size_bin, 0, 0, "binary-bit1");
+        if (job_type & 2u)
+            job_dma_stop(&jd, -1, ea_bin, job_type, 0, 0, "jobtype-bit1");
+        if (n_cache_raw > 2)
+            job_dma_stop(&jd, -1, ea_bin, (uint64_t)n_cache_raw * 8u, 0, 0, "cache-count");
+    }
     if (size_bin > SPU_LS_SIZE) {
         fprintf(stderr, "[spurs-job] job 0x%08X: bad sizeBinary=%u -- not run\n",
                 job_ea, size_bin);
@@ -426,9 +520,10 @@ static int run_spurs_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_e
      * written below would land on the job's own bytes, and a stack that wraps
      * LS addressing would run over them. */
     job_mem jm = { job_ea, image_id, size_bin, bss, size_io, size_out,
-                   (uint64_t)size_scr, (uint64_t)size_stk, 0 };
-    if ((uint64_t)size_bin + bss > JOB_RT_LS)
-        job_memory_stop(&jm, "image", (uint64_t)size_bin + bss);
+                   (uint64_t)size_scr, (uint64_t)size_stk, 0, limit };
+    const uint64_t img_alloc = q ? ALIGN128(size_bin + bss) : (uint64_t)size_bin + bss;
+    if ((uint64_t)base + img_alloc > limit)
+        job_memory_stop(&jm, "image", (uint64_t)base + img_alloc);
 
     /* The binary is read from guest memory by the CRT gate just below and again
      * when it is staged: its whole extent must lie inside mapped guest memory
@@ -472,7 +567,44 @@ static int run_spurs_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_e
                  f, sizeof f / sizeof f[0], NULL);
     }
 
-    /* ---- regions, following _cellSpursCheckJob's own arithmetic --------- */
+    /* ---- regions ----------------------------------------------------------
+     * Jobchain: _cellSpursCheckJob's own arithmetic, 1024-aligned, image at LS
+     * 0, cache buffers last. JobQueue2 (q): the PM's -- image at 0x7C00, 128-
+     * aligned, cache buffers first. */
+    /* Both lists are descriptor bytes. Reading them must stay inside guest
+     * memory: the extent is summed in 64 bits, so a sizeDmaList at the u16 cap
+     * next to a high descriptor EA cannot wrap into a low address. */
+    const uint64_t dma_base   = (uint64_t)job_ea + JH_SIZE;      /* input list ... */
+    /* ... then the cache list, at JH_SIZE + n_dma * 8 in the descriptor. */
+    const int lists_bad = snap ? (uint64_t)JH_SIZE + ((uint64_t)n_dma + n_cache) * 8u > snap_size
+                               : !guest_range_ok(dma_base, ((uint64_t)n_dma + n_cache) * 8u);
+    uint32_t cache_ls[4] = { 0, 0, 0, 0 };
+    job_xfer cache_x[4]  = { { 0, 0, 0 }, { 0, 0, 0 }, { 0, 0, 0 }, { 0, 0, 0 } };
+    uint64_t p;
+    uint32_t io_ls, out_ls, s_ls, stack_top;
+    if (q) {
+        if (lists_bad)
+            job_dma_stop(&jd, -1, dma_base, ((uint64_t)n_dma + n_cache) * 8u,
+                         0, 0, "descriptor-range");
+        p = (uint64_t)base + ALIGN128(size_bin + bss);
+        p = job_place_cache(&dv, &jd, &jm, q, n_dma, n_cache, p, cache_ls, cache_x);
+        io_ls = (uint32_t)p;
+        if (p + ALIGN128(size_io) > limit)
+            job_memory_stop(&jm, "io", p + ALIGN128(size_io));
+        p += ALIGN128(size_io);
+        out_ls = (uint32_t)p;                            /* independent of the useInOut word */
+        if (p + ALIGN128(size_out) > limit)
+            job_memory_stop(&jm, "out", p + ALIGN128(size_out));
+        p += ALIGN128(size_out);
+        /* sBuffer is the base of the scratch + stack block; the stack starts
+         * after A128(scratch) and its top T is where r1 comes from. */
+        s_ls = (uint32_t)p;
+        const uint64_t stack_base = p + ALIGN128(size_scr);
+        if (stack_base + ALIGN128(size_stk) > limit)
+            job_memory_stop(&jm, "stack", stack_base + ALIGN128(size_stk));
+        stack_top = (uint32_t)(stack_base + size_stk);
+        p = stack_base + ALIGN128(size_stk);
+    } else {
     /* Same rule as the scratch pointer: these are REGION BASES and stay valid
      * when the region is empty. NULL invites the job to dereference 0 -- and
      * since the job binary loads at LS 0, reading through a null base returns
@@ -480,56 +612,36 @@ static int run_spurs_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_e
      * wedged jobs were doing: each spun DMAing to the word at offset 0x64 of
      * its own image, which is why the addresses were misaligned and looked
      * like floats -- they were opcodes. */
-    uint64_t p         = ALIGN1024((uint64_t)size_bin + bss);
-    uint32_t io_ls     = (uint32_t)p;
+    p                  = ALIGN1024((uint64_t)size_bin + bss);
+    io_ls              = (uint32_t)p;
     if (size_io && p + size_io > JOB_RT_LS)
         job_memory_stop(&jm, "io", p + size_io);
     p += ALIGN1024((uint64_t)size_io);
-    uint32_t out_ls    = (uint32_t)p;
+    out_ls             = (uint32_t)p;
     if (size_out && p + size_out > JOB_RT_LS)
         job_memory_stop(&jm, "out", p + size_out);
     p += ALIGN1024((uint64_t)size_out);
     if (use_io && !out_ls) out_ls = io_ls;    /* in-out: output shares ioBuffer */
-    uint32_t ss_size   = (uint32_t)ALIGN1024((uint64_t)size_scr + size_stk);
+    const uint32_t ss_size = (uint32_t)ALIGN1024((uint64_t)size_scr + size_stk);
     /* The scratch pointer is the BASE OF THE SCRATCH+STACK BLOCK, and it is
      * valid even when sizeScratch is 0 -- a zero-length buffer still has an
      * address. Handing the job a NULL here meant it dereferenced 0 and read
      * ITS OWN CODE as data: every wedged job in Tokyo Jungle was loading a
      * word from LS 0x64 and using that SPU instruction word as a DMA address,
      * which is why the addresses looked like misaligned floats. */
-    uint32_t s_ls      = (uint32_t)p;
+    s_ls               = (uint32_t)p;
     /* The block's top is where r1 starts: the stack must lie wholly below
      * JOB_RT_LS, or LS masking would put it on the context and descriptor. */
     if (p + ss_size > JOB_RT_LS)
         job_memory_stop(&jm, "stack", p + ss_size);
-    uint32_t stack_top = s_ls + ss_size;
+    stack_top = s_ls + ss_size;
     p += ss_size;
 
     /* ---- cache-hinted read-only inputs: placed and checked here, staged below */
-    const uint64_t dma_base   = (uint64_t)job_ea + JH_SIZE;      /* input list ... */
-    /* ... then the cache list, at JH_SIZE + n_dma * 8 in the descriptor. */
-    /* Both lists are descriptor bytes. Reading them must stay inside guest
-     * memory: the extent is summed in 64 bits, so a sizeDmaList at the u16 cap
-     * next to a high descriptor EA cannot wrap into a low address. */
-    if (snap ? (uint64_t)JH_SIZE + ((uint64_t)n_dma + n_cache) * 8u > snap_size
-             : !guest_range_ok(dma_base, ((uint64_t)n_dma + n_cache) * 8u))
+    if (lists_bad)
         job_dma_stop(&jd, -1, dma_base, ((uint64_t)n_dma + n_cache) * 8u,
                      0, 0, "descriptor-range");
-    uint32_t cache_ls[4] = { 0, 0, 0, 0 };
-    job_xfer cache_x[4]  = { { 0, 0, 0 }, { 0, 0, 0 }, { 0, 0, 0 }, { 0, 0, 0 } };
-    for (uint32_t i = 0; i < n_cache; i++) {
-        uint64_t e   = dv64(&dv, (uint32_t)(JH_SIZE + (uint64_t)n_dma * 8u + (uint64_t)i * 8u));
-        uint32_t sz  = (uint32_t)(e >> 32);
-        uint32_t eal = (uint32_t)e;
-        if (!sz || !eal) continue;
-        if (!guest_range_ok(eal, sz))
-            job_dma_stop(&jd, (long long)i, eal, sz, 0, jm.cache + sz, "cache-range");
-        jm.cache += sz;
-        if (p + sz > JOB_RT_LS)
-            job_memory_stop(&jm, "cache", p + sz);
-        cache_ls[i] = (uint32_t)p;
-        cache_x[i].ls = (uint32_t)p; cache_x[i].ea = eal; cache_x[i].size = sz;
-        p += ALIGN1024((uint64_t)sz);
+    p = job_place_cache(&dv, &jd, &jm, q, n_dma, n_cache, p, cache_ls, cache_x);
     }
 
     /* ---- input DMA list -> ioBuffer, each entry 16-byte aligned ----------
@@ -602,8 +714,10 @@ static int run_spurs_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_e
     uint8_t* ls = SPURS_JOB_LS_ALLOC();
     if (!ls) { free(io_x); return -1; }
 
-    /* binary at LS 0 (PIC, so delta 0 keeps the lifted addresses) */
-    memcpy(ls, vm_base + ea_bin, size_bin);
+    /* binary at its base: LS 0 for a jobchain job (PIC, so delta 0 keeps the
+     * lifted addresses), 0x7C00 for a JobQueue2 job. Only sizeBinary << 4 bytes
+     * are copied; the rest of image+bss stays as the store was (zero). */
+    memcpy(ls + base, vm_base + ea_bin, size_bin);
     for (uint32_t i = 0; i < n_cache; i++)
         if (cache_x[i].size) memcpy(ls + cache_x[i].ls, vm_base + cache_x[i].ea, cache_x[i].size);
     for (uint32_t i = 0; i < n_dma; i++)
@@ -612,11 +726,16 @@ static int run_spurs_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_e
 
     /* ---- context + descriptor, parked above the job's memory region ------
      * jm2 keeps these in its own bss (outside job memory); we load the job at
-     * LS 0, so the top of LS is the equivalent free space. */
-    const uint32_t desc_ls = JOB_DESC_LS;       /* descriptors are <= 1024 B */
-    const uint32_t ctx_ls  = JOB_CTX_LS;        /* CellSpursJobContext2, 48 B */
+     * LS 0, so the top of LS is the equivalent free space.
+     * q: the PM's places. The worker runs one job at a time, so this is the
+     * PM's Execute slot k = 0 (the PM toggles k between 0 and 1 per job while
+     * it stays resident; a worker has no residency to toggle): the descriptor
+     * copy at D0 + k * maxDesc = D0, the JobContext2 at 0x68D0 + 0x30 * k. */
+    const uint32_t desc_ls = q ? d0 : JOB_DESC_LS;               /* descriptors are <= 1 KB */
+    const uint32_t ctx_ls  = q ? SPU_JQ2_CTX_LS : JOB_CTX_LS;    /* CellSpursJobContext2, 48 B */
     uint32_t dsz     = job_desc_size ? job_desc_size : 256u;
     if (dsz > 0x400) dsz = 0x400;
+    if (q && dsz > max_desc) dsz = max_desc;
     /* Every region, the stack included, ended at or below JOB_RT_LS (checked
      * above), so the descriptor, context and jm interface below land on free
      * local store. */
@@ -637,8 +756,9 @@ static int run_spurs_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_e
      * and never clears its completion counter. The interface is the 16 bytes
      * after the context: zero for Ver13, which only stashes the pointer; for
      * Ver14 the two entries (job_rt_plant). */
-    const uint32_t jm_iface = JOB_JM_IFACE;
-    if (crt == 14) job_rt_plant(ls);
+    const uint32_t jm_iface = q ? SPU_JQ2_JM_LS : JOB_JM_IFACE;
+    if (q) job_jq2_plant(ls);
+    else if (crt == 14) job_rt_plant(ls);
     /* The same crt also reads the SPURS kernel context with ABSOLUTE loads
      * (lqa): spuNum at 0x1C8 (cellSpursGetCurrentSpuId), the trace buffer at
      * 0x210, a trace-enable byte at 0x175. On hardware the kernel owns
@@ -647,28 +767,43 @@ static int run_spurs_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_e
      * and halted. The lifted code never reads those bytes as data (Ver14: only
      * 0x170, 0x1C0 and, with tracing on, 0x210 -- jq2e2-023), so overlay the
      * kernel's view: SPU 0, our DMA tag, tracing off. */
+    if (q) {
+        /* The PM's kernel view, exactly these words and nothing else in
+         * 0x0..0x2FF (jq2 static ABI doc 2): the CellSpurs EA as a u64 at
+         * 0x1C0, spuNum 0x1C8, dmaTagId 8 at 0x1CC, the PM's base 0xA00 as the
+         * u64 wklCurrentAddr at 0x1D0, wid at 0x1D8 and 0x1DC. The image sits
+         * at 0x7C00, so none of it can land on job code. */
+        ls32(ls, 0x1C0, 0);
+        ls32(ls, 0x1C4, jq2->spurs_ea);
+        ls32(ls, 0x1C8, jq2->spu_num);
+        ls32(ls, 0x1CC, 8);
+        ls32(ls, 0x1D4, 0xA00);
+        ls32(ls, 0x1D8, jq2->wid);
+        ls32(ls, 0x1DC, jq2->wid);
+    } else {
     memset(ls + 0x170, 0, 0x10);
     memset(ls + 0x1C0, 0, 0x10);
     ls32(ls, 0x1C8, g_spurs_job_spu_num);
     ls32(ls, 0x1CC, JOB_DMA_TAG);
     memset(ls + 0x210, 0, 0x10);
+    }
     ls32(ls, ctx_ls + JC_SIZE_JOB_DESC,
          ((dsz == 64 ? 0u : (dsz / 128u) & 0xFu) << 28) | jm_iface);
     ls16(ls, ctx_ls + JC_NUM_IO_BUFFER,    (uint16_t)n_dma);
     ls16(ls, ctx_ls + JC_NUM_CACHE_BUFFER, (uint16_t)n_cache);
     ls32(ls, ctx_ls + JC_O_BUFFER, out_ls);
     ls32(ls, ctx_ls + JC_S_BUFFER, s_ls);
-    ls32(ls, ctx_ls + JC_DMA_TAG,  JOB_DMA_TAG);
+    ls32(ls, ctx_ls + JC_DMA_TAG,  q ? 0u : JOB_DMA_TAG);       /* the PM never writes it */
     ls32(ls, ctx_ls + JC_EA_JOB_DESCRIPTOR,     0);
     ls32(ls, ctx_ls + JC_EA_JOB_DESCRIPTOR + 4, job_ea);
 
     { static SPURS_JOB_TLS int _n = 0;
       if (PS3_LOG_FIRST(_n, 4))
           fprintf(stderr,
-              "[spurs-job] job 0x%08X: bin 0x%08X+%u -> LS 0 | io=0x%05X(%u, %u dma, %u used)"
+              "[spurs-job] job 0x%08X: bin 0x%08X+%u -> LS 0x%X | io=0x%05X(%u, %u dma, %u used)"
               " out=0x%05X(%u) scratch=0x%05X(%u) stack_top=0x%05X(%u) cache=%u"
               " ctx=0x%05X desc=0x%05X(%u)\n",
-              job_ea, ea_bin, size_bin, io_ls, size_io, n_dma, io_used,
+              job_ea, ea_bin, size_bin, base, io_ls, size_io, n_dma, io_used,
               out_ls, size_out, s_ls, size_scr, stack_top, size_stk, n_cache,
               ctx_ls, desc_ls, dsz); }
 
@@ -744,8 +879,34 @@ static int run_spurs_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_e
     spu_context ctx;
     spu_context_init(&ctx, 0);
     ctx.image_id = image_id;
-    ctx.job_rt_ls = crt == 14 ? JOB_RT_LS : 0;
+    ctx.job_rt_ls = q ? SPU_JQ2_JM_CALL_LS : (crt == 14 ? JOB_RT_LS : 0);
+    ctx.job_rt_ls2 = q ? SPU_JQ2_JM_SWAP_LS : 0;
     memcpy(ctx.ls, ls, SPU_LS_SIZE);
+    if (q) {
+        /* The PM's entry state (jq2 static ABI doc 1.4): everything zero, then
+         * r0 = the link the executor's `stop 0` sentinel answers (the PM's own
+         * is inside itself and is not an input), r1 = stack top - 0x60, r3 the
+         * context, r4 the descriptor copy, r80/r81 = the PM's pointers to its
+         * saved slots (r1 + 0x20 / + 0x30), r126 = the entry. The PM also stores
+         * its link and r126 at those slots; the job never reads them, and our
+         * link is not the PM's, so they are not written. */
+        ctx.gpr[0]._u32[0]   = 0x3FF00u;               /* SPU_JOB_RETURN_LS */
+        ctx.gpr[1]._u32[0]   = stack_top - 0x60u;
+        /* r1 is a vector in the SPU ABI: word 0 the stack pointer, words 1..3
+         * the stack bytes left below it (the job's stack-limit code subtracts
+         * word 1 from the pointer -- the Setting job's helper at image+0x5F40
+         * stores the result, and the stored value differs without it). The PM
+         * enters with {sp, 0x1FA0, 0x1FA0, 0x1FA0} for an 8 KB stack: the
+         * stack's size less the 0x60 reserved above sp. The static spec lists
+         * only word 0; the dynamic run (m1r --dbg-pc 0x5834) shows the rest. */
+        ctx.gpr[1]._u32[1] = ctx.gpr[1]._u32[2] = ctx.gpr[1]._u32[3] = size_stk - 0x60u;
+        ctx.gpr[3]._u32[0]   = ctx_ls;
+        ctx.gpr[4]._u32[0]   = desc_ls;
+        ctx.gpr[80]._u32[0]  = ctx.gpr[1]._u32[0] + 0x20u;
+        ctx.gpr[81]._u32[0]  = ctx.gpr[1]._u32[0] + 0x30u;
+        ctx.gpr[126]._u32[0] = base;
+        ctx.pc               = base;
+    } else {
     /* SPU stack grows down. A function saves its link register in its
      * caller's frame, at 16($sp), so the entry's first store lands 16 bytes
      * above $sp. The cache buffers start right at stack_top: with $sp at
@@ -760,6 +921,7 @@ static int run_spurs_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_e
     ctx.gpr[0]._u32[0] = 0x3FF00u;                   /* SPU_JOB_RETURN_LS */
     ctx.gpr[3]._u32[0] = ctx_ls;                     /* CellSpursJobContext2* */
     ctx.gpr[4]._u32[0] = desc_ls;                    /* CellSpursJob256*      */
+    }
 
     { static SPURS_JOB_TLS int _n = 0;
       if (PS3_LOG_FIRST(_n, 4))
@@ -776,7 +938,7 @@ static int run_spurs_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_e
         /* What the loader laid out, handed over rather than recomputed. r1 is
          * the stack the job enters with. */
         const spu_job_layout layout = {
-            ea_bin, 0, size_bin, (uint32_t)bss, desc_ls, dsz, io_ls, size_io, out_ls, size_out,
+            ea_bin, base, size_bin, (uint32_t)bss, desc_ls, dsz, io_ls, size_io, out_ls, size_out,
             s_ls, size_scr, size_stk, ctx.gpr[1]._u32[0], ctx_ls };
         hooks->start(hooks->user, &ctx, &layout);
     }
@@ -847,8 +1009,11 @@ static int run_spurs_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_e
     g_spurs_job_mbox_intr = spu_channel_has_data(&ctx.ch_out_intr_mbox)
                           ? ctx.ch_out_intr_mbox.value : 0;
     g_spurs_job_mbox_valid = g_spurs_job_mbox || g_spurs_job_mbox_intr;
+    /* The word at descriptor+0x4C is a job's own user data: an EA only for the
+     * chain jobs that keep a command block there. Read it only when it names
+     * mapped guest memory (a JobQueue2 descriptor's user words are anything). */
     { uint32_t _cb = dv32(&dv, 0x4C);
-      g_spurs_job_cmd = _cb ? (g32(_cb) >> 16) : 0; }
+      g_spurs_job_cmd = (_cb && guest_range_ok(_cb, 4)) ? (g32(_cb) >> 16) : 0; }
     { const int s_t = getenv("SPURS_JOB_MBOX") ? 1 : 0;
       static SPURS_JOB_TLS int n = 0;
       if (s_t && PS3_LOG_FIRST(n, 16) && g_spurs_job_mbox_valid)
@@ -882,19 +1047,27 @@ static int run_spurs_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_e
 int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
                       uint32_t job_ea, uint32_t job_desc_size)
 {
-    return run_spurs_job(entry, image_id, job_ea, NULL, 0, job_desc_size, 1, NULL);
+    return run_spurs_job(entry, image_id, job_ea, NULL, 0, job_desc_size, 1, NULL, NULL);
 }
 
 int spu_run_spurs_job_snapshot(spu_lifted_entry_fn entry, int image_id, uint32_t job_ea,
                                const uint8_t* desc, uint32_t desc_size)
 {
     if (!desc || !desc_size) return -1;
-    return run_spurs_job(entry, image_id, job_ea, desc, desc_size, desc_size, 0, NULL);
+    return run_spurs_job(entry, image_id, job_ea, desc, desc_size, desc_size, 0, NULL, NULL);
 }
 
 int spu_run_spurs_job_hooked(spu_lifted_entry_fn entry, int image_id, uint32_t job_ea,
                              const uint8_t* desc, uint32_t desc_size, const spu_job_hooks* hooks)
 {
     if (!desc || !desc_size) return -1;
-    return run_spurs_job(entry, image_id, job_ea, desc, desc_size, desc_size, 0, hooks);
+    return run_spurs_job(entry, image_id, job_ea, desc, desc_size, desc_size, 0, hooks, NULL);
+}
+
+int spu_run_jq2_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_ea,
+                    const uint8_t* desc, uint32_t desc_size, const spu_jq2_env* env,
+                    const spu_job_hooks* hooks)
+{
+    if (!desc || !desc_size || !env) return -1;
+    return run_spurs_job(entry, image_id, job_ea, desc, desc_size, desc_size, 0, hooks, env);
 }

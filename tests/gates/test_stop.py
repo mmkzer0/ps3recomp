@@ -17,7 +17,7 @@ KINDS = ["identity-mismatch", "config-invalid", "unresolved-nid",
          "unresolved-guest-callback",
          "hle-unsupported-return", "spu-job-crt-version", "spu-job-memory",
          "spu-job-jm-entry", "spu-job-dma-list", "jq2-pool-release",
-         "jq2-job-end", "jq2-ring-entry", "jq2-wake", "jq2-state"]
+         "jq2-job-end", "jq2-ring-entry", "jq2-wake", "jq2-state", "jq2-jm-call"]
 
 
 def probe(*args):

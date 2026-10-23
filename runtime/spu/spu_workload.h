@@ -132,6 +132,47 @@ typedef struct spu_job_hooks {
 int spu_run_spurs_job_hooked(spu_lifted_entry_fn entry, int image_id, uint32_t job_ea,
                              const uint8_t* desc, uint32_t desc_size, const spu_job_hooks* hooks);
 
+/* The JobQueue2 job profile: a job a JobQueue2 worker runs is staged the way
+ * the JobQueue2 policy module (PM) stages it, which is NOT the jobchain layout
+ * above (docs/RUNTIME.md, "SPURS job start"; evidence in docs/JQ2.md). The PM's
+ * placement is fixed by queue and descriptor fields: image base 0x7C00, 128-
+ * byte aligned regions in the order image, cache buffers, io, out, scratch+
+ * stack, descriptor copy and JobContext2 at their own addresses, a kernel view
+ * of exactly seven words, and a jm interface at 0x7A10 = {0x1500, 0x5870}. */
+#define SPU_JQ2_IMAGE_LS      0x7C00u   /* image base (the PM's low heap start) */
+#define SPU_JQ2_DESC_TOP      0x3F400u  /* descriptor arena top: D0 = top - 4*maxDesc */
+#define SPU_JQ2_CTX_LS        0x68D0u   /* JobContext2 of Execute slot 0 (+0x30 per slot) */
+#define SPU_JQ2_JM_LS         0x7A10u   /* the jm interface table */
+#define SPU_JQ2_JM_CALL_LS    0x1500u   /* jm word 0: the scheduler switch (a stop here) */
+#define SPU_JQ2_JM_SWAP_LS    0x5870u   /* jm word 1: the tag-status poll routine */
+/* The stop code of the word planted at SPU_JQ2_JM_CALL_LS: a job that ends on
+ * it called jm word 0, which one job per worker has no manager to serve. */
+#define SPU_JQ2_JM_CALL_STOP  0x3B0Fu
+
+/* What the queue contributes to the staging (the PM reads these from the queue
+ * block and its kernel context). `max_desc` is the queue's maxDescriptor
+ * (queue+0xF14; 0 means 256), `spurs_ea` the CellSpurs EA (queue+0xF10),
+ * `wid` the queue's workload id and `spu_num` the SPU the worker stands for
+ * (kernel context 0x1D8/0x1DC and 0x1C8). */
+typedef struct spu_jq2_env {
+    uint32_t max_desc;
+    uint32_t spurs_ea;
+    uint32_t wid;
+    uint32_t spu_num;
+} spu_jq2_env;
+
+/* spu_run_spurs_job_hooked with the JobQueue2 profile. A worker runs one job
+ * at a time, so the job is the PM's Execute slot 0: its descriptor copy sits at
+ * D0 and its context at SPU_JQ2_CTX_LS. The descriptor, DMA-list and cache
+ * validation is the loader's one; a heap that would pass D0 is the named stop
+ * spu-job-memory with `limit` D0. The job is entered at SPU_JQ2_IMAGE_LS with
+ * the PM's registers (docs/JQ2.md). `end` runs with the finished context; the
+ * stop code SPU_JQ2_JM_CALL_STOP at SPU_JQ2_JM_CALL_LS + 4 means the job called
+ * jm word 0. Same return as spu_run_spurs_job. */
+int spu_run_jq2_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_ea,
+                    const uint8_t* desc, uint32_t desc_size, const spu_jq2_env* env,
+                    const spu_job_hooks* hooks);
+
 /* Fingerprint `image`, look up its lifted entry, and run it as a SPURS jobchain
  * job via spu_run_spurs_job. Runs SYNCHRONOUSLY on the caller's thread: a job
  * is not persistent (it runs to completion and returns to the manager), and a

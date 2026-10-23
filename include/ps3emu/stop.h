@@ -79,7 +79,8 @@ extern "C" {
     X(JQ2_JOB_END,              "jq2-job-end")                                 \
     X(JQ2_RING_ENTRY,           "jq2-ring-entry")                              \
     X(JQ2_WAKE,                 "jq2-wake")                                    \
-    X(JQ2_STATE,                "jq2-state")
+    X(JQ2_STATE,                "jq2-state")                                   \
+    X(JQ2_JM_CALL,              "jq2-jm-call")
 
 /* A fixed underlying type in C++ makes a kind outside the list (a caller's bug,
  * which the stop still reports as "invalid-kind") a well-defined value rather

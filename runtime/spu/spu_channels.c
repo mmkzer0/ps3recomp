@@ -2363,8 +2363,7 @@ void spu_indirect_branch(spu_context* ctx)
      * bytes until the routine returns to its caller -- the lifted bisl bracket
      * then resumes at the return address -- or stops at the trap, which ends
      * the run for spu_run_spurs_job to name. */
-    if (!fn && !ctx->policy_mode && ctx->job_rt_ls &&
-        ctx->pc - ctx->job_rt_ls < SPU_JOB_RT_SIZE) {
+    if (!fn && !ctx->policy_mode && SPU_JOB_RT_HAS(ctx, ctx->pc)) {
         spu_interp_run_until(ctx, ctx->pc, ctx->gpr[0]._u32[0] & SPU_LS_MASK);
         if (ctx->status & (SPU_STATUS_STOPPED_BY_STOP | SPU_STATUS_STOPPED_BY_HALT))
             spu_halt(ctx);

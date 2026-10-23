@@ -431,8 +431,12 @@ typedef struct spu_context {
     /* LS base of the SPURS job runtime area spurs_job.c planted (the code the
      * Ver14 jm interface points into), 0 when this context runs no such job.
      * Lifted code that branches into [job_rt_ls, +SPU_JOB_RT_SIZE) has no
-     * lifted function there; spu_indirect_branch interprets it instead. */
+     * lifted function there; spu_indirect_branch interprets it instead. A
+     * JobQueue2 job's jm interface points at two such places, 0x1500 and
+     * 0x5870 (JQ2 job profile): job_rt_ls2 is the second, 0 when unused. Test
+     * a pc with SPU_JOB_RT_HAS. */
     uint32_t job_rt_ls;
+    uint32_t job_rt_ls2;
 } spu_context;
 
 /* Reserved LS addresses (inside the kernel area, below the 0xA00 policy-module
@@ -449,6 +453,9 @@ typedef struct spu_context {
  * does not model. */
 #define SPU_JOB_RT_SIZE       0x100u
 #define SPU_JOB_RT_TRAP_STOP  0x3B0Eu
+#define SPU_JOB_RT_HAS(ctx, pc)                                                    \
+    (((ctx)->job_rt_ls  && (uint32_t)((pc) - (ctx)->job_rt_ls)  < SPU_JOB_RT_SIZE) ||  \
+     ((ctx)->job_rt_ls2 && (uint32_t)((pc) - (ctx)->job_rt_ls2) < SPU_JOB_RT_SIZE))
 
 /* The taskset policy module's syscall trampoline. Both the full resolver
  * (spu_channels.c) and the musttail fast path (spu_dispatch_mt.c) must treat a

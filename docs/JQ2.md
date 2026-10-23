@@ -501,6 +501,68 @@ local-store layout the loader chose (`spu_job_layout`: image, descriptor copy,
 io, out, scratch/stack, `r1` at entry), passed out by
 `spu_run_spurs_job_hooked`, not recomputed.
 
+### JQ2 job ABI
+
+The executor runs a job through `spu_run_jq2_job`, which stages local store the
+way the JobQueue2 policy module (PM) does, not the jobchain layout
+(`docs/RUNTIME.md`, "SPURS job start", "Two layouts"). Evidence:
+`out/M1/JQ2-JOB-ABI-static.md` (research repository; §1 launch sequence and
+placement, §2 kernel context, §3 jm interface, §5 staging spec; perturbation
+experiments E0-E13) and the dynamic run of the real PM (`m1r --dbg-pc 0x5834`:
+entry registers). ELF Setting is linked for the PM's base: staged at LS 0 the
+kernel-view overlay lands on its code and its outputs differ; with this layout
+`hle-setting` and `fw-setting` events are identical under `ps3diff` (J5).
+
+| Item | Value | Evidence |
+|---|---|---|
+| image base | `0x7C00`, `sizeBinary << 4` bytes copied, bss untouched | static 1.1 stage 6, 1.2 |
+| image + bss | `A128((sizeBinary + u16@+2) << 4)`; the bss is only `u16@+2 << 4`, the rest is the PM's rounding | static 1.2, E7 |
+| caches | `cacheBuffer[i]` = running pointer, each `A128(size)`, before io | E8, E9 |
+| io, out | `A128(sizeInOrInOut)`, `A128(sizeOut)`, out follows io, the `+0x10` word is not consulted | E4, E5 |
+| scratch + stack | `s` = out end; stack base `s + A128(sizeScratch << 4)`; `T = base + (sizeStack ? sizeStack << 4 : 8192)`; the heap advances by `A128(stackBytes)` | E1-E3, E7 |
+| `r1` | `T - 0x60`; words 1..3 `stackBytes - 0x60` (`0x1FA0` for 8 KB). The job's stack-limit helper subtracts word 1 | static 1.4; dynamic entry registers; Setting image `+0x5F40` stores the result |
+| descriptor copy | `D0 + k * maxDesc`, `D0 = 0x3F400 - 4 * maxDesc` (`0x3F000` for 256, `0x3E600` for 896) | static 1.1 stage 0, `m1r-007` |
+| `JobContext2` | `0x68D0 + 0x30 k`: `+0x00` io, `+0x04..` cache buffers, `+0x14 = ((descSize >> 7) & 0xF) << 28 \| 0x7A10`, `+0x18/+0x1A` numIo/numCache, `+0x1C` o, `+0x20` s, `+0x24 = 0`, `+0x28` 64-bit descriptor EA | static 1.2 |
+| jm table | `0x7A10 = {0x1500, 0x5870, 0, 0}`; the CRT copies the words into bss, so they are part of the image+bss hash | static 3.1, 3.5 |
+| kernel view | `0x1C0 {0, spursEA}`, `0x1C8` spuNum, `0x1CC = 8`, `0x1D4 = 0xA00`, `0x1D8`/`0x1DC` workload id; all else in `0..0x2FF` zero; nothing is ever written at an image address | static 2, 5.2 step 7 |
+| entry state | registers all zero, then `r0 = 0x3FF00`, `r1`, `r3 = ctx`, `r4 = desc`, `r80 = r1 + 0x20`, `r81 = r1 + 0x30`, `r126 = 0x7C00`; pc `0x7C00` | static 1.4, 5.2 step 8 |
+
+**One job per worker.** The PM alternates two Execute slots `k` while it stays
+resident; a worker runs one job at a time and has no residency to model, so
+`k = 0`: descriptor copy at `D0`, context at `0x68D0`.
+
+**Values from the executor.** `maxDesc` is the queue's `+0xF14`, the SPURS EA
+its `+0xF10`, `spuNum` the worker index. The workload id is the low five bits of
+`queue+0x6C`; `CreateCommon` writes `spurs EA | wid` there (`m1r-004`) and the
+HLE writes it with wid 0, the id the firmware gives the first workload (it has
+no workload registry), so the kernel view reads one source. `fw-setting` uses
+workload id 0.
+
+**The two jm routines.** Both are authored here, not copied. `0x5870` (the PM's
+coroutine swap) is the tag-status poll loop of `s_job_rt_swap` in `spurs_job.c`:
+`WrTagMask = -1`, immediate `WrTagUpdate`, `RdTagStat` until every group is
+complete, `bi $r0`; it clobbers only `r3`. For a single resident job that is the
+swap's whole observable effect (static 3.2); it is one definition shared with
+the JobChain Ver14 interface. `0x1500` (the scheduler switch) is a `stop` with
+code `0x3B0F` (`SPU_JQ2_JM_CALL_STOP`); a job that ends on it is the named stop
+`jq2-jm-call` with the request word `r3`, never executed or credited. Both run
+interpreted or lifted (the resolver interprets live bytes at the two addresses,
+`job_rt_ls` / `job_rt_ls2`).
+
+**Fail closed.** The staging stops by name, in the one validator, where the
+evidence does not decode the layout: `spu-job-dma-list` with `reason=jobtype-bit1`
+(descriptor `+0x2C` bit 1, static U1), `binary-bit1` (eaBinary bit 1, the PM's
+debugger hold, U6) and `cache-count` (more than the two cache entries the PM was
+observed with, U5); a heap that passes `D0` is `spu-job-memory` with `limit` =
+`D0` (the PM halts `0x80410A17`). Admission is the loader's: the CRT marker gate
+(`JOBCRT Ver13/14`), guest ranges of binary, caches and lists, the input-list
+rules. The PM's further checks (the image `+0x10` stub, the bin2 / ELF flag
+agreement, the `%SPURS JOB INFO%` trailer) are not repeated: the images the
+executor runs are the ones `hle-setting` compares.
+
+**Unresolved** (static §6): U2 second heap pool, U3 `+0x10` semantics, U4
+dmaTag use by other jobs, U10 same-EA resident shortcut.
+
 ### How the executor is tested
 
 `tests/spurs_jq2/test_jq2_executor.cpp`, one mode per process, on synthetic SPU
@@ -531,7 +593,7 @@ channel layer and LV2 event flags; labels `spurs;t0;tsan`:
   guest bytes outside the queue's blocks are untouched; a second run joins with
   30 jobs outstanding.
 - `observer`: `job_start` gets the worker's `spu_context` and the loader's layout
-  (image at LS 0 with its bss, the descriptor copy, `r1`, the context), an
+  (image at LS `0x7C00` with its bss, the descriptor copy, `r1`, the context), an
   `spu_observe` observer installed there sees the job's GET and PUT, `job_end`
   gets `r3`, and after the observer is removed no callback fires.
 - `validate`: every guard and status code of `jq2.h`, the guest layout create
@@ -540,3 +602,16 @@ channel layer and LV2 event flags; labels `spurs;t0;tsan`:
 - `stop_job`, `stop_crt`, `stop_ring`: forked children (the guest memory is
   shared) end in `jq2-job-end`, `spu-job-crt-version` and `jq2-ring-entry` with
   exit status 70, and the parent finds the port not credited.
+- `layout`, `layout-896`: a descriptor with two caches, an input list, io, out,
+  scratch and stack (maxDescriptor 256 and 896, workload ids 5 and 0x11 set in
+  `queue+0x6C`): every address of the table above derived by hand, the
+  descriptor copy at `0x3F000` / `0x3E600`, every `JobContext2` word, the jm
+  table, stop word and poll routine, the kernel view word by word (all else in
+  `0..0x2FF` zero), the registers lane by lane, and the loader's report.
+- `jm-wait`: a job GETLs a stalled two-element list, calls jm word 1 through the
+  table and uses the second element's data; the test acknowledges the stall
+  only after the routine has polled `RdTagStat` three times.
+- `heap-fit`, `stop-heap`: a heap that ends exactly at `D0` runs; 0x80 more is
+  `spu-job-memory` (region `stack`, `p`, `limit = D0`).
+- `stop-jm`, `stop-jm-lifted`, `stop-unmodelled`: `jq2-jm-call` (interpreted and
+  lifted) with the request word; `jobtype-bit1`, `binary-bit1`, `cache-count`.

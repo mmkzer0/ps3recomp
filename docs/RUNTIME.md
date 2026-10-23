@@ -443,6 +443,32 @@ interface and kernel view are modelled, so any other marker (Ver12, Ver15, no
 marker) is the named stop `spu-job-crt-version` rather than a run on a context
 the CRT was not built for.
 
+**Two layouts.** The text above and the tables describe the JobChain layout
+(`spu_run_spurs_job`, the chain walker, and the snapshot entries
+`spu_run_spurs_job_snapshot` / `_hooked`). A job a JobQueue2 worker runs is
+staged by `spu_run_jq2_job` the way the JobQueue2 policy module stages it, which
+differs in every address; the descriptor, DMA-list and cache validation, the CRT
+gate and the end-of-job handling are the same code (`run_spurs_job`), only the
+placement, the context and the entry state differ. The JobChain path is
+unchanged byte for byte (`tools/test_spurs_job_crt.py`, golden Ver13 hash).
+
+| | JobChain | JobQueue2 (`spu_run_jq2_job`) |
+|---|---|---|
+| image | LS `0` | LS `0x7C00`; `sizeBinary << 4` bytes copied, the rest (bss) untouched |
+| image + bss | `align1024(sizeBinary + 16 * hi32)` | `align128((sizeBinary + u16@+2) << 4)` (only the low half of the eaBinary high word) |
+| order, alignment | image, io, out, scratch+stack, caches; 1024 | image, caches, io, out, scratch+stack; 128 |
+| stack | `r1 = (top - 32) & ~15` | `T = base + (sizeStack ? sizeStack << 4 : 8192)`, `r1 = T - 0x60`, words 1..3 = stack bytes - 0x60 |
+| heap limit | `0x3FAC0` (`spu-job-memory`, `limit`) | `D0 = 0x3F400 - 4 * maxDesc` (`maxDesc` = queue `+0xF14`, 0 = 256) |
+| descriptor copy | `0x3FC00` | `D0` (slot 0) |
+| `JobContext2` | `0x3FBC0` | `0x68D0` (slot 0); `+0x24` dmaTag = 0 |
+| jm interface | `0x3FBF0`, code in the runtime area | `0x7A10 = {0x1500, 0x5870, 0, 0}` |
+| kernel view | `0x170`, `0x1C0`, `0x1CC = 20`, `0x210` overlay | `0x1C0 {0, spursEA}`, `0x1C8`, `0x1CC = 8`, `0x1D4 = 0xA00`, `0x1D8`/`0x1DC` = wid; the rest of `0..0x2FF` zero |
+| registers | `r0 = 0x3FF00, r1, r3, r4` | all zero, `r0 = 0x3FF00`, `r1`, `r3`, `r4`, `r80 = r1 + 0x20`, `r81 = r1 + 0x30`, `r126 = 0x7C00`; pc = `0x7C00` |
+
+The JobQueue2 profile is documented, with its evidence, in `docs/JQ2.md` ("JQ2
+job ABI"). `jq2_job_info.image_ls` and the other layout fields report the real
+addresses.
+
 **How a job ends.** `spu_run_with_halt`'s result is not a completion test, and
 the loader does not consult it: a lifted job's normal return, a chain job's
 second lap and a lifted `heq`/`hgt` assertion all halt the run. What the job
@@ -865,6 +891,7 @@ One rule covers PPU `lwarx`/`ldarx` + `stwcx.`/`stdcx.` and SPU `GETLLAR` + `PUT
 - **Granule.** The 128-byte line, for both sides. That is an implementation granularity, not a claim about the architectural PPU reservation granule (OQ-E in the adoption matrix is open). A conditional store anywhere in a line kills every reservation on it, including another PPU thread's on a different word (PPU-to-PPU used to be per word); a different line is never affected, there is no hashing.
 - **What advances the epoch.** A successful `stwcx.`/`stdcx.`, `PUTLLC`, `PUTLLUC`/`PUTQLLUC`, and everything that calls `spu_coh_notify_write[_except]`: SPU DMA `PUT` and `SDCRZ` into a line some SPU has reserved, PPU plain stores into such a line (`VM_WRITE_COH`), and the host helpers that edit a taskset line under the lock-line lock. An SPU's own DMA `PUT` moves its own reservation onto the new epoch (hardware does not cost an SPE its reservation for its own MFC write); its value compare still sees the data it changed.
 - **Lock order.** `spu_lockline_lock` (global) before the line's epoch lock, never the reverse. A `stwcx.` on a line no SPU has reserved takes only the line lock; on a reserved line it takes both, in that order, and the reserving SPUs are told afterwards.
+- **Host edits.** Host code that updates a line the guest also reserves (the JQ2 port line, the ring index word, the queue's port-slot bitmap) goes through `resv_host_rmw(ea, fn, user)`: `fn` edits the line inside the same critical section a landing `stwcx.` takes, with the same lock order, and returns whether it stored; only a store advances the epoch. `fn` must not block or take another model lock, and touches the line through atomics on whole aligned words, because `GETLLAR` copies it unlocked. Whole-line host copies (the descriptor pool's snapshots) use `resv_copy_in`, sixteen 64-bit atomic stores.
 - **Known limits** (stated in `reservation.h`; the fix is the AM-10 fast-path design, M2+): a plain PPU store into a line **no SPU has ever reserved** is caught only by the value compare, so a same-value plain store does not kill a PPU or SPU reservation; an SPU DMA `PUT` into a line only a PPU has reserved is the same; and the very first `GETLLAR` of a line can race a `stwcx.` that has not yet seen the line marked, so that one store does not raise `SPU_EVENT_LR` (the `PUTLLC` still fails). `tests/reservation` asserts the first two as limits, so closing them fails the test and forces this paragraph to change.
 
 `tests/reservation/test_reservation.c` (CTest `reservation_*`) runs both directions through the real SPU channel path and the real PPU atomics: `contract` (deterministic), `jq2` (an SPU `PUTLLC` counting at `+0x00` while PPU `lwarx`/`stwcx.` and `ldarx`/`stdcx.` loops count at `+0x10`/`+0x18` of the same line), `aba_ppu` and `aba_spu` (same-value stores, handshaked on atomics, no sleeps). Short runs are tiers `t0` and `tsan`; `*_stress` is 10^8 iterations in tier `stress`.

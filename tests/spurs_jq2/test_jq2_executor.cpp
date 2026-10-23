@@ -159,6 +159,12 @@ bool wait_for(P pred, int ms = 60000)
 /* ---- SPU encoders ------------------------------------------------------------ */
 
 std::uint32_t e_il(int rt, int imm) { return (0x81u << 23) | ((std::uint32_t(imm) & 0xFFFFu) << 7) | std::uint32_t(rt); }
+std::uint32_t e_ila(int rt, std::uint32_t imm) { return (0x21u << 25) | ((imm & 0x3FFFFu) << 7) | std::uint32_t(rt); }
+std::uint32_t e_ilhu(int rt, std::uint32_t imm) { return (0x82u << 23) | ((imm & 0xFFFFu) << 7) | std::uint32_t(rt); }
+std::uint32_t e_iohl(int rt, std::uint32_t imm) { return (0xC1u << 23) | ((imm & 0xFFFFu) << 7) | std::uint32_t(rt); }
+std::uint32_t e_and(int rt, int ra, int rb) { return (0xC1u << 21) | (std::uint32_t(rb) << 14) | (std::uint32_t(ra) << 7) | std::uint32_t(rt); }
+std::uint32_t e_ori0(int rt, int ra) { return (0x04u << 24) | (std::uint32_t(ra) << 7) | std::uint32_t(rt); }
+std::uint32_t e_bisl(int rt, int ra) { return (0x1A9u << 21) | (std::uint32_t(ra) << 7) | std::uint32_t(rt); }
 std::uint32_t e_a(int rt, int ra, int rb) { return (0x0C0u << 21) | (std::uint32_t(rb) << 14) | (std::uint32_t(ra) << 7) | std::uint32_t(rt); }
 std::uint32_t e_lqd(int rt, int ra, int off) { return (0x34u << 24) | (((std::uint32_t(off) / 16) & 0x3FFu) << 14) | (std::uint32_t(ra) << 7) | std::uint32_t(rt); }
 std::uint32_t e_lqa(int rt, std::uint32_t lsa) { return (0x61u << 23) | (((lsa >> 2) & 0xFFFFu) << 7) | std::uint32_t(rt); }
@@ -173,13 +179,20 @@ constexpr std::uint32_t kBiLr = 0x35000000u; /* bi $lr */
 constexpr std::uint32_t kCode = 0x300;
 constexpr std::uint32_t kImageSize = 0x1000;
 constexpr std::uint32_t kBssQuads = 0x100;     /* the buffers below live in the bss */
-constexpr std::uint32_t kLsIn = 0x1800, kLsOut = 0x1810;
+/* The JQ2 job profile puts the image at 0x7C00 (docs/JQ2.md); the job's two
+ * 16-byte buffers sit in its bss, 0x1800 and 0x1810 into the image. */
+constexpr std::uint32_t kBase = 0x7C00;
+constexpr std::uint32_t kLsIn = kBase + 0x1800, kLsOut = kBase + 0x1810;
 
-enum class Prog { transform, stop_early, bad_crt };
+enum class Prog { transform, stop_early, bad_crt, ret_only, jm_wait, jm_call };
+
+/* The jm_wait program's list: two elements for a GETL on tag 1, the first with
+ * the stall-and-notify bit. It is data in the image, at kBase + kList. */
+constexpr std::uint32_t kList = 0x700;
 
 void emit_dma(std::vector<std::uint32_t>& c, std::uint32_t lsa, int eal_reg, std::uint32_t cmd)
 {
-    c.push_back(e_il(5, int(lsa)));
+    c.push_back(e_ila(5, lsa));
     c.push_back(e_wrch(MFC_LSA, 5));
     c.push_back(e_il(5, 0));
     c.push_back(e_wrch(MFC_EAH, 5));
@@ -197,6 +210,19 @@ void emit_dma(std::vector<std::uint32_t>& c, std::uint32_t lsa, int eal_reg, std
     c.push_back(e_rdch(5, MFC_RdTagStat));
 }
 
+/* r84 = jm interface word 0 or 1, found the way the CRT preflight finds it:
+ * the low 28 bits of ctx+0x14 name the table. */
+void emit_jm_lookup(std::vector<std::uint32_t>& c, bool word1)
+{
+    c.push_back(e_lqd(5, 3, 0x10));
+    c.push_back(e_rotqbyi(5, 5, 4));
+    c.push_back(e_ilhu(6, 0x0FFF));
+    c.push_back(e_iohl(6, 0xFFFF));
+    c.push_back(e_and(7, 5, 6));
+    c.push_back(e_lqd(8, 7, 0));
+    c.push_back(word1 ? e_rotqbyi(84, 8, 4) : e_ori0(84, 8));
+}
+
 void build_image(std::uint32_t ea, Prog prog)
 {
     std::uint8_t* img = vm_base + ea;
@@ -205,6 +231,44 @@ void build_image(std::uint32_t ea, Prog prog)
     std::vector<std::uint32_t> c;
     if (prog == Prog::stop_early) {
         c.push_back(e_stop(0x2222));
+    } else if (prog == Prog::ret_only) {
+        c.push_back(kBiLr);
+    } else if (prog == Prog::jm_call) {
+        emit_jm_lookup(c, false);
+        c.push_back(e_il(3, 0x1234)); /* the request word */
+        c.push_back(e_bisl(0, 84));   /* call jm word 0 */
+        c.push_back(e_stop(0));
+    } else if (prog == Prog::jm_wait) {
+        /* GETL a stalled two-element list, then call jm word 1 (the tag wait)
+         * and use the SECOND element's data, which the MFC moves only after
+         * the stall is acknowledged. */
+        c.push_back(e_lqd(10, 4, 0x30));
+        c.push_back(e_rotqbyi(12, 10, 8));
+        emit_jm_lookup(c, true);
+        c.push_back(e_ori0(90, 0)); /* the link, for after the call */
+        c.push_back(e_ila(5, kLsIn));
+        c.push_back(e_wrch(MFC_LSA, 5));
+        c.push_back(e_il(5, 0));
+        c.push_back(e_wrch(MFC_EAH, 5));
+        c.push_back(e_ila(5, kBase + kList));
+        c.push_back(e_wrch(MFC_EAL, 5));
+        c.push_back(e_il(5, 16));
+        c.push_back(e_wrch(MFC_Size, 5));
+        c.push_back(e_il(5, 1));
+        c.push_back(e_wrch(MFC_TagID, 5));
+        c.push_back(e_il(5, int(MFC_GETL_CMD)));
+        c.push_back(e_wrch(MFC_Cmd, 5));
+        c.push_back(e_bisl(0, 84));
+        c.push_back(e_ori0(0, 90));
+        c.push_back(e_lqa(13, kLsOut)); /* the second element: kLsIn + 16 */
+        c.push_back(e_a(13, 13, 12));
+        c.push_back(e_stqa(13, kLsOut));
+        emit_dma(c, kLsOut, 10, MFC_PUT_CMD);
+        c.push_back(kBiLr);
+        put32(ea + kList, 0x80000010u); /* stall-and-notify, 16 bytes from the first input */
+        put32(ea + kList + 4, IN);
+        put32(ea + kList + 8, 0x10u); /* 16 bytes from the second */
+        put32(ea + kList + 12, IN + 0x10);
     } else {
         c.push_back(e_lqd(10, 4, 0x30));   /* r10 = {out_ea, in_ea, add, serial} */
         c.push_back(e_rotqbyi(11, 10, 4)); /* r11 word 0 = in_ea */
@@ -289,7 +353,7 @@ void hook_done(void*, const JobStart& js)
 }
 
 /* The job bodies a test selects; 0 leaves the interpreter. */
-enum LiftedKind { kNoLifted = 0, kLiftedNormal, kLiftedHalt };
+enum LiftedKind { kNoLifted = 0, kLiftedNormal, kLiftedHalt, kLiftedJmCall };
 int g_lifted = kNoLifted;
 
 /* A lifted-style body, written the way tools/spu_lifter.py emits code: channel
@@ -339,9 +403,33 @@ void lifted_job(spu_context* c, bool halt)
 void lifted_normal_entry(spu_context* c) { lifted_job(c, false); }
 void lifted_halt_entry(spu_context* c) { lifted_job(c, true); }
 
+/* A lifted body that calls jm word 0 the way lifted code calls through a
+ * register (the bisl bracket): the resolver finds no lifted function at 0x1500
+ * and interprets the planted stop word. */
+void lifted_jm_call_entry(spu_context* c)
+{
+    const std::uint32_t iface = ls_word(c, c->gpr[3]._u32[0] + 0x14) & 0x0FFFFFFFu;
+    constexpr std::uint32_t kRet = 0x2F0;
+    c->gpr[84] = spu_splat_u32(ls_word(c, iface));
+    c->gpr[3] = spu_splat_u32(0x1234);
+    const std::uint32_t target = c->gpr[84]._u32[0];
+    c->gpr[0] = spu_link(kRet);
+    const std::int32_t saved = c->image_id;
+    c->pc = target;
+    c->host_depth++;
+    spu_indirect_branch(c);
+    spu_drain_call(c, kRet);
+    c->host_depth--;
+    spu_img_restore(c, saved);
+}
+
 JobBody hook_select(void*, const JobStart&)
 {
-    return g_lifted == kLiftedHalt ? JobBody{&lifted_halt_entry, -1} : JobBody{&lifted_normal_entry, -1};
+    switch (g_lifted) {
+    case kLiftedHalt: return JobBody{&lifted_halt_entry, -1};
+    case kLiftedJmCall: return JobBody{&lifted_jm_call_entry, -1};
+    default: return JobBody{&lifted_normal_entry, -1};
+    }
 }
 
 void install_hooks()
@@ -357,6 +445,7 @@ struct Opts {
     std::uint32_t depth = 128;
     std::uint32_t workers = 2;
     bool pool = false;
+    std::uint32_t max_desc = 256; /* the attribute's maxSizeJobDescriptor: D0 = 0x3F400 - 4 * max_desc */
 };
 
 /* A queue with one port, the guest buffers laid out above. */
@@ -366,7 +455,7 @@ struct Rig {
     explicit Rig(const Opts& o = {})
     {
         put32(ATTR + 4, 8);
-        put32(ATTR + 8, 256);
+        put32(ATTR + 8, o.max_desc);
         if (o.pool) {
             for (std::uint32_t c = 0; c < 8; ++c) put32(POOL_ATTR + 4 * c, 0);
             put32(POOL_ATTR + 4 * 0, 2);  /* class 0 (64 B): two blocks */
@@ -902,12 +991,15 @@ void mode_observer()
         std::uint32_t serial;
         std::memcpy(&serial, g_obs.serial_bytes, 4);
         CHECK(__builtin_bswap32(serial) == a.serial, "the admission bytes");
-        CHECK(i.image_ea == IMAGE && i.image_ls == 0 && i.image_bytes == kImageSize &&
+        CHECK(i.image_ea == IMAGE && i.image_ls == kBase && i.image_bytes == kImageSize &&
                   i.bss_bytes == kBssQuads * 16,
               "image: ea 0x%X ls 0x%X bytes 0x%X bss 0x%X", i.image_ea, i.image_ls, i.image_bytes, i.bss_bytes);
-        CHECK(i.desc_bytes == 64 && i.desc_ls == SPU_LS_SIZE - 0x400, "descriptor copy: ls 0x%X bytes %u",
-              i.desc_ls, i.desc_bytes);
-        CHECK(i.ctx_ls == i.desc_ls - 0x40 && i.r1 > i.scratch_ls && i.r1 < i.ctx_ls,
+        /* maxDescriptor 256: D0 = 0x3F400 - 4 * 256; the context of slot 0 */
+        CHECK(i.desc_bytes == 64 && i.desc_ls == 0x3F000, "descriptor copy: ls 0x%X bytes %u", i.desc_ls,
+              i.desc_bytes);
+        /* image+bss end at 0x9C00 (A128((0x100 + 0x100) * 16) = 0x2000 from 0x7C00); no cache, io or out, so
+         * the scratch block starts there: scratch 0x100, stack 0x400, r1 = T - 0x60 */
+        CHECK(i.ctx_ls == 0x68D0 && i.scratch_ls == 0x9C00 && i.r1 == 0x9D00 + 0x400 - 0x60,
               "context 0x%X r1 0x%X scratch 0x%X", i.ctx_ls, i.r1, i.scratch_ls);
         CHECK(g_obs.end_r3 == i.ctx_ls, "r3 at the end: 0x%X", g_obs.end_r3);
         /* The observer installed in job_start saw the job's two MFC commands. */
@@ -1064,13 +1156,14 @@ int run_child(const std::function<void()>& child, std::string& err)
     return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
 }
 
-void stop_scenario(Prog prog, const char* kind, const char* needle)
+void stop_scenario(Prog prog, const char* kind, const char* needle, const std::function<void(const JobSpec&)>& patch = {})
 {
-    const std::function<void()> child = [prog] {
+    const std::function<void()> child = [prog, &patch] {
         build_image(IMAGE, prog);
         install_hooks();
         Rig rig({128, 1, false});
         const JobSpec a = spec(0);
+        if (patch) patch(a);
         rig.push(a.desc, 64, 0);
         jq2_port_sync(PORT, 0); /* never returns: the worker stops the process */
         std::fprintf(stderr, "the stop did not happen\n");
@@ -1120,6 +1213,264 @@ void mode_lifted()
     rig.teardown();
 }
 
+/* ---- the JQ2 job profile (docs/JQ2.md, "JQ2 job ABI") -------------------------- */
+
+/* What a job's context holds at its first instruction: the whole local store,
+ * the registers and pc, and the loader's layout report. Addresses and words in
+ * the checks below are derived from the descriptor by hand, not read back from
+ * the implementation. */
+struct StartState {
+    std::mutex mu;
+    int starts = 0;
+    jq2_job_info info{};
+    std::vector<std::uint8_t> ls = std::vector<std::uint8_t>(SPU_LS_SIZE);
+    u128 gpr[128]{};
+    std::uint32_t pc = 0;
+};
+StartState g_start;
+
+void state_start(void*, spu_context* ctx, const jq2_job_info* info)
+{
+    std::lock_guard<std::mutex> lk(g_start.mu);
+    ++g_start.starts;
+    g_start.info = *info;
+    std::memcpy(g_start.ls.data(), ctx->ls, SPU_LS_SIZE);
+    std::memcpy(g_start.gpr, ctx->gpr, sizeof g_start.gpr);
+    g_start.pc = ctx->pc;
+}
+void state_end(void*, spu_context*, std::uint32_t, const jq2_job_info*) {}
+
+std::uint32_t ls_be32(const std::vector<std::uint8_t>& ls, std::uint32_t a)
+{
+    return (std::uint32_t{ls[a]} << 24) | (std::uint32_t{ls[a + 1]} << 16) | (std::uint32_t{ls[a + 2]} << 8) | ls[a + 3];
+}
+
+bool ls_zero(const std::vector<std::uint8_t>& ls, std::uint32_t lo, std::uint32_t hi)
+{
+    for (std::uint32_t a = lo; a < hi; ++a)
+        if (ls[a] != 0) return false;
+    return true;
+}
+
+bool ls_equals_guest(const std::vector<std::uint8_t>& ls, std::uint32_t lsa, std::uint32_t ea, std::uint32_t n)
+{
+    return std::memcmp(ls.data() + lsa, vm_base + ea, n) == 0;
+}
+
+/* A descriptor with caches, an input list, io, out, scratch and stack:
+ *   image 0x1000 + bss (0x100 quadwords): A128((0x100 + 0x100) * 16) = 0x2000 from 0x7C00 -> 0x9C00
+ *   cache 0: A128(0x100) = 0x100 -> 0x9C00..0x9D00; cache 1: A128(0x150) = 0x180 -> 0x9D00..0x9E80
+ *   io: A128(0x4F0) = 0x500 -> 0x9E80..0xA380; out: A128(0x2C0) = 0x300 -> 0xA380..0xA680
+ *   scratch+stack: s = 0xA680, stack base = s + A128(0x400) = 0xAA80, T = + 0x800 = 0xB280
+ *   r1 = T - 0x60 = 0xB220, r80 = 0xB240, r81 = 0xB250
+ * maxDescriptor `max_desc`: D0 = 0x3F400 - 4 * max_desc (256: 0x3F000, 896: 0x3E600, the
+ * descriptor copy address the firmware run shows). The workload id is the low bits of
+ * queue+0x6C, which CreateCommon wrote as the SPURS EA | 0; the test sets `wid` there
+ * and expects it in the kernel view at 0x1D8 and 0x1DC. */
+void mode_layout(std::uint32_t max_desc, std::uint32_t wid)
+{
+    constexpr std::uint32_t CACHE0 = 0x600000, CACHE1 = 0x601000, BIG_IN = 0x602000;
+    build_image(IMAGE, Prog::ret_only);
+    install_hooks();
+    Rig rig({128, 1, false, max_desc});
+    const std::uint32_t d0 = 0x3F400 - 4 * max_desc;
+    CHECK(get32(QUEUE + 0x6C) == SPURS, "CreateCommon leaves queue+0x6C = spurs | wid 0: 0x%X", get32(QUEUE + 0x6C));
+    put32(QUEUE + 0x6C, SPURS | wid);
+    const JobSpec a = spec(0);
+    const std::uint32_t d = a.desc;
+    std::memset(vm_base + d, 0, 0x100);
+    put64(d + 0x00, (std::uint64_t{kBssQuads} << 32) | (IMAGE | 1u));
+    put16(d + 0x08, kImageSize >> 4);
+    put16(d + 0x0A, 8);      /* one input list element */
+    put32(d + 0x14, 0x4F0);  /* sizeInOrInOut */
+    put32(d + 0x18, 0x2C0);  /* sizeOut */
+    put16(d + 0x1C, 0x80);   /* stack 0x800 */
+    put16(d + 0x1E, 0x40);   /* scratch 0x400 */
+    put32(d + 0x24, 16);     /* two cache entries */
+    put64(d + 0x30, (std::uint64_t{0x80} << 32) | BIG_IN);
+    put64(d + 0x38, (std::uint64_t{0x100} << 32) | CACHE0);
+    put64(d + 0x40, (std::uint64_t{0x150} << 32) | CACHE1);
+    for (std::uint32_t i = 0x48; i < 0x80; ++i) vm_base[d + i] = std::uint8_t(0xA0 + i);
+    for (std::uint32_t i = 0; i < 0x80; ++i) vm_base[BIG_IN + i] = std::uint8_t(0x20 + i);
+    for (std::uint32_t i = 0; i < 0x100; ++i) vm_base[CACHE0 + i] = std::uint8_t(0x40 + 3 * i);
+    for (std::uint32_t i = 0; i < 0x150; ++i) vm_base[CACHE1 + i] = std::uint8_t(0x90 + 5 * i);
+
+    const jq2_job_observer obs{nullptr, &state_start, &state_end};
+    CHECK(jq2_set_job_observer(QUEUE, &obs) == 0, "install");
+    CHECK(rig.push(d, 128, 0) == 0, "push");
+    CHECK(jq2_port_sync(PORT, 0) == 0, "sync");
+
+    std::lock_guard<std::mutex> lk(g_start.mu);
+    CHECK(g_start.starts == 1, "starts %d", g_start.starts);
+    const std::vector<std::uint8_t>& ls = g_start.ls;
+    const jq2_job_info& i = g_start.info;
+
+    /* the loader's report */
+    CHECK(i.image_ls == 0x7C00 && i.image_bytes == 0x1000 && i.bss_bytes == 0x1000, "image 0x%X+0x%X bss 0x%X",
+          i.image_ls, i.image_bytes, i.bss_bytes);
+    CHECK(i.desc_ls == d0 && i.desc_bytes == 128 && i.ctx_ls == 0x68D0, "desc 0x%X ctx 0x%X", i.desc_ls, i.ctx_ls);
+    CHECK(i.io_ls == 0x9E80 && i.io_bytes == 0x4F0 && i.out_ls == 0xA380 && i.out_bytes == 0x2C0 &&
+              i.scratch_ls == 0xA680 && i.scratch_bytes == 0x400 && i.stack_bytes == 0x800 && i.r1 == 0xB220,
+          "io 0x%X out 0x%X scratch 0x%X r1 0x%X", i.io_ls, i.out_ls, i.scratch_ls, i.r1);
+
+    /* image, bss, caches, input list, descriptor copy */
+    CHECK(ls_equals_guest(ls, 0x7C00, IMAGE, 0x1000), "image bytes at 0x7C00");
+    CHECK(ls_zero(ls, 0x8C00, 0x9C00), "bss is not copied");
+    CHECK(ls_equals_guest(ls, 0x9C00, CACHE0, 0x100), "cache buffer 0");
+    CHECK(ls_equals_guest(ls, 0x9D00, CACHE1, 0x150) && ls_zero(ls, 0x9E50, 0x9E80), "cache buffer 1 and its padding");
+    CHECK(ls_equals_guest(ls, 0x9E80, BIG_IN, 0x80) && ls_zero(ls, 0x9F00, 0xA680), "input list staged at io, rest zero");
+    CHECK(ls_equals_guest(ls, d0, d, 128), "descriptor copy at D0");
+
+    /* JobContext2 at 0x68D0 */
+    const std::uint32_t x = 0x68D0;
+    const std::uint32_t ctx_words[12] = {0x9E80, 0x9C00, 0x9D00, 0, 0, 0x10007A10, 0x00010002, 0xA380, 0xA680, 0, 0, d};
+    for (std::uint32_t k = 0; k < 12; ++k)
+        CHECK(ls_be32(ls, x + 4 * k) == ctx_words[k], "ctx+0x%02X = 0x%08X, want 0x%08X", 4 * k, ls_be32(ls, x + 4 * k),
+              ctx_words[k]);
+
+    /* jm interface {0x1500, 0x5870, 0, 0}, the stop word and the poll routine */
+    CHECK(ls_be32(ls, 0x7A10) == 0x1500 && ls_be32(ls, 0x7A14) == 0x5870 && ls_be32(ls, 0x7A18) == 0 &&
+              ls_be32(ls, 0x7A1C) == 0,
+          "jm table");
+    CHECK(ls_be32(ls, 0x1500) == 0x3B0F, "jm word 0 is a stop 0x3B0F: 0x%08X", ls_be32(ls, 0x1500));
+    static const std::uint32_t poll[8] = {0x40FFFF83u, 0x21A00B03u, 0x40800003u, 0x21A00B83u,
+                                          0x01A00C03u, 0x7CFFC183u, 0x207FFD03u, 0x35000000u};
+    for (std::uint32_t k = 0; k < 8; ++k)
+        CHECK(ls_be32(ls, 0x5870 + 4 * k) == poll[k], "poll routine word %u", k);
+
+    /* the kernel view: exactly these words, everything else in 0..0x2FF zero */
+    const std::uint32_t spu_num = i.worker;
+    for (std::uint32_t a2 = 0; a2 < 0x300; a2 += 4) {
+        std::uint32_t want = 0;
+        switch (a2) {
+        case 0x1C4: want = SPURS; break;     /* spurs EA, low word of the u64 at 0x1C0 */
+        case 0x1C8: want = spu_num; break;
+        case 0x1CC: want = 8; break;
+        case 0x1D4: want = 0xA00; break;     /* wklCurrentAddr low word */
+        case 0x1D8: case 0x1DC: want = wid; break;   /* wklCurrentUniqueId, wklCurrentId */
+        default: break;
+        }
+        CHECK(ls_be32(ls, a2) == want, "kernel view 0x%03X = 0x%08X, want 0x%08X", a2, ls_be32(ls, a2), want);
+    }
+
+    /* entry state: only these lanes are non-zero (r1 words 1..3: the stack bytes left, 0x800 - 0x60) */
+    CHECK(g_start.pc == 0x7C00, "pc 0x%X", g_start.pc);
+    for (unsigned r = 0; r < 128; ++r) {
+        std::uint32_t want = 0;
+        switch (r) {
+        case 0: want = 0x3FF00; break;
+        case 1: want = 0xB220; break;
+        case 3: want = 0x68D0; break;
+        case 4: want = d0; break;
+        case 80: want = 0xB240; break;
+        case 81: want = 0xB250; break;
+        case 126: want = 0x7C00; break;
+        default: break;
+        }
+        const std::uint32_t rest = r == 1 ? 0x800 - 0x60 : 0;
+        CHECK(g_start.gpr[r]._u32[0] == want && g_start.gpr[r]._u32[1] == rest && g_start.gpr[r]._u32[2] == rest &&
+                  g_start.gpr[r]._u32[3] == rest,
+              "r%u = %08X %08X %08X %08X, want %08X %08X..", r, g_start.gpr[r]._u32[0], g_start.gpr[r]._u32[1],
+              g_start.gpr[r]._u32[2], g_start.gpr[r]._u32[3], want, rest);
+    }
+    const jq2_stats s = rig.stats();
+    CHECK(s.dispatched == 1 && s.executed == 1 && s.credited == 1, "counts");
+    rig.teardown();
+}
+
+/* The jm word 1 routine waits for a tag group. The job GETLs a two-element list
+ * whose first element stalls; the second element moves only once the stall is
+ * acknowledged, which the test does after the routine has polled RdTagStat
+ * three times. The job then calls the routine through the jm table and uses the
+ * second element's data: a routine that returned early would have read zeros. */
+struct WaitState {
+    std::atomic<int> reads{0}, acks{0};
+};
+WaitState g_wait;
+
+void wait_channel(void*, spu_context* ctx, int is_write, std::uint32_t ch, std::uint32_t)
+{
+    if (is_write) {
+        if (ch == MFC_WrListStallAck) g_wait.acks.fetch_add(1);
+        return;
+    }
+    if (ch != MFC_RdTagStat) return;
+    if (g_wait.reads.fetch_add(1) + 1 == 4) spu_wrch(ctx, MFC_WrListStallAck, spu_splat_u32(1));
+}
+const spu_observer g_wait_obs = {nullptr, nullptr, nullptr, nullptr, &wait_channel};
+void wait_start(void*, spu_context* ctx, const jq2_job_info*) { spu_observer_set(ctx, &g_wait_obs); }
+void wait_end(void*, spu_context* ctx, std::uint32_t, const jq2_job_info*) { spu_observer_set(ctx, nullptr); }
+
+void mode_jm_wait()
+{
+    build_image(IMAGE, Prog::jm_wait);
+    install_hooks();
+    Rig rig({128, 1, false});
+    const jq2_job_observer obs{nullptr, &wait_start, &wait_end};
+    CHECK(jq2_set_job_observer(QUEUE, &obs) == 0, "install");
+    const JobSpec a = spec(0);
+    const JobSpec second = spec(1); /* only its input, at IN + 0x10, is used */
+    CHECK(rig.push(a.desc, 64, 0) == 0, "push");
+    CHECK(jq2_port_sync(PORT, 0) == 0, "sync");
+    CHECK(g_wait.acks.load() == 1, "stall acknowledged %d times", g_wait.acks.load());
+    CHECK(g_wait.reads.load() >= 5, "RdTagStat read %d times: the routine did not poll until the tag completed",
+          g_wait.reads.load());
+    CHECK(out_is(a.out, second.in, a.add, a.serial, a.out, a.in), "the job used the second element's data");
+    const jq2_stats s = rig.stats();
+    CHECK(s.executed == 1 && s.credited == 1, "counts");
+    rig.teardown();
+}
+
+/* A job that calls jm word 0: interpreted, and lifted. */
+void mode_stop_jm() { stop_scenario(Prog::jm_call, "jq2-jm-call", "request=0x1234"); }
+void mode_stop_jm_lifted()
+{
+    g_lifted = kLiftedJmCall;
+    stop_scenario(Prog::jm_call, "jq2-jm-call", "request=0x1234");
+}
+
+/* The heap runs from the image to D0 = 0x3F000. io 0x34F00 leaves exactly
+ * 0x3F000 - 0x9C00 - 0x34F00 - 0x100 - 0x400 = 0: the job runs. 0x80 more and the
+ * stack block ends at 0x3F080: spu-job-memory, region stack, limit D0. */
+void mode_heap_fit()
+{
+    build_image(IMAGE, Prog::transform);
+    install_hooks();
+    Rig rig({128, 1, false});
+    const JobSpec a = spec(0);
+    put32(a.desc + 0x14, 0x34F00);
+    CHECK(rig.push(a.desc, 64, 0) == 0, "push");
+    CHECK(jq2_port_sync(PORT, 0) == 0, "sync");
+    CHECK(job_ok(a), "the job that fills the heap exactly ran");
+    const jq2_stats s = rig.stats();
+    CHECK(s.executed == 1 && s.credited == 1, "counts");
+    rig.teardown();
+}
+
+void mode_stop_heap()
+{
+    const auto over = [](const JobSpec& a) { put32(a.desc + 0x14, 0x34F80); };
+    stop_scenario(Prog::transform, "spu-job-memory", "region=stack", over);
+    stop_scenario(Prog::transform, "spu-job-memory", "p=0x3F080", over);
+    stop_scenario(Prog::transform, "spu-job-memory", "limit=0x3F000", over);
+}
+
+/* What the PM's evidence does not decode is a named stop, not a guess: the
+ * jobType byte's bit 1 (U1), the eaBinary low word's bit 1 (U6) and more than
+ * the two cache entries the PM was observed with (U5). */
+void mode_stop_unmodelled()
+{
+    stop_scenario(Prog::transform, "spu-job-dma-list", "reason=jobtype-bit1",
+                  [](const JobSpec& a) { put32(a.desc + 0x2C, 0x06000000u); });
+    stop_scenario(Prog::transform, "spu-job-dma-list", "reason=binary-bit1",
+                  [](const JobSpec& a) { put32(a.desc + 4, IMAGE | 3u); });
+    /* jobType 0x04 (bit 2: the ELF flag every Odin image carries) alone is fine; three cache entries are not */
+    stop_scenario(Prog::transform, "spu-job-dma-list", "reason=cache-count", [](const JobSpec& a) {
+        put32(a.desc + 0x2C, 0x04000000u);
+        put32(a.desc + 0x24, 24);
+    });
+}
+
 void mode_stop_ring()
 {
     const std::function<void()> child = [] {
@@ -1166,6 +1517,14 @@ int main(int argc, char** argv)
     else if (mode == "stop-job") mode_stop_job();
     else if (mode == "stop-halt") mode_stop_halt();
     else if (mode == "stop-crt") mode_stop_crt();
+    else if (mode == "layout") mode_layout(256, 5);
+    else if (mode == "layout-896") mode_layout(896, 0x11);
+    else if (mode == "stop-unmodelled") mode_stop_unmodelled();
+    else if (mode == "jm-wait") mode_jm_wait();
+    else if (mode == "heap-fit") mode_heap_fit();
+    else if (mode == "stop-jm") mode_stop_jm();
+    else if (mode == "stop-jm-lifted") mode_stop_jm_lifted();
+    else if (mode == "stop-heap") mode_stop_heap();
     else if (mode == "stop-ring") mode_stop_ring();
     else {
         std::printf("unknown mode %s\n", mode.c_str());
