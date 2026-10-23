@@ -11,6 +11,17 @@ hand-encoded SPU words over a deterministic junk pattern.
                  0x210), JobContext2 and ctx+0x14, the jm object and the
                  runtime area below it, zeroed bss, buffers and r1 above the
                  bss, and a CRT-like program that reaches main
+  dma-fit        an input DMA list that exactly fills sizeInOut runs, with both
+                 elements at their 16-byte slots in the ioBuffer
+  dma-over, dma-wrap, dma-beyond, dma-zero-ea, dma-size-zero, dma-size-limit,
+  dma-size-align, dma-misaligned, dma-desc-range, bin-ea-zero, bin-size-zero
+                 spu-job-dma-list stops naming the element (or -1), its EA and
+                 size, the LS offset, the cumulative bytes, the capacity and the
+                 reason: one byte past sizeInOut; ea+size wrapping 32-bit; an
+                 EA past guest memory; a non-zero size from the null page; a
+                 zero-size element; a size over 16 KB; a size that is not
+                 1/2/4/8 or a 16-byte multiple; an unaligned 8-byte EA; a list
+                 that leaves guest memory; eaBinary = 0; sizeBinary = 0
   ver13 (hash)   the Ver13 local store at entry, whole, equals the hash the
                  loader produced before Ver14 existed (GOLDEN_VER13_LS)
   fit            the last region (a cache buffer) ending exactly at the runtime
@@ -106,9 +117,46 @@ def main():
         digest = hashlib.sha256(dump.read_bytes()).hexdigest()
         assert digest == GOLDEN_VER13_LS, (
             f"the Ver13 local store at entry changed: sha256 {digest}")
-        for mode in ("ver14", "fit", "swap-interp", "swap-lifted",
+        for mode in ("ver14", "fit", "dma-fit", "swap-interp", "swap-lifted",
                      "swap-idle-interp", "swap-idle-lifted"):
             passes(mode)
+
+        # The input DMA list: a violation is a named stop before any byte is
+        # staged. Fields: the element, its EA and size, where it would land,
+        # the bytes through it, the declared capacity and the reason.
+        def dma_stop(mode, index, ea, size, ls, cumulative, capacity, reason,
+                     job="0x00010000"):
+            f = g.expect_stop(run(mode), "spu-job-dma-list")
+            want = {"job": job, "image": "7", "index": str(index),
+                    "ea": hexs(ea), "size": hexs(size), "ls": f"0x{ls:05X}",
+                    "cumulative": hexs(cumulative), "capacity": hexs(capacity),
+                    "reason": reason}
+            assert {k: f.get(k) for k in want} == want, (mode, f, want)
+
+        # one byte past sizeInOut (0x80): the second element starts at 0x1080
+        dma_stop("dma-over", 1, 0x30080, 1, 0x1080, 0x81, 0x80, "io-overrun")
+        # ea + size wraps 32-bit to 0; only the 64-bit bound sees it
+        dma_stop("dma-wrap", 0, 0xFFFFFFF0, 0x20, 0x1000, 0x20, 0x80, "ea-range")
+        # past the fixture's 1 MB guest VM
+        dma_stop("dma-beyond", 0, 0x200000, 0x10, 0x1000, 0x10, 0x80, "ea-range")
+        # the reserved null page
+        dma_stop("dma-zero-ea", 0, 0, 0x10, 0x1000, 0x10, 0x80, "ea-null")
+        # a zero-size element is not a transfer to skip
+        dma_stop("dma-size-zero", 0, 0x30000, 0, 0x1000, 0, 0x80, "size-zero")
+        # one byte past the MFC's 16 KB limit
+        dma_stop("dma-size-limit", 0, 0x30000, 0x4001, 0x1000, 0x4001, 0x80,
+                 "size-limit")
+        # 24 bytes is neither 1/2/4/8 nor a 16-byte multiple
+        dma_stop("dma-size-align", 0, 0x30000, 0x18, 0x1000, 0x18, 0x80,
+                 "size-align")
+        # an 8-byte transfer needs 8-byte alignment
+        dma_stop("dma-misaligned", 0, 0x30004, 8, 0x1000, 8, 0x80, "ea-align")
+        # the list itself leaves guest memory before its last element
+        dma_stop("dma-desc-range", -1, 0xFFF30, 0x100, 0, 0, 0x80,
+                 "descriptor-range", job="0x000FFF00")
+        # P3: no binary named by the descriptor
+        dma_stop("bin-ea-zero", -1, 0, 0x1000, 0, 0, 0x80, "eaBinary")
+        dma_stop("bin-size-zero", -1, 0x20000, 0, 0, 0, 0x80, "sizeBinary")
 
         # jm word 0: the trap, on both paths
         for mode in ("word0-interp", "word0-lifted"):
@@ -154,7 +202,7 @@ def main():
                     cache="0x2C1")
         # a 32-bit size must not wrap: ALIGN1024(0xFFFFFFFF) used to be 0
         memory_stop("huge-io", "io", IMAGE_SIZE + 0xFFFFFFFF, io="0xFFFFFFFF")
-    print("PASS: the JOBCRT gate, the Ver14 jm interface, kernel view and bss")
+    print("PASS: the JOBCRT gate, the Ver14 jm interface, kernel view, bss and input DMA list")
     return 0
 
 

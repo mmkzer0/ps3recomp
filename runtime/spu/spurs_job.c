@@ -42,6 +42,7 @@
  */
 
 #include "spu_coherency.h"
+#include "spu_dma.h"
 #include "spu_workload.h"
 #include "spu_context.h"
 
@@ -53,6 +54,9 @@
 
 extern uint8_t* vm_base;
 extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
+/* The guest VM's size: 0 means "not sized" (a host that maps the whole 32-bit
+ * space and commits on fault), in which case the 32-bit space is the bound. */
+extern uint32_t ppu_vm_size;
 
 /* ---- guest reads (big-endian) ------------------------------------------ */
 static uint32_t g32(uint32_t ea)
@@ -69,6 +73,14 @@ static uint16_t g16(uint32_t ea)
 static uint64_t g64(uint32_t ea)
 {
     return ((uint64_t)g32(ea) << 32) | (uint64_t)g32(ea + 4);
+}
+
+/* Is [ea, ea+size) inside the guest's VM? Summed in 64 bits, so an EA near the
+ * top of the 32-bit space cannot wrap to a low address. */
+static int guest_range_ok(uint64_t ea, uint64_t size)
+{
+    const uint64_t limit = ppu_vm_size ? (uint64_t)ppu_vm_size : 0x100000000ull;
+    return ea <= limit && size <= limit - ea;
 }
 
 /* ---- local-store writes (big-endian) ----------------------------------- */
@@ -266,6 +278,47 @@ PS3_NORETURN static void job_memory_stop(const job_mem* m, const char* region, u
              f, sizeof f / sizeof f[0], NULL);
 }
 
+/* What the descriptor's input DMA list asked for, for the spu-job-dma-list
+ * stop. Sizes in bytes, offsets in local store. */
+typedef struct job_dma {
+    uint32_t job_ea;
+    int      image_id;
+    uint32_t capacity;         /* sizeInOrInOut, the ioBuffer's declared size */
+} job_dma;
+
+/* index is the list element, -1 when the failure is not an element (the
+ * descriptor names no binary, or the list itself leaves guest memory). ls is
+ * where the element would start, cumulative the bytes through it. */
+PS3_NORETURN static void job_dma_stop(const job_dma* d, long long index,
+                                      uint64_t ea, uint64_t size, uint64_t ls,
+                                      uint64_t cumulative, const char* reason)
+{
+    char job_s[16], img_s[16], idx_s[16], ea_s[24], sz_s[24], ls_s[16];
+    char cum_s[24], cap_s[16];
+    snprintf(job_s, sizeof job_s, "0x%08X", d->job_ea);
+    snprintf(img_s, sizeof img_s, "%d", d->image_id);
+    snprintf(idx_s, sizeof idx_s, "%lld", index);
+    snprintf(ea_s, sizeof ea_s, "0x%llX", (unsigned long long)ea);
+    snprintf(sz_s, sizeof sz_s, "0x%llX", (unsigned long long)size);
+    snprintf(ls_s, sizeof ls_s, "0x%05llX", (unsigned long long)ls);
+    snprintf(cum_s, sizeof cum_s, "0x%llX", (unsigned long long)cumulative);
+    snprintf(cap_s, sizeof cap_s, "0x%X", d->capacity);
+    ps3_stop_field f[] = {
+        {"job", job_s}, {"image", img_s}, {"index", idx_s}, {"ea", ea_s},
+        {"size", sz_s}, {"ls", ls_s}, {"cumulative", cum_s},
+        {"capacity", cap_s}, {"reason", reason},
+    };
+    ps3_stop(PS3_STOP_SPU_JOB_DMA_LIST,
+             "a SPURS job descriptor names no binary, or carries an input DMA "
+             "list that cannot be staged into its ioBuffer",
+             "eaBinary and sizeBinary must be non-zero. The list at descriptor+0x30 "
+             "is sizeDmaList bytes of 8-byte {size word, EAL} elements: each size is "
+             "1/2/4/8 or a 16-byte multiple up to 16 KB, each EAL is naturally "
+             "aligned and inside guest memory, and the staged bytes fit "
+             "sizeInOrInOut. Check that the job descriptor is intact.",
+             f, sizeof f / sizeof f[0], NULL);
+}
+
 int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
                       uint32_t job_ea, uint32_t job_desc_size)
 {
@@ -290,7 +343,16 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
 
     if (n_cache > 4) n_cache = 4;                    /* jm2 caps at 4 */
     if (!size_stk) size_stk = JOB_STACK_DEFAULT;
-    if (!size_bin || size_bin > SPU_LS_SIZE) {
+
+    job_dma jd = { job_ea, image_id, size_io };
+    /* P3: a job that names no image is a malformed descriptor, never a
+     * success. Masking the cache-inhibit bit can leave eaBinary zero even
+     * though the guest word was 1. */
+    if (!ea_bin)
+        job_dma_stop(&jd, -1, ea_bin, size_bin, 0, 0, "eaBinary");
+    if (!size_bin)
+        job_dma_stop(&jd, -1, ea_bin, 0, 0, 0, "sizeBinary");
+    if (size_bin > SPU_LS_SIZE) {
         fprintf(stderr, "[spurs-job] job 0x%08X: bad sizeBinary=%u -- not run\n",
                 job_ea, size_bin);
         return -1;
@@ -373,11 +435,17 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     p += ss_size;
 
     /* ---- cache-hinted read-only inputs ---------------------------------- */
-    uint32_t dma_base   = job_ea + JH_SIZE;          /* input list ... */
-    uint32_t cache_base = dma_base + n_dma * 8u;     /* ... then cache list */
+    const uint64_t dma_base   = (uint64_t)job_ea + JH_SIZE;      /* input list ... */
+    const uint64_t cache_base = dma_base + (uint64_t)n_dma * 8u; /* ... then cache list */
+    /* Both lists are descriptor bytes. Reading them must stay inside guest
+     * memory: the extent is summed in 64 bits, so a sizeDmaList at the u16 cap
+     * next to a high descriptor EA cannot wrap into a low address. */
+    if (!guest_range_ok(dma_base, ((uint64_t)n_dma + n_cache) * 8u))
+        job_dma_stop(&jd, -1, dma_base, ((uint64_t)n_dma + n_cache) * 8u,
+                     0, 0, "descriptor-range");
     uint32_t cache_ls[4] = { 0, 0, 0, 0 };
     for (uint32_t i = 0; i < n_cache; i++) {
-        uint64_t e   = g64(cache_base + i * 8u);
+        uint64_t e   = g64((uint32_t)(cache_base + (uint64_t)i * 8u));
         uint32_t sz  = (uint32_t)(e >> 32);
         uint32_t eal = (uint32_t)e;
         if (!sz || !eal) continue;
@@ -389,14 +457,49 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
         p += ALIGN1024((uint64_t)sz);
     }
 
-    /* ---- input DMA list -> ioBuffer, each entry 16-byte aligned ---------- */
+    /* ---- input DMA list -> ioBuffer, each entry 16-byte aligned ----------
+     * Every element is validated before the first byte lands in local store.
+     * A violation must stop, not skip the element (the job would run on a
+     * buffer the console never assembled), and must not leave the elements
+     * before it staged (a partial ioBuffer is just as wrong). The rules are
+     * the MFC's, as spu_dma.h applies them per transfer: a 15-bit size, at
+     * most 16 KB, a 16-byte multiple and a 16-byte aligned pair from 16 bytes
+     * up, natural 1/2/4/8 alignment below. */
+    uint64_t io_cursor = 0;                          /* bytes from io_ls */
+    for (uint32_t i = 0; i < n_dma; i++) {
+        const uint64_t e     = g64((uint32_t)(dma_base + (uint64_t)i * 8u));
+        const uint64_t size  = (e >> 32) & 0x7FFFu;
+        const uint32_t eal   = (uint32_t)e;
+        const uint64_t el_ls = (uint64_t)io_ls + io_cursor;
+        const uint64_t end   = io_cursor + size;     /* 64-bit: no wrap */
+        const char* why = NULL;
+        if (!size)
+            why = "size-zero";
+        else if (size > MFC_MAX_DMA_SIZE)
+            why = "size-limit";
+        else if (size >= 16u) {
+            if (size & 15u) why = "size-align";
+            else if (((uint32_t)el_ls ^ eal) & 15u) why = "ea-align";
+        } else {
+            if (size != 1 && size != 2 && size != 4 && size != 8) why = "size-align";
+            else if (((uint32_t)el_ls ^ eal) & (uint32_t)(size - 1u)) why = "ea-align";
+        }
+        if (!why && !eal)
+            why = "ea-null";
+        if (!why && !guest_range_ok(eal, size))
+            why = "ea-range";
+        if (!why && end > size_io)
+            why = "io-overrun";
+        if (why)
+            job_dma_stop(&jd, (long long)i, eal, size, el_ls, end, why);
+        io_cursor += (size + 15u) & ~15ull;
+    }
+
     uint32_t io_cur = io_ls, io_used = 0;
     for (uint32_t i = 0; i < n_dma; i++) {
-        uint64_t e   = g64(dma_base + i * 8u);
-        uint32_t sz  = (uint32_t)((e >> 32) & 0x7FFFu);
-        uint32_t eal = (uint32_t)e;
-        if (!sz || !eal) continue;
-        if (!io_ls || io_cur + sz > SPU_LS_SIZE) break;
+        const uint64_t e    = g64((uint32_t)(dma_base + (uint64_t)i * 8u));
+        const uint32_t sz   = (uint32_t)((e >> 32) & 0x7FFFu);
+        const uint32_t eal  = (uint32_t)e;
         memcpy(ls + io_cur, vm_base + eal, sz);
         io_cur  += (sz + 15u) & ~15u;
         io_used += (sz + 15u) & ~15u;

@@ -454,8 +454,18 @@ stack top past local store wraps onto them) and is the named stop
 `spu-job-memory`, whose fields name each size, the failing `region`, its end
 `p` and the `limit` (`docs/STOPS.md`). The firmware knowledge base holds no
 total-size limit from `_cellSpursCheckJob`, so `0x3FAC0` is this loader's own
-layout bound, not a firmware figure. The input DMA list is copied into the
-ioBuffer unchecked against `sizeIn/Out`, as before.
+layout bound, not a firmware figure.
+
+**Input DMA list.** The descriptor's `sizeDmaList` bytes at `+0x30` are 8-byte
+`{size word, EAL}` elements; jm2 stages them into the ioBuffer in 16-byte slots
+before the job enters. The loader validates the whole list before writing any
+of it: every size is 1/2/4/8 or a 16-byte multiple up to 16 KB (the MFC rules
+`spu_dma.h` applies per transfer), every EAL is naturally aligned and inside
+guest memory, the input and cache lists themselves stay inside guest memory
+(summed in 64 bits), and the staged bytes fit `sizeInOrInOut`. A zero-size
+element, a null EA, or an `eaBinary`/`sizeBinary` of zero is a stop too: an
+element is never skipped and no partial ioBuffer is handed to the job. The
+named stop is `spu-job-dma-list`, whose fields name the element (`docs/STOPS.md`).
 
 **Kernel view.** Both CRTs read the SPURS kernel context with absolute loads;
 with the job at LS 0 those addresses are the job's own bytes, so the loader
@@ -488,7 +498,8 @@ Tests: `runtime/spu/tests/test_spurs_job_crt_main.c`, driven by
 `tools/test_spurs_job_crt.py` (`ctest -R spurs_job_crt`): synthetic Ver13 and
 Ver14 jobs with byte-checked local store, the Ver13 local store pinned by hash,
 a CRT-like program that reaches `main`, the word-1 wait on interpreted and
-lifted-style jobs, and each stop.
+lifted-style jobs, a DMA list that exactly fills the ioBuffer, and each stop,
+including every input-DMA-list violation and a list that leaves guest memory.
 
 ---
 

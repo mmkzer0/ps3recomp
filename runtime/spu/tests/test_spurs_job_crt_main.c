@@ -19,6 +19,18 @@
  *   ver13 [dump]     Ver13 start state; dump = file to write the entry LS to
  *   ver14            Ver14 start state with bss; the CRT-like program reaches main
  *   fit              the cache buffer ends exactly at the job runtime area's base: no stop
+ *   dma-fit          the input DMA list exactly fills ioBuffer: both elements land
+ *   dma-over         the second element overruns ioBuffer by one byte: spu-job-dma-list
+ *   dma-wrap         ea + size wraps 32-bit: spu-job-dma-list (64-bit range)
+ *   dma-beyond       an element EA past guest memory: spu-job-dma-list
+ *   dma-zero-ea      a non-zero size from the reserved null page: spu-job-dma-list
+ *   dma-size-zero    a zero-size element (never skipped): spu-job-dma-list
+ *   dma-size-limit   an element over 16 KB: spu-job-dma-list
+ *   dma-size-align   an element size that is not 1/2/4/8 or a 16-byte multiple
+ *   dma-misaligned   8-byte transfer from a 4-byte EA: spu-job-dma-list
+ *   dma-desc-range   the descriptor's list leaves guest memory: spu-job-dma-list
+ *   bin-ea-zero      eaBinary = 0: spu-job-dma-list
+ *   bin-size-zero    sizeBinary = 0: spu-job-dma-list
  *   swap-interp      jm word 1 called with an incomplete tag, interpreted job
  *   swap-lifted      the same, lifted-style job
  *   swap-idle-interp / swap-idle-lifted   word 1 called with every tag complete
@@ -147,6 +159,7 @@ typedef struct job_cfg {
     uint32_t    stack_qw;      /* sizeStack in quadwords; 0 = 0x40 */
     uint32_t    cache_bytes;   /* the one cache entry's size; 0 = 0x80 */
     uint32_t    io_bytes;      /* sizeIn/Out; 0 = 0x80 */
+    uint32_t    job_ea;        /* descriptor EA; 0 = JOB_EA */
 } job_cfg;
 
 typedef struct emitter { uint8_t* base; uint32_t pc; } emitter;
@@ -155,7 +168,7 @@ static void emit(emitter* e, uint32_t w) { put32(e->base + e->pc, w); e->pc += 4
 static void build_job(const job_cfg* c)
 {
     memset(g_mem, 0xC3, sizeof g_mem);             /* junk past the binary too */
-    uint8_t* d = g_mem + JOB_EA;
+    uint8_t* d = g_mem + (c->job_ea ? c->job_ea : JOB_EA);
     memset(d, 0, 0x100);
     uint8_t* img = g_mem + BIN_EA;
     for (uint32_t i = 0; i < IMAGE_SIZE; i++) img[i] = junk(i);
@@ -221,10 +234,31 @@ static void build_job(const job_cfg* c)
     put32(d + 0x24, 8);                                /* one cache entry */
     put64(d + 0x30, (0x80ull << 32) | IO_EA);
     put64(d + 0x38, ((uint64_t)(c->cache_bytes ? c->cache_bytes : 0x80u) << 32) | CACHE_EA);
-    for (uint32_t i = 0; i < 0x80; i++) {
+    for (uint32_t i = 0; i < 0x100; i++) {
         g_mem[IO_EA + i] = (uint8_t)(0x10 + i);
-        g_mem[CACHE_EA + i] = (uint8_t)(0x90 + i);
+        if (i < 0x80) g_mem[CACHE_EA + i] = (uint8_t)(0x90 + i);
     }
+}
+
+static uint64_t be64(const uint8_t* p) { return ((uint64_t)be32(p) << 32) | be32(p + 4); }
+
+/* One input DMA list element: the MFC's 8-byte {size word, EAL} pair. */
+static uint64_t dma_elem(uint32_t size, uint32_t ea)
+{
+    return ((uint64_t)size << 32) | ea;
+}
+
+/* Replace the built descriptor's input list with `n` elements. build_job left
+ * one element and one cache entry; the loader reads the cache list straight
+ * after the input list, so the cache entry moves with it. Every caller keeps
+ * the descriptor at JOB_EA, inside guest memory. */
+static void patch_dma_list(const uint64_t* elems, uint32_t n)
+{
+    uint8_t* d = g_mem + JOB_EA;
+    const uint64_t cache = be64(d + 0x38);
+    put16(d + 0x0A, (uint16_t)(n * 8));
+    for (uint32_t i = 0; i < n; i++) put64(d + 0x30 + i * 8, elems[i]);
+    put64(d + 0x30 + n * 8, cache);
 }
 
 /* ---- what the shims record ----------------------------------------------- */
@@ -299,13 +333,18 @@ static void entry_lifted(spu_context* ctx)
     take(&g_end, ctx);
 }
 
+static void run_built(uint32_t job_ea, void (*entry)(spu_context*))
+{
+    g_ran = 0;
+    spurs_job_set_spu_num(NUM_SPU);
+    const int rc = spu_run_spurs_job(entry, IMAGE_ID, job_ea, 256);
+    CHECK(rc == 0, "spu_run_spurs_job returned %d", rc);
+}
+
 static void run_job(const job_cfg* c, void (*entry)(spu_context*))
 {
     build_job(c);
-    g_ran = 0;
-    spurs_job_set_spu_num(NUM_SPU);
-    const int rc = spu_run_spurs_job(entry, IMAGE_ID, JOB_EA, 256);
-    CHECK(rc == 0, "spu_run_spurs_job returned %d", rc);
+    run_built(c->job_ea ? c->job_ea : JOB_EA, entry);
 }
 
 /* ---- start-state checks -------------------------------------------------- */
@@ -480,6 +519,61 @@ static void mode_stop_cfg(const job_cfg* c)
     g_fail++;
 }
 
+/* A descriptor that must stop before any input byte is staged. */
+static void mode_dma_stop(const uint64_t* elems, uint32_t n, uint32_t io_bytes)
+{
+    job_cfg c = { "JOBCRT Ver14", 0, PROG_MAIN, 0, 0, 0, io_bytes };
+    build_job(&c);
+    patch_dma_list(elems, n);
+    run_built(JOB_EA, entry_interp);
+    printf("FAIL: the job ran (%d)\n", g_ran);
+    g_fail++;
+}
+
+/* The list exactly fills sizeInOut: it must run, both elements in place. */
+static void mode_dma_fit(void)
+{
+    job_cfg c = { "JOBCRT Ver14", 0, PROG_MAIN, 0, 0, 0, 0x90 };
+    const uint64_t elems[] = { dma_elem(0x80, IO_EA), dma_elem(0x10, IO_EA + 0x80) };
+    build_job(&c);
+    patch_dma_list(elems, 2);
+    run_built(JOB_EA, entry_interp);
+    CHECK(g_ran, "an exactly filling DMA list did not run");
+    CHECK(g_end.stop_code == 0, "the job ended with stop 0x%X", g_end.stop_code);
+    CHECK(be32(g_end.ls + MARK_LS) == MARKER, "main did not run");
+    const uint32_t io = be32(g_start.ls + CTX_LS);
+    CHECK(io == 0x1000, "ioBuffer = 0x%X, want 0x1000", io);
+    CHECK(memcmp(g_start.ls + io, g_mem + IO_EA, 0x80) == 0, "first element data");
+    CHECK(memcmp(g_start.ls + io + 0x80, g_mem + IO_EA + 0x80, 0x10) == 0,
+          "second element data did not land at ioBuffer+0x80");
+}
+
+/* sizeDmaList describes a list that leaves guest memory before its last
+ * element: reading it would run past the VM. */
+static void mode_dma_desc_range(void)
+{
+    job_cfg c = { "JOBCRT Ver14", 0, PROG_MAIN, 0 };
+    c.job_ea = 0xFFF00;
+    build_job(&c);
+    put16(g_mem + c.job_ea + 0x0A, 0x100);   /* 32 entries: 0xFFF30 + 0x100 > 1 MB */
+    put32(g_mem + c.job_ea + 0x24, 0);       /* no cache list to read past it */
+    run_built(c.job_ea, entry_interp);
+    printf("FAIL: the job ran (%d)\n", g_ran);
+    g_fail++;
+}
+
+/* eaBinary or sizeBinary zero: there is no binary to run. */
+static void mode_bin_zero(int ea_zero)
+{
+    job_cfg c = { "JOBCRT Ver14", 0, PROG_MAIN, 0 };
+    build_job(&c);
+    if (ea_zero) put64(g_mem + JOB_EA, 0);
+    else put16(g_mem + JOB_EA + 0x08, 0);
+    run_built(JOB_EA, entry_interp);
+    printf("FAIL: the job ran (%d)\n", g_ran);
+    g_fail++;
+}
+
 static void mode_stop(const char* crt, uint32_t bss_qw)
 {
     job_cfg c = { crt, bss_qw, PROG_MAIN, 0, 0, 0, 0 };
@@ -525,6 +619,46 @@ int main(int argc, char** argv)
         job_cfg c = { "JOBCRT Ver14", 0, PROG_MAIN, 0, 0, 0, 0xFFFFFFFFu };
         mode_stop_cfg(&c);
     }
+    else if (!strcmp(m, "dma-fit")) mode_dma_fit();
+    else if (!strcmp(m, "dma-over")) {
+        /* 0x80-byte buffer, first element exactly fills it, second overruns by
+         * one byte */
+        const uint64_t e[] = { dma_elem(0x80, IO_EA), dma_elem(1, IO_EA + 0x80) };
+        mode_dma_stop(e, 2, 0x80);
+    }
+    else if (!strcmp(m, "dma-wrap")) {
+        /* 32-bit ea + size wraps to 0; only the 64-bit bound sees the overrun */
+        ppu_vm_size = 0;
+        const uint64_t e[] = { dma_elem(0x20, 0xFFFFFFF0u) };
+        mode_dma_stop(e, 1, 0x80);
+    }
+    else if (!strcmp(m, "dma-beyond")) {
+        const uint64_t e[] = { dma_elem(0x10, 0x200000u) };   /* past the 1 MB VM */
+        mode_dma_stop(e, 1, 0x80);
+    }
+    else if (!strcmp(m, "dma-zero-ea")) {
+        const uint64_t e[] = { dma_elem(0x10, 0) };
+        mode_dma_stop(e, 1, 0x80);
+    }
+    else if (!strcmp(m, "dma-size-zero")) {
+        const uint64_t e[] = { dma_elem(0, IO_EA) };
+        mode_dma_stop(e, 1, 0x80);
+    }
+    else if (!strcmp(m, "dma-size-limit")) {
+        const uint64_t e[] = { dma_elem(0x4001, IO_EA) };   /* one past 16 KB */
+        mode_dma_stop(e, 1, 0x80);
+    }
+    else if (!strcmp(m, "dma-size-align")) {
+        const uint64_t e[] = { dma_elem(0x18, IO_EA) };     /* not a 16-byte multiple */
+        mode_dma_stop(e, 1, 0x80);
+    }
+    else if (!strcmp(m, "dma-misaligned")) {
+        const uint64_t e[] = { dma_elem(8, IO_EA + 4) };
+        mode_dma_stop(e, 1, 0x80);
+    }
+    else if (!strcmp(m, "dma-desc-range")) mode_dma_desc_range();
+    else if (!strcmp(m, "bin-ea-zero")) mode_bin_zero(1);
+    else if (!strcmp(m, "bin-size-zero")) mode_bin_zero(0);
     else { fprintf(stderr, "unknown mode %s\n", m); return 2; }
 
     if (g_fail) return 1;
