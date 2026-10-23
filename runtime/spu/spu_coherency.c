@@ -136,7 +136,7 @@ void spu_coh_forget_range(uintptr_t lo, uintptr_t hi)
         spu_coh_entry* entry = *link;
         uintptr_t c = (uintptr_t)entry->ctx;
         if (c >= lo && c < hi) {
-            static int _n = 0;
+            static SPU_THREAD_LOCAL int _n = 0;
             if (PS3_LOG_FIRST(_n, 16))
                 fprintf(stderr, "[spu-coh] leaked ctx %p (img=%d) dropped at thread exit\n",
                         (void*)c, entry->ctx->image_id);
@@ -200,9 +200,9 @@ void spu_coh_notify_write(uint32_t ea)
             /* SPU_PUTLLC_WHY=1: name the agent that killed it. A PUTLLC that
              * always fails for "no reservation" is useless without knowing who
              * took it away -- a peer SPU, or the PPU committing to the line. */
-            { static int s_w = -1;
+            { static SPU_THREAD_LOCAL int s_w = -1;
               if (s_w < 0) s_w = getenv("SPU_PUTLLC_WHY") ? 1 : 0;
-              if (s_w) { static unsigned long long n;
+              if (s_w) { static SPU_THREAD_LOCAL unsigned long long n;
                   if ((++n % 200000) == 1)
                       fprintf(stderr, "[resv-lost] %llu: line 0x%08X taken from img=%d ctx=%p\n",
                               n, line, c->image_id, (void*)c); } }
