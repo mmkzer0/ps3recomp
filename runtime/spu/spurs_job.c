@@ -114,7 +114,7 @@ enum {
     JC_SIZE               = 0x30,
 };
 
-#define ALIGN1024(x)  (((x) + 1023u) & ~1023u)
+#define ALIGN1024(x)  (((uint64_t)(x) + 1023u) & ~(uint64_t)1023u)
 #define JOB_DMA_TAG   20u          /* "one of: {20,21}" — job_context_types.h */
 #define JOB_STACK_DEFAULT 8192u    /* _cellSpursCheckJob's sizeStack==0 default */
 
@@ -222,6 +222,50 @@ SPURS_JOB_TLS int g_spurs_job_mbox_valid;
 SPURS_JOB_TLS uint32_t g_spurs_job_spu_num;
 void spurs_job_set_spu_num(uint32_t n) { g_spurs_job_spu_num = n; }
 
+/* What the descriptor asked for, for the spu-job-memory stop. Sizes in bytes. */
+typedef struct job_mem {
+    uint32_t job_ea;
+    int      image_id;
+    uint32_t size_bin;
+    uint64_t bss;
+    uint32_t size_io, size_out;
+    uint64_t size_scr, size_stk;
+    uint64_t cache;            /* cache entry sizes read so far, the failing one included */
+} job_mem;
+
+/* p is the end address of the region that crosses JOB_RT_LS (64-bit, so a huge
+ * descriptor size names itself instead of wrapping). */
+PS3_NORETURN static void job_memory_stop(const job_mem* m, const char* region, uint64_t p)
+{
+    char job_s[16], img_s[16], bin_s[16], bss_s[24], mem_s[24], io_s[16], out_s[16];
+    char scr_s[24], stk_s[24], cache_s[24], p_s[24], lim_s[16];
+    snprintf(job_s, sizeof job_s, "0x%08X", m->job_ea);
+    snprintf(img_s, sizeof img_s, "%d", m->image_id);
+    snprintf(bin_s, sizeof bin_s, "0x%X", m->size_bin);
+    snprintf(bss_s, sizeof bss_s, "0x%llX", (unsigned long long)m->bss);
+    snprintf(mem_s, sizeof mem_s, "0x%llX", (unsigned long long)(m->size_bin + m->bss));
+    snprintf(io_s, sizeof io_s, "0x%X", m->size_io);
+    snprintf(out_s, sizeof out_s, "0x%X", m->size_out);
+    snprintf(scr_s, sizeof scr_s, "0x%llX", (unsigned long long)m->size_scr);
+    snprintf(stk_s, sizeof stk_s, "0x%llX", (unsigned long long)m->size_stk);
+    snprintf(cache_s, sizeof cache_s, "0x%llX", (unsigned long long)m->cache);
+    snprintf(p_s, sizeof p_s, "0x%llX", (unsigned long long)p);
+    snprintf(lim_s, sizeof lim_s, "0x%X", JOB_RT_LS);
+    ps3_stop_field f[] = {
+        {"job", job_s}, {"image", img_s}, {"binary", bin_s},
+        {"bss", bss_s}, {"memory", mem_s}, {"io", io_s}, {"out", out_s},
+        {"scratch", scr_s}, {"stack", stk_s}, {"cache", cache_s},
+        {"region", region}, {"p", p_s}, {"limit", lim_s},
+    };
+    ps3_stop(PS3_STOP_SPU_JOB_MEMORY,
+             "a SPURS job's image, bss, buffers or stack reach the job runtime area "
+             "at the top of local store",
+             "The descriptor's sizeBinary, the eaBinary high word (bss / 16), the "
+             "buffer sizes and sizeStack must leave the job context room above them; "
+             "check that the job descriptor is intact.",
+             f, sizeof f / sizeof f[0], NULL);
+}
+
 int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
                       uint32_t job_ea, uint32_t job_desc_size)
 {
@@ -252,29 +296,15 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
         return -1;
     }
 
-    /* The job's memory is its image plus bss, from LS 0. It must end below the
-     * job runtime area: past it the descriptor, context and jm interface
-     * written below would land on the job's own bytes. */
-    if ((uint64_t)size_bin + bss > JOB_RT_LS) {
-        char job_s[16], img_s[16], bin_s[16], bss_s[24], mem_s[24], lim_s[16];
-        snprintf(job_s, sizeof job_s, "0x%08X", job_ea);
-        snprintf(img_s, sizeof img_s, "%d", image_id);
-        snprintf(bin_s, sizeof bin_s, "0x%X", size_bin);
-        snprintf(bss_s, sizeof bss_s, "0x%llX", (unsigned long long)bss);
-        snprintf(mem_s, sizeof mem_s, "0x%llX", (unsigned long long)(size_bin + bss));
-        snprintf(lim_s, sizeof lim_s, "0x%X", JOB_RT_LS);
-        ps3_stop_field f[] = {
-            {"job", job_s}, {"image", img_s}, {"binary", bin_s},
-            {"bss", bss_s}, {"memory", mem_s}, {"limit", lim_s},
-        };
-        ps3_stop(PS3_STOP_SPU_JOB_MEMORY,
-                 "a SPURS job's image plus bss reaches the job runtime area at the top "
-                 "of local store",
-                 "The descriptor's sizeBinary and the eaBinary high word (bss / 16) must "
-                 "leave room for the job context above them; check that the job "
-                 "descriptor is intact.",
-                 f, sizeof f / sizeof f[0], NULL);
-    }
+    /* The job's memory is its image plus bss, from LS 0, then the io, out,
+     * scratch+stack and cache regions above it. All of it must end at or below
+     * the job runtime area: past it the descriptor, context and jm interface
+     * written below would land on the job's own bytes, and a stack that wraps
+     * LS addressing would run over them. */
+    job_mem jm = { job_ea, image_id, size_bin, bss, size_io, size_out,
+                   (uint64_t)size_scr, (uint64_t)size_stk, 0 };
+    if ((uint64_t)size_bin + bss > JOB_RT_LS)
+        job_memory_stop(&jm, "image", (uint64_t)size_bin + bss);
 
     uint8_t* ls = (uint8_t*)calloc(1, SPU_LS_SIZE);
     if (!ls) return -1;
@@ -310,7 +340,6 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     }
 
     /* ---- regions, following _cellSpursCheckJob's own arithmetic --------- */
-    uint32_t p         = ALIGN1024(size_bin + (uint32_t)bss);
     /* Same rule as the scratch pointer: these are REGION BASES and stay valid
      * when the region is empty. NULL invites the job to dereference 0 -- and
      * since the job binary loads at LS 0, reading through a null base returns
@@ -318,18 +347,29 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
      * wedged jobs were doing: each spun DMAing to the word at offset 0x64 of
      * its own image, which is why the addresses were misaligned and looked
      * like floats -- they were opcodes. */
-    uint32_t io_ls     = p;                p += ALIGN1024(size_io);
-    uint32_t out_ls    = p;                p += ALIGN1024(size_out);
+    uint64_t p         = ALIGN1024((uint64_t)size_bin + bss);
+    uint32_t io_ls     = (uint32_t)p;
+    if (size_io && p + size_io > JOB_RT_LS)
+        job_memory_stop(&jm, "io", p + size_io);
+    p += ALIGN1024((uint64_t)size_io);
+    uint32_t out_ls    = (uint32_t)p;
+    if (size_out && p + size_out > JOB_RT_LS)
+        job_memory_stop(&jm, "out", p + size_out);
+    p += ALIGN1024((uint64_t)size_out);
     if (use_io && !out_ls) out_ls = io_ls;    /* in-out: output shares ioBuffer */
-    uint32_t ss_size   = ALIGN1024(size_scr + size_stk);
+    uint32_t ss_size   = (uint32_t)ALIGN1024((uint64_t)size_scr + size_stk);
     /* The scratch pointer is the BASE OF THE SCRATCH+STACK BLOCK, and it is
      * valid even when sizeScratch is 0 -- a zero-length buffer still has an
      * address. Handing the job a NULL here meant it dereferenced 0 and read
      * ITS OWN CODE as data: every wedged job in Tokyo Jungle was loading a
      * word from LS 0x64 and using that SPU instruction word as a DMA address,
      * which is why the addresses looked like misaligned floats. */
-    uint32_t s_ls      = p;
-    uint32_t stack_top = p + ss_size;
+    uint32_t s_ls      = (uint32_t)p;
+    /* The block's top is where r1 starts: the stack must lie wholly below
+     * JOB_RT_LS, or LS masking would put it on the context and descriptor. */
+    if (p + ss_size > JOB_RT_LS)
+        job_memory_stop(&jm, "stack", p + ss_size);
+    uint32_t stack_top = s_ls + ss_size;
     p += ss_size;
 
     /* ---- cache-hinted read-only inputs ---------------------------------- */
@@ -341,10 +381,12 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
         uint32_t sz  = (uint32_t)(e >> 32);
         uint32_t eal = (uint32_t)e;
         if (!sz || !eal) continue;
-        if (p + sz > SPU_LS_SIZE) break;
-        cache_ls[i] = p;
+        jm.cache += sz;
+        if (p + sz > JOB_RT_LS)
+            job_memory_stop(&jm, "cache", p + sz);
+        cache_ls[i] = (uint32_t)p;
         memcpy(ls + p, vm_base + eal, sz);
-        p += ALIGN1024(sz);
+        p += ALIGN1024((uint64_t)sz);
     }
 
     /* ---- input DMA list -> ioBuffer, each entry 16-byte aligned ---------- */
@@ -367,9 +409,9 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     const uint32_t ctx_ls  = JOB_CTX_LS;        /* CellSpursJobContext2, 48 B */
     uint32_t dsz     = job_desc_size ? job_desc_size : 256u;
     if (dsz > 0x400) dsz = 0x400;
-    if (p > JOB_RT_LS)
-        fprintf(stderr, "[spurs-job] job 0x%08X: WARNING regions reach 0x%X, "
-                        "past the job runtime area at 0x%X\n", job_ea, p, JOB_RT_LS);
+    /* Every region, the stack included, ended at or below JOB_RT_LS (checked
+     * above), so the descriptor, context and jm interface below land on free
+     * local store. */
     memcpy(ls + desc_ls, vm_base + job_ea, dsz);
 
     ls32(ls, ctx_ls + JC_IO_BUFFER, io_ls);

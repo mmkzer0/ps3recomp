@@ -18,13 +18,17 @@
  *
  *   ver13 [dump]     Ver13 start state; dump = file to write the entry LS to
  *   ver14            Ver14 start state with bss; the CRT-like program reaches main
- *   fit              image + bss exactly at the job runtime area's base: no stop
+ *   fit              the cache buffer ends exactly at the job runtime area's base: no stop
  *   swap-interp      jm word 1 called with an incomplete tag, interpreted job
  *   swap-lifted      the same, lifted-style job
  *   swap-idle-interp / swap-idle-lifted   word 1 called with every tag complete
  *   word0-interp / word0-lifted           jm word 0 called: spu-job-jm-entry
  *   ver12 | ver15 | garbage | empty       spu-job-crt-version
- *   overlap          one quadword too much memory: spu-job-memory
+ *   overlap          one quadword too much memory: spu-job-memory (region image)
+ *   image-edge       image + bss end exactly at the runtime area: the io buffer above stops
+ *   stack-max        sizeStack = 0xFFFF: spu-job-memory (region stack)
+ *   cache-over       the cache buffer ends one byte past the runtime area: stop
+ *   huge-io          sizeIn/Out = 0xFFFFFFFF: spu-job-memory (region io), no wrap
  */
 #include "../spu_context.h"
 #include "../spu_dma.h"      /* vm_base */
@@ -76,6 +80,14 @@ enum {
     STALL_TAG = 5,
     MARKER    = 0x5A5A,
     LIFTED_RET = 0x2F0,          /* the address after the lifted bisl */
+};
+
+/* "fit": io starts at 0x3E800 (image + bss end exactly there, 1 KB aligned),
+ * io/out/scratch+stack take 0x1000, and the cache buffer's 0x2C0 bytes end at
+ * RT_LS. */
+enum {
+    FIT_BSS_QW = (0x3E800 - IMAGE_SIZE) / 16,
+    FIT_CACHE  = 0x2C0,
 };
 
 static int g_fail;
@@ -132,6 +144,9 @@ typedef struct job_cfg {
     uint32_t    bss_qw;        /* eaBinary high word */
     prog_kind   prog;
     int         stall;         /* leave tag STALL_TAG incomplete before the call */
+    uint32_t    stack_qw;      /* sizeStack in quadwords; 0 = 0x40 */
+    uint32_t    cache_bytes;   /* the one cache entry's size; 0 = 0x80 */
+    uint32_t    io_bytes;      /* sizeIn/Out; 0 = 0x80 */
 } job_cfg;
 
 typedef struct emitter { uint8_t* base; uint32_t pc; } emitter;
@@ -199,13 +214,13 @@ static void build_job(const job_cfg* c)
     put64(d + 0x00, ((uint64_t)c->bss_qw << 32) | (BIN_EA | 1u));   /* bit 0: cache inhibit */
     put16(d + 0x08, IMAGE_SIZE >> 4);
     put16(d + 0x0A, 8);                                /* one input DMA entry */
-    put32(d + 0x14, 0x80);                             /* ioBuffer bytes */
+    put32(d + 0x14, c->io_bytes ? c->io_bytes : 0x80);   /* ioBuffer bytes */
     put32(d + 0x18, 0x100);                            /* oBuffer bytes */
-    put16(d + 0x1C, 0x40);                             /* stack, quadwords */
+    put16(d + 0x1C, c->stack_qw ? c->stack_qw : 0x40);   /* stack, quadwords */
     put16(d + 0x1E, 0x20);                             /* scratch, quadwords */
     put32(d + 0x24, 8);                                /* one cache entry */
     put64(d + 0x30, (0x80ull << 32) | IO_EA);
-    put64(d + 0x38, (0x80ull << 32) | CACHE_EA);
+    put64(d + 0x38, ((uint64_t)(c->cache_bytes ? c->cache_bytes : 0x80u) << 32) | CACHE_EA);
     for (uint32_t i = 0; i < 0x80; i++) {
         g_mem[IO_EA + i] = (uint8_t)(0x10 + i);
         g_mem[CACHE_EA + i] = (uint8_t)(0x90 + i);
@@ -395,11 +410,17 @@ static void mode_start(int ver14, const char* dump)
 
 static void mode_fit(void)
 {
-    /* memory == the runtime area's base, to the byte */
-    job_cfg c = { "JOBCRT Ver14", (RT_LS - IMAGE_SIZE) / 16u, PROG_MAIN, 0 };
+    /* The last region, the cache buffer, ends exactly at the runtime area's
+     * base, to the byte: image+bss end at io, io/out/scratch+stack fill the
+     * 0x1000 below the cache buffer. */
+    job_cfg c = { "JOBCRT Ver14", FIT_BSS_QW, PROG_MAIN, 0, 0, FIT_CACHE, 0 };
     run_job(&c, entry_interp);
     CHECK(g_ran, "an exactly fitting job did not run");
-    CHECK(all_zero(g_start.ls + IMAGE_SIZE, RT_LS - IMAGE_SIZE), "bss not zero");
+    CHECK(all_zero(g_start.ls + IMAGE_SIZE, FIT_BSS_QW * 16u), "bss not zero");
+    const uint32_t cache = be32(g_start.ls + CTX_LS + 0x04);
+    CHECK(cache == RT_LS - FIT_CACHE, "cacheBuffer[0] = 0x%X, want 0x%X", cache, RT_LS - FIT_CACHE);
+    CHECK(memcmp(g_start.ls + cache, g_mem + CACHE_EA, FIT_CACHE) == 0, "cache buffer data");
+    CHECK(be32(g_start.ls + RT_LS) == RT_TRAP_STOP, "the runtime area's trap word was overwritten");
 }
 
 static void mode_swap(int lifted, int stall)
@@ -452,12 +473,17 @@ static void mode_word0(int lifted)
 }
 
 /* A job that must stop before it runs. */
-static void mode_stop(const char* crt, uint32_t bss_qw)
+static void mode_stop_cfg(const job_cfg* c)
 {
-    job_cfg c = { crt, bss_qw, PROG_MAIN, 0 };
-    run_job(&c, entry_interp);
+    run_job(c, entry_interp);
     printf("FAIL: the job ran (%d)\n", g_ran);
     g_fail++;
+}
+
+static void mode_stop(const char* crt, uint32_t bss_qw)
+{
+    job_cfg c = { crt, bss_qw, PROG_MAIN, 0, 0, 0, 0 };
+    mode_stop_cfg(&c);
 }
 
 int main(int argc, char** argv)
@@ -481,6 +507,24 @@ int main(int argc, char** argv)
     else if (!strcmp(m, "garbage")) mode_stop("\x01\x02JOBCRT ver", 0);
     else if (!strcmp(m, "empty")) mode_stop("\0\0\0\0\0\0\0\0\0\0\0", 0);
     else if (!strcmp(m, "overlap")) mode_stop("JOBCRT Ver14", (RT_LS - IMAGE_SIZE) / 16u + 1u);
+    else if (!strcmp(m, "image-edge")) {
+        /* image + bss ending exactly at the runtime area: the image fits, the
+         * stack above it does not */
+        job_cfg c = { "JOBCRT Ver14", (RT_LS - IMAGE_SIZE) / 16u, PROG_MAIN, 0, 0, 0, 0 };
+        mode_stop_cfg(&c);
+    }
+    else if (!strcmp(m, "stack-max")) {
+        job_cfg c = { "JOBCRT Ver14", 0, PROG_MAIN, 0, 0xFFFFu, 0, 0 };
+        mode_stop_cfg(&c);
+    }
+    else if (!strcmp(m, "cache-over")) {
+        job_cfg c = { "JOBCRT Ver14", FIT_BSS_QW, PROG_MAIN, 0, 0, FIT_CACHE + 1u, 0 };
+        mode_stop_cfg(&c);
+    }
+    else if (!strcmp(m, "huge-io")) {
+        job_cfg c = { "JOBCRT Ver14", 0, PROG_MAIN, 0, 0, 0, 0xFFFFFFFFu };
+        mode_stop_cfg(&c);
+    }
     else { fprintf(stderr, "unknown mode %s\n", m); return 2; }
 
     if (g_fail) return 1;

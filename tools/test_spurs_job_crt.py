@@ -13,8 +13,13 @@ hand-encoded SPU words over a deterministic junk pattern.
                  bss, and a CRT-like program that reaches main
   ver13 (hash)   the Ver13 local store at entry, whole, equals the hash the
                  loader produced before Ver14 existed (GOLDEN_VER13_LS)
-  fit, overlap   image + bss ending exactly at the runtime area's base runs;
-                 one quadword more is a spu-job-memory stop
+  fit            the last region (a cache buffer) ending exactly at the runtime
+                 area's base runs, with the bytes in place
+  overlap, image-edge, stack-max, cache-over, huge-io
+                 spu-job-memory stops naming every size, the region, the end
+                 address p and the limit: image + bss one quadword over; image +
+                 bss exact (the io buffer above stops); sizeStack = 0xFFFF; a
+                 cache buffer one byte over; a 0xFFFFFFFF io size (no wrap)
   swap-*         jm word 1 called with a tag still incomplete returns once the
                  MFC has completed it, with every register but r3 preserved,
                  for an interpreted job and for lifted-style bisl code; with
@@ -122,12 +127,33 @@ def main():
             assert (f["job"], f["image"], f["marker"], f["bytes"]) == (
                 "0x00010000", "7", marker, raw.hex().upper()), f
 
+        # Every stop names the descriptor's sizes (bytes), the region that
+        # crossed, the end address p it reached and the limit. Defaults of the
+        # fixture's descriptor: io 0x80, out 0x100, scratch 0x200, stack 0x400.
+        def memory_stop(mode, region, p, **sizes):
+            f = g.expect_stop(run(mode), "spu-job-memory")
+            want = {"job": "0x00010000", "image": "7", "binary": hexs(IMAGE_SIZE),
+                    "bss": "0x0", "io": "0x80", "out": "0x100", "scratch": "0x200",
+                    "stack": "0x400", "cache": "0x0", "limit": hexs(RT_LS),
+                    "region": region, "p": hexs(p)}
+            want.update(sizes)
+            want.setdefault("memory", hexs(IMAGE_SIZE + int(want["bss"], 16)))
+            assert {k: f.get(k) for k in want} == want, (mode, f, want)
+
         # image + bss one quadword past the runtime area
         bss = ((RT_LS - IMAGE_SIZE) // 16 + 1) * 16
-        f = g.expect_stop(run("overlap"), "spu-job-memory")
-        assert (f["job"], f["image"], f["binary"], f["bss"], f["memory"], f["limit"]) == (
-            "0x00010000", "7", hexs(IMAGE_SIZE), hexs(bss), hexs(IMAGE_SIZE + bss),
-            hexs(RT_LS)), f
+        memory_stop("overlap", "image", IMAGE_SIZE + bss, bss=hexs(bss))
+        # image + bss ending exactly at the runtime area is not the image's
+        # fault: the io buffer above (at the next 1 KB) stops
+        edge = RT_LS - IMAGE_SIZE
+        memory_stop("image-edge", "io", 0x3FC00 + 0x80, bss=hexs(edge))
+        # sizeStack = 0xFFFF: r1 would wrap LS addressing onto the context
+        memory_stop("stack-max", "stack", 0x1800 + 0x100400, stack="0xFFFF0")
+        # the cache buffer one byte past the runtime area (0x3F800 + 0x2C1)
+        memory_stop("cache-over", "cache", RT_LS + 1, bss=hexs(0x3E800 - IMAGE_SIZE),
+                    cache="0x2C1")
+        # a 32-bit size must not wrap: ALIGN1024(0xFFFFFFFF) used to be 0
+        memory_stop("huge-io", "io", IMAGE_SIZE + 0xFFFFFFFF, io="0xFFFFFFFF")
     print("PASS: the JOBCRT gate, the Ver14 jm interface, kernel view and bss")
     return 0
 
