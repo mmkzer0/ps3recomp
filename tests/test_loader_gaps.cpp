@@ -90,7 +90,10 @@ void ps3_indirect_call(ppu_context* ctx);
 void lv2_syscall(ppu_context* ctx);
 void ppu_unlifted_stub(uint64_t addr, ppu_context* ctx);
 extern uint32_t ppu_vm_size;
-uint32_t vm_read32(uint64_t a);
+// Parenthesised: ppu_recomp.h maps vm_read32 to its inline fast path by a
+// function-like macro, and redeclaring that static inline with C linkage is
+// an error to GCC.
+uint32_t (vm_read32)(uint64_t a);
 void vm_write32(uint64_t a, uint32_t v);
 uint64_t ppu_guest_call(uint32_t opd, uint64_t, uint64_t, uint64_t, uint64_t,
                         uint64_t, uint64_t, uint64_t, uint64_t);

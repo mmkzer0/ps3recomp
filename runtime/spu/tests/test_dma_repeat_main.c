@@ -32,6 +32,14 @@ void spu_coh_notify_write(uint32_t ea) { (void)ea; }
 void spu_coh_notify_write_except(uint32_t ea, const void* self) { (void)ea; (void)self; }
 void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
+/* The PUT path's lock-guard probe and write hook. Clang at -O1 prunes the PUT
+ * branch of this GET-only fixture, GCC keeps it and needs the symbols. */
+void spu_lockguard_check(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint32_t size,
+                         const char* what)
+{
+    (void)ctx; (void)ea; (void)ls; (void)size; (void)what;
+}
+void (*g_spu_put_hook)(uint32_t ea, uint32_t size) = 0;
 
 /* More state the runtime keeps for the diagnostics around mfc_submit. A GET of
  * 16 bytes never inspects any of it; every switch that would is off (the test
