@@ -39,10 +39,12 @@ ROOT = Path(__file__).resolve().parents[1]
 # A: li r3,5 ; blr          B: li r3,7 ; .word 0 (no instruction) ; blr
 # C: b +0x10 ; .word 0xFFFFFFFF, 0, 0 (a literal pool) ; li r3,3 ; blr ; .word 0 (padding)
 # D: li r3,9 ; b 0x20000 (outside the image)
+# E: bctr ; .word 0 ; bl 0x10004 (dead after the computed jump: no trap, no func_00010004)
 CODE = struct.pack('>IIIII', 0x38600005, 0x4E800020, 0x38600007, 0x00000000, 0x4E800020) + \
     struct.pack('>IIIIIII', 0x48000010, 0xFFFFFFFF, 0x00000000, 0x00000000, 0x38600003, 0x4E800020,
                 0x00000000) + \
-    struct.pack('>II', 0x38600009, 0x48000000 | (0x20000 - 0x10034))
+    struct.pack('>II', 0x38600009, 0x48000000 | (0x20000 - 0x10034)) + \
+    struct.pack('>III', 0x4E800420, 0x00000000, 0x48000001 | ((0x10004 - 0x10040) & 0x3FFFFFC))
 
 
 def main():
@@ -55,7 +57,8 @@ def main():
         (tmp / 'fn.json').write_text(json.dumps([{'start': '0x10000', 'end': '0x10008'},
                                                  {'start': '0x10008', 'end': '0x10014'},
                                                  {'start': '0x10014', 'end': '0x10030'},
-                                                 {'start': '0x10030', 'end': '0x10038'}]))
+                                                 {'start': '0x10030', 'end': '0x10038'},
+                                                 {'start': '0x10038', 'end': '0x10044'}]))
         lift = tmp / 'lift'
         subprocess.run([sys.executable, str(ROOT / 'tools/ppu_lifter.py'), str(tmp / 'code.bin'), '--raw',
                         '--base', '0x10000', '--functions', str(tmp / 'fn.json'), '--jobs', '1',
@@ -85,7 +88,11 @@ def main():
         assert fc['name'] == 'func_00010014' and fc['traps'] == [], fc
         assert fc['dead'] == [['0x00010018', '0x00010020'], ['0x0001002C', '0x0001002C']], fc
         assert fn['dead'] == [['0x00010010', '0x00010010']], fn   # the blr after the trap
-        assert report['summary']['dead_instructions'] == 5, report
+        fe = report['functions'][2]
+        assert fe['name'] == 'func_00010038' and fe['traps'] == [], fe
+        assert fe['dead'] == [['0x0001003C', '0x00010040']], fe
+        assert report['summary']['functions'] == 5, report        # no function seeded by dead code
+        assert report['summary']['dead_instructions'] == 7, report
         # the parallel lift (the default: --jobs = CPU count) reports the same gaps
         subprocess.run([sys.executable, str(ROOT / 'tools/ppu_lifter.py'), str(tmp / 'code.bin'), '--raw',
                         '--base', '0x10000', '--functions', str(tmp / 'fn.json'), '--jobs', '2',

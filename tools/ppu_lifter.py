@@ -860,14 +860,20 @@ def _last_line_is_terminator(body_lines: list[str]) -> bool:
 # The lowerings after which control never reaches the next instruction. Only
 # these exact shapes end a block for _lifted_reachable; anything else is taken
 # to fall through, so an unrecognised lowering can only keep code, never drop it.
+# A braced block with no nested braces that ends in `return;` (a tail call
+# through the trampoline, an indirect dispatch, a stop) always returns; any
+# goto inside it is still followed as an edge.
 _UNCOND_END_RE = re.compile(
     r"return;(\s*/\*.*\*/)?"                                          # blr
     r"|goto loc_[0-9A-F]{8};"                                         # internal b
-    r"|\{ g_trampoline_fn = \(void\(\*\)\(void\*\)\)\w+; return; \}"  # tail b
+    r"|\{ [^{}]*; return; \}"                                         # tail b, b -> non-code
     r"|switch \(\(uint32_t\)ctx->ctr\) \{.*\} return;"               # jump-table bctr
-    r"|\{ ppu_unlifted_stub\(0x[0-9A-F]+ULL, ctx\); return; \}"       # b -> non-code
+    r"|ps3_indirect_call\(ctx\); return;"                            # bctr
     r"|(ctx->lr = 0x[0-9A-F]+; )?ppu_unlifted_stub\(0x[0-9A-F]+ULL, ctx\);"  # bl -> non-code
     r"|ppu_trap_unknown_instruction\(.*\);")                          # noreturn
+# A branch whose condition the lifter folded to the constant 1 (BO "always")
+# is unconditional: `if (1) <terminator>` ends the block too.
+_ALWAYS_RE = re.compile(r"if \(1\) (.*)")
 _GOTO_RE = re.compile(r"goto loc_([0-9A-F]{8})\b")
 
 
@@ -892,7 +898,8 @@ def _lifted_reachable(lowered: list[tuple[int, str]]) -> list[bool]:
                 t = index.get(int(m.group(1), 16))
                 if t is not None and not live[t]:
                     work.append(t)
-            if _UNCOND_END_RE.fullmatch(code):
+            always = _ALWAYS_RE.fullmatch(code)
+            if _UNCOND_END_RE.fullmatch(always.group(1) if always else code):
                 break
             k += 1
     return live
