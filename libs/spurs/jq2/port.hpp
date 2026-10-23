@@ -327,7 +327,12 @@ private:
 template <PortLine L>
 class BasicPort {
 public:
-    explicit BasicPort(L line = {}) : line_(std::move(line)) {}
+    /* Two constructors, not one with a defaulted argument: a defaulted `L{}`
+     * is instantiated by std::is_constructible<BasicPort> (std::optional<Port>
+     * asks), and GuestPortLine has no public default constructor; libstdc++
+     * rejects that hard where libc++ does not. */
+    BasicPort() requires std::default_initializable<L> : line_{} {}
+    explicit BasicPort(L line) : line_(std::move(line)) {}
 
     [[nodiscard]] L& line() noexcept { return line_; }
 
