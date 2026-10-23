@@ -3612,13 +3612,25 @@ static uint32_t ppu_cb_entry_sp(const ppu_context* active, bool* on_host_slot)
  * dead host thread still holds is not inherited by a later one.
  *
  * The range sits above every real guest thread id. Those are the thread-table
- * index + 1 (1..PPU_THREAD_MAX, sys_ppu_thread.h) and stay far below 0x7F000000;
- * the top of the range stops short of 0x7FFFFFFE, which sys_ppu_thread_get_id
- * reports for a context with no id at all, and of the 0xFFFFFFFx words the
- * lwmutex owner field reserves. The range holds ~16.7 million threads; running
- * out is a stop, never a wrap onto an id still in use. */
+ * index + 1 (1..PPU_THREAD_MAX, sys_ppu_thread.h) and stay far below 0x7F000000.
+ * It ends at cellFiber's FIBER_FALLBACK_THREAD_ID (0x7FFF0000,
+ * libs/spurs/cellFiber.c): the counter never hands out that id or anything
+ * above it, so a host-callback thread and a parentless fiber cannot alias as
+ * lwmutex owners. The top also stops short of 0x7FFFFFFE, which
+ * sys_ppu_thread_get_id reports for a context with no id at all, and of the
+ * 0xFFFFFFFx words the lwmutex owner field reserves. The range holds 16,711,680
+ * threads; running out is a stop, never a wrap onto an id still in use. */
 #define PPU_HOST_TID_BASE   0x7F000000u
-#define PPU_HOST_TID_END    0x7FFFFFF0u
+#define PPU_HOST_TID_END    0x7FFF0000u
+/* No shared header carries the two constants, so each side pins its copy: this
+ * assert proves [BASE, END) excludes the fiber id, and cellFiber.c asserts its
+ * FIBER_FALLBACK_THREAD_ID is the same 0x7FFF0000. */
+static_assert(PPU_HOST_TID_BASE < PPU_HOST_TID_END,
+              "the host-callback id range is empty");
+static_assert(PPU_HOST_TID_END == 0x7FFF0000u,
+              "PPU_HOST_TID_END must stay equal to cellFiber.c's "
+              "FIBER_FALLBACK_THREAD_ID (0x7FFF0000) or a host-callback thread "
+              "can share an lwmutex owner id with a parentless fiber");
 static uint64_t ppu_host_thread_id(void)
 {
     static std::atomic<uint32_t> s_next{PPU_HOST_TID_BASE};

@@ -34,7 +34,6 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx);
 uint8_t* vm_base = nullptr;
 uint32_t ppu_vm_size = 0;
 uint32_t g_ww_lo = 0, g_ww_hi = 0;
-int g_resv_store_active = 0;
 void* g_ps3_guest_caller = nullptr;
 uint32_t g_ydkj_real_spurs_ea = 0, g_ydkj_real_taskset_ea = 0;
 

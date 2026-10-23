@@ -553,6 +553,14 @@ if(PS3RECOMP_BUILD_TESTS)
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_hle_abi.py")
         set_tests_properties(hle_abi PROPERTIES LABELS "ppu;t0" TIMEOUT 300)
+        # The registration table is fail-closed: every scanned definition is a
+        # firmware export by evidence or a host-side helper by rule (never a
+        # NID registered by guess), and the helper names the review caught must
+        # stay out of the table.
+        add_test(NAME gen_hle_nids
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_gen_hle_nids.py")
+        set_tests_properties(gen_hle_nids PROPERTIES LABELS "tools;t0" TIMEOUT 300)
     endif()
 endif()
 

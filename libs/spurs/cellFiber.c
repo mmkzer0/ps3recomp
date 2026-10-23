@@ -53,8 +53,15 @@ extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
 #define FIBER_MIN_STACK    0x400u
 /* Guest stack bytes kept free above the initial r1 (the ABI's back chain and register save area). */
 #define FIBER_STACK_TOP_PAD 0x100u
-/* r3 for the fiber's thread id when it is created outside a PPU thread. */
+/* r3 for the fiber's thread id when it is created outside a PPU thread. It must
+ * stay outside the host-callback id range in runtime/ppu/ppu_loader.cpp,
+ * [PPU_HOST_TID_BASE, PPU_HOST_TID_END) = [0x7F000000, 0x7FFF0000): that file
+ * asserts its exclusive end equals this value, and this assert pins it. */
 #define FIBER_FALLBACK_THREAD_ID 0x7FFF0000ull
+_Static_assert(FIBER_FALLBACK_THREAD_ID == 0x7FFF0000ull,
+               "FIBER_FALLBACK_THREAD_ID must stay equal to ppu_loader.cpp's "
+               "PPU_HOST_TID_END; any other value can fall inside the "
+               "host-callback id range and alias an lwmutex owner");
 
 /* ---------------------------------------------------------------------------
  * State

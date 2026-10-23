@@ -29,12 +29,25 @@ here, with a comment saying why:
                          registered at all (its computed NID would only ever
                          shadow a real import).
 
+Registration is fail-closed: every scanned name is classified with evidence as
+a firmware export or a host-side helper (classify_name), and a name that fits
+neither stops the generator (exit 2, naming the function) instead of being
+registered by guess. The export evidence is the curated NID sources
+(tools/nid_database.py's builtin table, tools/nid_from_protos.json) plus the
+SDK's export naming shapes; the helper evidence is a naming shape the SDK does
+not use for exports, or the explicit list above. docs/HLE_ABI.md's census
+section restates the counts.
+
 Usage:
     python gen_hle_nids.py --out gen/ppu_hle_nids.cpp cellGcmSys [cellSysutil ...]
     (lib names resolve to libs/**/<name>.c)
+    python gen_hle_nids.py --all --out /tmp/x.cpp
+    (--root <dir> scans <dir>/libs instead of this checkout; the generator's
+     own test points it at a synthetic tree)
 """
 import argparse
 import glob
+import json
 import os
 import sys
 import re
@@ -104,17 +117,15 @@ VARIADIC_EXPORTS = {
     "_sys_snprintf": "guest snprintf: fixed buffer + size + fmt, same va_list",
 }
 
-# Host-side helpers the name-prefix scan cannot tell from a firmware export.
-# None is a PS3 export (the SDK names are CamelCase, the Odin import table has
-# none of them), so registering their computed NID could only shadow a real
-# import. They stay ordinary C functions for their host callers.
+# Host-side helpers the shape rule cannot tell from a firmware export: their
+# names are CamelCase after the module prefix, exactly like an SDK export, so
+# only a reader can say they are not one. Each entry carries its reason, and an
+# entry that is also in the known NID sources is a contradiction the generator
+# refuses (classify_name) rather than resolving by guess. They stay ordinary C
+# functions for their host callers; registering their computed NID could only
+# shadow a real import. Helpers whose names carry a helper shape are caught by
+# HELPER_SHAPES and need no entry here.
 NOT_FIRMWARE_EXPORTS = {
-    "cellGame_get_title": "host-side accessor for the title string (boot caption)",
-    "cellGame_get_title_id": "host-side accessor for the title id",
-    "cellGame_get_hdd_title_id": "host-side accessor for the HDD title id",
-    "cellGcm_fifo_kick_event": "host-side Win32 event handle used by the present thread",
-    "sys_rsx_init": "internal init helper called by lv2_register.c, takes a host lv2_syscall_table*",
-
     # cellGcmSys's host-side EA/state helpers. The other backends declare them
     # with a local extern (rsx_d3d12_backend.c, rsx_draw_engine.c), and the
     # real firmware exports for the same jobs are cellGcmGetOffsetTable /
@@ -125,25 +136,98 @@ NOT_FIRMWARE_EXPORTS = {
     "cellGcmResolveIO": "host-side IO-table resolver (rsx_draw_engine extern)",
     "cellGcmResolveLocated": "host-side MAIN/LOCAL resolver (cellGcmSys extern)",
 
-    # The flip-present pipeline's host-thread plumbing (snake_case names, no
-    # SDK entry point of that shape).
-    "cellGcm_display_buffer_count": "host-side display-buffer count",
-    "cellGcm_fifo_kick_wait": "host-side present-thread wait",
-    "cellGcm_fifo_recycle": "host-side retired-command recycling",
-    "cellGcm_flip_request_count": "host-side pending-flip counter",
-    "cellGcm_ref_on_poll": "host-side RSX ref polling",
-    "cellGcm_request_tick": "host-side vblank tick request",
-    "cellGcm_rsx_process_fifo": "host-side FIFO walk",
-    "cellGcm_take_flip_pending": "host-side pending-flip consumer",
-    "cellGcm_take_flip_pending_synced": "host-side pending-flip consumer (synced)",
+    # Sub-operations of a real export (cellUserInfoSelectUser), not exports of
+    # their own; the capitalised suffix dodges the helper shape.
+    "cellUserInfoSelectUser_ListGet": "host-side half of the select-user list API",
+    "cellUserInfoSelectUser_ListSet": "host-side half of the select-user list API",
 
-    # Per-frame hooks the runtime calls directly.
-    "cellMsgDialog_tick": "per-frame host tick called by cellSysutil.c",
-    "cellSysutil_pump_seen": "host-side query for whether the title pumped callbacks",
-
-    # Registration helper, not an API a guest can call.
-    "cellSaveData_register_ctx_handlers": "in-tree registration helper for the cellSaveData ctx handlers",
+    # Internal init helper called from lv2_register.c.
+    "sys_rsx_init": "host-side init helper, takes a host lv2_syscall_table*",
 }
+
+# The naming shapes the SDK does not use for an export, tested BEFORE the
+# export evidence. `cell*` + `_` + a lowercase word is the host code's
+# snake_case (cellfs_translate_path, cellGcm_syscall_bringup, cellPad_poll);
+# `_syscall_` marks a guest-syscall bridge helper. sys_* and _sys_* are
+# deliberately absent: sys_net_bnet_accept, sys_heap_malloc and _sys_malloc are
+# real exports. A hit that is also a known export is a contradiction that stops
+# the generator -- narrow the rule, never drop a real export.
+HELPER_SHAPES = (
+    r"^_?cell[A-Za-z0-9]*_[a-z]",
+    r"_syscall_",
+)
+
+# The SDK's export naming shapes. A scanned name absent from the known NID
+# sources must match one of these to be registered.
+EXPORT_FAMILIES = (
+    r"^_?cell[A-Z0-9]",    # cellGcmInit, _cellSpursSendSignal (underscore alias)
+    r"^_?sce[A-Z0-9]",     # sceNpScoreCreateRequest
+    r"^_?sys_[a-z0-9_]",   # sys_net_bnet_accept, sys_heap_malloc, _sys_malloc
+)
+
+
+class UnclassifiedName(Exception):
+    """A scanned definition that is neither a proven export nor a helper."""
+
+
+def known_export_names():
+    """Every name the known firmware-export sources contain.
+
+    tools/nid_database.py's curated _BUILTIN_FUNCTIONS plus
+    tools/nid_from_protos.json (names recovered from debug-build symbol tables,
+    each validated against a NID those builds actually import by
+    tools/nid_harvest.py). Deliberately not NIDDatabase.load_builtins(): that
+    also ingests every name this repo defines (load_implemented), which would
+    call every host helper "known".
+    """
+    from nid_database import _BUILTIN_FUNCTIONS
+
+    names = {name for _module, name in _BUILTIN_FUNCTIONS}
+    proto = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "nid_from_protos.json")
+    try:
+        with open(proto, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        raise SystemExit(f"error: cannot read the harvested NID table {proto}: {e}\n"
+                         "  the export/helper classification needs it; restore it "
+                         "rather than registering unclassified names")
+    for module in data.values():
+        names.update(module)
+    return names
+
+
+def classify_name(name, known_exports):
+    """Classify one scanned definition as "export" or "helper".
+
+    Evidence in order: the explicit host-helper list; the host-helper naming
+    shapes; the known NID sources; the SDK export shapes. Anything else raises
+    UnclassifiedName, and main() refuses to write the table: the alternative is
+    to register a NID whose export status nobody established.
+    """
+    if name in NOT_FIRMWARE_EXPORTS:
+        if name in known_exports:
+            raise UnclassifiedName(
+                f"{name}: listed in NOT_FIRMWARE_EXPORTS as a host helper but present "
+                f"in the known firmware-export sources; one of the two is wrong")
+        return "helper"
+    for pattern in HELPER_SHAPES:
+        if re.search(pattern, name):
+            if name in known_exports:
+                raise UnclassifiedName(
+                    f"{name}: matches host-helper shape {pattern!r} but is present in "
+                    f"the known firmware-export sources; narrow HELPER_SHAPES instead "
+                    f"of dropping a real export")
+            return "helper"
+    if name in known_exports:
+        return "export"
+    for pattern in EXPORT_FAMILIES:
+        if re.match(pattern, name):
+            return "export"
+    raise UnclassifiedName(
+        f"{name}: not in the known firmware-export sources, matches neither an SDK "
+        f"export shape ({' | '.join(EXPORT_FAMILIES)}) nor a host-helper shape "
+        f"({' | '.join(HELPER_SHAPES)})")
 
 
 def scan(c_path):
@@ -155,7 +239,7 @@ def scan(c_path):
     return out
 
 
-def discover_all():
+def discover_all(root=ROOT):
     """Every PRX-style HLE module compiled into the runtime lib.
 
     The registration table must cover EVERY library the runtime implements:
@@ -170,25 +254,25 @@ def discover_all():
             "spurs", "sync", "codec", "font", "misc", "hardware"]
     names = set()
     for d in dirs:
-        for p in glob.glob(os.path.join(ROOT, "libs", d, "*.c")):
+        for p in glob.glob(os.path.join(root, "libs", d, "*.c")):
             n = os.path.splitext(os.path.basename(p))[0]
             if re.match(r"^(cell|sce|sys)", n) and not re.match(r"^(test_|validate_)", n):
                 names.add(n)
     return sorted(names)
 
 
-def module_source(lib):
-    cs = glob.glob(os.path.join(ROOT, "libs", "**", lib + ".c"), recursive=True)
+def module_source(lib, root=ROOT):
+    cs = glob.glob(os.path.join(root, "libs", "**", lib + ".c"), recursive=True)
     return cs[0] if cs else None
 
 
-def module_header(lib, c_path):
+def module_header(lib, c_path, root=ROOT):
     """Repository-relative header that declares the module's handlers."""
-    rel = os.path.relpath(c_path, ROOT)
+    rel = os.path.relpath(c_path, root)
     if lib in HEADER_OVERRIDES:
         return HEADER_OVERRIDES[lib]
     sibling = os.path.splitext(rel)[0] + ".h"
-    if os.path.exists(os.path.join(ROOT, sibling)):
+    if os.path.exists(os.path.join(root, sibling)):
         return sibling
     return None
 
@@ -212,34 +296,44 @@ def main():
                     help="Register EVERY PRX module compiled into the runtime "
                          "(the canonical invocation -- can't silently drop a "
                          "library the way a hand-typed list can).")
+    ap.add_argument("--root", default=ROOT,
+                    help="Tree whose libs/ directory is scanned (default: this "
+                         "checkout; the generator's test uses a synthetic tree).")
     ap.add_argument("--out", default="ppu_hle_nids.cpp")
     args = ap.parse_args()
 
     if args.all:
-        args.libs = discover_all() + list(args.libs)
+        args.libs = discover_all(args.root) + list(args.libs)
     if not args.libs:
         ap.error("no modules given; pass module names or --all")
 
+    known = known_export_names()
     regs, seen, nlibs, missing = [], set(), 0, []
-    headers, excluded = set(), []
+    headers, excluded, unclassified, scanned = set(), [], [], set()
     for lib in args.libs:
-        c_path = module_source(lib)
+        c_path = module_source(lib, args.root)
         if not c_path:
             missing.append(lib)
             continue
         nlibs += 1
-        header = module_header(lib, c_path)
+        header = module_header(lib, c_path, args.root)
         if header:
             headers.add(header)
         else:
             # The generated unit must see the declared types. A module with no
             # header (or a header that does not declare its handlers) is a
             # build failure at the handler's name; say it before the compiler.
-            print(f"warning: no header found for {os.path.relpath(c_path, ROOT)}; "
+            print(f"warning: no header found for {os.path.relpath(c_path, args.root)}; "
                   f"the generated table cannot compile until one declares its "
                   f"handlers", file=sys.stderr)
         for nid, name in scan(c_path):
-            if name in NOT_FIRMWARE_EXPORTS:
+            scanned.add(name)
+            try:
+                kind = classify_name(name, known)
+            except UnclassifiedName as e:
+                unclassified.append(str(e))
+                continue
+            if kind == "helper":
                 excluded.append(name)
                 continue
             if nid in seen:
@@ -260,7 +354,7 @@ def main():
     # registered. Fail loudly instead, and suggest the file that probably meant.
     if missing:
         have = sorted(os.path.splitext(os.path.basename(p))[0]
-                      for p in glob.glob(os.path.join(ROOT, "libs", "**", "*.c"),
+                      for p in glob.glob(os.path.join(args.root, "libs", "**", "*.c"),
                                          recursive=True))
         print("error: these module names match no libs/**/<name>.c, so every NID "
               "they export would go unregistered:", file=sys.stderr)
@@ -271,6 +365,20 @@ def main():
                    "  no similar file -- implement it or drop it from the list"
             print(f"  {lib}.c NOT FOUND\n{hint}", file=sys.stderr)
         sys.exit(1)
+
+    # Fail-closed: a name whose export status nobody established must not be
+    # registered by guess. Registering it would give its computed NID to a
+    # title import by accident (the exact bug this classification exists to
+    # prevent), so say which names and write nothing.
+    if unclassified:
+        print("error: cannot classify these scanned definitions as firmware "
+              "exports or host-side helpers; refusing to register them:",
+              file=sys.stderr)
+        for msg in sorted(set(unclassified)):
+            print(f"  {msg}", file=sys.stderr)
+        print("  Name it like an SDK export (CamelCase after the module), or add "
+              "it to NOT_FIRMWARE_EXPORTS with a reason.", file=sys.stderr)
+        sys.exit(2)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w") as f:
@@ -292,7 +400,9 @@ def main():
         if any(name == 'cellSaveDataListAutoLoad' for _, name in regs):
             f.write('    ps3_hle_register_ctx(0x21425307u, "cellSaveDataListAutoLoad", ps3_savedata_list_auto_load);\n')
         f.write("}\n")
-    print(f"wrote {args.out}: {len(regs)} NID handlers from {nlibs} module(s)")
+    print(f"wrote {args.out}: {len(regs)} NID handlers from {nlibs} module(s); "
+          f"scanned {len(scanned)} definition name(s), excluded "
+          f"{len(set(excluded))} host-side helper(s)")
     if excluded:
         print("not registered (host-side helper, not a firmware export): "
               + ", ".join(sorted(set(excluded))), file=sys.stderr)

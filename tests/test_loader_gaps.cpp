@@ -396,7 +396,7 @@ static int host_id_scenario()
 
     const uint64_t a = g_who[0], b = g_who[1];
     CHECK(a != b);
-    for (uint64_t id : {a, b}) CHECK(id >= 0x7F000000ull && id < 0x7FFFFFF0ull);
+    for (uint64_t id : {a, b}) CHECK(id >= 0x7F000000ull && id < 0x7FFF0000ull);
     CHECK(g_who[2] == a && g_who[3] == b);      /* stable for the life of the thread */
     /* a thread that starts after both ended does not inherit either id (no reuse: it
      * could otherwise inherit a lock a dead thread still holds) */
