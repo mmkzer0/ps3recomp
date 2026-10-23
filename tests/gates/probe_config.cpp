@@ -34,6 +34,12 @@ static void print_options()
         // Each value goes through the generated accessor, the way a call site reads it.
         if (!std::strcmp(o->section, "ppu") && !std::strcmp(o->key, "vscr_nj"))
             std::printf("%s", ps3_cfg_ppu_vscr_nj() ? "true" : "false");
+        else if (!std::strcmp(o->section, "ppu") && !std::strcmp(o->key, "opd_swap_fixup"))
+            std::printf("%s", ps3_cfg_ppu_opd_swap_fixup() ? "true" : "false");
+        else if (!std::strcmp(o->section, "spu") && !std::strcmp(o->key, "dma_repeat_limit"))
+            std::printf("%u", ps3_cfg_spu_dma_repeat_limit());
+        else if (!std::strcmp(o->section, "spu") && !std::strcmp(o->key, "dma_repeat_stop_secs"))
+            std::printf("%u", ps3_cfg_spu_dma_repeat_stop_secs());
         else if (!std::strcmp(o->section, "title") && !std::strcmp(o->key, "elf_sha256"))
             std::printf("\"%s\"", ps3_cfg_title_elf_sha256());
         else if (!std::strcmp(o->section, "diag") && !std::strcmp(o->key, "dump_config"))

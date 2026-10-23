@@ -76,6 +76,9 @@ struct Option {
     int             validator;
     const char*     doc;
     size_t          offset;      /* of the member in ps3_config */
+    uint32_t        default_u32;
+    uint32_t        min_u32;
+    uint32_t        max_u32;
     std::string     env;         /* PS3RECOMP_<SECTION>_<KEY> */
     std::string     default_text;
 };
@@ -94,17 +97,23 @@ const std::vector<Option>& options()
         std::vector<Option> t;
 #define PS3_CFG_BOOL(sec, k, def, doc_)                                                      \
         t.push_back({#sec, #k, PS3_CFG_TYPE_BOOL, (def) != 0, "", 0, PS3_CFG_V_NONE, doc_,   \
-                     offsetof(ps3_config, sec##_##k), {}, {}});
+                     offsetof(ps3_config, sec##_##k), 0u, 0u, 0u, {}, {}});
+#define PS3_CFG_U32(sec, k, def, lo, hi, doc_)                                               \
+        t.push_back({#sec, #k, PS3_CFG_TYPE_U32, false, "", 0, PS3_CFG_V_NONE, doc_,         \
+                     offsetof(ps3_config, sec##_##k), (uint32_t)(def), (uint32_t)(lo),       \
+                     (uint32_t)(hi), {}, {}});
 #define PS3_CFG_STR(sec, k, def, max_length, validator, doc_)                                \
         t.push_back({#sec, #k, PS3_CFG_TYPE_STR, false, def, max_length, validator, doc_,    \
-                     offsetof(ps3_config, sec##_##k), {}, {}});
+                     offsetof(ps3_config, sec##_##k), 0u, 0u, 0u, {}, {}});
 #include "ps3emu/config_options.def"
 #undef PS3_CFG_BOOL
+#undef PS3_CFG_U32
 #undef PS3_CFG_STR
         for (Option& o : t) {
             o.env = std::string(kEnvPrefix) + upper(o.section) + "_" + upper(o.key);
-            o.default_text = o.type == PS3_CFG_TYPE_BOOL ? (o.default_bool ? "true" : "false")
-                                                         : o.default_str;
+            if (o.type == PS3_CFG_TYPE_BOOL) o.default_text = o.default_bool ? "true" : "false";
+            else if (o.type == PS3_CFG_TYPE_U32) o.default_text = std::to_string(o.default_u32);
+            else o.default_text = o.default_str;
         }
         return t;
     }();
@@ -245,6 +254,12 @@ void store_bool(State& st, const Option& o, bool v, const std::string& source)
     st.source[option_index(&o)] = source;
 }
 
+void store_u32(State& st, const Option& o, uint32_t v, const std::string& source)
+{
+    *reinterpret_cast<uint32_t*>(reinterpret_cast<char*>(&st.cfg) + o.offset) = v;
+    st.source[option_index(&o)] = source;
+}
+
 void store_string(State& st, const Option& o, const std::string& v, const std::string& source)
 {
     char* dst = reinterpret_cast<char*>(&st.cfg) + o.offset;
@@ -257,8 +272,14 @@ void set_defaults(State& st)
     std::memset(&st.cfg, 0, sizeof st.cfg);
     st.source.assign(options().size(), "default");
     for (const Option& o : options()) {
-        if (o.type == PS3_CFG_TYPE_BOOL) *reinterpret_cast<bool*>(reinterpret_cast<char*>(&st.cfg) + o.offset) = o.default_bool;
-        else std::memcpy(reinterpret_cast<char*>(&st.cfg) + o.offset, o.default_str, std::strlen(o.default_str) + 1);
+        char* base = reinterpret_cast<char*>(&st.cfg) + o.offset;
+        switch (o.type) {
+        case PS3_CFG_TYPE_BOOL: *reinterpret_cast<bool*>(base) = o.default_bool; break;
+        case PS3_CFG_TYPE_U32:  *reinterpret_cast<uint32_t*>(base) = o.default_u32; break;
+        case PS3_CFG_TYPE_STR:
+            std::memcpy(base, o.default_str, std::strlen(o.default_str) + 1);
+            break;
+        }
     }
 }
 
@@ -322,6 +343,18 @@ void read_option_section(State& st, const std::string& file, const std::string& 
             if (!b)
                 invalid(at(file, v), path, std::string("expected boolean, found ") + type_name(v.type()));
             store_bool(st, *o, b->get(), source);
+        } else if (o->type == PS3_CFG_TYPE_U32) {
+            const toml::value<int64_t>* i = v.as_integer();
+            if (!i)
+                invalid(at(file, v), path, std::string("expected integer, found ") + type_name(v.type()));
+            const int64_t n = i->get();
+            /* A negative value is below every minimum (all are >= 0), so one
+             * range check reports both "too small" and "negative". */
+            if (n < (int64_t)o->min_u32 || n > (int64_t)o->max_u32)
+                invalid(at(file, v), path,
+                        "out of range: " + std::to_string(n) + " is not within " +
+                        std::to_string(o->min_u32) + ".." + std::to_string(o->max_u32));
+            store_u32(st, *o, uint32_t(n), source);
         } else {
             const toml::value<std::string>* s = v.as_string();
             if (!s)
@@ -471,6 +504,29 @@ bool parse_env_bool(const std::string& v, bool& out)
     return false;
 }
 
+/* A u32 environment value: decimal, or 0x/0X followed by hex digits. No sign,
+ * no whitespace, no trailing text: an operator who writes "-1" or "300ms" made
+ * a mistake the stop should name rather than wrap into a large number. */
+bool parse_env_u32(const std::string& v, uint64_t& out)
+{
+    if (v.empty()) return false;
+    size_t i = 0, base = 10;
+    if (v.size() > 2 && v[0] == '0' && (v[1] == 'x' || v[1] == 'X')) { base = 16; i = 2; }
+    uint64_t n = 0;
+    for (; i < v.size(); ++i) {
+        const char c = v[i];
+        unsigned d;
+        if (c >= '0' && c <= '9') d = unsigned(c - '0');
+        else if (base == 16 && c >= 'a' && c <= 'f') d = unsigned(c - 'a' + 10);
+        else if (base == 16 && c >= 'A' && c <= 'F') d = unsigned(c - 'A' + 10);
+        else return false;
+        if (n > (UINT64_MAX - d) / base) return false;
+        n = n * base + d;
+    }
+    out = n;
+    return true;
+}
+
 void read_environment(State& st)
 {
     std::vector<std::pair<std::string, std::string>> vars;   /* PS3RECOMP_* only */
@@ -502,6 +558,15 @@ void read_environment(State& st)
             if (!parse_env_bool(value, b))
                 invalid(w, key, "expected 1, 0, true or false, found '" + value + "'");
             store_bool(st, *opt, b, source);
+        } else if (opt->type == PS3_CFG_TYPE_U32) {
+            uint64_t n = 0;
+            if (!parse_env_u32(value, n))
+                invalid(w, key, "expected an unsigned decimal or 0x hexadecimal integer, found '" +
+                                value + "'");
+            if (n < opt->min_u32 || n > opt->max_u32)
+                invalid(w, key, "out of range: " + std::to_string(n) + " is not within " +
+                                std::to_string(opt->min_u32) + ".." + std::to_string(opt->max_u32));
+            store_u32(st, *opt, uint32_t(n), source);
         } else {
             std::string s = value;
             std::string why = check_string(*opt, s);
@@ -559,6 +624,7 @@ std::string dump_string(const State& st)
         out += std::string(o.key) + " = ";
         const char* base = reinterpret_cast<const char*>(&st.cfg) + o.offset;
         if (o.type == PS3_CFG_TYPE_BOOL) out += *reinterpret_cast<const bool*>(base) ? "true" : "false";
+        else if (o.type == PS3_CFG_TYPE_U32) out += std::to_string(*reinterpret_cast<const uint32_t*>(base));
         else toml_string(out, base);
         out += "  # source: " + st.source[i] + "\n";
     }
@@ -624,7 +690,18 @@ const State& loaded()
 
 } // namespace
 
+/* runtime/spu/spu_dma.h is a C header inlined into header-only fixtures, so it
+ * cannot call the accessors itself without making every fixture link this
+ * file. It reads its two knobs through these pointers instead (see the hook
+ * block in that header); a title links both because the PPU scaffold reads the
+ * configuration. Constant-initialised, so no init-order question. */
+static uint32_t dma_repeat_limit_option(void) { return ps3_cfg_spu_dma_repeat_limit(); }
+static uint32_t dma_repeat_stop_secs_option(void) { return ps3_cfg_spu_dma_repeat_stop_secs(); }
+
 extern "C" {
+
+uint32_t (*g_spu_dma_repeat_limit)(void) = dma_repeat_limit_option;
+uint32_t (*g_spu_dma_repeat_stop_secs)(void) = dma_repeat_stop_secs_option;
 
 const ps3_config* ps3_config_get(void)
 {

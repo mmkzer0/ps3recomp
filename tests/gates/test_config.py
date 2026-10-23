@@ -76,6 +76,9 @@ def test_defaults_without_file_or_environment():
     o = options(probe("get"))
     assert o == {
         "ppu.vscr_nj": ("true", "default"),
+        "ppu.opd_swap_fixup": ("false", "default"),
+        "spu.dma_repeat_limit": ("256", "default"),
+        "spu.dma_repeat_stop_secs": ("0", "default"),
         "title.elf_sha256": ('""', "default"),
         "diag.dump_config": ("false", "default"),
     }, o
@@ -136,6 +139,9 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
         src = dump_sources(p.stdout)
         assert src == {
             "ppu.vscr_nj": f"file:{c.path}",
+            "ppu.opd_swap_fixup": "default",
+            "spu.dma_repeat_limit": "default",
+            "spu.dma_repeat_stop_secs": "default",
             "title.elf_sha256": "env:PS3RECOMP_TITLE_ELF_SHA256",
             "diag.dump_config": "env:PS3RECOMP_DIAG_DUMP_CONFIG",
         }, src
@@ -145,7 +151,9 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
             tomllib = None
         if tomllib:
             doc = tomllib.loads(p.stdout)
-            assert doc == {"schema": 1, "ppu": {"vscr_nj": False},
+            assert doc == {"schema": 1,
+                           "ppu": {"vscr_nj": False, "opd_swap_fixup": False},
+                           "spu": {"dma_repeat_limit": 256, "dma_repeat_stop_secs": 0},
                            "title": {"elf_sha256": SHA_A}, "diag": {"dump_config": False}}, doc
 
 
@@ -263,6 +271,56 @@ def test_first_bad_variable_reported_is_deterministic():
     assert f["env"] == "PS3RECOMP_AAA", f
 
 
+# ---- u32 options -------------------------------------------------------------
+
+def test_u32_options_accept_in_range_file_and_environment():
+    with Cfg("schema = 1", "[spu]", "dma_repeat_limit = 1000", "dma_repeat_stop_secs = 86400") as c:
+        o = options(probe("--load", c.path, "get"))
+        assert o["spu.dma_repeat_limit"] == ("1000", f"file:{c.path}"), o
+        assert o["spu.dma_repeat_stop_secs"] == ("86400", f"file:{c.path}"), o
+    for text, want in (("300", "300"), ("0x100", "256"), ("0X10", "16")):
+        o = options(probe("get", PS3RECOMP_SPU_DMA_REPEAT_LIMIT=text))
+        assert o["spu.dma_repeat_limit"] == (want, "env:PS3RECOMP_SPU_DMA_REPEAT_LIMIT"), (text, o)
+    o = options(probe("get", PS3RECOMP_SPU_DMA_REPEAT_STOP_SECS="0"))
+    assert o["spu.dma_repeat_stop_secs"] == ("0", "env:PS3RECOMP_SPU_DMA_REPEAT_STOP_SECS"), o
+
+
+def test_u32_out_of_range_file_values_stop():
+    for key, bad in (("dma_repeat_limit", "0"), ("dma_repeat_limit", "4294967296"),
+                     ("dma_repeat_limit", "-1"), ("dma_repeat_stop_secs", "86401"),
+                     ("dma_repeat_stop_secs", "-1")):
+        with Cfg("schema = 1", "[spu]", f"{key} = {bad}") as c:
+            f = config_invalid(probe("--load", c.path, "get"))
+            assert f["key"] == f"spu.{key}" and f["line"] == "3", (key, bad, f)
+            assert "out of range" in f["detail"], (key, bad, f)
+
+
+def test_u32_wrong_type_file_values_stop():
+    for bad, found in (('"256"', "string"), ("2.5", "float"), ("true", "boolean")):
+        with Cfg("schema = 1", "[spu]", f"dma_repeat_limit = {bad}") as c:
+            f = config_invalid(probe("--load", c.path, "get"))
+            assert f["key"] == "spu.dma_repeat_limit" and f["line"] == "3", (bad, f)
+            assert f"expected integer, found {found}" in f["detail"], (bad, f)
+
+
+def test_u32_bad_environment_values_stop():
+    for bad in ("", "-1", "1.5", "abc", "0x", "4294967296"):
+        f = config_invalid(probe("get", PS3RECOMP_SPU_DMA_REPEAT_LIMIT=bad))
+        assert f["env"] == "PS3RECOMP_SPU_DMA_REPEAT_LIMIT", (bad, f)
+        assert f["key"] == "spu.dma_repeat_limit", (bad, f)
+
+
+def test_u32_value_and_source_appear_in_the_dump():
+    p = probe("dump", PS3RECOMP_SPU_DMA_REPEAT_LIMIT="0x200")
+    assert p.returncode == 0, p.stderr
+    assert ("dma_repeat_limit = 512  # source: env:PS3RECOMP_SPU_DMA_REPEAT_LIMIT"
+            in p.stdout), p.stdout
+    with Cfg("schema = 1", "[spu]", "dma_repeat_stop_secs = 30") as c:
+        p = probe("--load", c.path, "dump")
+        assert p.returncode == 0, p.stderr
+        assert f"dma_repeat_stop_secs = 30  # source: file:{c.path}" in p.stdout, p.stdout
+
+
 # ---- structured sections: [[hle.stub]] and [[lv2.stub]] ---------------------
 
 STUBS = ["schema = 1",
@@ -354,6 +412,16 @@ def test_concurrent_first_readers_share_one_configuration():
     for _ in range(20):
         p = probe("race")
         assert p.returncode == 0 and p.stdout.strip() == "distinct=1", p.stdout + p.stderr
+
+
+# ---- ppu.opd_swap_fixup ----------------------------------------------------------
+
+def test_opd_swap_fixup_defaults_off_and_is_read_from_file_and_environment():
+    with Cfg("schema = 1", "[ppu]", "opd_swap_fixup = true") as c:
+        o = options(probe("--load", c.path, "get"))
+        assert o["ppu.opd_swap_fixup"] == ("true", f"file:{c.path}"), o
+    o = options(probe("get", PS3RECOMP_PPU_OPD_SWAP_FIXUP="1"))
+    assert o["ppu.opd_swap_fixup"] == ("true", "env:PS3RECOMP_PPU_OPD_SWAP_FIXUP"), o
 
 
 # ---- ppu.vscr_nj ---------------------------------------------------------------

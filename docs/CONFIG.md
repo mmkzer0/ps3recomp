@@ -21,7 +21,9 @@ built-in default  <  config file (TOML)  <  environment
   for none). `PS3RECOMP_CONFIG=<path>` names the file instead and wins over the
   path the title built in. A named file that cannot be read is a stop.
 - **Environment.** `PS3RECOMP_<SECTION>_<KEY>`, upper case: `ppu.vscr_nj` is
-  `PS3RECOMP_PPU_VSCR_NJ`. Booleans are `1`, `0`, `true` or `false`.
+  `PS3RECOMP_PPU_VSCR_NJ`. Booleans are `1`, `0`, `true` or `false`. Unsigned
+  32-bit integers are decimal or `0x` hexadecimal (`0x200` and `512` are the same
+  value); a sign, whitespace or trailing text is refused rather than wrapped.
 - **Typos are errors.** Any `PS3RECOMP_*` variable that is not an option is a stop
   and names the closest real one. The exceptions are `PS3RECOMP_CONFIG` and the
   diagnostic variables that existing code still reads directly
@@ -48,7 +50,9 @@ the rest of the file is looked at. The version changes when an option is changed
 or removed, never when one is added.
 
 An unknown section or key, a value of the wrong type, a value out of range and a
-TOML syntax error all stop, naming the file, line, column and key:
+TOML syntax error all stop, naming the file, line, column and key. Integer
+(`u32`) options additionally refuse a value outside their documented range,
+including a negative one:
 
 ```
 PS3STOP v=1 kind=config-invalid file=title.toml line=3 col=1 key=ppu.vscr_nk detail="unknown key (did you mean 'vscr_nj'?)"
@@ -59,6 +63,9 @@ PS3STOP v=1 kind=config-invalid file=title.toml line=3 col=1 key=ppu.vscr_nk det
 | Key | Type | Default | Environment | Meaning |
 |---|---|---|---|---|
 | `ppu.vscr_nj` | bool | `true` | `PS3RECOMP_PPU_VSCR_NJ` | Initial VSCR[NJ] of every guest PPU context. Default chosen for RPCS3 parity; a policy, not a hardware fact |
+| `ppu.opd_swap_fixup` | bool | `false` | `PS3RECOMP_PPU_OPD_SWAP_FIXUP` | Redirect an indirect call whose `ctr` is not a lifted function but whose `r2` is (the guest wrote the function descriptor as `{toc, code}` instead of `{code, toc}`). The redirect compensates for a malformed title descriptor (Odin Sphere's flOw-style handler tables), not a PPC ABI guarantee; off, the call stops as `unresolved-indirect-call` and its hint names this option |
+| `spu.dma_repeat_limit` | u32 (1..4294967295) | `256` | `PS3RECOMP_SPU_DMA_REPEAT_LIMIT` | Identical back-to-back MFC transfers after which the SPU DMA engine applies a 1 ms back-off. Timing only: the engine still makes progress and the guest observes nothing |
+| `spu.dma_repeat_stop_secs` | u32 (0..86400) | `0` | `PS3RECOMP_SPU_DMA_REPEAT_STOP_SECS` | If non-zero, an SPU issuing identical MFC transfers for this many seconds stops with kind `spu-dma-repeat` (`image pc ea lsa cmd size count secs tid`). `0` never stops: polling a ring or label another agent writes is legitimate, and the old unconditional halt wedged those chains |
 | `title.elf_sha256` | string | `""` | `PS3RECOMP_TITLE_ELF_SHA256` | Optional pin: 64 hex digits, the SHA-256 of the executable `ppu_load_elf` may load, checked in addition to the hash the lifter recorded. Empty means no pin |
 | `diag.dump_config` | bool | `false` | `PS3RECOMP_DIAG_DUMP_CONFIG` | Print the effective configuration to stderr after loading |
 
@@ -104,6 +111,11 @@ schema = 1
 
 [ppu]
 vscr_nj = false  # source: file:title.toml
+opd_swap_fixup = false  # source: default
+
+[spu]
+dma_repeat_limit = 256  # source: default
+dma_repeat_stop_secs = 30  # source: env:PS3RECOMP_SPU_DMA_REPEAT_STOP_SECS
 
 [title]
 elf_sha256 = ""  # source: default

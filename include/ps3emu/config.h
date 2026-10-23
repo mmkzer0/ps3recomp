@@ -61,10 +61,12 @@ enum {
  * sized by the option's maximum length, so reading one never allocates. */
 typedef struct ps3_config {
 #define PS3_CFG_BOOL(section, key, def, doc) bool section##_##key;
+#define PS3_CFG_U32(section, key, def, min, max, doc) uint32_t section##_##key;
 #define PS3_CFG_STR(section, key, def, max_length, validator, doc) \
     char section##_##key[(max_length) + 1];
 #include "config_options.def"
 #undef PS3_CFG_BOOL
+#undef PS3_CFG_U32
 #undef PS3_CFG_STR
 } ps3_config;
 
@@ -74,10 +76,13 @@ const ps3_config* ps3_config_get(void);
 /* Accessors: ps3_cfg_<section>_<key>(). */
 #define PS3_CFG_BOOL(section, key, def, doc) \
     static inline bool ps3_cfg_##section##_##key(void) { return ps3_config_get()->section##_##key; }
+#define PS3_CFG_U32(section, key, def, min, max, doc) \
+    static inline uint32_t ps3_cfg_##section##_##key(void) { return ps3_config_get()->section##_##key; }
 #define PS3_CFG_STR(section, key, def, max_length, validator, doc) \
     static inline const char* ps3_cfg_##section##_##key(void) { return ps3_config_get()->section##_##key; }
 #include "config_options.def"
 #undef PS3_CFG_BOOL
+#undef PS3_CFG_U32
 #undef PS3_CFG_STR
 
 /* Load the configuration: defaults, then the file, then the environment.
@@ -95,13 +100,15 @@ const char* ps3_config_file(void);
 typedef enum ps3_config_type {
     PS3_CFG_TYPE_BOOL,
     PS3_CFG_TYPE_STR,
+    PS3_CFG_TYPE_U32,               /* unsigned 32-bit integer, range-checked */
 } ps3_config_type;
 
 typedef struct ps3_config_option {
     const char*     section;
     const char*     key;
     ps3_config_type type;
-    const char*     default_text;   /* "true"/"false" for a bool, the string itself otherwise */
+    const char*     default_text;   /* "true"/"false" for a bool, decimal for a u32,
+                                     * the string itself otherwise */
     const char*     env_name;       /* PS3RECOMP_<SECTION>_<KEY> */
     const char*     doc;
 } ps3_config_option;
