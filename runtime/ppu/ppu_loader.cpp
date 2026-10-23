@@ -2473,6 +2473,57 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
     }
 }
 
+/* No lifted function at the target of an indirect call. Whatever the cause,
+ * running on would execute nothing (or the wrong thing) and let the title carry
+ * on from state the console never produced, so this is a named stop at the
+ * FIRST hit, not a log line and a fabricated r3. The causes the old diagnostics
+ * told apart are carried in the stop itself: the descriptor words the guest
+ * dereferenced (r9..r12 are where the ELFv1 idiom keeps it) and the words at the
+ * target, plus a hint for the mistakes common enough to name. */
+[[noreturn]] static void ppu_indirect_call_stop(ppu_context* ctx, uint32_t tgt)
+{
+    extern uint32_t ps3_hle_count(void);
+    char target_s[16], lr_s[16];
+    snprintf(target_s, sizeof target_s, "0x%08X", tgt);
+    snprintf(lr_s, sizeof lr_s, "0x%08X", (uint32_t)ctx->lr);
+    auto words = [](uint32_t a) {
+        char b[64];
+        if (!a || (ppu_vm_size && (uint64_t)a + 16 > ppu_vm_size) || !vm_base) return std::string("unmapped");
+        snprintf(b, sizeof b, "%08X %08X %08X %08X", vm_read32(a), vm_read32(a + 4), vm_read32(a + 8), vm_read32(a + 12));
+        return std::string(b);
+    };
+    std::string desc;
+    for (int r = 9; r <= 12; r++) {
+        char b[24];
+        snprintf(b, sizeof b, "%sr%d=0x%08X:", desc.empty() ? "" : " ", r, (uint32_t)ctx->gpr[r]);
+        desc += b + words((uint32_t)ctx->gpr[r]);
+    }
+    const std::string at_target = words(tgt);
+    const char* hint = "none";
+    if (tgt == 0)
+        hint = "a NULL function pointer: a slot that was never populated, or an OPD that was zeroed "
+               "(r12 is the OPD a lifted import thunk loaded; a C++ virtual call leaves object, vtable "
+               "and OPD in r11/r9/r10)";
+    else if (ps3_hle_count() == 0)
+        hint = "no HLE handlers are registered, so this is almost certainly a firmware import rather than guest code";
+    else if (tgt == 0x39800000u)
+        hint = "0x39800000 is the instruction 'li r12,0', not an address: the call went through a firmware "
+               "import trampoline that was lifted literally; re-lift with --hle-stubs";
+    else if (tgt >= 0x10000000u && tgt < 0x30000000u)
+        hint = "the target is in the data/heap range: an uninitialised or stale vtable slot or function pointer";
+    else if (tgt & 3u)
+        hint = "the target is misaligned, so it is not a code address";
+    ps3_stop_field f[] = {
+        {"target", target_s}, {"caller_lr", lr_s}, {"descriptors", desc.c_str()},
+        {"target_words", at_target.c_str()}, {"hint", hint},
+    };
+    ps3_stop_site site = { ctx->lr, ctx->lr, ctx->thread_id };
+    ps3_stop(PS3_STOP_UNRESOLVED_INDIRECT_CALL, "an indirect call targets an address no lifted function starts at",
+             "Read 'hint' and the descriptor words: a firmware import needs HLE or --hle-stubs, a data-range "
+             "target is a guest bug upstream of this call, and a real code address needs a lift that covers it.",
+             f, 5, &site);
+}
+
 static void ps3_indirect_call_impl(ppu_context* ctx)
 {
     g_active_ctx = ctx;
@@ -2602,66 +2653,22 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
           }
       }
       skip_calltrace: ;
-    /* Null / return-to-OS sentinel: a bctr to address 0 means the guest
-     * unwound to the initial frame (or a not-yet-populated function pointer).
-     * Don't treat it as an unresolved call -- just return to the caller. */
+    /* A call to address 0: a function-pointer slot that was never populated, or
+     * an OPD that was zeroed. The console faults on it. Returning with r3
+     * untouched let the guest read its own first argument back as the result
+     * (Tokyo Jungle: cellAudioSetNotifyEventQueue "failed" with the key it was
+     * passed) and retry forever (Guitar Hero III's boot), so it is a named stop
+     * like any other target no lifted function starts at; the stop carries the
+     * descriptor registers that show which link of the chain read as zero. */
     if (addr == 0) {
-        /* Say so. A bctrl to 0 is nearly always a function-pointer table slot
-         * that was never populated, and returning quietly turns it into an
-         * infinite loop when the caller retries -- which is what it does. This
-         * had no report of any kind, so the failure presented as "a thread is
-         * busy in guest code" with nothing to grep for; Guitar Hero III spends
-         * its whole boot doing it. Same standing as [null-read]: on by default
-         * because a null call is always a bug, capped so it cannot flood, and
-         * PS3_NULL_CALL=0 turns it off.
-         *
-         * lr is the last DIRECT call site, not this one (bctrl does not write
-         * lr), so it names the neighbourhood rather than the instruction --
-         * still the fastest way to the right function. */
-        { static int s_nc = -1;
-          if (s_nc < 0) { const char* e = getenv("PS3_NULL_CALL");
-                          s_nc = (e && *e == '0') ? 0 : 1; }
-          /* Cap PER THREAD. A global cap lets one noisy thread exhaust it and
-           * silently hide every other thread's null calls -- the same trap the
-           * BRANCH-TO-0 log already fixed per image. Guitar Hero III's FMOD
-           * stream thread burned all 8 slots and hid the MAIN thread's, which
-           * is the one that matters. */
-          if (s_nc) { enum { NC_T = 64, NC_PER = 4 };
-              static long s_nt[NC_T];
-              unsigned ti = (unsigned)ctx->thread_id < NC_T
-                            ? (unsigned)ctx->thread_id : 0;
-              long s_n = s_nt[ti];
-              s_nt[ti] = s_n + 1;
-              if (s_n < NC_PER)
-                  /* r12 is NOT reliable here: a vtable bctrl loads ctr from
-                   * the OPD directly and never writes r12, so it prints stale
-                   * garbage. Dump the scratch registers the call sequence
-                   * actually used -- for a C++ virtual call r11/r9/r10 still
-                   * hold object/vtable/OPD, which is enough to see WHICH link
-                   * of the chain read as zero. */
-                  fprintf(stderr, "[null-call] guest called a NULL function pointer"
-                                  " (near lr=0x%08X, tid=%u)"
-                                  " r3=%08X r9=%08X r10=%08X r11=%08X r12=%08X\n",
-                          (uint32_t)ctx->lr, (unsigned)ctx->thread_id,
-                          (uint32_t)ctx->gpr[3],  (uint32_t)ctx->gpr[9],
-                          (uint32_t)ctx->gpr[10], (uint32_t)ctx->gpr[11],
-                          (uint32_t)ctx->gpr[12]);
-              /* ...and who made it, once per thread: lr only names the last
-               * direct call, which is usually the lwmutex around the real one. */
-              if (s_n == 0) ppu_dump_guest_stack(ctx, "nc");
-              else if (s_n == NC_PER)
-                  fprintf(stderr, "[null-call] tid=%u: further null calls not shown\n",
-                          (unsigned)ctx->thread_id);
-              if (s_n <= NC_PER) fflush(stderr); } }
         /* PPU_OPD_RECOVER=1: ctr==0 while r12 still points at a VALID OPD means
          * the lifted thunk failed to load the code word -- not that the function
-         * pointer is genuinely null. We already read opd[0] for the diagnostic
-         * below, so when it names a plausible code address, dispatch through it
-         * instead of returning. flOw dies exactly here during render init
+         * pointer is genuinely null. When opd[0] names a plausible code address,
+         * dispatch through it instead. flOw dies exactly here during render init
          * (func_0014F88C, opd[0]=0x10100148), and swallowing the call is why its
          * engine never establishes a screen render-target config.
          *
-         * Off by default: a genuinely-null pointer must still return quietly. */
+         * Off by default: a genuinely-null pointer stops. */
         {   static int _rec = -1;
             if (_rec < 0) { const char* e = getenv("PPU_OPD_RECOVER"); _rec = e ? 1 : 0; }
             uint32_t _opd = (uint32_t)ctx->gpr[12];
@@ -2675,27 +2682,7 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
                 }
             }
         }
-        if (addr == 0) {
-        /* Returning silently leaves r3 HOLDING THE FIRST ARGUMENT, so the guest
-         * reads its own input back as the return value and reports a nonsense
-         * error code. Tokyo Jungle: cellAudioSetNotifyEventQueue(key=0x23A0)
-         * "failed" with status 0x23A0 -- the key itself. Say so."*/
-        static int n = 0;
-        if (PS3_LOG_FIRST(n, 400))
-        { char who[64]; ppu_guest_caller(who, sizeof who);
-          if (n <= 400) {
-            /* The lifted import thunk leaves the OPD address it loaded in r12,
-             * so we can tell a zero SLOT from a zeroed OPD -- i.e. whether the
-             * import was never resolved or was resolved and later clobbered. */
-            uint32_t opd = (uint32_t)ctx->gpr[12];
-            uint32_t o0 = (opd && vm_base) ? __builtin_bswap32(*(volatile uint32_t*)(vm_base+opd)) : 0;
-            fprintf(stderr, "[ppu] bctr to NULL from %s r12(opd)=0x%08X opd[0]=0x%08X "
-                    "(r3=0x%08X r4=0x%08X "
-                    "tid=%llu) -- returning with r3 untouched\n", who, opd, o0,
-                    (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4],
-                    (unsigned long long)ctx->thread_id); } }
-        return;
-        }
+        if (addr == 0) ppu_indirect_call_stop(ctx, 0);
     }
 
     /* SPURS trace: log calls into libsre's cellSpurs export range so we can
@@ -2792,52 +2779,7 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
         s_depth--;
         return;
     }
-    /* No lifted function at ctr. Whatever the cause, running on would execute
-     * nothing (or the wrong thing) and let the title carry on from state the
-     * console never produced, so this is a named stop at the FIRST hit, not a
-     * log line and a fabricated r3. The causes the old diagnostics told apart
-     * are carried in the stop itself: the descriptor words the guest
-     * dereferenced (r9..r12 are where the ELFv1 idiom keeps it) and the words at
-     * the target, plus a hint for the mistakes common enough to name. */
-    {
-        extern uint32_t ps3_hle_count(void);
-        const uint32_t tgt = (uint32_t)ctx->ctr;
-        char target_s[16], lr_s[16];
-        snprintf(target_s, sizeof target_s, "0x%08X", tgt);
-        snprintf(lr_s, sizeof lr_s, "0x%08X", (uint32_t)ctx->lr);
-        auto words = [](uint32_t a) {
-            char b[64];
-            if (!a || (ppu_vm_size && (uint64_t)a + 16 > ppu_vm_size) || !vm_base) return std::string("unmapped");
-            snprintf(b, sizeof b, "%08X %08X %08X %08X", vm_read32(a), vm_read32(a + 4), vm_read32(a + 8), vm_read32(a + 12));
-            return std::string(b);
-        };
-        std::string desc;
-        for (int r = 9; r <= 12; r++) {
-            char b[24];
-            snprintf(b, sizeof b, "%sr%d=0x%08X:", desc.empty() ? "" : " ", r, (uint32_t)ctx->gpr[r]);
-            desc += b + words((uint32_t)ctx->gpr[r]);
-        }
-        const std::string at_target = words(tgt);
-        const char* hint = "none";
-        if (ps3_hle_count() == 0)
-            hint = "no HLE handlers are registered, so this is almost certainly a firmware import rather than guest code";
-        else if (tgt == 0x39800000u)
-            hint = "0x39800000 is the instruction 'li r12,0', not an address: the call went through a firmware "
-                   "import trampoline that was lifted literally; re-lift with --hle-stubs";
-        else if (tgt >= 0x10000000u && tgt < 0x30000000u)
-            hint = "the target is in the data/heap range: an uninitialised or stale vtable slot or function pointer";
-        else if (tgt & 3u)
-            hint = "the target is misaligned, so it is not a code address";
-        ps3_stop_field f[] = {
-            {"target", target_s}, {"caller_lr", lr_s}, {"descriptors", desc.c_str()},
-            {"target_words", at_target.c_str()}, {"hint", hint},
-        };
-        ps3_stop_site site = { ctx->lr, ctx->lr, ctx->thread_id };
-        ps3_stop(PS3_STOP_UNRESOLVED_INDIRECT_CALL, "an indirect call targets an address no lifted function starts at",
-                 "Read 'hint' and the descriptor words: a firmware import needs HLE or --hle-stubs, a data-range "
-                 "target is a guest bug upstream of this call, and a real code address needs a lift that covers it.",
-                 f, 5, &site);
-    }
+    ppu_indirect_call_stop(ctx, addr);
 }
 
 /* Called when lifted code branches to a function that wasn't in this lift

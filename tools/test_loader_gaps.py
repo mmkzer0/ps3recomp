@@ -134,6 +134,11 @@ def main():
         assert 'li r12,0' in f['hint'], f
         f = g.expect_stop(run('indirect', '0x20000000'), 'unresolved-indirect-call')
         assert 'data/heap' in f['hint'], f
+        # a NULL function pointer is not a "return to the caller": it stops too
+        p = run('indirect', '0x0')
+        assert 'RETURNED' not in p.stdout, (p.stdout, p.stderr)
+        f = g.expect_stop(p, 'unresolved-indirect-call')
+        assert f['target'] == '0x00000000' and 'NULL function pointer' in f['hint'], f
     print('PASS: unimplemented syscall, unlifted call, unresolved indirect call and unknown instruction all stop')
     return 0
 
