@@ -7,9 +7,19 @@ mistook for code. Schema version 1.
 An instruction the lifter has no lowering for used to become a `/* TODO */` no-op.
 It is now `ppu_trap_unknown_instruction(ctx, pc, word, "mnemonic");`, a call that
 stops the process (kind `unknown-instruction`, `docs/STOPS.md`) if the instruction
-is ever *executed*. Code that is never reached (data decoded as instructions, dead
-paths) costs nothing at run time, and the generated code still compiles, so every
-trap can be counted per function before anything runs.
+is ever *executed*. The generated code still compiles, so every trap can be
+counted per function before anything runs.
+
+Only instructions the lifted C can reach are lowered at all. A lifted function is
+entered at its first instruction and moves only by falling through or by
+`goto loc_X`, so an instruction no such path reaches (a literal pool branched
+over, padding after a return, anything after a trap call, which never returns)
+is dead in the generated program whatever its bytes are. It is left out and
+listed as a `dead` range instead of becoming a trap, and its call and branch
+targets are not registered, so data does not seed functions of its own. Only
+the lowerings that certainly end a block (`return`, `goto`, a tail call, a
+jump-table switch, a trap) stop the walk; every other lowering is taken to fall
+through, so an unrecognised one can only keep code, never drop it.
 
 ```json
 {
@@ -18,13 +28,16 @@ trap can be counted per function before anything runs.
   "input_sha256": "<hex SHA-256 of the lifted file>",
   "summary": {
     "functions": 0,               "functions_with_traps": 0,
-    "trapped_instructions": 0,    "capped_mid_tails": 0,
+    "trapped_instructions": 0,    "functions_with_dead": 0,
+    "dead_instructions": 0,       "capped_mid_tails": 0,
     "unresolved_targets": 0
   },
-  "functions": [                  // only functions that contain a trap
+  "functions": [                  // only functions with a trap or a dead range
     { "name": "func_00010008", "start": "0x00010008", "end": "0x00010014",
-      "traps": [ ["0x0001000C", "0x00000000", ".word 0x00000000"] ] }
+      "traps": [ ["0x0001000C", "0x00000000", ".word 0x00000000"] ],
                                   //  [pc, raw word, decoded "mnemonic operands"]
+      "dead": [ ["0x00010010", "0x00010010"] ] }
+                                  //  [first, last] address of each unreachable run
   ],
   "capped_mid_tails": [           // tails truncated at _MAX_MID_TAIL (0x6000 bytes)
     { "start": "0x...", "wanted_end": "0x...", "capped_end": "0x..." } ],

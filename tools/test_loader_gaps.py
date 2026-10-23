@@ -12,7 +12,12 @@ ppu_loader.cpp against that lift, and runs tests/test_loader_gaps.cpp:
   - an indirect call to no function: unresolved-indirect-call at the first hit;
   - the lifted function that runs up to the unknown instruction: it does not stop
     before it, it stops AT it (unknown-instruction, with the pc and word);
-  - the lift report lists that instruction.
+  - the lift report lists that instruction;
+  - data the lifted code cannot reach (a literal pool branched over, padding
+    after a return) is not lowered: no trap, listed as dead, and the code
+    around it still runs;
+  - a branch out of the lifted code (here: past the image's end) stops
+    (unlifted-function, naming the target) instead of returning.
 
 A line "RETURNED" from the fixture means the runtime carried on; every case that
 must stop treats it as failure.
@@ -32,7 +37,12 @@ import gates_common as g  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 # A: li r3,5 ; blr          B: li r3,7 ; .word 0 (no instruction) ; blr
-CODE = struct.pack('>IIIII', 0x38600005, 0x4E800020, 0x38600007, 0x00000000, 0x4E800020)
+# C: b +0x10 ; .word 0xFFFFFFFF, 0, 0 (a literal pool) ; li r3,3 ; blr ; .word 0 (padding)
+# D: li r3,9 ; b 0x20000 (outside the image)
+CODE = struct.pack('>IIIII', 0x38600005, 0x4E800020, 0x38600007, 0x00000000, 0x4E800020) + \
+    struct.pack('>IIIIIII', 0x48000010, 0xFFFFFFFF, 0x00000000, 0x00000000, 0x38600003, 0x4E800020,
+                0x00000000) + \
+    struct.pack('>II', 0x38600009, 0x48000000 | (0x20000 - 0x10034))
 
 
 def main():
@@ -43,7 +53,9 @@ def main():
         tmp = Path(tmp)
         (tmp / 'code.bin').write_bytes(CODE)
         (tmp / 'fn.json').write_text(json.dumps([{'start': '0x10000', 'end': '0x10008'},
-                                                 {'start': '0x10008', 'end': '0x10014'}]))
+                                                 {'start': '0x10008', 'end': '0x10014'},
+                                                 {'start': '0x10014', 'end': '0x10030'},
+                                                 {'start': '0x10030', 'end': '0x10038'}]))
         lift = tmp / 'lift'
         subprocess.run([sys.executable, str(ROOT / 'tools/ppu_lifter.py'), str(tmp / 'code.bin'), '--raw',
                         '--base', '0x10000', '--functions', str(tmp / 'fn.json'), '--jobs', '1',
@@ -68,6 +80,12 @@ def main():
         fn = report['functions'][0]
         assert fn['name'] == 'func_00010008' and fn['traps'][0][:2] == ['0x0001000C', '0x00000000'], fn
         assert 'word' in fn['traps'][0][2], fn
+        # the pool and the padding in C are dead in the lifted code: listed, not trapped
+        fc = report['functions'][1]
+        assert fc['name'] == 'func_00010014' and fc['traps'] == [], fc
+        assert fc['dead'] == [['0x00010018', '0x00010020'], ['0x0001002C', '0x0001002C']], fc
+        assert fn['dead'] == [['0x00010010', '0x00010010']], fn   # the blr after the trap
+        assert report['summary']['dead_instructions'] == 5, report
         # the parallel lift (the default: --jobs = CPU count) reports the same gaps
         subprocess.run([sys.executable, str(ROOT / 'tools/ppu_lifter.py'), str(tmp / 'code.bin'), '--raw',
                         '--base', '0x10000', '--functions', str(tmp / 'fn.json'), '--jobs', '2',
@@ -79,8 +97,15 @@ def main():
         # a function that is fine runs; the one with the unknown instruction does not stop before it
         p = run('call', '0x10000')
         assert p.returncode == 0 and 'RETURNED r3=0x5' in p.stdout, (p.stdout, p.stderr)
+        p = run('call', '0x10014')
+        assert p.returncode == 0 and 'RETURNED r3=0x3' in p.stdout, (p.stdout, p.stderr)
         f = g.expect_stop(run('call', '0x10008'), 'unknown-instruction')
         assert (f['pc'], f['word']) == ('0x1000C', '0x00000000') and f['tid'] == '1', f
+        # a branch out of the lifted code stops naming the target, it does not return
+        p = run('call', '0x10030')
+        assert 'RETURNED' not in p.stdout, (p.stdout, p.stderr)
+        f = g.expect_stop(p, 'unlifted-function')
+        assert f['target'] == '0x00020000', f
 
         # unimplemented syscall
         p = run('syscall', '999')

@@ -242,14 +242,20 @@ extern "C" {
 #endif
 extern const func_entry function_table[];
 extern const uint64_t  function_table_count;  /* entries, excluding sentinel */
-/* An instruction the lifter had no lowering for, executed. Stops the process
- * (kind unknown-instruction) naming its guest address and word; never returns. */
+/* Lifted code calls these where the guest would run something the lift does
+ * not contain; both stop the process and never return.
+ *   ppu_trap_unknown_instruction: an instruction with no lowering, executed
+ *     (kind unknown-instruction, naming its guest address and word).
+ *   ppu_unlifted_stub: a branch or call to an address outside the lifted code
+ *     (kind unlifted-function, naming the target). */
 #if defined(__GNUC__) || defined(__clang__)
 void ppu_trap_unknown_instruction(ppu_context* ctx, uint64_t pc, uint32_t word,
                                   const char* mnemonic) __attribute__((noreturn));
+void ppu_unlifted_stub(uint64_t addr, ppu_context* ctx) __attribute__((noreturn));
 #else
 __declspec(noreturn) void ppu_trap_unknown_instruction(ppu_context* ctx, uint64_t pc,
                                                        uint32_t word, const char* mnemonic);
+__declspec(noreturn) void ppu_unlifted_stub(uint64_t addr, ppu_context* ctx);
 #endif
 /* The SHA-256 (64 lower-case hex digits) of the file this output was lifted
  * from, recorded by the lifter. ppu_load_elf hashes the executable it is asked
@@ -814,6 +820,9 @@ class LiftedFunction:
     calls: list[int] = field(default_factory=list)  # addresses of bl targets
     fallthrough_to: int = 0  # if it falls off the end, the continuation address
     traps: list = field(default_factory=list)  # [pc, word, text] per instruction with no lowering
+    # [first, last] guest addresses of each run of in-range instructions that no
+    # path from the function's entry reaches (see _lifted_reachable); not lowered.
+    dead: list = field(default_factory=list)
 
 
 # Max span (bytes) for a mid-function tail-entry / gap wrapper. A real interior
@@ -846,6 +855,47 @@ def _last_line_is_terminator(body_lines: list[str]) -> bool:
                 t.startswith("func_") or
                 "{ func_" in t or t.startswith("{ g_trampoline_fn"))
     return False
+
+
+# The lowerings after which control never reaches the next instruction. Only
+# these exact shapes end a block for _lifted_reachable; anything else is taken
+# to fall through, so an unrecognised lowering can only keep code, never drop it.
+_UNCOND_END_RE = re.compile(
+    r"return;(\s*/\*.*\*/)?"                                          # blr
+    r"|goto loc_[0-9A-F]{8};"                                         # internal b
+    r"|\{ g_trampoline_fn = \(void\(\*\)\(void\*\)\)\w+; return; \}"  # tail b
+    r"|switch \(\(uint32_t\)ctx->ctr\) \{.*\} return;"               # jump-table bctr
+    r"|\{ ppu_unlifted_stub\(0x[0-9A-F]+ULL, ctx\); return; \}"       # b -> non-code
+    r"|(ctx->lr = 0x[0-9A-F]+; )?ppu_unlifted_stub\(0x[0-9A-F]+ULL, ctx\);"  # bl -> non-code
+    r"|ppu_trap_unknown_instruction\(.*\);")                          # noreturn
+_GOTO_RE = re.compile(r"goto loc_([0-9A-F]{8})\b")
+
+
+def _lifted_reachable(lowered: list[tuple[int, str]]) -> list[bool]:
+    """Which of a function's lowered instructions the lifted C can execute.
+
+    `lowered` is [(guest address, C statement)] in address order. A lifted
+    function is entered only at its first instruction and moves between its
+    instructions only by falling through or by `goto loc_X`, so an instruction
+    no such path reaches is dead in the generated program whatever the guest
+    bytes are: typically a literal pool or padding after a return. Dropping it
+    changes no behaviour; lowering it only turned data into trap calls."""
+    index = {addr: k for k, (addr, _) in enumerate(lowered)}
+    live = [False] * len(lowered)
+    work = [0] if lowered else []
+    while work:
+        k = work.pop()
+        while k < len(lowered) and not live[k]:
+            live[k] = True
+            code = lowered[k][1].strip()
+            for m in _GOTO_RE.finditer(code):
+                t = index.get(int(m.group(1), 16))
+                if t is not None and not live[t]:
+                    work.append(t)
+            if _UNCOND_END_RE.fullmatch(code):
+                break
+            k += 1
+    return live
 
 
 class PPULifter:
@@ -997,25 +1047,61 @@ class PPULifter:
                     if start <= _c < end:
                         internal_targets.add(_c)
 
-        emitted_labels: set[int] = set()
+        # Lower every instruction, keeping each one's side effects (calls,
+        # call/branch targets, traps) apart, then emit only those the lifted C
+        # can reach from the entry: a literal pool or padding inside the range
+        # would otherwise become trap calls and seed bogus call targets.
+        lowered = []
+        effects = []
         for insn in range_insns:
-            # Label
+            n_calls, n_traps = len(func.calls), len(func.traps)
+            outer = (self.call_targets, self.branch_targets)
+            self.call_targets, self.branch_targets = set(), set()
+            try:
+                c_line = self._translate(insn, func)
+            finally:
+                own = (self.call_targets, self.branch_targets)
+                self.call_targets, self.branch_targets = outer
+            lowered.append((insn.addr, c_line or ""))
+            effects.append((func.calls[n_calls:], func.traps[n_traps:], own))
+            del func.calls[n_calls:], func.traps[n_traps:]
+        live = _lifted_reachable(lowered)
+
+        emitted_labels: set[int] = set()
+        goto_targets: set[int] = set()
+        dead_first = dead_last = None
+        for insn, (_, c_line), (calls, traps, (ct, bt)), is_live in zip(
+                range_insns, lowered, effects, live):
+            if not is_live:
+                if dead_first is None:
+                    dead_first = insn.addr
+                dead_last = insn.addr
+                continue
+            if dead_first is not None:
+                func.dead.append([f"0x{dead_first:08X}", f"0x{dead_last:08X}"])
+                dead_first = None
+            func.calls.extend(calls)
+            func.traps.extend(traps)
+            self.call_targets |= ct
+            self.branch_targets |= bt
             if insn.addr in internal_targets:
                 func.body_lines.append(f"loc_{insn.addr:08X}:")
                 emitted_labels.add(insn.addr)
-
-            c_line = self._translate(insn, func)
             if c_line:
                 func.body_lines.append(f"    {c_line}")
+                goto_targets.update(int(m.group(1), 16) for m in _GOTO_RE.finditer(c_line))
+        if dead_first is not None:
+            func.dead.append([f"0x{dead_first:08X}", f"0x{dead_last:08X}"])
 
-        # An in-range branch target with no decoded instruction at its address
-        # (a branch into a data / undecoded region inside a too-large function
+        # A live branch to an in-range address with no decoded instruction (a
+        # branch into a data / undecoded region inside a too-large function
         # boundary from find_functions) still produced a `goto loc_X;` but no
         # label, which is a C2094 undefined-label compile error. Emit the
         # missing labels at the function tail so the goto lands on the implicit
         # return — these paths are misidentified data and never legitimately
         # execute. Keeps the chunk compilable without a post-process pass.
-        for tgt in sorted(internal_targets - emitted_labels):
+        decoded = {insn.addr for insn in range_insns}
+        for tgt in sorted(goto_targets - emitted_labels - decoded):
             func.body_lines.append(
                 f"    loc_{tgt:08X}: ; /* branch into undecoded region */")
 
@@ -1712,7 +1798,7 @@ class PPULifter:
                 if mn.endswith("u"):
                     line += f" ctx->gpr[{base}] += {disp};"
                 return line
-            return f"/* {mn} unhandled operands: {insn.operands} */;"
+            return self._trap(insn, func)
 
         # ------- Load/Store Multiple (Book I 3.3.5) -------
         # lmw rD,disp(rA): words at EA,EA+4,... into rD..r31 (zero-extended).
@@ -1734,7 +1820,7 @@ class PPULifter:
                         f"vm_write32(_ea + {4*(r-first)}, (uint32_t)ctx->gpr[{r}]);"
                         for r in range(first, 32))
                 return (f"{{ uint64_t _ea = ctx->gpr[{base}] + {disp}; {body} }}")
-            return f"/* {mn} unhandled operands: {insn.operands} */;"
+            return self._trap(insn, func)
 
         # ------- Stores -------
         store_map = {
@@ -1753,7 +1839,7 @@ class PPULifter:
                 if mn.endswith("u"):
                     line += f" ctx->gpr[{base}] += {disp};"
                 return line
-            return f"/* {mn} unhandled operands: {insn.operands} */;"
+            return self._trap(insn, func)
 
         # ------- Indexed Loads -------
         idx_load_map = {
@@ -1935,9 +2021,10 @@ class PPULifter:
                 if func.start_addr <= tgt < func.end_addr:
                     return f"goto loc_{tgt:08X};"
                 elif self._outside_code(tgt):
-                    # Target is outside the executable window -> data misread as
-                    # a branch. Don't seed a bogus func_X; just leave the fragment.
-                    return f"return; /* b -> non-code 0x{tgt:08X} */"
+                    # Target is outside the executable window: data misread as a
+                    # branch, or a real branch into code this lift lacks. Don't
+                    # seed a bogus func_X; stop there naming the target.
+                    return f"{{ ppu_unlifted_stub(0x{tgt:08X}ULL, ctx); return; }}"
                 else:
                     # Use trampoline for cross-fragment branches to avoid
                     # stack-growing recursion when backward branches re-enter
@@ -1960,7 +2047,7 @@ class PPULifter:
             try:
                 tgt = int(target, 16)
                 if self._outside_code(tgt):
-                    return f"/* bl -> non-code 0x{tgt:08X} */;"
+                    return f"ctx->lr = 0x{insn.addr + 4:08X}; ppu_unlifted_stub(0x{tgt:08X}ULL, ctx);"
                 func.calls.append(tgt)
                 self.call_targets.add(tgt)
                 # PPC `bl` sets LR = return address (next instr). Emit it so mflr
@@ -1968,7 +2055,7 @@ class PPULifter:
                 # addresses -> reliable back-chain unwinding for diagnostics.
                 return f"ctx->lr = 0x{insn.addr + 4:08X}; {self.prefix}func_{tgt:08X}(ctx); DRAIN_TRAMPOLINE(ctx);"
             except ValueError:
-                return f"/* bl {target} */;"
+                return self._trap(insn, func)
 
         # Conditional return: b<cond>lr [cr]
         # Examples: beqlr, bnelr, bltlr, blelr, bgtlr, bgelr, bdnzlr, bdzlr
@@ -2027,16 +2114,16 @@ class PPULifter:
                     cond = self._branch_condition(mn, ops, insn.raw)
                     return f"if ({cond}) goto loc_{tgt:08X};"
                 elif self._outside_code(tgt):
-                    # Conditional branch to non-code: data misread as code.
+                    # Conditional branch to non-code: stop there if it is taken.
                     cond = self._branch_condition(mn, ops, insn.raw)
-                    return f"if ({cond}) return; /* bc -> non-code 0x{tgt:08X} */"
+                    return f"if ({cond}) {{ ppu_unlifted_stub(0x{tgt:08X}ULL, ctx); return; }}"
                 else:
                     cond = self._branch_condition(mn, ops, insn.raw)
                     # Use trampoline for cross-fragment conditional branches
                     self.branch_targets.add(tgt)
                     return f"if ({cond}) {{ g_trampoline_fn = (void(*)(void*)){self.prefix}func_{tgt:08X}; return; }}"
             except ValueError:
-                return f"/* {mn} {insn.operands} */;"
+                return self._trap(insn, func)
 
         if mn == "bctr":
             # Jump-table dispatcher: if the cases are in-range blocks of THIS
@@ -2138,7 +2225,7 @@ class PPULifter:
                     return f"ctx->gpr[{g}] = ctx->vrsave;"
                 return f"ctx->vrsave = (uint32_t)ctx->gpr[{g}];"
             if spr_field is None:
-                return f"/* {mn} {insn.operands}: unsupported SPR -- no-op */;"
+                return self._trap(insn, func)
             if mn == "mfspr":
                 return f"ctx->gpr[{g}] = ctx->{spr_field};"
             if spr_field == "xer":
@@ -3823,20 +3910,24 @@ class PPULifter:
     def lift_report(self) -> dict:
         """The lift's gaps as plain data (schema 1, see docs/LIFT_REPORT.md)."""
         defined = {f.start_addr for f in self.functions}
-        traps_total = 0
+        traps_total = dead_total = 0
         funcs = []
         for f in self._emit_functions():
-            if f.traps:
+            if f.traps or f.dead:
                 traps_total += len(f.traps)
+                dead_total += sum((int(b, 16) - int(a, 16)) // 4 + 1 for a, b in f.dead)
                 funcs.append({"name": f.name, "start": f"0x{f.start_addr:08X}",
-                              "end": f"0x{f.end_addr:08X}", "traps": f.traps})
+                              "end": f"0x{f.end_addr:08X}", "traps": f.traps, "dead": f.dead})
         unresolved = sorted((self.call_targets | self.branch_targets) - defined)
         return {
             "schema": 1,
             "tool": "ppu_lifter.py",
             "input_sha256": self.image_sha256,
-            "summary": {"functions": len(self.functions), "functions_with_traps": len(funcs),
+            "summary": {"functions": len(self.functions),
+                        "functions_with_traps": sum(1 for f in funcs if f["traps"]),
                         "trapped_instructions": traps_total,
+                        "functions_with_dead": sum(1 for f in funcs if f["dead"]),
+                        "dead_instructions": dead_total,
                         "capped_mid_tails": len(self.capped_tails),
                         "unresolved_targets": len(unresolved)},
             "functions": funcs,
@@ -4779,7 +4870,7 @@ def _worker_lift(task):
         insns = disassemble_bytes(blob, start, _WORKER_STATE["be"]) if blob else []
         f = lifter.lift_function(insns, start, end)
         results.append((f.name, f.start_addr, f.end_addr, f.body_lines, f.calls,
-                        f.fallthrough_to, f.traps))
+                        f.fallthrough_to, f.traps, f.dead))
     return idx0, results, lifter.call_targets, lifter.branch_targets
 
 
@@ -4822,10 +4913,10 @@ def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
         raise
 
     for idx0 in sorted(results_by_idx):
-        for name, s, e, body, calls, ft, traps in results_by_idx[idx0]:
+        for name, s, e, body, calls, ft, traps, dead in results_by_idx[idx0]:
             lifter.functions.append(LiftedFunction(
                 name=name, start_addr=s, end_addr=e,
-                body_lines=body, calls=calls, fallthrough_to=ft, traps=traps))
+                body_lines=body, calls=calls, fallthrough_to=ft, traps=traps, dead=dead))
 
 
 def main() -> None:
@@ -5028,10 +5119,16 @@ def main() -> None:
                 # handler thread returned instantly and cellSpurs rolled back the
                 # SPU thread group.) Stop at the previous terminator so we never
                 # absorb the previous function's body; bound the walk to 3 insns.
+                # Stop at alignment padding and data words too (nop/lnop, `.word`):
+                # no setup instruction is one, and walking over them put the entry
+                # on the padding (or on a float constant decoded as an instruction)
+                # ahead of the real function, so the lifted entry was a trap.
                 _TERM = ("b", "ba", "blr", "blrl", "bctr", "bctrl", "rfid", "rfi")
                 for _ in range(3):
                     _prev = _by_addr.get(_ent - 4)
-                    if _prev is None or _prev.mnemonic in _TERM:
+                    if (_prev is None or _prev.mnemonic in _TERM
+                            or _prev.mnemonic in ("nop", "lnop")
+                            or _prev.mnemonic.startswith(".")):
                         break
                     _ent -= 4
                 _func_entries.add(_ent)
@@ -5443,7 +5540,8 @@ def main() -> None:
         json.dump(report, rf, separators=(",", ":"))
     s = report["summary"]
     print(f"  lift report: {report_path} ({s['trapped_instructions']} trapped instruction(s) in "
-          f"{s['functions_with_traps']} function(s), {s['capped_mid_tails']} capped tail(s), "
+          f"{s['functions_with_traps']} function(s), {s['dead_instructions']} unreachable "
+          f"instruction(s) not lowered, {s['capped_mid_tails']} capped tail(s), "
           f"{s['unresolved_targets']} unresolved target(s))")
 
 
