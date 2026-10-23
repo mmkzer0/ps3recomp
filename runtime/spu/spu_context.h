@@ -28,6 +28,28 @@ extern "C" {
 #  define SPU_ALIGN16 __attribute__((aligned(16)))
 #endif
 
+/* Diagnostic state several SPU threads touch. A lazily-read environment gate or
+ * a debug ring that every run shares is a data race once two jobs run on two
+ * threads (the JobQueue2 executor does): such state is per thread
+ * (SPU_THREAD_LOCAL), and a gate every run reads is a relaxed atomic.
+ * SPU_RELAXED_* are plain loads/stores where the compiler has no builtin. */
+#ifndef SPU_THREAD_LOCAL
+#  if defined(_MSC_VER)
+#    define SPU_THREAD_LOCAL __declspec(thread)
+#  else
+#    define SPU_THREAD_LOCAL __thread
+#  endif
+#endif
+#if defined(__GNUC__) || defined(__clang__)
+#  define SPU_RELAXED_LOAD(p)     __atomic_load_n((p), __ATOMIC_RELAXED)
+#  define SPU_RELAXED_STORE(p, v) __atomic_store_n((p), (v), __ATOMIC_RELAXED)
+#  define SPU_RELAXED_OR8(p, v)   ((void)__atomic_fetch_or((p), (v), __ATOMIC_RELAXED))
+#else
+#  define SPU_RELAXED_LOAD(p)     (*(p))
+#  define SPU_RELAXED_STORE(p, v) (*(p) = (v))
+#  define SPU_RELAXED_OR8(p, v)   (*(p) |= (v))
+#endif
+
 /* Local store size: 256 KB */
 #define SPU_LS_SIZE         (256 * 1024)
 #define SPU_LS_MASK         (SPU_LS_SIZE - 1)
@@ -48,7 +70,7 @@ void spu_ls_watch_slow(uint32_t lsa, int is_write, const uint8_t* p, uint32_t pc
 unsigned* spu_ls_watch_list(int* out_n);   /* the armed lines (n may be 0) */
 static inline void spu_ls_watch_hit2(uint32_t lsa, int is_write, const uint8_t* p,
                                      uint32_t pc, uint32_t lr) {
-    if (__builtin_expect(g_spu_ls_watch_n == 0, 1)) return;
+    if (__builtin_expect(SPU_RELAXED_LOAD(&g_spu_ls_watch_n) == 0, 1)) return;
     spu_ls_watch_slow(lsa, is_write, p, pc, lr);
 }
 static inline void spu_ls_watch_hit(uint32_t lsa, int is_write, const uint8_t* p) {
@@ -528,15 +550,15 @@ SPU_GATE int g_wws_code_probe = 0;   /* WWS code-buffer resolution, capped      
 SPU_GATE int g_wws_read_probe = 0;
 static __attribute__((noinline, cold)) void spu_ls_read_probe(const spu_context* ctx, uint32_t lsa)
 {
-    if (g_spu_ls_probe < 0) g_spu_ls_probe = getenv("SPU_LS_LOWREAD") ? 1 : 0;
+    if (SPU_RELAXED_LOAD(&g_spu_ls_probe) < 0) SPU_RELAXED_STORE(&g_spu_ls_probe, getenv("SPU_LS_LOWREAD") ? 1 : 0);
     /* SPU_LS_LOWREAD=1: a job that reads its OWN first bytes as data is
      * dereferencing a null base -- the job binary loads at LS 0, so [NULL+off]
      * returns its own instruction words. Report each distinct low address once,
      * with the pc, to find which pointer was never filled in. */
-    { static int s_lw = -1;
+    { static SPU_THREAD_LOCAL int s_lw = -1;
       if (s_lw < 0) s_lw = getenv("SPU_LS_LOWREAD") ? 1 : 0;
       if (s_lw && lsa < 0x200u && ctx->image_id > 0 && !ctx->policy_mode) {
-          static uint32_t seen[24]; static int n = 0; int known = 0;
+          static SPU_THREAD_LOCAL uint32_t seen[24]; static SPU_THREAD_LOCAL int n = 0; int known = 0;
           uint32_t key = (uint32_t)ctx->image_id << 24 | (lsa & 0x1F0);
           for (int i = 0; i < n; i++) if (seen[i] == key) { known = 1; break; }
           if (!known && n < 24) {
@@ -567,7 +589,7 @@ static __attribute__((noinline, cold)) void spu_ls_read_probe(const spu_context*
 static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
 {
     u128 v;
-    if (__builtin_expect(g_spu_ls_probe != 0, 0) || (ctx->image_id == 2 && ctx->policy_mode))
+    if (__builtin_expect(SPU_RELAXED_LOAD(&g_spu_ls_probe) != 0, 0) || (ctx->image_id == 2 && ctx->policy_mode))
         spu_ls_read_probe(ctx, lsa);
     lsa &= SPU_LS_MASK & ~0xFu;
     const uint8_t* p = &ctx->ls[lsa];

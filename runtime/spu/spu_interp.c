@@ -365,13 +365,16 @@ static int spu_step(spu_context* ctx) {
     return 0;
 }
 
+/* Where the last interpreted run got to, for the watchdog's diagnostics: written
+ * by every interpreting thread, so relaxed atomics (no ordering is implied). */
 uint32_t g_spu_interp_last_pc = 0;
 uint64_t g_spu_interp_steps   = 0;
 
-/* Call-trace ring buffer for diagnosing SPU asserts (env SPU_CALLTRACE). */
+/* Call-trace ring buffer for diagnosing SPU asserts (env SPU_CALLTRACE), one per
+ * interpreting thread. */
 #define SPU_TRACE_N 32
-static struct { uint32_t from, to; } s_trace[SPU_TRACE_N];
-static unsigned s_trace_i = 0;
+static SPU_THREAD_LOCAL struct { uint32_t from, to; } s_trace[SPU_TRACE_N];
+static SPU_THREAD_LOCAL unsigned s_trace_i = 0;
 void spu_trace_call(uint32_t from, uint32_t to) {
     s_trace[s_trace_i % SPU_TRACE_N].from = from;
     s_trace[s_trace_i % SPU_TRACE_N].to   = to;
@@ -402,6 +405,18 @@ uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa) {
 #endif
 static SPU_INTERP_TLS int s_interp_depth;
 
+/* The diagnostic gates of spu_interp_run_inner, read from the environment on a
+ * thread's first run (YDKJ_SPU_TRACE, SPU_STEPCAP, YDKJ_CRI_GATE1TRACE,
+ * SPU_INTERP_STATS) and the counters that count down as traces are dumped. */
+typedef struct interp_diag {
+    int init;
+    int tr;
+    uint64_t cap;
+    int g1, g1in;
+    long is;
+} interp_diag;
+static SPU_INTERP_TLS interp_diag t_interp_diag;
+
 static uint32_t spu_interp_run_inner(spu_context* ctx, uint32_t start_lsa,
                                      uint32_t stop_lsa, int outermost);
 
@@ -419,15 +434,23 @@ static uint32_t spu_interp_run_inner(spu_context* ctx, uint32_t start_lsa,
     uint64_t steps = 0;
     /* YDKJ_SPU_TRACE=N: log the last N PCs into a ring buffer and dump them when the
      * interp halts -- shows the path to a branch-to-0 (the cri task/policy wall). */
-    static int _tr=-1; if(_tr<0){const char*e=getenv("YDKJ_SPU_TRACE");_tr=e?atoi(e):0;}
-    static uint64_t _cap=0; { static int _ci=0; if(!_ci){_ci=1; const char*e=getenv("SPU_STEPCAP"); _cap=e?strtoull(e,0,0):0;} }
+    /* The env gates and their counters are per interpreting thread: they are
+     * read lazily and the counters count down as a trace is dumped. `dg` keeps
+     * the hot loop's checks off the thread-local lookup. */
+    interp_diag* const dg = &t_interp_diag;
+    if (!dg->init) {
+        const char* e;
+        dg->init = 1;
+        e = getenv("YDKJ_SPU_TRACE");       dg->tr  = e ? atoi(e) : 0;
+        e = getenv("SPU_STEPCAP");          dg->cap = e ? strtoull(e, 0, 0) : 0;
+        e = getenv("YDKJ_CRI_GATE1TRACE");  dg->g1  = e ? atoi(e) : 0;
+        e = getenv("SPU_INTERP_STATS");     dg->is  = e ? atol(e) : 0;
     /* YDKJ_CRI_GATE1TRACE=N: cri decode task busy-spins in the validator func_00026E80
      * (LS 0x26E80..0x26F14), a straight-line leaf that returns r3 = 0 / 0x8041090F /
      * 0x80410909. Hand-decoding its selb/fsm/gb/ceqh lanes proved unreliable, so log the
      * ACTUAL runtime result + inputs the first N times it returns. Fires on range-exit
      * (pc left the fn), when r3 and the leaf's non-restored intermediates are still live. */
-    static int _g1=-1; if(_g1<0){const char*e=getenv("YDKJ_CRI_GATE1TRACE");_g1=e?atoi(e):0;}
-    static int _g1in=0;
+    }
     uint32_t ring[64]; int rc=0, rn=0;
     for (;;) {
         /* Match the lifted path: only synthetic HLE tasks may bypass the
@@ -450,7 +473,7 @@ static uint32_t spu_interp_run_inner(spu_context* ctx, uint32_t start_lsa,
          * un-lifted image (e.g. a title's raw SPU jobs) must never rejoin
          * another image's functions that happen to share an LS address. */
         /* ponytail: pc-only match; a recursive call through the same site would stop early -- compare r1 too if one shows up. */
-        if (ctx->image_id >= 0 && ((stop_lsa && ctx->pc == stop_lsa) || spu_lifted_lookup(ctx, ctx->pc))) { g_spu_interp_steps = steps; g_spu_interp_last_pc = ctx->pc; return ctx->pc; }  /* rejoin fast path */
+        if (ctx->image_id >= 0 && ((stop_lsa && ctx->pc == stop_lsa) || spu_lifted_lookup(ctx, ctx->pc))) { SPU_RELAXED_STORE(&g_spu_interp_steps, steps); SPU_RELAXED_STORE(&g_spu_interp_last_pc, ctx->pc); return ctx->pc; }  /* rejoin fast path */
         /* Observer yield: before executing the instruction at ctx->pc, with no
          * state consumed -- resuming at ctx->pc re-enters exactly here. Only
          * the outermost run may stop this way; see spu_observe.h for why a
@@ -467,35 +490,34 @@ static uint32_t spu_interp_run_inner(spu_context* ctx, uint32_t start_lsa,
               }
               return SPU_INTERP_YIELDED;
           } }
-        g_spu_interp_last_pc = ctx->pc;
-        if (_g1>0) {
+        SPU_RELAXED_STORE(&g_spu_interp_last_pc, ctx->pc);
+        if (dg->g1>0) {
             int inr = (ctx->pc >= 0x26E80u && ctx->pc < 0x26F14u);
-            if (inr) { _g1in = 1; }
-            else if (_g1in) {
-                _g1in = 0;
+            if (inr) { dg->g1in = 1; }
+            else if (dg->g1in) {
+                dg->g1in = 0;
                 #define GLB(o) (((uint32_t)ctx->ls[(o)]<<24)|((uint32_t)ctx->ls[(o)+1]<<16)|((uint32_t)ctx->ls[(o)+2]<<8)|ctx->ls[(o)+3])
                 fprintf(stderr,"[gate1] func_00026E80 ret r3=%08X | LS2FB0=%08X LS2FB4=%08X LS2FB8=%08X | LS1E0=%08X LS1E4=%08X LS1E8=%08X | r1=%05X r29=%08X r32=%08X r16=%08X r22=%08X r8=%08X r6=%08X\n",
                     ctx->gpr[3]._u32[0], GLB(0x2FB0),GLB(0x2FB4),GLB(0x2FB8), GLB(0x1E0),GLB(0x1E4),GLB(0x1E8),
                     ctx->gpr[1]._u32[0], ctx->gpr[29]._u32[0], ctx->gpr[32]._u32[0],
                     ctx->gpr[16]._u32[0], ctx->gpr[22]._u32[0], ctx->gpr[8]._u32[0], ctx->gpr[6]._u32[0]);
                 #undef GLB
-                fflush(stderr); _g1--;
+                fflush(stderr); dg->g1--;
             }
         }
-        if (_tr>0) { ring[rc&63]=ctx->pc; rc++; if(rn<64)rn++; }
+        if (dg->tr>0) { ring[rc&63]=ctx->pc; rc++; if(rn<64)rn++; }
         steps++;
         /* SPU_INTERP_STATS=<seconds>: how much SPU code runs interpreted, by
          * image and 1 KB page of local store. A job module streamed in at an
          * address nothing was lifted for runs here at a fraction of the
          * compiled speed, and from the outside that only looks like a
          * workload that is slow for no reason (late audio, slow decode). */
-        { static long s_is = -1;
-          if (s_is < 0) { const char* e = getenv("SPU_INTERP_STATS"); s_is = e ? atol(e) : 0; }
+        { const long s_is = dg->is;
           if (s_is > 0) {
             enum { IS_N = 64 };
-            static volatile long long s_tot;
-            static int s_img[IS_N]; static uint32_t s_page[IS_N]; static volatile long long s_cnt[IS_N];
-            static unsigned long long s_t0;
+            static SPU_THREAD_LOCAL long long s_tot;
+            static SPU_THREAD_LOCAL int s_img[IS_N]; static SPU_THREAD_LOCAL uint32_t s_page[IS_N]; static SPU_THREAD_LOCAL long long s_cnt[IS_N];
+            static SPU_THREAD_LOCAL unsigned long long s_t0;
             uint32_t page = ctx->pc & ~0x3FFu;
             int k;
             for (k = 0; k < IS_N && s_cnt[k]; k++)
@@ -527,7 +549,7 @@ static uint32_t spu_interp_run_inner(spu_context* ctx, uint32_t start_lsa,
             } } }
         /* SPU_STEPCAP=N: a task that never halts (infinite work/wait loop) never
          * dumps its ring. Force a one-shot dump after N steps to see where it loops. */
-        if (_tr>0 && _cap && steps == _cap) {
+        if (dg->tr>0 && dg->cap && steps == dg->cap) {
             fprintf(stderr,"[spu-trace] STEPCAP pc=0x%05X after %llu steps; last %d PCs:",
                     ctx->pc, (unsigned long long)steps, rn);
             for(int k=rn;k>0;k--) fprintf(stderr," %05X", ring[(rc-k)&63]);
@@ -538,7 +560,7 @@ static uint32_t spu_interp_run_inner(spu_context* ctx, uint32_t start_lsa,
             fprintf(stderr,"[spu-trace] LS ctx: RUN=%08X READY=%08X PEND=%08X ENA=%08X SIG=%08X WAIT=%08X | 2790=%08X 2794=%08X 27D8=%08X 2FB0=%08X\n",
                 LB(0x2700),LB(0x2710),LB(0x2720),LB(0x2730),LB(0x2740),LB(0x2750),LB(0x2790),LB(0x2794),LB(0x27D8),LB(0x2FB0));
             #undef LB
-            fflush(stderr); _tr--; g_spu_interp_steps=steps; return 0x2000u;
+            fflush(stderr); dg->tr--; SPU_RELAXED_STORE(&g_spu_interp_steps, steps); return 0x2000u;
         }
         if (spu_step(ctx)) {
             /* stop 0x110 = SYS_SPU_THREAD_STOP_RECEIVE_EVENT. The worker writes
@@ -560,11 +582,11 @@ static uint32_t spu_interp_run_inner(spu_context* ctx, uint32_t start_lsa,
                 ctx->status = SPU_STATUS_RUNNING;
                 continue;
             }
-            g_spu_interp_steps = steps;
-            if (_tr>0) { fprintf(stderr,"[spu-trace] halt stop=0x%X pc=0x%05X after %llu steps; last %d PCs:",
+            SPU_RELAXED_STORE(&g_spu_interp_steps, steps);
+            if (dg->tr>0) { fprintf(stderr,"[spu-trace] halt stop=0x%X pc=0x%05X after %llu steps; last %d PCs:",
                     ctx->stop_code, ctx->pc, (unsigned long long)steps, rn);
                 for(int k=rn;k>0;k--) fprintf(stderr," %05X", ring[(rc-k)&63]);
-                fprintf(stderr,"\n"); fflush(stderr); _tr--; }
+                fprintf(stderr,"\n"); fflush(stderr); dg->tr--; }
             return ctx->stop_code; }
     }
 }

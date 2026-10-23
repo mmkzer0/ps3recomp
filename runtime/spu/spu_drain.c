@@ -336,7 +336,7 @@ void (*spu_take_interrupt(spu_context* ctx,
 /* See the declaration in spu_context.h. */
 void spu_depth_guard(spu_context* ctx)
 {
-    static uint32_t s_max = 0;
+    static SPU_THREAD_LOCAL uint32_t s_max = 0;
     if (!s_max) {
         const char* e = getenv("SPU_HOST_DEPTH_MAX");
         s_max = e ? (uint32_t)strtoul(e, 0, 0) : 2000u;
@@ -346,8 +346,8 @@ void spu_depth_guard(spu_context* ctx)
      * not "where are we" but "what cycle got us here" -- one pc names a point,
      * a ring names the loop. */
     enum { RING = 24 };
-    static uint32_t s_ring[RING];
-    static uint32_t s_n;
+    static SPU_THREAD_LOCAL uint32_t s_ring[RING];
+    static SPU_THREAD_LOCAL uint32_t s_n;
     s_ring[s_n % RING] = ((uint32_t)ctx->pc & SPU_LS_MASK);
     s_n++;
 

@@ -81,7 +81,7 @@ static unsigned long long  s_pass_count = 0;
 static int                 s_watchdog_prints = 0;
 
 static atomic_flag  s_init_claimed = ATOMIC_FLAG_INIT;
-static volatile int s_init_complete = 0;
+static atomic_int s_init_complete;
 
 static void ls_arm_now(void)
 {
@@ -96,25 +96,25 @@ static void ls_arm_now(void)
                 (unsigned long long)q);
         fflush(stderr);
     }
-    g_yz_lockstep_on = on;
+    SPU_RELAXED_STORE(&g_yz_lockstep_on, on);
 }
 
 int yz_lockstep_enabled(void)
 {
-    if (s_init_complete) return g_yz_lockstep_on;
+    if (atomic_load_explicit(&s_init_complete, memory_order_acquire)) return SPU_RELAXED_LOAD(&g_yz_lockstep_on);
     if (!atomic_flag_test_and_set_explicit(&s_init_claimed, memory_order_acq_rel)) {
         ls_arm_now();
-        s_init_complete = 1;
+        atomic_store_explicit(&s_init_complete, 1, memory_order_release);
     } else {
-        while (!s_init_complete) LS_RELAX();
+        while (!atomic_load_explicit(&s_init_complete, memory_order_acquire)) LS_RELAX();
     }
-    return g_yz_lockstep_on;
+    return SPU_RELAXED_LOAD(&g_yz_lockstep_on);
 }
 
 static int ls_hot(void)
 {
-    if (g_yz_lockstep_on == 0) return 0;
-    if (g_yz_lockstep_on < 0) return yz_lockstep_enabled();
+    if (SPU_RELAXED_LOAD(&g_yz_lockstep_on) == 0) return 0;
+    if (SPU_RELAXED_LOAD(&g_yz_lockstep_on) < 0) return yz_lockstep_enabled();
     return 1;
 }
 
@@ -215,7 +215,7 @@ void yz_lockstep_register(spu_context* ctx)
 
 void yz_lockstep_unregister(spu_context* ctx)
 {
-    if (g_yz_lockstep_on != 1) return;
+    if (SPU_RELAXED_LOAD(&g_yz_lockstep_on) != 1) return;
     LS_LOCK();
     int idx = ls_find_slot(ctx);
     if (idx >= 0) {

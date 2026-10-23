@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <setjmp.h>
+#include <stdatomic.h>
 #ifndef _WIN32
 #include <sched.h>   /* sched_yield */
 #endif
@@ -80,17 +81,25 @@ void spu_taskset_line_committed(uint32_t line);
 #define SPU_WATCH_MAX 4
 int g_spu_ls_watch_n = -1;
 static unsigned s_spu_ls_watch[SPU_WATCH_MAX];
+static atomic_flag s_spu_ls_watch_claim = ATOMIC_FLAG_INIT;
+static atomic_int  s_spu_ls_watch_ready;
 unsigned* spu_ls_watch_list(int* out_n)
 {
-    if (g_spu_ls_watch_n < 0) {
-        int n = 0; const char* e = getenv("SPU_LS_WATCH");
-        while (e && *e && n < SPU_WATCH_MAX) {
-            s_spu_ls_watch[n++] = (unsigned)strtoul(e, (char**)&e, 0) & ~0xFu;
-            while (*e == ',' || *e == ' ') e++;
+    /* One thread reads the environment; the others wait for its list. */
+    if (!atomic_load_explicit(&s_spu_ls_watch_ready, memory_order_acquire)) {
+        if (!atomic_flag_test_and_set(&s_spu_ls_watch_claim)) {
+            int n = 0; const char* e = getenv("SPU_LS_WATCH");
+            while (e && *e && n < SPU_WATCH_MAX) {
+                s_spu_ls_watch[n++] = (unsigned)strtoul(e, (char**)&e, 0) & ~0xFu;
+                while (*e == ',' || *e == ' ') e++;
+            }
+            SPU_RELAXED_STORE(&g_spu_ls_watch_n, n);
+            atomic_store_explicit(&s_spu_ls_watch_ready, 1, memory_order_release);
+        } else {
+            while (!atomic_load_explicit(&s_spu_ls_watch_ready, memory_order_acquire)) { }
         }
-        g_spu_ls_watch_n = n;
     }
-    *out_n = g_spu_ls_watch_n;
+    *out_n = SPU_RELAXED_LOAD(&g_spu_ls_watch_n);
     return s_spu_ls_watch;
 }
 void spu_ls_watch_slow(uint32_t lsa, int is_write, const uint8_t* p, uint32_t pc, uint32_t lr)
@@ -98,7 +107,7 @@ void spu_ls_watch_slow(uint32_t lsa, int is_write, const uint8_t* p, uint32_t pc
     int n; spu_ls_watch_list(&n);
     if (!n) return;
     uint32_t a = lsa & (SPU_LS_MASK & ~0xFu);
-    for (int i = 0; i < g_spu_ls_watch_n; i++) {
+    for (int i = 0; i < n; i++) {
         if (s_spu_ls_watch[i] == a) {
             fprintf(stderr, "[spu-watch %s 0x%05X pc=0x%05X lr=0x%05X] "
                 "%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
@@ -854,8 +863,8 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
      * worker that never issues an MFC command is either not being handed its
      * work descriptor or is waiting on a channel we never satisfy; the channel
      * mix distinguishes those. */
-    { static int s_c = -1; if (s_c < 0) { const char* e = getenv("SPU_CHHIST"); s_c = e ? (atoi(e) > 0 ? atoi(e) : 2000) : 0; }
-      if (s_c) { static unsigned long long w[128]; static unsigned long long n;
+    { static SPU_THREAD_LOCAL int s_c = -1; if (s_c < 0) { const char* e = getenv("SPU_CHHIST"); s_c = e ? (atoi(e) > 0 ? atoi(e) : 2000) : 0; }
+      if (s_c) { static SPU_THREAD_LOCAL unsigned long long w[128]; static SPU_THREAD_LOCAL unsigned long long n;
           w[channel & 127]++;
           if ((++n % (unsigned long long)s_c) == 0) { fprintf(stderr, "[chw] %llu writes:%c", n, 10);
               for (int i = 0; i < 128; i++) if (w[i])
@@ -1085,8 +1094,8 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
  * ===========================================================================*/
 u128 spu_rdch(spu_context* ctx, uint32_t channel)
 {
-    { static int s_c = -1; if (s_c < 0) { const char* e = getenv("SPU_CHHIST"); s_c = e ? (atoi(e) > 0 ? atoi(e) : 2000) : 0; }
-      if (s_c) { static unsigned long long r[128]; static unsigned long long n;
+    { static SPU_THREAD_LOCAL int s_c = -1; if (s_c < 0) { const char* e = getenv("SPU_CHHIST"); s_c = e ? (atoi(e) > 0 ? atoi(e) : 2000) : 0; }
+      if (s_c) { static SPU_THREAD_LOCAL unsigned long long r[128]; static SPU_THREAD_LOCAL unsigned long long n;
           r[channel & 127]++;
           if ((++n % (unsigned long long)s_c) == 0) { fprintf(stderr, "[chr] %llu reads:%c", n, 10);
               for (int i = 0; i < 128; i++) if (r[i])
@@ -1293,10 +1302,10 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
      * appear: park_on_empty_inmbox halts from inside THIS function, so a
      * worker that polls rchcnt and parks produced a completely empty channel
      * histogram and read as 'never touches a channel'. */
-    { static int s_c = -1;
+    { static SPU_THREAD_LOCAL int s_c = -1;
       if (s_c < 0) { const char* e = getenv("SPU_CHHIST");
         s_c = e ? (atoi(e) > 0 ? atoi(e) : 2000) : 0; }
-      if (s_c) { static unsigned long long c[128]; static unsigned long long n;
+      if (s_c) { static SPU_THREAD_LOCAL unsigned long long c[128]; static SPU_THREAD_LOCAL unsigned long long n;
           c[channel & 127]++;
           if ((++n % (unsigned long long)s_c) == 0) {
               fprintf(stderr, "[chc] %llu rchcnt:%c", n, 10);
@@ -1691,12 +1700,12 @@ void spu_overlay_register_sig(const uint8_t sig[16], int image_id)
  * file. One file per source EA: ovl_<ea>.bin. */
 static void spu_ovl_dump(spu_context* ctx, uint32_t ea, uint32_t lsa, const uint8_t* ls, uint32_t size)
 {
-    static int s_on = -1; static char s_dir[400]; static uint32_t s_lsa = 0x5000;
+    static SPU_TLS int s_on = -1; static SPU_TLS char s_dir[400]; static SPU_TLS uint32_t s_lsa = 0x5000;
     if (s_on < 0) { const char* e = getenv("SPU_DUMP_OVL"); s_on = e && *e;
         if (s_on) { snprintf(s_dir, sizeof s_dir, "%s", e);
                     char* c = strchr(s_dir, ','); if (c) { *c = 0; s_lsa = (uint32_t)strtoul(c + 1, 0, 0); } } }
     if (!s_on) return;
-    static uint32_t s_seen[256]; static unsigned s_n;
+    static SPU_TLS uint32_t s_seen[256]; static SPU_TLS unsigned s_n;
     static SPU_TLS uint32_t t_src, t_next_ea, t_next_lsa;
     FILE* f = NULL; char path[512];
     if (lsa == s_lsa && size >= 256) {
@@ -1720,7 +1729,7 @@ static void spu_ovl_dump(spu_context* ctx, uint32_t ea, uint32_t lsa, const uint
  * new bytes for [ea, ea+size). */
 void spu_lockguard_check(spu_context* ctx, uint32_t ea, const uint8_t* src, uint32_t size, const char* what)
 {
-    static int64_t s_g = -2;
+    static SPU_TLS int64_t s_g = -2;
     if (s_g == -2) { const char* e = getenv("SPU_LOCKGUARD"); s_g = e ? (int64_t)strtoul(e, 0, 16) : -1; }
     if (s_g < 0 || !vm_base) return;
     uint32_t g = (uint32_t)s_g;
@@ -1729,7 +1738,7 @@ void spu_lockguard_check(spu_context* ctx, uint32_t ea, const uint8_t* src, uint
     unsigned os = (o[0] << 8) | o[1], on = (o[2] << 8) | o[3];
     unsigned ns = (n[0] << 8) | n[1], nn = (n[2] << 8) | n[3];
     int bad = !(ns == os || ns == ((os + 1) & 0xFFFF)) || !(nn == on || nn == ((on + 1) & 0xFFFF));
-    if (bad) { static int c; if (PS3_LOG_FIRST(c, 32))
+    if (bad) { static SPU_TLS int c; if (PS3_LOG_FIRST(c, 32))
         fprintf(stderr, "[lockguard] %s img=%d pc=0x%05X ea=0x%08X size=%u: %04X/%04X -> %04X/%04X\n",
                 what, ctx ? ctx->image_id : -1, ctx ? (unsigned)(ctx->pc & SPU_LS_MASK) : 0u,
                 ea, size, os, on, ns, nn); }
