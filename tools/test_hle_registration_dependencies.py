@@ -14,16 +14,22 @@ if not shutil.which('cmake'):
     if os.environ.get('CI'): raise SystemExit('CMake is required for this CI regression')
     print('SKIP: CMake is unavailable')
     raise SystemExit(0)
+# The template generates the table through the toolkit's helper; run exactly
+# the template's lines (include + call) against a fixture SDK carrying that
+# helper, so the dependency rules under test are the shipped ones.
 text=(ROOT/'templates/project/CMakeLists.txt').read_text()
-start=text.index('if(EXISTS "${RECOMP_DIR}/ppu_hle_nids.cpp")')
+start=text.index('include("${PS3RECOMP_DIR}/cmake/PS3RecompPPU.cmake")')
 end=text.index('# ---------------------------------------------------------------------------',start)
 rule=text[start:end]
+assert 'ps3recomp_ppu_hle_nids(HLE_NID_TABLE' in rule,rule
 
 with tempfile.TemporaryDirectory(prefix='hle-registration-deps-') as tmp:
     root=Path(tmp); sdk=root/'sdk'; (sdk/'tools').mkdir(parents=True)
     (sdk/'libs/system').mkdir(parents=True)
-    for name in ['gen_hle_nids.py','nid_database.py']:
+    for name in ['gen_hle_nids.py','nid_database.py','nid_from_protos.json']:
         shutil.copyfile(ROOT/'tools'/name,sdk/'tools'/name)
+    (sdk/'cmake').mkdir()
+    shutil.copyfile(ROOT/'cmake/PS3RecompPPU.cmake',sdk/'cmake/PS3RecompPPU.cmake')
     module=sdk/'libs/system/cellFixture.c'
     module.write_text('int cellFixtureFirst(void) { return 0; }\n')
     project=root/'project';project.mkdir()
