@@ -117,14 +117,20 @@ s32 _sys_tolower(s32 c);
  * semantics). The callback arguments are guest OPD addresses, not host
  * function pointers; attach/detach return CELL_ESTAT while the matching
  * callback is not registered, else the callback's own result.
+ *
+ * attach/detach return s64, not s32: they are reached through the generic HLE
+ * adapter (ppu_hle.cpp), which copies the handler's full 64-bit return into
+ * r3, and a PPC64 s32 result lives sign-extended in r3 (an s32 return leaves
+ * the upper register half unspecified and zero-extended on arm64). The value
+ * is always an s32 sign-extended to 64 bits.
  * -----------------------------------------------------------------------*/
 
 s32 _sys_spu_printf_initialize(u32 agcb, u32 dgcb, u32 atcb, u32 dtcb);
 s32 _sys_spu_printf_finalize(void);
-s32 _sys_spu_printf_attach_group(u32 group);
-s32 _sys_spu_printf_detach_group(u32 group);
-s32 _sys_spu_printf_attach_thread(u32 thread);
-s32 _sys_spu_printf_detach_thread(u32 thread);
+s64 _sys_spu_printf_attach_group(u32 group);
+s64 _sys_spu_printf_detach_group(u32 group);
+s64 _sys_spu_printf_attach_thread(u32 thread);
+s64 _sys_spu_printf_detach_thread(u32 thread);
 
 /* ---------------------------------------------------------------------------
  * Lightweight mutex

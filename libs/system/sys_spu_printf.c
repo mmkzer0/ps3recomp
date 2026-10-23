@@ -28,14 +28,20 @@
  *       call replaces the first.
  *   s32 _sys_spu_printf_finalize(void)
  *       Zeroes all four callbacks. Always CELL_OK.
- *   s32 _sys_spu_printf_attach_group(u32 group)    -> agcb(group)
- *   s32 _sys_spu_printf_detach_group(u32 group)    -> dgcb(group)
- *   s32 _sys_spu_printf_attach_thread(u32 thread)  -> atcb(thread)
- *   s32 _sys_spu_printf_detach_thread(u32 thread)  -> dtcb(thread)
+ *   s64 _sys_spu_printf_attach_group(u32 group)    -> agcb(group)
+ *   s64 _sys_spu_printf_detach_group(u32 group)    -> dgcb(group)
+ *   s64 _sys_spu_printf_attach_thread(u32 thread)  -> atcb(thread)
+ *   s64 _sys_spu_printf_detach_thread(u32 thread)  -> dtcb(thread)
  *       The matching callback is a guest function s32 cb(u32 id). If it is NULL
  *       (never initialised, or finalised) the result is CELL_ESTAT and nothing
  *       is called; otherwise the callback runs on the caller's thread and its
- *       return value is the function's return value, unchanged.
+ *       return value is the function's return value, unchanged. The firmware
+ *       signature is s32; the host return type is s64 holding that s32
+ *       sign-extended, because these four are dispatched by the generic HLE
+ *       adapter (runtime/ppu/ppu_hle.cpp hle_generic), which copies the full
+ *       64-bit return into guest r3. A host s32 return leaves the upper half
+ *       of x0/rax unspecified (zero on arm64): CELL_ESTAT would reach the guest
+ *       as 0x000000008001000F instead of 0xFFFFFFFF8001000F.
  *
  * The firmware PRX that exports these (liblv2) is not among the PRXes under
  * ~/ps3-recon/odin-sphere-m0/fw/sprx/, so RPCS3 is the only primary source for
@@ -108,32 +114,32 @@ s32 _sys_spu_printf_finalize(void)
     return CELL_OK;
 }
 
-static s32 spu_printf_dispatch(int which, u32 id)
+static s64 spu_printf_dispatch(int which, u32 id)
 {
     spu_printf_lock();
     const u32 opd = s_spu_printf_cb[which];
     spu_printf_unlock();
     if (!opd)
-        return (s32)CELL_ESTAT;
-    return (s32)(u32)ppu_guest_call(opd, id, 0, 0, 0, 0, 0, 0, 0);
+        return (s64)(s32)CELL_ESTAT;
+    return (s64)(s32)(u32)ppu_guest_call(opd, id, 0, 0, 0, 0, 0, 0, 0);
 }
 
-s32 _sys_spu_printf_attach_group(u32 group)
+s64 _sys_spu_printf_attach_group(u32 group)
 {
     return spu_printf_dispatch(SPU_PRINTF_ATTACH_GROUP, group);
 }
 
-s32 _sys_spu_printf_detach_group(u32 group)
+s64 _sys_spu_printf_detach_group(u32 group)
 {
     return spu_printf_dispatch(SPU_PRINTF_DETACH_GROUP, group);
 }
 
-s32 _sys_spu_printf_attach_thread(u32 thread)
+s64 _sys_spu_printf_attach_thread(u32 thread)
 {
     return spu_printf_dispatch(SPU_PRINTF_ATTACH_THREAD, thread);
 }
 
-s32 _sys_spu_printf_detach_thread(u32 thread)
+s64 _sys_spu_printf_detach_thread(u32 thread)
 {
     return spu_printf_dispatch(SPU_PRINTF_DETACH_THREAD, thread);
 }

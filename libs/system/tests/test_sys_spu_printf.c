@@ -3,11 +3,21 @@
  * ppu_guest_call and return its result; with no callback registered (never
  * initialised, or after finalize) they return CELL_ESTAT and call nothing.
  *
+ * Two ways in. Direct C calls check the store/dispatch/finalize logic and the
+ * lock under threads. The generated NID table + the real ppu_hle.cpp
+ * (ps3_hle_call) check what a title sees: the attach/detach result reaches
+ * guest r3 as the s32 SIGN-EXTENDED to 64 bits (0xFFFFFFFF8001000F for
+ * CELL_ESTAT), not zero-extended, since the generic adapter copies the
+ * handler's whole 64-bit return into r3.
+ *
  * Built and run by tools/test_sys_spu_printf.py. ppu_guest_call is faked: it
  * records (opd, args) and returns a value the test chooses. */
 #include "../sys_spu_printf.c"
+#include "ppu_context.h"
 #include <assert.h>
+#include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #ifdef _WIN32
@@ -54,7 +64,7 @@ static void reset_rec(u64 ret)
 
 /* One dispatch: exact result, exactly one call, to `opd`, with `id` in r3 and
  * nothing else touched. */
-static void expect_dispatch(s32 (*fn)(u32), u32 id, u32 opd, u64 guest_r3, s32 want)
+static void expect_dispatch(s64 (*fn)(u32), u32 id, u32 opd, u64 guest_r3, s32 want)
 {
     reset_rec(guest_r3);
     assert(fn(id) == want);
@@ -66,7 +76,7 @@ static void expect_dispatch(s32 (*fn)(u32), u32 id, u32 opd, u64 guest_r3, s32 w
 
 static void expect_unregistered(void)
 {
-    s32 (*const fns[4])(u32) = {
+    s64 (*const fns[4])(u32) = {
         _sys_spu_printf_attach_group, _sys_spu_printf_detach_group,
         _sys_spu_printf_attach_thread, _sys_spu_printf_detach_thread };
     for (int i = 0; i < 4; i++) {
@@ -91,15 +101,110 @@ static void* hammer(void* arg)
 
 static void* churn(void* arg)
 {
-    volatile int* stop = arg;
-    while (!*stop)   /* replacing the same OPDs must never expose a torn/zero set */
+    atomic_int* stop = arg;
+    while (!atomic_load_explicit(stop, memory_order_acquire))   /* replacing the same OPDs must never expose a torn/zero set */
         assert(_sys_spu_printf_initialize(OPD_AG, OPD_DG, OPD_AT, OPD_DT) == CELL_OK);
     return NULL;
 }
 
+/* ---- the real HLE bridge (runtime/ppu/ppu_hle.cpp) and its collaborators ----
+ * ppu_hle.cpp is linked in as is; everything it reaches for beyond the generated
+ * table (tools/test_sys_spu_printf.py builds it) is a no-op here. */
+uint8_t* vm_base;
+uint32_t ppu_vm_size = 0x10000;
+uint32_t g_ww_lo, g_ww_hi;
+int g_resv_store_active;
+void* g_ps3_guest_caller;
+uint32_t g_ydkj_real_spurs_ea, g_ydkj_real_taskset_ea;
+uint32_t prx_resolve_export(uint32_t nid) { (void)nid; return 0; }
+void ps3_indirect_call(ppu_context* ctx) { (void)ctx; abort(); }
+void ppu_prof_stamp(void* ctx, unsigned pc) { (void)ctx; (void)pc; }
+void ppu_gcm_pump(void) {}
+uint32_t ppu_prof_resolve_host(void* ra) { (void)ra; return 0; }
+void ps3_msf(const char* fmt, ...) { (void)fmt; }
+int spu_coh_is_reserved(uint32_t ea) { (void)ea; return 0; }
+void spu_coh_notify_write(uint32_t ea) { (void)ea; }
+void spu_lockline_lock(void) {}
+void spu_lockline_unlock(void) {}
+void ppu_resv_break_store(uint64_t ea) { (void)ea; }
+void ps3_ww_report_inline(uint32_t ea, uint64_t v, int w) { (void)ea; (void)v; (void)w; }
+uint32_t vm_read32(uint64_t a) { uint32_t x; memcpy(&x, vm_base + a, 4); return __builtin_bswap32(x); }
+void vm_write32(uint64_t a, uint32_t x) { x = __builtin_bswap32(x); memcpy(vm_base + a, &x, 4); }
+uint64_t vm_read64(uint64_t a) { uint64_t x; memcpy(&x, vm_base + a, 8); return __builtin_bswap64(x); }
+/* ppu_hle.cpp declares vm_write64 with C++ linkage: tools/test_sys_spu_printf.py links a one-line
+ * C++ shim that forwards it here. */
+void ps3_test_vm_write64(uint64_t a, uint64_t x) { x = __builtin_bswap64(x); memcpy(vm_base + a, &x, 8); }
+void ppu_dump_guest_stack(ppu_context* ctx, const char* tag) { (void)ctx; (void)tag; }
+void ppu_dump_bctrl_ring(uint32_t tid, const char* tag) { (void)tid; (void)tag; }
+void ppu_guest_callstack(const char* tag) { (void)tag; }
+
+void ppu_hle_register_all(void);   /* generated: gen_hle_nids.py sys_spu_printf */
+int ps3_hle_has(uint32_t nid);
+void ps3_hle_call(uint32_t nid, ppu_context* ctx);
+
+/* Dispatch `nid` exactly as a title's import stub does and return the whole
+ * 64-bit guest r3. The argument registers past r3 carry noise: the callback
+ * must see only the id. */
+static uint64_t hle_r3(u32 nid, u32 id)
+{
+    static uint8_t arena[0x10000];
+    vm_base = arena;
+    ppu_context ctx;
+    memset(&ctx, 0, sizeof ctx);
+    ctx.gpr[1] = 0x8000;
+    ctx.gpr[2] = 0x12345678;
+    ctx.gpr[3] = 0xBADBADBA00000000ull | id;   /* a u32 parameter: only the low word is the argument */
+    for (int r = 4; r <= 10; r++) ctx.gpr[r] = 0xDEAD000000000000ull | (u64)r;
+    ps3_hle_call(nid, &ctx);
+    assert(ctx.gpr[2] == 0x12345678);
+    return ctx.gpr[3];
+}
+
+static void hle_nid_path(void)
+{
+    static const struct { u32 nid; u32 cb; } nids[4] = {
+        { 0xDD0C1E09u, OPD_AG },   /* _sys_spu_printf_attach_group */
+        { 0x5FDFB2FEu, OPD_DG },   /* _sys_spu_printf_detach_group */
+        { 0x1AE10B92u, OPD_AT },   /* _sys_spu_printf_attach_thread */
+        { 0xB3BBCF2Au, OPD_DT },   /* _sys_spu_printf_detach_thread */
+    };
+    ppu_hle_register_all();
+    for (int i = 0; i < 4; i++) assert(ps3_hle_has(nids[i].nid));
+    assert(ps3_hle_has(0x45FE2FCEu) && ps3_hle_has(0xDD3B27ACu));   /* initialize, finalize */
+
+    assert(_sys_spu_printf_initialize(OPD_AG, OPD_DG, OPD_AT, OPD_DT) == CELL_OK);
+    for (int i = 0; i < 4; i++) {
+        /* an s32 error (CELL_EINVAL-style) is sign-extended: the guest tests r3 as a 64-bit value */
+        reset_rec(0x80010005u);
+        assert(hle_r3(nids[i].nid, 0x77u + (u32)i) == 0xFFFFFFFF80010005ull);
+        assert(g_calls == 1 && g_last_opd == nids[i].cb && g_last_args[0] == 0x77u + (u32)i);
+        for (int r = 1; r < 8; r++) assert(g_last_args[r] == 0);
+        /* the callback's own r3 upper half is not part of an s32 result */
+        reset_rec(0xDEADBEEF80010005ull);
+        assert(hle_r3(nids[i].nid, 1) == 0xFFFFFFFF80010005ull);
+        reset_rec(0xDEADBEEF00000003ull);
+        assert(hle_r3(nids[i].nid, 1) == 3);
+        reset_rec(0xFFFFFFFFull);
+        assert(hle_r3(nids[i].nid, 1) == 0xFFFFFFFFFFFFFFFFull);
+        reset_rec(0x7FFFFFFFull);
+        assert(hle_r3(nids[i].nid, 1) == 0x7FFFFFFFull);
+        reset_rec(0);
+        assert(hle_r3(nids[i].nid, 1) == 0);
+    }
+
+    /* No callback registered: CELL_ESTAT, sign-extended, nothing called. */
+    assert(_sys_spu_printf_finalize() == CELL_OK);
+    for (int i = 0; i < 4; i++) {
+        reset_rec(0);
+        assert(hle_r3(nids[i].nid, 0x1234) == 0xFFFFFFFF8001000Full);
+        assert(g_calls == 0);
+    }
+    assert(_sys_spu_printf_initialize(OPD_AG, OPD_DG, OPD_AT, OPD_DT) == CELL_OK);
+}
+
 int main(void)
 {
-    s32 (*const fns[4])(u32) = {
+    s64 (*const fns[4])(u32) = {
         _sys_spu_printf_attach_group, _sys_spu_printf_detach_group,
         _sys_spu_printf_attach_thread, _sys_spu_printf_detach_thread };
     const u32 opds[4] = { OPD_AG, OPD_DG, OPD_AT, OPD_DT };
@@ -151,20 +256,24 @@ int main(void)
     /* Concurrency: process-global state under guest threads. Every call must
      * resolve to the registered OPD and reach it exactly once. */
     reset_rec(7);
-    volatile int stop = 0;
+    atomic_int stop;
+    atomic_init(&stop, 0);
     pthread_t workers[CONC_THREADS], churner;
     assert(pthread_create(&churner, NULL, churn, (void*)&stop) == 0);
     for (int i = 0; i < CONC_THREADS; i++)
         assert(pthread_create(&workers[i], NULL, hammer, NULL) == 0);
     for (int i = 0; i < CONC_THREADS; i++)
         assert(pthread_join(workers[i], NULL) == 0);
-    stop = 1;
+    atomic_store_explicit(&stop, 1, memory_order_release);
     assert(pthread_join(churner, NULL) == 0);
     assert(g_calls == 2u * CONC_THREADS * CONC_ITERS);
     assert(g_per_opd[0] == (unsigned)CONC_THREADS * CONC_ITERS);
     assert(g_per_opd[3] == (unsigned)CONC_THREADS * CONC_ITERS);
     assert(g_per_opd[1] == 0 && g_per_opd[2] == 0);
 
-    puts("PASS: _sys_spu_printf_* store, dispatch, ESTAT-when-unregistered, finalize, threads");
+    hle_nid_path();
+
+    puts("PASS: _sys_spu_printf_* store, dispatch, ESTAT-when-unregistered, finalize, threads, "
+         "64-bit sign-extended r3 through the NID table");
     return 0;
 }
