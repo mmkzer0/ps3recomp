@@ -28,25 +28,23 @@
  *       call replaces the first.
  *   s32 _sys_spu_printf_finalize(void)
  *       Zeroes all four callbacks. Always CELL_OK.
- *   s64 _sys_spu_printf_attach_group(u32 group)    -> agcb(group)
- *   s64 _sys_spu_printf_detach_group(u32 group)    -> dgcb(group)
- *   s64 _sys_spu_printf_attach_thread(u32 thread)  -> atcb(thread)
- *   s64 _sys_spu_printf_detach_thread(u32 thread)  -> dtcb(thread)
+ *   s32 _sys_spu_printf_attach_group(u32 group)    -> agcb(group)
+ *   s32 _sys_spu_printf_detach_group(u32 group)    -> dgcb(group)
+ *   s32 _sys_spu_printf_attach_thread(u32 thread)  -> atcb(thread)
+ *   s32 _sys_spu_printf_detach_thread(u32 thread)  -> dtcb(thread)
  *       The matching callback is a guest function s32 cb(u32 id). If it is NULL
  *       (never initialised, or finalised) the result is CELL_ESTAT and nothing
  *       is called; otherwise the callback runs on the caller's thread and its
- *       return value is the function's return value, unchanged. The firmware
- *       signature is s32; the host return type is s64 holding that s32
- *       sign-extended, because these four are dispatched by the generic HLE
- *       adapter (runtime/ppu/ppu_hle.cpp hle_generic), which copies the full
- *       64-bit return into guest r3. A host s32 return leaves the upper half
- *       of x0/rax unspecified (zero on arm64): CELL_ESTAT would reach the guest
- *       as 0x000000008001000F instead of 0xFFFFFFFF8001000F.
+ *       return value is the function's return value, unchanged. These keep the
+ *       firmware's s32 signature: the HLE adapter (ppu_hle_adapt.hpp) calls
+ *       them through it and sign-extends a 32-bit signed result into r3, so
+ *       CELL_ESTAT reaches the guest as 0xFFFFFFFF8001000F.
  *
- * The firmware PRX that exports these (liblv2) is not among the PRXes under
- * ~/ps3-recon/odin-sphere-m0/fw/sprx/, so RPCS3 is the only primary source for
- * the return codes; whether the retail initialize rejects a second call is not
- * established. This implementation follows RPCS3 (replace).
+ * Evidence anchor: the retail firmware set examined locally does not contain
+ * a liblv2 PRX exporting these symbols, so RPCS3 (rpcs3/Emu/Cell/Modules/
+ * sys_spu_.cpp, commit cd87a646219024b136f7cc4d0ceeb1a19d5c43ad) is the
+ * reference for the return codes; whether the retail initialize rejects a
+ * second call is not established. This implementation follows RPCS3 (replace).
  *
  * Thread safety: RPCS3 keeps bare globals. Guest threads are host threads here,
  * so the four OPDs live behind one lock and every attach/detach takes a
@@ -114,32 +112,33 @@ s32 _sys_spu_printf_finalize(void)
     return CELL_OK;
 }
 
-static s64 spu_printf_dispatch(int which, u32 id)
+static s32 spu_printf_dispatch(int which, u32 id)
 {
     spu_printf_lock();
     const u32 opd = s_spu_printf_cb[which];
     spu_printf_unlock();
     if (!opd)
-        return (s64)(s32)CELL_ESTAT;
-    return (s64)(s32)(u32)ppu_guest_call(opd, id, 0, 0, 0, 0, 0, 0, 0);
+        return (s32)CELL_ESTAT;
+    /* The callback's own r3 above the low word is not part of an s32 result. */
+    return (s32)(u32)ppu_guest_call(opd, id, 0, 0, 0, 0, 0, 0, 0);
 }
 
-s64 _sys_spu_printf_attach_group(u32 group)
+s32 _sys_spu_printf_attach_group(u32 group)
 {
     return spu_printf_dispatch(SPU_PRINTF_ATTACH_GROUP, group);
 }
 
-s64 _sys_spu_printf_detach_group(u32 group)
+s32 _sys_spu_printf_detach_group(u32 group)
 {
     return spu_printf_dispatch(SPU_PRINTF_DETACH_GROUP, group);
 }
 
-s64 _sys_spu_printf_attach_thread(u32 thread)
+s32 _sys_spu_printf_attach_thread(u32 thread)
 {
     return spu_printf_dispatch(SPU_PRINTF_ATTACH_THREAD, thread);
 }
 
-s64 _sys_spu_printf_detach_thread(u32 thread)
+s32 _sys_spu_printf_detach_thread(u32 thread)
 {
     return spu_printf_dispatch(SPU_PRINTF_DETACH_THREAD, thread);
 }

@@ -21,6 +21,7 @@
  * tests/smoke/, which is the same harness with a synthetic program in it and
  * is what proves this path runs at all on POSIX.
  */
+#include <atomic>
 #include <stdarg.h>
 #include "ppu_recomp.h"
 #include "ps3emu/milestone.h"   /* ps3_ms / ps3_ms_kv -- boot milestone log */
@@ -167,8 +168,15 @@ extern "C" char* (__cdecl* __imp_getenv)(const char*) = cached_getenv;
  * access violation means a HOST pointer deref (e.g. a bad function pointer or a
  * runtime-struct walk). Print the faulting address and the RIP as a module
  * offset (RVA) so it can be symbolized with llvm-symbolizer against the PDB. */
-extern "C" uint32_t    g_last_hle_nid;    /* ppu_hle.cpp breadcrumb */
-extern "C" const char* g_last_hle_name;
+extern "C" std::atomic<uint32_t>    g_last_hle_nid;    /* ppu_hle.cpp breadcrumb */
+extern "C" std::atomic<const char*> g_last_hle_name;
+
+static uint32_t hle_last_nid() { return g_last_hle_nid.load(std::memory_order_relaxed); }
+static const char* hle_last_name()
+{
+    const char* n = g_last_hle_name.load(std::memory_order_relaxed);
+    return n ? n : "";
+}
 
 extern "C" PPU_THREAD_LOCAL ppu_context* g_active_ctx;
 static LONG WINAPI ydkj_crash_filter(EXCEPTION_POINTERS* ep)
@@ -177,7 +185,7 @@ static LONG WINAPI ydkj_crash_filter(EXCEPTION_POINTERS* ep)
     fprintf(stderr, "\n[CRASH] code=0x%08lX rip=%p\n",
             (unsigned long)er->ExceptionCode, er->ExceptionAddress);
     fprintf(stderr, "[CRASH] last HLE NID 0x%08X (%s)\n",
-            g_last_hle_nid, g_last_hle_name ? g_last_hle_name : "");
+            hle_last_nid(), hle_last_name());
     if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2)
         fprintf(stderr, "[CRASH] %s fault address 0x%llX\n",
                 er->ExceptionInformation[0] ? "write" : "read",
@@ -214,7 +222,7 @@ static LONG WINAPI ydkj_crash_filter(EXCEPTION_POINTERS* ep)
 static void ydkj_abort_handler(int)
 {
     fprintf(stderr, "\n[ABORT] SIGABRT raised; last HLE NID 0x%08X (%s)\n",
-            g_last_hle_nid, g_last_hle_name ? g_last_hle_name : "");
+            hle_last_nid(), hle_last_name());
     void* frames[32];
     USHORT n = RtlCaptureStackBackTrace(0, 32, frames, NULL);
     HMODULE self = NULL;
@@ -571,8 +579,8 @@ static DWORD WINAPI vblank_ticker(LPVOID)
     return 0;
 }
 
-extern "C" uint32_t    g_last_hle_nid;
-extern "C" const char* g_last_hle_name;
+extern "C" std::atomic<uint32_t>    g_last_hle_nid;
+extern "C" std::atomic<const char*> g_last_hle_name;
 
 /* Windows-only from here to the end of hang_watchdog. Snapshotting every
  * OTHER thread and reading its instruction pointer needs tlhelp32 plus
@@ -600,13 +608,13 @@ static __declspec(thread) char   s_dbg_capbuf[16384];
 static __declspec(thread) char*  s_dbg_cap = NULL;
 static __declspec(thread) size_t s_dbg_capn = 0;
 
-extern "C" const char* g_hle_inflight[];   /* ppu_hle.cpp; 64 entries */
+extern "C" std::atomic<const char*> g_hle_inflight[];   /* ppu_hle.cpp; 64 entries */
 extern "C" void ppu_report_guest_lrs(void); /* ppu_loader.cpp */
 
 static void dump_threads(const char* label, HMODULE self)
 {
     dbg_printf( "[WATCHDOG] %s; last HLE call = 0x%08X (%s)\n",
-            label, g_last_hle_nid, g_last_hle_name ? g_last_hle_name : "");
+            label, hle_last_nid(), hle_last_name());
 
     /* Which HLE each guest thread is INSIDE right now.
      *
@@ -619,7 +627,7 @@ static void dump_threads(const char* label, HMODULE self)
      * case this answers. */
     { int any = 0;
       for (unsigned t = 0; t < 64u; t++) {
-          const char* n = g_hle_inflight[t];
+          const char* n = g_hle_inflight[t].load(std::memory_order_relaxed);
           if (!n) continue;
           if (!any) { dbg_printf("[WATCHDOG] guest threads inside an HLE:\n"); any = 1; }
           dbg_printf("[WATCHDOG]   guest-tid %-3u in %s\n", t, n);
@@ -977,13 +985,13 @@ static DWORD WINAPI debug_console(LPVOID param)
         } else if (!strcmp(verb, "prof") && sscanf(cmd, "%*s %u %u", &a, &b) >= 1) {
             dbg_prof((DWORD)a, b ? b : 5);
         } else if (!strcmp(verb, "hle")) {
-            dbg_printf("  last HLE = 0x%08X (%s)%c", g_last_hle_nid,
-                       g_last_hle_name ? g_last_hle_name : "", 10);
+            dbg_printf("  last HLE = 0x%08X (%s)%c", hle_last_nid(),
+                       hle_last_name(), 10);
         } else if (!strcmp(verb, "stat")) {
             dbg_printf("  uptime   %.1f s%c", (GetTickCount() - t0) / 1000.0, 10);
             dbg_printf("  flips    %u%c", cellGcm_flip_request_count(), 10);
-            dbg_printf("  last HLE 0x%08X (%s)%c", g_last_hle_nid,
-                       g_last_hle_name ? g_last_hle_name : "", 10);
+            dbg_printf("  last HLE 0x%08X (%s)%c", hle_last_nid(),
+                       hle_last_name(), 10);
             dbg_printf("  vm_base  %s%c", vm_base ? "live" : "not mapped", 10);
         } else if (!strcmp(verb, "mem") && sscanf(cmd, "%*s %x %u", &a, &b) >= 1) {
             dbg_mem(a, b);

@@ -17,6 +17,7 @@ if os.name == 'nt':
     raise SystemExit(0)
 
 FIXTURE = r'''
+#include "ppu_hle_adapt.hpp"
 #include "libs/spurs/cellSpurs.h"
 #include <cassert>
 #include <cstdint>
@@ -30,8 +31,8 @@ uint8_t* vm_base;
 uint32_t ppu_vm_size;
 void register_exit_code_fixture(void);
 }
-static void* handler;
-extern "C" void ps3_hle_register(unsigned nid, const char*, void* fn) {
+static ps3_hle_fn handler;
+extern "C" void ps3_hle_register(uint32_t nid, const char*, ps3_hle_fn fn) {
     assert(nid == 0x34552FA6u);
     assert(!handler);
     handler = fn;
@@ -46,10 +47,14 @@ static bool all_bytes(unsigned begin, unsigned end, uint8_t value) {
     for (unsigned i=begin; i<end; ++i) if (memory[i]!=value) return false;
     return true;
 }
+/* Exactly what ps3_hle_call does: the adapter derives the declared type, so the
+ * argument is the guest r3 and the result is the s32 sign-extended into r3. */
 static uint32_t call(uint64_t ea) {
-    using Entry = int32_t (*)(CellSpursTaskExitCode*);
-    return static_cast<uint32_t>(reinterpret_cast<Entry>(handler)(
-        reinterpret_cast<CellSpursTaskExitCode*>(static_cast<uintptr_t>(ea))));
+    ppu_context ctx;
+    std::memset(&ctx, 0, sizeof ctx);
+    ctx.gpr[3] = ea;
+    handler(&ctx);
+    return static_cast<uint32_t>(ctx.gpr[3]);
 }
 int main() {
     register_exit_code_fixture();
@@ -100,14 +105,15 @@ with tempfile.TemporaryDirectory(prefix='spurs-exit-initialize-') as name:
              if 'ps3_hle_register(0x34552FA6u,' in line]
     assert len(entries)<=1
     registration=tmp/'registration.cpp'
-    registration.write_text('extern "C" void ps3_hle_register(unsigned,const char*,void*);\n'
-        'extern "C" void cellSpursTaskExitCodeInitialize(void);\n'
+    registration.write_text('#include "ppu_hle_adapt.hpp"\n'
+        '#include "libs/spurs/cellSpurs.h"\n'
         'extern "C" void register_exit_code_fixture(void) {\n'+
         '\n'.join(entries)+'\n}\n')
     fixture=tmp/'fixture.cpp'; fixture.write_text(FIXTURE)
     obj=tmp/'spurs.o'; binary=tmp/'fixture'
     common=['-O1','-UNDEBUG','-ffunction-sections','-fdata-sections',
-            '-I'+str(ROOT),'-I'+str(ROOT/'include'),'-I'+str(ROOT/'runtime/spu')]
+            '-I'+str(ROOT),'-I'+str(ROOT/'include'),'-I'+str(ROOT/'runtime/ppu'),
+            '-I'+str(ROOT/'runtime/spu')]
     subprocess.run([os.environ.get('CC','cc'),'-std=gnu17',*common,'-c',
                     str(ROOT/'libs/spurs/cellSpurs.c'),'-o',str(obj)],check=True)
     linker=['-Wl,-dead_strip'] if platform.system()=='Darwin' else ['-Wl,--gc-sections']

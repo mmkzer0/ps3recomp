@@ -178,7 +178,19 @@ Compile the result into the port along with the lifted sources. It defines
 `ppu_hle_register_all()`, which `ppu_hle_init()` calls at startup;
 `runtime/ppu/ppu_hle.cpp` carries a weak do-nothing version so a build without
 it still links, which is why the omission is not a build error. The runtime
-warns at startup when it ends up with no handlers registered.
+warns at startup when it ends up with no handlers registered (and the first
+import then stops as `unresolved-nid`, not with a made-up return).
+
+The generated unit includes `ppu_hle_adapt.hpp` and every module header by
+repository-relative path (`libs/<dir>/<module>.h`), and calls each handler
+through `ps3_hle_adapt<&handler>`, which derives the handler's real C type.
+`cmake/PS3RecompPPU.cmake`'s `ps3recomp_ppu_hle_nids(...)` puts the three
+include directories the unit needs (toolkit root, `runtime/ppu`, `include`) on
+that **source file only**, so a title that links `ps3recomp_runtime` does not
+have to add them itself and its other translation units never see `libs/*`. A
+hand-rolled build outside that CMake function must add the toolkit root to the
+generated unit's include path. See [HLE_ABI.md](HLE_ABI.md) for the mapping and
+for the classification a pointer-returning handler needs.
 
 **The project template does this for you.** Its `CMakeLists.txt` generates the
 every-module table at configure time unless `recompiled/ppu_hle_nids.cpp`

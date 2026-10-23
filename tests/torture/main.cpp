@@ -17,6 +17,7 @@
  *                     e.g. the newlib dtoa infinite loop class of lifter bug)
  *   - clean finish -> exit 0; the text output carries pass/fail counts
  */
+#include <atomic>
 #include "ppu_recomp.h"
 #include <stdint.h>
 #include <stdio.h>
@@ -40,8 +41,15 @@ void     ps3_load_prx_modules(void) {}
 #include <windows.h>
 #include <tlhelp32.h>
 
-extern "C" uint32_t    g_last_hle_nid;    /* ppu_hle.cpp breadcrumb */
-extern "C" const char* g_last_hle_name;
+extern "C" std::atomic<uint32_t>    g_last_hle_nid;    /* ppu_hle.cpp breadcrumb */
+extern "C" std::atomic<const char*> g_last_hle_name;
+
+static uint32_t hle_last_nid() { return g_last_hle_nid.load(std::memory_order_relaxed); }
+static const char* hle_last_name()
+{
+    const char* n = g_last_hle_name.load(std::memory_order_relaxed);
+    return n ? n : "";
+}
 extern "C" PPU_THREAD_LOCAL ppu_context* g_active_ctx;
 
 static LONG WINAPI torture_crash_filter(EXCEPTION_POINTERS* ep)
@@ -50,7 +58,7 @@ static LONG WINAPI torture_crash_filter(EXCEPTION_POINTERS* ep)
     fprintf(stderr, "\n[CRASH] code=0x%08lX rip=%p\n",
             (unsigned long)er->ExceptionCode, er->ExceptionAddress);
     fprintf(stderr, "[CRASH] last HLE NID 0x%08X (%s)\n",
-            g_last_hle_nid, g_last_hle_name ? g_last_hle_name : "");
+            hle_last_nid(), hle_last_name());
     if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2)
         fprintf(stderr, "[CRASH] %s fault address 0x%llX\n",
                 er->ExceptionInformation[0] ? "write" : "read",
@@ -95,7 +103,7 @@ static DWORD WINAPI torture_watchdog(LPVOID)
                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                        (LPCSTR)&torture_watchdog, &self);
     fprintf(stderr, "\n[TIMEOUT] guest still running after %d s; last HLE 0x%08X (%s)\n",
-            secs, g_last_hle_nid, g_last_hle_name ? g_last_hle_name : "");
+            secs, hle_last_nid(), hle_last_name());
     DWORD me = GetCurrentThreadId(), pid = GetCurrentProcessId();
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     THREADENTRY32 te; te.dwSize = sizeof te;

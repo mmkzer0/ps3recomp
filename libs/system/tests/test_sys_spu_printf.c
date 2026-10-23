@@ -5,10 +5,10 @@
  *
  * Two ways in. Direct C calls check the store/dispatch/finalize logic and the
  * lock under threads. The generated NID table + the real ppu_hle.cpp
- * (ps3_hle_call) check what a title sees: the attach/detach result reaches
- * guest r3 as the s32 SIGN-EXTENDED to 64 bits (0xFFFFFFFF8001000F for
- * CELL_ESTAT), not zero-extended, since the generic adapter copies the
- * handler's whole 64-bit return into r3.
+ * (ps3_hle_call) check what a title sees: the handler's declared type is the
+ * firmware's s32, so the typed adapter (runtime/ppu/ppu_hle_adapt.hpp)
+ * sign-extends the result into guest r3 (0xFFFFFFFF8001000F for CELL_ESTAT),
+ * not zero-extended.
  *
  * Built and run by tools/test_sys_spu_printf.py. ppu_guest_call is faked: it
  * records (opd, args) and returns a value the test chooses. */
@@ -64,7 +64,7 @@ static void reset_rec(u64 ret)
 
 /* One dispatch: exact result, exactly one call, to `opd`, with `id` in r3 and
  * nothing else touched. */
-static void expect_dispatch(s64 (*fn)(u32), u32 id, u32 opd, u64 guest_r3, s32 want)
+static void expect_dispatch(s32 (*fn)(u32), u32 id, u32 opd, u64 guest_r3, s32 want)
 {
     reset_rec(guest_r3);
     assert(fn(id) == want);
@@ -76,7 +76,7 @@ static void expect_dispatch(s64 (*fn)(u32), u32 id, u32 opd, u64 guest_r3, s32 w
 
 static void expect_unregistered(void)
 {
-    s64 (*const fns[4])(u32) = {
+    s32 (*const fns[4])(u32) = {
         _sys_spu_printf_attach_group, _sys_spu_printf_detach_group,
         _sys_spu_printf_attach_thread, _sys_spu_printf_detach_thread };
     for (int i = 0; i < 4; i++) {
@@ -204,7 +204,7 @@ static void hle_nid_path(void)
 
 int main(void)
 {
-    s64 (*const fns[4])(u32) = {
+    s32 (*const fns[4])(u32) = {
         _sys_spu_printf_attach_group, _sys_spu_printf_detach_group,
         _sys_spu_printf_attach_thread, _sys_spu_printf_detach_thread };
     const u32 opds[4] = { OPD_AG, OPD_DG, OPD_AT, OPD_DT };

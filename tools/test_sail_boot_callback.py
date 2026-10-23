@@ -20,7 +20,8 @@ def main():
         tmp=Path(tmp)
         (tmp/'ppu_recomp.h').write_text('#include "ppu_context.h"\n')
         subprocess.run([sys.executable,str(root/'tools/gen_hle_nids.py'),'cellSail','--out',str(tmp/'nids.cpp')],check=True,timeout=15)
-        includes=['-I'+str(p) for p in (root/'include',root/'runtime/ppu',tmp)]
+        # root: the generated table includes libs/... headers by repository path.
+        includes=['-I'+str(p) for p in (root,root/'include',root/'runtime/ppu',tmp)]
         subprocess.run([os.environ.get('CC','cc'),'-std=gnu17','-O1','-UNDEBUG',*includes,'-c',str(root/'libs/codec/cellSail.c'),'-o',str(tmp/'sail.o')],check=True,timeout=30)
         subprocess.run([os.environ.get('CXX','c++'),'-std=c++17','-O1','-UNDEBUG',*includes,str(root/'tests/test_sail_boot_callback.cpp'),str(root/'runtime/ppu/ppu_hle.cpp'),*loader_support_sources(),str(tmp/'nids.cpp'),str(tmp/'sail.o'),'-o',str(tmp/'fixture')],check=True,timeout=45)
         env={k:v for k,v in os.environ.items() if k in ('PATH','HOME','TMPDIR','SYSTEMROOT')}

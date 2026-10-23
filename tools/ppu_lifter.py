@@ -93,7 +93,13 @@ typedef union {
 
 /* Field order and types match runtime/ppu/ppu_context.h exactly, so the
  * same pointer can flow between recompiled code and runtime syscall
- * handlers without layout drift. Keep the two in sync. */
+ * handlers without layout drift. Keep the two in sync.
+ *
+ * PPU_CONTEXT_DEFINED says "a ppu_context exists in this translation unit";
+ * runtime/ppu/ppu_hle_adapt.hpp includes ppu_context.h only when this marker
+ * is absent, because ppu_hle.cpp includes THIS header first and the two
+ * definitions must not meet. */
+#define PPU_CONTEXT_DEFINED 1
 typedef struct ppu_context {
     uint64_t gpr[32];   /* General-purpose registers  */
     double   fpr[32];   /* Floating-point registers   */

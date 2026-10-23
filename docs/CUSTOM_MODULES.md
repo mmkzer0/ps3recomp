@@ -165,21 +165,37 @@ s32 cellFooDecDecode(u32 handle, const CellFooDecSrc* src, CellFooDecInfo* info)
 
 Add your source file to the runtime library's source list in the top-level `CMakeLists.txt`.
 
-### 4. Register in Game Projects
+### 4. Register
 
-In the game's `hle_modules.cpp`, create bridge functions and register by NID:
+Nothing to write by hand. `tools/gen_hle_nids.py --all` finds the non-static
+function definitions, computes each NID and emits
 
 ```c
-static int64_t bridge_cellFooDecCreate(ppu_context* ctx) {
-    uint32_t handle_addr = (uint32_t)ctx->gpr[3];
-    u32 host_handle = 0;
-    s32 rc = cellFooDecCreate(&host_handle);
-    if (rc == CELL_OK && handle_addr)
-        vm_write32(handle_addr, host_handle);
-    ctx->gpr[3] = (uint64_t)(int64_t)rc;
-    return rc;
+ps3_hle_register(0x........u, "cellFooDecCreate",
+                 &ps3_hle_adapt<&cellFooDecCreate>);
+```
+
+into `ppu_hle_register_all()`, which `ppu_hle_init()` calls at startup. The
+adapter in `runtime/ppu/ppu_hle_adapt.hpp` derives the declared C type, so the
+function keeps its real signature; declare it in the module header (the
+generated unit includes that header, and an undeclared handler is a build
+error at its name). Pointer arguments are guest effective addresses; translate
+them inside the implementation with `GUEST_PTR`:
+
+```c
+s32 cellFooDecCreate(void* handle) {
+    u32* out = GUEST_PTR(handle, u32*);   /* the guest EA, NULL preserved */
+    ...
 }
 ```
+
+If the call shape cannot be expressed as a C signature (extra arguments the
+adapter cannot place, register side effects), register a context-aware handler
+with `ps3_hle_register_ctx` instead and marshal `ppu_context` yourself — see
+[NID_SYSTEM.md](NID_SYSTEM.md#hle-dispatch-plain-handlers-and-context-aware-handlers).
+Returning a pointer is a classified case: a guest EA uses
+`ps3_hle_adapt_guest_ea`, a host pointer is rejected. See
+[HLE_ABI.md](HLE_ABI.md).
 
 ---
 
@@ -266,7 +282,12 @@ This is simpler than dynamic allocation and matches PS3 behavior (fixed limits p
 
 ## Calling Convention Bridge
 
-When recompiled code calls an HLE function, the call goes through an import stub that dispatches via NID. The handler receives a `ppu_context*` with the full PPC64 register state.
+When recompiled code calls an HLE function, the import stub dispatches via
+`ps3_hle_call(<NID>, ctx)`. A plain handler keeps its declared C signature: the
+generated table registers `ps3_hle_adapt<&handler>`, which maps the PPC64
+ELFv1 state onto that signature and the result back (see
+[HLE_ABI.md](HLE_ABI.md)). You only write a `ppu_context` bridge when the call
+shape cannot be expressed as a C signature (`ps3_hle_register_ctx`).
 
 ### PPC64 ABI Register Usage
 
@@ -274,31 +295,32 @@ When recompiled code calls an HLE function, the call goes through an import stub
 |----------|---------|
 | r3-r10 | Integer/pointer arguments (first 8 args) |
 | f1-f13 | Floating-point arguments |
-| r3 | Integer return value |
+| r3 | Integer return value (sign-extend an `s32` yourself) |
 | f1 | Float return value |
-| r1 | Stack pointer |
+| r1 | Stack pointer; the caller's parameter save area is at `r1+48+8*i` for arg `i>=8` |
 | r2 | TOC (Table of Contents) base |
 | r13 | TLS base |
 
-### Bridge Function Template
+### Context-Aware Bridge Template
 
 ```c
-static int64_t bridge_cellFooBar(ppu_context* ctx)
+static void hle_cellFooBar(ppu_context* ctx)
 {
     /* Extract arguments from GPRs */
     uint32_t arg1 = (uint32_t)ctx->gpr[3];
     uint32_t arg2 = (uint32_t)ctx->gpr[4];
 
-    /* For pointer arguments: translate guest → host */
+    /* For pointer arguments: translate guest → host (or use GUEST_PTR) */
     const char* str = (const char*)(vm_base + (uint32_t)ctx->gpr[5]);
 
     /* Call real implementation */
     s32 rc = cellFooBar(arg1, arg2, str);
 
-    /* Store return value */
-    ctx->gpr[3] = (uint64_t)(int64_t)rc;
-    return rc;
+    /* Store the return value, s32 sign-extended into r3 */
+    ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)rc;
 }
+...
+ps3_hle_register_ctx(0x........u, "cellFooBar", hle_cellFooBar);
 ```
 
 ### Output Struct Pattern
@@ -306,7 +328,7 @@ static int64_t bridge_cellFooBar(ppu_context* ctx)
 When the HLE writes a struct to guest memory, each field must be byte-swapped:
 
 ```c
-static int64_t bridge_cellFooGetInfo(ppu_context* ctx)
+static void hle_cellFooGetInfo(ppu_context* ctx)
 {
     uint32_t info_addr = (uint32_t)ctx->gpr[3];
 
@@ -319,8 +341,7 @@ static int64_t bridge_cellFooGetInfo(ppu_context* ctx)
         vm_write64(info_addr + 8, host_info.field3);
     }
 
-    ctx->gpr[3] = (uint64_t)(int64_t)rc;
-    return rc;
+    ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)rc;
 }
 ```
 
