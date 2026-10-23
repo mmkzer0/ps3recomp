@@ -501,6 +501,10 @@ if(PS3RECOMP_BUILD_TESTS)
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_game_patchcheck.py")
         set_tests_properties(game_patchcheck PROPERTIES LABELS "runtime;t0")
+        add_test(NAME sys_spu_printf
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_sys_spu_printf.py")
+        set_tests_properties(sys_spu_printf PROPERTIES LABELS "runtime;t0")
     endif()
 endif()
 
