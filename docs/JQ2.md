@@ -1,15 +1,19 @@
-# JobQueue2 ring codec and reference scheduler
+# JobQueue2 ring codec, reference scheduler and port line
 
-`libs/spurs/jq2/` holds two pieces of the `ps3recomp_spurs_jq2` library. Both are
-pure C++20, deterministic, and free of runtime, thread and clock dependencies.
+`libs/spurs/jq2/` holds three pieces of the `ps3recomp_spurs_jq2` library. The
+codec and the scheduler are pure C++20, deterministic, and free of runtime,
+thread and clock dependencies; the port model's logic is too, and only its guest
+binding reaches into the runtime (see Port line).
 
 - `ring.hpp/.cpp`: the 8-byte command-ring entry codec.
 - `sched.hpp/.cpp`: a queue-level model of the SPU policy module's (PM's) intake,
   used as the oracle for the HLE executor.
+- `port.hpp/.cpp`: the port line, the PPU/SPU completion accounting a Port2 push
+  and Port2Sync share with the PM.
 
 Tests: `tests/spurs_jq2/` (`ctest --preset t0 -R jq2`). Evidence ids (`jq2fw-*`,
-`m1r-*`, `jq2co-*`) refer to the research repository's fact files; the codec and
-scheduler headers carry the per-field citations.
+`m1r-*`, `jq2co-*`, `jq2c-*`) refer to the research repository's fact files; the
+headers carry the per-field citations.
 
 ## Codec
 
@@ -120,3 +124,93 @@ writer that stored the wrong w1 bit 0, or has not finished the write) and
 `rewrite_entry(index, entry, phase)` (the writer completing it). An entry whose
 bit 0 differs from the expected phase ends the pass without being dispatched or
 consumed, and is not stepped over, until it is rewritten with the right phase.
+
+## Port line
+
+A port is a 128-byte, 128-aligned guest block. Four big-endian words carry the
+accounting; nothing else in the block is read or written by this module:
+
+| Offset | Word | Writer |
+|---|---|---|
+| `+0x00` | completion `A`: bits 28:0 count (compared as a signed 29-bit value), bits 31:29 Sync waiter state | PM (`A+1`), Port2Sync (`A-B`, registration) |
+| `+0x04` | waiter id (fiber EA or event-flag slot), stale after a wake | Port2Sync |
+| `+0x10` | submitted `B` | push (`B+1`, rollback `B-1`), Port2Sync (`B := 0`) |
+| `+0x14` | claim, byte 0 only | Port2Sync |
+
+Every operation is one critical section on the line in the reservation model
+(`resv_host_rmw`, `runtime/memory/reservation.{h,c}`): the same lock order and
+invalidation as a `stdcx.` that lands. An SPU `GETLLAR` reservation or a PPU
+`lwarx`/`ldarx` on the line therefore dies when the host stores, and a host
+operation that stores nothing (a BUSY, an AGAIN) kills nothing. `port.hpp` layers
+the rules as `PortWords` (pure transitions), `LocalPortLine` (single-threaded,
+the unit-test and trace-replay oracle), `GuestPortLine` (guest memory through
+`resv_host_rmw`) and `BasicPort<Line>` (the operations over either).
+
+| Operation | Effect | Evidence |
+|---|---|---|
+| `try_submit` (push with `flags&1`) | `B += 1` iff claim byte is 0 and `B <= 0x0FFFFFFE`; else BUSY `0x80410A0A`, port untouched | jq2c-007, `0x02004D70-0x02004DC0` |
+| `rollback_submit` (enqueue failed) | claim byte 0: `B -= 1` mod 2^32; claim held: BUSY | jq2c-007, `0x02004B8C-0x02004BC4`, JQ-CLOSURE-REVIEW finding 4 |
+| `push_accounted(enqueue)` | submit, enqueue, rollback on failure; a blocked rollback returns BUSY in place of the enqueue error | `0x02004BAC -> 0x02004C10` |
+| `credit_completion` (PM, per job without its own semaphore) | `A := (A+1) mod 2^29`; bits 30:29 kept; bit 31 kept unless `A == -1`, which clears it and makes the PM's release call due (`Wakeup{kind = bits 30:29, id = +0x04}`) | jq2c-009/010, PM `0x3404-0x3454` |
+| `sync(mode, wait)` (Port2Sync) | `mode & ~7`: INVAL `0x80410A02`. Claim (BUSY if held). Stale waiter bit: BUSY. `B > 0x0FFFFFFF`: INVAL. `sext29(A) >= B`: `A := A-B` (bits 31:29 kept), OK. Else mode bit 2: AGAIN `0x80410A01`; else register and block. Every path clears the claim; only OK zeroes `B`; AGAIN, BUSY and INVAL leave `A` and `B` | jq2c-001..004, `0x020045D8-0x020046F0`, `0x02003018-0x0200339C` |
+
+Guards a caller applies first (`check_port_ea`): null `0x80410A11`, not
+128-aligned `0x80410A10`.
+
+### Corrections and findings from decoding
+
+- **Credit keeps bits 30:29.** JQ-CLOSURE-STATIC B.2 says the PM "clears bits
+  30..29"; jq2c-010 left bits 31..29 unverified. The PM dataflow at LS
+  `0x3404-0x3444` (`fw/re/jq_pm.dis`) takes bits 28:0 from `A+1` through the
+  `0x1FFFFFFF` select and every other bit from the old word, except bit 31, which
+  is masked by `A != -1`. The traced `0x80000005 -> 0x80000006` agrees with both
+  readings; a word with bit 30 or 29 set separates them. The tests compare the
+  model with a transliteration of the SPU operation sequence over 200000 random
+  words and a bit-pattern grid.
+- **A blocking Sync registers, then sleeps.** `0x02003104-0x0200337C` stores
+  `A-B` (negative) with bit 31 set, bits 30:29 = the wait kind (0 fiber, 2 event
+  flag) and `+0x04` = the waiter id in one doubleword update, then waits. Each PM
+  credit adds one; when `A` passes from -1 to 0 the PM clears bit 31 and issues the
+  release call (`LS 0x3454-0x3488` into helper `0xB28`: mode = bits 30:29, EA =
+  `+0x04`). The waiter returns OK without re-reading `A`. `sync()` models this
+  with a three-call `SyncWait` environment (`acquire`, `block`, `release`); the
+  event-flag or fiber wait itself is the executor's. After a wake `+0x04` stays
+  stale and `A`'s bits 30:29 keep the wait kind (`0x40000000` after an
+  event-flag wait); neither blocks the next Sync.
+- **No traced Sync reached the registration path.** All 4106 traced port dumps
+  have bits 31:29 of `A`, the `+0x04` word and the claim word zero. A Sync that
+  had to wait would leave its id in `+0x04`.
+- **Firmware hazards kept, not fixed.** (1) A rollback that meets a Sync claim
+  returns BUSY and leaves the failed push's `B += 1` in place: that `B` can never
+  be credited, so a later blocking Sync waits forever. (2) A rollback after a
+  Sync reaped the push leaves `B = 0xFFFFFFFF`. Both are the firmware's and are
+  pinned by tests; the executor must not create the situations (a push whose
+  enqueue can fail should not race a Sync on the same port).
+- **Claim and BUSY ownership.** A Sync that loses the claim returns BUSY without
+  touching the claim byte; the owner's claim survives. A Sync that claimed
+  clears the byte on every return, including BUSY (stale waiter) and INVAL
+  (`B` above the bound).
+
+### How the port line is tested
+
+`tests/spurs_jq2/test_jq2_port.cpp` (labels `spurs;t0;tsan`; `jq2_port_race_stress`
+is `spurs;stress`):
+
+- `model`: every transition and code on `PortWords`/`LocalPort`: saturation at
+  `0x0FFFFFFF`, rollback, `sext29` wrap, modes 0..7 and the INVAL modes, AGAIN,
+  BUSY, INVAL, claim release on each path, registration and wake with spurious
+  wakes, credits arriving during `acquire`, and the credit against the
+  SPU-operation formulation.
+- `guest`: big-endian layout, bytes outside the four words, the guards, and the
+  reservation model's rule through the real PPU (`resv_*`) and SPU (`spu_wrch`
+  MFC) paths.
+- `claim`: a Port2Sync holding the claim makes a concurrent push return BUSY and
+  `B` stays exact.
+- `race N`: one SPU `GETLLAR`/`PUTLLC` credit loop, a pushing thread, a Sync
+  thread alternating modes 0 and 4, and a PPU `stwcx.` loop on other words of the
+  same line; final `A`, `B` and claim exact, the PPU counters exact, a 20 s
+  no-progress watchdog.
+
+The Odin-backed check is `tests/test_jq2_port_replay.cpp` in leifthrasir-recomp:
+it replays the `(A, B)` sequences of `jq-boot`, `closure` and `stall2` through
+`LocalPort`.
