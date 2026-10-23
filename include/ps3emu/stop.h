@@ -73,7 +73,13 @@ extern "C" {
     X(SPU_JOB_CRT_VERSION,      "spu-job-crt-version")                         \
     X(SPU_JOB_MEMORY,           "spu-job-memory")                              \
     X(SPU_JOB_JM_ENTRY,         "spu-job-jm-entry")                            \
-    X(SPU_JOB_DMA_LIST,         "spu-job-dma-list")
+    X(SPU_JOB_DMA_LIST,         "spu-job-dma-list")                            \
+    X(JQ2_POOL_RELEASE,         "jq2-pool-release")                            \
+    /* B4: the JobQueue2 HLE executor. */                                      \
+    X(JQ2_JOB_END,              "jq2-job-end")                                 \
+    X(JQ2_RING_ENTRY,           "jq2-ring-entry")                              \
+    X(JQ2_WAKE,                 "jq2-wake")                                    \
+    X(JQ2_STATE,                "jq2-state")
 
 /* A fixed underlying type in C++ makes a kind outside the list (a caller's bug,
  * which the stop still reports as "invalid-kind") a well-defined value rather

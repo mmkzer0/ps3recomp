@@ -133,7 +133,7 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 | Module | Category | Status | Notes |
 |---|---|---|---|
 | cellSpurs | SPURS | Partial | Management APIs, workloads, tasks, tasksets, event flags with real blocking (CRITICAL_SECTION/pthread condvars). Tasks, job chains and workloads run lifted SPU code; see SPU_LIFTER.md |
-| cellSpursJq | SPURS Job Queue | **Complete** | Job queue create/destroy, push with completion tracking, wait/tryWait with proper BUSY returns, port create/destroy, 16 max queues |
+| cellSpursJq | SPURS Job Queue | **Complete** | The 17 firmware exports a Port2 title imports, at their real signatures: 10/12-arg queue create, Shutdown/Join, Port2Create/Destroy, PushJobBody (descriptor fetched at admission), CopyPushJobBody (size-class pool, snapshot at push), PushSync/Port2Sync, attribute block. Executor in `libs/spurs/jq2/`; codes `0x80410A01/02/0A/0F/10/11`. Exports outside this surface are unregistered and stop as `unresolved-nid`, never `CELL_OK` |
 | cellDaisy | Daisy Chain | **Complete** | Lock-free FIFO pipes with real ring buffer, push/pop/try variants, 32 max pipes, 256 max depth, count/free queries |
 | cellFiber | Fiber | **Complete** | PPU fibers via Windows Fibers/ucontext: scheduler, create, RunFibers, WaitSignal/SendSignal, JoinFiber, Yield, Exit, Self |
 | cellSync | Sync Primitives | **Complete** | Atomic spinlock mutex, counter barrier, RWM, bounded queue, lock-free queue |

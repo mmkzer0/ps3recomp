@@ -79,9 +79,24 @@
  *   The PM's grab limit (maxGrab) and the secondary busy sets r36/r37
  *   (jq2co-003 Open) are not modelled; in-flight is the exact per-tag count
  *   over all instances.
- *   COPY, JOBLIST, FLUSH and unknown entries have no scheduling semantics in
- *   the evidence: push() rejects COPY/Unknown and a SYNC with an empty mask,
- *   and a pass that meets an unmodelled entry ends with `unsupported_entry`.
+ *   COPY is scheduled exactly as a JOB (the PM's decode sends types 0 and 2 to
+ *   one handler, jq2c-021): same tag, same barrier, dispatched as a JOB whose
+ *   descriptor is the pool slot. It is a modelled entry only when the
+ *   scheduler is configured with `copy_entries` (the HLE executor); the
+ *   default model rejects it as before. JOBLIST, FLUSH and unknown entries
+ *   have no scheduling semantics in the evidence: push() rejects a SYNC with an
+ *   empty mask and, without `copy_entries`, COPY and unknown entries, and a
+ *   pass that meets an unmodelled entry ends with `unsupported_entry`.
+ *
+ * Storage. The scheduling rules run over a RingStore: the entries, the read /
+ * write index and phase pair and the out-of-order marks. The default store is
+ * private memory (the deterministic model every B2 test drives). The HLE
+ * executor supplies a store over the guest queue (queue+0x00 indices and phase,
+ * the ring at queue+0x10, the marks at queue+0x180), so the rules and the PPU
+ * writer see the same guest bytes. Everything that is not ring storage (the
+ * per-tag counts, barriers and job slots) is the scheduler's own; a scheduler
+ * is not thread-safe, the executor serialises passes and completions, while
+ * ring_push() (the writer) is safe against them.
  */
 
 #ifndef PS3RECOMP_SPURS_JQ2_SCHED_HPP
@@ -92,6 +107,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <vector>
 
@@ -107,11 +123,64 @@ struct SchedConfig {
      * smallest depth the firmware PM accepted, m1r-015: 4; 8/16/32 identical).
      * Depths 1-3 are model-only geometries: accepted so the property tests get
      * wrap and phase flips every few pushes, with no firmware evidence behind
-     * the PM's behaviour on them. */
+     * the PM's behaviour on them. Ignored when the ring is supplied. */
     std::uint16_t depth = 128;
     unsigned instances = 2;          /* PM instances (SPUs) sharing the queue; >= 1 */
     unsigned slots_per_instance = 2; /* job slots per PM instance; >= 1 */
+    bool copy_entries = false;       /* schedule COPY as a JOB; see the header comment */
 };
+
+using EntryBytes = std::array<std::uint8_t, kEntryBytes>;
+
+/* One coherent view of the ring's index word. The ring holds `depth` entries;
+ * with equal indices it is empty when the phases are equal and full when they
+ * differ (the writer wrapped once more than the reader). */
+struct RingIndices {
+    std::uint16_t read = 0;
+    std::uint16_t write = 0;
+    bool read_phase = kInitialPhase;
+    bool write_phase = kInitialPhase;
+};
+
+/* Entries outstanding (pushed, not yet passed by the read index). */
+[[nodiscard]] constexpr std::uint16_t ring_outstanding(const RingIndices& ix, std::uint16_t depth) noexcept
+{
+    if (ix.read == ix.write) return ix.read_phase == ix.write_phase ? 0 : depth;
+    return static_cast<std::uint16_t>((ix.write + depth - ix.read) % depth);
+}
+
+/* Ring storage. Single reader (the scheduler), any number of writers: reserve()
+ * and store() are the writer's, everything else the reader's. A store must make
+ * each call atomic with respect to the others it names (the index word moves
+ * only through reserve() and advance_read()); an entry store is one 8-byte
+ * unit, so a reader sees an old or a new entry, never a torn one. */
+class RingStore {
+public:
+    struct Slot {
+        std::uint16_t index;
+        bool phase;
+    };
+
+    virtual ~RingStore() = default;
+    [[nodiscard]] virtual std::uint16_t depth() const noexcept = 0;
+    [[nodiscard]] virtual RingIndices indices() const noexcept = 0;
+    [[nodiscard]] virtual EntryBytes load(std::uint16_t index) const noexcept = 0;
+    virtual void store(std::uint16_t index, const EntryBytes& bytes) noexcept = 0;
+    [[nodiscard]] virtual bool out_of_order(std::uint16_t index) const noexcept = 0;
+    virtual void set_out_of_order(std::uint16_t index, bool marked) noexcept = 0;
+    /* The writer's slot: the next write index and the phase its entry carries,
+     * with the write index advanced (and the phase flipped on wrap). nullopt
+     * when `depth` entries are outstanding. The entry is stored afterwards; a
+     * reader that reaches the slot first sees the previous lap's entry, whose
+     * phase bit does not match. */
+    [[nodiscard]] virtual std::optional<Slot> reserve() noexcept = 0;
+    /* The reader moves the read index over `n` in-order entries, clearing each
+     * one's out-of-order mark and flipping the read phase on wrap. */
+    virtual void advance_read(unsigned n) noexcept = 0;
+};
+
+/* The private-memory store; nullptr for depth 0. */
+[[nodiscard]] std::unique_ptr<RingStore> make_local_ring(std::uint16_t depth);
 
 /* The PM's phase rule (measured on the firmware PM): it treats `w1_bit0` as a
  * written entry iff it equals `expected_phase`. */
@@ -120,7 +189,7 @@ struct SchedConfig {
 enum class PushError : std::uint8_t {
     none = 0,
     ring_full,          /* `depth` entries outstanding */
-    unsupported_entry,  /* COPY or UnknownEntry: no scheduling semantics */
+    unsupported_entry,  /* COPY (unless copy_entries) or UnknownEntry: no scheduling semantics */
     empty_sync_mask,    /* SYNC(0): no defined PM behaviour, refused */
     encode_failed,      /* the codec rejected the entry; see encode_error */
 };
@@ -133,6 +202,14 @@ struct PushResult {
     [[nodiscard]] bool ok() const noexcept { return error == PushError::none; }
 };
 
+/* The PPU writer over any store: refuses what the codec or the rules refuse
+ * (SYNC with an empty mask, a COPY unless `allow_copy`, an unknown entry) before
+ * taking a slot, then reserves and stores. `phase` overrides the phase bit the
+ * slot carries (a test hook; a real writer stores the slot's). Safe against a
+ * concurrent reader and other writers. */
+PushResult ring_push(RingStore& ring, const Entry& entry, bool allow_copy,
+                     std::optional<bool> phase = std::nullopt);
+
 /* A job the PM handed to a coroutine slot. `id` is unique and increases in
  * dispatch order. */
 struct Dispatch {
@@ -140,7 +217,10 @@ struct Dispatch {
     unsigned instance = 0;
     unsigned slot = 0;
     std::uint16_t ring_index = 0;
+    /* For a COPY, `job.descriptor_ea` is the pool slot holding the snapshot and
+     * `copy` is set; the tag, port and size are the entry's. */
     JobEntry job;
+    bool copy = false;
 };
 
 enum class PassEnd : std::uint8_t {
@@ -163,8 +243,15 @@ struct PassResult {
 
 class Scheduler {
 public:
-    /* nullopt when depth, instances or slots_per_instance is 0. */
+    /* nullopt when depth, instances or slots_per_instance is 0. The ring is
+     * private memory. */
     [[nodiscard]] static std::optional<Scheduler> create(const SchedConfig& config);
+
+    /* The same over a supplied ring; the depth is the ring's (config.depth is
+     * ignored). nullopt when the ring is null, has depth 0, or instances or
+     * slots_per_instance is 0. */
+    [[nodiscard]] static std::optional<Scheduler> create(const SchedConfig& config,
+                                                         std::unique_ptr<RingStore> ring);
 
     /* The PPU writer. JOB/SYNC only. The ring entry's w1 bit 0 is the queue's
      * write phase; the API flag lives in the JOB's port EA (JobEntry::port_ea
@@ -196,12 +283,15 @@ public:
     [[nodiscard]] std::uint16_t depth() const noexcept { return depth_; }
     [[nodiscard]] unsigned instances() const noexcept { return instances_; }
     [[nodiscard]] unsigned slots_per_instance() const noexcept { return slots_per_instance_; }
-    [[nodiscard]] std::uint16_t read_index() const noexcept { return read_; }
-    [[nodiscard]] std::uint16_t write_index() const noexcept { return write_; }
-    [[nodiscard]] bool read_phase() const noexcept { return read_phase_; }
-    [[nodiscard]] bool write_phase() const noexcept { return write_phase_; }
+    [[nodiscard]] std::uint16_t read_index() const noexcept { return ring_->indices().read; }
+    [[nodiscard]] std::uint16_t write_index() const noexcept { return ring_->indices().write; }
+    [[nodiscard]] bool read_phase() const noexcept { return ring_->indices().read_phase; }
+    [[nodiscard]] bool write_phase() const noexcept { return ring_->indices().write_phase; }
     /* Entries pushed and not yet passed by the read index. */
-    [[nodiscard]] std::uint16_t outstanding() const noexcept { return outstanding_; }
+    [[nodiscard]] std::uint16_t outstanding() const noexcept
+    {
+        return ring_outstanding(ring_->indices(), depth_);
+    }
     [[nodiscard]] unsigned inflight(unsigned tag) const noexcept;
     /* Tags currently barred, one bit per tag. */
     [[nodiscard]] std::uint16_t barred_mask() const noexcept { return barred_; }
@@ -210,8 +300,7 @@ public:
     [[nodiscard]] unsigned free_slots(unsigned instance) const noexcept;
     [[nodiscard]] const Dispatch* find_job(std::uint32_t dispatch_id) const noexcept;
     /* Raw ring bytes at a slot, exactly as the writer stored them. */
-    [[nodiscard]] const std::array<std::uint8_t, kEntryBytes>& ring_entry(
-        std::uint16_t index) const noexcept;
+    [[nodiscard]] EntryBytes ring_entry(std::uint16_t index) const noexcept;
     /* True when the entry at `index` was consumed behind a retained entry and
      * the read index has not yet passed it. */
     [[nodiscard]] bool consumed_out_of_order(std::uint16_t index) const noexcept;
@@ -222,26 +311,22 @@ public:
     [[nodiscard]] std::uint16_t sync_barred_tags(std::uint16_t index) const noexcept;
 
 private:
-    Scheduler(std::uint16_t depth, unsigned instances, unsigned slots_per_instance);
+    Scheduler(std::unique_ptr<RingStore> ring, unsigned instances, unsigned slots_per_instance,
+              bool copy_entries);
 
     /* The out-of-order mark; see the header comment. */
     void mark_consumed_out_of_order(std::uint16_t index);
 
     void release_satisfied_barriers() noexcept;
-    void advance_read(unsigned in_order_entries) noexcept;
+    PushResult push_impl(const Entry& entry, std::optional<bool> phase);
 
     std::uint16_t depth_;
     unsigned instances_;
     unsigned slots_per_instance_;
+    bool copy_entries_;
 
-    std::vector<std::array<std::uint8_t, kEntryBytes>> ring_;
-    std::vector<std::uint8_t> out_of_order_;
+    std::unique_ptr<RingStore> ring_;
     std::vector<std::uint16_t> sync_fresh_;
-    std::uint16_t read_ = 0;
-    std::uint16_t write_ = 0;
-    bool read_phase_ = kInitialPhase;
-    bool write_phase_ = kInitialPhase;
-    std::uint16_t outstanding_ = 0;
 
     std::array<unsigned, kTagCount> inflight_{};
     std::uint16_t barred_ = 0;

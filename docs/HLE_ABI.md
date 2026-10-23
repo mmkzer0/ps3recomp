@@ -26,9 +26,10 @@ handler's name in the instantiation context.
 
 The save-area offset is the ELFv1 one and is already used elsewhere in the
 runtime: `libs/network/sceNpScore.c`'s `stack_arg` reads the ninth argument at
-`r1 + 112` (`48 + 8*8`). Census: three registered handlers take more than eight
-parameters (`cellGcmSetZcull` 12, `cellSaveDataListAutoLoad` 9,
-`cellSpursWorkloadAttributeInitialize` 9).
+`r1 + 112` (`48 + 8*8`). Census: five registered handlers take more than eight
+parameters (`_cellSpursCreateJobQueueWithJobDescriptorPool` 12,
+`cellGcmSetZcull` 12, `_cellSpursCreateJobQueue` 10,
+`cellSaveDataListAutoLoad` 9, `cellSpursWorkloadAttributeInitialize` 9).
 
 ## The GUEST_PTR convention for pointer parameters
 
@@ -69,7 +70,7 @@ the platform's `char` signedness is honoured rather than assumed.
 A handler whose declared return is a pointer must be listed, with a reason, in
 `tools/gen_hle_nids.py`. The list is what selects the adapter, so a new
 pointer-returning handler that is not classified fails the build (the plain
-adapter's `static_assert` says to classify it). Census: 26 of the 1197 scanned
+adapter's `static_assert` says to classify it). Census: 26 of the 1200 scanned
 definitions return a pointer (22 registered, 4 excluded;
 `python3 tools/test_gen_hle_nids.py --census`).
 
@@ -154,12 +155,12 @@ the commands do not.
 `python3 tools/gen_hle_nids.py --all --out /tmp/x.cpp` is the run the build
 uses. It prints
 
-    wrote /tmp/x.cpp: 1151 NID handlers from 94 module(s); scanned 1197 definition name(s), excluded 46 host-side helper(s)
+    wrote /tmp/x.cpp: 1154 NID handlers from 94 module(s); scanned 1200 definition name(s), excluded 46 host-side helper(s)
 
-and `grep -c 'ps3_hle_register(0x' /tmp/x.cpp` prints `1151`. So: 94 module
-sources, 1197 unique definition names, **1151 registrations**, **46 host-side
+and `grep -c 'ps3_hle_register(0x' /tmp/x.cpp` prints `1154`. So: 94 module
+sources, 1200 unique definition names, **1154 registrations**, **46 host-side
 helpers** excluded. Registration is fail-closed: `classify_name` decides every
-one of the 1197 (see "Firmware export or host-side helper" below), and a name
+one of the 1200 (see "Firmware export or host-side helper" below), and a name
 with no evidence stops the generator (exit 2) instead of being registered.
 
 `python3 tools/test_gen_hle_nids.py --census` (requires `clang`) takes the
@@ -168,27 +169,29 @@ with no evidence stops the generator (exit 2) instead of being registered.
 integral/enum/pointer/record/function-pointer, and prints:
 
     modules scanned: 94
-    scanned definition names: 1197
-    definitions with a clang AST: 1197 (0 missing)
-    registered: 1151 (310 in the known NID sources, 841 by SDK export shape), excluded host-side helpers: 46
-    returns: integral 1114, void 56, float 1, pointer 26
+    scanned definition names: 1200
+    definitions with a clang AST: 1200 (0 missing)
+    registered: 1154 (321 in the known NID sources, 833 by SDK export shape), excluded host-side helpers: 46
+    returns: integral 1117, void 56, float 1, pointer 26
     pointer returns: 26 total = 22 registered (16 guest EA + 6 host-pointer stop) + 4 excluded (cellGame_get_hdd_title_id, cellGame_get_title, cellGame_get_title_id, cellGcm_fifo_kick_event)
-    parameters: pointer 1042, integral 1375, float 16, function-pointer 73, variadic 3, record 0, reference 0, array 0, enum 0
+    parameters: pointer 1050, integral 1390, float 16, function-pointer 73, variadic 3, record 0, reference 0, array 0, enum 0
     float parameters: 16 in 12 handlers
-    more than 8 parameters: cellGcmSetZcull(12), cellSaveDataListAutoLoad(9), cellSpursWorkloadAttributeInitialize(9)
+    more than 8 parameters: _cellSpursCreateJobQueueWithJobDescriptorPool(12), cellGcmSetZcull(12), _cellSpursCreateJobQueue(10), cellSaveDataListAutoLoad(9), cellSpursWorkloadAttributeInitialize(9)
 
 | Return class | Count |
 |---|---|
-| integral (including the 3 variadic `_sys_*printf`) | 1114 |
+| integral (including the 3 variadic `_sys_*printf`) | 1117 |
 | void | 56 |
 | `float` (`cellAvconfExt_display_gamma`, excluded as a helper) | 1 |
 | pointer | 26 (16 guest EA + 6 host-pointer stop + 4 excluded helpers) |
 
-Parameter features: 1042 pointer, 1375 integral, 16 floating-point across 12
+Parameter features: 1050 pointer, 1390 integral, 16 floating-point across 12
 handlers, 73 function-pointer, 3 variadic, 0 struct/union by value, 0
-reference, 0 array. Three handlers exceed eight parameters (`cellGcmSetZcull`
-12, `cellSaveDataListAutoLoad` 9, `cellSpursWorkloadAttributeInitialize` 9).
-Every one of the 1151 registered signatures compiles through the adapter, so
+reference, 0 array. Five handlers exceed eight parameters
+(`_cellSpursCreateJobQueueWithJobDescriptorPool` 12, `cellGcmSetZcull` 12,
+`_cellSpursCreateJobQueue` 10, `cellSaveDataListAutoLoad` 9,
+`cellSpursWorkloadAttributeInitialize` 9).
+Every one of the 1154 registered signatures compiles through the adapter, so
 none is in a rejected class.
 
 ### Firmware export or host-side helper
@@ -214,8 +217,8 @@ contradiction and stops the generator: the rule is narrowed, never allowed to
 drop a real export. A name that fits none of the three classes also stops it
 (exit 2, the name printed) and no table is written. Every dropped name is thus
 absent from both known-export sources (the contradiction check), and every
-kept name has evidence: the census prints the split — 310 of the 1151
-registrations are in the known NID sources, the other 841 pass an SDK export
+kept name has evidence: the census prints the split — 321 of the 1154
+registrations are in the known NID sources, the other 833 pass an SDK export
 shape, and none is in neither.
 
 None of the 46 excluded names is a firmware export, so registering one could

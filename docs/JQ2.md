@@ -1,15 +1,21 @@
-# JobQueue2 ring codec, reference scheduler and port line
+# JobQueue2 ring codec, reference scheduler, port line and HLE executor
 
-`libs/spurs/jq2/` holds three pieces of the `ps3recomp_spurs_jq2` library. The
-codec and the scheduler are pure C++20, deterministic, and free of runtime,
-thread and clock dependencies; the port model's logic is too, and only its guest
-binding reaches into the runtime (see Port line).
+`libs/spurs/jq2/` holds four pieces. The codec and the scheduler are pure C++20,
+deterministic, and free of runtime, thread and clock dependencies: they are the
+target `ps3recomp_spurs_jq2_model`. The port model's logic is too, and only its
+guest binding reaches into the runtime (see Port line); the port model and the
+executor are the target `ps3recomp_spurs_jq2`, which links the runtime
+explicitly (the runtime's `cellSpursJq.c` calls `jq2/jq2.h`, so the two static
+libraries depend on each other and CMake repeats the cycle on the link line).
 
 - `ring.hpp/.cpp`: the 8-byte command-ring entry codec.
 - `sched.hpp/.cpp`: a queue-level model of the SPU policy module's (PM's) intake,
-  used as the oracle for the HLE executor.
+  used as the oracle for the HLE executor and, over a guest-memory ring, as its
+  scheduling rules.
 - `port.hpp/.cpp`: the port line, the PPU/SPU completion accounting a Port2 push
   and Port2Sync share with the PM.
+- `executor.hpp/.cpp`, `jq2.h`: the HLE executor and the C surface the PPU
+  exports call (see Executor).
 
 Tests: `tests/spurs_jq2/` (`ctest --preset t0 -R jq2`). Evidence ids (`jq2fw-*`,
 `m1r-*`, `jq2co-*`, `jq2c-*`) refer to the research repository's fact files; the
@@ -214,3 +220,147 @@ is `spurs;stress`):
 The Odin-backed check is `tests/test_jq2_port_replay.cpp` in leifthrasir-recomp:
 it replays the `(A, B)` sequences of `jq-boot`, `closure` and `stall2` through
 `LocalPort`.
+
+## Executor
+
+`executor.cpp` is the runtime's stand-in for the firmware's job queue: the PPU
+half (validation, ring write, port accounting, ports, create/shutdown/join) and
+the SPU half (the policy module's intake and the job start), one `Queue` per
+guest queue EA. `jq2.h` is its C surface; the 17 `cellSpursJq` exports are thin
+adapters that call it (a firmware status in, the same s32 out). The layout of
+the guest queue block, the evidence behind each field and the choices the
+evidence does not settle are in the header of `executor.hpp`.
+
+**Pushes.** `jq2_port_push_job` / `jq2_port_copy_push` / `jq2_port_push_sync`
+apply the firmware guards (null `A11`, alignment `A10`, argument `A02`, port or
+queue state `A0F`, full ring `A01`, claim collision `A0A`), then account on the
+port line when `flags & 1` (`Port::push_accounted`: `B += 1`, ring write,
+rollback if the ring is full) and write one entry through `ring_push()` into the
+guest ring, under the reservation model: the index word at `queue+0x00` (read
+u16, write u16, flags u32 with the writer phase) moves only through
+`resv_host_rmw`, the entry is one 8-byte release store, and a worker that
+reaches the slot first sees the previous lap's entry, whose phase bit does not
+match (the PM's own protocol). A CopyPush takes a pool slot first (blocking),
+snapshots `size` bytes into it and enqueues the slot (contract S3).
+
+**Workers.** `worker_count` host threads (8 MB stacks: the loader keeps a whole
+`spu_context` on the stack) are the scheduler's instances, one job slot each.
+A worker runs `Scheduler::intake_pass` under the queue lock over `GuestRing`
+(`sched.hpp`'s `RingStore`, see below), takes the descriptor of the JOB it
+admitted from guest memory right there (contract S2) and runs the job outside
+the lock through `spu_run_spurs_job_snapshot`, which reads the header, the DMA
+and cache lists and the user words from that copy and never from guest memory
+again: an overwrite after admission does not reach the job, one before it does,
+exactly as on the PM. The job body is `interpreter_body()` (the SPU interpreter
+from LS 0); `ExecutorHooks::select_body` is the plug for lifted bodies once the
+job-image registry exists. A job counts as returned only when it executes the
+`stop 0` at the link address the loader plants (`0x3FF00`); any other stop, a
+halt, or a loader refusal is the named stop `jq2-job-end` and credits nothing.
+
+**Completion.** After the run: pool slot back (COPY), then `credit_completion()`
+on the port line, and the `Wakeup` it returns is performed: kind 2 sets bit
+`id % 64` of the queue's event flag `+0x80 + 4 * (id / 64)` (LV2 event flags
+through `sys_event_flag_*`), any other kind is the named stop `jq2-wake` (fibers
+do not exist yet). Last, the scheduler's `complete()` releases barriers. A
+`Port2Sync` that has to wait registers a host-allocated id (128 of them) and
+blocks on that bit with the firmware's wait (`AND | CLEAR`, no timeout).
+
+**Counters.** `jq2_queue_stats`: `pushed`, `dispatched`, `executed`,
+`credited`, `uncredited` (executed jobs pushed without `flags & 1`). `executed`
+is counted after the job returned and `credited` just before the port line is
+written, so at any instant `credited + uncredited <= executed <= dispatched` and
+at quiescence all three agree.
+
+**Shutdown and Join.** `Shutdown` refuses further ports and pushes (`A0F`) and
+tells the workers to leave once the ring is drained; it returns `A0A` while a
+port is attached. `Join` waits for the workers (so for every outstanding job,
+L1), destroys the event flags, sets bit `0x20` of `queue+0x6C` and hands
+`*(queue+0xF04)` back. The guest buffers stay the caller's (L2): nothing outside
+the queue block, the ring (`2048 + ((depth + 15) * 8 & ~0x7F)` bytes are zeroed
+at create, as the firmware does), the pool and the ports is written.
+
+**The PM's record line is not touched.** `queue+0x180..+0x1FF` is one 128-byte
+line of 16 per-grab-slot 8-byte records the PM rewrites with GETLLAR/PUTLLUC
+(the type-3 path stores at `line + slot * 8`), private scheduling state no PPU
+path reads. The executor writes nothing in `+0x180..+0x57F`; the out-of-order
+marks live in the `GuestRing` object (host state). m1r-013's "bitmap at
+queue+0x180" was a simplification; `Scheduler::mark_consumed_out_of_order`
+keeps its contract.
+
+### Scheduler over a ring store
+
+`Scheduler` keeps the model's rules and now runs them over a `RingStore`: the
+entries, the read/write index and phase pair, the out-of-order marks, the
+writer's `reserve()` and the reader's `advance_read()`. The default store is
+private memory, so every B2 test runs unchanged; the executor passes a store
+over the guest queue (`GuestRing`). `ring_push()` is the writer over any store
+and is safe against a concurrent reader. A COPY is scheduled exactly as a JOB
+(the PM's decode sends command types 0 and 2 to one handler, jq2c-021) when the
+scheduler is configured with `copy_entries`; `Dispatch::copy` and
+`job.descriptor_ea` (the pool slot) carry it. The ring is full when `depth`
+entries are outstanding; with equal indices the phases tell empty from full
+(`ring_outstanding`).
+
+### Shared SPU state
+
+Two workers run two jobs at once, so state the runtime kept in globals is now
+per thread or atomic: `spu_run_spurs_job_snapshot` keeps no retained local store
+(`spurs_job_ls_for_handle` is a chain-job notion; the chain walker's
+`spu_run_spurs_job` still retains it), the loader's and the MFC layer's
+lazily-read `SPU_*` environment gates and debug rings are thread-local
+(`SPU_THREAD_LOCAL`), the interpreter's watchdog counters
+(`g_spu_interp_steps`, `g_spu_interp_last_pc`) and the SPU local-store gates
+are relaxed atomics, and the committed-page cache is updated with an atomic OR.
+The `tsan` label of `test_jq2_executor` runs clean; paths the tests do not run
+(GETLLAR/PUTLLC jobs, lifted code) keep their unaudited lazy gates.
+
+### Job observer
+
+`jq2_set_job_observer` installs, per queue and off by default, a pair of
+callbacks on the worker thread that runs a job: `job_start` with the worker's
+`spu_context` after the job is staged and before its first instruction (the
+place to install an `spu_observe` observer), and `job_end` with `r3` as it
+returned. The `jq2_job_info` they receive carries the admission identity and the
+local-store layout the loader chose (`spu_job_layout`: image, descriptor copy,
+io, out, scratch/stack, `r1` at entry), passed out by
+`spu_run_spurs_job_hooked`, not recomputed.
+
+### How the executor is tested
+
+`tests/spurs_jq2/test_jq2_executor.cpp`, one mode per process, on synthetic SPU
+job images (a JOBCRT Ver13 header and 16 hand-encoded instructions: GET input,
+add the descriptor's words, PUT, return) and the real interpreter, loader,
+channel layer and LV2 event flags; labels `spurs;t0;tsan`:
+
+- `premature`: a store to the descriptor after the push and before admission
+  reaches the job; a store from inside the admission hook (after the copy) does
+  not.
+- `copy`: the CopyPush source can be scribbled at once; a class of two blocks
+  makes the third CopyPush block until a job returns its block, nine pushes
+  through it; a pool-less queue and a bad class are refused.
+- `credit`: 1000 jobs, 2 workers, 3 tags, a PushSync every ten pushes and a
+  Sync every hundred: at every Sync `dispatched == executed == credited ==
+  pushed`, `uncredited == 0`, every output right, A (count) and B zero.
+- `wrap`: a depth-4 ring wraps (and flips its phase) 30 times under two workers.
+- `barrier`: the m1r-013 ring `A(tag1) SYNC(tag1) C(tag1) D(tag0) C2(tag1)` with
+  A held in flight: D overtakes, the read index holds at the retained C, the
+  mark is set, C and C2 start only after A finished and in push order, the ring
+  bytes are never rewritten, `+0x180..+0x57F` stays zero.
+- `sync`: mode 4 `AGAIN` with jobs outstanding (A, B untouched), a blocked mode
+  0 holds the claim (`A` bit 31, claim byte), a second Sync and a push meet
+  `BUSY`, the blocked Sync returns 0 when the queue resumes, a mode with bits
+  above 7 is `INVAL`.
+- `join`: `Shutdown` is `BUSY` with a live port, `Join` before `Shutdown` is
+  `STAT`, `Join` returns only after the held job and the other eleven finished,
+  guest bytes outside the queue's blocks are untouched; a second run joins with
+  30 jobs outstanding.
+- `observer`: `job_start` gets the worker's `spu_context` and the loader's layout
+  (image at LS 0 with its bss, the descriptor copy, `r1`, the context), an
+  `spu_observe` observer installed there sees the job's GET and PUT, `job_end`
+  gets `r3`, and after the observer is removed no callback fires.
+- `validate`: every guard and status code of `jq2.h`, the guest layout create
+  leaves, ports and slots, and a job pushed without `flags & 1` (runs, never
+  credited, never counted in B).
+- `stop_job`, `stop_crt`, `stop_ring`: forked children (the guest memory is
+  shared) end in `jq2-job-end`, `spu-job-crt-version` and `jq2-ring-entry` with
+  exit status 70, and the parent finds the port not credited.

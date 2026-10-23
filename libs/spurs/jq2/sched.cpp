@@ -2,8 +2,8 @@
  * ps3recomp - SPURS JobQueue2 reference scheduler (queue-level model)
  *
  * The contract and its evidence live in sched.hpp. This file is the
- * deterministic implementation: no threads, no clock, no allocation after
- * create().
+ * implementation: no threads and no clock; the ring is whatever RingStore the
+ * scheduler was given (private memory by default).
  */
 
 #include "jq2/sched.hpp"
@@ -20,13 +20,113 @@ bool pm_accepts_phase(bool w1_bit0, bool expected_phase) noexcept
     return w1_bit0 == expected_phase;
 }
 
-Scheduler::Scheduler(std::uint16_t depth, unsigned instances, unsigned slots_per_instance)
-    : depth_(depth),
+namespace {
+
+/* The ring in private memory: the deterministic store of the model. */
+class LocalRing final : public RingStore {
+public:
+    explicit LocalRing(std::uint16_t depth) : depth_(depth), ring_(depth), out_of_order_(depth, 0) {}
+
+    std::uint16_t depth() const noexcept override { return depth_; }
+
+    RingIndices indices() const noexcept override { return {read_, write_, read_phase_, write_phase_}; }
+
+    EntryBytes load(std::uint16_t index) const noexcept override { return ring_[index]; }
+
+    void store(std::uint16_t index, const EntryBytes& bytes) noexcept override { ring_[index] = bytes; }
+
+    bool out_of_order(std::uint16_t index) const noexcept override { return out_of_order_[index] != 0; }
+
+    void set_out_of_order(std::uint16_t index, bool marked) noexcept override
+    {
+        out_of_order_[index] = marked ? 1 : 0;
+    }
+
+    std::optional<Slot> reserve() noexcept override
+    {
+        if (ring_outstanding(indices(), depth_) == depth_) return std::nullopt;
+        const Slot slot{write_, write_phase_};
+        write_ = static_cast<std::uint16_t>((write_ + 1) % depth_);
+        if (write_ == 0) write_phase_ = !write_phase_;
+        return slot;
+    }
+
+    void advance_read(unsigned n) noexcept override
+    {
+        for (unsigned i = 0; i < n; ++i) {
+            out_of_order_[read_] = 0;
+            read_ = static_cast<std::uint16_t>((read_ + 1) % depth_);
+            if (read_ == 0) read_phase_ = !read_phase_;
+        }
+    }
+
+private:
+    std::uint16_t depth_;
+    std::vector<EntryBytes> ring_;
+    std::vector<std::uint8_t> out_of_order_;
+    std::uint16_t read_ = 0;
+    std::uint16_t write_ = 0;
+    bool read_phase_ = kInitialPhase;
+    bool write_phase_ = kInitialPhase;
+};
+
+/* The storability rules shared by every writer: the same refusals, in the same
+ * order. The phase does not influence acceptance. */
+PushResult encode_for_store(const Entry& entry, bool phase, bool allow_copy, EncodeResult& encoded)
+{
+    PushResult result;
+    if ((!allow_copy && std::holds_alternative<CopyEntry>(entry)) ||
+        std::holds_alternative<UnknownEntry>(entry)) {
+        result.error = PushError::unsupported_entry;
+        return result;
+    }
+    if (const auto* sync = std::get_if<SyncEntry>(&entry); sync != nullptr && sync->mask == 0) {
+        result.error = PushError::empty_sync_mask;
+        return result;
+    }
+
+    encoded = encode(entry, phase);
+    if (!encoded.ok()) {
+        result.error = PushError::encode_failed;
+        result.encode_error = encoded.error;
+    }
+    return result;
+}
+
+}  // namespace
+
+std::unique_ptr<RingStore> make_local_ring(std::uint16_t depth)
+{
+    if (depth == 0) return nullptr;
+    return std::make_unique<LocalRing>(depth);
+}
+
+PushResult ring_push(RingStore& ring, const Entry& entry, bool allow_copy, std::optional<bool> phase)
+{
+    EncodeResult probe;
+    PushResult result = encode_for_store(entry, phase.value_or(kInitialPhase), allow_copy, probe);
+    if (!result.ok()) return result;
+
+    const std::optional<RingStore::Slot> slot = ring.reserve();
+    if (!slot) {
+        result.error = PushError::ring_full;
+        return result;
+    }
+    /* The slot's phase is known only now; the codec's acceptance never depends
+     * on it, so this encode succeeds like the probe. */
+    ring.store(slot->index, encode(entry, phase.value_or(slot->phase)).bytes);
+    result.index = slot->index;
+    return result;
+}
+
+Scheduler::Scheduler(std::unique_ptr<RingStore> ring, unsigned instances, unsigned slots_per_instance,
+                     bool copy_entries)
+    : depth_(ring->depth()),
       instances_(instances),
       slots_per_instance_(slots_per_instance),
-      ring_(depth),
-      out_of_order_(depth, 0),
-      sync_fresh_(depth, 0),
+      copy_entries_(copy_entries),
+      ring_(std::move(ring)),
+      sync_fresh_(depth_, 0),
       slots_(std::size_t(instances) * slots_per_instance),
       next_slot_(instances, 0)
 {
@@ -34,9 +134,15 @@ Scheduler::Scheduler(std::uint16_t depth, unsigned instances, unsigned slots_per
 
 std::optional<Scheduler> Scheduler::create(const SchedConfig& config)
 {
-    if (config.depth == 0 || config.instances == 0 || config.slots_per_instance == 0)
+    if (config.depth == 0) return std::nullopt;
+    return create(config, make_local_ring(config.depth));
+}
+
+std::optional<Scheduler> Scheduler::create(const SchedConfig& config, std::unique_ptr<RingStore> ring)
+{
+    if (!ring || ring->depth() == 0 || config.instances == 0 || config.slots_per_instance == 0)
         return std::nullopt;
-    return Scheduler(config.depth, config.instances, config.slots_per_instance);
+    return Scheduler(std::move(ring), config.instances, config.slots_per_instance, config.copy_entries);
 }
 
 unsigned Scheduler::inflight(unsigned tag) const noexcept
@@ -65,15 +171,14 @@ const Dispatch* Scheduler::find_job(std::uint32_t dispatch_id) const noexcept
     return nullptr;
 }
 
-const std::array<std::uint8_t, kEntryBytes>& Scheduler::ring_entry(
-    std::uint16_t index) const noexcept
+EntryBytes Scheduler::ring_entry(std::uint16_t index) const noexcept
 {
-    return ring_[index % depth_];
+    return ring_->load(static_cast<std::uint16_t>(index % depth_));
 }
 
 bool Scheduler::consumed_out_of_order(std::uint16_t index) const noexcept
 {
-    return out_of_order_[index % depth_] != 0;
+    return ring_->out_of_order(static_cast<std::uint16_t>(index % depth_));
 }
 
 std::uint16_t Scheduler::sync_barred_tags(std::uint16_t index) const noexcept
@@ -81,65 +186,32 @@ std::uint16_t Scheduler::sync_barred_tags(std::uint16_t index) const noexcept
     return sync_fresh_[index % depth_];
 }
 
-namespace {
-
-/* The storability rules shared by push() and rewrite_entry(): the same refusals,
- * in the same order. */
-PushResult encode_for_store(const Entry& entry, bool phase, EncodeResult& encoded)
-{
-    PushResult result;
-    if (std::holds_alternative<CopyEntry>(entry) ||
-        std::holds_alternative<UnknownEntry>(entry)) {
-        result.error = PushError::unsupported_entry;
-        return result;
-    }
-    if (const auto* sync = std::get_if<SyncEntry>(&entry); sync != nullptr && sync->mask == 0) {
-        result.error = PushError::empty_sync_mask;
-        return result;
-    }
-
-    encoded = encode(entry, phase);
-    if (!encoded.ok()) {
-        result.error = PushError::encode_failed;
-        result.encode_error = encoded.error;
-    }
-    return result;
-}
-
-}  // namespace
-
 PushResult Scheduler::push(const Entry& entry)
 {
-    return push_with_phase(entry, write_phase_);
+    return push_impl(entry, std::nullopt);
 }
 
 PushResult Scheduler::push_with_phase(const Entry& entry, bool phase)
 {
-    EncodeResult encoded;
-    PushResult result = encode_for_store(entry, phase, encoded);
-    if (!result.ok()) return result;
-    if (outstanding_ == depth_) {
-        result.error = PushError::ring_full;
-        return result;
-    }
+    return push_impl(entry, phase);
+}
 
-    result.index = write_;
-    ring_[write_] = encoded.bytes;
-    sync_fresh_[write_] = 0;
-    write_ = static_cast<std::uint16_t>((write_ + 1) % depth_);
-    if (write_ == 0) write_phase_ = !write_phase_;
-    ++outstanding_;
+PushResult Scheduler::push_impl(const Entry& entry, std::optional<bool> phase)
+{
+    PushResult result = ring_push(*ring_, entry, copy_entries_, phase);
+    if (result.ok()) sync_fresh_[result.index] = 0;
     return result;
 }
 
 bool Scheduler::rewrite_entry(std::uint16_t index, const Entry& entry, bool phase)
 {
     if (index >= depth_) return false;
-    const unsigned ahead = (index + depth_ - read_) % depth_;
-    if (ahead >= outstanding_ || out_of_order_[index] != 0) return false;
+    const RingIndices ix = ring_->indices();
+    const unsigned ahead = (index + depth_ - ix.read) % depth_;
+    if (ahead >= ring_outstanding(ix, depth_) || ring_->out_of_order(index)) return false;
     EncodeResult encoded;
-    if (!encode_for_store(entry, phase, encoded).ok()) return false;
-    ring_[index] = encoded.bytes;
+    if (!encode_for_store(entry, phase, copy_entries_, encoded).ok()) return false;
+    ring_->store(index, encoded.bytes);
     sync_fresh_[index] = 0;
     return true;
 }
@@ -147,21 +219,10 @@ bool Scheduler::rewrite_entry(std::uint16_t index, const Entry& entry, bool phas
 void Scheduler::mark_consumed_out_of_order(std::uint16_t index)
 {
     /* Measured on the firmware PM: the ring bytes are not rewritten; the mark
-     * lives in queue state (bitmap at queue+0x180). The model keeps it beside
-     * the ring. The read index passes a marked entry only when a later pass
-     * reaches it at the frontier (advance_read does not look ahead). */
-    out_of_order_[index] = 1;
-}
-
-void Scheduler::advance_read(unsigned in_order_entries) noexcept
-{
-    const auto step = [this]() {
-        out_of_order_[read_] = 0;
-        read_ = static_cast<std::uint16_t>((read_ + 1) % depth_);
-        if (read_ == 0) read_phase_ = !read_phase_;
-        --outstanding_;
-    };
-    for (unsigned i = 0; i < in_order_entries; ++i) step();
+     * lives in queue state (bitmap at queue+0x180), which is the store's. The
+     * read index passes a marked entry only when a later pass reaches it at the
+     * frontier (the store's advance_read does not look ahead). */
+    ring_->set_out_of_order(index, true);
 }
 
 void Scheduler::release_satisfied_barriers() noexcept
@@ -182,8 +243,9 @@ void Scheduler::release_satisfied_barriers() noexcept
 PassResult Scheduler::intake_pass(unsigned instance)
 {
     PassResult result;
-    result.read_before = read_;
-    result.read_after = read_;
+    const RingIndices ix = ring_->indices();
+    result.read_before = ix.read;
+    result.read_after = ix.read;
     if (instance >= instances_) {
         result.end = PassEnd::invalid_instance;
         return result;
@@ -193,16 +255,19 @@ PassResult Scheduler::intake_pass(unsigned instance)
         return result;
     }
 
+    /* The write index is read once: an entry a writer reserves later is the
+     * next pass's. */
+    const unsigned outstanding = ring_outstanding(ix, depth_);
     bool behind_retained = false;
     unsigned in_order = 0; /* entries consumed contiguously from the read index */
     result.end = PassEnd::ring_not_written;
 
-    for (unsigned k = 0; k < outstanding_; ++k) {
-        const std::uint32_t pos = std::uint32_t(read_) + k;
+    for (unsigned k = 0; k < outstanding; ++k) {
+        const std::uint32_t pos = std::uint32_t(ix.read) + k;
         const auto index = static_cast<std::uint16_t>(pos % depth_);
-        const bool expected = read_phase_ != (((pos / depth_) & 1u) != 0);
+        const bool expected = ix.read_phase != (((pos / depth_) & 1u) != 0);
 
-        const Decoded decoded = decode(ring_[index]);
+        const Decoded decoded = decode(ring_->load(index));
         if (!pm_accepts_phase(decoded.writer_bit, expected)) {
             result.end = PassEnd::ring_not_written;
             break;
@@ -215,14 +280,23 @@ PassResult Scheduler::intake_pass(unsigned instance)
                 in_order = k + 1;
         };
 
-        if (out_of_order_[index] != 0) {
+        if (ring_->out_of_order(index)) {
             /* Consumed by an earlier pass behind a since-resolved retained
              * entry; the read index only has to move over it. */
             if (!behind_retained) in_order = k + 1;
             continue;
         }
 
-        if (const auto* job = std::get_if<JobEntry>(&decoded.entry)) {
+        /* JOB, and COPY when modelled: one handler, one tag rule. */
+        std::optional<JobEntry> job;
+        bool copy = false;
+        if (const auto* j = std::get_if<JobEntry>(&decoded.entry)) {
+            job = *j;
+        } else if (const auto* c = std::get_if<CopyEntry>(&decoded.entry); c != nullptr && copy_entries_) {
+            job = JobEntry{c->port_ea, c->pool_ea, c->tag, c->size};
+            copy = true;
+        }
+        if (job) {
             if ((barred_ & (1u << job->tag)) != 0) {
                 behind_retained = true;
                 ++result.entries_retained;
@@ -240,6 +314,7 @@ PassResult Scheduler::intake_pass(unsigned instance)
             dispatch.slot = slot;
             dispatch.ring_index = index;
             dispatch.job = *job;
+            dispatch.copy = copy;
             slots_[std::size_t(instance) * slots_per_instance_ + slot] = dispatch;
             ++inflight_[job->tag];
             consume();
@@ -287,8 +362,8 @@ PassResult Scheduler::intake_pass(unsigned instance)
         break;
     }
 
-    advance_read(in_order);
-    result.read_after = read_;
+    ring_->advance_read(in_order);
+    result.read_after = ring_->indices().read;
     return result;
 }
 

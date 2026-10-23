@@ -758,30 +758,59 @@ SPURS (SPU Runtime System) is Sony's framework for distributing work across SPUs
 
 ### cellSpursJq
 
-**File:** `libs/spurs/cellSpursJq.c`
-**Purpose:** SPURS Job Queue — advanced SPU job dispatch
+**Files:** `libs/spurs/cellSpursJq.c` (PPU surface), `libs/spurs/jq2/`
+(executor), `libs/spurs/jq2/jq2.h` (C contract)
+**Purpose:** SPURS JobQueue2 — Port2 job submission, descriptor pools, and
+queue lifecycle
 
-Built on top of cellSpurs, provides a higher-level job submission and tracking interface. Jobs are submitted to queues and would normally be dispatched to SPUs for execution.
+The module implements the 17 `cellSpursJq` exports a title imports, with the
+firmware's argument order and error codes. Every handler decodes 32-bit guest
+EAs and calls `jq2.h`; the ring, scheduler, descriptor pool, LV2 event flags
+and SPU workers live in `libs/spurs/jq2/`. Jobs run through
+`spu_run_spurs_job` (interpreted or lifted); no job is ever credited without
+running, and a command-ring entry the executor does not model is a named stop.
 
-**Implementation:**
-- Up to 16 concurrent job queues
-- Jobs are accepted via `Push` and immediately marked complete (no SPU execution)
-- `Wait` and `TryWait` return immediately since jobs are instantly "done"
-- Port system connects event queues to job queues for push synchronization
+**Exports:**
+- `_cellSpursCreateJobQueue(rev, sdk, spurs, queue, attr, name, ring, depth,
+  workers, extra)` (10 args) and
+  `_cellSpursCreateJobQueueWithJobDescriptorPool(...)` (12 args, adds `pool`
+  and `poolAttr`) — create the queue block, command ring, event flags and
+  workers
+- `cellSpursShutdownJobQueue(queue)` / `cellSpursJoinJobQueue(queue, &out)` —
+  teardown; Join writes `queue+0xF04` to the guest out argument
+- `cellSpursJobQueuePort2Create(port, queue)` / `...Port2Destroy(port)` —
+  caller-owned 128-byte port block, queue slot in `queue+0x580`
+- `_cellSpursJobQueuePort2PushJobBody(port, desc, size, tag, flags)` —
+  descriptor fetched at admission (not copied at push)
+- `_cellSpursJobQueuePort2CopyPushJobBody(port, src, size, copySize, tag,
+  flags)` — synchronous snapshot into the queue's size-class descriptor pool
+- `cellSpursJobQueuePort2PushSync(port, tagMask, flags)` /
+  `...Port2Sync(port, mode)` — per-tag barriers and completion waits
+- the seven `cellSpursJobQueueAttribute*` exports — Initialize and the
+  MaxSizeJobDescriptor / GrabParameters / DoBusyWaiting / SubmitWithEntryLock /
+  IsJobTypeMemoryCheck / IsHaltOnError setters
 
-**Key Functions:**
-- `cellSpursJobQueueAttributeInitialize(&attr)` — set defaults (64 max jobs, grab=1, normal priority)
-- `cellSpursCreateJobQueue(spurs, &jq, &attr, buffer, size)` — create queue
-- `cellSpursDestroyJobQueue(&jq)` — destroy queue
-- `cellSpursJobQueuePush(&jq, job, size, tag, &id)` — submit job (completes immediately)
-- `cellSpursJobQueuePushJob(&jq, &job256, tag, &id)` — submit 256-byte job
-- `cellSpursJobQueueWait(&jq, id)` — wait for job (returns immediately)
-- `cellSpursJobQueueGetCount(&jq, &count)` — returns 0 (all jobs complete)
-- `cellSpursJobQueuePort2Create/Destroy/PushSync` — port-based submission
+**Attribute layout (`CellSpursJobQueueAttribute`):**
 
-**Job Types:**
-- `CellSpursJob256` — 256-byte job descriptor with DMA list, work area, binary EA
-- `CellSpursJob128` — 128-byte compact variant
+| Offset | Type | Meaning |
+|---|---|---|
+| `+0x00` | u32 | caller's; the exports never touch it |
+| `+0x04` | u32 | grab/class parameter, 1..16 (Initialize: 4) |
+| `+0x08` | u32 | maximum descriptor size, 256..1023, 128-aligned (Initialize: 256) |
+| `+0x0C` | u8 | SubmitWithEntryLock |
+| `+0x0D` | u8 | DoBusyWaiting |
+| `+0x0E` | u8 | IsHaltOnError |
+| `+0x0F` | u8 | IsJobTypeMemoryCheck |
+| `+0x10` | u32 | grab parameters, 0..255 (Initialize: 255; create reads byte `+0x13`) |
+
+**Return codes:** 0 or `JQ2_ERR_*` (`0x80410A01` AGAIN, `0x80410A02` INVAL,
+`0x80410A0A` BUSY, `0x80410A0F` STAT, `0x80410A10` ALIGN, `0x80410A11`
+NULL_POINTER). The exports do not produce any other value.
+
+Other firmware Jq exports (`cellSpursJobQueueSendSignal`,
+`cellSpursJobQueueSemaphoreTryAcquire`, the non-Port2 job APIs, ...) are not
+part of this surface. They are not registered here, so an import reaches the
+`unresolved-nid` named stop instead of a fabricated `CELL_OK`.
 
 ### cellDaisy
 
