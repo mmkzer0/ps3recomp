@@ -401,6 +401,12 @@ typedef struct spu_context {
      * that drives this context itself; zero from spu_context_init's memset, so
      * every existing context runs unobserved. Not copied or inherited. */
     const struct spu_observer* observer;
+
+    /* LS base of the SPURS job runtime area spurs_job.c planted (the code the
+     * Ver14 jm interface points into), 0 when this context runs no such job.
+     * Lifted code that branches into [job_rt_ls, +SPU_JOB_RT_SIZE) has no
+     * lifted function there; spu_indirect_branch interprets it instead. */
+    uint32_t job_rt_ls;
 } spu_context;
 
 /* Reserved LS addresses (inside the kernel area, below the 0xA00 policy-module
@@ -409,6 +415,14 @@ typedef struct spu_context {
  * kernel service; spu_indirect_branch intercepts (policy_mode only). */
 #define SPURS_PM_EXIT_TO_KERNEL_LS   0x9C0u
 #define SPURS_PM_SELECT_WORKLOAD_LS  0x9D0u
+
+/* The SPURS job runtime area: LS spurs_job.c fills below a Ver14 job's
+ * JobContext2 with the code its jm interface points at (docs/RUNTIME.md,
+ * "SPURS job start"). SPU_JOB_RT_TRAP_STOP is the stop code of the trap
+ * quadword at its base; a job that ends there called a jm entry the runtime
+ * does not model. */
+#define SPU_JOB_RT_SIZE       0x100u
+#define SPU_JOB_RT_TRAP_STOP  0x3B0Eu
 
 /* The taskset policy module's syscall trampoline. Both the full resolver
  * (spu_channels.c) and the musttail fast path (spu_dispatch_mt.c) must treat a

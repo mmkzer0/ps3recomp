@@ -2325,6 +2325,20 @@ void spu_indirect_branch(spu_context* ctx)
         spu_halt(ctx);
         return;
     }
+    /* The SPURS job runtime area (spurs_job.c): the Ver14 jm interface points
+     * word 1 at a short routine in local store and word 0 at a trap. They are
+     * machine code the job manager would have provided, not part of any lifted
+     * image, so there is no lifted function behind them. Interpret the live
+     * bytes until the routine returns to its caller -- the lifted bisl bracket
+     * then resumes at the return address -- or stops at the trap, which ends
+     * the run for spu_run_spurs_job to name. */
+    if (!fn && !ctx->policy_mode && ctx->job_rt_ls &&
+        ctx->pc - ctx->job_rt_ls < SPU_JOB_RT_SIZE) {
+        spu_interp_run_until(ctx, ctx->pc, ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+        if (ctx->status & (SPU_STATUS_STOPPED_BY_STOP | SPU_STATUS_STOPPED_BY_HALT))
+            spu_halt(ctx);
+        return;
+    }
     /* Branch into high LS with no lifted code there.
      *
      * This was added believing the jobs called a resident SPURS job-manager
