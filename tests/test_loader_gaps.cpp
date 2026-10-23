@@ -11,6 +11,15 @@
  *   test_loader_gaps unlifted <addr>
  *   test_loader_gaps indirect <target>
  *   test_loader_gaps call <addr>        a lifted function, through the registry
+ *   test_loader_gaps depth <addr>       an indirect call into a function that
+ *                                       calls itself until the host dispatch cap
+ *   test_loader_gaps opdswap <ctr> <r2> an indirect call whose ctr is not a
+ *                                       function and whose r2 is (swapped OPD)
+ *   test_loader_gaps guestcall <opd>    an HLE-initiated guest callback by OPD
+ *   test_loader_gaps guestcallopd <opd> <code> <toc>
+ *                                       writes that OPD, then calls it
+ *   test_loader_gaps guestcallct <code> [toc]
+ *                                       a callback by an already-resolved code
  */
 #include "ppu_recomp.h"
 #include <cstdio>
@@ -51,11 +60,17 @@ void ps3_indirect_call(ppu_context* ctx);
 void lv2_syscall(ppu_context* ctx);
 void ppu_unlifted_stub(uint64_t addr, ppu_context* ctx);
 extern uint32_t ppu_vm_size;
+uint32_t vm_read32(uint64_t a);
+void vm_write32(uint64_t a, uint32_t v);
+uint64_t ppu_guest_call(uint32_t opd, uint64_t, uint64_t, uint64_t, uint64_t,
+                        uint64_t, uint64_t, uint64_t, uint64_t);
+uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc, uint64_t, uint64_t, uint64_t,
+                           uint64_t, uint64_t, uint64_t, uint64_t);
 }
 
 int main(int argc, char** argv)
 {
-    if (argc != 3) return 2;
+    if (argc < 3) return 2;
     vm_base = (uint8_t*)mmap(nullptr, 0x20000000ull, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (vm_base == MAP_FAILED) return 2;
     ppu_vm_size = 0x20000000u;
@@ -78,6 +93,28 @@ int main(int argc, char** argv)
     } else if (!std::strcmp(argv[1], "call")) {
         ctx.ctr = arg;
         ps3_indirect_call(&ctx);
+    } else if (!std::strcmp(argv[1], "depth")) {
+        /* The fixture function does `mtctr r4; bctrl`, so r4 names the target
+         * it calls (itself) on every recursion. */
+        ctx.gpr[4] = arg;
+        ctx.ctr = arg;
+        ps3_indirect_call(&ctx);
+    } else if (!std::strcmp(argv[1], "opdswap") && argc == 4) {
+        ctx.ctr = arg;
+        ctx.gpr[2] = std::strtoull(argv[3], nullptr, 0);
+        ps3_indirect_call(&ctx);
+    } else if (!std::strcmp(argv[1], "guestcall")) {
+        ctx.gpr[3] = ppu_guest_call((uint32_t)arg, 0, 0, 0, 0, 0, 0, 0, 0);
+    } else if (!std::strcmp(argv[1], "guestcallopd") && argc == 5) {
+        /* Build an OPD in guest memory, then call it: <opd> <code> <toc>. */
+        const uint32_t opd = (uint32_t)arg;
+        vm_write32(opd, (uint32_t)std::strtoull(argv[3], nullptr, 0));
+        vm_write32(opd + 4, (uint32_t)std::strtoull(argv[4], nullptr, 0));
+        vm_write32(opd + 8, 0);
+        ctx.gpr[3] = ppu_guest_call(opd, 0, 0, 0, 0, 0, 0, 0, 0);
+    } else if (!std::strcmp(argv[1], "guestcallct")) {
+        const uint32_t toc = argc > 3 ? (uint32_t)std::strtoull(argv[3], nullptr, 0) : 0;
+        ctx.gpr[3] = ppu_guest_call_ct((uint32_t)arg, toc, 0, 0, 0, 0, 0, 0, 0);
     } else {
         return 2;
     }

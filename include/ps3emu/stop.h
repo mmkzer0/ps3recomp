@@ -64,7 +64,10 @@ extern "C" {
     X(UNIMPLEMENTED_SYSCALL,    "unimplemented-syscall")                       \
     X(UNLIFTED_FUNCTION,        "unlifted-function")                           \
     X(UNRESOLVED_INDIRECT_CALL, "unresolved-indirect-call")                    \
-    X(UNKNOWN_INSTRUCTION,      "unknown-instruction")
+    X(UNKNOWN_INSTRUCTION,      "unknown-instruction")                         \
+    X(DISPATCH_DEPTH_EXCEEDED,  "dispatch-depth-exceeded")                     \
+    X(SPU_DMA_REPEAT,           "spu-dma-repeat")                              \
+    X(UNRESOLVED_GUEST_CALLBACK, "unresolved-guest-callback")
 
 /* A fixed underlying type in C++ makes a kind outside the list (a caller's bug,
  * which the stop still reports as "invalid-kind") a well-defined value rather

@@ -9,6 +9,7 @@
  * than a silently ignored string.
  *
  *   PS3_CFG_BOOL(section, key, default, doc)
+ *   PS3_CFG_U32(section, key, default, min, max, doc)
  *   PS3_CFG_STR(section, key, default, max_length, validator, doc)
  *   PS3_CFG_LEGACY_ENV(name)
  *
@@ -27,6 +28,10 @@
 #ifndef PS3_CFG_BOOL
 #  define PS3_CFG_BOOL(section, key, def, doc)
 #  define PS3_CFG_BOOL_DEFAULTED
+#endif
+#ifndef PS3_CFG_U32
+#  define PS3_CFG_U32(section, key, def, min, max, doc)
+#  define PS3_CFG_U32_DEFAULTED
 #endif
 #ifndef PS3_CFG_STR
 #  define PS3_CFG_STR(section, key, def, max_length, validator, doc)
@@ -47,6 +52,31 @@ PS3_CFG_BOOL(ppu, vscr_nj, 1,
     "parity with RPCS3, which starts its PPU threads with NJ set. That is a "
     "policy, not a hardware fact: what the console's reset state and firmware "
     "leave in VSCR is not established.")
+
+PS3_CFG_BOOL(ppu, opd_swap_fixup, 0,
+    "Redirect an indirect call whose ctr is not a lifted function but whose r2 "
+    "(the TOC register) is: the guest wrote a function descriptor as {toc, code} "
+    "instead of {code, toc}, so the two words are swapped. Off by default. This "
+    "compensates for a title's malformed descriptor (Odin Sphere's flOw-style "
+    "handler tables and teardown vtables are written this way by func_0036FA74); "
+    "a swapped OPD is not a PPC ABI guarantee and the redirect can silently run "
+    "the wrong function. Off, the call stops as unresolved-indirect-call and its "
+    "hint names this option.")
+
+/* ---- spu ---------------------------------------------------------------- */
+
+PS3_CFG_U32(spu, dma_repeat_limit, 256, 1, 4294967295,
+    "How many identical MFC transfers (same EA and LSA, back to back) make the "
+    "SPU DMA engine apply its 1 ms back-off. The back-off is timing only: it "
+    "stops the host from spinning while a job polls a value another agent writes. "
+    "At the limit the engine only slows down; it does not halt the SPU.")
+
+PS3_CFG_U32(spu, dma_repeat_stop_secs, 0, 0, 86400,
+    "If non-zero, an SPU that has issued identical MFC transfers continuously "
+    "for this many seconds stops with kind spu-dma-repeat (image, pc, ea, lsa, "
+    "cmd, size, count, secs). 0 never stops: some jobs legitimately poll a ring "
+    "or label for longer than any fixed deadline, and a wrong halt wedges the "
+    "chain. This is a host watchdog, not PS3 hardware behaviour.")
 
 /* ---- title -------------------------------------------------------------- */
 
@@ -103,6 +133,10 @@ PS3_CFG_LEGACY_ENV("PS3RECOMP_IDA_PYTHON")
 #ifdef PS3_CFG_BOOL_DEFAULTED
 #  undef PS3_CFG_BOOL
 #  undef PS3_CFG_BOOL_DEFAULTED
+#endif
+#ifdef PS3_CFG_U32_DEFAULTED
+#  undef PS3_CFG_U32
+#  undef PS3_CFG_U32_DEFAULTED
 #endif
 #ifdef PS3_CFG_STR_DEFAULTED
 #  undef PS3_CFG_STR

@@ -51,6 +51,9 @@ Ids are stable kebab-case; a new gap gets a new kind, never a free-text variant.
 | `unlifted-function` | a call into a function the lift does not contain |
 | `unresolved-indirect-call` | an indirect call whose target is no lifted function |
 | `unknown-instruction` | an instruction the lifter did not know |
+| `dispatch-depth-exceeded` | `ps3_indirect_call` nested deeper than its host safety limit (4000) |
+| `spu-dma-repeat` | an SPU issued identical MFC transfers continuously past `spu.dma_repeat_stop_secs` |
+| `unresolved-guest-callback` | a host-initiated guest callback (`ppu_guest_call` / `ppu_guest_call_ct`) whose OPD or code word is 0 or is not a lifted function |
 
 Where each is raised, and what it carries beyond `pc lr tid`:
 
@@ -63,10 +66,38 @@ Where each is raised, and what it carries beyond `pc lr tid`:
 | `unlifted-function` | `ppu_unlifted_stub` | `target caller_lr` |
 | `unresolved-indirect-call` | `ps3_indirect_call` | `target caller_lr descriptors target_words hint` |
 | `unknown-instruction` | `ppu_trap_unknown_instruction`, emitted by the lifter | `pc word mnemonic` |
+| `dispatch-depth-exceeded` | `ps3_indirect_call_impl` | `target depth limit caller_lr` |
+| `spu-dma-repeat` | `mfc_submit` (`runtime/spu/spu_dma.h`) | `image ea lsa cmd size count secs`, with `pc` (LS address) and `tid` (SPU id) as the site |
+| `unresolved-guest-callback` | `ppu_guest_call`, `ppu_guest_call_ct` | `origin opd code toc descriptor hint`; `pc`/`lr` are 0 (no guest instruction runs) and `tid` is the calling guest thread |
 
 Lifted code does not track a guest pc, so for the first four `pc` is the caller's
 return address (the import stub's caller, the `sc` site, the call site). Only
 `unknown-instruction` knows the exact instruction address.
+
+`dispatch-depth-exceeded` is a **host** limit, not a statement about valid PS3
+programs: `ps3_indirect_call` recurses on the host stack, so a cyclic jump table,
+a self-targeting indirect call or a tail-call chain that never converges would
+overflow it. It was a quiet `return` (a fabricated guest return) before; now it
+stops at the call that would have been made.
+
+`spu-dma-repeat` is opt-in (`spu.dma_repeat_stop_secs`, default `0` = never
+stop). Identical transfers for `spu.dma_repeat_limit` (default 256) get a 1 ms
+back-off, which is timing only. The stop's `count` is the number of consecutive
+identical transfers observed and `secs` the wall time they lasted. Its `pc` is
+the SPU's local-store address and `tid` its SPU id; `lr` is 0, since an SPU has
+no link register in this model.
+
+`unresolved-guest-callback` is the host-initiated direction: an HLE library
+calls `ppu_guest_call` (an OPD) or `ppu_guest_call_ct` (a captured code/TOC) to
+deliver a notification into guest code. A callback that never ran is not a
+callback that returned 0, so a 0 OPD/code and a code no lifted function starts
+at both stop. The `descriptor` field is the four words at the OPD, which tells a
+clobbered descriptor from one that was never populated. **Where the firmware
+API makes a callback optional, the HLE caller must test the guest value itself**
+and do what the firmware does (skip, or return its parameter error); it must not
+dispatch 0. Every in-tree `g_ps3_guest_caller` site does this. The HLE frontier
+(`last_hle` / `syscall`) names the import or syscall the calling guest thread is
+inside, since the host function name is not available.
 
 A stop that has a `[[hle.stub]]` / `[[lv2.stub]]` entry for its NID or syscall
 number returns the entry's `ret` instead, logging it once as `ALLOW-LISTED ...`
