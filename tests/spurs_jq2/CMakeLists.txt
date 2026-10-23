@@ -20,6 +20,10 @@
 # jq2_port_race_stress is the same program at 10^7 pushes, label stress and
 # never t0.
 #
+# The CopyPush descriptor pool owns guest memory and therefore links the
+# reservation model and the named-stop implementation it calls; its test is
+# label t0 and tsan because it exercises the pool from several threads.
+#
 #   ctest --test-dir build/dev -L spurs
 #   ctest --preset t0 -R jq2
 #   ctest --preset tsan -R jq2_port
@@ -139,3 +143,19 @@ if(Python3_Interpreter_FOUND)
 else()
     message(STATUS "  spurs_jq2:    no python3; jq2_exports not registered")
 endif()
+
+# The CopyPush descriptor pool (libs/spurs/jq2/pool.cpp) owns guest memory; it
+# is exercised from several threads, so the test is also labelled tsan.
+add_executable(test_jq2_pool
+    test_jq2_pool.cpp
+    "${PROJECT_SOURCE_DIR}/runtime/memory/reservation.c"
+    "${PROJECT_SOURCE_DIR}/runtime/diag/stop.cpp"
+)
+target_include_directories(test_jq2_pool PRIVATE
+    "${PROJECT_SOURCE_DIR}/runtime/memory"
+    "${PROJECT_SOURCE_DIR}/runtime/ppu"
+    "${PROJECT_SOURCE_DIR}/include"
+)
+target_link_libraries(test_jq2_pool PRIVATE ps3recomp_spurs_jq2 Threads::Threads)
+add_test(NAME jq2_pool COMMAND test_jq2_pool)
+set_tests_properties(jq2_pool PROPERTIES LABELS "spurs;t0;tsan" TIMEOUT 120)
