@@ -17,7 +17,8 @@ Complete documentation for the Python-based recompilation pipeline tools in `too
 9. [prx_analyzer.py — Module Dependency Analysis](#prx_analyzerpy)
 10. [generate_stubs.py — HLE Stub Generator](#generate_stubspy)
 11. [gen_imports.py / gen_hle_nids.py — firmware imports](#gen_importspy--gen_hle_nidspy)
-12. [Dependencies](#dependencies)
+12. [ps3diff.py — trace schema, conversion and diff](#ps3diffpy)
+13. [Dependencies](#dependencies)
 
 ---
 
@@ -663,8 +664,29 @@ the table names handlers from the revision it was generated against.
 ---
 
 
-## Dependencies
+## ps3diff.py
 
+Trace schema, lossless conversion and differential comparison for PS3
+execution traces. `ps3diff.event/2` is the successor of
+`rpcs3-gdb-trace.event/1`: the older fields keep their meaning, and the new
+envelope names the execution context (PPU thread, SPU) plus the observations a
+job replay needs. `docs/PS3DIFF.md` is the contract.
+
+```bash
+python tools/ps3diff.py convert --to 2 trace.ndjson -o trace.v2.ndjson
+python tools/ps3diff.py convert --to 1 trace.v2.ndjson -o trace.v1.ndjson
+python tools/ps3diff.py validate trace.v2.ndjson
+python tools/ps3diff.py diff ref.v2.ndjson new.v2.ndjson --json --mask odin.mask.json
+```
+
+A canonical event/1 file round-trips byte for byte, or the converter refuses
+with the line number. `diff` aligns records per context by `ctx_seq`, ignores
+global interleaving and timing, and exits `0` identical, `1` divergent, `2`
+error, `3` zero records compared.
+
+---
+
+## Dependencies
 ### Python Requirements
 
 Listed in `tools/requirements.txt`:
