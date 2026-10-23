@@ -19,7 +19,7 @@ cflags = ['-std=gnu17', '-O1', '-UNDEBUG',
 cxxflags = ['-std=c++20', '-O1', '-UNDEBUG', '-I' + str(root / 'include')]
 common = ['spu_drain.c', 'spu_lockstep.c', 'spu_coherency.c', 'spu_workload.c',
           'spurs_policy.c', 'spurs_job.c', 'spu_tsp_weak.c', 'spu_vm_pagemap.c',
-          'spurs_policy_blob_weak.c', 'spu_interp.c']
+          'spurs_policy_blob_weak.c', 'spu_interp.c', '../memory/reservation.c']
 # Every fixture but the standalone coherence one compiles spu_channels.c into
 # itself (directly, or through test_spu_mfc_slots.c), which reaches the MFC
 # engine in spu_dma.h; the engine calls ps3_cfg_* and ps3_stop directly, so

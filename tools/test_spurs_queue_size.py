@@ -23,6 +23,6 @@ with tempfile.TemporaryDirectory(prefix='spurs-queue-size-') as tmp:
         '-Wl,-dead_strip' if platform.system()=='Darwin' else '-Wl,--gc-sections',
         '-I'+str(root/'include'),'-I'+str(root/'runtime/spu'),'-I'+str(root/'runtime/platform'),
         str(root/'tests/test_spurs_queue_size.c'),
-        *[str(root/'runtime/spu'/f'{u}.c') for u in units],
+        *[str(root/'runtime/spu'/f'{u}.c') for u in units], str(root/'runtime/memory/reservation.c'),
         str(root/'runtime/platform/win32_compat.c'),'-pthread','-lm','-o',str(out)],check=True)
     subprocess.run([str(out)],check=True,timeout=15)

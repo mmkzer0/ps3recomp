@@ -268,12 +268,16 @@ typedef struct spu_context {
     /* Atomic reservation state (GETLLAR/PUTLLC lock-line semantics). Multiple
      * SPU kernel threads share a lock-free queue in main memory; PUTLLC must
      * FAIL if the reserved 128-byte line changed since GETLLAR, or concurrent
-     * claims corrupt the queue. */
+     * claims corrupt the queue. "Changed" is two tests, both required to hold:
+     * the line's epoch is still resv_epoch (no store has landed on it, even
+     * one that rewrote the same bytes) and its bytes still equal resv_line.
+     * runtime/memory/reservation.h is the one statement of the rule. */
     uint32_t resv_ea;          /* reserved 128-byte line EA, aligned (0 = none) */
     int      resv_valid;
     uint32_t atomic_stat;      /* last atomic op result -> MFC_RdAtomicStat */
     uint64_t dbg_getllar;      /* SPU_PUTLLC_WHY: GETLLARs issued      */
     uint8_t  resv_line[128];   /* snapshot of the line at GETLLAR time */
+    uint64_t resv_epoch;       /* the line's epoch at GETLLAR time     */
 
     /* SPURS policy-module run mode (spurs_policy.c): nonzero while a lifted
      * policy module runs under the HLE'd kernel handoff. spu_indirect_branch

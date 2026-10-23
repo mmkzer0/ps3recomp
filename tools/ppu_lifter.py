@@ -111,8 +111,9 @@ typedef struct ppu_context {
     uint64_t cia;       /* Current instruction address */
     uint64_t thread_id;     /* PPU thread ID              */
     uint64_t reserve_addr;  /* lwarx/stwcx. reservation address */
-    uint64_t reserve_value; /* lwarx/stwcx. reservation value   */
-    int      reserve_valid; /* lwarx/stwcx. reservation flag    */
+    uint64_t reserve_value; /* lwarx/stwcx. reserved bits       */
+    uint64_t reserve_epoch; /* the line's epoch at the lwarx    */
+    int      reserve_valid; /* reservation width: 0, 4 or 8     */
     uint32_t vrsave;        /* VRSAVE (SPR 256): plain state      */
 } ppu_context;
 
@@ -128,13 +129,16 @@ void     vm_write8 (uint64_t addr, uint8_t  val);
 void     vm_write16(uint64_t addr, uint16_t val);
 void     vm_write32(uint64_t addr, uint32_t val);
 void     vm_write64(uint64_t addr, uint64_t val);
-/* stwcx./stdcx. store-conditional: atomically store `val` at `addr` iff the raw
- * big-endian guest word still equals `expected` (the value the paired lwarx/ldarx
- * loaded). Returns 1 if the reservation held (store applied), 0 otherwise. This
+/* lwarx/ldarx and stwcx./stdcx. (runtime/memory/reservation.h is the one
+ * statement of the rule). The load reserves; the store-conditional lands, and
+ * returns 1, only if nothing has stored to the reserved 128-byte line since
+ * the load (even the same value) and the reserved bytes are unchanged. This
  * makes lock-free sequences (free-list CAS, refcounts) correct across host
- * threads -- a plain conditional write races and corrupts under real concurrency. */
-int      ppu_stwcx32(uint64_t addr, uint32_t expected, uint32_t val);
-int      ppu_stdcx64(uint64_t addr, uint64_t expected, uint64_t val);
+ * threads, and across a PPU thread and an SPU PUTLLC on the same line. */
+uint32_t ppu_lwarx32(ppu_context* ctx, uint64_t addr);
+uint64_t ppu_ldarx64(ppu_context* ctx, uint64_t addr);
+int      ppu_stwcx32(ppu_context* ctx, uint64_t addr, uint32_t val);
+int      ppu_stdcx64(ppu_context* ctx, uint64_t addr, uint64_t val);
 #ifdef __cplusplus
 }
 #endif
@@ -2678,41 +2682,31 @@ class PPULifter:
         # (lwarx rD,0,rB; ...; stwcx. rS,0,rB) reuses r0 as scratch between the
         # lwarx and stwcx; emitting ctx->gpr[0] makes the two EAs diverge so the
         # reservation never matches and the loop spins forever.
+        # The reservation lives in the runtime (runtime/memory/reservation.h):
+        # lwarx/ldarx record the line's epoch with the loaded bits, and the
+        # store-conditional lands only if no store has reached the line since
+        # and the bits are unchanged. The lowering is just the call and CR0.
         if mn == "lwarx":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             ea = f"ctx->gpr[{ra}] + ctx->gpr[{rb}]" if ra != "0" else f"ctx->gpr[{rb}]"
-            return (f"{{ uint64_t ea = {ea}; "
-                    f"ctx->gpr[{rd}] = vm_read32(ea); "
-                    f"ctx->reserve_addr = (uint32_t)ea; ctx->reserve_value = ctx->gpr[{rd}]; }}")
+            return f"ctx->gpr[{rd}] = ppu_lwarx32(ctx, {ea});"
 
         if mn == "stwcx" or mn == "stwcx.":
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             ea = f"ctx->gpr[{ra}] + ctx->gpr[{rb}]" if ra != "0" else f"ctx->gpr[{rb}]"
-            # Atomic store-conditional: succeed only if the reservation address
-            # matches AND the guest word is unchanged since lwarx (ppu_stwcx32 does
-            # the atomic CAS). A plain conditional write loses concurrent updates
-            # (lock-free free-list/refcount corruption under real host threads).
-            return (f"{{ uint64_t ea = {ea}; "
-                    f"int _sc = (ctx->reserve_addr == (uint32_t)ea) && "
-                    f"ppu_stwcx32(ea, (uint32_t)ctx->reserve_value, (uint32_t)ctx->gpr[{rs}]); "
-                    f"ctx->cr = (ctx->cr & ~(0xFu << 28)) | (_sc ? (2u << 28) : 0u) | ((ctx->xer >> 31) << 28); "  # CR0 EQ = success
-                    f"ctx->reserve_addr = 0; }}")
+            return (f"{{ int _sc = ppu_stwcx32(ctx, {ea}, (uint32_t)ctx->gpr[{rs}]); "
+                    f"ctx->cr = (ctx->cr & ~(0xFu << 28)) | (_sc ? (2u << 28) : 0u) | ((ctx->xer >> 31) << 28); }}")  # CR0 EQ = success
 
         if mn == "ldarx":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             ea = f"ctx->gpr[{ra}] + ctx->gpr[{rb}]" if ra != "0" else f"ctx->gpr[{rb}]"
-            return (f"{{ uint64_t ea = {ea}; "
-                    f"ctx->gpr[{rd}] = vm_read64(ea); "
-                    f"ctx->reserve_addr = (uint32_t)ea; ctx->reserve_value = ctx->gpr[{rd}]; }}")
+            return f"ctx->gpr[{rd}] = ppu_ldarx64(ctx, {ea});"
 
         if mn == "stdcx" or mn == "stdcx.":
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             ea = f"ctx->gpr[{ra}] + ctx->gpr[{rb}]" if ra != "0" else f"ctx->gpr[{rb}]"
-            return (f"{{ uint64_t ea = {ea}; "
-                    f"int _sc = (ctx->reserve_addr == (uint32_t)ea) && "
-                    f"ppu_stdcx64(ea, ctx->reserve_value, ctx->gpr[{rs}]); "
-                    f"ctx->cr = (ctx->cr & ~(0xFu << 28)) | (_sc ? (2u << 28) : 0u) | ((ctx->xer >> 31) << 28); "
-                    f"ctx->reserve_addr = 0; }}")
+            return (f"{{ int _sc = ppu_stdcx64(ctx, {ea}, ctx->gpr[{rs}]); "
+                    f"ctx->cr = (ctx->cr & ~(0xFu << 28)) | (_sc ? (2u << 28) : 0u) | ((ctx->xer >> 31) << 28); }}")
 
         # ------- Data-stream hints: no architected effect -------
         if mn in ("dst", "dstst", "dss"):

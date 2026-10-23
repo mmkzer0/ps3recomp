@@ -9,7 +9,7 @@
 uint8_t* vm_base;
 uint32_t ppu_vm_size = 0x10000;
 /* The few runtime services the thread proc and create call; nothing here replaces the code under test. */
-void ppu_resv_register(ppu_context* c) { (void)c; }
+void ppu_ctx_register(ppu_context* c) { (void)c; }
 int ps3_intr_is_handler(unsigned long long tid) { (void)tid; return 0; }
 int ps3_intr_wait(unsigned long long tid) { (void)tid; return 0; }
 

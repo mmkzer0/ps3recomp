@@ -14,16 +14,9 @@
 
 extern uint8_t* vm_base;
 
-/* ppu_loader.cpp - PPU reservation bookkeeping. The ppu_memory.h inlines call
- * these on every store so lwarx/stwcx reservations can be broken; with no PPU
- * threads there is never a live reservation. */
-int  g_resv_store_active = 0;
-void ppu_resv_break_store(uint64_t ea) { (void)ea; }
-
-/* ppu_loader.cpp - each guest thread registers its context so a concurrent
- * stwcx can break its reservation. With g_resv_store_active off there is
- * nothing to register into. */
-void ppu_resv_register(void* ctx) { (void)ctx; }
+/* ppu_loader.cpp - each guest thread registers its context so the watchdog can
+ * list it. With no PPU threads there is nothing to register into. */
+void ppu_ctx_register(void* ctx) { (void)ctx; }
 
 /* ppu_loader.cpp - the size of the guest address space the loader mapped.
  * This host calloc's its own VM and passes bounds explicitly, so the bounds

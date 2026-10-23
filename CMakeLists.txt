@@ -429,6 +429,9 @@ if(PS3RECOMP_BUILD_TESTS)
     # the runtime library, so they run the handlers a title links.
     if(UNIX)
         add_subdirectory(tests/lwsync)
+        # The reservation model: PPU lwarx/stwcx. against SPU GETLLAR/PUTLLC,
+        # both directions, and the JQ2 port line under load.
+        add_subdirectory(tests/reservation)
     endif()
     # PS3_LOG_FIRST, the saturating counter behind the "first n times" log lines.
     add_executable(test_log_first tests/test_log_first.c)

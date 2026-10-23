@@ -35,7 +35,8 @@
  *         -o /tmp/test_spu_lockline_peer \
  *         runtime/spu/tests/test_spu_lockline_peer.c \
  *         runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
- *         runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
+ *         runtime/spu/spu_coherency.c runtime/memory/reservation.c \
+ *         runtime/spu/spu_workload.c \
  *         runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
  *         runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
  *         runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
@@ -439,14 +440,12 @@ int main(void)
  * and watch helpers, the host clock, and the title-specific SPURS hooks. None
  * of them is on the path this test drives.
  * -----------------------------------------------------------------------*/
-void ppu_resv_break_store(uint64_t ea)                 { (void)ea; }
 void ps3_ww_report_inline(uint32_t a, uint64_t v, int w)
 {
     (void)a; (void)v; (void)w;
 }
 unsigned long long ps3_ms_now(void)                    { return 0; }
 uint32_t g_ww_lo = 0xFFFFFFFFu, g_ww_hi = 0;
-int      g_resv_store_active = 0;
 uint32_t g_barrier_sync_watch = 0;
 
 void (*g_spurs_kernel_hook)(uint32_t) = 0;

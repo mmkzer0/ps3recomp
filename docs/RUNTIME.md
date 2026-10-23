@@ -169,9 +169,10 @@ typedef struct ppu_context {
     uint32_t vscr;          // Vector status and control register
     uint64_t cia;           // Current instruction address (program counter)
     uint64_t thread_id;     // Thread identification
-    uint64_t reserve_addr;  // lwarx/stwcx reservation address
-    uint64_t reserve_value; // lwarx/stwcx reservation value
-    int      reserve_valid; // Reservation validity flag
+    uint64_t reserve_addr;  // lwarx/ldarx reservation address
+    uint64_t reserve_value; // the raw big-endian bits that were loaded
+    uint64_t reserve_epoch; // the 128-byte line's epoch when they were
+    int      reserve_valid; // width of the load (0 = no reservation, 4 or 8)
 } ppu_context;
 ```
 
@@ -255,7 +256,7 @@ ppu_xer_get_byte_count(ctx) // Read string instruction byte count
 
 ### Load-Linked / Store-Conditional
 
-The `reserve_addr`, `reserve_value`, and `reserve_valid` fields implement the PowerPC atomic compare-and-swap pattern used by `lwarx`/`stwcx.` instructions. The recompiled code sets a reservation on `lwarx` and checks/clears it on `stwcx.`.
+The `reserve_*` fields hold a `lwarx`/`ldarx` reservation: the address, the bits loaded and the epoch of the 128-byte line they were loaded from. `stwcx.`/`stdcx.` succeed only if no store has reached the line since and the bits are unchanged. The rule is shared with the SPU's `GETLLAR`/`PUTLLC`; see [Reservations](#reservations).
 
 ### Stack Setup
 
@@ -737,6 +738,19 @@ In synchronous mode, all transfers complete immediately, so tag waits always suc
 An SPU transfer is a load or store of guest memory by another processor, and arm64 reorders independent loads and stores. `mfc_do_transfer` therefore brackets the copy: an **acquire fence before a GET** reads guest memory, and a **release fence after a PUT** wrote it. They pair with the barriers the lifter emits on the PPU side (`lwsync` lowers to an acq_rel fence, `sync` to seq_cst, `eieio` to a release fence; `PPU_FENCE` in `tools/ppu_lifter.py`): a PPU that stores data, executes `lwsync`, then stores a flag is read correctly by an SPU that GETs the flag and then the data, and an SPU that PUTs data and then a flag is read correctly by a PPU that loads the flag, executes `lwsync`, then loads the data. A PUT that copies under the lock-line lock is additionally released by `spu_lockline_unlock`.
 
 `tools/test_spu_dma_litmus.py` (`runtime/spu/tests/test_dma_litmus_main.c`) runs both directions through the real `mfc_submit`: short in tier `t0` (`spu_dma_litmus`), 10^8 publications per direction in the `stress` tier (`spu_dma_litmus_stress`). With either fence removed, the matching direction fails within a few seconds on arm64.
+
+### Reservations
+
+**Files:** `runtime/memory/reservation.{h,c}` (the model), `runtime/spu/spu_coherency.{c,h}` (SPU side: the lock-line lock, the table of reserving SPU contexts, `SPU_EVENT_LR`), `runtime/spu/spu_channels.c` (`GETLLAR`/`PUTLLC`/`PUTLLUC`), `runtime/ppu/ppu_loader.cpp` (`ppu_lwarx32`/`ppu_stwcx32`/`ppu_ldarx64`/`ppu_stdcx64`, the entry points the lifter calls).
+
+One rule covers PPU `lwarx`/`ldarx` + `stwcx.`/`stdcx.` and SPU `GETLLAR` + `PUTLLC`/`PUTLLUC`/`PUTQLLUC`. Every 128-byte line of guest memory has an **epoch**, a counter that advances each time a store lands on the line through a path that reports it. A reservation is the pair (epoch, value) read together; the conditional store succeeds only if the epoch is unchanged **and** the reserved bytes are unchanged, and the check and the store are one critical section on the line. The epoch is what an equal-value store cannot fake: an SPU `PUTLLC` that rewrites the bytes it read, or a `stwcx.` that stores the value it loaded, still advances it, so the other side's reservation is dead and its `PUTLLC` reports failure in `MFC_RdAtomicStat` (and raises `SPU_EVENT_LR`) or its `stwcx.` sets CR0 EQ clear.
+
+- **Granule.** The 128-byte line, for both sides. That is an implementation granularity, not a claim about the architectural PPU reservation granule (OQ-E in the adoption matrix is open). A conditional store anywhere in a line kills every reservation on it, including another PPU thread's on a different word (PPU-to-PPU used to be per word); a different line is never affected, there is no hashing.
+- **What advances the epoch.** A successful `stwcx.`/`stdcx.`, `PUTLLC`, `PUTLLUC`/`PUTQLLUC`, and everything that calls `spu_coh_notify_write[_except]`: SPU DMA `PUT` and `SDCRZ` into a line some SPU has reserved, PPU plain stores into such a line (`VM_WRITE_COH`), and the host helpers that edit a taskset line under the lock-line lock. An SPU's own DMA `PUT` moves its own reservation onto the new epoch (hardware does not cost an SPE its reservation for its own MFC write); its value compare still sees the data it changed.
+- **Lock order.** `spu_lockline_lock` (global) before the line's epoch lock, never the reverse. A `stwcx.` on a line no SPU has reserved takes only the line lock; on a reserved line it takes both, in that order, and the reserving SPUs are told afterwards.
+- **Known limits** (stated in `reservation.h`; the fix is the AM-10 fast-path design, M2+): a plain PPU store into a line **no SPU has ever reserved** is caught only by the value compare, so a same-value plain store does not kill a PPU or SPU reservation; an SPU DMA `PUT` into a line only a PPU has reserved is the same; and the very first `GETLLAR` of a line can race a `stwcx.` that has not yet seen the line marked, so that one store does not raise `SPU_EVENT_LR` (the `PUTLLC` still fails). `tests/reservation` asserts the first two as limits, so closing them fails the test and forces this paragraph to change.
+
+`tests/reservation/test_reservation.c` (CTest `reservation_*`) runs both directions through the real SPU channel path and the real PPU atomics: `contract` (deterministic), `jq2` (an SPU `PUTLLC` counting at `+0x00` while PPU `lwarx`/`stwcx.` and `ldarx`/`stdcx.` loops count at `+0x10`/`+0x18` of the same line), `aba_ppu` and `aba_spu` (same-value stores, handshaked on atomics, no sleeps). Short runs are tiers `t0` and `tsan`; `*_stress` is 10^8 iterations in tier `stress`.
 
 ---
 

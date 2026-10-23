@@ -119,10 +119,9 @@ static void* ppu_host_thread_proc(void* param)
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
 #endif
 
-    /* Register this thread's context for lwarx/stwcx cross-thread reservation
-     * invalidation (ppu_loader.cpp) -- so a concurrent stwcx breaks this thread's
-     * reservation and prevents ABA corruption of the guest's lock-free lists. */
-    { extern void ppu_resv_register(ppu_context*); ppu_resv_register(&info->ctx); }
+    /* Register this thread's context (ppu_loader.cpp) so the watchdog can say
+     * where it is. */
+    { extern void ppu_ctx_register(ppu_context*); ppu_ctx_register(&info->ctx); }
 
     fprintf(stderr, "[THREAD %llu] host thread started, entry=0x%08llX hosttid=%lu\n",
             (unsigned long long)info->ctx.thread_id,
