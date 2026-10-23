@@ -34,6 +34,9 @@
  *                                     (VM_WRITE_COH), and the host helpers that
  *                                     edit a taskset or SPURS line under the
  *                                     lock-line lock
+ *   resv_host_rmw                     a host-side update of a line (the JQ2
+ *                                     port line), under the same rule as a
+ *                                     stdcx. that lands
  *
  * KNOWN LIMITS (the hole is stated, not hidden; AM-10 owns the fix)
  *
@@ -140,6 +143,25 @@ int resv_stcx64(ppu_context* ctx, uint32_t ea, uint64_t val);
  * value compare still sees a change to the reserved bytes. Called by the
  * loader's store path with the storing thread's context. */
 void resv_keep_own(ppu_context* ctx, uint32_t ea);
+
+/* ---- host read-modify-write ----------------------------------------------- */
+
+/* Edits one 128-byte line as a single critical section of the model: what a
+ * successful stwcx./stdcx. is to a PPU thread, for host code that updates a
+ * line a guest (PPU or SPU) also reserves, such as the JQ2 port line. `fn`
+ * receives the host address of the 128-byte aligned line and returns nonzero
+ * iff it stored to it; it must neither block nor take another model lock, and
+ * must touch the line through atomics on whole aligned words (a concurrent
+ * reserved load, GETLLAR's copy, reads it unlocked).
+ *
+ * Same lock rule as a stcx. (see LOCK ORDER): on a line an SPU has reserved the
+ * lock-line lock is taken first, and the reserving SPUs are told afterwards;
+ * on any other line only the line lock is taken. A call whose `fn` reports no
+ * store leaves the epoch alone, so it kills no reservation. The line is held
+ * unconditionally (there is no reservation to validate). Returns whether `fn`
+ * stored (0 or 1). */
+typedef int (*resv_rmw_fn)(uint8_t* line, void* user);
+int resv_host_rmw(uint32_t ea, resv_rmw_fn fn, void* user);
 
 #ifdef __cplusplus
 }

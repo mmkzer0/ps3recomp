@@ -260,3 +260,19 @@ void resv_keep_own(ppu_context* ctx, uint32_t ea)
         ((uint32_t)ctx->reserve_addr >> RESV_LINE_SHIFT) == (ea >> RESV_LINE_SHIFT))
         ctx->reserve_epoch = resv_epoch(ea);
 }
+
+/* The same critical section as stcx() above, minus the reservation to validate:
+ * the line is held unconditionally and the epoch advances only if `fn` stored. */
+int resv_host_rmw(uint32_t ea, resv_rmw_fn fn, void* user)
+{
+    const int marked = resv_marked_spu(ea);
+    if (marked) spu_lockline_lock();
+    resv_line_lock(ea);
+    const int wrote = fn(vm_base + (ea & ~(RESV_LINE_SIZE - 1u)), user) != 0;
+    resv_line_unlock(ea, wrote);
+    if (marked) {
+        if (wrote) spu_coh_notify_write(ea);
+        spu_lockline_unlock();
+    }
+    return wrote;
+}
