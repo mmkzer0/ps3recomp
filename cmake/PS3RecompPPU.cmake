@@ -56,6 +56,8 @@ endfunction()
 #   <out_var>_HEADER       the generated header
 #   <out_var>_INCLUDE_DIR  the directory to add to target_include_directories
 #   <out_var>_LOADER_DIR   loader JSON (functions/imports/image) for reporting
+#   <out_var>_REPORT       ppu_lift_report.json: every trapped instruction, capped
+#                          tail and unresolved target (docs/LIFT_REPORT.md)
 function(ps3recomp_ppu_lift out_var)
     cmake_parse_arguments(ARG "" "INPUT;OUTPUT_DIR;CHUNKS;CODE_END;JOBS;SOURCE_NAME;HEADER_NAME"
                           "LIFTER_ARGS" ${ARGN})
@@ -105,7 +107,7 @@ function(ps3recomp_ppu_lift out_var)
         "${_loader_dir}/${_stem}.loader.json"
         "${_loader_dir}/${_stem}.imports.json")
 
-    set(_lift_outputs "${_out}/${_header}")
+    set(_lift_outputs "${_out}/${_header}" "${_out}/ppu_lift_report.json")
     set(_sources "")
     math(EXPR _last "${_chunks} - 1")
     foreach(_i RANGE 0 ${_last})
@@ -151,6 +153,7 @@ function(ps3recomp_ppu_lift out_var)
     set(${out_var}_HEADER "${_out}/${_header}" PARENT_SCOPE)
     set(${out_var}_INCLUDE_DIR "${_out}" PARENT_SCOPE)
     set(${out_var}_LOADER_DIR "${_loader_dir}" PARENT_SCOPE)
+    set(${out_var}_REPORT "${_out}/ppu_lift_report.json" PARENT_SCOPE)
 endfunction()
 
 # The HLE NID -> handler table: a hand-curated one beside the lift when the

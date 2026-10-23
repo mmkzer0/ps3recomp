@@ -674,6 +674,12 @@ relocated PRX, for example. `LIFTER_ARGS` forwards other lifter options.
 The generated translation units still need the title's large-TU flags: `-w`,
 `-ffp-contract=off`, and `-O1` rather than the Release `-O3`.
 
+The lift also writes `ppu_lift_report.json` (named by `<out_var>_REPORT`): every
+instruction lifted to a trap, every capped mid-function tail and every
+unresolved branch target, per function (`docs/LIFT_REPORT.md`). The generated
+table records the SHA-256 of the input ELF, and the loader refuses to run any
+other file under that lift (`docs/STOPS.md`, `identity-mismatch`).
+
 ### Configuration Reference (config.toml)
 
 See `templates/project/config.toml` for the full reference with comments. Key sections:
