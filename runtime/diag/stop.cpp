@@ -125,41 +125,7 @@ void write_all(const std::string& s)
 
 } // namespace
 
-/* runtime/spu/spu_dma.h is a C header inlined into header-only SPU fixtures,
- * so it cannot call ps3_stop() itself without making every fixture link this
- * file. It calls through this pointer instead (see the hook block there); a
- * title links both, and the PPU scaffold already references ps3_stop(). */
-static void spu_dma_repeat_stop(uint32_t image, uint32_t pc, uint64_t ea, uint32_t lsa,
-                                uint32_t cmd, uint32_t size, uint32_t count, uint64_t secs,
-                                uint32_t tid)
-{
-    char image_s[16], pc_s[16], ea_s[24], lsa_s[16], cmd_s[8], size_s[16], count_s[16], secs_s[24];
-    std::snprintf(image_s, sizeof image_s, "%u", image);
-    std::snprintf(pc_s, sizeof pc_s, "0x%05X", pc);
-    std::snprintf(ea_s, sizeof ea_s, "0x%08X", (uint32_t)ea);
-    std::snprintf(lsa_s, sizeof lsa_s, "0x%05X", lsa);
-    std::snprintf(cmd_s, sizeof cmd_s, "0x%02X", cmd);
-    std::snprintf(size_s, sizeof size_s, "%u", size);
-    std::snprintf(count_s, sizeof count_s, "%u", count);
-    std::snprintf(secs_s, sizeof secs_s, "%llu", (unsigned long long)secs);
-    ps3_stop_field f[] = {
-        {"image", image_s}, {"ea", ea_s}, {"lsa", lsa_s}, {"cmd", cmd_s},
-        {"size", size_s}, {"count", count_s}, {"secs", secs_s},
-    };
-    /* pc and tid are the site, so they stay the reserved pc=/tid= keys. */
-    ps3_stop_site site = { pc, 0, tid };
-    ps3_stop(PS3_STOP_SPU_DMA_REPEAT,
-             "an SPU has issued the same MFC transfer continuously past spu.dma_repeat_stop_secs",
-             "If the job is legitimately polling memory another agent writes (ring space, a "
-             "label), raise spu.dma_repeat_stop_secs or set it to 0, which disables this "
-             "watchdog; otherwise the protocol this transfer belongs to is wedged.",
-             f, sizeof f / sizeof f[0], &site);
-}
-
 extern "C" {
-
-void (*g_spu_dma_repeat_stop)(uint32_t, uint32_t, uint64_t, uint32_t, uint32_t, uint32_t,
-                              uint32_t, uint64_t, uint32_t) = spu_dma_repeat_stop;
 
 const char* ps3_stop_kind_id(ps3_stop_kind kind)
 {

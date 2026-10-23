@@ -690,18 +690,7 @@ const State& loaded()
 
 } // namespace
 
-/* runtime/spu/spu_dma.h is a C header inlined into header-only fixtures, so it
- * cannot call the accessors itself without making every fixture link this
- * file. It reads its two knobs through these pointers instead (see the hook
- * block in that header); a title links both because the PPU scaffold reads the
- * configuration. Constant-initialised, so no init-order question. */
-static uint32_t dma_repeat_limit_option(void) { return ps3_cfg_spu_dma_repeat_limit(); }
-static uint32_t dma_repeat_stop_secs_option(void) { return ps3_cfg_spu_dma_repeat_stop_secs(); }
-
 extern "C" {
-
-uint32_t (*g_spu_dma_repeat_limit)(void) = dma_repeat_limit_option;
-uint32_t (*g_spu_dma_repeat_stop_secs)(void) = dma_repeat_stop_secs_option;
 
 const ps3_config* ps3_config_get(void)
 {

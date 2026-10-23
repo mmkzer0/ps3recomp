@@ -9,7 +9,12 @@ real named-stop runtime (runtime/diag/stop.cpp), then:
     halt the SPU nor stop the process;
   - PS3RECOMP_SPU_DMA_REPEAT_STOP_SECS=1: the same run ends in exit 70 and one
     PS3STOP kind=spu-dma-repeat line carrying image pc ea lsa cmd size count
-    secs tid.
+    secs tid;
+  - the same stop, but with config.cpp/stop.cpp reachable only through a
+    static archive: the engine's direct calls must pull both members out of
+    the archive. With the old weak NULL hooks the fixture resolved them
+    locally, the archive stayed unextracted, and the configured stop was
+    silently ignored (the run then ends in "no stop", not 70).
 
 Each run is bounded, so a regression to "halt silently" or "never stop" fails
 instead of hanging the suite.
@@ -59,6 +64,20 @@ def main():
         binary = tmp / "test_dma_repeat"
         subprocess.run([cxx, *objects, "-pthread", "-lm", "-o", str(binary)], check=True)
 
+        # Partial-runtime regression: config.cpp and stop.cpp live only in a
+        # static archive and nothing in the fixture's main names them. The
+        # engine's direct ps3_cfg_*/ps3_stop calls must extract both members.
+        # A weak NULL hook in the header satisfies them locally instead, the
+        # archive stays unextracted, and the configured stop is ignored -- the
+        # fixture then hits its 3000-repeat bound and exits 3, not 70.
+        archive = tmp / "libps3recomp_runtime.a"
+        subprocess.run([os.environ.get("AR", "ar"), "rcs", str(archive),
+                        str(tmp / "config.o"), str(tmp / "stop.o")], check=True)
+        partial = tmp / "test_dma_repeat_archive"
+        subprocess.run([cxx, str(tmp / "test.o"), str(tmp / "pagemap.o"),
+                        str(tmp / "compat.o"), str(archive),
+                        "-pthread", "-lm", "-o", str(partial)], check=True)
+
         p = g.run([str(binary)], env=env, timeout=60)
         assert p.returncode == 0, (p.returncode, p.stdout, p.stderr)
         assert "PASS:" in p.stdout, p.stdout
@@ -70,8 +89,16 @@ def main():
             "7", "0x1234", "0x00000200", "0x00100", "0x40", "16", "1"), f
         assert int(f["count"]) >= 256, f
         assert int(f["secs"]) >= 1, f
+
+        p = g.run([str(partial), "stop"],
+                  env=dict(env, PS3RECOMP_SPU_DMA_REPEAT_STOP_SECS="1"), timeout=60)
+        f = g.expect_stop(p, "spu-dma-repeat")
+        assert (f["image"], f["pc"], f["ea"], f["lsa"], f["cmd"], f["size"], f["tid"]) == (
+            "7", "0x1234", "0x00000200", "0x00100", "0x40", "16", "1"), f
+        assert int(f["count"]) >= 256, f
+        assert int(f["secs"]) >= 1, f
     print("PASS: identical DMA transfers back off by default and stop only with "
-          "spu.dma_repeat_stop_secs set")
+          "spu.dma_repeat_stop_secs set (direct and static-archive links)")
     return 0
 
 

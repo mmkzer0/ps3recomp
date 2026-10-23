@@ -16,6 +16,18 @@ TOOLS="$REPO/tools"
 RUNTIME_SPU="$REPO/runtime/spu"
 
 GCC="${1:-${GCC:-gcc}}"
+CXX="${CXX:-c++}"
+
+# spu_dma.h calls the typed configuration (runtime/config/config.cpp) and the
+# named-stop runtime (runtime/diag/stop.cpp) directly, so every fixture that
+# inlines mfc_submit() needs both: they are strong references, not weak hooks.
+# Build them once, as C++, and link them into every fixture.
+RT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/spu-tests-runtime.XXXXXX")
+trap 'rm -rf "$RT_DIR"' EXIT
+"$CXX" -std=c++20 -O2 -I "$REPO/include" -c "$REPO/runtime/config/config.cpp" \
+    -o "$RT_DIR/config.o"
+"$CXX" -std=c++20 -O2 -I "$REPO/include" -c "$REPO/runtime/diag/stop.cpp" \
+    -o "$RT_DIR/stop.o"
 
 pass=0
 fail=0
@@ -44,9 +56,11 @@ for gen in "$HERE"/gen_test_*.py; do
     EXTRA=""
     [ -f "$HERE/test_${name}.deps" ] && . "$HERE/test_${name}.deps"
 
-    if "$GCC" -std=c11 -O2 -I "$gen_out" -I "$RUNTIME_SPU" \
-        "$gen_out/spu_recomp.c" "$main" $EXTRA -o "$exe" \
-        2> "$HERE/build_${name}.log"; then
+    if ( cd "$gen_out" &&
+         "$GCC" -std=c11 -O2 -I "$gen_out" -I "$RUNTIME_SPU" \
+             -c "$gen_out/spu_recomp.c" "$main" $EXTRA &&
+         "$CXX" "$gen_out"/*.o "$RT_DIR/config.o" "$RT_DIR/stop.o" \
+             -pthread -lm -o "$exe" ) 2> "$HERE/build_${name}.log"; then
         out=$("$exe" 2>&1) && rc=$? || rc=$?
         if [ "$rc" -eq 0 ]; then
             echo "[PASS] $name -- $out"

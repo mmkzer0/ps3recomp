@@ -26,11 +26,19 @@ else
 fi
 
 S="$REPO/runtime/spu"
+CXX="${CXX:-c++}"
 FLAGS=(-std=gnu17 -O2 -fwrapv -w -I "$S" -I "$REPO/include" -I "$REPO/runtime/platform" -I "$OUT")
 "$CC" "${FLAGS[@]}" -include "$HERE/bench_barrier.h" -c "$OUT/lift/spu_recomp.c" -o "$OUT/lifted.o"
-"$CC" "${FLAGS[@]}" -o "$OUT/spu_bench" "$HERE/spu_bench_main.c" "$OUT/lifted.o" \
-    "$S/spu_channels.c" "$S/spu_drain.c" "$S/spu_lockstep.c" "$S/spu_coherency.c" \
-    "$S/spu_workload.c" "$S/spurs_policy.c" "$S/spurs_job.c" "$S/spu_tsp_weak.c" \
-    "$S/spu_vm_pagemap.c" "$S/spurs_policy_blob_weak.c" "$S/spu_interp.c" \
-    "$REPO/runtime/platform/win32_compat.c" -lpthread -lm
+# spu_dma.h calls ps3_cfg_* and ps3_stop directly (strong references), so the
+# benchmark must link the typed configuration and the named-stop runtime.
+C_SOURCES=("$HERE/spu_bench_main.c" "$S/spu_channels.c" "$S/spu_drain.c" "$S/spu_lockstep.c"
+    "$S/spu_coherency.c" "$S/spu_workload.c" "$S/spurs_policy.c" "$S/spurs_job.c"
+    "$S/spu_tsp_weak.c" "$S/spu_vm_pagemap.c" "$S/spurs_policy_blob_weak.c"
+    "$S/spu_interp.c" "$REPO/runtime/platform/win32_compat.c")
+for src in "${C_SOURCES[@]}"; do
+    "$CC" "${FLAGS[@]}" -c "$src" -o "$OUT/$(basename "${src%.c}").o"
+done
+"$CXX" -std=c++20 -O2 -I "$REPO/include" -c "$REPO/runtime/config/config.cpp" -o "$OUT/config.o"
+"$CXX" -std=c++20 -O2 -I "$REPO/include" -c "$REPO/runtime/diag/stop.cpp" -o "$OUT/stop.o"
+"$CXX" -o "$OUT/spu_bench" "$OUT"/*.o -lpthread -lm
 "$OUT/spu_bench" "$@"

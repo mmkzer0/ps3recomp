@@ -25,6 +25,7 @@
 #include <stdio.h>
 #include <stdio.h>
 #include "../../include/ps3emu/stop.h"
+#include "../../include/ps3emu/config.h"
 #include "../platform/win32_compat.h"
 
 #ifdef __cplusplus
@@ -33,47 +34,14 @@ extern "C" {
 
 extern uint8_t* vm_base;
 
-/* ---- typed configuration and named stops, for a header-only engine -------
- * spu_dma.h is inlined into the runtime *and* into header-only SPU fixtures
- * (runtime/spu/tests, tools/test_spu_*.py) that link neither the typed
- * configuration (runtime/config/config.cpp) nor the named-stop runtime
- * (runtime/diag/stop.cpp). The engine reaches both through these pointers so
- * those fixtures keep linking: there they are NULL and the engine uses the
- * registry defaults below. The runtime defines them in config.cpp and
- * stop.cpp, and a title links both (the PPU scaffold references them).
- *
- * The defaults are the registry's defaults (spu.dma_repeat_limit=256,
- * spu.dma_repeat_stop_secs=0); change them together, tests/gates/test_config.py
- * checks the registry's. */
-#if defined(_MSC_VER)
-   /* MSVC/clang-cl have no portable weak data definitions: the runtime always
-    * links config.cpp and stop.cpp, so a plain declaration resolves. No
-    * header-only fixture is built there (the SPU python drivers skip Windows). */
-#  define SPU_DMA_HOOK
-#  define SPU_DMA_HOOK_NO_DEF 1
-#elif defined(__GNUC__) || defined(__clang__)
-#  define SPU_DMA_HOOK __attribute__((weak))
-#else
-#  define SPU_DMA_HOOK
-#  define SPU_DMA_HOOK_NO_DEF 1
-#endif
-
-#ifndef SPU_DMA_HOOK_NO_DEF
-SPU_DMA_HOOK uint32_t (*g_spu_dma_repeat_limit)(void) = 0;
-SPU_DMA_HOOK uint32_t (*g_spu_dma_repeat_stop_secs)(void) = 0;
-SPU_DMA_HOOK void (*g_spu_dma_repeat_stop)(uint32_t image, uint32_t pc, uint64_t ea,
-                                           uint32_t lsa, uint32_t cmd, uint32_t size,
-                                           uint32_t count, uint64_t secs, uint32_t tid) = 0;
-#else
-extern uint32_t (*g_spu_dma_repeat_limit)(void);
-extern uint32_t (*g_spu_dma_repeat_stop_secs)(void);
-extern void (*g_spu_dma_repeat_stop)(uint32_t image, uint32_t pc, uint64_t ea,
-                                     uint32_t lsa, uint32_t cmd, uint32_t size,
-                                     uint32_t count, uint64_t secs, uint32_t tid);
-#endif
-
-#define SPU_DMA_REPEAT_DEFAULT_LIMIT      256u
-#define SPU_DMA_REPEAT_DEFAULT_STOP_SECS  0u
+/* The two spu.dma_repeat_* knobs and the spu-dma-repeat stop are called
+ * directly, so every binary that inlines mfc_submit() holds a strong
+ * reference to ps3_config_get() and ps3_stop(). That is what makes a static
+ * archive pull config.cpp and stop.cpp in: with a weak NULL hook in this
+ * header the linker could satisfy the reference locally and never extract
+ * the strong archive members, silently ignoring the configured values.
+ * Header-only fixtures therefore link runtime/config/config.cpp and
+ * runtime/diag/stop.cpp (tools/test_spu_*.py, runtime/spu/tests/run_tests.sh). */
 
 /* Guard against a guest DMA whose effective address lands in reserved-but-
  * uncommitted guest memory (the 4 GB VM is MEM_RESERVE; only main mem / RSX /
@@ -1289,30 +1257,38 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
     { static SPU_THREAD_LOCAL uint32_t s_last_ea, s_last_lsa, s_rep;
       static SPU_THREAD_LOCAL unsigned long long s_since;
       extern unsigned long long ps3_ms_now(void);
-      const uint32_t limit = g_spu_dma_repeat_limit ? g_spu_dma_repeat_limit()
-                                                    : SPU_DMA_REPEAT_DEFAULT_LIMIT;
-      const uint32_t stop_secs = g_spu_dma_repeat_stop_secs
-                                     ? g_spu_dma_repeat_stop_secs()
-                                     : SPU_DMA_REPEAT_DEFAULT_STOP_SECS;
+      const uint32_t limit = ps3_cfg_spu_dma_repeat_limit();
+      const uint32_t stop_secs = ps3_cfg_spu_dma_repeat_stop_secs();
       if ((uint32_t)ea == s_last_ea && lsa == s_last_lsa) {
           if (++s_rep >= limit && !s_since) s_since = ps3_ms_now();
           if (stop_secs && s_rep >= limit &&
               ps3_ms_now() - s_since >= (unsigned long long)stop_secs * 1000u) {
               const uint32_t stop_pc = (uint32_t)spu->pc & SPU_LS_MASK;
               const unsigned long long elapsed = (ps3_ms_now() - s_since) / 1000u;
-              if (g_spu_dma_repeat_stop)
-                  g_spu_dma_repeat_stop((uint32_t)spu->image_id, stop_pc, ea, lsa,
-                                        cmd & 0xFFu, size, s_rep, elapsed,
-                                        spu->spu_id);
-              /* Only a header-only fixture (no named-stop runtime, and the knob
-               * is its default 0 there) can get here; stay fail-closed rather
-               * than halting silently if that ever changes. */
-              fprintf(stderr, "PS3STOP v=1 kind=spu-dma-repeat image=%d pc=0x%05X "
-                      "ea=0x%08X lsa=0x%05X cmd=0x%02X size=%u count=%u secs=%llu tid=%u\n",
-                      spu->image_id, stop_pc, (uint32_t)ea, lsa, cmd & 0xFFu, size,
-                      s_rep, elapsed, spu->spu_id);
-              fflush(stderr);
-              _Exit(PS3_STOP_EXIT_CODE);
+              char image_s[16], pc_s[16], ea_s[24], lsa_s[16], cmd_s[8];
+              char size_s[16], count_s[16], secs_s[24];
+              snprintf(image_s, sizeof image_s, "%u", (unsigned)spu->image_id);
+              snprintf(pc_s, sizeof pc_s, "0x%05X", stop_pc);
+              snprintf(ea_s, sizeof ea_s, "0x%08X", (unsigned)(uint32_t)ea);
+              snprintf(lsa_s, sizeof lsa_s, "0x%05X", (unsigned)lsa);
+              snprintf(cmd_s, sizeof cmd_s, "0x%02X", (unsigned)(cmd & 0xFFu));
+              snprintf(size_s, sizeof size_s, "%u", (unsigned)size);
+              snprintf(count_s, sizeof count_s, "%u", (unsigned)s_rep);
+              snprintf(secs_s, sizeof secs_s, "%llu", elapsed);
+              ps3_stop_field f[] = {
+                  {"image", image_s}, {"ea", ea_s}, {"lsa", lsa_s}, {"cmd", cmd_s},
+                  {"size", size_s}, {"count", count_s}, {"secs", secs_s},
+              };
+              /* pc and tid are the site, so they stay the reserved pc=/tid= keys. */
+              ps3_stop_site site = { stop_pc, 0, spu->spu_id };
+              ps3_stop(PS3_STOP_SPU_DMA_REPEAT,
+                       "an SPU has issued the same MFC transfer continuously past "
+                       "spu.dma_repeat_stop_secs",
+                       "If the job is legitimately polling memory another agent writes (ring "
+                       "space, a label), raise spu.dma_repeat_stop_secs or set it to 0, which "
+                       "disables this watchdog; otherwise the protocol this transfer belongs "
+                       "to is wedged.",
+                       f, sizeof f / sizeof f[0], &site);
           }
           if (s_rep >= limit) Sleep(1);   /* timing only: see above */
       } else { s_last_ea = (uint32_t)ea; s_last_lsa = lsa; s_rep = 0; s_since = 0; } }
@@ -1712,8 +1688,5 @@ static inline uint32_t mfc_channel_read(mfc_engine* mfc, spu_context* spu,
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
-
-#undef SPU_DMA_HOOK
-#undef SPU_DMA_HOOK_NO_DEF
 
 #endif /* SPU_DMA_H */
