@@ -11,8 +11,6 @@
 uint8_t* vm_base;
 uint32_t g_ww_lo, g_ww_hi;
 void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; abort(); }
-int g_resv_store_active;
-void ppu_resv_break_store(uint64_t addr) { (void)addr; abort(); }
 int spu_coh_is_reserved(uint32_t addr) { (void)addr; return 0; }
 void spu_coh_notify_write(uint32_t addr) { (void)addr; abort(); }
 void spu_lockline_lock(void) { abort(); }

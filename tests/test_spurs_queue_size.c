@@ -14,9 +14,7 @@ uint8_t* vm_base;
 uint32_t ppu_vm_size=0x20000;
 uint32_t g_ww_lo, g_ww_hi, g_barrier_sync_watch;
 uint32_t g_spu_image_src_ea, g_spu_image_ls_start, g_spu_image_span;
-int g_resv_store_active;
 void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
-void ppu_resv_break_store(uint64_t ea) { (void)ea; }
 void sys_event_queue_cancel_by_id(u32 id) { (void)id; }
 void sys_event_queue_uncancel_by_id(u32 id) { (void)id; }
 

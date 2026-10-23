@@ -20,7 +20,6 @@ extern "C" {
 uint8_t* vm_base;
 uint32_t ppu_vm_size = 0x10000;
 uint32_t g_ww_lo = 0, g_ww_hi = 0;
-int g_resv_store_active = 0;
 void ps3_hle_call(uint32_t, ppu_context*);
 uint32_t prx_resolve_export(uint32_t) { return 0; }
 void ps3_indirect_call(ppu_context*) { std::abort(); }
@@ -33,7 +32,6 @@ int spu_coh_is_reserved(uint32_t) { return 0; }
 void spu_coh_notify_write(uint32_t) {}
 void spu_lockline_lock() {}
 void spu_lockline_unlock() {}
-void ppu_resv_break_store(uint64_t) {}
 void ps3_ww_report_inline(uint32_t, uint64_t, int) {}
 uint32_t vm_read32(uint64_t) { return 0; }
 void vm_write32(uint64_t, uint32_t) {}

@@ -249,14 +249,12 @@ int main(void)
  * delivery hook's owner, the PPU's reservation and watch helpers, and the
  * title-specific SPURS hooks. None of them is on the path this test drives.
  * -----------------------------------------------------------------------*/
-void ppu_resv_break_store(uint64_t ea)                 { (void)ea; }
 void ps3_ww_report_inline(uint32_t a, uint64_t v, int w)
 {
     (void)a; (void)v; (void)w;
 }
 unsigned long long ps3_ms_now(void)                    { return 0; }
 uint32_t g_ww_lo = 0xFFFFFFFFu, g_ww_hi = 0;
-int      g_resv_store_active = 0;
 uint32_t g_barrier_sync_watch = 0;
 
 void (*g_spurs_kernel_hook)(uint32_t) = 0;
