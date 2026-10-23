@@ -26,7 +26,13 @@
  *   + per cache entry: align1024(size)                           cacheBuffer[0..3]
  *
  * We reproduce that arithmetic rather than invent a layout, so a job that
- * range-checks its own buffers sees what it would on hardware.
+ * range-checks its own buffers sees what it would on hardware. The binary's
+ * memory is its image plus the bss that the high word of eaBinary names.
+ *
+ * Only two CRT versions are modelled, JOBCRT Ver13 and Ver14; each gets the
+ * context's jm interface pointer and the kernel's view of LS 0x100-0x2FF, and
+ * Ver14 the two jm entries in the job runtime area. Any other version is a
+ * named stop. See docs/RUNTIME.md, "SPURS job start".
  *
  * Load address: the job binary is position-independent (job_start_w_crt derives
  * its load delta with a brsl-to-next / subtract-link-time-address idiom), so jm2
@@ -43,6 +49,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "ps3emu/log_first.h"
+#include "ps3emu/stop.h"
 
 extern uint8_t* vm_base;
 extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
@@ -111,6 +118,66 @@ enum {
 #define JOB_DMA_TAG   20u          /* "one of: {20,21}" — job_context_types.h */
 #define JOB_STACK_DEFAULT 8192u    /* _cellSpursCheckJob's sizeStack==0 default */
 
+/* Top of local store, from the top down: the job descriptor (<= 1 KB), the
+ * JobContext2 (48 B) with the jm interface object in the 16 bytes after it,
+ * and below those the job runtime area (SPU_JOB_RT_SIZE). Everything the job
+ * itself owns -- image, bss, buffers, stack -- lies below JOB_RT_LS. */
+#define JOB_DESC_LS   (SPU_LS_SIZE - 0x400u)
+#define JOB_CTX_LS    (JOB_DESC_LS - 0x40u)
+#define JOB_JM_IFACE  (JOB_CTX_LS + 0x30u)
+#define JOB_RT_LS     (JOB_CTX_LS - SPU_JOB_RT_SIZE)
+
+/* The CRT marker at LS 0x30 (the first 12 bytes of job_start_w_crt.o's header).
+ * The PM accepts any "JOBCRT Ver" suffix; this loader models two CRTs only. */
+#define JOB_CRT_MARKER_LS  0x30u
+#define JOB_CRT_MARKER_LEN 12u
+
+/* The Ver14 jm interface: two LS pointers the PM plants for the CRT (word 0
+ * its scheduler switch, word 1 its coroutine context swap). The CRT stashes
+ * word 1 and calls it, with the tag status it just read in r3, when a DMA tag
+ * it waits on is not complete. This loader runs one job at a time, so there
+ * is nothing to switch to: word 1 is a routine that waits for the MFC and
+ * returns. The PM's swap preserves r0-r2 and r80-r127 and hands back whatever
+ * the other context left in r3-r79; this routine preserves every register but
+ * r3, which carries the tag status (all ones) on return. The tag mask channel
+ * is left at -1.
+ *
+ *     0x10 loop: il      $r3, -1
+ *               wrch    MFC_WrTagMask, $r3
+ *               il      $r3, 0                   ; immediate update
+ *               wrch    MFC_WrTagUpdate, $r3
+ *               rdch    $r3, MFC_RdTagStat
+ *               ceqi    $r3, $r3, -1             ; every tag group complete?
+ *               brz     $r3, loop
+ *               bi      $r0
+ *
+ * Idle tag groups read as complete, so the loop ends exactly when every
+ * command the job issued has. Word 0 is never called by a Ver14 image; it
+ * points at a trap (a `stop` with SPU_JOB_RT_TRAP_STOP) so a call that does
+ * come is a named stop rather than a branch to LS 0, which ends the job as if
+ * it had finished. */
+#define JOB_RT_TRAP   0x00u
+#define JOB_RT_SWAP   0x10u
+static const uint32_t s_job_rt_swap[] = {
+    0x40FFFF83u,   /* il      $r3, -1                        */
+    0x21A00B03u,   /* wrch    MFC_WrTagMask, $r3             */
+    0x40800003u,   /* il      $r3, 0                         */
+    0x21A00B83u,   /* wrch    MFC_WrTagUpdate, $r3           */
+    0x01A00C03u,   /* rdch    $r3, MFC_RdTagStat             */
+    0x7CFFC183u,   /* ceqi    $r3, $r3, -1                   */
+    0x207FFD03u,   /* brz     $r3, loop (-6 words)           */
+    0x35000000u,   /* bi      $r0                            */
+};
+
+static void job_rt_plant(uint8_t* ls)
+{
+    ls32(ls, JOB_RT_LS + JOB_RT_TRAP, SPU_JOB_RT_TRAP_STOP);
+    for (uint32_t i = 0; i < sizeof s_job_rt_swap / sizeof s_job_rt_swap[0]; i++)
+        ls32(ls, JOB_RT_LS + JOB_RT_SWAP + i * 4u, s_job_rt_swap[i]);
+    ls32(ls, JOB_JM_IFACE,      JOB_RT_LS + JOB_RT_TRAP);
+    ls32(ls, JOB_JM_IFACE + 4u, JOB_RT_LS + JOB_RT_SWAP);
+}
+
 /* Local store of the most recent job, kept alive past the run.
  *
  * A title can poll the SPU that runs a job chain with sys_spu_thread_read_LS,
@@ -161,7 +228,13 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     if (!entry || !job_ea) return -1;
 
     /* ---- descriptor ---------------------------------------------------- */
-    uint32_t ea_bin   = (uint32_t)(g64(job_ea + JH_EA_BINARY) & ~1ull);
+    /* eaBinary is a be u64: the low word is the guest EA (bit 0 = CACHE_INHIBIT),
+     * the high word is, for an ELF job, the bss the crt zeroes itself, in
+     * quadwords (jq2e2-027). Truncating it to the EA loses the bss and lays the
+     * stack and buffers over it. */
+    uint64_t ea_bin64 = g64(job_ea + JH_EA_BINARY);
+    uint32_t ea_bin   = (uint32_t)(ea_bin64 & ~1ull);
+    uint64_t bss      = (ea_bin64 >> 32) << 4;
     uint32_t size_bin = (uint32_t)g16(job_ea + JH_SIZE_BINARY) << 4;
     uint32_t n_dma    = (uint32_t)g16(job_ea + JH_SIZE_DMA_LIST) / 8u;
     uint32_t use_io   = g32(job_ea + JH_USE_INOUT_BUFFER);
@@ -179,14 +252,65 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
         return -1;
     }
 
+    /* The job's memory is its image plus bss, from LS 0. It must end below the
+     * job runtime area: past it the descriptor, context and jm interface
+     * written below would land on the job's own bytes. */
+    if ((uint64_t)size_bin + bss > JOB_RT_LS) {
+        char job_s[16], img_s[16], bin_s[16], bss_s[24], mem_s[24], lim_s[16];
+        snprintf(job_s, sizeof job_s, "0x%08X", job_ea);
+        snprintf(img_s, sizeof img_s, "%d", image_id);
+        snprintf(bin_s, sizeof bin_s, "0x%X", size_bin);
+        snprintf(bss_s, sizeof bss_s, "0x%llX", (unsigned long long)bss);
+        snprintf(mem_s, sizeof mem_s, "0x%llX", (unsigned long long)(size_bin + bss));
+        snprintf(lim_s, sizeof lim_s, "0x%X", JOB_RT_LS);
+        ps3_stop_field f[] = {
+            {"job", job_s}, {"image", img_s}, {"binary", bin_s},
+            {"bss", bss_s}, {"memory", mem_s}, {"limit", lim_s},
+        };
+        ps3_stop(PS3_STOP_SPU_JOB_MEMORY,
+                 "a SPURS job's image plus bss reaches the job runtime area at the top "
+                 "of local store",
+                 "The descriptor's sizeBinary and the eaBinary high word (bss / 16) must "
+                 "leave room for the job context above them; check that the job "
+                 "descriptor is intact.",
+                 f, sizeof f / sizeof f[0], NULL);
+    }
+
     uint8_t* ls = (uint8_t*)calloc(1, SPU_LS_SIZE);
     if (!ls) return -1;
 
     /* ---- binary at LS 0 (PIC, so delta 0 keeps the lifted addresses) ---- */
     memcpy(ls, vm_base + ea_bin, size_bin);
 
+    /* ---- CRT gate ---------------------------------------------------------
+     * Only the two CRTs below are modelled (jm interface, kernel view). The PM
+     * accepts any "JOBCRT Ver" suffix, so a job from another SDK drop gets
+     * here and would run on a context it was not built for. */
+    unsigned crt = 0;
+    if (!memcmp(ls + JOB_CRT_MARKER_LS, "JOBCRT Ver13", JOB_CRT_MARKER_LEN)) crt = 13;
+    else if (!memcmp(ls + JOB_CRT_MARKER_LS, "JOBCRT Ver14", JOB_CRT_MARKER_LEN)) crt = 14;
+    if (!crt) {
+        char job_s[16], img_s[16], text_s[JOB_CRT_MARKER_LEN + 1], hex_s[2 * JOB_CRT_MARKER_LEN + 1];
+        snprintf(job_s, sizeof job_s, "0x%08X", job_ea);
+        snprintf(img_s, sizeof img_s, "%d", image_id);
+        for (unsigned i = 0; i < JOB_CRT_MARKER_LEN; i++) {
+            const uint8_t b = ls[JOB_CRT_MARKER_LS + i];
+            text_s[i] = (b >= 0x20 && b < 0x7F) ? (char)b : '?';
+            snprintf(hex_s + 2 * i, 3, "%02X", b);
+        }
+        text_s[JOB_CRT_MARKER_LEN] = 0;
+        ps3_stop_field f[] = {
+            {"job", job_s}, {"image", img_s}, {"marker", text_s}, {"bytes", hex_s},
+        };
+        ps3_stop(PS3_STOP_SPU_JOB_CRT_VERSION,
+                 "a SPURS job whose CRT marker is not JOBCRT Ver13 or JOBCRT Ver14",
+                 "Only those two CRTs' jm interface and kernel view are modelled; "
+                 "a job built against another CRT needs its own model before it can run.",
+                 f, sizeof f / sizeof f[0], NULL);
+    }
+
     /* ---- regions, following _cellSpursCheckJob's own arithmetic --------- */
-    uint32_t p         = ALIGN1024(size_bin);
+    uint32_t p         = ALIGN1024(size_bin + (uint32_t)bss);
     /* Same rule as the scratch pointer: these are REGION BASES and stay valid
      * when the region is empty. NULL invites the job to dereference 0 -- and
      * since the job binary loads at LS 0, reading through a null base returns
@@ -239,13 +363,13 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     /* ---- context + descriptor, parked above the job's memory region ------
      * jm2 keeps these in its own bss (outside job memory); we load the job at
      * LS 0, so the top of LS is the equivalent free space. */
-    uint32_t desc_ls = SPU_LS_SIZE - 0x400;     /* descriptors are <= 1024 B */
-    uint32_t ctx_ls  = desc_ls - 0x40;          /* CellSpursJobContext2, 48 B */
+    const uint32_t desc_ls = JOB_DESC_LS;       /* descriptors are <= 1024 B */
+    const uint32_t ctx_ls  = JOB_CTX_LS;        /* CellSpursJobContext2, 48 B */
     uint32_t dsz     = job_desc_size ? job_desc_size : 256u;
     if (dsz > 0x400) dsz = 0x400;
-    if (p > ctx_ls)
+    if (p > JOB_RT_LS)
         fprintf(stderr, "[spurs-job] job 0x%08X: WARNING regions reach 0x%X, "
-                        "past the context at 0x%X\n", job_ea, p, ctx_ls);
+                        "past the job runtime area at 0x%X\n", job_ea, p, JOB_RT_LS);
     memcpy(ls + desc_ls, vm_base + job_ea, dsz);
 
     ls32(ls, ctx_ls + JC_IO_BUFFER, io_ls);
@@ -253,27 +377,28 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
         ls32(ls, ctx_ls + JC_CACHE_BUFFER + (uint32_t)i * 4u, cache_ls[i]);
     /* sizeJobDescriptor:4 is the first bitfield of a big-endian u32, so it
      * occupies the TOP 4 bits. 0 means 64 bytes, otherwise n*128. */
-    /* The low 28 bits are not padding to a "JOBCRT Ver13" crt (WWS/Edge jobs,
-     * Twisted Metal's JobQueue jobs): jm2 parks an LS pointer to its kernel
-     * block there, and the crt returns 0x80410A11 and STOPs before main when
-     * it is 0 -- so the job never runs and never clears its completion
-     * counter. Hand it the free 16 bytes after the context (zeroed); the crt
-     * only stashes the pointer and clears the field again. */
-    uint32_t jm_iface = memcmp(ls + 0x30, "JOBCRT Ver13", 12) == 0 ? ctx_ls + 0x30 : 0;
+    /* The low 28 bits are not padding to a "JOBCRT Ver13"/"Ver14" crt (WWS and
+     * Edge jobs, Twisted Metal's JobQueue jobs, Odin Sphere's): the job manager
+     * parks an LS pointer to its jm interface there, and the crt returns
+     * 0x80410A11 and STOPs before main when it is 0 -- so the job never runs
+     * and never clears its completion counter. The interface is the 16 bytes
+     * after the context: zero for Ver13, which only stashes the pointer; for
+     * Ver14 the two entries (job_rt_plant). */
+    const uint32_t jm_iface = JOB_JM_IFACE;
+    if (crt == 14) job_rt_plant(ls);
     /* The same crt also reads the SPURS kernel context with ABSOLUTE loads
      * (lqa): spuNum at 0x1C8 (cellSpursGetCurrentSpuId), the trace buffer at
      * 0x210, a trace-enable byte at 0x175. On hardware the kernel owns
      * 0x100-0x2FF; here the job is loaded at 0, so those reads returned the
      * job's own instruction words and it indexed per-SPU tables with an opcode
-     * and halted. The lifted code never reads those bytes as data, so overlay
-     * the kernel's view: SPU 0, our DMA tag, tracing off. */
-    if (jm_iface) {
-        memset(ls + 0x170, 0, 0x10);
-        memset(ls + 0x1C0, 0, 0x10);
-        ls32(ls, 0x1C8, g_spurs_job_spu_num);
-        ls32(ls, 0x1CC, JOB_DMA_TAG);
-        memset(ls + 0x210, 0, 0x10);
-    }
+     * and halted. The lifted code never reads those bytes as data (Ver14: only
+     * 0x170, 0x1C0 and, with tracing on, 0x210 -- jq2e2-023), so overlay the
+     * kernel's view: SPU 0, our DMA tag, tracing off. */
+    memset(ls + 0x170, 0, 0x10);
+    memset(ls + 0x1C0, 0, 0x10);
+    ls32(ls, 0x1C8, g_spurs_job_spu_num);
+    ls32(ls, 0x1CC, JOB_DMA_TAG);
+    memset(ls + 0x210, 0, 0x10);
     ls32(ls, ctx_ls + JC_SIZE_JOB_DESC,
          ((dsz == 64 ? 0u : (dsz / 128u) & 0xFu) << 28) | jm_iface);
     ls16(ls, ctx_ls + JC_NUM_IO_BUFFER,    (uint16_t)n_dma);
@@ -366,6 +491,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     spu_context ctx;
     spu_context_init(&ctx, 0);
     ctx.image_id = image_id;
+    ctx.job_rt_ls = crt == 14 ? JOB_RT_LS : 0;
     memcpy(ctx.ls, ls, SPU_LS_SIZE);
     /* SPU stack grows down. A function saves its link register in its
      * caller's frame, at 16($sp), so the entry's first store lands 16 bytes
@@ -394,6 +520,25 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
      * HALT-ASSERT heqi 0x1650 seen once per jm2 job is NORMAL COMPLETION
      * noise, not a failure: the job's real work finished before the jump. */
     spu_run_with_halt(entry, &ctx);
+
+    /* The only way into the trap quadword is a call through jm word 0. Both
+     * paths end the run there: the interpreter stops at the `stop`, and the
+     * resolver halts the lifted run once the interpreted stub stops. */
+    if (ctx.job_rt_ls && (ctx.status & SPU_STATUS_STOPPED_BY_STOP) &&
+        ctx.stop_code == SPU_JOB_RT_TRAP_STOP &&
+        (ctx.pc & SPU_LS_MASK) == ctx.job_rt_ls + JOB_RT_TRAP + 4u) {
+        char job_s[16], img_s[16], ent_s[16];
+        snprintf(job_s, sizeof job_s, "0x%08X", job_ea);
+        snprintf(img_s, sizeof img_s, "%d", image_id);
+        snprintf(ent_s, sizeof ent_s, "0x%05X", ctx.job_rt_ls + JOB_RT_TRAP);
+        ps3_stop_field f[] = { {"job", job_s}, {"image", img_s}, {"entry", ent_s} };
+        ps3_stop_site site = { ctx.job_rt_ls + JOB_RT_TRAP, ctx.gpr[0]._u32[0] & SPU_LS_MASK, 0 };
+        ps3_stop(PS3_STOP_SPU_JOB_JM_ENTRY,
+                 "a Ver14 SPURS job called the jm interface's scheduler-switch entry",
+                 "No Odin Sphere job image does; the entry stands for the job manager's "
+                 "scheduler, which a single job run does not model.",
+                 f, sizeof f / sizeof f[0], &site);
+    }
 
     /* Capture the job's outbound mailbox. These are LS POINTERS TO STRINGS for
      * the SPU printf service, NOT query results -- value 0x83C0 from the sound

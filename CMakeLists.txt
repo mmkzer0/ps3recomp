@@ -457,10 +457,16 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME spu_dma_repeat
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_dma_repeat.py")
+        # The SPURS job loader: JOBCRT Ver13/Ver14 gate, Ver14 jm interface,
+        # kernel view and bss, each byte-checked on synthetic jobs.
+        add_test(NAME spurs_job_crt
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spurs_job_crt.py")
         set_tests_properties(spinlock_word_width PROPERTIES LABELS "sync;t0")
         set_tests_properties(spurs_task_exit_code_initialize spurs_taskset_size
             PROPERTIES LABELS "spurs;t0")
-        set_tests_properties(spu_sdcrz spu_observe spu_dma_repeat PROPERTIES LABELS "spu;t0")
+        set_tests_properties(spu_sdcrz spu_observe spu_dma_repeat spurs_job_crt
+            PROPERTIES LABELS "spu;t0")
         # Message passing between a PPU thread and an SPU through the real MFC
         # engine, both directions: acquire before a GET, release after a PUT.
         # The same program runs short here and at 10^8 in the stress tier.

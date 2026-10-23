@@ -96,6 +96,7 @@ static void build_job(uint16_t stack_qw, uint16_t scratch_qw)
     put32(JOB_EA + 0x24, 8);                    /* one cache DMA entry */
     put32(JOB_EA + 0x30, CACHE_SIZE);           /* entry: size ... */
     put32(JOB_EA + 0x34, CACHE_EA);             /* ... and address */
+    memcpy(g_guest_mem + BIN_EA + 0x30, "JOBCRT Ver13", 12);   /* the loader's CRT gate */
     for (uint32_t i = 0; i < CACHE_SIZE; i += 4)
         put32(CACHE_EA + i, 0xC0DE0000u | i);
 }

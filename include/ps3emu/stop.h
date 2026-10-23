@@ -69,7 +69,10 @@ extern "C" {
     X(SPU_DMA_REPEAT,           "spu-dma-repeat")                              \
     X(UNRESOLVED_GUEST_CALLBACK, "unresolved-guest-callback")                  \
     /* A6: an HLE handler returns a host pointer; stop, never truncate it. */ \
-    X(HLE_UNSUPPORTED_RETURN,   "hle-unsupported-return")
+    X(HLE_UNSUPPORTED_RETURN,   "hle-unsupported-return")                      \
+    X(SPU_JOB_CRT_VERSION,      "spu-job-crt-version")                         \
+    X(SPU_JOB_MEMORY,           "spu-job-memory")                              \
+    X(SPU_JOB_JM_ENTRY,         "spu-job-jm-entry")
 
 /* A fixed underlying type in C++ makes a kind outside the list (a caller's bug,
  * which the stop still reports as "invalid-kind") a well-defined value rather

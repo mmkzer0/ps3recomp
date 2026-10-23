@@ -15,7 +15,8 @@ KINDS = ["identity-mismatch", "config-invalid", "unresolved-nid",
          "unresolved-indirect-call", "unknown-instruction",
          "dispatch-depth-exceeded", "spu-dma-repeat",
          "unresolved-guest-callback",
-         "hle-unsupported-return"]
+         "hle-unsupported-return", "spu-job-crt-version", "spu-job-memory",
+         "spu-job-jm-entry"]
 
 
 def probe(*args):

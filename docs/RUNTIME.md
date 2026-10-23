@@ -419,6 +419,68 @@ uint32_t stop = spu_interp_run(&ctx, ctx->pc);
 
 Tests: `runtime/spu/tests/test_spu_observe.c` (`ctest -R spu_observe`).
 
+### SPURS job start
+
+**File:** `runtime/spu/spurs_job.c` (`spu_run_spurs_job`)
+
+A SPURS job is a raw image at LS 0 that enters through Sony's `JOBCRT` startup
+code with `r3` = `CellSpursJobContext2*` and `r4` = the job descriptor, both in
+local store. The loader lays the job out the way `_cellSpursCheckJob` sizes it
+(binary + bss, ioBuffer, oBuffer, scratch + stack, cache buffers, each
+`align1024`) and parks the context at the top of local store:
+
+| LS | What |
+|---|---|
+| `0x3FC00..0x3FFFF` | job descriptor copy (`r4`); `0x3FF00` is also the link the job returns to |
+| `0x3FBC0` | `JobContext2` (`r3`); `+0x14` = `sizeJobDescriptor:4` in the top nibble, the jm interface pointer in the low 18 bits |
+| `0x3FBF0` | the jm interface object (two LS pointers; all zero for Ver13) |
+| `0x3FAC0..0x3FBBF` | job runtime area (Ver14 only; zero for Ver13) |
+
+**CRT gate.** The 12 bytes at LS `0x30` must read `JOBCRT Ver13` or `JOBCRT Ver14`.
+The policy module accepts any `JOBCRT Ver` suffix, but only these two CRTs'
+interface and kernel view are modelled, so any other marker (Ver12, Ver15, no
+marker) is the named stop `spu-job-crt-version` rather than a run on a context
+the CRT was not built for.
+
+**Memory.** For an ELF job the high word of `eaBinary` is the bss in quadwords
+(the CRT zeroes it itself); the loader keeps the full 64 bits, so the job's
+memory is `sizeBinary + 16 * hi32`, every buffer and the stack (`r1`) start
+above it, and the bss reads as zero. Memory that reaches `0x3FAC0` would lie on
+the context and is the named stop `spu-job-memory`.
+
+**Kernel view.** Both CRTs read the SPURS kernel context with absolute loads;
+with the job at LS 0 those addresses are the job's own bytes, so the loader
+overlays what the kernel would show: `0x170..0x17F` zero (byte `0x175` = tracing
+off), `0x1C0..0x1CF` zero with the SPU number at `0x1C8` and the DMA tag (20) at
+`0x1CC`, `0x210..0x21F` zero.
+
+**Ver14 jm interface.** The CRT's preflight reads `ctx+0x14 & 0x0FFFFFFF` and,
+when it is zero, returns `0x80410A11` and stops before `main`. The job manager
+supplies two entries there; the loader does the same from the job runtime area:
+
+- word 0 (the job manager's scheduler switch) is never called by the Odin Sphere
+  images. It points at a `stop 0x3B0E` trap: a call ends the run in the named
+  stop `spu-job-jm-entry`.
+- word 1 (the coroutine context swap) is called with the tag status in `r3`
+  when a DMA tag the job waits on is not complete. There is no other context to
+  swap to, so it is an eight-instruction SPU routine that polls
+  `MFC_RdTagStat` (mask -1, immediate update) until every tag group is complete
+  and returns with `bi $r0`. It preserves every register but `r3`, which holds
+  the status (`0xFFFFFFFF`); the real swap preserves `r0-r2` and `r80-r127`.
+  The tag mask channel is left at -1.
+
+The runtime area is machine code, not part of any lifted image. A job running
+in the interpreter executes it directly; lifted code reaches it through
+`spu_indirect_branch`, which interprets the area (`spu_context.job_rt_ls`) until
+the routine returns to its caller. A tag that never completes is a wait that
+never ends, as on hardware.
+
+Tests: `runtime/spu/tests/test_spurs_job_crt_main.c`, driven by
+`tools/test_spurs_job_crt.py` (`ctest -R spurs_job_crt`): synthetic Ver13 and
+Ver14 jobs with byte-checked local store, the Ver13 local store pinned by hash,
+a CRT-like program that reaches `main`, the word-1 wait on interpreted and
+lifted-style jobs, and each stop.
+
 ---
 
 ## Type System
