@@ -13,7 +13,8 @@
  */
 
 #include "spu_dma.h"
-#include "spu_coherency.h" /* lock-line lock + PPU-write coherence bitmap */
+#include "spu_coherency.h" /* lock-line lock + PPU-write coherence */
+#include "../memory/reservation.h"   /* line epochs: the reservation rule */
 #include "spu_helpers.h"   /* spu_splat_u32 / spu_ls_read128 (SMC microstep) */
 #include "spu_observe.h"   /* per-context observer hooks (channels, MFC atoms) */
 #include "spu_lockstep.h"
@@ -598,7 +599,9 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * same instant. Copying the snapshot from `ls` restores that property,
          * and a store that lands after the read now leaves BOTH stale -- which
          * is what makes the lost-reservation event fire. */
-        memcpy(ls, mem, MFC_ATOMIC_LINE);              /* line -> local store */
+        const uint64_t epoch = resv_line_lock(ea);     /* no conditional store lands mid-read */
+        resv_copy_out(ls, mem);                        /* line -> local store */
+        resv_line_unlock(ea, 0);
         /* Snapshot from `ls`, NOT a second read of `mem`. Hardware GETLLAR is a
          * single atomic 128-byte read, so the reserved data and the reservation
          * come from the same instant. Reading guest memory twice lets a PPU store
@@ -614,6 +617,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * Havok's SPU allocator (GH3 collide task, LS 0xA66C) re-issues the
          * GETLLAR until that bit is set, and spun forever on 0. PUTLLUC is 2. */
         ctx->resv_ea = ea; ctx->resv_valid = 1; ctx->atomic_stat = 4;
+        ctx->resv_epoch = epoch;
         ctx->dbg_getllar++;
         /* A GETLLAR re-issued millions of times on one line is an SPU spin-wait
          * that nobody is releasing (a ticket lock, a counter barrier). Say so
@@ -692,11 +696,25 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
           uint32_t b = g_barrier_sync_watch;
           if (b && (ea & ~127u) == (b & ~127u)) g_spu_putllc_sync_hit++; }
         spu_lockline_lock();
+        /* The reservation holds iff the SPU still has one on this line, no
+         * store has landed on it since GETLLAR (the epoch, which an
+         * equal-value store cannot fake) and its bytes still equal the
+         * snapshot. The epoch test and the commit are one hold of the line, so
+         * a PPU stwcx. cannot land between them. */
+        int committed = 0;
         if (ctx->resv_valid && ctx->resv_ea == ea &&
-            memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
-            { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
-              spu_lockguard_check(ctx, ea, ls, MFC_ATOMIC_LINE, "PUTLLC"); }
-            memcpy(mem, ls, MFC_ATOMIC_LINE);          /* commit local store */
+            resv_line_lock_at(ea, ctx->resv_epoch)) {
+            uint8_t cur[MFC_ATOMIC_LINE];
+            resv_copy_out(cur, mem);
+            if (memcmp(cur, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
+                { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
+                  spu_lockguard_check(ctx, ea, ls, MFC_ATOMIC_LINE, "PUTLLC"); }
+                resv_copy_in(mem, ls);                 /* commit local store */
+                committed = 1;
+            }
+            resv_line_unlock(ea, committed);
+        }
+        if (committed) {
             /* A committing PUTLLC is a line write like any other, so every
              * PEER reservation on it is lost and its SPU takes SPU_EVENT_LR.
              * Silent, this is the same lost update the PPU half was added to
@@ -791,9 +809,11 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
     case MFC_PUTLLUC_CMD:
     case MFC_PUTQLLUC_CMD:
         spu_lockline_lock();
+        resv_line_lock(ea);
         { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
           spu_lockguard_check(ctx, ea, ls, MFC_ATOMIC_LINE, "PUTLLUC"); }
-        memcpy(mem, ls, MFC_ATOMIC_LINE);              /* unconditional store */
+        resv_copy_in(mem, ls);                         /* unconditional store */
+        resv_line_unlock(ea, 1);
         /* Unconditional, so it invalidates EVERY reservation on the line --
          * this SPU's included, which is why the notify runs before the
          * bookkeeping below rather than after it. A peer left holding a
@@ -967,14 +987,16 @@ static int yz_ch_block(void)
  * snapshots it, so compare against that snapshot rather than hooking every store.
  * ponytail: polled, not store-hooked -- one 128-byte memcmp per 10 ms poll on an
  * already-blocked SPU, and nothing at all on the PPU store path. The ceiling is
- * one poll of wake latency, and an A-B-A write that restores the same bytes
- * between polls is missed; hook the writers if either ever matters.
+ * one poll of wake latency. An A-B-A write that restores the same bytes is
+ * caught by the line's epoch when its writer reports to the reservation model
+ * (reservation.h, known limits 1 and 2) and missed otherwise.
  */
 static void spu_resv_lost_poll(spu_context* ctx)
 {
     if (!(ctx->event_mask & 0x400u) || !ctx->resv_valid) return;
     if (!vm_base || ctx->resv_ea == 0) return;
-    if (memcmp(vm_base + ctx->resv_ea, ctx->resv_line, 128) != 0) {
+    if (resv_epoch(ctx->resv_ea) != ctx->resv_epoch ||
+        memcmp(vm_base + ctx->resv_ea, ctx->resv_line, 128) != 0) {
         ctx->resv_valid = 0;
         ctx->event_status |= 0x400u;
     }

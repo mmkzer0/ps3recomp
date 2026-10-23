@@ -1,17 +1,21 @@
 /*
  * ps3recomp - PPU <-> SPU lock-line coherence
  *
- * See spu_coherency.h for what this is for. The state here is deliberately
- * plain: a bit per 128-byte line, a small table of the SPU contexts that have
- * ever reserved one, and the lock-line spinlock. Everything that WRITES it runs
- * with the lock-line lock held (the SPU's GETLLAR, the PPU's coherent store),
- * so the read-modify-write on a shared bitmap byte is serialized. Only
- * spu_coh_is_reserved reads without the lock, which is the entire point: it is
- * on every PPU store.
+ * See spu_coherency.h for what this is for. What is kept here is the SPU side
+ * of the reservation model (runtime/memory/reservation.h): the lock-line
+ * spinlock, the table of SPU contexts that have ever reserved a line, and the
+ * delivery of SPU_EVENT_LR to the ones a write took the reservation from. The
+ * per-line state -- the epoch every conditional store validates, and the
+ * reserved-line mark -- lives in the model. Everything that WRITES the context
+ * table or a reservation runs with the lock-line lock held (the SPU's GETLLAR,
+ * the PPU's coherent store), so the read-modify-write on them is serialized.
+ * Only spu_coh_is_reserved reads without the lock, which is the entire point:
+ * it is on every PPU store.
  */
 
 #include <stdlib.h>
 #include "spu_coherency.h"
+#include "../memory/reservation.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -58,29 +62,8 @@ void spu_lockline_unlock(void) { atomic_flag_clear_explicit(&g_lockline, memory_
 #endif
 
 /* ===========================================================================
- * The reserved-line bitmap
- *
- * One bit per 128-byte line over the whole 32-bit guest address space: 4 MiB of
- * zero-initialized BSS, of which only the pages around addresses an SPU has
- * actually reserved are ever touched. The reference implementation scopes its
- * bitmap to the one window a single title's SPURS structures live in; this
- * runtime hands out guest memory from several disjoint regions (the ELF image,
- * the sys_memory window at 0x40000000, the raw-SPU local-store windows), and a
- * line outside a hardcoded window would be silently non-coherent, which is the
- * failure this whole file exists to remove.
+ * The reservation holders
  * ===========================================================================*/
-#define SPU_COH_LINE_SHIFT  7                                  /* 128-byte lines */
-#define SPU_COH_LINES       (1u << (32 - SPU_COH_LINE_SHIFT))   /* 2^25 lines */
-#define SPU_COH_BITMAP_SZ   (SPU_COH_LINES / 8)                 /* 4 MiB */
-
-static unsigned char s_coh_bitmap[SPU_COH_BITMAP_SZ];
-
-/* Zero until the first GETLLAR anywhere. Keeps the PPU fast path off the
- * bitmap entirely for a title that runs no SPU code, and keeps every existing
- * test that stores through vm_write* paying one compare against a hot global.
- * Written once, under the lock; read unlocked, where a stale zero costs at most
- * one missed event on the very first reservation of the run. */
-static int s_coh_armed;
 
 /* Every live virtual context may retain a reservation between scheduling
  * quanta; physical SPU count is not a bound on this set. All access is under
@@ -95,9 +78,7 @@ unsigned long g_spu_lr_raise = 0;
 
 void spu_coh_reserve(spu_context* ctx, uint32_t ea)
 {
-    uint32_t line = ea >> SPU_COH_LINE_SHIFT;
-    s_coh_bitmap[line >> 3] |= (unsigned char)(1u << (line & 7));
-    s_coh_armed = 1;
+    resv_mark_spu(ea);
 
     if (!ctx) return;
     for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next)
@@ -170,9 +151,7 @@ void spu_coh_forget_range(uintptr_t lo, uintptr_t hi)
 
 int spu_coh_is_reserved(uint32_t addr)
 {
-    if (!s_coh_armed) return 0;
-    uint32_t line = addr >> SPU_COH_LINE_SHIFT;
-    return (s_coh_bitmap[line >> 3] >> (line & 7)) & 1u;
+    return resv_marked_spu(addr);
 }
 
 /* A DMA PUT is issued BY an SPU, and hardware does not take that SPU's own
@@ -183,29 +162,22 @@ int spu_coh_is_reserved(uint32_t addr)
  * livelocks exactly there: 16 million atomic ops on one line, every PUTLLC
  * failing for "no reservation", 600k of them self-inflicted.
  *
- * The PUTLLC path already guards this case by dropping its own reservation
- * before notifying; this gives the DMA path the same ability. */
-/* ppu_loader.cpp, when linked. The loader is compiled per game, so the host,
- * the fixtures and any build without it have no PPU reservations to break.
- * POSIX: a weak no-op definition the loader's overrides (a weak undefined
- * reference is not enough: ld64 only lets those stay unresolved for dylib
- * symbols). link.exe/lld-link: the linker's own default (see ppu_gcm_pump in
- * ppu_loader.cpp). */
-#if defined(_MSC_VER)
-void ppu_resv_break_line(uint32_t ea);
-void ppu_resv_break_line_absent(uint32_t ea) { (void)ea; }
-#pragma comment(linker, "/alternatename:ppu_resv_break_line=ppu_resv_break_line_absent")
-#else
-__attribute__((weak)) void ppu_resv_break_line(uint32_t ea) { (void)ea; }
-#endif
-
+ * The write advances the line's epoch like any other, which would fail the
+ * issuer's own PUTLLC on the epoch instead; so the issuer's reservation, if it
+ * is on this line, adopts the new epoch. Its value compare still sees the data
+ * the PUT changed. */
 void spu_coh_notify_write_except(uint32_t ea, const void* self)
 {
     uint32_t line = ea & ~127u;
-    ppu_resv_break_line(ea);
+    resv_bump(ea);
     for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next) {
         spu_context* c = entry->ctx;
-        if (!c || (const void*)c == self) continue;
+        if (!c) continue;
+        if ((const void*)c == self) {
+            if (c->resv_valid && (c->resv_ea & ~127u) == line)
+                c->resv_epoch = resv_epoch(ea);
+            continue;
+        }
         if (c->resv_valid && (c->resv_ea & ~127u) == line) {
             c->event_status |= SPU_EVENT_LR;
             c->resv_valid = 0;
@@ -218,7 +190,7 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
 void spu_coh_notify_write(uint32_t ea)
 {
     uint32_t line = ea & ~127u;
-    ppu_resv_break_line(ea);
+    resv_bump(ea);
     for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next) {
         spu_context* c = entry->ctx;
         if (!c) continue;

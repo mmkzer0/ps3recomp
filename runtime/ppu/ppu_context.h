@@ -97,9 +97,12 @@ typedef struct ppu_context {
     /* Thread identification */
     uint64_t thread_id;
 
-    /* Reserve address for lwarx/stwcx (load-linked / store-conditional) */
+    /* lwarx/ldarx reservation (runtime/memory/reservation.h): the address, the
+     * raw big-endian bits that were loaded, the line's epoch when they were,
+     * and the width of the load (0 = no reservation, 4 or 8). */
     uint64_t reserve_addr;
     uint64_t reserve_value;
+    uint64_t reserve_epoch;
     int      reserve_valid;
 
     /* VRSAVE (SPR 256): software-managed; kept so mfspr returns what mtspr wrote */

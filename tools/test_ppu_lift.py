@@ -706,8 +706,10 @@ def check_decode_and_lift():
     lifter = PPULifter()
     dummy = LiftedFunction(name="conf", start_addr=0, end_addr=0x10000)
     fails = [0]
+    total = [0]
 
     def check(label, word, expect_mn, operand_substr=None, code_substr=None):
+        total[0] += 1
         insn = ppu_disasm.decode(word, 0x30000)
         mn = insn.mnemonic.rstrip(".")
         if mn != expect_mn:
@@ -724,11 +726,13 @@ def check_decode_and_lift():
             print(f"FAIL {label}: lifter fell through to the unhandled catch-all: {code}")
             fails[0] += 1
             return
-        if code_substr and code_substr not in code:
-            print(f"FAIL {label}: lifted code {code!r} missing {code_substr!r}")
-            fails[0] += 1
-            return
-        print(f"[fpscr/vrsave] ok {label}: {insn.mnemonic} {insn.operands} -> {code}")
+        wanted = (code_substr,) if isinstance(code_substr, str) else (code_substr or ())
+        for want in wanted:
+            if want not in code:
+                print(f"FAIL {label}: lifted code {code!r} missing {want!r}")
+                fails[0] += 1
+                return
+        print(f"[fpscr/vrsave/atomics] ok {label}: {insn.mnemonic} {insn.operands} -> {code}")
 
     check("mtfsb0", fp_x_form(70, 5), "mtfsb0", code_substr="ppu_mtfsb(ctx, 5, 0)")
     check("mtfsb1", fp_x_form(38, 5), "mtfsb1", code_substr="ppu_mtfsb(ctx, 5, 1)")
@@ -738,8 +742,25 @@ def check_decode_and_lift():
     check("mtspr VRSAVE", spr_form(467, 3, 256), "mtspr",
           operand_substr="VRSAVE", code_substr="ctx->vrsave = (uint32_t)ctx->gpr[3]")
 
-    n_ok = 5 - fails[0]
-    print(f"[fpscr/vrsave] {n_ok} checks passed, {fails[0]} FAILED")
+    # Reservations. The reservation lives in the runtime (runtime/memory/
+    # reservation.h): the lowering is the call, the EA, and CR0 EQ from the
+    # call's result. rA = 0 is the literal zero, not r0 -- the canonical loop
+    # reuses r0 between the lwarx and the stwcx., and an EA built from gpr[0]
+    # there never matches its reservation.
+    cr0_eq = "ctx->cr = (ctx->cr & ~(0xFu << 28)) | (_sc ? (2u << 28) : 0u)"
+    check("lwarx rA=0", x_logic(20, 3, 0, 4), "lwarx",
+          code_substr="ctx->gpr[3] = ppu_lwarx32(ctx, ctx->gpr[4]);")
+    check("lwarx rA!=0", x_logic(20, 3, 5, 4), "lwarx",
+          code_substr="ppu_lwarx32(ctx, ctx->gpr[5] + ctx->gpr[4])")
+    check("stwcx. rA=0", x_logic(150, 3, 0, 4, rc=1), "stwcx",
+          code_substr=("int _sc = ppu_stwcx32(ctx, ctx->gpr[4], (uint32_t)ctx->gpr[3]);", cr0_eq))
+    check("ldarx rA=0", x_logic(84, 3, 0, 4), "ldarx",
+          code_substr="ctx->gpr[3] = ppu_ldarx64(ctx, ctx->gpr[4]);")
+    check("stdcx. rA!=0", x_logic(214, 3, 5, 4, rc=1), "stdcx",
+          code_substr=("int _sc = ppu_stdcx64(ctx, ctx->gpr[5] + ctx->gpr[4], ctx->gpr[3]);", cr0_eq))
+
+    n_ok = total[0] - fails[0]
+    print(f"[fpscr/vrsave/atomics] {n_ok} checks passed, {fails[0]} FAILED")
     return fails[0] == 0
 
 # ---------------------------------------------------------------------------

@@ -113,7 +113,6 @@ static void* churn(void* arg)
 uint8_t* vm_base;
 uint32_t ppu_vm_size = 0x10000;
 uint32_t g_ww_lo, g_ww_hi;
-int g_resv_store_active;
 void* g_ps3_guest_caller;
 uint32_t g_ydkj_real_spurs_ea, g_ydkj_real_taskset_ea;
 uint32_t prx_resolve_export(uint32_t nid) { (void)nid; return 0; }
@@ -126,7 +125,6 @@ int spu_coh_is_reserved(uint32_t ea) { (void)ea; return 0; }
 void spu_coh_notify_write(uint32_t ea) { (void)ea; }
 void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
-void ppu_resv_break_store(uint64_t ea) { (void)ea; }
 void ps3_ww_report_inline(uint32_t ea, uint64_t v, int w) { (void)ea; (void)v; (void)w; }
 uint32_t vm_read32(uint64_t a) { uint32_t x; memcpy(&x, vm_base + a, 4); return __builtin_bswap32(x); }
 void vm_write32(uint64_t a, uint32_t x) { x = __builtin_bswap32(x); memcpy(vm_base + a, &x, 4); }

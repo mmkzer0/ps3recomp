@@ -114,6 +114,25 @@ def loader_support_sources() -> list:
     return [os.path.join(ROOT, p) for p in LOADER_SUPPORT_SOURCES]
 
 
+# The same, for the loader's C dependencies: the reservation model is C11
+# atomics and cannot ride in the fixtures' C++ command line, so it is compiled
+# as C and handed over as an object.
+LOADER_SUPPORT_C_SOURCES = [
+    "runtime/memory/reservation.c",
+]
+
+
+def loader_support_objects(tmp) -> list:
+    cc = os.environ.get("CC", "cc")
+    objects = []
+    for rel in LOADER_SUPPORT_C_SOURCES:
+        obj = os.path.join(str(tmp), os.path.basename(rel) + ".o")
+        subprocess.run([cc, "-std=gnu17", "-O1", "-c", os.path.join(ROOT, rel), "-o", obj],
+                       check=True)
+        objects.append(obj)
+    return objects
+
+
 def compiler_family(cxx: str) -> str:
     """Ask the compiler what it is, rather than guessing from its filename.
 

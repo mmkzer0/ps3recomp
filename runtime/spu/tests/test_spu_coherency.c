@@ -6,7 +6,7 @@
  * SPU_EVENT_LR and loses its reservation. Any one of them silently missing
  * leaves the SPU parked forever, and nothing else in the tree fails, so this
  * asserts all three -- through the REAL PPU store path (ppu_memory.h's
- * vm_write* and ppu_stwcx), not a copy of it, since the whole bug class here is
+ * vm_write* and resv_stcx32), not a copy of it, since the whole bug class here is
  * a hook that is not where the stores actually go.
  *
  * The two paths that must NOT fire are tested as carefully as the one that
@@ -25,6 +25,7 @@
 /* The unit under test, compiled straight in: it is one small file whose only
  * dependency on the rest of the runtime is spu_ch_wake, stubbed below. */
 #include "../spu_coherency.c"
+#include "../../memory/reservation.c"
 
 /* The real PPU store and store-conditional path the hook lives in. */
 #include "../../ppu/ppu_memory.h"
@@ -35,14 +36,12 @@
 /* ---------------------------------------------------------------------------
  * The runtime pieces a real build supplies, stubbed.
  * -----------------------------------------------------------------------*/
-static uint8_t g_guest_mem[1u << 20];
+/* Page-aligned, as the runtime's guest mapping is: ldarx/stdcx. are 8-byte atomics. */
+static uint8_t g_guest_mem[1u << 20] __attribute__((aligned(4096)));
 uint8_t* vm_base = g_guest_mem;
 
-/* ppu_memory.h's inline stores reference these. Nothing here watches writes,
- * and PPU-vs-PPU reservation breaking is a different mechanism. */
+/* ppu_memory.h's inline stores reference this. Nothing here watches writes. */
 uint32_t g_ww_lo = 0xFFFFFFFFu, g_ww_hi = 0;
-int      g_resv_store_active = 0;
-void ppu_resv_break_store(uint64_t ea) { (void)ea; }
 void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width)
 {
     (void)addr; (void)val; (void)width;
@@ -246,8 +245,8 @@ static void test_store_conditional(void)
     g_wakes = 0;
 
     TEST("a successful stwcx into a reserved line raises SPU_EVENT_LR");
-    CHECK_EQ_U32(ppu_lwarx(&ppu, LINE_A + 32), 0x1000u);
-    CHECK(ppu_stwcx(&ppu, LINE_A + 32, 0x1001u) == 1);
+    CHECK_EQ_U32(resv_lwarx32(&ppu, LINE_A + 32), 0x1000u);
+    CHECK(resv_stcx32(&ppu, LINE_A + 32, 0x1001u) == 1);
     CHECK_EQ_U32(vm_read32(LINE_A + 32), 0x1001u);
     CHECK_EQ_U32(g_spu_a.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
     CHECK(g_spu_a.resv_valid == 0);
@@ -260,13 +259,13 @@ static void test_store_conditional(void)
     g_wakes = 0;
 
     TEST("a failed stwcx raises nothing");
-    ppu_lwarx(&ppu, LINE_A + 32);
+    resv_lwarx32(&ppu, LINE_A + 32);
     vm_write32(LINE_A + 64, 0x9999u);          /* elsewhere in the line */
     g_spu_a.event_status = 0;                  /* ignore that one */
     g_spu_a.resv_valid = 1;
     g_wakes = 0;
     ppu.reserve_value = 0xFFFFFFFFu;           /* now the compare cannot match */
-    CHECK(ppu_stwcx(&ppu, LINE_A + 32, 0x2002u) == 0);
+    CHECK(resv_stcx32(&ppu, LINE_A + 32, 0x2002u) == 0);
     CHECK_EQ_U32(g_spu_a.event_status, 0);
     CHECK(g_spu_a.resv_valid == 1);
     CHECK(g_wakes == 0);
@@ -279,8 +278,8 @@ static void test_store_conditional(void)
     g_wakes = 0;
 
     TEST("a successful stdcx into a reserved line raises SPU_EVENT_LR");
-    CHECK(ppu_ldarx(&ppu, LINE_A + 40) == 0x0102030405060708ull);
-    CHECK(ppu_stdcx(&ppu, LINE_A + 40, 0x1112131415161718ull) == 1);
+    CHECK(resv_ldarx64(&ppu, LINE_A + 40) == 0x0102030405060708ull);
+    CHECK(resv_stcx64(&ppu, LINE_A + 40, 0x1112131415161718ull) == 1);
     CHECK(vm_read64(LINE_A + 40) == 0x1112131415161718ull);
     CHECK_EQ_U32(g_spu_a.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
     CHECK(g_wakes == 1);

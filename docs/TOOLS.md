@@ -278,8 +278,8 @@ The preamble declares `g_trampoline_fn` as `extern "C" __declspec(thread)` to ma
 | `cmpwi cr0, r3, 0` | `{ int64_t a = ...; int64_t b = ...; cr_val = ...; }` | Inline CR update |
 | `beq target` | `if (((ctx->cr >> shift) & 2)) goto loc_XXXX;` | CR EQ bit check |
 | `sc` | `lv2_syscall(ctx);` | System call dispatch |
-| `lwarx r3, 0, r4` | `ctx->gpr[3] = vm_read32(ea); ctx->reserve_addr = ea;` | Atomic reservation |
-| `stwcx. r3, 0, r4` | `if (reserve_addr == ea) { store; CR0=EQ; } else { CR0=0; }` | Conditional store |
+| `lwarx r3, 0, r4` | `ctx->gpr[3] = ppu_lwarx32(ctx, ctx->gpr[4]);` | Atomic reservation (line epoch + bits, `runtime/memory/reservation.h`) |
+| `stwcx. r3, 0, r4` | `int _sc = ppu_stwcx32(ctx, ctx->gpr[4], (uint32_t)ctx->gpr[3]);` then `CR0 = _sc ? EQ : 0` (plus XER.SO) | Conditional store: fails if any store reached the line since the `lwarx` |
 | `lvx v3, r4, r5` | `memcpy(&ctx->vr[3], vm_base + (ea & ~0xF), 16);` | VMX vector load |
 | `vmaddfp v3, v4, v5, v6` | `d[i] = a[i] * c[i] + b[i]; (4× float)` | VMX multiply-add |
 | `vperm v3, v4, v5, v6` | Byte permutation across two source vectors | VMX shuffle |

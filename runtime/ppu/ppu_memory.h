@@ -5,7 +5,8 @@
  * virtual address to a host pointer via vm_base, then perform a load or
  * store with the appropriate byte swap.
  *
- * Atomic operations (lwarx/stwcx) are emulated with C11 atomics.
+ * Atomic operations (lwarx/stwcx and the SPU's GETLLAR/PUTLLC) are one model:
+ * runtime/memory/reservation.h.
  */
 
 #ifndef PPU_MEMORY_H
@@ -16,7 +17,6 @@
 
 #include <stdint.h>
 #include <string.h>
-#include <stdatomic.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -113,14 +113,11 @@ static inline double vm_read_f64(uint32_t addr)
 /* ---------------------------------------------------------------------------
  * Stores -- write host-endian value into big-endian guest memory.
  * -----------------------------------------------------------------------*/
-/* PPU reservation: a plain store to a reserved word must break other threads'
- * reservations (real-PPC granule semantics). g_resv_store_active gates it so the
- * default path is one predictable branch. Defined in ppu_loader.cpp. */
+/* Plain stores do not touch the reservation model unless the line is one an
+ * SPU has reserved (VM_WRITE_COH below); see reservation.h, known limit 1. */
 #ifdef __cplusplus
 extern "C" {
 #endif
-extern int  g_resv_store_active;
-void        ppu_resv_break_store(uint64_t ea);
 
 /* PPU <-> SPU lock-line coherence (runtime/spu/spu_coherency.c). A PPU store to
  * a 128-byte line an SPU has reserved with GETLLAR has to serialize through the
@@ -192,7 +189,6 @@ static inline void vm_write32(uint32_t addr, uint32_t val)
     PS3_WW_CHECK(addr, val, 4);
     uint32_t raw = ps3_bswap32(val);
     VM_WRITE_COH(addr, &raw, sizeof(raw));
-    if (g_resv_store_active > 0) ppu_resv_break_store(addr);
 }
 
 static inline void vm_write64(uint32_t addr, uint64_t val)
@@ -200,7 +196,6 @@ static inline void vm_write64(uint32_t addr, uint64_t val)
     PS3_WW_CHECK(addr, val, 8);
     uint64_t raw = ps3_bswap64(val);
     VM_WRITE_COH(addr, &raw, sizeof(raw));
-    if (g_resv_store_active > 0) ppu_resv_break_store(addr);
 }
 
 static inline void vm_write_f32(uint32_t addr, float val)
@@ -276,121 +271,9 @@ static inline void vm_memset(uint32_t guest_dst, int val, size_t len)
     }
 }
 
-/* ---------------------------------------------------------------------------
- * Atomic operations -- lwarx / stwcx emulation
- *
- * PowerPC reservation-based atomics:
- *   lwarx  rD, rA, rB   -- Load word and reserve (sets reservation)
- *   stwcx. rS, rA, rB   -- Store word conditional (clears reservation)
- *                           Sets CR0 EQ bit on success.
- *
- * We emulate this using C11 compare-and-swap on the host.
- * -----------------------------------------------------------------------*/
-
-static inline uint32_t ppu_lwarx(ppu_context* ctx, uint32_t addr)
-{
-    /* Read the current value from memory (big-endian, so swap). */
-    uint32_t raw;
-    _Atomic(uint32_t)* atom = (_Atomic(uint32_t)*)vm_ptr32(addr);
-    raw = atomic_load_explicit(atom, memory_order_acquire);
-
-    ctx->reserve_addr  = addr;
-    ctx->reserve_value = raw;
-    ctx->reserve_valid = 1;
-
-    return ps3_bswap32(raw);
-}
-
-static inline int ppu_stwcx(ppu_context* ctx, uint32_t addr, uint32_t val)
-{
-    if (!ctx->reserve_valid || ctx->reserve_addr != addr) {
-        /* No reservation or address mismatch -- fail */
-        ppu_cr_set(ctx, 0, PPU_CR_SO * ppu_xer_get_so(ctx));
-        ctx->reserve_valid = 0;
-        return 0;
-    }
-
-    uint32_t expected = (uint32_t)ctx->reserve_value;
-    uint32_t desired  = ps3_bswap32(val);
-    _Atomic(uint32_t)* atom = (_Atomic(uint32_t)*)vm_ptr32(addr);
-
-    /* On a line an SPU has reserved, commit under the lock-line lock and notify
-     * -- the same serialization the coherent stores above use, so a PPU commit
-     * can never land inside an SPU PUTLLC's compare/commit window (nor the
-     * reverse), and the reserving SPU gets its lost-reservation event. */
-    int ok;
-    if (spu_coh_is_reserved(addr)) {
-        spu_lockline_lock();
-        ok = atomic_compare_exchange_strong_explicit(
-            atom, &expected, desired,
-            memory_order_acq_rel, memory_order_acquire);
-        if (ok) spu_coh_notify_write(addr);
-        spu_lockline_unlock();
-    } else {
-        ok = atomic_compare_exchange_strong_explicit(
-            atom, &expected, desired,
-            memory_order_acq_rel, memory_order_acquire);
-    }
-
-    ctx->reserve_valid = 0;
-
-    if (ok)
-        ppu_cr_set(ctx, 0, PPU_CR_EQ | (PPU_CR_SO * ppu_xer_get_so(ctx)));
-    else
-        ppu_cr_set(ctx, 0, PPU_CR_SO * ppu_xer_get_so(ctx));
-
-    return ok;
-}
-
-/* 64-bit variants: ldarx / stdcx. */
-static inline uint64_t ppu_ldarx(ppu_context* ctx, uint32_t addr)
-{
-    _Atomic(uint64_t)* atom = (_Atomic(uint64_t)*)vm_ptr64(addr);
-    uint64_t raw = atomic_load_explicit(atom, memory_order_acquire);
-
-    ctx->reserve_addr  = addr;
-    ctx->reserve_value = raw;
-    ctx->reserve_valid = 1;
-
-    return ps3_bswap64(raw);
-}
-
-static inline int ppu_stdcx(ppu_context* ctx, uint32_t addr, uint64_t val)
-{
-    if (!ctx->reserve_valid || ctx->reserve_addr != addr) {
-        ppu_cr_set(ctx, 0, PPU_CR_SO * ppu_xer_get_so(ctx));
-        ctx->reserve_valid = 0;
-        return 0;
-    }
-
-    uint64_t expected = ctx->reserve_value;
-    uint64_t desired  = ps3_bswap64(val);
-    _Atomic(uint64_t)* atom = (_Atomic(uint64_t)*)vm_ptr64(addr);
-
-    int ok;
-    if (spu_coh_is_reserved(addr)) {
-        spu_lockline_lock();
-        ok = atomic_compare_exchange_strong_explicit(
-            atom, &expected, desired,
-            memory_order_acq_rel, memory_order_acquire);
-        if (ok) spu_coh_notify_write(addr);
-        spu_lockline_unlock();
-    } else {
-        ok = atomic_compare_exchange_strong_explicit(
-            atom, &expected, desired,
-            memory_order_acq_rel, memory_order_acquire);
-    }
-
-    ctx->reserve_valid = 0;
-
-    if (ok)
-        ppu_cr_set(ctx, 0, PPU_CR_EQ | (PPU_CR_SO * ppu_xer_get_so(ctx)));
-    else
-        ppu_cr_set(ctx, 0, PPU_CR_SO * ppu_xer_get_so(ctx));
-
-    return ok;
-}
-
+/* lwarx/ldarx and stwcx./stdcx. are resv_lwarx32 / resv_ldarx64 / resv_stcx32 /
+ * resv_stcx64 (runtime/memory/reservation.h), one implementation for the
+ * lifter's lowering and every harness. */
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

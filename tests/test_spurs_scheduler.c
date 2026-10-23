@@ -11,11 +11,9 @@ void spu_indirect_branch(spu_context*);
 void spu_halt(spu_context*);
 uint8_t* vm_base;
 uint32_t ppu_vm_size=0x20000;
-int g_resv_store_active;
 uint32_t g_ww_lo,g_ww_hi,g_barrier_sync_watch;
 uint32_t g_spu_image_src_ea,g_spu_image_ls_start,g_spu_image_span;
 unsigned long long ps3_ms_now(void) { LARGE_INTEGER n,f; QueryPerformanceCounter(&n); QueryPerformanceFrequency(&f); return n.QuadPart*1000/f.QuadPart; }
-void ppu_resv_break_store(uint64_t ea) {(void)ea;}
 void ps3_ww_report_inline(uint32_t a,uint64_t v,int w){(void)a;(void)v;(void)w;}
 static atomic_uint canceled_queues;
 void sys_event_queue_cancel_by_id(u32 id) { assert(id==3 || id==4);atomic_fetch_or(&canceled_queues,1u<<id); }
