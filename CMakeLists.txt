@@ -108,6 +108,7 @@ list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/tests/|/runtime/ppu/|/runtime/host/|
 # codec's T0 test links it alone. The runtime also carries it for HLE callers.
 add_library(ps3recomp_spurs_jq2 STATIC
     libs/spurs/jq2/ring.cpp
+    libs/spurs/jq2/sched.cpp
 )
 target_include_directories(ps3recomp_spurs_jq2 PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/libs/spurs"
