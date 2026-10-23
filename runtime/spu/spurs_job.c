@@ -1081,5 +1081,11 @@ int spu_run_jq2_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_ea,
                     const spu_job_hooks* hooks)
 {
     if (!desc || !desc_size || !env) return -1;
+    /* maxDesc is the queue attribute's maxSizeJobDescriptor: 0 (256) or
+     * 256..0x3FF in 128-byte steps, as queue creation checks it. D0 =
+     * 0x3F400 - 4 * maxDesc is formed in 32 bits, so anything else would
+     * wrap the heap limit past local store. */
+    if (env->max_desc && (env->max_desc < 256u || env->max_desc > 0x3FFu || (env->max_desc & 127u)))
+        return -1;
     return run_spurs_job(entry, image_id, job_ea, desc, desc_size, desc_size, 0, hooks, env);
 }

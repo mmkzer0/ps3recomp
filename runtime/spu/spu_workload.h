@@ -168,7 +168,8 @@ typedef struct spu_jq2_env {
  * spu-job-memory with `limit` D0. The job is entered at SPU_JQ2_IMAGE_LS with
  * the PM's registers (docs/JQ2.md). `end` runs with the finished context; the
  * stop code SPU_JQ2_JM_CALL_STOP at SPU_JQ2_JM_CALL_LS + 4 means the job called
- * jm word 0. Same return as spu_run_spurs_job. */
+ * jm word 0. Same return as spu_run_spurs_job; -1 also for a `max_desc` other
+ * than 0 or 256..0x3FF in 128-byte steps (the range queue creation accepts). */
 int spu_run_jq2_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_ea,
                     const uint8_t* desc, uint32_t desc_size, const spu_jq2_env* env,
                     const spu_job_hooks* hooks);
