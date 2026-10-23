@@ -8,6 +8,7 @@
 #include <time.h>
 #include "spu_interp.h"
 #include "spu_helpers.h"
+#include "spu_observe.h"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -390,7 +391,29 @@ uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa) {
     return spu_interp_run_until(ctx, start_lsa, 0);
 }
 
+/* Host-stack nesting of interpreter runs. The interpreter's own loop never
+ * recurses, but lifted code calls back in through spu_dispatch() and the SMC
+ * microstep, and those callers hold live C frames. An observer yield may only
+ * stop the outermost run (see spu_observe.h); a nested one is reported below. */
+#if defined(_MSC_VER)
+#  define SPU_INTERP_TLS __declspec(thread)
+#else
+#  define SPU_INTERP_TLS _Thread_local
+#endif
+static SPU_INTERP_TLS int s_interp_depth;
+
+static uint32_t spu_interp_run_inner(spu_context* ctx, uint32_t start_lsa,
+                                     uint32_t stop_lsa, int outermost);
+
 uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa) {
+    int depth = ++s_interp_depth;
+    uint32_t r = spu_interp_run_inner(ctx, start_lsa, stop_lsa, depth == 1);
+    --s_interp_depth;
+    return r;
+}
+
+static uint32_t spu_interp_run_inner(spu_context* ctx, uint32_t start_lsa,
+                                     uint32_t stop_lsa, int outermost) {
     ctx->pc = start_lsa & 0x3FFFC;
     ctx->status = SPU_STATUS_RUNNING;
     uint64_t steps = 0;
@@ -428,6 +451,22 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
          * another image's functions that happen to share an LS address. */
         /* ponytail: pc-only match; a recursive call through the same site would stop early -- compare r1 too if one shows up. */
         if (ctx->image_id >= 0 && ((stop_lsa && ctx->pc == stop_lsa) || spu_lifted_lookup(ctx, ctx->pc))) { g_spu_interp_steps = steps; g_spu_interp_last_pc = ctx->pc; return ctx->pc; }  /* rejoin fast path */
+        /* Observer yield: before executing the instruction at ctx->pc, with no
+         * state consumed -- resuming at ctx->pc re-enters exactly here. Only
+         * the outermost run may stop this way; see spu_observe.h for why a
+         * nested one has no host stack to unwind. */
+        { const spu_observer* obs = ctx->observer;
+          if (obs && obs->on_insn && obs->on_insn(obs->user, ctx, ctx->pc)) {
+              if (!outermost) {
+                  fprintf(stderr, "[spu-interp] observer yield at LS 0x%05X inside a nested "
+                                  "interpreter run (host depth %d); unsupported -- see "
+                                  "spu_observe.h\n",
+                          ctx->pc & SPU_LS_MASK, s_interp_depth);
+                  fflush(stderr);
+                  abort();
+              }
+              return SPU_INTERP_YIELDED;
+          } }
         g_spu_interp_last_pc = ctx->pc;
         if (_g1>0) {
             int inr = (ctx->pc >= 0x26E80u && ctx->pc < 0x26F14u);

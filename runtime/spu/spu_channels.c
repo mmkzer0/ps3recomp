@@ -15,6 +15,7 @@
 #include "spu_dma.h"
 #include "spu_coherency.h" /* lock-line lock + PPU-write coherence bitmap */
 #include "spu_helpers.h"   /* spu_splat_u32 / spu_ls_read128 (SMC microstep) */
+#include "spu_observe.h"   /* per-context observer hooks (channels, MFC atoms) */
 #include "spu_lockstep.h"
 #include "spu_interp.h"    /* spu_lifted_fn / spu_lifted_lookup -- defined below */
 #include "ps3emu/ps3_ftrace.h"
@@ -423,6 +424,16 @@ volatile unsigned g_spu_putllc_sync_hit = 0;
  * completion. Chosen above the context/descriptor we park near the top of LS. */
 #define SPU_JOB_RETURN_LS   0x3FF00u
 
+/* Finish an atomic command: report the status MFC_RdAtomicStat now returns,
+ * with the EA as the SPU staged it (same value on_mfc reported), then keep the
+ * handler's "handled" answer. */
+static int spu_mfc_atomic_done(spu_context* ctx, uint32_t cmd)
+{
+    spu_obs_atomic(ctx, cmd, ((uint64_t)ctx->mfc_eah << 32) | ctx->mfc_eal,
+                   ctx->atomic_stat);
+    return 1;
+}
+
 /* Returns 1 if `cmd` is an atomic line op and was handled here, else 0. */
 static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
 {
@@ -434,6 +445,10 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
     if (cmd != MFC_GETLLAR_CMD && cmd != MFC_PUTLLC_CMD &&
         cmd != MFC_PUTLLUC_CMD && cmd != MFC_PUTQLLUC_CMD)
         return 0;
+
+    /* Every atomic command, at enqueue (the DMA engine's mfc_submit reports
+     * the non-atomic ones). */
+    spu_obs_mfc_enqueue(ctx, cmd);
 
     uint32_t ea  = ctx->mfc_eal & ~(uint32_t)(MFC_ATOMIC_LINE - 1);
     uint32_t lsa = ctx->mfc_lsa & SPU_LS_MASK;
@@ -497,7 +512,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         } else {
             ctx->atomic_stat = 1;   /* PUTLLC failure (line "moved") */
         }
-        return 1;
+        return spu_mfc_atomic_done(ctx, cmd);
     }
 
     /* SPU_ATOM_EA=<hex>: log every lock-line atomic touching that EA`s 128B line.
@@ -669,7 +684,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                   fflush(stderr);
               }
           } }
-        return 1;
+        return spu_mfc_atomic_done(ctx, cmd);
 
     case MFC_PUTLLC_CMD:
         g_spu_putllc_count++;   /* run-scoped delta read by the PM flow trace */
@@ -771,7 +786,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
             spu_taskset_line_committed(ea & ~127u);
             if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
         }
-        return 1;
+        return spu_mfc_atomic_done(ctx, cmd);
 
     case MFC_PUTLLUC_CMD:
     case MFC_PUTQLLUC_CMD:
@@ -789,7 +804,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         spu_lockline_unlock();
         spu_taskset_line_committed(ea & ~127u);
         if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
-        return 1;
+        return spu_mfc_atomic_done(ctx, cmd);
 
     default:
         return 0;
@@ -826,6 +841,7 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
               for (int i = 0; i < 128; i++) if (w[i])
                   fprintf(stderr, "   wrch ch%-3d %llu%c", i, w[i], 10); } } }
     uint32_t v = value._u32[0];  /* channel writes use the preferred slot */
+    spu_obs_channel(ctx, 1, channel, v);
 
     if (channel_is_mfc(channel)) {
         /* Atomic line ops (GETLLAR/PUTLLC/...) need real reservation semantics,
@@ -1079,6 +1095,7 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
 
     if (channel_is_mfc(channel)) {
         v = mfc_channel_read(mfc_for(ctx), ctx, channel);
+        spu_obs_channel(ctx, 0, channel, v);
         return spu_make_preferred_u32(v);
     }
 
@@ -1131,6 +1148,7 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
         v = 0;
         break;
     }
+    spu_obs_channel(ctx, 0, channel, v);
     return spu_make_preferred_u32(v);
 }
 

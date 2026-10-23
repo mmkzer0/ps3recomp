@@ -166,6 +166,10 @@ typedef struct spu_channel {
     volatile long lock;  /* spu_channel_write/read: producer and consumer are different host threads */
 } spu_channel;
 
+/* Programmatic observation hooks (spu_observe.h). Forward-declared so this
+ * widely included header does not pull in the callback types. */
+struct spu_observer;
+
 /* ---------------------------------------------------------------------------
  * SPU execution context
  * -----------------------------------------------------------------------*/
@@ -392,6 +396,11 @@ typedef struct spu_context {
      * manager then ran its buffer loop a second time on the job's registers
      * and died in its own assert (the song-freeze). */
     uint32_t drain_ret_pc;
+
+    /* Execution observer (spu_observe.h), NULL when off. Installed by a tool
+     * that drives this context itself; zero from spu_context_init's memset, so
+     * every existing context runs unobserved. Not copied or inherited. */
+    const struct spu_observer* observer;
 } spu_context;
 
 /* Reserved LS addresses (inside the kernel area, below the 0xA00 policy-module

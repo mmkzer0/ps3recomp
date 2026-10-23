@@ -18,6 +18,7 @@
 #include "spu_context.h"
 #include "../../include/ps3emu/log_first.h"
 #include "spu_coherency.h"
+#include "spu_observe.h"
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
@@ -913,6 +914,9 @@ static inline int mfc_enqueue(mfc_engine* mfc, spu_context* spu)
  */
 static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
 {
+    /* At enqueue, before any transfer: the observer sees the command exactly
+     * as the SPU staged it in EAH:EAL/LSA/Size/TagID. */
+    spu_obs_mfc_enqueue(spu, cmd);
     /* SPU_CMDHIST=1: every MFC command that reaches the engine, by opcode and
      * SPU image. Catches list DMAs (putl/getl) that never reach
      * mfc_do_transfer's per-element path. */
