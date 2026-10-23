@@ -160,11 +160,24 @@ endfunction()
 # title has one, otherwise the canonical every-module table generated from the
 # toolkit's handler definitions. Reconfigures when a module is added and
 # rebuilds when an existing module changes.
+#
+# The generated unit includes ppu_hle_adapt.hpp and the modules' headers by
+# repository-relative path, so it needs the toolkit root, runtime/ppu and
+# include on its include path. Those are set as SOURCE properties on the table
+# only: a title includes the table and links ps3recomp_runtime and must not have
+# libs/* pushed into every one of its own translation units.
 function(ps3recomp_ppu_hle_nids out_var)
     cmake_parse_arguments(ARG "" "RECOMP_DIR" "" ${ARGN})
+    set(_table_includes
+        "${PS3RECOMP_DIR}"
+        "${PS3RECOMP_DIR}/runtime/ppu"
+        "${PS3RECOMP_DIR}/include")
     if(ARG_RECOMP_DIR AND EXISTS "${ARG_RECOMP_DIR}/ppu_hle_nids.cpp")
-        set(${out_var} "${ARG_RECOMP_DIR}/ppu_hle_nids.cpp" PARENT_SCOPE)
-        message(STATUS "HLE NID table:   ${ARG_RECOMP_DIR}/ppu_hle_nids.cpp")
+        set(_table "${ARG_RECOMP_DIR}/ppu_hle_nids.cpp")
+        set_source_files_properties("${_table}" PROPERTIES
+            INCLUDE_DIRECTORIES "${_table_includes}")
+        set(${out_var} "${_table}" PARENT_SCOPE)
+        message(STATUS "HLE NID table:   ${_table}")
         return()
     endif()
 
@@ -186,6 +199,8 @@ function(ps3recomp_ppu_hle_nids out_var)
                 "${PS3RECOMP_DIR}/tools/nid_database.py"
                 ${_hle_sources} "${_source_list}"
         COMMENT "Generating the HLE NID -> handler table")
+    set_source_files_properties("${_table}" PROPERTIES
+        INCLUDE_DIRECTORIES "${_table_includes}")
     set(${out_var} "${_table}" PARENT_SCOPE)
     message(STATUS "HLE NID table:   generated (every module)")
 endfunction()

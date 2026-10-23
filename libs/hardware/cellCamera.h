@@ -91,11 +91,11 @@ s32 cellCameraGetType(s32 devNum, s32* type);
 s32 cellCameraSetNotifyCallback(s32 devNum, CellCameraCallback cb, void* arg);
 s32 cellCameraRemoveNotifyCallback(s32 devNum);
 
+s32 cellCameraSetNotifyEventQueue2(u64 key, u64 source, u64 flag);
+s32 cellCameraRemoveNotifyEventQueue2(u64 key);
+
 #ifdef __cplusplus
 }
 #endif
-
-s32 cellCameraSetNotifyEventQueue2(u64 key, u64 source, u64 flag);
-s32 cellCameraRemoveNotifyEventQueue2(u64 key);
 
 #endif /* PS3RECOMP_CELL_CAMERA_H */

@@ -28,7 +28,8 @@ with tempfile.TemporaryDirectory(prefix='sys-spu-printf-') as tmp:
     (tmp / 'shim.cpp').write_text('#include <stdint.h>\n'
                                   'extern "C" void ps3_test_vm_write64(uint64_t, uint64_t);\n'
                                   'void vm_write64(uint64_t a, uint64_t x) { ps3_test_vm_write64(a, x); }\n')
-    includes = ['-I' + str(root / 'include'), '-I' + str(root / 'libs/system'),
+    # root: the generated table includes libs/... headers by repository path.
+    includes = ['-I' + str(root), '-I' + str(root / 'include'), '-I' + str(root / 'libs/system'),
                 '-I' + str(root / 'runtime/ppu'), '-I' + str(tmp)]
     linker = ['-Wl,-dead_strip'] if sys.platform == 'darwin' else ['-Wl,--gc-sections']
     subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG', '-Wall', '-Wextra',

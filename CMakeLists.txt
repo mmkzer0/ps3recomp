@@ -531,6 +531,13 @@ if(PS3RECOMP_BUILD_TESTS)
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_sys_spu_printf.py")
         set_tests_properties(sys_spu_printf PROPERTIES LABELS "runtime;t0")
+        # The typed HLE call adapter: every return class, the positional argument
+        # mapping and the guest parameter save area through the real
+        # ps3_hle_call (runtime/ppu/tests/test_hle.cpp).
+        add_test(NAME hle_abi
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_hle_abi.py")
+        set_tests_properties(hle_abi PROPERTIES LABELS "ppu;t0" TIMEOUT 300)
     endif()
 endif()
 
@@ -642,6 +649,12 @@ if(UNIX)
             DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tools/gen_hle_nids.py"
                     "${CMAKE_CURRENT_SOURCE_DIR}/tools/nid_database.py"
             COMMENT "Generating the HLE NID -> handler table")
+        # The generated unit includes libs/... by repository-relative path and
+        # ppu_hle_adapt.hpp from runtime/ppu; both are already on this target's
+        # include path, the repository root is not. Keep it private to the
+        # generated file rather than on every source of the smoke title.
+        set_source_files_properties("${SMOKE_GEN}/ppu_hle_nids.cpp"
+            PROPERTIES INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}")
 
         add_executable(ps3recomp_boot_smoke
             runtime/ppu/tests/boot_main.cpp

@@ -67,7 +67,9 @@ extern "C" {
     X(UNKNOWN_INSTRUCTION,      "unknown-instruction")                         \
     X(DISPATCH_DEPTH_EXCEEDED,  "dispatch-depth-exceeded")                     \
     X(SPU_DMA_REPEAT,           "spu-dma-repeat")                              \
-    X(UNRESOLVED_GUEST_CALLBACK, "unresolved-guest-callback")
+    X(UNRESOLVED_GUEST_CALLBACK, "unresolved-guest-callback")                  \
+    /* A6: an HLE handler returns a host pointer; stop, never truncate it. */ \
+    X(HLE_UNSUPPORTED_RETURN,   "hle-unsupported-return")
 
 /* A fixed underlying type in C++ makes a kind outside the list (a caller's bug,
  * which the stop still reports as "invalid-kind") a well-defined value rather

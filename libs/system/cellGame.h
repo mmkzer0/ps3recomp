@@ -165,6 +165,7 @@ s32 cellGameDataCheckCreate2(u32 version, const char* dirName, u32 errDialog,
 s32 cellGameGetParamInt(s32 id, s32* value);
 
 s32 cellGameGetParamString(s32 id, char* buf, u32 bufsize);
+s32 cellGameSetParamString(s32 id, const char* buf);
 
 s32 cellGameCreateGameData(CellGameSetInitParams* init, char* tmp_contentInfoPath,
                             char* tmp_usrdirPath);

@@ -107,10 +107,10 @@ s32 cellGemReset(u32 gemNum);
 s32 cellGemEnableMagnetometer(u32 gemNum, s32 enable);
 s32 cellGemEnableCameraPitchAngleCorrection(s32 enable);
 
+s32 cellGemGetMemorySize(s32 max_connect);
+
 #ifdef __cplusplus
 }
 #endif
-
-s32 cellGemGetMemorySize(s32 max_connect);
 
 #endif /* PS3RECOMP_CELL_GEM_H */

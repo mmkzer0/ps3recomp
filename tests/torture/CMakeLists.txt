@@ -41,6 +41,11 @@ set(PPU_GLUE
     "${PS3RECOMP_DIR}/runtime/ppu/ppu_fs.cpp"
 )
 
+# The generated table includes libs/... by repository-relative path; keep that
+# on the generated unit only, not on every source of the torture harness.
+set_source_files_properties(gen/ppu_hle_nids.cpp PROPERTIES
+    INCLUDE_DIRECTORIES "${PS3RECOMP_DIR}")
+
 add_executable(torture
     main.cpp
     gen/ppu_hle_nids.cpp

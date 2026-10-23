@@ -104,17 +104,25 @@ is the 16-byte secret
 Python suffix/byte-order was wrong; `nid.h` was already correct.*
 
 **Runtime (`runtime/ppu/ppu_hle.cpp`)**:
-- a flat NID → handler table (`ps3_hle_register`, `ps3_nid_table` from nid.h),
-- `ps3_hle_call(nid, ctx)` — resolves the NID and marshals the **PPC integer/
-  pointer ABI**: args `r3..r10` → C args, return → `r3`. Covers the majority of
-  `cellXxx` APIs. *Caveat:* functions that take/return **pointers** need
-  host↔guest address translation (per-function wrappers); the generic path
-  passes the raw value through.
+- a flat, file-private NID → adapter table (`ps3_hle_register`,
+  `ps3_hle_fn = void (*)(ppu_context*)`),
+- `ps3_hle_call(nid, ctx)` — resolves the NID and calls the registered adapter,
+  which was derived at compile time from the handler's declared C type
+  (`ps3_hle_adapt`, `runtime/ppu/ppu_hle_adapt.hpp`). Parameters come from
+  `r3..r10`/`f1..f13`/the caller's parameter save area, pointer parameters are
+  guest effective addresses (the `GUEST_PTR` convention), and the return is
+  mapped by its declared type (`s32` sign-extended, `u32` zero-extended, `u64`
+  unchanged, `float`/`double` in `f1`, `void` leaves `r3` alone). A signature
+  with no mapping fails the build at the handler's name. See
+  [HLE_ABI.md](HLE_ABI.md).
 
 **Table generation (`tools/gen_hle_nids.py`)**: scans an HLE lib's non-static
-function definitions, **computes** each NID, and emits the `ps3_hle_register`
-calls (no manual `/* NID */` annotations needed — and some hand-annotations were
-found to be wrong).
+function definitions, **computes** each NID, and emits
+`ps3_hle_register(0x.., "name", &ps3_hle_adapt<&name>)` (no manual `/* NID */`
+annotations needed — and some hand-annotations were found to be wrong). The
+generated unit includes `ppu_hle_adapt.hpp` and the module headers by
+repository-relative path, so the toolkit root is on the include path; handlers
+the header does not declare fail the build by name.
 
 **Coverage** against Uncharted's 172 imports: **69%** (118/172). cellGcmSys is
 100% (26/26). Remaining gaps are concentrated in **networking (sys_net), input

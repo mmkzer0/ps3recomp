@@ -317,6 +317,71 @@ s32 cellSpursEventFlagClear(CellSpursEventFlag* eventFlag, u16 bits);
 s32 cellSpursEventFlagGetDirection(CellSpursEventFlag* eventFlag,
                                    u32* direction);
 
+s32 cellSpursEventFlagDetachLv2EventQueue(CellSpursEventFlag* eventFlag);
+
+/* ---------------------------------------------------------------------------
+ * SPURS attribute initialisers, job chains, queues and job guards.
+ *
+ * The SDK's "_"-prefixed initialisers and the JobQueue2 surface. Their
+ * definitions are in cellSpurs.c; several take decoded guest effective
+ * addresses (u64 so the caller's full register is available) and are
+ * registered as context-aware or plain HLE handlers accordingly.
+ * -----------------------------------------------------------------------*/
+
+s32 _cellSpursAttributeInitialize(CellSpursAttribute* attr, u32 revision,
+                                  u32 sdkVersion, s32 nSpus, s32 spuPriority,
+                                  s32 ppuPriority, u8 exitIfNoWork);
+s32 _cellSpursEventFlagInitialize(void* spurs, void* taskset,
+                                  CellSpursEventFlag* eventFlag,
+                                  u32 clearMode, u32 direction);
+s32 _cellSpursJobChainAttributeInitialize(u32 jmRevision, u32 sdkRevision,
+                                          u64 attr_ea, u64 entry_ea,
+                                          u32 sizeJobDescriptor, u32 maxGrabbedJob,
+                                          u64 prio_ea, u32 maxContention);
+s32 _cellSpursQueueInitialize(u64 spurs_ea, u64 taskset_ea, u64 queue_ea,
+                              u64 buffer_ea, u32 size, u32 depth, u32 direction);
+s32 _cellSpursSendSignal(void* taskset, u32 taskId);
+s32 _cellSpursTaskAttributeInitialize(CellSpursTaskAttribute* attr, u32 revision,
+                                      u32 sdkVersion, u64 eaElf, u64 eaContext,
+                                      u32 sizeContext, const void* lsPattern,
+                                      const void* argument);
+s32 _cellSpursTasksetAttributeInitialize(CellSpursTasksetAttribute* attr,
+                                         u32 revision, u32 sdkVersion,
+                                         u64 argTaskset, u64 priority,
+                                         u32 maxContention);
+s32 _cellSpursWorkloadAttributeInitialize(u64 attr_ea, u32 revision,
+                                          u32 sdkVersion, u64 pm_ea, u32 size,
+                                          u64 data, u64 prio_ea, u32 minContention);
+
+s32 cellSpursCreateJobChain(u64 spurs_ea, u64 jc_ea, u64 entry_ea,
+                            u32 sizeJobDescriptor, u32 maxGrabbedJob,
+                            u64 prio_ea, u32 maxContention,
+                            u32 autoRequestSpuCount);
+s32 cellSpursCreateJobChainWithAttribute(u64 spurs_ea, u64 jc_ea, u64 attr_ea);
+s32 cellSpursCreateTaskWithAttribute(CellSpursTaskset* taskset,
+                                     CellSpursTaskId* taskId,
+                                     CellSpursTaskAttribute* attr);
+s32 cellSpursGetInfo(u64 spurs_ea, u64 info_ea);
+s32 cellSpursGetWorkloadInfo(u64 spurs_ea, u32 wid, u64 info_ea);
+s32 cellSpursJobChainAttributeSetName(u64 attr_ea, u64 name_ea);
+s32 cellSpursJobChainGetError(u64 jc_ea, u64 cause_out_ea);
+s32 cellSpursJobGuardInitialize(u64 jc_ea, u64 guard_ea, u32 notify_count,
+                                u32 request_spu_count, u32 auto_reset);
+s32 cellSpursJobGuardNotify(u64 guard_ea);
+s32 cellSpursJobGuardReset(u64 guard_ea);
+s32 cellSpursJoinJobChain(u64 jc_ea);
+s32 cellSpursKickJobChain(u64 jc_ea, u32 numReadyCount);
+s32 cellSpursQueueClear(u64 queue_ea);
+s32 cellSpursQueuePushBody(u64 queue_ea, u64 data_ea, u32 isBlocking);
+s32 cellSpursRequestIdleSpu(u64 spurs_ea);
+s32 cellSpursRunJobChain(u64 jc_ea);
+s32 cellSpursSetExceptionEventHandler(u64 spurs_ea, u64 handler_ea, u64 arg_ea);
+s32 cellSpursShutdownJobChain(u64 jc_ea);
+s32 cellSpursShutdownWorkload(u64 spurs_ea, u32 wid);
+s32 cellSpursWaitForWorkloadShutdown(u64 spurs_ea, u32 wid);
+s32 cellSpursWorkloadAttributeSetName(u64 attr_ea, u64 nameClass_ea,
+                                      u64 nameInstance_ea);
+
 #ifdef __cplusplus
 }
 #endif

@@ -18,6 +18,7 @@
  * needs the lifter to split output into multiple TUs (88 MB single-file
  * otherwise).
  */
+#include <atomic>
 #include "ppu_recomp.h"
 #include <stdint.h>
 #include <stdio.h>
@@ -51,8 +52,15 @@ void     ps3_load_prx_modules(void) {}
  * access violation means a HOST pointer deref (e.g. a bad function pointer or a
  * runtime-struct walk). Print the faulting address and the RIP as a module
  * offset (RVA) so it can be symbolized with llvm-symbolizer against the PDB. */
-extern "C" uint32_t    g_last_hle_nid;    /* ppu_hle.cpp breadcrumb */
-extern "C" const char* g_last_hle_name;
+extern "C" std::atomic<uint32_t>    g_last_hle_nid;    /* ppu_hle.cpp breadcrumb */
+extern "C" std::atomic<const char*> g_last_hle_name;
+
+static uint32_t hle_last_nid() { return g_last_hle_nid.load(std::memory_order_relaxed); }
+static const char* hle_last_name()
+{
+    const char* n = g_last_hle_name.load(std::memory_order_relaxed);
+    return n ? n : "";
+}
 
 extern "C" PPU_THREAD_LOCAL ppu_context* g_active_ctx;
 static LONG WINAPI ydkj_crash_filter(EXCEPTION_POINTERS* ep)
@@ -61,7 +69,7 @@ static LONG WINAPI ydkj_crash_filter(EXCEPTION_POINTERS* ep)
     fprintf(stderr, "\n[CRASH] code=0x%08lX rip=%p\n",
             (unsigned long)er->ExceptionCode, er->ExceptionAddress);
     fprintf(stderr, "[CRASH] last HLE NID 0x%08X (%s)\n",
-            g_last_hle_nid, g_last_hle_name ? g_last_hle_name : "");
+            hle_last_nid(), hle_last_name());
     if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2)
         fprintf(stderr, "[CRASH] %s fault address 0x%llX\n",
                 er->ExceptionInformation[0] ? "write" : "read",
@@ -98,7 +106,7 @@ static LONG WINAPI ydkj_crash_filter(EXCEPTION_POINTERS* ep)
 static void ydkj_abort_handler(int)
 {
     fprintf(stderr, "\n[ABORT] SIGABRT raised; last HLE NID 0x%08X (%s)\n",
-            g_last_hle_nid, g_last_hle_name ? g_last_hle_name : "");
+            hle_last_nid(), hle_last_name());
     void* frames[32];
     USHORT n = RtlCaptureStackBackTrace(0, 32, frames, NULL);
     HMODULE self = NULL;
@@ -243,8 +251,8 @@ static DWORD WINAPI vblank_ticker(LPVOID)
     return 0;
 }
 
-extern "C" uint32_t    g_last_hle_nid;
-extern "C" const char* g_last_hle_name;
+extern "C" std::atomic<uint32_t>    g_last_hle_nid;
+extern "C" std::atomic<const char*> g_last_hle_name;
 #include <tlhelp32.h>
 /* When the boot wedges, snapshot every other thread's instruction pointer as a
  * module RVA (symbolize with llvm-symbolizer) so a guest spin/wait is pinned to
@@ -257,7 +265,7 @@ extern "C" const char* g_last_hle_name;
 static void dump_threads(const char* label, HMODULE self)
 {
     fprintf(stderr, "[WATCHDOG] %s; last HLE call = 0x%08X (%s)\n",
-            label, g_last_hle_nid, g_last_hle_name ? g_last_hle_name : "");
+            label, hle_last_nid(), hle_last_name());
     DWORD me = GetCurrentThreadId(), pid = GetCurrentProcessId();
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     THREADENTRY32 te; te.dwSize = sizeof te;

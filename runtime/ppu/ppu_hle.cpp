@@ -7,22 +7,23 @@
  * --imports). This resolves the NID to a registered HLE handler and marshals
  * the PPC calling convention into a native C call.
  *
- * PPC64 ELFv1 integer/pointer ABI: arguments in r3..r10 (gpr[3..10]), return
- * value in r3. The generic adapter casts the handler to a uint64-in/uint64-out
- * function and passes the 8 GPR argument slots; this covers the large majority
- * of cellXxx APIs (integer args/handles, s32 return). Functions that take or
- * return *pointers* need host<->guest address translation and so require a
- * per-function wrapper -- the generic path passes the raw value through.
+ * PPC64 ELFv1 ABI: arguments in r3..r10 and f1..f13, further arguments in the
+ * caller's parameter save area, return value in r3 or f1. Each handler is
+ * called through ps3_hle_adapt<&handler> (ppu_hle_adapt.hpp), which derives
+ * that handler's declared C type and maps the guest state to it exactly --
+ * no universal function-pointer cast. A handler whose declared type has no
+ * mapping fails its own build with its name.
  *
  * Compiled as C++ (matches the lifted output). Game-agnostic.
  */
 #define PPU_NO_INLINE_LOADS   /* declares its own out-of-line vm_read* below */
 #include <chrono>
 #include "ppu_recomp.h"   /* ppu_context */
-#include "ps3emu/nid.h"   /* ps3_nid_table, ps3_nid_entry */
+#include "ppu_hle_adapt.hpp"
 #include "ps3emu/milestone.h" /* ps3_msf -- boot milestone log */
 #include "ps3emu/stop.h"      /* ps3_stop_register_frontier */
 #include "ps3emu/config.h"    /* ps3_config_find_hle_stub */
+#include <atomic>
 #include <mutex>
 #include <unordered_set>
 #include <stdlib.h>       /* getenv */
@@ -30,20 +31,36 @@
 #include <stdio.h>
 #include <stdlib.h>       /* getenv, atoi (boot trace) */
 
-/* Single flat NID -> handler table (all modules share it; resolution is by
- * NID which is globally unique). Sized for the firmware import surface. */
+/* Single flat NID -> adapter table (all modules share it; resolution is by NID
+ * which is globally unique). Sized for the firmware import surface.
+ *
+ * Private to this file: ps3_hle_has and ps3_hle_call are the only readers, so
+ * the entry holds the adapter at its real type instead of round-tripping a
+ * function pointer through ps3_nid_entry::handler (void*). The generic NID
+ * table in ps3emu/nid.h serves the module registry (module.h), not this. */
 #define HLE_NID_CAP 4096
-static ps3_nid_entry  g_hle_storage[HLE_NID_CAP];
-static ps3_nid_table  g_hle_nids;
-static int            g_hle_inited = 0;
+struct hle_entry {
+    uint32_t    nid;
+    const char* name;
+    ps3_hle_fn  fn;
+};
+static hle_entry g_hle[HLE_NID_CAP];
+static uint32_t  g_hle_count = 0;
 
-extern "C" void ps3_hle_register(uint32_t nid, const char* name, void* handler)
+static hle_entry* hle_find(uint32_t nid)
 {
-    if (!g_hle_inited) { ps3_nid_table_init(&g_hle_nids, g_hle_storage, HLE_NID_CAP); g_hle_inited = 1; }
-    ps3_nid_table_add(&g_hle_nids, nid, name, handler);
+    for (uint32_t i = 0; i < g_hle_count; i++)
+        if (g_hle[i].nid == nid) return &g_hle[i];
+    return nullptr;
 }
 
-extern "C" uint32_t ps3_hle_count(void) { return g_hle_inited ? g_hle_nids.count : 0; }
+extern "C" void ps3_hle_register(uint32_t nid, const char* name, ps3_hle_fn handler)
+{
+    if (g_hle_count >= HLE_NID_CAP || !handler) return;
+    g_hle[g_hle_count++] = { nid, name, handler };
+}
+
+extern "C" uint32_t ps3_hle_count(void) { return g_hle_count; }
 
 /* Context-aware handlers: functions that need the full ppu_context (to read
  * args beyond the generic ABI, set registers like r13, touch memory, etc.).
@@ -70,22 +87,23 @@ extern "C" int ps3_hle_has(uint32_t nid)
 {
     for (uint32_t i = 0; i < g_ctx_count; i++)
         if (g_ctx[i].nid == nid) return 1;
-    if (!g_hle_inited) return 0;
-    ps3_nid_entry* e = ps3_nid_table_find(&g_hle_nids, nid);
-    return (e && e->handler) ? 1 : 0;
+    return hle_find(nid) != nullptr;
 }
-
-/* Generic PPC integer/pointer ABI adapter. */
-typedef uint64_t (*hle_generic)(uint64_t, uint64_t, uint64_t, uint64_t,
-                                uint64_t, uint64_t, uint64_t, uint64_t);
 
 /* Host VM store (defined in ppu_loader.cpp) — used for the TOC save below. */
 void vm_write64(uint64_t addr, uint64_t val);
 
 /* Breadcrumb for the crash reporter: the last firmware import dispatched, so a
- * host AV inside an HLE handler names the culprit NID/function. */
-extern "C" uint32_t    g_last_hle_nid  = 0;
-extern "C" const char* g_last_hle_name = "";
+ * host AV inside an HLE handler names the culprit NID/function.
+ *
+ * Written on every dispatch by whichever guest thread is calling and read by
+ * the watchdog from its own thread, so the pair is a pair of atomics with
+ * relaxed ordering: each value is independently meaningful (the reader prints
+ * "nid (name)"), and there is nothing to order them against. The nid/name a
+ * STOP reports come from the stopping thread's own copy (t_last_hle_*, below),
+ * not from these. */
+extern "C" std::atomic<uint32_t>    g_last_hle_nid{0};
+extern "C" std::atomic<const char*> g_last_hle_name{""};
 
 /* Which HLE each guest thread is currently INSIDE, indexed by ctx->thread_id.
  *
@@ -96,7 +114,7 @@ extern "C" const char* g_last_hle_name = "";
  * returned), so the CTR the watchdog prints is not the answer either. This is:
  * set on entry, cleared on every exit path by the guard below. */
 #define PS3_HLE_INFLIGHT_MAX 64
-extern "C" const char* g_hle_inflight[PS3_HLE_INFLIGHT_MAX] = { nullptr };
+extern "C" std::atomic<const char*> g_hle_inflight[PS3_HLE_INFLIGHT_MAX] = { nullptr };
 
 /* A stop reports how far the guest got. The two globals above are shared by
  * every guest thread (the watchdog reads them from its own), so a stop on one
@@ -182,6 +200,31 @@ static void hle_unresolved(uint32_t nid, ppu_context* ctx)
              f, 3, &site);
 }
 
+/* A handler classified as returning a host pointer (tools/gen_hle_nids.py,
+ * runtime/ppu/ppu_hle_adapt.hpp). Handing the guest a truncated host address
+ * is the same fabricated-success bug as an unresolved import: it would carry
+ * on from state the console never produced. Stop at the call instead.
+ *
+ * The frontier pair was set by ps3_hle_call immediately before the dispatch,
+ * on this thread, so it names the import that is being refused. */
+extern "C" void ps3_hle_stop_unsupported_return(ppu_context* ctx)
+{
+    char nid_s[16];
+    snprintf(nid_s, sizeof nid_s, "0x%08X", t_last_hle_nid);
+    ps3_stop_field f[] = {
+        {"nid", nid_s},
+        {"name", t_last_hle_name && *t_last_hle_name ? t_last_hle_name : "unknown"},
+        {"reason", "returns a host pointer, not a guest EA"},
+    };
+    ps3_stop_site site = { ctx->lr, ctx->lr, ctx->thread_id };
+    ps3_stop(PS3_STOP_HLE_UNSUPPORTED_RETURN,
+             "HLE handler returns a host pointer, which has no guest address",
+             "Fix the handler to return the guest EA (the firmware's contract) or "
+             "move it to the context-aware table if its call shape is not an "
+             "import (docs/HLE_ABI.md).",
+             f, 3, &site);
+}
+
 extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
 
 /* PS3_HLE_TOP=<seconds>: the most-called HLE imports over each window, with
@@ -264,7 +307,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
     struct _TocGuard { ppu_context* c; uint64_t toc, sp;
         ~_TocGuard(){ c->gpr[2] = toc; vm_write64(sp + 0x28, toc);
                       unsigned t = (unsigned)c->thread_id;
-                      if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = nullptr; }
+                      if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t].store(nullptr, std::memory_order_relaxed); }
     } _tg{ ctx, ctx->gpr[2], ctx->gpr[1] };
     /* Deliver any pending vblank/flip tick on THIS (guest) thread, serialized with
      * guest execution -- the vblank ticker only marks ticks pending; the handlers
@@ -273,7 +316,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 
     /* Guest-PC breadcrumb for the sampling profiler (see lv2_syscall). */
     ppu_prof_stamp(ctx, ppu_prof_resolve_host(__builtin_return_address(0)));
-    g_last_hle_nid = nid;
+    g_last_hle_nid.store(nid, std::memory_order_relaxed);
     t_last_hle_nid = nid;
     /* Stamp the NAME here too, not only where a handler is found below.
      *
@@ -287,7 +330,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
      * watchdog reported it as "cellPadInit" -- which for a game that needs a
      * guitar controller is an extremely convincing wrong answer. Placeholder
      * now, overwritten with the real name once the handler is known. */
-    g_last_hle_name = "(unimplemented)";
+    g_last_hle_name.store("(unimplemented)", std::memory_order_relaxed);
     t_last_hle_name = "(unimplemented)";
 
     /* Boot trace: log the first N HLE calls (PS3_HLE_TRACE=N). Invaluable for
@@ -666,18 +709,18 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
              * Guitar Hero III wedges in sys_spinlock_unlock and was reported as
              * "cellPadInit", which for a game that needs a guitar controller is
              * a very convincing wrong answer to chase. */
-            g_last_hle_name = g_ctx[i].name;
+            g_last_hle_name.store(g_ctx[i].name, std::memory_order_relaxed);
             t_last_hle_name = g_ctx[i].name;
             { unsigned t = (unsigned)ctx->thread_id;
-              if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = g_ctx[i].name; }
+              if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t].store(g_ctx[i].name, std::memory_order_relaxed); }
             g_ctx[i].fn(ctx);
             { unsigned t = (unsigned)ctx->thread_id;
-              if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = nullptr; }
+              if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t].store(nullptr, std::memory_order_relaxed); }
             return;
         }
 
-    ps3_nid_entry* e = g_hle_inited ? ps3_nid_table_find(&g_hle_nids, nid) : nullptr;
-    if (!e || !e->handler) {
+    hle_entry* e = hle_find(nid);
+    if (!e) {
         /* Every unresolved import ends in hle_unresolved: a stop, or the title
          * config's [[hle.stub]] value. There is no environment switch in front of
          * it: the YDKJ_TUNERFIX and YDKJ_NETOFFLINE shortcuts that stood here are
@@ -703,7 +746,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
         hle_unresolved(nid, ctx);
         return;
     }
-    g_last_hle_name = e->name;
+    g_last_hle_name.store(e->name, std::memory_order_relaxed);
     t_last_hle_name = e->name;
     { static long s_ht = -1;
       if (s_ht < 0) { const char* ev = getenv("PS3_HLE_TOP"); s_ht = ev ? atol(ev) : 0;
@@ -711,7 +754,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
       if (s_ht > 0) hle_top_note(nid, e->name, ctx, s_ht); }
     ps3_msf("hle:%s", e->name);
     { unsigned t = (unsigned)ctx->thread_id;
-      if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = e->name; }
+      if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t].store(e->name, std::memory_order_relaxed); }
     if (nid == 0xD0B1D189u /*cellGcmSetTile*/ || nid == 0xDC09357Eu /*SetDisplayBuffer*/) {
         static int _g=0; if (PS3_LOG_FIRST(_g, 8))
             fprintf(stderr, "[hle-trace] %s lr=0x%08X cia=0x%08X r3..r8=%08X %08X %08X %08X %08X %08X\n",
@@ -719,17 +762,16 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                     (uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[4],(uint32_t)ctx->gpr[5],
                     (uint32_t)ctx->gpr[6],(uint32_t)ctx->gpr[7],(uint32_t)ctx->gpr[8]);
     }
-    hle_generic fn = (hle_generic)e->handler;
-    uint64_t r = fn(ctx->gpr[3], ctx->gpr[4], ctx->gpr[5], ctx->gpr[6],
-                    ctx->gpr[7], ctx->gpr[8], ctx->gpr[9], ctx->gpr[10]);
-    ctx->gpr[3] = r;   /* PPC return value */
+    /* The registered adapter derives this handler's own declared type
+     * (ppu_hle_adapt.hpp) and has already written r3/f1 per it. */
+    e->fn(ctx);
     /* PS3_HLE_PTRCHECK: the guest stores HLE return values as guest pointers, so
      * an HLE returning a value outside guest RAM (>= 0x10000000) that is not a
      * CELL_ERROR code (0x8001xxxx / 0x8002xxxx) is leaking a truncated HOST
      * pointer. It surfaces much later as an unresolved indirect call with no hint
      * of where it came from, which is why it is worth checking for directly. */
     { static int _pl=-1; if(_pl<0)_pl=getenv("PS3_HLE_PTRCHECK")?1:0;
-      if(_pl){ uint32_t rv=(uint32_t)r;
+      if(_pl){ uint32_t rv=(uint32_t)ctx->gpr[3];
         if(rv>=0x10000000u && (rv & 0xFFFF0000u)!=0x80010000u && (rv & 0xFFFF0000u)!=0x80020000u){
           static int _n=0; if(PS3_LOG_FIRST(_n, 40)) fprintf(stderr,"[PTRLEAK] NID 0x%08X %s returned 0x%08X (out-of-guest-RAM host ptr?)\n",
             nid, e->name?e->name:"?", rv); } } }

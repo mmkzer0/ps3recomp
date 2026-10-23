@@ -420,19 +420,39 @@ In practice, the vast majority of game-facing libraries use the default suffix (
 
 ---
 
-## Game-Side HLE Bridge Pattern
+## HLE dispatch: plain handlers and context-aware handlers
 
-In a recompiled game project, import stubs dispatch NID calls through `nid_dispatch()`. The handler receives a `ppu_context*` and must:
+In a recompiled title, import stubs are `ps3_hle_call(<NID>, ctx)`
+(`runtime/ppu/ppu_hle.cpp`). The NID resolves to one of two kinds of handler.
 
-1. **Extract arguments** from GPRs per the PPC64 ABI (r3-r10 = integer/pointer args, f1-f13 = float args)
+**Plain handlers** are ordinary C functions in `libs/` with their real SDK
+signature. `tools/gen_hle_nids.py` registers each one as
+`ps3_hle_register(0x.., "name", &ps3_hle_adapt<&name>)`, and the adapter
+(`runtime/ppu/ppu_hle_adapt.hpp`) derives that signature at compile time:
+arguments from `r3..r10`, `f1..f13` and the caller's parameter save area;
+pointer arguments are guest effective addresses, translated inside the function
+with `GUEST_PTR`; the return value is mapped by its declared type (`s32`
+sign-extended into r3, `u32` zero-extended, `u64` unchanged, `float`/`double`
+into f1, `void` leaves r3 untouched). No per-function bridge is needed for
+these; write the implementation and declare it in the module header. A signature
+with no defined mapping fails the build at the handler's name. See
+[HLE_ABI.md](HLE_ABI.md).
+
+**Context-aware handlers** (`ps3_hle_register_ctx`) receive the `ppu_context*`
+itself, for call shapes the C signature cannot express (a call with more than
+eight arguments in registers the plain adapter cannot see, register side
+effects, TOC/r13 changes). They do their own marshalling:
+
+1. **Extract arguments** from GPRs (r3-r10 = integer/pointer args, `f1-f13` = float args)
 2. **Translate pointers** — guest addresses become `vm_base + (uint32_t)addr`
 3. **Call the real implementation** with explicit C parameters
 4. **Write output structs** to guest memory in big-endian (each field via `vm_write32/16/8`)
-5. **Store return value** in `ctx->gpr[3]`
+5. **Store the return value** in `ctx->gpr[3]` (sign-extend an `s32` yourself:
+   `ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)rc;`)
 
 ```c
-// Example: bridge for cellFooGetInfo(u32 id, CellFooInfo* info)
-static int64_t bridge_cellFooGetInfo(ppu_context* ctx) {
+// Example: a context-aware wrapper for a call shape the C type cannot express
+static void hle_cellFooGetInfo(ppu_context* ctx) {
     uint32_t id        = (uint32_t)ctx->gpr[3];  // arg 1 from r3
     uint32_t info_addr = (uint32_t)ctx->gpr[4];  // arg 2 from r4 (guest ptr)
 
@@ -443,20 +463,16 @@ static int64_t bridge_cellFooGetInfo(ppu_context* ctx) {
         vm_write32(info_addr,     host_info.field1); // big-endian write
         vm_write32(info_addr + 4, host_info.field2);
     }
-
-    ctx->gpr[3] = (uint64_t)(int64_t)rc;
-    return rc;
+    ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)rc;
 }
+...
+ps3_hle_register_ctx(0x........u, "cellFooGetInfo", hle_cellFooGetInfo);
 ```
 
-**Critical: TOC save.** The `nid_dispatch()` function must save the TOC register (r2) to `sp+40` before calling any handler. The PPC64 ELF ABI requires callers to restore TOC after inter-module calls, but the lifter does not emit the save instruction. Without this, the caller reads garbage from the stack when it restores r2, corrupting all subsequent TOC-relative loads:
-
-```c
-static void nid_dispatch(ppu_context* ctx, uint32_t nid, const char* name) {
-    vm_write64((uint32_t)ctx->gpr[1] + 0x28, ctx->gpr[2]); // save TOC
-    void* handler = ps3_resolve_func_nid(nid);
-    if (handler) ((int64_t(*)(ppu_context*))handler)(ctx);
-}
-```
+**TOC save** is done by `ps3_hle_call` itself (r2 is snapshotted and written
+back to the caller's `sp+0x28` on every exit path), so neither kind of handler
+has to repeat it. A context-aware handler that dispatches into lifted code still
+needs the re-entry isolation that `ps3_hle_call` applies to the real-PRX path;
+see the comments there.
 
 See [CUSTOM_MODULES.md](CUSTOM_MODULES.md) for the complete module development guide, and [RSX_GRAPHICS.md](RSX_GRAPHICS.md) for how the cellGcmSys bridge handles RSX-specific data structures.

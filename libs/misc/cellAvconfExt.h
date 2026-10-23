@@ -80,6 +80,9 @@ s32 cellAudioOutGetConfiguration(u32 audioOut,
                                   void* option, u32 optionSize);
 s32 cellAudioOutGetState(u32 audioOut, u32 deviceIndex, void* state);
 s32 cellAudioOutSetCopyControl(u32 audioOut, u32 control);
+/* Defined in cellAvconfExt.c (the audio-out configuration entry point). */
+s32 cellAudioOutConfigure(u32 audioOut, void* config, void* option,
+                          u32 waitForEvent);
 
 /* HDMI/display audio */
 s32 cellAudioOutGetNumberOfDevice(u32 audioOut);

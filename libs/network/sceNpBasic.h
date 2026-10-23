@@ -10,6 +10,7 @@
 
 #include "ps3emu/ps3types.h"
 #include "ps3emu/error_codes.h"
+#include "sceNp.h"          /* SceNpOnlineId is defined once, in the SDK's layout */
 
 #ifdef __cplusplus
 extern "C" {
@@ -52,10 +53,9 @@ extern "C" {
  * Types
  * -----------------------------------------------------------------------*/
 
-typedef struct SceNpOnlineId {
-    char data[SCE_NP_ONLINEID_MAX_LENGTH + 1];
-    char padding[3];
-} SceNpOnlineId;
+/* SceNpOnlineId: see sceNp.h. Redefining it here (it used to be
+ * char data[17] + padding[3]) made a translation unit that includes both
+ * headers fail, so sceNp.h's SDK layout is the single definition. */
 
 typedef struct SceNpBasicFriendListEntry {
     SceNpOnlineId onlineId;
@@ -114,6 +114,14 @@ s32 sceNpBasicRecvInGameInvitation(void* data, u32 dataMaxSize,
 /* Block list */
 s32 sceNpBasicGetBlockListEntryCount(u32* count);
 s32 sceNpBasicAddBlockListEntry(const SceNpOnlineId* onlineId);
+
+/* Event queue and players history */
+s32 sceNpBasicGetEvent(u32* event, void* from, void* data, u32* size);
+s32 sceNpBasicGetPlayersHistoryEntryCount(u32 options, u32* count);
+s32 sceNpBasicAddPlayersHistoryAsync(const void* npids, u32 count,
+                                     const void* description, u32* reqId);
+s32 sceNpBasicRegisterContextSensitiveHandler(const void* context,
+                                              void* handler, void* arg);
 
 #ifdef __cplusplus
 }

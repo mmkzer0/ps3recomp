@@ -8,6 +8,12 @@
 
 #ifndef PPU_CONTEXT_H
 #define PPU_CONTEXT_H
+/* ppu_context is defined by this header OR by a lifter-generated
+ * ppu_recomp.h (tools/ppu_lifter.py HEADER_PREAMBLE, which defines the same
+ * marker). A unit that sees both -- ppu_hle.cpp includes the lifted header and
+ * the HLE adapter -- must not include the second definition; the two layouts
+ * are kept identical. */
+#define PPU_CONTEXT_DEFINED 1
 
 #include "../../include/ps3emu/ps3types.h"
 #include <stdint.h>
