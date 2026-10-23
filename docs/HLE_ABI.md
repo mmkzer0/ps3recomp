@@ -69,8 +69,9 @@ the platform's `char` signedness is honoured rather than assumed.
 A handler whose declared return is a pointer must be listed, with a reason, in
 `tools/gen_hle_nids.py`. The list is what selects the adapter, so a new
 pointer-returning handler that is not classified fails the build (the plain
-adapter's `static_assert` says to classify it). Census: 26 of 1208 candidate
-handlers return a pointer.
+adapter's `static_assert` says to classify it). Census: 26 of the 1197 scanned
+definitions return a pointer (22 registered, 4 excluded;
+`python3 tools/test_gen_hle_nids.py --census`).
 
 **Guest EA (16)** — the body returns an effective address; the adapter
 zero-extends its low 32 bits (`ps3_hle_adapt_guest_ea`):
@@ -145,57 +146,106 @@ names the handler):
 type matches the firmware's. This contract only guarantees that whatever is
 declared is called correctly.
 
-## Census (one-off, 2026-10-23)
+## Census
 
-Method: for each of the 94 module sources `tools/gen_hle_nids.py` scans, run
-`clang -Xclang -ast-dump=json`, take the *definition* of every name the
-generator registers (the definition is the truth, including for separate
-definitions in `sceNpCommerce.c` / `sceNpCommerce2.c`), resolve typedefs to
-integral/enum/pointer/record/function-pointer, and classify by the tables
-above. 1208 candidates; none missing.
+Every number below is produced by a command over this checkout; the tree moves,
+the commands do not.
+
+`python3 tools/gen_hle_nids.py --all --out /tmp/x.cpp` is the run the build
+uses. It prints
+
+    wrote /tmp/x.cpp: 1151 NID handlers from 94 module(s); scanned 1197 definition name(s), excluded 46 host-side helper(s)
+
+and `grep -c 'ps3_hle_register(0x' /tmp/x.cpp` prints `1151`. So: 94 module
+sources, 1197 unique definition names, **1151 registrations**, **46 host-side
+helpers** excluded. Registration is fail-closed: `classify_name` decides every
+one of the 1197 (see "Firmware export or host-side helper" below), and a name
+with no evidence stops the generator (exit 2) instead of being registered.
+
+`python3 tools/test_gen_hle_nids.py --census` (requires `clang`) takes the
+*definition* of every scanned name from each module source's
+`clang -Xclang -ast-dump=json`, resolves typedefs to
+integral/enum/pointer/record/function-pointer, and prints:
+
+    modules scanned: 94
+    scanned definition names: 1197
+    definitions with a clang AST: 1197 (0 missing)
+    registered: 1151 (310 in the known NID sources, 841 by SDK export shape), excluded host-side helpers: 46
+    returns: integral 1114, void 56, float 1, pointer 26
+    pointer returns: 26 total = 22 registered (16 guest EA + 6 host-pointer stop) + 4 excluded (cellGame_get_hdd_title_id, cellGame_get_title, cellGame_get_title_id, cellGcm_fifo_kick_event)
+    parameters: pointer 1042, integral 1375, float 16, function-pointer 73, variadic 3, record 0, reference 0, array 0, enum 0
+    float parameters: 16 in 12 handlers
+    more than 8 parameters: cellGcmSetZcull(12), cellSaveDataListAutoLoad(9), cellSpursWorkloadAttributeInitialize(9)
 
 | Return class | Count |
 |---|---|
-| integral (including the 3 variadic `_sys_*printf`) | 1124 |
-| void | 57 |
-| `float` (`cellAvconfExt_display_gamma`) | 1 |
+| integral (including the 3 variadic `_sys_*printf`) | 1114 |
+| void | 56 |
+| `float` (`cellAvconfExt_display_gamma`, excluded as a helper) | 1 |
 | pointer | 26 (16 guest EA + 6 host-pointer stop + 4 excluded helpers) |
 
-Parameter features: 1055 pointer, 1377 integral, 16 floating-point across 12
-handlers, 73 function-pointer, 0 struct/union by value, 0 reference, 0 rejected.
-Three handlers exceed eight parameters (see above).
+Parameter features: 1042 pointer, 1375 integral, 16 floating-point across 12
+handlers, 73 function-pointer, 3 variadic, 0 struct/union by value, 0
+reference, 0 array. Three handlers exceed eight parameters (`cellGcmSetZcull`
+12, `cellSaveDataListAutoLoad` 9, `cellSpursWorkloadAttributeInitialize` 9).
+Every one of the 1151 registered signatures compiles through the adapter, so
+none is in a rejected class.
 
-Registration list after classification: **1187 handlers** (1208 − 21 host-side
-helpers).
+### Firmware export or host-side helper
 
-### The 21 excluded host-side helpers
+The name scan finds every non-static definition named `cell*`, `sce*`,
+`sys_*`, `_cell*` or `_sys_*`, which includes host-side helpers the runtime
+calls directly. `tools/gen_hle_nids.py` classifies each name with evidence and
+refuses to guess:
 
-These match the generator's `cell*/sys*/sce*` name scan but are not firmware
-exports; none appears in the title import table used for this port
-(`out/imports.csv`, 210 imports), and the SDK's exports are CamelCase while
-these carry internal snake_case or are declared with a local `extern` in
-another module. Registering their computed NID could only shadow a real import.
+1. `NOT_FIRMWARE_EXPORTS` — an explicit entry with its reason.
+2. `HELPER_SHAPES` — the naming shapes the SDK does not use for an export: a
+   `cell*` prefix followed by `_` and a lowercase letter
+   (`^_?cell[A-Za-z0-9]*_[a-z]`, e.g. `cellPad_poll`, `cellfs_translate_path`,
+   `cellRtcGetTime_t`), or `_syscall_` anywhere. `sys_*` and `_sys_*` are
+   deliberately absent: they are the SDK's own snake_case export family
+   (`sys_net_bnet_accept`, `sys_heap_malloc`, `_sys_malloc`).
+3. the known NID sources (`tools/nid_database.py`'s builtin table,
+   `tools/nid_from_protos.json`) or an SDK export shape (CamelCase after the
+   module prefix).
+
+A shape hit or explicit entry that also appears in the known NID sources is a
+contradiction and stops the generator: the rule is narrowed, never allowed to
+drop a real export. A name that fits none of the three classes also stops it
+(exit 2, the name printed) and no table is written. Every dropped name is thus
+absent from both known-export sources (the contradiction check), and every
+kept name has evidence: the census prints the split — 310 of the 1151
+registrations are in the known NID sources, the other 841 pass an SDK export
+shape, and none is in neither.
+
+None of the 46 excluded names is a firmware export, so registering one could
+only shadow a real import: a title import whose 32-bit NID happened to match
+would dispatch guest arguments into a host function.
+
+**Excluded by shape (39).**
+
+| Group | Names |
+|---|---|
+| cellGcmSys host plumbing | `cellGcm_display_buffer_count`, `cellGcm_fifo_kick_event`, `cellGcm_fifo_kick_wait`, `cellGcm_fifo_recycle`, `cellGcm_flip_request_count`, `cellGcm_ref_on_poll`, `cellGcm_request_tick`, `cellGcm_rsx_process_fifo`, `cellGcm_take_flip_pending`, `cellGcm_take_flip_pending_synced`, `cellGcm_control_guest_addr`, `cellGcm_replay_display_buffers_to_engine` |
+| cellGcmSys guest-syscall bridge | `cellGcm_syscall_bringup`, `cellGcm_syscall_iomap`, `cellGcm_syscall_iounmap`, `cellGcm_syscall_set_fifo` |
+| cellGame boot/params plumbing | `cellGame_get_title`, `cellGame_get_title_id`, `cellGame_get_hdd_title_id`, `cellGame_set_title`, `cellGame_set_title_id`, `cellGame_set_content_path`, `cellGame_init_from_paramsfo` |
+| input event injection | `cellPad_poll`, `cellKb_keyEvent`, `cellMouse_moveEvent`, `cellMouse_buttonEvent`, `cellMouse_wheelEvent` |
+| video / save / rtc | `cellVideoOut_set_resolution`, `cellAvconfExt_display_gamma`, `cellSaveData_set_scratch_region`, `cellSaveData_register_ctx_handlers`, `cellRtcGetTime_t`, `cellRtcSetTime_t` |
+| filesystem path mapping | `cellfs_translate_path`, `cellfs_add_path_mapping`, `cellfs_set_root_path` |
+| per-frame hooks | `cellMsgDialog_tick`, `cellSysutil_pump_seen` |
+
+**Excluded by explicit list (7).** These names are CamelCase after the module
+prefix — shape-identical to an SDK export — so only a reader can say they are
+host helpers:
 
 | Name | Why it is not an export |
 |---|---|
-| `cellGame_get_title`, `cellGame_get_title_id`, `cellGame_get_hdd_title_id` | host-side accessors for the boot caption/title id |
-| `cellGcm_fifo_kick_event` | host Win32 event handle used by the present thread |
-| `sys_rsx_init` | internal init helper called from `lv2_register.c`, takes a host `lv2_syscall_table*` |
 | `cellGcmOffsetIsDisplay` | host display-offset predicate (`extern` in `rsx_d3d12_backend.c`) |
 | `cellGcmResolveOffset` | host offset→EA resolver (`extern` in `rsx_vertex_fetch.c`) |
 | `cellGcmResolveIO` | host IO-table resolver (`extern` in `rsx_draw_engine.c`) |
 | `cellGcmResolveLocated` | host MAIN/LOCAL resolver (`extern` in `cellGcmSys.c`) |
-| `cellGcm_display_buffer_count` | host display-buffer count |
-| `cellGcm_fifo_kick_wait` | host present-thread wait |
-| `cellGcm_fifo_recycle` | host retired-command recycling |
-| `cellGcm_flip_request_count` | host pending-flip counter |
-| `cellGcm_ref_on_poll` | host RSX ref polling |
-| `cellGcm_request_tick` | host vblank tick request |
-| `cellGcm_rsx_process_fifo` | host FIFO walk |
-| `cellGcm_take_flip_pending`, `cellGcm_take_flip_pending_synced` | host pending-flip consumers |
-| `cellMsgDialog_tick` | per-frame host tick called by `cellSysutil.c` |
-| `cellSysutil_pump_seen` | host query for whether the title pumped callbacks |
-| `cellSaveData_register_ctx_handlers` | in-tree registration helper |
+| `cellUserInfoSelectUser_ListGet`, `cellUserInfoSelectUser_ListSet` | host-side halves of the select-user list API (`cellUserInfoSelectUser` is the export) |
+| `sys_rsx_init` | internal init helper called from `lv2_register.c`, takes a host `lv2_syscall_table*` |
 
 ## Adding a handler
 
@@ -204,7 +254,12 @@ another module. Registering their computed NID could only shadow a real import.
    header declaration is a build error at the handler's name.
 2. If it returns a pointer, add its name to `GUEST_EA_RETURN` or
    `HOST_POINTER_RETURN` in `tools/gen_hle_nids.py` with a comment saying why.
-3. Run `python tools/gen_hle_nids.py --all --out <build>/ppu_hle_nids.cpp`.
+3. A host-side helper must not be registered: name it with a helper shape
+   (`<cell module>_<lowercase>`, `*_syscall_*`) so the rule excludes it, or add
+   it to `NOT_FIRMWARE_EXPORTS` with a reason. Anything the scanner cannot
+   classify stops the generator (exit 2, the name printed); it is never
+   registered by guess.
+4. Run `python tools/gen_hle_nids.py --all --out <build>/ppu_hle_nids.cpp`.
    The generated unit includes `ppu_hle_adapt.hpp` and the module headers by
    repository-relative path. `ps3recomp_ppu_hle_nids(...)`
    (`cmake/PS3RecompPPU.cmake`) sets the toolkit root, `runtime/ppu` and
@@ -223,4 +278,9 @@ path.
   `hle-unsupported-return` stop (exit 70).
 - `tools/test_sys_spu_printf.py`: the `s32` `_sys_spu_printf_*` family through
   the NID table, asserting the sign-extended 64-bit `r3`.
+- `tools/test_gen_hle_nids.py` (`ctest -R gen_hle_nids`): every scanned name is
+  a classified export or an excluded helper, the review's helper names stay out
+  of the table, and a synthetic unclassifiable definition exits 2 naming it and
+  writes nothing. Its `--census` mode reproduces the numbers above (needs
+  `clang`).
 - The full `--all` table compiles only when every handler is classified.

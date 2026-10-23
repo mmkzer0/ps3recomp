@@ -446,8 +446,16 @@ the CRT was not built for.
 **Memory.** For an ELF job the high word of `eaBinary` is the bss in quadwords
 (the CRT zeroes it itself); the loader keeps the full 64 bits, so the job's
 memory is `sizeBinary + 16 * hi32`, every buffer and the stack (`r1`) start
-above it, and the bss reads as zero. Memory that reaches `0x3FAC0` would lie on
-the context and is the named stop `spu-job-memory`.
+above it, and the bss reads as zero. Every region the job owns -- image + bss,
+ioBuffer, oBuffer, the scratch + stack block (its top is where `r1` starts) and
+each cache buffer -- must end at or below `0x3FAC0`; sizes are summed in 64 bits
+so none wraps. Anything else would lie on the runtime area or the context (a
+stack top past local store wraps onto them) and is the named stop
+`spu-job-memory`, whose fields name each size, the failing `region`, its end
+`p` and the `limit` (`docs/STOPS.md`). The firmware knowledge base holds no
+total-size limit from `_cellSpursCheckJob`, so `0x3FAC0` is this loader's own
+layout bound, not a firmware figure. The input DMA list is copied into the
+ioBuffer unchecked against `sizeIn/Out`, as before.
 
 **Kernel view.** Both CRTs read the SPURS kernel context with absolute loads;
 with the job at LS 0 those addresses are the job's own bytes, so the loader
@@ -854,7 +862,7 @@ Tests: `tests/lwsync` (`test_lwsync`) drives `ps3_hle_call` with the real NIDs. 
 
 ### Host-initiated callback thread ids
 
-A callback raised by a host thread with no guest context (`ppu_guest_call` / `ppu_guest_call_ct` with `g_active_ctx == nullptr`: the vblank, audio and timer threads) runs as a guest thread of its own. Its id is allocated once per host thread from a counter in `0x7F000000..0x7FFFFFEF`, kept for the life of the thread and never reused. Real guest thread ids are the thread-table index + 1 (at most `PPU_THREAD_MAX`, 64) and `sys_ppu_thread_get_id`'s "no id" sentinel is `0x7FFFFFFE`, so the ranges cannot meet. Two such threads are therefore two owners to an lwmutex (`tests/test_loader_gaps.cpp hostid`); a callback raised under a guest context still inherits that thread's id.
+A callback raised by a host thread with no guest context (`ppu_guest_call` / `ppu_guest_call_ct` with `g_active_ctx == nullptr`: the vblank, audio and timer threads) runs as a guest thread of its own. Its id is allocated once per host thread from a counter in `0x7F000000..0x7FFEFFFF` (16,711,680 ids), kept for the life of the thread and never reused; the first id the counter refuses is `0x7FFF0000`, which is cellFiber's `FIBER_FALLBACK_THREAD_ID` (`libs/spurs/cellFiber.c`), so a host-callback thread and a parentless fiber cannot share an owner id. Each file pins its copy of the boundary with a compile-time assert (`PPU_HOST_TID_END` is pinned to `0x7FFF0000` in `runtime/ppu/ppu_loader.cpp`, and `cellFiber.c` pins `FIBER_FALLBACK_THREAD_ID` to the same value). Real guest thread ids are the thread-table index + 1 (at most `PPU_THREAD_MAX`, 64) and `sys_ppu_thread_get_id`'s "no id" sentinel is `0x7FFFFFFE`, so those ranges cannot meet either. Two such threads are therefore two owners to an lwmutex (`tests/test_loader_gaps.cpp hostid`); a callback raised under a guest context still inherits that thread's id.
 
 ---
 
