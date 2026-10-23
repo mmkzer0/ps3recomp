@@ -236,7 +236,7 @@ typedef struct {
      * advances (NOT on every wait attempt/timeout -- a consumer polling
      * every 500ms on a dropped wakeup must still be flagged once outstanding
      * work sits unconsumed for T1_STALL_MS, not reset every poll cycle). */
-    LONG volatile last_progress_ms;
+    LONG64 volatile last_progress_ms;  /* 64-bit: see t1b_shared.parked_at_ms */
 } t1_shared;
 
 typedef struct {
@@ -312,7 +312,7 @@ static unsigned __stdcall t1_consumer(void* p)
         }
 
         InterlockedIncrement(&sh->consumed);
-        InterlockedExchange(&sh->last_progress_ms, (LONG)now_ms());
+        InterlockedExchange64(&sh->last_progress_ms, (LONG64)now_ms());
 
         int32_t urc = call1((int64_t(*)(ppu_context*))sys_mutex_unlock, &ctx, sh->mutex_id);
         if (urc != CELL_OK) { fail("test1", "consumer unlock rc=0x%08X", (unsigned)urc); return 1; }
@@ -336,7 +336,7 @@ static unsigned __stdcall t1_watchdog(void* p)
         Sleep(100);
         if (sh->done_producing && sh->produced <= sh->consumed) return 0; /* test finished cleanly */
         if (sh->produced > sh->consumed) {
-            ULONGLONG stalled_for = now_ms() - (ULONGLONG)sh->last_progress_ms;
+            ULONGLONG stalled_for = now_ms() - (ULONGLONG)ReadAcquire64(&sh->last_progress_ms);
             if (stalled_for > T1_STALL_MS) {
                 fprintf(stderr, "[FAIL] test1_no_lost_wakeup: STUCK: no consumption progress for "
                         ">%dms with produced=%ld consumed=%ld (possible lost wakeup)\n",
@@ -378,7 +378,9 @@ typedef struct {
     uint32_t mutex_id;
     uint32_t cond_id;
     LONG volatile woke;         /* 1 once the consumer's wait returns */
-    LONG volatile parked_at_ms; /* set just before the consumer waits */
+    /* 64-bit: a LONG holds monotonic milliseconds only for the first 24.8 days
+     * of host uptime; past that it went negative and every run "timed out". */
+    LONG64 volatile parked_at_ms; /* set just before the consumer waits */
 } t1b_shared;
 
 static unsigned __stdcall t1b_consumer(void* p)
@@ -390,7 +392,7 @@ static unsigned __stdcall t1b_consumer(void* p)
     int32_t rc = call2((int64_t(*)(ppu_context*))sys_mutex_lock, &ctx, sh->mutex_id, 0);
     if (rc != CELL_OK) { fail("test1b", "lock rc=0x%08X", (unsigned)rc); return 1; }
 
-    InterlockedExchange(&sh->parked_at_ms, (LONG)now_ms());
+    InterlockedExchange64(&sh->parked_at_ms, (LONG64)now_ms());
     rc = call2((int64_t(*)(ppu_context*))sys_cond_wait, &ctx, sh->cond_id, (uint64_t)0 /* infinite */);
     if (rc != CELL_OK) { fail("test1b", "wait rc=0x%08X", (unsigned)rc); return 1; }
 
@@ -405,8 +407,9 @@ static unsigned __stdcall t1b_watchdog(void* p)
     for (;;) {
         Sleep(50);
         if (sh->woke) return 0;
-        if (sh->parked_at_ms != 0) {
-            ULONGLONG since_park = now_ms() - (ULONGLONG)sh->parked_at_ms;
+        const LONG64 parked_at = ReadAcquire64(&sh->parked_at_ms);
+        if (parked_at != 0) {
+            ULONGLONG since_park = now_ms() - (ULONGLONG)parked_at;
             if (since_park > (ULONGLONG)(T1B_PARK_DELAY_MS + T1B_STALL_MS)) {
                 fprintf(stderr, "[FAIL] test1b_rendezvous_park: consumer parked >%dms ago and "
                         "never woke (signal delivered to an already-sleeping waiter was lost)\n",
@@ -493,7 +496,7 @@ static int test1_no_lost_wakeup(void)
     memset(&sh, 0, sizeof(sh));
     sh.mutex_id = mutex_id;
     sh.cond_id = cond_id;
-    sh.last_progress_ms = (LONG)now_ms();
+    sh.last_progress_ms = (LONG64)now_ms();
 
     HANDLE producers[T1_PRODUCERS];
     HANDLE consumers[T1_CONSUMERS];
