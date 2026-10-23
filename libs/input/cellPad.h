@@ -181,6 +181,9 @@ s32 cellPadGetData(u32 port_no, CellPadData* data);
 
 /* NID: 0x8B8013DA */
 s32 cellPadGetInfo2(CellPadInfo2* info);
+/* NID: 0x3AAAD464 -- the v1 entry point; `info` is the SAME CellPadInfo2
+ * layout in guest memory (see the definition). */
+s32 cellPadGetInfo(CellPadInfo2* info);
 s32 cellPadPeriphGetInfo(CellPadPeriphInfo* info);
 
 /* NID: 0xA703A51D */

@@ -56,6 +56,9 @@ s32 cellRtcGetCurrentClockLocalTime(CellRtcDateTime* pClock);
 
 s32 cellRtcGetCurrentClockUtc(CellRtcDateTime* pClock);
 
+/* UTC shifted by iTimeZone (minutes); the SDK entry point titles import. */
+s32 cellRtcGetCurrentClock(CellRtcDateTime* pClock, s32 iTimeZone);
+
 s32 cellRtcGetTime_t(const CellRtcTick* pTick, s64* pTime);
 
 s32 cellRtcSetTime_t(CellRtcTick* pTick, s64 iTime);

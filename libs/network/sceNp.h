@@ -132,6 +132,8 @@ s32 sceNpManagerGetNpId(SceNpId* npId);
 s32 sceNpManagerGetOnlineId(SceNpOnlineId* onlineId);
 s32 sceNpManagerGetOnlineName(SceNpOnlineName* onlineName);
 s32 sceNpManagerGetAccountAge(s32* age);
+s32 sceNpManagerGetContentRatingFlag(s32* isRestricted, s32* age);
+s32 sceNpManagerGetChatRestrictionFlag(s32* isRestricted);
 
 /* NPDRM availability checks. The guest passes its klicensee (16 bytes) and the
  * path of an EDAT/SELF; the klicensee is handed to the EDAT reader, which then

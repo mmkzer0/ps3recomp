@@ -154,6 +154,10 @@ s32 cellVideoOutGetDeviceInfo(u32 videoOut, u32 deviceIndex,
 
 s32 cellVideoOutGetNumberOfDevice(u32 videoOut);
 
+/* Resolution a display supports: 1 = available, 0 = not, negative = error. */
+s32 cellVideoOutGetResolutionAvailability(u32 videoOut, u32 resolutionId,
+                                          u32 aspect, u32 option);
+
 #ifdef __cplusplus
 }
 #endif

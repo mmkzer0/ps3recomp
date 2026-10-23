@@ -47,18 +47,15 @@ typedef struct SceNpCommerce2ProductInfo {
 
 /* ---------------------------------------------------------------------------
  * Functions
+ *
+ * This header declares only the entry points sceNpCommerce.c defines. Init,
+ * Term, CreateCtx, DestroyCtx, GetCategoryContentsStart and
+ * DoCheckoutFinishAsync are sceNpCommerce2.c's (see sceNpCommerce2.h); the
+ * stale copies that stood here had different signatures (a decoded context
+ * pointer vs the SDK's u32 handle), and a translation unit that includes both
+ * headers could not compile.
  * -----------------------------------------------------------------------*/
 
-s32 sceNpCommerce2Init(void);
-s32 sceNpCommerce2Term(void);
-
-s32 sceNpCommerce2CreateCtx(u32 version, const char* npCommId,
-                              SceNpCommerce2Ctx* ctx);
-s32 sceNpCommerce2DestroyCtx(SceNpCommerce2Ctx ctx);
-
-s32 sceNpCommerce2GetCategoryContentsStart(SceNpCommerce2Ctx ctx,
-                                             const char* categoryId,
-                                             u32 startPosition, u32 maxEntries);
 s32 sceNpCommerce2GetCategoryInfo(SceNpCommerce2Ctx ctx,
                                     SceNpCommerce2CategoryInfo* info);
 s32 sceNpCommerce2GetProductInfo(SceNpCommerce2Ctx ctx, u32 index,

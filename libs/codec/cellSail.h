@@ -142,6 +142,8 @@ typedef struct CellSailMemAllocatorFuncs {
 s32 cellSailPlayerInitialize2(u32 pSelf, u32 pAllocator, u32 pCallback,
                               u32 pUserParam, u32 pAttribute, u32 pResource);
 s32 cellSailSoundAdapterInitialize(u32 pSelf, u32 pCallbacks, u32 pArg);
+s32 cellSailGraphicsAdapterInitialize(u32 pSelf, u32 pCallbacks, u32 pArg);
+s32 cellSailGraphicsAdapterSetPreferredFormat(u32 pSelf, u32 pFormat);
 s32 cellSailMemAllocatorInitialize(CellSailMemAllocator* allocator,
                                      CellSailMemAllocatorFuncs* pFuncs);
 

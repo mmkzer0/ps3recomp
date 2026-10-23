@@ -427,7 +427,8 @@ void cellGcmDumpGraphicsError(void);
 u32 cellGcmGetDefaultCommandWordSize(void);
 u32 cellGcmGetDefaultSegmentWordSize(void);
 
-/* Immediate flip */
+/* Immediate flip, and the context/buffer form a title imports directly. */
+s32 cellGcmSetFlip(void* context, u32 bufferId);
 s32 cellGcmSetFlipImmediate(u32 bufferId);
 
 /* Flip status setter */
