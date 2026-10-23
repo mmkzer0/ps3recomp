@@ -3509,8 +3509,8 @@ extern "C" void ppu_install_thread_trampoline(void)
     g_ppu_thread_entry_trampoline = ppu_thread_entry_trampoline;
 }
 
-/* Call a guest function by OPD with up to 4 integer args, on a private scratch
- * stack, and return r3. Used by the HLE runtime to deliver callbacks into
+/* Call a guest function by OPD with up to 8 integer args, on guest stack space
+ * of its own (ppu_cb_entry_sp), and return r3. Used by the HLE runtime to deliver callbacks into
  * recompiled code (cellSysutil events, GCM vblank/flip handlers, ...) -- the
  * mechanism behind g_ps3_guest_caller (ps3emu/guest_call.h). */
 /* OPD fixups: some title OPDs (the GCM flip/vblank handlers at 0x530D70/78/80)
@@ -3577,6 +3577,148 @@ extern "C" void ppu_register_opd_fixup(uint32_t opd, uint32_t code, uint32_t toc
              f, 6, &site);
 }
 
+/* Guest stack for a host-initiated callback.
+ *
+ * A callback runs guest code, which builds frames below r1, so every ACTIVE
+ * callback needs stack space no other guest frame uses. The rule, as lv2 runs
+ * a callback (on the thread that raised it, nested on that thread's stack):
+ *
+ *  - Raised while this host thread is executing guest code (g_active_ctx is
+ *    set: an HLE handler running on a guest PPU thread, or a callback already
+ *    in flight on this thread): the callback runs on THAT stack, below the
+ *    current r1. Its entry r1 is r1 - PPU_CB_ENTRY_GAP, 16-aligned: the
+ *    288-byte ELFv1 red zone stays untouched and the 0x70-byte linkage area
+ *    the callee writes at entry (back chain, CR, LR, TOC, parameter save area)
+ *    lies under it. A nested callback sees the in-flight callback's r1 (the
+ *    scratch ctx is g_active_ctx while it runs), so it lands below it; on
+ *    return the scratch ctx dies and the caller's r1 is simply still the
+ *    caller's. Concurrent callbacks on different guest threads use different
+ *    guest stacks because their threads' r1 are different.
+ *
+ *  - Raised by a host thread that is running no guest code (g_active_ctx is
+ *    null: the vblank/audio/timer threads): the thread owns one
+ *    PPU_CB_HOST_SLOT_SIZE stack slot, claimed on its first callback and
+ *    released when the thread exits. The slots are the window reserved in vm.h
+ *    (VM_CB_HOST_STACK_WINDOW, the top of the stack region), which this
+ *    function owns: vm_stack_alloc_init ends the PPU thread-stack allocator
+ *    below it, so no thread stack can overlap a slot. The callback starts at the
+ *    slot's top; a callback nested on that thread goes below the one in flight
+ *    by the rule above.
+ *
+ * The old scheme gave every thread the SAME guest EA (and nested calls the same
+ * one again), so concurrent or re-entered callbacks overwrote each other's
+ * frames. A stack that cannot be given -- r1 outside the VM, the VM too small
+ * for the slot window, no free slot, a host slot out of room -- is a named stop,
+ * not a frame on top of someone else's. */
+#define PPU_CB_LINKAGE         0x70u
+#define PPU_CB_RED_ZONE        0x120u
+#define PPU_CB_ENTRY_GAP       (PPU_CB_LINKAGE + PPU_CB_RED_ZONE)
+#define PPU_CB_HOST_SLOTS      VM_CB_HOST_STACK_SLOTS
+#define PPU_CB_HOST_SLOT_SIZE  VM_PPU_STACK_SIZE
+#define PPU_CB_HOST_TOP        (VM_STACK_BASE + VM_STACK_REGION)
+#define PPU_CB_HOST_MIN_FREE   0x4000u   /* a host slot refuses a callback entered with less than this left */
+static_assert(PPU_CB_HOST_SLOTS <= 32, "s_cb_slots_used is a 32-bit mask");
+static_assert((uint64_t)PPU_CB_HOST_SLOTS * PPU_CB_HOST_SLOT_SIZE == VM_CB_HOST_STACK_WINDOW &&
+              PPU_CB_HOST_TOP - VM_CB_HOST_STACK_WINDOW == VM_CB_HOST_STACK_BASE,
+              "the slots must tile exactly the window vm.h reserves");
+
+static uint32_t s_cb_slots_used;   /* bit i set: host slot i belongs to a live thread */
+struct PpuCbHostSlot {
+    int slot = -1;
+    unsigned active = 0;   /* host-slot activations live on this thread (PpuCbSlotScope) */
+    ~PpuCbHostSlot()
+    {
+        if (slot >= 0) __atomic_fetch_and(&s_cb_slots_used, ~(1u << slot), __ATOMIC_RELEASE);
+    }
+};
+static thread_local PpuCbHostSlot t_cb_host;
+
+/* Holds one host-slot activation open for the lifetime of a guest call. */
+struct PpuCbSlotScope {
+    bool on;
+    explicit PpuCbSlotScope(bool o) : on(o) { if (on) ++t_cb_host.active; }
+    ~PpuCbSlotScope() { if (on) --t_cb_host.active; }
+    PpuCbSlotScope(const PpuCbSlotScope&) = delete;
+    PpuCbSlotScope& operator=(const PpuCbSlotScope&) = delete;
+};
+
+static uint32_t ppu_cb_slot_lo(int slot)
+{
+    return PPU_CB_HOST_TOP - (uint32_t)(slot + 1) * PPU_CB_HOST_SLOT_SIZE;
+}
+
+[[noreturn]] static void ppu_cb_stack_stop(const char* why, uint32_t sp, uint32_t lo)
+{
+    char sp_s[16], lo_s[16], vm_s[16];
+    snprintf(sp_s, sizeof sp_s, "0x%08X", sp);
+    snprintf(lo_s, sizeof lo_s, "0x%08X", lo);
+    snprintf(vm_s, sizeof vm_s, "0x%08X", ppu_vm_size);
+    ps3_stop_field f[] = {
+        {"origin", "stack"}, {"sp", sp_s}, {"limit", lo_s}, {"vm_size", vm_s}, {"hint", why},
+    };
+    ps3_stop_site site = { 0, 0, g_active_ctx ? g_active_ctx->thread_id : 0 };
+    ps3_stop(PS3_STOP_UNRESOLVED_GUEST_CALLBACK,
+             "a host-initiated guest callback could not be given guest stack space",
+             "the callback was NOT run (running it would put its frames on memory another "
+             "frame owns). Read the hint: a bad r1 is a guest bug or a corrupted ctx; a VM "
+             "that ends below the stack region needs ppu_vm_size to cover it; a host slot "
+             "that ran out means the callbacks nest deeper than 1 MB of guest stack.",
+             f, 5, &site);
+}
+
+/* `*on_host_slot` is set when the activation runs on this thread's host slot (the
+ * thread's first callback, or one nested in such a callback): the caller holds a
+ * PpuCbSlotScope for its duration, and while one is live every nested callback
+ * must be entered inside the slot -- an in-flight callback whose r1 left it
+ * (to or below the slot's lowest address) would otherwise put the nested frames
+ * on another slot or a thread stack. */
+static uint32_t ppu_cb_entry_sp(const ppu_context* active, bool* on_host_slot)
+{
+    const uint64_t vm_end = ppu_vm_size ? ppu_vm_size : 0x100000000ull;
+    *on_host_slot = false;
+    if (active) {
+        const uint64_t outer = active->gpr[1];
+        const bool in_slot_callback = t_cb_host.slot >= 0 && t_cb_host.active > 0;
+        const uint32_t lo = in_slot_callback ? ppu_cb_slot_lo(t_cb_host.slot) : 0;
+        if (in_slot_callback &&
+            !(outer > lo && outer <= (uint64_t)lo + PPU_CB_HOST_SLOT_SIZE))
+            ppu_cb_stack_stop("the in-flight callback's r1 left its host callback stack slot",
+                              (uint32_t)outer, lo);
+        if (outer < (uint64_t)VM_MAIN_MEM_BASE + PPU_CB_ENTRY_GAP || outer > vm_end)
+            ppu_cb_stack_stop("the calling guest context's r1 is not a guest stack address "
+                              "(or lies beyond the VM)", (uint32_t)outer, 0);
+        const uint32_t sp = (uint32_t)(outer - PPU_CB_ENTRY_GAP) & ~0xFu;
+        if (in_slot_callback) {
+            if (sp < lo + PPU_CB_HOST_MIN_FREE)
+                ppu_cb_stack_stop("this host thread's callback stack slot is out of room: the "
+                                  "callbacks nest too deep", sp, lo);
+            *on_host_slot = true;
+        }
+        return sp;
+    }
+    if (t_cb_host.slot < 0) {
+        uint32_t used = __atomic_load_n(&s_cb_slots_used, __ATOMIC_RELAXED);
+        for (;;) {
+            unsigned i = 0;
+            while (i < PPU_CB_HOST_SLOTS && (used & (1u << i))) i++;
+            if (i == PPU_CB_HOST_SLOTS)
+                ppu_cb_stack_stop("all host callback stack slots belong to live threads", 0, 0);
+            if (__atomic_compare_exchange_n(&s_cb_slots_used, &used, used | (1u << i), 0,
+                                            __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+                t_cb_host.slot = (int)i;
+                break;
+            }
+        }
+    }
+    const uint32_t lo  = ppu_cb_slot_lo(t_cb_host.slot);
+    const uint32_t top = lo + PPU_CB_HOST_SLOT_SIZE;
+    if (top > vm_end)
+        ppu_cb_stack_stop("the VM ends below the host callback stack window; ppu_vm_size must "
+                          "cover the whole stack region", top, lo);
+    *on_host_slot = true;
+    return top - 0x80u;   /* the linkage area the callee writes at entry (0x70) stays inside the slot */
+}
+
 extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
                                    uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                                    uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
@@ -3604,15 +3746,15 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
                     "zeroed it (the descriptor words are what guest memory holds now).");
     }
 
-    /* Private scratch stack high in the guest stack region, distinct from the
-     * main + ppu_thread stacks. One callback at a time per caller thread. */
-    static PPU_THREAD_LOCAL uint32_t s_cb_sp = 0;
-    if (!s_cb_sp) s_cb_sp = 0xCFFE0000u;
+    /* Own guest stack space for this activation: see ppu_cb_entry_sp. */
+    bool on_host_slot = false;
+    const uint32_t cb_sp = ppu_cb_entry_sp(g_active_ctx, &on_host_slot);
+    PpuCbSlotScope cb_scope(on_host_slot);
 
     ppu_context ctx;
     memset(&ctx, 0, sizeof(ctx));
     ctx.vscr    = ps3_ppu_initial_vscr();
-    ctx.gpr[1]  = s_cb_sp;
+    ctx.gpr[1]  = cb_sp;
     ctx.gpr[2]  = toc;
     ctx.gpr[3]  = a0; ctx.gpr[4] = a1; ctx.gpr[5] = a2; ctx.gpr[6] = a3;
     ctx.gpr[7]  = a4; ctx.gpr[8] = a5; ctx.gpr[9] = a6; ctx.gpr[10] = a7;
@@ -3643,7 +3785,7 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
 /* Call a guest function by an already-resolved {code, toc} pair. Used for
  * callbacks whose OPD is captured at registration time and may later be
  * clobbered in guest memory (e.g. the GCM flip/vblank handler OPDs). Same
- * scratch-stack + trampoline-drain behaviour as ppu_guest_call. */
+ * guest-stack + trampoline-drain behaviour as ppu_guest_call. */
 extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
                                       uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                                       uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
@@ -3661,13 +3803,15 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
             "does not cover this callback, or the descriptor was captured from clobbered "
             "guest memory.");
 
-    static PPU_THREAD_LOCAL uint32_t s_cb_sp = 0;
-    if (!s_cb_sp) s_cb_sp = 0xCFFE0000u;
+    /* Own guest stack space for this activation: see ppu_cb_entry_sp. */
+    bool on_host_slot = false;
+    const uint32_t cb_sp = ppu_cb_entry_sp(g_active_ctx, &on_host_slot);
+    PpuCbSlotScope cb_scope(on_host_slot);
 
     ppu_context ctx;
     memset(&ctx, 0, sizeof(ctx));
     ctx.vscr    = ps3_ppu_initial_vscr();
-    ctx.gpr[1]  = s_cb_sp;
+    ctx.gpr[1]  = cb_sp;
     ctx.gpr[2]  = toc;
     ctx.gpr[3]  = a0; ctx.gpr[4] = a1; ctx.gpr[5] = a2; ctx.gpr[6] = a3;
     ctx.gpr[7]  = a4; ctx.gpr[8] = a5; ctx.gpr[9] = a6; ctx.gpr[10] = a7;

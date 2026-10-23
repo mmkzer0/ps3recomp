@@ -32,7 +32,14 @@ ppu_loader.cpp against that lift, and runs tests/test_loader_gaps.cpp:
   - a host-initiated guest callback (ppu_guest_call / ppu_guest_call_ct) with a
     NULL OPD, a 0 code word or an unregistered code stops
     (unresolved-guest-callback, carrying origin/opd/code/toc/descriptor) and
-    never prints a return; a registered OPD/code still runs.
+    never prints a return; a registered OPD/code still runs;
+  - host-initiated callbacks get guest stack space of their own: concurrent
+    threads with and without a guest context, and callbacks that re-enter
+    ppu_guest_call_ct, run on distinct, non-overlapping stacks with their
+    outer frames, canaries and return values intact; a host thread's stack slot
+    is released when it exits; a callback that cannot be given a stack (r1 that
+    is no stack address, a VM below the host stack window, a host slot nested
+    out of room) stops (unresolved-guest-callback, origin stack).
 
 A line "RETURNED" from the fixture means the runtime carried on; every case that
 must stop treats it as failure.
@@ -88,6 +95,7 @@ def main():
         lift = tmp / 'lift'
         subprocess.run([sys.executable, str(ROOT / 'tools/ppu_lifter.py'), str(tmp / 'code.bin'), '--raw',
                         '--base', '0x10000', '--functions', str(tmp / 'fn.json'), '--jobs', '1',
+                        '--code-end', '0x10064',   # the declared end of the last function, past the image bytes
                         '--single-file', '--source-name', 'ppu_recomp.cpp', '--output', str(lift)],
                        check=True, capture_output=True)
         flags = ['-Wl,-dead_strip'] if sys.platform == 'darwin' else ['-Wl,--gc-sections', '-pthread', '-ldl']
@@ -135,6 +143,7 @@ def main():
         # the parallel lift (the default: --jobs = CPU count) reports the same gaps
         subprocess.run([sys.executable, str(ROOT / 'tools/ppu_lifter.py'), str(tmp / 'code.bin'), '--raw',
                         '--base', '0x10000', '--functions', str(tmp / 'fn.json'), '--jobs', '2',
+                        '--code-end', '0x10064',
                         '--single-file', '--source-name', 'ppu_recomp.cpp', '--output', str(tmp / 'lift2')],
                        check=True, capture_output=True)
         report2 = json.loads((tmp / 'lift2' / 'ppu_lift_report.json').read_text())
@@ -147,6 +156,7 @@ def main():
         (tmp / 'tail.json').write_text(json.dumps([{'start': '0x0', 'end': '0x10'}]))
         subprocess.run([sys.executable, str(ROOT / 'tools/ppu_lifter.py'), str(tmp / 'tail.bin'), '--raw',
                         '--base', '0', '--functions', str(tmp / 'tail.json'), '--jobs', '1',
+                        '--code-end', '0x10',
                         '--single-file', '--source-name', 'ppu_recomp.cpp',
                         '--output', str(tmp / 'tail')],
                        check=True, capture_output=True)
@@ -269,8 +279,34 @@ def main():
         assert p.returncode == 0 and 'RETURNED r3=0x5' in p.stdout, (p.stdout, p.stderr)
         p = run('guestcallct', '0x10000')
         assert p.returncode == 0 and 'RETURNED r3=0x5' in p.stdout, (p.stdout, p.stderr)
+
+        # Every active host-initiated callback has stack space no other frame uses
+        p = run('cbstack', '0')
+        assert p.returncode == 0 and 'CBSTACK OK' in p.stdout, (p.stdout, p.stderr)
+        p = run('cbexhaust', '0')
+        assert 'RETURNED' not in p.stdout, (p.stdout, p.stderr)
+        f = g.expect_stop(p, 'unresolved-guest-callback')
+        assert f['origin'] == 'stack' and 'nest too deep' in f['hint'], f
+        p = run('cbbadr1', '0')
+        assert 'RETURNED' not in p.stdout, (p.stdout, p.stderr)
+        f = g.expect_stop(p, 'unresolved-guest-callback')
+        assert f['origin'] == 'stack' and f['sp'] == '0x00000000' and f['tid'] == '7', f
+        assert 'not a guest stack address' in f['hint'], f
+        p = run('cbsmallvm', '0')
+        assert 'RETURNED' not in p.stdout, (p.stdout, p.stderr)
+        f = g.expect_stop(p, 'unresolved-guest-callback')
+        assert f['origin'] == 'stack' and f['vm_size'] == '0x20000000', f
+        assert 'ends below the host callback stack window' in f['hint'], f
+        # a host-slot callback whose r1 is at / below its slot's lowest address must
+        # not let a nested callback run on whatever memory lies there
+        for below in ('0', '0x1000', '0x100000'):
+            p = run('cbleave', below)
+            assert 'RETURNED' not in p.stdout and 'NESTED CALLBACK RAN' not in p.stdout, (below, p.stdout, p.stderr)
+            f = g.expect_stop(p, 'unresolved-guest-callback')
+            assert f['origin'] == 'stack' and 'left its host callback stack slot' in f['hint'], (below, f)
     print('PASS: unimplemented syscall, unlifted call, unresolved indirect call, dispatch depth, '
-          'OPD swap, unresolved guest callback and unknown instruction all stop')
+          'OPD swap, unresolved guest callback and unknown instruction all stop; host-initiated '
+          'callbacks get distinct, non-overlapping guest stacks')
     return 0
 
 

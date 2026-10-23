@@ -8,7 +8,8 @@
  *   0x00010000 - 0x0FFFFFFF : User-space (main memory, 256 MB)
  *   0x10000000 - 0x1FFFFFFF : RSX mapped memory
  *   0x30000000 - 0x3FFFFFFF : SPU local store windows (raw SPU mapping)
- *   0xD0000000 - 0xDFFFFFFF : Stack area
+ *   0xD0000000 - 0xDDFFFFFF : Stack area (PPU thread stacks, vm_stack_alloc)
+ *   0xDE000000 - 0xDFFFFFFF : Host callback stack window (VM_CB_HOST_STACK_WINDOW)
  */
 
 #ifndef VM_H
@@ -49,6 +50,15 @@ extern "C" {
 #define VM_STACK_REGION     0x10000000u      /* 256 MB stack region */
 
 #define VM_PPU_STACK_SIZE   0x00100000u      /* 1 MB default PPU stack */
+
+/* The top of the stack region belongs to ppu_cb_entry_sp (ppu_loader.cpp): one
+ * VM_PPU_STACK_SIZE slot per host thread that raises a guest callback while
+ * running no guest code. vm_stack_alloc_init ends the thread-stack allocator
+ * below this window, so sys_ppu_thread_create gets CELL_ENOMEM rather than a
+ * stack overlapping a live callback slot. */
+#define VM_CB_HOST_STACK_SLOTS   32u
+#define VM_CB_HOST_STACK_WINDOW  (VM_CB_HOST_STACK_SLOTS * VM_PPU_STACK_SIZE)
+#define VM_CB_HOST_STACK_BASE    (VM_STACK_BASE + VM_STACK_REGION - VM_CB_HOST_STACK_WINDOW)
 
 /* Loader-owned main/worker TLS images. User allocations must skip this window. */
 #define VM_PPU_TLS_BASE     0x10F00000u
@@ -344,13 +354,13 @@ static inline int32_t vm_protect(uint32_t addr, uint32_t size, int read, int wri
  * -----------------------------------------------------------------------*/
 typedef struct vm_stack_alloc {
     uint32_t next_addr;     /* next stack base to allocate */
-    uint32_t region_end;    /* end of the stack region */
+    uint32_t region_end;    /* end of the thread-stack area: VM_CB_HOST_STACK_BASE, not the region end */
 } vm_stack_alloc;
 
 static inline void vm_stack_alloc_init(vm_stack_alloc* sa)
 {
     sa->next_addr  = VM_STACK_BASE;
-    sa->region_end = VM_STACK_BASE + VM_STACK_REGION;
+    sa->region_end = VM_CB_HOST_STACK_BASE;
 }
 
 /*

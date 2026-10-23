@@ -65,7 +65,8 @@ On Windows, `VirtualAlloc` with `MEM_RESERVE` reserves the 4 GB range without co
 | `0x00010000 – 0x0FFFFFFF` | 256 MB | User ELF text + data (main memory) | `vm_init()` |
 | `0x10000000 – 0x1FFFFFFF` | 256 MB | RSX mapped memory / PRX module space | On demand via `vm_commit()` |
 | `0x30000000 – 0x3001FFFF` | 8 × 256 KB | SPU local store windows (raw SPU) | `vm_spu_ls_map()` |
-| `0xD0000000 – 0xDFFFFFFF` | 256 MB | Stack region | `vm_init()` |
+| `0xD0000000 – 0xDDFFFFFF` | 224 MB | PPU thread stacks (`vm_stack_alloc`) | `vm_init()` |
+| `0xDE000000 – 0xDFFFFFFF` | 32 MB | Host callback stack window (`VM_CB_HOST_STACK_WINDOW`, owned by `ppu_cb_entry_sp`) | `vm_init()` |
 
 ### Key Constants
 
@@ -80,6 +81,9 @@ On Windows, `VirtualAlloc` with `MEM_RESERVE` reserves the 4 GB range without co
 #define VM_STACK_BASE       0xD0000000u     // Stack region start
 #define VM_STACK_REGION     0x10000000u     // 256 MB for stacks
 #define VM_PPU_STACK_SIZE   0x00100000u     // 1 MB default per thread
+#define VM_CB_HOST_STACK_SLOTS  32u         // host callback stack slots
+#define VM_CB_HOST_STACK_WINDOW (VM_CB_HOST_STACK_SLOTS * VM_PPU_STACK_SIZE)  // 32 MB, top of the stack region
+#define VM_CB_HOST_STACK_BASE   (VM_STACK_BASE + VM_STACK_REGION - VM_CB_HOST_STACK_WINDOW)  // 0xDE000000
 #define VM_PAGE_SIZE        0x00001000u     // 4 KB pages
 ```
 
@@ -128,6 +132,8 @@ uint32_t stack_base = vm_stack_allocate(&sa, VM_PPU_STACK_SIZE);
 ```
 
 Each allocation includes a **guard page** (4 KB, `PAGE_NOACCESS`) at the bottom of the stack to detect overflow. The allocator returns the address *above* the guard page.
+
+The allocator ends at `VM_CB_HOST_STACK_BASE` (`0xDE000000`), not at the end of the stack region: the top `VM_CB_HOST_STACK_WINDOW` (32 MB, 32 slots of `VM_PPU_STACK_SIZE`) is reserved for the stacks of host threads that raise guest callbacks while running no guest code (`ppu_cb_entry_sp` in `ppu_loader.cpp` owns it). A thread-stack request that would reach the window fails (`vm_stack_allocate` returns 0, `sys_ppu_thread_create` returns `CELL_ENOMEM`) instead of overlapping a live callback slot.
 
 ### SPU Local Store Mapping
 

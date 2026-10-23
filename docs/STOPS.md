@@ -53,7 +53,7 @@ Ids are stable kebab-case; a new gap gets a new kind, never a free-text variant.
 | `unknown-instruction` | an instruction the lifter did not know |
 | `dispatch-depth-exceeded` | `ps3_indirect_call` nested deeper than its host safety limit (4000) |
 | `spu-dma-repeat` | an SPU issued identical MFC transfers continuously past `spu.dma_repeat_stop_secs` |
-| `unresolved-guest-callback` | a host-initiated guest callback (`ppu_guest_call` / `ppu_guest_call_ct`) whose OPD or code word is 0 or is not a lifted function |
+| `unresolved-guest-callback` | a host-initiated guest callback (`ppu_guest_call` / `ppu_guest_call_ct`) whose OPD or code word is 0 or is not a lifted function, or that cannot be given guest stack space |
 
 Where each is raised, and what it carries beyond `pc lr tid`:
 
@@ -68,7 +68,7 @@ Where each is raised, and what it carries beyond `pc lr tid`:
 | `unknown-instruction` | `ppu_trap_unknown_instruction`, emitted by the lifter | `pc word mnemonic` |
 | `dispatch-depth-exceeded` | `ps3_indirect_call_impl` | `target depth limit caller_lr` |
 | `spu-dma-repeat` | `mfc_submit` (`runtime/spu/spu_dma.h`) | `image ea lsa cmd size count secs`, with `pc` (LS address) and `tid` (SPU id) as the site |
-| `unresolved-guest-callback` | `ppu_guest_call`, `ppu_guest_call_ct` | `origin opd code toc descriptor hint`; `pc`/`lr` are 0 (no guest instruction runs) and `tid` is the calling guest thread |
+| `unresolved-guest-callback` | `ppu_guest_call`, `ppu_guest_call_ct` | `origin opd code toc descriptor hint`, or `origin=stack sp limit vm_size hint` when no guest stack space can be given (bad caller r1, VM too small for the host window, all host slots live, a host slot out of room); `pc`/`lr` are 0 (no guest instruction runs) and `tid` is the calling guest thread |
 
 Lifted code does not track a guest pc, so for the first four `pc` is the caller's
 return address (the import stub's caller, the `sc` site, the call site). Only
