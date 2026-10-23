@@ -51,6 +51,19 @@ def main():
         p = run('0x1234', cfg)
         assert p.returncode == 0 and 'RETURNED r3=0x0' in p.stdout, p.stdout
         g.expect_stop(run('0xDEADBEE0', cfg), 'unresolved-nid')      # only the listed NID
+
+        # no environment switch answers for an import: these used to return made-up values
+        for nid, var in (('0x05893E7C', 'YDKJ_NETOFFLINE'), ('0xE0998DBF', 'YDKJ_TUNERFIX'),
+                         ('0xCDC6AEFD', 'YDKJ_SAVEDATA')):
+            p = g.run([str(binary), nid], env=g.clean_env(**{var: '1'}))
+            assert 'RETURNED' not in p.stdout, (var, p.stdout)
+            assert g.expect_stop(p, 'unresolved-nid')['nid'] == nid, (var, p.stderr)
+
+        # a stop names the stopping thread's last import, not another thread's
+        p = g.run([str(binary), 'frontier', '0xDEADBEEF', '0x1234'],
+                  env=g.clean_env(PS3RECOMP_CONFIG=str(cfg)))
+        f = g.expect_stop(p, 'unknown-instruction')
+        assert f['last_hle_nid'] == '0xDEADBEEF', f
     print('PASS: unresolved NIDs stop; allow-listed ones return exactly their configured value')
     return 0
 

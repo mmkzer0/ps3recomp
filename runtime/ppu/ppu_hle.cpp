@@ -24,6 +24,7 @@
 #include "ps3emu/stop.h"      /* ps3_stop_register_frontier */
 #include "ps3emu/config.h"    /* ps3_config_find_hle_stub */
 #include <mutex>
+#include <unordered_set>
 #include <stdlib.h>       /* getenv */
 #include <stdint.h>
 #include <stdio.h>
@@ -97,13 +98,19 @@ extern "C" const char* g_last_hle_name = "";
 #define PS3_HLE_INFLIGHT_MAX 64
 extern "C" const char* g_hle_inflight[PS3_HLE_INFLIGHT_MAX] = { nullptr };
 
-/* A stop reports how far the guest got from the same breadcrumb. */
+/* A stop reports how far the guest got. The two globals above are shared by
+ * every guest thread (the watchdog reads them from its own), so a stop on one
+ * thread would name whatever another thread called last, through a data race.
+ * The frontier keeps its own per-thread copy instead: ps3_stop runs its
+ * providers on the stopping thread, so this is that thread's last import. */
+static thread_local uint32_t    t_last_hle_nid  = 0;
+static thread_local const char* t_last_hle_name = "";
 static void hle_stop_frontier(uint64_t, ps3_stop_frontier* out)
 {
-    if (!g_last_hle_nid) return;
+    if (!t_last_hle_nid) return;
     out->has_hle  = 1;
-    out->hle_nid  = g_last_hle_nid;
-    out->hle_name = g_last_hle_name;
+    out->hle_nid  = t_last_hle_nid;
+    out->hle_name = t_last_hle_name;
 }
 [[maybe_unused]] static const int s_hle_frontier_registered =
     (ps3_stop_register_frontier(hle_stop_frontier), 0);
@@ -152,13 +159,11 @@ static void hle_unresolved(uint32_t nid, ppu_context* ctx)
     snprintf(nid_s, sizeof nid_s, "0x%08X", nid);
     if (const ps3_cfg_hle_stub* s = ps3_config_find_hle_stub(nid)) {
         static std::mutex lock;
-        static uint32_t reported[256];
-        static unsigned n_reported;
-        bool first = true;
+        static std::unordered_set<uint32_t> reported;
+        bool first;
         {
             std::lock_guard<std::mutex> g(lock);
-            for (unsigned i = 0; i < n_reported; i++) if (reported[i] == nid) first = false;
-            if (first && n_reported < 256) reported[n_reported++] = nid;
+            first = reported.insert(nid).second;
         }
         if (first)
             fprintf(stderr, "[hle] ALLOW-LISTED unresolved import %s returns 0x%08X: %s (%s:%u)\n",
@@ -266,21 +271,10 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
      * run here so guest code never executes concurrently on the ticker thread. */
     if (ppu_gcm_pump) ppu_gcm_pump();
 
-    /* YDKJ_TUNERFIX (at the top so it wins over any registered handler): the
-     * profiler-presence query sysPrxForUser 0xE0998DBF, called by libsre
-     * _cellSpursIsLaunchedFromTuner (0x3000D318), must return 0x8001112E ("profiler not
-     * loaded") on a normal run. Anything else trips the usertrace.c:123 assert AND makes
-     * the fn report "launched from tuner", so the caller runs tuner/trace setup that fails
-     * with CELL_SPURS_CORE_ERROR_STAT -> the SPURS task workload never attaches. */
-    if (nid == 0xE0998DBFu && getenv("YDKJ_TUNERFIX")) {
-        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001112E;
-        static int _tn = 0; if (PS3_LOG_FIRST(_tn, 3))
-            fprintf(stderr, "[TUNERFIX] sysPrxForUser 0xE0998DBF -> 0x8001112E (profiler not loaded)\n");
-        return;
-    }
     /* Guest-PC breadcrumb for the sampling profiler (see lv2_syscall). */
     ppu_prof_stamp(ctx, ppu_prof_resolve_host(__builtin_return_address(0)));
     g_last_hle_nid = nid;
+    t_last_hle_nid = nid;
     /* Stamp the NAME here too, not only where a handler is found below.
      *
      * These are read as a pair -- the watchdog prints "last HLE call = <nid>
@@ -294,6 +288,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
      * guitar controller is an extremely convincing wrong answer. Placeholder
      * now, overwritten with the real name once the handler is known. */
     g_last_hle_name = "(unimplemented)";
+    t_last_hle_name = "(unimplemented)";
 
     /* Boot trace: log the first N HLE calls (PS3_HLE_TRACE=N). Invaluable for
      * new-SDK bring-up (e.g. PSL1GHT) where the failure is "nothing happens". */
@@ -672,6 +667,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
              * "cellPadInit", which for a game that needs a guitar controller is
              * a very convincing wrong answer to chase. */
             g_last_hle_name = g_ctx[i].name;
+            t_last_hle_name = g_ctx[i].name;
             { unsigned t = (unsigned)ctx->thread_id;
               if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = g_ctx[i].name; }
             g_ctx[i].fn(ctx);
@@ -682,49 +678,19 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 
     ps3_nid_entry* e = g_hle_inited ? ps3_nid_table_find(&g_hle_nids, nid) : nullptr;
     if (!e || !e->handler) {
-        /* Recorded before the diagnostic paths below, several of which return
-         * early. An import moving between resolved and unresolved is exactly the
-         * kind of change the gate exists to catch. */
+        /* Every unresolved import ends in hle_unresolved: a stop, or the title
+         * config's [[hle.stub]] value. There is no environment switch in front of
+         * it: the YDKJ_TUNERFIX and YDKJ_NETOFFLINE shortcuts that stood here are
+         * [[hle.stub]] entries in that title's config, and YDKJ_SAVEDATA's inline
+         * cellSaveDataAutoLoad2 needs a real cellSaveData implementation. An
+         * import moving between resolved and unresolved is exactly the kind of
+         * change the gate exists to catch, so it is recorded first. */
         ps3_msf("hle:unresolved:0x%08X", nid);
-        /* YDKJ_TUNERFIX: sysPrxForUser 0xE0998DBF is the profiler-presence query called
-         * by libsre _cellSpursIsLaunchedFromTuner (0x3000D318). On a normal (non-tuner)
-         * run it must return 0x8001112E ("profiler not loaded"); an unresolved-NID error
-         * instead trips the usertrace.c:123 assert AND makes the fn return "launched=1",
-         * so the caller does tuner/trace setup that fails with CELL_SPURS_CORE_ERROR_STAT
-         * -> the SPURS task workload never attaches -> no movie decode. Return not-loaded. */
-        if (nid == 0xE0998DBFu && getenv("YDKJ_TUNERFIX")) {
-            ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001112E;
-            static int _tn = 0; if (PS3_LOG_FIRST(_tn, 3))
-                fprintf(stderr, "[TUNERFIX] sysPrxForUser 0xE0998DBF -> 0x8001112E (profiler not loaded)\n");
-            return;
-        }
         static int logged = 0;
         if (logged < 40) { fprintf(stderr, "[hle] unresolved NID 0x%08X\n", nid); logged++; }
         /* cellSaveData call-shape capture: dump r3-r10 + resolve r7/r8 as OPD
          * callbacks (statCallback/fileCallback) to learn the cellSaveDataAutoLoad2
          * protocol so it can be implemented. */
-        /* YDKJ_SAVEDATA: minimal cellSaveDataAutoLoad2 (NID 0xCDC6AEFD). The game
-         * auto-loads its "BLUS30569-AUTO-" save; unimplemented = null completion =
-         * state never transitions. Implement the no-save/new-user path: invoke the
-         * game's statCallback (r8 OPD) with a CellSaveDataStatGet{isNewData=1}, honor
-         * its result, return CELL_SAVEDATA_RET_OK(0). Legit HLE (real first-run behavior). */
-        if (nid==0xCDC6AEFDu) { static int _sdi=-1; if(_sdi<0)_sdi=getenv("YDKJ_SAVEDATA")?1:0;
-          if(_sdi){ static int _once=0; if(PS3_LOG_FIRST(_once, 2)){
-            uint32_t statCb=(uint32_t)ctx->gpr[8];               /* statCallback OPD */
-            uint32_t SC=0x02000000u, SG=0x02000100u, SS=0x02000900u; /* scratch structs */
-            for(uint32_t a=0x02000000u;a<0x02001000u;a+=4) vm_write32(a,0);
-            /* CellSaveDataStatGet: hddFreeSizeKB@0, isNewData@4, dir@8(dirStat), getParam@0x40 */
-            vm_write32(SG+0x00, 0x100000);   /* hddFreeSizeKB */
-            vm_write32(SG+0x04, 1);          /* isNewData = 1 (no existing save) */
-            /* copy dirName ("BLUS30569-AUTO-") into dir.dirName @ 0x08+0x18=0x20 */
-            { uint32_t src=(uint32_t)ctx->gpr[5]; for(int i=0;i<31;i++){ uint32_t w=vm_read32((src+i)&~3u); uint8_t b=(w>>((3-((src+i)&3))*8))&0xFF; vm_write32((SG+0x20+i)&~3u, (vm_read32((SG+0x20+i)&~3u) & ~(0xFFu<<((3-((SG+0x20+i)&3))*8))) | ((uint32_t)b<<((3-((SG+0x20+i)&3))*8))); if(!b)break; } }
-            fprintf(stderr,"[SAVEDATA-HLE] cellSaveDataAutoLoad2: calling game statCallback OPD=0x%08X (isNewData=1)\n",statCb);
-            uint64_t r=ppu_guest_call(statCb, SC, SG, SS, 0, 0, 0, 0, 0);
-            int32_t cbres=(int32_t)vm_read32(SC+0x00);
-            fprintf(stderr,"[SAVEDATA-HLE] statCallback returned r3=0x%llX cbResult->result=%d -> returning OK\n",(unsigned long long)r,cbres);
-            ctx->gpr[3]=0; /* CELL_SAVEDATA_RET_OK */
-            return;
-          } } }
         if (nid==0xCDC6AEFDu || nid==0x27CB8BC2u) { static int _sd=0; if(PS3_LOG_FIRST(_sd, 3)){
             extern uint32_t vm_read32(uint64_t);
             uint32_t r7=(uint32_t)ctx->gpr[7], r8=(uint32_t)ctx->gpr[8];
@@ -734,22 +700,11 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
             /* if r4 is a dirName string, dump it */
             uint32_t r4=(uint32_t)ctx->gpr[4]; if(r4>0x10000&&r4<0x10000000){ char nm[32]; for(int i=0;i<31;i++){uint32_t b=vm_read32((r4+i)&~3u); nm[i]=(char)((b>>((3-((r4+i)&3))*8))&0xFF); if(!nm[i])break;} nm[31]=0; fprintf(stderr,"[SAVEDATA]   r4 dirName='%s'\n",nm); } }
         }
-        /* YDKJ_NETOFFLINE: unresolved network NIDs (sys_net/cellHttp/cellSysutil)
-         * default r3=0 (fake success) -> the game stores a NULL handle as an object
-         * and later virtual-calls it -> the 0xC708C708 null-vtable crash. Return a
-         * negative error instead so the game's online-content check takes its
-         * graceful OFFLINE-FAILURE path and proceeds with the local Persistent.zip. */
-        { static int _no=-1; if(_no<0)_no=getenv("YDKJ_NETOFFLINE")?1:0;
-          if(_no){ switch(nid){
-            case 0x139A9E9Bu: case 0x9FB6228Eu: case 0x05893E7Cu:
-            case 0x52AAC4FAu: case 0x9638F766u: case 0x522180BCu:
-              ctx->gpr[3] = 0x80010002u; /* generic failure (net unavailable) */
-              return;
-          } } }
         hle_unresolved(nid, ctx);
         return;
     }
     g_last_hle_name = e->name;
+    t_last_hle_name = e->name;
     { static long s_ht = -1;
       if (s_ht < 0) { const char* ev = getenv("PS3_HLE_TOP"); s_ht = ev ? atol(ev) : 0;
                       if (s_ht < 0) s_ht = 0; }

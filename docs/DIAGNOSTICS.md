@@ -1402,8 +1402,6 @@ not changed while a title runs.
   `runtime/ppu/ppu_loader.cpp:1433`
 - **`YDKJ_MINIMAL_CTX`** — _(no description in source)_
   `runtime/spu/spu_workload.c:443`
-- **`YDKJ_NETOFFLINE`** — YDKJ_NETOFFLINE: unresolved network NIDs (sys_net/cellHttp/cellSysutil) default r3=0 (fake success) -> the game stores a NULL handle as an object and later virtual-calls it -> the 0xC708C708 null-vtable crash. Return a negative error instead so the game's online-content check takes its graceful OFFLINE-FAILURE path and proceeds with the local Persistent.zip. */
-  `runtime/ppu/ppu_hle.cpp:660`
 - **`YDKJ_NOEXIT`** — YDKJ_NOEXIT (diagnostic): the title self-exits after ~2 frames on a teardown assert triggered by incomplete SPU/SPURS state (a timing race). Ignoring the exit on the calling thread lets the render loop keep running so we can see whether sustained execution produces on-screen content. */
   `libs/system/sysPrxForUser.c:172`
 - **`YDKJ_NOHDLR`** — Diagnostic (YDKJ_NOHDLR): suppress libsre's SPURS handler threads (entry in the libsre image range) -- they assert that the SPU side isn't operational and crash. Skipping them lets the main thread (already past cellSpursInitialize) keep running, to see how far it gets. The thread is "created" (tid returned) but never spawned. */
@@ -1430,8 +1428,6 @@ not changed while a title runs.
   `runtime/syscalls/sys_event.c:396`
 - **`YDKJ_RWATCH`** — _(no description in source)_
   `runtime/ppu/ppu_loader.cpp:1007`
-- **`YDKJ_SAVEDATA`** — protocol so it can be implemented. */ YDKJ_SAVEDATA: minimal cellSaveDataAutoLoad2 (NID 0xCDC6AEFD). The game auto-loads its "BLUS30569-AUTO-" save; unimplemented = null completion = state never transitions. Implement the no-save/new-user path: invoke the game's statCallback (r8 OPD) with a CellSaveDataStatGet{isNewData=1}, honor its result, return CELL_SAVEDATA_RET_OK(0). Legit HLE (real first-run behavior). */
-  `runtime/ppu/ppu_hle.cpp:629`
 - **`YDKJ_SPUREADY`** — EXPERIMENT (YDKJ_SPUREADY): the lifted libsre cellSpursInitialize busy-polls the SPU-thread descriptor field at img_ea+0x38 (e.g. 0x101671A8) for a non-zero "thread created/ready" status BEFORE it populates the SPURS instance / starts the group — but nothing in our HLE ever writes it (real lv2 does). Write the tid there to clear the poll so libsre can proceed past init. Diagnostic; value may need tuning. */
   `runtime/syscalls/lv2_register.c:597`
 - **`YDKJ_SPURSKERNEL`** — Empty image (entry=0) OR the real SPURS kernel-A entry (0x818, now that _sys_spu_image_import parses the kernel ELF) on a cellSpurs SPU thread -> route to the HLE SPURS kernel (YDKJ_SPURSKERNEL) so group_start runs a live SPU instead of an instant no-op. */
@@ -1450,8 +1446,6 @@ not changed while a title runs.
   `runtime/syscalls/sys_cond.c:77`  _(+2 more sites)_
 - **`YDKJ_SYSCALL_ARG`** — The task-API argument is passed in LOCAL STORE at 0x2FD0, not in r4: the caller does shufb(arg,...) -> stqd 0x2FD0 and only then sets r3 = number (see func_00026DE0 / func_000272AC in image 22). Logging r4 shows caller leftovers and hides what the task actually asked for. */
   `runtime/spu/spu_channels.c:1275`
-- **`YDKJ_TUNERFIX`** — YDKJ_TUNERFIX (at the top so it wins over any registered handler): the profiler-presence query sysPrxForUser 0xE0998DBF, called by libsre _cellSpursIsLaunchedFromTuner (0x3000D318), must return 0x8001112E ("profiler not loaded") on a normal run. Anything else trips the usertrace.c:123 assert AND makes the fn report "launched from tuner", so the caller runs tuner/trace setup that fails with CELL_SPURS_CORE_ERROR_STAT -> the SPURS task workload never attaches. */
-  `runtime/ppu/ppu_hle.cpp:223`  _(+1 more sites)_
 
 
 ## Parked DMA-list resume dumps
