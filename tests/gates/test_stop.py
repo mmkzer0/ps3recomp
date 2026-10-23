@@ -12,7 +12,9 @@ PROBE = None
 
 KINDS = ["identity-mismatch", "config-invalid", "unresolved-nid",
          "unimplemented-syscall", "unlifted-function",
-         "unresolved-indirect-call", "unknown-instruction"]
+         "unresolved-indirect-call", "unknown-instruction",
+         "dispatch-depth-exceeded", "spu-dma-repeat",
+         "unresolved-guest-callback"]
 
 
 def probe(*args):

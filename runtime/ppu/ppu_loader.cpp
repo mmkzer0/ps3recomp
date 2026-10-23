@@ -2513,9 +2513,23 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
         hint = "the target is in the data/heap range: an uninitialised or stale vtable slot or function pointer";
     else if (tgt & 3u)
         hint = "the target is misaligned, so it is not a code address";
+    /* The OPD-swap case: ctr was loaded from a {code, toc} pair that the guest
+     * wrote swapped, so r2 (the TOC register) holds the real function. The
+     * redirect is off by default (ppu.opd_swap_fixup), so name it here instead
+     * of leaving the operator with a bare unresolved call. */
+    std::string hint_text(hint);
+    const uint32_t r2 = (uint32_t)ctx->gpr[2];
+    if (ppu_lookup(r2)) {
+        char r2_s[16];
+        snprintf(r2_s, sizeof r2_s, "0x%08X", r2);
+        if (hint_text == "none") hint_text.clear();
+        else hint_text += "; ";
+        hint_text += std::string("r2 holds a lifted function (") + r2_s +
+                     "): the OPD may be swapped; ppu.opd_swap_fixup=true redirects";
+    }
     ps3_stop_field f[] = {
         {"target", target_s}, {"caller_lr", lr_s}, {"descriptors", desc.c_str()},
-        {"target_words", at_target.c_str()}, {"hint", hint},
+        {"target_words", at_target.c_str()}, {"hint", hint_text.c_str()},
     };
     ps3_stop_site site = { ctx->lr, ctx->lr, ctx->thread_id };
     ps3_stop(PS3_STOP_UNRESOLVED_INDIRECT_CALL, "an indirect call targets an address no lifted function starts at",
@@ -2717,30 +2731,46 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
     if (!fn) {
         /* OPD-swap clobber fixup: a malformed memcpy (game func_0036FA74) writes
          * some handler/vtable OPDs as {TOC, func} (code & toc SWAPPED), so lifted
-         * code loads ctr = TOC base and r2 = the real function. If ctr is not a
-         * registered function but r2 IS, they are swapped -- call r2 with the TOC
-         * (the value that was in the code slot). Fixes the flip/vblank handlers,
-         * the teardown vtable, and func_002642A0's virtual calls in one shot. */
-        uint32_t toc_reg = (uint32_t)ctx->gpr[2];
-        ppu_fn fn2 = ppu_lookup(toc_reg);
-        if (fn2) {
-            static int _n = 0;
-            if (PS3_LOG_FIRST(_n, 8)) fprintf(stderr, "[ppu] OPD-swap fixup: ctr=0x%08X not a func, using r2=0x%08X\n", addr, toc_reg);
-            ctx->gpr[2] = addr;        /* callee TOC = the (TOC) value from the code slot */
-            addr = toc_reg; ctx->ctr = toc_reg;
-            fn = fn2;
+         * code loads ctr = TOC base and r2 = the real function. That is a title
+         * defect, not a PPC ABI guarantee, so the redirect is opt-in through
+         * ppu.opd_swap_fixup (off by default). With it off, the call is an
+         * unresolved-indirect-call stop whose hint names the knob. */
+        if (ps3_cfg_ppu_opd_swap_fixup()) {
+            uint32_t toc_reg = (uint32_t)ctx->gpr[2];
+            ppu_fn fn2 = ppu_lookup(toc_reg);
+            if (fn2) {
+                static int _n = 0;
+                if (PS3_LOG_FIRST(_n, 8)) fprintf(stderr, "[ppu] OPD-swap fixup: ctr=0x%08X not a func, using r2=0x%08X\n", addr, toc_reg);
+                ctx->gpr[2] = addr;        /* callee TOC = the (TOC) value from the code slot */
+                addr = toc_reg; ctx->ctr = toc_reg;
+                fn = fn2;
+            }
         }
     }
     if (fn) {
-        /* Recursion-depth guard: a malformed/cyclic jump table (or a tail-call
+        /* Dispatch-depth guard: a malformed/cyclic jump table (or a tail-call
          * chain that never converges) can dispatch recursively without bound
-         * and blow the host stack. Cap the depth, log once, then unwind. */
+         * and blow the host stack. 4000 is a HOST safety limit only -- it is not
+         * a statement about valid PS3 programs, so it does not end the run
+         * quietly: exceeding it stops (dispatch-depth-exceeded) at the target
+         * that would have been called, never by faking a guest return. */
         int& s_depth = g_dispatch_depth;
         if (s_depth > 4000) {
-            static int warned = 0;
-            if (PS3_LOG_FIRST(warned, 8))
-                fprintf(stderr, "[ppu] recursion cap @0x%08X depth=%d -- skipping\n", addr, s_depth);
-            return;
+            char target_s[16], depth_s[16], lr_s[16];
+            snprintf(target_s, sizeof target_s, "0x%08X", addr);
+            snprintf(depth_s, sizeof depth_s, "%d", s_depth);
+            snprintf(lr_s, sizeof lr_s, "0x%08X", (uint32_t)ctx->lr);
+            ps3_stop_field f[] = {
+                {"target", target_s}, {"depth", depth_s}, {"limit", "4000"},
+                {"caller_lr", lr_s},
+            };
+            ps3_stop_site site = { addr, ctx->lr, ctx->thread_id };
+            ps3_stop(PS3_STOP_DISPATCH_DEPTH_EXCEEDED,
+                     "the host dispatch-depth cap was reached while entering a lifted function",
+                     "4000 is a host safety limit, not a limit of valid PS3 code: look for a cyclic "
+                     "jump table, an indirect call whose target is itself, or a tail-call chain that "
+                     "never converges. The target named is the call that would have been made.",
+                     f, 4, &site);
         }
         s_depth++;
         /* PPU_TOCFIX: the dispatched function's TOC (r2) is the OPD toc we were
@@ -3499,11 +3529,63 @@ extern "C" void ppu_register_opd_fixup(uint32_t opd, uint32_t code, uint32_t toc
         s_opd_fixups[s_opd_fixup_n].code = code; s_opd_fixups[s_opd_fixup_n].toc = toc; s_opd_fixup_n++; }
 }
 
+/* A host-initiated guest callback that never ran must not look like a callback
+ * that ran and returned 0. The HLE libraries call into the guest through
+ * ppu_guest_call / ppu_guest_call_ct for notifications (GCM flip/vblank,
+ * cellSysutil events, save-data/boot callbacks, PPU thread entry ...); an OPD
+ * or code word that does not resolve to a lifted function means the callback
+ * was not delivered, and whatever state it was supposed to update stays stale
+ * -- thousands of guest calls away from here. So it stops.
+ *
+ * Where the firmware API makes a callback optional, the HLE caller must test
+ * the guest value itself and do what the firmware does (skip, or return
+ * CELL_*_ERROR_PARAM / CELL_*_ERROR_INVALID_ARGUMENT); it must not hand 0 to
+ * this dispatcher. Every in-tree `g_ps3_guest_caller` site does. */
+[[noreturn]] static void ppu_guest_call_stop(const char* origin, uint32_t opd,
+                                             uint32_t code, uint32_t toc,
+                                             const char* hint)
+{
+    char opd_s[16], code_s[16], toc_s[16];
+    snprintf(opd_s, sizeof opd_s, "0x%08X", opd);
+    snprintf(code_s, sizeof code_s, "0x%08X", code);
+    snprintf(toc_s, sizeof toc_s, "0x%08X", toc);
+    /* The descriptor words separate a CLOBBERED OPD from one the loader never
+     * populated; those need opposite fixes. */
+    std::string descriptor = "none";
+    if (opd) {
+        char b[80];
+        snprintf(b, sizeof b, "%08X %08X %08X %08X",
+                 vm_read32(opd), vm_read32(opd + 4), vm_read32(opd + 8), vm_read32(opd + 12));
+        descriptor = b;
+    }
+    /* Host-initiated: no guest instruction is executing, so pc/lr are 0, but
+     * the calling thread's id is real and lets the frontier name the lv2
+     * syscall or HLE import this callback is nested inside. */
+    const uint64_t tid = g_active_ctx ? g_active_ctx->thread_id : 0;
+    ps3_stop_field f[] = {
+        {"origin", origin}, {"opd", opd_s}, {"code", code_s}, {"toc", toc_s},
+        {"descriptor", descriptor.c_str()}, {"hint", hint},
+    };
+    ps3_stop_site site = { 0, 0, tid };
+    ps3_stop(PS3_STOP_UNRESOLVED_GUEST_CALLBACK,
+             "a host-initiated guest callback does not resolve to a lifted function",
+             "If the firmware API makes this callback optional, the HLE caller must test the "
+             "guest value itself and skip the dispatch (or return the firmware's parameter "
+             "error); otherwise the OPD is unpopulated/clobbered (the descriptor words show "
+             "it) or its code is not in this lift (re-lift, or record the descriptor with "
+             "ppu_register_opd_fixup).",
+             f, 6, &site);
+}
+
 extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
                                    uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                                    uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
 {
-    if (!opd_addr) return 0;
+    if (!opd_addr)
+        ppu_guest_call_stop("opd", 0, 0, 0,
+            "the caller passed OPD 0: a callback the guest never registered (or cleared). "
+            "An optional callback must be tested by the HLE caller before dispatch; a "
+            "required one that is 0 means the guest skipped registration.");
     uint32_t code = 0, toc = 0;
     ppu_opd_resolve(opd_addr, &code, &toc);
     ppu_fn fn = ppu_lookup(code);
@@ -3514,14 +3596,13 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
                 fn = ppu_lookup(code); break; }
     }
     if (!fn) {
-        /* Print the descriptor bytes too: "code 0x00000000" alone cannot
-         * distinguish a CLOBBERED OPD from one the loader never populated,
-         * and those need opposite fixes. */
-        fprintf(stderr, "[ppu] guest_call: OPD 0x%08X -> code 0x%08X not registered"
-                        " (opd: %08X %08X %08X %08X)\n",
-                opd_addr, code, vm_read32(opd_addr), vm_read32(opd_addr + 4),
-                vm_read32(opd_addr + 8), vm_read32(opd_addr + 12));
-        return 0; }
+        ppu_guest_call_stop("opd", opd_addr, code, toc,
+            code ? "the OPD's code word names an address no lifted function starts at: the "
+                    "lift does not cover this callback, or the OPD was clobbered after "
+                    "registration (the descriptor words are what guest memory holds now)."
+                 : "the OPD's code word is 0: it was never populated, or a guest store "
+                    "zeroed it (the descriptor words are what guest memory holds now).");
+    }
 
     /* Private scratch stack high in the guest stack region, distinct from the
      * main + ppu_thread stacks. One callback at a time per caller thread. */
@@ -3567,9 +3648,18 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
                                       uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                                       uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
 {
-    if (!code) return 0;
+    /* Same contract as ppu_guest_call: a callback that never ran is not a
+     * callback that returned 0 (see ppu_guest_call_stop above). */
+    if (!code)
+        ppu_guest_call_stop("code", 0, 0, toc,
+            "the caller passed code 0: no callback was captured at registration time. An "
+            "optional callback must be tested by the HLE caller before dispatch.");
     ppu_fn fn = ppu_lookup(code);
-    if (!fn) { fprintf(stderr, "[ppu] guest_call_ct: code 0x%08X not registered\n", code); return 0; }
+    if (!fn)
+        ppu_guest_call_stop("code", 0, code, toc,
+            "the captured code word names an address no lifted function starts at: the lift "
+            "does not cover this callback, or the descriptor was captured from clobbered "
+            "guest memory.");
 
     static PPU_THREAD_LOCAL uint32_t s_cb_sp = 0;
     if (!s_cb_sp) s_cb_sp = 0xCFFE0000u;

@@ -17,7 +17,17 @@ ppu_loader.cpp against that lift, and runs tests/test_loader_gaps.cpp:
     after a return) is not lowered: no trap, listed as dead, and the code
     around it still runs;
   - a branch out of the lifted code (here: past the image's end) stops
-    (unlifted-function, naming the target) instead of returning.
+    (unlifted-function, naming the target) instead of returning;
+  - a lifted function that calls itself through ctr stops at the host
+    dispatch-depth cap (dispatch-depth-exceeded, target/depth/limit/caller_lr),
+    never with a fake return;
+  - an indirect call whose ctr is not a lifted function but whose r2 is stops
+    (unresolved-indirect-call) with a hint naming ppu.opd_swap_fixup off, and
+    runs the r2 function when ppu.opd_swap_fixup = true;
+  - a host-initiated guest callback (ppu_guest_call / ppu_guest_call_ct) with a
+    NULL OPD, a 0 code word or an unregistered code stops
+    (unresolved-guest-callback, carrying origin/opd/code/toc/descriptor) and
+    never prints a return; a registered OPD/code still runs.
 
 A line "RETURNED" from the fixture means the runtime carried on; every case that
 must stop treats it as failure.
@@ -40,11 +50,14 @@ ROOT = Path(__file__).resolve().parents[1]
 # C: b +0x10 ; .word 0xFFFFFFFF, 0, 0 (a literal pool) ; li r3,3 ; blr ; .word 0 (padding)
 # D: li r3,9 ; b 0x20000 (outside the image)
 # E: bctr ; .word 0 ; bl 0x10004 (dead after the computed jump: no trap, no func_00010004)
+# F: mtctr r4 ; bctrl ; blr -- calls ctr, which the fixture sets to F's own
+# address in r4, so it recurses through ps3_indirect_call until the depth cap
 CODE = struct.pack('>IIIII', 0x38600005, 0x4E800020, 0x38600007, 0x00000000, 0x4E800020) + \
     struct.pack('>IIIIIII', 0x48000010, 0xFFFFFFFF, 0x00000000, 0x00000000, 0x38600003, 0x4E800020,
                 0x00000000) + \
     struct.pack('>II', 0x38600009, 0x48000000 | (0x20000 - 0x10034)) + \
-    struct.pack('>III', 0x4E800420, 0x00000000, 0x48000001 | ((0x10004 - 0x10040) & 0x3FFFFFC))
+    struct.pack('>III', 0x4E800420, 0x00000000, 0x48000001 | ((0x10004 - 0x10040) & 0x3FFFFFC)) + \
+    struct.pack('>III', 0x7C8903A6, 0x4E800421, 0x4E800020)
 
 
 def main():
@@ -58,7 +71,8 @@ def main():
                                                  {'start': '0x10008', 'end': '0x10014'},
                                                  {'start': '0x10014', 'end': '0x10030'},
                                                  {'start': '0x10030', 'end': '0x10038'},
-                                                 {'start': '0x10038', 'end': '0x10044'}]))
+                                                 {'start': '0x10038', 'end': '0x10044'},
+                                                 {'start': '0x10048', 'end': '0x10054'}]))
         lift = tmp / 'lift'
         subprocess.run([sys.executable, str(ROOT / 'tools/ppu_lifter.py'), str(tmp / 'code.bin'), '--raw',
                         '--base', '0x10000', '--functions', str(tmp / 'fn.json'), '--jobs', '1',
@@ -91,7 +105,9 @@ def main():
         fe = report['functions'][2]
         assert fe['name'] == 'func_00010038' and fe['traps'] == [], fe
         assert fe['dead'] == [['0x0001003C', '0x00010040']], fe
-        assert report['summary']['functions'] == 5, report        # no function seeded by dead code
+        # 6 declared functions, plus func_00010044: with F present the address
+        # after E is inside the image, so E's tail entry is seeded there
+        assert report['summary']['functions'] == 7, report        # no function seeded by DEAD code
         assert report['summary']['dead_instructions'] == 7, report
         # the parallel lift (the default: --jobs = CPU count) reports the same gaps
         subprocess.run([sys.executable, str(ROOT / 'tools/ppu_lifter.py'), str(tmp / 'code.bin'), '--raw',
@@ -146,7 +162,66 @@ def main():
         assert 'RETURNED' not in p.stdout, (p.stdout, p.stderr)
         f = g.expect_stop(p, 'unresolved-indirect-call')
         assert f['target'] == '0x00000000' and 'NULL function pointer' in f['hint'], f
-    print('PASS: unimplemented syscall, unlifted call, unresolved indirect call and unknown instruction all stop')
+
+        # a lifted function that calls ITSELF through ctr recurses on the host
+        # stack until the dispatch-depth cap: a named stop, never a fake return
+        p = run('depth', '0x10048')
+        assert 'RETURNED' not in p.stdout, (p.stdout, p.stderr)
+        f = g.expect_stop(p, 'dispatch-depth-exceeded')
+        assert (f['target'], f['pc'], f['limit'], f['tid']) == (
+            '0x00010048', '0x10048', '4000', '1'), f
+        assert int(f['depth']) > 4000, f
+
+        # ctr is not a lifted function but r2 is: off by default, so the
+        # unresolved stop says the OPD may be swapped and names the knob
+        p = run('opdswap', '0x00020000', '0x10000')
+        assert 'RETURNED' not in p.stdout, (p.stdout, p.stderr)
+        f = g.expect_stop(p, 'unresolved-indirect-call')
+        assert f['target'] == '0x00020000', f
+        assert 'r2 holds a lifted function' in f['hint'] and 'ppu.opd_swap_fixup' in f['hint'], f
+        # ... and with the knob on, the r2 function runs (r3=5) instead of stopping
+        opd_cfg = tmp / 'opd.toml'
+        opd_cfg.write_text('schema = 1\n[ppu]\nopd_swap_fixup = true\n')
+        p = run('opdswap', '0x00020000', '0x10000', cfg=opd_cfg)
+        assert p.returncode == 0 and 'RETURNED r3=0x5' in p.stdout, (p.stdout, p.stderr)
+
+        # A host-initiated guest callback that never ran must not look like one
+        # that returned 0: NULL OPD, 0 code and unregistered code all stop.
+        p = run('guestcall', '0x0')
+        assert 'RETURNED' not in p.stdout, (p.stdout, p.stderr)
+        f = g.expect_stop(p, 'unresolved-guest-callback')
+        assert (f['origin'], f['opd'], f['code'], f['pc']) == (
+            'opd', '0x00000000', '0x00000000', '0x0'), f
+        assert f['descriptor'] == 'none' and 'OPD 0' in f['hint'], f
+
+        p = run('guestcallopd', '0x00020000', '0', '0x10000')
+        assert 'RETURNED' not in p.stdout, (p.stdout, p.stderr)
+        f = g.expect_stop(p, 'unresolved-guest-callback')
+        assert (f['origin'], f['opd'], f['code'], f['toc']) == (
+            'opd', '0x00020000', '0x00000000', '0x00010000'), f
+        assert f['descriptor'].startswith('00000000 00010000'), f
+        assert 'code word is 0' in f['hint'], f
+
+        p = run('guestcallopd', '0x00020000', '0x12340', '0x10000')
+        assert 'RETURNED' not in p.stdout, (p.stdout, p.stderr)
+        f = g.expect_stop(p, 'unresolved-guest-callback')
+        assert f['code'] == '0x00012340' and f['descriptor'].startswith('00012340'), f
+        assert 'no lifted function starts at' in f['hint'], f
+
+        for code, toc in (('0x0', '0x00010000'), ('0x12340', '0x0')):
+            p = run('guestcallct', code, toc)
+            assert 'RETURNED' not in p.stdout, (p.stdout, p.stderr)
+            f = g.expect_stop(p, 'unresolved-guest-callback')
+            assert (f['origin'], f['opd'], f['code'], f['toc']) == (
+                'code', '0x00000000', "0x%08X" % int(code, 16), "0x%08X" % int(toc, 16)), f
+
+        # a registered OPD/code still runs and returns its r3
+        p = run('guestcallopd', '0x00020000', '0x10000', '0x0')
+        assert p.returncode == 0 and 'RETURNED r3=0x5' in p.stdout, (p.stdout, p.stderr)
+        p = run('guestcallct', '0x10000')
+        assert p.returncode == 0 and 'RETURNED r3=0x5' in p.stdout, (p.stdout, p.stderr)
+    print('PASS: unimplemented syscall, unlifted call, unresolved indirect call, dispatch depth, '
+          'OPD swap, unresolved guest callback and unknown instruction all stop')
     return 0
 
 

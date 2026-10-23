@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdio.h>
+#include "../../include/ps3emu/stop.h"
 #include "../platform/win32_compat.h"
 
 #ifdef __cplusplus
@@ -31,6 +32,48 @@ extern "C" {
 #endif
 
 extern uint8_t* vm_base;
+
+/* ---- typed configuration and named stops, for a header-only engine -------
+ * spu_dma.h is inlined into the runtime *and* into header-only SPU fixtures
+ * (runtime/spu/tests, tools/test_spu_*.py) that link neither the typed
+ * configuration (runtime/config/config.cpp) nor the named-stop runtime
+ * (runtime/diag/stop.cpp). The engine reaches both through these pointers so
+ * those fixtures keep linking: there they are NULL and the engine uses the
+ * registry defaults below. The runtime defines them in config.cpp and
+ * stop.cpp, and a title links both (the PPU scaffold references them).
+ *
+ * The defaults are the registry's defaults (spu.dma_repeat_limit=256,
+ * spu.dma_repeat_stop_secs=0); change them together, tests/gates/test_config.py
+ * checks the registry's. */
+#if defined(_MSC_VER)
+   /* MSVC/clang-cl have no portable weak data definitions: the runtime always
+    * links config.cpp and stop.cpp, so a plain declaration resolves. No
+    * header-only fixture is built there (the SPU python drivers skip Windows). */
+#  define SPU_DMA_HOOK
+#  define SPU_DMA_HOOK_NO_DEF 1
+#elif defined(__GNUC__) || defined(__clang__)
+#  define SPU_DMA_HOOK __attribute__((weak))
+#else
+#  define SPU_DMA_HOOK
+#  define SPU_DMA_HOOK_NO_DEF 1
+#endif
+
+#ifndef SPU_DMA_HOOK_NO_DEF
+SPU_DMA_HOOK uint32_t (*g_spu_dma_repeat_limit)(void) = 0;
+SPU_DMA_HOOK uint32_t (*g_spu_dma_repeat_stop_secs)(void) = 0;
+SPU_DMA_HOOK void (*g_spu_dma_repeat_stop)(uint32_t image, uint32_t pc, uint64_t ea,
+                                           uint32_t lsa, uint32_t cmd, uint32_t size,
+                                           uint32_t count, uint64_t secs, uint32_t tid) = 0;
+#else
+extern uint32_t (*g_spu_dma_repeat_limit)(void);
+extern uint32_t (*g_spu_dma_repeat_stop_secs)(void);
+extern void (*g_spu_dma_repeat_stop)(uint32_t image, uint32_t pc, uint64_t ea,
+                                     uint32_t lsa, uint32_t cmd, uint32_t size,
+                                     uint32_t count, uint64_t secs, uint32_t tid);
+#endif
+
+#define SPU_DMA_REPEAT_DEFAULT_LIMIT      256u
+#define SPU_DMA_REPEAT_DEFAULT_STOP_SECS  0u
 
 /* Guard against a guest DMA whose effective address lands in reserved-but-
  * uncommitted guest memory (the 4 GB VM is MEM_RESERVE; only main mem / RSX /
@@ -1222,39 +1265,56 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
         }
     }
 
-    /* A job re-issuing the SAME transfer forever is wedged, not slow: nothing
-     * about its state can change if the DMA is all it is doing. This used to
-     * count only REJECTED transfers, so once the EA check started committing
-     * pages on demand the counter never advanced and a spinning job simply hung
-     * the chain walker instead. Count repeats whether or not the transfer
-     * succeeds, and halt at a known pc rather than hanging silently.
-     * The count alone is not enough: polling a value another agent writes is
-     * also the same transfer over and over. God of War: Ascension's EDGE
-     * geometry jobs wait for ring space by re-reading an RSX label until the
-     * GPU catches up, and 256 reads take well under a millisecond, so a
-     * count-only rule halted a healthy job and wedged the frame. Halt only once
-     * the repeats have also lasted SPU_DMA_REPEAT_SECS (default 30) of wall
-     * time. Below that, back off 1 ms per repeat rather than spinning. */
+    /* A job that re-issues the SAME transfer is not necessarily wedged:
+     * polling a value another agent writes is also the same transfer over and
+     * over. God of War: Ascension's EDGE geometry jobs wait for ring space by
+     * re-reading an RSX label until the GPU catches up, and 256 reads take well
+     * under a millisecond. So the engine does two separate things:
+     *
+     *   - At spu.dma_repeat_limit identical transfers (default 256) it applies
+     *     a 1 ms back-off per repeat. That is TIMING ONLY -- it keeps a healthy
+     *     poll from spinning the host, and it changes nothing the guest can
+     *     observe.
+     *   - If spu.dma_repeat_stop_secs is non-zero and the repeats have also
+     *     lasted that long, the SPU stops with kind spu-dma-repeat (image, pc,
+     *     ea, lsa, cmd, size, count, secs). The default is 0 (never stop):
+     *     some jobs legitimately poll for longer than any fixed deadline, and
+     *     the old unconditional halt wedged those chains. A count-only rule
+     *     would stop them after microseconds, which is why the deadline is
+     *     wall time and opt-in.
+     *
+     * Counting includes transfers the EA check rejects: once it started
+     * committing pages on demand, a spinning job's counter never advanced and
+     * the chain walker hung silently. */
     { static SPU_THREAD_LOCAL uint32_t s_last_ea, s_last_lsa, s_rep;
       static SPU_THREAD_LOCAL unsigned long long s_since;
-      static uint32_t s_limit = 0; static unsigned long long s_secs;
       extern unsigned long long ps3_ms_now(void);
-      if (!s_limit) { const char* e = getenv("SPU_DMA_REPEAT_LIMIT");
-                      s_limit = e ? (uint32_t)strtoul(e, 0, 0) : 256u;
-                      e = getenv("SPU_DMA_REPEAT_SECS");
-                      s_secs = e ? strtoull(e, 0, 0) : 30u; }
+      const uint32_t limit = g_spu_dma_repeat_limit ? g_spu_dma_repeat_limit()
+                                                    : SPU_DMA_REPEAT_DEFAULT_LIMIT;
+      const uint32_t stop_secs = g_spu_dma_repeat_stop_secs
+                                     ? g_spu_dma_repeat_stop_secs()
+                                     : SPU_DMA_REPEAT_DEFAULT_STOP_SECS;
       if ((uint32_t)ea == s_last_ea && lsa == s_last_lsa) {
-          if (++s_rep >= s_limit && !s_since) s_since = ps3_ms_now();
-          if (s_rep >= s_limit && ps3_ms_now() - s_since >= s_secs * 1000u) {
-              s_rep = 0; s_since = 0;   /* re-arm: the chain may run this job again */
-              extern void spu_halt(spu_context*);
-              fprintf(stderr, "[spu-dma] img=%d pc=0x%05X: %u identical "
-                      "transfers to ea=0x%08X -- halting the SPU\n",
-                      spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, s_limit,
-                      (uint32_t)ea);
+          if (++s_rep >= limit && !s_since) s_since = ps3_ms_now();
+          if (stop_secs && s_rep >= limit &&
+              ps3_ms_now() - s_since >= (unsigned long long)stop_secs * 1000u) {
+              const uint32_t stop_pc = (uint32_t)spu->pc & SPU_LS_MASK;
+              const unsigned long long elapsed = (ps3_ms_now() - s_since) / 1000u;
+              if (g_spu_dma_repeat_stop)
+                  g_spu_dma_repeat_stop((uint32_t)spu->image_id, stop_pc, ea, lsa,
+                                        cmd & 0xFFu, size, s_rep, elapsed,
+                                        spu->spu_id);
+              /* Only a header-only fixture (no named-stop runtime, and the knob
+               * is its default 0 there) can get here; stay fail-closed rather
+               * than halting silently if that ever changes. */
+              fprintf(stderr, "PS3STOP v=1 kind=spu-dma-repeat image=%d pc=0x%05X "
+                      "ea=0x%08X lsa=0x%05X cmd=0x%02X size=%u count=%u secs=%llu tid=%u\n",
+                      spu->image_id, stop_pc, (uint32_t)ea, lsa, cmd & 0xFFu, size,
+                      s_rep, elapsed, spu->spu_id);
               fflush(stderr);
-              spu_halt(spu);
-          } else if (s_rep >= s_limit) Sleep(1);
+              _Exit(PS3_STOP_EXIT_CODE);
+          }
+          if (s_rep >= limit) Sleep(1);   /* timing only: see above */
       } else { s_last_ea = (uint32_t)ea; s_last_lsa = lsa; s_rep = 0; s_since = 0; } }
 
     /* Mark tag as in-progress */
@@ -1652,5 +1712,8 @@ static inline uint32_t mfc_channel_read(mfc_engine* mfc, spu_context* spu,
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
+
+#undef SPU_DMA_HOOK
+#undef SPU_DMA_HOOK_NO_DEF
 
 #endif /* SPU_DMA_H */
