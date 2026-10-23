@@ -358,9 +358,11 @@ PS3_NORETURN static void job_dma_stop(const job_dma* d, long long index,
         {"capacity", cap_s}, {"reason", reason},
     };
     ps3_stop(PS3_STOP_SPU_JOB_DMA_LIST,
-             "a SPURS job descriptor names no binary, or carries an input DMA "
+             "a SPURS job descriptor names no binary, a binary or cache entry outside "
+             "guest memory, or carries an input DMA "
              "list that cannot be staged into its ioBuffer",
-             "eaBinary and sizeBinary must be non-zero. The list at descriptor+0x30 "
+             "eaBinary and sizeBinary must be non-zero and the binary, and every cache-list "
+             "entry, must lie inside guest memory. The list at descriptor+0x30 "
              "is sizeDmaList bytes of 8-byte {size word, EAL} elements, issued as an "
              "MFC list GET: each size is 1/2/4/8 or a 16-byte multiple up to 16 KB, "
              "each EAL is naturally aligned and inside guest memory, a transfer below "
@@ -427,6 +429,12 @@ static int run_spurs_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_e
                    (uint64_t)size_scr, (uint64_t)size_stk, 0 };
     if ((uint64_t)size_bin + bss > JOB_RT_LS)
         job_memory_stop(&jm, "image", (uint64_t)size_bin + bss);
+
+    /* The binary is read from guest memory by the CRT gate just below and again
+     * when it is staged: its whole extent must lie inside mapped guest memory
+     * before either read forms a host pointer. */
+    if (!guest_range_ok(ea_bin, size_bin))
+        job_dma_stop(&jd, -1, ea_bin, size_bin, 0, 0, "binary-range");
 
     /* ---- CRT gate ---------------------------------------------------------
      * The binary lands at LS 0 further down, once the whole descriptor has been
@@ -514,6 +522,8 @@ static int run_spurs_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_e
         uint32_t sz  = (uint32_t)(e >> 32);
         uint32_t eal = (uint32_t)e;
         if (!sz || !eal) continue;
+        if (!guest_range_ok(eal, sz))
+            job_dma_stop(&jd, (long long)i, eal, sz, 0, jm.cache + sz, "cache-range");
         jm.cache += sz;
         if (p + sz > JOB_RT_LS)
             job_memory_stop(&jm, "cache", p + sz);
@@ -770,12 +780,22 @@ static int run_spurs_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_e
             s_ls, size_scr, size_stk, ctx.gpr[1]._u32[0], ctx_ls };
         hooks->start(hooks->user, &ctx, &layout);
     }
+    /* The runner's result (halted or returned) is not a completion test and is
+     * not consulted here. A lifted job's normal return is itself reported as a
+     * halt (the resolver halts the lifted run when the interpreted stub at the
+     * link stops), a chain job's second lap halts in the CRT as normal
+     * completion (see the NOTE above), and a lifted `heq`/`hgt` assertion halts
+     * too. What the job ended on is in the finished context; whether that is a
+     * success is the caller's policy, and the queue executor's is the strict
+     * one: it classifies the context in hooks->end (libs/spurs/jq2/executor.cpp,
+     * require_normal_return) and stops with jq2-job-end otherwise. */
     spu_run_with_halt(entry, &ctx);
-    if (hooks && hooks->end) hooks->end(hooks->user, &ctx);
 
     /* The only way into the trap quadword is a call through jm word 0. Both
      * paths end the run there: the interpreter stops at the `stop`, and the
-     * resolver halts the lifted run once the interpreted stub stops. */
+     * resolver halts the lifted run once the interpreted stub stops. This
+     * loader's own stop comes before the caller's end hook, so a body that
+     * called word 0 is named for it, not as a generic job end. */
     if (ctx.job_rt_ls && (ctx.status & SPU_STATUS_STOPPED_BY_STOP) &&
         ctx.stop_code == SPU_JOB_RT_TRAP_STOP &&
         (ctx.pc & SPU_LS_MASK) == ctx.job_rt_ls + JOB_RT_TRAP + 4u) {
@@ -791,6 +811,8 @@ static int run_spurs_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_e
                  "scheduler, which a single job run does not model.",
                  f, sizeof f / sizeof f[0], &site);
     }
+
+    if (hooks && hooks->end) hooks->end(hooks->user, &ctx);
 
     /* Capture the job's outbound mailbox. These are LS POINTERS TO STRINGS for
      * the SPU printf service, NOT query results -- value 0x83C0 from the sound

@@ -31,6 +31,12 @@
  *   observer    jq2_set_job_observer: the worker's spu_context and the loader's
  *               layout at job start, r3 at job end, nothing once removed
  *   validate    every guard and firmware status code of the surface
+ *   lifted      the same transform as a lifted-style body (the C an SPU lifter emits: channel
+ *               writes, `bi $lr` as SPU_RET): it returns normally, is executed and credited
+ *               once, and its output is right
+ *   stop-halt   a lifted-style body that halts (the lifter's halt-on-condition: status HALT,
+ *               spu_halt longjmp) before its output write: named stop jq2-job-end reason=halt,
+ *               no output, no credit
  *   stop-job    a job that executes `stop 0x2222`: named stop jq2-job-end, the
  *               port is not credited
  *   stop-crt    a job image with another CRT: the loader's named stop, no credit
@@ -40,6 +46,7 @@
 #include "jq2/jq2.h"
 
 #include "spu_context.h"
+#include "spu_helpers.h"
 #include "spu_observe.h"
 
 #include <sys/mman.h>
@@ -62,6 +69,9 @@
 extern "C" {
 uint8_t* vm_base;
 extern uint32_t ppu_vm_size; /* runtime/host/host_stubs.c */
+void spu_wrch(spu_context* ctx, uint32_t channel, u128 value);
+u128 spu_rdch(spu_context* ctx, uint32_t channel);
+void spu_halt(spu_context* ctx);
 }
 
 using namespace ps3recomp::spurs::jq2;
@@ -278,11 +288,68 @@ void hook_done(void*, const JobStart& js)
     g_probe.done[serial_of(js)] = ++g_probe.clock;
 }
 
+/* The job bodies a test selects; 0 leaves the interpreter. */
+enum LiftedKind { kNoLifted = 0, kLiftedNormal, kLiftedHalt };
+int g_lifted = kNoLifted;
+
+/* A lifted-style body, written the way tools/spu_lifter.py emits code: channel
+ * writes through the context, the halt-on-condition as `status = HALT;
+ * spu_halt(ctx); return;` and `bi $lr` at depth 0 as SPU_RET. It does the
+ * transform program's work: GET 16 bytes from the descriptor's in_ea, add
+ * {add, serial, out_ea, in_ea}, PUT the result to out_ea. The halting kind
+ * halts after the GET and before the output is stored or written. */
+void lifted_dma(spu_context* c, std::uint32_t lsa, std::uint32_t ea, std::uint32_t cmd)
+{
+    spu_wrch(c, MFC_LSA, spu_splat_u32(lsa));
+    spu_wrch(c, MFC_EAH, spu_splat_u32(0));
+    spu_wrch(c, MFC_EAL, spu_splat_u32(ea));
+    spu_wrch(c, MFC_Size, spu_splat_u32(16));
+    spu_wrch(c, MFC_TagID, spu_splat_u32(1));
+    spu_wrch(c, MFC_Cmd, spu_splat_u32(cmd));
+    spu_wrch(c, MFC_WrTagMask, spu_splat_u32(2));
+    spu_wrch(c, MFC_WrTagUpdate, spu_splat_u32(2));
+    (void)spu_rdch(c, MFC_RdTagStat);
+}
+
+std::uint32_t ls_word(const spu_context* c, std::uint32_t lsa)
+{
+    std::uint32_t v;
+    std::memcpy(&v, c->ls + lsa, 4);
+    return be32(v);
+}
+
+void lifted_job(spu_context* c, bool halt)
+{
+    const std::uint32_t d = c->gpr[4]._u32[0];
+    const std::uint32_t out = ls_word(c, d + 0x30), in = ls_word(c, d + 0x34);
+    const std::uint32_t k[4] = {ls_word(c, d + 0x38), ls_word(c, d + 0x3C), out, in};
+    lifted_dma(c, kLsIn, in, MFC_GET_CMD);
+    if (halt) {
+        c->status = SPU_STATUS_STOPPED_BY_HALT;
+        spu_halt(c);
+        return;
+    }
+    for (std::uint32_t i = 0; i < 4; ++i) {
+        const std::uint32_t v = be32(ls_word(c, kLsIn + 4 * i) + k[i]);
+        std::memcpy(c->ls + kLsOut + 4 * i, &v, 4);
+    }
+    lifted_dma(c, kLsOut, out, MFC_PUT_CMD);
+    SPU_RET(c);
+}
+void lifted_normal_entry(spu_context* c) { lifted_job(c, false); }
+void lifted_halt_entry(spu_context* c) { lifted_job(c, true); }
+
+JobBody hook_select(void*, const JobStart&)
+{
+    return g_lifted == kLiftedHalt ? JobBody{&lifted_halt_entry, -1} : JobBody{&lifted_normal_entry, -1};
+}
+
 void install_hooks()
 {
     ExecutorHooks h;
     h.on_admit = &hook_admit;
     h.on_done = &hook_done;
+    if (g_lifted != kNoLifted) h.select_body = &hook_select;
     set_executor_hooks(h);
 }
 
@@ -1024,6 +1091,35 @@ void stop_scenario(Prog prog, const char* kind, const char* needle)
 void mode_stop_job() { stop_scenario(Prog::stop_early, "jq2-job-end", "stop_code=0x2222"); }
 void mode_stop_crt() { stop_scenario(Prog::bad_crt, "spu-job-crt-version", nullptr); }
 
+/* A lifted-style job that halts before its output write: the Sync never
+ * returns, the output stays as it was and nothing is credited. */
+void mode_stop_halt()
+{
+    g_lifted = kLiftedHalt;
+    stop_scenario(Prog::transform, "jq2-job-end", "reason=halt");
+    const JobSpec a = spec(0);
+    for (std::uint32_t i = 0; i < 4; ++i)
+        CHECK(get32(a.out + 4 * i) == 0, "the halted job wrote its output");
+}
+
+/* The normal return of a lifted-style body: executed and credited once. */
+void mode_lifted()
+{
+    g_lifted = kLiftedNormal;
+    build_image(IMAGE, Prog::transform);
+    install_hooks();
+    Rig rig({128, 1, false});
+    const JobSpec a = spec(0);
+    rig.push(a.desc, 64, 0);
+    CHECK(jq2_port_sync(PORT, 0) == 0, "sync");
+    CHECK(job_ok(a), "the lifted job's output");
+    jq2_stats s{};
+    CHECK(jq2_queue_stats(QUEUE, &s) == 0, "stats");
+    CHECK(s.dispatched == 1 && s.executed == 1 && s.credited == 1, "counts %llu/%llu/%llu",
+          (unsigned long long)s.dispatched, (unsigned long long)s.executed, (unsigned long long)s.credited);
+    rig.teardown();
+}
+
 void mode_stop_ring()
 {
     const std::function<void()> child = [] {
@@ -1066,7 +1162,9 @@ int main(int argc, char** argv)
     else if (mode == "join") mode_join();
     else if (mode == "observer") mode_observer();
     else if (mode == "validate") mode_validate();
+    else if (mode == "lifted") mode_lifted();
     else if (mode == "stop-job") mode_stop_job();
+    else if (mode == "stop-halt") mode_stop_halt();
     else if (mode == "stop-crt") mode_stop_crt();
     else if (mode == "stop-ring") mode_stop_ring();
     else {

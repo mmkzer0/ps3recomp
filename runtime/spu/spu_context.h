@@ -641,23 +641,26 @@ static __attribute__((noinline, cold)) void spu_ls_write_probe_pre(spu_context* 
         }
     }
 }
-/* SPU_SMC_WATCH, out of line: g_spu_smc_watch is -1 until read, then 0/1. */
+/* SPU_SMC_WATCH, out of line: g_spu_smc_watch is -1 until read, then 0/1. Two
+ * workers can reach their first write together, so the gate is read and
+ * initialised with relaxed atomics (every initialiser stores the same value,
+ * the environment's), like g_spu_ls_probe above. */
 extern int g_spu_smc_watch;
 static __attribute__((noinline, cold)) void spu_ls_write_probe_smc(spu_context* ctx, uint32_t lsa, const uint8_t* p)
 {
-    if (g_spu_smc_watch < 0) g_spu_smc_watch = getenv("SPU_SMC_WATCH") ? 1 : 0;
+    if (SPU_RELAXED_LOAD(&g_spu_smc_watch) < 0) SPU_RELAXED_STORE(&g_spu_smc_watch, getenv("SPU_SMC_WATCH") ? 1 : 0);
     /* SPU_SMC_WATCH=<img>: self-modification detector. Log any store whose
      * target LS line falls inside that image's CODE segment (the segment
      * bounds come from SPU_SMC_LO/HI, default the pm_wwsjob range 0xA00..
      * 0x3700). A hit proves the guest rewrites its own instructions -- which
      * a static recompiler cannot follow. */
-    { static int s = -2; static uint32_t lo, hi, img;
+    { static SPU_THREAD_LOCAL int s = -2; static SPU_THREAD_LOCAL uint32_t lo, hi, img;
       if (s == -2) { const char* e = getenv("SPU_SMC_WATCH");
         s = e ? atoi(e) : -1; img = (uint32_t)s;
         const char* l = getenv("SPU_SMC_LO"); lo = l ? (uint32_t)strtoul(l,0,0) : 0xA00;
         const char* h = getenv("SPU_SMC_HI"); hi = h ? (uint32_t)strtoul(h,0,0) : 0x3700; }
       if (s >= 0 && (uint32_t)ctx->image_id == img && lsa >= lo && lsa < hi) {
-          static int _n = 0;
+          static SPU_THREAD_LOCAL int _n = 0;   /* per worker: a shared counter would race */
           if (PS3_LOG_FIRST(_n, 48))
               fprintf(stderr, "[spu-SMC] img=%d WROTE CODE @0x%05X (pc=0x%05X) = %02X%02X%02X%02X\n",
                       ctx->image_id, lsa, (uint32_t)ctx->pc & SPU_LS_MASK,
@@ -693,7 +696,7 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
 #endif
     spu_ls_watch_hit2(lsa, 1, p, (uint32_t)ctx->pc & SPU_LS_MASK,
                       ctx->gpr[0]._u32[0] & SPU_LS_MASK);
-    if (__builtin_expect(g_spu_smc_watch != 0, 0))
+    if (__builtin_expect(SPU_RELAXED_LOAD(&g_spu_smc_watch) != 0, 0))
         spu_ls_write_probe_smc(ctx, lsa, p);
 }
 

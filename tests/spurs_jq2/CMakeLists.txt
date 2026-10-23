@@ -90,7 +90,8 @@ set_tests_properties(jq2_port_race_stress PROPERTIES LABELS "spurs;stress" TIMEO
 #   jq2_exec_join       Shutdown / Join with outstanding jobs (L1), caller-owned buffers (L2)
 #   jq2_exec_observer   the job observer: layout at start, r3 at end, off when removed
 #   jq2_exec_validate   every guard and status code of jq2.h
-#   jq2_exec_stop_*     a job that stops, another CRT, a ring entry nobody models
+#   jq2_exec_lifted     a lifted-style body returns normally: executed and credited once
+#   jq2_exec_stop_*     a job that stops or halts (interpreted or lifted), another CRT, a ring entry nobody models
 # host_stubs.c satisfies the PPU-loader symbols the runtime's HLE modules name,
 # as a game-less host does.
 add_executable(test_jq2_executor test_jq2_executor.cpp
@@ -99,7 +100,7 @@ target_include_directories(test_jq2_executor PRIVATE "${PROJECT_SOURCE_DIR}/runt
 target_link_libraries(test_jq2_executor PRIVATE ps3recomp_spurs_jq2 Threads::Threads)
 # The runtime carries C++ and Objective-C, so the C++ driver links.
 set_target_properties(test_jq2_executor PROPERTIES LINKER_LANGUAGE CXX)
-foreach(mode premature copy credit wrap barrier sync join observer validate stop-job stop-crt stop-ring)
+foreach(mode premature copy credit wrap barrier sync join observer validate lifted stop-job stop-halt stop-crt stop-ring)
     string(REPLACE "-" "_" name "${mode}")
     add_test(NAME jq2_exec_${name} COMMAND test_jq2_executor ${mode})
     set_tests_properties(jq2_exec_${name} PROPERTIES LABELS "spurs;t0;tsan" TIMEOUT 300)

@@ -443,6 +443,18 @@ interface and kernel view are modelled, so any other marker (Ver12, Ver15, no
 marker) is the named stop `spu-job-crt-version` rather than a run on a context
 the CRT was not built for.
 
+**How a job ends.** `spu_run_with_halt`'s result is not a completion test, and
+the loader does not consult it: a lifted job's normal return, a chain job's
+second lap and a lifted `heq`/`hgt` assertion all halt the run. What the job
+ended on is in the finished context, and the caller decides. The loader calls
+`hooks->end` with that context after its own jm-entry stop. The JobQueue2
+executor's policy is strict and lives in one place, `require_normal_return`
+(`libs/spurs/jq2/executor.cpp`): the only normal returns are `stop 0` just past
+the link `0x3FF00` (interpreted) and a branch onto the link with no stop or halt
+status (lifted, `SPU_JOB_RETURN_LS` in the resolver); anything else is the named
+stop `jq2-job-end` and the job is neither executed nor credited. The chain
+walker (`spu_run_spurs_job`) keeps its old behaviour.
+
 **Memory.** For an ELF job the high word of `eaBinary` is the bss in quadwords
 (the CRT zeroes it itself); the loader keeps the full 64 bits, so the job's
 memory is `sizeBinary + 16 * hi32`, every buffer and the stack (`r1`) start
@@ -464,13 +476,18 @@ ioBuffer with the low nibble of the local-store address taken from `EAL` (a 1, 2
 4 or 8-byte transfer sits at its own offset in its quadword), the next element at
 the next quadword boundary after its size. The offset counts toward the
 `sizeInOrInOut` bound. The loader validates the whole descriptor -- binary fields,
-CRT marker, region layout, cache list and input list -- before it writes a byte of
-local store: every size is 1/2/4/8 or a 16-byte multiple up to 16 KB (the MFC
-rules `spu_dma.h` applies per transfer), every EAL is naturally aligned and
-inside guest memory, the input and cache lists themselves stay inside guest
-memory (summed in 64 bits), and the staged bytes fit `sizeInOrInOut`. A
-zero-size element, a null EA, or an `eaBinary`/`sizeBinary` of zero is a stop too:
-an element is never skipped and no partial ioBuffer is handed to the job.
+the binary's and every cache entry's guest range, CRT marker, region layout, cache
+list and input list -- before it writes a byte of local store: every size is
+1/2/4/8 or a 16-byte multiple up to 16 KB (the MFC rules `spu_dma.h` applies per
+transfer), every EAL is naturally aligned and inside guest memory, the input and
+cache lists themselves stay inside guest memory (summed in 64 bits), the binary
+(`eaBinary`, `sizeBinary` x 16) and each cache entry (EAL, size) lie inside
+guest memory by the same bound (`ppu_vm_size`, else the 32-bit space) before the
+CRT marker is read from the binary or any staging read forms a host pointer
+(`reason=binary-range` / `cache-range`), and the staged bytes fit
+`sizeInOrInOut`. A zero-size element, a null EA, or an `eaBinary`/`sizeBinary` of
+zero is a stop too: an element is never skipped and no partial ioBuffer is handed
+to the job.
 
 **Stall-and-notify.** Bit 31 of an element's size word (a zero-size marker with it
 set is the wwsjob sentinel) makes the MFC transfer the element, park the rest of

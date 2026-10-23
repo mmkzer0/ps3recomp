@@ -31,6 +31,9 @@
  *   dma-desc-range   the descriptor's list leaves guest memory: spu-job-dma-list
  *   bin-ea-zero      eaBinary = 0: spu-job-dma-list
  *   bin-size-zero    sizeBinary = 0: spu-job-dma-list
+ *   bin-range        the binary extent leaves guest memory (bounded VM, inaccessible page
+ *                    after it): spu-job-dma-list reason binary-range, no read past the VM
+ *   cache-range      a cache-list entry starts at the VM's end: reason cache-range
  *   swap-interp      jm word 1 called with an incomplete tag, interpreted job
  *   swap-lifted      the same, lifted-style job
  *   swap-idle-interp / swap-idle-lifted   word 1 called with every tag complete
@@ -728,6 +731,40 @@ static void mode_bin_zero(const char* mode, int ea_zero)
     expect_untouched_stop(JOB_EA, mode);
 }
 
+/* The guest VM is g_mem followed by an inaccessible page, so a loader that
+ * reads a descriptor-supplied range past it faults (the child dies on SIGSEGV,
+ * not with a stop) instead of passing by luck. */
+static void use_guarded_vm(void)
+{
+    const size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    uint8_t* m = (uint8_t*)mmap(NULL, sizeof g_mem + page, PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (m == MAP_FAILED) { perror("mmap"); exit(2); }
+    memcpy(m, g_mem, sizeof g_mem);
+    if (mprotect(m + sizeof g_mem, page, PROT_NONE) != 0) { perror("mprotect"); exit(2); }
+    vm_base = m;
+}
+
+/* A binary (bin) or a cache entry outside guest memory: a named stop before
+ * the CRT-marker read or any staging read. */
+static void mode_range(const char* mode, int bin)
+{
+    job_cfg c = { "JOBCRT Ver14", 0, PROG_MAIN, 0 };
+    build_job(&c);
+    uint8_t* d = g_mem + JOB_EA;
+    if (bin) {
+        /* 0x1000 bytes from 0xFFFF0: the first 0x10 are inside the VM, the CRT
+         * marker (+0x30) is not */
+        put64(d + 0x00, 0xFFFF0u | 1u);
+    } else {
+        /* one byte at the VM's end */
+        put16(d + 0x0A, 0);
+        put64(d + 0x30, dma_elem(1, (uint32_t)sizeof g_mem));
+    }
+    use_guarded_vm();
+    expect_untouched_stop(JOB_EA, mode);
+}
+
 static void mode_stop(const char* crt, uint32_t bss_qw)
 {
     job_cfg c = { crt, bss_qw, PROG_MAIN, 0, 0, 0, 0 };
@@ -825,6 +862,8 @@ int main(int argc, char** argv)
     else if (!strcmp(m, "dma-desc-range")) mode_dma_desc_range(m);
     else if (!strcmp(m, "bin-ea-zero")) mode_bin_zero(m, 1);
     else if (!strcmp(m, "bin-size-zero")) mode_bin_zero(m, 0);
+    else if (!strcmp(m, "bin-range")) mode_range(m, 1);
+    else if (!strcmp(m, "cache-range")) mode_range(m, 0);
     else { fprintf(stderr, "unknown mode %s\n", m); return 2; }
 
     if (g_fail) return 1;

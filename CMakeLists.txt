@@ -110,31 +110,48 @@ list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/tests/|/runtime/ppu/|/runtime/host/|
 # ps3recomp_spurs_jq2 is the guest-facing half: the port line (port.cpp, the
 # guest memory base and the reservation model) and the HLE executor
 # (executor.cpp: the guest queue, the SPU workers, the LV2 event flags, the
-# SPURS job loader, named stops). It needs the runtime and the runtime needs it
-# (cellSpursJq.c calls jq2/jq2.h), so the two static libraries depend on each
-# other explicitly: CMake repeats a cycle of static libraries on the link line,
-# where relying on archive order left port.o's resv_host_rmw undefined in any
-# link that had not already pulled reservation.o.
-add_library(ps3recomp_spurs_jq2_model STATIC
+# SPURS job loader, named stops). The runtime needs it (cellSpursJq.c calls
+# jq2/jq2.h) and it needs the runtime.
+#
+# The sources are compiled once, as OBJECT libraries, and their objects go into
+# BOTH the standalone static libraries (the T0 tests link those) and the
+# runtime archive itself. The installed toolkit ships one archive,
+# libps3recomp_runtime.a, and a title links only that (docs/BUILDING.md,
+# "Linking Against the Runtime"): it must carry every jq2_* definition its HLE
+# objects call. The standalone libraries come first on an in-tree link line, so
+# the duplicate members in the runtime archive are never pulled.
+add_library(ps3recomp_spurs_jq2_model_objs OBJECT
     libs/spurs/jq2/ring.cpp
     libs/spurs/jq2/sched.cpp
+)
+target_include_directories(ps3recomp_spurs_jq2_model_objs PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/libs/spurs"
+)
+add_library(ps3recomp_spurs_jq2_model STATIC
+    $<TARGET_OBJECTS:ps3recomp_spurs_jq2_model_objs>
 )
 target_include_directories(ps3recomp_spurs_jq2_model PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/libs/spurs"
 )
 
-add_library(ps3recomp_spurs_jq2 STATIC
+add_library(ps3recomp_spurs_jq2_objs OBJECT
     libs/spurs/jq2/port.cpp
     libs/spurs/jq2/pool.cpp
     libs/spurs/jq2/executor.cpp
 )
-target_include_directories(ps3recomp_spurs_jq2 PUBLIC
+target_include_directories(ps3recomp_spurs_jq2_objs PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/libs/spurs"
 )
-target_include_directories(ps3recomp_spurs_jq2 PRIVATE
+target_include_directories(ps3recomp_spurs_jq2_objs PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime"
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu"
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
+)
+add_library(ps3recomp_spurs_jq2 STATIC
+    $<TARGET_OBJECTS:ps3recomp_spurs_jq2_objs>
+)
+target_include_directories(ps3recomp_spurs_jq2 PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/libs/spurs"
 )
 find_package(Threads REQUIRED)
 target_link_libraries(ps3recomp_spurs_jq2 PUBLIC ps3recomp_spurs_jq2_model Threads::Threads)
@@ -143,8 +160,9 @@ target_link_libraries(ps3recomp_spurs_jq2 PRIVATE ps3recomp_runtime)
 add_library(ps3recomp_runtime STATIC
     ${HLE_SOURCES}
     ${RUNTIME_SOURCES}
+    $<TARGET_OBJECTS:ps3recomp_spurs_jq2_model_objs>
+    $<TARGET_OBJECTS:ps3recomp_spurs_jq2_objs>
 )
-target_link_libraries(ps3recomp_runtime PRIVATE ps3recomp_spurs_jq2)
 
 target_include_directories(ps3recomp_runtime PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"

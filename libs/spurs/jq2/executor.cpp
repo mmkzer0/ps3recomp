@@ -652,18 +652,33 @@ thread_local const JobStart* t_job = nullptr;
               &site);
 }
 
-void interpreter_entry(spu_context* ctx)
+/* The one definition of a job's normal return, for every job body. The job
+ * returns through the link register the loader plants (kJobReturnLs, 0x3FF00),
+ * and the two kinds of body arrive there differently:
+ *   interpreted  local store at the link is zero: `stop 0`, status STOP, stop
+ *                code 0, pc just past it;
+ *   lifted       the resolver (spu_indirect_branch, SPU_JOB_RETURN_LS) halts the
+ *                run when a branch lands on the link: pc == the link and the
+ *                status is neither STOP nor HALT.
+ * spu_run_with_halt reports a halt for the lifted return as well as for a
+ * lifted `heq`/`hgt` assertion, so its result cannot tell them apart; the
+ * context can. Anything else - a `stop` with another code, a halt-assertion
+ * (status HALT), a run that ended elsewhere - ended the job without returning. */
+void require_normal_return(const spu_context* ctx)
 {
-    spu_interp_run(ctx, 0);
-    /* The job returns through the link register the loader plants (0x3FF00),
-     * where local store is zero: `stop 0`, with pc just past it. */
-    if (ctx->status == SPU_STATUS_STOPPED_BY_STOP && ctx->stop_code == 0 &&
-        (ctx->pc & SPU_LS_MASK) == kJobReturnLs + 4u)
-        return;
+    const std::uint32_t pc = ctx->pc & SPU_LS_MASK;
+    if (ctx->status == SPU_STATUS_STOPPED_BY_STOP && ctx->stop_code == 0 && pc == kJobReturnLs + 4u) return;
+    if (pc == kJobReturnLs && (ctx->status & (SPU_STATUS_STOPPED_BY_STOP | SPU_STATUS_STOPPED_BY_HALT)) == 0) return;
     const char* reason = ctx->status == SPU_STATUS_STOPPED_BY_HALT   ? "halt"
                          : ctx->status == SPU_STATUS_STOPPED_BY_STOP ? "stop"
                                                                      : "status";
     job_end_stop(ctx, reason);
+}
+
+void interpreter_entry(spu_context* ctx)
+{
+    spu_interp_run(ctx, 0);
+    require_normal_return(ctx);
 }
 
 void Queue::run_job(const JobStart& js, const std::optional<jq2_job_observer>& obs)
@@ -677,7 +692,12 @@ void Queue::run_job(const JobStart& js, const std::optional<jq2_job_observer>& o
     t_job = &js;
     int rc;
     if (!obs) {
-        rc = spu_run_spurs_job_snapshot(body.entry, body.image_id, js.descriptor_ea, js.descriptor.data(), js.size);
+        /* The loader runs the body and calls `end` with the finished context,
+         * where the job's ending is classified (require_normal_return). */
+        spu_job_hooks hooks{};
+        hooks.end = [](void*, spu_context* ctx) { require_normal_return(ctx); };
+        rc = spu_run_spurs_job_hooked(body.entry, body.image_id, js.descriptor_ea, js.descriptor.data(), js.size,
+                                      &hooks);
     } else {
         /* The loader hands the layout it chose to the observer; the job's
          * identity is what this worker admitted. */
@@ -717,6 +737,7 @@ void Queue::run_job(const JobStart& js, const std::optional<jq2_job_observer>& o
             if (ob.obs->job_start != nullptr) ob.obs->job_start(ob.obs->user, ctx, &i);
         };
         hooks.end = [](void* user, spu_context* ctx) {
+            require_normal_return(ctx);
             auto& ob = *static_cast<Observed*>(user);
             if (ob.obs->job_end != nullptr) ob.obs->job_end(ob.obs->user, ctx, ctx->gpr[3]._u32[0], &ob.info);
         };

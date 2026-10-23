@@ -186,6 +186,10 @@ def main():
         # P3: no binary named by the descriptor
         dma_stop("bin-ea-zero", -1, 0, 0x1000, 0, 0, 0x80, "eaBinary")
         dma_stop("bin-size-zero", -1, 0x20000, 0, 0, 0, 0x80, "sizeBinary")
+        # a binary or a cache entry outside the (bounded) guest VM, which is
+        # followed by an inaccessible page: a stop, not a fault past the VM
+        dma_stop("bin-range", -1, 0xFFFF0, 0x1000, 0, 0, 0x80, "binary-range")
+        dma_stop("cache-range", 0, 0x100000, 1, 0, 1, 0x80, "cache-range")
 
         # jm word 0: the trap, on both paths
         for mode in ("word0-interp", "word0-lifted"):

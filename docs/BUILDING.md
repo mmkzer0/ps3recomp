@@ -118,9 +118,17 @@ dir build\libps3recomp_runtime.a      # Windows (MinGW)
 ```bash
 cmake --install build --prefix /usr/local
 # Installs:
-#   /usr/local/lib/libps3recomp_runtime.a
+#   /usr/local/lib/libps3recomp_runtime.a   (the one archive: it carries the JobQueue2
+#                                            codec, scheduler, port, pool and executor
+#                                            objects the cellSpursJq handlers call)
 #   /usr/local/include/ps3emu/*.h
 ```
+
+The installed toolkit is that single archive plus the `ps3emu` headers: a title
+links `libps3recomp_runtime.a` alone (see "Linking Against the Runtime"), with no
+separate JobQueue2 library. The `ps3recomp_spurs_jq2` and
+`ps3recomp_spurs_jq2_model` static libraries exist for the in-tree tests; their
+objects are the same ones compiled into the runtime archive and are not installed.
 
 ---
 
@@ -559,7 +567,8 @@ This library contains:
 add_subdirectory(path/to/ps3recomp)
 target_link_libraries(my_game PRIVATE ps3recomp_runtime)
 
-# Option 2: Find an installed ps3recomp
+# Option 2: Find an installed ps3recomp (one archive; it includes the JobQueue2
+# executor that the cellSpursJq handlers call)
 find_library(PS3RECOMP_LIB ps3recomp_runtime PATHS /usr/local/lib)
 find_path(PS3RECOMP_INCLUDE ps3emu/ps3types.h PATHS /usr/local/include)
 target_link_libraries(my_game PRIVATE ${PS3RECOMP_LIB})
