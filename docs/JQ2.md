@@ -4,10 +4,11 @@
 deterministic, and free of runtime, thread and clock dependencies: they are the
 target `ps3recomp_spurs_jq2_model`. The port model's logic is too, and only its
 guest binding reaches into the runtime (see Port line); the port model, the
-descriptor pool and the executor are the target `ps3recomp_spurs_jq2`, which
-links the runtime explicitly (the runtime's `cellSpursJq.c` calls `jq2/jq2.h`,
-so the two static libraries depend on each other and CMake repeats the cycle on
-the link line).
+descriptor pool and the executor are the target `ps3recomp_spurs_jq2`. Both
+targets are built from object libraries whose objects are also part of
+`ps3recomp_runtime` (the runtime's `cellSpursJq.c` calls `jq2/jq2.h`), so an
+installed title links the one runtime archive; the standalone targets exist for
+the in-tree tests.
 
 - `ring.hpp/.cpp`: the 8-byte command-ring entry codec. Pure C++20,
   deterministic, no runtime dependency.

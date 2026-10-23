@@ -443,6 +443,18 @@ static int run_spurs_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_e
 {
     if (!entry || !job_ea) return -1;
     const desc_view dv = { snap, snap_size, job_ea };
+    /* Without a snapshot (the chain walker) the header is read, and later
+     * copied into local store, straight from guest memory: the whole span the
+     * copy takes must be mapped before the first header read. */
+    if (!snap) {
+        uint32_t span = job_desc_size ? job_desc_size : 256u;
+        if (span > 0x400) span = 0x400;
+        if (span < JH_SIZE) span = JH_SIZE;
+        if (!guest_range_ok(job_ea, span)) {
+            const job_dma jd0 = { job_ea, image_id, 0 };
+            job_dma_stop(&jd0, -1, job_ea, span, 0, 0, "descriptor-range");
+        }
+    }
 
     /* ---- descriptor ---------------------------------------------------- */
     /* eaBinary is a be u64: the low word is the guest EA (bit 0 = CACHE_INHIBIT),

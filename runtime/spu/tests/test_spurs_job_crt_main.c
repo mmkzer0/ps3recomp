@@ -34,6 +34,8 @@
  *   bin-range        the binary extent leaves guest memory (bounded VM, inaccessible page
  *                    after it): spu-job-dma-list reason binary-range, no read past the VM
  *   cache-range      a cache-list entry starts at the VM's end: reason cache-range
+ *   desc-range       the descriptor span the chain walker copies (256 bytes) leaves
+ *                    guest memory: reason descriptor-range, before any header read
  *   swap-interp      jm word 1 called with an incomplete tag, interpreted job
  *   swap-lifted      the same, lifted-style job
  *   swap-idle-interp / swap-idle-lifted   word 1 called with every tag complete
@@ -745,6 +747,20 @@ static void use_guarded_vm(void)
     vm_base = m;
 }
 
+/* The descriptor itself ends past the VM: its header fits, the 256 bytes the
+ * loader copies into the context do not (a guard page follows the VM). */
+static void mode_desc_range(const char* mode)
+{
+    job_cfg c = { "JOBCRT Ver14", 0, PROG_MAIN, 0 };
+    c.job_ea = 0xFFF00;
+    build_job(&c);
+    memmove(g_mem + 0xFFF80, g_mem + c.job_ea, 0x80);
+    put16(g_mem + 0xFFF80 + 0x0A, 0);        /* no input list */
+    put32(g_mem + 0xFFF80 + 0x24, 0);        /* no cache list */
+    use_guarded_vm();
+    expect_untouched_stop(0xFFF80, mode);
+}
+
 /* A binary (bin) or a cache entry outside guest memory: a named stop before
  * the CRT-marker read or any staging read. */
 static void mode_range(const char* mode, int bin)
@@ -864,6 +880,7 @@ int main(int argc, char** argv)
     else if (!strcmp(m, "bin-size-zero")) mode_bin_zero(m, 0);
     else if (!strcmp(m, "bin-range")) mode_range(m, 1);
     else if (!strcmp(m, "cache-range")) mode_range(m, 0);
+    else if (!strcmp(m, "desc-range")) mode_desc_range(m);
     else { fprintf(stderr, "unknown mode %s\n", m); return 2; }
 
     if (g_fail) return 1;
