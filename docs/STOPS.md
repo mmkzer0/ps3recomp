@@ -58,6 +58,7 @@ Ids are stable kebab-case; a new gap gets a new kind, never a free-text variant.
 | `spu-job-crt-version` | a SPURS job whose CRT marker at LS `0x30` is not `JOBCRT Ver13` or `JOBCRT Ver14` (Ver12, Ver15, garbage): the loader models those two CRTs only |
 | `spu-job-memory` | a SPURS job with a region ending past the job runtime area at the top of local store: image plus bss (`eaBinary` high word x 16), ioBuffer, oBuffer, the scratch + stack block (a `sizeStack` of `0xFFFF` puts `r1` at `0xFFFF0`, which LS masking lands on the context), or a cache buffer. The regions are laid out as `_cellSpursCheckJob` sizes them, each base `align1024`; the end checked is `base + size` (the stack block's aligned top), and an empty region is not checked |
 | `spu-job-jm-entry` | a Ver14 job called the jm interface's scheduler-switch entry (word 0), which the runtime does not model |
+| `jq2-pool-release` | a host-side `CopyPushJobBody` descriptor-pool release named an EA that is not a live block of the queue's pool: outside every class region (`reason=foreign`), inside a class region but not on a block start (`reason=misaligned`), already on the free list (`reason=double-free`), or the pool's guest count and host free map disagree (`reason=count-mismatch`). Fields: `queue`, `ea`, `class` (decimal, or `none` when no class owns the EA), `reason` |
 
 Where each is raised, and what it carries beyond `pc lr tid`:
 
@@ -77,6 +78,7 @@ Where each is raised, and what it carries beyond `pc lr tid`:
 | `spu-job-crt-version` | `spu_run_spurs_job` (`runtime/spu/spurs_job.c`) | `job image marker bytes` (`marker` is the 12 bytes at LS 0x30 with every non-printable as `?`, `bytes` the same 12 as hex) |
 | `spu-job-memory` | `spu_run_spurs_job` | `job image binary bss memory io out scratch stack cache region p limit` (bytes; `bss` is `eaBinary` high word x 16, `memory` = `binary + bss`, `io`/`out` the descriptor's `sizeInOrInout`/`sizeOut`, `scratch`/`stack` `sizeScratch`/`sizeStack` x 16 (a zero stack shows the 8 KB default), `cache` the sum of the cache entry sizes read up to and including the failing one, `region` the one that crossed (`image`, `io`, `out`, `stack` = the scratch + stack block, `cache`), `p` that region's end address (64-bit, never wrapped) and `limit` the lowest reserved top-of-LS address) |
 | `spu-job-jm-entry` | `spu_run_spurs_job` | `job image entry lr`; `pc`/`lr` are the trap's LS address and the caller's link register |
+| `jq2-pool-release` | `DescriptorPool::release` (`libs/spurs/jq2/pool.cpp`) | `queue ea class reason`; a host-side pool bookkeeping fault, so there is no guest site (`pc`/`lr`/`tid` stay 0) |
 
 Lifted code does not track a guest pc, so for the first four `pc` is the caller's
 return address (the import stub's caller, the `sc` site, the call site). Only

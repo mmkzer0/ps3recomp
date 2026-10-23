@@ -103,12 +103,16 @@ list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/tests/|/runtime/ppu/|/runtime/host/|
 # ---------------------------------------------------------------------------
 # Static library
 # ---------------------------------------------------------------------------
-# The Jq2 command-ring codec is pure C++20 with no runtime dependency, so it is
-# a target of its own: a title can link it without the HLE runtime, and the
-# codec's T0 test links it alone. The runtime also carries it for HLE callers.
+# The Jq2 command-ring codec and reference scheduler are pure C++20 with no
+# runtime dependency; the CopyPush descriptor pool is the guest-memory owner and
+# therefore calls the runtime's reservation model, named stop and vm_base.
+# Consumers of pool.cpp link those (the runtime library and tests/jq2 already
+# do). A title that only wants the codec can still link this target and pull
+# just the ring/sched objects.
 add_library(ps3recomp_spurs_jq2 STATIC
     libs/spurs/jq2/ring.cpp
     libs/spurs/jq2/sched.cpp
+    libs/spurs/jq2/pool.cpp
 )
 target_include_directories(ps3recomp_spurs_jq2 PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/libs/spurs"
