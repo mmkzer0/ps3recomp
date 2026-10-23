@@ -443,10 +443,13 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME spu_sdcrz
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_sdcrz.py")
+        add_test(NAME spu_observe
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_observe.py")
         set_tests_properties(spinlock_word_width PROPERTIES LABELS "sync;t0")
         set_tests_properties(spurs_task_exit_code_initialize spurs_taskset_size
             PROPERTIES LABELS "spurs;t0")
-        set_tests_properties(spu_sdcrz PROPERTIES LABELS "spu;t0")
+        set_tests_properties(spu_sdcrz spu_observe PROPERTIES LABELS "spu;t0")
     endif()
     if(NOT WIN32)
         find_package(Python3 3.10 COMPONENTS Interpreter QUIET)

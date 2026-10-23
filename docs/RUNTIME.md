@@ -359,6 +359,60 @@ spu_channel_has_data(&ch)       // Check if channel has data
 | 29 | `SPU_RdInMbox` | Read | Read inbound mailbox (PPU → SPU) |
 | 30 | `SPU_WrOutIntrMbox` | Write | Write outbound interrupt mailbox |
 
+### Execution Observer
+
+**File:** `runtime/spu/spu_observe.h`
+
+A per-context hook set for tools that drive an SPU context themselves (research
+harnesses, oracles, differential tests). It is not a diagnostic switch: nothing
+is installed on a normal run, there are no environment knobs or globals, and
+every hook site costs one predictable null check when the pointer is clear.
+
+```c
+typedef struct spu_observer {
+    void* user;
+    int  (*on_insn)(void* user, spu_context* ctx, uint32_t pc);
+    void (*on_mfc)(void* user, spu_context* ctx, const spu_obs_mfc* cmd);
+    void (*on_atomic)(void* user, spu_context* ctx, uint32_t cmd,
+                      uint64_t ea, uint32_t atomic_status);
+    void (*on_channel)(void* user, spu_context* ctx, int is_write,
+                       uint32_t ch, uint32_t value);
+} spu_observer;
+
+void spu_observer_set(spu_context* ctx, const spu_observer* obs);  /* NULL = off */
+```
+
+The callbacks report, in order: each instruction the **interpreter** is about
+to execute (`on_insn`; lifted code is not observed at instruction level), each
+MFC command at enqueue including atomics (`on_mfc`), the status an atomic
+command leaves in `MFC_RdAtomicStat` (`on_atomic`: `4` GETLLAR complete, `0`
+PUTLLC success, `1` PUTLLC failure, `2` PUTLLUC complete), and every `rdch` /
+`wrch` once its value is known (`on_channel`). Any callback left NULL is
+skipped.
+
+`on_insn` may **yield**: returning nonzero makes the outermost
+`spu_interp_run()` / `spu_interp_run_until()` return `SPU_INTERP_YIELDED`
+(`0xFFFFFFFF`, never a real stop code) with `ctx->pc` at the instruction that
+was not executed and no other state consumed. `spu_interp_run(ctx, ctx->pc)`
+resumes exactly there, which is how a harness round-robins several contexts on
+one host thread. A yield requested from a *nested* interpreter run -- one
+entered by lifted code through `spu_dispatch()` or the SMC microstep -- cannot
+unwind that host stack without losing guest state, so it is reported on stderr
+and aborts instead of pretending to stop. Observe contexts from the outermost
+entry.
+
+```c
+static int on_insn(void* user, spu_context* ctx, uint32_t pc) {
+    (void)ctx;
+    return ++*(int*)user > 1000;   /* run 1000 instructions per slice */
+}
+static spu_observer obs = { .user = &counter, .on_insn = on_insn };
+spu_observer_set(&ctx, &obs);
+uint32_t stop = spu_interp_run(&ctx, ctx->pc);
+```
+
+Tests: `runtime/spu/tests/test_spu_observe.c` (`ctest -R spu_observe`).
+
 ---
 
 ## Type System

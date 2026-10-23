@@ -10,6 +10,13 @@
 - **Typed, versioned config** (`ps3emu/config.h`, `docs/CONFIG.md`): default < TOML file < `PS3RECOMP_<SECTION>_<KEY>`, effective-config dump, unknown keys and unknown `PS3RECOMP_*` variables stop. Vendors toml++ 3.4.0.
 - **`ppu.vscr_nj`** (default true, RPCS3 parity; a policy, not a hardware fact) is applied to every guest PPU context. `ppu_context_init` applies it; `ppu_context_clear` is the raw zeroing.
 - **Identity gate**: the lifter records the SHA-256 of its input as `ppu_lift_image_sha256()`; `ppu_load_elf` refuses any other file. Titles must re-lift, call `ps3_config_load()` first in `main()`, and link the runtime library's new modules.
+- **SPU execution observer** (`runtime/spu/spu_observe.h`): a per-context hook
+  set for tools that drive an SPU context themselves. Reports every interpreted
+  instruction (with a yield that resumes exactly at `ctx->pc`), every MFC
+  command at enqueue including atomics, each atomic command's `MFC_RdAtomicStat`
+  result, and every `rdch`/`wrch` value. Off unless a tool installs it; no
+  environment knobs. Covered by `runtime/spu/tests/test_spu_observe.c` and
+  documented in `docs/RUNTIME.md`.
 
 ### v0.14.0 — *"Outside In"* (October 2026)
 
