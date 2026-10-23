@@ -9,9 +9,10 @@
   dependency.
 - `pool.hpp/.cpp`: the `CopyPushJobBody` descriptor pool in the queue's guest
   memory, with the acquire/release/snapshot verbs and the blocking wait hook.
-  It reaches guest memory through the runtime's `vm_base` mapping and calls the
-  A2(b) reservation model and the named-stop implementation, so the runtime
-  library provides those symbols (the pool test links them explicitly).
+  It reaches guest memory through the runtime's `vm_base` mapping, bounds
+  snapshot ranges by `ppu_vm_size`, and calls the A2(b) reservation model and
+  the named-stop implementation, so the runtime library provides those symbols
+  (the pool test defines `vm_base`/`ppu_vm_size` and links the rest explicitly).
 
 Tests: `tests/spurs_jq2/` (`ctest --preset t0 -R jq2`); `jq2_pool` is also
 labelled `tsan`. Evidence ids (`jq2fw-*`, `jq2c-*`, `m1r-*`, `jq2co-*`) refer
@@ -137,9 +138,21 @@ class unconfigured) and behaves like the firmware: Acquire returns A11.
 - `snapshot(src, size, dst)` copies exactly `size` bytes from the guest source
   to a live block, one destination line at a time under the reservation lock.
   It returns INVAL for a free/foreign destination, a size above the class size,
-  an address-space wrap, or overlapping source and destination. Zero bytes is a
+  or overlapping source and destination, and `PoolError::address` (firmware code
+  INVAL, `0x80410A02`) for a source or destination range outside the runtime's
+  mapped guest memory (`ppu_vm_size`, or the 32-bit space when the host does not
+  size it - the bound the SPURS job loader uses) or wrapping it, checked in
+  64 bits before any host pointer is formed. The firmware validates no address
+  (its vector copy moves exactly the length it is given, jq2fw-025/026), so
+  `address` has no code of its own: invalid arguments are INVAL (jq2fw-022); on
+  hardware the copy would take a storage fault [INFERENCE]. Zero bytes is a
   no-op. The copy is byte-exact, so a non-multiple-of-8 `descriptorSize` is
-  copied as bytes (the firmware's helper copies exactly its length).
+  copied as bytes (the firmware's helper copies exactly its length). The bytes
+  are stored as relaxed 64-bit atomics (`resv_copy_in` for a whole aligned
+  line, a compare-and-swap merge for an unaligned edge word), because PPU
+  `lwarx/ldarx` read guest words lock-free (`reservation.h`, "128-byte line
+  copies"): a byte-wise copy would race them and could show a torn word. The
+  line lock serializes conditional stores and SPU atomics, not those loads.
 - `shutdown()` wakes every waiter and makes the next blocking acquire return
   AGAIN, so the executor can join workers during queue teardown. Releases still
   work.
@@ -177,6 +190,15 @@ binary with a `--child` mode for the stop cases:
   (threads, entered-handshake, no sleep used as synchronisation);
 - `snapshot` copies exactly `descriptorSize` bytes (200 of a 256-byte class),
   the tail stays untouched, and scribbling the source afterwards is invisible;
+- `snapshot` refuses a source that starts inside, at, far past or wraps the end
+  of the VM, and a destination past a shrunk VM, with `address` and without
+  writing the block; the test's VM image is followed by an inaccessible page,
+  so an access past it faults instead of passing by luck; the last 16 bytes of
+  the VM are a valid source;
+- two PPU threads (`resv_ldarx64`, `resv_lwarx32`) read every word of a block
+  while it alternates between two uniform images (203 bytes, so a 3-byte merged
+  tail word): every word read is one image's, never torn, the bytes after the
+  copy keep their old value, and the TSAN run reports no race;
 - foreign, misaligned and double-free releases each stop in a subprocess with
   exit 70 and the `jq2-pool-release` machine line naming queue/ea/class/reason;
 - a PPU reservation taken before a release cannot commit afterwards, the epoch

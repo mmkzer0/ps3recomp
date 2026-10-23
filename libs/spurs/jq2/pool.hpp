@@ -151,6 +151,15 @@ enum class PoolError : std::uint8_t {
     inval,         /* 0x80410A02: invalid class/layout/snapshot argument */
     align,         /* 0x80410A10: queue/pool/poolAttr not 128-byte aligned */
     null_pointer,  /* 0x80410A11: null create argument or unconfigured class */
+    /* A snapshot source or destination range that is not inside the runtime's
+     * mapped guest memory (ppu_vm_size, or the 32-bit space when the host does
+     * not size it) or wraps it. The firmware validates no address - its vector
+     * copy (0x020063E8, jq2fw-025/026) moves exactly the length it is given -
+     * so there is no firmware code of its own; invalid arguments return
+     * INVAL (0x80410A02, jq2fw-022) and this error maps there. [INFERENCE: on
+     * hardware the copy would take a storage fault.] It is a separate value so
+     * a caller can tell the range from an argument-shape INVAL. */
+    address,
 };
 
 /* The guest-visible firmware code for an error, 0 for none. */
@@ -227,10 +236,14 @@ public:
 
     /* Copy exactly `size` bytes from guest EA `src_ea` to the allocated block
      * `dst_ea`, before the executor enqueues the command (contract S3). The
-     * destination must be a live block and the copy must fit its class. The
-     * destination lines are updated through the reservation model, so a stale
-     * PPU/SPU reservation on them is invalidated. The source may be overwritten
-     * by the caller as soon as this returns. */
+     * destination must be a live block and the copy must fit its class; source
+     * and destination ranges must lie inside mapped guest memory (`address`
+     * otherwise, before any host pointer is formed) and not overlap (`inval`).
+     * The destination lines are updated through the reservation model, so a
+     * stale PPU/SPU reservation on them is invalidated, and the bytes are
+     * stored as 64-bit atomics (a concurrent lwarx/ldarx never reads a torn
+     * word). The source may be overwritten by the caller as soon as this
+     * returns. */
     [[nodiscard]] PoolError snapshot(std::uint32_t src_ea, std::uint32_t size,
                                      std::uint32_t dst_ea) noexcept;
 

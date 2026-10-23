@@ -12,6 +12,11 @@
  *     deterministic handshake, no sleep used as synchronisation),
  *   - snapshot copies exactly the requested byte count and the source may be
  *     scribbled afterwards (contract S3),
+ *   - snapshot rejects a source or destination outside the runtime's mapped
+ *     guest memory (ppu_vm_size) before forming a pointer, proved on a VM
+ *     followed by an inaccessible page,
+ *   - snapshot stores atomic 64-bit words, so PPU reserved loads (lwarx/ldarx)
+ *     racing it never see a torn word (a data race under TSAN otherwise),
  *   - a corrupt release (foreign/misaligned/double-free) stops by name in a
  *     subprocess with exit 70,
  *   - the A2(b) reservation protocol: a pool write kills a PPU reservation on
@@ -48,6 +53,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <sys/mman.h>
 #endif
 
 /* The host layer's flat guest mapping and the SPU half of the reservation
@@ -57,6 +63,7 @@ static std::atomic<unsigned> g_spu_notifies{0};
 
 extern "C" {
 std::uint8_t* vm_base = nullptr;
+std::uint32_t ppu_vm_size = 0;
 
 void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
@@ -95,8 +102,16 @@ int g_failures;
 struct Fixture {
     std::vector<std::uint8_t> mem;
 
-    Fixture() : mem(kMemSize, 0xCC) { vm_base = mem.data(); }
-    ~Fixture() { vm_base = nullptr; }
+    Fixture() : mem(kMemSize, 0xCC)
+    {
+        vm_base = mem.data();
+        ppu_vm_size = static_cast<std::uint32_t>(kMemSize);
+    }
+    ~Fixture()
+    {
+        vm_base = nullptr;
+        ppu_vm_size = 0;
+    }
     Fixture(const Fixture&) = delete;
     Fixture& operator=(const Fixture&) = delete;
 
@@ -686,13 +701,186 @@ void test_snapshot()
     const AcquireResult again = pool->acquire(2, false);
     CHECK(again.ok());
     /* Overflow and overlap are refused. */
-    CHECK(pool->snapshot(0xFFFFFFFFu, 2, again.ea) == PoolError::inval);
+    CHECK(pool->snapshot(0xFFFFFFFFu, 2, again.ea) == PoolError::address);
     CHECK(pool->snapshot(again.ea, 16, again.ea) == PoolError::inval);
 
     /* Zero bytes is a no-op (the firmware copies descriptorSize bytes). */
     std::memset(fixture.bytes(again.ea), 0x77, 256);
     CHECK(pool->snapshot(kSrcEa, 0, again.ea) == PoolError::none);
     CHECK(fixture.get8(again.ea) == 0x77);
+}
+
+/* A snapshot range outside mapped guest memory is refused before any pointer
+ * is formed. The VM image is copied into a mapping that ends in an
+ * inaccessible page, so an access past kMemSize faults (SIGSEGV fails the
+ * test) rather than passing by luck. */
+#if PS3_POOL_SUBPROCESS
+void test_snapshot_bounds()
+{
+    Fixture fixture;
+    CountingHook hook;
+    std::array<std::uint32_t, kPoolClassCount> counts{};
+    counts[2] = 1;
+    fixture.counts(counts);
+
+    PoolError error = PoolError::inval;
+    const auto pool = make_pool(fixture, hook, counts, error);
+    CHECK(pool != nullptr && error == PoolError::none);
+    if (!pool) return;
+    const AcquireResult slot = pool->acquire(2, false);
+    CHECK(slot.ok());
+
+    const std::size_t page = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+    const std::size_t total = kMemSize + page;
+    void* const map = mmap(nullptr, total, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(map != MAP_FAILED);
+    if (map == MAP_FAILED) return;
+    auto* const guarded = static_cast<std::uint8_t*>(map);
+    std::memcpy(guarded, fixture.mem.data(), kMemSize);
+    CHECK(mprotect(guarded + kMemSize, page, PROT_NONE) == 0);
+    vm_base = guarded;
+    std::memset(guarded + slot.ea, 0xAA, 256);
+
+    /* The error maps to the firmware's INVAL (jq2fw-022). */
+    CHECK(firmware_code(PoolError::address) == kSpursJobErrorInval);
+
+    /* Source ranges that start inside and end past the VM, start at its end,
+     * start far past it, or wrap the 32-bit space: all refused, and the
+     * destination block is left alone. */
+    CHECK(pool->snapshot(static_cast<std::uint32_t>(kMemSize) - 8, 16, slot.ea) ==
+          PoolError::address);
+    CHECK(pool->snapshot(static_cast<std::uint32_t>(kMemSize), 16, slot.ea) ==
+          PoolError::address);
+    CHECK(pool->snapshot(static_cast<std::uint32_t>(kMemSize) + 0x1000, 1, slot.ea) ==
+          PoolError::address);
+    CHECK(pool->snapshot(0xFFFFFFF0u, 0x20, slot.ea) == PoolError::address);
+    for (std::uint32_t i = 0; i < 256; ++i) CHECK(guarded[slot.ea + i] == 0xAA);
+
+    /* The last 16 bytes of the VM are a valid source. */
+    for (std::uint32_t i = 0; i < 16; ++i)
+        guarded[kMemSize - 16 + i] = static_cast<std::uint8_t>(0x30 + i);
+    CHECK(pool->snapshot(static_cast<std::uint32_t>(kMemSize) - 16, 16, slot.ea) ==
+          PoolError::none);
+    for (std::uint32_t i = 0; i < 16; ++i)
+        CHECK(guarded[slot.ea + i] == static_cast<std::uint8_t>(0x30 + i));
+
+    /* A smaller VM puts the destination block out of range: refused before
+     * the copy, though the source is inside. */
+    std::memset(guarded + slot.ea, 0xAA, 256);
+    ppu_vm_size = slot.ea + 8;
+    CHECK(pool->snapshot(0x1000, 16, slot.ea) == PoolError::address);
+    for (std::uint32_t i = 0; i < 256; ++i) CHECK(guarded[slot.ea + i] == 0xAA);
+    /* ... and a host that does not size its VM bounds by the 32-bit space. */
+    ppu_vm_size = 0;
+    CHECK(pool->snapshot(0x1000, 16, slot.ea) == PoolError::none);
+    CHECK(pool->snapshot(0xFFFFFFF0u, 0x20, slot.ea) == PoolError::address);
+
+    vm_base = fixture.mem.data();
+    munmap(map, total);
+}
+#endif
+
+/* ---- Snapshot vs PPU reserved loads -------------------------------------- */
+
+/* lwarx/ldarx read guest words lock-free (reservation.c), so the snapshot must
+ * store whole words atomically: never a torn word, and no data race (TSAN
+ * flags a byte-wise copy against those atomic loads). The block alternates
+ * between two uniform images; a 3-byte tail past a whole word exercises the
+ * merged edge store, whose neighbouring five bytes must stay as they were. */
+void test_snapshot_vs_reserved_loads()
+{
+    Fixture fixture;
+    CountingHook hook;
+    std::array<std::uint32_t, kPoolClassCount> counts{};
+    counts[2] = 1; /* 256 bytes */
+    fixture.counts(counts);
+
+    PoolError error = PoolError::inval;
+    const auto pool = make_pool(fixture, hook, counts, error);
+    CHECK(pool != nullptr && error == PoolError::none);
+    if (!pool) return;
+    const AcquireResult slot = pool->acquire(2, false);
+    CHECK(slot.ok());
+
+    constexpr std::uint32_t kSize = 203; /* 25 whole words + a 3-byte tail */
+    constexpr std::uint32_t kWords = (kSize + 7) / 8;
+    constexpr std::uint8_t kFill = 0xEE;
+    constexpr std::uint8_t kPattern[2] = {0xAA, 0x55};
+    constexpr std::uint32_t kSrcA = kSrcEa;
+    constexpr std::uint32_t kSrcB = kSrcEa + 0x100;
+
+    std::memset(fixture.bytes(slot.ea), kFill, 256);
+    std::memset(fixture.bytes(kSrcA), kPattern[0], kSize);
+    std::memset(fixture.bytes(kSrcB), kPattern[1], kSize);
+
+    /* What the block holds once a pattern is in: pattern bytes up to kSize,
+     * the old fill after. */
+    std::array<std::array<std::uint8_t, kWords * 8>, 2> image{};
+    for (unsigned v = 0; v < 2; ++v)
+        for (std::uint32_t i = 0; i < image[v].size(); ++i)
+            image[v][i] = i < kSize ? kPattern[v] : kFill;
+    const auto be64 = [](const std::uint8_t* p) {
+        std::uint64_t raw;
+        std::memcpy(&raw, p, sizeof raw);
+        return ps3_bswap64(raw);
+    };
+    const auto be32 = [](const std::uint8_t* p) {
+        std::uint32_t raw;
+        std::memcpy(&raw, p, sizeof raw);
+        return ps3_bswap32(raw);
+    };
+
+    CHECK(pool->snapshot(kSrcA, kSize, slot.ea) == PoolError::none);
+
+    std::atomic<bool> stop{false};
+    std::atomic<unsigned> bad{0};
+    std::atomic<unsigned long> reads{0};
+    std::vector<std::thread> readers;
+    readers.emplace_back([&] {
+        ppu_context context{};
+        while (!stop.load(std::memory_order_relaxed)) {
+            for (std::uint32_t k = 0; k < kWords; ++k) {
+                const std::uint64_t got = resv_ldarx64(&context, slot.ea + 8 * k);
+                if (got != be64(image[0].data() + 8 * k) && got != be64(image[1].data() + 8 * k))
+                    bad.fetch_add(1);
+            }
+            reads.fetch_add(kWords, std::memory_order_relaxed);
+        }
+    });
+    readers.emplace_back([&] {
+        ppu_context context{};
+        while (!stop.load(std::memory_order_relaxed)) {
+            for (std::uint32_t k = 0; k < kWords * 2; ++k) {
+                const std::uint32_t got = resv_lwarx32(&context, slot.ea + 4 * k);
+                if (got != be32(image[0].data() + 4 * k) && got != be32(image[1].data() + 4 * k))
+                    bad.fetch_add(1);
+            }
+            reads.fetch_add(kWords * 2, std::memory_order_relaxed);
+        }
+    });
+
+    /* Snapshot until the readers have made real progress alongside the writer;
+     * stop after an even count, so the last copy (an odd index) is the B image. */
+    constexpr unsigned kMinSnapshots = 3000;
+    constexpr unsigned long kMinReads = 40000;
+    constexpr unsigned kMaxSnapshots = 400000;
+    unsigned done = 0;
+    do {
+        CHECK(pool->snapshot((done & 1u) ? kSrcB : kSrcA, kSize, slot.ea) == PoolError::none);
+        ++done;
+    } while ((done < kMinSnapshots || (done & 1u) != 0 ||
+              reads.load(std::memory_order_relaxed) < kMinReads) &&
+             done < kMaxSnapshots);
+    stop.store(true);
+    for (auto& reader : readers) reader.join();
+
+    CHECK(bad.load() == 0);
+    CHECK(reads.load() > 0);
+    /* The last copy (an odd index) was the B image. */
+    for (std::uint32_t i = 0; i < kWords * 8; ++i)
+        CHECK(fixture.get8(slot.ea + i) == image[1][i]);
+    for (std::uint32_t i = kWords * 8; i < 256; ++i) CHECK(fixture.get8(slot.ea + i) == kFill);
 }
 
 /* ---- Reservation protocol ------------------------------------------------ */
@@ -954,6 +1142,10 @@ int main(int argc, char** argv)
     test_exhaustion();
     test_blocking_wakeup();
     test_snapshot();
+#if PS3_POOL_SUBPROCESS
+    test_snapshot_bounds();
+#endif
+    test_snapshot_vs_reserved_loads();
     test_concurrent();
     test_corrupt_release_stops();
     test_reservation_protocol(); /* last: resv_mark_spu is permanent */

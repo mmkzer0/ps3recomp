@@ -32,6 +32,11 @@ extern "C" {
  * test fixture): guest EA -> host address. */
 extern std::uint8_t* vm_base;
 
+/* The guest address-space size (runtime/memory/vm.h): non-zero once the host has
+ * mapped guest memory, 0 for a host that maps the whole 32-bit space and
+ * commits on fault. */
+extern std::uint32_t ppu_vm_size;
+
 /* The SPU side of the reservation model (runtime/spu/spu_coherency.c). */
 void spu_lockline_lock(void);
 void spu_lockline_unlock(void);
@@ -48,6 +53,17 @@ constexpr std::uint32_t kLineBytes = 128;
 {
     return vm_base ? vm_base + static_cast<std::size_t>(ea)
                    : reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(ea));
+}
+
+/* Is [ea, ea+size) inside the guest's mapped memory? The bound is the one the
+ * SPURS job loader applies (runtime/spu/spurs_job.c guest_range_ok): the VM
+ * size when the host sized it, else the 32-bit space. Summed in 64 bits, so a
+ * range near the top of the space cannot wrap to a low address. Checked before
+ * any host pointer is formed from the EA. */
+[[nodiscard]] bool guest_range_ok(std::uint64_t ea, std::uint64_t size) noexcept
+{
+    const std::uint64_t limit = ppu_vm_size != 0 ? ppu_vm_size : 0x100000000ull;
+    return ea <= limit && size <= limit - ea;
 }
 
 /* Plain big-endian field loads at create time (the queue is not published yet,
@@ -168,15 +184,55 @@ void store_be32_locked(std::uint32_t ea, std::uint32_t value) noexcept
     hold.commit();
 }
 
+/* Store bytes into guest memory as relaxed 64-bit atomics, so a concurrent PPU
+ * lwarx/ldarx (runtime/memory/reservation.c reads the word lock-free) never
+ * sees a torn word and the access is race-free (runtime/memory/reservation.h,
+ * "128-byte line copies"). A word the range covers is stored whole; at an
+ * unaligned edge the covered bytes are merged into the word with a
+ * compare-and-swap, so the neighbouring bytes of that word - another
+ * descriptor's, or a PPU's - are never written back stale. The bytes are
+ * copied verbatim: no byte swap, the guest memory is big-endian and so is the
+ * source. */
+void store_bytes_atomic(std::uint32_t dst_ea, const std::uint8_t* src, std::size_t size) noexcept
+{
+    while (size != 0) {
+        const std::uint32_t skip = dst_ea & 7u;
+        const std::size_t chunk = std::min<std::size_t>(size, 8u - skip);
+        std::atomic_ref<std::uint64_t> word(
+            *reinterpret_cast<std::uint64_t*>(guest_bytes(dst_ea - skip)));
+        if (chunk == 8) {
+            std::uint64_t raw;
+            std::memcpy(&raw, src, sizeof raw);
+            word.store(raw, std::memory_order_relaxed);
+        } else {
+            std::uint64_t current = word.load(std::memory_order_relaxed);
+            std::uint64_t merged;
+            do {
+                merged = current;
+                std::memcpy(reinterpret_cast<std::uint8_t*>(&merged) + skip, src, chunk);
+            } while (!word.compare_exchange_weak(current, merged, std::memory_order_relaxed,
+                                                 std::memory_order_relaxed));
+        }
+        dst_ea += static_cast<std::uint32_t>(chunk);
+        src += chunk;
+        size -= chunk;
+    }
+}
+
 /* Copy into guest memory through the destination lines' critical sections.
- * Used for the create-path control areas and the descriptor snapshot. */
+ * Used for the create-path control areas and the descriptor snapshot. A whole
+ * aligned line goes through resv_copy_in (sixteen 64-bit atomics); the rest
+ * through store_bytes_atomic. */
 void copy_to_guest(std::uint32_t dst_ea, const std::uint8_t* src, std::size_t size) noexcept
 {
     while (size != 0) {
         const std::uint32_t offset = dst_ea & (kLineBytes - 1u);
         const std::size_t chunk = std::min<std::size_t>(size, kLineBytes - offset);
         LineHold hold(dst_ea);
-        std::memcpy(guest_bytes(dst_ea), src, chunk);
+        if (chunk == kLineBytes)
+            resv_copy_in(guest_bytes(dst_ea), src);
+        else
+            store_bytes_atomic(dst_ea, src, chunk);
         hold.wrote();
         hold.commit();
         dst_ea += static_cast<std::uint32_t>(chunk);
@@ -194,6 +250,7 @@ std::int32_t firmware_code(PoolError error) noexcept
         return 0;
     case PoolError::again:
         return kSpursJobErrorAgain;
+    case PoolError::address:
     case PoolError::inval:
         return kSpursJobErrorInval;
     case PoolError::align:
@@ -680,12 +737,14 @@ PoolError DescriptorPool::snapshot(std::uint32_t src_ea, std::uint32_t size,
 
     if (size == 0) return PoolError::none;
 
-    /* Fail closed instead of wrapping the guest address space or copying
-     * overlapping regions (the firmware's vector copy is forward). */
+    /* Fail closed instead of reading or writing outside guest memory, wrapping
+     * the address space or copying overlapping regions (the firmware's vector
+     * copy is forward). The range is checked against the runtime's mapped guest
+     * memory before any host pointer is formed. */
+    if (!guest_range_ok(src_ea, size) || !guest_range_ok(dst_ea, size))
+        return PoolError::address;
     const std::uint64_t src_end = static_cast<std::uint64_t>(src_ea) + size;
     const std::uint64_t dst_end = static_cast<std::uint64_t>(dst_ea) + size;
-    if (src_end > 0x100000000ull || dst_end > 0x100000000ull)
-        return PoolError::inval;
     if (src_ea < dst_end && dst_ea < src_end)
         return PoolError::inval;
 
