@@ -457,15 +457,34 @@ total-size limit from `_cellSpursCheckJob`, so `0x3FAC0` is this loader's own
 layout bound, not a firmware figure.
 
 **Input DMA list.** The descriptor's `sizeDmaList` bytes at `+0x30` are 8-byte
-`{size word, EAL}` elements; jm2 stages them into the ioBuffer in 16-byte slots
-before the job enters. The loader validates the whole list before writing any
-of it: every size is 1/2/4/8 or a 16-byte multiple up to 16 KB (the MFC rules
-`spu_dma.h` applies per transfer), every EAL is naturally aligned and inside
-guest memory, the input and cache lists themselves stay inside guest memory
-(summed in 64 bits), and the staged bytes fit `sizeInOrInOut`. A zero-size
-element, a null EA, or an `eaBinary`/`sizeBinary` of zero is a stop too: an
-element is never skipped and no partial ioBuffer is handed to the job. The
-named stop is `spu-job-dma-list`, whose fields name the element (`docs/STOPS.md`).
+`{size word, EAL}` elements. The policy module issues the list as an MFC list GET
+(`jq2e2-018`), so the loader stages each element where `mfc_run_list`
+(`spu_dma.h`) puts it, before the job enters: at the running quadword base of the
+ioBuffer with the low nibble of the local-store address taken from `EAL` (a 1, 2,
+4 or 8-byte transfer sits at its own offset in its quadword), the next element at
+the next quadword boundary after its size. The offset counts toward the
+`sizeInOrInOut` bound. The loader validates the whole descriptor -- binary fields,
+CRT marker, region layout, cache list and input list -- before it writes a byte of
+local store: every size is 1/2/4/8 or a 16-byte multiple up to 16 KB (the MFC
+rules `spu_dma.h` applies per transfer), every EAL is naturally aligned and
+inside guest memory, the input and cache lists themselves stay inside guest
+memory (summed in 64 bits), and the staged bytes fit `sizeInOrInOut`. A
+zero-size element, a null EA, or an `eaBinary`/`sizeBinary` of zero is a stop too:
+an element is never skipped and no partial ioBuffer is handed to the job.
+
+**Stall-and-notify.** Bit 31 of an element's size word (a zero-size marker with it
+set is the wwsjob sentinel) makes the MFC transfer the element, park the rest of
+the list and raise SPU event 2; the list resumes when the notified party writes
+`MFC_WrListStallAck`. At a job start nobody holds that role: the job has not
+entered and the policy module's own handler is not modelled (`jq2e2-018` records
+only the issue). The loader therefore does not run the list through the MFC
+engine -- which would also treat a malformed element as a silent no-op, against a
+live local store, before the list was checked -- and an element with the bit set
+is the named stop `reason=stall-notify`, with or without a transfer. The staging
+layout above is pinned to `mfc_run_list` by `tools/test_spurs_job_crt.py`, which
+runs both over the same lists.
+
+The named stop is `spu-job-dma-list`, whose fields name the element (`docs/STOPS.md`).
 
 **Kernel view.** Both CRTs read the SPURS kernel context with absolute loads;
 with the job at LS 0 those addresses are the job's own bytes, so the loader

@@ -22,6 +22,23 @@ hand-encoded SPU words over a deterministic junk pattern.
                  zero-size element; a size over 16 KB; a size that is not
                  1/2/4/8 or a 16-byte multiple; an unaligned 8-byte EA; a list
                  that leaves guest memory; eaBinary = 0; sizeBinary = 0
+  dma-seam       the local store the loader stages into is observable (the
+                 loader is built with SPURS_JOB_LS_TEST): the check behind the
+                 "no local-store byte written" assertions
+  dma-lsa, dma-lsa-edge, dma-lsa-over
+                 1/2/4/8-byte elements with non-zero EAL low nibbles land at
+                 the MFC's LSA (low nibble from EAL), byte for byte what the
+                 MFC list engine (mfc_run_list) stages; the last short element
+                 may end exactly at sizeInOut, one byte less is io-overrun
+  dma-stall, dma-stall-zero
+                 a stall-and-notify element (bit 31 of the size word), with a
+                 transfer and as a zero-size marker: the MFC engine parks the
+                 list and raises the notify; a job start has no one to
+                 acknowledge it, so the loader stops (spu-job-dma-list,
+                 reason stall-notify)
+  dma-late-bad   a malformed LAST element after a valid list
+  every dma-* stop runs the loader over a shared 0xA5-filled local store and
+  asserts that no byte of it was written before the stop
   ver13 (hash)   the Ver13 local store at entry, whole, equals the hash the
                  loader produced before Ver14 existed (GOLDEN_VER13_LS)
   fit            the last region (a cache buffer) ending exactly at the runtime
@@ -64,7 +81,7 @@ def build(tmp):
     spu = ROOT / "runtime" / "spu"
     cc = os.environ.get("CC", "cc")
     cxx = os.environ.get("CXX", "c++")
-    cflags = ["-std=gnu17", "-O1", "-UNDEBUG",
+    cflags = ["-std=gnu17", "-O1", "-UNDEBUG", "-DSPURS_JOB_LS_TEST",
               "-I" + str(ROOT / "include"), "-I" + str(spu),
               "-I" + str(ROOT / "runtime/platform")]
     cxxflags = ["-std=c++20", "-O1", "-UNDEBUG", "-I" + str(ROOT / "include")]
@@ -117,8 +134,8 @@ def main():
         digest = hashlib.sha256(dump.read_bytes()).hexdigest()
         assert digest == GOLDEN_VER13_LS, (
             f"the Ver13 local store at entry changed: sha256 {digest}")
-        for mode in ("ver14", "fit", "dma-fit", "swap-interp", "swap-lifted",
-                     "swap-idle-interp", "swap-idle-lifted"):
+        for mode in ("ver14", "fit", "dma-fit", "dma-seam", "dma-lsa", "dma-lsa-edge",
+                     "swap-interp", "swap-lifted", "swap-idle-interp", "swap-idle-lifted"):
             passes(mode)
 
         # The input DMA list: a violation is a named stop before any byte is
@@ -126,7 +143,10 @@ def main():
         # the bytes through it, the declared capacity and the reason.
         def dma_stop(mode, index, ea, size, ls, cumulative, capacity, reason,
                      job="0x00010000"):
-            f = g.expect_stop(run(mode), "spu-job-dma-list")
+            p = run(mode)
+            f = g.expect_stop(p, "spu-job-dma-list")
+            assert "FAIL" not in p.stdout, (mode, p.stdout)
+            assert f"LS-UNTOUCHED: {mode}" in p.stdout, (mode, p.stdout)
             want = {"job": job, "image": "7", "index": str(index),
                     "ea": hexs(ea), "size": hexs(size), "ls": f"0x{ls:05X}",
                     "cumulative": hexs(cumulative), "capacity": hexs(capacity),
@@ -149,8 +169,17 @@ def main():
         # 24 bytes is neither 1/2/4/8 nor a 16-byte multiple
         dma_stop("dma-size-align", 0, 0x30000, 0x18, 0x1000, 0x18, 0x80,
                  "size-align")
-        # an 8-byte transfer needs 8-byte alignment
-        dma_stop("dma-misaligned", 0, 0x30004, 8, 0x1000, 8, 0x80, "ea-align")
+        # an 8-byte transfer needs 8-byte alignment (it would sit at nibble 4)
+        dma_stop("dma-misaligned", 0, 0x30004, 8, 0x1004, 0xC, 0x80, "ea-align")
+        # the 8-byte element at EAL nibble 8 takes ioBuffer+0x38..0x40: one
+        # byte past a 0x3F buffer, though its quadword base is well inside
+        dma_stop("dma-lsa-over", 3, 0x30038, 8, 0x1038, 0x40, 0x3F, "io-overrun")
+        # stall-and-notify, with a transfer (size 0x10) and as a zero-size
+        # marker; the size is the low 15 bits of the word
+        dma_stop("dma-stall", 1, 0x30010, 0x10, 0x1010, 0x20, 0x80, "stall-notify")
+        dma_stop("dma-stall-zero", 1, 0x30010, 0, 0x1010, 0x10, 0x80, "stall-notify")
+        # a bad last element, 0x18 after 0x80 + 0x10 bytes: nothing written
+        dma_stop("dma-late-bad", 2, 0x30090, 0x18, 0x1090, 0xA8, 0x100, "size-align")
         # the list itself leaves guest memory before its last element
         dma_stop("dma-desc-range", -1, 0xFFF30, 0x100, 0, 0, 0x80,
                  "descriptor-range", job="0x000FFF00")

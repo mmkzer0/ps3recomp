@@ -41,6 +41,19 @@
  *   stack-max        sizeStack = 0xFFFF: spu-job-memory (region stack)
  *   cache-over       the cache buffer ends one byte past the runtime area: stop
  *   huge-io          sizeIn/Out = 0xFFFFFFFF: spu-job-memory (region io), no wrap
+ *   dma-seam         the loader's local store (a substituted allocation, see below) holds the
+ *                    staged ioBuffer after a run: the check behind every "no LS write" below
+ *   dma-lsa          1/2/4/8/16-byte elements with non-zero EAL low nibbles stage exactly as
+ *                    the MFC list engine (mfc_run_list) stages them
+ *   dma-lsa-edge     the same list, the last short element ending exactly at sizeInOrInOut
+ *   dma-lsa-over     one byte less: the short element's offset counts, spu-job-dma-list
+ *   dma-stall        a stall-and-notify element with a transfer: the MFC engine parks the
+ *                    list, the loader stops (reason stall-notify)
+ *   dma-stall-zero   a zero-size stall marker (the wwsjob sentinel): the same
+ *   dma-late-bad     a malformed LAST element after a valid list: no local-store byte written
+ *
+ * Every dma-* stop mode runs the loader in a forked child over a shared 0xA5-filled local
+ * store and has the parent check the store untouched (stdout "LS-UNTOUCHED"), then exits 70.
  */
 #include "../spu_context.h"
 #include "../spu_dma.h"      /* vm_base */
@@ -52,6 +65,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
@@ -61,6 +77,20 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel);
 void spurs_job_set_spu_num(uint32_t n);
 
 static uint8_t g_mem[1u << 20];
+
+/* The loader's local store comes from here (spurs_job.c is built with
+ * SPURS_JOB_LS_TEST). Armed, it is a store shared with the parent, filled with
+ * a pattern, so a forked loader that stops can be asked what it wrote. */
+#define LS_PATTERN 0xA5
+static uint8_t* g_shared_ls;
+uint8_t* spurs_job_test_ls_alloc(void)
+{
+    return g_shared_ls ? g_shared_ls : (uint8_t*)calloc(1, SPU_LS_SIZE);
+}
+void spurs_job_test_ls_free(uint8_t* ls)
+{
+    if (ls != g_shared_ls) free(ls);
+}
 
 /* ---- layout the loader promises, pinned independently of its macros ------ */
 enum {
@@ -519,15 +549,143 @@ static void mode_stop_cfg(const job_cfg* c)
     g_fail++;
 }
 
-/* A descriptor that must stop before any input byte is staged. */
-static void mode_dma_stop(const uint64_t* elems, uint32_t n, uint32_t io_bytes)
+/* Run the loader in a child over the shared pattern store; return the child's
+ * wait status and how many store bytes differ from the pattern. */
+static int run_forked(uint32_t job_ea, size_t* touched)
+{
+    g_shared_ls = (uint8_t*)mmap(NULL, SPU_LS_SIZE, PROT_READ | PROT_WRITE,
+                                 MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (g_shared_ls == MAP_FAILED) { perror("mmap"); exit(2); }
+    memset(g_shared_ls, LS_PATTERN, SPU_LS_SIZE);
+    fflush(stdout); fflush(stderr);
+    const pid_t pid = fork();
+    if (pid < 0) { perror("fork"); exit(2); }
+    if (pid == 0) {
+        run_built(job_ea, entry_interp);
+        _exit(0);                  /* it ran: the parent decides whether it should have */
+    }
+    int st = 0;
+    if (waitpid(pid, &st, 0) != pid) { perror("waitpid"); exit(2); }
+    *touched = 0;
+    for (uint32_t i = 0; i < SPU_LS_SIZE; i++) *touched += g_shared_ls[i] != LS_PATTERN;
+    return st;
+}
+
+/* A descriptor that must stop before any byte reaches local store. The child
+ * stops (exit 70, its PS3STOP line on stderr); the parent checks the store and
+ * ends with the same code, so the driver reads one stop. */
+static void expect_untouched_stop(uint32_t job_ea, const char* mode)
+{
+    size_t touched;
+    const int st = run_forked(job_ea, &touched);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 70, "the loader exited 0x%X, not with a stop", st);
+    CHECK(touched == 0, "%zu local-store bytes were written before the stop", touched);
+    if (!g_fail) printf("LS-UNTOUCHED: %s\n", mode);
+    fflush(stdout);
+    _exit(g_fail ? 1 : 70);
+}
+
+static void mode_dma_stop(const char* mode, const uint64_t* elems, uint32_t n, uint32_t io_bytes)
 {
     job_cfg c = { "JOBCRT Ver14", 0, PROG_MAIN, 0, 0, 0, io_bytes };
     build_job(&c);
     patch_dma_list(elems, n);
+    expect_untouched_stop(JOB_EA, mode);
+}
+
+/* What the MFC list engine stages for `elems`, in a context of its own: the
+ * list sits in its local store, as a GETL's list does, and mfc_run_list runs it
+ * into dest. */
+enum { REF_LIST_LS = 0x2000, REF_TAG = 3 };
+static spu_context g_ref;
+static void mfc_reference(const uint64_t* elems, uint32_t n, uint32_t dest)
+{
+    spu_context_init(&g_ref, 0);
+    for (uint32_t i = 0; i < n; i++) put64(g_ref.ls + REF_LIST_LS + i * 8u, elems[i]);
+    const int rc = mfc_run_list(&g_ref, REF_LIST_LS, n, dest, 0, MFC_GETL_CMD, REF_TAG);
+    CHECK(rc == 0, "mfc_run_list returned %d", rc);
+}
+
+/* 1/2/4/8-byte elements with EAL low nibbles 5, 6, 0xC and 8, then a quadword:
+ * each takes its own quadword of the ioBuffer and sits at its nibble in it. */
+static uint32_t lsa_list(uint64_t* e)
+{
+    e[0] = dma_elem(1, IO_EA + 0x05);
+    e[1] = dma_elem(2, IO_EA + 0x16);
+    e[2] = dma_elem(4, IO_EA + 0x2C);
+    e[3] = dma_elem(8, IO_EA + 0x38);
+    e[4] = dma_elem(0x10, IO_EA + 0x40);
+    return 5;
+}
+
+/* Staged bytes equal the MFC engine's over the whole ioBuffer, and sit where
+ * the nibbles say, independent of the engine. */
+static void mode_dma_lsa(uint32_t n, uint32_t io_bytes)
+{
+    uint64_t e[5];
+    lsa_list(e);
+    job_cfg c = { "JOBCRT Ver14", 0, PROG_MAIN, 0, 0, 0, io_bytes };
+    build_job(&c);
+    patch_dma_list(e, n);
     run_built(JOB_EA, entry_interp);
-    printf("FAIL: the job ran (%d)\n", g_ran);
-    g_fail++;
+    CHECK(g_ran, "a list of short elements did not run");
+    const uint32_t io = be32(g_start.ls + CTX_LS);
+    CHECK(io == 0x1000, "ioBuffer = 0x%X, want 0x1000", io);
+
+    mfc_reference(e, n, io);
+    CHECK(memcmp(g_start.ls + io, g_ref.ls + io, io_bytes) == 0,
+          "the staged ioBuffer differs from what the MFC list engine stages");
+    static const struct { uint32_t off, size, src; } at[] = {
+        { 0x05, 1, 0x05 }, { 0x16, 2, 0x16 }, { 0x2C, 4, 0x2C }, { 0x38, 8, 0x38 }, { 0x40, 16, 0x40 },
+    };
+    for (uint32_t i = 0; i < n; i++)
+        CHECK(memcmp(g_start.ls + io + at[i].off, g_mem + IO_EA + at[i].src, at[i].size) == 0,
+              "element %u is not at ioBuffer+0x%X", i, at[i].off);
+    CHECK(g_start.ls[io] == 0 && g_start.ls[io + 0x10] == 0,
+          "a short element landed at the quadword base");
+}
+
+static void mode_dma_lsa_over(void)
+{
+    uint64_t e[5];
+    lsa_list(e);
+    /* the 8-byte element at EAL nibble 8 ends at ioBuffer+0x40: one byte past */
+    mode_dma_stop("dma-lsa-over", e, 4, 0x3F);
+}
+
+/* The MFC engine on a list with a stall element: it transfers, parks the rest
+ * and raises the notify. The loader has no one to acknowledge that, so it stops. */
+static void mode_dma_stall(const char* mode, uint32_t stall_word, uint32_t stall_ea, uint32_t io_bytes)
+{
+    const uint64_t e[] = { dma_elem(0x10, IO_EA), dma_elem(stall_word, stall_ea),
+                           dma_elem(0x10, IO_EA + 0x20) };
+    job_cfg c = { "JOBCRT Ver14", 0, PROG_MAIN, 0, 0, 0, io_bytes };
+    build_job(&c);
+    patch_dma_list(e, 3);
+
+    mfc_reference(e, 3, 0x1000);
+    CHECK((g_ref.event_status & 0x2u) != 0, "the MFC engine raised no stall-and-notify event");
+    CHECK(g_ref.list_stall_mask == (1u << REF_TAG), "parked mask 0x%X", g_ref.list_stall_mask);
+    CHECK(g_ref.list_stall_remaining[REF_TAG] == 1, "elements left after the stall: %u",
+          g_ref.list_stall_remaining[REF_TAG]);
+    CHECK(memcmp(g_ref.ls + 0x1000, g_mem + IO_EA, 0x10) == 0, "engine: element before the stall");
+    CHECK(memcmp(g_ref.ls + 0x1020, g_mem + IO_EA + 0x20, 0x10) != 0,
+          "engine: the element after the stall was staged");
+    expect_untouched_stop(JOB_EA, mode);
+}
+
+/* The loader's store is the one the substituted allocation hands out. */
+static void mode_dma_seam(void)
+{
+    job_cfg c = { "JOBCRT Ver14", 0, PROG_MAIN, 0, 0, 0, 0x90 };
+    const uint64_t e[] = { dma_elem(0x80, IO_EA), dma_elem(0x10, IO_EA + 0x80) };
+    build_job(&c);
+    patch_dma_list(e, 2);
+    size_t touched;
+    const int st = run_forked(JOB_EA, &touched);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0, "the job exited 0x%X", st);
+    CHECK(touched >= IMAGE_SIZE + 0x90, "only %zu store bytes were written", touched);
+    CHECK(memcmp(g_shared_ls + 0x1000, g_mem + IO_EA, 0x90) == 0, "ioBuffer in the shared store");
 }
 
 /* The list exactly fills sizeInOut: it must run, both elements in place. */
@@ -550,28 +708,24 @@ static void mode_dma_fit(void)
 
 /* sizeDmaList describes a list that leaves guest memory before its last
  * element: reading it would run past the VM. */
-static void mode_dma_desc_range(void)
+static void mode_dma_desc_range(const char* mode)
 {
     job_cfg c = { "JOBCRT Ver14", 0, PROG_MAIN, 0 };
     c.job_ea = 0xFFF00;
     build_job(&c);
     put16(g_mem + c.job_ea + 0x0A, 0x100);   /* 32 entries: 0xFFF30 + 0x100 > 1 MB */
     put32(g_mem + c.job_ea + 0x24, 0);       /* no cache list to read past it */
-    run_built(c.job_ea, entry_interp);
-    printf("FAIL: the job ran (%d)\n", g_ran);
-    g_fail++;
+    expect_untouched_stop(c.job_ea, mode);
 }
 
 /* eaBinary or sizeBinary zero: there is no binary to run. */
-static void mode_bin_zero(int ea_zero)
+static void mode_bin_zero(const char* mode, int ea_zero)
 {
     job_cfg c = { "JOBCRT Ver14", 0, PROG_MAIN, 0 };
     build_job(&c);
     if (ea_zero) put64(g_mem + JOB_EA, 0);
     else put16(g_mem + JOB_EA + 0x08, 0);
-    run_built(JOB_EA, entry_interp);
-    printf("FAIL: the job ran (%d)\n", g_ran);
-    g_fail++;
+    expect_untouched_stop(JOB_EA, mode);
 }
 
 static void mode_stop(const char* crt, uint32_t bss_qw)
@@ -620,45 +774,57 @@ int main(int argc, char** argv)
         mode_stop_cfg(&c);
     }
     else if (!strcmp(m, "dma-fit")) mode_dma_fit();
+    else if (!strcmp(m, "dma-seam")) mode_dma_seam();
+    else if (!strcmp(m, "dma-lsa")) mode_dma_lsa(5, 0x50);
+    else if (!strcmp(m, "dma-lsa-edge")) mode_dma_lsa(4, 0x40);
+    else if (!strcmp(m, "dma-lsa-over")) mode_dma_lsa_over();
+    else if (!strcmp(m, "dma-stall")) mode_dma_stall(m, 0x80000010u, IO_EA + 0x10, 0x80);
+    else if (!strcmp(m, "dma-stall-zero")) mode_dma_stall(m, 0x80000000u, IO_EA + 0x10, 0x80);
+    else if (!strcmp(m, "dma-late-bad")) {
+        /* the first two elements are fine; the last is not a legal size */
+        const uint64_t e[] = { dma_elem(0x80, IO_EA), dma_elem(0x10, IO_EA + 0x80),
+                               dma_elem(0x18, IO_EA + 0x90) };
+        mode_dma_stop(m, e, 3, 0x100);
+    }
     else if (!strcmp(m, "dma-over")) {
         /* 0x80-byte buffer, first element exactly fills it, second overruns by
          * one byte */
         const uint64_t e[] = { dma_elem(0x80, IO_EA), dma_elem(1, IO_EA + 0x80) };
-        mode_dma_stop(e, 2, 0x80);
+        mode_dma_stop(m, e, 2, 0x80);
     }
     else if (!strcmp(m, "dma-wrap")) {
         /* 32-bit ea + size wraps to 0; only the 64-bit bound sees the overrun */
         ppu_vm_size = 0;
         const uint64_t e[] = { dma_elem(0x20, 0xFFFFFFF0u) };
-        mode_dma_stop(e, 1, 0x80);
+        mode_dma_stop(m, e, 1, 0x80);
     }
     else if (!strcmp(m, "dma-beyond")) {
         const uint64_t e[] = { dma_elem(0x10, 0x200000u) };   /* past the 1 MB VM */
-        mode_dma_stop(e, 1, 0x80);
+        mode_dma_stop(m, e, 1, 0x80);
     }
     else if (!strcmp(m, "dma-zero-ea")) {
         const uint64_t e[] = { dma_elem(0x10, 0) };
-        mode_dma_stop(e, 1, 0x80);
+        mode_dma_stop(m, e, 1, 0x80);
     }
     else if (!strcmp(m, "dma-size-zero")) {
         const uint64_t e[] = { dma_elem(0, IO_EA) };
-        mode_dma_stop(e, 1, 0x80);
+        mode_dma_stop(m, e, 1, 0x80);
     }
     else if (!strcmp(m, "dma-size-limit")) {
         const uint64_t e[] = { dma_elem(0x4001, IO_EA) };   /* one past 16 KB */
-        mode_dma_stop(e, 1, 0x80);
+        mode_dma_stop(m, e, 1, 0x80);
     }
     else if (!strcmp(m, "dma-size-align")) {
         const uint64_t e[] = { dma_elem(0x18, IO_EA) };     /* not a 16-byte multiple */
-        mode_dma_stop(e, 1, 0x80);
+        mode_dma_stop(m, e, 1, 0x80);
     }
     else if (!strcmp(m, "dma-misaligned")) {
         const uint64_t e[] = { dma_elem(8, IO_EA + 4) };
-        mode_dma_stop(e, 1, 0x80);
+        mode_dma_stop(m, e, 1, 0x80);
     }
-    else if (!strcmp(m, "dma-desc-range")) mode_dma_desc_range();
-    else if (!strcmp(m, "bin-ea-zero")) mode_bin_zero(1);
-    else if (!strcmp(m, "bin-size-zero")) mode_bin_zero(0);
+    else if (!strcmp(m, "dma-desc-range")) mode_dma_desc_range(m);
+    else if (!strcmp(m, "bin-ea-zero")) mode_bin_zero(m, 1);
+    else if (!strcmp(m, "bin-size-zero")) mode_bin_zero(m, 0);
     else { fprintf(stderr, "unknown mode %s\n", m); return 2; }
 
     if (g_fail) return 1;

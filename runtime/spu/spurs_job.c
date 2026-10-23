@@ -52,6 +52,19 @@
 #include "ps3emu/log_first.h"
 #include "ps3emu/stop.h"
 
+/* The job's local store comes from these two. A test builds this file with
+ * SPURS_JOB_LS_TEST and supplies the functions, to see what is written to the
+ * store and when (tools/test_spurs_job_crt.py). */
+#ifdef SPURS_JOB_LS_TEST
+extern uint8_t* spurs_job_test_ls_alloc(void);
+extern void spurs_job_test_ls_free(uint8_t* ls);
+#define SPURS_JOB_LS_ALLOC()  spurs_job_test_ls_alloc()
+#define SPURS_JOB_LS_FREE(p)  spurs_job_test_ls_free(p)
+#else
+#define SPURS_JOB_LS_ALLOC()  ((uint8_t*)calloc(1, SPU_LS_SIZE))
+#define SPURS_JOB_LS_FREE(p)  free(p)
+#endif
+
 extern uint8_t* vm_base;
 extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
 /* The guest VM's size: 0 means "not sized" (a host that maps the whole 32-bit
@@ -70,9 +83,37 @@ static uint16_t g16(uint32_t ea)
     const uint8_t* p = vm_base + ea;
     return (uint16_t)(((uint32_t)p[0] << 8) | (uint32_t)p[1]);
 }
-static uint64_t g64(uint32_t ea)
+
+/* The job descriptor as the loader reads it: guest memory at `ea` (the job
+ * manager that walks a chain reads it where the title left it), or `snap`, the
+ * bytes captured when a job queue admitted the job. A snapshot is the job's
+ * own copy: a store to the guest descriptor after admission does not reach it,
+ * and a read past its end is 0. */
+typedef struct desc_view {
+    const uint8_t* snap;     /* NULL: read guest memory */
+    uint32_t       n;        /* snapshot bytes */
+    uint32_t       ea;
+} desc_view;
+
+static int dv_has(const desc_view* d, uint32_t off, uint32_t len)
 {
-    return ((uint64_t)g32(ea) << 32) | (uint64_t)g32(ea + 4);
+    return (uint64_t)off + len <= d->n;
+}
+static uint16_t dv16(const desc_view* d, uint32_t off)
+{
+    if (!d->snap) return g16(d->ea + off);
+    return dv_has(d, off, 2) ? (uint16_t)(((uint32_t)d->snap[off] << 8) | d->snap[off + 1]) : 0;
+}
+static uint32_t dv32(const desc_view* d, uint32_t off)
+{
+    if (!d->snap) return g32(d->ea + off);
+    if (!dv_has(d, off, 4)) return 0;
+    const uint8_t* p = d->snap + off;
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+static uint64_t dv64(const desc_view* d, uint32_t off)
+{
+    return ((uint64_t)dv32(d, off) << 32) | (uint64_t)dv32(d, off + 4);
 }
 
 /* Is [ea, ea+size) inside the guest's VM? Summed in 64 bits, so an EA near the
@@ -286,6 +327,14 @@ typedef struct job_dma {
     uint32_t capacity;         /* sizeInOrInOut, the ioBuffer's declared size */
 } job_dma;
 
+/* One validated copy from guest memory into local store: where it lands, where
+ * it comes from and how many bytes. The loader reads and checks the whole
+ * descriptor first and only then stages these, so a descriptor changing in
+ * guest memory between the two cannot turn a checked copy into another one. */
+typedef struct job_xfer {
+    uint32_t ls, ea, size;
+} job_xfer;
+
 /* index is the list element, -1 when the failure is not an element (the
  * descriptor names no binary, or the list itself leaves guest memory). ls is
  * where the element would start, cumulative the bytes through it. */
@@ -312,34 +361,45 @@ PS3_NORETURN static void job_dma_stop(const job_dma* d, long long index,
              "a SPURS job descriptor names no binary, or carries an input DMA "
              "list that cannot be staged into its ioBuffer",
              "eaBinary and sizeBinary must be non-zero. The list at descriptor+0x30 "
-             "is sizeDmaList bytes of 8-byte {size word, EAL} elements: each size is "
-             "1/2/4/8 or a 16-byte multiple up to 16 KB, each EAL is naturally "
-             "aligned and inside guest memory, and the staged bytes fit "
-             "sizeInOrInOut. Check that the job descriptor is intact.",
+             "is sizeDmaList bytes of 8-byte {size word, EAL} elements, issued as an "
+             "MFC list GET: each size is 1/2/4/8 or a 16-byte multiple up to 16 KB, "
+             "each EAL is naturally aligned and inside guest memory, a transfer below "
+             "16 bytes lands at the local-store offset EAL & 15 within its quadword, "
+             "and the staged bytes fit sizeInOrInOut. The stall-and-notify bit "
+             "(bit 31 of the size word) is not modelled: it needs a job manager to "
+             "acknowledge the stall, which a job start does not have. Check that the "
+             "job descriptor is intact.",
              f, sizeof f / sizeof f[0], NULL);
 }
 
-int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
-                      uint32_t job_ea, uint32_t job_desc_size)
+/* The loader. `snap` NULL reads the descriptor from guest memory at job_ea;
+ * otherwise from the snap_size bytes at `snap`, with job_ea still the EA the job
+ * sees as its eaJobDescriptor. `retain_ls` keeps the finished local store for
+ * spurs_job_ls_for_handle (a chain job); a queue's job has no chain handle and
+ * keeps no shared state, so two of them can run on two threads at once. */
+static int run_spurs_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_ea,
+                         const uint8_t* snap, uint32_t snap_size,
+                         uint32_t job_desc_size, int retain_ls, const spu_job_hooks* hooks)
 {
     if (!entry || !job_ea) return -1;
+    const desc_view dv = { snap, snap_size, job_ea };
 
     /* ---- descriptor ---------------------------------------------------- */
     /* eaBinary is a be u64: the low word is the guest EA (bit 0 = CACHE_INHIBIT),
      * the high word is, for an ELF job, the bss the crt zeroes itself, in
      * quadwords (jq2e2-027). Truncating it to the EA loses the bss and lays the
      * stack and buffers over it. */
-    uint64_t ea_bin64 = g64(job_ea + JH_EA_BINARY);
+    uint64_t ea_bin64 = dv64(&dv, JH_EA_BINARY);
     uint32_t ea_bin   = (uint32_t)(ea_bin64 & ~1ull);
     uint64_t bss      = (ea_bin64 >> 32) << 4;
-    uint32_t size_bin = (uint32_t)g16(job_ea + JH_SIZE_BINARY) << 4;
-    uint32_t n_dma    = (uint32_t)g16(job_ea + JH_SIZE_DMA_LIST) / 8u;
-    uint32_t use_io   = g32(job_ea + JH_USE_INOUT_BUFFER);
-    uint32_t size_io  = g32(job_ea + JH_SIZE_IN_OR_INOUT);
-    uint32_t size_out = g32(job_ea + JH_SIZE_OUT);
-    uint32_t size_stk = (uint32_t)g16(job_ea + JH_SIZE_STACK) << 4;
-    uint32_t size_scr = (uint32_t)g16(job_ea + JH_SIZE_SCRATCH) << 4;
-    uint32_t n_cache  = g32(job_ea + JH_SIZE_CACHE_DMA_LIST) / 8u;
+    uint32_t size_bin = (uint32_t)dv16(&dv, JH_SIZE_BINARY) << 4;
+    uint32_t n_dma    = (uint32_t)dv16(&dv, JH_SIZE_DMA_LIST) / 8u;
+    uint32_t use_io   = dv32(&dv, JH_USE_INOUT_BUFFER);
+    uint32_t size_io  = dv32(&dv, JH_SIZE_IN_OR_INOUT);
+    uint32_t size_out = dv32(&dv, JH_SIZE_OUT);
+    uint32_t size_stk = (uint32_t)dv16(&dv, JH_SIZE_STACK) << 4;
+    uint32_t size_scr = (uint32_t)dv16(&dv, JH_SIZE_SCRATCH) << 4;
+    uint32_t n_cache  = dv32(&dv, JH_SIZE_CACHE_DMA_LIST) / 8u;
 
     if (n_cache > 4) n_cache = 4;                    /* jm2 caps at 4 */
     if (!size_stk) size_stk = JOB_STACK_DEFAULT;
@@ -368,25 +428,28 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     if ((uint64_t)size_bin + bss > JOB_RT_LS)
         job_memory_stop(&jm, "image", (uint64_t)size_bin + bss);
 
-    uint8_t* ls = (uint8_t*)calloc(1, SPU_LS_SIZE);
-    if (!ls) return -1;
-
-    /* ---- binary at LS 0 (PIC, so delta 0 keeps the lifted addresses) ---- */
-    memcpy(ls, vm_base + ea_bin, size_bin);
-
     /* ---- CRT gate ---------------------------------------------------------
-     * Only the two CRTs below are modelled (jm interface, kernel view). The PM
+     * The binary lands at LS 0 further down, once the whole descriptor has been
+     * validated; the marker is read from the bytes that will be there (zero
+     * past the image, as the store is). */
+    uint8_t marker[JOB_CRT_MARKER_LEN];
+    for (uint32_t i = 0; i < JOB_CRT_MARKER_LEN; i++) {
+        const uint32_t o = JOB_CRT_MARKER_LS + i;
+        marker[i] = o < size_bin ? vm_base[(uint64_t)ea_bin + o] : 0;
+    }
+
+    /* Only the two CRTs below are modelled (jm interface, kernel view). The PM
      * accepts any "JOBCRT Ver" suffix, so a job from another SDK drop gets
      * here and would run on a context it was not built for. */
     unsigned crt = 0;
-    if (!memcmp(ls + JOB_CRT_MARKER_LS, "JOBCRT Ver13", JOB_CRT_MARKER_LEN)) crt = 13;
-    else if (!memcmp(ls + JOB_CRT_MARKER_LS, "JOBCRT Ver14", JOB_CRT_MARKER_LEN)) crt = 14;
+    if (!memcmp(marker, "JOBCRT Ver13", JOB_CRT_MARKER_LEN)) crt = 13;
+    else if (!memcmp(marker, "JOBCRT Ver14", JOB_CRT_MARKER_LEN)) crt = 14;
     if (!crt) {
         char job_s[16], img_s[16], text_s[JOB_CRT_MARKER_LEN + 1], hex_s[2 * JOB_CRT_MARKER_LEN + 1];
         snprintf(job_s, sizeof job_s, "0x%08X", job_ea);
         snprintf(img_s, sizeof img_s, "%d", image_id);
         for (unsigned i = 0; i < JOB_CRT_MARKER_LEN; i++) {
-            const uint8_t b = ls[JOB_CRT_MARKER_LS + i];
+            const uint8_t b = marker[i];
             text_s[i] = (b >= 0x20 && b < 0x7F) ? (char)b : '?';
             snprintf(hex_s + 2 * i, 3, "%02X", b);
         }
@@ -434,18 +497,20 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     uint32_t stack_top = s_ls + ss_size;
     p += ss_size;
 
-    /* ---- cache-hinted read-only inputs ---------------------------------- */
+    /* ---- cache-hinted read-only inputs: placed and checked here, staged below */
     const uint64_t dma_base   = (uint64_t)job_ea + JH_SIZE;      /* input list ... */
-    const uint64_t cache_base = dma_base + (uint64_t)n_dma * 8u; /* ... then cache list */
+    /* ... then the cache list, at JH_SIZE + n_dma * 8 in the descriptor. */
     /* Both lists are descriptor bytes. Reading them must stay inside guest
      * memory: the extent is summed in 64 bits, so a sizeDmaList at the u16 cap
      * next to a high descriptor EA cannot wrap into a low address. */
-    if (!guest_range_ok(dma_base, ((uint64_t)n_dma + n_cache) * 8u))
+    if (snap ? (uint64_t)JH_SIZE + ((uint64_t)n_dma + n_cache) * 8u > snap_size
+             : !guest_range_ok(dma_base, ((uint64_t)n_dma + n_cache) * 8u))
         job_dma_stop(&jd, -1, dma_base, ((uint64_t)n_dma + n_cache) * 8u,
                      0, 0, "descriptor-range");
     uint32_t cache_ls[4] = { 0, 0, 0, 0 };
+    job_xfer cache_x[4]  = { { 0, 0, 0 }, { 0, 0, 0 }, { 0, 0, 0 }, { 0, 0, 0 } };
     for (uint32_t i = 0; i < n_cache; i++) {
-        uint64_t e   = g64((uint32_t)(cache_base + (uint64_t)i * 8u));
+        uint64_t e   = dv64(&dv, (uint32_t)(JH_SIZE + (uint64_t)n_dma * 8u + (uint64_t)i * 8u));
         uint32_t sz  = (uint32_t)(e >> 32);
         uint32_t eal = (uint32_t)e;
         if (!sz || !eal) continue;
@@ -453,36 +518,60 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
         if (p + sz > JOB_RT_LS)
             job_memory_stop(&jm, "cache", p + sz);
         cache_ls[i] = (uint32_t)p;
-        memcpy(ls + p, vm_base + eal, sz);
+        cache_x[i].ls = (uint32_t)p; cache_x[i].ea = eal; cache_x[i].size = sz;
         p += ALIGN1024((uint64_t)sz);
     }
 
     /* ---- input DMA list -> ioBuffer, each entry 16-byte aligned ----------
-     * Every element is validated before the first byte lands in local store.
-     * A violation must stop, not skip the element (the job would run on a
-     * buffer the console never assembled), and must not leave the elements
-     * before it staged (a partial ioBuffer is just as wrong). The rules are
-     * the MFC's, as spu_dma.h applies them per transfer: a 15-bit size, at
-     * most 16 KB, a 16-byte multiple and a 16-byte aligned pair from 16 bytes
-     * up, natural 1/2/4/8 alignment below. */
+     * The PM issues this list as an MFC list GET (jq2e2-018), so an element
+     * lands where spu_dma.h's mfc_run_list puts it: at the running quadword
+     * base, its LSA low nibble taken from EAL (a 1/2/4/8-byte transfer sits at
+     * its own offset in the quadword), the next element at the next quadword
+     * boundary after its size. Every element is validated before the first
+     * byte lands in local store, binary and cache included. A violation must
+     * stop, not skip the element (the job would run on a buffer the console
+     * never assembled), and must not leave the elements before it staged (a
+     * partial ioBuffer is just as wrong). The rules are the MFC's, as
+     * spu_dma.h applies them per transfer: a 15-bit size, at most 16 KB, a
+     * 16-byte multiple and a 16-byte aligned pair from 16 bytes up, natural
+     * 1/2/4/8 alignment below.
+     *
+     * Bit 31 of the size word is stall-and-notify: the MFC transfers the
+     * element, parks the rest of the list and raises SPU event 2, and the
+     * list resumes when the notified party writes MFC_WrListStallAck. At a job
+     * start there is no such party: the job has not entered, so the notify
+     * would reach no one and the tail of the list would never be staged (or,
+     * delivered to the job that did not issue the list, would corrupt its
+     * event state). The PM's own handler for it is not in the evidence
+     * (jq2e2-018 records the issue only). So the flag is a named stop, whether
+     * or not the element also carries a transfer. The engine cannot stage the
+     * list instead: it treats a malformed element as a silent no-op and runs
+     * against a live context's local store, which would mean writing before
+     * the whole list was checked. */
     uint64_t io_cursor = 0;                          /* bytes from io_ls */
+    job_xfer* io_x = n_dma ? (job_xfer*)malloc((size_t)n_dma * sizeof *io_x) : NULL;
+    if (n_dma && !io_x) return -1;
     for (uint32_t i = 0; i < n_dma; i++) {
-        const uint64_t e     = g64((uint32_t)(dma_base + (uint64_t)i * 8u));
+        const uint64_t e     = dv64(&dv, (uint32_t)(JH_SIZE + (uint64_t)i * 8u));
         const uint64_t size  = (e >> 32) & 0x7FFFu;
+        const int      stall = (int)((e >> 63) & 1u);
         const uint32_t eal   = (uint32_t)e;
-        const uint64_t el_ls = (uint64_t)io_ls + io_cursor;
-        const uint64_t end   = io_cursor + size;     /* 64-bit: no wrap */
+        const uint32_t lane  = eal & 15u;            /* the MFC's LSA low nibble */
+        const uint64_t el_ls = (uint64_t)io_ls + io_cursor + lane;
+        const uint64_t end   = io_cursor + lane + size;   /* 64-bit: no wrap */
         const char* why = NULL;
-        if (!size)
+        if (stall)
+            why = "stall-notify";
+        else if (!size)
             why = "size-zero";
         else if (size > MFC_MAX_DMA_SIZE)
             why = "size-limit";
         else if (size >= 16u) {
             if (size & 15u) why = "size-align";
-            else if (((uint32_t)el_ls ^ eal) & 15u) why = "ea-align";
+            else if (lane) why = "ea-align";
         } else {
             if (size != 1 && size != 2 && size != 4 && size != 8) why = "size-align";
-            else if (((uint32_t)el_ls ^ eal) & (uint32_t)(size - 1u)) why = "ea-align";
+            else if (eal & (uint32_t)(size - 1u)) why = "ea-align";
         }
         if (!why && !eal)
             why = "ea-null";
@@ -492,18 +581,24 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
             why = "io-overrun";
         if (why)
             job_dma_stop(&jd, (long long)i, eal, size, el_ls, end, why);
+        io_x[i].ls   = (uint32_t)el_ls;
+        io_x[i].ea   = eal;
+        io_x[i].size = (uint32_t)size;
         io_cursor += (size + 15u) & ~15ull;
     }
+    const uint32_t io_used = (uint32_t)io_cursor;
 
-    uint32_t io_cur = io_ls, io_used = 0;
-    for (uint32_t i = 0; i < n_dma; i++) {
-        const uint64_t e    = g64((uint32_t)(dma_base + (uint64_t)i * 8u));
-        const uint32_t sz   = (uint32_t)((e >> 32) & 0x7FFFu);
-        const uint32_t eal  = (uint32_t)e;
-        memcpy(ls + io_cur, vm_base + eal, sz);
-        io_cur  += (sz + 15u) & ~15u;
-        io_used += (sz + 15u) & ~15u;
-    }
+    /* ---- the descriptor is valid: stage binary, cache, input list -------- */
+    uint8_t* ls = SPURS_JOB_LS_ALLOC();
+    if (!ls) { free(io_x); return -1; }
+
+    /* binary at LS 0 (PIC, so delta 0 keeps the lifted addresses) */
+    memcpy(ls, vm_base + ea_bin, size_bin);
+    for (uint32_t i = 0; i < n_cache; i++)
+        if (cache_x[i].size) memcpy(ls + cache_x[i].ls, vm_base + cache_x[i].ea, cache_x[i].size);
+    for (uint32_t i = 0; i < n_dma; i++)
+        memcpy(ls + io_x[i].ls, vm_base + io_x[i].ea, io_x[i].size);
+    free(io_x);
 
     /* ---- context + descriptor, parked above the job's memory region ------
      * jm2 keeps these in its own bss (outside job memory); we load the job at
@@ -515,7 +610,10 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     /* Every region, the stack included, ended at or below JOB_RT_LS (checked
      * above), so the descriptor, context and jm interface below land on free
      * local store. */
-    memcpy(ls + desc_ls, vm_base + job_ea, dsz);
+    if (snap)
+        memcpy(ls + desc_ls, snap, dsz < snap_size ? dsz : snap_size);
+    else
+        memcpy(ls + desc_ls, vm_base + job_ea, dsz);
 
     ls32(ls, ctx_ls + JC_IO_BUFFER, io_ls);
     for (int i = 0; i < 4; i++)
@@ -554,7 +652,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     ls32(ls, ctx_ls + JC_EA_JOB_DESCRIPTOR,     0);
     ls32(ls, ctx_ls + JC_EA_JOB_DESCRIPTOR + 4, job_ea);
 
-    { static int _n = 0;
+    { static SPURS_JOB_TLS int _n = 0;
       if (PS3_LOG_FIRST(_n, 4))
           fprintf(stderr,
               "[spurs-job] job 0x%08X: bin 0x%08X+%u -> LS 0 | io=0x%05X(%u, %u dma, %u used)"
@@ -567,12 +665,12 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     /* SPURS_JOB_DESCDUMP=1: hexdump the guest job descriptor. The SPU derives
      * its DMA and atomic EAs from these words, so when a job spins on a
      * lock-line address that is not backed, this is what to read first. */
-    { static int _d = 0;
+    { static SPURS_JOB_TLS int _d = 0;
       if (getenv("SPURS_JOB_DESCDUMP") && PS3_LOG_FIRST(_d, 4)) {
           fprintf(stderr, "[spurs-job] desc @0x%08X (%u bytes):", job_ea, dsz);
           for (uint32_t o = 0; o < dsz && o < 128; o += 4) {
               if ((o & 31) == 0) fprintf(stderr, "\n    +%02X:", o);
-              fprintf(stderr, " %08X", g32(job_ea + o));
+              fprintf(stderr, " %08X", dv32(&dv, o));
           }
           fprintf(stderr, "\n");
           /* SPURS_JOB_DESCDUMP=2: follow plausible guest EAs in the job user
@@ -581,7 +679,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
            * originates in one of these blocks. */
           if (atoi(getenv("SPURS_JOB_DESCDUMP")) >= 2) {
               for (uint32_t o = JH_SIZE; o < dsz && o < 128; o += 4) {
-                  uint32_t v = g32(job_ea + o);
+                  uint32_t v = dv32(&dv, o);
                   if (v < 0x10000u || v >= 0xD0000000u) continue;
                   fprintf(stderr, "[spurs-job]   user+0x%02X -> 0x%08X:", o, v);
                   for (uint32_t q = 0; q < 8; q++)
@@ -599,13 +697,13 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
      * the user data + that command block so the bail path is attributable. */
     uint32_t dump_cmd = 0;
     if (getenv("SPURS_JOB_DUMP")) {
-        uint64_t ud  = g64(job_ea + JH_SIZE);        /* desc+0x30 */
+        uint64_t ud  = dv64(&dv, JH_SIZE);           /* desc+0x30 */
         uint32_t cmd = (uint32_t)ud;                 /* low word = EA */
         fprintf(stderr, "[spurs-job] job 0x%08X userdata: %016llX %016llX %016llX %016llX\n",
                 job_ea, (unsigned long long)ud,
-                (unsigned long long)g64(job_ea + JH_SIZE + 8),
-                (unsigned long long)g64(job_ea + JH_SIZE + 16),
-                (unsigned long long)g64(job_ea + JH_SIZE + 24));
+                (unsigned long long)dv64(&dv, JH_SIZE + 8),
+                (unsigned long long)dv64(&dv, JH_SIZE + 16),
+                (unsigned long long)dv64(&dv, JH_SIZE + 24));
         if (cmd && cmd < 0x50000000u) {
             dump_cmd = cmd;
             fprintf(stderr, "[spurs-job]   cmdblock @0x%08X:", cmd);
@@ -653,7 +751,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     ctx.gpr[3]._u32[0] = ctx_ls;                     /* CellSpursJobContext2* */
     ctx.gpr[4]._u32[0] = desc_ls;                    /* CellSpursJob256*      */
 
-    { static int _n = 0;
+    { static SPURS_JOB_TLS int _n = 0;
       if (PS3_LOG_FIRST(_n, 4))
           fprintf(stderr, "[spurs-job] ENTER r3=%08X r4=%08X r1=%08X entry-fn image=%d\n",
                   ctx.gpr[3]._u32[0], ctx.gpr[4]._u32[0], ctx.gpr[1]._u32[0],
@@ -664,7 +762,16 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
      * and trips its parameter guard, which HALTS -- ending the run. So the
      * HALT-ASSERT heqi 0x1650 seen once per jm2 job is NORMAL COMPLETION
      * noise, not a failure: the job's real work finished before the jump. */
+    if (hooks && hooks->start) {
+        /* What the loader laid out, handed over rather than recomputed. r1 is
+         * the stack the job enters with. */
+        const spu_job_layout layout = {
+            ea_bin, 0, size_bin, (uint32_t)bss, desc_ls, dsz, io_ls, size_io, out_ls, size_out,
+            s_ls, size_scr, size_stk, ctx.gpr[1]._u32[0], ctx_ls };
+        hooks->start(hooks->user, &ctx, &layout);
+    }
     spu_run_with_halt(entry, &ctx);
+    if (hooks && hooks->end) hooks->end(hooks->user, &ctx);
 
     /* The only way into the trap quadword is a call through jm word 0. Both
      * paths end the run there: the interpreter stops at the `stop`, and the
@@ -691,13 +798,17 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
      * comment here claimed they carried the title's bus counts; they do not,
      * and feeding them into the completion event turned 0x40000000 into a 1 GB
      * allocation request. Kept because the printf service needs them. */
-    memcpy(s_job_ls, ctx.ls, SPU_LS_SIZE);   /* keep the store readable */
+    if (retain_ls) {
+        memcpy(s_job_ls, ctx.ls, SPU_LS_SIZE);   /* keep the store readable */
+        s_job_ls_valid = 1;
+    }
     /* TEMP SPURS_JOB_LSWORD=<img>:<lsa>: after a job of that image, print the
      * LS word at lsa and every other LS offset holding the same value. */
-    { static int img = -2; static uint32_t lsa; static int n = 0;
-      if (img == -2) { const char* e = getenv("SPURS_JOB_LSWORD"); img = -1;
-          if (e) { img = atoi(e); const char* c = strchr(e, ':'); lsa = c ? (uint32_t)strtoul(c + 1, 0, 16) : 0; } }
-      if (img == image_id && n++ < 3) {
+    { const char* e = getenv("SPURS_JOB_LSWORD");
+      static SPURS_JOB_TLS int n = 0;
+      const char* c = e ? strchr(e, ':') : 0;
+      const uint32_t lsa = c ? (uint32_t)strtoul(c + 1, 0, 16) : 0;
+      if (e && atoi(e) == image_id && PS3_LOG_FIRST(n, 3)) {
           const uint8_t* q = ctx.ls + (lsa & 0x3FFFC);
           uint32_t v = ((uint32_t)q[0] << 24) | ((uint32_t)q[1] << 16) | ((uint32_t)q[2] << 8) | q[3];
           fprintf(stderr, "[lsword] img=%d job=0x%08X LS[0x%05X]=0x%08X io=0x%05X also at:", image_id, job_ea, lsa, v, io_ls);
@@ -708,17 +819,16 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
           }
           fprintf(stderr, "\n");
       } }
-    s_job_ls_valid = 1;
 
     g_spurs_job_mbox      = spu_channel_has_data(&ctx.ch_out_mbox)
                           ? ctx.ch_out_mbox.value : 0;
     g_spurs_job_mbox_intr = spu_channel_has_data(&ctx.ch_out_intr_mbox)
                           ? ctx.ch_out_intr_mbox.value : 0;
     g_spurs_job_mbox_valid = g_spurs_job_mbox || g_spurs_job_mbox_intr;
-    { uint32_t _cb = g32(job_ea + 0x4C);
+    { uint32_t _cb = dv32(&dv, 0x4C);
       g_spurs_job_cmd = _cb ? (g32(_cb) >> 16) : 0; }
-    { static int s_t = -1; if (s_t < 0) s_t = getenv("SPURS_JOB_MBOX") ? 1 : 0;
-      static int n = 0;
+    { const int s_t = getenv("SPURS_JOB_MBOX") ? 1 : 0;
+      static SPURS_JOB_TLS int n = 0;
       if (s_t && PS3_LOG_FIRST(n, 16) && g_spurs_job_mbox_valid)
           fprintf(stderr, "[spurs-job] job 0x%08X posted mbox=0x%08X intr=0x%08X\n",
                   job_ea, g_spurs_job_mbox, g_spurs_job_mbox_intr); }
@@ -743,6 +853,26 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
     spu_mfc_release(&ctx);
     spu_coh_unregister(&ctx);   /* stack local: out of the reserver set */
     { extern void spu_mfc_release(spu_context*); spu_mfc_release(&ctx); }
-    free(ls);
+    SPURS_JOB_LS_FREE(ls);
     return 0;
+}
+
+int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
+                      uint32_t job_ea, uint32_t job_desc_size)
+{
+    return run_spurs_job(entry, image_id, job_ea, NULL, 0, job_desc_size, 1, NULL);
+}
+
+int spu_run_spurs_job_snapshot(spu_lifted_entry_fn entry, int image_id, uint32_t job_ea,
+                               const uint8_t* desc, uint32_t desc_size)
+{
+    if (!desc || !desc_size) return -1;
+    return run_spurs_job(entry, image_id, job_ea, desc, desc_size, desc_size, 0, NULL);
+}
+
+int spu_run_spurs_job_hooked(spu_lifted_entry_fn entry, int image_id, uint32_t job_ea,
+                             const uint8_t* desc, uint32_t desc_size, const spu_job_hooks* hooks)
+{
+    if (!desc || !desc_size) return -1;
+    return run_spurs_job(entry, image_id, job_ea, desc, desc_size, desc_size, 0, hooks);
 }

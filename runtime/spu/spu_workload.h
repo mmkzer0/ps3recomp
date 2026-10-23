@@ -91,6 +91,47 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
 int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
                       uint32_t job_ea, uint32_t job_desc_size);
 
+/* The same, for a job a queue has admitted. `desc`, desc_size bytes (<= 1 KB),
+ * is the descriptor as it was when the job was admitted: every field the loader
+ * reads (header, DMA and cache lists, user words) and the copy placed in local
+ * store come from it, never from guest memory, so a store to the guest
+ * descriptor after admission does not reach the job. `job_ea` is still the EA
+ * the job sees as its eaJobDescriptor. Reads past desc_size are 0. The finished
+ * local store is not retained for spurs_job_ls_for_handle, so jobs may run on
+ * several threads at once. Same return as spu_run_spurs_job. */
+int spu_run_spurs_job_snapshot(spu_lifted_entry_fn entry, int image_id, uint32_t job_ea,
+                               const uint8_t* desc, uint32_t desc_size);
+
+/* What spu_run_spurs_job_hooked tells a job observer about the local store it
+ * laid out, all in bytes and LS offsets: the image from LS 0 (`image_bytes` the
+ * descriptor's sizeBinary, `bss_bytes` the eaBinary high word x 16), the
+ * descriptor copy, the ioBuffer and oBuffer (sizeInOrInOut / sizeOut), the
+ * scratch and stack block, and the CellSpursJobContext2. `r1` is the stack
+ * pointer the job is entered with. `image_ea` is the guest EA of the image. */
+typedef struct spu_job_layout {
+    uint32_t image_ea, image_ls, image_bytes, bss_bytes;
+    uint32_t desc_ls, desc_bytes;
+    uint32_t io_ls, io_bytes;
+    uint32_t out_ls, out_bytes;
+    uint32_t scratch_ls, scratch_bytes, stack_bytes;
+    uint32_t r1;
+    uint32_t ctx_ls;
+} spu_job_layout;
+
+/* Called on the running thread with the job's spu_context: `start` after the
+ * job is staged and before its first instruction (the place to install an
+ * spu_observe observer on `ctx`), `end` once the entry returned. Either may be
+ * NULL. A job that ends in a named stop never reaches `end`. */
+typedef struct spu_job_hooks {
+    void* user;
+    void (*start)(void* user, spu_context* ctx, const spu_job_layout* layout);
+    void (*end)(void* user, spu_context* ctx);
+} spu_job_hooks;
+
+/* spu_run_spurs_job_snapshot with job hooks (NULL: none, the same call). */
+int spu_run_spurs_job_hooked(spu_lifted_entry_fn entry, int image_id, uint32_t job_ea,
+                             const uint8_t* desc, uint32_t desc_size, const spu_job_hooks* hooks);
+
 /* Fingerprint `image`, look up its lifted entry, and run it as a SPURS jobchain
  * job via spu_run_spurs_job. Runs SYNCHRONOUSLY on the caller's thread: a job
  * is not persistent (it runs to completion and returns to the manager), and a
