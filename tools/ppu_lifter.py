@@ -823,6 +823,9 @@ class LiftedFunction:
     # [first, last] guest addresses of each run of in-range instructions that no
     # path from the function's entry reaches (see _lifted_reachable); not lowered.
     dead: list = field(default_factory=list)
+    # live `goto loc_X` targets with no emitted instruction: the label stops
+    # (ppu_unlifted_stub) instead of falling off the function. Addresses, sorted.
+    undecoded_targets: list = field(default_factory=list)
 
 
 # Max span (bytes) for a mid-function tail-entry / gap wrapper. A real interior
@@ -831,6 +834,13 @@ class LiftedFunction:
 # boundary explodes output/memory. Capping bounds the blast radius (the rare real
 # >24KB tail just truncates; the bogus case becomes a small harmless stub).
 _MAX_MID_TAIL = 0x6000
+
+# Placeholder in a function body for the fall-through continuation. It is
+# emitted BEFORE any tail stop label: a guest path that falls off the last
+# instruction reaches the continuation linearly, while the labels stay
+# reachable only by `goto loc_X`. Without the ordering a conditional branch
+# that falls through would run into a stop label belonging to a different path.
+_TAIL_CONTINUATION = "/*__PPU_TAIL_CONTINUATION__*/"
 
 
 def _last_line_is_terminator(body_lines: list[str]) -> bool:
@@ -852,6 +862,7 @@ def _last_line_is_terminator(body_lines: list[str]) -> bool:
         if t.startswith("if ("):
             return False
         return (t.startswith("return") or "goto " in t or
+                "ppu_unlifted_stub(" in t or
                 t.startswith("func_") or
                 "{ func_" in t or t.startswith("{ g_trampoline_fn"))
     return False
@@ -1100,17 +1111,28 @@ class PPULifter:
         if dead_first is not None:
             func.dead.append([f"0x{dead_first:08X}", f"0x{dead_last:08X}"])
 
-        # A live branch to an in-range address with no decoded instruction (a
+        # A live branch to an in-range address with no emitted instruction (a
         # branch into a data / undecoded region inside a too-large function
         # boundary from find_functions) still produced a `goto loc_X;` but no
-        # label, which is a C2094 undefined-label compile error. Emit the
-        # missing labels at the function tail so the goto lands on the implicit
-        # return — these paths are misidentified data and never legitimately
-        # execute. Keeps the chunk compilable without a post-process pass.
-        decoded = {insn.addr for insn in range_insns}
-        for tgt in sorted(goto_targets - emitted_labels - decoded):
+        # label, which is a C2094 undefined-label compile error. The old fix
+        # emitted an empty label at the function tail, so the goto fell off the
+        # function and returned -- a guest path that must stop instead reported
+        # success. Emit the missing label with a stop naming the target, and
+        # record it in the lift report. A goto target the reachability pass
+        # keeps is live by construction, so every such label is a real path.
+        decoded = {insn.addr for insn, is_live in zip(range_insns, live) if is_live}
+        tail_stops = sorted(goto_targets - emitted_labels - decoded)
+        falls_through = not _last_line_is_terminator(func.body_lines)
+        if tail_stops and falls_through:
+            # The labels below are entered only by `goto loc_X`, but a
+            # fall-through path reaches the end of the C body linearly: put the
+            # continuation first so it never executes a stop label.
+            func.body_lines.append(f"    {_TAIL_CONTINUATION}")
+        for tgt in tail_stops:
+            func.undecoded_targets.append(tgt)
             func.body_lines.append(
-                f"    loc_{tgt:08X}: ; /* branch into undecoded region */")
+                f"    loc_{tgt:08X}: ppu_unlifted_stub(0x{tgt:08X}ULL, ctx); "
+                f"/* branch into undecoded region */")
 
         # If the function's last instruction is not an unconditional terminator,
         # PPC falls through to end_addr. The compiler frequently places "outlined"
@@ -1132,7 +1154,7 @@ class PPULifter:
         # address order -- which starts exactly at `end` for contiguous functions
         # -- so no promotion is needed for correctness, and merged-function splits
         # are handled by the boundary-recovery prologue scan instead.
-        if not _last_line_is_terminator(func.body_lines):
+        if falls_through:
             func.fallthrough_to = end
 
         # Robust callee-saved-register preservation. The PPC ABI guarantees
@@ -2144,6 +2166,13 @@ class PPULifter:
                 for c in cases:
                     if func.start_addr <= c < func.end_addr:
                         arms.append(f"case 0x{c:08X}u: goto loc_{c:08X};")
+                    elif self._outside_code(c):
+                        # A table entry outside the executable window is data
+                        # (e.g. the ELF header); never trampoline into a bogus
+                        # func_X for it. If the guest really dispatches there,
+                        # stop and name the target.
+                        arms.append(f"case 0x{c:08X}u: {{ "
+                                    f"ppu_unlifted_stub(0x{c:08X}ULL, ctx); return; }}")
                     else:
                         # Case OUTSIDE this function's range. Almost always the
                         # function was truncated by the IDA export (its real body
@@ -3784,8 +3813,12 @@ class PPULifter:
         Returns the number of tail-entry functions generated.
         """
         defined = {f.start_addr for f in self.functions}
-        # All addresses that are referenced as func_X but not yet defined
-        all_refs = (self.call_targets | self.branch_targets) - defined
+        # All addresses that are referenced as func_X but not yet defined. A
+        # target outside the executable window is data the boundary detector
+        # misread, never a function entry (F4e); the lowering already stops on
+        # it, so do not promote it to a func_X here.
+        all_refs = {t for t in (self.call_targets | self.branch_targets) - defined
+                    if not self._outside_code(t)}
 
         if not all_refs:
             return 0
@@ -3917,14 +3950,18 @@ class PPULifter:
     def lift_report(self) -> dict:
         """The lift's gaps as plain data (schema 1, see docs/LIFT_REPORT.md)."""
         defined = {f.start_addr for f in self.functions}
-        traps_total = dead_total = 0
+        traps_total = dead_total = undecoded_total = 0
         funcs = []
         for f in self._emit_functions():
-            if f.traps or f.dead:
+            if f.traps or f.dead or f.undecoded_targets:
                 traps_total += len(f.traps)
                 dead_total += sum((int(b, 16) - int(a, 16)) // 4 + 1 for a, b in f.dead)
+                undecoded_total += len(f.undecoded_targets)
                 funcs.append({"name": f.name, "start": f"0x{f.start_addr:08X}",
-                              "end": f"0x{f.end_addr:08X}", "traps": f.traps, "dead": f.dead})
+                              "end": f"0x{f.end_addr:08X}", "traps": f.traps,
+                              "dead": f.dead,
+                              "undecoded_targets": [f"0x{t:08X}"
+                                                    for t in f.undecoded_targets]})
         unresolved = sorted((self.call_targets | self.branch_targets) - defined)
         return {
             "schema": 1,
@@ -3935,6 +3972,9 @@ class PPULifter:
                         "trapped_instructions": traps_total,
                         "functions_with_dead": sum(1 for f in funcs if f["dead"]),
                         "dead_instructions": dead_total,
+                        "functions_with_undecoded_targets": sum(
+                            1 for f in funcs if f["undecoded_targets"]),
+                        "undecoded_targets": undecoded_total,
                         "capped_mid_tails": len(self.capped_tails),
                         "unresolved_targets": len(unresolved)},
             "functions": funcs,
@@ -4133,8 +4173,6 @@ class PPULifter:
             lines.append(f"/* {label} */")
         weak = "__attribute__((weak)) " if getattr(self, "weak_emit", False) else ""
         lines.append(f"void {weak}{func.name}(ppu_context* ctx) {{")
-        for bline in _fuse_cr(func.body_lines):
-            lines.append(f"    {bline}" if not bline.endswith(":") else bline)
 
         # If a function doesn't end with blr/b/bctr (a return or unconditional
         # branch), PPC execution falls through to the next address. The lifter
@@ -4145,6 +4183,7 @@ class PPULifter:
         # registered for lifting, so the shared frame is restored correctly. Fall
         # back to the next function in address order only if the continuation
         # wasn't emitted (e.g. it was outside the code window).
+        cont: list[str] = []
         if func.fallthrough_to:
             target = None
             if func.fallthrough_to in func_by_addr:
@@ -4162,11 +4201,23 @@ class PPULifter:
                     if nxt.start_addr == func.fallthrough_to:
                         target = nxt.name
             if target:
-                lines.append(f"        {{ g_trampoline_fn = (void(*)(void*)){target}; return; }}")
+                cont.append(f"        {{ g_trampoline_fn = (void(*)(void*)){target}; return; }}")
             else:
                 print(f"  WARNING: {func.name} has no continuation at "
                       f"0x{func.fallthrough_to:08X}; emitting halt", flush=True)
-                lines.append(f"        /* missing continuation 0x{func.fallthrough_to:08X}: halt */ return;")
+                cont.append(f"        /* missing continuation 0x{func.fallthrough_to:08X}: halt */ return;")
+
+        # The marker places the continuation before any tail stop label (see
+        # _TAIL_CONTINUATION). Without a marker it belongs at the end.
+        placed = False
+        for bline in _fuse_cr(func.body_lines):
+            if bline.strip() == _TAIL_CONTINUATION:
+                lines.extend(cont)
+                placed = True
+                continue
+            lines.append(f"    {bline}" if not bline.endswith(":") else bline)
+        if cont and not placed:
+            lines.extend(cont)
 
         lines.append("}")
         lines.append("")
@@ -4877,7 +4928,7 @@ def _worker_lift(task):
         insns = disassemble_bytes(blob, start, _WORKER_STATE["be"]) if blob else []
         f = lifter.lift_function(insns, start, end)
         results.append((f.name, f.start_addr, f.end_addr, f.body_lines, f.calls,
-                        f.fallthrough_to, f.traps, f.dead))
+                        f.fallthrough_to, f.traps, f.dead, f.undecoded_targets))
     return idx0, results, lifter.call_targets, lifter.branch_targets
 
 
@@ -4920,10 +4971,11 @@ def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
         raise
 
     for idx0 in sorted(results_by_idx):
-        for name, s, e, body, calls, ft, traps, dead in results_by_idx[idx0]:
+        for name, s, e, body, calls, ft, traps, dead, undecoded in results_by_idx[idx0]:
             lifter.functions.append(LiftedFunction(
-                name=name, start_addr=s, end_addr=e,
-                body_lines=body, calls=calls, fallthrough_to=ft, traps=traps, dead=dead))
+                name=name, start_addr=s, end_addr=e, body_lines=body, calls=calls,
+                fallthrough_to=ft, traps=traps, dead=dead,
+                undecoded_targets=undecoded))
 
 
 def main() -> None:
@@ -5005,6 +5057,12 @@ def main() -> None:
 
     # Get instructions (and keep the raw executable blobs for worker processes)
     seg_blobs: list[tuple[int, bytes]] = []
+    # Start of the executable code, not the executable segment: an ELF's R-X
+    # PT_LOAD begins at the ELF header (Odin: 0x10000, first function 0x10200),
+    # so the segment base covers headers and padding that are not code. Filled
+    # from the lowest SHF_EXECINSTR section below; None = fall back to the
+    # first function bound.
+    elf_exec_lo: int | None = None
     if args.raw:
         all_insns = disassemble_bytes(file_data, base_addr, big_endian)
         seg_blobs = [(base_addr, file_data)]
@@ -5014,6 +5072,16 @@ def main() -> None:
             elf = ELFFile(args.input)
             elf.load()
             big_endian = elf.elf_header.big_endian
+            # SHF_EXECINSTR = 4. The lowest executable section is the first
+            # guest instruction; the ELF header/phdrs in the same PT_LOAD are
+            # not code, and treating them as such seeded functions below .text.
+            for _sec in (getattr(elf, "section_headers", None) or []):
+                _addr = int(getattr(_sec, "sh_addr", 0) or 0)
+                _size = int(getattr(_sec, "sh_size", 0) or 0)
+                _flags = int(getattr(_sec, "sh_flags", 0) or 0)
+                if _addr and _size and (_flags & 4):
+                    elf_exec_lo = (_addr if elf_exec_lo is None
+                                   else min(elf_exec_lo, _addr))
             all_insns = []
             for ph in elf.program_headers:
                 if ph.p_type == PT_LOAD and (ph.p_flags & 1):
@@ -5044,6 +5112,17 @@ def main() -> None:
     if not func_bounds:
         print("No functions found. Use --functions to provide a function list.", file=sys.stderr)
         sys.exit(1)
+
+    # Executable code window start. Raw input starts at its load base; an ELF
+    # starts at its lowest executable section (or, when the file has no
+    # sections, its first function bound). This is a hard lower bound: anything
+    # below it is header, data or padding, never an entry (F4e).
+    if args.raw:
+        code_lo = base_addr
+    elif elf_exec_lo is not None:
+        code_lo = elf_exec_lo
+    else:
+        code_lo = min(s for s, _ in func_bounds)
 
     # ----- recover merged function boundaries -----------------------------
     # The call-graph-derived function list can merge several real functions into
@@ -5314,6 +5393,11 @@ def main() -> None:
                     return _starts0[k]
                 return None
             enclosed_cases = set()
+            # F4e: only targets inside the executable window may become (or
+            # extend) a function. A table entry pointing below .text is data
+            # (Odin: the ELF header at 0x10000), and the bctr lowering stops
+            # on it instead of trampolining into a bogus func_X.
+            jt_targets = {t for t in jt_targets if code_lo <= t < text_hi}
             for disp, cases in tables.items():
                 if not cases:
                     continue
@@ -5327,7 +5411,8 @@ def main() -> None:
                 # starts into a single 2.3M-line emission that clang then
                 # dead-stripped to a 34 KB object. Bound the extension by the
                 # same span cap the mid-function tail pass uses.
-                near = [c for c in cases if abs(c - disp) <= _MAX_MID_TAIL]
+                near = [c for c in cases
+                        if abs(c - disp) <= _MAX_MID_TAIL and code_lo <= c < text_hi]
                 if not near:
                     continue
                 maxc = max(near)
@@ -5391,13 +5476,19 @@ def main() -> None:
         func_bounds = sorted(_fbmap.items())
         print(f"  fall-through repair: +{_tails} tail function(s) for truncated bounds")
 
+    # No function entry outside the executable window [code_lo, code_hi). The
+    # loader list, jump-table cases and synthesized fall-through tails all pass
+    # through here, so a target below .text (the ELF header, padding) or at/after
+    # the code end never becomes a lifted function. Ends are clamped to code_hi.
+    before = len(func_bounds)
     if args.code_end is not None:
-        before = len(func_bounds)
         func_bounds = [(s, min(e, args.code_end)) for s, e in func_bounds
                        if s < args.code_end]
-        if before != len(func_bounds):
-            print(f"  code-end 0x{args.code_end:08X}: dropped "
-                  f"{before - len(func_bounds)} out-of-text functions")
+    func_bounds = [(s, e) for s, e in func_bounds if s >= code_lo and e > s]
+    if before != len(func_bounds):
+        print(f"  code window [0x{code_lo:08X}, "
+              f"{f'0x{args.code_end:08X}' if args.code_end is not None else 'exec end'}): "
+              f"dropped {before - len(func_bounds)} out-of-window function(s)")
 
     # Firmware-import stub split: the .lib.stub trampolines are usually lumped
     # into one big function by boundary detection. Carve each 0x20-byte stub out
@@ -5441,14 +5532,18 @@ def main() -> None:
     # (multi-TOC titles keep the stack read). See `ld r2, N(r1)` in the load path.
     if len(toc_candidates) == 1:
         lifter.toc_base = toc_candidates[0]
+    # The window always needs its start: with --code-end it used to stay 0, so
+    # every target below .text was "in code" and a data word misread as a branch
+    # could seed a function below the text start (Odin: 0xFD8/0x6664/0xC664).
+    lifter.code_lo = code_lo
     lifter.code_hi = args.code_end
-    # Without --code-end, default the executable window to the function-bounds
-    # span so branches into data still get clamped. With no window at all, a
-    # garbage target decoded from data (e.g. dead bytes after a blrl reached by
-    # fallthrough) is emitted as a call to a nonexistent func_XXXXXXXX and the
-    # link fails (LBP: func_FFFFFFEC from a literal pool misread as a bc).
+    # Without --code-end, default the executable window's end to the
+    # function-bounds end so branches into data still get clamped. With no
+    # window at all, a garbage target decoded from data (e.g. dead bytes after a
+    # blrl reached by fallthrough) is emitted as a call to a nonexistent
+    # func_XXXXXXXX and the link fails (LBP: func_FFFFFFEC from a literal pool
+    # misread as a bc).
     if lifter.code_hi is None and func_bounds:
-        lifter.code_lo = min(s for s, _ in func_bounds)
         lifter.code_hi = max(e for _, e in func_bounds)
     lifter.hle_stub_nids = hle_stubs
     lifter.function_entries = _func_entries
@@ -5548,7 +5643,8 @@ def main() -> None:
     s = report["summary"]
     print(f"  lift report: {report_path} ({s['trapped_instructions']} trapped instruction(s) in "
           f"{s['functions_with_traps']} function(s), {s['dead_instructions']} unreachable "
-          f"instruction(s) not lowered, {s['capped_mid_tails']} capped tail(s), "
+          f"instruction(s) not lowered, {s['undecoded_targets']} undecoded target(s), "
+          f"{s['capped_mid_tails']} capped tail(s), "
           f"{s['unresolved_targets']} unresolved target(s))")
 
 
