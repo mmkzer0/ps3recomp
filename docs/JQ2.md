@@ -91,3 +91,32 @@ two coroutine slots). Operations: `push`, `intake_pass(instance)`, `complete(id)
 - `push()` rejects COPY, Unknown and SYNC(0): no scheduling semantics are
   documented for them. `maxGrab` and the PM's secondary busy sets (`r36`/`r37`)
   are not modelled; in-flight counts are exact over all instances.
+
+### Depth geometries
+
+The smallest depth the firmware PM accepted is 4 (m1r-015; 4/8/16/32 behaved
+identically), and that is the only range with firmware evidence. `Scheduler::create`
+nevertheless accepts any depth >= 1: depths 1-3 are **model-only geometries**,
+kept deliberately because a ring that wraps and flips its phase every one to three
+pushes is the sharpest stress of the wrap/phase bookkeeping (the property tests run
+depths 1-12). Nothing about the PM's behaviour at depths 1-3 is known; do not read
+a passing model run at those depths as firmware behaviour. A consumer that models
+a guest queue (B4) must take the depth the guest configured, and a guest depth
+below 4 is outside what was measured.
+
+### How the model is tested
+
+The property tests (`tests/spurs_jq2/test_jq2_sched.cpp`) do not trust the
+scheduler to report on itself. An independent oracle, written from this contract
+and sharing nothing with `Scheduler`, numbers the pushed entries by absolute
+position and derives the read position, the barred tags, what each SYNC barred,
+the out-of-order marks and the phase bit the writer stored from the pushed
+sequence and the dispatch/complete events alone; every `Scheduler` observer is
+compared with it after every operation.
+
+`push()` always stores the phase the PM expects, so the wrong-phase path needs two
+test hooks that add no scheduling semantics: `push_with_phase(entry, phase)` (a
+writer that stored the wrong w1 bit 0, or has not finished the write) and
+`rewrite_entry(index, entry, phase)` (the writer completing it). An entry whose
+bit 0 differs from the expected phase ends the pass without being dispatched or
+consumed, and is not stepped over, until it is rewritten with the right phase.

@@ -81,7 +81,11 @@ std::uint16_t Scheduler::sync_barred_tags(std::uint16_t index) const noexcept
     return sync_fresh_[index % depth_];
 }
 
-PushResult Scheduler::push(const Entry& entry)
+namespace {
+
+/* The storability rules shared by push() and rewrite_entry(): the same refusals,
+ * in the same order. */
+PushResult encode_for_store(const Entry& entry, bool phase, EncodeResult& encoded)
 {
     PushResult result;
     if (std::holds_alternative<CopyEntry>(entry) ||
@@ -94,12 +98,26 @@ PushResult Scheduler::push(const Entry& entry)
         return result;
     }
 
-    const EncodeResult encoded = encode(entry, write_phase_);
+    encoded = encode(entry, phase);
     if (!encoded.ok()) {
         result.error = PushError::encode_failed;
         result.encode_error = encoded.error;
-        return result;
     }
+    return result;
+}
+
+}  // namespace
+
+PushResult Scheduler::push(const Entry& entry)
+{
+    return push_with_phase(entry, write_phase_);
+}
+
+PushResult Scheduler::push_with_phase(const Entry& entry, bool phase)
+{
+    EncodeResult encoded;
+    PushResult result = encode_for_store(entry, phase, encoded);
+    if (!result.ok()) return result;
     if (outstanding_ == depth_) {
         result.error = PushError::ring_full;
         return result;
@@ -112,6 +130,18 @@ PushResult Scheduler::push(const Entry& entry)
     if (write_ == 0) write_phase_ = !write_phase_;
     ++outstanding_;
     return result;
+}
+
+bool Scheduler::rewrite_entry(std::uint16_t index, const Entry& entry, bool phase)
+{
+    if (index >= depth_) return false;
+    const unsigned ahead = (index + depth_ - read_) % depth_;
+    if (ahead >= outstanding_ || out_of_order_[index] != 0) return false;
+    EncodeResult encoded;
+    if (!encode_for_store(entry, phase, encoded).ok()) return false;
+    ring_[index] = encoded.bytes;
+    sync_fresh_[index] = 0;
+    return true;
 }
 
 void Scheduler::mark_consumed_out_of_order(std::uint16_t index)

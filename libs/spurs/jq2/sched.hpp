@@ -103,7 +103,12 @@ inline constexpr unsigned kTagCount = 16;
 inline constexpr bool kInitialPhase = true;
 
 struct SchedConfig {
-    std::uint16_t depth = 128;       /* ring entries, queue+0x14; >= 1 */
+    /* Ring entries, queue+0x14; >= 1. Only depths >= 4 are firmware-tested (the
+     * smallest depth the firmware PM accepted, m1r-015: 4; 8/16/32 identical).
+     * Depths 1-3 are model-only geometries: accepted so the property tests get
+     * wrap and phase flips every few pushes, with no firmware evidence behind
+     * the PM's behaviour on them. */
+    std::uint16_t depth = 128;
     unsigned instances = 2;          /* PM instances (SPUs) sharing the queue; >= 1 */
     unsigned slots_per_instance = 2; /* job slots per PM instance; >= 1 */
 };
@@ -165,6 +170,19 @@ public:
      * write phase; the API flag lives in the JOB's port EA (JobEntry::port_ea
      * != 0). */
     PushResult push(const Entry& entry);
+
+    /* Test hooks for a writer that stored the wrong phase, or has not finished
+     * a write. They add no scheduling semantics: push() is
+     * push_with_phase(entry, write_phase()).
+     *   push_with_phase: push(), but the entry's w1 bit 0 is `phase`. A phase
+     *       other than write_phase() is an entry the PM does not yet see as
+     *       written: it ends every pass that reaches it.
+     *   rewrite_entry:   store `entry` with w1 bit 0 = `phase` over a pushed,
+     *       not yet consumed slot, as the writer completing that write would.
+     *       False (nothing changed) if `index` is not such a slot or the entry
+     *       is not storable (COPY, Unknown, SYNC(0), codec rejection). */
+    PushResult push_with_phase(const Entry& entry, bool phase);
+    [[nodiscard]] bool rewrite_entry(std::uint16_t index, const Entry& entry, bool phase);
 
     /* One PM intake pass on `instance`; commits the read index at its end. */
     PassResult intake_pass(unsigned instance);
