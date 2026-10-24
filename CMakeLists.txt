@@ -617,6 +617,17 @@ if(PS3RECOMP_BUILD_TESTS)
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_gen_hle_nids.py")
         set_tests_properties(gen_hle_nids PROPERTIES LABELS "tools;t0" TIMEOUT 300)
+        # docs/DIAGNOSTICS.md is hand-maintained prose; the checker requires the
+        # knob set (and its summary counts) to match the sources, not the whole
+        # generated text.
+        add_test(NAME diagnostics_index
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/gen_diagnostics_index.py" --check)
+        add_test(NAME diagnostics_index_check
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_gen_diagnostics_index.py")
+        set_tests_properties(diagnostics_index diagnostics_index_check
+            PROPERTIES LABELS "tools;t0")
     endif()
 endif()
 
