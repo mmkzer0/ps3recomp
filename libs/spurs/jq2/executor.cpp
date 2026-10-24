@@ -896,6 +896,9 @@ PortRef resolve_port(std::uint32_t port)
         ref.error = static_cast<std::int32_t>(guard);
         return ref;
     }
+    if (!jq2_guest_range_ok(port, kPortBytes)) {
+        ps3_stop_guest_range("resolve_port", "port", port, kPortBytes, jq2_guest_limit());
+    }
     if (host(port)[kPInit] != 1) {
         ref.error = JQ2_ERR_STAT;
         return ref;
@@ -1087,6 +1090,9 @@ int32_t jq2_queue_create(uint32_t revision, uint32_t sdk_version, uint32_t spurs
     if (!aligned(spurs, 128) || !aligned(queue, 128) || !aligned(command_ring, 128)) return JQ2_ERR_ALIGN;
     if ((pool == 0) != (pool_attr == 0)) return JQ2_ERR_INVAL;
     if (command_depth > JQ2_MAX_DEPTH || worker_count > JQ2_MAX_WORKERS) return JQ2_ERR_INVAL;
+    if (!jq2_guest_range_ok(attr, 0x0C)) {
+        ps3_stop_guest_range("jq2_queue_create", "attr", attr, 0x0C, jq2_guest_limit());
+    }
     const std::uint32_t classes = ld32(attr + 0x04);
     const std::uint32_t max_descriptor = ld32(attr + 0x08);
     if (classes < 1 || classes > 16 || max_descriptor < 256 || max_descriptor > 0x3FF || !aligned(max_descriptor, 128))
@@ -1097,6 +1103,14 @@ int32_t jq2_queue_create(uint32_t revision, uint32_t sdk_version, uint32_t spurs
     if (command_depth == 0 || worker_count == 0) return JQ2_ERR_INVAL;
     if (find_queue(queue)) return JQ2_ERR_STAT;
 
+    if (!jq2_guest_range_ok(queue, kQueueBytes)) {
+        ps3_stop_guest_range("jq2_queue_create", "queue", queue, kQueueBytes, jq2_guest_limit());
+    }
+    const std::uint64_t ring_size = 2048ull + (((static_cast<std::uint64_t>(command_depth) + 15ull) * 8ull) & ~0x7Full);
+    if (!jq2_guest_range_ok(command_ring, ring_size)) {
+        ps3_stop_guest_range("jq2_queue_create", "command_ring", command_ring, ring_size, jq2_guest_limit());
+    }
+
     ExecutorHooks hooks;
     {
         std::lock_guard<std::mutex> lk(g_hooks_mu);
@@ -1106,7 +1120,7 @@ int32_t jq2_queue_create(uint32_t revision, uint32_t sdk_version, uint32_t spurs
     /* The firmware zeroes the queue block and the command buffer (the ring and
      * the room the buffer carries beyond it). */
     std::memset(host(queue), 0, kQueueBytes);
-    std::memset(host(command_ring), 0, 2048u + ((std::uint32_t{command_depth + 15} * 8u) & ~0x7Fu));
+    std::memset(host(command_ring), 0, ring_size);
 
     std::int32_t rc = evf_create(queue + kQEventFlag);
     if (rc != 0) return rc;
@@ -1198,6 +1212,10 @@ int32_t jq2_port_create(uint32_t port, uint32_t queue)
     if (!aligned(port, 128) || !aligned(queue, 128)) return JQ2_ERR_ALIGN;
     const auto q = find_queue(queue);
     if (!q || q->shut()) return JQ2_ERR_STAT;
+
+    if (!jq2_guest_range_ok(port, kPortBytes)) {
+        ps3_stop_guest_range("jq2_port_create", "port", port, kPortBytes, jq2_guest_limit());
+    }
 
     std::memset(host(port), 0, kPortBytes);
     st32(port + kPLink, queue);

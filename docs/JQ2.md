@@ -421,6 +421,18 @@ guest queue EA. `jq2.h` is its C surface; the 17 `cellSpursJq` exports are thin
 adapters that call it (a firmware status in, the same s32 out). The layout of
 the guest queue block, the evidence behind each field and the choices the
 evidence does not settle are in the header of `executor.hpp`.
+**Guest memory range validation.** All guest pointers and spans supplied to the
+JQ2 HLE (queue block, command ring, attribute blocks, descriptor pool, ports,
+and join exit codes) are bounded by `ppu_vm_size` (or the 32-bit address space
+when unconstrained) before forming any host pointer, computing offsets, or
+touching guest memory. The firmware itself checks only null and alignment:
+inventing an error status code for out-of-range addresses would not be
+firmware-faithful, while unconstrained host pointer arithmetic would cause host
+out-of-bounds access. The fail-closed answer is the named stop `hle-guest-range`.
+The stop is raised strictly after the firmware's own null and alignment checks
+(so an invalid EA that the firmware would reject with an error code still
+receives that code) and before any guest read or write.
+
 
 **Pushes.** `jq2_port_push_job` / `jq2_port_copy_push` / `jq2_port_push_sync`
 apply the firmware guards (null `A11`, alignment `A10`, argument `A02`, port or

@@ -7,9 +7,8 @@
  * PPU lwarx/ldarx or SPU GETLLAR reservation on the line dies and a concurrent
  * conditional store waits for the section (reservation.h, LOCK ORDER).
  */
-
 #include "jq2/port.hpp"
-
+#include "jq2/jq2.h"
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -71,6 +70,17 @@ int rmw(std::uint8_t* line, void* user)
 }
 
 }  // namespace
+std::optional<GuestPortLine> GuestPortLine::at(std::uint32_t ea, PortStatus* error) noexcept
+{
+    const PortStatus st = check_port_ea(ea);
+    if (error != nullptr) *error = st;
+    if (st != PortStatus::ok) return std::nullopt;
+    if (!jq2_guest_range_ok(ea, kPortBytes)) {
+        ps3_stop_guest_range("GuestPortLine::at", "port", ea, kPortBytes, jq2_guest_limit());
+    }
+    return GuestPortLine(ea);
+}
+
 
 bool GuestPortLine::update_raw(Thunk fn, void* user) const
 {
