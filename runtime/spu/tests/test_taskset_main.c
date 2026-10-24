@@ -61,10 +61,12 @@ typedef struct { CellSyncLFQueue* work_q; ev_queue* evq; int done; } spurs_tasks
 
 static void taskset_run(spurs_taskset* ts) {
     uint8_t item[16];
+    const uintptr_t QSCRATCH_EA = 0x200;
     /* non-blocking drain: cellSyncLFQueuePop BLOCKS when empty (it's the
      * blocking variant); TryPop returns an error so the taskset stops when the
-     * workload queue is exhausted. */
-    while (cellSyncLFQueueTryPop(ts->work_q, item) == CELL_OK) {
+     * workload queue is exhausted. cellSync takes guest EAs. */
+    while (cellSyncLFQueueTryPop(ts->work_q, (void*)QSCRATCH_EA) == CELL_OK) {
+        memcpy(item, &g_mem[QSCRATCH_EA], 16);
         memcpy(&g_mem[WORK_EA], item, 16);                 /* deliver workload to the SPU task input */
         spu_context ctx; spu_context_init(&ctx, 0);
         mfc_engine_init(&g_mfc);
@@ -83,20 +85,22 @@ int main(void) {
     memset(g_mem, 0, sizeof(g_mem));
     memset(&g_taskset_evq, 0, sizeof(g_taskset_evq)); g_taskset_evq.active = 1;
 
-    /* PPU: a real cellSync LFQueue feeding the taskset, buffer in shared memory. */
-    CellSyncLFQueue q;
-    cellSyncLFQueueInitialize(&q, &g_mem[QUEUE_BUF], 16, 8, 0, 0);
+    /* PPU: a real cellSync LFQueue feeding the taskset, buffer in shared memory.
+     * cellSync's C API takes guest EAs; the queue object lives in guest memory. */
+    const uintptr_t QLF_EA = 0x300, QSCRATCH_EA = 0x200;
+    cellSyncLFQueueInitialize((CellSyncLFQueue*)QLF_EA, (void*)QUEUE_BUF, 16, 8, 0, 0);
 
     /* PPU enqueues 3 workloads. */
     const uint32_t kWork[3] = { 0x1111AAAA, 0x2222BBBB, 0x3333CCCC };
     int pushed = 0;
     for (int i = 0; i < 3; i++) {
         uint8_t item[16] = {0}; wbe32(item, kWork[i]);
-        if (cellSyncLFQueuePush(&q, item) == CELL_OK) pushed++;
+        memcpy(&g_mem[QSCRATCH_EA], item, 16);
+        if (cellSyncLFQueuePush((CellSyncLFQueue*)QLF_EA, (void*)QSCRATCH_EA) == CELL_OK) pushed++;
     }
 
     /* Run the taskset: it drains the queue, invoking the lifted SPU task per item. */
-    spurs_taskset ts = { &q, &g_taskset_evq, 0 };
+    spurs_taskset ts = { (CellSyncLFQueue*)QLF_EA, &g_taskset_evq, 0 };
     taskset_run(&ts);
 
     /* Verify: 3 workloads processed, 3 completion events, each result == its input. */
