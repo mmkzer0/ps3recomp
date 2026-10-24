@@ -304,19 +304,33 @@ static int cb_stack_scenarios()
     CHECK(g_acts[0].entry == first_entry);
 
     /* The thread-stack allocator cannot hand out a stack that intersects the host
-     * callback window: it ends below it, so exhausting it returns 0 (CELL_ENOMEM
-     * for sys_ppu_thread_create) instead of overlapping a live slot. */
+     * callback window: it ends below it, so exhausting it returns CELL_ENOMEM
+     * (and sys_ppu_thread_create CELL_ENOMEM) instead of overlapping a live slot. */
     vm_stack_alloc sa;
     vm_stack_alloc_init(&sa);
     CHECK(sa.region_end == VM_CB_HOST_STACK_BASE && VM_CB_HOST_STACK_BASE == HOST_TOP - HOST_WINDOW);
     unsigned stacks = 0;
-    for (uint32_t base; (base = vm_stack_allocate(&sa, VM_PPU_STACK_SIZE)) != 0; ++stacks) {
+    for (uint32_t base = 0; vm_stack_allocate(&sa, VM_PPU_STACK_SIZE, &base) == CELL_OK; ++stacks) {
         CHECK(base >= VM_STACK_BASE);
         CHECK((uint64_t)base + VM_PPU_STACK_SIZE <= VM_CB_HOST_STACK_BASE);   /* [base, base+size) is below the window */
     }
     CHECK(stacks > 100 && stacks < VM_STACK_REGION / VM_PPU_STACK_SIZE);   /* it ran out, and before the region's end */
-    CHECK(vm_stack_allocate(&sa, VM_PPU_STACK_SIZE) == 0);
-    CHECK(vm_stack_allocate(&sa, VM_STACK_REGION) == 0);
+    uint32_t unused = 0;
+    CHECK(vm_stack_allocate(&sa, VM_PPU_STACK_SIZE, &unused) == (int32_t)CELL_ENOMEM);
+    CHECK(vm_stack_allocate(&sa, VM_STACK_REGION, &unused) == (int32_t)CELL_ENOMEM);
+    {
+        /* An arena that does not reach the stack region: the guard page is refused,
+         * so no stack is handed out (a stack without its guard overflows silently). */
+        const uint32_t orig_vm_size = ppu_vm_size;
+        ppu_vm_size = 0x10000u;
+        CHECK(vm_protect(0x10000000u, 0x1000, 0, 0, 0) == (int32_t)CELL_EFAULT);
+        CHECK(vm_commit(0x10000000u, 0x1000) == (int32_t)CELL_EFAULT);
+        vm_stack_alloc bounded{0x10000000u, 0xA0000000u};
+        uint32_t bad = 0;
+        CHECK(vm_stack_allocate(&bounded, 0x10000, &bad) == (int32_t)CELL_EFAULT);
+        CHECK(bad == 0 && bounded.next_addr == 0x10000000u);
+        ppu_vm_size = orig_vm_size;
+    }
     std::printf("CBSTACK OK: %d ctx threads + %d host threads + 100 short-lived threads, "
                 "stacks distinct and disjoint; %u thread stacks fit below the host window\n",
                 N, N, stacks);

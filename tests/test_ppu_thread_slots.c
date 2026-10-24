@@ -17,6 +17,14 @@ int ps3_intr_wait(unsigned long long tid) { (void)tid; return 0; }
  * has, so a thread that started with its VSCR unset is caught. */
 #define TEST_INITIAL_VSCR 0x00010000u
 uint32_t ps3_ppu_initial_vscr(void) { return TEST_INITIAL_VSCR; }
+_Noreturn void ps3_stop(ps3_stop_kind kind, const char* what, const char* remedy,
+                        const ps3_stop_field* fields, size_t nfields,
+                        const ps3_stop_site* site)
+{
+    (void)kind; (void)what; (void)remedy; (void)fields; (void)nfields; (void)site;
+    fprintf(stderr, "ps3_stop called in test: kind=%d\n", (int)kind);
+    abort();
+}
 
 static int g_entered, g_vscr_wrong;
 static void guest_entry(ppu_context* ctx)   /* the thread body returns at once */

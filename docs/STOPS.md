@@ -72,6 +72,7 @@ Ids are stable kebab-case; a new gap gets a new kind, never a free-text variant.
 | `gcm-unmodelled` | the firmware has a command-stream path the runtime does not reproduce, so a stream built without it would be a guess: `cellRescSetConvertAndFlip` in a PAL-interpolating (720x576 with PAL temporal mode 1..4) or interlaced configuration, or with more than 256 vertices; a command context whose buffer-full callback did not leave room for a reservation. Fields: `func`, `feature`, `reason` |
 | `gcm-wait-timeout` | an RSX wait stood unsatisfied for `gcm.wait_timeout_ms` (default 10 s): a NV406E semaphore ACQUIRE whose label never reached the value, or the command-context buffer-full callback waiting for the RSX to leave the next 32 KiB segment. The hardware waits forever; the agent that should end the wait never ran. Fields: `func`, `what`, `offset`, `value`, `current`, `waited_ms` |
 | `guest-null-access` | a guest load or store reached the unmapped null page: a load below `0x10000` or a store below `0x1000` (the bounds `ppu_null_read_report` and the store check always had). Real hardware faults on each; the flat VM would instead read back garbage or swallow the store and let the run continue on it. Default; `ppu.null_page = "drop"` keeps the legacy log-and-drop handling for a title that needs it. Fields: `access` (`read`/`write`), `width` (bytes), `ea`, `fn` |
+| `stack-guard-fault` | the guard page of a new PPU thread's stack could not be set: `vm_protect` refused it (the guest arena, `ppu_vm_size`, does not cover the stack region) or the host `mprotect` failed. A host fault, never handed to the guest as `CELL_ENOMEM`, and never a stack without its guard. Fields: `size`, `guard`, `base` |
 
 Where each is raised, and what it carries beyond `pc lr tid`:
 
@@ -105,6 +106,7 @@ Where each is raised, and what it carries beyond `pc lr tid`:
 | `gcm-unmodelled` | `ps3_stop_gcm_unmodelled` (`libs/video/cellResc.c`, `libs/video/cellGcmSys.c`) | `func feature reason` |
 | `gcm-wait-timeout` | `ps3_stop_gcm_wait_timeout` (`libs/video/cellGcmSys.c`) | `func what offset value current waited_ms` |
 | `guest-null-access` | `vm_read8/16/32/64`, `ppu_lwarx32`, `ppu_ldarx64`, `vm_write8/16/32/64` (`ppu_loader.cpp`, `ppu_null_page_stop`) | `access width ea fn`; `fn` is the guest function the access came from (resolved from the host return address, `0x00000000` if none), `pc` is that same entry (lifted code keeps no guest pc), `lr` is the context's link register and `tid` the guest thread; the guest call chain is dumped to stderr first |
+| `stack-guard-fault` | `sys_ppu_thread_create` (`runtime/syscalls/sys_ppu_thread.c`) | `size guard base`; `base` is the guest address the guard was for, `pc`/`lr` the creator's link register |
 
 Lifted code does not track a guest pc, so for the first four `pc` is the caller's
 return address (the import stub's caller, the `sc` site, the call site). Only

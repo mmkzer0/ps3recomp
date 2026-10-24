@@ -126,14 +126,15 @@ vm_stack_alloc sa;
 vm_stack_alloc_init(&sa);
 
 // Allocate a 1 MB stack with guard page
-uint32_t stack_base = vm_stack_allocate(&sa, VM_PPU_STACK_SIZE);
-// stack_base points past the guard page
-// Usable stack top = stack_base + VM_PPU_STACK_SIZE
+uint32_t stack_base = 0;
+int32_t rc = vm_stack_allocate(&sa, VM_PPU_STACK_SIZE, &stack_base);
+// CELL_OK: stack_base points past the guard page; usable stack top = stack_base + VM_PPU_STACK_SIZE
+// CELL_ENOMEM: the region is spent. CELL_EFAULT: the guard page could not be set
 ```
 
-Each allocation includes a **guard page** (4 KB, `PAGE_NOACCESS`) at the bottom of the stack to detect overflow. The allocator returns the address *above* the guard page.
+Each allocation includes a **guard page** (one host page, no access) at the bottom of the stack to detect overflow. The allocator returns the address *above* the guard page. It never hands out a stack whose guard could not be set: `vm_protect` and `vm_commit` refuse any range outside the guest arena (`[0, ppu_vm_size)` when `ppu_vm_size` is set, which includes the identity mapping with `vm_base == 0`; otherwise the 4 GB reservation), and a refused or failed guard is `CELL_EFAULT`. `sys_ppu_thread_create` turns that into the stop `stack-guard-fault`; it is a host fault, not a guest `CELL_ENOMEM`.
 
-The allocator ends at `VM_CB_HOST_STACK_BASE` (`0xDE000000`), not at the end of the stack region: the top `VM_CB_HOST_STACK_WINDOW` (32 MB, 32 slots of `VM_PPU_STACK_SIZE`) is reserved for the stacks of host threads that raise guest callbacks while running no guest code (`ppu_cb_entry_sp` in `ppu_loader.cpp` owns it). A thread-stack request that would reach the window fails (`vm_stack_allocate` returns 0, `sys_ppu_thread_create` returns `CELL_ENOMEM`) instead of overlapping a live callback slot.
+The allocator ends at `VM_CB_HOST_STACK_BASE` (`0xDE000000`), not at the end of the stack region: the top `VM_CB_HOST_STACK_WINDOW` (32 MB, 32 slots of `VM_PPU_STACK_SIZE`) is reserved for the stacks of host threads that raise guest callbacks while running no guest code (`ppu_cb_entry_sp` in `ppu_loader.cpp` owns it). A thread-stack request that would reach the window fails (`vm_stack_allocate` returns `CELL_ENOMEM`, and so does `sys_ppu_thread_create`) instead of overlapping a live callback slot.
 
 ### SPU Local Store Mapping
 

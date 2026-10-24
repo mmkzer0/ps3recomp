@@ -25,6 +25,7 @@ static PPU_TLS int     s_exit_armed = 0;
 _Static_assert(PPU_THREAD_MAX == PPU_THREAD_SLOTS, "a thread id carries its slot in its low 6 bits");
 #include "../platform/win32_compat.h"   /* GetCurrentThreadId on POSIX */
 #include "ps3emu/ps3_ftrace.h"           /* PS3_FTRACE: thread names for the report */
+#include "ps3emu/stop.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>   /* getenv (else return value truncated to int on x64) */
@@ -380,8 +381,24 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
     memset(t, 0, sizeof(*t));
 
     /* Allocate guest stack */
-    uint32_t stack_addr = vm_stack_allocate(&g_vm_stack_alloc, stack_size);
-    if (stack_addr == 0) {
+    uint32_t stack_addr = 0;
+    const int32_t stack_rc = vm_stack_allocate(&g_vm_stack_alloc, stack_size, &stack_addr);
+    if (stack_rc == (int32_t)CELL_EFAULT) {
+        /* A host fault, not a guest ENOMEM: the guest arena does not cover the stack region, or mprotect failed. */
+        char size_s[16], pg_s[16], base_s[16];
+        snprintf(size_s, sizeof(size_s), "0x%08X", stack_size);
+        snprintf(pg_s, sizeof(pg_s), "0x%08X", vm_host_page_size());
+        snprintf(base_s, sizeof(base_s), "0x%08X", g_vm_stack_alloc.next_addr);
+        ps3_stop_field f[] = { {"size", size_s}, {"guard", pg_s}, {"base", base_s} };
+        ps3_stop_site site = { ctx->lr, ctx->lr, ctx->thread_id };
+        table_unlock();
+        ps3_stop(PS3_STOP_STACK_GUARD_FAULT,
+                 "the guard page of a new PPU thread's stack could not be set",
+                 "vm_protect refused the guard page: the guest arena (ppu_vm_size) does not cover the stack "
+                 "region, or the host mprotect failed.",
+                 f, sizeof(f) / sizeof(f[0]), &site);
+    }
+    if (stack_rc != CELL_OK) {
         table_unlock();
         return (int64_t)(int32_t)CELL_ENOMEM;
     }

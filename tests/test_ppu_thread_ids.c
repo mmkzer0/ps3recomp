@@ -23,6 +23,14 @@ void ppu_ctx_register(ppu_context* c) { (void)c; }
 int ps3_intr_is_handler(unsigned long long tid) { (void)tid; return 0; }
 int ps3_intr_wait(unsigned long long tid) { (void)tid; return 0; }
 uint32_t ps3_ppu_initial_vscr(void) { return 0; }
+PS3_NORETURN void ps3_stop(ps3_stop_kind kind, const char* what, const char* remedy,
+                           const ps3_stop_field* fields, size_t nfields,
+                           const ps3_stop_site* site)
+{
+    (void)kind; (void)what; (void)remedy; (void)fields; (void)nfields; (void)site;
+    fprintf(stderr, "ps3_stop called in test: kind=%d\n", (int)kind);
+    abort();
+}
 
 static uint64_t g_hold_id;             /* the thread with this id waits in its entry until it is cleared */
 static void guest_entry(ppu_context* ctx)
@@ -215,6 +223,6 @@ int main(void)
 
     if (g_fails) { fprintf(stderr, "%d check(s) failed\n", g_fails); return 1; }
     puts("PASS: PPU thread ids are monotonic and never reused; stale ids are ESRCH");
+    munmap(vm_base, (size_t)VM_TOTAL_SIZE);
     return 0;
 }
-    munmap(vm_base, (size_t)VM_TOTAL_SIZE);

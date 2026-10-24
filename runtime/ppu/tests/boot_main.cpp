@@ -1250,8 +1250,9 @@ int main(int argc, char** argv)
     uint32_t stack_top = STACK_TOP;
     { const char* ms = getenv("PS3_MAIN_STACK_LV2");
       if (ms && *ms && *ms != '0') {
-          uint32_t base = vm_stack_allocate(&g_vm_stack_alloc, VM_PPU_STACK_SIZE);
-          if (base) stack_top = base + VM_PPU_STACK_SIZE;
+          uint32_t base = 0;
+          if (vm_stack_allocate(&g_vm_stack_alloc, VM_PPU_STACK_SIZE, &base) == CELL_OK)
+              stack_top = base + VM_PPU_STACK_SIZE;
       } }
     printf("\n[boot] dispatching entry OPD 0x%08X (stack top 0x%08X)\n\n", entry, stack_top);
 #ifdef _WIN32

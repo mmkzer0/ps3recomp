@@ -304,6 +304,13 @@ static inline void vm_shutdown(void)
 static inline int32_t vm_commit(uint32_t addr, uint32_t size)
 {
     if (!VM_READY) return CELL_EFAULT;
+    /* Arena bounds: if ppu_vm_size is nonzero, the arena is constrained to [0, ppu_vm_size).
+     * If ppu_vm_size is 0, the runtime follows the 4 GB address-space mapping (VM_TOTAL_SIZE)
+     * initialized by vm_init. Ranges that wrap or cross this limit are rejected with CELL_EFAULT. */
+    uint64_t limit = ppu_vm_size ? (uint64_t)ppu_vm_size : (uint64_t)VM_TOTAL_SIZE;
+    if ((uint64_t)addr >= limit || (uint64_t)addr + (uint64_t)size > limit)
+        return CELL_EFAULT;
+    if (size == 0) return CELL_OK;
     size = VM_ALIGN_UP(size, VM_PAGE_SIZE);
 
 #ifdef _WIN32
@@ -320,6 +327,10 @@ static inline int32_t vm_commit(uint32_t addr, uint32_t size)
 static inline int32_t vm_protect(uint32_t addr, uint32_t size, int read, int write, int exec)
 {
     if (!VM_READY) return CELL_EFAULT;
+    uint64_t limit = ppu_vm_size ? (uint64_t)ppu_vm_size : (uint64_t)VM_TOTAL_SIZE;
+    if ((uint64_t)addr >= limit || (uint64_t)addr + (uint64_t)size > limit)
+        return CELL_EFAULT;
+    if (size == 0) return CELL_OK;
     size = VM_ALIGN_UP(size, VM_PAGE_SIZE);
 
 #ifdef _WIN32
@@ -364,11 +375,13 @@ static inline void vm_stack_alloc_init(vm_stack_alloc* sa)
 }
 
 /*
- * Allocate a stack.  Returns the BASE address of the stack region (lowest address).
- * The usable stack top = base + size.
- * Returns 0 on failure.
+ * Allocate a stack: *base_out = the BASE address of the usable stack (lowest
+ * address, above its guard page); the stack top is base + size.
+ * CELL_ENOMEM: the stack region is spent. CELL_EFAULT: the guard page could not
+ * be set (vm_protect refused the range or the host failed it); nothing is
+ * allocated, because a stack without its guard would overflow silently.
  */
-static inline uint32_t vm_stack_allocate(vm_stack_alloc* sa, uint32_t stack_size)
+static inline int32_t vm_stack_allocate(vm_stack_alloc* sa, uint32_t stack_size, uint32_t* base_out)
 {
     /* Host page granularity throughout: the guard must be exactly one host
      * page, and the stack above it must start on a host page boundary, or a
@@ -380,16 +393,18 @@ static inline uint32_t vm_stack_allocate(vm_stack_alloc* sa, uint32_t stack_size
     /* Add a guard page */
     uint32_t total = stack_size + pg;
 
-    if (sa->next_addr + total > sa->region_end)
-        return 0; /* out of stack space */
+    if ((uint64_t)sa->next_addr + total > sa->region_end)
+        return CELL_ENOMEM;
 
     uint32_t base = sa->next_addr;
-    sa->next_addr += total;
-
     /* Guard page at the bottom (no access) */
-    vm_protect(base, pg, 0, 0, 0);
+    int32_t rc = vm_protect(base, pg, 0, 0, 0);
+    if (rc != CELL_OK)
+        return CELL_EFAULT;
 
-    return base + pg; /* skip the guard page */
+    sa->next_addr += total;
+    *base_out = base + pg; /* skip the guard page */
+    return CELL_OK;
 }
 
 /* ---------------------------------------------------------------------------
