@@ -111,6 +111,14 @@ struct ExecutorHooks {
     void (*on_admit)(void* user, const JobStart&) = nullptr;
     /* A job returned; nothing has been credited or released yet. */
     void (*on_done)(void* user, const JobStart&) = nullptr;
+    /* A push (job, copy or sync) has passed its checks and is about to take the
+     * port-line update and the ring write; it runs on the pushing thread with no
+     * queue or line lock held. A test seam: it lets a test hold a push at exactly
+     * the point where Shutdown can overtake it (the reservation model exposes no
+     * contention signal to observe a pusher parked on a line, and a sleep does
+     * not order anything). Null in production, where the cost is one null test.
+     * `port_ea` is the pushing port. */
+    void (*on_push_checked)(void* user, std::uint32_t port_ea) = nullptr;
 };
 
 /* Install hooks for the queues created after this call. */
