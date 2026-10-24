@@ -276,7 +276,7 @@ s32 cellGcmSetFlipCommandWithWaitLabel(u32 bufferId, u32 labelIndex, u32 labelVa
  *   cellGcm_ctx_emit: reserve `n` words, write them at `current`, advance `current`.
  *   cellGcm_emit_flip_command: `_cellGcmSetFlipCommand` as libgcm_sys writes it (19 words: driver
  *     queue 0xE944, NV406E label handshake, CALL 0, driver flip head 0xE924); returns
- *     CELL_GCM_ERROR_INVALID_VALUE for a buffer id above 7. `ctx` is the guest context EA. */
+ *     CELL_GCM_ERROR_FAILURE for a buffer id above 7. `ctx` is the guest context EA. */
 int  cellGcm_ctx_reserve(u32 ctx, u32 words);
 void cellGcm_ctx_emit(u32 ctx, const u32* words, u32 n);
 s32  cellGcm_emit_flip_command(u32 ctx, u32 bufferId);

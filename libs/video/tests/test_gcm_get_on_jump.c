@@ -6,17 +6,17 @@
  * milliseconds after the JUMP, so a title waiting for the RSX to leave a
  * segment before it reuses that segment waited for the whole pass.
  *
- * Segment A (io 0x0000) runs a probe method, then JUMPs to segment B
- * (io 0x8000), which runs two more; put is after them. The probe stub reads
- * get each time: in A it is where the pass started, in B it must already be
- * B's start. A self-JUMP (park) publishes nothing, and get ends at put.
+ * Segment A (io 0x1000, where _cellGcmInitBody puts the first segment) runs a probe method, then JUMPs to
+ * segment B (io 0x9000, the second 32 KiB segment), which runs two more; put is after them. The probe
+ * stub reads get each time: in A it is where the pass started, in B it must already be B's start. A
+ * self-JUMP (park) publishes nothing, and get ends at put.
  *
- * gcc -std=gnu17 -I include -I libs/video
- *   libs/video/tests/test_gcm_get_on_jump.c -ffunction-sections
- *   -fdata-sections -Wl,--gc-sections -pthread -o /tmp/test_gcm_get_on_jump
- *   (clang on macOS: -Wl,-dead_strip)
+ * cc -std=gnu17 -I include -I libs/video libs/video/tests/test_gcm_get_on_jump.c
+ *   libs/video/gcm_default_state.c -ffunction-sections -fdata-sections -Wl,--gc-sections -pthread
+ *   -o /tmp/test_gcm_get_on_jump        (clang on macOS: -Wl,-dead_strip)   (tools/test_gcm_get_on_jump.py)
  */
 #include "../cellGcmSys.c"
+#include "gcm_fixture_stubs.h"
 #include <stdio.h>
 #include <stdlib.h>
 uint8_t* vm_base;
@@ -63,7 +63,8 @@ void rsx_raise_user_cmd(uint32_t arg) { (void)arg; }
 #define IO_ADDR   0x00100000u
 #define IO_SIZE   0x00100000u
 #define CMD_SIZE  0x00010000u
-#define SEG_B     0x00008000u
+#define CMD0      0x00001000u              /* the first segment: InitBody's context begins here */
+#define SEG_B     0x00009000u              /* the second segment */
 
 static uint32_t g_heap = 0x00400000u;
 static u32 host_alloc(u32 size, u32 align)
@@ -109,19 +110,19 @@ int main(void)
     const uint32_t ctrl = (uint32_t)(uintptr_t)cellGcmGetControlRegister();
 
     /* A: probe 0, JUMP to B.  B: probe 1, probe 2, then a park at put. */
-    u32 a = put_probe(0, 0);
+    u32 a = put_probe(CMD0, 0);
     gw32(IO_ADDR + a, 0x20000000u | SEG_B);
     u32 b = put_probe(SEG_B, 1);
     b = put_probe(b, 2);
     gw32(IO_ADDR + b, 0x20000000u | b);          /* park: JUMP to itself */
 
-    s_fifo_getoff = 0;
-    vm_write32(ctrl + 4, 0);
+    s_fifo_getoff = CMD0;
+    vm_write32(ctrl + 4, CMD0);
     vm_write32(ctrl + 0, b);                     /* put at the park */
     cellGcm_rsx_process_fifo();
 
     check(seen_n == 3, "the three probe methods ran");
-    check(seen_get[0] == 0, "in A, get is where the pass started");
+    check(seen_get[0] == CMD0, "in A, get is where the pass started");
     check(seen_get[1] == SEG_B, "in B, get is already B's start (the JUMP's target)");
     check(seen_get[2] == SEG_B, "get does not move with every method");
     check(vm_read32(ctrl + 4) == b, "after the pass, get is put");

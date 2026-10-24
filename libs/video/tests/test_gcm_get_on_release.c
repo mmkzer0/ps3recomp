@@ -16,12 +16,16 @@
  * GCM_GET_EQ_PUT=1 (argument "eq-put") the RELEASE publishes nothing and get
  * is put at the end of the pass, as before.
  *
- * gcc -std=gnu17 -I include -I libs/video
- *   libs/video/tests/test_gcm_get_on_release.c -ffunction-sections
- *   -fdata-sections -Wl,--gc-sections -pthread -o /tmp/test_gcm_get_on_release
- *   (clang on macOS: -Wl,-dead_strip)
+ * The stream starts at io 0x1000, where _cellGcmInitBody puts the first segment. The ACQUIRE in the
+ * ACQUIRE+RELEASE command waits for the value the RELEASE before it wrote to the same label, so it is
+ * already satisfied (a real wait would hold the walker: tests/gcm_initbody, test_gcm_flip_stream.c).
+ *
+ * cc -std=gnu17 -I include -I libs/video libs/video/tests/test_gcm_get_on_release.c
+ *   libs/video/gcm_default_state.c -ffunction-sections -fdata-sections -Wl,--gc-sections -pthread
+ *   -o /tmp/test_gcm_get_on_release     (clang on macOS: -Wl,-dead_strip)   (tools/test_gcm_get_on_release.py)
  */
 #include "../cellGcmSys.c"
+#include "gcm_fixture_stubs.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -73,6 +77,7 @@ void rsx_raise_user_cmd(uint32_t arg)
 #define IO_ADDR   0x00100000u
 #define IO_SIZE   0x00100000u
 #define CMD_SIZE  0x00010000u
+#define CMD0      0x00001000u              /* the first segment: InitBody's context begins here */
 
 static uint32_t g_heap = 0x00400000u;
 static u32 host_alloc(u32 size, u32 align)
@@ -123,7 +128,7 @@ int main(int argc, char** argv)
     /* probe 0, OFFSET, RELEASE 0x11, probe 1, ACQUIRE 0x11 + RELEASE 0x22 in
      * one two-method command, probe 2, probe 3; put after the last probe. */
     const u32 off = SEMA_OFF, rel1 = 0x11u, acq_rel[2] = { 0x11u, 0x22u };
-    u32 io = put_probe(0, 0);
+    u32 io = put_probe(CMD0, 0);
     io = put_cmd(io, 0, 0x64u, 1, &off);
     io = put_cmd(io, 0, 0x6Cu, 1, &rel1);
     const u32 end_rel1 = io;
@@ -134,13 +139,13 @@ int main(int argc, char** argv)
     io = put_probe(io, 3);
     const u32 put = io;
 
-    s_fifo_getoff = 0;
-    vm_write32(ctrl + 4, 0);
+    s_fifo_getoff = CMD0;
+    vm_write32(ctrl + 4, CMD0);
     vm_write32(ctrl + 0, put);
     cellGcm_rsx_process_fifo();
 
     check(seen_n == 4, "the four probe commands ran");
-    check(seen_get[0] == 0 && seen_label[0] == 0, "before any RELEASE, neither get nor the label has moved");
+    check(seen_get[0] == CMD0 && seen_label[0] == 0, "before any RELEASE, neither get nor the label has moved");
     check(seen_label[1] == 0x11u, "the RELEASE wrote its label");
     check(seen_label[2] == 0x22u, "the RELEASE inside ACQUIRE+RELEASE wrote its label");
     if (!eq_put) {
@@ -148,7 +153,7 @@ int main(int argc, char** argv)
         check(seen_get[2] == end_rel2, "get is past the whole ACQUIRE+RELEASE command");
         check(seen_get[3] == end_rel2, "get does not move with the methods after it");
     } else {
-        check(seen_get[1] == 0 && seen_get[2] == 0 && seen_get[3] == 0,
+        check(seen_get[1] == CMD0 && seen_get[2] == CMD0 && seen_get[3] == CMD0,
               "GCM_GET_EQ_PUT: a RELEASE publishes nothing mid-pass");
     }
     check(vm_read32(ctrl + 4) == put, "after the pass, get is put");
