@@ -47,10 +47,12 @@
  *
  * Port2Sync blocking. A blocked Sync registers a waiter id in the port line
  * (port.hpp) and sleeps on one bit of the queue's first 64-bit event flag
- * (+0x80): id n is bit n of it, 64 ids (0..63). The PM's wake does the
- * matching flag set (jq2c-013). The firmware's wake helper (0x6348) rejects
- * ids above 63, so a 65th concurrent Sync is the named stop `jq2-wake`
- * (reason `waiter-id`), not a wait for a free id.
+ * (+0x80): id n is bit n of it. The four BE32 guest bitmap words at
+ * +0x88..+0x94 allocate MSB first through reservation-model transactions.
+ * Id0 leaks on first allocation (the firmware's sentinel collision), leaving
+ * ids 1..63 wakeable. The PM's wake helper (0x6348) rejects ids above 63, so
+ * the 64th concurrent Sync publishes its attempted id64 allocation and stops
+ * with `jq2-wake reason=waiter-id`, rather than waiting forever.
  *
  * A job in the scheduler's terms: one instance per worker with ONE job slot,
  * because a worker runs a job to completion before it examines the ring again

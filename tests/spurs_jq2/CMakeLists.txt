@@ -89,7 +89,7 @@ set_tests_properties(jq2_port_race_stress PROPERTIES LABELS "spurs;stress" TIMEO
 #   jq2_exec_sync       Port2Sync modes 0 and 4, BUSY, INVAL for every other mode
 #   jq2_exec_sync_concurrent  several PPU threads blocked in mode 0 at once, each woken by its own credits
 #   jq2_exec_join       Shutdown / Join with outstanding jobs (L1), caller-owned buffers (L2)
-#   jq2_exec_stop_waiter_id, _waiter_alloc, _wait  jq2-wake: a waiter id above 63, a 65th blocked Sync, a failed wait
+#   jq2_exec_stop_waiter_id, _waiter_alloc, _wait  jq2-wake: a waiter id above 63, a 64th blocked Sync, a failed wait
 #   jq2_exec_stop_push_shutdown, _copy_push_shutdown  jq2-state: a push that lands after Shutdown
 #   jq2_exec_observer   the job observer: layout at start, r3 at end, off when removed
 #   jq2_exec_validate   every guard and status code of jq2.h
@@ -106,7 +106,7 @@ target_link_libraries(test_jq2_executor PRIVATE ps3recomp_spurs_jq2 Threads::Thr
 set_target_properties(test_jq2_executor PROPERTIES LINKER_LANGUAGE CXX)
 foreach(mode premature copy credit wrap barrier sync join observer validate lifted layout layout-896 jm-wait heap-fit
               stop-job stop-halt stop-jm stop-jm-lifted stop-heap stop-unmodelled stop-crt stop-ring
-              sync-concurrent stop-waiter-id stop-waiter-alloc stop-wait stop-push-shutdown stop-copy-push-shutdown)
+              sync-concurrent waiter-fresh waiter-63 stop-waiter-id stop-waiter-alloc stop-wait stop-push-shutdown stop-copy-push-shutdown)
     string(REPLACE "-" "_" name "${mode}")
     add_test(NAME jq2_exec_${name} COMMAND test_jq2_executor ${mode})
     set_tests_properties(jq2_exec_${name} PROPERTIES LABELS "spurs;t0;tsan" TIMEOUT 300)

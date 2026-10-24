@@ -46,7 +46,7 @@
  *               once, each woken by its own credits
  *   stop-waiter-id   a credit finds an event-flag waiter with id 64: jq2-wake
  *               reason=waiter-id
- *   stop-waiter-alloc  a 65th concurrent blocked Sync: jq2-wake reason=waiter-id
+ *   stop-waiter-alloc  a 64th concurrent blocked Sync: jq2-wake reason=waiter-id
  *   stop-wait   a blocked Sync whose event flag was destroyed: jq2-wake reason=wait
  *   stop-push-shutdown, stop-copy-push-shutdown  a push that passed its checks
  *               and reaches the ring after Shutdown: jq2-state
@@ -58,7 +58,9 @@
 #include "spu_context.h"
 #include "spu_helpers.h"
 #include "spu_observe.h"
+#include "spu_coherency.h"
 #include "syscalls/sys_event.h"
+#include "memory/reservation.h"
 
 #include <sys/mman.h>
 #include <sys/wait.h>
@@ -72,6 +74,7 @@
 #include <cstring>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -1559,6 +1562,90 @@ void expect_stop(const std::function<void()>& child, const char* kind, std::init
     CHECK(err.find("the stop did not happen") == std::string::npos, "the child ran past the stop");
 }
 
+std::uint32_t bitmap_atomic(spu_context* ctx, std::uint32_t cmd)
+{
+    spu_wrch(ctx, MFC_LSA, spu_make_preferred_u32(0x1000));
+    spu_wrch(ctx, MFC_EAH, spu_make_preferred_u32(0));
+    spu_wrch(ctx, MFC_EAL, spu_make_preferred_u32(QUEUE + 0x80));
+    spu_wrch(ctx, MFC_Cmd, spu_make_preferred_u32(cmd));
+    return spu_rdch(ctx, MFC_RdAtomicStat)._u32[0];
+}
+
+/* Exercise the real Sync path twice: zero is allocated and leaked, not
+ * pre-reserved, and the released event id remains stale in the port. */
+void mode_waiter_fresh()
+{
+    build_image(IMAGE, Prog::transform);
+    install_hooks();
+    Rig rig({128, 1, false});
+    auto spu = std::make_unique<spu_context>();
+    spu_context_init(spu.get(), 7);
+    for (unsigned w = 0; w < 4; ++w) CHECK(get32(QUEUE + 0x88 + 4 * w) == 0, "fresh bitmap word %u", w);
+    for (unsigned round = 0; round < 2; ++round) {
+        CHECK(set_intake_paused(QUEUE, true), "pause");
+        const JobSpec job = spec(round);
+        CHECK(rig.push(job.desc, 64, 0) == 0, "push");
+        ppu_context reservation{};
+        resv_lwarx32(&reservation, QUEUE + 0x98);
+        bitmap_atomic(spu.get(), MFC_GETLLAR_CMD);
+        std::int32_t rc = -1;
+        std::thread waiter([&] { rc = jq2_port_sync(PORT, 0); });
+        CHECK(wait_for([] { return (port_a(PORT) & 0x80000000u) != 0; }), "registered");
+        CHECK(get32(QUEUE + 0x88) == 0xC0000000u, "id0 leaked and id1 allocated");
+        CHECK(get32(PORT + 4) == 1, "first wakeable id is 1");
+        CHECK(resv_stcx32(&reservation, QUEUE + 0x98, 0) == 0, "allocation invalidates neighboring reservation");
+        CHECK(bitmap_atomic(spu.get(), MFC_PUTLLC_CMD) != 0, "allocation kills SPU reservation");
+        bitmap_atomic(spu.get(), MFC_GETLLAR_CMD);
+        resv_lwarx32(&reservation, QUEUE + 0x98);
+        CHECK(jq2_queue_shutdown(QUEUE) == JQ2_ERR_BUSY, "attached blocked port prevents Shutdown");
+        CHECK(jq2_port_destroy(PORT) == JQ2_ERR_BUSY, "blocked port prevents Destroy");
+        CHECK(set_intake_paused(QUEUE, false), "resume");
+        waiter.join();
+        CHECK(rc == 0 && job_ok(job), "Sync completes after real output");
+        CHECK(get32(QUEUE + 0x88) == 0x80000000u, "only id0 remains allocated");
+        CHECK(resv_stcx32(&reservation, QUEUE + 0x98, 0) == 0, "release invalidates neighboring reservation");
+        CHECK(bitmap_atomic(spu.get(), MFC_PUTLLC_CMD) != 0, "release kills SPU reservation");
+        CHECK(get32(PORT + 4) == 1 && (port_a(PORT) & 0x80000000u) == 0, "stale id retained after wake");
+        CHECK(jq2_port_sync(PORT, 4) == 0 && get32(PORT + 4) == 1, "poll preserves stale id");
+        for (unsigned w = 1; w < 4; ++w) CHECK(get32(QUEUE + 0x88 + 4 * w) == 0, "unused bitmap word %u", w);
+    }
+    spu_coh_unregister(spu.get());
+    spu_mfc_release(spu.get());
+    rig.teardown();
+}
+
+/* Pretend ids0..62 are owned by other ports, using the same guest reservation
+ * transaction as a guest allocator. The last wakeable bit must be usable. */
+int occupy_waiters(std::uint8_t*, void* user)
+{
+    const unsigned words = *static_cast<unsigned*>(user);
+    for (unsigned w = 0; w < words; ++w) put32(QUEUE + 0x88 + 4 * w, 0xFFFFFFFFu);
+    if (words == 1) put32(QUEUE + 0x8C, 0xFFFFFFFEu);
+    return 1;
+}
+
+void mode_waiter_63()
+{
+    build_image(IMAGE, Prog::transform);
+    install_hooks();
+    Rig rig({128, 1, false});
+    unsigned words = 1;
+    resv_host_rmw(QUEUE + 0x88, &occupy_waiters, &words);
+    CHECK(set_intake_paused(QUEUE, true), "pause");
+    const JobSpec job = spec(0);
+    CHECK(rig.push(job.desc, 64, 0) == 0, "push");
+    std::int32_t rc = -1;
+    std::thread waiter([&] { rc = jq2_port_sync(PORT, 0); });
+    CHECK(wait_for([] { return (port_a(PORT) & 0x80000000u) != 0; }), "registered");
+    CHECK(get32(PORT + 4) == 63 && get32(QUEUE + 0x8C) == 0xFFFFFFFFu, "id63 uses word1 low bit");
+    CHECK(set_intake_paused(QUEUE, false), "resume");
+    waiter.join();
+    CHECK(rc == 0 && job_ok(job), "flag bit63 wakes after output");
+    CHECK(get32(QUEUE + 0x88) == 0xFFFFFFFFu && get32(QUEUE + 0x8C) == 0xFFFFFFFEu, "only id63 released");
+    CHECK(get32(PORT + 4) == 63 && jq2_port_sync(PORT, 4) == 0 && get32(PORT + 4) == 63, "id63 stays stale");
+    rig.teardown();
+}
+
 /* Several PPU threads blocked in Port2Sync mode 0 at the same time, one port
  * each. Each registers its own waiter id, all stay blocked while intake is
  * paused, and each is woken by the credit of its own job. */
@@ -1578,6 +1665,32 @@ void mode_sync_concurrent()
         CHECK(jq2_port_push_job(port, specs.back().desc, 64, 0, 1) == 0, "push on port %u", i);
     }
 
+    /* Exercise the SPU-marked line lock path and competing PPU reservations,
+     * without letting unrelated neighboring stores get overwritten. */
+    resv_mark_spu(QUEUE + 0x88);
+    put32(QUEUE + 0x9C, 0x12345678u);
+    std::atomic<bool> touching{true};
+    std::atomic<unsigned> touches{0};
+    std::thread toucher([&] {
+        ppu_context ctx{};
+        while (touching.load(std::memory_order_acquire)) {
+            const auto value = resv_lwarx32(&ctx, QUEUE + 0x98);
+            if (resv_stcx32(&ctx, QUEUE + 0x98, value + 1)) touches.fetch_add(1);
+        }
+    });
+    CHECK(wait_for([&] { return touches.load() != 0; }), "neighbor conditional store runs");
+    std::atomic<unsigned> spu_touches{0};
+    std::thread spu_toucher([&] {
+        auto ctx = std::make_unique<spu_context>();
+        spu_context_init(ctx.get(), 7);
+        while (touching.load(std::memory_order_acquire)) {
+            bitmap_atomic(ctx.get(), MFC_GETLLAR_CMD);
+            if (bitmap_atomic(ctx.get(), MFC_PUTLLC_CMD) == 0) spu_touches.fetch_add(1);
+        }
+        spu_coh_unregister(ctx.get());
+        spu_mfc_release(ctx.get());
+    });
+    CHECK(wait_for([&] { return spu_touches.load() != 0; }), "SPU conditional store runs");
     std::atomic<std::int32_t> result[kPorts];
     for (auto& r : result) r = -1;
     std::vector<std::thread> threads;
@@ -1592,17 +1705,23 @@ void mode_sync_concurrent()
     for (unsigned i = 0; i < kPorts; ++i) {
         const std::uint32_t port = PORT + 0x80 * i;
         const std::uint32_t id = get32(port + 0x04);
-        CHECK(id < 64, "port %u waiter id %u is within the firmware's 0..63", i, id);
+        CHECK(id >= 1 && id < 64, "port %u waiter id %u is within the firmware's 1..63", i, id);
         CHECK(((port_a(port) >> 29) & 3) == 2, "port %u waits on an event flag (kind 2)", i);
         CHECK(id >= 64 || (seen_ids & (std::uint64_t{1} << id)) == 0, "port %u waiter id %u is not shared", i, id);
         if (id < 64) seen_ids |= std::uint64_t{1} << id;
         CHECK(((get32(port + 0x14) >> 24) & 0xFF) == 1, "port %u holds the claim", i);
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    CHECK(get32(QUEUE + 0x88) == 0xF8000000u && get32(QUEUE + 0x8C) == 0 &&
+              get32(QUEUE + 0x90) == 0 && get32(QUEUE + 0x94) == 0, "exact concurrent guest bitmap");
     for (unsigned i = 0; i < kPorts; ++i) CHECK(result[i] == -1, "port %u's Sync is still blocked", i);
 
     CHECK(set_intake_paused(QUEUE, false), "resume");
     for (auto& t : threads) t.join();
+    touching.store(false, std::memory_order_release);
+    toucher.join();
+    spu_toucher.join();
+    CHECK(get32(QUEUE + 0x98) == touches.load() && get32(QUEUE + 0x9C) == 0x12345678u,
+          "bitmap transactions preserve racing neighbor stores and guard");
     for (unsigned i = 0; i < kPorts; ++i) {
         const std::uint32_t port = PORT + 0x80 * i;
         CHECK(result[i] == 0, "port %u's Sync returned 0x%X", i, unsigned(result[i].load()));
@@ -1610,6 +1729,8 @@ void mode_sync_concurrent()
               "port %u: A=0x%X B=%u claim=0x%X", i, port_a(port), port_b(port), get32(port + 0x14));
         CHECK(job_ok(specs[i]), "job %u output", i);
     }
+    CHECK(get32(QUEUE + 0x88) == 0x80000000u && get32(QUEUE + 0x8C) == 0 &&
+              get32(QUEUE + 0x90) == 0 && get32(QUEUE + 0x94) == 0, "concurrent release retains only leaked0");
     const jq2_stats s = rig.stats();
     CHECK(s.dispatched == kPorts && s.executed == kPorts && s.credited == kPorts, "counts");
     for (unsigned i = 1; i < kPorts; ++i) CHECK(jq2_port_destroy(PORT + 0x80 * i) == 0, "port %u destroy", i);
@@ -1636,28 +1757,33 @@ void mode_stop_waiter_id()
         "jq2-wake", {"reason=waiter-id", "kind=2", "id=64"});
 }
 
-/* 64 Syncs are blocked on 64 ports, so the 65th would need id 64. */
+/* The attempted id64 allocation is published before the fail-closed stop. */
 void mode_stop_waiter_alloc()
 {
     expect_stop(
         [] {
-            constexpr unsigned kSyncs = 65;
+            constexpr unsigned kSyncs = 1;
             build_image(IMAGE, Prog::transform);
             install_hooks();
             arm_child_watchdog(5);
             Rig rig({128, 1, false});
             CHECK(set_intake_paused(QUEUE, true), "pause");
+            unsigned words = 2;
+            resv_host_rmw(QUEUE + 0x88, &occupy_waiters, &words);
             for (unsigned i = 0; i < kSyncs; ++i) {
                 const std::uint32_t port = PORT + 0x80 * i;
                 if (i != 0) CHECK(jq2_port_create(port, QUEUE) == 0, "port %u create", i);
                 const JobSpec s = spec(i);
                 CHECK(jq2_port_push_job(port, s.desc, 64, 0, 1) == 0, "push on port %u", i);
             }
-            std::vector<std::thread> threads;
-            for (unsigned i = 0; i < kSyncs; ++i) threads.emplace_back([i] { jq2_port_sync(PORT + 0x80 * i, 0); });
-            std::this_thread::sleep_for(std::chrono::seconds(30));
+            std::thread([] { jq2_port_sync(PORT, 0); }).detach();
+            wait_for([] { return false; }, 10000);
         },
-        "jq2-wake", {"reason=waiter-id", "id=64"});
+        "jq2-wake", {"reason=waiter-id", "queue=0x10000", "id=64",
+                     "bitmap=0xFFFFFFFFFFFFFFFF8000000000000000", "fw=\"pm-wake-rejects-id>63\""});
+    CHECK(get32(QUEUE + 0x88) == 0xFFFFFFFFu && get32(QUEUE + 0x8C) == 0xFFFFFFFFu &&
+              get32(QUEUE + 0x90) == 0x80000000u && get32(QUEUE + 0x94) == 0, "attempted id64 bit remains at stop");
+    CHECK((port_a(PORT) & 0x80000000u) == 0 && get32(OUT) == 0, "id64 never registered or executed");
 }
 
 /* A destroyed event flag makes the blocked Sync's wait fail. */
@@ -1750,6 +1876,8 @@ int main(int argc, char** argv)
     else if (mode == "stop-heap") mode_stop_heap();
     else if (mode == "stop-ring") mode_stop_ring();
     else if (mode == "sync-concurrent") mode_sync_concurrent();
+    else if (mode == "waiter-fresh") mode_waiter_fresh();
+    else if (mode == "waiter-63") mode_waiter_63();
     else if (mode == "stop-waiter-id") mode_stop_waiter_id();
     else if (mode == "stop-waiter-alloc") mode_stop_waiter_alloc();
     else if (mode == "stop-wait") mode_stop_wait();
