@@ -631,6 +631,34 @@ s32 cellRescSetConvertAndFlip(void* context, s32 index)
     return CELL_OK;
 }
 
+/* cellRescSetWaitFlip(context) -- firmware 020045E8 (export 02000488, NID 0x0D3C22CE). SDK `void`.
+ * Appends one 4-word group to the command context at guest EA `context`, which holds the RSX until
+ * the previous flip has been executed:
+ *
+ *     NV406E SEMAPHORE_OFFSET (0x0064) = <label offset>,  NV406E SEMAPHORE_ACQUIRE (0x0068) = 0
+ *
+ * The label is 0x10, the flip-done label `_cellGcmSetFlipCommand` releases as 0xFFFFFFFF just before
+ * its flip head and the driver sets back to 0 when it completes the flip (cellGcmTickVBlank). The
+ * one other case is 720x576 (the stored display mode, +0xD0, is 2) with a non-zero PAL temporal mode
+ * (+0x10) other than 5: the label is 18 << 4 (0x120), or 19 << 4 when +0x1DC == 1. The firmware only
+ * ever clears +0x1DC (stores at 02003B30 and 02003BC0 write 0, nothing writes 1), so it is 18.
+ *
+ * The group is reserved like every group of the library (`current + 16 > end` -> callback(ctx, 4); a
+ * callback that returns non-zero abandons the group, which cellGcm_ctx_reserve reports as the
+ * gcm-unmodelled stop). It does not check that cellRescInit ran. The firmware's r3 on return is the
+ * context when no callback ran and the callback's 0 otherwise; nothing reads it. */
+s32 cellRescSetWaitFlip(void* context)
+{
+    const u32 ctx = (u32)(uintptr_t)context;
+    u32 label = 0x10;
+    if (s_display_mode == CELL_RESC_720x576 && s_config.palTemporalMode != 0 && s_config.palTemporalMode != 5)
+        label = 18u << 4;
+    const u32 w[4] = { 0x00040064u, label, 0x00040068u, 0u };
+    const int callback = vm_read32(ctx + 8) + 16u > vm_read32(ctx + 4);
+    cellGcm_ctx_emit(ctx, w, 4);
+    return callback ? 0 : (s32)ctx;
+}
+
 s32 cellRescSetFlipHandler(void (*handler)(u32))
 {
     s_flip_handler_opd = (u32)(uintptr_t)handler;

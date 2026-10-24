@@ -21,11 +21,12 @@
  *      status was reset, and not for a flip queued after that beat.
  *   7. A flip requested outside the stream completes on the next beat, once.
  *
- * gcc -std=gnu17 -I include -I libs/video libs/video/tests/test_gcm_flip_stream.c
- *   -ffunction-sections -fdata-sections -Wl,--gc-sections -pthread
- *   -o /tmp/test_gcm_flip_stream        (clang on macOS: -Wl,-dead_strip)
+ * cc -std=gnu17 -I include -I libs/video libs/video/tests/test_gcm_flip_stream.c
+ *   libs/video/gcm_default_state.c -ffunction-sections -fdata-sections -Wl,--gc-sections -pthread
+ *   -o /tmp/test_gcm_flip_stream        (clang on macOS: -Wl,-dead_strip)   (tools/test_gcm_flip_stream.py)
  */
 #include "../cellGcmSys.c"
+#include "gcm_fixture_stubs.h"
 #include <stdio.h>
 #include <stdlib.h>
 uint8_t* vm_base;
@@ -135,11 +136,19 @@ int main(void)
     long p = GCM_PENDING_TAKE();
     check((p & 1) && !(p & 2), "a tick before the drain is a vblank, not a flip");
 
-    /* 3: the title flushes; the walker runs to put (the acquire does not block
-     * unless GCM_SEMA_ACQUIRE is set) and stops at the flip. */
+    /* 3: the title flushes. The ACQUIRE is a real wait (the label holds 0, not VALUE): the walker is
+     * held at it, nothing past it runs and no flip completes. The agent that writes the label (an SPU
+     * job, a PPU thread) then does so, and the walker runs to put and stops at the flip. */
     vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io + 20);
     cellGcm_rsx_process_fifo();
-    check(s_fifo_getoff == io + 20, "the drain consumed the wait and the flip");
+    check(s_fifo_getoff == io + 8,
+          "the drain is held at the ACQUIRE (OFFSET consumed): the label has not reached the value");
+    cellGcm_request_tick();
+    p = GCM_PENDING_TAKE();
+    check((p & 1) && !(p & 2), "a held flip does not complete on the next tick");
+    vm_write32(label_ea, VALUE);
+    cellGcm_rsx_process_fifo();
+    check(s_fifo_getoff == io + 20, "the label arrived: the drain consumed the wait and the flip");
     cellGcm_request_tick();
     p = GCM_PENDING_TAKE();
     check((p & 1) && (p & 2), "the next tick completes the flip");

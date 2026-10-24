@@ -414,6 +414,14 @@ unsigned long long gcm_driver_event_count(u32 kind)
  * yet answered: the NV406E acquire on label 0x30 that follows it waits for exactly that answer. */
 static int s_drv_queue_pending;
 static unsigned long long s_acq_t0;   /* tentative: defined with the label constants below */
+/* A flip head (0xE924) has retired and the driver has not yet completed the flip: the next vblank
+ * writes 0 to the flip-done label (0x10), which libgcm_sys's flip stream released as 0xFFFFFFFF just
+ * before the head and which cellRescSetWaitFlip's ACQUIRE waits to see 0 [INFERENCE: the label is
+ * the driver's, and the recording shows it 0 between flips]. */
+static volatile int s_drv_flip_label_pending;
+/* The last walker pass ended on an NV406E ACQUIRE. Everything ahead of it has executed, so a flip
+ * head retired before it is ready to present although get != put. */
+static volatile int s_acquire_blocked;
 
 /* New session: no event retired, no flip awaiting its handshake, no acquire standing. */
 static void gcm_driver_events_reset(void)
@@ -421,6 +429,8 @@ static void gcm_driver_events_reset(void)
     atomic_store(&s_driver_event_seq, 0ull);
     for (u32 k = 0; k < GCM_DRV_EVENT_KINDS; k++) atomic_store(&s_driver_event_count[k], 0ull);
     s_drv_queue_pending = 0;
+    s_drv_flip_label_pending = 0;
+    s_acquire_blocked = 0;
     s_acq_t0 = 0;
 }
 
@@ -993,7 +1003,18 @@ void ppu_gcm_pump(void)
 
 /* Back-compat: the old direct entry points now just mark a tick pending (so any
  * caller other than the ticker still works) -- delivery stays on the main thread. */
-void cellGcmTickVBlank(void) { s_vblank_count++; GCM_PENDING_SET(1); }
+/* A vblank is when the driver completes a flip the RSX has executed: the flip-done label goes back to
+ * 0, which releases an ACQUIRE waiting on it (cellRescSetWaitFlip). */
+void cellGcmTickVBlank(void)
+{
+    s_vblank_count++;
+    if (s_drv_flip_label_pending) {
+        s_drv_flip_label_pending = 0;
+        atomic_thread_fence(memory_order_release);
+        vm_write32(GCM_LABEL_GUEST_BASE + GCM_LABEL_FLIP_DONE, 0);
+    }
+    GCM_PENDING_SET(1);
+}
 /* Only deliver a flip completion when a flip is actually outstanding.
  *
  * Ticking unconditionally at 60 Hz fires the guest's flip handler even when
@@ -1543,7 +1564,7 @@ int cellGcm_take_flip_pending_synced(void)
     if (!s_flip_pending) return 0;
     u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
     u32 get = vm_read32(GCM_CONTROL_GUEST_ADDR + 4);
-    if (get != put) return 0;   /* frame not fully drained yet */
+    if (get != put && !s_acquire_blocked) return 0;   /* frame not fully drained yet */
     s_flip_pending = 0;
     return 1;
 }
@@ -1892,6 +1913,7 @@ static int gcm_get_eq_put(void)
 
 static void gcm_rsx_process_fifo_unlocked(void)
 {
+    s_acquire_blocked = 0;
     { static unsigned _n = 0; static unsigned long long _t0 = 0;
       extern unsigned long long ps3_ms_now(void);
       _n++;
@@ -2298,7 +2320,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     }
                     else if (m == 0x68u) s_acq_t0 = 0;                /* satisfied */
                 }
-                if (sem_blocked) { s_sema_blocked_pass = 1; break; }
+                if (sem_blocked) { s_sema_blocked_pass = 1; s_acquire_blocked = 1; break; }
                 s_fifo_getoff += 4 + count * 4;
                 continue;
             }
@@ -2472,6 +2494,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                         if (s_fifo_flips_reached != s_fifo_flips_queued) s_fifo_flips_reached++;
                     }
                     gcm_driver_event(GCM_DRV_EVENT_FLIP_HEAD, s_drv_flip_queue);
+                    s_drv_flip_label_pending = 1;
                     drv_flip = 1;
                 } else if (mfull == 0xE920u || mfull == 0xE924u) {
                     cellGcmSetFlipCommand(vm_read32(dea) & 7u);
