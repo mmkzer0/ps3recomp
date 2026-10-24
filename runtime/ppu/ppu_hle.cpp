@@ -23,6 +23,7 @@
 #include "ps3emu/milestone.h" /* ps3_msf -- boot milestone log */
 #include "ps3emu/stop.h"      /* ps3_stop_register_frontier */
 #include "ps3emu/config.h"    /* ps3_config_find_hle_stub */
+#include "ps3emu/hle_observer.h"
 #include <atomic>
 #include <mutex>
 #include <unordered_set>
@@ -266,7 +267,7 @@ static void hle_top_note(uint32_t nid, const char* name, const ppu_context* ctx,
     for (int j = 0; j < ht_used; j++) ht_n[j] = 0;
 }
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
-extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
+extern "C" void ps3_hle_dispatch(uint32_t nid, ppu_context* ctx)   /* C linkage: the block-scope externs below rely on it */
 {
     /* HLE_BT_EVERY=<n>: dump the calling thread's guest stack every nth HLE
      * call it makes. WAITBT_EVERY only samples threads that are blocking on an
@@ -775,6 +776,24 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
         if(rv>=0x10000000u && (rv & 0xFFFF0000u)!=0x80010000u && (rv & 0xFFFF0000u)!=0x80020000u){
           static int _n=0; if(PS3_LOG_FIRST(_n, 40)) fprintf(stderr,"[PTRLEAK] NID 0x%08X %s returned 0x%08X (out-of-guest-RAM host ptr?)\n",
             nid, e->name?e->name:"?", rv); } } }
+}
+
+/* The one entry every firmware import goes through. The observer (ps3emu/hle_observer.h) sees the
+ * call before the dispatch and the return after it. */
+static std::atomic<const ps3_hle_observer*> g_hle_observer{nullptr};
+
+extern "C" void ps3_hle_set_observer(const ps3_hle_observer* observer)
+{
+    g_hle_observer.store(observer, std::memory_order_release);
+}
+
+extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
+{
+    const ps3_hle_observer* obs = g_hle_observer.load(std::memory_order_acquire);
+    if (!obs) { ps3_hle_dispatch(nid, ctx); return; }
+    if (obs->on_call) obs->on_call(obs->user, nid, ctx);
+    ps3_hle_dispatch(nid, ctx);
+    if (obs->on_return) obs->on_return(obs->user, nid, ctx);
 }
 
 /* Populated by the generated registration unit (gen_hle_nids.py). Weak so a
