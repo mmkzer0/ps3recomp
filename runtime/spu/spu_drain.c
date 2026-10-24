@@ -7,6 +7,7 @@
  * place -- later milestones only replace the bodies. */
 #include "spu_context.h"
 #include <setjmp.h>
+#include <stdatomic.h>
 
 /* See spu_context.h `irq_frame`. */
 typedef struct spu_irq_frame {
@@ -127,9 +128,12 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
     /* 0x2318 = the type-2 load's ring-full bail (resets scan, retries). */
     if ((ctx->pc & 0x3FFFF) != 0x2318) return;
 
-    static SPU_THREAD_LOCAL unsigned s_bail = 0;
-    if (++s_bail < 4096) return;      /* only after a real spin, not one pass */
-    s_bail = 0;
+    /* Shared, as before the per-thread split: the sweep threshold is a
+     * process-wide spin budget, not one budget per worker. */
+    static _Atomic unsigned s_bail = 0;
+    if (atomic_fetch_add_explicit(&s_bail, 1, memory_order_relaxed) + 1 < 4096)
+        return;                       /* only after a real spin, not one pass */
+    atomic_store_explicit(&s_bail, 0, memory_order_relaxed);
 
     /* Set bit 31 (the 0x8000 first-halfword done flag) on each pending record
      * the release sweep scans (16 slots, 4-byte stride at LS 0xDF0), for any

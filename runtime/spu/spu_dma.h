@@ -23,6 +23,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include "../../include/ps3emu/stop.h"
 #include "../../include/ps3emu/config.h"
@@ -326,12 +327,16 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
           ++tot;
           /* On the first PUT to EA 0, dump the whole local store: the code that
            * computed the null destination, and the LS words it read it from,
-           * are both in there. */
+           * are both in there. Once per process, not once per worker -- every
+           * worker's first null PUT would overwrite the same file. */
           if (tot == 1 && (uint32_t)ea == 0) {
-              FILE* f = fopen("spu_ls_nullput.bin", "wb");
-              if (f) { fwrite(spu->ls, 1, 0x40000, f); fclose(f);
-                  fprintf(stderr, "[put] wrote spu_ls_nullput.bin (pc=0x%05X)%c",
-                          (uint32_t)spu->pc & SPU_LS_MASK, 10); }
+              static _Atomic int s_dumped = 0;
+              if (!atomic_exchange_explicit(&s_dumped, 1, memory_order_relaxed)) {
+                  FILE* f = fopen("spu_ls_nullput.bin", "wb");
+                  if (f) { fwrite(spu->ls, 1, 0x40000, f); fclose(f);
+                      fprintf(stderr, "[put] wrote spu_ls_nullput.bin (pc=0x%05X)%c",
+                              (uint32_t)spu->pc & SPU_LS_MASK, 10); }
+              }
           }
           { static SPU_THREAD_LOCAL u32 seen[48]; static SPU_THREAD_LOCAL int ns = 0;
             u32 k = (uint32_t)ea & ~0xFFFFu;       /* 64 KB granularity */

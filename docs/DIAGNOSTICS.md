@@ -1020,11 +1020,11 @@ requires the opt-in `spu.dma_repeat_stop_secs` (default 0 = never stop); see
   `runtime/spu/spu_channels.c:1767`
 - **`SPU_IRQTRACE`** — _(no description in source)_
   `runtime/spu/spu_channels.c:1548`  _(+1 more sites)_
-- **`SPU_JOBDRAIN`** — _(no description in source)_
+- **`SPU_JOBDRAIN`** — SPU_JOBDRAIN=1: when a job's ring-full bail (LS 0x2318) spins, mark the pending ring records done. The spin threshold is shared by the whole process (one budget, not one per worker): the sweep mutates the one guest local store.
   `runtime/spu/spu_drain.c:101`
 - **`SPU_JOBEXEC`** — _(no description in source)_
   `runtime/spu/spu_channels.c:1934`
-- **`SPU_JOBEXEC_DUMP`** — _(no description in source)_
+- **`SPU_JOBEXEC_DUMP`** — SPU_JOBEXEC_DUMP=<path>: write the full 256 KB local store at the first job-entry dispatch (pc 0x4A40). Once per process: a per-worker dump would overwrite the same oracle file.
   `runtime/spu/spu_channels.c:1945`
 - **`SPU_JOBTRACE`** — _(no description in source)_
   `runtime/spu/spu_channels.c:1864`
@@ -1056,13 +1056,13 @@ requires the opt-in `spu.dma_repeat_stop_secs` (default 0 = never stop); see
   `runtime/spu/spu_drain.c:50`
 - **`SPU_OVL_DIAG`** — LBP overlay-load diagnosis: a GET of the FMOD overlay descriptor (32B from ~0x94Fxxx) then a large GET from a NULL source = the overlay never loads. Dump the descriptor content to see where the real source EA was dropped. */
   `runtime/spu/spu_dma.h:535`
-- **`SPU_PCHIST`** — _(no description in source)_
+- **`SPU_PCHIST`** — SPU_PCHIST=1: per-worker histogram of trampoline hops by the GPU module's symbol ranges, printed every 4M hops. The gate and counters are thread-local because every worker enters the tick on its first hop.
   `runtime/spu/spu_context.h:662`
 - **`SPU_POLLTRACE`** — _(no description in source)_
   `runtime/spu/spu_channels.c:289`  _(+3 more sites)_
 - **`SPU_PUTEA`** — SPU_PUTEA=1: the first few FULL destination addresses per SPU. The 1 MB bucket histogram showed spu1..3 writing only bucket 0 and spu0 buckets 1..3, with nothing in bucket 4 -- where the composite samples PS1 VRAM (RSX local + 0x400000). Buckets keep only 4 address bits, so that may be an artifact of where RSX local memory actually sits; the full EA settles it. */
   `runtime/spu/spu_dma.h:1011`
-- **`SPU_PUTHIST`** — _(no description in source)_
+- **`SPU_PUTHIST`** — SPU_PUTHIST=1: histogram of PUT destinations by 1 MB bucket. The first null PUT to EA 0 dumps the whole local store to `spu_ls_nullput.bin`; that dump is claimed once per process, not once per worker.
   `runtime/spu/spu_dma.h:266`  _(+1 more sites)_
 - **`SPU_RAW_DBG`** — _(no description in source)_
   `runtime/spu/spu_raw.c:93`
@@ -1096,17 +1096,17 @@ requires the opt-in `spu.dma_repeat_stop_secs` (default 0 = never stop); see
   `runtime/spu/spu_dma.h:1440`
 - **`SPU_TAILRET`** — _(no description in source)_
   `runtime/spu/spu_drain.c:343`
-- **`SPU_TRACE`** — _(no description in source)_
+- **`SPU_TRACE`** — SPU_TRACE=1: enable the per-instruction trace on stderr. The destination and budget are process-wide, so every SPU worker writes the one stream. The environment is still the only opt-in; `spu_trace_init(path)` only redirects the destination.
   `runtime/spu/spu_channels.c:2186`
 - **`SPU_TRACE_AT_WALL`** — _(no description in source)_
   `runtime/spu/spu_channels.c:2166`
-- **`SPU_TRACE_FILE`** — _(no description in source)_
+- **`SPU_TRACE_FILE`** — SPU_TRACE_FILE=<path>: redirect the trace to <path> and opt in. Opened once per process by the one worker elected to read the environment; the other workers wait for that destination, so none can truncate the file. `spu_trace_init(<path>)` sets the same destination, but SPU_TRACE or SPU_TRACE_FILE is still required to enable output.
   `runtime/spu/spu_channels.c:2185`
 - **`SPU_TRACE_FLOWCTX`** — _(no description in source)_
   `runtime/spu/spu_channels.c:2173`
 - **`SPU_TRACE_IMG`** — _(no description in source)_
   `runtime/spu/spu_channels.c:2179`
-- **`SPU_TRACE_MAX`** — _(no description in source)_
+- **`SPU_TRACE_MAX`** — SPU_TRACE_MAX=<n>: process-wide line budget for the trace (default 200000, 0 = unbounded). One shared counter, so concurrent workers cannot each write a full budget.
   `runtime/spu/spu_channels.c:2188`
 - **`SPU_VRAMPC`** — _(no description in source)_
   `runtime/spu/spu_dma.h:926`

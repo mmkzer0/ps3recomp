@@ -154,7 +154,9 @@ static inline u128 spu_splat_u32(uint32_t v) {
  * One line per site. */
 static inline void spu_unsupported(uint32_t pc, const char* mnemonic)
 {
-    static int warned;
+    /* Included by generated lifted C (C17) and by the JQ2 C++ executor test, so
+     * use the header's portable storage class rather than _Thread_local. */
+    static SPU_THREAD_LOCAL int warned;
     if (warned < 64) {
         warned++;
         fprintf(stderr, "[spu] UNSUPPORTED %s at LS 0x%05X -- executed, "

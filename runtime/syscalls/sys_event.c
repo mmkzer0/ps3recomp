@@ -1164,9 +1164,11 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
     uint64_t bitpat     = LV2_ARG_U64(ctx, 1);
     uint32_t mode       = LV2_ARG_U32(ctx, 2);
     uint32_t result_addr = LV2_ARG_PTR(ctx, 3);
-    { static int n=0; if(PS3_LOG_FIRST(n, 30)) fprintf(stderr,"[WAIT] event_flag_wait(flag=%u pat=0x%llX mode=%u)\n", flag_id,(unsigned long long)bitpat,mode); }
+    /* Diagnostics on a PPU syscall several threads issue: per-thread counters,
+     * so PS3_LOG_FIRST does not race and each thread logs its own first calls. */
+    { static _Thread_local int n=0; if(PS3_LOG_FIRST(n, 30)) fprintf(stderr,"[WAIT] event_flag_wait(flag=%u pat=0x%llX mode=%u)\n", flag_id,(unsigned long long)bitpat,mode); }
     uint64_t timeout_us = LV2_ARG_U64(ctx, 4);
-    { static int _w=0; if (PS3_LOG_FIRST(_w, 40)) fprintf(stderr, "[WAIT] event_flag_wait(flag=%u bits=0x%llX timeout=%llu)\n", flag_id, (unsigned long long)bitpat, (unsigned long long)timeout_us); }
+    { static _Thread_local int _w=0; if (PS3_LOG_FIRST(_w, 40)) fprintf(stderr, "[WAIT] event_flag_wait(flag=%u bits=0x%llX timeout=%llu)\n", flag_id, (unsigned long long)bitpat, (unsigned long long)timeout_us); }
     /* SPU-completion shim (targeted): the main thread spins in func_003319D0 until
      * *(r29+0x24) (a completion counter the SPU would increment) reaches the target
      * *(r29). Since we don't yet run the SPU workload, satisfy that counter so the
@@ -1179,7 +1181,7 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
         uint32_t obj = (uint32_t)ctx->gpr[29];
         uint8_t* tgt = (uint8_t*)vm_to_host(obj);
         uint8_t* cur = (uint8_t*)vm_to_host(obj + 0x24);
-        static int _n=0; if (PS3_LOG_FIRST(_n, 12))
+        static _Thread_local int _n=0; if (PS3_LOG_FIRST(_n, 12))
             fprintf(stderr, "[evt] SPU-completion shim: flag=%u r29=0x%08X target=%02X%02X%02X%02X cur=%02X%02X%02X%02X -> satisfied\n",
                     flag_id, obj, tgt[0],tgt[1],tgt[2],tgt[3], cur[0],cur[1],cur[2],cur[3]);
         cur[0]=tgt[0]; cur[1]=tgt[1]; cur[2]=tgt[2]; cur[3]=tgt[3];
@@ -1187,7 +1189,7 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
     }
 
     if (flag_id == 0 || flag_id > SYS_EVENT_FLAG_MAX) {
-        { static int _e=0; if(PS3_LOG_FIRST(_e, 8)) fprintf(stderr,"[evt] flag_wait flag=%u OUT-OF-RANGE (max=%d) -> ESRCH\n", flag_id, SYS_EVENT_FLAG_MAX); }
+        { static _Thread_local int _e=0; if(PS3_LOG_FIRST(_e, 8)) fprintf(stderr,"[evt] flag_wait flag=%u OUT-OF-RANGE (max=%d) -> ESRCH\n", flag_id, SYS_EVENT_FLAG_MAX); }
         return (int64_t)(int32_t)CELL_ESRCH;
     }
 
@@ -1196,15 +1198,15 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
      * NEVER-CREATED flag -> ESRCH each time. Test whether returning CELL_OK
      * (as if the flag were set) breaks the spin and lets the game progress into
      * real render code. Diagnostic only; identifies whether the spin is the gate. */
-    { static int s_f = -1; if (s_f < 0) s_f = getenv("PS3_EVF_OK_IF_MISSING") ? 1 : 0;
+    { static _Thread_local int s_f = -1; if (s_f < 0) s_f = getenv("PS3_EVF_OK_IF_MISSING") ? 1 : 0;
       if (s_f && !g_sys_event_flags[flag_id-1].active) {
-        static int _n=0; if(PS3_LOG_FIRST(_n, 4)) fprintf(stderr,"[evt] PS3_EVF_OK_IF_MISSING: flag=%u -> return CELL_OK (break spin)\n", flag_id);
+        static _Thread_local int _n=0; if(PS3_LOG_FIRST(_n, 4)) fprintf(stderr,"[evt] PS3_EVF_OK_IF_MISSING: flag=%u -> return CELL_OK (break spin)\n", flag_id);
         if (result_addr != 0) { write_be32(result_addr, (uint32_t)(bitpat>>32)); write_be32(result_addr+4, (uint32_t)bitpat); }
         return CELL_OK;
       } }
     sys_event_flag_info* f = &g_sys_event_flags[flag_id - 1];
     if (!f->active) {
-        { static int _e=0; if(PS3_LOG_FIRST(_e, 8)) {
+        { static _Thread_local int _e=0; if(PS3_LOG_FIRST(_e, 8)) {
             uint32_t r29=(uint32_t)ctx->gpr[29], r30=(uint32_t)ctx->gpr[30], r31=(uint32_t)ctx->gpr[31], r3g=(uint32_t)ctx->gpr[3];
             fprintf(stderr,"[evt] flag_wait flag=%u NOT ACTIVE -> ESRCH; r3=0x%08X r29=0x%08X r30=0x%08X r31=0x%08X\n", flag_id, r3g, r29, r30, r31);
             /* dump the loop's likely counter object (r29-relative, like the flag=1000 shim's *(r29)/*(r29+0x24)) */
@@ -1225,7 +1227,7 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
 #endif
         return (int64_t)(int32_t)CELL_ESRCH;
     }
-    { static int _a=0; if(PS3_LOG_FIRST(_a, 8)) fprintf(stderr,"[evt] flag_wait flag=%u ACTIVE, pattern=0x%llX awaiting bits=0x%llX -> BLOCK\n", flag_id,(unsigned long long)f->pattern,(unsigned long long)bitpat); }
+    { static _Thread_local int _a=0; if(PS3_LOG_FIRST(_a, 8)) fprintf(stderr,"[evt] flag_wait flag=%u ACTIVE, pattern=0x%llX awaiting bits=0x%llX -> BLOCK\n", flag_id,(unsigned long long)f->pattern,(unsigned long long)bitpat); }
 
     if (bitpat == 0)
         return (int64_t)(int32_t)CELL_EINVAL;
@@ -1235,9 +1237,9 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
      * so boot stalls on a black screen. Force-satisfy the wait (set the awaited
      * bits) to see if the game advances into its real render/content code. Blunt;
      * identifies the gate. */
-    { static int s_fe = -1; if (s_fe < 0) s_fe = getenv("PS3_EVF_FORCE") ? 1 : 0;
+    { static _Thread_local int s_fe = -1; if (s_fe < 0) s_fe = getenv("PS3_EVF_FORCE") ? 1 : 0;
       if (s_fe && f->active && !flag_check(f->pattern, bitpat, mode)) {
-        static int _n = 0; if (PS3_LOG_FIRST(_n, 20))
+        static _Thread_local int _n = 0; if (PS3_LOG_FIRST(_n, 20))
             fprintf(stderr, "[evt] PS3_EVF_FORCE: force-satisfy flag=%u bits=0x%llX mode=%u\n",
                     flag_id, (unsigned long long)bitpat, mode);
 #ifdef _WIN32
@@ -1415,7 +1417,7 @@ int64_t sys_event_flag_set(ppu_context* ctx)
     uint32_t flag_id = LV2_ARG_U32(ctx, 0);
     uint64_t bitpat  = LV2_ARG_U64(ctx, 1);
 
-    { static int _n=0; if(PS3_LOG_FIRST(_n, 200)) fprintf(stderr,"[evt] flag_set(flag=%u bits=0x%llX)\n",
+    { static _Thread_local int _n=0; if(PS3_LOG_FIRST(_n, 200)) fprintf(stderr,"[evt] flag_set(flag=%u bits=0x%llX)\n",
         flag_id,(unsigned long long)bitpat); }
 
     if (flag_id == 0 || flag_id > SYS_EVENT_FLAG_MAX)

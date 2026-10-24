@@ -28,7 +28,7 @@ void spu_indirect_branch_mt(spu_context* ctx)
      * but never returns). Each SPU job runs on its own host thread, so a
      * thread-local counter + small PC ring is race-free; a trace line prints
      * every ~4M dispatches -- a healthy task finishes long before tripping. */
-    { static int s_watch = -1;
+    { static SPU_THREAD_LOCAL int s_watch = -1;
       if (s_watch < 0) s_watch = getenv("PS3_SPU_PCWATCH") ? 1 : 0;
       if (s_watch) {
           static _Thread_local unsigned long long n;

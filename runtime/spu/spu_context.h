@@ -878,10 +878,12 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc);
  * 0x171100), so they are exact rather than guessed. */
 static inline void spu_pchist_tick(const spu_context* ctx)
 {
-    static int en = -1;
+    /* Per worker: the gate is written by both workers' first hop, and the
+     * histogram is only meaningful per execution thread anyway. */
+    static SPU_THREAD_LOCAL int en = -1;
     if (en < 0) en = getenv("SPU_PCHIST") ? 1 : 0;
     if (!en) return;
-    static unsigned long long b[8][8], n;
+    static SPU_THREAD_LOCAL unsigned long long b[8][8], n;
     const unsigned sp = (unsigned)(ctx->spu_id & 7u);
     const uint32_t pc = (uint32_t)ctx->pc & SPU_LS_MASK;
     const int k = pc < 0x00188u ? 0

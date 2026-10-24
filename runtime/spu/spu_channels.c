@@ -2628,13 +2628,17 @@ void spu_indirect_branch(spu_context* ctx)
           /* SPU_JOBEXEC_DUMP=<path>: write the full 256KB LS the first time a job
            * entry (pc==codeBuffer+entryOffset) dispatches, to diff vs the RPCS3
            * oracle SPU4 dump (why our job bails where the oracle's runs). */
-          static SPU_THREAD_LOCAL int s_dumped = 0;
-          if (!s_dumped && ctx->pc == 0x4A40) {
+          /* Once per process, not per worker: every worker reaching this job
+           * entry would otherwise overwrite the same oracle dump. */
+          static _Atomic int s_dumped = 0;
+          if (ctx->pc == 0x4A40) {
               const char* dp = getenv("SPU_JOBEXEC_DUMP");
-              if (dp) { FILE* f = fopen(dp, "wb");
+              if (dp && !atomic_exchange_explicit(&s_dumped, 1,
+                                                  memory_order_relaxed)) {
+                  FILE* f = fopen(dp, "wb");
                   if (f) { fwrite(ctx->ls, 1, SPU_LS_SIZE, f); fclose(f);
                       fprintf(stderr, "[jobexec] dumped LS at job entry -> %s\n", dp); }
-                  s_dumped = 1; } } }
+              } } }
     }
     if (fn) {
         spu_check_stack_reset(ctx, fn);
@@ -2819,14 +2823,11 @@ void spu_indirect_branch(spu_context* ctx)
  * to redirect to a file. The format is intentionally minimal and stable
  * so a small converter can line it up against an RPCS3.log SPU trace.
  * ===========================================================================*/
-static SPU_THREAD_LOCAL FILE* s_trace_fp = NULL;
-
-void spu_trace_init(const char* path)
-{
-    if (!path || !*path) { s_trace_fp = stderr; return; }
-    s_trace_fp = fopen(path, "w");
-    if (!s_trace_fp) s_trace_fp = stderr;
-}
+/* One destination and one budget for the whole process. spu_trace_init is a
+ * startup call, not a per-thread one, and the lazy SPU_TRACE_FILE open must
+ * win exactly once: a per-worker open would truncate the same file and leak a
+ * handle per worker. */
+static _Atomic(FILE*) s_trace_fp = NULL;
 
 /* Bounded by design: a --trace lift emits one call PER INSTRUCTION, so an image
  * that spins (a persistent SPURS policy module polling its job queue never
@@ -2840,10 +2841,71 @@ void spu_trace_init(const char* path)
  * job kernel, kept from the WWS verification) would otherwise spew the
  * per-instruction log into every boot. Enable with SPU_TRACE=1 (stderr) or
  * SPU_TRACE_FILE=<path>. */
-static SPU_THREAD_LOCAL long long s_trace_left = -1;     /* -1 uninit, -2 unbounded, 0 off */
+/* -3 = one thread is reading the env and opening the file, -2 unbounded,
+ * -1 uninitialised, 0 off, >0 lines left. */
+#define TRACE_LEFT_INIT (-3)
+static _Atomic long long s_trace_left = -1;
 /* Set when spu_trace_pc suppressed its line (gates below): the paired
  * spu_trace_rt call for the same instruction must also stay silent. */
 static SPU_THREAD_LOCAL int s_trace_suppress;
+
+/* Publish `fp` unless a destination is already set; returns the winner. A
+ * loser closes the FILE it opened (a concurrent spu_trace_init may have set
+ * one); stderr is never closed. */
+static FILE* trace_fp_publish(FILE* fp)
+{
+    FILE* expected = NULL;
+    if (atomic_compare_exchange_strong_explicit(&s_trace_fp, &expected, fp,
+                                                memory_order_acq_rel,
+                                                memory_order_acquire))
+        return fp;
+    if (fp != stderr) fclose(fp);
+    return expected;
+}
+
+static void trace_yield(void)
+{
+#ifdef _WIN32
+    SwitchToThread();
+#else
+    sched_yield();
+#endif
+}
+
+/* Elected initialiser: it alone reads the opt-in environment and opens
+ * SPU_TRACE_FILE, so no other worker can fopen("w") and truncate a file this
+ * thread has already written. A destination published earlier by
+ * spu_trace_init wins; the budget is stored last with release so a worker that
+ * stops waiting also observes that destination. */
+static void trace_lazy_init(void)
+{
+    long long init;
+    const char* p = getenv("SPU_TRACE_FILE");
+    if ((!p || !*p) && !getenv("SPU_TRACE")) {
+        init = 0;                  /* not opted in */
+    } else {
+        if (p && *p &&
+            atomic_load_explicit(&s_trace_fp, memory_order_acquire) == NULL) {
+            FILE* nf = fopen(p, "w");
+            (void)trace_fp_publish(nf ? nf : stderr);
+        }
+        const char* m = getenv("SPU_TRACE_MAX");
+        init = (m && *m) ? atoll(m) : 200000;
+        if (init == 0) init = -2;   /* -2 = unbounded */
+    }
+    atomic_store_explicit(&s_trace_left, init, memory_order_release);
+}
+
+void spu_trace_init(const char* path)
+{
+    FILE* fp = (path && *path) ? fopen(path, "w") : NULL;
+    if (!fp) fp = stderr;
+    /* Replace without closing: a worker that loaded the previous pointer may
+     * still be inside fprintf. The documented contract is once at startup.
+     * The environment remains the only opt-in: init redirects the destination
+     * for every worker but does not start the trace budget. */
+    atomic_store_explicit(&s_trace_fp, fp, memory_order_release);
+}
 
 void spu_trace_pc(spu_context* ctx, uint32_t pc)
 {
@@ -2869,33 +2931,58 @@ void spu_trace_pc(spu_context* ctx, uint32_t pc)
                         s_ti = e ? atoll(e) : -1; }
       if (s_ti >= 0 && ctx->image_id != (int)s_ti) { s_trace_suppress = 1; return; } }
     s_trace_suppress = 0;
-    if (s_trace_left < 0) {
-        if (s_trace_left == -1) {
-            const char* p = getenv("SPU_TRACE_FILE");
-            if ((!p || !*p) && !getenv("SPU_TRACE")) { s_trace_left = 0; return; }
-            if (p && *p && !s_trace_fp) spu_trace_init(p);
-            const char* m = getenv("SPU_TRACE_MAX");
-            s_trace_left = (m && *m) ? atoll(m) : 200000;
-            if (s_trace_left == 0) s_trace_left = -2;   /* -2 = unbounded */
+    long long left = atomic_load_explicit(&s_trace_left, memory_order_acquire);
+    if (left == -1 || left == TRACE_LEFT_INIT) {
+        if (left == -1) {
+            long long expected = -1;
+            if (atomic_compare_exchange_strong_explicit(&s_trace_left, &expected,
+                                                        TRACE_LEFT_INIT,
+                                                        memory_order_acq_rel,
+                                                        memory_order_acquire))
+                trace_lazy_init();
+        }
+        /* One election per process: everyone else waits for the destination
+         * and budget it publishes instead of reopening SPU_TRACE_FILE. */
+        do {
+            left = atomic_load_explicit(&s_trace_left, memory_order_acquire);
+            if (left == TRACE_LEFT_INIT) trace_yield();
+        } while (left == TRACE_LEFT_INIT);
+    }
+    FILE* fp = atomic_load_explicit(&s_trace_fp, memory_order_acquire);
+    if (!fp) fp = trace_fp_publish(stderr);
+    if (left == 0) return;
+    if (left > 0) {
+        /* Process-wide budget: claim one line with CAS so two workers cannot
+         * both take the last unit (which would drive the count negative and
+         * make the next call mistake it for "uninitialised"). */
+        long long cur = left;
+        for (;;) {
+            if (cur == 0) return;
+            if (cur < 0) break;         /* unbounded */
+            if (atomic_compare_exchange_weak_explicit(&s_trace_left, &cur, cur - 1,
+                                                      memory_order_relaxed,
+                                                      memory_order_relaxed)) {
+                if (cur == 1) {         /* this call took the last line */
+                    fprintf(fp, "-- SPU_TRACE_MAX reached; trace stopped --\n");
+                    fflush(fp);
+                    return;
+                }
+                break;
+            }
         }
     }
-    if (!s_trace_fp) s_trace_fp = stderr;
-    if (s_trace_left == 0) return;
-    if (s_trace_left > 0 && --s_trace_left == 0) {
-        fprintf(s_trace_fp, "-- SPU_TRACE_MAX reached; trace stopped --\n");
-        fflush(s_trace_fp);
-        return;
-    }
-    fprintf(s_trace_fp, "%05X\n", pc & SPU_LS_MASK);
+    fprintf(fp, "%05X\n", pc & SPU_LS_MASK);
 }
 
 void spu_trace_rt(spu_context* ctx, uint32_t rt)
 {
     if (s_trace_suppress) return;          /* paired _pc line was gated out */
-    if (s_trace_left == 0) return;         /* tracing off/stopped (see _pc) */
-    if (!s_trace_fp) s_trace_fp = stderr;
+    if (atomic_load_explicit(&s_trace_left, memory_order_relaxed) == 0)
+        return;                            /* tracing off/stopped (see _pc) */
+    FILE* fp = atomic_load_explicit(&s_trace_fp, memory_order_acquire);
+    if (!fp) fp = trace_fp_publish(stderr);
     u128 v = ctx->gpr[rt & 0x7F];
-    fprintf(s_trace_fp, "  r%-3u %016llX %016llX\n",
+    fprintf(fp, "  r%-3u %016llX %016llX\n",
             (unsigned)(rt & 0x7F),
             (unsigned long long)v._u64[0],
             (unsigned long long)v._u64[1]);
