@@ -36,6 +36,17 @@ static float s_aspect_h = 1.0f;
 static float s_aspect_v = 1.0f;
 static float s_pal_ratio = 0.5f;
 
+/* Library object +0x124: the destination buffer size cellRescSetDisplayMode took from the mode's
+ * Dsts record (see resc_dsts_buffer_size). */
+static u32 s_dst_buffer_size = 0;
+
+/* The SDK version lv2 syscall 25 reports: the title's PROC_PARAM, loaded by ppu_load_elf
+ * (runtime/syscalls/sdk_version.c). */
+extern u32 ps3_process_sdk_version(void);
+
+static int resc_dsts_index(u32 mode);
+static u32 resc_dsts_buffer_size(u32 mode, const CellRescDsts* rec);
+
 /* The library's four convert fragment programs, one per (PAL interpolate mode,
  * interlace) case. Firmware 02003A2C..02003B10 loads them into the library
  * object at +0xDC, +0xE0, +0xE4 and +0xE8 from embedded Cg binaries; +0xFC
@@ -134,6 +145,11 @@ s32 cellRescSetDisplayMode(u32 displayMode)
                 return (s32)CELL_RESC_ERROR_BAD_COMBINATION;
         }
     }
+
+    /* 02004878..020048DC: the destination buffer size, from the record SetDsts stored for this
+     * mode so far (zero if there is none yet: the title may call SetDsts afterwards, and the
+     * firmware does not recompute). Kept for cellRescGetBufferSize's constant-VRAM case. */
+    s_dst_buffer_size = resc_dsts_buffer_size(displayMode, &s_dsts[resc_dsts_index(displayMode)]);
 
     const int interlaced = (s_config.interlaceMode == 1);
     if (displayMode == CELL_RESC_720x576 && pal - 2u <= 2u)
@@ -277,19 +293,86 @@ s32 cellRescGcmSurface2RescSrc(const void* gcmSurface, void* rescSrc)
     return CELL_OK;
 }
 
+static int resc_dsts_index(u32 mode);
+
+/* The size of one destination buffer of `mode` (firmware 02007D98): its height rounded up to the
+ * record's heightAlign, times the record's pitch, in 32-bit arithmetic. The heights are those
+ * of 02007CB8 (480, 576, 720, 1080). */
+static u32 resc_dsts_buffer_size(u32 mode, const CellRescDsts* rec)
+{
+    u32 h;
+    switch (mode) {
+    case CELL_RESC_720x480:   h = 480;  break;
+    case CELL_RESC_720x576:   h = 576;  break;
+    case CELL_RESC_1280x720:  h = 720;  break;
+    case CELL_RESC_1920x1080: h = 1080; break;
+    default:                  h = 0;    break;
+    }
+    return ((rec->heightAlign + h - 1u) & (0u - rec->heightAlign)) * rec->pitch;
+}
+
+/* Size in bytes of the library's convert fragment-program microcode, per program: the size word
+ * (`+0x18`) of each embedded Cg binary, which the library keeps at program object `+0xC`. */
+static const u32 k_prog_ucode_size[RESC_PROG_COUNT] = {0x10, 0x60, 0x1E0, 0x240};
+
+/* Firmware 02004B48. Three out-sizes, each optional:
+ *   colour    resourcePolicy bit 0 (constant VRAM): the destination buffer size SetDisplayMode
+ *             took from the mode's record, times the colour-buffer count of the current mode
+ *             (PAL 576 with an interpolating PAL mode 6, with PAL_60_DROP 3, else 2);
+ *             otherwise (020022A0): the largest, over the supported modes, of that mode's
+ *             buffer size times cellRescGetNumColorBuffers(mode, palTemporalMode), from the
+ *             records SetDsts has stored;
+ *   vertex    384;
+ *   fragment  constant VRAM: the current program's microcode size. Otherwise 768 when the
+ *             title's SDK version is above 0x27FFFF, else by the init config's size:
+ *             20 -> the current program's microcode size, 24 or 28 -> interlaced: 640 when the
+ *             display mode is 576 with a non-zero PAL mode, else 512; progressive: 96 when 576
+ *             is supported and the PAL mode is 2..4, else 16; any other size -> 0.
+ * The SDK version is what lv2 syscall 25 reports (the title's PROC_PARAM). */
 s32 cellRescGetBufferSize(u32* colorBufSize, u32* vertexBufSize, u32* fragmentBufSize)
 {
     if (!s_initialized)
         return (s32)CELL_RESC_ERROR_NOT_INITIALIZED;
 
-    /* Provide reasonable buffer sizes for state tracking */
-    if (colorBufSize)
-        vm_write32((uint32_t)(uintptr_t)colorBufSize, 1920 * 1080 * 4); /* RGBA 1080p */
-    if (vertexBufSize)
-        vm_write32((uint32_t)(uintptr_t)vertexBufSize, 64 * 1024); /* 64KB vertex buffer */
-    if (fragmentBufSize)
-        vm_write32((uint32_t)(uintptr_t)fragmentBufSize, 256 * 1024); /* 256KB fragment shader */
+    const u32 pal = s_config.palTemporalMode;
+    u32 color, fragment;
+    if (s_config.resourcePolicy & 1u) {
+        u32 n = 2;
+        if (s_display_mode == CELL_RESC_720x576)
+            n = (pal - 2u <= 2u) ? 6 : (pal == CELL_RESC_PAL_60_DROP ? 3 : 2);
+        color = s_dst_buffer_size * n;
+        fragment = k_prog_ucode_size[s_cur_prog];
+    } else {
+        int32_t max = 0;
+        for (u32 mode = 1; mode <= 8; mode <<= 1) {
+            if (!(s_config.supportModes & mode))
+                continue;
+            const int32_t size = (int32_t)(resc_dsts_buffer_size(mode, &s_dsts[resc_dsts_index(mode)]) *
+                                           (u32)cellRescGetNumColorBuffers(mode, pal, 0));
+            if (size >= max)
+                max = size;
+        }
+        color = (u32)max;
+        if (ps3_process_sdk_version() > 0x27FFFFu) {
+            fragment = 768;
+        } else if (s_config.size == 24 || s_config.size == 28) {
+            if (s_config.interlaceMode == 1)
+                fragment = (s_display_mode == CELL_RESC_720x576 && pal != 0) ? 640 : 512;
+            else
+                fragment = ((s_config.supportModes & CELL_RESC_720x576) && pal - 2u <= 2u) ? 96 : 16;
+        } else if (s_config.size == 20) {
+            fragment = k_prog_ucode_size[s_cur_prog];
+        } else {
+            fragment = 0;
+        }
+    }
 
+    if (colorBufSize)
+        vm_write32((uint32_t)(uintptr_t)colorBufSize, color);
+    if (vertexBufSize)
+        vm_write32((uint32_t)(uintptr_t)vertexBufSize, 384);
+    if (fragmentBufSize)
+        vm_write32((uint32_t)(uintptr_t)fragmentBufSize, fragment);
     return CELL_OK;
 }
 
@@ -331,6 +414,23 @@ s32 cellRescSetSrc(s32 index, const CellRescSrc* src)
     return CELL_OK;
 }
 
+/* Dsts record index of a destination mode (firmware 020006B4): 480 -> 0, 576 -> 1, 720 -> 2,
+ * 1080 -> 3, anything else -1. */
+static int resc_dsts_index(u32 mode)
+{
+    switch (mode) {
+    case CELL_RESC_720x480:   return 0;
+    case CELL_RESC_720x576:   return 1;
+    case CELL_RESC_1280x720:  return 2;
+    case CELL_RESC_1920x1080: return 3;
+    default:                  return -1;
+    }
+}
+
+/* Firmware 020006B4: not initialised -> NOT_INITIALIZED; NULL dsts -> BAD_ARGUMENT; a mode that
+ * is not 1, 2, 4 or 8 -> BAD_ARGUMENT. The record ({format, pitch, heightAlign}) is stored as
+ * given: nothing in it is validated here, and nothing is recomputed (the destination buffer
+ * size is taken from the record by cellRescSetDisplayMode and cellRescGetBufferSize). */
 s32 cellRescSetDsts(u32 displayMode, const CellRescDsts* dsts)
 {
     printf("[cellResc] SetDsts(mode=0x%x)\n", displayMode);
@@ -341,13 +441,15 @@ s32 cellRescSetDsts(u32 displayMode, const CellRescDsts* dsts)
     if (!dsts)
         return (s32)CELL_RESC_ERROR_BAD_ARGUMENT;
 
-    /* Map display mode to index */
-    int idx = 0;
-    if (displayMode & CELL_RESC_720x576) idx = 1;
-    else if (displayMode & CELL_RESC_1280x720) idx = 2;
-    else if (displayMode & CELL_RESC_1920x1080) idx = 3;
+    const int idx = resc_dsts_index(displayMode);
+    if (idx < 0)
+        return (s32)CELL_RESC_ERROR_BAD_ARGUMENT;
 
-    s_dsts[idx] = *GUEST_PTR(dsts, const CellRescDsts*);
+    /* Decoded to host order: the guest struct is big-endian. */
+    const u32 ea = (u32)(uintptr_t)dsts;
+    s_dsts[idx].format      = vm_read32(ea + 0);
+    s_dsts[idx].pitch       = vm_read32(ea + 4);
+    s_dsts[idx].heightAlign = vm_read32(ea + 8);
     return CELL_OK;
 }
 

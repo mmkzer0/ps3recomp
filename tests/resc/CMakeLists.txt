@@ -61,3 +61,22 @@ target_include_directories(test_resc_register_count PRIVATE
 set_target_properties(test_resc_register_count PROPERTIES LINKER_LANGUAGE CXX)
 add_test(NAME resc_register_count COMMAND test_resc_register_count)
 set_tests_properties(resc_register_count PROPERTIES LABELS "resc;t0")
+
+# cellRescGetBufferSize (firmware 0x02004B48 / 0x020022A0) and the Dsts records and SDK
+# version it reads.
+add_executable(test_resc_buffer_size
+    test_buffer_size.c
+    "${PROJECT_SOURCE_DIR}/runtime/host/host_stubs.c"
+)
+target_link_libraries(test_resc_buffer_size PRIVATE ps3recomp_runtime)
+if(NOT WIN32)
+    target_link_libraries(test_resc_buffer_size PRIVATE m)
+endif()
+target_include_directories(test_resc_buffer_size PRIVATE
+    "${PROJECT_SOURCE_DIR}/libs/video"
+    "${PROJECT_SOURCE_DIR}/include"
+    "${PROJECT_SOURCE_DIR}/runtime"
+)
+set_target_properties(test_resc_buffer_size PROPERTIES LINKER_LANGUAGE CXX)
+add_test(NAME resc_buffer_size COMMAND test_resc_buffer_size)
+set_tests_properties(resc_buffer_size PROPERTIES LABELS "resc;t0")
