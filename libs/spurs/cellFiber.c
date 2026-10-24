@@ -14,6 +14,7 @@
 #include "../../runtime/ppu/ppu_dispatch_state.h"
 #include "../../runtime/syscalls/sys_ppu_thread.h"
 #include "../../runtime/syscalls/sys_event.h"
+#include "../../runtime/syscalls/sys_timer.h"
 #include "../../runtime/memory/reservation.h"
 #include "ps3emu/endian.h"
 #include "ps3emu/stop.h"
@@ -359,6 +360,17 @@ static s32 check_attribute(u32 ea, int fiber, int worker)
 static void check_extensions(u32 ea, int fiber, int worker)
 {
     if (!ea) return;
+    if (!fiber) {
+        /* libfiber FW 4.93 InitializeScheduler 0x02001CA4..0x02002000 reads only
+         * +0x10 (autoCheckFlags 0x02001E10), +0x11 (debuggerSupport 0x02001E28),
+         * and +0x14 (interval 0x02001E04). Unread bytes in +0x0C..+0xFF and
+         * +0x100..+0x17F are ignored by firmware.
+         * Periodic stack-canary checking (dispatch loop 0x02002C58, check 0x0200150C)
+         * is not modelled; fail closed if autoCheckFlags is non-zero to avoid hiding
+         * stack overflow. */
+        if (vm_base[ea + 0x10]) unsupported("Initialize", ea, "+0x10", "auto-check");
+        return;
+    }
     for (u32 i = 0xC; i < (worker ? 0x180u : 0x100u); ++i) {
         if (fiber && i >= 0x10 && i < 0x30) continue;
         if (worker && i >= 0x108 && i < 0x10C) continue;
@@ -382,6 +394,24 @@ static s32 scheduler_init(u32 ea, u32 attr, int utility)
     vm_write8(ea + 0x41, 1);
     vm_write32(ea + 0xE0, ea + 0xE0); vm_write32(ea + 0xE4, ea + 0xE0);
     vm_write32(ea + 0xE8, ea + 0xE8); vm_write32(ea + 0xEC, ea + 0xE8);
+    if (attr) {
+        /* libfiber FW 4.93 InitializeScheduler 0x02001CA4..0x02002000 reads ONLY:
+         * - +0x10 autoCheckFlags (0x02001E10), stored at scheduler+0x148 (0x02001E20);
+         * - +0x11 debuggerSupport (0x02001E28), registers scheduler in internal debugger
+         *   table and stores slot address at scheduler+0x168 (0x02005AD8, 0x02005BB8).
+         *   Deviation: libfiber debugger table does not exist in this HLE, so
+         *   scheduler+0x168 remains 0 and fibers are not registered (debugger-only,
+         *   not visible to guest scheduling).
+         * - +0x14 autoCheckFlagsIntervalUsec (0x02001E04), converted to timebase ticks
+         *   and stored as BE64 at scheduler+0x138, with scheduler+0x140 zeroed
+         *   (0x02001E38, 0x02001E44).
+         * Unread bytes in +0x0C..+0xFF and +0x100..+0x17F are ignored as firmware does. */
+        const u32 usec = ld32(attr + 0x14);
+        const u64 ticks = (u64)usec * PS3_TIMEBASE_FREQ / 1000000ULL;
+        vm_write64(ea + 0x138, ticks);
+        vm_write64(ea + 0x140, 0);
+        vm_write8(ea + 0x148, vm_base[attr + 0x10]);
+    }
     return CELL_OK;
 }
 s32 cellFiberPpuInitializeScheduler(CellFiberPpuScheduler* scheduler, const CellFiberPpuSchedulerAttribute* attr)
