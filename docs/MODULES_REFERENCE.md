@@ -127,6 +127,14 @@ This is the most critical module. It provides:
 - `_sys_spu_printf_initialize` stores four guest callback OPDs; `_sys_spu_printf_attach_group`/`detach_group`/`attach_thread`/`detach_thread` call the matching one through `ppu_guest_call` and return its result, or `CELL_ESTAT` while it is not registered; `_sys_spu_printf_finalize` clears them
 - State is process-global behind one lock; the guest callback runs with the lock released
 
+### sys_crashdump
+
+**File:** `libs/system/sys_crashdump.c`
+**Purpose:** Crash dump user log area registration
+
+- `sys_crash_dump_set_user_log_area(index, new_entry)`: registers a user log buffer (`label[16]`, `addr`, `size`) at slot 0..127. Returns `CELL_OK` on success, or `CELL_EINVAL` (`0x80010002`) if `index > 127` or `new_entry` is NULL (oracle: RPCS3 `sys_crashdump.cpp` @ `e53ac18f`). Out-of-bounds guest pointers stop with `hle-guest-range`.
+- `sys_crash_dump_get_user_log_area(index, entry)`: retrieves the registered user log buffer for slot `index`. Returns `CELL_OK` on success (zeroed if slot unpopulated, matching oracle), or `CELL_EINVAL` if `index > 127` or `entry` is NULL.
+
 ### cellSysmodule
 
 **File:** `libs/system/cellSysmodule.c`
