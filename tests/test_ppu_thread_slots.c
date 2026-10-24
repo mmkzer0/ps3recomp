@@ -7,7 +7,7 @@
 #include <time.h>
 
 uint8_t* vm_base;
-uint32_t ppu_vm_size = 0x10000;
+uint32_t ppu_vm_size;   /* main(): the arena covers the stack region the allocator hands out */
 /* The few runtime services the thread proc and create call; nothing here replaces the code under test. */
 void ppu_ctx_register(ppu_context* c) { (void)c; }
 int ps3_intr_is_handler(unsigned long long tid) { (void)tid; return 0; }
@@ -67,7 +67,12 @@ static void settle(void)
 
 int main(void)
 {
-    vm_base = calloc(1, 0x10000); assert(vm_base);
+    /* A real guest arena that covers the stack region: the stack allocator sets a guard page per thread, and
+     * vm_protect refuses any range outside [0, ppu_vm_size). */
+    vm_base = (uint8_t*)mmap(NULL, (size_t)VM_TOTAL_SIZE, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+    assert(vm_base != MAP_FAILED);
+    ppu_vm_size = 0xA0000000u;
     g_vm_stack_alloc.next_addr = 0x10000000u;   /* the guest stack region the threads bump-allocate from */
     g_vm_stack_alloc.region_end = 0xA0000000u;
     g_ppu_thread_entry_trampoline = guest_entry;
@@ -117,7 +122,7 @@ int main(void)
     EXPECT_EQ(g_entered > 3 * PPU_THREAD_MAX, 1);
     EXPECT_EQ(g_vscr_wrong, 0);
 
-    free(vm_base);
+    munmap(vm_base, (size_t)VM_TOTAL_SIZE);
     if (g_fails) { fprintf(stderr, "%d check(s) failed\n", g_fails); return 1; }
     puts("PASS: non-joinable PPU threads free their slot when they end; joinable ones keep it until joined");
     return 0;
