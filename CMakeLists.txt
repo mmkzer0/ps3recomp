@@ -699,6 +699,10 @@ if(PS3RECOMP_BUILD_TESTS)
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_thread_slots.py")
         set_tests_properties(ppu_thread_slots PROPERTIES LABELS "runtime;t0" TIMEOUT 300)
+        add_test(NAME ppu_thread_stack_recycle
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_thread_stack_recycle.py")
+        set_tests_properties(ppu_thread_stack_recycle PROPERTIES LABELS "runtime;t0;tsan" TIMEOUT 300)
         # docs/DIAGNOSTICS.md is hand-maintained prose; the checker requires the
         # knob set (and its summary counts) to match the sources, not the whole
         # generated text.

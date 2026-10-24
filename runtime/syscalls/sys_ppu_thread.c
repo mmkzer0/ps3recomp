@@ -197,6 +197,17 @@ static void* ppu_host_thread_proc(void* param)
         pthread_mutex_destroy(&info->finish_mutex);
         pthread_cond_destroy(&info->finish_cond);
 #endif
+        /* Free guest stack. Safe here because guest code runs only inside
+         * g_ppu_thread_entry_trampoline; once unwound/returned, this host thread
+         * executes purely host C code on its host stack (PPU_HOST_STACK_BYTES)
+         * and will never touch guest memory again. Freeing the stack under
+         * the table lock right before freeing the slot ensures another thread
+         * can immediately reuse both without races. */
+        if (info->stack_addr) {
+            vm_stack_free(&g_vm_stack_alloc, info->stack_addr, info->stack_size);
+            info->stack_addr = 0;
+            info->stack_size = 0;
+        }
         info->state = PPU_THREAD_STATE_FREE;
         table_unlock();
 #ifdef _WIN32
@@ -507,6 +518,11 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
     if (t->host_thread == NULL) {
         t->state = PPU_THREAD_STATE_FREE;
         CloseHandle(t->finish_event);
+        if (t->stack_addr) {
+            vm_stack_free(&g_vm_stack_alloc, t->stack_addr, t->stack_size);
+            t->stack_addr = 0;
+            t->stack_size = 0;
+        }
         table_unlock();
         return (int64_t)(int32_t)CELL_EAGAIN;
     }
@@ -553,6 +569,11 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
         t->state = PPU_THREAD_STATE_FREE;
         pthread_mutex_destroy(&t->finish_mutex);
         pthread_cond_destroy(&t->finish_cond);
+        if (t->stack_addr) {
+            vm_stack_free(&g_vm_stack_alloc, t->stack_addr, t->stack_size);
+            t->stack_addr = 0;
+            t->stack_size = 0;
+        }
         table_unlock();
         return (int64_t)(int32_t)CELL_EAGAIN;
     }
@@ -690,6 +711,11 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
     pthread_mutex_destroy(&t->finish_mutex);
     pthread_cond_destroy(&t->finish_cond);
 #endif
+    if (t->stack_addr) {
+        vm_stack_free(&g_vm_stack_alloc, t->stack_addr, t->stack_size);
+        t->stack_addr = 0;
+        t->stack_size = 0;
+    }
     t->state = PPU_THREAD_STATE_FREE;
     table_unlock();
 
@@ -722,6 +748,11 @@ int64_t sys_ppu_thread_detach(ppu_context* ctx)
         pthread_mutex_destroy(&t->finish_mutex);
         pthread_cond_destroy(&t->finish_cond);
 #endif
+        if (t->stack_addr) {
+            vm_stack_free(&g_vm_stack_alloc, t->stack_addr, t->stack_size);
+            t->stack_addr = 0;
+            t->stack_size = 0;
+        }
         t->state = PPU_THREAD_STATE_FREE;
     } else {
         t->state = PPU_THREAD_STATE_DETACHED;

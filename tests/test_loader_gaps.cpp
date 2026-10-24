@@ -319,6 +319,17 @@ static int cb_stack_scenarios()
     CHECK(vm_stack_allocate(&sa, VM_PPU_STACK_SIZE, &unused) == (int32_t)CELL_ENOMEM);
     CHECK(vm_stack_allocate(&sa, VM_STACK_REGION, &unused) == (int32_t)CELL_ENOMEM);
     {
+        /* Freeing a stack allows an exact-size allocation to succeed without advancing next_addr. */
+        const uint32_t last_base = sa.next_addr - VM_PPU_STACK_SIZE;
+        const uint32_t prev_next = sa.next_addr;
+        vm_stack_free(&sa, last_base, VM_PPU_STACK_SIZE);
+        uint32_t reused_base = 0;
+        CHECK(vm_stack_allocate(&sa, VM_PPU_STACK_SIZE, &reused_base) == CELL_OK);
+        CHECK(reused_base == last_base);
+        CHECK(sa.next_addr == prev_next);
+        CHECK(vm_stack_allocate(&sa, VM_PPU_STACK_SIZE, &unused) == (int32_t)CELL_ENOMEM);
+    }
+    {
         /* An arena that does not reach the stack region: the guard page is refused,
          * so no stack is handed out (a stack without its guard overflows silently). */
         const uint32_t orig_vm_size = ppu_vm_size;

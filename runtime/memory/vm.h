@@ -22,6 +22,7 @@
 #include <stddef.h>
 #include <string.h>
 #include <assert.h>
+#include <stdio.h>
 
 #ifdef _WIN32
   #define WIN32_LEAN_AND_MEAN
@@ -373,20 +374,45 @@ static inline int32_t vm_protect(uint32_t addr, uint32_t size, int read, int wri
 }
 
 /* ---------------------------------------------------------------------------
+ * Address translation helpers
+ * -----------------------------------------------------------------------*/
+
+static inline void* vm_to_host(uint32_t addr)
+{
+    return (void*)(vm_base + addr);
+}
+
+static inline uint32_t vm_to_guest(const void* host_ptr)
+{
+    return (uint32_t)((const uint8_t*)host_ptr - vm_base);
+}
+
+/* ---------------------------------------------------------------------------
  * Stack allocation for PPU threads
  *
  * Simple bump allocator within the stack region.  Each thread gets
  * a fixed-size stack with a guard page at the bottom.
  * -----------------------------------------------------------------------*/
+#define VM_STACK_FREE_MAX 256u
+
+typedef struct vm_stack_entry {
+    uint32_t base;
+    uint32_t size;  /* host-page aligned size */
+} vm_stack_entry;
+
 typedef struct vm_stack_alloc {
     uint32_t next_addr;     /* next stack base to allocate */
     uint32_t region_end;    /* end of the thread-stack area: VM_CB_HOST_STACK_BASE, not the region end */
+    uint32_t free_count;
+    vm_stack_entry free_entries[VM_STACK_FREE_MAX];
 } vm_stack_alloc;
 
 static inline void vm_stack_alloc_init(vm_stack_alloc* sa)
 {
-    sa->next_addr  = VM_STACK_BASE;
-    sa->region_end = VM_CB_HOST_STACK_BASE;
+    sa->next_addr   = VM_STACK_BASE;
+    sa->region_end  = VM_CB_HOST_STACK_BASE;
+    sa->free_count  = 0;
+    memset(sa->free_entries, 0, sizeof(sa->free_entries));
 }
 
 /*
@@ -409,6 +435,27 @@ static inline int32_t vm_stack_allocate(vm_stack_alloc* sa, uint32_t stack_size,
      * request that does not fit the region is CELL_ENOMEM. */
     const uint64_t aligned = ((uint64_t)stack_size + pg - 1u) & ~((uint64_t)pg - 1u);
 
+    /* Search host-side free list for exact-size match (LIFO: search backwards).
+     * Exact-size matching avoids internal fragmentation and block splitting
+     * (which would leave sub-blocks without guard pages). The guard page at
+     * base - pg was set once when initially carved from bump space and stays
+     * protected across reuses. */
+    for (uint32_t i = sa->free_count; i > 0; i--) {
+        uint32_t idx = i - 1;
+        if (sa->free_entries[idx].size == (uint32_t)aligned) {
+            uint32_t base = sa->free_entries[idx].base;
+            sa->free_entries[idx] = sa->free_entries[sa->free_count - 1];
+            sa->free_count--;
+            /* Zero the usable stack range before handing out (not the guard page).
+             * Before recycling, new bump-allocated stacks came from the zero-filled
+             * arena (anonymous mmap / VirtualAlloc), so guest code reading uninitialized
+             * stack frames saw 0. Zeroing on reuse preserves that invariant. */
+            memset(vm_to_host(base), 0, (size_t)aligned);
+            *base_out = base;
+            return CELL_OK;
+        }
+    }
+
     /* Add a guard page */
     const uint64_t total = aligned + pg;
 
@@ -424,6 +471,46 @@ static inline int32_t vm_stack_allocate(vm_stack_alloc* sa, uint32_t stack_size,
     sa->next_addr += (uint32_t)total;
     *base_out = base + pg; /* skip the guard page */
     return CELL_OK;
+}
+
+/*
+ * Free a stack previously allocated with vm_stack_allocate.
+ * base is the usable base (*base_out from vm_stack_allocate, above the guard page).
+ * The guard page at base - pg remains PROT_NONE and is not touched.
+ * Freed stacks are stored host-side in sa->free_entries without storing metadata
+ * in guest memory.
+ */
+static inline void vm_stack_free(vm_stack_alloc* sa, uint32_t base, uint32_t size)
+{
+    if (!sa || base == 0 || size == 0)
+        return;
+
+    const uint32_t pg = vm_host_page_size();
+    const uint64_t aligned = ((uint64_t)size + pg - 1u) & ~((uint64_t)pg - 1u);
+    if (aligned == 0 || (uint64_t)base + aligned > sa->region_end)
+        return;
+    if (base < pg || base + aligned > sa->next_addr)
+        return;
+    if ((base & (pg - 1u)) != 0)
+        return;
+
+    /* Prevent duplicate frees */
+    for (uint32_t i = 0; i < sa->free_count; i++) {
+        if (sa->free_entries[i].base == base)
+            return;
+    }
+
+    if (sa->free_count < VM_STACK_FREE_MAX) {
+        sa->free_entries[sa->free_count].base = base;
+        sa->free_entries[sa->free_count].size = (uint32_t)aligned;
+        sa->free_count++;
+    } else {
+        /* Free list is full: log the leak explicitly (never silent drop).
+         * 256 entries exceeds the maximum number of 1 MB stacks (223) that the 224 MB
+         * region can hold, and is 4x PPU_THREAD_MAX (64). */
+        fprintf(stderr, "[VM] vm_stack_free: free list full (%u entries), leaking stack base=0x%08X size=0x%08X\n",
+                (unsigned)sa->free_count, base, (unsigned)aligned);
+    }
 }
 
 /* ---------------------------------------------------------------------------
@@ -449,20 +536,6 @@ static inline uint32_t vm_spu_ls_addr(uint32_t spu_index)
 static inline uint8_t* vm_spu_ls_host_ptr(uint32_t spu_index)
 {
     return vm_base + VM_SPU_BASE + spu_index * VM_SPU_WINDOW_SIZE;
-}
-
-/* ---------------------------------------------------------------------------
- * Address translation helpers
- * -----------------------------------------------------------------------*/
-
-static inline void* vm_to_host(uint32_t addr)
-{
-    return (void*)(vm_base + addr);
-}
-
-static inline uint32_t vm_to_guest(const void* host_ptr)
-{
-    return (uint32_t)((const uint8_t*)host_ptr - vm_base);
 }
 
 static inline int vm_is_valid_addr(uint32_t addr)

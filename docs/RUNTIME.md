@@ -119,7 +119,9 @@ Checks if a guest address falls within any committed memory region (main memory,
 
 ### Stack Allocator
 
-The `vm_stack_alloc` structure provides a bump allocator for PPU thread stacks within the `0xD0000000` region:
+The `vm_stack_alloc` structure manages PPU thread stacks within the `0xD0000000` region.
+It carves out new stacks with a guard page using bump allocation, and recycles freed stacks
+using an exact-size free list per size class.
 
 ```c
 vm_stack_alloc sa;
@@ -130,12 +132,21 @@ uint32_t stack_base = 0;
 int32_t rc = vm_stack_allocate(&sa, VM_PPU_STACK_SIZE, &stack_base);
 // CELL_OK: stack_base points past the guard page; usable stack top = stack_base + VM_PPU_STACK_SIZE
 // CELL_ENOMEM: the region is spent. CELL_EFAULT: the guard page could not be set
+
+// Free the stack when the thread slot is released (after join or detached exit)
+vm_stack_free(&sa, stack_base, VM_PPU_STACK_SIZE);
 ```
 
 Each allocation includes a **guard page** (one host page, no access) at the bottom of the stack to detect overflow. The allocator returns the address *above* the guard page. It never hands out a stack whose guard could not be set: `vm_protect` and `vm_commit` refuse any range outside the guest arena (`[0, ppu_vm_size)` when `ppu_vm_size` is set, which includes the identity mapping with `vm_base == 0`; otherwise the 4 GB reservation), and a refused or failed guard is `CELL_EFAULT`. `sys_ppu_thread_create` turns that into the stop `stack-guard-fault`; it is a host fault, not a guest `CELL_ENOMEM`.
 
+Freed stacks are returned to `vm_stack_alloc` via `vm_stack_free(sa, base, size)`:
+- **Host-side free list:** Freed stack metadata (`base`, `size`) is maintained entirely host-side in `sa->free_entries` (up to `VM_STACK_FREE_MAX = 256` entries), never written into guest stack memory. This ensures stale guest pointers cannot corrupt allocator state, and guest memory contents remain unpolluted. The 256-slot cap exceeds the maximum number of 1 MB stacks (223) that the 224 MB region can physically accommodate and is 4× the maximum concurrent thread count (`PPU_THREAD_MAX = 64`). If the table ever fills, subsequent frees are explicitly logged to stderr as leaks rather than silently dropped.
+- **Exact-size recycling:** Allocations search `free_entries` for an exact size match (LIFO). Exact-size reuse avoids internal fragmentation and block splitting (which would leave split sub-blocks without guard pages).
+- **Zeroed upon reuse:** Reused stacks are zeroed across their usable range (`memset(vm_to_host(base), 0, aligned)`) before being handed out, matching the behavior of fresh pages from the zero-filled guest arena. The guard page below `base` is not touched.
+- **Guard retention:** The guard page below the stack base (`base - page_size`) is protected once when initially carved out from bump space and stays protected across frees and reuses; it is never re-protected on reuse.
+- **Thread safety:** In the runtime, `g_vm_stack_alloc` operations are synchronized under the thread-table lock (`table_lock()`).
+- **Safe freeing order:** A thread's stack is freed only after the thread's guest code has completely finished running (after `pthread_join` in `sys_ppu_thread_join`, or in `ppu_host_thread_proc` after the guest entry trampoline has returned or unwound for non-joinable/detached threads). Because guest code executes only within the trampoline and the host thread runs remaining epilogue logic on its dedicated host stack (`PPU_HOST_STACK_BYTES`), the guest stack is never accessed while or after being returned to the free list.
 The allocator ends at `VM_CB_HOST_STACK_BASE` (`0xDE000000`), not at the end of the stack region: the top `VM_CB_HOST_STACK_WINDOW` (32 MB, 32 slots of `VM_PPU_STACK_SIZE`) is reserved for the stacks of host threads that raise guest callbacks while running no guest code (`ppu_cb_entry_sp` in `ppu_loader.cpp` owns it). A thread-stack request that would reach the window fails (`vm_stack_allocate` returns `CELL_ENOMEM`, and so does `sys_ppu_thread_create`) instead of overlapping a live callback slot.
-
 ### SPU Local Store Mapping
 
 For raw SPU access (PPU reading/writing SPU local store via memory-mapped IO), each SPU's 256 KB local store is mapped into the guest address space:
