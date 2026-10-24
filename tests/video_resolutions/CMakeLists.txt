@@ -39,6 +39,14 @@ video_resolutions_case(only1080 "1")
 video_resolutions_case(pair "4,1")
 video_resolutions_case(extended "13,10")
 video_resolutions_case(configure "1,2")
+video_resolutions_case(checks "")
+
+# cellVideoOutConfigure on an output other than PRIMARY: no firmware or oracle answer, so a named stop.
+add_test(NAME video_resolutions_configure_secondary COMMAND test_video_resolutions configure_secondary)
+set_tests_properties(video_resolutions_configure_secondary PROPERTIES
+    ENVIRONMENT_MODIFICATION "PS3RECOMP_VIDEO_RESOLUTIONS=unset:"
+    PASS_REGULAR_EXPRESSION "PS3STOP v=1 kind=gcm-unmodelled[^\n]*func=cellVideoOutConfigure[^\n]*feature=video-out"
+    LABELS "video;t0")
 
 # An id outside the known set stops the load with config-invalid, naming the key.
 add_test(NAME video_resolutions_invalid COMMAND test_video_resolutions default)

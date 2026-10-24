@@ -69,14 +69,19 @@ extern "C" {
 /* ---------------------------------------------------------------------------
  * Error codes
  * -----------------------------------------------------------------------*/
-#define CELL_VIDEO_OUT_ERROR_NOT_IMPLEMENTED  (s32)(CELL_ERROR_BASE_VIDEO | 0x01)
-#define CELL_VIDEO_OUT_ERROR_ILLEGAL_CONFIGURATION (s32)(CELL_ERROR_BASE_VIDEO | 0x02)
-#define CELL_VIDEO_OUT_ERROR_ILLEGAL_PARAMETER (s32)(CELL_ERROR_BASE_VIDEO | 0x03)
-#define CELL_VIDEO_OUT_ERROR_PARAMETER_OUT_OF_RANGE (s32)(CELL_ERROR_BASE_VIDEO | 0x04)
-#define CELL_VIDEO_OUT_ERROR_DEVICE_NOT_FOUND (s32)(CELL_ERROR_BASE_VIDEO | 0x05)
-#define CELL_VIDEO_OUT_ERROR_UNSUPPORTED_VIDEO_OUT (s32)(CELL_ERROR_BASE_VIDEO | 0x06)
-#define CELL_VIDEO_OUT_ERROR_UNSUPPORTED_DISPLAY_MODE (s32)(CELL_ERROR_BASE_VIDEO | 0x07)
-#define CELL_VIDEO_OUT_ERROR_CONDITION_BUSY (s32)(CELL_ERROR_BASE_VIDEO | 0x08)
+/* The cellVideoOut codes, as RPCS3's rpcs3/Emu/Cell/Modules/cellVideoOut.h (enum CellVideoOutError) has them:
+ * 0x8002B220..0x8002B228. They were CELL_ERROR_BASE_VIDEO | 0x01..0x08 (0x8002B101..0x8002B108), numbers that are
+ * not the oracle's and that fall inside the cellSysutil error range. The family has no firmware module here
+ * (libsysutil is not in the firmware set), so the oracle is the only evidence for them. */
+#define CELL_VIDEO_OUT_ERROR_NOT_IMPLEMENTED          ((s32)0x8002B220)
+#define CELL_VIDEO_OUT_ERROR_ILLEGAL_CONFIGURATION    ((s32)0x8002B221)
+#define CELL_VIDEO_OUT_ERROR_ILLEGAL_PARAMETER        ((s32)0x8002B222)
+#define CELL_VIDEO_OUT_ERROR_PARAMETER_OUT_OF_RANGE   ((s32)0x8002B223)
+#define CELL_VIDEO_OUT_ERROR_DEVICE_NOT_FOUND         ((s32)0x8002B224)
+#define CELL_VIDEO_OUT_ERROR_UNSUPPORTED_VIDEO_OUT    ((s32)0x8002B225)
+#define CELL_VIDEO_OUT_ERROR_UNSUPPORTED_DISPLAY_MODE ((s32)0x8002B226)
+#define CELL_VIDEO_OUT_ERROR_CONDITION_BUSY           ((s32)0x8002B227)
+#define CELL_VIDEO_OUT_ERROR_VALUE_IS_NOT_SET         ((s32)0x8002B228)
 
 /* ---------------------------------------------------------------------------
  * Structures

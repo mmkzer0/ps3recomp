@@ -1,10 +1,11 @@
-/* cellGcmMapMainMemory's IO offsets come from the IO page table (first fit), and no map happens before cellGcmInit.
- * Includes the real implementation and drives its public entry points; the expected numbers are the ones the
- * firmware/reference emulator hand out, not derived from the code under test.
+/* cellGcmMapMainMemory's IO offsets come from the IO page table (first fit), and a map before cellGcmInit is the named
+ * stop hle-uninitialized (libgcm_sys searches IO tables that are zero until Init). Includes the real implementation and
+ * drives its public entry points; the expected numbers are the ones the firmware hands out, not derived from the code
+ * under test.
  *
- * Scenario (a title that maps before it initialises): MapMainMemory(0x40000000, 2MB) before cellGcmInit, then
- * cellGcmInit with an 8MB IO window at io 0 (ea 0x40300000), then more maps. With a bump pointer kept across Init the
- * pre-Init map moved it to 0x300000, and the next map landed on io 0x300000 inside the Init window. */
+ * Scenario (a title that maps, then initialises): cellGcmInit with an 8MB IO window at io 0 (ea 0x40300000), then more
+ * maps. With a bump pointer kept across Init a map made before it moved the pointer to 0x300000, and the next map
+ * landed on io 0x300000 inside the Init window; first fit over the table cannot. */
 #include "../libs/video/cellGcmSys.c"
 #include <assert.h>
 
@@ -16,6 +17,18 @@ void spu_coh_notify_write(uint32_t addr) { (void)addr; abort(); }
 void spu_lockline_lock(void) { abort(); }
 void spu_lockline_unlock(void) { abort(); }
 void (*g_spu_put_hook)(uint32_t ea, uint32_t size);   /* set by cellGcmInit */
+
+/* A named stop here unwinds to the check that armed it. */
+#include <setjmp.h>
+static jmp_buf g_jb;
+static int g_armed, g_stop_kind = -1;
+PS3_NORETURN void ps3_stop(ps3_stop_kind k, const char* w, const char* r, const ps3_stop_field* f, size_t n,
+                           const ps3_stop_site* s)
+{ (void)w; (void)r; (void)f; (void)n; (void)s; if (!g_armed) abort(); g_stop_kind = (int)k; longjmp(g_jb, 1); }
+PS3_NORETURN void ps3_stop_gcm_unmodelled(const char* fn, const char* feat, const char* why)
+{ (void)fn; (void)feat; (void)why; if (!g_armed) abort(); g_stop_kind = PS3_STOP_GCM_UNMODELLED; longjmp(g_jb, 1); }
+PS3_NORETURN void ps3_stop_hle_uninitialized(const char* fn, const char* mod, const char* why)
+{ (void)fn; (void)mod; (void)why; if (!g_armed) abort(); g_stop_kind = PS3_STOP_HLE_UNINITIALIZED; longjmp(g_jb, 1); }
 
 #define MB 0x100000u
 #define OUT ((u32*)(uintptr_t)0x100)
@@ -49,9 +62,8 @@ int main(void)
     vm_base = calloc(1, 0x10000); assert(vm_base);
     ppu_hle_inject_base = 0x1000;
 
-    /* --- the title's exact sequence, whatever the pre-Init map answers: no later map may overlap the Init window --- */
+    /* --- the Init window is io 0..8MB and a later map lands after it, not inside it --- */
     power_on();
-    (void)cellGcmMapMainMemory(0x40000000, 2 * MB, OUT);
     EXPECT_EQ((u32)cellGcmInit(0x100000, 8 * MB, 0x40300000), (u32)CELL_OK);
     {
         u32 io = map(0x40D00000, 6 * MB);
@@ -59,16 +71,20 @@ int main(void)
         EXPECT_EQ(gcm_io2ea(0x300000), 0x40600000u);       /* still the window's own page */
     }
 
-    /* --- a map before cellGcmInit is refused, and changes nothing --- */
+    /* --- a map before cellGcmInit is the hle-uninitialized stop, and changes nothing --- */
     power_on();
     vm_write32(0x100, 0xDEADBEEFu);
-    EXPECT_EQ((u32)cellGcmMapMainMemory(0x40000000, 2 * MB, OUT), (u32)CELL_GCM_ERROR_NO_IO_PAGE_TABLE);
+    g_stop_kind = -1; g_armed = 1;
+    if (!setjmp(g_jb)) (void)cellGcmMapMainMemory(0x40000000, 2 * MB, OUT);
+    g_armed = 0;
+    EXPECT_EQ((unsigned long long)g_stop_kind, (unsigned long long)PS3_STOP_HLE_UNINITIALIZED);
     EXPECT_EQ(vm_read32(0x100), 0xDEADBEEFu);          /* *offset untouched */
     EXPECT_EQ(s_io_mapping_count, 0);
     EXPECT_EQ(s_io_address_table[0x400], 0xFFFFu);     /* nothing populated either way */
     EXPECT_EQ(s_ea_address_table[1], 0xFFFFu);
-    /* AddressToOffset's auto-map of low main memory does not run before Init either */
-    EXPECT((u32)cellGcmAddressToOffset(0x10000000, OUT) != (u32)CELL_OK);
+    /* AddressToOffset's auto-map of low main memory does not run before Init either: FAILURE, offset untouched */
+    EXPECT_EQ((u32)cellGcmAddressToOffset(0x10000000, OUT), 0x802100FFu);
+    EXPECT_EQ(vm_read32(0x100), 0xDEADBEEFu);
     EXPECT_EQ(s_io_mapping_count, 0);
 
     /* --- Init with an 8MB window at io 0 (ea 0x40300000), then the maps land after it, first fit --- */
@@ -126,6 +142,6 @@ int main(void)
 
     free(vm_base);
     if (g_fails) { fprintf(stderr, "%d check(s) failed\n", g_fails); return 1; }
-    puts("PASS: GCM IO first fit, map refused before Init and when IO space is full, Init window kept");
+    puts("PASS: GCM IO first fit, hle-uninitialized stop before Init, refusal when IO space is full, Init window kept");
     return 0;
 }

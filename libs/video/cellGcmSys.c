@@ -783,14 +783,30 @@ u32 cellGcmSetupContext(u32 ctx_out_addr, u32 cmdSize, u32 ioSize, u32 ioAddress
     return cdata;
 }
 
+/* A store through a caller's NULL pointer. libgcm_sys writes its out-parameters without testing them, so on the
+ * console a NULL one is a store into the null page, which faults; here vm_write32 would land silently at guest
+ * address 0 and the title would run on. guest-null-access is the stop the loader raises for the same store made by
+ * guest code (runtime/ppu/ppu_loader.cpp, ppu_null_page_stop). */
+#define GCM_NULL_STORE_WHAT "an HLE handler would store through a null guest pointer"
+#define GCM_NULL_STORE_REMEDY \
+    "The firmware stores to this out-parameter without testing it and faults on a null one. " \
+    "Find the call in the guest that passed NULL; no return value would be faithful."
+#define GCM_NULL_STORE_FIELDS(fn) \
+    ((const ps3_stop_field[]){ {"access", "write"}, {"width", "4"}, {"ea", "0x00000000"}, {"fn", (fn)} })
+
 s32 cellGcmGetConfiguration(CellGcmConfig* config)
 {
     /* `config` is a GUEST address; write the 6 u32 fields big-endian via
      * vm_write32 (a raw *config = s_config faults / is host-endian). The game
      * reads localAddress/localSize from here to lay out VRAM framebuffers. */
     uint32_t cfg = (uint32_t)(uintptr_t)config;
+    /* libgcm_sys 0x0200476C (cellGcmGetConfiguration, NID 0xE315A0B2, opd 0x0200BCBC) never tests its argument: the
+     * six words go to r31 = config at 0x0200479C..0x020047C8 and the function holds no error constant, so a NULL
+     * config is a store into the null page (a fault), not CELL_GCM_ERROR_INVALID_VALUE. (While no GCM context
+     * exists the function skips every store, 0x02004780..0x0200478C, and returns 0; this stops for NULL either way.) */
     if (!cfg)
-        return CELL_GCM_ERROR_INVALID_VALUE;
+        ps3_stop(PS3_STOP_GUEST_NULL_ACCESS, GCM_NULL_STORE_WHAT, GCM_NULL_STORE_REMEDY,
+                 GCM_NULL_STORE_FIELDS(__func__), 4, NULL);
 
     vm_write32(cfg +  0, s_config.localAddress);
     vm_write32(cfg +  4, s_config.ioAddress);
@@ -3400,8 +3416,7 @@ s32 cellGcmAddressToOffset(u32 address, u32* offset)
 {
     /* `offset` is a GUEST address; write big-endian via vm_write32. */
     uint32_t off_ea = (uint32_t)(uintptr_t)offset;
-    if (!off_ea)
-        return CELL_GCM_ERROR_INVALID_VALUE;
+    u32 out;   /* the offset to hand back: every success path sets it and ends at `store` */
     /* A2O_DBG=<N>: the EA->offset conversions a title asks for. A texture bound
      * at an offset nothing ever writes usually means the offset came from an EA
      * in a space we classified wrongly, and that is only visible here. */
@@ -3422,23 +3437,23 @@ s32 cellGcmAddressToOffset(u32 address, u32* offset)
         address < s_config.localAddress + s_config.localSize) {
         u32 loff = address - s_config.localAddress;
         if ((loff >> 20) < sizeof(s_local_offset_page)) s_local_offset_page[loff >> 20] = 1;
-        vm_write32(off_ea, loff);
-        return CELL_OK;
+        out = loff;
+        goto store;
     }
 
     /* IO-mapped main memory: consult offset table */
     u32 page = address >> 20;
     if (page < 65536 && s_io_address_table[page] != 0xFFFF) {
         u32 io_page = s_io_address_table[page];
-        vm_write32(off_ea, (io_page << 20) | (address & 0xFFFFF));
-        return CELL_OK;
+        out = (io_page << 20) | (address & 0xFFFFF);
+        goto store;
     }
 
     /* Legacy fallback for initial IO region */
     if (s_config.ioAddress != 0 && address >= s_config.ioAddress &&
         address < s_config.ioAddress + s_config.ioSize) {
-        vm_write32(off_ea, address - s_config.ioAddress);
-        return CELL_OK;
+        out = address - s_config.ioAddress;
+        goto store;
     }
 
     /* Auto-map unmapped main memory. On real hardware PSL1GHT pre-maps its
@@ -3458,27 +3473,37 @@ s32 cellGcmAddressToOffset(u32 address, u32* offset)
      * So the test is now what it always meant: anything below RSX local memory
      * is main memory. Local is checked first and returns above, so reaching
      * here with an address under localAddress means an unmapped main-memory
-     * page, which is exactly the case this fallback exists for. */
+     * page, which is exactly the case this fallback exists for.
+     *
+     * The firmware has no auto-map: libgcm_sys 0x02003F90 (cellGcmAddressToOffset, NID 0x21AC3697,
+     * opd 0x0200BC64) looks the page up in the EA->IO table (0x02003FC4) and answers an unmapped one with
+     * 0x802100FF, CELL_GCM_ERROR_FAILURE (0x02003FDC -> 0x02003FBC; the code is preloaded in r8 at
+     * 0x02003F94/0x02003F9C). The auto-map is this runtime's extension for the homebrew SDKs above. */
     /* NULL is not a buffer. Auto-mapping it costs an IO page and, worse, hands
      * the title a real-looking offset for guest address 0 -- so an EA the title
      * computed as NULL (a failed allocation, an out-param it never filled)
      * silently becomes a valid RSX offset instead of an error it could notice.
      * The Orange Box's chooser asks for exactly this, and the page it burned was
-     * the one the following cellGcmMapMainMemory would otherwise have taken. */
+     * the one the following cellGcmMapMainMemory would otherwise have taken.
+     *
+     * The firmware's answer for page 0 is its answer for any unmapped page, FAILURE with *offset left
+     * alone (libgcm_sys 0x02003F90, 0x02003FDC -> 0x02003FBC; it has no address test of its own; a mapped page 0
+     * was handled above). The code here was INVALID_VALUE and the out-param was cleared; neither is the firmware's. */
     if (address < 0x100000u) {
         printf("[cellGcmSys] AddressToOffset REFUSED: ea 0x%08X is not a mappable "
                "address (page 0)\n", address);
-        vm_write32(off_ea, 0);
-        return CELL_GCM_ERROR_INVALID_VALUE;
+        return CELL_GCM_ERROR_FAILURE;
     }
 
     u32 auto_map_limit = s_config.localAddress ? s_config.localAddress : 0x40000000u;
     if (address < auto_map_limit && s_gcm_initialized) {
         u32 ea_page = address & ~0xFFFFFu;
         u32 io      = gcm_io_alloc(0x100000u);
+        /* No IO page left for the auto-map. The firmware has no auto-map to run out of; its answer for an EA
+         * it has no IO page for is FAILURE (libgcm_sys 0x02003FDC -> 0x02003FBC, r8 = 0x802100FF from
+         * 0x02003F94), and this is that answer, with *offset untouched as there. */
         if (io == 0xFFFFFFFFu) {
             printf("[cellGcmSys] AddressToOffset: no free IO page to auto-map ea 0x%08X\n", address);
-            vm_write32(off_ea, 0);
             return CELL_GCM_ERROR_FAILURE;
         }
         populate_offset_table(ea_page, io, 0x100000u);
@@ -3502,17 +3527,26 @@ s32 cellGcmAddressToOffset(u32 address, u32* offset)
         }
         printf("[cellGcmSys] AddressToOffset: auto-mapped ea 0x%08X -> io 0x%08X\n",
                ea_page, io);
-        vm_write32(off_ea, io | (address & 0xFFFFFu));
-        return CELL_OK;
+        out = io | (address & 0xFFFFFu);
+        goto store;
     }
 
     printf("[cellGcmSys] WARNING: AddressToOffset failed for 0x%08X\n", address);
-    vm_write32(off_ea, 0);
     { static int _d = -1; if (_d < 0) _d = getenv("A2O_FAILDBG") ? 1 : 0;
       if (_d) { static int _n = 0; if (PS3_LOG_FIRST(_n, 12))
           fprintf(stderr, "[A2O] FAILED ea=0x%08X (not in local or IO space)%c",
                   address, 10); } }
     return CELL_GCM_ERROR_FAILURE;
+
+store:
+    /* libgcm_sys 0x02003F90 stores the offset (0x02003FB8, 0x02003FE4) only on success and never tests the
+     * pointer: a NULL `offset` is a store into the null page (a fault), not CELL_GCM_ERROR_INVALID_VALUE, and
+     * an EA it cannot convert returns FAILURE before any store (so NULL with such an EA is FAILURE, not a fault). */
+    if (!off_ea)
+        ps3_stop(PS3_STOP_GUEST_NULL_ACCESS, GCM_NULL_STORE_WHAT, GCM_NULL_STORE_REMEDY,
+                 GCM_NULL_STORE_FIELDS(__func__), 4, NULL);
+    vm_write32(off_ea, out);
+    return CELL_OK;
 }
 
 /* IO-offset space allocator for main-memory mappings. It never hands out a
@@ -3555,42 +3589,64 @@ s32 cellGcmMapMainMemory(u32 ea, u32 size, u32* offset)
      * invisible. Same lesson as the savedata early returns. */
     printf("[cellGcmSys] MapMainMemory(ea=0x%08X, size=0x%X)\n", ea, size);
 
-    if (!offset) {
-        printf("[cellGcmSys] MapMainMemory REFUSED: offset out-param is NULL\n");
-        return CELL_GCM_ERROR_INVALID_VALUE;
-    }
-    /* Size and EA must both be 1MB aligned. */
-    if (size == 0 || (size & 0xFFFFF) != 0) {
-        printf("[cellGcmSys] MapMainMemory REFUSED: size 0x%X is not a non-zero multiple of 1MB\n", size);
-        return CELL_GCM_ERROR_INVALID_ALIGNMENT;
-    }
+    /* libgcm_sys 0x0200488C (cellGcmMapMainMemory, NID 0xA114EC67, opd 0x0200BCCC) tests the EA first: its low
+     * 20 bits (0x0200489C, 0x020048A4, 0x020048D4) and a misaligned one returns 0x802100FF =
+     * CELL_GCM_ERROR_FAILURE (0x020048D8..0x020048DC). RPCS3 cellGcmMapMainMemory() (cellGcmSys.cpp) answers
+     * FAILURE too. This was INVALID_ALIGNMENT, a code the firmware never returns here. */
     if ((ea & 0xFFFFF) != 0) {
         printf("[cellGcmSys] MapMainMemory REFUSED: ea 0x%08X is not 1MB aligned\n", ea);
-        return CELL_GCM_ERROR_INVALID_ALIGNMENT;
-    }
-
-    /* Before cellGcmInit there is no IO page table to map into (the reference
-     * emulator returns NO_IO_PAGE_TABLE here too). Accepting the map only for
-     * Init to wipe it left the title holding an offset that Init then gave to
-     * its own window. */
-    if (!s_gcm_initialized) {
-        printf("[cellGcmSys] MapMainMemory REFUSED: cellGcmInit has not run (no IO page table)\n");
-        return CELL_GCM_ERROR_NO_IO_PAGE_TABLE;
-    }
-
-    /* A free slot first, then the IO region: allocating the region before
-     * the slot check leaked IO space on every refused call. */
-    IoMapping* mapping = find_free_mapping();
-    if (!mapping) {
-        printf("[cellGcmSys] WARNING: no free IO mapping slots\n");
         return CELL_GCM_ERROR_FAILURE;
     }
+    /* The size's low 20 bits are the second test (libgcm_sys 0x02004918, 0x0200491C, 0x02004920), the same
+     * FAILURE 0x802100FF (0x020048D8). A size that is a multiple of 1MB goes on, 0 included. */
+    if ((size & 0xFFFFF) != 0) {
+        printf("[cellGcmSys] MapMainMemory REFUSED: size 0x%X is not a multiple of 1MB\n", size);
+        return CELL_GCM_ERROR_FAILURE;
+    }
+    /* The firmware does not test for size 0 (libgcm_sys 0x0200488C: nothing between 0x02004920 and the search at
+     * 0x02004954): an empty window is "found" at IO page 0 and the call is handed to lv2 with length 0
+     * (sc 672 at 0x020049F8, r6 = size), whose answer the firmware returns unchanged (0x02004AA8..0x02004AC4).
+     * That syscall is not in the firmware set, so the result is unknown; RPCS3 answers FAILURE for it, which
+     * the firmware would only do for an argument it tested itself. Named stop, not a guess. */
+    if (size == 0)
+        ps3_stop_gcm_unmodelled(__func__, "zero-size",
+                                "libgcm_sys passes a size of 0 to lv2 (sc 672); the kernel's answer is not known");
+
+    /* The firmware has no "initialised" test either: libgcm_sys 0x0200488C searches the IO->EA table at
+     * TOC(-0x7FC8)+0x1800 against the IO window size at +0x1C08 (0x0200494C), and both are 0 until cellGcmInit
+     * fills them (zero in the lifted image). Before Init the bound ioPages - run (0x02004950) underflows, the scan
+     * at 0x02004954 walks past the table, and the lv2 context id 0x02000204 returns (0) is not a context. That is
+     * undefined behaviour, not an error code; NO_IO_PAGE_TABLE here was never the firmware's answer (RPCS3's
+     * cellGcmMapMainMemory() has no such test either). Named stop. */
+    if (!s_gcm_initialized)
+        ps3_stop_hle_uninitialized(__func__, "cellGcmSys",
+                                   "libgcm_sys searches IO page tables that cellGcmInit builds; before it they are zero");
 
     u32 io_offset = gcm_io_alloc(size);
+    /* libgcm_sys 0x0200488C searches the IO->EA table first-fit for a run of size>>20 free pages
+     * (0x02004954..0x02004988) and, when none is left, unlocks (0x020087C8) and returns 0x80210001 =
+     * CELL_GCM_ERROR_NO_IO_PAGE_TABLE (0x0200499C..0x020049A0). The same code, for the same condition. */
     if (io_offset == 0xFFFFFFFFu) {
         printf("[cellGcmSys] MapMainMemory REFUSED: no free run of 0x%X bytes of IO space\n", size);
         return CELL_GCM_ERROR_NO_IO_PAGE_TABLE;
     }
+
+    IoMapping* mapping = find_free_mapping();
+    /* The firmware keeps a map only in the two u16 page tables (libgcm_sys 0x02004A14..0x02004A74) and has no
+     * list to run out of: once a run is free the map succeeds. The slot is this runtime's bookkeeping for the
+     * FIFO walker (find_io_mapping_by_io), so a full list is a limit of ours; the FAILURE it returned was not the
+     * firmware's (its only FAILURE here is a misaligned argument, 0x020048D8). A code would be a guess. Named stop. */
+    if (!mapping)
+        ps3_stop_gcm_unmodelled(__func__, "io-mapping-slots",
+                                "the runtime's IO mapping list is full where the firmware's page tables are not");
+
+    /* libgcm_sys stores the new offset only at the end (stw r23, 0(r26) at 0x02004A7C, r26 = offset) with no test
+     * of the pointer, so a NULL `offset` faults there, after the tables are updated; it is not
+     * CELL_GCM_ERROR_INVALID_VALUE. */
+    if (!offset)
+        ps3_stop(PS3_STOP_GUEST_NULL_ACCESS, GCM_NULL_STORE_WHAT, GCM_NULL_STORE_REMEDY,
+                 GCM_NULL_STORE_FIELDS(__func__), 4, NULL);
+
     printf("[cellGcmSys] MapMainMemory -> io 0x%08X\n", io_offset);
 
     mapping->ea     = ea;
@@ -3906,6 +3962,10 @@ s32 cellGcmSetZcull(u8 index, u32 offset, u32 width, u32 height,
 /* NID: 0x2BB1F1E5 */
 s32 cellGcmBindTile(u8 index)
 {
+    /* libgcm_sys 0x02002AB8 (cellGcmBindTile, NID 0x4524CCCD, opd 0x0200BB64) takes the index as the low byte
+     * of r3 (0x02002ACC) and compares it first, `cmplwi 0xE; bgt` (0x02002AD4, 0x02002AE4): 15 and up return
+     * 0x80210003 = CELL_GCM_ERROR_INVALID_VALUE (preloaded in r3 at 0x02002AC8/0x02002AE0) before anything
+     * else. The same limit and the same code. */
     if (index >= CELL_GCM_MAX_TILE_COUNT)
         return CELL_GCM_ERROR_INVALID_VALUE;
 

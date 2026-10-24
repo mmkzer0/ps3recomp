@@ -8,6 +8,7 @@
 #include "cellVideoOut.h"
 #include "ps3emu/endian.h"
 #include "ps3emu/config.h"        /* video.resolutions */
+#include "ps3emu/stop.h"          /* the named stop for a videoOut the oracle does not test */
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
 #include <stdio.h>
 #include <string.h>
@@ -170,36 +171,41 @@ s32 cellVideoOutGetState(u32 videoOut, u32 deviceIndex, CellVideoOutState* state
     printf("[cellVideoOut] GetState(videoOut=%u, deviceIndex=%u)\n",
            videoOut, deviceIndex);
 
+    /* RPCS3 rpcs3/Emu/Cell/Modules/cellVideoOut.cpp, cellVideoOutGetState(): `!state` is the first test and
+     * returns CELL_VIDEO_OUT_ERROR_ILLEGAL_PARAMETER. */
     if (!state)
         return CELL_VIDEO_OUT_ERROR_ILLEGAL_PARAMETER;
 
-    if (videoOut != CELL_VIDEO_OUT_PRIMARY && videoOut != CELL_VIDEO_OUT_SECONDARY)
-        return CELL_VIDEO_OUT_ERROR_UNSUPPORTED_VIDEO_OUT;
+    /* RPCS3 cellVideoOutGetState() next asks cellVideoOutGetNumberOfDevice(videoOut) (PRIMARY 1, SECONDARY 0, any
+     * other value the error UNSUPPORTED_VIDEO_OUT) and returns CELL_VIDEO_OUT_ERROR_DEVICE_NOT_FOUND for
+     * `device_count < 0 || deviceIndex >= device_count`. So an unknown videoOut is DEVICE_NOT_FOUND (the switch
+     * default that returns UNSUPPORTED_VIDEO_OUT sits behind that test and is unreachable), and so are the
+     * secondary output and any deviceIndex but 0. This returned UNSUPPORTED_VIDEO_OUT for an unknown videoOut and
+     * answered OK for the secondary. */
+    if (videoOut != CELL_VIDEO_OUT_PRIMARY || deviceIndex >= 1u)
+        return CELL_VIDEO_OUT_ERROR_DEVICE_NOT_FOUND;
 
     state = GUEST_PTR(state, CellVideoOutState*);
     memset(state, 0, sizeof(CellVideoOutState));
 
-    if (videoOut == CELL_VIDEO_OUT_PRIMARY) {
-        state->state      = 0; /* CELL_VIDEO_OUT_OUTPUT_STATE_ENABLED (was 2=PREPARING; PhyreEngine gates render-target config on ENABLED) */
-        state->colorSpace = CELL_VIDEO_OUT_COLOR_SPACE_RGB;
+    state->state      = 0; /* CELL_VIDEO_OUT_OUTPUT_STATE_ENABLED (was 2=PREPARING; PhyreEngine gates render-target config on ENABLED) */
+    state->colorSpace = CELL_VIDEO_OUT_COLOR_SPACE_RGB;
 
-        /* Fill the 8-byte displayMode struct byte-wise (endian-safe): the
-         * guest reads resolutionId/scanMode/aspect as individual bytes. */
-        (void)0;
-        state->displayMode.resolutionId = current_resolution();
-        state->displayMode.scanMode     = CELL_VIDEO_OUT_SCAN_MODE_PROGRESSIVE;
-        state->displayMode.conversion   = 0;
-        state->displayMode.aspect       = CELL_VIDEO_OUT_ASPECT_16_9;
-        state->displayMode.refreshRates = ps3_bswap16(current_refresh_flag());
-    } else {
-        state->state = 0; /* disabled */
-    }
+    /* Fill the 8-byte displayMode struct byte-wise (endian-safe): the
+     * guest reads resolutionId/scanMode/aspect as individual bytes. */
+    state->displayMode.resolutionId = current_resolution();
+    state->displayMode.scanMode     = CELL_VIDEO_OUT_SCAN_MODE_PROGRESSIVE;
+    state->displayMode.conversion   = 0;
+    state->displayMode.aspect       = CELL_VIDEO_OUT_ASPECT_16_9;
+    state->displayMode.refreshRates = ps3_bswap16(current_refresh_flag());
 
     return CELL_OK;
 }
 
 s32 cellVideoOutGetResolution(u32 resolutionId, CellVideoOutResolution* resolution)
 {
+    /* RPCS3 cellVideoOut.cpp, cellVideoOutGetResolution(): `!resolution` is the first test and returns
+     * CELL_VIDEO_OUT_ERROR_ILLEGAL_PARAMETER. */
     if (!resolution)
         return CELL_VIDEO_OUT_ERROR_ILLEGAL_PARAMETER;
 
@@ -223,11 +229,18 @@ s32 cellVideoOutConfigure(u32 videoOut, CellVideoOutConfiguration* config,
 {
     printf("[cellVideoOut] Configure(videoOut=%u)\n", videoOut);
 
+    /* RPCS3 cellVideoOut.cpp, cellVideoOutConfigure(): `!config` is the first test and returns
+     * CELL_VIDEO_OUT_ERROR_ILLEGAL_PARAMETER. */
     if (!config)
         return CELL_VIDEO_OUT_ERROR_ILLEGAL_PARAMETER;
 
+    /* RPCS3 cellVideoOutConfigure() has no videoOut test at all: after `!config` it checks the pitch, the
+     * resolution id and the aspect and configures its one output whatever videoOut was. What the console does for
+     * a videoOut other than PRIMARY is not known (libsysutil is not in the firmware set and the oracle ignores the
+     * argument rather than answering it), so UNSUPPORTED_VIDEO_OUT here was a guess. Named stop. */
     if (videoOut != CELL_VIDEO_OUT_PRIMARY)
-        return CELL_VIDEO_OUT_ERROR_UNSUPPORTED_VIDEO_OUT;
+        ps3_stop_gcm_unmodelled(__func__, "video-out",
+                                "cellVideoOutConfigure on an output other than PRIMARY has no known console behaviour");
 
     config = GUEST_PTR(config, CellVideoOutConfiguration*);
     s_resolution_id = config->resolutionId;

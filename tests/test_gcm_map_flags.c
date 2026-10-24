@@ -10,6 +10,14 @@ int spu_coh_is_reserved(uint32_t addr) { (void)addr; return 0; }
 void spu_coh_notify_write(uint32_t addr) { (void)addr; abort(); }
 void spu_lockline_lock(void) { abort(); }
 void spu_lockline_unlock(void) { abort(); }
+/* None of the named stops is reached here. */
+PS3_NORETURN void ps3_stop(ps3_stop_kind k, const char* w, const char* r, const ps3_stop_field* f, size_t n,
+                           const ps3_stop_site* s)
+{ (void)k; (void)w; (void)r; (void)f; (void)n; (void)s; abort(); }
+PS3_NORETURN void ps3_stop_gcm_unmodelled(const char* fn, const char* feat, const char* why)
+{ (void)fn; (void)feat; (void)why; abort(); }
+PS3_NORETURN void ps3_stop_hle_uninitialized(const char* fn, const char* mod, const char* why)
+{ (void)fn; (void)mod; (void)why; abort(); }
 
 static void reset_maps(void) {
     memset(s_io_mappings,0,sizeof(s_io_mappings));s_io_mapping_count=0;

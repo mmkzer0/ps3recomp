@@ -159,6 +159,31 @@ int main(int argc, char** argv)
         vm_base[CFG_EA + 2] = CELL_VIDEO_OUT_ASPECT_16_9;
         CHECK(cellVideoOutConfigure(0, (CellVideoOutConfiguration*)(uintptr_t)CFG_EA, NULL, 0) == 0, "Configure");
         expect("configure/after", m, 2, 1, 1920u * 4, 1);
+    } else if (!strcmp(mode, "checks")) {
+        /* The codes are RPCS3's cellVideoOut.h enum (0x8002B220..0x8002B228), and the checks are its order. */
+        CHECK((uint32_t)CELL_VIDEO_OUT_ERROR_ILLEGAL_PARAMETER == 0x8002B222u, "ILLEGAL_PARAMETER value");
+        CHECK((uint32_t)CELL_VIDEO_OUT_ERROR_DEVICE_NOT_FOUND == 0x8002B224u, "DEVICE_NOT_FOUND value");
+        CHECK((uint32_t)CELL_VIDEO_OUT_ERROR_UNSUPPORTED_VIDEO_OUT == 0x8002B225u, "UNSUPPORTED_VIDEO_OUT value");
+        CHECK((uint32_t)CELL_VIDEO_OUT_ERROR_VALUE_IS_NOT_SET == 0x8002B228u, "VALUE_IS_NOT_SET value");
+        CellVideoOutState* st = (CellVideoOutState*)(uintptr_t)STATE_EA;
+        /* !state first, whatever videoOut is */
+        CHECK((uint32_t)cellVideoOutGetState(0, 0, NULL) == 0x8002B222u, "GetState !state");
+        CHECK((uint32_t)cellVideoOutGetState(7, 0, NULL) == 0x8002B222u, "GetState !state, bad videoOut");
+        /* then device_count: primary 1, secondary 0, anything else an error < 0 -> DEVICE_NOT_FOUND */
+        CHECK((uint32_t)cellVideoOutGetState(7, 0, st) == 0x8002B224u, "GetState unknown videoOut");
+        CHECK((uint32_t)cellVideoOutGetState(CELL_VIDEO_OUT_SECONDARY, 0, st) == 0x8002B224u, "GetState secondary");
+        CHECK((uint32_t)cellVideoOutGetState(0, 1, st) == 0x8002B224u, "GetState deviceIndex 1");
+        CHECK(cellVideoOutGetState(0, 0, st) == 0, "GetState primary");
+        CHECK((uint32_t)cellVideoOutGetResolution(2, NULL) == 0x8002B222u, "GetResolution !resolution");
+        CHECK((uint32_t)cellVideoOutConfigure(0, NULL, NULL, 0) == 0x8002B222u, "Configure !config");
+        CHECK((uint32_t)cellVideoOutConfigure(1, NULL, NULL, 0) == 0x8002B222u, "Configure !config precedes videoOut");
+    } else if (!strcmp(mode, "configure_secondary")) {
+        /* No firmware and no oracle test for a videoOut other than PRIMARY: a named stop, not UNSUPPORTED_VIDEO_OUT.
+         * ctest expects the gcm-unmodelled stop line. */
+        memset(vm_base + CFG_EA, 0, sizeof(CellVideoOutConfiguration));
+        (void)cellVideoOutConfigure(1, (CellVideoOutConfiguration*)(uintptr_t)CFG_EA, NULL, 0);
+        printf("video_resolutions configure_secondary: returned\n");
+        return 1;
     } else {
         printf("unknown mode %s\n", mode);
         return 2;

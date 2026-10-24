@@ -7,8 +7,8 @@ and cellGcm_syscall_iomap (pulled verbatim out of libs/video/cellGcmSys.c,
 with CELL_GCM_MAX_IO_MAPPINGS from cellGcmSys.h and GCM_IO_PAGES from the .c)
 against a small stub for guest memory, and checks:
 
-0. cellGcmMapMainMemory before cellGcmInit is refused with
-   CELL_GCM_ERROR_NO_IO_PAGE_TABLE, maps nothing and leaves the out-param;
+0. cellGcmMapMainMemory before cellGcmInit is the named stop hle-uninitialized
+   (libgcm_sys searches IO tables that are zero until Init): it maps nothing and leaves the out-param;
 1. a title mapping separate 1 MB chunks gets at least 40 distinct IO offsets
    before the first refusal (Killzone 3 maps up to 38);
 2. a refused cellGcmMapMainMemory does not consume IO address space (no IO
@@ -44,7 +44,10 @@ def function(signature):
 
 slots = re.search(r'^#define CELL_GCM_MAX_IO_MAPPINGS\s+(\d+)', hdr, re.M).group(1)
 io_pages = re.search(r'^#define GCM_IO_PAGES\s+(\w+)', src, re.M).group(1)
-parts = [function(r'static void populate_offset_table\(u32 ea, u32 io, u32 size\)'),
+macros = re.search(r'#define GCM_NULL_STORE_WHAT.*?\{"fn", \(fn\)\} \}\)\n', src, re.S)
+assert macros, 'GCM_NULL_STORE_* macros not found'
+parts = [macros.group(0),
+         function(r'static void populate_offset_table\(u32 ea, u32 io, u32 size\)'),
          function(r'static void clear_offset_table\(u32 ea, u32 io, u32 size\)'),
          function(r'static IoMapping\* find_mapping_by_io\(u32 io\)'),
          function(r'static IoMapping\* find_free_mapping\(void\)'),
@@ -55,6 +58,8 @@ parts = [function(r'static void populate_offset_table\(u32 ea, u32 io, u32 size\
 
 HARNESS = r'''
 #include <stdint.h>
+#include <setjmp.h>
+#include <ps3emu/stop.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -85,6 +90,16 @@ static int io_pages_used(void)
     return n;
 }
 static u32 gcm_io_alloc(u32 size);
+/* The named stops end the process in the runtime; here they unwind to the check that armed them. */
+static jmp_buf g_jb;
+static int g_armed, g_stop_kind = -1;
+PS3_NORETURN void ps3_stop(ps3_stop_kind k, const char* w, const char* r, const ps3_stop_field* f, size_t n,
+                           const ps3_stop_site* s)
+{ (void)w; (void)r; (void)f; (void)n; (void)s; if (!g_armed) abort(); g_stop_kind = (int)k; longjmp(g_jb, 1); }
+PS3_NORETURN void ps3_stop_gcm_unmodelled(const char* fn, const char* feat, const char* why)
+{ (void)fn; (void)feat; (void)why; if (!g_armed) abort(); g_stop_kind = PS3_STOP_GCM_UNMODELLED; longjmp(g_jb, 1); }
+PS3_NORETURN void ps3_stop_hle_uninitialized(const char* fn, const char* mod, const char* why)
+{ (void)fn; (void)mod; (void)why; if (!g_armed) abort(); g_stop_kind = PS3_STOP_HLE_UNINITIALIZED; longjmp(g_jb, 1); }
 %s
 int main(void)
 {
@@ -93,13 +108,15 @@ int main(void)
     memset(s_ea_address_table, 0xFF, sizeof s_ea_address_table);
     memset(s_io_address_table, 0xFF, sizeof s_io_address_table);
 
-    /* 0: no IO page table before cellGcmInit. */
+    /* 0: no IO page table before cellGcmInit: a named stop, nothing mapped, the out-param untouched. */
     vm_write32(0x100, 0xDEADBEEFu);
-    s32 rc0 = cellGcmMapMainMemory(0x40000000u, 0x200000u, out);
-    int pre_ok = rc0 == (s32)CELL_GCM_ERROR_NO_IO_PAGE_TABLE && io_pages_used() == 0 && s_io_mapping_count == 0
+    g_armed = 1;
+    if (!setjmp(g_jb)) (void)cellGcmMapMainMemory(0x40000000u, 0x200000u, out);
+    g_armed = 0;
+    int pre_ok = g_stop_kind == PS3_STOP_HLE_UNINITIALIZED && io_pages_used() == 0 && s_io_mapping_count == 0
                  && rd32(0x100) == 0xDEADBEEFu;
-    printf("%%s map before cellGcmInit refused: rc 0x%%08X, %%d IO pages used\n",
-           pre_ok ? "ok  " : "FAIL", (u32)rc0, io_pages_used());
+    printf("%%s map before cellGcmInit is the hle-uninitialized stop: kind %%d, %%d IO pages used\n",
+           pre_ok ? "ok  " : "FAIL", g_stop_kind, io_pages_used());
     ok &= pre_ok;
     s_gcm_initialized = 1;
 

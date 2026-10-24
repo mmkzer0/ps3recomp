@@ -103,7 +103,6 @@
 #define CELL_ERROR_BASE_SYSMODULE       0x80012000
 #define CELL_ERROR_BASE_FS              0x80010700
 #define CELL_ERROR_BASE_AUDIO           0x80310700
-#define CELL_ERROR_BASE_VIDEO           0x8002B100
 #define CELL_ERROR_BASE_GCM             0x80210000   /* libgcm_sys returns 0x802100FF / 0x80210001 (FW 4.93 0x020009F0) */
 #define CELL_ERROR_BASE_NET             0x80130100
 #define CELL_ERROR_BASE_PAD             0x80121100
