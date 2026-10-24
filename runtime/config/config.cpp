@@ -243,6 +243,38 @@ std::string check_string(const Option& o, std::string& s)
                 return "expected 64 hex digits (a SHA-256), found a non-hex character";
         }
         return {};
+    case PS3_CFG_V_VIDEO_RESOLUTIONS: {
+        /* The cellVideoOut resolution ids (libs/video/cellVideoOut.h). */
+        static const unsigned kIds[] = {1, 2, 4, 5, 10, 11, 12, 13};
+        if (s.empty()) return {};
+        bool want[14] = {false};
+        size_t pos = 0;
+        for (;;) {
+            size_t end = s.find(',', pos);
+            std::string tok = s.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+            while (!tok.empty() && (tok.front() == ' ' || tok.front() == '\t')) tok.erase(tok.begin());
+            while (!tok.empty() && (tok.back() == ' ' || tok.back() == '\t')) tok.pop_back();
+            bool ok = !tok.empty() && tok.size() <= 2;
+            unsigned v = 0;
+            for (char c : tok) {
+                if (c < '0' || c > '9') { ok = false; break; }
+                v = v * 10 + unsigned(c - '0');
+            }
+            bool known = false;
+            for (unsigned id : kIds) known = known || (ok && id == v);
+            if (!known)
+                return "'" + tok + "' is not a resolution id; expected a comma-separated list from "
+                       "1 (1080), 2 (720), 4 (480), 5 (576), 10, 11, 12, 13";
+            want[v] = true;
+            if (end == std::string::npos) break;
+            pos = end + 1;
+        }
+        std::string norm;
+        for (unsigned id : kIds)
+            if (want[id]) norm += (norm.empty() ? "" : ",") + std::to_string(id);
+        s = norm;
+        return {};
+    }
     default:
         return {};
     }

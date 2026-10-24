@@ -69,6 +69,7 @@ Ids are stable kebab-case; a new gap gets a new kind, never a free-text variant.
 | `hle-uninitialized` | an HLE function was called before its module's init, where the firmware's behaviour is undefined (it dereferences state the init builds), so no return value is faithful. Fields: `func`, `module`, `reason` |
 | `sync2-semaphore-unsupported` | a semaphore call supplies a non-null custom thread/notifier config (`reason=custom-config`), reinitializes a suspended call, finds an unmodelled waiter/queue state, or cannot wait/notify its fiber. Custom configs stop before count or queue side effects |
 | `fiber-unsupported` | an initialized fiber/scheduler attribute requests an unimplemented optional callback/setting (`reason=attribute-field`), host execution/queue state cannot be honored, a worker event resource fails, or the firmware's attempted 33rd worker has no representable 32-bit bitmap slot (`reason=worker-capacity`). The raw initializer also stops if there is no calling PPU context from which to read r13 |
+| `gcm-unmodelled` | the firmware has a command-stream path the runtime does not reproduce, so a stream built without it would be a guess: `cellRescSetConvertAndFlip` in a PAL-interpolating (720x576 with PAL temporal mode 1..4) or interlaced configuration, or with more than 256 vertices; a command context whose buffer-full callback did not leave room for a reservation. Fields: `func`, `feature`, `reason` |
 
 Where each is raised, and what it carries beyond `pc lr tid`:
 
@@ -99,6 +100,7 @@ Where each is raised, and what it carries beyond `pc lr tid`:
 | `hle-uninitialized` | `ps3_stop_hle_uninitialized` | `func module reason` |
 | `sync2-semaphore-unsupported` | `libs/sync/cellSync2.c` (`sem_unsupported`) | `api sem config reason`; `config` is the guest config EA, never a timeout |
 | `fiber-unsupported` | `libs/spurs/cellFiber.c` (`unsupported`) | `api ea field reason`; an unsupported attribute names its byte offset in `field`; worker-capacity retains the attempted guest count increment |
+| `gcm-unmodelled` | `ps3_stop_gcm_unmodelled` (`libs/video/cellResc.c`, `libs/video/cellGcmSys.c`) | `func feature reason` |
 
 Lifted code does not track a guest pc, so for the first four `pc` is the caller's
 return address (the import stub's caller, the `sc` site, the call site). Only

@@ -7,6 +7,7 @@
 
 #include "cellVideoOut.h"
 #include "ps3emu/endian.h"
+#include "ps3emu/config.h"        /* video.resolutions */
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
 #include <stdio.h>
 #include <string.h>
@@ -28,12 +29,81 @@ static u32 s_pitch          = 1280 * 4;
 static void get_resolution_wh(u32 resId, u16* w, u16* h);
 
 /* ---------------------------------------------------------------------------
+ * The display's resolution set (video.resolutions, docs/CONFIG.md)
+ *
+ * Empty (the default) is "no restriction": every id is available and the device
+ * lists 480, 576, 720, 1080. A configured list is the set the display reports;
+ * availability, the device's mode list and the resolution GetState reports all
+ * answer from it.
+ * -----------------------------------------------------------------------*/
+static const u8 k_known_resolutions[] = {
+    CELL_VIDEO_OUT_RESOLUTION_480,  CELL_VIDEO_OUT_RESOLUTION_576,
+    CELL_VIDEO_OUT_RESOLUTION_720,  CELL_VIDEO_OUT_RESOLUTION_1080,
+    CELL_VIDEO_OUT_RESOLUTION_1600x1080, CELL_VIDEO_OUT_RESOLUTION_1440x1080,
+    CELL_VIDEO_OUT_RESOLUTION_1280x1080, CELL_VIDEO_OUT_RESOLUTION_960x1080,
+};
+
+static int resolutions_restricted(void)
+{
+    return ps3_cfg_video_resolutions()[0] != '\0';
+}
+
+/* The list was validated and normalised at load: ids 1,2,4,5,10..13 joined by ','. */
+static int resolution_listed(u32 id)
+{
+    const char* p = ps3_cfg_video_resolutions();
+    while (*p) {
+        u32 v = 0;
+        while (*p >= '0' && *p <= '9')
+            v = v * 10u + (u32)(*p++ - '0');
+        if (v == id)
+            return 1;
+        if (*p == ',')
+            p++;
+    }
+    return 0;
+}
+
+static int resolution_available(u32 id)
+{
+    return resolutions_restricted() ? resolution_listed(id) : 1;
+}
+
+/* What GetState and GetConfiguration report until the title configures one:
+ * 720, or the first listed id when 720 is not. */
+static u8 initial_resolution(void)
+{
+    if (!resolutions_restricted() || resolution_listed(CELL_VIDEO_OUT_RESOLUTION_720))
+        return CELL_VIDEO_OUT_RESOLUTION_720;
+    for (unsigned i = 0; i < sizeof k_known_resolutions; i++)
+        if (resolution_listed(k_known_resolutions[i]))
+            return k_known_resolutions[i];
+    return CELL_VIDEO_OUT_RESOLUTION_720;   /* unreachable: a non-empty list names a known id */
+}
+
+static int s_configured = 0;   /* Configure or cellVideoOut_set_resolution has set a resolution */
+static u8 current_resolution(void)
+{
+    return s_configured ? s_resolution_id : initial_resolution();
+}
+
+static u32 current_pitch(void)
+{
+    if (s_configured)
+        return s_pitch;
+    u16 w, h;
+    get_resolution_wh(initial_resolution(), &w, &h);
+    return (u32)w * 4;
+}
+
+/* ---------------------------------------------------------------------------
  * Configuration
  * -----------------------------------------------------------------------*/
 
 void cellVideoOut_set_resolution(u8 resolutionId)
 {
     s_resolution_id = resolutionId;
+    s_configured = 1;
 
     /* Update pitch based on resolution (host-endian helper; the public
      * cellVideoOutGetResolution writes guest big-endian now) */
@@ -95,7 +165,7 @@ s32 cellVideoOutGetState(u32 videoOut, u32 deviceIndex, CellVideoOutState* state
         /* Fill the 8-byte displayMode struct byte-wise (endian-safe): the
          * guest reads resolutionId/scanMode/aspect as individual bytes. */
         (void)0;
-        state->displayMode.resolutionId = (u8)s_resolution_id;
+        state->displayMode.resolutionId = current_resolution();
         state->displayMode.scanMode     = CELL_VIDEO_OUT_SCAN_MODE_PROGRESSIVE;
         state->displayMode.conversion   = 0;
         state->displayMode.aspect       = CELL_VIDEO_OUT_ASPECT_16_9;
@@ -152,6 +222,7 @@ s32 cellVideoOutConfigure(u32 videoOut, CellVideoOutConfiguration* config,
         s_pitch = (u32)w * 4;
     }
 
+    s_configured = 1;
     printf("[cellVideoOut] Configure: resId=%u, format=%u, aspect=%u, pitch=%u\n",
            s_resolution_id, s_color_format, s_aspect, s_pitch);
 
@@ -171,10 +242,10 @@ s32 cellVideoOutGetConfiguration(u32 videoOut, CellVideoOutConfiguration* config
 
     config = GUEST_PTR(config, CellVideoOutConfiguration*);
     memset(config, 0, sizeof(CellVideoOutConfiguration));
-    config->resolutionId = s_resolution_id;
+    config->resolutionId = current_resolution();
     config->format       = s_color_format;
     config->aspect       = s_aspect;
-    config->pitch        = ps3_bswap32(s_pitch);  /* guest BE struct */
+    config->pitch        = ps3_bswap32(current_pitch());  /* guest BE struct */
 
     return CELL_OK;
 }
@@ -200,33 +271,18 @@ s32 cellVideoOutGetDeviceInfo(u32 videoOut, u32 deviceIndex,
     info->state          = 2; /* connected */
     info->rgbOutputRange = 1;
 
-    /* Report supported modes */
+    /* Report supported modes: the four standard ones when video.resolutions is empty,
+     * else exactly the listed ids. */
     int idx = 0;
-
-    /* 480p */
-    info->availableModes[idx].resolutionId = CELL_VIDEO_OUT_RESOLUTION_480;
-    info->availableModes[idx].scanMode     = CELL_VIDEO_OUT_SCAN_MODE_PROGRESSIVE;
-    info->availableModes[idx].aspect       = CELL_VIDEO_OUT_ASPECT_16_9;
-    idx++;
-
-    /* 576p */
-    info->availableModes[idx].resolutionId = CELL_VIDEO_OUT_RESOLUTION_576;
-    info->availableModes[idx].scanMode     = CELL_VIDEO_OUT_SCAN_MODE_PROGRESSIVE;
-    info->availableModes[idx].aspect       = CELL_VIDEO_OUT_ASPECT_16_9;
-    idx++;
-
-    /* 720p */
-    info->availableModes[idx].resolutionId = CELL_VIDEO_OUT_RESOLUTION_720;
-    info->availableModes[idx].scanMode     = CELL_VIDEO_OUT_SCAN_MODE_PROGRESSIVE;
-    info->availableModes[idx].aspect       = CELL_VIDEO_OUT_ASPECT_16_9;
-    idx++;
-
-    /* 1080p */
-    info->availableModes[idx].resolutionId = CELL_VIDEO_OUT_RESOLUTION_1080;
-    info->availableModes[idx].scanMode     = CELL_VIDEO_OUT_SCAN_MODE_PROGRESSIVE;
-    info->availableModes[idx].aspect       = CELL_VIDEO_OUT_ASPECT_16_9;
-    idx++;
-
+    for (unsigned i = 0; i < sizeof k_known_resolutions; i++) {
+        const u8 id = k_known_resolutions[i];
+        if (resolutions_restricted() ? !resolution_listed(id) : i >= 4)
+            continue;
+        info->availableModes[idx].resolutionId = id;
+        info->availableModes[idx].scanMode     = CELL_VIDEO_OUT_SCAN_MODE_PROGRESSIVE;
+        info->availableModes[idx].aspect       = CELL_VIDEO_OUT_ASPECT_16_9;
+        idx++;
+    }
     info->availableModeCount = (u8)idx;
 
     return CELL_OK;
@@ -242,14 +298,16 @@ s32 cellVideoOutGetNumberOfDevice(u32 videoOut)
     return 0;
 }
 
-/* Is (resolutionId, aspect) available on this output? Return 1 (available) for
- * the primary output. A 0 here makes the game skip its display-buffer/tile
- * setup, leaving a null render object it later dereferences. */
+/* Is (resolutionId, aspect) available on this output? The primary output answers from
+ * video.resolutions: every id when it is empty (a 0 here makes a game skip its
+ * display-buffer/tile setup, leaving a null render object it later dereferences), else
+ * 1 for a listed id and 0 for any other. The aspect is not part of the answer. */
 s32 cellVideoOutGetResolutionAvailability(u32 videoOut, u32 resolutionId,
                                           u32 aspect, u32 option)
 {
     (void)aspect; (void)option;
-    printf("[cellVideoOut] GetResolutionAvailability(out=%u, res=%u) -> 1\n",
-           videoOut, resolutionId);
-    return (videoOut == CELL_VIDEO_OUT_PRIMARY) ? 1 : 0;
+    const s32 r = (videoOut == CELL_VIDEO_OUT_PRIMARY) ? resolution_available(resolutionId) : 0;
+    printf("[cellVideoOut] GetResolutionAvailability(out=%u, res=%u) -> %d\n",
+           videoOut, resolutionId, (int)r);
+    return r;
 }

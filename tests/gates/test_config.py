@@ -79,6 +79,7 @@ def test_defaults_without_file_or_environment():
         "ppu.opd_swap_fixup": ("false", "default"),
         "spu.dma_repeat_limit": ("256", "default"),
         "spu.dma_repeat_stop_secs": ("0", "default"),
+        "video.resolutions": ('""', "default"),
         "title.elf_sha256": ('""', "default"),
         "diag.dump_config": ("false", "default"),
     }, o
@@ -142,6 +143,7 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
             "ppu.opd_swap_fixup": "default",
             "spu.dma_repeat_limit": "default",
             "spu.dma_repeat_stop_secs": "default",
+            "video.resolutions": "default",
             "title.elf_sha256": "env:PS3RECOMP_TITLE_ELF_SHA256",
             "diag.dump_config": "env:PS3RECOMP_DIAG_DUMP_CONFIG",
         }, src
@@ -154,6 +156,7 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
             assert doc == {"schema": 1,
                            "ppu": {"vscr_nj": False, "opd_swap_fixup": False},
                            "spu": {"dma_repeat_limit": 256, "dma_repeat_stop_secs": 0},
+                           "video": {"resolutions": ""},
                            "title": {"elf_sha256": SHA_A}, "diag": {"dump_config": False}}, doc
 
 
@@ -212,6 +215,21 @@ def test_out_of_range_and_malformed_values_stop():
         with Cfg("schema = 1", "[title]", f'elf_sha256 = "{bad}"') as c:
             f = config_invalid(probe("--load", c.path, "get"))
             assert f["key"] == "title.elf_sha256" and f["line"] == "3", (bad, f)
+
+
+def test_video_resolutions_normalise_and_reject_unknown_ids():
+    for text, want in (("2", '"2"'), ("2,1", '"1,2"'), (" 5 , 2,2 ", '"2,5"'), ("13,10,4", '"4,10,13"'),
+                       ("1,2,4,5,10,11,12,13", '"1,2,4,5,10,11,12,13"')):
+        with Cfg("schema = 1", "[video]", f'resolutions = "{text}"') as c:
+            o = options(probe("--load", c.path, "get"))
+            assert o["video.resolutions"] == (want, f"file:{c.path}"), (text, o)
+    o = options(probe("get", PS3RECOMP_VIDEO_RESOLUTIONS="2"))
+    assert o["video.resolutions"] == ('"2"', "env:PS3RECOMP_VIDEO_RESOLUTIONS"), o
+    for bad in ("0", "3", "6", "14", "99", "abc", "2,", ",2", "2,,4", "-1", "720", "1 2"):
+        with Cfg("schema = 1", "[video]", f'resolutions = "{bad}"') as c:
+            f = config_invalid(probe("--load", c.path, "get"))
+            assert f["key"] == "video.resolutions" and f["line"] == "3", (bad, f)
+            assert "resolution id" in f["detail"], (bad, f)
 
 
 def test_schema_mismatch_missing_and_mistyped_stop():

@@ -45,8 +45,12 @@ HOST_HELPERS = set("""
     cellGcmResolveIO
     cellGcmResolveLocated
     cellGcmResolveOffset
+    cellGcm_address_to_offset
     cellGcm_control_guest_addr
+    cellGcm_ctx_emit
+    cellGcm_ctx_reserve
     cellGcm_display_buffer_count
+    cellGcm_emit_flip_command
     cellGcm_fifo_kick_event
     cellGcm_fifo_kick_wait
     cellGcm_fifo_recycle

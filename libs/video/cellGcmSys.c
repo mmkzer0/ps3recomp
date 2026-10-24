@@ -27,6 +27,7 @@ static u32 s_gcm_context_ea = 0;
 #include <stdlib.h>
 #include <stdint.h>
 #include "ps3emu/log_first.h"
+#include "ps3emu/stop.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -114,6 +115,10 @@ static u32 s_current_display_buffer_id = 0;
  * presenting on a raw flip-count change raced the drain and showed empty or
  * mixed batches (wave: black flashes, layout flicker). */
 static volatile int s_flip_pending = 0;
+
+/* The display buffer the last GCM_DRIVER_QUEUE (0xE944) method named; the next GCM_FLIP_HEAD
+ * (0xE924, bit 31 set) presents it. */
+static u32 s_drv_flip_queue = 0;
 /* A flip _cellGcmSetFlipCommand queued in the FIFO: | bufferId, bit 8 = ours. */
 #define GCM_FLIP_MARKER 0xFEAD0100u
 /* Flips queued into the command stream by gcm_flip_into_fifo, and how many of
@@ -2135,6 +2140,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 s_fifo_getoff += 4 + count * 4;
                 continue;
             }
+            int drv_flip = 0;   /* a GCM_FLIP_HEAD (0xE924) ran in this method block */
             for (u32 i = 0; i < count; i++) {
                 u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
                 if (!dea) break;
@@ -2282,6 +2288,24 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 { const u32 mfull = (subch << 13) | m;
                 if (mfull == 0xEB00u || mfull == 0xEB04u) {
                     cellGcmQueueUserCommand(vm_read32(dea));
+                } else if (mfull == 0xE944u) {
+                    /* GCM_DRIVER_QUEUE index 1 (base 0xE940): the flip the next 0xE924 shows.
+                     * _cellGcmSetFlipCommand (libgcm_sys 0x02008948) writes the display buffer id
+                     * here, ahead of its label handshake and `CALL 0`. */
+                    s_drv_flip_queue = vm_read32(dea) & 0xFFu;
+                } else if (mfull == 0xE924u && (vm_read32(dea) & 0x80000000u)) {
+                    /* GCM_FLIP_HEAD index 1 (base 0xE920), argument 0x8000010F as libgcm_sys writes it
+                     * (bit 31 set): flip to the buffer 0xE944 queued. The same present half as the
+                     * 0xFEAD marker; the guest-visible half ran when the command was emitted
+                     * (cellGcm_emit_flip_command). */
+                    if (s_drv_flip_queue < CELL_GCM_MAX_DISPLAY_BUFFER_NUM &&
+                        s_display_buffer_set[s_drv_flip_queue]) {
+                        gcm_set_current_display_buffer(s_drv_flip_queue);
+                        s_flip_pending = 1;
+                        s_flip_request_count++;
+                        if (s_fifo_flips_reached != s_fifo_flips_queued) s_fifo_flips_reached++;
+                    }
+                    drv_flip = 1;
                 } else if (mfull == 0xE920u || mfull == 0xE924u) {
                     cellGcmSetFlipCommand(vm_read32(dea) & 7u);
                 } else if (subch == 0 || (subch == 1 && !s1_2d)) {
@@ -2320,6 +2344,10 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 }
             }
             s_fifo_getoff += 4 + count * 4;
+            /* A driver flip head stops the pass like the 0xFEAD marker does, so the ticker presents
+             * the completed frame before the next one's head is drained. */
+            if (drv_flip && gcm_fifo_backlog(put, s_fifo_getoff) < GCM_FIFO_CATCHUP_BYTES)
+                { why = "flip"; break; }
             continue;
         }
         { static int _uw = 0; if (PS3_LOG_FIRST(_uw, 16) && getenv("RTT_DUMP"))
@@ -2756,6 +2784,89 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
 }
 
 s32 cellGcmSetFlipCommand(u32 bufferId) { return gcm_flip_request(bufferId, 0); }
+
+/* ---- C2: the libgcm command-context primitives the library emitters share ------------------
+ *
+ * The firmware writes its commands through `CellGcmContextData` {begin, end, current, callback}
+ * (guest memory, big-endian). Every group is preceded by `current + 4*words > end`; when that
+ * holds it calls `callback(ctx, words)` and carries on only if the callback returns 0.
+ * ps3_invoke_guest cannot return the guest's r3, so success is judged the way the firmware's
+ * next write would be: re-read the context and require the room. */
+
+int cellGcm_ctx_reserve(u32 ctx, u32 words)
+{
+    u32 cur = vm_read32(ctx + 8), end = vm_read32(ctx + 4);
+    if (cur + words * 4u <= end)
+        return 1;
+    const u32 opd = vm_read32(ctx + 0xC);
+    if (opd && vm_read32(opd) == GCM_FIFO_CALLBACK_SENTINEL_EA)
+        cellGcm_fifo_recycle(ctx);                       /* the runtime's own ring */
+    else if (opd)
+        ps3_invoke_guest(opd, ctx, words, 0, 0, 0, 0, 0, 0);
+    cur = vm_read32(ctx + 8);
+    end = vm_read32(ctx + 4);
+    if (cur + words * 4u <= end)
+        return 1;
+    char why[96];
+    snprintf(why, sizeof why, "callback 0x%08X left no room: current 0x%08X end 0x%08X need %u words",
+             opd, cur, end, words);
+    ps3_stop_gcm_unmodelled("cellGcm_ctx_reserve", "buffer-full-callback", why);
+}
+
+/* One command group: reserve `n` words, write them at `current`, advance `current`. */
+void cellGcm_ctx_emit(u32 ctx, const u32* w, u32 n)
+{
+    cellGcm_ctx_reserve(ctx, n);
+    const u32 cur = vm_read32(ctx + 8);
+    for (u32 i = 0; i < n; i++)
+        vm_write32(cur + i * 4u, w[i]);
+    vm_write32(ctx + 8, cur + n * 4u);
+}
+
+/* `_cellGcmSetFlipCommand` as libgcm_sys writes it (body 0x02008948, entry 0x02008AE0), behind
+ * libresc's helper 0x02008780: a buffer id above 7 is CELL_GCM_ERROR_INVALID_VALUE (0x802100FF),
+ * else 19 words are reserved and written:
+ *   GCM_DRIVER_QUEUE 0xE944 = bufferId                     (subchannel 7)
+ *   NV406E 0x0060 = 0x56616661 (semaphore DMA), 0x0064 = 0x30, 0x006C = 0 (release label 0x30),
+ *   0x0064 = 0x30, 0x0068 = 1 (acquire label 0x30 == 1: the flip-ready handshake)
+ *   CALL 0                                                  (driver default-state subroutine)
+ *   0x0064 = 0x10, 0x006C = 0xFFFFFFFF                      (release label 0x10)
+ *   GCM_FLIP_HEAD 0xE924 = 0x8000010F                       (subchannel 7)
+ * The guest-visible half of the flip request (status, flip handler) runs now, as it does for the
+ * 0xFEAD marker path; the walker presents when it reaches 0xE924. */
+s32 cellGcm_emit_flip_command(u32 ctx, u32 bufferId)
+{
+    if (bufferId > 7)
+        return CELL_GCM_ERROR_INVALID_VALUE;
+    const u32 w[19] = {
+        0x0004E944u, bufferId,
+        0x00040060u, 0x56616661u,
+        0x00040064u, 0x30u,
+        0x0004006Cu, 0u,
+        0x00040064u, 0x30u,
+        0x00040068u, 1u,
+        0x00000002u,
+        0x00040064u, 0x10u,
+        0x0004006Cu, 0xFFFFFFFFu,
+        0x0004E924u, 0x8000010Fu,
+    };
+    cellGcm_ctx_emit(ctx, w, 19);
+    if (s_display_buffer_set[bufferId]) {
+        s_fifo_flips_queued++;
+        gcm_flip_request(bufferId, 1);
+    }
+    return CELL_OK;
+}
+
+/* Host-side cellGcmAddressToOffset: the result in `*offset_out` (host memory). The guest API
+ * writes through a guest pointer, so the offset goes through a scratch word in the HLE page. */
+s32 cellGcm_address_to_offset(u32 address, u32* offset_out)
+{
+    const u32 scratch = VM_HLE_INJECT_BASE + 0x2F40u;
+    const s32 rc = cellGcmAddressToOffset(address, (u32*)(uintptr_t)scratch);
+    *offset_out = vm_read32(scratch);
+    return rc;
+}
 
 /* The real _cellGcmSetFlipCommand appends the flip to the command buffer, so
  * the RSX flips once it has executed everything queued before it. Firing it

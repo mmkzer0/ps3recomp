@@ -270,6 +270,18 @@ s32 cellGcmSetFlipCommand(u32 bufferId);
 /* NID: 0xD01B570F */
 s32 cellGcmSetFlipCommandWithWaitLabel(u32 bufferId, u32 labelIndex, u32 labelValue);
 
+/* Host-side command-context primitives for library emitters (cellResc): not firmware exports.
+ *   cellGcm_ctx_reserve: libgcm's `current + 4*words > end -> callback(ctx, words)`; returns 1
+ *     with room, else stops (gcm-unmodelled) when the callback left none.
+ *   cellGcm_ctx_emit: reserve `n` words, write them at `current`, advance `current`.
+ *   cellGcm_emit_flip_command: `_cellGcmSetFlipCommand` as libgcm_sys writes it (19 words: driver
+ *     queue 0xE944, NV406E label handshake, CALL 0, driver flip head 0xE924); returns
+ *     CELL_GCM_ERROR_INVALID_VALUE for a buffer id above 7. `ctx` is the guest context EA. */
+int  cellGcm_ctx_reserve(u32 ctx, u32 words);
+void cellGcm_ctx_emit(u32 ctx, const u32* words, u32 n);
+s32  cellGcm_emit_flip_command(u32 ctx, u32 bufferId);
+s32  cellGcm_address_to_offset(u32 address, u32* offset_out);
+
 /* NID: 0xA2478CA3 */
 s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId);
 

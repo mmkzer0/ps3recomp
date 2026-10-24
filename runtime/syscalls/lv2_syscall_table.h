@@ -38,12 +38,15 @@ extern "C" {
 #define SYS_PROCESS_GET_SDK_VERSION     25
 
 /* The SDK version sys_process_get_sdk_version reports. It is a variable and
- * not a constant because the real number comes out of the title: the loader
+ * not a constant because the real number comes out of the title: ppu_load_elf
  * reads sys_process_param_t.sdk_version from the ELF's PROC_PARAM segment and
  * assigns it here before running any guest code. The default is what a title
  * with no such segment gets. libsre picks feature sets off this, so leaving it
- * unset is not neutral. */
+ * unset is not neutral. ps3_process_sdk_version() is the value the syscall
+ * answers (PS3_SDK_VERSION overriding); HLE code that asks the same question
+ * calls it. */
 extern uint32_t g_ps3_sdk_version;
+uint32_t ps3_process_sdk_version(void);
 
 
 #define SYS_PPU_THREAD_CREATE           41

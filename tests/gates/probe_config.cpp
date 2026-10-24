@@ -40,6 +40,8 @@ static void print_options()
             std::printf("%u", ps3_cfg_spu_dma_repeat_limit());
         else if (!std::strcmp(o->section, "spu") && !std::strcmp(o->key, "dma_repeat_stop_secs"))
             std::printf("%u", ps3_cfg_spu_dma_repeat_stop_secs());
+        else if (!std::strcmp(o->section, "video") && !std::strcmp(o->key, "resolutions"))
+            std::printf("\"%s\"", ps3_cfg_video_resolutions());
         else if (!std::strcmp(o->section, "title") && !std::strcmp(o->key, "elf_sha256"))
             std::printf("\"%s\"", ps3_cfg_title_elf_sha256());
         else if (!std::strcmp(o->section, "diag") && !std::strcmp(o->key, "dump_config"))
