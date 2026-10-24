@@ -67,16 +67,18 @@ int main(void) {
     memset(&g_spu_evq, 0, sizeof(g_spu_evq)); g_spu_evq.active = 1;
 
     /* PPU: a real cellSync LFQueue whose data buffer lives in shared memory at
-     * WORK_EA, so the SPU can DMA the queued items. */
-    CellSyncLFQueue q;
-    cellSyncLFQueueInitialize(&q, &g_mem[WORK_EA], /*elemSize*/16, /*depth*/4,
+     * WORK_EA, so the SPU can DMA the queued items. cellSync's C API takes
+     * guest EAs; the queue object itself also lives in guest memory. */
+    const uintptr_t QLF_EA = 0x300, QSCRATCH_EA = 0x180;
+    cellSyncLFQueueInitialize((CellSyncLFQueue*)QLF_EA, (void*)WORK_EA, /*elemSize*/16, /*depth*/4,
                               /*direction*/0, /*eaSignal*/0);
 
     /* PPU enqueues a work item (16 bytes, BE word0 = 0xC0DE0042). */
     uint8_t work[16] = {0};
     work[0]=0xC0; work[1]=0xDE; work[2]=0x00; work[3]=0x42;
     const uint32_t kWork = 0xC0DE0042u;
-    int pushed = (cellSyncLFQueuePush(&q, work) == CELL_OK);
+    memcpy(&g_mem[QSCRATCH_EA], work, sizeof work);
+    int pushed = (cellSyncLFQueuePush((CellSyncLFQueue*)QLF_EA, (void*)QSCRATCH_EA) == CELL_OK);
 
     /* SPU consumes the queued item (DMA), echoes it to RESULT_EA, raises event. */
     spu_func_00000000(&ctx);
@@ -85,7 +87,8 @@ int main(void) {
     ev_t evt; int got_evt = (evq_receive(&g_spu_evq, &evt) == 0);
     uint32_t result = be32(&g_mem[RESULT_EA]);
     uint8_t popped[16] = {0};
-    int popped_ok = (cellSyncLFQueuePop(&q, popped) == CELL_OK);
+    int popped_ok = (cellSyncLFQueuePop((CellSyncLFQueue*)QLF_EA, (void*)QSCRATCH_EA) == CELL_OK);
+    memcpy(popped, &g_mem[QSCRATCH_EA], sizeof popped);
     uint32_t pop_val = be32(popped);
 
     int push_ok   = pushed;

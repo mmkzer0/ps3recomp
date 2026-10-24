@@ -67,6 +67,15 @@ int main(void) {
     spu_recomp_register();
 
     spu_func_00000000(ctx);
+    /* Tail branches and returns are lifted as `ctx->pc = ...;
+     * g_spu_trampoline_fn = ...; return`. Drive them the way the runtime's
+     * dispatch loop does, so the KATs run to the stop instead of stopping at
+     * the first tail call. */
+    while (g_spu_trampoline_fn) {
+        void (*next)(spu_context*) = g_spu_trampoline_fn;
+        g_spu_trampoline_fn = 0;
+        next(ctx);
+    }
 
     int bad = 0;
     if (!g_stopped) { printf("FAIL: guest never reached stop\n"); bad = 1; }

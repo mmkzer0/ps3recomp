@@ -50,6 +50,7 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#include <pthread.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #include "win32_compat.h"
@@ -411,6 +412,21 @@ static int host_id_scenario()
     return 0;
 }
 
+/* `depth` recurses through 4000 host dispatches before the cap stops it. ASan
+ * and UBSan instrument every frame, so the default 8 MB stack runs out first
+ * and the process dies at the stack guard instead of reaching the named stop.
+ * Run that mode on a thread whose stack is sized for the instrumented frames. */
+static constexpr size_t DEPTH_STACK = 64u << 20;
+
+struct DepthRun { ppu_context* ctx; };
+
+static void* depth_thread(void* p)
+{
+    DepthRun* r = (DepthRun*)p;
+    ps3_indirect_call(r->ctx);
+    return nullptr;
+}
+
 int main(int argc, char** argv)
 {
     if (argc < 3) return 2;
@@ -451,7 +467,14 @@ int main(int argc, char** argv)
          * it calls (itself) on every recursion. */
         ctx.gpr[4] = arg;
         ctx.ctr = arg;
-        ps3_indirect_call(&ctx);
+        DepthRun run{&ctx};
+        pthread_attr_t attr;
+        CHECK(pthread_attr_init(&attr) == 0);
+        CHECK(pthread_attr_setstacksize(&attr, DEPTH_STACK) == 0);
+        pthread_t thread;
+        CHECK(pthread_create(&thread, &attr, depth_thread, &run) == 0);
+        pthread_attr_destroy(&attr);
+        pthread_join(thread, nullptr);
     } else if (!std::strcmp(argv[1], "opdswap") && argc == 4) {
         ctx.ctr = arg;
         ctx.gpr[2] = std::strtoull(argv[3], nullptr, 0);

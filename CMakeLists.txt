@@ -543,6 +543,13 @@ if(PS3RECOMP_BUILD_TESTS)
                 COMMAND "${Python3_EXECUTABLE}"
                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_spu_fnms_zero_extended.py")
             set_tests_properties(spu_fnms_zero_extended PROPERTIES LABELS "spu;t0")
+            # The per-fixture integration harnesses: real runtime, hand-encoded
+            # SPU programs, channel-overriding stubs (runtime/spu/tests/run_tests.sh).
+            add_test(NAME spu_runtime_tests
+                COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu/tests/run_tests.sh")
+            set_tests_properties(spu_runtime_tests PROPERTIES
+                LABELS "spu;t0" TIMEOUT 300
+                ENVIRONMENT "PYTHON=${Python3_EXECUTABLE}")
         endif()
     endif()
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
@@ -620,6 +627,17 @@ if(PS3RECOMP_BUILD_TESTS)
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_gen_hle_nids.py")
         set_tests_properties(gen_hle_nids PROPERTIES LABELS "tools;t0" TIMEOUT 300)
+        # docs/DIAGNOSTICS.md is hand-maintained prose; the checker requires the
+        # knob set (and its summary counts) to match the sources, not the whole
+        # generated text.
+        add_test(NAME diagnostics_index
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/gen_diagnostics_index.py" --check)
+        add_test(NAME diagnostics_index_check
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_gen_diagnostics_index.py")
+        set_tests_properties(diagnostics_index diagnostics_index_check
+            PROPERTIES LABELS "tools;t0")
     endif()
 endif()
 

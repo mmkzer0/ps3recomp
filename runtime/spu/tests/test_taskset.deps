@@ -1,2 +1,3 @@
-# rung 4 links the real cellSync LFQueue HLE module
+# Link the real cellSync LFQueue HLE module: the taskset drains a guest-memory
+# queue (the fixture passes guest EAs, as cellSync's C API expects).
 EXTRA="-I $REPO/libs/sync -I $REPO/include $REPO/libs/sync/cellSync.c"
