@@ -1155,7 +1155,15 @@ int main(int argc, char** argv)
     vm_base = (uint8_t*)VirtualAlloc(NULL, VM_SIZE, MEM_RESERVE, PAGE_READWRITE);
     ppu_vm_size = 0;   /* full 32-bit space backed -> OOB guard unnecessary */
 #else
-    vm_base = (uint8_t*)calloc(1, 0xE0000000u);
+    /* mmap, not calloc: the arena must start on a host page, or the per-thread
+     * stack guard pages cannot be protected (an allocator such as ASan's hands
+     * back an unaligned block, and the guard then fails as stack-guard-fault).
+     * Anonymous pages read as zero, as calloc's did. */
+    {
+        void* p = mmap(NULL, 0xE0000000u, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+        vm_base = p == MAP_FAILED ? NULL : (uint8_t*)p;
+    }
     ppu_vm_size = 0xE0000000u;
 #endif
     if (!vm_base) { printf("vm alloc failed\n"); return 1; }
