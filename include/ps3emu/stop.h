@@ -83,7 +83,9 @@ extern "C" {
     X(JQ2_JM_CALL,              "jq2-jm-call")                                 \
     X(HLE_GUEST_RANGE,          "hle-guest-range")                             \
     /* C1: an HLE call before its module's init, firmware behaviour undefined. */ \
-    X(HLE_UNINITIALIZED,        "hle-uninitialized")
+    X(HLE_UNINITIALIZED,        "hle-uninitialized")                           \
+    /* C2: a GCM/RESC path the firmware has and the runtime does not model. */ \
+    X(GCM_UNMODELLED,           "gcm-unmodelled")
 
 /* A fixed underlying type in C++ makes a kind outside the list (a caller's bug,
  * which the stop still reports as "invalid-kind") a well-defined value rather
@@ -151,6 +153,12 @@ PS3_NORETURN void ps3_stop_guest_range(const char* func, const char* arg,
  * Fields: func, module, reason. */
 PS3_NORETURN void ps3_stop_hle_uninitialized(const char* func, const char* module,
                                              const char* reason);
+
+/* Generic helper to raise PS3_STOP_GCM_UNMODELLED: the firmware has a command-stream
+ * path (or a command-context state) the runtime does not reproduce, so any stream
+ * it emitted would be a guess. Fields: func, feature, reason. */
+PS3_NORETURN void ps3_stop_gcm_unmodelled(const char* func, const char* feature,
+                                          const char* reason);
 
 /* ---- frontier ---------------------------------------------------------- */
 

@@ -114,7 +114,7 @@ static void test_error_paths(void)
     /* Before init. */
     CHECK((u32)cellRescSetDisplayMode(CELL_RESC_1280x720) == 0x80210301u, "SetDisplayMode before init");
     CHECK((u32)cellRescSetSrc(0, (const CellRescSrc*)(uintptr_t)SRC_EA) == 0x80210301u, "SetSrc before init");
-    CHECK((u32)cellRescSetConvertAndFlip(0) == 0x80210301u, "ConvertAndFlip before init");
+    CHECK((u32)cellRescSetConvertAndFlip(NULL, 0) == 0x80210301u, "ConvertAndFlip before init");
 
     /* Init argument check, then re-init. */
     CHECK((u32)cellRescInit(NULL) == 0x80210304u, "Init(NULL)");

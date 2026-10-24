@@ -1,15 +1,19 @@
 /*
  * ps3recomp - cellResc HLE implementation
  *
- * Resolution scaling stub. Since the recompiled game renders through
- * the host GPU, actual rescaling is handled by the host graphics API.
- * This module tracks state so game code that queries RESC works correctly.
+ * The library's configuration state (init config, display mode, Dsts and Src records, buffer
+ * addresses, convert programs) and the command stream cellRescSetConvertAndFlip appends to the
+ * title's GCM context (resc_convert.c). Behaviour follows libresc FW 4.93; firmware addresses are
+ * cited where a rule comes from them. Rendering is the RSX backend's: this module only emits
+ * the same commands the firmware does.
  */
 
 #include "cellResc.h"
 #include "ps3emu/stop.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: translate + byte-swap */
 #include "ps3emu/guest_call.h"   /* ps3_invoke_guest: handlers are guest OPDs */
+#include "cellGcmSys.h"          /* display buffers, address->offset, the flip command */
+#include "resc_convert.h"        /* the convert-and-flip command stream */
 #include <stdio.h>
 #include <string.h>
 #include "ps3emu/log_first.h"
@@ -29,7 +33,6 @@ static CellRescDsts s_dsts[4]; /* one per display mode */
  * the same way cellGcmSetFlipHandler's is. */
 static u32 s_flip_handler_opd = 0;
 static u32 s_vblank_handler_opd = 0;
-static u32 s_flip_target = 0;   /* display buffer the next convert-and-flip presents */
 static s32 s_flip_status = 0;
 static u64 s_last_flip_time = 0;
 static float s_aspect_h = 1.0f;
@@ -60,6 +63,30 @@ static u32 resc_dsts_buffer_size(u32 mode, const CellRescDsts* rec);
 enum { RESC_PROG_DC, RESC_PROG_E0, RESC_PROG_E4, RESC_PROG_E8, RESC_PROG_COUNT };
 static u8 s_prog_regcount[RESC_PROG_COUNT] = {2, 3, 4, 4};
 static int s_cur_prog = RESC_PROG_DC;
+
+/* The library's convert fragment programs by the header fields the emitter reads (see
+ * RescFragProgram). Embedded Cg binaries (profile 0x1B5C, FW 4.93): the attribute input mask at
+ * +0x04, the texcoord masks at +0x0C/+0x0E/+0x10, no output-from-R0/depth/kill flags. The
+ * register count comes from s_prog_regcount (cellRescSetRegisterCount patches it). */
+static const RescFragProgram k_prog_desc[RESC_PROG_COUNT] = {
+    /* DC */ { 0x4000, 0x0001, 0xFFFF, 0, 2, 0, 0, 0, 0 },
+    /* E0 */ { 0xC000, 0x0003, 0xFFFF, 0, 3, 0, 0, 0, 0 },
+    /* E4 */ { 0x4000, 0x0001, 0xFFFF, 0, 4, 0, 0, 0, 0 },
+    /* E8 */ { 0xC000, 0x0003, 0xFFFF, 0, 4, 0, 0, 0, 0 },
+};
+
+/* More of the library object the convert stream reads (firmware offsets in comments). The mode
+ * size and pitch are snapshots cellRescSetDisplayMode takes: a later SetDsts changes the Dsts
+ * record but not these. */
+#define RESC_MAX_COLOR_BUFFERS 6
+static u32 s_mode_width, s_mode_height, s_mode_pitch;   /* +0x114, +0x118, +0x11C */
+static u32 s_buf_color_ea, s_buf_vertex_ea, s_buf_fragment_ea;   /* +0x100, +0x104, +0x108 */
+static u32 s_color_offset[RESC_MAX_COLOR_BUFFERS];     /* +0x128 + 4 * i */
+static u32 s_vertex_count;                              /* +0x140 */
+static u32 s_frame_toggle;                              /* +0x110: this frame's colour buffer */
+static u32 s_prog_ucode_offset[RESC_PROG_COUNT];        /* program object +0x10, -1 until copied */
+static u8  s_attr[3];                                   /* +0x152..+0x154 vertex attribute slots */
+static u8  s_tex_unit;                                  /* +0x155 source texture unit */
 
 /* ---------------------------------------------------------------------------
  * API implementations
@@ -92,15 +119,34 @@ s32 cellRescInit(const CellRescInitConfig* initConfig)
         s_config.flipMode = f[6];
     }
     memset(s_src, 0, sizeof(s_src));
-    memset(s_dsts, 0, sizeof(s_dsts));
+    /* Firmware 02003680..020036DC: each mode's Dsts record starts as {A8R8G8B8 (8), the tiled
+     * pitch of width * 4, height alignment 8}, so a title that never calls SetDsts still has a
+     * usable destination (and the size SetDisplayMode derives from it is the plain frame size). */
+    {
+        static const u32 k_mode_width[4] = { 720, 720, 1280, 1920 };
+        for (int i = 0; i < 4; i++) {
+            s_dsts[i].format = 8;
+            s_dsts[i].pitch = cellGcmGetTiledPitchSize(k_mode_width[i] * 4u);
+            s_dsts[i].heightAlign = 8;
+        }
+    }
     s_flip_handler_opd = 0;
     s_vblank_handler_opd = 0;
-    s_flip_target = 0;
     s_flip_status = 0;
     s_last_flip_time = 0;
     s_aspect_h = 1.0f;
     s_aspect_v = 1.0f;
     s_cur_prog = RESC_PROG_DC;   /* 02003A2C: +0xFC = +0xDC */
+    s_mode_width = s_mode_height = s_mode_pitch = 0;
+    s_dst_buffer_size = 0;
+    s_buf_color_ea = s_buf_vertex_ea = s_buf_fragment_ea = 0;
+    memset(s_color_offset, 0, sizeof s_color_offset);
+    s_vertex_count = 0;
+    s_frame_toggle = 0;
+    for (int i = 0; i < RESC_PROG_COUNT; i++)
+        s_prog_ucode_offset[i] = 0xFFFFFFFFu;   /* program object ctor 02007AC8: +0x10 = -1 */
+    s_attr[0] = 0; s_attr[1] = 8; s_attr[2] = 9;   /* 02002490: the vertex program's input slots */
+    s_tex_unit = 0xFF;                              /* 02003678: unresolved until SetBufferAddress */
     s_initialized = 1;
     return CELL_OK;
 }
@@ -150,6 +196,13 @@ s32 cellRescSetDisplayMode(u32 displayMode)
      * mode so far (zero if there is none yet: the title may call SetDsts afterwards, and the
      * firmware does not recompute). Kept for cellRescGetBufferSize's constant-VRAM case. */
     s_dst_buffer_size = resc_dsts_buffer_size(displayMode, &s_dsts[resc_dsts_index(displayMode)]);
+    {   /* 020048AC..020048DC: size and pitch snapshots (the heights are 02007CB8's) */
+        const int ri = resc_dsts_index(displayMode);
+        s_mode_width  = displayMode == CELL_RESC_1920x1080 ? 1920 : displayMode == CELL_RESC_1280x720 ? 1280 : 720;
+        s_mode_height = displayMode == CELL_RESC_1920x1080 ? 1080 : displayMode == CELL_RESC_1280x720 ? 720 :
+                        displayMode == CELL_RESC_720x576 ? 576 : 480;
+        s_mode_pitch  = s_dsts[ri].pitch;
+    }
 
     const int interlaced = (s_config.interlaceMode == 1);
     if (displayMode == CELL_RESC_720x576 && pal - 2u <= 2u)
@@ -376,18 +429,85 @@ s32 cellRescGetBufferSize(u32* colorBufSize, u32* vertexBufSize, u32* fragmentBu
     return CELL_OK;
 }
 
+/* The colour buffers one display mode cycles through: 6 for 720x576 with a PAL interpolating
+ * mode, 3 for PAL_60_DROP, else 2 (firmware 02006858..02006918; the same count as
+ * cellRescGetNumColorBuffers). */
+static u32 resc_color_buffer_count(void)
+{
+    if (s_display_mode == CELL_RESC_720x576) {
+        const u32 pal = s_config.palTemporalMode;
+        if (pal - 2u <= 2u)
+            return 6;
+        if (pal == CELL_RESC_PAL_60_DROP)
+            return 3;
+    }
+    return 2;
+}
+
+/* Firmware 02001884: the quad's four records, written big-endian into the vertex buffer. */
+static void resc_fill_vertex_buffer(void)
+{
+    u32 v[24];
+    resc_quad_vertices(s_display_mode, s_config.ratioMode, s_config.size, s_aspect_h, s_aspect_v, v);
+    for (u32 i = 0; i < 24; i++)
+        vm_write32(s_buf_vertex_ea + i * 4u, v[i]);
+    s_vertex_count = 4;
+}
+
+/* RSX offset of a guest address through cellGcmAddressToOffset. The firmware ignores that call's
+ * result (the offset stays whatever the stack held); an address GCM cannot map is a stop here. */
+static u32 resc_offset_of(u32 ea, const char* func, const char* what)
+{
+    u32 off = 0;
+    if (cellGcm_address_to_offset(ea, &off) != CELL_OK)
+        ps3_stop_gcm_unmodelled(func, what, "cellGcmAddressToOffset failed; the firmware would use an uninitialised stack word");
+    return off;
+}
+
+/* Firmware 02006778. In order: not initialised -> NOT_INITIALIZED; a NULL buffer -> BAD_ARGUMENT;
+ * colour not 128-byte, vertex not 4-byte or fragment not 64-byte aligned -> BAD_ALIGNMENT. The
+ * buffers are stored; the colour buffers' RSX offsets are `offset(colorBuf) + i * <size
+ * SetDisplayMode derived>` (02006894), and each is registered with cellGcmSetDisplayBuffer as
+ * buffer i (the first error is returned). Then the quad is written into the vertex buffer
+ * (progressive configurations: the interlaced variant takes another path) and the current convert
+ * fragment program's RSX offset is set.
+ *
+ * Not reproduced: the library also copies the program's microcode into the fragment buffer
+ * (02006C70). No microcode is held here, so the buffer stays as the title left it; the stream
+ * refers to it by offset only, and a renderer that executes the program (M3) needs the copy. */
 s32 cellRescSetBufferAddress(void* colorBuf, void* vertexBuf, void* fragmentBuf)
 {
-    (void)colorBuf;
-    (void)vertexBuf;
-    (void)fragmentBuf;
-
     printf("[cellResc] SetBufferAddress()\n");
 
     if (!s_initialized)
         return (s32)CELL_RESC_ERROR_NOT_INITIALIZED;
 
-    /* In host-GPU mode we don't use these buffers directly */
+    const u32 color = (u32)(uintptr_t)colorBuf, vertex = (u32)(uintptr_t)vertexBuf,
+              fragment = (u32)(uintptr_t)fragmentBuf;
+    if (!color || !vertex || !fragment)
+        return (s32)CELL_RESC_ERROR_BAD_ARGUMENT;
+    if ((color & 0x7Fu) || (vertex & 3u) || (fragment & 0x3Fu))
+        return (s32)CELL_RESC_ERROR_BAD_ALIGNMENT;
+
+    s_buf_color_ea = color;
+    s_buf_vertex_ea = vertex;
+    s_buf_fragment_ea = fragment;
+
+    const u32 base = resc_offset_of(color, "cellRescSetBufferAddress", "colorBuf");
+    const u32 n = resc_color_buffer_count();
+    for (u32 i = 0; i < n; i++)
+        s_color_offset[i] = i * s_dst_buffer_size + base;
+    for (u32 i = 0; i < n; i++) {
+        const s32 rc = cellGcmSetDisplayBuffer(i, s_color_offset[i], s_mode_pitch, s_mode_width,
+                                               s_mode_height);
+        if (rc != CELL_OK)
+            return rc;
+    }
+
+    if (s_config.interlaceMode != 1)
+        resc_fill_vertex_buffer();
+    s_prog_ucode_offset[s_cur_prog] = resc_offset_of(fragment, "cellRescSetBufferAddress", "fragmentShader");
+    s_tex_unit = 0;   /* 020023B8: the program's sampler resolves to unit 0 */
     return CELL_OK;
 }
 
@@ -453,39 +573,57 @@ s32 cellRescSetDsts(u32 displayMode, const CellRescDsts* dsts)
     return CELL_OK;
 }
 
-s32 cellRescSetConvertAndFlip(s32 index)
+/* Firmware 02004D4C (export 020004E0). In order: not initialised -> NOT_INITIALIZED; a source
+ * index above 7 -> BAD_ARGUMENT. Then the convert stream is appended to the command context at
+ * guest EA `context` (resc_convert.c, one group per firmware reservation), followed by
+ * `_cellGcmSetFlipCommand` for display buffer `+0x110 & 0xFF` (020051CC, the flip result is not
+ * checked), and the frame toggle flips. Always CELL_OK once past the checks.
+ *
+ * The interlaced configuration (`+0x14` == 1: a pre-pass at 02001AC0 and a second texture) and
+ * 720x576 with PAL temporal mode 1..4 (an interpolating draw or another flip path, 020050F8..)
+ * take branches that are not reproduced: a named stop, never a stream without them. */
+s32 cellRescSetConvertAndFlip(void* context, s32 index)
 {
     if (!s_initialized)
         return (s32)CELL_RESC_ERROR_NOT_INITIALIZED;
+    if ((u32)index > 7u)
+        return (s32)CELL_RESC_ERROR_BAD_ARGUMENT;
 
-    /* This is a real flip, not bookkeeping. A title that presents through RESC
-     * -- Virtua Fighter 5 does -- renders into an off-screen surface and asks
-     * RESC to scale it into a display buffer and show it. Tracking a counter
-     * here and returning CELL_OK meant no flip ever reached cellGcm, so the
-     * title's frame loop never closed: nothing retired, and it kept appending
-     * to a command buffer it could never reclaim.
-     *
-     * ponytail: the convert half is deliberately not emitted -- the backend
-     * already presents at the output resolution, so RESC's scale is a no-op for
-     * us. What must happen is the flip. Rotate through the display buffers the
-     * title registered, the way RESC's own double/triple buffering does. Emit a
-     * real conversion draw if a title ever needs RESC's PAL/interlace modes
-     * rather than a plain scale. */
-    extern s32 cellGcmSetFlipCommand(u32 bufferId);
-    extern u32 cellGcm_display_buffer_count(void);
-    u32 nbuf = cellGcm_display_buffer_count();
-    if (nbuf) {
-        cellGcmSetFlipCommand(s_flip_target % nbuf);
-        s_flip_target = (u32)((s_flip_target + 1) % nbuf);
-    }
+    if (s_config.interlaceMode == 1)
+        ps3_stop_gcm_unmodelled("cellRescSetConvertAndFlip", "interlace-mode",
+                                "interlaceMode 1 adds a pre-pass (02001AC0) and a second source texture");
+    if (s_display_mode == CELL_RESC_720x576 && s_config.palTemporalMode - 1u <= 3u)
+        ps3_stop_gcm_unmodelled("cellRescSetConvertAndFlip", "pal-temporal-mode",
+                                "720x576 with PAL temporal mode 1..4 draws more than one pass or flips differently");
+
+    const u32 ctx = (u32)(uintptr_t)context;
+    RescConvertIn in;
+    memset(&in, 0, sizeof in);
+    in.width = s_mode_width;
+    in.height = s_mode_height;
+    in.pitch = s_mode_pitch;
+    in.dst_format = s_dsts[resc_dsts_index(s_display_mode)].format;
+    in.color_offset = s_color_offset[s_frame_toggle % RESC_MAX_COLOR_BUFFERS];
+    in.vertex_offset = s_buf_vertex_ea ? resc_offset_of(s_buf_vertex_ea, "cellRescSetConvertAndFlip", "vertexArray") : 0;
+    in.vertex_count = s_vertex_count;
+    memcpy(in.attr, s_attr, sizeof in.attr);
+    in.tex_unit = s_tex_unit;
+    in.src = s_src[index];
+    in.fp = k_prog_desc[s_cur_prog];
+    in.fp.num_regs = s_prog_regcount[s_cur_prog];
+    in.fp.ucode_offset = s_prog_ucode_offset[s_cur_prog];
+    resc_emit_convert_stream(ctx, &in);
+
+    cellGcm_emit_flip_command(ctx, s_frame_toggle & 0xFFu);
+    s_frame_toggle ^= 1u;
 
     s_flip_status = 0;      /* flip complete */
     s_last_flip_time++;
 
     { static int n = 0;
       if (PS3_LOG_FIRST(n, 4))
-          printf("[cellResc] SetConvertAndFlip(src=%d) -> flip, %u display buffer(s)\n",
-                 index, nbuf); }
+          printf("[cellResc] SetConvertAndFlip(ctx=0x%08X, src=%d) -> convert stream + flip of buffer %u\n",
+                 ctx, index, s_frame_toggle ^ 1u); }
 
     if (s_flip_handler_opd)
         ps3_invoke_guest(s_flip_handler_opd, 1, 0, 0, 0, 0, 0, 0, 0);
@@ -570,6 +708,9 @@ s32 cellRescCreateInterlaceTable(void* buf, float ea, u32 tableLen, s32 depth)
     return CELL_OK;
 }
 
+/* Firmware 02004194. Not initialised -> NOT_INITIALIZED; either value outside [0.5, 2.0] ->
+ * BAD_ARGUMENT, nothing stored. Otherwise stored (+0x148 horizontal, +0x14C vertical), and the
+ * quad is rewritten when the vertex buffer is set and the configuration is progressive. */
 s32 cellRescAdjustAspectRatio(float horizontal, float vertical)
 {
     printf("[cellResc] AdjustAspectRatio(h=%.2f, v=%.2f)\n", horizontal, vertical);
@@ -577,7 +718,12 @@ s32 cellRescAdjustAspectRatio(float horizontal, float vertical)
     if (!s_initialized)
         return (s32)CELL_RESC_ERROR_NOT_INITIALIZED;
 
+    if (!(horizontal >= 0.5f) || horizontal > 2.0f || !(vertical >= 0.5f) || vertical > 2.0f)
+        return (s32)CELL_RESC_ERROR_BAD_ARGUMENT;
+
     s_aspect_h = horizontal;
     s_aspect_v = vertical;
+    if (s_buf_vertex_ea && s_config.interlaceMode != 1)
+        resc_fill_vertex_buffer();
     return CELL_OK;
 }

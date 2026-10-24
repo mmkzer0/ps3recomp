@@ -155,12 +155,12 @@ the commands do not.
 `python3 tools/gen_hle_nids.py --all --out /tmp/x.cpp` is the run the build
 uses. It prints
 
-    wrote /tmp/x.cpp: 1158 NID handlers from 94 module(s); scanned 1205 definition name(s), excluded 47 host-side helper(s)
+    wrote /tmp/x.cpp: 1158 NID handlers from 94 module(s); scanned 1209 definition name(s), excluded 51 host-side helper(s)
 
 and `grep -c 'ps3_hle_register(0x' /tmp/x.cpp` prints `1158`. So: 94 module
-sources, 1205 unique definition names, **1158 registrations**, **47 host-side
+sources, 1209 unique definition names, **1158 registrations**, **51 host-side
 helpers** excluded. Registration is fail-closed: `classify_name` decides every
-one of the 1205 (see "Firmware export or host-side helper" below), and a name
+one of the 1209 (see "Firmware export or host-side helper" below), and a name
 with no evidence stops the generator (exit 2) instead of being registered.
 
 `python3 tools/test_gen_hle_nids.py --census` (requires `clang`) takes the
@@ -169,23 +169,23 @@ with no evidence stops the generator (exit 2) instead of being registered.
 integral/enum/pointer/record/function-pointer, and prints:
 
     modules scanned: 94
-    scanned definition names: 1205
-    definitions with a clang AST: 1205 (0 missing)
-    registered: 1158 (323 in the known NID sources, 835 by SDK export shape), excluded host-side helpers: 47
-    returns: integral 1121, void 57, float 1, pointer 26
+    scanned definition names: 1209
+    definitions with a clang AST: 1209 (0 missing)
+    registered: 1158 (323 in the known NID sources, 835 by SDK export shape), excluded host-side helpers: 51
+    returns: integral 1124, void 58, float 1, pointer 26
     pointer returns: 26 total = 22 registered (16 guest EA + 6 host-pointer stop) + 4 excluded (cellGame_get_hdd_title_id, cellGame_get_title, cellGame_get_title_id, cellGcm_fifo_kick_event)
-    parameters: pointer 1052, integral 1393, float 16, function-pointer 73, variadic 3, record 0, reference 0, array 0, enum 0
+    parameters: pointer 1055, integral 1400, float 16, function-pointer 73, variadic 3, record 0, reference 0, array 0, enum 0
     float parameters: 16 in 12 handlers
     more than 8 parameters: _cellSpursCreateJobQueueWithJobDescriptorPool(12), cellGcmSetZcull(12), _cellSpursCreateJobQueue(10), cellSaveDataListAutoLoad(9), cellSpursWorkloadAttributeInitialize(9)
 
 | Return class | Count |
 |---|---|
-| integral (including the 3 variadic `_sys_*printf`) | 1121 |
-| void | 57 |
+| integral (including the 3 variadic `_sys_*printf`) | 1124 |
+| void | 58 |
 | `float` (`cellAvconfExt_display_gamma`, excluded as a helper) | 1 |
 | pointer | 26 (16 guest EA + 6 host-pointer stop + 4 excluded helpers) |
 
-Parameter features: 1052 pointer, 1393 integral, 16 floating-point across 12
+Parameter features: 1055 pointer, 1400 integral, 16 floating-point across 12
 handlers, 73 function-pointer, 3 variadic, 0 struct/union by value, 0
 reference, 0 array. Five handlers exceed eight parameters
 (`_cellSpursCreateJobQueueWithJobDescriptorPool` 12, `cellGcmSetZcull` 12,
@@ -221,7 +221,7 @@ kept name has evidence: the census prints the split — 323 of the 1158
 registrations are in the known NID sources, the other 835 pass an SDK export
 shape, and none is in neither.
 
-None of the 47 excluded names is a firmware export, so registering one could
+None of the 51 excluded names is a firmware export, so registering one could
 only shadow a real import: a title import whose 32-bit NID happened to match
 would dispatch guest arguments into a host function.
 

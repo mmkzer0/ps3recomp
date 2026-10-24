@@ -87,6 +87,21 @@ static u32 count_for(u32 mode, u32 pal)
     return (pal >= 2 && pal <= 4) ? 6 : pal == 1 ? 3 : 2;
 }
 
+/* The Dsts records cellRescInit installs (firmware 02003680): {8, tiled pitch of width * 4, 8}. A
+ * title that never calls SetDsts for a mode sizes that mode's buffers from these. */
+static u32 dpitch(u32 mode) { return mode == 1 || mode == 2 ? 0xC00 : mode == 4 ? 0x1400 : 0x2000; }
+static u32 dsize(u32 mode) { return buffer(mode, dpitch(mode), 8); }
+static u32 dcolor(u32 support, u32 pal)
+{
+    u32 m = 0;
+    for (u32 mode = 1; mode <= 8; mode <<= 1)
+        if (support & mode) {
+            const u32 v = dsize(mode) * count_for(mode, pal);
+            if (v >= m) m = v;
+        }
+    return m;
+}
+
 static void sdk(const char* v)
 {
     if (v) setenv("PS3_SDK_VERSION", v, 1); else unsetenv("PS3_SDK_VERSION");
@@ -126,9 +141,10 @@ int main(void)
     CHECK(cellRescGetBufferSize((u32*)(uintptr_t)OUT_EA, NULL, NULL) == 0 && gr32(OUT_EA) == 0x780000 &&
           gr32(OUT_EA + 4) == 0xEEEEEEEEu && gr32(OUT_EA + 8) == 0xEEEEEEEEu, "only colour requested");
 
-    /* No Dsts yet: every record is zero, the size is 0. */
+    /* No SetDsts: the colour size comes from the default records Init installed. */
     init(&odin);
-    get("no dsts", 0, 768);
+    get("default dsts", dcolor(4, 1), 768);
+    CHECK(dsize(4) == 720u * 0x1400u, "the default 720p size is the plain frame size");
 
     /* Largest over the supported modes, each with its own record. */
     Cfg two = {28, 2, 4 | 8, 1, 0, 0};
@@ -196,48 +212,48 @@ int main(void)
                     Cfg c = {size, 2, support, pal, 0, 0};
                     init(&c);
                     const u32 want = ((support & 2) && pal >= 2 && pal <= 4) ? 96 : 16;
-                    get("sdk<=0x27FFFF progressive", 0, want);
+                    get("sdk<=0x27FFFF progressive", dcolor(support, pal), want);
                 }
         /* interlaced: 640 when the display mode is 576 and PAL != 0, else 512 */
         for (u32 pal = 0; pal <= 5; ++pal) {
             Cfg c = {28, 2, 2 | 4, pal, 1, pal == 5 ? 1 : 0};   /* PAL 5 needs a non-zero flip mode */
             init(&c);
             CHECK(cellRescSetDisplayMode(4) == 0, "SetDisplayMode 720 pal %u", pal);
-            get("interlaced 720", 0, 512);
+            get("interlaced 720", dcolor(6, pal), 512);
             CHECK(cellRescSetDisplayMode(2) == 0, "SetDisplayMode 576 pal %u", pal);
-            get("interlaced 576", 0, pal != 0 ? 640 : 512);
+            get("interlaced 576", dcolor(6, pal), pal != 0 ? 640 : 512);
         }
         /* config size 20: the current program's microcode; any other size: 0 */
         Cfg s20 = {20, 2, 4, 1, 0, 0};
         init(&s20);
-        get("size 20", 0, 0x10);
+        get("size 20", dcolor(4, 1), 0x10);
         Cfg s16 = {16, 2, 4, 1, 0, 0};
         init(&s16);
-        get("size 16", 0, 0);
+        get("size 16", dcolor(4, 1), 0);
         Cfg s32 = {32, 2, 4, 1, 0, 0};
         init(&s32);
-        get("size 32", 0, 0);
+        get("size 32", dcolor(4, 1), 0);
     }
     /* interlaced 576 */
     {
         Cfg c = {28, 2, 2, 2, 1, 0};
         init(&c);
         CHECK(cellRescSetDisplayMode(2) == 0, "SetDisplayMode 576 interlaced");
-        get("interlaced 576 pal 2", 0, 640);
+        get("interlaced 576 pal 2", dcolor(2, 2), 640);
         Cfg z = {28, 2, 2, 0, 1, 0};
         init(&z);
         CHECK(cellRescSetDisplayMode(2) == 0, "SetDisplayMode 576 pal 0");
-        get("interlaced 576 pal 0", 0, 512);
+        get("interlaced 576 pal 0", dcolor(2, 0), 512);
         /* size 20: the config carries no interlace or flip field (the firmware copies `size` bytes), so
          * the program is E0 or DC by PAL alone. */
         Cfg e = {20, 2, 2, 2, 1, 0};
         init(&e);
         CHECK(cellRescSetDisplayMode(2) == 0, "SetDisplayMode 576 size 20");
-        get("size 20, program E0", 0, 0x60);
+        get("size 20, program E0", dcolor(2, 2), 0x60);
         Cfg e0 = {20, 2, 4, 0, 1, 0};
         init(&e0);
         CHECK(cellRescSetDisplayMode(4) == 0, "SetDisplayMode 720 size 20");
-        get("size 20, program DC", 0, 0x10);
+        get("size 20, program DC", dcolor(4, 0), 0x10);
     }
 
     /* Constant VRAM (policy bit 0): the size SetDisplayMode took from the record, the SDK does not matter. */
@@ -248,11 +264,12 @@ int main(void)
         set_dsts(4, 0x1400, 0x40);
         CHECK(cellRescSetDisplayMode(4) == 0, "SetDisplayMode");
         get("constant VRAM 720", buffer(4, 0x1400, 0x40) * 2, 0x10);
-        /* a record set after SetDisplayMode does not change it, and a mode set before any record gives 0 */
+        /* a record set after SetDisplayMode does not change it: the size SetDisplayMode took is the
+         * default record's (Init), not the one SetDsts stored afterwards */
         init(&c);
         CHECK(cellRescSetDisplayMode(4) == 0, "SetDisplayMode first");
         set_dsts(4, 0x1400, 0x40);
-        get("constant VRAM, Dsts after SetDisplayMode", 0, 0x10);
+        get("constant VRAM, Dsts after SetDisplayMode", dsize(4) * 2, 0x10);
         /* 576: the colour-buffer count by PAL mode, the program by PAL and interlace */
         for (u32 pal = 0; pal <= 4; ++pal) {
             Cfg p = {28, 1, 2, pal, 0, 0};

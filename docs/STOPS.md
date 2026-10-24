@@ -67,6 +67,7 @@ Ids are stable kebab-case; a new gap gets a new kind, never a free-text variant.
 | `jq2-jm-call` | a JobQueue2 job called jm interface word 0 (`0x1500`, the policy module's scheduler switch: "yield this Execute slot to the manager with a request"). No Odin Sphere job image does; the HLE executor runs one job per worker and has no manager to switch to. The job is neither executed nor credited |
 | `hle-guest-range` | an HLE handler was given a guest EA or span that is not inside guest memory: `ea` crosses `limit`, or `ea + size` wraps. Fields: `func`, `arg`, `ea`, `size`, `limit` |
 | `hle-uninitialized` | an HLE function was called before its module's init, where the firmware's behaviour is undefined (it dereferences state the init builds), so no return value is faithful. Fields: `func`, `module`, `reason` |
+| `gcm-unmodelled` | the firmware has a command-stream path the runtime does not reproduce, so a stream built without it would be a guess: `cellRescSetConvertAndFlip` in a PAL-interpolating (720x576 with PAL temporal mode 1..4) or interlaced configuration, or with more than 256 vertices; a command context whose buffer-full callback did not leave room for a reservation. Fields: `func`, `feature`, `reason` |
 
 Where each is raised, and what it carries beyond `pc lr tid`:
 
@@ -95,6 +96,7 @@ Where each is raised, and what it carries beyond `pc lr tid`:
 | `jq2-jm-call` | `libs/spurs/jq2/executor.cpp` (`require_normal_return`) | `queue job port tag worker request lr status`, with `request` the job's r3 at the call (the request word) and `lr` the caller's link register (also the `lr` of the machine line); `pc` is the stop word's address, `0x1500` |
 | `hle-guest-range` | `ps3_stop_guest_range` | `func arg ea size limit` |
 | `hle-uninitialized` | `ps3_stop_hle_uninitialized` | `func module reason` |
+| `gcm-unmodelled` | `ps3_stop_gcm_unmodelled` (`libs/video/cellResc.c`, `libs/video/cellGcmSys.c`) | `func feature reason` |
 
 Lifted code does not track a guest pc, so for the first four `pc` is the caller's
 return address (the import stub's caller, the `sc` site, the call site). Only

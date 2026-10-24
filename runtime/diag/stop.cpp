@@ -262,4 +262,17 @@ void ps3_stop_hle_uninitialized(const char* func, const char* module, const char
              f, sizeof f / sizeof f[0], nullptr);
 }
 
+void ps3_stop_gcm_unmodelled(const char* func, const char* feature, const char* reason)
+{
+    const ps3_stop_field f[] = {
+        {"func", func ? func : "unknown"},
+        {"feature", feature ? feature : "unknown"},
+        {"reason", reason ? reason : "unknown"},
+    };
+    ps3_stop(PS3_STOP_GCM_UNMODELLED,
+             "the firmware's command-stream path for this configuration is not reproduced, and a stream built without it would be a guess",
+             "Model the firmware path (libresc/libgcm_sys), or run a configuration that does not reach it.",
+             f, sizeof f / sizeof f[0], nullptr);
+}
+
 } // extern "C"

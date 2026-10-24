@@ -114,7 +114,7 @@ u32 cellResc_convert_register_count(void);
 s32 cellRescSetSrc(s32 index, const CellRescSrc* src);
 s32 cellRescSetDsts(u32 displayMode, const CellRescDsts* dsts);
 s32 cellRescGcmSurface2RescSrc(const void* gcmSurface, void* rescSrc);
-s32 cellRescSetConvertAndFlip(s32 index);
+s32 cellRescSetConvertAndFlip(void* context, s32 index);
 
 s32 cellRescSetFlipHandler(void (*handler)(u32));
 s32 cellRescSetVBlankHandler(void (*handler)(u32));
