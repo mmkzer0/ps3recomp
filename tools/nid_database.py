@@ -402,6 +402,10 @@ _BUILTIN_FUNCTIONS: list[tuple[str, str]] = [
     ("sysPrxForUser", "sys_tty_read"),
     ("sysPrxForUser", "sys_dbg_register_ppu_exception_handler"),
 
+    # ---- sys_crashdump ----
+    ("sys_crashdump", "sys_crash_dump_get_user_log_area"),
+    ("sys_crashdump", "sys_crash_dump_set_user_log_area"),
+
     # ---- cellResc ----
     ("cellResc", "cellRescInit"),
     ("cellResc", "cellRescExit"),
