@@ -467,6 +467,8 @@ if(PS3RECOMP_BUILD_TESTS)
         add_subdirectory(tests/gcm_reports)
         # cellResc error numbering and the VideoOut resolution-id mapper.
         add_subdirectory(tests/resc)
+        # cellGcmGetTiledPitchSize against libgcm_sys's pitch table.
+        add_subdirectory(tests/gcm_pitch)
     endif()
     # The startup gates (typed config, identity, VSCR policy) and the named stop
     # they end in: probe executables run per scenario by Python runners.

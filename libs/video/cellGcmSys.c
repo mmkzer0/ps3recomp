@@ -451,13 +451,16 @@ static IoMapping* find_free_mapping(void)
     return NULL;
 }
 
-/* Valid tiled pitch sizes (power-of-two aligned, common RSX values) */
+/* The 31 tiled pitches cellGcmGetTiledPitchSize can return: the library's own
+ * table (libgcm_sys 0x0200B398, index 0 is a 0 sentinel that is skipped), which
+ * stops at 0xE000. The generic 0x10000 that used to end this list is not in it:
+ * a size above 0xE000 has no tiled pitch and the firmware answers 0. */
 static const u32 s_valid_pitches[] = {
     0x0200, 0x0300, 0x0400, 0x0500, 0x0600, 0x0700, 0x0800,
     0x0A00, 0x0C00, 0x0D00, 0x0E00, 0x1000, 0x1400, 0x1800,
     0x1A00, 0x1C00, 0x2000, 0x2800, 0x3000, 0x3400, 0x3800,
     0x4000, 0x5000, 0x6000, 0x6800, 0x7000, 0x8000, 0xA000,
-    0xC000, 0xD000, 0xE000, 0x10000
+    0xC000, 0xD000, 0xE000
 };
 static const int s_valid_pitch_count = sizeof(s_valid_pitches) / sizeof(s_valid_pitches[0]);
 
