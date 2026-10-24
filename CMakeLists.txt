@@ -498,6 +498,24 @@ if(PS3RECOMP_BUILD_TESTS)
     add_test(NAME log_first COMMAND test_log_first)
     set_tests_properties(log_first PROPERTIES LABELS "runtime;t0")
 
+    # The sysPrxForUser CRT shims bound the guest spans they copy: a span that
+    # leaves the arena is a named stop (hle-guest-range) raised before the copy,
+    # not a write past guest memory. The fixture maps an arena with a PROT_NONE
+    # guard page after it, so a copy that gets through faults instead. Compiled
+    # against the shim's own source (the rest of the runtime asks for a whole
+    # host layer) with the real stop implementation.
+    add_executable(test_sysprx_guest_range
+        tests/test_sysprx_guest_range.c
+        libs/system/sysPrxForUser.c
+        runtime/diag/stop.cpp)
+    target_include_directories(test_sysprx_guest_range PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/system"
+        "${CMAKE_CURRENT_SOURCE_DIR}/runtime")
+    set_target_properties(test_sysprx_guest_range PROPERTIES LINKER_LANGUAGE CXX)
+    add_test(NAME sysprx_guest_range COMMAND test_sysprx_guest_range)
+    set_tests_properties(sysprx_guest_range PROPERTIES LABELS "runtime;t0" TIMEOUT 60)
+
     # A guest exit ends the host process while the PPU, SPU, RSX and audio host
     # threads are still running, so the runtime exits with quick_exit(): no
     # C++ static destructor runs under a live thread. The fixture pairs such a

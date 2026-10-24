@@ -15,6 +15,8 @@
  */
 #include "ppu_recomp.h"      /* ppu_context */
 #include "../../libs/filesystem/edat.h"
+#include "../memory/vm.h"    /* vm_range_ok, vm_guest_limit: the one guest-range rule */
+#include "ps3emu/stop.h"     /* ps3_stop_guest_range */
 #include "ps3emu/nid.h"      /* ps3_compute_nid */
 #include "ps3emu/guest_call.h" /* ps3_invoke_guest: AIO completion is a guest OPD */
 #include "sdata_decrypt.h"   /* SDATA/EDAT (NPD) decryption for cellFsSdataOpen */
@@ -71,7 +73,6 @@ typedef struct stat fs_stat64_t;
 
 extern "C" uint8_t* vm_base;
 extern "C" void ppu_guest_caller(char* out, size_t n);
-extern "C" uint32_t ppu_vm_size;
 extern "C" void     ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
 extern "C" void     vm_write32(uint64_t a, uint32_t v);
 extern "C" void     vm_write64(uint64_t a, uint64_t v);
@@ -81,8 +82,8 @@ extern "C" void     vm_write64(uint64_t a, uint64_t v);
 /* Host root that the PS3 mount points map into (dir containing PS3_GAME). */
 extern "C" const char* ppu_vfs_root = ".";
 
-/* CELL_FS return / mode / flag constants. */
-#define CELL_OK              0
+/* CELL_FS return / mode / flag constants. (CELL_OK comes from
+ * ps3emu/error_codes.h, which runtime/memory/vm.h includes.) */
 #define CELL_FS_ENOENT       (-2147418106)   /* 0x80010006 -- was -2147418090, which is 0x80010016 = CELL_ENOTCONN, not ENOENT */
 #define CELL_FS_EISDIR       (-2147418094)   /* 0x80010012 */
 #define CELL_FS_EIO          (-2147418111)
@@ -110,11 +111,30 @@ extern "C" const char* ppu_vfs_root = ".";
 #define CELL_FS_TYPE_REG     2
 
 /* ---- guest memory string helpers ---- */
+
+/* Is [ea, ea+size) inside guest memory? runtime/memory/vm.h owns the rule; this
+ * refuses a 64-bit EA above the 32-bit guest space that a narrowing cast would
+ * wrap back into it. */
+static inline bool fs_range_ok(uint64_t ea, uint64_t size)
+{
+    return ea <= UINT32_MAX && vm_range_ok((uint32_t)ea, size);
+}
+
+/* The span a handler was given leaves guest memory: the firmware would have
+ * handed the buffer to the kernel, so there is no error code that is faithful,
+ * and truncating it would read a different file than the caller asked for. */
+[[noreturn]] static void fs_range_stop(const char* api, const char* arg, uint64_t ea, uint64_t size)
+{
+    ps3_stop_guest_range(api, arg, ea, size, vm_guest_limit());
+}
+
 static void guest_strcpy(char* dst, uint32_t gaddr, size_t cap)
 {
     size_t i = 0;
     for (; i < cap - 1; i++) {
-        if (ppu_vm_size && gaddr + i >= ppu_vm_size) break;
+        /* Stop at the end of guest memory: a path with no NUL before it is not a
+         * guest string, and the prefix written so far would name another file. */
+        if (!fs_range_ok((uint64_t)gaddr + i, 1)) fs_range_stop("cellFs", "path", (uint64_t)gaddr + i, 1);
         char c = (char)vm_base[gaddr + i];
         if (!c) break;
         dst[i] = c;
@@ -435,7 +455,23 @@ static void cellFsRead(ppu_context* ctx)
     if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
     uint64_t raw_nbytes = ctx->gpr[5];
     long fpos_before = ftell(g_files[fd]);
-    if (ppu_vm_size && (uint64_t)buf + nbytes > ppu_vm_size) nbytes = ppu_vm_size - buf;
+    /* The firmware checks the null out pointer and the null buffer here and
+     * nowhere else (oracle RPCS3 sys_fs_read: `!nread` or `!buf` -> CELL_EFAULT),
+     * so both keep their code; the byte count is left at 0, which is a value a
+     * caller can act on. A buffer that leaves the arena is a different matter:
+     * see below. */
+    if (!nread_ptr || !buf) {
+        if (nread_ptr && fs_range_ok(nread_ptr, 8)) vm_write64(nread_ptr, 0);
+        ctx->gpr[3] = 0x8001000Du; /* CELL_EFAULT */
+        return;
+    }
+    /* A buffer that is partly or wholly outside guest memory is NOT clamped to
+     * the part inside it and NOT reported as "0 bytes, CELL_OK": the old
+     * `ppu_vm_size - buf` underflowed when buf already lay past the arena, and
+     * fread wrote past the mapping. lv2's own answer to a copyout fault is
+     * unverified, so there is no faithful error code to invent -- the span is
+     * refused before any host pointer is formed. */
+    if (!fs_range_ok(buf, nbytes)) fs_range_stop("cellFsRead", "buf", buf, nbytes);
     fs_prefault(buf, nbytes);
     size_t n = fread(vm_base + buf, 1, (size_t)nbytes, g_files[fd]);   /* raw bytes, no swap */
     /* PS3_FSLOG_EOF=<fd>,<bytes>: report end-of-file past <bytes> on one descriptor.
@@ -487,7 +523,7 @@ static void cellFsRead(ppu_context* ctx)
     if (getenv("PS3_FSLOG_TOC") && nbytes >= 50000) {  /* data.toc read -> who parses it? */
         fprintf(stderr, "[TOC] data.toc read into buf=0x%08X n=%zu; lr=0x%08llX; guest-stack RAs:\n", buf, n, (unsigned long long)ctx->lr);
         uint32_t sp = (uint32_t)ctx->gpr[1];
-        for (uint32_t i = 0; i < 128 && sp + i*4 + 4 <= ppu_vm_size; i++) {
+        for (uint32_t i = 0; i < 128 && fs_range_ok((uint64_t)sp + i*4, 4); i++) {
             uint32_t a = sp + i*4; uint32_t w = (vm_base[a]<<24)|(vm_base[a+1]<<16)|(vm_base[a+2]<<8)|vm_base[a+3];
             if (w >= 0x10000u && w < 0x600000u) fprintf(stderr, "[TOC]   ra 0x%08X (@sp+0x%X)\n", w, i*4);
         }
@@ -503,6 +539,16 @@ static void cellFsWrite(ppu_context* ctx)
     uint64_t nbytes = ctx->gpr[5];
     uint32_t nwr_ptr = (uint32_t)ctx->gpr[6];
     if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    /* Oracle RPCS3 sys_fs_write: `!buf` -> CELL_EFAULT with bytes written 0. */
+    if (!buf) {
+        if (fs_range_ok(nwr_ptr, 8)) vm_write64(nwr_ptr, 0);
+        ctx->gpr[3] = 0x8001000Du; /* CELL_EFAULT */
+        return;
+    }
+    /* Same rule as the read path: lv2 would read this span, so it must be guest
+     * memory in full. Neither a clamped prefix nor "0 bytes, CELL_OK" is a
+     * faithful answer to a span that leaves the arena. */
+    if (!fs_range_ok(buf, nbytes)) fs_range_stop("cellFsWrite", "buf", buf, nbytes);
     fs_prefault(buf, nbytes);   /* kernel READS the buffer; same reserved-page trap */
     size_t n = fwrite(vm_base + buf, 1, (size_t)nbytes, g_files[fd]);
     /* DIAGNOSTIC (PS3_FSLOG_BT=1): dump the guest back-chain when the game logs the
@@ -707,9 +753,7 @@ static void cellFsGetDirectoryEntries(ppu_context* ctx)
     const uint32_t entries = (uint32_t)ctx->gpr[4];
     const uint32_t bytes = (uint32_t)ctx->gpr[5];
     const uint32_t count_ptr = (uint32_t)ctx->gpr[6];
-    const uint64_t limit = ppu_vm_size ? ppu_vm_size : 0x100000000ull;
-    if (!entries || !count_ptr || uint64_t(entries) + bytes > limit ||
-        uint64_t(count_ptr) + 4 > limit) {
+    if (!entries || !count_ptr || !fs_range_ok(entries, bytes) || !fs_range_ok(count_ptr, 4)) {
         ctx->gpr[3] = 0x8001000Du; // CELL_EFAULT
         return;
     }
@@ -857,7 +901,7 @@ static void cellFsSdataOpenByFd(ppu_context* ctx)
 
 static uint32_t guest_be32(uint32_t a)
 {
-    if (ppu_vm_size && (uint64_t)a + 4 > ppu_vm_size) return 0;
+    if (!fs_range_ok(a, 4)) return 0;
     return ((uint32_t)vm_base[a] << 24) | ((uint32_t)vm_base[a+1] << 16) |
            ((uint32_t)vm_base[a+2] << 8) | (uint32_t)vm_base[a+3];
 }
@@ -891,7 +935,20 @@ static void cellFsAioRead(ppu_context* ctx)
     size_t n = 0;
     int32_t err = CELL_FS_ENOENT;
     if (fd >= 0 && fd < FS_MAX && g_files[fd]) {
-        if (ppu_vm_size && (uint64_t)buf + size > ppu_vm_size) size = ppu_vm_size - buf;
+        if (!buf) {
+            /* No copyout at guest address 0 (the null page is not a buffer). */
+            err = (int32_t)0x8001000Du; /* CELL_EFAULT */
+            ctx->gpr[3] = CELL_OK;
+            if (getenv("PS3_FSLOG"))
+                fprintf(stderr, "[fs] aio read id=%d fd=%d off=%llu size=%llu -> EFAULT (null buffer)\n",
+                        id, fd, (unsigned long long)offset, (unsigned long long)size);
+            if (cb_opd) ps3_invoke_guest(cb_opd, aio, (uint64_t)(int64_t)err,
+                                         (uint64_t)(int64_t)id, (uint64_t)n, 0, 0, 0, 0);
+            return;
+        }
+        /* As in cellFsRead: a span that leaves the arena is a named stop, never
+         * a clamped read of the part that fits. */
+        if (!fs_range_ok(buf, size)) fs_range_stop("cellFsAioRead", "buf", buf, size);
         fs_prefault(buf, size);
         /* AIO reads are absolute: they must not move the fd's own position,
          * and the guest issues them from several threads at once (FIOS media

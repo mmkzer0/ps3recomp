@@ -25,6 +25,16 @@ void vm_write64(uint64_t a, uint64_t v) { uint64_t be = __builtin_bswap64(v); me
 void ppu_guest_caller(char* out, size_t n) { if (n) out[0] = 0; }
 void ps3_vfs_ps3game_fallback(char* path, size_t cap) { (void)path; (void)cap; }
 void ydkj_host_bt(const char* tag) { (void)tag; }
+/* cellFs handlers refuse a guest span outside the arena with this stop; nothing
+ * this fixture drives may reach it. */
+PS3_NORETURN void ps3_stop_guest_range(const char* func, const char* arg,
+                                       uint64_t ea, uint64_t size, uint64_t limit)
+{
+    fprintf(stderr, "kind=hle-guest-range func=%s arg=%s ea=0x%llX size=0x%llX limit=0x%llX\n",
+            func, arg, (unsigned long long)ea, (unsigned long long)size, (unsigned long long)limit);
+    fflush(stderr);
+    _Exit(PS3_STOP_EXIT_CODE);
+}
 }
 ps3_guest_caller_fn g_ps3_guest_caller = nullptr;
 const char* edat_resolve(const char* host_path, char* buf, size_t cap) { (void)buf; (void)cap; return host_path; }

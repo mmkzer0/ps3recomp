@@ -8,6 +8,7 @@
 
 #include "sysPrxForUser.h"
 #include "../../runtime/memory/vm.h"
+#include "ps3emu/stop.h"
 #include <ps3emu/guest_call.h>
 #include <ps3emu/host_exit.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_write32: translate + byte-swap */
@@ -188,6 +189,18 @@ static inline void* yz_g2h(const void* g)
     return ea ? (void*)(vm_base + ea) : (void*)0;
 }
 
+/* A guest span a CRT shim is about to copy: the length argument is the most the
+ * function touches, so [EA, EA+len) must be guest memory in full. Out of range is
+ * a named stop, never a partial copy or a silent skip -- the guest would read
+ * back bytes the console never wrote. A NULL EA stays the shims' own business
+ * (each one already treats it as the firmware does). */
+static void yz_span(const char* func, const char* arg, const void* g, u32 size)
+{
+    const u32 ea = (u32)(uintptr_t)g;
+    if (ea && !vm_range_ok(ea, size))
+        ps3_stop_guest_range(func, arg, ea, size, vm_guest_limit());
+}
+
 /* Guest-aware printf core: the varargs reach us as raw 64-bit register values
  * (the generic HLE adapter forwards gpr3..10), so a %s argument is a GUEST
  * effective address -- passing it straight to the host vprintf derefs it as a
@@ -289,6 +302,9 @@ s32 _sys_strncpy(char* dst, const char* src, u32 size)
 {
     char* d = (char*)yz_g2h(dst); const char* s = (const char*)yz_g2h(src);
     if (!d || !s) return CELL_EFAULT;
+    /* strncpy writes exactly size bytes and reads at most size of src. */
+    yz_span("_sys_strncpy", "dst", dst, size);
+    yz_span("_sys_strncpy", "src", src, size);
     strncpy(d, s, size);
     return CELL_OK;
 }
@@ -320,7 +336,13 @@ char* _sys_strcpy(char* dst, const char* src)
 char* _sys_strncat(char* dst, const char* src, u32 size)
 {
     char* d = (char*)yz_g2h(dst); const char* s = (const char*)yz_g2h(src);
-    if (d && s) strncat(d, s, size);
+    if (d && s) {
+        /* At most size bytes of src are read. dst's own span is
+         * strlen(dst)+appended+1, which the arguments do not state; it is
+         * already the shim's contract that dst holds a guest string. */
+        yz_span("_sys_strncat", "src", src, size);
+        strncat(d, s, size);
+    }
     return dst;
 }
 
@@ -328,20 +350,30 @@ s32 _sys_strncmp(const char* s1, const char* s2, u32 size)
 {
     const char* a = (const char*)yz_g2h(s1); const char* b = (const char*)yz_g2h(s2);
     if (!a || !b) return -1;
+    /* strncmp reads at most size bytes of each. */
+    yz_span("_sys_strncmp", "s1", s1, size);
+    yz_span("_sys_strncmp", "s2", s2, size);
     return strncmp(a, b, size);
 }
 
 void* _sys_memset(void* dst, s32 val, u32 size)
 {
     void* d = yz_g2h(dst);
-    if (d) memset(d, val, size);
+    if (d) {
+        yz_span("_sys_memset", "dst", dst, size);
+        memset(d, val, size);
+    }
     return dst;
 }
 
 void* _sys_memcpy(void* dst, const void* src, u32 size)
 {
     void* d = yz_g2h(dst); const void* s = yz_g2h(src);
-    if (d && s) memcpy(d, s, size);
+    if (d && s) {
+        yz_span("_sys_memcpy", "dst", dst, size);
+        yz_span("_sys_memcpy", "src", src, size);
+        memcpy(d, s, size);
+    }
     return dst;
 }
 
@@ -349,6 +381,8 @@ s32 _sys_memcmp(const void* s1, const void* s2, u32 size)
 {
     const void* a = yz_g2h(s1); const void* b = yz_g2h(s2);
     if (!a || !b) return 0;
+    yz_span("_sys_memcmp", "s1", s1, size);
+    yz_span("_sys_memcmp", "s2", s2, size);
     return memcmp(a, b, size);
 }
 
