@@ -25,7 +25,8 @@
  *               executor's state: the PM's record area in the queue stays
  *               untouched) and the read index holds at the retained entry
  *   sync        Port2Sync mode 0 blocks and returns 0, mode 4 AGAIN, a second
- *               Sync and a push meet BUSY, bad modes INVAL
+ *               Sync and a push meet BUSY, every other mode INVAL with the
+ *               port line unchanged
  *   join        Shutdown/Join: Join returns only after the outstanding jobs
  *               finished (L1); guest buffers stay the caller's (L2)
  *   observer    jq2_set_job_observer: the worker's spu_context and the loader's
@@ -41,6 +42,15 @@
  *               port is not credited
  *   stop-crt    a job image with another CRT: the loader's named stop, no credit
  *   stop-ring   an entry the executor does not model: named stop jq2-ring-entry
+ *   sync-concurrent  several PPU threads block in mode 0 on different ports at
+ *               once, each woken by its own credits
+ *   stop-waiter-id   a credit finds an event-flag waiter with id 64: jq2-wake
+ *               reason=waiter-id
+ *   stop-waiter-alloc  a 65th concurrent blocked Sync: jq2-wake reason=waiter-id
+ *   stop-wait   a blocked Sync whose event flag was destroyed: jq2-wake reason=wait
+ *   stop-push-shutdown, stop-copy-push-shutdown  a push that passed its checks
+ *               and reaches the ring after Shutdown: jq2-state
+ *               reason=push-after-shutdown
  */
 #include "jq2/executor.hpp"
 #include "jq2/jq2.h"
@@ -48,6 +58,7 @@
 #include "spu_context.h"
 #include "spu_helpers.h"
 #include "spu_observe.h"
+#include "syscalls/sys_event.h"
 
 #include <sys/mman.h>
 #include <sys/wait.h>
@@ -70,6 +81,7 @@ extern "C" {
 uint8_t* vm_base;
 extern uint32_t ppu_vm_size; /* runtime/host/host_stubs.c */
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value);
+int resv_host_rmw(uint32_t ea, int (*fn)(uint8_t* line, void* user), void* user); /* runtime/memory/reservation.h */
 u128 spu_rdch(spu_context* ctx, uint32_t channel);
 void spu_halt(spu_context* ctx);
 }
@@ -790,8 +802,10 @@ void mode_sync()
     Rig rig({128, 2, false});
 
     CHECK(jq2_port_sync(PORT, 0) == 0, "an idle port syncs at once");
-    CHECK(jq2_port_sync(PORT, 8) == JQ2_ERR_INVAL, "mode 8");
-    CHECK(jq2_port_sync(PORT, 5) == JQ2_ERR_INVAL || true, "mode 5 is mode 4 plus bit 0 (not inval)");
+    CHECK(jq2_port_sync(PORT, 4) == 0, "mode 4 on an idle port");
+    /* PPU 0x020045E8 accepts only modes 0 and 4. */
+    for (const std::uint32_t mode : {1u, 2u, 3u, 5u, 6u, 7u, 8u, 0xCu, 0x80000000u})
+        CHECK(jq2_port_sync(PORT, mode) == JQ2_ERR_INVAL, "mode 0x%X on an idle port", mode);
 
     CHECK(set_intake_paused(QUEUE, true), "pause");
     std::vector<JobSpec> specs;
@@ -802,6 +816,18 @@ void mode_sync()
     CHECK(port_b() == 3 && port_a() == 0, "A=%u B=%u", port_a(), port_b());
     CHECK(jq2_port_sync(PORT, 4) == JQ2_ERR_AGAIN, "mode 4 with jobs outstanding");
     CHECK(port_b() == 3 && port_a() == 0, "AGAIN leaves A and B");
+    {
+        /* Jobs outstanding (A < B): a mode that is neither 0 nor 4 is INVAL, does
+         * not poll, and leaves A, B and the claim word as they were. Modes 1, 2
+         * and 3 are covered on the model (test_jq2_port): accepted here they would
+         * block this thread for good. */
+        const std::uint32_t claim_word = get32(PORT + 0x14);
+        for (const std::uint32_t mode : {5u, 6u, 7u, 8u, 0xCu, 0x80000000u}) {
+            CHECK(jq2_port_sync(PORT, mode) == JQ2_ERR_INVAL, "mode 0x%X with jobs outstanding", mode);
+            CHECK(port_a() == 0 && port_b() == 3 && get32(PORT + 0x14) == claim_word,
+                  "mode 0x%X left A=0x%X B=%u claim=0x%X", mode, port_a(), port_b(), get32(PORT + 0x14));
+        }
+    }
 
     std::atomic<std::int32_t> blocked{-1};
     std::thread t([&] { blocked = jq2_port_sync(PORT, 0); });
@@ -1494,6 +1520,199 @@ void mode_stop_ring()
     CHECK(err.find("kind=jq2-ring-entry") != std::string::npos, "stderr names kind=jq2-ring-entry");
 }
 
+/* ---- waiters, waits and Shutdown ------------------------------------------------ */
+
+/* If the stop has not happened by the deadline the child says so and leaves with
+ * status 1, so the parent's checks fail instead of the ctest timeout. */
+void arm_child_watchdog(int seconds)
+{
+    std::thread([seconds] {
+        std::this_thread::sleep_for(std::chrono::seconds(seconds));
+        std::fprintf(stderr, "the stop did not happen\n");
+        std::fflush(stderr);
+        _exit(1);
+    }).detach();
+}
+
+void expect_stop(const std::function<void()>& child, const char* kind, std::initializer_list<const char*> needles)
+{
+    std::string err;
+    const int rc = run_child(child, err);
+    CHECK(rc == 70, "exit status %d, wanted 70 (a named stop)", rc);
+    CHECK(err.find(std::string("kind=") + kind) != std::string::npos, "stderr names kind=%s", kind);
+    for (const char* needle : needles) CHECK(err.find(needle) != std::string::npos, "stderr carries %s", needle);
+    CHECK(err.find("the stop did not happen") == std::string::npos, "the child ran past the stop");
+}
+
+/* Several PPU threads blocked in Port2Sync mode 0 at the same time, one port
+ * each. Each registers its own waiter id, all stay blocked while intake is
+ * paused, and each is woken by the credit of its own job. */
+void mode_sync_concurrent()
+{
+    constexpr unsigned kPorts = 4;
+    build_image(IMAGE, Prog::transform);
+    install_hooks();
+    Rig rig({128, 2, false});
+    CHECK(set_intake_paused(QUEUE, true), "pause");
+
+    std::vector<JobSpec> specs;
+    for (unsigned i = 0; i < kPorts; ++i) {
+        const std::uint32_t port = PORT + 0x80 * i;
+        if (i != 0) CHECK(jq2_port_create(port, QUEUE) == 0, "port %u create", i);
+        specs.push_back(spec(i));
+        CHECK(jq2_port_push_job(port, specs.back().desc, 64, 0, 1) == 0, "push on port %u", i);
+    }
+
+    std::atomic<std::int32_t> result[kPorts];
+    for (auto& r : result) r = -1;
+    std::vector<std::thread> threads;
+    for (unsigned i = 0; i < kPorts; ++i)
+        threads.emplace_back([&result, i] { result[i] = jq2_port_sync(PORT + 0x80 * i, 0); });
+
+    bool all_registered = true;
+    for (unsigned i = 0; i < kPorts; ++i)
+        all_registered = wait_for([&] { return (port_a(PORT + 0x80 * i) & 0x80000000u) != 0; }) && all_registered;
+    CHECK(all_registered, "every Sync registered its wait");
+    std::uint64_t seen_ids = 0;
+    for (unsigned i = 0; i < kPorts; ++i) {
+        const std::uint32_t port = PORT + 0x80 * i;
+        const std::uint32_t id = get32(port + 0x04);
+        CHECK(id < 64, "port %u waiter id %u is within the firmware's 0..63", i, id);
+        CHECK(((port_a(port) >> 29) & 3) == 2, "port %u waits on an event flag (kind 2)", i);
+        CHECK(id >= 64 || (seen_ids & (std::uint64_t{1} << id)) == 0, "port %u waiter id %u is not shared", i, id);
+        if (id < 64) seen_ids |= std::uint64_t{1} << id;
+        CHECK(((get32(port + 0x14) >> 24) & 0xFF) == 1, "port %u holds the claim", i);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    for (unsigned i = 0; i < kPorts; ++i) CHECK(result[i] == -1, "port %u's Sync is still blocked", i);
+
+    CHECK(set_intake_paused(QUEUE, false), "resume");
+    for (auto& t : threads) t.join();
+    for (unsigned i = 0; i < kPorts; ++i) {
+        const std::uint32_t port = PORT + 0x80 * i;
+        CHECK(result[i] == 0, "port %u's Sync returned 0x%X", i, unsigned(result[i].load()));
+        CHECK(credit_of(port) == 0 && port_b(port) == 0 && ((get32(port + 0x14) >> 24) & 0xFF) == 0,
+              "port %u: A=0x%X B=%u claim=0x%X", i, port_a(port), port_b(port), get32(port + 0x14));
+        CHECK(job_ok(specs[i]), "job %u output", i);
+    }
+    const jq2_stats s = rig.stats();
+    CHECK(s.dispatched == kPorts && s.executed == kPorts && s.credited == kPorts, "counts");
+    for (unsigned i = 1; i < kPorts; ++i) CHECK(jq2_port_destroy(PORT + 0x80 * i) == 0, "port %u destroy", i);
+    rig.teardown();
+}
+
+/* The firmware's wake helper (0x6348) rejects ids above 63, so a credit that
+ * finds an event-flag waiter registered with id 64 is a named stop. The line is
+ * forged: A = -1 with bit 31 and kind 2, +0x04 = 64. */
+void mode_stop_waiter_id()
+{
+    expect_stop(
+        [] {
+            build_image(IMAGE, Prog::transform);
+            install_hooks();
+            arm_child_watchdog(5);
+            Rig rig({128, 1, false});
+            put32(PORT + 0x00, 0xDFFFFFFFu);
+            put32(PORT + 0x04, 64);
+            const JobSpec a = spec(0);
+            CHECK(rig.push(a.desc, 64, 0) == 0, "push");
+            std::this_thread::sleep_for(std::chrono::seconds(30));
+        },
+        "jq2-wake", {"reason=waiter-id", "kind=2", "id=64"});
+}
+
+/* 64 Syncs are blocked on 64 ports, so the 65th would need id 64. */
+void mode_stop_waiter_alloc()
+{
+    expect_stop(
+        [] {
+            constexpr unsigned kSyncs = 65;
+            build_image(IMAGE, Prog::transform);
+            install_hooks();
+            arm_child_watchdog(5);
+            Rig rig({128, 1, false});
+            CHECK(set_intake_paused(QUEUE, true), "pause");
+            for (unsigned i = 0; i < kSyncs; ++i) {
+                const std::uint32_t port = PORT + 0x80 * i;
+                if (i != 0) CHECK(jq2_port_create(port, QUEUE) == 0, "port %u create", i);
+                const JobSpec s = spec(i);
+                CHECK(jq2_port_push_job(port, s.desc, 64, 0, 1) == 0, "push on port %u", i);
+            }
+            std::vector<std::thread> threads;
+            for (unsigned i = 0; i < kSyncs; ++i) threads.emplace_back([i] { jq2_port_sync(PORT + 0x80 * i, 0); });
+            std::this_thread::sleep_for(std::chrono::seconds(30));
+        },
+        "jq2-wake", {"reason=waiter-id", "id=64"});
+}
+
+/* A destroyed event flag makes the blocked Sync's wait fail. */
+void mode_stop_wait()
+{
+    expect_stop(
+        [] {
+            build_image(IMAGE, Prog::transform);
+            install_hooks();
+            arm_child_watchdog(5);
+            Rig rig({128, 1, false});
+            CHECK(set_intake_paused(QUEUE, true), "pause");
+            const JobSpec a = spec(0);
+            CHECK(rig.push(a.desc, 64, 0) == 0, "push");
+            ppu_context ctx;
+            std::memset(&ctx, 0, sizeof ctx);
+            ctx.gpr[3] = get32(QUEUE + 0x80); /* the queue's first event flag */
+            CHECK(sys_event_flag_destroy(&ctx) == 0, "destroy the flag");
+            jq2_port_sync(PORT, 0); /* registers, waits, the wait fails: never returns */
+            std::fprintf(stderr, "the stop did not happen: the Sync returned\n");
+        },
+        "jq2-wake", {"reason=wait", "rc=0x"});
+}
+
+/* A push that passed its checks while the port was destroyed and the queue shut
+ * down and joined: it is held at its port-line update by a host lock on the
+ * line, then released into a ring nobody drains. */
+void push_shutdown_scenario(bool copy)
+{
+    expect_stop(
+        [copy] {
+            build_image(IMAGE, Prog::transform);
+            install_hooks();
+            arm_child_watchdog(10);
+            Rig rig({128, 1, copy});
+            const JobSpec a = spec(0);
+            struct Hold {
+                std::atomic<bool> holding{false}, release{false};
+            } hold;
+            std::thread holder([&hold] {
+                resv_host_rmw(
+                    PORT,
+                    [](std::uint8_t*, void* user) -> int {
+                        auto& h = *static_cast<Hold*>(user);
+                        h.holding = true;
+                        while (!h.release) std::this_thread::sleep_for(std::chrono::microseconds(100));
+                        return 0; /* stores nothing */
+                    },
+                    &hold);
+            });
+            CHECK(wait_for([&] { return hold.holding.load(); }), "the line is held");
+            std::thread pusher([copy, &a] {
+                const std::int32_t rc = copy ? jq2_port_copy_push(PORT, a.desc, 64, 64, 0, 1)
+                                             : jq2_port_push_job(PORT, a.desc, 64, 0, 1);
+                std::fprintf(stderr, "the stop did not happen: the push returned 0x%X\n", unsigned(rc));
+            });
+            std::this_thread::sleep_for(std::chrono::milliseconds(300)); /* past check_push, waiting on the line */
+            CHECK(jq2_port_destroy(PORT) == 0, "port destroy");
+            CHECK(jq2_queue_shutdown(QUEUE) == 0, "shutdown");
+            std::uint32_t exit_value = 0;
+            CHECK(jq2_queue_join(QUEUE, &exit_value) == 0, "join: the workers are gone");
+            hold.release = true;
+            pusher.join();
+            holder.join();
+        },
+        "jq2-state", {"reason=push-after-shutdown"});
+}
+void mode_stop_push_shutdown() { push_shutdown_scenario(false); }
+void mode_stop_copy_push_shutdown() { push_shutdown_scenario(true); }
+
 }  // namespace
 
 int main(int argc, char** argv)
@@ -1526,6 +1745,12 @@ int main(int argc, char** argv)
     else if (mode == "stop-jm-lifted") mode_stop_jm_lifted();
     else if (mode == "stop-heap") mode_stop_heap();
     else if (mode == "stop-ring") mode_stop_ring();
+    else if (mode == "sync-concurrent") mode_sync_concurrent();
+    else if (mode == "stop-waiter-id") mode_stop_waiter_id();
+    else if (mode == "stop-waiter-alloc") mode_stop_waiter_alloc();
+    else if (mode == "stop-wait") mode_stop_wait();
+    else if (mode == "stop-push-shutdown") mode_stop_push_shutdown();
+    else if (mode == "stop-copy-push-shutdown") mode_stop_copy_push_shutdown();
     else {
         std::printf("unknown mode %s\n", mode.c_str());
         return 2;

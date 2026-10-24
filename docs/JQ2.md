@@ -335,7 +335,7 @@ the unit-test and trace-replay oracle), `GuestPortLine` (guest memory through
 | `rollback_submit` (enqueue failed) | claim byte 0: `B -= 1` mod 2^32; claim held: BUSY | jq2c-007, `0x02004B8C-0x02004BC4`, JQ-CLOSURE-REVIEW finding 4 |
 | `push_accounted(enqueue)` | submit, enqueue, rollback on failure; a blocked rollback returns BUSY in place of the enqueue error | `0x02004BAC -> 0x02004C10` |
 | `credit_completion` (PM, per job without its own semaphore) | `A := (A+1) mod 2^29`; bits 30:29 kept; bit 31 kept unless `A == -1`, which clears it and makes the PM's release call due (`Wakeup{kind = bits 30:29, id = +0x04}`) | jq2c-009/010, PM `0x3404-0x3454` |
-| `sync(mode, wait)` (Port2Sync) | `mode & ~7`: INVAL `0x80410A02`. Claim (BUSY if held). Stale waiter bit: BUSY. `B > 0x0FFFFFFF`: INVAL. `sext29(A) >= B`: `A := A-B` (bits 31:29 kept), OK. Else mode bit 2: AGAIN `0x80410A01`; else register and block. Every path clears the claim; only OK zeroes `B`; AGAIN, BUSY and INVAL leave `A` and `B` | jq2c-001..004, `0x020045D8-0x020046F0`, `0x02003018-0x0200339C` |
+| `sync(mode, wait)` (Port2Sync) | Mode 0 (blocking) or 4 (poll); every other value INVAL `0x80410A02` (PPU `0x020045E8` computes `mode & ~4`), before the port is touched. Claim (BUSY if held). Stale waiter bit: BUSY. `B > 0x0FFFFFFF`: INVAL. `sext29(A) >= B`: `A := A-B` (bits 31:29 kept), OK. Else mode 4: AGAIN `0x80410A01`; else (mode 0) register and block. Every path clears the claim; only OK zeroes `B`; AGAIN, BUSY and INVAL leave `A` and `B` | jq2c-001..004, `0x020045D8-0x020046F0`, `0x02003018-0x0200339C` |
 
 Guards a caller applies first (`check_port_ea`): null `0x80410A11`, not
 128-aligned `0x80410A10`.
@@ -360,6 +360,20 @@ Guards a caller applies first (`check_port_ea`): null `0x80410A11`, not
   event-flag or fiber wait itself is the executor's. After a wake `+0x04` stays
   stale and `A`'s bits 30:29 keep the wait kind (`0x40000000` after an
   event-flag wait); neither blocks the next Sync.
+- **Waiter ids differ from the firmware's in three ways, and stop at 64.** The
+  PM's wake (`0x0ED4` into helper `0x6348`) passes the unreduced id from `+0x04`
+  and the helper rejects ids above 63, so the firmware never wakes a waiter with
+  an id of 64 or more. The HLE therefore allocates ids 0..63 only: a 65th
+  concurrent blocked Sync, or a credit that finds an event-flag waiter with id
+  64 or more in the line, is the named stop `jq2-wake` with `reason=waiter-id`
+  (ids 0..63 behave as before). What the HLE still does differently, so that a
+  title or test must not read these words as firmware state: (1) the firmware
+  treats id 0 as "none" and probably numbers its waiters from 1 `[unverified]`;
+  the HLE hands out id 0 first and has been left that way. (2) The firmware's
+  allocation bitmap at `queue+0x88..0x94` stays zero in the HLE: ids are a host
+  bitset. (3) After a wake `+0x04` keeps the woken id (and `A` the wait kind);
+  what the firmware leaves there is untraced `[unverified]`, so the word is
+  meaningful only while bit 31 of `A` is set.
 - **No traced Sync reached the registration path.** All 4106 traced port dumps
   have bits 31:29 of `A`, the `+0x04` word and the claim word zero. A Sync that
   had to wait would leave its id in `+0x04`.
@@ -380,7 +394,7 @@ Guards a caller applies first (`check_port_ea`): null `0x80410A11`, not
 is `spurs;stress`):
 
 - `model`: every transition and code on `PortWords`/`LocalPort`: saturation at
-  `0x0FFFFFFF`, rollback, `sext29` wrap, modes 0..7 and the INVAL modes, AGAIN,
+  `0x0FFFFFFF`, rollback, `sext29` wrap, modes 0 and 4 and the INVAL modes (1, 2, 3, 5, 6, 7, 8 and above, which leave A, B and the claim byte as they were), AGAIN,
   BUSY, INVAL, claim release on each path, registration and wake with spurious
   wakes, credits arriving during `acquire`, and the credit against the
   SPU-operation formulation.
@@ -435,12 +449,17 @@ job-image registry exists. A job counts as returned only when it executes the
 halt, or a loader refusal is the named stop `jq2-job-end` and credits nothing.
 
 **Completion.** After the run: pool slot back (COPY), then `credit_completion()`
-on the port line, and the `Wakeup` it returns is performed: kind 2 sets bit
-`id % 64` of the queue's event flag `+0x80 + 4 * (id / 64)` (LV2 event flags
-through `sys_event_flag_*`), any other kind is the named stop `jq2-wake` (fibers
-do not exist yet). Last, the scheduler's `complete()` releases barriers. A
-`Port2Sync` that has to wait registers a host-allocated id (128 of them) and
-blocks on that bit with the firmware's wait (`AND | CLEAR`, no timeout).
+on the port line, and the `Wakeup` it returns is performed: kind 2 with an id
+below 64 sets bit `id` of the queue's event flag `+0x80` (LV2 event flags
+through `sys_event_flag_*`); a fiber, another kind or an id of 64 or more is the
+named stop `jq2-wake` (`reason` `fiber`, `wait-kind`, `waiter-id`). Last, the
+scheduler's `complete()` releases barriers. A `Port2Sync` that has to wait
+registers a host-allocated id (64 of them; a 65th concurrent Sync is
+`jq2-wake` `reason=waiter-id`) and blocks on that bit with the firmware's wait
+(`AND | CLEAR`, no timeout). A wait that returns non-zero (the flag was
+destroyed) is `jq2-wake` `reason=wait` with the return code; it never loops.
+The second event flag (`+0x84`) is still created and destroyed, as the
+firmware does, but no waiter uses it.
 
 **Counters.** `jq2_queue_stats`: `pushed`, `dispatched`, `executed`,
 `credited`, `uncredited` (executed jobs pushed without `flags & 1`). `executed`
@@ -455,6 +474,16 @@ L1), destroys the event flags, sets bit `0x20` of `queue+0x6C` and hands
 `*(queue+0xF04)` back. The guest buffers stay the caller's (L2): nothing outside
 the queue block, the ring (`2048 + ((depth + 15) * 8 & ~0x7F)` bytes are zeroed
 at create, as the firmware does), the pool and the ports is written.
+
+A push and `Shutdown` are ordered by the queue lock: every push writes its ring
+entry under it and refuses to if `Shutdown` has already told the workers to
+leave, because a worker that has seen an empty ring after that point is gone
+and the entry would never run or be credited. A push that passed its checks and
+then lost that race (a caller bug: the port was destroyed and the queue shut
+down while the push was in flight) is the named stop `jq2-state`
+`reason=push-after-shutdown`, never a silent drop. Plain, copy and sync pushes
+share the one enqueue path, so a COPY stops before it could release its pool
+slot and leaks nothing the stop does not report.
 
 **The PM's record line is not touched.** `queue+0x180..+0x1FF` is one 128-byte
 line of 16 per-grab-slot 8-byte records the PM rewrites with GETLLAR/PUTLLUC
@@ -587,8 +616,19 @@ channel layer and LV2 event flags; labels `spurs;t0;tsan`:
   bytes are never rewritten, `+0x180..+0x57F` stays zero.
 - `sync`: mode 4 `AGAIN` with jobs outstanding (A, B untouched), a blocked mode
   0 holds the claim (`A` bit 31, claim byte), a second Sync and a push meet
-  `BUSY`, the blocked Sync returns 0 when the queue resumes, a mode with bits
-  above 7 is `INVAL`.
+  `BUSY`, the blocked Sync returns 0 when the queue resumes, and every mode
+  other than 0 and 4 (1, 2, 3, 5, 6, 7, 8, `0x80000000`) is `INVAL` with A, B and
+  the claim byte as they were.
+- `sync-concurrent`: two ports, a blocked mode-0 Sync on each from separate PPU
+  threads at the same time (distinct waiter ids), both woken by their own
+  credits; labelled `tsan`, so no report may name `libs/spurs/jq2`.
+- `stop-waiter-id`, `stop-waiter-alloc`, `stop-wait`: forked children ending in
+  `jq2-wake` with exit 70: a credit that finds an event-flag waiter with id 64
+  (`reason=waiter-id`), a 65th concurrent blocked Sync (`reason=waiter-id`), and
+  a blocked Sync whose event flag was destroyed (`reason=wait`, with `rc`).
+- `stop-push-shutdown`, `stop-copy-push-shutdown`: a push held at its port-line
+  update while the port is destroyed and the queue shut down, then released:
+  `jq2-state` `reason=push-after-shutdown` (plain and copy).
 - `join`: `Shutdown` is `BUSY` with a live port, `Join` before `Shutdown` is
   `STAT`, `Join` returns only after the held job and the other eleven finished,
   guest bytes outside the queue's blocks are untouched; a second run joins with

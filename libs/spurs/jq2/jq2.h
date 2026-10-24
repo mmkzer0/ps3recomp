@@ -166,9 +166,10 @@ int32_t jq2_port_copy_push(uint32_t port, uint32_t source, uint32_t size, uint32
  * not touched. */
 int32_t jq2_port_push_sync(uint32_t port, uint32_t tag_mask, uint32_t flags);
 
-/* cellSpursJobQueuePort2Sync(port, mode): mode 0 blocks until every job pushed
- * with flags & 1 has been credited, mode 4 returns AGAIN while any is
- * outstanding, other bits of mode INVAL. A concurrent Sync on the port BUSY.
+/* cellSpursJobQueuePort2Sync(port, mode): mode 0 (blocking) blocks until every
+ * job pushed with flags & 1 has been credited, mode 4 (poll) returns AGAIN
+ * while any is outstanding; every other value is INVAL (PPU 0x020045E8 tests
+ * mode & ~4). A concurrent Sync on the port BUSY.
  * Port accounting is libs/spurs/jq2/port.hpp's. */
 int32_t jq2_port_sync(uint32_t port, uint32_t mode);
 

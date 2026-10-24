@@ -46,10 +46,11 @@
  *   +0xFF8 SDK version, +0xFFC revision                     jq2fw-018/019
  *
  * Port2Sync blocking. A blocked Sync registers a waiter id in the port line
- * (port.hpp) and sleeps on one bit of the queue's two 64-bit event flags: id n
- * is bit n%64 of the flag at +0x80 + 4*(n/64), 128 ids. The PM's wake does the
- * matching flag set (jq2c-013). Ids are handed out by the host; a 129th
- * concurrent Sync waits for an id.
+ * (port.hpp) and sleeps on one bit of the queue's first 64-bit event flag
+ * (+0x80): id n is bit n of it, 64 ids (0..63). The PM's wake does the
+ * matching flag set (jq2c-013). The firmware's wake helper (0x6348) rejects
+ * ids above 63, so a 65th concurrent Sync is the named stop `jq2-wake`
+ * (reason `waiter-id`), not a wait for a free id.
  *
  * A job in the scheduler's terms: one instance per worker with ONE job slot,
  * because a worker runs a job to completion before it examines the ring again
