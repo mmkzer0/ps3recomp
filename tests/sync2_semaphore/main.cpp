@@ -25,6 +25,8 @@ uint32_t prx_resolve_export(uint32_t) { return 0; }
 void ps3_indirect_call(ppu_context*) { std::abort(); }
 uint64_t ppu_guest_call(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) { std::abort(); }
 uint32_t ppu_prof_resolve_host(void*) { return 0; }
+struct CellSyncQueue;
+extern "C" int32_t cellSyncQueueInitialize(CellSyncQueue* queue, void* buffer, uint32_t size, uint32_t depth);
 }
 void vm_write64(uint64_t ea, uint64_t v) { v = __builtin_bswap64(v); std::memcpy(vm_base + ea, &v, 8); }
 
@@ -105,6 +107,19 @@ void layout()
     CHECK(call(INITIALIZE, SEM, 0, 0, ATTR) == error(0x80410C11));
     wr16(ATTR + 4, 0x20);
     CHECK(call(INITIALIZE, SEM, BUF, 0, ATTR) == error(0x80410C02));
+    /* cellSyncQueueInitialize order: NULL pointer -> ALIGN -> INVAL */
+    CHECK(cellSyncQueueInitialize(nullptr, (void*)(uintptr_t)0x1000, 16, 1) == int32_t(0x80410111));
+    CHECK(cellSyncQueueInitialize((CellSyncQueue*)(uintptr_t)0x1000, nullptr, 16, 1) == int32_t(0x80410111));
+    /* Unaligned queue or buffer with invalid depth/size must return ALIGN (0x80410110), not INVAL (0x80410102) */
+    CHECK(cellSyncQueueInitialize((CellSyncQueue*)(uintptr_t)0x1004, (void*)(uintptr_t)0x2000, 16, 0) == int32_t(0x80410110));
+    CHECK(cellSyncQueueInitialize((CellSyncQueue*)(uintptr_t)0x1000, (void*)(uintptr_t)0x2004, 16, 0) == int32_t(0x80410110));
+    CHECK(cellSyncQueueInitialize((CellSyncQueue*)(uintptr_t)0x1004, (void*)(uintptr_t)0x2000, 15, 1) == int32_t(0x80410110));
+    CHECK(cellSyncQueueInitialize((CellSyncQueue*)(uintptr_t)0x1000, (void*)(uintptr_t)0x2004, 15, 1) == int32_t(0x80410110));
+    /* Valid alignment with invalid depth or size returns INVAL */
+    CHECK(cellSyncQueueInitialize((CellSyncQueue*)(uintptr_t)0x1000, (void*)(uintptr_t)0x2000, 16, 0) == int32_t(0x80410102));
+    CHECK(cellSyncQueueInitialize((CellSyncQueue*)(uintptr_t)0x1000, (void*)(uintptr_t)0x2000, 15, 1) == int32_t(0x80410102));
+    /* Valid parameters initialize successfully */
+    CHECK(cellSyncQueueInitialize((CellSyncQueue*)(uintptr_t)0x1000, (void*)(uintptr_t)0x2000, 16, 1) == 0);
 }
 void counts()
 {

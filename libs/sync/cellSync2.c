@@ -366,6 +366,7 @@ static PS3_NORETURN void sem_unsupported(const char* api, u32 sem, u32 config, c
 
 s32 _cellSync2SemaphoreAttributeInitialize(u32 attr, u32 sdkVersion)
 {
+    /* fw libsync2 0x02005748 */
     if (!attr) return CELL_SYNC2_ERROR_NULL_POINTER;
     sem_range(__func__, "attr", attr, 128);
     memset(vm_base + attr, 0, 128);
@@ -378,14 +379,20 @@ s32 _cellSync2SemaphoreAttributeInitialize(u32 attr, u32 sdkVersion)
 
 s32 cellSync2SemaphoreInitialize(u32 sem, u32 workBuffer, s32 initialValue, u32 attr)
 {
+    /* fw libsync2 0x020055D4, 0x0200564C */
     if (!sem || !attr) return CELL_SYNC2_ERROR_NULL_POINTER;
+    /* fw libsync2 0x02005654, 0x020056A8 */
     if ((sem & 127) || (workBuffer & 7)) return CELL_SYNC2_ERROR_ALIGN;
     sem_range(__func__, "attr", attr, 128);
     const u32 sdk = sem_rd32(attr);
     const u16 max = sem_rd16(attr + 6), mask = sem_rd16(attr + 4);
+    /* fw libsync2 0x02004B54, 0x02004B78 */
     if (sdk - 0x270000u > 0xC0000u || max == 0 || max > 0x8000) return CELL_SYNC2_ERROR_INVAL;
+    /* fw libsync2 0x02005680, 0x0200572C */
     if (max == 1 && workBuffer) return CELL_SYNC2_ERROR_INVAL;
+    /* fw libsync2 0x02005688, 0x020056C4 */
     if (max > 1 && !workBuffer) return CELL_SYNC2_ERROR_NULL_POINTER;
+    /* fw libsync2 0x02005694, 0x020056D4 */
     if (!mask || (mask & 0x3E30)) return CELL_SYNC2_ERROR_INVAL;
     sem_range(__func__, "sem", sem, 128);
     SEM_LOCK();
@@ -416,7 +423,9 @@ s32 cellSync2SemaphoreInitialize(u32 sem, u32 workBuffer, s32 initialValue, u32 
 
 s32 cellSync2SemaphoreGetCount(u32 sem, u32 countOut)
 {
+    /* fw libsync2 0x02004C24, 0x02004C38 */
     if (!sem || !countOut) return CELL_SYNC2_ERROR_NULL_POINTER;
+    /* fw libsync2 0x02004C3C */
     if (sem & 127) return CELL_SYNC2_ERROR_ALIGN;
     sem_range(__func__, "sem", sem, 128);
     sem_range(__func__, "countOut", countOut, 4);
@@ -595,6 +604,7 @@ s32 cellSync2SemaphoreRelease(u32 sem, u32 count, u32 notifierConfig)
     u32 fiber = 0;
     s32 rc = sem_front(__func__, sem, notifierConfig, &fiber);
     if (rc) return rc;
+    /* fw libsync2 0x02004D6C */
     if (count > 0x7FFFFF) return CELL_SYNC2_ERROR_INVAL;
     if (!count) return CELL_OK;
     SEM_LOCK();

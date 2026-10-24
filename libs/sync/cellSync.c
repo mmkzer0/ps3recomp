@@ -86,6 +86,7 @@ s32 cellSyncMutexInitialize(CellSyncMutex* mutex)
 {
     unsigned int _ea = (unsigned int)(uintptr_t)mutex;
     mutex = GUEST_PTR(mutex, CellSyncMutex*);
+    /* fw libsre 0x0200033C */
     if (!mutex)
         return CELL_SYNC_ERROR_NULL_POINTER;
 
@@ -101,6 +102,7 @@ s32 cellSyncMutexLock(CellSyncMutex* mutex)
 {
     unsigned int _ea = (unsigned int)(uintptr_t)mutex;
     mutex = GUEST_PTR(mutex, CellSyncMutex*);
+    /* fw libsre 0x02000414 */
     if (!mutex)
         return CELL_SYNC_ERROR_NULL_POINTER;
     SYNC_WATCH_LOG("LOCK", _ea, mutex);
@@ -156,6 +158,7 @@ s32 cellSyncMutexUnlock(CellSyncMutex* mutex)
 {
     unsigned int _ea = (unsigned int)(uintptr_t)mutex;
     mutex = GUEST_PTR(mutex, CellSyncMutex*);
+    /* fw libsre 0x02000494 */
     if (!mutex)
         return CELL_SYNC_ERROR_NULL_POINTER;
     SYNC_WATCH_LOG("UNLOCK", _ea, mutex);
@@ -488,10 +491,14 @@ s32 cellSyncQueueInitialize(CellSyncQueue* queue, void* buffer,
                             u32 size, u32 depth)
 {
     uint32_t q = (uint32_t)(uintptr_t)queue, b = (uint32_t)(uintptr_t)buffer;
+    /* fw libsre 0x020004F8 */
     if (!q) return CELL_SYNC_ERROR_NULL_POINTER;
+    /* fw libsre 0x02000530 */
     if (size && !b) return CELL_SYNC_ERROR_NULL_POINTER;
-    if (!depth || size % 16) return CELL_SYNC_ERROR_INVAL;
+    /* fw libsre 0x02000514, 0x02000548 */
     if (q % 32 || b % 16) return CELL_SYNC_ERROR_ALIGN;
+    /* fw libsre 0x02000554, 0x02000568 */
+    if (!depth || size % 16) return CELL_SYNC_ERROR_INVAL;
 
     vm_write32(q + 0x08, size);
     vm_write32(q + 0x0C, depth);

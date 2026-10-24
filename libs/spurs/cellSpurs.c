@@ -550,6 +550,7 @@ s32 cellSpursInitialize(CellSpurs* spurs, s32 nSpus, s32 spuPriority,
 s32 cellSpursInitializeWithAttribute(CellSpurs* spurs,
                                      const CellSpursAttribute* attr)
 {
+    /* fw libsre 0x0200849C, 0x020075E4 */
     if (!spurs || !attr)
         return CELL_SPURS_CORE_ERROR_NULL_POINTER;
     u32 spurs_ea = (u32)(uintptr_t)spurs;
@@ -619,6 +620,7 @@ s32 _cellSpursAttributeInitialize(CellSpursAttribute* attr, u32 revision,
 s32 cellSpursAttributeSetNamePrefix(CellSpursAttribute* attr,
                                     const char* prefix, u32 size)
 {
+    /* fw libsre 0x02007334 */
     if (!attr)
         return CELL_SPURS_CORE_ERROR_NULL_POINTER;
     attr = GUEST_PTR(attr, CellSpursAttribute*);
@@ -644,6 +646,7 @@ s32 cellSpursAttributeSetSpuThreadGroupType(CellSpursAttribute* attr,
 
 s32 cellSpursAttributeEnableSpuPrintfIfAvailable(CellSpursAttribute* attr)
 {
+    /* fw libsre 0x02007248 */
     if (!attr) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
     return CELL_OK;
 }

@@ -536,12 +536,15 @@ static int signal_rmw(u8* line, void* user)
 }
 s32 cellFiberPpuWaitSignal(void)
 {
+    /* fw libfiber 0x02003B9C */
     if (!tls_slot()) return (s32)CELL_FIBER_ERROR_NOSYSINIT;
     Fiber* f = t_cur;
+    /* fw libfiber 0x02003BC8 */
     if (!f) return (s32)CELL_FIBER_ERROR_PERM;
     LOCK();
     SignalOp op = {f->ea, 1, 0, 0};
     resv_host_rmw(f->ea, signal_rmw, &op);
+    /* fw libfiber 0x020034C0 */
     if (op.invalid) { UNLOCK(); return (s32)CELL_FIBER_ERROR_STAT; }
     if (op.transition) f->state = F_WAIT_SIGNAL;
     UNLOCK();
@@ -662,6 +665,7 @@ s32 cellFiberPpuUtilWorkerControlWakeup(u32 ea)
 {
     s32 rc = control_check(ea); if (rc) return rc;
     LOCK(); Sched* s = find_sched(ea);
+    /* fw libfiber 0x02005374 */
     if (!s || !s->utility) { UNLOCK(); return (s32)CELL_FIBER_ERROR_STAT; }
     const u64 old = ld64(ea + 0x200);
     /* 02005368 permits the old-SDK inactive wake path through 0x2FFFFF. */
@@ -675,11 +679,15 @@ void ps3_fiber_set_worker_exit_hook(void (*hook)(void*, u32), void* user)
 s32 cellFiberPpuUtilWorkerControlRunFibers(u32 ea)
 {
     s32 rc = control_check(ea); if (rc) return rc;
+    /* fw libfiber 0x02000810 */
     if (t_cur) return (s32)CELL_FIBER_ERROR_PERM;
     LOCK(); Sched* s = find_sched(ea);
+    /* fw libfiber 0x02004EBC */
     if (!s || !s->utility || !(ld64(ea + 0x200) & WORKER_ACTIVE)) { UNLOCK(); return (s32)CELL_FIBER_ERROR_STAT; }
+    /* fw libfiber 0x020007E8 */
     if (!tls_slot()) { UNLOCK(); return (s32)CELL_FIBER_ERROR_NOSYSINIT; }
     u64 state = ld64(ea + 0x200);
+    /* fw libfiber 0x02004EC4 */
     if ((state >> 56) > 32) { UNLOCK(); return (s32)CELL_FIBER_ERROR_AGAIN; }
     const u32 used = ld32(ea + 0x288);
     worker_update(ea, 0, 0, 1ull << 56, 0);
