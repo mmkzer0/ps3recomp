@@ -15,6 +15,7 @@
 #include "spu_workload.h"   /* SPU image -> lifted-entry dispatch (runtime/spu) */
 #include "spurs_taskset.h"  /* REAL BE CellSpursTaskset layout builders (fork Option-B) */
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
+#include "../../runtime/syscalls/sys_event.h"  /* queue push/cancel/uncancel, PS3_NODISCARD */
 #include <stdio.h>
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
 #include <string.h>
@@ -706,10 +707,6 @@ s32 cellSpursSetPriorities(CellSpurs* spurs, CellSpursWorkloadId wid,
  * all -- storing a single id let the second attach hide the first. */
 #define MAX_SPURS_QUEUES 8
 #define SPURS_EVENT_PORT 0u
-extern int sys_event_queue_push_by_id(uint32_t queue_id, uint64_t source,
-                                      uint64_t data1, uint64_t data2, uint64_t data3);
-extern void sys_event_queue_cancel_by_id(uint32_t queue_id);
-extern void sys_event_queue_uncancel_by_id(uint32_t queue_id);
 
 static u32 s_spurs_event_queue[MAX_SPURS_QUEUES];
 /* WHICH SPURS instance attached each queue. A title with more than one instance

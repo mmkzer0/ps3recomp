@@ -685,18 +685,23 @@ static size_t spu_host_stack_bytes(void)
 
 #ifndef _WIN32
 /* pthread_create with that stack, falling back to the host default if the size
- * is refused -- a thread with a small stack beats no thread at all. */
-static void spu_spawn_host_thread(spu_thread_handle_t* out,
-                                  void* (*fn)(void*), void* arg)
+ * is refused -- a thread with a small stack beats no thread at all. Returns the
+ * errno of the attempt that failed, so a caller can tell the guest its start
+ * did not happen instead of marking the thread running and joining a pthread_t
+ * that pthread_create never wrote. */
+PS3_NODISCARD static int spu_spawn_host_thread(spu_thread_handle_t* out,
+                                               void* (*fn)(void*), void* arg)
 {
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     int rc = EINVAL;
-    if (pthread_attr_setstacksize(&attr, spu_host_stack_bytes()) == 0)
+    if (pthread_attr_setstacksize(&attr, spu_host_stack_bytes()) == 0) {
         rc = pthread_create(out, &attr, fn, arg);
+    }
     pthread_attr_destroy(&attr);
     if (rc != 0)
-        pthread_create(out, NULL, fn, arg);
+        rc = pthread_create(out, NULL, fn, arg);
+    return rc;
 }
 #endif
 
@@ -764,9 +769,9 @@ static void* spu_fallback_thread_proc(void* arg)
      * the SPU's completion signal (which normally comes from a WrOutIntrMbox the
      * SPU issues before finishing). Tests whether the render hang is that wait. */
     if (getenv("RD_SPU_DONE_EVENT") && t->connected_queue) {
-        extern int sys_event_queue_push_by_id(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t);
-        sys_event_queue_push_by_id(t->connected_queue,
-            ((uint64_t)t->tid << 32) | 0x2u, (uint64_t)(uint32_t)rc, 0, 0);
+        sys_event_queue_push_from_kernel(t->connected_queue,
+            ((uint64_t)t->tid << 32) | 0x2u, (uint64_t)(uint32_t)rc, 0, 0,
+            "spu-thread-done");
         fprintf(stderr, "[SPU-DONE-EVT] tid=0x%X rc=0x%X -> queue=%u\n",
                 t->tid, rc, t->connected_queue);
     }
@@ -1056,7 +1061,21 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
                 pthread_mutex_init(&t->finish_event.mu, NULL);
                 pthread_cond_init(&t->finish_event.cv, NULL);
                 t->finish_event.done = 0;
-                spu_spawn_host_thread(&t->host_thread, spu_exec_thread_proc, t);
+                if (spu_spawn_host_thread(&t->host_thread, spu_exec_thread_proc, t) != 0) {
+                    /* The guest asked for the group to start and no host thread
+                     * runs this SPU: report the resource exhaustion the same way
+                     * sys_ppu_thread_create does. Leave t->running 0 so
+                     * group_join never waits on, or pthread_joins, a handle
+                     * pthread_create did not write. */
+                    pthread_mutex_destroy(&t->finish_event.mu);
+                    pthread_cond_destroy(&t->finish_event.cv);
+                    t->running = 0;
+                    fprintf(stderr, "[SPU] group_start id=0x%X tid=0x%X: "
+                            "host thread creation failed -> CELL_EAGAIN\n", id, t->tid);
+                    fflush(stderr);
+                    ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EAGAIN;
+                    return (int64_t)(int32_t)CELL_EAGAIN;
+                }
 #endif
                 fprintf(stderr, "[SPU] group_start id=0x%X tid=0x%X entry=0x%08X "
                         "args=0x%08X -> LIFTED SPU execution (image %d, "
@@ -1174,7 +1193,19 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
         pthread_mutex_init(&t->finish_event.mu, NULL);
         pthread_cond_init(&t->finish_event.cv, NULL);
         t->finish_event.done = 0;
-        spu_spawn_host_thread(&t->host_thread, spu_fallback_thread_proc, t);
+        if (spu_spawn_host_thread(&t->host_thread, spu_fallback_thread_proc, t) != 0) {
+            /* Same resource exhaustion as the lifted path above: tell the guest
+             * the group did not start and do not leave a thread marked running
+             * whose pthread_t group_join would later join. */
+            pthread_mutex_destroy(&t->finish_event.mu);
+            pthread_cond_destroy(&t->finish_event.cv);
+            t->running = 0;
+            fprintf(stderr, "[SPU] group_start id=0x%X tid=0x%X: "
+                    "host thread creation failed -> CELL_EAGAIN\n", id, t->tid);
+            fflush(stderr);
+            ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EAGAIN;
+            return (int64_t)(int32_t)CELL_EAGAIN;
+        }
 #endif
         /* Start handshake for a persistent worker: do not let group_start
          * return until the worker has published its live context.
@@ -1298,13 +1329,20 @@ static int64_t sys_spu_thread_group_join_handler(ppu_context* ctx)
     /* Notify any connected event queue. Real PS3 sends a SYS_SPU_THREAD_GROUP
      * event with type-specific data; we collapse to a "group stopped" tag
      * (data1 = group_id, data2 = exit_status, data3 = cause). PPU code
-     * blocked in sys_event_queue_receive on this queue wakes up here. */
+     * blocked in sys_event_queue_receive on this queue wakes up here.
+     *
+     * group_join has no event-queue error to hand back (lv2 returns the
+     * group's cause and status, never the queue's state), and RPCS3 discards
+     * its send_run_event result for the same reason. A full or destroyed
+     * queue is therefore a legal guest situation: the delivery is dropped as
+     * lv2 does, counted and logged, not a stop. */
     if (g->event_queue_id) {
-        sys_event_queue_push_by_id(g->event_queue_id,
-                                   (uint64_t)g->id,
-                                   (uint64_t)(int64_t)g->exit_status,
-                                   (uint64_t)g->cause,
-                                   0);
+        sys_event_queue_push_from_kernel(g->event_queue_id,
+                                         (uint64_t)g->id,
+                                         (uint64_t)(int64_t)g->exit_status,
+                                         (uint64_t)g->cause,
+                                         0,
+                                         "spu-group-stopped");
     }
 
     vm_write_be32(cause_ea,  g->cause);
@@ -1760,7 +1798,6 @@ static int64_t sys_spu_thread_connect_event_handler(ppu_context* ctx)
  * real hardware; the plain mailbox is PPU-polled, but we deliver both as events
  * here (harmless: a handler that doesn't expect data ignores it) gated so we
  * don't flood. */
-extern int sys_event_queue_push_by_id(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t);
 static void ydkj_spu_out_mbox_deliver(uint32_t group_id, uint32_t spu_id,
                                       int is_intr, uint32_t value)
 {
@@ -1786,10 +1823,15 @@ static void ydkj_spu_out_mbox_deliver(uint32_t group_id, uint32_t spu_id,
                 spu_id, is_intr, value, q, t ? "found" : "MISSING"); }
     if (!q) return;
     /* SPURS SPU-event source convention: high word tags it as an SPU thread
-     * event; data1 = the mailbox value. */
-    sys_event_queue_push_by_id(q,
+     * event; data1 = the mailbox value. The lv2 path that returns a status to
+     * the SPU (the code < 64 send_event dispatch in spu_deliver_user_event,
+     * which writes CELL_EBUSY for a full queue) has already run: this hook is
+     * the observer with no return channel, so a full or destroyed queue is the
+     * counted lv2 drop rather than a stop. */
+    sys_event_queue_push_from_kernel(q,
         ((uint64_t)spu_id << 32) | (is_intr ? 0x2u : 0x1u),
-        (uint64_t)value, 0, 0);
+        (uint64_t)value, 0, 0,
+        is_intr ? "spu-out-intr-mbox" : "spu-out-mbox");
     { static int s_w = 0; if (PS3_LOG_FIRST(s_w, 32))
         fprintf(stderr, "[SPU->PPU] mbox deliver spu=0x%X intr=%d val=0x%08X -> q=%u\n",
                 spu_id, is_intr, value, q); }

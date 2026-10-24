@@ -41,6 +41,21 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Marks a result that reports an error and must not be discarded: dropping one
+ * is a silent loss (an event never delivered, a thread never started and then
+ * joined) and the runtime's rule is to fail closed or stop, never carry on.
+ * This header is the fail-closed one every syscall and HLE header already
+ * reaches, so the marker lives beside the stop it prevents. C compilers that
+ * are not MSVC use warn_unused_result; C++ uses the standard attribute. */
+#if defined(_MSC_VER) && !defined(__clang__)
+#  include <sal.h>
+#  define PS3_NODISCARD _Check_return_
+#elif defined(__cplusplus)
+#  define PS3_NODISCARD [[nodiscard]]
+#else
+#  define PS3_NODISCARD __attribute__((warn_unused_result))
+#endif
+
 #ifdef __cplusplus
 #  define PS3_NORETURN [[noreturn]]
 extern "C" {
@@ -92,7 +107,10 @@ extern "C" {
     X(GCM_WAIT_TIMEOUT,         "gcm-wait-timeout")                            \
     /* C3: a guest load or store into the unmapped null page (ppu.null_page). */ \
     X(GUEST_NULL_ACCESS,        "guest-null-access")                           \
-    X(STACK_GUARD_FAULT,        "stack-guard-fault")
+    X(STACK_GUARD_FAULT,        "stack-guard-fault")                           \
+    /* An lv2-internal producer sent to a queue id that never existed: our  */ \
+    /* bookkeeping is wrong (full or destroyed queues drop, as lv2 does). */  \
+    X(EVENT_DELIVERY_LOST,      "event-delivery-lost")
 
 /* A fixed underlying type in C++ makes a kind outside the list (a caller's bug,
  * which the stop still reports as "invalid-kind") a well-defined value rather

@@ -15,21 +15,13 @@
 #include "../../runtime/memory/vm.h"   /* vm_commit */
 #include "cellAudio.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_read64, vm_write32 */
+#include "../../runtime/syscalls/sys_event.h"  /* queue push/lookup/create, PS3_NODISCARD */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <math.h>
 #include "ps3emu/log_first.h"
-
-/* Event-queue push/lookup (runtime/syscalls/sys_event.c). Forward-declared
- * rather than including sys_event.h to avoid pulling PPU context/syscall
- * table types into the HLE audio module. */
-extern int      sys_event_queue_push_by_id(uint32_t queue_id,
-                                            uint64_t source, uint64_t data1,
-                                            uint64_t data2,  uint64_t data3);
-extern uint32_t sys_event_find_queue_by_key(uint64_t key);
-extern uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size);
 
 /* ---------------------------------------------------------------------------
  * Backend selection
@@ -548,8 +540,14 @@ static void audio_notify_event_queues(void)
         if (!s_notify_queues[i].in_use) continue;
         uint32_t qid = sys_event_find_queue_by_key(s_notify_queues[i].key);
         if (qid)
-            sys_event_queue_push_by_id(qid, s_notify_queues[i].key,
-                                       0 /*CELL_AUDIO_EVENT_MIX*/, 0, 0);
+            /* The mix thread has no caller to return to, and RPCS3's
+             * cellAudio discards queues[i]->send(...)'s result: a full or
+             * destroyed queue is the guest falling behind or tearing audio
+             * down, so drop it as lv2 does (counted and logged). Only an id
+             * that never named a queue stops. */
+            sys_event_queue_push_from_kernel(qid, s_notify_queues[i].key,
+                                             0 /*CELL_AUDIO_EVENT_MIX*/, 0, 0,
+                                             "audio-period");
     }
 }
 

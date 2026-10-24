@@ -9,6 +9,7 @@
 #include "../ppu/ppu_context.h"
 #include "../../include/ps3emu/ps3types.h"
 #include "../../include/ps3emu/error_codes.h"
+#include "../../include/ps3emu/stop.h"   /* PS3_NODISCARD */
 
 #include <stdint.h>
 
@@ -47,6 +48,11 @@ typedef struct sys_event_t {
 
 typedef struct sys_event_queue_info {
     int      active;
+    /* 1 once this slot has held a queue. Destroy clears `active` but not this,
+     * so a kernel producer can tell an id whose queue the guest destroyed
+     * (legal: lv2 drops the event) from an id that never named a queue at all
+     * (a stale or uninitialised id in the runtime's own bookkeeping). */
+    int      ever_created;
     uint32_t protocol;
     int32_t  type;
     char     name[8];
@@ -155,10 +161,47 @@ void sys_event_init(lv2_syscall_table* tbl);
 /* Public helper for non-syscall callers (e.g. SPU group/thread bridges
  * that need to notify PPU code of completion). Pushes an event into
  * the queue identified by queue_id. Returns 0 on success, -1 if the
- * queue is unknown/inactive or full. */
-int sys_event_queue_push_by_id(uint32_t queue_id,
-                               uint64_t source, uint64_t data1,
-                               uint64_t data2,  uint64_t data3);
+ * queue is unknown/inactive or full. A kernel producer with no sender to
+ * hand that failure back to must use sys_event_queue_push_from_kernel. */
+PS3_NODISCARD int sys_event_queue_push_by_id(uint32_t queue_id,
+                                             uint64_t source, uint64_t data1,
+                                             uint64_t data2,  uint64_t data3);
+
+/* Causes a kernel-produced event is dropped for. lv2 drops a full queue (the
+ * guest's consumer fell behind) and a queue the guest destroyed; neither is an
+ * error the guest sees. */
+enum {
+    SYS_EVENT_KERNEL_DROP_FULL = 0,       /* guest queue full */
+    SYS_EVENT_KERNEL_DROP_DESTROYED = 1,  /* guest destroyed the queue */
+    SYS_EVENT_KERNEL_DROP_COUNT
+};
+
+/* Total kernel-produced events dropped for `cause` (SYS_EVENT_KERNEL_DROP_*).
+ * Diagnostics/tests read this; it is atomic, so it can be sampled while guest
+ * threads produce events. */
+unsigned long long sys_event_kernel_drop_count(int cause);
+
+/* Deliver an event from an lv2-internal producer that has no return channel
+ * (an SPU completion, group-stop notification, mailbox interrupt, RSX ISR or
+ * audio-period tick).
+ *
+ * Oracle: RPCS3's internal producers ignore the queue's answer --
+ * cellAudio.cpp calls `queues[i]->send(...)` and discards it, and
+ * sys_spu.cpp's `send_run_event` result is discarded. A full queue means the
+ * guest fell behind and a destroyed queue means the guest is gone; both are
+ * legal guest situations, so they drop here too -- counted per cause and
+ * logged once per (producer, cause), never silently.
+ *
+ * An id that never named a queue (0, past the table, or a slot no create ever
+ * used, i.e. not "destroyed") is a bookkeeping error in this runtime, not a
+ * guest situation, and stops as PS3_STOP_EVENT_DELIVERY_LOST.
+ *
+ * `producer` names the component in the log/stop line and is retained for the
+ * once-per-log check, so it must have static lifetime (a string literal). */
+void sys_event_queue_push_from_kernel(uint32_t queue_id,
+                                      uint64_t source, uint64_t data1,
+                                      uint64_t data2, uint64_t data3,
+                                      const char* producer);
 
 /* Resolve an event queue by its ipc_key; returns queue_id (1-based) or 0. */
 uint32_t sys_event_find_queue_by_key(uint64_t key);

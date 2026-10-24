@@ -9,6 +9,8 @@
 #include "../spu/spu_workload.h"   /* spu_elf_image_size, spu_workload_dispatch_async */
 #include <string.h>
 #include <stdlib.h>               /* getenv */
+#include <stdio.h>                /* snprintf in the delivery diagnosis */
+#include "ps3emu/stop.h"
 #include "ps3emu/log_first.h"
 
 /* Recorded by sys_spu_thread_initialize (lv2_register.c): the SPURS kernel
@@ -117,10 +119,11 @@ uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size)
 
     sys_event_queue_info* q = &g_sys_event_queues[slot];
     memset(q, 0, sizeof(*q));
-    q->active   = 1;
-    q->key      = key;
-    q->capacity = size;
-    q->type     = SYS_PPU_QUEUE;
+    q->active       = 1;
+    q->ever_created = 1;
+    q->key          = key;
+    q->capacity     = size;
+    q->type         = SYS_PPU_QUEUE;
 
     /* The waiter primitives MUST be initialised here too. memset+fields is
      * not enough: a zeroed CRITICAL_SECTION is not a valid one, and the
@@ -165,13 +168,14 @@ int64_t sys_event_queue_create(ppu_context* ctx)
 
     sys_event_queue_info* q = &g_sys_event_queues[slot];
     memset(q, 0, sizeof(*q));
-    q->active   = 1;
-    q->key      = key;
-    q->capacity = size;
-    q->head     = 0;
-    q->tail     = 0;
-    q->count    = 0;
-    q->type     = SYS_PPU_QUEUE;
+    q->active       = 1;
+    q->ever_created = 1;
+    q->key          = key;
+    q->capacity     = size;
+    q->head         = 0;
+    q->tail         = 0;
+    q->count        = 0;
+    q->type         = SYS_PPU_QUEUE;
     fprintf(stderr, "[evt] queue_create -> id=%d key=0x%llX size=%d\n",
             slot + 1, (unsigned long long)key, size);
 
@@ -941,6 +945,100 @@ int sys_event_queue_push_by_id(uint32_t queue_id,
     evt.data2  = data2;
     evt.data3  = data3;
     return event_queue_push(q, &evt);
+}
+
+/* Kernel-produced events dropped because the guest queue is full or was
+ * destroyed. Atomic: host producers run concurrently with diagnostics that
+ * read the counts. */
+static unsigned long long s_kernel_drops[SYS_EVENT_KERNEL_DROP_COUNT];
+
+unsigned long long sys_event_kernel_drop_count(int cause)
+{
+    if (cause < 0 || cause >= SYS_EVENT_KERNEL_DROP_COUNT) return 0;
+    return __atomic_load_n(&s_kernel_drops[cause], __ATOMIC_RELAXED);
+}
+
+static void kernel_drop_record(const char* producer, int cause, uint32_t queue_id)
+{
+    __atomic_fetch_add(&s_kernel_drops[cause], 1ull, __ATOMIC_RELAXED);
+
+    /* Once per (producer, cause), the PS3_LOG_FIRST pattern keyed by the
+     * producer name instead of the call site. The producer strings are runtime
+     * components (static literals), so the table is small; a lost race on the
+     * first call can print the line twice, the counter stays exact. */
+    enum { MAX_PRODUCERS = 8 };
+    static const char* names[MAX_PRODUCERS];
+    static int logged[MAX_PRODUCERS][SYS_EVENT_KERNEL_DROP_COUNT];
+    int slot = -1;
+    for (int i = 0; i < MAX_PRODUCERS && slot < 0; i++) {
+        const char* n = __atomic_load_n(&names[i], __ATOMIC_ACQUIRE);
+        if (n) {
+            if (strcmp(n, producer) == 0) slot = i;
+        } else if (__atomic_compare_exchange_n(&names[i], &n, producer, 0,
+                                               __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            slot = i;
+        } else if (n && strcmp(n, producer) == 0) {
+            slot = i;
+        }
+    }
+    if (slot < 0) return;   /* table full: still counted */
+    if (!PS3_LOG_FIRST(logged[slot][cause], 1)) return;
+    fprintf(stderr, "[evt] kernel event dropped: producer=%s queue=0x%X cause=%s "
+            "(lv2 drops this too; the guest queue is not waiting)\n",
+            producer, queue_id,
+            cause == SYS_EVENT_KERNEL_DROP_FULL ? "full" : "destroyed");
+}
+
+void sys_event_queue_push_from_kernel(uint32_t queue_id,
+                                      uint64_t source, uint64_t data1,
+                                      uint64_t data2, uint64_t data3,
+                                      const char* producer)
+{
+    const char* name = producer ? producer : "unnamed";
+
+    /* Oracle: lv2's internal producers ignore the queue's answer. RPCS3
+     * cellAudio.cpp calls queues[i]->send(...) and discards it, and sys_spu.cpp
+     * discards send_run_event's result: a full queue means the guest fell
+     * behind, a destroyed one means the guest is gone. Both are legal guest
+     * situations, so drop them as lv2 does -- counted and logged, not silent,
+     * and never a stop. */
+    if (queue_id != 0 && queue_id <= SYS_EVENT_QUEUE_MAX) {
+        sys_event_queue_info* q = &g_sys_event_queues[queue_id - 1];
+        /* `ever_created` is what separates a destroyed queue (this slot held
+         * one) from an id that never named a queue at all. */
+        if (q->ever_created) {
+            if (!q->active) {
+                kernel_drop_record(name, SYS_EVENT_KERNEL_DROP_DESTROYED, queue_id);
+                return;
+            }
+            if (sys_event_queue_push_by_id(queue_id, source, data1, data2, data3) == 0)
+                return;
+            if (!q->active) {
+                /* Destroyed while the push was in flight. */
+                kernel_drop_record(name, SYS_EVENT_KERNEL_DROP_DESTROYED, queue_id);
+            } else {
+                kernel_drop_record(name, SYS_EVENT_KERNEL_DROP_FULL, queue_id);
+            }
+            return;
+        }
+    }
+
+    /* No queue ever existed at this id: a stale or uninitialised id in our
+     * bookkeeping, not a guest situation. */
+    char queue_s[16], source_s[24];
+    snprintf(queue_s, sizeof queue_s, "0x%X", queue_id);
+    snprintf(source_s, sizeof source_s, "0x%llX", (unsigned long long)source);
+    ps3_stop_field f[] = {
+        {"producer", name},
+        {"queue",    queue_s},
+        {"cause",    "invalid-id"},
+        {"source",   source_s},
+    };
+    ps3_stop(PS3_STOP_EVENT_DELIVERY_LOST,
+             "a kernel producer delivered an event to an id that never named a queue",
+             "the guest did not destroy this queue; the producer holds a stale or "
+             "uninitialised id. Fix the bookkeeping that produced it",
+             f, sizeof f / sizeof f[0], NULL);
 }
 
 /* Public helper: resolve an event queue by its ipc_key (as registered at

@@ -22,12 +22,14 @@
 #
 cmake_minimum_required(VERSION 3.20)
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
-    project(sync_stress LANGUAGES C)
+    project(sync_stress LANGUAGES C CXX)
     enable_testing()
 endif()
 
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ---------------------------------------------------------------------------
 # Location of the ps3recomp runtime sources under test. Overridable so a
@@ -58,7 +60,13 @@ add_executable(sync_stress
     "${RUNTIME_SYNC_DIR}/sys_semaphore.c"
     "${RUNTIME_SYNC_DIR}/sys_event.c"
     "${RUNTIME_SYNC_DIR}/sys_rwlock.c"
+    # sys_event.c reports a lost internal delivery through ps3_stop. The stop
+    # implementation is not part of the sync code under test, so it comes from
+    # the real tree even when PS3RECOMP_TREE_ROOT is a seeded-bug mirror.
+    "${PS3RECOMP_ROOT}/runtime/diag/stop.cpp"
 )
+# sys_event.c now reaches ps3_stop, whose implementation is C++.
+set_target_properties(sync_stress PROPERTIES LINKER_LANGUAGE CXX)
 if(NOT WIN32)
     # The Win32 handle, wait and thread API the harness drives.
     target_sources(sync_stress PRIVATE

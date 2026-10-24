@@ -659,7 +659,14 @@ int64_t sys_timer_start(ppu_context* ctx)
     t->thread_handle = CreateThread(NULL, 0, timer_thread_proc, t, 0, NULL);
 #else
     t->stop_flag = 0;
-    pthread_create(&t->thread, NULL, timer_thread_proc, t);
+    if (pthread_create(&t->thread, NULL, timer_thread_proc, t) != 0) {
+        /* The timer syscall has a caller: lv2's resource-exhaustion error is
+         * CELL_EAGAIN (sys_timer_create in RPCS3 returns it when it cannot make
+         * the timer). running stays 0 so sys_timer_stop/destroy never join a
+         * pthread_t that pthread_create did not write. */
+        t->running = 0;
+        return (int64_t)(int32_t)CELL_EAGAIN;
+    }
 #endif
 
     return CELL_OK;

@@ -189,14 +189,17 @@ static uint32_t s_isr_qid = 0;
 /* Push one RSX event, filtered by the handler mask gcm publishes at +0x12C0,
  * exactly as rsx::thread::send_event does. Sending an unmasked event is not
  * merely wasteful: gcm's ISR dispatches on the flag bits, so a bit it never
- * asked for reaches a handler slot it never filled in. */
+ * asked for reaches a handler slot it never filled in. The RSX raises this from
+ * an interrupt, so there is no sender to hand a queue error back to: lv2 drops
+ * a full or destroyed queue (the guest fell behind or is gone), counted and
+ * logged here; only an id that never named a queue stops. */
 static void rsx_send_event(uint64_t flags)
 {
     if (!s_isr_qid) return;
     uint32_t mask = vm_read32(RSX_DRIVER_INFO_EA + RSX_DI_HANDLERS);
     flags &= (uint64_t)mask;
     if (!flags) return;
-    sys_event_queue_push_by_id(s_isr_qid, 0, 0, flags, 0);
+    sys_event_queue_push_from_kernel(s_isr_qid, 0, 0, flags, 0, "rsx-isr");
 }
 
 /* The RSX raises this when the FIFO executes GCM_SET_USER_COMMAND (method
