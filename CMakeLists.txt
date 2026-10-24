@@ -715,6 +715,7 @@ if(UNIX)
                     --out "${SMOKE_GEN}/ppu_hle_nids.cpp" --all
             DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tools/gen_hle_nids.py"
                     "${CMAKE_CURRENT_SOURCE_DIR}/tools/nid_database.py"
+                    ${HLE_SOURCES}
             COMMENT "Generating the HLE NID -> handler table")
         # The generated unit includes libs/... by repository-relative path and
         # ppu_hle_adapt.hpp from runtime/ppu; both are already on this target's
