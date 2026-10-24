@@ -33,7 +33,34 @@ static void reserve(uint32_t ea) {
     assert(spu_mfc_atomic(&peer,MFC_GETLLAR_CMD));assert(peer.resv_valid);
     peer.event_status=0;
 }
-int main(void) {
+/* One malformed storage control per process: a stop ends the process, so the
+ * Python driver invokes the fixture once per case and checks the machine line.
+ * Returns only when no stop happened (a failure). */
+static int stop_case(const char* name)
+{
+    const uint32_t ea=0x20000;
+    uint64_t sea=ea;
+    uint32_t ssize=2048, scmd=0x89;
+    spu_context_init(&writer,0);writer.image_id=-1;
+    prepare(ea,2048);
+    if(!strcmp(name,"size")) ssize=16512;
+    else if(!strcmp(name,"alignment")) sea=ea+1;
+    else if(!strcmp(name,"size-alignment")) ssize=16;
+    else if(!strcmp(name,"ea-high")) sea=0x100020000ull;
+    else if(!strcmp(name,"ea-wrap")) {sea=0xFFFFFF80ull;ssize=256;}
+    else if(!strcmp(name,"stalled-tag")) writer.list_stall_mask=(1u<<11);
+    else if(!strcmp(name,"no-vm")) vm_base=NULL;
+    else if(!strcmp(name,"class-size")) {ssize=16512;scmd=0x01020089u;}
+    else {fprintf(stderr,"unknown case %s\n",name);return 2;}
+    writer.mfc_eah=(uint32_t)(sea>>32);writer.mfc_eal=(uint32_t)sea;
+    writer.mfc_size=ssize;
+    int rc=mfc_submit(mfc_for(&writer),&writer,scmd);
+    fprintf(stderr,"FAIL: %s returned %d without a stop\n",name,rc);
+    return 3;
+}
+int main(int argc, char** argv) {
+    if (argc == 2) return stop_case(argv[1]);
+    if (argc != 1) return 2;
     const uint32_t ea=0x20000;
     spu_context_init(&writer,0);writer.image_id=-1;
     spu_context_init(&peer,0);peer.image_id=-1;
@@ -73,30 +100,16 @@ int main(void) {
     assert(peer.atomic_stat==1 && guest[ea+1920]==0);
     reserve(ea+2048);assert(mfc_submit(mfc_for(&writer),&writer,0x89)==0);
     assert(peer.resv_valid && !(peer.event_status&SPU_EVENT_LR));
-    /* Unsupported storage-control forms fail without guest writes or a
-     * successful tag receipt, including high EA bits instead of truncation. */
-    const struct {uint64_t ea; uint32_t size;} invalid[]={
-        {ea,0},{ea,16512},{ea+1,2048},{ea,16},
-        {0x100020000ull,2048},{0xFFFFFF80ull,256}
-    };
-    for(unsigned i=0;i<sizeof(invalid)/sizeof(invalid[0]);i++) {
-        prepare(ea,2048);writer.mfc_eah=(uint32_t)(invalid[i].ea>>32);
-        writer.mfc_eal=(uint32_t)invalid[i].ea;writer.mfc_size=invalid[i].size;
-        assert(mfc_submit(mfc_for(&writer),&writer,0x89)==-1);
-        for(unsigned j=0;j<2048;j++)assert(guest[ea+j]==0x77);
-        assert(!(mfc_for(&writer)->tag_completed&(1u<<11)));
-        assert(mfc_submit(mfc_for(&writer),&writer,0x01020089u)==-1);
-        assert(!(mfc_for(&writer)->tag_completed&(1u<<11)));
-    }
-    prepare(ea,2048);uint8_t* real_vm=vm_base;vm_base=NULL;
-    assert(mfc_submit(mfc_for(&writer),&writer,0x89)==-1);vm_base=real_vm;
-    assert(guest[ea]==0x77 && !(mfc_for(&writer)->tag_completed&(1u<<11)));
-    /* An earlier stall in the same tag must prevent zeroing/completion. An
-     * unrelated stalled tag must not block this tag's synchronous command. */
-    prepare(ea,2048);writer.list_stall_mask=(1u<<11);
-    assert(mfc_submit(mfc_for(&writer),&writer,0x89)==-1);
-    assert(guest[ea]==0x77 && !(mfc_for(&writer)->tag_completed&(1u<<11)));
-    writer.list_stall_mask=(1u<<12);
+    /* A zero-byte storage control moves nothing and completes its tag: RPCS3
+     * executes an MFC command only when size != 0 (SPUThread.cpp,
+     * process_mfc_cmd). Invalid ranges and the stalled-tag case stop the
+     * process with kind spu-mfc-error; those cases live in stop_case(), each
+     * in its own process because a stop is terminal. */
+    prepare(ea,0);
+    assert(mfc_submit(mfc_for(&writer),&writer,0x89)==0);
+    assert(guest[ea]==0x77 && (mfc_for(&writer)->tag_completed&(1u<<11)));
+    /* An unrelated stalled tag must not block this tag's synchronous command. */
+    prepare(ea,2048);writer.list_stall_mask=(1u<<12);
     assert(mfc_submit(mfc_for(&writer),&writer,0x89)==0);cleared(ea,2048);
     writer.list_stall_mask=0;
     spu_coh_unregister(&first_peer);spu_coh_unregister(&peer);

@@ -53,6 +53,7 @@ Ids are stable kebab-case; a new gap gets a new kind, never a free-text variant.
 | `unknown-instruction` | an instruction the lifter did not know |
 | `dispatch-depth-exceeded` | `ps3_indirect_call` nested deeper than its host safety limit (4000) |
 | `spu-dma-repeat` | an SPU issued identical MFC transfers continuously past `spu.dma_repeat_stop_secs` |
+| `spu-mfc-error` | an SPU issued an MFC transfer the hardware rejects: a size over 16 KiB, a size not a multiple of 16 for a transfer of 16 bytes or more, LSA/EA alignment the MFC does not accept, an LSA range past the 256 KiB local store, an EA range outside committed guest memory (including one that wraps 4 GB), a PUT into the unmapped null page, a storage-control range that is not a whole 128-byte range, or SDCRZ in a tag group with a parked list. The hardware raises an MFC command/alignment error and the SPU does not run on. A zero-byte transfer is not one: RPCS3 executes a command only when its size is non-zero, and the runtime completes it without moving data |
 | `unresolved-guest-callback` | a host-initiated guest callback (`ppu_guest_call` / `ppu_guest_call_ct`) whose OPD or code word is 0 or is not a lifted function, or that cannot be given guest stack space |
 | `hle-unsupported-return` | an HLE handler whose declared return type is a host pointer: there is no guest address for it (classified in `tools/gen_hle_nids.py`, see [HLE_ABI.md](HLE_ABI.md)) |
 | `spu-job-crt-version` | a SPURS job whose CRT marker at LS `0x30` is not `JOBCRT Ver13` or `JOBCRT Ver14` (Ver12, Ver15, garbage): the loader models those two CRTs only |
@@ -89,6 +90,7 @@ Where each is raised, and what it carries beyond `pc lr tid`:
 | `unknown-instruction` | `ppu_trap_unknown_instruction`, emitted by the lifter | `pc word mnemonic` |
 | `dispatch-depth-exceeded` | `ps3_indirect_call_impl` | `target depth limit caller_lr` |
 | `spu-dma-repeat` | `mfc_submit` (`runtime/spu/spu_dma.h`) | `image ea lsa cmd size count secs`, with `pc` (LS address) and `tid` (SPU id) as the site |
+| `spu-mfc-error` | `mfc_do_transfer` (`runtime/spu/spu_dma.h`), reached from `mfc_submit`, `mfc_run_list` and `mfc_list_stall_ack` | `cmd lsa ea size tag reason` (`reason` is `size`, `alignment`, `ls-overrun`, `ea-uncommitted`, `null-ea` or `sdczr-stalled-tag`); `pc` is the SPU's local-store address and `tid` its SPU id; `lr` is 0, since an SPU has no link register in this model |
 | `unresolved-guest-callback` | `ppu_guest_call`, `ppu_guest_call_ct` | `origin opd code toc descriptor hint`, or `origin=stack sp limit vm_size hint` when no guest stack space can be given (bad caller r1, VM too small for the host window, all host slots live, a host slot out of room); `pc`/`lr` are 0 (no guest instruction runs) and `tid` is the calling guest thread |
 | `hle-unsupported-return` | `ps3_hle_call` (`runtime/ppu/ppu_hle.cpp`), from the adapter's `ps3_hle_adapt_host_ptr_stop` | `nid name reason` (`reason` is `returns a host pointer, not a guest EA`); `pc`/`lr` are the caller's return address (the import stub's caller) and `tid` is the calling guest thread |
 | `spu-job-crt-version` | `spu_run_spurs_job` (`runtime/spu/spurs_job.c`) | `job image marker bytes` (`marker` is the 12 bytes at LS 0x30 with every non-printable as `?`, `bytes` the same 12 as hex) |
@@ -128,6 +130,15 @@ back-off, which is timing only. The stop's `count` is the number of consecutive
 identical transfers observed and `secs` the wall time they lasted. Its `pc` is
 the SPU's local-store address and `tid` its SPU id; `lr` is 0, since an SPU has
 no link register in this model.
+
+`spu-mfc-error` is the MFC command/alignment error the hardware raises, so the
+SPU cannot run on as if the transfer had completed. Two states that look like
+errors are not: a zero-byte transfer completes without moving data (RPCS3's
+`process_mfc_cmd` executes an MFC command only when its size is non-zero), and
+an `MFC_WrListStallAck` naming a tag with no parked list is ignored (RPCS3 acts
+on the acknowledgement only when the tag's stall-mask bit is set). Resuming a
+parked list whose remaining elements are malformed is a real transfer and stops
+like any other.
 
 `unresolved-guest-callback` is the host-initiated direction: an HLE library
 calls `ppu_guest_call` (an OPD) or `ppu_guest_call_ct` (a captured code/TOC) to

@@ -176,12 +176,43 @@ static inline int mfc_is_fence(uint32_t cmd)
     return (cmd & 0x02) != 0; /* fence variants have bit 1 set */
 }
 
+/* The MFC answers a malformed transfer with an alignment or command error and
+ * the SPU does not run on past it; a DMA that never moved its data is not a
+ * completed DMA. CBEA 1.02 section 7.7 gives the transfer rules, and RPCS3's
+ * command handler resolves only sizes up to 0x4000 and otherwise throws
+ * (SPUThread.cpp, process_mfc_cmd). Name the command exactly as the SPU staged
+ * it, so the stop points at the descriptor that built this transfer, with the
+ * SPU's own pc and id as the site. */
+PS3_NORETURN static inline void mfc_dma_error(spu_context* spu, uint32_t cmd,
+                                              uint32_t lsa, uint64_t ea,
+                                              uint32_t size, uint32_t tag,
+                                              const char* reason)
+{
+    char cmd_s[8], lsa_s[16], ea_s[24], size_s[16], tag_s[8];
+    snprintf(cmd_s, sizeof cmd_s, "0x%02X", (unsigned)(cmd & 0xFFu));
+    snprintf(lsa_s, sizeof lsa_s, "0x%05X", (unsigned)lsa);
+    snprintf(ea_s, sizeof ea_s, "0x%llX", (unsigned long long)ea);
+    snprintf(size_s, sizeof size_s, "%u", (unsigned)size);
+    snprintf(tag_s, sizeof tag_s, "%u", (unsigned)tag);
+    ps3_stop_field f[] = {
+        {"cmd", cmd_s}, {"lsa", lsa_s}, {"ea", ea_s},
+        {"size", size_s}, {"tag", tag_s}, {"reason", reason},
+    };
+    ps3_stop_site site = { (uint32_t)spu->pc & SPU_LS_MASK, 0, spu->spu_id };
+    ps3_stop(PS3_STOP_SPU_MFC_ERROR,
+             "an SPU issued an MFC transfer the hardware rejects",
+             "The descriptor, or the code that computed it, is wrong. The MFC raises a "
+             "DMA error and the SPU does not continue past it; fix the transfer instead "
+             "of letting the job run on without it.",
+             f, sizeof f / sizeof f[0], &site);
+}
+
 /*
  * Execute a single DMA transfer between local store and main memory.
- * Returns 0 on success, -1 on error.
+ * Returns 0 on success; a malformed transfer stops the process.
  */
 static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
-                                   uint32_t size, uint32_t cmd)
+                                   uint32_t size, uint32_t cmd, uint32_t tag)
 {
     /* Upper16 command-channel bits carry replacement/transfer class IDs. */
     if ((cmd & 0xFFFFu) == MFC_SDCRZ_CMD) {
@@ -190,20 +221,23 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
          * (table 7-6); currently support whole 128-byte blocks, up to 16 KiB.
          * Reject other forms visibly instead of applying ordinary LS DMA
          * validation or claiming an unsupported command completed. */
-        if (!size || size > MFC_MAX_DMA_SIZE || (size & 127u) || (ea & 127u) ||
-            (ea >> 32) || !mfc_ea_range_committed(ea, size)) {
-            fprintf(stderr, "[mfc] REJECTED SDCRZ range: ea=0x%016llX size=%u\n",
-                    (unsigned long long)ea, size);
-            return -1;
-        }
+        /* Zero bytes move nothing. RPCS3 executes an MFC command only when
+         * size != 0 (SPUThread.cpp, process_mfc_cmd) and do_list_transfer
+         * returns for size 0, so this is a completed no-op, not an MFC error. */
+        if (!size)
+            return 0;
+        if (size > MFC_MAX_DMA_SIZE)
+            mfc_dma_error(spu, cmd, lsa, ea, size, tag, "size");
+        if ((size & 127u) || (ea & 127u))
+            mfc_dma_error(spu, cmd, lsa, ea, size, tag, "alignment");
+        if ((ea >> 32) || !mfc_ea_range_committed(ea, size))
+            mfc_dma_error(spu, cmd, lsa, ea, size, tag, "ea-uncommitted");
         /* Storage controls impose a barrier in their tag group. Ordinary
          * transfers finish synchronously, but a stalled list does not. This
-         * engine cannot execute SDCRZ ahead of that still-pending transfer. */
-        if (spu->list_stall_mask & (1u << (spu->mfc_tag & 31u))) {
-            fprintf(stderr, "[mfc] REJECTED SDCRZ behind stalled tag %u\n",
-                    spu->mfc_tag & 31u);
-            return -1;
-        }
+         * engine cannot execute SDCRZ ahead of that still-pending transfer, so
+         * it cannot honour the command rather than guessing an order. */
+        if (spu->list_stall_mask & (1u << (spu->mfc_tag & 31u)))
+            mfc_dma_error(spu, cmd, lsa, ea, size, tag, "sdczr-stalled-tag");
         /* Serialize zeroing with reservation compare-and-commit. Notify each
          * touched line even for a zero-to-zero write: byte comparisons alone
          * cannot detect that a peer's reservation was lost. Issuer exclusion
@@ -253,41 +287,33 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                 fprintf(stderr, "[dma-range] %.0f B/s put, %.0f B/s get\n",
                         s_put * 1000.0 / (now - s_t0), s_get * 1000.0 / (now - s_t0));
                 s_put = s_get = 0; s_t0 = now; } } } }
-    /* Malformed transfers are REJECTED, as the hardware MFC does. The rules
-     * are the ones the SDK's own dma.h asserts: a non-zero size, at most
-     * 16 KB, a multiple of 16 once >= 16 bytes, and LSA/EA sharing 16-byte
-     * alignment. Real hardware raises an MFC alignment exception and does
-     * NOT move the data; performing it anyway lets one bad descriptor spray
-     * the guest image. YDKJ issues exactly one such PUT -- 16 KB from a
-     * 4-byte-aligned EA of 0x00542004, straight over the title's own data --
-     * and every later call through the clobbered OPDs reports
-     * "code 0x00000000 not registered".
+    /* A malformed transfer is an MFC error, not a dropped DMA. CBEA 1.02
+     * section 7.7 and the SDK's own dma.h require at most 16 KiB, a multiple
+     * of 16 bytes once the transfer is 16 bytes or larger, and LSA/EA sharing
+     * 16-byte alignment. A PUT below the lv2-reserved low 64 KiB is a
+     * descriptor whose destination field came through as zero. The hardware
+     * raises an MFC alignment error and does not move the data.
      *
-     * SPU_DMA_LAX=1 restores the old permissive behaviour. */
+     * SPU_DMA_LAX=1 skips these pre-transfer checks for fixtures that
+     * deliberately stage misaligned or null-page descriptors. The hard MFC
+     * limits below (size over 16 KiB, LS overrun, EA range) always apply. */
     { static _Thread_local int s_lax = -1; if (s_lax < 0) s_lax = getenv("SPU_DMA_LAX") ? 1 : 0;
       if (!s_lax) {
-          /* A PUT into the null page is the same class of accident: lv2 reserves
-           * the low 64 KB and no title DMAs there on purpose, so an EA that
-           * small means the descriptor field holding the real destination came
-           * through as zero. GT5P's second audio job spills its whole local
-           * store (0x0000/0x4000/0x8000, 34 KB) to EA 0 on every pass --
-           * 363,577 of 364,600 PUTs in a 40 s boot. Performing them writes
-           * nothing useful and buries the real destinations in the histogram.
-           * GETs from low EAs stay allowed: they only read garbage, and
-           * LBP_SKIP_NULL_DMA already exists to test zeroing them instead. */
-          int malformed = (size == 0) || (size > 0x4000)
-                       || (size >= 16 && (size & 15))
-                       || (((lsa ^ (uint32_t)ea) & 15) != 0)
-                       || (mfc_is_put(cmd) && (uint32_t)ea < 0x10000u);
-          if (malformed) {
-              static SPU_THREAD_LOCAL int _n = 0;
-              if (PS3_LOG_FIRST(_n, 8))
-                  fprintf(stderr, "[mfc] REJECTED malformed transfer: img=%d pc=0x%05X"
-                                  " cmd=0x%X lsa=0x%05X ea=0x%08X size=%u\n",
-                          spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK, cmd,
-                          lsa, (uint32_t)ea, size);
+          /* Zero bytes move nothing and are a completed command, not an MFC
+           * error: RPCS3's process_mfc_cmd executes a transfer only when
+           * size != 0 (SPUThread.cpp). */
+          if (size == 0)
               return 0;
-          } } }
+          if (size > MFC_MAX_DMA_SIZE)
+              mfc_dma_error(spu, cmd, lsa, ea, size, tag, "size");
+          if (size >= 16 && (size & 15u))
+              mfc_dma_error(spu, cmd, lsa, ea, size, tag, "alignment");
+          if (((lsa ^ (uint32_t)ea) & 15u) != 0)
+              mfc_dma_error(spu, cmd, lsa, ea, size, tag, "alignment");
+          /* GETs from low EAs stay allowed: they only read garbage. */
+          if (mfc_is_put(cmd) && (uint32_t)ea < 0x10000u)
+              mfc_dma_error(spu, cmd, lsa, ea, size, tag, "null-ea");
+      } }
     /* SPU_DMACHK=1: report transfers that break the MFC rules the guest's own
      * dma.h asserts on -- size 0 or > 16 KB, size not a multiple of 16 for
      * transfers of 16+ bytes, or LSA/EA not sharing 16-byte alignment. */
@@ -417,42 +443,42 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                       spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK,
                       (uint32_t)ea, size, lsa);
       } }
-    /* Validate size */
-    if (size == 0 || size > MFC_MAX_DMA_SIZE)
-        return -1;
+    /* A zero-byte transfer completes without moving data (RPCS3's
+     * process_mfc_cmd runs a command only when size != 0). A size over 16 KiB
+     * is an MFC command error: RPCS3 resolves only sizes <= 0x4000 and throws
+     * otherwise (SPUThread.cpp). The checks above are skipped under
+     * SPU_DMA_LAX=1, and list elements carry their own size, so both cases
+     * still arrive here. */
+    if (size == 0)
+        return 0;
+    if (size > MFC_MAX_DMA_SIZE)
+        mfc_dma_error(spu, cmd, lsa, ea, size, tag, "size");
 
     /* Mask LSA to local store range */
     lsa &= SPU_LS_MASK;
 
-    /* Reject transfers that would overrun the 256 KB local store buffer (a real
-     * SPU MFC requires the LS range to be valid; an out-of-range lsa+size here
-     * would corrupt host heap past spu->ls). */
+    /* An LSA range past the 256 KiB local store is an MFC alignment error; the
+     * hardware does not wrap it, and this engine must not write past spu->ls. */
     if ((uint64_t)lsa + (uint64_t)size > (uint64_t)SPU_LS_SIZE)
-        return -1;
+        mfc_dma_error(spu, cmd, lsa, ea, size, tag, "ls-overrun");
 
-    /* Reject transfers whose main-memory range is not committed guest memory,
-     * so a garbage EA (e.g. from an incomplete SPURS context) is a failed DMA
-     * rather than a host segfault. */
+    /* An EA range outside committed guest memory (including a range that wraps
+     * the 32-bit space) is an MFC error: the hardware does not fabricate bytes
+     * and the host must not fault on the guest's bad descriptor. */
     if (!mfc_ea_range_committed(ea, size)) {
-        static SPU_THREAD_LOCAL int s_warned = 0;
-        if (PS3_LOG_FIRST(s_warned, 32))
-            fprintf(stderr, "[spu-dma] SKIP %s img=%d pc=0x%05X lsa=0x%05X ea=0x%08X "
-                    "size=%u%s (EA not committed -- bad/garbage DMA target)\n",
-                    mfc_is_get(cmd) ? "GET" : "PUT", spu->image_id,
-                    (uint32_t)spu->pc & SPU_LS_MASK, lsa, (uint32_t)ea, size,
-                    (size <= 8 && ((uint32_t)ea & (size - 1))) ? " MISALIGNED" : "");
-        /* SPU_DMA_SKIP_DUMP=1: show the LS payload a skipped PUT was carrying.
-         * A job that DMAs a small buffer to a garbage EA in a tight loop is
-         * usually an SPU-side assert/print path, and the payload names the
-         * actual complaint -- far more useful than the address it failed at. */
+        /* SPU_DMA_SKIP_DUMP=1: show the LS payload the rejected PUT was
+         * carrying. A job that DMAs a small buffer to a garbage EA in a tight
+         * loop is usually an SPU-side assert/print path, and the payload names
+         * the actual complaint. */
         { static _Thread_local int s_d = -1; if (s_d < 0) s_d = getenv("SPU_DMA_SKIP_DUMP") ? 1 : 0;
-          if (s_d && s_warned <= 2) {
+          static SPU_THREAD_LOCAL int s_n = 0;
+          if (s_d && s_n++ < 3) {
             const uint8_t* q = spu->ls + (lsa & SPU_LS_MASK);
             fprintf(stderr, "  LS[0x%05X] ascii: ", lsa);
             for (uint32_t i = 0; i < 128; i++)
                 fputc((q[i] >= 32 && q[i] < 127) ? q[i] : 46, stderr);
             fputc(10, stderr); fflush(stderr); } }
-        return -1;
+        mfc_dma_error(spu, cmd, lsa, ea, size, tag, "ea-uncommitted");
     }
 
     uint8_t* ls_ptr = &spu->ls[lsa];
@@ -819,8 +845,7 @@ static inline int mfc_run_list(spu_context* spu, uint32_t elem_lsa,
              * 1/2/4/8-byte transfers. The EA supplies its byte offset within
              * the first quadword. Keep the rounded cursor for stall/resume. */
             uint32_t transfer_lsa = (dest_lsa & ~15u) | (eal & 15u);
-            int rc = mfc_do_transfer(spu, transfer_lsa, ea, xfer_size, base_cmd);
-            if (rc != 0) return rc;
+            mfc_do_transfer(spu, transfer_lsa, ea, xfer_size, base_cmd, tag);
             dest_lsa = (dest_lsa & ~15u) + ((xfer_size + 15u) & ~15u);
         }
 
@@ -869,6 +894,10 @@ static inline int mfc_list_stall_ack(struct mfc_engine* mfc, spu_context* spu,
 {
     uint32_t t = tag & 0x1F;
     if (!(spu->list_stall_mask & (1u << t))) {
+        /* An acknowledgement for a tag with no parked list is an expected
+         * state, not an error: RPCS3's MFC_WrListStallAck acts only when the
+         * tag's ch_stall_mask bit is set and otherwise returns without side
+         * effects (SPUThread.cpp, the MFC_WrListStallAck case). */
         static SPU_THREAD_LOCAL int _n = 0;
         if (PS3_LOG_FIRST(_n, 8))
             fprintf(stderr, "[mfc-list] StallAck tag=%u but no parked list "
@@ -904,12 +933,12 @@ static inline int mfc_list_stall_ack(struct mfc_engine* mfc, spu_context* spu,
         fprintf(stderr, "\n");
       }
     }
-    int rc = mfc_run_list(spu, spu->list_stall_elem_lsa[t], spu->list_stall_remaining[t],
-                          spu->list_stall_dest_lsa[t], spu->list_stall_ea_base[t],
-                          spu->list_stall_cmd[t], t);
+    mfc_run_list(spu, spu->list_stall_elem_lsa[t], spu->list_stall_remaining[t],
+                 spu->list_stall_dest_lsa[t], spu->list_stall_ea_base[t],
+                 spu->list_stall_cmd[t], t);
     if (!(spu->list_stall_mask & (1u << t)))      /* ran to the end: tag done */
         mfc->tag_completed |= (1u << t);
-    return rc;
+    return 0;
 }
 
 static inline int mfc_do_list_transfer(spu_context* spu, uint32_t list_lsa,
@@ -925,30 +954,9 @@ static inline int mfc_do_list_transfer(spu_context* spu, uint32_t list_lsa,
 }
 
 /* ---------------------------------------------------------------------------
- * Enqueue an MFC command (called when SPU writes to MFC_Cmd channel)
- * -----------------------------------------------------------------------*/
-static inline int mfc_enqueue(mfc_engine* mfc, spu_context* spu)
-{
-    if (mfc->queue_count >= MFC_QUEUE_DEPTH)
-        return -1; /* queue full */
-
-    uint32_t lsa  = spu->mfc_lsa;
-    uint64_t ea   = ((uint64_t)spu->mfc_eah << 32) | spu->mfc_eal;
-    uint32_t size = spu->mfc_size;
-    uint32_t tag  = spu->mfc_tag;
-    uint32_t cmd  = spu->ls[0]; /* overridden below */
-
-    /* The cmd was just written to the MFC_Cmd channel -- we receive it
-     * as a parameter to the channel write handler.  For this inline API,
-     * the caller should pass it.  We use a wrapper below. */
-    (void)cmd;
-    return 0;
-}
-
-/*
  * Submit and immediately execute an MFC command.
  * This is the main entry point called when the SPU writes to MFC_Cmd.
- */
+ * -----------------------------------------------------------------------*/
 static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
 {
     /* At enqueue, before any transfer: the observer sees the command exactly
@@ -970,7 +978,6 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
     uint64_t ea   = ((uint64_t)spu->mfc_eah << 32) | spu->mfc_eal;
     uint32_t size = spu->mfc_size;
     uint32_t tag  = spu->mfc_tag & 0x1F;
-    int rc = 0;
 
     /* SPU_WATCHEA=<hex guest addr>: report every DMA whose destination range
      * covers one word, with the SPU id, its pc and the value the word holds
@@ -1517,16 +1524,16 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
                     "list\n0x%05X size=0x%X (%u elems) tag=%u\n",
                     spu->image_id, cmd, lsa, (uint32_t)ea & SPU_LS_MASK,
                     size, size / 8, tag); }
-        rc = mfc_do_list_transfer(spu, (uint32_t)ea & SPU_LS_MASK,
-                                  ea & 0xFFFFFFFF00000000ull, size, cmd);
+        mfc_do_list_transfer(spu, (uint32_t)ea & SPU_LS_MASK,
+                             ea & 0xFFFFFFFF00000000ull, size, cmd);
     } else {
-        rc = mfc_do_transfer(spu, lsa, ea, size, cmd);
+        mfc_do_transfer(spu, lsa, ea, size, cmd, tag);
     }
 
     /* wwsjob batch-fetch probe: the claim path GETs the batch's command data
      * to LS 0xC00; if this arrives empty/garbage the interrupt handler has
      * nothing to stage and the pipeline idles forever. Dump the first words. */
-    if (spu->image_id == 2 && lsa == 0xC00 && cmd == 0x40 && rc == 0) {
+    if (spu->image_id == 2 && lsa == 0xC00 && cmd == 0x40) {
         /* Global count of loadCommands fetches: the per-run claim-vs-stage
          * summary in spurs_policy.c diffs this across a PM run to catch the
          * dispatch that CLAIMS a ticket but never stages its job. */
@@ -1580,11 +1587,10 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
     /* Mark tag as completed -- EXCEPT a list parked at a stall-and-notify
      * element: its tag group stays incomplete until MFC_WrListStallAck resumes
      * it to the end (mfc_list_stall_ack marks completion then). */
-    if (!(spu->list_stall_mask & (1u << (tag & 0x1F))) &&
-        ((cmd & 0xFFFFu) != MFC_SDCRZ_CMD || rc == 0))
+    if (!(spu->list_stall_mask & (1u << tag)))
         mfc->tag_completed |= (1u << tag);
 
-    return rc;
+    return 0;
 }
 
 /* ---------------------------------------------------------------------------

@@ -112,7 +112,9 @@ extern "C" {
     /* bookkeeping is wrong (full or destroyed queues drop, as lv2 does). */  \
     X(EVENT_DELIVERY_LOST,      "event-delivery-lost")                         \
     /* A JobQueue2 parameter combination the firmware accepts whose console behaviour is unknown. */ \
-    X(JQ2_UNMODELLED,           "jq2-unmodelled")
+    X(JQ2_UNMODELLED,           "jq2-unmodelled")                              \
+    /* An MFC transfer the hardware rejects (a command/alignment error). */   \
+    X(SPU_MFC_ERROR,            "spu-mfc-error")
 
 /* A fixed underlying type in C++ makes a kind outside the list (a caller's bug,
  * which the stop still reports as "invalid-kind") a well-defined value rather
