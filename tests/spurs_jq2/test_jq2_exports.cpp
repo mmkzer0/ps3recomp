@@ -71,6 +71,11 @@ void ppu_dump_bctrl_ring(uint32_t, const char*) {}
 void ppu_guest_caller(char* out, size_t n) { if (out && n) out[0] = '\0'; }
 uint32_t ppu_active_lr(void) { return 0; }
 uint32_t ps3_spu_image_source_ea(uint32_t ea) { return ea; }
+/* The executor reaches cellFiber, which names the loader's dispatch-state
+ * hooks; no PPU dispatcher is linked here, which is the documented NULL case. */
+int* ps3_ppu_dispatch_depth_slot(void) { return nullptr; }
+int* ps3_ppu_vcall_sp_slot(void) { return nullptr; }
+uint32_t** ps3_ppu_vcall_stack_slot(void) { return nullptr; }
 
 void ps3_hle_call(uint32_t nid, ppu_context* ctx);
 void ppu_hle_init(void);

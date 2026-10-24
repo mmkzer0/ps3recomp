@@ -396,7 +396,8 @@ Guards a caller applies first (`check_port_ea`): null `0x80410A11`, not
 
 This is the authorized coherent step-1 boundary, **not full B5 acceptance**.
 The following maps the B5-SCOPE §6 rows to exercised toolkit evidence.
-`NOT RUN` is not a pass; no fiber or Sync2 ABI cutover is included here.
+`NOT RUN` is not a pass; no fiber or Sync2 ABI cutover is included here (steps
+2-5 follow below).
 
 | §6 scenario | Status at this checkpoint |
 |---|---|
@@ -454,7 +455,79 @@ without suppressions or changes to runtime instrumentation.
 
 Generated coverage is now 8/16 imported NIDs (3 fiber, all 5 Sync2); total
 registrations remain 1154. UtilWorkerControl, kind 0, dispatch isolation,
-worker Shutdown and real-job C4 remain outside this checkpoint.
+worker Shutdown and real-job C4 remain outside this checkpoint (steps 3-5 are
+recorded next).
+
+### B5 steps 3-5 checkpoint: fibers, kind 0 and the producer property
+
+Final status of the B5-SCOPE §6 rows. Every test is synthetic (no game or
+firmware bytes); `jq2_fiber_*` run the real loader, the generated HLE table
+(`cellFiber`, `cellSync2`, `cellSpursJq`) and the executor with a synthetic SPU
+body, and order races by pause/admission hooks and guest state, never sleeps.
+
+| §6 scenario | Result | Evidence |
+|---|---|---|
+| Generated HLE imports / ABI | PASS 16/16 | `gen_hle_nids.py --all`: all 16 NIDs registered (1162 handlers); `fiber_switch_worker_*`, `sync2_semaphore_*` dispatch them |
+| Attribute/layout/error precedence | PASS | `fiber_switch_worker_attributes`, `sync2_semaphore_layout` |
+| Default worker lifecycle | PASS | `fiber_switch_worker_lifecycle` (two real PPU workers, exit hook, Shutdown/Finalize BUSY and STAT) |
+| Signal-before / wait-before / duplicate | PASS | `fiber_switch_worker_dispatch` (coalesced signal, yield, second fiber); `jq2_fiber_spurious` (stale signal ends WaitSignal early, Sync parks again) |
+| Actual kind0 Port2Sync | PASS | `jq2_fiber_kind0`: waiting bit, kind 0, `A=0x9FFFFFFF`, `+4` = fiber EA, bitmap words 0, second fiber ran while parked, credit wakes the first, output visible |
+| Fresh id0 allocator | PASS | `jq2_exec_waiter_fresh`; `jq2_fiber_mixed` (thread waiter between two fiber waiters: ids 0 leaked and 1) |
+| id63 / id64 | PASS | `jq2_exec_waiter_63`, `jq2_exec_stop_waiter_alloc` |
+| Bitmap contention/reservations | PASS | `jq2_exec_sync_concurrent` (event path); `jq2_fiber_race` and `_kind0` (fiber waiters take no bitmap bit) |
+| Stale +4 after wake | PASS | `jq2_fiber_kind0` (fiber EA kept), `jq2_fiber_mixed` (event id 1 kept, then the next fiber's EA) |
+| Queue Shutdown during blocked Sync | PASS | `jq2_fiber_shutdown`: queue Shutdown and port Destroy BUSY while the fiber is parked |
+| Worker Shutdown during blocked Sync/Acquire | PASS | `jq2_fiber_shutdown` (control Shutdown BUSY, port line, control word and fiber state unchanged, nothing signalled or credited; succeeds after completion) |
+| Count-N and signed counts | PASS, corrected | `sync2_semaphore_debt` / `_counts` (prefix reserved, GetCount 0 while blocked, Release pays the debt) |
+| Sync2 fiber consumer / C4 | PASS | `jq2_fiber_c4`: three shapes, ledger partial order and counts below |
+| Dispatch state isolation | PASS | `fiber_switch_worker_dispatch` (nested indirect calls, vcall storage, reservation, `g_active_ctx`, depth) and `tools/test_ppu_dispatch_depth.py` |
+| Unsupported/stops | PASS | `sync2_semaphore_config_*`, `fiber_switch_worker_attributes` (`fiber-unsupported`), `jq2_exec_stop_fiber_notify`, `jq2_fiber_stop_wait` (`reason=fiber-wait`) |
+
+**C4 as run (`jq2_fiber_c4`).** A producer fiber pushes jobs on alternating tags,
+calls the real mode-0 Sync, checks the job output, takes `GetCount`, and then
+`Release`s once per job. Consumer fibers `Acquire` once per job. The ledger stamps
+admit, body start, done, Sync return, release begin and each Acquire return;
+the test compares order and counts, not times:
+
+- per job: admit < start < done < Sync return < release;
+- the t-th successful Acquire (ticketed after it returns) follows the t-th release;
+  every Acquire sees the output of jobs `0..t`;
+- `GetCount` is never negative and never above the releases begun; it is 0 at the end;
+- dispatched = executed = credited = jobs pushed; no event-flag bit was taken.
+
+Shapes: (1) consumers parked first, and a job on tag 1 held in its admission
+hook while the tag-0 job completes and is credited, so the producer's Sync, the
+releases and the acquires all wait for the long job; (2) three releases before
+any Acquire; (3) three competing consumers, nine jobs, batches of three. The
+scope's "two tags with one unmasked long job" is shape 1; Port2Sync waits for
+every job pushed with `flags & 1`, not for a tag set, so the masked-tag
+barrier (`PushSync`) stays covered by `jq2_exec_barrier`.
+
+**Fail-before.** With `executor.cpp` at the step-3 baseline all eight new
+tests fail (`jq2_fiber_kind0`, `_spurious`, `_shutdown` and `_stop_wait` after
+their 20 s wait for the kind-0 state; `_mixed`, `_race`, `_c4` and
+`jq2_exec_stop_fiber_notify` at once). The baseline's fiber Sync registers an
+event-flag id and blocks its worker, and its kind-0 wake stops with
+`reason=fiber`.
+
+**Sanitizers.** Final dev selection 64/64; ASan/UBSan 60/60; TSan 55/55.
+ucontext switching is not annotated for TSan (`__tsan_switch_to_fiber` is not
+used): every fiber stays on one host thread, so TSan sees cross-thread access
+to guest state and the executor but not races between fibers of one worker, and
+its stack traces through a suspended fiber are unreliable. TSan flagged three
+host races that are fixed rather than suppressed: diagnostic statics in
+`ps3_indirect_call` (now thread-local), an unlocked `f->pattern` read in a
+`sys_event_flag_wait` log line, and the profiler's main-thread breadcrumb
+(`ppu_prof_stamp` now attributes a fiber's private context to its worker's
+slot and the breadcrumbs are relaxed atomics).
+
+**Deviations kept.** A fiber's registration is not rolled back on a refused
+`WaitSignal` (stop instead); nonfiber waiters keep the 1..63 event-id
+capacity and the stop on id64; custom Sync2 configs and optional fiber
+attribute fields stop (`sync2-semaphore-unsupported`, `fiber-unsupported`);
+CreateFiber wakes parked workers as Wakeup does [INFERENCE: the firmware's own
+wake path in creation is not decoded].
+
 
 ### How the port line is tested
 
@@ -531,15 +604,23 @@ halt, or a loader refusal is the named stop `jq2-job-end` and credits nothing.
 **Completion.** After the run: pool slot back (COPY), then `credit_completion()`
 on the port line, and the `Wakeup` it returns is performed: kind 2 with an id
 below 64 sets bit `id` of the queue's event flag `+0x80` (LV2 event flags
-through `sys_event_flag_*`); a fiber, another kind or an id of 64 or more is the
-named stop `jq2-wake` (`reason` `fiber`, `wait-kind`, `waiter-id`). Last, the
-scheduler's `complete()` releases barriers. A `Port2Sync` that has to wait
+through `sys_event_flag_*`); kind 0 signals the fiber whose EA the waiter word
+holds, through `ps3_fiber_notify` (the same guest state transition as
+`cellFiberPpuSendSignal`, so it works before or after the fiber reached
+`cellFiberPpuWaitSignal`); another kind, an id of 64 or more, or a fiber the
+library refuses (null, misaligned, unknown, finished) is the named stop
+`jq2-wake` (`reason` `wait-kind`, `waiter-id`, `fiber-notify` with the
+library's status). Last, the scheduler's `complete()` releases barriers. A
+`Port2Sync` that has to wait asks `cellFiberPpuSelf` only then: a fiber
+registers kind 0 with its own EA at `+0x04`, takes no bitmap bit and parks in
+`cellFiberPpuWaitSignal`, so its worker runs other fibers; a plain thread
 registers a guest-bitmap id (1..63; id0 leaks, and an attempted id64 stops with
 `jq2-wake reason=waiter-id`) and blocks on that bit with the firmware's wait
 (`AND | CLEAR`, no timeout). A wait that returns non-zero (the flag was
-destroyed) is `jq2-wake` `reason=wait` with the return code; it never loops.
-The second event flag (`+0x84`) is still created and destroyed, as the
-firmware does, but no waiter uses it.
+destroyed, or `WaitSignal` refused) is `jq2-wake` `reason=wait` / `fiber-wait`
+with the return code; it never loops. A stale signal ends `WaitSignal` early;
+`sync()` sees bit 31 still set and parks again. The second event flag (`+0x84`)
+is still created and destroyed, as the firmware does, but no waiter uses it.
 
 **Counters.** `jq2_queue_stats`: `pushed`, `dispatched`, `executed`,
 `credited`, `uncredited` (executed jobs pushed without `flags & 1`). `executed`

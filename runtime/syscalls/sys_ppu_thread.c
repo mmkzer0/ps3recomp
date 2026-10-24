@@ -275,41 +275,62 @@ uint64_t ppu_thread_register_main(void)
  * r9 = thread name pointer
  * -----------------------------------------------------------------------*/
 
-/* Profiler accessor: snapshot slot idx (0-based). Returns 1 if the slot holds
- * a live thread, filling tid/cia/name. Lets a host-side sampling profiler
- * iterate guest threads without depending on ppu_thread_info's layout. */
-static unsigned s_prof_main_pc = 0;   /* main guest thread: ctx lives outside the table */
+/* PC breadcrumbs are independent diagnostic samples, not publication of guest
+ * registers. Relaxed atomics suffice; Windows' Interlocked fallback supplies
+ * stronger full barriers without changing the shared thread-info layout. */
+static uint32_t prof_load(const uint32_t* pc)
+{
+#if defined(_MSC_VER) && !defined(__clang__)
+    return (uint32_t)InterlockedCompareExchange((volatile LONG*)pc, 0, 0);
+#else
+    return __atomic_load_n(pc, __ATOMIC_RELAXED);
+#endif
+}
+static void prof_store(uint32_t* pc, uint32_t value)
+{
+#if defined(_MSC_VER) && !defined(__clang__)
+    InterlockedExchange((volatile LONG*)pc, (LONG)value);
+#else
+    __atomic_store_n(pc, value, __ATOMIC_RELAXED);
+#endif
+}
+static uint32_t s_prof_main_pc;
 
+/* Slot metadata/name lifetime is unchanged. A missing PC is reported as zero,
+ * never sampled from a concurrently executing architectural context. */
 int ppu_prof_snapshot(int idx, unsigned* tid, unsigned* cia, const char** name)
 {
     if (idx < 0 || idx >= PPU_THREAD_MAX) return 0;
     ppu_thread_info* t = &g_ppu_threads[idx];
     if (idx == 0 && t->state == PPU_THREAD_STATE_FREE) {
-        /* slot 0 stays FREE (the main thread never registers) -- serve its
-         * dispatcher breadcrumb here so the profiler sees tid 1. */
-        *tid = 1; *cia = s_prof_main_pc; *name = "main";
-        return s_prof_main_pc != 0;
+        *tid = 1; *cia = prof_load(&s_prof_main_pc); *name = "main";
+        return *cia != 0;
     }
     if (t->state == PPU_THREAD_STATE_FREE) return 0;
-    *tid  = (unsigned)(idx + 1);
-    *cia  = t->prof_pc ? t->prof_pc : (unsigned)t->ctx.cia;
+    *tid = (unsigned)(idx + 1);
+    *cia = prof_load(&t->prof_pc);
     *name = t->name;
     return 1;
 }
 
-/* Called from the lv2/HLE dispatchers with the guest ctx (== &info->ctx). */
 void ppu_prof_stamp(void* vctx, unsigned lr)
 {
-    /* container-of: every dispatched ctx is embedded in its ppu_thread_info */
-    char* p = (char*)vctx - offsetof(ppu_thread_info, ctx);
-    ppu_thread_info* t = (ppu_thread_info*)p;
-    int in_range = (t >= g_ppu_threads && t < g_ppu_threads + PPU_THREAD_MAX);
-    if (!in_range) { s_prof_main_pc = lr; return; }
-    { static int _n = 0; if (PS3_LOG_FIRST(_n, 0))
-        fprintf(stderr, "[prof-stamp] ctx=%p base=%p in_range=%d lr=0x%X\n",
-                vctx, (void*)g_ppu_threads, in_range, lr); }
-    if (in_range)
-        t->prof_pc = lr;
+    /* A fiber has a private context, but executes as its owning PPU worker.
+     * Do not attribute every non-table context to one shared main-thread PC.
+     * Integer range/stride checks also avoid comparing unrelated C pointers. */
+    const uintptr_t candidate = (uintptr_t)vctx - offsetof(ppu_thread_info, ctx);
+    const uintptr_t base = (uintptr_t)g_ppu_threads;
+    ppu_thread_info* t = NULL;
+    if (candidate >= base && candidate - base < sizeof g_ppu_threads &&
+        (candidate - base) % sizeof(ppu_thread_info) == 0) {
+        t = (ppu_thread_info*)candidate;
+    } else if (vctx) {
+        const uint64_t id = ((ppu_context*)vctx)->thread_id;
+        if (id >= 1 && id <= PPU_THREAD_MAX && g_ppu_threads[id - 1].ctx.thread_id == id)
+            t = &g_ppu_threads[id - 1];
+    }
+    if (t) prof_store(&t->prof_pc, lr);
+    else prof_store(&s_prof_main_pc, lr);
 }
 
 int64_t sys_ppu_thread_create(ppu_context* ctx)
@@ -346,6 +367,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
     /* Set up the PPU context for the new thread */
     ppu_context_init(&t->ctx);
     t->ctx.cia = entry;
+    prof_store(&t->prof_pc, (uint32_t)entry);
     t->ctx.gpr[3] = arg;
     ppu_set_stack(&t->ctx, (uint64_t)stack_addr, (uint64_t)stack_size);
     /* Copy TOC from creating thread */

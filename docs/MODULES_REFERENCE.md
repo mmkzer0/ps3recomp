@@ -843,36 +843,81 @@ Producer-consumer pipeline framework for streaming data between PPU and SPU. Unl
 ### cellFiber
 
 **File:** `libs/spurs/cellFiber.c`
-**Purpose:** Cooperative multitasking (PPU fibers), the SDK's scheduler API
+**Purpose:** Cooperative PPU fibers and persistent UtilWorkerControl workers
 
-**Backend:**
-- Windows: `CreateFiberEx()` / `SwitchToFiber()` / `ConvertThreadToFiber()`
-- POSIX: `makecontext()` / `swapcontext()` (`ucontext_t`)
+- The eight UtilWorkerControl exports use guest EAs and firmware arities:
+  `_cellFiberPpuUtilWorkerControlAttributeInitialize(attr,sdk)`,
+  `InitializeWithAttribute(control,attr)`,
+  `CreateFiber(control,fiber,entry,u64Arg,priority,stack,size,attr)`,
+  `RunFibers(control)`, `Wakeup(control)`, `SendSignal(fiber,out)`,
+  `Shutdown(control)` and `Finalize(control)`.
+- The established scheduler API remains available: Initialize/FinalizeScheduler,
+  CreateFiber, RunFibers, WaitSignal/SendSignal, JoinFiber, Yield, Exit and Self.
+  Guest priority queues are FIFO within priorities 0..3. There is no invented
+  0x400-byte stack minimum in the common creation checks.
+- Fiber and scheduler attributes have their BE magic/SDK defaults; the worker
+  attribute is 0x180 bytes with SDK at +0x108. Optional settings/callback fields
+  beyond the supported defaults stop with `fiber-unsupported`, naming the
+  field, rather than being silently ignored.
+- Guest fiber state, priority queues and lifetime links are authoritative and
+  published through reservation transactions. Signal bit0x10 coalesces; a
+  signal waiter uses bit0x08; notification clears waiting and sets runnable
+  bit1 exactly once. All public and host notifications share this transition.
+- Worker RunFibers remains on the calling PPU thread until Shutdown, including
+  when every current fiber is blocked or finished. The control's LV2 event
+  flag at +0x208 wakes parked workers; the packed +0x200 word and +0x288
+  worker bitmap remain guest-visible. Wakeup never executes fibers in its
+  caller. Finalize returns STAT while active and BUSY while workers remain.
+- CreateFiber on a worker control notifies the parked workers as Wakeup does,
+  so a fiber created after RunFibers began is run. The firmware's creation
+  path (`02002494-24AC`) is not decoded far enough to name its own wake; the
+  notification is the minimum a persistent worker needs [INFERENCE].
+- JobQueue2 Port2Sync uses the same state: a fiber's blocking Sync registers
+  kind 0 with its own EA (`cellFiberPpuSelf`) and parks in
+  `cellFiberPpuWaitSignal`; the credit path calls `ps3_fiber_notify`, the
+  same transition as SendSignal. See `JQ2.md` for the port line.
+- Host mechanics: ucontext on POSIX and Windows fibers on Windows; each fiber
+  owns its native stack and `ppu_context`. After first dispatch, a context is
+  pinned to that worker to preserve native TLS references in suspended frames.
+  The executing worker supplies its guest thread identity and r13. Self reads
+  the current fiber EA at `r13 + tlsOffset + 0x20`.
+- Suspension preserves `g_active_ctx`, recursion depth and complete live vcall
+  storage. The loader's existing slot bridge exchanges a fiber-owned storage
+  pointer, so no live frame array is copied on each switch. Game-less hosts
+  return NULL slots only because no indirect dispatcher is linked; the
+  title-style worker fixture requires the loader's real non-NULL slots.
 
-**Features:**
-- `cellFiberPpuInitializeScheduler` / `FinalizeScheduler`, `CreateFiber(scheduler, fiber, entry, arg, priority, eaStack, sizeStack, attr)`
-- `RunFibers` runs the scheduler's fibers on the calling thread until every one has ended; lowest priority number
-  first, creation order among equals
-- `WaitSignal` / `SendSignal` (a signal sent early is kept; any host thread may send), `JoinFiber` (from a fiber or
-  from any thread), `Yield`, `Exit`, `Self`
-- Each fiber has its own guest stack (the caller's `eaStack`) and its own host stack and `ppu_context`; the entry runs
-  through the PPU thread trampoline
-- The SDK's error codes (`0x8076xxxx`) and structure sizes; the attribute contents are not modelled
-- Not implemented: the `cellFiberPpuUtil*` worker-control functions
-
-**Pre-landing RE for worker Shutdown (not implemented here):** pinned FW4.93
-libfiber SHA-256
+**Pinned RE:** FW4.93 libfiber SHA-256
 `3be3192ee20ea993ad28e498bf96d992373a2057c2ce0ca4323e6798ed183430`.
-Helper `02001768-17D0`, after NULL/alignment/initialized checks, writes
-`scheduler[+0xE8] != schedulerEA + 0xE8` to its byte output. Shutdown calls it
-at `020058F4` and returns BUSY on true (`02005914` / `02005964`).
-This is the scheduler's nonempty fiber-lifetime list, not runnable-count or
-sleeping-worker state: CreateFiber links `fiber+0x320` there at
-`0200246C-2490`; unlink helper `02001464-1488` is called at `02003164` and
-`0200385C`. A signal-blocked fiber is not evidence of an empty list.
-The initialization anchor's SDK-declared return type remains unproven by
-these firmware bytes; the existing no-argument no-op is not validated by
-this investigation and must be fenced/corrected in the fiber cutover.
+
+- `_cellFiberPpuInitialize(u64 anchor)` models the instruction-level ABI, not
+  an inferred SDK C declaration or a success code. `02003D18-3D28` computes
+  the full wrapped `anchor-r13` in r3 and stores its low word in the module's
+  TLS-offset slot (initially FFFFFFFF, the NOSYSINIT sentinel). The handler
+  reads r13 from the calling PPU context. The SDK wrapper's complete storage
+  allocation remains unproved; only established accessed spans are used.
+- Shutdown helper `02001768-17D0` reports whether
+  `scheduler[+0xE8] != schedulerEA+0xE8`; `020058F4` / `02005914` /
+  `02005964` turn that into BUSY. A blocked fiber keeps its lifetime node:
+  creation links `fiber+0x320` at `0200246C-2490`, and `02001464-1488`
+  unlinks it. Shutdown cannot cancel or fake completion for blocked work.
+  Generic Finalize likewise cannot discard pending stacks
+  (`02002864-286C`, `02002A5C-2A74`).
+- **Signal routing correction:** helper `02001954-1A2C` returns the scheduler
+  active-run byte and fiber ownership kind separately. Wrapper
+  `0200544C-54C0` tests **fiber+0x10==1**, not scheduler+0x40. Kind1 wakes the
+  control EA in the low word of fiber+0x18 and does not write the optional
+  output; ordinary output receives the scheduler's active-run byte.
+- RunFibers admission checks old worker count **>32**, not >=32. If the old
+  count is32 and all32 bitmap bits are occupied, HLE retains the attempted
+  count33 then stops with `fiber-unsupported field=worker-slot
+  reason=worker-capacity` instead of pretending that a 33rd event bit exists.
+
+`tests/fiber_switch` retains the scheduler regression and adds generated HLE
+imports with the real PPU indirect dispatcher: wrapped initializer results,
+attributes/error precedence, worker lifecycle, shared signals, nested
+dispatch state, resource/optional-field stops and guest bounds. These are
+synthetic toolkit fixtures, not firmware execution or title acceptance.
 
 ---
 

@@ -32,6 +32,7 @@
 #include "spu/spu_context.h"
 #include "spu/spu_interp.h"
 #include "spu/spu_workload.h"
+#include "cellFiber.h"
 #include "syscalls/sys_event.h"
 
 extern "C" {
@@ -885,17 +886,26 @@ void Queue::wake(const Wakeup& w, const JobStart& js)
         evf_set(flag_ids_[w.id >> 6], std::uint64_t{1} << (w.id & 63u));
         return;
     }
-    const bool fiber = w.kind == static_cast<std::uint32_t>(WaitKind::fiber);
+    if (w.kind == static_cast<std::uint32_t>(WaitKind::fiber)) {
+        /* The PM updates the fiber's state word directly (LS 0x0B28..0x0EBC); the
+         * same transition as SendSignal's, so the fiber wakes whether or not it
+         * has reached cellFiberPpuWaitSignal yet. */
+        const ps3_fiber_notify_status st = ps3_fiber_notify(w.id);
+        if (st == PS3_FIBER_NOTIFY_OK) return;
+        stop_with(PS3_STOP_JQ2_WAKE, "a registered Port2Sync fiber waiter cannot be signalled",
+                  "The port's waiter word is not a live fiber (null, misaligned, unknown, finished or never "
+                  "created); the line was written by something else, or the fiber was destroyed while waiting.",
+                  {hex("queue", ea_), hex("port", js.port_ea), dec("kind", w.kind), hex("fiber", w.id),
+                   text("reason", "fiber-notify"), dec("status", static_cast<std::uint32_t>(st))});
+    }
     stop_with(PS3_STOP_JQ2_WAKE, "a registered Port2Sync waiter cannot be woken",
-              fiber ? "The waiter is a fiber (wait kind 0); fibers are not modelled yet, so no HLE Port2Sync registers "
-                      "one. The port line was written by something else."
-              : event_flag ? "The firmware's PM wake rejects waiter ids above 63 (helper 0x6348), so it never wakes "
-                             "such a waiter; this executor registers ids 1..63 only. The port line was written by "
-                             "something else."
-                           : "The port line's wait kind is not one this executor registers; the line was written by "
-                             "something else.",
+              event_flag ? "The firmware's PM wake rejects waiter ids above 63 (helper 0x6348), so it never wakes "
+                           "such a waiter; this executor registers ids 1..63 only. The port line was written by "
+                           "something else."
+                         : "The port line's wait kind is not one this executor registers; the line was written by "
+                           "something else.",
               {hex("queue", ea_), hex("port", js.port_ea), dec("kind", w.kind), dec("id", w.id),
-               text("reason", fiber ? "fiber" : event_flag ? "waiter-id" : "wait-kind")});
+               text("reason", event_flag ? "waiter-id" : "wait-kind")});
 }
 
 /* ---- the registry ------------------------------------------------------- */
@@ -1069,12 +1079,39 @@ PushCheck check_push(std::uint32_t port, std::uint32_t descriptor, std::uint32_t
     return c;
 }
 
-/* Port2Sync's wait: one bit of the queue's event flags (executor.hpp). */
-struct EventFlagWait {
+/* Port2Sync's wait. A fiber registers itself (kind 0, +4 = its EA) and blocks in
+ * cellFiberPpuWaitSignal, so its worker keeps running other fibers; the credit
+ * path signals the fiber's own state word (Queue::wake). Anything else takes a
+ * bit of the queue's event flags (executor.hpp). Which one is decided only when
+ * the port needs a wait, as the firmware decides it (PPU 0x020030D4 reads Self
+ * before the registration; a poll or a completed Sync never asks). */
+struct PortWait {
     Queue& q;
-    Waiter acquire() { return {WaitKind::event_flag, q.acquire_waiter()}; }
-    void block(const Waiter& w) { q.block_on(w.id); }
-    void release(const Waiter& w) { q.release_waiter(w.id); }
+    Waiter acquire()
+    {
+        const auto self = static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(cellFiberPpuSelf()));
+        if (self != 0) return {WaitKind::fiber, self};
+        return {WaitKind::event_flag, q.acquire_waiter()};
+    }
+    void block(const Waiter& w)
+    {
+        if (w.kind == WaitKind::event_flag) {
+            q.block_on(w.id);
+            return;
+        }
+        /* The firmware treats any other return as an assertion (PPU 0x020032AC);
+         * a refused wait would otherwise loop in sync() with bit 31 still set. */
+        if (const std::int32_t rc = cellFiberPpuWaitSignal(); rc != 0) {
+            stop_with(PS3_STOP_JQ2_WAKE, "a blocked Port2Sync fiber's wait for its signal failed",
+                      "cellFiberPpuWaitSignal refused the wait; the fiber can never be woken.",
+                      {hex("queue", q.ea()), hex("fiber", w.id), text("reason", "fiber-wait"),
+                       hex("rc", static_cast<std::uint32_t>(rc))});
+        }
+    }
+    void release(const Waiter& w)
+    {
+        if (w.kind == WaitKind::event_flag) q.release_waiter(w.id);
+    }
 };
 
 }  // namespace
@@ -1340,7 +1377,7 @@ int32_t jq2_port_sync(uint32_t port, uint32_t mode)
     const PortRef ref = resolve_port(port);
     if (ref.error != JQ2_OK) return ref.error;
     std::optional<Port> p = bind_port(port);
-    EventFlagWait wait{*ref.queue};
+    PortWait wait{*ref.queue};
     return static_cast<std::int32_t>(p->sync(mode, wait));
 }
 

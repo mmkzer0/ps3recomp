@@ -45,9 +45,13 @@ uint64_t call(uint32_t nid, uint64_t a = 0, uint64_t b = 0, uint64_t c = 0, uint
     ppu_context& ctx = g_active_ctx ? local : g_ppu_threads[slot].ctx;
     ctx.gpr[1] = g_active_ctx ? g_active_ctx->gpr[1] : 0x40000 + 0x1000 * slot;
     ctx.thread_id = slot + 1;
+    ctx.gpr[13] = g_active_ctx ? g_active_ctx->gpr[13] : 0x3A00;
     ctx.gpr[3] = a; ctx.gpr[4] = b; ctx.gpr[5] = c; ctx.gpr[6] = d;
     ctx.gpr[7] = 0x77777777; ctx.gpr[10] = 0xAAAAAAAA;
+    auto* saved_active = g_active_ctx;
+    g_active_ctx = &ctx;
     ps3_hle_call(nid, &ctx);
+    g_active_ctx = saved_active;
     CHECK(ctx.gpr[7] == 0x77777777 && ctx.gpr[10] == 0xAAAAAAAA);
     return ctx.gpr[3];
 }
@@ -178,6 +182,10 @@ void fiber_entry(ppu_context* ctx)
 void fiber()
 {
     init(0);
+    ppu_context home{};
+    home.gpr[1] = 0x35000; home.gpr[13] = 0x3A00; home.thread_id = 1;
+    g_active_ctx = &home;
+    CHECK(call(0x55870804, 0x3B00) == 0x100);
     g_ppu_thread_entry_trampoline = fiber_entry;
     auto* s = reinterpret_cast<CellFiberPpuScheduler*>(0x4000);
     CHECK(cellFiberPpuInitializeScheduler(s, nullptr) == 0);
@@ -188,6 +196,7 @@ void fiber()
     }
     CHECK(cellFiberPpuRunFibers(s) == 0 && ledger == 2 && count() == 0);
     CHECK(cellFiberPpuFinalizeScheduler(s) == 0);
+    g_active_ctx = nullptr;
 }
 void stopped(const std::string& mode)
 {

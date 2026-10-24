@@ -3,10 +3,12 @@ find_package(Python3 3.10 COMPONENTS Interpreter REQUIRED)
 set(SYNC2_HLE_GEN "${CMAKE_CURRENT_BINARY_DIR}/ppu_hle_nids.cpp")
 add_custom_command(OUTPUT "${SYNC2_HLE_GEN}"
     COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/tools/gen_hle_nids.py"
-            cellSync2 --out "${SYNC2_HLE_GEN}"
+            cellSync2 cellFiber --out "${SYNC2_HLE_GEN}"
     DEPENDS "${PROJECT_SOURCE_DIR}/tools/gen_hle_nids.py"
             "${PROJECT_SOURCE_DIR}/libs/sync/cellSync2.c"
             "${PROJECT_SOURCE_DIR}/libs/sync/cellSync2.h"
+            "${PROJECT_SOURCE_DIR}/libs/spurs/cellFiber.c"
+            "${PROJECT_SOURCE_DIR}/libs/spurs/cellFiber.h"
     VERBATIM)
 add_executable(sync2_semaphore main.cpp
     host_stubs.c

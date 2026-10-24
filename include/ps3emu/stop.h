@@ -84,7 +84,8 @@ extern "C" {
     X(HLE_GUEST_RANGE,          "hle-guest-range")                             \
     /* C1: an HLE call before its module's init, firmware behaviour undefined. */ \
     X(HLE_UNINITIALIZED,        "hle-uninitialized")                           \
-    X(SYNC2_SEMAPHORE_UNSUPPORTED, "sync2-semaphore-unsupported")
+    X(SYNC2_SEMAPHORE_UNSUPPORTED, "sync2-semaphore-unsupported")            \
+    X(FIBER_UNSUPPORTED,        "fiber-unsupported")
 
 /* A fixed underlying type in C++ makes a kind outside the list (a caller's bug,
  * which the stop still reports as "invalid-kind") a well-defined value rather

@@ -1227,7 +1227,9 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
 #endif
         return (int64_t)(int32_t)CELL_ESRCH;
     }
-    { static _Thread_local int _a=0; if(PS3_LOG_FIRST(_a, 8)) fprintf(stderr,"[evt] flag_wait flag=%u ACTIVE, pattern=0x%llX awaiting bits=0x%llX -> BLOCK\n", flag_id,(unsigned long long)f->pattern,(unsigned long long)bitpat); }
+    /* No f->pattern here: it is guarded by f->lock and this diagnostic runs
+     * unlocked, so two first-time waiters would race a concurrent set. */
+    { static _Thread_local int _a=0; if(PS3_LOG_FIRST(_a, 8)) fprintf(stderr,"[evt] flag_wait flag=%u ACTIVE, awaiting bits=0x%llX -> BLOCK\n", flag_id,(unsigned long long)bitpat); }
 
     if (bitpat == 0)
         return (int64_t)(int32_t)CELL_EINVAL;

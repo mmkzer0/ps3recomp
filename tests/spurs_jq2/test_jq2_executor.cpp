@@ -1757,6 +1757,27 @@ void mode_stop_waiter_id()
         "jq2-wake", {"reason=waiter-id", "kind=2", "id=64"});
 }
 
+/* A credit finds a kind-0 waiter whose fiber EA names no fiber. The firmware's
+ * PM would write whatever guest bytes sit there; the executor signals only
+ * through the fiber library and stops when it refuses (status 3: not a live
+ * fiber), instead of reporting a wake that never happened. */
+void mode_stop_fiber_notify()
+{
+    expect_stop(
+        [] {
+            build_image(IMAGE, Prog::transform);
+            install_hooks();
+            arm_child_watchdog(5);
+            Rig rig({128, 1, false});
+            put32(PORT + 0x00, 0x9FFFFFFFu); /* waiting, kind 0, A - B = -1 once B is 1 */
+            put32(PORT + 0x04, 0x1000);      /* 128-aligned, no such fiber */
+            const JobSpec a = spec(0);
+            CHECK(rig.push(a.desc, 64, 0) == 0, "push");
+            std::this_thread::sleep_for(std::chrono::seconds(30));
+        },
+        "jq2-wake", {"reason=fiber-notify", "kind=0", "fiber=0x1000", "status=3"});
+}
+
 /* The attempted id64 allocation is published before the fail-closed stop. */
 void mode_stop_waiter_alloc()
 {
@@ -1881,6 +1902,7 @@ int main(int argc, char** argv)
     else if (mode == "stop-waiter-id") mode_stop_waiter_id();
     else if (mode == "stop-waiter-alloc") mode_stop_waiter_alloc();
     else if (mode == "stop-wait") mode_stop_wait();
+    else if (mode == "stop-fiber-notify") mode_stop_fiber_notify();
     else if (mode == "stop-push-shutdown") mode_stop_push_shutdown();
     else if (mode == "stop-copy-push-shutdown") mode_stop_copy_push_shutdown();
     else {
