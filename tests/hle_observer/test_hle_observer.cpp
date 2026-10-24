@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -72,7 +73,10 @@ void handler(ppu_context* c)
     c->gpr[3] = 0x80010001u + (c->gpr[3] & 0xFF);   // a return derived from the argument
 }
 
+/* The callbacks run on the calling guest thread, concurrently: the fields they record are the fixture's
+ * own shared state, so they are written under `mu` (the counters are atomic for the main thread's reads). */
 struct Seen {
+    std::mutex mu;
     std::atomic<int> calls{0}, returns{0};
     int call_at = -1, return_at = -1, handler_runs_at_call = -1, handler_runs_at_return = -1;
     uint32_t nid = 0, r3 = 0, r4 = 0, r10 = 0, ret = 0;
@@ -82,6 +86,7 @@ struct Seen {
 static void on_call(void* u, uint32_t nid, const ppu_context* c)
 {
     Seen* s = static_cast<Seen*>(u);
+    std::lock_guard<std::mutex> lk(s->mu);
     s->calls++;
     s->call_at = g_clock++;
     s->handler_runs_at_call = g_handler_runs;
@@ -92,6 +97,7 @@ static void on_return(void* u, uint32_t nid, const ppu_context* c)
 {
     Seen* s = static_cast<Seen*>(u);
     (void)nid;
+    std::lock_guard<std::mutex> lk(s->mu);
     s->returns++;
     s->return_at = g_clock++;
     s->handler_runs_at_return = g_handler_runs;
