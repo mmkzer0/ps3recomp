@@ -50,9 +50,10 @@
  * (+0x80): id n is bit n of it. The four BE32 guest bitmap words at
  * +0x88..+0x94 allocate MSB first through reservation-model transactions.
  * Id0 leaks on first allocation (the firmware's sentinel collision), leaving
- * ids 1..63 wakeable. The PM's wake helper (0x6348) rejects ids above 63, so
- * the 64th concurrent Sync publishes its attempted id64 allocation and stops
- * with `jq2-wake reason=waiter-id`, rather than waiting forever.
+ * ids 1..127 allocatable. If credit arrives before registration, the Sync takes
+ * the credit and frees the id without blocking. The PM's wake helper (0x6348)
+ * rejects unreduced ids above 63, so a credit trying to wake a registered
+ * waiter with id 64 or above stops with `jq2-wake reason=waiter-id`.
  *
  * A job in the scheduler's terms: one instance per worker with ONE job slot,
  * because a worker runs a job to completion before it examines the ring again

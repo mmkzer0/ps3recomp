@@ -75,10 +75,12 @@ constexpr std::uint32_t kFlagReaderPhase = 0x40;
 constexpr std::uint32_t kJoined = 0x20;
 
 constexpr std::uint32_t kMaxPorts = 0x400;
-/* The PPU allocator scans 128 bits, but the PM wake rejects ids above 63.
- * Zero collides with the PPU's "not allocated" sentinel and leaks on first
- * use; only ids 1..63 can be registered. Preserve attempted higher bits before
- * stopping rather than reproducing the firmware's uninterruptible wait. */
+/* The PPU allocator scans 128 bits (ids 1..127; id 0 collides with the sentinel
+ * and leaks); the PPU waits on bit id&63 of flag id>>6. The PM wake passes the
+ * unreduced id as the bit to sys_event_flag_set_bit_impatient (0x6348), which
+ * rejects bits above 63, so only ids 1..63 can wake. A registered waiter with
+ * id >= 64 stops at wake time, where the console drops the wake. */
+constexpr unsigned kWaiterBits = 128;
 constexpr unsigned kWaiterIds = 64;
 
 /* The port block's own words (the line's accounting words are port.hpp's). */
@@ -501,7 +503,7 @@ public:
     unsigned acquire_waiter()
     {
         for (;;) {
-            unsigned id = 128;
+            unsigned id = kWaiterBits;
             resv_host_rmw(ea_ + kQWaiterBitmap, [](std::uint8_t* line, void* user) {
                 auto& allocated = *static_cast<unsigned*>(user);
                 for (unsigned w = 0; w < 4; ++w) {
@@ -517,7 +519,7 @@ public:
                 return 0;
             }, &id);
             if (id == 0) continue; /* firmware retries without freeing the sentinel */
-            if (id < kWaiterIds) return id;
+            if (id < kWaiterBits) return id;
             std::array<std::uint32_t, 4> words{};
             resv_host_rmw(ea_ + kQWaiterBitmap, [](std::uint8_t* line, void* user) {
                 auto& words = *static_cast<std::array<std::uint32_t, 4>*>(user);
@@ -529,11 +531,11 @@ public:
             Kv bitmap{"bitmap", {}};
             std::snprintf(bitmap.value, sizeof bitmap.value, "0x%08X%08X%08X%08X",
                           words[0], words[1], words[2], words[3]);
-            stop_with(PS3_STOP_JQ2_WAKE, "a Port2Sync waiter id the firmware's wake cannot signal was needed",
-                      "Only ids 1..63 can wake. The guest bitmap retains the attempted allocation; "
-                      "the HLE stops instead of waiting forever or entering the firmware assertion loop.",
-                      {hex("queue", ea_), text("reason", id == 128 ? "waiter-exhausted" : "waiter-id"),
-                       dec("id", id), bitmap, text("fw", "pm-wake-rejects-id>63")});
+            stop_with(PS3_STOP_JQ2_WAKE, "all Port2Sync waiter ids are exhausted",
+                      "All 128 waiter bits are occupied; the firmware's allocator asserts here (0x02003178). "
+                      "The guest bitmap retains the state.",
+                      {hex("queue", ea_), text("reason", "waiter-exhausted"),
+                       dec("id", kWaiterBits), bitmap, text("fw", "ppu-alloc-asserts")});
         }
     }
     void release_waiter(unsigned id)
@@ -898,14 +900,17 @@ void Queue::wake(const Wakeup& w, const JobStart& js)
                   {hex("queue", ea_), hex("port", js.port_ea), dec("kind", w.kind), hex("fiber", w.id),
                    text("reason", "fiber-notify"), dec("status", static_cast<std::uint32_t>(st))});
     }
+    if (event_flag) {
+        stop_with(PS3_STOP_JQ2_WAKE, "a registered Port2Sync waiter cannot be woken",
+                  "The firmware's PM passes the unreduced waiter id as the bit to sys_event_flag_set_bit_impatient (0x6348), which rejects bits above 63; the PM discards the error, so the console's waiter never wakes. The PPU side waits on bit id&63 of flag id>>6 (built for 128 ids): a missing '& 63' in the PM.",
+                  {hex("queue", ea_), hex("port", js.port_ea), dec("kind", w.kind), dec("id", w.id),
+                   text("reason", "waiter-id"), text("fw", "pm-wake-rejects-id>63")});
+    }
     stop_with(PS3_STOP_JQ2_WAKE, "a registered Port2Sync waiter cannot be woken",
-              event_flag ? "The firmware's PM wake rejects waiter ids above 63 (helper 0x6348), so it never wakes "
-                           "such a waiter; this executor registers ids 1..63 only. The port line was written by "
-                           "something else."
-                         : "The port line's wait kind is not one this executor registers; the line was written by "
-                           "something else.",
+              "The port line's wait kind is not one this executor registers; the line was written by "
+              "something else.",
               {hex("queue", ea_), hex("port", js.port_ea), dec("kind", w.kind), dec("id", w.id),
-               text("reason", event_flag ? "waiter-id" : "wait-kind")});
+               text("reason", "wait-kind")});
 }
 
 /* ---- the registry ------------------------------------------------------- */

@@ -367,14 +367,27 @@ Guards a caller applies first (`check_port_ea`): null `0x80410A11`, not
   the PPU allocator (`0x02003128-0x02003174`). Id0 is allocated but collides
   with the "not allocated" sentinel (`0x02003360-0x02003368`): it leaks and
   allocation retries, registering id1 on a fresh queue. Release clears only
-  the nonzero allocated bit. Thus ids **1..63** are wakeable event identities.
-  The PM's wake (`0x0ED4` into helper `0x6348`) rejects unreduced ids above 63.
-  **Diagnostic deviation (firmware defect, KB m1r-027):** firmware silently
-  hangs on an unwakeable id. The HLE preserves the attempted id64 bitmap bit,
-  then stops with `jq2-wake reason=waiter-id`, `queue`, `id`, the four BE32
-  words concatenated as `bitmap=0x...`, and `fw=pm-wake-rejects-id>63`.
+  the nonzero allocated bit. The allocator hands out ids **1..127**.
+  After allocating, the PPU loop re-reads the port line (`0x020030E4`): if enough
+  credit has arrived meanwhile, it takes the credit, frees the id (`0x020031D4`)
+  and returns 0 without blocking. An id of 64 or above therefore does not hang
+  the console by itself. Otherwise it registers wait kind 2 with that id
+  (`0x02003360-0x0200337C`) and blocks in `sys_event_flag_wait(flag = queue+0x80+4*(id>>6), bits = 1ull << (id & 63), mode 0x11 AND|CLEAR)` (`0x020032F4-0x02003330`).
+  The PPU side is built correctly for all 128 ids.
+  The defect sits in the SPU PM wake (`0x0ED4` into helper `0x6348`): it selects
+  flag word `id >> 6`, but passes the unreduced id as the bit to
+  `sys_event_flag_set_bit_impatient` (`0x6348`), which rejects bits above 63;
+  the PM discards the error (a forgotten `& 63` in the PM).
+- **Diagnostic deviation (firmware defect, KB m1r-027):** firmware silently
+  hangs only when a credit tries to wake a registered kind-2 waiter with id 64
+  or above; the waiter stays blocked, through queue teardown too (the firmware's
+  destroy gets EBUSY and ignores it). The stop sits at the wake (`Queue::wake`),
+  not at allocation, because allocation alone does not hang the console.
+  A credit waking a waiter with id >= 64 stops with `jq2-wake reason=waiter-id`,
+  `queue`, `port`, `kind=2`, `id`, and `fw=pm-wake-rejects-id>63`.
   A bug-compatible fidelity mode is explicitly not provided.
-  Full 128-bit exhaustion stops with `reason=waiter-exhausted id=128`.
+  Full 128-bit exhaustion stops at allocation with `reason=waiter-exhausted id=128`
+  and `fw=ppu-alloc-asserts`, where the firmware's allocator asserts (`0x02003178`).
   Allocation/release invalidate neighboring PPU/SPU reservations and preserve
   unrelated words on the same line; no authoritative host bitset remains.
   Firmware leaves `+0x04` stale after wake and polling Sync, as does the HLE;
@@ -789,11 +802,14 @@ channel layer and LV2 event flags; labels `spurs;t0;tsan`:
 - `sync-concurrent`: four ports register distinct ids1..4 while PPU stwcx.
   and SPU GETLLAR/PUTLLC touch the same line; exact bitmap before/after,
   neighbor stores/guard preserved and each real job output visible.
-- `stop-waiter-id`, `stop-waiter-alloc`, `stop-wait`: forked children ending in
-  `jq2-wake` with exit 70: a credit that finds an event-flag waiter with id 64
-  (`reason=waiter-id`), attempted allocation of id64 (`reason=waiter-id`, its
-  bit at `+0x90` retained and no waiter registered or job executed), and
-  a blocked Sync whose event flag was destroyed (`reason=wait`, with `rc`).
+- `stop-waiter-id`, `waiter-64-nowake`, `stop-waiter-64-wake`, `stop-wait`: forked
+  children ending in `jq2-wake` with exit 70 (or returning 0 without stopping):
+  a credit that finds an event-flag waiter with id 64 (`reason=waiter-id`),
+  an allocation of id 64 where credit arrives before registration or Sync completes
+  without blocking (`waiter-64-nowake`: no stop, id 64 cleared, returns 0),
+  a 64th concurrent Sync that registers kind 2 with id 64 and blocks, then stops
+  on credit wake (`stop-waiter-64-wake`: `reason=waiter-id id=64`), and an
+  event-flag wait that fails with ESRCH (`stop-wait`: `reason=wait`, with `rc`).
 - `stop-push-shutdown`, `stop-copy-push-shutdown`: a push parked by the test seam
   `ExecutorHooks::on_push_checked` (called on the pushing thread after the
   checks and before the port-line update; null in production) while the port is

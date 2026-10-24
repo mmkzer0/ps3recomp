@@ -46,14 +46,18 @@
  *               once, each woken by its own credits
  *   stop-waiter-id   a credit finds an event-flag waiter with id 64: jq2-wake
  *               reason=waiter-id
- *   stop-waiter-alloc  a 64th concurrent blocked Sync: jq2-wake reason=waiter-id
- *   stop-wait   a blocked Sync whose event flag was destroyed: jq2-wake reason=wait
+ *   waiter-64-nowake id 64 allocated, credit arrives before registration or Sync
+ *               completes without blocking: no stop, id 64 cleared, returns 0
+ *   stop-waiter-64-wake 64th concurrent Sync registers kind 2 with id 64 and blocks,
+ *               a credit triggers jq2-wake reason=waiter-id id=64
+ *   stop-wait   an event-flag wait that fails (ESRCH, e.g. destroyed before wait): jq2-wake reason=wait
  *   stop-push-shutdown, stop-copy-push-shutdown  a push that passed its checks
  *               and reaches the ring after Shutdown: jq2-state
  *               reason=push-after-shutdown
  */
 #include "jq2/executor.hpp"
 #include "jq2/jq2.h"
+#include "jq2/port.hpp"
 
 #include "spu_context.h"
 #include "spu_helpers.h"
@@ -1786,12 +1790,79 @@ void mode_stop_fiber_notify()
         "jq2-wake", {"reason=fiber-notify", "kind=0", "fiber=0x1000", "status=3"});
 }
 
-/* The attempted id64 allocation is published before the fail-closed stop. */
-void mode_stop_waiter_alloc()
+/* Id 64 is allocated (63 concurrent blocked Syncs hold ids 1..63). Credit arrives
+ * before the Sync registers, so the Sync completes without blocking, releases
+ * id 64 and returns 0 without stopping. */
+struct NowakeWait {
+    std::uint32_t queue_ea;
+    std::uint32_t port_ea;
+    Waiter acquire()
+    {
+        unsigned id = 128;
+        resv_host_rmw(queue_ea + 0x88, [](std::uint8_t* line, void* user) {
+            auto& allocated = *static_cast<unsigned*>(user);
+            for (unsigned w = 0; w < 4; ++w) {
+                auto word = std::atomic_ref<std::uint32_t>(
+                    *reinterpret_cast<std::uint32_t*>(line + 8 + 4 * w));
+                const std::uint32_t bits = ps3_bswap32(word.load(std::memory_order_relaxed));
+                if (bits == UINT32_MAX) continue;
+                const unsigned bit = static_cast<unsigned>(__builtin_clz(~bits));
+                word.store(ps3_bswap32(bits | (0x80000000u >> bit)), std::memory_order_release);
+                allocated = 32 * w + bit;
+                return 1;
+            }
+            return 0;
+        }, &id);
+        GuestPortLine::at(port_ea)->update([](PortWords& w) {
+            w.credit_completion();
+            return true;
+        });
+        return {WaitKind::event_flag, id};
+    }
+    void block(const Waiter&) {}
+    void release(const Waiter& w)
+    {
+        struct Release { unsigned id; } release{w.id};
+        resv_host_rmw(queue_ea + 0x88, [](std::uint8_t* line, void* user) {
+            const unsigned id = static_cast<Release*>(user)->id;
+            auto word = std::atomic_ref<std::uint32_t>(
+                *reinterpret_cast<std::uint32_t*>(line + 8 + 4 * (id / 32)));
+            const std::uint32_t mask = 0x80000000u >> (id % 32);
+            word.fetch_and(ps3_bswap32(~mask), std::memory_order_release);
+            return 1;
+        }, &release);
+    }
+};
+
+void mode_waiter_64_nowake()
+{
+    build_image(IMAGE, Prog::transform);
+    install_hooks();
+    Rig rig({128, 1, false});
+    unsigned words = 2;
+    resv_host_rmw(QUEUE + 0x88, &occupy_waiters, &words);
+    const JobSpec s = spec(0);
+    CHECK(rig.push(s.desc, 64, 0) == 0, "push");
+    NowakeWait wait{QUEUE, PORT};
+    auto line = GuestPortLine::at(PORT);
+    CHECK(line.has_value(), "port line");
+    BasicPort port(*line);
+    const PortStatus st = port.sync(0, wait);
+    CHECK(st == PortStatus::ok, "Sync returned 0 without blocking (got 0x%X)", static_cast<unsigned>(st));
+    CHECK(get32(QUEUE + 0x88) == 0xFFFFFFFFu && get32(QUEUE + 0x8C) == 0xFFFFFFFFu &&
+              get32(QUEUE + 0x90) == 0 && get32(QUEUE + 0x94) == 0,
+          "id64 bit cleared again");
+    CHECK((port_a(PORT) & 0x80000000u) == 0, "waiter never registered");
+    rig.teardown();
+}
+
+/* The 64th concurrent Sync registers kind 2 with id 64 and blocks. A credit then
+ * triggers the stop jq2-wake reason=waiter-id id=64 because the firmware PM wake
+ * helper (0x6348) rejects unreduced ids > 63. */
+void mode_stop_waiter_64_wake()
 {
     expect_stop(
         [] {
-            constexpr unsigned kSyncs = 1;
             build_image(IMAGE, Prog::transform);
             install_hooks();
             arm_child_watchdog(5);
@@ -1799,23 +1870,21 @@ void mode_stop_waiter_alloc()
             CHECK(set_intake_paused(QUEUE, true), "pause");
             unsigned words = 2;
             resv_host_rmw(QUEUE + 0x88, &occupy_waiters, &words);
-            for (unsigned i = 0; i < kSyncs; ++i) {
-                const std::uint32_t port = PORT + 0x80 * i;
-                if (i != 0) CHECK(jq2_port_create(port, QUEUE) == 0, "port %u create", i);
-                const JobSpec s = spec(i);
-                CHECK(jq2_port_push_job(port, s.desc, 64, 0, 1) == 0, "push on port %u", i);
-            }
+            const JobSpec s = spec(0);
+            CHECK(jq2_port_push_job(PORT, s.desc, 64, 0, 1) == 0, "push");
             std::thread([] { jq2_port_sync(PORT, 0); }).detach();
+            CHECK(wait_for([] { return (port_a(PORT) & 0x80000000u) != 0; }), "registered");
+            CHECK(get32(PORT + 4) == 64, "registered id 64");
+            CHECK(set_intake_paused(QUEUE, false), "resume");
             wait_for([] { return false; }, 10000);
         },
-        "jq2-wake", {"reason=waiter-id", "queue=0x10000", "id=64",
-                     "bitmap=0xFFFFFFFFFFFFFFFF8000000000000000", "fw=\"pm-wake-rejects-id>63\""});
-    CHECK(get32(QUEUE + 0x88) == 0xFFFFFFFFu && get32(QUEUE + 0x8C) == 0xFFFFFFFFu &&
-              get32(QUEUE + 0x90) == 0x80000000u && get32(QUEUE + 0x94) == 0, "attempted id64 bit remains at stop");
-    CHECK((port_a(PORT) & 0x80000000u) == 0 && get32(OUT) == 0, "id64 never registered or executed");
+        "jq2-wake", {"reason=waiter-id", "kind=2", "id=64", "fw=\"pm-wake-rejects-id>63\""});
 }
 
-/* A destroyed event flag makes the blocked Sync's wait fail. */
+/* Under lv2 semantics, sys_event_flag_destroy returns CELL_EBUSY if threads are
+ * waiting, so a flag cannot be destroyed while a Sync is blocked on it.
+ * The HLE stop reason=wait is reached when the wait returns an error such as
+ * CELL_ESRCH (here, the flag was destroyed before the wait began). */
 void mode_stop_wait()
 {
     expect_stop(
@@ -1908,7 +1977,8 @@ int main(int argc, char** argv)
     else if (mode == "waiter-fresh") mode_waiter_fresh();
     else if (mode == "waiter-63") mode_waiter_63();
     else if (mode == "stop-waiter-id") mode_stop_waiter_id();
-    else if (mode == "stop-waiter-alloc") mode_stop_waiter_alloc();
+    else if (mode == "waiter-64-nowake") mode_waiter_64_nowake();
+    else if (mode == "stop-waiter-64-wake") mode_stop_waiter_64_wake();
     else if (mode == "stop-wait") mode_stop_wait();
     else if (mode == "stop-fiber-notify") mode_stop_fiber_notify();
     else if (mode == "stop-push-shutdown") mode_stop_push_shutdown();
