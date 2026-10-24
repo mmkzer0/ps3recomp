@@ -588,6 +588,11 @@ if(PS3RECOMP_BUILD_TESTS)
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_loader_gaps.py")
         set_tests_properties(hle_unresolved loader_gaps PROPERTIES LABELS "ppu;t0" TIMEOUT 300)
+        # ppu_load_elf sets the SDK version syscall 25 reports from the ELF's PROC_PARAM.
+        add_test(NAME proc_param_sdk_version
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_proc_param.py")
+        set_tests_properties(proc_param_sdk_version PROPERTIES LABELS "ppu;t0" TIMEOUT 300)
         add_test(NAME game_patchcheck
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_game_patchcheck.py")

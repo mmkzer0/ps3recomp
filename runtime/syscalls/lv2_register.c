@@ -2303,9 +2303,7 @@ static int64_t sys_process_get_sdk_version_handler(ppu_context* ctx)
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EFAULT;
         return (int64_t)(int32_t)CELL_EFAULT;
     }
-    const char* override = getenv("PS3_SDK_VERSION");
-    uint32_t version = override && *override ? (uint32_t)strtoul(override, NULL, 0) : g_ps3_sdk_version;
-    vm_write_be32(version_ea, version);
+    vm_write_be32(version_ea, ps3_process_sdk_version());
     ctx->gpr[3] = 0;
     return 0;
 }

@@ -989,6 +989,10 @@ extern "C" void ppu_guard_page(uint32_t guest_ea) { (void)guest_ea; }
  * rather than dying. */
 extern "C" uint32_t ppu_vm_size = 0;
 
+/* The SDK version sys_process_get_sdk_version reports; ppu_load_elf sets it from PROC_PARAM.
+ * Defined in runtime/syscalls/sdk_version_weak.c. */
+extern "C" uint32_t g_ps3_sdk_version;
+
 /* PT_TLS template (captured by ppu_load_elf) + the main thread's TLS image.
  * PPC64 ELF TLS: r13 (thread pointer) = image_base + 0x7000. The image sits in
  * the free window just below the mmapper region (0x11000000) and above any
@@ -3158,6 +3162,24 @@ extern "C" uint32_t ppu_load_elf(const char* path)
             g_tls_memsz  = (uint32_t)be64(ph + 40);
             fprintf(stderr, "[ppu] PT_TLS template vaddr=0x%08X filesz=0x%X memsz=0x%X\n",
                     g_tls_vaddr, g_tls_filesz, g_tls_memsz);
+            continue;
+        }
+        if (p_type == 0x60000001u /*PT_PROC_PARAM*/) {
+            /* sys_process_param_t: {u32 size, u32 magic 0x13BCC5F6, u32 version, u32 sdk_version,
+             * ...}. sdk_version is the SDK the title was built with, and it is what
+             * sys_process_get_sdk_version (lv2 syscall 25) must answer: libresc sizes its buffers
+             * from it, libsre picks feature sets by it. A title with no such segment keeps the
+             * runtime's default (runtime/syscalls/sdk_version_weak.c). */
+            const uint64_t po = be64(ph + 8), pf = be64(ph + 32);
+            if (po <= fsz && pf <= fsz && po + pf <= fsz && pf >= 0x10 &&
+                be32(file + po + 4) == 0x13BCC5F6u) {
+                g_ps3_sdk_version = be32(file + po + 12);
+                fprintf(stderr, "[ppu] PROC_PARAM sdk_version 0x%08X\n", g_ps3_sdk_version);
+            } else {
+                fprintf(stderr, "[ppu] PROC_PARAM segment %u is malformed (offset 0x%llX size 0x%llX), "
+                        "keeping the default SDK version 0x%08X\n", i, (unsigned long long)po,
+                        (unsigned long long)pf, g_ps3_sdk_version);
+            }
             continue;
         }
         if (p_type != 1 /*PT_LOAD*/) continue;

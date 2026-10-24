@@ -1,9 +1,9 @@
 /* Default for the SDK version sys_process_get_sdk_version reports.
  *
- * The real number comes out of the title: a loader reads
+ * The real number comes out of the title: ppu_load_elf reads
  * sys_process_param_t.sdk_version from the ELF's PROC_PARAM segment and assigns
- * it before running any guest code. A port that does that defines this variable
- * itself, and every other port still needs the symbol to LINK.
+ * it before running any guest code. A port with its own loader may define this
+ * variable itself, and every other build still needs the symbol to LINK.
  *
  * Separate one-symbol TU on purpose: a port that ships its own definition
  * resolves the reference from its own object and this archive member is never
