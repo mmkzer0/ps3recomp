@@ -66,6 +66,7 @@ Ids are stable kebab-case; a new gap gets a new kind, never a free-text variant.
 | `jq2-state` | a JobQueue2 executor invariant broke: a finished job was not in flight in the scheduler, a ring entry named a port EA that is not a port block, the ring writer refused an entry the front end had validated, a port's queue slot was not allocated, a worker thread could not be started, or a push passed its checks while Shutdown ran and reached the ring after the workers were told to leave (`reason=push-after-shutdown`) |
 | `jq2-jm-call` | a JobQueue2 job called jm interface word 0 (`0x1500`, the policy module's scheduler switch: "yield this Execute slot to the manager with a request"). No Odin Sphere job image does; the HLE executor runs one job per worker and has no manager to switch to. The job is neither executed nor credited |
 | `hle-guest-range` | an HLE handler was given a guest EA or span that is not inside guest memory: `ea` crosses `limit`, or `ea + size` wraps. Fields: `func`, `arg`, `ea`, `size`, `limit` |
+| `hle-uninitialized` | an HLE function was called before its module's init, where the firmware's behaviour is undefined (it dereferences state the init builds), so no return value is faithful. Fields: `func`, `module`, `reason` |
 
 Where each is raised, and what it carries beyond `pc lr tid`:
 
@@ -93,6 +94,7 @@ Where each is raised, and what it carries beyond `pc lr tid`:
 | `jq2-state` | the executor | `queue` plus the facts of the broken invariant (`dispatch`, `port`, `slot`, `error encode`, `workers`; `port reason=push-after-shutdown` from the enqueue path, shared by plain, copy and sync pushes) |
 | `jq2-jm-call` | `libs/spurs/jq2/executor.cpp` (`require_normal_return`) | `queue job port tag worker request lr status`, with `request` the job's r3 at the call (the request word) and `lr` the caller's link register (also the `lr` of the machine line); `pc` is the stop word's address, `0x1500` |
 | `hle-guest-range` | `ps3_stop_guest_range` | `func arg ea size limit` |
+| `hle-uninitialized` | `ps3_stop_hle_uninitialized` | `func module reason` |
 
 Lifted code does not track a guest pc, so for the first four `pc` is the caller's
 return address (the import stub's caller, the `sc` site, the call site). Only

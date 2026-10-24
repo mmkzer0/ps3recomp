@@ -67,6 +67,7 @@ HOST_HELPERS = set("""
     cellMouse_wheelEvent
     cellMsgDialog_tick
     cellPad_poll
+    cellResc_convert_register_count
     cellRtcGetTime_t
     cellRtcSetTime_t
     cellSaveData_register_ctx_handlers

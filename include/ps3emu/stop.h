@@ -81,7 +81,9 @@ extern "C" {
     X(JQ2_WAKE,                 "jq2-wake")                                    \
     X(JQ2_STATE,                "jq2-state")                                   \
     X(JQ2_JM_CALL,              "jq2-jm-call")                                 \
-    X(HLE_GUEST_RANGE,          "hle-guest-range")
+    X(HLE_GUEST_RANGE,          "hle-guest-range")                             \
+    /* C1: an HLE call before its module's init, firmware behaviour undefined. */ \
+    X(HLE_UNINITIALIZED,        "hle-uninitialized")
 
 /* A fixed underlying type in C++ makes a kind outside the list (a caller's bug,
  * which the stop still reports as "invalid-kind") a well-defined value rather
@@ -142,6 +144,13 @@ PS3_NORETURN void ps3_stop(ps3_stop_kind kind, const char* what,
  * Fields: func, arg, ea, size, limit. */
 PS3_NORETURN void ps3_stop_guest_range(const char* func, const char* arg,
                                        uint64_t ea, uint64_t size, uint64_t limit);
+
+/* Generic helper to raise PS3_STOP_HLE_UNINITIALIZED: an HLE call made before
+ * its module's init, where the firmware's behaviour is undefined (it reads or
+ * writes state its init has not built), so no return value is faithful.
+ * Fields: func, module, reason. */
+PS3_NORETURN void ps3_stop_hle_uninitialized(const char* func, const char* module,
+                                             const char* reason);
 
 /* ---- frontier ---------------------------------------------------------- */
 

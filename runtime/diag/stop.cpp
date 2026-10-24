@@ -249,4 +249,17 @@ void ps3_stop_guest_range(const char* func, const char* arg,
              f, sizeof f / sizeof f[0], nullptr);
 }
 
+void ps3_stop_hle_uninitialized(const char* func, const char* module, const char* reason)
+{
+    const ps3_stop_field f[] = {
+        {"func", func ? func : "unknown"},
+        {"module", module ? module : "unknown"},
+        {"reason", reason ? reason : "unknown"},
+    };
+    ps3_stop(PS3_STOP_HLE_UNINITIALIZED,
+             "an HLE function was called before its module was initialised and the firmware's behaviour there is undefined",
+             "Fix the caller to initialise the module first, or implement the firmware's behaviour for this call.",
+             f, sizeof f / sizeof f[0], nullptr);
+}
+
 } // extern "C"

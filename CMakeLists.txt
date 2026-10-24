@@ -464,6 +464,8 @@ if(PS3RECOMP_BUILD_TESTS)
     # each report DMA context. Links the runtime like the POSIX host below.
     if(UNIX)
         add_subdirectory(tests/gcm_reports)
+        # cellResc error numbering and the VideoOut resolution-id mapper.
+        add_subdirectory(tests/resc)
     endif()
     # The startup gates (typed config, identity, VSCR policy) and the named stop
     # they end in: probe executables run per scenario by Python runners.

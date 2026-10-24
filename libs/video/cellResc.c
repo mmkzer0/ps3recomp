@@ -7,6 +7,7 @@
  */
 
 #include "cellResc.h"
+#include "ps3emu/stop.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: translate + byte-swap */
 #include "ps3emu/guest_call.h"   /* ps3_invoke_guest: handlers are guest OPDs */
 #include <stdio.h>
@@ -35,6 +36,20 @@ static float s_aspect_h = 1.0f;
 static float s_aspect_v = 1.0f;
 static float s_pal_ratio = 0.5f;
 
+/* The library's four convert fragment programs, one per (PAL interpolate mode,
+ * interlace) case. Firmware 02003A2C..02003B10 loads them into the library
+ * object at +0xDC, +0xE0, +0xE4 and +0xE8 from embedded Cg binaries; +0xFC
+ * points at the current one, and cellRescSetRegisterCount patches the register
+ * count byte of that program's header (blob header + 0x12, 02008B3C).
+ *
+ * The defaults are the byte at +0x12 of each embedded fragment program's header
+ * (profile 0x1B5C, 7004): 2, 3, 4, 4. The counts live in the library's data,
+ * not in the per-Init state, so they are not reset by cellRescInit/Exit
+ * [INFERENCE: the blobs are patched in place; nothing reloads them]. */
+enum { RESC_PROG_DC, RESC_PROG_E0, RESC_PROG_E4, RESC_PROG_E8, RESC_PROG_COUNT };
+static u8 s_prog_regcount[RESC_PROG_COUNT] = {2, 3, 4, 4};
+static int s_cur_prog = RESC_PROG_DC;
+
 /* ---------------------------------------------------------------------------
  * API implementations
  * -----------------------------------------------------------------------*/
@@ -49,7 +64,22 @@ s32 cellRescInit(const CellRescInitConfig* initConfig)
     if (!initConfig)
         return (s32)CELL_RESC_ERROR_BAD_ARGUMENT;
 
-    s_config = *GUEST_PTR(initConfig, const CellRescInitConfig*);
+    /* Decoded to host order, as the firmware does (memset 28 bytes, then copy
+     * `size` bytes into the library object): fields past `size` stay 0. */
+    {
+        const u32 ea = (u32)(uintptr_t)initConfig;
+        u32 f[7] = {0};
+        const u32 size = vm_read32(ea);
+        for (u32 i = 0; i < 7 && i * 4 < size; i++)
+            f[i] = vm_read32(ea + i * 4);
+        s_config.size = f[0];
+        s_config.resourcePolicy = f[1];
+        s_config.supportModes = f[2];
+        s_config.ratioMode = f[3];
+        s_config.palTemporalMode = f[4];
+        s_config.interlaceMode = f[5];
+        s_config.flipMode = f[6];
+    }
     memset(s_src, 0, sizeof(s_src));
     memset(s_dsts, 0, sizeof(s_dsts));
     s_flip_handler_opd = 0;
@@ -59,6 +89,7 @@ s32 cellRescInit(const CellRescInitConfig* initConfig)
     s_last_flip_time = 0;
     s_aspect_h = 1.0f;
     s_aspect_v = 1.0f;
+    s_cur_prog = RESC_PROG_DC;   /* 02003A2C: +0xFC = +0xDC */
     s_initialized = 1;
     return CELL_OK;
 }
@@ -69,6 +100,15 @@ void cellRescExit(void)
     s_initialized = 0;
 }
 
+/* Firmware 02004774. In order: not initialised -> NOT_INITIALIZED; a mode
+ * outside the config's supportModes, or not one of 1/2/4/8 -> BAD_ARGUMENT;
+ * the mode is stored (+0xD0); for 720x576 a PAL temporal mode that the flip
+ * mode forbids -> BAD_COMBINATION (PAL_60_DROP .. _DROP_FLEXIBLE with flipMode
+ * 1, or palTemporalMode 5 with flipMode 0). Then the convert program is
+ * picked (02004900..02004A28): 720x576 with PAL_60_INTERPOLATE..._FLEXIBLE
+ * uses E8 when interlaceMode is 1 and E0 otherwise; every other case E4 when
+ * interlaceMode is 1 and DC otherwise. The rest of the firmware function
+ * programs the RSX through cellGcm and is not modelled here. */
 s32 cellRescSetDisplayMode(u32 displayMode)
 {
     printf("[cellResc] SetDisplayMode(0x%x)\n", displayMode);
@@ -76,28 +116,164 @@ s32 cellRescSetDisplayMode(u32 displayMode)
     if (!s_initialized)
         return (s32)CELL_RESC_ERROR_NOT_INITIALIZED;
 
+    if ((displayMode & s_config.supportModes) == 0)
+        return (s32)CELL_RESC_ERROR_BAD_ARGUMENT;
+    if (displayMode != CELL_RESC_720x480 && displayMode != CELL_RESC_720x576 &&
+        displayMode != CELL_RESC_1280x720 && displayMode != CELL_RESC_1920x1080)
+        return (s32)CELL_RESC_ERROR_BAD_ARGUMENT;
+
     s_display_mode = displayMode;
+
+    const u32 pal = s_config.palTemporalMode;
+    if (displayMode == CELL_RESC_720x576) {
+        if (pal - 2u <= 2u || pal == CELL_RESC_PAL_60_DROP) {
+            if (s_config.flipMode == 1)
+                return (s32)CELL_RESC_ERROR_BAD_COMBINATION;
+        } else if (pal == 5) {
+            if (s_config.flipMode == 0)
+                return (s32)CELL_RESC_ERROR_BAD_COMBINATION;
+        }
+    }
+
+    const int interlaced = (s_config.interlaceMode == 1);
+    if (displayMode == CELL_RESC_720x576 && pal - 2u <= 2u)
+        s_cur_prog = interlaced ? RESC_PROG_E8 : RESC_PROG_E0;
+    else
+        s_cur_prog = interlaced ? RESC_PROG_E4 : RESC_PROG_DC;
     return CELL_OK;
 }
 
-s32 cellRescGetNumColorBuffers(u32 displayMode, u32 palTemporalMode, u32* numBufs)
+/* Firmware 020003A4 (void): patches the register count byte of the current
+ * convert fragment program (02008B3C). Before cellRescInit, and after Exit
+ * (02003B3C clears +0xFC), the firmware dereferences a NULL program pointer, so
+ * there is no faithful result: named stop. */
+void cellRescSetRegisterCount(u8 regCount)
 {
-    (void)displayMode;
+    if (!s_initialized)
+        ps3_stop_hle_uninitialized("cellRescSetRegisterCount", "cellResc",
+                                   "the firmware reads the current program through the library object's +0xFC pointer, which only cellRescInit sets");
+    s_prog_regcount[s_cur_prog] = regCount;
+}
 
-    if (!numBufs)
+/* Firmware 020003D8: the register count byte of the current convert fragment
+ * program (02008AD8), zero-extended into an s32. Same stop before Init. */
+s32 cellRescGetRegisterCount(void)
+{
+    if (!s_initialized)
+        ps3_stop_hle_uninitialized("cellRescGetRegisterCount", "cellResc",
+                                   "the firmware reads the current program through the library object's +0xFC pointer, which only cellRescInit sets");
+    return (s32)s_prog_regcount[s_cur_prog];
+}
+
+/* Host accessor for the convert-and-flip emission: the register count the
+ * current convert fragment program carries, 0 while uninitialised. Not a
+ * firmware export (the `cellResc_` shape keeps it out of the NID table). */
+u32 cellResc_convert_register_count(void)
+{
+    return s_initialized ? s_prog_regcount[s_cur_prog] : 0;
+}
+
+/* Returns the number of colour buffers (the count is the return value, not an
+ * out-parameter). Firmware 02000194: no initialisation check; a non-zero
+ * `reserved` is BAD_ARGUMENT; only the 720x576 destination mode depends on the
+ * PAL temporal mode (DROP -> 3, INTERPOLATE / _30_DROP / _FLEXIBLE -> 6),
+ * every other destination gets 2. */
+s32 cellRescGetNumColorBuffers(u32 dstMode, u32 palTemporalMode, u32 reserved)
+{
+    if (reserved != 0)
         return (s32)CELL_RESC_ERROR_BAD_ARGUMENT;
 
-    /* PAL interpolation modes need extra buffers */
+    if (dstMode != CELL_RESC_720x576)
+        return 2;
+
     switch (palTemporalMode) {
     case CELL_RESC_PAL_60_INTERPOLATE:
     case CELL_RESC_PAL_60_INTERPOLATE_30_DROP:
     case CELL_RESC_PAL_60_INTERPOLATE_DROP_FLEXIBLE:
-        vm_write32((uint32_t)(uintptr_t)numBufs, 6);
-        break;
+        return 6;
+    case CELL_RESC_PAL_60_DROP:
+        return 3;
     default:
-        vm_write32((uint32_t)(uintptr_t)numBufs, 2);
-        break;
+        return 2;
     }
+}
+
+/* Firmware 02000278 -> 0200089C: NULL output -> BAD_ARGUMENT; the VideoOut
+ * resolution ids 1 (1080), 2 (720), 4 (480), 5 (576) map to the RESC buffer
+ * modes 8, 4, 1, 2; every other id (3 included) is BAD_ARGUMENT with the output
+ * untouched. No initialisation check: titles call this before cellRescInit. */
+s32 cellRescVideoOutResolutionId2RescBufferMode(u32 resolutionId, u32* bufferMode)
+{
+    if (!bufferMode)
+        return (s32)CELL_RESC_ERROR_BAD_ARGUMENT;
+
+    u32 mode;
+    switch (resolutionId) {
+    case 1: mode = CELL_RESC_1920x1080; break;
+    case 2: mode = CELL_RESC_1280x720;  break;
+    case 4: mode = CELL_RESC_720x480;   break;
+    case 5: mode = CELL_RESC_720x576;   break;
+    default:
+        return (s32)CELL_RESC_ERROR_BAD_ARGUMENT;
+    }
+    vm_write32((uint32_t)(uintptr_t)bufferMode, mode);
+    return CELL_OK;
+}
+
+/* Firmware 020002B0 -> 02003EF0. Offsets into the guest CellGcmSurface
+ * (type@0 antialias@1 colorFormat@2 colorOffset[4]@8 colorPitch[4]@0x18
+ * width@0x34 height@0x36) and the 16-byte CellRescSrc it fills
+ * (format@0 pitch@4 width@8 height@0xA offset@0xC).
+ *
+ * No initialisation check. Either pointer NULL -> BAD_ARGUMENT. The format is
+ * the NV4097 texture format byte of colour target 0 (A8R8G8B8 0x85,
+ * F_W16Z16Y16X16 0x9A, +0x20 for a pitch-layout surface; 02007D3C), 0xFF for
+ * any other surface format or layout. width/height are the surface's, scaled
+ * for the anti-aliasing mode only when the init config's `size` is 24 or 28:
+ * antialias 3 -> 2x1, 4 and 5 -> 2x2, everything else 1x1. */
+#define GCM_SURFACE_TYPE_PITCH   1
+#define GCM_SURFACE_TYPE_SWIZZLE 2
+
+static u32 resc_surface_texture_format(u32 color_format, u32 type)
+{
+    u32 base;
+    if (color_format == 8)
+        base = 0x85;
+    else if (color_format == 11)
+        base = 0x9A;
+    else
+        return 0xFF;
+    if (type == GCM_SURFACE_TYPE_PITCH)
+        return base | 0x20;
+    if (type == GCM_SURFACE_TYPE_SWIZZLE)
+        return base;
+    return 0xFF;
+}
+
+s32 cellRescGcmSurface2RescSrc(const void* gcmSurface, void* rescSrc)
+{
+    if (!gcmSurface || !rescSrc)
+        return (s32)CELL_RESC_ERROR_BAD_ARGUMENT;
+
+    const u32 sf = (u32)(uintptr_t)gcmSurface;
+    const u32 dst = (u32)(uintptr_t)rescSrc;
+
+    u32 mul_w = 1, mul_h = 1;
+    if (s_config.size == 24 || s_config.size == 28) {
+        const u32 aa = vm_read8(sf + 1);
+        if (aa == 3) {
+            mul_w = 2;
+        } else if (aa >= 4 && aa <= 5) {
+            mul_w = 2;
+            mul_h = 2;
+        }
+    }
+
+    vm_write32(dst + 0, resc_surface_texture_format(vm_read8(sf + 2), vm_read8(sf + 0)));
+    vm_write32(dst + 4, vm_read32(sf + 0x18));
+    vm_write16(dst + 8, (uint16_t)(mul_w * vm_read16(sf + 0x34)));
+    vm_write16(dst + 10, (uint16_t)(mul_h * vm_read16(sf + 0x36)));
+    vm_write32(dst + 12, vm_read32(sf + 8));
     return CELL_OK;
 }
 
