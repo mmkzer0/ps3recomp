@@ -1440,8 +1440,8 @@ uint8_t  vm_read8 (uint64_t a) { if (vm_oob((uint32_t)a,1)) return 0; vm_hotmap(
     ppu_rwatch_hit((uint32_t)a, 1, __builtin_return_address(0));
     { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
       if ((uint32_t)a==last) { if (++n==200000) {
-          fprintf(stderr, "[HOTREAD8] spinning on 0x%08X val=0x%02X tid=%lu guest-fn=0x%08X\n",
-                  (uint32_t)a, vm_base[(uint32_t)a], GetCurrentThreadId(),
+          fprintf(stderr, "[HOTREAD8] spinning on 0x%08X val=0x%02X tid=%u guest-fn=0x%08X\n",
+                  (uint32_t)a, vm_base[(uint32_t)a], (unsigned)GetCurrentThreadId(),
                   ppu_prof_resolve_host(__builtin_return_address(0)));
           n=0; } }
       else { last=(uint32_t)a; n=0; } }

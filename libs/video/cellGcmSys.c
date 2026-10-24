@@ -2837,8 +2837,8 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
     static int s_recdbg = -1;
     if (s_recdbg < 0) s_recdbg = getenv("GCM_RECDBG") ? 1 : 0;
     if (s_recdbg)
-        fprintf(stderr, "[REC>] tid=%lu begin=%08X cur=%08X put=%08X get=%08X drained=%08X\n",
-                GetCurrentThreadId(), begin, current,
+        fprintf(stderr, "[REC>] tid=%u begin=%08X cur=%08X put=%08X get=%08X drained=%08X\n",
+                (unsigned)GetCurrentThreadId(), begin, current,
                 vm_read32(GCM_CONTROL_GUEST_ADDR + 0),
                 vm_read32(GCM_CONTROL_GUEST_ADDR + 4),
                 g_gcm_fifo_drained_ea);
@@ -2895,8 +2895,8 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
     s_fifo_recycle_waiting = 0;                          /* current no longer reads end */
 
     if (s_recdbg)
-        fprintf(stderr, "[REC<] tid=%lu cur-now=%08X put=%08X get=%08X drained=%08X spins=%d\n",
-                GetCurrentThreadId(), vm_read32(ctx_ea + 0x8),
+        fprintf(stderr, "[REC<] tid=%u cur-now=%08X put=%08X get=%08X drained=%08X spins=%d\n",
+                (unsigned)GetCurrentThreadId(), vm_read32(ctx_ea + 0x8),
                 vm_read32(GCM_CONTROL_GUEST_ADDR + 0),
                 vm_read32(GCM_CONTROL_GUEST_ADDR + 4),
                 g_gcm_fifo_drained_ea, spins);
@@ -3733,10 +3733,10 @@ u32 cellGcmResolveLocated(int local, u32 offset)
 /* NID: 0xF80196C1 */
 u32* cellGcmGetLabelAddress(u8 index)
 {
-    if (index >= CELL_GCM_MAX_LABEL_COUNT) {
-        printf("[cellGcmSys] WARNING: GetLabelAddress index %u out of range\n", index);
-        return NULL;
-    }
+    /* Every u8 index names a label: the RSX label area is 256 entries
+     * (CELL_GCM_MAX_LABEL_COUNT) and the firmware's parameter is u8, so the
+     * type already bounds the index. The old `index >= 256` test could never
+     * be true. */
     { static int n = 0; if (n++ < 32)   /* TEMP */
         fprintf(stderr, "[cellGcmSys] GetLabelAddress(0x%X) -> 0x%08X\n", index,
                 GCM_LABEL_GUEST_BASE + (u32)index * GCM_LABEL_STRIDE); }
