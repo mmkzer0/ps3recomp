@@ -302,7 +302,10 @@ std::unique_ptr<DescriptorPool> DescriptorPool::create(const PoolConfig& config,
         error = PoolError::null_pointer;
         return nullptr;
     }
-    if (((config.queue_ea | config.pool_ea | config.pool_attr_ea) & 0x7Fu) != 0) {
+    /* The firmware aligns the queue and pool EAs only; the pool attribute is
+     * read as eight u32 counts at whatever EA it has (CreateCommon
+     * 0x020004E8..0x02000530 never tests r30). */
+    if (((config.queue_ea | config.pool_ea) & 0x7Fu) != 0) {
         error = PoolError::align;
         return nullptr;
     }

@@ -367,8 +367,8 @@ static void create_12_args(Guest& g, uint32_t spurs, uint32_t queue, uint32_t ri
     CHECK_EQ(g.call(0x983BE7FCu, 2, 0x330000, spurs, queue, attr, 0, pool_attr, name, ring, 8, 1, 0), A02);
     CHECK_EQ(g.call(0x983BE7FCu, 2, 0x330000, spurs, queue, attr, pool + 64, pool_attr, name, ring, 8, 1, 0),
              A10);
-    CHECK_EQ(g.call(0x983BE7FCu, 2, 0x330000, spurs, queue, attr, pool, pool_attr + 64, name, ring, 8, 1, 0),
-             A10);
+    /* No pool-attribute alignment check: the firmware has none (CreateCommon
+     * 0x020004E8..0x02000530); jq2_exec_validate covers a 16-aligned one. */
 
     /* Success. Args 9..12 (command buffer, depth, workers, extra) are the
      * save-area parameters. */

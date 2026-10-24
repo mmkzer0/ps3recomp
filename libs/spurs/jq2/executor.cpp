@@ -1167,7 +1167,11 @@ int32_t jq2_queue_create(uint32_t revision, uint32_t sdk_version, uint32_t spurs
     const std::uint32_t max_descriptor = ld32(attr + 0x08);
     if (classes < 1 || classes > 16 || max_descriptor < 256 || max_descriptor > 0x3FF || !aligned(max_descriptor, 128))
         return JQ2_ERR_INVAL;
-    if (pool != 0 && (!aligned(pool, 128) || !aligned(pool_attr, 128))) return JQ2_ERR_ALIGN;
+    /* CreateCommon (libspurs_jq 0x020004E8..0x02000530) checks 128-byte
+     * alignment of the SPURS, queue, command-ring and pool EAs only; the pool
+     * attribute (r9 -> r30) is never alignment-checked. Odin passes a
+     * 16-byte-aligned stack poolAttr, which the firmware accepts. */
+    if (pool != 0 && !aligned(pool, 128)) return JQ2_ERR_ALIGN;
     /* Beyond the firmware's checks: a ring of no entries, or no worker to run
      * it, can never make progress. */
     if (command_depth == 0 || worker_count == 0) return JQ2_ERR_INVAL;

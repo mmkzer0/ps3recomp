@@ -1092,6 +1092,14 @@ void mode_validate()
     CHECK(create(SPURS, QUEUE, ATTR, POOL, 0, RING, 128, 2) == IN_, "pool without attr");
     CHECK(create(SPURS, QUEUE, ATTR, 0, POOL_ATTR, RING, 128, 2) == IN_, "attr without pool");
     CHECK(create(SPURS, QUEUE, ATTR, POOL + 16, POOL_ATTR, RING, 128, 2) == AL, "pool alignment");
+    /* The firmware never aligns poolAttr: a 16-byte-aligned stack attribute
+     * must create the queue (it returned ALIGN here before). */
+    put32(POOL_ATTR + 16 + 0x08, 1); /* class 2: one block, like POOL_ATTR */
+    CHECK(create(SPURS, QUEUE, ATTR, POOL, POOL_ATTR + 16, RING, 128, 2) == 0, "16-aligned pool attribute");
+    {
+        std::uint32_t exit_value = 0;
+        CHECK(jq2_queue_shutdown(QUEUE) == 0 && jq2_queue_join(QUEUE, &exit_value) == 0, "teardown");
+    }
     CHECK(create(SPURS, QUEUE, ATTR, 0, 0, RING, 0x8001, 2) == IN_, "depth over 0x8000");
     CHECK(create(SPURS, QUEUE, ATTR, 0, 0, RING, 0, 2) == IN_, "depth 0");
     CHECK(create(SPURS, QUEUE, ATTR, 0, 0, RING, 128, 9) == IN_, "9 workers");

@@ -116,8 +116,9 @@ confirms the image: `q+0x608/0x628/0x648` = 0x37649380/0x3764B380/0x3764B380,
 `q+0x660/0x664` = 0x37649380/0x3764B380, and the first block's link = base+0x100
 after the one observed pop (jq2c-019, JQ-CLOSURE-STATIC D.4).
 
-`create` rejects a null queue/pool/poolAttr EA (A11), a non-128-byte-aligned EA
-(A10), a count above the u16 record field, or a layout that would run past the
+`create` rejects a null queue/pool/poolAttr EA (A11), a queue or pool EA that is
+not 128-byte aligned (A10; the pool attribute has no alignment check, CreateCommon
+`0x020004E8..0x02000530`), a count above the u16 record field, or a layout that would run past the
 32-bit guest address space (A02). A pool with all counts zero is valid (every
 class unconfigured) and behaves like the firmware: Acquire returns A11.
 
