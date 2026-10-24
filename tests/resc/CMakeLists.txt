@@ -100,3 +100,24 @@ target_include_directories(test_resc_convert PRIVATE
 set_target_properties(test_resc_convert PROPERTIES LINKER_LANGUAGE CXX)
 add_test(NAME resc_convert COMMAND test_resc_convert)
 set_tests_properties(resc_convert PROPERTIES LABELS "resc;gcm;t0")
+
+# cellRescSetWaitFlip (libresc 0x020045E8): the 4-word ACQUIRE group on the flip-done label (0x10, or
+# 18 << 4 for 720x576 with a PAL temporal mode), its reservation, and the walker side: held at the ACQUIRE
+# until the vblank after the flip head completes the flip, presentable meanwhile, and a flip nobody
+# completes is the gcm-wait-timeout stop.
+add_executable(test_resc_waitflip
+    test_waitflip.c
+    "${PROJECT_SOURCE_DIR}/runtime/host/host_stubs.c"
+)
+target_link_libraries(test_resc_waitflip PRIVATE ps3recomp_runtime)
+if(NOT WIN32)
+    target_link_libraries(test_resc_waitflip PRIVATE m)
+endif()
+target_include_directories(test_resc_waitflip PRIVATE
+    "${PROJECT_SOURCE_DIR}/libs/video"
+    "${PROJECT_SOURCE_DIR}/include"
+    "${PROJECT_SOURCE_DIR}/runtime"
+)
+set_target_properties(test_resc_waitflip PROPERTIES LINKER_LANGUAGE CXX)
+add_test(NAME resc_waitflip COMMAND test_resc_waitflip)
+set_tests_properties(resc_waitflip PROPERTIES LABELS "resc;gcm;t0")

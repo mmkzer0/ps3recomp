@@ -115,6 +115,8 @@ s32 cellRescSetSrc(s32 index, const CellRescSrc* src);
 s32 cellRescSetDsts(u32 displayMode, const CellRescDsts* dsts);
 s32 cellRescGcmSurface2RescSrc(const void* gcmSurface, void* rescSrc);
 s32 cellRescSetConvertAndFlip(void* context, s32 index);
+/* NID 0x0D3C22CE. SDK `void`; the firmware leaves the context (or 0 after a buffer-full callback) in r3. */
+s32 cellRescSetWaitFlip(void* context);
 
 s32 cellRescSetFlipHandler(void (*handler)(u32));
 s32 cellRescSetVBlankHandler(void (*handler)(u32));
