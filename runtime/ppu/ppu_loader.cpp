@@ -1316,6 +1316,32 @@ extern "C" void resv_keep_own(ppu_context* ctx, uint32_t ea);
         }                                                                     \
     } while (0)
 
+/* A device model's window of guest memory in which a guest store has to be ordered after what the device
+ * has already been handed. libs/video/cellGcmSys.c registers the RSX's semaphore labels: the RSX is a host
+ * thread there, and a store the title makes to a label has to land after the walker has read every command
+ * the title published before it (the console's RSX does, within microseconds of the `put` store; the host
+ * thread may be descheduled for milliseconds). The hook runs on the storing thread, before the store lands,
+ * and only for 32-bit stores through vm_write32 -- the lifted program's own stores. libs/ HLE code stores
+ * through the inline family in ppu_memory.h and never comes here. With no window registered the check is
+ * one subtract and compare. */
+static std::atomic<uint64_t> g_store_hook_window{0};                      /* lo | len << 32; len 0 = none */
+static std::atomic<void (*)(uint32_t ea, uint32_t value)> g_store_hook_fn{nullptr};
+
+extern "C" void ppu_set_store_hook(uint32_t lo, uint32_t len, void (*fn)(uint32_t ea, uint32_t value))
+{
+    g_store_hook_fn.store(fn, std::memory_order_release);
+    g_store_hook_window.store(fn ? ((uint64_t)len << 32) | lo : 0, std::memory_order_release);
+}
+
+static inline void ppu_store_hook(uint32_t a, uint32_t v)
+{
+    const uint64_t w = g_store_hook_window.load(std::memory_order_acquire);
+    if ((uint32_t)(a - (uint32_t)w) < (uint32_t)(w >> 32)) {
+        const auto fn = g_store_hook_fn.load(std::memory_order_acquire);
+        if (fn) fn(a, v);
+    }
+}
+
 extern "C" {
 /* PPU_RWATCH=<hex>[,len] -- see the note in vm_read8. */
 static inline void ppu_rwatch_hit(uint32_t a, int width, void* ra)
@@ -1871,6 +1897,7 @@ void vm_write8 (uint64_t a, uint8_t  v) { barrier_watch_hit((uint32_t)a, v, 1, _
 void vm_write16(uint64_t a, uint16_t v) { barrier_watch_hit((uint32_t)a, v, 2, __builtin_return_address(0)); if (vm_oob((uint32_t)a,2) || vm_null_store((uint32_t)a, v, 2, __builtin_return_address(0))) return;
     v = __builtin_bswap16(v); VM_WRITE_COH(a, &v, 2); }
 void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, __builtin_return_address(0)); if (vm_oob((uint32_t)a,4) || vm_null_store((uint32_t)a, v, 4, __builtin_return_address(0))) return;
+    ppu_store_hook((uint32_t)a, v);
 #ifdef _WIN32
     /* PT restore: a full-word store of a valid pointer (high byte set) to a
      * previously-truncated slot clears the record (that truncation was transient). */

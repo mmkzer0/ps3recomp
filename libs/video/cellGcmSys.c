@@ -1861,6 +1861,71 @@ static void gcm_ref_publish_one(void)
 static SRWLOCK s_gcm_fifo_lock = SRWLOCK_INIT;
 static void gcm_rsx_process_fifo_unlocked(void);
 
+/* ---- guest stores to a label are ordered after the walker ------------------------------------------------
+ *
+ * A title that syncs the PPU and the RSX through a label queues a NV406E ACQUIRE for the label's next value
+ * (one per frame: value N, then N+1, ...), kicks the command segment, and overwrites the label with the next
+ * value as soon as it builds the next frame. The ACQUIRE compares for equality (the PFIFO puller, and RPCS3's
+ * nv406e::semaphore_acquire `while (sema != arg)`), so the RSX has to read the kicked ACQUIRE before the
+ * title's next store to that label, or it waits for N for ever. Nothing in the guest orders the two: no
+ * second label, no get/put handshake, no flip status sits between the kick and the store. The console orders
+ * them by speed -- the RSX fetches the kick within microseconds, the PPU needs a frame's worth of code to
+ * reach the store [INFERENCE: no console trace; the guest's protocol relies on it]. The walker here is a host
+ * thread that polls, and one that a loaded host leaves off the CPU for a few milliseconds loses: on a host
+ * running other builds (load average 6-13 on 12 cores) a title's next label store came 5.27 ms after its kick
+ * and the walker read the kick 13 us after that store; a 15-minute unloaded soak ended with the same
+ * signature at 785 s [INFERENCE: the same cause, one scheduling hiccup in ~47,000 frames].
+ *
+ * So a 32-bit store by guest code into the label window waits, before it lands, for one complete walker pass
+ * that began after the store was reached (the pass reads `put` afresh): the RSX has by then read everything
+ * the guest had published, and evaluated every ACQUIRE among it against the label's old value. This is the
+ * console's ordering with an RSX that is never late; an ACQUIRE the RSX is held in front of (the flip wait,
+ * say) is still missed by a store, as on the console, and still ends in gcm-wait-timeout. Nothing to wait
+ * for -- `get` already at `put` -- costs two reads. The walker threads (any thread that ran a pass) never
+ * wait: they cannot wait for themselves, and guest code a pass calls (a flip handler) may store a label.
+ * `gcm.wait_timeout_ms` bounds the wait; a walker that never runs a pass is a host fault and a named stop.
+ *
+ * runtime/ppu/ppu_loader.cpp (compiled per game, not part of the runtime library) calls the hook from its
+ * vm_write32 and defines ppu_set_store_hook; the first pass registers the label window. A link without the
+ * loader (a host, a fixture) gets the default below, which registers nothing: there is no guest code to
+ * order. */
+#if defined(_MSC_VER)
+#define GCM_TLS __declspec(thread)
+void ppu_set_store_hook(u32 lo, u32 len, void (*fn)(u32 ea, u32 value));
+void ppu_set_store_hook_default(u32 lo, u32 len, void (*fn)(u32 ea, u32 value)) { (void)lo; (void)len; (void)fn; }
+#pragma comment(linker, "/alternatename:ppu_set_store_hook=ppu_set_store_hook_default")
+#else
+#define GCM_TLS _Thread_local
+__attribute__((weak)) void ppu_set_store_hook(u32 lo, u32 len, void (*fn)(u32 ea, u32 value))
+{ (void)lo; (void)len; (void)fn; }
+#endif
+
+static atomic_ullong s_pass_begin, s_pass_end;   /* walker passes started / finished; bumped under s_gcm_fifo_lock */
+static GCM_TLS int   t_gcm_walker;               /* this thread has run a pass */
+
+static void gcm_guest_label_store(u32 ea, u32 value)
+{
+    extern unsigned long long ps3_ms_now(void);
+    if (t_gcm_walker) return;
+    if (vm_read32(GCM_CONTROL_GUEST_ADDR + 0) == vm_read32(GCM_CONTROL_GUEST_ADDR + 4)) return;
+    /* The next pass to begin: it takes the lock after this load, so it reads a `put` this thread has published. */
+    const unsigned long long target = atomic_load(&s_pass_begin) + 1u;
+    const unsigned long long t0 = ps3_ms_now();
+    /* Yield first (the walker is normally a pass away), then sleep; bounded like the segment-switch wait below. */
+    for (unsigned spin = 0; atomic_load(&s_pass_end) < target; spin++) {
+        const unsigned long long waited = ps3_ms_now() - t0;
+        if (waited >= ps3_cfg_gcm_wait_timeout_ms())
+            ps3_stop_gcm_wait_timeout("cellGcm_label_store", "rsx-walker-pass", ea - GCM_LABEL_GUEST_BASE, value,
+                                      vm_read32(ea), (u32)waited);
+        Sleep(spin < 64u ? 0u : 1u);
+    }
+}
+
+static void gcm_register_label_store_hook(void)
+{
+    ppu_set_store_hook(GCM_LABEL_GUEST_BASE, CELL_GCM_MAX_LABEL_COUNT * GCM_LABEL_STRIDE, gcm_guest_label_store);
+}
+
 /* Kick event: a game thread whose fence wait finds the queue DRY signals the
  * present thread to run the FIFO walker NOW instead of on its next 16 ms
  * tick. A movie frame issues ~46 one-ahead cellGcmFinish waits; paying a
@@ -1923,9 +1988,12 @@ static uint64_t s_ft_sema_t0;          /* PS3_FTRACE: when the walker began wait
 
 void cellGcm_rsx_process_fifo(void)
 {
+    t_gcm_walker = 1;
     const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
     AcquireSRWLockExclusive(&s_gcm_fifo_lock);
+    atomic_fetch_add(&s_pass_begin, 1);
     gcm_rsx_process_fifo_unlocked();
+    atomic_fetch_add(&s_pass_end, 1);
     ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
     if (ft_t0) {
         const uint64_t t1 = ps3_ft_now();
@@ -1967,7 +2035,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * that does read the context (the ring-recycle heuristic) is separately guarded
      * by s_gcm_ctx_out_ea, which stays 0 on that path. */
     if (!s_gcm_context_ea && !s_gcm_syscall_mode) return;
-    if (!s_inited) { rsx_state_init(&s_state); s_inited = 1; }
+    if (!s_inited) { rsx_state_init(&s_state); s_inited = 1; gcm_register_label_store_hook(); }
 
     /* Walk the FIFO exactly like the RSX: chase the guest-written `put` (an IO
      * offset in the control register), decoding method headers and following

@@ -94,8 +94,9 @@ PS3_CFG_U32(spu, dma_repeat_stop_secs, 0, 0, 86400,
 
 PS3_CFG_U32(gcm, wait_timeout_ms, 10000, 1, 3600000,
     "How long, in milliseconds, an RSX wait may stand unsatisfied before the run stops with kind "
-    "gcm-wait-timeout: a NV406E semaphore acquire whose label never reaches the value, or the "
-    "command-context buffer-full callback waiting for the RSX to leave the next segment. The "
+    "gcm-wait-timeout: a NV406E semaphore acquire whose label never reaches the value, the "
+    "command-context buffer-full callback waiting for the RSX to leave the next segment, or a guest "
+    "store to a label waiting for the RSX walker's next pass. The "
     "hardware waits forever; a wait that expires here means the agent that should end it (an SPU "
     "job writing a label, the driver, the walker) never ran. A host watchdog, not PS3 behaviour.")
 
