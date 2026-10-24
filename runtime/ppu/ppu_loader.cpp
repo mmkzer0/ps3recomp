@@ -2333,9 +2333,9 @@ extern "C" void ps3_indirect_call_to(ppu_context* ctx, uint32_t target)
 
 extern "C" void ps3_indirect_call(ppu_context* ctx)
 {
-    static int on = -1;
+    static PPU_THREAD_LOCAL int on = -1;
     if (on < 0) on = getenv("PPU_CSCHECK") ? 1 : 0;
-    { static int hg = -1; if (hg < 0) hg = getenv("PS3_ICALL_GATE") ? 1 : 0;
+    { static PPU_THREAD_LOCAL int hg = -1; if (hg < 0) hg = getenv("PS3_ICALL_GATE") ? 1 : 0;
       if (hg) { const uint32_t tgt = (uint32_t)ctx->ctr; icall_hist(ctx, tgt, 0);
                 ps3_indirect_call_impl(ctx); icall_hist(ctx, tgt, 1); return; } }
     if (!on) { ps3_indirect_call_impl(ctx); return; }
@@ -2344,7 +2344,7 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
     for (int r = 14; r < 32; r++) save[r - 13] = ctx->gpr[r];
     ps3_indirect_call_impl(ctx);
     if (ctx->gpr[1] != save[0] || memcmp(&ctx->gpr[14], &save[1], 18 * sizeof(uint64_t))) {
-        static uint32_t seen[256]; static unsigned n;
+        static PPU_THREAD_LOCAL uint32_t seen[256]; static PPU_THREAD_LOCAL unsigned n;
         for (unsigned i = 0; i < n; i++) if (seen[i] == tgt) return;
         if (n < 256) seen[n++] = tgt;
         char buf[400]; int p = snprintf(buf, sizeof buf, "[cscheck] target 0x%08X changed:", tgt);
@@ -2432,18 +2432,18 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
      * the disassembly, because nothing calls it with a `bl`. Diffing this ring
      * between the last frame a title drew and the first it did not is the only
      * way to see which way the dispatch went. */
-    { static int on = -1;
+    { static PPU_THREAD_LOCAL int on = -1;
       if (on < 0) on = getenv("BCTRL_RING") ? 1 : 0;
       if (on) {
           unsigned t = (unsigned)ctx->thread_id & 15;
           g_bctrl_ring[t][g_bctrl_pos[t] & (BCTRL_RING_N - 1)] = (uint32_t)ctx->ctr;
           g_bctrl_pos[t]++;
       } }
-    { static int bc=-2; if(bc==-2) bc=getenv("PS3_BREADCRUMB")?1:0;
+    { static PPU_THREAD_LOCAL int bc=-2; if(bc==-2) bc=getenv("PS3_BREADCRUMB")?1:0;
       if(bc){ unsigned t=(unsigned)ctx->thread_id & 63; g_bc_last[t]=(uint32_t)ctx->ctr; g_bc_cnt[t]++; } }
 #ifdef _WIN32
-    { static int64_t tw=-2; if(tw==-2){const char*e=getenv("PPU_TOCWATCH"); tw=e?(int64_t)strtoul(e,0,16):-1;}
-      if(tw>=0 && (uint32_t)ctx->gpr[2]==(uint32_t)tw){ static int _n=0; if(PS3_LOG_FIRST(_n, 4)){
+    { static PPU_THREAD_LOCAL int64_t tw=-2; if(tw==-2){const char*e=getenv("PPU_TOCWATCH"); tw=e?(int64_t)strtoul(e,0,16):-1;}
+      if(tw>=0 && (uint32_t)ctx->gpr[2]==(uint32_t)tw){ static PPU_THREAD_LOCAL int _n=0; if(PS3_LOG_FIRST(_n, 4)){
         char* mb=(char*)GetModuleHandleA(0); void* bt[24]; unsigned short fr=RtlCaptureStackBackTrace(0,24,bt,0);
         char ln[800]; int p=snprintf(ln,sizeof ln,"[TOCWATCH] r2=0x%08X ctr=0x%08X bt:",(uint32_t)ctx->gpr[2],(uint32_t)ctx->ctr);
         for(int i=0;i<fr;i++) p+=snprintf(ln+p,sizeof(ln)-p," %llX",(unsigned long long)((char*)bt[i]-mb));
@@ -2454,11 +2454,11 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
     /* PS3_CALLTRACE=N: log the first N indirect calls (target + r3/r4) --
      * generic visibility into vtable/callback dispatch (e.g. which job body a
      * JobManager worker runs). */
-    { static int64_t ctr_n=-2; if(ctr_n==-2){const char*e=getenv("PS3_CALLTRACE"); ctr_n=e?atoi(e):0;}
+    { static PPU_THREAD_LOCAL int64_t ctr_n=-2; if(ctr_n==-2){const char*e=getenv("PS3_CALLTRACE"); ctr_n=e?atoi(e):0;}
       /* PS3_CALLTRACE_LR=<hex>: only calls returning to this guest address.
        * An unfiltered trace is far too heavy to reach a late failure -- it
        * changes the timing enough that the run never gets there. */
-      static int64_t only_lr = -2;
+      static PPU_THREAD_LOCAL int64_t only_lr = -2;
       if (only_lr == -2) { const char* e = getenv("PS3_CALLTRACE_LR");
                            only_lr = e ? (int64_t)strtoul(e, 0, 16) : -1; }
       /* PS3_CALLTRACE_R5=<n>: only calls with this selector in r5. Some lifted
@@ -2470,11 +2470,11 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
        * when neither lr nor an argument is distinctive. */
       /* PS3_CALLTRACE_TO=<hex>: only calls whose TARGET is this address --
        * the way to catch an entry point that has no direct callers. */
-      static int64_t only_to = -2;
+      static PPU_THREAD_LOCAL int64_t only_to = -2;
       if (only_to == -2) { const char* e = getenv("PS3_CALLTRACE_TO");
                            only_to = e ? (int64_t)strtoul(e, 0, 16) : -1; }
       if (only_to >= 0 && addr != (uint32_t)only_to) goto skip_calltrace;
-      static int64_t only_from = -2;
+      static PPU_THREAD_LOCAL int64_t only_from = -2;
       if (only_from == -2) { const char* e = getenv("PS3_CALLTRACE_FROM");
                              only_from = e ? (int64_t)strtoul(e, 0, 16) : -1; }
       char cf[64];
@@ -2483,7 +2483,7 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
           char want[32]; snprintf(want, sizeof want, "func_%08X", (uint32_t)only_from);
           if (strncmp(cf, want, strlen(want)) != 0) goto skip_calltrace;
       }
-      static int64_t only_r5 = -2;
+      static PPU_THREAD_LOCAL int64_t only_r5 = -2;
       if (only_r5 == -2) { const char* e = getenv("PS3_CALLTRACE_R5");
                            only_r5 = e ? strtol(e, 0, 0) : -1; }
       if (only_r5 >= 0 && (int64_t)(int32_t)ctx->gpr[5] != only_r5) { /* skip */ } else
@@ -2568,13 +2568,13 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
          * engine never establishes a screen render-target config.
          *
          * Off by default: a genuinely-null pointer stops. */
-        {   static int _rec = -1;
+        {   static PPU_THREAD_LOCAL int _rec = -1;
             if (_rec < 0) { const char* e = getenv("PPU_OPD_RECOVER"); _rec = e ? 1 : 0; }
             uint32_t _opd = (uint32_t)ctx->gpr[12];
             if (_rec && _opd && vm_base) {
                 uint32_t _c = __builtin_bswap32(*(volatile uint32_t*)(vm_base + _opd));
                 if (_c && (_c & 3) == 0) {
-                    static int _n2 = 0;
+                    static PPU_THREAD_LOCAL int _n2 = 0;
                     if (PS3_LOG_FIRST(_n2, 8))
                         fprintf(stderr, "[ppu] OPD-RECOVER: ctr=0 -> dispatching opd[0]=0x%08X\n", _c);
                     addr = _c;
@@ -2588,7 +2588,7 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
      * identify the instance-init function (called with &spurs = 0x40009D00) and
      * confirm libsre receives the correct struct pointer. Env SPURS_TRACE. */
     if (addr >= 0x30031200u && addr < 0x30031900u) {
-        static int64_t st=-2; if (st==-2){ const char* e=getenv("SPURS_TRACE"); st=e?1:0; }
+        static PPU_THREAD_LOCAL int64_t st=-2; if (st==-2){ const char* e=getenv("SPURS_TRACE"); st=e?1:0; }
         if (st) fprintf(stderr, "[SPURSTRACE] call libsre 0x%08X  r3=0x%08X r4=0x%08X r5=0x%08X\n",
             addr, (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[5]);
     }
@@ -2599,9 +2599,9 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
      * completes and CreateTaskset (0x30014DC4) / CreateTask (0x30012520) are
      * ever reached, or execution stalls in the SPU bring-up handshake. */
     {
-        static int64_t lt=-2; if (lt==-2){ const char* e=getenv("PS3_PRX_CALLTRACE"); lt=e?1:0; }
+        static PPU_THREAD_LOCAL int64_t lt=-2; if (lt==-2){ const char* e=getenv("PS3_PRX_CALLTRACE"); lt=e?1:0; }
         if (lt && addr>=0x30000000u && addr<0x3001D718u) {
-            static uint32_t seen[1024]; static int nseen=0; int found=0;
+            static PPU_THREAD_LOCAL uint32_t seen[1024]; static PPU_THREAD_LOCAL int nseen=0; int found=0;
             for (int i=0;i<nseen;i++) if (seen[i]==addr){ found=1; break; }
             if (!found && nseen<1024) {
                 seen[nseen++]=addr;
@@ -2624,7 +2624,7 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
             uint32_t toc_reg = (uint32_t)ctx->gpr[2];
             ppu_fn fn2 = ppu_lookup(toc_reg);
             if (fn2) {
-                static int _n = 0;
+                static PPU_THREAD_LOCAL int _n = 0;
                 if (PS3_LOG_FIRST(_n, 8)) fprintf(stderr, "[ppu] OPD-swap fixup: ctr=0x%08X not a func, using r2=0x%08X\n", addr, toc_reg);
                 ctx->gpr[2] = addr;        /* callee TOC = the (TOC) value from the code slot */
                 addr = toc_reg; ctx->ctr = toc_reg;
