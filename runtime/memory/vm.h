@@ -301,15 +301,33 @@ static inline void vm_shutdown(void)
  * Memory region commit / protect
  * -----------------------------------------------------------------------*/
 
+/* The arena the guest may touch: [0, limit). A zero ppu_vm_size means the host
+ * maps (or commits on fault) the whole 32-bit space, NOT a zero-length arena,
+ * so it must never be used as the limit itself. */
+static inline uint64_t vm_guest_limit(void)
+{
+    return ppu_vm_size ? (uint64_t)ppu_vm_size : VM_TOTAL_SIZE;
+}
+
+/* Is the guest span [ea, ea+size) wholly inside guest memory? This is the ONE
+ * copy of the rule: vm_commit/vm_protect use it, and every handler that forms a
+ * host pointer from a guest span asks it instead of comparing ppu_vm_size
+ * itself. VM_READY is part of the rule: before vm_init nothing is mapped, and
+ * under native-VA mapping vm_base is 0 (guest EA == host address), so
+ * "vm_base != NULL" is not the readiness test. Written as a subtraction so that
+ * a size near UINT64_MAX cannot wrap ea+size to a small number and pass. */
+static inline int vm_range_ok(uint32_t ea, uint64_t size)
+{
+    if (!VM_READY) return 0;
+    const uint64_t limit = vm_guest_limit();
+    return (uint64_t)ea <= limit && size <= limit - (uint64_t)ea;
+}
+
 static inline int32_t vm_commit(uint32_t addr, uint32_t size)
 {
-    if (!VM_READY) return CELL_EFAULT;
-    /* Arena bounds: if ppu_vm_size is nonzero, the arena is constrained to [0, ppu_vm_size).
-     * If ppu_vm_size is 0, the runtime follows the 4 GB address-space mapping (VM_TOTAL_SIZE)
-     * initialized by vm_init. Ranges that wrap or cross this limit are rejected with CELL_EFAULT. */
-    uint64_t limit = ppu_vm_size ? (uint64_t)ppu_vm_size : (uint64_t)VM_TOTAL_SIZE;
-    if ((uint64_t)addr >= limit || (uint64_t)addr + (uint64_t)size > limit)
-        return CELL_EFAULT;
+    /* In the arena and backed? A range that wraps or crosses the limit is
+     * refused; vm_range_ok carries the readiness test too. */
+    if (!vm_range_ok(addr, size)) return CELL_EFAULT;
     if (size == 0) return CELL_OK;
     size = VM_ALIGN_UP(size, VM_PAGE_SIZE);
 
@@ -326,10 +344,7 @@ static inline int32_t vm_commit(uint32_t addr, uint32_t size)
 
 static inline int32_t vm_protect(uint32_t addr, uint32_t size, int read, int write, int exec)
 {
-    if (!VM_READY) return CELL_EFAULT;
-    uint64_t limit = ppu_vm_size ? (uint64_t)ppu_vm_size : (uint64_t)VM_TOTAL_SIZE;
-    if ((uint64_t)addr >= limit || (uint64_t)addr + (uint64_t)size > limit)
-        return CELL_EFAULT;
+    if (!vm_range_ok(addr, size)) return CELL_EFAULT;
     if (size == 0) return CELL_OK;
     size = VM_ALIGN_UP(size, VM_PAGE_SIZE);
 
@@ -387,11 +402,15 @@ static inline int32_t vm_stack_allocate(vm_stack_alloc* sa, uint32_t stack_size,
      * page, and the stack above it must start on a host page boundary, or a
      * 16 KB host would either refuse the mprotect or protect part of the
      * stack itself. On a 4 KB host this is the layout it always was. */
-    uint32_t pg = vm_host_page_size();
-    stack_size = VM_ALIGN_UP(stack_size, pg);
+    const uint32_t pg = vm_host_page_size();
+    /* 64 bits: a guest stack_size within a page of UINT32_MAX used to make
+     * VM_ALIGN_UP (and stack_size + pg) wrap to a small number, so the region
+     * check below passed and the caller got a stack with no room in it. A
+     * request that does not fit the region is CELL_ENOMEM. */
+    const uint64_t aligned = ((uint64_t)stack_size + pg - 1u) & ~((uint64_t)pg - 1u);
 
     /* Add a guard page */
-    uint32_t total = stack_size + pg;
+    const uint64_t total = aligned + pg;
 
     if ((uint64_t)sa->next_addr + total > sa->region_end)
         return CELL_ENOMEM;
@@ -402,7 +421,7 @@ static inline int32_t vm_stack_allocate(vm_stack_alloc* sa, uint32_t stack_size,
     if (rc != CELL_OK)
         return CELL_EFAULT;
 
-    sa->next_addr += total;
+    sa->next_addr += (uint32_t)total;
     *base_out = base + pg; /* skip the guard page */
     return CELL_OK;
 }

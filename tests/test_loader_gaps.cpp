@@ -331,6 +331,47 @@ static int cb_stack_scenarios()
         CHECK(bad == 0 && bounded.next_addr == 0x10000000u);
         ppu_vm_size = orig_vm_size;
     }
+    {
+        /* The one guest-range rule (runtime/memory/vm.h): a zero ppu_vm_size is
+         * the whole 4 GB space, not a zero-length arena; an identity mapping is
+         * ready with vm_base == 0; a span that wraps past 2^32 is refused while
+         * an exact end is accepted. */
+        const uint32_t orig_vm_size = ppu_vm_size;
+        uint8_t* const orig_base = vm_base;
+        ppu_vm_size = 0;
+        CHECK(vm_range_ok(0x00001000u, 0x10u) == 1);
+        CHECK(vm_range_ok(0xFFFFFFF0u, 0x10u) == 1);      /* ends exactly at 4 GB */
+        CHECK(vm_range_ok(0xFFFFFFF0u, 0x20u) == 0);      /* wraps past it */
+        CHECK(vm_range_ok(0x80000000u, 0x80000000u) == 1);
+        CHECK(vm_range_ok(0u, 0u) == 1);
+        ppu_vm_size = 0x10000u;
+        CHECK(vm_range_ok(0x10000u, 0u) == 1);            /* empty span at the end */
+        CHECK(vm_range_ok(0x10000u, 1u) == 0);            /* one past the end */
+        CHECK(vm_range_ok(0xF000u, 0x1000u) == 1);        /* exact end */
+        CHECK(vm_range_ok(0xF001u, 0x1000u) == 0);
+        /* Identity mapping: the EA is the host address, so vm_base is 0 by
+         * design and must not be read as "no VM". */
+        vm_base = nullptr;
+        CHECK(vm_range_ok(0x8000u, 0x100u) == 1);
+        CHECK(vm_range_ok(0x10000u, 0x100u) == 0);
+        /* Nothing initialised: no guest pointer may be formed at all. */
+        ppu_vm_size = 0;
+        CHECK(vm_range_ok(0x1000u, 4u) == 0);
+        vm_base = orig_base;
+        ppu_vm_size = orig_vm_size;
+    }
+    {
+        /* A request that does not fit the region: vm_stack_allocate's alignment
+         * and guard-page addition used to wrap in 32 bits, so this passed and
+         * handed out a stack with no room in it. */
+        vm_stack_alloc huge;
+        vm_stack_alloc_init(&huge);
+        uint32_t base = 0;
+        CHECK(vm_stack_allocate(&huge, 0xFFFFF000u, &base) == (int32_t)CELL_ENOMEM);
+        CHECK(base == 0 && huge.next_addr == VM_STACK_BASE);
+        CHECK(vm_stack_allocate(&huge, 0xFFFFFFFFu, &base) == (int32_t)CELL_ENOMEM);
+        CHECK(base == 0 && huge.next_addr == VM_STACK_BASE);
+    }
     std::printf("CBSTACK OK: %d ctx threads + %d host threads + 100 short-lived threads, "
                 "stacks distinct and disjoint; %u thread stacks fit below the host window\n",
                 N, N, stacks);

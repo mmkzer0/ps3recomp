@@ -198,6 +198,19 @@ void fiber()
     CHECK(cellFiberPpuFinalizeScheduler(s) == 0);
     g_active_ctx = nullptr;
 }
+/* ppu_vm_size == 0 is the whole 32-bit space (the runtime's convention), not a
+ * zero-length arena: every span a valid EA names is in range, so neither the
+ * semaphore nor the fiber path may stop. Both used to treat 0 as the limit and
+ * stopped on the first call; they also treated vm_base == 0 as "no VM", which is
+ * wrong for the identity mapping. */
+void fullvm()
+{
+    const uint32_t saved = ppu_vm_size;
+    ppu_vm_size = 0;
+    fiber();    /* cellFiber: scheduler/fiber attributes, stacks, signals, Syncs */
+    layout();   /* cellSync2: attribute block, initialize, out parameters */
+    ppu_vm_size = saved;
+}
 void stopped(const std::string& mode)
 {
     int fd[2]; CHECK(pipe(fd) == 0);
@@ -230,7 +243,8 @@ int main(int argc, char** argv)
     const std::string mode = argv[1];
     if (mode == "layout") layout(); else if (mode == "counts") counts();
     else if (mode == "debt") debt(); else if (mode == "multi") multi();
-    else if (mode == "fiber") fiber(); else stopped(mode);
+    else if (mode == "fiber") fiber(); else if (mode == "fullvm") fullvm();
+    else stopped(mode);
     std::printf("%s %s\n", failures ? "FAIL" : "PASS", argv[1]);
     return failures ? 1 : 0;
 }

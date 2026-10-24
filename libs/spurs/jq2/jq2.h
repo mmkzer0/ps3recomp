@@ -61,26 +61,28 @@
 
 #include <stdint.h>
 #include "ps3emu/stop.h"
+#include "../../../runtime/memory/vm.h"   /* vm_range_ok, vm_guest_limit: the arena rule */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-extern uint32_t ppu_vm_size;
-
-/* Returns the guest VM limit: ppu_vm_size if set, else 2^32. */
+/* Returns the guest VM limit: ppu_vm_size if set, else 2^32. Kept as the jq2
+ * surface's name for the runtime's rule (runtime/memory/vm.h), so a caller that
+ * reports the limit in a stop prints the effective bound, never a raw
+ * ppu_vm_size of 0. */
 static inline uint64_t jq2_guest_limit(void)
 {
-    return ppu_vm_size ? (uint64_t)ppu_vm_size : 0x100000000ull;
+    return vm_guest_limit();
 }
 
-/* Returns 1 if [ea, ea+size) sits wholly within guest memory.
- * Computes the bound in 64 bits so a large ea + size that would wrap past the
- * top of the 32-bit space cannot wrap to a low address. */
+/* Returns 1 if [ea, ea+size) sits wholly within guest memory. This is the
+ * jq2 API; the rule itself (readiness, the 4 GB convention, 64-bit arithmetic
+ * that cannot wrap) is vm_range_ok's. A 64-bit EA above the guest space is
+ * refused here rather than narrowed into it. */
 static inline int jq2_guest_range_ok(uint64_t ea, uint64_t size)
 {
-    const uint64_t limit = jq2_guest_limit();
-    return ea <= limit && size <= limit - ea;
+    return ea <= 0xFFFFFFFFull && vm_range_ok((uint32_t)ea, size);
 }
 
 #define JQ2_OK 0

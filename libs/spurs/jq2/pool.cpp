@@ -33,11 +33,6 @@ extern "C" {
  * test fixture): guest EA -> host address. */
 extern std::uint8_t* vm_base;
 
-/* The guest address-space size (runtime/memory/vm.h): non-zero once the host has
- * mapped guest memory, 0 for a host that maps the whole 32-bit space and
- * commits on fault. */
-extern std::uint32_t ppu_vm_size;
-
 /* The SPU side of the reservation model (runtime/spu/spu_coherency.c). */
 void spu_lockline_lock(void);
 void spu_lockline_unlock(void);

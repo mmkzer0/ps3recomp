@@ -13,6 +13,7 @@
 
 #include "sys_crashdump.h"
 #include "../../runtime/ppu/ppu_memory.h"
+#include "../../runtime/memory/vm.h"      /* vm_range_ok, vm_guest_limit: the arena rule */
 #include "ps3emu/stop.h"
 #include "ps3emu/log_first.h"
 #include <stdio.h>
@@ -43,25 +44,15 @@ typedef struct {
 
 static CrashDumpLogArea s_log_areas[SYS_CRASH_DUMP_MAX_LOG_AREA + 1];
 
-static inline uint64_t guest_limit(void)
-{
-    return ppu_vm_size ? (uint64_t)ppu_vm_size : 0x100000000ull;
-}
-
-static inline int guest_range_ok(uint64_t ea, uint64_t size)
-{
-    const uint64_t limit = guest_limit();
-    return ea <= limit && size <= limit - ea;
-}
-
 s32 sys_crash_dump_set_user_log_area(u8 index, const sys_crash_dump_log_area_info_t* new_entry)
 {
     if (index > SYS_CRASH_DUMP_MAX_LOG_AREA || !new_entry) {
         return (s32)CELL_EINVAL;
     }
     const u32 ea = (u32)(uintptr_t)new_entry;
-    if (!guest_range_ok(ea, sizeof(sys_crash_dump_log_area_info_t))) {
-        ps3_stop_guest_range(__func__, "new_entry", ea, sizeof(sys_crash_dump_log_area_info_t), guest_limit());
+    if (!vm_range_ok(ea, sizeof(sys_crash_dump_log_area_info_t))) {
+        ps3_stop_guest_range(__func__, "new_entry", ea, sizeof(sys_crash_dump_log_area_info_t),
+                             vm_guest_limit());
     }
 
     LOCK();
@@ -87,8 +78,9 @@ s32 sys_crash_dump_get_user_log_area(u8 index, sys_crash_dump_log_area_info_t* e
         return (s32)CELL_EINVAL;
     }
     const u32 ea = (u32)(uintptr_t)entry;
-    if (!guest_range_ok(ea, sizeof(sys_crash_dump_log_area_info_t))) {
-        ps3_stop_guest_range(__func__, "entry", ea, sizeof(sys_crash_dump_log_area_info_t), guest_limit());
+    if (!vm_range_ok(ea, sizeof(sys_crash_dump_log_area_info_t))) {
+        ps3_stop_guest_range(__func__, "entry", ea, sizeof(sys_crash_dump_log_area_info_t),
+                             vm_guest_limit());
     }
 
     LOCK();

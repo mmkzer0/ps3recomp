@@ -45,6 +45,7 @@
 #include "spu_dma.h"
 #include "spu_workload.h"
 #include "spu_context.h"
+#include "../memory/vm.h"       /* vm_range_ok: the guest arena rule */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -67,9 +68,6 @@ extern void spurs_job_test_ls_free(uint8_t* ls);
 
 extern uint8_t* vm_base;
 extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
-/* The guest VM's size: 0 means "not sized" (a host that maps the whole 32-bit
- * space and commits on fault), in which case the 32-bit space is the bound. */
-extern uint32_t ppu_vm_size;
 
 /* ---- guest reads (big-endian) ------------------------------------------ */
 static uint32_t g32(uint32_t ea)
@@ -116,12 +114,12 @@ static uint64_t dv64(const desc_view* d, uint32_t off)
     return ((uint64_t)dv32(d, off) << 32) | (uint64_t)dv32(d, off + 4);
 }
 
-/* Is [ea, ea+size) inside the guest's VM? Summed in 64 bits, so an EA near the
- * top of the 32-bit space cannot wrap to a low address. */
+/* Is [ea, ea+size) inside the guest's VM? The rule is vm_range_ok's
+ * (runtime/memory/vm.h); descriptor fields are 64-bit guest words, so an EA
+ * above the 32-bit space is refused here instead of being narrowed into it. */
 static int guest_range_ok(uint64_t ea, uint64_t size)
 {
-    const uint64_t limit = ppu_vm_size ? (uint64_t)ppu_vm_size : 0x100000000ull;
-    return ea <= limit && size <= limit - ea;
+    return ea <= 0xFFFFFFFFull && vm_range_ok((uint32_t)ea, size);
 }
 
 /* ---- local-store writes (big-endian) ----------------------------------- */

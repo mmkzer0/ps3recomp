@@ -37,7 +37,6 @@
 
 extern "C" {
 extern uint8_t* vm_base;
-extern uint32_t ppu_vm_size;
 void spurs_job_set_spu_num(uint32_t n);
 }
 
@@ -654,8 +653,9 @@ private:
     {
         const std::uint32_t size = size_bytes(d.job.size);
         const std::uint32_t ea = d.job.descriptor_ea;
-        const std::uint64_t limit = ppu_vm_size ? ppu_vm_size : 0x1'0000'0000ull;
-        if (ea == 0 || size == 0 || std::uint64_t{ea} + size > limit) stop_ring_entry("descriptor", d);
+        /* Non-null and non-empty are the firmware's own conditions; the arena
+         * bound is the one rule in jq2.h (over vm_range_ok). */
+        if (ea == 0 || size == 0 || !jq2_guest_range_ok(ea, size)) stop_ring_entry("descriptor", d);
         desc.assign(host(ea), host(ea) + size);
 
         JobStart js;

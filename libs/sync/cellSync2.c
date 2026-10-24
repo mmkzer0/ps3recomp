@@ -12,10 +12,10 @@
 #include <string.h>
 #include <stdatomic.h>
 #include "../spurs/cellFiber.h"
+#include "../../runtime/memory/vm.h"          /* vm_range_ok: the guest arena rule */
 #include "../../runtime/memory/reservation.h"
 #include "ps3emu/endian.h"
 #include "ps3emu/stop.h"
-extern u32 ppu_vm_size;
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -332,8 +332,11 @@ static pthread_cond_t sem_cv = PTHREAD_COND_INITIALIZER;
 
 static void sem_range(const char* api, const char* arg, u32 ea, u64 size)
 {
-    if (!vm_base || (u64)ea + size > ppu_vm_size)
-        ps3_stop_guest_range(api, arg, ea, size, ppu_vm_size);
+    /* The arena rule lives in vm.h: a zero ppu_vm_size means the whole 32-bit
+     * space, so it is not a zero-length limit, and readiness is not
+     * "vm_base != NULL" (an identity mapping has vm_base == 0). */
+    if (!vm_range_ok(ea, size))
+        ps3_stop_guest_range(api, arg, ea, size, vm_guest_limit());
 }
 static u16 sem_rd16(u32 ea)
 {
