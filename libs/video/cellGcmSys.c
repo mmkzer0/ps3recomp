@@ -419,8 +419,9 @@ static unsigned long long s_acq_t0;   /* tentative: defined with the label const
  * before the head and which cellRescSetWaitFlip's ACQUIRE waits to see 0 [INFERENCE: the label is
  * the driver's, and the recording shows it 0 between flips]. */
 static volatile int s_drv_flip_label_pending;
-/* The last walker pass ended on an NV406E ACQUIRE. Everything ahead of it has executed, so a flip
- * head retired before it is ready to present although get != put. */
+/* The last walker pass ended where the frame behind a flip head is complete although get != put: on an
+ * NV406E ACQUIRE after the head (cellRescSetWaitFlip's), or right at the head. Everything ahead of
+ * that point has executed, so the flip is ready to present. */
 static volatile int s_acquire_blocked;
 
 /* New session: no event retired, no flip awaiting its handshake, no acquire standing. */
@@ -2537,7 +2538,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
             /* A driver flip head stops the pass like the 0xFEAD marker does, so the ticker presents
              * the completed frame before the next one's head is drained. */
             if (drv_flip && gcm_fifo_backlog(put, s_fifo_getoff) < GCM_FIFO_CATCHUP_BYTES)
-                { why = "flip"; break; }
+                { why = "flip"; s_acquire_blocked = 1; break; }
             continue;
         }
         { static int _uw = 0; if (PS3_LOG_FIRST(_uw, 16) && getenv("RTT_DUMP"))
