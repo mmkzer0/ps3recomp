@@ -14,6 +14,7 @@ file and line instead of being guessed at downstream.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -297,6 +298,12 @@ def _check_scalar_map(rec: dict, name: str) -> None:
                                 f"must be a scalar, found {type(item).__name__}")
 
 
+def _record_identity(rec: dict) -> str:
+    """`seq 3 (ppu:0000000001000000)`, for errors raised inside a record."""
+    key = ctx_key(rec["ctx"]) if "ctx" in rec else f"ppu:{rec['thread']}"
+    return f"seq {rec['seq']} ({key})"
+
+
 def _check_dumps(rec: dict) -> None:
     dumps = rec["dumps"]
     if not isinstance(dumps, list):
@@ -339,11 +346,23 @@ def _check_dumps(rec: dict) -> None:
         _need_hex(dump, "sha256", where, HEX_SHA256, "64 lowercase hex digits")
         if "hex" in dump:
             text = dump["hex"]
+            subject = f"dump {name!r} in record {_record_identity(rec)}"
             if not isinstance(text, str) or not re.fullmatch(r"[0-9a-f]*", text):
-                raise RecordProblem(f"{where}.hex", "must be lowercase hex digits")
+                raise RecordProblem(f"{where}.hex",
+                                    f"{subject}: must be lowercase hex digits")
+            if len(text) % 2:
+                raise RecordProblem(f"{where}.hex",
+                                    f"{subject}: holds an odd number of digits "
+                                    f"({len(text)}), not whole bytes")
             if len(text) != 2 * dump["read"]:
                 raise RecordProblem(f"{where}.hex",
-                                    f"holds {len(text) // 2} bytes, read says {dump['read']}")
+                                    f"{subject}: holds {len(text) // 2} bytes, "
+                                    f"read says {dump['read']}")
+            digest = hashlib.sha256(bytes.fromhex(text)).hexdigest()
+            if digest != dump["sha256"]:
+                raise RecordProblem(f"{where}.hex",
+                                    f"{subject}: its bytes hash to {digest}, "
+                                    f"not the dump's {dump['sha256']}")
 
 
 def _check_ctx(rec: dict) -> None:
