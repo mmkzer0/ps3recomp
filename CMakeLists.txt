@@ -724,6 +724,9 @@ if(PS3RECOMP_BUILD_TESTS)
             add_executable(${name} ${source})
             target_include_directories(${name} PRIVATE
                 "${CMAKE_CURRENT_SOURCE_DIR}/include")
+            # The fixtures compile HLE sources that reach win32_backtrace.h
+            # (dladdr/Dl_info); glibc hides those without _GNU_SOURCE.
+            target_compile_definitions(${name} PRIVATE _GNU_SOURCE)
             if(APPLE)
                 target_link_options(${name} PRIVATE "-Wl,-dead_strip")
             else()
