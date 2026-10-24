@@ -32,6 +32,10 @@ void spu_lockline_unlock(void) {}
 void spu_lockguard_check(spu_context* c,uint32_t ea,const uint8_t* p,uint32_t n,const char* what)
 { (void)c;(void)ea;(void)p;(void)n;(void)what; }
 void spu_ch_wake(spu_context* c) { (void)c; }
+/* Every transfer here is valid: an MFC error stop (spu_dma.h) is a failure of this test. */
+void ps3_stop(ps3_stop_kind k,const char* what,const char* remedy,const ps3_stop_field* f,size_t n,
+              const ps3_stop_site* site)
+{ (void)remedy;(void)f;(void)n;(void)site;fprintf(stdout,"FAIL: stop %d: %s\n",(int)k,what);exit(2); }
 
 static void check(int ok,const char* what)
 { if(!ok){fprintf(stdout,"FAIL: %s\n",what);exit(2);} }
