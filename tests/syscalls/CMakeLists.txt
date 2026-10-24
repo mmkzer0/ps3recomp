@@ -48,3 +48,27 @@ set_tests_properties(lock_line PROPERTIES
     LABELS "runtime;syscalls;t0"
     TIMEOUT 30
 )
+add_executable(test_event_flag
+    test_event_flag.c
+    "${PS3RECOMP_ROOT}/runtime/syscalls/sys_event.c"
+    "${PS3RECOMP_ROOT}/tests/sync_stress/test_shims.c"
+)
+target_include_directories(test_event_flag PRIVATE
+    "${PS3RECOMP_ROOT}/runtime/syscalls"
+    "${PS3RECOMP_ROOT}/runtime"
+    "${PS3RECOMP_ROOT}/runtime/ppu"
+    "${PS3RECOMP_ROOT}/include"
+)
+if(MSVC)
+    target_compile_definitions(test_event_flag PRIVATE _CRT_SECURE_NO_WARNINGS)
+else()
+    target_compile_options(test_event_flag PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    find_package(Threads REQUIRED)
+    target_link_libraries(test_event_flag PRIVATE Threads::Threads)
+endif()
+
+add_test(NAME event_flag COMMAND test_event_flag)
+set_tests_properties(event_flag PROPERTIES
+    LABELS "runtime;t0;tsan"
+    TIMEOUT 30
+)

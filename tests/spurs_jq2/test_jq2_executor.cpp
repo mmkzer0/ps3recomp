@@ -1830,11 +1830,11 @@ void mode_stop_wait()
             ppu_context ctx;
             std::memset(&ctx, 0, sizeof ctx);
             ctx.gpr[3] = get32(QUEUE + 0x80); /* the queue's first event flag */
-            CHECK(sys_event_flag_destroy(&ctx) == 0, "destroy the flag");
-            jq2_port_sync(PORT, 0); /* registers, waits, the wait fails: never returns */
+            CHECK(sys_event_flag_destroy(&ctx) == 0, "destroy the flag before wait (0 waiters)");
+            jq2_port_sync(PORT, 0); /* registers, waits on destroyed flag -> ESRCH */
             std::fprintf(stderr, "the stop did not happen: the Sync returned\n");
         },
-        "jq2-wake", {"reason=wait", "rc=0x"});
+        "jq2-wake", {"reason=wait", "rc=0x80010005"});
 }
 
 /* A push that passed its checks while the port was destroyed and the queue shut

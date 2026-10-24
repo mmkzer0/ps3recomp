@@ -1127,8 +1127,26 @@ int64_t sys_event_flag_destroy(ppu_context* ctx)
     }
 
 #ifdef _WIN32
+    EnterCriticalSection(&f->lock);
+    if (f->waiters > 0) {
+        /* RPCS3 oracle (rpcs3/Emu/Cell/lv2/sys_event_flag.cpp sys_event_flag_destroy):
+         * if waiters exist on the event flag, return CELL_EBUSY and destroy nothing. */
+        LeaveCriticalSection(&f->lock);
+        evt_table_unlock();
+        return (int64_t)(int32_t)CELL_EBUSY;
+    }
+    LeaveCriticalSection(&f->lock);
     DeleteCriticalSection(&f->lock);
 #else
+    pthread_mutex_lock(&f->lock);
+    if (f->waiters > 0) {
+        /* RPCS3 oracle (rpcs3/Emu/Cell/lv2/sys_event_flag.cpp sys_event_flag_destroy):
+         * if waiters exist on the event flag, return CELL_EBUSY and destroy nothing. */
+        pthread_mutex_unlock(&f->lock);
+        evt_table_unlock();
+        return (int64_t)(int32_t)CELL_EBUSY;
+    }
+    pthread_mutex_unlock(&f->lock);
     pthread_cond_destroy(&f->cv);
     pthread_mutex_destroy(&f->lock);
 #endif
@@ -1255,8 +1273,12 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
     EnterCriticalSection(&f->lock);
 
     if (timeout_us == 0) {
-        while (!flag_check(f->pattern, bitpat, mode) && f->active) {
-            SleepConditionVariableCS(&f->cv, &f->lock, INFINITE);
+        if (!flag_check(f->pattern, bitpat, mode) && f->active) {
+            f->waiters++;
+            while (!flag_check(f->pattern, bitpat, mode) && f->active) {
+                SleepConditionVariableCS(&f->cv, &f->lock, INFINITE);
+            }
+            f->waiters--;
         }
     } else if (timeout_us < 1000) {
         /* Sub-ms timed wait: poll the pattern to a QPC deadline instead of a
@@ -1264,35 +1286,45 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
          * under f->lock (sys_event_flag_set/clear), so yielding with the lock
          * dropped never misses a committed pattern change -- it just re-reads
          * the latest value on the next lock acquisition. */
-        int64_t deadline = lv2_usec_deadline(timeout_us);
-        while (!flag_check(f->pattern, bitpat, mode) && f->active) {
-            if (lv2_deadline_passed(deadline)) {
-                /* Write current pattern even on timeout */
-                if (result_addr != 0) {
-                    uint64_t* out = (uint64_t*)vm_to_host(result_addr);
-                    *out = bswap64(f->pattern);
-                }
-                LeaveCriticalSection(&f->lock);
-                return (int64_t)(int32_t)CELL_ETIMEDOUT;
-            }
-            LeaveCriticalSection(&f->lock);
-            SwitchToThread();
-            EnterCriticalSection(&f->lock);
-        }
-    } else {
-        DWORD ms = (DWORD)(timeout_us / 1000);
-        while (!flag_check(f->pattern, bitpat, mode) && f->active) {
-            if (!SleepConditionVariableCS(&f->cv, &f->lock, ms)) {
-                if (GetLastError() == ERROR_TIMEOUT) {
+        if (!flag_check(f->pattern, bitpat, mode) && f->active) {
+            f->waiters++;
+            int64_t deadline = lv2_usec_deadline(timeout_us);
+            while (!flag_check(f->pattern, bitpat, mode) && f->active) {
+                if (lv2_deadline_passed(deadline)) {
                     /* Write current pattern even on timeout */
                     if (result_addr != 0) {
                         uint64_t* out = (uint64_t*)vm_to_host(result_addr);
                         *out = bswap64(f->pattern);
                     }
+                    f->waiters--;
                     LeaveCriticalSection(&f->lock);
                     return (int64_t)(int32_t)CELL_ETIMEDOUT;
                 }
+                LeaveCriticalSection(&f->lock);
+                SwitchToThread();
+                EnterCriticalSection(&f->lock);
             }
+            f->waiters--;
+        }
+    } else {
+        DWORD ms = (DWORD)(timeout_us / 1000);
+        if (!flag_check(f->pattern, bitpat, mode) && f->active) {
+            f->waiters++;
+            while (!flag_check(f->pattern, bitpat, mode) && f->active) {
+                if (!SleepConditionVariableCS(&f->cv, &f->lock, ms)) {
+                    if (GetLastError() == ERROR_TIMEOUT) {
+                        /* Write current pattern even on timeout */
+                        if (result_addr != 0) {
+                            uint64_t* out = (uint64_t*)vm_to_host(result_addr);
+                            *out = bswap64(f->pattern);
+                        }
+                        f->waiters--;
+                        LeaveCriticalSection(&f->lock);
+                        return (int64_t)(int32_t)CELL_ETIMEDOUT;
+                    }
+                }
+            }
+            f->waiters--;
         }
     }
 
@@ -1315,8 +1347,12 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
     pthread_mutex_lock(&f->lock);
 
     if (timeout_us == 0) {
-        while (!flag_check(f->pattern, bitpat, mode) && f->active) {
-            pthread_cond_wait(&f->cv, &f->lock);
+        if (!flag_check(f->pattern, bitpat, mode) && f->active) {
+            f->waiters++;
+            while (!flag_check(f->pattern, bitpat, mode) && f->active) {
+                pthread_cond_wait(&f->cv, &f->lock);
+            }
+            f->waiters--;
         }
     } else {
         struct timespec ts;
@@ -1327,16 +1363,21 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
             ts.tv_sec++;
             ts.tv_nsec -= 1000000000L;
         }
-        while (!flag_check(f->pattern, bitpat, mode) && f->active) {
-            int rc = pthread_cond_timedwait(&f->cv, &f->lock, &ts);
-            if (rc == ETIMEDOUT) {
-                if (result_addr != 0) {
-                    uint64_t* out = (uint64_t*)vm_to_host(result_addr);
-                    *out = bswap64(f->pattern);
+        if (!flag_check(f->pattern, bitpat, mode) && f->active) {
+            f->waiters++;
+            while (!flag_check(f->pattern, bitpat, mode) && f->active) {
+                int rc = pthread_cond_timedwait(&f->cv, &f->lock, &ts);
+                if (rc == ETIMEDOUT) {
+                    if (result_addr != 0) {
+                        uint64_t* out = (uint64_t*)vm_to_host(result_addr);
+                        *out = bswap64(f->pattern);
+                    }
+                    f->waiters--;
+                    pthread_mutex_unlock(&f->lock);
+                    return (int64_t)(int32_t)CELL_ETIMEDOUT;
                 }
-                pthread_mutex_unlock(&f->lock);
-                return (int64_t)(int32_t)CELL_ETIMEDOUT;
             }
+            f->waiters--;
         }
     }
 

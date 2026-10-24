@@ -110,6 +110,7 @@ typedef struct sys_event_flag_info {
     uint32_t type;       /* single / multi waiter */
     char     name[8];
     uint64_t pattern;    /* 64-bit flag word */
+    uint32_t waiters;    /* number of blocked waiters */
 
 #ifdef _WIN32
     CRITICAL_SECTION lock;
