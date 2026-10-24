@@ -589,6 +589,31 @@ The stop is raised strictly after the firmware's own null and alignment checks
 receives that code) and before any guest read or write.
 
 
+**Queue creation.** `jq2_queue_create` implements the checks of the firmware's
+`CreateCommon` routine (`libspurs_jq` `0x020003CC`) in exact firmware order:
+
+1. `0x020003D0` spurs == 0, `0x020004C0` queue == 0, `0x020004C8` attr == 0,
+   `0x020004D0` command_ring == 0: each gives `0x80410A11` (`NULL_POINTER`).
+2. `0x020004D8..0x02000508`: `(pool == 0) != (pool_attr == 0)`: gives `0x80410A11`
+   (`NULL_POINTER`).
+3. `0x020004E8..0x02000530`: 128-byte alignment of spurs, queue, command_ring,
+   and pool if non-null: `0x80410A10` (`ALIGN`). `pool_attr` is never alignment-checked.
+4. `0x02000534`: depth > 0x8000 gives `0x80410A02` (`INVAL`).
+   `0x02000548`: workers > 8 gives `0x80410A02` (`INVAL`).
+5. `0x0200055C`: `sc 351` (`sys_memory_get_page_attribute`) on the queue EA;
+   if `access_right & 2` is clear, `0x80410A02` (`INVAL`). Our flat VM cannot
+   express that page attribute; it is always satisfied and unmodelled here.
+6. `0x0200057C..0x020005A8`: attr+4 (classes) - 1 > 15 gives `0x80410A02` (`INVAL`);
+   attr+8 (max descriptor) <= 0xFF, > 0x3FF, or not 128-aligned gives `0x80410A02` (`INVAL`).
+
+Guest range check on attr (`jq2_guest_range_ok`, 0x0C bytes) runs directly before
+the attr+4 / attr+8 reads, after all preceding firmware checks.
+
+The firmware has no check for depth == 0 or workers == 0. Console behaviour is
+unknown; creating a queue with depth 0 or workers 0 stops with named stop
+`jq2-unmodelled` (`depth`, `workers`).
+A queue EA that already has an active queue is `0x80410A0F` (`STAT`).
+
 **Pushes.** `jq2_port_push_job` / `jq2_port_copy_push` / `jq2_port_push_sync`
 apply the firmware guards (null `A11`, alignment `A10`, argument `A02`, port or
 queue state `A0F`, full ring `A01`, claim collision `A0A`), then account on the

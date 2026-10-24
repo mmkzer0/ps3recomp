@@ -21,7 +21,7 @@ KINDS = ["identity-mismatch", "config-invalid", "unresolved-nid",
          "hle-guest-range", "hle-uninitialized",
          "sync2-semaphore-unsupported", "fiber-unsupported", "gcm-unmodelled",
          "gcm-wait-timeout", "guest-null-access", "stack-guard-fault",
-         "event-delivery-lost"]
+         "event-delivery-lost", "jq2-unmodelled"]
 
 
 def probe(*args):

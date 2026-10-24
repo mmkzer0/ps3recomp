@@ -1161,25 +1161,49 @@ int32_t jq2_queue_create(uint32_t revision, uint32_t sdk_version, uint32_t spurs
     (void)name;  /* only names the workload in the firmware; the workers are anonymous */
     (void)extra; /* the firmware body does not read it */
 
+    /* 1. 0x020003D0 spurs == 0, 0x020004C0 queue == 0, 0x020004C8 attr == 0,
+     *    0x020004D0 command_ring == 0: each gives NULL_POINTER (0x80410A11). */
     if (spurs == 0 || queue == 0 || attr == 0 || command_ring == 0) return JQ2_ERR_NULL_POINTER;
+
+    /* 2. 0x020004D8..0x02000508: if pool != 0 and pool_attr == 0, or pool == 0
+     *    and pool_attr != 0, gives NULL_POINTER (0x80410A11). */
+    if ((pool == 0) != (pool_attr == 0)) return JQ2_ERR_NULL_POINTER;
+
+    /* 3. 0x020004E8..0x02000530: 128-byte alignment of spurs, queue, command_ring,
+     *    and pool if non-null, gives ALIGN (0x80410A10). pool_attr is never
+     *    alignment-checked (Odin passes a 16-byte-aligned stack poolAttr). */
     if (!aligned(spurs, 128) || !aligned(queue, 128) || !aligned(command_ring, 128)) return JQ2_ERR_ALIGN;
-    if ((pool == 0) != (pool_attr == 0)) return JQ2_ERR_INVAL;
+    if (pool != 0 && !aligned(pool, 128)) return JQ2_ERR_ALIGN;
+
+    /* 4. 0x02000534: depth > 0x8000 gives INVAL (0x80410A02).
+     *    0x02000548: workers > 8 gives INVAL (0x80410A02). */
     if (command_depth > JQ2_MAX_DEPTH || worker_count > JQ2_MAX_WORKERS) return JQ2_ERR_INVAL;
+
+    /* 5. 0x0200055C: sc 351 (sys_memory_get_page_attribute) on the queue EA;
+     *    if access_right & 2 is clear, INVAL (0x80410A02). Our flat VM cannot
+     *    express page protection attributes; it is always satisfied and not
+     *    modelled here. */
+
+    /* Guest range validation on attr directly before reading attr fields. */
     if (!jq2_guest_range_ok(attr, 0x0C)) {
         ps3_stop_guest_range("jq2_queue_create", "attr", attr, 0x0C, jq2_guest_limit());
     }
+    /* 6. 0x0200057C..0x02000588: attr+4 (classes) - 1 > 15 gives INVAL (0x80410A02).
+     *    0x0200058C..0x020005A8: attr+8 (max descriptor) <= 0xFF, > 0x3FF, or not
+     *    128-aligned gives INVAL (0x80410A02). */
     const std::uint32_t classes = ld32(attr + 0x04);
     const std::uint32_t max_descriptor = ld32(attr + 0x08);
     if (classes < 1 || classes > 16 || max_descriptor < 256 || max_descriptor > 0x3FF || !aligned(max_descriptor, 128))
         return JQ2_ERR_INVAL;
-    /* CreateCommon (libspurs_jq 0x020004E8..0x02000530) checks 128-byte
-     * alignment of the SPURS, queue, command-ring and pool EAs only; the pool
-     * attribute (r9 -> r30) is never alignment-checked. Odin passes a
-     * 16-byte-aligned stack poolAttr, which the firmware accepts. */
-    if (pool != 0 && !aligned(pool, 128)) return JQ2_ERR_ALIGN;
-    /* Beyond the firmware's checks: a ring of no entries, or no worker to run
-     * it, can never make progress. */
-    if (command_depth == 0 || worker_count == 0) return JQ2_ERR_INVAL;
+
+    /* The firmware has NO check for depth == 0 or workers == 0. Console behaviour
+     * is unknown and unmodelled; a ring of no entries or no workers cannot make
+     * progress in the HLE executor. */
+    if (command_depth == 0 || worker_count == 0) {
+        stop_with(PS3_STOP_JQ2_UNMODELLED, "JobQueue2 queue created with zero depth or zero workers",
+                  "The firmware does not check for depth == 0 or workers == 0, but a queue of no entries or no workers cannot make progress in the HLE executor.",
+                  {dec("depth", command_depth), dec("workers", worker_count)});
+    }
     if (find_queue(queue)) return JQ2_ERR_STAT;
 
     if (!jq2_guest_range_ok(queue, kQueueBytes)) {

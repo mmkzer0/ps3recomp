@@ -149,7 +149,7 @@ enum class PoolError : std::uint8_t {
     none = 0,
     again,         /* 0x80410A01: class empty, non-blocking acquire */
     inval,         /* 0x80410A02: invalid class/layout/snapshot argument */
-    align,         /* 0x80410A10: queue/pool/poolAttr not 128-byte aligned */
+    align,         /* 0x80410A10: queue/pool not 128-byte aligned (poolAttr is never checked) */
     null_pointer,  /* 0x80410A11: null create argument or unconfigured class */
     /* A snapshot source or destination range that is not inside the runtime's
      * mapped guest memory (ppu_vm_size, or the 32-bit space when the host does
@@ -165,9 +165,10 @@ enum class PoolError : std::uint8_t {
 /* The guest-visible firmware code for an error, 0 for none. */
 [[nodiscard]] std::int32_t firmware_code(PoolError error) noexcept;
 
-/* The three create-path arguments this pool needs. All are guest EAs and must
- * be 128-byte aligned (CreateCommon alignment rule, jq2fw-019). `pool_attr_ea`
- * points at the eight per-class block counts, u32[0..7] (CreateCommon arg 7). */
+/* The three create-path arguments this pool needs. queue_ea and pool_ea are
+ * guest EAs and must be 128-byte aligned (CreateCommon alignment rule, jq2fw-019;
+ * pool_attr_ea is never alignment-checked). `pool_attr_ea` points at the eight
+ * per-class block counts, u32[0..7] (CreateCommon arg 7). */
 struct PoolConfig {
     std::uint32_t queue_ea = 0;
     std::uint32_t pool_ea = 0;

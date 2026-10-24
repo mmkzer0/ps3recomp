@@ -106,8 +106,9 @@ static inline int jq2_guest_range_ok(uint64_t ea, uint64_t size)
  *   spurs                  128-aligned SPURS EA, stored at queue+0xF10
  *   queue                  128-aligned, >= 0x1000 bytes; zeroed (0x1000) here
  *   attr                   the attribute block (fields above)
- *   pool, pool_attr        both 0 or both 128-aligned (the descriptor pool of
- *                          the CopyPush path); anything else is INVAL
+ *   pool, pool_attr        both 0, or pool 128-aligned and pool_attr non-zero
+ *                          (pool_attr is never alignment-checked); pool XOR
+ *                          pool_attr is NULL_POINTER
  *   name                   guest C string naming the queue, may be 0; the
  *                          firmware names its SPURS workload with it, the host
  *                          workers are anonymous, so it is not read
@@ -118,9 +119,10 @@ static inline int jq2_guest_range_ok(uint64_t ea, uint64_t size)
  *   extra                  unused by the firmware body as far as RE shows
  *
  * Guards in firmware order: null (spurs, queue, attr, command_ring) A11;
- * alignment (spurs, queue, command_ring, then pool, pool_attr) A10; pool xor
- * pool_attr A02; depth / worker_count A02; attribute range A02.
- *
+ * pool xor pool_attr A11; alignment (spurs, queue, command_ring, then pool if
+ * non-null; pool_attr is never alignment-checked) A10; depth / worker_count A02;
+ * sys_memory_get_page_attribute on queue EA (access_right & 2, unmodelled);
+ * attribute range A02. Zero depth or zero workers stops (jq2-unmodelled).
  * Leaves the queue as the firmware leaves it (m1r-004, JQ-FW-PPU): ring EA at
  * +0x10, depth at +0x14, ring indices and phase at +0x00/+0x04 (read 0, write 0,
  * +0x04 = 0x60), event flag ids at +0x80/+0x84 (LV2 event flags), the port slot

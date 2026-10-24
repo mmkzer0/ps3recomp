@@ -301,8 +301,6 @@ static void create_validation_tests(Guest& g, uint32_t spurs, uint32_t queue, ui
 
     CHECK_EQ(g.call(0xF244E799u, 2, 0x330000, spurs, queue, attr, name, ring, 0x8001, 1, extra), A02);
     CHECK_EQ(g.call(0xF244E799u, 2, 0x330000, spurs, queue, attr, name, ring, 4, 9, extra), A02);
-    CHECK_EQ(g.call(0xF244E799u, 2, 0x330000, spurs, queue, attr, name, ring, 0, 1, extra), A02);
-    CHECK_EQ(g.call(0xF244E799u, 2, 0x330000, spurs, queue, attr, name, ring, 4, 0, extra), A02);
 
     /* Attribute range (0x0200057C-0x020005B8). */
     wr32(attr + 0x04, 0);
@@ -362,9 +360,9 @@ static void create_12_args(Guest& g, uint32_t spurs, uint32_t queue, uint32_t ri
 {
     const uint32_t name = alloc(32, 1);
 
-    /* Pool and pool attribute must be both present or both absent. */
-    CHECK_EQ(g.call(0x983BE7FCu, 2, 0x330000, spurs, queue, attr, pool, 0, name, ring, 8, 1, 0), A02);
-    CHECK_EQ(g.call(0x983BE7FCu, 2, 0x330000, spurs, queue, attr, 0, pool_attr, name, ring, 8, 1, 0), A02);
+    /* Pool and pool attribute must be both present or both absent (0x020004D8..0x02000508: A11). */
+    CHECK_EQ(g.call(0x983BE7FCu, 2, 0x330000, spurs, queue, attr, pool, 0, name, ring, 8, 1, 0), A11);
+    CHECK_EQ(g.call(0x983BE7FCu, 2, 0x330000, spurs, queue, attr, 0, pool_attr, name, ring, 8, 1, 0), A11);
     CHECK_EQ(g.call(0x983BE7FCu, 2, 0x330000, spurs, queue, attr, pool + 64, pool_attr, name, ring, 8, 1, 0),
              A10);
     /* No pool-attribute alignment check: the firmware has none (CreateCommon

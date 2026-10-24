@@ -110,7 +110,9 @@ extern "C" {
     X(STACK_GUARD_FAULT,        "stack-guard-fault")                           \
     /* An lv2-internal producer sent to a queue id that never existed: our  */ \
     /* bookkeeping is wrong (full or destroyed queues drop, as lv2 does). */  \
-    X(EVENT_DELIVERY_LOST,      "event-delivery-lost")
+    X(EVENT_DELIVERY_LOST,      "event-delivery-lost")                         \
+    /* A JobQueue2 parameter combination the firmware accepts whose console behaviour is unknown. */ \
+    X(JQ2_UNMODELLED,           "jq2-unmodelled")
 
 /* A fixed underlying type in C++ makes a kind outside the list (a caller's bug,
  * which the stop still reports as "invalid-kind") a well-defined value rather
