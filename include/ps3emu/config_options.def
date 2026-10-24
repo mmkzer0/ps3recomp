@@ -78,6 +78,23 @@ PS3_CFG_U32(spu, dma_repeat_stop_secs, 0, 0, 86400,
     "or label for longer than any fixed deadline, and a wrong halt wedges the "
     "chain. This is a host watchdog, not PS3 hardware behaviour.")
 
+/* ---- video -------------------------------------------------------------- */
+
+PS3_CFG_STR(video, resolutions, "", 31, PS3_CFG_V_VIDEO_RESOLUTIONS,
+    "The resolutions the display reports as available, as a comma-separated list "
+    "of cellVideoOut resolution ids: 1 (1080), 2 (720), 4 (480), 5 (576), "
+    "10 (1600x1080), 11 (1440x1080), 12 (1280x1080), 13 (960x1080). "
+    "cellVideoOutGetResolutionAvailability answers from it, "
+    "cellVideoOutGetDeviceInfo lists exactly these modes, and the resolution "
+    "cellVideoOutGetState reports before the title configures one is 720 when "
+    "it is in the list, else the first of 480, 576, 720, 1080, 1600x1080, "
+    "1440x1080, 1280x1080, 960x1080 that is. An id outside that set is a "
+    "config error. Empty (the default) means no restriction: every id is "
+    "reported available and the device lists 480, 576, 720 and 1080. A real "
+    "console answers per connected display, so a list is a policy (for example "
+    "to run a title at the resolution an oracle trace was recorded at), not a "
+    "hardware fact.")
+
 /* ---- title -------------------------------------------------------------- */
 
 PS3_CFG_STR(title, elf_sha256, "", 64, PS3_CFG_V_SHA256_OR_EMPTY,
