@@ -425,6 +425,12 @@ public:
         if (pool_) pool_->shutdown();
     }
 
+    /* A push has passed its checks; see ExecutorHooks::on_push_checked. */
+    void push_checked(std::uint32_t port_ea) const
+    {
+        if (hooks_.on_push_checked != nullptr) hooks_.on_push_checked(hooks_.user, port_ea);
+    }
+
     /* The ring write of every push, ordered against Shutdown by mu_: Shutdown
      * sets stopping_ under mu_, and a worker leaves only after seeing stopping_
      * with an empty ring under mu_. An entry written here under mu_ with
@@ -959,6 +965,7 @@ int bitmap_rmw(std::uint8_t* line, void* user)
  * carries flags & 1. */
 std::int32_t enqueue(Queue& q, std::uint32_t port_ea, const Entry& entry, bool accounted)
 {
+    q.push_checked(port_ea);
     const auto write = [&]() -> std::uint32_t {
         const std::optional<PushResult> pushed = q.push_unless_shut(entry);
         if (!pushed) {

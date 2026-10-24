@@ -81,7 +81,6 @@ extern "C" {
 uint8_t* vm_base;
 extern uint32_t ppu_vm_size; /* runtime/host/host_stubs.c */
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value);
-int resv_host_rmw(uint32_t ea, int (*fn)(uint8_t* line, void* user), void* user); /* runtime/memory/reservation.h */
 u128 spu_rdch(spu_context* ctx, uint32_t channel);
 void spu_halt(spu_context* ctx);
 }
@@ -444,10 +443,26 @@ JobBody hook_select(void*, const JobStart&)
     }
 }
 
+/* The push held by hook_push_checked (push_shutdown_scenario). Process-wide and
+ * never destroyed: its pusher is detached and the process ends with the stop it
+ * provokes. */
+struct PushGate {
+    std::atomic<bool> armed{false}, reached{false}, release{false}, returned{false};
+};
+PushGate g_gate;
+
+void hook_push_checked(void*, std::uint32_t)
+{
+    if (!g_gate.armed) return;
+    g_gate.reached = true;
+    while (!g_gate.release) std::this_thread::sleep_for(std::chrono::microseconds(100));
+}
+
 void install_hooks()
 {
     ExecutorHooks h;
     h.on_admit = &hook_admit;
+    h.on_push_checked = &hook_push_checked;
     h.on_done = &hook_done;
     if (g_lifted != kNoLifted) h.select_body = &hook_select;
     set_executor_hooks(h);
@@ -1668,8 +1683,11 @@ void mode_stop_wait()
 }
 
 /* A push that passed its checks while the port was destroyed and the queue shut
- * down and joined: it is held at its port-line update by a host lock on the
- * line, then released into a ring nobody drains. */
+ * down and joined. ExecutorHooks::on_push_checked parks the pusher after
+ * check_push and before its port-line update, so the order is established by the
+ * hook's handshake, not by timing; it is then released into a ring nobody
+ * drains. Both threads are detached because the pusher's named stop ends the
+ * process, so nothing can join them. */
 void push_shutdown_scenario(bool copy)
 {
     expect_stop(
@@ -1678,35 +1696,21 @@ void push_shutdown_scenario(bool copy)
             install_hooks();
             arm_child_watchdog(10);
             Rig rig({128, 1, copy});
-            const JobSpec a = spec(0);
-            struct Hold {
-                std::atomic<bool> holding{false}, release{false};
-            } hold;
-            std::thread holder([&hold] {
-                resv_host_rmw(
-                    PORT,
-                    [](std::uint8_t*, void* user) -> int {
-                        auto& h = *static_cast<Hold*>(user);
-                        h.holding = true;
-                        while (!h.release) std::this_thread::sleep_for(std::chrono::microseconds(100));
-                        return 0; /* stores nothing */
-                    },
-                    &hold);
-            });
-            CHECK(wait_for([&] { return hold.holding.load(); }), "the line is held");
-            std::thread pusher([copy, &a] {
-                const std::int32_t rc = copy ? jq2_port_copy_push(PORT, a.desc, 64, 64, 0, 1)
-                                             : jq2_port_push_job(PORT, a.desc, 64, 0, 1);
+            const std::uint32_t desc = spec(0).desc;
+            g_gate.armed = true;
+            std::thread([copy, desc] {
+                const std::int32_t rc = copy ? jq2_port_copy_push(PORT, desc, 64, 64, 0, 1)
+                                             : jq2_port_push_job(PORT, desc, 64, 0, 1);
                 std::fprintf(stderr, "the stop did not happen: the push returned 0x%X\n", unsigned(rc));
-            });
-            std::this_thread::sleep_for(std::chrono::milliseconds(300)); /* past check_push, waiting on the line */
+                g_gate.returned = true;
+            }).detach();
+            CHECK(wait_for([] { return g_gate.reached.load(); }), "the push passed its checks");
             CHECK(jq2_port_destroy(PORT) == 0, "port destroy");
             CHECK(jq2_queue_shutdown(QUEUE) == 0, "shutdown");
             std::uint32_t exit_value = 0;
             CHECK(jq2_queue_join(QUEUE, &exit_value) == 0, "join: the workers are gone");
-            hold.release = true;
-            pusher.join();
-            holder.join();
+            g_gate.release = true;
+            wait_for([] { return g_gate.returned.load(); }, 10000); /* the stop ends the process first */
         },
         "jq2-state", {"reason=push-after-shutdown"});
 }

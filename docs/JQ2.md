@@ -626,9 +626,13 @@ channel layer and LV2 event flags; labels `spurs;t0;tsan`:
   `jq2-wake` with exit 70: a credit that finds an event-flag waiter with id 64
   (`reason=waiter-id`), a 65th concurrent blocked Sync (`reason=waiter-id`), and
   a blocked Sync whose event flag was destroyed (`reason=wait`, with `rc`).
-- `stop-push-shutdown`, `stop-copy-push-shutdown`: a push held at its port-line
-  update while the port is destroyed and the queue shut down, then released:
-  `jq2-state` `reason=push-after-shutdown` (plain and copy).
+- `stop-push-shutdown`, `stop-copy-push-shutdown`: a push parked by the test seam
+  `ExecutorHooks::on_push_checked` (called on the pushing thread after the
+  checks and before the port-line update; null in production) while the port is
+  destroyed and the queue shut down and joined, then released: `jq2-state`
+  `reason=push-after-shutdown` (plain and copy). The seam exists because
+  the reservation model shows no contention on a held line and a sleep orders
+  nothing; the pusher is detached since its stop ends the process.
 - `join`: `Shutdown` is `BUSY` with a live port, `Join` before `Shutdown` is
   `STAT`, `Join` returns only after the held job and the other eleven finished,
   guest bytes outside the queue's blocks are untouched; a second run joins with
