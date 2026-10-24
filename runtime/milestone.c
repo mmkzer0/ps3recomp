@@ -47,6 +47,7 @@ static int       g_full_warned;       /* guarded by g_lock */
 static int       g_enabled = -1;
 static FILE*     g_out;               /* guarded by g_lock */
 static int       g_dumped;            /* guarded by g_lock */
+static int       g_dump_claimed;      /* atomic: the first dump call wins */
 
 /* Counts are the one part of the record a killed process would otherwise lose,
  * and "is it still drawing?" is exactly the question a blank or hung run asks.
@@ -108,7 +109,11 @@ static int ms_enabled(void)
             if (g_out) {
                 fprintf(g_out, "# ps3recomp milestone log v1\n");
                 fflush(g_out);
+                /* The process can end two ways: quick_exit() for a guest exit,
+                 * exit() for a harness whose entry function returned. Register
+                 * on both; ps3_ms_dump() runs once. */
                 atexit(ps3_ms_dump);
+                at_quick_exit(ps3_ms_dump);
                 e = 1;
             } else {
                 fprintf(stderr, "[milestone] cannot open %s -- log disabled\n", path);
@@ -277,6 +282,10 @@ void ps3_ms_dump(void)
 {
     if (ms_enabled() != 1) return;
 
+    /* atexit and at_quick_exit both carry this handler, and a caller may also
+     * invoke it directly. The first call claims it; the rest are no-ops. */
+    if (__atomic_exchange_n(&g_dump_claimed, 1, __ATOMIC_ACQ_REL)) return;
+
     ms_lock();
     if (g_dumped || !g_out) { ms_unlock(); return; }
     g_dumped = 1;
@@ -287,4 +296,8 @@ void ps3_ms_dump(void)
     fclose(g_out);
     g_out = NULL;
     ms_unlock();
+
+    /* quick_exit does not flush stdio, so every handler gets its own output
+     * out; registration order then does not matter. */
+    fflush(NULL);
 }

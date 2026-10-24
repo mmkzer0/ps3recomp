@@ -5,6 +5,7 @@
  */
 
 #include "cellGameExec.h"
+#include "ps3emu/host_exit.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_write32 -- guest addrs */
 #include <stdio.h>
 #include <string.h>
@@ -65,7 +66,9 @@ void cellGameExitToShelf(void)
                s_exit_param.titleId, s_exit_param.type);
     }
 
-    exit(0);
+    /* The same guest-exit shape as sys_process_exit: threads are still live,
+     * so no static destructor may run. See ps3emu/host_exit.h. */
+    ps3_host_exit(0);
 }
 
 s32 cellGameGetBootGameInfo(u32* type, char* dirName, u32* execData)

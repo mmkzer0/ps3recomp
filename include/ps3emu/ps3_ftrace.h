@@ -124,9 +124,11 @@ static inline void ps3_ft_dump(void)
     }
     fclose(f);
     fprintf(stderr, "[ftrace] wrote %u spans (%u dropped) to %s\n", n, s->dropped, s->path);
+    /* quick_exit does not flush stdio; a handler flushes its own output. */
+    fflush(NULL);
 }
 
-static inline void ps3_ft_dump_atexit(void) { ps3_ft_dump(); }
+static inline void ps3_ft_dump_at_exit(void) { ps3_ft_dump(); }
 
 /* First hook: read PS3_FTRACE once. Hooks see "off" while another thread is
  * still setting up, which only loses spans before the window anyway. */
@@ -158,7 +160,11 @@ static inline int ps3_ft_init(void)
                 s->base = ps3_ft_now();
                 s->start = s->base + (uint64_t)(start * 1e9);
                 s->end = s->start + (uint64_t)(secs * 1e9);
-                atexit(ps3_ft_dump_atexit);
+                /* Both ways a process ends: quick_exit() for a guest exit and
+                 * exit() for a harness that returned from main. The dump only
+                 * runs on the one that happens. */
+                atexit(ps3_ft_dump_at_exit);
+                at_quick_exit(ps3_ft_dump_at_exit);
                 fprintf(stderr, "[ftrace] recording %.1f s from t=%.1f s into %s\n", secs, start, s->path);
                 on = 2;
             }

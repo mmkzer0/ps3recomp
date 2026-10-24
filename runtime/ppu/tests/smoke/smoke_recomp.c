@@ -29,10 +29,10 @@
  * Every step prints a marker line, and the line comes out of the image's own
  * string table, so the text in the log is evidence that ppu_load_elf copied
  * the PT_LOAD data into guest RAM. The same steps are recorded as ids, and
- * smoke_verify() -- installed with atexit() just before the guest exits, so
- * it runs before any other handler -- checks the whole run and decides the
- * process's exit code. It is deliberately the guest that decides: the point
- * of the exercise is that the guest ran.
+ * smoke_verify() -- installed with atexit() and at_quick_exit() just before the
+ * guest exits, so it runs before any other handler -- checks the whole run and
+ * decides the process's exit code. It is deliberately the guest that decides:
+ * the point of the exercise is that the guest ran.
  */
 #include "ppu_recomp.h"
 
@@ -81,9 +81,10 @@ extern PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*);
     } \
 } while (0)
 
-/* Published by libs/system/sysPrxForUser.c before it calls the host exit(). An
- * atexit handler cannot see what exit() was called with, so this is the only
- * way to check that the status the guest chose is the status that arrived. */
+/* Published by libs/system/sysPrxForUser.c before it calls the host exit. An
+ * exit handler cannot see what the host exit was called with, so this is the
+ * only way to check that the status the guest chose is the status that
+ * arrived. */
 extern int g_sys_process_exit_called;
 extern int32_t g_sys_process_exit_code;
 
@@ -202,6 +203,9 @@ static atomic_uint   g_create_marked;
 static const char*   g_fail[SMOKE_FAIL_CAP];
 static atomic_uint   g_fail_n;
 
+/* smoke_verify is registered on both exit paths; the first call claims it. */
+static atomic_uint   g_verified;
+
 static void smoke_fail(const char* what)
 {
     unsigned i = atomic_fetch_add(&g_fail_n, 1u);
@@ -312,10 +316,12 @@ void func_00010900(ppu_context* ctx) { ps3_hle_call(NID_cellGcmSetVBlankHandler,
 /* ---------------------------------------------------------------------------
  * The verdict.
  *
- * Runs from the host exit() inside sys_process_exit, installed immediately
- * before the guest makes that call so it is the FIRST atexit handler to run --
- * the frame clock and the RSX backend are still live at that moment, and
- * whatever they do while the process tears down is not this check's business.
+ * Runs from the host quick exit inside sys_process_exit, installed immediately
+ * before the guest makes that call so it is the FIRST quick-exit handler to run
+ * -- the frame clock and the RSX backend are still live at that moment, and
+ * whatever they do while the process exits is not this check's business. It is
+ * registered with atexit() too, for a harness whose entry function returns
+ * instead; whichever exit runs, it reports once.
  * -----------------------------------------------------------------------*/
 static const char* const k_step_name[SMOKE_STEP_COUNT] = {
     "entry", "image", "hle", "thread-create", "thread-body",
@@ -324,6 +330,8 @@ static const char* const k_step_name[SMOKE_STEP_COUNT] = {
 
 static void smoke_verify(void)
 {
+    if (atomic_exchange(&g_verified, 1u)) return;   /* registered on both paths */
+
     unsigned n = atomic_load(&g_mark_n);
     unsigned frames = ppu_boot_frames_presented();
     unsigned flips  = cellGcm_flip_request_count();
@@ -621,10 +629,13 @@ void func_00010000(ppu_context* ctx)
 
     smoke_mark(ctx, SMOKE_STEP_EXIT);
 
-    /* Installed last so it runs first: exit() calls handlers in reverse order
-     * of registration, and this one must get its verdict out while the rest of
-     * the process is still standing. */
+    /* Installed last so it runs first: handlers run in reverse order of
+     * registration, and this one must get its verdict out while the rest of
+     * the process is still standing. Both exits carry it -- quick_exit() for
+     * the guest's sys_process_exit, exit() for a harness that returns from
+     * main -- and it reports once. */
     atexit(smoke_verify);
+    at_quick_exit(smoke_verify);
 
     ctx->gpr[3] = SMOKE_EXIT_STATUS;
     func_00010700(ctx); DRAIN_TRAMPOLINE(ctx);

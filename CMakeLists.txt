@@ -498,8 +498,33 @@ if(PS3RECOMP_BUILD_TESTS)
     add_test(NAME log_first COMMAND test_log_first)
     set_tests_properties(log_first PROPERTIES LABELS "runtime;t0")
 
+    # A guest exit ends the host process while the PPU, SPU, RSX and audio host
+    # threads are still running, so the runtime exits with quick_exit(): no
+    # C++ static destructor runs under a live thread. The fixture pairs such a
+    # destructor with a host thread that keeps writing a global, and checks
+    # that its quick-exit diagnostic reaches a pipe -- quick_exit flushes
+    # nothing, so the handler flushes its own output. See ps3emu/host_exit.h.
+    add_executable(test_quick_exit
+        tests/test_quick_exit.c
+        tests/test_quick_exit_static.cpp
+        runtime/host/host_stubs.c)
+    target_include_directories(test_quick_exit PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/system"
+        "${CMAKE_CURRENT_SOURCE_DIR}/runtime"
+        "${CMAKE_CURRENT_SOURCE_DIR}/runtime/platform")
+    target_link_libraries(test_quick_exit PRIVATE ps3recomp_runtime)
+    set_target_properties(test_quick_exit PROPERTIES LINKER_LANGUAGE CXX)
+
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
+        # The guest exit path itself: status, the flush-through-a-pipe and the
+        # static destructor that must stay unrun.
+        add_test(NAME quick_exit
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_quick_exit.py"
+                $<TARGET_FILE:test_quick_exit>)
+        set_tests_properties(quick_exit PROPERTIES LABELS "runtime;t0" TIMEOUT 120)
         add_test(NAME spinlock_word_width
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spinlock_word_width.py")

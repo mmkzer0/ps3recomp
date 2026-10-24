@@ -64,9 +64,10 @@ void ps3_msf(const char* fmt, ...);
  * line for it. */
 void ps3_ms_kv(const char* key, long long value);
 
-/* Write the final counts section and close the log. Registered with atexit() on
- * first use; calling it directly is safe and idempotent. Counts are also
- * checkpointed as the run goes, so this is the tidy ending, not the only one. */
+/* Write the final counts section and close the log. Registered with atexit()
+ * and at_quick_exit() on first use; calling it directly is safe and idempotent.
+ * Counts are also checkpointed as the run goes, so this is the tidy ending, not
+ * the only one. */
 void ps3_ms_dump(void);
 
 #ifdef __cplusplus

@@ -9,6 +9,7 @@
 #include "sysPrxForUser.h"
 #include "../../runtime/memory/vm.h"
 #include <ps3emu/guest_call.h>
+#include <ps3emu/host_exit.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_write32: translate + byte-swap */
 #include <stdio.h>
 #include <stdarg.h>
@@ -103,14 +104,15 @@ static u32 s_next_heap_id = 1;
  * Process management
  * -----------------------------------------------------------------------*/
 
-/* The status the guest asked to exit with, published before the host exit()
- * runs. exit() gives its argument to _exit and to nothing else -- an atexit
- * handler cannot read it -- so without this the only place a guest's chosen
- * status is visible is the process's own exit code. That forces a harness to
- * exit with the guest's status rather than with its own verdict about the run,
- * and makes "the guest asked for 0" indistinguishable from "the harness fell
- * through and returned 0". Written before any of the diagnostic detours below,
- * so a parked or held exit still records what was asked for. */
+/* The status the guest asked to exit with, published before the host exit
+ * runs. The host exit gives its argument to _exit and to nothing else -- an
+ * atexit or at_quick_exit handler cannot read it -- so without this the only
+ * place a guest's chosen status is visible is the process's own exit code. That
+ * forces a harness to exit with the guest's status rather than with its own
+ * verdict about the run, and makes "the guest asked for 0" indistinguishable
+ * from "the harness fell through and returned 0". Written before any of the
+ * diagnostic detours below, so a parked or held exit still records what was
+ * asked for. */
 int g_sys_process_exit_called = 0;
 s32 g_sys_process_exit_code   = 0;
 
@@ -141,7 +143,13 @@ void sys_process_exit(s32 exitcode)
 #endif
         }
     }
-    exit(exitcode);
+    /* lv2 ends every thread before it tears anything down; the host cannot, so
+     * this must not be exit(): its atexit handlers and C++ static destructors
+     * would run while the PPU, SPU, RSX and audio host threads still use the
+     * mutexes, registries and containers they destroy -- undefined behaviour
+     * that surfaces as a crash on the way out. ps3_host_exit flushes stdio and
+     * calls quick_exit(), which runs no static destructor. */
+    ps3_host_exit(exitcode);
 }
 
 s32 sys_process_getpid(void)

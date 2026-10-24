@@ -26,6 +26,7 @@
 #include "ppu_recomp.h"
 #include "ps3emu/milestone.h"   /* ps3_ms / ps3_ms_kv -- boot milestone log */
 #include "ps3emu/config.h"      /* ps3_config_load */
+#include "ps3emu/host_exit.h"   /* ps3_host_exit -- guest exit while threads run */
 /* PPU_THREAD_LOCAL only -- NOT ppu_context.h, which would redefine the struct
  * a generated ppu_recomp.h already declares. Ports generated before the
  * qualifier existed do not define it, so the scaffold must carry its own
@@ -1260,11 +1261,9 @@ int main(int argc, char** argv)
 #endif
     int rc = ppu_run(entry, stack_top);
     printf("\n[boot] ppu_run returned %d (entry function unwound)\n", rc);
-    /* A guest that called sys_process_exit never reaches this line: that path
-     * ends in the host exit(). Getting here means the entry function returned
-     * instead, so hand back the status the guest published if it published one
-     * -- returning a hardcoded 0 reported success for a run that never got
-     * anywhere, which is exactly the kind of green a boot harness must not
-     * produce. */
-    return g_sys_process_exit_called ? (int)g_sys_process_exit_code : 0;
+    /* A guest that called sys_process_exit never reaches this line. Getting
+     * here means the entry function returned instead, and the frame clock and
+     * RSX backend are still running: exit() would tear their state down, so
+     * hand back the published status through the same quick exit. */
+    ps3_host_exit(g_sys_process_exit_called ? (int)g_sys_process_exit_code : 0);
 }
