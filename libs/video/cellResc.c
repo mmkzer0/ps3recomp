@@ -27,14 +27,6 @@ static CellRescInitConfig s_config;
 static u32 s_display_mode = CELL_RESC_1280x720;
 static CellRescSrc s_src[8]; /* up to 8 color buffers */
 static CellRescDsts s_dsts[4]; /* one per display mode */
-/* Guest OPD addresses, not host function pointers: what a title passes is a
- * guest function descriptor, and calling it as a host pointer is a crash
- * waiting for the first title that sets one. Invoked through ps3_invoke_guest,
- * the same way cellGcmSetFlipHandler's is. */
-static u32 s_flip_handler_opd = 0;
-static u32 s_vblank_handler_opd = 0;
-static s32 s_flip_status = 0;
-static u64 s_last_flip_time = 0;
 static float s_aspect_h = 1.0f;
 static float s_aspect_v = 1.0f;
 static float s_pal_ratio = 0.5f;
@@ -46,6 +38,16 @@ static u32 s_dst_buffer_size = 0;
 /* The SDK version lv2 syscall 25 reports: the title's PROC_PARAM, loaded by ppu_load_elf
  * (runtime/syscalls/sdk_version.c). */
 extern u32 ps3_process_sdk_version(void);
+
+/* True when the library keeps its own flip flag instead of asking libgcm (firmware 020044D0, 02004534,
+ * 02003704, 02003794, 02004590): the stored display mode (+0xD0) is 2 (720x576) and the PAL temporal
+ * mode (+0x10) is neither 0 nor 5. Every other configuration, 720p included, is a plain call to the
+ * libgcm export. The library flag (+0x1D8) is set by the library's own flip handler and not modelled:
+ * that configuration stops instead of answering. */
+static int resc_has_own_flip_flag(void)
+{
+    return s_display_mode == CELL_RESC_720x576 && s_config.palTemporalMode != 0 && s_config.palTemporalMode != 5;
+}
 
 static int resc_dsts_index(u32 mode);
 static u32 resc_dsts_buffer_size(u32 mode, const CellRescDsts* rec);
@@ -130,10 +132,6 @@ s32 cellRescInit(const CellRescInitConfig* initConfig)
             s_dsts[i].heightAlign = 8;
         }
     }
-    s_flip_handler_opd = 0;
-    s_vblank_handler_opd = 0;
-    s_flip_status = 0;
-    s_last_flip_time = 0;
     s_aspect_h = 1.0f;
     s_aspect_v = 1.0f;
     s_cur_prog = RESC_PROG_DC;   /* 02003A2C: +0xFC = +0xDC */
@@ -617,16 +615,12 @@ s32 cellRescSetConvertAndFlip(void* context, s32 index)
     cellGcm_emit_flip_command(ctx, s_frame_toggle & 0xFFu);
     s_frame_toggle ^= 1u;
 
-    s_flip_status = 0;      /* flip complete */
-    s_last_flip_time++;
 
     { static int n = 0;
       if (PS3_LOG_FIRST(n, 4))
           printf("[cellResc] SetConvertAndFlip(ctx=0x%08X, src=%d) -> convert stream + flip of buffer %u\n",
                  ctx, index, s_frame_toggle ^ 1u); }
 
-    if (s_flip_handler_opd)
-        ps3_invoke_guest(s_flip_handler_opd, 1, 0, 0, 0, 0, 0, 0, 0);
 
     return CELL_OK;
 }
@@ -659,17 +653,29 @@ s32 cellRescSetWaitFlip(void* context)
     return callback ? 0 : (s32)ctx;
 }
 
+/* cellRescSetFlipHandler / cellRescSetVBlankHandler: firmware 02003704 / 02003794 (exports 020002E8 /
+ * 02000314). With the library initialised and a display mode set, any mode but 720x576 hands the
+ * handler to libgcm (cellGcmSetFlipHandler 0200A56C, NID 0xA41EF7E8; cellGcmSetVBlankHandler 0200A5AC)
+ * and keeps none itself, so the driver's flip and vblank deliver it. [INFERENCE: before a display mode
+ * is set the firmware parks the handler in a library global for its own handler to call; the title
+ * is not told apart here and gets the same delivery.] */
 s32 cellRescSetFlipHandler(void (*handler)(u32))
 {
-    s_flip_handler_opd = (u32)(uintptr_t)handler;
-    printf("[cellResc] SetFlipHandler(opd=0x%08X)\n", s_flip_handler_opd);
+    if (resc_has_own_flip_flag())
+        ps3_stop_gcm_unmodelled("cellRescSetFlipHandler", "pal-flip-flag",
+                                "720x576 with a PAL temporal mode routes the handler through the library's own flip handler");
+    printf("[cellResc] SetFlipHandler(opd=0x%08X)\n", (u32)(uintptr_t)handler);
+    cellGcmSetFlipHandler(handler);
     return CELL_OK;
 }
 
 s32 cellRescSetVBlankHandler(void (*handler)(u32))
 {
-    s_vblank_handler_opd = (u32)(uintptr_t)handler;
-    printf("[cellResc] SetVBlankHandler(opd=0x%08X)\n", s_vblank_handler_opd);
+    if (resc_has_own_flip_flag())
+        ps3_stop_gcm_unmodelled("cellRescSetVBlankHandler", "pal-flip-flag",
+                                "720x576 with a PAL temporal mode routes the handler through the library's own handler");
+    printf("[cellResc] SetVBlankHandler(opd=0x%08X)\n", (u32)(uintptr_t)handler);
+    cellGcmSetVBlankHandler(handler);
     return CELL_OK;
 }
 
@@ -682,33 +688,39 @@ s32 cellRescGetDisplayMode(u32* displayMode)
     return CELL_OK;
 }
 
+/* cellRescGetLastFlipTime: without the library flag the firmware (02004590, export 0200045C) returns
+ * cellGcmGetLastFlipTime (0200A52C, NID 0x63387071). */
 s32 cellRescGetLastFlipTime(u64* time)
 {
     if (!time)
         return (s32)CELL_RESC_ERROR_BAD_ARGUMENT;
+    if (resc_has_own_flip_flag())
+        ps3_stop_gcm_unmodelled("cellRescGetLastFlipTime", "pal-flip-flag",
+                                "720x576 with a PAL temporal mode keeps the flip time in the library object (+0x1B0)");
 
-    vm_write64((uint32_t)(uintptr_t)time, s_last_flip_time);
+    vm_write64((uint32_t)(uintptr_t)time, cellGcmGetLastFlipTime());
     return CELL_OK;
 }
 
+/* cellRescResetFlipStatus: firmware 02004534 (export 02000438, NID 0x129922A0). Without the library
+ * flag it is cellGcmResetFlipStatus (0200455C -> the stub at 0200A5EC, NID 0xB2E761D4). */
 void cellRescResetFlipStatus(void)
 {
-    s_flip_status = 1; /* waiting for next flip */
+    if (resc_has_own_flip_flag())
+        ps3_stop_gcm_unmodelled("cellRescResetFlipStatus", "pal-flip-flag",
+                                "720x576 with a PAL temporal mode keeps the flip flag in the library object (+0x1D8)");
+    cellGcmResetFlipStatus();
 }
 
+/* cellRescGetFlipStatus: firmware 020044D0 (export 0200040C, NID 0xC47C5C22). Without the library flag
+ * it is cellGcmGetFlipStatus (020044F8 -> 0200A54C, NID 0x72A577CE): WAITING until the flip the RSX
+ * executed has been completed by the driver. Nothing completes it here, and a poll never does. */
 s32 cellRescGetFlipStatus(void)
 {
-    /* Auto-complete pending flips when polled, so games don't stall
-     * waiting for events in the null renderer. */
-    if (s_flip_status == 1) {
-        s_flip_status = 0;
-        s_last_flip_time++;
-        if (s_flip_handler_opd)
-            ps3_invoke_guest(s_flip_handler_opd, 1, 0, 0, 0, 0, 0, 0, 0);
-        if (s_vblank_handler_opd)
-            ps3_invoke_guest(s_vblank_handler_opd, 1, 0, 0, 0, 0, 0, 0, 0);
-    }
-    return s_flip_status;
+    if (resc_has_own_flip_flag())
+        ps3_stop_gcm_unmodelled("cellRescGetFlipStatus", "pal-flip-flag",
+                                "720x576 with a PAL temporal mode keeps the flip flag in the library object (+0x1D8)");
+    return (s32)cellGcmGetFlipStatus();
 }
 
 s32 cellRescSetPalInterpolateDropFlexRatio(float ratio)

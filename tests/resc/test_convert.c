@@ -199,7 +199,10 @@ static void test_stream_and_toggle(void)
 
     /* Frame 0. */
     const uint32_t at0 = gr32(g_ctx + 8);
+    cellRescResetFlipStatus();
     CHECK(cellRescSetConvertAndFlip((void*)(uintptr_t)g_ctx, 2) == 0, "ConvertAndFlip frame 0");
+    CHECK(cellRescGetFlipStatus() == 1, "queueing the flip does not complete it: status %d, want WAITING (1)",
+          cellRescGetFlipStatus());
     const uint32_t cur0 = gr32(g_ctx + 8);
     CHECK(cur0 - at0 == 185u * 4u, "frame 0 appended %u bytes, want %u", cur0 - at0, 185u * 4u);
     compare_stream(at0, k_frame0, 185, "frame 0");

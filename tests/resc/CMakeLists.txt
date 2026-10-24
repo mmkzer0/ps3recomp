@@ -121,3 +121,23 @@ target_include_directories(test_resc_waitflip PRIVATE
 set_target_properties(test_resc_waitflip PROPERTIES LINKER_LANGUAGE CXX)
 add_test(NAME resc_waitflip COMMAND test_resc_waitflip)
 set_tests_properties(resc_waitflip PROPERTIES LABELS "resc;gcm;t0")
+
+# cellRescResetFlipStatus / GetFlipStatus / SetFlipHandler / SetVBlankHandler / GetLastFlipTime (libresc 02004534,
+# 020044D0, 02003704, 02003794, 02004590): libgcm's status, not a library flag that completes on a poll; the
+# 720x576 PAL-temporal configuration that keeps its own flag is a named stop.
+add_executable(test_resc_flipstatus
+    test_flipstatus.c
+    "${PROJECT_SOURCE_DIR}/runtime/host/host_stubs.c"
+)
+target_link_libraries(test_resc_flipstatus PRIVATE ps3recomp_runtime)
+if(NOT WIN32)
+    target_link_libraries(test_resc_flipstatus PRIVATE m)
+endif()
+target_include_directories(test_resc_flipstatus PRIVATE
+    "${PROJECT_SOURCE_DIR}/libs/video"
+    "${PROJECT_SOURCE_DIR}/include"
+    "${PROJECT_SOURCE_DIR}/runtime"
+)
+set_target_properties(test_resc_flipstatus PROPERTIES LINKER_LANGUAGE CXX)
+add_test(NAME resc_flipstatus COMMAND test_resc_flipstatus)
+set_tests_properties(resc_flipstatus PROPERTIES LABELS "resc;gcm;t0")
