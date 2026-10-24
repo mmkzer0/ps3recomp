@@ -24,6 +24,7 @@
 #include "ps3emu/stop.h"      /* ps3_stop_register_frontier */
 #include "ps3emu/config.h"    /* ps3_config_find_hle_stub */
 #include "ps3emu/hle_observer.h"
+#include "../syscalls/ppu_thread_id.h"   /* ppu_tid_diag_index: the in-flight tables are indexed by table slot */
 #include <atomic>
 #include <mutex>
 #include <unordered_set>
@@ -307,8 +308,8 @@ extern "C" void ps3_hle_dispatch(uint32_t nid, ppu_context* ctx)   /* C linkage:
      * ABI slot on every exit path (offset 40 = 0x28 is the reserved TOC doubleword). */
     struct _TocGuard { ppu_context* c; uint64_t toc, sp;
         ~_TocGuard(){ c->gpr[2] = toc; vm_write64(sp + 0x28, toc);
-                      unsigned t = (unsigned)c->thread_id;
-                      if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t].store(nullptr, std::memory_order_relaxed); }
+                      const unsigned t = ppu_tid_diag_index(c->thread_id);
+                      if (t && t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t].store(nullptr, std::memory_order_relaxed); }
     } _tg{ ctx, ctx->gpr[2], ctx->gpr[1] };
     /* Deliver any pending vblank/flip tick on THIS (guest) thread, serialized with
      * guest execution -- the vblank ticker only marks ticks pending; the handlers
@@ -712,11 +713,11 @@ extern "C" void ps3_hle_dispatch(uint32_t nid, ppu_context* ctx)   /* C linkage:
              * a very convincing wrong answer to chase. */
             g_last_hle_name.store(g_ctx[i].name, std::memory_order_relaxed);
             t_last_hle_name = g_ctx[i].name;
-            { unsigned t = (unsigned)ctx->thread_id;
-              if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t].store(g_ctx[i].name, std::memory_order_relaxed); }
+            { const unsigned t = ppu_tid_diag_index(ctx->thread_id);
+              if (t && t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t].store(g_ctx[i].name, std::memory_order_relaxed); }
             g_ctx[i].fn(ctx);
-            { unsigned t = (unsigned)ctx->thread_id;
-              if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t].store(nullptr, std::memory_order_relaxed); }
+            { const unsigned t = ppu_tid_diag_index(ctx->thread_id);
+              if (t && t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t].store(nullptr, std::memory_order_relaxed); }
             return;
         }
 
@@ -754,8 +755,8 @@ extern "C" void ps3_hle_dispatch(uint32_t nid, ppu_context* ctx)   /* C linkage:
                       if (s_ht < 0) s_ht = 0; }
       if (s_ht > 0) hle_top_note(nid, e->name, ctx, s_ht); }
     ps3_msf("hle:%s", e->name);
-    { unsigned t = (unsigned)ctx->thread_id;
-      if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t].store(e->name, std::memory_order_relaxed); }
+    { const unsigned t = ppu_tid_diag_index(ctx->thread_id);
+      if (t && t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t].store(e->name, std::memory_order_relaxed); }
     if (nid == 0xD0B1D189u /*cellGcmSetTile*/ || nid == 0xDC09357Eu /*SetDisplayBuffer*/) {
         static int _g=0; if (PS3_LOG_FIRST(_g, 8))
             fprintf(stderr, "[hle-trace] %s lr=0x%08X cia=0x%08X r3..r8=%08X %08X %08X %08X %08X %08X\n",

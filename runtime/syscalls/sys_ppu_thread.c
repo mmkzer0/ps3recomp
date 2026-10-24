@@ -21,6 +21,8 @@ static PPU_TLS int     s_exit_armed = 0;
 
 #include <stddef.h>
 #include "sys_ppu_thread.h"
+#include "ppu_thread_id.h"
+_Static_assert(PPU_THREAD_MAX == PPU_THREAD_SLOTS, "a thread id carries its slot in its low 6 bits");
 #include "../platform/win32_compat.h"   /* GetCurrentThreadId on POSIX */
 #include "ps3emu/ps3_ftrace.h"           /* PS3_FTRACE: thread names for the report */
 #include <string.h>
@@ -48,6 +50,12 @@ static PPU_TLS int     s_exit_armed = 0;
 ppu_thread_info       g_ppu_threads[PPU_THREAD_MAX];
 vm_stack_alloc        g_vm_stack_alloc;
 ppu_thread_entry_fn   g_ppu_thread_entry_trampoline = NULL;
+
+/* The id of the thread in each slot, for the sampling profiler only. ppu_prof_snapshot runs on another host thread
+ * without the table lock, and ctx.thread_id is part of the architectural context it must not read; this mirror is
+ * written with an atomic store where an id is assigned. */
+static uint32_t s_prof_tid[PPU_THREAD_MAX];
+static void prof_store(uint32_t* pc, uint32_t value);
 
 /* Simple mutex for thread table access */
 #ifdef _WIN32
@@ -79,6 +87,10 @@ static void table_unlock(void)
 #endif
 }
 
+/* Guest PPU thread ids (ppu_thread_id.h): id = serial * PPU_THREAD_MAX + slot + 1, the serial counting creations
+ * (main is serial 0, slot 0, id 1). Guarded by the table lock. */
+static uint64_t s_next_serial = 1;
+
 /* Find a free slot. Returns index or -1. Must be called under lock. */
 static int find_free_slot(void)
 {
@@ -89,12 +101,15 @@ static int find_free_slot(void)
     return -1;
 }
 
-/* Find thread by ID. The ID is the index + 1 (0 is invalid). */
+/* Find a thread by id: the slot is in the id, and the slot must still hold that id. A slot that was freed (the thread
+ * exited and was joined or detached, or was not joinable) or reused holds another id or none, so a stale id is
+ * unknown from then on. Must be called under lock. */
 static ppu_thread_info* find_thread(uint64_t thread_id)
 {
-    if (thread_id == 0 || thread_id > PPU_THREAD_MAX) return NULL;
-    ppu_thread_info* t = &g_ppu_threads[thread_id - 1];
-    if (t->state == PPU_THREAD_STATE_FREE) return NULL;
+    const int slot = ppu_tid_slot(thread_id);
+    if (slot < 0) return NULL;
+    ppu_thread_info* t = &g_ppu_threads[slot];
+    if (t->state == PPU_THREAD_STATE_FREE || t->ctx.thread_id != thread_id) return NULL;
     return t;
 }
 
@@ -248,6 +263,7 @@ uint64_t ppu_thread_register_main(void)
     if (t->state == PPU_THREAD_STATE_FREE) {
         memset(t, 0, sizeof(*t));
         t->ctx.thread_id = 1;
+        prof_store(&s_prof_tid[0], 1u);
         t->state    = PPU_THREAD_STATE_RUNNING;
         t->joinable = 0;                    /* nobody joins the main thread */
         strncpy(t->name, "main", sizeof(t->name) - 1);
@@ -307,7 +323,7 @@ int ppu_prof_snapshot(int idx, unsigned* tid, unsigned* cia, const char** name)
         return *cia != 0;
     }
     if (t->state == PPU_THREAD_STATE_FREE) return 0;
-    *tid = (unsigned)(idx + 1);
+    *tid = prof_load(&s_prof_tid[idx]);
     *cia = prof_load(&t->prof_pc);
     *name = t->name;
     return 1;
@@ -325,9 +341,9 @@ void ppu_prof_stamp(void* vctx, unsigned lr)
         (candidate - base) % sizeof(ppu_thread_info) == 0) {
         t = (ppu_thread_info*)candidate;
     } else if (vctx) {
-        const uint64_t id = ((ppu_context*)vctx)->thread_id;
-        if (id >= 1 && id <= PPU_THREAD_MAX && g_ppu_threads[id - 1].ctx.thread_id == id)
-            t = &g_ppu_threads[id - 1];
+        const int slot = ppu_tid_slot(((ppu_context*)vctx)->thread_id);
+        if (slot >= 0 && g_ppu_threads[slot].ctx.thread_id == ((ppu_context*)vctx)->thread_id)
+            t = &g_ppu_threads[slot];
     }
     if (t) prof_store(&t->prof_pc, lr);
     else prof_store(&s_prof_main_pc, lr);
@@ -353,6 +369,12 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
         table_unlock();
         return (int64_t)(int32_t)CELL_EAGAIN;
     }
+    /* Every guest id below the host-callback range spent: refused, never wrapped onto an id in use. */
+    const uint64_t thread_id_next = ppu_tid_make(s_next_serial, (unsigned)slot);
+    if (thread_id_next >= PPU_GUEST_TID_END) {
+        table_unlock();
+        return (int64_t)(int32_t)CELL_EAGAIN;
+    }
 
     ppu_thread_info* t = &g_ppu_threads[slot];
     memset(t, 0, sizeof(*t));
@@ -373,8 +395,12 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
     /* Copy TOC from creating thread */
     t->ctx.gpr[2] = ctx->gpr[2];
 
-    uint64_t thread_id = (uint64_t)(slot + 1);
+    /* An id is taken once and never again (lv2 hands out increasing ids; RPCS3 does too): a guest that keeps the id
+     * of an exited thread must not find a later thread under it, whichever slot backs it. */
+    uint64_t thread_id = thread_id_next;
+    s_next_serial++;
     t->ctx.thread_id = thread_id;
+    prof_store(&s_prof_tid[slot], (uint32_t)thread_id);   /* < PPU_GUEST_TID_END, fits */
 
     t->state      = PPU_THREAD_STATE_RUNNING;
     t->priority   = priority;
@@ -1117,11 +1143,12 @@ int64_t sys_ppu_thread_get_priority(ppu_context* ctx)
     table_lock();
     ppu_thread_info* t = find_thread(tid);
     if (!t) {
-        /* The main thread (and any thread we didn't spawn via sys_ppu_thread_create)
-         * isn't in our table. Returning ESRCH here is fatal for engines that query
-         * their own priority at startup (PhyreEngine PApplication::PlatformInit ->
-         * "Error initializing PSSG"). Report a sane default priority + success. */
         table_unlock();
+        /* A host-callback context (ppu_loader.cpp: ids from 0x7F000000) is a guest thread to the code it runs, and
+         * is in no table: it asks for its own priority and gets a sane default. Engines do that at startup
+         * (PhyreEngine PApplication::PlatformInit -> "Error initializing PSSG"). Any other id that is not in
+         * the table names no thread -- never one, or one that exited and was joined -- and ids are not reused. */
+        if (tid < PPU_GUEST_TID_END) return (int64_t)(int32_t)CELL_ESRCH;
         if (prio_addr != 0) {
             int32_t prio = 1000;
             int32_t* out = (int32_t*)vm_to_host(prio_addr);

@@ -28,7 +28,7 @@ extern "C" {
 #endif
 
 /* Maximum concurrent PPU threads */
-#define PPU_THREAD_MAX  64
+#define PPU_THREAD_MAX  64   /* = PPU_THREAD_SLOTS (ppu_thread_id.h) */
 
 /* Thread states */
 #define PPU_THREAD_STATE_FREE       0

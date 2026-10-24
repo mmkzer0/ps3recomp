@@ -81,7 +81,7 @@ int main(void)
         int64_t rc = create(0, &tid);
         if (rc != 0) { EXPECT_EQ(rc, 0); fprintf(stderr, "  create #%d (tid so far %d) failed\n", i + 1, ok); break; }
         ok++;
-        EXPECT_EQ(tid >= 2 && tid <= PPU_THREAD_MAX, 1);
+        EXPECT_EQ(tid >= 2, 1);   /* ids are counted up from 2, not slot numbers (tests/test_ppu_thread_ids.c) */
         settle();
     }
     EXPECT_EQ(ok, 3 * PPU_THREAD_MAX);
@@ -97,7 +97,8 @@ int main(void)
 
     /* 3. Negative control for the semantics: joinable threads (flags bit 0) that nobody joins keep their slot, so
      *    the table still fills up and the next create is refused with EAGAIN. */
-    for (int i = 0; i < PPU_THREAD_MAX - 1; i++) EXPECT_EQ(create(1, NULL), 0);
+    uint64_t first_joinable = 0;
+    for (int i = 0; i < PPU_THREAD_MAX - 1; i++) EXPECT_EQ(create(1, i ? NULL : &first_joinable), 0);
     settle();
     EXPECT_EQ(used_slots(), PPU_THREAD_MAX - 1);             /* all FINISHED, none freed */
     EXPECT_EQ(create(1, NULL), (int64_t)(int32_t)CELL_EAGAIN);
@@ -106,7 +107,7 @@ int main(void)
     /* 4. Joining one frees its slot for a new create. */
     {
         ppu_context ctx; memset(&ctx, 0, sizeof(ctx));
-        ctx.gpr[3] = 5;            /* tid 5 */
+        ctx.gpr[3] = first_joinable;
         EXPECT_EQ(sys_ppu_thread_join(&ctx), 0);
         EXPECT_EQ(create(1, NULL), 0);
     }

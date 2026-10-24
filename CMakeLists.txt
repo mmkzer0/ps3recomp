@@ -641,6 +641,15 @@ if(PS3RECOMP_BUILD_TESTS)
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_savedata_enable_overlay.py")
         set_tests_properties(savedata_enable_overlay PROPERTIES LABELS "ppu;t0" TIMEOUT 300)
+        # PPU thread ids: counted up, never reused (a stale id is ESRCH), distinct under concurrent creates.
+        add_test(NAME ppu_thread_ids
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_thread_ids.py")
+        set_tests_properties(ppu_thread_ids PROPERTIES LABELS "runtime;t0;tsan" TIMEOUT 300)
+        add_test(NAME ppu_thread_slots
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_thread_slots.py")
+        set_tests_properties(ppu_thread_slots PROPERTIES LABELS "runtime;t0" TIMEOUT 300)
         # docs/DIAGNOSTICS.md is hand-maintained prose; the checker requires the
         # knob set (and its summary counts) to match the sources, not the whole
         # generated text.

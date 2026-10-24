@@ -42,6 +42,7 @@
 #include "ps3emu/config.h"       /* ps3_ppu_initial_vscr */
 #include "ps3emu/identity.h"     /* ps3_identity_check_image */
 #include "ps3emu/milestone.h"   /* ps3_ms / ps3_msf -- boot milestone log */     /* ppu_context, func decls, ppu_recomp_register */
+#include "../syscalls/ppu_thread_id.h"   /* ppu_tid_diag_index: the in-flight tables are indexed by table slot */
 #include "../memory/vm.h"   /* vm_commit -- sys_mmapper_search_and_map maps for real */
 #include "../platform/win32_compat.h"      /* Win32 types, interlocked ops, Sleep/QPC on POSIX */
 #include "../platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
@@ -2815,9 +2816,10 @@ extern "C" uint32_t g_sc_inflight[PS3_SC_INFLIGHT_MAX] = { 0 };
  * above rather than a tracer of its own. */
 static void sc_stop_frontier(uint64_t thread_id, ps3_stop_frontier* out)
 {
-    if (thread_id >= PS3_SC_INFLIGHT_MAX || !g_sc_inflight[thread_id]) return;
+    const unsigned t = ppu_tid_diag_index(thread_id);
+    if (!t || t >= PS3_SC_INFLIGHT_MAX || !g_sc_inflight[t]) return;
     out->has_syscall = 1;
-    out->syscall_num = g_sc_inflight[thread_id];
+    out->syscall_num = g_sc_inflight[t];
 }
 [[maybe_unused]] static const int s_sc_frontier_registered =
     (ps3_stop_register_frontier(sc_stop_frontier), 0);
@@ -2855,8 +2857,8 @@ extern "C" void lv2_syscall(ppu_context* ctx)
      * syscall, and at which guest call site (lr at entry). */
     struct _ScGuard {
         ppu_context* c; uint64_t num, t0; uint32_t lr;
-        ~_ScGuard() { unsigned t = (unsigned)c->thread_id;
-                      if (t < PS3_SC_INFLIGHT_MAX) g_sc_inflight[t] = 0;
+        ~_ScGuard() { const unsigned t = ppu_tid_diag_index(c->thread_id);
+                      if (t && t < PS3_SC_INFLIGHT_MAX) g_sc_inflight[t] = 0;
                       if (PS3_FT_ON() && t0) {
                           const uint64_t t1 = ps3_ft_now();
                           if (num == 141) ps3_ft_usleep(t, lr, t0, t1);   /* sys_timer_usleep */
@@ -2864,8 +2866,8 @@ extern "C" void lv2_syscall(ppu_context* ctx)
                               ps3_ft_span(PS3_FT_SYSCALL, t, (uint32_t)num, lr, t0, t1);
                       } }
     } _sg{ ctx, num, PS3_FT_ON() ? ps3_ft_now() : 0, (uint32_t)ctx->lr };
-    { unsigned t = (unsigned)ctx->thread_id;
-      if (t < PS3_SC_INFLIGHT_MAX) g_sc_inflight[t] = (uint32_t)num; }
+    { const unsigned t = ppu_tid_diag_index(ctx->thread_id);
+      if (t && t < PS3_SC_INFLIGHT_MAX) g_sc_inflight[t] = (uint32_t)num; }
     /* Guest-PC breadcrumb for the sampling profiler: record the syscall
      * callsite (lr) in the runtime-side thread info. cia itself is the thread
      * entry OPD (load-bearing for the entry trampoline) -- do not touch it. */
@@ -3681,8 +3683,8 @@ static uint32_t ppu_cb_entry_sp(const ppu_context* active, bool* on_host_slot)
  * first callback and keeps it for life, and ids are never recycled, so a lock a
  * dead host thread still holds is not inherited by a later one.
  *
- * The range sits above every real guest thread id. Those are the thread-table
- * index + 1 (1..PPU_THREAD_MAX, sys_ppu_thread.h) and stay far below 0x7F000000.
+ * The range sits above every real guest thread id. Those are handed out once, in increasing order, and end below
+ * 0x7F000000 (ppu_thread_id.h: serial * 64 + slot + 1).
  * Its fixed exclusive end is 0x7FFF0000. Fibers inherit the executing PPU
  * worker's identity; they no longer manufacture a parentless owner id.
  * The top also stops short of 0x7FFFFFFE, which sys_ppu_thread_get_id reports
