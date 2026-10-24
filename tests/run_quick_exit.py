@@ -30,7 +30,7 @@ DESTRUCTOR = "[quick-exit] static destructor ran"
 
 def main(argv):
     if len(argv) != 2:
-        print("usage: test_quick_exit.py <fixture>", file=sys.stderr)
+        print("usage: run_quick_exit.py <fixture>", file=sys.stderr)
         return 2
 
     env = g.clean_env()

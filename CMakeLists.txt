@@ -522,7 +522,7 @@ if(PS3RECOMP_BUILD_TESTS)
         # static destructor that must stay unrun.
         add_test(NAME quick_exit
             COMMAND "${Python3_EXECUTABLE}"
-                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_quick_exit.py"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_quick_exit.py"
                 $<TARGET_FILE:test_quick_exit>)
         set_tests_properties(quick_exit PROPERTIES LABELS "runtime;t0" TIMEOUT 120)
         add_test(NAME spinlock_word_width

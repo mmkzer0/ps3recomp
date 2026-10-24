@@ -18,7 +18,7 @@
  *   - a host thread keeps writing a global, as the frame clock and the RSX
  *     backend keep writing the runtime's state over a guest's exit.
  *
- * Then it calls sys_process_exit(7) and never returns. tools/test_quick_exit.py
+ * Then it calls sys_process_exit(7) and never returns. tests/run_quick_exit.py
  * asserts status 7, the diagnostic present, the destructor marker absent.
  */
 #include "sysPrxForUser.h"          /* sys_process_exit */
