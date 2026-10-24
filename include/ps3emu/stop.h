@@ -80,7 +80,8 @@ extern "C" {
     X(JQ2_RING_ENTRY,           "jq2-ring-entry")                              \
     X(JQ2_WAKE,                 "jq2-wake")                                    \
     X(JQ2_STATE,                "jq2-state")                                   \
-    X(JQ2_JM_CALL,              "jq2-jm-call")
+    X(JQ2_JM_CALL,              "jq2-jm-call")                                 \
+    X(HLE_GUEST_RANGE,          "hle-guest-range")
 
 /* A fixed underlying type in C++ makes a kind outside the list (a caller's bug,
  * which the stop still reports as "invalid-kind") a well-defined value rather
@@ -136,6 +137,11 @@ PS3_NORETURN void ps3_stop(ps3_stop_kind kind, const char* what,
                            const char* remedy,
                            const ps3_stop_field* fields, size_t nfields,
                            const ps3_stop_site* site);
+
+/* Generic helper to raise PS3_STOP_HLE_GUEST_RANGE.
+ * Fields: func, arg, ea, size, limit. */
+PS3_NORETURN void ps3_stop_guest_range(const char* func, const char* arg,
+                                       uint64_t ea, uint64_t size, uint64_t limit);
 
 /* ---- frontier ---------------------------------------------------------- */
 

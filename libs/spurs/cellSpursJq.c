@@ -36,10 +36,13 @@
 s32 cellSpursJobQueueAttributeInitialize(CellSpursJobQueueAttribute* attr)
 {
     if (!attr) return JQ2_ERR_NULL_POINTER;
+    const u32 ea = GUEST_EA(attr);
+    if (!jq2_guest_range_ok(ea, 0x14)) {
+        ps3_stop_guest_range(__func__, "attr", ea, 0x14, jq2_guest_limit());
+    }
 
     /* 0x02000024-0x0200004C: +0x10 := 255 (its top byte +0x13 becomes 0xFF),
      * +0x04 := 4, +0x08 := 256, +0x0C..+0x0F := 0. +0x00 is left alone. */
-    const u32 ea = GUEST_EA(attr);
     vm_write32(ea + 0x10, 255);
     vm_write32(ea + 0x04, 4);
     vm_write32(ea + 0x08, 256);
@@ -55,7 +58,11 @@ s32 cellSpursJobQueueAttributeSetMaxSizeJobDescriptor(CellSpursJobQueueAttribute
     if (!attr) return JQ2_ERR_NULL_POINTER;
     /* 0x02000128-0x02000174: (size - 256) <= 767 and size & 127 == 0. */
     if (size < 256 || size > 1023 || (size & 127u) != 0) return JQ2_ERR_INVAL;
-    vm_write32(GUEST_EA(attr) + 0x08, size);
+    const u32 ea = GUEST_EA(attr);
+    if (!jq2_guest_range_ok(ea + 8, 4)) {
+        ps3_stop_guest_range(__func__, "attr", ea + 8, 4, jq2_guest_limit());
+    }
+    vm_write32(ea + 0x08, size);
     return JQ2_OK;
 }
 
@@ -67,6 +74,12 @@ s32 cellSpursJobQueueAttributeSetGrabParameters(CellSpursJobQueueAttribute* attr
      * +0x04 := arg3 and +0x10 := arg2. */
     if (grabParameters > 255 || maxGrab < 1 || maxGrab > 16) return JQ2_ERR_INVAL;
     const u32 ea = GUEST_EA(attr);
+    if (!jq2_guest_range_ok(ea + 4, 4)) {
+        ps3_stop_guest_range(__func__, "attr", ea + 4, 4, jq2_guest_limit());
+    }
+    if (!jq2_guest_range_ok(ea + 0x10, 4)) {
+        ps3_stop_guest_range(__func__, "attr", ea + 0x10, 4, jq2_guest_limit());
+    }
     vm_write32(ea + 0x04, maxGrab);
     vm_write32(ea + 0x10, grabParameters);
     return JQ2_OK;
@@ -75,28 +88,44 @@ s32 cellSpursJobQueueAttributeSetGrabParameters(CellSpursJobQueueAttribute* attr
 s32 cellSpursJobQueueAttributeSetSubmitWithEntryLock(CellSpursJobQueueAttribute* attr, s32 submitWithEntryLock)
 {
     if (!attr) return JQ2_ERR_NULL_POINTER;
-    vm_write8(GUEST_EA(attr) + 0x0C, (u8)submitWithEntryLock);   /* 0x020000B0 */
+    const u32 ea = GUEST_EA(attr);
+    if (!jq2_guest_range_ok(ea + 0x0C, 1)) {
+        ps3_stop_guest_range(__func__, "attr", ea + 0x0C, 1, jq2_guest_limit());
+    }
+    vm_write8(ea + 0x0C, (u8)submitWithEntryLock);   /* 0x020000B0 */
     return JQ2_OK;
 }
 
 s32 cellSpursJobQueueAttributeSetDoBusyWaiting(CellSpursJobQueueAttribute* attr, s32 doBusyWaiting)
 {
     if (!attr) return JQ2_ERR_NULL_POINTER;
-    vm_write8(GUEST_EA(attr) + 0x0D, (u8)doBusyWaiting);        /* 0x020000D4 */
+    const u32 ea = GUEST_EA(attr);
+    if (!jq2_guest_range_ok(ea + 0x0D, 1)) {
+        ps3_stop_guest_range(__func__, "attr", ea + 0x0D, 1, jq2_guest_limit());
+    }
+    vm_write8(ea + 0x0D, (u8)doBusyWaiting);        /* 0x020000D4 */
     return JQ2_OK;
 }
 
 s32 cellSpursJobQueueAttributeSetIsHaltOnError(CellSpursJobQueueAttribute* attr, s32 isHaltOnError)
 {
     if (!attr) return JQ2_ERR_NULL_POINTER;
-    vm_write8(GUEST_EA(attr) + 0x0E, (u8)isHaltOnError);        /* 0x020000F8 */
+    const u32 ea = GUEST_EA(attr);
+    if (!jq2_guest_range_ok(ea + 0x0E, 1)) {
+        ps3_stop_guest_range(__func__, "attr", ea + 0x0E, 1, jq2_guest_limit());
+    }
+    vm_write8(ea + 0x0E, (u8)isHaltOnError);        /* 0x020000F8 */
     return JQ2_OK;
 }
 
 s32 cellSpursJobQueueAttributeSetIsJobTypeMemoryCheck(CellSpursJobQueueAttribute* attr, s32 isCheck)
 {
     if (!attr) return JQ2_ERR_NULL_POINTER;
-    vm_write8(GUEST_EA(attr) + 0x0F, (u8)isCheck);              /* 0x0200011C */
+    const u32 ea = GUEST_EA(attr);
+    if (!jq2_guest_range_ok(ea + 0x0F, 1)) {
+        ps3_stop_guest_range(__func__, "attr", ea + 0x0F, 1, jq2_guest_limit());
+    }
+    vm_write8(ea + 0x0F, (u8)isCheck);              /* 0x0200011C */
     return JQ2_OK;
 }
 
@@ -136,15 +165,20 @@ s32 cellSpursShutdownJobQueue(void* queue)
 
 s32 cellSpursJoinJobQueue(void* queue, s32* exit_code)
 {
-    /* jq2_queue_join takes the one host pointer in this surface: the word the
-     * firmware writes through its out argument. The guest store happens here,
-     * after Join has stopped every worker (0x02000E04-0x02000E18, jq2fw-044). */
+    if (!queue || !exit_code) return JQ2_ERR_NULL_POINTER;
+    const u32 queue_ea = GUEST_EA(queue);
+    if ((queue_ea & 127u) != 0) return JQ2_ERR_ALIGN;
+
+    const u32 exit_ea = GUEST_EA(exit_code);
+    if (!jq2_guest_range_ok(exit_ea, 4)) {
+        ps3_stop_guest_range(__func__, "exit_code", exit_ea, 4, jq2_guest_limit());
+    }
+
     u32 value = 0;
-    const s32 rc = jq2_queue_join(GUEST_EA(queue), exit_code ? &value : NULL);
-    if (rc == JQ2_OK) vm_write32(GUEST_EA(exit_code), value);
+    const s32 rc = jq2_queue_join(queue_ea, &value);
+    if (rc == JQ2_OK) vm_write32(exit_ea, value);
     return rc;
 }
-
 /* ---- port -------------------------------------------------------------- */
 
 s32 cellSpursJobQueuePort2Create(void* port, void* queue)

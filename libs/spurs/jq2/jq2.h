@@ -60,10 +60,28 @@
 #define PS3RECOMP_SPURS_JQ2_JQ2_H
 
 #include <stdint.h>
+#include "ps3emu/stop.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+extern uint32_t ppu_vm_size;
+
+/* Returns the guest VM limit: ppu_vm_size if set, else 2^32. */
+static inline uint64_t jq2_guest_limit(void)
+{
+    return ppu_vm_size ? (uint64_t)ppu_vm_size : 0x100000000ull;
+}
+
+/* Returns 1 if [ea, ea+size) sits wholly within guest memory.
+ * Computes the bound in 64 bits so a large ea + size that would wrap past the
+ * top of the 32-bit space cannot wrap to a low address. */
+static inline int jq2_guest_range_ok(uint64_t ea, uint64_t size)
+{
+    const uint64_t limit = jq2_guest_limit();
+    return ea <= limit && size <= limit - ea;
+}
 
 #define JQ2_OK 0
 #define JQ2_ERR_AGAIN ((int32_t)0x80410A01u)

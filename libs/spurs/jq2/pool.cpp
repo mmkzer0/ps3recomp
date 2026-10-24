@@ -16,6 +16,7 @@
  */
 
 #include "pool.hpp"
+#include "jq2.h"
 
 #include "../../../include/ps3emu/endian.h"
 #include "../../../include/ps3emu/stop.h"
@@ -54,18 +55,6 @@ constexpr std::uint32_t kLineBytes = 128;
     return vm_base ? vm_base + static_cast<std::size_t>(ea)
                    : reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(ea));
 }
-
-/* Is [ea, ea+size) inside the guest's mapped memory? The bound is the one the
- * SPURS job loader applies (runtime/spu/spurs_job.c guest_range_ok): the VM
- * size when the host sized it, else the 32-bit space. Summed in 64 bits, so a
- * range near the top of the space cannot wrap to a low address. Checked before
- * any host pointer is formed from the EA. */
-[[nodiscard]] bool guest_range_ok(std::uint64_t ea, std::uint64_t size) noexcept
-{
-    const std::uint64_t limit = ppu_vm_size != 0 ? ppu_vm_size : 0x100000000ull;
-    return ea <= limit && size <= limit - ea;
-}
-
 /* Plain big-endian field loads at create time (the queue is not published yet,
  * so there is no concurrent writer; the class counts are read once). */
 [[nodiscard]] std::uint32_t load_be32(std::uint32_t ea) noexcept
@@ -323,6 +312,10 @@ std::unique_ptr<DescriptorPool> DescriptorPool::create(const PoolConfig& config,
         error = PoolError::inval;
         return nullptr;
     }
+    if (!jq2_guest_range_ok(config.pool_attr_ea, 0x20)) {
+        ps3_stop_guest_range("DescriptorPool::create", "pool_attr", config.pool_attr_ea, 0x20, jq2_guest_limit());
+    }
+
 
     std::array<std::uint32_t, kPoolClassCount> counts{};
     for (unsigned cls = 0; cls < kPoolClassCount; ++cls) {
@@ -391,6 +384,11 @@ std::unique_ptr<DescriptorPool> DescriptorPool::create(const PoolConfig& config,
         }
     }
 
+    const std::uint64_t pool_size = cursor - config.pool_ea;
+    if (!jq2_guest_range_ok(config.pool_ea, pool_size)) {
+        ps3_stop_guest_range("DescriptorPool::create", "pool", config.pool_ea, pool_size, jq2_guest_limit());
+    }
+
     auto pool = std::unique_ptr<DescriptorPool>(
         new DescriptorPool(config, wait_hook, std::move(classes), block_area_end,
                            static_cast<std::uint32_t>(cursor)));
@@ -402,6 +400,9 @@ void DescriptorPool::build_guest_layout(
     const std::array<std::uint32_t, kPoolClassCount>& counts)
 {
     const std::uint32_t queue = config_.queue_ea;
+
+    /* Dependency: [queue_ea, queue_ea + 0x1000) was validated by jq2_queue_create,
+     * which covers [queue_ea + 0x600, queue_ea + 0x700). */
 
     /* The create body memsets the queue before this runs; clearing the pool's
      * own 0x100-byte header makes create independent of that and leaves the
@@ -741,7 +742,7 @@ PoolError DescriptorPool::snapshot(std::uint32_t src_ea, std::uint32_t size,
      * the address space or copying overlapping regions (the firmware's vector
      * copy is forward). The range is checked against the runtime's mapped guest
      * memory before any host pointer is formed. */
-    if (!guest_range_ok(src_ea, size) || !guest_range_ok(dst_ea, size))
+    if (!jq2_guest_range_ok(src_ea, size) || !jq2_guest_range_ok(dst_ea, size))
         return PoolError::address;
     const std::uint64_t src_end = static_cast<std::uint64_t>(src_ea) + size;
     const std::uint64_t dst_end = static_cast<std::uint64_t>(dst_ea) + size;

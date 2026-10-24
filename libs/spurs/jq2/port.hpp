@@ -297,13 +297,7 @@ struct LocalPortLine {
  * words under it (the stdcx. retry loop), so `f` must be repeatable. */
 class GuestPortLine {
 public:
-    [[nodiscard]] static std::optional<GuestPortLine> at(std::uint32_t ea, PortStatus* error = nullptr) noexcept
-    {
-        const PortStatus st = check_port_ea(ea);
-        if (error != nullptr) *error = st;
-        if (st != PortStatus::ok) return std::nullopt;
-        return GuestPortLine(ea);
-    }
+    [[nodiscard]] static std::optional<GuestPortLine> at(std::uint32_t ea, PortStatus* error = nullptr) noexcept;
 
     template <class F>
     bool update(F&& f) const

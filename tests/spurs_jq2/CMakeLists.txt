@@ -96,7 +96,7 @@ set_tests_properties(jq2_port_race_stress PROPERTIES LABELS "spurs;stress" TIMEO
 # as a game-less host does.
 add_executable(test_jq2_executor test_jq2_executor.cpp
     "${PROJECT_SOURCE_DIR}/runtime/host/host_stubs.c")
-target_include_directories(test_jq2_executor PRIVATE "${PROJECT_SOURCE_DIR}/runtime/spu")
+target_include_directories(test_jq2_executor PRIVATE "${PROJECT_SOURCE_DIR}/runtime/spu" "${PROJECT_SOURCE_DIR}/include")
 target_link_libraries(test_jq2_executor PRIVATE ps3recomp_spurs_jq2 Threads::Threads)
 # The runtime carries C++ and Objective-C, so the C++ driver links.
 set_target_properties(test_jq2_executor PROPERTIES LINKER_LANGUAGE CXX)
@@ -161,3 +161,16 @@ target_include_directories(test_jq2_pool PRIVATE
 target_link_libraries(test_jq2_pool PRIVATE ps3recomp_spurs_jq2 Threads::Threads)
 add_test(NAME jq2_pool COMMAND test_jq2_pool)
 set_tests_properties(jq2_pool PROPERTIES LABELS "spurs;t0;tsan" TIMEOUT 120)
+
+add_executable(test_jq2_range test_jq2_range.cpp
+    "${PROJECT_SOURCE_DIR}/runtime/host/host_stubs.c")
+target_include_directories(test_jq2_range PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${PROJECT_SOURCE_DIR}/libs/spurs"
+    "${PROJECT_SOURCE_DIR}/runtime/spu"
+    "${PROJECT_SOURCE_DIR}/include"
+)
+target_link_libraries(test_jq2_range PRIVATE ps3recomp_spurs_jq2 ps3recomp_runtime Threads::Threads)
+set_target_properties(test_jq2_range PROPERTIES LINKER_LANGUAGE CXX)
+add_test(NAME jq2_range COMMAND test_jq2_range)
+set_tests_properties(jq2_range PROPERTIES LABELS "spurs;t0" TIMEOUT 120)

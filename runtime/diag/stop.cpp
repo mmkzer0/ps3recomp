@@ -229,4 +229,24 @@ void ps3_stop(ps3_stop_kind kind, const char* what, const char* remedy,
     std::_Exit(PS3_STOP_EXIT_CODE);
 }
 
+void ps3_stop_guest_range(const char* func, const char* arg,
+                          uint64_t ea, uint64_t size, uint64_t limit)
+{
+    char ea_s[24], sz_s[24], lim_s[24];
+    std::snprintf(ea_s, sizeof ea_s, "0x%llX", (unsigned long long)ea);
+    std::snprintf(sz_s, sizeof sz_s, "0x%llX", (unsigned long long)size);
+    std::snprintf(lim_s, sizeof lim_s, "0x%llX", (unsigned long long)limit);
+    const ps3_stop_field f[] = {
+        {"func", func ? func : "unknown"},
+        {"arg", arg ? arg : "unknown"},
+        {"ea", ea_s},
+        {"size", sz_s},
+        {"limit", lim_s},
+    };
+    ps3_stop(PS3_STOP_HLE_GUEST_RANGE,
+             "an HLE handler was given a guest EA or span outside guest memory",
+             "Fix the caller to pass an address inside guest memory, or enlarge ppu.vm_size.",
+             f, sizeof f / sizeof f[0], nullptr);
+}
+
 } // extern "C"
