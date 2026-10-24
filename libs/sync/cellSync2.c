@@ -602,7 +602,7 @@ s32 cellSync2SemaphoreRelease(u32 sem, u32 count, u32 notifierConfig)
         SemWait* w = sem_queue_pop(sem);
         w->notified = 1;
         if (w->fiber) {
-            if (cellFiberPpuSendSignal((CellFiberPpu*)(uintptr_t)w->fiber, NULL))
+            if (ps3_fiber_notify(w->fiber) != PS3_FIBER_NOTIFY_OK)
                 sem_unsupported(__func__, sem, 0, "fiber-notify");
         } else {
             wake_ppu = 1;

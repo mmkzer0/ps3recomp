@@ -33,26 +33,14 @@
 #endif
 
 /* ---------------------------------------------------------------------------
- * Guest memory. cellFiber.c writes through vm_write32/vm_memset, so a plain host buffer standing in for guest memory is
- * all it needs (the same shim tests/sync_stress uses).
+ * Guest memory stays synthetic; reservation/coherence and OS wait paths come
+ * from the real runtime rather than shadow store/lock implementations.
  * -----------------------------------------------------------------------*/
 #define GUEST_MEM_SIZE (1u * 1024u * 1024u)
-static uint8_t g_guest_mem[GUEST_MEM_SIZE];
+_Alignas(128) static uint8_t g_guest_mem[GUEST_MEM_SIZE];
 uint8_t* vm_base = g_guest_mem;
+extern uint32_t ppu_vm_size;
 
-/* ppu_memory.h's inline stores reference these. Nothing here watches guest writes or holds a reservation. */
-uint32_t g_ww_lo = 0xFFFFFFFFu, g_ww_hi = 0;
-void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width)
-{
-    (void)addr; (void)val; (void)width;
-}
-
-/* PPU <-> SPU lock-line coherence (runtime/spu/spu_coherency.c), which every store consults. This suite runs no SPU, so
- * no line is ever reserved and the store path is the plain memcpy it always was. */
-int  spu_coh_is_reserved(uint32_t addr) { (void)addr; return 0; }
-void spu_lockline_lock(void)   { }
-void spu_lockline_unlock(void) { }
-void spu_coh_notify_write(uint32_t addr) { (void)addr; }
 
 static uint32_t g_bump = 4096;   /* keep guest address 0 invalid */
 static uint32_t guest_alloc(uint32_t size, uint32_t align)
@@ -72,13 +60,8 @@ static uint32_t read_be32(uint32_t addr)
 /* ---------------------------------------------------------------------------
  * The PPU thread side the library calls into
  * -----------------------------------------------------------------------*/
-PPU_THREAD_LOCAL ppu_context* g_active_ctx;
-
-/* The VSCR policy comes from the runtime's config module, which this standalone
- * test does not link. A value no zeroed context has, so the check in case 1
- * shows the fiber's context took its VSCR from the policy. */
+extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
 #define TEST_INITIAL_VSCR 0x00010000u
-uint32_t ps3_ppu_initial_vscr(void) { return TEST_INITIAL_VSCR; }
 
 typedef int32_t (*guest_fn)(uint64_t arg);
 #define ENTRY_BASE 0x1000u
@@ -98,7 +81,7 @@ static void trampoline(ppu_context* ctx)
     guest_fn fn = g_entries[ctx->cia - ENTRY_BASE];
     ctx->gpr[3] = (uint64_t)(uint32_t)fn(ctx->gpr[3]);
 }
-ppu_thread_entry_fn g_ppu_thread_entry_trampoline = trampoline;
+/* The runtime owns the trampoline slot; main installs this synthetic entry. */
 
 /* ---------------------------------------------------------------------------
  * Failure bookkeeping
@@ -166,10 +149,10 @@ static void case_order(void)
 {
     CellFiberPpuScheduler* s = new_scheduler();
     order_n = 0;
-    /* priorities 5, 1, 5, so the order is 1 (priority 1), 0, 2 (creation order) */
-    order_fibers[0] = new_fiber(s, order_entry, 0xA5A5000000000100ull, 5);
+    /* Priorities are 0..3; equal valid priorities retain creation order. */
+    order_fibers[0] = new_fiber(s, order_entry, 0xA5A5000000000100ull, 3);
     order_fibers[1] = new_fiber(s, order_entry, 0x5A5A000000000101ull, 1);
-    order_fibers[2] = new_fiber(s, order_entry, 0x3C3C000000000102ull, 5);
+    order_fibers[2] = new_fiber(s, order_entry, 0x3C3C000000000102ull, 3);
     CHECK_RC(cellFiberPpuRunFibers(s), CELL_OK);
     CHECK(order_n == 3);
     CHECK(order_seen[0] == 0x01 && order_seen[1] == 0x00 && order_seen[2] == 0x02);
@@ -379,18 +362,21 @@ static void case_errors(void)
     memset(g_guest_mem + attr, 0xA5, CELL_FIBER_PPU_ATTRIBUTE_SIZE + 16);
     CHECK_RC(_cellFiberPpuAttributeInitialize((CellFiberPpuAttribute*)(uintptr_t)attr, 0x360001), CELL_OK);
     int zeroed = 1, untouched = 1;
-    for (unsigned i = 0; i < CELL_FIBER_PPU_ATTRIBUTE_SIZE; i++) if (g_guest_mem[attr + i]) zeroed = 0;
+    CHECK(read_be32(attr) == 0xF784E782 && read_be32(attr + 4) == 0xF9EA9359 && read_be32(attr + 8) == 0x360001);
+    CHECK(strcmp((char*)g_guest_mem + attr + 0x10, "*NO NAME*") == 0);
+    for (unsigned i = 0x30; i < CELL_FIBER_PPU_ATTRIBUTE_SIZE; i++) if (g_guest_mem[attr + i]) zeroed = 0;
     for (unsigned i = 0; i < 16; i++) if (g_guest_mem[attr + CELL_FIBER_PPU_ATTRIBUTE_SIZE + i] != 0xA5) untouched = 0;
     CHECK(zeroed && untouched);
     memset(g_guest_mem + attr, 0xA5, CELL_FIBER_PPU_ATTRIBUTE_SIZE + 16);
     CHECK_RC(_cellFiberPpuSchedulerAttributeInitialize((CellFiberPpuSchedulerAttribute*)(uintptr_t)attr, 0x360001), CELL_OK);
     zeroed = 1; untouched = 1;
-    for (unsigned i = 0; i < CELL_FIBER_PPU_SCHEDULER_ATTRIBUTE_SIZE; i++) if (g_guest_mem[attr + i]) zeroed = 0;
+    CHECK(read_be32(attr) == 0x44007515 && read_be32(attr + 4) == 0x864E5F4C && read_be32(attr + 8) == 0x360001);
+    for (unsigned i = 0xC; i < CELL_FIBER_PPU_SCHEDULER_ATTRIBUTE_SIZE; i++) if (g_guest_mem[attr + i]) zeroed = 0;
     for (unsigned i = 0; i < 16; i++) if (g_guest_mem[attr + CELL_FIBER_PPU_SCHEDULER_ATTRIBUTE_SIZE + i] != 0xA5) untouched = 0;
     CHECK(zeroed && untouched);
     CHECK_RC(_cellFiberPpuAttributeInitialize(NULL, 0), CELL_FIBER_ERROR_NULL_POINTER);
     CHECK_RC(_cellFiberPpuSchedulerAttributeInitialize(NULL, 0), CELL_FIBER_ERROR_NULL_POINTER);
-    CHECK_RC(_cellFiberPpuInitialize(), CELL_OK);
+    CHECK(_cellFiberPpuInitialize(g_active_ctx->gpr[13] + 0x100) == 0x100);
 
     /* scheduler */
     uint32_t s_ea = guest_alloc(CELL_FIBER_PPU_SCHEDULER_SIZE, CELL_FIBER_PPU_SCHEDULER_ALIGN);
@@ -413,15 +399,20 @@ static void case_errors(void)
     CHECK_RC(cellFiberPpuCreateFiber(s, f, opd, 0, 1, NULL, STACK_SIZE, NULL), CELL_FIBER_ERROR_NULL_POINTER);
     CHECK_RC(cellFiberPpuCreateFiber(s, (CellFiberPpu*)(uintptr_t)(f_ea + 16), opd, 0, 1, (void*)(uintptr_t)stk, STACK_SIZE, NULL),
              CELL_FIBER_ERROR_ALIGN);
-    CHECK_RC(cellFiberPpuCreateFiber(s, f, opd, 0, 1, (void*)(uintptr_t)stk, 0x100, NULL), CELL_FIBER_ERROR_INVAL);
+    CHECK_RC(cellFiberPpuCreateFiber(s, f, opd, 0, 1, (void*)(uintptr_t)(stk + 1), 0x100, NULL), CELL_FIBER_ERROR_ALIGN);
     CHECK_RC(cellFiberPpuCreateFiber((CellFiberPpuScheduler*)(uintptr_t)(s_ea + CELL_FIBER_PPU_SCHEDULER_ALIGN), f, opd, 0, 1,
                                      (void*)(uintptr_t)stk, STACK_SIZE, NULL), CELL_FIBER_ERROR_INVAL);
+    CHECK_RC(cellFiberPpuCreateFiber(s, f, opd, 0, 4, (void*)(uintptr_t)stk, STACK_SIZE, NULL), CELL_FIBER_ERROR_INVAL);
     CHECK_RC(cellFiberPpuCreateFiber(s, f, opd, 0, 1, (void*)(uintptr_t)stk, STACK_SIZE, NULL), CELL_OK);
     CHECK_RC(cellFiberPpuCreateFiber(s, f, opd, 0, 1, (void*)(uintptr_t)stk, STACK_SIZE, NULL), CELL_FIBER_ERROR_STAT);
+    /* The inspected common creation path has no invented 0x400 minimum. */
+    uint32_t small = guest_alloc(CELL_FIBER_PPU_SIZE, CELL_FIBER_PPU_ALIGN);
+    CHECK_RC(cellFiberPpuCreateFiber(s, (CellFiberPpu*)(uintptr_t)small, opd, 0, 1,
+                                   (void*)(uintptr_t)stk, 0x100, NULL), CELL_OK);
 
     /* signals and joins on things that do not exist, and calls that need a fiber */
     CHECK_RC(cellFiberPpuSendSignal(NULL, NULL), CELL_FIBER_ERROR_NULL_POINTER);
-    CHECK_RC(cellFiberPpuSendSignal((CellFiberPpu*)(uintptr_t)(f_ea + CELL_FIBER_PPU_ALIGN), NULL), CELL_FIBER_ERROR_INVAL);
+    CHECK_RC(cellFiberPpuSendSignal((CellFiberPpu*)(uintptr_t)(f_ea + CELL_FIBER_PPU_ALIGN), NULL), CELL_FIBER_ERROR_STAT);
     CHECK_RC(cellFiberPpuJoinFiber(NULL, NULL), CELL_FIBER_ERROR_NULL_POINTER);
     CHECK_RC(cellFiberPpuJoinFiber((CellFiberPpu*)(uintptr_t)(f_ea + CELL_FIBER_PPU_ALIGN), NULL), CELL_FIBER_ERROR_INVAL);
     CHECK_RC(cellFiberPpuWaitSignal(), CELL_FIBER_ERROR_PERM);
@@ -437,9 +428,11 @@ static void case_errors(void)
     CHECK_RC(cellFiberPpuFinalizeScheduler(g_err_sched), CELL_OK);
     CHECK_RC(cellFiberPpuJoinFiber(FIBER(inner), NULL), CELL_FIBER_ERROR_INVAL);   /* gone with its scheduler */
 
-    /* the first scheduler still has its never-run fiber; finalizing drops it */
+    /* A pending lifetime node makes Finalize BUSY; it may not discard stacks. */
+    CHECK_RC(cellFiberPpuFinalizeScheduler(s), CELL_FIBER_ERROR_BUSY);
+    CHECK_RC(cellFiberPpuRunFibers(s), CELL_OK);
     CHECK_RC(cellFiberPpuFinalizeScheduler(s), CELL_OK);
-    CHECK_RC(cellFiberPpuSendSignal(f, NULL), CELL_FIBER_ERROR_INVAL);
+    CHECK_RC(cellFiberPpuSendSignal(f, NULL), CELL_FIBER_ERROR_STAT);
     printf("[case errors] ok\n");
 }
 
@@ -452,6 +445,14 @@ int main(void)
      * dies with it. */
     setvbuf(stdout, NULL, _IONBF, 0);
     printf("=== ps3recomp fiber_switch ===\n");
+    ppu_context home;
+    memset(&home, 0, sizeof home);
+    home.gpr[13] = 0x100;
+    home.thread_id = 1;
+    g_active_ctx = &home;
+    ppu_vm_size = GUEST_MEM_SIZE;
+    g_ppu_thread_entry_trampoline = trampoline;
+    CHECK(_cellFiberPpuInitialize(0x200) == 0x100);
 
     case_order();
     case_signal_pingpong();

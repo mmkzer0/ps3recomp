@@ -27,6 +27,7 @@
 #include <vector>
 #include <string>
 #include <atomic>
+#include "ppu_dispatch_state.h"
 #ifdef _WIN32
 #  include <windows.h>
 #else
@@ -1232,7 +1233,10 @@ static void pt_restore(uint32_t addr) { for (int i=0;i<g_pt_n;i++) if (g_pt_addr
 #endif
 /* Stack of currently-executing indirect-call (vtable) targets on this thread, so a
  * write hook can name the virtual method that is running when it writes a value. */
-static PPU_THREAD_LOCAL uint32_t g_vcall_stk[128];
+static PPU_THREAD_LOCAL uint32_t g_vcall_home[PS3_PPU_VCALL_SLOTS];
+/* Coroutine owners exchange the storage pointer, not just its live depth:
+ * another suspended fiber must not overwrite this one's diagnostic frames. */
+static PPU_THREAD_LOCAL uint32_t* g_vcall_stk = nullptr;
 static PPU_THREAD_LOCAL int      g_vcall_sp = 0;
 /* Nesting depth of ps3_indirect_call on this host thread (the recursion guard
  * in ps3_indirect_call_impl). A host coroutine that runs guest code and ends by
@@ -1246,6 +1250,11 @@ static PPU_THREAD_LOCAL int      g_vcall_sp = 0;
 static PPU_THREAD_LOCAL int      g_dispatch_depth = 0;
 extern "C" int* ps3_ppu_dispatch_depth_slot(void) { return &g_dispatch_depth; }
 extern "C" int* ps3_ppu_vcall_sp_slot(void) { return &g_vcall_sp; }
+extern "C" uint32_t** ps3_ppu_vcall_stack_slot(void)
+{
+    if (!g_vcall_stk) g_vcall_stk = g_vcall_home;
+    return &g_vcall_stk;
+}
 
 extern "C" void resv_keep_own(ppu_context* ctx, uint32_t ea);
 
@@ -2666,8 +2675,9 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
          * deserializer ran with a wrong TOC -> garbage globals -> abort. Re-pin r2
          * to the dispatched toc before each link so the chain stays consistent. */
         uint32_t _toc0 = (uint32_t)ctx->gpr[2];
-        static int _tf=-1; if(_tf<0)_tf=getenv("PPU_TOCFIX")?1:0;
-        if (g_vcall_sp < 128) g_vcall_stk[g_vcall_sp] = addr;
+        static PPU_THREAD_LOCAL int _tf=-1; if(_tf<0)_tf=getenv("PPU_TOCFIX")?1:0;
+        if (!g_vcall_stk) g_vcall_stk = g_vcall_home;
+        if (g_vcall_sp < PS3_PPU_VCALL_SLOTS) g_vcall_stk[g_vcall_sp] = addr;
         g_vcall_sp++;
         fn(ctx);
         while (g_trampoline_fn) {
@@ -2679,8 +2689,8 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
         if (g_vcall_sp > 0) g_vcall_sp--;
         /* PPU_RETWATCH=<hex>: catch the first vcall(s) whose RETURN value (r3)
          * equals this, pinning the exact virtual method that produces the poison. */
-        { static int64_t rw=-2; if(rw==-2){const char*e=getenv("PPU_RETWATCH"); rw=e?(int64_t)strtoul(e,0,16):-1;}
-          if(rw>=0 && (uint32_t)ctx->gpr[3]==(uint32_t)rw){ static int _n=0; if(PS3_LOG_FIRST(_n, 8)){
+        { static PPU_THREAD_LOCAL int64_t rw=-2; if(rw==-2){const char*e=getenv("PPU_RETWATCH"); rw=e?(int64_t)strtoul(e,0,16):-1;}
+          if(rw>=0 && (uint32_t)ctx->gpr[3]==(uint32_t)rw){ static PPU_THREAD_LOCAL int _n=0; if(PS3_LOG_FIRST(_n, 8)){
             fprintf(stderr,"[RETWATCH] vcall -> func_%08X returned r3=0x%08X\n", addr, (uint32_t)rw);
 #ifdef _WIN32
             void* bt[16]; unsigned short fr=RtlCaptureStackBackTrace(0,16,bt,0);
@@ -3613,24 +3623,19 @@ static uint32_t ppu_cb_entry_sp(const ppu_context* active, bool* on_host_slot)
  *
  * The range sits above every real guest thread id. Those are the thread-table
  * index + 1 (1..PPU_THREAD_MAX, sys_ppu_thread.h) and stay far below 0x7F000000.
- * It ends at cellFiber's FIBER_FALLBACK_THREAD_ID (0x7FFF0000,
- * libs/spurs/cellFiber.c): the counter never hands out that id or anything
- * above it, so a host-callback thread and a parentless fiber cannot alias as
- * lwmutex owners. The top also stops short of 0x7FFFFFFE, which
- * sys_ppu_thread_get_id reports for a context with no id at all, and of the
+ * Its fixed exclusive end is 0x7FFF0000. Fibers inherit the executing PPU
+ * worker's identity; they no longer manufacture a parentless owner id.
+ * The top also stops short of 0x7FFFFFFE, which sys_ppu_thread_get_id reports
+ * for a context with no id at all, and of the
  * 0xFFFFFFFx words the lwmutex owner field reserves. The range holds 16,711,680
  * threads; running out is a stop, never a wrap onto an id still in use. */
 #define PPU_HOST_TID_BASE   0x7F000000u
 #define PPU_HOST_TID_END    0x7FFF0000u
-/* No shared header carries the two constants, so each side pins its copy: this
- * assert proves [BASE, END) excludes the fiber id, and cellFiber.c asserts its
- * FIBER_FALLBACK_THREAD_ID is the same 0x7FFF0000. */
+/* Keep the established host-callback identity domain stable. */
 static_assert(PPU_HOST_TID_BASE < PPU_HOST_TID_END,
               "the host-callback id range is empty");
 static_assert(PPU_HOST_TID_END == 0x7FFF0000u,
-              "PPU_HOST_TID_END must stay equal to cellFiber.c's "
-              "FIBER_FALLBACK_THREAD_ID (0x7FFF0000) or a host-callback thread "
-              "can share an lwmutex owner id with a parentless fiber");
+              "the established host-callback id boundary must remain stable");
 static uint64_t ppu_host_thread_id(void)
 {
     static std::atomic<uint32_t> s_next{PPU_HOST_TID_BASE};

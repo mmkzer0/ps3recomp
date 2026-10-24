@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "../ppu/ppu_context.h"   /* ppu_context, PPU_THREAD_LOCAL */
+#include "../ppu/ppu_dispatch_state.h"
 
 extern uint8_t* vm_base;
 
@@ -110,6 +111,21 @@ void ps3_ww_report_inline(unsigned int addr, unsigned long long val, int width)
 unsigned int ppu_active_lr(void) { return 0; }
 
 PPU_THREAD_LOCAL ppu_context* g_active_ctx = 0;
+
+/* NULL means no PPU dispatcher exists in this link: there are no indirect
+ * frames for a fiber switch to preserve. A title links ppu_loader.cpp's strong
+ * hooks instead; never create a second, shadow dispatch TLS convention here. */
+#ifdef _MSC_VER
+int* ps3_host_no_dispatch_slot(void) { return NULL; }
+uint32_t** ps3_host_no_vcall_storage(void) { return NULL; }
+#pragma comment(linker, "/alternatename:ps3_ppu_dispatch_depth_slot=ps3_host_no_dispatch_slot")
+#pragma comment(linker, "/alternatename:ps3_ppu_vcall_sp_slot=ps3_host_no_dispatch_slot")
+#pragma comment(linker, "/alternatename:ps3_ppu_vcall_stack_slot=ps3_host_no_vcall_storage")
+#else
+__attribute__((weak)) int* ps3_ppu_dispatch_depth_slot(void) { return NULL; }
+__attribute__((weak)) int* ps3_ppu_vcall_sp_slot(void) { return NULL; }
+__attribute__((weak)) uint32_t** ps3_ppu_vcall_stack_slot(void) { return NULL; }
+#endif
 uint32_t g_spu_image_src_ea = 0;
 uint32_t g_spu_image_ls_start = 0;
 uint32_t g_spu_image_span = 0;

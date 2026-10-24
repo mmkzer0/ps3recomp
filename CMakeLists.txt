@@ -451,6 +451,9 @@ if(PS3RECOMP_BUILD_TESTS)
     # works on arm64 is a question to answer rather than assume.
     add_subdirectory(tests/fiber_switch)
     add_subdirectory(tests/sync2_semaphore)
+    if(UNIX)
+        add_subdirectory(tests/jq2_fiber)
+    endif()
     # Syscall 14's address/flags classification as a plain unit test: the
     # check is pure, so the test links one runtime translation unit
     # (lv2_lock_line.c) and nothing else.
