@@ -22,8 +22,6 @@ uint8_t* vm_base = g_guest;
 int ps3_log_verbose(void) { return 0; }
 void ppu_dump_guest_stack(ppu_context* c, const char* t) { (void)c; (void)t; }
 int spu_workload_dispatch_async(const uint8_t* e, uint32_t a, uint32_t b) { (void)e; (void)a; (void)b; return 0; }
-uint32_t g_spu_pending_evt[3];
-int g_spu_pending_evt_valid;
 size_t spu_elf_image_size(const uint8_t* elf, size_t max_scan) { (void)elf; (void)max_scan; return 0; }
 
 static int32_t flag_create(uint64_t init_pattern, uint32_t* out_id)
