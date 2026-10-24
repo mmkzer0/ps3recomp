@@ -54,6 +54,7 @@ enum {
     PS3_CFG_V_NONE = 0,
     PS3_CFG_V_SHA256_OR_EMPTY,   /* "" or 64 hex digits; stored lower case */
     PS3_CFG_V_VIDEO_RESOLUTIONS, /* "" or comma-separated cellVideoOut resolution ids; stored sorted, unique */
+    PS3_CFG_V_NULL_PAGE,         /* "stop" or "drop" */
 };
 
 /* ---- typed storage ------------------------------------------------------- */

@@ -71,6 +71,7 @@ Ids are stable kebab-case; a new gap gets a new kind, never a free-text variant.
 | `fiber-unsupported` | an initialized fiber/scheduler attribute requests an unimplemented optional callback/setting (`reason=attribute-field`), an unmodelled periodic stack-canary check (`reason=auto-check`), host execution/queue state cannot be honored, a worker event resource fails, or the firmware's attempted 33rd worker has no representable 32-bit bitmap slot (`reason=worker-capacity`). The raw initializer also stops if there is no calling PPU context from which to read r13 |
 | `gcm-unmodelled` | the firmware has a command-stream path the runtime does not reproduce, so a stream built without it would be a guess: `cellRescSetConvertAndFlip` in a PAL-interpolating (720x576 with PAL temporal mode 1..4) or interlaced configuration, or with more than 256 vertices; a command context whose buffer-full callback did not leave room for a reservation. Fields: `func`, `feature`, `reason` |
 | `gcm-wait-timeout` | an RSX wait stood unsatisfied for `gcm.wait_timeout_ms` (default 10 s): a NV406E semaphore ACQUIRE whose label never reached the value, or the command-context buffer-full callback waiting for the RSX to leave the next 32 KiB segment. The hardware waits forever; the agent that should end the wait never ran. Fields: `func`, `what`, `offset`, `value`, `current`, `waited_ms` |
+| `guest-null-access` | a guest load or store reached the unmapped null page: a load below `0x10000` or a store below `0x1000` (the bounds `ppu_null_read_report` and the store check always had). Real hardware faults on each; the flat VM would instead read back garbage or swallow the store and let the run continue on it. Default; `ppu.null_page = "drop"` keeps the legacy log-and-drop handling for a title that needs it. Fields: `access` (`read`/`write`), `width` (bytes), `ea`, `fn` |
 
 Where each is raised, and what it carries beyond `pc lr tid`:
 
@@ -103,6 +104,7 @@ Where each is raised, and what it carries beyond `pc lr tid`:
 | `fiber-unsupported` | `libs/spurs/cellFiber.c` (`unsupported`) | `api ea field reason`; an unsupported attribute names its byte offset in `field`; worker-capacity retains the attempted guest count increment |
 | `gcm-unmodelled` | `ps3_stop_gcm_unmodelled` (`libs/video/cellResc.c`, `libs/video/cellGcmSys.c`) | `func feature reason` |
 | `gcm-wait-timeout` | `ps3_stop_gcm_wait_timeout` (`libs/video/cellGcmSys.c`) | `func what offset value current waited_ms` |
+| `guest-null-access` | `vm_read8/16/32/64`, `ppu_lwarx32`, `ppu_ldarx64`, `vm_write8/16/32/64` (`ppu_loader.cpp`, `ppu_null_page_stop`) | `access width ea fn`; `fn` is the guest function the access came from (resolved from the host return address, `0x00000000` if none), `pc` is that same entry (lifted code keeps no guest pc), `lr` is the context's link register and `tid` the guest thread; the guest call chain is dumped to stderr first |
 
 Lifted code does not track a guest pc, so for the first four `pc` is the caller's
 return address (the import stub's caller, the `sc` site, the call site). Only
@@ -146,6 +148,14 @@ A stop that has a `[[hle.stub]]` / `[[lv2.stub]]` entry for its NID or syscall
 number returns the entry's `ret` instead, logging it once as `ALLOW-LISTED ...`
 with the reason and config line (`docs/CONFIG.md`). Nothing else continues past a
 gap: no environment variable, no blanket form.
+
+`guest-null-access` is the default for every access into the null page, and the
+first one stops: the older handling logged `[null-write] ... DROPPED` and
+`[null-read]` and carried on, so a worker that read and wrote `NULL+0x5B0..0x5DC`
+ran on garbage and hung later, nowhere near the pointer that was null. Bounds are
+`< 0x10000` for loads and `< 0x1000` for stores. `ppu.null_page = "drop"`
+(`docs/CONFIG.md`, with a written reason in the title config) restores the log,
+the dropped stores and the containment of a sweep that walks up out of the page.
 
 ## Frontier
 

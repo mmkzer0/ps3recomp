@@ -44,12 +44,17 @@ ppu_loader.cpp against that lift, and runs tests/test_loader_gaps.cpp:
     callbacks (kept for life, never reused, outside every real thread id), so two
     of them running at once are two owners to an lwmutex: one that holds it blocks
     the other, and the other's trylock is EBUSY and its unlock EPERM;
+  - a guest load or store into the null page stops (guest-null-access, with
+    access/width/ea/fn and the site) at every width, below 0x10000 for loads and
+    0x1000 for stores; ppu.null_page = "drop" keeps the legacy log, dropped
+    stores and sweep containment.
 
 A line "RETURNED" from the fixture means the runtime carried on; every case that
 must stop treats it as failure.
 """
 import json
 import os
+import re
 from pathlib import Path
 import struct
 import subprocess
@@ -313,8 +318,61 @@ def main():
             assert 'RETURNED' not in p.stdout and 'NESTED CALLBACK RAN' not in p.stdout, (below, p.stdout, p.stderr)
             f = g.expect_stop(p, 'unresolved-guest-callback')
             assert f['origin'] == 'stack' and 'left its host callback stack slot' in f['hint'], (below, f)
+
+        # A guest load or store into the null page is a named stop by default. The
+        # accesses are the ones the Odin canary made (NULL+0x0..0x38 and
+        # NULL+0x5B0..0x5DC), at every width, through the same inline load path
+        # the lifted code uses: below 0x10000 it falls back to the checked accessor.
+        hexfn = re.compile(r'^0x[0-9A-F]{8}$')
+        for access, ea, width in (('read', '0x0', '4'), ('read', '0x38', '8'), ('read', '0x5B0', '2'),
+                                  ('read', '0x5DC', '1'), ('read', '0x2000', '4'), ('read', '0xFFFC', '4'),
+                                  ('write', '0x0', '4'), ('write', '0x5B0', '8'), ('write', '0x5DC', '2'),
+                                  ('write', '0xFFF', '1')):
+            p = run('null' + access, ea, width)
+            assert 'RETURNED' not in p.stdout, (access, ea, width, p.stdout, p.stderr)
+            f = g.expect_stop(p, 'guest-null-access')
+            assert (f['access'], f['width'], f['ea'], f['tid']) == (
+                access, width, '0x%08X' % int(ea, 16), '1'), (access, ea, width, f)
+            assert hexfn.match(f['fn']) and int(f['pc'], 16) == int(f['fn'], 16) and f['lr'] == '0x10100', f
+            assert '[null-read]' not in p.stderr and '[null-write]' not in p.stderr, p.stderr
+        # the first store of a sweep stops; nothing is dropped and carried on from
+        f = g.expect_stop(run('nullsweep', '0'), 'guest-null-access')
+        assert (f['access'], f['ea']) == ('write', '0x00000010'), f
+        # the bounds are the ones the checks always had: loads below 0x10000, stores below 0x1000
+        p = run('nullread', '0x10000', '4')
+        assert p.returncode == 0 and 'RETURNED r3=0xABABABAB' in p.stdout, (p.stdout, p.stderr)
+        for ea in ('0x1000', '0x2000'):
+            p = run('nullwrite', ea, '4')
+            assert p.returncode == 0 and 'RETURNED r3=0x5A' in p.stdout, (ea, p.stdout, p.stderr)
+
+        # ppu.null_page = "drop": the legacy handling for a title that needs it. The
+        # file carries the reason, as docs/CONFIG.md requires.
+        drop_cfg = tmp / 'drop.toml'
+        drop_cfg.write_text('schema = 1\n[ppu]\n# synthetic test: stands in for a title that dereferences\n'
+                            '# page 0 on purpose\nnull_page = "drop"\n')
+        p = run('nullread', '0x38', '4', cfg=drop_cfg)
+        assert p.returncode == 0 and 'RETURNED r3=0xABABABAB' in p.stdout, (p.stdout, p.stderr)
+        assert '[null-read] guest read32 from 0x00000038' in p.stderr, p.stderr
+        p = run('nullread', '0x5B0', '8', cfg=drop_cfg)
+        assert p.returncode == 0 and 'RETURNED r3=0xABABABABABABABAB' in p.stdout, (p.stdout, p.stderr)
+        for width in ('1', '2', '4', '8'):
+            p = run('nullwrite', '0x5B0', width, cfg=drop_cfg)
+            assert p.returncode == 0 and 'RETURNED r3=0xAB' in p.stdout, (width, p.stdout, p.stderr)   # dropped
+            assert '[null-write] guest wrote%d' % (int(width) * 8) in p.stderr and 'DROPPED' in p.stderr, p.stderr
+        # the sweep out of the null page stays dropped, and its end lets the next store land
+        p = run('nullsweep', '0', cfg=drop_cfg)
+        assert p.returncode == 0 and 'SWEEP 10=AB 1010=AB 3000=5A' in p.stdout, (p.stdout, p.stderr)
+        assert '[null-write] sweep contained' in p.stderr, p.stderr
+        # the environment sets it too, and anything but stop/drop is a config stop
+        p = g.run([str(binary), 'nullread', '0x38', '4'], env=g.clean_env(PS3RECOMP_PPU_NULL_PAGE='drop'))
+        assert p.returncode == 0 and 'RETURNED r3=0xABABABAB' in p.stdout, (p.stdout, p.stderr)
+        bad_cfg = tmp / 'bad-null-page.toml'
+        bad_cfg.write_text('schema = 1\n[ppu]\nnull_page = "land"\n')
+        f = g.expect_stop(run('nullread', '0x38', '4', cfg=bad_cfg), 'config-invalid')
+        assert f['key'] == 'ppu.null_page' and '"stop" or "drop"' in f['detail'], f
     print('PASS: unimplemented syscall, unlifted call, unresolved indirect call, dispatch depth, '
-          'OPD swap, unresolved guest callback and unknown instruction all stop; host-initiated '
+          'OPD swap, unresolved guest callback, unknown instruction and null-page access all stop '
+          '(ppu.null_page=drop keeps the legacy handling); host-initiated '
           'callbacks get distinct, non-overlapping guest stacks and their own thread ids')
     return 0
 

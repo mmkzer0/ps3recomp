@@ -1079,30 +1079,65 @@ static inline int vm_oob(uint32_t a, uint32_t n)
  * and the guest reads NULL ten million times. Every one of those looks like a
  * separate bug, and none of them is where the damage happened.
  *
- * So drop the store -- hardware never lets it land -- and say so once per
- * writing function. [null-read] is the read-side twin; this is the store side,
- * and it is the more important of the two because a read returns a wrong value
- * while a write destroys state that was correct.
+ * So the store is a named stop, guest-null-access, at the FIRST one: the run
+ * ends holding the access and the guest function that made it instead of
+ * carrying on from state hardware never produces. A title that has to run past
+ * it sets ppu.null_page = "drop" in its config (docs/CONFIG.md), which keeps the
+ * old handling: drop the store -- hardware never lets it land -- and say so once
+ * per writing function. [null-read] is the read-side twin; this is the store
+ * side, and it is the more important of the two because a read returns a wrong
+ * value while a write destroys state that was correct.
  *
  * ponytail: first page only, not the whole 0..0x10000 userspace hole. A null
  * pointer plus a struct offset is what this is for; widen it if a title turns
- * out to scribble higher. */
+ * out to scribble higher. Loads use the 64 KB bound (ppu_null_read_report). */
 extern "C" PPU_THREAD_LOCAL ppu_context* g_active_ctx;
 extern "C" void ppu_dump_guest_stack(ppu_context*, const char*);
 extern "C" uint32_t g_null_sweep_hi = 0;   /* 0 = not sweeping */
 static uint32_t g_null_sweep_last = 0;
 static unsigned g_null_sweep_tid = 0;
+
+/* ppu.null_page, read once: the configuration is immutable after load, and this
+ * is only reached from the cold half of the checks, never the fast path. */
+static bool ppu_null_page_drops()
+{
+    static const bool drop = strcmp(ps3_cfg_ppu_null_page(), "drop") == 0;
+    return drop;
+}
+
+/* `width` is in bytes. The site's pc is the entry of the guest function the
+ * access came from (resolved from the host return address): lifted code keeps
+ * no guest pc, and ctx->lr is only as fresh as the last call that set it. */
+[[noreturn]] static void ppu_null_page_stop(const char* access, uint32_t ea, int width, void* ra)
+{
+    const uint32_t fn = ppu_prof_resolve_host(ra);
+    char width_s[8], ea_s[16], fn_s[16];
+    snprintf(width_s, sizeof width_s, "%d", width);
+    snprintf(ea_s, sizeof ea_s, "0x%08X", ea);
+    snprintf(fn_s, sizeof fn_s, "0x%08X", fn);
+    ps3_stop_field f[] = {
+        {"access", access}, {"width", width_s}, {"ea", ea_s}, {"fn", fn_s},
+    };
+    ps3_stop_site site = { fn, g_active_ctx ? g_active_ctx->lr : 0u,
+                           g_active_ctx ? g_active_ctx->thread_id : 0u };
+    /* The guest call chain names the allocation that came back null; the stop
+     * line alone only names the function that dereferenced it. */
+    if (g_active_ctx) ppu_dump_guest_stack(g_active_ctx, "null-access");
+    ps3_stop(PS3_STOP_GUEST_NULL_ACCESS, "a guest load or store reached the unmapped null page",
+             "The guest dereferenced a null (or near-null) pointer, which faults on real hardware. "
+             "Find the pointer that is null in the function 'fn' (its caller allocated or "
+             "initialised nothing). A title that must run past it sets ppu.null_page = \"drop\" "
+             "in its config, with the reason written next to it.",
+             f, 4, &site);
+}
+
 static int vm_null_store_report(uint32_t a, uint32_t v, int width, void* ra)
 {
-    static int en = -1;
-    if (en < 0) { const char* e = getenv("PS3_NULL_WRITE");
-                  en = (e && *e == (char)48) ? 0 : 1; }   /* PS3_NULL_WRITE=0 */
-    if (!en) return 0;                                    /* let it land */
-    { static int sweep = -1;
-      if (sweep < 0) { const char* e = getenv("PS3_NULL_SWEEP"); sweep = e ? 1 : 0; }
-      if (sweep) { g_null_sweep_hi = 1; g_null_sweep_last = a;
-                   g_null_sweep_tid = g_active_ctx
-                                    ? (unsigned)g_active_ctx->thread_id : 0u; } }
+    if (!ppu_null_page_drops()) ppu_null_page_stop("write", a, width, ra);
+    /* Containment of a runaway sweep (vm_null_sweep) is part of "drop": a store
+     * that is dropped has to stay dropped when the memset walks up out of the page. */
+    g_null_sweep_hi = 1; g_null_sweep_last = a;
+    g_null_sweep_tid = g_active_ctx ? (unsigned)g_active_ctx->thread_id : 0u;
     { static long n = 0;
       enum { NW_MAX = 8 };
       long i = n++;
@@ -1126,7 +1161,7 @@ static int vm_null_store_report(uint32_t a, uint32_t v, int width, void* ra)
     return 1;
 }
 
-/* PS3_NULL_SWEEP=1: contain a runaway sweep that started from a null pointer.
+/* ppu.null_page = "drop": contain a runaway sweep that started from a null pointer.
  *
  * Dropping the page-0 stores alone does not save the image. memset(NULL, 0, n)
  * with a large n walks UP out of the null page and keeps going -- Guitar Hero
@@ -1139,9 +1174,9 @@ static int vm_null_store_report(uint32_t a, uint32_t v, int width, void* ra)
  * ponytail: a monotonic-run heuristic, not dataflow. Once a null-page store is
  * seen, keep dropping while addresses climb within 0x1000 of the last dropped
  * one, and stop the moment the pattern breaks. That is enough for a memset or
- * memcpy and nothing else. It is OFF by default because a false positive drops
- * a real store; turn it on to test whether the sweep is what is killing a
- * title. If it becomes load-bearing, replace it with a faulting store. */
+ * memcpy and nothing else. It only runs after a null-page store was dropped, so
+ * it only exists for titles that chose "drop"; a false positive drops a real
+ * store. If it becomes load-bearing, replace it with a faulting store. */
 
 
 static int vm_null_sweep(uint32_t a)
@@ -1334,13 +1369,12 @@ static inline void ppu_rwatch_hit(uint32_t a, int width, void* ra)
  * presenting as "the title boots and then hangs" with nothing pointing at the
  * NULL. Capped so a title that does this in a hot path cannot flood the log.
  *
- * Off with PS3_NULL_READ=0 for a title that dereferences low addresses on
- * purpose (a few use page 0 as a scratch constant pool). */
+ * With ppu.null_page = "drop" (a title that dereferences low addresses on
+ * purpose -- a few use page 0 as a scratch constant pool) this logs and the
+ * read returns what memory holds; by default it is a guest-null-access stop. */
 static inline void ppu_null_read_report(uint32_t a, int width, void* ra)
 {
-    static int s_on = -1;
-    if (s_on < 0) { const char* e = getenv("PS3_NULL_READ"); s_on = (e && *e == '0') ? 0 : 1; }
-    if (!s_on) return;
+    if (!ppu_null_page_drops()) ppu_null_page_stop("read", a, width, ra);
     static long s_n = 0;
     if (!PS3_LOG_FIRST(s_n, 16)) return;
     const uint32_t fn = ppu_prof_resolve_host(ra);
@@ -1411,7 +1445,9 @@ uint8_t  vm_read8 (uint64_t a) { if (vm_oob((uint32_t)a,1)) return 0; vm_hotmap(
           n=0; } }
       else { last=(uint32_t)a; n=0; } }
     return vm_base[(uint32_t)a]; }
-uint16_t vm_read16(uint64_t a) { if (vm_oob((uint32_t)a,2)) return 0; ppu_rwatch_hit((uint32_t)a, 2, __builtin_return_address(0)); vm_hotmap((uint32_t)a,2); uint16_t v; memcpy(&v, vm_base + (uint32_t)a, 2);
+uint16_t vm_read16(uint64_t a) { if (vm_oob((uint32_t)a,2)) return 0; ppu_rwatch_hit((uint32_t)a, 2, __builtin_return_address(0));
+    if ((uint32_t)a < 0x10000u) ppu_null_read_report((uint32_t)a, 2, __builtin_return_address(0));
+    vm_hotmap((uint32_t)a,2); uint16_t v; memcpy(&v, vm_base + (uint32_t)a, 2);
     { static PPU_THREAD_LOCAL uint32_t last=0xFFFFFFFFu; static PPU_THREAD_LOCAL uint32_t n=0;
       if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD16] spinning on 0x%08X\n", (uint32_t)a); n=0; } } else { last=(uint32_t)a; n=0; } }
     return __builtin_bswap16(v); }
@@ -2386,7 +2422,9 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
     snprintf(lr_s, sizeof lr_s, "0x%08X", (uint32_t)ctx->lr);
     auto words = [](uint32_t a) {
         char b[64];
-        if (!a || (ppu_vm_size && (uint64_t)a + 16 > ppu_vm_size) || !vm_base) return std::string("unmapped");
+        /* Below 0x10000 is the null page: reading it here would raise guest-null-access
+         * and replace the stop this is building. */
+        if (a < 0x10000u || (ppu_vm_size && (uint64_t)a + 16 > ppu_vm_size) || !vm_base) return std::string("unmapped");
         snprintf(b, sizeof b, "%08X %08X %08X %08X", vm_read32(a), vm_read32(a + 4), vm_read32(a + 8), vm_read32(a + 12));
         return std::string(b);
     };
@@ -3357,7 +3395,7 @@ extern "C" void (*g_ppu_thread_entry_trampoline)(ppu_context*);
  * one shared block, thread 2 clears the flag and writes -1 to the pointer
  * while thread 1 is inside the allocator. Thread 1 then reads its own context
  * as null, every allocation on it returns 0, and the caller memsets the null
- * buffer -- see [null-write]. One shared word, and the title cannot allocate.
+ * buffer -- see guest-null-access (ppu.null_page). One shared word, and the title cannot allocate.
  *
  * The PRX path (sys_initialize_tls in ppu_sysprx.cpp) has always done this per
  * block; this is the same thing for the static path.
@@ -3469,7 +3507,7 @@ extern "C" void ppu_register_opd_fixup(uint32_t opd, uint32_t code, uint32_t toc
     /* The descriptor words separate a CLOBBERED OPD from one the loader never
      * populated; those need opposite fixes. */
     std::string descriptor = "none";
-    if (opd) {
+    if (opd >= 0x10000u) {   /* the null page is not readable evidence: see ppu_null_page_stop */
         char b[80];
         snprintf(b, sizeof b, "%08X %08X %08X %08X",
                  vm_read32(opd), vm_read32(opd + 4), vm_read32(opd + 8), vm_read32(opd + 12));

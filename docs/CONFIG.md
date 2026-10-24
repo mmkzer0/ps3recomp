@@ -64,6 +64,7 @@ PS3STOP v=1 kind=config-invalid file=title.toml line=3 col=1 key=ppu.vscr_nk det
 |---|---|---|---|---|
 | `ppu.vscr_nj` | bool | `true` | `PS3RECOMP_PPU_VSCR_NJ` | Initial VSCR[NJ] of every guest PPU context. Default chosen for RPCS3 parity; a policy, not a hardware fact |
 | `ppu.opd_swap_fixup` | bool | `false` | `PS3RECOMP_PPU_OPD_SWAP_FIXUP` | Redirect an indirect call whose `ctr` is not a lifted function but whose `r2` is (the guest wrote the function descriptor as `{toc, code}` instead of `{code, toc}`). The redirect compensates for a malformed title descriptor (Odin Sphere's flOw-style handler tables), not a PPC ABI guarantee; off, the call stops as `unresolved-indirect-call` and its hint names this option |
+| `ppu.null_page` | string (`stop` \| `drop`) | `stop` | `PS3RECOMP_PPU_NULL_PAGE` | What a guest load below `0x10000` or store below `0x1000` does. `stop`: the run ends at the first one with kind `guest-null-access` (`access width ea fn`, plus `pc lr tid`). `drop`: the legacy handling for a title that needs it, a load logs `[null-read]` and returns what memory holds, a store logs `[null-write]` and is dropped, and a store sweep that starts in the null page (a memset on a null buffer) stays dropped until it breaks off. Hardware faults on every such access, so `drop` papers over a guest defect; a title config that sets it must carry a written reason (see below) |
 | `spu.dma_repeat_limit` | u32 (1..4294967295) | `256` | `PS3RECOMP_SPU_DMA_REPEAT_LIMIT` | Identical back-to-back MFC transfers after which the SPU DMA engine applies a 1 ms back-off. Timing only: the engine still makes progress and the guest observes nothing |
 | `spu.dma_repeat_stop_secs` | u32 (0..86400) | `0` | `PS3RECOMP_SPU_DMA_REPEAT_STOP_SECS` | If non-zero, an SPU issuing identical MFC transfers for this many seconds stops with kind `spu-dma-repeat` (`image pc ea lsa cmd size count secs tid`). `0` never stops: polling a ring or label another agent writes is legitimate, and the old unconditional halt wedged those chains |
 | `gcm.wait_timeout_ms` | u32 (1..3600000) | `10000` | `PS3RECOMP_GCM_WAIT_TIMEOUT_MS` | How long an RSX wait may stand unsatisfied before the run stops with kind `gcm-wait-timeout`: a NV406E semaphore acquire whose label never reaches the value, or the command-context buffer-full callback waiting for the RSX to leave the next segment. The hardware waits forever; a host watchdog, not PS3 behaviour |
@@ -100,6 +101,24 @@ an `[[lv2.stub]]` when a syscall has none (`unimplemented-syscall`); a hit retur
 `ret` and logs `ALLOW-LISTED ...` once with the reason and the config line, a miss
 stops. An entry for something that *is* implemented is never consulted.
 Lookup: `ps3_config_find_hle_stub()` and `ps3_config_find_lv2_stub()`.
+
+## `ppu.null_page = "drop"` needs a written reason
+
+The default stops at the first guest access into the null page. `drop` lets the
+run continue past a defect real hardware would have faulted on, so it is a per-title
+exception, never a blanket setting: the title's config file sets it, and the line
+above it says why, as `reason` does for `[[hle.stub]]`:
+
+```toml
+[ppu]
+# reason: the title's allocator probes page 0 on purpose and reads the 0s back
+null_page = "drop"
+```
+
+No in-repo title config or test relies on `drop`; the loader test
+(`tools/test_loader_gaps.py`) sets it only to prove the legacy handling still
+works. The environment form (`PS3RECOMP_PPU_NULL_PAGE=drop`) is for a one-off
+experiment, not for a title's standing configuration.
 
 ## Effective configuration
 

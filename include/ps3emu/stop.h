@@ -89,7 +89,9 @@ extern "C" {
     /* C2: a GCM/RESC path the firmware has and the runtime does not model. */ \
     X(GCM_UNMODELLED,           "gcm-unmodelled")                              \
     /* C2: an RSX wait (a semaphore acquire, the command-context callback) that no one ended. */ \
-    X(GCM_WAIT_TIMEOUT,         "gcm-wait-timeout")
+    X(GCM_WAIT_TIMEOUT,         "gcm-wait-timeout")                            \
+    /* C3: a guest load or store into the unmapped null page (ppu.null_page). */ \
+    X(GUEST_NULL_ACCESS,        "guest-null-access")
 
 /* A fixed underlying type in C++ makes a kind outside the list (a caller's bug,
  * which the stop still reports as "invalid-kind") a well-defined value rather

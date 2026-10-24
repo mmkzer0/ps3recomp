@@ -63,6 +63,18 @@ PS3_CFG_BOOL(ppu, opd_swap_fixup, 0,
     "the wrong function. Off, the call stops as unresolved-indirect-call and its "
     "hint names this option.")
 
+PS3_CFG_STR(ppu, null_page, "stop", 4, PS3_CFG_V_NULL_PAGE,
+    "What a guest load or store into the null page does: \"stop\" (the default) "
+    "ends the run at the first one with kind guest-null-access (access, width, "
+    "ea, fn, and pc/lr/tid); \"drop\" keeps the legacy behaviour of titles that "
+    "need it: a load logs [null-read] and returns what memory holds, a store "
+    "logs [null-write] and is dropped, and a store sweep that starts in the "
+    "null page (a memset on a null buffer) is dropped until it breaks off. The "
+    "null page is [0, 0x10000) for loads and [0, 0x1000) for stores. Real "
+    "hardware faults on every such access, so \"drop\" papers over a guest "
+    "defect and lets the run continue on state the console never produced; a "
+    "title config that sets it must say why in a comment.")
+
 /* ---- spu ---------------------------------------------------------------- */
 
 PS3_CFG_U32(spu, dma_repeat_limit, 256, 1, 4294967295,

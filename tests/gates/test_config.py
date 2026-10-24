@@ -77,6 +77,7 @@ def test_defaults_without_file_or_environment():
     assert o == {
         "ppu.vscr_nj": ("true", "default"),
         "ppu.opd_swap_fixup": ("false", "default"),
+        "ppu.null_page": ('"stop"', "default"),
         "spu.dma_repeat_limit": ("256", "default"),
         "spu.dma_repeat_stop_secs": ("0", "default"),
         "gcm.wait_timeout_ms": ("10000", "default"),
@@ -142,6 +143,7 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
         assert src == {
             "ppu.vscr_nj": f"file:{c.path}",
             "ppu.opd_swap_fixup": "default",
+            "ppu.null_page": "default",
             "spu.dma_repeat_limit": "default",
             "spu.dma_repeat_stop_secs": "default",
             "gcm.wait_timeout_ms": "default",
@@ -156,7 +158,7 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
         if tomllib:
             doc = tomllib.loads(p.stdout)
             assert doc == {"schema": 1,
-                           "ppu": {"vscr_nj": False, "opd_swap_fixup": False},
+                           "ppu": {"vscr_nj": False, "opd_swap_fixup": False, "null_page": "stop"},
                            "spu": {"dma_repeat_limit": 256, "dma_repeat_stop_secs": 0},
                            "gcm": {"wait_timeout_ms": 10000},
                            "video": {"resolutions": ""},
@@ -233,6 +235,26 @@ def test_video_resolutions_normalise_and_reject_unknown_ids():
             f = config_invalid(probe("--load", c.path, "get"))
             assert f["key"] == "video.resolutions" and f["line"] == "3", (bad, f)
             assert "resolution id" in f["detail"], (bad, f)
+
+
+def test_null_page_is_stop_or_drop_from_file_and_environment():
+    with Cfg("schema = 1", "[ppu]", "# a title that reads page 0 on purpose", 'null_page = "drop"') as c:
+        o = options(probe("--load", c.path, "get"))
+        assert o["ppu.null_page"] == ('"drop"', f"file:{c.path}"), o
+        o = options(probe("--load", c.path, "get", PS3RECOMP_PPU_NULL_PAGE="stop"))
+        assert o["ppu.null_page"] == ('"stop"', "env:PS3RECOMP_PPU_NULL_PAGE"), o
+    o = options(probe("get", PS3RECOMP_PPU_NULL_PAGE="drop"))
+    assert o["ppu.null_page"] == ('"drop"', "env:PS3RECOMP_PPU_NULL_PAGE"), o
+    for bad in ("land", "Stop", "DROP", "", "true"):
+        with Cfg("schema = 1", "[ppu]", f'null_page = "{bad}"') as c:
+            f = config_invalid(probe("--load", c.path, "get"))
+            assert f["key"] == "ppu.null_page" and f["line"] == "3", (bad, f)
+            assert '"stop" or "drop"' in f["detail"], (bad, f)
+        f = config_invalid(probe("get", PS3RECOMP_PPU_NULL_PAGE=bad))
+        assert f["env"] == "PS3RECOMP_PPU_NULL_PAGE" and f["key"] == "ppu.null_page", (bad, f)
+    with Cfg("schema = 1", "[ppu]", "null_page = true") as c:      # a bool is the wrong type
+        f = config_invalid(probe("--load", c.path, "get"))
+        assert f["key"] == "ppu.null_page" and f["line"] == "3", f
 
 
 def test_schema_mismatch_missing_and_mistyped_stop():
