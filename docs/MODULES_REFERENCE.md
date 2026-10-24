@@ -860,6 +860,20 @@ Producer-consumer pipeline framework for streaming data between PPU and SPU. Unl
 - The SDK's error codes (`0x8076xxxx`) and structure sizes; the attribute contents are not modelled
 - Not implemented: the `cellFiberPpuUtil*` worker-control functions
 
+**Pre-landing RE for worker Shutdown (not implemented here):** pinned FW4.93
+libfiber SHA-256
+`3be3192ee20ea993ad28e498bf96d992373a2057c2ce0ca4323e6798ed183430`.
+Helper `02001768-17D0`, after NULL/alignment/initialized checks, writes
+`scheduler[+0xE8] != schedulerEA + 0xE8` to its byte output. Shutdown calls it
+at `020058F4` and returns BUSY on true (`02005914` / `02005964`).
+This is the scheduler's nonempty fiber-lifetime list, not runnable-count or
+sleeping-worker state: CreateFiber links `fiber+0x320` there at
+`0200246C-2490`; unlink helper `02001464-1488` is called at `02003164` and
+`0200385C`. A signal-blocked fiber is not evidence of an empty list.
+The initialization anchor's SDK-declared return type remains unproven by
+these firmware bytes; the existing no-argument no-op is not validated by
+this investigation and must be fenced/corrected in the fiber cutover.
+
 ---
 
 ## Synchronization
@@ -881,14 +895,43 @@ All cellSync primitives use **busy-waiting (spinlocks)** — they spin in a tigh
 ### cellSync2
 
 **File:** `libs/sync/cellSync2.c`
-**Purpose:** OS-backed synchronization primitives
+**Purpose:** Extended synchronization primitives; firmware semaphore surface
 
-Unlike cellSync (spinlocks), cellSync2 uses **real OS blocking**:
+- **Semaphore**: `_cellSync2SemaphoreAttributeInitialize(attrEA,sdk)`,
+  `cellSync2SemaphoreInitialize(semEA,bufferEA,initial,attrEA)`,
+  `GetCount(semEA,outEA)`, and `Acquire` / `TryAcquire` / `Release`
+  `(semEA,count,configEA)`. Null config selects PPU or current-fiber routing.
+  All semaphore arguments are guest EAs. Attributes and objects are 128 bytes;
+  objects require 128-byte alignment. No host pointers or OS objects overlay
+  guest memory. Shared count/state and waiter FIFO updates use reservations.
+- An insufficient single-waiter Acquire reserves the available prefix,
+  clears the available count and records the remaining debt; Release pays
+  debt before notifying. Multi-waiter blocking Acquire accepts count0/1,
+  reserving released tokens before wake so GetCount never reports them as
+  available. Signed initial range is `[-0x800000,0x7FFFFF]`.
+- Default fiber waits yield through `cellFiberPpuWaitSignal`; notification
+  shares the existing fiber signal registry. Nonfiber calls park on a host
+  condition variable, using opaque integer wake identities in the guest FIFO
+  rather than firmware's shared LV2 event-flag allocation. This is a host
+  scheduling mechanism, not a different count or reservation contract.
+- Non-null custom configs stop with `sync2-semaphore-unsupported` before
+  successful-support side effects. Reinitializing a suspended semaphore and
+  unmodelled queue/waiter or failed fiber notification paths also fail closed.
+- **Mutex / Condition Variable / Queue** retain the unrelated legacy
+  OS-backed implementations; their ABI/layout fidelity is not established.
 
-- **Mutex**: CRITICAL_SECTION/pthread_mutex with timeout support
-- **Condition Variable**: CONDITION_VARIABLE/pthread_cond with timeout
-- **Semaphore**: Win32 Semaphore/sem_t with timeout
-- **Queue**: Bounded blocking queue (producers block when full, consumers block when empty)
+**Step-2 RE correction:** pinned FW4.93 libsync2 SHA-256
+`9ffffaefa71c86e21a37177a9b8fa0400899ebe376ead482a9af7afe72bfa7fd`.
+`02005300-5324` clears the high available word and stores
+`0x40000000 | (requested-available)` in the low word. Release
+`02004EF8-4F64` / `02004FEC-4FF8` pays this debt before notification.
+This corrects B5-SCOPE's earlier no-prefix-reservation interpretation;
+it is firmware behavior, not a deviation.
+
+`tests/sync2_semaphore` exercises generated imported calls, poison/canary
+layouts and validation precedence, signed/count-N/overflow semantics,
+multiple consumers, real default-fiber yield/wake and named config/range
+stops. Fixtures contain synthetic guest data only.
 
 ---
 

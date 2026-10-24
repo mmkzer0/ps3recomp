@@ -81,7 +81,8 @@ extern "C" {
     X(JQ2_WAKE,                 "jq2-wake")                                    \
     X(JQ2_STATE,                "jq2-state")                                   \
     X(JQ2_JM_CALL,              "jq2-jm-call")                                 \
-    X(HLE_GUEST_RANGE,          "hle-guest-range")
+    X(HLE_GUEST_RANGE,          "hle-guest-range")                              \
+    X(SYNC2_SEMAPHORE_UNSUPPORTED, "sync2-semaphore-unsupported")
 
 /* A fixed underlying type in C++ makes a kind outside the list (a caller's bug,
  * which the stop still reports as "invalid-kind") a well-defined value rather

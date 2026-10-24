@@ -1,9 +1,8 @@
 /*
  * ps3recomp - cellSync2 HLE implementation
  *
- * Extended sync primitives using host OS primitives.
- * Windows: SRWLOCK, CONDITION_VARIABLE
- * Unix: pthread_mutex, pthread_cond, ps3_sem_t (runtime/platform/posix_sem.h)
+ * Semaphores use guest big-endian reservation state and cooperative fiber
+ * waits. The unrelated legacy primitives still use host OS objects.
  */
 
 #include "cellSync2.h"
@@ -11,13 +10,18 @@
 #include "../../runtime/platform/darwin_compat.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdatomic.h>
+#include "../spurs/cellFiber.h"
+#include "../../runtime/memory/reservation.h"
+#include "ps3emu/endian.h"
+#include "ps3emu/stop.h"
+extern u32 ppu_vm_size;
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #else
 #include <pthread.h>
-#include "../../runtime/platform/posix_sem.h"   /* sem_init is ENOSYS on Darwin */
 #include <errno.h>
 #include <time.h>
 #endif
@@ -48,16 +52,6 @@ typedef struct Sync2CondInternal {
 #endif
 } Sync2CondInternal;
 
-typedef struct Sync2SemInternal {
-    u32 initialized;
-    s32 value;
-    s32 maxValue;
-#ifdef _WIN32
-    HANDLE sem;
-#else
-    ps3_sem_t sem;
-#endif
-} Sync2SemInternal;
 
 typedef struct Sync2QueueInternal {
     u32 initialized;
@@ -83,8 +77,6 @@ _Static_assert(sizeof(Sync2MutexInternal) <= CELL_SYNC2_MUTEX_SIZE,
                "Sync2MutexInternal too large");
 _Static_assert(sizeof(Sync2CondInternal) <= CELL_SYNC2_COND_SIZE,
                "Sync2CondInternal too large");
-_Static_assert(sizeof(Sync2SemInternal) <= CELL_SYNC2_SEMAPHORE_SIZE,
-               "Sync2SemInternal too large");
 _Static_assert(sizeof(Sync2QueueInternal) <= CELL_SYNC2_QUEUE_SIZE,
                "Sync2QueueInternal too large");
 
@@ -306,130 +298,319 @@ s32 cellSync2CondSignalAll(CellSync2Cond* cond)
  * Semaphore
  * =====================================================================*/
 
-s32 cellSync2SemaphoreAttributeInitialize(CellSync2SemaphoreAttribute* attr)
+/* Semaphore ABI/state: libsync2 0200540C..5514, 02005000..533C.
+ * Host state contains only suspended-call identities. Counts, reservations,
+ * FIFO indices and records live in guest memory. Lock order is sem_lock,
+ * fiber registry (notification only), reservation line; never switch a fiber
+ * or run a guest callback while sem_lock or a reservation line is held.
+ * Nonfiber wake tokens name host parked calls, never host pointers/OS objects.
+ */
+typedef struct SemWait {
+    struct SemWait* next;
+    u32 sem;
+    u32 fiber;
+    u64 token;
+    int notified;
+} SemWait;
+static SemWait* sem_waits;
+static u64 sem_next_token = 1;
+#ifdef _WIN32
+static SRWLOCK sem_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE sem_cv = CONDITION_VARIABLE_INIT;
+#define SEM_LOCK() AcquireSRWLockExclusive(&sem_lock)
+#define SEM_UNLOCK() ReleaseSRWLockExclusive(&sem_lock)
+#define SEM_WAIT() SleepConditionVariableSRW(&sem_cv, &sem_lock, INFINITE, 0)
+#define SEM_WAKE() WakeAllConditionVariable(&sem_cv)
+#else
+static pthread_mutex_t sem_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t sem_cv = PTHREAD_COND_INITIALIZER;
+#define SEM_LOCK() pthread_mutex_lock(&sem_lock)
+#define SEM_UNLOCK() pthread_mutex_unlock(&sem_lock)
+#define SEM_WAIT() pthread_cond_wait(&sem_cv, &sem_lock)
+#define SEM_WAKE() pthread_cond_broadcast(&sem_cv)
+#endif
+
+static void sem_range(const char* api, const char* arg, u32 ea, u64 size)
 {
-    attr = GUEST_PTR(attr, CellSync2SemaphoreAttribute*);
+    if (!vm_base || (u64)ea + size > ppu_vm_size)
+        ps3_stop_guest_range(api, arg, ea, size, ppu_vm_size);
+}
+static u16 sem_rd16(u32 ea)
+{
+    u16 v; memcpy(&v, vm_base + ea, 2); return ps3_bswap16(v);
+}
+static u32 sem_rd32(u32 ea)
+{
+    u32 v; memcpy(&v, vm_base + ea, 4); return ps3_bswap32(v);
+}
+static u64 sem_load64(u32 ea)
+{
+    return ps3_bswap64(atomic_load_explicit((_Atomic u64*)(vm_base + ea), memory_order_acquire));
+}
+static void sem_store64(u8* p, u64 v)
+{
+    atomic_store_explicit((_Atomic u64*)p, ps3_bswap64(v), memory_order_release);
+}
+static PS3_NORETURN void sem_unsupported(const char* api, u32 sem, u32 config, const char* reason)
+{
+    char s[16], c[16];
+    snprintf(s, sizeof s, "0x%X", sem); snprintf(c, sizeof c, "0x%X", config);
+    const ps3_stop_field fields[] = {{"api", api}, {"sem", s}, {"config", c}, {"reason", reason}};
+    ps3_stop(PS3_STOP_SYNC2_SEMAPHORE_UNSUPPORTED, "unsupported Sync2 semaphore operation",
+             "Implement the pinned firmware callback/resource path before using this configuration.",
+             fields, sizeof fields / sizeof fields[0], NULL);
+}
+
+s32 _cellSync2SemaphoreAttributeInitialize(u32 attr, u32 sdkVersion)
+{
     if (!attr) return CELL_SYNC2_ERROR_NULL_POINTER;
-    attr->maxWaiters = 32;
-    attr->maxValue = 0x7FFFFFFF;
+    sem_range(__func__, "attr", attr, 128);
+    memset(vm_base + attr, 0, 128);
+    vm_write32(attr, sdkVersion);
+    vm_write16(attr + 4, 0x010F);
+    vm_write16(attr + 6, 1);
+    memcpy(vm_base + attr + 8, "CellSync2Semaphore", sizeof "CellSync2Semaphore");
     return CELL_OK;
 }
 
-s32 cellSync2SemaphoreInit(CellSync2Semaphore* sem, s32 initialValue,
-                           const CellSync2SemaphoreAttribute* attr)
+s32 cellSync2SemaphoreInitialize(u32 sem, u32 workBuffer, s32 initialValue, u32 attr)
 {
-    attr = GUEST_PTR(attr, const CellSync2SemaphoreAttribute*);
-    if (!sem) return CELL_SYNC2_ERROR_NULL_POINTER;
-
-    Sync2SemInternal* s = (Sync2SemInternal*)sem;
-    memset(s, 0, sizeof(Sync2SemInternal));
-    s->value = initialValue;
-    s->maxValue = attr ? attr->maxValue : 0x7FFFFFFF;
-    s->initialized = 1;
-
-#ifdef _WIN32
-    s->sem = CreateSemaphoreW(NULL, initialValue, s->maxValue, NULL);
-    if (!s->sem) return CELL_SYNC2_ERROR_STAT;
-#else
-    if (ps3_sem_init(&s->sem, (unsigned)initialValue) != 0)
-        return CELL_SYNC2_ERROR_STAT;
-#endif
-
+    if (!sem || !attr) return CELL_SYNC2_ERROR_NULL_POINTER;
+    if ((sem & 127) || (workBuffer & 7)) return CELL_SYNC2_ERROR_ALIGN;
+    sem_range(__func__, "attr", attr, 128);
+    const u32 sdk = sem_rd32(attr);
+    const u16 max = sem_rd16(attr + 6), mask = sem_rd16(attr + 4);
+    if (sdk - 0x270000u > 0xC0000u || max == 0 || max > 0x8000) return CELL_SYNC2_ERROR_INVAL;
+    if (max == 1 && workBuffer) return CELL_SYNC2_ERROR_INVAL;
+    if (max > 1 && !workBuffer) return CELL_SYNC2_ERROR_NULL_POINTER;
+    if (!mask || (mask & 0x3E30)) return CELL_SYNC2_ERROR_INVAL;
+    sem_range(__func__, "sem", sem, 128);
+    SEM_LOCK();
+    for (SemWait* w = sem_waits; w; w = w->next)
+        if (w->sem == sem) sem_unsupported(__func__, sem, 0, "reinitialize-blocked");
+    memset(vm_base + sem, 0, 128);
+    /* Both late failures happen after the firmware zeroes the object. The
+     * queue helper rejects byte sizes above 0x40000 (02005F14..5F30). */
+    if (initialValue < -0x800000 || initialValue > 0x7FFFFF || max == 0x8000) {
+        SEM_UNLOCK();
+        return CELL_SYNC2_ERROR_INVAL;
+    }
+    const u32 buffer = workBuffer ? workBuffer : sem + 0x48;
+    const u32 bytes = 8u * (max + 1u);
+    sem_range(__func__, "workBuffer", buffer, bytes);
+    memset(vm_base + buffer, 0, bytes);
+    vm_write64(sem, 0x8000000080000000ull);
+    vm_write32(sem + 8, buffer);
+    vm_write16(sem + 0xC, max + 1u);
+    vm_write64(sem + 0x10, (u64)(u32)initialValue << 32);
+    vm_write32(sem + 0x18, sdk);
+    vm_write16(sem + 0x20, mask);
+    vm_write16(sem + 0x22, max);
+    memcpy(vm_base + sem + 0x28, vm_base + attr + 8, 31);
+    SEM_UNLOCK();
     return CELL_OK;
 }
 
-s32 cellSync2SemaphoreAcquire(CellSync2Semaphore* sem, u32 count,
-                              u64 timeoutUsec)
+s32 cellSync2SemaphoreGetCount(u32 sem, u32 countOut)
 {
-    if (!sem) return CELL_SYNC2_ERROR_NULL_POINTER;
-    Sync2SemInternal* s = (Sync2SemInternal*)sem;
-    if (!s->initialized) return CELL_SYNC2_ERROR_NOT_INITIALIZED;
+    if (!sem || !countOut) return CELL_SYNC2_ERROR_NULL_POINTER;
+    if (sem & 127) return CELL_SYNC2_ERROR_ALIGN;
+    sem_range(__func__, "sem", sem, 128);
+    sem_range(__func__, "countOut", countOut, 4);
+    vm_write32(countOut, (u32)(sem_load64(sem + 0x10) >> 32));
+    return CELL_OK;
+}
 
-    for (u32 i = 0; i < count; i++) {
-#ifdef _WIN32
-        DWORD ms = (timeoutUsec == 0) ? INFINITE : (DWORD)(timeoutUsec / 1000);
-        DWORD rc = WaitForSingleObject(s->sem, ms);
-        if (rc == WAIT_TIMEOUT) return CELL_SYNC2_ERROR_TIMEDOUT;
-        if (rc != WAIT_OBJECT_0) return CELL_SYNC2_ERROR_STAT;
-#else
-        if (timeoutUsec == 0) {
-            ps3_sem_wait(&s->sem);
+typedef struct SemOp {
+    u32 count;
+    u16 max;
+    int action; /* 0 try, 1 acquire, 2 release, 3 acknowledge */
+    s32 rc;
+    u32 wakes;
+    int blocked;
+} SemOp;
+
+static int sem_state_rmw(u8* line, void* user)
+{
+    SemOp* op = user;
+    const u64 old = ps3_bswap64(atomic_load_explicit((_Atomic u64*)(line + 0x10), memory_order_relaxed));
+    s32 count = (s32)(old >> 32);
+    u32 state = (u32)old;
+    if (op->action == 3) {
+        if (op->max == 1) state &= 0x3FFFFFFFu;
+        else state -= 0x10001u;
+    } else if (op->action < 2) {
+        if (count >= (s32)op->count) count -= (s32)op->count;
+        else if (op->action == 0) { op->rc = CELL_SYNC2_ERROR_AGAIN; return 0; }
+        else if (op->max == 1) {
+            if (state & 0x40000000u) { op->rc = CELL_SYNC2_ERROR_BUSY; return 0; }
+            /* 02005300..5324 reserves the available prefix and records debt,
+             * not an OS semaphore's per-unit decrement loop. */
+            state = 0x40000000u | (op->count - (u32)count);
+            count = 0;
+            op->blocked = 1;
         } else {
-            struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            ts.tv_sec  += (time_t)(timeoutUsec / 1000000);
-            ts.tv_nsec += (long)((timeoutUsec % 1000000) * 1000);
-            if (ts.tv_nsec >= 1000000000L) {
-                ts.tv_sec++;
-                ts.tv_nsec -= 1000000000L;
-            }
-            if (ps3_sem_timedwait(&s->sem, &ts) != 0) {
-                if (errno == ETIMEDOUT) return CELL_SYNC2_ERROR_TIMEDOUT;
-                return CELL_SYNC2_ERROR_STAT;
+            if ((state & 0xFFFFu) == op->max) { op->rc = CELL_SYNC2_ERROR_NOMEM; return 0; }
+            ++state;
+            op->blocked = 1;
+        }
+    } else {
+        const s64 sum = (s64)count + op->count;
+        if (sum > 0x7FFFFF) { op->rc = CELL_SYNC2_ERROR_STAT; return 0; }
+        count = (s32)sum;
+        if (count > 0) {
+            if (op->max == 1) {
+                if ((state & 0xC0000000u) == 0x40000000u) {
+                    const u32 debt = state & 0x3FFFFFFFu;
+                    if ((u32)count < debt) { state -= (u32)count; count = 0; }
+                    else { count -= (s32)debt; state = 0xC0000000u; op->wakes = 1; }
+                }
+            } else {
+                const u32 waiting = (state & 0xFFFFu) - (state >> 16);
+                op->wakes = waiting < (u32)count ? waiting : (u32)count;
+                count -= (s32)op->wakes;
+                state += op->wakes << 16;
             }
         }
-#endif
     }
+    sem_store64(line + 0x10, ((u64)(u32)count << 32) | state);
+    return 1;
+}
 
+typedef struct SemWord { u32 ea; u64 value; } SemWord;
+static int sem_word_rmw(u8* line, void* user)
+{
+    const SemWord* w = user;
+    sem_store64(line + (w->ea & 127), w->value);
+    return 1;
+}
+static void sem_put_word(u32 ea, u64 value)
+{
+    SemWord word = {ea, value};
+    resv_host_rmw(ea, sem_word_rmw, &word);
+}
+
+/* Serial host calls use the firmware queue's stable (no in-flight producer/
+ * consumer) representation. The two index words retain their phase bits;
+ * each slot retains its generation when consumed (02005C2C..5C58). */
+static void sem_queue_push(u32 sem, u16 type, u64 token)
+{
+    const u64 header = sem_load64(sem);
+    const u32 tail = (u32)header, cap = sem_rd16(sem + 0xC);
+    if (cap < 2 || (tail & 0xFFFFu) >= cap) sem_unsupported("Acquire", sem, 0, "queue-state");
+    const u32 buffer = sem_rd32(sem + 8);
+    sem_range("Acquire", "workBuffer", buffer, 8ull * cap);
+    const u32 ea = buffer + 8u * (tail & 0xFFFFu);
+    const u64 old = sem_load64(ea);
+    const u64 generation = (((old >> 52) + 1u) & 0x1FFu) << 52;
+    sem_put_word(ea, ((u64)(tail >> 31) << 63) | generation | ((u64)(type == 2) << 48) | token);
+    u32 next = (tail & 0x80000000u) | ((tail + 1u) & 0xFFFFu);
+    if ((next & 0xFFFFu) == cap) next = (tail ^ 0x80000000u) & 0x80000000u;
+    sem_put_word(sem, (header & 0xFFFFFFFF00000000ull) | next);
+}
+
+static SemWait* sem_queue_pop(u32 sem)
+{
+    const u64 header = sem_load64(sem);
+    const u32 head = (u32)(header >> 32), cap = sem_rd16(sem + 0xC);
+    if (cap < 2 || (head & 0xFFFFu) >= cap) sem_unsupported("Release", sem, 0, "queue-state");
+    const u32 buffer = sem_rd32(sem + 8);
+    sem_range("Release", "workBuffer", buffer, 8ull * cap);
+    const u32 ea = buffer + 8u * (head & 0xFFFFu);
+    const u64 record = sem_load64(ea), token = record & 0x0000FFFFFFFFFFFFull;
+    const u32 fiber = ((record >> 48) & 15u) == 1 ? (u32)token : 0;
+    SemWait* found = NULL;
+    for (SemWait* w = sem_waits; w; w = w->next)
+        if (w->sem == sem && w->token == token && w->fiber == fiber && !w->notified) { found = w; break; }
+    if (!found) sem_unsupported("Release", sem, 0, "waiter-state");
+    const u64 phase = (u64)(head >> 31) << 62;
+    sem_put_word(ea, (record & 0x9FF0000000000000ull) | phase | (1ull << 61));
+    u32 next = (head & 0x80000000u) | ((head + 1u) & 0xFFFFu);
+    if ((next & 0xFFFFu) == cap) next = (head ^ 0x80000000u) & 0x80000000u;
+    sem_put_word(sem, ((u64)next << 32) | (u32)header);
+    return found;
+}
+
+static s32 sem_front(const char* api, u32 sem, u32 config, u32* fiber)
+{
+    if (!sem) return CELL_SYNC2_ERROR_NULL_POINTER;
+    if (sem & 127) return CELL_SYNC2_ERROR_ALIGN;
+    if (config) sem_unsupported(api, sem, config, "custom-config");
+    sem_range(api, "sem", sem, 128);
+    const u16 mask = sem_rd16(sem + 0x20);
+    *fiber = (mask & 2) ? (u32)(uintptr_t)cellFiberPpuSelf() : 0;
+    if (!(mask & (*fiber ? 2 : 1))) return CELL_SYNC2_ERROR_THREAD_TYPE;
     return CELL_OK;
 }
 
-s32 cellSync2SemaphoreTryAcquire(CellSync2Semaphore* sem, u32 count)
+static s32 sem_acquire(const char* api, u32 sem, u32 count, u32 config, int blocking)
 {
-    if (!sem) return CELL_SYNC2_ERROR_NULL_POINTER;
-    Sync2SemInternal* s = (Sync2SemInternal*)sem;
-    if (!s->initialized) return CELL_SYNC2_ERROR_NOT_INITIALIZED;
+    u32 fiber = 0;
+    s32 rc = sem_front(api, sem, config, &fiber);
+    if (rc) return rc;
+    const u16 max = sem_rd16(sem + 0x22);
+    if (count > 0x7FFFFF || (blocking && max != 1 && count > 1)) return CELL_SYNC2_ERROR_INVAL;
+    if (!count) return CELL_OK;
+    SEM_LOCK();
+    SemOp op = {count, max, blocking, CELL_OK, 0, 0};
+    resv_host_rmw(sem, sem_state_rmw, &op);
+    if (op.rc || !op.blocked) { SEM_UNLOCK(); return op.rc; }
+    SemWait wait = {sem_waits, sem, fiber, fiber ? fiber : sem_next_token++, 0};
+    sem_waits = &wait;
+    sem_queue_push(sem, fiber ? 2 : 1, wait.token);
+    if (fiber) {
+        /* Always consume the notifier's signal, including release-before-wait.
+         * Unrelated signals may return early; only this wait's notification
+         * authorizes acknowledging its guest reservation. */
+        do {
+            SEM_UNLOCK();
+            rc = cellFiberPpuWaitSignal();
+            SEM_LOCK();
+            if (rc) sem_unsupported(api, sem, 0, "fiber-wait");
+        } while (!wait.notified);
+    } else {
+        while (!wait.notified) SEM_WAIT();
+    }
+    op.action = 3;
+    resv_host_rmw(sem, sem_state_rmw, &op);
+    for (SemWait** w = &sem_waits; *w; w = &(*w)->next)
+        if (*w == &wait) { *w = wait.next; break; }
+    SEM_UNLOCK();
+    return CELL_OK;
+}
 
-    for (u32 i = 0; i < count; i++) {
-#ifdef _WIN32
-        DWORD rc = WaitForSingleObject(s->sem, 0);
-        if (rc == WAIT_TIMEOUT) return CELL_SYNC2_ERROR_BUSY;
-        if (rc != WAIT_OBJECT_0) return CELL_SYNC2_ERROR_STAT;
-#else
-        if (ps3_sem_trywait(&s->sem) != 0) {
-            if (errno == EAGAIN) return CELL_SYNC2_ERROR_BUSY;
-            return CELL_SYNC2_ERROR_STAT;
+s32 cellSync2SemaphoreAcquire(u32 sem, u32 count, u32 threadConfig)
+{
+    return sem_acquire(__func__, sem, count, threadConfig, 1);
+}
+s32 cellSync2SemaphoreTryAcquire(u32 sem, u32 count, u32 threadConfig)
+{
+    return sem_acquire(__func__, sem, count, threadConfig, 0);
+}
+s32 cellSync2SemaphoreRelease(u32 sem, u32 count, u32 notifierConfig)
+{
+    u32 fiber = 0;
+    s32 rc = sem_front(__func__, sem, notifierConfig, &fiber);
+    if (rc) return rc;
+    if (count > 0x7FFFFF) return CELL_SYNC2_ERROR_INVAL;
+    if (!count) return CELL_OK;
+    SEM_LOCK();
+    SemOp op = {count, sem_rd16(sem + 0x22), 2, CELL_OK, 0, 0};
+    resv_host_rmw(sem, sem_state_rmw, &op);
+    int wake_ppu = 0;
+    for (u32 i = 0; i < op.wakes; ++i) {
+        SemWait* w = sem_queue_pop(sem);
+        w->notified = 1;
+        if (w->fiber) {
+            if (cellFiberPpuSendSignal((CellFiberPpu*)(uintptr_t)w->fiber, NULL))
+                sem_unsupported(__func__, sem, 0, "fiber-notify");
+        } else {
+            wake_ppu = 1;
         }
-#endif
     }
-
-    return CELL_OK;
-}
-
-s32 cellSync2SemaphoreRelease(CellSync2Semaphore* sem, u32 count)
-{
-    if (!sem) return CELL_SYNC2_ERROR_NULL_POINTER;
-    Sync2SemInternal* s = (Sync2SemInternal*)sem;
-    if (!s->initialized) return CELL_SYNC2_ERROR_NOT_INITIALIZED;
-
-    for (u32 i = 0; i < count; i++) {
-#ifdef _WIN32
-        ReleaseSemaphore(s->sem, 1, NULL);
-#else
-        ps3_sem_post(&s->sem);
-#endif
-    }
-
-    return CELL_OK;
-}
-
-s32 cellSync2SemaphoreGetValue(const CellSync2Semaphore* sem, s32* value)
-{
-    if (!sem || !value) return CELL_SYNC2_ERROR_NULL_POINTER;
-    Sync2SemInternal* s = (Sync2SemInternal*)sem;
-    if (!s->initialized) return CELL_SYNC2_ERROR_NOT_INITIALIZED;
-
-#ifdef _WIN32
-    /* Windows doesn't have a direct "get value" for semaphores.
-     * Use a 0-timeout wait + release trick, or track internally. */
-    vm_write32((u32)(uintptr_t)value, (u32)s->value); /* approximate */
-#else
-    int v;
-    ps3_sem_getvalue(&s->sem, &v);
-    vm_write32((u32)(uintptr_t)value, (u32)v);
-#endif
-
-    return CELL_OK;
+    if (wake_ppu) SEM_WAKE();
+    SEM_UNLOCK();
+    return op.rc;
 }
 
 /* =========================================================================

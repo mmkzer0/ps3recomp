@@ -427,6 +427,35 @@ existing 3 fiber and 2 Sync2 imports. Pre-landing fiber anchor/return ABI,
 scheduler Shutdown BUSY predicate and custom Sync2 config fencing remain
 outside this completed waiter cutover; they are not resolved by these tests.
 
+### B5 step-2 checkpoint: Sync2 semaphore cutover
+
+The preceding table is the historical step-1 checkpoint. Step 2 additionally
+passes the semaphore attribute/layout/error-precedence and count/signed-range
+rows, all five imported Sync2 NIDs through generated dispatch, default
+scheduler-fiber Acquire/Release, and custom-config/range stops.
+The Count-N row is **corrected by step-2 RE**: initial count 2 / Acquire(3)
+reserves the prefix, GetCount is 0 while blocked, and Release(1) pays the debt.
+Pinned firmware ranges and host scheduling mechanics are recorded in
+`MODULES_REFERENCE.md` under cellSync2.
+
+All eight new `sync2_semaphore_*` tests failed before the cutover: default
+consumer flows stopped at the absent imported attribute initializer, while
+stop fixtures rejected that wrong stop and unchanged guest state. Those
+baseline results do not independently exercise the old per-unit count loop.
+After cutover they pass, including eight debt/wake cycles (four FIFO wraps),
+output publication, four competing consumers and a real fiber yield/wake.
+Final dev selection: 52/52; ASan/UBSan selection: 47/47; TSan selection: 43/43.
+`sync2_semaphore_fiber` passed in both sanitizer presets with no reported
+ucontext instrumentation failure; that is bounded execution evidence, not
+proof that arbitrary coroutine switching is sanitizer-safe. Other new tests
+do not switch ucontexts. Initial TSan runs exposed fixture stack/context
+aliasing; callers now have distinct guest stacks and PPU thread-table slots,
+without suppressions or changes to runtime instrumentation.
+
+Generated coverage is now 8/16 imported NIDs (3 fiber, all 5 Sync2); total
+registrations remain 1154. UtilWorkerControl, kind 0, dispatch isolation,
+worker Shutdown and real-job C4 remain outside this checkpoint.
+
 ### How the port line is tested
 
 `tests/spurs_jq2/test_jq2_port.cpp` (labels `spurs;t0;tsan`; `jq2_port_race_stress`

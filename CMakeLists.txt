@@ -450,6 +450,7 @@ if(PS3RECOMP_BUILD_TESTS)
     # them and the shape of ucontext_t on _XOPEN_SOURCE, so whether that path
     # works on arm64 is a question to answer rather than assume.
     add_subdirectory(tests/fiber_switch)
+    add_subdirectory(tests/sync2_semaphore)
     # Syscall 14's address/flags classification as a plain unit test: the
     # check is pure, so the test links one runtime translation unit
     # (lv2_lock_line.c) and nothing else.
