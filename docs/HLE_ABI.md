@@ -70,7 +70,7 @@ the platform's `char` signedness is honoured rather than assumed.
 A handler whose declared return is a pointer must be listed, with a reason, in
 `tools/gen_hle_nids.py`. The list is what selects the adapter, so a new
 pointer-returning handler that is not classified fails the build (the plain
-adapter's `static_assert` says to classify it). Census: 26 of the 1221 scanned
+adapter's `static_assert` says to classify it). Census: 26 of the 1224 scanned
 definitions return a pointer (22 registered, 4 excluded;
 `python3 tools/test_gen_hle_nids.py --census`).
 
@@ -155,12 +155,12 @@ the commands do not.
 `python3 tools/gen_hle_nids.py --all --out /tmp/x.cpp` is the run the build
 uses. It prints
 
-    wrote /tmp/x.cpp: 1170 NID handlers from 95 module(s); scanned 1221 definition name(s), excluded 51 host-side helper(s)
+    wrote /tmp/x.cpp: 1170 NID handlers from 95 module(s); scanned 1224 definition name(s), excluded 54 host-side helper(s)
 
 and `grep -c 'ps3_hle_register(0x' /tmp/x.cpp` prints `1170`. So: 95 module
-sources, 1221 unique definition names, **1170 registrations**, **51 host-side
+sources, 1224 unique definition names, **1170 registrations**, **54 host-side
 helpers** excluded. Registration is fail-closed: `classify_name` decides every
-one of the 1221 (see "Firmware export or host-side helper" below), and a name
+one of the 1224 (see "Firmware export or host-side helper" below), and a name
 with no evidence stops the generator (exit 2) instead of being registered.
 
 `python3 tools/test_gen_hle_nids.py --census` (requires `clang`) takes the
@@ -169,23 +169,23 @@ with no evidence stops the generator (exit 2) instead of being registered.
 integral/enum/pointer/record/function-pointer, and prints:
 
     modules scanned: 95
-    scanned definition names: 1221
-    definitions with a clang AST: 1221 (0 missing)
-    registered: 1170 (333 in the known NID sources, 837 by SDK export shape), excluded host-side helpers: 51
-    returns: integral 1136, void 58, float 1, pointer 26
+    scanned definition names: 1224
+    definitions with a clang AST: 1224 (0 missing)
+    registered: 1170 (333 in the known NID sources, 837 by SDK export shape), excluded host-side helpers: 54
+    returns: integral 1136, void 61, float 1, pointer 26
     pointer returns: 26 total = 22 registered (16 guest EA + 6 host-pointer stop) + 4 excluded (cellGame_get_hdd_title_id, cellGame_get_title, cellGame_get_title_id, cellGcm_fifo_kick_event)
-    parameters: pointer 1050, integral 1434, float 16, function-pointer 73, variadic 3, record 0, reference 0, array 0, enum 0
+    parameters: pointer 1052, integral 1434, float 16, function-pointer 73, variadic 3, record 0, reference 0, array 0, enum 0
     float parameters: 16 in 12 handlers
     more than 8 parameters: _cellSpursCreateJobQueueWithJobDescriptorPool(12), cellGcmSetZcull(12), _cellSpursCreateJobQueue(10), cellSaveDataListAutoLoad(9), cellSpursWorkloadAttributeInitialize(9)
 
 | Return class | Count |
 |---|---|
 | integral (including the 3 variadic `_sys_*printf`) | 1136 |
-| void | 58 |
+| void | 59 |
 | `float` (`cellAvconfExt_display_gamma`, excluded as a helper) | 1 |
 | pointer | 26 (16 guest EA + 6 host-pointer stop + 4 excluded helpers) |
 
-Parameter features: 1050 pointer, 1434 integral, 16 floating-point across 12
+Parameter features: 1052 pointer, 1434 integral, 16 floating-point across 12
 handlers, 73 function-pointer, 3 variadic, 0 struct/union by value, 0
 reference, 0 array. Five handlers exceed eight parameters
 (`_cellSpursCreateJobQueueWithJobDescriptorPool` 12, `cellGcmSetZcull` 12,
@@ -221,19 +221,19 @@ kept name has evidence: the census prints the split — 333 of the 1170
 registrations are in the known NID sources, the other 837 pass an SDK export
 shape, and none is in neither.
 
-None of the 51 excluded names is a firmware export, so registering one could
+None of the 54 excluded names is a firmware export, so registering one could
 only shadow a real import: a title import whose 32-bit NID happened to match
 would dispatch guest arguments into a host function.
 
-**Excluded by shape (40).**
+**Excluded by shape (43).**
 
 | Group | Names |
 |---|---|
-| cellGcmSys host plumbing | `cellGcm_display_buffer_count`, `cellGcm_fifo_kick_event`, `cellGcm_fifo_kick_wait`, `cellGcm_fifo_recycle`, `cellGcm_flip_request_count`, `cellGcm_ref_on_poll`, `cellGcm_request_tick`, `cellGcm_rsx_process_fifo`, `cellGcm_take_flip_pending`, `cellGcm_take_flip_pending_synced`, `cellGcm_control_guest_addr`, `cellGcm_replay_display_buffers_to_engine` |
+| cellGcmSys host plumbing | `cellGcm_display_buffer_count`, `cellGcm_fifo_kick_event`, `cellGcm_fifo_kick_wait`, `cellGcm_fifo_recycle`, `cellGcm_flip_request_count`, `cellGcm_ref_on_poll`, `cellGcm_request_tick`, `cellGcm_rsx_process_fifo`, `cellGcm_take_flip_pending`, `cellGcm_take_flip_pending_synced`, `cellGcm_vblank_flip_label`, `cellGcm_vblank_signal`, `cellGcm_control_guest_addr`, `cellGcm_replay_display_buffers_to_engine` |
 | cellGcmSys guest-syscall bridge | `cellGcm_syscall_bringup`, `cellGcm_syscall_iomap`, `cellGcm_syscall_iounmap`, `cellGcm_syscall_set_fifo` |
 | cellGame boot/params plumbing | `cellGame_get_title`, `cellGame_get_title_id`, `cellGame_get_hdd_title_id`, `cellGame_set_title`, `cellGame_set_title_id`, `cellGame_set_content_path`, `cellGame_init_from_paramsfo` |
 | input event injection | `cellPad_poll`, `cellKb_keyEvent`, `cellMouse_moveEvent`, `cellMouse_buttonEvent`, `cellMouse_wheelEvent` |
-| video / save / rtc | `cellVideoOut_set_resolution`, `cellAvconfExt_display_gamma`, `cellSaveData_set_scratch_region`, `cellSaveData_register_ctx_handlers`, `cellRtcGetTime_t`, `cellRtcSetTime_t`, `cellResc_convert_register_count` |
+| video / save / rtc | `cellVideoOut_refresh_rate`, `cellVideoOut_set_resolution`, `cellAvconfExt_display_gamma`, `cellSaveData_set_scratch_region`, `cellSaveData_register_ctx_handlers`, `cellRtcGetTime_t`, `cellRtcSetTime_t`, `cellResc_convert_register_count` |
 | filesystem path mapping | `cellfs_translate_path`, `cellfs_add_path_mapping`, `cellfs_set_root_path` |
 | per-frame hooks | `cellMsgDialog_tick`, `cellSysutil_pump_seen` |
 

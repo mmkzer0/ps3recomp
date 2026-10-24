@@ -60,6 +60,12 @@ extern "C" {
 #define CELL_VIDEO_OUT_DISPLAY_MODE_1280_720_50HZ      0x00000040
 #define CELL_VIDEO_OUT_DISPLAY_MODE_1920_1080_50HZ     0x00000080
 
+/* CellVideoOutDisplayMode.refreshRates flags */
+#define CELL_VIDEO_OUT_REFRESH_RATE_59_94HZ  0x0001
+#define CELL_VIDEO_OUT_REFRESH_RATE_50HZ     0x0002
+#define CELL_VIDEO_OUT_REFRESH_RATE_60HZ     0x0004
+#define CELL_VIDEO_OUT_REFRESH_RATE_30HZ     0x0008
+
 /* ---------------------------------------------------------------------------
  * Error codes
  * -----------------------------------------------------------------------*/
@@ -134,6 +140,11 @@ typedef struct CellVideoOutDeviceInfo {
 
 /* Set the default resolution (call before game boots) */
 void cellVideoOut_set_resolution(u8 resolutionId);
+
+/* The refresh rate of the display mode GetState reports, as the fraction hz_num / hz_den (the mode's refresh-rate
+ * flag: 59.94 Hz is 60000 / 1001). The vertical blank the RSX raises (cellGcmTickVBlank) repeats at this rate; the
+ * title's host clock schedules from it. */
+void cellVideoOut_refresh_rate(u32* hz_num, u32* hz_den);
 
 /* ---------------------------------------------------------------------------
  * Functions

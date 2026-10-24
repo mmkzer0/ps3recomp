@@ -115,6 +115,17 @@ static void expect(const char* what, const int* want_modes, int n_want, int want
         CHECK(cellVideoOutGetResolutionAvailability(1, id, 0, 0) == 0, "%s: secondary output reports id %u", what, id);
     }
     CHECK(avail((u32)st) == 1, "%s: the state's resolution %d is not available", what, st);
+
+    /* The refresh rate the vertical blank repeats at follows the refresh-rate flag GetState reports for the
+     * mode (59.94 Hz = flag 1 = 60000 / 1001), for every mode the display can run. */
+    {
+        const uint32_t ea = STATE_EA + offsetof(CellVideoOutState, displayMode) + offsetof(CellVideoOutDisplayModeBytes, refreshRates);
+        const uint32_t flag = ((uint32_t)vm_base[ea] << 8) | vm_base[ea + 1];
+        u32 num = 0, den = 0;
+        cellVideoOut_refresh_rate(&num, &den);
+        CHECK(flag == CELL_VIDEO_OUT_REFRESH_RATE_59_94HZ, "%s: GetState reports refresh flag 0x%X, want 1 (59.94 Hz)", what, flag);
+        CHECK(num == 60000u && den == 1001u, "%s: refresh rate %u/%u, want 60000/1001 for the flag GetState reports", what, num, den);
+    }
 }
 
 int main(int argc, char** argv)

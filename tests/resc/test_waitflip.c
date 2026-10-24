@@ -38,6 +38,8 @@ extern uint32_t vm_read32(uint64_t addr);
 extern void cellGcm_rsx_process_fifo(void);
 extern int cellGcm_take_flip_pending_synced(void);
 extern void cellGcmTickVBlank(void);
+extern void cellGcm_vblank_signal(void);
+extern void cellGcm_vblank_flip_label(void);
 
 uint8_t* vm_base = NULL;
 
@@ -221,6 +223,23 @@ static void test_walker(void)
           gr32(g_ctrl + 4), put, gr32(label_ea(0x41)));
     cellGcmTickVBlank();
     CHECK(gr32(label_ea(1)) == 0, "a vblank with no flip outstanding leaves the label alone");
+
+    /* The two halves of the vblank: the vertical blank itself leaves the flip outstanding; the driver's answer
+     * completes it. */
+    flip_then_wait();
+    const uint32_t put2 = gr32(g_ctrl + 0);
+    for (int i = 0; i < 6; i++) { cellGcm_rsx_process_fifo(); usleep(2000); }
+    /* (the scene's reset counts the heads from zero again) */
+    CHECK(gcm_driver_event_count(GCM_DRV_EVENT_FLIP_HEAD) == 1 && gr32(label_ea(1)) == 0xFFFFFFFFu,
+          "the second flip head retired and released the label: heads %u, label 0x%X",
+          (unsigned)gcm_driver_event_count(GCM_DRV_EVENT_FLIP_HEAD), gr32(label_ea(1)));
+    CHECK(cellGcm_take_flip_pending_synced() == 1, "the second frame is presentable (put 0x%X)", put2);
+    cellGcm_vblank_signal();
+    CHECK(gr32(label_ea(1)) == 0xFFFFFFFFu, "the vertical blank alone does not complete the flip: 0x%X", gr32(label_ea(1)));
+    cellGcm_vblank_flip_label();
+    CHECK(gr32(label_ea(1)) == 0, "the driver's answer zeroed the flip-done label: 0x%X", gr32(label_ea(1)));
+    for (int i = 0; i < 6 && gr32(g_ctrl + 4) != put2; i++) { cellGcm_rsx_process_fifo(); usleep(2000); }
+    CHECK(gr32(g_ctrl + 4) == put2, "released: get 0x%X put 0x%X", gr32(g_ctrl + 4), put2);
 }
 
 /* ---- the named stop --------------------------------------------------------------------------------- */

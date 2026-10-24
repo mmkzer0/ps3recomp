@@ -89,14 +89,14 @@ static s32 scene_resc(u32 support, u32 pal, u32 flip, u32 mode)
 }
 
 static int g_flip_calls, g_vblank_calls;
-static uint64_t g_flip_arg;
+static uint64_t g_flip_arg, g_vblank_args[16];
 static uint32_t g_flip_opd, g_vblank_opd;
 static void fake_caller(uint32_t opd, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5,
                         uint64_t a6, uint64_t a7)
 {
     (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; (void)a7;
     if (opd == g_flip_opd) { g_flip_calls++; g_flip_arg = a0; }
-    else if (opd == g_vblank_opd) g_vblank_calls++;
+    else if (opd == g_vblank_opd) { if (g_vblank_calls < 16) g_vblank_args[g_vblank_calls] = a0; g_vblank_calls++; }
 }
 
 /* A flip command in the FIFO, the way a frame queues one. */
@@ -155,6 +155,40 @@ static void test_720p_is_libgcm(void)
     g_ps3_guest_caller = NULL;
 }
 
+/* The vblank handler runs once per vblank the driver raised, not once for however many are pending: a vblank
+ * thread that ran late fires its missed vblanks back to back (RPCS3's does, each one counted and each handler call
+ * queued), and the guest's counter advances by the missed count. */
+static void test_a_late_pump_runs_the_handler_once_per_vblank(void)
+{
+    CHECK(scene_resc(CELL_RESC_1280x720, 0, 0, CELL_RESC_1280x720) == 0, "720p");
+    scene_gcm();
+    g_vblank_opd = host_alloc(8, 8);
+    gw32(g_vblank_opd, 0x00123500u);
+    cellRescSetVBlankHandler((void (*)(u32))(uintptr_t)g_vblank_opd);
+    g_ps3_guest_caller = fake_caller;
+    ppu_gcm_pump();                       /* whatever was pending */
+    g_vblank_calls = 0;
+
+    cellGcmTickVBlank();
+    ppu_gcm_pump();
+    CHECK(g_vblank_calls == 1, "one vblank, one pump: handler x%d, want x1", g_vblank_calls);
+    const uint64_t first = g_vblank_args[0];
+
+    g_vblank_calls = 0;
+    for (int i = 0; i < 3; i++) cellGcmTickVBlank();   /* the thread ran late: three missed vblanks back to back */
+    ppu_gcm_pump();
+    CHECK(g_vblank_calls == 3, "three vblanks pending at one pump: handler x%d, want x3", g_vblank_calls);
+    CHECK(g_vblank_args[0] == first + 1 && g_vblank_args[1] == first + 2 && g_vblank_args[2] == first + 3,
+          "the three calls carry the vblank numbers %llu %llu %llu, want %llu..%llu", (unsigned long long)g_vblank_args[0],
+          (unsigned long long)g_vblank_args[1], (unsigned long long)g_vblank_args[2], (unsigned long long)first + 1,
+          (unsigned long long)first + 3);
+
+    g_vblank_calls = 0;
+    ppu_gcm_pump();
+    CHECK(g_vblank_calls == 0, "a second pump with nothing pending called the handler x%d", g_vblank_calls);
+    g_ps3_guest_caller = NULL;
+}
+
 /* ---- the PAL configuration: a named stop ------------------------------------------------------------------ */
 
 static int run_child(const char* self, const char* mode, char* out, size_t cap)
@@ -188,6 +222,7 @@ int main(int argc, char** argv)
     }
 
     test_720p_is_libgcm();
+    test_a_late_pump_runs_the_handler_once_per_vblank();
 
     static const char* const modes[] = { "pal-get", "pal-reset", "pal-flip-handler", "pal-vblank-handler",
                                          "pal-last-flip-time" };

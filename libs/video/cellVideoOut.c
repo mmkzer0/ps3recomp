@@ -112,6 +112,27 @@ void cellVideoOut_set_resolution(u8 resolutionId)
     s_pitch = (u32)w * 4;
 }
 
+/* The refresh-rate flag of the mode the display runs: every mode listed (480, 576, 720, 1080 and the 1080
+ * variants) is reported at 59.94 Hz, as GetState always has. [INFERENCE: a 576 PAL output is 50 Hz on the console;
+ * no firmware evidence for that here, so it is not changed.] */
+static u16 current_refresh_flag(void)
+{
+    return CELL_VIDEO_OUT_REFRESH_RATE_59_94HZ;
+}
+
+void cellVideoOut_refresh_rate(u32* hz_num, u32* hz_den)
+{
+    u32 num, den;
+    switch (current_refresh_flag()) {
+    case CELL_VIDEO_OUT_REFRESH_RATE_59_94HZ: num = 60000; den = 1001; break;
+    case CELL_VIDEO_OUT_REFRESH_RATE_50HZ:    num = 50;    den = 1;    break;
+    case CELL_VIDEO_OUT_REFRESH_RATE_60HZ:    num = 60;    den = 1;    break;
+    default:                                  num = 30000; den = 1001; break;   /* CELL_VIDEO_OUT_REFRESH_RATE_30HZ */
+    }
+    if (hz_num) *hz_num = num;
+    if (hz_den) *hz_den = den;
+}
+
 /* ---------------------------------------------------------------------------
  * Helpers
  * -----------------------------------------------------------------------*/
@@ -169,7 +190,7 @@ s32 cellVideoOutGetState(u32 videoOut, u32 deviceIndex, CellVideoOutState* state
         state->displayMode.scanMode     = CELL_VIDEO_OUT_SCAN_MODE_PROGRESSIVE;
         state->displayMode.conversion   = 0;
         state->displayMode.aspect       = CELL_VIDEO_OUT_ASPECT_16_9;
-        state->displayMode.refreshRates = ps3_bswap16(0x0001); /* 59.94Hz flag */
+        state->displayMode.refreshRates = ps3_bswap16(current_refresh_flag());
     } else {
         state->state = 0; /* disabled */
     }

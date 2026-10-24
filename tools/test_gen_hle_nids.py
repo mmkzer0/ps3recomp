@@ -65,6 +65,8 @@ HOST_HELPERS = set("""
     cellGcm_syscall_set_fifo
     cellGcm_take_flip_pending
     cellGcm_take_flip_pending_synced
+    cellGcm_vblank_flip_label
+    cellGcm_vblank_signal
     cellKb_keyEvent
     cellMouse_buttonEvent
     cellMouse_moveEvent
@@ -79,6 +81,7 @@ HOST_HELPERS = set("""
     cellSysutil_pump_seen
     cellUserInfoSelectUser_ListGet
     cellUserInfoSelectUser_ListSet
+    cellVideoOut_refresh_rate
     cellVideoOut_set_resolution
     cellfs_add_path_mapping
     cellfs_set_root_path

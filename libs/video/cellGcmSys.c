@@ -902,6 +902,9 @@ u32 cellGcmGetFlipStatus(void)
 static volatile LONG s_gcm_pending = 0;    /* bit0 = vblank, bit1 = flip */
 #define GCM_PENDING_SET(bits)  InterlockedOr(&s_gcm_pending, (bits))
 #define GCM_PENDING_TAKE()     InterlockedExchange(&s_gcm_pending, 0)
+static volatile LONG s_gcm_vblank_pending = 0;   /* vblanks raised since the last pump */
+#define GCM_VBLANK_POST()      InterlockedIncrement(&s_gcm_vblank_pending)
+#define GCM_VBLANK_TAKE()      InterlockedExchange(&s_gcm_vblank_pending, 0)
 static volatile LONG s_gcm_pumping = 0;
 #define GCM_PUMP_TRY_ENTER() (InterlockedCompareExchange(&s_gcm_pumping, 1, 0) == 0)
 #define GCM_PUMP_LEAVE()     InterlockedExchange(&s_gcm_pumping, 0)
@@ -910,6 +913,9 @@ static volatile LONG s_gcm_pumping = 0;
 static atomic_int s_gcm_pending = 0;
 #define GCM_PENDING_SET(bits)  atomic_fetch_or(&s_gcm_pending, (bits))
 #define GCM_PENDING_TAKE()     atomic_exchange(&s_gcm_pending, 0)
+static atomic_int s_gcm_vblank_pending = 0;   /* vblanks raised since the last pump */
+#define GCM_VBLANK_POST()      atomic_fetch_add(&s_gcm_vblank_pending, 1)
+#define GCM_VBLANK_TAKE()      atomic_exchange(&s_gcm_vblank_pending, 0)
 static atomic_flag s_gcm_pumping = ATOMIC_FLAG_INIT;
 #define GCM_PUMP_TRY_ENTER() (!atomic_flag_test_and_set_explicit(&s_gcm_pumping, memory_order_acquire))
 #define GCM_PUMP_LEAVE()     atomic_flag_clear_explicit(&s_gcm_pumping, memory_order_release)
@@ -922,6 +928,7 @@ static u32 s_fifo_getoff;   /* tentative: defined below */
 void cellGcm_request_tick(void)
 {
     s_vblank_count++;
+    GCM_VBLANK_POST();
     /* GCM_FLIP_NEEDS_FIFO=1: only mark a flip pending once the walker has
      * actually consumed up to `put`.
      *
@@ -973,10 +980,19 @@ void ppu_gcm_pump(void)
                if ((calls % 20000) == 0)
                    fprintf(stderr, "[gcm-pump] calls=%u vblank=%u flip=%u vcount=%u%c",
                            calls, nv, nf, s_vblank_count, 10); } }
-    if ((p & 1) && s_vblank_handler_opd && g_ps3_guest_caller) {
-        ydkj_restore_handler_opd(s_vblank_handler_opd, s_vblank_handler_code);
-        g_ps3_guest_caller(s_vblank_handler_opd, (uint64_t)s_vblank_count,
-                           0, 0, 0, 0, 0, 0, 0);
+    if (p & 1) {
+        /* One call per vblank the driver raised since the last pump, not one for however many are pending: the
+         * console's interrupt posts each vblank to the handler (RPCS3's vblank thread queues one handler call per
+         * vblank it fires, late ones back to back). With one vblank pending this is the old single call. Each call
+         * gets its own vblank number, the last one the current count. */
+        const long n = (long)GCM_VBLANK_TAKE();
+        if (s_vblank_handler_opd && g_ps3_guest_caller) {
+            for (long i = 0; i < n; i++) {
+                ydkj_restore_handler_opd(s_vblank_handler_opd, s_vblank_handler_code);
+                g_ps3_guest_caller(s_vblank_handler_opd, (uint64_t)(s_vblank_count - (u32)(n - 1 - i)),
+                                   0, 0, 0, 0, 0, 0, 0);
+            }
+        }
     }
     if (p & 2) {
         /* Delivery waits for a guest thread to reach an HLE call or a timer
@@ -1005,16 +1021,30 @@ void ppu_gcm_pump(void)
 /* Back-compat: the old direct entry points now just mark a tick pending (so any
  * caller other than the ticker still works) -- delivery stays on the main thread. */
 /* A vblank is when the driver completes a flip the RSX has executed: the flip-done label goes back to
- * 0, which releases an ACQUIRE waiting on it (cellRescSetWaitFlip). */
-void cellGcmTickVBlank(void)
+ * 0, which releases an ACQUIRE waiting on it (cellRescSetWaitFlip). The two halves are separate entry points
+ * for a host whose clock must not wait behind the walker: cellGcm_vblank_signal is the vertical blank itself
+ * (the counter, the handler's call) and may be raised from a thread of its own at the instant it is due;
+ * cellGcm_vblank_flip_label is the driver's answer and is called where the walker runs, after it has presented the
+ * frame behind the flip head (cellGcm_take_flip_pending_synced) -- the label's release is what lets the walker go past
+ * the head's ACQUIRE, so the present has to come first. cellGcmTickVBlank is the two in that order. */
+void cellGcm_vblank_signal(void)
 {
     s_vblank_count++;
+    GCM_VBLANK_POST();
+    GCM_PENDING_SET(1);
+}
+void cellGcm_vblank_flip_label(void)
+{
     if (s_drv_flip_label_pending) {
         s_drv_flip_label_pending = 0;
         atomic_thread_fence(memory_order_release);
         vm_write32(GCM_LABEL_GUEST_BASE + GCM_LABEL_FLIP_DONE, 0);
     }
-    GCM_PENDING_SET(1);
+}
+void cellGcmTickVBlank(void)
+{
+    cellGcm_vblank_signal();
+    cellGcm_vblank_flip_label();
 }
 /* Only deliver a flip completion when a flip is actually outstanding.
  *
