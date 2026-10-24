@@ -11,7 +11,6 @@ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
 void spu_coh_notify_write(uint32_t a) { (void)a; }
 void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
-ps3_guest_caller_fn g_ps3_guest_caller;
 void cellMsgDialog_tick(void) {}
 void np_psnr_pump(void) {}
 void ps3_stop(ps3_stop_kind k, const char* w, const char* r,
