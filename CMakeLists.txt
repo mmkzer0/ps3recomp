@@ -715,6 +715,66 @@ if(PS3RECOMP_BUILD_TESTS)
         set_tests_properties(diagnostics_index diagnostics_index_check
             PROPERTIES LABELS "tools;t0")
     endif()
+
+    # Module-level HLE argument/state checks (Phase 2a).  These are the same
+    # standalone fixtures the CI workflows build; they include the module
+    # source and define the host stubs themselves.
+    if(UNIX)
+        function(ps3recomp_add_hle_check_test name source)
+            add_executable(${name} ${source})
+            target_include_directories(${name} PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}/include")
+            if(APPLE)
+                target_link_options(${name} PRIVATE "-Wl,-dead_strip")
+            else()
+                target_compile_options(${name} PRIVATE
+                    -ffunction-sections -fdata-sections)
+                target_link_options(${name} PRIVATE "-Wl,--gc-sections")
+            endif()
+            add_test(NAME ${name} COMMAND ${name})
+            set_tests_properties(${name} PROPERTIES LABELS "hle;t0" TIMEOUT 60)
+        endfunction()
+
+        ps3recomp_add_hle_check_test(hle_netctl_checks
+            libs/network/tests/test_netctl_checks.c)
+        target_include_directories(hle_netctl_checks PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/system")
+        ps3recomp_add_hle_check_test(hle_cellfs_checks
+            libs/filesystem/tests/test_cellfs_checks.c)
+        ps3recomp_add_hle_check_test(hle_avconf_checks
+            libs/misc/tests/test_avconf_gamma.c)
+        ps3recomp_add_hle_check_test(hle_game_paths
+            libs/system/tests/test_game_paths.c)
+        ps3recomp_add_hle_check_test(hle_savedata_io
+            libs/system/tests/test_savedata_io.c)
+        ps3recomp_add_hle_check_test(hle_trophy_start
+            libs/network/tests/test_trophy_start.c)
+        ps3recomp_add_hle_check_test(hle_trophy_registration
+            libs/network/tests/test_trophy_registration.c)
+        target_sources(hle_trophy_registration PRIVATE libs/system/cellSysutil.c)
+        target_link_libraries(hle_trophy_registration PRIVATE Threads::Threads)
+        ps3recomp_add_hle_check_test(hle_dialog_callbacks
+            libs/system/tests/test_dialog_callbacks.c)
+        target_sources(hle_dialog_callbacks PRIVATE libs/system/cellSysutil.c)
+        target_link_libraries(hle_dialog_callbacks PRIVATE Threads::Threads)
+
+        if(SDL2_FOUND)
+            ps3recomp_add_hle_check_test(hle_audio_ring
+                libs/audio/tests/test_audio_ring.c)
+            ps3recomp_add_hle_check_test(hle_pad_rumble
+                libs/input/tests/test_pad_rumble.c)
+            if(TARGET SDL2::SDL2)
+                target_link_libraries(hle_audio_ring PRIVATE SDL2::SDL2)
+                target_link_libraries(hle_pad_rumble PRIVATE SDL2::SDL2)
+            else()
+                target_include_directories(hle_audio_ring PRIVATE ${SDL2_INCLUDE_DIRS})
+                target_include_directories(hle_pad_rumble PRIVATE ${SDL2_INCLUDE_DIRS})
+                target_link_libraries(hle_audio_ring PRIVATE ${SDL2_LIBRARIES})
+                target_link_libraries(hle_pad_rumble PRIVATE ${SDL2_LIBRARIES})
+            endif()
+            target_link_libraries(hle_pad_rumble PRIVATE m)
+        endif()
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------

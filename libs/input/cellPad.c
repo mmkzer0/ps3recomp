@@ -516,14 +516,16 @@ s32 cellPadInit(u32 max_connect)
 {
     printf("[cellPad] Init(max_connect=%u)\n", max_connect);
 
+    /* RPCS3 cellPad.cpp cellPadInit: already initialized -> ALREADY_INITIALIZED
+     * (0x80121103, the local ALREADY_OPENED value). */
     if (s_pad_initialized)
-        return CELL_PAD_ERROR_ALREADY_OPENED;
+        return CELL_PAD_ERROR_ALREADY_INITIALIZED;
 
-    /* The bound is the 127-slot pad table, not the 7 ports: larger requests
-     * are accepted and clamped. Resistance: Fall of Man asks for 8; rejected,
-     * the library stayed closed, every GetInfo failed and the title never
-     * polled the pad -- stuck on "Press the START button". */
-    if (max_connect == 0 || max_connect > 127)
+    /* RPCS3 cellPad.cpp cellPadInit: max_connect==0 or > CELL_MAX_PADS (127)
+     * -> INVALID_PARAMETER.  Larger requests are accepted and clamped by the
+     * readers. Resistance: Fall of Man asks for 8; rejected, the library
+     * stayed closed and the title never polled the pad. */
+    if (max_connect == 0 || max_connect > CELL_MAX_PADS)
         return CELL_PAD_ERROR_INVALID_PARAMETER;
 
     s_pad_initialized = 1;
@@ -570,11 +572,20 @@ s32 cellPadGetData(u32 port_no, CellPadData* data_guest)
 {
     { static int _once = 0;
       if (!_once++) printf("[cellPad] GetData polling begins (port %u)\n", port_no); }
+    /* RPCS3 cellPad.cpp cellPadGetData: uninitialized -> UNINITIALIZED
+     * (0x80121104, the local NOT_OPENED value). */
     if (!s_pad_initialized)
-        return CELL_PAD_ERROR_NOT_OPENED;
+        return CELL_PAD_ERROR_UNINITIALIZED;
 
-    if (port_no >= s_max_connect || !data_guest)
+    /* RPCS3 cellPad.cpp cellPadGetData: port_no >= CELL_MAX_PADS || !data
+     * -> INVALID_PARAMETER; a port inside the table but past the configured
+     * maximum -> NO_DEVICE. */
+    if (port_no >= CELL_MAX_PADS || !data_guest)
         return CELL_PAD_ERROR_INVALID_PARAMETER;
+    /* RPCS3 cellPad.cpp cellPadGetData: a port past the configured maximum
+     * (get_max_connect = min(max_connect, 7)) -> NO_DEVICE. */
+    if (port_no >= s_max_connect)
+        return CELL_PAD_ERROR_NO_DEVICE;
 
     /* Build in a local host struct, then copy to guest memory big-endian. */
     CellPadData _d; CellPadData* data = &_d;
@@ -953,9 +964,11 @@ s32 cellPadGetInfo(CellPadInfo2* info)
 
 s32 cellPadGetInfo2(CellPadInfo2* info_guest)
 {
+    /* RPCS3 cellPad.cpp cellPadGetInfo2: !max_connect -> UNINITIALIZED. */
     if (!s_pad_initialized)
-        return CELL_PAD_ERROR_NOT_OPENED;
+        return CELL_PAD_ERROR_UNINITIALIZED;
 
+    /* RPCS3 cellPad.cpp cellPadGetInfo2: !info -> INVALID_PARAMETER. */
     if (!info_guest)
         return CELL_PAD_ERROR_INVALID_PARAMETER;
 
@@ -1061,11 +1074,17 @@ s32 cellPadSetPortSetting(u32 port_no, u32 port_setting)
     printf("[cellPad] SetPortSetting(port=%u, setting=0x%X)\n",
            port_no, port_setting);
 
+    /* RPCS3 cellPad.cpp cellPadSetPortSetting: !max_connect -> UNINITIALIZED. */
     if (!s_pad_initialized)
-        return CELL_PAD_ERROR_NOT_OPENED;
+        return CELL_PAD_ERROR_UNINITIALIZED;
 
-    if (port_no >= CELL_PAD_MAX_PORT_NUM)
+    /* RPCS3 cellPad.cpp cellPadSetPortSetting: port_no >= CELL_MAX_PADS (127)
+     * -> INVALID_PARAMETER; a port in [7,127) is explicitly accepted with OK
+     * and the setting is not stored. */
+    if (port_no >= CELL_MAX_PADS)
         return CELL_PAD_ERROR_INVALID_PARAMETER;
+    if (port_no >= CELL_PAD_MAX_PORT_NUM)
+        return CELL_OK;
 
     s_port_setting[port_no] = port_setting;
     return CELL_OK;
@@ -1164,11 +1183,19 @@ s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param)
 
 s32 cellPadClearBuf(u32 port_no)
 {
+    /* RPCS3 cellPad.cpp cellPadClearBuf: !max_connect -> UNINITIALIZED. */
     if (!s_pad_initialized)
-        return CELL_PAD_ERROR_NOT_OPENED;
+        return CELL_PAD_ERROR_UNINITIALIZED;
 
-    if (port_no >= CELL_PAD_MAX_PORT_NUM)
+    /* RPCS3 cellPad.cpp cellPadClearBuf: port_no >= CELL_MAX_PADS (127)
+     * -> INVALID_PARAMETER; a port in the table but past the configured
+     * maximum -> NO_DEVICE. */
+    if (port_no >= CELL_MAX_PADS)
         return CELL_PAD_ERROR_INVALID_PARAMETER;
+    /* RPCS3 cellPad.cpp cellPadClearBuf: a port past the configured maximum
+     * (get_max_connect = min(max_connect, 7)) -> NO_DEVICE. */
+    if (port_no >= s_max_connect)
+        return CELL_PAD_ERROR_NO_DEVICE;
 
     /* Nothing to clear in our implementation -- state is polled fresh */
     return CELL_OK;

@@ -11,6 +11,7 @@
 #include "sceNpTrophy.h"
 #include "../system/cellSysutil.h"
 #include "ps3emu/guest_call.h"
+#include "ps3emu/stop.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -199,6 +200,8 @@ s32 sceNpTrophyInit(void* poolPtr, u32 poolSize, u32 containerId, u64 options)
 
     printf("[sceNpTrophy] Init()\n");
 
+    /* RPCS3 sceNpTrophy.cpp sceNpTrophyInit: re-init ->
+     * ALREADY_INITIALIZED. */
     if (s_trophy_initialized)
         return SCE_NP_TROPHY_ERROR_ALREADY_INITIALIZED;
 
@@ -232,11 +235,20 @@ s32 sceNpTrophyCreateContext(SceNpTrophyContext* context,
                              const SceNpCommunicationSignature* commSign,
                              u64 options)
 {
-    (void)commSign; (void)options;
+    (void)options;
 
+    /* RPCS3 sceNpTrophy.cpp sceNpTrophyCreateContext checks commSign before
+     * the init state; the SDK error value is 0x80551603. */
+    if (!commSign)
+        return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
+
+    /* RPCS3 sceNpTrophy.cpp sceNpTrophyCreateContext: not initialized ->
+     * NOT_INITIALIZED. */
     if (!s_trophy_initialized)
         return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
 
+    /* RPCS3 sceNpTrophy.cpp sceNpTrophyCreateContext: !context || !commId ->
+     * INVALID_ARGUMENT. */
     if (!context || !commId)
         return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
     const SceNpCommunicationId* commId_h = GUEST_PTR(commId, const SceNpCommunicationId*);
@@ -276,9 +288,12 @@ s32 sceNpTrophyDestroyContext(SceNpTrophyContext context)
 
 s32 sceNpTrophyCreateHandle(SceNpTrophyHandle* handle)
 {
+    /* RPCS3 sceNpTrophy.cpp sceNpTrophyCreateHandle: !init -> NOT_INITIALIZED. */
     if (!s_trophy_initialized)
         return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
 
+    /* RPCS3 sceNpTrophy.cpp sceNpTrophyCreateHandle: !handle ->
+     * INVALID_ARGUMENT. */
     if (!handle)
         return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
 
@@ -316,22 +331,37 @@ s32 sceNpTrophyRegisterContext(SceNpTrophyContext context,
 {
     (void)options;
 
+    /* RPCS3 sceNpTrophy.cpp sceNpTrophyRegisterContext: !init -> NOT_INITIALIZED. */
     if (!s_trophy_initialized)
         return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
 
-    if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS ||
-        !s_contexts[context].in_use)
+    /* RPCS3 sceNpTrophy.cpp get_context_ex(): a context outside [1, MAX] ->
+     * INVALID_ARGUMENT; an idm miss -> UNKNOWN_CONTEXT.  The published SDK
+     * has one INVALID_CONTEXT code (0x80551605) for the table miss. */
+    if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS)
+        return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
+    /* SDK sceNpTrophy.h SCE_NP_TROPHY_ERROR_INVALID_CONTEXT (0x80551605). */
+    if (!s_contexts[context].in_use)
         return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
 
-    if (handle <= 0 || handle > SCE_NP_TROPHY_MAX_HANDLES ||
-        !s_handles[handle].in_use)
+    /* RPCS3 sceNpTrophy.cpp get_context_ex(): the same split for the handle. */
+    if (handle <= 0 || handle > SCE_NP_TROPHY_MAX_HANDLES)
+        return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
+    /* SDK sceNpTrophy.h SCE_NP_TROPHY_ERROR_INVALID_HANDLE (0x80551606). */
+    if (!s_handles[handle].in_use)
         return SCE_NP_TROPHY_ERROR_INVALID_HANDLE;
 
-    if (s_contexts[context].registered)
-        return SCE_NP_TROPHY_ERROR_CONTEXT_ALREADY_REG;
-
+    /* RPCS3 sceNpTrophy.cpp sceNpTrophyRegisterContext: !statusCb ->
+     * INVALID_ARGUMENT. */
     if (!statusCb) return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
-    if (!g_ps3_guest_caller) return SCE_NP_TROPHY_ERROR_UNKNOWN;
+
+    /* RPCS3 sceNpTrophy.cpp sceNpTrophyRegisterContext() dispatches statusCb;
+     * this HLE has no guest callback bridge, so it is a named stop. */
+    if (!g_ps3_guest_caller)
+        ps3_stop(PS3_STOP_UNRESOLVED_GUEST_CALLBACK,
+                 "sceNpTrophyRegisterContext has no guest callback bridge",
+                 "set g_ps3_guest_caller before calling the trophy API",
+                 NULL, 0, NULL);
 
     /* Load any previously saved trophy data */
     trophy_load(&s_contexts[context]);
@@ -346,11 +376,18 @@ s32 sceNpTrophyRegisterContext(SceNpTrophyContext context,
      * Intermediate firmware installation progress is not simulated here. */
     g_ps3_guest_caller(statusCb, (u32)context, SCE_NP_TROPHY_STATUS_INSTALLED,
                        0, 0, arg, 0, 0, 0);
-    if (!s_trophy_initialized) return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
+    /* RPCS3 sceNpTrophy.cpp sceNpTrophyRegisterContext() re-resolves the
+     * context and handle after the callback (:660/:666); the SDK codes are
+     * 0x80551605 / 0x80551606. */
     if (!s_contexts[context].in_use) return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
+    /* RPCS3 sceNpTrophy.cpp sceNpTrophyRegisterContext() re-resolves the
+     * handle (:666); the SDK code is 0x80551606. */
     if (!s_handles[handle].in_use) return SCE_NP_TROPHY_ERROR_INVALID_HANDLE;
     const u64 completion[8] = {(u32)context, SCE_NP_TROPHY_STATUS_PROCESSING_COMPLETE,
                                0, 0, arg, 0, 0, 0};
+    /* RPCS3 sceNpTrophy.cpp sceNpTrophyRegisterContext() queues the completion
+     * through cellSysutil; this HLE queue can fail to allocate, mapped to the
+     * SDK OUT_OF_MEMORY (0x80551604). */
     if (cellSysutilQueueGuestCallbackArgs(statusCb, completion) != CELL_OK) {
         s_contexts[context].registered = 0;
         return SCE_NP_TROPHY_ERROR_OUT_OF_MEMORY;
@@ -365,15 +402,23 @@ s32 sceNpTrophyGetRequiredDiskSpace(SceNpTrophyContext context,
 {
     (void)handle; (void)options;
 
+    /* RPCS3 sceNpTrophy.cpp sceNpTrophyGetRequiredDiskSpace checks reqspace
+     * before the init state. */
+    if (!reqSpace)
+        return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
+
+    /* RPCS3 sceNpTrophy.cpp sceNpTrophyGetRequiredDiskSpace: !init ->
+     * NOT_INITIALIZED. */
     if (!s_trophy_initialized)
         return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
 
-    if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS ||
-        !s_contexts[context].in_use)
+    /* RPCS3 sceNpTrophy.cpp get_context_ex(): range -> INVALID_ARGUMENT. */
+    if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS)
+        return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
+    /* SDK sceNpTrophy.h SCE_NP_TROPHY_ERROR_INVALID_CONTEXT (0x80551605). */
+    if (!s_contexts[context].in_use)
         return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
 
-    if (!reqSpace)
-        return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
     reqSpace = GUEST_PTR(reqSpace, u64*);
 
     /* Typical trophy pack size. The guest is big-endian and reads this u64
@@ -532,18 +577,26 @@ s32 sceNpTrophyGetTrophyUnlockState(SceNpTrophyContext context,
 {
     (void)handle;
 
+    /* RPCS3 sceNpTrophy.cpp sceNpTrophyGetTrophyUnlockState checks the output
+     * pointers before the init state. */
+    if (!flags || !count)
+        return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
+
+    /* RPCS3 sceNpTrophy.cpp sceNpTrophyGetTrophyUnlockState: !init ->
+     * NOT_INITIALIZED. */
     if (!s_trophy_initialized)
         return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
 
-    if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS ||
-        !s_contexts[context].in_use)
+    /* RPCS3 sceNpTrophy.cpp get_context_ex(): range -> INVALID_ARGUMENT. */
+    if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS)
+        return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
+    /* SDK sceNpTrophy.h SCE_NP_TROPHY_ERROR_INVALID_CONTEXT (0x80551605). */
+    if (!s_contexts[context].in_use)
         return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
 
+    /* SDK sceNpTrophy.h SCE_NP_TROPHY_ERROR_CONTEXT_NOT_REGISTERED (0x80551607). */
     if (!s_contexts[context].registered)
         return SCE_NP_TROPHY_ERROR_CONTEXT_NOT_REGISTERED;
-
-    if (!flags || !count)
-        return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
 
     u32 flags_ea = (u32)(uintptr_t)flags;
     for (u32 o = 0; o < sizeof(SceNpTrophyFlagArray); o += 4)

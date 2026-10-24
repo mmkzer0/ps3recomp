@@ -16,18 +16,21 @@ int main(void)
     vm_base = calloc(1, 65536);
     assert(vm_base);
     memcpy(vm_base + 0x100, "NPWR00000", 9);
+    /* RPCS3 sceNpTrophyCreateContext checks commSign before the init state. */
     assert(sceNpTrophyCreateContext((void*)0x200, (void*)0x100, NULL, 0) ==
+           SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT);
+    assert(sceNpTrophyCreateContext((void*)0x200, (void*)0x100, (void*)0x108, 0) ==
            SCE_NP_TROPHY_ERROR_NOT_INITIALIZED);
     assert(sceNpTrophyInit(NULL, 0, 0, 0) == CELL_OK);
-    assert(sceNpTrophyCreateContext(NULL, (void*)0x100, NULL, 0) ==
+    assert(sceNpTrophyCreateContext(NULL, (void*)0x100, (void*)0x108, 0) ==
            SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT);
     for (int i = 0; i < SCE_NP_TROPHY_MAX_CONTEXTS; i++) {
-        assert(sceNpTrophyCreateContext((void*)0x200, (void*)0x100, NULL, 0) == CELL_OK);
+        assert(sceNpTrophyCreateContext((void*)0x200, (void*)0x100, (void*)0x108, 0) == CELL_OK);
         assert(vm_read32(0x200) == (u32)(i + 1));
         assert(sceNpTrophyCreateHandle((void*)0x204) == CELL_OK);
         assert(vm_read32(0x204) == (u32)(i + 1));
     }
-    assert(sceNpTrophyCreateContext((void*)0x200, (void*)0x100, NULL, 0) == SCE_NP_TROPHY_ERROR_OUT_OF_MEMORY);
+    assert(sceNpTrophyCreateContext((void*)0x200, (void*)0x100, (void*)0x108, 0) == SCE_NP_TROPHY_ERROR_OUT_OF_MEMORY);
     assert(sceNpTrophyCreateHandle((void*)0x204) == SCE_NP_TROPHY_ERROR_OUT_OF_MEMORY);
     assert(sceNpTrophyDestroyContext(0) == SCE_NP_TROPHY_ERROR_INVALID_CONTEXT);
     assert(sceNpTrophyDestroyHandle(0) == SCE_NP_TROPHY_ERROR_INVALID_HANDLE);

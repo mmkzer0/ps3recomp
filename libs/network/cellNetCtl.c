@@ -130,6 +130,8 @@ s32 cellNetCtlInit(void)
 {
     printf("[cellNetCtl] Init()\n");
 
+    /* RPCS3 cellNetCtl.cpp cellNetCtlInit: already initialized ->
+     * CELL_NET_CTL_ERROR_NOT_TERMINATED. */
     if (s_netctl_initialized)
         return CELL_NET_CTL_ERROR_NOT_TERMINATED;
 
@@ -148,34 +150,35 @@ void cellNetCtlTerm(void)
 
 s32 cellNetCtlGetState(s32* state)
 {
+    /* RPCS3 cellNetCtl.cpp cellNetCtlGetState: not initialized ->
+     * CELL_NET_CTL_ERROR_NOT_INITIALIZED. */
     if (!s_netctl_initialized)
         return CELL_NET_CTL_ERROR_NOT_INITIALIZED;
 
+    /* RPCS3 cellNetCtl.cpp cellNetCtlGetState: !state ->
+     * CELL_NET_CTL_ERROR_INVALID_ADDR. */
     if (!state)
         return CELL_NET_CTL_ERROR_INVALID_ADDR;
 
-    if (!netctl_online()) {
-        /* Offline: FAIL the query rather than report state=Disconnected.
-         * LBP's connect job (sub_F433C(0)) polls GetState forever until
-         * IPObtained and only exits on ret<0 -- and the working RPCS3 boot
-         * shows exactly one GetState call failing with NOT_INITIALIZED,
-         * after which the game proceeds offline. Still write a sane state
-         * for callers that ignore the return value. */
-        vm_write32((uint32_t)(uintptr_t)state, CELL_NET_CTL_STATE_Disconnected);
-        printf("[cellNetCtl] GetState() -> error NOT_INITIALIZED (offline mode)\n");
-        return CELL_NET_CTL_ERROR_NOT_INITIALIZED;
-    }
-
-    vm_write32((uint32_t)(uintptr_t)state, CELL_NET_CTL_STATE_IPObtained);
-    printf("[cellNetCtl] GetState() -> IPObtained\n");
+    /* RPCS3 cellNetCtl.cpp cellNetCtlGetState writes get_net_status() and
+     * returns CELL_OK even while offline; it does not fail the query. */
+    vm_write32((uint32_t)(uintptr_t)state,
+               netctl_online() ? CELL_NET_CTL_STATE_IPObtained
+                               : CELL_NET_CTL_STATE_Disconnected);
+    printf("[cellNetCtl] GetState() -> %s\n",
+           netctl_online() ? "IPObtained" : "Disconnected");
     return CELL_OK;
 }
 
 s32 cellNetCtlGetInfo(s32 code, CellNetCtlInfo* info)
 {
+    /* RPCS3 cellNetCtl.cpp cellNetCtlGetInfo: not initialized ->
+     * CELL_NET_CTL_ERROR_NOT_INITIALIZED. */
     if (!s_netctl_initialized)
         return CELL_NET_CTL_ERROR_NOT_INITIALIZED;
 
+    /* RPCS3 cellNetCtl.cpp cellNetCtlGetInfo: !info ->
+     * CELL_NET_CTL_ERROR_INVALID_ADDR. */
     if (!info)
         return CELL_NET_CTL_ERROR_INVALID_ADDR;
 

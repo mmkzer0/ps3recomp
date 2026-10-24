@@ -10,6 +10,7 @@
 #include "ps3emu/guest_call.h"
 #include "../../runtime/ppu/ppu_memory.h"
 #include "../../runtime/memory/vm.h"
+#include "ps3emu/stop.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -1264,14 +1265,25 @@ s32 cellSaveDataAutoLoad2(u32 version, const char* dirName,
                            CellSaveDataFileCallback funcFile,
                            u32 container, void* userdata)
 {
-    dirName = savedata_host_str(dirName);
-    (void)version; (void)errDialog; (void)setBuf; (void)funcFile;
+    (void)version; (void)errDialog; (void)funcFile;
     (void)container;
+
+    /* RPCS3 cellSaveData.cpp savedata_check_args: for AUTO_LOAD a null dirName
+     * is reason 2 and a null setBuf is reason 74; savedata_op maps either to
+     * CELL_SAVEDATA_ERROR_PARAM.  funcStat is not validated by the oracle. */
+    if (!dirName || !setBuf)
+        return CELL_SAVEDATA_ERROR_PARAM;
+
+    /* RPCS3 cellSaveData.cpp cellSaveDataAutoLoad2() does not validate
+     * funcStat; a null/invalid OPD faults when the guest calls it, so fail
+     * closed with the HLE guest-range stop. */
+    if (!funcStat)
+        ps3_stop_guest_range(__func__, "funcStat", (u32)(uintptr_t)funcStat, 8,
+                             vm_guest_limit());
+
+    dirName = savedata_host_str(dirName);
     printf("[cellSaveData] AutoLoad2(version=%u, dir='%s')\n",
            version, dirName ? dirName : "<null>");
-
-    if (!dirName || !setBuf || !funcStat)
-        return CELL_SAVEDATA_ERROR_PARAM;
 
     /* funcStat is the GAME's guest-OPD address. Marshal StatGet/Set/CB
      * into guest BE memory and dispatch through g_ps3_guest_caller.

@@ -65,6 +65,22 @@ int main(void)
     assert(set_gamma(0.5) == (int32_t)0x8002b223);
     assert(cellAvconfExt_display_gamma() == 1.1f);
     assert(set_gamma(0.8) == 0 && cellAvconfExt_display_gamma() == 0.8f);
+
+    /* RPCS3 cellAudioOut.cpp: the audio output calls use the 0x8002B2xx
+     * namespace, not CELL_EINVAL, and reject an unknown audioOut. */
+    assert(cellAudioOutGetConfiguration(CELL_AUDIO_OUT_PRIMARY, NULL, NULL, 0) ==
+           CELL_AUDIO_OUT_ERROR_ILLEGAL_PARAMETER);
+    assert(cellAudioOutGetConfiguration(CELL_AUDIO_OUT_SECONDARY,
+                                        (void*)(uintptr_t)16, NULL, 0) ==
+           CELL_AUDIO_OUT_ERROR_UNSUPPORTED_AUDIO_OUT);
+    assert(cellAudioOutGetConfiguration(2, (void*)(uintptr_t)16, NULL, 0) ==
+           CELL_AUDIO_OUT_ERROR_ILLEGAL_PARAMETER);
+    assert(cellAudioOutGetState(CELL_AUDIO_OUT_PRIMARY, 0, NULL) ==
+           CELL_AUDIO_OUT_ERROR_ILLEGAL_PARAMETER);
+    assert(cellAudioOutGetState(2, 0, (void*)(uintptr_t)32) ==
+           CELL_AUDIO_OUT_ERROR_ILLEGAL_PARAMETER);
+    assert(cellAudioOutGetState(CELL_AUDIO_OUT_PRIMARY, 0,
+                                (void*)(uintptr_t)32) == CELL_OK);
     puts("test_avconf_gamma: OK");
     return 0;
 }

@@ -26,6 +26,9 @@ uint32_t ppu_vm_size;
 uint32_t g_ww_lo, g_ww_hi;
 void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
 int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+void ps3_stop_guest_range(const char* f, const char* a, uint64_t ea,
+                          uint64_t size, uint64_t limit)
+{ (void)f; (void)a; (void)ea; (void)size; (void)limit; abort(); }
 void spu_coh_notify_write(uint32_t a) { (void)a; }
 void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}

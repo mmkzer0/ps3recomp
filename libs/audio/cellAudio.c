@@ -693,16 +693,9 @@ static void audio_stop_mix_thread(void)
 
 s32 cellAudioInit(void)
 {
-    /* PS3_NO_AUDIO=1: report that the audio library is unavailable. Middleware
-     * that drives its mixer through SPU jobs will otherwise block the whole boot
-     * waiting on work we cannot yet complete; failing here lets a title take its
-     * silent path and keep going. Diagnostic first, workaround second. */
-    if (getenv("PS3_NO_AUDIO")) {
-        printf("[cellAudio] PS3_NO_AUDIO -- reporting audio unavailable\n");
-        return (s32)CELL_AUDIO_ERROR_NOT_INIT;
-    }
     printf("[cellAudio] Init()\n");
 
+    /* RPCS3 cellAudio.cpp cellAudioInit (g_audio.init) returns ALREADY_INIT. */
     if (s_audio_initialized)
         return CELL_AUDIO_ERROR_ALREADY_INIT;
 
@@ -758,6 +751,7 @@ s32 cellAudioQuit(void)
 
 s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
 {
+    /* RPCS3 cellAudio.cpp cellAudioPortOpen: init recheck -> NOT_INIT. */
     if (!s_audio_initialized)
         return CELL_AUDIO_ERROR_NOT_INIT;
 
@@ -765,6 +759,7 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
      * fields via vm_read64 (a raw param->nChannel faults / is host-endian). */
     uint32_t param_ea   = (uint32_t)(uintptr_t)param;
     uint32_t portNum_ea = (uint32_t)(uintptr_t)portNum;
+    /* RPCS3 cellAudio.cpp cellAudioPortOpen: !audioParam || !portNum -> PARAM. */
     if (!param_ea || !portNum_ea)
         return CELL_AUDIO_ERROR_PARAM;
 
@@ -773,9 +768,12 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
     printf("[cellAudio] PortOpen(nChannel=%llu, nBlock=%llu)\n",
            (unsigned long long)nch, (unsigned long long)nblk);
 
-    if (nch != CELL_AUDIO_PORT_2CH && nch != CELL_AUDIO_PORT_8CH)
+    /* RPCS3 cellAudio.cpp cellAudioPortOpen: nChannel must be 2, 8 or 0. */
+    if (nch != CELL_AUDIO_PORT_2CH && nch != CELL_AUDIO_PORT_8CH && nch != 0)
         return CELL_AUDIO_ERROR_PARAM;
-    if (nblk != CELL_AUDIO_BLOCK_8 && nblk != CELL_AUDIO_BLOCK_16 && nblk != CELL_AUDIO_BLOCK_32)
+    /* RPCS3 cellAudio.cpp cellAudioPortOpen: nBlock must be 2, 4, 8, 16 or 32. */
+    if (nblk != 2 && nblk != 4 && nblk != CELL_AUDIO_BLOCK_8 &&
+        nblk != CELL_AUDIO_BLOCK_16 && nblk != CELL_AUDIO_BLOCK_32)
         return CELL_AUDIO_ERROR_PARAM;
 
     mutex_lock(&s_audio_mutex);
@@ -789,6 +787,7 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
         }
     }
 
+    /* RPCS3 cellAudio.cpp cellAudioPortOpen: open_port() null -> PORT_FULL. */
     if (found < 0) {
         mutex_unlock(&s_audio_mutex);
         return CELL_AUDIO_ERROR_PORT_FULL;
@@ -817,10 +816,12 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
                    "Audio port storage exceeds its reserved VM window");
     u32 guest_buf = VM_AUDIO_BASE + (u32)found * VM_AUDIO_PORT_SIZE;
     u32 guest_ridx = guest_buf + 0x100000u;
+    /* RPCS3 cellAudio.cpp allocate_port: every lv2-map failure returns
+     * CELL_AUDIO_ERROR_SHAREDMEMORY (0x8031070B), after closing the port. */
     if (vm_commit(guest_buf, VM_AUDIO_PORT_SIZE) != CELL_OK) {
         port->in_use = 0;
         mutex_unlock(&s_audio_mutex);
-        return CELL_AUDIO_ERROR_AUDIOSYSTEM;
+        return CELL_AUDIO_ERROR_SHAREDMEMORY;
     }
 
     port->buffer = (float*)(vm_base + guest_buf);     /* host view of guest buffer */
@@ -869,12 +870,20 @@ s32 cellAudioPortStart(u32 portNum)
 {
     printf("[cellAudio] PortStart(port=%u)\n", portNum);
 
+    /* RPCS3 cellAudio.cpp cellAudioPortStart: init -> NOT_INIT. */
     if (!s_audio_initialized)
         return CELL_AUDIO_ERROR_NOT_INIT;
 
-    if (portNum >= CELL_AUDIO_PORT_MAX || !s_ports[portNum].in_use)
+    /* RPCS3 cellAudio.cpp cellAudioPortStart: out-of-range port -> PARAM (the
+     * firmware does not fold the range into PORT_NOT_OPEN). */
+    if (portNum >= CELL_AUDIO_PORT_MAX)
+        return CELL_AUDIO_ERROR_PARAM;
+
+    /* RPCS3 cellAudio.cpp cellAudioPortStart: closed -> PORT_NOT_OPEN. */
+    if (!s_ports[portNum].in_use)
         return CELL_AUDIO_ERROR_PORT_NOT_OPEN;
 
+    /* RPCS3 cellAudio.cpp cellAudioPortStart: started -> PORT_ALREADY_RUN. */
     if (s_ports[portNum].running)
         return CELL_AUDIO_ERROR_PORT_ALREADY_RUN;
 
@@ -1055,20 +1064,19 @@ s32 cellAudioRemoveNotifyEventQueue(u64 key)
 
 s32 cellAudioGetPortConfig(u32 portNum, CellAudioPortConfig* config)
 {
+    /* RPCS3 cellAudio.cpp cellAudioGetPortConfig: init -> NOT_INIT. */
     if (!s_audio_initialized)
         return CELL_AUDIO_ERROR_NOT_INIT;
 
-    if (portNum >= CELL_AUDIO_PORT_MAX || !s_ports[portNum].in_use)
-        return CELL_AUDIO_ERROR_PORT_NOT_OPEN;
-
-    if (!config)
+    /* RPCS3 cellAudio.cpp cellAudioGetPortConfig: !portConfig || out-of-range
+     * -> PARAM.  There is no in_use test: a closed port still returns its
+     * config with status CLOSE. */
+    if (!config || portNum >= CELL_AUDIO_PORT_MAX)
         return CELL_AUDIO_ERROR_PARAM;
 
     /* `config` is a GUEST address; write the BE struct field-by-field at its
      * guest offsets (8-byte aligned u64s). */
     uint32_t cfg = (uint32_t)(uintptr_t)config;
-    if (!cfg)
-        return CELL_AUDIO_ERROR_PARAM;
 
     mutex_lock(&s_audio_mutex);
     AudioPortSlot* port = &s_ports[portNum];
@@ -1084,8 +1092,11 @@ s32 cellAudioGetPortConfig(u32 portNum, CellAudioPortConfig* config)
      *   uint32_t   portSize;       u32 @ 24
      *   sys_addr_t portAddr;       u32 @ 28      -> 32 bytes */
     vm_write32(cfg +  0, (u32)port->read_idx_addr);                          /* readIndexAddr */
-    vm_write32(cfg +  4, port->running ? CELL_AUDIO_STATUS_RUN
-                                       : CELL_AUDIO_STATUS_READY);           /* status */
+    /* RPCS3 cellAudio.cpp cellAudioGetPortConfig: closed -> CLOSE,
+     * opened -> READY, started -> RUN. */
+    vm_write32(cfg +  4, !port->in_use ? CELL_AUDIO_STATUS_CLOSE
+                         : port->running ? CELL_AUDIO_STATUS_RUN
+                                         : CELL_AUDIO_STATUS_READY);         /* status */
     vm_write64(cfg +  8, port->param.nChannel);                             /* nChannel */
     vm_write64(cfg + 16, port->param.nBlock);                               /* nBlock */
     vm_write32(cfg + 24, port->buf_size);                                   /* portSize */

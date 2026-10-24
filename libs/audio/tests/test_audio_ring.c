@@ -14,6 +14,10 @@ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
 void spu_coh_notify_write(uint32_t a) { (void)a; }
 void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
+uint32_t sys_event_find_queue_by_key(uint64_t key) { (void)key; return 0; }
+void sys_event_queue_push_from_kernel(uint32_t q, uint64_t s, uint64_t d1,
+                                      uint64_t d2, uint64_t d3, const char* p)
+{ (void)q; (void)s; (void)d1; (void)d2; (void)d3; (void)p; }
 
 int main(void)
 {
@@ -60,6 +64,27 @@ int main(void)
     assert(vm_read64((u32)s_ports[0].read_idx_addr) == 0);
     assert(cellAudioPortStart(0) == CELL_OK);
     assert(cellAudioPortStart(0) == CELL_AUDIO_ERROR_PORT_ALREADY_RUN);
+    assert(cellAudioInit() == CELL_AUDIO_ERROR_ALREADY_INIT);
+    /* RPCS3 folds the range into PARAM; the HLE used to return PORT_NOT_OPEN. */
+    assert(cellAudioPortStart(CELL_AUDIO_PORT_MAX) == CELL_AUDIO_ERROR_PARAM);
+    assert(cellAudioGetPortConfig(CELL_AUDIO_PORT_MAX, (void*)0x300) == CELL_AUDIO_ERROR_PARAM);
+    assert(cellAudioGetPortConfig(0, NULL) == CELL_AUDIO_ERROR_PARAM);
+    /* RPCS3 cellAudioGetPortConfig returns a CLOSE status for a closed port. */
+    assert(cellAudioPortClose(1) == CELL_OK);
+    assert(cellAudioGetPortConfig(1, (void*)0x300) == CELL_OK);
+    assert(vm_read32(0x304) == CELL_AUDIO_STATUS_CLOSE);
+    assert(cellAudioPortStart(1) == CELL_AUDIO_ERROR_PORT_NOT_OPEN);
+    /* RPCS3 accepts nChannel 0 and nBlock 2/4; the old HLE rejected both. */
+    vm_write64(0x100, 0);
+    vm_write64(0x108, 2);
+    assert(cellAudioPortOpen((void*)0x100, (void*)0x200) == CELL_OK);
+    assert(cellAudioPortClose(1) == CELL_OK);
+    vm_write64(0x100, 3);
+    vm_write64(0x108, 8);
+    assert(cellAudioPortOpen((void*)0x100, (void*)0x200) == CELL_AUDIO_ERROR_PARAM);
+    vm_write64(0x100, 2);
+    vm_write64(0x108, 3);
+    assert(cellAudioPortOpen((void*)0x100, (void*)0x200) == CELL_AUDIO_ERROR_PARAM);
     s_ports[0].read_index = 35;
     s_audio_start_us = 1000000;
     assert(cellAudioGetPortBlockTag(0, 3, (void*)0x300) == CELL_OK);

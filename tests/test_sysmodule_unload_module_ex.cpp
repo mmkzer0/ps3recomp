@@ -63,7 +63,9 @@ int main() {
     CHECK(call(QUERY,0xF044)==0);
     CHECK(call(UNLOAD,0xF044,0xDEADBEEF)==0);
     CHECK(call(QUERY,0xF044)==0x80012003);
-    CHECK(call(UNLOAD,0xF044)==0x80012003);
+    // RPCS3 unload_module<false>: an already-unloaded module returns OK, not
+    // CELL_SYSMODULE_ERROR_UNLOADED.
+    CHECK(call(UNLOAD,0xF044)==0);
     CHECK(call(LOAD,0xF044)==0);
     CHECK(call(UNLOAD,0xF044,UINT64_MAX)==0); // Extra GPRs are not pointers or arguments.
     // Independent literal allowlist from RPCS3 LOADABLE_INTERNAL_MODULES_EX.
@@ -87,7 +89,9 @@ int main() {
         CHECK(call(UNLOAD,id)==(accepts?0u:0x80012002u));
         CHECK(call(QUERY,id)==(accepts?0x80012003u:0u));
         if(!accepts)CHECK(cellSysmoduleUnloadModule(uint16_t(id))==0);
-        CHECK(call(UNLOAD,id)==(accepts?0x80012003u:0x80012002u));
+        // RPCS3 unload_module<false>: a loadable but not-loaded id is OK;
+        // unloadable ids are still rejected with UNKNOWN.
+        CHECK(call(UNLOAD,id)==(accepts?0u:0x80012002u));
     }
     CHECK(cellSysmoduleLoadModule(0x44)==0);
     CHECK(call(LOAD,0xF044)==0);

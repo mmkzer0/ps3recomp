@@ -175,8 +175,11 @@ s32 cellSysutilRegisterCallback(s32 slot, CellSysutilCallback func, void* userda
     printf("[cellSysutil] RegisterCallback(slot=%d, func=0x%08X)\n",
            slot, func_addr);
 
+    /* RPCS3 cellSysutil.cpp cellSysutilRegisterCallback: slot >= 4 (the
+     * literal CELL_SYSUTIL_MAX_CALLBACKS) -> CELL_SYSUTIL_ERROR_VALUE.  A
+     * negative signed slot is the same out-of-range value on the u32 ABI. */
     if (slot < 0 || slot >= CELL_SYSUTIL_MAX_CALLBACKS)
-        return CELL_SYSUTIL_ERROR_NUM;
+        return CELL_SYSUTIL_ERROR_VALUE;
 
     if (func_addr == 0) {
         /* Treat as Unregister — matches observed game behaviour. */
@@ -411,6 +414,8 @@ static s32 sysutil_language(void)
 
 s32 cellSysutilGetSystemParamInt(s32 id, u32 value_ea)
 {
+    /* RPCS3 cellSysutil.cpp cellSysutilGetSystemParamInt: !value ->
+     * CELL_SYSUTIL_ERROR_VALUE. */
     if (!value_ea)
         return CELL_SYSUTIL_ERROR_VALUE;
 

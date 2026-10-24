@@ -14,6 +14,8 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host */
+#include "../../runtime/memory/vm.h"         /* vm_range_ok, vm_guest_limit */
+#include "ps3emu/stop.h"
 #include "ps3emu/log_first.h"
 
 /* glibc's <sys/stat.h> exposes st_atime/st_mtime/st_ctime as macros that expand
@@ -441,10 +443,15 @@ s32 cellFsOpen(const char* path, s32 flags, CellFsFd* fd, const void* arg, u64 s
     printf("[cellFs] Open(path='%s', flags=0x%X)\n", gpath(path) ? gpath(path) : "<null>", flags);
     { extern char* getenv(const char*); static int _bt=-1; if(_bt<0){ const char* e=getenv("PS3_FSLOG_BT"); _bt=(e&&*e&&*e!='0')?1:0; } if(_bt){ extern unsigned int ppu_prof_resolve_host(void*); void* fr[24]; unsigned short n=RtlCaptureStackBackTrace(0,24,fr,0); char ln[600]; int p=snprintf(ln,sizeof ln,"[FSBT]"); unsigned int prev=0; for(unsigned short i=0;i<n;i++){ unsigned int g=ppu_prof_resolve_host(fr[i]); if(g&&g!=prev){ prev=g; p+=snprintf(ln+p,sizeof(ln)-p," %08X",g); } } fprintf(stderr,"%s%c",ln,10); } }
 
+    /* RPCS3 cellFs.cpp cellFsOpen: !fd -> CELL_EFAULT.  A null/invalid path
+     * goes through sys_fs.cpp translate_to_str, which returns CELL_EFAULT for
+     * a pointer it cannot read; the HLE folds both into the same guard. */
     if (!path || !fd)
         return CELL_EFAULT;
 
     char host_path[CELL_FS_MAX_FS_PATH_LENGTH];
+    /* RPCS3 sys_fs.cpp sys_fs_open returns the path translation error; an
+     * unmapped VFS prefix has no host path, reported as CELL_ENOENT here. */
     if (translate_path(gpath(path), host_path, sizeof(host_path)) != 0) {
         /* gpath(), not the raw parameter: `path` is a GUEST address, and
          * printing it as a host string faults. The failure path was
@@ -466,14 +473,30 @@ s32 cellFsOpen(const char* path, s32 flags, CellFsFd* fd, const void* arg, u64 s
         fp = fopen(host_path, "w+b");
     }
 
+    /* RPCS3 sys_fs.cpp open_raw maps the host errno: noent -> ENOENT,
+     * notdir -> ENOTDIR, isdir -> EISDIR, exists+O_EXCL -> EEXIST,
+     * access -> EACCES, name too long / read-only / too many files likewise.
+     * The HLE used to collapse everything to ENOENT and EACCES to EPERM. */
     if (!fp) {
         printf("[cellFs] Open: fopen('%s', '%s') failed: %s\n", host_path, mode, strerror(errno));
-        if (errno == ENOENT) return (s32)CELL_ENOENT;
-        if (errno == EACCES) return (s32)CELL_EPERM;
-        return (s32)CELL_ENOENT;
+        switch (errno) {
+        case ENOENT:        return (s32)CELL_ENOENT;
+        case EACCES:        return (s32)CELL_EACCES;
+        case EPERM:         return (s32)CELL_EPERM;
+        case EISDIR:        return (s32)CELL_EISDIR;
+        case ENOTDIR:       return (s32)CELL_ENOTDIR;
+        case EEXIST:        return (s32)CELL_EEXIST;
+        case EMFILE:
+        case ENFILE:        return CELL_FS_ERROR_EMFILE;
+        case ENAMETOOLONG:  return (s32)CELL_ENAMETOOLONG;
+        case EROFS:         return (s32)CELL_EROFS;
+        case ENOSPC:        return (s32)CELL_ENOSPC;
+        default:            return (s32)CELL_ENOENT;
+        }
     }
 
     CellFsFd slot = alloc_fd();
+    /* RPCS3 sys_fs.cpp sys_fs_open: fd-budget exhaustion -> CELL_EMFILE. */
     if (slot < 0) {
         fclose(fp);
         return CELL_FS_ERROR_EMFILE;
@@ -498,6 +521,7 @@ s32 cellFsClose(CellFsFd fd)
 {
     printf("[cellFs] Close(fd=%d)\n", fd);
 
+    /* RPCS3 sys_fs.cpp sys_fs_close: an unknown fd -> CELL_EBADF. */
     if (fd < 0 || fd >= MAX_OPEN_FILES || !s_files[fd].in_use)
         return CELL_FS_ERROR_EBADF;
 
@@ -513,11 +537,17 @@ s32 cellFsClose(CellFsFd fd)
 /* NID: 0x4D5FF8E2 */
 s32 cellFsRead(CellFsFd fd, void* buf, u64 nbytes, u64* nread)
 {
-    if (fd < 0 || fd >= MAX_OPEN_FILES || !s_files[fd].in_use)
+    /* RPCS3 sys_fs.cpp sys_fs_read: unknown fd -> *nread=0, CELL_EBADF. */
+    if (fd < 0 || fd >= MAX_OPEN_FILES || !s_files[fd].in_use) {
+        if (nread) *(u64*)gptr(nread) = 0;
         return CELL_FS_ERROR_EBADF;
+    }
 
-    if (!buf)
+    /* RPCS3 sys_fs.cpp sys_fs_read: !buf -> *nread=0, CELL_EFAULT. */
+    if (!buf) {
+        if (nread) *(u64*)gptr(nread) = 0;
         return CELL_EFAULT;
+    }
 
     u64 bytes_read = 0;
 
@@ -577,6 +607,7 @@ s32 cellFsWrite(CellFsFd fd, const void* buf, u64 nbytes, u64* nwrite)
 /* NID: 0xA397D042 */
 s32 cellFsLseek(CellFsFd fd, s64 offset, s32 whence, u64* pos)
 {
+    /* RPCS3 sys_fs.cpp sys_fs_lseek: an unknown fd -> CELL_EBADF. */
     if (fd < 0 || fd >= MAX_OPEN_FILES || !s_files[fd].in_use)
         return CELL_FS_ERROR_EBADF;
 
@@ -607,14 +638,20 @@ s32 cellFsFstat(CellFsFd fd, CellFsStat* sb)
 {
     printf("[cellFs] Fstat(fd=%d)\n", fd);
 
+    /* RPCS3 sys_fs.cpp sys_fs_fstat: an unknown fd -> CELL_EBADF. */
     if (fd < 0 || fd >= MAX_OPEN_FILES || !s_files[fd].in_use)
         return CELL_FS_ERROR_EBADF;
-    if (!sb)
-        return CELL_EFAULT;
+
+    /* RPCS3 sys_fs.cpp sys_fs_fstat() has no !sb guard: a null sb faults in
+     * the guest.  A null or out-of-arena destination is the same guest fault
+     * here, so fail closed with the HLE guest-range stop instead of
+     * inventing EFAULT. */
+    if (!vm_range_ok((u32)(uintptr_t)sb, sizeof(CellFsStat)))
+        ps3_stop_guest_range(__func__, "sb", (u32)(uintptr_t)sb,
+                             sizeof(CellFsStat), vm_guest_limit());
 
     /* `sb` is a guest address; work through the host alias. */
     CellFsStat* sbh = (CellFsStat*)gptr(sb);
-    if (!sbh) return CELL_EFAULT;
 
     if (s_files[fd].host_fp) {
 #ifdef _WIN32

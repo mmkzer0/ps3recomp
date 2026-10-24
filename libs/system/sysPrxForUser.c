@@ -410,8 +410,12 @@ s32 _sys_tolower(s32 c) { return tolower(c); }
 
 s32 sys_ppu_thread_once(u32 once_ctrl_ea, u32 init_opd)
 {
-    if (!once_ctrl_ea)
-        return (s32)CELL_EINVAL;
+    /* RPCS3 sys_ppu_thread_.cpp sys_ppu_thread_once has no argument check:
+     * it dereferences *once_ctrl, so a null/unmapped control word faults in
+     * the guest.  Fail closed instead of inventing CELL_EINVAL. */
+    if (!vm_range_ok(once_ctrl_ea, 4))
+        ps3_stop_guest_range("sys_ppu_thread_once", "once_ctrl", once_ctrl_ea,
+                             4, vm_guest_limit());
 
     slot_lock();
     const int first = (vm_read32(once_ctrl_ea) == 0);

@@ -13,6 +13,7 @@ void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
 
 ps3_guest_caller_fn g_ps3_guest_caller;
+const char* ppu_vfs_root = ".";
 
 int main(void)
 {
@@ -31,6 +32,12 @@ int main(void)
     assert(dir_exists(host)); assert(rmdir(host) == 0);
     snprintf(host, sizeof(host), "%s/TEST00000", root);
     assert(rmdir(host) == 0); assert(rmdir(root) == 0);
+    /* RPCS3 cellGame.cpp cellGameGetParamString: !buf || bufsize == 0 ->
+     * CELL_GAME_ERROR_PARAM. */
+    assert(cellGameGetParamString(CELL_GAME_PARAMID_TITLE_ID, NULL, 10) ==
+           CELL_GAME_ERROR_PARAM);
+    assert(cellGameGetParamString(CELL_GAME_PARAMID_TITLE_ID, (void*)0x600, 0) ==
+           CELL_GAME_ERROR_PARAM);
     free(vm_base);
     puts("Game creation returns guest paths and creates host directories");
 }

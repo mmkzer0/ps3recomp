@@ -116,8 +116,19 @@ s32 cellAudioOutGetConfiguration(u32 audioOut,
 
     printf("[cellAvconfExt] AudioOutGetConfiguration()\n");
 
+    /* RPCS3 cellAudioOut.cpp cellAudioOutGetConfiguration: !config ->
+     * CELL_AUDIO_OUT_ERROR_ILLEGAL_PARAMETER; only PRIMARY is supported,
+     * SECONDARY -> UNSUPPORTED_AUDIO_OUT and any other value -> ILLEGAL. */
     if (!config)
-        return CELL_EINVAL;
+        return CELL_AUDIO_OUT_ERROR_ILLEGAL_PARAMETER;
+    /* RPCS3 cellAudioOut.cpp cellAudioOutGetConfiguration: SECONDARY ->
+     * UNSUPPORTED_AUDIO_OUT; any other non-PRIMARY -> ILLEGAL_PARAMETER. */
+    if (audioOut == CELL_AUDIO_OUT_SECONDARY)
+        return CELL_AUDIO_OUT_ERROR_UNSUPPORTED_AUDIO_OUT;
+    /* RPCS3 cellAudioOut.cpp cellAudioOutGetConfiguration: default ->
+     * ILLEGAL_PARAMETER. */
+    if (audioOut != CELL_AUDIO_OUT_PRIMARY)
+        return CELL_AUDIO_OUT_ERROR_ILLEGAL_PARAMETER;
     config = GUEST_PTR(config, CellAudioOutConfiguration*);
 
     memset(config, 0, sizeof(CellAudioOutConfiguration));
@@ -141,8 +152,16 @@ s32 cellAudioOutGetState(u32 audioOut, u32 deviceIndex, void* state)
     (void)deviceIndex;
     uint32_t ea = (uint32_t)(uintptr_t)state;
     printf("[cellAvconfExt] AudioOutGetState(audioOut=%u)\n", audioOut);
+    /* RPCS3 cellAudioOut.cpp cellAudioOutGetState: !state ->
+     * CELL_AUDIO_OUT_ERROR_ILLEGAL_PARAMETER; GetNumberOfDevice rejects an
+     * unknown audioOut with ILLEGAL_PARAMETER too. */
     if (!ea)
-        return CELL_EINVAL;
+        return CELL_AUDIO_OUT_ERROR_ILLEGAL_PARAMETER;
+    /* RPCS3 cellAudioOut.cpp cellAudioOutGetState: GetNumberOfDevice rejects an
+     * audioOut outside PRIMARY/SECONDARY with ILLEGAL_PARAMETER. */
+    if (audioOut != CELL_AUDIO_OUT_PRIMARY &&
+        audioOut != CELL_AUDIO_OUT_SECONDARY)
+        return CELL_AUDIO_OUT_ERROR_ILLEGAL_PARAMETER;
 
     vm_write8(ea + 0, 0);                                   /* ENABLED        */
     vm_write8(ea + 1, CELL_AUDIO_OUT_CODING_TYPE_LPCM);

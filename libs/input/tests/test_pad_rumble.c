@@ -106,9 +106,33 @@ static void test_set_act_direct(void)
     set_act(0, 1, 1, (s32)CELL_PAD_ERROR_NOT_OPENED);
 }
 
+static void test_argument_checks(void)
+{
+    /* RPCS3 cellPad.cpp: the table bound is CELL_MAX_PADS=127; ports in
+     * [7,127) return NO_DEVICE (GetData/ClearBuf) or OK (SetPortSetting). */
+    assert(cellPadInit(0) == (s32)CELL_PAD_ERROR_INVALID_PARAMETER);
+    assert(cellPadInit(CELL_MAX_PADS + 1) == (s32)CELL_PAD_ERROR_INVALID_PARAMETER);
+    assert(cellPadInit(8) == CELL_OK);
+    assert(cellPadInit(8) == (s32)CELL_PAD_ERROR_ALREADY_INITIALIZED);
+    assert(cellPadGetData(0, NULL) == (s32)CELL_PAD_ERROR_INVALID_PARAMETER);
+    assert(cellPadGetData(CELL_MAX_PADS, (void*)0x100) == (s32)CELL_PAD_ERROR_INVALID_PARAMETER);
+    assert(cellPadGetData(8, (void*)0x100) == (s32)CELL_PAD_ERROR_NO_DEVICE);
+    assert(cellPadSetPortSetting(CELL_MAX_PADS, 0) == (s32)CELL_PAD_ERROR_INVALID_PARAMETER);
+    assert(cellPadSetPortSetting(8, 0) == CELL_OK);
+    assert(cellPadSetPortSetting(0, 0) == CELL_OK);
+    assert(cellPadClearBuf(CELL_MAX_PADS) == (s32)CELL_PAD_ERROR_INVALID_PARAMETER);
+    assert(cellPadClearBuf(8) == (s32)CELL_PAD_ERROR_NO_DEVICE);
+    assert(cellPadClearBuf(0) == CELL_OK);
+    assert(cellPadEnd() == CELL_OK);
+    assert(cellPadGetData(0, (void*)0x100) == (s32)CELL_PAD_ERROR_UNINITIALIZED);
+    assert(cellPadSetPortSetting(0, 0) == (s32)CELL_PAD_ERROR_UNINITIALIZED);
+    assert(cellPadClearBuf(0) == (s32)CELL_PAD_ERROR_UNINITIALIZED);
+}
+
 int main(void)
 {
     test_levels();
+    test_argument_checks();
     test_set_act_direct();
     printf("test_pad_rumble: ok\n");
     return 0;

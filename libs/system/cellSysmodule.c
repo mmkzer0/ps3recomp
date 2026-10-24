@@ -90,6 +90,8 @@ s32 cellSysmoduleLoadModule(u16 id)
            id, sysmodule_id_to_name(id));
 
     int slot = sysmodule_slot(id);
+    /* RPCS3 cellSysmodule.cpp cellSysmoduleLoadModule: out-of-range or
+     * non-loadable id -> CELL_SYSMODULE_ERROR_UNKNOWN. */
     if (slot < 0)
         return CELL_SYSMODULE_ERROR_UNKNOWN;
 
@@ -107,11 +109,15 @@ s32 cellSysmoduleUnloadModule(u16 id)
            id, sysmodule_id_to_name(id));
 
     int slot = sysmodule_slot(id);
+    /* RPCS3 cellSysmodule.cpp cellSysmoduleUnloadModule: out-of-range or
+     * non-loadable id -> CELL_SYSMODULE_ERROR_UNKNOWN. */
     if (slot < 0)
         return CELL_SYSMODULE_ERROR_UNKNOWN;
 
+    /* RPCS3 unload_module<false>: a module with loaded_count == 0 returns
+     * CELL_OK; it does not raise UNLOADED. */
     if (!s_module_loaded[slot])
-        return CELL_SYSMODULE_ERROR_UNLOADED;
+        return CELL_OK;
 
     s_module_loaded[slot] = 0;
     return CELL_OK;
@@ -124,6 +130,8 @@ s32 cellSysmoduleIsLoaded(u16 id)
            id, sysmodule_id_to_name(id));
 
     int slot = sysmodule_slot(id);
+    /* RPCS3 cellSysmodule.cpp cellSysmoduleIsLoaded: out-of-range or
+     * non-loadable id -> CELL_SYSMODULE_ERROR_UNKNOWN. */
     if (slot < 0)
         return CELL_SYSMODULE_ERROR_UNKNOWN;
 

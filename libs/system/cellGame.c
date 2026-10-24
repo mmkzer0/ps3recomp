@@ -687,6 +687,8 @@ s32 cellGameGetParamString(s32 id, char* buf, u32 bufsize)
      * byte data, so no byte-swap -- just write into the guest buffer. A raw
      * strncpy(buf, ...) faulted on the guest stack address. */
     uint32_t buf_ea = (uint32_t)(uintptr_t)buf;
+    /* RPCS3 cellGame.cpp cellGameGetParamString: !buf || bufsize == 0 ->
+     * CELL_GAME_ERROR_PARAM. */
     if (!buf_ea || bufsize == 0)
         return CELL_GAME_ERROR_PARAM;
     char* hbuf = (char*)(vm_base + buf_ea);

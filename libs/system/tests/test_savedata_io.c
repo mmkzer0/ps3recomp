@@ -7,6 +7,9 @@ uint32_t ppu_vm_size;
 uint32_t g_ww_lo, g_ww_hi;
 void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
 int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+void ps3_stop_guest_range(const char* f, const char* a, uint64_t ea,
+                          uint64_t size, uint64_t limit)
+{ (void)f; (void)a; (void)ea; (void)size; (void)limit; abort(); }
 void spu_coh_notify_write(uint32_t a) { (void)a; }
 void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
@@ -74,6 +77,14 @@ int main(void)
     memcpy(vm_base + 0x400, payload, sizeof(payload));
     vm_write32(0x108, 0x300); vm_write32(0x200, 4); vm_write32(0x204, 2);
     g_ps3_guest_caller = callback;
+    /* RPCS3 savedata_check_args reasons 2 (dirName) and 74 (setBuf); the HLE
+     * used to fold a null funcStat into the same PARAM check. */
+    assert(cellSaveDataAutoLoad2(0, NULL, 0, (void*)0x200, (void*)0x800,
+                                (void*)0x900, 0, (void*)7) ==
+           CELL_SAVEDATA_ERROR_PARAM);
+    assert(cellSaveDataAutoLoad2(0, (void*)0x100, 0, NULL, (void*)0x800,
+                                (void*)0x900, 0, (void*)7) ==
+           CELL_SAVEDATA_ERROR_PARAM);
     assert(cellSaveDataFixedSave2(0, (void*)0x100, (void*)0x200, (void*)0x800,
                                 (void*)0x900, (void*)0xA00, 0, (void*)7) == CELL_OK);
     assert(step == 3);

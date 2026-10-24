@@ -33,6 +33,12 @@ int main(void)
 {
     vm_base = calloc(1, 65536); assert(vm_base);
     memcpy(vm_base + 0x200, "Install data", 13);
+    /* RPCS3 cellSysutil.cpp: slot >= 4 -> ERROR_VALUE (the HLE used NUM);
+     * !value -> ERROR_VALUE. */
+    assert(cellSysutilRegisterCallback(-1, 0, 0) == CELL_SYSUTIL_ERROR_VALUE);
+    assert(cellSysutilRegisterCallback(CELL_SYSUTIL_MAX_CALLBACKS, 0, 0) ==
+           CELL_SYSUTIL_ERROR_VALUE);
+    assert(cellSysutilRegisterCallback(0, 0, 0) == CELL_OK);
     g_ps3_guest_caller = callback;
     assert(cellMsgDialogOpen2(0xA0, (void*)0x200, (void*)0x100,
                             (void*)0x1234, NULL) == CELL_OK);
