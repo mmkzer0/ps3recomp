@@ -331,6 +331,9 @@ s32 cellSaveDataAutoLoad2(u32 version, const char* dirName,
 
 s32 cellSaveDataDelete2(u32 container);
 
+/* cellSysutil export 0xE7FA820B; see the definition for the evidence. */
+s32 cellSaveDataEnableOverlay(s32 enable);
+
 /* Old / non-_2 variants from earlier SDK builds — same semantics. */
 s32 cellSaveDataAutoSave(u32 version, const char* dirName,
                           u32 errDialog,

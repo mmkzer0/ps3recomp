@@ -1308,6 +1308,23 @@ s32 cellSaveDataDelete2(u32 container)
     return CELL_OK;
 }
 
+/* cellSaveDataEnableOverlay(s32 enable), cellSysutil export 0xE7FA820B.
+ *
+ * It switches the system's save-data overlay (the dialog the firmware draws over a title during a
+ * save-data operation) on or off. No libsysutil module is in the firmware set, so the semantics come
+ * from callers and from RPCS3 (an oracle, not ground truth). Titles call it with enable = 1
+ * immediately before an auto-load and ignore the result. RPCS3 logs it at notice level and returns
+ * CELL_OK without validating the value.
+ *
+ * This host has no system overlay and the save-data calls here run no dialog, so there is no state to
+ * keep: the flag changes nothing a title or a later call can observe. The return is the one the
+ * reference gives for every value, not a stand-in for an unmodelled failure. */
+s32 cellSaveDataEnableOverlay(s32 enable)
+{
+    printf("[cellSaveData] EnableOverlay(%d)\n", enable);
+    return CELL_OK;
+}
+
 /* ---------------------------------------------------------------------------
  * Old / non-_2 variants — same wrapper pattern as the _2 versions, with
  * the same guest-callback caveat.

@@ -636,6 +636,11 @@ if(PS3RECOMP_BUILD_TESTS)
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_gen_hle_nids.py")
         set_tests_properties(gen_hle_nids PROPERTIES LABELS "tools;t0" TIMEOUT 300)
+        # cellSaveDataEnableOverlay (cellSysutil 0xE7FA820B): registered in the table and returns CELL_OK.
+        add_test(NAME savedata_enable_overlay
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_savedata_enable_overlay.py")
+        set_tests_properties(savedata_enable_overlay PROPERTIES LABELS "ppu;t0" TIMEOUT 300)
         # docs/DIAGNOSTICS.md is hand-maintained prose; the checker requires the
         # knob set (and its summary counts) to match the sources, not the whole
         # generated text.
