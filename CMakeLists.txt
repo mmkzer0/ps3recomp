@@ -450,6 +450,7 @@ if(PS3RECOMP_BUILD_TESTS)
     # them and the shape of ucontext_t on _XOPEN_SOURCE, so whether that path
     # works on arm64 is a question to answer rather than assume.
     add_subdirectory(tests/fiber_switch)
+    add_subdirectory(tests/sync2_semaphore)
     # Syscall 14's address/flags classification as a plain unit test: the
     # check is pure, so the test links one runtime translation unit
     # (lv2_lock_line.c) and nothing else.
@@ -717,6 +718,7 @@ if(UNIX)
                     --out "${SMOKE_GEN}/ppu_hle_nids.cpp" --all
             DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tools/gen_hle_nids.py"
                     "${CMAKE_CURRENT_SOURCE_DIR}/tools/nid_database.py"
+                    ${HLE_SOURCES}
             COMMENT "Generating the HLE NID -> handler table")
         # The generated unit includes libs/... by repository-relative path and
         # ppu_hle_adapt.hpp from runtime/ppu; both are already on this target's

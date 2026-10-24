@@ -17,17 +17,20 @@ extern "C" {
 #endif
 
 /* ---------------------------------------------------------------------------
- * Error codes (shared base with cellSync)
+ * Firmware error family (legacy non-semaphore names retained).
  * -----------------------------------------------------------------------*/
-#define CELL_SYNC2_ERROR_AGAIN                  (CELL_ERROR_BASE_SYNC | 0x41)
-#define CELL_SYNC2_ERROR_INVAL                  (CELL_ERROR_BASE_SYNC | 0x42)
-#define CELL_SYNC2_ERROR_NOMEM                  (CELL_ERROR_BASE_SYNC | 0x44)
-#define CELL_SYNC2_ERROR_BUSY                   (CELL_ERROR_BASE_SYNC | 0x4A)
-#define CELL_SYNC2_ERROR_STAT                   (CELL_ERROR_BASE_SYNC | 0x4F)
-#define CELL_SYNC2_ERROR_NULL_POINTER           (CELL_ERROR_BASE_SYNC | 0x51)
+#define CELL_SYNC2_ERROR_AGAIN                  ((s32)0x80410C01)
+#define CELL_SYNC2_ERROR_INVAL                  ((s32)0x80410C02)
+#define CELL_SYNC2_ERROR_NOMEM                  ((s32)0x80410C04)
+#define CELL_SYNC2_ERROR_BUSY                   ((s32)0x80410C0A)
+#define CELL_SYNC2_ERROR_STAT                   ((s32)0x80410C0F)
+#define CELL_SYNC2_ERROR_ALIGN                  ((s32)0x80410C10)
+#define CELL_SYNC2_ERROR_NULL_POINTER           ((s32)0x80410C11)
+#define CELL_SYNC2_ERROR_THREAD_TYPE            ((s32)0x80410C12)
+/* Unrelated legacy timeout/queue APIs are not firmware-corrected here. */
 #define CELL_SYNC2_ERROR_TIMEDOUT               (CELL_ERROR_BASE_SYNC | 0x52)
 #define CELL_SYNC2_ERROR_NOT_INITIALIZED        (CELL_ERROR_BASE_SYNC | 0x53)
-#define CELL_SYNC2_ERROR_OVERFLOW               (CELL_ERROR_BASE_SYNC | 0x54)
+#define CELL_SYNC2_ERROR_OVERFLOW               CELL_SYNC2_ERROR_STAT
 #define CELL_SYNC2_ERROR_EMPTY                  (CELL_ERROR_BASE_SYNC | 0x55)
 
 /* ---------------------------------------------------------------------------
@@ -84,19 +87,21 @@ typedef struct CellSync2Semaphore {
     u8 _opaque[CELL_SYNC2_SEMAPHORE_SIZE];
 } CellSync2Semaphore;
 
+/* Guest big-endian layout. Public semaphore arguments are guest EAs. */
 typedef struct CellSync2SemaphoreAttribute {
-    u32 maxWaiters;
-    s32 maxValue;
+    u32 sdkVersion;
+    u16 threadTypes;
+    u16 maxWaiters;
+    char name[32];
+    u8 reserved[88];
 } CellSync2SemaphoreAttribute;
 
-s32 cellSync2SemaphoreAttributeInitialize(CellSync2SemaphoreAttribute* attr);
-s32 cellSync2SemaphoreInit(CellSync2Semaphore* sem, s32 initialValue,
-                           const CellSync2SemaphoreAttribute* attr);
-s32 cellSync2SemaphoreAcquire(CellSync2Semaphore* sem, u32 count,
-                              u64 timeoutUsec);
-s32 cellSync2SemaphoreTryAcquire(CellSync2Semaphore* sem, u32 count);
-s32 cellSync2SemaphoreRelease(CellSync2Semaphore* sem, u32 count);
-s32 cellSync2SemaphoreGetValue(const CellSync2Semaphore* sem, s32* value);
+s32 _cellSync2SemaphoreAttributeInitialize(u32 attr, u32 sdkVersion);
+s32 cellSync2SemaphoreInitialize(u32 sem, u32 workBuffer, s32 initialValue, u32 attr);
+s32 cellSync2SemaphoreGetCount(u32 sem, u32 countOut);
+s32 cellSync2SemaphoreAcquire(u32 sem, u32 count, u32 threadConfig);
+s32 cellSync2SemaphoreTryAcquire(u32 sem, u32 count, u32 threadConfig);
+s32 cellSync2SemaphoreRelease(u32 sem, u32 count, u32 notifierConfig);
 
 /* ---------------------------------------------------------------------------
  * CellSync2Queue -- bounded queue with blocking and timeout

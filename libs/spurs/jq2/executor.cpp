@@ -17,7 +17,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <bitset>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
@@ -60,6 +59,7 @@ constexpr std::uint32_t kWorkloadIdMask = 0x1F;
 constexpr std::uint32_t kWorkloadId = 0;
 constexpr std::uint32_t kQPortCount = 0x70;
 constexpr std::uint32_t kQEventFlag = 0x80; /* two u32 ids */
+constexpr std::uint32_t kQWaiterBitmap = 0x88; /* four BE32 words, MSB first */
 constexpr std::uint32_t kQPortBitmap = 0x580;
 constexpr std::uint32_t kQExit = 0xF04;
 constexpr std::uint32_t kQSpurs = 0xF10;
@@ -74,10 +74,10 @@ constexpr std::uint32_t kFlagReaderPhase = 0x40;
 constexpr std::uint32_t kJoined = 0x20;
 
 constexpr std::uint32_t kMaxPorts = 0x400;
-/* The firmware's PM wake passes the unreduced waiter id to helper 0x6348
- * (via 0x0ED4), which rejects ids above 63: a waiter with a higher id would
- * never be woken. Ids are therefore 0..63 and a 65th concurrent Sync is a
- * named stop, not a wait for a free id. */
+/* The PPU allocator scans 128 bits, but the PM wake rejects ids above 63.
+ * Zero collides with the PPU's "not allocated" sentinel and leaks on first
+ * use; only ids 1..63 can be registered. Preserve attempted higher bits before
+ * stopping rather than reproducing the firmware's uninterruptible wait. */
 constexpr unsigned kWaiterIds = 64;
 
 /* The port block's own words (the line's accounting words are port.hpp's). */
@@ -499,24 +499,54 @@ public:
 
     unsigned acquire_waiter()
     {
-        {
-            std::lock_guard<std::mutex> lk(wait_mu_);
-            for (unsigned id = 0; id < kWaiterIds; ++id) {
-                if (!waiter_ids_.test(id)) {
-                    waiter_ids_.set(id);
-                    return id;
+        for (;;) {
+            unsigned id = 128;
+            resv_host_rmw(ea_ + kQWaiterBitmap, [](std::uint8_t* line, void* user) {
+                auto& allocated = *static_cast<unsigned*>(user);
+                for (unsigned w = 0; w < 4; ++w) {
+                    auto word = std::atomic_ref<std::uint32_t>(
+                        *reinterpret_cast<std::uint32_t*>(line + 8 + 4 * w));
+                    const std::uint32_t bits = ps3_bswap32(word.load(std::memory_order_relaxed));
+                    if (bits == UINT32_MAX) continue;
+                    const unsigned bit = static_cast<unsigned>(__builtin_clz(~bits));
+                    word.store(ps3_bswap32(bits | (0x80000000u >> bit)), std::memory_order_release);
+                    allocated = 32 * w + bit;
+                    return 1;
                 }
-            }
+                return 0;
+            }, &id);
+            if (id == 0) continue; /* firmware retries without freeing the sentinel */
+            if (id < kWaiterIds) return id;
+            std::array<std::uint32_t, 4> words{};
+            resv_host_rmw(ea_ + kQWaiterBitmap, [](std::uint8_t* line, void* user) {
+                auto& words = *static_cast<std::array<std::uint32_t, 4>*>(user);
+                for (unsigned w = 0; w < words.size(); ++w)
+                    words[w] = ps3_bswap32(std::atomic_ref<std::uint32_t>(
+                        *reinterpret_cast<std::uint32_t*>(line + 8 + 4 * w)).load(std::memory_order_relaxed));
+                return 0;
+            }, &words);
+            Kv bitmap{"bitmap", {}};
+            std::snprintf(bitmap.value, sizeof bitmap.value, "0x%08X%08X%08X%08X",
+                          words[0], words[1], words[2], words[3]);
+            stop_with(PS3_STOP_JQ2_WAKE, "a Port2Sync waiter id the firmware's wake cannot signal was needed",
+                      "Only ids 1..63 can wake. The guest bitmap retains the attempted allocation; "
+                      "the HLE stops instead of waiting forever or entering the firmware assertion loop.",
+                      {hex("queue", ea_), text("reason", id == 128 ? "waiter-exhausted" : "waiter-id"),
+                       dec("id", id), bitmap, text("fw", "pm-wake-rejects-id>63")});
         }
-        stop_with(PS3_STOP_JQ2_WAKE, "a Port2Sync waiter id the firmware's wake cannot signal was needed",
-                  "The firmware's PM wake rejects waiter ids above 63 (helper 0x6348), so it would never wake this "
-                  "waiter; 64 Syncs are already blocked on this queue.",
-                  {hex("queue", ea_), text("reason", "waiter-id"), dec("id", kWaiterIds)});
     }
     void release_waiter(unsigned id)
     {
-        std::lock_guard<std::mutex> lk(wait_mu_);
-        waiter_ids_.reset(id);
+        if (id == 0) return;
+        struct Release { unsigned id; } release{id};
+        resv_host_rmw(ea_ + kQWaiterBitmap, [](std::uint8_t* line, void* user) {
+            const unsigned id = static_cast<Release*>(user)->id;
+            auto word = std::atomic_ref<std::uint32_t>(
+                *reinterpret_cast<std::uint32_t*>(line + 8 + 4 * (id / 32)));
+            const std::uint32_t bits = ps3_bswap32(word.load(std::memory_order_relaxed));
+            word.store(ps3_bswap32(bits & ~(0x80000000u >> (id % 32))), std::memory_order_release);
+            return 1;
+        }, &release);
     }
     void block_on(unsigned id)
     {
@@ -665,10 +695,6 @@ private:
     std::vector<pthread_t> threads_;
 
     std::mutex port_mu_; /* port slot allocation and the attached count */
-
-    std::mutex wait_mu_;
-    /* waiter_ids_: ids 0..kWaiterIds-1 in use, under wait_mu_ */
-    std::bitset<kWaiterIds> waiter_ids_;
 
     PoolWake pool_wake_;
     std::unique_ptr<DescriptorPool> pool_;
@@ -864,7 +890,7 @@ void Queue::wake(const Wakeup& w, const JobStart& js)
               fiber ? "The waiter is a fiber (wait kind 0); fibers are not modelled yet, so no HLE Port2Sync registers "
                       "one. The port line was written by something else."
               : event_flag ? "The firmware's PM wake rejects waiter ids above 63 (helper 0x6348), so it never wakes "
-                             "such a waiter; this executor registers ids 0..63 only. The port line was written by "
+                             "such a waiter; this executor registers ids 1..63 only. The port line was written by "
                              "something else."
                            : "The port line's wait kind is not one this executor registers; the line was written by "
                              "something else.",

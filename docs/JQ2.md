@@ -360,20 +360,24 @@ Guards a caller applies first (`check_port_ea`): null `0x80410A11`, not
   event-flag or fiber wait itself is the executor's. After a wake `+0x04` stays
   stale and `A`'s bits 30:29 keep the wait kind (`0x40000000` after an
   event-flag wait); neither blocks the next Sync.
-- **Waiter ids differ from the firmware's in three ways, and stop at 64.** The
-  PM's wake (`0x0ED4` into helper `0x6348`) passes the unreduced id from `+0x04`
-  and the helper rejects ids above 63, so the firmware never wakes a waiter with
-  an id of 64 or more. The HLE therefore allocates ids 0..63 only: a 65th
-  concurrent blocked Sync, or a credit that finds an event-flag waiter with id
-  64 or more in the line, is the named stop `jq2-wake` with `reason=waiter-id`
-  (ids 0..63 behave as before). What the HLE still does differently, so that a
-  title or test must not read these words as firmware state: (1) the firmware
-  treats id 0 as "none" and probably numbers its waiters from 1 `[unverified]`;
-  the HLE hands out id 0 first and has been left that way. (2) The firmware's
-  allocation bitmap at `queue+0x88..0x94` stays zero in the HLE: ids are a host
-  bitset. (3) After a wake `+0x04` keeps the woken id (and `A` the wait kind);
-  what the firmware leaves there is untraced `[unverified]`, so the word is
-  meaningful only while bit 31 of `A` is set.
+- **Guest waiter bitmap and the id0 leak.** The four BE32 words at
+  `queue+0x88..0x94` start zero and are the authoritative allocation state.
+  Allocation scans MSB first, through reservation-model transactions, just as
+  the PPU allocator (`0x02003128-0x02003174`). Id0 is allocated but collides
+  with the "not allocated" sentinel (`0x02003360-0x02003368`): it leaks and
+  allocation retries, registering id1 on a fresh queue. Release clears only
+  the nonzero allocated bit. Thus ids **1..63** are wakeable event identities.
+  The PM's wake (`0x0ED4` into helper `0x6348`) rejects unreduced ids above 63.
+  **Diagnostic deviation (firmware defect, KB m1r-027):** firmware silently
+  hangs on an unwakeable id. The HLE preserves the attempted id64 bitmap bit,
+  then stops with `jq2-wake reason=waiter-id`, `queue`, `id`, the four BE32
+  words concatenated as `bitmap=0x...`, and `fw=pm-wake-rejects-id>63`.
+  A bug-compatible fidelity mode is explicitly not provided.
+  Full 128-bit exhaustion stops with `reason=waiter-exhausted id=128`.
+  Allocation/release invalidate neighboring PPU/SPU reservations and preserve
+  unrelated words on the same line; no authoritative host bitset remains.
+  Firmware leaves `+0x04` stale after wake and polling Sync, as does the HLE;
+  only bit31 makes that identity a live waiter.
 - **No traced Sync reached the registration path.** All 4106 traced port dumps
   have bits 31:29 of `A`, the `+0x04` word and the claim word zero. A Sync that
   had to wait would leave its id in `+0x04`.
@@ -387,6 +391,70 @@ Guards a caller applies first (`check_port_ea`): null `0x80410A11`, not
   touching the claim byte; the owner's claim survives. A Sync that claimed
   clears the byte on every return, including BUSY (stale waiter) and INVAL
   (`B` above the bound).
+
+### B5 acceptance checkpoint: waiter cutover only
+
+This is the authorized coherent step-1 boundary, **not full B5 acceptance**.
+The following maps the B5-SCOPE §6 rows to exercised toolkit evidence.
+`NOT RUN` is not a pass; no fiber or Sync2 ABI cutover is included here.
+
+| §6 scenario | Status at this checkpoint |
+|---|---|
+| Generated HLE imports / ABI | FAIL coverage: generator registers 5/16 imports; full dispatch test NOT RUN |
+| Attribute/layout/error precedence | NOT RUN (fiber/Sync2 surface unchanged) |
+| Default worker lifecycle | NOT RUN |
+| Signal-before / wait-before / duplicate | NOT RUN |
+| Actual kind0 Port2Sync | NOT RUN; existing fiber stop remains |
+| Fresh id0 allocator | PASS: `jq2_exec_waiter_fresh`, two full wait/wake cycles and id1 reuse |
+| id63 / id64 | PASS: `jq2_exec_waiter_63`, `jq2_exec_stop_waiter_alloc` (exit70, bitmap and firmware-defect diagnostics) |
+| Bitmap contention/reservations | PASS event path: `jq2_exec_sync_concurrent` races PPU/SPU reservations; fiber variant NOT RUN |
+| Stale +4 after wake | PASS event path: fresh/id63 tests; fiber variant NOT RUN |
+| Queue Shutdown during blocked Sync | PASS event path: fresh test checks BUSY and real-job completion; fiber variant NOT RUN |
+| Worker Shutdown during blocked Sync/Acquire | NOT RUN |
+| Count-N and signed counts | NOT RUN |
+| Sync2 fiber consumer / C4 | NOT RUN |
+| Dispatch state isolation | NOT RUN |
+| Unsupported/stops | PASS existing JQ2 event-id/resource tests; custom config/fiber families NOT RUN |
+
+The four waiter discriminators failed before the allocator cutover (fresh:
+14 checks; id63: 2; concurrent: 3; attempted id64: 7). The refined bitmap/fw
+diagnostic assertions also failed before those fields were added. Final dev
+selection passed 44/44; ASan/UBSan JQ2 selection 39/39; TSan JQ2 selection
+35/35. These fixtures do not switch ucontexts, so these sanitizer results say
+nothing about suspended fiber instrumentation. JOBCRT regression passed.
+The all-module generator still reports 1154 handlers, including only the
+existing 3 fiber and 2 Sync2 imports. Pre-landing fiber anchor/return ABI,
+scheduler Shutdown BUSY predicate and custom Sync2 config fencing remain
+outside this completed waiter cutover; they are not resolved by these tests.
+
+### B5 step-2 checkpoint: Sync2 semaphore cutover
+
+The preceding table is the historical step-1 checkpoint. Step 2 additionally
+passes the semaphore attribute/layout/error-precedence and count/signed-range
+rows, all five imported Sync2 NIDs through generated dispatch, default
+scheduler-fiber Acquire/Release, and custom-config/range stops.
+The Count-N row is **corrected by step-2 RE**: initial count 2 / Acquire(3)
+reserves the prefix, GetCount is 0 while blocked, and Release(1) pays the debt.
+Pinned firmware ranges and host scheduling mechanics are recorded in
+`MODULES_REFERENCE.md` under cellSync2.
+
+All eight new `sync2_semaphore_*` tests failed before the cutover: default
+consumer flows stopped at the absent imported attribute initializer, while
+stop fixtures rejected that wrong stop and unchanged guest state. Those
+baseline results do not independently exercise the old per-unit count loop.
+After cutover they pass, including eight debt/wake cycles (four FIFO wraps),
+output publication, four competing consumers and a real fiber yield/wake.
+Final dev selection: 52/52; ASan/UBSan selection: 47/47; TSan selection: 43/43.
+`sync2_semaphore_fiber` passed in both sanitizer presets with no reported
+ucontext instrumentation failure; that is bounded execution evidence, not
+proof that arbitrary coroutine switching is sanitizer-safe. Other new tests
+do not switch ucontexts. Initial TSan runs exposed fixture stack/context
+aliasing; callers now have distinct guest stacks and PPU thread-table slots,
+without suppressions or changes to runtime instrumentation.
+
+Generated coverage is now 8/16 imported NIDs (3 fiber, all 5 Sync2); total
+registrations remain 1154. UtilWorkerControl, kind 0, dispatch isolation,
+worker Shutdown and real-job C4 remain outside this checkpoint.
 
 ### How the port line is tested
 
@@ -466,8 +534,8 @@ below 64 sets bit `id` of the queue's event flag `+0x80` (LV2 event flags
 through `sys_event_flag_*`); a fiber, another kind or an id of 64 or more is the
 named stop `jq2-wake` (`reason` `fiber`, `wait-kind`, `waiter-id`). Last, the
 scheduler's `complete()` releases barriers. A `Port2Sync` that has to wait
-registers a host-allocated id (64 of them; a 65th concurrent Sync is
-`jq2-wake` `reason=waiter-id`) and blocks on that bit with the firmware's wait
+registers a guest-bitmap id (1..63; id0 leaks, and an attempted id64 stops with
+`jq2-wake reason=waiter-id`) and blocks on that bit with the firmware's wait
 (`AND | CLEAR`, no timeout). A wait that returns non-zero (the flag was
 destroyed) is `jq2-wake` `reason=wait` with the return code; it never loops.
 The second event flag (`+0x84`) is still created and destroyed, as the
@@ -631,12 +699,18 @@ channel layer and LV2 event flags; labels `spurs;t0;tsan`:
   `BUSY`, the blocked Sync returns 0 when the queue resumes, and every mode
   other than 0 and 4 (1, 2, 3, 5, 6, 7, 8, `0x80000000`) is `INVAL` with A, B and
   the claim byte as they were.
-- `sync-concurrent`: two ports, a blocked mode-0 Sync on each from separate PPU
-  threads at the same time (distinct waiter ids), both woken by their own
-  credits; labelled `tsan`, so no report may name `libs/spurs/jq2`.
+- `waiter-fresh`: fresh four-word bitmap, id0 attempted/leaked then id1 reused
+  over two real jobs; allocation/release kill PPU and SPU reservations; stale
+  `+4` survives wake/poll. Attached blocked Sync makes Shutdown/Destroy BUSY.
+- `waiter-63`: preoccupy bits0..62 through a reservation transaction; id63
+  registers, wakes through event bit63, releases only its bit and stays stale.
+- `sync-concurrent`: four ports register distinct ids1..4 while PPU stwcx.
+  and SPU GETLLAR/PUTLLC touch the same line; exact bitmap before/after,
+  neighbor stores/guard preserved and each real job output visible.
 - `stop-waiter-id`, `stop-waiter-alloc`, `stop-wait`: forked children ending in
   `jq2-wake` with exit 70: a credit that finds an event-flag waiter with id 64
-  (`reason=waiter-id`), a 65th concurrent blocked Sync (`reason=waiter-id`), and
+  (`reason=waiter-id`), attempted allocation of id64 (`reason=waiter-id`, its
+  bit at `+0x90` retained and no waiter registered or job executed), and
   a blocked Sync whose event flag was destroyed (`reason=wait`, with `rc`).
 - `stop-push-shutdown`, `stop-copy-push-shutdown`: a push parked by the test seam
   `ExecutorHooks::on_push_checked` (called on the pushing thread after the

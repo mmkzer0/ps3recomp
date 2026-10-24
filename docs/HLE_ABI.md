@@ -174,7 +174,7 @@ integral/enum/pointer/record/function-pointer, and prints:
     registered: 1158 (323 in the known NID sources, 835 by SDK export shape), excluded host-side helpers: 47
     returns: integral 1121, void 57, float 1, pointer 26
     pointer returns: 26 total = 22 registered (16 guest EA + 6 host-pointer stop) + 4 excluded (cellGame_get_hdd_title_id, cellGame_get_title, cellGame_get_title_id, cellGcm_fifo_kick_event)
-    parameters: pointer 1052, integral 1393, float 16, function-pointer 73, variadic 3, record 0, reference 0, array 0, enum 0
+    parameters: pointer 1044, integral 1405, float 16, function-pointer 73, variadic 3, record 0, reference 0, array 0, enum 0
     float parameters: 16 in 12 handlers
     more than 8 parameters: _cellSpursCreateJobQueueWithJobDescriptorPool(12), cellGcmSetZcull(12), _cellSpursCreateJobQueue(10), cellSaveDataListAutoLoad(9), cellSpursWorkloadAttributeInitialize(9)
 
@@ -185,7 +185,7 @@ integral/enum/pointer/record/function-pointer, and prints:
 | `float` (`cellAvconfExt_display_gamma`, excluded as a helper) | 1 |
 | pointer | 26 (16 guest EA + 6 host-pointer stop + 4 excluded helpers) |
 
-Parameter features: 1052 pointer, 1393 integral, 16 floating-point across 12
+Parameter features: 1044 pointer, 1405 integral, 16 floating-point across 12
 handlers, 73 function-pointer, 3 variadic, 0 struct/union by value, 0
 reference, 0 array. Five handlers exceed eight parameters
 (`_cellSpursCreateJobQueueWithJobDescriptorPool` 12, `cellGcmSetZcull` 12,

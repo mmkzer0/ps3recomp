@@ -83,7 +83,8 @@ extern "C" {
     X(JQ2_JM_CALL,              "jq2-jm-call")                                 \
     X(HLE_GUEST_RANGE,          "hle-guest-range")                             \
     /* C1: an HLE call before its module's init, firmware behaviour undefined. */ \
-    X(HLE_UNINITIALIZED,        "hle-uninitialized")
+    X(HLE_UNINITIALIZED,        "hle-uninitialized")                           \
+    X(SYNC2_SEMAPHORE_UNSUPPORTED, "sync2-semaphore-unsupported")
 
 /* A fixed underlying type in C++ makes a kind outside the list (a caller's bug,
  * which the stop still reports as "invalid-kind") a well-defined value rather
