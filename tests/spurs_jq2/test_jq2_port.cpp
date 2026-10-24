@@ -6,7 +6,8 @@
  *                             saturation, rollback (including a rollback
  *                             blocked by a Sync claim), the PM's credit against
  *                             an independent SPU-operation formulation, sext29
- *                             wrap, Port2Sync modes 0..7 and 8, AGAIN / BUSY /
+ *                             wrap, Port2Sync modes 0 and 4 (valid) against
+ *                             1, 2, 3, 5, 6, 7, 8 and above (INVAL), AGAIN / BUSY /
  *                             BAD_ARG, claim release on every path, the waiter
  *                             registration and wake protocol
  *   test_jq2_port guest       the guest binding: big-endian byte layout, bytes
@@ -291,19 +292,30 @@ void test_sync_codes()
 {
     NoWait none;
 
-    /* mode & ~7 -> BAD_ARG before anything is claimed, even on a claimed port. */
-    for (const std::uint32_t mode : {8u, 9u, 0xCu, 0x10u, 0x80000000u, 0xFFFFFFF8u}) {
+    /* Only modes 0 and 4 are valid: PPU 0x020045E8 computes mode & ~4 and
+     * returns INVAL for anything left. INVAL comes before anything is claimed,
+     * even on a claimed port, and leaves A, B and the claim byte as they were,
+     * whether or not A >= B (so a mode that is "mode 4 plus a bit" neither
+     * polls nor blocks). */
+    for (const std::uint32_t mode : {1u, 2u, 3u, 5u, 6u, 7u, 8u, 9u, 0xCu, 0x10u, 0x80000000u, 0xFFFFFFF8u,
+                                     0xFFFFFFFFu}) {
         LocalPort p = local(W(5, 0, 5, 0));
         CHECK(u32(p.sync(mode, none)) == kInval);
         CHECK(p.line().words == W(5, 0, 5, 0));
+        p = local(W(1, 0x55, 3, 0)); /* A < B: would poll or block in a valid mode */
+        ScriptedWait would_block(&p); /* answers a wait, so a wrongly accepted mode fails instead of hanging */
+        CHECK(u32(p.sync(mode, would_block)) == kInval);
+        CHECK(would_block.acquires == 0);
+        CHECK(p.line().words == W(1, 0x55, 3, 0));
         p = local(W(5, 0, 5, 0x01000000));
         CHECK(u32(p.sync(mode, none)) == kInval);
         CHECK(p.line().words == W(5, 0, 5, 0x01000000));
     }
+    CHECK(none.calls == 0);
 
-    /* Every valid mode completes when A >= B: A := A - B, B := 0, claim cleared.
-     * Modes with bit 2 set poll; the others would block; neither waits here. */
-    for (std::uint32_t mode = 0; mode < 8; ++mode) {
+    /* Both valid modes complete when A >= B: A := A - B, B := 0, claim cleared.
+     * Mode 4 polls and mode 0 would block; neither waits here. */
+    for (const std::uint32_t mode : {0u, 4u}) {
         LocalPort p = local(W(5, 0x77, 3, 0x00AABBCC));
         CHECK(p.sync(mode, none) == PortStatus::ok);
         CHECK(p.line().words == W(2, 0x77, 0, 0x00AABBCC)); /* claim byte only */
@@ -326,9 +338,9 @@ void test_sync_codes()
         CHECK(p.line().words == W(0x60000000, 4, 0, 0));
     }
 
-    /* Mode with bit 2 set: AGAIN while A < B, counters and waiter word as they
-     * were, claim released. */
-    for (const std::uint32_t mode : {4u, 5u, 6u, 7u}) {
+    /* Mode 4: AGAIN while A < B, counters and waiter word as they were, claim
+     * released. */
+    for (const std::uint32_t mode : {4u}) {
         LocalPort p = local(W(1, 0x55, 3, 0));
         CHECK(u32(p.sync(mode, none)) == kAgain);
         CHECK(p.line().words == W(1, 0x55, 3, 0));

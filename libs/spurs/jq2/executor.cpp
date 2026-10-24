@@ -74,7 +74,11 @@ constexpr std::uint32_t kFlagReaderPhase = 0x40;
 constexpr std::uint32_t kJoined = 0x20;
 
 constexpr std::uint32_t kMaxPorts = 0x400;
-constexpr unsigned kWaiterIds = 128;
+/* The firmware's PM wake passes the unreduced waiter id to helper 0x6348
+ * (via 0x0ED4), which rejects ids above 63: a waiter with a higher id would
+ * never be woken. Ids are therefore 0..63 and a 65th concurrent Sync is a
+ * named stop, not a wait for a free id. */
+constexpr unsigned kWaiterIds = 64;
 
 /* The port block's own words (the line's accounting words are port.hpp's). */
 constexpr std::uint32_t kPLink = 0x08;
@@ -421,6 +425,19 @@ public:
         if (pool_) pool_->shutdown();
     }
 
+    /* The ring write of every push, ordered against Shutdown by mu_: Shutdown
+     * sets stopping_ under mu_, and a worker leaves only after seeing stopping_
+     * with an empty ring under mu_. An entry written here under mu_ with
+     * stopping_ clear is therefore seen by a worker; nullopt means Shutdown won
+     * and the entry was not written (it would never run or be credited). The
+     * lock order is mu_, then the ring's reservation-model line lock. */
+    std::optional<PushResult> push_unless_shut(const Entry& entry)
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (stopping_) return std::nullopt;
+        return ring_push(*ring_, entry, true);
+    }
+
     void join_workers()
     {
         for (pthread_t t : threads_) pthread_join(t, nullptr);
@@ -476,25 +493,36 @@ public:
 
     unsigned acquire_waiter()
     {
-        std::unique_lock<std::mutex> lk(wait_mu_);
-        wait_cv_.wait(lk, [&] { return waiter_ids_.count() < kWaiterIds; });
-        for (unsigned id = 0; id < kWaiterIds; ++id) {
-            if (!waiter_ids_.test(id)) {
-                waiter_ids_.set(id);
-                return id;
+        {
+            std::lock_guard<std::mutex> lk(wait_mu_);
+            for (unsigned id = 0; id < kWaiterIds; ++id) {
+                if (!waiter_ids_.test(id)) {
+                    waiter_ids_.set(id);
+                    return id;
+                }
             }
         }
-        return 0; /* unreachable: count() < kWaiterIds */
+        stop_with(PS3_STOP_JQ2_WAKE, "a Port2Sync waiter id the firmware's wake cannot signal was needed",
+                  "The firmware's PM wake rejects waiter ids above 63 (helper 0x6348), so it would never wake this "
+                  "waiter; 64 Syncs are already blocked on this queue.",
+                  {hex("queue", ea_), text("reason", "waiter-id"), dec("id", kWaiterIds)});
     }
     void release_waiter(unsigned id)
     {
-        {
-            std::lock_guard<std::mutex> lk(wait_mu_);
-            waiter_ids_.reset(id);
-        }
-        wait_cv_.notify_one();
+        std::lock_guard<std::mutex> lk(wait_mu_);
+        waiter_ids_.reset(id);
     }
-    void block_on(unsigned id) { evf_wait(flag_ids_[id >> 6], std::uint64_t{1} << (id & 63u)); }
+    void block_on(unsigned id)
+    {
+        /* A failed wait (a destroyed event flag) would otherwise return to
+         * sync(), find bit 31 still set and wait again, forever. */
+        const std::int32_t rc = evf_wait(flag_ids_[id >> 6], std::uint64_t{1} << (id & 63u));
+        if (rc != 0) {
+            stop_with(PS3_STOP_JQ2_WAKE, "a blocked Port2Sync's event-flag wait failed",
+                      "The queue's event flag was destroyed or refused the wait; the waiter can never be woken.",
+                      {hex("queue", ea_), text("reason", "wait"), dec("id", id), hex("rc", static_cast<std::uint32_t>(rc))});
+        }
+    }
 
     std::mutex& port_mutex() { return port_mu_; }
 
@@ -633,7 +661,7 @@ private:
     std::mutex port_mu_; /* port slot allocation and the attached count */
 
     std::mutex wait_mu_;
-    std::condition_variable wait_cv_;
+    /* waiter_ids_: ids 0..kWaiterIds-1 in use, under wait_mu_ */
     std::bitset<kWaiterIds> waiter_ids_;
 
     PoolWake pool_wake_;
@@ -820,17 +848,22 @@ void Queue::credit(const JobStart& js)
 
 void Queue::wake(const Wakeup& w, const JobStart& js)
 {
-    if (w.kind == static_cast<std::uint32_t>(WaitKind::event_flag) && w.id < kWaiterIds) {
+    const bool event_flag = w.kind == static_cast<std::uint32_t>(WaitKind::event_flag);
+    if (event_flag && w.id < kWaiterIds) {
         evf_set(flag_ids_[w.id >> 6], std::uint64_t{1} << (w.id & 63u));
         return;
     }
+    const bool fiber = w.kind == static_cast<std::uint32_t>(WaitKind::fiber);
     stop_with(PS3_STOP_JQ2_WAKE, "a registered Port2Sync waiter cannot be woken",
-              w.kind == static_cast<std::uint32_t>(WaitKind::fiber)
-                  ? "The waiter is a fiber (wait kind 0); fibers are not modelled yet, so no HLE Port2Sync registers "
-                    "one. The port line was written by something else."
-                  : "The port line's wait kind or id is not one this executor registers; the line was written by "
-                    "something else.",
-              {hex("queue", ea_), hex("port", js.port_ea), dec("kind", w.kind), dec("id", w.id)});
+              fiber ? "The waiter is a fiber (wait kind 0); fibers are not modelled yet, so no HLE Port2Sync registers "
+                      "one. The port line was written by something else."
+              : event_flag ? "The firmware's PM wake rejects waiter ids above 63 (helper 0x6348), so it never wakes "
+                             "such a waiter; this executor registers ids 0..63 only. The port line was written by "
+                             "something else."
+                           : "The port line's wait kind is not one this executor registers; the line was written by "
+                             "something else.",
+              {hex("queue", ea_), hex("port", js.port_ea), dec("kind", w.kind), dec("id", w.id),
+               text("reason", fiber ? "fiber" : event_flag ? "waiter-id" : "wait-kind")});
 }
 
 /* ---- the registry ------------------------------------------------------- */
@@ -927,7 +960,18 @@ int bitmap_rmw(std::uint8_t* line, void* user)
 std::int32_t enqueue(Queue& q, std::uint32_t port_ea, const Entry& entry, bool accounted)
 {
     const auto write = [&]() -> std::uint32_t {
-        const PushResult r = ring_push(q.ring(), entry, true);
+        const std::optional<PushResult> pushed = q.push_unless_shut(entry);
+        if (!pushed) {
+            /* Reached by a push that passed check_push while Shutdown ran. The
+             * accounted path has already counted it in B and the copy path
+             * holds a pool slot: neither can be undone here, so it is a stop
+             * rather than a silent drop. */
+            stop_with(PS3_STOP_JQ2_STATE, "a push reached the JobQueue2 ring after Shutdown",
+                      "A push raced Shutdown: the workers may already be gone, so the entry would never run or be "
+                      "credited. Do not push to a queue that is being shut down.",
+                      {hex("queue", q.ea()), hex("port", port_ea), text("reason", "push-after-shutdown")});
+        }
+        const PushResult& r = *pushed;
         if (r.ok()) {
             q.counters().pushed.fetch_add(1);
             return 0;

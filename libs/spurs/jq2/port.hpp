@@ -50,14 +50,16 @@
  *                       is shli/rotmai (sext29), ai (+1), selb with 0x1FFFFFFF
  *                       for bits 28:0, and an andbi-masked selb for bit 31;
  *                       bits 30:29 come from the old word, they are not cleared]
- *   sync(mode, wait)    Port2Sync. mode & ~7 -> INVAL, before the port is
+ *   sync(mode, wait)    Port2Sync. Only mode 0 (block) and 4 (poll) are valid;
+ *                       every other value -> INVAL (PPU 0x020045E8, which
+ *                       tests mode & ~4), before the port is
  *                       touched. Otherwise claim (BUSY if held), then:
  *                         bit 31 of A set (a stale waiter)      -> BUSY
  *                         B > 0x0FFFFFFF                        -> INVAL
  *                         sext29(A) >= B                        -> A := A - B in
  *                                       bits 28:0 (bits 31:29 kept), OK
- *                         sext29(A) <  B, mode & 4              -> AGAIN
- *                         sext29(A) <  B, mode & 4 == 0         -> wait (below)
+ *                         sext29(A) <  B, mode 4                -> AGAIN
+ *                         sext29(A) <  B, mode 0                -> wait (below)
  *                       then, on every path, the claim byte is cleared and, on
  *                       OK only, B := 0. AGAIN, BUSY and INVAL leave A and B as
  *                       they were. Nothing else is ever returned (contract C2).
@@ -131,7 +133,7 @@ inline constexpr std::uint32_t kSubmittedMax = 0x0FFF'FFFF;
 enum class PortStatus : std::uint32_t {
     ok = 0,
     again = 0x80410A01,         /* mode 4 and A < B */
-    inval = 0x80410A02,         /* mode & ~7, or B above kSubmittedMax */
+    inval = 0x80410A02,         /* mode other than 0 and 4, or B above kSubmittedMax */
     busy = 0x80410A0A,          /* claim held, stale waiter, or B saturated */
     misaligned = 0x80410A10,    /* port EA not 128-aligned */
     null_pointer = 0x80410A11,  /* port EA 0 */
@@ -384,11 +386,13 @@ public:
         return wake;
     }
 
-    /* Port2Sync. `wait` is used only when mode & 4 == 0 and A < B. */
+    /* Port2Sync. `wait` is used only in mode 0 when A < B. */
     template <SyncWait W>
     [[nodiscard]] PortStatus sync(std::uint32_t mode, W& wait)
     {
-        if ((mode & ~std::uint32_t{7}) != 0) return PortStatus::inval;
+        /* The firmware computes mode & ~4 (PPU 0x020045E8: rlwinm r0,r4,29,1,31;
+         * rlwinm r0,r0,3,0,31; cmpwi r0,0): only 0 (block) and 4 (poll) pass. */
+        if (mode != 0 && mode != 4) return PortStatus::inval;
 
         std::uint32_t b = 0;
         PortStatus rc = PortStatus::busy;
