@@ -2891,7 +2891,10 @@ static void trace_lazy_init(void)
         }
         const char* m = getenv("SPU_TRACE_MAX");
         init = (m && *m) ? atoll(m) : 200000;
-        if (init == 0) init = -2;   /* -2 = unbounded */
+        /* 0 and every negative are unbounded. Only -2 may reach the atomic:
+         * -1 would re-elect on the next call and -3 IS the election sentinel,
+         * so a parsed value must never be published as either. */
+        if (init <= 0) init = -2;
     }
     atomic_store_explicit(&s_trace_left, init, memory_order_release);
 }
