@@ -600,10 +600,12 @@ int64_t sys_ppu_thread_exit(ppu_context* ctx)
     ppu_thread_info* t = find_thread(tid);
     if (t) {
         t->exit_status = (int64_t)status;
-        /* A non-joinable host thread frees its slot in ppu_host_thread_proc, right after the
-         * unwind below (freeing it here let a new thread take the slot while this one still ran its epilogue).
-         * The main thread (slot 0) has no such epilogue and is marked FINISHED as before. */
-        if (t->joinable || t == &g_ppu_threads[0])
+        /* Joinable threads mark FINISHED in ppu_host_thread_proc's epilogue after
+         * unwinding/returning out of the guest trampoline. Marking it here would let
+         * a concurrent sys_ppu_thread_detach free the slot while this thread still
+         * ran its epilogue. The main thread (slot 0) has no epilogue and is marked
+         * FINISHED here. */
+        if (t == &g_ppu_threads[0])
             t->state = PPU_THREAD_STATE_FINISHED;
 
 #ifdef _WIN32
@@ -753,6 +755,7 @@ int64_t sys_ppu_thread_detach(ppu_context* ctx)
             t->stack_addr = 0;
             t->stack_size = 0;
         }
+        t->joinable = 0;
         t->state = PPU_THREAD_STATE_FREE;
     } else {
         t->state = PPU_THREAD_STATE_DETACHED;
