@@ -456,8 +456,23 @@ void cellGcmSetVBlankFrequency(u32 freq);
 
 /* User command */
 void cellGcmSetUserCommand(u32 cmd);
-/* Host FIFO consumer: defer the retired command to ppu_gcm_pump. */
+/* Host FIFO consumer: queue the retired command, in retirement order and never coalesced, for
+ * ppu_gcm_pump to deliver (AM-27). gcm_user_ring_drops counts commands lost to a full ring. */
 void cellGcmQueueUserCommand(u32 cmd);
+u32  gcm_user_ring_drops(void);
+
+/* Driver events the FIFO walker retires, for C3's event comparison. `seq` counts from 1 in
+ * retirement order. The observer runs on the walker thread, inside the drain; it must not block. */
+typedef enum GcmDriverEventKind {
+    GCM_DRV_EVENT_QUEUE_FLIP   = 0,   /* GCM_DRIVER_QUEUE 0xE944; arg = display buffer id */
+    GCM_DRV_EVENT_FLIP_HEAD    = 1,   /* GCM_FLIP_HEAD 0xE924 with bit 31: the present; arg = buffer id */
+    GCM_DRV_EVENT_USER_COMMAND = 2,   /* GCM_SET_USER_COMMAND 0xEB00; arg = the command */
+    GCM_DRV_EVENT_KINDS        = 3
+} GcmDriverEventKind;
+typedef struct GcmDriverEvent { u32 kind; u32 arg; unsigned long long seq; } GcmDriverEvent;
+typedef void (*GcmDriverObserver)(const GcmDriverEvent* ev);
+void gcm_set_driver_observer(GcmDriverObserver fn);
+unsigned long long gcm_driver_event_count(u32 kind);
 
 /* Invalidate tile */
 s32 cellGcmSetInvalidateTile(u8 index);

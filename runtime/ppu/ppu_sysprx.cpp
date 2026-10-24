@@ -220,8 +220,9 @@ static void hle_cellGcmInitBody(ppu_context* ctx)
     uint32_t ioAddr  = (uint32_t)ctx->gpr[6];
     fprintf(stderr, "[HLE] _cellGcmInitBody(ctx_out=0x%08X, cmdSize=0x%X, ioSize=0x%X, ioAddr=0x%X)\n",
             ctx_out, cmdSize, ioSize, ioAddr);
-    cellGcmSetupContext(ctx_out, cmdSize, ioSize, ioAddr, gcm_guest_alloc, gcm_guest_write32);
-    ctx->gpr[3] = 0;   /* CELL_OK */
+    /* 0 = the firmware's argument validation failed (CELL_GCM_ERROR_FAILURE, 0x802100FF) */
+    ctx->gpr[3] = cellGcmSetupContext(ctx_out, cmdSize, ioSize, ioAddr, gcm_guest_alloc, gcm_guest_write32)
+                      ? 0u : 0x802100FFu;
 }
 
 /* --- sys_net offline model ---------------------------------------------

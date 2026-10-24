@@ -275,4 +275,26 @@ void ps3_stop_gcm_unmodelled(const char* func, const char* feature, const char* 
              f, sizeof f / sizeof f[0], nullptr);
 }
 
+void ps3_stop_gcm_wait_timeout(const char* func, const char* what, uint32_t offset, uint32_t value,
+                               uint32_t current, uint32_t waited_ms)
+{
+    char off_s[24], val_s[24], cur_s[24], ms_s[24];
+    std::snprintf(off_s, sizeof off_s, "0x%08X", offset);
+    std::snprintf(val_s, sizeof val_s, "0x%08X", value);
+    std::snprintf(cur_s, sizeof cur_s, "0x%08X", current);
+    std::snprintf(ms_s, sizeof ms_s, "%u", waited_ms);
+    const ps3_stop_field f[] = {
+        {"func", func ? func : "unknown"},
+        {"what", what ? what : "unknown"},
+        {"offset", off_s},
+        {"value", val_s},
+        {"current", cur_s},
+        {"waited_ms", ms_s},
+    };
+    ps3_stop(PS3_STOP_GCM_WAIT_TIMEOUT,
+             "an RSX wait stood unsatisfied past gcm.wait_timeout_ms; the agent that should end it never ran",
+             "Find the producer of the label (SPU job, driver) or raise gcm.wait_timeout_ms if the producer is only slow.",
+             f, sizeof f / sizeof f[0], nullptr);
+}
+
 } // extern "C"

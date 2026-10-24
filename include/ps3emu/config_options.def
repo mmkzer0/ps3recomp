@@ -78,6 +78,15 @@ PS3_CFG_U32(spu, dma_repeat_stop_secs, 0, 0, 86400,
     "or label for longer than any fixed deadline, and a wrong halt wedges the "
     "chain. This is a host watchdog, not PS3 hardware behaviour.")
 
+/* ---- gcm ---------------------------------------------------------------- */
+
+PS3_CFG_U32(gcm, wait_timeout_ms, 10000, 1, 3600000,
+    "How long, in milliseconds, an RSX wait may stand unsatisfied before the run stops with kind "
+    "gcm-wait-timeout: a NV406E semaphore acquire whose label never reaches the value, or the "
+    "command-context buffer-full callback waiting for the RSX to leave the next segment. The "
+    "hardware waits forever; a wait that expires here means the agent that should end it (an SPU "
+    "job writing a label, the driver, the walker) never ran. A host watchdog, not PS3 behaviour.")
+
 /* ---- video -------------------------------------------------------------- */
 
 PS3_CFG_STR(video, resolutions, "", 31, PS3_CFG_V_VIDEO_RESOLUTIONS,
