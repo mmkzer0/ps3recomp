@@ -118,8 +118,9 @@ A dump entry is one of the three shapes the event/1 producer emits, unchanged:
 {"name": "unreadable_ptr", "error": "pointer at 0x00100020 unreadable"}
 ```
 
-- `hex` is optional and, when present, holds exactly `read` bytes as lowercase
-  hex.
+- `hex` is optional and, when present, must be lowercase hex of even length
+  that decodes to exactly `read` bytes, and the SHA-256 of those bytes must
+  equal the dump's `sha256`.
 - `read <= len`; a successful dump has `len >= 1`.
 - Dump names are unique within a record.
 - An `error` dump is either `{name, error}` or `{name, ea, len, error}`;

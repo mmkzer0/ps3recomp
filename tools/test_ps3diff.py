@@ -11,6 +11,7 @@ validation catches a broken per-context order, and diff aligns per context
 and reports exactly the first divergence instead of guessing.
 """
 
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -150,11 +151,66 @@ class Convert(ToolTestCase):
 
 class Validate(ToolTestCase):
     def test_valid_schemas(self):
-        for name in ("v1-basic.ndjson", "v2-basic.ndjson", "v2-kinds.ndjson"):
+        for name in ("v1-basic.ndjson", "v1-noncanonical.ndjson",
+                     "v2-basic.ndjson", "v2-kinds.ndjson"):
             with self.subTest(name=name):
                 result = run_tool("validate", FIXTURES / name)
                 self.assert_exit(result, 0)
                 self.assertIn("valid:", result.stdout)
+
+    def test_consistent_dump_hex_and_sha_pass(self):
+        records = base_v2()
+        dump = records[0]["dumps"][0]
+        dump["hex"] = "ff00ff00ff00ff00ff00ff00ff00ff00"
+        dump["sha256"] = hashlib.sha256(bytes.fromhex(dump["hex"])).hexdigest()
+        consistent = write_records(self.path("consistent.ndjson"), records)
+        result = run_tool("validate", consistent)
+        self.assert_exit(result, 0)
+
+    def test_dump_hex_sha_mismatch_names_the_dump(self):
+        records = base_v2()
+        dump = records[0]["dumps"][0]
+        dump["hex"] = "1" + dump["hex"][1:]
+        broken = write_records(self.path("sha-mismatch.ndjson"), records)
+        result = run_tool("validate", broken)
+        self.assert_exit(result, 2)
+        self.assertIn("line 1", result.stderr)
+        self.assertIn("dumps[0].hex", result.stderr)
+        self.assertIn("'in'", result.stderr)
+        self.assertIn("seq 0", result.stderr)
+        self.assertIn("ppu:0000000001000000", result.stderr)
+        self.assertIn("not the dump's", result.stderr)
+
+    def test_dump_hex_shorter_than_read_names_the_dump(self):
+        records = base_v2()
+        dump = records[0]["dumps"][0]
+        dump["hex"] = dump["hex"][:-2]
+        broken = write_records(self.path("short-hex.ndjson"), records)
+        result = run_tool("validate", broken)
+        self.assert_exit(result, 2)
+        self.assertIn("'in'", result.stderr)
+        self.assertIn("15 bytes", result.stderr)
+        self.assertIn("read says 16", result.stderr)
+
+    def test_dump_hex_odd_length_names_the_dump(self):
+        records = base_v2()
+        dump = records[0]["dumps"][0]
+        dump["hex"] = dump["hex"][:-1]
+        broken = write_records(self.path("odd-hex.ndjson"), records)
+        result = run_tool("validate", broken)
+        self.assert_exit(result, 2)
+        self.assertIn("'in'", result.stderr)
+        self.assertIn("odd", result.stderr)
+
+    def test_dump_hex_uppercase_names_the_dump(self):
+        records = base_v2()
+        dump = records[0]["dumps"][0]
+        dump["hex"] = dump["hex"].upper()
+        broken = write_records(self.path("upper-hex.ndjson"), records)
+        result = run_tool("validate", broken)
+        self.assert_exit(result, 2)
+        self.assertIn("'in'", result.stderr)
+        self.assertIn("lowercase hex digits", result.stderr)
 
     def test_broken_ctx_seq(self):
         records = base_v2()
