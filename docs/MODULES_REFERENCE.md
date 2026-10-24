@@ -856,9 +856,18 @@ Producer-consumer pipeline framework for streaming data between PPU and SPU. Unl
   Guest priority queues are FIFO within priorities 0..3. There is no invented
   0x400-byte stack minimum in the common creation checks.
 - Fiber and scheduler attributes have their BE magic/SDK defaults; the worker
-  attribute is 0x180 bytes with SDK at +0x108. Optional settings/callback fields
-  beyond the supported defaults stop with `fiber-unsupported`, naming the
-  field, rather than being silently ignored.
+  attribute is 0x180 bytes with SDK at +0x108. Scheduler and worker-control
+  attribute handling reflects FW 4.93 `InitializeScheduler` (`0x02001CA4-0x02002000`),
+  which reads only `+0x10` autoCheckFlags (`0x02001E10`), `+0x11` debuggerSupport
+  (`0x02001E28`), and `+0x14` autoCheckFlagsIntervalUsec (`0x02001E04`); unread
+  bytes in `+0x0C..+0xFF` and `+0x100..+0x17F` are ignored. Deviation: libfiber's
+  debugger table does not exist in this HLE, so `scheduler+0x168` stays 0 and fibers
+  are not registered; this is debugger-only and not visible to guest scheduling.
+  `+0x14` is converted to timebase ticks at `scheduler+0x138` with `scheduler+0x140`
+  zeroed. If `+0x10` is non-zero, HLE stops with `fiber-unsupported reason=auto-check`
+  because periodic stack-canary checks (`0x02002C58`, `0x0200150C`) are not modelled.
+  Fiber attribute (`fiber == 1`) settings beyond defaults continue to stop with
+  `fiber-unsupported`, naming the field.
 - Guest fiber state, priority queues and lifetime links are authoritative and
   published through reservation transactions. Signal bit0x10 coalesces; a
   signal waiter uses bit0x08; notification clears waiting and sets runnable
@@ -912,6 +921,11 @@ Producer-consumer pipeline framework for streaming data between PPU and SPU. Unl
   count is32 and all32 bitmap bits are occupied, HLE retains the attempted
   count33 then stops with `fiber-unsupported field=worker-slot
   reason=worker-capacity` instead of pretending that a 33rd event bit exists.
+- **Scheduler attribute reads (`0x02001CA4-0x02002000`):** firmware reads only
+  `+0x10` (stored at `scheduler+0x148`), `+0x11` (registers scheduler in internal
+  debugger table; slot address stored at `scheduler+0x168`), and `+0x14`
+  (interval in usec converted to timebase ticks and stored as BE64 at
+  `scheduler+0x138`, zeroing `scheduler+0x140`). Unread bytes are ignored.
 
 `tests/fiber_switch` retains the scheduler regression and adds generated HLE
 imports with the real PPU indirect dispatcher: wrapped initializer results,

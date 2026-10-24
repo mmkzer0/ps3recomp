@@ -260,9 +260,15 @@ void stopped(unsigned scenario)
             std::memcpy(vm_base + CONTROL + 0x200, &state, 8);
             wr(CONTROL + 0x288, 0xFFFFFFFF);
             call(RUN, CONTROL);
-        } else {
+        } else if (scenario == 2) {
             std::memset(vm_base + MEM - 128, 0xA5, 128);
             call(ATTR_INIT, MEM - 128, 0x330000);
+        } else if (scenario == 3) {
+            call(SHUTDOWN, CONTROL);
+            call(FINALIZE, CONTROL);
+            CHECK(call(WATTR, ATTR, 0x360001) == 0);
+            vm_base[ATTR + 0x10] = 1;
+            call(INITIALIZE, CONTROL, ATTR);
         }
         _exit(1);
     }
@@ -277,6 +283,8 @@ void stopped(unsigned scenario)
     } else if (scenario == 1) {
         CHECK(output.find("field=worker-slot") != std::string::npos && output.find("reason=worker-capacity") != std::string::npos);
         CHECK((word(CONTROL + 0x200) >> 56) == 33);
+    } else if (scenario == 3) {
+        CHECK(output.find("field=+0x10") != std::string::npos && output.find("reason=auto-check") != std::string::npos);
     } else {
         for (unsigned i = 0; i < 128; ++i) CHECK(vm_base[MEM - 128 + i] == 0xA5);
     }
@@ -318,7 +326,39 @@ void attributes()
     CHECK(call(RUN, 0) == err(0x80760011) && call(RUN, CONTROL + 1) == err(0x80760010));
     CHECK(call(FINALIZE, CONTROL) == err(0x8076000F));
     CHECK(call(SHUTDOWN, CONTROL) == 0 && call(FINALIZE, CONTROL) == 0);
-    for (unsigned scenario = 0; scenario < 3; ++scenario) stopped(scenario);
+
+    /* +0x11=1 initializes OK and +0x168 stays 0 */
+    CHECK(call(WATTR, ATTR, 0x360001) == 0);
+    vm_base[ATTR + 0x11] = 1;
+    std::memset(vm_base + CONTROL + 0x168, 0xCC, 8);
+    CHECK(call(INITIALIZE, CONTROL, ATTR) == 0);
+    CHECK(word(CONTROL + 0x168) == 0);
+    CHECK(call(SHUTDOWN, CONTROL) == 0 && call(FINALIZE, CONTROL) == 0);
+
+    /* +0x14=1000 gives expected ticks at +0x138 with +0x140=0 */
+    CHECK(call(WATTR, ATTR, 0x360001) == 0);
+    wr(ATTR + 0x14, 1000);
+    std::memset(vm_base + CONTROL + 0x138, 0xCC, 16);
+    CHECK(call(INITIALIZE, CONTROL, ATTR) == 0);
+    constexpr uint64_t expected_ticks = 1000ull * 79800000ull / 1000000ull;
+    CHECK(word(CONTROL + 0x138) == expected_ticks);
+    CHECK(word(CONTROL + 0x140) == 0);
+    CHECK(call(SHUTDOWN, CONTROL) == 0 && call(FINALIZE, CONTROL) == 0);
+
+    /* garbage in unread bytes is accepted */
+    CHECK(call(WATTR, ATTR, 0x360001) == 0);
+    std::memset(vm_base + ATTR + 0x0C, 0xA5, 0x180 - 0x0C);
+    vm_base[ATTR + 0x10] = 0;
+    vm_base[ATTR + 0x11] = 1;
+    wr(ATTR + 0x14, 1000);
+    wr(ATTR + 0x108, 0x360001);
+    CHECK(call(INITIALIZE, CONTROL, ATTR) == 0);
+    CHECK(word(CONTROL + 0x138) == expected_ticks);
+    CHECK(word(CONTROL + 0x140) == 0);
+    CHECK(word(CONTROL + 0x168) == 0);
+    CHECK(call(SHUTDOWN, CONTROL) == 0 && call(FINALIZE, CONTROL) == 0);
+
+    for (unsigned scenario = 0; scenario < 4; ++scenario) stopped(scenario);
 }
 int main(int argc, char** argv)
 {
