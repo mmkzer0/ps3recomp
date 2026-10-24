@@ -36,6 +36,8 @@ static void print_options()
             std::printf("%s", ps3_cfg_ppu_vscr_nj() ? "true" : "false");
         else if (!std::strcmp(o->section, "ppu") && !std::strcmp(o->key, "opd_swap_fixup"))
             std::printf("%s", ps3_cfg_ppu_opd_swap_fixup() ? "true" : "false");
+        else if (!std::strcmp(o->section, "ppu") && !std::strcmp(o->key, "null_page"))
+            std::printf("\"%s\"", ps3_cfg_ppu_null_page());
         else if (!std::strcmp(o->section, "spu") && !std::strcmp(o->key, "dma_repeat_limit"))
             std::printf("%u", ps3_cfg_spu_dma_repeat_limit());
         else if (!std::strcmp(o->section, "spu") && !std::strcmp(o->key, "dma_repeat_stop_secs"))

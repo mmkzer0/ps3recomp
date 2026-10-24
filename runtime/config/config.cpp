@@ -243,6 +243,9 @@ std::string check_string(const Option& o, std::string& s)
                 return "expected 64 hex digits (a SHA-256), found a non-hex character";
         }
         return {};
+    case PS3_CFG_V_NULL_PAGE:
+        if (s == "stop" || s == "drop") return {};
+        return "expected \"stop\" or \"drop\", found \"" + s + "\"";
     case PS3_CFG_V_VIDEO_RESOLUTIONS: {
         /* The cellVideoOut resolution ids (libs/video/cellVideoOut.h). */
         static const unsigned kIds[] = {1, 2, 4, 5, 10, 11, 12, 13};

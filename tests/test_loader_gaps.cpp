@@ -39,6 +39,11 @@
  *                                       thread id of its own, kept for life and
  *                                       never reused, and an lwmutex one holds
  *                                       blocks the other (ownership by id)
+ *   test_loader_gaps nullread <ea> <width>   a guest load at <ea> (1/2/4/8 bytes)
+ *   test_loader_gaps nullwrite <ea> <width>  a guest store at <ea>; reports the
+ *                                       first byte of memory afterwards
+ *   test_loader_gaps nullsweep 0        a null-page store, one 0x1000 above it
+ *                                       and one far past it (ppu.null_page=drop)
  */
 #include "ppu_recomp.h"
 #include <atomic>
@@ -326,7 +331,8 @@ static int cb_stack_scenarios()
  * callbacks below call the real lwmutex handlers on their own context, so the
  * id they pass is the id the loader gave them. */
 static constexpr uint32_t CB_HOLD = 0x30030, CB_PEER = 0x30040, CB_WHO = 0x30050;
-static constexpr uint32_t LW_ATTR = 0x2000, LW_MUTEX = 0x2100;
+/* Above 0x10000: the page below it is the null page, which stops a guest load. */
+static constexpr uint32_t LW_ATTR = 0x12000, LW_MUTEX = 0x12100;
 static constexpr int32_t LW_OK = 0, LW_EBUSY = (int32_t)0x8001000A, LW_EPERM = (int32_t)0x80010009;
 static std::atomic<uint64_t> g_who[8];
 static std::atomic<int> g_holds, g_tried, g_unlocking;
@@ -513,6 +519,43 @@ int main(int argc, char** argv)
          * (0: exactly at it) re-enters ppu_guest_call_ct: the nested callback must
          * not run (cb_mark would print). */
         ctx.gpr[3] = ppu_guest_call_ct(CB_LEAVE, CB_TOC, arg, 0, 0, 0, 0, 0, 0, 0);
+    } else if (!std::strcmp(argv[1], "nullread") && argc == 4) {
+        /* A guest load of <width> bytes at <arg>. Memory behind the null page is
+         * ordinary RAM here, so a load that is let through returns the 0xAB fill. */
+        g_active_ctx = &ctx;
+        const uint32_t ea = (uint32_t)arg;
+        std::memset(vm_base + ea, 0xAB, 16);
+        switch (std::atoi(argv[3])) {
+        case 1: ctx.gpr[3] = vm_read8(ea); break;
+        case 2: ctx.gpr[3] = vm_read16(ea); break;
+        case 4: ctx.gpr[3] = vm_read32(ea); break;
+        case 8: ctx.gpr[3] = vm_read64(ea); break;
+        default: return 2;
+        }
+    } else if (!std::strcmp(argv[1], "nullwrite") && argc == 4) {
+        /* A guest store of <width> bytes of 0x5A at <arg>; reports the first byte
+         * of memory afterwards: 0xAB if the store was dropped, 0x5A if it landed. */
+        g_active_ctx = &ctx;
+        const uint32_t ea = (uint32_t)arg;
+        std::memset(vm_base + ea, 0xAB, 16);
+        switch (std::atoi(argv[3])) {
+        case 1: vm_write8(ea, 0x5A); break;
+        case 2: vm_write16(ea, 0x5A5A); break;
+        case 4: vm_write32(ea, 0x5A5A5A5Au); break;
+        case 8: vm_write64(ea, 0x5A5A5A5A5A5A5A5Aull); break;
+        default: return 2;
+        }
+        ctx.gpr[3] = vm_base[ea];
+    } else if (!std::strcmp(argv[1], "nullsweep")) {
+        /* A store into the null page, one 0x1000 above it (the memset walking up),
+         * and one far past it: under "drop" the first two are dropped and the third
+         * ends the sweep and lands. */
+        g_active_ctx = &ctx;
+        std::memset(vm_base, 0xAB, 0x4000);
+        vm_write32(0x10, 0x5A5A5A5Au);
+        vm_write32(0x1010, 0x5A5A5A5Au);
+        vm_write32(0x3000, 0x5A5A5A5Au);
+        std::printf("SWEEP 10=%02X 1010=%02X 3000=%02X\n", vm_base[0x10], vm_base[0x1010], vm_base[0x3000]);
     } else {
         return 2;
     }
