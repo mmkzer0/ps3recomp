@@ -87,7 +87,9 @@ extern "C" {
     X(SYNC2_SEMAPHORE_UNSUPPORTED, "sync2-semaphore-unsupported")            \
     X(FIBER_UNSUPPORTED,        "fiber-unsupported")                           \
     /* C2: a GCM/RESC path the firmware has and the runtime does not model. */ \
-    X(GCM_UNMODELLED,           "gcm-unmodelled")
+    X(GCM_UNMODELLED,           "gcm-unmodelled")                              \
+    /* C2: an RSX wait (a semaphore acquire, the command-context callback) that no one ended. */ \
+    X(GCM_WAIT_TIMEOUT,         "gcm-wait-timeout")
 
 /* A fixed underlying type in C++ makes a kind outside the list (a caller's bug,
  * which the stop still reports as "invalid-kind") a well-defined value rather
@@ -161,6 +163,13 @@ PS3_NORETURN void ps3_stop_hle_uninitialized(const char* func, const char* modul
  * it emitted would be a guess. Fields: func, feature, reason. */
 PS3_NORETURN void ps3_stop_gcm_unmodelled(const char* func, const char* feature,
                                           const char* reason);
+
+/* Generic helper to raise PS3_STOP_GCM_WAIT_TIMEOUT: the RSX (or the guest at a command-context
+ * segment switch) waited for something no agent produced within gcm.wait_timeout_ms. The real
+ * hardware waits forever; a bounded wait that expires means a producer is missing. Fields: func,
+ * what, offset, value, current, waited_ms. */
+PS3_NORETURN void ps3_stop_gcm_wait_timeout(const char* func, const char* what, uint32_t offset,
+                                            uint32_t value, uint32_t current, uint32_t waited_ms);
 
 /* ---- frontier ---------------------------------------------------------- */
 

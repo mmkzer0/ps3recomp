@@ -19,7 +19,8 @@ KINDS = ["identity-mismatch", "config-invalid", "unresolved-nid",
          "spu-job-jm-entry", "spu-job-dma-list", "jq2-pool-release",
          "jq2-job-end", "jq2-ring-entry", "jq2-wake", "jq2-state", "jq2-jm-call",
          "hle-guest-range", "hle-uninitialized",
-         "sync2-semaphore-unsupported", "fiber-unsupported", "gcm-unmodelled"]
+         "sync2-semaphore-unsupported", "fiber-unsupported", "gcm-unmodelled",
+         "gcm-wait-timeout"]
 
 
 def probe(*args):

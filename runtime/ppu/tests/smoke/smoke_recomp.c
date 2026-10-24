@@ -266,7 +266,10 @@ static void smoke_usleep(ppu_context* ctx, uint32_t us)
 /* One non-incrementing NV4097 method write, byte for byte what
  * runtime/host/host_posix.c's emit() produces -- except that the words are
  * stored with the lifted vm_write32, so they take the guest store path. */
-static uint32_t g_fifo_len;
+/* The command area begins 0x1000 bytes into the IO window (the default-state subroutine fills
+ * the first 0x98C): the address _cellGcmInitBody puts the context at. */
+#define SMOKE_CMD_OFFSET 0x1000u
+static uint32_t g_fifo_len = SMOKE_CMD_OFFSET;
 
 static void smoke_emit(uint32_t method, uint32_t data)
 {
@@ -495,8 +498,8 @@ void func_00010000(ppu_context* ctx)
     smoke_check((int32_t)ctx->gpr[3] == 0, "_cellGcmInitBody returned an error");
     gcm_ctx = vm_read32(SMOKE_SC_GCMCTX);
     smoke_check(gcm_ctx != 0, "_cellGcmInitBody left the context pointer null");
-    smoke_check(vm_read32(gcm_ctx + 0) == SMOKE_IO_ADDR,
-                "the GCM context does not begin at the IO address");
+    smoke_check(vm_read32(gcm_ctx + 0) == SMOKE_IO_ADDR + SMOKE_CMD_OFFSET,
+                "the GCM context does not begin at the command area (IO address + 0x1000)");
     smoke_mark(ctx, SMOKE_STEP_HLE);
 
     /* A guest thread. The entry is an OPD address, which the runtime's thread

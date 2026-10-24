@@ -28,6 +28,8 @@ static u32 s_gcm_context_ea = 0;
 #include <stdint.h>
 #include "ps3emu/log_first.h"
 #include "ps3emu/stop.h"
+#include "ps3emu/config.h"        /* gcm.wait_timeout_ms */
+#include "gcm_default_state.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -301,22 +303,126 @@ static u32 s_second_v_frequency = 0;
 static u32 s_vblank_frequency   = 0;
 
 /* User command */
+#include <stdatomic.h>
 #ifdef _WIN32
 static volatile LONG s_user_command = 0;
 #define GCM_USER_STORE(cmd) InterlockedExchange(&s_user_command, (LONG)(cmd))
-/* Pair the pending marker with its cause so a later producer cannot
- * overwrite a cause already claimed by the callback pump. */
-static volatile LONG64 s_user_pending = 0;
-#define GCM_USER_PENDING_STORE(value) InterlockedExchange64(&s_user_pending, (LONG64)(value))
-#define GCM_USER_PENDING_TAKE() ((u64)InterlockedExchange64(&s_user_pending, 0))
 #else
-#include <stdatomic.h>
 static atomic_uint s_user_command = 0;
 #define GCM_USER_STORE(cmd) atomic_store(&s_user_command, (cmd))
-static _Atomic(u64) s_user_pending = 0;
-#define GCM_USER_PENDING_STORE(value) atomic_store(&s_user_pending, (value))
-#define GCM_USER_PENDING_TAKE() atomic_exchange(&s_user_pending, 0)
 #endif
+
+/* The ordered user-command queue (AM-27). GCM_SET_USER_COMMAND (0xEB00) raises an interrupt
+ * per method; the driver's cause register would coalesce two raised before the handler runs, but
+ * a title's handler counts them (the semaphore its flip path blocks on is posted once per
+ * command), so a coalesced command parks the title. Every command is therefore kept, in the
+ * order the RSX retired it. Bounded multi-producer / single-consumer ring (Vyukov): a cell's
+ * `turn` is 2*lap while it is free for that lap's producer and 2*lap+1 once the command is
+ * written, so the zero-initialised array is a valid empty ring and no lock is taken. A full
+ * ring drops the command and counts it; `gcm_user_ring_drops` makes the loss observable. */
+#define GCM_USER_RING_SIZE 1024u
+typedef struct GcmUserCell { atomic_uint turn; u32 cmd; } GcmUserCell;
+static GcmUserCell s_user_ring[GCM_USER_RING_SIZE];
+static atomic_uint s_user_ring_tail;     /* next position to produce into */
+static atomic_uint s_user_ring_head;     /* next position to consume */
+static atomic_uint s_user_ring_drops;
+
+static void gcm_user_ring_reset(void)
+{
+    for (u32 i = 0; i < GCM_USER_RING_SIZE; i++) {
+        atomic_store(&s_user_ring[i].turn, 0u);
+        s_user_ring[i].cmd = 0;
+    }
+    atomic_store(&s_user_ring_tail, 0u);
+    atomic_store(&s_user_ring_head, 0u);
+    atomic_store(&s_user_ring_drops, 0u);
+}
+
+static int gcm_user_ring_push(u32 cmd)
+{
+    u32 pos = atomic_load_explicit(&s_user_ring_tail, memory_order_relaxed);
+    for (;;) {
+        GcmUserCell* c = &s_user_ring[pos % GCM_USER_RING_SIZE];
+        const u32 want = (pos / GCM_USER_RING_SIZE) * 2u;
+        const int diff = (int)(atomic_load_explicit(&c->turn, memory_order_acquire) - want);
+        if (diff == 0) {
+            if (atomic_compare_exchange_weak_explicit(&s_user_ring_tail, &pos, pos + 1u,
+                                                      memory_order_relaxed, memory_order_relaxed)) {
+                c->cmd = cmd;
+                atomic_store_explicit(&c->turn, want + 1u, memory_order_release);
+                return 1;
+            }
+        } else if (diff < 0) {
+            atomic_fetch_add(&s_user_ring_drops, 1u);     /* the consumer is a whole lap behind */
+            return 0;
+        } else {
+            pos = atomic_load_explicit(&s_user_ring_tail, memory_order_relaxed);
+        }
+    }
+}
+
+/* Single consumer (the pump, which serialises itself). 1 and *cmd set, or 0 when empty. */
+static int gcm_user_ring_pop(u32* cmd)
+{
+    const u32 pos = atomic_load_explicit(&s_user_ring_head, memory_order_relaxed);
+    GcmUserCell* c = &s_user_ring[pos % GCM_USER_RING_SIZE];
+    const u32 want = (pos / GCM_USER_RING_SIZE) * 2u + 1u;
+    if (atomic_load_explicit(&c->turn, memory_order_acquire) != want) return 0;
+    *cmd = c->cmd;
+    atomic_store_explicit(&c->turn, want + 1u, memory_order_release);
+    atomic_store_explicit(&s_user_ring_head, pos + 1u, memory_order_relaxed);
+    return 1;
+}
+
+/* User commands the ring has had to drop because it was full (never in a healthy run). */
+u32 gcm_user_ring_drops(void)
+{
+    return atomic_load(&s_user_ring_drops);
+}
+
+/* Driver events, in the order the RSX retires the methods (the walker is the only producer, so
+ * `seq` is a total order). C3 compares event sequences against the recorded run: one flip head
+ * per frame, every user command, queue-flip before its flip head. Counted always; an observer
+ * (one per process) sees each event as it retires. */
+static _Atomic(GcmDriverObserver) s_driver_observer;
+static atomic_ullong s_driver_event_seq;
+static atomic_ullong s_driver_event_count[GCM_DRV_EVENT_KINDS];
+
+static void gcm_driver_event(u32 kind, u32 arg)
+{
+    GcmDriverEvent ev;
+    ev.kind = kind;
+    ev.arg  = arg;
+    ev.seq  = atomic_fetch_add(&s_driver_event_seq, 1ull) + 1ull;
+    atomic_fetch_add(&s_driver_event_count[kind], 1ull);
+    GcmDriverObserver fn = atomic_load(&s_driver_observer);
+    if (fn) fn(&ev);
+}
+
+void gcm_set_driver_observer(GcmDriverObserver fn)
+{
+    atomic_store(&s_driver_observer, fn);
+}
+
+/* Events of `kind` retired since cellGcmInit; 0 for an unknown kind. */
+unsigned long long gcm_driver_event_count(u32 kind)
+{
+    return kind < GCM_DRV_EVENT_KINDS ? atomic_load(&s_driver_event_count[kind]) : 0ull;
+}
+
+/* A flip the driver has been told of (0xE944) but whose queue interrupt the PPU handler has not
+ * yet answered: the NV406E acquire on label 0x30 that follows it waits for exactly that answer. */
+static int s_drv_queue_pending;
+static unsigned long long s_acq_t0;   /* tentative: defined with the label constants below */
+
+/* New session: no event retired, no flip awaiting its handshake, no acquire standing. */
+static void gcm_driver_events_reset(void)
+{
+    atomic_store(&s_driver_event_seq, 0ull);
+    for (u32 k = 0; k < GCM_DRV_EVENT_KINDS; k++) atomic_store(&s_driver_event_count[k], 0ull);
+    s_drv_queue_pending = 0;
+    s_acq_t0 = 0;
+}
 
 /* Tile configuration (up to 15 tiles, 8 commonly used) */
 static CellGcmTileInfo s_tiles[CELL_GCM_MAX_TILE_COUNT];
@@ -353,6 +459,13 @@ static u64 gcm_report_timestamp(void)
  * pointer would be read as a guest offset and land out of bounds. */
 #define GCM_LABEL_GUEST_BASE  (VM_HLE_INJECT_BASE + 0x0000u)
 #define GCM_LABEL_STRIDE      0x10u
+/* Offsets of the labels libgcm_sys's own flip stream uses (the first reserved indexes of the
+ * window): the driver's flip-ready handshake word and the flip-done marker. */
+#define GCM_LABEL_FLIP_READY  0x30u
+#define GCM_LABEL_FLIP_DONE   0x10u
+/* The NV406E acquire the walker is stalled on: when it began, so a wait nobody ends stops. */
+static u32 s_acq_off, s_acq_val;
+static unsigned long long s_acq_t0;
 static u32 s_labels[CELL_GCM_MAX_LABEL_COUNT];
 
 /* GCM control register (put/get/ref). This MUST live in guest memory: the title
@@ -532,7 +645,8 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
     s_second_v_frequency = 0;
     s_vblank_frequency = 0;
     GCM_USER_STORE(0);
-    GCM_USER_PENDING_STORE(0);
+    gcm_user_ring_reset();
+    gcm_driver_events_reset();
 
     /* Set up the initial IO mapping for the command buffer region */
     if (ioAddress != 0 && ioSize > 0) {
@@ -564,17 +678,52 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
     return CELL_OK;
 }
 
+/* The default command buffer's segment record, as libgcm_sys builds it (FW 4.93, 0x020036D4,
+ * called from _cellGcmInitBody 0x020009A8): the IO window starts with the default-state
+ * subroutine; the command buffer proper begins 0x1000 bytes in and is cut into 32 KiB
+ * segments, the context spanning one at a time. When it fills, the buffer-full callback
+ * (0x02003AAC) flushes, JUMPs from the old `current` to the next segment and waits for the
+ * RSX to have left that segment. The last segment wraps to the second 0x400 words of the
+ * window (`wrap_start`). All sizes in words. */
+#define GCM_SEGMENT_WORDS     0x2000u    /* [0x30] */
+#define GCM_FIRST_SEG_OFFSET  0x1000u    /* bytes; the 6th argument of 0x020036D4 */
+#define GCM_WRAP_START_WORDS  0x400u     /* [0x28] */
+typedef struct GcmIb {
+    int valid;
+    u32 ctx_ea;        /* the CellGcmContextData InitBody returned */
+    u32 io_ea;         /* ioAddress */
+    u32 cmd_words;     /* [0x24]: cmdSize in words, rounded down to whole segments */
+    u32 seg_words;     /* [0x30] */
+    u32 nseg;          /* [0x34] */
+    u32 last_end;      /* [0x18]: EA of the last word of the last segment */
+    u32 first_begin_off, last_end_off;   /* [0x1C]/[0x20]: RSX offsets bounding the ring */
+} GcmIb;
+static GcmIb s_ib;
+static u32 gcm_ea2io(u32 ea);   /* defined with the wrap callback below */
+
+/* Point the default context at its first segment and reset the FIFO (0x020036D4 + sc 674). */
+static void gcm_ib_reset_context(u32 ctx)
+{
+    const u32 begin = s_ib.io_ea + GCM_FIRST_SEG_OFFSET;
+    vm_write32(ctx + 0x0, begin);
+    vm_write32(ctx + 0x4, s_ib.io_ea + s_ib.seg_words * 4u - 4u);
+    vm_write32(ctx + 0x8, begin);
+    cellGcm_syscall_set_fifo(s_ib.first_begin_off, s_ib.first_begin_off);
+}
+
 /* Reusable _cellGcmInitBody core (NID 0x15BAE46B). See cellGcmSys.h for why the
  * guest vm is injected as callbacks. The CellGcmContextData layout here is the
  * one proven in the shipping Simpsons port (begin@0/end@4/current@8/callback@C);
  * getting it wrong makes the game read `current` as the callback OPD and stall
- * in cellGcmFlush. The command buffer is the start of the game's IO region. */
+ * in cellGcmFlush.
+ *
+ * The IO window's layout is the firmware's (see GcmIb): default-state subroutine at io 0,
+ * context at io + 0x1000 over the first 32 KiB segment. Returns 0, with nothing initialised,
+ * when the firmware would fail with CELL_GCM_ERROR_FAILURE: cmdSize not a word multiple
+ * or <= 0xFFFF, cmdSize + 0x1000 > ioSize, ioSize or ioAddress not 1 MiB aligned. */
 u32 cellGcmSetupContext(u32 ctx_out_addr, u32 cmdSize, u32 ioSize, u32 ioAddress,
                         CellGcmGuestAlloc galloc, CellGcmGuestWrite32 gwrite32)
 {
-    if (cmdSize < 0x10000)
-        cmdSize = 0x10000;
-
     /* PSL1GHT's gcmInitBody passes ioAddress = 0, expecting gcm to allocate the
      * IO region itself (the official SDK has the app allocate and pass it).
      * Taking the 0 literally put the FIFO command buffer at guest address 0 --
@@ -583,30 +732,43 @@ u32 cellGcmSetupContext(u32 ctx_out_addr, u32 cmdSize, u32 ioSize, u32 ioAddress
     if (ioAddress == 0 && galloc)
         ioAddress = galloc(ioSize ? ioSize : 0x100000, 0x100000);
 
+    if (cmdSize <= 0xFFFFu || (cmdSize & 3u) != 0 || (u64)cmdSize + 0x1000u > ioSize ||
+        (ioSize & 0xFFFFFu) != 0 || (ioAddress & 0xFFFFFu) != 0)
+        return 0;
+
+    u32 cdata = galloc ? galloc(16, 16) : 0;
+    if (!cdata || !gwrite32)
+        return 0;
+
     cellGcmInit(cmdSize, ioSize, ioAddress);
 
-    u32 cmdbuf = ioAddress;                 /* FIFO lives at the IO region start */
-    u32 cdata  = galloc ? galloc(16, 16) : 0;
-    if (cdata && gwrite32) {
-        gwrite32(cdata + 0x0, cmdbuf);              /* begin   */
-        gwrite32(cdata + 0x4, cmdbuf + cmdSize);    /* end     */
-        gwrite32(cdata + 0x8, cmdbuf);              /* current */
-        /* Command-buffer-full callback: a guest OPD {func, toc} routed to
-         * hle_gcm_callback -> cellGcm_fifo_recycle. Without a real callback the
-         * ring never recycles and the FIFO wedges once `current` reaches `end`. */
-        u32 opd = galloc ? galloc(8, 8) : 0;
-        if (opd) {
-            gwrite32(opd + 0x0, GCM_FIFO_CALLBACK_SENTINEL_EA);  /* func EA */
-            gwrite32(opd + 0x4, 0);                              /* toc (unused) */
-            gwrite32(cdata + 0xC, opd);                          /* callback OPD */
-        } else {
-            gwrite32(cdata + 0xC, 0);
-        }
-        if (ctx_out_addr)
-            gwrite32(ctx_out_addr, cdata);          /* *context = &ctxdata */
-        s_gcm_ctx_out_ea = ctx_out_addr;   /* the title's gCellGcmCurrentContext */
-        s_gcm_context_ea = cdata;                   /* RSX drains commands from here */
+    /* io 0: the default-state subroutine, then (as InitBody does at 0x02000AD8) it ends in RET,
+     * which gcm_emit_default_state writes. */
+    gcm_emit_default_state(ioAddress);
+
+    s_ib.valid     = 1;
+    s_ib.ctx_ea    = cdata;
+    s_ib.io_ea     = ioAddress;
+    s_ib.seg_words = GCM_SEGMENT_WORDS;
+    s_ib.cmd_words = (cmdSize >> 2) & ~(GCM_SEGMENT_WORDS - 1u);
+    s_ib.nseg      = s_ib.cmd_words / GCM_SEGMENT_WORDS;
+    s_ib.last_end  = ioAddress + s_ib.cmd_words * 4u - 4u;
+    s_ib.first_begin_off = gcm_ea2io(ioAddress + GCM_FIRST_SEG_OFFSET);
+    s_ib.last_end_off    = gcm_ea2io(s_ib.last_end);
+
+    /* Command-buffer-full callback: a guest OPD {func, toc} routed to
+     * hle_gcm_callback -> cellGcm_fifo_recycle (the firmware's 0x02003AAC). */
+    u32 opd = galloc(8, 8);
+    gwrite32(cdata + 0xC, opd);
+    if (opd) {
+        gwrite32(opd + 0x0, GCM_FIFO_CALLBACK_SENTINEL_EA);  /* func EA */
+        gwrite32(opd + 0x4, 0);                              /* toc (unused) */
     }
+    gcm_ib_reset_context(cdata);
+    if (ctx_out_addr)
+        gwrite32(ctx_out_addr, cdata);          /* *context = &ctxdata */
+    s_gcm_ctx_out_ea = ctx_out_addr;   /* the title's gCellGcmCurrentContext */
+    s_gcm_context_ea = cdata;                   /* RSX drains commands from here */
     return cdata;
 }
 
@@ -792,7 +954,7 @@ void ppu_gcm_pump(void)
 {
     if (!GCM_PUMP_TRY_ENTER()) return;
     long p = (long)GCM_PENDING_TAKE();
-    u64 user = GCM_USER_PENDING_TAKE();
+    /* AM-27: the user commands the RSX retired, delivered below in that order */
     /* GCM_PUMP_DBG=1: how often each guest handler is actually delivered. */
     { static int d = -1; static unsigned nv, nf, calls;
       if (d < 0) d = getenv("GCM_PUMP_DBG") ? 1 : 0;
@@ -822,8 +984,7 @@ void ppu_gcm_pump(void)
             g_ps3_guest_caller(s_flip_handler_opd, 1, 0, 0, 0, 0, 0, 0, 0);
         }
     }
-    if (user) {
-        u32 cmd = (u32)user;
+    for (u32 cmd; gcm_user_ring_pop(&cmd);) {
         if (s_user_handler_opd && g_ps3_guest_caller)
             g_ps3_guest_caller(s_user_handler_opd, (uint64_t)cmd, 0, 0, 0, 0, 0, 0, 0);
     }
@@ -2107,34 +2268,35 @@ static void gcm_rsx_process_fifo_unlocked(void)
                             fprintf(stderr, "[SEMA-REL] get=0x%08X off=0x%X val=0x%08X\n", s_fifo_getoff, s_sema_offset, v); }
                     }
                     else if (m == 0x68u && vm_read32(la) != v) {
-            /* GCM_SEMA_ACQUIRE=1 makes ACQUIRE actually block, which is what
-             * the hardware does. Off by default: a title whose label nothing
-             * ever writes would wedge the drain permanently, and RELEASE on
-             * its own is the half that unblocks a waiting guest. */
-            static int blk = -1; static unsigned blk_ms;
-            if (blk < 0) { const char* e = getenv("GCM_SEMA_ACQUIRE"); blk = e ? atoi(e) : 0;
-                           const char* t = getenv("GCM_SEMA_ACQUIRE_MS"); blk_ms = t ? (unsigned)atoi(t) : 0; }
-            if (blk) {
-                /* GCM_SEMA_ACQUIRE_MS=<ms>: a bounded wait. The hardware waits
-                 * for ever; an emulated producer that never comes (a boot-time
-                 * label nobody services yet) would wedge the drain, so after
-                 * <ms> on the same acquire it is consumed and said so. inFAMOUS 2
-                 * acquires a label its SPU lighting writes each frame: waiting
-                 * here is what orders the RSX's sampling after that write. */
-                static u32 b_off, b_val; static unsigned long long b_t0;
-                extern unsigned long long ps3_ms_now(void);
-                const unsigned long long now = ps3_ms_now();
-                if (!b_t0 || b_off != s_sema_offset || b_val != v) { b_off = s_sema_offset; b_val = v; b_t0 = now; }
-                if (!blk_ms || now - b_t0 < blk_ms) {
-                    if (PS3_FT_ON() && !s_ft_sema_t0) s_ft_sema_t0 = ps3_ft_now();
-                    sem_blocked = 1; break;
-                }
-                { static int tn; if (PS3_LOG_FIRST(tn, 12))
-                    fprintf(stderr, "[SEMA] acquire off=0x%X == 0x%08X gave up after %u ms (label 0x%08X)\n",
-                            s_sema_offset, v, blk_ms, vm_read32(la)); }
-                b_t0 = 0;
-            }
-        }
+                        /* ACQUIRE stalls the RSX until the label holds the value; it consumes the
+                         * method only then. The one agent the runtime models is the driver's
+                         * answer to a queued flip: libgcm_sys's flip stream (E944, then RELEASE
+                         * label 0x30 = 0, ACQUIRE label 0x30 == 1) waits for the PPU's queue
+                         * interrupt handler to store 1 there [INFERENCE: the handler is the
+                         * driver's, and is not delivered here]. Every other label is written by a
+                         * guest agent (an SPU job, a PPU thread); if it never comes the hardware
+                         * waits for ever, so the run stops with a named stop instead of
+                         * stalling silently (gcm.wait_timeout_ms). */
+                        if (s_sema_offset == GCM_LABEL_FLIP_READY && v == 1u && s_drv_queue_pending) {
+                            s_drv_queue_pending = 0;
+                            s_acq_t0 = 0;
+                            atomic_thread_fence(memory_order_release);
+                            vm_write32(la, v);
+                        } else {
+                            extern unsigned long long ps3_ms_now(void);
+                            const unsigned long long now = ps3_ms_now();
+                            if (!s_acq_t0 || s_acq_off != s_sema_offset || s_acq_val != v) {
+                                s_acq_off = s_sema_offset; s_acq_val = v; s_acq_t0 = now;
+                            }
+                            const unsigned long long waited = now - s_acq_t0;
+                            if (waited >= ps3_cfg_gcm_wait_timeout_ms())
+                                ps3_stop_gcm_wait_timeout("cellGcm_rsx_process_fifo", "semaphore-acquire",
+                                                          s_sema_offset, v, vm_read32(la), (u32)waited);
+                            if (PS3_FT_ON() && !s_ft_sema_t0) s_ft_sema_t0 = ps3_ft_now();
+                            sem_blocked = 1; break;
+                        }
+                    }
+                    else if (m == 0x68u) s_acq_t0 = 0;                /* satisfied */
                 }
                 if (sem_blocked) { s_sema_blocked_pass = 1; break; }
                 s_fifo_getoff += 4 + count * 4;
@@ -2164,6 +2326,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                      * reading that event; its handler runs from the pump.
                      * The `continue` skips the 0xEB00 case below, so queue
                      * it for the pump here. */
+                    gcm_driver_event(GCM_DRV_EVENT_USER_COMMAND, vm_read32(dea));
                     if (s_user_handler_opd) cellGcmQueueUserCommand(vm_read32(dea));
                     continue;
                 }
@@ -2287,12 +2450,15 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * the draw-engine call above does. */
                 { const u32 mfull = (subch << 13) | m;
                 if (mfull == 0xEB00u || mfull == 0xEB04u) {
+                    gcm_driver_event(GCM_DRV_EVENT_USER_COMMAND, vm_read32(dea));
                     cellGcmQueueUserCommand(vm_read32(dea));
                 } else if (mfull == 0xE944u) {
                     /* GCM_DRIVER_QUEUE index 1 (base 0xE940): the flip the next 0xE924 shows.
                      * _cellGcmSetFlipCommand (libgcm_sys 0x02008948) writes the display buffer id
                      * here, ahead of its label handshake and `CALL 0`. */
                     s_drv_flip_queue = vm_read32(dea) & 0xFFu;
+                    s_drv_queue_pending = 1;
+                    gcm_driver_event(GCM_DRV_EVENT_QUEUE_FLIP, s_drv_flip_queue);
                 } else if (mfull == 0xE924u && (vm_read32(dea) & 0x80000000u)) {
                     /* GCM_FLIP_HEAD index 1 (base 0xE920), argument 0x8000010F as libgcm_sys writes it
                      * (bit 31 set): flip to the buffer 0xE944 queued. The same present half as the
@@ -2305,6 +2471,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                         s_flip_request_count++;
                         if (s_fifo_flips_reached != s_fifo_flips_queued) s_fifo_flips_reached++;
                     }
+                    gcm_driver_event(GCM_DRV_EVENT_FLIP_HEAD, s_drv_flip_queue);
                     drv_flip = 1;
                 } else if (mfull == 0xE920u || mfull == 0xE924u) {
                     cellGcmSetFlipCommand(vm_read32(dea) & 7u);
@@ -2407,9 +2574,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
           }
       } else burned = 0; }
 
-    /* A drain stopped on a semaphore acquire (GCM_SEMA_ACQUIRE) holds `get`
-     * on purpose: that is the wait, not a stuck walker, and the acquire's own
-     * bound (GCM_SEMA_ACQUIRE_MS) is what ends it. So is a self-JUMP park,
+    /* A drain stopped on a semaphore acquire holds `get`
+     * on purpose: that is the wait, not a stuck walker, and the stop
+     * after gcm.wait_timeout_ms is what ends it. So is a self-JUMP park,
      * which GCM_PARK_GRACE_MS ends. This counter counts drain passes, not
      * time: both stop every pass at the same `get`, so it fired a few
      * milliseconds in and resynced to put. For a park that is before the
@@ -2453,7 +2620,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
      *
      * ponytail: append the JUMP at `current` the way the SDK's own callback
      * does, rather than tracking a second copy of the ring's geometry. */
-    if (s_gcm_ctx_out_ea) {
+    if (s_gcm_ctx_out_ea && !(s_ib.valid && vm_read32(s_gcm_ctx_out_ea) == s_ib.ctx_ea)) {
         u32 ctx = vm_read32(s_gcm_ctx_out_ea);
         u32 begin = ctx ? vm_read32(ctx + 0x0) : 0;
         u32 end   = ctx ? vm_read32(ctx + 0x4) : 0;
@@ -2553,9 +2720,59 @@ static u32 gcm_ea2io(u32 ea)
     return ((u32)io_page << 20) | (ea & 0xFFFFFu);
 }
 
+/* The default command buffer's buffer-full callback (libgcm_sys 0x02003AAC; layout in GcmIb).
+ * Flush, JUMP from the old `current` to the next 32 KiB segment, move the context onto it, then
+ * wait while the RSX is still inside that segment (it would be overwritten under it) or outside
+ * the ring altogether (running the default-state subroutine at io 0). The last segment wraps to
+ * the start of the command area. The firmware sleeps in a loop for this; so does this, bounded by
+ * gcm.wait_timeout_ms (the hardware waits for ever). Runs on the guest thread; the walker is
+ * the RSX and moves `get`. */
+static void gcm_segment_switch(u32 ctx)
+{
+    extern unsigned long long ps3_ms_now(void);
+    const u32 cur = vm_read32(ctx + 0x8), end = vm_read32(ctx + 0x4);
+    const u32 cur_off = gcm_ea2io(cur);
+    if (cur_off != 0xFFFFFFFFu) {
+        atomic_thread_fence(memory_order_release);
+        vm_write32(GCM_CONTROL_GUEST_ADDR + 0, cur_off);                 /* flush: put = current */
+    }
+    u32 start, segend;
+    if (end == s_ib.last_end) {
+        start  = s_ib.io_ea + GCM_WRAP_START_WORDS * 4u;
+        segend = s_ib.io_ea + s_ib.seg_words * 4u - 4u;
+    } else {
+        start  = end + 4u;
+        segend = start + s_ib.seg_words * 4u - 4u;
+    }
+    const u32 start_off = gcm_ea2io(start), end_off = gcm_ea2io(segend);
+    vm_write32(cur, 0x20000000u | start_off);                            /* JUMP to the segment */
+    vm_write32(ctx + 0x4, segend);
+    vm_write32(ctx + 0x0, start);
+    atomic_thread_fence(memory_order_release);
+    vm_write32(ctx + 0x8, start);
+
+    const unsigned long long t0 = ps3_ms_now();
+    s_fifo_recycle_waiting = 1;
+    for (;;) {
+        const u32 get = vm_read32(GCM_CONTROL_GUEST_ADDR + 4);
+        const int in_segment = get >= start_off && get <= end_off;
+        const int outside    = get < s_ib.first_begin_off || get > s_ib.last_end_off;
+        if (!in_segment && !outside) break;
+        const unsigned long long waited = ps3_ms_now() - t0;
+        if (waited >= ps3_cfg_gcm_wait_timeout_ms()) {
+            s_fifo_recycle_waiting = 0;
+            ps3_stop_gcm_wait_timeout("gcm-segment-callback", "segment-busy", start_off, end_off,
+                                      get, (u32)waited);
+        }
+        Sleep(1);
+    }
+    s_fifo_recycle_waiting = 0;
+}
+
 void cellGcm_fifo_recycle(u32 ctx_ea)
 {
     if (!ctx_ea) return;
+    if (s_ib.valid && ctx_ea == s_ib.ctx_ea) { gcm_segment_switch(ctx_ea); return; }
     u32 begin   = vm_read32(ctx_ea + 0x0);
     u32 current = vm_read32(ctx_ea + 0x8);
     if (current <= begin) return;                       /* nothing to recycle */
@@ -2824,7 +3041,7 @@ void cellGcm_ctx_emit(u32 ctx, const u32* w, u32 n)
 }
 
 /* `_cellGcmSetFlipCommand` as libgcm_sys writes it (body 0x02008948, entry 0x02008AE0), behind
- * libresc's helper 0x02008780: a buffer id above 7 is CELL_GCM_ERROR_INVALID_VALUE (0x802100FF),
+ * libresc's helper 0x02008780: a buffer id above 7 is CELL_GCM_ERROR_FAILURE (0x802100FF),
  * else 19 words are reserved and written:
  *   GCM_DRIVER_QUEUE 0xE944 = bufferId                     (subchannel 7)
  *   NV406E 0x0060 = 0x56616661 (semaphore DMA), 0x0064 = 0x30, 0x006C = 0 (release label 0x30),
@@ -2837,7 +3054,7 @@ void cellGcm_ctx_emit(u32 ctx, const u32* w, u32 n)
 s32 cellGcm_emit_flip_command(u32 ctx, u32 bufferId)
 {
     if (bufferId > 7)
-        return CELL_GCM_ERROR_INVALID_VALUE;
+        return CELL_GCM_ERROR_FAILURE;
     const u32 w[19] = {
         0x0004E944u, bufferId,
         0x00040060u, 0x56616661u,
@@ -2904,7 +3121,8 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
      * fence release in its tail, and the title then waited for it forever. */
     const u32 begin = vm_read32(ctx), io_begin = gcm_ea2io(begin);
     const u32 cb_opd = vm_read32(ctx + 0xC);
-    const int runtime_ring = cb_opd && vm_read32(cb_opd) == GCM_FIFO_CALLBACK_SENTINEL_EA;
+    const int runtime_ring = cb_opd && vm_read32(cb_opd) == GCM_FIFO_CALLBACK_SENTINEL_EA &&
+                             !(s_ib.valid && ctx == s_ib.ctx_ea);   /* segmented: its callback switches */
     if (runtime_ring && end - (cur + 4) < GCM_FLIP_WRAP_BYTES && io_begin != 0xFFFFFFFFu &&
         s_fifo_getoff >= io_begin + GCM_RECYCLE_MARGIN) {
         vm_write32(cur + 4, 0x20000000u | io_begin);   /* JUMP -> begin */
@@ -3790,7 +4008,9 @@ void cellGcmTerminate(void)
     s_io_map_reserved = 0;
     s_default_fifo_mode = 0;
     GCM_USER_STORE(0);
-    GCM_USER_PENDING_STORE(0);
+    gcm_user_ring_reset();
+    gcm_driver_events_reset();
+    memset(&s_ib, 0, sizeof s_ib);
 
     memset(s_display_buffers, 0, sizeof(s_display_buffers));
     memset(s_display_buffer_set, 0, sizeof(s_display_buffer_set));
@@ -3910,6 +4130,11 @@ void cellGcmSetDefaultCommandBuffer(void)
     s_control.get = 0;
     s_control.ref = 0;
 
+    /* _cellGcmSetDefaultCommandBuffer (libgcm_sys 0x020038D0) re-runs the segment-record
+     * builder (0x020036D4) with the sizes cellGcmInit saved: the default context goes back to
+     * its first segment and put and get to its start. It does not touch the title's pointer
+     * to the context. */
+    if (s_ib.valid) gcm_ib_reset_context(s_ib.ctx_ea);
     /* On hardware this re-points gCellGcmCurrentContext at the default context
      * cellGcmInit built. Zeroing a host-side struct is not that: a title that
      * calls it to go back to the big default buffer stays on whatever smaller
@@ -3949,16 +4174,18 @@ void cellGcmDumpGraphicsError(void)
     printf("[cellGcmSys] DumpGraphicsError (no-op)\n");
 }
 
-/* Default command word size: 0x400 (1024) words */
+/* The default command buffer's size in words: the part of cellGcmInit's command size that is a
+ * whole number of segments (libgcm_sys 0x02003464 returns the context record's +0x24). 0 before
+ * cellGcmInit. */
 u32 cellGcmGetDefaultCommandWordSize(void)
 {
-    return 0x400;
+    return s_ib.valid ? s_ib.cmd_words : 0;
 }
 
-/* Default segment word size: 0x100 (256) words */
+/* The default segment's size in words: 0x2000 words, 32 KiB (libgcm_sys 0x02003470, +0x30). */
 u32 cellGcmGetDefaultSegmentWordSize(void)
 {
-    return 0x100;
+    return s_ib.valid ? s_ib.seg_words : 0;
 }
 
 /* Immediate flip — perform flip right now */
@@ -4008,13 +4235,13 @@ void cellGcmSetUserCommand(u32 cmd)
     GCM_USER_STORE(cmd);
 }
 
-/* Called when a FIFO consumer retires a user-interrupt method. Publishing
- * the cause and pending marker is atomic; guest code runs later in the pump.
- * Like the driver cause register, multiple pending commands coalesce. */
+/* Called when a FIFO consumer retires a user-interrupt method. The command goes onto the ordered
+ * ring (AM-27): every command is delivered, in the order the RSX retired it, never coalesced;
+ * guest code runs later in the pump. A full ring drops the command and counts it. */
 void cellGcmQueueUserCommand(u32 cmd)
 {
     GCM_USER_STORE(cmd);
-    GCM_USER_PENDING_STORE((1ULL << 32) | cmd);
+    gcm_user_ring_push(cmd);
 }
 
 /* Invalidate a tile region (unbind + clear) */

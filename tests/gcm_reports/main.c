@@ -94,7 +94,7 @@ int main(void)
     for (unsigned i = 0; i < sizeof offs / sizeof offs[0]; i++)
         for (unsigned k = 0; k < 16; k += 4) gw32(IO_ADDR + offs[i] + k, SENTINEL);
 
-    g_head = 0;
+    g_head = 0x1000;                 /* the command area starts 0x1000 into the IO window */
     emit(0x1800, (1u << 24) | LOCAL_OFF);               /* default context: local */
     emit(0x01A8, 0xFEED0001u);                           /* SET_CONTEXT_DMA_REPORT: main */
     emit(0x1800, (1u << 24) | MAIN_OFF1);

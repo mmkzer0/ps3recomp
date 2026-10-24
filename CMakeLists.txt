@@ -468,6 +468,9 @@ if(PS3RECOMP_BUILD_TESTS)
     # each report DMA context. Links the runtime like the POSIX host below.
     if(UNIX)
         add_subdirectory(tests/gcm_reports)
+        # _cellGcmInitBody's command-buffer layout, segment callback, NV406E acquire, ordered
+        # user commands.
+        add_subdirectory(tests/gcm_initbody)
         # cellResc error numbering and the VideoOut resolution-id mapper.
         add_subdirectory(tests/resc)
         # cellGcmGetTiledPitchSize against libgcm_sys's pitch table.
@@ -483,6 +486,8 @@ if(PS3RECOMP_BUILD_TESTS)
     # the runtime library, so they run the handlers a title links.
     if(UNIX)
         add_subdirectory(tests/lwsync)
+        # The HLE call observer ps3_hle_call reports to (hle_observer.h).
+        add_subdirectory(tests/hle_observer)
         # The reservation model: PPU lwarx/stwcx. against SPU GETLLAR/PUTLLC,
         # both directions, and the JQ2 port line under load.
         add_subdirectory(tests/reservation)

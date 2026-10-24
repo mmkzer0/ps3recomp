@@ -981,7 +981,7 @@ Each HLE module defines errors as `(base | local_code)`:
 | `0x80010700` | cellFs / sys_fs |
 | `0x80310700` | cellAudio |
 | `0x8002B100` | cellVideoOut |
-| `0x80210700` | cellGcmSys |
+| `0x80210000` | cellGcmSys (`0x802100FF` failure, `0x80210001`..`0x80210005`) |
 | `0x80130100` | cellNet |
 | `0x80121100` | cellPad |
 | `0x8002B000` | cellSysutil |
