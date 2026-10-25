@@ -1003,18 +1003,18 @@ PS3 error codes are 32-bit values. `CELL_OK` (0) indicates success. All error co
 
 ### Module Error Bases
 
-Each HLE module defines errors as `(base | local_code)`:
+Each HLE module defines errors as `(base | local_code)`. The bases below are an overview; `include/ps3emu/error_codes.h` and each module's header are authoritative.
 
 | Base | Module |
 |------|--------|
 | `0x80012000` | cellSysmodule |
 | `0x80010700` | cellFs / sys_fs |
 | `0x80310700` | cellAudio |
-| `0x8002B100` | cellVideoOut |
+| `0x8002B220` | cellVideoOut (`CELL_VIDEO_OUT_ERROR_NOT_IMPLEMENTED` is `0x8002B220`) |
 | `0x80210000` | cellGcmSys (`0x802100FF` failure, `0x80210001`..`0x80210005`) |
 | `0x80130100` | cellNet |
 | `0x80121100` | cellPad |
-| `0x8002B000` | cellSysutil |
+| `0x8002B100` | cellSysutil (`TYPE` `0x8002B101` to `NUM` `0x8002B104`) |
 | `0x80540000` | cellFont |
 | `0x80410700` | cellSpurs |
 | `0x80710100` | cellHttp |
