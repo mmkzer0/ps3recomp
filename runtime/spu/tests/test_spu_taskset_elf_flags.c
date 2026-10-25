@@ -1,16 +1,24 @@
 /* Synthetic taskset requeue boundary. The driver inserts the unchanged production
  * ELF parser and scheduler functions; only host dispatch is intercepted so no
- * SPU thread or original title image is required. */
+ * SPU thread or original title image is required. With a mode argument it runs
+ * one task the policy module cannot load, which ends the process in the named
+ * stop spurs-task-halt (tools/test_spu_taskset_elf_flags.py reads the PS3STOP line). */
 #include <stdint.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "ps3emu/stop.h"
+#include "memory/vm.h"
+#define SPURS_TASK_TOP    0x3000u      /* defined in spu_workload.c between the extracted functions */
+#define SPURS_TASK_BOTTOM 0x40000u
 typedef int32_t LONG;
 static LONG InterlockedExchange(volatile LONG* value, LONG replacement)
 { LONG old = *value; *value = replacement; return old; }
 static void Sleep(unsigned ms) { (void)ms; }
 uint8_t* vm_base;
+uint32_t ppu_vm_size = 0x400000;
+static int dispatch_result = 1;     /* what the host dispatch answers: 0 = no lifted program */
 uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
 static unsigned dispatches;
 static const uint8_t* dispatched_image;
@@ -23,7 +31,7 @@ void spu_coh_notify_write(uint32_t ea) { (void)ea; }
 static int spu_workload_dispatch_async(const uint8_t* image, uint32_t size, uint32_t context)
 {
     dispatches++; dispatched_image = image; dispatched_size = size;
-    dispatched_context = context; return 1;
+    dispatched_context = context; return dispatch_result;
 }
 /* Taskset2 exit-code slot: these tasksets are not registered as Taskset2,
  * where production returns without touching memory. */
@@ -57,9 +65,20 @@ static void setup(uint32_t flags, int pending)
     /* Unrelated TaskInfo metadata must survive address normalization. */
     be32(ts + 0x80, 0x11223344); be32(ts + 0x90, 0xAABBCCDD);
 }
-int main(void)
+int main(int argc, char** argv)
 {
     vm_base = calloc(1, 0x400000); if (!vm_base) return 2;
+    if (argc == 2) {
+        if (!strcmp(argv[1], "bad-elf")) { setup(1, 0); vm_base[ELF] = 0; }          /* not an ELF */
+        else if (!strcmp(argv[1], "null-elf")) { setup(7, 1); be32(vm_base + TASKSET + 0x94, 7); }  /* tag bits only */
+        else if (!strcmp(argv[1], "segment")) { setup(1, 0); be32(vm_base + ELF + 60, 0x100); }   /* PT_LOAD below 0x3000 */
+        else if (!strcmp(argv[1], "unmapped")) { setup(1, 0); be32(vm_base + TASKSET + 0x94, 0x3FFFF0); }
+        else if (!strcmp(argv[1], "no-lifted")) { setup(1, 0); dispatch_result = 0; }
+        else return 2;
+        spu_taskset_task_exited(TASKSET, 127);
+        fprintf(stderr, "FAIL: a task the policy module cannot load was left pending\n");
+        return 1;
+    }
     for (uint32_t flags = 0; flags < 8; flags++) for (int pending = 0; pending < 2; pending++) {
         setup(flags, pending); uint8_t before[48];
         memcpy(before, vm_base + TASKSET + 0x80, sizeof(before));
@@ -84,15 +103,7 @@ int main(void)
     setup(1, 0); vm_base[TASKSET + 0x10] = 0;
     spu_taskset_task_exited(TASKSET, 127);
     CHECK(dispatches == 0, "enabled task without work is not dispatched");
-    setup(1, 0); vm_base[ELF] = 0;
-    spu_taskset_task_exited(TASKSET, 127);
-    CHECK(dispatches == 0, "invalid untagged ELF is not dispatched");
-    CHECK(s_ts_run[0].running[0] == 0, "invalid ELF leaves host run table clear");
-    CHECK(vm_base[TASKSET + 0x10] == 0x80, "invalid ELF preserves ready state");
-    setup(7, 1); be32(vm_base + TASKSET + 0x94, 7);
-    spu_taskset_task_exited(TASKSET, 127);
-    CHECK(dispatches == 0, "metadata-only null ELF is not dispatched");
-    CHECK(vm_base[TASKSET + 0x20] == 0x80, "null ELF preserves pending state");
+    /* An unloadable ELF (not an ELF; a null address under the tag bits) is not here: it is a halt. */
     setup(1, 0); vm_base[TASKSET + 0x20] = 0x80; ts_running(TASKSET)[0] = 0x80;
     spu_taskset_task_exited(TASKSET, 0);
     CHECK(dispatches == 0, "exiting task is not restarted");

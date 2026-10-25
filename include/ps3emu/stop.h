@@ -116,7 +116,11 @@ extern "C" {
     /* An MFC transfer the hardware rejects (a command/alignment error). */   \
     X(SPU_MFC_ERROR,            "spu-mfc-error")                               \
     /* An in-range guest span the host could not make accessible (vm_commit). */ \
-    X(HLE_COMMIT_FAILED,        "hle-commit-failed")
+    X(HLE_COMMIT_FAILED,        "hle-commit-failed")                           \
+    /* A SPURS task the taskset policy module cannot load: the kernel halts the SPU. */ \
+    X(SPURS_TASK_HALT,          "spurs-task-halt")                             \
+    /* A SPURS task or job whose SPU program the runtime cannot run (no lifted entry). */ \
+    X(SPURS_DISPATCH_MISS,      "spurs-dispatch-miss")
 
 /* A fixed underlying type in C++ makes a kind outside the list (a caller's bug,
  * which the stop still reports as "invalid-kind") a well-defined value rather
@@ -205,6 +209,28 @@ PS3_NORETURN void ps3_stop_gcm_unmodelled(const char* func, const char* feature,
  * what, offset, value, current, waited_ms. */
 PS3_NORETURN void ps3_stop_gcm_wait_timeout(const char* func, const char* what, uint32_t offset,
                                             uint32_t value, uint32_t current, uint32_t waited_ms);
+
+/* Generic helper to raise PS3_STOP_SPURS_TASK_HALT: a SPURS task the SPU-side taskset policy module
+ * cannot load (spursTasksetLoadElf fails: a null or misaligned ELF address, not an SPU ELF, a load
+ * segment outside the task area), where the real kernel halts the SPU (RPCS3 cellSpursSpu.cpp
+ * spursTasksetLoadElf -> spursHalt). The HLE has no SPU that halts and no firmware error to return
+ * (cellSpursCreateTask validates only null and 16-byte alignment), so it stops rather than report a
+ * started task that never runs. `site` is the calling guest thread's position when the caller is on
+ * one, else NULL. Fields: api, taskset, task, elf, reason. */
+PS3_NORETURN void ps3_stop_spurs_task_halt(const char* api, uint32_t taskset_ea, uint32_t task,
+                                           uint32_t elf_ea, const char* reason,
+                                           const ps3_stop_site* site);
+
+/* Generic helper to raise PS3_STOP_SPURS_DISPATCH_MISS: a SPURS task or job whose image is a loadable
+ * SPU program that the runtime cannot dispatch (no lifted entry is registered for its fingerprint, or the
+ * host could not start the worker). The console runs the program; reporting the task started or the job
+ * done would be success for work that never ran. `task` >= 0 names a task of `owner_ea`'s taskset
+ * (fields api, taskset, task, image, size, fingerprint); `task` < 0 a job at `owner_ea` (fields api, job,
+ * image, size, fingerprint). `image_ea` is the guest EA of the image and `size` its byte count the
+ * fingerprint covers. `site` as for ps3_stop_spurs_task_halt. */
+PS3_NORETURN void ps3_stop_spurs_dispatch_miss(const char* api, uint32_t owner_ea, int32_t task,
+                                               uint32_t image_ea, uint32_t size, uint64_t fingerprint,
+                                               const ps3_stop_site* site);
 
 /* ---- frontier ---------------------------------------------------------- */
 

@@ -318,4 +318,50 @@ void ps3_stop_gcm_wait_timeout(const char* func, const char* what, uint32_t offs
              f, sizeof f / sizeof f[0], nullptr);
 }
 
+void ps3_stop_spurs_task_halt(const char* api, uint32_t taskset_ea, uint32_t task,
+                              uint32_t elf_ea, const char* reason, const ps3_stop_site* site)
+{
+    char ts_s[24], task_s[24], elf_s[24];
+    std::snprintf(ts_s, sizeof ts_s, "0x%08X", taskset_ea);
+    std::snprintf(task_s, sizeof task_s, "%u", task);
+    std::snprintf(elf_s, sizeof elf_s, "0x%08X", elf_ea);
+    const ps3_stop_field f[] = {
+        {"api", api ? api : "unknown"},
+        {"taskset", ts_s},
+        {"task", task_s},
+        {"elf", elf_s},
+        {"reason", reason ? reason : "unknown"},
+    };
+    ps3_stop(PS3_STOP_SPURS_TASK_HALT,
+             "a SPURS task's ELF cannot be loaded by the taskset policy module, which halts the SPU on the console",
+             "Pass cellSpursCreateTask a 16-byte aligned 32-bit big-endian SPU ELF whose load segments lie in the task area "
+             "(local store 0x3000..0x40000); a task whose TaskInfo.elf is 0 or not an ELF never runs on the console either.",
+             f, sizeof f / sizeof f[0], site);
+}
+
+void ps3_stop_spurs_dispatch_miss(const char* api, uint32_t owner_ea, int32_t task,
+                                  uint32_t image_ea, uint32_t size, uint64_t fingerprint,
+                                  const ps3_stop_site* site)
+{
+    char owner_s[24], task_s[24], img_s[24], size_s[24], fp_s[24];
+    std::snprintf(owner_s, sizeof owner_s, "0x%08X", owner_ea);
+    std::snprintf(task_s, sizeof task_s, "%d", task);
+    std::snprintf(img_s, sizeof img_s, "0x%08X", image_ea);
+    std::snprintf(size_s, sizeof size_s, "0x%X", size);
+    std::snprintf(fp_s, sizeof fp_s, "0x%016llX", (unsigned long long)fingerprint);
+    /* A job has no task id: leave the field out rather than print -1. */
+    ps3_stop_field f[6];
+    size_t n = 0;
+    f[n++] = {"api", api ? api : "unknown"};
+    f[n++] = {task >= 0 ? "taskset" : "job", owner_s};
+    if (task >= 0) f[n++] = {"task", task_s};
+    f[n++] = {"image", img_s};
+    f[n++] = {"size", size_s};
+    f[n++] = {"fingerprint", fp_s};
+    ps3_stop(PS3_STOP_SPURS_DISPATCH_MISS,
+             "a SPURS task or job names an SPU program the runtime has no way to run, and reporting it started or done would be success for work that never ran",
+             "Lift the SPU image and register it (spu_workload_register; SPU_DUMP_MISS=<dir> writes the unrecognised image out), or run a configuration that does not reach it.",
+             f, n, site);
+}
+
 } // extern "C"

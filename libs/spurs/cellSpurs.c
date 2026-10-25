@@ -21,6 +21,9 @@
 #include <string.h>
 #include <stdint.h>
 #include "ps3emu/log_first.h"
+#include "ps3emu/stop.h"
+#include "../../runtime/memory/vm.h"   /* vm_range_ok / vm_guest_limit: the guest arena rule */
+extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;   /* the calling guest thread, for a stop's site */
 
 /* Bridge the real (BE) taskset EA + selected taskId from CreateTask to the image-22
  * SPU dispatch (spu_workload.c), so spurs_pm_build_context can build the leaf's
@@ -993,6 +996,21 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
         return CELL_SPURS_TASK_ERROR_NULL_POINTER;
     }
 
+    /* RPCS3 _spurs::create_task (Emu/Cell/Modules/cellSpurs.cpp), the oracle for libspurs: a null ELF is
+     * CELL_SPURS_TASK_ERROR_NULL_POINTER (0x80410911), one not 16-byte aligned CELL_SPURS_TASK_ERROR_ALIGN
+     * (0x80410910), both before a task id is taken. Nothing else about the image is checked on the PPU
+     * ("TODO: Verify the ELF header is proper"); a bad image is found by the SPU-side policy module, below.
+     * The literals are the firmware's: the CELL_SPURS_TASK_ERROR_* macros of cellSpurs.h carry other
+     * numbers (the same reason the attribute and EA checks above spell them out). */
+    if (!elf_ea) {
+        fprintf(stderr, "[cellSpurs] CreateTask REJECT null elf (taskset=0x%08X)\n", taskset_ea);
+        return (s32)0x80410911u;
+    }
+    if (elf_ea & 15u) {
+        fprintf(stderr, "[cellSpurs] CreateTask REJECT unaligned elf 0x%08X (taskset=0x%08X)\n", elf_ea, taskset_ea);
+        return (s32)0x80410910u;
+    }
+
     if (!g_ydkj_real_taskset_ea) { /* real-BE init flag (native ->initialized clobbered by BE layout) */
         fprintf(stderr, "[cellSpurs] CreateTask REJECT no-init (taskset=0x%08X elf=0x%08X)\n",
                 taskset_ea, elf_ea);
@@ -1105,28 +1123,36 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
                 fflush(stderr);
             }
 
-            /* Run the task's SPU program if a lifted build is registered for it.
-             * The registry maps the task ELF (by content fingerprint) to its
-             * pre-lifted native entry; dispatch loads the ELF into a local store
-             * and runs it with the task arg in r3. INERT until the title
-             * registers its lifted SPU set: an unregistered image MISSes and
-             * returns 0, preserving the prior "track only" behaviour.
-             *
-             * NOTE: dispatch is synchronous (runs to completion inline). That
-             * suits create+join task patterns; a workload/taskset whose SPU job
-             * waits on concurrent PPU-side signals will want the async lv2
-             * SPU-thread path instead — wired when a title exercises it. */
-            if (elf) {
+            /* The SPU-side taskset policy module loads the ELF when it dispatches the task, and when the
+             * load fails it halts the SPU: RPCS3 cellSpursSpu.cpp spursTasksetDispatch, `if
+             * (spursTasksetLoadElf(...) != CELL_OK) { spu_log.error(...); spursHalt(spu); }`. The create
+             * call has already returned CELL_OK on the console, so the halt is what the guest sees; the HLE
+             * dispatches here, and an image the loader would refuse is that halt (a task that "started" and
+             * never runs is the one outcome the console never produces). A span outside guest memory is the
+             * HLE range rule's stop, not a guess about what the ELF would have been. */
+            {
+                const ps3_stop_site site = { g_active_ctx ? g_active_ctx->lr : 0u, g_active_ctx ? g_active_ctx->lr : 0u,
+                                             g_active_ctx ? g_active_ctx->thread_id : 0u };
+                if (!vm_range_ok(elf_ea, 0x34))
+                    ps3_stop_guest_range("cellSpursCreateTask", "elf", elf_ea, 0x34, vm_guest_limit());
+                size_t sz = 0;
+                const char* why = spu_task_elf_halt_reason(elf_ea, &sz);
+                if (why)
+                    ps3_stop_spurs_task_halt("cellSpursCreateTask", taskset_ea, i, elf_ea, why,
+                                             g_active_ctx ? &site : NULL);
                 /* elf/context are guest effective addresses; translate the image
                  * pointer to host memory for fingerprint+load, but keep context
                  * as the guest EA (the SPU job's DMA uses guest EAs / r3). */
                 const uint8_t* host_elf = GUEST_PTR(elf, const uint8_t*);
-                size_t sz = spu_elf_image_size(host_elf, 2u * 1024 * 1024);
-                if (sz)
-                    /* Async: SPURS tasks are persistent workers — running them
-                     * inline would block this PPU thread forever (deadlock). */
-                    spu_workload_dispatch_async(host_elf, (uint32_t)sz,
-                                                (uint32_t)(uintptr_t)context);
+                /* Async: SPURS tasks are persistent workers — running them
+                 * inline would block this PPU thread forever (deadlock). It returns 0 when no lifted
+                 * program is registered for the image (or the host could not start the worker), and the
+                 * console runs the task either way: reporting it started is success for work that never
+                 * ran, so that is a stop. */
+                if (!spu_workload_dispatch_async(host_elf, (uint32_t)sz, (uint32_t)(uintptr_t)context))
+                    ps3_stop_spurs_dispatch_miss("cellSpursCreateTask", taskset_ea, (int32_t)i, elf_ea,
+                                                 (uint32_t)sz, spu_workload_fingerprint(host_elf, sz),
+                                                 g_active_ctx ? &site : NULL);
             }
             return CELL_OK;
         }
@@ -2424,13 +2450,12 @@ static void jc_run_one_job(u32 job_ea, int idx, u32 size_desc)
       }
       _n++; }
 
-    if (!ea_bin || !size_bin || ea_bin >= 0x10000000u) {
-        static int _b = 0;
-        if (PS3_LOG_FIRST(_b, 4))
-            printf("[cellSpurs]   job[%d]: implausible binary (ea=0x%08X size=%u) -- skipped\n",
-                   idx, ea_bin, size_bin);
-        return;
-    }
+    /* A descriptor that names no binary, or one that leaves guest memory, is not a job the console's job
+     * manager skips: it has CELL_SPURS_JOB_ERROR_INVALID_BINARY for it, and the loader's rule for a malformed
+     * descriptor is a named stop (spu-job-dma-list). RPCS3 has no job-chain policy module to cite
+     * (cellSpursSpu.cpp spursJobChainEntry is a TODO). The check comes first because the dispatch below
+     * fingerprints the bytes at ea_bin. */
+    spu_job_check_binary(job_ea, ea_bin, size_bin);
     /* A jobchain job is NOT a SPURS task: Sony's jm2 stages the whole working
      * set in local store and enters the job's CRT with r3 = CellSpursJobContext2*
      * and r4 = the job descriptor, both LS pointers. Dispatching it on the task
@@ -2438,7 +2463,11 @@ static void jc_run_one_job(u32 job_ea, int idx, u32 size_desc)
      * DMA traffic at all. spu_workload_dispatch_job reproduces jm2's staging.
      * Synchronous by design: a job runs to completion, and the chain's own
      * NEXT/CALL/RET commands are what order them. */
-    spu_workload_dispatch_job(vm_base + ea_bin, size_bin, job_ea, size_desc);
+    /* It returns 0 when no lifted program is registered for the binary: the console runs the job, and the
+     * chain would go on to signal it done (jc_signal_done) and run the next one over work that never ran. */
+    if (!spu_workload_dispatch_job(vm_base + ea_bin, size_bin, job_ea, size_desc))
+        ps3_stop_spurs_dispatch_miss("jobchain", job_ea, -1, ea_bin, size_bin,
+                                     spu_workload_fingerprint(vm_base + ea_bin, size_bin), NULL);
 }
 
 /* Walk one chain's command stream. Bounded: a malformed or self-looping stream

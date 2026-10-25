@@ -183,6 +183,11 @@ int spu_run_jq2_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_ea,
 int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
                               uint32_t job_ea, uint32_t job_desc_size);
 
+/* The descriptor checks spu_run_spurs_job opens with, for a caller that reads the binary first: a job
+ * whose eaBinary or sizeBinary is 0, or whose binary leaves guest memory, is the named stop
+ * spu-job-dma-list (image -1). Returns when the binary is usable. */
+void spu_job_check_binary(uint32_t job_ea, uint32_t ea_bin, uint32_t size_bin);
+
 /* Load a 32-bit big-endian SPU ELF image into a 256 KB local store: each PT_LOAD
  * segment is copied to its p_vaddr (BSS zero-filled). Returns 1 on success and
  * writes the entry vaddr (e_entry, which may legitimately be 0) to *entry_out;
@@ -198,6 +203,14 @@ int spu_elf_load_to_ls(const uint8_t* image, size_t image_size, uint8_t* ls,
  * an SPU ELF pointer without an explicit length. `max_avail` bounds the read in
  * case the header is corrupt; returns 0 if `image` is not a valid SPU ELF. */
 size_t spu_elf_image_size(const uint8_t* image, size_t max_avail);
+
+/* Why the SPURS taskset policy module cannot load the task ELF at guest EA `elf_ea`, or NULL when it can
+ * (then *size_out is the image's size in bytes). The module's loader (RPCS3 cellSpursSpu.cpp
+ * spursTasksetLoadElf) refuses a null address, anything that does not parse as an ELF, and a PT_LOAD
+ * segment outside the task area of local store (0x3000..0x40000), and the kernel then halts the SPU. Reasons:
+ * "null-elf", "elf-outside-guest-memory", "not-an-spu-elf", "segment-outside-task-area". Reads only
+ * inside guest memory. */
+const char* spu_task_elf_halt_reason(uint32_t elf_ea, size_t* size_out);
 
 /* Dispatch a registered SPU image: fingerprint `image`, find its lifted entry,
  * load it into a fresh local store, and run it with `args_ea` in r3 (SPURS task

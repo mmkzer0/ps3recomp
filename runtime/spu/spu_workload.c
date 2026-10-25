@@ -13,6 +13,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include "ps3emu/log_first.h"
+#include "ps3emu/stop.h"
+#include "../memory/vm.h"       /* vm_range_ok / vm_guest_limit: the guest arena rule */
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -195,6 +197,41 @@ size_t spu_elf_image_size(const uint8_t* image, size_t max_avail)
 }
 
 /* ---- dispatch ---------------------------------------------------------- */
+
+/* The task area of local store the SPURS taskset policy module loads a task into (RPCS3 cellSpurs.h
+ * CELL_SPURS_TASK_TOP / CELL_SPURS_TASK_BOTTOM). */
+#define SPURS_TASK_TOP    0x3000u
+#define SPURS_TASK_BOTTOM 0x40000u
+
+const char* spu_task_elf_halt_reason(uint32_t elf_ea, size_t* size_out)
+{
+    if (!elf_ea) return "null-elf";
+    if (!vm_range_ok(elf_ea, 0x34)) return "elf-outside-guest-memory";
+    uint64_t avail = vm_guest_limit() - elf_ea;
+    if (avail > 2u * 1024 * 1024) avail = 2u * 1024 * 1024;
+    const uint8_t* image = vm_base + elf_ea;
+    const size_t sz = spu_elf_image_size(image, (size_t)avail);
+    if (!sz) return "not-an-spu-elf";
+
+    const uint32_t e_phoff = rd_be32(image + 0x1C);
+    uint16_t e_phentsize = rd_be16(image + 0x2A);
+    const uint16_t e_phnum = rd_be16(image + 0x2C);
+    if (e_phentsize < 0x20) e_phentsize = 0x20;      /* as spu_elf_load_to_ls reads them */
+    for (uint16_t k = 0; k < e_phnum; k++) {
+        const size_t po = (size_t)e_phoff + (size_t)k * e_phentsize;
+        if (po + 0x20 > sz) break;
+        const uint8_t* ph = image + po;
+        if (rd_be32(ph) != 1u /*PT_LOAD*/) continue;
+        const uint32_t p_offset = rd_be32(ph + 0x04), p_vaddr = rd_be32(ph + 0x08);
+        const uint32_t p_paddr = rd_be32(ph + 0x0C), p_filesz = rd_be32(ph + 0x10), p_memsz = rd_be32(ph + 0x14);
+        if (p_paddr >= SPURS_TASK_BOTTOM) break;     /* RPCS3 stops at the first segment placed past the area */
+        if (p_vaddr < SPURS_TASK_TOP || (uint64_t)p_vaddr + p_memsz > SPURS_TASK_BOTTOM)
+            return "segment-outside-task-area";
+        if ((uint64_t)p_offset + p_filesz > sz) return "not-an-spu-elf";
+    }
+    *size_out = sz;
+    return NULL;
+}
 
 int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
                           uint32_t args_ea)
@@ -454,6 +491,8 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
      * the lock is released (the dispatch writes guest memory itself). */
     uint32_t start_t[128], start_elf[128], start_ctx[128];
     size_t start_sz[128];
+    const char* halt_reason = NULL;      /* the first task the policy module could not load */
+    uint32_t halt_t = 0, halt_elf = 0;
     int n_start = 0;
     spu_lockline_lock();
     if (done_task < 128) {
@@ -476,9 +515,12 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
         /* TaskInfo stores ELF metadata in the low three bits. Keep those
          * guest bytes intact and use only the address for loading. */
         elf &= ~7u;
-        if (!elf) continue;
-        size_t sz = spu_elf_image_size(vm_base + elf, 2u * 1024 * 1024);
-        if (!sz) continue;
+        /* A task whose ELF the policy module cannot load halts the SPU (RPCS3 cellSpursSpu.cpp
+         * spursTasksetDispatch: `if (spursTasksetLoadElf(...) != CELL_OK) { spursHalt(spu); }`). Leaving
+         * the task pending, as this scan did, is a task that never runs and a guest that waits for it. */
+        size_t sz = 0;
+        const char* why = spu_task_elf_halt_reason(elf, &sz);
+        if (why) { halt_reason = why; halt_t = t; halt_elf = elf; break; }
         ts[0x20 + t / 8] &= (uint8_t)~m;                 /* pending -> started */
         run[t / 8] |= m;
         start_t[n_start] = t; start_elf[n_start] = elf; start_ctx[n_start] = ctx;
@@ -486,11 +528,22 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
     }
     spu_coh_notify_write(taskset_ea);
     spu_lockline_unlock();
+    if (halt_reason) {
+        s_ts_held = 0; ts_unlock();
+        ps3_stop_spurs_task_halt("taskset-restart", taskset_ea, halt_t, halt_elf, halt_reason, NULL);
+    }
     for (int i = 0; i < n_start; i++) {
         fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X "
                         "(after task %u exited)\n", start_t[i], taskset_ea, start_elf[i], done_task);
         g_ydkj_real_taskset_ea = taskset_ea; g_ydkj_real_taskid = start_t[i];
-        spu_workload_dispatch_async(vm_base + start_elf[i], (uint32_t)start_sz[i], start_ctx[i]);
+        if (!spu_workload_dispatch_async(vm_base + start_elf[i], (uint32_t)start_sz[i], start_ctx[i])) {
+            /* No lifted entry for the image (or no host thread): the task was marked running above and would
+             * never run, nor ever be started again. */
+            s_ts_held = 0; ts_unlock();
+            ps3_stop_spurs_dispatch_miss("taskset-restart", taskset_ea, (int32_t)start_t[i], start_elf[i],
+                                         (uint32_t)start_sz[i],
+                                         spu_workload_fingerprint(vm_base + start_elf[i], start_sz[i]), NULL);
+        }
     }
     s_ts_held = 0; ts_unlock();
 }

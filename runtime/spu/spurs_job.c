@@ -425,6 +425,20 @@ static uint64_t job_place_cache(const desc_view* dv, const job_dma* jd, job_mem*
     return p;
 }
 
+/* The loader's first descriptor checks, for a caller that has to read the binary before the loader runs
+ * (the job-chain walker fingerprints it to find the lifted entry): no image, no size, or an image that
+ * leaves guest memory is the same stop run_spurs_job raises, with no image id yet. */
+void spu_job_check_binary(uint32_t job_ea, uint32_t ea_bin, uint32_t size_bin)
+{
+    const job_dma jd = { job_ea, -1, 0 };
+    if (!ea_bin)
+        job_dma_stop(&jd, -1, ea_bin, size_bin, 0, 0, "eaBinary");
+    if (!size_bin)
+        job_dma_stop(&jd, -1, ea_bin, 0, 0, 0, "sizeBinary");
+    if (!guest_range_ok(ea_bin, size_bin))
+        job_dma_stop(&jd, -1, ea_bin, size_bin, 0, 0, "binary-range");
+}
+
 /* The loader. `snap` NULL reads the descriptor from guest memory at job_ea;
  * otherwise from the snap_size bytes at `snap`, with job_ea still the EA the job
  * sees as its eaJobDescriptor. `retain_ls` keeps the finished local store for
