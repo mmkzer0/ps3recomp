@@ -249,6 +249,27 @@ void ps3_stop_guest_range(const char* func, const char* arg,
              f, sizeof f / sizeof f[0], nullptr);
 }
 
+void ps3_stop_commit_failed(const char* func, const char* arg,
+                            uint64_t ea, uint64_t size, int32_t rc)
+{
+    char ea_s[24], sz_s[24], rc_s[24];
+    std::snprintf(ea_s, sizeof ea_s, "0x%llX", (unsigned long long)ea);
+    std::snprintf(sz_s, sizeof sz_s, "0x%llX", (unsigned long long)size);
+    std::snprintf(rc_s, sizeof rc_s, "0x%08X", (unsigned)rc);
+    const ps3_stop_field f[] = {
+        {"func", func ? func : "unknown"},
+        {"arg", arg ? arg : "unknown"},
+        {"ea", ea_s},
+        {"size", sz_s},
+        {"rc", rc_s},
+    };
+    ps3_stop(PS3_STOP_HLE_COMMIT_FAILED,
+             "a guest span inside guest memory could not be committed for a host access",
+             "A host fault (mprotect/VirtualAlloc); check the host's memory limits and the "
+             "arena geometry, then retry. The guest span itself was in range.",
+             f, sizeof f / sizeof f[0], nullptr);
+}
+
 void ps3_stop_hle_uninitialized(const char* func, const char* module, const char* reason)
 {
     const ps3_stop_field f[] = {

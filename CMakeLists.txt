@@ -516,6 +516,26 @@ if(PS3RECOMP_BUILD_TESTS)
     add_test(NAME sysprx_guest_range COMMAND test_sysprx_guest_range)
     set_tests_properties(sysprx_guest_range PROPERTIES LABELS "runtime;t0" TIMEOUT 60)
 
+    # sys_fs_read/sys_fs_write hand the host a guest span and the 8-byte
+    # nread/nwrite out-pointers. A span that leaves guest memory, or a size
+    # whose u64 bound the old (uint32_t) truncation lost, is a named stop
+    # (hle-guest-range) raised before the transfer; a bad fd is CELL_EBADF
+    # before any pointer is looked at. The fixture maps an arena with a
+    # PROT_NONE guard page after it, so a check that misses faults instead,
+    # and it links the real stop implementation.
+    add_executable(test_sys_fs_guest_range
+        tests/test_sys_fs_guest_range.c
+        runtime/syscalls/sys_fs.c
+        libs/filesystem/edat.c
+        runtime/diag/stop.cpp)
+    target_include_directories(test_sys_fs_guest_range PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/runtime"
+        "${CMAKE_CURRENT_SOURCE_DIR}/runtime/syscalls")
+    set_target_properties(test_sys_fs_guest_range PROPERTIES LINKER_LANGUAGE CXX)
+    add_test(NAME sys_fs_guest_range COMMAND test_sys_fs_guest_range)
+    set_tests_properties(sys_fs_guest_range PROPERTIES LABELS "runtime;t0" TIMEOUT 60)
+
     # A guest exit ends the host process while the PPU, SPU, RSX and audio host
     # threads are still running, so the runtime exits with quick_exit(): no
     # C++ static destructor runs under a live thread. The fixture pairs such a
@@ -755,6 +775,23 @@ if(PS3RECOMP_BUILD_TESTS)
             libs/system/tests/test_game_paths.c)
         ps3recomp_add_hle_check_test(hle_savedata_io
             libs/system/tests/test_savedata_io.c)
+        # cellSaveData turns the funcFile callback's fileBuf EA into a host
+        # pointer. A span that leaves guest memory is a named stop
+        # (hle-guest-range) before the pointer is formed, so this fixture
+        # links the real stop implementation instead of the abort stub the
+        # other savedata fixtures define, and runs the refused call in a child.
+        add_executable(test_savedata_filebuf_range
+            libs/system/tests/test_savedata_filebuf_range.c
+            runtime/diag/stop.cpp)
+        target_include_directories(test_savedata_filebuf_range PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/system"
+            "${CMAKE_CURRENT_SOURCE_DIR}/runtime"
+            "${CMAKE_CURRENT_SOURCE_DIR}/runtime/ppu")
+        target_compile_definitions(test_savedata_filebuf_range PRIVATE _GNU_SOURCE)
+        set_target_properties(test_savedata_filebuf_range PROPERTIES LINKER_LANGUAGE CXX)
+        add_test(NAME savedata_filebuf_range COMMAND test_savedata_filebuf_range)
+        set_tests_properties(savedata_filebuf_range PROPERTIES LABELS "hle;t0" TIMEOUT 60)
         ps3recomp_add_hle_check_test(hle_trophy_start
             libs/network/tests/test_trophy_start.c)
         ps3recomp_add_hle_check_test(hle_trophy_registration

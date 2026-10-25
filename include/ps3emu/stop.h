@@ -114,7 +114,9 @@ extern "C" {
     /* A JobQueue2 parameter combination the firmware accepts whose console behaviour is unknown. */ \
     X(JQ2_UNMODELLED,           "jq2-unmodelled")                              \
     /* An MFC transfer the hardware rejects (a command/alignment error). */   \
-    X(SPU_MFC_ERROR,            "spu-mfc-error")
+    X(SPU_MFC_ERROR,            "spu-mfc-error")                               \
+    /* An in-range guest span the host could not make accessible (vm_commit). */ \
+    X(HLE_COMMIT_FAILED,        "hle-commit-failed")
 
 /* A fixed underlying type in C++ makes a kind outside the list (a caller's bug,
  * which the stop still reports as "invalid-kind") a well-defined value rather
@@ -175,6 +177,14 @@ PS3_NORETURN void ps3_stop(ps3_stop_kind kind, const char* what,
  * Fields: func, arg, ea, size, limit. */
 PS3_NORETURN void ps3_stop_guest_range(const char* func, const char* arg,
                                        uint64_t ea, uint64_t size, uint64_t limit);
+
+/* Generic helper to raise PS3_STOP_HLE_COMMIT_FAILED: a guest span that is
+ * inside guest memory (vm_range_ok) but that the host could not make readable
+ * and writable for a host access (vm_commit: mprotect/VirtualAlloc failed), so
+ * a handler that hands it to the kernel cannot proceed. A host fault, never an
+ * error code the firmware does not return. Fields: func, arg, ea, size, rc. */
+PS3_NORETURN void ps3_stop_commit_failed(const char* func, const char* arg,
+                                         uint64_t ea, uint64_t size, int32_t rc);
 
 /* Generic helper to raise PS3_STOP_HLE_UNINITIALIZED: an HLE call made before
  * its module's init, where the firmware's behaviour is undefined (it reads or

@@ -270,6 +270,15 @@ static s32 dispatch_func_file(uint32_t func_opd, uint32_t* userdata_ea,
     out->fileOffset = vm_read32(set_ea + 32);
     out->fileSize = vm_read32(set_ea + 36);
     out->fileBufSize = vm_read32(set_ea + 40);
+    /* The funcFile callback reports fileBuf as a guest EA; process_file_op
+     * dereferences it as a host pointer in fread/fwrite (RPCS3's callback
+     * path does the same through the guest ptr). The host kernel cannot fault
+     * a reserved guest page in, so bound the whole span before forming the
+     * pointer: a span outside guest memory has no CELL_SAVEDATA_ERROR_* the
+     * firmware would return for it. */
+    if (buffer && out->fileBufSize && !vm_range_ok(buffer, out->fileBufSize))
+        ps3_stop_guest_range("cellSaveData", "fileBuf", buffer, out->fileBufSize,
+                             vm_guest_limit());
     out->fileBuf = buffer ? vm_base + buffer : NULL;
     /* fread/fwrite on fileBuf go through the kernel, which cannot fault in a
      * demand-committed guest page (see sys_fs_read). Commit it first. */

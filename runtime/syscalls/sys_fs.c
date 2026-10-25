@@ -5,6 +5,7 @@
 #include "sys_fs.h"
 #include "../../libs/filesystem/edat.h"
 #include "../memory/vm.h"
+#include "ps3emu/stop.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -55,6 +56,57 @@ static void write_be64(uint32_t addr, uint64_t val)
           ((val << 56) & 0xFF00000000000000ULL);
 #endif
     *p = val;
+}
+
+/* ---------------------------------------------------------------------------
+ * Guest buffer bounds (RPCS3 lv2/sys_fs.cpp sys_fs_read / sys_fs_write)
+ *
+ * The firmware tests and writes the out-pointer first (null -> EFAULT; null
+ * buffer, bad fd or access-mode mismatch -> *out = 0 plus the code), then the
+ * fd and mode, and only after that hands `nbytes` and the buffer to the file
+ * object, which the kernel reads or writes in place. RPCS3's
+ * file->op_read/op_write dereference the guest span the same way. Our host
+ * fread/fwrite goes through the kernel too, so the buffer span is checked
+ * after those firmware checks and before the commit and transfer.
+ * vm_range_ok is the one rule (runtime/memory/vm.h) and its 64-bit
+ * subtraction is what keeps a size near UINT64_MAX from wrapping ea + size
+ * back into the arena. A span outside guest memory has no return code the
+ * firmware would give, so it stops. The out-pointer span is checked right
+ * after its null test: the firmware's 0 store would otherwise be the first
+ * unchecked host write.
+ * -----------------------------------------------------------------------*/
+static void fs_check_span(const char* func, const char* arg, uint32_t ea, uint64_t size)
+{
+    if (!vm_range_ok(ea, size))
+        ps3_stop_guest_range(func, arg, ea, size, vm_guest_limit());
+}
+
+/* vm_commit takes a u32 size. The range check bounds a span by the arena, so
+ * at most the single arena-wide [0, 4 GiB) span does not fit in a u32: commit
+ * it in two page-aligned pieces instead of truncating the size the way the
+ * old (uint32_t)size cast did. */
+static int32_t fs_commit_span(uint32_t ea, uint64_t size)
+{
+    while (size) {
+        const uint32_t chunk = size > 0xFFFFF000ull ? 0xFFFFF000u : (uint32_t)size;
+        const int32_t rc = vm_commit(ea, chunk);
+        if (rc != CELL_OK) return rc;
+        ea += chunk;
+        size -= chunk;
+    }
+    return CELL_OK;
+}
+
+/* A commit that fails after the span was proved in-range is a host fault
+ * (mprotect/VirtualAlloc), not a guest range error, and the firmware has no
+ * code for it: stop by name rather than read into pages the host never made
+ * writable. */
+static void fs_commit_or_stop(const char* func, const char* arg, uint32_t ea, uint64_t size)
+{
+    if (!size) return;
+    const int32_t rc = fs_commit_span(ea, size);
+    if (rc != CELL_OK)
+        ps3_stop_commit_failed(func, arg, ea, size, rc);
 }
 
 /* ---------------------------------------------------------------------------
@@ -496,23 +548,53 @@ int64_t sys_fs_read(ppu_context* ctx)
     uint64_t size       = LV2_ARG_U64(ctx, 2);
     uint32_t nread_addr = LV2_ARG_PTR(ctx, 3);
 
-    int slot = fd - 3;
-    if (slot < 0 || slot >= SYS_FS_FD_MAX)
-        return (int64_t)(int32_t)CELL_EBADF;
+    /* RPCS3 lv2/sys_fs.cpp sys_fs_read, in order:
+     *   1. !nread                                   -> CELL_EFAULT
+     *   2. !buf                                     -> *nread = 0, CELL_EFAULT
+     *   3. !file, or nbytes && flags & O_WRONLY     -> *nread = 0, CELL_EBADF
+     *   4. !nbytes                                  -> *nread = 0, CELL_OK
+     * The host must touch both guest spans, so two checks are inserted: the
+     * out-pointer's 8 bytes before its first store (the 0s below would
+     * otherwise be unchecked host writes), and the buffer span after the
+     * fd/mode checks and before the commit and fread. */
+    if (nread_addr == 0)
+        return (int64_t)(int32_t)CELL_EFAULT;
+    fs_check_span("sys_fs_read", "nread", nread_addr, 8);
 
-    sys_fs_fd_info* f = &g_sys_fs_fds[slot];
-    if (!f->active || !f->fp)
-        return (int64_t)(int32_t)CELL_EBADF;
+    if (buf_addr == 0) {
+        write_be64(nread_addr, 0);
+        return (int64_t)(int32_t)CELL_EFAULT;
+    }
 
-    void* buf = vm_to_host(buf_addr);
-    long pos_before = ftell(f->fp);
+    const int slot = fd - 3;
+    sys_fs_fd_info* f = (slot >= 0 && slot < SYS_FS_FD_MAX) ? &g_sys_fs_fds[slot] : NULL;
+    if (!f || !f->active || !f->fp ||
+        (size && (f->flags & CELL_FS_O_WRONLY))) {
+        /* RPCS3 writes 0 with nread.try_write(0) (allowed to fail); the span
+         * was bounded above, so the store cannot be the one that fails. */
+        write_be64(nread_addr, 0);
+        return (int64_t)(int32_t)CELL_EBADF;
+    }
+
+    /* RPCS3: for nbytes == 0 the whole body (and the file lock test we do not
+     * model) is skipped -- only the checks above ran. */
+    if (!size) {
+        write_be64(nread_addr, 0);
+        return CELL_OK;
+    }
+
+    fs_check_span("sys_fs_read", "buf", buf_addr, size);
     /* The VM commits pages on first user-mode touch; a read the CRT hands to
      * the kernel (anything past its 4 KB buffer) into a still-reserved page
      * fails instead, and fread comes back short. GH3's Bink reader saw that
      * as a read error on every movie and never decoded a frame -- solid green
      * video. ppu_fs.cpp fs_prefault is the same fix for cellFs. */
-    if (size) vm_commit(buf_addr, (uint32_t)size);
+    fs_commit_or_stop("sys_fs_read", "buf", buf_addr, size);
+
+    void* buf = vm_to_host(buf_addr);
+    long pos_before = ftell(f->fp);
     size_t nread = fread(buf, 1, (size_t)size, f->fp);
+
 
     /* PS3_FSTRACE=<n>: every nth read, the fd and the file offset it came from.
      *
@@ -531,9 +613,7 @@ int64_t sys_fs_read(ppu_context* ctx)
                       fn, fd, pos_before, (unsigned long long)size,
                       (unsigned long long)nread); } }
 
-    if (nread_addr != 0) {
-        write_be64(nread_addr, (uint64_t)nread);
-    }
+    write_be64(nread_addr, (uint64_t)nread);
 
     /* FLOW_FSDBG: the lv2 path is what PhyreEngine titles actually use (they do
      * not go through the cellFs HLE), so PS3_FSLOG in ppu_fs.cpp never fires. */
@@ -566,28 +646,48 @@ int64_t sys_fs_write(ppu_context* ctx)
     uint64_t size         = LV2_ARG_U64(ctx, 2);
     uint32_t nwritten_addr = LV2_ARG_PTR(ctx, 3);
 
-    int slot = fd - 3;
-    if (slot < 0 || slot >= SYS_FS_FD_MAX) {
-        /* Invalid fd — pretend write succeeded (CRT stdio uses corrupted fds) */
-        if (nwritten_addr != 0)
-            write_be64(nwritten_addr, size);
+    /* RPCS3 lv2/sys_fs.cpp sys_fs_write, in order:
+     *   1. !nwrite                                  -> CELL_EFAULT
+     *   2. !buf                                     -> *nwrite = 0, CELL_EFAULT
+     *   3. !file, or nbytes && !(flags & O_ACCMODE) -> *nwrite = 0, CELL_EBADF
+     *   4. !nbytes                                  -> *nwrite = 0, CELL_OK
+     * Host policy as in sys_fs_read. This used to answer CELL_OK and report
+     * `size` for a non-file fd, telling the guest a write happened that did
+     * not (8be0c21's "pretend write succeeded"). */
+    if (nwritten_addr == 0)
+        return (int64_t)(int32_t)CELL_EFAULT;
+    fs_check_span("sys_fs_write", "nwrite", nwritten_addr, 8);
+
+    if (buf_addr == 0) {
+        write_be64(nwritten_addr, 0);
+        return (int64_t)(int32_t)CELL_EFAULT;
+    }
+
+    const int slot = fd - 3;
+    sys_fs_fd_info* f = (slot >= 0 && slot < SYS_FS_FD_MAX) ? &g_sys_fs_fds[slot] : NULL;
+    if (!f || !f->active || !f->fp ||
+        (size && !(f->flags & CELL_FS_O_ACCMODE))) {
+        /* RPCS3 writes 0 with nwrite.try_write(0) (allowed to fail); the span
+         * was bounded above, so the store cannot be the one that fails. */
+        write_be64(nwritten_addr, 0);
+        return (int64_t)(int32_t)CELL_EBADF;
+    }
+
+    /* RPCS3: for nbytes == 0 the whole body (and the file lock test we do not
+     * model) is skipped -- only the checks above ran. */
+    if (!size) {
+        write_be64(nwritten_addr, 0);
         return CELL_OK;
     }
 
-    sys_fs_fd_info* f = &g_sys_fs_fds[slot];
-    if (!f->active || !f->fp) {
-        if (nwritten_addr != 0)
-            write_be64(nwritten_addr, size);
-        return CELL_OK;
-    }
+    fs_check_span("sys_fs_write", "buf", buf_addr, size);
+    fs_commit_or_stop("sys_fs_write", "buf", buf_addr, size);
 
     const void* buf = vm_to_host(buf_addr);
     size_t nwritten = fwrite(buf, 1, (size_t)size, f->fp);
     fflush(f->fp);
 
-    if (nwritten_addr != 0) {
-        write_be64(nwritten_addr, (uint64_t)nwritten);
-    }
+    write_be64(nwritten_addr, (uint64_t)nwritten);
 
     return CELL_OK;
 }
