@@ -35,6 +35,12 @@ extern "C" {
 #define SCE_NP_TROPHY_ERROR_ABORT                   0x8055160F
 #define SCE_NP_TROPHY_ERROR_UNKNOWN                 0x805516FF
 
+/* The firmware's own values (FW 4.93 libsysutil_np_trophy; RPCS3
+ * sceNpTrophy.h at e53ac18f), for codes this header did not carry. */
+#define SCE_NP_TROPHY_ERROR_PROCESSING_ABORTED      0x8002290F
+#define SCE_NP_TROPHY_ERROR_DISC_IO                 0x8002291A
+#define SCE_NP_TROPHY_ERROR_ILLEGAL_UPDATE          0x8002292A
+
 /* ---------------------------------------------------------------------------
  * Constants
  * -----------------------------------------------------------------------*/
@@ -135,6 +141,9 @@ s32 sceNpTrophyRegisterContext(SceNpTrophyContext context,
 #define SCE_NP_TROPHY_STATUS_DATA_CORRUPT       2
 #define SCE_NP_TROPHY_STATUS_INSTALLED          3
 #define SCE_NP_TROPHY_STATUS_REQUIRES_UPDATE    4
+#define SCE_NP_TROPHY_STATUS_PROCESSING_SETUP    5
+#define SCE_NP_TROPHY_STATUS_PROCESSING_PROGRESS 6
+#define SCE_NP_TROPHY_STATUS_PROCESSING_FINALIZE 7
 #define SCE_NP_TROPHY_STATUS_PROCESSING_COMPLETE 8
 
 s32 sceNpTrophyGetRequiredDiskSpace(SceNpTrophyContext context,
@@ -168,6 +177,11 @@ s32 sceNpTrophyGetGameProgress(SceNpTrophyContext context,
 
 /* Set the trophy storage directory (defaults to "gamedata/trophies") */
 void sceNpTrophySetStoragePath(const char* path);
+
+/* Host-side: how many sceNpTrophyRegisterContext calls returned at the wait cap
+ * (trophy.register_wait_cap_vblanks) instead of after the completion was
+ * consumed. A counter for a run's report; the cap is also logged. */
+u32 sceNpTrophy_register_wait_cap_count(void);
 
 #ifdef __cplusplus
 }

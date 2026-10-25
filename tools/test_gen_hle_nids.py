@@ -79,6 +79,7 @@ HOST_HELPERS = set("""
     cellSaveData_register_ctx_handlers
     cellSaveData_set_scratch_region
     cellSysutil_pump_seen
+    cellSysutil_register_poll_hook
     cellUserInfoSelectUser_ListGet
     cellUserInfoSelectUser_ListSet
     cellVideoOut_refresh_rate
@@ -86,6 +87,7 @@ HOST_HELPERS = set("""
     cellfs_add_path_mapping
     cellfs_set_root_path
     cellfs_translate_path
+    sceNpTrophy_register_wait_cap_count
     sys_rsx_init
 """.split())
 

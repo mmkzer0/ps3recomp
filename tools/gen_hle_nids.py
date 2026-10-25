@@ -143,6 +143,10 @@ NOT_FIRMWARE_EXPORTS = {
 
     # Internal init helper called from lv2_register.c.
     "sys_rsx_init": "host-side init helper, takes a host lv2_syscall_table*",
+
+    # Counter for a run's report, read by a host (the cap-return count of
+    # sceNpTrophyRegisterContext); no title imports it.
+    "sceNpTrophy_register_wait_cap_count": "host-side counter, not a firmware export",
 }
 
 # The naming shapes the SDK does not use for an export, tested BEFORE the

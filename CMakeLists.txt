@@ -839,6 +839,7 @@ if(PS3RECOMP_BUILD_TESTS)
             libs/network/tests/test_trophy_registration.c)
         target_sources(hle_trophy_registration PRIVATE libs/system/cellSysutil.c)
         target_link_libraries(hle_trophy_registration PRIVATE Threads::Threads)
+        set_tests_properties(hle_trophy_registration PROPERTIES LABELS "hle;t0;tsan")
         ps3recomp_add_hle_check_test(hle_dialog_callbacks
             libs/system/tests/test_dialog_callbacks.c)
         target_sources(hle_dialog_callbacks PRIVATE libs/system/cellSysutil.c)

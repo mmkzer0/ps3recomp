@@ -152,6 +152,40 @@ static void drain_guest_completions(void)
     draining = 0;
 }
 
+/* Libraries whose events the firmware's peer (VSH) posts over time register a
+ * pump here instead of enqueueing everything into the batch above at once. The
+ * firmware's CheckCallback drains whatever is queued in one call (libsysutil
+ * 0x02004E98, TS-FW-PACKETREAD-opus.md A2.4); the pump models the posting side:
+ * it runs on whichever thread polls and delivers what its library has posted
+ * by then. */
+#define SYSUTIL_POLL_HOOKS_MAX 4
+static void (*s_poll_hooks[SYSUTIL_POLL_HOOKS_MAX])(void);
+
+s32 cellSysutil_register_poll_hook(void (*hook)(void))
+{
+    s32 rc = CELL_OK;
+    COMPLETION_LOCK();
+    int slot = -1;
+    for (int i = 0; i < SYSUTIL_POLL_HOOKS_MAX; i++) {
+        if (s_poll_hooks[i] == hook) { slot = i; break; }
+        if (!s_poll_hooks[i] && slot < 0) slot = i;
+    }
+    if (slot < 0) rc = (s32)CELL_ENOMEM;
+    else s_poll_hooks[slot] = hook;
+    COMPLETION_UNLOCK();
+    return rc;
+}
+
+static void run_poll_hooks(void)
+{
+    void (*hooks[SYSUTIL_POLL_HOOKS_MAX])(void);
+    COMPLETION_LOCK();
+    memcpy(hooks, s_poll_hooks, sizeof(hooks));
+    COMPLETION_UNLOCK();
+    for (int i = 0; i < SYSUTIL_POLL_HOOKS_MAX; i++)
+        if (hooks[i]) hooks[i]();
+}
+
 static s32 s_bgm_enabled = 1;
 static s32 s_bgm_status = CELL_SYSUTIL_BGMPLAYBACK_STATUS_STOP;
 static char s_cache_path[CELL_SYSCACHE_PATH_MAX];
@@ -226,6 +260,7 @@ s32 cellSysutilCheckCallback(void)
      * same poll delivers them. A no-op when no psnr server is configured. */
     { extern void np_psnr_pump(void); np_psnr_pump(); }
     drain_guest_completions();
+    run_poll_hooks();
     /* No cellMsgDialog_pump() here: #155 replaced that mechanism with
      * drain_guest_completions() above, deferring a dialog answer to this poll
      * instead of pumping it separately. #156 branched before #155 landed, so its

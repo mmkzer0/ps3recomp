@@ -81,6 +81,7 @@ def test_defaults_without_file_or_environment():
         "spu.dma_repeat_limit": ("256", "default"),
         "spu.dma_repeat_stop_secs": ("0", "default"),
         "gcm.wait_timeout_ms": ("10000", "default"),
+        "trophy.register_wait_cap_vblanks": ("1024", "default"),
         "video.resolutions": ('""', "default"),
         "title.elf_sha256": ('""', "default"),
         "diag.dump_config": ("false", "default"),
@@ -147,6 +148,7 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
             "spu.dma_repeat_limit": "default",
             "spu.dma_repeat_stop_secs": "default",
             "gcm.wait_timeout_ms": "default",
+            "trophy.register_wait_cap_vblanks": "default",
             "video.resolutions": "default",
             "title.elf_sha256": "env:PS3RECOMP_TITLE_ELF_SHA256",
             "diag.dump_config": "env:PS3RECOMP_DIAG_DUMP_CONFIG",
@@ -161,6 +163,7 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
                            "ppu": {"vscr_nj": False, "opd_swap_fixup": False, "null_page": "stop"},
                            "spu": {"dma_repeat_limit": 256, "dma_repeat_stop_secs": 0},
                            "gcm": {"wait_timeout_ms": 10000},
+                           "trophy": {"register_wait_cap_vblanks": 1024},
                            "video": {"resolutions": ""},
                            "title": {"elf_sha256": SHA_A}, "diag": {"dump_config": False}}, doc
 

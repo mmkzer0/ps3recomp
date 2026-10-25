@@ -12,6 +12,7 @@
 #include "../system/cellSysutil.h"
 #include "ps3emu/guest_call.h"
 #include "ps3emu/stop.h"
+#include "ps3emu/config.h"   /* trophy.register_pump_timeout_ms */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,13 +24,25 @@
 /* HLE args arrive as guest effective addresses; translate before deref. */
 #define GUEST_PTR(p, T) ((T)((p) ? (void*)(vm_base + (uint32_t)(uintptr_t)(p)) : (void*)0))
 
+/* The guest-call bridge that returns r3 (runtime/ppu/ppu_loader.cpp). The
+ * g_ps3_guest_caller hook is void and the firmware's inline status callback
+ * is judged by its return value, so that one call goes through this; same
+ * precedent as sys_spu_printf.c. */
+extern u64 ppu_guest_call(u32 opd_addr,
+                          u64 a0, u64 a1, u64 a2, u64 a3,
+                          u64 a4, u64 a5, u64 a6, u64 a7);
+
+#include <errno.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 #ifdef _WIN32
 #include <direct.h>
 #include <io.h>
+#include <windows.h>
 #define mkdir_p(path) _mkdir(path)
 #define PATH_SEP '\\'
 #else
-#include <sys/stat.h>
+#include <pthread.h>
 #include <unistd.h>
 #define mkdir_p(path) mkdir(path, 0755)
 #define PATH_SEP '/'
@@ -63,6 +76,21 @@ typedef struct {
     u8                       unlocked[SCE_NP_TROPHY_MAX_NUM_TROPHIES];
     u64                      unlock_time[SCE_NP_TROPHY_MAX_NUM_TROPHIES];
     u32                      total_trophies;
+    /* Registration lifecycle, guarded by s_life_lock. life_serial is non-zero
+     * while the lifecycle is owned by this context; destroying or re-registering
+     * the context zeroes or replaces it, which cancels the rest. v0 is the
+     * vblank it started at, posted how many statuses the "VSH" has queued,
+     * delivered how many a poll has run. complete_seen/complete_v mark the
+     * completion's consumption. */
+    u64                      life_serial;
+    u32                      life_cb;
+    u32                      life_arg;
+    u32                      life_v0;
+    u32                      life_posted;
+    u32                      life_delivered;
+    int                      life_complete_seen;
+    u32                      life_complete_v;
+    u64                      life_complete_poll;
 } TrophyContext;
 
 typedef struct {
@@ -72,6 +100,71 @@ typedef struct {
 /* ID zero is the firmware invalid sentinel; retain all four usable slots. */
 static TrophyContext s_contexts[SCE_NP_TROPHY_MAX_CONTEXTS + 1];
 static TrophyHandle  s_handles[SCE_NP_TROPHY_MAX_HANDLES + 1];
+
+/* ---------------------------------------------------------------------------
+ * Registration lifecycle: synchronisation
+ *
+ * sceNpTrophyRegisterContext blocks on the registration thread while the
+ * status events are delivered by whichever thread calls
+ * cellSysutilCheckCallback, so the lifecycle fields are shared across guest
+ * threads. They live behind one lock and one condition variable; the lock is
+ * never held across a guest callback or a sleep (the condition wait releases
+ * it). The rest of this module is not guarded and is not made to be.
+ * -----------------------------------------------------------------------*/
+
+#ifdef _WIN32
+static SRWLOCK s_life_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE s_life_cv = CONDITION_VARIABLE_INIT;
+typedef DWORD trophy_tid;
+static trophy_tid trophy_self(void) { return GetCurrentThreadId(); }
+static int trophy_tid_eq(trophy_tid a, trophy_tid b) { return a == b; }
+static void life_lock(void)   { AcquireSRWLockExclusive(&s_life_lock); }
+static void life_unlock(void) { ReleaseSRWLockExclusive(&s_life_lock); }
+static void life_wake(void)   { WakeAllConditionVariable(&s_life_cv); }
+static void life_wait(u64 us)
+{
+    DWORD ms = (DWORD)((us + 999) / 1000);
+    SleepConditionVariableSRW(&s_life_cv, &s_life_lock, ms ? ms : 1, 0);
+}
+static u64 trophy_clock_real(void)
+{
+    LARGE_INTEGER f, c;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (u64)(c.QuadPart / f.QuadPart) * 1000000u +
+           (u64)(c.QuadPart % f.QuadPart) * 1000000u / (u64)f.QuadPart;
+}
+#else
+static pthread_mutex_t s_life_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  s_life_cv   = PTHREAD_COND_INITIALIZER;
+typedef pthread_t trophy_tid;
+static trophy_tid trophy_self(void) { return pthread_self(); }
+static int trophy_tid_eq(trophy_tid a, trophy_tid b) { return pthread_equal(a, b); }
+static void life_lock(void)   { pthread_mutex_lock(&s_life_lock); }
+static void life_unlock(void) { pthread_mutex_unlock(&s_life_lock); }
+static void life_wake(void)   { pthread_cond_broadcast(&s_life_cv); }
+static void life_wait(u64 us)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec  += (time_t)(us / 1000000u);
+    ts.tv_nsec += (long)(us % 1000000u) * 1000;
+    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+    pthread_cond_timedwait(&s_life_cv, &s_life_lock, &ts);
+}
+static u64 trophy_clock_real(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (u64)ts.tv_sec * 1000000u + (u64)ts.tv_nsec / 1000u;
+}
+#endif
+
+static u64       s_life_next_serial = 1;
+static u32       s_register_wait_caps;   /* RegisterContext calls that returned at the cap */
+static int       s_life_delivering;      /* a status callback is running */
+static trophy_tid s_life_deliverer;      /* ... on this thread */
+static u64       s_life_polls;           /* polls that began with no callback running */
 
 /* ---------------------------------------------------------------------------
  * Persistent storage helpers
@@ -104,7 +197,7 @@ static void trophy_get_filepath(const SceNpCommunicationId* commId,
     snprintf(buf, bufsize, "%s/%s.json", s_storage_path, commId->data);
 }
 
-static void trophy_save(TrophyContext* ctx)
+static int trophy_save(TrophyContext* ctx)
 {
     char filepath[1024];
     FILE* fp;
@@ -117,7 +210,7 @@ static void trophy_save(TrophyContext* ctx)
     if (!fp) {
         printf("[sceNpTrophy] WARNING: Could not save trophies to %s\n",
                filepath);
-        return;
+        return -1;
     }
 
     fprintf(fp, "{\n  \"trophies\": [");
@@ -130,7 +223,7 @@ static void trophy_save(TrophyContext* ctx)
         }
     }
     fprintf(fp, "\n  ]\n}\n");
-    fclose(fp);
+    return fclose(fp) ? -1 : 0;
 }
 
 static void trophy_load(TrophyContext* ctx)
@@ -180,6 +273,301 @@ static u32 trophy_count_unlocked(TrophyContext* ctx)
     return count;
 }
 
+/* The trophy installation state, from what the toolkit keeps: the store file
+ * written for the community id. RPCS3 sceNpTrophy.cpp
+ * sceNpTrophyRegisterContext/GetRequiredDiskSpace take it from the existence
+ * of the installed trophy directory; the firmware leaves it to the VSH
+ * (FW 4.93 libsysutil_np_trophy RegisterContext 0x02001614, status of the
+ * first reply). A store path that exists but cannot be classified (not a
+ * regular file, unreadable directory) leaves the state unknown: refuse
+ * instead of guessing INSTALLED. */
+static int trophy_install_state(const SceNpCommunicationId* commId, u32* status)
+{
+    char filepath[1024];
+    struct stat st;
+
+    trophy_get_filepath(commId, filepath, sizeof(filepath));
+    if (stat(filepath, &st) == 0) {
+        if ((st.st_mode & S_IFMT) == S_IFREG) {
+            *status = SCE_NP_TROPHY_STATUS_INSTALLED;
+            return 0;
+        }
+        printf("[sceNpTrophy] trophy store %s is not a regular file\n", filepath);
+        return -1;
+    }
+    if (errno == ENOENT) {
+        *status = SCE_NP_TROPHY_STATUS_NOT_INSTALLED;
+        return 0;
+    }
+    printf("[sceNpTrophy] cannot establish the install state of %s (errno %d)\n",
+           filepath, errno);
+    return -1;
+}
+
+/* ---------------------------------------------------------------------------
+ * Registration lifecycle
+ *
+ * Provenance of each part:
+ *  - FW 4.93 libsysutil_np_trophy / libsysutil, as lifted in
+ *    TS-FW-PACKETREAD-opus.md (A2, A3): RegisterContext blocks in its second
+ *    round trip to the VSH (0x02001614..0x02001B68; the wait loop
+ *    0x02003F30..0x02003F58 calls only cellSysutilPacketRead, which sleeps on
+ *    a condition variable the VSH signals and never runs a dispatcher). The
+ *    VSH posts the status events to the process's sysutil event queue
+ *    (capacity 127) as id 299, data2 = ctx<<32|status, data3 =
+ *    completed<<32|total. They run only inside cellSysutilCheckCallback, on
+ *    whichever thread calls it, which drains everything posted so far in one
+ *    call (0x02004E98); the dispatcher (0x020005E4 -> 0x0200049C) calls
+ *    cb(ctx, status, completed, total, arg) and discards its return value.
+ *    Never on the blocked thread. A call made on the thread that pumps does
+ *    not deadlock: the wait does not depend on a poll, the events wait in the
+ *    queue.
+ *  - RPCS3-oracle (sceNpTrophy.cpp sceNpTrophyRegisterContext, pinned
+ *    e53ac18f): the sequence and the completed/total counts. The firmware
+ *    does not show them (they are VSH-side): SETUP 0..3 of 3, PROGRESS
+ *    0..N-1 of N-1, FINALIZE 0..max(N-1,9)-5 of the same, COMPLETE 0 of 0,
+ *    N the trophy count; one event queued per step of 2 s / events, the step
+ *    waiting until a CheckCallback consumed the previous event or 50 ms more;
+ *    never less than about 2 s over the whole sequence.
+ *  - Heuristic (RPCS3 style; whether the console's VSH waits for consumption
+ *    is not known): the call returns only after a CheckCallback has consumed
+ *    COMPLETE, a later CheckCallback has begun (the consumer polls its
+ *    mailbox after each one, on the same thread, so the previous frame's
+ *    reading is done) and one step of vblanks has passed, as RPCS3's step waits
+ *    for the consumer. A title that retires its registration thread the moment
+ *    the call returns and clears the mailbox its status callback fills has by
+ *    then seen the completion; returning earlier is the measured failure behind
+ *    #37. A vblank edge alone is not enough: the completion can land a
+ *    microsecond before one.
+ *
+ * Pacing is counted in vblanks (cellGcmGetVBlankCount), the guest-visible time
+ * base, not in wall-clock time: a deterministic rendering of RPCS3's rules, so
+ * a run and its replay do not depend on the host's speed. 2 s at the
+ * console's 59.94 Hz is 120 vblanks over the events (one vblank a step with
+ * the usual few hundred events); RPCS3's 50 ms grace is 3 vblanks.
+ *
+ * Mechanism: a queue and a clock, no thread of our own. posted counts the
+ * events the "VSH" has queued: event k is due at vblank v0 + k * step, and
+ * whichever thread looks first (the blocked caller, or a poll) queues what is
+ * due, never more than the queue holds (a full queue holds the VSH back: the
+ * firmware's behaviour on overflow is unknown, so none is invented). The poll
+ * hook, run from cellSysutilCheckCallback on the polling thread, drains the
+ * queue in order, one callback at a time process-wide. The caller only
+ * waits (condition variable, lock released); the wait is bounded by
+ * trophy.register_wait_cap_vblanks (RPCS3's worst case), and at the cap the
+ * call returns success, as the firmware does when it does not hang, counting
+ * and logging it; the lifecycle stays owned by the context and a later poll
+ * delivers the rest. An unticking vblank counter would otherwise be a silent
+ * hang: that is the gcm-wait-timeout stop.
+ * -----------------------------------------------------------------------*/
+
+extern u32 cellGcmGetVBlankCount(void);
+
+#define TROPHY_PACE_TOTAL_VBLANKS   120u   /* RPCS3-oracle: 2 s minimum at 59.94 Hz */
+#define TROPHY_EVENT_QUEUE_CAP      127u   /* FW 4.93 sysutil event queue (A2.6) */
+#define TROPHY_WAIT_SLICE_US       4000u   /* re-check the vblank counter at least this often */
+
+#define TROPHY_STATUS_SEGMENTS 4
+
+/* RPCS3-oracle counts; see the block comment above. */
+static void life_segments(u32 trophies, u32 seg[TROPHY_STATUS_SEGMENTS])
+{
+    const u32 n = trophies ? trophies - 1 : 0;
+    seg[0] = 3;                        /* SETUP */
+    seg[1] = n;                        /* PROGRESS */
+    seg[2] = (n > 9 ? n : 9) - 5;      /* FINALIZE */
+    seg[3] = 0;                        /* COMPLETE */
+}
+
+static u32 life_step_vblanks(u32 events)
+{
+    const u32 p = (TROPHY_PACE_TOTAL_VBLANKS + events - 1) / events;
+    return p ? p : 1;
+}
+
+static u32 life_event_count(u32 trophies)
+{
+    u32 seg[TROPHY_STATUS_SEGMENTS], n = 0;
+    life_segments(trophies, seg);
+    for (int i = 0; i < TROPHY_STATUS_SEGMENTS; i++) n += seg[i] + 1;
+    return n;
+}
+
+static void life_event_at(u32 trophies, u32 idx,
+                          u32* status, u32* completed, u32* total)
+{
+    u32 seg[TROPHY_STATUS_SEGMENTS];
+    life_segments(trophies, seg);
+    for (int i = 0; i < TROPHY_STATUS_SEGMENTS; i++) {
+        if (idx <= seg[i]) {
+            *status = SCE_NP_TROPHY_STATUS_PROCESSING_SETUP + (u32)i;
+            *completed = idx;
+            *total = seg[i];
+            return;
+        }
+        idx -= seg[i] + 1;
+    }
+    /* idx is always below life_event_count(); keep the last event on a slip. */
+    *status = SCE_NP_TROPHY_STATUS_PROCESSING_COMPLETE;
+    *completed = 0;
+    *total = 0;
+}
+
+static void trophy_require_bridge(const char* who)
+{
+    /* RPCS3 sceNpTrophy.cpp sceNpTrophyRegisterContext() dispatches statusCb;
+     * this HLE has no guest callback bridge, so it is a named stop. */
+    if (!g_ps3_guest_caller)
+        ps3_stop(PS3_STOP_UNRESOLVED_GUEST_CALLBACK, who,
+                 "set g_ps3_guest_caller before calling the trophy API",
+                 NULL, 0, NULL);
+}
+
+/* Lock held. Ends the context's lifecycle: queued statuses are dropped and
+ * the registration thread, if it is waiting, is woken to return. */
+static void life_cancel_locked(TrophyContext* c)
+{
+    c->life_serial = 0;
+    c->life_posted = 0;
+    c->life_delivered = 0;
+    c->life_complete_seen = 0;
+    life_wake();
+}
+
+/* Lock held. After a context is cancelled, a status callback already running
+ * on another thread must finish before the caller returns, so no callback
+ * runs after Destroy/Term returns. A callback that destroys its own context
+ * runs on this thread and is not waited for. */
+static void life_quiesce_locked(void)
+{
+    while (s_life_delivering && !trophy_tid_eq(s_life_deliverer, trophy_self()))
+        life_wait(TROPHY_WAIT_SLICE_US);
+}
+
+/* Lock held. Queue what is due at vblank `vb` and fits in the queue. */
+static void life_post_locked(TrophyContext* c, u32 vb)
+{
+    const u32 events = life_event_count(c->total_trophies);
+    const u32 step = life_step_vblanks(events);
+    u64 due = 1u + (u64)(u32)(vb - c->life_v0) / step;
+    if (due > events) due = events;
+    const u32 room = TROPHY_EVENT_QUEUE_CAP - (c->life_posted - c->life_delivered);
+    u32 n = due > c->life_posted ? (u32)(due - c->life_posted) : 0;
+    if (n > room) n = room;
+    c->life_posted += n;
+}
+
+/* Run by every cellSysutilCheckCallback (cellSysutil_register_poll_hook), on
+ * the polling thread: queue what is due, then drain the queue in order, one
+ * callback at a time process-wide. A poll made from inside a status callback
+ * finds one running and delivers nothing. */
+static void trophy_poll(void)
+{
+    life_lock();
+    if (s_life_delivering) { life_unlock(); return; }
+    s_life_polls++;
+    for (;;) {
+        TrophyContext* c = NULL;
+        s32 id = 0;
+        const u32 vb = cellGcmGetVBlankCount();
+        for (s32 i = 1; i <= SCE_NP_TROPHY_MAX_CONTEXTS; i++) {
+            TrophyContext* k = &s_contexts[i];
+            if (!k->in_use || !k->life_serial) continue;
+            life_post_locked(k, vb);
+            if (!c && k->life_delivered < k->life_posted) { c = k; id = i; }
+        }
+        if (!c) break;
+        u32 status, completed, total;
+        life_event_at(c->total_trophies, c->life_delivered,
+                      &status, &completed, &total);
+        const u64 serial = c->life_serial;
+        const u32 cb = c->life_cb, arg = c->life_arg;
+        s_life_delivering = 1;
+        s_life_deliverer = trophy_self();
+        life_unlock();
+
+        trophy_require_bridge("a trophy status is due but there is no guest callback bridge");
+        /* FW dispatch 0x0200049C discards the callback's return value here. */
+        g_ps3_guest_caller(cb, (u32)id, status, completed, total, arg, 0, 0, 0);
+        /* Milestones for a run's log: the first status and the completion. */
+        if (status == SCE_NP_TROPHY_STATUS_PROCESSING_COMPLETE ||
+            (status == SCE_NP_TROPHY_STATUS_PROCESSING_SETUP && !completed))
+            printf("[sceNpTrophy] status %u delivered to ctx=%d at vblank %u\n",
+                   status, id, cellGcmGetVBlankCount());
+
+        life_lock();
+        s_life_delivering = 0;
+        if (c->life_serial == serial) {
+            c->life_delivered++;
+            if (c->life_delivered == life_event_count(c->total_trophies)) {
+                c->life_complete_seen = 1;
+                c->life_complete_v = cellGcmGetVBlankCount();
+                c->life_complete_poll = s_life_polls;
+            }
+        }
+        life_wake();
+    }
+    life_unlock();
+}
+
+/* The wait of sceNpTrophyRegisterContext: until the completion has been
+ * consumed and one step has passed, or the cap. Returns CELL_OK, or the error
+ * of a context that was destroyed or re-registered meanwhile. */
+static s32 trophy_run_lifecycle(s32 context, u64 serial)
+{
+    TrophyContext* c = &s_contexts[context];
+    const u32 cap = ps3_cfg_trophy_register_wait_cap_vblanks();
+    const u32 gcm_timeout_ms = ps3_cfg_gcm_wait_timeout_ms();
+    life_lock();
+    const u32 events = life_event_count(c->total_trophies);
+    const u32 step = life_step_vblanks(events);
+    const u32 start_vb = cellGcmGetVBlankCount();
+    u32 seen_vb = start_vb;
+    u64 seen_at = trophy_clock_real();
+    for (;;) {
+        if (c->life_serial != serial) {
+            const s32 rc = c->in_use ? (s32)SCE_NP_TROPHY_ERROR_PROCESSING_ABORTED
+                                     : (s32)SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
+            life_unlock();
+            return rc;
+        }
+        const u32 vb = cellGcmGetVBlankCount();
+        life_post_locked(c, vb);
+        if (c->life_complete_seen && s_life_polls > c->life_complete_poll &&
+            (u32)(vb - c->life_complete_v) >= step)
+            break;
+        if ((u32)(vb - start_vb) >= cap) {
+            s_register_wait_caps++;
+            const u32 posted = c->life_posted, delivered = c->life_delivered;
+            life_unlock();
+            printf("[sceNpTrophy] register-wait-cap ctx=%d posted=%u consumed=%u events=%u "
+                   "waited_vblanks=%u cap=%u: returning success, a later poll delivers the rest\n",
+                   context, posted, delivered, events, (u32)(vb - start_vb), cap);
+            return CELL_OK;
+        }
+        /* A vblank counter that stands still would hold this thread for ever:
+         * that is an RSX wait nobody ended. */
+        const u64 now = trophy_clock_real();
+        if (vb != seen_vb) { seen_vb = vb; seen_at = now; }
+        else if (now - seen_at >= (u64)gcm_timeout_ms * 1000u) {
+            life_unlock();
+            ps3_stop_gcm_wait_timeout("sceNpTrophyRegisterContext", "trophy-vblank", 0,
+                                      (u32)context, vb, (u32)((now - seen_at) / 1000u));
+        }
+        life_wait(TROPHY_WAIT_SLICE_US);
+    }
+    life_unlock();
+    return CELL_OK;
+}
+
+u32 sceNpTrophy_register_wait_cap_count(void)
+{
+    life_lock();
+    const u32 n = s_register_wait_caps;
+    life_unlock();
+    return n;
+}
+
 /* ---------------------------------------------------------------------------
  * API implementations
  * -----------------------------------------------------------------------*/
@@ -224,9 +612,14 @@ s32 sceNpTrophyTerm(void)
             trophy_save(&s_contexts[i]);
     }
 
+    life_lock();
+    for (int i = 1; i <= SCE_NP_TROPHY_MAX_CONTEXTS; i++)
+        life_cancel_locked(&s_contexts[i]);
+    life_quiesce_locked();
     memset(s_contexts, 0, sizeof(s_contexts));
     memset(s_handles, 0, sizeof(s_handles));
     s_trophy_initialized = 0;
+    life_unlock();
     return CELL_OK;
 }
 
@@ -281,7 +674,11 @@ s32 sceNpTrophyDestroyContext(SceNpTrophyContext context)
     if (s_contexts[context].registered)
         trophy_save(&s_contexts[context]);
 
+    life_lock();
+    life_cancel_locked(&s_contexts[context]);
     s_contexts[context].in_use = 0;
+    life_quiesce_locked();
+    life_unlock();
     printf("[sceNpTrophy] DestroyContext(ctx=%d)\n", context);
     return CELL_OK;
 }
@@ -355,45 +752,74 @@ s32 sceNpTrophyRegisterContext(SceNpTrophyContext context,
      * INVALID_ARGUMENT. */
     if (!statusCb) return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
 
-    /* RPCS3 sceNpTrophy.cpp sceNpTrophyRegisterContext() dispatches statusCb;
-     * this HLE has no guest callback bridge, so it is a named stop. */
-    if (!g_ps3_guest_caller)
-        ps3_stop(PS3_STOP_UNRESOLVED_GUEST_CALLBACK,
-                 "sceNpTrophyRegisterContext has no guest callback bridge",
-                 "set g_ps3_guest_caller before calling the trophy API",
-                 NULL, 0, NULL);
+    trophy_require_bridge("sceNpTrophyRegisterContext has no guest callback bridge");
+
+    /* The status the first callback reports follows the install state
+     * (RPCS3: trophy directory exists -> INSTALLED, else NOT_INSTALLED). An
+     * unknown state is an I/O error, never an assumed INSTALLED. */
+    u32 status0;
+    if (trophy_install_state(&s_contexts[context].commId, &status0) != 0)
+        return SCE_NP_TROPHY_ERROR_DISC_IO;
 
     /* Load any previously saved trophy data */
     trophy_load(&s_contexts[context]);
     s_contexts[context].registered = 1;
 
-    printf("[sceNpTrophy] RegisterContext(ctx=%d, handle=%d, statusCb=0x%08X, "
-           "arg=0x%08X) -> loaded saved data\n", context, handle, statusCb, arg);
+    {
+        char record[1024];
+        trophy_get_filepath(&s_contexts[context].commId, record, sizeof(record));
+        printf("[sceNpTrophy] RegisterContext(ctx=%d, handle=%d, statusCb=0x%08X, "
+               "arg=0x%08X) status0=%s: install record %s %s\n",
+               context, handle, statusCb, arg,
+               status0 == SCE_NP_TROPHY_STATUS_INSTALLED ? "INSTALLED" : "NOT_INSTALLED",
+               record, status0 == SCE_NP_TROPHY_STATUS_INSTALLED ? "exists" : "absent");
+    }
 
-    /* Use the runner's OPD bridge, not the optional code/TOC scaffold entry
-     * point. Registration status is synchronous; its terminal notification is
-     * delivered through sysutil polling, after the HLE storage load completes.
-     * Intermediate firmware installation progress is not simulated here. */
-    g_ps3_guest_caller(statusCb, (u32)context, SCE_NP_TROPHY_STATUS_INSTALLED,
-                       0, 0, arg, 0, 0, 0);
+    /* The inline "ask permission" callback, on the caller thread. FW 4.93
+     * RegisterContext 0x020018E0..0x020018EC / RPCS3 statusCb(...) < 0: a
+     * negative return clears the registration and fails the call. */
+    const s32 cb_rc = (s32)(u32)ppu_guest_call(statusCb, (u32)context, status0,
+                                               0, 0, arg, 0, 0, 0);
+    if (cb_rc < 0) {
+        if (s_contexts[context].in_use) s_contexts[context].registered = 0;
+        return SCE_NP_TROPHY_ERROR_PROCESSING_ABORTED;
+    }
     /* RPCS3 sceNpTrophy.cpp sceNpTrophyRegisterContext() re-resolves the
      * context and handle after the callback (:660/:666); the SDK codes are
      * 0x80551605 / 0x80551606. */
     if (!s_contexts[context].in_use) return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
-    /* RPCS3 sceNpTrophy.cpp sceNpTrophyRegisterContext() re-resolves the
-     * handle (:666); the SDK code is 0x80551606. */
     if (!s_handles[handle].in_use) return SCE_NP_TROPHY_ERROR_INVALID_HANDLE;
-    const u64 completion[8] = {(u32)context, SCE_NP_TROPHY_STATUS_PROCESSING_COMPLETE,
-                               0, 0, arg, 0, 0, 0};
-    /* RPCS3 sceNpTrophy.cpp sceNpTrophyRegisterContext() queues the completion
-     * through cellSysutil; this HLE queue can fail to allocate, mapped to the
-     * SDK OUT_OF_MEMORY (0x80551604). */
-    if (cellSysutilQueueGuestCallbackArgs(statusCb, completion) != CELL_OK) {
+
+    /* The install: the store file now exists, so the next registration of
+     * this community id reports INSTALLED. RPCS3 maps a failed install to
+     * ILLEGAL_UPDATE. */
+    if (status0 != SCE_NP_TROPHY_STATUS_INSTALLED &&
+        trophy_save(&s_contexts[context]) != 0) {
+        s_contexts[context].registered = 0;
+        return SCE_NP_TROPHY_ERROR_ILLEGAL_UPDATE;
+    }
+
+    /* Take ownership of a fresh lifecycle; one still in flight for this
+     * context is superseded and its registration thread returns. */
+    life_lock();
+    const u64 serial = s_life_next_serial++;
+    life_cancel_locked(&s_contexts[context]);
+    s_contexts[context].life_serial = serial;
+    s_contexts[context].life_cb = statusCb;
+    s_contexts[context].life_arg = arg;
+    s_contexts[context].life_v0 = cellGcmGetVBlankCount();
+    life_unlock();
+    if (cellSysutil_register_poll_hook(trophy_poll) != CELL_OK) {
+        life_lock();
+        life_cancel_locked(&s_contexts[context]);
+        life_unlock();
         s_contexts[context].registered = 0;
         return SCE_NP_TROPHY_ERROR_OUT_OF_MEMORY;
     }
 
-    return CELL_OK;
+    const s32 rc = trophy_run_lifecycle(context, serial);
+    printf("[sceNpTrophy] RegisterContext(ctx=%d) -> 0x%08X\n", context, (u32)rc);
+    return rc;
 }
 
 s32 sceNpTrophyGetRequiredDiskSpace(SceNpTrophyContext context,
@@ -421,15 +847,22 @@ s32 sceNpTrophyGetRequiredDiskSpace(SceNpTrophyContext context,
 
     reqSpace = GUEST_PTR(reqSpace, u64*);
 
-    /* Typical trophy pack size. The guest is big-endian and reads this u64
-     * back in BE order, so the value MUST be byte-swapped on write -- otherwise
-     * a host-LE 0x100000 is read as 0x0010000000000000 (2^44). LBP feeds this
-     * "required disk space" straight into its save-data free-space accounting
+    /* RPCS3 sceNpTrophy.cpp sceNpTrophyGetRequiredDiskSpace: 0 once the trophy
+     * data is installed; otherwise the pack size, for which the toolkit has
+     * no TRP and keeps its fixed 1 MB. The guest is big-endian and reads this
+     * u64 back in BE order, so the value MUST be byte-swapped on write --
+     * otherwise a host-LE 0x100000 is read as 0x0010000000000000 (2^44). LBP
+     * feeds this straight into its save-data free-space accounting
      * (sub_379EC0: errB = budget - usedKB - reqSpaceKB); a garbage 2^44 makes
      * errB underflow negative -> cellGame GameData check returns ERROR-B ->
      * boot bails. (Same LE-write class as the cellUserInfo fix.) */
-    *reqSpace = ps3_bswap64((u64)(1024 * 1024)); /* 1 MB, big-endian */
-    printf("[sceNpTrophy] GetRequiredDiskSpace(ctx=%d) -> 1MB\n", context);
+    u32 install;
+    if (trophy_install_state(&s_contexts[context].commId, &install) != 0)
+        return SCE_NP_TROPHY_ERROR_DISC_IO;
+    const u64 space = install == SCE_NP_TROPHY_STATUS_INSTALLED ? 0 : 1024 * 1024;
+    *reqSpace = ps3_bswap64(space);
+    printf("[sceNpTrophy] GetRequiredDiskSpace(ctx=%d) -> %llu\n", context,
+           (unsigned long long)space);
     return CELL_OK;
 }
 

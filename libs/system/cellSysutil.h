@@ -111,6 +111,12 @@ s32 cellSysutilQueueGuestCallback(u32 opd, u64 arg0, u64 arg1);
 /* Copy eight guest register arguments into the deferred completion queue. */
 s32 cellSysutilQueueGuestCallbackArgs(u32 opd, const u64 args[8]);
 
+/* Register a pump that every cellSysutilCheckCallback runs after the batch
+ * drain, on the polling thread. For libraries whose events the firmware's VSH
+ * peer posts over time; the pump delivers what has been posted by that poll.
+ * Idempotent per function; CELL_ENOMEM when the small fixed table is full. */
+s32 cellSysutil_register_poll_hook(void (*hook)(void));
+
 /* Host-side helper: queue a sysutil event to be delivered to the game's
  * registered callback at the next cellSysutilCheckCallback poll. status
  * is one of the CELL_SYSUTIL_* event codes (REQUEST_EXITGAME,
