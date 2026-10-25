@@ -78,8 +78,7 @@ static void settle(void)
         int running = 0;
         table_lock();
         for (int k = 1; k < PPU_THREAD_MAX; k++) {
-            if (g_ppu_threads[k].state == PPU_THREAD_STATE_RUNNING ||
-                g_ppu_threads[k].state == PPU_THREAD_STATE_DETACHED)
+            if (g_ppu_threads[k].state == PPU_THREAD_STATE_RUNNING)
                 running++;
         }
         table_unlock();

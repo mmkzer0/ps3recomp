@@ -137,11 +137,11 @@ Yields the current thread's time slice.
 
 #### `sys_ppu_thread_join` (44)
 
-Blocks until the specified thread exits. Stores the exit code.
+Blocks until the specified thread exits. Stores the exit code. `CELL_EDEADLK` for the calling thread itself, `CELL_EINVAL` for a detached thread or one another join already waits for, `CELL_ESRCH` for an id that names no thread (a thread that was joined, detached or non-joinable and ended is gone); a thread that already exited is reaped at once.
 
 #### `sys_ppu_thread_detach` (45)
 
-Detaches a thread so its resources are auto-cleaned on exit.
+Detaches a thread so its resources are auto-cleaned on exit; a thread that already exited is reaped at once. `CELL_EINVAL` if it is already detached, `CELL_EBUSY` while a join waits for it, `CELL_ESRCH` for an id that names no thread.
 
 #### `sys_ppu_thread_get_join_state` (46)
 

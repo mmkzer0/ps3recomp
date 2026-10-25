@@ -114,6 +114,75 @@ static ppu_thread_info* find_thread(uint64_t thread_id)
     return t;
 }
 
+/* Free a slot: the sync objects and the guest stack, then FREE. Must be called under lock, by the one reaper of the
+ * thread, decided by a transition under that lock: the thread's own epilogue when it is DETACHED (it also
+ * pthread_detach's itself there), the join that moved it JOINABLE -> JOINING (after its pthread_join), or the detach
+ * that found it a ZOMBIE (which pthread_detach's it). Nobody else destroys the sync objects, frees the stack,
+ * detaches or joins the host thread, or sets FREE.
+ *
+ * A slot may be reused once FREE, so each reaper has to know that no old host thread touches the slot again:
+ *   - the detached worker, by construction: its last access to the slot is this call under the table lock, and it
+ *     touches nothing after the unlock;
+ *   - a join, by waiting: pthread_join returned, the worker is gone;
+ *   - the detach of a zombie, by construction: the worker published ZOMBIE as its last access to the slot, under
+ *     the table lock, and runs only host code that names no slot (the epilogue hook, the return) after it.
+ * Hidden references are covered the same way: the slot's context pointer lives in the worker's g_active_ctx (its
+ * own thread-local, read only by that thread, and the worker runs no guest code after the trampoline returns) and in
+ * ppu_ctx_register's table (a diagnostic list that never forgets, which only reads static storage). */
+static void reap_slot_locked(ppu_thread_info* t)
+{
+#ifdef _WIN32
+    if (t->finish_event) CloseHandle(t->finish_event);
+    if (t->host_thread) CloseHandle(t->host_thread);
+    t->finish_event = NULL;
+    t->host_thread = NULL;
+#else
+    pthread_mutex_destroy(&t->finish_mutex);
+    pthread_cond_destroy(&t->finish_cond);
+#endif
+    if (t->stack_addr) {
+        vm_stack_free(&g_vm_stack_alloc, t->stack_addr, t->stack_size);
+        t->stack_addr = 0;
+        t->stack_size = 0;
+    }
+    t->state = PPU_THREAD_STATE_FREE;
+}
+
+/* Wake the thread's joiner. Must be called under the table lock, which is what orders it before the joiner's
+ * reap (lock order: table lock, then finish_mutex). */
+static void wake_joiner_locked(ppu_thread_info* t)
+{
+#ifdef _WIN32
+    SetEvent(t->finish_event);
+#else
+    pthread_mutex_lock(&t->finish_mutex);
+    t->finished = 1;
+    pthread_cond_signal(&t->finish_cond);
+    pthread_mutex_unlock(&t->finish_mutex);
+#endif
+}
+
+/* The epilogue hook (ppu_thread_set_epilogue_hook), read by every created thread's epilogue. */
+static ppu_thread_epilogue_hook_fn s_epilogue_hook;
+
+static ppu_thread_epilogue_hook_fn epilogue_hook_load(void)
+{
+#if defined(_MSC_VER) && !defined(__clang__)
+    return (ppu_thread_epilogue_hook_fn)InterlockedCompareExchangePointer((PVOID volatile*)&s_epilogue_hook, NULL, NULL);
+#else
+    return __atomic_load_n(&s_epilogue_hook, __ATOMIC_ACQUIRE);
+#endif
+}
+
+void ppu_thread_set_epilogue_hook(ppu_thread_epilogue_hook_fn fn)
+{
+#if defined(_MSC_VER) && !defined(__clang__)
+    InterlockedExchangePointer((PVOID volatile*)&s_epilogue_hook, (PVOID)fn);
+#else
+    __atomic_store_n(&s_epilogue_hook, fn, __ATOMIC_RELEASE);
+#endif
+}
+
 /* ---------------------------------------------------------------------------
  * Host thread entry point
  * -----------------------------------------------------------------------*/
@@ -180,54 +249,34 @@ static void* ppu_host_thread_proc(void* param)
                 (unsigned long long)info->ctx.thread_id);
     }
 
-    /* Mark as finished */
+    /* Publish the end. The last access to `info` is under the table lock: once it is released a join or detach
+     * may reap the slot (and a create reuse it) while this thread is still on its way out, so nothing below
+     * touches `info`. */
     table_lock();
+    const uint64_t tid    = info->ctx.thread_id;
+    const int      joiner = info->joiner;
     info->exit_status = (int64_t)info->ctx.gpr[3];
-
-    /* A thread nobody can join (created without SYS_PPU_THREAD_CREATE_JOINABLE, or detached)
-     * frees its slot here, its last use of `info`. The sync objects go first, under the table lock: once the slot is
-     * FREE a new sys_ppu_thread_create may reuse it and create its own. Joinable threads stay FINISHED for the join. */
-    if (!info->joinable) {
-#ifdef _WIN32
-        if (info->finish_event) CloseHandle(info->finish_event);
-        if (info->host_thread) CloseHandle(info->host_thread);
-        info->finish_event = NULL;
-        info->host_thread = NULL;
-#else
-        pthread_mutex_destroy(&info->finish_mutex);
-        pthread_cond_destroy(&info->finish_cond);
+    if (joiner == PPU_JOIN_DETACHED) {
+        /* A thread nobody can join (created without SYS_PPU_THREAD_CREATE_JOINABLE, or detached) detaches itself
+         * and frees its slot: the sync objects and the guest stack go under the table lock, since once the slot is
+         * FREE a new sys_ppu_thread_create may reuse it. Guest code runs only inside
+         * g_ppu_thread_entry_trampoline; this host thread now runs host C code on its host stack and never touches
+         * guest memory again. */
+#ifndef _WIN32
+        pthread_detach(pthread_self());
 #endif
-        /* Free guest stack. Safe here because guest code runs only inside
-         * g_ppu_thread_entry_trampoline; once unwound/returned, this host thread
-         * executes purely host C code on its host stack (PPU_HOST_STACK_BYTES)
-         * and will never touch guest memory again. Freeing the stack under
-         * the table lock right before freeing the slot ensures another thread
-         * can immediately reuse both without races. */
-        if (info->stack_addr) {
-            vm_stack_free(&g_vm_stack_alloc, info->stack_addr, info->stack_size);
-            info->stack_addr = 0;
-            info->stack_size = 0;
-        }
-        info->state = PPU_THREAD_STATE_FREE;
-        table_unlock();
-#ifdef _WIN32
-        return 0;
-#else
-        return NULL;
-#endif
+        reap_slot_locked(info);
+    } else {
+        info->state = PPU_THREAD_STATE_ZOMBIE;
+        if (joiner == PPU_JOIN_JOINING)
+            wake_joiner_locked(info);
     }
-    info->state = PPU_THREAD_STATE_FINISHED;
     table_unlock();
 
-    /* Signal anyone waiting for join */
+    { ppu_thread_epilogue_hook_fn hook = epilogue_hook_load(); if (hook) hook(tid, joiner); }
 #ifdef _WIN32
-    SetEvent(info->finish_event);
     return 0;
 #else
-    pthread_mutex_lock(&info->finish_mutex);
-    info->finished = 1;
-    pthread_cond_signal(&info->finish_cond);
-    pthread_mutex_unlock(&info->finish_mutex);
     return NULL;
 #endif
 }
@@ -277,7 +326,7 @@ uint64_t ppu_thread_register_main(void)
         t->ctx.thread_id = 1;
         prof_store(&s_prof_tid[0], 1u);
         t->state    = PPU_THREAD_STATE_RUNNING;
-        t->joinable = 0;                    /* nobody joins the main thread */
+        t->joiner   = PPU_JOIN_DETACHED;    /* nobody joins the main thread */
         strncpy(t->name, "main", sizeof(t->name) - 1);
         ps3_ft_name(1, "main");
 #ifdef _WIN32
@@ -433,9 +482,9 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
     t->state      = PPU_THREAD_STATE_RUNNING;
     t->priority   = priority;
     /* SYS_PPU_THREAD_CREATE_JOINABLE is bit 0 of the flags. If every thread were joinable, a thread created without
-     * the flag (nobody will ever join it) would stay FINISHED after its exit and keep its slot, and a title that
+     * the flag (nobody will ever join it) would stay a zombie after its exit and keep its slot, and a title that
      * starts a short-lived worker per task would see CELL_EAGAIN once 63 of them had run. */
-    t->joinable   = (flags & 1u) ? 1 : 0;
+    t->joiner     = (flags & 1u) ? PPU_JOIN_JOINABLE : PPU_JOIN_DETACHED;
     t->stack_addr = stack_addr;
     t->stack_size = stack_size;
     t->entry_addr = entry;
@@ -577,7 +626,6 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
         table_unlock();
         return (int64_t)(int32_t)CELL_EAGAIN;
     }
-    if (!t->joinable) pthread_detach(t->host_thread);   /* nobody pthread_joins it */
 #endif
 
     table_unlock();
@@ -600,22 +648,12 @@ int64_t sys_ppu_thread_exit(ppu_context* ctx)
     ppu_thread_info* t = find_thread(tid);
     if (t) {
         t->exit_status = (int64_t)status;
-        /* Joinable threads mark FINISHED in ppu_host_thread_proc's epilogue after
-         * unwinding/returning out of the guest trampoline. Marking it here would let
-         * a concurrent sys_ppu_thread_detach free the slot while this thread still
-         * ran its epilogue. The main thread (slot 0) has no epilogue and is marked
-         * FINISHED here. */
+        /* A created thread publishes its end, and wakes its joiner, in ppu_host_thread_proc's epilogue after
+         * unwinding out of the guest trampoline: ending here would let a concurrent join or detach reap the slot
+         * while this thread still ran its epilogue. The main thread (slot 0) has no epilogue and is marked here;
+         * nobody joins it. */
         if (t == &g_ppu_threads[0])
-            t->state = PPU_THREAD_STATE_FINISHED;
-
-#ifdef _WIN32
-        SetEvent(t->finish_event);
-#else
-        pthread_mutex_lock(&t->finish_mutex);
-        t->finished = 1;
-        pthread_cond_signal(&t->finish_cond);
-        pthread_mutex_unlock(&t->finish_mutex);
-#endif
+            t->state = PPU_THREAD_STATE_ZOMBIE;
     }
     table_unlock();
 
@@ -639,7 +677,7 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
 {
     uint64_t tid          = LV2_ARG_U64(ctx, 0);
     uint32_t status_addr  = LV2_ARG_PTR(ctx, 1);
-    { static int n=0; if(PS3_LOG_FIRST(n, 30)) fprintf(stderr,"[WAIT] ppu_thread_join(tid=%llu)\n", (unsigned long long)tid); }
+    { static PPU_TLS int n=0; if(PS3_LOG_FIRST(n, 30)) fprintf(stderr,"[WAIT] ppu_thread_join(tid=%llu)\n", (unsigned long long)tid); }
 
     table_lock();
     ppu_thread_info* t = find_thread(tid);
@@ -647,26 +685,60 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
         table_unlock();
         return (int64_t)(int32_t)CELL_ESRCH;
     }
-    if (!t->joinable || t->state == PPU_THREAD_STATE_DETACHED) {
+    /* A thread that joins itself would wait for its own end. */
+    if (tid == ctx->thread_id) {
+        table_unlock();
+        return (int64_t)(int32_t)CELL_EDEADLK;
+    }
+    /* lv2: detached, or another join already in progress -> EINVAL. */
+    if (t->joiner != PPU_JOIN_JOINABLE) {
         table_unlock();
         return (int64_t)(int32_t)CELL_EINVAL;
     }
+    /* This call is the slot's one reaper from here on; a concurrent detach says EBUSY, a concurrent join EINVAL.
+     * A zombie has nothing to wait for. */
+    t->joiner     = PPU_JOIN_JOINING;
+    t->joiner_tid = ctx->thread_id;
+    const int must_wait = (t->state != PPU_THREAD_STATE_ZOMBIE);
+#ifdef _WIN32
+    HANDLE finish_event = t->finish_event;
+#else
+    const pthread_t host_thread = t->host_thread;
+#endif
     table_unlock();
 
-    /* Wait for completion */
+    /* Wait for the epilogue, which wakes a JOINING thread's joiner under the table lock after publishing ZOMBIE.
+     * Nothing is held here, so the epilogue can never wait for us. */
+    if (must_wait) {
 #ifdef _WIN32
-    WaitForSingleObject(t->finish_event, INFINITE);
+        WaitForSingleObject(finish_event, INFINITE);
 #else
-    pthread_mutex_lock(&t->finish_mutex);
-    while (!t->finished) {
-        pthread_cond_wait(&t->finish_cond, &t->finish_mutex);
+        pthread_mutex_lock(&t->finish_mutex);
+        while (!t->finished)
+            pthread_cond_wait(&t->finish_cond, &t->finish_mutex);
+        pthread_mutex_unlock(&t->finish_mutex);
+#endif
     }
-    pthread_mutex_unlock(&t->finish_mutex);
+
+#ifndef _WIN32
+    /* Reap the host thread with the table lock RELEASED.
+     *
+     * pthread_join blocks until the thread procedure returns, and that procedure's epilogue takes the table lock to
+     * publish its end. A joiner that held the lock across the join would wait for a thread that waits for the lock,
+     * and the whole title would stop with no message. The slot stays ours meanwhile: it is not FREE, and no one
+     * else may reap a JOINING slot. Slot reuse is safe here by waiting: it becomes FREE only after pthread_join
+     * returned, when the worker is gone. Windows has no such wait: CloseHandle below records nothing about whether
+     * the thread has finished and never blocks (unverified there; the epilogue still touches nothing after its
+     * last table-lock section). */
+    pthread_join(host_thread, NULL);
 #endif
 
-    /* Write exit status */
+    table_lock();
+    const int64_t es = t->exit_status;
+    reap_slot_locked(t);
+    table_unlock();
+
     if (status_addr != 0) {
-        int64_t es = t->exit_status;
         int64_t* out = (int64_t*)vm_to_host(status_addr);
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
         uint64_t u = (uint64_t)es;
@@ -683,43 +755,6 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
         *out = es;
 #endif
     }
-
-    /* Clean up */
-#ifdef _WIN32
-    table_lock();
-    CloseHandle(t->host_thread);
-    CloseHandle(t->finish_event);
-    t->host_thread = NULL;
-    t->finish_event = NULL;
-#else
-    /* Reap the host thread with the table lock RELEASED.
-     *
-     * pthread_join blocks until the thread procedure returns, and that
-     * procedure's epilogue takes the table lock to stamp its own state. The
-     * joiner is woken well before that epilogue runs, because a guest thread
-     * normally ends at sys_ppu_thread_exit, which signals `finished` from
-     * INSIDE the thread body and then longjmps back out to the epilogue. So a
-     * joiner that holds the lock across the join is waiting for a thread that
-     * is waiting for the lock -- and the whole title stops with no message.
-     *
-     * Windows never saw it: its half of this block is CloseHandle, which
-     * records nothing about whether the thread has finished and never waits.
-     * The two halves have to be read as one thing, and only one of them was.
-     * Take the lock again afterwards for the teardown, which is what actually
-     * needs it: nothing can claim this slot in between, because it is still
-     * FINISHED rather than FREE until the line below. */
-    pthread_join(t->host_thread, NULL);
-    table_lock();
-    pthread_mutex_destroy(&t->finish_mutex);
-    pthread_cond_destroy(&t->finish_cond);
-#endif
-    if (t->stack_addr) {
-        vm_stack_free(&g_vm_stack_alloc, t->stack_addr, t->stack_size);
-        t->stack_addr = 0;
-        t->stack_size = 0;
-    }
-    t->state = PPU_THREAD_STATE_FREE;
-    table_unlock();
 
     return CELL_OK;
 }
@@ -740,29 +775,27 @@ int64_t sys_ppu_thread_detach(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
     }
 
-    if (t->state == PPU_THREAD_STATE_FINISHED) {
-        /* Already finished, free it */
-#ifdef _WIN32
-        CloseHandle(t->host_thread);
-        CloseHandle(t->finish_event);
-#else
-        pthread_detach(t->host_thread);
-        pthread_mutex_destroy(&t->finish_mutex);
-        pthread_cond_destroy(&t->finish_cond);
-#endif
-        if (t->stack_addr) {
-            vm_stack_free(&g_vm_stack_alloc, t->stack_addr, t->stack_size);
-            t->stack_addr = 0;
-            t->stack_size = 0;
-        }
-        t->joinable = 0;
-        t->state = PPU_THREAD_STATE_FREE;
-    } else {
-        t->state = PPU_THREAD_STATE_DETACHED;
-        t->joinable = 0;
+    /* lv2: detached -> EINVAL; a join in progress -> EBUSY (the join is the reaper, this call touches nothing).
+     * A zombie is reaped here, as the join it never got would have; any other thread becomes DETACHED and its own
+     * epilogue reaps it. */
+    if (t->joiner == PPU_JOIN_DETACHED) {
+        table_unlock();
+        return (int64_t)(int32_t)CELL_EINVAL;
+    }
+    if (t->joiner == PPU_JOIN_JOINING) {
+        table_unlock();
+        return (int64_t)(int32_t)CELL_EBUSY;
+    }
+
+    if (t->state == PPU_THREAD_STATE_ZOMBIE) {
+        /* Slot reuse is safe by construction: the worker's last access to the slot was publishing ZOMBIE under the
+         * table lock, and it may still be on its way out of the epilogue, which names no slot. */
 #ifndef _WIN32
         pthread_detach(t->host_thread);
 #endif
+        reap_slot_locked(t);
+    } else {
+        t->joiner = PPU_JOIN_DETACHED;
     }
 
     table_unlock();
@@ -1296,7 +1329,7 @@ int64_t sys_ppu_thread_get_join_state(ppu_context* ctx)
 
     table_lock();
     ppu_thread_info* t = find_thread(tid);
-    int32_t joinable = t ? t->joinable : 0;
+    int32_t joinable = t ? (t->joiner != PPU_JOIN_DETACHED) : 0;
     table_unlock();
 
     if (out_addr != 0) {

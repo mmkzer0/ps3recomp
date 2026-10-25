@@ -703,6 +703,11 @@ if(PS3RECOMP_BUILD_TESTS)
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_thread_stack_recycle.py")
         set_tests_properties(ppu_thread_stack_recycle PROPERTIES LABELS "runtime;t0;tsan" TIMEOUT 300)
+        # The lv2 join/detach state machine and the worker epilogue's last access to its slot, ordered by a hook.
+        add_test(NAME ppu_thread_join_detach
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_thread_join_detach.py")
+        set_tests_properties(ppu_thread_join_detach PROPERTIES LABELS "runtime;t0;tsan" TIMEOUT 300)
         # docs/DIAGNOSTICS.md is hand-maintained prose; the checker requires the
         # knob set (and its summary counts) to match the sources, not the whole
         # generated text.

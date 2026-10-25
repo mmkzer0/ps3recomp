@@ -145,7 +145,25 @@ Freed stacks are returned to `vm_stack_alloc` via `vm_stack_free(sa, base, size)
 - **Zeroed upon reuse:** Reused stacks are zeroed across their usable range (`memset(vm_to_host(base), 0, aligned)`) before being handed out, matching the behavior of fresh pages from the zero-filled guest arena. The guard page below `base` is not touched.
 - **Guard retention:** The guard page below the stack base (`base - page_size`) is protected once when initially carved out from bump space and stays protected across frees and reuses; it is never re-protected on reuse.
 - **Thread safety:** In the runtime, `g_vm_stack_alloc` operations are synchronized under the thread-table lock (`table_lock()`).
-- **Safe freeing order:** A thread's stack is freed only after the thread's guest code has completely finished running (after `pthread_join` in `sys_ppu_thread_join`, or in `ppu_host_thread_proc` after the guest entry trampoline has returned or unwound for non-joinable/detached threads). Because guest code executes only within the trampoline and the host thread runs remaining epilogue logic on its dedicated host stack (`PPU_HOST_STACK_BYTES`), the guest stack is never accessed while or after being returned to the free list.
+- **Safe freeing order:** A thread's stack is freed only after the thread's guest code has completely finished running, and only by the slot's one reaper (below). Because guest code executes only within the trampoline and the host thread runs the rest of its epilogue on its dedicated host stack (`PPU_HOST_STACK_BYTES`), the guest stack is never accessed while or after being returned to the free list.
+- **Join / detach state machine** (`sys_ppu_thread.c`, lv2 `ppu_join_status`; every transition under the thread-table lock). A slot is `RUNNING`, `ZOMBIE` (exited, not yet reaped) or `FREE`, and, while not `FREE`, its joiner state is `JOINABLE`, `JOINING(tid)` or `DETACHED`. A thread created without `SYS_PPU_THREAD_CREATE_JOINABLE` is `DETACHED` from the start; the main thread (slot 0) is too and has no epilogue.
+
+  | Event | Slot state | Result |
+  |---|---|---|
+  | `join(self)` | any | `CELL_EDEADLK` |
+  | `join` | `JOINABLE`, running | `JOINING(caller)`; waits for the epilogue, `pthread_join`s with the lock released, reaps, `CELL_OK` |
+  | `join` | `JOINABLE`, `ZOMBIE` | `JOINING`; no wait; `pthread_join`, reap, `CELL_OK` |
+  | `join` | `DETACHED` or `JOINING` | `CELL_EINVAL` |
+  | `detach` | `JOINABLE`, running | `DETACHED`, `CELL_OK`; the thread's own epilogue reaps |
+  | `detach` | `JOINABLE`, `ZOMBIE` | `pthread_detach`, reap, `CELL_OK` |
+  | `detach` | `DETACHED` | `CELL_EINVAL` |
+  | `detach` | `JOINING` | `CELL_EBUSY` |
+  | epilogue | `JOINABLE` | `ZOMBIE` |
+  | epilogue | `JOINING` | `ZOMBIE`, wakes the joiner |
+  | epilogue | `DETACHED` | `pthread_detach(self)`, reap (`FREE`) |
+  | any call | `FREE` or another id in the slot | `CELL_ESRCH` (ids are never reused) |
+
+  Reaping (destroying the join objects, `vm_stack_free`, `CloseHandle`, `FREE`) is done by exactly one party: the worker when `DETACHED`, the joiner when it moved the slot to `JOINING`, the detacher of a `ZOMBIE`. The worker's last access to its slot is that section under the table lock, so a slot is reusable the moment it is `FREE`; a joiner additionally waits for the host thread (`pthread_join`) first. `ppu_thread_set_epilogue_hook` is a test seam called after that section.
 The allocator ends at `VM_CB_HOST_STACK_BASE` (`0xDE000000`), not at the end of the stack region: the top `VM_CB_HOST_STACK_WINDOW` (32 MB, 32 slots of `VM_PPU_STACK_SIZE`) is reserved for the stacks of host threads that raise guest callbacks while running no guest code (`ppu_cb_entry_sp` in `ppu_loader.cpp` owns it). A thread-stack request that would reach the window fails (`vm_stack_allocate` returns `CELL_ENOMEM`, and so does `sys_ppu_thread_create`) instead of overlapping a live callback slot.
 ### SPU Local Store Mapping
 
