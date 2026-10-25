@@ -17,29 +17,59 @@ extern "C" {
 
 /* ---------------------------------------------------------------------------
  * Error codes
+ *
+ * The firmware's values, 0x800229xx. FW 4.93 libsysutil_np_trophy confirms
+ * 0x80022901 (already initialized), 02 (not initialized), 03 (not supported),
+ * 06 (invalid argument), 0A (unknown context), 0F (processing aborted) and 11
+ * (unknown handle); the rest are RPCS3's sceNpTrophy.h at e53ac18f. A title
+ * compares against these through its SDK header. The context/handle a call
+ * names that the library does not hold is UNKNOWN_*; INVALID_CONTEXT and
+ * INVALID_HANDLE are different codes.
  * -----------------------------------------------------------------------*/
-#define SCE_NP_TROPHY_ERROR_NOT_INITIALIZED         0x80551601
-#define SCE_NP_TROPHY_ERROR_ALREADY_INITIALIZED     0x80551602
-#define SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT        0x80551603
-#define SCE_NP_TROPHY_ERROR_OUT_OF_MEMORY           0x80551604
-#define SCE_NP_TROPHY_ERROR_INVALID_CONTEXT         0x80551605
-#define SCE_NP_TROPHY_ERROR_INVALID_HANDLE          0x80551606
-#define SCE_NP_TROPHY_ERROR_CONTEXT_NOT_REGISTERED  0x80551607
-#define SCE_NP_TROPHY_ERROR_ALREADY_EXISTS          0x80551608
-#define SCE_NP_TROPHY_ERROR_NOT_FOUND               0x80551609
-#define SCE_NP_TROPHY_ERROR_ALREADY_UNLOCKED        0x8055160A
-#define SCE_NP_TROPHY_ERROR_PLATINUM_CANNOT_UNLOCK  0x8055160B
-#define SCE_NP_TROPHY_ERROR_CONTEXT_ALREADY_REG     0x8055160C
-#define SCE_NP_TROPHY_ERROR_INSUFFICIENT_SPACE      0x8055160D
-#define SCE_NP_TROPHY_ERROR_PROCESSING              0x8055160E
-#define SCE_NP_TROPHY_ERROR_ABORT                   0x8055160F
-#define SCE_NP_TROPHY_ERROR_UNKNOWN                 0x805516FF
-
-/* The firmware's own values (FW 4.93 libsysutil_np_trophy; RPCS3
- * sceNpTrophy.h at e53ac18f), for codes this header did not carry. */
-#define SCE_NP_TROPHY_ERROR_PROCESSING_ABORTED      0x8002290F
-#define SCE_NP_TROPHY_ERROR_DISC_IO                 0x8002291A
-#define SCE_NP_TROPHY_ERROR_ILLEGAL_UPDATE          0x8002292A
+#define SCE_NP_TROPHY_ERROR_ALREADY_INITIALIZED          0x80022901
+#define SCE_NP_TROPHY_ERROR_NOT_INITIALIZED              0x80022902
+#define SCE_NP_TROPHY_ERROR_NOT_SUPPORTED                0x80022903
+#define SCE_NP_TROPHY_ERROR_CONTEXT_NOT_REGISTERED       0x80022904
+#define SCE_NP_TROPHY_ERROR_OUT_OF_MEMORY                0x80022905
+#define SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT             0x80022906
+#define SCE_NP_TROPHY_ERROR_EXCEEDS_MAX                  0x80022907
+#define SCE_NP_TROPHY_ERROR_INSUFFICIENT                 0x80022909
+#define SCE_NP_TROPHY_ERROR_UNKNOWN_CONTEXT              0x8002290A
+#define SCE_NP_TROPHY_ERROR_INVALID_FORMAT               0x8002290B
+#define SCE_NP_TROPHY_ERROR_BAD_RESPONSE                 0x8002290C
+#define SCE_NP_TROPHY_ERROR_INVALID_GRADE                0x8002290D
+#define SCE_NP_TROPHY_ERROR_INVALID_CONTEXT              0x8002290E
+#define SCE_NP_TROPHY_ERROR_PROCESSING_ABORTED           0x8002290F
+#define SCE_NP_TROPHY_ERROR_ABORT                        0x80022910
+#define SCE_NP_TROPHY_ERROR_UNKNOWN_HANDLE               0x80022911
+#define SCE_NP_TROPHY_ERROR_LOCKED                       0x80022912
+#define SCE_NP_TROPHY_ERROR_HIDDEN                       0x80022913
+#define SCE_NP_TROPHY_ERROR_CANNOT_UNLOCK_PLATINUM       0x80022914
+#define SCE_NP_TROPHY_ERROR_ALREADY_UNLOCKED             0x80022915
+#define SCE_NP_TROPHY_ERROR_INVALID_TYPE                 0x80022916
+#define SCE_NP_TROPHY_ERROR_INVALID_HANDLE               0x80022917
+#define SCE_NP_TROPHY_ERROR_INVALID_NP_COMM_ID           0x80022918
+#define SCE_NP_TROPHY_ERROR_UNKNOWN_NP_COMM_ID           0x80022919
+#define SCE_NP_TROPHY_ERROR_DISC_IO                      0x8002291A
+#define SCE_NP_TROPHY_ERROR_CONF_DOES_NOT_EXIST          0x8002291B
+#define SCE_NP_TROPHY_ERROR_UNSUPPORTED_FORMAT           0x8002291C
+#define SCE_NP_TROPHY_ERROR_ALREADY_INSTALLED            0x8002291D
+#define SCE_NP_TROPHY_ERROR_BROKEN_DATA                  0x8002291E
+#define SCE_NP_TROPHY_ERROR_VERIFICATION_FAILURE         0x8002291F
+#define SCE_NP_TROPHY_ERROR_INVALID_TROPHY_ID            0x80022920
+#define SCE_NP_TROPHY_ERROR_UNKNOWN_TROPHY_ID            0x80022921
+#define SCE_NP_TROPHY_ERROR_UNKNOWN_TITLE                0x80022922
+#define SCE_NP_TROPHY_ERROR_UNKNOWN_FILE                 0x80022923
+#define SCE_NP_TROPHY_ERROR_DISC_NOT_MOUNTED             0x80022924
+#define SCE_NP_TROPHY_ERROR_SHUTDOWN                     0x80022925
+#define SCE_NP_TROPHY_ERROR_TITLE_ICON_NOT_FOUND         0x80022926
+#define SCE_NP_TROPHY_ERROR_TROPHY_ICON_NOT_FOUND        0x80022927
+#define SCE_NP_TROPHY_ERROR_INSUFFICIENT_DISK_SPACE      0x80022928
+#define SCE_NP_TROPHY_ERROR_ILLEGAL_UPDATE               0x8002292A
+#define SCE_NP_TROPHY_ERROR_SAVEDATA_USER_DOES_NOT_MATCH 0x8002292B
+#define SCE_NP_TROPHY_ERROR_TROPHY_ID_DOES_NOT_EXIST     0x8002292C
+#define SCE_NP_TROPHY_ERROR_SERVICE_UNAVAILABLE          0x8002292D
+#define SCE_NP_TROPHY_ERROR_UNKNOWN                      0x800229FF
 
 /* ---------------------------------------------------------------------------
  * Constants

@@ -32,8 +32,8 @@ int main(void)
     }
     assert(sceNpTrophyCreateContext((void*)0x200, (void*)0x100, (void*)0x108, 0) == SCE_NP_TROPHY_ERROR_OUT_OF_MEMORY);
     assert(sceNpTrophyCreateHandle((void*)0x204) == SCE_NP_TROPHY_ERROR_OUT_OF_MEMORY);
-    assert(sceNpTrophyDestroyContext(0) == SCE_NP_TROPHY_ERROR_INVALID_CONTEXT);
-    assert(sceNpTrophyDestroyHandle(0) == SCE_NP_TROPHY_ERROR_INVALID_HANDLE);
+    assert(sceNpTrophyDestroyContext(0) == SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT);
+    assert(sceNpTrophyDestroyHandle(0) == SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT);
     assert(sceNpTrophyInit(NULL, 0, 0, 0) == SCE_NP_TROPHY_ERROR_ALREADY_INITIALIZED);
     assert(sceNpTrophyGetRequiredDiskSpace(1, 1, (void*)0x208, 0) == CELL_OK);
     assert(vm_read64(0x208) == 1024 * 1024);

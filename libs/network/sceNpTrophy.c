@@ -527,7 +527,7 @@ static s32 trophy_run_lifecycle(s32 context, u64 serial)
     for (;;) {
         if (c->life_serial != serial) {
             const s32 rc = c->in_use ? (s32)SCE_NP_TROPHY_ERROR_PROCESSING_ABORTED
-                                     : (s32)SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
+                                     : (s32)SCE_NP_TROPHY_ERROR_UNKNOWN_CONTEXT;
             life_unlock();
             return rc;
         }
@@ -631,7 +631,7 @@ s32 sceNpTrophyCreateContext(SceNpTrophyContext* context,
     (void)options;
 
     /* RPCS3 sceNpTrophy.cpp sceNpTrophyCreateContext checks commSign before
-     * the init state; the SDK error value is 0x80551603. */
+     * the init state; the firmware's INVALID_ARGUMENT is 0x80022906. */
     if (!commSign)
         return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
 
@@ -667,9 +667,12 @@ s32 sceNpTrophyDestroyContext(SceNpTrophyContext context)
     if (!s_trophy_initialized)
         return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
 
-    if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS ||
-        !s_contexts[context].in_use)
-        return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
+    /* RPCS3 sceNpTrophyDestroyContext: an id outside the table is
+     * INVALID_ARGUMENT, one the table does not hold UNKNOWN_CONTEXT. */
+    if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS)
+        return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
+    if (!s_contexts[context].in_use)
+        return SCE_NP_TROPHY_ERROR_UNKNOWN_CONTEXT;
 
     if (s_contexts[context].registered)
         trophy_save(&s_contexts[context]);
@@ -711,9 +714,11 @@ s32 sceNpTrophyDestroyHandle(SceNpTrophyHandle handle)
     if (!s_trophy_initialized)
         return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
 
-    if (handle <= 0 || handle > SCE_NP_TROPHY_MAX_HANDLES ||
-        !s_handles[handle].in_use)
-        return SCE_NP_TROPHY_ERROR_INVALID_HANDLE;
+    /* RPCS3 sceNpTrophyDestroyHandle: the same split for the handle. */
+    if (handle <= 0 || handle > SCE_NP_TROPHY_MAX_HANDLES)
+        return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
+    if (!s_handles[handle].in_use)
+        return SCE_NP_TROPHY_ERROR_UNKNOWN_HANDLE;
 
     s_handles[handle].in_use = 0;
     printf("[sceNpTrophy] DestroyHandle(handle=%d)\n", handle);
@@ -726,31 +731,33 @@ s32 sceNpTrophyRegisterContext(SceNpTrophyContext context,
                                u32 arg,
                                u64 options)
 {
-    (void)options;
-
     /* RPCS3 sceNpTrophy.cpp sceNpTrophyRegisterContext: !init -> NOT_INITIALIZED. */
     if (!s_trophy_initialized)
         return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
 
     /* RPCS3 sceNpTrophy.cpp get_context_ex(): a context outside [1, MAX] ->
-     * INVALID_ARGUMENT; an idm miss -> UNKNOWN_CONTEXT.  The published SDK
-     * has one INVALID_CONTEXT code (0x80551605) for the table miss. */
+     * INVALID_ARGUMENT; an idm miss -> UNKNOWN_CONTEXT (FW 4.93
+     * RegisterContext: 0x80022906 / 0x8002290A). */
     if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS)
         return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
-    /* SDK sceNpTrophy.h SCE_NP_TROPHY_ERROR_INVALID_CONTEXT (0x80551605). */
+    /* The table miss: SCE_NP_TROPHY_ERROR_UNKNOWN_CONTEXT (0x8002290A). */
     if (!s_contexts[context].in_use)
-        return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
+        return SCE_NP_TROPHY_ERROR_UNKNOWN_CONTEXT;
 
     /* RPCS3 sceNpTrophy.cpp get_context_ex(): the same split for the handle. */
     if (handle <= 0 || handle > SCE_NP_TROPHY_MAX_HANDLES)
         return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
-    /* SDK sceNpTrophy.h SCE_NP_TROPHY_ERROR_INVALID_HANDLE (0x80551606). */
+    /* The table miss: SCE_NP_TROPHY_ERROR_UNKNOWN_HANDLE (0x80022911). */
     if (!s_handles[handle].in_use)
-        return SCE_NP_TROPHY_ERROR_INVALID_HANDLE;
+        return SCE_NP_TROPHY_ERROR_UNKNOWN_HANDLE;
 
     /* RPCS3 sceNpTrophy.cpp sceNpTrophyRegisterContext: !statusCb ->
      * INVALID_ARGUMENT. */
     if (!statusCb) return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
+
+    /* Only options 0 and 1 (show the error and exit on an abort) exist: FW 4.93
+     * RegisterContext 0x02001664 area, RPCS3 options > SHOW_ERROR_EXIT. */
+    if (options > 1) return SCE_NP_TROPHY_ERROR_NOT_SUPPORTED;
 
     trophy_require_bridge("sceNpTrophyRegisterContext has no guest callback bridge");
 
@@ -785,10 +792,10 @@ s32 sceNpTrophyRegisterContext(SceNpTrophyContext context,
         return SCE_NP_TROPHY_ERROR_PROCESSING_ABORTED;
     }
     /* RPCS3 sceNpTrophy.cpp sceNpTrophyRegisterContext() re-resolves the
-     * context and handle after the callback (:660/:666); the SDK codes are
-     * 0x80551605 / 0x80551606. */
-    if (!s_contexts[context].in_use) return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
-    if (!s_handles[handle].in_use) return SCE_NP_TROPHY_ERROR_INVALID_HANDLE;
+     * context and handle after the callback (:660/:666); the codes are
+     * 0x8002290A / 0x80022911. */
+    if (!s_contexts[context].in_use) return SCE_NP_TROPHY_ERROR_UNKNOWN_CONTEXT;
+    if (!s_handles[handle].in_use) return SCE_NP_TROPHY_ERROR_UNKNOWN_HANDLE;
 
     /* The install: the store file now exists, so the next registration of
      * this community id reports INSTALLED. RPCS3 maps a failed install to
@@ -841,9 +848,9 @@ s32 sceNpTrophyGetRequiredDiskSpace(SceNpTrophyContext context,
     /* RPCS3 sceNpTrophy.cpp get_context_ex(): range -> INVALID_ARGUMENT. */
     if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS)
         return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
-    /* SDK sceNpTrophy.h SCE_NP_TROPHY_ERROR_INVALID_CONTEXT (0x80551605). */
+    /* The table miss: SCE_NP_TROPHY_ERROR_UNKNOWN_CONTEXT (0x8002290A). */
     if (!s_contexts[context].in_use)
-        return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
+        return SCE_NP_TROPHY_ERROR_UNKNOWN_CONTEXT;
 
     reqSpace = GUEST_PTR(reqSpace, u64*);
 
@@ -878,7 +885,7 @@ s32 sceNpTrophyGetGameInfo(SceNpTrophyContext context,
 
     if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS ||
         !s_contexts[context].in_use)
-        return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
+        return SCE_NP_TROPHY_ERROR_UNKNOWN_CONTEXT;
 
     if (!s_contexts[context].registered)
         return SCE_NP_TROPHY_ERROR_CONTEXT_NOT_REGISTERED;
@@ -926,7 +933,7 @@ s32 sceNpTrophyGetTrophyInfo(SceNpTrophyContext context,
 
     if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS ||
         !s_contexts[context].in_use)
-        return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
+        return SCE_NP_TROPHY_ERROR_UNKNOWN_CONTEXT;
 
     if (!s_contexts[context].registered)
         return SCE_NP_TROPHY_ERROR_CONTEXT_NOT_REGISTERED;
@@ -969,7 +976,7 @@ s32 sceNpTrophyUnlockTrophy(SceNpTrophyContext context,
 
     if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS ||
         !s_contexts[context].in_use)
-        return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
+        return SCE_NP_TROPHY_ERROR_UNKNOWN_CONTEXT;
 
     if (!s_contexts[context].registered)
         return SCE_NP_TROPHY_ERROR_CONTEXT_NOT_REGISTERED;
@@ -1023,11 +1030,11 @@ s32 sceNpTrophyGetTrophyUnlockState(SceNpTrophyContext context,
     /* RPCS3 sceNpTrophy.cpp get_context_ex(): range -> INVALID_ARGUMENT. */
     if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS)
         return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
-    /* SDK sceNpTrophy.h SCE_NP_TROPHY_ERROR_INVALID_CONTEXT (0x80551605). */
+    /* The table miss: SCE_NP_TROPHY_ERROR_UNKNOWN_CONTEXT (0x8002290A). */
     if (!s_contexts[context].in_use)
-        return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
+        return SCE_NP_TROPHY_ERROR_UNKNOWN_CONTEXT;
 
-    /* SDK sceNpTrophy.h SCE_NP_TROPHY_ERROR_CONTEXT_NOT_REGISTERED (0x80551607). */
+    /* SCE_NP_TROPHY_ERROR_CONTEXT_NOT_REGISTERED (0x80022904). */
     if (!s_contexts[context].registered)
         return SCE_NP_TROPHY_ERROR_CONTEXT_NOT_REGISTERED;
 
@@ -1058,7 +1065,7 @@ s32 sceNpTrophyGetGameProgress(SceNpTrophyContext context,
 
     if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS ||
         !s_contexts[context].in_use)
-        return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
+        return SCE_NP_TROPHY_ERROR_UNKNOWN_CONTEXT;
 
     if (!s_contexts[context].registered)
         return SCE_NP_TROPHY_ERROR_CONTEXT_NOT_REGISTERED;

@@ -496,7 +496,7 @@ static void case_destroy(void)
     assert(atomic_load(&g_nlog) == 7);
     assert(sceNpTrophyDestroyContext(1) == CELL_OK);
     reg_join(&r);
-    assert(r.rc == (s32)SCE_NP_TROPHY_ERROR_INVALID_CONTEXT);
+    assert(r.rc == (s32)SCE_NP_TROPHY_ERROR_UNKNOWN_CONTEXT);
     const unsigned frozen = atomic_load(&g_nlog);
     for (int i = 0; i < 500; i++) { atomic_fetch_add(&g_vblank, 100); assert(poll_once() == 0); }
     assert(atomic_load(&g_nlog) == frozen);
@@ -509,7 +509,7 @@ static void case_destroy(void)
     frames_until_log(4);
     assert(sceNpTrophyTerm() == CELL_OK);
     reg_join(&r);
-    assert(r.rc == (s32)SCE_NP_TROPHY_ERROR_INVALID_CONTEXT);
+    assert(r.rc == (s32)SCE_NP_TROPHY_ERROR_UNKNOWN_CONTEXT);
     const unsigned after_term = atomic_load(&g_nlog);
     for (int i = 0; i < 100; i++) { atomic_fetch_add(&g_vblank, 100); assert(poll_once() == 0); }
     assert(atomic_load(&g_nlog) == after_term);
@@ -576,7 +576,7 @@ static void case_guards(void)
     assert(sceNpTrophyRegisterContext(5, 1, CB_OPD, CB_ARG, 0) == SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT);
     assert(sceNpTrophyRegisterContext(1, 0, CB_OPD, CB_ARG, 0) == SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT);
     assert(sceNpTrophyRegisterContext(1, 5, CB_OPD, CB_ARG, 0) == SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT);
-    assert(sceNpTrophyRegisterContext(1, 2, CB_OPD, CB_ARG, 0) == SCE_NP_TROPHY_ERROR_INVALID_HANDLE);
+    assert(sceNpTrophyRegisterContext(1, 2, CB_OPD, CB_ARG, 0) == SCE_NP_TROPHY_ERROR_UNKNOWN_HANDLE);
     assert(sceNpTrophyRegisterContext(1, 1, 0, CB_ARG, 0) == SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT);
     assert(sceNpTrophyGetRequiredDiskSpace(0, 1, (u64*)(uintptr_t)0x300, 0) ==
            SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT);
