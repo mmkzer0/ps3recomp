@@ -710,9 +710,14 @@ void mode_credit()
         for (std::uint32_t j = batch * kBatch; j < (batch + 1) * kBatch; ++j)
             if (!job_ok(specs[j])) CHECK(false, "job %u output", j);
     }
-    const auto view = observe_queue(QUEUE);
-    CHECK(view && view->outstanding == 0 && view->running == 0 && view->barred == 0,
-          "quiescent: outstanding %u running %u barred 0x%X", view ? view->outstanding : 0, view ? view->running : 0,
+    /* A job credits its port inside run_job, before its worker re-takes the queue lock to drop `running`,
+     * so a Sync that has seen every credit can return while the last worker is still on its way out.
+     * `running` is executor-internal; quiescence is eventual, not ordered against the Sync. */
+    decltype(observe_queue(QUEUE)) view;
+    CHECK(wait_for([&] {
+        view = observe_queue(QUEUE);
+        return view && view->outstanding == 0 && view->running == 0 && view->barred == 0;
+    }), "quiescent: outstanding %u running %u barred 0x%X", view ? view->outstanding : 0, view ? view->running : 0,
           view ? view->barred : 0);
     rig.teardown();
 }
