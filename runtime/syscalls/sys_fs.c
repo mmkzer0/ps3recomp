@@ -81,34 +81,6 @@ static void fs_check_span(const char* func, const char* arg, uint32_t ea, uint64
         ps3_stop_guest_range(func, arg, ea, size, vm_guest_limit());
 }
 
-/* vm_commit takes a u32 size. The range check bounds a span by the arena, so
- * at most the single arena-wide [0, 4 GiB) span does not fit in a u32: commit
- * it in two page-aligned pieces instead of truncating the size the way the
- * old (uint32_t)size cast did. */
-static int32_t fs_commit_span(uint32_t ea, uint64_t size)
-{
-    while (size) {
-        const uint32_t chunk = size > 0xFFFFF000ull ? 0xFFFFF000u : (uint32_t)size;
-        const int32_t rc = vm_commit(ea, chunk);
-        if (rc != CELL_OK) return rc;
-        ea += chunk;
-        size -= chunk;
-    }
-    return CELL_OK;
-}
-
-/* A commit that fails after the span was proved in-range is a host fault
- * (mprotect/VirtualAlloc), not a guest range error, and the firmware has no
- * code for it: stop by name rather than read into pages the host never made
- * writable. */
-static void fs_commit_or_stop(const char* func, const char* arg, uint32_t ea, uint64_t size)
-{
-    if (!size) return;
-    const int32_t rc = fs_commit_span(ea, size);
-    if (rc != CELL_OK)
-        ps3_stop_commit_failed(func, arg, ea, size, rc);
-}
-
 /* ---------------------------------------------------------------------------
  * Path translation
  *
@@ -589,7 +561,7 @@ int64_t sys_fs_read(ppu_context* ctx)
      * fails instead, and fread comes back short. GH3's Bink reader saw that
      * as a read error on every movie and never decoded a frame -- solid green
      * video. ppu_fs.cpp fs_prefault is the same fix for cellFs. */
-    fs_commit_or_stop("sys_fs_read", "buf", buf_addr, size);
+    vm_commit_or_stop("sys_fs_read", "buf", buf_addr, size);
 
     void* buf = vm_to_host(buf_addr);
     long pos_before = ftell(f->fp);
@@ -681,7 +653,7 @@ int64_t sys_fs_write(ppu_context* ctx)
     }
 
     fs_check_span("sys_fs_write", "buf", buf_addr, size);
-    fs_commit_or_stop("sys_fs_write", "buf", buf_addr, size);
+    vm_commit_or_stop("sys_fs_write", "buf", buf_addr, size);
 
     const void* buf = vm_to_host(buf_addr);
     size_t nwritten = fwrite(buf, 1, (size_t)size, f->fp);

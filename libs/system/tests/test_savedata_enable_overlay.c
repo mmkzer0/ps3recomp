@@ -11,6 +11,8 @@ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
 void ps3_stop_guest_range(const char* f, const char* a, uint64_t ea,
                           uint64_t size, uint64_t limit)
 { (void)f; (void)a; (void)ea; (void)size; (void)limit; abort(); }
+void ps3_stop_commit_failed(const char* f, const char* a, uint64_t ea, uint64_t size, int32_t rc)
+{ (void)f; (void)a; (void)ea; (void)size; (void)rc; abort(); }
 void spu_coh_notify_write(uint32_t a) { (void)a; }
 void spu_lockline_lock(void) {}
 void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*)) { (void)nid; (void)name; (void)fn; }

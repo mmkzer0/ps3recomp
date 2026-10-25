@@ -105,7 +105,7 @@ Where each is raised, and what it carries beyond `pc lr tid`:
 | `jq2-state` | the executor | `queue` plus the facts of the broken invariant (`dispatch`, `port`, `slot`, `error encode`, `workers`; `port reason=push-after-shutdown` from the enqueue path, shared by plain, copy and sync pushes) |
 | `jq2-jm-call` | `libs/spurs/jq2/executor.cpp` (`require_normal_return`) | `queue job port tag worker request lr status`, with `request` the job's r3 at the call (the request word) and `lr` the caller's link register (also the `lr` of the machine line); `pc` is the stop word's address, `0x1500` |
 | `hle-guest-range` | `ps3_stop_guest_range` | `func arg ea size limit` |
-| `hle-commit-failed` | `ps3_stop_commit_failed` (`runtime/syscalls/sys_fs.c`) | `func arg ea size rc` |
+| `hle-commit-failed` | `ps3_stop_commit_failed`, via `vm_commit_or_stop` (`runtime/memory/vm.h`), called by `sys_fs_read`/`sys_fs_write` (`runtime/syscalls/sys_fs.c`) and the cellSaveData `fileBuf` (`libs/system/cellSaveData.c`) | `func arg ea size rc` |
 | `hle-uninitialized` | `ps3_stop_hle_uninitialized` (`libs/video/cellResc.c`, `libs/video/cellGcmSys.c`) | `func module reason` |
 | `sync2-semaphore-unsupported` | `libs/sync/cellSync2.c` (`sem_unsupported`) | `api sem config reason`; `config` is the guest config EA, never a timeout |
 | `fiber-unsupported` | `libs/spurs/cellFiber.c` (`unsupported`) | `api ea field reason`; an unsupported attribute names its byte offset in `field`; worker-capacity retains the attempted guest count increment |

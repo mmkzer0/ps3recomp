@@ -10,11 +10,13 @@
  * is a named stop (hle-guest-range, naming dispatch_func_file and fileBuf),
  * not a host pointer into whatever follows the arena.
  *
- * The savedata APIs end the process on a stop, so the out-of-arena case runs
- * in a forked child; the parent checks the exit status and the machine line.
+ * The savedata APIs end the process on a stop, so each refused case runs in a
+ * forked child; the parent checks the exit status and the machine line.
  * The arena has a PROT_NONE guard page after it, so a transfer the check
  * misses faults instead of passing silently. An in-arena fileBuf still makes
- * the same save round trip.
+ * the same save round trip. An in-arena fileBuf whose pages the host cannot
+ * commit (here: unmapped under the arena) stops with hle-commit-failed; the
+ * commit result used to be dropped, and the fwrite then faulted.
  *
  *   libs/system/tests/test_savedata_filebuf_range.c, linked with the real stop
  *   implementation (it includes ../cellSaveData.c, as the other savedata
@@ -82,6 +84,53 @@ static void callback(u32 opd, u64 cb_ea, u64 get, u64 set,
     }
 }
 
+static s32 run_save(void);
+
+/* Run one save in a forked child and require it to end in the named stop
+ * `kind` with `func=cellSaveData arg=fileBuf`. `prep` runs in the child first. */
+static void expect_stop(const char* what, const char* kind, void (*prep)(void))
+{
+    int fds[2];
+    if (pipe(fds) != 0) { printf("FAIL: pipe\n"); exit(1); }
+    const pid_t pid = fork();
+    if (pid == 0) {
+        close(fds[0]);
+        dup2(fds[1], STDERR_FILENO);
+        close(fds[1]);
+        if (prep) prep();
+        run_save();
+        _exit(1);   /* returned: the span was not refused */
+    }
+    close(fds[1]);
+    char out[4096];
+    size_t used = 0;
+    ssize_t n;
+    while (used < sizeof out - 1 && (n = read(fds[0], out + used, sizeof out - 1 - used)) > 0)
+        used += (size_t)n;
+    out[used] = 0;
+    close(fds[0]);
+    int status = 0;
+    waitpid(pid, &status, 0);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == PS3_STOP_EXIT_CODE,
+          "%s stops (status 0x%X)", what, status);
+    const char* line = strstr(out, "PS3STOP v=1");
+    char want[64];
+    snprintf(want, sizeof want, "kind=%s", kind);
+    CHECK(line && strstr(line, want) &&
+          strstr(line, "func=cellSaveData") && strstr(line, "arg=fileBuf"),
+          "%s names itself in the machine line%s%s", what,
+          line ? ": " : " (no machine line)", line ? line : "");
+}
+
+static const uint32_t UNCOMMITTABLE_EA = 0x8000;   /* host-page aligned on 4K and 16K hosts */
+
+/* Unmap one host page inside the arena: mprotect on it fails (ENOMEM), which is
+ * what a host that cannot back a guest page looks like to vm_commit. */
+static void unmap_buffer_page(void)
+{
+    munmap(vm_base + UNCOMMITTABLE_EA, (size_t)sysconf(_SC_PAGESIZE));
+}
+
 /* One save attempt: returns the HLE result, or exits the process on a stop. */
 static s32 run_save(void)
 {
@@ -134,33 +183,12 @@ int main(void)
      * through the guard page. */
     s_file_buf_ea = ARENA - 2;
     s_file_buf_size = 0x10;
-    int fds[2];
-    if (pipe(fds) != 0) { printf("FAIL: pipe\n"); return 1; }
-    const pid_t pid = fork();
-    if (pid == 0) {
-        close(fds[0]);
-        dup2(fds[1], STDERR_FILENO);
-        close(fds[1]);
-        run_save();
-        _exit(1);   /* returned: the span was not refused */
-    }
-    close(fds[1]);
-    char out[4096];
-    size_t used = 0;
-    ssize_t n;
-    while (used < sizeof out - 1 && (n = read(fds[0], out + used, sizeof out - 1 - used)) > 0)
-        used += (size_t)n;
-    out[used] = 0;
-    close(fds[0]);
-    int status = 0;
-    waitpid(pid, &status, 0);
-    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == PS3_STOP_EXIT_CODE,
-          "an out-of-arena fileBuf stops (status 0x%X)", status);
-    const char* line = strstr(out, "PS3STOP v=1");
-    CHECK(line && strstr(line, "kind=hle-guest-range") &&
-          strstr(line, "func=cellSaveData") && strstr(line, "arg=fileBuf"),
-          "the fileBuf stop names itself in the machine line%s%s",
-          line ? ": " : " (no machine line)", line ? line : "");
+    expect_stop("an out-of-arena fileBuf", "hle-guest-range", NULL);
+
+    /* An in-arena fileBuf the host cannot commit stops before the fwrite. */
+    s_file_buf_ea = UNCOMMITTABLE_EA;
+    s_file_buf_size = 0x10;
+    expect_stop("an uncommittable fileBuf", "hle-commit-failed", unmap_buffer_page);
 
     munmap(p, (size_t)ARENA + page);
     snprintf(path, sizeof path, "%s/TEST00000/DATA.BIN", root); unlink(path);

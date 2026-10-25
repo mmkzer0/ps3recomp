@@ -17,6 +17,7 @@
 
 #include "../../include/ps3emu/ps3types.h"
 #include "../../include/ps3emu/error_codes.h"
+#include "../../include/ps3emu/stop.h"   /* PS3_NODISCARD, ps3_stop_commit_failed */
 
 #include <stdint.h>
 #include <stddef.h>
@@ -324,7 +325,9 @@ static inline int vm_range_ok(uint32_t ea, uint64_t size)
     return (uint64_t)ea <= limit && size <= limit - (uint64_t)ea;
 }
 
-static inline int32_t vm_commit(uint32_t addr, uint32_t size)
+/* The result must be checked: a failed commit leaves the pages PROT_NONE, and a
+ * host access to them faults instead of stopping by name (vm_commit_or_stop). */
+PS3_NODISCARD static inline int32_t vm_commit(uint32_t addr, uint32_t size)
 {
     /* In the arena and backed? A range that wraps or crosses the limit is
      * refused; vm_range_ok carries the readiness test too. */
@@ -341,6 +344,25 @@ static inline int32_t vm_commit(uint32_t addr, uint32_t size)
 #endif
 
     return CELL_OK;
+}
+
+/* Commit a guest span that a host access (kernel I/O, memcpy) is about to touch,
+ * or stop. The caller has already proved the span in range (vm_range_ok, else
+ * ps3_stop_guest_range), so a failure here is a host fault (mprotect or
+ * VirtualAlloc), for which the firmware has no code: PS3_STOP_HLE_COMMIT_FAILED.
+ * vm_commit takes a u32 size, and only the single arena-wide [0, 4 GiB) span does
+ * not fit, so the span is committed in page-aligned chunks rather than truncated. */
+static inline void vm_commit_or_stop(const char* func, const char* arg, uint32_t ea, uint64_t size)
+{
+    /* The stop names the caller's whole span, not the chunk that failed. */
+    uint32_t at = ea;
+    for (uint64_t left = size; left;) {
+        const uint32_t chunk = left > 0xFFFFF000ull ? 0xFFFFF000u : (uint32_t)left;
+        const int32_t rc = vm_commit(at, chunk);
+        if (rc != CELL_OK) ps3_stop_commit_failed(func, arg, ea, size, rc);
+        at += chunk;
+        left -= chunk;
+    }
 }
 
 static inline int32_t vm_protect(uint32_t addr, uint32_t size, int read, int write, int exec)
