@@ -75,6 +75,10 @@ static void hook(uint32_t ea, uint32_t value)
 }
 static void reset() { s_calls = 0; s_ea = s_value = s_old = 0xDEADBEEF; s_old_bytes_intact = s_ea_in_window = true; }
 
+// Counts only: the top-of-address-space checks call the span path without executing a store, so there are no
+// host bytes there for the ordinary hook to read.
+static void span_hook(uint32_t ea, uint32_t) { ++s_calls; s_ea = ea; }
+
 // The store forms run against one probe area of 0xA5 bytes: a form's store has to turn exactly the bytes
 // [BASE + first, +len) into something else.
 static const uint32_t AREA = 0x20000, AREA_LEN = 0x400, BASE = 0x20100;
@@ -85,22 +89,28 @@ static void window(uint32_t lo, uint32_t len)
     ppu_set_store_hook(lo, len, len ? hook : nullptr);
 }
 
+static ppu_context s_ctx;   // the context the current form ran on (its CR0 after a store-conditional)
+
+static void prepare_form(const store_form& f)
+{
+    std::memset(&s_ctx, 0, sizeof s_ctx);
+    std::memset(vm_base + AREA, 0xA5, AREA_LEN);
+    s_ctx.gpr[4] = BASE + f.ea_off;
+    s_ctx.gpr[5] = 0x1122334455667788ull;
+    s_ctx.gpr[6] = 0x55667788u;              // stswi / stswx: the second register of the string
+    s_ctx.gpr[29] = 0x11111111u; s_ctx.gpr[30] = 0x22222222u; s_ctx.gpr[31] = 0x33333333u;   // stmw
+    s_ctx.xer = 7;                           // stswx: the byte count
+    for (int i = 0; i < 16; i++) s_ctx.vr[5].b[i] = (uint8_t)(0x10 + i);
+    const uint64_t one = 0x3FF0000000000001ull; std::memcpy(&s_ctx.fpr[5], &one, 8);
+    if (f.kind == 1) ppu_lwarx32(&s_ctx, BASE + f.ea_off);
+    if (f.kind == 2) ppu_ldarx64(&s_ctx, BASE + f.ea_off);
+}
+
 static void run_form(const store_form& f)
 {
-    static ppu_context ctx;
-    std::memset(&ctx, 0, sizeof ctx);
-    std::memset(vm_base + AREA, 0xA5, AREA_LEN);
+    prepare_form(f);
     reset();
-    ctx.gpr[4] = BASE + f.ea_off;
-    ctx.gpr[5] = 0x1122334455667788ull;
-    ctx.gpr[6] = 0x55667788u;              // stswi / stswx: the second register of the string
-    ctx.gpr[29] = 0x11111111u; ctx.gpr[30] = 0x22222222u; ctx.gpr[31] = 0x33333333u;   // stmw
-    ctx.xer = 7;                           // stswx: the byte count
-    for (int i = 0; i < 16; i++) ctx.vr[5].b[i] = (uint8_t)(0x10 + i);
-    const uint64_t one = 0x3FF0000000000001ull; std::memcpy(&ctx.fpr[5], &one, 8);
-    if (f.kind == 1) ppu_lwarx32(&ctx, BASE + f.ea_off);
-    if (f.kind == 2) ppu_ldarx64(&ctx, BASE + f.ea_off);
-    f.run(&ctx);
+    f.run(&s_ctx);
 }
 
 // After a form ran: its bytes changed, no other byte of the area did.
@@ -127,6 +137,11 @@ static void test_form(const store_form& f)
     check(s_old_bytes_intact, what);
     std::snprintf(what, sizeof what, "%s: the store landed, and only its own bytes changed", f.name);
     check(store_landed_exactly(f), what);
+    if (f.kind) {
+        // The emitted stwcx./stdcx. writes CR0 itself: EQ on success, SO from XER (0 here).
+        std::snprintf(what, sizeof what, "%s: the successful conditional leaves CR0 = EQ only", f.name);
+        check((s_ctx.cr >> 28) == 2, what);
+    }
 
     // An overlap of one byte is an overlap: the window is the last byte the store writes. The hook gets the
     // first window address the store covers.
@@ -155,6 +170,23 @@ static void test_form(const store_form& f)
     run_form(f);
     std::snprintf(what, sizeof what, "%s: with no hook registered the store lands and calls nothing", f.name);
     check(s_calls == 0 && store_landed_exactly(f), what);
+}
+
+// A store-conditional whose reservation was replaced stores nothing and clears CR0[EQ]. ppu_stwcx32 runs the
+// store hook before it validates: the wait the hook represents happens either way, and the guest's own loop
+// retries a failed conditional.
+static void test_store_conditional_failure(const store_form& f)
+{
+    char what[160];
+    prepare_form(f);
+    ppu_lwarx32(&s_ctx, BASE + 0x300);         // the guest's one reservation now names another line
+    window(AREA, AREA_LEN);
+    reset();
+    f.run(&s_ctx);
+    std::snprintf(what, sizeof what, "%s: a failed conditional still runs the hook once, at its address", f.name);
+    check(s_calls == 1 && s_ea == BASE + f.ea_off, what);
+    std::snprintf(what, sizeof what, "%s: ... stores nothing and clears CR0[EQ]", f.name);
+    check(vm_base[BASE + f.ea_off] == 0xA5 && (s_ctx.cr >> 28) == 0, what);
 }
 
 int main()
@@ -215,7 +247,27 @@ int main()
     check(s_calls == 1 && s_ea == 0x20100, "a window of nearly 4 GB hooks a store inside it (the bound does not wrap)");
     ppu_set_store_hook(0, 0, nullptr);
 
-    for (unsigned i = 0; i < g_nforms; i++) test_form(g_forms[i]);
+    // The 32-bit top of the address space: the window is the last 256 bytes, and the span checks below are
+    // the inline modular compare plus the out-of-line 64-bit decision. No store is executed here (the probe
+    // VM is 256 KiB, so only the range check can run); the hook only counts.
+    ppu_set_store_hook(0xFFFFFF00u, 0x100, span_hook);
+    s_win_lo = 0xFFFFFF00u; s_win_len = 0x100;
+    reset(); PPU_STORE_HOOK(0xFFFFFFF8u, 8);
+    check(s_calls == 1 && s_ea == 0xFFFFFFF8u, "a store in the last 8 bytes of the address space is hooked");
+    reset(); PPU_STORE_HOOK(0xFFFFFF00u, 16);
+    check(s_calls == 1 && s_ea == 0xFFFFFF00u, "a 16-byte store whose last byte is 4 GiB-1 is hooked");
+    reset(); PPU_STORE_HOOK(0xFFFFFEF8u, 8);
+    check(s_calls == 0, "a store that ends one byte below the top window is not hooked");
+    ppu_set_store_hook(0, 0x1000, span_hook);
+    s_win_lo = 0; s_win_len = 0x1000;
+    reset(); PPU_STORE_HOOK(0xFFFFFFF8u, 16);
+    check(s_calls == 0, "a span from the top of the address space does not reach a low window (no wrapped bytes are written)");
+    ppu_set_store_hook(0, 0, nullptr);
+
+    for (unsigned i = 0; i < g_nforms; i++) {
+        test_form(g_forms[i]);
+        if (g_forms[i].kind) test_store_conditional_failure(g_forms[i]);
+    }
 
     std::printf("[ppu_store_hook] %s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
     std::free(vm_base);

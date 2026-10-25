@@ -684,6 +684,22 @@ if(PS3RECOMP_BUILD_TESTS)
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_lifter_code_window.py")
         set_tests_properties(lifter_code_window PROPERTIES LABELS "tools;t0")
+        # #22: every store form into the RSX label window runs the hook before
+        # its bytes land (the forms are generated from the real lifter), and the
+        # GCM label-store path goes through the real module. The lifter's own
+        # conformance suite runs every lowered instruction against the runtime.
+        add_test(NAME ppu_store_hook
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_store_hook.py")
+        add_test(NAME gcm_label_store
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_gcm_label_store.py")
+        set_tests_properties(ppu_store_hook gcm_label_store
+            PROPERTIES LABELS "ppu;t0" TIMEOUT 300)
+        add_test(NAME ppu_lift_conformance
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_lift.py")
+        set_tests_properties(ppu_lift_conformance PROPERTIES LABELS "ppu;t0" TIMEOUT 600)
         # The trace schema contract: event/1 converts losslessly, validation is
         # strict, and diff reports the first divergence per execution context.
         add_test(NAME ps3diff
