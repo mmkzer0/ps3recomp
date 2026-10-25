@@ -36,8 +36,9 @@
  *   - Every pointer is a guest effective address (u32). The one host pointer is
  *     the out parameter of jq2_queue_join.
  *   - Every function returns the firmware's s32: 0 on success, otherwise
- *       JQ2_ERR_AGAIN         0x80410A01  ring full, port slots exhausted, Sync
- *                                         poll with jobs outstanding (mode 4)
+ *       JQ2_ERR_AGAIN         0x80410A01  ring full with push flags bit 2 (otherwise
+ *                                         the push waits), port slots exhausted,
+ *                                         Sync poll with jobs outstanding (mode 4)
  *       JQ2_ERR_INVAL         0x80410A02  argument out of range
  *       JQ2_ERR_BUSY          0x80410A0A  Sync claim collision, destroy with
  *                                         submissions outstanding
@@ -169,8 +170,12 @@ int32_t jq2_port_destroy(uint32_t port);
  * 16-aligned, tag 0..15 (INVAL otherwise).
  * flags & 1 selects whether the entry carries the port EA, and with it the
  * submission count B at port+0x10 and the completion credit: a job pushed
- * without it is run but never credited to the port. Full ring AGAIN; a port
- * whose Sync holds the claim BUSY. Wakes the workers. */
+ * without it is run but never credited to the port. flags & ~7 is INVAL
+ * (FW 4.93, tested first; CopyPush: flags & ~3, PushSync: flags & ~4); bit 1
+ * is the named stop jq2-unmodelled (docs/JQ2.md). A full ring blocks the pusher
+ * until a worker has consumed an entry (a fiber parks cooperatively); with
+ * flags & 4 it returns AGAIN instead and writes nothing. A port whose Sync
+ * holds the claim BUSY. Wakes the workers. */
 int32_t jq2_port_push_job(uint32_t port, uint32_t descriptor, uint32_t size, uint32_t tag, uint32_t flags);
 
 /* _cellSpursJobQueuePort2CopyPushJobBody(port, source, size, copy_size, tag,
@@ -186,7 +191,8 @@ int32_t jq2_port_copy_push(uint32_t port, uint32_t source, uint32_t size, uint32
 
 /* cellSpursJobQueuePort2PushSync(port, tag_mask, flags): enqueue a SYNC for the
  * tags in tag_mask (non-zero, 16 bits; INVAL otherwise). The port's words are
- * not touched. */
+ * not touched. flags is 0 or 4, tested before anything else (INVAL otherwise,
+ * FW 4.93); bit 2 as for PushJobBody. */
 int32_t jq2_port_push_sync(uint32_t port, uint32_t tag_mask, uint32_t flags);
 
 /* cellSpursJobQueuePort2Sync(port, mode): mode 0 (blocking) blocks until every

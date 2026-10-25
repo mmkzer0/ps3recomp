@@ -93,6 +93,11 @@ set_tests_properties(jq2_port_race_stress PROPERTIES LABELS "spurs;stress" TIMEO
 #   jq2_exec_stop_push_shutdown, _copy_push_shutdown  jq2-state: a push that lands after Shutdown
 #   jq2_exec_desc_sizes  every descriptor size the firmware accepts (64, 128..896) through ring, admission and loader on a maxDescriptor 896 queue
 #   jq2_exec_stop_push_size0, _copy_push_size0  jq2-unmodelled: the firmware accepts size 0, the HLE models no 0-byte descriptor
+#   jq2_exec_push_block, _pushsync_block, _push_block_copy  a push without flags bit 2 on a full ring waits (a pusher parked by ExecutorHooks::on_push_blocked, released when intake resumes) and lands in order
+#   jq2_exec_push_nonblock  flags bit 2 on a full ring: AGAIN, nothing written, B rolled back
+#   jq2_exec_push_flags  PushJob flags & ~7, CopyPush flags & ~3, PushSync flags & ~4 are A02 first
+#   jq2_exec_stop_push_block_shutdown  jq2-unmodelled: a pusher parked on a full ring when Shutdown runs
+#   jq2_exec_stop_push_flag1, _copy_push_flag1  jq2-unmodelled: flag bit 1, stored for the PM by the firmware, is not decoded
 #   jq2_exec_observer   the job observer: layout at start, r3 at end, off when removed
 #   jq2_exec_validate   every guard and status code of jq2.h
 #   jq2_exec_lifted     a lifted-style body returns normally: executed and credited once
@@ -109,7 +114,9 @@ set_target_properties(test_jq2_executor PROPERTIES LINKER_LANGUAGE CXX)
 foreach(mode premature copy credit wrap barrier sync join observer validate lifted layout layout-896 jm-wait heap-fit
               stop-job stop-halt stop-jm stop-jm-lifted stop-heap stop-unmodelled stop-crt stop-ring
               sync-concurrent waiter-fresh waiter-63 stop-waiter-id waiter-64-nowake stop-waiter-64-wake stop-wait stop-fiber-notify
-              stop-push-shutdown stop-copy-push-shutdown desc-sizes stop-push-size0 stop-copy-push-size0)
+              stop-push-shutdown stop-copy-push-shutdown desc-sizes stop-push-size0 stop-copy-push-size0
+              push-block push-nonblock pushsync-block push-block-copy push-flags stop-push-block-shutdown
+              stop-push-flag1 stop-copy-push-flag1)
     string(REPLACE "-" "_" name "${mode}")
     add_test(NAME jq2_exec_${name} COMMAND test_jq2_executor ${mode})
     set_tests_properties(jq2_exec_${name} PROPERTIES LABELS "spurs;t0;tsan" TIMEOUT 300)

@@ -24,12 +24,12 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "memory/reservation.h"
 #include "ps3emu/endian.h"
 #include "ps3emu/stop.h"
-#include "ps3emu/fw_divergence.h"
 #include "spu/spu_context.h"
 #include "spu/spu_interp.h"
 #include "spu/spu_workload.h"
@@ -419,12 +419,15 @@ public:
     void begin_shutdown()
     {
         shut_.store(true, std::memory_order_release);
+        std::vector<std::uint32_t> room;
         {
             std::lock_guard<std::mutex> lk(mu_);
             stopping_ = true;
             ++gen_;
+            room = take_room_fibers(); /* a blocked pusher looks again and sees Shutdown */
         }
         cv_.notify_all();
+        signal_room_fibers(room);
         if (pool_) pool_->shutdown();
     }
 
@@ -434,17 +437,54 @@ public:
         if (hooks_.on_push_checked != nullptr) hooks_.on_push_checked(hooks_.user, port_ea);
     }
 
+    /* What the ring write of a push came to: `result` is empty when Shutdown won and the entry was
+     * not written; `waited` says the pusher had found the ring full and waited for room. */
+    struct Pushed {
+        std::optional<PushResult> result;
+        bool waited = false;
+    };
+
     /* The ring write of every push, ordered against Shutdown by mu_: Shutdown
      * sets stopping_ under mu_, and a worker leaves only after seeing stopping_
      * with an empty ring under mu_. An entry written here under mu_ with
-     * stopping_ clear is therefore seen by a worker; nullopt means Shutdown won
-     * and the entry was not written (it would never run or be credited). The
-     * lock order is mu_, then the ring's reservation-model line lock. */
-    std::optional<PushResult> push_unless_shut(const Entry& entry)
+     * stopping_ clear is therefore seen by a worker; an empty result means
+     * Shutdown won and the entry was not written (it would never run or be
+     * credited). With `block` a full ring is waited out (await_room) instead of
+     * returned as ring_full. The lock order is mu_, then the ring's
+     * reservation-model line lock. */
+    Pushed push_unless_shut(const Entry& entry, bool block, std::uint32_t port_ea)
     {
-        std::lock_guard<std::mutex> lk(mu_);
-        if (stopping_) return std::nullopt;
-        return ring_push(*ring_, entry, true);
+        Pushed out;
+        std::unique_lock<std::mutex> lk(mu_);
+        for (;;) {
+            if (stopping_) return out;
+            const PushResult r = ring_push(*ring_, entry, true);
+            if (r.error != PushError::ring_full || !block) {
+                out.result = r;
+                return out;
+            }
+            const bool first = !out.waited; /* a wake that finds the ring full again is not a new park */
+            out.waited = true;
+            await_room(lk, port_ea, first);
+        }
+    }
+
+    /* Under mu_: the fibers parked in await_room, for the caller to signal with signal_room_fibers
+     * once it has dropped the lock. A fiber is handed out once, so one wake leaves no stale signal. */
+    std::vector<std::uint32_t> take_room_fibers() { return std::exchange(room_fibers_, {}); }
+
+    /* With no queue lock held. A parked fiber is live by construction, so a refusal is a broken
+     * invariant. */
+    void signal_room_fibers(const std::vector<std::uint32_t>& fibers) const
+    {
+        for (const std::uint32_t fiber : fibers) {
+            const ps3_fiber_notify_status st = ps3_fiber_notify(fiber);
+            if (st == PS3_FIBER_NOTIFY_OK) continue;
+            stop_with(PS3_STOP_JQ2_WAKE, "a push fiber waiting for ring room cannot be signalled",
+                      "The fiber parked in the ring writer is not live (finished or destroyed while waiting).",
+                      {hex("queue", ea_), hex("fiber", fiber), text("reason", "push-room-notify"),
+                       dec("status", static_cast<std::uint32_t>(st))});
+        }
     }
 
     void join_workers()
@@ -595,6 +635,41 @@ private:
                   {hex("queue", ea_), text("reason", reason), hex("index", d.ring_index), hex("descriptor", d.job.descriptor_ea)});
     }
 
+    /* Under mu_ with the ring full: wait until a worker's intake pass has made room, or Shutdown has
+     * been called. Returns with mu_ held and the ring state unknown; the caller looks again.
+     *
+     * A fiber must wait cooperatively, so its worker keeps running other fibers: it parks in
+     * cellFiberPpuWaitSignal on its own EA (FW 4.93's fiber pusher does the same) and the worker's
+     * intake pass signals it through take_room_fibers / signal_room_fibers. A thread blocks on the
+     * queue's progress condition (the firmware waits on the queue's event flag with a waiter bit; the
+     * host condition variable is this executor's equivalent for a waiter nothing outside it can see).
+     *
+     * Registration and the generation read happen under mu_, before the lock is dropped, so a wake
+     * between that point and the wait (a worker consuming, Shutdown) is never lost: a fiber's signal
+     * is sticky, and a thread's predicate compares gen_ with the value read under the lock. */
+    void await_room(std::unique_lock<std::mutex>& lk, std::uint32_t port_ea, bool first)
+    {
+        const auto self = static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(cellFiberPpuSelf()));
+        const std::uint64_t seen = gen_;
+        if (self != 0) room_fibers_.push_back(self);
+        lk.unlock();
+        if (first && hooks_.on_push_blocked != nullptr) hooks_.on_push_blocked(hooks_.user, port_ea);
+        if (self == 0) {
+            lk.lock();
+            cv_.wait(lk, [&] { return gen_ != seen; });
+            return;
+        }
+        const std::int32_t rc = cellFiberPpuWaitSignal();
+        lk.lock();
+        std::erase(room_fibers_, self); /* gone already when the intake pass signalled it */
+        if (rc != 0) {
+            stop_with(PS3_STOP_JQ2_WAKE, "a push fiber's wait for ring room failed",
+                      "cellFiberPpuWaitSignal refused the wait; the fiber can never be woken.",
+                      {hex("queue", ea_), hex("fiber", self), text("reason", "push-room-wait"),
+                       hex("rc", static_cast<std::uint32_t>(rc))});
+        }
+    }
+
     void worker_loop(unsigned instance)
     {
         spurs_job_set_spu_num(instance);
@@ -621,7 +696,11 @@ private:
                     counters_.dispatched.fetch_add(1);
                     ++gen_;
                     cv_.notify_all(); /* the entries behind it may be runnable elsewhere */
+                    /* The pass consumed this entry: a pusher waiting on a full ring has room. A thread
+                     * pusher saw gen_ move; a fiber is signalled once the lock is released. */
+                    const std::vector<std::uint32_t> room = take_room_fibers();
                     lk.unlock();
+                    signal_room_fibers(room);
                     run_job(js, obs);
                     lk.lock();
                     if (!sched_->complete(d.id)) {
@@ -636,9 +715,16 @@ private:
                 }
                 if (pass.syncs_consumed != 0 || pass.read_after != pass.read_before) {
                     /* Consumed something and dispatched nothing (a SYNC, or entries
-                     * behind a barrier): the next pass may dispatch. */
+                     * behind a barrier): the next pass may dispatch, and a pusher
+                     * waiting on a full ring may have room. */
                     ++gen_;
                     cv_.notify_all();
+                    const std::vector<std::uint32_t> room = take_room_fibers();
+                    if (!room.empty()) {
+                        lk.unlock();
+                        signal_room_fibers(room);
+                        lk.lock();
+                    }
                     continue;
                 }
             }
@@ -690,6 +776,7 @@ private:
     std::uint64_t gen_ = 0;
     bool paused_ = false;
     bool stopping_ = false;
+    std::vector<std::uint32_t> room_fibers_; /* fibers parked in await_room, under mu_ */
     std::optional<jq2_job_observer> observer_; /* under mu_ */
     unsigned running_ = 0;
     std::atomic<bool> shut_{false};
@@ -1007,13 +1094,24 @@ int bitmap_rmw(std::uint8_t* line, void* user)
 }
 
 /* Enqueue one entry for a port's push, with the port accounting when the push
- * carries flags & 1. */
-std::int32_t enqueue(Queue& q, std::uint32_t port_ea, const Entry& entry, bool accounted)
+ * carries flags & 1. `block` is the firmware's !(flags & 4): a full ring makes
+ * the pusher wait until a worker has made room, or with the bit set returns
+ * AGAIN (FW 4.93 ring writer 0x02001138). */
+std::int32_t enqueue(Queue& q, std::uint32_t port_ea, const Entry& entry, bool accounted, bool block)
 {
     q.push_checked(port_ea);
     const auto write = [&]() -> std::uint32_t {
-        const std::optional<PushResult> pushed = q.push_unless_shut(entry);
-        if (!pushed) {
+        const Queue::Pushed pushed = q.push_unless_shut(entry, block, port_ea);
+        if (!pushed.result) {
+            if (pushed.waited) {
+                /* Reachable only for a push without flags & 1: an accounted push holds B, which keeps its
+                 * port from being destroyed and so Shutdown from succeeding. */
+                stop_with(PS3_STOP_JQ2_UNMODELLED, "a JobQueue2 push was waiting for ring room when the queue shut down",
+                          "The firmware's pusher waits on a full ring; what it does when Shutdown arrives meanwhile "
+                          "is not decoded, and the HLE does not invent a return code. Do not shut down a queue "
+                          "while a push is blocked on it.",
+                          {hex("queue", q.ea()), hex("port", port_ea), text("reason", "push-blocked-at-shutdown")});
+            }
             /* Reached by a push that passed check_push while Shutdown ran. The
              * accounted path has already counted it in B and the copy path
              * holds a pool slot: neither can be undone here, so it is a stop
@@ -1023,17 +1121,13 @@ std::int32_t enqueue(Queue& q, std::uint32_t port_ea, const Entry& entry, bool a
                       "credited. Do not push to a queue that is being shut down.",
                       {hex("queue", q.ea()), hex("port", port_ea), text("reason", "push-after-shutdown")});
         }
-        const PushResult& r = *pushed;
+        const PushResult& r = *pushed.result;
         if (r.ok()) {
             q.counters().pushed.fetch_add(1);
             return 0;
         }
-        if (r.error == PushError::ring_full) {
-            /* FW 4.93 libspurs_jq ring writer: a full ring returns A01 only with flags bit 2; otherwise
-             * the pusher waits for room. Counted until the blocking path exists. */
-            PS3_FW_DIVERGENCE("JQ-S15");
-            return static_cast<std::uint32_t>(JQ2_ERR_AGAIN);
-        }
+        /* Only a non-blocking push (flags bit 2) gets here with a full ring. */
+        if (r.error == PushError::ring_full) return static_cast<std::uint32_t>(JQ2_ERR_AGAIN);
         stop_with(PS3_STOP_JQ2_STATE, "the ring writer refused an entry the executor had validated",
                   "An executor invariant broke; this is a bug in the executor.",
                   {hex("queue", q.ea()), dec("error", static_cast<unsigned>(r.error)),
@@ -1379,18 +1473,36 @@ int32_t jq2_port_destroy(uint32_t port)
     return JQ2_OK;
 }
 
+/* Push flag bit 1: FW 4.93 PushBodyInternal stores it in entry w0 bit 2 for the PM, whose reading of it is not
+ * decoded. Rather than drop it silently, a push that sets it stops once every firmware check has passed and
+ * before anything is written. */
+static void stop_on_push_flag1(const char* api, uint32_t port, uint32_t flags)
+{
+    if ((flags & 2u) == 0) return;
+    stop_with(PS3_STOP_JQ2_UNMODELLED, "JobQueue2 push with flag bit 1 (stored for the PM, meaning not decoded)",
+              "The HLE writes no w0 bit 2 and models no PM effect for it; decode the PM's use before allowing it.",
+              {text("api", api), hex("port", port), hex("flags", flags)});
+}
+
 int32_t jq2_port_push_job(uint32_t port, uint32_t descriptor, uint32_t size, uint32_t tag, uint32_t flags)
 {
+    /* FW 4.93 PushJobBody wrapper: flags & ~7 is the first test. Bit 1 stops (stop_on_push_flag1); bit 2 is
+     * "do not block on a full ring". */
+    if ((flags & ~7u) != 0) return JQ2_ERR_INVAL;
     const PushCheck c = check_push(port, descriptor, size, tag);
     if (c.error != JQ2_OK) return c.error;
+    stop_on_push_flag1("PushJobBody", port, flags);
     const bool accounted = (flags & 1u) != 0;
     const JobEntry entry{accounted ? port : 0u, descriptor, static_cast<std::uint8_t>(tag), c.code};
-    return enqueue(*c.port.queue, port, entry, accounted);
+    return enqueue(*c.port.queue, port, entry, accounted, (flags & 4u) == 0);
 }
 
 int32_t jq2_port_copy_push(uint32_t port, uint32_t source, uint32_t size, uint32_t copy_size, uint32_t tag,
                            uint32_t flags)
 {
+    /* FW 4.93 CopyPushJobBody wrapper: flags & ~3 is the first test; bit 1 stops (stop_on_push_flag1), bit 2
+     * does not exist. */
+    if ((flags & ~3u) != 0) return JQ2_ERR_INVAL;
     const PushCheck c = check_push(port, source, size, tag);
     if (c.error != JQ2_OK) return c.error;
     if (size > copy_size) return JQ2_ERR_INVAL;
@@ -1400,6 +1512,7 @@ int32_t jq2_port_copy_push(uint32_t port, uint32_t source, uint32_t size, uint32
 
     const ClassResult cls = DescriptorPool::class_of_copy_size(copy_size);
     if (!cls.ok()) return firmware_code(cls.error);
+    stop_on_push_flag1("CopyPushJobBody", port, flags);
     const AcquireResult slot = pool->acquire(cls.cls, true);
     if (!slot.ok()) return firmware_code(slot.error);
     if (const PoolError e = pool->snapshot(source, size, slot.ea); e != PoolError::none) {
@@ -1409,18 +1522,22 @@ int32_t jq2_port_copy_push(uint32_t port, uint32_t source, uint32_t size, uint32
 
     const bool accounted = (flags & 1u) != 0;
     const CopyEntry entry{accounted ? port : 0u, slot.ea, static_cast<std::uint8_t>(tag), c.code};
-    const std::int32_t rc = enqueue(q, port, entry, accounted);
+    /* CopyPush has no non-blocking mode: a full ring always waits for room. */
+    const std::int32_t rc = enqueue(q, port, entry, accounted, true);
     if (rc != JQ2_OK) pool->release(slot.ea);
     return rc;
 }
 
 int32_t jq2_port_push_sync(uint32_t port, uint32_t tag_mask, uint32_t flags)
 {
+    /* FW 4.93 PushSync tests the flags first, before the port: only 0 and 4 pass, and bit 2 is "do not
+     * block on a full ring". The tag mask comes after the port tests. */
+    if ((flags & ~4u) != 0) return JQ2_ERR_INVAL;
     const PortRef ref = resolve_port(port);
     if (ref.error != JQ2_OK) return ref.error;
-    if (tag_mask == 0 || tag_mask > 0xFFFFu || (flags & ~1u) != 0) return JQ2_ERR_INVAL;
+    if (tag_mask == 0 || tag_mask > 0xFFFFu) return JQ2_ERR_INVAL;
     if (ref.queue->shut()) return JQ2_ERR_STAT;
-    return enqueue(*ref.queue, port, SyncEntry{static_cast<std::uint16_t>(tag_mask)}, false);
+    return enqueue(*ref.queue, port, SyncEntry{static_cast<std::uint16_t>(tag_mask)}, false, (flags & 4u) == 0);
 }
 
 int32_t jq2_port_sync(uint32_t port, uint32_t mode)

@@ -58,6 +58,13 @@
  *               128..896) end to end; the ring word carries the 3-bit class
  *   stop-push-size0, stop-copy-push-size0  the firmware accepts size 0; the HLE stops:
  *               jq2-unmodelled
+ *   stop-push-flag1, stop-copy-push-flag1  flag bit 1 (stored for the PM, not decoded) on an
+ *               otherwise valid push: jq2-unmodelled, after every firmware check
+ *   push-block, pushsync-block, push-block-copy  a push without flags bit 2 on a full
+ *               ring parks (on_push_blocked) until intake resumes, then lands in order
+ *   push-nonblock  flags bit 2 on a full ring is AGAIN: nothing written, B rolled back
+ *   push-flags  PushJob flags & ~7, CopyPush flags & ~3, PushSync flags & ~4: A02, first
+ *   stop-push-block-shutdown  Shutdown while a pusher is parked: jq2-unmodelled
  */
 #include "jq2/executor.hpp"
 #include "jq2/jq2.h"
@@ -469,11 +476,19 @@ void hook_push_checked(void*, std::uint32_t)
     while (!g_gate.release) std::this_thread::sleep_for(std::chrono::microseconds(100));
 }
 
+/* A push parked on a full ring (ExecutorHooks::on_push_blocked). */
+struct PushParked {
+    std::atomic<unsigned> blocked{0};
+};
+PushParked g_parked;
+void hook_push_blocked(void*, std::uint32_t) { g_parked.blocked.fetch_add(1); }
+
 void install_hooks()
 {
     ExecutorHooks h;
     h.on_admit = &hook_admit;
     h.on_push_checked = &hook_push_checked;
+    h.on_push_blocked = &hook_push_blocked;
     h.on_done = &hook_done;
     if (g_lifted != kNoLifted) h.select_body = &hook_select;
     set_executor_hooks(h);
@@ -509,27 +524,12 @@ struct Rig {
     {
         return jq2_port_push_job(port, desc, size, tag, flags);
     }
-    /* Push until the ring has room. */
+    /* Push; a full ring is waited out (flags without bit 2). */
     void push_wait(std::uint32_t desc, std::uint32_t size, std::uint32_t tag, std::uint32_t flags = 1)
     {
-        for (;;) {
-            const std::int32_t rc = push(desc, size, tag, flags);
-            if (rc == 0) return;
-            CHECK(rc == JQ2_ERR_AGAIN, "push rc=0x%X", unsigned(rc));
-            if (rc != JQ2_ERR_AGAIN) return;
-            std::this_thread::sleep_for(std::chrono::microseconds(100));
-        }
+        CHECK(push(desc, size, tag, flags) == 0, "push");
     }
-    void sync_tags_wait(std::uint32_t mask)
-    {
-        for (;;) {
-            const std::int32_t rc = jq2_port_push_sync(port, mask, 0);
-            if (rc == 0) return;
-            CHECK(rc == JQ2_ERR_AGAIN, "push sync rc=0x%X", unsigned(rc));
-            if (rc != JQ2_ERR_AGAIN) return;
-            std::this_thread::sleep_for(std::chrono::microseconds(100));
-        }
-    }
+    void sync_tags_wait(std::uint32_t mask) { CHECK(jq2_port_push_sync(port, mask, 0) == 0, "push sync"); }
     jq2_stats stats()
     {
         jq2_stats s{};
@@ -2043,6 +2043,253 @@ void push_size0_scenario(bool copy)
         "jq2-unmodelled", {"size=0", "0-byte descriptor"});
 }
 
+void push_flag1_scenario(bool copy)
+{
+    expect_stop(
+        [copy] {
+            build_image(IMAGE, Prog::transform);
+            install_hooks();
+            arm_child_watchdog(10);
+            Rig rig({128, 1, copy});
+            const std::uint32_t desc = spec(0).desc;
+            const std::int32_t rc = copy ? jq2_port_copy_push(PORT, desc, 64, 64, 0, 3)
+                                         : jq2_port_push_job(PORT, desc, 64, 0, 3);
+            std::fprintf(stderr, "the stop did not happen: the push returned 0x%X\n", unsigned(rc));
+        },
+        "jq2-unmodelled", {"flags=0x3", "flag bit 1"});
+}
+
+/* ---- a full ring --------------------------------------------------------------- */
+
+/* The firmware's ring writer waits on a full ring unless the push's flags have bit 2 (PushJob and
+ * PushSync) and returns AGAIN only then (re_jq2.md A.2; 0x02001138). The ring is kept full by
+ * pausing intake; ExecutorHooks::on_push_blocked says when a pusher is parked, so no test sleeps to
+ * order anything. */
+struct RingSnap {
+    std::uint8_t entries[32];
+    std::uint64_t index_word;
+    bool operator==(const RingSnap& o) const
+    {
+        return std::memcmp(entries, o.entries, sizeof entries) == 0 && index_word == o.index_word;
+    }
+};
+RingSnap ring_snap()
+{
+    RingSnap s{};
+    std::memcpy(s.entries, vm_base + RING, sizeof s.entries);
+    std::memcpy(&s.index_word, vm_base + QUEUE, 8);
+    return s;
+}
+
+/* A depth-4 queue, one worker, intake paused, the ring full of jobs 0..3 pushed with `flags`. */
+struct FullRing {
+    Rig rig;
+    std::vector<JobSpec> specs;
+    explicit FullRing(bool pool = false, std::uint32_t flags = 1) : rig({4, 1, pool})
+    {
+        CHECK(set_intake_paused(QUEUE, true), "pause");
+        for (std::uint32_t j = 0; j < 4; ++j) {
+            specs.push_back(spec(j));
+            CHECK(rig.push(specs.back().desc, 64, 0, flags) == 0, "fill %u", j);
+        }
+        const auto view = observe_queue(QUEUE);
+        CHECK(view && view->outstanding == 4, "the ring is full");
+    }
+};
+
+/* A push on a thread of its own. `resumed` is set before the queue resumes, so a push that returned
+ * without waiting for the consumer sees it clear. */
+struct Pusher {
+    std::atomic<bool> done{false}, resumed{false}, resumed_at_return{false};
+    std::atomic<std::int32_t> rc{-1};
+    std::thread t;
+    explicit Pusher(std::function<std::int32_t()> f)
+        : t([this, f] {
+              rc = f();
+              resumed_at_return = resumed.load();
+              done = true;
+          })
+    {
+    }
+    /* True once the push is parked on the ring; false if it returned instead. */
+    bool parked()
+    {
+        wait_for([&] { return g_parked.blocked.load() >= 1 || done.load(); });
+        return g_parked.blocked.load() >= 1 && !done.load();
+    }
+    void release()
+    {
+        resumed = true;
+        CHECK(set_intake_paused(QUEUE, false), "resume");
+        t.join();
+    }
+};
+
+bool admitted_before(std::uint32_t first, std::uint32_t second)
+{
+    std::lock_guard<std::mutex> lk(g_probe.mu);
+    return g_probe.admit.count(first) != 0 && g_probe.admit.count(second) != 0 &&
+           g_probe.admit[first] < g_probe.admit[second];
+}
+
+/* (a) A job push with flags 1 on a full ring waits, B already counts it, and the entry lands after
+ * the four in front of it once the worker has consumed one. */
+void mode_push_block()
+{
+    build_image(IMAGE, Prog::transform);
+    install_hooks();
+    FullRing f;
+    const JobSpec e = spec(4);
+    CHECK(port_b() == 4, "B %u", port_b());
+    Pusher p([&] { return f.rig.push(e.desc, 64, 0, 1); });
+    CHECK(p.parked(), "the push parks on the full ring (the firmware returns AGAIN only with flags bit 2)");
+    CHECK(g_parked.blocked.load() == 1, "parked once");
+    CHECK(port_b() == 5, "B is taken before the ring write: %u", port_b());
+    CHECK(f.rig.stats().pushed == 4, "nothing was written");
+    p.release();
+    CHECK(p.rc.load() == 0, "rc 0x%X", unsigned(p.rc.load()));
+    CHECK(p.resumed_at_return.load(), "the push returned only after the consumer resumed");
+    CHECK(jq2_port_sync(PORT, 0) == 0, "sync");
+    for (const JobSpec& s : f.specs) CHECK(job_ok(s), "job %u", s.serial);
+    CHECK(job_ok(e), "the pushed job ran");
+    CHECK(admitted_before(3, 4), "the entry landed behind the four in front of it");
+    CHECK(f.rig.stats().pushed == 5 && port_b() == 0, "pushed %llu B %u", (unsigned long long)f.rig.stats().pushed,
+          port_b());
+    f.rig.teardown();
+}
+
+/* (b) With flags bit 2 a full ring is AGAIN, nothing is written and B is as it was; a non-blocking
+ * push with room writes. */
+void mode_push_nonblock()
+{
+    build_image(IMAGE, Prog::transform);
+    install_hooks();
+    FullRing f(false, 5); /* the ring is filled by non-blocking, accounted pushes */
+    const JobSpec e = spec(4);
+    const RingSnap before = ring_snap();
+    CHECK(f.rig.push(e.desc, 64, 0, 5) == JQ2_ERR_AGAIN, "flags 5");
+    CHECK(f.rig.push(e.desc, 64, 0, 4) == JQ2_ERR_AGAIN, "flags 4 (not accounted)");
+    CHECK(jq2_port_push_sync(PORT, 1, 4) == JQ2_ERR_AGAIN, "PushSync flags 4");
+    CHECK(port_b() == 4, "the accounted push is rolled back: B %u", port_b());
+    CHECK(ring_snap() == before, "nothing was written to the ring");
+    CHECK(f.rig.stats().pushed == 4 && g_parked.blocked.load() == 0, "nothing parked");
+    CHECK(set_intake_paused(QUEUE, false), "resume");
+    CHECK(jq2_port_sync(PORT, 0) == 0, "sync");
+    for (const JobSpec& s : f.specs) CHECK(job_ok(s), "job %u", s.serial);
+    CHECK(f.rig.push(e.desc, 64, 0, 5) == 0, "a non-blocking push with room writes");
+    CHECK(jq2_port_sync(PORT, 0) == 0, "sync");
+    CHECK(job_ok(e), "the job ran");
+    f.rig.teardown();
+}
+
+/* (c) PushSync: flags 4 on a full ring is AGAIN and writes nothing; flags 0 waits and the SYNC lands. */
+void mode_pushsync_block()
+{
+    build_image(IMAGE, Prog::transform);
+    install_hooks();
+    FullRing f;
+    const RingSnap before = ring_snap();
+    CHECK(jq2_port_push_sync(PORT, 1, 4) == JQ2_ERR_AGAIN, "flags 4");
+    CHECK(ring_snap() == before && f.rig.stats().pushed == 4, "nothing was written");
+    Pusher p([] { return jq2_port_push_sync(PORT, 1, 0); });
+    CHECK(p.parked(), "PushSync flags 0 parks on the full ring");
+    CHECK(f.rig.stats().pushed == 4, "still nothing written");
+    p.release();
+    CHECK(p.rc.load() == 0 && p.resumed_at_return.load(), "rc 0x%X", unsigned(p.rc.load()));
+    CHECK(jq2_port_sync(PORT, 0) == 0, "sync");
+    CHECK(wait_for([] {
+        const auto v = observe_queue(QUEUE);
+        return v && v->outstanding == 0;
+    }), "the SYNC was consumed");
+    CHECK(get16(QUEUE + 2) == 1 && get16(QUEUE + 0) == 1, "write %u read %u: the SYNC took the fifth slot",
+          get16(QUEUE + 2), get16(QUEUE + 0));
+    CHECK(f.rig.stats().pushed == 5, "pushed");
+    f.rig.teardown();
+}
+
+/* A CopyPush has no non-blocking mode: on a full ring it waits (holding its pool slot) like a job. */
+void mode_push_block_copy()
+{
+    build_image(IMAGE, Prog::transform);
+    install_hooks();
+    FullRing f(true);
+    const JobSpec e = spec(4);
+    Pusher p([&] { return jq2_port_copy_push(PORT, e.desc, 64, 64, 0, 1); });
+    CHECK(p.parked(), "the CopyPush parks on the full ring");
+    build_desc(e.desc, IMAGE, e.out, e.in, 999, 999); /* the source is free to reuse: the pool holds a snapshot */
+    p.release();
+    CHECK(p.rc.load() == 0 && p.resumed_at_return.load(), "rc 0x%X", unsigned(p.rc.load()));
+    CHECK(jq2_port_sync(PORT, 0) == 0, "sync");
+    CHECK(job_ok(e), "the snapshot ran");
+    CHECK(admitted_before(3, 4), "in order");
+    f.rig.teardown();
+}
+
+/* (d) The flag masks are the first test of each API (FW 4.93): PushJob flags & ~7, CopyPush flags &
+ * ~3, PushSync flags & ~4, before the port is looked at. Nothing is touched by a refusal. */
+void mode_push_flags()
+{
+    build_image(IMAGE, Prog::transform);
+    install_hooks();
+    Rig rig({4, 1, false});
+    CHECK(set_intake_paused(QUEUE, true), "pause");
+    const JobSpec a = spec(0), b = spec(1);
+    const RingSnap before = ring_snap();
+    for (const std::uint32_t flags : {8u, 0x10u, 0x80000000u, 0xFFFFFFF8u}) {
+        CHECK(jq2_port_push_job(PORT, a.desc, 64, 0, flags) == JQ2_ERR_INVAL, "PushJob flags 0x%X", unsigned(flags));
+        CHECK(jq2_port_push_job(0, 0, 64, 0, flags) == JQ2_ERR_INVAL, "PushJob flags 0x%X before the port", unsigned(flags));
+    }
+    for (const std::uint32_t flags : {1u, 2u, 3u, 5u, 6u, 7u, 8u, 0x80000000u}) {
+        CHECK(jq2_port_push_sync(PORT, 1, flags) == JQ2_ERR_INVAL, "PushSync flags 0x%X", unsigned(flags));
+        CHECK(jq2_port_push_sync(0, 1, flags) == JQ2_ERR_INVAL, "PushSync flags 0x%X before the port", unsigned(flags));
+    }
+    for (const std::uint32_t flags : {4u, 5u, 8u, 0x80000000u}) {
+        CHECK(jq2_port_copy_push(PORT, a.desc, 64, 64, 0, flags) == JQ2_ERR_INVAL, "CopyPush flags 0x%X", unsigned(flags));
+        CHECK(jq2_port_copy_push(0, 0, 64, 64, 0, flags) == JQ2_ERR_INVAL, "CopyPush flags 0x%X before the port", unsigned(flags));
+    }
+    /* the mask is exactly ~3: flags 3 passes it (a queue with no pool then has no class) */
+    CHECK(jq2_port_copy_push(PORT, a.desc, 64, 64, 0, 3) == JQ2_ERR_NULL_POINTER, "CopyPush flags 3");
+    CHECK(ring_snap() == before && port_b() == 0 && rig.stats().pushed == 0 && g_parked.blocked.load() == 0,
+          "a refused push touches nothing");
+
+    /* the legal combinations without bit 1 are accepted (bit 1 stops: stop-push-flag1) */
+    CHECK(jq2_port_push_job(PORT, a.desc, 64, 0, 0) == 0, "PushJob flags 0");
+    CHECK(jq2_port_push_job(PORT, b.desc, 64, 0, 4) == 0, "PushJob flags 4 with room");
+    CHECK(jq2_port_push_sync(PORT, 1, 4) == 0, "PushSync flags 4 with room");
+    CHECK(get32(RING + 0) % 8 == 0 && get32(RING + 8) % 8 == 0, "w0 bit 2 stays clear: 0x%08X 0x%08X",
+          get32(RING + 0), get32(RING + 8));
+    CHECK(port_b() == 0, "no flags bit 0: nothing accounted");
+    CHECK(set_intake_paused(QUEUE, false), "resume");
+    CHECK(wait_for([&] { return rig.stats().executed == 2; }), "both jobs ran");
+    CHECK(job_ok(a) && job_ok(b), "outputs");
+    rig.teardown();
+}
+
+/* (f) A pusher parked on a full ring when the queue shuts down: what the firmware does is not
+ * decoded, so it is a named stop. Only an unaccounted push can be parked at Shutdown: an accounted
+ * one holds B, which keeps its port (and so Shutdown) from succeeding. The pusher is detached
+ * because its stop ends the process. */
+void mode_stop_push_block_shutdown()
+{
+    expect_stop(
+        [] {
+            build_image(IMAGE, Prog::transform);
+            install_hooks();
+            arm_child_watchdog(10);
+            FullRing f(false, 0);
+            const JobSpec e = spec(4);
+            std::thread([e] {
+                const std::int32_t rc = jq2_port_push_job(PORT, e.desc, 64, 0, 0);
+                std::fprintf(stderr, "the stop did not happen: the push returned 0x%X\n", unsigned(rc));
+            }).detach();
+            CHECK(wait_for([] { return g_parked.blocked.load() >= 1; }), "the push parks");
+            CHECK(jq2_port_destroy(PORT) == 0, "port destroy");
+            CHECK(jq2_queue_shutdown(QUEUE) == 0, "shutdown");
+            wait_for([] { return false; }, 10000); /* the stop ends the process first */
+        },
+        "jq2-unmodelled", {"reason=push-blocked-at-shutdown"});
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
@@ -2088,6 +2335,14 @@ int main(int argc, char** argv)
     else if (mode == "desc-sizes") mode_desc_sizes();
     else if (mode == "stop-push-size0") push_size0_scenario(false);
     else if (mode == "stop-copy-push-size0") push_size0_scenario(true);
+    else if (mode == "stop-push-flag1") push_flag1_scenario(false);
+    else if (mode == "stop-copy-push-flag1") push_flag1_scenario(true);
+    else if (mode == "push-block") mode_push_block();
+    else if (mode == "push-nonblock") mode_push_nonblock();
+    else if (mode == "pushsync-block") mode_pushsync_block();
+    else if (mode == "push-block-copy") mode_push_block_copy();
+    else if (mode == "push-flags") mode_push_flags();
+    else if (mode == "stop-push-block-shutdown") mode_stop_push_block_shutdown();
     else {
         std::printf("unknown mode %s\n", mode.c_str());
         return 2;

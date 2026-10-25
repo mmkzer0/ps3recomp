@@ -37,8 +37,8 @@ descriptor size class is `size >> 7` in `w1` bits 3..1 (0 is 64 bytes, 1..7 are
 128..896; `SizeCode` keeps the shifted values 0, 2 ... 14) and the EA is
 16-aligned, so bits 3..0 of `w1` are class and phase. Every class is a valid
 size. FW 4.93 PushBodyInternal also stores API flag bit 1 in `w0` bit 2; the
-HLE writer leaves it clear, nothing here consumes it, and an entry with it set
-decodes as `UnknownEntry`. SYNC: `w0 = mask << 16 | 7`, `w1 = bit0`.
+HLE never writes it (a push with flag bit 1 stops, see "Flags and a full ring"),
+and an entry with it set decodes as `UnknownEntry`. SYNC: `w0 = mask << 16 | 7`, `w1 = bit0`.
 
 `w1` bit 0 is **writer metadata**, never an API flag or a mask. It is the queue's
 phase bit (`queue+4` bit 5, toggled on ring wrap) for JOB, COPY and SYNC alike
@@ -621,9 +621,9 @@ A queue EA that already has an active queue is `0x80410A0F` (`STAT`).
 
 **Pushes.** `jq2_port_push_job` / `jq2_port_copy_push` / `jq2_port_push_sync`
 apply the firmware guards (null `A11`, alignment `A10`, argument `A02`, port or
-queue state `A0F`, full ring `A01`, claim collision `A0A`), then account on the
-port line when `flags & 1` (`Port::push_accounted`: `B += 1`, ring write,
-rollback if the ring is full) and write one entry through `ring_push()` into the
+queue state `A0F`, claim collision `A0A`; a full ring is below), then account on
+the port line when `flags & 1` (`Port::push_accounted`: `B += 1`, ring write,
+rollback if the ring write fails) and write one entry through `ring_push()` into the
 guest ring, under the reservation model: the index word at `queue+0x00` (read
 u16, write u16, flags u32 with the writer phase) moves only through
 `resv_host_rmw`, the entry is one 8-byte release store, and a worker that
@@ -633,6 +633,31 @@ snapshots `size` bytes into it and enqueues the slot (contract S3). The
 descriptor `size` is 64 or a multiple of 128 up to the queue's maxDescriptor
 (256..896); anything else is `A02`, and 0, which the firmware's test also
 passes, is the named stop `jq2-unmodelled`.
+
+**Flags and a full ring.** The flags are the first test of each API (FW 4.93,
+before the port): PushJob `flags & ~7`, CopyPush `flags & ~3`, PushSync
+`flags & ~4` (legal values exactly 0 and 4) are `A02`. Bit 0 is the port
+accounting. Bit 1 (PushJob, CopyPush) the firmware stores in `w0` bit 2 of the
+entry for the PM, whose reading of it is not decoded; a push that sets it passes
+every firmware check and then stops with `jq2-unmodelled` (`api port flags`)
+before anything is written. Bit 2 (PushJob, PushSync;
+CopyPush has none) is "do not block": the firmware's ring writer
+(`0x02001138`) returns `A01` on a full ring only then, and otherwise the PPU
+waits until the ring has room. The HLE does the same. With bit 2 set a full
+ring is `A01`, the accounting is rolled back and nothing is written. Without
+it the pusher waits, having taken B first, as the firmware does: a fiber
+parks in `cellFiberPpuWaitSignal` on its own EA (its worker keeps running
+other fibers) and the worker whose intake pass consumed an entry signals it
+(`ps3_fiber_notify`, once per wait, so no stale signal is left); any other
+thread waits on the queue's progress condition. Registration and the
+generation read happen under the queue lock, so a pass between the full-ring
+test and the wait is never lost. Shutdown while a pusher waits is the named
+stop `jq2-unmodelled` `reason=push-blocked-at-shutdown` (the firmware's
+behaviour is not decoded; reachable only for a push without `flags & 1`,
+because an accounted push's B keeps its port, and so Shutdown, from
+succeeding). `ExecutorHooks::on_push_blocked` reports a parked pusher to a
+test. A fiber whose `WaitSignal` is refused, or one that cannot be signalled,
+is `jq2-wake` with `reason=push-room-wait` / `push-room-notify`.
 
 **Workers.** `worker_count` host threads (8 MB stacks: the loader keeps a whole
 `spu_context` on the stack) are the scheduler's instances, one job slot each.
@@ -874,6 +899,17 @@ channel layer and LV2 event flags; labels `spurs;t0;tsan`:
   accepts (64 and 128..896 in steps of 128): the ring word holds the class, the
   worker's admission fetch and the loader's descriptor copy are those bytes.
   `stop-push-size0`, `stop-copy-push-size0`: size 0 is `jq2-unmodelled`.
+- `push-block`, `pushsync-block`, `push-block-copy`: with intake paused and a
+  depth-4 ring full, a push without flags bit 2 parks (`on_push_blocked`, no
+  sleep), has taken B, writes nothing, and returns 0 only after the consumer
+  resumed, landing behind the four entries in front of it. `push-nonblock`:
+  flags bit 2 is `A01` with B rolled back and the ring bytes unchanged.
+  `push-flags`: the three flag masks, before the port, with no state touched.
+  `stop-push-block-shutdown`: `jq2-unmodelled reason=push-blocked-at-shutdown`.
+  `jq2_fiber_push_full`: a fiber pusher on a full ring parks, the one fiber
+  worker runs a second fiber that resumes the queue, and the intake pass
+  signals the first; `jq2_fiber_stop_push_wait`: a fiber whose `WaitSignal` is
+  refused stops `jq2-wake reason=push-room-wait`.
 - `jm-wait`: a job GETLs a stalled two-element list, calls jm word 1 through the
   table and uses the second element's data; the test acknowledges the stall
   only after the routine has polled `RdTagStat` three times.

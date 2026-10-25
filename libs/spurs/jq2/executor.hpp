@@ -55,6 +55,14 @@
  * rejects unreduced ids above 63, so a credit trying to wake a registered
  * waiter with id 64 or above stops with `jq2-wake reason=waiter-id`.
  *
+ * Full ring. A push whose flags leave bit 2 clear waits until an intake pass
+ * has consumed an entry (the firmware's ring writer waits on a full ring and
+ * returns AGAIN only with bit 2 set): a fiber parks in cellFiberPpuWaitSignal
+ * on its own EA and the worker's pass signals it, so its worker keeps running
+ * other fibers; any other thread waits on the queue's progress condition.
+ * Shutdown while one waits is the named stop `jq2-unmodelled
+ * reason=push-blocked-at-shutdown`: the firmware's behaviour is not decoded.
+ *
  * A job in the scheduler's terms: one instance per worker with ONE job slot,
  * because a worker runs a job to completion before it examines the ring again
  * (the PM interleaves two coroutine slots on one SPU; the model's observable
@@ -122,6 +130,14 @@ struct ExecutorHooks {
      * not order anything). Null in production, where the cost is one null test.
      * `port_ea` is the pushing port. */
     void (*on_push_checked)(void* user, std::uint32_t port_ea) = nullptr;
+    /* A push found the ring full and, because its flags do not say "do not block", waits for room
+     * (FW 4.93 ring writer 0x02001138). It runs on the pushing thread with no queue lock held,
+     * after the pusher is committed to waking when a worker consumes an entry or Shutdown is
+     * called, and before it waits, so a test that acts once this has run cannot have its wake
+     * lost: it needs no sleep to know the push is parked. Once per push, however often a wake finds
+     * the ring full again. A test seam; null in production.
+     * `port_ea` is the pushing port. */
+    void (*on_push_blocked)(void* user, std::uint32_t port_ea) = nullptr;
 };
 
 /* Install hooks for the queues created after this call. */

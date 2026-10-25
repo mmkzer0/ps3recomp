@@ -8,6 +8,9 @@
 #   jq2_fiber_mixed      fiber and thread waiters on one port: +4 stays stale, bitmap untouched by fibers
 #   jq2_fiber_race       fibers race job completion against registration, no lost wake
 #   jq2_fiber_shutdown   Shutdown / Destroy while a fiber is blocked in Sync: BUSY, nothing faked
+#   jq2_fiber_push_full  a fiber pushing onto a full ring parks (the worker runs another fiber) and is
+#                        signalled when an intake pass frees a slot
+#   jq2_fiber_stop_push_wait  a fiber that cannot WaitSignal cannot wait on a full ring: jq2-wake
 #   jq2_fiber_c4         B5's producer property: job output, Sync, GetCount/Release, Acquire
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 set(JQ2_FIBER_GEN "${CMAKE_CURRENT_BINARY_DIR}/gen")
@@ -39,7 +42,7 @@ target_include_directories(jq2_fiber PRIVATE "${JQ2_FIBER_GEN}" "${PROJECT_SOURC
     "${PROJECT_SOURCE_DIR}/libs/video" "${PROJECT_SOURCE_DIR}/include")
 target_link_libraries(jq2_fiber PRIVATE ps3recomp_runtime Threads::Threads)
 set_target_properties(jq2_fiber PROPERTIES LINKER_LANGUAGE CXX)
-foreach(mode kind0 spurious mixed race shutdown c4 stop-wait)
+foreach(mode kind0 spurious mixed race shutdown c4 stop-wait push-full stop-push-wait)
     string(REPLACE "-" "_" name "${mode}")
     add_test(NAME jq2_fiber_${name} COMMAND jq2_fiber "${mode}")
     set_tests_properties(jq2_fiber_${name} PROPERTIES LABELS "spurs;fiber;t0;tsan" TIMEOUT 120)

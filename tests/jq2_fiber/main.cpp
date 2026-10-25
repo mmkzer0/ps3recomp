@@ -219,6 +219,10 @@ void hold_job(int serial)
 bool gate_reached() { std::lock_guard lk(gate.mu); return gate.reached; }
 void open_gate() { { std::lock_guard lk(gate.mu); gate.open = true; gate.serial = -1; } gate.cv.notify_all(); }
 
+/* A push parked on a full ring (ExecutorHooks::on_push_blocked). */
+std::atomic<unsigned> push_blocked{0};
+void hook_push_blocked(void*, uint32_t) { push_blocked.fetch_add(1); }
+
 /* ---- world ------------------------------------------------------------------ */
 
 std::atomic<unsigned> fibers_done{0};
@@ -245,6 +249,7 @@ void boot(unsigned queue_workers, unsigned ring_depth = 16)
     hooks.select_body = &hook_select;
     hooks.on_admit = &hook_admit;
     hooks.on_done = &hook_done;
+    hooks.on_push_blocked = &hook_push_blocked;
     set_executor_hooks(hooks);
     wr(QATTR + 4, 8); wr(QATTR + 8, 256);
     CHECK(jq2_queue_create(1, SDK, SPURS, QUEUE, QATTR, 0, 0, 0, RING, ring_depth, queue_workers, 0) == 0);
@@ -301,21 +306,23 @@ bool bitmap_is(uint32_t w0, uint32_t w1 = 0, uint32_t w2 = 0, uint32_t w3 = 0)
 
 /* ---- fiber bodies ----------------------------------------------------------- */
 
-enum Role : uint64_t { R_SYNC = 1, R_OTHER, R_RACE, R_PRODUCER, R_CONSUMER, R_BREAK };
+enum Role : uint64_t { R_SYNC = 1, R_OTHER, R_RACE, R_PRODUCER, R_CONSUMER, R_BREAK, R_PUSHFULL, R_RESUME, R_BREAK_PUSH };
 /* arg: role | job << 8 | port << 24 */
 uint64_t arg_of(Role r, unsigned job = 0, unsigned port = 0) { return r | (uint64_t(job) << 8) | (uint64_t(port) << 24); }
 
 /* The producer's push; the ring may be full until the SPU workers drain it. */
 void push(ppu_context* ctx, unsigned port, unsigned j, unsigned tag)
 {
-    uint64_t rc;
-    do { rc = hc(ctx, PUSH, port_ea(port), desc_of(j), 64, tag, 1); } while (rc == uint64_t(int64_t(int32_t(JQ2_ERR_AGAIN))));
+    const uint64_t rc = hc(ctx, PUSH, port_ea(port), desc_of(j), 64, tag, 1); /* flags 1 waits on a full ring */
     CHECK(rc == 0);
 }
 
 std::atomic<bool> second_ran{false};
 std::atomic<uint32_t> a_when_second{0}, seen_marker{0};
 std::atomic<uint64_t> sync_rc{~0ull};
+std::atomic<uint64_t> full_push_rc{~0ull};
+std::atomic<bool> pusher_done{false}, pusher_done_when_resumed{true};
+std::atomic<unsigned> blocked_when_resumed{0};
 
 struct Phase {
     unsigned first = 0, jobs = 0, batch = 1, consumers = 0;
@@ -388,6 +395,19 @@ void fiber_main(ppu_context* ctx)
         break;
     case R_PRODUCER: producer(ctx); break;
     case R_CONSUMER: consumer(ctx); break;
+    case R_PUSHFULL:
+        full_push_rc = hc(ctx, PUSH, port_ea(port), desc_of(job), 64, 0, 1);
+        pusher_done = true;
+        break;
+    case R_RESUME:
+        blocked_when_resumed = push_blocked.load();
+        pusher_done_when_resumed = pusher_done.load();
+        CHECK(set_intake_paused(QUEUE, false));
+        break;
+    case R_BREAK_PUSH:
+        wr(FIBER, 0); /* its own state word: the wait on a full ring must refuse */
+        hc(ctx, PUSH, port_ea(port), desc_of(job), 64, 0, 1);
+        break;
     case R_BREAK: {
         /* Zero this fiber's own state word: its WaitSignal must now refuse. */
         wr(FIBER, 0);
@@ -622,6 +642,33 @@ void c4()
     teardown();
 }
 
+/* A fiber pushes onto a full ring (flags 1: do not return AGAIN, wait for room).
+ * It parks in WaitSignal, so the one worker thread runs the second fiber, which
+ * resumes the queue; the intake pass that frees a slot signals the first. The
+ * order comes from the hooks and the pause, not from timing. */
+void push_full()
+{
+    boot(1, 4);
+    CHECK(set_intake_paused(QUEUE, true));
+    for (unsigned j = 0; j < 5; ++j) build_job(j);
+    for (unsigned j = 0; j < 4; ++j) CHECK(call(PUSH, port_ea(0), desc_of(j), 64, 0, 1) == 0);
+    CHECK(rd(PORT + 0x10) == 4);
+    make_fiber(arg_of(R_PUSHFULL, 4));
+    make_fiber(arg_of(R_RESUME));
+    start_workers(1);
+    CHECK(until([] { return fibers_done == 2; }));
+    CHECK(full_push_rc.load() == 0);
+    CHECK(push_blocked.load() == 1 && blocked_when_resumed.load() == 1);
+    CHECK(!pusher_done_when_resumed.load()); /* parked, not returned, while the second fiber ran */
+    CHECK(call(SYNC, port_ea(0), 0) == 0);
+    for (unsigned j = 0; j < 5; ++j) CHECK(output_ok(j));
+    CHECK(L.admit[3] < L.admit[4]);
+    CHECK(rd(PORT + 0x10) == 0 && (a_of() & 0x1FFFFFFFu) == 0);
+    const jq2_stats s = stats();
+    CHECK(s.pushed == 5 && s.dispatched == 5 && s.credited == 5);
+    teardown();
+}
+
 /* ---- stops ------------------------------------------------------------------ */
 
 void expect_stop(const std::function<void()>& child, std::initializer_list<const char*> needles)
@@ -663,6 +710,21 @@ void stop_wait()
     }, {"reason=fiber-wait", "rc=0x8076000F"});
 }
 
+/* A fiber that cannot wait cannot park on a full ring either: the executor stops
+ * instead of returning a code or spinning. */
+void stop_push_wait()
+{
+    expect_stop([] {
+        boot(1, 4);
+        CHECK(set_intake_paused(QUEUE, true));
+        for (unsigned j = 0; j < 5; ++j) build_job(j);
+        for (unsigned j = 0; j < 4; ++j) CHECK(call(PUSH, port_ea(0), desc_of(j), 64, 0, 1) == 0);
+        make_fiber(arg_of(R_BREAK_PUSH, 4));
+        start_workers(1);
+        for (;;) std::this_thread::yield();
+    }, {"reason=push-room-wait", "rc=0x8076000F"});
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
@@ -682,6 +744,8 @@ int main(int argc, char** argv)
     else if (mode == "shutdown") shutdown();
     else if (mode == "c4") c4();
     else if (mode == "stop-wait") stop_wait();
+    else if (mode == "push-full") push_full();
+    else if (mode == "stop-push-wait") stop_push_wait();
     else return 2;
     std::printf("%s %s\n", failures ? "FAIL" : "PASS", argv[1]);
     return failures ? 1 : 0;

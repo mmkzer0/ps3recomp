@@ -22,10 +22,11 @@
  *                               [jq2fw-049; jq2c-022]
  *         2      push flag 1    The firmware stores API flags bit 1 here (the
  *                               entry is port | tag << 3 | (flags >> 1 & 1) << 2
- *                               | command). Nothing in this HLE consumes it
- *                               and the PM's reading of it is not decoded, so
- *                               the writer leaves it clear and an entry that
- *                               has it set decodes as UnknownEntry.
+ *                               | command). The PM's reading of it is not
+ *                               decoded, so a push with flag bit 1 stops
+ *                               (jq2-unmodelled), the writer leaves the bit
+ *                               clear and an entry that has it set decodes
+ *                               as UnknownEntry.
  *         1..0   command        0 = JOB, 2 = COPY. [jq2c-021; jq-ring2]
  *     w1  31..4  data EA        JOB: the caller's descriptor EA (not copied)
  *                               [jq2fw-023]. COPY: the queue-pool destination
