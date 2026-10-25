@@ -13,7 +13,7 @@ import struct
 import subprocess
 import sys
 import tempfile
-from check_ppu_scaffold import loader_support_objects, loader_support_sources, stub_header
+from check_ppu_scaffold import lifter_abi_sources, loader_support_objects, loader_support_sources, stub_header
 
 ROOT = Path(__file__).resolve().parents[1]
 SENTINEL = 0xDEADBEEF
@@ -60,7 +60,7 @@ def main():
         subprocess.run([os.environ.get('CXX', 'c++'), '-std=c++17', '-O1', '-ffunction-sections', '-fdata-sections',
                         '-I' + str(tmp), '-I' + str(ROOT / 'include'), '-I' + str(ROOT / 'runtime/platform'),
                         str(ROOT / 'runtime/ppu/ppu_loader.cpp'), str(ROOT / 'tests/test_proc_param.cpp'),
-                        *loader_support_sources(), *loader_support_objects(tmp), str(obj), *flags,
+                        *loader_support_sources(), *lifter_abi_sources(), *loader_support_objects(tmp), str(obj), *flags,
                         '-o', str(binary)], check=True, timeout=120)
         env = {k: v for k, v in os.environ.items() if not k.startswith(('PPU_', 'PS3_', 'PS3RECOMP_', 'SPU_'))}
         for i, (name, (segments, want)) in enumerate(cases.items()):

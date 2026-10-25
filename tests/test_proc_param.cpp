@@ -10,6 +10,7 @@
 #include <cstring>
 #include <sys/mman.h>
 #include "win32_compat.h"
+#include "ps3emu/lifter_abi.h"   /* the lifted-code ABI this fixture is written in */
 
 extern "C" {
 uint8_t* vm_base;
@@ -31,6 +32,9 @@ extern const func_entry function_table[] = {{0, nullptr, nullptr}};
 extern const uint64_t function_table_count = 0;
 static char g_image_sha[65];
 extern "C" const char* ppu_lift_image_sha256(void) { return g_image_sha; }
+/* The lifted-code ABI this fixture is written in; the loader checks it at
+ * startup (ps3emu/lifter_abi.h). A real lift gets this from ppu_recomp.h. */
+extern "C" const uint32_t ppu_lifter_abi = PPU_RUNTIME_LIFTER_ABI;
 
 static constexpr uint32_t kSentinel = 0xDEADBEEFu;
 

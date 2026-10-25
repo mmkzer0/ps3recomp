@@ -10,7 +10,7 @@ import gates_common as g
 
 PROBE = None
 
-KINDS = ["identity-mismatch", "config-invalid", "unresolved-nid",
+KINDS = ["identity-mismatch", "lifter-abi", "config-invalid", "unresolved-nid",
          "unimplemented-syscall", "unlifted-function",
          "unresolved-indirect-call", "unknown-instruction",
          "dispatch-depth-exceeded", "spu-dma-repeat",

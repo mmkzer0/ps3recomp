@@ -26,6 +26,7 @@
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include "ps3emu/lifter_abi.h"   /* the lifted-code ABI this fixture is written in */
 
 /* The generated loader's three-field registry entry; this fixture registers
  * its synthetic functions at runtime and has no static lifted program. */
@@ -37,6 +38,9 @@ extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
 extern const func_entry function_table[1] = {{0, nullptr, nullptr}};
 extern const uint64_t function_table_count = 0;
 const char* ppu_lift_image_sha256(void) { return ""; }
+/* The lifted-code ABI this fixture is written in (ppu_recomp.h stamps it for a
+ * real lift); the loader checks it at startup. */
+extern const uint32_t ppu_lifter_abi = PPU_RUNTIME_LIFTER_ABI;   /* C linkage from the block above */
 void ppu_hle_init(void);
 void ps3_hle_call(uint32_t, ppu_context*);
 void ppu_register_function(uint64_t, void (*)(ppu_context*));

@@ -318,6 +318,20 @@ void ps3_stop_gcm_wait_timeout(const char* func, const char* what, uint32_t offs
              f, sizeof f / sizeof f[0], nullptr);
 }
 
+void ps3_stop_lifter_abi(uint32_t expected, uint32_t got)
+{
+    char exp_s[24], got_s[24];
+    std::snprintf(exp_s, sizeof exp_s, "%u", expected);
+    std::snprintf(got_s, sizeof got_s, "%u", got);
+    const ps3_stop_field f[] = { {"expected", exp_s}, {"got", got_s} };
+    ps3_stop(PS3_STOP_LIFTER_ABI,
+             "the lifted code was generated for a different lifted-code ABI than this runtime implements; "
+             "running it would silently skip hooks the runtime assumes (a changed store-hook ABI, for example)",
+             "Re-lift the executable with this runtime's tools/ppu_lifter.py (and regenerate its header), "
+             "or build the runtime that matches the lift.",
+             f, sizeof f / sizeof f[0], nullptr);
+}
+
 void ps3_stop_spurs_task_halt(const char* api, uint32_t taskset_ea, uint32_t task,
                               uint32_t elf_ea, const char* reason, const ps3_stop_site* site)
 {

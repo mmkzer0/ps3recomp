@@ -81,6 +81,22 @@ HEADER_PREAMBLE = """\
 #pragma once
 #include <stdint.h>
 
+/* The lifted-code ABI these sources were generated for. The lifter bumps it
+ * together with the runtime's PPU_RUNTIME_LIFTER_ABI (include/ps3emu/lifter_abi.h)
+ * whenever generated code must change with the runtime -- a new store hook, a
+ * changed hook ABI. The loader compares the two before it reads the executable,
+ * so a lift from an older lifter stops by name instead of running without the
+ * hooks the runtime assumes. The generated source defines the symbol; a lift
+ * older than this stamp has no symbol at all, which is a link error. */
+#define PPU_LIFTER_ABI 1
+#ifdef __cplusplus
+extern "C" {
+#endif
+extern const uint32_t ppu_lifter_abi;
+#ifdef __cplusplus
+}
+#endif
+
 """ + FENCE_PREAMBLE + """
 /* 128-bit vector register for VMX/AltiVec */
 typedef union {
@@ -4021,6 +4037,8 @@ class PPULifter:
                                             self.prefix + "function_table")
                                    .replace("ppu_lift_image_sha256",
                                             self.prefix + "ppu_lift_image_sha256")
+                                   .replace("ppu_lifter_abi",
+                                            self.prefix + "ppu_lifter_abi")
                     if self.prefix else HEADER_PREAMBLE)
         lines = [preamble]
         # Forward declarations
@@ -4265,6 +4283,11 @@ class PPULifter:
         lines.append("    { 0, NULL, NULL }")
         lines.append("};")
         lines.append(f"const uint64_t {self.prefix}function_table_count = {len(funcs)};")
+        lines.append("")
+        # The ABI the sources were generated for; the runtime compares it with
+        # its own PPU_RUNTIME_LIFTER_ABI before it loads anything (lifter-abi).
+        lines.append("/* Lifted-code ABI (PPU_LIFTER_ABI in ppu_recomp.h). */")
+        lines.append(f"const uint32_t {self.prefix}ppu_lifter_abi = PPU_LIFTER_ABI;")
         lines.append("")
         # Without the image's hash the runtime cannot tell whether it is
         # running the executable this was lifted from, so refuse to write

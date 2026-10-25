@@ -60,6 +60,9 @@ def test_split_output_carries_it_in_the_table_chunk():
         tables = list(out.glob('ppu_recomp_table.*'))
         assert len(tables) == 1, tables
         assert recorded(out, tables[0].name)[1] == want
+        # The ABI stamp sits beside the table and identity: one definition per lift.
+        assert 'const uint32_t ppu_lifter_abi = PPU_LIFTER_ABI;' in tables[0].read_text()
+        assert '#define PPU_LIFTER_ABI ' in (out / 'ppu_recomp.h').read_text()
         # the default line-count split puts the table in the last chunk
         out = lift(Path(tmp), BLR)
         assert recorded(out, sorted(p.name for p in out.glob('ppu_recomp_*.cpp'))[-1])[1] == want
@@ -79,6 +82,9 @@ def test_a_symbol_prefix_prefixes_the_function_in_header_and_source():
         assert recorded(out)[0] == 'libsre_ppu_lift_image_sha256'
         assert 'const char* libsre_ppu_lift_image_sha256(void);' in (out / 'ppu_recomp.h').read_text()
         assert 'const char* ppu_lift_image_sha256(void);' not in (out / 'ppu_recomp.h').read_text()
+        # The ABI stamp is per-image too, like the table and the identity.
+        assert 'const uint32_t libsre_ppu_lifter_abi = PPU_LIFTER_ABI;' in (out / 'ppu_recomp.c').read_text()
+        assert 'extern const uint32_t libsre_ppu_lifter_abi;' in (out / 'ppu_recomp.h').read_text()
 
 
 def make_lifter():

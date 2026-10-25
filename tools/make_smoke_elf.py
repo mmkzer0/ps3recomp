@@ -220,7 +220,10 @@ def build_identity(elf: bytes) -> str:
     return ("/* Written by tools/make_smoke_elf.py: the identity of the smoke title's\n"
             " * image, where a lifted title has the one ppu_lifter.py records. */\n"
             '#include "ppu_recomp.h"\n'
-            f'const char* ppu_lift_image_sha256(void) {{ return "{digest}"; }}\n')
+            f'const char* ppu_lift_image_sha256(void) {{ return "{digest}"; }}\n'
+            "/* The lifted-code ABI this title was written for (the smoke source is\n"
+            " * hand-written, so the stamp the lifter would emit is written here). */\n"
+            "const uint32_t ppu_lifter_abi = PPU_LIFTER_ABI;\n")
 
 
 def main() -> int:

@@ -32,6 +32,9 @@ static unsigned failures;
 // production gate checks the file ppu_load_elf reads against it.
 static char g_image_sha[65];
 extern "C" const char* ppu_lift_image_sha256(void) { return g_image_sha; }
+/* The lifted-code ABI this fixture is written in (ppu_recomp.h stamps it for a
+ * real lift); the loader checks it at startup. */
+const uint32_t ppu_lifter_abi = PPU_LIFTER_ABI;
 static unsigned called;
 static void check(bool ok, const char* what) {
     if (!ok) { std::fprintf(stderr,"FAIL: %s\n",what); ++failures; }

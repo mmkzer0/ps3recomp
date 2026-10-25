@@ -63,7 +63,7 @@ import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tests' / 'gates'))
-from check_ppu_scaffold import loader_support_objects, loader_support_sources  # noqa: E402
+from check_ppu_scaffold import lifter_abi_sources, loader_support_objects, loader_support_sources  # noqa: E402
 import gates_common as g  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -114,7 +114,7 @@ def main():
                         '-I' + str(ROOT / 'runtime/ppu'), '-I' + str(ROOT / 'runtime/platform'),
                         str(ROOT / 'runtime/ppu/ppu_loader.cpp'), str(ROOT / 'tests/test_loader_gaps.cpp'),
                         str(ROOT / 'runtime/syscalls/sys_lwsync.cpp'),
-                        str(lift / 'ppu_recomp.cpp'), *loader_support_sources(), *loader_support_objects(tmp),
+                        str(lift / 'ppu_recomp.cpp'), *loader_support_sources(), *lifter_abi_sources(), *loader_support_objects(tmp),
                         *flags, '-o', str(binary)],
                        check=True, timeout=300)
 

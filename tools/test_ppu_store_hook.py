@@ -16,7 +16,7 @@ from pathlib import Path
 TOOLS = Path(__file__).resolve().parent
 sys.path.insert(0, str(TOOLS))
 import ppu_disasm  # noqa: E402
-from check_ppu_scaffold import loader_support_objects, loader_support_sources, stub_header  # noqa: E402
+from check_ppu_scaffold import lifter_abi_sources, loader_support_objects, loader_support_sources, stub_header  # noqa: E402
 from ppu_lifter import LiftedFunction, PPULifter  # noqa: E402
 
 ROOT = TOOLS.parent
@@ -121,7 +121,7 @@ def main():
                         str(ROOT / 'runtime/ppu/ppu_loader.cpp'),
                         str(ROOT / 'runtime/ppu/tests/test_ppu_store_hook.cpp'),
                         str(tmp / 'store_forms.cpp'),
-                        *loader_support_sources(), *loader_support_objects(tmp),
+                        *loader_support_sources(), *lifter_abi_sources(), *loader_support_objects(tmp),
                         *flags, '-o', str(binary)], check=True)
         env = {k: v for k, v in os.environ.items() if not k.startswith(('PPU_', 'PS3_', 'PS3RECOMP_', 'SPU_'))}
         r = subprocess.run([str(binary)], env=env, capture_output=True, text=True, timeout=60)

@@ -114,6 +114,17 @@ def loader_support_sources() -> list:
     return [os.path.join(ROOT, p) for p in LOADER_SUPPORT_SOURCES]
 
 
+# ppu_load_elf calls ps3_lifter_abi_check (include/ps3emu/lifter_abi.h) before it
+# reads the file, so a fixture that compiles the loader links the check too. It
+# references the lift's ppu_lifter_abi stamp: a real lift defines it in its
+# generated source, a hand-written fixture must (see the fixture source).
+LIFTER_ABI_SOURCES = ["runtime/diag/lifter_abi.c"]
+
+
+def lifter_abi_sources() -> list:
+    return [os.path.join(ROOT, p) for p in LIFTER_ABI_SOURCES]
+
+
 # The same, for the loader's C dependencies: the reservation model is C11
 # atomics and cannot ride in the fixtures' C++ command line, so it is compiled
 # as C and handed over as an object.

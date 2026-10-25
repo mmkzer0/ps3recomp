@@ -41,6 +41,7 @@
 #include "ps3emu/stop.h"         /* ps3_stop, ps3_stop_register_frontier */
 #include "ps3emu/config.h"       /* ps3_ppu_initial_vscr */
 #include "ps3emu/identity.h"     /* ps3_identity_check_image */
+#include "ps3emu/lifter_abi.h"   /* ps3_lifter_abi_check */
 #include "ps3emu/milestone.h"   /* ps3_ms / ps3_msf -- boot milestone log */     /* ppu_context, func decls, ppu_recomp_register */
 #include "../syscalls/ppu_thread_id.h"   /* ppu_tid_diag_index: the in-flight tables are indexed by table slot */
 #include "../memory/vm.h"   /* vm_commit -- sys_mmapper_search_and_map maps for real */
@@ -3237,6 +3238,11 @@ static uint64_t ppu_image_overlap_end(uint64_t addr, uint64_t end)
 
 extern "C" uint32_t ppu_load_elf(const char* path)
 {
+    /* The lift's ABI before the file is even read: a header/source pair from a
+     * different ppu_lifter.py cannot run against this runtime, and an old pair
+     * has no symbol to compare (a link error). See ps3emu/lifter_abi.h. */
+    ps3_lifter_abi_check();
+
     FILE* f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "[ppu] cannot open %s\n", path); return 0; }
     fseek(f, 0, SEEK_END);

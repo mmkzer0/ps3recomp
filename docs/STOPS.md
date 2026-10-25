@@ -45,6 +45,7 @@ Ids are stable kebab-case; a new gap gets a new kind, never a free-text variant.
 | Kind | Raised when |
 |---|---|
 | `identity-mismatch` | the executable loaded is not the one the runtime was lifted from, or does not match the `title.elf_sha256` pin |
+| `lifter-abi` | the lifted code was generated for a lifted-code ABI this runtime does not implement (`PPU_LIFTER_ABI` in the generated header against `PPU_RUNTIME_LIFTER_ABI`), so hooks the runtime assumes would not run |
 | `config-invalid` | the configuration is wrong: bad file, unknown key, wrong type, out of range, unknown `PS3RECOMP_*` variable |
 | `unresolved-nid` | a firmware import has no handler and no `[[hle.stub]]` entry |
 | `unimplemented-syscall` | an lv2 syscall nobody implements and no `[[lv2.stub]]` entry |
@@ -85,6 +86,7 @@ Where each is raised, and what it carries beyond `pc lr tid`:
 | Kind | Raised in | Fields |
 |---|---|---|
 | `identity-mismatch` | `ppu_load_elf` | `path size expected actual expected_from [pin_source]` |
+| `lifter-abi` | `ps3_lifter_abi_check` (`runtime/diag/lifter_abi.c`), called from `ppu_load_elf` before the file is read | `expected got` (the runtime's ABI and the lift's) |
 | `config-invalid` | `ps3_config_*` | `file line col key env detail` |
 | `unresolved-nid` | `ps3_hle_call` (`runtime/ppu/ppu_hle.cpp`) | `nid name caller_lr` (`name` is `unknown`: the lift keeps only the NID) |
 | `unimplemented-syscall` | `lv2_syscall` (`ppu_loader.cpp`) | `num caller_lr` |

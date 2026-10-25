@@ -37,6 +37,9 @@ void (*g_ppu_thread_entry_trampoline)(uint32_t, uint64_t, uint32_t, uint64_t);
 const func_entry function_table[1] = {{0, nullptr, nullptr}};
 const uint64_t function_table_count = 0;
 const char* ppu_lift_image_sha256(void) { return ""; }
+/* The lifted-code ABI this fixture is written in (ppu_recomp.h stamps it for a
+ * real lift); the loader checks it at startup. */
+const uint32_t ppu_lifter_abi = PPU_LIFTER_ABI;
 uint32_t ps3_hle_count(void) { return 0; }
 void ppu_set_store_hook(uint32_t lo, uint32_t len, void (*fn)(uint32_t ea, uint32_t value));
 void vm_write8(uint64_t a, uint8_t v);

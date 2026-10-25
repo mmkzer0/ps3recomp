@@ -41,3 +41,19 @@ gates_py_test(sha256 runtime test_sha256.py $<TARGET_FILE:probe_sha256>)
 
 gates_probe(probe_config probe_config.cpp)
 gates_py_test(config "config;tsan" test_config.py $<TARGET_FILE:probe_config>)
+
+# The lifted-code ABI gate: the runtime's check against a lift stamped with its
+# ABI (runs), with another (stops lifter-abi), and with no stamp at all (link
+# error). One source, two stamps; the driver also builds the unstamped pair.
+gates_probe(probe_lifter_abi_match probe_lifter_abi.c stamp_lifter_abi.c)
+target_compile_definitions(probe_lifter_abi_match PRIVATE
+    PPU_PROBE_ABI=PPU_RUNTIME_LIFTER_ABI)
+
+gates_probe(probe_lifter_abi_mismatch probe_lifter_abi.c stamp_lifter_abi.c)
+target_compile_definitions(probe_lifter_abi_mismatch PRIVATE
+    "PPU_PROBE_ABI=(PPU_RUNTIME_LIFTER_ABI+1)")
+
+gates_py_test(lifter_abi runtime test_lifter_abi.py
+    $<TARGET_FILE:probe_lifter_abi_match>
+    $<TARGET_FILE:probe_lifter_abi_mismatch>
+    ${PROJECT_SOURCE_DIR})
