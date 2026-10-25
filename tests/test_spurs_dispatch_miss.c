@@ -42,6 +42,8 @@ unsigned long long ps3_ms_now(void) { return 0; }
 void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
 void sys_event_queue_cancel_by_id(u32 id) { (void)id; }
 void sys_event_queue_uncancel_by_id(u32 id) { (void)id; }
+/* The restart scan's entry point (runtime/spu/spu_workload.c; no header declares it). */
+void spu_taskset_start_pending(uint32_t taskset_ea);
 
 static int real_dispatch;                       /* 1: go through to the real registry */
 static unsigned dispatches;
@@ -77,6 +79,24 @@ static void make_elf(uint8_t* image, uint32_t vaddr)
     be32(image + 52, 1); be32(image + 56, 84); be32(image + 60, vaddr); be32(image + 64, vaddr);
     be32(image + 68, 16); be32(image + 72, 16); be32(image + 76, 5);
     be32(image + 80, 16); memset(image + 84, 0x5A, 16);
+}
+
+/* An ELF header with room for `n` program headers; the caller fills them with phdr(). */
+static void make_elf_phdrs(uint8_t* image, uint16_t n)
+{
+    memset(image, 0, 0x40 + (size_t)n * 32 + 0x20);
+    memcpy(image, "\177ELF", 4); image[4] = 1; image[5] = 2; image[6] = 1;
+    be16(image + 0x10, 2); be16(image + 0x12, 23); be32(image + 0x14, 1);
+    be32(image + 0x18, 0x3000); be32(image + 0x1C, 52);
+    be16(image + 0x28, 52); be16(image + 0x2A, 32); be16(image + 0x2C, n);
+}
+
+static void phdr(uint8_t* image, unsigned k, uint32_t type, uint32_t off, uint32_t vaddr,
+                 uint32_t paddr, uint32_t filesz, uint32_t memsz, uint32_t flags)
+{
+    uint8_t* p = image + 52 + (size_t)k * 32;
+    be32(p + 0, type); be32(p + 4, off); be32(p + 8, vaddr); be32(p + 12, paddr);
+    be32(p + 16, filesz); be32(p + 20, memsz); be32(p + 24, flags); be32(p + 28, 4);
 }
 
 static void setup(void)
@@ -130,6 +150,40 @@ int main(int argc, char** argv)
         make_elf(vm_base + ELF + 8, 0x3000);
         CHECK((uint32_t)create_task(ELF + 8) == 0x80410910u, "an ELF not 16-byte aligned is ALIGN");
         CHECK(dispatches == 0 && enabled_bits_clear(), "and no task id was taken");
+    } else if (!strcmp(mode, "task-ok-phdr-paddr")) {
+        /* RPCS3 stops the program-header scan at the first header, of ANY type, whose p_paddr is at
+         * or past the task bottom (cellSpursSpu.cpp:2014). A later PT_LOAD outside the area is then
+         * never reached. The scan used to skip non-PT_LOAD headers and halt on that segment. */
+        make_elf_phdrs(vm_base + ELF, 2);
+        phdr(vm_base + ELF, 0, 2 /*PT_DYNAMIC*/, 0x100, 0, 0x50000, 0, 0, 0);
+        phdr(vm_base + ELF, 1, 1 /*PT_LOAD*/, 0x100, 0x100 /*below TOP*/, 0x100, 0x10, 0x10, 5);
+        CHECK(create_task(ELF) == 0, "a header past the task bottom ends the scan");
+        CHECK(dispatches == 1, "and the load carries on to dispatch");
+    } else if (!strcmp(mode, "task-ok-vaddr-wrap")) {
+        /* p_vaddr + p_memsz is 32-bit in RPCS3 (:2023): 0xFFFFF000 + 0x2000 wraps to 0x1000,
+         * inside the task area. The 64-bit sum used here said 0x100001000 and halted. p_paddr is
+         * inside the task bottom, so the scan does not end before the check. */
+        make_elf_phdrs(vm_base + ELF, 1);
+        phdr(vm_base + ELF, 0, 1, 0x100, 0xFFFFF000u, 0x3000, 0x10, 0x2000, 5);
+        CHECK(create_task(ELF) == 0, "a segment whose size wraps into the area is inside it");
+        CHECK(dispatches == 1, "and the load carries on to dispatch");
+    } else if (!strcmp(mode, "task-ok-empty-elf")) {
+        /* No program headers and no sections: nothing to load, and RPCS3 accepts it (:2006 only
+         * rejects an image the parser cannot read). The old size check called it not-an-spu-elf. */
+        make_elf_phdrs(vm_base + ELF, 0);
+        CHECK(create_task(ELF) == 0, "an ELF with no loadable bytes is accepted");
+        CHECK(dispatches == 1 && dispatched_size == 0, "and dispatched with size 0");
+    } else if (!strcmp(mode, "task-restart-bit3")) {
+        /* TaskInfo's low three bits are flags; bit 3 is not. RPCS3 masks 0xFFFFFFF8 (:1760) and
+         * the loader rejects what remains as INVAL (:1999). The restart scan masked four bits. */
+        memset(vm_base + TASKSET, 0, 0x2000);
+        make_elf(vm_base + ELF, 0x3000);
+        vm_base[TASKSET + 0x10] = 0x80;                  /* task 0 ready */
+        vm_base[TASKSET + 0x30] = 0x80;                  /* task 0 enabled */
+        be32(vm_base + TASKSET + 0x80 + 0x14, ELF | 8u);  /* TaskInfo[0].elf, bit 3 set */
+        spu_taskset_start_pending(TASKSET);
+        fprintf(stderr, "FAIL: the restart scan loaded a task whose ELF address is not 16-byte aligned\n");
+        return 1;
     } else if (!strcmp(mode, "task-bad-elf") || !strcmp(mode, "task-bad-elf-host")) {
         if (!strcmp(mode, "task-bad-elf-host")) g_active_ctx = NULL;
         memset(vm_base + ELF, 0xA5, 0x100);     /* aligned, mapped, and not an ELF */

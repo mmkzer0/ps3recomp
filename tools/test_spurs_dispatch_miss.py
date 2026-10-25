@@ -99,8 +99,15 @@ def main():
             p = run(mode)
             assert p.returncode == 0 and f"PASS: {mode}" in p.stdout, (mode, p.returncode, p.stdout, p.stderr[-3000:])
 
-        for mode in ("task-ok", "task-null-elf", "task-unaligned-elf", "job-ok"):
+        for mode in ("task-ok", "task-null-elf", "task-unaligned-elf", "job-ok",
+                     "task-ok-phdr-paddr", "task-ok-vaddr-wrap", "task-ok-empty-elf"):
             passes(mode)
+
+        # spursTasksetLoadElf alignment (RPCS3 :1760 masks three flag bits, :1999 rejects the rest):
+        # the restart scan keeps bit 3, so the loader sees a 16-byte-misaligned address and halts.
+        f = g.expect_stop(run("task-restart-bit3"), "spurs-task-halt")
+        assert f["api"] == "taskset-restart" and f["taskset"] == "0x00004000" and f["task"] == "0" \
+            and f["elf"] == "0x00010008" and f["reason"] == "unaligned-elf", f
 
         f = g.expect_stop(run("task-bad-elf"), "spurs-task-halt")
         assert f["api"] == "cellSpursCreateTask" and f["taskset"] == "0x00004000" and f["task"] == "0" \

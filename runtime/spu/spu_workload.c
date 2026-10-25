@@ -203,15 +203,30 @@ size_t spu_elf_image_size(const uint8_t* image, size_t max_avail)
 #define SPURS_TASK_TOP    0x3000u
 #define SPURS_TASK_BOTTOM 0x40000u
 
+/* RPCS3 spursTasksetLoadElf (cellSpursSpu.cpp:1997-2047) is the oracle, point for point:
+ *   - a null or 16-byte misaligned address is INVAL (0x80410902), :1999;
+ *   - a program header whose p_paddr is at or past the task bottom STOPS the scan, whatever its
+ *     type (:2014-2017, and the copy loop :2035): a later segment RPCS3 never looks at cannot
+ *     fail the load, and an earlier non-loadable header can end the scan before a bad PT_LOAD;
+ *   - p_vaddr + p_memsz is 32-bit and wraps (:2023), so a segment near the top of the address
+ *     space whose size wraps into the task area is inside it;
+ *   - the file a segment is checked against is the rest of the guest address space
+ *     (fs::file(vm::base(elfAddr), 0 - elfAddr), :2004), not a clamped window;
+ *   - an ELF with no loadable bytes is accepted -- :2006 only rejects an image the parser cannot
+ *     read -- so a zero image size is not an error here; it is the dispatcher's bound.
+ * The size handed back is the dispatcher's clamped image size (0 for such an ELF). */
 const char* spu_task_elf_halt_reason(uint32_t elf_ea, size_t* size_out)
 {
     if (!elf_ea) return "null-elf";
+    if (elf_ea & 0x0Fu) return "unaligned-elf";          /* RPCS3 INVAL */
     if (!vm_range_ok(elf_ea, 0x34)) return "elf-outside-guest-memory";
-    uint64_t avail = vm_guest_limit() - elf_ea;
-    if (avail > 2u * 1024 * 1024) avail = 2u * 1024 * 1024;
     const uint8_t* image = vm_base + elf_ea;
-    const size_t sz = spu_elf_image_size(image, (size_t)avail);
-    if (!sz) return "not-an-spu-elf";
+    const uint64_t avail = (uint64_t)vm_guest_limit() - elf_ea;
+    if (avail < 0x34) return "elf-outside-guest-memory";
+    /* What the parser rejects is what spu_elf_image_size rejects: not a 32-bit big-endian ELF. */
+    if (!(image[0] == 0x7F && image[1] == 'E' && image[2] == 'L' && image[3] == 'F'))
+        return "not-an-spu-elf";
+    if (image[4] != 1 || image[5] != 2) return "not-an-spu-elf";   /* ELFCLASS32, ELFDATA2MSB */
 
     const uint32_t e_phoff = rd_be32(image + 0x1C);
     uint16_t e_phentsize = rd_be16(image + 0x2A);
@@ -219,17 +234,22 @@ const char* spu_task_elf_halt_reason(uint32_t elf_ea, size_t* size_out)
     if (e_phentsize < 0x20) e_phentsize = 0x20;      /* as spu_elf_load_to_ls reads them */
     for (uint16_t k = 0; k < e_phnum; k++) {
         const size_t po = (size_t)e_phoff + (size_t)k * e_phentsize;
-        if (po + 0x20 > sz) break;
+        if ((uint64_t)po + 0x20 > avail) break;      /* past the file RPCS3 would read */
         const uint8_t* ph = image + po;
+        const uint32_t p_paddr = rd_be32(ph + 0x0C);
+        if (p_paddr >= SPURS_TASK_BOTTOM) break;     /* any header type, as RPCS3 breaks */
         if (rd_be32(ph) != 1u /*PT_LOAD*/) continue;
         const uint32_t p_offset = rd_be32(ph + 0x04), p_vaddr = rd_be32(ph + 0x08);
-        const uint32_t p_paddr = rd_be32(ph + 0x0C), p_filesz = rd_be32(ph + 0x10), p_memsz = rd_be32(ph + 0x14);
-        if (p_paddr >= SPURS_TASK_BOTTOM) break;     /* RPCS3 stops at the first segment placed past the area */
-        if (p_vaddr < SPURS_TASK_TOP || (uint64_t)p_vaddr + p_memsz > SPURS_TASK_BOTTOM)
+        const uint32_t p_filesz = rd_be32(ph + 0x10), p_memsz = rd_be32(ph + 0x14);
+        if (p_vaddr < SPURS_TASK_TOP ||
+            (uint32_t)(p_vaddr + p_memsz) > SPURS_TASK_BOTTOM)   /* 32-bit wrap, as RPCS3 */
             return "segment-outside-task-area";
-        if ((uint64_t)p_offset + p_filesz > sz) return "not-an-spu-elf";
+        if ((uint64_t)p_offset + p_filesz > avail) return "not-an-spu-elf";
     }
-    *size_out = sz;
+    uint64_t window = avail;
+    if (window > 2u * 1024 * 1024) window = 2u * 1024 * 1024;
+    /* 0 is a valid answer (an ELF with no loadable bytes); the caller's dispatch decides. */
+    *size_out = spu_elf_image_size(image, (size_t)window);
     return NULL;
 }
 
@@ -509,11 +529,12 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
         const uint8_t* ti = ts + 0x80 + 0x30 * t;
         uint32_t elf = ((uint32_t)ti[0x14] << 24) | ((uint32_t)ti[0x15] << 16) |
                        ((uint32_t)ti[0x16] << 8) | ti[0x17];
-        elf &= ~0xFu;   /* low bits are flags: an SPU-side CreateTask2 stores elf|4 */
         uint32_t ctx = ((uint32_t)ti[0x1C] << 24) | ((uint32_t)ti[0x1D] << 16) |
                        ((uint32_t)ti[0x1E] << 8) | ti[0x1F];
-        /* TaskInfo stores ELF metadata in the low three bits. Keep those
-         * guest bytes intact and use only the address for loading. */
+        /* TaskInfo's low THREE bits are flags (RPCS3 masks 0xFFFFFFF8 at cellSpursSpu.cpp:1760 and
+         * keeps the unmasked word only for its x2FD4 flag bits). Bit 3 is not a flag: RPCS3 keeps
+         * it through that mask and spursTasksetLoadElf rejects the address as INVAL (:1999).
+         * Masking four bits, as this scan used to, silently loaded an image the console halts on. */
         elf &= ~7u;
         /* A task whose ELF the policy module cannot load halts the SPU (RPCS3 cellSpursSpu.cpp
          * spursTasksetDispatch: `if (spursTasksetLoadElf(...) != CELL_OK) { spursHalt(spu); }`). Leaving
