@@ -1050,14 +1050,18 @@ std::int32_t enqueue(Queue& q, std::uint32_t port_ea, const Entry& entry, bool a
     return static_cast<std::int32_t>(rc);
 }
 
-std::optional<SizeCode> size_code_of(std::uint32_t size)
+/* FW 4.93 libspurs_jq PushBodyInternal: a descriptor size is 64 or a multiple of 128 (0 included, by
+ * the shape of its test) and at most the queue's maxDescriptor, which is at most 896. */
+bool descriptor_size_ok(std::uint32_t size, std::uint32_t max_descriptor)
 {
-    switch (size) {
-    case 64: return SizeCode::bytes64;
-    case 128: return SizeCode::bytes128;
-    case 256: return SizeCode::bytes256;
-    }
-    return std::nullopt;
+    return (size == 64 || (size & 127) == 0) && size <= max_descriptor;
+}
+
+/* The ring's class of a size descriptor_size_ok accepted, other than 0: (size >> 7) << 1, with 64 in
+ * class 0. */
+SizeCode size_code_of(std::uint32_t size)
+{
+    return size == 64 ? SizeCode::bytes64 : static_cast<SizeCode>((size >> 7) << 1);
 }
 
 /* The shared front of both pushes: port, tag, descriptor size. */
@@ -1081,14 +1085,18 @@ PushCheck check_push(std::uint32_t port, std::uint32_t descriptor, std::uint32_t
         c.error = JQ2_ERR_ALIGN;
     } else if (tag > 15) {
         c.error = JQ2_ERR_INVAL;
-    } else if (const auto code = size_code_of(size); !code || size > c.port.queue->max_descriptor()) {
-        /* FW 4.93 libspurs_jq PushBodyInternal accepts 64 and every multiple of 128 up to the queue's
-         * max descriptor; this HLE encodes only 64/128/256. */
-        if (!code && (size == 64 || size % 128 == 0) && size <= c.port.queue->max_descriptor())
-            PS3_FW_DIVERGENCE("JQ-S05");
+    } else if (!descriptor_size_ok(size, c.port.queue->max_descriptor())) {
         c.error = JQ2_ERR_INVAL;
+    } else if (size == 0) {
+        /* The firmware's shape test lets 0 through (0 & 127 == 0) and its size class is then 0, the
+         * class of 64 bytes, so a 0-byte entry would be admitted as a 64-byte one; the HLE gives no
+         * code to it. */
+        stop_with(PS3_STOP_JQ2_UNMODELLED, "JobQueue2 push of a 0-byte descriptor",
+                  "The firmware accepts size 0 (its size test is 64 or a multiple of 128) and the HLE does not "
+                  "model a 0-byte descriptor.",
+                  {hex("queue", c.port.queue->ea()), hex("port", port), dec("size", size)});
     } else {
-        c.code = *code;
+        c.code = size_code_of(size);
     }
     if (c.error == JQ2_OK && c.port.queue->shut()) c.error = JQ2_ERR_STAT;
     return c;

@@ -91,6 +91,8 @@ set_tests_properties(jq2_port_race_stress PROPERTIES LABELS "spurs;stress" TIMEO
 #   jq2_exec_join       Shutdown / Join with outstanding jobs (L1), caller-owned buffers (L2)
 #   jq2_exec_stop_waiter_id, _waiter_alloc, _wait, _fiber_notify  jq2-wake: a waiter id above 63, a 64th blocked Sync, a failed wait, a kind-0 waiter that is no fiber
 #   jq2_exec_stop_push_shutdown, _copy_push_shutdown  jq2-state: a push that lands after Shutdown
+#   jq2_exec_desc_sizes  every descriptor size the firmware accepts (64, 128..896) through ring, admission and loader on a maxDescriptor 896 queue
+#   jq2_exec_stop_push_size0, _copy_push_size0  jq2-unmodelled: the firmware accepts size 0, the HLE models no 0-byte descriptor
 #   jq2_exec_observer   the job observer: layout at start, r3 at end, off when removed
 #   jq2_exec_validate   every guard and status code of jq2.h
 #   jq2_exec_lifted     a lifted-style body returns normally: executed and credited once
@@ -107,7 +109,7 @@ set_target_properties(test_jq2_executor PROPERTIES LINKER_LANGUAGE CXX)
 foreach(mode premature copy credit wrap barrier sync join observer validate lifted layout layout-896 jm-wait heap-fit
               stop-job stop-halt stop-jm stop-jm-lifted stop-heap stop-unmodelled stop-crt stop-ring
               sync-concurrent waiter-fresh waiter-63 stop-waiter-id waiter-64-nowake stop-waiter-64-wake stop-wait stop-fiber-notify
-              stop-push-shutdown stop-copy-push-shutdown)
+              stop-push-shutdown stop-copy-push-shutdown desc-sizes stop-push-size0 stop-copy-push-size0)
     string(REPLACE "-" "_" name "${mode}")
     add_test(NAME jq2_exec_${name} COMMAND test_jq2_executor ${mode})
     set_tests_properties(jq2_exec_${name} PROPERTIES LABELS "spurs;t0;tsan" TIMEOUT 300)

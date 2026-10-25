@@ -32,8 +32,13 @@ carry the per-field citations.
 ## Codec
 
 An entry is two big-endian u32 words. JOB (command 0) and COPY (command 2):
-`w0 = portEA | tag << 3 | command`, `w1 = dataEA | sizeCode | bit0`. SYNC:
-`w0 = mask << 16 | 7`, `w1 = bit0`.
+`w0 = portEA | tag << 3 | command`, `w1 = dataEA | class << 1 | bit0`, where the
+descriptor size class is `size >> 7` in `w1` bits 3..1 (0 is 64 bytes, 1..7 are
+128..896; `SizeCode` keeps the shifted values 0, 2 ... 14) and the EA is
+16-aligned, so bits 3..0 of `w1` are class and phase. Every class is a valid
+size. FW 4.93 PushBodyInternal also stores API flag bit 1 in `w0` bit 2; the
+HLE writer leaves it clear, nothing here consumes it, and an entry with it set
+decodes as `UnknownEntry`. SYNC: `w0 = mask << 16 | 7`, `w1 = bit0`.
 
 `w1` bit 0 is **writer metadata**, never an API flag or a mask. It is the queue's
 phase bit (`queue+4` bit 5, toggled on ring wrap) for JOB, COPY and SYNC alike
@@ -624,7 +629,10 @@ u16, write u16, flags u32 with the writer phase) moves only through
 `resv_host_rmw`, the entry is one 8-byte release store, and a worker that
 reaches the slot first sees the previous lap's entry, whose phase bit does not
 match (the PM's own protocol). A CopyPush takes a pool slot first (blocking),
-snapshots `size` bytes into it and enqueues the slot (contract S3).
+snapshots `size` bytes into it and enqueues the slot (contract S3). The
+descriptor `size` is 64 or a multiple of 128 up to the queue's maxDescriptor
+(256..896); anything else is `A02`, and 0, which the firmware's test also
+passes, is the named stop `jq2-unmodelled`.
 
 **Workers.** `worker_count` host threads (8 MB stacks: the loader keeps a whole
 `spu_context` on the stack) are the scheduler's instances, one job slot each.
@@ -862,6 +870,10 @@ channel layer and LV2 event flags; labels `spurs;t0;tsan`:
   descriptor copy at `0x3F000` / `0x3E600`, every `JobContext2` word, the jm
   table, stop word and poll routine, the kernel view word by word (all else in
   `0..0x2FF` zero), the registers lane by lane, and the loader's report.
+- `desc-sizes`: a maxDescriptor 896 queue runs a job of every size the firmware
+  accepts (64 and 128..896 in steps of 128): the ring word holds the class, the
+  worker's admission fetch and the loader's descriptor copy are those bytes.
+  `stop-push-size0`, `stop-copy-push-size0`: size 0 is `jq2-unmodelled`.
 - `jm-wait`: a job GETLs a stalled two-element list, calls jm word 1 through the
   table and uses the second element's data; the test acknowledges the stall
   only after the routine has polled `RdTagStat` three times.

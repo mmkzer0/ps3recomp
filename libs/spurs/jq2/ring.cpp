@@ -9,7 +9,6 @@
 #include "jq2/ring.hpp"
 
 #include <algorithm>
-#include <optional>
 #include <type_traits>
 
 namespace ps3recomp::spurs::jq2 {
@@ -18,7 +17,7 @@ namespace {
 constexpr std::uint32_t kCommandMask = 0x7u;
 constexpr std::uint32_t kTagMask = 0xFu;
 constexpr std::uint32_t kTagShift = 3;
-constexpr std::uint32_t kSizeCodeMask = 0x6u;
+constexpr std::uint32_t kSizeCodeMask = 0xEu;
 constexpr std::uint32_t kWriterBitMask = 0x1u;
 constexpr std::uint32_t kSyncMarker = 0x7u;
 constexpr std::uint32_t kSyncMaskShift = 16;
@@ -49,8 +48,7 @@ UnknownEntry unknown_from(std::span<const std::uint8_t, kEntryBytes> bytes)
 
 bool valid_size_code(SizeCode code) noexcept
 {
-    return code == SizeCode::bytes64 || code == SizeCode::bytes128 ||
-           code == SizeCode::bytes256;
+    return (static_cast<std::uint32_t>(code) & ~kSizeCodeMask) == 0;
 }
 
 /* Fields shared by JOB and COPY. The only difference is what w1 names. */
@@ -62,23 +60,25 @@ struct JobFields {
     bool writer_bit;
 };
 
-std::optional<JobFields> decode_job_fields(std::uint32_t w0, std::uint32_t w1) noexcept
+JobFields decode_job_fields(std::uint32_t w0, std::uint32_t w1) noexcept
 {
-    /* w1 bits 2..1 carry 0/1/2. Value 3 is not a size the firmware emits. */
-    const std::uint32_t size_bits = (w1 & kSizeCodeMask) >> 1;
-    if (size_bits > 2) return std::nullopt;
-
-    /* w1 bit 3 is descriptor EA bit 3, which 16-byte alignment forces to 0.
-     * An entry that sets it is not a JOB/COPY this codec can represent. */
-    if ((w1 & 0x8u) != 0) return std::nullopt;
-
+    /* w1 bits 3..1 are the 3-bit size class and bit 0 the phase; the data EA is
+     * 16-byte aligned, so bits 3..0 never belong to it. Every class value is a
+     * size the firmware emits (64 and 128..896), so none is refused here. */
     JobFields fields{};
     fields.port_ea = w0 & ~std::uint32_t(0x7Fu);
-    fields.data_ea = w1 & ~std::uint32_t(0x7u);
+    fields.data_ea = w1 & ~std::uint32_t(0xFu);
     fields.tag = static_cast<std::uint8_t>((w0 >> kTagShift) & kTagMask);
-    fields.size = static_cast<SizeCode>(size_bits << 1);
+    fields.size = static_cast<SizeCode>(w1 & kSizeCodeMask);
     fields.writer_bit = (w1 & kWriterBitMask) != 0;
     return fields;
+}
+
+template <class E>
+Decoded decode_job_entry(std::uint32_t w0, std::uint32_t w1) noexcept
+{
+    const JobFields fields = decode_job_fields(w0, w1);
+    return Decoded{E{fields.port_ea, fields.data_ea, fields.tag, fields.size}, fields.writer_bit};
 }
 
 EncodeResult encode_job_like(std::uint32_t command, std::uint32_t port_ea,
@@ -121,17 +121,9 @@ Decoded decode(std::span<const std::uint8_t, kEntryBytes> bytes) noexcept
 
     switch (w0 & kCommandMask) {
     case static_cast<std::uint32_t>(Command::job):
-        if (const auto fields = decode_job_fields(w0, w1))
-            return Decoded{JobEntry{fields->port_ea, fields->data_ea, fields->tag,
-                                    fields->size},
-                           fields->writer_bit};
-        break;
+        return decode_job_entry<JobEntry>(w0, w1);
     case static_cast<std::uint32_t>(Command::copy):
-        if (const auto fields = decode_job_fields(w0, w1))
-            return Decoded{CopyEntry{fields->port_ea, fields->data_ea, fields->tag,
-                                     fields->size},
-                           fields->writer_bit};
-        break;
+        return decode_job_entry<CopyEntry>(w0, w1);
     case static_cast<std::uint32_t>(Command::sync):
         /* SYNC is (mask << 16) | 7 with w1 = phase; bits 15..3 and w1 31..1
          * are written zero. */

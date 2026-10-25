@@ -164,8 +164,9 @@ int32_t jq2_port_destroy(uint32_t port);
 
 /* _cellSpursJobQueuePort2PushJobBody(port, descriptor, size, tag, flags):
  * enqueue a JOB naming the caller's descriptor, which is NOT copied: the job
- * reads it when a worker admits it (contract S2). size is 64, 128 or 256
- * (<= the queue maximum), descriptor 16-aligned, tag 0..15 (INVAL otherwise).
+ * reads it when a worker admits it (contract S2). size is 64 or a multiple of 128 up to the queue
+ * maximum (at most 896; INVAL otherwise, and 0 is the named stop jq2-unmodelled), descriptor
+ * 16-aligned, tag 0..15 (INVAL otherwise).
  * flags & 1 selects whether the entry carries the port EA, and with it the
  * submission count B at port+0x10 and the completion credit: a job pushed
  * without it is run but never credited to the port. Full ring AGAIN; a port
@@ -220,7 +221,7 @@ struct spu_context;
 typedef struct jq2_job_info {
     uint32_t queue, port;             /* port 0: pushed without flags & 1, never credited */
     uint32_t descriptor_ea;           /* the caller's descriptor, or the COPY's pool slot */
-    uint32_t descriptor_size;         /* 64, 128 or 256 */
+    uint32_t descriptor_size;         /* 64, or 128..896 in steps of 128 */
     const uint8_t* descriptor;        /* the bytes fetched at admission (valid for the call) */
     uint32_t tag, copy, worker, dispatch_id;
     uint32_t image_ea, image_ls, image_bytes, bss_bytes;

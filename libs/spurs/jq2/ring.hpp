@@ -20,18 +20,29 @@
  *         6..3   tag            0..15. Static: tag at numeric bits 35..38 of
  *                               the 64-bit entry; PM: (w0 >> 3) & 0xF.
  *                               [jq2fw-049; jq2c-022]
- *         2      zero           Port alignment clears bits 6..0, and the tag
- *                               starts at bit 3. [jq2fw-011; jq-ring2]
+ *         2      push flag 1    The firmware stores API flags bit 1 here (the
+ *                               entry is port | tag << 3 | (flags >> 1 & 1) << 2
+ *                               | command). Nothing in this HLE consumes it
+ *                               and the PM's reading of it is not decoded, so
+ *                               the writer leaves it clear and an entry that
+ *                               has it set decodes as UnknownEntry.
  *         1..0   command        0 = JOB, 2 = COPY. [jq2c-021; jq-ring2]
- *     w1  31..3  data EA        JOB: the caller's descriptor EA (not copied)
+ *     w1  31..4  data EA        JOB: the caller's descriptor EA (not copied)
  *                               [jq2fw-023]. COPY: the queue-pool destination
  *                               holding the snapshot [jq2c-020]. Descriptor
- *                               EAs are 16-byte aligned [jq2fw-022], so bit 3
- *                               is zero.
- *         2..1   size code      bits hold 0/1/2, emitted as the firmware's
- *                               0/2/4: 64/128/256 bytes. Static builder
- *                               rlwinm32(size,26,6,30), runtime 128 -> 2 and
- *                               256 -> 4. [JQ-FW-PPU; jq-ring2]
+ *                               EAs are 16-byte aligned [jq2fw-022], so bits
+ *                               3..0 of w1 belong to the size class and the
+ *                               writer bit.
+ *         3..1   size class     (descriptor size >> 7), a 3-bit class: 0 is 64
+ *                               bytes (and, by an accident of the firmware's
+ *                               size test, 0), 1..7 are 128..896 bytes in steps
+ *                               of 128. The PPU builder forms (size >> 6)
+ *                               with bit 0 cleared, i.e. the class in bits 3..1
+ *                               of the word. The enum below keeps the
+ *                               shifted values 0, 2, 4 ... 14. Every value of
+ *                               the field is a valid class; bit 3 is the class's
+ *                               high bit, not a free EA bit. [FW 4.93 libspurs_jq
+ *                               PushBodyInternal, re_jq2.md A.3]
  *         0      writer bit     NOT an API flag. w1 bit 0 is the queue's phase
  *                               bit (queue+4 bit 5, toggled on ring wrap) and
  *                               nothing else. The PM compares it with an
@@ -116,12 +127,20 @@ enum class Command : std::uint8_t {
     sync = 0b111,
 };
 
-/* Descriptor-size code as the firmware emits it into w1 bits 2..0. The values
- * are the documented 0/2/4 codes, not a byte count. [JQ-FW-PPU; jq-ring2] */
+/* Descriptor-size class as the firmware emits it into w1 bits 3..1, held here
+ * shifted left by one (the word's own bits 3..0 with the phase clear). The
+ * values are the firmware's 0/2/4/6/8/10/12/14, not a byte count: the byte
+ * size is `(class >> 1) * 128`, with class 0 naming 64. [JQ-FW-PPU; jq-ring2;
+ * FW 4.93 PushBodyInternal, re_jq2.md A.3] */
 enum class SizeCode : std::uint8_t {
     bytes64 = 0,
     bytes128 = 2,
     bytes256 = 4,
+    bytes384 = 6,
+    bytes512 = 8,
+    bytes640 = 10,
+    bytes768 = 12,
+    bytes896 = 14,
 };
 
 /* Byte size named by a size code. Returns 0 for a value outside the enum. */
@@ -134,6 +153,16 @@ constexpr std::uint32_t size_bytes(SizeCode code) noexcept
         return 128;
     case SizeCode::bytes256:
         return 256;
+    case SizeCode::bytes384:
+        return 384;
+    case SizeCode::bytes512:
+        return 512;
+    case SizeCode::bytes640:
+        return 640;
+    case SizeCode::bytes768:
+        return 768;
+    case SizeCode::bytes896:
+        return 896;
     }
     return 0;
 }
@@ -200,7 +229,7 @@ enum class EncodeError : std::uint8_t {
     port_ea_misaligned,        /* port EA bits 6..0 set; Port2 requires 128 */
     descriptor_ea_misaligned,  /* JOB descriptor EA bits 3..0 not zero */
     pool_ea_misaligned,        /* COPY pool EA bits 3..0 not zero */
-    invalid_size_code,         /* SizeCode outside 64/128/256 */
+    invalid_size_code,         /* SizeCode that is none of the eight classes */
 };
 
 struct EncodeResult {

@@ -106,7 +106,8 @@ void test_writer_bit_jobs()
 {
     const std::uint32_t port = 0x40000080u;
     const std::uint32_t desc = 0x80000010u;
-    for (const SizeCode size : {SizeCode::bytes64, SizeCode::bytes128, SizeCode::bytes256}) {
+    for (const SizeCode size : {SizeCode::bytes64, SizeCode::bytes128, SizeCode::bytes256, SizeCode::bytes384,
+                                SizeCode::bytes512, SizeCode::bytes640, SizeCode::bytes768, SizeCode::bytes896}) {
         const std::uint32_t size_bits = static_cast<std::uint32_t>(size);
         const JobEntry job{port, desc, 3, size};
         const CopyEntry copy{port, desc, 3, size};
@@ -208,16 +209,23 @@ void test_field_boundaries()
     CHECK(encode(JobEntry{port, desc, 16, SizeCode::bytes64}, false).error ==
           EncodeError::tag_out_of_range);
 
-    /* Every size code with the writer bit clear and set, in w1 bits 2..0. */
-    expect_encoded(JobEntry{port, desc, 1, SizeCode::bytes64}, false, port | 0x08u, desc);
-    expect_encoded(JobEntry{port, desc, 1, SizeCode::bytes64}, true, port | 0x08u, desc | 1u);
-    expect_encoded(JobEntry{port, desc, 1, SizeCode::bytes128}, false, port | 0x08u, desc | 2u);
-    expect_encoded(JobEntry{port, desc, 1, SizeCode::bytes128}, true, port | 0x08u, desc | 3u);
-    expect_encoded(JobEntry{port, desc, 1, SizeCode::bytes256}, false, port | 0x08u, desc | 4u);
-    expect_encoded(JobEntry{port, desc, 1, SizeCode::bytes256}, true, port | 0x08u, desc | 5u);
-    CHECK(size_bytes(SizeCode::bytes64) == 64);
-    CHECK(size_bytes(SizeCode::bytes128) == 128);
-    CHECK(size_bytes(SizeCode::bytes256) == 256);
+    /* Every size class with the writer bit clear and set, in w1 bits 3..0. */
+    const struct {
+        SizeCode code;
+        std::uint32_t bytes;
+    } classes[] = {{SizeCode::bytes64, 64},   {SizeCode::bytes128, 128}, {SizeCode::bytes256, 256},
+                   {SizeCode::bytes384, 384}, {SizeCode::bytes512, 512}, {SizeCode::bytes640, 640},
+                   {SizeCode::bytes768, 768}, {SizeCode::bytes896, 896}};
+    std::uint32_t expected_code = 0;
+    for (const auto& cls : classes) {
+        CHECK(static_cast<std::uint32_t>(cls.code) == expected_code);
+        expect_encoded(JobEntry{port, desc, 1, cls.code}, false, port | 0x08u, desc | expected_code);
+        expect_encoded(JobEntry{port, desc, 1, cls.code}, true, port | 0x08u, desc | expected_code | 1u);
+        expect_encoded(CopyEntry{port, desc, 1, cls.code}, true, port | 0x0Au, desc | expected_code | 1u);
+        CHECK(size_bytes(cls.code) == cls.bytes);
+        expected_code += 2;
+    }
+    CHECK(size_bytes(static_cast<SizeCode>(16)) == 0);
 
     /* Port: the 128-byte alignment is the field's low edge. */
     expect_encoded(JobEntry{0xFFFFFF80u, desc, 0, SizeCode::bytes256}, false, 0xFFFFFF80u,
@@ -227,7 +235,7 @@ void test_field_boundaries()
     CHECK(encode(JobEntry{0xFFFFFFC0u, desc, 0, SizeCode::bytes256}, true).error ==
           EncodeError::port_ea_misaligned);
 
-    /* Descriptor / pool EA: 16-byte alignment clears w1 bit 3. */
+    /* Descriptor / pool EA: 16-byte alignment leaves w1 bits 3..0 to the size class and the phase. */
     expect_encoded(JobEntry{port, 0xFFFFFFF0u, 0, SizeCode::bytes64}, false, port,
                    0xFFFFFFF0u);
     CHECK(encode(JobEntry{port, 0xFFFFFFE4u, 0, SizeCode::bytes64}, false).error ==
@@ -237,9 +245,13 @@ void test_field_boundaries()
     CHECK(encode(CopyEntry{port, 0xFFFFFFE8u, 0, SizeCode::bytes64}, false).error ==
           EncodeError::pool_ea_misaligned);
 
-    /* A size code outside the three the firmware emits has no wire form. */
-    CHECK(encode(JobEntry{port, desc, 0, static_cast<SizeCode>(6)}, false).error ==
-          EncodeError::invalid_size_code);
+    /* Only the eight classes have a wire form: an odd value or one past 896 does not. */
+    for (const unsigned code : {1u, 3u, 5u, 15u, 16u}) {
+        CHECK(encode(JobEntry{port, desc, 0, static_cast<SizeCode>(code)}, false).error ==
+              EncodeError::invalid_size_code);
+        CHECK(encode(CopyEntry{port, desc, 0, static_cast<SizeCode>(code)}, false).error ==
+              EncodeError::invalid_size_code);
+    }
 }
 
 void test_unknown()
@@ -261,16 +273,24 @@ void test_unknown()
         CHECK(std::holds_alternative<UnknownEntry>(decode(bytes).entry));
     }
 
-    /* JOB/COPY with a size-code field value of 3, or with descriptor bit 3. */
+    /* Every value of the 3-bit class in w1 bits 3..1 is a JOB/COPY size, bit 3 (the class's high
+     * bit) included: 384..896 are no longer unknown entries. */
     {
-        const auto bytes = make_bytes(0x00000000u, 0x00000006u);
-        const Decoded d = decode(bytes);
-        CHECK(std::holds_alternative<UnknownEntry>(d.entry));
-        CHECK(encode(d.entry, d.writer_bit).bytes == bytes);
-    }
-    {
-        const auto bytes = make_bytes(0x00000000u, 0x00000008u);
-        CHECK(std::holds_alternative<UnknownEntry>(decode(bytes).entry));
+        const std::uint32_t bytes[8] = {64, 128, 256, 384, 512, 640, 768, 896};
+        for (std::uint32_t cls = 0; cls < 8; ++cls) {
+            const std::uint32_t w1 = 0x80000010u | (cls << 1);
+            const Decoded job = decode(make_bytes(0x00000000u, w1));
+            const auto* typed_job = std::get_if<JobEntry>(&job.entry);
+            CHECK(typed_job != nullptr);
+            if (typed_job != nullptr) {
+                CHECK(size_bytes(typed_job->size) == bytes[cls]);
+                CHECK(typed_job->descriptor_ea == 0x80000010u);
+            }
+            const Decoded copy = decode(make_bytes(0x00000002u, w1 | 1u));
+            const auto* typed_copy = std::get_if<CopyEntry>(&copy.entry);
+            CHECK(typed_copy != nullptr && copy.writer_bit);
+            if (typed_copy != nullptr) CHECK(size_bytes(typed_copy->size) == bytes[cls]);
+        }
     }
 
     /* Unknown bytes survive exactly, including a zero type word, whatever

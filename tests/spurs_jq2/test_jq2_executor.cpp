@@ -54,6 +54,10 @@
  *   stop-push-shutdown, stop-copy-push-shutdown  a push that passed its checks
  *               and reaches the ring after Shutdown: jq2-state
  *               reason=push-after-shutdown
+ *   desc-sizes  a maxDescriptor 896 queue runs every firmware-accepted descriptor size (64,
+ *               128..896) end to end; the ring word carries the 3-bit class
+ *   stop-push-size0, stop-copy-push-size0  the firmware accepts size 0; the HLE stops:
+ *               jq2-unmodelled
  */
 #include "jq2/executor.hpp"
 #include "jq2/jq2.h"
@@ -1952,6 +1956,93 @@ void push_shutdown_scenario(bool copy)
 void mode_stop_push_shutdown() { push_shutdown_scenario(false); }
 void mode_stop_copy_push_shutdown() { push_shutdown_scenario(true); }
 
+/* The firmware accepts a descriptor size of 64 or any multiple of 128 up to the queue's
+ * maxDescriptor (re_jq2.md A.3), and the ring carries it as a 3-bit class in w1 bits 3..1. On a
+ * maxDescriptor 896 queue every size travels ring -> admission -> loader intact: the ring word
+ * holds the class, the worker fetches exactly that many bytes, and the loader stages them. */
+struct SizesSeen {
+    std::mutex mu;
+    std::vector<jq2_job_info> info;
+    std::vector<std::vector<std::uint8_t>> fetched, staged;
+};
+SizesSeen g_sizes;
+
+void sizes_start(void*, spu_context* ctx, const jq2_job_info* info)
+{
+    std::lock_guard<std::mutex> lk(g_sizes.mu);
+    g_sizes.info.push_back(*info);
+    g_sizes.fetched.emplace_back(info->descriptor, info->descriptor + info->descriptor_size);
+    g_sizes.staged.emplace_back(ctx->ls + info->desc_ls, ctx->ls + info->desc_ls + info->desc_bytes);
+}
+
+void mode_desc_sizes()
+{
+    build_image(IMAGE, Prog::transform);
+    install_hooks();
+    Rig rig({128, 1, false, 896});
+    const jq2_job_observer obs{nullptr, &sizes_start, &state_end};
+    CHECK(jq2_set_job_observer(QUEUE, &obs) == 0, "install");
+
+    const std::uint32_t sizes[8] = {64, 128, 256, 384, 512, 640, 768, 896};
+    std::vector<JobSpec> specs;
+    for (std::uint32_t j = 0; j < 8; ++j) {
+        JobSpec s = spec(j);
+        s.desc = DESC + 0x10000 + 0x1000 * j; /* room for 896 bytes */
+        build_desc(s.desc, IMAGE, s.out, s.in, s.add, s.serial);
+        for (std::uint32_t i = 0x40; i < sizes[j]; ++i) vm_base[s.desc + i] = std::uint8_t(0x30 + 7 * j + 3 * i);
+        specs.push_back(s);
+
+        /* the ring word, with the worker held off: class in w1 bits 3..1, the phase in bit 0, w0 bit 2
+         * clear (the writer stores no push flag bit 1) */
+        if (j == 7) {
+            CHECK(set_intake_paused(QUEUE, true), "pause");
+            CHECK(rig.push(s.desc, sizes[j], 1) == 0, "push %u", sizes[j]);
+            const std::uint32_t w1 = get32(RING + 7 * 8 + 4);
+            CHECK((w1 & ~0xFu) == s.desc && (w1 & 0xE) == 14, "ring w1 0x%08X for size 896", w1);
+            CHECK((get32(RING + 7 * 8) & 7) == 0, "w0 0x%08X", get32(RING + 7 * 8));
+            CHECK(set_intake_paused(QUEUE, false), "resume");
+            CHECK(jq2_port_sync(PORT, 0) == 0, "sync %u", sizes[j]);
+        } else {
+            CHECK(rig.push(s.desc, sizes[j], j & 3) == 0, "push %u", sizes[j]);
+            CHECK(jq2_port_sync(PORT, 0) == 0, "sync %u", sizes[j]);
+        }
+        CHECK(job_ok(s), "the %u-byte job ran on its descriptor", sizes[j]);
+    }
+
+    std::lock_guard<std::mutex> lk(g_sizes.mu);
+    CHECK(g_sizes.info.size() == 8, "%zu jobs started", g_sizes.info.size());
+    for (std::size_t j = 0; j < g_sizes.info.size() && j < 8; ++j) {
+        CHECK(g_sizes.info[j].descriptor_size == sizes[j] && g_sizes.info[j].desc_bytes == sizes[j],
+              "job %zu: descriptor %u staged %u, want %u", j, g_sizes.info[j].descriptor_size,
+              g_sizes.info[j].desc_bytes, sizes[j]);
+        CHECK(g_sizes.fetched[j].size() == sizes[j] &&
+                  std::memcmp(g_sizes.fetched[j].data(), vm_base + specs[j].desc, sizes[j]) == 0,
+              "job %zu: the admission fetch is the descriptor", j);
+        CHECK(g_sizes.staged[j].size() == sizes[j] &&
+                  std::memcmp(g_sizes.staged[j].data(), vm_base + specs[j].desc, sizes[j]) == 0,
+              "job %zu: the loader's copy is the descriptor", j);
+    }
+    rig.teardown();
+}
+
+/* The firmware accepts size 0 (its test is `size == 64 || size % 128 == 0`) and the HLE models no
+ * 0-byte descriptor: a named stop, not a code the firmware does not return. */
+void push_size0_scenario(bool copy)
+{
+    expect_stop(
+        [copy] {
+            build_image(IMAGE, Prog::transform);
+            install_hooks();
+            arm_child_watchdog(10);
+            Rig rig({128, 1, copy});
+            const std::uint32_t desc = spec(0).desc;
+            const std::int32_t rc = copy ? jq2_port_copy_push(PORT, desc, 0, 64, 0, 1)
+                                         : jq2_port_push_job(PORT, desc, 0, 0, 1);
+            std::fprintf(stderr, "the stop did not happen: the push returned 0x%X\n", unsigned(rc));
+        },
+        "jq2-unmodelled", {"size=0", "0-byte descriptor"});
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
@@ -1994,6 +2085,9 @@ int main(int argc, char** argv)
     else if (mode == "stop-fiber-notify") mode_stop_fiber_notify();
     else if (mode == "stop-push-shutdown") mode_stop_push_shutdown();
     else if (mode == "stop-copy-push-shutdown") mode_stop_copy_push_shutdown();
+    else if (mode == "desc-sizes") mode_desc_sizes();
+    else if (mode == "stop-push-size0") push_size0_scenario(false);
+    else if (mode == "stop-copy-push-size0") push_size0_scenario(true);
     else {
         std::printf("unknown mode %s\n", mode.c_str());
         return 2;
