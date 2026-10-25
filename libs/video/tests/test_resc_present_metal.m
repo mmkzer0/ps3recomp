@@ -67,6 +67,17 @@ void ps3_stop_hle_uninitialized(const char* f, const char* m, const char* r) { d
 void ps3_stop_gcm_unmodelled(const char* f, const char* feature, const char* r) { die(f, feature, r); }
 u32 ps3_process_sdk_version(void) { return 0x00400000u; }
 
+/* The included backend's legacy fixed-function path references these. Debug builds dead-strip that
+ * path; at -O3 the references survive in functions the linker keeps (CI release job). The engine
+ * path under test never calls them, so reaching one is a test failure. */
+u32 cellGcmResolveOffset(u32 offset) { (void)offset; die("cellGcmResolveOffset", "legacy", "reached"); return 0; }
+int cellGcmOffsetIsDisplay(u32 offset) { (void)offset; die("cellGcmOffsetIsDisplay", "legacy", "reached"); return 0; }
+void rsx_fetch_attrib(const rsx_state* st, int idx, u32 vi, float out[4])
+{
+    (void)st; (void)idx; (void)vi; (void)out;
+    die("rsx_fetch_attrib", "legacy", "reached");
+}
+
 /* libgcm as the library sees it: display buffers go to the engine, the stream goes to the engine's
  * method decoder. The flip command is recorded; the test presents explicitly. */
 static u32 g_flip_buffer = 0xFFFFFFFFu;
