@@ -545,7 +545,8 @@ s32 cellFiberPpuWaitSignal(void)
     LOCK();
     SignalOp op = {f->ea, 1, 0, 0};
     resv_host_rmw(f->ea, signal_rmw, &op);
-    /* fw libfiber 0x020034C0 */
+    /* Not a firmware check: the FW 4.93 WaitSignal core (0x020034A4..0x02003574) has no STAT exit, it
+     * retries the atomic update (loop head 0x020034C0). A consistency guard: HLE-only, counted. */
     if (op.invalid) { PS3_FW_DIVERGENCE("F23-wait-invalid"); UNLOCK(); return (s32)CELL_FIBER_ERROR_STAT; }
     if (op.transition) f->state = F_WAIT_SIGNAL;
     UNLOCK();
@@ -666,10 +667,11 @@ s32 cellFiberPpuUtilWorkerControlWakeup(u32 ea)
 {
     s32 rc = control_check(ea); if (rc) return rc;
     LOCK(); Sched* s = find_sched(ea);
-    /* fw libfiber 0x02005374 */
+    /* Not a firmware check: FW 4.93 Wakeup (0x02005260..0x02005380) tests only the SDK window below, and a
+     * zeroed control wakes with OK. A guard for a control this HLE never initialised: HLE-only, counted. */
     if (!s || !s->utility) { PS3_FW_DIVERGENCE("F32-wakeup-unknown"); UNLOCK(); return (s32)CELL_FIBER_ERROR_STAT; }
     const u64 old = ld64(ea + 0x200);
-    /* 02005368 permits the old-SDK inactive wake path through 0x2FFFFF. */
+    /* 0x02005368 (STAT at 0x02005374) permits the old-SDK inactive wake path through 0x2FFFFF. */
     if (!(old & WORKER_ACTIVE) && ld32(ea + 0x28C) > 0x2FFFFF) { UNLOCK(); return (s32)CELL_FIBER_ERROR_STAT; }
     wake_control_locked(ea); UNLOCK(); return CELL_OK;
 }
@@ -680,12 +682,13 @@ void ps3_fiber_set_worker_exit_hook(void (*hook)(void*, u32), void* user)
 s32 cellFiberPpuUtilWorkerControlRunFibers(u32 ea)
 {
     s32 rc = control_check(ea); if (rc) return rc;
-    /* fw libfiber 0x02000810 */
+    /* Not in FW 4.93 UWC.RunFibers: 0x02000810 is in the shared helper 0x02000748..0x020008A0 that Exit,
+     * Yield and WaitSignal call and RunFibers does not. HLE-only, counted. */
     if (t_cur) { PS3_FW_DIVERGENCE("F33-perm"); return (s32)CELL_FIBER_ERROR_PERM; }
     LOCK(); Sched* s = find_sched(ea);
     /* fw libfiber 0x02004EBC */
     if (!s || !s->utility || !(ld64(ea + 0x200) & WORKER_ACTIVE)) { UNLOCK(); return (s32)CELL_FIBER_ERROR_STAT; }
-    /* fw libfiber 0x020007E8 */
+    /* Not in FW 4.93 UWC.RunFibers: 0x020007E8 is the TLS test of the same helper. HLE-only, counted. */
     if (!tls_slot()) { PS3_FW_DIVERGENCE("F33-nosysinit"); UNLOCK(); return (s32)CELL_FIBER_ERROR_NOSYSINIT; }
     u64 state = ld64(ea + 0x200);
     /* fw libfiber 0x02004EC4 */
