@@ -1144,8 +1144,9 @@ std::int32_t enqueue(Queue& q, std::uint32_t port_ea, const Entry& entry, bool a
     return static_cast<std::int32_t>(rc);
 }
 
-/* FW 4.93 libspurs_jq PushBodyInternal: a descriptor size is 64 or a multiple of 128 (0 included, by
- * the shape of its test) and at most the queue's maxDescriptor, which is at most 896. */
+/* FW 4.93 libspurs_jq PushBodyInternal (0x020049EC; size tests at 0x02004AC0..0x02004ACC): a descriptor
+ * size is 64 or a multiple of 128 (0 included, by the shape of its test) and at most the queue's
+ * maxDescriptor, which is at most 896. */
 bool descriptor_size_ok(std::uint32_t size, std::uint32_t max_descriptor)
 {
     return (size == 64 || (size & 127) == 0) && size <= max_descriptor;
@@ -1473,9 +1474,9 @@ int32_t jq2_port_destroy(uint32_t port)
     return JQ2_OK;
 }
 
-/* Push flag bit 1: FW 4.93 PushBodyInternal stores it in entry w0 bit 2 for the PM, whose reading of it is not
- * decoded. Rather than drop it silently, a push that sets it stops once every firmware check has passed and
- * before anything is written. */
+/* Push flag bit 1: FW 4.93 PushBodyInternal (0x020049EC) stores it in entry w0 bit 2 for the PM, whose
+ * reading of it is not decoded. Rather than drop it silently, a push that sets it stops once every firmware
+ * check has passed and before anything is written. */
 static void stop_on_push_flag1(const char* api, uint32_t port, uint32_t flags)
 {
     if ((flags & 2u) == 0) return;
@@ -1486,8 +1487,8 @@ static void stop_on_push_flag1(const char* api, uint32_t port, uint32_t flags)
 
 int32_t jq2_port_push_job(uint32_t port, uint32_t descriptor, uint32_t size, uint32_t tag, uint32_t flags)
 {
-    /* FW 4.93 PushJobBody wrapper: flags & ~7 is the first test. Bit 1 stops (stop_on_push_flag1); bit 2 is
-     * "do not block on a full ring". */
+    /* FW 4.93 PushJobBody wrapper (0x02004E48, NID 0xCF89F218): flags & ~7 is the first test. Bit 1 stops
+     * (stop_on_push_flag1); bit 2 is "do not block on a full ring". */
     if ((flags & ~7u) != 0) return JQ2_ERR_INVAL;
     const PushCheck c = check_push(port, descriptor, size, tag);
     if (c.error != JQ2_OK) return c.error;
@@ -1500,8 +1501,8 @@ int32_t jq2_port_push_job(uint32_t port, uint32_t descriptor, uint32_t size, uin
 int32_t jq2_port_copy_push(uint32_t port, uint32_t source, uint32_t size, uint32_t copy_size, uint32_t tag,
                            uint32_t flags)
 {
-    /* FW 4.93 CopyPushJobBody wrapper: flags & ~3 is the first test; bit 1 stops (stop_on_push_flag1), bit 2
-     * does not exist. */
+    /* FW 4.93 CopyPushJobBody wrapper (0x02004E0C): flags & ~3 is the first test; bit 1 stops
+     * (stop_on_push_flag1), bit 2 does not exist. */
     if ((flags & ~3u) != 0) return JQ2_ERR_INVAL;
     const PushCheck c = check_push(port, source, size, tag);
     if (c.error != JQ2_OK) return c.error;
@@ -1530,8 +1531,9 @@ int32_t jq2_port_copy_push(uint32_t port, uint32_t source, uint32_t size, uint32
 
 int32_t jq2_port_push_sync(uint32_t port, uint32_t tag_mask, uint32_t flags)
 {
-    /* FW 4.93 PushSync tests the flags first, before the port: only 0 and 4 pass, and bit 2 is "do not
-     * block on a full ring". The tag mask comes after the port tests. */
+    /* FW 4.93 PushSync (0x020042D8, NID 0xFC526B72; flag test at 0x020042E8..0x020042FC) tests the flags
+     * first, before the port: only 0 and 4 pass, and bit 2 is "do not block on a full ring". The tag mask
+     * comes after the port tests. */
     if ((flags & ~4u) != 0) return JQ2_ERR_INVAL;
     const PortRef ref = resolve_port(port);
     if (ref.error != JQ2_OK) return ref.error;
