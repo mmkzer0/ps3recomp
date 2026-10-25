@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <stdatomic.h>
 #include "ps3emu/log_first.h"
 
 /* Guest memory and the RSX offset resolvers, declared the way every backend
@@ -183,6 +184,218 @@ static struct {
 /* The decompilers' HLSL. The VP decompiler builds bodies up to 192 KB. */
 static char s_vs_hlsl[256 * 1024];
 static char s_ps_hlsl[256 * 1024];
+
+/* ---- draw accounting, pipeline failures and frame identity (M3 gaps 3e/3g/3d)
+ *
+ * The draw path runs on the FIFO walker thread; the gate and the tests read
+ * these from another one, so every counter is relaxed-atomic (AGENTS.md). Each
+ * drop logs at powers of two, like fw_divergence.h, so a hot path cannot flood
+ * the log and a run cut short by a kill still shows the first hit.
+ *
+ * The pipeline-failure table has a single writer (the walker creates
+ * pipelines); readers only observe counts, so an entry publishes its hash
+ * before its count. */
+
+static _Atomic unsigned long long s_submitted;
+static _Atomic unsigned long long s_executed;
+static _Atomic unsigned long long s_dropped[RSX_DROP_REASON_COUNT];
+
+static _Atomic unsigned long long s_dump_errors;
+
+#define ENG_MAX_PIPE_FAILURES 16
+static struct {
+    _Atomic unsigned long long hash;
+    _Atomic unsigned long long count;
+} s_pipe_fail[ENG_MAX_PIPE_FAILURES];
+static _Atomic unsigned s_pipe_fail_used;
+static _Atomic unsigned long long s_pipe_fail_other;
+
+static unsigned long long eng_pow2_bump(_Atomic unsigned long long* c)
+{
+    const unsigned long long n =
+        atomic_fetch_add_explicit(c, 1, memory_order_relaxed) + 1;
+    return n;
+}
+
+static int eng_is_pow2(unsigned long long n) { return n && !(n & (n - 1)); }
+
+const char* rsx_drop_reason_name(rsx_drop_reason reason)
+{
+    static const char* const names[RSX_DROP_REASON_COUNT] = {
+        "not-ready", "no-packets", "fetch-failed", "mixed-sources",
+        "needs-expansion", "unsupported-topology", "no-vertices",
+        "topology-rebuild-failed", "no-indices", "no-targets",
+        "pipeline-failed", "debug-skip", "texture-feedback",
+        "index-alloc-failed", "constant-alloc-failed",
+    };
+    if ((unsigned)reason >= RSX_DROP_REASON_COUNT) return "invalid";
+    return names[reason];
+}
+
+/* One dropped draw: the reason's counter, and the sentence a run has to show. */
+static void eng_drop(rsx_drop_reason reason)
+{
+    const unsigned long long n = eng_pow2_bump(&s_dropped[reason]);
+    if (eng_is_pow2(n))
+        fprintf(stderr, "[rsx-drop] reason=%s count=%llu\n",
+                rsx_drop_reason_name(reason), n);
+}
+
+static void eng_submitted(void)
+{
+    atomic_fetch_add_explicit(&s_submitted, 1, memory_order_relaxed);
+}
+
+static void eng_executed(void)
+{
+    atomic_fetch_add_explicit(&s_executed, 1, memory_order_relaxed);
+}
+
+void rsx_draw_engine_draw_stats(rsx_draw_engine_stats* out)
+{
+    if (!out) return;
+    out->submitted = atomic_load_explicit(&s_submitted, memory_order_relaxed);
+    out->executed  = atomic_load_explicit(&s_executed, memory_order_relaxed);
+    out->dropped = 0;
+    for (unsigned i = 0; i < RSX_DROP_REASON_COUNT; i++) {
+        out->by_reason[i] = atomic_load_explicit(&s_dropped[i], memory_order_relaxed);
+        out->dropped += out->by_reason[i];
+    }
+}
+
+void rsx_draw_engine_reset_draw_stats(void)
+{
+    atomic_store_explicit(&s_submitted, 0, memory_order_relaxed);
+    atomic_store_explicit(&s_executed, 0, memory_order_relaxed);
+    for (unsigned i = 0; i < RSX_DROP_REASON_COUNT; i++)
+        atomic_store_explicit(&s_dropped[i], 0, memory_order_relaxed);
+    for (unsigned i = 0; i < ENG_MAX_PIPE_FAILURES; i++) {
+        atomic_store_explicit(&s_pipe_fail[i].hash, 0, memory_order_relaxed);
+        atomic_store_explicit(&s_pipe_fail[i].count, 0, memory_order_relaxed);
+    }
+    atomic_store_explicit(&s_pipe_fail_used, 0, memory_order_relaxed);
+    atomic_store_explicit(&s_pipe_fail_other, 0, memory_order_relaxed);
+    atomic_store_explicit(&s_dump_errors, 0, memory_order_relaxed);
+}
+
+/* A pipeline that could not be created, counted by the program it was for. */
+static void eng_pipeline_failed(u64 fp_hash)
+{
+    const unsigned used = atomic_load_explicit(&s_pipe_fail_used, memory_order_relaxed);
+    for (unsigned i = 0; i < used; i++) {
+        if (atomic_load_explicit(&s_pipe_fail[i].hash, memory_order_relaxed) != fp_hash)
+            continue;
+        const unsigned long long n = eng_pow2_bump(&s_pipe_fail[i].count);
+        if (eng_is_pow2(n))
+            fprintf(stderr, "[rsx-pipeline-fail] fp=%016llx count=%llu\n",
+                    (unsigned long long)fp_hash, n);
+        return;
+    }
+    const unsigned slot = atomic_fetch_add_explicit(&s_pipe_fail_used, 1,
+                                                    memory_order_relaxed);
+    if (slot < ENG_MAX_PIPE_FAILURES) {
+        atomic_store_explicit(&s_pipe_fail[slot].hash, fp_hash, memory_order_relaxed);
+        atomic_store_explicit(&s_pipe_fail[slot].count, 1, memory_order_relaxed);
+        fprintf(stderr, "[rsx-pipeline-fail] fp=%016llx count=1\n",
+                (unsigned long long)fp_hash);
+    } else {
+        const unsigned long long n = eng_pow2_bump(&s_pipe_fail_other);
+        if (eng_is_pow2(n))
+            fprintf(stderr, "[rsx-pipeline-fail] other count=%llu\n", n);
+    }
+}
+
+u32 rsx_draw_engine_pipeline_failures(rsx_pipeline_failure* out, u32 max)
+{
+    const unsigned used = atomic_load_explicit(&s_pipe_fail_used, memory_order_relaxed);
+    const unsigned n = used < ENG_MAX_PIPE_FAILURES ? used : ENG_MAX_PIPE_FAILURES;
+    u32 written = 0;
+    for (unsigned i = 0; i < n; i++) {
+        const unsigned long long count =
+            atomic_load_explicit(&s_pipe_fail[i].count, memory_order_relaxed);
+        if (!count) continue;
+        if (out && written < max) {
+            out[written].fp_hash =
+                atomic_load_explicit(&s_pipe_fail[i].hash, memory_order_relaxed);
+            out[written].count = count;
+        }
+        written++;
+    }
+    return written;
+}
+
+/* The flip-head ordinal the identity carries: the same 0xE924 word with bit 31
+ * that cellGcmSys turns into GCM_DRV_EVENT_FLIP_HEAD (cellGcmSys.c:2611). The
+ * engine is fed that word in the same walker order, so its count is that
+ * ordinal. */
+static u32 s_flip_heads;
+/* The buffer the guest queued (0xE944) for the flip in progress: the head's own
+ * word is a command (0x8000010F), not a buffer id, so the queued one is what
+ * names the scanout. */
+static u32 s_queued_buffer;
+static int s_queued_valid;
+
+/* The last present's identity crosses threads -- the FIFO walker publishes it,
+ * the metal backend and a gate or a test read it -- so it is a seqlock over
+ * atomic words rather than three plain fields. The sequence is odd while a
+ * writer is in the middle of a publish. */
+static _Atomic unsigned s_identity_seq;
+static _Atomic u32 s_identity_flip;
+static _Atomic u32 s_identity_present;
+static _Atomic u32 s_identity_buffer;
+static _Atomic int s_identity_valid;
+
+static u32 eng_last_flip_id(void)
+{
+    return s_flip_heads ? s_flip_heads - 1u : RSX_FRAME_NO_FLIP;
+}
+
+static void eng_identity_publish(u32 flip_id, u32 present_seq, u32 buffer)
+{
+    const unsigned s = atomic_load_explicit(&s_identity_seq, memory_order_relaxed);
+    atomic_store_explicit(&s_identity_seq, s + 1u, memory_order_relaxed);
+    atomic_store_explicit(&s_identity_flip, flip_id, memory_order_relaxed);
+    atomic_store_explicit(&s_identity_present, present_seq, memory_order_relaxed);
+    atomic_store_explicit(&s_identity_buffer, buffer, memory_order_relaxed);
+    atomic_store_explicit(&s_identity_valid, 1, memory_order_relaxed);
+    atomic_store_explicit(&s_identity_seq, s + 2u, memory_order_release);
+}
+
+int rsx_draw_engine_frame_identity(rsx_frame_identity* out)
+{
+    if (!atomic_load_explicit(&s_identity_valid, memory_order_acquire)) return 0;
+    for (;;) {
+        const unsigned s1 = atomic_load_explicit(&s_identity_seq, memory_order_acquire);
+        if (!(s1 & 1u)) {
+            const u32 flip = atomic_load_explicit(&s_identity_flip, memory_order_relaxed);
+            const u32 seq = atomic_load_explicit(&s_identity_present, memory_order_relaxed);
+            const u32 buf = atomic_load_explicit(&s_identity_buffer, memory_order_relaxed);
+            if (atomic_load_explicit(&s_identity_seq, memory_order_acquire) == s1) {
+                if (out) {
+                    out->flip_id = flip;
+                    out->present_seq = seq;
+                    out->display_buffer = buf;
+                }
+                return 1;
+            }
+        }
+    }
+}
+
+/* "00042" or "none", for a log line or a file name. */
+static void eng_fmt_flip(char* buf, size_t n, u32 flip_id)
+{
+    if (flip_id == RSX_FRAME_NO_FLIP)
+        snprintf(buf, n, "none");
+    else
+        snprintf(buf, n, "%u", flip_id);
+}
+
+unsigned long long rsx_draw_engine_pass_dump_errors(void)
+{
+    return atomic_load_explicit(&s_dump_errors, memory_order_relaxed);
+}
+
 
 /* The draw accumulator: one BEGIN_END group's batches, references and cuts. */
 static struct {
@@ -1786,6 +1999,9 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                 (unsigned long long)key, fixed ? "built-in" : "guest",
                 vi, fi, nconst, (unsigned long long)fp_hash,
                 handle ? "ok" : "FAILED (draw dropped)"); }
+    /* The log above stops at 32 lines; the failure count does not. It is per
+     * fragment program, so a run can say which program never compiles. */
+    if (!handle) eng_pipeline_failed(fp_hash);
 
     g.pipelines[g.n_pipelines].key = key;
     g.pipelines[g.n_pipelines].fp_hash = fp_hash;
@@ -2243,10 +2459,23 @@ static struct {
     FILE* draws_log;        /* RSX_ENGINE_PASS_DUMP_DRAWS: one line a draw */
     u32 pass;
     int open;
+    u32 frame_seq;          /* present_seq of the frame this pass belongs to */
+    u32 flip_id;            /* flip head current when the pass opened */
     u32 n_targets, targets[RSX_BE_MAX_COLOR_TARGETS], zslot;
     u32 draws, clears;
     char first[2048];
 } s_pd;
+
+/* A flip ordinal for a file name or the index: five digits, or "none" before
+ * the first head, so the name is unique per present even when two presents
+ * share a flip (which they do about three times per flip). */
+static void pd_flip_name(char* out, size_t n, u32 flip_id)
+{
+    if (flip_id == RSX_FRAME_NO_FLIP)
+        snprintf(out, n, "none");
+    else
+        snprintf(out, n, "%05u", flip_id);
+}
 
 static int pd_open_index(void)
 {
@@ -2277,8 +2506,12 @@ static int pd_capturing(void)
         s_pd.state = (s_pd.dir && *s_pd.dir) ? 1 : 3;
     }
     if (s_pd.state == 1 && s_pd.after_s &&
-        difftime(time(NULL), s_pd.start) >= (double)s_pd.after_s && pd_open_index())
-        fprintf(s_pd.index, "from a draw of frame %u, %u s in\n", g.frames, s_pd.after_s);
+        difftime(time(NULL), s_pd.start) >= (double)s_pd.after_s && pd_open_index()) {
+        char flip[16];
+        pd_flip_name(flip, sizeof flip, eng_last_flip_id());
+        fprintf(s_pd.index, "from a draw of frame %u, %u s in s=%u flip=%s\n",
+                g.frames, s_pd.after_s, g.frames, flip);
+    }
     return s_pd.state == 2;
 }
 
@@ -2313,7 +2546,16 @@ static void pd_write_surface(u32 slot, const char* path)
     case RSX_BE_FMT_R16G16B16A16F: bpp = 8;  break;
     case RSX_BE_FMT_R32G32B32A32F: bpp = 16; break;
     case RSX_BE_FMT_R32F:          bpp = 4;  break;
-    default: return;
+    default: {
+        /* M3 gap 3c: a format the PPM writer cannot express is counted and
+         * logged, never skipped in silence. */
+        const unsigned long long n = eng_pow2_bump(&s_dump_errors);
+        if (eng_is_pow2(n))
+            fprintf(stderr, "[rsx-pass-dump] unsupported format=%d surface=%u"
+                            " seq=%u count=%llu\n",
+                    (int)s->fmt, slot, s_pd.frame_seq, n);
+        return;
+    }
     }
     if (!s->handle || !s->w || !s->h || !g.be->readback) return;
     u8* raw = (u8*)malloc((size_t)s->w * s->h * bpp);
@@ -2388,24 +2630,28 @@ static void pd_close_pass(void)
 {
     if (!s_pd.open) return;
     char path[1024];
+    char flip[16];
+    pd_flip_name(flip, sizeof flip, s_pd.flip_id);
     fprintf(s_pd.index, "pass %03u: draws %u clears %u |", s_pd.pass, s_pd.draws,
             s_pd.clears);
     for (u32 k = 0; k < s_pd.n_targets; k++) {
         const eng_surface* s = &g.surfaces[s_pd.targets[k]];
         fprintf(s_pd.index, " %c 0x%08X fmt %d %ux%u p%u", 'A' + (int)k, s->offset,
                 (int)s->fmt, s->w, s->h, s->pitch);
-        snprintf(path, sizeof path, "%s/pass%03u_t%u.ppm", s_pd.dir, s_pd.pass, k);
+        snprintf(path, sizeof path, "%s/s%05u_f%s_pass%03u_t%u.ppm", s_pd.dir,
+                 s_pd.frame_seq, flip, s_pd.pass, k);
         pd_write_surface(s_pd.targets[k], path);
     }
     if (s_pd.zslot != ENG_INVALID) {
         float lo, hi;
-        snprintf(path, sizeof path, "%s/pass%03u_z.pgm", s_pd.dir, s_pd.pass);
+        snprintf(path, sizeof path, "%s/s%05u_f%s_pass%03u_z.pgm", s_pd.dir,
+                 s_pd.frame_seq, flip, s_pd.pass);
         pd_write_depth(s_pd.zslot, path, &lo, &hi);
         const eng_zdepth* z = &g.zdepths[s_pd.zslot];
         fprintf(s_pd.index, " | zeta 0x%08X p%u depth %.9g..%.9g (%ux%u, written %ux%u)",
                 z->offset, z->pitch, lo, hi, z->w, z->h, z->used_w, z->used_h);
     }
-    fprintf(s_pd.index, " |%s\n", s_pd.first);
+    fprintf(s_pd.index, " |%s s=%u flip=%s\n", s_pd.first, s_pd.frame_seq, flip);
     fflush(s_pd.index);
     s_pd.pass++;
     s_pd.open = 0;
@@ -2431,6 +2677,11 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
     if (!same) {
         pd_close_pass();
         s_pd.open = 1;
+        /* The frame being built is the next present (g.frames), and the flip
+         * head it follows is the last one counted; both go into the file
+         * names and the index line. */
+        s_pd.frame_seq = g.frames;
+        s_pd.flip_id = eng_last_flip_id();
         s_pd.n_targets = n_targets;
         memcpy(s_pd.targets, targets, n_targets * sizeof(u32));
         s_pd.zslot = zslot;
@@ -2505,24 +2756,33 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
 
 /* Called on every present: arm on the first frame heavy enough when no delay
  * was asked for, and while capturing, close the pass in progress and write
- * the presented surface. */
-static void pd_present(u32 presented)
+ * the presented surface under the present's own identity. The name carries
+ * present_seq, which advances on every present, so two presents between two
+ * passes no longer share a file (M3 gaps 3a/3b: 130 of 389 present images were
+ * lost to that collision before). */
+static void pd_present(u32 presented, const rsx_frame_identity* fid)
 {
     if (s_pd.state == 0) pd_capturing();
     if (s_pd.state == 1 && !s_pd.after_s && g.guest_draws >= s_pd.min_draws) {
+        char flip[16];
+        pd_flip_name(flip, sizeof flip, fid->flip_id);
         if (pd_open_index())
-            fprintf(s_pd.index, "frame %u (after a frame of %u guest draws)\n",
-                    g.frames + 1, g.guest_draws);
+            fprintf(s_pd.index, "frame %u (after a frame of %u guest draws) s=%u flip=%s\n",
+                    g.frames + 1, g.guest_draws, fid->present_seq, flip);
         return;
     }
     if (s_pd.state == 2) {
         char path[1024];
+        char flip[16];
+        pd_flip_name(flip, sizeof flip, fid->flip_id);
         pd_close_pass();
         if (s_pd.state != 2) return;               /* that pass was the last */
-        snprintf(path, sizeof path, "%s/present%03u.ppm", s_pd.dir, s_pd.pass);
+        snprintf(path, sizeof path, "%s/present_s%05u_f%s.ppm", s_pd.dir,
+                 fid->present_seq, flip);
         pd_write_surface(presented, path);
-        fprintf(s_pd.index, "present%03u: surface %u 0x%08X, %u guest draws\n",
-                s_pd.pass, presented, g.surfaces[presented].offset, g.guest_draws);
+        fprintf(s_pd.index, "present_s%05u: surface %u 0x%08X, %u guest draws flip=%s\n",
+                fid->present_seq, presented, g.surfaces[presented].offset,
+                g.guest_draws, flip);
         fflush(s_pd.index);
     }
 }
@@ -2530,11 +2790,20 @@ static void pd_present(u32 presented)
 static void sink_end(void* user, const rsx_dispatch* r)
 {
     (void)user; (void)r;
-    if (!g.ready || !dc.n_packets || !dc.fetch_ok) return;
+    /* Every group that ends here is one submitted draw; it leaves through
+     * exactly one of the eng_drop() sites below or through eng_executed() at
+     * the end, so submitted == executed + sum(dropped) always holds. */
+    eng_submitted();
+    if (!g.ready)            { eng_drop(RSX_DROP_NOT_READY); return; }
+    if (!dc.n_packets)       { eng_drop(RSX_DROP_NO_PACKETS); return; }
+    if (!dc.fetch_ok)        { eng_drop(RSX_DROP_FETCH_FAILED); return; }
     /* Mixed geometry sources have no defined concatenation here. Reject the
      * whole group instead of drawing partial/misordered geometry. */
     if (dc.n_immediate && (dc.n_arr || dc.n_idx || dc.inl_bytes ||
-                          r->inline_dropped != dc.inline_dropped_at_begin)) return;
+                          r->inline_dropped != dc.inline_dropped_at_begin)) {
+        eng_drop(RSX_DROP_MIXED_SOURCES);
+        return;
+    }
 
     const u32 prim = g.rsx.current_primitive;
     /* Everything that becomes triangles -- lists, strips, fans, quads, quad
@@ -2549,33 +2818,43 @@ static void sink_end(void* user, const rsx_dispatch* r)
     int scratch = 0;
     const int rebuild = eng_topology_rebuild(prim, 0, &scratch) != 0;
     if (!rebuild) {
-        if (rsx_primitive_needs_expansion(prim)) return;
+        if (rsx_primitive_needs_expansion(prim)) {
+            eng_drop(RSX_DROP_NEEDS_EXPANSION);
+            return;
+        }
         topology = rsx_primitive_topology(prim);
-        if (topology == RSX_TOPOLOGY_UNSUPPORTED) return;
+        if (topology == RSX_TOPOLOGY_UNSUPPORTED) {
+            eng_drop(RSX_DROP_UNSUPPORTED_TOPOLOGY);
+            return;
+        }
     }
 
     rsx_vertex_layout_plan layout;
     eng_vertex_layout(&layout);
     dc_fetch(&layout, rebuild);
-    if (!dc.n_verts || !dc.fetch_ok) return;
+    if (!dc.fetch_ok)        { eng_drop(RSX_DROP_FETCH_FAILED); return; }
+    if (!dc.n_verts)         { eng_drop(RSX_DROP_NO_VERTICES); return; }
 
     int indexed = 0;
     u32 n_draw = dc.n_source_refs;
     if (rebuild) {
-        if (!eng_topology_rebuild(prim, dc.refs_remapped, &indexed)) return;
+        if (!eng_topology_rebuild(prim, dc.refs_remapped, &indexed)) {
+            eng_drop(RSX_DROP_TOPOLOGY_REBUILD_FAILED);
+            return;
+        }
         n_draw = indexed
             ? rsx_draw_engine_topology_index_count(prim, dc.n_source_refs,
                                                    dc.cuts, dc.n_cuts)
             : dc.n_source_refs - dc.n_source_refs % 3u;
     }
-    if (!n_draw) return;
+    if (!n_draw)             { eng_drop(RSX_DROP_NO_INDICES); return; }
 
     rsx_be_render_state rs;
     rsx_draw_engine_decode_render_state(&g.rsx, &rs);
 
     u32 targets[RSX_BE_MAX_COLOR_TARGETS];
     const u32 n_targets = eng_current_target_set(targets);
-    if (!n_targets) return;
+    if (!n_targets)          { eng_drop(RSX_DROP_NO_TARGETS); return; }
     const u32 target = targets[0];
 
     rsx_dsp_surface sf;
@@ -2596,8 +2875,11 @@ static void sink_end(void* user, const rsx_dispatch* r)
                                           eng_surface_format(sf.color_format),
                                           n_targets, &pipeline_is_fixed, &tex_used,
                                           &fp_hash);
-    if (!pipeline) return;
-    if (fp_hash && eng_debug_fp(fp_hash, pipeline)) return;
+    if (!pipeline)           { eng_drop(RSX_DROP_PIPELINE_FAILED); return; }
+    if (fp_hash && eng_debug_fp(fp_hash, pipeline)) {
+        eng_drop(RSX_DROP_DEBUG_SKIP);
+        return;
+    }
 
     /* Textures before any pipeline or target binding: a cache refresh can
      * replace a resource, and the backend is free to submit while doing it. */
@@ -2611,12 +2893,18 @@ static void sink_end(void* user, const rsx_dispatch* r)
     memset(vsamplers, 0, sizeof vsamplers);
     const u32 tex_mask = sink_bind_textures(targets, n_targets, zslot, tex_used,
                                             textures, samplers);
-    if (tex_mask == ENG_INVALID) return;
+    if (tex_mask == ENG_INVALID) {
+        eng_drop(RSX_DROP_TEXTURE_FEEDBACK);
+        return;
+    }
     const u32 vtex_mask = sink_bind_vertex_textures(eng_vtex_mask(), vtextures,
                                                     vsamplers);
 
     if (indexed) {
-        if (!dc_reserve_indices(n_draw)) return;
+        if (!dc_reserve_indices(n_draw)) {
+            eng_drop(RSX_DROP_INDEX_ALLOC_FAILED);
+            return;
+        }
         rsx_draw_engine_write_topology_indices(
             prim, dc.n_source_refs, dc.cuts, dc.n_cuts,
             dc.refs_remapped ? dc.ref_remap.occurrence_to_unique : NULL,
@@ -2650,7 +2938,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
     const u32 fp_bytes = (nslots + 1u) * 16u;
     if (g.fp_cb_cap < fp_bytes) {
         u8* n = (u8*)realloc(g.fp_cb, fp_bytes);
-        if (!n) return;
+        if (!n) { eng_drop(RSX_DROP_CONSTANT_ALLOC_FAILED); return; }
         g.fp_cb = n;
         g.fp_cb_cap = fp_bytes;
     }
@@ -2724,6 +3012,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
     const u32 uploaded = indexed ? dc.n_verts : n_draw;
     g.be->draw(g.be->user, topology, dc.verts, uploaded, layout.stride,
                indexed ? g.indices : NULL, indexed ? n_draw : 0);
+    eng_executed();
     /* Counted only when the draw ran the guest's OWN programs, which is what
      * the test hook means: a draw through the built-in pair is a draw, not
      * evidence that the decompile-translate-compile path worked. */
@@ -2821,16 +3110,29 @@ static void eng_present(u32 buffer_id)
     if (!g.ready) return;
     const u32 target = eng_present_surface(buffer_id);
     if (target == ENG_INVALID) return;
+    /* The present's identity: the flip ordinal is the GCM's
+     * (eng_last_flip_id), the present ordinal is the engine's, and the buffer
+     * is the one the guest queued for this flip -- the head's own word is a
+     * command, not a buffer id. */
+    rsx_frame_identity fid;
+    fid.flip_id = eng_last_flip_id();
+    fid.present_seq = g.frames;
+    fid.display_buffer = s_queued_valid ? s_queued_buffer : (buffer_id & 7u);
+    eng_identity_publish(fid.flip_id, fid.present_seq, fid.display_buffer);
+    char flip[16];
+    eng_fmt_flip(flip, sizeof flip, fid.flip_id);
     if (getenv("PS3RECOMP_METAL_FRAME_DUMP") && g.frames % 120 == 0) {
         u32 current = eng_current_surface();
-        fprintf(stderr, "[rsx capture] frame=%u buffer=%u selected=%u current=%u draws=%u surfaces=%u\n",
-                g.frames, buffer_id, target, current, g.guest_draws, g.n_surfaces);
+        /* The identity is appended, not inserted: existing parsers read the
+         * frame=/buffer=/selected=/draws= fields by position. */
+        fprintf(stderr, "[rsx capture] frame=%u buffer=%u selected=%u current=%u draws=%u surfaces=%u flip=%s\n",
+                g.frames, buffer_id, target, current, g.guest_draws, g.n_surfaces, flip);
         for (u32 i = 0; i < g.n_surfaces; ++i)
             fprintf(stderr, "[rsx capture] surface %u loc=%u offset=%08X size=%ux%u handle=%u\n",
                     i, g.surfaces[i].location, g.surfaces[i].offset,
                     g.surfaces[i].w, g.surfaces[i].h, g.surfaces[i].handle);
     }
-    pd_present(target);
+    pd_present(target, &fid);
     g.last_present_surface = target;
     g.be->present(g.be->user, g.surfaces[target].handle);
     g.frames++;
@@ -2901,6 +3203,14 @@ int rsx_draw_engine_init(u32 width, u32 height)
     sink.flip             = sink_flip;
     rsx_dispatch_init(&g.rsx, &sink);
     g.ready = 1;
+    /* A fresh engine starts at zero: the counters describe this run, not the
+     * process. */
+    rsx_draw_engine_reset_draw_stats();
+    s_flip_heads = 0;
+    s_queued_buffer = 0;
+    s_queued_valid = 0;
+    atomic_store_explicit(&s_identity_valid, 0, memory_order_relaxed);
+    atomic_store_explicit(&s_identity_seq, 0, memory_order_relaxed);
     /* Display buffers the title registered before the backend came up. */
     cellGcm_replay_display_buffers_to_engine();
     fprintf(stderr, "[rsx engine] register-file draw engine up (%ux%u)\n",
@@ -2945,6 +3255,15 @@ void rsx_draw_engine_method(u32 method, u32 arg)
      * (0xE9xx, 0xEBxx) encode the subchannel bits as part of the address;
      * preserve them with the wider mask. */
     u32 m = (method >= 0xE000u) ? (method & 0xFFFCu) : (method & 0x1FFCu);
+    /* A GCM flip head -- 0xE924 with bit 31 -- is the word cellGcmSys turns
+     * into GCM_DRV_EVENT_FLIP_HEAD (cellGcmSys.c:2611). Counting it here, in
+     * the same FIFO order, gives the identity the same ordinal the C3 event
+     * file reports for the flip. */
+    if (m == 0xE944u) {                 /* the queue flip names the scanout */
+        s_queued_buffer = arg & 7u;
+        s_queued_valid = 1;
+    }
+    if (m == 0xE924u && (arg & 0x80000000u)) s_flip_heads++;
     rsx_dispatch_method(&g.rsx, m, arg);
 }
 

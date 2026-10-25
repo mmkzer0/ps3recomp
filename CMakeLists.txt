@@ -927,6 +927,29 @@ if(UNIX)
         endif()
         set_target_properties(test_shader_spirv PROPERTIES LINKER_LANGUAGE CXX)
     endif()
+
+    # The register-file draw engine's accounting and dump naming (M3 gaps
+    # 3a-3e, 3g). Driven through rsx_draw_engine_method() against a recording
+    # stub backend: no GPU, no host API, no game content. Same source set the
+    # CI workflows compile ad hoc.
+    foreach(engine_test test_rsx_draw_accounting test_rsx_draw_dump_names)
+        add_executable(${engine_test}
+            libs/video/tests/${engine_test}.c
+            libs/video/rsx_draw_engine.c
+            libs/video/rsx_dispatch.c
+            libs/video/rsx_vertex_compact.c
+            libs/video/rsx_texture_layout.c
+            libs/video/rsx_vp_decompiler.c
+            libs/video/rsx_fp_decompiler.c
+        )
+        target_include_directories(${engine_test} PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests"
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        )
+        add_test(NAME ${engine_test} COMMAND ${engine_test})
+        set_tests_properties(${engine_test} PROPERTIES LABELS "gcm;t0" TIMEOUT 120)
+    endforeach()
 endif()
 
 # ---------------------------------------------------------------------------

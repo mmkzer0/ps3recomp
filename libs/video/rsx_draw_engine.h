@@ -292,6 +292,93 @@ void rsx_draw_engine_present_buffer(u32 buffer_id);
  * rsx_draw_engine_present() without presenting now. */
 void rsx_draw_engine_note_flip(u32 buffer_id);
 
+/* ---- draw accounting (M3 gap 3e) ---------------------------------------- */
+
+/* Every draw group that ends is counted once as submitted. It is either
+ * executed or dropped for exactly one reason, so
+ *
+ *     submitted == executed + sum(by_reason)
+ *
+ * holds for every run, and a new drop path has to name its cause: there is no
+ * "other" bucket. The counters are process-wide and relaxed-atomic; a dropped
+ * draw logs its 1st, 2nd, 4th, ... hit as
+ * `[rsx-drop] reason=<name> count=<n>`, so no drop path is silent. */
+typedef enum {
+    RSX_DROP_NOT_READY = 0,    /* the group ended before the engine came up */
+    RSX_DROP_NO_PACKETS,       /* BEGIN_END with no draw packet between */
+    RSX_DROP_FETCH_FAILED,     /* a vertex or index span could not be read */
+    RSX_DROP_MIXED_SOURCES,    /* immediate vertices mixed with arrays/indices */
+    RSX_DROP_NEEDS_EXPANSION,  /* the primitive needs an expansion this engine lacks */
+    RSX_DROP_UNSUPPORTED_TOPOLOGY,
+    RSX_DROP_NO_VERTICES,      /* the fetch produced no vertex */
+    RSX_DROP_TOPOLOGY_REBUILD_FAILED,
+    RSX_DROP_NO_INDICES,       /* the rebuild left nothing to draw */
+    RSX_DROP_NO_TARGETS,       /* no colour target is bound */
+    RSX_DROP_PIPELINE_FAILED,  /* the program pair did not translate or compile */
+    RSX_DROP_DEBUG_SKIP,       /* RSX_ENGINE_SKIP_FP named this program */
+    RSX_DROP_TEXTURE_FEEDBACK, /* a sampled target could not be resolved */
+    RSX_DROP_INDEX_ALLOC_FAILED,
+    RSX_DROP_CONSTANT_ALLOC_FAILED,
+    RSX_DROP_REASON_COUNT
+} rsx_drop_reason;
+
+const char* rsx_drop_reason_name(rsx_drop_reason reason);
+
+typedef struct {
+    unsigned long long submitted;
+    unsigned long long executed;
+    unsigned long long dropped;                  /* the sum of by_reason */
+    unsigned long long by_reason[RSX_DROP_REASON_COUNT];
+} rsx_draw_engine_stats;
+
+/* Snapshot the counters. They do not reset on their own; init clears them. */
+void rsx_draw_engine_draw_stats(rsx_draw_engine_stats* out);
+/* Zero them, for a test or for a per-frame read at a quiescent point. */
+void rsx_draw_engine_reset_draw_stats(void);
+
+/* Pipeline creation failures per fragment program (M3 gap 3g): the pipeline
+ * log is capped, this count is not. Writes up to `max` entries into `out`
+ * (may be NULL with max 0) and returns the number of distinct programs; a
+ * fixed-function pipeline reports fp_hash 0. */
+typedef struct {
+    unsigned long long fp_hash;
+    unsigned long long count;
+} rsx_pipeline_failure;
+
+u32 rsx_draw_engine_pipeline_failures(rsx_pipeline_failure* out, u32 max);
+
+/* ---- frame identity (M3 gap 3d) ----------------------------------------- */
+
+/* The engine's present counter and the GCM's flip counter are not one
+ * counter: the flip sink is reached about three times per guest flip (0xE944,
+ * then 0xE924, and 0xE920), so the identity records both numbers instead of
+ * deriving either from the other.
+ *
+ *   flip_id        0-based ordinal of the most recent GCM flip head -- the
+ *                  same ordinal cellGcmSys counts for GCM_DRV_EVENT_FLIP_HEAD,
+ *                  because the engine sees the one 0xE924 word with bit 31 in
+ *                  the same FIFO order. RSX_FRAME_NO_FLIP before the first.
+ *   present_seq    0-based ordinal of this engine present (the counter the
+ *                  dump files are named by).
+ *   display_buffer the display buffer id this present used (0..7).
+ */
+#define RSX_FRAME_NO_FLIP 0xFFFFFFFFu
+
+typedef struct {
+    u32 flip_id;
+    u32 present_seq;
+    u32 display_buffer;
+} rsx_frame_identity;
+
+/* The identity of the last completed present. Returns 1 when one has happened. */
+int rsx_draw_engine_frame_identity(rsx_frame_identity* out);
+
+/* Count of pass-dump images refused for an unsupported surface format (M3 gap
+ * 3c): a format the PPM writer cannot express is counted and logged, never a
+ * silent skip. */
+unsigned long long rsx_draw_engine_pass_dump_errors(void);
+
+
 /* Guest memory and the surfaces the engine renders on the host GPU, kept
  * coherent around a 2D transfer (NV3089) that the FIFO walker performs on
  * guest memory. A title copies its rendered scene out to main memory for

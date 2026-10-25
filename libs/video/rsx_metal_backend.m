@@ -3680,15 +3680,116 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
 }
 
 /* Opt-in readback of the game surface, useful on a locked Mac or in CI.
- * Headless submits have completed; windowed captures fence the same queue. */
-static void eng_dump_frame(id<MTLTexture> src)
+ * Headless submits have completed; windowed captures fence the same queue.
+ *
+ * The file name carries the present's identity -- `s<present_seq>` and
+ * `f<flip_id>` (or `fnone` before the first flip head) -- so no dump
+ * overwrites another (M3 gaps 3a/3b). The base is
+ * PS3RECOMP_METAL_FRAME_DUMP; a trailing ".ppm" is replaced by the identity
+ * suffix. Selection (all read once, like every diagnostic knob):
+ *   default            every 120th present
+ *   ..._RANGE=a-b      present_seq in [a, b] (inclusive)
+ *   ..._LIST=a,b,c     exactly those present_seq values
+ * A surface format the PPM writer cannot express is counted and logged (gap
+ * 3c), never skipped silently. */
+static struct {
+    int init;
+    unsigned stride;
+    int have_range, range_lo, range_hi;
+    int have_list;
+    unsigned list[32];
+    unsigned n_list;
+} s_fdump;
+
+static _Atomic unsigned long long s_fdump_written;
+static _Atomic unsigned long long s_fdump_errors;
+
+static void fdump_parse(void)
 {
-    const char* path = getenv("PS3RECOMP_METAL_FRAME_DUMP");
-    if (!path || !*path) return;
-    static unsigned frame;
-    if ((++frame % 120) != 0) return;
+    if (s_fdump.init) return;
+    s_fdump.init = 1;
+    s_fdump.stride = 120;
+    const char* r = getenv("PS3RECOMP_METAL_FRAME_DUMP_RANGE");
+    if (r && *r) {
+        char* end = NULL;
+        const long a = strtol(r, &end, 0);
+        if (end && (*end == '-' || *end == ':')) {
+            const long b = strtol(end + 1, NULL, 0);
+            if (a >= 0 && b >= a) {
+                s_fdump.have_range = 1;
+                s_fdump.range_lo = (int)a;
+                s_fdump.range_hi = (int)b;
+            }
+        }
+    }
+    const char* l = getenv("PS3RECOMP_METAL_FRAME_DUMP_LIST");
+    if (l && *l) {
+        const char* p = l;
+        while (*p && s_fdump.n_list < 32) {
+            char* end = NULL;
+            const unsigned long v = strtoul(p, &end, 0);
+            if (end == p) break;
+            s_fdump.list[s_fdump.n_list++] = (unsigned)v;
+            s_fdump.have_list = 1;
+            p = end;
+            while (*p == ',' || *p == ' ') p++;
+        }
+    }
+}
+
+static int fdump_wanted(u32 seq)
+{
+    if (s_fdump.have_list) {
+        for (unsigned i = 0; i < s_fdump.n_list; i++)
+            if (s_fdump.list[i] == seq) return 1;
+        return 0;
+    }
+    if (s_fdump.have_range)
+        return seq >= (u32)s_fdump.range_lo && seq <= (u32)s_fdump.range_hi;
+    return s_fdump.stride && (seq % s_fdump.stride) == 0;
+}
+
+/* "<base>_s00042_f00041.ppm", with a ".ppm" on the base replaced. */
+static void fdump_name(char* out, size_t n, const char* base,
+                       const rsx_frame_identity* fid)
+{
+    char flip[16];
+    if (fid->flip_id == RSX_FRAME_NO_FLIP) snprintf(flip, sizeof flip, "none");
+    else snprintf(flip, sizeof flip, "%05u", fid->flip_id);
+    size_t len = strlen(base);
+    if (len > 4 && strcmp(base + len - 4, ".ppm") == 0) len -= 4;
+    snprintf(out, n, "%.*s_s%05u_f%s.ppm", (int)len, base, fid->present_seq, flip);
+}
+
+unsigned long long rsx_metal_backend_frame_dumps(void)
+{
+    return atomic_load_explicit(&s_fdump_written, memory_order_relaxed);
+}
+
+unsigned long long rsx_metal_backend_frame_dump_errors(void)
+{
+    return atomic_load_explicit(&s_fdump_errors, memory_order_relaxed);
+}
+
+static void eng_dump_frame(id<MTLTexture> src, const rsx_frame_identity* fid)
+{
+    const char* base = getenv("PS3RECOMP_METAL_FRAME_DUMP");
+    if (!base || !*base || !fid) return;
+    fdump_parse();
+    if (!fdump_wanted(fid->present_seq)) return;
+    char flip[16];
+    if (fid->flip_id == RSX_FRAME_NO_FLIP) snprintf(flip, sizeof flip, "none");
+    else snprintf(flip, sizeof flip, "%u", fid->flip_id);
     if ([src pixelFormat] != MTLPixelFormatRGBA8Unorm &&
-        [src pixelFormat] != MTLPixelFormatBGRA8Unorm) return;
+        [src pixelFormat] != MTLPixelFormatBGRA8Unorm) {
+        const unsigned long long n =
+            atomic_fetch_add_explicit(&s_fdump_errors, 1, memory_order_relaxed) + 1;
+        if (!(n & (n - 1)))
+            fprintf(stderr, "[rsx frame-dump] unsupported format=%lu s=%u flip=%s"
+                            " count=%llu\n",
+                    (unsigned long)[src pixelFormat], fid->present_seq, flip, n);
+        return;
+    }
     size_t w = [src width], h = [src height];
     if (!w || !h || w > 16384 || h > 16384) return;
     unsigned char* rgba = malloc(w * h * 4);
@@ -3700,6 +3801,8 @@ static void eng_dump_frame(id<MTLTexture> src)
     }
     [src getBytes:rgba bytesPerRow:w * 4
       fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
+    char path[1200];
+    fdump_name(path, sizeof path, base, fid);
     FILE* f = fopen(path, "wb");
     if (f) {
         fprintf(f, "P6\n%zu %zu\n255\n", w, h);
@@ -3710,7 +3813,9 @@ static void eng_dump_frame(id<MTLTexture> src)
             fwrite(rgb, 1, 3, f);
         }
         fclose(f);
-        fprintf(stderr, "[rsx engine/metal] captured frame %u to %s\n", frame, path);
+        atomic_fetch_add_explicit(&s_fdump_written, 1, memory_order_relaxed);
+        fprintf(stderr, "[rsx frame-dump] s=%u flip=%s surface=%u to %s\n",
+                fid->present_seq, flip, fid->display_buffer, path);
     }
     free(rgba);
 }
@@ -3721,7 +3826,9 @@ static void eng_present(void* user, u32 surface)
     id<MTLTexture> src = eng_obj(surface);
     if (!src) { eng_encode_and_commit(nil); return; }
     eng_encode_and_commit(src);
-    eng_dump_frame(src);
+    rsx_frame_identity fid;
+    if (rsx_draw_engine_frame_identity(&fid))
+        eng_dump_frame(src, &fid);
 }
 
 static void eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,

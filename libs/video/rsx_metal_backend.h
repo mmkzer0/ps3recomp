@@ -61,6 +61,12 @@ u32  rsx_metal_backend_readback_center(void);
  * the same test triangle and a pixel check alone could not tell them apart. */
 u32  rsx_metal_backend_guest_draws(void);
 
+/* PS3RECOMP_METAL_FRAME_DUMP counters: images written, and presents whose
+ * surface format the PPM writer cannot express (counted and logged, never
+ * skipped in silence). */
+unsigned long long rsx_metal_backend_frame_dumps(void);
+unsigned long long rsx_metal_backend_frame_dump_errors(void);
+
 #ifdef __cplusplus
 }
 #endif

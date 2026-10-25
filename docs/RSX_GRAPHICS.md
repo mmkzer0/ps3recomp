@@ -303,6 +303,56 @@ Maps RSX vertex attribute types (from `NV4097_SET_VERTEX_DATA_ARRAY_FORMAT`) to 
 
 ---
 
+## Register-File Draw Engine: Frame Identity, Accounting and Dumps
+
+**File:** `libs/video/rsx_draw_engine.{c,h}`
+
+The engine is the default path on macOS (`PS3RECOMP_RSX_ENGINE=dispatch`, the backend's default;
+`vtable` is the way back). Three contracts matter to anything that compares or captures its output.
+
+**Frame identity.** The engine's present counter and the GCM's flip counter are separate: the flip sink is
+reached about three times per guest flip (the queued word `0xE944`, then the head `0xE924`, and `0xE920`).
+`rsx_draw_engine_frame_identity()` returns `{flip_id, present_seq, display_buffer}` for the last present:
+
+| field | meaning |
+|---|---|
+| `flip_id` | 0-based ordinal of the last GCM flip head retired *before* this present — the same ordinal `cellGcmSys` counts for `GCM_DRV_EVENT_FLIP_HEAD`, because the engine sees the same `0xE924` word with bit 31 in the same FIFO order. `RSX_FRAME_NO_FLIP` before the first head. The head's own present carries its own ordinal. |
+| `present_seq` | 0-based engine present ordinal: the number the dump files are named by. |
+| `display_buffer` | the display buffer the guest queued for this flip (0..7); the head's word is a command, not a buffer id. |
+
+No counter is derived from the other, and no flip id is invented for a present that precedes a head.
+
+**Draw accounting.** Every `BEGIN_END` group is one *submitted* draw. It is either *executed* or dropped
+for exactly one reason from `rsx_drop_reason` (no packets, fetch failed, mixed sources, needs expansion,
+unsupported topology, no vertices, rebuild failed, no indices, no targets, pipeline failed, debug skip,
+texture feedback, index/constant allocation, not ready). The identity
+
+```
+submitted == executed + sum(by_reason)
+```
+
+therefore holds for every run. `rsx_draw_engine_draw_stats()` snapshots the counters (relaxed-atomic,
+process-wide); `rsx_draw_engine_reset_draw_stats()` zeroes them. A drop logs its 1st, 2nd, 4th ... hit as
+`[rsx-drop] reason=<name> count=<n>` — the `fw_divergence.h` pattern — so a drop path is never silent even
+when the log is cut short.
+
+**Pipeline failures** are counted per fragment program (`rsx_draw_engine_pipeline_failures()`), logged at
+powers of two as `[rsx-pipeline-fail] fp=<hash> count=<n>`. The older `[rsx engine] pipeline ...` detail
+line still stops at 32; the count does not.
+
+**Dumps.** Both dump families name their files by the frame identity, so no image overwrites another:
+
+- `RSX_ENGINE_PASS_DUMP`: `present_s<present_seq>_f<flip_id>.ppm`, and per pass
+  `s<present_seq>_f<flip_id>_pass<NNN>_t<K>.ppm` / `_z.pgm`. `fnone` before the first flip head. The
+  index (`passes.txt`) repeats `s=` and `flip=` on every line.
+- `PS3RECOMP_METAL_FRAME_DUMP`: `<base>_s<present_seq>_f<flip_id>.ppm`. Presents are selected by
+  `PS3RECOMP_METAL_FRAME_DUMP_RANGE=<first>-<last>` or `PS3RECOMP_METAL_FRAME_DUMP_LIST=<a,b,c>`, else
+  every 120th. A surface format the PPM writer cannot express is an error line plus a counter
+  (`rsx_metal_backend_frame_dump_errors()`), never a silent skip; the pass dump counts its own through
+  `rsx_draw_engine_pass_dump_errors()`.
+
+---
+
 ## RSX Shader Translation (Future Work)
 
 The RSX uses a proprietary shader ISA derived from NVIDIA's NV40/NV47 architecture:
