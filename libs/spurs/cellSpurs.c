@@ -868,7 +868,7 @@ static s32 spurs_create_taskset(CellSpurs* spurs, CellSpursTaskset* taskset,
     }
 
     if (!spurs_guest_range_valid(taskset_ea, taskset_size))
-        return (s32)0x8041090Du; /* host backing safety, before writes */
+        return CELL_SPURS_TASK_ERROR_FAULT; /* host backing safety, before writes */
     taskset = GUEST_PTR(taskset, CellSpursTaskset*);
     memset(taskset, 0, taskset_size);
 
@@ -896,12 +896,12 @@ s32 cellSpursCreateTasksetWithAttribute(CellSpurs* spurs,
                                         const CellSpursTasksetAttribute* attr)
 {
     u32 attr_ea = (u32)(uintptr_t)attr;
-    if (!attr_ea) return (s32)0x80410911u;
-    if (attr_ea & 7u) return (s32)0x80410910u;
-    if (!spurs_guest_range_valid(attr_ea, sizeof(*attr))) return (s32)0x8041090Du;
+    if (!attr_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    if (attr_ea & 7u) return CELL_SPURS_TASK_ERROR_ALIGN;
+    if (!spurs_guest_range_valid(attr_ea, sizeof(*attr))) return CELL_SPURS_TASK_ERROR_FAULT;
     const CellSpursTasksetAttribute* attr_h = GUEST_PTR(attr, const CellSpursTasksetAttribute*);
     u32 size = attr_h->tasksetSize;
-    if (size != 0x1900u && size != 0x2900u) return (s32)0x80410902u;
+    if (size != 0x1900u && size != 0x2900u) return CELL_SPURS_TASK_ERROR_INVAL;
     return spurs_create_taskset(spurs, taskset, 0, NULL, 0, size);
 }
 
@@ -1000,15 +1000,14 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
      * CELL_SPURS_TASK_ERROR_NULL_POINTER (0x80410911), one not 16-byte aligned CELL_SPURS_TASK_ERROR_ALIGN
      * (0x80410910), both before a task id is taken. Nothing else about the image is checked on the PPU
      * ("TODO: Verify the ELF header is proper"); a bad image is found by the SPU-side policy module, below.
-     * The literals are the firmware's: the CELL_SPURS_TASK_ERROR_* macros of cellSpurs.h carry other
-     * numbers (the same reason the attribute and EA checks above spell them out). */
+     * The macros carry the firmware's values (libsre 0x02012520 returns these same literals). */
     if (!elf_ea) {
         fprintf(stderr, "[cellSpurs] CreateTask REJECT null elf (taskset=0x%08X)\n", taskset_ea);
-        return (s32)0x80410911u;
+        return CELL_SPURS_TASK_ERROR_NULL_POINTER;
     }
     if (elf_ea & 15u) {
         fprintf(stderr, "[cellSpurs] CreateTask REJECT unaligned elf 0x%08X (taskset=0x%08X)\n", elf_ea, taskset_ea);
-        return (s32)0x80410910u;
+        return CELL_SPURS_TASK_ERROR_ALIGN;
     }
 
     if (!g_ydkj_real_taskset_ea) { /* real-BE init flag (native ->initialized clobbered by BE layout) */
@@ -1347,8 +1346,8 @@ s32 cellSpursTaskAttributeInitialize(CellSpursTaskAttribute* attr)
 s32 cellSpursTaskExitCodeInitialize(CellSpursTaskExitCode* exitCode)
 {
     u32 ea = (u32)(uintptr_t)exitCode;
-    if (!ea) return (s32)0x80410911u;
-    if (ea & 0x7Fu) return (s32)0x80410910u;
+    if (!ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    if (ea & 0x7Fu) return CELL_SPURS_TASK_ERROR_ALIGN;
 
     /* A zero size denotes the existing fully backed 32-bit VM convention.
      * Native-VA ports may have a null base with a nonzero mapped size. Check
@@ -1361,7 +1360,7 @@ s32 cellSpursTaskExitCodeInitialize(CellSpursTaskExitCode* exitCode)
         end > 0x100000000ull ||
         (ppu_vm_size && end > ppu_vm_size) ||
         base > UINTPTR_MAX - ea || base + ea > UINTPTR_MAX - 0x7Fu)
-        return (s32)0x8041090Du;
+        return CELL_SPURS_TASK_ERROR_FAULT;
 
     memset((void*)(base + ea), 0, 0x80u);
     return CELL_OK;
@@ -3357,10 +3356,10 @@ s32 cellSpursGetTasksetInfo(u64 taskset_ea, u64 info_ea)
 s32 cellSpursTasksetAttributeSetTasksetSize(CellSpursTasksetAttribute* attr, u32 size)
 {
     u32 ea = (u32)(uintptr_t)attr;
-    if (!ea) return (s32)0x80410911u;
-    if (ea & 7u) return (s32)0x80410910u;
-    if (size != 0x1900u && size != 0x2900u) return (s32)0x80410902u;
-    if (!spurs_guest_range_valid(ea, sizeof(*attr))) return (s32)0x8041090Du;
+    if (!ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    if (ea & 7u) return CELL_SPURS_TASK_ERROR_ALIGN;
+    if (size != 0x1900u && size != 0x2900u) return CELL_SPURS_TASK_ERROR_INVAL;
+    if (!spurs_guest_range_valid(ea, sizeof(*attr))) return CELL_SPURS_TASK_ERROR_FAULT;
     attr = GUEST_PTR(attr, CellSpursTasksetAttribute*);
     attr->tasksetSize = size;
     return CELL_OK;
