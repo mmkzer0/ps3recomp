@@ -11,6 +11,7 @@
 #include "cellResc.h"
 #include "ps3emu/stop.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: translate + byte-swap */
+#include "../../runtime/memory/vm.h"        /* vm_range_ok, vm_guest_limit */
 #include "ps3emu/guest_call.h"   /* ps3_invoke_guest: handlers are guest OPDs */
 #include "cellGcmSys.h"          /* display buffers, address->offset, the flip command */
 #include "resc_convert.h"        /* the convert-and-flip command stream */
@@ -462,6 +463,27 @@ static u32 resc_offset_of(u32 ea, const char* func, const char* what)
     return off;
 }
 
+/* The DC convert program's microcode: one TEX instruction (texture unit 0, texcoord 0, result to the
+ * colour output, end) in the RSX's in-memory word order -- the plain `tex2D` of a full-screen blit,
+ * the 0x10 bytes k_prog_ucode_size[DC] names (libresc embedded Cg binary: ucode at program object
+ * +0x8, size +0xC). Written big-endian so guest memory holds the bytes the RSX reads. */
+static const u32 k_dc_ucode[4] = { 0x9E011700u, 0xC8011C9Du, 0xC8000001u, 0xC8003FE1u };
+
+/* Firmware 02006C70: the copy of the current convert program's microcode into the fragment buffer.
+ * The E0/E4/E8 programs serve interlaced and PAL-interpolating configurations, and every one of
+ * those stops by name in cellRescSetConvertAndFlip, the only consumer of the buffer's content; their
+ * microcode is therefore not held and nothing can run on the uncopied buffer. */
+static void resc_copy_convert_program(u32 fragment_ea)
+{
+    if (s_cur_prog != RESC_PROG_DC)
+        return;
+    if (!vm_range_ok(fragment_ea, sizeof k_dc_ucode))
+        ps3_stop_guest_range("cellRescSetBufferAddress", "fragmentBuf", fragment_ea, sizeof k_dc_ucode,
+                             vm_guest_limit());
+    for (u32 i = 0; i < 4; i++)
+        vm_write32(fragment_ea + i * 4u, k_dc_ucode[i]);
+}
+
 /* Firmware 02006778. In order: not initialised -> NOT_INITIALIZED; a NULL buffer -> BAD_ARGUMENT;
  * colour not 128-byte, vertex not 4-byte or fragment not 64-byte aligned -> BAD_ALIGNMENT. The
  * buffers are stored; the colour buffers' RSX offsets are `offset(colorBuf) + i * <size
@@ -470,9 +492,9 @@ static u32 resc_offset_of(u32 ea, const char* func, const char* what)
  * (progressive configurations: the interlaced variant takes another path) and the current convert
  * fragment program's RSX offset is set.
  *
- * Not reproduced: the library also copies the program's microcode into the fragment buffer
- * (02006C70). No microcode is held here, so the buffer stays as the title left it; the stream
- * refers to it by offset only, and a renderer that executes the program (M3) needs the copy. */
+ * The library also copies the current program's microcode into the fragment buffer (02006C70,
+ * resc_copy_convert_program). The stream refers to that buffer by offset only: without the copy the
+ * RSX runs whatever the title left there (zeros), the draw samples nothing and writes black. */
 s32 cellRescSetBufferAddress(void* colorBuf, void* vertexBuf, void* fragmentBuf)
 {
     printf("[cellResc] SetBufferAddress()\n");
@@ -505,6 +527,7 @@ s32 cellRescSetBufferAddress(void* colorBuf, void* vertexBuf, void* fragmentBuf)
     if (s_config.interlaceMode != 1)
         resc_fill_vertex_buffer();
     s_prog_ucode_offset[s_cur_prog] = resc_offset_of(fragment, "cellRescSetBufferAddress", "fragmentShader");
+    resc_copy_convert_program(fragment);
     s_tex_unit = 0;   /* 020023B8: the program's sampler resolves to unit 0 */
     return CELL_OK;
 }

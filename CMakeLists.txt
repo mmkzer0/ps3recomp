@@ -873,6 +873,42 @@ if(UNIX)
         target_link_libraries(test_shader_msl PRIVATE ps3recomp_msl_translation)
     endif()
 
+    # The RESC output path on a real Metal device: the library's convert-and-flip stream, run by
+    # the real draw engine, must put the composed surface into the display buffer. Links the
+    # library's own cellResc.c/resc_convert.c and the engine through the test, not ps3recomp_runtime
+    # (the test supplies the libgcm side). Skips (77) without a Metal device.
+    if(APPLE AND PS3RECOMP_MSL_TRANSLATION)
+        add_executable(test_resc_present_metal
+            libs/video/tests/test_resc_present_metal.m
+            libs/video/cellResc.c
+            libs/video/resc_convert.c
+            libs/video/rsx_shader_msl.cpp
+            libs/video/rsx_vp_decompiler.c
+            libs/video/rsx_fp_decompiler.c
+            libs/video/rsx_texture_layout.c
+            libs/video/rsx_dispatch.c
+            libs/video/rsx_vertex_compact.c
+        )
+        set_source_files_properties(libs/video/tests/test_resc_present_metal.m
+            PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+        target_include_directories(test_resc_present_metal PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests"
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/runtime"
+        )
+        target_link_libraries(test_resc_present_metal PRIVATE ps3recomp_msl_translation
+            "-framework Metal" "-framework QuartzCore" "-framework Foundation" "-framework AppKit")
+        set_target_properties(test_resc_present_metal PROPERTIES LINKER_LANGUAGE CXX)
+        # The included backend also carries its legacy fixed-function entry points, which pull in
+        # the RSX state machine; the engine path under test never reaches them.
+        target_link_options(test_resc_present_metal PRIVATE "-Wl,-dead_strip")
+        add_test(NAME resc_present_metal COMMAND test_resc_present_metal)
+        set_tests_properties(resc_present_metal PROPERTIES
+            LABELS "resc;video;gpu;t0" SKIP_RETURN_CODE 77 TIMEOUT 120
+            ENVIRONMENT "PS3RECOMP_METAL_HEADLESS=1")
+    endif()
+
     # The HLSL -> SPIR-V translation cache, memory and disk. Needs glslang
     # only, no GPU.
     if(PS3RECOMP_SPIRV_TRANSLATION)

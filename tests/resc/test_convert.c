@@ -365,6 +365,31 @@ static void test_vertex_buffer_and_aspect(void)
     CHECK(gr32(VERTEX_EA + 8) == 0x3E800000u, "quad rewritten: u0 0x%08X", gr32(VERTEX_EA + 8));
 }
 
+/* libresc 02006C70: SetBufferAddress copies the current convert program's microcode into the
+ * fragment buffer. The stream names that buffer by offset only, so a buffer left as the title had it
+ * (here 0xDEADBEEF; zeros in a real title) is a convert draw that samples nothing. The DC program is
+ * one TEX instruction: opcode 0x17 after the RSX's halfword swap. */
+static void test_fragment_microcode(void)
+{
+    for (u32 i = 0; i < 6; i++) gw32(FRAG_EA + i * 4u, 0xDEADBEEFu);
+    scene_1080p();
+    const u32 w0 = gr32(FRAG_EA);
+    const u32 swapped = ((w0 & 0xFFFFu) << 16) | (w0 >> 16);
+    CHECK(((swapped >> 24) & 0x3Fu) == 0x17u, "word 0 is a TEX instruction: 0x%08X", w0);
+    CHECK(gr32(FRAG_EA + 4) != 0xDEADBEEFu && gr32(FRAG_EA + 8) != 0xDEADBEEFu &&
+          gr32(FRAG_EA + 12) != 0xDEADBEEFu, "all four words of the program were written");
+    CHECK(gr32(FRAG_EA + 16) == 0xDEADBEEFu, "the copy is the program's 0x10 bytes and no more");
+    /* The DC program only: the interlaced E4 program has more microcode than is held, and its
+     * SetConvertAndFlip stops, so the buffer is left alone. */
+    for (u32 i = 0; i < 6; i++) gw32(FRAG_EA + i * 4u, 0xDEADBEEFu);
+    scene_gcm();
+    scene_init(CELL_RESC_1280x720, 0, 0, 1, 0);
+    CHECK(cellRescSetDisplayMode(CELL_RESC_1280x720) == 0, "SetDisplayMode interlaced");
+    CHECK(cellRescSetBufferAddress((void*)(uintptr_t)COLOR_EA, (void*)(uintptr_t)VERTEX_EA,
+                                   (void*)(uintptr_t)FRAG_EA) == 0, "SetBufferAddress interlaced");
+    CHECK(gr32(FRAG_EA) == 0xDEADBEEFu, "E4 microcode is not held, the buffer is untouched");
+}
+
 static void test_vertex_program_words(void)
 {
     const u8 attr[3] = { 3, 9, 12 };
@@ -440,7 +465,8 @@ static void child_scene(u32 support, u32 mode, u32 pal, u32 interlace, u32 flip)
 int main(int argc, char** argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
-    const uint32_t vm_size = ppu_hle_inject_base + 0x10000u > 0x02000000u ? ppu_hle_inject_base + 0x10000u : 0x02000000u;
+    /* Guest memory out to the fragment buffer: SetBufferAddress writes the convert program there. */
+    const uint32_t vm_size = FRAG_EA + 0x10000u;
     vm_base = (uint8_t*)calloc(1, vm_size);
     if (!vm_base) { printf("[FAIL] guest VM alloc\n"); return 1; }
     ppu_vm_size = vm_size;
@@ -486,6 +512,7 @@ int main(int argc, char** argv)
     test_quad();
     test_vertex_buffer_and_aspect();
     test_vertex_program_words();
+    test_fragment_microcode();
     test_errors();
 
     check_stop(argv[0], "interlace", "interlace-mode");

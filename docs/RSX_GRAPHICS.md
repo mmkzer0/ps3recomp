@@ -60,6 +60,12 @@ The game interacts with the GPU through `cellGcmSys` — the PS3 SDK's RSX inter
 - `cellGcmResetFlipStatus()` / `cellGcmGetFlipStatus()` — Flip state tracking.
 - `cellGcmGetLastFlipTime()` — Returns host timestamp via `QueryPerformanceCounter` (Windows) or `clock_gettime` (POSIX).
 
+### RESC output path (`cellResc`, `resc_convert.c`)
+A title that composes into an off-screen surface hands it to `cellRescSetSrc` and ends the frame with `cellRescSetConvertAndFlip`. The HLE appends the firmware's stream (`resc_emit_convert_stream`): state, a 4-vertex quad, the display buffer as the colour target, the source as texture unit 0, a vertex program, the fragment program binding and one draw. The draw engine runs it like any other pass: the source is a registered colour surface, so unit 0 samples that surface (render-to-texture), not guest memory.
+- **The fragment program is guest memory.** `SHADER_PROGRAM` names the buffer the title passed to `cellRescSetBufferAddress`, and the library's own microcode lives in that buffer only because `cellRescSetBufferAddress` copies it there (libresc `0x02006C70`). Without the copy the buffer holds whatever the title left (zeros): the program samples nothing and every display buffer comes out black. The DC program (one TEX instruction) is held; E0/E4/E8 belong to interlaced and PAL-interpolating modes, whose `cellRescSetConvertAndFlip` is a named stop.
+- **How to see it.** `RSX_ENGINE_PASS_DUMP` writes each pass and an index line per pass. The convert pass lists its texture unit (`t0 0:0x<src offset> fA5 1280x720 ... S<n>@<serial>`: `S` names the registered surface that is sampled). A convert pass with no `t0` entry is the signature of an empty fragment program.
+- **Test.** `resc_present_metal` (`libs/video/tests/test_resc_present_metal.m`, CMake on Apple with the MSL translation, label `gpu`; skips with exit 77 without a Metal device) renders a gradient into a 1280x720 surface, runs the library's SetSrc/SetBufferAddress/SetConvertAndFlip through the real draw engine and Metal backend, presents buffer 0 and compares every pixel of the display buffer with the source (worst channel error 1).
+
 ### Memory Management
 - `cellGcmMapMainMemory(ea, size, offset)` — Maps main memory for GPU access. Uses a bump allocator with 1MB alignment and tracks mappings in an offset table.
 - `cellGcmMapEaIoAddress(ea, io, size)` — Explicit EA→IO mapping with overlap detection.
