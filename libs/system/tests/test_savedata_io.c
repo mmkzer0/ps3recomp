@@ -2,6 +2,7 @@
  * -Wl,-dead_strip -o /tmp/test_savedata_io && /tmp/test_savedata_io */
 #include "../cellSaveData.c"
 #include <assert.h>
+#include <sys/mman.h>
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
 uint32_t g_ww_lo, g_ww_hi;
@@ -72,7 +73,12 @@ int main(void)
 {
     char root[] = "/tmp/ps3recomp-savedata-io-XXXXXX";
     assert(mkdtemp(root)); strcpy(s_save_root, root);
-    vm_base = calloc(1, 0x200000); assert(vm_base);
+    /* mmap, not calloc: the fileBuf commit (vm_commit_or_stop) mprotects
+     * vm_base + ea, which must be page-aligned. glibc's calloc of 2 MB is an
+     * mmap plus a 16-byte header, so on Linux the commit failed and the
+     * stop stub aborted; macOS happened to hand back an aligned block. */
+    vm_base = mmap(NULL, 0x200000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    assert(vm_base != MAP_FAILED);
     assert(cellSaveData_set_scratch_region(0x100000, 0x20000) == CELL_OK);
     strcpy((char*)vm_base + 0x300, "TEST00000");
     strcpy((char*)vm_base + 0x340, "DATA.BIN");
@@ -105,6 +111,6 @@ int main(void)
     snprintf(path, sizeof(path), "%s/TEST00000/ICON0.PNG", root); assert(unlink(path) == 0);
     snprintf(path, sizeof(path), "%s/TEST00000/PARAM.SFO", root); assert(unlink(path) == 0);
     snprintf(path, sizeof(path), "%s/TEST00000", root); assert(rmdir(path) == 0);
-    assert(rmdir(root) == 0); free(vm_base);
+    assert(rmdir(root) == 0); munmap(vm_base, 0x200000);
     puts("Save/load round trip, callback userdata, metadata, and byte-count checks passed");
 }
