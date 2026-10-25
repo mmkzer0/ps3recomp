@@ -80,17 +80,26 @@ jobs:
           done
 
   linux:
-    name: ubuntu-24.04 x86_64 (dev)
+    # Two compilers on the same libstdc++. AGENTS.md promises GCC parity, and
+    # GCC differs from clang where it counts here, for example it still
+    # warns on a (void) discard of a warn_unused_result call (#26).
+    name: ubuntu-24.04 x86_64 (dev, ${{ matrix.cc }})
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { cc: clang, cxx: clang++ }
+          - { cc: gcc-14, cxx: g++-14 }
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build libsdl2-dev clang \
+          sudo apt-get install -y ninja-build libsdl2-dev clang g++-14 \
             glslang-dev glslang-tools spirv-tools libspirv-cross-c-shared-dev
       - name: Configure
-        run: CC=clang CXX=clang++ cmake --preset dev
+        run: CC=${{ matrix.cc }} CXX=${{ matrix.cxx }} cmake --preset dev
       - name: Build
         run: cmake --build --preset dev
       - name: Test
