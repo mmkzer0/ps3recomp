@@ -19,6 +19,17 @@ runtime/ppu/ppu_sysprx.cpp's ps3_hle_register_ctx (the sysPrxForUser, CRT and
 network context surface) are NOT in that table and are not scanned; the JSON
 reports their NIDs as unmatched when --imports names them.
 
+Each handler's body is then walked as a call graph: a call by identifier into
+a static function in the same translation unit, or into a free function
+defined in libs/**/*.c or libs/**/*.cpp (named or anonymous namespace,
+extern "C"), is followed transitively up to MAX_CALL_DEPTH edges.  A check in
+a callee is reported under the handler, with the callee's file:line and a
+`via` chain (empty when the check is in the handler itself).  Class methods,
+function pointers, macros and lambda definitions are not call targets; calls
+written inside a lambda body are part of the enclosing function's body.  A
+callee reached from several handlers is reported once per handler (a row) and
+counted once in the dedupe summary.
+
 Check shapes found (syntactic, one level of `if` consequence):
   * `if (cond) return <error>;`
   * `if (cond) { ... return <error>; ... }`
@@ -30,17 +41,24 @@ The scope field separately marks whether the condition names a declared
 parameter.  It is a hint only: a condition on a local derived from a parameter
 reads as "state" (see Limits).
 
-Evidence classes, from the nearest comment that carries evidence, in order of
-specificity: the action's own comment, the `if`'s comment (both with only
-whitespace between comment and code), a trailing same-line comment, the
-handler's leading comment, then the file header.  The file header is reported
-with source="file" because it is the module's contract, not a claim about one
-check.
+Evidence is per-check only when the comment is contiguous with the action, the
+`if` (both with only whitespace between comment and code), or trails the action
+on the same line (evidence_scope action / if / trailing).  A comment on the
+function's leading signature line, or in the file header, says nothing about
+one check: such a check is class `header-only` when that comment carries
+evidence, and `none` otherwise.  Classes:
   fw-ea          a firmware address 0x0200xxxx (or 0200xxxx), or a firmware
                  version/module plus a KB or work|docs document reference.
   oracle-rpcs3   names RPCS3 and the file/function consulted.
   sdk            names the SDK and a header/prototype/documented convention.
-  none           no evidence.
+  host-only      the per-check comment carries the `HLE-only` marker: the HLE
+                 adds this check deliberately, it is not a firmware claim.
+                 Takes precedence over fw-ea/oracle-rpcs3/sdk.
+  header-only    only the function-leading or file-header comment carries
+                 evidence; it is not per-check proof.
+  none           no evidence at any scope.
+Per-check firmware-evidence totals count fw-ea, oracle-rpcs3 and sdk only;
+host-only, header-only and none are reported beside them.
 
 Output: JSON (machine-checkable, full evidence) and a Markdown table.
 
@@ -52,33 +70,42 @@ Usage:
 
 Limits (also recorded in the JSON under "limits"):
   - A comment is attached only when it is contiguous with the action (only
-    whitespace between).  A file header or function comment separated by the
-    signature is not evidence for a check inside the body.
+    whitespace between).  Only the action/if/trailing scopes are per-check
+    evidence; a function-leading comment or the file header can only make a
+    check header-only.
   - Only `if` consequences are scanned.  `else`, ternary, switch-case, goto
     error paths, and loops that end in an error return are not checks here.
-  - Calls into host helpers are not followed.  jq2_queue_create's checks (the
-    other half of the JQ2 create divergence) live in libs/spurs/jq2/executor.cpp,
-    which defines no registered handler, so they are outside this scan.
+  - Calls are followed by identifier: `name(` not preceded by `.` or `->`;
+    `ns::name(` resolves by the last identifier.  Only free-function
+    definitions in libs/**/*.c and libs/**/*.cpp are targets.  A class method,
+    function pointer, macro or lambda-definition is not followed; a function
+    prototype inside a body can look like a call.
+  - A static or anonymous-namespace function resolves only within its own
+    file; an external definition resolves by name across libs/.  A call chain
+    deeper than MAX_CALL_DEPTH edges is not followed.
   - A string/comment-aware brace matcher handles literals, but `#if 0` blocks
     and macro bodies are not expanded or disabled.
-  - `uses_param` is a word match against the declared parameter names; a
-    condition on a local computed from a parameter is marked "state".
+  - `uses_param` is a word match against the parameters of the function that
+    contains the check; a condition on a local computed from a parameter is
+    marked "state".
   - Non-ASCII source is read as latin-1 (the same convention as
     gen_hle_nids.py).
 
-Exit status is 0 when the audit ran (the `none` class is data, not a tool
-failure), 2 on a malformed --imports file.
+Exit status is 0 when the audit ran (the `none`, `header-only` and `host-only`
+classes are data, not a tool failure), 2 on a malformed --imports file.  The
+tool does not gate on any class.
 """
 
 from __future__ import annotations
 
 import argparse
 import bisect
+import glob
 import json
 import os
 import re
 import sys
-from collections import Counter, OrderedDict
+from collections import Counter, OrderedDict, deque
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -87,42 +114,62 @@ ROOT = os.path.dirname(TOOLS)
 sys.path.insert(0, TOOLS)
 import gen_hle_nids as gen  # noqa: E402
 
-SCHEMA = "ps3recomp.hle-check-audit/1"
+SCHEMA = "ps3recomp.hle-check-audit/2"
 
-CLASSES = ("fw-ea", "oracle-rpcs3", "sdk", "none")
+# Per-check firmware-evidence classes; host-only is a policy marker, and
+# header-only/none are reported beside it, not as evidence.
+CLASSES = ("fw-ea", "oracle-rpcs3", "sdk", "host-only", "header-only", "none")
+PER_CHECK_CLASSES = ("fw-ea", "oracle-rpcs3", "sdk")
+
+# A per-check comment that marks the check as deliberately added by the HLE
+# (not a firmware claim), e.g. libs/spurs/cellFiber.c's "HLE-only, counted."
+HOST_ONLY_RE = re.compile(r"\bHLE-only\b")
+
+# Call-graph edges followed from a handler body; a check in the function at
+# depth 4 is scanned, a call made by that function is not followed.
+MAX_CALL_DEPTH = 4
 
 LIMITS = [
     "A comment is attached only when only whitespace separates it from the "
     "action (comment above the if or above the action) or when it trails the "
-    "action on the same line. The handler's leading comment (contiguous before "
-    "the signature) and the file header are weaker fallbacks; the JSON records "
-    "which one via evidence_scope. A section comment above an earlier function "
-    "is not propagated, so a group-level claim (e.g. cellSpursJq.c's 'each checks "
-    "only attr != NULL') shows up as none for the later functions -- a false "
-    "positive for review, never a false pass.",
+    "action on the same line. Only action/if/trailing are per-check evidence. "
+    "The function's leading comment and the file header can only make the "
+    "check header-only (evidence_scope function/file); they are never "
+    "per-check proof.",
     "A comment separated from the action by a declaration or another statement "
     "(a multi-statement validation block) is not attached: only the action, "
     "the if, the trailing line, the function's leading comment and the file "
     "header are tried.",
-    "Evidence is syntactic: the first attached scope (action, if, trailing, "
-    "function, file) whose comment contains a firmware EA/RPCS3/SDK reference "
-    "passes, even if the sentence is about a different check. If none carries "
-    "evidence, the nearest comment is reported with class none. The evidence "
-    "text and source let the follow-up judge the match.",
+    "Evidence is syntactic: the first attached per-check scope (action, if, "
+    "trailing) whose comment contains a firmware EA/RPCS3/SDK reference, or "
+    "the HLE-only marker, classifies the check, even if the sentence is about "
+    "a different check. A header-scope comment can only make the check "
+    "header-only. The evidence text and source let the follow-up judge the "
+    "match.",
     "Only the consequent of an `if` is scanned. `else`, ternary, switch-case, "
     "goto error paths and loop-condition exits are not classified.",
-    "Calls into host helpers are not followed. jq2_queue_create (the implementation "
-    "of _cellSpursCreateJobQueue*) lives in libs/spurs/jq2/executor.cpp, which "
-    "defines no registered handler, so its checks are outside the scan.",
+    "Calls are followed by identifier: an identifier immediately followed by "
+    "`(` and not preceded by '.' or '->'. A qualified call (ns::name(...)) "
+    "resolves by its last identifier. Only free-function definitions in "
+    "libs/**/*.c and libs/**/*.cpp are followed (named and anonymous "
+    "namespaces, extern \"C\"); class methods, function pointers, macros and "
+    "lambda definitions are not. A function prototype inside a body can look "
+    "like a call.",
+    "A static or anonymous-namespace function resolves only within its own "
+    "file; an external definition resolves by name across libs/. A callee "
+    "reached through more than MAX_CALL_DEPTH (%d) edges from the handler is "
+    "not followed." % MAX_CALL_DEPTH,
+    "A callee reached from several handlers produces one row per handler. The "
+    "dedupe summary counts a unique check site as (file, line, condition, "
+    "code, kind) once, however many handlers or paths reach it.",
     "Handlers registered by ps3_hle_register_ctx in runtime/ppu/ppu_sysprx.cpp "
     "(sysPrxForUser/CRT/network context surface) are not in the generated libs "
     "NID table and are not scanned; their --imports NIDs are reported unmatched.",
     "`#if 0` blocks and macro bodies are not preprocessed; a literal `if` there "
-    "would be scanned. The tree has none under libs/ today, but the claim is "
-    "syntactic.",
-    "uses_param is a word match against the declared parameter names. A condition "
-    "on a local derived from a parameter (ea = (u32)ptr; if (ea ...)) reads as "
-    "state; the check is still listed.",
+    "would be scanned. The claim is syntactic.",
+    "uses_param is a word match against the parameters of the function that "
+    "contains the check. A condition on a local derived from a parameter "
+    "(ea = (u32)ptr; if (ea ...)) reads as state; the check is still listed.",
     "Source is read as latin-1, matching gen_hle_nids.py.",
 ]
 
@@ -451,6 +498,354 @@ def discover_handlers(root: str) -> Tuple[List[Handler], List[str]]:
 
 
 # ---------------------------------------------------------------------------
+# Call graph: free-function definitions under libs/**/*.c and *.cpp
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Function:
+    name: str
+    rel: str
+    text: str
+    mask: str
+    def_start: int
+    body_start: int
+    body_end: int
+    params: List[str]
+    static: bool = False
+
+
+_CONTROL_NAMES = frozenset({
+    "if", "for", "while", "switch", "catch", "sizeof", "alignof", "typeof",
+    "__typeof__", "decltype", "defined", "return", "do", "else",
+    "_Static_assert", "static_assert", "__attribute__", "noexcept", "throw",
+    "requires",
+})
+
+_BRACE_RE = re.compile(r"[{}]")
+_ATTR_HEAD_RE = re.compile(r"\[\[[^\[\]]*\]\]\s*$")
+_ATTRIBUTE_GNU_RE = re.compile(r"__attribute__\s*\(\(.*\)\)\s*$", re.S)
+_QUALIFIER_SUFFIX_RE = re.compile(
+    r"(?:const|volatile|override|final|noexcept|mutable|&|&&)\s*$")
+_NAMESPACE_RE = re.compile(
+    r"namespace(?:\s+[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)?\s*$")
+_EXTERN_C_RE = re.compile(r'extern\s+"C(?:\+\+)?"\s*$')
+_CLASS_RE = re.compile(r"(?:^|\s)(?:class|struct|union)\b")
+
+
+def _match_open(s: str, close: int, open_ch: str, close_ch: str) -> int:
+    """Index of the open_ch matching s[close] == close_ch, or -1."""
+    depth = 0
+    for i in range(close, -1, -1):
+        if s[i] == close_ch:
+            depth += 1
+        elif s[i] == open_ch:
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
+def _rfind_top_level(s: str, token: str) -> int:
+    depth = 0
+    i = len(s) - len(token)
+    while i >= 0:
+        c = s[i]
+        if c in ")]":
+            depth += 1
+        elif c in "([":
+            if depth:
+                depth -= 1
+        elif depth == 0 and s.startswith(token, i):
+            return i
+        i -= 1
+    return -1
+
+
+def _head_start(mask: str, brace: int) -> int:
+    """Start of the statement/construct head before the `{` at brace.
+
+    Walks back to the previous top-level ';', '{' or '}', ignoring separators
+    inside parentheses/brackets (a `for (;;)` head).
+    """
+    paren = bracket = 0
+    floor = max(0, brace - 4000)
+    i = brace - 1
+    while i >= floor:
+        c = mask[i]
+        if c == ")":
+            paren += 1
+        elif c == "(":
+            if paren:
+                paren -= 1
+        elif c == "]":
+            bracket += 1
+        elif c == "[":
+            if bracket:
+                bracket -= 1
+        elif paren == 0 and bracket == 0 and c in ";{}":
+            break
+        i -= 1
+    return i + 1
+
+
+def _has_top_level_single_colon(s: str) -> bool:
+    """True for a single ':' outside (), [] (a constructor init list or label).
+
+    '::' qualification and a `? :` whose operands are parenthesised are not
+    matches; a function head never carries a top-level single colon.
+    """
+    depth = 0
+    i = 0
+    while i < len(s):
+        c = s[i]
+        if c in "([":
+            depth += 1
+        elif c in ")]":
+            if depth:
+                depth -= 1
+        elif depth == 0 and c == ":":
+            if i + 1 < len(s) and s[i + 1] == ":":
+                i += 2
+                continue
+            if i > 0 and s[i - 1] == ":":
+                i += 1
+                continue
+            return True
+        i += 1
+    return False
+
+
+def _parse_signature(mask: str, head_start: int, brace: int
+                     ) -> Optional[Tuple[str, str, bool, int]]:
+    """(name, params, static, def_start) for a function head, or None.
+
+    The head is the masked text since the previous top-level delimiter.  A
+    definition ends in `)` optionally followed by cv/noexcept/attribute/
+    trailing-return suffixes.  Control statements, calls, lambdas and
+    out-of-class method definitions are rejected.
+    """
+    raw = mask[head_start:brace]
+    lead = len(raw) - len(raw.lstrip())
+    def_start = head_start + lead
+    s = raw.rstrip()
+    if not s:
+        return None
+    while True:
+        if s.endswith(")"):
+            close = len(s) - 1
+            open_paren = _match_open(s, close, "(", ")")
+            if open_paren < 0:
+                return None
+            before = s[:open_paren].rstrip()
+            m = re.search(r"([A-Za-z_]\w*)$", before)
+            if m and m.group(1) in ("noexcept", "__attribute__", "decltype",
+                                    "throw", "requires"):
+                s = before[:m.start(1)].rstrip()
+                continue
+            break
+        if s.endswith("]"):
+            m = _ATTR_HEAD_RE.search(s)
+            if m:
+                s = s[:m.start()].rstrip()
+                continue
+            return None
+        m = _ATTRIBUTE_GNU_RE.search(s)
+        if m:
+            s = s[:m.start()].rstrip()
+            continue
+        m = _QUALIFIER_SUFFIX_RE.search(s)
+        if m:
+            s = s[:m.start()].rstrip()
+            continue
+        cut = _rfind_top_level(s, "->")
+        if cut >= 0:
+            s = s[:cut].rstrip()
+            continue
+        return None
+    if not s.endswith(")"):
+        return None
+    if _has_top_level_single_colon(s):
+        return None
+    close = len(s) - 1
+    open_paren = _match_open(s, close, "(", ")")
+    if open_paren < 0:
+        return None
+    before = s[:open_paren].rstrip()
+    m = re.search(r"([A-Za-z_]\w*)$", before)
+    if not m:
+        return None
+    name = m.group(1)
+    if name in _CONTROL_NAMES:
+        return None
+    if in_preprocessor_line(mask, head_start + m.start(1)):
+        return None
+    prefix = before[:m.start(1)].rstrip()
+    # A call (`q->run`, `q.run`), an assignment/lambda, or a qualified
+    # out-of-class method definition is not a free-function definition.
+    if prefix.endswith(("->", ".", "=", "::", ":", ",")):
+        return None
+    return name, s[open_paren + 1:close], bool(re.search(r"\bstatic\b", prefix)), def_start
+
+
+def _block_kind(head: str, raw_head: str) -> str:
+    s = head.strip()
+    if _CLASS_RE.search(s):
+        return "class"
+    # The string literal in extern "C" is blanked in the mask.
+    if _EXTERN_C_RE.search(raw_head.strip()):
+        return "extern"
+    if s == "namespace":
+        return "anon"
+    if _NAMESPACE_RE.search(s):
+        return "namespace"
+    return "block"
+
+
+def parse_functions(rel: str, text: str, mask: str) -> List[Function]:
+    """Free-function definitions in one masked source file.
+
+    Every `{` is classified from the statement head before it, with a stack of
+    enclosing blocks, so a definition inside a class body (a method) is not
+    indexed and a lambda body stays part of its enclosing function.
+    """
+    funcs: List[Function] = []
+    stack: List[Tuple[str, bool]] = []
+    for m in _BRACE_RE.finditer(mask):
+        brace = m.start()
+        if m.group() == "}":
+            if stack:
+                stack.pop()
+            continue
+        head_start = _head_start(mask, brace)
+        head = mask[head_start:brace]
+        sig = _parse_signature(mask, head_start, brace)
+        parent, internal = stack[-1] if stack else ("top", False)
+        if sig is not None:
+            name, params_text, is_static, def_start = sig
+            if parent in ("top", "namespace", "extern", "anon"):
+                close = find_matching(mask, brace, "{", "}")
+                if close >= 0:
+                    funcs.append(Function(
+                        name=name, rel=rel, text=text, mask=mask,
+                        def_start=def_start, body_start=brace, body_end=close,
+                        params=parse_param_names(params_text),
+                        static=is_static or internal or parent == "anon"))
+            stack.append(("function", internal))
+        else:
+            kind = _block_kind(head, text[head_start:brace])
+            stack.append((kind, internal or kind == "anon"))
+    return funcs
+
+
+@dataclass
+class SourceUnit:
+    rel: str
+    text: str
+    mask: str
+    lines: LineIndex
+    comments: List[Comment]
+    functions: List[Function]
+
+
+class TreeIndex:
+    """Function definitions under libs/, and call resolution between them."""
+
+    def __init__(self, root: str, warnings: List[str]) -> None:
+        self.units: Dict[str, SourceUnit] = {}
+        self.by_name: Dict[str, List[Function]] = {}
+        paths: List[str] = []
+        for pattern in ("*.c", "*.cpp"):
+            paths.extend(glob.glob(os.path.join(root, "libs", "**", pattern),
+                                   recursive=True))
+        for path in sorted(set(paths)):
+            rel = os.path.relpath(path, root)
+            try:
+                text = open(path, encoding="latin1").read()
+            except OSError as e:
+                warnings.append(f"cannot read {path}: {e}")
+                continue
+            mask = mask_source(text)
+            lines = LineIndex(text)
+            unit = SourceUnit(rel, text, mask, lines,
+                              collect_comments(text, lines),
+                              parse_functions(rel, text, mask))
+            self.units[rel] = unit
+            for func in unit.functions:
+                self.by_name.setdefault(func.name, []).append(func)
+
+    def unit(self, rel: str) -> Optional[SourceUnit]:
+        return self.units.get(rel)
+
+    def resolve(self, caller_rel: str, name: str) -> List[Function]:
+        """Definitions of `name` a call in caller_rel can bind to.
+
+        A definition in the caller's own file wins (static and
+        anonymous-namespace functions are TU-local).  Otherwise an external
+        definition anywhere under libs/ matches.
+        """
+        candidates = self.by_name.get(name)
+        if not candidates:
+            return []
+        same_file = [f for f in candidates if f.rel == caller_rel]
+        if same_file:
+            return same_file
+        return [f for f in candidates if not f.static]
+
+
+_CALL_RE = re.compile(r"(?<![\w])([A-Za-z_]\w*)\s*\(")
+
+
+def called_names(func: Function) -> List[str]:
+    """Identifiers called in the function body, in source order, unique.
+
+    A call is `name(`; `q->name(` / `q.name(` are method calls and are not
+    followed (the function index holds free functions only).  A qualified
+    `ns::name(` is followed by its last identifier.  Lambda bodies in the body
+    are included: their calls belong to the enclosing function.
+    """
+    names: List[str] = []
+    seen = set()
+    mask = func.mask
+    for m in _CALL_RE.finditer(mask, func.body_start + 1, func.body_end):
+        start = m.start(1)
+        if in_preprocessor_line(mask, start):
+            continue
+        prefix = mask[max(0, start - 2):start]
+        if prefix.endswith("->") or prefix.endswith("."):
+            continue
+        name = m.group(1)
+        if name in _CONTROL_NAMES or name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+    return names
+
+
+def audit_handler(handler: Handler, index: TreeIndex) -> List[Check]:
+    """Checks in the handler body and in reachable callees, attributed to it."""
+    checks: List[Check] = []
+    visited = {(handler.rel, handler.name)}
+    queue = deque([(handler, 0, [])])
+    while queue:
+        func, depth, via = queue.popleft()
+        unit = index.unit(func.rel)
+        if unit is None:
+            continue
+        checks.extend(extract_checks(func, handler, via, unit.comments,
+                                     unit.lines))
+        if depth >= MAX_CALL_DEPTH:
+            continue
+        for name in called_names(func):
+            for callee in index.resolve(func.rel, name):
+                key = (callee.rel, callee.name)
+                if key in visited:
+                    continue
+                visited.add(key)
+                queue.append((callee, depth + 1, via + [callee.name]))
+    return checks
+
+
+# ---------------------------------------------------------------------------
 # Error-code and stop recognition
 # ---------------------------------------------------------------------------
 
@@ -573,6 +968,10 @@ def classify_evidence(text: str) -> Tuple[str, str]:
     """(class, basis) for one comment group.  Strongest evidence wins."""
     if not text:
         return "none", ""
+    # A deliberate HLE-only check outranks every firmware citation: the
+    # comment says the cited site is not this check's firmware body.
+    if HOST_ONLY_RE.search(text):
+        return "host-only", "hle-only-marker"
     if FW_EA_RE.search(text):
         return "fw-ea", "ea"
     if FW_VERSION_RE.search(text) and (FW_DOC_RE.search(text) or FW_MODULE_RE.search(text)):
@@ -596,6 +995,7 @@ class Check:
     nid: int
     file: str
     line: int
+    via: List[str]         # callee chain from the handler; [] = direct check
     if_line: int
     condition: str
     code: str
@@ -614,6 +1014,7 @@ class Check:
         d["nid"] = f"0x{self.nid:08X}"
         d["file"] = self.file
         d["line"] = self.line
+        d["via"] = list(self.via)
         d["if_line"] = self.if_line
         d["condition"] = self.condition
         d["code"] = self.code
@@ -692,7 +1093,7 @@ class EvidenceContext:
     file_header: List[Comment]
 
 
-def _make_context(handler: Handler, comments: Sequence[Comment],
+def _make_context(handler: Function, comments: Sequence[Comment],
                   lines: "LineIndex") -> EvidenceContext:
     leading = _comments_before(handler.def_start, comments, handler.mask)
     file_header: List[Comment] = []
@@ -709,21 +1110,22 @@ def _group_text(group: Sequence[Comment]) -> str:
     return ' '.join(re.sub(r"[-=*_~#]{3,}", " ", text).split())
 
 
-def _pick_evidence(candidates: Sequence[Tuple[str, Sequence[Comment]]]
+def _pick_evidence(per_check: Sequence[Tuple[str, Sequence[Comment]]],
+                   header: Sequence[Tuple[str, Sequence[Comment]]]
                    ) -> Tuple[str, str, Optional[int], str, str]:
-    """First candidate group whose comment carries evidence.
+    """(text, class, line, basis, scope) for one check.
 
-    Candidates are ordered by specificity (action, if, trailing, function
-    comment, file header).  The function comment must still precede the
-    signature with only whitespace between; the file header is the module's own
-    contract statement and is reported with source="file" so a reviewer can
-    tell it is not check-specific.  If none carries evidence, the nearest
-    informative group's text is still reported.
+    Per-check scopes (action, if, trailing) decide the class.  Only when none
+    of them carries evidence is the function-leading comment or the file
+    header consulted, and then the class is `header-only`: the comment is the
+    module's or function's contract, not proof about this check.  If nothing
+    carries evidence, the nearest informative group's text is still reported
+    with class none.
     """
     nearest_text = ""
     nearest_line: Optional[int] = None
     nearest_scope = ""
-    for scope, group in candidates:
+    for scope, group in list(per_check) + list(header):
         if not group:
             continue
         text = _group_text(group)
@@ -731,9 +1133,24 @@ def _pick_evidence(candidates: Sequence[Tuple[str, Sequence[Comment]]]
             continue
         if nearest_line is None:
             nearest_text, nearest_line, nearest_scope = text, group[0].line_start, scope
+    for scope, group in per_check:
+        if not group:
+            continue
+        text = _group_text(group)
+        if not text:
+            continue
         cls, basis = classify_evidence(text)
         if cls != "none":
             return text, cls, group[0].line_start, basis, scope
+    for scope, group in header:
+        if not group:
+            continue
+        text = _group_text(group)
+        if not text:
+            continue
+        cls, basis = classify_evidence(text)
+        if cls != "none":
+            return text, "header-only", group[0].line_start, basis, scope
     return nearest_text, "none", nearest_line, "", nearest_scope
 
 
@@ -742,13 +1159,14 @@ def _scope(condition: str, params: Sequence[str]) -> str:
     return "param" if any(p in words for p in params) else "state"
 
 
-def extract_checks(handler: Handler, comments: Sequence[Comment],
+def extract_checks(func: Function, owner: Handler, via: Sequence[str],
+                   comments: Sequence[Comment],
                    lines: "LineIndex") -> List[Check]:
-    mask = handler.mask
-    text = handler.text
-    body_start = handler.body_start
-    body_end = handler.body_end
-    ctx = _make_context(handler, comments, lines)
+    mask = func.mask
+    text = func.text
+    body_start = func.body_start
+    body_end = func.body_end
+    ctx = _make_context(func, comments, lines)
     checks: List[Check] = []
     for m in re.finditer(r"(?<![\w#])if\s*\(", mask[body_start + 1:body_end]):
         if_pos = body_start + 1 + m.start()
@@ -782,7 +1200,7 @@ def extract_checks(handler: Handler, comments: Sequence[Comment],
                     code = error_code(expr)
                     if code:
                         checks.append(self_check(
-                            handler, condition, code, "return", if_pos,
+                            func, owner, via, condition, code, "return", if_pos,
                             s, semi + 1, ctx, comments, mask, lines))
                     break
                 if tok.group(0).startswith("ps3_stop"):
@@ -790,7 +1208,7 @@ def extract_checks(handler: Handler, comments: Sequence[Comment],
                     if stop:
                         code, stmt_end = stop
                         checks.append(self_check(
-                            handler, condition, code, "stop", if_pos,
+                            func, owner, via, condition, code, "stop", if_pos,
                             s, stmt_end, ctx, comments, mask, lines))
                     break
                 # A declaration or a nested construct: keep looking for the
@@ -808,46 +1226,51 @@ def extract_checks(handler: Handler, comments: Sequence[Comment],
                     code = error_code(expr)
                     if code:
                         checks.append(self_check(
-                            handler, condition, code, "return", if_pos,
+                            func, owner, via, condition, code, "return", if_pos,
                             q, semi + 1, ctx, comments, mask, lines))
             elif tok and tok.group(0).startswith("ps3_stop"):
                 stop = stop_call(mask, text, q, stmt_end)
                 if stop:
                     code, end = stop
                     checks.append(self_check(
-                        handler, condition, code, "stop", if_pos,
+                        func, owner, via, condition, code, "stop", if_pos,
                         q, end, ctx, comments, mask, lines))
     return checks
 
 
-def self_check(handler: Handler, condition: str, code: str, kind: str,
+def self_check(func: Function, owner: Handler, via: Sequence[str],
+               condition: str, code: str, kind: str,
                if_pos: int, action_start: int, action_end: int,
                ctx: EvidenceContext, comments: Sequence[Comment], mask: str,
                lines: "LineIndex") -> Check:
     trail = _trailing_comment(action_end, comments, mask, lines)
-    evidence, cls, ev_line, basis, ev_scope = _pick_evidence([
-        ("action", _comments_before(action_start, comments, mask)),
-        ("if", _comments_before(if_pos, comments, mask)),
-        ("trailing", [trail] if trail is not None else []),
-        ("function", ctx.leading),
-        ("file", ctx.file_header),
-    ])
+    evidence, cls, ev_line, basis, ev_scope = _pick_evidence(
+        [
+            ("action", _comments_before(action_start, comments, mask)),
+            ("if", _comments_before(if_pos, comments, mask)),
+            ("trailing", [trail] if trail is not None else []),
+        ],
+        [
+            ("function", ctx.leading),
+            ("file", ctx.file_header),
+        ])
     return Check(
-        handler=handler.name,
-        nid=handler.nid,
-        file=handler.rel,
+        handler=owner.name,
+        nid=owner.nid,
+        file=func.rel,
         line=lines.line(action_start),
+        via=list(via),
         if_line=lines.line(if_pos),
         condition=condition,
         code=code,
         kind=kind,
-        scope=_scope(condition, handler.params),
+        scope=_scope(condition, func.params),
         cls=cls,
         basis=basis,
         evidence=evidence,
         evidence_line=ev_line,
         evidence_scope=ev_scope,
-        module=os.path.splitext(os.path.basename(handler.rel))[0],
+        module=os.path.splitext(os.path.basename(owner.rel))[0],
     )
 
 
@@ -898,10 +1321,34 @@ def counts(checks: Sequence[Check]) -> "OrderedDict":
     d = OrderedDict()
     d["total"] = len(checks)
     d["by_class"] = OrderedDict((k, by_class.get(k, 0)) for k in CLASSES)
+    d["per_check_evidence"] = sum(by_class.get(k, 0) for k in PER_CHECK_CLASSES)
     d["by_kind"] = OrderedDict(sorted(by_kind.items()))
     d["by_scope"] = OrderedDict(sorted(by_scope.items()))
     d["by_file"] = OrderedDict(sorted(by_file.items()))
     d["by_module"] = OrderedDict(sorted(by_module.items()))
+    return d
+
+
+def dedupe_summary(checks: Sequence[Check]) -> "OrderedDict":
+    """One count per check site, however many handlers/paths reach it.
+
+    A row is audited once per handler (a callee shared by two handlers is two
+    rows).  A unique site is (file, line, condition, code, kind); a site is
+    shared when more than one handler reaches it.
+    """
+    sites: "OrderedDict[Tuple[str, int, str, str, str], List[Check]]" = OrderedDict()
+    for c in checks:
+        key = (c.file, c.line, c.condition, c.code, c.kind)
+        sites.setdefault(key, []).append(c)
+    by_class = Counter(group[0].cls for group in sites.values())
+    shared = sum(1 for group in sites.values()
+                 if len({c.handler for c in group}) > 1)
+    d = OrderedDict()
+    d["site_key"] = "file:line + condition + code + kind"
+    d["rows"] = len(checks)
+    d["unique_sites"] = len(sites)
+    d["shared_sites"] = shared
+    d["by_class_unique"] = OrderedDict((k, by_class.get(k, 0)) for k in CLASSES)
     return d
 
 
@@ -917,6 +1364,7 @@ def build_report(root: str, handlers: Sequence[Handler], checks: Sequence[Check]
     rep["handlers_with_checks"] = len({c.handler for c in checks})
     rep["checks"] = [c.as_dict() for c in checks]
     rep["counts"] = counts(checks)
+    rep["dedupe"] = dedupe_summary(checks)
     rep["unmatched_imports"] = [f"0x{n:08X}" for n in sorted(set(unmatched))]
     rep["warnings"] = list(warnings)
     rep["limits"] = list(LIMITS)
@@ -949,6 +1397,22 @@ def markdown(report: "OrderedDict", selected_classes: Sequence[str]) -> str:
     for k in CLASSES:
         lines.append(f"| `{k}` | {c['by_class'].get(k, 0)} |")
     lines.append("")
+    per = c["per_check_evidence"]
+    lines.append(
+        f"Per-check firmware evidence: {per} of {c['total']} "
+        f"(`fw-ea` {c['by_class'].get('fw-ea', 0)}, "
+        f"`oracle-rpcs3` {c['by_class'].get('oracle-rpcs3', 0)}, "
+        f"`sdk` {c['by_class'].get('sdk', 0)}); "
+        f"`host-only` {c['by_class'].get('host-only', 0)}; "
+        f"`header-only` {c['by_class'].get('header-only', 0)}; "
+        f"`none` {c['by_class'].get('none', 0)}.")
+    lines.append("")
+    dd = report["dedupe"]
+    lines.append(
+        f"Unique check sites: {dd['unique_sites']} ({dd['site_key']}); "
+        f"rows: {dd['rows']}; sites reached from more than one handler: "
+        f"{dd['shared_sites']}.")
+    lines.append("")
     lines.append("By kind: " + ", ".join(f"`{k}` {v}" for k, v in c["by_kind"].items()))
     lines.append("")
     lines.append("By scope: " + ", ".join(f"`{k}` {v}" for k, v in c["by_scope"].items()))
@@ -968,14 +1432,16 @@ def markdown(report: "OrderedDict", selected_classes: Sequence[str]) -> str:
         for w in report["warnings"]:
             lines.append(f"- {w}")
         lines.append("")
-    lines.append("| handler | file:line | condition | code | class | source | evidence |")
-    lines.append("|---|---|---|---|---|---|---|")
+    lines.append("| handler | file:line | via | condition | code | class | source | evidence |")
+    lines.append("|---|---|---|---|---|---|---|---|")
     for ch in checks:
         ev = ch["evidence"]
         ev_disp = ev if ev else "—"
         src = ch.get("evidence_scope") or "—"
+        via = " -> ".join(ch.get("via") or []) or "—"
         lines.append(
             f"| `{_md_cell(ch['handler'])}` | `{_md_cell(ch['file'])}:{ch['line']}` | "
+            f"`{_md_cell(via)}` | "
             f"`{_md_cell(ch['condition'], 220)}` | `{_md_cell(ch['code'])}` | "
             f"`{ch['class']}` | `{src}` | {_md_cell(ev_disp, 220)} |")
     lines.append("")
@@ -994,7 +1460,18 @@ def markdown(report: "OrderedDict", selected_classes: Sequence[str]) -> str:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description="Audit the evidence behind every parameter check in the HLE "
-                    "handlers (registered libs/** NID-table functions).")
+                    "handlers (registered libs/** NID-table functions) and in "
+                    "the static or cross-TU helpers their bodies call.",
+        epilog="Reachability: calls by identifier are followed up to %d edges "
+               "into static same-file helpers and into free functions defined "
+               "in libs/**/*.c and libs/**/*.cpp; a callee check keeps the "
+               "callee's file:line and gains a `via` chain. Evidence: only an "
+               "action/if/trailing comment is per-check (fw-ea, oracle-rpcs3, "
+               "sdk, or host-only for an `HLE-only` marker); function-leading "
+               "or file-header evidence is class header-only. Exit status: 0 "
+               "when the audit ran; none/header-only/host-only are data, not "
+               "failures; 2 on a malformed --imports file. The tool does not "
+               "gate on any class." % MAX_CALL_DEPTH)
     ap.add_argument("--root", default=ROOT,
                     help="tree whose libs/ is scanned (default: this checkout)")
     ap.add_argument("--imports", default=None,
@@ -1004,7 +1481,7 @@ def main(argv=None) -> int:
     ap.add_argument("--md", default=None, help="write the Markdown table here")
     ap.add_argument("--classes", default=None,
                     help="comma-separated classes to include in the reports "
-                         "(default: all; e.g. none)")
+                         "(default: all; one of " + ", ".join(CLASSES) + ")")
     args = ap.parse_args(argv)
 
     selected = CLASSES
@@ -1026,7 +1503,10 @@ def main(argv=None) -> int:
             return 2
         wanted = set(imports)
 
-    handlers, warnings = discover_handlers(args.root)
+    handlers, handler_warnings = discover_handlers(args.root)
+    warnings: List[str] = []
+    index = TreeIndex(args.root, warnings)
+    warnings.extend(handler_warnings)
     if wanted is not None:
         for nid in sorted(wanted):
             if not any(h.nid == nid for h in handlers):
@@ -1035,12 +1515,10 @@ def main(argv=None) -> int:
 
     checks: List[Check] = []
     for h in handlers:
-        lines = LineIndex(h.text)
-        comments = collect_comments(h.text, lines)
-        checks.extend(extract_checks(h, comments, lines))
+        checks.extend(audit_handler(h, index))
     if selected != CLASSES:
         checks = [c for c in checks if c.cls in selected]
-    checks.sort(key=lambda c: (c.file, c.line, c.handler))
+    checks.sort(key=lambda c: (c.file, c.line, c.handler, c.via))
 
     report = build_report(args.root, handlers, checks, args.imports, imports,
                           unmatched, warnings)

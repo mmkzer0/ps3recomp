@@ -175,6 +175,86 @@ void host_helper(s32 x)
 {
     if (x) return;
 }
+
+static s32 check_helper(s32 x)
+{
+    /* 0x02007777: firmware range check. */
+    if (x < 0) return CELL_EINVAL;
+    return CELL_OK;
+}
+
+s32 cellTestHelperCall(s32 x)
+{
+    return check_helper(x);
+}
+
+/* 0x02008888: function-level claim only. */
+s32 cellTestFunctionHeader(s32 x)
+{
+    if (x < 0) return CELL_EINVAL;
+    return CELL_OK;
+}
+
+/* 0x02009999: function-level claim, superseded per check. */
+s32 cellTestIfWins(s32 x)
+{
+    /* 0x0200AAAA: this check's firmware site. */
+    if (x < 0) return CELL_EINVAL;
+    return CELL_OK;
+}
+
+s32 cellTestHostOnly(s32 x)
+{
+    /* 0x0200CCCC is the shared helper's site; HLE-only, counted. */
+    if (x < 0) return CELL_EINVAL;
+    return CELL_OK;
+}
+
+s32 cellTestCppCaller(s32 x)
+{
+    return audit::cpp_check(x);
+}
+
+static s32 cycle_a(s32 x);
+s32 cellTestCycle(s32 x)
+{
+    if (x < -1) return CELL_EINVAL;
+    if (x == 0) return cycle_a(x);
+    return CELL_OK;
+}
+static s32 cycle_a(s32 x)
+{
+    if (x == 1) return CELL_EINVAL;
+    return cellTestCycle(x);
+}
+
+static s32 depth5(s32 x)
+{
+    if (x == 55) return CELL_EINVAL;
+    return CELL_OK;
+}
+static s32 depth4(s32 x)
+{
+    if (x == 44) return CELL_EINVAL;
+    if (x == 45) return depth5(x);
+    return CELL_OK;
+}
+static s32 depth3(s32 x) { return depth4(x); }
+static s32 depth2(s32 x)
+{
+    if (x == 22) return CELL_EINVAL;
+    return depth3(x);
+}
+static s32 depth1(s32 x) { return depth2(x); }
+s32 cellTestDepth(s32 x) { return depth1(x); }
+
+static s32 shared_check(s32 x)
+{
+    if (x == 6) return CELL_EINVAL;
+    return CELL_OK;
+}
+s32 cellTestSharedA(s32 x) { return shared_check(x); }
+s32 cellTestSharedB(s32 x) { return shared_check(x); }
 '''
 
 HEADER = r'''/* Synthetic header fixture. RPCS3 cellTestHeader.cpp: this contract is the oracle. */
@@ -189,6 +269,26 @@ s32 cellTestHeaderOracle(u32 x)
     if (x) return CELL_EINVAL;
     return CELL_OK;
 }
+'''
+
+
+CPP = r'''/* Synthetic C++ helper fixture. */
+#include <stdint.h>
+typedef int32_t s32;
+typedef uint32_t u32;
+#define CELL_OK 0
+#define CELL_EINVAL 0x80010002
+
+namespace audit {
+
+s32 cpp_check(s32 x)
+{
+    /* 0x0200B0B0: firmware range check. */
+    if (x < 0) return CELL_EINVAL;
+    return CELL_OK;
+}
+
+}  // namespace audit
 '''
 
 
@@ -207,6 +307,7 @@ def write_tree(tmp):
     (tmp / "libs" / "system").mkdir(parents=True)
     (tmp / "libs" / "system" / "cellTestAudit.c").write_text(MAIN)
     (tmp / "libs" / "system" / "cellTestHeader.c").write_text(HEADER)
+    (tmp / "libs" / "system" / "audit_helpers.cpp").write_text(CPP)
 
 
 def by_handler(checks, name):
@@ -290,21 +391,24 @@ def test_classes_and_shapes():
         check(got["cellTestParam"]["scope"] == "param", "param scope")
 
         c = got["cellTestHeaderOracle"]
-        check(c["class"] == "oracle-rpcs3" and c["evidence_scope"] == "file",
-              f"file-header oracle: {c['class']} {c.get('evidence_scope')}")
+        check(c["class"] == "header-only" and c["evidence_scope"] == "file",
+              f"file-header scope: {c['class']} {c.get('evidence_scope')}")
 
         counts = rep["counts"]
-        check(counts["by_class"] == {"fw-ea": 8, "oracle-rpcs3": 2,
-                                     "sdk": 1, "none": 5},
+        check(counts["by_class"] == {"fw-ea": 11, "oracle-rpcs3": 1, "sdk": 1,
+                                     "host-only": 1, "header-only": 2,
+                                     "none": 11},
               f"class counts: {counts['by_class']}")
-        check(counts["by_kind"] == {"return": 14, "stop": 2},
+        check(counts["per_check_evidence"] == 13,
+              f"per-check evidence: {counts['per_check_evidence']}")
+        check(counts["by_kind"] == {"return": 25, "stop": 2},
               f"kind counts: {counts['by_kind']}")
-        check(counts["by_scope"] == {"param": 15, "state": 1},
+        check(counts["by_scope"] == {"param": 26, "state": 1},
               f"scope counts: {counts['by_scope']}")
-        check(len(checks) == 16, f"total checks: {len(checks)}")
+        check(len(checks) == 27, f"total checks: {len(checks)}")
 
         text = m.read_text()
-        check("| handler | file:line | condition | code | class | source | evidence |"
+        check("| handler | file:line | via | condition | code | class | source | evidence |"
               in text, "markdown table header")
         check("cellTestFwEa" in text and "0x02001234" in text,
               "markdown lost a row/evidence")
@@ -331,7 +435,8 @@ def test_imports_filter():
         check(names == {"cellTestFwEa", "cellTestNone"},
               f"filtered handlers with checks: {names}")
         check(rep["counts"]["by_class"] == {"fw-ea": 1, "oracle-rpcs3": 0,
-                                            "sdk": 0, "none": 1},
+                                            "sdk": 0, "host-only": 0,
+                                            "header-only": 0, "none": 1},
               f"filtered class counts: {rep['counts']['by_class']}")
 
         bad = tmp / "bad.txt"
@@ -349,7 +454,7 @@ def test_class_filter():
         r = run(["--root", str(tmp), "--classes", "none", "--json", str(j)])
         check(r.returncode == 0, f"tool failed: {r.stderr}")
         rep = json.loads(j.read_text())
-        check(len(rep["checks"]) == 5,
+        check(len(rep["checks"]) == 11,
               f"none-only total: {len(rep['checks'])}")
         check(all(c["class"] == "none" for c in rep["checks"]),
               "class filter leaked another class")
@@ -367,8 +472,101 @@ def test_whole_tree():
         check(len(rep["checks"]) > 100, f"checks: {len(rep['checks'])}")
         check(rep["warnings"] == [], f"warnings: {rep['warnings']}")
         check(set(rep["counts"]["by_class"]) ==
-              {"fw-ea", "oracle-rpcs3", "sdk", "none"},
+              {"fw-ea", "oracle-rpcs3", "sdk", "host-only", "header-only",
+               "none"},
               f"classes: {rep['counts']['by_class']}")
+        check(rep["dedupe"]["unique_sites"] <= rep["counts"]["total"],
+              f"dedupe: {rep['dedupe']}")
+
+
+def audit_tree(tmp):
+    j = tmp / "audit.json"
+    r = run(["--root", str(tmp), "--json", str(j)])
+    check(r.returncode == 0, f"tool failed: {r.stderr}")
+    return json.loads(j.read_text())
+
+
+def test_reachability():
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        write_tree(tmp)
+        rep = audit_tree(tmp)
+        checks = rep["checks"]
+
+        direct = by_handler(checks, "cellTestFwEa")[0]
+        check(direct["via"] == [], f"direct check via: {direct['via']}")
+
+        rows = by_handler(checks, "cellTestHelperCall")
+        check(len(rows) == 1, f"helper rows: {len(rows)}")
+        c = rows[0]
+        check(c["via"] == ["check_helper"], f"helper via: {c['via']}")
+        check(c["file"].endswith("cellTestAudit.c") and c["class"] == "fw-ea",
+              f"helper row: {c['file']} {c['class']}")
+
+        rows = by_handler(checks, "cellTestCppCaller")
+        check(len(rows) == 1, f"cpp rows: {len(rows)}")
+        c = rows[0]
+        check(c["file"].endswith("audit_helpers.cpp"),
+              f"cpp check file: {c['file']}")
+        check(c["via"] == ["cpp_check"], f"cpp via: {c['via']}")
+        check(c["class"] == "fw-ea", f"cpp class: {c['class']}")
+
+
+def test_cycle_and_depth_limit():
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        write_tree(tmp)
+        checks = audit_tree(tmp)["checks"]
+
+        cycle = by_handler(checks, "cellTestCycle")
+        check(len(cycle) == 2, f"cycle rows: {len(cycle)}")
+        check({tuple(c["via"]) for c in cycle} == {(), ("cycle_a",)},
+              f"cycle vias: {[c['via'] for c in cycle]}")
+
+        depth = by_handler(checks, "cellTestDepth")
+        check(len(depth) == 2, f"depth rows: {len(depth)}")
+        by_cond = {c["condition"]: c for c in depth}
+        check("x == 22" in by_cond and "x == 44" in by_cond,
+              f"depth conditions: {sorted(by_cond)}")
+        check("x == 55" not in by_cond, "a 5th call edge was followed")
+        c = by_cond["x == 44"]
+        check(c["via"] == ["depth1", "depth2", "depth3", "depth4"],
+              f"depth-4 via: {c['via']}")
+
+
+def test_dedupe():
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        write_tree(tmp)
+        rep = audit_tree(tmp)
+        dd = rep["dedupe"]
+        check(dd["rows"] == 27, f"dedupe rows: {dd['rows']}")
+        check(dd["unique_sites"] == 26,
+              f"dedupe unique sites: {dd['unique_sites']}")
+        check(dd["shared_sites"] == 1,
+              f"dedupe shared sites: {dd['shared_sites']}")
+        a = by_handler(rep["checks"], "cellTestSharedA")[0]
+        b = by_handler(rep["checks"], "cellTestSharedB")[0]
+        check((a["file"], a["line"], a["code"]) ==
+              (b["file"], b["line"], b["code"]),
+              "the two shared rows are not the same site")
+
+
+def test_header_only_and_host_only():
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        write_tree(tmp)
+        checks = audit_tree(tmp)["checks"]
+
+        c = by_handler(checks, "cellTestFunctionHeader")[0]
+        check(c["class"] == "header-only" and c["evidence_scope"] == "function",
+              f"function-leading: {c['class']} {c.get('evidence_scope')}")
+        c = by_handler(checks, "cellTestIfWins")[0]
+        check(c["class"] == "fw-ea" and c["evidence_scope"] == "if",
+              f"if-scoped evidence lost: {c['class']} {c.get('evidence_scope')}")
+        c = by_handler(checks, "cellTestHostOnly")[0]
+        check(c["class"] == "host-only", f"host-only class: {c['class']}")
+        check("HLE-only" in c["evidence"], f"host-only evidence: {c['evidence']}")
 
 
 def main():
@@ -376,6 +574,10 @@ def main():
         ("classes and check shapes", test_classes_and_shapes),
         ("imports filter", test_imports_filter),
         ("class filter", test_class_filter),
+        ("reachability", test_reachability),
+        ("cycle and depth limit", test_cycle_and_depth_limit),
+        ("dedupe", test_dedupe),
+        ("header-only and host-only", test_header_only_and_host_only),
         ("whole tree", test_whole_tree),
     ]
     for name, fn in tests:
