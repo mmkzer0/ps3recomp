@@ -908,6 +908,8 @@ template <class T> static inline T vm_raw_ld_(uint64_t ea) { T v; memcpy(&v, g_v
 #define VM_RAW_ST(T, ea, val) do { T _v = (val); memcpy(g_vm_stub + VMOFF(ea), &_v, sizeof(T)); } while (0)
 static inline void vm_raw_ld16(void* dst, uint64_t ea) { memcpy(dst, g_vm_stub + VMOFF(ea), 16); }
 static inline void vm_raw_st16(uint64_t ea, const void* src) { memcpy(g_vm_stub + VMOFF(ea), src, 16); }
+/* No store hook in this driver (tools/test_ppu_store_hook.py runs the real one against the real loader). */
+#define PPU_STORE_HOOK(ea, n) ((void)0)
 /* Trap guard. A "may_trap" case exists to prove lifted code does NOT fault --
  * e.g. divw by zero must be lowered to a defined result, not a hardware trap.
  * MSVC catches that with SEH. POSIX has no SEH, so arm a signal handler and

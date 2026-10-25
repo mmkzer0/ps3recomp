@@ -1,12 +1,17 @@
-// The store hook of ppu_loader.cpp's vm_write32 (ppu_set_store_hook).
+// The store hook of ppu_loader.cpp (ppu_set_store_hook).
 //
-// A device model registers a window of guest memory; a 32-bit guest store into it runs the hook first, on
-// the storing thread, with the address and the value, while the old value is still in memory (the RSX
-// walker's label ordering, libs/video/cellGcmSys.c, needs exactly that). Nothing else calls it: not a store
-// outside the window, not a 8/16/64-bit store, not after the hook was removed or with an empty window.
+// A device model registers a window of guest memory; a guest store that overlaps it runs the hook first, on
+// the storing thread, with the first window address the store covers, while the old bytes are still in
+// memory (the RSX walker's label ordering, libs/video/cellGcmSys.c, needs exactly that). That holds for every
+// form of guest store, not only the 32-bit one: the load/store family of any width, the multiple-word and
+// string stores, the byte-reversed stores, the store-conditionals, the vector stores and dcbz. The forms are
+// the code the real lifter emits (tools/test_ppu_store_hook.py generates store_forms.cpp from it). Nothing
+// calls the hook for a store next to the window, with no hook registered, with an empty window or after
+// the hook was removed.
 //
 // Built by tools/test_ppu_store_hook.py against the real ppu_loader.cpp (the stubs are those of
 // test_ppu_dispatch_depth.cpp: a loader-only fixture).
+#define PPU_NO_INLINE_LOADS   // the fixture declares the loader's own vm_read32 below
 #include "ppu_recomp.h"
 #include <cstdio>
 #include <cstdlib>
@@ -33,13 +38,19 @@ const func_entry function_table[1] = {{0, nullptr, nullptr}};
 const uint64_t function_table_count = 0;
 const char* ppu_lift_image_sha256(void) { return ""; }
 uint32_t ps3_hle_count(void) { return 0; }
-
 void ppu_set_store_hook(uint32_t lo, uint32_t len, void (*fn)(uint32_t ea, uint32_t value));
 void vm_write8(uint64_t a, uint8_t v);
 void vm_write16(uint64_t a, uint16_t v);
 void vm_write32(uint64_t a, uint32_t v);
 void vm_write64(uint64_t a, uint64_t v);
 uint32_t vm_read32(uint64_t a);
+uint32_t ppu_lwarx32(ppu_context* ctx, uint64_t ea);
+uint64_t ppu_ldarx64(ppu_context* ctx, uint64_t ea);
+
+typedef struct { const char* name; void (*run)(ppu_context*); int kind;
+                 unsigned ea_off, first, len, calls; } store_form;
+extern const store_form g_forms[];
+extern const unsigned g_nforms;
 }
 
 static const uint32_t LO = 0x20000, LEN = 0x100;
@@ -52,12 +63,99 @@ static void check(bool ok, const char* what)
 
 static unsigned s_calls;
 static uint32_t s_ea, s_value, s_old;
+static bool s_old_bytes_intact;      // at every hook call, the byte at its address still held the old value
+static uint32_t s_win_lo, s_win_len;
+static bool s_ea_in_window;
 static void hook(uint32_t ea, uint32_t value)
 {
     ++s_calls; s_ea = ea; s_value = value;
     s_old = vm_read32(ea);          // what memory holds while the hook runs
+    s_old_bytes_intact = s_old_bytes_intact && vm_base[ea] == 0xA5;
+    s_ea_in_window = s_ea_in_window && ea >= s_win_lo && ea - s_win_lo < s_win_len;
 }
-static void reset() { s_calls = 0; s_ea = s_value = s_old = 0xDEADBEEF; }
+static void reset() { s_calls = 0; s_ea = s_value = s_old = 0xDEADBEEF; s_old_bytes_intact = s_ea_in_window = true; }
+
+// The store forms run against one probe area of 0xA5 bytes: a form's store has to turn exactly the bytes
+// [BASE + first, +len) into something else.
+static const uint32_t AREA = 0x20000, AREA_LEN = 0x400, BASE = 0x20100;
+
+static void window(uint32_t lo, uint32_t len)
+{
+    s_win_lo = lo; s_win_len = len;
+    ppu_set_store_hook(lo, len, len ? hook : nullptr);
+}
+
+static void run_form(const store_form& f)
+{
+    static ppu_context ctx;
+    std::memset(&ctx, 0, sizeof ctx);
+    std::memset(vm_base + AREA, 0xA5, AREA_LEN);
+    reset();
+    ctx.gpr[4] = BASE + f.ea_off;
+    ctx.gpr[5] = 0x1122334455667788ull;
+    ctx.gpr[6] = 0x55667788u;              // stswi / stswx: the second register of the string
+    ctx.gpr[29] = 0x11111111u; ctx.gpr[30] = 0x22222222u; ctx.gpr[31] = 0x33333333u;   // stmw
+    ctx.xer = 7;                           // stswx: the byte count
+    for (int i = 0; i < 16; i++) ctx.vr[5].b[i] = (uint8_t)(0x10 + i);
+    const uint64_t one = 0x3FF0000000000001ull; std::memcpy(&ctx.fpr[5], &one, 8);
+    if (f.kind == 1) ppu_lwarx32(&ctx, BASE + f.ea_off);
+    if (f.kind == 2) ppu_ldarx64(&ctx, BASE + f.ea_off);
+    f.run(&ctx);
+}
+
+// After a form ran: its bytes changed, no other byte of the area did.
+static bool store_landed_exactly(const store_form& f)
+{
+    for (uint32_t a = AREA; a < AREA + AREA_LEN; a++) {
+        const bool in_region = a >= BASE + f.first && a < BASE + f.first + f.len;
+        if ((vm_base[a] != 0xA5) != in_region) return false;
+    }
+    return true;
+}
+
+static void test_form(const store_form& f)
+{
+    char what[160];
+    const uint32_t first = BASE + f.first, last = first + f.len - 1;
+
+    window(AREA, AREA_LEN);
+    run_form(f);
+    std::snprintf(what, sizeof what, "%s: a window over the whole area runs the hook %u time(s), each within the window",
+                  f.name, f.calls);
+    check(s_calls == f.calls && s_ea_in_window, what);
+    std::snprintf(what, sizeof what, "%s: the hook ran before the bytes it covers were stored", f.name);
+    check(s_old_bytes_intact, what);
+    std::snprintf(what, sizeof what, "%s: the store landed, and only its own bytes changed", f.name);
+    check(store_landed_exactly(f), what);
+
+    // An overlap of one byte is an overlap: the window is the last byte the store writes. The hook gets the
+    // first window address the store covers.
+    window(last, 1);
+    run_form(f);
+    std::snprintf(what, sizeof what, "%s: a store that overlaps the window by its last byte runs the hook once, at that byte", f.name);
+    check(s_calls == 1 && s_ea == last && s_old_bytes_intact, what);
+    check(store_landed_exactly(f), "  ... and it landed");
+
+    window(first, 1);
+    run_form(f);
+    std::snprintf(what, sizeof what, "%s: a store that overlaps the window by its first byte runs the hook", f.name);
+    check(s_calls >= 1 && s_ea == first && s_old_bytes_intact, what);
+
+    window(first - 1, 1);
+    run_form(f);
+    std::snprintf(what, sizeof what, "%s: a window one byte below the store is not hooked", f.name);
+    check(s_calls == 0 && store_landed_exactly(f), what);
+
+    window(last + 1, 1);
+    run_form(f);
+    std::snprintf(what, sizeof what, "%s: a window one byte above the store is not hooked", f.name);
+    check(s_calls == 0 && store_landed_exactly(f), what);
+
+    ppu_set_store_hook(0, 0, nullptr);
+    run_form(f);
+    std::snprintf(what, sizeof what, "%s: with no hook registered the store lands and calls nothing", f.name);
+    check(s_calls == 0 && store_landed_exactly(f), what);
+}
 
 int main()
 {
@@ -69,6 +167,7 @@ int main()
     check(s_calls == 0, "no hook registered: a store in the window calls nothing");
 
     ppu_set_store_hook(LO, LEN, hook);
+    s_win_lo = LO; s_win_len = LEN;
     reset();
     vm_write32(LO + 0x10, 0x1234);
     check(s_calls == 1 && s_ea == LO + 0x10 && s_value == 0x1234, "a 32-bit store in the window runs the hook with its address and value");
@@ -83,19 +182,40 @@ int main()
     check(s_calls == 0, "the word after the window");
     reset(); vm_write32(LO - 4, 5);
     check(s_calls == 0, "the word before the window");
+    reset(); vm_write32(LO - 2, 6);
+    check(s_calls == 1 && s_ea == LO, "an unaligned word that straddles the window's start is hooked, at the window's first address");
 
-    reset();
-    vm_write8(LO + 0x20, 1); vm_write16(LO + 0x22, 2); vm_write64(LO + 0x28, 3);
-    check(s_calls == 0, "8-, 16- and 64-bit stores are not hooked");
+    reset(); vm_write8(LO + 0x20, 0x41);
+    check(s_calls == 1 && s_ea == LO + 0x20 && s_value == 0x41, "an 8-bit store in the window runs the hook with its value");
+    reset(); vm_write16(LO + 0x22, 0x4243);
+    check(s_calls == 1 && s_ea == LO + 0x22 && s_value == 0x4243, "a 16-bit store in the window runs the hook with its value");
+    reset(); vm_write64(LO + 0x28, 0x1111111122222222ull);
+    check(s_calls == 1 && s_ea == LO + 0x28 && s_value == 0x22222222u, "a 64-bit store in the window runs the hook once (value: its low word)");
+    reset(); vm_write64(LO + LEN - 4, 7);
+    check(s_calls == 1 && s_ea == LO + LEN - 4, "a doubleword whose first word is the window's last word is hooked once");
+    reset(); vm_write64(LO - 4, 8);
+    check(s_calls == 1 && s_ea == LO, "a doubleword whose second word is the window's first word is hooked once");
+    reset(); vm_write64(LO + LEN, 9); vm_write64(LO - 8, 10);
+    check(s_calls == 0, "doublewords on either side of the window are not hooked");
+    reset(); vm_write8(LO - 1, 1); vm_write8(LO + LEN, 1); vm_write16(LO - 2, 1); vm_write16(LO + LEN, 1);
+    check(s_calls == 0, "bytes and halfwords on either side of the window are not hooked");
 
     ppu_set_store_hook(LO, 0, hook);
-    reset(); vm_write32(LO + 0x10, 6);
+    reset(); vm_write32(LO + 0x10, 6); vm_write64(LO + 0x10, 6); vm_write8(LO + 0x10, 6);
     check(s_calls == 0, "an empty window hooks nothing");
 
     ppu_set_store_hook(LO, LEN, hook);
     ppu_set_store_hook(0, 0, nullptr);
-    reset(); vm_write32(LO + 0x10, 7);
+    reset(); vm_write32(LO + 0x10, 7); vm_write64(LO + 0x10, 7);
     check(s_calls == 0, "after the hook is removed the window is dead");
+
+    ppu_set_store_hook(0, 0xFFFFFFFFu, hook);
+    s_win_lo = 0; s_win_len = 0xFFFFFFFFu;
+    reset(); vm_write32(0x20100, 8);
+    check(s_calls == 1 && s_ea == 0x20100, "a window of nearly 4 GB hooks a store inside it (the bound does not wrap)");
+    ppu_set_store_hook(0, 0, nullptr);
+
+    for (unsigned i = 0; i < g_nforms; i++) test_form(g_forms[i]);
 
     std::printf("[ppu_store_hook] %s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
     std::free(vm_base);

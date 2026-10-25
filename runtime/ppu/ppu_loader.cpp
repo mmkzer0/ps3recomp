@@ -1320,26 +1320,54 @@ extern "C" void resv_keep_own(ppu_context* ctx, uint32_t ea);
  * has already been handed. libs/video/cellGcmSys.c registers the RSX's semaphore labels: the RSX is a host
  * thread there, and a store the title makes to a label has to land after the walker has read every command
  * the title published before it (the console's RSX does, within microseconds of the `put` store; the host
- * thread may be descheduled for milliseconds). The hook runs on the storing thread, before the store lands,
- * and only for 32-bit stores through vm_write32 -- the lifted program's own stores. libs/ HLE code stores
- * through the inline family in ppu_memory.h and never comes here. With no window registered the check is
- * one subtract and compare. */
-static std::atomic<uint64_t> g_store_hook_window{0};                      /* lo | len << 32; len 0 = none */
+ * thread may be descheduled for milliseconds). The hook runs on the storing thread, before the store lands.
+ *
+ * EVERY form of guest store runs it, because a label word can be written by any of them (#22): the
+ * vm_write8/16/32/64 family, the store-conditionals below, and the forms the lifter emits as raw host
+ * stores -- byte-reversed, vector, dcbz -- which call ppu_store_hook_span through PPU_STORE_HOOK
+ * (tools/ppu_lifter.py, HEADER_PREAMBLE). stmw and stswi/stswx are one word / one byte store per element and
+ * run it per element: the first one's wait is the one that matters, since `get` is at `put` after it.
+ * A store that overlaps the window by a byte runs it, once, with the first window address it covers.
+ * libs/ HLE code stores through the inline family in ppu_memory.h and never comes here (HLE is not guest
+ * code), and neither does an SPU's DMA: see docs/RUNTIME.md.
+ *
+ * With no window registered the check is one acquire load, one subtract and one compare, inline in the
+ * lifted code as well (the window word is the exported ppu_store_window); the slow path is out of line. */
+extern "C" { uint64_t ppu_store_window = 0; }                                      /* lo | len << 32; len 0 = none */
 static std::atomic<void (*)(uint32_t ea, uint32_t value)> g_store_hook_fn{nullptr};
 
 extern "C" void ppu_set_store_hook(uint32_t lo, uint32_t len, void (*fn)(uint32_t ea, uint32_t value))
 {
     g_store_hook_fn.store(fn, std::memory_order_release);
-    g_store_hook_window.store(fn ? ((uint64_t)len << 32) | lo : 0, std::memory_order_release);
+    __atomic_store_n(&ppu_store_window, fn ? ((uint64_t)len << 32) | lo : 0, __ATOMIC_RELEASE);
 }
 
-static inline void ppu_store_hook(uint32_t a, uint32_t v)
+/* Whether the store of [a, a+n) overlaps the window, decided in 64-bit arithmetic. Only reached when the
+ * inline check below said "maybe": that one is a single modular compare, so it may say maybe for a store
+ * that wraps the 32-bit space or for an empty window, and never says no to one that overlaps. */
+static void ppu_store_hook_slow(uint32_t a, uint32_t n, uint32_t v)
 {
-    const uint64_t w = g_store_hook_window.load(std::memory_order_acquire);
-    if ((uint32_t)(a - (uint32_t)w) < (uint32_t)(w >> 32)) {
-        const auto fn = g_store_hook_fn.load(std::memory_order_acquire);
-        if (fn) fn(a, v);
-    }
+    const uint64_t w = __atomic_load_n(&ppu_store_window, __ATOMIC_ACQUIRE);
+    const uint64_t lo = (uint32_t)w, len = w >> 32;
+    if (!len || (uint64_t)a + n <= lo || (uint64_t)a >= lo + len) return;
+    const auto fn = g_store_hook_fn.load(std::memory_order_acquire);
+    if (fn) fn(a > lo ? a : (uint32_t)lo, v);
+}
+
+/* n > 0 bytes at a. The test is `(a + n - 1 - lo) mod 2^32 < len + n - 1`, the right side in 64 bits so that
+ * a window of nearly 4 GB cannot wrap it: the store's last byte is at or above lo, and its first at or below
+ * the window's last. The same expression is PPU_STORE_HOOK's. */
+static inline void ppu_store_hook(uint32_t a, uint32_t n, uint32_t v)
+{
+    const uint64_t w = __atomic_load_n(&ppu_store_window, __ATOMIC_ACQUIRE);
+    if (__builtin_expect((uint64_t)(uint32_t)(a + n - 1u - (uint32_t)w) < (w >> 32) + n - 1u, 0))
+        ppu_store_hook_slow(a, n, v);
+}
+
+/* The lifted code's raw stores have no value to report: the hook gets 0. */
+extern "C" void ppu_store_hook_span(uint64_t ea, uint32_t n)
+{
+    ppu_store_hook_slow((uint32_t)ea, n, 0);
 }
 
 extern "C" {
@@ -1820,7 +1848,12 @@ extern "C" int ppu_stwcx32(ppu_context* ctx, uint64_t ea, uint32_t val)
     const uint32_t expected = __builtin_bswap32((uint32_t)ctx->reserve_value);
     int ok = 0;
     if (vm_oob(a, 4)) ctx->reserve_valid = 0;
-    else              ok = resv_stcx32(ctx, a, val);
+    else {
+        /* A store-conditional that fails stores nothing, but it waits like one: the wait is only a delay, and
+         * a reservation it costs is retried by the guest's own loop, now with `get` at `put`. */
+        ppu_store_hook(a, 4, val);
+        ok = resv_stcx32(ctx, a, val);
+    }
     /* PPU_CASWATCH=<hex ea>: log successful stwcx. on that 128-byte line.
      * PPU_WWATCH hooks plain stores only; an atomic counter (a semaphore an SPU
      * spins on) is written exclusively through here and looked untouched. */
@@ -1875,7 +1908,10 @@ extern "C" int ppu_stdcx64(ppu_context* ctx, uint64_t ea, uint64_t val)
     const uint32_t a = (uint32_t)ea;
     int ok = 0;
     if (vm_oob(a, 8)) ctx->reserve_valid = 0;
-    else              ok = resv_stcx64(ctx, a, val);
+    else {
+        ppu_store_hook(a, 8, (uint32_t)val);
+        ok = resv_stcx64(ctx, a, val);
+    }
     if (ok && g_ww_lo && a + 4u >= g_ww_lo && a < g_ww_hi) {
         /* Report as two words: the watch window is word-granular, and a
          * doubleword CAS on a counter pair is exactly the case worth seeing. */
@@ -1885,6 +1921,7 @@ extern "C" int ppu_stdcx64(ppu_context* ctx, uint64_t ea, uint64_t val)
     return ok;
 }
 void vm_write8 (uint64_t a, uint8_t  v) { barrier_watch_hit((uint32_t)a, v, 1, __builtin_return_address(0)); if (vm_oob((uint32_t)a,1) || vm_null_store((uint32_t)a, v, 1, __builtin_return_address(0))) return;
+    ppu_store_hook((uint32_t)a, 1, v);
 #ifdef _WIN32
     /* PT detector: does this byte-write turn its word into the hunted truncated value? */
     { if(g_pt_val==-2){const char*e=getenv("PT"); g_pt_val=e?(int64_t)strtoul(e,0,16):-1;}
@@ -1895,9 +1932,10 @@ void vm_write8 (uint64_t a, uint8_t  v) { barrier_watch_hit((uint32_t)a, v, 1, _
 #endif
     VM_WRITE_COH(a, &v, 1); }
 void vm_write16(uint64_t a, uint16_t v) { barrier_watch_hit((uint32_t)a, v, 2, __builtin_return_address(0)); if (vm_oob((uint32_t)a,2) || vm_null_store((uint32_t)a, v, 2, __builtin_return_address(0))) return;
+    ppu_store_hook((uint32_t)a, 2, v);
     v = __builtin_bswap16(v); VM_WRITE_COH(a, &v, 2); }
 void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, __builtin_return_address(0)); if (vm_oob((uint32_t)a,4) || vm_null_store((uint32_t)a, v, 4, __builtin_return_address(0))) return;
-    ppu_store_hook((uint32_t)a, v);
+    ppu_store_hook((uint32_t)a, 4, v);
 #ifdef _WIN32
     /* PT restore: a full-word store of a valid pointer (high byte set) to a
      * previously-truncated slot clears the record (that truncation was transient). */
@@ -1918,6 +1956,7 @@ void vm_write64(uint64_t a, uint64_t v) {
     barrier_watch_hit((uint32_t)a,     (uint32_t)(v >> 32), 4, __builtin_return_address(0));
     barrier_watch_hit((uint32_t)a + 4, (uint32_t)v,         4, __builtin_return_address(0));
     if (vm_oob((uint32_t)a,8) || vm_null_store((uint32_t)a, (uint32_t)(v >> 32), 8, __builtin_return_address(0))) return;
+    ppu_store_hook((uint32_t)a, 8, (uint32_t)v);
     v = __builtin_bswap64(v); VM_WRITE_COH(a, &v, 8); }
 }
 

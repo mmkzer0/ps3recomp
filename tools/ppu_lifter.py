@@ -178,6 +178,20 @@ static inline void vm_raw_st16(uint64_t ea, const void* src) {
     uint64_t lo, hi; memcpy(&lo, src, 8); memcpy(&hi, (const uint8_t*)src + 8, 8);
     VM_RAW_ST(uint64_t, ea, lo); VM_RAW_ST(uint64_t, ea + 8, hi); }
 extern int      vm_inline_ok;
+/* The store hook (runtime/ppu/ppu_loader.cpp, ppu_set_store_hook). A device model registers one window of
+ * guest memory, and a guest store that overlaps it has to run the model's hook first (the RSX's semaphore
+ * labels: a store must land after the walker has read what the title published before it). The vm_write*
+ * family does that itself; the forms below store through vm_base, so they ask first. n > 0 bytes at ea:
+ * the store overlaps the window iff its last byte is at or above lo and its first at or below the window's
+ * last, one modular compare (a store that wraps the 32-bit space may take the out-of-line call needlessly,
+ * never the other way). Outside the window: one acquire load and one compare. */
+extern uint64_t ppu_store_window;   /* lo | len << 32; 0 = no window */
+void ppu_store_hook_span(uint64_t ea, uint32_t n);
+#define PPU_STORE_HOOK(ea, n) do { \\
+    const uint64_t _w = __atomic_load_n(&ppu_store_window, __ATOMIC_ACQUIRE); \\
+    const uint32_t _a = (uint32_t)(ea), _n = (uint32_t)(n); \\
+    if (__builtin_expect((uint64_t)(uint32_t)(_a + _n - 1u - (uint32_t)_w) < (_w >> 32) + _n - 1u, 0)) \\
+        ppu_store_hook_span(_a, _n); } while (0)
 extern uint32_t ppu_vm_size;
 extern uint32_t ppu_hle_inject_base;
 #ifdef __cplusplus
@@ -2726,11 +2740,13 @@ class PPULifter:
             ra, rb = _reg_idx(ops[1]), _reg_idx(ops[2])
             if mn.startswith("stvl"):
                 loop = "for (uint32_t i = 0; i < 16u - sh; i++) m[sh + i] = s[i];"
+                hook = "PPU_STORE_HOOK(ea, 16u - sh);"
             else:
                 loop = "for (uint32_t i = 16u - sh; i < 16u; i++) m[i - (16u - sh)] = s[i];"
+                hook = "if (sh) PPU_STORE_HOOK(ea & ~0xFULL, sh);"
             return (f"{{ uint64_t ea = {_xea(ra, rb)}; uint32_t sh = (uint32_t)(ea & 0xF); "
                     f"uint8_t* m = vm_base + (uint32_t)(ea & ~0xFULL); "
-                    f"const uint8_t* s = (const uint8_t*)&ctx->vr[{vs}]; {loop} }}")
+                    f"const uint8_t* s = (const uint8_t*)&ctx->vr[{vs}]; {hook} {loop} }}")
 
         if mn == "lwaux":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
@@ -2740,7 +2756,7 @@ class PPULifter:
         if mn == "stdbrx":
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             return (f"{{ uint64_t ea = {_xea(ra, rb)}; uint64_t raw = ctx->gpr[{rs}]; "
-                    f"VM_RAW_ST(uint64_t, ea, raw); }}")   # host LE = byte-reversed
+                    f"PPU_STORE_HOOK(ea, 8); VM_RAW_ST(uint64_t, ea, raw); }}")   # host LE = byte-reversed
 
         # ------- String word load/store -------
         # NB bytes (lswi: NB field, 0 = 32; lswx: XER[25:31]) move between memory
@@ -2777,7 +2793,7 @@ class PPULifter:
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
                     f"uint32_t raw = (uint32_t)ctx->gpr[{rs}]; "
-                    f"VM_RAW_ST(uint32_t, ea, raw); }}")
+                    f"PPU_STORE_HOOK(ea, 4); VM_RAW_ST(uint32_t, ea, raw); }}")
 
         if mn == "lhbrx":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
@@ -2798,7 +2814,7 @@ class PPULifter:
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
                     f"uint16_t raw = (uint16_t)ctx->gpr[{rs}]; "
-                    f"VM_RAW_ST(uint16_t, ea, raw); }}")
+                    f"PPU_STORE_HOOK(ea, 2); VM_RAW_ST(uint16_t, ea, raw); }}")
 
         # ------- Load algebraic -------
         if mn == "lwax":
@@ -2835,7 +2851,7 @@ class PPULifter:
             ra = _reg_idx(ops[0])
             rb = _reg_idx(ops[1])
             return (f"{{ uint64_t ea = ({_xea(ra,rb)}) & ~0x7FULL; "
-                    f"memset(vm_base + (uint32_t)ea, 0, 128); }}")
+                    f"PPU_STORE_HOOK(ea, 128); memset(vm_base + (uint32_t)ea, 0, 128); }}")
 
         if mn in ("dcbt", "dcbtst", "dcbf", "dcbst", "dcba", "icbi"):
             return f"/* {mn}: cache hint, no-op */;"
@@ -2933,7 +2949,7 @@ class PPULifter:
             ra = _reg_idx(ops[1])
             rb = _reg_idx(ops[2])
             return (f"{{ uint64_t ea = ({_xea(ra,rb)}) & ~0xFULL; "
-                    f"vm_raw_st16(ea, &ctx->vr[{vs}]); }}")
+                    f"PPU_STORE_HOOK(ea, 16); vm_raw_st16(ea, &ctx->vr[{vs}]); }}")
 
         # Cell unaligned vector loads (CBEA / AltiVec): lvlx loads bytes
         # [EA&15 .. 15] of the aligned quadword left-justified into vD and
@@ -2982,7 +2998,7 @@ class PPULifter:
             return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
                     f"ea &= ~{size - 1}ULL; "
                     f"{{ uint{size*8}_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[{vs}] + (ea & 15), {size}); "
-                    f"VM_RAW_ST(uint{size*8}_t, ea, _e); }} }}")
+                    f"PPU_STORE_HOOK(ea, {size}); VM_RAW_ST(uint{size*8}_t, ea, _e); }} }}")
 
         if mn == "lvsl" or mn == "lvsr":
             vd = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])

@@ -1892,7 +1892,7 @@ static void gcm_rsx_process_fifo_unlocked(void);
  * and the walker read the kick 13 us after that store; a 15-minute unloaded soak ended with the same
  * signature at 785 s [INFERENCE: the same cause, one scheduling hiccup in ~47,000 frames].
  *
- * So a 32-bit store by guest code into the label window waits, before it lands, for one complete walker pass
+ * So a store by guest code into the label window waits, before it lands, for one complete walker pass
  * that began after the store was reached (the pass reads `put` afresh): the RSX has by then read everything
  * the guest had published, and evaluated every ACQUIRE among it against the label's old value. This is the
  * console's ordering with an RSX that is never late; an ACQUIRE the RSX is held in front of (the flip wait,
@@ -1901,8 +1901,10 @@ static void gcm_rsx_process_fifo_unlocked(void);
  * wait: they cannot wait for themselves, and guest code a pass calls (a flip handler) may store a label.
  * `gcm.wait_timeout_ms` bounds the wait; a walker that never runs a pass is a host fault and a named stop.
  *
- * runtime/ppu/ppu_loader.cpp (compiled per game, not part of the runtime library) calls the hook from its
- * vm_write32 and defines ppu_set_store_hook; the first pass registers the label window. A link without the
+ * runtime/ppu/ppu_loader.cpp (compiled per game, not part of the runtime library) calls the hook from every
+ * form of guest store (vm_write8..64, the store-conditionals, and the lifter's PPU_STORE_HOOK; see docs/RUNTIME.md,
+ * "Guest Store Hook") and defines ppu_set_store_hook; the first pass registers the label window. The one HLE
+ * path that stores a label on a guest thread, cellGcmSetFlipCommandWithWaitLabel, calls it itself. A link without the
  * loader (a host, a fixture) gets the default below, which registers nothing: there is no guest code to
  * order. */
 #if defined(_MSC_VER)
@@ -3288,7 +3290,11 @@ s32 cellGcmSetFlipCommandWithWaitLabel(u32 bufferId, u32 labelIndex, u32 labelVa
 
     /* Wait until the label reaches the expected value (instant in HLE). Labels
      * live in guest memory (see cellGcmGetLabelAddress) so the game can poll. */
-    vm_write32(GCM_LABEL_GUEST_BASE + labelIndex * GCM_LABEL_STRIDE, labelValue);
+    {   /* A guest thread's store into the label window, made by the HLE: ordered like the lifted ones. */
+        const u32 label_ea = GCM_LABEL_GUEST_BASE + labelIndex * GCM_LABEL_STRIDE;
+        gcm_guest_label_store(label_ea, labelValue);
+        vm_write32(label_ea, labelValue);
+    }
 
     return cellGcmSetFlipCommand(bufferId);
 }

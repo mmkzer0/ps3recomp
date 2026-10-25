@@ -288,6 +288,24 @@ ppu_xer_get_byte_count(ctx) // Read string instruction byte count
 
 The `reserve_*` fields hold a `lwarx`/`ldarx` reservation: the address, the bits loaded and the epoch of the 128-byte line they were loaded from. `stwcx.`/`stdcx.` succeed only if no store has reached the line since and the bits are unchanged. The rule is shared with the SPU's `GETLLAR`/`PUTLLC`; see [Reservations](#reservations).
 
+### Guest Store Hook
+
+`ppu_set_store_hook(lo, len, fn)` (`runtime/ppu/ppu_loader.cpp`) registers one window of guest memory in which a guest store must be ordered after what a device model has already been handed. The RSX walker is the user (`libs/video/cellGcmSys.c`, `gcm_guest_label_store`): a store the title makes to a label waits, before it lands, for one walker pass that began after the store was reached, so an equality ACQUIRE queued before the store sees the label's old value (M2 R1, #17).
+
+**Every form of guest store runs the hook** (#22), once per store that overlaps the window by at least one byte, with the first window address the store covers (`fn(ea, value)`; `value` is the low 32 bits of the stored register for the integer and store-conditional forms, and 0 for the forms that store no single register: vector stores, `dcbz`, the byte-reversed forms). The hook runs on the storing thread with the old bytes still in memory.
+
+| Form | Path |
+|---|---|
+| `stb` `sth` `stw` `std` and their update, indexed and FP (`stfs` `stfd` `stfiwx`) forms | `vm_write8/16/32/64` |
+| `stmw` | one `vm_write32` per register; the hook runs per word |
+| `stswi` `stswx` | one `vm_write8` per byte; the hook runs per byte |
+| `stwcx.` `stdcx.` | `ppu_stwcx32` / `ppu_stdcx64`, before the compare-exchange (a failing one waits too; it stores nothing) |
+| `stwbrx` `sthbrx` `stdbrx` `stvx` `stvxl` `stvlx` `stvrx` `stvebx` `stvehx` `stvewx` `dcbz` | emitted as raw host stores; the lifted code runs `PPU_STORE_HOOK(ea, n)` (`HEADER_PREAMBLE` in `tools/ppu_lifter.py`) over the bytes the store writes, which calls `ppu_store_hook_span` when they overlap the window |
+
+A store outside the window costs one acquire load of the window word (`ppu_store_window`, inline in the lifted code too) and one range compare. Not covered, by design: HLE stores (`libs/` use the inline `vm_write*` family of `ppu_memory.h`, which does not come here) except the one HLE path that writes a label on a guest thread, `cellGcmSetFlipCommandWithWaitLabel`, which calls the hook itself; and an SPU's DMA into the window (the hook state lives in the per-game loader, which the SPU runtime does not link; an SPU `PUT` into a label is unordered against the walker). A port regenerates its lifted sources with the lifter that carries `PPU_STORE_HOOK`; sources lifted earlier still link, and their raw forms stay unhooked.
+
+Test: `python3 tools/test_ppu_store_hook.py` runs every form above, as the real lifter emits it, against the real loader.
+
 ### Stack Setup
 
 ```c
