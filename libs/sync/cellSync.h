@@ -11,18 +11,27 @@
 #include "ps3emu/ps3types.h"
 #include "ps3emu/error_codes.h"
 
-/* The generated C++ NID table (smoke/ppu_hle_nids.cpp) includes this header.
- * libstdc++'s <stdatomic.h> declares atomic_uint for C++ only from C++23 on,
- * and the tree is C++20, so C++ takes the std:: names, as fw_divergence.h
- * does. They have the same size and lock-free representation as the C11 types
- * the C implementation uses. */
+/* The generated C++ NID table (smoke/ppu_hle_nids.cpp) includes this header but
+ * never touches a field: only the C implementation performs the atomic
+ * operations. C++ therefore spells the 4-byte fields as plain integers rather
+ * than including <atomic>, which would be pulled into every include site and
+ * cannot follow <stdatomic.h> (libstdc++'s kill_dependency macro from C++11 to
+ * C++20 makes the later <atomic> fail). The layout assert below holds both
+ * languages to the same guest-visible fields. */
 #ifdef __cplusplus
-#include <atomic>
-using std::atomic_int;
-using std::atomic_uint;
+#define CELL_SYNC_ATOMIC_UINT unsigned
+#define CELL_SYNC_ATOMIC_INT  int
 #else
 #include <stdatomic.h>
+#define CELL_SYNC_ATOMIC_UINT atomic_uint
+#define CELL_SYNC_ATOMIC_INT  atomic_int
 #endif
+
+/* The implementation and the generated C++ table must agree on the field
+ * widths: a 4-byte lock-free atomic on the C side, the same 4 bytes on the C++
+ * side. */
+typedef char cell_sync_atomic_layout[
+    (sizeof(CELL_SYNC_ATOMIC_UINT) == 4 && sizeof(CELL_SYNC_ATOMIC_INT) == 4) ? 1 : -1];
 
 #ifdef __cplusplus
 extern "C" {
@@ -49,7 +58,7 @@ extern "C" {
  * CellSyncMutex -- 32-bit spinlock
  * -----------------------------------------------------------------------*/
 typedef struct CellSyncMutex {
-    atomic_uint lock;
+    CELL_SYNC_ATOMIC_UINT lock;
 } CellSyncMutex;
 
 s32 cellSyncMutexInitialize(CellSyncMutex* mutex);
@@ -61,9 +70,9 @@ s32 cellSyncMutexUnlock(CellSyncMutex* mutex);
  * CellSyncBarrier -- counter-based barrier
  * -----------------------------------------------------------------------*/
 typedef struct CellSyncBarrier {
-    atomic_uint arrived;
+    CELL_SYNC_ATOMIC_UINT arrived;
     u32         total;
-    atomic_uint phase;
+    CELL_SYNC_ATOMIC_UINT phase;
 } CellSyncBarrier;
 
 s32 cellSyncBarrierInitialize(CellSyncBarrier* barrier, u16 totalCount);
@@ -76,8 +85,8 @@ s32 cellSyncBarrierTryWait(CellSyncBarrier* barrier);
  * CellSyncRwm -- reader-writer memory
  * -----------------------------------------------------------------------*/
 typedef struct CellSyncRwm {
-    atomic_int  readers;
-    atomic_uint writer;
+    CELL_SYNC_ATOMIC_INT  readers;
+    CELL_SYNC_ATOMIC_UINT writer;
     u32         size;
     void*       buffer;
 } CellSyncRwm;
@@ -115,14 +124,14 @@ s32 cellSyncQueueClear(CellSyncQueue* queue);
 #define CELL_SYNC_LFQUEUE_DIR_POP   1
 
 typedef struct CellSyncLFQueue {
-    atomic_uint head;
-    atomic_uint tail;
-    atomic_uint count;
+    CELL_SYNC_ATOMIC_UINT head;
+    CELL_SYNC_ATOMIC_UINT tail;
+    CELL_SYNC_ATOMIC_UINT count;
     u32         depth;
     u32         elemSize;
     u8*         buffer;
     u32         direction;
-    atomic_uint lock;
+    CELL_SYNC_ATOMIC_UINT lock;
 } CellSyncLFQueue;
 
 s32 cellSyncLFQueueInitialize(CellSyncLFQueue* queue, void* buffer,

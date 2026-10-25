@@ -498,6 +498,17 @@ if(PS3RECOMP_BUILD_TESTS)
     add_test(NAME log_first COMMAND test_log_first)
     set_tests_properties(log_first PROPERTIES LABELS "runtime;t0")
 
+    # cellSync.h from C++, with <stdatomic.h> included first: the generated NID
+    # table includes the header that way and no other in-tree TU did, so this
+    # keeps the C++ spelling -- and the field layout both languages share --
+    # compiling (and it links nothing; the C file is the implementation).
+    add_executable(test_cell_sync_header tests/test_cell_sync_header.cpp)
+    target_include_directories(test_cell_sync_header PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/sync")
+    add_test(NAME cell_sync_header COMMAND test_cell_sync_header)
+    set_tests_properties(cell_sync_header PROPERTIES LABELS "hle;t0")
+
     # The sysPrxForUser CRT shims bound the guest spans they copy: a span that
     # leaves the arena is a named stop (hle-guest-range) raised before the copy,
     # not a write past guest memory. The fixture maps an arena with a PROT_NONE

@@ -115,7 +115,7 @@ extern "C" {
 ```
 
 **`C11 _Atomic in C++ file`**
-Some headers (e.g., `cellSync.h`) use C11 atomics incompatible with C++. Only include headers for modules you actually bridge — use stubs for the rest.
+`cellSync.h` is includable from C++: its atomic fields are plain 32-bit integers there (only the C implementation performs the atomic operations), and the header asserts that both spellings are the same four bytes. A header that includes `<stdatomic.h>` directly — `runtime/spu/spu_dma.h`, the SPU-side code — is C-only; `runtime/platform/win32_compat.h` uses the `__atomic` builtins to stay usable from both languages.
 
 ### Runtime Errors
 
