@@ -19,6 +19,7 @@
 #include "../../runtime/memory/reservation.h"
 #include "ps3emu/endian.h"
 #include "ps3emu/stop.h"
+#include "ps3emu/fw_divergence.h"
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -390,7 +391,7 @@ static s32 scheduler_init(u32 ea, u32 attr, int utility)
     if (rc) return rc;
     if (!tls_slot()) return (s32)CELL_FIBER_ERROR_NOSYSINIT;
     check_extensions(attr, 0, utility);
-    if (find_sched(ea)) return (s32)CELL_FIBER_ERROR_STAT;
+    if (find_sched(ea)) { PS3_FW_DIVERGENCE("F09"); return (s32)CELL_FIBER_ERROR_STAT; }
     Sched* s = calloc(1, sizeof *s);
     if (!s) return (s32)CELL_FIBER_ERROR_NOMEM;
     s->ea = ea; s->utility = utility; s->next = s_scheds; s_scheds = s;
@@ -466,9 +467,9 @@ static s32 create_fiber(u32 scheduler, u32 fiber, u32 entry, u64 arg, u32 priori
     range("CreateFiber", "fiber", fiber, CELL_FIBER_PPU_SIZE);
     range("CreateFiber", "entry", entry, 8); range("CreateFiber", "stack", stack, size);
     LOCK(); Sched* s = find_sched(scheduler);
-    if (!s) { UNLOCK(); return (s32)CELL_FIBER_ERROR_INVAL; }
-    if (utility != s->utility) { UNLOCK(); return (s32)CELL_FIBER_ERROR_STAT; }
-    if (find_fiber(fiber)) { UNLOCK(); return (s32)CELL_FIBER_ERROR_STAT; }
+    if (!s) { PS3_FW_DIVERGENCE("F19"); UNLOCK(); return (s32)CELL_FIBER_ERROR_INVAL; }
+    if (utility != s->utility) { PS3_FW_DIVERGENCE("F20"); UNLOCK(); return (s32)CELL_FIBER_ERROR_STAT; }
+    if (find_fiber(fiber)) { PS3_FW_DIVERGENCE("F21"); UNLOCK(); return (s32)CELL_FIBER_ERROR_STAT; }
     Fiber* f = calloc(1, sizeof *f);
     if (!f) { UNLOCK(); return (s32)CELL_FIBER_ERROR_NOMEM; }
     f->ea = fiber; f->opd = entry; f->arg = arg; f->stack_ea = stack; f->stack_size = size;
@@ -545,7 +546,7 @@ s32 cellFiberPpuWaitSignal(void)
     SignalOp op = {f->ea, 1, 0, 0};
     resv_host_rmw(f->ea, signal_rmw, &op);
     /* fw libfiber 0x020034C0 */
-    if (op.invalid) { UNLOCK(); return (s32)CELL_FIBER_ERROR_STAT; }
+    if (op.invalid) { PS3_FW_DIVERGENCE("F23-wait-invalid"); UNLOCK(); return (s32)CELL_FIBER_ERROR_STAT; }
     if (op.transition) f->state = F_WAIT_SIGNAL;
     UNLOCK();
     if (op.transition) host_yield(f);
@@ -666,7 +667,7 @@ s32 cellFiberPpuUtilWorkerControlWakeup(u32 ea)
     s32 rc = control_check(ea); if (rc) return rc;
     LOCK(); Sched* s = find_sched(ea);
     /* fw libfiber 0x02005374 */
-    if (!s || !s->utility) { UNLOCK(); return (s32)CELL_FIBER_ERROR_STAT; }
+    if (!s || !s->utility) { PS3_FW_DIVERGENCE("F32-wakeup-unknown"); UNLOCK(); return (s32)CELL_FIBER_ERROR_STAT; }
     const u64 old = ld64(ea + 0x200);
     /* 02005368 permits the old-SDK inactive wake path through 0x2FFFFF. */
     if (!(old & WORKER_ACTIVE) && ld32(ea + 0x28C) > 0x2FFFFF) { UNLOCK(); return (s32)CELL_FIBER_ERROR_STAT; }
@@ -680,12 +681,12 @@ s32 cellFiberPpuUtilWorkerControlRunFibers(u32 ea)
 {
     s32 rc = control_check(ea); if (rc) return rc;
     /* fw libfiber 0x02000810 */
-    if (t_cur) return (s32)CELL_FIBER_ERROR_PERM;
+    if (t_cur) { PS3_FW_DIVERGENCE("F33-perm"); return (s32)CELL_FIBER_ERROR_PERM; }
     LOCK(); Sched* s = find_sched(ea);
     /* fw libfiber 0x02004EBC */
     if (!s || !s->utility || !(ld64(ea + 0x200) & WORKER_ACTIVE)) { UNLOCK(); return (s32)CELL_FIBER_ERROR_STAT; }
     /* fw libfiber 0x020007E8 */
-    if (!tls_slot()) { UNLOCK(); return (s32)CELL_FIBER_ERROR_NOSYSINIT; }
+    if (!tls_slot()) { PS3_FW_DIVERGENCE("F33-nosysinit"); UNLOCK(); return (s32)CELL_FIBER_ERROR_NOSYSINIT; }
     u64 state = ld64(ea + 0x200);
     /* fw libfiber 0x02004EC4 */
     if ((state >> 56) > 32) { UNLOCK(); return (s32)CELL_FIBER_ERROR_AGAIN; }

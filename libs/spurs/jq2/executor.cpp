@@ -29,6 +29,7 @@
 #include "memory/reservation.h"
 #include "ps3emu/endian.h"
 #include "ps3emu/stop.h"
+#include "ps3emu/fw_divergence.h"
 #include "spu/spu_context.h"
 #include "spu/spu_interp.h"
 #include "spu/spu_workload.h"
@@ -1027,7 +1028,12 @@ std::int32_t enqueue(Queue& q, std::uint32_t port_ea, const Entry& entry, bool a
             q.counters().pushed.fetch_add(1);
             return 0;
         }
-        if (r.error == PushError::ring_full) return static_cast<std::uint32_t>(JQ2_ERR_AGAIN);
+        if (r.error == PushError::ring_full) {
+            /* FW 4.93 libspurs_jq ring writer: a full ring returns A01 only with flags bit 2; otherwise
+             * the pusher waits for room. Counted until the blocking path exists. */
+            PS3_FW_DIVERGENCE("JQ-S15");
+            return static_cast<std::uint32_t>(JQ2_ERR_AGAIN);
+        }
         stop_with(PS3_STOP_JQ2_STATE, "the ring writer refused an entry the executor had validated",
                   "An executor invariant broke; this is a bug in the executor.",
                   {hex("queue", q.ea()), dec("error", static_cast<unsigned>(r.error)),
@@ -1076,6 +1082,10 @@ PushCheck check_push(std::uint32_t port, std::uint32_t descriptor, std::uint32_t
     } else if (tag > 15) {
         c.error = JQ2_ERR_INVAL;
     } else if (const auto code = size_code_of(size); !code || size > c.port.queue->max_descriptor()) {
+        /* FW 4.93 libspurs_jq PushBodyInternal accepts 64 and every multiple of 128 up to the queue's
+         * max descriptor; this HLE encodes only 64/128/256. */
+        if (!code && (size == 64 || size % 128 == 0) && size <= c.port.queue->max_descriptor())
+            PS3_FW_DIVERGENCE("JQ-S05");
         c.error = JQ2_ERR_INVAL;
     } else {
         c.code = *code;

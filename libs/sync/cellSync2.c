@@ -16,6 +16,7 @@
 #include "../../runtime/memory/reservation.h"
 #include "ps3emu/endian.h"
 #include "ps3emu/stop.h"
+#include "ps3emu/fw_divergence.h"
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -604,6 +605,10 @@ s32 cellSync2SemaphoreRelease(u32 sem, u32 count, u32 notifierConfig)
     u32 fiber = 0;
     s32 rc = sem_front(__func__, sem, notifierConfig, &fiber);
     if (rc) return rc;
+    /* FW 4.93 libsync2 Release (0x02004D08..0x02004D60): with no notifier config, thread types the default
+     * notifiers (types 1, 2, 4, 8) do not cover fail with 0x80410C13 before the count bound. The HLE
+     * accepts them; counted until a title is seen to reach it. */
+    if (sem_rd16(sem + 0x20) & 0xF0u) PS3_FW_DIVERGENCE("S25");
     /* fw libsync2 0x02004D6C */
     if (count > 0x7FFFFF) return CELL_SYNC2_ERROR_INVAL;
     if (!count) return CELL_OK;
