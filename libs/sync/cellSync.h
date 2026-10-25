@@ -11,7 +11,18 @@
 #include "ps3emu/ps3types.h"
 #include "ps3emu/error_codes.h"
 
+/* The generated C++ NID table (smoke/ppu_hle_nids.cpp) includes this header.
+ * libstdc++'s <stdatomic.h> declares atomic_uint for C++ only from C++23 on,
+ * and the tree is C++20, so C++ takes the std:: names, as fw_divergence.h
+ * does. They have the same size and lock-free representation as the C11 types
+ * the C implementation uses. */
+#ifdef __cplusplus
+#include <atomic>
+using std::atomic_int;
+using std::atomic_uint;
+#else
 #include <stdatomic.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {
