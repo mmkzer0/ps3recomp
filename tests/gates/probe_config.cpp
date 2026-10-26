@@ -48,6 +48,12 @@ static void print_options()
             std::printf("%u", ps3_cfg_trophy_register_wait_cap_vblanks());
         else if (!std::strcmp(o->section, "video") && !std::strcmp(o->key, "resolutions"))
             std::printf("\"%s\"", ps3_cfg_video_resolutions());
+        else if (!std::strcmp(o->section, "video") && !std::strcmp(o->key, "rsx_capture"))
+            std::printf("%s", ps3_cfg_video_rsx_capture() ? "true" : "false");
+        else if (!std::strcmp(o->section, "video") && !std::strcmp(o->key, "rsx_capture_dir"))
+            std::printf("\"%s\"", ps3_cfg_video_rsx_capture_dir());
+        else if (!std::strcmp(o->section, "video") && !std::strcmp(o->key, "rsx_capture_frames"))
+            std::printf("%u", ps3_cfg_video_rsx_capture_frames());
         else if (!std::strcmp(o->section, "title") && !std::strcmp(o->key, "elf_sha256"))
             std::printf("\"%s\"", ps3_cfg_title_elf_sha256());
         else if (!std::strcmp(o->section, "diag") && !std::strcmp(o->key, "dump_config"))

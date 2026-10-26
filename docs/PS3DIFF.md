@@ -328,3 +328,94 @@ zero overlap) are derived from those fixtures in the test.
 The local T1 check additionally round-trips every
 `odin-sphere-m0/fw/trace/*.ndjson` (3,490 call + 3,485 ret records) and
 compares the result byte for byte; those traces never enter this repository.
+
+---
+
+## `ps3diff.rsx/1`: an RSX capture
+
+A sibling schema in the same package for slice H1b (M3): the command stream the RSX
+consumed and every guest-memory input it consumed with it, recorded at the moment of
+consumption. The envelope rules are event/2's (strict fields, strictly increasing `seq`,
+contiguous `ctx_seq`, canonical JSON, `ctx` `{"kind":"ppu","id":"rsx"}`), with one
+difference: `t` is the constant `0.0`, because a wall clock would make two captures of the
+same inputs differ. Producer: `libs/video/rsx_capture.cpp`, enabled by `video.rsx_capture`
+(`docs/CONFIG.md`). Validator and comparison: `tools/ps3diff/rsx.py`.
+
+A capture is a directory: `capture.ndjson` (written through `capture.ndjson.partial` and
+renamed when it closes; no tool accepts the `.partial`) and `blobs/sha256/<2 hex>/<sha256>`
+(content-addressed, written once). Only a **clean-reset** capture exists: it starts at
+`cellGcmSetupContext`, and a FIFO step before any `gcm-init` is the stop `rsx-capture`
+(`reason=midstream`); `bootstrap.mode` is `"clean-reset"` and nothing else validates.
+
+### Events
+
+| Event | Input? | Fields beyond the envelope |
+|---|---|---|
+| `capture-start` | yes | `bootstrap`, `producer` |
+| `environment` | no | `machine`: `gpu macos metal build glslang spirv_cross toolkit_sha title_sha` |
+| `gcm-init` | yes | `cmd_size io_size io_ea` |
+| `gcm-state` | yes | `op`: `io-map`/`io-unmap` (`ea io size`), `display-buffer` (`id offset pitch width height`) |
+| `fifo-method` | yes | `get put call_ret subchannel type count method bound binds reads writes` |
+| `fifo-branch` | yes | `get put call_ret kind` (`jump`/`call`/`ret`) `target reads writes` |
+| `fifo-word` | yes | `get put call_ret reads writes`: a flip marker or a word the walker skips |
+| `fifo-nop` | yes | `get put call_ret words reads writes`: a run of zero words |
+| `draw` | no | `outcome reason fixed_function state_hash` |
+| `frame-complete` | no | `frame capture_hash state_hash frame_hash readback draws unknown_methods resyncs valid invalid` |
+| `capture-end` | no | `frames events capture_hash` |
+
+A FIFO event is one step of the walker, in the order the walker took it, never the order of
+the ring: `get` is the IO offset the step starts at, `put` the pass's PUT, `call_ret` the
+one-deep CALL return slot before the step. The validator walks the steps and refuses a step
+that is not where the previous one left the walker, a CALL while one is outstanding, a RET
+with none, and a branch target or `get` with no IO mapping. A semaphore acquire that is still
+waiting is not an event: the walker reads it again on the next pass.
+
+A blob reference is `{ea, location, size, sha256, consume_seq}` plus optional `offset` (the
+RSX offset) and `kind`. `consume_seq` is one global ordinal over reads and writes, strictly
+increasing across events. `reads` are what the step consumed (the packet words as `fifo`
+reads, a label, vertex, index, texture and fragment-program spans, 2D transfer sources);
+`writes` are what the RSX wrote (a label release, a report). Two reads of one event that
+disagree on the same bytes are the stop `rsx-capture` (`reason=read-conflict`): a replay
+writes every blob of an event before it runs the event. A missing blob, a blob whose bytes do
+not hash to its name and a blob of the wrong size are each named by `validate`.
+
+### Three hashes
+
+| Hash | Scope | Meaning |
+|---|---|---|
+| `capture_hash` | `input-events/v1` | SHA-256 of the canonical lines of the input events so far, newline included: it binds every blob hash. The `environment` event is not in it. |
+| `state_hash` | `frame-state/v1` (a draw: `draw-state/v1`) | The register file, transform program, constants, subchannel bindings and fragment-program digest at each draw, chained, then the register file at the flip. |
+| `frame_hash` | `raw-readback/v1` | SHA-256 of the unmodified readback bytes. |
+
+The readback descriptor is `{format, channel_order, row_pitch, alpha, colorspace, clamp,
+width, height}`: `format` is `rgba8-unorm`, `rgba16-float` or `rgba32-float`, `alpha` is
+`kept`, `clamp` is `none`, `colorspace` is the pixel format's transfer function. The bytes are
+read only after the command buffer completed. A presented surface in any other format is the
+stop `rsx-capture` (`reason=readback-format`), never a skipped frame.
+
+### Frames
+
+A frame is a flip head, identified by `{flip_id, guest_frame, display_buffer}` (plus
+`present_seq`). `flip_id` is the zero-based ordinal of `0xE924` heads with bit 31, as C3 counts
+`GcmFlipHead`; `guest_frame` is the zero-based ordinal of the `0xE944` queue words
+(`GcmQueueFlip`) the head presents, `null` when it had none. A head is presented about three
+times; the frame is the first. `draws` obeys `submitted = executed + sum(dropped)` and
+`valid` is true exactly when `invalid` is empty: any dropped draw (`dropped-draws`), a draw on
+the built-in pipeline (`fixed-function`), a walker recovery that dropped commands
+(`fifo-resync`), unknown methods (`unknown-methods`), a head with no queued flip
+(`no-queued-flip`) or a missing readback makes the frame invalid. A frame that hides one of
+these is refused by `validate`.
+
+### Commands
+
+```
+python3 tools/ps3diff.py validate captures/h1/capture.ndjson
+python3 tools/ps3diff.py rsx-compare a/capture.ndjson b/capture.ndjson [--flip N] [--json]
+```
+
+`rsx-compare` pairs frames by `flip_id` and compares identity, then `capture_hash`,
+`state_hash`, the readback descriptor and `frame_hash`, in that order, so a divergence is
+looked for in the inputs, then the state, then the pixels. Exit status: 0 equal on at least one
+frame; 1 a frame differs or is invalid; 2 data or schema error; 3 zero frames compared (an
+error); 4 the environment records differ: **not comparable**, neither a pass nor a failure.
+Byte equality holds only on equal GPU, macOS, Metal, build and translator versions.

@@ -74,6 +74,11 @@ HARNESS = r'''
 #define GCM_IO_PAGES %s
 typedef struct { u32 ioAddress, ioSize; } CellGcmConfig;
 static CellGcmConfig s_config = { 0x100000u, 0x200000u };
+/* The extracted offset-table code reports each change to the RSX capture when one is open (rsx_capture.h);
+ * none is, here. */
+typedef struct { void (*io_map)(u32 mapped, u32 ea, u32 io, u32 size); } cap_sink;
+static const cap_sink* s_cap;
+static int s_cap_quiet;
 typedef struct IoMapping { u32 ea; u32 io; u32 size; int active; } IoMapping;
 static IoMapping s_io_mappings[CELL_GCM_MAX_IO_MAPPINGS];
 static int s_io_mapping_count = 0;

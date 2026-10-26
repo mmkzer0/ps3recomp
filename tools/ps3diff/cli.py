@@ -8,6 +8,7 @@ import sys
 
 from .convert import convert_file
 from .diff import diff_files, report_text
+from .rsx import SCHEMA_RSX, compare_files, report_text as rsx_report_text, validate_rsx
 from .schema import (
     Ps3DiffError,
     context_keys,
@@ -25,6 +26,7 @@ _EXAMPLES_VALIDATE = """\
 examples:
   ps3diff validate trace.v2.ndjson
   ps3diff validate trace.ndjson                # event/1 is checked too
+  ps3diff validate captures/h1/capture.ndjson  # ps3diff.rsx/1, blobs checked
 """
 _EXAMPLES_DIFF = """\
 examples:
@@ -32,6 +34,14 @@ examples:
   ps3diff diff ref.v2.ndjson new.v2.ndjson --json
   ps3diff diff ref.v2.ndjson new.v2.ndjson --mask odin.mask.json
   ps3diff diff ref.v2.ndjson new.v2.ndjson --ctx-map threads.json
+"""
+_EXAMPLES_RSX_COMPARE = """\
+examples:
+  ps3diff rsx-compare capture.ndjson replay/capture.ndjson
+  ps3diff rsx-compare capture.ndjson replay/capture.ndjson --flip 99 --json
+
+exit status: 0 equal, 1 a frame differs or is invalid, 2 data or schema error,
+3 nothing was compared (an error), 4 the environment records differ (not comparable).
 """
 
 
@@ -43,7 +53,7 @@ def _parser() -> argparse.ArgumentParser:
                "rpcs3-gdb-trace.event/1. See docs/PS3DIFF.md.",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True,
-                                metavar="{convert,validate,diff}")
+                                metavar="{convert,validate,diff,rsx-compare}")
 
     convert = sub.add_parser(
         "convert", help="convert between event/1 and event/2",
@@ -84,6 +94,19 @@ def _parser() -> argparse.ArgumentParser:
     diff.add_argument("--json", action="store_true",
                       help="print the report as JSON")
     diff.set_defaults(func=_cmd_diff)
+
+    rsx = sub.add_parser(
+        "rsx-compare", help="compare two ps3diff.rsx/1 captures frame by frame",
+        description="Validate both captures, then compare the frames they share by flip_id: identity, "
+                    "capture hash (inputs), state hash, readback descriptor and frame hash (pixels), "
+                    "in that order. Differing environment records are 'not comparable', never a pass "
+                    "or a failure; zero compared frames is an error.",
+        epilog=_EXAMPLES_RSX_COMPARE, formatter_class=argparse.RawDescriptionHelpFormatter)
+    rsx.add_argument("a", metavar="A", help="reference capture (capture.ndjson)")
+    rsx.add_argument("b", metavar="B", help="candidate capture (capture.ndjson)")
+    rsx.add_argument("--flip", type=int, metavar="N", help="compare only the frame with this flip_id")
+    rsx.add_argument("--json", action="store_true", help="print the report as JSON")
+    rsx.set_defaults(func=_cmd_rsx_compare)
     return parser
 
 
@@ -94,12 +117,28 @@ def _cmd_convert(args: argparse.Namespace) -> int:
 
 def _cmd_validate(args: argparse.Namespace) -> int:
     entries = read_ndjson(args.file)
+    if entries and entries[0][2].get("schema") == SCHEMA_RSX:
+        cap = validate_rsx(args.file, entries)
+        print(f"{args.file}: valid: {len(entries)} records, {len(cap.frames)} frames, "
+              f"{sum(1 for f in cap.frames if f['valid'])} valid ({SCHEMA_RSX})")
+        return 0
     schema = validate_entries(args.file, entries)
     contexts = context_keys(schema, [rec for _, _, rec in entries])
     state = schema if schema is not None else "empty"
     print(f"{args.file}: valid: {len(entries)} records, "
           f"{len(contexts)} contexts ({state})")
     return 0
+
+
+def _cmd_rsx_compare(args: argparse.Namespace) -> int:
+    report, status = compare_files(args.a, args.b, args.flip)
+    if args.json:
+        print(json.dumps(report, indent=1, ensure_ascii=False))
+    else:
+        print(rsx_report_text(report))
+    if status == 3:
+        print("ps3diff: error: " + report["error"], file=sys.stderr)
+    return status
 
 
 def _cmd_diff(args: argparse.Namespace) -> int:

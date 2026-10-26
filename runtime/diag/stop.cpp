@@ -378,4 +378,17 @@ void ps3_stop_spurs_dispatch_miss(const char* api, uint32_t owner_ea, int32_t ta
              f, n, site);
 }
 
+void ps3_stop_rsx_capture(const char* func, const char* reason, const char* detail)
+{
+    const ps3_stop_field f[] = {
+        {"func", func ? func : "unknown"},
+        {"reason", reason ? reason : "unknown"},
+        {"detail", detail ? detail : ""},
+    };
+    ps3_stop(PS3_STOP_RSX_CAPTURE,
+             "an RSX capture or replay cannot be trusted: continuing would write or replay a capture that only looks complete",
+             "Fix the named cause (docs/PS3DIFF.md, \"ps3diff.rsx/1\") and capture again; a capture that stopped is never a baseline.",
+             f, sizeof f / sizeof f[0], nullptr);
+}
+
 } // extern "C"

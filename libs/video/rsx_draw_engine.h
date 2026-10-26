@@ -94,6 +94,7 @@ typedef struct rsx_be_render_state {
 #define RSX_BE_FLUSH_VERTEX_RING     0
 #define RSX_BE_FLUSH_GUEST_REFERENCE 1
 #define RSX_BE_FLUSH_SHUTDOWN        2
+#define RSX_BE_FLUSH_CAPTURE         3   /* a capture is about to read the presented frame */
 
 /* clear_depth_stencil flags */
 #define RSX_BE_CLEAR_DEPTH   0x1u
@@ -235,6 +236,11 @@ typedef struct rsx_draw_backend {
      * engine owns the returned handle and releases it with texture_release.
      * 0 rejects the consuming draw; NULL retains the legacy guest-upload route. */
     u32 (*color_snapshot)(void* user, u32 surface);
+    /* Optional. 1 when the last submit completed without an error, a dropped
+     * record or an encoding failure. A capture reads a frame back only when
+     * this says the work that produced it ran; NULL means the backend cannot
+     * say, and the capture then marks the frame unreadable. */
+    int (*last_commit_ok)(void* user);
 
     /* Optional. 3D textures (SET_TEXTURE_FORMAT dimension 3, CONTROL3 depth):
      * a volume of `depth` slices per level, each slice one upload of decoded
@@ -360,12 +366,22 @@ u32 rsx_draw_engine_pipeline_failures(rsx_pipeline_failure* out, u32 max);
  *                  the same FIFO order. RSX_FRAME_NO_FLIP before the first.
  *   present_seq    0-based ordinal of this engine present (the counter the
  *                  dump files are named by).
+ *   guest_frame    0-based ordinal of the queued flip (each 0xE944 word, the
+ *                  GcmQueueFlip event) that the most recent flip head
+ *                  presents; RSX_FRAME_NO_FLIP while a head has had none. The
+ *                  engine counts the 0xE944 words it is fed, in walker order,
+ *                  like flip_id, so a flip queued some other way (the 0xFEAD
+ *                  marker, the SetFlip HLE) has no guest_frame.
  *   display_buffer the display buffer id this present used (0..7).
+ *
+ * The contract triple a capture carries is {flip_id, guest_frame,
+ * display_buffer}; present_seq is an extra.
  */
 #define RSX_FRAME_NO_FLIP 0xFFFFFFFFu
 
 typedef struct {
     u32 flip_id;
+    u32 guest_frame;
     u32 present_seq;
     u32 display_buffer;
 } rsx_frame_identity;

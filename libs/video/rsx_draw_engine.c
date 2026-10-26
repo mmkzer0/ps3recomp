@@ -24,6 +24,7 @@
 #include <time.h>
 #include <stdatomic.h>
 #include "ps3emu/log_first.h"
+#include "rsx_capture.h"
 
 /* Guest memory and the RSX offset resolvers, declared the way every backend
  * that reads guest data declares them (rsx_vertex_fetch.h). */
@@ -37,6 +38,20 @@ u32 cellGcmResolveIO(u32 offset);
 /* The guest VM's OOB guard: the size a host backed, or 0 for "the whole 32-bit
  * space is backed and no check is needed" (runtime/memory/vm.h). */
 extern u32 ppu_vm_size;
+
+/* The RSX capture (rsx_capture.h): NULL unless rsx_capture.cpp registered it,
+ * so a run without capture pays one pointer test per hook. */
+static const rsx_capture_sink* s_capture;
+void rsx_draw_engine_set_capture_sink(const rsx_capture_sink* sink) { s_capture = sink; }
+/* What the next captured guest read is for (rsx_cap_read_kind): set around the
+ * few call sites that know, reset to "other" after. */
+static u32 s_read_kind;
+/* The draw in progress ran the built-in pipeline (handed to the capture). */
+static u32 s_cap_fixed;
+/* The flip head the capture last wrote a frame for: a head is presented about
+ * three times (0xE944, 0xE924, 0xE920), and only the first is its frame. */
+static u32 s_cap_last_flip = 0xFFFFFFFFu;
+static void eng_cap_draw(u32 executed, u32 reason);
 
 /* ------------------------------------------------------------------------- */
 
@@ -239,6 +254,7 @@ static void eng_drop(rsx_drop_reason reason)
     if (eng_is_pow2(n))
         fprintf(stderr, "[rsx-drop] reason=%s count=%llu\n",
                 rsx_drop_reason_name(reason), n);
+    eng_cap_draw(0, (u32)reason);
 }
 
 static void eng_submitted(void)
@@ -249,6 +265,7 @@ static void eng_submitted(void)
 static void eng_executed(void)
 {
     atomic_fetch_add_explicit(&s_executed, 1, memory_order_relaxed);
+    eng_cap_draw(1, 0);
 }
 
 void rsx_draw_engine_draw_stats(rsx_draw_engine_stats* out)
@@ -329,6 +346,10 @@ u32 rsx_draw_engine_pipeline_failures(rsx_pipeline_failure* out, u32 max)
  * engine is fed that word in the same walker order, so its count is that
  * ordinal. */
 static u32 s_flip_heads;
+/* The queued flips (0xE944 words) seen so far, and the one the latest flip
+ * head presents: the identity's guest_frame. */
+static u32 s_queue_flips;
+static u32 s_head_guest_frame = RSX_FRAME_NO_FLIP;
 /* The buffer the guest queued (0xE944) for the flip in progress: the head's own
  * word is a command (0x8000010F), not a buffer id, so the queued one is what
  * names the scanout. */
@@ -343,6 +364,7 @@ static _Atomic unsigned s_identity_seq;
 static _Atomic u32 s_identity_flip;
 static _Atomic u32 s_identity_present;
 static _Atomic u32 s_identity_buffer;
+static _Atomic u32 s_identity_guest;
 static _Atomic int s_identity_valid;
 
 static u32 eng_last_flip_id(void)
@@ -350,11 +372,12 @@ static u32 eng_last_flip_id(void)
     return s_flip_heads ? s_flip_heads - 1u : RSX_FRAME_NO_FLIP;
 }
 
-static void eng_identity_publish(u32 flip_id, u32 present_seq, u32 buffer)
+static void eng_identity_publish(u32 flip_id, u32 guest_frame, u32 present_seq, u32 buffer)
 {
     const unsigned s = atomic_load_explicit(&s_identity_seq, memory_order_relaxed);
     atomic_store_explicit(&s_identity_seq, s + 1u, memory_order_relaxed);
     atomic_store_explicit(&s_identity_flip, flip_id, memory_order_relaxed);
+    atomic_store_explicit(&s_identity_guest, guest_frame, memory_order_relaxed);
     atomic_store_explicit(&s_identity_present, present_seq, memory_order_relaxed);
     atomic_store_explicit(&s_identity_buffer, buffer, memory_order_relaxed);
     atomic_store_explicit(&s_identity_valid, 1, memory_order_relaxed);
@@ -368,11 +391,13 @@ int rsx_draw_engine_frame_identity(rsx_frame_identity* out)
         const unsigned s1 = atomic_load_explicit(&s_identity_seq, memory_order_acquire);
         if (!(s1 & 1u)) {
             const u32 flip = atomic_load_explicit(&s_identity_flip, memory_order_relaxed);
+            const u32 guest = atomic_load_explicit(&s_identity_guest, memory_order_relaxed);
             const u32 seq = atomic_load_explicit(&s_identity_present, memory_order_relaxed);
             const u32 buf = atomic_load_explicit(&s_identity_buffer, memory_order_relaxed);
             if (atomic_load_explicit(&s_identity_seq, memory_order_acquire) == s1) {
                 if (out) {
                     out->flip_id = flip;
+                    out->guest_frame = guest;
                     out->present_seq = seq;
                     out->display_buffer = buf;
                 }
@@ -447,8 +472,13 @@ void rsx_draw_engine_set_guest_memory(rsx_vertex_guest_ptr_fn reader, void* user
     s_guest_user = user;
 }
 
-static const u8* eng_guest_ptr(void* user, u32 location, u32 offset,
-                               u32 min_bytes)
+/* The span, resolved and range-checked, as a pointer into guest memory. Reads
+ * that only look (revalidation hashes) and writes go through this; what the
+ * draw consumes goes through eng_guest_ptr, which a capture answers with its
+ * immutable copy. The bound is the host's backed size, or all 4 GiB: a span
+ * that would wrap past the top is refused, never folded back to 0. */
+static const u8* eng_guest_ptr_raw(void* user, u32 location, u32 offset,
+                                   u32 min_bytes)
 {
     (void)user;
     if (!min_bytes || min_bytes > (256u << 20)) return NULL;
@@ -456,8 +486,19 @@ static const u8* eng_guest_ptr(void* user, u32 location, u32 offset,
     if (!vm_base) return NULL;
     const u32 ea = cellGcmResolveLocated(location == RSX_LOCATION_LOCAL, offset);
     if (!ea) return NULL;
-    if (ppu_vm_size && (u64)ea + min_bytes > ppu_vm_size) return NULL;
+    const u64 limit = ppu_vm_size ? (u64)ppu_vm_size : 0x100000000ull;
+    if ((u64)ea + min_bytes > limit) return NULL;
     return vm_base + ea;
+}
+
+static const u8* eng_guest_ptr(void* user, u32 location, u32 offset,
+                               u32 min_bytes)
+{
+    const u8* p = eng_guest_ptr_raw(user, location, offset, min_bytes);
+    if (!p || !s_capture) return p;
+    const u32 ea = s_guest_reader ? offset
+        : cellGcmResolveLocated(location == RSX_LOCATION_LOCAL, offset);
+    return s_capture->read(location, offset, ea, p, min_bytes, s_read_kind);
 }
 
 static u64 eng_fnv1a(const void* data, u32 n, u64 hash)
@@ -998,7 +1039,7 @@ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 
                 eng_nonzero_pixels(rows, n * h, bpp));
     const int rgba = rsx_texture_argb_is_rgba();
     for (u32 r = 0; r < h; r++) {
-        u8* dst = (u8*)eng_guest_ptr(NULL, location, offset + r * pitch, bytes);
+        u8* dst = (u8*)eng_guest_ptr_raw(NULL, location, offset + r * pitch, bytes);
         if (!dst) return;
         u8* src = rows + (size_t)r * n * bpp;
         if (bpp == 8u) {
@@ -1184,7 +1225,7 @@ static void eng_deswizzle_3d_slice(u8* dst, const u8* src, u32 w, u32 h, u32 d, 
 static u64 eng_texture_content_hash(u32 location, u32 offset, u32 span,
                                     int* readable)
 {
-    const u8* src = span ? eng_guest_ptr(NULL, location, offset, span) : NULL;
+    const u8* src = span ? eng_guest_ptr_raw(NULL, location, offset, span) : NULL;
     if (!src) { *readable = 0; return 0; }
     u64 hash = 1469598103934665603ull;
     u32 i = 0;
@@ -1210,7 +1251,7 @@ static u64 eng_texture_content_hash(u32 location, u32 offset, u32 span,
 static u64 eng_texture_sparse_hash(u32 location, u32 offset, u32 span,
                                    int* readable)
 {
-    const u8* src = span ? eng_guest_ptr(NULL, location, offset, span) : NULL;
+    const u8* src = span ? eng_guest_ptr_raw(NULL, location, offset, span) : NULL;
     if (!src) { *readable = 0; return 0; }
     u64 hash = 1469598103934665603ull;
     for (u32 i = 0; i + 64 <= span; i += ENG_TEXHASH_STRIDE)
@@ -1262,7 +1303,9 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     if (depth > 1 && !cube && g.be->texture_create_3d && g.be->texture_upload_3d &&
         !lv[0].tl.compressed && lv[0].tl.bytes_per_texel) {
         const u32 span = eng_texture_span_3d(fmt, w, h, depth, levels, pitch);
+        s_read_kind = RSX_CAP_READ_TEXTURE;
         const u8* src = eng_guest_ptr(NULL, location, offset, span);
+        s_read_kind = RSX_CAP_READ_OTHER;
         if (!src) return 0;
         const u32 handle = g.be->texture_create_3d(g.be->user, eng_texfmt(lv[0].tl.fmt),
                                                    w, h, depth, nlv, remap, fmt);
@@ -1300,7 +1343,9 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     const u32 face_stride = cube
         ? rsx_texture_cube_face_stride(fmt, w, h, levels, pitch) : 0u;
     const u32 span = eng_texture_span(fmt, w, h, levels, pitch, cube);
+    s_read_kind = RSX_CAP_READ_TEXTURE;
     const u8* src = eng_guest_ptr(NULL, location, offset, span);
+    s_read_kind = RSX_CAP_READ_OTHER;
     if (!src) return 0;
 
     const u32 handle = g.be->texture_create(g.be->user, eng_texfmt(lv[0].tl.fmt),
@@ -1492,7 +1537,7 @@ static int eng_zdepth_to_guest(u32 slot)
                              w * (u32)sizeof(float)) != 0)
         return 0;
     for (u32 r = 0; r < h; r++) {
-        u8* dst = (u8*)eng_guest_ptr(NULL, z->location, z->offset + r * z->pitch, w * bpp);
+        u8* dst = (u8*)eng_guest_ptr_raw(NULL, z->location, z->offset + r * z->pitch, w * bpp);
         if (!dst) return 0;
         const float* src = s_depth_rows + (size_t)r * w;
         for (u32 c = 0; c < w; c++) {
@@ -1655,9 +1700,16 @@ static int eng_guest_programs(const u8** out_vp, u32* out_vp_instrs,
     if (rsx_dsp_reg(&g.rsx, 0x08E4)) {
         u32 fp_loc = 0;
         const u32 fp_off = rsx_dsp_fragment_program(&g.rsx, &fp_loc);
-        fp_uc = eng_guest_ptr(NULL, fp_loc, fp_off, 16);
+        fp_uc = eng_guest_ptr_raw(NULL, fp_loc, fp_off, 16);
         fp_size = fp_uc ? rsx_fp_program_size(fp_uc, ENG_FP_MAX_BYTES) : 0;
-        if (fp_size) fp_uc = eng_guest_ptr(NULL, fp_loc, fp_off, fp_size);
+        if (fp_size) {
+            /* The size came from looking; what the draw translates is the
+             * span as consumed, and it must end where the look said it does. */
+            s_read_kind = RSX_CAP_READ_PROGRAM;
+            fp_uc = eng_guest_ptr(NULL, fp_loc, fp_off, fp_size);
+            s_read_kind = RSX_CAP_READ_OTHER;
+            if (fp_uc && s_capture && rsx_fp_program_size(fp_uc, fp_size) != fp_size) fp_uc = NULL;
+        }
         if (!fp_uc) fp_size = 0;
     }
 
@@ -2069,6 +2121,21 @@ static int dc_reserve_indices(u32 count)
     return 1;
 }
 
+static const u8* eng_guest_ptr_k(u32 kind, u32 location, u32 offset, u32 min_bytes)
+{
+    s_read_kind = kind;
+    const u8* p = eng_guest_ptr(NULL, location, offset, min_bytes);
+    s_read_kind = RSX_CAP_READ_OTHER;
+    return p;
+}
+
+/* The fetch plan's resolver: every span it asks for is vertex data. */
+static const u8* eng_guest_ptr_vertex(void* user, u32 location, u32 offset, u32 min_bytes)
+{
+    (void)user;
+    return eng_guest_ptr_k(RSX_CAP_READ_VERTEX, location, offset, min_bytes);
+}
+
 /* Turn this group's batches into a reference list, recording a CUT rather
  * than fetching a phantom vertex wherever the restart sentinel appears, then
  * collapse repeated references and fetch each unique vertex once.
@@ -2110,10 +2177,10 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
             const u8* run = NULL;
             if (count && start <= 0xFFFFFFFFull && bytes <= 0xFFFFFFFFull &&
                 start + bytes <= 0x100000000ull)
-                run = eng_guest_ptr(NULL, ia_loc, (u32)start, (u32)bytes);
+                run = eng_guest_ptr_k(RSX_CAP_READ_INDEX, ia_loc, (u32)start, (u32)bytes);
             for (u32 i = 0; i < count && dc.fetch_ok; i++) {
                 const u8* p = run ? run + (size_t)i * esz
-                    : eng_guest_ptr(NULL, ia_loc, ia.offset + (first + i) * esz, esz);
+                    : eng_guest_ptr_k(RSX_CAP_READ_INDEX, ia_loc, ia.offset + (first + i) * esz, esz);
                 if (!p) { dc.fetch_ok = 0; break; }
                 const u32 index = ia.is_u32
                     ? (((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3])
@@ -2143,7 +2210,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
     }
 
     dc.layout = *layout;
-    rsx_vertex_fetch_plan_init(&dc.fetch_plan, &g.rsx, layout, eng_guest_ptr, NULL);
+    rsx_vertex_fetch_plan_init(&dc.fetch_plan, &g.rsx, layout, eng_guest_ptr_vertex, NULL);
     rsx_vertex_fetch_plan_set_inline(&dc.fetch_plan, &g.rsx, dc.inl, dc.inl_bytes);
     rsx_vertex_fetch_plan_prepare(&dc.fetch_plan, dc.refs, dc.n_refs);
     if (!dc_reserve_verts((u64)dc.n_refs * layout->stride)) {
@@ -3012,6 +3079,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
     const u32 uploaded = indexed ? dc.n_verts : n_draw;
     g.be->draw(g.be->user, topology, dc.verts, uploaded, layout.stride,
                indexed ? g.indices : NULL, indexed ? n_draw : 0);
+    s_cap_fixed = pipeline_is_fixed ? 1u : 0u;
     eng_executed();
     /* Counted only when the draw ran the guest's OWN programs, which is what
      * the test hook means: a draw through the built-in pair is a draw, not
@@ -3105,6 +3173,61 @@ static u32 eng_present_surface(u32 buffer_id)
     return eng_current_surface();
 }
 
+/* One draw group's outcome, for the capture (rsx_capture.h). */
+static void eng_cap_draw(u32 executed, u32 reason)
+{
+    if (!s_capture) return;
+    s_capture->draw(&g.rsx, executed, reason,
+                    executed ? "" : rsx_drop_reason_name((rsx_drop_reason)reason),
+                    executed ? s_cap_fixed : 0u);
+    s_cap_fixed = 0;
+}
+
+/* The frame a flip head completes, read back after the GPU work that made it
+ * has run. A surface format the readback contract does not define is an error
+ * the capture raises, never a skipped frame. */
+static void eng_cap_frame(const rsx_frame_identity* fid, u32 slot)
+{
+    rsx_cap_frame f;
+    memset(&f, 0, sizeof f);
+    f.flip_id = fid->flip_id;
+    f.guest_frame = fid->guest_frame;
+    f.display_buffer = fid->display_buffer;
+    f.present_seq = fid->present_seq;
+    f.rsx = &g.rsx;
+    const eng_surface* s = &g.surfaces[slot];
+    u32 bpp = 0;
+    switch (s->fmt) {
+    case RSX_BE_FMT_R8G8B8A8:      f.format = "rgba8-unorm";   bpp = 4;  break;
+    case RSX_BE_FMT_R16G16B16A16F: f.format = "rgba16-float";  bpp = 8;  break;
+    case RSX_BE_FMT_R32G32B32A32F: f.format = "rgba32-float";  bpp = 16; break;
+    default: break;
+    }
+    f.surface_format = (u32)s->fmt;
+    u8* buf = NULL;
+    if (!bpp) {
+        f.readback = 1;
+    } else if (!g.be->readback || !g.be->submit_and_wait || !g.be->last_commit_ok || !s->w || !s->h) {
+        f.readback = 2;
+    } else {
+        g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_CAPTURE);
+        const u32 pitch = s->w * bpp;
+        if (!g.be->last_commit_ok(g.be->user)) {
+            f.readback = 3;
+        } else if (!(buf = (u8*)malloc((size_t)pitch * s->h))) {
+            f.readback = 2;
+        } else {
+            g.be->readback(g.be->user, s->handle, 0, 0, s->w, s->h, buf, pitch);
+            f.channel_order = "rgba";
+            f.colorspace = "linear";
+            f.width = s->w; f.height = s->h; f.row_pitch = pitch;
+            f.bytes = buf;
+        }
+    }
+    s_capture->frame(&f);
+    free(buf);
+}
+
 static void eng_present(u32 buffer_id)
 {
     if (!g.ready) return;
@@ -3116,9 +3239,10 @@ static void eng_present(u32 buffer_id)
      * command, not a buffer id. */
     rsx_frame_identity fid;
     fid.flip_id = eng_last_flip_id();
+    fid.guest_frame = s_head_guest_frame;
     fid.present_seq = g.frames;
     fid.display_buffer = s_queued_valid ? s_queued_buffer : (buffer_id & 7u);
-    eng_identity_publish(fid.flip_id, fid.present_seq, fid.display_buffer);
+    eng_identity_publish(fid.flip_id, fid.guest_frame, fid.present_seq, fid.display_buffer);
     char flip[16];
     eng_fmt_flip(flip, sizeof flip, fid.flip_id);
     if (getenv("PS3RECOMP_METAL_FRAME_DUMP") && g.frames % 120 == 0) {
@@ -3135,6 +3259,10 @@ static void eng_present(u32 buffer_id)
     pd_present(target, &fid);
     g.last_present_surface = target;
     g.be->present(g.be->user, g.surfaces[target].handle);
+    if (s_capture && fid.flip_id != RSX_FRAME_NO_FLIP && fid.flip_id != s_cap_last_flip) {
+        s_cap_last_flip = fid.flip_id;
+        eng_cap_frame(&fid, target);
+    }
     g.frames++;
     g.last_guest_draws = g.guest_draws;
     g.guest_draws = 0;
@@ -3209,6 +3337,10 @@ int rsx_draw_engine_init(u32 width, u32 height)
     s_flip_heads = 0;
     s_queued_buffer = 0;
     s_queued_valid = 0;
+    s_queue_flips = 0;
+    s_head_guest_frame = RSX_FRAME_NO_FLIP;
+    s_cap_last_flip = RSX_FRAME_NO_FLIP;
+    s_cap_fixed = 0;
     atomic_store_explicit(&s_identity_valid, 0, memory_order_relaxed);
     atomic_store_explicit(&s_identity_seq, 0, memory_order_relaxed);
     /* Display buffers the title registered before the backend came up. */
@@ -3262,8 +3394,12 @@ void rsx_draw_engine_method(u32 method, u32 arg)
     if (m == 0xE944u) {                 /* the queue flip names the scanout */
         s_queued_buffer = arg & 7u;
         s_queued_valid = 1;
+        s_queue_flips++;
     }
-    if (m == 0xE924u && (arg & 0x80000000u)) s_flip_heads++;
+    if (m == 0xE924u && (arg & 0x80000000u)) {
+        s_flip_heads++;
+        s_head_guest_frame = s_queue_flips ? s_queue_flips - 1u : RSX_FRAME_NO_FLIP;
+    }
     rsx_dispatch_method(&g.rsx, m, arg);
 }
 

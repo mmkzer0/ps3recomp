@@ -121,7 +121,9 @@ extern "C" {
     /* A SPURS task the taskset policy module cannot load: the kernel halts the SPU. */ \
     X(SPURS_TASK_HALT,          "spurs-task-halt")                             \
     /* A SPURS task or job whose SPU program the runtime cannot run (no lifted entry). */ \
-    X(SPURS_DISPATCH_MISS,      "spurs-dispatch-miss")
+    X(SPURS_DISPATCH_MISS,      "spurs-dispatch-miss")                         \
+    /* H1b: an RSX capture or replay that cannot be trusted (a blob, a span, an output). */ \
+    X(RSX_CAPTURE,              "rsx-capture")
 
 /* A fixed underlying type in C++ makes a kind outside the list (a caller's bug,
  * which the stop still reports as "invalid-kind") a well-defined value rather
@@ -238,6 +240,14 @@ PS3_NORETURN void ps3_stop_spurs_task_halt(const char* api, uint32_t taskset_ea,
 PS3_NORETURN void ps3_stop_spurs_dispatch_miss(const char* api, uint32_t owner_ea, int32_t task,
                                                uint32_t image_ea, uint32_t size, uint64_t fingerprint,
                                                const ps3_stop_site* site);
+
+/* Generic helper to raise PS3_STOP_RSX_CAPTURE: the RSX capture or replay (ps3diff.rsx/1, libs/video/
+ * rsx_capture.h) met something that would make its result untrustworthy, so it ends here instead of writing
+ * or replaying a capture that only looks complete: a blob missing or altered, a capture that did not start
+ * at a clean GCM reset, a consumed span two reads disagree on, an unsupported readback format, an output it
+ * cannot write. Fields: func, reason (a stable id: midstream, blob-missing, blob-altered, read-conflict,
+ * readback-format, output-exists, io, ...), detail (free text naming the file, address or event). */
+PS3_NORETURN void ps3_stop_rsx_capture(const char* func, const char* reason, const char* detail);
 
 /* ---- frontier ---------------------------------------------------------- */
 

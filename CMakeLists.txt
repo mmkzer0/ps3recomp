@@ -75,6 +75,9 @@ endif()
 # to a stub wherever the shader tools are absent, so it is part of the
 # library everywhere. See the "Guest shaders on Metal" section below.
 list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_msl.cpp")
+# The RSX capture writer (rsx_capture.h): C++ for the JSON and file handling. The walker and the
+# engine reach it only through a registered sink, so it is optional for any link that skips it.
+list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_capture.cpp")
 # cellAtrac decodes with FFmpeg's ATRAC3plus decoder as extracted by PPSSPP
 # (LGPL-2.1, kept separate in third_party/at3_standalone -- see its README).
 file(GLOB AT3_SOURCES "third_party/at3_standalone/*.cpp")
@@ -167,6 +170,33 @@ add_library(ps3recomp_runtime STATIC
 target_include_directories(ps3recomp_runtime PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )
+
+# What a capture's environment record says about this build. Fixed when CMake configures: a commit
+# made afterwards is not in it, so a baseline is only comparable to a build configured at the same
+# state. "-dirty" marks tracked changes in the work tree at that moment.
+set(PS3RECOMP_TOOLKIT_SHA "unknown")
+find_package(Git QUIET)
+if(Git_FOUND)
+    execute_process(COMMAND "${GIT_EXECUTABLE}" rev-parse --short=12 HEAD
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        OUTPUT_VARIABLE _ps3_sha OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET RESULT_VARIABLE _ps3_sha_rc)
+    if(_ps3_sha_rc EQUAL 0 AND _ps3_sha)
+        set(PS3RECOMP_TOOLKIT_SHA "${_ps3_sha}")
+        execute_process(COMMAND "${GIT_EXECUTABLE}" status --porcelain --untracked-files=no
+            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+            OUTPUT_VARIABLE _ps3_dirty OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+        if(_ps3_dirty)
+            set(PS3RECOMP_TOOLKIT_SHA "${_ps3_sha}-dirty")
+        endif()
+    endif()
+endif()
+if(CMAKE_BUILD_TYPE)
+    set(PS3RECOMP_BUILD_TYPE_NAME "${CMAKE_BUILD_TYPE}")
+else()
+    set(PS3RECOMP_BUILD_TYPE_NAME "unspecified")
+endif()
+set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_capture.cpp" PROPERTIES
+    COMPILE_DEFINITIONS "PS3RECOMP_TOOLKIT_SHA=\"${PS3RECOMP_TOOLKIT_SHA}\";PS3RECOMP_BUILD_TYPE=\"${PS3RECOMP_BUILD_TYPE_NAME}\"")
 
 # HLE modules include their own headers
 target_include_directories(ps3recomp_runtime PRIVATE
@@ -990,6 +1020,52 @@ if(UNIX)
         add_test(NAME ${engine_test} COMMAND ${engine_test})
         set_tests_properties(${engine_test} PROPERTIES LABELS "gcm;t0" TIMEOUT 120)
     endforeach()
+
+    # The RSX capture (ps3diff.rsx/1), producer side. Both fixtures leave a capture in a directory and
+    # tools/test_rsx_capture.py checks it: the walker's (executed order, binds, labels, a wait that is
+    # not an event) and the engine's (draws, the buffer as each draw consumed it, drops, frames).
+    # No GPU, no game content. They link only what they test, like the other single-TU fixtures.
+    set(RSX_CAPTURE_FIXTURE_INCLUDES
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/runtime")
+    add_executable(test_rsx_capture_walker
+        libs/video/tests/test_rsx_capture_walker.c
+        libs/video/rsx_capture.cpp
+        libs/video/gcm_default_state.c
+        runtime/diag/stop.cpp
+        runtime/diag/sha256.cpp)
+    add_executable(test_rsx_capture_engine
+        libs/video/tests/test_rsx_capture_engine.c
+        libs/video/rsx_capture.cpp
+        libs/video/rsx_draw_engine.c
+        libs/video/rsx_dispatch.c
+        libs/video/rsx_vertex_compact.c
+        libs/video/rsx_texture_layout.c
+        libs/video/rsx_vp_decompiler.c
+        libs/video/rsx_fp_decompiler.c
+        runtime/diag/stop.cpp
+        runtime/diag/sha256.cpp)
+    foreach(t test_rsx_capture_walker test_rsx_capture_engine)
+        target_include_directories(${t} PRIVATE ${RSX_CAPTURE_FIXTURE_INCLUDES})
+        target_compile_definitions(${t} PRIVATE _GNU_SOURCE)
+        target_link_libraries(${t} PRIVATE Threads::Threads)
+        set_target_properties(${t} PROPERTIES LINKER_LANGUAGE CXX C_EXTENSIONS ON)
+        if(APPLE)
+            target_link_options(${t} PRIVATE "-Wl,-dead_strip")
+        else()
+            target_compile_options(${t} PRIVATE $<$<COMPILE_LANGUAGE:C>:-ffunction-sections -fdata-sections>)
+            target_link_options(${t} PRIVATE "-Wl,--gc-sections")
+            target_link_libraries(${t} PRIVATE m)
+        endif()
+    endforeach()
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME rsx_capture
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_rsx_capture.py"
+                $<TARGET_FILE:test_rsx_capture_walker> $<TARGET_FILE:test_rsx_capture_engine>)
+        set_tests_properties(rsx_capture PROPERTIES LABELS "gcm;t0" TIMEOUT 120)
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------

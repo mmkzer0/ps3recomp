@@ -176,6 +176,18 @@ done:
 
 extern "C" int rsx_hlsl_to_msl_available(void) { return 1; }
 
+extern "C" void rsx_hlsl_to_msl_versions(char* glslang_out, u32 glslang_size,
+                                         char* spirv_cross_out, u32 spirv_cross_size)
+{
+    const glslang::Version v = glslang::GetVersion();
+    if (glslang_out && glslang_size)
+        snprintf(glslang_out, glslang_size, "%d.%d.%d", v.major, v.minor, v.patch);
+    unsigned maj = 0, min = 0, patch = 0;
+    spvc_get_version(&maj, &min, &patch);
+    if (spirv_cross_out && spirv_cross_size)
+        snprintf(spirv_cross_out, spirv_cross_size, "%u.%u.%u", maj, min, patch);
+}
+
 extern "C" int rsx_hlsl_to_msl(const char* hlsl, int stage,
                                char* out, u32 out_size,
                                char* log, u32 log_size)
@@ -200,6 +212,13 @@ extern "C" int rsx_hlsl_to_msl(const char* hlsl, int stage,
 #else /* !PS3RECOMP_HAVE_MSL_TRANSLATION */
 
 extern "C" int rsx_hlsl_to_msl_available(void) { return 0; }
+
+extern "C" void rsx_hlsl_to_msl_versions(char* glslang_out, u32 glslang_size,
+                                         char* spirv_cross_out, u32 spirv_cross_size)
+{
+    if (glslang_out && glslang_size) snprintf(glslang_out, glslang_size, "n/a");
+    if (spirv_cross_out && spirv_cross_size) snprintf(spirv_cross_out, spirv_cross_size, "n/a");
+}
 
 extern "C" int rsx_hlsl_to_msl(const char* hlsl, int stage,
                                char* out, u32 out_size,

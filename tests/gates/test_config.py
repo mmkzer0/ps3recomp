@@ -83,6 +83,9 @@ def test_defaults_without_file_or_environment():
         "gcm.wait_timeout_ms": ("10000", "default"),
         "trophy.register_wait_cap_vblanks": ("1024", "default"),
         "video.resolutions": ('""', "default"),
+        "video.rsx_capture": ("false", "default"),
+        "video.rsx_capture_dir": ('""', "default"),
+        "video.rsx_capture_frames": ("0", "default"),
         "title.elf_sha256": ('""', "default"),
         "diag.dump_config": ("false", "default"),
     }, o
@@ -150,6 +153,9 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
             "gcm.wait_timeout_ms": "default",
             "trophy.register_wait_cap_vblanks": "default",
             "video.resolutions": "default",
+            "video.rsx_capture": "default",
+            "video.rsx_capture_dir": "default",
+            "video.rsx_capture_frames": "default",
             "title.elf_sha256": "env:PS3RECOMP_TITLE_ELF_SHA256",
             "diag.dump_config": "env:PS3RECOMP_DIAG_DUMP_CONFIG",
         }, src
@@ -164,7 +170,8 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
                            "spu": {"dma_repeat_limit": 256, "dma_repeat_stop_secs": 0},
                            "gcm": {"wait_timeout_ms": 10000},
                            "trophy": {"register_wait_cap_vblanks": 1024},
-                           "video": {"resolutions": ""},
+                           "video": {"resolutions": "", "rsx_capture": False, "rsx_capture_dir": "",
+                                     "rsx_capture_frames": 0},
                            "title": {"elf_sha256": SHA_A}, "diag": {"dump_config": False}}, doc
 
 

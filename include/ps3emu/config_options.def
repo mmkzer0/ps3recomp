@@ -130,6 +130,24 @@ PS3_CFG_STR(video, resolutions, "", 31, PS3_CFG_V_VIDEO_RESOLUTIONS,
     "to run a title at the resolution an oracle trace was recorded at), not a "
     "hardware fact.")
 
+PS3_CFG_BOOL(video, rsx_capture, 0,
+    "Record the RSX command stream and every guest-memory input the RSX consumes as a "
+    "ps3diff.rsx/1 capture (docs/PS3DIFF.md) under video.rsx_capture_dir. Off by default: the "
+    "FIFO walker and the draw engine then run exactly as before. The capture starts from "
+    "cellGcmInit, so it needs the option set before the title's first RSX command; a "
+    "walker that meets the first command without a GCM init stops with kind rsx-capture "
+    "(reason=midstream). Capture copies and hashes every consumed span: expect a slower run.")
+
+PS3_CFG_STR(video, rsx_capture_dir, "", 255, PS3_CFG_V_NONE,
+    "The directory video.rsx_capture writes into (capture.ndjson and blobs/sha256/). It is "
+    "created if missing and must not already hold a capture. Empty with video.rsx_capture on "
+    "is a config error.")
+
+PS3_CFG_U32(video, rsx_capture_frames, 0, 0, 1000000,
+    "Close the capture after this many completed frames (flip heads) and stop capturing; the "
+    "title keeps running. 0 captures until the process exits normally; a process that is "
+    "killed leaves capture.ndjson.partial, which no tool accepts.")
+
 /* ---- title -------------------------------------------------------------- */
 
 PS3_CFG_STR(title, elf_sha256, "", 64, PS3_CFG_V_SHA256_OR_EMPTY,

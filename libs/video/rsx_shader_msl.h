@@ -40,6 +40,12 @@ extern "C" {
  * stub is in. A backend asks this once and picks its shader path. */
 int rsx_hlsl_to_msl_available(void);
 
+/* The versions of the two libraries the translation runs on ("major.minor.patch"),
+ * or "n/a" for the stub: part of the environment a capture records, since byte
+ * equality of two renders holds only for equal translators. */
+void rsx_hlsl_to_msl_versions(char* glslang_out, u32 glslang_size,
+                              char* spirv_cross_out, u32 spirv_cross_size);
+
 /* Translate one HLSL shader whose entry point is `main` into MSL.
  *   hlsl     : NUL-terminated HLSL source, as the decompilers emit it.
  *   stage    : RSX_SHADER_STAGE_VERTEX or RSX_SHADER_STAGE_FRAGMENT.

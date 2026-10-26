@@ -69,6 +69,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include "ps3emu/log_first.h"
+#include "rsx_capture.h"
+/* The capture module is optional in a link (tests build this file without it):
+ * a weak reference to its installer keeps this backend linking either way. */
+__attribute__((weak_import)) int rsx_capture_install_from_config(const rsx_capture_environment* env);
 
 /* ------------------------------------------------------------------------- */
 
@@ -3844,6 +3848,14 @@ static void eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
     if (ft_t0) ps3_ft_span(PS3_FT_READBACK, 0, w, h, ft_t0, ps3_ft_now());
 }
 
+/* 1 when the last commit ran to completion without an error, a dropped record
+ * or an encoding failure: the condition a capture reads a frame back under. */
+static int eng_last_commit_ok(void* user)
+{
+    (void)user;
+    return s_eng_checked_completed;
+}
+
 /* Read depth through the existing full-size R32Float resolve, then copy the
  * requested rectangle to CPU-coherent shared storage. Resolving only the ROI
  * would rescale the source and change its coordinates. Never expose bytes
@@ -3933,6 +3945,7 @@ static const rsx_draw_backend s_engine_backend = {
     .clear_depth_stencil  = eng_clear_depth_stencil,
     .present              = eng_present,
     .readback             = eng_readback,
+    .last_commit_ok       = eng_last_commit_ok,
 };
 
 /* ---- public API ---------------------------------------------------------- */
@@ -4018,6 +4031,19 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
             s_eng_active = 1;
         } else {
             rsx_set_backend(&s_backend_vtable);
+        }
+        if (s_eng_active && rsx_capture_install_from_config) {
+            /* The record every capture carries: byte equality of two renders holds only on equal
+             * GPU, OS, Metal, build and translator versions (M3-SCOPE H1, machine scope). */
+            char glslang[32], spirv_cross[32];
+            rsx_hlsl_to_msl_versions(glslang, sizeof glslang, spirv_cross, sizeof spirv_cross);
+            const char* gpu = [[s_dev name] UTF8String];
+            const char* macos = [[[NSProcessInfo processInfo] operatingSystemVersionString] UTF8String];
+            char metal[96] = "n/a";
+            if (@available(macOS 14.0, *))
+                snprintf(metal, sizeof metal, "%s", [[[s_dev architecture] name] UTF8String]);
+            rsx_capture_environment env = { gpu, macos, metal, NULL, glslang, spirv_cross, NULL, NULL };
+            rsx_capture_install_from_config(&env);
         }
         fprintf(stderr, "[RSX metal] %s on %s (%ux%u), guest shaders %s, %s path\n",
                 s_headless ? "headless" : "windowed",

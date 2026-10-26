@@ -59,6 +59,7 @@ HOST_HELPERS = set("""
     cellGcm_replay_display_buffers_to_engine
     cellGcm_request_tick
     cellGcm_rsx_process_fifo
+    cellGcm_set_capture_sink
     cellGcm_syscall_bringup
     cellGcm_syscall_iomap
     cellGcm_syscall_iounmap

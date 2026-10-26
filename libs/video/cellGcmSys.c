@@ -30,6 +30,16 @@ static u32 s_gcm_context_ea = 0;
 #include "ps3emu/stop.h"
 #include "ps3emu/config.h"        /* gcm.wait_timeout_ms */
 #include "gcm_default_state.h"
+#include "rsx_capture.h"
+
+/* The RSX capture (rsx_capture.cpp), when one is open: NULL otherwise, so a run
+ * with capture off costs one pointer test per hook. It is registered before the
+ * walker's first pass and cleared only after its last, never in between. */
+static const rsx_capture_sink* s_cap;
+void cellGcm_set_capture_sink(const rsx_capture_sink* sink) { s_cap = sink; }
+/* Set while cellGcmInit rebuilds the base IO mapping: the replay does that
+ * itself when it replays gcm-init, so it is not a separate event. */
+static int s_cap_quiet;
 
 #ifdef _WIN32
 #include <windows.h>
@@ -535,6 +545,7 @@ static void populate_offset_table(u32 ea, u32 io, u32 size)
         s_io_address_table[ea_page + i] = (u16)(io_page + i);
         s_ea_address_table[io_page + i] = (u16)(ea_page + i);
     }
+    if (s_cap && !s_cap_quiet) s_cap->io_map(1, ea, io, size);
 }
 
 /* Clear offset table entries for an IO mapping */
@@ -548,6 +559,7 @@ static void clear_offset_table(u32 ea, u32 io, u32 size)
         s_io_address_table[ea_page + i] = 0xFFFF;
         s_ea_address_table[io_page + i] = 0xFFFF;
     }
+    if (s_cap) s_cap->io_map(0, ea, io, size);
 }
 
 /* Find an IO mapping by EA */
@@ -661,7 +673,9 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
 
     /* Set up the initial IO mapping for the command buffer region */
     if (ioAddress != 0 && ioSize > 0) {
+        s_cap_quiet = 1;
         populate_offset_table(ioAddress, 0, ioSize);
+        s_cap_quiet = 0;
 
         s_io_mappings[0].ea     = ioAddress;
         s_io_mappings[0].io     = 0;
@@ -751,6 +765,7 @@ u32 cellGcmSetupContext(u32 ctx_out_addr, u32 cmdSize, u32 ioSize, u32 ioAddress
     if (!cdata || !gwrite32)
         return 0;
 
+    if (s_cap) s_cap->gcm_init(cmdSize, ioSize, ioAddress);
     cellGcmInit(cmdSize, ioSize, ioAddress);
 
     /* io 0: the default-state subroutine, then (as InitBody does at 0x02000AD8) it ends in RET,
@@ -1170,6 +1185,59 @@ static u32 gcm_fifo_backlog(u32 put, u32 get)
 }
 static u32 s_last_ring_off = 0;   /* last offset the walker actually consumed */
 static u32 s_fifo_calloff = 0;
+
+/* ---------------------------------------------------------------------------
+ * Spans the RSX consumes, and the capture of them (rsx_capture.h)
+ * -----------------------------------------------------------------------*/
+
+/* The guest address space a consumed span must stay inside: what the host
+ * backed, or all 4 GiB when it reserved them. */
+static u64 gcm_vm_limit(void)
+{
+    extern uint32_t ppu_vm_size;
+    return ppu_vm_size ? (u64)ppu_vm_size : 0x100000000ull;
+}
+
+/* [ea, ea+size) stays inside guest memory. Summed in 64 bits, so a span that
+ * would wrap past 4 GiB is refused rather than folded back to the start. */
+static int gcm_span_ok(u64 ea, u64 size)
+{
+    return size && ea + size <= gcm_vm_limit();
+}
+
+/* Open the capture event for one walker step. */
+static void gcm_cap_step(u32 kind, u32 get, u32 put, const u32* words, u32 nwords,
+                         u32 subch, u32 incrementing, u32 count, u32 target)
+{
+    rsx_cap_step st;
+    st.kind = kind; st.get = get; st.put = put; st.call_ret = s_fifo_calloff;
+    st.subch = subch; st.incrementing = incrementing; st.count = count; st.target = target;
+    st.words = words; st.nwords = nwords; st.io2ea = gcm_io2ea;
+    s_cap->step_begin(&st);
+}
+
+/* A capture failure, through the sink. */
+static void gcm_cap_fail(const char* reason, const char* detail)
+{
+    s_cap->fail(reason, detail);
+    abort();
+}
+
+/* A big-endian word the RSX reads from guest memory at `ea` (RSX offset
+ * `off`), through the capture when one is open so that what the walker acts
+ * on is the copy the capture recorded. */
+static u32 gcm_cap_read32(u32 off, u32 ea, u32 kind)
+{
+    if (!s_cap) return vm_read32(ea);
+    extern u8* vm_base;
+    if (!gcm_span_ok(ea, 4)) {
+        char d[64];
+        snprintf(d, sizeof d, "a 4-byte RSX read at ea 0x%08X leaves guest memory", ea);
+        gcm_cap_fail("span", d);
+    }
+    const u8* p = s_cap->read(RSX_CAP_LOC_MAIN, off, ea, vm_base + ea, 4, kind);
+    return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3];
+}
 
 /* ---------------------------------------------------------------------------
  * 2D transfer engines (FIFO subchannels != 0).
@@ -1754,6 +1822,7 @@ static u32 gcm_spu_block_for_put(u32 put)
  * is not, it deadlocks the title. Sweep the skipped range first. */
 static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
 {
+    if (s_cap) s_cap->note(RSX_CAP_NOTE_RESYNC, *getoff, put, 0);
     static int n = 0;
     if (PS3_LOG_FIRST(n, 8))
         fprintf(stderr, "[cellGcmSys] FIFO resync (%s) 0x%08X -> put 0x%08X\n",
@@ -2223,6 +2292,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
              * on would mix the next frame's head into the batch (wave: every
              * frame split across 4 presents, layout flashing/zooming). */
             extern s32 cellGcmSetFlipCommand(u32 bufferId);
+            if (s_cap) gcm_cap_step(RSX_CAP_STEP_WORD, s_fifo_getoff, put, &w, 1, 0, 0, 0, 0);
             s_fifo_getoff += 4;
             /* Count the flip WORDS the title actually writes into the FIFO,
              * separately from the presents that result. When a title stops
@@ -2263,6 +2333,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
              * 3 MB ring at boot, wraps, and a walker stopping at every flip
              * then crawled ~1 KB a tick while the title wrote over the
              * commands ahead of it. */
+            if (s_cap) s_cap->step_end();
             if (gcm_fifo_backlog(put, s_fifo_getoff) < GCM_FIFO_CATCHUP_BYTES)
                 { why = "flip"; break; }
             continue;
@@ -2316,6 +2387,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                   s_park_pass = 1;
                   break;
               }
+              if (s_cap) gcm_cap_step(RSX_CAP_STEP_JUMP, s_fifo_getoff, put, &w, 1, 0, 0, 0, tgt);
               if (tgt < s_fifo_getoff) s_fifo_back_jumps++;
               s_fifo_getoff = tgt;
               /* get is the RSX's fetch pointer: a title polling it sees the
@@ -2324,18 +2396,23 @@ static void gcm_rsx_process_fifo_unlocked(void)
                * come tens of milliseconds later. GCM_GET_EQ_PUT keeps its
                * own value. */
               if (!gcm_get_eq_put()) vm_write32(GCM_CONTROL_GUEST_ADDR + 4, tgt); }
+            if (s_cap) s_cap->step_end();
             continue;
         }
         if ((w & 3) == 2) {                    /* CALL: offset | 2 */
             { u32 tgt = w & 0x1FFFFFFCu;
               if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("CALL", tgt, w); gcm_fifo_resync_why("unmapped-CALL", &s_fifo_getoff, put); break; }
+              if (s_cap) gcm_cap_step(RSX_CAP_STEP_CALL, s_fifo_getoff, put, &w, 1, 0, 0, 0, tgt);
               s_fifo_calloff = s_fifo_getoff + 4;
               s_fifo_getoff  = tgt; }
+            if (s_cap) s_cap->step_end();
             continue;
         }
         if (w == 0x00020000u) {                /* RET */
+            if (s_cap) gcm_cap_step(RSX_CAP_STEP_RET, s_fifo_getoff, put, &w, 1, 0, 0, 0, s_fifo_calloff);
             s_fifo_getoff = s_fifo_calloff;
             s_fifo_calloff = 0;
+            if (s_cap) s_cap->step_end();
             continue;
         }
         if (type == 0 || type == 2) {          /* method (incrementing / NI) */
@@ -2373,6 +2450,21 @@ static void gcm_rsx_process_fifo_unlocked(void)
              * the method, so the next pass re-reads it -- which is what the hardware does
              * while it waits. Semaphore offsets index the same label window
              * cellGcmGetLabelAddress hands out. */
+            u32 cw[1 + 0x7FF];
+            if (s_cap) {
+                /* The ring words behind PUT were stored before PUT and are not
+                 * written again until the walker has passed them (the same
+                 * contract the acquire fence above relies on), so reading the
+                 * packet here for the capture and again below sees one value. */
+                cw[0] = w;
+                for (u32 i = 0; i < count; i++) {
+                    const u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
+                    if (!dea)
+                        gcm_cap_fail("fifo-unmapped", "a method packet's data word has no IO mapping");
+                    cw[1 + i] = vm_read32(dea);
+                }
+                gcm_cap_step(RSX_CAP_STEP_METHOD, s_fifo_getoff, put, cw, 1 + count, subch, type == 0, count, 0);
+            }
             if (subch == 0 && (method == 0x64u || method == 0x68u || method == 0x6Cu)) {
                 int sem_blocked = 0;
                 for (u32 i = 0; i < count; i++) {
@@ -2381,10 +2473,11 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     u32 m = (type == 0) ? method + i * 4 : method;
                     u32 v = vm_read32(dea);
                     u32 la = GCM_LABEL_GUEST_BASE + (s_sema_offset & 0xFFFFu);
+                    const u32 lv = (m == 0x68u) ? gcm_cap_read32(s_sema_offset, la, RSX_CAP_READ_LABEL) : 0;
                     { static int sn = 0; if (getenv("GCM_RECDBG") && PS3_LOG_FIRST(sn, 12))
                         fprintf(stderr, "[SEMA] m=0x%02X v=0x%08X off=0x%X\n", m, v, s_sema_offset); }
                     /* PS3_FTRACE: an acquire this walker sat on is satisfied now. */
-                    if (m == 0x68u && s_ft_sema_t0 && vm_read32(la) == v) {
+                    if (m == 0x68u && s_ft_sema_t0 && lv == v) {
                         ps3_ft_span(PS3_FT_SEMA, 0, s_sema_offset, v, s_ft_sema_t0, ps3_ft_now());
                         s_ft_sema_t0 = 0;
                     }
@@ -2403,10 +2496,11 @@ static void gcm_rsx_process_fifo_unlocked(void)
                             vm_write32(GCM_CONTROL_GUEST_ADDR + 4, s_fifo_getoff + 4 + count * 4);
                         atomic_thread_fence(memory_order_release);
                         vm_write32(la, v);
+                        if (s_cap) s_cap->write(RSX_CAP_LOC_MAIN, s_sema_offset, la, vm_base + la, 4, RSX_CAP_WRITE_LABEL);
                         { static int rn = 0; if (s_sema_offset != 0x400u && PS3_LOG_FIRST(rn, 40))   /* TEMP */
                             fprintf(stderr, "[SEMA-REL] get=0x%08X off=0x%X val=0x%08X\n", s_fifo_getoff, s_sema_offset, v); }
                     }
-                    else if (m == 0x68u && vm_read32(la) != v) {
+                    else if (m == 0x68u && lv != v) {
                         /* ACQUIRE stalls the RSX until the label holds the value; it consumes the
                          * method only then. The one agent the runtime models is the driver's
                          * answer to a queued flip: libgcm_sys's flip stream (E944, then RELEASE
@@ -2421,6 +2515,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                             s_acq_t0 = 0;
                             atomic_thread_fence(memory_order_release);
                             vm_write32(la, v);
+                            if (s_cap) s_cap->write(RSX_CAP_LOC_MAIN, s_sema_offset, la, vm_base + la, 4, RSX_CAP_WRITE_LABEL);
                         } else {
                             extern unsigned long long ps3_ms_now(void);
                             const unsigned long long now = ps3_ms_now();
@@ -2430,15 +2525,16 @@ static void gcm_rsx_process_fifo_unlocked(void)
                             const unsigned long long waited = now - s_acq_t0;
                             if (waited >= ps3_cfg_gcm_wait_timeout_ms())
                                 ps3_stop_gcm_wait_timeout("cellGcm_rsx_process_fifo", "semaphore-acquire",
-                                                          s_sema_offset, v, vm_read32(la), (u32)waited);
+                                                          s_sema_offset, v, lv, (u32)waited);
                             if (PS3_FT_ON() && !s_ft_sema_t0) s_ft_sema_t0 = ps3_ft_now();
                             sem_blocked = 1; break;
                         }
                     }
                     else if (m == 0x68u) s_acq_t0 = 0;                /* satisfied */
                 }
-                if (sem_blocked) { s_sema_blocked_pass = 1; s_acquire_blocked = 1; break; }
+                if (sem_blocked) { if (s_cap) s_cap->step_cancel(); s_sema_blocked_pass = 1; s_acquire_blocked = 1; break; }
                 s_fifo_getoff += 4 + count * 4;
+                if (s_cap) s_cap->step_end();
                 continue;
             }
             int drv_flip = 0;   /* a GCM_FLIP_HEAD (0xE924) ran in this method block */
@@ -2640,6 +2736,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                                 vm_write32(rea + 4u, (u32)ts);
                                 vm_write32(rea + 8u, val);
                                 vm_write32(rea + 12u, 0u);
+                                if (s_cap) s_cap->write(RSX_CAP_LOC_MAIN, off, rea, vm_base + rea, 16, RSX_CAP_WRITE_REPORT);
                             } else { static int un = 0; if (PS3_LOG_FIRST(un, 4)) printf("[GET_REPORT] main-memory offset 0x%X is not IO-mapped%c", off, 10); }
                         } else if (idx < CELL_GCM_MAX_REPORT_COUNT) {
                             s_report_data[idx].timestamp = ts;
@@ -2651,6 +2748,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 }
             }
             s_fifo_getoff += 4 + count * 4;
+            if (s_cap) s_cap->step_end();
             /* A driver flip head stops the pass like the 0xFEAD marker does, so the ticker presents
              * the completed frame before the next one's head is drained. */
             if (drv_flip && gcm_fifo_backlog(put, s_fifo_getoff) < GCM_FIFO_CATCHUP_BYTES)
@@ -2659,6 +2757,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
         }
         { static int _uw = 0; if (PS3_LOG_FIRST(_uw, 16) && getenv("RTT_DUMP"))
             fprintf(stderr, "[FIFOUW] unknown word 0x%08X at getoff 0x%X\n", w, s_fifo_getoff); }
+        if (s_cap) { gcm_cap_step(RSX_CAP_STEP_WORD, s_fifo_getoff, put, &w, 1, 0, 0, 0, 0); s_cap->step_end(); }
         s_fifo_getoff += 4;                    /* unknown word: skip */
     }
 
@@ -3019,6 +3118,7 @@ s32 cellGcmSetDisplayBuffer(u32 bufferId, u32 offset, u32 pitch,
     s_display_buffers[bufferId].width  = width;
     s_display_buffers[bufferId].height = height;
     s_display_buffer_set[bufferId] = 1;
+    if (s_cap) s_cap->display_buffer(bufferId, offset, pitch, width, height);
 
     /* Tell the live engine too, or it has no registered scanout to present and
      * falls back to whatever surface happens to be current. Display buffers are
