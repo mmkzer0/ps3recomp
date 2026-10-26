@@ -4474,6 +4474,44 @@ def _const_base_targets(win, rC, read_u32, text_lo, text_hi, bctr_addr):
     return None
 
 
+# Mnemonics whose first operand is READ, not written: they never define the table-base register.
+_JT_NON_DEFS = ('st', 'mt', 'cmp', 'b', 'tw', 'td', 'dcb', 'icb', 'lf', 'sync', 'eieio', 'isync')
+
+
+def _materialized_constant(seg, k, depth=0):
+    """The 32-bit constant instruction seg[k] leaves in its destination register, or None.
+
+    #45 shape: `lis rT,hi; addi rT,rT,lo; ...; lwzx rD,rIdx,rT; [extsw rD,rD;] add rD,rD,rT; mtctr rD; bctr`
+    (Sony's compiler) builds the table address from immediates -- no TOC slot, no load -- and the
+    signed `lo` carries into the high half (`lis 0x202; addi -0x7888` is 0x2018778). Only an immediate
+    chain is a constant: a register defined by a load, an `add` of another register, or anything else
+    returns None, so a dispatcher whose base is not folded at link time stays unresolved (named stop).
+    """
+    def s16(v):
+        v &= 0xFFFF
+        return v - 0x10000 if v & 0x8000 else v
+    w = seg[k]
+    a = [x.strip() for x in w.operands.split(',')]
+    try:
+        if w.mnemonic == 'lis' and len(a) == 2:
+            return (s16(int(a[1], 0)) << 16) & 0xFFFFFFFF
+        if w.mnemonic == 'li' and len(a) == 2:
+            return s16(int(a[1], 0)) & 0xFFFFFFFF
+        if w.mnemonic == 'addi' and len(a) == 3 and depth < 4:
+            imm = s16(int(a[2], 0))
+            if a[1] == 'r0':                    # `addi rD,0,imm` is `li` (RA=0 reads as zero)
+                return imm & 0xFFFFFFFF
+            for j in range(k - 1, -1, -1):
+                b = [x.strip() for x in seg[j].operands.split(',')]
+                if not b or b[0] != a[1] or seg[j].mnemonic.startswith(_JT_NON_DEFS):
+                    continue
+                base = _materialized_constant(seg, j, depth + 1)   # nearest definition decides
+                return None if base is None else (base + imm) & 0xFFFFFFFF
+    except ValueError:
+        return None
+    return None
+
+
 def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts=None):
     """Find `mtctr rX; bctr` switch dispatchers and read their jump tables.
 
@@ -4701,6 +4739,7 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
         for cand in _cands:
             disp = None; r_base = None; base_is_ld = False
             disp2 = None; disp2_is_ld = False
+            kc = None                       # constant table base (#45 lis/addi shape), else None
             # Walk backward to the NEAREST instruction that defines `cand`, and
             # accept it as the table base only if that definition is a TOC load
             # (`lwz`/`ld cand, disp(r2)`). Stopping at the first definition is
@@ -4725,11 +4764,15 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
             # Widening is safe for the cases that already worked: the walk stops
             # at the NEAREST definition of `cand`, so when one exists inside the
             # window the result is unchanged.
-            for w in reversed(win_cand):
+            for _wi, w in reversed(list(enumerate(win_cand))):
                 a = [x.strip() for x in w.operands.split(',')]
                 if not a or a[0] != cand or w.mnemonic.startswith(('st', 'lf')):
                     continue                    # not a GPR def: a store READS it; ppu_disasm names lfs/lfd's FPR target rN
-                if w.mnemonic in ('lwz', 'ld') and len(a) == 2 and '(r2)' in a[1]:
+                if w.mnemonic in ('lis', 'li', 'addi'):
+                    kc = _materialized_constant(win_cand, _wi)
+                    if kc is not None:
+                        r_base = cand
+                elif w.mnemonic in ('lwz', 'ld') and len(a) == 2 and '(r2)' in a[1]:
                     disp = mem_disp(a[1]); r_base = cand
                     base_is_ld = (w.mnemonic == 'ld')
                 elif w.mnemonic in ('lwz', 'ld') and len(a) == 2 and '(' in a[1]:
@@ -4767,15 +4810,15 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
                             break
                         _scan = _live(_scan_lo(i), i)
                 break                           # first definition of cand wins/loses
-            if disp is not None:
-                _bases.append((r_base, disp, base_is_ld, disp2, disp2_is_ld))
+            if disp is not None or kc is not None:
+                _bases.append((r_base, disp, base_is_ld, disp2, disp2_is_ld, kc))
         _dbg(all_insns[i].addr, f"bases={_bases} toc={toc}")
-        if not _bases or not toc:
+        if not _bases or not (toc or any(b[5] is not None for b in _bases)):
             continue
         toc_candidates = toc if isinstance(toc, (list, tuple)) else [toc]
         best = []
         best_key = (0, 0)
-        for r_base, disp, base_is_ld, disp2, disp2_is_ld in _bases:
+        for r_base, disp, base_is_ld, disp2, disp2_is_ld, kc in _bases:
             # offset table iff an `add rC, *, r_base` combines the loaded value + base
             is_offset = any(
                 w.mnemonic == 'add' and
@@ -4857,8 +4900,8 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
             # with. We don't track per-function TOCs here, so try each candidate
             # and keep the one whose table decodes to the most in-text case
             # targets (a wrong TOC reads unrelated data and validates 0 targets).
-            for cand in toc_candidates:
-                if not cand:
+            for cand in (toc_candidates if kc is None else [0]):
+                if kc is None and not cand:
                     continue
                 def _read_ptr(_ea, _is_ld):
                     # ELFv1 TOC entries are 64-bit; a table address always fits the
@@ -4869,8 +4912,8 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
                     if read_u32(_ea):
                         return None
                     return read_u32((_ea + 4) & 0xFFFFFFFF)
-                table_base = _read_ptr(cand + disp, base_is_ld)
-                if table_base is not None and disp2 is not None:
+                table_base = kc if kc is not None else _read_ptr(cand + disp, base_is_ld)
+                if kc is None and table_base is not None and disp2 is not None:
                     table_base = _read_ptr(table_base + disp2, disp2_is_ld)
                 _dbg(all_insns[i].addr, f"r_base={r_base} cand_toc=0x{cand:X} table_base={None if table_base is None else hex(table_base)} count={count} is_offset={is_offset} text=[0x{text_lo:X},0x{text_hi:X})")
                 if table_base is None:

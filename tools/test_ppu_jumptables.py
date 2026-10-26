@@ -370,6 +370,10 @@ def main() -> int:
     test_const_base_needs_constant()
     test_multi_toc_prefers_targets_near_the_dispatcher()
     test_bound_compare_beyond_window()
+    test_const_base_lis_addi()
+    test_const_base_negative_lo_carry()
+    test_const_base_with_nonconstant_addend_refused()
+    test_addi_of_loaded_register_refused()
     if FAILS:
         print(f"FAILED: {', '.join(FAILS)}")
         return 1
@@ -400,6 +404,50 @@ def test_const_base_needs_constant():
     mem = {base: w_blr(), TOC + 8: base}
     got = discover([w_lwz(8, 2, 8), w_add(8, 8, 7), w_mtctr(8), w_bctr()], mem)
     check("non-constant base is not a constant-base jump", got, None)
+
+
+def w_addi(rt, ra, si):    return (14 << 26) | (rt << 21) | (ra << 16) | (si & 0xFFFF)
+def w_extsw(ra, rs):       return (31 << 26) | (rs << 21) | (ra << 16) | (986 << 1)
+def w_lis(rt, hi):         return w_addis(rt, 0, hi)
+
+
+def _const_offset_switch(base_hi, lo, mem, table):
+    """`lis r9,hi; addi r9,r9,lo; slwi r11,r3,2; lwzx r0,r11,r9; extsw r0,r0; add r0,r0,r9; mtctr; bctr`:
+    the #45 shape of a table whose ABSOLUTE base is built from immediates (no TOC slot, no load)."""
+    mem.update({table + 0: 0x100, table + 4: 0x200, table + 8: 0x300, table + 12: 0xFFFFFFFF})
+    return discover([w_cmplwi(0, 3, 2), w_lis(9, base_hi), w_addi(9, 9, lo), w_slwi(11, 3, 2),
+                     w_lwzx(0, 11, 9), w_extsw(0, 0), w_add(0, 0, 9), w_mtctr(0), w_bctr()], mem)
+
+
+def test_const_base_lis_addi():
+    table = 0x14010
+    got = _const_offset_switch(1, 0x4010, {}, table)
+    check("lis/addi constant table base (positive lo)", got, [table + 0x100, table + 0x200, table + 0x300])
+
+
+def test_const_base_negative_lo_carry():
+    """`lis 2; addi -0x7888` is 0x18778, not 0x28778: the signed `lo` borrows from the high half."""
+    table = 0x18778
+    got = _const_offset_switch(2, -0x7888, {}, table)
+    check("lis/addi constant table base (negative lo carries)", got, [table + 0x100, table + 0x200, table + 0x300])
+
+
+def test_const_base_with_nonconstant_addend_refused():
+    """The base is folded from immediates and then displaced by a loaded register: not a constant."""
+    table = 0x14010
+    mem = {TOC + 8: 0, table + 0: 0x100, table + 4: 0x200, table + 8: 0x300, table + 12: 0xFFFFFFFF}
+    got = discover([w_cmplwi(0, 3, 2), w_lis(9, 1), w_addi(9, 9, 0x4010), w_lwz(10, 2, 8), w_add(9, 9, 10),
+                    w_slwi(11, 3, 2), w_lwzx(0, 11, 9), w_add(0, 0, 9), w_mtctr(0), w_bctr()], mem)
+    check("lis/addi base plus a loaded addend is refused", got, None)
+
+
+def test_addi_of_loaded_register_refused():
+    """`lwz r9,8(r2); addi r9,r9,0x10` is a TOC load plus an offset, not a link-time constant."""
+    table = 0x14010
+    mem = {TOC + 8: table - 0x10, table + 0: 0x100, table + 4: 0x200, table + 8: 0x300, table + 12: 0xFFFFFFFF}
+    got = discover([w_cmplwi(0, 3, 2), w_lwz(9, 2, 8), w_addi(9, 9, 0x10), w_slwi(11, 3, 2),
+                    w_lwzx(0, 11, 9), w_add(0, 0, 9), w_mtctr(0), w_bctr()], mem)
+    check("addi of a loaded register is not a constant base", got, None)
 
 
 if __name__ == "__main__":
