@@ -403,7 +403,7 @@ extern "C" void ps3_hle_dispatch(uint32_t nid, ppu_context* ctx)   /* C linkage:
      * listed in YDKJ_FORCE_HLE (comma-separated hex). Some LLE entry points fail
      * against our partially-modelled SPURS state and the CALLER ASSERTS on it:
      * YDKJ's CRI calls _cellSpursEventFlagInitialize (0x5EF96465), libsre returns
-     * 0x80410910 (CELL_SPURS_TASK_ERROR_STAT), and CRI's own
+     * 0x80410910 (CELL_SPURS_TASK_ERROR_ALIGN), and CRI's own
      * "CellSpursTaskset.cc:423: ret == CELL_OK -- assertion failed" kills its
      * taskset init => the movie decode task is never created. Forcing the HLE
      * (which succeeds) lets the caller proceed. */
@@ -548,7 +548,7 @@ extern "C" void ps3_hle_dispatch(uint32_t nid, ppu_context* ctx)   /* C linkage:
                 #undef _RD
             }
             /* cellSpursEventFlagAttachLv2EventQueue (0x22AAB31D) validates the
-             * event flag at r3 and returns CELL_SPURS_CORE_ERROR_PERM (0x80410909)
+             * event flag at r3 and returns CELL_SPURS_TASK_ERROR_PERM (0x80410909)
              * unless the direction byte at +0xE is 1 (SPU2PPU) or 3 (ANY2ANY) --
              * the check is plainly visible in lifted libsre at 0x30015AB4.
              *

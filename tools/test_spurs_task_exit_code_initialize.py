@@ -24,6 +24,8 @@ FIXTURE = r'''
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <sys/wait.h>
+#include <unistd.h>
 static_assert(sizeof(CellSpursTaskExitCode)==128);
 static_assert(alignof(CellSpursTaskExitCode)==128);
 extern "C" {
@@ -56,6 +58,21 @@ static uint32_t call(uint64_t ea) {
     handler(&ctx);
     return static_cast<uint32_t>(ctx.gpr[3]);
 }
+/* A span the host cannot back stops by name (hle-guest-range), which is
+ * terminal: run it in a child and require the stop exit status. */
+static void expect_stop_call(uint64_t ea, const char* what) {
+    std::fflush(stdout);
+    pid_t p = fork();
+    expect(p >= 0, "fork");
+    if (p == 0) { (void)call(ea); _exit(0); }   /* reaching here means no stop */
+    int st = 0;
+    expect(waitpid(p, &st, 0) == p, "waitpid");
+    if (!(WIFEXITED(st) && WEXITSTATUS(st) == 70)) {
+        std::fprintf(stderr, "FAIL: %s did not stop (status 0x%X)\n", what, st);
+        std::abort();
+    }
+    ++checks;
+}
 int main() {
     register_exit_code_fixture();
     expect(handler != nullptr, "generated NID 34552FA6 is registered");
@@ -75,16 +92,16 @@ int main() {
     expect(call(0x100000080ull)==0,"pointer arguments use guest low 32 bits");
     expect(call(0x100000000ull)==0x80410911u,"guest low-32 null takes priority");
     expect(call(0x380)==0&&all_bytes(0x380,0x400,0),"last complete backed container");
-    expect(call(0x400)==0x8041090Du,"outside backing rejected before access");
+    expect_stop_call(0x400,"outside backing");
     ppu_vm_size=0x3FF;
-    expect(call(0x380)==0x8041090Du,"partial backing rejected before access");
+    expect_stop_call(0x380,"partial backing");
     ppu_vm_size=sizeof(memory);
-    expect(call(0xFFFFFF80u)==0x8041090Du,"high aligned EA cannot wrap backing check");
-    expect(call(0xFFFFFFFFu)==0x80410910u,"alignment error precedes backing check");
+    expect_stop_call(0xFFFFFF80u,"a high aligned EA whose span wraps");
+    expect(call(0xFFFFFFFFu)==0x80410910u,"alignment error precedes the backing check");
     vm_base=reinterpret_cast<uint8_t*>(UINTPTR_MAX-0x40u); ppu_vm_size=0;
-    expect(call(0x80)==0x8041090Du,"host address overflow rejected before access");
+    expect_stop_call(0x80,"a host address that would overflow");
     vm_base=nullptr; ppu_vm_size=0;
-    expect(call(0x80)==0x8041090Du,"uninitialized VM rejected");
+    expect_stop_call(0x80,"an uninitialized VM");
     expect(call(0)==0x80410911u,"null error precedes VM readiness");
     expect(call(0x81)==0x80410910u,"alignment error precedes VM readiness");
     vm_base=memory; ppu_vm_size=0; // existing runtime convention: full guest VM
@@ -110,13 +127,22 @@ with tempfile.TemporaryDirectory(prefix='spurs-exit-initialize-') as name:
         'extern "C" void register_exit_code_fixture(void) {\n'+
         '\n'.join(entries)+'\n}\n')
     fixture=tmp/'fixture.cpp'; fixture.write_text(FIXTURE)
-    obj=tmp/'spurs.o'; binary=tmp/'fixture'
+    obj=tmp/'spurs.o'; stop_obj=tmp/'stop.o'; binary=tmp/'fixture'
     common=['-O1','-UNDEBUG','-ffunction-sections','-fdata-sections',
             '-I'+str(ROOT),'-I'+str(ROOT/'include'),'-I'+str(ROOT/'runtime/ppu'),
             '-I'+str(ROOT/'runtime/spu')]
     subprocess.run([os.environ.get('CC','cc'),'-std=gnu17',*common,'-c',
                     str(ROOT/'libs/spurs/cellSpurs.c'),'-o',str(obj)],check=True)
+    subprocess.run([os.environ.get('CXX','c++'),'-std=c++20',*common,'-c',
+                    str(ROOT/'runtime/diag/stop.cpp'),'-o',str(stop_obj)],check=True)
     linker=['-Wl,-dead_strip'] if platform.system()=='Darwin' else ['-Wl,--gc-sections']
     subprocess.run([os.environ.get('CXX','c++'),'-std=c++20',*common,
-        str(fixture),str(registration),str(obj),*linker,'-pthread','-lm','-o',str(binary)],check=True)
-    subprocess.run([str(binary)],check=True,timeout=10,cwd=tmp)
+        str(fixture),str(registration),str(obj),str(stop_obj),*linker,'-pthread','-lm','-o',str(binary)],check=True)
+    p=subprocess.run([str(binary)],timeout=20,cwd=tmp,capture_output=True,text=True)
+    print(p.stdout,end='')
+    assert p.returncode==0, p.stderr[-3000:]
+    stops=[l for l in p.stderr.splitlines() if l.startswith('PS3STOP ')]
+    assert len(stops)==5, p.stderr[-3000:]
+    for l in stops:
+        assert 'kind=hle-guest-range' in l and 'func=cellSpursTaskExitCodeInitialize' in l \
+            and 'arg=exitCode' in l and 'size=0x80' in l, l

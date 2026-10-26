@@ -30,6 +30,12 @@
 uint8_t* vm_base;
 uint32_t ppu_vm_size = 0x40000;
 uint32_t g_ww_lo, g_ww_hi, g_barrier_sync_watch;
+/* libsre 4.93 gates the context alignment on the SDK version (0x02011B78 asks
+ * ps3_process_sdk_version, 0x02011B88/0x02011BD4 pick the mask). The runtime
+ * answers from the title's PROC_PARAM; the fixture sets it per mode and starts
+ * at the runtime's own default (runtime/syscalls/sdk_version_weak.c). */
+static uint32_t fixture_sdk = 0x00350001u;
+uint32_t ps3_process_sdk_version(void) { return fixture_sdk; }
 int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size, uint32_t args_ea);
 int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size, uint32_t job_ea, uint32_t job_desc_size);
 uint32_t g_spu_image_src_ea, g_spu_image_ls_start, g_spu_image_span;
@@ -64,7 +70,8 @@ int fixture_dispatch_job(const uint8_t* image, uint32_t size, uint32_t job_ea, u
     return 1;
 }
 
-enum { TASKSET = 0x4000, TASK_ID_OUT = 0x2000, ELF = 0x10000, TASK_CTX = 0x20000, JOB = 0x3000, BINARY = 0x30000 };
+enum { TASKSET = 0x4000, TASK_ID_OUT = 0x2000, ELF = 0x10000, TASK_CTX = 0x20000,
+       LSP = 0x21000, ATTR = 0x22000, JOB = 0x3000, BINARY = 0x30000 };
 
 static void be16(uint8_t* p, uint16_t v) { p[0] = v >> 8; p[1] = v; }
 static void be32(uint8_t* p, uint32_t v) { p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v; }
@@ -73,6 +80,7 @@ static void be32(uint8_t* p, uint32_t v) { p[0] = v >> 24; p[1] = v >> 16; p[2] 
 static void make_elf(uint8_t* image, uint32_t vaddr)
 {
     memcpy(image, "\177ELF", 4); image[4] = 1; image[5] = 2; image[6] = 1;
+    image[7] = 0;   /* EI_OSABI: the creator compares all 8 bytes (0x02011BFC) */
     be16(image + 0x10, 2); be16(image + 0x12, 23); be32(image + 0x14, 1);
     be32(image + 0x18, vaddr); be32(image + 0x1C, 52);
     be16(image + 0x28, 52); be16(image + 0x2A, 32); be16(image + 0x2C, 1);
@@ -106,10 +114,17 @@ static void setup(void)
     dispatches = job_dispatches = 0; dispatched_image = NULL; dispatched_size = dispatched_context = 0;
 }
 
-static int create_task(uint32_t elf)
+/* A context at TASK_CTX with a size the creator accepts: the firmware returns
+ * 0x80410902 for any context with fewer than 0x400 bytes (0x02011BF4). */
+static int create_task_ex(uint32_t elf, uint32_t ctx, uint32_t size, uint32_t lsp)
 {
     return (int)cellSpursCreateTask((CellSpursTaskset*)(uintptr_t)TASKSET, (CellSpursTaskId*)(uintptr_t)TASK_ID_OUT,
-                                    (void*)(uintptr_t)elf, (void*)(uintptr_t)TASK_CTX, 0, 0, 0);
+                                    (void*)(uintptr_t)elf, (void*)(uintptr_t)ctx, size, lsp, 0);
+}
+
+static int create_task(uint32_t elf)
+{
+    return create_task_ex(elf, TASK_CTX, 0x2000, 0);
 }
 
 static int enabled_bits_clear(void)
@@ -153,10 +168,11 @@ int main(int argc, char** argv)
     } else if (!strcmp(mode, "task-ok-phdr-paddr")) {
         /* RPCS3 stops the program-header scan at the first header, of ANY type, whose p_paddr is at
          * or past the task bottom (cellSpursSpu.cpp:2014). A later PT_LOAD outside the area is then
-         * never reached. The scan used to skip non-PT_LOAD headers and halt on that segment. */
+         * never reached. The segment below is outside the area at the TOP (vaddr+memsz > 0x40000),
+         * which the PPU-side header check does not test: it only rejects p_vaddr <= 0x2FFF. */
         make_elf_phdrs(vm_base + ELF, 2);
         phdr(vm_base + ELF, 0, 2 /*PT_DYNAMIC*/, 0x100, 0, 0x50000, 0, 0, 0);
-        phdr(vm_base + ELF, 1, 1 /*PT_LOAD*/, 0x100, 0x100 /*below TOP*/, 0x100, 0x10, 0x10, 5);
+        phdr(vm_base + ELF, 1, 1 /*PT_LOAD*/, 0x100, 0x3F000, 0x3000, 0x10, 0x2000, 5);
         CHECK(create_task(ELF) == 0, "a header past the task bottom ends the scan");
         CHECK(dispatches == 1, "and the load carries on to dispatch");
     } else if (!strcmp(mode, "task-ok-vaddr-wrap")) {
@@ -184,14 +200,87 @@ int main(int argc, char** argv)
         spu_taskset_start_pending(TASKSET);
         fprintf(stderr, "FAIL: the restart scan loaded a task whose ELF address is not 16-byte aligned\n");
         return 1;
-    } else if (!strcmp(mode, "task-bad-elf") || !strcmp(mode, "task-bad-elf-host")) {
-        if (!strcmp(mode, "task-bad-elf-host")) g_active_ctx = NULL;
+    } else if (!strcmp(mode, "task-bad-elf")) {
+        /* The PPU-side header check (0x02011BFC..0x02011C24): the first 8 bytes
+         * must be 7F454C46 01020100, so a non-ELF image is NOEXEC here -- a
+         * return value, never the SPU-side halt. */
         memset(vm_base + ELF, 0xA5, 0x100);     /* aligned, mapped, and not an ELF */
-        (void)create_task(ELF);
-        fprintf(stderr, "FAIL: cellSpursCreateTask returned for an image that is not an SPU ELF\n");
-        return 1;
+        CHECK((uint32_t)create_task(ELF) == 0x80410907u, "a non-ELF image is NOEXEC on the PPU");
+        CHECK(dispatches == 0 && enabled_bits_clear() && vm_read32(TASK_ID_OUT) == 0,
+              "and no task id was taken or dispatched");
+    } else if (!strcmp(mode, "task-bad-machine")) {
+        make_elf(vm_base + ELF, 0x3000);
+        be16(vm_base + ELF + 0x12, 2);          /* EM_PPC64, not EM_SPU (23) */
+        CHECK((uint32_t)create_task(ELF) == 0x80410907u, "e_machine != 23 is NOEXEC");
+    } else if (!strcmp(mode, "task-bad-entry")) {
+        make_elf(vm_base + ELF, 0x3000);
+        be32(vm_base + ELF + 0x18, 0x2FFF);     /* must be > 0x2FFF */
+        CHECK((uint32_t)create_task(ELF) == 0x80410907u, "e_entry <= 0x2FFF is NOEXEC");
+    } else if (!strcmp(mode, "task-vaddr-low")) {
+        /* A PT_LOAD below the task area. The ELF's e_entry and its other field
+         * stay above 0x2FFF, so only the program-header test rejects it. */
+        make_elf(vm_base + ELF, 0x3000);
+        be32(vm_base + ELF + 52 + 8, 0x2FFF);
+        CHECK((uint32_t)create_task(ELF) == 0x80410907u, "a PT_LOAD vaddr <= 0x2FFF is NOEXEC");
+        CHECK(dispatches == 0 && enabled_bits_clear(), "and no task id was taken");
+    } else if (!strcmp(mode, "task-ctx-align")) {
+        /* 0x02011B78: above SDK 0x27FFFF the context must be 128-byte aligned;
+         * at or below it 16 bytes (0x02011B88 / 0x02011BD4). 0x20040 passes the
+         * 16-byte test and fails the 128-byte one. */
+        make_elf(vm_base + ELF, 0x3000);
+        fixture_sdk = 0x00350001u;
+        CHECK((uint32_t)create_task_ex(ELF, 0x20040, 0x1000, 0) == 0x80410910u,
+              "a context at 0x20040 is misaligned above SDK 0x27FFFF");
+        fixture_sdk = 0x00270000u;
+        CHECK(create_task_ex(ELF, 0x20040, 0x1000, 0) == 0, "the same context is accepted at or below it");
+        CHECK(dispatches == 1, "and the task starts");
+    } else if (!strcmp(mode, "task-ctx-size")) {
+        /* 0x02011BF4: a context with fewer than 0x400 bytes is INVAL, and the
+         * check is skipped only for a null context. */
+        make_elf(vm_base + ELF, 0x3000);
+        CHECK((uint32_t)create_task_ex(ELF, TASK_CTX, 0x3FF, 0) == 0x80410902u,
+              "a context shorter than 0x400 bytes is INVAL");
+        CHECK(create_task_ex(ELF, TASK_CTX, 0x400, 0) == 0, "0x400 bytes is accepted");
+    } else if (!strcmp(mode, "task-ls-pattern")) {
+        /* 0x02011D6C: the pattern may mark no more 2 KiB blocks than the context
+         * save area holds; 0x2000 bytes give (0x2000-1024)/2048 = 3 slots. */
+        make_elf(vm_base + ELF, 0x3000);
+        be32(vm_base + LSP + 0,  0x01000000u);
+        be32(vm_base + LSP + 4,  0x01000000u);
+        be32(vm_base + LSP + 8,  0x01000000u);
+        be32(vm_base + LSP + 12, 0x01000000u);
+        CHECK((uint32_t)create_task_ex(ELF, TASK_CTX, 0x2000, LSP) == 0x80410902u,
+              "four blocks for three slots is INVAL");
+        be32(vm_base + LSP + 12, 0);
+        CHECK(create_task_ex(ELF, TASK_CTX, 0x2000, LSP) == 0, "three blocks for three slots is accepted");
+    } else if (!strcmp(mode, "task-ls-pattern-word0")) {
+        /* 0x02011D74: the first word's top six bits (local store 0..0x5FF) must
+         * be clear. */
+        make_elf(vm_base + ELF, 0x3000);
+        be32(vm_base + LSP + 0, 0x80000000u);
+        CHECK((uint32_t)create_task_ex(ELF, TASK_CTX, 0x2000, LSP) == 0x80410902u,
+              "a pattern marking the first 2 KB block is INVAL");
+    } else if (!strcmp(mode, "task-no-slot")) {
+        /* 0x02011F20: the creator's slot scan gives up with AGAIN. */
+        make_elf(vm_base + ELF, 0x3000);
+        memset(vm_base + TASKSET + 0x30, 0xFF, 16);   /* all 128 enabled bits set */
+        CHECK((uint32_t)create_task(ELF) == 0x80410901u, "no free task slot is AGAIN");
+        CHECK(dispatches == 0, "and nothing is dispatched");
+    } else if (!strcmp(mode, "task-attr-bad-elf")) {
+        /* _cellSpursTaskAttributeInitialize 0x02010D3C runs the same header check
+         * (ori 0x907 at 0x02010EC4) and a null ELF is its 0x80410911. */
+        CellSpursTaskAttribute* attr = (CellSpursTaskAttribute*)(uintptr_t)ATTR;
+        memset(vm_base + ELF, 0xA5, 0x100);
+        CHECK((uint32_t)_cellSpursTaskAttributeInitialize(attr, 1, 0x00350001u, ELF, TASK_CTX, 0x1000, 0, 0)
+              == 0x80410907u, "the attribute initializer rejects a non-ELF image with NOEXEC");
+        make_elf(vm_base + ELF, 0x3000);
+        CHECK(_cellSpursTaskAttributeInitialize(attr, 1, 0x00350001u, ELF, TASK_CTX, 0x1000, 0, 0) == 0,
+              "and accepts a real SPU ELF");
     } else if (!strcmp(mode, "task-segment")) {
-        make_elf(vm_base + ELF, 0x100);         /* an ELF, but its segment is not in the task area */
+        /* Accepted by the PPU check (vaddr > 0x2FFF) with a segment that leaves
+         * the task area at the top: the SPU-side loader halts. */
+        make_elf_phdrs(vm_base + ELF, 1);
+        phdr(vm_base + ELF, 0, 1, 84, 0x3F000, 0x3000, 16, 0x2000, 5);
         (void)create_task(ELF);
         fprintf(stderr, "FAIL: cellSpursCreateTask returned for an ELF the policy module cannot load\n");
         return 1;

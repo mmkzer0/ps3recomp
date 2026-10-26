@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
-"""A SPURS task or job the HLE cannot dispatch is a named stop or the firmware's error, never CELL_OK (#20).
+"""A SPURS task or job the HLE cannot dispatch is a named stop or the firmware's error, never CELL_OK (#20, #40).
 
 Builds tests/test_spurs_dispatch_miss.c (the real libs/spurs/cellSpurs.c over the real runtime units) and runs
 one mode per process:
 
   task-ok, task-null-elf, task-unaligned-elf
         a parseable task is dispatched; a null ELF is CELL_SPURS_TASK_ERROR_NULL_POINTER and one that is not
-        16-byte aligned CELL_SPURS_TASK_ERROR_ALIGN (RPCS3 _spurs::create_task), with no task id taken
-  task-bad-elf, task-bad-elf-host, task-segment
-        an aligned image the taskset policy module cannot load (not an SPU ELF; a PT_LOAD outside the task
-        area) ends in spurs-task-halt (RPCS3 spursTasksetLoadElf fails, then spursHalt): the taskset, task id,
-        ELF EA and reason, and the calling guest thread as the site (none from a host thread)
+        16-byte aligned CELL_SPURS_TASK_ERROR_ALIGN (libsre 0x02012520), with no task id taken
+  task-bad-elf, task-bad-machine, task-bad-entry, task-vaddr-low, task-attr-bad-elf
+        the PPU-side task-image check (libsre 0x02011ACC, and the same check in
+        _cellSpursTaskAttributeInitialize 0x02010D3C) returns 0x80410907 (NOEXEC) for a bad magic,
+        e_machine != 23, e_entry <= 0x2FFF or a PT_LOAD vaddr <= 0x2FFF -- a return value, never a stop
+  task-ctx-align, task-ctx-size, task-ls-pattern, task-ls-pattern-word0, task-no-slot
+        the creator's other PPU checks: the context alignment by SDK version (0x80410910), a context below
+        0x400 bytes or an lsPattern the context save area cannot hold (0x80410902), and no free task id
+        (0x80410901)
+  task-segment
+        an image the PPU accepts but the taskset policy module cannot load (a PT_LOAD outside the task area)
+        ends in spurs-task-halt (RPCS3 spursTasksetLoadElf fails, then spursHalt): the taskset, task id, ELF
+        EA and reason, and the calling guest thread as the site
   task-unmapped-elf
         an ELF EA whose header is not inside guest memory is hle-guest-range, not a host fault
   task-no-lifted, job-no-lifted
@@ -100,7 +108,10 @@ def main():
             assert p.returncode == 0 and f"PASS: {mode}" in p.stdout, (mode, p.returncode, p.stdout, p.stderr[-3000:])
 
         for mode in ("task-ok", "task-null-elf", "task-unaligned-elf", "job-ok",
-                     "task-ok-phdr-paddr", "task-ok-vaddr-wrap", "task-ok-empty-elf"):
+                     "task-ok-phdr-paddr", "task-ok-vaddr-wrap", "task-ok-empty-elf",
+                     "task-bad-elf", "task-bad-machine", "task-bad-entry", "task-vaddr-low",
+                     "task-ctx-align", "task-ctx-size", "task-ls-pattern",
+                     "task-ls-pattern-word0", "task-no-slot", "task-attr-bad-elf"):
             passes(mode)
 
         # spursTasksetLoadElf alignment (RPCS3 :1760 masks three flag bits, :1999 rejects the rest):
@@ -109,14 +120,10 @@ def main():
         assert f["api"] == "taskset-restart" and f["taskset"] == "0x00004000" and f["task"] == "0" \
             and f["elf"] == "0x00010008" and f["reason"] == "unaligned-elf", f
 
-        f = g.expect_stop(run("task-bad-elf"), "spurs-task-halt")
-        assert f["api"] == "cellSpursCreateTask" and f["taskset"] == "0x00004000" and f["task"] == "0" \
-            and f["elf"] == "0x00010000" and f["reason"] == "not-an-spu-elf", f
-        assert f["pc"] == "0x123450" and f["lr"] == "0x123450" and f["tid"] == "7", f
-        f = g.expect_stop(run("task-bad-elf-host"), "spurs-task-halt")
-        assert f["elf"] == "0x00010000" and "pc" not in f and "lr" not in f and "tid" not in f, f
         f = g.expect_stop(run("task-segment"), "spurs-task-halt")
-        assert f["reason"] == "segment-outside-task-area" and f["elf"] == "0x00010000", f
+        assert f["api"] == "cellSpursCreateTask" and f["taskset"] == "0x00004000" and f["task"] == "0" \
+            and f["elf"] == "0x00010000" and f["reason"] == "segment-outside-task-area", f
+        assert f["pc"] == "0x123450" and f["lr"] == "0x123450" and f["tid"] == "7", f
         f = g.expect_stop(run("task-unmapped-elf"), "hle-guest-range")
         assert f["func"] == "cellSpursCreateTask" and f["arg"] == "elf" and f["ea"] == "0x3FFF0" \
             and f["size"] == "0x34" and f["limit"] == "0x40000", f

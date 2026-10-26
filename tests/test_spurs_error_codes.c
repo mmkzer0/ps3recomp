@@ -3,13 +3,30 @@
  *
  * The values are literals here, not macros: the point is that the header's macros equal what the
  * firmware returns (libsre 4.93; RPCS3 cellSpurs.h at e53ac18f). A macro that drifts back to the
- * old 0x804107xx task range fails this test.
+ * old 0x804107xx task range fails this test, and a value the firmware never builds must not be
+ * defined at all (the #ifdef guards below).
  *
  * Firmware evidence: cellSpursCreateTask (code 0x02012520) returns 0x80410911 for a null taskset,
- * 0x80410910 for a misaligned one; cellSpursTaskExitCodeInitialize (0x02013638) 0x8041090F on its
- * state check. The task STAT path below reaches the same check without an initialised taskset. */
+ * 0x80410910 for a misaligned one and calls the shared creator (0x02011ACC) whose PPU-side ELF
+ * header check returns 0x80410907; cellSpursTaskExitCodeInitialize (0x02013638) 0x8041090F on its
+ * state check. The task STAT path below reaches the HLE's own initialised-taskset check without an
+ * initialised taskset. */
 #include <ps3emu/ps3types.h>
 #include "../libs/spurs/cellSpurs.h"
+
+/* Values libsre 4.93 never builds: a site for any of them would make this fail to compile. */
+#ifdef CELL_SPURS_TASK_ERROR_NOSYS
+#error "TASK NOSYS (0x80410903) is not a firmware code"
+#endif
+#ifdef CELL_SPURS_TASK_ERROR_NOMEM
+#error "TASK NOMEM (0x80410904) is not a firmware code"
+#endif
+#ifdef CELL_SPURS_TASK_ERROR_FAULT
+#error "TASK FAULT (0x8041090D) is not a firmware code"
+#endif
+#ifdef CELL_SPURS_CORE_ERROR_NOMEM
+#error "CORE NOMEM (0x80410704) is not a firmware code"
+#endif
 
 #include "../libs/spurs/cellSpurs.c"
 
@@ -32,6 +49,26 @@ unsigned long long ps3_ms_now(void) { return 0; }
 void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
 void sys_event_queue_cancel_by_id(u32 id) { (void)id; }
 void sys_event_queue_uncancel_by_id(u32 id) { (void)id; }
+/* The creator asks the SDK version (libsre 0x02011B78); the fixture is the
+ * runtime's own default, above 0x27FFFF. */
+static uint32_t fixture_sdk = 0x00350001u;
+uint32_t ps3_process_sdk_version(void) { return fixture_sdk; }
+
+#define ERR_ELF 0x1000u
+#define ERR_TS  0x3000u
+#define ERR_TID 0x4000u
+
+/* A 32-bit big-endian SPU ELF the PPU-side check accepts: the 8-byte magic,
+ * e_machine 23, e_entry 0x3000, no program headers. */
+static void make_min_elf(uint32_t ea)
+{
+    memset(vm_base + ea, 0, 0x40);
+    memcpy(vm_base + ea, "\177ELF", 4);
+    vm_base[ea + 4] = 1; vm_base[ea + 5] = 2; vm_base[ea + 6] = 1; vm_base[ea + 7] = 0;
+    vm_base[ea + 0x13] = 23;                    /* e_machine, big-endian */
+    vm_base[ea + 0x1A] = 0x30;                  /* e_entry 0x00003000 */
+    /* e_phnum (+0x2C) = 0 */
+}
 
 static int g_failures;
 
@@ -55,15 +92,22 @@ int main(void)
     CHECK_CODE("cellSpursInitialize(NULL) [core]",
                cellSpursInitialize(NULL, 1, 0, 0, 0), 0x80410711u);
 
-    /* TASK family, through CreateTask: null, unaligned, and the no-init STAT. */
+    /* TASK family, through CreateTask: null, unaligned, a header the PPU
+     * rejects, and the HLE's no-init STAT once the image is acceptable. */
     CHECK_CODE("cellSpursCreateTask(NULL ...) [task]",
                cellSpursCreateTask(NULL, NULL, NULL, NULL, 0, 0, 0), 0x80410911u);
     CHECK_CODE("cellSpursCreateTask(elf=...001) [task align]",
                cellSpursCreateTask((CellSpursTaskset*)0x1000, (CellSpursTaskId*)0x1100,
                                    (void*)0x1001, NULL, 0, 0, 0), 0x80410910u);
-    CHECK_CODE("cellSpursCreateTask(uninitialised) [task stat]",
-               cellSpursCreateTask((CellSpursTaskset*)0x1000, (CellSpursTaskId*)0x1100,
-                                   (void*)0x1000, NULL, 0, 0, 0), 0x8041090Fu);
+    CHECK_CODE("cellSpursCreateTask(zero image) [task noexec]",
+               cellSpursCreateTask((CellSpursTaskset*)(uintptr_t)ERR_TS,
+                                   (CellSpursTaskId*)(uintptr_t)ERR_TID,
+                                   (void*)0x1000, NULL, 0, 0, 0), 0x80410907u);
+    make_min_elf(ERR_ELF);
+    CHECK_CODE("cellSpursCreateTask(valid ELF, no init) [task stat]",
+               cellSpursCreateTask((CellSpursTaskset*)(uintptr_t)ERR_TS,
+                                   (CellSpursTaskId*)(uintptr_t)ERR_TID,
+                                   (void*)(uintptr_t)ERR_ELF, NULL, 0, 0, 0), 0x8041090Fu);
 
     /* TASK family, through a second API: the exit code object. */
     CHECK_CODE("cellSpursTaskExitCodeInitialize(NULL) [task]",
@@ -73,8 +117,9 @@ int main(void)
 
     /* Families with no HLE path that returns them: the constants themselves carry the firmware's
      * values (RPCS3 CellSpursTaskError / CellSpursPolicyModuleError / CellSpursJobError). */
+    CHECK_CODE("CELL_SPURS_TASK_ERROR_AGAIN", CELL_SPURS_TASK_ERROR_AGAIN, 0x80410901u);
+    CHECK_CODE("CELL_SPURS_TASK_ERROR_INVAL", CELL_SPURS_TASK_ERROR_INVAL, 0x80410902u);
     CHECK_CODE("CELL_SPURS_TASK_ERROR_NOEXEC", CELL_SPURS_TASK_ERROR_NOEXEC, 0x80410907u);
-    CHECK_CODE("CELL_SPURS_TASK_ERROR_FAULT", CELL_SPURS_TASK_ERROR_FAULT, 0x8041090Du);
     CHECK_CODE("CELL_SPURS_TASK_ERROR_FATAL", CELL_SPURS_TASK_ERROR_FATAL, 0x80410914u);
     CHECK_CODE("CELL_SPURS_TASK_ERROR_SHUTDOWN", CELL_SPURS_TASK_ERROR_SHUTDOWN, 0x80410920u);
     CHECK_CODE("CELL_SPURS_POLICY_MODULE_ERROR_AGAIN", CELL_SPURS_POLICY_MODULE_ERROR_AGAIN, 0x80410801u);

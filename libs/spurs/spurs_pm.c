@@ -80,7 +80,7 @@ uint64_t spurs_pm_build_context(uint8_t* ls, uint32_t taskset_ea, uint32_t taskI
      * validation reads fields the real kernel + taskset PM populate there.
      * moduleId @0x1E4 must be "TK" (stamped by the taskset PM, RPCS3
      * spursTasksetInit) -- without it every task-API wait (event flag / queue)
-     * fails its context check with ERROR_STAT 0x80410909: LBP's binkspu movie
+     * fails its context check with 0x80410909: LBP's binkspu movie
      * IO task spun forever on exactly that, so BinkWait never completed and
      * the intro never produced a frame. Also plant the spurs instance ptr
      * (@0x1C0, read from the taskset header) + spuNum/dmaTagId, which the

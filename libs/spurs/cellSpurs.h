@@ -25,10 +25,18 @@ extern "C" {
  *   - cellSpursCreateTask (code 0x02012520) returns 0x80410911 for a null
  *     taskset (lis 0x8041 / ori 0x911 at 0x0201253C-0x02012548) and 0x80410910
  *     for a misaligned one (ori 0x910 at 0x02012594);
+ *   - the shared task creator it calls (0x02011ACC) returns 0x80410902 for the
+ *     context/lsPattern checks (ori 0x902 at 0x02011D84), 0x80410907 for the
+ *     task ELF header (ori 0x907 at 0x02011C1C) and 0x80410901 with no free
+ *     task slot (ori 0x901 at 0x02011F20);
  *   - cellSpursTaskExitCodeInitialize (0x02013638) returns 0x8041090F on its
  *     state check (ori 0x90F at 0x02013760);
- *   - 0x804108xx policy returns are in libsre (0x801/0x802/0x810/0x811 at
- *     0x020085E8..0x020099D0) and the 0x80410A17 job code in libspurs_jq.
+ *   - the workload API is the policy-module family (0x804108xx): RemoveWorkload
+ *     (0x0200A50C) returns 0x811/0x810/0x802/0x805/0x80A/0x80F, AddWorkload's
+ *     shared body (0x020097E4) 0x801 with no free workload;
+ *   - the job-chain API is the job family (0x80410Axx): JoinJobChain
+ *     (0x02018EBC) 0x80410A11/0x80410A10, JobGuardInitialize (0x02018188)
+ *     0x80410A02/0x80410A10/0x80410A11.
  * A code with no firmware or RPCS3 backing is not defined here.
  * -----------------------------------------------------------------------*/
 
@@ -38,10 +46,13 @@ extern "C" {
 #define CELL_SPURS_ERROR_BASE_JOB               0x80410A00
 
 /* Core return codes (RPCS3 CellSpursCoreError; firmware literals 0x0701,
- * 0x0702, 0x0705, 0x0709, 0x070A, 0x070F, 0x0710, 0x0711). */
+ * 0x0702, 0x0705, 0x0709, 0x070A, 0x070F, 0x0710, 0x0711). There is no CORE
+ * 0x80410704 (NOMEM): libsre 4.93 has no site that builds it -- neither the
+ * instance initializer (0x020075DC returns 0x0702/0x0709/0x070A/0x070F/0x0710/
+ * 0x0711) nor any other function. A host allocation failure is reported as
+ * STAT, a code the firmware does return for an instance it cannot use. */
 #define CELL_SPURS_CORE_ERROR_AGAIN             (CELL_ERROR_BASE_SPURS | 0x01)
 #define CELL_SPURS_CORE_ERROR_INVAL             (CELL_ERROR_BASE_SPURS | 0x02)
-#define CELL_SPURS_CORE_ERROR_NOMEM             (CELL_ERROR_BASE_SPURS | 0x04)
 #define CELL_SPURS_CORE_ERROR_SRCH              (CELL_ERROR_BASE_SPURS | 0x05)
 #define CELL_SPURS_CORE_ERROR_BUSY              (CELL_ERROR_BASE_SPURS | 0x0A)
 #define CELL_SPURS_CORE_ERROR_STAT              (CELL_ERROR_BASE_SPURS | 0x0F)
@@ -68,17 +79,18 @@ extern "C" {
 #define CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER (CELL_SPURS_ERROR_BASE_POLICY_MODULE | 0x11)
 
 /* Task return codes (RPCS3 CellSpursTaskError). The task range is 0x804109xx:
- * the CreateTask NULL_POINTER/ALIGN returns above and the STAT return of
- * TaskExitCodeInitialize are the firmware's own literals. */
+ * the CreateTask NULL_POINTER/ALIGN/INVAL/NOEXEC/AGAIN returns and the STAT
+ * return of TaskExitCodeInitialize are the firmware's own literals. Only codes
+ * libsre 4.93 actually builds are defined: TASK NOSYS (0x03), NOMEM (0x04),
+ * NOENT (0x06) and FAULT (0x0D) have no site in the image (RPCS3 defines them;
+ * the firmware does not return them), and a guest span the host cannot back is
+ * a named stop (hle-guest-range), never a fabricated code. */
 #define CELL_SPURS_TASK_ERROR_AGAIN             (CELL_SPURS_ERROR_BASE_TASK | 0x01)
 #define CELL_SPURS_TASK_ERROR_INVAL             (CELL_SPURS_ERROR_BASE_TASK | 0x02)
-#define CELL_SPURS_TASK_ERROR_NOSYS             (CELL_SPURS_ERROR_BASE_TASK | 0x03)
-#define CELL_SPURS_TASK_ERROR_NOMEM             (CELL_SPURS_ERROR_BASE_TASK | 0x04)
 #define CELL_SPURS_TASK_ERROR_SRCH              (CELL_SPURS_ERROR_BASE_TASK | 0x05)
 #define CELL_SPURS_TASK_ERROR_NOEXEC            (CELL_SPURS_ERROR_BASE_TASK | 0x07)
 #define CELL_SPURS_TASK_ERROR_PERM              (CELL_SPURS_ERROR_BASE_TASK | 0x09)
 #define CELL_SPURS_TASK_ERROR_BUSY              (CELL_SPURS_ERROR_BASE_TASK | 0x0A)
-#define CELL_SPURS_TASK_ERROR_FAULT             (CELL_SPURS_ERROR_BASE_TASK | 0x0D)
 #define CELL_SPURS_TASK_ERROR_STAT              (CELL_SPURS_ERROR_BASE_TASK | 0x0F)
 #define CELL_SPURS_TASK_ERROR_ALIGN             (CELL_SPURS_ERROR_BASE_TASK | 0x10)
 #define CELL_SPURS_TASK_ERROR_NULL_POINTER      (CELL_SPURS_ERROR_BASE_TASK | 0x11)

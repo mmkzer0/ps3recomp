@@ -506,7 +506,10 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
         for (int i = 0; i < MAX_SPURS_INST; i++)
             if (!__atomic_load_n(&s_inst[i].ea, __ATOMIC_ACQUIRE)) { si = &s_inst[i]; break; }
     }
-    if (!si) { ReleaseSRWLockExclusive(&s_inst_directory_lock); return CELL_SPURS_CORE_ERROR_NOMEM; }
+    /* A host table that cannot hold another instance. The firmware has no
+     * NOMEM code for this (0x80410704 has no site anywhere in libsre 4.93);
+     * STAT is a code it does return for an instance it cannot use. */
+    if (!si) { ReleaseSRWLockExclusive(&s_inst_directory_lock); return CELL_SPURS_CORE_ERROR_STAT; }
 
     AcquireSRWLockExclusive(&si->lock);
     if (si->kernel_live || si->stopping || si->starting) {
@@ -842,7 +845,7 @@ static int spurs_guest_range_valid(u32 ea, u32 bytes)
  * Taskset
  * =====================================================================*/
 
-static s32 spurs_create_taskset(CellSpurs* spurs, CellSpursTaskset* taskset,
+static s32 spurs_create_taskset(const char* api, CellSpurs* spurs, CellSpursTaskset* taskset,
                                 u64 args, const u8* priority, u32 maxContention,
                                 u32 taskset_size)
 {
@@ -867,8 +870,13 @@ static s32 spurs_create_taskset(CellSpurs* spurs, CellSpursTaskset* taskset,
         return CELL_SPURS_CORE_ERROR_STAT;
     }
 
-    if (!spurs_guest_range_valid(taskset_ea, taskset_size))
-        return CELL_SPURS_TASK_ERROR_FAULT; /* host backing safety, before writes */
+    /* A taskset span the host cannot back is a stop (hle-guest-range), never a
+     * fabricated code: libsre 4.93 has no site that returns 0x8041090D. The
+     * header is written even for a zero requested size, so that span is what
+     * must be backed. */
+    { const u32 need = taskset_size ? taskset_size : CSTS_STRUCT_END;
+      if (!spurs_guest_range_valid(taskset_ea, need))
+          ps3_stop_guest_range(api, "taskset", taskset_ea, need, vm_guest_limit()); }
     taskset = GUEST_PTR(taskset, CellSpursTaskset*);
     memset(taskset, 0, taskset_size);
 
@@ -887,8 +895,8 @@ static s32 spurs_create_taskset(CellSpurs* spurs, CellSpursTaskset* taskset,
 s32 cellSpursCreateTaskset(CellSpurs* spurs, CellSpursTaskset* taskset,
                            u64 args, const u8* priority, u32 maxContention)
 {
-    return spurs_create_taskset(spurs, taskset, args, priority, maxContention,
-                                CSTS_STRUCT_END);
+    return spurs_create_taskset("cellSpursCreateTaskset", spurs, taskset, args, priority,
+                                maxContention, CSTS_STRUCT_END);
 }
 
 s32 cellSpursCreateTasksetWithAttribute(CellSpurs* spurs,
@@ -898,11 +906,17 @@ s32 cellSpursCreateTasksetWithAttribute(CellSpurs* spurs,
     u32 attr_ea = (u32)(uintptr_t)attr;
     if (!attr_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
     if (attr_ea & 7u) return CELL_SPURS_TASK_ERROR_ALIGN;
-    if (!spurs_guest_range_valid(attr_ea, sizeof(*attr))) return CELL_SPURS_TASK_ERROR_FAULT;
+    /* 0x02014CF8 checks the attribute's null, alignment and revision; the size
+     * test lives only in cellSpursTasksetAttributeSetTasksetSize (0x02014360),
+     * so an attribute that never went through the setter keeps the size it was
+     * initialised with. */
+    if (!spurs_guest_range_valid(attr_ea, sizeof(*attr)))
+        ps3_stop_guest_range("cellSpursCreateTasksetWithAttribute", "attr", attr_ea,
+                             sizeof(*attr), vm_guest_limit());
     const CellSpursTasksetAttribute* attr_h = GUEST_PTR(attr, const CellSpursTasksetAttribute*);
     u32 size = attr_h->tasksetSize;
-    if (size != 0x1900u && size != 0x2900u) return CELL_SPURS_TASK_ERROR_INVAL;
-    return spurs_create_taskset(spurs, taskset, 0, NULL, 0, size);
+    return spurs_create_taskset("cellSpursCreateTasksetWithAttribute", spurs, taskset, 0,
+                                NULL, 0, size);
 }
 
 s32 cellSpursDestroyTaskset(CellSpursTaskset* taskset)
@@ -958,6 +972,74 @@ s32 cellSpursTasksetAttributeSetName(CellSpursTasksetAttribute* attr,
  * Task
  * =====================================================================*/
 
+/* The SDK version the firmware gates features on (lv2 syscall 25); the HLE
+ * libraries ask it the way libsre does (libs/video/cellResc.c does the same). */
+extern u32 ps3_process_sdk_version(void);
+
+/* The creator's PPU-side task-image test. libsre 4.93 runs it in the shared
+ * creator 0x02011ACC (cellSpursCreateTask 0x02012520 calls it with r3..r9 =
+ * taskset, taskId, elf, context, sizeContext, lsPattern, argument) and again in
+ * _cellSpursTaskAttributeInitialize 0x02010D3C:
+ *
+ *   0x02011BFC..0x02011C24  the first 8 bytes must be 7F454C46 01020100
+ *                           (ELF32, big-endian, EV_CURRENT)
+ *   0x02011D90             e_machine (+0x12) == 23 (EM_SPU)
+ *   0x02011D9C             e_entry   (+0x18) > 0x2FFF
+ *   0x02011EF8             every PT_LOAD's p_vaddr (+8) > 0x2FFF
+ *
+ * A failure returns 0x80410907 (NOEXEC) from the PPU side. That is a return
+ * value, not the SPU-side halt: the console's create call has already returned
+ * CELL_OK when the taskset policy module loads the image and finds a segment
+ * outside the task area (see spu_task_elf_halt_reason and docs/STOPS.md).
+ *
+ * The program-header walk is the firmware's: 32-bit wrapping EA arithmetic,
+ * e_phentsize added per iteration, every header of the table looked at. The
+ * read spans are checked first; the console would fault on an unmapped one, and
+ * the HLE stops by name (hle-guest-range) rather than reading host memory. */
+static s32 spurs_task_elf_header_code(u32 elf_ea, const char* api)
+{
+    if (!vm_range_ok(elf_ea, 0x34))
+        ps3_stop_guest_range(api, "elf", elf_ea, 0x34, vm_guest_limit());
+    if ((((u64)vm_read32(elf_ea) << 32) | vm_read32(elf_ea + 4)) != 0x7F454C4601020100ull)
+        return CELL_SPURS_TASK_ERROR_NOEXEC;
+    if (vm_read16(elf_ea + 0x12) != 23u)
+        return CELL_SPURS_TASK_ERROR_NOEXEC;
+    if (vm_read32(elf_ea + 0x18) <= 0x2FFFu)
+        return CELL_SPURS_TASK_ERROR_NOEXEC;
+
+    const u32 e_phoff     = vm_read32(elf_ea + 0x1C);
+    const u16 e_phentsize = vm_read16(elf_ea + 0x2A);
+    const u16 e_phnum     = vm_read16(elf_ea + 0x2C);
+    u32 ph = elf_ea + e_phoff;                 /* 32-bit wrap, as 0x02011DBC */
+    for (u16 k = 0; k < e_phnum; k++, ph += e_phentsize) {
+        if (!vm_range_ok(ph, 0x0Cu))
+            ps3_stop_guest_range(api, "elf program headers", ph, 0x0C, vm_guest_limit());
+        if (vm_read32(ph) != 1u) continue;     /* PT_LOAD */
+        if (vm_read32(ph + 8) <= 0x2FFFu)
+            return CELL_SPURS_TASK_ERROR_NOEXEC;
+    }
+    return CELL_OK;
+}
+
+/* The creator's lsPattern test (0x02011C38..0x02011D80). The pattern is a
+ * 128-bit map of the 2 KB local-store blocks the task may dirty, and the
+ * context save area holds one slot per such block: 122 by default, else
+ * (sizeContext - 1024) / 2048 (rlwinm at 0x02011E00), with a null context
+ * giving none. The firmware returns 0x80410902 (INVAL) when the pattern marks
+ * more blocks than there are slots (0x02011D6C) or when its first word's top
+ * six bits are set (0x02011D74; local store 0x0000..0x05FF is the policy
+ * module's own). A null pattern is not checked at all. */
+static int spurs_task_ls_pattern_bad(const u32 lsp[4], u32 context_ea, u32 size_context)
+{
+    unsigned bits = 0;
+    for (int w = 0; w < 4; w++)
+        for (u32 v = lsp[w]; v; v >>= 1) bits += v & 1u;
+    const u32 slots = context_ea
+        ? (size_context > 0x3D400u ? 122u : (size_context - 1024u) >> 11)
+        : 0u;
+    return bits > slots || (lsp[0] & 0xFC000000u) != 0;
+}
+
 /* Real SDK ABI (verified against RPCS3 cellSpurs.cpp:370):
  *   cellSpursCreateTask(taskset, taskId, elf, context, sizeContext,
  *                       CellSpursTaskLsPattern* lsPattern,
@@ -972,8 +1054,6 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
                         void* elf, void* context, u32 sizeContext,
                         u32 lsPattern_ea, u32 argument_ea)
 {
-    (void)context; (void)sizeContext;
-
     /* Read the 16-byte CellSpursTaskArgument + optional LS pattern from guest mem. */
     uint32_t task_arg[4] = {0,0,0,0};
     uint32_t task_lsp[4] = {0,0,0,0};
@@ -996,11 +1076,9 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
         return CELL_SPURS_TASK_ERROR_NULL_POINTER;
     }
 
-    /* RPCS3 _spurs::create_task (Emu/Cell/Modules/cellSpurs.cpp), the oracle for libspurs: a null ELF is
-     * CELL_SPURS_TASK_ERROR_NULL_POINTER (0x80410911), one not 16-byte aligned CELL_SPURS_TASK_ERROR_ALIGN
-     * (0x80410910), both before a task id is taken. Nothing else about the image is checked on the PPU
-     * ("TODO: Verify the ELF header is proper"); a bad image is found by the SPU-side policy module, below.
-     * The macros carry the firmware's values (libsre 0x02012520 returns these same literals). */
+    /* The creator's first three checks (0x02011B24, 0x02011B68, 0x02011B88):
+     * a null taskset or ELF is NULL_POINTER, and the ELF's address must be
+     * 16-byte aligned (ALIGN) under either SDK branch. */
     if (!elf_ea) {
         fprintf(stderr, "[cellSpurs] CreateTask REJECT null elf (taskset=0x%08X)\n", taskset_ea);
         return CELL_SPURS_TASK_ERROR_NULL_POINTER;
@@ -1008,6 +1086,40 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
     if (elf_ea & 15u) {
         fprintf(stderr, "[cellSpurs] CreateTask REJECT unaligned elf 0x%08X (taskset=0x%08X)\n", elf_ea, taskset_ea);
         return CELL_SPURS_TASK_ERROR_ALIGN;
+    }
+
+    /* cellSpursCreateTask 0x02012520 takes a task id only after the shared
+     * creator 0x02011ACC has accepted the arguments, and the creator checks in
+     * this order: the context's alignment (128 bytes above SDK 0x27FFFF, 16
+     * bytes at or below it; 0x02011B88/0x02011BD4), a context size of 0x400
+     * or more when a context is given (0x02011BF4), the ELF header
+     * (spurs_task_elf_header_code), the lsPattern, and only then a free task
+     * slot. Every failure is a return value, never the SPU-side halt. #41
+     * covers the SDK gates outside this call. */
+    { const u32 sdk = ps3_process_sdk_version();
+      const u32 ctx_mask = sdk > 0x27FFFFu ? 0x7Fu : 0x0Fu;
+      if (context_ea & ctx_mask) {
+          fprintf(stderr, "[cellSpurs] CreateTask REJECT misaligned context 0x%08X (sdk 0x%08X mask 0x%X)\n",
+                  context_ea, sdk, ctx_mask);
+          return CELL_SPURS_TASK_ERROR_ALIGN;
+      } }
+    if (context_ea && sizeContext <= 0x3FFu) {
+        fprintf(stderr, "[cellSpurs] CreateTask REJECT context size %u (taskset=0x%08X)\n",
+                sizeContext, taskset_ea);
+        return CELL_SPURS_TASK_ERROR_INVAL;
+    }
+
+    { const s32 hdr = spurs_task_elf_header_code(elf_ea, "cellSpursCreateTask");
+      if (hdr) {
+          fprintf(stderr, "[cellSpurs] CreateTask REJECT task ELF header 0x%08X (taskset=0x%08X)\n",
+                  elf_ea, taskset_ea);
+          return hdr;
+      } }
+
+    if (lsPattern_ea && spurs_task_ls_pattern_bad(task_lsp, context_ea, sizeContext)) {
+        fprintf(stderr, "[cellSpurs] CreateTask REJECT lsPattern 0x%08X for context 0x%08X size %u\n",
+                lsPattern_ea, context_ea, sizeContext);
+        return CELL_SPURS_TASK_ERROR_INVAL;
     }
 
     if (!g_ydkj_real_taskset_ea) { /* real-BE init flag (native ->initialized clobbered by BE layout) */
@@ -1122,18 +1234,19 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
                 fflush(stderr);
             }
 
-            /* The SPU-side taskset policy module loads the ELF when it dispatches the task, and when the
-             * load fails it halts the SPU: RPCS3 cellSpursSpu.cpp spursTasksetDispatch, `if
-             * (spursTasksetLoadElf(...) != CELL_OK) { spu_log.error(...); spursHalt(spu); }`. The create
-             * call has already returned CELL_OK on the console, so the halt is what the guest sees; the HLE
-             * dispatches here, and an image the loader would refuse is that halt (a task that "started" and
-             * never runs is the one outcome the console never produces). A span outside guest memory is the
-             * HLE range rule's stop, not a guess about what the ELF would have been. */
+            /* The PPU accepted the header above; what is left is the SPU-side
+             * taskset policy module's own load, which it performs at dispatch
+             * and which halts the SPU when it fails (RPCS3 cellSpursSpu.cpp
+             * spursTasksetDispatch, `if (spursTasksetLoadElf(...) != CELL_OK)
+             * { spu_log.error(...); spursHalt(spu); }`). The create call has
+             * already returned CELL_OK on the console, so the halt is what the
+             * guest sees; the HLE dispatches here, and an image the loader
+             * refuses is that halt. Only reasons the PPU-side check does not
+             * cover reach this: a PT_LOAD outside the task area, or a segment
+             * whose file bytes leave the image. */
             {
                 const ps3_stop_site site = { g_active_ctx ? g_active_ctx->lr : 0u, g_active_ctx ? g_active_ctx->lr : 0u,
                                              g_active_ctx ? g_active_ctx->thread_id : 0u };
-                if (!vm_range_ok(elf_ea, 0x34))
-                    ps3_stop_guest_range("cellSpursCreateTask", "elf", elf_ea, 0x34, vm_guest_limit());
                 size_t sz = 0;
                 const char* why = spu_task_elf_halt_reason(elf_ea, &sz);
                 if (why)
@@ -1159,7 +1272,10 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
 
     fprintf(stderr, "[cellSpurs] CreateTask: taskset 0x%08X has no free task id (all 128 enabled)\n",
             taskset_ea);
-    return CELL_SPURS_TASK_ERROR_NOMEM;
+    /* 0x80410901: the creator retries its slot scan and gives up with AGAIN
+     * (ori 0x901 at 0x02011F20), not NOMEM -- the firmware never builds
+     * 0x80410904 there. */
+    return CELL_SPURS_TASK_ERROR_AGAIN;
 }
 
 /* The SDK's versioned task-attribute initializer. ABI (8 GPR args):
@@ -1174,6 +1290,16 @@ s32 _cellSpursTaskAttributeInitialize(CellSpursTaskAttribute* attr, u32 revision
 {
     (void)sdkVersion;
     if (!attr) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    /* _cellSpursTaskAttributeInitialize 0x02010D3C checks the task image the
+     * same way the creator does: a null ELF (0x02010DD4) and then the header
+     * (spurs_task_elf_header_code; ori 0x907 at 0x02010EC4). Both are return
+     * values, so an attribute built from a bad image never reaches create. The
+     * context and size checks of the same function are not repeated here: this
+     * HLE entry's r6/r7 shapes are the ones the argument-form hacks below
+     * rewrite, and the create path checks the fields it forwards. */
+    if (!(u32)eaElf) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    { const s32 hdr = spurs_task_elf_header_code((u32)eaElf, "_cellSpursTaskAttributeInitialize");
+      if (hdr) return hdr; }
     attr = GUEST_PTR(attr, CellSpursTaskAttribute*);
     memset(attr, 0, sizeof(CellSpursTaskAttribute));
     attr->revision    = revision;
@@ -1349,20 +1475,17 @@ s32 cellSpursTaskExitCodeInitialize(CellSpursTaskExitCode* exitCode)
     if (!ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
     if (ea & 0x7Fu) return CELL_SPURS_TASK_ERROR_ALIGN;
 
-    /* A zero size denotes the existing fully backed 32-bit VM convention.
-     * Native-VA ports may have a null base with a nonzero mapped size. Check
-     * before forming a host address, so malformed EAs cannot wrap or write
-     * outside a bounded arena. FAULT is a host-backing safety failure. */
-    extern u32 ppu_vm_size;
-    u64 end = (u64)ea + 0x80u;
-    uintptr_t base = (uintptr_t)vm_base;
-    if ((!vm_base && !ppu_vm_size) ||
-        end > 0x100000000ull ||
-        (ppu_vm_size && end > ppu_vm_size) ||
-        base > UINTPTR_MAX - ea || base + ea > UINTPTR_MAX - 0x7Fu)
-        return CELL_SPURS_TASK_ERROR_FAULT;
+    /* The firmware (0x02013638) checks the pointer's null and 128-byte
+     * alignment and then clears 0x80 bytes -- nothing else. A container the
+     * host cannot back is a stop (hle-guest-range), never 0x8041090D: libsre
+     * builds no such task code. A zero ppu_vm_size still means the whole
+     * 32-bit guest arena (vm_guest_limit), and a native-VA port has vm_base 0,
+     * so the readiness test is vm_range_ok's, not "vm_base != NULL". */
+    if ((uintptr_t)vm_base > UINTPTR_MAX - ea || !vm_range_ok(ea, 0x80u))
+        ps3_stop_guest_range("cellSpursTaskExitCodeInitialize", "exitCode", ea, 0x80u,
+                             vm_guest_limit());
 
-    memset((void*)(base + ea), 0, 0x80u);
+    memset((void*)((uintptr_t)vm_base + ea), 0, 0x80u);
     return CELL_OK;
 }
 
@@ -1376,7 +1499,7 @@ s32 cellSpursAddWorkload(CellSpurs* spurs, CellSpursWorkloadId* wid,
                          u32 maxContention)
 {
     if (!spurs || !wid)
-        return CELL_SPURS_CORE_ERROR_NULL_POINTER;
+        return CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER;
     /* spurs/wid/priority are guest EAs; pm stays a guest EA (it's the SPU
      * program address consumed later by the workload dispatch). */
     uint32_t spurs_ea = (uint32_t)(uintptr_t)spurs;
@@ -1437,7 +1560,11 @@ s32 cellSpursAddWorkload(CellSpurs* spurs, CellSpursWorkloadId* wid,
     }
 
     spurs_api_unlock(si);
-    return CELL_SPURS_CORE_ERROR_NOMEM;
+    /* The shared add body returns 0x80410801 (AGAIN) when no workload slot is
+     * free (ori 0x801 in the slot scan of 0x020097E4); the policy family, not
+     * CORE, and again not NOMEM (the firmware builds neither 0x80410804 nor
+     * 0x80410704 anywhere). */
+    return CELL_SPURS_POLICY_MODULE_ERROR_AGAIN;
 }
 
 /* Real (BE) CellSpursWorkloadAttribute offsets (libspurs layout; the game's
@@ -1486,7 +1613,9 @@ s32 cellSpursAddWorkloadWithAttribute(CellSpurs* spurs,
                                        CellSpursWorkloadId* wid,
                                        const CellSpursWorkloadAttribute* attr)
 {
-    if (!attr) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
+    /* 0x02009F0C: a null attribute is 0x80410811 and a misaligned one
+     * 0x80410810, both policy-module codes. */
+    if (!attr) return CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER;
     uint32_t attr_ea = (uint32_t)(uintptr_t)attr;
 
     /* Decode the REAL BE attribute from guest memory. */
@@ -1567,7 +1696,8 @@ s32 _cellSpursWorkloadAttributeInitialize(u64 attr_ea, u32 revision, u32 sdkVers
                                           u64 pm_ea, u32 size, u64 data,
                                           u64 prio_ea, u32 minContention)
 {
-    if (!attr_ea) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
+    /* 0x0200A000: null attribute 0x80410811, misalignment 0x80410810. */
+    if (!attr_ea) return CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER;
     vm_write32((u32)attr_ea + WKATTR_REVISION,   revision);
     vm_write32((u32)attr_ea + WKATTR_SDKVERSION, sdkVersion);
     vm_write32((u32)attr_ea + WKATTR_PM,         (u32)pm_ea);
@@ -1589,7 +1719,8 @@ s32 _cellSpursWorkloadAttributeInitialize(u64 attr_ea, u32 revision, u32 sdkVers
 
 s32 cellSpursWorkloadAttributeSetName(u64 attr_ea, u64 nameClass_ea, u64 nameInstance_ea)
 {
-    if (!attr_ea) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
+    /* 0x0200975C: null attribute 0x80410811, misalignment 0x80410810. */
+    if (!attr_ea) return CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER;
     vm_write32((u32)attr_ea + WKATTR_NAME_CLASS, (u32)nameClass_ea);
     vm_write32((u32)attr_ea + WKATTR_NAME_INST,  (u32)nameInstance_ea);
     printf("[cellSpurs] WorkloadAttributeSetName(attr=0x%08X, \"%s\", \"%s\")\n",
@@ -1601,17 +1732,21 @@ s32 cellSpursWorkloadAttributeSetName(u64 attr_ea, u64 nameClass_ea, u64 nameIns
 
 s32 cellSpursRemoveWorkload(CellSpurs* spurs, CellSpursWorkloadId wid)
 {
-    if (!spurs) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
-    if (wid >= CELL_SPURS_MAX_WORKLOAD) return CELL_SPURS_CORE_ERROR_INVAL;
+    /* 0x0200A50C, in the firmware's order: null 0x80410811, misalignment
+     * 0x80410810, an id past the workload table 0x80410802, an id that names no
+     * workload 0x80410805, a workload still running 0x8041080A, any other
+     * state 0x8041080F -- the policy-module family, never CORE. */
+    if (!spurs) return CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER;
+    if (wid >= CELL_SPURS_MAX_WORKLOAD) return CELL_SPURS_POLICY_MODULE_ERROR_INVAL;
     struct SpursInst* si;
     s32 rc = spurs_api_lock((u32)(uintptr_t)spurs, &si);
     if (rc) return rc;
     if (!s_workloads[wid].in_use || s_workloads[wid].spurs_ea != si->ea) {
-        spurs_api_unlock(si); return CELL_SPURS_CORE_ERROR_SRCH;
+        spurs_api_unlock(si); return CELL_SPURS_POLICY_MODULE_ERROR_SRCH;
     }
 
     if (si->active[wid] || spurs_policy_release_workload(si->ea, wid)) {
-        spurs_api_unlock(si); return CELL_SPURS_CORE_ERROR_BUSY;
+        spurs_api_unlock(si); return CELL_SPURS_POLICY_MODULE_ERROR_BUSY;
     }
     s_workloads[wid].in_use = 0;
     vm_write8(si->ea + SPURS_WKL_STATE1 + wid, 3);
@@ -1630,7 +1765,8 @@ s32 cellSpursWorkloadAttributeInitialize(CellSpursWorkloadAttribute* attr,
                                          u32 minContention,
                                          u32 maxContention)
 {
-    if (!attr) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
+    /* 0x0200A000 (the shared initializer): null attribute 0x80410811. */
+    if (!attr) return CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER;
     attr = GUEST_PTR(attr, CellSpursWorkloadAttribute*);
     const u8* priority_h = GUEST_PTR(priority, const u8*);
 
@@ -1824,7 +1960,9 @@ failed:
     AcquireSRWLockExclusive(&si->lock);
     si->kernel_live = 0; si->stopping = 0;
     ReleaseSRWLockExclusive(&si->lock);
-    return CELL_SPURS_CORE_ERROR_NOMEM;
+    /* The host could not start the kernel's threads; the firmware has no NOMEM
+     * to return for that (see spurs_initialize_common). */
+    return CELL_SPURS_CORE_ERROR_STAT;
 }
 
 static s32 spurs_scheduler_stop(struct SpursInst* si, u32 ea)
@@ -1866,13 +2004,15 @@ static void spurs_scheduler_retire(u32 ea)
 s32 cellSpursReadyCountStore(CellSpurs* spurs, CellSpursWorkloadId wid,
                              u32 value)
 {
-    if (!spurs) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
-    if (wid >= CELL_SPURS_MAX_WORKLOAD) return CELL_SPURS_CORE_ERROR_INVAL;
+    /* 0x0200AC24: null 0x80410811, id past the table 0x80410802, an id that
+     * names no workload 0x80410805 -- the policy-module family. */
+    if (!spurs) return CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER;
+    if (wid >= CELL_SPURS_MAX_WORKLOAD) return CELL_SPURS_POLICY_MODULE_ERROR_INVAL;
     struct SpursInst* si;
     s32 rc = spurs_api_lock((u32)(uintptr_t)spurs, &si);
     if (rc) return rc;
     if (!s_workloads[wid].in_use || s_workloads[wid].spurs_ea != si->ea) {
-        spurs_api_unlock(si); return CELL_SPURS_CORE_ERROR_SRCH;
+        spurs_api_unlock(si); return CELL_SPURS_POLICY_MODULE_ERROR_SRCH;
     }
 
     s_workloads[wid].readyCount = value;
@@ -1892,13 +2032,15 @@ s32 cellSpursReadyCountStore(CellSpurs* spurs, CellSpursWorkloadId wid,
 static s32 spurs_ready_exchange(CellSpurs* spurs, CellSpursWorkloadId wid,
                                  u32* old, u32 compare, u32 value, int conditional)
 {
-    if (!spurs || !old) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
-    if (wid >= CELL_SPURS_MAX_WORKLOAD) return CELL_SPURS_CORE_ERROR_INVAL;
+    /* 0x0200AD2C (Swap) and 0x0200AAC4 (CompareAndSwap): the same policy-module
+     * codes as ReadyCountStore. */
+    if (!spurs || !old) return CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER;
+    if (wid >= CELL_SPURS_MAX_WORKLOAD) return CELL_SPURS_POLICY_MODULE_ERROR_INVAL;
     struct SpursInst* si;
     s32 rc = spurs_api_lock((u32)(uintptr_t)spurs, &si);
     if (rc) return rc;
     if (!s_workloads[wid].in_use || s_workloads[wid].spurs_ea != si->ea) {
-        spurs_api_unlock(si); return CELL_SPURS_CORE_ERROR_SRCH;
+        spurs_api_unlock(si); return CELL_SPURS_POLICY_MODULE_ERROR_SRCH;
     }
     spu_lockline_lock();
     u8 previous = vm_read8(si->ea + SPURS_WKL_READY1 + wid);
@@ -1922,7 +2064,9 @@ s32 cellSpursReadyCountCompareAndSwap(CellSpurs* spurs, CellSpursWorkloadId wid,
 
 s32 cellSpursWakeUp(CellSpurs* spurs)
 {
-    if (!spurs) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
+    /* 0x020085D0: null 0x80410811 and misalignment 0x80410810 -- the
+     * policy-module family, not CORE. */
+    if (!spurs) return CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER;
     struct SpursInst* si;
     s32 rc = spurs_api_lock((u32)(uintptr_t)spurs, &si);
     if (rc) return rc;
@@ -1965,8 +2109,11 @@ s32 cellSpursEventFlagInitialize(CellSpursTaskset* taskset,
 
     EventFlagSync* sync = ef_sync_alloc(eventFlag_ea);
     if (!sync) {
+        /* The host's 64-slot sync table is full. The firmware's initializer
+         * (0x02015758) returns 0x80410902 only for its own argument checks and
+         * builds no NOMEM; report the state error a guest can act on. */
         printf("[cellSpurs] EventFlagInitialize: no free sync slots!\n");
-        return CELL_SPURS_TASK_ERROR_NOMEM;
+        return CELL_SPURS_TASK_ERROR_STAT;
     }
 
     printf("[cellSpurs] EventFlagInitialize(clearMode=%u, direction=%u) flagEA=0x%08X taskset=0x%08X\n",
@@ -2289,7 +2436,9 @@ s32 _cellSpursJobChainAttributeInitialize(u32 jmRevision, u32 sdkRevision, u64 a
                                           u64 entry_ea, u32 sizeJobDescriptor,
                                           u32 maxGrabbedJob, u64 prio_ea, u32 maxContention)
 {
-    if (!attr_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    /* _cellSpursJobChainAttributeInitialize 0x02018568: the job family's
+     * 0x80410A11 for a null attribute. */
+    if (!attr_ea) return CELL_SPURS_JOB_ERROR_NULL_POINTER;
     vm_write32((u32)attr_ea + JCATTR_REVISION,   jmRevision);
     vm_write32((u32)attr_ea + JCATTR_SDKVERSION, sdkRevision);
     vm_write32((u32)attr_ea + JCATTR_ENTRY,      (u32)entry_ea);
@@ -2315,7 +2464,8 @@ s32 _cellSpursJobChainAttributeInitialize(u32 jmRevision, u32 sdkRevision, u64 a
 
 s32 cellSpursJobChainAttributeSetName(u64 attr_ea, u64 name_ea)
 {
-    if (!attr_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    /* Job-chain API: 0x80410A11 for a null attribute. */
+    if (!attr_ea) return CELL_SPURS_JOB_ERROR_NULL_POINTER;
     vm_write32((u32)attr_ea + JCATTR_NAME, (u32)name_ea);
     printf("[cellSpurs] JobChainAttributeSetName(attr=0x%08X, \"%s\")\n",
            (u32)attr_ea, name_ea ? (const char*)(vm_base + (u32)name_ea) : "-");
@@ -2337,12 +2487,17 @@ static s32 jc_register(u32 jc_ea, u32 entry_ea, u16 size_desc, u16 max_grab,
         }
     }
     printf("[cellSpurs] %s: registry full\n", who);
-    return CELL_OK;
+    /* A chain that was not registered would later be "UNKNOWN chain" and the
+     * kick would silently walk nothing; the job family's AGAIN says the host
+     * table has no room. */
+    return CELL_SPURS_JOB_ERROR_AGAIN;
 }
 
 s32 cellSpursCreateJobChainWithAttribute(u64 spurs_ea, u64 jc_ea, u64 attr_ea)
 {
-    if (!spurs_ea || !jc_ea || !attr_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    /* 0x02018A98: the job family's 0x80410A11 for a null argument and
+     * 0x80410A02 for an argument the chain cannot use. */
+    if (!spurs_ea || !jc_ea || !attr_ea) return CELL_SPURS_JOB_ERROR_NULL_POINTER;
     u32 entry   = vm_read32((u32)attr_ea + JCATTR_ENTRY);
     u32 sd_mg   = vm_read32((u32)attr_ea + JCATTR_SIZE_DESC);
     u32 name_ea = vm_read32((u32)attr_ea + JCATTR_NAME);
@@ -2390,7 +2545,8 @@ s32 cellSpursCreateJobChain(u64 spurs_ea, u64 jc_ea, u64 entry_ea,
                             u32 autoRequestSpuCount)
 {
     (void)spurs_ea; (void)prio_ea;
-    if (!jc_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    /* cellSpursCreateJobChain 0x02018C90 is the job family too. */
+    if (!jc_ea) return CELL_SPURS_JOB_ERROR_NULL_POINTER;
 
     static int _n = 0;
     if (PS3_LOG_FIRST(_n, 3)) {
@@ -2520,12 +2676,14 @@ s32 cellSpursJobGuardInitialize(u64 jc_ea, u64 guard_ea, u32 notify_count,
 {
     (void)jc_ea; (void)request_spu_count;
     u32 ea = (u32)guard_ea;
-    if (!ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    /* 0x02018188: null 0x80410A11, an unusable guard 0x80410A02; the job
+     * family, not the task family. A full host guard table is AGAIN (0xA01). */
+    if (!ea) return CELL_SPURS_JOB_ERROR_NULL_POINTER;
 
     int i = jg_find(ea);
     if (i < 0)
         for (i = 0; i < MAX_JOBGUARDS; i++) if (!s_jobguards[i].active) break;
-    if (i >= MAX_JOBGUARDS) return CELL_SPURS_TASK_ERROR_AGAIN;
+    if (i >= MAX_JOBGUARDS) return CELL_SPURS_JOB_ERROR_AGAIN;
 
     s_jobguards[i].ea         = ea;
     s_jobguards[i].count      = notify_count;
@@ -2551,7 +2709,8 @@ s32 cellSpursJobGuardNotify(u64 guard_ea)
     int i = jg_find(ea);
     if (i < 0) {
         printf("[cellSpurs] JobGuardNotify(0x%08X) -- unknown guard\n", ea);
-        return CELL_SPURS_TASK_ERROR_INVAL;
+        /* 0x020180B0: an unusable guard is the job family's 0x80410A02. */
+        return CELL_SPURS_JOB_ERROR_INVAL;
     }
     /* Count notifications as CREDITS rather than decrementing to a floor of
      * zero. The guard used to reload its count at the moment the walker
@@ -2575,7 +2734,8 @@ s32 cellSpursJobGuardReset(u64 guard_ea)
 {
     u32 ea = (u32)guard_ea;
     int i = jg_find(ea);
-    if (i < 0) return CELL_SPURS_TASK_ERROR_INVAL;
+    /* 0x0201806C: an unusable guard is the job family's 0x80410A02. */
+    if (i < 0) return CELL_SPURS_JOB_ERROR_INVAL;
     s_jobguards[i].count = s_jobguards[i].reset;
     vm_write32(ea, s_jobguards[i].count);
     return CELL_OK;
@@ -2969,7 +3129,9 @@ s32 cellSpursQueueSize(u64 queue_ea, u64 size_ea)
     int32_t  w0  = (int32_t)vm_read32(q + 0x00);
     int32_t  w1  = (int32_t)vm_read32(q + 0x04);
     int32_t  mod = (int32_t)vm_read32(q + 0x0C);
-    if (mod <= 0) return CELL_SPURS_TASK_ERROR_INVAL;
+    /* No size test here: 0x020168FC (cellSpursQueueSize) answers a null or
+     * misaligned queue and nothing else -- a queue that was never initialised
+     * has both indices zero, and the ring arithmetic below says 0. */
 
     int32_t  pop  = (w0 < 0) ? ~w0 : w0;
     int32_t  push = (w1 < 0) ? ~w1 : w1;
@@ -3128,10 +3290,15 @@ s32 cellSpursGetWorkloadInfo(u64 spurs_ea, u32 wid, u64 info_ea)
     static int _n = 0;
     if (PS3_LOG_FIRST(_n, 8)) printf("[cellSpurs] GetWorkloadInfo(wid=%u info=0x%08X)\n", wid, (u32)info_ea);
 
+    /* 0x0200E814: null spurs/info 0x80410811, an id past the workload table
+     * 0x80410802, an id that names no workload 0x80410805 -- the policy-module
+     * family. */
     if (!spurs_ea || !info_ea)
-        return CELL_SPURS_CORE_ERROR_NULL_POINTER;
-    if (wid >= CELL_SPURS_MAX_WORKLOAD || !s_workloads[wid].in_use)
-        return CELL_SPURS_CORE_ERROR_INVAL;
+        return CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER;
+    if (wid >= CELL_SPURS_MAX_WORKLOAD)
+        return CELL_SPURS_POLICY_MODULE_ERROR_INVAL;
+    if (!s_workloads[wid].in_use)
+        return CELL_SPURS_POLICY_MODULE_ERROR_SRCH;
 
     /* CellSpursWorkloadInfo is a GUEST out-buffer (cell/spurs/workload_types.h),
      * big-endian, 32-bit pointers. This used to return CELL_OK writing NOTHING,
@@ -3358,8 +3525,13 @@ s32 cellSpursTasksetAttributeSetTasksetSize(CellSpursTasksetAttribute* attr, u32
     u32 ea = (u32)(uintptr_t)attr;
     if (!ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
     if (ea & 7u) return CELL_SPURS_TASK_ERROR_ALIGN;
+    /* 0x02014360: null 0x80410911, misalignment 0x80410910, a size other than
+     * 0x1900/0x2900 0x80410902 -- this is the only function that checks the
+     * size. A span the host cannot back is a stop, not 0x8041090D. */
     if (size != 0x1900u && size != 0x2900u) return CELL_SPURS_TASK_ERROR_INVAL;
-    if (!spurs_guest_range_valid(ea, sizeof(*attr))) return CELL_SPURS_TASK_ERROR_FAULT;
+    if (!spurs_guest_range_valid(ea, sizeof(*attr)))
+        ps3_stop_guest_range("cellSpursTasksetAttributeSetTasksetSize", "attr", ea,
+                             sizeof(*attr), vm_guest_limit());
     attr = GUEST_PTR(attr, CellSpursTasksetAttribute*);
     attr->tasksetSize = size;
     return CELL_OK;

@@ -54,16 +54,22 @@ int main(void)
     CHECK(5, ~9, 8, 8, 4);         /* mixed */
 
     /* errors, and *size untouched on them. The expected values are the firmware's literals, not the
-     * macros: this fixture pins what the guest sees, so a macro that drifts fails it. */
+     * macros: this fixture pins what the guest sees, so a macro that drifts fails it. 0x020168FC
+     * answers only a null or misaligned queue -- there is no size test, so a queue that was never
+     * initialised takes the ring arithmetic like any other. */
     vm_write32(OUT, 0x12345678u);
     assert(cellSpursQueueSize(0, OUT) == (s32)0x80410911u);        /* CELL_SPURS_TASK_ERROR_NULL_POINTER */
     assert(cellSpursQueueSize(Q, 0) == (s32)0x80410911u);
     assert(cellSpursQueueSize(Q + 0x10, OUT) == (s32)0x80410910u); /* CELL_SPURS_TASK_ERROR_ALIGN */
-    ring(0, 0, 0, 0);              /* never initialised: no depth at +0x0C */
-    assert(cellSpursQueueSize(Q, OUT) == (s32)0x80410902u);        /* CELL_SPURS_TASK_ERROR_INVAL */
+    assert(vm_read32(OUT) == 0x12345678u);                        /* error paths write nothing */
+    ring(0, 0, 0, 0);              /* never initialised: both indices zero, no depth word */
+    assert(cellSpursQueueSize(Q, OUT) == CELL_OK && vm_read32(OUT) == 0);
     ring(0, 3, 0, 8);              /* a word at +0x14 is not a depth (it is part of the buffer EA) */
-    assert(cellSpursQueueSize(Q, OUT) == (s32)0x80410902u);
-    assert(vm_read32(OUT) == 0x12345678u);
+    assert(cellSpursQueueSize(Q, OUT) == CELL_OK && vm_read32(OUT) == 3);
+    /* pop past push with no wrap term: the ring's own unsigned difference, where the removed
+     * invented INVAL check used to stand in for a zero depth. */
+    ring(5, 3, 0, 8);
+    assert(cellSpursQueueSize(Q, OUT) == CELL_OK && vm_read32(OUT) == 0xFFFFFFFEu);
 
     free(vm_base);
     puts("PASS: cellSpursQueueSize occupancy, wrap, normalised indices, NULL/alignment/uninitialised errors");
