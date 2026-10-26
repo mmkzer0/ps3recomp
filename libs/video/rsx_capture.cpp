@@ -634,6 +634,8 @@ extern "C" {
 
 const char* rsx_capture_toolkit_sha(void) { return PS3RECOMP_TOOLKIT_SHA; }
 
+const rsx_capture_environment* rsx_capture_environment_record(void) { return C.open ? &C.env_copy : nullptr; }
+
 int rsx_capture_install(const rsx_capture_environment* env, const rsx_capture_options* opt)
 {
     if (C.open) return 1;

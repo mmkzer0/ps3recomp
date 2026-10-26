@@ -165,6 +165,10 @@ int  rsx_capture_install(const rsx_capture_environment* env, const rsx_capture_o
  * a no-op returning 0 while video.rsx_capture is off. */
 int  rsx_capture_install_from_config(const rsx_capture_environment* env);
 
+/* The environment record the open capture carries, defaults filled in (build type, toolkit sha, "n/a"),
+ * or NULL while none is open. rsx_replay compares it with the capture it replays. */
+const rsx_capture_environment* rsx_capture_environment_record(void);
+
 /* Write capture-end and publish capture.ndjson. Idempotent; also runs at normal
  * process exit once a capture is open. */
 void rsx_capture_finish(void);

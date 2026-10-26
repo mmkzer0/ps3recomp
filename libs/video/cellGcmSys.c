@@ -43,6 +43,11 @@ void cellGcm_set_capture_sink(const rsx_capture_sink* sink) { s_cap = sink; }
  * itself when it replays gcm-init, so it is not a separate event. */
 static int s_cap_quiet;
 
+/* The feed rsx_replay drives through cellGcm_rsx_replay_step: while one recorded step runs, the walker stops
+ * where that step left it, and a GET_REPORT takes the timestamp the capture recorded, because the report's
+ * timer is the host clock and no replay can reproduce it. */
+static struct { int on; u32 end; const u64* ts; u32 n_ts, used_ts; } s_replay;
+
 /* ---------------------------------------------------------------------------
  * Object bindings and method verdicts (rsx_method_class.h)
  * -----------------------------------------------------------------------*/
@@ -566,6 +571,11 @@ static u64 s_report_last_ts;
  * walker pass must not share a time stamp or go backwards. */
 static u64 gcm_report_timestamp(void)
 {
+    if (s_replay.on) {
+        const u64 t = s_replay.used_ts < s_replay.n_ts ? s_replay.ts[s_replay.used_ts] : 0u;
+        s_replay.used_ts++;
+        return t;
+    }
     u64 t = get_timestamp_ns();
     if (t <= s_report_last_ts) t = s_report_last_ts + 1u;
     s_report_last_ts = t;
@@ -2390,6 +2400,23 @@ void cellGcm_rsx_process_fifo(void)
     }
 }
 
+/* Run exactly one recorded step (rsx_replay). The walker is not seeked: it must already stand where the
+ * recording says the step began, so a replay that has drifted is reported, not papered over. */
+int cellGcm_rsx_replay_step(const GcmReplayStep* s, u32 got[2])
+{
+    got[0] = s_fifo_getoff; got[1] = s_fifo_calloff;
+    if (s_fifo_getoff != s->get || s_fifo_calloff != s->call_ret) return GCM_REPLAY_NOT_AT_STEP;
+    vm_write32(GCM_CONTROL_GUEST_ADDR + 0, s->put);
+    s_replay.on = 1; s_replay.end = s->end;
+    s_replay.ts = s->report_ts; s_replay.n_ts = s->n_report_ts; s_replay.used_ts = 0;
+    cellGcm_rsx_process_fifo();
+    s_replay.on = 0;
+    got[0] = s_fifo_getoff; got[1] = s_fifo_calloff;
+    if (s_fifo_getoff != s->end) return GCM_REPLAY_LANDED_ELSEWHERE;
+    if (s_replay.used_ts != s->n_report_ts) { got[0] = s_replay.used_ts; return GCM_REPLAY_REPORT_COUNT; }
+    return 0;
+}
+
 /* GCM_GET_EQ_PUT=1: see where get is published at the end of a pass. */
 static int gcm_get_eq_put(void)
 {
@@ -2519,7 +2546,10 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * short of `put` every tick is the signature of a FIFO that can never
      * catch up, and the reason is the whole diagnosis. */
     const char* why = "caught-up";
-    while (s_fifo_getoff != put && budget-- > 0) {
+    /* A replayed step reports the PUT its live pass saw (the capture records it, the flip backlog test reads
+     * it) but stops where the step left the walker, so one recorded step is one iteration. */
+    const u32 stop = s_replay.on ? s_replay.end : put;
+    while (s_fifo_getoff != stop && budget-- > 0) {
         u32 ea = gcm_io2ea(s_fifo_getoff);
         if (!ea) {
             /* get is sitting on an IO offset with no mapping -- the title

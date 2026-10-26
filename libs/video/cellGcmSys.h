@@ -494,6 +494,22 @@ u32  gcm_unknown_methods(GcmUnknownMethod* out, u32 max);
 void gcm_method_stats_reset(void);
 const char* gcm_method_class_name(u32 cls);
 
+/* One recorded FIFO step, for rsx_replay (docs/RSX_GRAPHICS.md, "Replay"). `put` is what the live pass saw;
+ * `end` is where the step leaves the walker (a branch's target, the next word otherwise). A GET_REPORT in the
+ * step takes the next of `report_ts` (the capture's timers: the live ones came from the host clock). */
+typedef struct GcmReplayStep {
+    u32 get, call_ret;
+    u32 put, end;
+    const u64* report_ts;
+    u32 n_report_ts;
+} GcmReplayStep;
+enum {
+    GCM_REPLAY_NOT_AT_STEP = 1,        /* got = {get, call_ret} the walker stood at */
+    GCM_REPLAY_LANDED_ELSEWHERE = 2,   /* got = {get, call_ret} it left the step at */
+    GCM_REPLAY_REPORT_COUNT = 3        /* got[0] = reports the walker wrote */
+};
+int cellGcm_rsx_replay_step(const GcmReplayStep* s, u32 got[2]);
+
 /* Invalidate tile */
 s32 cellGcmSetInvalidateTile(u8 index);
 

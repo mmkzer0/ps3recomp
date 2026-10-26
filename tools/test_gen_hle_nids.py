@@ -58,6 +58,7 @@ HOST_HELPERS = set("""
     cellGcm_ref_on_poll
     cellGcm_replay_display_buffers_to_engine
     cellGcm_request_tick
+    cellGcm_rsx_replay_step
     cellGcm_rsx_process_fifo
     cellGcm_set_capture_sink
     cellGcm_syscall_bringup

@@ -67,6 +67,17 @@ u32  rsx_metal_backend_guest_draws(void);
 unsigned long long rsx_metal_backend_frame_dumps(void);
 unsigned long long rsx_metal_backend_frame_dump_errors(void);
 
+/* What rsx_metal_backend_init settled on, for a host that must not run any other way (rsx_replay). */
+#define RSX_METAL_HEADLESS       1u   /* offscreen, no window */
+#define RSX_METAL_GUEST_SHADERS  2u   /* guest programs translated; clear = fixed-function fallback */
+#define RSX_METAL_ENGINE_PATH    4u   /* the register-file draw engine drives the backend */
+u32  rsx_metal_backend_status(void);
+
+/* This machine's record for a capture's `environment` event (GPU, macOS, Metal, translators). `build`,
+ * `toolkit_sha` and `title_sha` are left NULL: the capture writer fills them. -1 before init. */
+struct rsx_capture_environment;
+int  rsx_metal_backend_capture_environment(struct rsx_capture_environment* env);
+
 #ifdef __cplusplus
 }
 #endif

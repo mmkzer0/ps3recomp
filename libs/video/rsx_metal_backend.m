@@ -3982,6 +3982,34 @@ static const rsx_draw_backend s_engine_backend = {
 
 /* ---- public API ---------------------------------------------------------- */
 
+/* ---- what a capture and a replay record about this machine ---------------- */
+
+/* The record every capture carries: byte equality of two renders holds only on equal GPU, OS, Metal,
+ * build and translator versions (M3-SCOPE H1, machine scope). The strings are copied: they outlive the
+ * NSStrings they come from. */
+int rsx_metal_backend_capture_environment(rsx_capture_environment* env)
+{
+    static char gpu[128], macos[128], metal[96], glslang[32], spirv_cross[32];
+    if (!s_dev) return -1;
+    @autoreleasepool {
+        rsx_hlsl_to_msl_versions(glslang, sizeof glslang, spirv_cross, sizeof spirv_cross);
+        snprintf(gpu, sizeof gpu, "%s", [[s_dev name] UTF8String]);
+        snprintf(macos, sizeof macos, "%s", [[[NSProcessInfo processInfo] operatingSystemVersionString] UTF8String]);
+        snprintf(metal, sizeof metal, "n/a");
+        if (@available(macOS 14.0, *))
+            snprintf(metal, sizeof metal, "%s", [[[s_dev architecture] name] UTF8String]);
+    }
+    env->gpu = gpu; env->macos = macos; env->metal = metal; env->build = NULL;
+    env->glslang = glslang; env->spirv_cross = spirv_cross; env->toolkit_sha = NULL; env->title_sha = NULL;
+    return 0;
+}
+
+u32 rsx_metal_backend_status(void)
+{
+    return (s_headless ? RSX_METAL_HEADLESS : 0u) | (s_guest_shaders ? RSX_METAL_GUEST_SHADERS : 0u) |
+           (s_eng_active ? RSX_METAL_ENGINE_PATH : 0u);
+}
+
 int rsx_metal_backend_init(u32 width, u32 height, const char* title)
 {
     @autoreleasepool {
@@ -4065,16 +4093,8 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
             rsx_set_backend(&s_backend_vtable);
         }
         if (s_eng_active && rsx_capture_install_from_config) {
-            /* The record every capture carries: byte equality of two renders holds only on equal
-             * GPU, OS, Metal, build and translator versions (M3-SCOPE H1, machine scope). */
-            char glslang[32], spirv_cross[32];
-            rsx_hlsl_to_msl_versions(glslang, sizeof glslang, spirv_cross, sizeof spirv_cross);
-            const char* gpu = [[s_dev name] UTF8String];
-            const char* macos = [[[NSProcessInfo processInfo] operatingSystemVersionString] UTF8String];
-            char metal[96] = "n/a";
-            if (@available(macOS 14.0, *))
-                snprintf(metal, sizeof metal, "%s", [[[s_dev architecture] name] UTF8String]);
-            rsx_capture_environment env = { gpu, macos, metal, NULL, glslang, spirv_cross, NULL, NULL };
+            rsx_capture_environment env;
+            rsx_metal_backend_capture_environment(&env);
             rsx_capture_install_from_config(&env);
         }
         fprintf(stderr, "[RSX metal] %s on %s (%ux%u), guest shaders %s, %s path\n",
