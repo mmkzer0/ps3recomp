@@ -13,6 +13,8 @@ skipped by name, never passed.
 import hashlib
 import json
 import re
+import shutil
+import os
 import subprocess
 import sys
 import tempfile
@@ -147,11 +149,10 @@ def test_fixture(binary, tmp):
           "...and its destination a write holding what the copy left there")
     check(src and src[0]["consume_seq"] < dst[0]["consume_seq"], "...consumed before it was written")
     frames = [e for e in ev if e["event"] == "frame-complete"]
-    check(len(frames) == 1 and frames[0]["unknown_methods"] == 3 and frames[0]["valid"] is False and
-          frames[0]["invalid"] == ["unknown-methods"],
-          f"unknown methods make the captured frame invalid and carry the count ({frames[0]['unknown_methods'] if frames else None})")
+    check(len(frames) == 1 and frames[0]["unknown_methods"] == 0 and frames[0]["valid"] is True,
+          f"known gaps (missing states) do not invalidate a frame ({frames[0]['unknown_methods'] if frames else None})")
     err = validation_error(d / "capture.ndjson")
-    check(err is not None and "unknown_methods" in err, f"`validate` refuses that capture ({err})")
+    check(err is None, f"`validate` accepts a capture whose only oddities are known gaps ({err})")
 
     c = Path(tmp) / "clean"
     p = run(binary, "clean", c)
@@ -174,9 +175,65 @@ def test_dump_list(binary):
     check("kept" not in p.stdout, "...before anything was kept or dumped")
 
 
+def test_classification_table():
+    """The header's table through a probe compiled from it (never parsed as text)."""
+    cxx = os.environ.get("CXX") or shutil.which("c++") or shutil.which("clang++") or shutil.which("g++")
+    if not cxx:
+        print("[rsx_methods] SKIP the classification probe: no C++ compiler (CXX, c++, clang++, g++)")
+        return
+    probe = Path(tempfile.gettempdir()) / "rsx_method_probe"
+    src = ROOT / "libs/video/tests/rsx_method_probe.cpp"
+    cmd = [cxx, "-std=c++17", "-O1", "-I", str(ROOT / "include"), "-I", str(ROOT / "libs/video"),
+           str(src), str(ROOT / "runtime/diag/stop.cpp"), "-o", str(probe)]
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if p.returncode != 0:
+        check(False, f"the classification probe compiles\n{p.stderr[-1500:]}")
+        return
+    p = subprocess.run([str(probe)], capture_output=True, text=True, timeout=60)
+    for line in p.stdout.splitlines():
+        if line.startswith("[PASS]") or line.startswith("[FAIL]"):
+            print(line)
+    check(p.returncode == 0, f"the classification probe passes every check (exit {p.returncode})")
+
+
+def test_doc_matches_table(tmp):
+    """docs/RSX_GRAPHICS.md's table must list exactly the header's rows, with the same verdicts."""
+    cxx = os.environ.get("CXX") or shutil.which("c++") or shutil.which("clang++") or shutil.which("g++")
+    if not cxx:
+        print("[rsx_methods] SKIP the table/doc comparison: no C++ compiler")
+        return
+    probe = Path(tmp) / "probe_dump"
+    p = subprocess.run([cxx, "-std=c++17", "-O1", "-I", str(ROOT / "include"), "-I", str(ROOT / "libs/video"),
+                        str(ROOT / "libs/video/tests/rsx_method_probe.cpp"),
+                        str(ROOT / "runtime/diag/stop.cpp"), "-o", str(probe)],
+                       capture_output=True, text=True, timeout=120)
+    if p.returncode != 0:
+        check(False, f"the probe builds for the doc comparison\n{p.stderr[-800:]}")
+        return
+    dump = subprocess.run([str(probe), "--dump"], capture_output=True, text=True, timeout=60)
+    rows = set()
+    for line in dump.stdout.splitlines():
+        f = line.split()
+        if len(f) == 6 and f[0] == "ROW":
+            rows.add((f[1].lower(), f[2].lower(), f[4]))
+    doc = (ROOT / "docs/RSX_GRAPHICS.md").read_text()
+    doc_rows = set()
+    for line in doc.splitlines():
+        m = re.match(r"\|\s*(\w+)\s*\|\s*(0x[0-9A-Fa-f]{4})(?:\+\d+)?\s*\|\s*`[^`]*`\s*\|\s*(handled|inert|missing)\s*\|", line)
+        if m:
+            doc_rows.add((m.group(1).lower(), m.group(2).lower(), m.group(3)))
+    missing = rows - doc_rows
+    extra = doc_rows - rows
+    check(not missing and not extra,
+          f"docs/RSX_GRAPHICS.md lists every table row with its verdict ({len(rows)} rows; "
+          f"missing {sorted(missing)[:3]}, extra {sorted(extra)[:3]})")
+
+
 def main():
     binaries = sys.argv[1:]
     with tempfile.TemporaryDirectory(prefix="rsx-methods-") as tmp:
+        test_classification_table()
+        test_doc_matches_table(tmp)
         test_validator(tmp)
         if binaries:
             test_fixture(binaries[0], tmp)

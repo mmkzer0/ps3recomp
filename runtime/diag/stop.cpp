@@ -417,4 +417,27 @@ void ps3_stop_rsx_capture(const char* func, const char* reason, const char* deta
              f, sizeof f / sizeof f[0], nullptr);
 }
 
+void ps3_stop_rsx_unknown_method(const char* cls, uint32_t method, uint32_t subchannel,
+                                 uint32_t fifo, uint32_t word, uint32_t data)
+{
+    char method_s[16], sub_s[16], fifo_s[16], word_s[16], data_s[16];
+    snprintf(method_s, sizeof method_s, "0x%04X", method);
+    snprintf(sub_s, sizeof sub_s, "%u", subchannel);
+    snprintf(fifo_s, sizeof fifo_s, "0x%08X", fifo);
+    snprintf(word_s, sizeof word_s, "0x%08X", word);
+    snprintf(data_s, sizeof data_s, "0x%08X", data);
+    const ps3_stop_field f[] = {
+        {"class", cls ? cls : "invalid"},
+        {"method", method_s},
+        {"subchannel", sub_s},
+        {"fifo", fifo_s},
+        {"word", word_s},
+        {"data", data_s},
+    };
+    ps3_stop(PS3_STOP_RSX_UNKNOWN_METHOD,
+             "an RSX FIFO method has no consumer and no allow-list entry: the console applied it and this runtime would drop it",
+             "Classify the (class, method) pair in libs/video/rsx_method_class.h and docs/RSX_GRAPHICS.md: name the consumer, cite why it is inert, or record it as a missing state (an S2 row) — never widen the allow-list without evidence.",
+             f, sizeof f / sizeof f[0], nullptr);
+}
+
 } // extern "C"

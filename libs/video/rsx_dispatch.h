@@ -205,6 +205,9 @@ typedef struct rsx_dsp_viewport {
 } rsx_dsp_viewport;
 void rsx_dsp_get_viewport(const rsx_dispatch* rsx, rsx_dsp_viewport* out);
 
+/* SET_CLIP_MIN / SET_CLIP_MAX: the depth range the window z is mapped through (0..1 at reset). */
+void rsx_dsp_depth_range(const rsx_dispatch* rsx, float* near_z, float* far_z);
+
 /* Vertex attribute stream layout (VTXFMT / VTXBUF_OFFSET registers) */
 typedef struct rsx_dsp_vertex_attr {
     u32 type;            /* RSX_VTX_TYPE_*; 0 = disabled                    */

@@ -83,6 +83,15 @@ void ps3_stop_gcm_wait_timeout(const char* func, const char* what, uint32_t offs
     exit(70);
 }
 /* The NV0039 copy's stops: no fixture here copies, so reaching one is a bug. */
+/* S1's live stop: a fixture that reaches it feeds the walker a pair nothing classifies. */
+PS3_NORETURN void ps3_stop_rsx_unknown_method(const char* cls, uint32_t method, uint32_t subchannel,
+                                              uint32_t fifo, uint32_t word, uint32_t data)
+{
+    printf("[FAIL] rsx-unknown-method class %s method 0x%04X subchannel %u fifo 0x%08X word 0x%08X data 0x%08X\n",
+           cls ? cls : "invalid", method, subchannel, fifo, word, data);
+    exit(70);
+}
+
 PS3_NORETURN void ps3_stop_gcm_unmodelled(const char* func, const char* feature, const char* reason)
 {
     printf("[FAIL] gcm-unmodelled in %s: %s: %s\n", func, feature, reason);

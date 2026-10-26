@@ -237,6 +237,7 @@ typedef struct {
     /* The guest viewport rect in target pixels. Only draws use it; a clear is
      * a load action over the whole attachment. */
     u32 vp_x, vp_y, vp_w, vp_h;
+    float vp_near, vp_far;    /* SET_CLIP_MIN/MAX at record time */
 } MtlTarget;
 
 typedef struct {
@@ -1536,6 +1537,7 @@ static void target_for(const rsx_state* st, MtlTarget* t)
     t->zeta_off = st->surface_zeta_offset;
     t->vp_x = st->viewport_x; t->vp_y = st->viewport_y;
     t->vp_w = st->viewport_w; t->vp_h = st->viewport_h;
+    t->vp_near = st->clip_min; t->vp_far = st->clip_max;
     if (!t->off) return;
     surface_get(t->off, t->w, t->h, t->fmt);
     for (int m = 0; m < 3; m++)
@@ -2114,6 +2116,8 @@ static void encode_draw(id<MTLRenderCommandEncoder> enc, const MtlDraw* d,
         vp.originX = (double)d->rt.vp_x; vp.originY = (double)d->rt.vp_y;
         vp.width   = (double)d->rt.vp_w; vp.height  = (double)d->rt.vp_h;
     }
+    vp.znear = (double)d->rt.vp_near;
+    vp.zfar  = (double)d->rt.vp_far;
     [enc setViewport:vp];
     [enc setScissorRect:(MTLScissorRect){
         (NSUInteger)vp.originX, (NSUInteger)vp.originY,
@@ -2270,6 +2274,7 @@ typedef struct {
     u32 vtex[RSX_BE_MAX_VERTEX_TEXTURES];
     int vsamp[RSX_BE_MAX_VERTEX_TEXTURES];
     float vp[4];
+    float vp_z[2];              /* SET_CLIP_MIN/MAX: the depth range the window z maps through */
     u32   sc[4];
     u32   stencil_ref;
     float clear_rgba[4];
@@ -3137,6 +3142,13 @@ static void eng_set_viewport(void* user, float x, float y, float w, float h)
     s_eng_pending.vp[2] = w; s_eng_pending.vp[3] = h;
 }
 
+static void eng_set_depth_range(void* user, float near_z, float far_z)
+{
+    (void)user;
+    s_eng_pending.vp_z[0] = near_z;
+    s_eng_pending.vp_z[1] = far_z;
+}
+
 static void eng_set_scissor(void* user, u32 x, u32 y, u32 w, u32 h)
 {
     (void)user;
@@ -3216,7 +3228,8 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
     [enc setCullMode:p->cull];
     [enc setFrontFacingWinding:p->winding];
     [enc setStencilReferenceValue:r->stencil_ref];
-    MTLViewport vp = { r->vp[0], r->vp[1], r->vp[2], r->vp[3], 0.0, 1.0 };
+    MTLViewport vp = { r->vp[0], r->vp[1], r->vp[2], r->vp[3],
+                       (double)r->vp_z[0], (double)r->vp_z[1] };
     [enc setViewport:vp];
     if (r->sc[2] && r->sc[3])
         [enc setScissorRect:(MTLScissorRect){ r->sc[0], r->sc[1], r->sc[2], r->sc[3] }];
@@ -3970,6 +3983,7 @@ static const rsx_draw_backend s_engine_backend = {
     .bind_textures        = eng_bind_textures,
     .bind_vertex_textures = eng_bind_vertex_textures,
     .set_viewport         = eng_set_viewport,
+    .set_depth_range      = eng_set_depth_range,
     .set_scissor          = eng_set_scissor,
     .set_stencil_ref      = eng_set_stencil_ref,
     .draw                 = eng_draw,

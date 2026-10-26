@@ -92,6 +92,9 @@ typedef struct {
     u32 stencil_ref;
     float depth_bounds[2];
     int n_depth_bounds;
+    /* SET_CLIP_MIN/MAX as handed to the backend per draw, and how often it asked. */
+    float depth_range[2];
+    int n_depth_range;
     u32 last_created_texture, last_created_color;
     u32 last_released;
     float last_clear_depth;
@@ -221,6 +224,8 @@ static void stub_scissor(void* u, u32 x, u32 y, u32 w, u32 h)
 }
 
 static void stub_stencil_ref(void* u, u32 r) { (void)u; stub.stencil_ref = r; }
+static void stub_depth_range(void* u, float near_z, float far_z)
+{ (void)u; stub.depth_range[0] = near_z; stub.depth_range[1] = far_z; stub.n_depth_range++; }
 static void stub_depth_bounds(void* u, float lo, float hi)
 {
     (void)u;
@@ -346,6 +351,7 @@ static const rsx_draw_backend g_stub_backend = {
     .set_viewport = stub_viewport,
     .set_scissor = stub_scissor,
     .set_stencil_ref = stub_stencil_ref,
+    .set_depth_range = stub_depth_range,
     .set_depth_bounds = stub_depth_bounds,
     .draw = stub_draw,
     .clear_color = stub_clear_color,

@@ -364,7 +364,9 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
      * {timestamp, 0} to notify slot (ctx & 7) ^ 7 in IO page 0xF1, for the
      * CELL_GCM_CONTEXT_DMA_NOTIFY_MAIN_n objects (cellGcmGetNotifyDataAddress). */
     { static u32 s_notify_ctx = 0;
-      if (method == 0x0180) s_notify_ctx = data;
+      /* The notify context is the state the NOTIFY method below writes through: storing it IS
+       * consuming it (the walker's verdict names this function). */
+      if (method == 0x0180) { s_notify_ctx = data; return 0; }
       if (method == 0x0104) {
           if ((s_notify_ctx & ~7u) == (0x6660420Fu & ~7u)) {
               extern void vm_write32(uint32_t a, uint32_t v);
@@ -385,7 +387,9 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
       if (method == 0x01A4) {
           if (data != s_sem_ctx) { static int _l = 0; if (_l++ < 8)
               fprintf(stderr, "[RSX] semaphore context dma = 0x%08X\n", data); }
+          /* The context decides where 0x1D70/0x1D74 below put the label: storing it consumes it. */
           s_sem_ctx = data;
+          return 0;
       }
       if (method == 0x1D6C) { s_sem_off = data; return 0; }
       if ((method == 0x1D70 || method == 0x1D74) && s_sem_ctx == 0xFEED0001u) {
@@ -459,6 +463,18 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     if (method >= 0x0A30 && method < 0x0A40) {
         u32 f = data; float v; memcpy(&v, &f, 4);
         state->viewport_scale[(method - 0x0A30) >> 2] = v;
+        return 0;
+    }
+
+    /* Depth range (SET_CLIP_MIN/SET_CLIP_MAX). libgcm's cellGcmSetViewport writes both, in the same
+     * packet as the viewport rect (docs/rsxfifo.txt "SetClipMinMax"/"SetViewport"), so these are part
+     * of the viewport, not an unrelated clip plane: the window z the vertex program produces is mapped
+     * to [near, far] before the depth test and write. */
+    if (method == NV4097_SET_CLIP_MIN || method == NV4097_SET_CLIP_MAX) {
+        float v;
+        memcpy(&v, &data, 4);
+        if (method == NV4097_SET_CLIP_MIN) state->clip_min = v;
+        else                              state->clip_max = v;
         return 0;
     }
 

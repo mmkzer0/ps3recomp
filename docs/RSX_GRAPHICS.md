@@ -488,3 +488,214 @@ For each unique shader program the game uses:
 | `rsx_null_backend.c` | 260 | Win32 window + GDI clear |
 | `rsx_primitives.h` | 112 | Topology mapping + index conversion |
 | `rsx_vertex_formats.h` | 115 | Vertex type → DXGI format mapping |
+
+---
+
+## Method classification (S1, issue #47)
+
+The RSX FIFO carries `(class, method, value)` triples. A subchannel is a binding slot: `SET_OBJECT`
+(method 0) names the object, and the object's class gives a method number its meaning. Every method the
+walker consumes (`libs/video/cellGcmSys.c`) ends in exactly one verdict, decided by
+`libs/video/rsx_method_class.h` — the table there is the source of truth; this section mirrors it, and
+`tools/test_rsx_methods.py` fails if the two disagree.
+
+### Verdicts
+
+| Verdict | Meaning | At runtime |
+|---|---|---|
+| **handled** | a consumer reads it: a draw-time read of the register file, or a dispatch/command handler. The row names the consumer (`file` / `function`) | counted `handled`; the state takes effect |
+| **inert** | nothing this renderer does depends on it, for the value the row pins. `data`/`mask` hold that value; `mask = 0` means every value | counted `inert` when the write matches the pin; **missing** when it does not |
+| **missing** | a real state this renderer ignores. Either implemented (depth range) or an S2 row below | counted `missing`, first occurrence logged; does not stop and does not invalidate a capture frame |
+| **unknown** | no row covers the pair | a capture frame is invalid, and the live walker stops with `rsx-unknown-method` |
+
+**Why `missing` does not stop.** A gap that is known, documented and scheduled is not an unexplained
+command: it is a measured divergence (the S2 rows). Stopping on it would make the boot unusable and hide
+the census that reports it. An **unknown** pair is different — nothing says what the console did with it,
+so the frame it belongs to cannot be trusted, and `ps3diff validate` refuses it.
+
+**Why an unbound write is dropped, and why a live run has none.** A method on a slot with no object bound
+reaches no engine: PFIFO has no class to decode it against (envytools `rnndb/fifo/nv_object.xml` — the
+subchannel's object is what gives a method its meaning), so the console drops the write. The walker models
+that instead of letting the state land in a register file. An *unregistered* handle is not dropped: this
+runtime does not know that class's methods, so the pair stays unknown and stops.
+
+The console's channel is bound before any title traffic: the driver's init emits and runs the default-state
+subroutine whose first words are the seven `SET_OBJECT`s, and libgcm's own RESC conversion stream
+(`resc_convert.c`) writes viewport and depth state without binding anything — which can only work on a
+bound channel. `cellGcmInit` therefore installs those seven bindings when it writes the subroutine; the
+census's 18 "unbound" observations are that window (the same 18 NV4097 methods, before the first observed
+`SET_OBJECT`), not a different class. A slot that is never bound (a bug in the guest, or a synthetic ring)
+still has its writes dropped, and `test_rsx_method_census.c` checks both.
+
+**Why the census is exact.** The pin on each inert row is what the driver's default-state routine
+(`libs/video/gcm_default_state.c`) writes every flip, and what RPCS3's reset image
+(`rsx_state::init()`, `rsx_methods.cpp`) holds: the two agree. A title that writes another value turns
+the pair into `missing` at that write, so an allow-list entry can never hide a changed state.
+
+### Evidence tags
+
+| Tag | Meaning |
+|---|---|
+| `consumer` | handled: the row names the file and function that reads it |
+| `oracle-null` | RPCS3 at `d00d8023` binds no handler **and** has no register decoder/accessor for it (`rsx_methods.cpp`, `rsx_methods.h`, `rsx_decode.h`), and the row states why it can |
+| `oracle-value` | the oracle reads the register; what it selects is the hardware reset value, which this renderer implements as its fixed behaviour. The row pins that value |
+| `order` | a stall/invalidate/ordering hint; the walker is a synchronous in-order interpreter, so it already holds when the method is read |
+| `redundant` | the information is carried by bits the renderer does read (a location bit, the one destination surface the 2D path owns) |
+| `absent-stage` | the register drives a stage a shader-only NV40 pipeline does not have (fixed-function T&L, combiners, texture matrices); the oracle ignores it too |
+| `no-transfer` | the 2D object performs no transfer in this stream, so the register is an input to work that never happens |
+| `missing` | an S2 gap: no consumer, value not a reset default the renderer implements |
+
+**Oracle pin.** RPCS3 `v0.0.43-20402-d00d8023` (M3 Amendment 3, item 6), read as a semantics oracle only.
+The register names are the psdevwiki list in `docs/rsxfifo.txt` and envytools `rnndb`.
+
+### The table
+
+One row per register, or per array register (`+N` = the next N method numbers). Sorted by class then
+method, like the header.
+
+| Class | Method | Register | Verdict | Evidence | Consumer / why |
+|---|---|---|---|---|---|
+| NV406E | 0x0060 | `NV406E_SET_CONTEXT_DMA_SEMAPHORE` | inert | oracle-null | the DMA object the semaphore offset addresses; RPCS3 binds nullptr and addresses the label  window by offset alone, as gcm_rsx_process_fifo does ... |
+| NV4097 | 0x0000 | `NV4097_SET_OBJECT` | handled | consumer | cellGcmSys.c gcm_bind_object: the binding table every later method on the slot decodes against |
+| NV4097 | 0x0100 | `NV4097_NO_OPERATION` | inert | oracle-null | RPCS3 resets the register and binds no handler to it; rsx_dispatch.c carries it as an explicit  no-op (mark_class EXEC) |
+| NV4097 | 0x0110 | `NV4097_WAIT_FOR_IDLE` | inert | order | libgcm's SetWaitForIdle / SetWriteBackEndLabelForConditional step (docs/rsxfifo.txt): the engine  must have completed everything issued before it. ... |
+| NV4097 | 0x0180 | `NV4097_SET_CONTEXT_DMA_NOTIFIES` | handled | consumer | rsx_commands.c rsx_process_method: the NOTIFY (0x0104) path writes the notify slot of this context |
+| NV4097 | 0x0184+1 | `NV4097_SET_CONTEXT_DMA_A/B` | inert | redundant | the texture DMA objects; the location of a texture is the format word's DMA bits and the 31-bit  offset (rsx_dsp_get_texture), so the handle adds ... |
+| NV4097 | 0x018C | `NV4097_SET_CONTEXT_DMA_COLOR_B` | handled | consumer | rsx_dsp_get_surface: colour target B's location (dma_to_location) |
+| NV4097 | 0x0190 | `NV4097_SET_CONTEXT_DMA_STATE` | inert | oracle-null | a state-object DMA handle for the fixed-function T&L state rung; RPCS3 has no decoder and the  engine's state arrives as method writes, not as a ... |
+| NV4097 | 0x0194+1 | `NV4097_SET_CONTEXT_DMA_COLOR_A/ZETA` | handled | consumer | rsx_dsp_get_surface: colour target A and zeta locations |
+| NV4097 | 0x019C+1 | `NV4097_SET_CONTEXT_DMA_VERTEX_A/B` | inert | redundant | vertex-array DMA objects; the location is the offset word's bit 31 (rsx_dsp_get_vertex_attr),  which is what both the SDK and RPCS3 use |
+| NV4097 | 0x01A4 | `NV4097_SET_CONTEXT_DMA_SEMAPHORE` | handled | consumer | rsx_commands.c rsx_process_method: chooses the main-memory or label-window byte swap of 0x1D70/0x1D74 |
+| NV4097 | 0x01A8 | `NV4097_SET_CONTEXT_DMA_REPORT` | handled | consumer | cellGcmSys.c gcm_rsx_process_fifo_unlocked: s_report_dma, the GET_REPORT destination |
+| NV4097 | 0x01AC+1 | `NV4097_SET_CONTEXT_DMA_CLIP_ID/CULL_DATA` | inert | oracle-null | DMA handles for the clip-id and cull-data objects (conditional rendering). RPCS3 binds nullptr  with no decoder; this renderer models neither feature ... |
+| NV4097 | 0x01B4+1 | `NV4097_SET_CONTEXT_DMA_COLOR_C/D` | handled | consumer | rsx_dsp_get_surface: MRT targets C and D locations |
+| NV4097 | 0x0200+11 | `NV4097_SET_SURFACE_* (0x200..0x22C)` | handled | consumer | rsx_commands.c process_surface_method into rsx_state, and rsx_dsp_get_surface on the  register-file path: clip, format, pitches, offsets, colour ... |
+| NV4097 | 0x0230 | `NV4097_HIERZ_OFFSET (rnndb)` | inert | absent-stage | the hierarchical-Z compression block. Compression is a bandwidth optimization: the depth values  the zeta surface holds are unchanged, and the engine ... |
+| NV4097 | 0x0238+1 | `NV4097_SET_CYLINDRICAL_WRAP[0:1]` | inert | oracle-null | NV30-era cylindrical texture wrap; RPCS3 binds nullptr with no decoder; the sampler decodes wrap  from TEX_ADDRESS (rsx_dsp_get_texture.wrap), which ... |
+| NV4097 | 0x0240+3 | `NV4097_SET_TEX_MATRIX_ENABLE[0:3] (rnndb)` | inert | absent-stage | fixed-function texture matrices, a T&L stage the VP replaces; RPCS3 has no decoder |
+| NV4097 | 0x0280+3 | `NV4097_SET_SURFACE_PITCH_C/D, COLOR_C/DOFFSET` | handled | consumer | the same two consumers for the MRT targets C and D |
+| NV4097 | 0x02B8 | `NV4097_SET_WINDOW_OFFSET` | missing | missing | S2: the shader-window offset every window coordinate is translated by. The engine's epilogue  hard-codes offset 0 (rsx_draw_engine.c xf[]), the value ... |
+| NV4097 | 0x02BC | `NV4097_SET_WINDOW_CLIP_TYPE` | inert | oracle-null | selects whether the window clip rectangles below discard or only clip; RPCS3 has no decoder for  any of the window-clip registers |
+| NV4097 | 0x02C0+15 | `NV4097_SET_WINDOW_CLIP_HORIZONTAL/VERTICAL[0:7]` | inert | oracle-null | eight window clip rectangles (0x2C0..0x2FC); RPCS3 decodes none of them; the engine clips with  the surface clip (rsx_dsp_get_surface) and the ... |
+| NV4097 | 0x0300 | `NV4097_SET_DITHER_ENABLE` | inert | oracle-value | enabled at reset (rsx_state::init 0x300=1). A dither matrix maps a value the ROP already holds  at the target's precision (8-bit for the A8R8G8B8 ... |
+| NV4097 | 0x031C | `NV4097_SET_BLEND_COLOR` | missing | missing | S2: the constant blend colour. The engine builds every blend from the factors and equation  and never binds a constant colour, so a draw whose factor ... |
+| NV4097 | 0x032C | `NV4097_SET_STENCIL_MASK` | handled | consumer | rsx_draw_engine.c build_render_state: rs->s_write_mask (the front stencil write mask) |
+| NV4097 | 0x0348 | `NV4097_SET_TWO_SIDED_STENCIL_TEST_ENABLE` | handled | consumer | rsx_draw_engine.c build_render_state: rs->stencil_two_sided |
+| NV4097 | 0x034C | `NV4097_SET_BACK_STENCIL_MASK` | missing | missing | S2: the back-face stencil write mask. The engine reads the front mask only; Metal's stencil  descriptor has per-face masks, so the fix is to carry ... |
+| NV4097 | 0x0350 | `NV4097_SET_BACK_STENCIL_FUNC` | handled | consumer | rsx_draw_engine.c build_render_state: rs->bs_func |
+| NV4097 | 0x0354 | `NV4097_SET_BACK_STENCIL_FUNC_REF` | missing | missing | S2: with two-sided stencil the back faces compare against this reference; the engine passes one  reference (front) to the encoder. Metal shares the ... |
+| NV4097 | 0x0358 | `NV4097_SET_BACK_STENCIL_FUNC_MASK` | missing | missing | S2: back-face compare mask, same row as 0x0354 (front mask is read, back is not) |
+| NV4097 | 0x035C+2 | `NV4097_SET_BACK_STENCIL_OP_*` | handled | consumer | rsx_draw_engine.c build_render_state: rs->bs_fail/bs_zfail/bs_zpass |
+| NV4097 | 0x0368 | `NV4097_SET_SHADE_MODE` | inert | oracle-value | GL_SMOOTH at reset (0x1D01), which is what the MSL vertex outputs interpolate as. A flat shade  mode would need an interpolation qualifier per ... |
+| NV4097 | 0x036C | `NV4097_SET_BLEND_ENABLE_MRT` | handled | consumer | rsx_draw_engine.c build_render_state: rs->blend_mrt |
+| NV4097 | 0x0370 | `NV4097_SET_COLOR_MASK_MRT` | handled | consumer | rsx_draw_engine.c build_render_state: rs->color_mask_mrt |
+| NV4097 | 0x0374 | `NV4097_SET_LOGIC_OP_ENABLE` | inert | oracle-value | logic op disabled at reset (enable 0); the engine has no logic-op stage (Metal has none either) |
+| NV4097 | 0x0378 | `NV4097_SET_LOGIC_OP` | inert | oracle-value | the logic operation itself (copy at reset); it cannot be applied while the enable above is 0,  and the row pins the reset value so a change is ... |
+| NV4097 | 0x037C | `NV4097_SET_BLEND_COLOR2` | inert | oracle-value | the second blend constant, 0 at reset; only a blend factor naming the constant-2 source reads  it, and the engine implements the factors the title ... |
+| NV4097 | 0x0380+2 | `NV4097_SET_DEPTH_BOUNDS_*` | handled | consumer | rsx_draw_engine.c build_render_state rs->depth_bounds_test and the per-draw set_depth_bounds  (0x0384/0x0388 as raw floats) |
+| NV4097 | 0x0394 | `NV4097_SET_CLIP_MIN` | handled | consumer | rsx_process_method rsx_state.clip_min / rsx_dsp_depth_range: the near end of the depth range  passed to the Metal viewport (rsx_draw_engine.c draw, ... |
+| NV4097 | 0x0398 | `NV4097_SET_CLIP_MAX` | handled | consumer | ...the far end, same consumers |
+| NV4097 | 0x03B0 | `NV4097_SET_CONTROL0` | inert | oracle-value | the mip-rounding mode bit (rnndb MIPMAP_ROUNDING, bit 20) is set at reset; it chooses which mip  level a coordinate exactly between two levels ... |
+| NV4097 | 0x03B8 | `NV4097_SET_LINE_WIDTH` | inert | oracle-value | line width 8 = 1/8-pixel units = 1.0 px at reset; the engine draws the host's 1-px lines,  which is what that value asks for |
+| NV4097 | 0x03BC | `NV4097_SET_LINE_SMOOTH_ENABLE` | inert | oracle-value | line smoothing off at reset; the engine draws unsmoothed lines, as the reset value asks |
+| NV4097 | 0x03C0 | `NV4097_SET_ANISO_SPREAD` | inert | oracle-null | the anisotropic LOD spread table; RPCS3 binds nullptr with no decoder and its samplers take the  anisotropy from TEX_FILTER alone ... |
+| NV4097 | 0x03C4+14 | `NV4097 fixed-function TEX_MATRIX/TEX_GEN block` | inert | absent-stage | 0x3C4..0x3FC is the NV30 fixed-function texture-matrix/generator rung (rnndb gives it no NV40_3D  variant); the VP replaces it and RPCS3 ignores the ... |
+| NV4097 | 0x0400+15 | `NV4097_UNK0400[0:15] (nv40.h NV40TCL_UNK0400)` | inert | oracle-null | 16 words of 0x7421 the default state writes; RPCS3 stores the same reset values under  registers[0x400] with no name and no decoder, so not even the ... |
+| NV4097 | 0x0440+15 | `NV4097 dither matrix (rnndb DITHER_MATRIX)` | inert | oracle-null | the 4x4 ordered dither table the default state writes; see 0x0300: the ROP output and the target  are both 8-bit, where this table is the identity; ... |
+| NV4097 | 0x08CC | `NV4097_SET_FOG_MODE` | inert | oracle-value | CELL_GCM_FOG_MODE_EXP at reset; the fog stage applies the FP's fog coordinate (o5.x) with this  mode, and this renderer has no fog stage: RPCS3 ... |
+| NV4097 | 0x08D0+2 | `NV4097_SET_FOG_PARAMS` | inert | oracle-value | the fog equation constants, all 0 at reset (a zero exponential constant makes the fog factor  0); same stage as 0x08CC |
+| NV4097 | 0x0A0C | `NV4097_SET_POINT_CENTER_MODE` | inert | oracle-null | whether a point sprite is centred on the pixel; RPCS3 binds nullptr with no decoder and the  engine draws POINTS with the host's convention, value 0 ... |
+| NV4097 | 0x0A60+2 | `NV4097_SET_POLY_OFFSET_*_ENABLE` | inert | oracle-value | polygon-offset enables, all 0 at reset: no offset is applied, which is what the engine does  (it sets no depth bias). A title that enables one needs ... |
+| NV4097 | 0x0A78+1 | `NV4097_SET_POLYGON_OFFSET_*` | inert | oracle-value | offset factor and bias, both 0 at reset; see 0x0A60 |
+| NV4097 | 0x0B00+15 | `NV4097_SET_TEXTURE_CONTROL2[0:15]` | inert | oracle-null | the per-unit trilinear/aniso optimization hints (rnndb TEX_FILTER_OPTIMIZATION); RPCS3 binds  nullptr with no decoder: a quality/bandwidth hint, not ... |
+| NV4097 | 0x0B40+9 | `NV4097_SET_TEX_COORD_CONTROL[0:9]` | inert | oracle-null | per-texcoord interpolation mode (2D/linear, centroid). RPCS3 binds nullptr with no decoder and  interpolates perspective-correct always, as this ... |
+| NV4097 | 0x1428 | `NV4097_SET_SPECULAR_ENABLE` | inert | absent-stage | fixed-function lighting: whether the specular term is added after texturing; the VP computes  colours. RPCS3 has no decoder |
+| NV4097 | 0x142C | `NV4097_SET_TWO_SIDE_LIGHT_EN` | inert | absent-stage | fixed-function two-sided lighting (front/back colour select). With a VP the back-face colours  are outputs o3/o4, which no consumer of this renderer ... |
+| NV4097 | 0x1450 | `NV4097_SET_PERFORMANCE_PARAMS` | inert | oracle-null | PGRAPH performance counters/thresholds; RPCS3 has no decoder and nothing in the pipeline reads a  performance register |
+| NV4097 | 0x1454 | `NV4097_SET_FLAT_SHADE_OP` | inert | absent-stage | fixed-function flat shading of the primary/secondary colour; RPCS3 has no decoder (it gets flat  shading from the shader's own interpolation ... |
+| NV4097 | 0x145C | `NV4097_SET_EDGE_FLAG` | inert | absent-stage | fixed-function edge flag; RPCS3 has no decoder |
+| NV4097 | 0x1478 | `NV4097_SET_USER_CLIP_PLANE_CONTROL` | inert | oracle-null | which of the VP's clip distances (o[9..14] on NV30 numbering) the fixed-function clipper tests;  this renderer clips with the host's clip volume ... |
+| NV4097 | 0x147C | `NV4097_SET_POLYGON_STIPPLE` | inert | absent-stage | polygon stipple, a fragment-stage mask of the fixed-function ROP; RPCS3 decodes it but the engine  has no stipple stage; value 0 = disabled, the ... |
+| NV4097 | 0x1710 | `NV4097_INVALIDATE_VERTEX_CACHE_FILE` | inert | order | drop the post-transform vertex cache; the engine fetches every vertex from guest memory for every  draw (rsx_vertex_fetch.c), so no cache exists to ... |
+| NV4097 | 0x1714 | `NV4097_INVALIDATE_VERTEX_FILE` | handled | consumer | rsx_dispatch.c dsp_fill_classes marks it EXEC: the engine keeps no post-transform vertex  cache, so the invalidate has nothing to drop and every draw ... |
+| NV4097 | 0x1738+1 | `NV4097_SET_VERTEX_DATA_BASE_OFFSET/INDEX` | handled | consumer | rsx_dsp_vertex_data_base_offset/index: added to every vertex fetch and indexed draw |
+| NV4097 | 0x17CC | `NV4097_SET_ZPASS_PIXEL_COUNT_ENABLE` | inert | oracle-value | zpass counting enable, 0 at reset; RPCS3 binds set_zcull_pixel_count_enable, this renderer has  no occlusion query (GET_REPORT answers 0xFFFF for a ... |
+| NV4097 | 0x1800 | `NV4097_GET_REPORT` | handled | consumer | cellGcmSys.c gcm_rsx_process_fifo_unlocked: writes the report slot (or main-memory report  area) named by SET_CONTEXT_DMA_REPORT, with the chunk's ... |
+| NV4097 | 0x1828+1 | `NV4097_SET_FRONT/BACK_POLYGON_MODE` | inert | oracle-null | fill/line/point rasterization mode; RPCS3 binds nullptr with a decoder it never acts on, and the  engine rasterizes triangles: the title writes the ... |
+| NV4097 | 0x1838 | `NV4097_SET_POLY_SMOOTH_ENABLE` | inert | oracle-null | polygon antialiasing via coverage; RPCS3 decodes it and no host pipeline models coverage AA; the  engine's MSAA comes from the surface's antialias ... |
+| NV4097 | 0x1D64 | `NV4097_SET_INDEXED_CONSTANT_READ_LIMITS` | inert | oracle-null | bounds the constant indices a VP may read (0x02000000 at reset); RPCS3 has no decoder, and the  decompiler bounds every constant read to ... |
+| NV4097 | 0x1D78 | `NV4097_SET_ZMIN_MAX_CONTROL` | inert | oracle-value | depth-test direction/rounding controls; the engine reads the engine-visible depth state from  DEPTH_FUNC/MASK/TEST (0x0A6C..0x0A74); RPCS3 binds ... |
+| NV4097 | 0x1D7C | `NV4097_SET_ANTI_ALIASING_CONTROL` | inert | oracle-value | AA sample placement; the engine takes the sample grid from the surface format's antialias field  (rsx_dsp_get_surface), which is what libgcm sets ... |
+| NV4097 | 0x1D80 | `NV4097_SET_SURFACE_COMPRESSION` | inert | oracle-null | zeta/colour compression enable; no compression in this renderer (the surface is read and  written uncompressed), RPCS3 has no decoder; value 3 = the ... |
+| NV4097 | 0x1D88 | `NV4097_SET_SHADER_WINDOW` | missing | missing | S2: window height, origin (top/bottom) and pixel centre. The engine's epilogue hard-codes a  top-left origin (rsx_draw_engine.c xf[1]/xf[5]) while ... |
+| NV4097 | 0x1D98+1 | `NV4097_SET_CLEAR_RECT_HORIZONTAL/VERTICAL` | inert | oracle-value | the rectangle CLEAR_SURFACE covers; 0x0FFF0000/0x0FFF0000 at reset, i.e. the full 4096x4096  window, so clearing the attachment is the same clear. ... |
+| NV4097 | 0x1DA4 | `NV4097_SET_CLIP_ID_TEST_ENABLE` | inert | oracle-null | clip-id conditional rendering enable, 0 at reset; RPCS3 has no decoder and this renderer draws  every batch |
+| NV4097 | 0x1DB4 | `NV4097_SET_LINE_STIPPLE` | inert | oracle-null | line stipple enable/pattern; RPCS3 has no decoder; the engine draws lines solid, value 0 |
+| NV4097 | 0x1E94 | `NV4097_SET_TRANSFORM_EXECUTION_MODE` | inert | absent-stage | VPE execution mode (fixed-function vs program). The engine always runs the VP  (rsx_dsp_vp_start / TRANSFORM_PROGRAM_LOAD) because libgcm titles ... |
+| NV4097 | 0x1E98 | `NV4097_SET_RENDER_ENABLE` | inert | oracle-value | the VPE render-enable word; the engine runs the vertex program unconditionally (libgcm titles  always bind one, and RPCS3's set_render_mode only ... |
+| NV4097 | 0x1EE0 | `NV4097_SET_POINT_SIZE` | inert | oracle-value | point size 1.0 at reset; the engine draws POINTS as 1-px points, which is 1.0 |
+| NV4097 | 0x1EE4+1 | `NV4097_SET_POINT_PARAMS_ENABLE` | inert | oracle-value | point parameters/sprite enable, both 0 at reset; point sprites need a sprite coordinate the  engine does not generate, and the reset value asks for ... |
+| NV4097 | 0x1EF8 | `NV4097_SET_TRANSFORM_TIMEOUT` | inert | oracle-null | the VPE's timeout and watchdog threshold: a hang detector for the transform engine, not state a  draw reads. RPCS3 binds nullptr with no decoder |
+| NV4097 | 0x1FC4+4 | `NV4097_SET_ATTRIB_COLOR/TEX_COORD/TEX_COORD_EX/UCLIP0/UCLIP1` | inert | absent-stage | the fixed-function attribute *routing* (which VP output carries COL0/TEX0/...). The VP decompiler  emits the hardware's reset routing directly ... |
+| NV4097 | 0x1FE0 | `NV4097_SET_REDUCE_DST_COLOR` | inert | oracle-null | whether the reduce stage may read the destination; RPCS3 has no decoder; value 1 = reset |
+| NV4097 | 0x1FE8 | `NV4097_SET_NO_PARANOID_TEXTURE_FETCHES` | inert | oracle-null | relaxes texture-fetch bounds checks; RPCS3 has no decoder. The engine validates every texture  span before sampling (rsx_texture_layout.c, ... |
+| NV4097 | 0x1FEC | `NV4097_SET_SHADER_PACKER` | handled | consumer | rsx_draw_engine.c fragment-pipeline key (the register is read with the fragment program and  SHADER_CONTROL to decide the output packing) |
+| NV0039 | 0x0000 | `NV0039_SET_OBJECT` | handled | consumer | cellGcmSys.c gcm_bind_object / gcm_nv0039_method case 0 |
+| NV0039 | 0x0180 | `NV0039_SET_CONTEXT_DMA_NOTIFIES` | inert | oracle-null | the notifier object the hardware would write on BUFFER_NOTIFY; RPCS3's nv0039::buffer_notify  never reads it (the notify argument only reaches a ... |
+| NV0039 | 0x0184 | `NV0039_SET_CONTEXT_DMA_BUFFER_IN` | handled | consumer | cellGcmSys.c gcm_nv0039_method: the copy source location |
+| NV0039 | 0x0188 | `NV0039_SET_CONTEXT_DMA_BUFFER_OUT` | handled | consumer | cellGcmSys.c gcm_nv0039_method: the copy destination location |
+| NV0039 | 0x030C | `NV0039_OFFSET_IN` | handled | consumer | gcm_nv0039_method / gcm_nv0039_copy |
+| NV0039 | 0x0310 | `NV0039_OFFSET_OUT` | handled | consumer | gcm_nv0039_method / gcm_nv0039_copy |
+| NV0039 | 0x0314+4 | `NV0039_PITCH_IN..FORMAT` | handled | consumer | gcm_nv0039_method / gcm_nv0039_copy |
+| NV0039 | 0x0328 | `NV0039_BUFFER_NOTIFY` | handled | consumer | gcm_nv0039_method: the copy trigger |
+| NV3062 | 0x0000 | `NV3062_SET_OBJECT` | handled | consumer | cellGcmSys.c gcm_bind_object: routes the slot's 2D methods |
+| NV3062 | 0x0180 | `NV3062_SET_CONTEXT_DMA_NOTIFIES` | inert | oracle-null | the 2D object's notify context; gcm_2d_method never raises a notify (the copy runs inline,  cellGcmSys.c) and RPCS3 binds nullptr with no decoder |
+| NV3062 | 0x0300 | `NV3062_SET_COLOR_FORMAT` | handled | consumer | gcm_2d_method: s_gcm2d.color_fmt |
+| NV3062 | 0x0304 | `NV3062_SET_PITCH` | handled | consumer | gcm_2d_method: s_gcm2d.pitch |
+| NV3062 | 0x030C | `NV3062_SET_OFFSET_DESTIN` | handled | consumer | gcm_2d_method: s_gcm2d.dst_offset |
+| NV308A | 0x0000 | `NV308A_SET_OBJECT` | handled | consumer | cellGcmSys.c gcm_bind_object: routes the slot's 2D methods |
+| NV308A | 0x0180 | `NV308A_SET_CONTEXT_DMA_NOTIFIES` | inert | oracle-null | see NV3062 0x0180: the 2D path raises no notify and RPCS3 has no decoder |
+| NV308A | 0x0184+5 | `NV308A_SET_CONTEXT_COLOR_KEY..BETA4` | inert | no-transfer | the inline-transfer raster-op context (colour key, clip rectangle, pattern, ROP, beta). Odin  sends no NV308A_COLOR (0x400) and no SIZE_OUT/SIZE_IN ... |
+| NV308A | 0x019C | `NV308A_SET_CONTEXT_SURFACE` | inert | redundant | names the destination surface object; the 2D path has exactly one destination state, the NV3062  object's (s_gcm2d), which is the object this handle ... |
+| NV308A | 0x02FC | `NV308A_SET_OPERATION` | inert | no-transfer | the transfer's blend operation; see 0x0184: no transfer is issued by this object in the census |
+| NV309E | 0x0000 | `NV309E_SET_OBJECT` | handled | consumer | cellGcmSys.c gcm_bind_object: routes the slot's 2D methods |
+| NV309E | 0x0180 | `NV309E_SET_CONTEXT_DMA_NOTIFIES` | inert | oracle-null | see NV3062 0x0180 |
+| NV309E | 0x0184 | `NV309E_SET_CONTEXT_DMA_IMAGE` | inert | redundant | the destination image object; the swizzled path writes local memory unconditionally  (gcm_2d_method: cellGcmResolveLocated(1, s_nv309e.offset)), and ... |
+| NV3089 | 0x0000 | `NV3089_SET_OBJECT` | handled | consumer | cellGcmSys.c gcm_bind_object: routes the slot's 2D methods |
+| NV3089 | 0x0180 | `NV3089_SET_CONTEXT_DMA_NOTIFIES` | inert | oracle-null | see NV3062 0x0180 |
+| DRIVER | 0x0000 | `SCE_DRIVER_SET_OBJECT` | handled | consumer | cellGcmSys.c gcm_bind_object: the driver object makes 0xE9xx/0xEBxx words on the slot driver commands |
+
+### Census
+
+The 120 s Odin boot (`scratch/h1b-census`, the last `GCM_METHOD_STATS` block) carried 214 observations:
+NV4097 177, NV308A 10, NV309E 3, NV3062 2, NV3089 2, NV406E 1, driver 1, and 18 NV4097 methods seen
+before the first observed bind. Those 18 are the same methods as some of the 177, so the stream has 196
+distinct `(class, method)` pairs. Classified: **21 handled, 170 inert, 5 missing, 0 unknown**; the 18
+pre-bind observations classify as the NV4097 rows they belong to. `libs/video/tests/test_rsx_method_census.c`
+replays the pair table through the real walker (214 writes + 7 binds: 34 handled, 180 inert, 7 missing,
+0 unknown).
+
+### Handled states the walker itself consumes
+
+`SET_OBJECT` (the binding), `GET_REPORT` (`0x1800`) and `SET_CONTEXT_DMA_REPORT` (`0x1A8`) are consumed by
+`cellGcmSys.c`; `SET_CONTEXT_DMA_NOTIFIES` (`0x0180`) and `SET_CONTEXT_DMA_SEMAPHORE` (`0x01A4`) by
+`rsx_commands.c` (the notify write and the back-end label write); the depth range by the engine (below).
+
+### Implemented in S1: the depth range
+
+`SET_CLIP_MIN` (`0x0394`) / `SET_CLIP_MAX` (`0x0398`) are part of every viewport: libgcm's
+`cellGcmSetViewport` writes them in the same packet (`docs/rsxfifo.txt`, "SetClipMinMax" / "SetViewport").
+Window z is mapped to `[near, far]` before the depth test and the depth write. The path:
+`rsx_commands.c` (`rsx_state.clip_min/clip_max`) and `rsx_dispatch.c` (`rsx_dsp_depth_range`) →
+`rsx_draw_engine.c` (the optional `set_depth_range` backend hook, called per draw) →
+`rsx_metal_backend.m` (`MTLViewport.znear/zfar`, both the engine and the vtable path).
+Tests: `rsx_depth_range` (host) and `depth_range_metal` (0.25/0.75 → depth buffer 0.25/0.75).
+
+### Known gaps (S2)
+
+| State | What the renderer does today | S2 row |
+|---|---|---|
+| `NV4097_SET_WINDOW_OFFSET` (`0x02B8`) | the window transform has a fixed zero offset | add a per-draw window offset to the viewport epilogue; needs RPCS3's `window_offset_x/y` semantics pinned first |
+| `NV4097_SET_SHADER_WINDOW` (`0x1D88`) | the NDC→window epilogue hard-codes a top-left origin and integer pixel centres | decode height/origin/pixel-centre and apply it in the epilogue; needs a reference frame to settle the convention (M3 non-goal) |
+| `NV4097_SET_BACK_STENCIL_MASK` / `_FUNC_REF` / `_FUNC_MASK` (`0x034C`, `0x0354`, `0x0358`) | two-sided stencil compares and writes with the front mask and reference | carry the back masks in `rsx_be_render_state`; Metal has per-face masks but one shared reference, so a differing back reference needs emulation |
+| `NV4097_SET_BLEND_COLOR` (`0x031C`) | constant blend factors use the host default instead of the guest's colour | add the four floats to the pipeline/encoder state |

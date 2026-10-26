@@ -1124,6 +1124,7 @@ if(UNIX)
     # bytes observed. tools/test_rsx_methods.py runs the fixture's modes and checks the captures it leaves.
     add_executable(test_gcm_nv0039
         libs/video/tests/test_gcm_nv0039.c
+        libs/video/rsx_dispatch.c
         libs/video/rsx_capture.cpp
         libs/video/gcm_default_state.c
         runtime/memory/label_window.c
@@ -1140,6 +1141,72 @@ if(UNIX)
         target_link_options(test_gcm_nv0039 PRIVATE "-Wl,--gc-sections")
         target_link_libraries(test_gcm_nv0039 PRIVATE m)
     endif()
+    # The method classification against the census it must explain (issue #47): one synthetic FIFO with
+    # every observed (class, method) pair, counted, plus the unclassified pair's named stop. The real
+    # register-file class table is linked in, because that is the engine's consumer list.
+    add_executable(test_rsx_method_census
+        libs/video/tests/test_rsx_method_census.c
+        libs/video/rsx_dispatch.c
+        libs/video/gcm_default_state.c
+        runtime/memory/label_window.c
+        runtime/diag/stop.cpp)
+    target_include_directories(test_rsx_method_census PRIVATE ${RSX_CAPTURE_FIXTURE_INCLUDES})
+    target_compile_definitions(test_rsx_method_census PRIVATE _GNU_SOURCE)
+    target_link_libraries(test_rsx_method_census PRIVATE Threads::Threads)
+    set_target_properties(test_rsx_method_census PROPERTIES LINKER_LANGUAGE CXX C_EXTENSIONS ON)
+    if(APPLE)
+        target_link_options(test_rsx_method_census PRIVATE "-Wl,-dead_strip")
+    else()
+        target_compile_options(test_rsx_method_census PRIVATE $<$<COMPILE_LANGUAGE:C>:-ffunction-sections -fdata-sections>)
+        target_link_options(test_rsx_method_census PRIVATE "-Wl,--gc-sections")
+        target_link_libraries(test_rsx_method_census PRIVATE m)
+    endif()
+    add_test(NAME rsx_method_census COMMAND $<TARGET_FILE:test_rsx_method_census>)
+    set_tests_properties(rsx_method_census PROPERTIES LABELS "rsx;t0" TIMEOUT 120)
+
+    # The depth range (SET_CLIP_MIN/MAX) through the register-file engine, host only: the guest's
+    # 0.25/0.75 must reach the backend per draw. The real Metal readback is test_depth_range_metal.m.
+    add_executable(test_rsx_depth_range
+        libs/video/tests/test_rsx_depth_range.c
+        libs/video/rsx_vertex_compact.c
+        libs/video/rsx_texture_layout.c
+        libs/video/rsx_vp_decompiler.c
+        libs/video/rsx_fp_decompiler.c)
+    target_include_directories(test_rsx_depth_range PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/runtime"
+    )
+    set_target_properties(test_rsx_depth_range PROPERTIES LINKER_LANGUAGE CXX C_EXTENSIONS ON)
+    target_link_libraries(test_rsx_depth_range PRIVATE m)
+    add_test(NAME rsx_depth_range COMMAND $<TARGET_FILE:test_rsx_depth_range>)
+    set_tests_properties(rsx_depth_range PROPERTIES LABELS "rsx;t0" TIMEOUT 120)
+
+    # The same contract on a real device: [0.25, 0.75] must land in MTLViewport.znear/zfar, read back
+    # from the depth buffer. Labelled gpu so a host without Metal skips it (exit 77), never passes.
+    if(APPLE AND PS3RECOMP_MSL_TRANSLATION)
+        add_executable(test_depth_range_metal
+            libs/video/tests/test_depth_range_metal.m
+            libs/video/rsx_dispatch.c
+            libs/video/rsx_vertex_compact.c
+            libs/video/rsx_texture_layout.c
+            libs/video/rsx_vp_decompiler.c
+            libs/video/rsx_fp_decompiler.c
+            libs/video/rsx_capture.cpp
+            libs/video/rsx_shader_msl.cpp
+            runtime/diag/sha256.cpp)
+        set_source_files_properties(libs/video/tests/test_depth_range_metal.m
+            PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+        target_include_directories(test_depth_range_metal PRIVATE ${RSX_CAPTURE_FIXTURE_INCLUDES})
+        target_link_libraries(test_depth_range_metal PRIVATE ps3recomp_msl_translation Threads::Threads
+            "-framework Metal" "-framework QuartzCore" "-framework Foundation" "-framework AppKit")
+        target_link_options(test_depth_range_metal PRIVATE "-Wl,-dead_strip")
+        set_target_properties(test_depth_range_metal PROPERTIES LINKER_LANGUAGE CXX)
+        add_test(NAME depth_range_metal COMMAND $<TARGET_FILE:test_depth_range_metal>)
+        set_tests_properties(depth_range_metal PROPERTIES LABELS "rsx;gpu;t0" SKIP_RETURN_CODE 77 TIMEOUT 300)
+    endif()
+
     set(RSX_METHODS_TEST_ARGS $<TARGET_FILE:test_gcm_nv0039>)
     # The backend's dump-list parser, no GPU: the .m includes the backend and reaches only fdump_parse.
     if(APPLE)

@@ -127,7 +127,9 @@ extern "C" {
     /* H1b: an RSX capture or replay that cannot be trusted (a blob, a span, an output). */ \
     X(RSX_CAPTURE,              "rsx-capture")                                 \
     /* A host path an HLE handler builds does not fit its buffer; a cut path names another directory. */ \
-    X(HOST_PATH_LIMIT,          "host-path-limit")
+    X(HOST_PATH_LIMIT,          "host-path-limit")                                                         \
+    /* S1: a FIFO method no class consumes and no allow-list entry cites. */                               \
+    X(RSX_UNKNOWN_METHOD,       "rsx-unknown-method")
 
 /* A fixed underlying type in C++ makes a kind outside the list (a caller's bug,
  * which the stop still reports as "invalid-kind") a well-defined value rather
@@ -263,6 +265,15 @@ PS3_NORETURN void ps3_stop_spurs_dispatch_miss(const char* api, uint32_t owner_e
  * cannot write. Fields: func, reason (a stable id: midstream, blob-missing, blob-altered, read-conflict,
  * readback-format, output-exists, io, ...), detail (free text naming the file, address or event). */
 PS3_NORETURN void ps3_stop_rsx_capture(const char* func, const char* reason, const char* detail);
+
+/* Generic helper to raise PS3_STOP_RSX_UNKNOWN_METHOD: a FIFO method whose (class, method) pair no
+ * consumer reads and no allow-list row classifies (rsx_method_class.h). The frame it belongs to cannot
+ * be trusted, so the walker ends the process instead of consuming a command nobody explained: a method
+ * silently dropped is state the console applied and this runtime did not. `cls` is the bound class's
+ * name (rsx_class_name), `fifo` the IO offset of the packet header the method arrived in and `word` the
+ * data word's offset. Fields: class, method, subchannel, fifo, word, data. */
+PS3_NORETURN void ps3_stop_rsx_unknown_method(const char* cls, uint32_t method, uint32_t subchannel,
+                                              uint32_t fifo, uint32_t word, uint32_t data);
 
 /* ---- frontier ---------------------------------------------------------- */
 

@@ -3038,6 +3038,13 @@ static void sink_end(void* user, const rsx_dispatch* r)
     g.be->bind_textures(g.be->user, textures, samplers, tex_mask);
     g.be->bind_vertex_textures(g.be->user, vtextures, vsamplers, vtex_mask);
     g.be->set_viewport(g.be->user, 0.0f, 0.0f, W, H);
+    /* The guest's depth range: window z (already through the viewport transform above) is mapped to
+     * [near, far] before the depth test. libgcm writes both registers with every SetViewport. */
+    if (g.be->set_depth_range) {
+        float near_z, far_z;
+        rsx_dsp_depth_range(&g.rsx, &near_z, &far_z);
+        g.be->set_depth_range(g.be->user, near_z, far_z);
+    }
 
     /* The guest scissor intersected with the surface. The nv40 reset is a
      * full 4096x4096 window and a never-written register reads 0 here, which

@@ -110,6 +110,15 @@ int main(void)
     (void)cellGcmSetupContext(ctx_out, CMD_SIZE, IO_SIZE, IO_ADDR, host_alloc, host_w32);
     const uint32_t ctrl = (uint32_t)(uintptr_t)cellGcmGetControlRegister();
 
+    /* Bind the 3D object first: a method on a subchannel with no object bound reaches no engine on the
+     * console, and the walker models that drop (cellGcmSys.c gcm_method_unbound). */
+    gw32(IO_ADDR + CMD0, (1u << 18) | 0u);       /* SET_OBJECT */
+    gw32(IO_ADDR + CMD0 + 4, RSX_OBJ_NV4097);
+    s_fifo_getoff = CMD0;
+    vm_write32(ctrl + 4, CMD0);
+    vm_write32(ctrl + 0, CMD0 + 8);
+    cellGcm_rsx_process_fifo();
+
     /* A: probe 0, JUMP to B.  B: probe 1, probe 2, then a park at put. */
     u32 a = put_probe(CMD0, 0);
     gw32(IO_ADDR + a, 0x20000000u | SEG_B);
@@ -117,6 +126,7 @@ int main(void)
     b = put_probe(b, 2);
     gw32(IO_ADDR + b, 0x20000000u | b);          /* park: JUMP to itself */
 
+    /* The bind consumed the first packet; A's probe stays at CMD0, so rewind get there. */
     s_fifo_getoff = CMD0;
     vm_write32(ctrl + 4, CMD0);
     vm_write32(ctrl + 0, b);                     /* put at the park */

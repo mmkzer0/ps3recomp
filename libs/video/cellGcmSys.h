@@ -475,11 +475,13 @@ void gcm_set_driver_observer(GcmDriverObserver fn);
 unsigned long long gcm_driver_event_count(u32 kind);
 
 /* What the FIFO walker did with every method it consumed (rsx_method_class.h): each ends as handled,
- * inert (allow-listed, with evidence) or unknown. Unknown ones are counted per (class, method) and make
- * a capture frame invalid; they are not a stop yet (M3-SCOPE Amendment 1, finding 5). The counters are
- * cumulative until gcm_method_stats_reset(); they may be read from any thread. */
+ * inert (allow-listed for the value it pins), missing (a state this renderer ignores, with an S2 row in
+ * docs/RSX_GRAPHICS.md), or unknown (no row at all: the live walker stops with rsx-unknown-method and a
+ * capture frame is invalid). `unbound` counts methods dropped because the slot had no object bound,
+ * which is what the console does. The counters are cumulative until gcm_method_stats_reset(); they may
+ * be read from any thread. */
 typedef struct GcmMethodStats {
-    unsigned long long handled, inert, unknown;
+    unsigned long long handled, inert, missing, unknown, unbound;
     unsigned long long m2mf_copies;   /* NV0039 BUFFER_NOTIFY copies executed */
 } GcmMethodStats;
 typedef struct GcmUnknownMethod {
@@ -491,6 +493,8 @@ typedef struct GcmUnknownMethod {
 void gcm_method_stats(GcmMethodStats* out);
 /* Fills up to `max` entries, ordered by class then method; returns the number of distinct pairs. */
 u32  gcm_unknown_methods(GcmUnknownMethod* out, u32 max);
+/* The same for the pairs classified missing: the known gaps, per (class, method). */
+u32  gcm_missing_methods(GcmUnknownMethod* out, u32 max);
 void gcm_method_stats_reset(void);
 const char* gcm_method_class_name(u32 cls);
 

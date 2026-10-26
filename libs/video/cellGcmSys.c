@@ -70,31 +70,65 @@ static struct {
 } s_m2mf;
 static _Atomic unsigned long long s_m2mf_copies;
 
-/* Every method the walker consumes ends in one verdict. Unknown ones are counted per (class, method);
- * the first GCM_UNKNOWN_LOG_MAX distinct pairs are logged; a capture marks the frame invalid. The
- * counters are read from another thread (a title printing them at exit), so they are relaxed atomics;
- * the first-seen subchannel and data word are diagnostics and need no order. */
+/* Every method the walker consumes ends in one verdict (rsx_method_class.h). Unknown ones are counted
+ * per (class, method); the first GCM_UNKNOWN_LOG_MAX distinct pairs are logged; a capture marks the
+ * frame invalid; and the live walker STOPS (`rsx-unknown-method`, M3-SCOPE Amendment 1 finding 5,
+ * switched on by slice S1). Missing states (a real state this renderer ignores, with an S2 row) are
+ * counted and logged too, but they do not stop: they are known, documented gaps, not unexplained ones.
+ * The counters are read from another thread (a title printing them at exit), so they are relaxed
+ * atomics; the first-seen subchannel and data word are diagnostics and need no order. */
 #define GCM_UNKNOWN_LOG_MAX 16u
-static _Atomic unsigned long long s_mc_handled, s_mc_inert, s_mc_unknown;
+#define GCM_MISSING_LOG_MAX 16u
+static _Atomic unsigned long long s_mc_handled, s_mc_inert, s_mc_unknown, s_mc_missing, s_mc_unbound;
 static struct {
     _Atomic unsigned long long count;
     u32 data;
     u8  subch;
 } s_mc_tab[RSX_CLASS_COUNT][0x800];
-static unsigned s_mc_logged;
+static struct {
+    _Atomic unsigned long long count;
+    u32 data;
+    u8  subch;
+} s_miss_tab[RSX_CLASS_COUNT][0x800];
+static unsigned s_mc_logged, s_miss_logged;
 
-/* `handled` says a consumer took the method. Otherwise it is inert (the allow-list, with evidence) or
- * unknown. The unknown case is deliberately NOT a named stop yet: M3-SCOPE Amendment 1 (finding 5)
- * holds that stop back until slice S1 has classified the 13 methods G0 found (class-bound routing is
- * S1's too), because every frame of the title would stop at the first of them. Until then an unknown
- * method is visible (counter, log, an invalid capture frame) and nothing is claimed about the frame. */
-static void gcm_method_verdict(u32 subch, u32 m, u32 data, int handled)
+/* `handled` says a consumer took the method. Otherwise the (class, method) pair is looked up in the
+ * table (rsx_method_class.h): INERT when the write carries the value the row pins, MISSING when the
+ * row is an S2 gap or the write differs from the pinned value, and UNKNOWN when no row covers the pair
+ * at all -- the only case that stops. `fifo` is the IO offset of the packet header, `word` its data
+ * word: the two positions that let an operator find the command again in a capture or a log. */
+static void gcm_method_verdict(u32 subch, u32 m, u32 data, int handled, u32 fifo, u32 word)
 {
     const rsx_class_id cls = (m && m < 0x100u) ? RSX_CLASS_NV406E : (rsx_class_id)s_subch_class[subch & 7u];
     if (handled) { atomic_fetch_add_explicit(&s_mc_handled, 1, memory_order_relaxed); return; }
-    if (rsx_method_inert(cls, m)) { atomic_fetch_add_explicit(&s_mc_inert, 1, memory_order_relaxed); return; }
-    atomic_fetch_add_explicit(&s_mc_unknown, 1, memory_order_relaxed);
+    const rsx_method_rule* rule = NULL;
+    const rsx_method_verdict v = rsx_method_check(cls, m, data, &rule);
     const u32 idx = (m >> 2) & 0x7FFu;
+    if (v == RSX_METHOD_HANDLED) {
+        /* The row names a consumer that is not on this configuration's path (the register-file engine
+         * while it is disabled). The pair is classified, not unexplained, so it is not unknown. */
+        atomic_fetch_add_explicit(&s_mc_handled, 1, memory_order_relaxed);
+        return;
+    }
+    if (v == RSX_METHOD_INERT) {
+        atomic_fetch_add_explicit(&s_mc_inert, 1, memory_order_relaxed);
+        return;
+    }
+    if (v == RSX_METHOD_MISSING) {
+        atomic_fetch_add_explicit(&s_mc_missing, 1, memory_order_relaxed);
+        if (atomic_fetch_add_explicit(&s_miss_tab[cls][idx].count, 1, memory_order_relaxed) == 0) {
+            s_miss_tab[cls][idx].data = data;
+            s_miss_tab[cls][idx].subch = (u8)subch;
+            if (s_miss_logged < GCM_MISSING_LOG_MAX) {
+                s_miss_logged++;
+                fprintf(stderr, "[rsx-method] missing %s method 0x%04X = 0x%08X (%s; subchannel %u, fifo 0x%X)\n",
+                        rsx_class_name(cls), m, data, rule ? rule->name : "no row", subch, fifo);
+            }
+        }
+        return;
+    }
+    /* Unknown: no consumer, no allow-list row that covers this value. */
+    atomic_fetch_add_explicit(&s_mc_unknown, 1, memory_order_relaxed);
     if (atomic_fetch_add_explicit(&s_mc_tab[cls][idx].count, 1, memory_order_relaxed) == 0) {
         s_mc_tab[cls][idx].data = data;
         s_mc_tab[cls][idx].subch = (u8)subch;
@@ -105,6 +139,21 @@ static void gcm_method_verdict(u32 subch, u32 m, u32 data, int handled)
         }
     }
     if (s_cap) s_cap->note(RSX_CAP_NOTE_UNKNOWN_METHOD, subch, m, data);
+    ps3_stop_rsx_unknown_method(rsx_class_name(cls), m, subch, fifo, word, data);
+}
+
+/* A method on a slot with no object bound reaches no engine: PFIFO has no class to decode it against
+ * (envytools fifo/nv_object.xml: the subchannel's object table is what gives a method its meaning), so
+ * the console drops the write. Dropping it here is the faithful model; counting it keeps the census
+ * honest about writes that never become state. An UNREGISTERED handle is not dropped: this runtime does
+ * not know that class's methods, so the method stays unknown and stops. */
+static void gcm_method_unbound(u32 subch, u32 m, u32 data)
+{
+    atomic_fetch_add_explicit(&s_mc_unbound, 1, memory_order_relaxed);
+    { static int n = 0;
+      if (PS3_LOG_FIRST(n, 8))
+          fprintf(stderr, "[rsx-method] dropped unbound method 0x%04X = 0x%08X (subchannel %u)\n",
+                  m, data, subch); }
 }
 
 void gcm_method_stats(GcmMethodStats* out)
@@ -112,7 +161,9 @@ void gcm_method_stats(GcmMethodStats* out)
     if (!out) return;
     out->handled = atomic_load_explicit(&s_mc_handled, memory_order_relaxed);
     out->inert   = atomic_load_explicit(&s_mc_inert, memory_order_relaxed);
+    out->missing = atomic_load_explicit(&s_mc_missing, memory_order_relaxed);
     out->unknown = atomic_load_explicit(&s_mc_unknown, memory_order_relaxed);
+    out->unbound = atomic_load_explicit(&s_mc_unbound, memory_order_relaxed);
     out->m2mf_copies = atomic_load_explicit(&s_m2mf_copies, memory_order_relaxed);
 }
 
@@ -132,15 +183,35 @@ u32 gcm_unknown_methods(GcmUnknownMethod* out, u32 max)
     return n;
 }
 
+u32 gcm_missing_methods(GcmUnknownMethod* out, u32 max)
+{
+    u32 n = 0;
+    for (u32 c = 0; c < RSX_CLASS_COUNT; c++)
+        for (u32 i = 0; i < 0x800u; i++) {
+            const unsigned long long count = atomic_load_explicit(&s_miss_tab[c][i].count, memory_order_relaxed);
+            if (!count) continue;
+            if (out && n < max) {
+                out[n].cls = c; out[n].method = i << 2; out[n].count = count;
+                out[n].subch = s_miss_tab[c][i].subch; out[n].data = s_miss_tab[c][i].data;
+            }
+            n++;
+        }
+    return n;
+}
+
 void gcm_method_stats_reset(void)
 {
     atomic_store_explicit(&s_mc_handled, 0, memory_order_relaxed);
     atomic_store_explicit(&s_mc_inert, 0, memory_order_relaxed);
+    atomic_store_explicit(&s_mc_missing, 0, memory_order_relaxed);
     atomic_store_explicit(&s_mc_unknown, 0, memory_order_relaxed);
+    atomic_store_explicit(&s_mc_unbound, 0, memory_order_relaxed);
     atomic_store_explicit(&s_m2mf_copies, 0, memory_order_relaxed);
     for (u32 c = 0; c < RSX_CLASS_COUNT; c++)
-        for (u32 i = 0; i < 0x800u; i++)
+        for (u32 i = 0; i < 0x800u; i++) {
             atomic_store_explicit(&s_mc_tab[c][i].count, 0, memory_order_relaxed);
+            atomic_store_explicit(&s_miss_tab[c][i].count, 0, memory_order_relaxed);
+        }
 }
 
 const char* gcm_method_class_name(u32 cls) { return rsx_class_name((rsx_class_id)cls); }
@@ -883,6 +954,21 @@ u32 cellGcmSetupContext(u32 ctx_out_addr, u32 cmdSize, u32 ioSize, u32 ioAddress
     /* io 0: the default-state subroutine, then (as InitBody does at 0x02000AD8) it ends in RET,
      * which gcm_emit_default_state writes. */
     gcm_emit_default_state(ioAddress);
+
+    /* The subroutine's first words are the channel's SET_OBJECTs, and the driver runs it during init:
+     * the console's subchannels are bound before any title traffic. The RESC conversion stream proves it —
+     * cellRescSetConvertAndFlip's stream (resc_convert.c) writes viewport and depth state without a bind,
+     * and the firmware's first flip only CALLs the subroutine afterwards (docs/rsxfifo.txt "SetViewport"),
+     * so those writes can only work on a channel that is already bound. Model that here, once per init,
+     * instead of leaving the table empty until the first observed SET_OBJECT: the walker would otherwise
+     * drop the first frame's streams as unbound (and the depth range and viewport with them). */
+    gcm_bind_object(0, RSX_OBJ_NV4097);
+    gcm_bind_object(1, RSX_OBJ_NV0039);
+    gcm_bind_object(3, RSX_OBJ_NV3062);
+    gcm_bind_object(4, RSX_OBJ_NV309E);
+    gcm_bind_object(5, RSX_OBJ_NV308A);
+    gcm_bind_object(6, RSX_OBJ_NV3089);
+    gcm_bind_object(7, RSX_OBJ_DRIVER);
 
     s_ib.valid     = 1;
     s_ib.ctx_ea    = cdata;
@@ -2362,13 +2448,20 @@ static void gcm_method_stats_report(void)
     t0 = now;
     GcmMethodStats st;
     gcm_method_stats(&st);
-    fprintf(stderr, "[rsx-method-stats] handled=%llu inert=%llu unknown=%llu m2mf_copies=%llu\n", st.handled,
-            st.inert, st.unknown, st.m2mf_copies);
+    fprintf(stderr, "[rsx-method-stats] handled=%llu inert=%llu missing=%llu unknown=%llu unbound=%llu "
+                    "m2mf_copies=%llu\n",
+            st.handled, st.inert, st.missing, st.unknown, st.unbound, st.m2mf_copies);
     for (u32 c = 0; c < RSX_CLASS_COUNT; c++)
         for (u32 i = 0; i < 0x800u; i++) {
             const unsigned long long n = atomic_load_explicit(&s_mc_tab[c][i].count, memory_order_relaxed);
-            if (n) fprintf(stderr, "[rsx-method-stats]   %s 0x%04X x%llu (first: subchannel %u, data 0x%08X)\n",
+            if (n) fprintf(stderr, "[rsx-method-stats]   unknown %s 0x%04X x%llu (first: subchannel %u, data 0x%08X)\n",
                            rsx_class_name((rsx_class_id)c), i << 2, n, s_mc_tab[c][i].subch, s_mc_tab[c][i].data);
+        }
+    for (u32 c = 0; c < RSX_CLASS_COUNT; c++)
+        for (u32 i = 0; i < 0x800u; i++) {
+            const unsigned long long n = atomic_load_explicit(&s_miss_tab[c][i].count, memory_order_relaxed);
+            if (n) fprintf(stderr, "[rsx-method-stats]   missing %s 0x%04X x%llu (first: subchannel %u, data 0x%08X)\n",
+                           rsx_class_name((rsx_class_id)c), i << 2, n, s_miss_tab[c][i].subch, s_miss_tab[c][i].data);
         }
 }
 
@@ -2870,9 +2963,11 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * the 3D register file or the live-draw mirror: NV0039's 0x0304-0x0328 are NV4097's
                  * alpha, blend and colour-mask state there. */
                 if (s_subch_class[subch] == RSX_CLASS_NV0039) {
-                    gcm_method_verdict(subch, m, mdata, gcm_nv0039_method(m, mdata));
+                    gcm_method_verdict(subch, m, mdata, gcm_nv0039_method(m, mdata),
+                                       s_fifo_getoff, s_fifo_getoff + 4 + i * 4);
                     continue;
                 }
+
                 /* GCM_SET_USER_COMMAND is method 0xEB00, which this decode
                  * splits into subchannel 7 / method 0x0B00 -- so it was landing
                  * in the 2D engine path and being dropped as unrecognised. It
@@ -2894,7 +2989,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                      * it for the pump here. */
                     gcm_driver_event(GCM_DRV_EVENT_USER_COMMAND, vm_read32(dea));
                     if (s_user_handler_opd) cellGcmQueueUserCommand(vm_read32(dea));
-                    gcm_method_verdict(subch, m, mdata, 1);
+                    gcm_method_verdict(subch, m, mdata, 1, s_fifo_getoff, s_fifo_getoff + 4 + i * 4);
                     continue;
                 }
                 /* GCM_SUBCH1_3D=1: treat subchannel 1 as the 3D object too.
@@ -3011,6 +3106,14 @@ static void gcm_rsx_process_fifo_unlocked(void)
                                  n_be, n_va, n_ia), fflush(stdout);
                   } }
 
+                /* No object bound: no class decodes the method, so the console drops the write
+                 * (envytools fifo/nv_object.xml: the subchannel's object is what gives a method its
+                 * meaning). The driver words below are the LV1's, not an engine's, so subchannel 7 is
+                 * left alone; a bind or an LV1 word is not dropped. */
+                if (m >= 0x100u && subch != 7 && s_subch_class[subch] == RSX_CLASS_UNBOUND) {
+                    gcm_method_unbound(subch, m, mdata);
+                    continue;
+                }
                 /* Driver methods (0xE9xx, 0xEBxx) occupy bits 2-15 of the
                  * FIFO word; the standard 11-bit extraction (w & 0x1FFC)
                  * truncates them.  Reconstruct the full address the same way
@@ -3048,8 +3151,14 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     const int rc = rsx_process_method(&s_state, m, vm_read32(dea));
                     /* Handled when the state machine took it, or -- with the register-file engine on --
                      * when the engine has a consumer for it. SET_OBJECT is the binding table's. */
+                    /* The register-file dispatch's class table is a property of the method number
+                     * (rsx_dispatch.h), not of this run's configuration: a method it classifies is
+                     * consumed on the register-file path even while that path is off, so it is
+                     * classified, not unknown. */
                     handled = rc == 0 || m == 0 ||
-                              (rsx_draw_engine_enabled() && rsx_dsp_method_class(m) != RSX_DSP_CLASS_TODO);
+                              /* the walker's own consumers: GET_REPORT's destination (0x1A8) */
+                              m == 0x1A8u || m == 0x1800u ||
+                              rsx_dsp_method_class(m) != RSX_DSP_CLASS_TODO;
                     /* NV406E_SET_REFERENCE: queue the fence value for PACED
                      * publication (gcm_ref_publish below) instead of letting a
                      * later fence in the same batch overwrite it. */
@@ -3081,8 +3190,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
                         }
                     }
                 } else
-                    handled = gcm_2d_method(subch, m, vm_read32(dea));
-                gcm_method_verdict(subch, m, mdata, handled);
+                    handled = gcm_2d_method(subch, m, vm_read32(dea)) || m == 0;
+                gcm_method_verdict(subch, m, mdata, handled, s_fifo_getoff, s_fifo_getoff + 4 + i * 4);
                 }
             }
             s_fifo_getoff += 4 + count * 4;

@@ -43,4 +43,14 @@ PS3_NORETURN void ps3_stop_guest_range(const char* func, const char* arg, uint64
     exit(70);
 }
 
+/* S1's live stop. A fixture that reaches it feeds the walker a (class, method) pair nothing classifies:
+ * say which, with the position that lets the row be found again, and end with the stop status. */
+PS3_NORETURN void ps3_stop_rsx_unknown_method(const char* cls, uint32_t method, uint32_t subchannel,
+                                              uint32_t fifo, uint32_t word, uint32_t data)
+{
+    printf("[FAIL] rsx-unknown-method class %s method 0x%04X subchannel %u fifo 0x%08X word 0x%08X data 0x%08X\n",
+           cls ? cls : "invalid", method, subchannel, fifo, word, data);
+    exit(70);
+}
+
 #endif

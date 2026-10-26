@@ -236,19 +236,55 @@ def test_manifest_edits(tmp, live):
     check(s == 2 and error_of(r) == "unfinished-capture", f"an unfinished capture is refused by name ({s}, {error_of(r)})")
 
 
+def patch_method(cap, old, new):
+    """Rewrite the first fifo-method packet of `cap` to another method number, keeping every hash honest.
+
+    Hand-building the packet through the live walker is impossible now that an unclassified method is a
+    named stop: the capture has to exist first, so the fixture patches a valid one. The packet's header
+    word is rewritten in its blob, the blob rehashed, and the capture hash recomputed."""
+    recs = records(cap)
+    for r in recs:
+        if r["event"] == "fifo-method" and r["method"] == f"0x{old:04x}":
+            rd = next(x for x in r["reads"] if x["kind"] == "fifo")
+            path = blob_path(cap, rd["sha256"])
+            data = bytearray(path.read_bytes())
+            hdr = int.from_bytes(data[0:4], "big")
+            data[0:4] = ((hdr & ~0x1FFC) | (new & 0x1FFC)).to_bytes(4, "big")
+            sha = hashlib.sha256(bytes(data)).hexdigest()
+            base = cap / "blobs" / "sha256" / sha[:2]
+            base.mkdir(parents=True, exist_ok=True)
+            (base / sha).write_bytes(bytes(data))
+            rd["sha256"] = sha
+            r["method"] = f"0x{new:04x}"
+            write_records(cap, recs, rehash=True)
+            return True
+    return False
+
+
 def test_refusals(tmp, live):
     s, r, _ = replay(tmp, live, "fixed-function", env={"PS3RECOMP_METAL_FIXED_FUNCTION": "1"})
     check(s == 2 and error_of(r) == "fixed-function", f"a fixed-function fallback is refused by name ({s}, {error_of(r)})")
 
-    unk = scene(tmp, "unknown", "unknown")
-    s, r, _ = replay(tmp, unk, "unknown")
-    check(s == 2 and error_of(r) == "unknown-method", f"an unknown method is a named error ({s}, {error_of(r)})")
+    # Fail-before/after for the live stop, on the same capture: one method number differs.
+    unk = scene(tmp, "unknown")
+    check(patch_method(unk, 0x0a74, 0x1f80), "a valid capture carries an unclassified NV4097 method (0x1F80)")
+    s, r, err = replay(tmp, unk, "unknown")
+    fields = dict(part.split("=", 1) for part in err.split() if "=" in part)
+    check(s == 70 and fields.get("kind") == "rsx-unknown-method",
+          f"replaying it stops with the named stop rsx-unknown-method (exit {s})")
+    check(fields.get("class") == "NV4097" and fields.get("method") == "0x1F80" and
+          fields.get("subchannel") == "0" and fields.get("fifo", "").startswith("0x") and
+          fields.get("word", "").startswith("0x"),
+          f"the stop names class, method, subchannel, fifo and word ({fields.get('class')} {fields.get('method')} "
+          f"sub {fields.get('subchannel')} fifo {fields.get('fifo')} word {fields.get('word')})")
     s, text = cli("validate", str(unk / "capture.ndjson"))
-    check(s != 0 and "no object class handles" in text, "...and ps3diff validate refuses the same capture")
-    s, r, _ = replay(tmp, unk, "unknown-accepted", "--accept-unknown-methods")
-    check(s == 5 and r["status"] == "diagnostic-equal" and r["accept_unknown_methods"] and not r["gate_valid"]
-          and all(not row["gate_valid"] for row in r["results"]),
-          f"--accept-unknown-methods replays it, equal, but not gate-valid in the header and every frame ({s})")
+    check(s == 0, f"the capture itself is well-formed: validate accepts it ({s} {text[:80]})")
+
+    mir = scene(tmp, "mirror")
+    check(patch_method(mir, 0x0a74, 0x0100), "...and the mirror capture carries an allow-listed method instead (0x0100)")
+    s, r, err = replay(tmp, mir, "mirror")
+    check(s == 0 and r and r["results"] and error_of(r) is None,
+          f"the mirror capture replays and produces its frame ({s}, {r and r['status']})")
 
     rep = scene(tmp, "report", "report")
     s, r, _ = replay(tmp, rep, "report-accepted", "--accept-unknown-methods")

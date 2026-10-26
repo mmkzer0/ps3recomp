@@ -195,6 +195,10 @@ typedef struct rsx_draw_backend {
     void (*bind_vertex_textures)(void* user, const u32* textures,
                                  const rsx_be_sampler_desc* samplers, u32 mask);
     void (*set_viewport)(void* user, float x, float y, float w, float h);
+    /* Optional: the depth range the draw's window z is mapped through (SET_CLIP_MIN/SET_CLIP_MAX),
+     * called before every draw like the stencil reference. A backend that leaves this NULL behaves as
+     * if the range were [0, 1], the reset value. */
+    void (*set_depth_range)(void* user, float near_z, float far_z);
     void (*set_scissor)(void* user, u32 x, u32 y, u32 w, u32 h);
     void (*set_stencil_ref)(void* user, u32 ref);
     /* Optional: the depth bounds for the next draw, called before every

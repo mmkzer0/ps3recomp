@@ -130,6 +130,16 @@
 #define M_NV4097_NOP            0x0100
 #define M_VP_ATTRIB_EN          0x1FF0
 #define M_VP_RESULT_EN          0x1FF4
+#define M_CLIP_MIN              0x0394
+#define M_CLIP_MAX              0x0398
+#define M_STENCIL_TEST_ENABLE   0x0328
+#define M_STENCIL_MASK          0x032C
+#define M_TWO_SIDED_STENCIL     0x0348
+#define M_BACK_STENCIL_FUNC     0x0350
+#define M_BACK_STENCIL_OPS      0x035C
+#define M_BLEND_ENABLE_MRT      0x036C
+#define M_DEPTH_BOUNDS_ENABLE   0x0380
+#define M_SHADER_PACKER         0x1FEC
 
 #define DMA_HANDLE_LOCAL        0xFEED0000u
 #define DMA_HANDLE_MAIN         0xFEED0001u
@@ -202,6 +212,23 @@ static void dsp_fill_classes(dsp_class_table* t)
     mark_class(t, M_VP_ATTRIB_EN,      1, RSX_DSP_CLASS_STATE);
     mark_class(t, M_VP_RESULT_EN,      1, RSX_DSP_CLASS_STATE);
 
+    /* Render state the register-file draw engine reads at draw time (rsx_draw_engine.c
+     * build_render_state, and the depth range through rsx_dsp_depth_range). These were live before
+     * this row existed only because the engine read the register file directly; the walker's coverage
+     * report had no way to see that, which is what S1's census exposed (0x032C, 0x0348, 0x0350,
+     * 0x035C-0x0364, 0x036C, 0x0380-0x0388, 0x0394/0x0398, 0x1FEC). */
+    /* The front-face stencil block 0x328..0x344 (enable, mask, func, ref, func mask, three ops) is read
+     * by rsx_draw_engine.c build_render_state. */
+    mark_class(t, M_STENCIL_TEST_ENABLE, 8, RSX_DSP_CLASS_STATE);
+    mark_class(t, M_STENCIL_MASK,        1, RSX_DSP_CLASS_STATE);
+    mark_class(t, M_TWO_SIDED_STENCIL,   1, RSX_DSP_CLASS_STATE);
+    mark_class(t, M_BACK_STENCIL_FUNC,   1, RSX_DSP_CLASS_STATE);
+    mark_class(t, M_BACK_STENCIL_OPS,    3, RSX_DSP_CLASS_STATE); /* FAIL, ZFAIL, ZPASS */
+    mark_class(t, M_BLEND_ENABLE_MRT,    1, RSX_DSP_CLASS_STATE);
+    mark_class(t, M_DEPTH_BOUNDS_ENABLE, 3, RSX_DSP_CLASS_STATE); /* ENABLE, MIN, MAX */
+    mark_class(t, M_CLIP_MIN,            2, RSX_DSP_CLASS_STATE); /* CLIP_MIN, CLIP_MAX */
+    mark_class(t, M_SHADER_PACKER,       1, RSX_DSP_CLASS_STATE);
+
     /* Explicit no-ops: the vertex cache invalidate hint and the reserved
      * NOP method carry no state the replay harness needs (there is no CPU
      * vertex cache to invalidate; every draw re-fetches from guest memory
@@ -261,6 +288,12 @@ void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
      * as numbering oracle). Seeded so a raw register read is trustworthy for
      * clear consumers, mirroring COLOR_MASK/FRONT_FACE above. */
     rsx->regs[0x1D8C >> 2] = 0xFFFFFF00u;
+
+    /* NV40 reset DEPTH_RANGE_FAR is 1.0 and DEPTH_RANGE_NEAR 0.0 (RPCS3 rsx_state::init
+     * registers[NV4097_SET_CLIP_MAX]=0x3f800000, SET_CLIP_MIN=0). Without the far seed a fresh
+     * register file claims a [0, 0] range, which no console has: the depth range is read per draw
+     * (rsx_dsp_depth_range), so the reset has to be the hardware's. */
+    rsx->regs[M_CLIP_MAX >> 2] = 0x3F800000u;
 
     memcpy(rsx->klass, dsp_classes()->klass, sizeof rsx->klass);
 }
@@ -530,6 +563,19 @@ void rsx_dsp_get_surface(const rsx_dispatch* rsx, rsx_dsp_surface* out)
     out->zeta_offset   = rsx_dsp_reg(rsx, M_ZETA_OFFSET);
     out->zeta_pitch    = rsx_dsp_reg(rsx, M_ZETA_PITCH);
     out->zeta_location = dma_to_location(rsx_dsp_reg(rsx, M_DMA_ZETA));
+}
+
+/* Depth range: the guest's window z (what the vertex program and the viewport transform produce) is
+ * mapped to [near, far] before the depth test and the depth write. libgcm writes both registers per
+ * viewport (docs/rsxfifo.txt "SetClipMinMax"), so a title that changes them changes every draw. */
+void rsx_dsp_depth_range(const rsx_dispatch* rsx, float* near_z, float* far_z)
+{
+    const u32 n = rsx_dsp_reg(rsx, M_CLIP_MIN), f = rsx_dsp_reg(rsx, M_CLIP_MAX);
+    float nf, ff;
+    memcpy(&nf, &n, 4);
+    memcpy(&ff, &f, 4);
+    if (near_z) *near_z = nf;
+    if (far_z)  *far_z = ff;
 }
 
 void rsx_dsp_get_viewport(const rsx_dispatch* rsx, rsx_dsp_viewport* out)

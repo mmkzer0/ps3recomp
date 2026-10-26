@@ -45,11 +45,14 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
 {
     (void)state; (void)data;
     if (g_3d_n < 64) g_3d[g_3d_n++] = method;
-    return (method == 0x0394u || method == 0x0100u) ? -1 : 0;
+    /* The vtable state machine consumes BEGIN_END (a draw, so the walker's `handled` comes from the
+     * consumer); it consumes nothing else this fixture asks about, so the verdict comes from the table. */
+    return method == 0x1808u ? 0 : -1;
 }
 int  rsx_draw_engine_enabled(void) { return 0; }
 void rsx_draw_engine_method(u32 method, u32 arg) { (void)method; (void)arg; }
-u32  rsx_dsp_method_class(u32 method) { (void)method; return RSX_DSP_CLASS_TODO; }
+/* rsx_dsp_method_class is the real one (rsx_dispatch.c): its class table is a property of the method
+ * number and is the engine's consumer list, so the verdicts below see it. */
 void rsx_draw_engine_note_flip(u32 buffer_id) { (void)buffer_id; }
 void rsx_draw_engine_guest_read(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
 void rsx_draw_engine_guest_wrote(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
@@ -282,7 +285,10 @@ static void rebind(void)
 
 /* ---- verdicts -------------------------------------------------------------------------------- */
 
-static void verdicts(int with_unknown)
+/* Verdicts over the allow-listed and value-pinned methods. An unknown method is a named stop now, so
+ * this fixture exercises the classes that do NOT stop: handled, inert, and the known gaps (missing).
+ * The stop itself is test_rsx_method_census.c's forked case. */
+static void verdicts(int with_missing)
 {
     gcm_method_stats_reset();
     put1(0, 0, RSX_OBJ_NV4097);
@@ -290,23 +296,31 @@ static void verdicts(int with_unknown)
     put1(0, 0x1808, 1);          /* handled */
     put1(0, 0x0100, 0);          /* NO_OPERATION: inert, allow-listed */
     put1(1, 0x0180, 0);          /* NV0039 DMA_NOTIFY: inert, allow-listed */
-    if (with_unknown) {
-        put1(0, 0x0394, 7);      /* no handler, not allow-listed */
-        put1(0, 0x0394, 8);
-        put1(1, 0x0190, 9);      /* an NV0039 method nothing implements */
+    if (with_missing) {
+        put1(0, 0x1D88, 0x12D0); /* shader window: an S2 gap, missing for its value */
+        put1(0, 0x1D88, 0x1000); /* ...twice, one distinct pair */
+        put1(0, 0x0300, 0);      /* dither pinned to enabled=1: a different value is missing */
     }
     run();
     GcmMethodStats st;
     gcm_method_stats(&st);
     GcmUnknownMethod u[8];
     const u32 n = gcm_unknown_methods(u, 8);
-    check(st.inert == 2, "NO_OPERATION and NV0039 DMA_NOTIFY count as inert");
-    if (with_unknown) {
-        check(st.unknown == 3 && n == 2, "three unknown methods, two distinct (class, method) pairs");
-        check(n == 2 && u[0].cls == RSX_CLASS_NV4097 && u[0].method == 0x394 && u[0].count == 2 &&
-              u[0].data == 7 && u[1].cls == RSX_CLASS_NV0039 && u[1].method == 0x190 && u[1].count == 1,
-              "counted per class: NV4097 0x0394 twice, NV0039 0x0190 once, each with its first data word");
-        check(!strcmp(gcm_method_class_name(u[1].cls), "NV0039"), "the class has a name");
+    printf("[verdicts] handled=%llu inert=%llu missing=%llu unknown=%llu unbound=%llu\n",
+           st.handled, st.inert, st.missing, st.unknown, st.unbound);
+    /* NO_OPERATION is also marked EXEC by the dispatcher's class table (its explicit no-op), so a
+     * consumer takes it and the allow-list entry is the second, redundant citation; the NV0039 notify
+     * has no consumer and is counted inert. */
+    check(st.inert == 1, "NV0039 DMA_NOTIFY counts as inert (NO_OPERATION is consumed as a no-op)");
+    if (with_missing) {
+        check(st.unknown == 0 && n == 0, "missing states are not unknown: the frame stays valid");
+        check(st.missing == 3, "three writes are classified missing");
+        GcmUnknownMethod m[8];
+        const u32 mn = gcm_missing_methods(m, 8);
+        check(mn == 2 && m[0].cls == RSX_CLASS_NV4097 && m[0].method == 0x300 && m[0].count == 1 &&
+              m[0].data == 0 && m[1].method == 0x1D88 && m[1].count == 2 && m[1].data == 0x12D0,
+              "counted per pair: the off-value dither once, the shader window twice, with first data words");
+        check(!strcmp(gcm_method_class_name(m[1].cls), "NV4097"), "the class has a name");
     } else {
         check(st.unknown == 0 && n == 0, "handled and allow-listed methods leave the unknown count at zero");
     }

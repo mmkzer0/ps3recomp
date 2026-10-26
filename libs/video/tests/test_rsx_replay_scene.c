@@ -11,7 +11,8 @@
  *
  * Extra arguments add what the walker cannot classify yet (the capture then counts unknown methods, and a
  * replay must refuse it by name or take --accept-unknown-methods):
- *   unknown  a method no object class handles (NV4097 0x0394);
+ *   unknown  a method no object class handles (NV4097 0x1F80, outside the constant window and the
+ *            allow-list; 0x0394 used to be one until S1 implemented the depth range);
  *   report   a GET_REPORT: the walker handles it in place, the method census still counts SET_REPORT_DMA and
  *            GET_REPORT as unknown. Its 16-byte write carries a host-clock timer.
  *
@@ -214,7 +215,7 @@ int main(int argc, char** argv)
     vertex_arrays(VTX_TRI);
     m(0x8E4, FP_COL | 2u); m(0x1D60, 64);
     m(0x1808, 5 /* TRIANGLES */); m(0x1814, 2u << 24); m(0x1808, 0);
-    if (unknown) m(0x0394, 1);
+    if (unknown) m(0x1F80, 1);
     /* NV0039: 64 bytes, window 2 source to window 2 destination */
     m1(0x184, 0xFEED0001u); m1(0x188, 0xFEED0001u);
     m1(0x30C, TEX_SRC); m1(0x310, TEX_DST);

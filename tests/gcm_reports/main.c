@@ -95,6 +95,9 @@ int main(void)
         for (unsigned k = 0; k < 16; k += 4) gw32(IO_ADDR + offs[i] + k, SENTINEL);
 
     g_head = 0x1000;                 /* the command area starts 0x1000 into the IO window */
+    /* Bind the 3D object first: a method on a subchannel with no object bound reaches no engine on
+     * the console, and the walker models that drop (cellGcmSys.c gcm_method_unbound). */
+    emit(0x0000, 0x31337000u);
     emit(0x1800, (1u << 24) | LOCAL_OFF);               /* default context: local */
     emit(0x01A8, 0xFEED0001u);                           /* SET_CONTEXT_DMA_REPORT: main */
     emit(0x1800, (1u << 24) | MAIN_OFF1);
