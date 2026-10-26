@@ -1205,6 +1205,19 @@ if(UNIX)
         set_target_properties(test_depth_range_metal PROPERTIES LINKER_LANGUAGE CXX)
         add_test(NAME depth_range_metal COMMAND $<TARGET_FILE:test_depth_range_metal>)
         set_tests_properties(depth_range_metal PROPERTIES LABELS "rsx;gpu;t0" SKIP_RETURN_CODE 77 TIMEOUT 300)
+        if(PS3RECOMP_SANITIZE)
+            # Same false positive as `rsx_replay` above (#52): spirv-cross reports a container-overflow
+            # reading the SPIR-V vector glslang filled, with a correct data()/size() handoff
+            # (rsx_shader_msl.cpp:121). Homebrew's glslang is uninstrumented; dyld coalescing its weak
+            # std::vector code with our instrumented copies leaves the vector's annotations stale.
+            # dev-ci run 40366340676 hit it here, inside eng_function, before any readback ran. It does
+            # not reproduce on the local Xcode toolchain (the test passes with the check on there), so
+            # this rests on the CI evidence and the identical, already-accepted #52 case. Only that
+            # check is off, only for this test; the rest repeats the preset's ASAN_OPTIONS, which
+            # ENVIRONMENT replaces.
+            set_tests_properties(depth_range_metal PROPERTIES ENVIRONMENT
+                "ASAN_OPTIONS=detect_leaks=0:strict_string_checks=1:detect_container_overflow=0")
+        endif()
     endif()
 
     set(RSX_METHODS_TEST_ARGS $<TARGET_FILE:test_gcm_nv0039>)
