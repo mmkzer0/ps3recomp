@@ -354,6 +354,31 @@ line still stops at 32; the count does not.
 
 ---
 
+## Replay: `rsx_replay` (macOS)
+
+**Files:** `tools/rsx_replay/rsx_replay.cpp`, `cellGcm_rsx_replay_step` in `libs/video/cellGcmSys.c`,
+`rsx_metal_backend_status` / `rsx_metal_backend_capture_environment` in `libs/video/rsx_metal_backend.m`.
+
+A `ps3diff.rsx/1` capture (docs/PS3DIFF.md) is replayed through the code the title runs, not a copy of
+it: `rsx_replay` maps a synthetic guest address space, replays `gcm-init` (`cellGcmSetupContext`) and the
+state events (`cellGcmMapEaIoAddress`, `cellGcmUnmapEaIoAddress`, `cellGcmSetDisplayBuffer`), brings up
+`rsx_metal_backend` headless, and then feeds the FIFO walker one recorded step at a time. The walker
+entry `cellGcm_rsx_replay_step` does three things and nothing else: it checks the walker stands where the step
+began (GET and the CALL return slot), it runs the walker with the PUT the live pass saw but stops where
+the step left the walker, and it hands a GET_REPORT the recorded timer instead of the host clock. Everything
+between (method decoding, the class table, the draw engine, the readback) is the live path.
+
+Because the replay is captured by the same writer, a replay that reproduced the inputs has the live
+capture's `capture_hash` at every frame: equal input events, read ordinals included. A cancelled step
+(an ACQUIRE the walker sat on for several passes) leaves no read ordinals behind, otherwise the live
+hash would depend on how long the title took to write the label.
+
+What a replay cannot reproduce is named, not smoothed over: `present_seq` (the title's frame clock
+presents between flips) is reported and never compared; the label window's address comes from the label
+blobs; a GET_REPORT timer is the recorded one. Errors and exit statuses: docs/PS3DIFF.md, "Replay".
+
+---
+
 ## RSX Shader Translation (Future Work)
 
 The RSX uses a proprietary shader ISA derived from NVIDIA's NV40/NV47 architecture:

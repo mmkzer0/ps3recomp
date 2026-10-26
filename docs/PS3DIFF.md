@@ -423,3 +423,63 @@ looked for in the inputs, then the state, then the pixels. Exit status: 0 equal 
 frame; 1 a frame differs or is invalid; 2 data or schema error; 3 zero frames compared (an
 error); 4 the environment records differ: **not comparable**, neither a pass nor a failure.
 Byte equality holds only on equal GPU, macOS, Metal, build and translator versions.
+
+### Replay: `rsx_replay`
+
+```
+rsx_replay <capture-dir> [--frames a-b] [--out report.json] [--manifest DIR] [--accept-unknown-methods]
+```
+
+macOS only (CMake target `rsx_replay`, built with the Metal backend and the shader translator). It
+replays the capture through the same FIFO walker, draw engine and headless Metal backend the title
+ran, with guest shaders on; a build or run that would fall back to the fixed-function pipeline is
+refused by name (`fixed-function`). The replay is itself captured by the same writer: its
+**manifest** (`DIR`, default `<report>.manifest`, else a temporary directory) is a `ps3diff.rsx/1`
+capture, so `ps3diff rsx-compare live/capture.ndjson DIR/capture.ndjson` works on it, and a replay
+that reproduced the inputs has the live capture's input hash frame for frame.
+
+`--frames a-b` (or `a`) names the flips to compare, by `flip_id`. A replay always starts at the
+clean reset and runs through the last frame named, because the register file, the surfaces and
+the texture cache at flip `a` are what the earlier flips made.
+
+Per recorded step the runner writes the step's blobs to their guest addresses, runs the walker over
+exactly that step with the PUT the live pass saw, and checks every recorded `writes` entry (label
+RELEASE, report, NV0039 destination) against the guest memory the replay produced. The
+walker is not seeked: each step must start where the previous one left it (GET and the CALL return
+slot). The one recorded value the replay does not recompute is a GET_REPORT's timer: it is the host
+clock on the live side, so the replay feeds the recorded one (`cellGcm_rsx_replay_step`). Nothing
+else reads a clock; the replay is one thread, as the title's walker, engine and backend are, and the
+readback follows the completed command buffer. The label window's guest address (`ppu_hle_inject_base`)
+is not in the capture; it is read from the first label blob's `ea - offset`.
+
+**Named errors** (exit 2; `error.name` in the report, also on stderr as `rsx_replay: error <name>: ...`):
+
+| Name | Meaning |
+|---|---|
+| `missing-blob` / `altered-blob` | a blob the manifest names is not in `blobs/sha256`, or its bytes are not its name or its declared size |
+| `capture-hash` | a frame's recorded input hash is not the hash of the input events before it: the manifest was edited |
+| `unknown-method` | a frame up to the last compared one consumed methods no object class handles (see below) |
+| `step-discontinuity` | a step does not start where the walker is (or with the same CALL return slot) |
+| `step-landing` | the walker did not leave a step where the recording ends it |
+| `write-mismatch` | a recorded write was not reproduced (value, or the number of report writes) |
+| `frame-identity` | the replay's frames are not the capture's `{flip_id, guest_frame, display_buffer}`; `present_seq` counts the engine's own presents, to which the title's frame clock adds some, so it is reported and not compared |
+| `fixed-function` | guest shaders are off in the backend |
+| `unfinished-capture`, `truncated-capture`, `no-capture`, `capture-format`, `hle-base`, `bootstrap`, `blob-range`, `gcm-init`, `gcm-state`, `config`, `backend`, `manifest` | the capture or the host cannot be replayed |
+
+Exit status: **0** every compared frame is equal (capture, state and frame hash, readback
+descriptor, draw counts) and valid; **1** a compared frame differs or is invalid (`first` names
+the flip and the field); **2** a named error; **3** zero frames compared (`zero-frames`);
+**4** *not comparable*: the live environment record and this machine's differ (`environment.differs`
+lists the fields; nothing is replayed); **5** diagnostic only, see below; **70** a stop raised by
+the walker, the engine or the writer.
+
+`--accept-unknown-methods` is a diagnostic for a capture that `validate` refuses because of
+`unknown-methods` (until each such method is classified). The replay runs, but the report says
+`gate_valid: false` in its header and in every frame, and the exit status for an otherwise equal
+replay is 5, never 0. It proves that the replay of those frames is deterministic; it is not a
+baseline.
+
+The report is `ps3diff.rsx.replay/1` JSON: `status`, `exit`, `capture_hash`, `gate_valid`,
+`environment` (live, replay, differs), `error`, `first`, and per frame the identity,
+`present_seq` (live and replay), `result` and the hashes of both sides. The environment's
+`title_sha` is carried over from the capture (it names who produced the inputs, not what renders them).

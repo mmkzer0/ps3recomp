@@ -979,6 +979,23 @@ if(UNIX)
             ENVIRONMENT "PS3RECOMP_METAL_HEADLESS=1")
     endif()
 
+    # The RSX capture replay runner (docs/RSX_GRAPHICS.md, "Replay"): a ps3diff.rsx/1 capture through the
+    # real FIFO walker, draw engine and headless Metal backend, with no title. It links the whole runtime
+    # library, like ps3recomp_host, so it runs the code the title runs, not a copy of it.
+    if(APPLE AND PS3RECOMP_MSL_TRANSLATION)
+        add_executable(rsx_replay
+            tools/rsx_replay/rsx_replay.cpp
+            runtime/host/host_stubs.c
+        )
+        target_include_directories(rsx_replay PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/runtime"
+        )
+        target_link_libraries(rsx_replay PRIVATE ps3recomp_runtime)
+        set_target_properties(rsx_replay PROPERTIES LINKER_LANGUAGE CXX)
+    endif()
+
     # The HLSL -> SPIR-V translation cache, memory and disk. Needs glslang
     # only, no GPU.
     if(PS3RECOMP_SPIRV_TRANSLATION)
@@ -1106,6 +1123,40 @@ if(UNIX)
             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_rsx_methods.py"
                 ${RSX_METHODS_TEST_ARGS})
         set_tests_properties(rsx_methods PROPERTIES LABELS "gcm;t0" TIMEOUT 120)
+    endif()
+
+    # Capture -> replay on a real Metal device (tools/test_rsx_replay.py): the scene fixture is a synthetic
+    # live run through the real walker, engine and backend; rsx_replay replays what it captured. Labelled
+    # `gpu` so a host without Metal (every Linux job) lists the test as skipped, never as passed.
+    if(APPLE AND PS3RECOMP_MSL_TRANSLATION)
+        add_executable(test_rsx_replay_scene
+            libs/video/tests/test_rsx_replay_scene.c
+            runtime/host/host_stubs.c
+        )
+        target_include_directories(test_rsx_replay_scene PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/runtime"
+        )
+        target_link_libraries(test_rsx_replay_scene PRIVATE ps3recomp_runtime)
+        set_target_properties(test_rsx_replay_scene PROPERTIES LINKER_LANGUAGE CXX)
+        if(Python3_Interpreter_FOUND)
+            add_test(NAME rsx_replay
+                COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_rsx_replay.py"
+                    $<TARGET_FILE:rsx_replay> $<TARGET_FILE:test_rsx_replay_scene>)
+            set_tests_properties(rsx_replay PROPERTIES LABELS "gcm;video;gpu;t0" SKIP_RETURN_CODE 77 TIMEOUT 300)
+            if(PS3RECOMP_SANITIZE)
+                # On macos-15 / Xcode 16.4 (dev-ci run 40307082211) spirv-cross reports a
+                # container-overflow reading the SPIR-V vector that glslang filled, with a correct
+                # data()/size() call. glslang is Homebrew's prebuilt, uninstrumented dylib; the likely
+                # cause is that dyld coalesces its weak std::vector code with our instrumented copies,
+                # which leaves the vector's container annotations stale (the documented false-positive
+                # class for mixed builds). Only that check is off, only for this test; the rest repeats
+                # the asan test preset's ASAN_OPTIONS, which ENVIRONMENT replaces.
+                set_tests_properties(rsx_replay PROPERTIES ENVIRONMENT
+                    "ASAN_OPTIONS=detect_leaks=0:strict_string_checks=1:detect_container_overflow=0")
+            endif()
+        endif()
     endif()
 endif()
 
