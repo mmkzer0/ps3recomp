@@ -142,6 +142,7 @@ table carries the same prefix and stem for the lift.
 | `libsync2` | 61 | semaphore attribute validation, initialize/finalize/wait/signal/try-wait, buffer-size arithmetic | 61 match |
 | `libfiber` | 98 | scheduler and fiber lifecycle without a guest context switch | 78 match, 16 diverge, 1 no-hle, 1 inconclusive, 2 lifted-blocked |
 | `libspurs_jq` | 242 (155 sequences) | JQ2 attribute, create (10- and 12-argument forms), shutdown/join, Port2 create/destroy, PushJob/CopyPush/PushSync/Sync, ring and descriptor-pool accounting | 175 match (119 common mode, 56 independent), 50 diverge, 6 no-hle, 9 inconclusive, 2 lifted-blocked |
+| `libsysutil` | 186 | cellSaveData AutoLoad2/AutoSave2: funcStat result x errDialog x version matrix, NULL arguments, `setBuf` boundaries, peer faults, one file operation; behind a scripted fake system process | 3 match (common mode), 135 diverge (128 are the #48 rows), 48 lifted-blocked (peer incomplete), see "Savedata" |
 
 The counts are a property of the HLE at the commit; they move when a finding is fixed. The
 per-function aggregate in the report is keyed by name and NID, and the summary separates
@@ -331,6 +332,58 @@ masked range still diverge.
 The 4 GiB guest space is reserved `PROT_NONE` with the arena mapped inside it, so a lifted access
 outside the arena is a deterministic `guest-fault` (not whichever host mapping happens to follow
 `vm_base`).
+
+## Savedata (libsysutil worker behind a scripted peer)
+
+The firmware's savedata worker (`0x0200C878`, reached from `cellSaveData*2`) does no file I/O: it
+serialises each step into tagged name/value messages (`dh_cxml.h`: header with a 4-character
+group tag, `0x110`, six sections; tree = root node + 16-byte `{name,type,value,aux}` entries,
+types 1 int / 3 string / 6 blob) and exchanges them with the system process over a shared-memory
+ring. The worker is lifted whole; only the ring is replaced.
+
+**Lift.** `scetool -d` (local keys) decrypts `libsysutil.sprx`; `lift_prx.py --base 0x02000000` +
+`lift_module.py` give 387 functions, 0 trapped instructions, 0 unresolved targets. The Sony
+compiler builds jump-table bases from `lis`/`addi` immediates (no TOC slot), which `ppu_lifter.py`
+did not recognise (#45 shape, `lwzx; extsw; add; mtctr; bctr`): every `switch` -- including the
+allocator callback table and the funcStat result switch -- landed on an unlifted label. The
+lifter now folds a constant `lis/addi`/`li` base (`_materialized_constant`; a base that is loaded,
+or displaced by a loaded register, stays unresolved) and the harness names the remaining case
+`unresolved-jump-table` (a computed branch into the image that is not a function entry), distinct
+from `unlifted-function`. With it, libsysutil lifts 8 dispatchers / 38 case targets; the allocator
+table decodes 12 entries, bounded by the table's own extent (the cursor reaching the first case).
+
+**Override seam.** `tools/diff_harness/apply_overrides.py` wraps chosen lifted functions; the case
+table calls `dh::override_symbol("group.name", fn)`. The symbol -> address table
+(`<mod>_overrides.json`, bound to the image SHA-256 by `dh_symbols.py`, evidence required per
+entry) lives outside the repository with the lift; committed code names symbols only. `fn` returns
+true when it handled the call, false to run the original (used for observation-only hooks). The
+seam is backend-neutral: an interpreted side intercepts the same addresses by the same symbols.
+Fail-closed: a fingerprint mismatch, an unknown symbol, a symbol with no wrapper, a duplicate, or a
+non-entry address stops the run with exit 2. Each handled call is logged as `override:<symbol>`.
+
+**Peer protocol** (`vsh.channel_acquire`, `vsh.ring_write`, `vsh.ring_read` + observation-only
+`savedata.param_error`, `savedata.abort_report`). Requests seen from the real worker for
+AutoLoad/AutoSave2: `getOwnerShip{elmUtilType,elmUtilOption}`, `loadModules{..,elmContainer}`,
+`getSaveDataStat{elmUtilOption,elmUtilType,elmUserId,elmDirName,elmFileListNumMax}`, and on the
+error path `abort{elmAbortParam(blob 0x40)}`. Replies: `{elmResult}` per command;
+`getSaveDataStat` is answered by two messages, `{elmResult, elmIsNewData}` then
+`{elmDataStat (blob, must be 1704 bytes)}`. A request the peer does not script stops the lifted
+side (`model-stop`), it is never answered optimistically. The same guest funcStat/funcFile
+callbacks run on both sides and write what they were handed into a guest log the comparator diffs.
+
+**Matrix and coverage.** 168 matrix cases (funcStat {-6,-5,-4,-1,0,1,2} x errDialog {0..3} x
+version {0..2}, AutoLoad2 on an existing save and AutoSave2 on a new one), 9 NULL/`setBuf`
+cases, 8 peer-fault cases (ack != 0, `0x80029262` instead of isNew, no space, broken PARAM.SFO,
+short/missing stat blob, a reply that is not a message, a failing open ack), 1 file operation.
+Declared against the current HLE (dev `e1050053`): 128 diverge rows carry reason `#48`; they flip
+to match with that fix (`cases_libsysutil_savedata_baseline.inc`, `D` -> `M`). **Not yet
+evidence about the HLE:** 48 AutoLoad2-on-existing-save cases stop in the peer (the worker asks
+for a further reply the peer does not yet script) and the 7 non-#48 diverge rows have not been
+attributed. The List/Fixed forms need `getDirList`/`openSaveList` scripting and are not covered;
+the peer faults have no HLE equivalent and must not be read as matches.
+
+Fail-before: `--case-flag mutate-peer` (the peer answers the opposite isNew) and `--no-overrides`
+(the real ring, which needs raw syscalls) each turn declared verdicts into `unexpected`.
 
 ## Known limitations
 

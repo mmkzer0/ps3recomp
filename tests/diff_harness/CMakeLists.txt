@@ -73,7 +73,7 @@ if(APPLE AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
                 diff_synth "GCC on macOS cannot build the Metal backend; use clang")
     set_tests_properties(diff_synth PROPERTIES LABELS "diff;t0" SKIP_RETURN_CODE 77)
     if(PS3RECOMP_DIFF_FW_DIR)
-        foreach(mod libsync2 libfiber)
+        foreach(mod libsync2 libfiber libsysutil)
             add_test(NAME diff_fw_${mod}
                 COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/tools/diff_harness/skip.py"
                         ${mod} "GCC on macOS cannot build the Metal backend; use clang")
@@ -117,6 +117,11 @@ endfunction()
 # ---------------------------------------------------------------------------
 if(PS3RECOMP_DIFF_FW_DIR)
 # dh_add_module(<mod> <prefix> <lifted-c-name> <cases.cpp> <hle-lib>...)
+#
+# A module with <META>/<mod>_overrides.json (named internal addresses bound to the image's
+# SHA-256, see tools/diff_harness/dh_symbols.py) gets the override seam: the lifted C is wrapped
+# by apply_overrides.py into <stem>_ovr.c, which is what the runner compiles, and the generated
+# tables carry the symbols. Without the file the module is built exactly as before.
 function(dh_add_module MOD PREFIX CNAME CASES)
     set(META "${DH_FW_REAL}/lift/${MOD}")
     set(LIFT "${DH_FW_REAL}/lift/${MOD}_c")
@@ -135,15 +140,32 @@ function(dh_add_module MOD PREFIX CNAME CASES)
 
     set(GEN_TABLES "${LIFT}/${PREFIX}harness_tables.cpp")
     set(GEN_LAYOUT "${LIFT}/${PREFIX}harness_layout.cpp")
+    set(LIFTED_SRC "${LIFT}/${CNAME}.c")
+    set(SYM_ARGS "")
+    set(SYM_DEPS "")
+    if(EXISTS "${META}/${MOD}_overrides.json")
+        set(LIFTED_SRC "${LIFT}/${CNAME}_ovr.c")
+        set(SYM_ARGS --symbols "${META}/${MOD}_overrides.json")
+        set(SYM_DEPS "${META}/${MOD}_overrides.json" "${PROJECT_SOURCE_DIR}/tools/diff_harness/dh_symbols.py")
+        add_custom_command(
+            OUTPUT "${LIFTED_SRC}"
+            COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/tools/diff_harness/apply_overrides.py"
+                    --lifted "${LIFT}/${CNAME}.c" --prefix ${PREFIX} --image "${META}/${MOD}_image.bin"
+                    --exports "${META}/${MOD}_exports.json" --symbols "${META}/${MOD}_overrides.json"
+                    --out "${LIFTED_SRC}"
+            DEPENDS "${PROJECT_SOURCE_DIR}/tools/diff_harness/apply_overrides.py" ${SYM_DEPS}
+                    "${LIFT}/${CNAME}.c" "${META}/${MOD}_image.bin" "${META}/${MOD}_exports.json"
+            VERBATIM)
+    endif()
     add_custom_command(
         OUTPUT "${GEN_TABLES}" "${GEN_LAYOUT}"
         COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/tools/diff_harness/gen_tables.py"
                 --name ${MOD} --prefix ${PREFIX} --header ${CNAME}.h
                 --exports "${META}/${MOD}_exports.json" --imports "${META}/${MOD}_imports.json"
-                --image "${META}/${MOD}_image.bin" --out "${LIFT}"
+                --image "${META}/${MOD}_image.bin" ${SYM_ARGS} --out "${LIFT}"
         DEPENDS "${PROJECT_SOURCE_DIR}/tools/diff_harness/gen_tables.py"
                 "${META}/${MOD}_image.bin" "${META}/${MOD}_exports.json"
-                "${META}/${MOD}_imports.json" "${META}/${MOD}_functions.json"
+                "${META}/${MOD}_imports.json" "${META}/${MOD}_functions.json" ${SYM_DEPS}
         VERBATIM)
 
     # The HLE registrations, generated exactly as a port generates them.
@@ -160,13 +182,13 @@ function(dh_add_module MOD PREFIX CNAME CASES)
     set_source_files_properties("${HLE_GEN}" PROPERTIES INCLUDE_DIRECTORIES "${PROJECT_SOURCE_DIR}")
 
     # The lifted C uses C++ constructs (extern "C", thread-local g_trampoline_fn).
-    set_source_files_properties("${LIFT}/${CNAME}.c" PROPERTIES LANGUAGE CXX COMPILE_OPTIONS "-w")
+    set_source_files_properties("${LIFTED_SRC}" PROPERTIES LANGUAGE CXX COMPILE_OPTIONS "-w")
 
     add_executable(dh_diff_${MOD}
         ${DH_CORE} ${CASES}
         "${PROJECT_SOURCE_DIR}/runtime/host/host_stubs.c"
         "${PROJECT_SOURCE_DIR}/runtime/ppu/ppu_hle.cpp" "${HLE_GEN}"
-        "${LIFT}/${CNAME}.c" "${GEN_TABLES}" "${GEN_LAYOUT}")
+        "${LIFTED_SRC}" "${GEN_TABLES}" "${GEN_LAYOUT}")
     dh_common(dh_diff_${MOD})
     target_include_directories(dh_diff_${MOD} PRIVATE "${LIFT}")
     dh_host_stubs(dh_diff_${MOD})
@@ -184,6 +206,9 @@ dh_add_module(libfiber fwfiber_ fwfiber cases_libfiber.cpp cellFiber cellSync2 s
 # JQ2: the JQ HLE plus the HLEs its lifted code forwards through its imports
 # (cellFiberPpuSelf, _sys_memset/_sys_strncmp/_sys_printf, sys_process_get_paramsfo).
 dh_add_module(libspurs_jq fwjq_ fwjq cases_libspurs_jq.cpp cellSpursJq cellFiber sysPrxForUser)
+# Savedata: the real libsysutil's worker behind cellSaveData*, against libs/system/cellSaveData.c.
+# The HLE core needs sysPrxForUser for the lwmutex and string helpers the lifted code imports.
+dh_add_module(libsysutil fwusys_ fwusys cases_libsysutil_savedata.cpp cellSaveData sysPrxForUser)
 endif()
 
 # The path-hygiene/skip contract of the tools needs no toolchain.
@@ -315,7 +340,7 @@ add_custom_command(
     VERBATIM)
 
 add_custom_command(
-    OUTPUT "${DH_SYNTH_C}/synth.c" "${DH_SYNTH_C}/synth_harness_tables.cpp" "${DH_SYNTH_C}/synth_harness_layout.cpp"
+    OUTPUT "${DH_SYNTH_C}/synth.c" "${DH_SYNTH_C}/synth_ovr.c" "${DH_SYNTH_C}/synth_harness_tables.cpp" "${DH_SYNTH_C}/synth_harness_layout.cpp"
     COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/tools/diff_harness/make_synth.py"
             --elf "${DH_SYNTH_OUT}/synth.elf" --out "${DH_SYNTH_OUT}"
             --lifter "${PROJECT_SOURCE_DIR}/tools/ppu_lifter.py"
@@ -323,19 +348,21 @@ add_custom_command(
     DEPENDS "${DH_SYNTH_OUT}/synth.elf"
             "${PROJECT_SOURCE_DIR}/tools/diff_harness/make_synth.py"
             "${PROJECT_SOURCE_DIR}/tools/diff_harness/gen_tables.py"
+            "${PROJECT_SOURCE_DIR}/tools/diff_harness/apply_overrides.py"
+            "${PROJECT_SOURCE_DIR}/tools/diff_harness/dh_symbols.py"
             "${PROJECT_SOURCE_DIR}/tools/ppu_lifter.py"
             "${PROJECT_SOURCE_DIR}/tools/elf_parser.py"
             "${PROJECT_SOURCE_DIR}/tools/ppu_disasm.py"
     VERBATIM)
 
-set_source_files_properties("${DH_SYNTH_C}/synth.c" PROPERTIES LANGUAGE CXX COMPILE_OPTIONS "-w")
+set_source_files_properties("${DH_SYNTH_C}/synth_ovr.c" PROPERTIES LANGUAGE CXX COMPILE_OPTIONS "-w")
 set_source_files_properties("${DH_SYNTH_C}/synth_harness_tables.cpp" PROPERTIES COMPILE_OPTIONS "-w")
 
 add_executable(dh_diff_synth
     ${DH_CORE} synth/synth_hle.cpp synth/cases_synth.cpp
     "${PROJECT_SOURCE_DIR}/runtime/host/host_stubs.c"
     "${PROJECT_SOURCE_DIR}/runtime/ppu/ppu_hle.cpp"
-    "${DH_SYNTH_C}/synth.c" "${DH_SYNTH_C}/synth_harness_tables.cpp" "${DH_SYNTH_C}/synth_harness_layout.cpp")
+    "${DH_SYNTH_C}/synth_ovr.c" "${DH_SYNTH_C}/synth_harness_tables.cpp" "${DH_SYNTH_C}/synth_harness_layout.cpp")
 dh_common(dh_diff_synth)
 # This binary only ever runs the checked-in synthetic fixture; its image and
 # report live in the repository's build tree, which the firmware runners refuse.
