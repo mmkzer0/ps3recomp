@@ -91,7 +91,7 @@ jobs:
     # warns on a (void) discard of a warn_unused_result call (#26).
     name: ubuntu-24.04 x86_64 (dev, ${{ matrix.cc }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -101,9 +101,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
+        # The runners' Ubuntu mirror is at times very slow: on 2026-10-26 the
+        # same install took 5 min (run 40299155562) and more than 30 min (runs
+        # 40302851162, 40307082211), with the PowerPC64 cross packages (~30 MB)
+        # the largest part. Retries and fetch timeouts end a dead connection;
+        # the step bound ends a hang without cutting off a slow mirror.
+        timeout-minutes: 40
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ninja-build libsdl2-dev clang lld g++-14 \
+          APT="-o Acquire::Retries=5 -o Acquire::http::Timeout=60 -o Acquire::https::Timeout=60"
+          sudo apt-get $APT update
+          sudo apt-get $APT install -y ninja-build libsdl2-dev clang lld g++-14 \
             glslang-dev glslang-tools spirv-tools libspirv-cross-c-shared-dev \
             gcc-powerpc64-linux-gnu g++-powerpc64-linux-gnu binutils-powerpc64-linux-gnu
       - name: Configure
