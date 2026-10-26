@@ -125,16 +125,22 @@ counts, function seed count) so you can sanity-check the lift before proceeding.
 
 Feed `<name>_functions.json` to `ppu_lifter.py` as the function boundary list, in the lifter's
 raw-image mode (load a flat binary at a fixed base rather than parsing an ELF with its own
-entry point):
+entry point). Raw mode needs the module TOC as well: a PRX's switch dispatchers address their
+jump tables TOC-relative, and without `--toc` every switch becomes an unresolved indirect call.
+Take the TOC from the `lift_prx.py` summary (`TOC 0x...`), or from the second word of any
+export OPD:
 
 ```bash
 python tools/ppu_lifter.py out/libsre_image.bin --raw --base 0x02000000 \
+    --toc 0x0200F380 \
     --functions out/libsre_functions.json --output recomp_prx/
 ```
 
-This produces ordinary lifted C source, the same kind [PPU_RECOMP.md](PPU_RECOMP.md) and
-[SPU_LIFTER.md](SPU_LIFTER.md) describe for game code, compiled into your project like any
-other translation unit. The seeds in `_functions.json` are region-bounded; the lifter's normal
+The output is **C++**, not C: the generated source uses `extern "C"` declarations and a
+thread-local trampoline pointer, so compile it as C++ (as a game port's lifted code is). It is
+the same kind [PPU_RECOMP.md](PPU_RECOMP.md) and [SPU_LIFTER.md](SPU_LIFTER.md) describe for
+game code, compiled into your project like any other translation unit. The seeds in
+`_functions.json` are region-bounded; the lifter's normal
 discovery pass (branch targets, tail entries) fills in interior functions within each region.
 
 ## Step 4: load, patch, and bind at runtime
