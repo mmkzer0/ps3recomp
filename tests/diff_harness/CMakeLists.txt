@@ -288,9 +288,9 @@ if(NOT DH_PPC_CLANG_FOUND OR NOT DH_LD_LLD_FOUND)
         COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/tools/diff_harness/skip.py"
                 diff_synth "no PPC64-capable clang / ld.lld")
     set_tests_properties(diff_synth PROPERTIES LABELS "diff;t0" SKIP_RETURN_CODE 77)
-    return()
 endif()
 
+if(DH_PPC_CLANG_FOUND AND DH_LD_LLD_FOUND)
 message(STATUS "diff_harness: synthetic fixture with ${DH_PPC_CLANG_FOUND} ${DH_PPC_CPU_FLAG} + ${DH_LD_LLD_FOUND}")
 
 set(DH_SYNTH_SRC "${CMAKE_CURRENT_SOURCE_DIR}/synth")
@@ -347,3 +347,211 @@ add_test(NAME diff_synth
     COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/tools/diff_harness/test_synth.py"
             "$<TARGET_FILE:dh_diff_synth>" "${DH_SYNTH_OUT}")
 set_tests_properties(diff_synth PROPERTIES LABELS "diff;t0" TIMEOUT 240 SKIP_RETURN_CODE 77)
+endif()
+
+# ---------------------------------------------------------------------------
+# Cross-compiled synthetic variants (synlib): a second, independent module
+# ---------------------------------------------------------------------------
+# tests/diff_harness/synth/syn_*.{c,cpp,S} implement one small library
+# (syn_spec.h) four ways -- C, C++, hand-written assembly and a deliberately
+# buggy C -- plus ref_native.c as the HLE side. tools/diff_harness/synth_pack.py
+# packages each linked powerpc64-linux-gnu ELF as a PRX-shaped image + JSON and
+# lift_module.py lifts it with the toolkit's own ppu_lifter.py, so the fixture
+# also exercises the lifter's ABI and table handling (see DIFF_HARNESS.md).
+#
+# The GCC route is optional: without the cross toolchain these variants
+# register a visible SKIP. Set PS3RECOMP_DIFF_SYNTHETIC_REQUIRED=ON in CI,
+# where the toolchain is installed, so a silently vanished suite is an error.
+option(PS3RECOMP_DIFF_SYNTHETIC_REQUIRED
+       "Fail configuration when the PowerPC64 cross toolchain is missing" OFF)
+set(PS3RECOMP_SYN_PREFIX "powerpc64-linux-gnu" CACHE STRING
+    "Triplet prefix of the PowerPC64 big-endian cross toolchain")
+
+find_program(DH_SYN_GCC ${PS3RECOMP_SYN_PREFIX}-gcc)
+find_program(DH_SYN_GXX ${PS3RECOMP_SYN_PREFIX}-g++)
+find_program(DH_SYN_LD  ${PS3RECOMP_SYN_PREFIX}-ld)
+if(NOT DH_SYN_GCC OR NOT DH_SYN_GXX OR NOT DH_SYN_LD)
+    set(DH_SYN_WHY "needs ${PS3RECOMP_SYN_PREFIX}-gcc/-g++/-ld (apt: gcc-powerpc64-linux-gnu g++-powerpc64-linux-gnu binutils-powerpc64-linux-gnu)")
+    if(PS3RECOMP_DIFF_SYNTHETIC_REQUIRED)
+        message(FATAL_ERROR "diff_harness synthetic variants: ${DH_SYN_WHY}")
+    endif()
+    message(STATUS "diff_harness: cross-compiled synthetic variants SKIPPED: ${DH_SYN_WHY}")
+    add_test(NAME diff_synth_synlib
+        COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/tools/diff_harness/skip.py"
+                synlib "${DH_SYN_WHY}")
+    set_tests_properties(diff_synth_synlib PROPERTIES LABELS "diff;t0" SKIP_RETURN_CODE 77)
+    return()
+endif()
+
+# -mcpu=cell is the PS3's PPU; newer GCCs dropped it, the generic core is the fallback.
+set(DH_SYN_CPU "-mcpu=powerpc64")
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/syn-probe")
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/syn-probe/probe.c" "unsigned probe(unsigned a) { return a + 1u; }\n")
+execute_process(
+    COMMAND "${DH_SYN_GCC}" -m64 -mcpu=cell -c "${CMAKE_CURRENT_BINARY_DIR}/syn-probe/probe.c"
+            -o "${CMAKE_CURRENT_BINARY_DIR}/syn-probe/cell.o"
+    RESULT_VARIABLE DH_SYN_CELL_RC OUTPUT_QUIET ERROR_QUIET)
+if(DH_SYN_CELL_RC EQUAL 0)
+    set(DH_SYN_CPU "-mcpu=cell")
+endif()
+
+execute_process(COMMAND "${DH_SYN_LD}" --help OUTPUT_VARIABLE DH_SYN_LD_HELP ERROR_QUIET)
+string(FIND "${DH_SYN_LD_HELP}" "--no-warn-rwx-segments" DH_SYN_HAS_RWX)
+set(DH_SYN_LD_OPTS -z noexecstack --no-toc-optimize)
+if(NOT DH_SYN_HAS_RWX EQUAL -1)
+    list(APPEND DH_SYN_LD_OPTS --no-warn-rwx-segments)
+endif()
+
+# The PS3's terms: 64-bit registers, 32-bit effective addresses.
+#   -mcmodel=small     TOC entries loaded with `ld rX,disp(r2)`, the form the
+#                      lifter's jump-table discovery reads, kept by the linker
+#                      with --no-toc-optimize
+#   -ffreestanding     no libc, no memset/memcpy conjured from loops, no unwind tables
+set(DH_SYN_BASE 0x02000000)
+set(DH_SYN_ARCH -m64 ${DH_SYN_CPU} -mcmodel=small -mno-altivec -mno-vsx)
+set(DH_SYN_CFLAGS ${DH_SYN_ARCH} -O2 -ffreestanding -fno-builtin -fno-pic -fno-pie
+    -fno-asynchronous-unwind-tables -fno-unwind-tables -fno-stack-protector
+    -fno-tree-loop-distribute-patterns -ffp-contract=off -Wall -Wextra
+    -I "${CMAKE_CURRENT_SOURCE_DIR}/synth")
+set(DH_SYN_CXXFLAGS ${DH_SYN_CFLAGS} -std=c++17 -fno-exceptions -fno-rtti -fno-threadsafe-statics)
+
+set(DH_SYNLIB_MANIFEST "${CMAKE_CURRENT_SOURCE_DIR}/synth/syn_module.json")
+set(DH_SYNLIB_OUT "${CMAKE_CURRENT_BINARY_DIR}/synlib")
+file(MAKE_DIRECTORY "${DH_SYNLIB_OUT}")
+
+add_custom_command(OUTPUT "${DH_SYNLIB_OUT}/syn_nids.h"
+    COMMAND "${Python3_EXECUTABLE}" -I "${PROJECT_SOURCE_DIR}/tools/diff_harness/synth_pack.py"
+            --manifest "${DH_SYNLIB_MANIFEST}" --emit-nid-header "${DH_SYNLIB_OUT}/syn_nids.h"
+    DEPENDS "${PROJECT_SOURCE_DIR}/tools/diff_harness/synth_pack.py" "${DH_SYNLIB_MANIFEST}"
+    VERBATIM)
+
+add_custom_command(OUTPUT "${DH_SYNLIB_OUT}/syn_stubs.o"
+    COMMAND "${DH_SYN_GCC}" ${DH_SYN_ARCH} -I "${CMAKE_CURRENT_SOURCE_DIR}/synth"
+            -c "${CMAKE_CURRENT_SOURCE_DIR}/synth/syn_stubs.S" -o "${DH_SYNLIB_OUT}/syn_stubs.o"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/synth/syn_stubs.S" "${CMAKE_CURRENT_SOURCE_DIR}/synth/syn_spec.h"
+    VERBATIM)
+
+# Engine, runtime stand-ins, the reference and the HLE core, shared by the variants.
+add_library(dh_synlib_common OBJECT
+    ${DH_CORE}
+    "${CMAKE_CURRENT_SOURCE_DIR}/synth/ref_native.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/synth/syn_ref_register.cpp"
+    "${DH_SYNLIB_OUT}/syn_nids.h"
+    "${PROJECT_SOURCE_DIR}/runtime/host/host_stubs.c"
+    "${PROJECT_SOURCE_DIR}/runtime/ppu/ppu_hle.cpp")
+target_include_directories(dh_synlib_common PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/synth" "${DH_SYNLIB_OUT}"
+    "${PROJECT_SOURCE_DIR}/runtime" "${PROJECT_SOURCE_DIR}/runtime/ppu"
+    "${PROJECT_SOURCE_DIR}/libs" "${PROJECT_SOURCE_DIR}/libs/spurs"
+    "${PROJECT_SOURCE_DIR}/include" "${PROJECT_SOURCE_DIR}" "${PROJECT_SOURCE_DIR}/tests/spurs_jq2")
+target_compile_definitions(dh_synlib_common PRIVATE
+    PS3RECOMP_TOOLKIT_SHA="${DH_TOOLKIT_SHA}" PS3RECOMP_REPO_ROOT="${PROJECT_SOURCE_DIR}"
+    PS3RECOMP_DIFF_SYNTHETIC=1)
+dh_host_stubs(dh_synlib_common)
+
+# dh_syn_add_variant(<tag> <source> <c|cxx|asm> <expect-diverge> [CFLAGS ...] [KEEP_TOC_OPT] [JT_GAP])
+#   CFLAGS        extra compiler flags after the defaults (a later -O wins)
+#   KEEP_TOC_OPT  let the linker rewrite TOC loads into addis/addi (its default)
+#   JT_GAP        code generation puts the switch dispatch in a shape the lifter
+#                 does not recognise yet (issue #45); the cases that reach it
+#                 are declared lifted-blocked rather than silently passing
+function(dh_syn_add_variant TAG SRC KIND EXPECT_DIVERGE)
+    cmake_parse_arguments(V "KEEP_TOC_OPT;JT_GAP" "" "CFLAGS" ${ARGN})
+    set(ld_opts ${DH_SYN_LD_OPTS})
+    if(V_KEEP_TOC_OPT)
+        list(REMOVE_ITEM ld_opts --no-toc-optimize)
+    endif()
+    set(D "${DH_SYNLIB_OUT}/${TAG}")
+    set(NAME libsyn_${TAG})
+    set(PREFIX syn${TAG}_)
+    set(SRC_PATH "${CMAKE_CURRENT_SOURCE_DIR}/synth/${SRC}")
+    file(MAKE_DIRECTORY "${D}")
+
+    if(KIND STREQUAL "cxx")
+        set(compile "${DH_SYN_GXX}" ${DH_SYN_CXXFLAGS} ${V_CFLAGS} -c "${SRC_PATH}" -o "${D}/syn.o")
+    elseif(KIND STREQUAL "asm")
+        set(compile "${DH_SYN_GCC}" ${DH_SYN_ARCH} -Wa,-mregnames
+                    -I "${CMAKE_CURRENT_SOURCE_DIR}/synth" -c "${SRC_PATH}" -o "${D}/syn.o")
+    else()
+        set(compile "${DH_SYN_GCC}" ${DH_SYN_CFLAGS} ${V_CFLAGS} -c "${SRC_PATH}" -o "${D}/syn.o")
+    endif()
+    add_custom_command(OUTPUT "${D}/syn.elf"
+        COMMAND ${compile}
+        COMMAND "${DH_SYN_LD}" -T "${CMAKE_CURRENT_SOURCE_DIR}/synth/syn_gcc.ld"
+                --defsym SYN_BASE=${DH_SYN_BASE} ${ld_opts}
+                -o "${D}/syn.elf" "${D}/syn.o" "${DH_SYNLIB_OUT}/syn_stubs.o"
+        DEPENDS "${SRC_PATH}" "${DH_SYNLIB_OUT}/syn_stubs.o"
+                "${CMAKE_CURRENT_SOURCE_DIR}/synth/syn_spec.h"
+                "${CMAKE_CURRENT_SOURCE_DIR}/synth/syn_gcc.ld" "${CMAKE_CURRENT_SOURCE_DIR}/synth/syn_c.c"
+        VERBATIM)
+
+    add_custom_command(OUTPUT "${D}/${NAME}_image.bin" "${D}/${NAME}_exports.json"
+                              "${D}/${NAME}_imports.json" "${D}/${NAME}_functions.json"
+                              "${D}/${NAME}_names.json"
+        COMMAND "${Python3_EXECUTABLE}" -I "${PROJECT_SOURCE_DIR}/tools/diff_harness/synth_pack.py"
+                --manifest "${DH_SYNLIB_MANIFEST}" --elf "${D}/syn.elf" --name ${NAME}
+                --base ${DH_SYN_BASE} --out "${D}"
+        DEPENDS "${PROJECT_SOURCE_DIR}/tools/diff_harness/synth_pack.py" "${DH_SYNLIB_MANIFEST}"
+                "${D}/syn.elf"
+        VERBATIM)
+
+    add_custom_command(OUTPUT "${D}/lifted.c" "${D}/lifted.h"
+        COMMAND "${Python3_EXECUTABLE}" -I "${PROJECT_SOURCE_DIR}/tools/diff_harness/lift_module.py"
+                --meta "${D}" --name ${NAME} --prefix ${PREFIX} --stem lifted --out "${D}"
+        DEPENDS "${PROJECT_SOURCE_DIR}/tools/diff_harness/lift_module.py"
+                "${PROJECT_SOURCE_DIR}/tools/ppu_lifter.py"
+                "${D}/${NAME}_image.bin" "${D}/${NAME}_exports.json" "${D}/${NAME}_functions.json"
+        BYPRODUCTS "${D}/ppu_lift_report.json"
+        VERBATIM)
+
+    add_custom_command(OUTPUT "${D}/${PREFIX}harness_tables.cpp" "${D}/${PREFIX}harness_layout.cpp"
+        COMMAND "${Python3_EXECUTABLE}" -I "${PROJECT_SOURCE_DIR}/tools/diff_harness/gen_tables.py"
+                --synthetic --name ${NAME} --prefix ${PREFIX} --header lifted.h
+                --names "${D}/${NAME}_names.json" --exports "${D}/${NAME}_exports.json"
+                --imports "${D}/${NAME}_imports.json" --image "${D}/${NAME}_image.bin" --out "${D}"
+        DEPENDS "${PROJECT_SOURCE_DIR}/tools/diff_harness/gen_tables.py" "${D}/${NAME}_names.json"
+                "${D}/${NAME}_exports.json" "${D}/${NAME}_imports.json" "${D}/${NAME}_image.bin"
+        VERBATIM)
+
+    # The lifted C uses C++ constructs (extern "C", thread-local g_trampoline_fn).
+    set_source_files_properties("${D}/lifted.c" PROPERTIES LANGUAGE CXX COMPILE_OPTIONS "-w")
+    set_source_files_properties("${D}/${PREFIX}harness_tables.cpp" PROPERTIES COMPILE_OPTIONS "-w")
+    add_executable(dh_syn_${TAG} $<TARGET_OBJECTS:dh_synlib_common>
+        "${CMAKE_CURRENT_SOURCE_DIR}/synth/syn_cases.cpp"
+        "${D}/lifted.c" "${D}/${PREFIX}harness_tables.cpp" "${D}/${PREFIX}harness_layout.cpp")
+    dh_common(dh_syn_${TAG})
+    target_include_directories(dh_syn_${TAG} PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/synth" "${DH_SYNLIB_OUT}" "${D}")
+    target_compile_definitions(dh_syn_${TAG} PRIVATE PS3RECOMP_DIFF_SYNTHETIC=1)
+    add_dependencies(dh_syn_${TAG} dh_synlib_common)
+    if(EXPECT_DIVERGE GREATER 0)
+        target_compile_definitions(dh_syn_${TAG} PRIVATE SYN_VARIANT_BUG=1)
+    endif()
+    if(V_JT_GAP)
+        target_compile_definitions(dh_syn_${TAG} PRIVATE SYN_VARIANT_JT_GAP=1)
+    endif()
+    # min-cases is the table's exact size, repeated here on purpose: editing the
+    # table alone cannot make the bug variant's count check vacuous.
+    add_test(NAME diff_synth_${TAG}
+        COMMAND $<TARGET_FILE:dh_syn_${TAG}> --min-cases 138 --expect-diverge ${EXPECT_DIVERGE}
+                --out "${D}/results_${TAG}.json")
+    set_tests_properties(diff_synth_${TAG} PROPERTIES LABELS "diff;t0" TIMEOUT 180)
+endfunction()
+
+dh_syn_add_variant(c      syn_c.c     c   0)
+dh_syn_add_variant(cpp    syn_cpp.cpp cxx 0)
+dh_syn_add_variant(asm    syn_asm.S   asm 0)
+# The six cases marked `bug` in syn_cases.cpp (init06, init12, cmd60, cmd63,
+# seq02, seq03); the number is repeated here so the test cannot go vacuous.
+dh_syn_add_variant(cbug   syn_c_bug.c c   6)
+# More code generation for the lifter to chew on (same source, same table):
+#   -Os  out-of-line register save/restore helpers made by the linker
+#   -O3  unrolled loops
+dh_syn_add_variant(c_Os   syn_c.c     c   0 CFLAGS -Os)
+dh_syn_add_variant(c_O3   syn_c.c     c   0 CFLAGS -O3 -funroll-loops)
+# Known lifter gaps (issue #45), declared rather than hidden: GCC's two other
+# ways to dispatch a switch.
+#   -O0                table base + index added, then lwz rX,0(rY) (no lwzx)
+#   -mcmodel=medium    table base made with addis/addi from r2 (Ubuntu default)
+dh_syn_add_variant(c_O0     syn_c.c   c   0 CFLAGS -O0 JT_GAP)
+dh_syn_add_variant(c_medium syn_c.c   c   0 CFLAGS -mcmodel=medium KEEP_TOC_OPT JT_GAP)

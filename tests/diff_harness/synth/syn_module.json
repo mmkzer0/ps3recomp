@@ -1,0 +1,5 @@
+{
+  "library": "synlib",
+  "exports": ["synObjInit", "synObjCommand", "synObjPush", "synBufChecksum", "synBits", "synFpu"],
+  "imports": ["synHostMemset"]
+}
