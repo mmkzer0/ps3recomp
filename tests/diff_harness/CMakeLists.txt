@@ -56,6 +56,33 @@ if(PS3RECOMP_DIFF_FW_DIR)
     endif()
 endif()
 
+# The harness itself is portable C++20, but its runtime library carries the
+# Metal/Objective-C backend, which GCC on macOS cannot compile
+# (-fobjc-arc is clang-only). That is a pre-existing platform constraint, not
+# a harness one: on Linux the GCC/libstdc++ CI job builds and runs this fixture.
+# Say so at configure time and register the visible skips instead of a target
+# that cannot link.
+if(APPLE AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    message(STATUS "diff_harness: SKIPPED: GCC on macOS cannot build the runtime's Metal backend; "
+                   "build the differential harness with clang (GCC is supported on Linux)")
+    add_test(NAME diff_harness_tools
+        COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/tools/test_diff_harness.py")
+    set_tests_properties(diff_harness_tools PROPERTIES LABELS "diff;t0" TIMEOUT 120)
+    add_test(NAME diff_synth
+        COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/tools/diff_harness/skip.py"
+                diff_synth "GCC on macOS cannot build the Metal backend; use clang")
+    set_tests_properties(diff_synth PROPERTIES LABELS "diff;t0" SKIP_RETURN_CODE 77)
+    if(PS3RECOMP_DIFF_FW_DIR)
+        foreach(mod libsync2 libfiber)
+            add_test(NAME diff_fw_${mod}
+                COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/tools/diff_harness/skip.py"
+                        ${mod} "GCC on macOS cannot build the Metal backend; use clang")
+            set_tests_properties(diff_fw_${mod} PROPERTIES LABELS "fw;stress" SKIP_RETURN_CODE 77)
+        endforeach()
+    endif()
+    return()
+endif()
+
 set(DH_CORE dh_main.cpp dh_engine.cpp dh_runtime.cpp)
 
 # Common include/link/define setup. The runner needs the repo root at compile
@@ -159,3 +186,160 @@ endif()
 add_test(NAME diff_harness_tools
     COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/tools/test_diff_harness.py")
 set_tests_properties(diff_harness_tools PROPERTIES LABELS "diff;t0" TIMEOUT 120)
+
+# ---------------------------------------------------------------------------
+# Synthetic fixture (no firmware)
+# ---------------------------------------------------------------------------
+set(DH_PPC_CLANG "" CACHE FILEPATH "PPC64-capable clang for the synthetic differential fixture")
+set(DH_LD_LLD "" CACHE FILEPATH "ld.lld for the synthetic differential fixture")
+
+function(dh_try_ppc_compile clang out_ok out_flags)
+    set(${out_ok} FALSE PARENT_SCOPE)
+    set(${out_flags} "" PARENT_SCOPE)
+    if(NOT clang)
+        return()
+    endif()
+    set(probe_dir "${CMAKE_CURRENT_BINARY_DIR}/ppc-probe")
+    file(MAKE_DIRECTORY "${probe_dir}")
+    file(WRITE "${probe_dir}/probe.c" "unsigned probe(unsigned a) { return a + 1u; }\n")
+    foreach(cpu "-mcpu=ppc-cell-be" "-mcpu=cell" "")
+        file(REMOVE "${probe_dir}/probe.o")
+        execute_process(
+            COMMAND "${clang}" --target=powerpc64-unknown-linux-gnu ${cpu} -ffreestanding -fno-builtin -O2
+                    -c "${probe_dir}/probe.c" -o "${probe_dir}/probe.o"
+            RESULT_VARIABLE rc OUTPUT_QUIET ERROR_QUIET)
+        if(rc EQUAL 0 AND EXISTS "${probe_dir}/probe.o")
+            file(READ "${probe_dir}/probe.o" magic HEX LIMIT 20)
+            # 7f 45 4c 46 | class 02 (ELF64) | data 02 (big endian) | machine 0015 (PPC64)
+            if(magic MATCHES "^7f454c46" AND magic MATCHES "^7f454c460202" AND magic MATCHES "0015$")
+                set(${out_ok} TRUE PARENT_SCOPE)
+                set(${out_flags} "${cpu}" PARENT_SCOPE)
+                return()
+            endif()
+        endif()
+    endforeach()
+endfunction()
+
+set(DH_PPC_CANDIDATES "")
+if(DH_PPC_CLANG)
+    list(APPEND DH_PPC_CANDIDATES "${DH_PPC_CLANG}")
+endif()
+if(DEFINED ENV{PS3RECOMP_PPC_CLANG})
+    list(APPEND DH_PPC_CANDIDATES "$ENV{PS3RECOMP_PPC_CLANG}")
+endif()
+list(APPEND DH_PPC_CANDIDATES
+    /opt/homebrew/opt/llvm/bin/clang /usr/local/opt/llvm/bin/clang
+    clang clang-20 clang-19 clang-18 clang-17 clang-16 clang-15)
+
+set(DH_PPC_CLANG_FOUND "")
+set(DH_PPC_CPU_FLAG "")
+foreach(cand IN LISTS DH_PPC_CANDIDATES)
+    set(resolved "${cand}")
+    if(NOT IS_ABSOLUTE "${cand}")
+        unset(_found CACHE)
+        find_program(_found NAMES "${cand}")
+        set(resolved "${_found}")
+    endif()
+    if(NOT resolved OR NOT EXISTS "${resolved}")
+        continue()
+    endif()
+    dh_try_ppc_compile("${resolved}" ok flags)
+    if(ok)
+        set(DH_PPC_CLANG_FOUND "${resolved}")
+        set(DH_PPC_CPU_FLAG "${flags}")
+        break()
+    endif()
+endforeach()
+
+set(DH_LD_CANDIDATES "")
+if(DH_LD_LLD)
+    list(APPEND DH_LD_CANDIDATES "${DH_LD_LLD}")
+endif()
+list(APPEND DH_LD_CANDIDATES /opt/homebrew/bin/ld.lld /usr/local/bin/ld.lld ld.lld lld)
+set(DH_LD_LLD_FOUND "")
+foreach(cand IN LISTS DH_LD_CANDIDATES)
+    set(resolved "${cand}")
+    if(NOT IS_ABSOLUTE "${cand}")
+        unset(_found CACHE)
+        find_program(_found NAMES "${cand}")
+        set(resolved "${_found}")
+    endif()
+    if(resolved AND EXISTS "${resolved}")
+        execute_process(COMMAND "${resolved}" --version RESULT_VARIABLE rc OUTPUT_QUIET ERROR_QUIET)
+        if(rc EQUAL 0)
+            set(DH_LD_LLD_FOUND "${resolved}")
+            break()
+        endif()
+    endif()
+endforeach()
+
+if(NOT DH_PPC_CLANG_FOUND OR NOT DH_LD_LLD_FOUND)
+    if(NOT DH_PPC_CLANG_FOUND)
+        message(STATUS "diff_harness: synthetic fixture SKIPPED: no PPC64-capable clang "
+                       "(set -DDH_PPC_CLANG=/path/to/clang)")
+    else()
+        message(STATUS "diff_harness: synthetic fixture SKIPPED: no ld.lld (set -DDH_LD_LLD=/path/to/ld.lld)")
+    endif()
+    add_test(NAME diff_synth
+        COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/tools/diff_harness/skip.py"
+                diff_synth "no PPC64-capable clang / ld.lld")
+    set_tests_properties(diff_synth PROPERTIES LABELS "diff;t0" SKIP_RETURN_CODE 77)
+    return()
+endif()
+
+message(STATUS "diff_harness: synthetic fixture with ${DH_PPC_CLANG_FOUND} ${DH_PPC_CPU_FLAG} + ${DH_LD_LLD_FOUND}")
+
+set(DH_SYNTH_SRC "${CMAKE_CURRENT_SOURCE_DIR}/synth")
+set(DH_SYNTH_OUT "${CMAKE_CURRENT_BINARY_DIR}/synth")
+set(DH_SYNTH_C "${DH_SYNTH_OUT}/lift/synth_c")
+
+add_custom_command(
+    OUTPUT "${DH_SYNTH_OUT}/synth.elf"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${DH_SYNTH_OUT}"
+    COMMAND "${DH_PPC_CLANG_FOUND}" --target=powerpc64-unknown-linux-gnu ${DH_PPC_CPU_FLAG}
+            -ffreestanding -fno-builtin -O2 -c "${DH_SYNTH_SRC}/module.c" -o "${DH_SYNTH_OUT}/module.o"
+    COMMAND "${DH_PPC_CLANG_FOUND}" --target=powerpc64-unknown-linux-gnu ${DH_PPC_CPU_FLAG}
+            -ffreestanding -fno-builtin -O2 -x c++ -std=c++20 -fno-exceptions -fno-rtti -fno-builtin
+            -c "${DH_SYNTH_SRC}/module_cpp.cpp" -o "${DH_SYNTH_OUT}/module_cpp.o"
+    COMMAND "${DH_PPC_CLANG_FOUND}" --target=powerpc64-unknown-linux-gnu
+            -c "${DH_SYNTH_SRC}/module_asm.S" -o "${DH_SYNTH_OUT}/module_asm.o"
+    COMMAND "${DH_LD_LLD_FOUND}" -static -nostdlib -T "${DH_SYNTH_SRC}/synth.ld"
+            -o "${DH_SYNTH_OUT}/synth.elf"
+            "${DH_SYNTH_OUT}/module.o" "${DH_SYNTH_OUT}/module_cpp.o" "${DH_SYNTH_OUT}/module_asm.o"
+    DEPENDS "${DH_SYNTH_SRC}/module.c" "${DH_SYNTH_SRC}/module_cpp.cpp"
+            "${DH_SYNTH_SRC}/module_asm.S" "${DH_SYNTH_SRC}/synth.ld"
+    VERBATIM)
+
+add_custom_command(
+    OUTPUT "${DH_SYNTH_C}/synth.c" "${DH_SYNTH_C}/synth_harness_tables.cpp" "${DH_SYNTH_C}/synth_harness_layout.cpp"
+    COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/tools/diff_harness/make_synth.py"
+            --elf "${DH_SYNTH_OUT}/synth.elf" --out "${DH_SYNTH_OUT}"
+            --lifter "${PROJECT_SOURCE_DIR}/tools/ppu_lifter.py"
+            --gen-tables "${PROJECT_SOURCE_DIR}/tools/diff_harness/gen_tables.py"
+    DEPENDS "${DH_SYNTH_OUT}/synth.elf"
+            "${PROJECT_SOURCE_DIR}/tools/diff_harness/make_synth.py"
+            "${PROJECT_SOURCE_DIR}/tools/diff_harness/gen_tables.py"
+            "${PROJECT_SOURCE_DIR}/tools/ppu_lifter.py"
+            "${PROJECT_SOURCE_DIR}/tools/elf_parser.py"
+            "${PROJECT_SOURCE_DIR}/tools/ppu_disasm.py"
+    VERBATIM)
+
+set_source_files_properties("${DH_SYNTH_C}/synth.c" PROPERTIES LANGUAGE CXX COMPILE_OPTIONS "-w")
+set_source_files_properties("${DH_SYNTH_C}/synth_harness_tables.cpp" PROPERTIES COMPILE_OPTIONS "-w")
+
+add_executable(dh_diff_synth
+    ${DH_CORE} synth/synth_hle.cpp synth/cases_synth.cpp
+    "${PROJECT_SOURCE_DIR}/runtime/host/host_stubs.c"
+    "${PROJECT_SOURCE_DIR}/runtime/ppu/ppu_hle.cpp"
+    "${DH_SYNTH_C}/synth.c" "${DH_SYNTH_C}/synth_harness_tables.cpp" "${DH_SYNTH_C}/synth_harness_layout.cpp")
+dh_common(dh_diff_synth)
+# This binary only ever runs the checked-in synthetic fixture; its image and
+# report live in the repository's build tree, which the firmware runners refuse.
+target_compile_definitions(dh_diff_synth PRIVATE PS3RECOMP_DIFF_SYNTHETIC=1)
+target_include_directories(dh_diff_synth PRIVATE "${DH_SYNTH_C}")
+dh_host_stubs(dh_diff_synth)
+
+add_test(NAME diff_synth
+    COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/tools/diff_harness/test_synth.py"
+            "$<TARGET_FILE:dh_diff_synth>" "${DH_SYNTH_OUT}")
+set_tests_properties(diff_synth PROPERTIES LABELS "diff;t0" TIMEOUT 240 SKIP_RETURN_CODE 77)

@@ -48,7 +48,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
-        run: brew install ninja sdl2 glslang spirv-cross
+        run: brew install ninja sdl2 glslang spirv-cross llvm lld
       - name: Configure
         run: cmake --preset ${{ matrix.preset }}
       - name: Build
@@ -96,7 +96,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build libsdl2-dev clang g++-14 \
+          sudo apt-get install -y ninja-build libsdl2-dev clang lld g++-14 \
             glslang-dev glslang-tools spirv-tools libspirv-cross-c-shared-dev
       - name: Configure
         run: CC=${{ matrix.cc }} CXX=${{ matrix.cxx }} cmake --preset dev
