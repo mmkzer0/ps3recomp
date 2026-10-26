@@ -33,6 +33,7 @@ concurrency:
 jobs:
   hygiene:
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - name: No game or firmware material in the tree
@@ -41,6 +42,7 @@ jobs:
   macos:
     name: macos-15 arm64 (${{ matrix.preset }})
     runs-on: macos-15
+    timeout-minutes: ${{ inputs.stress && 120 || 45 }}
     strategy:
       fail-fast: false
       matrix:
@@ -64,6 +66,10 @@ jobs:
   tool-suites:
     name: macos-15 arm64 (tools/test_*.py)
     runs-on: macos-15
+    # A Metal fixture stuck in the runner's GPU stack ignores its own
+    # subprocess timeout (seen on 2026-10-26, run 40297372432); bound the job
+    # instead of letting it hold a macOS runner for the 6 h default.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -85,6 +91,7 @@ jobs:
     # warns on a (void) discard of a warn_unused_result call (#26).
     name: ubuntu-24.04 x86_64 (dev, ${{ matrix.cc }})
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
