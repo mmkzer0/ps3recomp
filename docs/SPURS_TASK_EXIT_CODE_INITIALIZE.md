@@ -13,11 +13,13 @@ container's opaque size/alignment is also corroborated by the
 RPCS3's initializer is unimplemented and is not the behavioral oracle.
 
 Pointer arguments follow the runtime's low-32-bit guest-EA convention. Before
-writing, the HLE checks VM readiness, a nonwrapping span, and the configured
+writing, the HLE checks VM readiness, the nonwrapping span, and the configured
 backing limit. A zero `ppu_vm_size` retains the runtime's full-VM convention;
-a nonzero size permits native-VA ports with a zero base. An invalid backing
-span returns task `FAULT` (`0x8041090D`) as host safety behavior, rather than
-attempting an out-of-bounds host write.
+a nonzero size permits native-VA ports with a zero base. A span the host cannot
+back stops by name (`hle-guest-range`, `func=cellSpursTaskExitCodeInitialize`,
+`arg=exitCode`) rather than attempting an out-of-bounds host write; the firmware
+has no code for it (libsre 4.93 builds no task `FAULT`, `0x8041090D`), so no
+error is fabricated.
 
 Initialization does not attach the container to a task attribute or publish
 an exit result. `cellSpursTaskAttributeSetExitCodeContainer`, retention through
@@ -26,6 +28,7 @@ task creation, and result publication/retrieval/wakeup remain separate work.
 `tools/test_spurs_task_exit_code_initialize.py` compiles the real production
 handler and the actual generated target NID registration. Synthetic guest
 memory verifies errors, exact clearing with canaries, repeated initialization,
-guest pointer narrowing, and backing failures. The standalone fixture uses a
+guest pointer narrowing, and backing failures (each in its own process, since a
+stop is terminal). The standalone fixture uses a
 POSIX C/C++ toolchain; Windows skips it explicitly. It runs through CTest when
 tests and Python are enabled.
