@@ -48,6 +48,9 @@ constexpr uint32_t OPD_BASE   = 0x02100000u;   /* harness-owned import descripto
 constexpr uint32_t TRAMP_BASE = 0x02110000u;   /* harness-owned import "code" */
 
 extern uint8_t* mem;                            /* == vm_base */
+/* True in the child that runs the HLE side; pre/post hooks and import models
+ * use it to act on one side only. */
+bool     on_hle_side();
 void     wr8(uint32_t ea, uint8_t v);
 void     wr16(uint32_t ea, uint16_t v);
 void     wr32(uint32_t ea, uint32_t v);
@@ -90,9 +93,12 @@ struct Capture { int slot; enum Kind { Ret, Mem32, Mem64 } kind; uint32_t ea; };
 
 struct Step {
     std::string func; uint32_t nid = 0;
-    Arg args[8];
+    /* r3..r10, then the ninth..twelfth argument in the caller's parameter save
+     * area (r1+0x70, 0x78, 0x80, 0x88) as the ELFv1 call ABI places them. */
+    Arg args[12];
     std::vector<Capture> caps;
     std::function<void()> pre;      /* guest-memory edit before the step; runs on both sides */
+    std::function<void()> post;     /* host-side action after a returned step; use on_hle_side() to act on one side */
     bool ret64 = false;             /* compare all of r3, not the low 32 bits */
 };
 Step step(const char* func, uint32_t nid, std::initializer_list<Arg> args = {});
@@ -200,7 +206,19 @@ struct Options {
     std::string filter;       /* run only cases whose id contains this */
     bool        verbose = false;
     uint32_t    disable_dimensions = 0;   /* diagnostic/test only; see Dimension */
+    /* Guards against a vacuous pass (a case table that silently shrank, or a
+     * declared DIVERGE that stopped being observed): fail the run unless at
+     * least min_cases ran and, when expect_diverge >= 0, exactly that many
+     * cases came out as diverge. Test-only like disable_dimensions. */
+    int         min_cases = 0;
+    int         expect_diverge = -1;
 };
+
+/* For import/syscall models: abort the lifted call with a named reason (verdict
+ * lifted-blocked), or block for good (the case timeout then turns it into a
+ * timeout outcome on that side, exactly as the HLE's own blocking does). */
+[[noreturn]] void model_stop(const char* reason);
+[[noreturn]] void model_block(const char* what);
 
 /* A host function standing in for a guest function that a library calls back (a fiber entry, a
  * callback): register it at a guest code address and put {addr, 0} in an OPD the case passes. */

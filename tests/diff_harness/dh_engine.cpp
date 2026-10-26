@@ -76,7 +76,7 @@ Step step(const char* func, uint32_t nid, std::initializer_list<Arg> args)
     Step s;
     s.func = func; s.nid = nid;
     int i = 0;
-    for (const Arg& a : args) if (i < 8) s.args[i++] = a;
+    for (const Arg& a : args) if (i < 12) s.args[i++] = a;
     return s;
 }
 
@@ -93,6 +93,9 @@ static uint32_t g_tramp_target;
 static uint32_t g_cur_step;
 static const std::vector<std::pair<uint32_t, uint32_t>>* g_mask;
 static const std::vector<std::pair<uint32_t, uint32_t>>* g_mask_image;
+static bool g_hle_side = false;
+
+bool on_hle_side() { return g_hle_side; }
 
 /* r14..r31 seed; see the ABI check in child_run/evaluate. */
 constexpr uint64_t ABI_SENTINEL_BASE = 0xA5A5A5A500000000ull;
@@ -110,6 +113,20 @@ struct LiftBlock {
 [[noreturn]] static void lift_block(const char* blocker, const std::string& detail)
 {
     throw LiftBlock{blocker, detail};
+}
+
+[[noreturn]] void model_stop(const char* reason)
+{
+    throw LiftBlock{"model-stop", reason};
+}
+[[noreturn]] void model_block(const char* what)
+{
+    /* A stand-in that must wait on state this harness cannot provide: block for
+     * good, so the per-side alarm turns it into a timeout outcome. */
+    char t[256];
+    int n = snprintf(t, sizeof t, "kind=dh-blocked %s\n", what);
+    if (write(STDERR_FILENO, t, (size_t)n) < 0) {}
+    for (;;) pause();
 }
 
 static void register_fn(uint32_t addr, host_fn fn) { g_registry[addr] = fn; }
@@ -349,15 +366,18 @@ static void child_run(Side side, const Case& c, const std::vector<Step>& steps, 
         sigemptyset(&sa.sa_mask); sigaction(SIGSEGV, &sa, nullptr); sigaction(SIGBUS, &sa, nullptr);
     }
     std::map<int, uint64_t> slots;
+    g_hle_side = side == Side::Hle;
     std::string final_status = "returned", final_blocker, final_detail;
     for (uint32_t si = 0; si < steps.size(); ++si) {
         const Step& st = steps[si];
         g_cur_step = si;
         if (st.pre) st.pre();
         ppu_context ctx{};
-        for (int i = 0; i < 8; ++i) {
+        for (int i = 0; i < 12; ++i) {
             const Arg& a = st.args[i];
-            ctx.gpr[3 + i] = a.slot >= 0 ? (uint64_t)(slots[a.slot] + (uint64_t)a.add) : a.lit;
+            const uint64_t v = a.slot >= 0 ? (uint64_t)(slots[a.slot] + (uint64_t)a.add) : a.lit;
+            if (i < 8) ctx.gpr[3 + i] = v;
+            else wr64(STACK_TOP + 0x70 + 8 * (i - 8), v);   /* ELFv1 parameter save area, r1 + 48 + 8*i */
         }
         ctx.gpr[1] = STACK_TOP; ctx.gpr[13] = TLS_R13; ctx.thread_id = 1;
         /* r14..r31 are the ELFv1 nonvolatile set. Distinct sentinels, not
@@ -404,6 +424,7 @@ static void child_run(Side side, const Case& c, const std::vector<Step>& steps, 
         if (side == Side::Lifted && sr.status == "returned")
             for (int r = 14; r < 32; ++r)
                 if (ctx.gpr[r] != (ABI_SENTINEL_BASE | (uint64_t)r)) sr.abi_bad |= 1u << (r - 14);
+        if (sr.status == "returned" && st.post) st.post();
         if (sr.status == "returned")
             for (const Capture& cp : st.caps) {
                 uint64_t v = cp.kind == Capture::Ret ? ctx.gpr[3] : cp.kind == Capture::Mem32 ? rd32(cp.ea)
@@ -1444,6 +1465,14 @@ int run(const dh_module& mod, std::vector<Case>& cases, const ImportPolicy& pol,
     if (n_compared == 0) {
         fprintf(stderr, "[dh] no case compared the HLE against the lifted code; a run without a comparison is not evidence\n");
         return 2;
+    }
+    if (n_run < opt.min_cases) {
+        fprintf(stderr, "[dh] only %d case(s) ran, at least %d required\n", n_run, opt.min_cases);
+        return 1;
+    }
+    if (opt.expect_diverge >= 0 && n_div != opt.expect_diverge) {
+        fprintf(stderr, "[dh] %d case(s) diverged, %d declared\n", n_div, opt.expect_diverge);
+        return 1;
     }
     return n_unexpected ? 1 : 0;
 }

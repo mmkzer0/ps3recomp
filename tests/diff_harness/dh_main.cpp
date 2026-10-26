@@ -1,10 +1,11 @@
 /* Differential-harness runner:
  *   dh_diff --out report.json [--image relocated.bin] [--filter substr] [-v]
- *           [--disable-dimension NAME]...
+ *           [--disable-dimension NAME]... [--min-cases N] [--expect-diverge N]
  * The report is one JSON document (schema ps3recomp.diffharness/1), written
  * through a .partial file and renamed into place. */
 #include "dh_engine.h"
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -24,6 +25,8 @@ int main(int argc, char** argv)
         if (!strcmp(argv[i], "--out") && i + 1 < argc) opt.out = argv[++i];
         else if (!strcmp(argv[i], "--filter") && i + 1 < argc) opt.filter = argv[++i];
         else if (!strcmp(argv[i], "--image") && i + 1 < argc) opt.image = argv[++i];
+        else if (!strcmp(argv[i], "--min-cases") && i + 1 < argc) opt.min_cases = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--expect-diverge") && i + 1 < argc) opt.expect_diverge = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-v")) opt.verbose = true;
         else if (!strcmp(argv[i], "--disable-dimension") && i + 1 < argc) {
             const char* name = argv[++i];
