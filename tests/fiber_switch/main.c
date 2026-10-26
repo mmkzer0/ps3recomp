@@ -268,6 +268,8 @@ static int32_t self_entry(uint64_t arg)
 {
     (void)arg;
     self_seen = (uint32_t)(uintptr_t)cellFiberPpuSelf();
+    uint32_t out = guest_alloc(4, 4);
+    CHECK_RC(cellFiberPpuJoinFiber(cellFiberPpuSelf(), (s32*)(uintptr_t)out), CELL_FIBER_ERROR_DEADLK);
     return 0;
 }
 
@@ -413,8 +415,17 @@ static void case_errors(void)
     /* signals and joins on things that do not exist, and calls that need a fiber */
     CHECK_RC(cellFiberPpuSendSignal(NULL, NULL), CELL_FIBER_ERROR_NULL_POINTER);
     CHECK_RC(cellFiberPpuSendSignal((CellFiberPpu*)(uintptr_t)(f_ea + CELL_FIBER_PPU_ALIGN), NULL), CELL_FIBER_ERROR_STAT);
+    /* JoinFiber in the firmware's order (libfiber 0x02003574..0x0200369C): NULL fiber, NULL
+     * status, ALIGN, NOSYSINIT, DEADLK, INVAL (+0x31C bit 0), STAT (state word 0). A NULL status
+     * on a live fiber used to wait for a fiber nobody runs. */
+    uint32_t out = guest_alloc(4, 4), stray = guest_alloc(CELL_FIBER_PPU_SIZE, CELL_FIBER_PPU_ALIGN);
     CHECK_RC(cellFiberPpuJoinFiber(NULL, NULL), CELL_FIBER_ERROR_NULL_POINTER);
-    CHECK_RC(cellFiberPpuJoinFiber((CellFiberPpu*)(uintptr_t)(f_ea + CELL_FIBER_PPU_ALIGN), NULL), CELL_FIBER_ERROR_INVAL);
+    CHECK_RC(cellFiberPpuJoinFiber(f, NULL), CELL_FIBER_ERROR_NULL_POINTER);
+    CHECK_RC(cellFiberPpuJoinFiber((CellFiberPpu*)(uintptr_t)(f_ea + 16), (s32*)(uintptr_t)out), CELL_FIBER_ERROR_ALIGN);
+    CHECK_RC(cellFiberPpuJoinFiber((CellFiberPpu*)(uintptr_t)stray, (s32*)(uintptr_t)out), CELL_FIBER_ERROR_STAT);
+    g_guest_mem[stray + 0x31F] = 1;     /* storage of a fiber created with an onExit callback */
+    g_guest_mem[stray + 3] = 1;         /* even with a live state word, INVAL comes first */
+    CHECK_RC(cellFiberPpuJoinFiber((CellFiberPpu*)(uintptr_t)stray, (s32*)(uintptr_t)out), CELL_FIBER_ERROR_INVAL);
     CHECK_RC(cellFiberPpuWaitSignal(), CELL_FIBER_ERROR_PERM);
     CHECK_RC(cellFiberPpuYield(), CELL_FIBER_ERROR_PERM);
     CHECK_RC(cellFiberPpuExit(0), CELL_FIBER_ERROR_PERM);
@@ -426,7 +437,7 @@ static void case_errors(void)
     CHECK_RC(cellFiberPpuRunFibers(g_err_sched), CELL_OK);
     CHECK(join_status(inner) == 0);
     CHECK_RC(cellFiberPpuFinalizeScheduler(g_err_sched), CELL_OK);
-    CHECK_RC(cellFiberPpuJoinFiber(FIBER(inner), NULL), CELL_FIBER_ERROR_INVAL);   /* gone with its scheduler */
+    CHECK_RC(cellFiberPpuJoinFiber(FIBER(inner), NULL), CELL_FIBER_ERROR_NULL_POINTER);   /* status is tested first */
 
     /* A pending lifetime node makes Finalize BUSY; it may not discard stacks. */
     CHECK_RC(cellFiberPpuFinalizeScheduler(s), CELL_FIBER_ERROR_BUSY);

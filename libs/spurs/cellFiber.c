@@ -608,11 +608,27 @@ CellFiberPpu* cellFiberPpuSelf(void)
 }
 s32 cellFiberPpuJoinFiber(CellFiberPpu* fiber, s32* status)
 {
+    /* FW 4.93 libfiber 0x02003574..0x0200369C, in order: NULL fiber, NULL status, ALIGN (&127),
+     * NOSYSINIT, DEADLK (fiber is the caller), INVAL (+0x31C bit 0: created with an onExit
+     * callback), STAT (state word +0 is 0, i.e. never created or already joined). */
     const u32 ea = (u32)(uintptr_t)fiber;
-    if (!ea) return (s32)CELL_FIBER_ERROR_NULL_POINTER;
+    if (!ea || !status) return (s32)CELL_FIBER_ERROR_NULL_POINTER;
+    if (ea & 127) return (s32)CELL_FIBER_ERROR_ALIGN;
+    const u32 slot = tls_slot();
+    if (!slot) return (s32)CELL_FIBER_ERROR_NOSYSINIT;
+    if (ld32(slot) == ea) return (s32)CELL_FIBER_ERROR_DEADLK;
     Fiber* self = t_cur;
     LOCK(); Fiber* f = find_fiber(ea);
-    if (!f || f == self) { UNLOCK(); return (s32)CELL_FIBER_ERROR_INVAL; }
+    if (!f) {
+        /* The firmware reads the storage; it has no registry. Storage it would join as a live
+         * fiber, but that this runtime never created, cannot be joined here. */
+        range(__func__, "fiber", ea, 0x320);
+        const u32 flags = ld32(ea + 0x31C), state = ld32(ea);
+        UNLOCK();
+        if (flags & 1) return (s32)CELL_FIBER_ERROR_INVAL;
+        if (!state) return (s32)CELL_FIBER_ERROR_STAT;
+        unsupported(__func__, ea, "state", "unknown-fiber");
+    }
     if (self && f->state != F_DONE) {
         self->state = F_WAIT_JOIN; self->join_ea = ea; bits32(self->ea, 2, 0x20);
         UNLOCK(); host_yield(self); LOCK(); self->join_ea = 0;
@@ -620,7 +636,7 @@ s32 cellFiberPpuJoinFiber(CellFiberPpu* fiber, s32* status)
     while ((f = find_fiber(ea)) && f->state != F_DONE) WAIT();
     s32 rc = CELL_OK;
     if (!f) rc = (s32)CELL_FIBER_ERROR_INVAL;
-    else if (status) { range(__func__, "status", (u32)(uintptr_t)status, 4); vm_write32((u32)(uintptr_t)status, (u32)f->status); }
+    else { range(__func__, "status", (u32)(uintptr_t)status, 4); vm_write32((u32)(uintptr_t)status, (u32)f->status); }
     UNLOCK(); return rc;
 }
 
