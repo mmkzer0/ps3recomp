@@ -5,6 +5,7 @@
  * runs the binary with that dimension disabled and requires the case to go
  * undetected, so the dimension cannot rot silently. */
 #include "dh_engine.h"
+#include "ppu/ppu_context.h"
 
 using namespace dh;
 
@@ -26,6 +27,7 @@ constexpr uint32_t N_FAULT_SPAN  = 0x91000015;
 constexpr uint32_t N_FAULT_RET   = 0x91000016;
 constexpr uint32_t N_FAULT_ZERO  = 0x91000017;
 constexpr uint32_t N_MASK_ADJ    = 0x91000018;
+constexpr uint32_t N_OVR_OK      = 0x91000021;
 constexpr uint32_t DST = 0x00040000, SRC = 0x00041000;
 constexpr uint32_t FAULT_EA = 0x90000000u;
 
@@ -43,6 +45,16 @@ void add(const char* id, const char* func, uint32_t nid, std::initializer_list<u
     for (uint64_t a : args) if (i < 8) c.args[i++] = a;
     g_out->push_back(std::move(c));
 }
+
+/* Replaces the lifted module's internal function: the firmware twin computes 2a, this answers
+ * 3a, which is what makes the HLE's 3a+1 and the lifted export's helper(a)+1 agree. With the
+ * test-only "mutate-override" flag it answers 3a+1 instead, which must flip the verdict. */
+bool ovr_internal(void* v)
+{
+    ppu_context* c = (ppu_context*)v;
+    c->gpr[3] = (uint32_t)(c->gpr[3] * 3u + (case_flag("mutate-override") ? 1u : 0u));
+    return true;
+}
 }  // namespace
 
 namespace dh {
@@ -57,6 +69,8 @@ ImportPolicy import_policy()
 void register_cases(std::vector<Case>& out)
 {
     g_out = &out;
+    override_symbol("synth.internal_91000021", ovr_internal);
+    if (case_flag("bogus-override")) override_symbol("synth.no_such", ovr_internal);   /* test_synth.py: fail closed */
 
     /* matched executions */
     add("ret_match", "synth_ret", N_RET_OK, {7}, Expect::Match, "return");
@@ -87,6 +101,8 @@ void register_cases(std::vector<Case>& out)
         "HLE range stop and lifted guest-fault at the same EA");
     add("fault_span", "synth_fault_span", N_FAULT_SPAN, {FAULT_EA}, Expect::Inconclusive, "fault-span",
         "two guest faults at the same step whose spans do not overlap");
+    add("override_match", "synth_override", N_OVR_OK, {7}, Expect::Match, "return",
+        "matches only because the internal helper is overridden: the module alone computes 2a+1");
     add("fault_zero", "synth_fault_zero", N_FAULT_ZERO, {FAULT_EA}, Expect::Inconclusive, "fault-span",
         "a zero-length HLE range covers nothing and cannot pair with the lifted fault");
     add("fault_return", "synth_fault_return", N_FAULT_RET, {FAULT_EA}, Expect::Diverge, "status",

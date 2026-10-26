@@ -76,18 +76,18 @@ def main(argv):
 
     s = doc.get("summary", {})
     check(s.get("unexpected") == 0, f"unexpected={s.get('unexpected')}")
-    check(s.get("compared") == 15, f"compared={s.get('compared')} (want 15)")
-    check(s.get("match") == 6, f"match={s.get('match')} (want 6)")
+    check(s.get("compared") == 16, f"compared={s.get('compared')} (want 16)")
+    check(s.get("match") == 7, f"match={s.get('match')} (want 7)")
     check(s.get("diverge") == 6, f"diverge={s.get('diverge')} (want 6)")
     check(s.get("inconclusive") == 3, f"inconclusive={s.get('inconclusive')} (want 3)")
     check(s.get("no-hle") == 1, f"no-hle={s.get('no-hle')} (want 1)")
     check(s.get("common_mode") == 1, f"common_mode={s.get('common_mode')} (want 1)")
-    check(s.get("independent_match") == 5, "independent_match")
+    check(s.get("independent_match") == 6, "independent_match")
 
     by_id = cases(doc)
     expected = {
         "ret_match": "match", "write_match": "match", "import_match": "match",
-        "asm_match": "match", "cpp_match": "match", "fault_match": "match",
+        "asm_match": "match", "cpp_match": "match", "fault_match": "match", "override_match": "match",
         "ret_wrong": "diverge", "write_missing": "diverge", "pad_extra": "diverge",
         "mask_adjacent": "diverge", "import_swap": "diverge", "fault_return": "diverge",
         "fault_span": "inconclusive", "fault_zero": "inconclusive", "hang": "inconclusive",
@@ -110,6 +110,13 @@ def main(argv):
     check(by_id["fault_span"]["cause_kind"] == "fault-span", "fault_span cause")
     check(by_id["fault_zero"]["cause_kind"] == "fault-span", "fault_zero cause")
     check(by_id["hang"]["cause_kind"] == "hang", "hang cause")
+
+    # The seam: the report names the override and logs every handled call on the lifted side.
+    check(env.get("overrides") == ["synth.internal_91000021"], f"environment.overrides {env.get('overrides')}")
+    check(env.get("symbols_fingerprint") == sha256_file(image), "environment.symbols_fingerprint")
+    ovr_calls = [i for i in by_id["override_match"]["imports"] if i["name"] == "override:synth.internal_91000021"]
+    check(len(ovr_calls) == 1 and ovr_calls[0]["policy"] == "model" and ovr_calls[0]["args"][0] == "0x7"
+          and ovr_calls[0]["ret"] == "0x15", f"override call record {ovr_calls}")
 
     agg = doc.get("functions", {})
     check(agg.get("synth_import", {}).get("0x91000003", {}).get("common_mode") == 1,
@@ -145,6 +152,18 @@ def main(argv):
     check(rc == 0, f"control: import_swap still diverges with return disabled (exit {rc})")
     check(cases(doc)["import_swap"]["verdict"] == "diverge", "control: import dimension intact")
 
+    # ---- fail-before: the override seam -----------------------------------
+    # override_match agrees with the HLE only because the lifted module's internal helper is
+    # replaced: without the override the module computes 2a+1 and the case must diverge, and an
+    # override that answers wrongly must flip it as well. Either way the run fails.
+    for extra, why in ((["--no-overrides"], "no override installed"),
+                       (["--case-flag", "mutate-override"], "mutated override answer")):
+        rc, doc, _log = run(binary, fail_out, ["--filter", "override_match"] + extra)
+        check(doc is not None and rc == 1, f"{why}: the run must fail (exit {rc})")
+        c = cases(doc)["override_match"]
+        check(c["verdict"] == "diverge" and c["unexpected"] is True and c["cause_kind"] == "return",
+              f"{why}: override_match is {c['verdict']}/{c['cause_kind']}, want an unexpected return divergence")
+
     # ---- fail-closed runs --------------------------------------------------
     rc, _doc, _log = run(binary, fail_out, ["--filter", "does-not-exist"])
     check(rc == 2, f"an unmatched filter must be a harness error, got {rc}")
@@ -152,8 +171,13 @@ def main(argv):
     check(rc == 2, f"a filter with no compared case must not succeed, got {rc}")
     rc, _doc, _log = run(binary, fail_out, ["--disable-dimension", "bogus"])
     check(rc == 2, f"an unknown dimension must be a usage error, got {rc}")
+    # An override on a symbol the generated table does not have must stop the run, not fall back
+    # to the lifted function (which would look like an ordinary divergence or even a match).
+    rc, _doc, log = run(binary, fail_out, ["--case-flag", "bogus-override"])
+    check(rc == 2 and "synth.no_such" in log and "generated symbol table" in log,
+          f"an unknown override symbol must be a harness error naming it, got {rc}")
 
-    print("test_synth: PASS (16 cases, 7 dimensions fail-before, fail-closed paths)")
+    print("test_synth: PASS (17 cases, 7 dimensions + override seam fail-before, fail-closed paths)")
     return 0
 
 

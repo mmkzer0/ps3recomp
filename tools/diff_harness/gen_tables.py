@@ -27,6 +27,8 @@ import argparse, json, os, struct, sys
 
 ROOT = os.path.realpath(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import dh_symbols  # noqa: E402
 
 
 def be32(buf, off):
@@ -57,6 +59,8 @@ def main():
     ap.add_argument("--header", required=True, help="the lifter's header name, e.g. fwsync2.h")
     ap.add_argument("--out", required=True)
     ap.add_argument("--names", help="optional JSON {nid_hex: name} consulted before the NID database")
+    ap.add_argument("--symbols", help="override-symbol file (dh_symbols.py): named internal addresses, "
+                                      "bound to the image by its SHA-256")
     ap.add_argument("--synthetic", action="store_true",
                     help="input is the checked-in synthetic fixture (not firmware): allow an "
                          "in-repository build directory")
@@ -122,11 +126,20 @@ def main():
                 bad += 1
             lines.append('    {0x%08Xu, 0x%08Xu, 0x%08Xu, "%s", "%s"},' % (n, s, slot, lib, nm(n)))
             n_im += 1
-    lines += ["};", "",
-              'extern "C" const dh_module dh_module_desc = {',
+    sym_rows, sym_sha = [], ""
+    if a.symbols:
+        if not a.synthetic and inside_repo(a.symbols):
+            sys.exit(f"refusing firmware-derived input inside the repository (--symbols): {os.path.realpath(a.symbols)}")
+        sym_sha, syms = dh_symbols.load(a.symbols, image, base)
+        sym_rows = ['    {"%s", 0x%08Xu},' % (n, ea) for n, ea, _ in syms]
+    lines += ["};", ""]
+    if sym_rows:
+        lines += ["static const dh_symbol k_symbols[] = {"] + sym_rows + ["};", ""]
+    lines += ['extern "C" const dh_module dh_module_desc = {',
               '    "%s", 0x%08Xu, 0x%08Xu, "%s",' % (a.name, base, toc, os.path.realpath(a.image)),
               "    k_exports, %d, k_imports, %d," % (n_ex, n_im),
-              "    %sfunction_table, %sfunction_table_count, %sctx_layout" % (a.prefix, a.prefix, a.prefix),
+              "    %sfunction_table, %sfunction_table_count, %sctx_layout," % (a.prefix, a.prefix, a.prefix),
+              "    %s, %d, \"%s\"" % ("k_symbols" if sym_rows else "nullptr", len(sym_rows), sym_sha),
               "};", ""]
     open(os.path.join(out, a.prefix + "harness_tables.cpp"), "w").write("\n".join(lines))
 

@@ -54,7 +54,7 @@ void declare(Case& c, bool bug, bool sw, const char* note, int sw_step)
     if (sw && kJtGap) {
         c.expect = Expect::Blocked; c.note = B_GAP;
         c.expect_cause = "blocked"; c.expect_step = sw_step;
-        c.blocker = "unlifted-function"; c.blocker_step = sw_step;
+        c.blocker = "unresolved-jump-table"; c.blocker_step = sw_step;
     }
 }
 void add_case(const char* id, uint32_t nid, const char* func, std::initializer_list<uint64_t> a,

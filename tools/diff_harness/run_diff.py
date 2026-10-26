@@ -32,7 +32,7 @@ ROOT = os.path.realpath(os.path.dirname(os.path.dirname(os.path.dirname(os.path.
 
 # module -> (lifter --symbol-prefix, lifted file stem)
 MODULES = {"libsync2": ("fwsync2_", "fwsync2"), "libfiber": ("fwfiber_", "fwfiber"),
-           "libspurs_jq": ("fwjq_", "fwjq")}
+           "libspurs_jq": ("fwjq_", "fwjq"), "libsysutil": ("fwusys_", "fwusys")}
 
 
 def inside_repo(p):

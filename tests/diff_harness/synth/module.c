@@ -55,3 +55,12 @@ EXPORT u32 synth_nid_91000018(u32 dst, u32 src)
     for (u32 i = 0; i < 8; ++i) d[i] = s[i];
     return 0;
 }
+
+/* Override seam. `synth_internal_91000021` is an INTERNAL function (hand-written in
+ * module_asm.S, like the import stub: a code symbol in .text that a plain bl reaches without a
+ * function descriptor): it is not exported. The case table replaces it through its symbol
+ * (tools/diff_harness/make_synth.py writes the symbol file from this naming convention). On
+ * its own the module computes 2a+1; the HLE twin computes 3a+1, so the case matches only
+ * when the override (3a) is what the lifted call actually runs. */
+extern u32 synth_internal_91000021(u32 a);
+EXPORT u32 synth_nid_91000021(u32 a) { return synth_internal_91000021(a) + 1u; }

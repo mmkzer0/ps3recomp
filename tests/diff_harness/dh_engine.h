@@ -200,6 +200,22 @@ struct SideResult {
     bool wire_ok = false;                          /* a valid final record arrived */
 };
 
+/* ---- internal-function overrides (lifted side only) --------------------- */
+/* Import models stand in for what a module CALLS OUT to. An override stands in for a function
+ * INSIDE the module, named by a symbol of the generated table (`dh_symbol`): the lifted code's
+ * own calls reach the replacement instead of the lifted body, with the guest registers as the
+ * caller left them. It is how a case puts a scripted peer (a fake service behind the module's
+ * IPC primitives) where the real peer is not available. The seam is backend-neutral: a
+ * later interpreted side would intercept the same guest address through the same symbol.
+ *
+ * The hook returns true when it handled the call (r3 etc. set as the callee would), false to
+ * run the original lifted function. Every handled call is logged as an import record named
+ * `override:<symbol>` (policy model), so the report shows what the lifted side did NOT run.
+ * The module's tables must carry the symbol and the lifted C must have been wrapped by
+ * tools/diff_harness/apply_overrides.py; otherwise the run stops with a harness error. */
+typedef bool (*override_fn)(void* /*ppu_context* */);
+void override_symbol(const char* symbol, override_fn fn);
+
 struct Options {
     std::string image;        /* override dh_module.default_image */
     std::string out;          /* result file: one JSON document, atomic rename (required) */
@@ -212,6 +228,12 @@ struct Options {
      * cases came out as diverge. Test-only like disable_dimensions. */
     int         min_cases = 0;
     int         expect_diverge = -1;
+    /* Test-only, like disable_dimensions: run the lifted side without any override, to prove
+     * that a case matches BECAUSE of its override (tools/diff_harness/test_synth.py). */
+    bool        no_overrides = false;
+    /* Test-only free-form switches a case table may read through case_flag() (e.g. the
+     * synthetic fixture's "mutate-override", which makes its override answer wrongly). */
+    std::set<std::string> case_flags;
 };
 
 /* For import/syscall models: abort the lifted call with a named reason (verdict
@@ -223,6 +245,15 @@ struct Options {
 /* A host function standing in for a guest function that a library calls back (a fiber entry, a
  * callback): register it at a guest code address and put {addr, 0} in an OPD the case passes. */
 void register_guest_fn(uint32_t code_addr, void (*fn)(void* /*ppu_context* */));
+
+/* Call the guest function whose OPD is at `opd` from host code (the HLE's guest-caller hook):
+ * registered host functions only, r3..r10 = a0..a7. An OPD that names no registered function is
+ * a harness block, never a silent return. */
+void guest_call(uint32_t opd, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7);
+
+bool case_flag(const char* name);
+void set_case_flags(const std::set<std::string>& flags);   /* dh_main, before register_cases() */
 
 /* Registered by the library's case file. */
 void register_cases(std::vector<Case>& out);

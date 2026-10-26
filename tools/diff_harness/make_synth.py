@@ -16,6 +16,7 @@ Exports are the `.opd` symbols named synth_nid_<8 hex digits> (ELFv1 keeps a
 function descriptor in .opd); imports are the `.text` symbols named
 synth_import_<8 hex digits> whose body is the SCE stub shape."""
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -31,6 +32,7 @@ from elf_parser import ELFFile, PT_LOAD, SHT_SYMTAB  # noqa: E402
 SYMBOL = struct.Struct(">IBBHQQ")     # Elf64_Sym
 NID_SYM = re.compile(r"^synth_nid_([0-9A-Fa-f]{8})$")
 IMP_SYM = re.compile(r"^synth_import_([0-9A-Fa-f]{8})$")
+INT_SYM = re.compile(r"^synth_internal_([0-9A-Fa-f]{8})$")   # internal functions the override seam may replace
 
 
 def be32(buf, off):
@@ -154,6 +156,22 @@ def main():
     image_path = os.path.join(meta_dir, a.name + "_image.bin")
     open(image_path, "wb").write(image)
 
+    # ---- override symbols: internal code symbols named synth_internal_<id> ---
+    # Hand-written in module_asm.S: a .text code symbol, so a plain bl reaches it. The .text
+    # symbol scan below seeds it for the lifter like the import stub.
+    symbols = {}
+    for name, sec, value, _typ in syms:
+        m = INT_SYM.match(name)
+        if not m or sec != ".text":
+            continue
+        if not (text_sh.sh_addr <= value < text_sh.sh_addr + text_sh.sh_size):
+            raise SystemExit(f"make_synth: {name} code 0x{value:X} outside .text")
+        symbols[f"synth.internal_{m.group(1).lower()}"] = {
+            "addr": f"0x{value:08X}", "evidence": f"ELF symbol {name} in the synthetic module's source"}
+    symbols_path = os.path.join(meta_dir, a.name + "_overrides.json")
+    json.dump({"image_sha256": hashlib.sha256(image).hexdigest(), "symbols": symbols},
+              open(symbols_path, "w"), indent=1)
+
     # ---- imports: .text stubs named synth_import_<nid> ---------------------
     imports, slot_syms = {}, {}
     for name, sec, value, _typ in syms:
@@ -203,12 +221,22 @@ def main():
     if subprocess.run(cmd).returncode:
         return 2
 
+    # The seam: wrap the override points in the lifted C (apply_overrides.py). The checked-in
+    # fixture is synthetic, so the tool is told it may write into the build tree.
+    cmd = [sys.executable, os.path.join(ROOT, "tools", "diff_harness", "apply_overrides.py"), "--synthetic",
+           "--lifted", os.path.join(lifted_dir, "synth.c"), "--prefix", a.prefix, "--image", image_path,
+           "--exports", os.path.join(meta_dir, a.name + "_exports.json"), "--symbols", symbols_path,
+           "--out", os.path.join(lifted_dir, "synth_ovr.c")]
+    print("+ " + " ".join(cmd))
+    if subprocess.run(cmd).returncode:
+        return 2
+
     # The synthetic output may live inside the repository build tree: it is not
     # firmware-derived, so gen_tables gets its explicit synthetic switch.
     cmd = [sys.executable, a.gen_tables, "--synthetic", "--name", a.name, "--prefix", a.prefix,
            "--header", "synth.h", "--exports", os.path.join(meta_dir, a.name + "_exports.json"),
            "--imports", os.path.join(meta_dir, a.name + "_imports.json"), "--image", image_path,
-           "--out", lifted_dir]
+           "--symbols", symbols_path, "--out", lifted_dir]
     print("+ " + " ".join(cmd))
     if subprocess.run(cmd).returncode:
         return 2

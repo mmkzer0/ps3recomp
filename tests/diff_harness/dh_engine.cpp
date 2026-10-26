@@ -132,6 +132,64 @@ struct LiftBlock {
 static void register_fn(uint32_t addr, host_fn fn) { g_registry[addr] = fn; }
 void register_guest_fn(uint32_t addr, void (*fn)(void*)) { g_registry[addr] = fn; }
 
+/* ---- case flags (test-only switches a case table may read) --------------- */
+static std::set<std::string> g_case_flags;
+bool case_flag(const char* name) { return g_case_flags.count(name) != 0; }
+void set_case_flags(const std::set<std::string>& flags) { g_case_flags = flags; }
+
+/* ---- internal-function overrides ------------------------------------------ */
+/* Registered by the case file before run(); resolved against the module's generated symbol
+ * table (and the wrapper table apply_overrides.py appended to the lifted C) in run(). */
+struct PendingOverride { std::string symbol; override_fn fn; };
+static std::vector<PendingOverride> g_pending_overrides;
+struct ActiveOverride { std::string symbol; override_fn fn; uint32_t index; };
+static std::unordered_map<uint32_t, ActiveOverride> g_overrides;   /* guest EA -> override */
+static bool g_overrides_on = true;
+
+void override_symbol(const char* symbol, override_fn fn) { g_pending_overrides.push_back({symbol, fn}); }
+
+extern "C" {
+/* Appended to the lifted C by tools/diff_harness/apply_overrides.py; absent in a module without
+ * override points. */
+extern const uint32_t dh_override_wrapped[] __attribute__((weak));
+extern const uint32_t dh_override_wrapped_count __attribute__((weak));
+}
+
+/* Called first thing by every wrapped lifted function (apply_overrides.py). */
+extern "C" int dh_override_hit(uint32_t addr, ppu_context* ctx)
+{
+    if (!g_overrides_on) return 0;
+    auto it = g_overrides.find(addr);
+    if (it == g_overrides.end()) return 0;
+    ImportRec r;
+    r.nid = 0xFFFD0000u | it->second.index; r.name = "override:" + it->second.symbol;
+    r.policy = Policy::Model; r.step = g_cur_step;
+    r.arg[0] = ctx->gpr[3]; r.arg[1] = ctx->gpr[4]; r.arg[2] = ctx->gpr[5]; r.arg[3] = ctx->gpr[6];
+    const size_t at = g_lifted_imports->size();
+    g_lifted_imports->push_back(r);          /* kept even when the override stops the side */
+    if (!it->second.fn(ctx)) { g_lifted_imports->resize(at); return 0; }
+    (*g_lifted_imports)[at].ret = ctx->gpr[3]; (*g_lifted_imports)[at].has_ret = true;
+    return 1;
+}
+
+void guest_call(uint32_t opd, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
+{
+    const uint32_t code = rd32(opd), toc = rd32(opd + 4);
+    auto it = g_registry.find(code);
+    if (it == g_registry.end()) {
+        fprintf(stderr, "kind=dh-unlifted-function addr=0x%X\n", code);
+        _exit(72);
+    }
+    ppu_context ctx{};
+    const uint64_t args[8] = {a0, a1, a2, a3, a4, a5, a6, a7};
+    for (int i = 0; i < 8; ++i) ctx.gpr[3 + i] = args[i];
+    ctx.gpr[1] = (g_active_ctx ? g_active_ctx->gpr[1] : (uint64_t)STACK_TOP) - 0x800;
+    ctx.gpr[2] = toc; ctx.gpr[13] = TLS_R13; ctx.thread_id = 1; ctx.lr = SENTINEL;
+    it->second(&ctx);
+    while (g_trampoline_fn) { auto f = g_trampoline_fn; g_trampoline_fn = nullptr; f(&ctx); }
+}
+
 static std::string hex(uint64_t v)
 {
     char b[24];
@@ -210,6 +268,8 @@ extern "C" void dh_syscall(ppu_context* c)
     r.ret = c->gpr[3]; r.has_ret = true; g_lifted_imports->push_back(r);
 }
 
+static uint32_t g_image_size = 0;   /* bytes of the loaded module image (set by run()) */
+
 extern "C" void ps3_indirect_call(ppu_context* ctx)
 {
     const uint32_t t = (uint32_t)ctx->ctr;
@@ -219,8 +279,15 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
         return;
     }
     auto it = g_registry.find(t);
-    if (it == g_registry.end())
+    if (it == g_registry.end()) {
+        /* A target inside the module's own image that no lifted function starts at is the landing
+         * site of a computed branch (a `switch`) whose table the lifter did not resolve (#45); a
+         * target outside every lifted module is an unlifted function. Different causes, different
+         * blockers, so a declaration for one cannot hide the other. */
+        if (g_mod && t >= g_mod->base && t < g_mod->base + g_image_size && (t & 3) == 0)
+            lift_block("unresolved-jump-table", "computed branch to " + hex(t) + ", inside the lifted image but not a function entry: a switch whose jump table the lifter did not resolve (#45)");
         lift_block("unlifted-function", "indirect call to unlifted guest address " + hex(t));
+    }
     it->second(ctx);
 }
 
@@ -1296,6 +1363,7 @@ int run(const dh_module& mod, std::vector<Case>& cases, const ImportPolicy& pol,
      * the HLE side into the lifted side. The harness binds exports itself. */
     uint32_t image_size = 0;
     uint8_t* img = prx_image_load_file(path.c_str(), &image_size);
+    g_image_size = image_size;
     if (!img) { fprintf(stderr, "[dh] cannot read image %s\n", path.c_str()); return 2; }
     char image_sha[PS3_SHA256_HEX_SIZE];
     ps3_sha256_hex(img, image_size, image_sha);
@@ -1319,6 +1387,34 @@ int run(const dh_module& mod, std::vector<Case>& cases, const ImportPolicy& pol,
     fprintf(stderr, "[dh] %s: image 0x%X bytes @0x%08X, %llu lifted functions, %u/%u import slots patched\n",
             mod.name, image_size, mod.base, (unsigned long long)lr.funcs_registered, patched, mod.n_imports);
 
+    /* Resolve the overrides the case table asked for. Each must name a symbol of THIS build's
+     * generated table (bound to the image by its SHA-256) and an address the lifted C wraps;
+     * anything else would run the original function and look like a match. */
+    g_overrides_on = !opt.no_overrides;
+    if (!g_pending_overrides.empty() &&
+        (!mod.symbols_fingerprint || strcmp(mod.symbols_fingerprint, image_sha) != 0)) {
+        fprintf(stderr, "[dh] %s: the module's symbol table (%s) was not generated for this image (%s)\n",
+                mod.name, mod.symbols_fingerprint ? mod.symbols_fingerprint : "none", image_sha);
+        return 2;
+    }
+    for (const PendingOverride& p : g_pending_overrides) {
+        uint32_t addr = 0;
+        for (uint32_t i = 0; i < mod.n_symbols; ++i)
+            if (!strcmp(mod.symbols[i].name, p.symbol.c_str())) addr = mod.symbols[i].addr;
+        bool wrapped = false;
+        if (&dh_override_wrapped_count && &dh_override_wrapped[0])
+            for (uint32_t i = 0; i < dh_override_wrapped_count; ++i) wrapped |= dh_override_wrapped[i] == addr;
+        if (!addr || !wrapped || g_overrides.count(addr) || !g_registry.count(addr)) {
+            fprintf(stderr, "[dh] %s: override symbol '%s' %s\n", mod.name, p.symbol.c_str(),
+                    !addr ? "is not in the module's generated symbol table"
+                    : !wrapped ? "has no wrapper in the lifted C (apply_overrides.py was not run on it)"
+                    : g_overrides.count(addr) ? "is overridden twice"
+                    : "is not a lifted function entry");
+            return 2;
+        }
+        g_overrides[addr] = {p.symbol, p.fn, (uint32_t)g_overrides.size()};
+    }
+
     JsonWriter w;
     w.begin_object();
     w.field("schema", "ps3recomp.diffharness/1");
@@ -1331,6 +1427,11 @@ int run(const dh_module& mod, std::vector<Case>& cases, const ImportPolicy& pol,
     w.field("image_size", (uint64_t)image_size);
     w.field("base", hex(mod.base));
     w.field("toc", hex(mod.toc));
+    w.field("symbols_fingerprint", mod.symbols_fingerprint ? mod.symbols_fingerprint : "");
+    w.key("overrides");
+    w.begin_array();
+    for (const PendingOverride& p : g_pending_overrides) w.value(p.symbol);
+    w.end_array();
     w.field("harness", "dh_diff");
     w.end_object();
     w.key("options");

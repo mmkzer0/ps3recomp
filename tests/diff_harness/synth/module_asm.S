@@ -22,6 +22,12 @@ synth_nid_91000006_code:
     add 3, 3, 4
     blr
 
+    /* 0x91000021: the internal function the override seam replaces; 2a */
+    .globl synth_internal_91000021
+synth_internal_91000021:
+    slwi 3, 3, 1
+    blr
+
     /* 0x91000100: imported helper. The shape mirrors the firmware's SCE stub:
      * load the slot (descriptor), read {code,toc}, jump to the code with the
      * module TOC in r2. decode_slot() reads the first three instructions. */

@@ -14,6 +14,10 @@ typedef struct { uint32_t nid; uint32_t opd; const char* lib; const char* name; 
 /* stub_ea: the import stub's code; slot_ea: the word the stub loads to find its
  * {code,toc} descriptor (0 when the stub is not the SCE glue shape). */
 typedef struct { uint32_t nid; uint32_t stub_ea; uint32_t slot_ea; const char* lib; const char* name; } dh_import;
+/* A named internal address of the module (an override point, see dh_engine.h). The name is
+ * symbolic and lives in the committed case files; the address lives only in the generated
+ * table, which is bound to the image by `symbols_fingerprint` (the image's SHA-256). */
+typedef struct { const char* name; uint32_t addr; } dh_symbol;
 
 /* ctx_layout[]: sizeof, gpr, fpr, cr, lr, ctr, xer, thread_id of the ppu_context
  * the LIFTED code was compiled against. */
@@ -26,6 +30,8 @@ typedef struct {
     const dh_import*      imports;  uint32_t n_imports;
     const prx_func_entry* funcs;    uint64_t func_count;
     const uint32_t*       ctx_layout;
+    const dh_symbol*      symbols;  uint32_t n_symbols;
+    const char*           symbols_fingerprint;   /* image SHA-256 the symbols were derived from; "" without symbols */
 } dh_module;
 
 extern const dh_module dh_module_desc;

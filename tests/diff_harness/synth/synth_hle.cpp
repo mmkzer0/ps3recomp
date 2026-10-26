@@ -29,6 +29,7 @@ constexpr uint32_t N_FAULT_SPAN  = 0x91000015;
 constexpr uint32_t N_FAULT_RET   = 0x91000016;
 constexpr uint32_t N_FAULT_ZERO  = 0x91000017;
 constexpr uint32_t N_MASK_ADJ    = 0x91000018;
+constexpr uint32_t N_OVR_OK      = 0x91000021;
 constexpr uint64_t FAULT_EA      = 0x90000000ull;
 
 /* The imported helper has no effect on the return value or on memory: only the
@@ -86,6 +87,7 @@ void hle_hang(ppu_context* c)
 }
 void hle_asm_add(ppu_context* c) { c->gpr[3] = (uint32_t)c->gpr[3] + (uint32_t)c->gpr[4]; }
 void hle_cpp_mul(ppu_context* c) { c->gpr[3] = (uint32_t)(c->gpr[3] * c->gpr[4] + 7u); }
+void hle_ovr_ok(ppu_context* c)  { c->gpr[3] = (uint32_t)(c->gpr[3] * 3u + 1u); }
 }  // namespace
 
 extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
@@ -108,5 +110,6 @@ extern "C" void ppu_hle_register_all(void)
     ps3_hle_register_ctx(N_FAULT_RET,   "synth_fault_return", hle_fault_return);
     ps3_hle_register_ctx(N_FAULT_ZERO,  "synth_fault_zero",   hle_fault_zero);
     ps3_hle_register_ctx(N_MASK_ADJ,    "synth_mask_adjacent", hle_pad_extra);
+    ps3_hle_register_ctx(N_OVR_OK,      "synth_override",     hle_ovr_ok);
     /* N_RET's no-HLE twin 0x91000008 is deliberately not registered. */
 }

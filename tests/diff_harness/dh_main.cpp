@@ -1,6 +1,7 @@
 /* Differential-harness runner:
  *   dh_diff --out report.json [--image relocated.bin] [--filter substr] [-v]
  *           [--disable-dimension NAME]... [--min-cases N] [--expect-diverge N]
+ *           [--no-overrides] [--case-flag NAME]...      (the last two: test-only)
  * The report is one JSON document (schema ps3recomp.diffharness/1), written
  * through a .partial file and renamed into place. */
 #include "dh_engine.h"
@@ -27,6 +28,8 @@ int main(int argc, char** argv)
         else if (!strcmp(argv[i], "--image") && i + 1 < argc) opt.image = argv[++i];
         else if (!strcmp(argv[i], "--min-cases") && i + 1 < argc) opt.min_cases = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--expect-diverge") && i + 1 < argc) opt.expect_diverge = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--no-overrides")) opt.no_overrides = true;
+        else if (!strcmp(argv[i], "--case-flag") && i + 1 < argc) opt.case_flags.insert(argv[++i]);
         else if (!strcmp(argv[i], "-v")) opt.verbose = true;
         else if (!strcmp(argv[i], "--disable-dimension") && i + 1 < argc) {
             const char* name = argv[++i];
@@ -40,7 +43,8 @@ int main(int argc, char** argv)
         } else {
             fprintf(stderr,
                     "usage: %s --out report.json [--filter substr] [--image relocated.bin] [-v]\n"
-                    "          [--disable-dimension return|writes|extra|imports|faults|fault-span|hang]\n",
+                    "          [--disable-dimension return|writes|extra|imports|faults|fault-span|hang]\n"
+                    "          [--min-cases N] [--expect-diverge N] [--no-overrides] [--case-flag NAME]\n",
                     argv[0]);
             return 2;
         }
@@ -49,6 +53,7 @@ int main(int argc, char** argv)
         fprintf(stderr, "--out is required: a run writes one JSON report\n");
         return 2;
     }
+    dh::set_case_flags(opt.case_flags);
     std::vector<dh::Case> cases;
     dh::register_cases(cases);
     return dh::run(dh_module_desc, cases, dh::import_policy(), opt);
