@@ -1053,6 +1053,8 @@ PS3 save data uses a callback pattern:
 - File read/write within save directories
 - Delete save data
 - Auto-save and auto-load convenience functions
+- Callback results as FW 4.93 maps them: `funcStat` 0 continues, 1 returns `CELL_OK` without a PARAM.SFO write or file loop, -1..-5 return `CELL_SAVEDATA_ERROR_CBRESULT` (-4 `NODATA` included; the firmware returns `NODATA` only when VSH reports it), anything else `PARAM`. `funcFile` ends on 1 or 2 and follows the RPCS3 oracle for the rest. `version > 1` and `errDialog > 2` are `PARAM`, checked before the NULL arguments. `statGet.fileList` points at the title's `setBuf->buf`, also when the list is empty.
+- A title that needs a different answer for its own save flow (for example treating `NODATA` as success) carries it in its own port, never in the toolkit.
 
 ### cellGame
 

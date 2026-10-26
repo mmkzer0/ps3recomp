@@ -119,8 +119,8 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 
 | Module | Category | Status | Notes |
 |---|---|---|---|
-| cellSaveData | Save Data | **Complete** | Callback-driven save/load, directory enumeration, file ops, simplified PARAM.SFO |
-| cellGame | Game Utility | **Complete** | Boot check, content permit, param read, data directory management |
+| cellSaveData | Save Data | **Complete** | Callback-driven save/load, directory enumeration, file ops, simplified PARAM.SFO. `funcStat`/`funcFile` results map as FW 4.93 does (0 continues, 1 ends with `CELL_OK`, -1..-5 `CBRESULT`, else `PARAM`; NODATA only from VSH), `version > 1` and `errDialog > 2` are `PARAM`, `statGet.fileList` is the title's `setBuf->buf` (#48) |
+| cellGame | Game Utility | **Complete** | Boot check, content permit (creates nothing), param read, data directory management. Host paths use their own 1024-byte buffers and stop with `host-path-limit` rather than being cut into a guest-sized buffer (#49) |
 | cellMsgDialog | Message Dialog | **Complete** | Prints to stdout, auto-responds YES/OK, progress bar tracking |
 | cellOskDialog | OSK Dialog | **Complete** | UTF-16 support, configurable default response, async pattern |
 | cellVideoUpload | Video Upload | **Complete** | Init/term, upload returns NOT_SUPPORTED |
