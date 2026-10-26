@@ -31,7 +31,7 @@ extern "C" int32_t cellSyncQueueInitialize(CellSyncQueue* queue, void* buffer, u
 void vm_write64(uint64_t ea, uint64_t v) { v = __builtin_bswap64(v); std::memcpy(vm_base + ea, &v, 8); }
 
 constexpr uint32_t MEM = 0x80000, SEM = 0x1000, ATTR = 0x2001, BUF = 0x3000, OUT = 0x3801;
-constexpr uint32_t ATTRIBUTE = 0x2D77FE17, INITIALIZE = 0xC5DEE254, GET = 0x4E2EE031;
+constexpr uint32_t ATTRIBUTE = 0x2D77FE17, INITIALIZE = 0xC5DEE254, GET = 0x4E2EE031, ESTIMATE = 0x74C2780F;
 constexpr uint32_t ACQUIRE = 0xD1B0D146, RELEASE = 0x0C2983AC, TRY = 0x5E4B0F87;
 int failures;
 #define CHECK(c) do { if (!(c)) { std::fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #c); ++failures; } } while (0)
@@ -120,6 +120,39 @@ void layout()
     CHECK(cellSyncQueueInitialize((CellSyncQueue*)(uintptr_t)0x1000, (void*)(uintptr_t)0x2000, 15, 1) == int32_t(0x80410102));
     /* Valid parameters initialize successfully */
     CHECK(cellSyncQueueInitialize((CellSyncQueue*)(uintptr_t)0x1000, (void*)(uintptr_t)0x2000, 16, 1) == 0);
+}
+/* fw libsync2 0x02004B94 (EstimateBufferSize) and the name copy of Initialize: the two rows the
+ * differential harness found against the lifted firmware (#28). */
+void estimate()
+{
+    auto attr = [](uint32_t sdk, uint16_t max) { CHECK(call(ATTRIBUTE, ATTR, sdk) == 0); wr16(ATTR + 6, max); };
+    auto size = [](uint64_t rc_expected, uint32_t expected) {
+        wr(OUT, 0xA5A5A5A5);
+        CHECK(call(ESTIMATE, ATTR, OUT) == rc_expected);
+        CHECK(rd(OUT) == expected);
+    };
+    CHECK(call(ESTIMATE, 0, OUT) == error(0x80410C11));
+    attr(0x270000, 1);  size(0, 0);              /* one waiter: no external buffer */
+    attr(0x270000, 2);  size(0, 24);
+    attr(0x330000, 4);  size(0, 40);             /* upper end of the SDK window */
+    attr(0x270000, 0x8000); size(0, 0x40008);    /* Initialize rejects this size later; Estimate does not */
+    attr(0x26FFFF, 4);  size(error(0x80410C02), 0xA5A5A5A5);
+    attr(0x330001, 4);  size(error(0x80410C02), 0xA5A5A5A5);
+    attr(0x270000, 0);  size(error(0x80410C02), 0xA5A5A5A5);
+    attr(0x270000, 0x8001); size(error(0x80410C02), 0xA5A5A5A5);
+    /* the attribute is validated before the output pointer */
+    attr(0x260000, 4);
+    CHECK(call(ESTIMATE, ATTR, 0) == error(0x80410C02));
+    attr(0x270000, 4);
+    CHECK(call(ESTIMATE, ATTR, 0) == error(0x80410C11));
+
+    /* strncpy, not memcpy: what follows the name's terminator in the attribute is not copied */
+    attr(0x270000, 1);
+    std::memset(vm_base + ATTR + 8 + 19, 0x5A, 31 - 19);
+    std::memset(vm_base + SEM, 0xA5, 128);
+    CHECK(call(INITIALIZE, SEM, 0, 0, ATTR) == 0);
+    CHECK(std::strcmp(reinterpret_cast<char*>(vm_base + SEM + 0x28), "CellSync2Semaphore") == 0);
+    for (unsigned i = 0x28 + 19; i < 0x28 + 31; ++i) CHECK(vm_base[SEM + i] == 0);
 }
 void counts()
 {
@@ -257,7 +290,7 @@ int main(int argc, char** argv)
     ppu_vm_size = MEM; ppu_hle_init();
     const std::string mode = argv[1];
     if (mode == "layout") layout(); else if (mode == "counts") counts();
-    else if (mode == "debt") debt(); else if (mode == "multi") multi();
+    else if (mode == "debt") debt(); else if (mode == "multi") multi(); else if (mode == "estimate") estimate();
     else if (mode == "fiber") fiber(); else if (mode == "fullvm") fullvm();
     else stopped(mode);
     std::printf("%s %s\n", failures ? "FAIL" : "PASS", argv[1]);

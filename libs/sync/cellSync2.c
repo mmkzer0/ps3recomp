@@ -378,6 +378,22 @@ s32 _cellSync2SemaphoreAttributeInitialize(u32 attr, u32 sdkVersion)
     return CELL_OK;
 }
 
+s32 cellSync2SemaphoreEstimateBufferSize(u32 attr, u32 bufferSize)
+{
+    /* fw libsync2 0x02004B94: the shared attribute validator (0x02004B38: NULL, SDK window,
+     * maxWaiters in [1,0x8000]) runs before the output pointer is tested. One waiter needs no
+     * external buffer, which is why Initialize rejects one (0x02005680). */
+    if (!attr) return CELL_SYNC2_ERROR_NULL_POINTER;
+    sem_range(__func__, "attr", attr, 8);
+    const u32 sdk = sem_rd32(attr);
+    const u16 max = sem_rd16(attr + 6);
+    if (sdk - 0x270000u > 0xC0000u || max == 0 || max > 0x8000) return CELL_SYNC2_ERROR_INVAL;
+    if (!bufferSize) return CELL_SYNC2_ERROR_NULL_POINTER;
+    sem_range(__func__, "bufferSize", bufferSize, 4);
+    vm_write32(bufferSize, max < 2 ? 0 : 8u * (max + 1u));
+    return CELL_OK;
+}
+
 s32 cellSync2SemaphoreInitialize(u32 sem, u32 workBuffer, s32 initialValue, u32 attr)
 {
     /* fw libsync2 0x020055D4, 0x0200564C */
@@ -417,7 +433,9 @@ s32 cellSync2SemaphoreInitialize(u32 sem, u32 workBuffer, s32 initialValue, u32 
     vm_write32(sem + 0x18, sdk);
     vm_write16(sem + 0x20, mask);
     vm_write16(sem + 0x22, max);
-    memcpy(vm_base + sem + 0x28, vm_base + attr + 8, 31);
+    /* fw libsync2 copies the name with strncpy(sem + 0x28, attr->name, 31): bytes after the
+     * terminator are zero, whatever the attribute block held there. */
+    strncpy((char*)vm_base + sem + 0x28, (const char*)vm_base + attr + 8, 31);
     SEM_UNLOCK();
     return CELL_OK;
 }

@@ -97,6 +97,7 @@ typedef struct CellSync2SemaphoreAttribute {
 } CellSync2SemaphoreAttribute;
 
 s32 _cellSync2SemaphoreAttributeInitialize(u32 attr, u32 sdkVersion);
+s32 cellSync2SemaphoreEstimateBufferSize(u32 attr, u32 bufferSize);
 s32 cellSync2SemaphoreInitialize(u32 sem, u32 workBuffer, s32 initialValue, u32 attr);
 s32 cellSync2SemaphoreGetCount(u32 sem, u32 countOut);
 s32 cellSync2SemaphoreAcquire(u32 sem, u32 count, u32 threadConfig);
