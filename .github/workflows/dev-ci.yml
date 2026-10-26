@@ -97,9 +97,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ninja-build libsdl2-dev clang lld g++-14 \
-            glslang-dev glslang-tools spirv-tools libspirv-cross-c-shared-dev
+            glslang-dev glslang-tools spirv-tools libspirv-cross-c-shared-dev \
+            gcc-powerpc64-linux-gnu g++-powerpc64-linux-gnu binutils-powerpc64-linux-gnu
       - name: Configure
-        run: CC=${{ matrix.cc }} CXX=${{ matrix.cxx }} cmake --preset dev
+        # The synthetic synlib variants require the PowerPC64 cross toolchain
+        # installed above: a missing one is a configure error here, never a
+        # silently skipped suite.
+        run: CC=${{ matrix.cc }} CXX=${{ matrix.cxx }} cmake --preset dev -DPS3RECOMP_DIFF_SYNTHETIC_REQUIRED=ON
       - name: Build
         run: cmake --build --preset dev
       - name: Test
