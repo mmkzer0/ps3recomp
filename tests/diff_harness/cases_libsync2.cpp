@@ -3,7 +3,7 @@
  * the RPCS3 ones with guest pointers as u32:
  *
  *   s32 _cellSync2SemaphoreAttributeInitialize(u32 attr, u32 sdkVersion)
- *   s32 cellSync2SemaphoreEstimateBufferSize(u32 attr, u32 bufferSizeOut)   (no HLE yet)
+ *   s32 cellSync2SemaphoreEstimateBufferSize(u32 attr, u32 bufferSizeOut)
  *   s32 cellSync2SemaphoreInitialize(u32 sem, u32 workBuffer, s32 initialValue, u32 attr)
  *
  * Attribute block layout (the HLE's, cellSync2.c:368): +0 sdk, +4 threadTypes
@@ -40,7 +40,8 @@ void add(const char* id, const char* fn, uint32_t nid, std::initializer_list<uin
 void attr_init(const char* id, uint64_t attr, uint64_t sdk, Expect e = Expect::Match, const char* note = "")
 { add(id, "_cellSync2SemaphoreAttributeInitialize", NID_ATTR, {attr, sdk}, nullptr, e, note); }
 void estimate(const char* id, uint64_t attr, uint64_t out, std::function<void()> s)
-{ add(id, "cellSync2SemaphoreEstimateBufferSize", NID_EST, {attr, out}, std::move(s), Expect::NoHle, "HLE does not implement this export"); }
+{ add(id, "cellSync2SemaphoreEstimateBufferSize", NID_EST, {attr, out}, std::move(s), Expect::Match,
+      "the HLE implements the export as of the parity fix; both sides return the buffer size"); }
 void init(const char* id, uint64_t sem, uint64_t buf, int32_t iv, uint64_t attr, std::function<void()> s,
           Expect e = Expect::Match, const char* note = "")
 { add(id, "cellSync2SemaphoreInitialize", NID_INIT, {sem, buf, (uint64_t)(uint32_t)iv, attr}, std::move(s), e, note); }
@@ -128,21 +129,19 @@ void register_cases(std::vector<Case>& out)
     init("init37_iv_neg_800001",    SEM,     0,  -0x800001, ATTR, valid(0x270000, 1, 1));
     init("init38_garbage_attr",     SEM,     0,   0, ATTR, nullptr);
     init("init39_name_tail_garbage", SEM,    0,   0, ATTR, [] { put_attr(ATTR, 0x270000, 0x010F, 1, true); },
-         Expect::Diverge, "S12: HLE memcpy()s 31 name bytes, the firmware strncpy()s (zero-pads after the NUL)");
+         Expect::Match, "S12: the HLE copies the name with strncpy like the firmware as of the parity fix");
     init("init40_sdk_bad_and_max_0", SEM,    0,   0, ATTR, valid(0x26FFFF, 0, 0));
     init("init41_order_max1buf_vs_mask", SEM, BUF, 0, ATTR, valid(0x270000, 0x0010, 1));
     init("init42_order_nobuf_vs_mask",  SEM,  0,  0, ATTR, valid(0x270000, 0x0010, 4));
     init("init43_attr_oob",         SEM,     0,   0, BAD_EA, nullptr, Expect::Match,
          "stage 1 reported a divergence (HLE named stop vs host SIGSEGV); fault normalisation pairs them as guest-fault");
 
-    /* Why a non-obvious verdict is expected: init39 must diverge on the copied
-     * tail bytes, and attr10/init43 must pair a fault (same step, overlapping
-     * spans), not match for some other reason. */
+    /* Why a non-obvious verdict is expected: the estimate cases and init39 must
+     * now match through the return/memory path, and attr10/init43 must pair a
+     * fault (same step, overlapping spans), not match for some other reason. */
     for (auto& c : out) {
-        if (c.id == "init39_name_tail_garbage") {
-            c.expect_cause = "memory"; c.expect_step = 0;
-            c.expect_range_lo = SEM + 0x28; c.expect_range_hi = SEM + 0x47;
-        }
+        if (c.id.rfind("est", 0) == 0) { c.expect_cause = "return"; c.expect_step = 0; }
+        if (c.id == "init39_name_tail_garbage") { c.expect_cause = "return"; c.expect_step = 0; }
         if (c.id == "attr10_oob_pointer") { c.expect_cause = "fault"; c.expect_step = 0; }
         if (c.id == "init43_attr_oob") { c.expect_cause = "fault"; c.expect_step = 0; }
     }

@@ -260,11 +260,14 @@ void register_cases(std::vector<Case>& out)
 
     /* ---- JoinFiber without running (F28) ------------------------------------- */
     add("jn01_null", "F28", {init0(), join(0u)});
-    add("jn02_status_null", "F28", seq({create(), join(FIB, 0u)}), Expect::Diverge,
-        "FW: NULL_POINTER for status; HLE accepts NULL (then waits for a fiber that cannot run)", nullptr, 2);
-    add("jn03_fiber_misaligned", "F28", seq({join(FIB + 0x40)}), Expect::Diverge, "FW: ALIGN; HLE has no ALIGN test (unknown fiber -> INVAL)");
-    add("jn04_no_sysinit", "F28", {join(FIB)}, Expect::Diverge, "FW: NOSYSINIT; HLE: INVAL");
-    add("jn05_unknown_fiber_zeroed", "F28", seq({join(FIB)}), Expect::Diverge, "FW: STAT (fiber state word 0); HLE: INVAL");
+    add("jn02_status_null", "F28", seq({create(), join(FIB, 0u)}), Expect::Match,
+        "FW: NULL_POINTER for status; the HLE checks status NULL before waiting as of the parity fix", nullptr, 2);
+    add("jn03_fiber_misaligned", "F28", seq({join(FIB + 0x40)}), Expect::Match,
+        "FW: ALIGN; the HLE checks ALIGN as of the parity fix");
+    add("jn04_no_sysinit", "F28", {join(FIB)}, Expect::Match,
+        "FW: NOSYSINIT; the HLE checks NOSYSINIT as of the parity fix");
+    add("jn05_unknown_fiber_zeroed", "F28", seq({join(FIB)}), Expect::Match,
+        "FW: STAT (fiber state word 0); the HLE reads STAT from the storage bytes as of the parity fix");
     add("jn05b_unknown_fiber_garbage", "F28", seq({join(FIB)}), Expect::Match, "state word is 0xA5A5A5A5: the FW treats it as a live fiber and the HLE as unknown, both end in the same code",
         [] { fill(FIB, 0x380, 0xA5); });
     add("jn06_null_before_sysinit", "F28", {join(0u)});
@@ -300,7 +303,7 @@ void register_cases(std::vector<Case>& out)
     witness_cause("cf27_sched_uninitialised", "return");
     witness_cause("rf04_unknown_sched", "return");
     witness_cause("rf05_empty_scheduler", "abi");
-    witness_cause("jn02_status_null", "status");
+    witness_cause("jn02_status_null", "return");
     witness_cause("jn03_fiber_misaligned", "return");
     witness_cause("jn04_no_sysinit", "return");
     witness_cause("jn05_unknown_fiber_zeroed", "return");
@@ -330,6 +333,7 @@ void register_cases(std::vector<Case>& out)
     witness_step("jn03_fiber_misaligned", 3);
     witness_step("jn04_no_sysinit", 0);
     witness_step("jn05_unknown_fiber_zeroed", 3);
+    witness_step("jn05b_unknown_fiber_garbage", 3);
     witness_step("yl01_no_sysinit", 0);
     witness_step("ex01_no_sysinit", 0);
     /* The lifted RunFibers reaches a zero word (an unknown instruction) at the
