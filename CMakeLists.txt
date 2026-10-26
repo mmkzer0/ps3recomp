@@ -852,6 +852,20 @@ if(PS3RECOMP_BUILD_TESTS)
             libs/misc/tests/test_avconf_gamma.c)
         ps3recomp_add_hle_check_test(hle_game_paths
             libs/system/tests/test_game_paths.c)
+        # cellGame host paths: the refused calls end in named stops, so this
+        # fixture links the real stop implementation and runs them in a child.
+        add_executable(test_game_host_paths
+            libs/system/tests/test_game_host_paths.c
+            runtime/diag/stop.cpp)
+        target_include_directories(test_game_host_paths PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/system"
+            "${CMAKE_CURRENT_SOURCE_DIR}/runtime"
+            "${CMAKE_CURRENT_SOURCE_DIR}/runtime/ppu")
+        target_compile_definitions(test_game_host_paths PRIVATE _GNU_SOURCE)
+        set_target_properties(test_game_host_paths PROPERTIES LINKER_LANGUAGE CXX)
+        add_test(NAME game_host_paths COMMAND test_game_host_paths)
+        set_tests_properties(game_host_paths PROPERTIES LABELS "hle;t0" TIMEOUT 60)
         ps3recomp_add_hle_check_test(hle_savedata_io
             libs/system/tests/test_savedata_io.c)
         # cellSaveData turns the funcFile callback's fileBuf EA into a host

@@ -11,6 +11,13 @@ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
 void spu_coh_notify_write(uint32_t a) { (void)a; }
 void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
+/* No stop is on this fixture's path (test_game_host_paths.c covers them). */
+void ps3_stop(ps3_stop_kind k, const char* w, const char* r, const ps3_stop_field* f,
+              size_t n, const ps3_stop_site* s)
+{ (void)k; (void)w; (void)r; (void)f; (void)n; (void)s; abort(); }
+void ps3_stop_guest_range(const char* f, const char* a, uint64_t ea, uint64_t size,
+                          uint64_t limit)
+{ (void)f; (void)a; (void)ea; (void)size; (void)limit; abort(); }
 
 ps3_guest_caller_fn g_ps3_guest_caller;
 const char* ppu_vfs_root = ".";

@@ -125,7 +125,9 @@ extern "C" {
     /* A SPURS task or job whose SPU program the runtime cannot run (no lifted entry). */ \
     X(SPURS_DISPATCH_MISS,      "spurs-dispatch-miss")                         \
     /* H1b: an RSX capture or replay that cannot be trusted (a blob, a span, an output). */ \
-    X(RSX_CAPTURE,              "rsx-capture")
+    X(RSX_CAPTURE,              "rsx-capture")                                 \
+    /* A host path an HLE handler builds does not fit its buffer; a cut path names another directory. */ \
+    X(HOST_PATH_LIMIT,          "host-path-limit")
 
 /* A fixed underlying type in C++ makes a kind outside the list (a caller's bug,
  * which the stop still reports as "invalid-kind") a well-defined value rather
