@@ -91,7 +91,8 @@ function(dh_common tgt)
     target_include_directories(${tgt} PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}"
         "${PROJECT_SOURCE_DIR}/runtime" "${PROJECT_SOURCE_DIR}/runtime/ppu"
-        "${PROJECT_SOURCE_DIR}/libs" "${PROJECT_SOURCE_DIR}/include" "${PROJECT_SOURCE_DIR}"
+        "${PROJECT_SOURCE_DIR}/libs" "${PROJECT_SOURCE_DIR}/libs/spurs"
+        "${PROJECT_SOURCE_DIR}/include" "${PROJECT_SOURCE_DIR}"
         "${PROJECT_SOURCE_DIR}/tests/spurs_jq2")   # its ppu_recomp.h shim: ppu_hle.cpp wants the lifter's header for ppu_context
     target_compile_definitions(${tgt} PRIVATE
         PS3RECOMP_TOOLKIT_SHA="${DH_TOOLKIT_SHA}"
@@ -180,6 +181,9 @@ endfunction()
 
 dh_add_module(libsync2 fwsync2_ fwsync2 cases_libsync2.cpp cellSync2 sysPrxForUser)
 dh_add_module(libfiber fwfiber_ fwfiber cases_libfiber.cpp cellFiber cellSync2 sysPrxForUser)
+# JQ2: the JQ HLE plus the HLEs its lifted code forwards through its imports
+# (cellFiberPpuSelf, _sys_memset/_sys_strncmp/_sys_printf, sys_process_get_paramsfo).
+dh_add_module(libspurs_jq fwjq_ fwjq cases_libspurs_jq.cpp cellSpursJq cellFiber sysPrxForUser)
 endif()
 
 # The path-hygiene/skip contract of the tools needs no toolchain.
