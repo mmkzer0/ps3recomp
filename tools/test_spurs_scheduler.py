@@ -19,7 +19,8 @@ with tempfile.TemporaryDirectory(prefix='spurs-scheduler-') as tmp:
     # the fixture must link the typed configuration and the named-stop runtime.
     c_sources=[r/'tests/test_spurs_scheduler.c',
                *[r/'runtime/spu'/f'{u}.c' for u in units],
-               r/'runtime/memory/reservation.c', r/'runtime/platform/win32_compat.c']
+               r/'runtime/memory/reservation.c', r/'runtime/memory/label_window.c',
+               r/'runtime/platform/win32_compat.c']
     objects=[]
     for index,src in enumerate(c_sources):
         obj=tmp/f'{index}.o'

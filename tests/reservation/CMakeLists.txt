@@ -31,6 +31,7 @@ set(RESV_SPU_DIR "${PROJECT_SOURCE_DIR}/runtime/spu")
 add_executable(test_reservation
     test_reservation.c
     "${PROJECT_SOURCE_DIR}/runtime/memory/reservation.c"
+    "${PROJECT_SOURCE_DIR}/runtime/memory/label_window.c"
     "${RESV_SPU_DIR}/spu_channels.c" "${RESV_SPU_DIR}/spu_drain.c" "${RESV_SPU_DIR}/spu_lockstep.c"
     "${RESV_SPU_DIR}/spu_coherency.c" "${RESV_SPU_DIR}/spu_workload.c" "${RESV_SPU_DIR}/spurs_policy.c"
     "${RESV_SPU_DIR}/spurs_job.c" "${RESV_SPU_DIR}/spu_tsp_weak.c" "${RESV_SPU_DIR}/spu_vm_pagemap.c"

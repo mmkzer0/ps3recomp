@@ -52,6 +52,7 @@ for src in spu_channels.c spu_drain.c spu_lockstep.c spu_coherency.c spu_interp.
     "$GCC" "${RTCFLAGS[@]}" "${extra[@]}" -c "$RUNTIME_SPU/$src" -o "$RT_DIR/${src%.c}.o"
 done
 "$GCC" "${RTCFLAGS[@]}" -c "$REPO/runtime/memory/reservation.c" -o "$RT_DIR/reservation.o"
+"$GCC" "${RTCFLAGS[@]}" -c "$REPO/runtime/memory/label_window.c" -o "$RT_DIR/label_window.o"
 "$GCC" "${RTCFLAGS[@]}" -c "$REPO/runtime/platform/win32_compat.c" -o "$RT_DIR/win32_compat.o"
 "$GCC" "${RTCFLAGS[@]}" -c "$HERE/test_runtime_stubs.c" -o "$RT_DIR/test_runtime_stubs.o"
 "$CXX" -std=c++20 -O2 -I "$REPO/include" -c "$REPO/runtime/config/config.cpp" -o "$RT_DIR/config.o"

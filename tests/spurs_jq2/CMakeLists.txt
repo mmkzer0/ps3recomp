@@ -44,6 +44,7 @@ add_executable(test_jq2_port
     jq2_port_harness.c
     "${PROJECT_SOURCE_DIR}/libs/spurs/jq2/port.cpp"
     "${PROJECT_SOURCE_DIR}/runtime/memory/reservation.c"
+    "${PROJECT_SOURCE_DIR}/runtime/memory/label_window.c"
     "${JQ2_SPU_DIR}/spu_channels.c" "${JQ2_SPU_DIR}/spu_drain.c" "${JQ2_SPU_DIR}/spu_lockstep.c"
     "${JQ2_SPU_DIR}/spu_coherency.c" "${JQ2_SPU_DIR}/spu_workload.c" "${JQ2_SPU_DIR}/spurs_policy.c"
     "${JQ2_SPU_DIR}/spurs_job.c" "${JQ2_SPU_DIR}/spu_tsp_weak.c" "${JQ2_SPU_DIR}/spu_vm_pagemap.c"

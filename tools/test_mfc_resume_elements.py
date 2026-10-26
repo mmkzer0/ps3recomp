@@ -16,7 +16,7 @@ class ResumeElementsTests(unittest.TestCase):
         if not cc:raise unittest.SkipTest('C compiler required')
         cls.tmp=tempfile.TemporaryDirectory();cls.addClassCleanup(cls.tmp.cleanup)
         cls.exe=Path(cls.tmp.name)/('resume-elements.exe' if os.name=='nt' else 'resume-elements')
-        cmd=[cc,'-std=gnu17','-O2','-I',str(ROOT/'include'),'-I',str(ROOT/'runtime/spu'),'-I',str(ROOT/'runtime/platform'),str(ROOT/'runtime/spu/tests/test_mfc_resume_elements.c'),str(ROOT/'runtime/platform/win32_compat.c'),'-o',str(cls.exe)]
+        cmd=[cc,'-std=gnu17','-O2','-I',str(ROOT/'include'),'-I',str(ROOT/'runtime/spu'),'-I',str(ROOT/'runtime/platform'),str(ROOT/'runtime/spu/tests/test_mfc_resume_elements.c'),str(ROOT/'runtime/memory/label_window.c'),str(ROOT/'runtime/platform/win32_compat.c'),'-o',str(cls.exe)]
         if os.name!='nt':cmd.insert(1,'-pthread')
         if os.environ.get('MFC_TEST_SANITIZE'):cmd[1:1]=['-fsanitize=undefined','-fno-sanitize-recover=all']
         subprocess.run(cmd,check=True,capture_output=True,text=True)

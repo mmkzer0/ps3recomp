@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include "../../include/ps3emu/stop.h"
 #include "../../include/ps3emu/config.h"
+#include "../memory/label_window.h"
 #include "../platform/win32_compat.h"
 
 #ifdef __cplusplus
@@ -479,6 +480,19 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                 fputc((q[i] >= 32 && q[i] < 127) ? q[i] : 46, stderr);
             fputc(10, stderr); fflush(stderr); } }
         mfc_dma_error(spu, cmd, lsa, ea, size, tag, "ea-uncommitted");
+    }
+
+    /* An SPU store into the window a device model registered (the RSX label window) cannot be ordered the
+     * way a PPU store is. The PUT may be the value an RSX ACQUIRE is waiting for: it has to land before the
+     * walker reads the ACQUIRE, and waiting for a walker pass would deadlock that producer. Or it may
+     * overwrite a label the walker has not read yet: it has to land after a pass, as a PPU store does. The
+     * runtime cannot tell the two apart, so it counts the PUT and stops by name (docs/STOPS.md,
+     * spu-label-window) instead of guessing. ps3_label_window_spu_puts() exposes the count to diagnostics. */
+    if (mfc_is_put(cmd) && ps3_label_window_maybe((uint32_t)ea, size) &&
+        ps3_label_window_overlaps(ea, size)) {
+        ps3_stop_site site = { (uint32_t)spu->pc & SPU_LS_MASK, 0, spu->spu_id };
+        ps3_stop_spu_label_window("mfc_do_transfer", cmd, ea, size, tag,
+                                  ps3_label_window_note_spu_put(), &site);
     }
 
     uint8_t* ls_ptr = &spu->ls[lsa];

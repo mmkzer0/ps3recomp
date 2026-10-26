@@ -318,6 +318,32 @@ void ps3_stop_gcm_wait_timeout(const char* func, const char* what, uint32_t offs
              f, sizeof f / sizeof f[0], nullptr);
 }
 
+void ps3_stop_spu_label_window(const char* func, uint32_t cmd, uint64_t ea,
+                               uint32_t size, uint32_t tag, uint64_t count,
+                               const ps3_stop_site* site)
+{
+    char cmd_s[8], ea_s[24], size_s[16], tag_s[8], count_s[24];
+    std::snprintf(cmd_s, sizeof cmd_s, "0x%02X", (unsigned)(cmd & 0xFFu));
+    std::snprintf(ea_s, sizeof ea_s, "0x%llX", (unsigned long long)ea);
+    std::snprintf(size_s, sizeof size_s, "%u", (unsigned)size);
+    std::snprintf(tag_s, sizeof tag_s, "%u", (unsigned)tag);
+    std::snprintf(count_s, sizeof count_s, "%llu", (unsigned long long)count);
+    const ps3_stop_field f[] = {
+        {"func", func ? func : "unknown"},
+        {"cmd", cmd_s},
+        {"ea", ea_s},
+        {"size", size_s},
+        {"tag", tag_s},
+        {"count", count_s},
+    };
+    ps3_stop(PS3_STOP_SPU_LABEL_WINDOW,
+             "an SPU MFC PUT/PUTL writes into the guest store window a device model registered",
+             "The runtime cannot tell whether this PUT produces the value an RSX ACQUIRE waits for or "
+             "overwrites a label the walker has not read: order the title's protocol explicitly (a PPU "
+             "store, or a label outside the window) instead of letting the SPU write it.",
+             f, sizeof f / sizeof f[0], site);
+}
+
 void ps3_stop_lifter_abi(uint32_t expected, uint32_t got)
 {
     char exp_s[24], got_s[24];

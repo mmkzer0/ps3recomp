@@ -52,6 +52,7 @@ def main():
         for src, flags, out in (
                 (spu / "tests/test_dma_repeat_main.c", cflags, "test.o"),
                 (spu / "spu_vm_pagemap.c", cflags, "pagemap.o"),
+                (ROOT / "runtime/memory/label_window.c", cflags, "label_window.o"),
                 (ROOT / "runtime/platform/win32_compat.c", cflags, "compat.o")):
             obj = tmp / out
             subprocess.run([cc, *flags, "-c", str(src), "-o", str(obj)], check=True)
@@ -72,7 +73,8 @@ def main():
         # fixture then hits its 3000-repeat bound and exits 3, not 70.
         archive = tmp / "libps3recomp_runtime.a"
         subprocess.run([os.environ.get("AR", "ar"), "rcs", str(archive),
-                        str(tmp / "config.o"), str(tmp / "stop.o")], check=True)
+                        str(tmp / "config.o"), str(tmp / "stop.o"),
+                        str(tmp / "label_window.o")], check=True)
         partial = tmp / "test_dma_repeat_archive"
         subprocess.run([cxx, str(tmp / "test.o"), str(tmp / "pagemap.o"),
                         str(tmp / "compat.o"), str(archive),

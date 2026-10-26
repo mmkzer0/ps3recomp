@@ -22,6 +22,7 @@ KINDS = ["identity-mismatch", "lifter-abi", "config-invalid", "unresolved-nid",
          "sync2-semaphore-unsupported", "fiber-unsupported", "gcm-unmodelled",
          "gcm-wait-timeout", "guest-null-access", "stack-guard-fault",
          "event-delivery-lost", "jq2-unmodelled", "spu-mfc-error",
+         "spu-label-window",
          "hle-commit-failed", "spurs-task-halt", "spurs-dispatch-miss", "rsx-capture"]
 
 

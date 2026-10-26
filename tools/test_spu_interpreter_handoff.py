@@ -12,7 +12,8 @@ root = Path(__file__).resolve().parents[1]
 spu = root / 'runtime/spu'
 sources = ['spu_channels.c', 'spu_drain.c', 'spu_lockstep.c', 'spu_coherency.c',
            'spu_workload.c', 'spurs_policy.c', 'spurs_job.c', 'spu_tsp_weak.c',
-           'spu_vm_pagemap.c', 'spurs_policy_blob_weak.c', 'spu_interp.c', '../memory/reservation.c']
+           'spu_vm_pagemap.c', 'spurs_policy_blob_weak.c', 'spu_interp.c',
+           '../memory/reservation.c', '../memory/label_window.c']
 cflags = ['-std=gnu17', '-O1', '-UNDEBUG',
           '-I' + str(root / 'include'), '-I' + str(spu),
           '-I' + str(root / 'runtime/platform')]

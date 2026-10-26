@@ -36,6 +36,11 @@ void spu_ch_wake(spu_context* c) { (void)c; }
 void ps3_stop(ps3_stop_kind k,const char* what,const char* remedy,const ps3_stop_field* f,size_t n,
               const ps3_stop_site* site)
 { (void)remedy;(void)f;(void)n;(void)site;fprintf(stdout,"FAIL: stop %d: %s\n",(int)k,what);exit(2); }
+/* No window is ever registered here; a PUT into one is a failure of this test. */
+void ps3_stop_spu_label_window(const char* func,uint32_t cmd,uint64_t ea,uint32_t size,
+                               uint32_t tag,uint64_t count,const ps3_stop_site* site)
+{ (void)func;(void)cmd;(void)ea;(void)size;(void)tag;(void)count;(void)site;
+  fprintf(stdout,"FAIL: spu-label-window stop\n");exit(2); }
 
 static void check(int ok,const char* what)
 { if(!ok){fprintf(stdout,"FAIL: %s\n",what);exit(2);} }

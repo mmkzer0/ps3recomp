@@ -13,7 +13,8 @@ spu = root / 'runtime/spu'
 # Real interpreter, channels, MFC engine backing, lock-line and drain code:
 # the hook sites under test must be the production ones.
 sources = ['spu_channels.c', 'spu_interp.c', 'spu_coherency.c', 'spu_lockstep.c',
-           'spu_drain.c', 'spu_vm_pagemap.c', '../memory/reservation.c']
+           'spu_drain.c', 'spu_vm_pagemap.c', '../memory/reservation.c',
+           '../memory/label_window.c']
 cflags = ['-std=gnu17', '-O1', '-UNDEBUG',
           '-I' + str(root / 'include'), '-I' + str(spu),
           '-I' + str(root / 'runtime/platform')]

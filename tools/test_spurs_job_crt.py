@@ -89,6 +89,7 @@ def build(tmp):
                "spu_drain.c", "spu_vm_pagemap.c", "spurs_job.c"]
     c_sources = [spu / "tests/test_spurs_job_crt_main.c", *[spu / s for s in sources],
                  ROOT / "runtime/memory/reservation.c",
+                 ROOT / "runtime/memory/label_window.c",
                  ROOT / "runtime/platform/win32_compat.c"]
     objects = []
     for index, src in enumerate(c_sources):

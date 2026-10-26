@@ -646,6 +646,11 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME spu_mfc_errors
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_mfc_errors.py")
+        # An SPU PUT/PUTL into the registered guest store window (the RSX label
+        # window) is counted and stops by name; a PUT outside it is untouched.
+        add_test(NAME spu_label_window
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_label_window.py")
         # The SPURS job loader: JOBCRT Ver13/Ver14 gate, Ver14 jm interface,
         # kernel view and bss, each byte-checked on synthetic jobs.
         add_test(NAME spurs_job_crt
@@ -655,7 +660,7 @@ if(PS3RECOMP_BUILD_TESTS)
         set_tests_properties(spurs_task_exit_code_initialize spurs_taskset_size spurs_error_codes
             spurs_dispatch_miss spu_taskset_elf_flags PROPERTIES LABELS "spurs;t0")
         set_tests_properties(spu_sdcrz spu_observe spu_dma_repeat spu_mfc_errors
-            spurs_job_crt PROPERTIES LABELS "spu;t0")
+            spu_label_window spurs_job_crt PROPERTIES LABELS "spu;t0")
         # Message passing between a PPU thread and an SPU through the real MFC
         # engine, both directions: acquire before a GET, release after a PUT.
         # The same program runs short here and at 10^8 in the stress tier.

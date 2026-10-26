@@ -110,7 +110,8 @@ def main():
         tmp = Path(tmp)
         binary = tmp / "test_spu_trace_file"
         build(binary, [spu / "tests" / "test_spu_trace_file.c",
-                       spu / "spu_channels.c"])
+                       spu / "spu_channels.c",
+                       root / "runtime/memory/label_window.c"])
         for _ in range(3):
             check_trace_init(binary, tmp)
         # Repeated because the lazy-open election is the property under test.

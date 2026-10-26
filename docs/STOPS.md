@@ -55,6 +55,7 @@ Ids are stable kebab-case; a new gap gets a new kind, never a free-text variant.
 | `dispatch-depth-exceeded` | `ps3_indirect_call` nested deeper than its host safety limit (4000) |
 | `spu-dma-repeat` | an SPU issued identical MFC transfers continuously past `spu.dma_repeat_stop_secs` |
 | `spu-mfc-error` | an SPU issued an MFC transfer the hardware rejects: a size over 16 KiB, a size not a multiple of 16 for a transfer of 16 bytes or more, LSA/EA alignment the MFC does not accept, an LSA range past the 256 KiB local store, an EA range outside committed guest memory (including one that wraps 4 GB), a PUT into the unmapped null page, a storage-control range that is not a whole 128-byte range, or SDCRZ in a tag group with a parked list. The hardware raises an MFC command/alignment error and the SPU does not run on. A zero-byte transfer is not one: RPCS3 executes a command only when its size is non-zero, and the runtime completes it without moving data |
+| `spu-label-window` | an SPU MFC PUT/PUTL whose span overlaps the guest store window a device model registered (the RSX label window). The runtime cannot tell whether the PUT produces the value an RSX ACQUIRE is waiting for (it would have to land before the walker reads the ACQUIRE, and waiting for a pass would deadlock that producer) or overwrites a label the walker has not read yet (it would have to land after a pass), so it counts the PUT and stops rather than guess. Every such PUT is counted, including the one the stop reports (`count`) |
 | `unresolved-guest-callback` | a host-initiated guest callback (`ppu_guest_call` / `ppu_guest_call_ct`) whose OPD or code word is 0 or is not a lifted function, or that cannot be given guest stack space |
 | `hle-unsupported-return` | an HLE handler whose declared return type is a host pointer: there is no guest address for it (classified in `tools/gen_hle_nids.py`, see [HLE_ABI.md](HLE_ABI.md)) |
 | `spu-job-crt-version` | a SPURS job whose CRT marker at LS `0x30` is not `JOBCRT Ver13` or `JOBCRT Ver14` (Ver12, Ver15, garbage): the loader models those two CRTs only |
@@ -97,6 +98,7 @@ Where each is raised, and what it carries beyond `pc lr tid`:
 | `dispatch-depth-exceeded` | `ps3_indirect_call_impl` | `target depth limit caller_lr` |
 | `spu-dma-repeat` | `mfc_submit` (`runtime/spu/spu_dma.h`) | `image ea lsa cmd size count secs`, with `pc` (LS address) and `tid` (SPU id) as the site |
 | `spu-mfc-error` | `mfc_do_transfer` (`runtime/spu/spu_dma.h`), reached from `mfc_submit`, `mfc_run_list` and `mfc_list_stall_ack` | `cmd lsa ea size tag reason` (`reason` is `size`, `alignment`, `ls-overrun`, `ea-uncommitted`, `null-ea` or `sdczr-stalled-tag`); `pc` is the SPU's local-store address and `tid` its SPU id; `lr` is 0, since an SPU has no link register in this model |
+| `spu-label-window` | `ps3_stop_spu_label_window`, from `mfc_do_transfer` (`runtime/spu/spu_dma.h`) after the transfer's own validity checks, before any byte moves | `func cmd ea size tag count`: `cmd` is the transfer command (`0x20` for a PUT and for a PUTL element, whose list bit is stripped by the list runner), `ea` the transfer's effective address (`0x%llX`; the first byte, which is inside the window by at least one byte), `size` its byte count, `tag` its MFC tag, and `count` the per-process number of such PUTs including this one (`ps3_label_window_spu_puts`). `pc` is the SPU's local-store address, `tid` its SPU id, `lr` 0 |
 | `unresolved-guest-callback` | `ppu_guest_call`, `ppu_guest_call_ct` | `origin opd code toc descriptor hint`, or `origin=stack sp limit vm_size hint` when no guest stack space can be given (bad caller r1, VM too small for the host window, all host slots live, a host slot out of room); `pc`/`lr` are 0 (no guest instruction runs) and `tid` is the calling guest thread |
 | `hle-unsupported-return` | `ps3_hle_call` (`runtime/ppu/ppu_hle.cpp`), from the adapter's `ps3_hle_adapt_host_ptr_stop` | `nid name reason` (`reason` is `returns a host pointer, not a guest EA`); `pc`/`lr` are the caller's return address (the import stub's caller) and `tid` is the calling guest thread |
 | `spu-job-crt-version` | `spu_run_spurs_job` (`runtime/spu/spurs_job.c`) | `job image marker bytes` (`marker` is the 12 bytes at LS 0x30 with every non-printable as `?`, `bytes` the same 12 as hex) |
@@ -149,6 +151,17 @@ an `MFC_WrListStallAck` naming a tag with no parked list is ignored (RPCS3 acts
 on the acknowledgement only when the tag's stall-mask bit is set). Resuming a
 parked list whose remaining elements are malformed is a real transfer and stops
 like any other.
+
+`spu-label-window` is the SPU counterpart of the PPU store hook
+(`runtime/memory/label_window.{h,c}`): a PUT/PUTL into the window a device model
+registered (the RSX label window) is a store the runtime cannot order. Waiting
+for a walker pass, as a PPU store does, would deadlock a PUT that is the value
+an RSX ACQUIRE is waiting for (the walker is inside the pass that waits on it,
+so no new pass can start); landing it unordered is the #34 race. The runtime
+counts it and stops, naming the EA, size, command, tag, the SPU's pc/id and the
+per-process count, so a title whose protocol writes a label from an SPU can be
+recognised and fixed. A PUT outside the window is untouched and costs one
+window read per transfer.
 
 `unresolved-guest-callback` is the host-initiated direction: an HLE library
 calls `ppu_guest_call` (an OPD) or `ppu_guest_call_ct` (a captured code/TOC) to

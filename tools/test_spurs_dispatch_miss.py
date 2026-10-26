@@ -75,7 +75,8 @@ def build(tmp):
     c_sources = [ROOT / "tests/test_spurs_dispatch_miss.c",
                  *[ROOT / "runtime/spu" / f"{u}.c" for u in units],
                  ROOT / "libs/spurs/spurs_taskset.c",
-                 ROOT / "runtime/memory/reservation.c", ROOT / "runtime/platform/win32_compat.c"]
+                 ROOT / "runtime/memory/reservation.c", ROOT / "runtime/memory/label_window.c",
+                 ROOT / "runtime/platform/win32_compat.c"]
     objects = []
     for index, src in enumerate(c_sources):
         obj = tmp / f"{index}.o"

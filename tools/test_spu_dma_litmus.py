@@ -45,6 +45,7 @@ def main():
         objects = []
         for src, out in ((spu / "tests/test_dma_litmus_main.c", "test.o"),
                          (spu / "spu_vm_pagemap.c", "pagemap.o"),
+                         (ROOT / "runtime/memory/label_window.c", "label_window.o"),
                          (ROOT / "runtime/platform/win32_compat.c", "compat.o")):
             obj = tmp / out
             subprocess.run([cc, *cflags, "-c", str(src), "-o", str(obj)], check=True)
