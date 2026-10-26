@@ -14,6 +14,7 @@
 #include "../../runtime/platform/win32_compat.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 (translate + byte-swap, OOB-safe) */
 #include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
+#include "../../runtime/memory/label_window.h"  /* the store window, shared with the SPU MFC path */
 #include "../../runtime/spu/spu_coherency.h" /* the blit row copy's reservation bookkeeping */
 #include "rsx_commands.h"                    /* rsx_state, rsx_process_command_buffer */
 #include "../../include/ps3emu/guest_call.h" /* g_ps3_guest_caller for direct handler dispatch */
@@ -2256,34 +2257,23 @@ static void gcm_rsx_process_fifo_unlocked(void);
  *
  * runtime/ppu/ppu_loader.cpp (compiled per game, not part of the runtime library) calls the hook from every
  * form of guest store (vm_write8..64, the store-conditionals, and the lifter's PPU_STORE_HOOK; see docs/RUNTIME.md,
- * "Guest Store Hook") and defines ppu_set_store_hook; the first pass registers the label window. The one HLE
- * path that stores a label on a guest thread, cellGcmSetFlipCommandWithWaitLabel, calls it itself. A link without the
- * loader (a host, a fixture) gets the default below, which registers nothing: there is no guest code to
- * order. */
-#if defined(_MSC_VER)
-#define GCM_TLS __declspec(thread)
-void ppu_set_store_hook(u32 lo, u32 len, void (*fn)(u32 ea, u32 value));
-void ppu_set_store_hook_default(u32 lo, u32 len, void (*fn)(u32 ea, u32 value)) { (void)lo; (void)len; (void)fn; }
-#pragma comment(linker, "/alternatename:ppu_set_store_hook=ppu_set_store_hook_default")
-#else
-#define GCM_TLS _Thread_local
-__attribute__((weak)) void ppu_set_store_hook(u32 lo, u32 len, void (*fn)(u32 ea, u32 value))
-{ (void)lo; (void)len; (void)fn; }
-#endif
-
-static atomic_ullong s_pass_begin, s_pass_end;   /* walker passes started / finished; bumped under s_gcm_fifo_lock */
-static GCM_TLS int   t_gcm_walker;               /* this thread has run a pass */
+ * "Guest Store Hook"). The window, its hook and the pass counters live in the runtime library
+ * (runtime/memory/label_window.{h,c}) so that the SPU MFC path reaches the same state: an SPU PUT/PUTL into
+ * the window is a store this runtime cannot order safely (it may be the value an ACQUIRE is waiting for),
+ * and it stops by name instead (docs/STOPS.md, spu-label-window). The first pass registers the label window.
+ * The one HLE path that stores a label on a guest thread, cellGcmSetFlipCommandWithWaitLabel, calls it itself.
+ */
 
 static void gcm_guest_label_store(u32 ea, u32 value)
 {
     extern unsigned long long ps3_ms_now(void);
-    if (t_gcm_walker) return;
+    if (ps3_label_window_on_walker()) return;
     if (vm_read32(GCM_CONTROL_GUEST_ADDR + 0) == vm_read32(GCM_CONTROL_GUEST_ADDR + 4)) return;
     /* The next pass to begin: it takes the lock after this load, so it reads a `put` this thread has published. */
-    const unsigned long long target = atomic_load(&s_pass_begin) + 1u;
+    const unsigned long long target = ps3_label_window_next_pass();
     const unsigned long long t0 = ps3_ms_now();
     /* Yield first (the walker is normally a pass away), then sleep; bounded like the segment-switch wait below. */
-    for (unsigned spin = 0; atomic_load(&s_pass_end) < target; spin++) {
+    for (unsigned spin = 0; !ps3_label_window_pass_done(target); spin++) {
         const unsigned long long waited = ps3_ms_now() - t0;
         if (waited >= ps3_cfg_gcm_wait_timeout_ms())
             ps3_stop_gcm_wait_timeout("cellGcm_label_store", "rsx-walker-pass", ea - GCM_LABEL_GUEST_BASE, value,
@@ -2385,12 +2375,11 @@ static void gcm_method_stats_report(void)
 
 void cellGcm_rsx_process_fifo(void)
 {
-    t_gcm_walker = 1;
     const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
     AcquireSRWLockExclusive(&s_gcm_fifo_lock);
-    atomic_fetch_add(&s_pass_begin, 1);
+    ps3_label_window_pass_begin();
     gcm_rsx_process_fifo_unlocked();
-    atomic_fetch_add(&s_pass_end, 1);
+    ps3_label_window_pass_end();
     ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
     gcm_method_stats_report();
     if (ft_t0) {

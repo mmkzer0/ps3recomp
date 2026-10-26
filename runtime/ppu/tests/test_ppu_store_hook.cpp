@@ -1,4 +1,4 @@
-// The store hook of ppu_loader.cpp (ppu_set_store_hook).
+// The store hook of ppu_loader.cpp (ppu_set_store_hook, runtime/memory/label_window.{h,c}).
 //
 // A device model registers a window of guest memory; a guest store that overlaps it runs the hook first, on
 // the storing thread, with the first window address the store covers, while the old bytes are still in

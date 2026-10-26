@@ -18,6 +18,7 @@ with tempfile.TemporaryDirectory(prefix='gcm-get-on-jump-') as tmp:
                     '-ffunction-sections', '-fdata-sections',
                     '-I' + str(root / 'include'), '-I' + str(root / 'libs/video'),
                     str(root / 'libs/video/tests/test_gcm_get_on_jump.c'),
+                    str(root / 'runtime/memory/label_window.c'),
                     str(root / 'libs/video/gcm_default_state.c'), *linker,
                     '-o', str(binary)], check=True)
     result = subprocess.run([str(binary)], timeout=30, capture_output=True, text=True)

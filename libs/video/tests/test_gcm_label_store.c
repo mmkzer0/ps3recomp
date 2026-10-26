@@ -10,7 +10,8 @@
  *               the walker looks, the label holds N+1, and the walker is held at ACQUIRE(N) for ever. This is
  *               the failure, reproduced without a loaded host.
  *   ordered     the PPU's store goes through the hook the runtime registered (ppu_set_store_hook, which the
- *               loader's vm_write32 calls before the store lands): it waits for the late walker, which
+ *               loader's vm_write32 reaches through ps3_label_window_store before the store lands): it waits
+ *               for the late walker, which
  *               passes ACQUIRE(N) against the old value; then the label becomes N+1, the next segment's
  *               ACQUIRE(N+1) passes too, and nothing stopped. Also: with `get` at `put` the store does not
  *               wait (no walker needed), and a walker thread's own store never waits.
@@ -20,7 +21,7 @@
  * no-walker must exit 70 with the stop line.
  *
  * cc -std=gnu17 -I include -I libs/video libs/video/tests/test_gcm_label_store.c
- *   libs/video/tests/gcm_store_hook_capture.c libs/video/gcm_default_state.c -ffunction-sections
+ *   runtime/memory/label_window.c libs/video/gcm_default_state.c -ffunction-sections
  *   -fdata-sections -Wl,--gc-sections -pthread -o /tmp/test_gcm_label_store
  *   (clang on macOS: -Wl,-dead_strip)   (tools/test_gcm_label_store.py)
  */
@@ -95,14 +96,12 @@ PS3_NORETURN void ps3_stop_guest_range(const char* func, const char* arg, uint64
     exit(70);
 }
 
-/* What ppu_loader.cpp's vm_write32 does for a guest store: the registered hook first, then the store. The hook
- * is the one the runtime registered with ppu_set_store_hook, captured by gcm_store_hook_capture.c (which
- * overrides cellGcmSys.c's default setter). */
-extern void (*g_hook)(u32 ea, u32 value);
-extern u32 g_hook_lo, g_hook_len;
+/* What ppu_loader.cpp's vm_write32 does for a guest store: the registered hook first, then the store. The
+ * window and hook are the runtime library's (runtime/memory/label_window.c), registered by the first walker
+ * pass through ppu_set_store_hook; ps3_label_window_store is the same out-of-line call the loader makes. */
 static void guest_store32(u32 ea, u32 v)
 {
-    if (g_hook && ea - g_hook_lo < g_hook_len) g_hook(ea, v);
+    ps3_label_window_store(ea, 4, v);
     vm_write32(ea, v);
 }
 
@@ -222,7 +221,8 @@ int main(int argc, char** argv)
     vm_write32(g_ctrl + 4, CMD0);
     vm_write32(g_ctrl + 0, CMD0);
     cellGcm_rsx_process_fifo();                     /* the first pass registers the store hook; put == get */
-    check(g_hook != NULL && g_hook_lo == GCM_LABEL_GUEST_BASE && g_hook_len == CELL_GCM_MAX_LABEL_COUNT * GCM_LABEL_STRIDE,
+    check((uint32_t)ppu_store_window == GCM_LABEL_GUEST_BASE &&
+          (ppu_store_window >> 32) == CELL_GCM_MAX_LABEL_COUNT * GCM_LABEL_STRIDE,
           "the first pass registered the store hook for the 256-label window");
 
     pthread_t ppu;

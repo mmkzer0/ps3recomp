@@ -19,6 +19,7 @@ with tempfile.TemporaryDirectory(prefix='gcm-get-on-release-') as tmp:
                     '-ffunction-sections', '-fdata-sections',
                     '-I' + str(root / 'include'), '-I' + str(root / 'libs/video'),
                     str(root / 'libs/video/tests/test_gcm_get_on_release.c'),
+                    str(root / 'runtime/memory/label_window.c'),
                     str(root / 'libs/video/gcm_default_state.c'), *linker,
                     '-o', str(binary)], check=True)
     base = {k: v for k, v in os.environ.items() if k != 'GCM_GET_EQ_PUT'}

@@ -130,6 +130,7 @@ def lifter_abi_sources() -> list:
 # as C and handed over as an object.
 LOADER_SUPPORT_C_SOURCES = [
     "runtime/memory/reservation.c",
+    "runtime/memory/label_window.c",         # ppu_store_window / ppu_set_store_hook (moved out of the loader)
     "runtime/syscalls/sdk_version_weak.c",   # g_ps3_sdk_version, which ppu_load_elf sets from PROC_PARAM
 ]
 

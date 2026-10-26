@@ -194,7 +194,7 @@ static inline void vm_raw_st16(uint64_t ea, const void* src) {
     uint64_t lo, hi; memcpy(&lo, src, 8); memcpy(&hi, (const uint8_t*)src + 8, 8);
     VM_RAW_ST(uint64_t, ea, lo); VM_RAW_ST(uint64_t, ea + 8, hi); }
 extern int      vm_inline_ok;
-/* The store hook (runtime/ppu/ppu_loader.cpp, ppu_set_store_hook). A device model registers one window of
+/* The store hook (runtime/memory/label_window.{h,c}, ppu_set_store_hook). A device model registers one window of
  * guest memory, and a guest store that overlaps it has to run the model's hook first (the RSX's semaphore
  * labels: a store must land after the walker has read what the title published before it). The vm_write*
  * family does that itself; the forms below store through vm_base, so they ask first. n > 0 bytes at ea:

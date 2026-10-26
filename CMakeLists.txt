@@ -1051,6 +1051,7 @@ if(UNIX)
         libs/video/tests/test_rsx_capture_walker.c
         libs/video/rsx_capture.cpp
         libs/video/gcm_default_state.c
+        runtime/memory/label_window.c
         runtime/diag/stop.cpp
         runtime/diag/sha256.cpp)
     add_executable(test_rsx_capture_engine
@@ -1090,6 +1091,7 @@ if(UNIX)
         libs/video/tests/test_gcm_nv0039.c
         libs/video/rsx_capture.cpp
         libs/video/gcm_default_state.c
+        runtime/memory/label_window.c
         runtime/diag/stop.cpp
         runtime/diag/sha256.cpp)
     target_include_directories(test_gcm_nv0039 PRIVATE ${RSX_CAPTURE_FIXTURE_INCLUDES})

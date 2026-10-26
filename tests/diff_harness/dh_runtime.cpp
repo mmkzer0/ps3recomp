@@ -49,10 +49,10 @@ uint64_t ppu_guest_call(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64
 void vm_write64(uint64_t ea, uint64_t v) { v = __builtin_bswap64(v); memcpy(vm_base + (uint32_t)ea, &v, 8); }
 
 /* The lift's store hook (tools/ppu_lifter.py PPU_STORE_HOOK) is linked out of
- * ppu_loader.cpp, which a host fixture does not build. No RSX label window
- * exists here, so the window stays empty and the hook is never reached. */
+ * ppu_loader.cpp, which a host fixture does not build. The window itself is
+ * defined by the runtime library (runtime/memory/label_window.c); no RSX label
+ * window exists here, so the window stays empty and the hook is never reached. */
 extern "C" {
-uint64_t ppu_store_window = 0;
 /* cellGcmSys.c defines this too; weak keeps the link valid whichever member
  * the archive pulls (the fixture never injects code through it). */
 __attribute__((weak)) uint32_t ppu_hle_inject_base = 0;

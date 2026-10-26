@@ -45,6 +45,7 @@
 #include "ps3emu/milestone.h"   /* ps3_ms / ps3_msf -- boot milestone log */     /* ppu_context, func decls, ppu_recomp_register */
 #include "../syscalls/ppu_thread_id.h"   /* ppu_tid_diag_index: the in-flight tables are indexed by table slot */
 #include "../memory/vm.h"   /* vm_commit -- sys_mmapper_search_and_map maps for real */
+#include "../memory/label_window.h"   /* the store window, shared with the SPU MFC path */
 #include "../platform/win32_compat.h"      /* Win32 types, interlocked ops, Sleep/QPC on POSIX */
 #include "../platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
 #ifndef _WIN32
@@ -1330,29 +1331,16 @@ extern "C" void resv_keep_own(ppu_context* ctx, uint32_t ea);
  * run it per element: the first one's wait is the one that matters, since `get` is at `put` after it.
  * A store that overlaps the window by a byte runs it, once, with the first window address it covers.
  * libs/ HLE code stores through the inline family in ppu_memory.h and never comes here (HLE is not guest
- * code), and neither does an SPU's DMA: see docs/RUNTIME.md.
+ * code). An SPU's MFC PUT/PUTL reaches the same window state from the runtime library and stops by name
+ * (runtime/spu/spu_dma.h, docs/RUNTIME.md).
  *
- * With no window registered the check is one acquire load, one subtract and one compare, inline in the
- * lifted code as well (the window word is the exported ppu_store_window); the slow path is out of line. */
-extern "C" { uint64_t ppu_store_window = 0; }                                      /* lo | len << 32; len 0 = none */
-static std::atomic<void (*)(uint32_t ea, uint32_t value)> g_store_hook_fn{nullptr};
-
-extern "C" void ppu_set_store_hook(uint32_t lo, uint32_t len, void (*fn)(uint32_t ea, uint32_t value))
+ * The window and its hook live in the runtime library (runtime/memory/label_window.{h,c}), so the SPU
+ * runtime links them too. With no window registered the check is one acquire load, one subtract and one
+ * compare, inline in the lifted code as well (the window word is the exported ppu_store_window); only an
+ * overlap enters the library. */
+extern "C" void ppu_store_hook_span(uint64_t ea, uint32_t n)
 {
-    g_store_hook_fn.store(fn, std::memory_order_release);
-    __atomic_store_n(&ppu_store_window, fn ? ((uint64_t)len << 32) | lo : 0, __ATOMIC_RELEASE);
-}
-
-/* Whether the store of [a, a+n) overlaps the window, decided in 64-bit arithmetic. Only reached when the
- * inline check below said "maybe": that one is a single modular compare, so it may say maybe for a store
- * that wraps the 32-bit space or for an empty window, and never says no to one that overlaps. */
-static void ppu_store_hook_slow(uint32_t a, uint32_t n, uint32_t v)
-{
-    const uint64_t w = __atomic_load_n(&ppu_store_window, __ATOMIC_ACQUIRE);
-    const uint64_t lo = (uint32_t)w, len = w >> 32;
-    if (!len || (uint64_t)a + n <= lo || (uint64_t)a >= lo + len) return;
-    const auto fn = g_store_hook_fn.load(std::memory_order_acquire);
-    if (fn) fn(a > lo ? a : (uint32_t)lo, v);
+    ps3_label_window_store((uint32_t)ea, n, 0);
 }
 
 /* n > 0 bytes at a. The test is `(a + n - 1 - lo) mod 2^32 < len + n - 1`, the right side in 64 bits so that
@@ -1362,13 +1350,7 @@ static inline void ppu_store_hook(uint32_t a, uint32_t n, uint32_t v)
 {
     const uint64_t w = __atomic_load_n(&ppu_store_window, __ATOMIC_ACQUIRE);
     if (__builtin_expect((uint64_t)(uint32_t)(a + n - 1u - (uint32_t)w) < (w >> 32) + n - 1u, 0))
-        ppu_store_hook_slow(a, n, v);
-}
-
-/* The lifted code's raw stores have no value to report: the hook gets 0. */
-extern "C" void ppu_store_hook_span(uint64_t ea, uint32_t n)
-{
-    ppu_store_hook_slow((uint32_t)ea, n, 0);
+        ps3_label_window_store(a, n, v);
 }
 
 extern "C" {
