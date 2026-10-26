@@ -84,6 +84,8 @@ int main(void)
     strcpy((char*)vm_base + 0x340, "DATA.BIN");
     memcpy(vm_base + 0x400, payload, sizeof(payload));
     vm_write32(0x108, 0x300); vm_write32(0x200, 4); vm_write32(0x204, 2);
+    /* The file list is written into setBuf->buf (bufSize +32, buf* +36). */
+    vm_write32(0x220, 0x400); vm_write32(0x224, 0x800);
     g_ps3_guest_caller = callback;
     /* RPCS3 savedata_check_args reasons 2 (dirName) and 74 (setBuf); the HLE
      * used to fold a null funcStat into the same PARAM check. */

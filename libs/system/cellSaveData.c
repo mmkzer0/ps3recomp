@@ -312,10 +312,16 @@ static void marshal_statget_init(uint32_t addr, int is_new, const char* dirName,
 
 /* Dispatch funcStat callback via the guest-caller hook.
  * Returns the cbResult.result value the callback wrote, or
- * CELL_SAVEDATA_CBRESULT_ERR_FAILURE if no dispatcher is installed. */
+ * CELL_SAVEDATA_CBRESULT_ERR_FAILURE if no dispatcher is installed.
+ *
+ * statGet.fileList is the guest address of the title's own setBuf->buf, also
+ * when the list is empty (FW 4.93 libsysutil, out/M3/SAVEDATA-FW-RE.md; RPCS3
+ * d00d8023 cellSaveData.cpp:1554 agrees); the firmware does not build the list
+ * in HLE scratch. `list_ea` is that address, and the caller has already proved
+ * [list_ea, list_ea + input->fileListNum * 56) lies in guest memory. */
 static s32 dispatch_func_stat_full(uint32_t func_opd, int is_new, const char* dirName,
                                    uint32_t* userdata_ea, const CellSaveDataStatGet* input,
-                                   CellSaveDataStatSet* output)
+                                   uint32_t list_ea, CellSaveDataStatSet* output)
 {
     if (!g_ps3_guest_caller) return CELL_SAVEDATA_CBRESULT_ERR_FAILURE;
 
@@ -342,12 +348,14 @@ static s32 dispatch_func_stat_full(uint32_t func_opd, int is_new, const char* di
         vm_write32(get_ea + 1624, (u32)input->sysSizeKB);
         vm_write32(get_ea + 1628, input->fileNum);
         vm_write32(get_ea + 1632, input->fileListNum);
-        u32 files = input->fileListNum ? scratch_alloc(input->fileListNum * 56) : 0;
-        if (input->fileListNum && !files) return CELL_SAVEDATA_CBRESULT_ERR_FAILURE;
-        vm_write32(get_ea + 1636, files);
+        vm_write32(get_ea + 1636, list_ea);
+        if (input->fileListNum)
+            vm_commit_or_stop("cellSaveData", "setBuf->buf", list_ea,
+                              (u64)input->fileListNum * 56);
         for (u32 i = 0; i < input->fileListNum; i++) {
             const CellSaveDataFileStat* f = input->fileList + i;
-            u32 dst = files + i * 56;
+            u32 dst = list_ea + i * 56;
+            memset(vm_base + dst, 0, 56);   /* the title's buffer holds stale bytes */
             vm_write32(dst, f->fileType); vm_write64(dst + 8, f->st_size);
             vm_write64(dst + 16, (u64)f->st_atime);
             vm_write64(dst + 24, (u64)f->st_mtime);
@@ -853,6 +861,46 @@ static void read_param_sfo(const char* save_path, CellSaveDataSystemFileParam* p
     }
 }
 
+/* One mapping of a callback's cbResult.result to the API return code.
+ *
+ * funcStat (FW 4.93 libsysutil, out/M3/SAVEDATA-FW-RE.md `map_cb`: funcStat is
+ * called by bctrl at 0x0200D7A4, the result read at 0x0200D7AC and dispatched
+ * through a jump table indexed by result + 5; the error path loads 0xB401):
+ *    0         OK_NEXT        continue (caller proceeds to the PARAM.SFO / funcFile work)
+ *    1         OK_LAST        CELL_OK at once, no PARAM.SFO write, no file loop
+ *   -1..-5     ERR_*          CELL_SAVEDATA_ERROR_CBRESULT, ERR_NODATA (-4) included:
+ *                             the firmware returns NODATA only when VSH reports it
+ *    2, others                CELL_SAVEDATA_ERROR_PARAM (OK_LAST_NOCONFIRM is valid
+ *                             for funcFile and funcDone only)
+ * A title that wants NODATA treated as success carries that in its own port.
+ * Callers test `== OK_NEXT` themselves; this returns CELL_OK for it so that a
+ * continuing result is never mistaken for an error.
+ *
+ * funcFile: the firmware RE is silent, so this follows the RPCS3-oracle
+ * (d00d8023 cellSaveData.cpp:1888-1920): OK_LAST and OK_LAST_NOCONFIRM end the
+ * sequence with CELL_OK, -5..-1 give CBRESULT, anything else PARAM. */
+static s32 map_cb_error(s32 r)
+{
+    if (r >= CELL_SAVEDATA_CBRESULT_ERR_INVALID && r <= CELL_SAVEDATA_CBRESULT_ERR_NOSPACE)
+        return CELL_SAVEDATA_ERROR_CBRESULT;
+    return CELL_SAVEDATA_ERROR_PARAM;
+}
+
+static s32 map_func_stat_result(s32 r)
+{
+    if (r == CELL_SAVEDATA_CBRESULT_OK_NEXT || r == CELL_SAVEDATA_CBRESULT_OK_LAST)
+        return CELL_OK;
+    return map_cb_error(r);
+}
+
+static s32 map_func_file_result(s32 r)
+{
+    if (r == CELL_SAVEDATA_CBRESULT_OK_NEXT || r == CELL_SAVEDATA_CBRESULT_OK_LAST ||
+        r == CELL_SAVEDATA_CBRESULT_OK_LAST_NOCONFIRM)
+        return CELL_OK;
+    return map_cb_error(r);
+}
+
 /* Core save/load implementation shared by List/Fixed/Auto variants */
 static s32 savedata_execute(const char* dirName, int is_save,
                              CellSaveDataSetBuf* setBuf,
@@ -880,16 +928,30 @@ static s32 savedata_execute(const char* dirName, int is_save,
      * read setBuf->fileListMax off a guest stack address and took an access
      * violation (0xD00DCF84 = r1+0x90). Read it out of guest memory, the way
      * the dirListMax read below already does. fileListMax is at +4. */
-    u32 file_list_max = setBuf ? vm_read32((u32)(uintptr_t)setBuf + 4) : 64;
+    const u32 setbuf_ea = (u32)(uintptr_t)setBuf;
+    u32 file_list_max = setBuf ? vm_read32(setbuf_ea + 4) : 0;
     if (file_list_max > CELL_SAVEDATA_LISTITEM_MAX) return CELL_SAVEDATA_ERROR_PARAM;
+    /* The file list lives in the title's own buffer: SetBuf { bufSize +32; buf* +36 }.
+     * Prove the whole span before any entry is written (a span outside guest
+     * memory has no CELL_SAVEDATA_ERROR_* the firmware would return for it), and
+     * let at most bufSize / sizeof(CellSaveDataFileStat) entries through. */
+    const u32 buf_size = setBuf ? vm_read32(setbuf_ea + 32) : 0;
+    const u32 buf_ea = setBuf ? vm_read32(setbuf_ea + 36) : 0;
+    if (buf_size && !vm_range_ok(buf_ea, buf_size))
+        ps3_stop_guest_range("cellSaveData", "setBuf->buf", buf_ea, buf_size,
+                             vm_guest_limit());
+    const u32 list_cap = buf_ea ? (buf_size / 56u < file_list_max ? buf_size / 56u
+                                                                   : file_list_max) : 0;
     CellSaveDataFileStat* fileList = NULL;
     u32 fileNum = 0;
 
     if (file_list_max > 0) {
-        fileList = (CellSaveDataFileStat*)calloc(file_list_max, sizeof(CellSaveDataFileStat));
-        if (!fileList) return CELL_SAVEDATA_ERROR_INTERNAL;
+        if (list_cap) {
+            fileList = (CellSaveDataFileStat*)calloc(list_cap, sizeof(CellSaveDataFileStat));
+            if (!fileList) return CELL_SAVEDATA_ERROR_INTERNAL;
+        }
         if (!is_new) {
-            fileNum = enumerate_save_files(save_path, fileList, file_list_max);
+            fileNum = enumerate_save_files(save_path, fileList, list_cap);
         }
     }
 
@@ -921,7 +983,7 @@ static s32 savedata_execute(const char* dirName, int is_save,
     }
 
     statGet.fileNum = fileNum;
-    statGet.fileListNum = fileNum < file_list_max ? fileNum : file_list_max;
+    statGet.fileListNum = fileNum < list_cap ? fileNum : list_cap;
     statGet.fileList = fileList;
     statGet.bind = 0;
     statGet.sizeKB = 0;
@@ -941,14 +1003,12 @@ static s32 savedata_execute(const char* dirName, int is_save,
      * dispatcher, which builds StatGet/StatSet in guest memory. */
     u32 callback_userdata = (u32)(uintptr_t)userdata;
     cbResult.result = dispatch_func_stat_full((uint32_t)(uintptr_t)funcStat, is_new,
-                         dirName, &callback_userdata, &statGet, &statSet);
+                         dirName, &callback_userdata, &statGet, buf_ea, &statSet);
 
-    if (cbResult.result < 0) {
-        printf("[cellSaveData] stat callback returned error %d\n", cbResult.result);
+    if (cbResult.result != CELL_SAVEDATA_CBRESULT_OK_NEXT) {
+        printf("[cellSaveData] funcStat returned %d: ending the operation\n", cbResult.result);
         free(fileList);
-        if (cbResult.result == CELL_SAVEDATA_CBRESULT_ERR_NODATA)
-            return CELL_SAVEDATA_ERROR_NODATA;
-        return CELL_SAVEDATA_ERROR_CBRESULT;
+        return map_func_stat_result(cbResult.result);
     }
 
     /* Write PARAM.SFO if stat set provided params and we're saving */
@@ -962,13 +1022,16 @@ static s32 savedata_execute(const char* dirName, int is_save,
 
     /* Each NEXT callback requests one operation. LAST ends the sequence;
      * its zero-initialized FileSet is not an implicit read request. */
-    if (funcFile && cbResult.result == CELL_SAVEDATA_CBRESULT_OK_NEXT) {
+    if (funcFile) {
         u32 exc_size = 0;
         while (1) {
             CellSaveDataFileSet fileSet;
-            cbResult.result = dispatch_func_file((u32)(uintptr_t)funcFile,
-                                                 &callback_userdata, exc_size, &fileSet);
-            if (cbResult.result != CELL_SAVEDATA_CBRESULT_OK_NEXT) break;
+            const s32 file_result = dispatch_func_file((u32)(uintptr_t)funcFile,
+                                                       &callback_userdata, exc_size, &fileSet);
+            if (file_result != CELL_SAVEDATA_CBRESULT_OK_NEXT) {
+                free(fileList);
+                return map_func_file_result(file_result);
+            }
             s32 exc = process_file_op(save_path, &fileSet);
             printf("[cellSaveData] file op=%u type=%u name='%s' off=%u size=%u buf=%u -> %d\n",
                    fileSet.fileOperation, fileSet.fileType,
@@ -981,12 +1044,6 @@ static s32 savedata_execute(const char* dirName, int is_save,
 
     free(fileList);
 
-    if (cbResult.result < 0) {
-        if (cbResult.result == CELL_SAVEDATA_CBRESULT_ERR_NODATA)
-            return CELL_SAVEDATA_ERROR_NODATA;
-        return CELL_SAVEDATA_ERROR_CBRESULT;
-    }
-
     printf("[cellSaveData] %s complete for '%s'\n",
            is_save ? "SAVE" : "LOAD", dirName);
     return CELL_OK;
@@ -995,6 +1052,22 @@ static s32 savedata_execute(const char* dirName, int is_save,
 /* ---------------------------------------------------------------------------
  * API implementations
  * -----------------------------------------------------------------------*/
+/* Argument order of FW 4.93 libsysutil and RPCS3 savedata_check_args
+ * (d00d8023 cellSaveData.cpp:482-492): `version > 1` is PARAM (reason 1), then
+ * `errDialog > 2` (reason 5) where the entry has one, both before any NULL
+ * check. The List and Fixed entries have no errDialog: the console runs them
+ * with ALWAYS. */
+static s32 savedata_check_version(u32 version)
+{
+    return version > CELL_SAVEDATA_VERSION_420 ? CELL_SAVEDATA_ERROR_PARAM : CELL_OK;
+}
+
+static s32 savedata_check_version_dialog(u32 version, u32 errDialog)
+{
+    if (version > CELL_SAVEDATA_VERSION_420 || errDialog > CELL_SAVEDATA_ERRDIALOG_NOREPEAT)
+        return CELL_SAVEDATA_ERROR_PARAM;
+    return CELL_OK;
+}
 
 s32 cellSaveDataListSave2(u32 version, CellSaveDataSetList* setList,
                            CellSaveDataSetBuf* setBuf,
@@ -1005,6 +1078,8 @@ s32 cellSaveDataListSave2(u32 version, CellSaveDataSetList* setList,
 {
     printf("[cellSaveData] ListSave2(version=%u)\n", version);
 
+    if (savedata_check_version(version) != CELL_OK)
+        return CELL_SAVEDATA_ERROR_PARAM;
     if (!setList || !setBuf || !funcList || !funcStat)
         return CELL_SAVEDATA_ERROR_PARAM;
 
@@ -1067,6 +1142,8 @@ s32 cellSaveDataListLoad2(u32 version, CellSaveDataSetList* setList,
 {
     printf("[cellSaveData] ListLoad2(version=%u)\n", version);
 
+    if (savedata_check_version(version) != CELL_OK)
+        return CELL_SAVEDATA_ERROR_PARAM;
     if (!setList || !setBuf || !funcList || !funcStat)
         return CELL_SAVEDATA_ERROR_PARAM;
 
@@ -1213,6 +1290,8 @@ s32 cellSaveDataFixedSave2(u32 version, CellSaveDataSetList* setList,
 {
     (void)container;
     printf("[cellSaveData] FixedSave2(version=%u)\n", version);
+    if (savedata_check_version(version) != CELL_OK)
+        return CELL_SAVEDATA_ERROR_PARAM;
     return savedata_fixed(1, setList, setBuf, funcFixed, funcStat, funcFile, userdata);
 }
 
@@ -1225,6 +1304,8 @@ s32 cellSaveDataFixedLoad2(u32 version, CellSaveDataSetList* setList,
 {
     (void)container;
     printf("[cellSaveData] FixedLoad2(version=%u)\n", version);
+    if (savedata_check_version(version) != CELL_OK)
+        return CELL_SAVEDATA_ERROR_PARAM;
     return savedata_fixed(0, setList, setBuf, funcFixed, funcStat, funcFile, userdata);
 }
 
@@ -1236,8 +1317,9 @@ s32 cellSaveDataListAutoLoad(u32 version, u32 errDialog,
                             u32 container, void* userdata)
 {
     (void)container;
-    if (errDialog > 2) return CELL_SAVEDATA_ERROR_PARAM;
     printf("[cellSaveData] ListAutoLoad(version=%u)\n", version);
+    if (savedata_check_version_dialog(version, errDialog) != CELL_OK)
+        return CELL_SAVEDATA_ERROR_PARAM;
     return savedata_fixed(0, setList, setBuf, funcFixed, funcStat, funcFile, userdata);
 }
 
@@ -1276,12 +1358,14 @@ s32 cellSaveDataAutoLoad2(u32 version, const char* dirName,
                            CellSaveDataFileCallback funcFile,
                            u32 container, void* userdata)
 {
-    (void)version; (void)errDialog; (void)funcFile;
     (void)container;
 
-    /* RPCS3 cellSaveData.cpp savedata_check_args: for AUTO_LOAD a null dirName
-     * is reason 2 and a null setBuf is reason 74; savedata_op maps either to
+    /* RPCS3 cellSaveData.cpp savedata_check_args: version (reason 1) and
+     * errDialog (reason 5) come first; then for AUTO_LOAD a null dirName is
+     * reason 2 and a null setBuf reason 74; savedata_op maps each to
      * CELL_SAVEDATA_ERROR_PARAM.  funcStat is not validated by the oracle. */
+    if (savedata_check_version_dialog(version, errDialog) != CELL_OK)
+        return CELL_SAVEDATA_ERROR_PARAM;
     if (!dirName || !setBuf)
         return CELL_SAVEDATA_ERROR_PARAM;
 
@@ -1299,27 +1383,12 @@ s32 cellSaveDataAutoLoad2(u32 version, const char* dirName,
     /* funcStat is the GAME's guest-OPD address. Marshal StatGet/Set/CB
      * into guest BE memory and dispatch through g_ps3_guest_caller.
      * Even on first-run-no-data, the game observes funcStat fire with
-     * isNewData=1 so its title state machine can advance. */
-    char save_path[1024];
-    build_save_path(save_path, sizeof(save_path), dirName);
-    int is_new = !dir_has_save(save_path);
-
-    (void)is_new;
-    /* Full sequence: funcStat, then the funcFile loop that reads the files.
-     * Stopping after funcStat (OK_NEXT) left a title with a save on disk
-     * waiting for its data forever -- GH3's second boot sat on "Checking HDD".
+     * isNewData=1 so its title state machine can advance.
      *
-     * flОw first-boot: its funcStat returns ERR_NODATA on a new profile
-     * (isNewData=1). The callback already ran and told the game "no save",
-     * so report AutoLoad as CELL_OK -- an ERROR return leaves the title
-     * parked in MODE_AUTO_LOAD (no app loop, no flips).
-     * Per the SDK the correct return here is CELL_SAVEDATA_ERROR_NODATA,
-     * and a real title handles it; that flОw does not is a bug somewhere in
-     * its MODE_AUTO_LOAD state machine we have not tracked down. Keep the
-     * compat return until that is understood -- it was dropped once already
-     * in the fold merge and cost a boot regression. */
-    s32 r = savedata_execute(dirName, 0, setBuf, funcStat, funcFile, userdata);
-    return r == CELL_SAVEDATA_ERROR_NODATA ? CELL_OK : r;
+     * Full sequence: funcStat, then the funcFile loop that reads the files.
+     * Stopping after funcStat (OK_NEXT) left a title with a save on disk
+     * waiting for its data forever -- GH3's second boot sat on "Checking HDD". */
+    return savedata_execute(dirName, 0, setBuf, funcStat, funcFile, userdata);
 }
 
 s32 cellSaveDataDelete2(u32 container)
@@ -1413,9 +1482,11 @@ s32 cellSaveDataAutoSave(u32 version, const char* dirName,
                           u32 container, void* userdata)
 {
     dirName = savedata_host_str(dirName);
-    (void)errDialog; (void)funcFile; (void)container;
+    (void)container;
     printf("[cellSaveData] AutoSave(version=%u, dir='%s')\n",
            version, dirName ? dirName : "<null>");
+    if (savedata_check_version_dialog(version, errDialog) != CELL_OK)
+        return CELL_SAVEDATA_ERROR_PARAM;
     if (!dirName || !setBuf || !funcStat)
         return CELL_SAVEDATA_ERROR_PARAM;
 
@@ -1447,31 +1518,25 @@ s32 cellSaveDataAutoLoad(u32 version, const char* dirName,
                           u32 container, void* userdata)
 {
     dirName = savedata_host_str(dirName);
-    (void)version; (void)errDialog; (void)setBuf; (void)funcFile;
     (void)container;
     printf("[cellSaveData] AutoLoad(version=%u, dir='%s')\n",
            version, dirName ? dirName : "<null>");
+    if (savedata_check_version_dialog(version, errDialog) != CELL_OK)
+        return CELL_SAVEDATA_ERROR_PARAM;
     if (!dirName || !setBuf || !funcStat)
         return CELL_SAVEDATA_ERROR_PARAM;
 
-    char save_path[1024];
-    build_save_path(save_path, sizeof(save_path), dirName);
-    int is_new = !dir_has_save(save_path);
-
-    (void)is_new;
-    /* Same as cellSaveDataAutoLoad2 above, including flОw's first-boot compat
-     * return (it calls this old non-_2 variant). */
-    s32 r = savedata_execute(dirName, 0, setBuf, funcStat, funcFile, userdata);
-    return r == CELL_SAVEDATA_ERROR_NODATA ? CELL_OK : r;
+    return savedata_execute(dirName, 0, setBuf, funcStat, funcFile, userdata);
 }
 
 s32 cellSaveDataDelete(u32 version, const char* dirName,
                         u32 container)
 {
-    (void)version;
     dirName = savedata_host_str(dirName);
     printf("[cellSaveData] Delete(dir='%s', container=%u)\n",
            dirName ? dirName : "<null>", container);
+    if (savedata_check_version(version) != CELL_OK)
+        return CELL_SAVEDATA_ERROR_PARAM;
     return CELL_OK;
 }
 

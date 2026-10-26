@@ -885,6 +885,22 @@ if(PS3RECOMP_BUILD_TESTS)
         set_target_properties(test_savedata_filebuf_range PROPERTIES LINKER_LANGUAGE CXX)
         add_test(NAME savedata_filebuf_range COMMAND test_savedata_filebuf_range)
         set_tests_properties(savedata_filebuf_range PROPERTIES LABELS "hle;t0" TIMEOUT 60)
+        # funcStat/funcFile result mapping, version/errDialog PARAM, and the
+        # statGet.fileList contract (#48). The refused setBuf->buf span is a
+        # named stop, so it links the real stop implementation like the fixture
+        # above and runs that case in a forked child.
+        add_executable(test_savedata_cbresult
+            libs/system/tests/test_savedata_cbresult.c
+            runtime/diag/stop.cpp)
+        target_include_directories(test_savedata_cbresult PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/system"
+            "${CMAKE_CURRENT_SOURCE_DIR}/runtime"
+            "${CMAKE_CURRENT_SOURCE_DIR}/runtime/ppu")
+        target_compile_definitions(test_savedata_cbresult PRIVATE _GNU_SOURCE)
+        set_target_properties(test_savedata_cbresult PROPERTIES LINKER_LANGUAGE CXX)
+        add_test(NAME savedata_cbresult COMMAND test_savedata_cbresult)
+        set_tests_properties(savedata_cbresult PROPERTIES LABELS "hle;t0" TIMEOUT 60)
         ps3recomp_add_hle_check_test(hle_trophy_start
             libs/network/tests/test_trophy_start.c)
         ps3recomp_add_hle_check_test(hle_trophy_registration

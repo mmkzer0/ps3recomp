@@ -21,6 +21,12 @@ s32 cellSaveData_set_scratch_region(u32 base, u32 size);
  * Constants
  * -----------------------------------------------------------------------*/
 #define CELL_SAVEDATA_VERSION_CURRENT    0
+#define CELL_SAVEDATA_VERSION_420        1   /* highest version the API accepts */
+
+/* errDialog of the Auto* / ListAuto* entries; anything above NOREPEAT is PARAM */
+#define CELL_SAVEDATA_ERRDIALOG_NONE     0
+#define CELL_SAVEDATA_ERRDIALOG_ALWAYS   1
+#define CELL_SAVEDATA_ERRDIALOG_NOREPEAT 2
 
 #define CELL_SAVEDATA_DIRNAME_SIZE       32
 #define CELL_SAVEDATA_FILENAME_SIZE      13
