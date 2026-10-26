@@ -43,6 +43,7 @@
 #include "rsx_dispatch.h"
 
 #include <string.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include "ps3emu/log_first.h"
@@ -138,10 +139,99 @@ static u32 dma_to_location(u32 handle)
     return handle == DMA_HANDLE_MAIN ? RSX_LOCATION_MAIN : RSX_LOCATION_LOCAL;
 }
 
-static void mark_class(rsx_dispatch* rsx, u32 method, u32 count, u8 klass)
+/* The coverage classification is a property of the method number alone, so it is built once and every
+ * dispatch instance copies it; rsx_dsp_method_class() lets a caller that owns no instance (the FIFO
+ * walker) ask the same question. */
+typedef struct { u8 klass[RSX_DSP_NUM_REGS]; } dsp_class_table;
+
+static void mark_class(dsp_class_table* t, u32 method, u32 count, u8 klass)
 {
     for (u32 i = 0; i < count; i++)
-        rsx->klass[(method >> 2) + i] = klass;
+        t->klass[(method >> 2) + i] = klass;
+}
+
+static void dsp_fill_classes(dsp_class_table* t)
+{
+    /* Execution methods */
+    mark_class(t, M_VERTEX_BEGIN_END,  1, RSX_DSP_CLASS_EXEC);
+    mark_class(t, M_VB_VERTEX_BATCH,   1, RSX_DSP_CLASS_EXEC);
+    mark_class(t, M_INLINE_ARRAY,      1, RSX_DSP_CLASS_EXEC);
+    mark_class(t, M_VB_INDEX_BATCH,    1, RSX_DSP_CLASS_EXEC);
+    mark_class(t, M_CLEAR_BUFFERS,     1, RSX_DSP_CLASS_EXEC);
+    mark_class(t, M_VP_UPLOAD_INST,   32, RSX_DSP_CLASS_EXEC);
+    mark_class(t, M_VP_UPLOAD_CONST,  32, RSX_DSP_CLASS_EXEC);
+    mark_class(t, M_GCM_FLIP_HEAD_0,   1, RSX_DSP_CLASS_EXEC);
+    mark_class(t, M_GCM_FLIP_HEAD_1,   1, RSX_DSP_CLASS_EXEC);
+    mark_class(t, M_GCM_DRIVER_FLIP,   1, RSX_DSP_CLASS_EXEC);
+
+    /* State the getters decode */
+    mark_class(t, M_DMA_COLOR1,        1, RSX_DSP_CLASS_STATE);
+    mark_class(t, M_DMA_COLOR0,        2, RSX_DSP_CLASS_STATE); /* +ZETA */
+    mark_class(t, M_DMA_COLOR2,        2, RSX_DSP_CLASS_STATE);
+    mark_class(t, M_RT_HORIZ,         12, RSX_DSP_CLASS_STATE); /* 0x200..0x22C */
+    mark_class(t, M_COLOR2_PITCH,      4, RSX_DSP_CLASS_STATE);
+    mark_class(t, M_VIEWPORT_HORIZ,    2, RSX_DSP_CLASS_STATE);
+    mark_class(t, M_VIEWPORT_TRANSLATE, 8, RSX_DSP_CLASS_STATE);
+    mark_class(t, M_VTXBUF_OFFSET,    16, RSX_DSP_CLASS_STATE);
+    mark_class(t, M_VERTEX_DATA_BASE,  2, RSX_DSP_CLASS_STATE);
+    mark_class(t, M_VTXFMT,           16, RSX_DSP_CLASS_STATE);
+    mark_class(t, M_IDXBUF_OFFSET,     2, RSX_DSP_CLASS_STATE);
+    mark_class(t, M_TEX_SIZE1,        16, RSX_DSP_CLASS_STATE);
+    mark_class(t, M_TEX_OFFSET, RSX_DSP_NUM_TEXTURES * 8, RSX_DSP_CLASS_STATE);
+    mark_class(t, M_CLEAR_DEPTH_VALUE, 2, RSX_DSP_CLASS_STATE);
+    mark_class(t, M_VP_UPLOAD_FROM_ID, 1, RSX_DSP_CLASS_STATE);
+    mark_class(t, M_RESTART_INDEX_ENABLE, 2, RSX_DSP_CLASS_STATE);
+    mark_class(t, M_VP_UPLOAD_CONST_ID, 1, RSX_DSP_CLASS_STATE);
+    mark_class(t, M_FP_ACTIVE_PROGRAM, 1, RSX_DSP_CLASS_STATE);
+    mark_class(t, M_FP_CONTROL,        1, RSX_DSP_CLASS_STATE);
+    mark_class(t, M_VP_START_FROM_ID,  1, RSX_DSP_CLASS_STATE);
+    mark_class(t, M_VTX_ATTR_4F,      64, RSX_DSP_CLASS_STATE);
+
+    /* Alpha test / blend / color-mask / depth / cull: rsx_dsp_reg reads these
+     * straight from the register file (replay_main.c's decode_render_state,
+     * color-mask application), so they were already live; this only corrects
+     * the coverage report. */
+    mark_class(t, M_ALPHA_FUNC_ENABLE, 3, RSX_DSP_CLASS_STATE); /* ..FUNC_REF */
+    mark_class(t, M_BLEND_FUNC_ENABLE, 5, RSX_DSP_CLASS_STATE); /* ..BLEND_EQUATION */
+    mark_class(t, M_COLOR_MASK,        1, RSX_DSP_CLASS_STATE);
+    mark_class(t, M_MRT_COLOR_MASK,    1, RSX_DSP_CLASS_STATE);
+    mark_class(t, M_DEPTH_FUNC,        3, RSX_DSP_CLASS_STATE); /* ..TEST_ENABLE */
+    mark_class(t, M_CULL_FACE,         1, RSX_DSP_CLASS_STATE);
+    mark_class(t, M_FRONT_FACE,        1, RSX_DSP_CLASS_STATE);
+    mark_class(t, M_CULL_FACE_ENABLE,  1, RSX_DSP_CLASS_STATE);
+    mark_class(t, M_VP_ATTRIB_EN,      1, RSX_DSP_CLASS_STATE);
+    mark_class(t, M_VP_RESULT_EN,      1, RSX_DSP_CLASS_STATE);
+
+    /* Explicit no-ops: the vertex cache invalidate hint and the reserved
+     * NOP method carry no state the replay harness needs (there is no CPU
+     * vertex cache to invalidate; every draw re-fetches from guest memory
+     * each time). Classifying them EXEC removes them from the TODO count
+     * without pretending they do anything. */
+    mark_class(t, M_VTX_CACHE_INVALIDATE, 1, RSX_DSP_CLASS_EXEC);
+    mark_class(t, M_NV4097_NOP,           1, RSX_DSP_CLASS_EXEC);
+}
+
+static dsp_class_table s_classes;
+static atomic_int s_classes_state;   /* 0 unbuilt, 1 being built, 2 ready */
+
+static const dsp_class_table* dsp_classes(void)
+{
+    if (atomic_load_explicit(&s_classes_state, memory_order_acquire) != 2) {
+        int expected = 0;
+        if (atomic_compare_exchange_strong(&s_classes_state, &expected, 1)) {
+            dsp_fill_classes(&s_classes);
+            atomic_store_explicit(&s_classes_state, 2, memory_order_release);
+        } else {
+            while (atomic_load_explicit(&s_classes_state, memory_order_acquire) != 2) { }
+        }
+    }
+    return &s_classes;
+}
+
+u32 rsx_dsp_method_class(u32 method)
+{
+    const u32 idx = (method & 0xFFFFCu) >> 2;
+    return idx < RSX_DSP_NUM_REGS ? dsp_classes()->klass[idx] : RSX_DSP_CLASS_TODO;
 }
 
 void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
@@ -172,63 +262,7 @@ void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
      * clear consumers, mirroring COLOR_MASK/FRONT_FACE above. */
     rsx->regs[0x1D8C >> 2] = 0xFFFFFF00u;
 
-    /* Execution methods */
-    mark_class(rsx, M_VERTEX_BEGIN_END,  1, RSX_DSP_CLASS_EXEC);
-    mark_class(rsx, M_VB_VERTEX_BATCH,   1, RSX_DSP_CLASS_EXEC);
-    mark_class(rsx, M_INLINE_ARRAY,      1, RSX_DSP_CLASS_EXEC);
-    mark_class(rsx, M_VB_INDEX_BATCH,    1, RSX_DSP_CLASS_EXEC);
-    mark_class(rsx, M_CLEAR_BUFFERS,     1, RSX_DSP_CLASS_EXEC);
-    mark_class(rsx, M_VP_UPLOAD_INST,   32, RSX_DSP_CLASS_EXEC);
-    mark_class(rsx, M_VP_UPLOAD_CONST,  32, RSX_DSP_CLASS_EXEC);
-    mark_class(rsx, M_GCM_FLIP_HEAD_0,   1, RSX_DSP_CLASS_EXEC);
-    mark_class(rsx, M_GCM_FLIP_HEAD_1,   1, RSX_DSP_CLASS_EXEC);
-    mark_class(rsx, M_GCM_DRIVER_FLIP,   1, RSX_DSP_CLASS_EXEC);
-
-    /* State the getters decode */
-    mark_class(rsx, M_DMA_COLOR1,        1, RSX_DSP_CLASS_STATE);
-    mark_class(rsx, M_DMA_COLOR0,        2, RSX_DSP_CLASS_STATE); /* +ZETA */
-    mark_class(rsx, M_DMA_COLOR2,        2, RSX_DSP_CLASS_STATE);
-    mark_class(rsx, M_RT_HORIZ,         12, RSX_DSP_CLASS_STATE); /* 0x200..0x22C */
-    mark_class(rsx, M_COLOR2_PITCH,      4, RSX_DSP_CLASS_STATE);
-    mark_class(rsx, M_VIEWPORT_HORIZ,    2, RSX_DSP_CLASS_STATE);
-    mark_class(rsx, M_VIEWPORT_TRANSLATE, 8, RSX_DSP_CLASS_STATE);
-    mark_class(rsx, M_VTXBUF_OFFSET,    16, RSX_DSP_CLASS_STATE);
-    mark_class(rsx, M_VERTEX_DATA_BASE,  2, RSX_DSP_CLASS_STATE);
-    mark_class(rsx, M_VTXFMT,           16, RSX_DSP_CLASS_STATE);
-    mark_class(rsx, M_IDXBUF_OFFSET,     2, RSX_DSP_CLASS_STATE);
-    mark_class(rsx, M_TEX_SIZE1,        16, RSX_DSP_CLASS_STATE);
-    mark_class(rsx, M_TEX_OFFSET, RSX_DSP_NUM_TEXTURES * 8, RSX_DSP_CLASS_STATE);
-    mark_class(rsx, M_CLEAR_DEPTH_VALUE, 2, RSX_DSP_CLASS_STATE);
-    mark_class(rsx, M_VP_UPLOAD_FROM_ID, 1, RSX_DSP_CLASS_STATE);
-    mark_class(rsx, M_RESTART_INDEX_ENABLE, 2, RSX_DSP_CLASS_STATE);
-    mark_class(rsx, M_VP_UPLOAD_CONST_ID, 1, RSX_DSP_CLASS_STATE);
-    mark_class(rsx, M_FP_ACTIVE_PROGRAM, 1, RSX_DSP_CLASS_STATE);
-    mark_class(rsx, M_FP_CONTROL,        1, RSX_DSP_CLASS_STATE);
-    mark_class(rsx, M_VP_START_FROM_ID,  1, RSX_DSP_CLASS_STATE);
-    mark_class(rsx, M_VTX_ATTR_4F,      64, RSX_DSP_CLASS_STATE);
-
-    /* Alpha test / blend / color-mask / depth / cull: rsx_dsp_reg reads these
-     * straight from the register file (replay_main.c's decode_render_state,
-     * color-mask application), so they were already live; this only corrects
-     * the coverage report. */
-    mark_class(rsx, M_ALPHA_FUNC_ENABLE, 3, RSX_DSP_CLASS_STATE); /* ..FUNC_REF */
-    mark_class(rsx, M_BLEND_FUNC_ENABLE, 5, RSX_DSP_CLASS_STATE); /* ..BLEND_EQUATION */
-    mark_class(rsx, M_COLOR_MASK,        1, RSX_DSP_CLASS_STATE);
-    mark_class(rsx, M_MRT_COLOR_MASK,    1, RSX_DSP_CLASS_STATE);
-    mark_class(rsx, M_DEPTH_FUNC,        3, RSX_DSP_CLASS_STATE); /* ..TEST_ENABLE */
-    mark_class(rsx, M_CULL_FACE,         1, RSX_DSP_CLASS_STATE);
-    mark_class(rsx, M_FRONT_FACE,        1, RSX_DSP_CLASS_STATE);
-    mark_class(rsx, M_CULL_FACE_ENABLE,  1, RSX_DSP_CLASS_STATE);
-    mark_class(rsx, M_VP_ATTRIB_EN,      1, RSX_DSP_CLASS_STATE);
-    mark_class(rsx, M_VP_RESULT_EN,      1, RSX_DSP_CLASS_STATE);
-
-    /* Explicit no-ops: the vertex cache invalidate hint and the reserved
-     * NOP method carry no state the replay harness needs (there is no CPU
-     * vertex cache to invalidate; every draw re-fetches from guest memory
-     * each time). Classifying them EXEC removes them from the TODO count
-     * without pretending they do anything. */
-    mark_class(rsx, M_VTX_CACHE_INVALIDATE, 1, RSX_DSP_CLASS_EXEC);
-    mark_class(rsx, M_NV4097_NOP,           1, RSX_DSP_CLASS_EXEC);
+    memcpy(rsx->klass, dsp_classes()->klass, sizeof rsx->klass);
 }
 
 void rsx_dispatch_seed_registers(rsx_dispatch* rsx, const u32* regs, u32 count)

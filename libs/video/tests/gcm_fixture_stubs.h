@@ -27,4 +27,20 @@ void ps3_stop_gcm_wait_timeout(const char* func, const char* what, uint32_t offs
     exit(70);
 }
 
+/* The NV0039 copy ends in these when its registers describe something the runtime will not model, or a
+ * span that leaves guest memory. A fixture that reaches one has a bug: say which, end with the stop status. */
+PS3_NORETURN void ps3_stop_gcm_unmodelled(const char* func, const char* feature, const char* reason)
+{
+    printf("[FAIL] gcm-unmodelled in %s: %s: %s\n", func, feature, reason);
+    exit(70);
+}
+
+PS3_NORETURN void ps3_stop_guest_range(const char* func, const char* arg, uint64_t ea, uint64_t size,
+                                       uint64_t limit)
+{
+    printf("[FAIL] hle-guest-range in %s: %s ea 0x%llX size 0x%llX limit 0x%llX\n", func, arg,
+           (unsigned long long)ea, (unsigned long long)size, (unsigned long long)limit);
+    exit(70);
+}
+
 #endif

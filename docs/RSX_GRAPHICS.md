@@ -346,7 +346,8 @@ line still stops at 32; the count does not.
   `s<present_seq>_f<flip_id>_pass<NNN>_t<K>.ppm` / `_z.pgm`. `fnone` before the first flip head. The
   index (`passes.txt`) repeats `s=` and `flip=` on every line.
 - `PS3RECOMP_METAL_FRAME_DUMP`: `<base>_s<present_seq>_f<flip_id>.ppm`. Presents are selected by
-  `PS3RECOMP_METAL_FRAME_DUMP_RANGE=<first>-<last>` or `PS3RECOMP_METAL_FRAME_DUMP_LIST=<a,b,c>`, else
+  `PS3RECOMP_METAL_FRAME_DUMP_RANGE=<first>-<last>` or `PS3RECOMP_METAL_FRAME_DUMP_LIST=<a,b,c>` (at most 32
+  entries; a longer list is a `config-invalid` stop naming the count), else
   every 120th. A surface format the PPM writer cannot express is an error line plus a counter
   (`rsx_metal_backend_frame_dump_errors()`), never a silent skip; the pass dump counts its own through
   `rsx_draw_engine_pass_dump_errors()`.

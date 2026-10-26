@@ -70,6 +70,8 @@
 #include <string.h>
 #include "ps3emu/log_first.h"
 #include "rsx_capture.h"
+#include "ps3emu/stop.h"
+#include <dlfcn.h>
 /* The capture module is optional in a link (tests build this file without it):
  * a weak reference to its installer keeps this backend linking either way. */
 __attribute__((weak_import)) int rsx_capture_install_from_config(const rsx_capture_environment* env);
@@ -3696,12 +3698,37 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
  *   ..._LIST=a,b,c     exactly those present_seq values
  * A surface format the PPM writer cannot express is counted and logged (gap
  * 3c), never skipped silently. */
+#define FDUMP_LIST_MAX 32u
+
+/* The stop machinery is optional in a link, like the capture module: fixtures that include this file
+ * without runtime/diag/stop.cpp still end the process, with the same sentence. Found by name at the one
+ * moment it is needed, since no declaration of ps3_stop can be weak once stop.h has declared it. */
+
+static void fdump_list_too_long(unsigned count)
+{
+    char n[16], max[16], what[192];
+    snprintf(n, sizeof n, "%u", count);
+    snprintf(max, sizeof max, "%u", FDUMP_LIST_MAX);
+    snprintf(what, sizeof what,
+             "invalid configuration: PS3RECOMP_METAL_FRAME_DUMP_LIST names %u present numbers; at most %u are kept",
+             count, FDUMP_LIST_MAX);
+    static const char remedy[] = "name at most 32 present numbers, or select a span with PS3RECOMP_METAL_FRAME_DUMP_RANGE";
+    typedef void (*stop_fn)(int, const char*, const char*, const ps3_stop_field*, size_t, const ps3_stop_site*);
+    const stop_fn stop = (stop_fn)dlsym(RTLD_DEFAULT, "ps3_stop");
+    if (stop) {
+        const ps3_stop_field f[] = { {"env", "PS3RECOMP_METAL_FRAME_DUMP_LIST"}, {"count", n}, {"max", max} };
+        stop((int)PS3_STOP_CONFIG_INVALID, what, remedy, f, 3, NULL);
+    }
+    fprintf(stderr, "[STOP] config-invalid: %s (%s)\n", what, remedy);
+    exit(70);
+}
+
 static struct {
     int init;
     unsigned stride;
     int have_range, range_lo, range_hi;
     int have_list;
-    unsigned list[32];
+    unsigned list[FDUMP_LIST_MAX];
     unsigned n_list;
 } s_fdump;
 
@@ -3729,15 +3756,20 @@ static void fdump_parse(void)
     const char* l = getenv("PS3RECOMP_METAL_FRAME_DUMP_LIST");
     if (l && *l) {
         const char* p = l;
-        while (*p && s_fdump.n_list < 32) {
+        unsigned total = 0;
+        while (*p) {
             char* end = NULL;
             const unsigned long v = strtoul(p, &end, 0);
             if (end == p) break;
-            s_fdump.list[s_fdump.n_list++] = (unsigned)v;
+            if (s_fdump.n_list < FDUMP_LIST_MAX) s_fdump.list[s_fdump.n_list++] = (unsigned)v;
+            total++;
             s_fdump.have_list = 1;
             p = end;
             while (*p == ',' || *p == ' ') p++;
         }
+        /* Keeping the first 32 and dropping the rest silently made a frame the user named come out
+         * missing, with nothing to say why. */
+        if (total > FDUMP_LIST_MAX) fdump_list_too_long(total);
     }
 }
 

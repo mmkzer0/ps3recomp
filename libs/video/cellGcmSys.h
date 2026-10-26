@@ -474,6 +474,26 @@ typedef void (*GcmDriverObserver)(const GcmDriverEvent* ev);
 void gcm_set_driver_observer(GcmDriverObserver fn);
 unsigned long long gcm_driver_event_count(u32 kind);
 
+/* What the FIFO walker did with every method it consumed (rsx_method_class.h): each ends as handled,
+ * inert (allow-listed, with evidence) or unknown. Unknown ones are counted per (class, method) and make
+ * a capture frame invalid; they are not a stop yet (M3-SCOPE Amendment 1, finding 5). The counters are
+ * cumulative until gcm_method_stats_reset(); they may be read from any thread. */
+typedef struct GcmMethodStats {
+    unsigned long long handled, inert, unknown;
+    unsigned long long m2mf_copies;   /* NV0039 BUFFER_NOTIFY copies executed */
+} GcmMethodStats;
+typedef struct GcmUnknownMethod {
+    u32 cls;                          /* rsx_class_id: name it with gcm_method_class_name() */
+    u32 method;
+    unsigned long long count;
+    u32 subch, data;                  /* the first occurrence's subchannel and data word */
+} GcmUnknownMethod;
+void gcm_method_stats(GcmMethodStats* out);
+/* Fills up to `max` entries, ordered by class then method; returns the number of distinct pairs. */
+u32  gcm_unknown_methods(GcmUnknownMethod* out, u32 max);
+void gcm_method_stats_reset(void);
+const char* gcm_method_class_name(u32 cls);
+
 /* Invalidate tile */
 s32 cellGcmSetInvalidateTile(u8 index);
 

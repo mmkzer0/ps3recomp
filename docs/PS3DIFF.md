@@ -402,9 +402,13 @@ A frame is a flip head, identified by `{flip_id, guest_frame, display_buffer}` (
 times; the frame is the first. `draws` obeys `submitted = executed + sum(dropped)` and
 `valid` is true exactly when `invalid` is empty: any dropped draw (`dropped-draws`), a draw on
 the built-in pipeline (`fixed-function`), a walker recovery that dropped commands
-(`fifo-resync`), unknown methods (`unknown-methods`), a head with no queued flip
-(`no-queued-flip`) or a missing readback makes the frame invalid. A frame that hides one of
-these is refused by `validate`.
+(`fifo-resync`), a head with no queued flip (`no-queued-flip`) or a missing readback makes the
+frame invalid. A frame that hides one of these is refused by `validate`.
+
+`unknown_methods` counts the methods the frame consumed that no object class handles and no
+allow-list entry covers (`libs/video/rsx_method_class.h`). The capture writes the count and
+the reason `unknown-methods`; `validate` and `rsx-compare` refuse such a frame outright, so a
+capture with one is an error, not an `invalid` baseline to skip past.
 
 ### Commands
 

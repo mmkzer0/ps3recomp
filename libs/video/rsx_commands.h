@@ -378,6 +378,10 @@ typedef struct rsx_state {
     int stencil_dirty;
     int texture_dirty;
     int vertex_dirty;
+
+    /* Methods rsx_process_command_buffer met that this state machine has no handler for and that
+     * rsx_method_class.h does not allow-list. The FIFO walker counts its own, per (class, method). */
+    unsigned long long unknown_methods;
 } rsx_state;
 
 /* ---------------------------------------------------------------------------
@@ -390,7 +394,9 @@ void rsx_state_init(rsx_state* state);
 /* Process a single NV47xx method call.
  * method: register address (e.g., NV4097_SET_BLEND_ENABLE)
  * data:   32-bit value to write
- * Returns 0 on success, -1 if method is unrecognized. */
+ * Returns 0 when a handler consumed it, -1 when this state machine has no handler for the method.
+ * -1 is not "inert": the caller decides, against rsx_method_class.h, whether the method is an
+ * allow-listed no-op or an unknown one. */
 int rsx_process_method(rsx_state* state, u32 method, u32 data);
 
 /* Process a command buffer segment.

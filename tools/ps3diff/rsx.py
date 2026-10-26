@@ -535,6 +535,13 @@ def _frame(rec: dict, running_hash: str, last_flip: int, draws: dict, cap: RsxCa
           "do not match the draw events since the previous frame")
     for k in ("unknown_methods", "resyncs"):
         _need(_is_int(rec[k]) and rec[k] >= 0, k, "must be an integer >= 0")
+    # A method no object class handles is input the replay cannot account for, so the frame is not a
+    # baseline for anything: an error here, in rsx-compare (which validates both sides first) and in a
+    # replay, never merely an `invalid` frame that a comparison could skip past. The capture still records
+    # the count and the reason (M3-SCOPE 3f); this is the reader's refusal.
+    _need(rec["unknown_methods"] == 0, "unknown_methods",
+          f"the frame consumed {rec['unknown_methods']} method(s) that no object class handles: not a baseline "
+          "until each is classified as handled, or allow-listed as inert with evidence")
     _need(isinstance(rec["valid"], bool), "valid", "must be a boolean")
     inv = rec["invalid"]
     _need(isinstance(inv, list) and inv == sorted(set(inv)) and all(isinstance(x, str) and x for x in inv), "invalid",
@@ -547,8 +554,6 @@ def _frame(rec: dict, running_hash: str, last_flip: int, draws: dict, cap: RsxCa
         must.add("fixed-function")
     if rec["resyncs"]:
         must.add("fifo-resync")
-    if rec["unknown_methods"]:
-        must.add("unknown-methods")
     if f["guest_frame"] is None:
         must.add("no-queued-flip")
     if rb is None:

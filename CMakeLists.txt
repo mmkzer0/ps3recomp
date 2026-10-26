@@ -1066,6 +1066,47 @@ if(UNIX)
                 $<TARGET_FILE:test_rsx_capture_walker> $<TARGET_FILE:test_rsx_capture_engine>)
         set_tests_properties(rsx_capture PROPERTIES LABELS "gcm;t0" TIMEOUT 120)
     endif()
+
+    # NV0039 (M2MF) and the walker's method verdicts: the real walker over synthetic rings, destination
+    # bytes observed. tools/test_rsx_methods.py runs the fixture's modes and checks the captures it leaves.
+    add_executable(test_gcm_nv0039
+        libs/video/tests/test_gcm_nv0039.c
+        libs/video/rsx_capture.cpp
+        libs/video/gcm_default_state.c
+        runtime/diag/stop.cpp
+        runtime/diag/sha256.cpp)
+    target_include_directories(test_gcm_nv0039 PRIVATE ${RSX_CAPTURE_FIXTURE_INCLUDES})
+    target_compile_definitions(test_gcm_nv0039 PRIVATE _GNU_SOURCE)
+    target_link_libraries(test_gcm_nv0039 PRIVATE Threads::Threads)
+    set_target_properties(test_gcm_nv0039 PROPERTIES LINKER_LANGUAGE CXX C_EXTENSIONS ON)
+    if(APPLE)
+        target_link_options(test_gcm_nv0039 PRIVATE "-Wl,-dead_strip")
+    else()
+        target_compile_options(test_gcm_nv0039 PRIVATE $<$<COMPILE_LANGUAGE:C>:-ffunction-sections -fdata-sections>)
+        target_link_options(test_gcm_nv0039 PRIVATE "-Wl,--gc-sections")
+        target_link_libraries(test_gcm_nv0039 PRIVATE m)
+    endif()
+    set(RSX_METHODS_TEST_ARGS $<TARGET_FILE:test_gcm_nv0039>)
+    # The backend's dump-list parser, no GPU: the .m includes the backend and reaches only fdump_parse.
+    if(APPLE)
+        add_executable(test_metal_frame_dump_list
+            libs/video/tests/test_metal_frame_dump_list.m
+            runtime/diag/stop.cpp)
+        set_source_files_properties(libs/video/tests/test_metal_frame_dump_list.m
+            PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+        target_include_directories(test_metal_frame_dump_list PRIVATE ${RSX_CAPTURE_FIXTURE_INCLUDES})
+        target_link_libraries(test_metal_frame_dump_list PRIVATE Threads::Threads
+            "-framework Metal" "-framework QuartzCore" "-framework Foundation" "-framework AppKit")
+        set_target_properties(test_metal_frame_dump_list PROPERTIES LINKER_LANGUAGE CXX)
+        target_link_options(test_metal_frame_dump_list PRIVATE "-Wl,-dead_strip")
+        list(APPEND RSX_METHODS_TEST_ARGS $<TARGET_FILE:test_metal_frame_dump_list>)
+    endif()
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME rsx_methods
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_rsx_methods.py"
+                ${RSX_METHODS_TEST_ARGS})
+        set_tests_properties(rsx_methods PROPERTIES LABELS "gcm;t0" TIMEOUT 120)
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------

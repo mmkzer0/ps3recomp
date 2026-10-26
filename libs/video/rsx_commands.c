@@ -21,6 +21,7 @@
 #include <string.h>
 #include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
 #include "ps3emu/log_first.h"
+#include "rsx_method_class.h"
 
 /* ---------------------------------------------------------------------------
  * Global backend
@@ -879,15 +880,9 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
      * The draw engine handles the actual present; suppress the unknown log. */
     if (method == 0xE920 || method == 0xE924) return 0;
 
-    /* Unrecognized method -- log in debug builds */
-#ifndef NDEBUG
-    static int s_unknown_count = 0;
-    if (s_unknown_count < 50) {
-        printf("[RSX] unknown method 0x%04X = 0x%08X\n", method, data);
-        s_unknown_count++;
-    }
-#endif
-
+    /* No handler. The caller classifies it (rsx_method_class.h): an allow-listed no-op, or an unknown
+     * method that is counted and fails a capture frame. Logging here was Debug-only and capped at 50
+     * lines, which hid the count in a Release run (M3 gap 3f). */
     return -1;
 }
 
@@ -916,7 +911,14 @@ int rsx_process_command_buffer(rsx_state* state, const u32* buf, u32 size)
             for (u32 i = 0; i < num_data && pos < count; i++) {
                 u32 data = buf[pos++];
                 u32 m = increasing ? (method + i * 4) : method;
-                rsx_process_method(state, m, data);
+                /* SET_OBJECT (0) binds a class; this bounded parser has no binding table, the walker does. */
+                if (rsx_process_method(state, m, data) < 0 && m != 0 &&
+                    !rsx_method_inert(RSX_CLASS_NV4097, m)) {
+                    static int n = 0;
+                    state->unknown_methods++;
+                    if (PS3_LOG_FIRST(n, 16))
+                        fprintf(stderr, "[RSX] unknown method 0x%04X = 0x%08X (command buffer)\n", m, data);
+                }
                 methods_processed++;
             }
         } else if (type == 1) {

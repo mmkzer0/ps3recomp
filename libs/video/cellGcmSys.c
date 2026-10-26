@@ -31,6 +31,8 @@ static u32 s_gcm_context_ea = 0;
 #include "ps3emu/config.h"        /* gcm.wait_timeout_ms */
 #include "gcm_default_state.h"
 #include "rsx_capture.h"
+#include "rsx_method_class.h"
+#include <stdatomic.h>
 
 /* The RSX capture (rsx_capture.cpp), when one is open: NULL otherwise, so a run
  * with capture off costs one pointer test per hook. It is registered before the
@@ -40,6 +42,102 @@ void cellGcm_set_capture_sink(const rsx_capture_sink* sink) { s_cap = sink; }
 /* Set while cellGcmInit rebuilds the base IO mapping: the replay does that
  * itself when it replays gcm-init, so it is not a separate event. */
 static int s_cap_quiet;
+
+/* ---------------------------------------------------------------------------
+ * Object bindings and method verdicts (rsx_method_class.h)
+ * -----------------------------------------------------------------------*/
+
+/* SET_OBJECT per subchannel: the raw handle and the class it resolves to. cellGcmInit clears them: that
+ * is the clean reset a capture starts from, and the FIFO itself resets no binding. */
+static u32 s_subch_handle[8];
+static u8  s_subch_class[8];
+
+static void gcm_bind_object(u32 subch, u32 handle)
+{
+    s_subch_handle[subch & 7u] = handle;
+    s_subch_class[subch & 7u]  = (u8)rsx_class_from_handle(handle);
+}
+
+/* The NV0039 (M2MF) object's registers. One object, whatever subchannel it is bound to. */
+static struct {
+    u32 dma_in, dma_out, off_in, off_out, pitch_in, pitch_out, line_len, line_count, format;
+} s_m2mf;
+static _Atomic unsigned long long s_m2mf_copies;
+
+/* Every method the walker consumes ends in one verdict. Unknown ones are counted per (class, method);
+ * the first GCM_UNKNOWN_LOG_MAX distinct pairs are logged; a capture marks the frame invalid. The
+ * counters are read from another thread (a title printing them at exit), so they are relaxed atomics;
+ * the first-seen subchannel and data word are diagnostics and need no order. */
+#define GCM_UNKNOWN_LOG_MAX 16u
+static _Atomic unsigned long long s_mc_handled, s_mc_inert, s_mc_unknown;
+static struct {
+    _Atomic unsigned long long count;
+    u32 data;
+    u8  subch;
+} s_mc_tab[RSX_CLASS_COUNT][0x800];
+static unsigned s_mc_logged;
+
+/* `handled` says a consumer took the method. Otherwise it is inert (the allow-list, with evidence) or
+ * unknown. The unknown case is deliberately NOT a named stop yet: M3-SCOPE Amendment 1 (finding 5)
+ * holds that stop back until slice S1 has classified the 13 methods G0 found (class-bound routing is
+ * S1's too), because every frame of the title would stop at the first of them. Until then an unknown
+ * method is visible (counter, log, an invalid capture frame) and nothing is claimed about the frame. */
+static void gcm_method_verdict(u32 subch, u32 m, u32 data, int handled)
+{
+    const rsx_class_id cls = (m && m < 0x100u) ? RSX_CLASS_NV406E : (rsx_class_id)s_subch_class[subch & 7u];
+    if (handled) { atomic_fetch_add_explicit(&s_mc_handled, 1, memory_order_relaxed); return; }
+    if (rsx_method_inert(cls, m)) { atomic_fetch_add_explicit(&s_mc_inert, 1, memory_order_relaxed); return; }
+    atomic_fetch_add_explicit(&s_mc_unknown, 1, memory_order_relaxed);
+    const u32 idx = (m >> 2) & 0x7FFu;
+    if (atomic_fetch_add_explicit(&s_mc_tab[cls][idx].count, 1, memory_order_relaxed) == 0) {
+        s_mc_tab[cls][idx].data = data;
+        s_mc_tab[cls][idx].subch = (u8)subch;
+        if (s_mc_logged < GCM_UNKNOWN_LOG_MAX) {
+            s_mc_logged++;
+            fprintf(stderr, "[rsx-method] unknown %s method 0x%04X (subchannel %u, data 0x%08X)\n",
+                    rsx_class_name(cls), m, subch, data);
+        }
+    }
+    if (s_cap) s_cap->note(RSX_CAP_NOTE_UNKNOWN_METHOD, subch, m, data);
+}
+
+void gcm_method_stats(GcmMethodStats* out)
+{
+    if (!out) return;
+    out->handled = atomic_load_explicit(&s_mc_handled, memory_order_relaxed);
+    out->inert   = atomic_load_explicit(&s_mc_inert, memory_order_relaxed);
+    out->unknown = atomic_load_explicit(&s_mc_unknown, memory_order_relaxed);
+    out->m2mf_copies = atomic_load_explicit(&s_m2mf_copies, memory_order_relaxed);
+}
+
+u32 gcm_unknown_methods(GcmUnknownMethod* out, u32 max)
+{
+    u32 n = 0;
+    for (u32 c = 0; c < RSX_CLASS_COUNT; c++)
+        for (u32 i = 0; i < 0x800u; i++) {
+            const unsigned long long count = atomic_load_explicit(&s_mc_tab[c][i].count, memory_order_relaxed);
+            if (!count) continue;
+            if (out && n < max) {
+                out[n].cls = c; out[n].method = i << 2; out[n].count = count;
+                out[n].subch = s_mc_tab[c][i].subch; out[n].data = s_mc_tab[c][i].data;
+            }
+            n++;
+        }
+    return n;
+}
+
+void gcm_method_stats_reset(void)
+{
+    atomic_store_explicit(&s_mc_handled, 0, memory_order_relaxed);
+    atomic_store_explicit(&s_mc_inert, 0, memory_order_relaxed);
+    atomic_store_explicit(&s_mc_unknown, 0, memory_order_relaxed);
+    atomic_store_explicit(&s_m2mf_copies, 0, memory_order_relaxed);
+    for (u32 c = 0; c < RSX_CLASS_COUNT; c++)
+        for (u32 i = 0; i < 0x800u; i++)
+            atomic_store_explicit(&s_mc_tab[c][i].count, 0, memory_order_relaxed);
+}
+
+const char* gcm_method_class_name(u32 cls) { return rsx_class_name((rsx_class_id)cls); }
 
 #ifdef _WIN32
 #include <windows.h>
@@ -632,6 +730,9 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
     memset(s_labels, 0, sizeof(s_labels));
     memset(s_io_address_table, 0xFF, sizeof(s_io_address_table));
     memset(s_ea_address_table, 0xFF, sizeof(s_ea_address_table));
+    memset(s_subch_handle, 0, sizeof(s_subch_handle));
+    memset(s_subch_class, 0, sizeof(s_subch_class));
+    memset(&s_m2mf, 0, sizeof(s_m2mf));
 
     /*
      * Populate a plausible configuration.
@@ -1336,18 +1437,191 @@ static void nv3089_engine_wrote(u32 dst_pitch, u32 x0, u32 y0, u32 x1, u32 y1)
  * pixel: an SPU holding a reservation on a 128-byte line the row overwrites
  * loses it and gets its lost-reservation event. The two byte swaps a
  * vm_read32/vm_write32 pair does cancel, so the bytes move verbatim. */
+static int gcm_span_reserved(u32 d, u32 n)
+{
+    const u32 l0 = d & ~127u, l1 = (d + n - 1) & ~127u;
+    for (u32 a = l0; a <= l1; a += 128)
+        if (spu_coh_is_reserved(a)) return 1;
+    return 0;
+}
+
+static void gcm_span_written(u32 d, u32 n)
+{
+    const u32 l0 = d & ~127u, l1 = (d + n - 1) & ~127u;
+    for (u32 a = l0; a <= l1; a += 128)
+        if (spu_coh_is_reserved(a)) spu_coh_notify_write(a);
+}
+
+/* Store `n` host bytes at guest `d` with that bookkeeping. `s` may overlap the guest span (memmove). */
+static void gcm_row_store(u32 d, const u8* s, u32 n)
+{
+    extern u8* vm_base;
+    if (!gcm_span_reserved(d, n)) { memmove(vm_base + d, s, n); return; }
+    spu_lockline_lock();
+    memmove(vm_base + d, s, n);
+    gcm_span_written(d, n);
+    spu_lockline_unlock();
+}
+
 static void gcm_row_copy(u32 d, u32 s, u32 n)
 {
     extern u8* vm_base;
-    const u32 l0 = d & ~127u, l1 = (d + n - 1) & ~127u;
-    int reserved = 0;
-    for (u32 a = l0; a <= l1 && !reserved; a += 128) reserved = spu_coh_is_reserved(a);
-    if (!reserved) { memmove(vm_base + d, vm_base + s, n); return; }
-    spu_lockline_lock();
-    memmove(vm_base + d, vm_base + s, n);
-    for (u32 a = l0; a <= l1; a += 128)
-        if (spu_coh_is_reserved(a)) spu_coh_notify_write(a);
-    spu_lockline_unlock();
+    gcm_row_store(d, vm_base + s, n);
+}
+
+/* ---------------------------------------------------------------------------
+ * NV0039 (M2MF buffer copy)
+ *
+ * BUFFER_NOTIFY (0x328) runs the copy the other registers describe: LINE_COUNT rows of LINE_LENGTH
+ * elements. An element is one byte, read every `input increment` bytes and written every `output
+ * increment` bytes (FORMAT bits 0-7 and 8-15: 1, 2 or 4 on this chip), and rows are PITCH apart, a signed
+ * distance. Register layout and the 1/2/4 increments: envytools rnndb graph/nv_m2mf.xml. Row order and
+ * overlap follow RPCS3 Emu/RSX/NV47/HW/nv0039.cpp (e53ac18f, read as a reference, nothing taken):
+ *   - rows are copied in ascending order;
+ *   - an overlapping plain copy behaves as if the whole source were read first (RPCS3: memmove for a
+ *     block, a packed temporary for rows);
+ *   - an overlapping copy with an increment above 1 is NOT snapshotted: the elements move one at a time
+ *     and a later element can read what an earlier one wrote.
+ * RPCS3 also accepts increments 3, and a zero-sized copy is a no-op there; this one stops on a bad
+ * increment (even for a zero-sized copy) and does nothing for an empty one.
+ * -----------------------------------------------------------------------*/
+#define GCM_M2MF_FN "cellGcm_rsx_process_fifo"
+
+static u32 gcm_m2mf_inc(u32 inc, const char* which)
+{
+    if (inc == 1u || inc == 2u || inc == 4u) return inc;
+    char why[128];
+    snprintf(why, sizeof why, "NV0039 FORMAT %s increment is %u; only 1, 2 and 4 are modelled", which, inc);
+    ps3_stop_gcm_unmodelled(GCM_M2MF_FN, "m2mf-increment", why);
+}
+
+static u32 gcm_m2mf_location(u32 dma, const char* which)
+{
+    if (dma == 0xFEED0000u) return RSX_CAP_LOC_LOCAL;
+    if (dma == 0xFEED0001u) return RSX_CAP_LOC_MAIN;
+    char why[128];
+    snprintf(why, sizeof why, "NV0039 %s DMA object 0x%08X is neither local (0xFEED0000) nor main (0xFEED0001)",
+             which, dma);
+    ps3_stop_gcm_unmodelled(GCM_M2MF_FN, "m2mf-dma", why);
+}
+
+/* The guest EA of RSX offset `lo` for the whole extent [lo, hi), which must lie in the 32-bit offset
+ * space and map to one contiguous run of guest memory. Every bound is summed in 64 bits, before the first
+ * byte moves, so nothing wraps. */
+static u64 gcm_m2mf_extent(const char* which, u32 loc, int64_t lo, int64_t hi)
+{
+    const u64 size = (u64)(hi - lo);
+    if (lo < 0 || hi > (int64_t)0x100000000ll)
+        ps3_stop_guest_range(GCM_M2MF_FN, which, (u64)lo, size, 0x100000000ull);
+    u64 ea;
+    if (loc == RSX_CAP_LOC_LOCAL) {
+        ea = cellGcmResolveLocated(1, (u32)lo);
+        if (ea != (u64)s_config.localAddress + (u64)lo)    /* the helper's 32-bit sum wrapped */
+            ps3_stop_guest_range(GCM_M2MF_FN, which, (u64)s_config.localAddress + (u64)lo, size, gcm_vm_limit());
+    } else {
+        ea = cellGcmResolveLocated(0, (u32)lo);
+        if (!ea) ps3_stop_guest_range(GCM_M2MF_FN, which, 0, size, gcm_vm_limit());
+        /* IO pages map independently: a span that crosses one is contiguous in guest memory only if the
+         * next page maps to the next 1 MiB. */
+        const u64 first_page_ea = ea - ((u64)lo & 0xFFFFFull);
+        for (u64 p = ((u64)lo >> 20) + 1; p <= ((u64)hi - 1) >> 20; p++)
+            if (cellGcmResolveLocated(0, (u32)(p << 20)) != first_page_ea + ((p - ((u64)lo >> 20)) << 20))
+                ps3_stop_guest_range(GCM_M2MF_FN, which, ea, size, gcm_vm_limit());
+    }
+    if (!gcm_span_ok(ea, size)) ps3_stop_guest_range(GCM_M2MF_FN, which, ea, size, gcm_vm_limit());
+    return ea;
+}
+
+static void gcm_nv0039_copy(void)
+{
+    extern u8* vm_base;
+    const u32 in_inc  = gcm_m2mf_inc(s_m2mf.format & 0xFFu, "input");
+    const u32 out_inc = gcm_m2mf_inc((s_m2mf.format >> 8) & 0xFFu, "output");
+    const u64 cols = s_m2mf.line_len, rows = s_m2mf.line_count;
+    if (!cols || !rows) return;
+    const u32 in_loc  = gcm_m2mf_location(s_m2mf.dma_in, "input");
+    const u32 out_loc = gcm_m2mf_location(s_m2mf.dma_out, "output");
+
+    /* The bytes each side touches: the first row's offset plus the rows' signed spread, plus one row's
+     * reach. Whole spans are resolved and bounded before any byte moves. */
+    const int64_t pin = (int32_t)s_m2mf.pitch_in, pout = (int32_t)s_m2mf.pitch_out;
+    const int64_t sback = (int64_t)(rows - 1) * pin, dback = (int64_t)(rows - 1) * pout;
+    const int64_t smin = sback < 0 ? sback : 0, dmin = dback < 0 ? dback : 0;
+    const int64_t srow = (int64_t)((cols - 1) * in_inc + 1), drow = (int64_t)((cols - 1) * out_inc + 1);
+    const int64_t slo = (int64_t)s_m2mf.off_in + smin, shi = (int64_t)s_m2mf.off_in + (sback > 0 ? sback : 0) + srow;
+    const int64_t dlo = (int64_t)s_m2mf.off_out + dmin, dhi = (int64_t)s_m2mf.off_out + (dback > 0 ? dback : 0) + drow;
+    const u64 sea = gcm_m2mf_extent("m2mf-source", in_loc, slo, shi);
+    const u64 dea = gcm_m2mf_extent("m2mf-destination", out_loc, dlo, dhi);
+    const u64 slen = (u64)(shi - slo), dlen = (u64)(dhi - dlo);
+    if (slen > 0xFFFFFFFFull) ps3_stop_guest_range(GCM_M2MF_FN, "m2mf-source", sea, slen, 0xFFFFFFFFull);
+    if (dlen > 0xFFFFFFFFull) ps3_stop_guest_range(GCM_M2MF_FN, "m2mf-destination", dea, dlen, 0xFFFFFFFFull);
+
+    /* The source is consumed through the capture when one is open, so what moves is what was recorded. */
+    const u8* sv = vm_base + sea;
+    if (s_cap)
+        sv = s_cap->read(in_loc, (u32)slo, (u32)sea, vm_base + sea, (u32)slen, RSX_CAP_READ_DMA_SOURCE);
+
+    const int overlap = sea < dea + dlen && dea < sea + slen;
+    if (in_inc != 1u || out_inc != 1u) {
+        const u8* s = overlap ? vm_base + sea : sv;    /* overlapping: see the header comment */
+        for (int64_t r = 0; r < (int64_t)rows; r++) {
+            const u8* sr = s + (r * pin - smin);
+            const u32 d = (u32)(dea + (u64)(r * pout - dmin));
+            const int reserved = gcm_span_reserved(d, (u32)drow);
+            if (reserved) spu_lockline_lock();
+            for (u64 c = 0; c < cols; c++) vm_base[d + c * out_inc] = sr[c * in_inc];
+            if (reserved) { gcm_span_written(d, (u32)drow); spu_lockline_unlock(); }
+        }
+    } else {
+        const int block = pin == (int64_t)cols && pout == (int64_t)cols;
+        u8* tmp = NULL;
+        if (overlap) {
+            tmp = (u8*)malloc((size_t)(cols * rows));
+            if (!tmp) {
+                char why[96];
+                snprintf(why, sizeof why, "no host memory for the %llu-byte overlap buffer", cols * rows);
+                ps3_stop_gcm_unmodelled(GCM_M2MF_FN, "m2mf-overlap", why);
+            }
+            for (int64_t r = 0; r < (int64_t)rows; r++)
+                memcpy(tmp + (u64)r * cols, sv + (r * pin - smin), (size_t)cols);
+            sv = tmp;
+        }
+        if (block) {
+            gcm_row_store((u32)dea, sv, (u32)(cols * rows));
+        } else {
+            for (int64_t r = 0; r < (int64_t)rows; r++)
+                gcm_row_store((u32)(dea + (u64)(r * pout - dmin)),
+                              overlap ? tmp + (u64)r * cols : sv + (r * pin - smin), (u32)cols);
+        }
+        free(tmp);
+    }
+    if (s_cap) s_cap->write(out_loc, (u32)dlo, (u32)dea, vm_base + dea, (u32)dlen, RSX_CAP_WRITE_DMA);
+    atomic_fetch_add_explicit(&s_m2mf_copies, 1, memory_order_relaxed);
+    { static int n = 0;
+      if (PS3_LOG_FIRST(n, 4))
+          fprintf(stderr, "[NV0039] %llux%llu inc %u/%u: %s 0x%08X pitch %d -> %s 0x%08X pitch %d%s\n", cols, rows,
+                  in_inc, out_inc, in_loc ? "main" : "local", s_m2mf.off_in, (int)pin,
+                  out_loc ? "main" : "local", s_m2mf.off_out, (int)pout, overlap ? " (overlap)" : ""); }
+}
+
+/* One NV0039 method. 1 when it was consumed. DMA_NOTIFY (0x180) is allow-listed inert in
+ * rsx_method_class.h; the rest of the object's methods have no register here. */
+static int gcm_nv0039_method(u32 method, u32 data)
+{
+    switch (method) {
+    case 0x0000: return 1;                          /* SET_OBJECT: bound by the walker */
+    case 0x0184: s_m2mf.dma_in = data; return 1;     /* DMA_BUFFER_IN */
+    case 0x0188: s_m2mf.dma_out = data; return 1;    /* DMA_BUFFER_OUT */
+    case 0x030C: s_m2mf.off_in = data; return 1;     /* OFFSET_IN */
+    case 0x0310: s_m2mf.off_out = data; return 1;    /* OFFSET_OUT */
+    case 0x0314: s_m2mf.pitch_in = data; return 1;   /* PITCH_IN */
+    case 0x0318: s_m2mf.pitch_out = data; return 1;  /* PITCH_OUT */
+    case 0x031C: s_m2mf.line_len = data; return 1;   /* LINE_LENGTH_IN */
+    case 0x0320: s_m2mf.line_count = data; return 1; /* LINE_COUNT */
+    case 0x0324: s_m2mf.format = data; return 1;     /* FORMAT */
+    case 0x0328: gcm_nv0039_copy(); return 1;        /* BUFFER_NOTIFY: the trigger */
+    }
+    return 0;
 }
 
 static void nv3089_blit(void)
@@ -1552,12 +1826,12 @@ static void nv3089_blit(void)
                out_w, out_h, f, src, in_pitch, dst, dst_pitch, out_x, out_y); } }
 }
 
-static void gcm_2d_method(u32 subch, u32 method, u32 data)
+static int gcm_2d_method(u32 subch, u32 method, u32 data)
 {
     /* GCM2D_TRACE=1: histogram of (subchannel, method) actually seen. The
      * subchannel a title binds each 2D object to is libgcm-version-specific and
-     * SET_OBJECT binds are not tracked, so state landing on an unexpected
-     * subchannel is silently dropped -- which looks like a blit using stale
+     * this function still routes by subchannel number, so state landing on an
+     * unexpected subchannel is dropped -- which looks like a blit using stale
      * destination state rather than like missing state. */
     { static int tr = -1;
       if (tr < 0) { const char* e = getenv("GCM2D_TRACE"); tr = e ? atoi(e) : 0; }
@@ -1578,18 +1852,19 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
               printf("---%c", 10);
           }
       } }
-    /* Subchannel bindings are libgcm-version-specific (SET_OBJECT binds are
-     * not tracked): demosaic's SDK emits dest-surface on sub 3 and image-from-
-     * CPU on sub 5 (cellGcmSetInlineTransfer: 0x4630C / 0xCA304 / 0xA400
-     * headers); other versions use the classic 2 / 4. Accept both. */
+    /* Routing is still by subchannel number (only NV0039 is routed by its binding, before this runs):
+     * demosaic's SDK emits dest-surface on sub 3 and image-from-CPU on sub 5 (cellGcmSetInlineTransfer:
+     * 0x4630C / 0xCA304 / 0xA400 headers); other versions use the classic 2 / 4. Accept both. Routing every
+     * class by its bound object is slice S1's. Returns 1 when a case below consumed the method; the
+     * caller turns that into a verdict. */
     if (subch == 2 || subch == 3) {         /* NV3062 context surface 2D */
         switch (method) {
-        case 0x0184: case 0x0188: s_gcm2d.dst_dma = data; return;
-        case 0x0300: s_gcm2d.color_fmt  = data; return;
-        case 0x0304: s_gcm2d.pitch      = data; return;
-        case 0x030C: s_gcm2d.dst_offset = data; return;
+        case 0x0184: case 0x0188: s_gcm2d.dst_dma = data; return 1;
+        case 0x0300: s_gcm2d.color_fmt  = data; return 1;
+        case 0x0304: s_gcm2d.pitch      = data; return 1;
+        case 0x030C: s_gcm2d.dst_offset = data; return 1;
         }
-        return;
+        return 0;
     }
     if (subch == 4 || subch == 5) {         /* NV308A image-from-CPU, or NV309E */
         /* NV309E swizzled-surface state. SET_FORMAT (0x0300) does not exist on
@@ -1600,13 +1875,15 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
                 printf("[NV309E] format=0x%08X (log2 %ux%u fmt=0x%X)%c", data,
                        1u << ((data >> 16) & 0xFF), 1u << ((data >> 24) & 0xFF),
                        data & 0xFFFF, 10); }
-            return; }
+            return 1; }
         if (method == 0x0304 && s_nv309e.active && s_nv309e.subch == (int)subch) {
-            s_nv309e.offset = data; return; }
+            s_nv309e.offset = data; return 1; }
         switch (method) {
-        case 0x0304: s_gcm2d.point    = data; return;
-        case 0x0308: s_gcm2d.size_out = data; return;
-        case 0x030C: return;                /* SIZE_IN */
+        case 0x0304: s_gcm2d.point    = data; return 1;
+        case 0x0308: s_gcm2d.size_out = data; return 1;
+        /* SIZE_IN: ignored since the first NV308A path, with no evidence that nothing depends on it, so it
+         * is not allow-listed: it counts as an unknown method until S1 decides. */
+        case 0x030C: return 0;
         }
         if (method >= 0x0400 && method <= 0x07FC) {
             /* COLOR data word: write into the destination surface. Inline
@@ -1624,9 +1901,9 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
                          base + py * dst_pitch + px * 4, s_gcm2d.dst_offset,
                          s_gcm2d.dst_dma, px, py, dst_pitch, data); }
             vm_write32(base + py * dst_pitch + px * 4, data);
-            return;
+            return 1;
         }
-        return;
+        return 0;
     }
     /* NV3089 "scaled image from memory" -- the blit PSGL uses to move a texture
      * it has assembled elsewhere into the VRAM the sampler reads. Without it a
@@ -1640,33 +1917,30 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
      * offset, 0x040C in u/v start -- which is also the trigger. */
     if (subch == 6 || subch == 7) {
         switch (method) {
-        case 0x0184: s_nv3089.src_dma   = data; return;
-        case 0x0198: s_nv3089.dst_surf  = data; return;
-        case 0x0300: s_nv3089.fmt       = data; return;
-        case 0x0304: s_nv3089.op        = data; return;
-        case 0x0308: s_nv3089.clip_pt   = data; return;
-        case 0x030C: s_nv3089.clip_sz   = data; return;
-        case 0x0310: s_nv3089.out_pt    = data; return;
-        case 0x0314: s_nv3089.out_sz    = data; return;
-        case 0x0318: s_nv3089.ds_dx     = data; return;
-        case 0x031C: s_nv3089.dt_dy     = data; return;
-        case 0x0400: s_nv3089.in_sz     = data; return;
-        case 0x0404: s_nv3089.in_fmt    = data; return;
-        case 0x0408: s_nv3089.in_off    = data; return;
-        case 0x040C: s_nv3089.in_uv     = data; nv3089_blit(); return;
+        case 0x0184: s_nv3089.src_dma   = data; return 1;
+        case 0x0198: s_nv3089.dst_surf  = data; return 1;
+        case 0x0300: s_nv3089.fmt       = data; return 1;
+        case 0x0304: s_nv3089.op        = data; return 1;
+        case 0x0308: s_nv3089.clip_pt   = data; return 1;
+        case 0x030C: s_nv3089.clip_sz   = data; return 1;
+        case 0x0310: s_nv3089.out_pt    = data; return 1;
+        case 0x0314: s_nv3089.out_sz    = data; return 1;
+        case 0x0318: s_nv3089.ds_dx     = data; return 1;
+        case 0x031C: s_nv3089.dt_dy     = data; return 1;
+        case 0x0400: s_nv3089.in_sz     = data; return 1;
+        case 0x0404: s_nv3089.in_fmt    = data; return 1;
+        case 0x0408: s_nv3089.in_off    = data; return 1;
+        case 0x040C: s_nv3089.in_uv     = data; nv3089_blit(); return 1;
         }
-        return;
+        return 0;
     }
-    /* NV0039 / NV309E: not implemented yet -- log first sightings. */
-    /* GCM2D_DBG=<N> raises the cap and adds the data word: the fixed 8 showed
-     * only that SOMETHING was unhandled, not enough to implement it. */
+    /* Subchannels 0 and 1 reach here only under GCM_SUBCH1_2D=1. GCM2D_DBG=<N> raises the cap on the
+     * first-sighting log and adds the data word. */
     static int warned = 0, wcap = -1;
     if (wcap < 0) { const char* e = getenv("GCM2D_DBG"); wcap = e ? atoi(e) : 8; }
     if (warned < wcap) { warned++;
         printf("[GCM2D-UNH] subch %u method 0x%04X data=0x%08X\n", subch, method, data); }
-    if (0)
-        printf("[cellGcmSys] FIFO subch %u method 0x%04X (unhandled 2D engine)\n",
-               subch, method);
+    return 0;
 }
 
 /* Present gate for the ticker: a flip is ready once the drain has consumed
@@ -2072,6 +2346,32 @@ void cellGcm_ref_on_poll(void)
 }
 
 static uint64_t s_ft_sema_t0;          /* PS3_FTRACE: when the walker began waiting on the current acquire */
+/* GCM_METHOD_STATS=<secs>: every <secs>, what the walker has done with the methods it consumed so far --
+ * the verdict totals, the NV0039 copies run, and every (class, method) it counted as unknown. A diagnostic
+ * only: the counters themselves are exported through gcm_method_stats(). Walker thread. */
+static void gcm_method_stats_report(void)
+{
+    static int secs = -1;
+    static unsigned long long t0;
+    if (secs < 0) { const char* e = getenv("GCM_METHOD_STATS"); secs = e ? atoi(e) : 0; }
+    if (secs <= 0) return;
+    extern unsigned long long ps3_ms_now(void);
+    const unsigned long long now = ps3_ms_now();
+    if (!t0) t0 = now;
+    if (now - t0 < (unsigned long long)secs * 1000u) return;
+    t0 = now;
+    GcmMethodStats st;
+    gcm_method_stats(&st);
+    fprintf(stderr, "[rsx-method-stats] handled=%llu inert=%llu unknown=%llu m2mf_copies=%llu\n", st.handled,
+            st.inert, st.unknown, st.m2mf_copies);
+    for (u32 c = 0; c < RSX_CLASS_COUNT; c++)
+        for (u32 i = 0; i < 0x800u; i++) {
+            const unsigned long long n = atomic_load_explicit(&s_mc_tab[c][i].count, memory_order_relaxed);
+            if (n) fprintf(stderr, "[rsx-method-stats]   %s 0x%04X x%llu (first: subchannel %u, data 0x%08X)\n",
+                           rsx_class_name((rsx_class_id)c), i << 2, n, s_mc_tab[c][i].subch, s_mc_tab[c][i].data);
+        }
+}
+
 
 void cellGcm_rsx_process_fifo(void)
 {
@@ -2082,6 +2382,7 @@ void cellGcm_rsx_process_fifo(void)
     gcm_rsx_process_fifo_unlocked();
     atomic_fetch_add(&s_pass_end, 1);
     ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
+    gcm_method_stats_report();
     if (ft_t0) {
         const uint64_t t1 = ps3_ft_now();
         if (t1 - ft_t0 >= ps3_ft_min_ns())
@@ -2542,6 +2843,17 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
                 if (!dea) break;
                 u32 m = (type == 0) ? method + i * 4 : method;
+                const u32 mdata = vm_read32(dea);
+                /* SET_OBJECT binds before anything else reads the word: what follows on this subchannel
+                 * is that object's. */
+                if (m == 0) gcm_bind_object(subch, mdata);
+                /* NV0039 is routed by its binding, not by a subchannel number. Its methods never reach
+                 * the 3D register file or the live-draw mirror: NV0039's 0x0304-0x0328 are NV4097's
+                 * alpha, blend and colour-mask state there. */
+                if (s_subch_class[subch] == RSX_CLASS_NV0039) {
+                    gcm_method_verdict(subch, m, mdata, gcm_nv0039_method(m, mdata));
+                    continue;
+                }
                 /* GCM_SET_USER_COMMAND is method 0xEB00, which this decode
                  * splits into subchannel 7 / method 0x0B00 -- so it was landing
                  * in the 2D engine path and being dropped as unrecognised. It
@@ -2563,6 +2875,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                      * it for the pump here. */
                     gcm_driver_event(GCM_DRV_EVENT_USER_COMMAND, vm_read32(dea));
                     if (s_user_handler_opd) cellGcmQueueUserCommand(vm_read32(dea));
+                    gcm_method_verdict(subch, m, mdata, 1);
                     continue;
                 }
                 /* GCM_SUBCH1_3D=1: treat subchannel 1 as the 3D object too.
@@ -2684,6 +2997,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * truncates them.  Reconstruct the full address the same way
                  * the draw-engine call above does. */
                 { const u32 mfull = (subch << 13) | m;
+                int handled = 1;   /* the driver words below are consumed in place */
                 if (mfull == 0xEB00u || mfull == 0xEB04u) {
                     gcm_driver_event(GCM_DRV_EVENT_USER_COMMAND, vm_read32(dea));
                     cellGcmQueueUserCommand(vm_read32(dea));
@@ -2712,7 +3026,11 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 } else if (mfull == 0xE920u || mfull == 0xE924u) {
                     cellGcmSetFlipCommand(vm_read32(dea) & 7u);
                 } else if (subch == 0 || (subch == 1 && !s1_2d)) {
-                    rsx_process_method(&s_state, m, vm_read32(dea));
+                    const int rc = rsx_process_method(&s_state, m, vm_read32(dea));
+                    /* Handled when the state machine took it, or -- with the register-file engine on --
+                     * when the engine has a consumer for it. SET_OBJECT is the binding table's. */
+                    handled = rc == 0 || m == 0 ||
+                              (rsx_draw_engine_enabled() && rsx_dsp_method_class(m) != RSX_DSP_CLASS_TODO);
                     /* NV406E_SET_REFERENCE: queue the fence value for PACED
                      * publication (gcm_ref_publish below) instead of letting a
                      * later fence in the same batch overwrite it. */
@@ -2744,7 +3062,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
                         }
                     }
                 } else
-                    gcm_2d_method(subch, m, vm_read32(dea));
+                    handled = gcm_2d_method(subch, m, vm_read32(dea));
+                gcm_method_verdict(subch, m, mdata, handled);
                 }
             }
             s_fifo_getoff += 4 + count * 4;

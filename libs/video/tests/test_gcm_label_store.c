@@ -50,6 +50,7 @@ void rsx_state_init(rsx_state* state) { (void)state; }
 int  rsx_process_method(rsx_state* state, u32 method, u32 data) { (void)state; (void)method; (void)data; return 0; }
 int  rsx_draw_engine_enabled(void) { return 0; }
 void rsx_draw_engine_method(u32 method, u32 arg) { (void)method; (void)arg; }
+u32  rsx_dsp_method_class(u32 method) { (void)method; return RSX_DSP_CLASS_TODO; }
 void rsx_draw_engine_note_flip(u32 buffer_id) { (void)buffer_id; }
 void rsx_draw_engine_guest_read(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
 void rsx_draw_engine_guest_wrote(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
@@ -78,6 +79,19 @@ void ps3_stop_gcm_wait_timeout(const char* func, const char* what, uint32_t offs
     printf("[STOP] gcm-wait-timeout func=%s what=%s offset=0x%08X value=0x%08X current=0x%08X waited_ms=%u\n", func,
            what, offset, value, current, waited_ms);
     fflush(stdout);
+    exit(70);
+}
+/* The NV0039 copy's stops: no fixture here copies, so reaching one is a bug. */
+PS3_NORETURN void ps3_stop_gcm_unmodelled(const char* func, const char* feature, const char* reason)
+{
+    printf("[FAIL] gcm-unmodelled in %s: %s: %s\n", func, feature, reason);
+    exit(70);
+}
+PS3_NORETURN void ps3_stop_guest_range(const char* func, const char* arg, uint64_t ea, uint64_t size,
+                                       uint64_t limit)
+{
+    printf("[FAIL] hle-guest-range in %s: %s ea 0x%llX size 0x%llX limit 0x%llX\n", func, arg,
+           (unsigned long long)ea, (unsigned long long)size, (unsigned long long)limit);
     exit(70);
 }
 

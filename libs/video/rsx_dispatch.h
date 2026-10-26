@@ -155,6 +155,11 @@ void rsx_dispatch_seed_transform_constants(rsx_dispatch* rsx, const u32* words, 
 /* Dispatch one register write. */
 void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg);
 
+/* The coverage class (RSX_DSP_CLASS_*) this dispatcher gives a method number, whether or not any
+ * instance exists. RSX_DSP_CLASS_TODO means no consumer of the register file is known to read it: the
+ * FIFO walker counts such a method as unknown unless rsx_method_class.h allow-lists it. */
+u32 rsx_dsp_method_class(u32 method);
+
 /* ---- decoded state getters -------------------------------------------- */
 
 static inline u32 rsx_dsp_reg(const rsx_dispatch* rsx, u32 method)
