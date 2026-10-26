@@ -451,6 +451,9 @@ if(PS3RECOMP_BUILD_TESTS)
     # works on arm64 is a question to answer rather than assume.
     add_subdirectory(tests/fiber_switch)
     add_subdirectory(tests/sync2_semaphore)
+    # Differential harness (HLE vs lifted firmware); inert unless PS3RECOMP_DIFF_FW_DIR names a
+    # lifted module kept outside the repository (tests/diff_harness/CMakeLists.txt).
+    add_subdirectory(tests/diff_harness)
     if(UNIX)
         add_subdirectory(tests/jq2_fiber)
     endif()
