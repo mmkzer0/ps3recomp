@@ -158,7 +158,10 @@ int main(void)
         const u32 zs = eng_zdepth_get(RSX_LOCATION_LOCAL, ZETA_OFF, W, H);
         T(zs != ENG_INVALID && g.zdepths[zs].had_write, "the draw wrote the depth target");
         if (zs != ENG_INVALID && s_engine_backend.depth_readback) {
-            float d[4];
+            /* One row of W floats: the call copies (W - 16) floats at `out_pitch` bytes each. A
+             * four-element buffer held the whole row in an earlier version; ASan caught the
+             * stack overflow and the release builds read past the array for the samples below. */
+            float d[W];
             const int ok = s_engine_backend.depth_readback(NULL, g.zdepths[zs].handle,
                                                            8, H / 2, W - 16, 1, d, (W - 16) * 4);
             T(ok == 0, "the depth buffer reads back");
