@@ -249,6 +249,14 @@ def test_walker(tmp):
     check(p.returncode == 70 and f and f["kind"] == "rsx-capture" and f["reason"] == "output-exists",
           f"a directory that holds a capture is refused ({p.returncode} {f})")
 
+    # Passes the walker spent waiting on the ACQUIRE are host timing: they leave nothing in the capture, not even
+    # a gap in the read ordinals, so the capture hash is the one of a run that waited once.
+    r = Path(tmp) / "walker-retries"
+    p = run(WALKER, r, "retries")
+    check(p.returncode == 0, f"the walker fixture runs with seven more waiting passes ({p.returncode})")
+    end = lambda cap: [e for e in events(cap) if e["event"] == "capture-end"][0]["capture_hash"]["value"]
+    check(p.returncode == 0 and end(r) == end(d), "the capture hash does not depend on how many passes waited on the acquire")
+
     p = run(WALKER, Path(tmp) / "walker-mid", "midstream")
     f = stop_of(p)
     check(p.returncode == 70 and f and f["kind"] == "rsx-capture" and f["reason"] == "midstream",

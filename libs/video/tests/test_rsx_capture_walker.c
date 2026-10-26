@@ -8,8 +8,8 @@
  *   - a NV406E semaphore: OFFSET, RELEASE (a write), ACQUIRE that waits (no event: the walker reads
  *     it again next pass) and then consumes the label's value as it stood at that moment.
  *
- * argv[2], when given, names a scenario that must END IN A STOP; the process then exits 70 through
- * the stop and the Python side asserts the machine line:
+ * argv[2], when given, names a scenario. "retries" runs to the end like the default one; the others must END IN A
+ * STOP: the process then exits 70 through the stop and the Python side asserts the machine line:
  *   midstream      the first RSX command comes before any cellGcmSetupContext
  *
  * cc -std=gnu17 ... (CMake target test_rsx_capture_walker)
@@ -133,6 +133,10 @@ int main(int argc, char** argv)
     const u32 label_ea = GCM_LABEL_GUEST_BASE + LABEL * GCM_LABEL_STRIDE;
     vm_write32(GCM_CONTROL_GUEST_ADDR + 0, at);
     cellGcm_rsx_process_fifo();
+    /* "retries": the walker sits on the ACQUIRE for several more passes before the agent arrives. How many is
+     * host timing, so it must not show in the capture (the read ordinals of a cancelled step are given back). */
+    if (!strcmp(scenario, "retries"))
+        for (int i = 0; i < 7; i++) cellGcm_rsx_process_fifo();
     int ok = vm_read32(label_ea) == 7u && s_fifo_getoff < at;
     printf("[%s] the walk stops at the ACQUIRE (label %u, get 0x%x of 0x%x)\n", ok ? "PASS" : "FAIL",
            vm_read32(label_ea), s_fifo_getoff, at);

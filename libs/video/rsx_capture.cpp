@@ -128,6 +128,7 @@ struct Cap {
     std::deque<std::vector<u8>> arena;
     std::vector<std::pair<u32, u32>> binds;
     u32 bound_at_start = 0;
+    u64 step_consume0 = 0;      // consume_seq when the open step began
 
     // A run of consecutive zero words, written as one event.
     bool nop = false;
@@ -412,6 +413,7 @@ void s_step_begin(const rsx_cap_step* s)
     C.step.words = C.words.data();
     C.reads.clear(); C.writes.clear(); C.arena.clear(); g_read_copies.clear(); C.binds.clear();
     C.in_step = true;
+    C.step_consume0 = C.consume_seq;
     C.program_sha.clear();
     memcpy(C.bound_before, C.bound, sizeof C.bound);
     C.bound_at_start = s->subch < 8 ? C.bound[s->subch] : 0;
@@ -449,6 +451,9 @@ void s_step_cancel()
 {
     if (!C.in_step) return;
     C.in_step = false;
+    // A wait the walker retried leaves nothing behind, the read ordinals included: how many passes sat on an
+    // ACQUIRE is host timing, and consume_seq is part of the capture hash.
+    C.consume_seq = C.step_consume0;
     memcpy(C.bound, C.bound_before, sizeof C.bound);
     C.reads.clear(); C.writes.clear(); C.arena.clear(); g_read_copies.clear(); C.binds.clear();
 }
