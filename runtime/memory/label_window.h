@@ -50,10 +50,11 @@ static inline int ps3_label_window_maybe(uint32_t ea, uint32_t n)
 void ps3_label_window_store(uint32_t ea, uint32_t n, uint32_t value);
 
 /* The exact overlap decision, for a device that writes guest memory itself (an
- * SPU MFC PUT/PUTL). n is the transfer size in bytes. */
+ * SPU MFC PUT/PUTL, or an atomic PUTLLC/PUTLLUC/PUTQLLUC line). n is the
+ * transfer size in bytes. */
 int ps3_label_window_overlaps(uint64_t ea, uint32_t n);
 
-/* Process-wide count of SPU PUT/PUTL transfers whose span overlapped the
+/* Process-wide count of SPU PUT/PUTL and atomic put transfers whose span overlapped the
  * window. Bumped before the named stop, so it is observable from the first
  * such transfer on (the stop's `count` field, or this accessor). */
 unsigned long long ps3_label_window_spu_puts(void);

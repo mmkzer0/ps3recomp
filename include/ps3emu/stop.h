@@ -116,7 +116,7 @@ extern "C" {
     X(JQ2_UNMODELLED,           "jq2-unmodelled")                              \
     /* An MFC transfer the hardware rejects (a command/alignment error). */   \
     X(SPU_MFC_ERROR,            "spu-mfc-error")                               \
-    /* An SPU PUT/PUTL into the store window a device model registered (the RSX label window). */ \
+    /* An SPU PUT/PUTL, or an atomic PUTLLC/PUTLLUC/PUTQLLUC line, into the store window a device model registered (the RSX label window). */ \
     X(SPU_LABEL_WINDOW,         "spu-label-window")                            \
     /* An in-range guest span the host could not make accessible (vm_commit). */ \
     X(HLE_COMMIT_FAILED,        "hle-commit-failed")                           \
@@ -219,7 +219,8 @@ PS3_NORETURN void ps3_stop_gcm_unmodelled(const char* func, const char* feature,
 PS3_NORETURN void ps3_stop_gcm_wait_timeout(const char* func, const char* what, uint32_t offset,
                                             uint32_t value, uint32_t current, uint32_t waited_ms);
 
-/* Generic helper to raise PS3_STOP_SPU_LABEL_WINDOW: an SPU MFC PUT/PUTL whose span overlaps the guest
+/* Generic helper to raise PS3_STOP_SPU_LABEL_WINDOW: an SPU MFC PUT/PUTL, or an atomic PUTLLC/PUTLLUC/PUTQLLUC
+ * line (#51), whose span overlaps the guest
  * store window a device model registered (libs/video/cellGcmSys.c registers the RSX label window). The
  * runtime cannot know whether the PUT produces the value an RSX ACQUIRE is waiting for (it would have to
  * land before the walker reads the ACQUIRE) or overwrites a label the walker has not read yet (it would

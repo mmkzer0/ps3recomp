@@ -680,6 +680,27 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         return spu_mfc_atomic_done(ctx, cmd);
     }
 
+    /* #51: an atomic line store is a PUT into one 128-byte line, so it is the
+     * same unorderable store #34 counted and stopped for the plain MFC PUT
+     * (spu_dma.h, mfc_do_transfer). PUTLLC, PUTLLUC and PUTQLLUC all write all
+     * 128 bytes, and every one of them writes the window whenever the line
+     * overlaps it. The check is BEFORE the lock-line lock and before any byte
+     * of the line is read or committed: whether a PUTLLC's reservation would
+     * have succeeded is exactly the guess the runtime must not make, so every
+     * form fails closed here. GETLLAR is a load and is not checked. */
+    if ((cmd == MFC_PUTLLC_CMD || cmd == MFC_PUTLLUC_CMD || cmd == MFC_PUTQLLUC_CMD) &&
+        ps3_label_window_maybe(ea, MFC_ATOMIC_LINE) &&
+        ps3_label_window_overlaps(ea, MFC_ATOMIC_LINE)) {
+        /* The tag is the one the SPU staged in MFC_TagID, the field mfc_submit
+         * reads (spu_dma.h). An atomic completes through MFC_RdAtomicStat and
+         * does not wait on a tag group, so the field names the issuer rather
+         * than a tag wait. */
+        ps3_stop_site site = { (uint32_t)ctx->pc & SPU_LS_MASK, 0, ctx->spu_id };
+        ps3_stop_spu_label_window("spu_mfc_atomic", cmd, ea, MFC_ATOMIC_LINE,
+                                  ctx->mfc_tag & 0x1Fu,
+                                  ps3_label_window_note_spu_put(), &site);
+    }
+
     /* SPU_ATOM_EA=<hex>: log every lock-line atomic touching that EA`s 128B line.
      * SPU_ATOM_FULL=1 additionally dumps 32 bytes of the line before and after.
      *
