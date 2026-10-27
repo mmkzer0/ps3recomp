@@ -85,8 +85,8 @@ int main(int argc,char** argv)
         held_reports(40,CELL_PAD_CTRL_CROSS,0);
     }else if(!strcmp(mode,"ports-clear")){
         publish(path,"0x4000 2\n");
-        /* dev contract (RPCS3 cellPadGetData): a port inside the 127-slot table but past max_connect is
-         * NO_DEVICE; only >= CELL_MAX_PADS or NULL is INVALID_PARAMETER. Not yet checked against libio FW. */
+        /* FW 4.93 libio (cellPad.c cites the EAs): port 7 has no connected device -> NO_DEVICE; only a port
+         * past the 127-slot table or a NULL buffer is INVALID_PARAMETER. Upstream expected INVALID here. */
         assert(cellPadGetData(7,guest)==(s32)CELL_PAD_ERROR_NO_DEVICE);
         assert(cellPadGetData(CELL_MAX_PADS,guest)==(s32)CELL_PAD_ERROR_INVALID_PARAMETER);
         assert(cellPadGetData(0,NULL)==(s32)CELL_PAD_ERROR_INVALID_PARAMETER);
@@ -94,7 +94,7 @@ int main(int argc,char** argv)
         s_pad_initialized=1;assert(file_size(path)>0);
         assert(read_pad(1)==0 && file_size(path)>0); /* disconnected nonzero port */
         assert(cellPadClearBuf(0)==CELL_OK);
-        assert(cellPadClearBuf(7)==(s32)CELL_PAD_ERROR_NO_DEVICE);   /* same dev contract as GetData above */
+        assert(cellPadClearBuf(7)==(s32)CELL_PAD_ERROR_NO_DEVICE);   /* same FW rule as GetData above */
         assert(read_pad(0)==0 && !file_size(path));
         assert(cellPadClearBuf(0)==CELL_OK);
         for(unsigned n=0;n<100;n++)assert(read_pad(1)==0);

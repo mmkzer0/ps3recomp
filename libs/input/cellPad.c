@@ -797,13 +797,13 @@ s32 cellPadGetData(u32 port_no, CellPadData* data_guest)
     if (!s_pad_initialized)
         return CELL_PAD_ERROR_UNINITIALIZED;
 
-    /* RPCS3 cellPad.cpp cellPadGetData: port_no >= CELL_MAX_PADS || !data
-     * -> INVALID_PARAMETER; a port inside the table but past the configured
-     * maximum -> NO_DEVICE. */
+    /* FW 4.93 libio cellPadGetData (0x02002220 -> 0x02003080): port_no > 126
+     * or data == NULL -> INVALID_PARAMETER (0x020030E4); a port whose
+     * connection byte is not "connected" -> NO_DEVICE (0x0200319C), which a
+     * port past the configured maximum always is. RPCS3 cellPad.cpp agrees
+     * (get_max_connect = min(max_connect, 7)). */
     if (port_no >= CELL_MAX_PADS || !data_guest)
         return CELL_PAD_ERROR_INVALID_PARAMETER;
-    /* RPCS3 cellPad.cpp cellPadGetData: a port past the configured maximum
-     * (get_max_connect = min(max_connect, 7)) -> NO_DEVICE. */
     if (port_no >= s_max_connect)
         return CELL_PAD_ERROR_NO_DEVICE;
 
@@ -1448,13 +1448,11 @@ s32 cellPadClearBuf(u32 port_no)
     if (!s_pad_initialized)
         return CELL_PAD_ERROR_UNINITIALIZED;
 
-    /* RPCS3 cellPad.cpp cellPadClearBuf: port_no >= CELL_MAX_PADS (127)
-     * -> INVALID_PARAMETER; a port in the table but past the configured
-     * maximum -> NO_DEVICE. */
+    /* FW 4.93 libio cellPadClearBuf (0x0200236C -> 0x0200544C): port_no > 126
+     * -> INVALID_PARAMETER (0x020054A8); a port that is not connected ->
+     * NO_DEVICE (0x020054F0), as for cellPadGetData. */
     if (port_no >= CELL_MAX_PADS)
         return CELL_PAD_ERROR_INVALID_PARAMETER;
-    /* RPCS3 cellPad.cpp cellPadClearBuf: a port past the configured maximum
-     * (get_max_connect = min(max_connect, 7)) -> NO_DEVICE. */
     if (port_no >= s_max_connect)
         return CELL_PAD_ERROR_NO_DEVICE;
 
