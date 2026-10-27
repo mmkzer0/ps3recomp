@@ -658,6 +658,7 @@ method, like the header.
 | NV308A | 0x0184+5 | `NV308A_SET_CONTEXT_COLOR_KEY..BETA4` | inert | no-transfer | the inline-transfer raster-op context (colour key, clip rectangle, pattern, ROP, beta). Odin  sends no NV308A_COLOR (0x400) and no SIZE_OUT/SIZE_IN ... |
 | NV308A | 0x019C | `NV308A_SET_CONTEXT_SURFACE` | inert | redundant | names the destination surface object; the 2D path has exactly one destination state, the NV3062  object's (s_gcm2d), which is the object this handle ... |
 | NV308A | 0x02FC | `NV308A_SET_OPERATION` | inert | no-transfer | the transfer's blend operation; see 0x0184: no transfer is issued by this object in the census |
+| NV308A | 0x0300 | `NV308A_SET_COLOR_FORMAT` | inert | redundant | the colour format of the inline-transfer words (the default state writes 4 on this slot every flip, ahead of the NV309E bind); the inline write stores 32-bit words into the destination surface, whose format is the NV3062 object's (s_gcm2d.color_fmt), and RPCS3 reads no NV308A_SET_COLOR_FORMAT. Pinned to the default state's value. Until the class keyed the handler this word was read as NV309E's SET_FORMAT |
 | NV309E | 0x0000 | `NV309E_SET_OBJECT` | handled | consumer | cellGcmSys.c gcm_bind_object: routes the slot's 2D methods |
 | NV309E | 0x0180 | `NV309E_SET_CONTEXT_DMA_NOTIFIES` | inert | oracle-null | see NV3062 0x0180 |
 | NV309E | 0x0184 | `NV309E_SET_CONTEXT_DMA_IMAGE` | inert | redundant | the destination image object; the swizzled path writes local memory unconditionally  (gcm_2d_method: cellGcmResolveLocated(1, s_nv309e.offset)), and ... |
@@ -680,6 +681,27 @@ replays the pair table through the real walker (214 writes + 7 binds: 34 handled
 `SET_OBJECT` (the binding), `GET_REPORT` (`0x1800`) and `SET_CONTEXT_DMA_REPORT` (`0x1A8`) are consumed by
 `cellGcmSys.c`; `SET_CONTEXT_DMA_NOTIFIES` (`0x0180`) and `SET_CONTEXT_DMA_SEMAPHORE` (`0x01A4`) by
 `rsx_commands.c` (the notify write and the back-end label write); the depth range by the engine (below).
+
+### What consumed a word (the verdict) and where a word goes (the routing)
+
+A method is interpreted in the class SET_OBJECT bound on its subchannel (`gcm_method_class`), never by the
+subchannel's number: libgcm's default state binds 0 NV4097, 1 NV0039, 3 NV3062, 4 NV309E, 5 NV308A, 6 NV3089 and
+7 the driver object (`cellGcmSetupContext` binds the same table), and a title may bind NV4097 on another slot.
+Methods `0x04..0xFC` are NV406E channel control on every subchannel, and the driver's `0xE9xx`/`0xEBxx` words
+are addressed by the method number itself; neither needs a binding. Everything else on a slot with no object is
+dropped and counted (`unbound`); on a slot bound to a handle this table does not know it is unknown and stops.
+
+Only words of a slot bound to NV4097 (and the driver's) reach the 3D register-file mirrors (the draw engine and
+the live-draw engine). Both keep one NV4097 register file and mask the subchannel off the method, so a 2D word
+used to be stored as the NV4097 register of the same offset: NV308A's `0x018C/0x0194/0x0198` are
+`SET_CONTEXT_DMA_COLOR1/COLOR0/ZETA` there, and the title's every-flip default state moved the colour and depth
+surfaces to RSX local memory. `libs/video/tests/test_gcm_class_routing.c` runs the real walker and engine.
+
+The verdict records the consumer that took the word. With the draw engine on and no vtable backend the walker
+no longer feeds `rsx_state` (#466), so the legacy state machine's answer cannot stand for a register the engine
+reads: those registers carry a class-table row in `rsx_dispatch.c` (`dsp_fill_classes`), each naming the read.
+Added with the gate's follow-up: the scissor (`0x08C0/0x08C4`), the vertex textures (`0x0900..0x097C`), the
+frequency-divider mask (`0x1FC0`) and the VP branch bits (`0x1FF8`).
 
 ### Implemented in S1: the depth range
 

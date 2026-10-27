@@ -456,6 +456,13 @@ static const rsx_method_rule rsx_method_rules[] = {
           "object's (s_gcm2d), which is the object this handle names (value 0x313371C3)"),
     INERT(RSX_CLASS_NV308A, 0x02FC, 1, RSX_EV_NO_TRANSFER, "NV308A_SET_OPERATION",
           "the transfer's blend operation; see 0x0184: no transfer is issued by this object in the census"),
+    INERT_V(RSX_CLASS_NV308A, 0x0300, 1, 4, 0xFFFFFFFF, RSX_EV_REDUNDANT, "NV308A_SET_COLOR_FORMAT",
+          "the colour format of the inline-transfer words; the default state writes 4 on this slot at every "
+          "flip, ahead of the NV309E bind. The inline write stores each COLOR word as a 32-bit value into the "
+          "destination surface, whose format is the NV3062 object's SET_COLOR_FORMAT (s_gcm2d.color_fmt), and "
+          "RPCS3 reads no NV308A_SET_COLOR_FORMAT (rsx_methods.cpp binds nullptr, no reader under Emu/RSX). "
+          "Pinned to the default state's value so a title that selects another source format is reported "
+          "missing. Until the class keyed the handler this word was read as NV309E's SET_FORMAT"),
 
 /* ---- NV309E context surface swizzled -------------------------------------------------------- */
     HANDLED(RSX_CLASS_NV309E, 0x0000, 1, RSX_EV_CONSUMER, "NV309E_SET_OBJECT",

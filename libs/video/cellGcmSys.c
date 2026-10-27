@@ -64,6 +64,27 @@ static void gcm_bind_object(u32 subch, u32 handle)
     s_subch_class[subch & 7u]  = (u8)rsx_class_from_handle(handle);
 }
 
+/* The class that interprets a method word. Channel control (NV406E, methods 1..0xFC) is the puller's: it
+ * decodes on every subchannel, bound or not. Everything else means what the object bound to the slot
+ * says, and nothing when none is. */
+static rsx_class_id gcm_method_class(u32 subch, u32 m)
+{
+    if (m && m < 0x100u) return RSX_CLASS_NV406E;
+    return (rsx_class_id)s_subch_class[subch & 7u];
+}
+
+/* Whether the 3D register-file mirrors (the draw engine, the live-draw engine) take this word. Both mask
+ * the subchannel off and keep one NV4097 register file, so a word from another class would be stored as
+ * an NV4097 register: NV308A's 0x018C/0x0194/0x0198 are SET_CONTEXT_DMA_COLOR1/COLOR0/ZETA there, and a
+ * 2D write to them silently moved the colour and depth surfaces to RSX local memory. They take methods
+ * of a slot bound to NV4097, and the driver's own words (0xE9xx, 0xEBxx), whose address space is the
+ * method number itself rather than a binding. */
+static int gcm_feeds_3d_mirror(u32 subch, u32 m)
+{
+    if (((subch << 13) | m) >= 0xE000u) return 1;
+    return m >= 0x100u && s_subch_class[subch & 7u] == RSX_CLASS_NV4097;
+}
+
 /* The NV0039 (M2MF) object's registers. One object, whatever subchannel it is bound to. */
 static struct {
     u32 dma_in, dma_out, off_in, off_out, pitch_in, pitch_out, line_len, line_count, format;
@@ -99,7 +120,7 @@ static unsigned s_mc_logged, s_miss_logged;
  * word: the two positions that let an operator find the command again in a capture or a log. */
 static void gcm_method_verdict(u32 subch, u32 m, u32 data, int handled, u32 fifo, u32 word)
 {
-    const rsx_class_id cls = (m && m < 0x100u) ? RSX_CLASS_NV406E : (rsx_class_id)s_subch_class[subch & 7u];
+    const rsx_class_id cls = gcm_method_class(subch, m);
     if (handled) { atomic_fetch_add_explicit(&s_mc_handled, 1, memory_order_relaxed); return; }
     const rsx_method_rule* rule = NULL;
     const rsx_method_verdict v = rsx_method_check(cls, m, data, &rule);
@@ -2001,13 +2022,10 @@ static void nv3089_blit(void)
                out_w, out_h, f, src, in_pitch, dst, dst_pitch, out_x, out_y); } }
 }
 
-static int gcm_2d_method(u32 subch, u32 method, u32 data)
+static int gcm_2d_method(u32 subch, rsx_class_id cls, u32 method, u32 data)
 {
-    /* GCM2D_TRACE=1: histogram of (subchannel, method) actually seen. The
-     * subchannel a title binds each 2D object to is libgcm-version-specific and
-     * this function still routes by subchannel number, so state landing on an
-     * unexpected subchannel is dropped -- which looks like a blit using stale
-     * destination state rather than like missing state. */
+    /* GCM2D_TRACE=1: histogram of (subchannel, method) actually seen. The subchannel a title binds each 2D
+     * object to is libgcm-version-specific; the histogram says which slot carried what. */
     { static int tr = -1;
       if (tr < 0) { const char* e = getenv("GCM2D_TRACE"); tr = e ? atoi(e) : 0; }
       if (tr) {
@@ -2027,12 +2045,11 @@ static int gcm_2d_method(u32 subch, u32 method, u32 data)
               printf("---%c", 10);
           }
       } }
-    /* Routing is still by subchannel number (only NV0039 is routed by its binding, before this runs):
-     * demosaic's SDK emits dest-surface on sub 3 and image-from-CPU on sub 5 (cellGcmSetInlineTransfer:
-     * 0x4630C / 0xCA304 / 0xA400 headers); other versions use the classic 2 / 4. Accept both. Routing every
-     * class by its bound object is slice S1's. Returns 1 when a case below consumed the method; the
-     * caller turns that into a verdict. */
-    if (subch == 2 || subch == 3) {         /* NV3062 context surface 2D */
+    /* Routed by the class bound on the slot, whatever subchannel number the title picked: demosaic's SDK
+     * emits dest-surface on sub 3 and image-from-CPU on sub 5 (cellGcmSetInlineTransfer: 0x4630C / 0xCA304 /
+     * 0xA400 headers), other versions use the classic 2 / 4. Only the four 2D classes reach here. Returns 1
+     * when a case below consumed the method; the caller turns that into a verdict. */
+    if (cls == RSX_CLASS_NV3062) {          /* context surface 2D */
         switch (method) {
         case 0x0184: case 0x0188: s_gcm2d.dst_dma = data; return 1;
         case 0x0300: s_gcm2d.color_fmt  = data; return 1;
@@ -2041,18 +2058,24 @@ static int gcm_2d_method(u32 subch, u32 method, u32 data)
         }
         return 0;
     }
-    if (subch == 4 || subch == 5) {         /* NV308A image-from-CPU, or NV309E */
-        /* NV309E swizzled-surface state. SET_FORMAT (0x0300) does not exist on
-         * NV308A, so seeing it identifies the object bound here. */
-        if (method == 0x0300) { s_nv309e.fmt = data; s_nv309e.active = 1;
-                                s_nv309e.subch = (int)subch;
+    if (cls == RSX_CLASS_NV309E) {          /* swizzled surface */
+        switch (method) {
+        case 0x0300:
+            s_nv309e.fmt = data; s_nv309e.active = 1;
+            s_nv309e.subch = (int)subch;
             { static int _n = 0; if (PS3_LOG_FIRST(_n, 4))
                 printf("[NV309E] format=0x%08X (log2 %ux%u fmt=0x%X)%c", data,
                        1u << ((data >> 16) & 0xFF), 1u << ((data >> 24) & 0xFF),
                        data & 0xFFFF, 10); }
-            return 1; }
-        if (method == 0x0304 && s_nv309e.active && s_nv309e.subch == (int)subch) {
-            s_nv309e.offset = data; return 1; }
+            return 1;
+        case 0x0304: s_nv309e.offset = data; return 1;
+        }
+        return 0;
+    }
+    /* NV308A image-from-CPU. Its own 0x0300 is SET_COLOR_FORMAT, not the swizzled surface's SET_FORMAT:
+     * the class says which one a word is (gcm_default_state.c writes it on this slot, ahead of the
+     * NV309E bind). */
+    if (cls == RSX_CLASS_NV308A) {
         switch (method) {
         case 0x0304: s_gcm2d.point    = data; return 1;
         case 0x0308: s_gcm2d.size_out = data; return 1;
@@ -2090,7 +2113,7 @@ static int gcm_2d_method(u32 subch, u32 method, u32 data)
      * point/size, 0x0310/0x0314 out point/size, 0x0318/0x031C ds/dx dt/dy in
      * 20.12 fixed point, 0x0400 in size, 0x0404 (origin<<16)|pitch, 0x0408 in
      * offset, 0x040C in u/v start -- which is also the trigger. */
-    if (subch == 6 || subch == 7) {
+    if (cls == RSX_CLASS_NV3089) {
         switch (method) {
         case 0x0184: s_nv3089.src_dma   = data; return 1;
         case 0x0198: s_nv3089.dst_surf  = data; return 1;
@@ -2109,12 +2132,6 @@ static int gcm_2d_method(u32 subch, u32 method, u32 data)
         }
         return 0;
     }
-    /* Subchannels 0 and 1 reach here only under GCM_SUBCH1_2D=1. GCM2D_DBG=<N> raises the cap on the
-     * first-sighting log and adds the data word. */
-    static int warned = 0, wcap = -1;
-    if (wcap < 0) { const char* e = getenv("GCM2D_DBG"); wcap = e ? atoi(e) : 8; }
-    if (warned < wcap) { warned++;
-        printf("[GCM2D-UNH] subch %u method 0x%04X data=0x%08X\n", subch, method, data); }
     return 0;
 }
 
@@ -2784,7 +2801,7 @@ static int gcm_word_diag(void)
     return on;
 }
 
-/* One data word for the 3D engine (subchannel 0, or 1 unless GCM_SUBCH1_2D),
+/* One data word of a slot bound to NV4097, or a channel-control (NV406E) word,
  * plus the methods whose answer the walker writes itself. Returns the verdict
  * the walker records (gcm_method_verdict): nonzero when a consumer took the
  * method. */
@@ -3369,8 +3386,6 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 continue;
             }
             int drv_flip = 0;   /* a GCM_FLIP_HEAD (0xE924) ran in this method block */
-            static int s1_2d = -1;
-            if (s1_2d < 0) { const char* e = getenv("GCM_SUBCH1_2D"); s1_2d = e ? atoi(e) : 0; }
             /* A run of 3D methods inside one 1 MB IO page, with no per-word
              * diagnostic on: its words are contiguous in guest memory, so the
              * offset is translated once and the per-word checks below, none of
@@ -3378,17 +3393,15 @@ static void gcm_rsx_process_fifo_unlocked(void)
              * way (God of War HD: about five million vertex-program microcode and
              * constant words a second).
              *
-             * Not "none of which can match" for everything the per-word loop does,
-             * so the run is taken only where that holds: method 0 (SET_OBJECT, which
-             * binds the subchannel's class) and a subchannel bound to NV0039 (its
-             * methods are the M2MF's, never the 3D file's) go the per-word way, and
-             * every word the run consumes still ends in a method verdict, so the
-             * census (gcm_method_stats) counts the same words either way. The
+             * Not "none of which can match" for everything the per-word loop does, so the run is
+             * taken only where that holds: a slot bound to NV4097, and methods above channel
+             * control. SET_OBJECT (which binds the slot's class), the puller's own words and every
+             * other class go the per-word way. Every word the run consumes still ends in a method
+             * verdict, so the census (gcm_method_stats) counts the same words either way. The
              * capture step is closed here as it is at the end of the loop.
              * Never with a capture sink attached: the capture contract wants every consumed word a
              * step, in executed order, so the per-word path runs then. */
-            if (!wdiag && !s_cap && count && method != 0 && (subch == 0 || (subch == 1 && !s1_2d)) &&
-                s_subch_class[subch & 7u] != RSX_CLASS_NV0039 &&
+            if (!wdiag && !s_cap && count && method >= 0x100u && s_subch_class[subch & 7u] == RSX_CLASS_NV4097 &&
                 ((s_fifo_getoff + 4) >> 20) == ((s_fifo_getoff + count * 4) >> 20)) {
                 const u32 dea = gcm_io2ea(s_fifo_getoff + 4);
                 if (dea) {
@@ -3420,8 +3433,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 if (m == 0) gcm_bind_object(subch, mdata);
                 /* NV0039 is routed by its binding, not by a subchannel number. Its methods never reach
                  * the 3D register file or the live-draw mirror: NV0039's 0x0304-0x0328 are NV4097's
-                 * alpha, blend and colour-mask state there. */
-                if (s_subch_class[subch] == RSX_CLASS_NV0039) {
+                 * alpha, blend and colour-mask state there. The puller's words (0 < m < 0x100) are
+                 * NV406E on every subchannel, whatever is bound, and go the channel-control way below. */
+                if (s_subch_class[subch] == RSX_CLASS_NV0039 && (m == 0 || m >= 0x100u)) {
                     gcm_method_verdict(subch, m, mdata, gcm_nv0039_method(m, mdata),
                                        s_fifo_getoff, s_fifo_getoff + 4 + i * 4);
                     continue;
@@ -3451,16 +3465,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     gcm_method_verdict(subch, m, mdata, 1, s_fifo_getoff, s_fifo_getoff + 4 + i * 4);
                     continue;
                 }
-                /* GCM_SUBCH1_3D=1: treat subchannel 1 as the 3D object too.
-                 * The title issues NV4097 methods on it -- 0x1A80..0x1AC0 is
-                 * SET_TEXTURE_OFFSET for units 4-6 -- and the 2D path silently
-                 * discards whatever it does not recognise, so that state never
-                 * reaches the renderer. SET_OBJECT binds are not tracked, which
-                 * is what makes the subchannel-to-engine mapping a guess. */
                 /* GCM_OBJDBG=1: log every SET_OBJECT (method 0). The handle a
-                 * title binds to a subchannel is what says which engine that
-                 * subchannel drives; comparing subchannel 1 against subchannel 0
-                 * turns the routing below from a guess into a reading. */
+                 * title binds to a subchannel is what says which class that
+                 * slot decodes, so the log shows what the binding table holds. */
                 if (wdiag) { static int od = -1;
                   if (od < 0) { const char* e = getenv("GCM_OBJDBG"); od = e ? 1 : 0; }
                   if (od && m == 0) {
@@ -3471,20 +3478,11 @@ static void gcm_rsx_process_fifo_unlocked(void)
                           printf("[GCM-OBJ] subch=%u SET_OBJECT handle=0x%08X%c",
                                  subch, h, 10); fflush(stdout);
                       } } }
-                /* The subchannel is a binding slot, not an engine selector: a
-                 * title may bind NV4097 to something other than subchannel 0.
-                 * Twisted Metal uses subchannel 1, and caner (canersaka) hit
-                 * the same thing in Yakuza Dead Souls, where SPU-built command
-                 * lists bind NV4097 elsewhere -- his rsx_live_draw.c masks the
-                 * subchannel out of the method for exactly this reason.
-                 *
-                 * gcm_2d_method only ever handles subchannels 2..7 (NV3062,
-                 * NV308A/NV309E, NV3089), so anything arriving on 1 was being
-                 * dropped on the floor -- for this title that included
-                 * SET_SHADER_PROGRAM, leaving one stale fragment program bound
-                 * for every draw in the game. Treat the subchannels the 2D path
-                 * does not claim as 3D. GCM_SUBCH1_2D=1 restores the old split.
-                 */
+                /* The subchannel is a binding slot, not an engine selector: a title may bind NV4097 to
+                 * something other than subchannel 0 (Twisted Metal uses subchannel 1, and Yakuza Dead
+                 * Souls' SPU-built command lists bind it elsewhere), and libgcm's own default state binds
+                 * subchannel 1 to NV0039. A word is therefore interpreted in the class SET_OBJECT bound on
+                 * its slot (gcm_method_class), never by the slot's number. */
                 /* GCM_SUBCH_GATE=<file>: while <file> exists, log every method on a
                  * non-zero subchannel -- what each binding slot actually carries. */
                 if (wdiag) { static const char* sg = (const char*)-1; static unsigned poll; static int open_g;
@@ -3507,13 +3505,14 @@ static void gcm_rsx_process_fifo_unlocked(void)
                       if ((poll++ & 255u) == 0) { FILE* g = fopen(sg, "rb"); open_g = g != NULL; if (g) fclose(g); }
                       if (open_g) printf("[subch] %u 0x%04X = 0x%08X%c", subch, m, vm_read32(dea), 10);
                   } }
-                /* Mirror the whole method stream into the live NV4097->D3D12
+                /* Mirror the NV4097 method stream into the live NV4097->D3D12
                  * engine (caner / canersaka). Inert unless RSX_LIVE_DRAW is set.
                  * It wants the raw method with its subchannel bits -- it
-                 * canonicalises with & 0x1FFC itself. */
+                 * canonicalises with & 0x1FFC itself, which is why only words
+                 * of a slot bound to NV4097 (and the driver's) may go. */
                 if (wdiag) { static int live = -1;
                   if (live < 0) live = rsx_live_draw_enabled();
-                  if (live) rsx_live_draw_method((subch << 13) | m, vm_read32(dea)); }
+                  if (live && gcm_feeds_3d_mirror(subch, m)) rsx_live_draw_method((subch << 13) | m, vm_read32(dea)); }
                 /* GCM_METHOD_HIST=<secs>: every <secs>, the most frequent
                  * (subchannel, method) pairs dispatched since the last report --
                  * what a frame is actually made of when nothing draws. */
@@ -3545,7 +3544,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * same reason the live engine does, and masks them itself. */
                 if (wdiag) { static int eng = -1;
                   if (eng < 0) eng = rsx_draw_engine_enabled();
-                  if (eng) rsx_draw_engine_method((subch << 13) | m, vm_read32(dea)); }
+                  if (eng && gcm_feeds_3d_mirror(subch, m)) rsx_draw_engine_method((subch << 13) | m, vm_read32(dea)); }
 
                 /* RSX_LIVE_FEED_DBG=1: what the FIFO actually carries. Counted
                  * for any run, live engine or not, so the method stream and the
@@ -3576,6 +3575,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * truncates them.  Reconstruct the full address the same way
                  * the draw-engine call above does. */
                 { const u32 mfull = (subch << 13) | m;
+                const rsx_class_id cls = gcm_method_class(subch, m);
                 int handled = 1;   /* the driver words below are consumed in place */
                 if (mfull == 0xEB00u || mfull == 0xEB04u) {
                     gcm_driver_event(GCM_DRV_EVENT_USER_COMMAND, vm_read32(dea));
@@ -3604,10 +3604,16 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     drv_flip = 1;
                 } else if (mfull == 0xE920u || mfull == 0xE924u) {
                     cellGcmSetFlipCommand(vm_read32(dea) & 7u);
-                } else if (subch == 0 || (subch == 1 && !s1_2d)) {
+                } else if (cls == RSX_CLASS_NV4097 || cls == RSX_CLASS_NV406E) {
                     handled = gcm_3d_method(&s_state, m, vm_read32(dea), legacy_state_live);
-                } else
-                    handled = gcm_2d_method(subch, m, vm_read32(dea)) || m == 0;
+                } else if (cls == RSX_CLASS_NV3062 || cls == RSX_CLASS_NV308A ||
+                           cls == RSX_CLASS_NV309E || cls == RSX_CLASS_NV3089) {
+                    handled = gcm_2d_method(subch, cls, m, vm_read32(dea)) || m == 0;
+                } else {
+                    /* The driver object and a handle this table does not know decode no method but the
+                     * bind itself; any other word has no consumer and ends as unknown. */
+                    handled = m == 0;
+                }
                 gcm_method_verdict(subch, m, mdata, handled, s_fifo_getoff, s_fifo_getoff + 4 + i * 4);
                 }
             }

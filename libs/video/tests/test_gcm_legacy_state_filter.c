@@ -1,9 +1,12 @@
-/* The FIFO walker hands rsx_state every subchannel-0 method only while
+/* The FIFO walker hands rsx_state every NV4097 method only while
  * something reads that state: the vtable backend, or the walker without the
  * draw engine. With the draw engine up and no vtable, only the methods
  * rsx_process_method acts on beyond its state reach it (cellGcmSys.c,
- * gcm_legacy_method_has_effect). Subchannel 1 (not 2D by default) reaches
- * rsx_state the same way and is filtered the same way.
+ * gcm_legacy_method_has_effect). A second slot a title binds to NV4097 reaches
+ * rsx_state the same way and is filtered the same way. Slot 1 is NV0039 in
+ * libgcm's default state (gcm_default_state.c; cellGcmSetupContext binds it), so
+ * the fixture rebinds it, as a title whose command lists use it for 3D does; a
+ * word on a slot bound to anything else never reaches rsx_state at all.
  *
  * cc -std=gnu17 -I include -I libs/video
  *   libs/video/tests/test_gcm_legacy_state_filter.c
@@ -39,7 +42,9 @@ static int engine_on;
 static rsx_backend* vtable;
 int  rsx_process_method(rsx_state* state, u32 method, u32 data)
 { (void)state; (void)data; if (legacy_n < 64) legacy_seen[legacy_n++] = method; return 0; }
-u32  rsx_dsp_method_class(u32 method) { (void)method; return RSX_DSP_CLASS_TODO; }
+/* This fixture observes what reaches rsx_state, not what the census calls a method: the engine is
+ * taken to consume every register, so a filtered word is classified rather than a named stop. */
+u32  rsx_dsp_method_class(u32 method) { (void)method; return RSX_DSP_CLASS_STATE; }
 int  rsx_draw_engine_enabled(void) { return engine_on; }
 rsx_backend* rsx_get_backend(void) { return vtable; }
 /* The walker hands vertex-program runs here (#554). */
@@ -111,6 +116,16 @@ static void walk(u32 ctrl)
     vm_write32(ctrl + 0, io);
     cellGcm_rsx_process_fifo();
 }
+/* One SET_OBJECT on `subch`, walked on its own. */
+static void bind_slot(u32 ctrl, u32 subch, u32 handle)
+{
+    gw32(IO_ADDR, (1u << 18) | (subch << 13));
+    gw32(IO_ADDR + 4, handle);
+    s_fifo_getoff = 0;
+    vm_write32(ctrl + 4, 0);
+    vm_write32(ctrl + 0, 8);
+    cellGcm_rsx_process_fifo();
+}
 static int seen_exactly(const u32* want, u32 n)
 {
     if (legacy_n != n) return 0;
@@ -132,6 +147,15 @@ int main(int argc, char** argv)
     (void)cellGcmSetupContext(ctx_out, CMD_SIZE, IO_SIZE, IO_ADDR, host_alloc, host_w32);
     const uint32_t ctrl = (uint32_t)(uintptr_t)cellGcmGetControlRegister();
 
+    /* As libgcm leaves it, slot 1 is the M2MF's: its DMA_BUFFER_IN (0x0184) is NV0039's, not NV4097's
+     * SET_CONTEXT_DMA_B, and no state machine sees it. */
+    gw32(IO_ADDR, (1u << 18) | (1u << 13) | 0x0184u);
+    gw32(IO_ADDR + 4, 0xFEED0000u);
+    legacy_n = 0; s_fifo_getoff = 0;
+    vm_write32(ctrl + 4, 0); vm_write32(ctrl + 0, 8);
+    engine_on = 0; vtable = NULL; cellGcm_rsx_process_fifo();
+    check(legacy_n == 0, "a word on a slot bound to NV0039 never reaches rsx_state");
+    bind_slot(ctrl, 1, RSX_OBJ_NV4097);
     engine_on = 0; vtable = NULL; walk(ctrl);
     check(seen_exactly(bare, N_METHODS), "without the draw engine every method reaches rsx_state");
 

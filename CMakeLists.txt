@@ -1299,6 +1299,11 @@ if(UNIX)
         add_test(NAME gcm_park_modes
             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_gcm_park_modes.py")
         set_tests_properties(gcm_park_modes PROPERTIES LABELS "gcm;t0" TIMEOUT 120)
+        # The walker with the real draw engine: a method is interpreted in the class bound on its
+        # subchannel (a 2D class never reaches the NV4097 register file), puller words act on every slot.
+        add_test(NAME gcm_class_routing
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_gcm_class_routing.py")
+        set_tests_properties(gcm_class_routing PROPERTIES LABELS "gcm;t0" TIMEOUT 120)
     endif()
 
     # Capture -> replay on a real Metal device (tools/test_rsx_replay.py): the scene fixture is a synthetic
