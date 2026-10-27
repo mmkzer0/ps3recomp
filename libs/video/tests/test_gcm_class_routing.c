@@ -23,6 +23,7 @@
  */
 #include "../cellGcmSys.c"
 #include "../rsx_draw_engine.c"
+#include "../resc_convert.h"
 #include "gcm_fixture_stubs.h"   /* ps3_config_get and the named stops cellGcmSys.c ends in */
 #include <stdio.h>
 #include <stdlib.h>
@@ -132,6 +133,10 @@ static void t_release(void* u, u32 s) { (void)u; (void)s; }
 static void t_clear_color(void* u, u32 s, const float rgba[4]) { (void)u; (void)s; (void)rgba; }
 static void t_clear_depth(void* u, u32 d, u32 flags, float dv, u8 st) { (void)u; (void)d; (void)flags; (void)dv; (void)st; }
 static void t_present(void* u, u32 s) { (void)u; (void)s; }
+/* The RESC stream draws: a pipeline the engine cannot build is the documented drop, not a crash. */
+static u32 t_pipeline_create(void* u, const char* vs, const char* ps, const rsx_be_render_state* rs,
+                             const rsx_vertex_layout_plan* l, u32 stride, rsx_be_format f, u32 n)
+{ (void)u; (void)vs; (void)ps; (void)rs; (void)l; (void)stride; (void)f; (void)n; return 0; }
 
 int main(int argc, char** argv)
 {
@@ -143,6 +148,8 @@ int main(int argc, char** argv)
 
     /* "fast": no engine and no per-word diagnostic, so the walker's 3D-run fast path is eligible. */
     const int fast = argc > 1 && !strcmp(argv[1], "fast");
+    /* "legacy-handled <file>": no engine; the methods the state machine takes (see below). */
+    const int masked = argc > 2 && !strcmp(argv[1], "legacy-handled");
 
     /* The engine comes up before the first pass: the walker caches whether it is on. */
     /* The register file is what is read back, so the backend only has to give the default state's CLEAR
@@ -151,8 +158,9 @@ int main(int argc, char** argv)
         .color_target_create = t_color_create, .depth_target_create = t_depth_create,
         .color_target_release = t_release, .depth_target_release = t_release,
         .clear_color = t_clear_color, .clear_depth_stencil = t_clear_depth, .present = t_present,
+        .pipeline_create = t_pipeline_create,
     };
-    if (!fast) {
+    if (!fast && !masked) {
         rsx_draw_engine_set_backend(&be);
         rsx_draw_engine_set_default(1);
         if (rsx_draw_engine_init(64, 64) != 0) { puts("FAIL: engine init"); return 1; }
@@ -161,6 +169,40 @@ int main(int argc, char** argv)
     (void)cellGcmSetupContext(ctx_out, CMD_SIZE, IO_SIZE, IO_ADDR, host_alloc, host_w32);
     const uint32_t ctrl = (uint32_t)(uintptr_t)cellGcmGetControlRegister();
 
+    if (masked) {
+        /* Every NV4097 method the legacy state machine takes (tools/test_gcm_class_routing.py asks the
+         * real rsx_commands.c for the list) has a verdict with the draw engine on and no vtable backend,
+         * where that machine is not fed: a consumer, an INERT row or a MISSING row, never unknown. A
+         * method that dev counted "handled" only because the machine stored it, with nothing reading it,
+         * belongs on the list below with its reason; it then stays unknown on purpose. */
+        static const u32 k_fake_handled[] = {
+            0   /* none: the entries are listed with their registry class and reason */
+        };
+        FILE* f = fopen(argv[2], "r");
+        if (!f) { puts("[FAIL] cannot read the legacy-handled list"); return 1; }
+        unsigned n = 0, unknown = 0;
+        char line[32];
+        while (fgets(line, sizeof line, f)) {
+            const u32 m = (u32)strtoul(line, NULL, 16);
+            int skip = 0;
+            for (size_t i = 0; i < sizeof k_fake_handled / sizeof k_fake_handled[0]; i++)
+                if (k_fake_handled[i] && k_fake_handled[i] == m) skip = 1;
+            if (skip) continue;
+            n++;
+            const rsx_method_rule* rule = NULL;
+            static rsx_state st;   /* the stub state machine ignores it */
+            const int handled = gcm_3d_method(&st, m, 0u, /* legacy_state_live */ 0);
+            if (!handled && rsx_method_check(RSX_CLASS_NV4097, m, 0u, &rule) == RSX_METHOD_UNKNOWN) {
+                printf("[FAIL] legacy-handled NV4097 method 0x%04X is unknown with the engine on\n", m);
+                unknown++;
+            }
+        }
+        fclose(f);
+        check(n > 100 && unknown == 0, "every NV4097 method the legacy state machine takes has a verdict engine-on");
+        printf("[gcm_class_routing legacy-handled] %s (%u methods, %u unknown)\n", unknown ? "FAIL" : "PASS", n, unknown);
+        free(vm_base);
+        return t_fails ? 1 : 0;
+    }
     if (fast) {
         /* NV4097 bound on slot 7, a run of one word on the fast path's terms: 0xE944 is the driver's flip
          * queue word, not NV4097 method 0x0944 (a vertex-texture register). */
@@ -191,6 +233,31 @@ int main(int argc, char** argv)
     check(reg(0x018C) == DMA_LOCAL && reg(0x0194) == DMA_LOCAL && reg(0x0198) == DMA_LOCAL,
           "...NV308A's 0x018C/0x0194/0x0198 (zeros there) leave NV4097's DMA contexts as NV4097 set them");
     check(!s_nv309e.active, "...and NV308A's COLOR_FORMAT is not the swizzled surface's SET_FORMAT");
+
+    /* 0b. The toolkit's own RESC convert-and-flip stream (resc_convert.c, the real generator) through the
+     * walker with the engine on: every word classified. It carries 0x1FD8 (NV4097_INVALIDATE_L2), which the
+     * legacy state machine took as an explicit no-op and the engine-on walker does not feed. */
+    {
+        RescConvertIn in;
+        memset(&in, 0, sizeof in);
+        in.width = 1280; in.height = 720; in.pitch = 5120; in.dst_format = 5;
+        in.color_offset = 0x1000; in.vertex_offset = 0x2000; in.vertex_count = 4;
+        in.attr[0] = 0; in.attr[1] = 8; in.attr[2] = 9; in.tex_unit = 0;
+        in.src.format = 0x85; in.src.pitch = 5120; in.src.width = 1280; in.src.height = 720; in.src.offset = 0x3000;
+        in.fp.num_regs = 2; in.fp.ucode_offset = 0x4000;
+        const u32 rctx = s_ib.ctx_ea;
+        const u32 rstart = gcm_ea2io(vm_read32(rctx + 8));
+        resc_emit_convert_stream(rctx, &in);
+        const u32 rend = gcm_ea2io(vm_read32(rctx + 8));
+        const GcmMethodStats r0 = stats();
+        s_fifo_getoff = rstart;
+        vm_write32(ctrl + 4, rstart);
+        vm_write32(ctrl + 0, rend);
+        cellGcm_rsx_process_fifo();
+        const GcmMethodStats r1 = stats();
+        check(s_fifo_getoff == rend && r1.unknown == r0.unknown && r1.handled + r1.inert > r0.handled + r0.inert,
+              "the RESC convert stream is walked to its end with every word classified (0x1FD8 included)");
+    }
 
     /* 1. The census verdict of a register only the engine reads. The engine is on, no vtable backend is
      * registered, so the state machine is not fed and the class table is the only consumer on record. These

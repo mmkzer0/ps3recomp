@@ -86,6 +86,19 @@ static int probe_matches_baseline(void)
 
 int main(int argc, char** argv)
 {
+    /* --handled: the NV4097 methods (0x0100..0x1FFC) the state machine takes (returns 0) for some data
+     * word, one "0x%04X" per line. tools/test_gcm_class_routing.py hands the list to the walker fixture,
+     * which checks that none of them is an unknown method with the draw engine on (the engine-on walker
+     * does not feed this machine, so its answer cannot stand for them). */
+    if (argc > 1 && !strcmp(argv[1], "--handled")) {
+        static const u32 probe_data[] = { 0u, 1u, 0xFFFFFFFFu, 0x12345678u, 0xFEED0001u };
+        for (u32 m = 0x0100u; m <= 0x1FFCu; m += 4u)
+            for (u32 d = 0; d < sizeof probe_data / sizeof probe_data[0]; d++) {
+                rsx_state_init(&st);
+                if (rsx_process_method(&st, m, probe_data[d]) == 0) { printf("0x%04X\n", m); break; }
+            }
+        return 0;
+    }
     if (argc > 1) {
         n_effect = 0;
         for (int i = 1; i < argc && n_effect < 16; i++) effect_set[n_effect++] = (u32)strtoul(argv[i], NULL, 16);

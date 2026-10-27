@@ -406,6 +406,16 @@ static const rsx_method_rule rsx_method_rules[] = {
           "emits the hardware's reset routing directly (o0=HPOS, o1=COL0, o7..o15=TEX0..8; "
           "rsx_vp_decompiler.c header), which is the value the driver writes; RPCS3 has no decoder for these "
           "because it names the VP's outputs itself"),
+    INERT(RSX_CLASS_NV4097, 0x1FD8, 1, RSX_EV_ORDER, "NV4097_INVALIDATE_L2",
+          "drop the texture/post-transform cache (psl1ght NV40TCL_TEX_CACHE_CTL; the RESC convert stream, "
+          "resc_convert.c, emits it after the texture state and before the programs). The engine keeps no such cache: it reads "
+          "the fragment program and the textures from guest memory for every draw and keys its pipelines and "
+          "texture uploads by content hash (eng_pipeline_get, the texture hash in rsx_draw_engine.c), so there "
+          "is nothing to drop; the invalidate is issued before the draw it protects. RPCS3 only flags the "
+          "shader dirty (rsx_methods.cpp:1707 -> nv4097::set_shader_program_dirty), reads no register, and its "
+          "FIFO marks the method always_ignore (RSXFIFO.h:80-93). The legacy state machine had it as an "
+          "explicit no-op (rsx_commands.c, NV4097_INVALIDATE_L2) -- this row says so for the engine-on path "
+          "where that machine is not fed"),
     INERT(RSX_CLASS_NV4097, 0x1FE0, 1, RSX_EV_ORACLE_NULL, "NV4097_SET_REDUCE_DST_COLOR",
           "whether the reduce stage may read the destination; RPCS3 has no decoder; value 1 = reset"),
     INERT(RSX_CLASS_NV4097, 0x1FE8, 1, RSX_EV_ORACLE_NULL, "NV4097_SET_NO_PARANOID_TEXTURE_FETCHES",
