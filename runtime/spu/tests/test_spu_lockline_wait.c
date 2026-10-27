@@ -8,6 +8,7 @@
 #include <time.h>
 #include "../spu_coherency.c"
 #include "../../memory/reservation.c"
+#include "../../../tests/spu_ls_watch_fixture.h"
 
 void spu_ch_wake(spu_context* ctx) { (void)ctx; }
 /* reservation.c (the reservation authority spu_coherency.c calls) needs a guest base; nothing here touches guest memory. */
