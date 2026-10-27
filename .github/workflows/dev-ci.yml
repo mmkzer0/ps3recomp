@@ -75,6 +75,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Install dependencies
+        # test_pad_file_reports.py (v0.18.0) builds its SDL HLE fixture with
+        # sdl2-config. A missing dependency must fail the job, never skip.
+        run: brew install sdl2
       - name: Run the tool and lifter suites
         env:
           CI: "1"          # a skipped conformance run fails instead of passing
