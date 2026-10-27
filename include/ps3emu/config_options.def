@@ -78,10 +78,12 @@ PS3_CFG_STR(ppu, null_page, "stop", 4, PS3_CFG_V_NULL_PAGE,
 /* ---- spu ---------------------------------------------------------------- */
 
 PS3_CFG_U32(spu, dma_repeat_limit, 256, 1, 4294967295,
-    "How many identical MFC transfers (same EA and LSA, back to back) make the "
-    "SPU DMA engine apply its 1 ms back-off. The back-off is timing only: it "
-    "stops the host from spinning while a job polls a value another agent writes. "
-    "At the limit the engine only slows down; it does not halt the SPU.")
+    "How many identical MFC transfers (same EA and LSA, back to back) start the "
+    "SPU DMA engine's back-off: it yields the thread for the first 2 ms of the "
+    "episode, where a healthy poll ends, then sleeps 1 ms per repeat. The back-off "
+    "is timing only: it stops the host from spinning while a job polls a value "
+    "another agent writes. At the limit the engine only slows down; it does not "
+    "halt the SPU.")
 
 PS3_CFG_U32(spu, dma_repeat_stop_secs, 0, 0, 86400,
     "If non-zero, an SPU that has issued identical MFC transfers continuously "
