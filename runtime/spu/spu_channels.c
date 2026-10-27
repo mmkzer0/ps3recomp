@@ -738,18 +738,16 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * peer that must WRITE the line waits for it (canersaka ticks the
          * GETLLAR fast+slow paths for exactly this reason). */
         yz_lockstep_tick(ctx);
-        /* A registered holder re-reading an already marked line -- every
-         * policy-module poll -- publishes its reservation and copies without
-         * the lock; any write the copy misses ends that reservation (see
-         * spu_coh_reserve_fast). Anything else takes the lock as before. */
-        const int llar_fast = spu_coh_reserve_fast(ctx, ea);
-        if (!llar_fast) {
-            spu_lockline_lock();
-            /* Tell the PPU store paths this line is live, so a store into it goes
-             * through the lock and raises SPU_EVENT_LR here instead of landing
-             * unannounced. Nothing else about this transaction changes. */
-            spu_coh_reserve(ctx, ea);
-        }
+        /* Every GETLLAR takes the lock-line lock. A registered holder's poll
+         * of an already marked line used to skip it (upstream's lock-free
+         * reserve); that path rested on every writer consulting a second
+         * bitmap, which the merge dropped, so the reservation model's own
+         * lock is the only authority here (#57). */
+        spu_lockline_lock();
+        /* Tell the PPU store paths this line is live, so a store into it goes
+         * through the lock and raises SPU_EVENT_LR here instead of landing
+         * unannounced. Nothing else about this transaction changes. */
+        spu_coh_reserve(ctx, ea);
 
         /* ONE read of guest memory, then the snapshot from that copy.
          *
@@ -785,7 +783,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         /* MFC_RdAtomicStat after a GETLLAR reads 4 (GETLLAR complete), not 0:
          * Havok's SPU allocator (GH3 collide task, LS 0xA66C) re-issues the
          * GETLLAR until that bit is set, and spun forever on 0. PUTLLUC is 2. */
-        if (!llar_fast) { ctx->resv_ea = ea; ctx->resv_valid = 1; }   /* the fast path published it already */
+        ctx->resv_ea = ea; ctx->resv_valid = 1;   /* under the lock-line lock, as spu_coh_reserve expects */
         ctx->atomic_stat = 4;
         ctx->resv_epoch = epoch;
         ctx->dbg_getllar++;
@@ -802,7 +800,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                       ctx->image_id, (unsigned)(ctx->pc & SPU_LS_MASK), ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea,
                       m[0],m[1],m[2],m[3], m[4],m[5],m[6],m[7], m[8],m[9],m[10],m[11], m[12],m[13],m[14],m[15]);
           } }
-        if (!llar_fast) spu_lockline_unlock();
+        spu_lockline_unlock();
         /* SPU_LLARWATCH=<hex EA>: every GETLLAR of that line, with the LSA it
          * used and the first word as it lands in BOTH places.
          *

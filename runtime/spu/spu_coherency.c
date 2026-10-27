@@ -10,15 +10,14 @@
  * table or a reservation runs with the lock-line lock held (the SPU's GETLLAR,
  * the PPU's coherent store), so the read-modify-write on them is serialized.
  * Only spu_coh_is_reserved reads without the lock, which is the entire point:
- * it is on every PPU store. The one other unlocked path is a GETLLAR that
- * re-reserves a marked line (spu_coh_reserve_fast); its ordering argument is
- * there, and it is compiled out by default (SPU_COH_FAST_GETLLAR).
+ * it is on every PPU store, and it answers from the reservation model's mark,
+ * set with an atomic OR. The merge's second bitmap, published with a plain
+ * store beside it, is gone with the inline store path that read it (#57).
  */
 
 #include <stdlib.h>
 #include "spu_coherency.h"
 #include "../memory/reservation.h"
-#include "spu_coh_bitmap.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -113,24 +112,6 @@ void spu_lockline_unlock(void) { if (pthread_mutex_unlock(&g_lockline)) abort();
 /* ===========================================================================
  * The reservation holders
  * ===========================================================================*/
-#define SPU_COH_LINES       (1u << (32 - SPU_COH_LINE_SHIFT))   /* 2^25 lines */
-#define SPU_COH_BITMAP_SZ   (SPU_COH_LINES / 8)                 /* 4 MiB */
-
-/* The reservation model (runtime/memory/reservation.h) owns the reserved-line
- * mark (resv_mark_spu / resv_marked_spu); spu_coh_is_reserved answers from it.
- * This bitmap exists only because upstream's inline PPU store paths read it
- * through g_spu_coh_bits (spu_coh_bitmap.h). It is published with a plain
- * store and set with a plain read-modify-write, so nothing here may depend on
- * it to skip an invalidation or an event. bitmap: pending block-2 proof. */
-static unsigned char s_coh_bitmap[SPU_COH_BITMAP_SZ];
-
-/* g_spu_coh_bits stays NULL until the first GETLLAR anywhere. That keeps the
- * PPU fast path off the bitmap entirely for a title that runs no SPU code, and
- * keeps every existing test that stores through vm_write* paying one compare
- * against a hot global. Written under the lock; read unlocked, where a stale
- * NULL costs at most one missed event on the very first reservation of the
- * run. */
-
 /* Every live virtual context may retain a reservation between scheduling
  * quanta; physical SPU count is not a bound on this set. All access is under
  * the lock-line lock. Nodes are removed before their context's lifetime ends. */
@@ -146,18 +127,6 @@ unsigned long g_spu_lr_raise = 0;
 void spu_coh_reserve(spu_context* ctx, uint32_t ea)
 {
     resv_mark_spu(ea);
-    /* Read before writing. The kernel reserves the same few lines over and
-     * over, and a store of the same value still takes the cache line away
-     * from every other core: each PPU store then missed on the pointer and on
-     * the bitmap byte. */
-    uint32_t line = ea >> SPU_COH_LINE_SHIFT;
-    const unsigned char bit = (unsigned char)(1u << (line & 7));
-    /* bitmap: pending block-2 proof (compile-time symbol only; see above). */
-    if (!(s_coh_bitmap[line >> 3] & bit))
-        s_coh_bitmap[line >> 3] |= bit;
-    if (!g_spu_coh_bits)
-        g_spu_coh_bits = s_coh_bitmap;
-
     if (!ctx) return;
     for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next)
         if (entry->ctx == ctx) { __atomic_store_n(&ctx->coh_listed, 1, __ATOMIC_RELAXED); return; }
@@ -176,8 +145,8 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
 void spu_coh_watch_add(spu_coh_watch* watch, uint32_t ea,
                        void (*wake)(void*), void* opaque)
 {
-    /* Arming the existing bitmap makes PPU stores/CAS and MFC writes use
-     * the same serialized commit/notify path as SPU reservations. */
+    /* Marking the line makes PPU stores/CAS and MFC writes use the same
+     * serialized commit/notify path as SPU reservations. */
     spu_coh_reserve(NULL, ea);
     watch->line = ea & ~127u;
     watch->wake = wake;
@@ -262,88 +231,27 @@ int spu_coh_is_reserved(uint32_t addr)
 {
     /* The one authority: the reservation model's mark (reservation.h), set
      * under the lock-line lock with an atomic OR and read with an atomic
-     * load. The upstream bitmap (g_spu_coh_bits) is not consulted here, so no
-     * store or invalidation decision made through this function depends on
-     * it. bitmap: pending block-2 proof. */
+     * load, so a PPU store locks and notifies exactly the SPUs that hold the
+     * line. */
     return resv_marked_spu(addr);
 }
 
 /* ===========================================================================
- * GETLLAR without the lock-line lock
- *
- * Every SPURS policy module polls its workload lines with GETLLAR, so taking
- * the one global lock for each poll serialized every SPU on a 128-byte copy.
- * A poll is almost always a context that already holds a node in s_coh_ctxs
- * re-reading a line that is already marked, and for that case the lock buys
- * nothing the reservation itself does not:
- *
- *   reader (spu_coh_reserve_fast + caller)    writer (any notifier caller)
- *     resv_valid = 0, resv_ea = ea,             store the new line data
- *     resv_valid = 1                            spu_coh_writer_fence()
- *     seq_cst fence                             load resv_valid / resv_ea
- *     copy the line                             if they cover the line:
- *                                                 LR, resv_valid = 0
- *
- * This is the store-buffering (Dekker) shape: with a seq_cst fence between the
- * store and the load on both sides, the two fences are ordered, so at least
- * one side sees the other. Either the reader's copy already holds the write
- * (an ordinary GETLLAR after the store), or the writer sees the reservation
- * and ends it -- the reader may then hold a stale or torn copy, but its
- * PUTLLC fails and it has SPU_EVENT_LR, exactly as for a write landing just
- * after a locked GETLLAR. A writer that loads stale resv_valid/resv_ea is one
- * whose fence came first, so the copy already holds its data; at worst it
- * ends the new reservation spuriously. What the reader gives up is a copy
- * atomic against a writer's multi-store critical section, but such a copy is
- * always followed by that writer's notify, so the reservation is ended.
- *
- * Two preconditions keep every writer of the line on that right-hand side:
- *  - the line is already marked. Marks are never cleared, so every store path
- *    that checks spu_coh_is_reserved takes the notifier for this line.
- *  - ctx is already in s_coh_ctxs (coh_listed). The node was linked under the
- *    lock by an earlier GETLLAR of this same thread, so any writer whose
- *    critical section could overlap this read walks past it.
- * Anything else takes the lock and spu_coh_reserve as before.
- *
- * Writers still hold the lock-line lock, so they stay serialized with each
- * other and with PUTLLC's compare-and-commit; only the reader stopped
- * waiting. resv_valid and resv_ea are accessed atomically on both sides of
- * the race; everything else about a reservation is still only touched by the
- * owning thread or under the lock.
+ * The notify path's reader-side predicates
  * ===========================================================================*/
+/* Order a notifier's stores to the line before the reservation reads below.
+ * Every notifier holds the lock-line lock, which orders them by itself; the
+ * fence states the requirement rather than leaving it to the lock's current
+ * strength, because a lost invalidation is a lost event, not a slow path. */
 static inline void spu_coh_writer_fence(void) { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
 
+/* Does `c` hold a live reservation on `line`? `c` belongs to another thread,
+ * so both fields are read atomically; resv_ea only means anything while
+ * resv_valid is set. */
 static inline int spu_coh_holds(const spu_context* c, uint32_t line)
 {
     return __atomic_load_n(&c->resv_valid, __ATOMIC_RELAXED) &&
            (__atomic_load_n(&c->resv_ea, __ATOMIC_RELAXED) & ~127u) == line;
-}
-
-/* Off by default. The argument above needs EVERY store path that can write a
- * marked line to go through the notifier, and upstream's PPU store paths decide
- * that from the plain-published bitmap, not from the reservation model's mark.
- * Until that is proven (bitmap: pending block-2 proof) a GETLLAR takes the
- * lock-line lock as it did before, so the reservation model stays the only
- * authority. -DSPU_COH_FAST_GETLLAR=1 restores upstream's behaviour. */
-#ifndef SPU_COH_FAST_GETLLAR
-#define SPU_COH_FAST_GETLLAR 0
-#endif
-int spu_coh_reserve_fast(spu_context* ctx, uint32_t ea)
-{
-#if !SPU_COH_FAST_GETLLAR
-    (void)ctx; (void)ea;
-    return 0;
-#else
-    if (!ctx || !__atomic_load_n(&ctx->coh_listed, __ATOMIC_RELAXED) ||
-        !spu_coh_is_reserved(ea))
-        return 0;
-    /* Retire any older reservation before retargeting it. The fence is what
-     * the argument above rests on. */
-    __atomic_store_n(&ctx->resv_valid, 0, __ATOMIC_RELAXED);
-    __atomic_store_n(&ctx->resv_ea, ea, __ATOMIC_RELAXED);
-    __atomic_store_n(&ctx->resv_valid, 1, __ATOMIC_RELAXED);
-    __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    return 1;
-#endif
 }
 
 /* A DMA PUT is issued BY an SPU, and hardware does not take that SPU's own

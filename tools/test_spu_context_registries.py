@@ -32,16 +32,14 @@ with tempfile.TemporaryDirectory(prefix='spu-context-registry-') as tmp:
         obj = tmp / (src.stem + '.o')
         subprocess.run([cxx, *cxxflags, '-c', str(src), '-o', str(obj)], check=True)
         runtime_objects.append(str(obj))
-    # test_spu_lockline_peer runs twice: the default build (every GETLLAR takes
-    # the lock-line lock) and SPU_COH_FAST_GETLLAR=1 (the optional lock-free
-    # GETLLAR for a registered holder, off by default: the reservation model is
-    # the only authority).
-    variants = [(n, 0) for n in ['test_spu_mfc_slots', 'test_spu_mfc_shared_lookup', 'test_spu_coherency']]
-    variants += [('test_spu_lockline_peer', 0), ('test_spu_lockline_peer', 1)]
-    variants += [(n, 0) for n in ['test_spu_registry_allocation', 'test_spu_mfc_env_once']]
-    for name, fast in variants:
-        tag = name + ('-fast-getllar' if fast else '')
-        vflags = cflags + (['-DSPU_COH_FAST_GETLLAR=1'] if fast else [])
+    # test_spu_lockline_peer runs once: every GETLLAR, a registered holder's
+    # included, takes the lock-line lock. The lock-free variant upstream added
+    # is gone with the second bitmap it relied on (#57).
+    variants = ['test_spu_mfc_slots', 'test_spu_mfc_shared_lookup', 'test_spu_coherency',
+                'test_spu_lockline_peer', 'test_spu_registry_allocation',
+                'test_spu_mfc_env_once']
+    for name in variants:
+        tag = name
         binary = tmp / tag
         sources = [str(spu / 'tests' / (name + '.c'))]
         link_flags = []
@@ -53,12 +51,12 @@ with tempfile.TemporaryDirectory(prefix='spu-context-registry-') as tmp:
             objects = []
             for index, src in enumerate(sources):
                 obj = tmp / f'{tag}-{index}.o'
-                subprocess.run([cc, *vflags, '-c', src, '-o', str(obj)], check=True)
+                subprocess.run([cc, *cflags, '-c', src, '-o', str(obj)], check=True)
                 objects.append(str(obj))
             subprocess.run([cxx, *objects, *runtime_objects, '-pthread', '-lm',
                             '-o', str(binary)], check=True)
         else:
-            subprocess.run([cc, *vflags, *sources,
+            subprocess.run([cc, *cflags, *sources,
                             '-o', str(binary)], check=True)
         if name == 'test_spu_registry_allocation':
             for mode, diagnostic in [('mfc', 'cannot allocate private MFC engine'),

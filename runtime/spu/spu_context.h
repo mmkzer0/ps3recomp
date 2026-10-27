@@ -466,9 +466,9 @@ typedef struct spu_context {
     volatile int stop_request;
 
     /* Nonzero while this context is in spu_coherency.c's list of reservation
-     * holders, so its GETLLAR can skip the lock-line lock (see
-     * spu_coh_reserve_fast). Written under that lock, read by the context's
-     * own thread. */
+     * holders, so a writer's notify finds its reservation. Written under that
+     * lock; read by the context's own thread and by the fixtures that assert
+     * registration. */
     int coh_listed;
 } spu_context;
 

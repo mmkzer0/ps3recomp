@@ -37,7 +37,6 @@
 #include "ppu_tls.h"   /* PPU_THREAD_LOCAL, without a second ppu_context */
 #define PPU_NO_INLINE_LOADS   /* this file defines the out-of-line accessors */
 #include "ppu_recomp.h"
-#include "../spu/spu_coh_bitmap.h"   /* weak definition of g_spu_coh_bits, which the lifted inline stores name; a fixture without spu_coherency.c sees NULL. The loader does not test the bitmap itself (spu_coh_is_reserved decides). */
 #include "ps3emu/ps3_ftrace.h"   /* PS3_FTRACE timeline */
 #include "ps3emu/stop.h"         /* ps3_stop, ps3_stop_register_frontier */
 #include "ps3emu/config.h"       /* ps3_ppu_initial_vscr */
@@ -863,9 +862,9 @@ extern "C" void ppu_log_host_chain(const char* tag);  /* fwd decl (defined below
  * to serialize through the SPU lock-line lock, or it can land inside a PUTLLC's
  * compare and be written straight back over; and it has to raise SPU_EVENT_LR,
  * which is how an SPURS idle service parked in `rdch SPU_RdEventStat` finds out
- * work was posted. spu_coh_is_reserved is the one authority the stores ask
- * (upstream's inline bitmap test, spu_coh_line_reserved, is deliberately not
- * used here: bitmap pending block-2 proof, see tools/ppu_lifter.py). */
+ * work was posted. spu_coh_is_reserved answers from the reservation model
+ * (runtime/memory/reservation.h), the one authority for SPU-reserved lines;
+ * the merge's second bitmap was dropped with the inline store path (#57). */
 extern "C" int  spu_coh_is_reserved(uint32_t addr);
 extern "C" void spu_lockline_lock(void);
 extern "C" void spu_lockline_unlock(void);

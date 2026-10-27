@@ -14,7 +14,6 @@
 
 #include "../../include/ps3emu/endian.h"
 #include "ppu_context.h"
-#include "../spu/spu_coh_bitmap.h"
 
 #include <stdint.h>
 #include <string.h>
@@ -127,9 +126,8 @@ extern "C" {
  * SPURS idle service parked in `rdch SPU_RdEventStat` learns work was posted.
  * Declared here rather than pulling spu_coherency.h into every HLE module.
  *
- * The authority is the reservation model (spu_coh_is_reserved); upstream's
- * inline bitmap (spu_coh_bitmap.h) is not consulted. bitmap: pending block-2
- * proof. */
+ * The authority is the reservation model (spu_coh_is_reserved); a second
+ * bitmap beside it was dropped with the inline store path (#57). */
 int         spu_coh_is_reserved(uint32_t addr);
 void        spu_lockline_lock(void);
 void        spu_lockline_unlock(void);
@@ -140,7 +138,7 @@ void        spu_coh_notify_write(uint32_t addr);
 
 #define VM_WRITE_COH(addr, src, n)                                            \
     do {                                                                      \
-        if (spu_coh_is_reserved((uint32_t)(addr))) {  /* bitmap: pending block-2 proof */ \
+        if (spu_coh_is_reserved((uint32_t)(addr))) {                      \
             spu_lockline_lock();                                              \
             memcpy(vm_ptr8((uint32_t)(addr)), (src), (n));                    \
             spu_coh_notify_write((uint32_t)(addr));                           \

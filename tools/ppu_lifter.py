@@ -211,22 +211,15 @@ void ppu_store_hook_span(uint64_t ea, uint32_t n);
 extern int      vm_inline_st_ok;
 extern uint32_t ppu_vm_size;
 extern uint32_t ppu_hle_inject_base;
-/* Inline guest-store fast paths, the store side of the loads below: every
- * lifted store was an out-of-line call, about a fifth of God of War HD's main
- * thread. A store the out-of-line path treats specially still goes there:
- * anything outside the inline range, any armed store diagnostic (vm_inline_st_ok,
- * the barrier watch, a null-page sweep), and a store to a line an SPU holds a
- * reservation on, which has to take the lock-line lock and raise the
- * lost-reservation event, and a store that overlaps the store window above,
- * which has to run the device model's hook (ppu_store_hook_span, from the
- * out-of-line vm_write*). Every store form therefore runs the hook: the inline
- * ones that stay inline are outside the window, the others call out. */
-#ifndef PPU_INLINE_SPU_BITMAP
-#define PPU_INLINE_SPU_BITMAP 0   /* see vm_mm_st_ok: pending block-2 proof */
-#endif
+/* Every lifted store goes out of line to vm_write*. Only the out-of-line path
+ * runs the device model's label-window hook (ppu_store_hook_span), the store
+ * watches and VM_WRITE_COH, which serializes against an SPU reservation and
+ * raises its lost-reservation event; an inline store can miss any of them, so
+ * vm_mm_st_ok below always declines. Issue #57 owns an inline path that asks
+ * the reservation marks themselves (runtime/memory/reservation.h) instead of a
+ * second bitmap published beside them. */
 extern uint32_t             g_barrier_sync_watch;
 extern uint32_t             g_null_sweep_hi;
-extern const unsigned char* g_spu_coh_bits;   /* SPU-reserved lines, NULL until the first */
 #ifdef __cplusplus
 }
 #endif
@@ -235,8 +228,8 @@ extern const unsigned char* g_spu_coh_bits;   /* SPU-reserved lines, NULL until 
  * tell apart from these globals, so code that reads them directly reloads
  * all of them after every store. Each lifted function takes one copy at entry
  * (PPU_MM_SNAP, emitted by the lifter) and its loads and stores use that.
- * What can change while a function runs -- the SPU reservation bitmap, the
- * store watches and the store window -- is still read from the globals.
+ * What can change while a function runs -- the store watches and the store
+ * window -- is still read from the globals, by the out-of-line store path.
  *
  * The copy holds the inline range as one span from 0x10000: not the null
  * page, not the raw SPU windows from 0xE0000000, nothing past the end of the
@@ -276,31 +269,10 @@ static inline int vm_mm_ok(const ppu_mm* m, uint32_t ea, uint32_t n)
 }
 static inline int vm_mm_st_ok(const ppu_mm* m, uint32_t ea, uint32_t n)
 {
-    if (!__builtin_expect(vm_mm_in(m->st_span, ea, n), 1) ||
-        __builtin_expect((g_barrier_sync_watch | g_null_sweep_hi) != 0, 0))
-        return 0;
-    /* The store window is registered after the program starts (the RSX
-     * initialises it), so it is read here, not taken into the snapshot:
-     * the same one acquire load and one modular compare as PPU_STORE_HOOK. */
-    const uint64_t w = __atomic_load_n(&ppu_store_window, __ATOMIC_ACQUIRE);
-    if (__builtin_expect((uint64_t)(uint32_t)(ea + n - 1u - (uint32_t)w) < (w >> 32) + n - 1u, 0))
-        return 0;
-    /* bitmap: pending block-2 proof. The SPU-reserved-line bitmap is upstream's; the authority for what an
-     * SPU has reserved, and for every invalidation a PPU store owes it, is the reservation model
-     * (runtime/memory/reservation.h). Until the two are proven to be one set of bits,
-     * every store takes the out-of-line vm_write*, which decides. Gating on "no line reserved yet"
-     * is not enough: a store that read NULL can land after an SPU's first GETLLAR without breaking it.
-     * Build the lifted code with -DPPU_INLINE_SPU_BITMAP=1 to test the bit inline again. */
-#if PPU_INLINE_SPU_BITMAP
-    const unsigned char* bits = g_spu_coh_bits;
-    if (bits) {
-        const uint32_t line = ea >> 7;
-        if ((bits[line >> 3] >> (line & 7)) & 1u) return 0;
-    }
-    return 1;
-#else
+    /* Always out of line; see the store-path note above. The function stays so
+     * the vm_write*_mm helpers and PPU_MM_SNAP keep their shape. */
+    (void)m; (void)ea; (void)n;
     return 0;
-#endif
 }
 static inline uint8_t vm_read8_mm(const ppu_mm* m, uint64_t a)
 {

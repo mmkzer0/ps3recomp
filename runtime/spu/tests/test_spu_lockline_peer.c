@@ -27,11 +27,11 @@
  * asserted, the raise then happens under the lock, and only afterwards is the
  * acknowledge let through.
  *
- * Two more, after the PUTLLUC cases, cover the GETLLAR that skips the lock
- * (spu_coh_reserve_fast): that it really is lock-free for a registered holder
- * on a marked line and still waits otherwise, and -- raced for real this
- * time, because the point is the memory ordering -- that a write racing it is
- * either in the copy or ends the reservation with SPU_EVENT_LR, never neither.
+ * Two more, after the PUTLLUC cases, cover GETLLAR against the lock: a
+ * registered holder's GETLLAR of a marked line takes the lock-line lock,
+ * exactly like any other, and -- raced for real -- a write racing it is either
+ * in the copy or ends the reservation with SPU_EVENT_LR, never neither. The
+ * lock-free variant upstream added is gone (#57).
  *
  * spu_channels.c is compiled in rather than linked, because spu_mfc_atomic()
  * is file-static: the same reason test_spu_mfc_slots.c does it.
@@ -313,27 +313,18 @@ static int llar_completes_under_held_lock(uint32_t ea)
     return done;
 }
 
-/* The lock-free GETLLAR (spu_coh_reserve_fast) is optional and compiled out
- * unless the build sets SPU_COH_FAST_GETLLAR=1 (spu_coherency.c); the default
- * build must take the lock-line lock for a registered holder's GETLLAR too, so
- * the reservation model stays the only authority. tools/test_spu_context_registries.py
- * and tools/test_spu_event_producers.py build this fixture both ways. */
-#ifndef SPU_COH_FAST_GETLLAR
-#define SPU_COH_FAST_GETLLAR 0
-#endif
-static void test_registered_getllar_skips_the_lock(void)
+/* A registered holder's GETLLAR takes the lock-line lock like any other: the
+ * lock-free variant upstream added rested on a second bitmap that every writer
+ * had to consult, which the merge dropped, so the reservation model stays the
+ * only authority (#57). */
+static void test_registered_getllar_takes_the_lock(void)
 {
     reset_pair();
     spu_atomic(&g_a, LSA_A, LINE_A, MFC_GETLLAR_CMD);   /* registers, marks */
     g_guest_mem[LINE_A + 5] = 0x77;
 
-#if SPU_COH_FAST_GETLLAR
-    TEST("a registered holder's GETLLAR of a marked line does not wait for the lock");
-    CHECK(llar_completes_under_held_lock(LINE_A) == 1);
-#else
-    TEST("a registered holder's GETLLAR of a marked line takes the lock (default build)");
+    TEST("a registered holder's GETLLAR of a marked line takes the lock");
     CHECK(llar_completes_under_held_lock(LINE_A) == 0);
-#endif
     CHECK(g_a.resv_valid == 1);
     CHECK_EQ_U32(g_a.resv_ea, LINE_A);
     CHECK_EQ_U32(g_a.ls[LSA_A + 5], 0x77);
@@ -362,14 +353,14 @@ static void test_registered_getllar_skips_the_lock(void)
     CHECK(g_a.coh_listed == 1);
 }
 
-/* A write racing a lock-free GETLLAR, for real. Two threads are released
- * together each round, with skewed start delays so the copy and the write
- * overlap at varying offsets: g_a's GETLLAR on one, and on the other a write
- * of the whole line with a new byte -- alternately the PPU's coherent store
- * (lock, write, notify) and a peer SPU's PUTLLUC. Afterwards g_a must hold
- * either a valid reservation whose copy is the new line throughout, or no
- * reservation and SPU_EVENT_LR. A reservation that survives with an old or
- * torn copy is the lost update the fences exist to prevent. */
+/* A write racing a GETLLAR, for real. Two threads are released together each
+ * round, with skewed start delays so the lock is won in either order: g_a's
+ * GETLLAR on one, and on the other a write of the whole line with a new byte --
+ * alternately the PPU's coherent store (lock, write, notify) and a peer SPU's
+ * PUTLLUC. Afterwards g_a must hold either a valid reservation whose copy is
+ * the new line throughout, or no reservation and SPU_EVENT_LR. A reservation
+ * that survives with an old or torn copy is the lost update the lock exists to
+ * prevent. */
 #define RACE_ROUNDS 200000
 static atomic_int g_race_go, g_race_reader_done, g_race_writer_done;
 
@@ -408,7 +399,7 @@ static void* race_writer(void* arg)
     return NULL;
 }
 
-static void test_racing_write_ends_lockfree_reservation(void)
+static void test_racing_write_ends_reservation(void)
 {
     reset_pair();
     spu_atomic(&g_a, LSA_A, LINE_A, MFC_GETLLAR_CMD);   /* registers, marks */
@@ -446,9 +437,9 @@ static void test_racing_write_ends_lockfree_reservation(void)
     pthread_join(r, NULL);
     pthread_join(w, NULL);
 
-    printf("  lock-free GETLLAR race: %lu saw the write, %lu lost the reservation\n",
+    printf("  GETLLAR race: %lu saw the write, %lu lost the reservation\n",
            saw_write, lost);
-    TEST("a write racing a lock-free GETLLAR is in its copy or ends its reservation");
+    TEST("a write racing a GETLLAR is in its copy or ends its reservation");
     CHECK(stale_kept == 0);
     TEST("...and a reservation it ends raises SPU_EVENT_LR");
     CHECK(lost_no_event == 0);
@@ -697,8 +688,8 @@ int main(void)
     test_putllc_breaks_peer();
     test_failed_putllc_is_quiet();
     test_putlluc_breaks_peer();
-    test_registered_getllar_skips_the_lock();
-    test_racing_write_ends_lockfree_reservation();
+    test_registered_getllar_takes_the_lock();
+    test_racing_write_ends_reservation();
     test_plain_put_breaks_peer();
     test_plain_put_elsewhere_is_quiet();
     test_wide_put_finds_the_reserved_line();
