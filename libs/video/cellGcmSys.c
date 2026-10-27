@@ -467,16 +467,11 @@ static int s_io_mapping_hw = 0;
  * recompiled game, not host function pointers. Stored as uint32_t and
  * invoked through g_ps3_guest_caller (see ps3emu/guest_call.h). */
 
-/* Handler mask exported for the RSX event delivery path. Bit layout matches
- * the RPCS3 SYS_RSX_EVENT enum (vblank=0x02, flip=0x04, user_cmd=0x80).
- * The runner's vblank tick reads this to decide which events to send to
- * the libgcm interrupt thread. Updated by Set*Handler below.
- *
- * If g_gcm_driver_info_ea is non-zero, the mask is also written to
- * driver_info + 0x12C0 so the game's own libgcm interrupt path can read it
- * directly from guest memory. The runner sets g_gcm_driver_info_ea during
- * RSX context allocation. */
-uint32_t g_gcm_handler_mask = 0;
+/* Guest address of the RsxDriverInfo the lv2 side handed out (sys_rsx_context_allocate), or 0 while the
+ * runner has not published one. The handler mask lives in it at +0x12C0 (gcm_handler_word); with no
+ * driver info the setters keep only their host slots. The runner sets this before cellGcmInit, as the
+ * firmware has the driver info in hand before its init body runs (dossier §2: the bootstrap's start
+ * value goes into the word after the context exists). It must be 4-aligned and inside guest memory. */
 uint32_t g_gcm_driver_info_ea = 0;
 
 static u32 s_flip_handler_opd     = 0;
@@ -510,15 +505,66 @@ static void ydkj_restore_handler_opd(u32 opd, u32 code) {
         static int _n=0; if(PS3_LOG_FIRST(_n, 6)) fprintf(stderr,"[HANDLERFIX] restored clobbered OPD 0x%08X code=0x%08X\n",opd,code);
     }
 }
-static void gcm_update_handler_mask(void)
+
+/* The handler mask word, driver_info + 0x12C0, as FW 4.93 libgcm_sys keeps it (dossier
+ * GCM-CALLBACK-OPD-CONTRACT.md §1, §2, §6 T6).
+ *
+ * Each Set*Handler does a read-modify-write of ITS OWN bit: set for a handler, cleared for NULL
+ * (rlwinm sequences at the setters, vblank 0x020080B4, flip 0x02007F98, second vblank 0x02007FD0, queue
+ * 0x02007DD0, user 0x02007D58). Every other bit is left alone, so a word the HLE did not build alone
+ * (the bootstrap's start value, a bit the driver side owns) survives. The old rebuild from three slots
+ * destroyed those and used the wrong bits (flip 0x4 is the firmware's GRAPHICS bit).
+ *
+ * MODE. The firmware picks the slot, and so the bit, by a config word `mode` (setter semantics, §1):
+ * 0 takes the first of a pair (vblank 0x1, flip 0x8, second vblank 0x400, queue 0x20), 1-2 the second
+ * (vblank 0x2, flip 0x10, second vblank 0x800, queue 0x40); the user handler has one slot and bit 0x80
+ * either way. The firmware leaves open which slot a setter fills (the config word is not traced; the
+ * dispatcher, §2, treats both slots alike and passes r3 = 0 for the first, 1 for the second). Mode 1-2 is
+ * modelled, on this evidence: (1) RPCS3 at the pin raises only the head-1 bits, 0x2 for vblank and 0x10
+ * for flip (dossier §3, `FLIP_BASE << 1`: "we only ever use head 1"); (2) ppu_gcm_pump delivers the
+ * completed flip with r3 = 1, the dispatcher's 0x10 / state+0x1C path; (3) the vblank bit stays the 0x2 the
+ * HLE always published. What would overturn it: a firmware trace of the config mode word (`*(*(TOC-0x7FF0)
+ * + 8)`, helper 0x02001090) reading 0 on a console that delivers these events, which would put the title's
+ * handlers in the first slots (0x1, 0x8, 0x400, 0x20). No setter sets graphics 0x4; it is only the start
+ * value. */
+#define GCM_DI_HANDLERS       0x12C0u
+#define GCM_HBIT_VBLANK       0x00000002u
+#define GCM_HBIT_FLIP         0x00000010u
+#define GCM_HBIT_SECOND_V     0x00000800u
+#define GCM_HBIT_QUEUE        0x00000040u
+#define GCM_HBIT_USER         0x00000080u
+/* The bootstrap (0x02008194), once the interrupt thread exists, stores 4 into the word (`li r0,4; stw`,
+ * 0x02008240/0x02008244): a plain store, whatever the word held. */
+#define GCM_HANDLER_START     0x00000004u
+
+/* The word is guest memory, so big endian. The firmware's lwz/stw give no ordering and no atomicity beyond
+ * the word itself; the host RMW is a CAS loop on that one 32-bit cell with the mask byte-swapped, relaxed,
+ * so two registrations racing keep both bits and nothing more is claimed to the guest. The runner owns
+ * g_gcm_driver_info_ea: 4-aligned and inside guest memory. */
+static _Atomic u32* gcm_handler_word(void)
 {
-    uint32_t m = 0;
-    if (s_vblank_handler_opd) m |= 0x02;
-    if (s_flip_handler_opd)   m |= 0x04;
-    if (s_user_handler_opd)   m |= 0x80;
-    g_gcm_handler_mask = m;
-    if (g_gcm_driver_info_ea)
-        vm_write32(g_gcm_driver_info_ea + 0x12C0, m);
+    if (!g_gcm_driver_info_ea) return NULL;
+    return (_Atomic u32*)(vm_base + g_gcm_driver_info_ea + GCM_DI_HANDLERS);
+}
+
+static void gcm_handler_bit(u32 bit, int on)
+{
+    _Atomic u32* w = gcm_handler_word();
+    if (!w) return;
+    const u32 be = ps3_bswap32(bit);
+    u32 old = atomic_load_explicit(w, memory_order_relaxed), cur;
+    do cur = on ? (old | be) : (old & ~be);
+    while (!atomic_compare_exchange_weak_explicit(w, &old, cur,
+                                                  memory_order_relaxed, memory_order_relaxed));
+    PS3_WW_CHECK(g_gcm_driver_info_ea + GCM_DI_HANDLERS, ps3_bswap32(cur), 4);
+}
+
+static void gcm_handler_word_start(void)
+{
+    _Atomic u32* w = gcm_handler_word();
+    if (!w) return;
+    atomic_store_explicit(w, ps3_bswap32(GCM_HANDLER_START), memory_order_relaxed);
+    PS3_WW_CHECK(g_gcm_driver_info_ea + GCM_DI_HANDLERS, GCM_HANDLER_START, 4);
 }
 
 /* Legacy host-typed slots kept around for any caller still treating
@@ -958,6 +1004,12 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
       gcm_forget_spu_blocks();
       g_spu_put_hook = gcm_note_spu_put; }
 
+    /* The bootstrap stores the start value into the handler word once the interrupt thread exists, i.e.
+     * once init has succeeded (dossier §2: 0x02008194 refuses a second creation, and the already-
+     * initialised return above likewise writes nothing). cellGcmInit is the HLE's init body, and
+     * cellGcmSetupContext (the _cellGcmInitBody core) goes through it. The HLE has no interrupt thread
+     * (#73); the word is what a guest reader sees. */
+    gcm_handler_word_start();
     s_gcm_initialized = 1;
     return CELL_OK;
 }
@@ -4349,7 +4401,7 @@ void cellGcmSetFlipHandler(CellGcmFlipHandler handler)
     s_flip_handler_opd = (u32)(size_t)handler;
     s_flip_handler = handler;
     { u32 c = s_flip_handler_opd ? vm_read32(s_flip_handler_opd) : 0; if (c) s_flip_handler_code = c; }
-    gcm_update_handler_mask();
+    gcm_handler_bit(GCM_HBIT_FLIP, s_flip_handler_opd != 0);
 }
 
 /* NID: 0xA91B0402 */
@@ -4359,7 +4411,7 @@ void cellGcmSetVBlankHandler(CellGcmVBlankHandler handler)
     s_vblank_handler_opd = (u32)(size_t)handler;
     s_vblank_handler = handler;
     { u32 c = s_vblank_handler_opd ? vm_read32(s_vblank_handler_opd) : 0; if (c) s_vblank_handler_code = c; }
-    gcm_update_handler_mask();
+    gcm_handler_bit(GCM_HBIT_VBLANK, s_vblank_handler_opd != 0);
 }
 
 /* NID: 0xDC494430 */
@@ -4368,6 +4420,7 @@ void cellGcmSetSecondVHandler(CellGcmSecondVHandler handler)
     printf("[cellGcmSys] SetSecondVHandler(opd=0x%08X)\n", (unsigned)(size_t)handler);
     s_second_v_handler_opd = (u32)(size_t)handler;
     s_second_v_handler = handler;
+    gcm_handler_bit(GCM_HBIT_SECOND_V, s_second_v_handler_opd != 0);
 }
 
 /* NID: 0x06EDEA9E */
@@ -4376,7 +4429,7 @@ void cellGcmSetUserHandler(CellGcmUserHandler handler)
     printf("[cellGcmSys] SetUserHandler(opd=0x%08X)\n", (unsigned)(size_t)handler);
     s_user_handler_opd = (u32)(size_t)handler;
     s_user_handler = handler;
-    gcm_update_handler_mask();
+    gcm_handler_bit(GCM_HBIT_USER, s_user_handler_opd != 0);
 }
 
 /* NID: 0x63387071 */
@@ -5399,6 +5452,7 @@ void cellGcmSetQueueHandler(CellGcmQueueHandler handler)
 {
     printf("[cellGcmSys] SetQueueHandler(%p)\n", (void*)(size_t)handler);
     s_queue_handler = handler;
+    gcm_handler_bit(GCM_HBIT_QUEUE, handler != NULL);
 }
 
 /* Set second V frequency */

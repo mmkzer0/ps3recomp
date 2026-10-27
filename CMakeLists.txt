@@ -1311,6 +1311,15 @@ if(UNIX)
         add_test(NAME gcm_class_routing
             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_gcm_class_routing.py")
         set_tests_properties(gcm_class_routing PROPERTIES LABELS "gcm;t0" TIMEOUT 120)
+        # #68: the handler mask word at driver_info+0x12C0 as libgcm_sys keeps it (dossier T6): start value 4 after
+        # init, a per-bit read-modify-write in each setter, foreign bits surviving. `gcm_handler_mask_race` is the same
+        # fixture with two threads registering at once, built with -fsanitize=thread where the compiler has it.
+        add_test(NAME gcm_handler_mask
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_gcm_handler_mask.py" mask)
+        set_tests_properties(gcm_handler_mask PROPERTIES LABELS "gcm;t0" TIMEOUT 120)
+        add_test(NAME gcm_handler_mask_race
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_gcm_handler_mask.py" race)
+        set_tests_properties(gcm_handler_mask_race PROPERTIES LABELS "gcm;t0;tsan" TIMEOUT 300)
     endif()
 
     # Capture -> replay on a real Metal device (tools/test_rsx_replay.py): the scene fixture is a synthetic
