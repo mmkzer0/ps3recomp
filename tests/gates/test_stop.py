@@ -105,6 +105,29 @@ def test_buffered_stdout_is_flushed_before_the_banner():
     assert "log line before the stop" in p.stdout
 
 
+# ps3_stdio fully buffers both streams, and every stop path ends in std::_Exit, which
+# flushes nothing (#54): each path must push out what was written before it.
+def test_buffered_streams_reach_the_pipe_before_the_banner():
+    p = probe("buffered-both")
+    g.expect_stop(p, "unimplemented-syscall")
+    assert "stdout line before the stop" in p.stdout, p.stdout
+    assert p.stderr.index("stderr line before the stop") < p.stderr.index("PS3RECOMP STOP:"), p.stderr
+
+
+def test_nested_stop_keeps_what_the_provider_wrote():
+    p = probe("buffered-nested")
+    g.expect_stop(p, "config-invalid")
+    assert "nested=1" in p.stderr, p.stderr
+    assert "provider stdout line" in p.stdout, p.stdout
+    assert "provider stderr line" in p.stderr, p.stderr
+
+
+def test_full_provider_table_keeps_buffered_stdout():
+    p = probe("buffered-table-full")
+    g.expect_stop(p, "invalid-kind")
+    assert "stdout line before the stop" in p.stdout, p.stdout
+
+
 def test_concurrent_stops_print_one_coherent_banner():
     for _ in range(25):
         p = probe("concurrent")

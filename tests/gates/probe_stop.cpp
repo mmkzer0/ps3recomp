@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <thread>
+#include <utility>
 #include <vector>
 
 static void hle_provider(uint64_t, ps3_stop_frontier* out)
@@ -28,6 +29,31 @@ static void syscall_provider(uint64_t thread_id, ps3_stop_frontier* out)
 static void stopping_provider(uint64_t, ps3_stop_frontier*)
 {
     ps3_stop(PS3_STOP_CONFIG_INVALID, "provider stopped", "none", nullptr, 0, nullptr);
+}
+
+/* ps3_stdio's setting since v0.18.0: both streams fully buffered (#54). */
+static void buffer_both_streams()
+{
+    static char out_buf[1 << 16], err_buf[1 << 16];
+    std::setvbuf(stdout, out_buf, _IOFBF, sizeof out_buf);
+    std::setvbuf(stderr, err_buf, _IOFBF, sizeof err_buf);
+}
+
+/* Writes after the outer stop's flush, then stops again: the nested exit path. */
+static void logging_stopping_provider(uint64_t, ps3_stop_frontier*)
+{
+    std::printf("provider stdout line\n");
+    std::fprintf(stderr, "provider stderr line\n");
+    ps3_stop(PS3_STOP_CONFIG_INVALID, "provider stopped", "none", nullptr, 0, nullptr);
+}
+
+template <int N>
+static void idle_provider(uint64_t, ps3_stop_frontier*) {}
+
+template <int... N>
+static void register_providers(std::integer_sequence<int, N...>)
+{
+    (ps3_stop_register_frontier(idle_provider<N>), ...);
 }
 
 int main(int argc, char** argv)
@@ -85,6 +111,23 @@ int main(int argc, char** argv)
     if (!std::strcmp(scenario, "buffered-stdout")) {
         std::printf("log line before the stop\n");   // stdout is a pipe here: block-buffered
         ps3_stop(PS3_STOP_UNIMPLEMENTED_SYSCALL, "w", "r", nullptr, 0, nullptr);
+    }
+    if (!std::strcmp(scenario, "buffered-both")) {
+        buffer_both_streams();
+        std::printf("stdout line before the stop\n");
+        std::fprintf(stderr, "stderr line before the stop\n");
+        ps3_stop(PS3_STOP_UNIMPLEMENTED_SYSCALL, "w", "r", nullptr, 0, nullptr);
+    }
+    if (!std::strcmp(scenario, "buffered-nested")) {
+        buffer_both_streams();
+        ps3_stop_register_frontier(logging_stopping_provider);
+        ps3_stop(PS3_STOP_UNRESOLVED_INDIRECT_CALL, "outer", "outer", nullptr, 0, nullptr);
+    }
+    if (!std::strcmp(scenario, "buffered-table-full")) {
+        buffer_both_streams();
+        std::printf("stdout line before the stop\n");
+        register_providers(std::make_integer_sequence<int, 9>{});   // one more than the table holds
+        return 3;   // not reached: the ninth registration stops
     }
     if (!std::strcmp(scenario, "concurrent")) {
         std::atomic<int> ready{0};

@@ -123,6 +123,16 @@ void write_all(const std::string& s)
     std::fflush(stderr);
 }
 
+// Every way out of a stop ends here. std::_Exit runs no atexit handler and
+// flushes no stream, and ps3_stdio fully buffers stdout and stderr (#54), so
+// what the runtime or the guest wrote before the stop is pushed out first on
+// every path; a nested stop or a full provider table would otherwise drop it.
+[[noreturn]] void exit_stopped()
+{
+    std::fflush(nullptr);
+    std::_Exit(PS3_STOP_EXIT_CODE);
+}
+
 } // namespace
 
 extern "C" {
@@ -145,7 +155,7 @@ void ps3_stop_register_frontier(ps3_stop_frontier_fn fn)
     // Eight providers is far more than the runtime has; running out is a bug in
     // whoever added the ninth, and dropping its frontier silently would hide it.
     write_all("PS3STOP v=1 kind=invalid-kind detail=frontier-provider-table-full\n");
-    std::_Exit(PS3_STOP_EXIT_CODE);
+    exit_stopped();
 }
 
 void ps3_stop(ps3_stop_kind kind, const char* what, const char* remedy,
@@ -156,14 +166,15 @@ void ps3_stop(ps3_stop_kind kind, const char* what, const char* remedy,
 
     if (t_stopping) {
         write_all(std::string("PS3STOP v=1 kind=") + id + " nested=1\n");
-        std::_Exit(PS3_STOP_EXIT_CODE);
+        exit_stopped();
     }
     t_stopping = true;
     g_stop_lock.lock();
 
-    // Whatever the guest or the runtime had buffered goes out first, so the
-    // log leading up to the stop is complete when the banner lands after it.
-    std::fflush(stdout);
+    // Whatever the guest or the runtime had buffered, on either stream, goes
+    // out before the frontier providers run, so the log leading up to the stop
+    // is complete even if a provider stops again, and the banner lands after it.
+    std::fflush(nullptr);
 
     ps3_stop_frontier fr = {};
     for (auto& slot : g_providers) {
@@ -226,7 +237,7 @@ void ps3_stop(ps3_stop_kind kind, const char* what, const char* remedy,
     out += rule + "\n" + line + "\n";
 
     write_all(out);
-    std::_Exit(PS3_STOP_EXIT_CODE);
+    exit_stopped();
 }
 
 void ps3_stop_guest_range(const char* func, const char* arg,
