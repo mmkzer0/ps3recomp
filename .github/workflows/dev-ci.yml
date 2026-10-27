@@ -88,6 +88,11 @@ jobs:
             echo "--- $t"
             python "$t"
           done
+      - name: NID annotations state the NID their function computes
+        # Registration computes every NID from the function name, so a stale
+        # `/* NID: 0x... */` comment is invisible to the build and wrong to
+        # whoever reads it as evidence. cellGcmSys carried 33 wrong ones.
+        run: python3 tools/check_nid_comments.py libs
 
   linux:
     # Two compilers on the same libstdc++. AGENTS.md promises GCC parity, and
