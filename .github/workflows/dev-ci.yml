@@ -104,19 +104,48 @@ jobs:
           - { cc: gcc-14, cxx: g++-14 }
     steps:
       - uses: actions/checkout@v4
+      # Downloaded .debs are cached, so a slow mirror costs only the index
+      # update. Bump the key suffix when the package list changes; until then
+      # a stale cache only means the new packages are downloaded.
+      - name: Restore the apt package cache
+        id: apt-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/apt-archives
+          key: apt-ubuntu-24.04-v1
       - name: Install dependencies
-        # The runners' Ubuntu mirror is at times very slow: on 2026-10-26 the
-        # same install took 5 min (run 40299155562) and more than 30 min (runs
-        # 40302851162, 40307082211), with the PowerPC64 cross packages (~30 MB)
-        # the largest part. Retries and fetch timeouts end a dead connection;
-        # the step bound ends a hang without cutting off a slow mirror.
+        id: apt-install
+        # The runners' Ubuntu mirror is at times very slow or hangs: on
+        # 2026-10-26 the same install took 5 min (run 40299155562) and more
+        # than 30 min (runs 40302851162, 40307082211), and on 2026-10-27 one
+        # job sat in it for 25+ min (run 40507665836). Each attempt is bounded
+        # and retried instead of waiting out one hung connection; three failed
+        # attempts fail the job. The step bound stays as the outer limit.
         timeout-minutes: 40
         run: |
-          APT="-o Acquire::Retries=5 -o Acquire::http::Timeout=60 -o Acquire::https::Timeout=60"
-          sudo apt-get $APT update
-          sudo apt-get $APT install -y ninja-build libsdl2-dev clang lld g++-14 \
-            glslang-dev glslang-tools spirv-tools libspirv-cross-c-shared-dev \
-            gcc-powerpc64-linux-gnu g++-powerpc64-linux-gnu binutils-powerpc64-linux-gnu
+          mkdir -p "$HOME/apt-archives/partial"
+          APT="-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"
+          APT="$APT -o Dir::Cache::Archives=$HOME/apt-archives"
+          PKGS="ninja-build libsdl2-dev clang lld g++-14 glslang-dev glslang-tools spirv-tools
+                libspirv-cross-c-shared-dev gcc-powerpc64-linux-gnu g++-powerpc64-linux-gnu
+                binutils-powerpc64-linux-gnu"
+          ok=0
+          for attempt in 1 2 3; do
+            if sudo timeout 300 apt-get $APT update &&
+               sudo timeout 300 apt-get $APT install -y $PKGS; then
+              ok=1; break
+            fi
+            echo "::warning::apt attempt $attempt failed or timed out"
+            sleep 15
+          done
+          sudo chown -R "$(id -u):$(id -g)" "$HOME/apt-archives"
+          test "$ok" = 1
+      - name: Save the apt package cache
+        if: steps.apt-install.outcome == 'success' && steps.apt-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/apt-archives
+          key: apt-ubuntu-24.04-v1
       - name: Configure
         # The synthetic synlib variants require the PowerPC64 cross toolchain
         # installed above: a missing one is a configure error here, never a
