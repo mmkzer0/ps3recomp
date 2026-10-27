@@ -301,6 +301,19 @@ def vcase(name, word, vb_reg, vb_bytes, vd_reg, exp_bytes,
                        va_reg=va_reg, va_bytes=va_bytes,
                        vc_reg=vc_reg, vc_bytes=vc_bytes))
 
+# Multi-instruction cases. `case()` lifts and runs ONE statement, which cannot
+# express a copy: a load/store pair is where a word-order bug lives, and it
+# only shows up when both statements run against the same context with the
+# result compared in memory. A seq case therefore carries the instruction
+# words and the mnemonics they must decode to, seeds registers and memory,
+# then checks the destination bytes.
+SEQ_CASES = []   # dicts: name, mns, words, in_regs, in_mem, exp_mem
+
+def seq_case(name, mns, words, in_regs, in_mem, exp_mem):
+    SEQ_CASES.append(dict(name=name, mns=tuple(mns), words=list(words),
+                          in_regs=in_regs, in_mem=in_mem or {},
+                          exp_mem=exp_mem or {}))
+
 def be_w(vals):    # N x uint32 (big-endian lane values) -> 4N raw bytes
     return struct.pack(f">{len(vals)}I", *(v & 0xFFFFFFFF for v in vals))
 def be_h(vals):    # N x uint16 (big-endian lane values) -> 2N raw bytes
@@ -695,6 +708,45 @@ def build_vcases():
 build_vcases()
 
 # ---------------------------------------------------------------------------
+# T7: a {code, toc} OPD (or any multi-word guest value) copied through a
+# load/store pair must arrive in the same word order.
+#
+# The OPD is how the guest names a function: code word first, TOC word second.
+# A swap anywhere in ld/std, lfd/stfd or lvx/stvx turns the copy into
+# {toc, code}, and every indirect call through the copied descriptor then
+# branches into the TOC. No single-instruction case can see it -- the load and
+# the store each look right on their own -- so each case below runs the pair
+# and compares the destination bytes with the source bytes, in order.
+# ---------------------------------------------------------------------------
+
+def build_seq_cases():
+    opd = be_w([0x00012340, 0x00089000])      # 8 bytes, big-endian: code, toc
+    quad = be_w([0x00012340, 0x00089000, 0x0BADF00D, 0xDEADBEEF])
+
+    # ld r3,0(r4) ; std r3,0(r5) -- the integer path through a GPR.
+    seq_case("ld+std copy keeps opd word order", ("ld", "std"),
+             (d_form(58, 3, 4, 0), d_form(62, 3, 5, 0)),
+             {4: 0x1000, 5: 0x2000},
+             in_mem={0x1000: opd}, exp_mem={0x2000: opd})
+
+    # lfd f3,0(r4) ; stfd f3,0(r5) -- the double path, raw bits untouched.
+    seq_case("lfd+stfd copy keeps opd word order", ("lfd", "stfd"),
+             (d_form(50, 3, 4, 0), d_form(54, 3, 5, 0)),
+             {4: 0x3000, 5: 0x4000},
+             in_mem={0x3000: opd}, exp_mem={0x4000: opd})
+
+    # lvx v2,r0,r4 ; stvx v2,r0,r5 -- the 16-byte path, four distinct words.
+    # lvx/stvx are X-form (opcode 31, XO 103/231), so the vD field sits where
+    # x_logic's rs field does -- vx_form is the VA-form helper, a different
+    # opcode that decodes as vmsumuhs for these operands.
+    seq_case("lvx+stvx copy keeps quad word order", ("lvx", "stvx"),
+             (x_logic(103, 2, 0, 4), x_logic(231, 2, 0, 5)),
+             {4: 0x5000, 5: 0x6000},
+             in_mem={0x5000: quad}, exp_mem={0x6000: quad})
+
+build_seq_cases()
+
+# ---------------------------------------------------------------------------
 # Decode/lift-only checks: FPSCR bit ops (mtfsb0/mtfsb1/mtfsfi) and the
 # VRSAVE mfspr/mtspr pair, verified directly against ppu_disasm.decode and
 # PPULifter._translate. FPSCR and VRSAVE are modelled in the context: the
@@ -1057,6 +1109,46 @@ extern "C" void vm_write64(uint64_t a, uint64_t v) { v = CONF_BSWAP64(v); memcpy
                     f'check_vr("{nm}", (const uint8_t*)&ctx->vr[{c["vd_reg"]}], _want); }}')
         out.append("    }")
 
+    # T7 sequence cases: every statement of the pair runs against the same
+    # context, in order, then the destination memory is compared byte for
+    # byte with the source value.
+    for i, c in enumerate(SEQ_CASES):
+        codes = []
+        decoded = []
+        for k, word in enumerate(c["words"]):
+            insn = ppu_disasm.decode(word, 0x40000 + i * 16 + k * 4)
+            decoded.append(f"{insn.mnemonic} {insn.operands}")
+            code = lifter._translate(insn, dummy)
+            # A pair that lost a statement would leave the destination
+            # untouched and fail, but say which one instead of failing
+            # obscurely -- and never let it be dropped from the program.
+            assert not code.startswith("/*"), (c["name"], decoded, code)
+            codes.append(code)
+        got_mns = tuple(d.split(" ", 1)[0] for d in decoded)
+        if got_mns != c["mns"]:
+            print(f"ENCODING mismatch for {c['name']!r}: decoded as "
+                  f"{'+'.join(got_mns)}, want {'+'.join(c['mns'])} -- case skipped")
+            n_encoding_skipped += 1
+            continue
+        nm = c["name"].replace('"', "'")
+        out.append(f'    {{ /* seq case {i}: {nm} | {" ; ".join(decoded)} */')
+        out.append("      memset(ctx, 0, sizeof(*ctx));")
+        out.append("      memset(g_vm_stub, 0, sizeof(g_vm_stub));")
+        for reg, val in c["in_regs"].items():
+            out.append(f"      ctx->gpr[{reg}] = 0x{val:016X}ULL;")
+        for addr, blob in c["in_mem"].items():
+            byts = ", ".join(f"0x{b:02X}" for b in blob)
+            out.append(f"      {{ static const uint8_t _m[{len(blob)}] = {{ {byts} }}; "
+                       f"memcpy(g_vm_stub + VMOFF(0x{addr:X}), _m, {len(blob)}); }}")
+        for code in codes:
+            out.append(f"      {code}")
+        for addr, blob in c["exp_mem"].items():
+            byts = ", ".join(f"0x{b:02X}" for b in blob)
+            out.append(f'      {{ static const uint8_t _want[{len(blob)}] = {{ {byts} }}; '
+                       f'check_mem("{nm}", 0x{addr:X}ULL, g_vm_stub + VMOFF(0x{addr:X}), '
+                       f"_want, {len(blob)}); }}")
+        out.append("    }")
+
     # AltiVec element loads/stores: every byte offset exercises lane selection
     # and natural alignment, including RA=0 with a deliberately nonzero r0.
     # Loads leave the other lanes undefined, so compare only the selected bytes.
@@ -1108,7 +1200,7 @@ extern "C" void vm_write64(uint64_t a, uint64_t v) { v = CONF_BSWAP64(v); memcpy
     text = "\n".join(out)
     with open(path, "w") as f:
         f.write(text)
-    n_total = len(CASES) + len(VCASES) + n_vector_memory
+    n_total = len(CASES) + len(VCASES) + len(SEQ_CASES) + n_vector_memory
     print(f"wrote {path}: {n_total - n_encoding_skipped} cases "
           f"({n_encoding_skipped} skipped at generation)")
 

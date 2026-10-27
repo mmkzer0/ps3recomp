@@ -7661,6 +7661,36 @@ int main(void) {
       (void)vmx_vcmpbfp(&ctx->vr[2], &ctx->vr[0], &ctx->vr[1]);
       { uint8_t _want[16] = { 0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00 }; check_vr("vcmpbfp", (const uint8_t*)&ctx->vr[2], _want); }
     }
+    { /* seq case 0: ld+std copy keeps opd word order | ld r3, 0x0(r4) ; std r3, 0x0(r5) */
+      memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0, sizeof(g_vm_stub));
+      ctx->gpr[4] = 0x0000000000001000ULL;
+      ctx->gpr[5] = 0x0000000000002000ULL;
+      { static const uint8_t _m[8] = { 0x00, 0x01, 0x23, 0x40, 0x00, 0x08, 0x90, 0x00 }; memcpy(g_vm_stub + VMOFF(0x1000), _m, 8); }
+      ctx->gpr[3] = vm_read64(ctx->gpr[4] + 0x0);
+      vm_write64(ctx->gpr[5] + 0x0, ctx->gpr[3]);
+      { static const uint8_t _want[8] = { 0x00, 0x01, 0x23, 0x40, 0x00, 0x08, 0x90, 0x00 }; check_mem("ld+std copy keeps opd word order", 0x2000ULL, g_vm_stub + VMOFF(0x2000), _want, 8); }
+    }
+    { /* seq case 1: lfd+stfd copy keeps opd word order | lfd r3, 0x0(r4) ; stfd r3, 0x0(r5) */
+      memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0, sizeof(g_vm_stub));
+      ctx->gpr[4] = 0x0000000000003000ULL;
+      ctx->gpr[5] = 0x0000000000004000ULL;
+      { static const uint8_t _m[8] = { 0x00, 0x01, 0x23, 0x40, 0x00, 0x08, 0x90, 0x00 }; memcpy(g_vm_stub + VMOFF(0x3000), _m, 8); }
+      { uint64_t tmp = vm_read64(ctx->gpr[4] + 0x0); memcpy(&ctx->fpr[3], &tmp, 8); }
+      { uint64_t tmp; memcpy(&tmp, &ctx->fpr[3], 8); vm_write64(ctx->gpr[5] + 0x0, tmp); }
+      { static const uint8_t _want[8] = { 0x00, 0x01, 0x23, 0x40, 0x00, 0x08, 0x90, 0x00 }; check_mem("lfd+stfd copy keeps opd word order", 0x4000ULL, g_vm_stub + VMOFF(0x4000), _want, 8); }
+    }
+    { /* seq case 2: lvx+stvx copy keeps quad word order | lvx v2, r0, r4 ; stvx v2, r0, r5 */
+      memset(ctx, 0, sizeof(*ctx));
+      memset(g_vm_stub, 0, sizeof(g_vm_stub));
+      ctx->gpr[4] = 0x0000000000005000ULL;
+      ctx->gpr[5] = 0x0000000000006000ULL;
+      { static const uint8_t _m[16] = { 0x00, 0x01, 0x23, 0x40, 0x00, 0x08, 0x90, 0x00, 0x0B, 0xAD, 0xF0, 0x0D, 0xDE, 0xAD, 0xBE, 0xEF }; memcpy(g_vm_stub + VMOFF(0x5000), _m, 16); }
+      { uint64_t ea = (ctx->gpr[4]) & ~0xFULL; vm_raw_ld16(&ctx->vr[2], ea); }
+      { uint64_t ea = (ctx->gpr[5]) & ~0xFULL; PPU_STORE_HOOK(ea, 16); vm_raw_st16(ea, &ctx->vr[2]); }
+      { static const uint8_t _want[16] = { 0x00, 0x01, 0x23, 0x40, 0x00, 0x08, 0x90, 0x00, 0x0B, 0xAD, 0xF0, 0x0D, 0xDE, 0xAD, 0xBE, 0xEF }; check_mem("lvx+stvx copy keeps quad word order", 0x6000ULL, g_vm_stub + VMOFF(0x6000), _want, 16); }
+    }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
