@@ -1,10 +1,11 @@
 /* The identical-transfer watchdog in mfc_submit, driven through the real
  * engine with a synthetic GET and a test-owned millisecond clock.
  *
- *   ./fixture         back-off schedule: yield, then sleep, then halt
+ *   ./fixture         back-off schedule: yield, then sleep; never halts
  *   ./fixture log     one repeat episode for SPU_DMA_REPEAT_LOG to report
  *
- * tools/test_spu_dma_repeat.py runs both and checks the stderr lines. */
+ * tools/test_spu_dma_repeat.py runs both: the schedule mode checks stdout, the
+ * log mode checks the SPU_DMA_REPEAT_LOG lines on stderr. */
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -61,32 +62,37 @@ int main(int argc, char** argv)
     /* Below the limit: plain transfers, no back-off at all. */
     assert(repeats_ms(255) < 250.0);
 
-    /* Inside the first SPU_DMA_REPEAT_BACKOFF_MS (default 2) of the episode
-     * the watchdog yields. With the clock held at the episode start, 1000
-     * repeats past the limit take nowhere near the >= 1000 ms that a 1 ms
-     * sleep per repeat costs. */
+    /* The yield window is a fixed 2 ms of the episode (spu_dma.h). With the
+     * clock held at the episode start, 1000 repeats past the limit take
+     * nowhere near the >= 1000 ms that a 1 ms sleep per repeat costs. */
     const double yield_ms = repeats_ms(1000);
     printf("1000 repeats inside the yield window: %.1f ms\n", yield_ms);
     assert(yield_ms < 250.0);
 
-    /* Past the window it backs off 1 ms per repeat, as before. */
+    /* Past the window it backs off 1 ms per repeat. */
     s_fake_ms += 2;
     const double sleep_ms = repeats_ms(20);
     printf("20 repeats past the yield window: %.1f ms\n", sleep_ms);
     assert(sleep_ms >= 15.0);
 
-    /* And after SPU_DMA_REPEAT_SECS (default 30) it halts and re-arms: the
-     * next 255 repeats are plain transfers again. */
+    /* Our contract: spu.dma_repeat_stop_secs defaults to 0, so elapsed time
+     * never halts the episode or stops the process. Cross the 30 s at which
+     * upstream's fixture halted and re-armed: the episode is still open here,
+     * so the next repeats keep backing off about 1 ms each. A re-arm would
+     * make them plain transfers, and a stop would end the run with kind
+     * spu-dma-repeat (exit 70) before the PASS line. */
     s_fake_ms += 30u * 1000u;
-    get(0x20000, 0x1000, 16);                 /* halts (reported on stderr) */
-    assert(repeats_ms(255) < 250.0);
+    const double open_ms = repeats_ms(20);
+    printf("20 repeats 30 s into the episode: %.1f ms\n", open_ms);
+    assert(open_ms >= 15.0);
 
     /* A different transfer ends the episode; the new one starts a fresh count. */
     get(0x20100, 0x2000, 128);
     assert(repeats_ms(255) < 250.0);
 
     spu_mfc_release(&spu);
-    puts("PASS: identical-transfer watchdog yields inside the back-off window, sleeps after it, halts after the time limit");
+    puts("PASS: the default never halts or stops; it yields, then backs off, "
+         "and a different transfer ends the episode");
     return 0;
 }
 

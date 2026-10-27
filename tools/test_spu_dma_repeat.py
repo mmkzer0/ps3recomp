@@ -19,8 +19,10 @@ real named-stop runtime (runtime/diag/stop.cpp), then:
 Each run is bounded, so a regression to "halt silently" or "never stop" fails
 instead of hanging the suite.
 
-Then drives the watchdog's reporting through the synthetic fixture
-runtime/spu/tests/test_spu_dma_repeat.c (a test-owned millisecond clock):
+Then drives the watchdog's timing schedule and its reporting through the
+synthetic fixture runtime/spu/tests/test_spu_dma_repeat.c (a test-owned
+millisecond clock): at the default spu.dma_repeat_stop_secs (0) the episode
+yields, backs off and never halts or stops, even past 30 s; and
 SPU_DMA_REPEAT_LOG=<n> must name the repeated transfer, its size included, and
 only when it is set.
 """
@@ -112,7 +114,13 @@ def main():
 
 
 def repeat_log_fixture(cc, cxx, cflags, cxxflags, env):
-    """SPU_DMA_REPEAT_LOG: one episode, one line, naming the repeated transfer.
+    """The watchdog's own schedule, then SPU_DMA_REPEAT_LOG reporting.
+
+    Default mode: the 2 ms yield window and the 1 ms per-repeat back-off, with
+    no halt and no stop at the default spu.dma_repeat_stop_secs (0), even past
+    30 s of the test-owned clock.
+
+    Log mode: one episode, one line, naming the repeated transfer.
 
     The fixture includes spu_channels.c, so it links the rest of the SPU runtime
     plus the typed configuration and named-stop runtime the engine calls.
@@ -144,6 +152,16 @@ def repeat_log_fixture(cc, cxx, cflags, cxxflags, env):
                                cwd=tmp, capture_output=True, text=True, timeout=30)
             assert p.returncode == 0, (p.returncode, p.stdout, p.stderr)
             return p.stderr
+
+        # The watchdog's timing schedule under our contract: with the default
+        # spu.dma_repeat_stop_secs (0) the episode must never halt, and the
+        # process must never stop -- crossing 30 s of the test-owned clock keeps
+        # backing off. Exit 70 (kind spu-dma-repeat) or a re-armed episode fails
+        # this phase instead of passing silently.
+        p = subprocess.run([str(binary)], env=env, cwd=tmp, capture_output=True,
+                           text=True, timeout=30)
+        assert p.returncode == 0, (p.returncode, p.stdout, p.stderr)
+        assert "never halts or stops" in p.stdout, p.stdout
 
         err = run("log")
         assert "[dma-repeat]" not in err, "repeat log printed while unset"
