@@ -34,11 +34,14 @@ extern "C" {
  * the HLE ABI passes them through untranslated.
  *   check: cbFunc(status, errorCode, version, cbFuncArg)
  *   show:  cbFunc(status, param, cbFuncArg), a CellSysutilCallback          */
+/* NID 0x59D1629A */
 s32 sceNpEulaCheckEulaStatus(u32 communicationId, u32 arg2, u64 arg3,
-                             u32 cbFunc, u32 cbFuncArg);              /* NID 0x59D1629A */
-s32 sceNpEulaAbort(void);                                             /* NID 0x5EC05AD8 */
+                             u32 cbFunc, u32 cbFuncArg);
+/* NID 0x5EC05AD8 */
+s32 sceNpEulaAbort(void);
+/* NID 0x6599500D */
 s32 sceNpEulaShowCurrentEula(u32 communicationId, u64 arg2,
-                             u32 cbFunc, u32 cbFuncArg);              /* NID 0x6599500D */
+                             u32 cbFunc, u32 cbFuncArg);
 
 /* Called by cellSysutilCheckCallback: moves a pending answer to the guest
  * callback queue, which that same poll drains (RPCS3's sysutil_register_cb). */

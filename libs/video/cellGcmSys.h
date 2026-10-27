@@ -193,7 +193,7 @@ typedef void (*CellGcmQueueHandler)(u32 head);
 
 /* Initialization */
 
-/* NID: 0xB2E761D4 */
+/* NID: 0xB477F06A */
 s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress);
 
 /* Reusable core of _cellGcmInitBody (NID 0x15BAE46B) — the function the SDK's
@@ -225,29 +225,28 @@ s32 cellGcmGetConfiguration(CellGcmConfig* config);
 
 /* Command buffer control */
 
-/* NID: 0x8572A8E0 */
+/* NID: 0xA547ADDE */
 CellGcmControl* cellGcmGetControlRegister(void);
 
 /* Display / flip */
 
-/* NID: 0xDB23E867 */
+/* NID: 0xC8F3BD09 */
 u32 cellGcmGetCurrentField(void);
 
-/* NID: 0xA53D12AE */
+/* NID: 0x4AE8D215 */
 void cellGcmSetFlipMode(u32 mode);
 
-/* NID: 0xC44D8F34 */
+/* NID: 0x983FB9AA */
 void cellGcmSetWaitFlip(void);
 void cellGcmSetWaitFlipUnsafe(void);
 u32 cellGcmGetReport(u32 type, u32 index);
 
-/* NID: 0x51C9D62B */
+/* NID: 0xB2E761D4 */
 void cellGcmResetFlipStatus(void);
 
-/* NID: 0xE315A0B2 */
+/* NID: 0x72A577CE */
 u32 cellGcmGetFlipStatus(void);
 
-/* NID: 0xDC09357E */
 /* --- sys_rsx_* bridge (libs/video/sys_rsx.c) -----------------------------
  * A firmware module links libgcm statically and reaches RSX through the lv2
  * syscalls, so no cellGcm* import ever runs. These let the syscall layer drive
@@ -261,13 +260,14 @@ void cellGcm_syscall_set_fifo(u32 put, u32 get);
  * engine, for an engine that comes up after cellGcmSetDisplayBuffer ran. */
 void cellGcm_replay_display_buffers_to_engine(void);
 
+/* NID: 0xA53D12AE */
 s32 cellGcmSetDisplayBuffer(u32 bufferId, u32 offset, u32 pitch,
                             u32 width, u32 height);
 
-/* NID: 0xEAA52F23 */
+/* NID: 0x5C770579 */
 s32 cellGcmSetFlipCommand(u32 bufferId);
 
-/* NID: 0xD01B570F */
+/* NID: 0x2B827690 */
 s32 cellGcmSetFlipCommandWithWaitLabel(u32 bufferId, u32 labelIndex, u32 labelValue);
 
 /* Host-side command-context primitives for library emitters (cellResc): not firmware exports.
@@ -282,19 +282,19 @@ void cellGcm_ctx_emit(u32 ctx, const u32* words, u32 n);
 s32  cellGcm_emit_flip_command(u32 ctx, u32 bufferId);
 s32  cellGcm_address_to_offset(u32 address, u32* offset_out);
 
-/* NID: 0xA2478CA3 */
+/* NID: 0x0B4B62D5 */
 s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId);
 
-/* NID: 0x1BFAB6EE */
+/* NID: 0x371674CF */
 CellGcmDisplayInfo* cellGcmGetDisplayBufferByFlipIndex(u32 index);
 
-/* NID: 0x8BADE8BE */
+/* NID: 0x93806525 */
 u32 cellGcmGetCurrentDisplayBufferId(void);
 
-/* NID: 0xD9B7653E */
+/* NID: 0xA41EF7E8 */
 void cellGcmSetFlipHandler(CellGcmFlipHandler handler);
 
-/* NID: 0xA547ADDE */
+/* NID: 0xA91B0402 */
 void cellGcmSetVBlankHandler(CellGcmVBlankHandler handler);
 
 /* Host-side ticks. Call from the game's host driver to fire any
@@ -304,39 +304,39 @@ void cellGcmSetVBlankHandler(CellGcmVBlankHandler handler);
 void cellGcmTickVBlank(void);
 void cellGcmTickFlip(void);
 
-/* NID: 0xF9BFCDA3 */
+/* NID: 0xDC494430 */
 void cellGcmSetSecondVHandler(CellGcmSecondVHandler handler);
 
-/* NID: 0x0B4B62D5 */
+/* NID: 0x06EDEA9E */
 void cellGcmSetUserHandler(CellGcmUserHandler handler);
 
-/* NID: 0x21AC3697 */
+/* NID: 0x63387071 */
 u64 cellGcmGetLastFlipTime(void);
 
 /* Address translation / IO mapping */
 
-/* NID: 0x0E6B0DFF */
+/* NID: 0x2922AED0 */
 s32 cellGcmGetOffsetTable(CellGcmOffsetTable* table);
 
-/* NID: 0xDB769B32 */
+/* NID: 0x21AC3697 */
 s32 cellGcmAddressToOffset(u32 address, u32* offset);
 
-/* NID: 0x2A6FBA9C */
+/* NID: 0xA114EC67 */
 s32 cellGcmMapMainMemory(u32 ea, u32 size, u32* offset);
 
-/* NID: 0x5A41C10F */
+/* NID: 0x63441CB4 */
 s32 cellGcmMapEaIoAddress(u32 ea, u32 io, u32 size);
 
 /* NID: 0x626E8518 */
 s32 cellGcmMapEaIoAddressWithFlags(u32 ea, u32 io, u32 size, u32 flags);
 
-/* NID: 0xDB23E867 (disambiguation by context) */
+/* NID: 0xEFD00F54 (disambiguation by context) */
 s32 cellGcmUnmapEaIoAddress(u32 ea);
 
-/* NID: 0x3B9BD5BD */
+/* NID: 0xDB23E867 */
 s32 cellGcmUnmapIoAddress(u32 io);
 
-/* NID: 0xC47D0812 */
+/* NID: 0x2A6FBA9C */
 s32 cellGcmIoOffsetToAddress(u32 ioOffset, u32* ea);
 
 /* Label / report / timestamp */
@@ -344,42 +344,42 @@ s32 cellGcmIoOffsetToAddress(u32 ioOffset, u32* ea);
 /* NID: 0xF80196C1 */
 u32* cellGcmGetLabelAddress(u8 index);
 
-/* NID: 0x8572ADE4 */
+/* NID: 0x9A0159AF */
 CellGcmReportData* cellGcmGetReportDataAddress(u32 index);
 
-/* NID: 0x97FC4B73 */
+/* NID: 0x5A41C10F */
 u64 cellGcmGetTimeStamp(u32 index);
 
 /* Tile / Zcull */
 
-/* NID: 0x0B4B62D5 */
+/* NID: 0xD0B1D189 */
 s32 cellGcmSetTile(u8 index, u8 location, u32 offset, u32 size,
                    u32 pitch, u8 comp, u16 base, u8 bank);
 
-/* NID: 0x06EDEA25 */
+/* NID: 0xD34A420D */
 s32 cellGcmSetZcull(u8 index, u32 offset, u32 width, u32 height,
                     u32 cullStart, u32 zFormat, u32 aaFormat,
                     u32 zcullDir, u32 zcullFormat,
                     u32 sFunc, u32 sRef, u32 sMask);
 
-/* NID: 0x2BB1F1E5 */
+/* NID: 0x4524CCCD */
 s32 cellGcmBindTile(u8 index);
 
-/* NID: 0x1F61F9D3 */
+/* NID: 0x9DC04436 */
 s32 cellGcmBindZcull(u8 index);
 
-/* NID: 0x75843042 */
+/* NID: 0xD9B7653E */
 s32 cellGcmUnbindTile(u8 index);
 
-/* NID: 0xA093BE1C */
+/* NID: 0xA75640E8 */
 s32 cellGcmUnbindZcull(u8 index);
 
 /* Misc */
 
-/* NID: 0x107BF789 */
+/* NID: 0x055BD74D */
 u32 cellGcmGetTiledPitchSize(u32 size);
 
-/* NID: 0xBC982946 */
+/* NID: 0x51C9D62B */
 void cellGcmSetDebugOutputLevel(u32 level);
 
 /* --- Additional functions needed by Tokyo Jungle --- */

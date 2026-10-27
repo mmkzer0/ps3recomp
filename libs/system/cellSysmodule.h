@@ -122,7 +122,7 @@ extern "C" {
  * Functions
  * -----------------------------------------------------------------------*/
 
-/* NID: 0x26A6E12B */
+/* NID: 0x63FF6FF9 */
 s32 cellSysmoduleInitialize(void);
 s32 cellSysmoduleFinalize(void);
 s32 cellSysmoduleLoadModule(u16 id);

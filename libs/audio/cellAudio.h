@@ -105,10 +105,10 @@ s32 cellAudioPortGetStatus(u32 portNum, u32* status);
 /* NID: 0xE4046AFE */
 s32 cellAudioGetPortBlockTag(u32 portNum, u64 blockNo, u64* tag);
 
-/* NID: 0xFF3626FD */
+/* NID: 0x4109D08C */
 s32 cellAudioGetPortTimestamp(u32 portNum, u64 tag, u64* stamp);
 
-/* NID: 0x5676F81C */
+/* NID: 0xE4046AFE */
 s32 cellAudioGetPortBlockTag(u32 portNum, u64 blockNo, u64* tag);
 s32 cellAudioSetPersonalDevice(s32 iPersonalStream, s32 iDevice);
 

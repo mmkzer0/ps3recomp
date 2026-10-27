@@ -863,7 +863,7 @@ static const int s_valid_pitch_count = sizeof(s_valid_pitches) / sizeof(s_valid_
  * API implementations -- Initialization
  * -----------------------------------------------------------------------*/
 
-/* NID: 0xB2E761D4 */
+/* NID: 0xB477F06A */
 s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
 {
     printf("[cellGcmSys] Init(cmdSize=0x%X, ioSize=0x%X, ioAddr=0x%08X)\n",
@@ -1110,7 +1110,7 @@ s32 cellGcmGetConfiguration(CellGcmConfig* config)
  * Command buffer control
  * -----------------------------------------------------------------------*/
 
-/* NID: 0x8572A8E0 */
+/* NID: 0xA547ADDE */
 CellGcmControl* cellGcmGetControlRegister(void)
 {
     /* Return the GUEST address of the control register (not &s_control, a host
@@ -1123,21 +1123,21 @@ CellGcmControl* cellGcmGetControlRegister(void)
  * Display / flip
  * -----------------------------------------------------------------------*/
 
-/* NID: 0xDB23E867 */
+/* NID: 0xC8F3BD09 */
 u32 cellGcmGetCurrentField(void)
 {
     /* Returns 0 or 1 for interlaced; always 0 for progressive. */
     return 0;
 }
 
-/* NID: 0xA53D12AE */
+/* NID: 0x4AE8D215 */
 void cellGcmSetFlipMode(u32 mode)
 {
     printf("[cellGcmSys] SetFlipMode(mode=%u)\n", mode);
     s_flip_mode = mode;
 }
 
-/* NID: 0xC44D8F34 */
+/* NID: 0x983FB9AA */
 void cellGcmSetWaitFlip(void)
 {
     /* Block until the pending flip completes (the present thread marks it done
@@ -1161,7 +1161,7 @@ void cellGcmSetWaitFlip(void)
  * a boot and got a faked CELL_OK (no wait at all) before this was registered. */
 void cellGcmSetWaitFlipUnsafe(void) { cellGcmSetWaitFlip(); }
 
-/* NID: 0x51C9D62B */
+/* NID: 0xB2E761D4 */
 void cellGcmResetFlipStatus(void)
 {
     { static int n = 0;
@@ -1174,7 +1174,7 @@ void cellGcmResetFlipStatus(void)
     FLIP_UNLOCK();
 }
 
-/* NID: 0xE315A0B2 */
+/* NID: 0x72A577CE */
 u32 cellGcmGetFlipStatus(void)
 {
     /* Avoid host-calling the guest OPDs directly (they're not valid host
@@ -4000,7 +4000,7 @@ void cellGcm_replay_display_buffers_to_engine(void)
                                                s_display_buffers[i].height);
 }
 
-/* NID: 0xDC09357E */
+/* NID: 0xA53D12AE */
 s32 cellGcmSetDisplayBuffer(u32 bufferId, u32 offset, u32 pitch,
                             u32 width, u32 height)
 {
@@ -4039,7 +4039,6 @@ int cellGcmOffsetIsDisplay(u32 offset)
     return 0;
 }
 
-/* NID: 0xEAA52F23 */
 /* How many display buffers the title has actually registered. cellResc needs
  * it to know how far to rotate its flip target; nothing else about the set is
  * anyone else's business, so this stays a count rather than exposing the array. */
@@ -4138,6 +4137,7 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
     return CELL_OK;
 }
 
+/* NID: 0x5C770579 */
 s32 cellGcmSetFlipCommand(u32 bufferId) { return gcm_flip_request(bufferId, 0); }
 
 /* ---- C2: the libgcm command-context primitives the library emitters share ------------------
@@ -4280,7 +4280,7 @@ s32 cellGcmSetFlip(void* context, u32 bufferId)
     return cellGcmSetFlipCommand(bufferId);
 }
 
-/* NID: 0xD01B570F */
+/* NID: 0x2B827690 */
 s32 cellGcmSetFlipCommandWithWaitLabel(u32 bufferId, u32 labelIndex, u32 labelValue)
 {
     if (labelIndex >= CELL_GCM_MAX_LABEL_COUNT)
@@ -4297,7 +4297,7 @@ s32 cellGcmSetFlipCommandWithWaitLabel(u32 bufferId, u32 labelIndex, u32 labelVa
     return cellGcmSetFlipCommand(bufferId);
 }
 
-/* NID: 0xA2478CA3 */
+/* NID: 0x0B4B62D5 */
 s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
 {
     (void)ctx;  /* command buffer context -- not used in HLE */
@@ -4325,20 +4325,20 @@ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
     return CELL_OK;
 }
 
-/* NID: 0x1BFAB6EE */
+/* NID: 0x371674CF */
 CellGcmDisplayInfo* cellGcmGetDisplayBufferByFlipIndex(u32 index)
 {
     u32 id = index % CELL_GCM_MAX_DISPLAY_BUFFER_NUM;
     return &s_display_buffers[id];
 }
 
-/* NID: 0x8BADE8BE */
+/* NID: 0x93806525 */
 u32 cellGcmGetCurrentDisplayBufferId(void)
 {
     return s_current_display_buffer_id;
 }
 
-/* NID: 0xD9B7653E */
+/* NID: 0xA41EF7E8 */
 void cellGcmSetFlipHandler(CellGcmFlipHandler handler)
 {
     /* `handler` is a guest OPD address — store as such and remember
@@ -4352,7 +4352,7 @@ void cellGcmSetFlipHandler(CellGcmFlipHandler handler)
     gcm_update_handler_mask();
 }
 
-/* NID: 0xA547ADDE */
+/* NID: 0xA91B0402 */
 void cellGcmSetVBlankHandler(CellGcmVBlankHandler handler)
 {
     printf("[cellGcmSys] SetVBlankHandler(opd=0x%08X)\n", (unsigned)(size_t)handler);
@@ -4362,7 +4362,7 @@ void cellGcmSetVBlankHandler(CellGcmVBlankHandler handler)
     gcm_update_handler_mask();
 }
 
-/* NID: 0xF9BFCDA3 */
+/* NID: 0xDC494430 */
 void cellGcmSetSecondVHandler(CellGcmSecondVHandler handler)
 {
     printf("[cellGcmSys] SetSecondVHandler(opd=0x%08X)\n", (unsigned)(size_t)handler);
@@ -4370,7 +4370,7 @@ void cellGcmSetSecondVHandler(CellGcmSecondVHandler handler)
     s_second_v_handler = handler;
 }
 
-/* NID: 0x0B4B62D5 */
+/* NID: 0x06EDEA9E */
 void cellGcmSetUserHandler(CellGcmUserHandler handler)
 {
     printf("[cellGcmSys] SetUserHandler(opd=0x%08X)\n", (unsigned)(size_t)handler);
@@ -4379,7 +4379,7 @@ void cellGcmSetUserHandler(CellGcmUserHandler handler)
     gcm_update_handler_mask();
 }
 
-/* NID: 0x21AC3697 */
+/* NID: 0x63387071 */
 u64 cellGcmGetLastFlipTime(void)
 {
     return s_last_flip_time;
@@ -4389,7 +4389,6 @@ u64 cellGcmGetLastFlipTime(void)
  * Address translation / IO mapping
  * -----------------------------------------------------------------------*/
 
-/* NID: 0x0E6B0DFF */
 /* Mirror the host tables into the guest window the title will index. */
 static void gcm_publish_offset_tables(void)
 {
@@ -4399,6 +4398,7 @@ static void gcm_publish_offset_tables(void)
     }
 }
 
+/* NID: 0x2922AED0 */
 s32 cellGcmGetOffsetTable(CellGcmOffsetTable* table)
 {
     u32 ea = (u32)(uintptr_t)table;
@@ -4413,9 +4413,9 @@ s32 cellGcmGetOffsetTable(CellGcmOffsetTable* table)
     return CELL_OK;
 }
 
-/* NID: 0xDB769B32 */
 static u32 gcm_io_alloc(u32 size);   /* defined below */
 
+/* NID: 0x21AC3697 */
 s32 cellGcmAddressToOffset(u32 address, u32* offset)
 {
     /* `offset` is a GUEST address; write big-endian via vm_write32. */
@@ -4581,7 +4581,7 @@ static u32 gcm_io_alloc(u32 size)
     return 0xFFFFFFFFu;
 }
 
-/* NID: 0x2A6FBA9C */
+/* NID: 0xA114EC67 */
 s32 cellGcmMapMainMemory(u32 ea, u32 size, u32* offset)
 {
     /* Log the REQUEST before validating it. Every rejection below used to
@@ -4665,7 +4665,7 @@ s32 cellGcmMapMainMemory(u32 ea, u32 size, u32* offset)
     return CELL_OK;
 }
 
-/* NID: 0x5A41C10F */
+/* NID: 0x63441CB4 */
 s32 cellGcmMapEaIoAddress(u32 ea, u32 io, u32 size)
 {
     /* Logged before validation, and every failure path named -- same reason as
@@ -4734,7 +4734,7 @@ s32 cellGcmMapEaIoAddressWithFlags(u32 ea, u32 io, u32 size, u32 flags)
     return cellGcmMapEaIoAddress(ea, io, size);
 }
 
-/* NID: 0xDB23E867 (disambiguation by context) */
+/* NID: 0xEFD00F54 (disambiguation by context) */
 s32 cellGcmUnmapEaIoAddress(u32 ea)
 {
     IoMapping* mapping = find_mapping_by_ea(ea);
@@ -4750,7 +4750,7 @@ s32 cellGcmUnmapEaIoAddress(u32 ea)
     return CELL_OK;
 }
 
-/* NID: 0x3B9BD5BD */
+/* NID: 0xDB23E867 */
 s32 cellGcmUnmapIoAddress(u32 io)
 {
     IoMapping* mapping = find_mapping_by_io(io);
@@ -4766,7 +4766,7 @@ s32 cellGcmUnmapIoAddress(u32 io)
     return CELL_OK;
 }
 
-/* NID: 0xC47D0812 */
+/* NID: 0x2A6FBA9C */
 s32 cellGcmIoOffsetToAddress(u32 ioOffset, u32* ea)
 {
     uint32_t ea_ea = (uint32_t)(uintptr_t)ea;   /* guest out-param */
@@ -4871,7 +4871,7 @@ u32* cellGcmGetLabelAddress(u8 index)
     return (u32*)(uintptr_t)(GCM_LABEL_GUEST_BASE + (u32)index * GCM_LABEL_STRIDE);
 }
 
-/* NID: 0x8572ADE4 */
+/* NID: 0x9A0159AF */
 CellGcmReportData* cellGcmGetReportDataAddress(u32 index)
 {
     if (index >= CELL_GCM_MAX_REPORT_COUNT) {
@@ -4881,7 +4881,6 @@ CellGcmReportData* cellGcmGetReportDataAddress(u32 index)
     return &s_report_data[index];
 }
 
-/* NID: 0x97FC4B73 */
 /* NID: 0x99D397AC. The value NV4097_GET_REPORT stored at this index (the
  * walker fills it). Unregistered, every call returned a faked 0. */
 u32 cellGcmGetReport(u32 type, u32 index)
@@ -4893,6 +4892,7 @@ u32 cellGcmGetReport(u32 type, u32 index)
     return s_report_data[index].value;
 }
 
+/* NID: 0x5A41C10F */
 u64 cellGcmGetTimeStamp(u32 index)
 {
     if (index >= CELL_GCM_MAX_REPORT_COUNT)
@@ -4910,7 +4910,7 @@ u64 cellGcmGetTimeStamp(u32 index)
  * Tile / Zcull configuration
  * -----------------------------------------------------------------------*/
 
-/* NID: 0x0B4B62D5 */
+/* NID: 0xD0B1D189 */
 s32 cellGcmSetTile(u8 index, u8 location, u32 offset, u32 size,
                    u32 pitch, u8 comp, u16 base, u8 bank)
 {
@@ -4935,7 +4935,7 @@ s32 cellGcmSetTile(u8 index, u8 location, u32 offset, u32 size,
     return CELL_OK;
 }
 
-/* NID: 0x06EDEA25 */
+/* NID: 0xD34A420D */
 s32 cellGcmSetZcull(u8 index, u32 offset, u32 width, u32 height,
                     u32 cullStart, u32 zFormat, u32 aaFormat,
                     u32 zcullDir, u32 zcullFormat,
@@ -4963,7 +4963,7 @@ s32 cellGcmSetZcull(u8 index, u32 offset, u32 width, u32 height,
     return CELL_OK;
 }
 
-/* NID: 0x2BB1F1E5 */
+/* NID: 0x4524CCCD */
 s32 cellGcmBindTile(u8 index)
 {
     /* libgcm_sys 0x02002AB8 (cellGcmBindTile, NID 0x4524CCCD, opd 0x0200BB64) takes the index as the low byte
@@ -4978,7 +4978,7 @@ s32 cellGcmBindTile(u8 index)
     return CELL_OK;
 }
 
-/* NID: 0x1F61F9D3 */
+/* NID: 0x9DC04436 */
 s32 cellGcmBindZcull(u8 index)
 {
     if (index >= CELL_GCM_MAX_ZCULL_COUNT)
@@ -4989,7 +4989,7 @@ s32 cellGcmBindZcull(u8 index)
     return CELL_OK;
 }
 
-/* NID: 0x75843042 */
+/* NID: 0xD9B7653E */
 s32 cellGcmUnbindTile(u8 index)
 {
     if (index >= CELL_GCM_MAX_TILE_COUNT)
@@ -5000,7 +5000,7 @@ s32 cellGcmUnbindTile(u8 index)
     return CELL_OK;
 }
 
-/* NID: 0xA093BE1C */
+/* NID: 0xA75640E8 */
 s32 cellGcmUnbindZcull(u8 index)
 {
     if (index >= CELL_GCM_MAX_ZCULL_COUNT)
@@ -5015,7 +5015,7 @@ s32 cellGcmUnbindZcull(u8 index)
  * Misc
  * -----------------------------------------------------------------------*/
 
-/* NID: 0x107BF789
+/* NID: 0x055BD74D
  * SDK prototype (cell/gcm.h): uint32_t cellGcmGetTiledPitchSize(const uint32_t size)
  * -- returns the pitch BY VALUE in r3 (no out-pointer!). The old signature here
  * took (size, u32* pitch-out) and returned a status code, so every caller got 0
@@ -5036,7 +5036,7 @@ u32 cellGcmGetTiledPitchSize(u32 size)
     return r;
 }
 
-/* NID: 0xBC982946 */
+/* NID: 0x51C9D62B */
 void cellGcmSetDebugOutputLevel(u32 level)
 {
     printf("[cellGcmSys] SetDebugOutputLevel(level=%u)\n", level);
@@ -5110,12 +5110,11 @@ s32 cellGcmSetDefaultFifoSize(u32 size)
  * bufferId as arg1 made the range check eat the context pointer, so the
  * flip counter never advanced (wave: presents free-ran 4x per frame,
  * layout flashing/zooming). */
-/* NID 0x21397818 is gcmSetFlipCommand (PSL1GHT libgcm_sys exports.h) -- it
+/* NID: 0x21397818. gcmSetFlipCommand (PSL1GHT libgcm_sys exports.h) -- it
  * was misassigned to cellGcmGetLabelAddress (real NID 0xF80196C1), so every
  * import-based flip (LBP: cellGcmSetFlip -> stub 0x7482FC(ctx, id)) landed
  * in the label getter and no flip was EVER issued: the intro-movie pump ran,
  * drew, "flipped" into the wrong function, and the screen stayed black. */
-/* NID: 0x21397818 */
 s32 _cellGcmSetFlipCommand(void* ctx, u32 bufferId)
 {
     if (gcm_flip_into_fifo((u32)(uintptr_t)ctx, bufferId))
@@ -5123,7 +5122,6 @@ s32 _cellGcmSetFlipCommand(void* ctx, u32 bufferId)
     return cellGcmSetFlipCommand(bufferId);
 }
 
-/* NID: 0xD8F88E1A */
 /* libgcm writes this into the context: NV406E SEMAPHORE_OFFSET and
  * SEMAPHORE_ACQUIRE for the label, then the flip, so the RSX flips once the
  * label holds the value. The import used to write the label itself, from the
@@ -5132,6 +5130,7 @@ s32 _cellGcmSetFlipCommand(void* ctx, u32 bufferId)
  * way on its main context. Queue it the same way as _cellGcmSetFlipCommand,
  * and fall back to the immediate form when the context is not a mapped command
  * buffer or has no room. */
+/* NID: 0xD8F88E1A */
 s32 _cellGcmSetFlipCommandWithWaitLabel(void* ctx, u32 bufferId,
                                         u32 labelIndex, u32 labelValue)
 {
