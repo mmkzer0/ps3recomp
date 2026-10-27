@@ -56,6 +56,9 @@ void spu_coh_notify_write(uint32_t) {}
 void spu_lockline_lock() {}
 void spu_lockline_unlock() {}
 void ps3_ww_report_inline(uint32_t, uint64_t, int) {}
+/* PS3_PRIO_START's scheduling hint (sys_ppu_thread.c). It only delays a creator while its higher-priority child
+ * has not blocked yet, there is no thread table here, and the knob is off by default, so nothing is noted. */
+void ppu_thread_note_block(uint64_t) {}
 /* ps3_hle_call spills the caller's r2 into its stack frame (r1 + 0x28). */
 uint32_t vm_read32(uint64_t a) { uint32_t v; std::memcpy(&v, vm_base + a, 4); return __builtin_bswap32(v); }
 void vm_write32(uint64_t a, uint32_t v) { v = __builtin_bswap32(v); std::memcpy(vm_base + a, &v, 4); }

@@ -110,6 +110,11 @@ typedef void (*hle_ctx_fn)(ppu_context*);
 static struct { const char* name; hle_ctx_fn fn; } g_hle[16];
 static int g_hle_n;
 void ps3_hle_register_ctx(uint32_t, const char* name, hle_ctx_fn fn) { g_hle[g_hle_n].name = name; g_hle[g_hle_n++].fn = fn; }
+/* No fast table here: g_hle runs every lwsync call through its full handler, which is what the fast forms fall back
+ * to anyway (tests/lwsync covers them through ps3_hle_dispatch). */
+void ps3_hle_register_fast(uint32_t, int (*)(ppu_context*)) {}
+/* PS3_PRIO_START's hint (sys_ppu_thread.c): no thread table here and the knob is off, so nothing is noted. */
+void ppu_thread_note_block(uint64_t) {}
 void ps3_lwsync_register(void);
 }
 
