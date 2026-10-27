@@ -18,8 +18,15 @@ real named-stop runtime (runtime/diag/stop.cpp), then:
 
 Each run is bounded, so a regression to "halt silently" or "never stop" fails
 instead of hanging the suite.
+
+Then drives the watchdog's reporting through the synthetic fixture
+runtime/spu/tests/test_spu_dma_repeat.c (a test-owned millisecond clock):
+SPU_DMA_REPEAT_LOG=<n> must name the repeated transfer, its size included, and
+only when it is set.
 """
 import os
+import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -70,7 +77,7 @@ def main():
         # engine's direct ps3_cfg_*/ps3_stop calls must extract both members.
         # A weak NULL hook in the header satisfies them locally instead, the
         # archive stays unextracted, and the configured stop is ignored -- the
-        # fixture then hits its 3000-repeat bound and exits 3, not 70.
+        # fixture then hits its 10 s bound and exits 3, not 70.
         archive = tmp / "libps3recomp_runtime.a"
         subprocess.run([os.environ.get("AR", "ar"), "rcs", str(archive),
                         str(tmp / "config.o"), str(tmp / "stop.o"),
@@ -101,6 +108,56 @@ def main():
         assert int(f["secs"]) >= 1, f
     print("PASS: identical DMA transfers back off by default and stop only with "
           "spu.dma_repeat_stop_secs set (direct and static-archive links)")
+    return repeat_log_fixture(cc, cxx, cflags, cxxflags, env)
+
+
+def repeat_log_fixture(cc, cxx, cflags, cxxflags, env):
+    """SPU_DMA_REPEAT_LOG: one episode, one line, naming the repeated transfer.
+
+    The fixture includes spu_channels.c, so it links the rest of the SPU runtime
+    plus the typed configuration and named-stop runtime the engine calls.
+    """
+    spu = ROOT / "runtime" / "spu"
+    common = ["spu_drain.c", "spu_lockstep.c", "spu_coherency.c", "spu_workload.c",
+              "spurs_policy.c", "spurs_job.c", "spu_tsp_weak.c", "spu_vm_pagemap.c",
+              "spurs_policy_blob_weak.c", "spu_interp.c"]
+    sources = ([spu / "tests/test_spu_dma_repeat.c"] + [spu / n for n in common] +
+               [ROOT / "runtime/memory/reservation.c", ROOT / "runtime/memory/label_window.c",
+                ROOT / "runtime/platform/win32_compat.c"])
+    flags = cflags + shlex.split(os.environ.get("CFLAGS", ""))
+    with tempfile.TemporaryDirectory(prefix="spu-dma-repeat-log-") as tmp:
+        tmp = Path(tmp)
+        objects = []
+        for index, src in enumerate(sources):
+            obj = tmp / f"{index}-{src.stem}.o"
+            subprocess.run([cc, *flags, "-c", str(src), "-o", str(obj)], check=True)
+            objects.append(str(obj))
+        for src in (ROOT / "runtime/config/config.cpp", ROOT / "runtime/diag/stop.cpp"):
+            obj = tmp / (src.stem + ".o")
+            subprocess.run([cxx, *cxxflags, "-c", str(src), "-o", str(obj)], check=True)
+            objects.append(str(obj))
+        binary = tmp / "fixture"
+        subprocess.run([cxx, *objects, "-pthread", "-lm", "-o", str(binary)], check=True)
+
+        def run(*args, extra=None):
+            p = subprocess.run([str(binary), *args], env={**env, **(extra or {})},
+                               cwd=tmp, capture_output=True, text=True, timeout=30)
+            assert p.returncode == 0, (p.returncode, p.stdout, p.stderr)
+            return p.stderr
+
+        err = run("log")
+        assert "[dma-repeat]" not in err, "repeat log printed while unset"
+
+        err = run("log", extra={"SPU_DMA_REPEAT_LOG": "4"})
+        lines = [l for l in err.splitlines() if l.startswith("[dma-repeat]")]
+        assert len(lines) == 1, err
+        m = re.search(r"img=(\d+) pc=0x[0-9A-F]{5} ea=0x([0-9A-F]{8}) "
+                      r"lsa=0x([0-9A-F]{5}) size=(\d+) repeats=(\d+) us=\d+", lines[0])
+        assert m, lines[0]
+        assert m.group(1) == "5" and m.group(2) == "00020000", lines[0]
+        assert m.group(3) == "01000" and m.group(4) == "16", lines[0]
+        assert m.group(5) == "299", lines[0]
+    print("PASS: SPU_DMA_REPEAT_LOG names the repeated transfer and its size")
     return 0
 
 

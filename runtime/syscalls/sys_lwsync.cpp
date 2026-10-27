@@ -86,6 +86,26 @@
 
 extern "C" uint8_t* vm_base;
 extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
+/* ppu_hle.cpp: a fast form beside a full handler; it returns 0 to take the full call. Weak where the compiler has
+ * it: a fixture that supplies its own ps3_hle_register_ctx and links this file without ppu_hle.cpp (tests/
+ * test_loader_gaps.cpp) has no fast table, and the handlers then simply run in full. */
+#if defined(__GNUC__) || defined(__clang__)
+extern "C" __attribute__((weak)) void ps3_hle_register_fast(uint32_t nid, int (*fn)(ppu_context*));
+#  define LW_REGISTER_FAST(nid, fn) do { if (ps3_hle_register_fast) ps3_hle_register_fast(nid, fn); } while (0)
+#else
+extern "C" void ps3_hle_register_fast(uint32_t nid, int (*fn)(ppu_context*));
+#  define LW_REGISTER_FAST(nid, fn) ps3_hle_register_fast(nid, fn)
+#endif
+/* sys_ppu_thread.c: this thread is about to wait (PS3_PRIO_START). sys_ppu_thread.h is not included: its lv2
+ * headers redefine ppu_context. Weak where the compiler has it, so a fixture that links this file without the
+ * thread table (tests/lwsync) neither pulls sys_ppu_thread.o in nor fails to link; the call is skipped there. */
+#if defined(__GNUC__) || defined(__clang__)
+extern "C" __attribute__((weak)) void ppu_thread_note_block(uint64_t tid);
+#  define LW_NOTE_BLOCK(tid) do { if (ppu_thread_note_block) ppu_thread_note_block(tid); } while (0)
+#else
+extern "C" void ppu_thread_note_block(uint64_t tid);
+#  define LW_NOTE_BLOCK(tid) ppu_thread_note_block(tid)
+#endif
 
 namespace {
 
@@ -417,6 +437,7 @@ int32_t mutex_acquire(uint32_t tid, uint32_t ea, uint64_t timeout_us, bool block
     publish(x);
     r.lk.unlock();
 
+    LW_NOTE_BLOCK(tid);                                 /* PS3_PRIO_START: about to wait */
     if (park(w, deadline_of(timeout_us))) return kOk;   /* handed the lock by an unlock */
 
     r.lk.lock();
@@ -535,6 +556,7 @@ int32_t cond_wait(uint32_t tid, uint32_t ea, uint64_t timeout_us)
     cr.lk.unlock();
 
     int32_t result = kOk;
+    LW_NOTE_BLOCK(tid);                                 /* PS3_PRIO_START: about to wait */
     if (!park(w, deadline_of(timeout_us))) {
         std::unique_lock<std::mutex> cl(c.m);
         if (w.in_cond_q) {                              /* not signalled: timed out */
@@ -612,6 +634,24 @@ void h_lwmutex_lock(ppu_context* c)    { ret(c, mutex_acquire(self(c), arg32(c, 
 void h_lwmutex_trylock(ppu_context* c) { ret(c, mutex_acquire(self(c), arg32(c, 3), 0, false)); }
 void h_lwmutex_unlock(ppu_context* c)  { ret(c, mutex_unlock(self(c), arg32(c, 3))); }
 
+/* Fast forms for ps3_hle_dispatch (ps3_hle_register_fast): they run no guest code, leave r2 alone and do not
+ * block. A lock that is free or already the caller's is taken here; a lock that has to wait, and every error, return
+ * 0 and take the full handler, which redoes the call from scratch (a failed non-blocking acquire changes nothing).
+ * Unlock never waits: it hands the lock to the head waiter or frees it, and always finishes. Fast calls do not
+ * show in PS3_FTRACE or the in-flight table. Upstream's atomic lock word (dc37f00b) has no counterpart: this
+ * backend's uncontended path is already one host-mutex acquire and no kernel call. */
+int f_lwmutex_lock(ppu_context* c)
+{
+    if (mutex_acquire(self(c), arg32(c, 3), 0, false) != kOk) return 0;
+    ret(c, kOk);
+    return 1;
+}
+int f_lwmutex_unlock(ppu_context* c)
+{
+    ret(c, mutex_unlock(self(c), arg32(c, 3)));
+    return 1;
+}
+
 void h_lwcond_create(ppu_context* c)     { ret(c, cond_create(arg32(c, 3), arg32(c, 4), arg32(c, 5))); }
 void h_lwcond_destroy(ppu_context* c)    { ret(c, cond_destroy(arg32(c, 3))); }
 void h_lwcond_signal(ppu_context* c)     { ret(c, cond_signal(self(c), arg32(c, 3), Signal::One, 0)); }
@@ -629,6 +669,8 @@ extern "C" void ps3_lwsync_register(void)
     LW("sys_lwmutex_lock",       h_lwmutex_lock);
     LW("sys_lwmutex_trylock",    h_lwmutex_trylock);
     LW("sys_lwmutex_unlock",     h_lwmutex_unlock);
+    LW_REGISTER_FAST(ps3_compute_nid("sys_lwmutex_lock"),   f_lwmutex_lock);
+    LW_REGISTER_FAST(ps3_compute_nid("sys_lwmutex_unlock"), f_lwmutex_unlock);
     LW("sys_lwcond_create",      h_lwcond_create);
     LW("sys_lwcond_destroy",     h_lwcond_destroy);
     LW("sys_lwcond_signal",      h_lwcond_signal);

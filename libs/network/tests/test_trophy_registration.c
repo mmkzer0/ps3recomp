@@ -42,6 +42,7 @@ void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
 void cellMsgDialog_tick(void) {}
 void np_psnr_pump(void) {}
+void ps3_np_eula_tick(void) {}
 void ps3_stop(ps3_stop_kind k, const char* w, const char* r,
               const ps3_stop_field* f, size_t n, const ps3_stop_site* s)
 { (void)k; (void)w; (void)r; (void)f; (void)n; (void)s; abort(); }

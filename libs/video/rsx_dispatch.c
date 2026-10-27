@@ -287,7 +287,7 @@ void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
      * 0xFFFFFF00 = depth 1.0, stencil 0 (RPCS3 rsx_methods.cpp reset image
      * as numbering oracle). Seeded so a raw register read is trustworthy for
      * clear consumers, mirroring COLOR_MASK/FRONT_FACE above. */
-    rsx->regs[0x1D8C >> 2] = 0xFFFFFF00u;
+    rsx->regs[0x1D8C >> 2] = RSX_DSP_ZSTENCIL_CLEAR_RESET;
 
     /* NV40 reset DEPTH_RANGE_FAR is 1.0 and DEPTH_RANGE_NEAR 0.0 (RPCS3 rsx_state::init
      * registers[NV4097_SET_CLIP_MAX]=0x3f800000, SET_CLIP_MIN=0). Without the far seed a fresh
@@ -394,11 +394,23 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
         (method >= 0x0A80 && method < 0x0B00))
         vtx_const_fold(rsx, method, arg);
 
-    /* Completing a floating-point position emits a register-based vertex.
-     * Other attributes update the current values copied with that position.
-     * Keep these writes as ordinary constant state outside BEGIN/END. */
-    if (rsx->in_begin_end && (method == 0x1508 || method == 0x1C0C) &&
-        rsx->sink.immediate_vertex)
+    /* Completing a position emits a register-based vertex: the last word of
+     * ATTR0 in any of its immediate encodings. Other attributes update the
+     * current values copied with that position. Keep these writes as ordinary
+     * constant state outside BEGIN/END.
+     *
+     * Only the float encodings used to count (DATA3F's Z, DATA4F's W).
+     * Resistance's movie player sends its quad as DATA2S positions, so every
+     * movie frame drew nothing and the cutscenes played on a black screen. */
+    if (rsx->in_begin_end && rsx->sink.immediate_vertex &&
+        (method == 0x1508 ||    /* DATA3F  Z            */
+         method == 0x1C0C ||    /* DATA4F  W            */
+         method == 0x1884 ||    /* DATA2F  Y            */
+         method == 0x1E40 ||    /* DATA1F  X            */
+         method == 0x1900 ||    /* DATA2S  (one word)   */
+         method == 0x1940 ||    /* DATA4UB (one word)   */
+         method == 0x1984 ||    /* DATA4S  second word  */
+         method == 0x0A84))     /* SCALED4S second word */
         rsx->sink.immediate_vertex(rsx->sink.user, rsx);
 
     /* Transform program upload window: word goes to instruction slot

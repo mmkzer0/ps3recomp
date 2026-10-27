@@ -721,10 +721,18 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
          * snapshot against a line this copy has already replaced and commits
          * over it, and a peer parked on RdEventStat sleeps through the write.
          *
-         * So when the span touches a reserved line the copy and the notify run
-         * as ONE critical section under the lock-line lock -- the same contract
-         * the PPU store path and the PUTLLC commit keep, and the only way the
-         * copy cannot land inside a peer's compare-and-commit window. Spans
+         * So a reserved line's copy and its notify run as ONE critical section
+         * under the lock-line lock -- the same contract the PPU store path and
+         * the PUTLLC commit keep, and the only way the copy cannot land inside
+         * a peer's compare-and-commit window. Only the reserved lines need it:
+         * in a multi-line span the others are copied first, without the lock,
+         * exactly as an unreserved span is, and the locked pass then copies the
+         * lines it skipped and notifies every reserved one. A line reserved
+         * after its unlocked copy is notified there but NOT copied again: a
+         * peer may already have reserved and committed it on top of our bytes,
+         * and a second copy would write that commit back over. A wide PUT that
+         * touches one queue line no longer holds every other SPU's atomics off
+         * for the whole copy. Spans
          * that touch no reserved line keep the lock-free copy: bulk asset PUTs
          * are large and hot, and the scan is a bitmap bit per 128 bytes against
          * a global that stays zero until an SPU reserves its first line.
@@ -748,7 +756,34 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                 if (spu_coh_is_reserved(a)) { span_reserved = 1; break; }
                 if (a == a1) break;
             }
-            if (span_reserved) {
+            /* Lines the unlocked pass left for the locked one: a 16 KiB
+             * transfer spans at most 129 lines. */
+            uint64_t locked_lines[3] = {0, 0, 0};
+            if (span_reserved && a0 != a1 && ((a1 - a0) >> 7) < 64u * 3u) {
+                const uint32_t ea32 = (uint32_t)ea;
+                uint32_t i = 0;
+                for (uint32_t a = a0; ; a += 128u, i++) {
+                    const uint32_t lo = a > ea32 ? a - ea32 : 0u;
+                    const uint32_t hi = a + 128u - ea32 < size ? a + 128u - ea32 : size;
+                    if (spu_coh_is_reserved(a)) locked_lines[i >> 6] |= 1ull << (i & 63u);
+                    else memcpy(ea_ptr + lo, ls_ptr + lo, hi - lo);
+                    if (a == a1) break;
+                }
+                spu_lockline_lock();
+                i = 0;
+                for (uint32_t a = a0; ; a += 128u, i++) {
+                    const uint32_t lo = a > ea32 ? a - ea32 : 0u;
+                    const uint32_t hi = a + 128u - ea32 < size ? a + 128u - ea32 : size;
+                    if ((locked_lines[i >> 6] >> (i & 63u)) & 1u) {
+                        memcpy(ea_ptr + lo, ls_ptr + lo, hi - lo);
+                        spu_coh_notify_write_except(a, spu);
+                    } else if (spu_coh_is_reserved(a)) {
+                        spu_coh_notify_write_except(a, spu);   /* reserved after its copy */
+                    }
+                    if (a == a1) break;
+                }
+                spu_lockline_unlock();
+            } else if (span_reserved) {
                 spu_lockline_lock();
                 memcpy(ea_ptr, ls_ptr, size);
                 for (uint32_t a = a0; ; a += 128u) {
@@ -806,10 +841,19 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         /* POISON-DMA detector: does an SPU PUT write the singleton object region
          * (0x40003000-0x40005000) or carry the 0xC708C708 poison? This host-side
          * memcpy bypasses vm_write32/AWATCH, so it's the prime suspect for the
-         * garbage fn-ptr fields that cause the 0xC708C708 vcall crash. */
+         * garbage fn-ptr fields that cause the 0xC708C708 vcall crash.
+         * PUTs outside the region are only scanned for the poison word with
+         * SPU_POISON_DMA_WATCH=1 (see below). */
         { uint32_t e = (uint32_t)ea;
           int hitregion = (e < 0x40005000u && e + size > 0x40003000u);
           int haspoison = 0;
+          static int s_poison_watch = -1;
+          /* SPU_POISON_DMA_WATCH=1 (any value): scan every PUT payload for the
+           * poison word and also log PUTs that carry it outside the region.
+           * Unset, only PUTs into the region are scanned (their lines are
+           * unchanged): the scan is a second pass over every byte of every PUT. */
+          if (s_poison_watch < 0) s_poison_watch = getenv("SPU_POISON_DMA_WATCH") ? 1 : 0;
+          if (hitregion || s_poison_watch)
           for (uint32_t o = 0; o + 4 <= size; o += 4) {
               uint32_t w; memcpy(&w, (const char*)ls_ptr + o, 4);
               if (w == 0x08C708C7u) { haspoison = 1; break; } /* 0xC708C708 BE in LS bytes */
@@ -872,7 +916,12 @@ static inline int mfc_run_list(spu_context* spu, uint32_t elem_lsa,
             spu->list_stall_cmd[t]       = base_cmd;
             spu->list_stall_mask |= (1u << t);  /* this tag now has a parked list */
             spu->list_stall_stat |= (1u << t);  /* accumulate into the notify mask */
-            spu->event_status    |= 0x2u;       /* SPU_EVENT_SN stall-and-notify */
+            /* Reservation invalidation can publish LR from another thread, and
+             * WrEventAck clears bits from this one. SPU_EVENT_SET is an atomic
+             * fetch-or (#492), so none of the three can read-modify-write a
+             * freshly raised notification away -- which is what this needed the
+             * lock-line lock for before. */
+            SPU_EVENT_SET(spu, 0x2u);           /* SPU_EVENT_SN stall-and-notify */
             /* Real MFC runs a queued list asynchronously, so the notify lands
              * AFTER the arming code finishes. We run it inline here, so hold the
              * resulting interrupt off for a few drain ticks -- otherwise the WWS
@@ -971,6 +1020,51 @@ static inline int mfc_do_list_transfer(spu_context* spu, uint32_t list_lsa,
  * Submit and immediately execute an MFC command.
  * This is the main entry point called when the SPU writes to MFC_Cmd.
  * -----------------------------------------------------------------------*/
+/* SPU_DMA_REPEAT_LOG support (see mfc_submit). Per-thread episode clock and
+ * counters; the per-image totals are per thread too, so no line is shared. */
+static inline uint64_t spu_dma_repeat_now_us(void)
+{
+#ifdef _WIN32
+    return (uint64_t)GetTickCount64() * 1000u;
+#else
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+#endif
+}
+static SPU_THREAD_LOCAL struct {
+    uint64_t start_us, lines, episodes;
+    uint32_t start_pc, size;
+    struct { int image; uint64_t n, us; } tot[16];
+} t_dma_repeat_log;
+static inline void spu_dma_repeat_log_start(const spu_context* spu)
+{
+    t_dma_repeat_log.start_us = spu_dma_repeat_now_us();
+    t_dma_repeat_log.start_pc = (uint32_t)spu->pc & SPU_LS_MASK;
+    t_dma_repeat_log.size = spu->mfc_size;   /* the repeated transfer's, not the one that ends the episode */
+}
+static inline void spu_dma_repeat_log_end(const spu_context* spu, uint32_t ea, uint32_t lsa, uint32_t reps, int64_t limit)
+{
+    const uint64_t us = spu_dma_repeat_now_us() - t_dma_repeat_log.start_us;
+    if (t_dma_repeat_log.lines < (uint64_t)limit) {
+        t_dma_repeat_log.lines++;
+        fprintf(stderr, "[dma-repeat] spu=%u img=%d pc=0x%05X ea=0x%08X lsa=0x%05X size=%u repeats=%u us=%llu\n",
+                spu->spu_id & 7u, spu->image_id, t_dma_repeat_log.start_pc, ea, lsa, t_dma_repeat_log.size, reps,
+                (unsigned long long)us);
+    }
+    for (int i = 0; i < 16; i++) {
+        if (t_dma_repeat_log.tot[i].n && t_dma_repeat_log.tot[i].image != spu->image_id) continue;
+        t_dma_repeat_log.tot[i].image = spu->image_id; t_dma_repeat_log.tot[i].n++; t_dma_repeat_log.tot[i].us += us;
+        break;
+    }
+    if ((++t_dma_repeat_log.episodes % 4096u) == 0) {
+        fprintf(stderr, "[dma-repeat] spu=%u %llu episodes:", spu->spu_id & 7u, (unsigned long long)t_dma_repeat_log.episodes);
+        for (int i = 0; i < 16 && t_dma_repeat_log.tot[i].n; i++)
+            fprintf(stderr, " img%d n=%llu us=%llu", t_dma_repeat_log.tot[i].image,
+                    (unsigned long long)t_dma_repeat_log.tot[i].n, (unsigned long long)t_dma_repeat_log.tot[i].us);
+        fputc(10, stderr);
+    }
+}
+
 static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
 {
     /* At enqueue, before any transfer: the observer sees the command exactly
@@ -1301,44 +1395,95 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      * Counting includes transfers the EA check rejects: once it started
      * committing pages on demand, a spinning job's counter never advanced and
      * the chain walker hung silently. */
-    { static SPU_THREAD_LOCAL uint32_t s_last_ea, s_last_lsa, s_rep;
-      static SPU_THREAD_LOCAL unsigned long long s_since;
+    /* One thread-local object: every Darwin TLV access is a call, and this
+     * runs on every MFC command. */
+    { static SPU_THREAD_LOCAL struct {
+          uint32_t last_ea, last_lsa, rep; unsigned long long since;
+          int env_init; long long log; unsigned long long backoff_ms;
+      } t_rep;
+#define s_last_ea    t_rep.last_ea
+#define s_last_lsa   t_rep.last_lsa
+#define s_rep        t_rep.rep
+#define s_since      t_rep.since
+#define s_log        t_rep.log
+#define s_backoff_ms t_rep.backoff_ms
       extern unsigned long long ps3_ms_now(void);
       const uint32_t limit = ps3_cfg_spu_dma_repeat_limit();
       const uint32_t stop_secs = ps3_cfg_spu_dma_repeat_stop_secs();
+      /* Two diagnostics-and-timing knobs that are still environment variables
+       * (not spu.* options): read once per thread, with the thread's state. */
+      if (!t_rep.env_init) {
+          const char* e;
+          t_rep.env_init = 1;
+          /* The yield window is a fixed 2 ms: a host liveness policy, not an
+           * option, and no behavioural environment read (typed config only). */
+          s_backoff_ms = 2u;
+          /* SPU_DMA_REPEAT_LOG=<n>: report the first n repeat episodes per
+           * thread as they end (image, pc, transfer, repeats, duration), and a
+           * per-image total every 4096 episodes. Says what a job is polling and
+           * how long it waits -- the watchdog's back-off is on the critical path
+           * only when such episodes are. Unset: no cost beyond the existing test. */
+          e = getenv("SPU_DMA_REPEAT_LOG");
+          s_log = e ? atoll(e) : 0;
+      }
       if ((uint32_t)ea == s_last_ea && lsa == s_last_lsa) {
-          if (++s_rep >= limit && !s_since) s_since = ps3_ms_now();
-          if (stop_secs && s_rep >= limit &&
-              ps3_ms_now() - s_since >= (unsigned long long)stop_secs * 1000u) {
-              const uint32_t stop_pc = (uint32_t)spu->pc & SPU_LS_MASK;
-              const unsigned long long elapsed = (ps3_ms_now() - s_since) / 1000u;
-              char image_s[16], pc_s[16], ea_s[24], lsa_s[16], cmd_s[8];
-              char size_s[16], count_s[16], secs_s[24];
-              snprintf(image_s, sizeof image_s, "%u", (unsigned)spu->image_id);
-              snprintf(pc_s, sizeof pc_s, "0x%05X", stop_pc);
-              snprintf(ea_s, sizeof ea_s, "0x%08X", (unsigned)(uint32_t)ea);
-              snprintf(lsa_s, sizeof lsa_s, "0x%05X", (unsigned)lsa);
-              snprintf(cmd_s, sizeof cmd_s, "0x%02X", (unsigned)(cmd & 0xFFu));
-              snprintf(size_s, sizeof size_s, "%u", (unsigned)size);
-              snprintf(count_s, sizeof count_s, "%u", (unsigned)s_rep);
-              snprintf(secs_s, sizeof secs_s, "%llu", elapsed);
-              ps3_stop_field f[] = {
-                  {"image", image_s}, {"ea", ea_s}, {"lsa", lsa_s}, {"cmd", cmd_s},
-                  {"size", size_s}, {"count", count_s}, {"secs", secs_s},
-              };
-              /* pc and tid are the site, so they stay the reserved pc=/tid= keys. */
-              ps3_stop_site site = { stop_pc, 0, spu->spu_id };
-              ps3_stop(PS3_STOP_SPU_DMA_REPEAT,
-                       "an SPU has issued the same MFC transfer continuously past "
-                       "spu.dma_repeat_stop_secs",
-                       "If the job is legitimately polling memory another agent writes (ring "
-                       "space, a label), raise spu.dma_repeat_stop_secs or set it to 0, which "
-                       "disables this watchdog; otherwise the protocol this transfer belongs "
-                       "to is wedged.",
-                       f, sizeof f / sizeof f[0], &site);
+          if (++s_rep >= limit) {
+              const unsigned long long now = ps3_ms_now();
+              if (!s_since) {
+                  s_since = now;
+                  if (s_log) spu_dma_repeat_log_start(spu);
+              }
+              if (stop_secs && now - s_since >= (unsigned long long)stop_secs * 1000u) {
+                  const uint32_t stop_pc = (uint32_t)spu->pc & SPU_LS_MASK;
+                  const unsigned long long elapsed = (now - s_since) / 1000u;
+                  char image_s[16], pc_s[16], ea_s[24], lsa_s[16], cmd_s[8];
+                  char size_s[16], count_s[16], secs_s[24];
+                  snprintf(image_s, sizeof image_s, "%u", (unsigned)spu->image_id);
+                  snprintf(pc_s, sizeof pc_s, "0x%05X", stop_pc);
+                  snprintf(ea_s, sizeof ea_s, "0x%08X", (unsigned)(uint32_t)ea);
+                  snprintf(lsa_s, sizeof lsa_s, "0x%05X", (unsigned)lsa);
+                  snprintf(cmd_s, sizeof cmd_s, "0x%02X", (unsigned)(cmd & 0xFFu));
+                  snprintf(size_s, sizeof size_s, "%u", (unsigned)size);
+                  snprintf(count_s, sizeof count_s, "%u", (unsigned)s_rep);
+                  snprintf(secs_s, sizeof secs_s, "%llu", elapsed);
+                  ps3_stop_field f[] = {
+                      {"image", image_s}, {"ea", ea_s}, {"lsa", lsa_s}, {"cmd", cmd_s},
+                      {"size", size_s}, {"count", count_s}, {"secs", secs_s},
+                  };
+                  /* pc and tid are the site, so they stay the reserved pc=/tid= keys. */
+                  ps3_stop_site site = { stop_pc, 0, spu->spu_id };
+                  ps3_stop(PS3_STOP_SPU_DMA_REPEAT,
+                           "an SPU has issued the same MFC transfer continuously past "
+                           "spu.dma_repeat_stop_secs",
+                           "If the job is legitimately polling memory another agent writes (ring "
+                           "space, a label), raise spu.dma_repeat_stop_secs or set it to 0, which "
+                           "disables this watchdog; otherwise the protocol this transfer belongs "
+                           "to is wedged.",
+                           f, sizeof f / sizeof f[0], &site);
+              }
+              /* Timing only: see above. A job re-reading a word another agent
+               * writes (an RSX label, a ring-space counter, a peer job's
+               * completion flag) is bound by that write, and a 1 ms sleep per
+               * poll lands it up to a millisecond late -- on the frame's
+               * critical path when the poller is the frame's longest job.
+               * Yield for the first 2 ms of
+               * an episode, where a healthy wait ends, and back off 1 ms per
+               * repeat after that. */
+              else if (now - s_since < s_backoff_ms) SwitchToThread();
+              else Sleep(1);
           }
-          if (s_rep >= limit) Sleep(1);   /* timing only: see above */
-      } else { s_last_ea = (uint32_t)ea; s_last_lsa = lsa; s_rep = 0; s_since = 0; } }
+      } else {
+          if (s_log && s_rep >= limit)
+              spu_dma_repeat_log_end(spu, s_last_ea, s_last_lsa, s_rep, s_log);
+          s_last_ea = (uint32_t)ea; s_last_lsa = lsa; s_rep = 0; s_since = 0;
+      }
+#undef s_last_ea
+#undef s_last_lsa
+#undef s_rep
+#undef s_since
+#undef s_log
+#undef s_backoff_ms
+    }
 
     /* Mark tag as in-progress */
     mfc->tag_completed &= ~(1u << tag);
@@ -1513,14 +1658,20 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
          * sequence is exactly what the pipeline diagnosis needs. */
         extern uint32_t g_barrier_sync_watch;
         static SPU_THREAD_LOCAL int _post = 0;
-        int open = (_pn < 96) || (g_barrier_sync_watch && _post < 256);
-        if (open) {
-            if (_pn >= 96) _post++;
-            fprintf(stderr, "[spurs-pm] DMA cmd=0x%02X lsa=0x%05X ea=0x%09llX size=0x%X tag=%u\n",
-                    cmd, lsa, (unsigned long long)ea, size, tag);
-        } else if (_pn == 96)
-            fprintf(stderr, "[spurs-pm] DMA trace suppressed from here\n");
-        _pn++;
+        /* Once the trace has closed (96 lines and the suppression notice)
+         * nothing here can print again unless the barrier watch is armed, so
+         * stop advancing the counter: every policy-module DMA on every SPU
+         * thread was writing this one shared word. */
+        if (_pn <= 96 || g_barrier_sync_watch) {
+            int open = (_pn < 96) || (g_barrier_sync_watch && _post < 256);
+            if (open) {
+                if (_pn >= 96) _post++;
+                fprintf(stderr, "[spurs-pm] DMA cmd=0x%02X lsa=0x%05X ea=0x%09llX size=0x%X tag=%u\n",
+                        cmd, lsa, (unsigned long long)ea, size, tag);
+            } else if (_pn == 96)
+                fprintf(stderr, "[spurs-pm] DMA trace suppressed from here\n");
+            _pn++;
+        }
     }
 
     /* Execute the transfer.

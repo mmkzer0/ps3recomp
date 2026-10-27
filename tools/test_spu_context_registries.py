@@ -32,8 +32,17 @@ with tempfile.TemporaryDirectory(prefix='spu-context-registry-') as tmp:
         obj = tmp / (src.stem + '.o')
         subprocess.run([cxx, *cxxflags, '-c', str(src), '-o', str(obj)], check=True)
         runtime_objects.append(str(obj))
-    for name in ['test_spu_mfc_slots', 'test_spu_mfc_shared_lookup', 'test_spu_coherency', 'test_spu_lockline_peer', 'test_spu_registry_allocation']:
-        binary = tmp / name
+    # test_spu_lockline_peer runs twice: the default build (every GETLLAR takes
+    # the lock-line lock) and SPU_COH_FAST_GETLLAR=1 (the optional lock-free
+    # GETLLAR for a registered holder, off by default: the reservation model is
+    # the only authority).
+    variants = [(n, 0) for n in ['test_spu_mfc_slots', 'test_spu_mfc_shared_lookup', 'test_spu_coherency']]
+    variants += [('test_spu_lockline_peer', 0), ('test_spu_lockline_peer', 1)]
+    variants += [(n, 0) for n in ['test_spu_registry_allocation', 'test_spu_mfc_env_once']]
+    for name, fast in variants:
+        tag = name + ('-fast-getllar' if fast else '')
+        vflags = cflags + (['-DSPU_COH_FAST_GETLLAR=1'] if fast else [])
+        binary = tmp / tag
         sources = [str(spu / 'tests' / (name + '.c'))]
         link_flags = []
         if name != 'test_spu_coherency':
@@ -43,13 +52,13 @@ with tempfile.TemporaryDirectory(prefix='spu-context-registry-') as tmp:
                                 str(root / 'runtime/memory/label_window.c')]
             objects = []
             for index, src in enumerate(sources):
-                obj = tmp / f'{name}-{index}.o'
-                subprocess.run([cc, *cflags, '-c', src, '-o', str(obj)], check=True)
+                obj = tmp / f'{tag}-{index}.o'
+                subprocess.run([cc, *vflags, '-c', src, '-o', str(obj)], check=True)
                 objects.append(str(obj))
             subprocess.run([cxx, *objects, *runtime_objects, '-pthread', '-lm',
                             '-o', str(binary)], check=True)
         else:
-            subprocess.run([cc, *cflags, *sources,
+            subprocess.run([cc, *vflags, *sources,
                             '-o', str(binary)], check=True)
         if name == 'test_spu_registry_allocation':
             for mode, diagnostic in [('mfc', 'cannot allocate private MFC engine'),
@@ -61,10 +70,10 @@ with tempfile.TemporaryDirectory(prefix='spu-context-registry-') as tmp:
                 print(name + '/' + mode + ': PASS (visible allocation failure)')
             continue
         result = subprocess.run([str(binary)], timeout=30, capture_output=True, text=True)
-        print(name + ': ' + ('PASS' if result.returncode == 0 else 'FAIL'))
+        print(tag + ': ' + ('PASS' if result.returncode == 0 else 'FAIL'))
         print(result.stdout.strip())
         if result.returncode:
             print(result.stderr[-2500:])
-        if result.returncode: failed.append(name)
+        if result.returncode: failed.append(tag)
 if failed:
     raise SystemExit('Failed: ' + ', '.join(failed))

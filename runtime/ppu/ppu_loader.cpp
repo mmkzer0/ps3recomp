@@ -37,6 +37,7 @@
 #include "ppu_tls.h"   /* PPU_THREAD_LOCAL, without a second ppu_context */
 #define PPU_NO_INLINE_LOADS   /* this file defines the out-of-line accessors */
 #include "ppu_recomp.h"
+#include "../spu/spu_coh_bitmap.h"   /* weak definition of g_spu_coh_bits, which the lifted inline stores name; a fixture without spu_coherency.c sees NULL. The loader does not test the bitmap itself (spu_coh_is_reserved decides). */
 #include "ps3emu/ps3_ftrace.h"   /* PS3_FTRACE timeline */
 #include "ps3emu/stop.h"         /* ps3_stop, ps3_stop_register_frontier */
 #include "ps3emu/config.h"       /* ps3_ppu_initial_vscr */
@@ -48,6 +49,7 @@
 #include "../memory/label_window.h"   /* the store window, shared with the SPU MFC path */
 #include "../platform/win32_compat.h"      /* Win32 types, interlocked ops, Sleep/QPC on POSIX */
 #include "../platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
+#include "../platform/ps3_stdio.h"        /* ps3_stdio_init -- buffered stdout/stderr, timed flush */
 #ifndef _WIN32
 #include <sys/mman.h>   /* the guest-pointer trap reserves the low 4 GB */
 #include <signal.h>
@@ -629,6 +631,8 @@ static void samp_report(void)
  * guest histogram says nothing about where it loops. */
 static DWORD s_samp_boot_tid;
 static int   s_samp_main = -1;
+static int   s_samp_drain = -1;
+extern "C" volatile unsigned long g_gcm_drain_tid;
 
 static uint32_t samp_stack_guest(HANDLE h, const CONTEXT* c)
 {
@@ -641,6 +645,41 @@ static uint32_t samp_stack_guest(HANDLE h, const CONTEXT* c)
         if (g) return g;
     }
     return 0;
+}
+
+/* PS3_SAMPLE_RVAS=<file>: every sample's address as an RVA of the executable,
+ * one hex word per line, appended at each report. 0 marks a sample outside the
+ * executable (a wait in ntdll, a DLL). The extent map above credits any host
+ * code that sits between two lifted functions to the first of them; naming
+ * these RVAs from the linker map (scripts/gow1hd.py symbolize does the
+ * parsing) attributes guest and runtime code exactly. */
+static FILE*     s_samp_rva_file;
+static uint32_t* s_samp_rvas;
+static uint32_t  s_samp_rva_n, s_samp_rva_cap;
+static void samp_rva_record(uintptr_t rip)
+{
+    if (!s_samp_rva_file) return;
+    static uintptr_t base, end;
+    if (!base) {
+        base = (uintptr_t)GetModuleHandleA(NULL);
+        const IMAGE_NT_HEADERS* nt = (const IMAGE_NT_HEADERS*)(base + ((const IMAGE_DOS_HEADER*)base)->e_lfanew);
+        end = base + nt->OptionalHeader.SizeOfImage;
+    }
+    if (s_samp_rva_n == s_samp_rva_cap) {
+        uint32_t cap = s_samp_rva_cap ? s_samp_rva_cap * 2 : 65536;
+        uint32_t* n = (uint32_t*)realloc(s_samp_rvas, cap * sizeof *n);
+        if (!n) return;
+        s_samp_rvas = n; s_samp_rva_cap = cap;
+    }
+    s_samp_rvas[s_samp_rva_n++] = (rip >= base && rip < end) ? (uint32_t)(rip - base) : 0u;
+}
+static void samp_rva_flush(void)
+{
+    if (!s_samp_rva_file) return;
+    fprintf(s_samp_rva_file, "# %llu ms\n", (unsigned long long)GetTickCount64());  /* block end */
+    for (uint32_t i = 0; i < s_samp_rva_n; i++) fprintf(s_samp_rva_file, "%x\n", s_samp_rvas[i]);
+    fflush(s_samp_rva_file);
+    s_samp_rva_n = 0;
 }
 
 static DWORD WINAPI samp_thread(LPVOID p)
@@ -656,13 +695,58 @@ static DWORD WINAPI samp_thread(LPVOID p)
     unsigned ei = 0;
     unsigned long long next_report = t0 + early[0];
     samp_build_map();
+    if (const char* f = getenv("PS3_SAMPLE_RVAS")) s_samp_rva_file = fopen(f, "w");
+    /* PS3_SAMPLE_MAIN and PS3_SAMPLE_DRAIN sample one thread: open it once
+     * rather than walk a snapshot of every thread in the process each period,
+     * which held the rate to about 17 samples a second. The drain's thread is
+     * known once it has walked the FIFO, and reopened if that changes. */
+    HANDLE main_h = (s_samp_main > 0)
+        ? OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, s_samp_boot_tid) : NULL;
+    DWORD one_tid = s_samp_main > 0 ? s_samp_boot_tid : 0;
     for (;;) {
+        if (s_samp_drain > 0 && g_gcm_drain_tid && g_gcm_drain_tid != one_tid) {
+            if (main_h) CloseHandle(main_h);
+            one_tid = (DWORD)g_gcm_drain_tid;
+            main_h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, one_tid);
+        }
+        if (main_h) {
+            if (SuspendThread(main_h) != (DWORD)-1) {
+                CONTEXT c; c.ContextFlags = CONTEXT_CONTROL;
+                if (GetThreadContext(main_h, &c)) {
+                    s_samp_total++;
+                    samp_rva_record((uintptr_t)c.Rip);
+                    uint32_t g = samp_lookup((uintptr_t)c.Rip);
+                    if (!g && s_samp_main > 0) g = samp_stack_guest(main_h, &c);
+                    if (g) { s_samp_guest++; samp_hit(g); samp_tid_hit(one_tid);
+                             samp_tid2(one_tid, 1, 0); }
+                    else { int nt = samp_mod_hit((uintptr_t)c.Rip);
+                           if (!nt) samp_rva_hit((uintptr_t)c.Rip);
+                           samp_tid2(one_tid, 0, nt); }
+                }
+                ResumeThread(main_h);
+            }
+            Sleep(period);
+            if (GetTickCount64() >= next_report) {
+                fprintf(stderr, "[samp] --- report at t=%llums ---\n",
+                        (unsigned long long)(GetTickCount64() - t0));
+                samp_report();
+                samp_rva_flush();
+                if (ei + 1 < sizeof early / sizeof early[0]) { ei++; next_report = t0 + early[ei]; }
+                else next_report = GetTickCount64() + 10000;
+            }
+            continue;
+        }
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
         if (snap != INVALID_HANDLE_VALUE) {
             THREADENTRY32 te; te.dwSize = sizeof te;
             if (Thread32First(snap, &te)) do {
                 if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
                 if (s_samp_main > 0 && te.th32ThreadID != s_samp_boot_tid) continue;
+                /* PS3_SAMPLE_DRAIN=1: only the thread that last walked the
+                 * RSX FIFO (cellGcm_rsx_process_fifo records it), so the RVA
+                 * histogram is the drain's own cost, not the spin loops of
+                 * every SPU thread. */
+                if (s_samp_drain > 0 && te.th32ThreadID != g_gcm_drain_tid) continue;
                 HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT,
                                       FALSE, te.th32ThreadID);
                 if (!h) continue;
@@ -670,6 +754,7 @@ static DWORD WINAPI samp_thread(LPVOID p)
                     CONTEXT c; c.ContextFlags = CONTEXT_CONTROL;
                     if (GetThreadContext(h, &c)) {
                         s_samp_total++;
+                        samp_rva_record((uintptr_t)c.Rip);
                         uint32_t g = samp_lookup((uintptr_t)c.Rip);
                         if (!g && s_samp_main > 0) g = samp_stack_guest(h, &c);
                         if (g) { s_samp_guest++; samp_hit(g); samp_tid_hit(te.th32ThreadID);
@@ -689,6 +774,7 @@ static DWORD WINAPI samp_thread(LPVOID p)
             fprintf(stderr, "[samp] --- report at t=%llums ---\n",
                     (unsigned long long)(GetTickCount64() - t0));
             samp_report();
+            samp_rva_flush();
             if (ei + 1 < sizeof early / sizeof early[0]) { ei++; next_report = t0 + early[ei]; }
             else next_report = GetTickCount64() + 10000;
         }
@@ -746,6 +832,7 @@ void ps3_sampler_start(void)
     unsigned ms = (unsigned)atoi(e); if (!ms) ms = 5;
     s_samp_boot_tid = GetCurrentThreadId();
     s_samp_main = getenv("PS3_SAMPLE_MAIN") ? 1 : 0;
+    s_samp_drain = getenv("PS3_SAMPLE_DRAIN") ? 1 : 0;
     /* Self-check: does .pdata actually describe the lifted bodies? If not, the
      * exact attribution mode misses ALL guest code by construction and its "0
      * guest samples" means nothing. Print it rather than assume either way. */
@@ -776,8 +863,9 @@ extern "C" void ppu_log_host_chain(const char* tag);  /* fwd decl (defined below
  * to serialize through the SPU lock-line lock, or it can land inside a PUTLLC's
  * compare and be written straight back over; and it has to raise SPU_EVENT_LR,
  * which is how an SPURS idle service parked in `rdch SPU_RdEventStat` finds out
- * work was posted. spu_coh_is_reserved reads a global that stays zero until an
- * SPU reserves its first line, so an ordinary store pays one branch. */
+ * work was posted. spu_coh_is_reserved is the one authority the stores ask
+ * (upstream's inline bitmap test, spu_coh_line_reserved, is deliberately not
+ * used here: bitmap pending block-2 proof, see tools/ppu_lifter.py). */
 extern "C" int  spu_coh_is_reserved(uint32_t addr);
 extern "C" void spu_lockline_lock(void);
 extern "C" void spu_lockline_unlock(void);
@@ -1355,9 +1443,18 @@ static inline void ppu_store_hook(uint32_t a, uint32_t n, uint32_t v)
 
 extern "C" {
 /* PPU_RWATCH=<hex>[,len] -- see the note in vm_read8. */
+/* -2 until PPU_RWATCH is read, -1 when unset. File scope so the gate below is
+ * one load inlined into every vm_read*, not a call. */
+static int64_t s_rwatch_lo = -2;
+static __attribute__((noinline)) void ppu_rwatch_hit_slow(uint32_t a, int width, void* ra);
 static inline void ppu_rwatch_hit(uint32_t a, int width, void* ra)
 {
-    static int64_t s_lo = -2; static uint32_t s_len = 0x10;
+    if (__builtin_expect(s_rwatch_lo == -1, 1)) return;
+    ppu_rwatch_hit_slow(a, width, ra);
+}
+static __attribute__((noinline)) void ppu_rwatch_hit_slow(uint32_t a, int width, void* ra)
+{
+    int64_t& s_lo = s_rwatch_lo; static uint32_t s_len = 0x10;
     if (s_lo == -2) {
         const char* e = getenv("PPU_RWATCH");
         s_lo = e ? (int64_t)strtoul(e, 0, 16) : -1;
@@ -1434,8 +1531,10 @@ static inline void ppu_null_read_report(uint32_t a, int width, void* ra)
 }
 
 /* ppu_recomp.h's inline loads (vm_read*_inl) skip the out-of-line accessors'
- * probes, so they run only while no read diagnostic is armed. */
+ * probes, so they run only while no read diagnostic is armed; its inline
+ * stores (vm_write*_inl) likewise for the store diagnostics. */
 extern "C" int vm_inline_ok = 0;
+extern "C" int vm_inline_st_ok = 0;
 static struct VmInlineInit {
     VmInlineInit() {
         static const char* const vars[] = {
@@ -1444,6 +1543,10 @@ static struct VmInlineInit {
         int d = 0;
         for (int i = 0; vars[i]; i++) if (getenv(vars[i])) d = 1;
         vm_inline_ok = !d;
+        static const char* const svars[] = { "PPU_WVAL", "PPU_WWATCH", "PT", 0 };
+        int sd = 0;
+        for (int i = 0; svars[i]; i++) if (getenv(svars[i])) sd = 1;
+        vm_inline_st_ok = !sd;
     }
 } s_vm_inline_init;
 
@@ -1663,8 +1766,18 @@ static void ww_arm_inline_window(uint32_t ww)
     g_ww_lo = ww & ~15u;
     g_ww_hi = (ww & ~15u) + len;
 }
+/* -1 until read; 0 when neither PPU_WVAL nor PPU_WWATCH is set, which with no
+ * sync-line probe armed leaves every guest store one load and one compare. */
+static int s_store_watch = -1;
+static __attribute__((noinline)) void barrier_watch_hit_slow(uint32_t a, uint32_t v, int width, void* ra);
 static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra)
 {
+    if (__builtin_expect(s_store_watch == 0, 1) && !g_barrier_sync_watch) return;
+    barrier_watch_hit_slow(a, v, width, ra);
+}
+static __attribute__((noinline)) void barrier_watch_hit_slow(uint32_t a, uint32_t v, int width, void* ra)
+{
+    if (s_store_watch < 0) s_store_watch = getenv("PPU_WVAL") || getenv("PPU_WWATCH") ? 1 : 0;
     /* PPU_WVAL=<hexvalue>: log every PPU store that WRITES this value, wherever
      * it lands. PPU_WWATCH answers "who writes this address"; when a bad value is
      * copied from node to node down a list, that only ever catches the copy.
@@ -3877,11 +3990,16 @@ extern "C" ppu_context* volatile g_ppu_main_ctx = nullptr;
 
 extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
 {
-    /* Line-buffer stdout: HLE logs mix printf (stdout) with probe fprintf
-     * (stderr); with a redirected block-buffered stdout, printf lines sat in
-     * the buffer for minutes and were LOST when the run was killed -- which
-     * made "the log line is absent" unusable as evidence. */
-    setvbuf(stdout, NULL, _IONBF, 0);
+    /* HLE logs mix printf (stdout) with probe fprintf (stderr); with a
+     * redirected block-buffered stdout and nothing flushing it, printf lines
+     * sat in the buffer for minutes and were LOST when the run was killed --
+     * which made "the log line is absent" unusable as evidence. This used to
+     * set stdout unbuffered, which with mingw-w64 costs one write() per
+     * character. ps3_stdio_init() buffers stdout and stderr and flushes them
+     * every PS3_STDIO_FLUSH_MS (50 ms), at exit, on abort and on a crash, so a
+     * killed run loses at most one interval (runtime/platform/ps3_stdio.h).
+     * PS3_STDIO_UNBUFFERED=1 restores the old unbuffered stdout. */
+    ps3_stdio_init();
 
     g_ppu_thread_entry_trampoline = ppu_thread_entry_trampoline;
     uint32_t code = 0, toc = 0;

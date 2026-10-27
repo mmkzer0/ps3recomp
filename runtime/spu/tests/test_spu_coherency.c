@@ -26,6 +26,7 @@
  * dependency on the rest of the runtime is spu_ch_wake, stubbed below. */
 #include "../spu_coherency.c"
 #include "../../memory/reservation.c"
+#include "../../../tests/spu_ls_watch_fixture.h"
 
 /* The real PPU store and store-conditional path the hook lives in. */
 #include "../../ppu/ppu_memory.h"

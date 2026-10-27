@@ -49,6 +49,10 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
      * consumer); it consumes nothing else this fixture asks about, so the verdict comes from the table. */
     return method == 0x1808u ? 0 : -1;
 }
+/* 0 = no batched fast path: every word reaches rsx_process_method above. */
+int  rsx_process_vp_run(rsx_state* state, u32 method, const u8* src, u32 count)
+{ (void)state; (void)method; (void)src; (void)count; return 0; }
+rsx_backend* rsx_get_backend(void) { return NULL; }
 int  rsx_draw_engine_enabled(void) { return 0; }
 void rsx_draw_engine_method(u32 method, u32 arg) { (void)method; (void)arg; }
 /* rsx_dsp_method_class is the real one (rsx_dispatch.c): its class table is a property of the method

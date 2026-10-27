@@ -45,6 +45,10 @@ void rsx_state_init(rsx_state* state) { (void)state; }
  * the census was taken in when the register-file engine classified the method itself. */
 int rsx_process_method(rsx_state* state, u32 method, u32 data)
 { (void)state; (void)method; (void)data; return -1; }
+/* 0 = no batched fast path: every word reaches rsx_process_method above. */
+int  rsx_process_vp_run(rsx_state* state, u32 method, const u8* src, u32 count)
+{ (void)state; (void)method; (void)src; (void)count; return 0; }
+rsx_backend* rsx_get_backend(void) { return NULL; }
 int  rsx_draw_engine_enabled(void) { return 0; }
 void rsx_draw_engine_method(u32 method, u32 arg) { (void)method; (void)arg; }
 u32  rsx_dsp_method_class(u32 method);   /* the real one, from rsx_dispatch.c */

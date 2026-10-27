@@ -84,8 +84,12 @@ int main(int argc, char** argv)
     mfc_engine_init(&mfc);
     memset(g_mem, 0, sizeof g_mem);
 
-    /* 3000 sleeps of 1 ms is a 3 s bound; the stop must arrive after ~1 s. */
-    const unsigned long max = stop_expected ? 3000ul : 300ul;
+    /* The guard yields for the first 2 ms of an episode (a healthy poll ends
+     * there) and sleeps 1 ms per repeat after that, so a repeat COUNT bound
+     * would be spent inside the yield window. Bound the stop run by wall
+     * time instead: the stop must arrive after ~1 s, well inside 10 s. */
+    const unsigned long max = stop_expected ? ~0ul : 300ul;
+    const unsigned long long t0 = ps3_ms_now();
     unsigned long n;
     for (n = 0; n < max; ++n) {
         const int rc = mfc_submit(&mfc, &ctx, MFC_GET_CMD);
@@ -93,9 +97,10 @@ int main(int argc, char** argv)
             fprintf(stderr, "FAIL: mfc_submit returned %d at repeat %lu\n", rc, n);
             return 1;
         }
+        if (stop_expected && (n & 63u) == 0 && ps3_ms_now() - t0 > 10000ull) break;
     }
     if (stop_expected) {
-        fprintf(stderr, "FAIL: no spu-dma-repeat stop after %lu identical transfers\n", n);
+        fprintf(stderr, "FAIL: no spu-dma-repeat stop after %lu identical transfers (10 s)\n", n);
         return 3;
     }
     printf("PASS: %lu identical transfers, no stop, no halt\n", n);

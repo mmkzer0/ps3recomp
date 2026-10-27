@@ -24,6 +24,7 @@
 #include "ps3emu/stop.h"      /* ps3_stop_register_frontier */
 #include "ps3emu/config.h"    /* ps3_config_find_hle_stub */
 #include "ps3emu/hle_observer.h"
+#include "ps3emu/ps3_ftrace.h"   /* PS3_FTRACE: spans of HLE import calls */
 #include "../syscalls/ppu_thread_id.h"   /* ppu_tid_diag_index: the in-flight tables are indexed by table slot */
 #include <atomic>
 #include <mutex>
@@ -79,6 +80,37 @@ extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, hle_ctx_fn 
         g_ctx[g_ctx_count].name = name ? name : "?";   /* named in the milestone log */
         g_ctx_count++;
     }
+}
+
+/* Leaf imports that can finish without the dispatcher: no guest code, no
+ * change to r2, no blocking. The module that implements one registers a fast
+ * form beside the full handler. ps3_hle_dispatch tries it first (so the
+ * observer in ps3_hle_call still sees a fast call), and the fast form
+ * returns 0 to take the full call instead (a contended lock that has to wait,
+ * say). God of War HD takes an lwmutex about 640,000 times in one frame (its
+ * allocator, when a wave spawns), and the dispatcher's guard and bookkeeping
+ * were a large part of each. Registered at init, before guest threads run.
+ * Fast calls do not show in PS3_FTRACE. */
+typedef int (*hle_fast_fn)(ppu_context*);
+#define HLE_FAST_N 64u
+static struct { uint32_t nid; hle_fast_fn fn; } g_hle_fast[HLE_FAST_N];
+extern "C" void ps3_hle_register_fast(uint32_t nid, hle_fast_fn fn)
+{
+    const uint32_t h = (nid * 2654435761u) >> 26;
+    for (uint32_t i = 0; i < HLE_FAST_N; i++) {
+        auto& e = g_hle_fast[(h + i) & (HLE_FAST_N - 1)];
+        if (!e.fn || e.nid == nid) { e.nid = nid; e.fn = fn; return; }
+    }
+}
+static inline hle_fast_fn hle_fast(uint32_t nid)
+{
+    const uint32_t h = (nid * 2654435761u) >> 26;
+    for (uint32_t i = 0; i < HLE_FAST_N; i++) {
+        const auto& e = g_hle_fast[(h + i) & (HLE_FAST_N - 1)];
+        if (!e.fn) return nullptr;
+        if (e.nid == nid) return e.fn;
+    }
+    return nullptr;
 }
 
 /* Is this NID implemented here? Lets a host boot harness that owns its own
@@ -270,6 +302,9 @@ static void hle_top_note(uint32_t nid, const char* name, const ppu_context* ctx,
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
 extern "C" void ps3_hle_dispatch(uint32_t nid, ppu_context* ctx)   /* C linkage: the block-scope externs below rely on it */
 {
+    if (const hle_fast_fn f = hle_fast(nid))
+        if (f(ctx)) return;
+
     /* HLE_BT_EVERY=<n>: dump the calling thread's guest stack every nth HLE
      * call it makes. WAITBT_EVERY only samples threads that are blocking on an
      * event queue, which misses a thread that stops looping while it is BUSY --
@@ -306,11 +341,16 @@ extern "C" void ps3_hle_dispatch(uint32_t nid, ppu_context* ctx)   /* C linkage:
      * base (e.g. func_002B03AC's `*(r2-0x4B34)` FMOD list head -> null -> infinite walk
      * -> no draws). Snapshot the caller r2+sp now and restore BOTH the live r2 and the
      * ABI slot on every exit path (offset 40 = 0x28 is the reserved TOC doubleword). */
-    struct _TocGuard { ppu_context* c; uint64_t toc, sp;
+    /* It also closes the PS3_FTRACE span of the call: a thread blocked in an
+     * import (a file read, a SPURS wait) shows up nowhere else. */
+    struct _TocGuard { ppu_context* c; uint64_t toc, sp, ft0; uint32_t nid, lr;
         ~_TocGuard(){ c->gpr[2] = toc; vm_write64(sp + 0x28, toc);
                       const unsigned t = ppu_tid_diag_index(c->thread_id);
-                      if (t && t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t].store(nullptr, std::memory_order_relaxed); }
-    } _tg{ ctx, ctx->gpr[2], ctx->gpr[1] };
+                      if (t && t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t].store(nullptr, std::memory_order_relaxed);
+                      if (ft0) { const uint64_t t1 = ps3_ft_now();
+                                 if (t1 - ft0 >= ps3_ft_min_ns())
+                                     ps3_ft_span(PS3_FT_HLE, t ? t : (uint32_t)c->thread_id, nid, lr, ft0, t1); } }   /* t = slot + 1, what ps3_ft_name keys on */
+    } _tg{ ctx, ctx->gpr[2], ctx->gpr[1], PS3_FT_ON() ? ps3_ft_now() : 0, nid, (uint32_t)ctx->lr };
     /* Deliver any pending vblank/flip tick on THIS (guest) thread, serialized with
      * guest execution -- the vblank ticker only marks ticks pending; the handlers
      * run here so guest code never executes concurrently on the ticker thread. */
@@ -799,8 +839,21 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 
 /* Populated by the generated registration unit (gen_hle_nids.py). Weak so a
  * build without it still links (no HLE registered -> imports log + return 0). */
+#if defined(_MSC_VER)
+/* MSVC has no weak functions: /alternatename redirects references to the
+ * default only while the strong definition from the generated unit is absent
+ * -- weak semantics, and ignored when ppu_hle_nids.cpp is linked. */
+extern "C" void ppu_hle_register_all_default(void) {}
+extern "C" void ppu_hle_register_all(void);   /* generated unit; /alternatename falls back */
+#  if defined(_M_IX86)
+#    pragma comment(linker, "/alternatename:_ppu_hle_register_all=_ppu_hle_register_all_default")
+#  else
+#    pragma comment(linker, "/alternatename:ppu_hle_register_all=ppu_hle_register_all_default")
+#  endif
+#else
 extern "C" void ppu_hle_register_all(void) __attribute__((weak));
 extern "C" void ppu_hle_register_all(void) {}
+#endif
 
 extern "C" void ppu_hle_init(void)
 {

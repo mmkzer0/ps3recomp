@@ -1038,7 +1038,8 @@ Each HLE module defines errors as `(base | local_code)`. The bases below are an 
 | `0x80121100` | cellPad |
 | `0x8002B100` | cellSysutil (`TYPE` `0x8002B101` to `NUM` `0x8002B104`) |
 | `0x80540000` | cellFont |
-| `0x80410700` | cellSpurs |
+| `0x80410700` | cellSpurs (core) |
+| `0x80410900` | cellSpurs (tasks) |
 | `0x80710100` | cellHttp |
 | `0x80720100` | cellSsl |
 

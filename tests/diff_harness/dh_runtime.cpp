@@ -13,6 +13,8 @@ extern "C" {
 uint8_t* vm_base = nullptr;
 
 int      vm_inline_ok = 1;                       /* lifted loads take the inline path */
+int      vm_inline_st_ok = 0;                    /* lifted stores take vm_write*, where the harness sees them */
+uint32_t g_null_sweep_hi = 0;                   /* no null-page sweep */
 PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*) = nullptr;
 
 uint8_t  vm_read8(uint64_t a)  { return vm_base[(uint32_t)a]; }

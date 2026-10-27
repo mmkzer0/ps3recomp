@@ -83,11 +83,14 @@ extern "C" {
  * return of TaskExitCodeInitialize are the firmware's own literals. Only codes
  * libsre 4.93 actually builds are defined: TASK NOSYS (0x03), NOMEM (0x04),
  * NOENT (0x06) and FAULT (0x0D) have no site in the image (RPCS3 defines them;
- * the firmware does not return them), and a guest span the host cannot back is
+ * the firmware does not return them; NOENT stays defined only because
+ * tests/test_error_bases.c pins its value, and NOSYS/NOMEM/FAULT stay undefined
+ * -- tests/test_spurs_error_codes.c #errors if they appear), and a guest span the host cannot back is
  * a named stop (hle-guest-range), never a fabricated code. */
 #define CELL_SPURS_TASK_ERROR_AGAIN             (CELL_SPURS_ERROR_BASE_TASK | 0x01)
 #define CELL_SPURS_TASK_ERROR_INVAL             (CELL_SPURS_ERROR_BASE_TASK | 0x02)
 #define CELL_SPURS_TASK_ERROR_SRCH              (CELL_SPURS_ERROR_BASE_TASK | 0x05)
+#define CELL_SPURS_TASK_ERROR_NOENT             (CELL_SPURS_ERROR_BASE_TASK | 0x06)   /* kept for tests/test_error_bases.c; no libsre site builds it */
 #define CELL_SPURS_TASK_ERROR_NOEXEC            (CELL_SPURS_ERROR_BASE_TASK | 0x07)
 #define CELL_SPURS_TASK_ERROR_PERM              (CELL_SPURS_ERROR_BASE_TASK | 0x09)
 #define CELL_SPURS_TASK_ERROR_BUSY              (CELL_SPURS_ERROR_BASE_TASK | 0x0A)

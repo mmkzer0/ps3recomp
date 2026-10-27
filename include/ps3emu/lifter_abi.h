@@ -28,7 +28,7 @@ extern "C" {
 /* The lifted-code ABI this runtime implements. Bump it together with
  * PPU_LIFTER_ABI in tools/ppu_lifter.py whenever generated code must change to
  * stay correct against the runtime (a new store hook, a changed hook ABI). */
-#define PPU_RUNTIME_LIFTER_ABI 1u
+#define PPU_RUNTIME_LIFTER_ABI 2u
 
 /* Compare the ABI the linked lift was generated for (the `ppu_lifter_abi`
  * symbol its source defines) with PPU_RUNTIME_LIFTER_ABI. Returns when they
