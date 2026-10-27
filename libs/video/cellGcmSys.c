@@ -2798,13 +2798,15 @@ static int gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
      * every 3D method through this function -- there are two callers, and a
      * gate at one of them only would be a silent half-measure.
      *
-     * The verdict (gcm_method_verdict) is the state machine's when it ran
-     * (0 = it took the method), or, with the register-file engine on, the
-     * engine's: a method the engine has a consumer for is handled, and
-     * SET_OBJECT is the binding table's. A method the gate kept from the state
-     * machine and the engine does not claim has no live consumer, so it counts
-     * as unhandled -- the state machine's answer for it would be about state
-     * nothing reads. */
+     * The verdict (gcm_method_verdict) says what consumed the word: the state
+     * machine when it ran (0 = it took the method), or the register-file
+     * dispatch's class table (rsx_dsp_method_class), which names every register
+     * the draw engine reads. SET_OBJECT is the binding table's. A method the
+     * gate kept from the state machine and the class table does not claim has no
+     * live consumer, so it counts as unhandled -- the state machine's answer for
+     * it would be about state nothing reads. That is why every register the
+     * engine reads needs its class-table row: the state machine used to answer
+     * for it, unseen. */
     int handled = 0;
     if (legacy_state_live || gcm_legacy_method_has_effect(m))
         handled = rsx_process_method(st, m, v) == 0;

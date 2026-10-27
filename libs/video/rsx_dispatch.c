@@ -85,6 +85,9 @@
 #define M_TEX_SIZE1             0x1840  /* + unit * 4  (control3)           */
 #define M_TEX_OFFSET            0x1A00  /* + unit * 0x20 (8-word unit block) */
 #define M_VERTEX_TEXTURE        0x0900  /* + unit * 0x20 (8-word unit block) */
+#define M_SCISSOR_HORIZONTAL    0x08C0  /* x[0:15] | width[16:31]; vertical at +4 */
+#define M_FREQ_DIVIDER_OP       0x1FC0
+#define M_TRANSFORM_BRANCH_BITS 0x1FF8
 #define M_FP_ACTIVE_PROGRAM     0x08E4  /* offset | dma-context [1:0]        */
 #define M_FP_CONTROL            0x1D60
 #define M_VP_START_FROM_ID      0x1EA0
@@ -228,6 +231,20 @@ static void dsp_fill_classes(dsp_class_table* t)
     mark_class(t, M_DEPTH_BOUNDS_ENABLE, 3, RSX_DSP_CLASS_STATE); /* ENABLE, MIN, MAX */
     mark_class(t, M_CLIP_MIN,            2, RSX_DSP_CLASS_STATE); /* CLIP_MIN, CLIP_MAX */
     mark_class(t, M_SHADER_PACKER,       1, RSX_DSP_CLASS_STATE);
+
+    /* Registers the engine reads straight from the register file at draw time. With the
+     * engine on and no vtable backend the walker no longer feeds rsx_state (#466), so the state
+     * machine's answer used to be what made these "handled"; the engine is the consumer, and the
+     * class table is where it says so. Each row names the read:
+     *   0x08C0/0x08C4 scissor        rsx_draw_engine.c eng_scissor_rect: the rectangle a draw is clipped to
+     *   0x0900.. vertex textures     rsx_dsp_get_vertex_texture (eng_vtex_mask, sink_bind_vertex_textures),
+     *                                four 8-word unit blocks
+     *   0x1FC0 frequency divider     rsx_vertex_compact.c: the modulo/divide mask of the vertex fetch plan
+     *   0x1FF8 VP branch bits        rsx_draw_engine.c: the static-branch condition bits of the program */
+    mark_class(t, M_SCISSOR_HORIZONTAL, 2, RSX_DSP_CLASS_STATE);
+    mark_class(t, M_VERTEX_TEXTURE, RSX_DSP_NUM_VERTEX_TEXTURES * 8, RSX_DSP_CLASS_STATE);
+    mark_class(t, M_FREQ_DIVIDER_OP, 1, RSX_DSP_CLASS_STATE);
+    mark_class(t, M_TRANSFORM_BRANCH_BITS, 1, RSX_DSP_CLASS_STATE);
 
     /* Explicit no-ops: the vertex cache invalidate hint and the reserved
      * NOP method carry no state the replay harness needs (there is no CPU
