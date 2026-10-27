@@ -95,10 +95,29 @@ PS3_CFG_U32(spu, dma_repeat_stop_secs, 0, 0, 86400,
 PS3_CFG_U32(gcm, wait_timeout_ms, 10000, 1, 3600000,
     "How long, in milliseconds, an RSX wait may stand unsatisfied before the run stops with kind "
     "gcm-wait-timeout: a NV406E semaphore acquire whose label never reaches the value, the "
-    "command-context buffer-full callback waiting for the RSX to leave the next segment, or a guest "
-    "store to a label waiting for the RSX walker's next pass. The "
+    "command-context buffer-full callback waiting for the RSX to leave the next segment, a guest "
+    "store to a label waiting for the RSX walker's next pass, or a self-JUMP park nobody patches "
+    "(what=jump-park; see gcm.park_resync). The "
     "hardware waits forever; a wait that expires here means the agent that should end it (an SPU "
     "job writing a label, the driver, the walker) never ran. A host watchdog, not PS3 behaviour.")
+
+PS3_CFG_BOOL(gcm, park_resync, 0,
+    "Compatibility mode for a command-buffer park: a JUMP to itself that the guest patches later "
+    "(Edge geometry jobs reserve holes this way; a title may append after the park, move put there and "
+    "patch the park last). Off, the Reference behaviour: the RSX waits at the park for the patch, "
+    "however late, and GET never moves to put because a host deadline expired; a park that stands the "
+    "whole gcm.wait_timeout_ms with put elsewhere stops with kind gcm-wait-timeout (what=jump-park). "
+    "On, a park that has stood gcm.park_grace_ms with put elsewhere and still unpatched moves GET to "
+    "put and drops the commands in between, and every such intervention is logged with the mode and "
+    "the effective grace. The commands it drops (a fence among them) were never executed, so this can "
+    "stop a title that the Reference mode runs correctly; it exists for a title whose producer never "
+    "patches the park. A host liveness policy, not PS3 behaviour.")
+
+PS3_CFG_U32(gcm, park_grace_ms, 50, 1, 60000,
+    "How long, in milliseconds, a self-JUMP park stands with put elsewhere before gcm.park_resync moves "
+    "GET to put. Effective only with gcm.park_resync on; the Reference mode ignores it. God of War HD, "
+    "loading its menu, took more than 50 ms between its append and its patch of the park, so a title "
+    "that needs the Compatibility mode may need this longer.")
 
 /* ---- trophy ------------------------------------------------------------- */
 

@@ -1412,28 +1412,17 @@ static unsigned long long park_since;
  * catches up instead. Sized well above a frame's command list so a
  * title that keeps up never sees this path. */
 #define GCM_FIFO_CATCHUP_BYTES 0x10000u
-/* How long a self-JUMP park may stand with `put` somewhere else before the
- * drain gives up on it being patched and follows `put` instead.
- * GCM_PARK_GRACE_MS=<ms> sets it. A title that appends after the park, moves
- * `put` there and patches the park last needs it longer: God of War HD,
- * loading its menu, has taken more than 50 ms between the two stores, and
- * following `put` dropped the commands in between, a fence with them, so
- * the boot stopped. The RSX itself would just wait. */
-#define GCM_PARK_GRACE_MS 50ull
-static unsigned long long gcm_park_grace_ms(void)
-{
-    static long long ms = -1;
-    if (ms < 0) { const char* e = getenv("GCM_PARK_GRACE_MS"); ms = e ? atoll(e) : (long long)GCM_PARK_GRACE_MS; }
-    return (unsigned long long)ms;
-}
-/* GCM_PARK_RESYNC=1: compatibility mode for the jump-park resync. Off by default: the reference
- * RSX never advances GET past a park on its own (see the walker's JUMP case). */
-static int gcm_park_compat(void)
-{
-    static int on = -1;
-    if (on < 0) { const char* e = getenv("GCM_PARK_RESYNC"); on = (e && atoi(e)) ? 1 : 0; }
-    return on;
-}
+/* A self-JUMP park the guest has not patched while `put` stands elsewhere. A title that appends after the
+ * park, moves `put` there and patches the park last leaves the park standing for a while: God of War HD,
+ * loading its menu, has taken more than 50 ms between the two stores, and following `put` dropped the
+ * commands in between, a fence with them, so the boot stopped. The RSX itself just waits.
+ *
+ * Reference mode (gcm.park_resync off, the default): the walker waits at the park for as long as the guest
+ * takes, and a park that stands the whole gcm.wait_timeout_ms is the named stop `gcm-wait-timeout`
+ * (what=jump-park); GET never moves to `put` because a host deadline expired.
+ * Compatibility mode (gcm.park_resync on): a park that has stood gcm.park_grace_ms with the same `put`
+ * and is still unpatched moves GET to `put`, dropping the commands between, and logs the intervention
+ * with the mode and the effective grace. */
 /* How close `current` must get to `end` before the runtime will recycle a ring
  * on the title's behalf. One gcmReserve is 8 bytes; a page of slack keeps a
  * title that is merely near the end from being touched. */
@@ -3194,11 +3183,10 @@ static void gcm_rsx_process_fifo_unlocked(void)
                       const unsigned long long now = ps3_ms_now();
                       if (park_off != s_fifo_getoff || park_put != put) {
                           park_off = s_fifo_getoff; park_put = put; park_since = now;
-                      } else if (gcm_park_compat()) {
-                          /* Compatibility mode (GCM_PARK_RESYNC=1, default off): the grace
-                           * expiring follows `put`, dropping the commands in between. Every
-                           * intervention is logged, not just the first few. */
-                          if (now - park_since >= gcm_park_grace_ms() &&
+                      } else if (ps3_cfg_gcm_park_resync()) {
+                          /* Compatibility mode: the grace expiring follows `put`, dropping the commands
+                           * in between. Every intervention is logged, not just the first few. */
+                          if (now - park_since >= ps3_cfg_gcm_park_grace_ms() &&
                               /* Read the park again before giving up on it.
                                * An SPU job that fills a command-buffer hole
                                * (Edge geometry reserves them as self-JUMPs)
@@ -3206,18 +3194,19 @@ static void gcm_rsx_process_fifo_unlocked(void)
                                * resync, which would then jump over the
                                * commands it just wrote. */
                               vm_read32(gcm_io2ea(s_fifo_getoff)) == w) {
-                              fprintf(stderr, "[cellGcmSys] COMPAT jump-park: park 0x%08X stood %llu ms with put 0x%08X; "
-                                      "get follows put, dropping the commands between (GCM_PARK_RESYNC)\n",
-                                      s_fifo_getoff, now - park_since, put);
+                              fprintf(stderr, "[cellGcmSys] jump-park intervention: mode=compatibility grace=%u ms "
+                                      "park=0x%08X stood=%llu ms put=0x%08X: get follows put, the commands between "
+                                      "are dropped (gcm.park_resync)\n",
+                                      ps3_cfg_gcm_park_grace_ms(), s_fifo_getoff, now - park_since, put);
                               park_off = 0;
                               gcm_fifo_dump_around(s_fifo_getoff);
                               gcm_fifo_resync_why("jump-park", &s_fifo_getoff, put);
                           }
                       } else if (now - park_since >= ps3_cfg_gcm_wait_timeout_ms()) {
-                          /* Reference behaviour: the RSX waits at a park for the patch, however
-                           * late (GCM_PARK_GRACE_MS only matters in compatibility mode). A park
-                           * that stands the whole wait timeout with put elsewhere is a producer
-                           * that is missing, and a named stop. */
+                          /* Reference mode: the RSX waits at a park for the patch, however late
+                           * (gcm.park_grace_ms only matters in Compatibility mode). A park that stands
+                           * the whole wait timeout with put elsewhere is a producer that is missing,
+                           * and a named stop. */
                           ps3_stop_gcm_wait_timeout("cellGcm_rsx_process_fifo", "jump-park", s_fifo_getoff, put,
                                                     w & 0x1FFFFFFCu, (u32)(now - park_since));
                       }
@@ -3689,7 +3678,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
     /* A drain stopped on a semaphore acquire holds `get`
      * on purpose: that is the wait, not a stuck walker, and the stop
      * after gcm.wait_timeout_ms is what ends it. So is a self-JUMP park,
-     * which GCM_PARK_GRACE_MS ends. This counter counts drain passes, not
+     * which gcm.wait_timeout_ms stops (Reference mode) or gcm.park_grace_ms
+     * ends (Compatibility mode, gcm.park_resync). This counter counts drain passes, not
      * time: both stop every pass at the same `get`, so it fired a few
      * milliseconds in and resynced to put. For a park that is before the
      * title has patched it into a JUMP to the commands it just wrote at the

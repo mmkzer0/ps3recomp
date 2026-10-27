@@ -1,7 +1,8 @@
 /* A park the walker has left is forgotten (cellGcmSys.c).
  *
  * A self-JUMP park the title has not patched yet is waited on for
- * GCM_PARK_GRACE_MS with the same put; past that the walker resyncs to put.
+ * gcm.park_grace_ms with the same put; past that, in Compatibility mode (gcm.park_resync), the walker
+ * resyncs to put.
  * The park's start time used to be kept after the walker left the park, so
  * when the walker next stopped at the same address with the same put -- a
  * title that reuses its command blocks does that -- the new park inherited a
@@ -118,6 +119,9 @@ int main(void)
     if (!vm_base) { puts("FAIL: guest VM alloc"); return 1; }
     ppu_vm_size = vm_size;
 
+    /* The park resync is Compatibility mode (gcm.park_resync); the Reference mode waits and ends in a stop
+     * (test_gcm_park_modes.c). */
+    ps3_fixture_config()->gcm_park_resync = true;
     u32 ctx_out = host_alloc(4, 4);
     (void)cellGcmSetupContext(ctx_out, CMD_SIZE, IO_SIZE, IO_ADDR, host_alloc, host_w32);
     const uint32_t ctrl = (uint32_t)(uintptr_t)cellGcmGetControlRegister();
@@ -140,7 +144,7 @@ int main(void)
 
     /* Well past the grace, A is reused: the park stands again, and the walker
      * comes back to it with the same put. */
-    usleep((useconds_t)(GCM_PARK_GRACE_MS * 3u * 1000u));
+    usleep((useconds_t)(ps3_cfg_gcm_park_grace_ms() * 3u * 1000u));
     gw32(IO_ADDR + park, 0x20000000u | park);
     s_fifo_getoff = 0;
     cellGcm_rsx_process_fifo();
@@ -150,7 +154,7 @@ int main(void)
     check(s_fifo_getoff == park, "...and keeps waiting within the grace");
 
     /* Left unpatched past the grace, the walker still gives up on it. */
-    usleep((useconds_t)(GCM_PARK_GRACE_MS * 3u * 1000u));
+    usleep((useconds_t)(ps3_cfg_gcm_park_grace_ms() * 3u * 1000u));
     cellGcm_rsx_process_fifo();
     check(s_fifo_getoff == put, "an unpatched park past the grace resyncs to put");
 

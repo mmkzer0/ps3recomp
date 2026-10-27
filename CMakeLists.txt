@@ -1294,6 +1294,11 @@ if(UNIX)
             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_rsx_methods.py"
                 ${RSX_METHODS_TEST_ARGS})
         set_tests_properties(rsx_methods PROPERTIES LABELS "gcm;t0" TIMEOUT 120)
+        # The park heuristic in both modes (Reference stop, Compatibility resync) on one synthetic parked
+        # FIFO; the fixture compiles cellGcmSys.c into itself (tools/test_gcm_park_modes.py).
+        add_test(NAME gcm_park_modes
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_gcm_park_modes.py")
+        set_tests_properties(gcm_park_modes PROPERTIES LABELS "gcm;t0" TIMEOUT 120)
     endif()
 
     # Capture -> replay on a real Metal device (tools/test_rsx_replay.py): the scene fixture is a synthetic

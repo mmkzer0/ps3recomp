@@ -81,6 +81,8 @@ def test_defaults_without_file_or_environment():
         "spu.dma_repeat_limit": ("256", "default"),
         "spu.dma_repeat_stop_secs": ("0", "default"),
         "gcm.wait_timeout_ms": ("10000", "default"),
+        "gcm.park_resync": ("false", "default"),
+        "gcm.park_grace_ms": ("50", "default"),
         "trophy.register_wait_cap_vblanks": ("1024", "default"),
         "video.resolutions": ('""', "default"),
         "video.rsx_capture": ("false", "default"),
@@ -122,6 +124,25 @@ def test_environment_alone_sets_options():
         assert o["ppu.vscr_nj"] == (want, "env:PS3RECOMP_PPU_VSCR_NJ"), (text, o)
 
 
+def test_park_resync_and_grace_come_from_file_and_environment():
+    with Cfg("schema = 1", "[gcm]", "park_resync = true", "park_grace_ms = 200") as c:
+        o = options(probe("--load", c.path, "get"))
+        assert o["gcm.park_resync"] == ("true", f"file:{c.path}"), o
+        assert o["gcm.park_grace_ms"] == ("200", f"file:{c.path}"), o
+        o = options(probe("--load", c.path, "get", PS3RECOMP_GCM_PARK_RESYNC="0", PS3RECOMP_GCM_PARK_GRACE_MS="75"))
+        assert o["gcm.park_resync"] == ("false", "env:PS3RECOMP_GCM_PARK_RESYNC"), o
+        assert o["gcm.park_grace_ms"] == ("75", "env:PS3RECOMP_GCM_PARK_GRACE_MS"), o
+    o = options(probe("get", PS3RECOMP_GCM_PARK_RESYNC="1"))
+    assert o["gcm.park_resync"] == ("true", "env:PS3RECOMP_GCM_PARK_RESYNC"), o
+    assert o["gcm.park_grace_ms"] == ("50", "default"), o        # the grace is separate from the mode
+
+
+def test_park_grace_out_of_range_stops():
+    for bad in ("0", "60001"):
+        f = config_invalid(probe("get", PS3RECOMP_GCM_PARK_GRACE_MS=bad))
+        assert f["key"] == "gcm.park_grace_ms" and "out of range" in f["detail"], (bad, f)
+
+
 def test_ps3recomp_config_names_the_file_and_beats_the_title_path():
     with Cfg("schema = 1", "[ppu]", "vscr_nj = false") as title, \
          Cfg("schema = 1", "[diag]", "dump_config = false") as operator:
@@ -151,6 +172,8 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
             "spu.dma_repeat_limit": "default",
             "spu.dma_repeat_stop_secs": "default",
             "gcm.wait_timeout_ms": "default",
+            "gcm.park_resync": "default",
+            "gcm.park_grace_ms": "default",
             "trophy.register_wait_cap_vblanks": "default",
             "video.resolutions": "default",
             "video.rsx_capture": "default",
@@ -168,7 +191,7 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
             assert doc == {"schema": 1,
                            "ppu": {"vscr_nj": False, "opd_swap_fixup": False, "null_page": "stop"},
                            "spu": {"dma_repeat_limit": 256, "dma_repeat_stop_secs": 0},
-                           "gcm": {"wait_timeout_ms": 10000},
+                           "gcm": {"wait_timeout_ms": 10000, "park_resync": False, "park_grace_ms": 50},
                            "trophy": {"register_wait_cap_vblanks": 1024},
                            "video": {"resolutions": "", "rsx_capture": False, "rsx_capture_dir": "",
                                      "rsx_capture_frames": 0},

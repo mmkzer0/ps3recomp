@@ -7,7 +7,7 @@
  * are replayed.
  *
  * io 0 holds a park (a JUMP to itself) and put lies past it, so the walker
- * parks; once the park has stood with the same put for GCM_PARK_GRACE_MS the
+ * parks; once the park has stood with the same put for gcm.park_grace_ms the
  * next pass resyncs to put. Between the park and put: a NOP, an NV406E
  * semaphore offset + release, a forward JUMP over garbage, and an NV4097
  * semaphore offset + back-end release.
@@ -111,7 +111,7 @@ static u32 put_method(u32 io, u32 method, u32 arg)
 static void wait_past_grace(void)
 {
     const unsigned long long t0 = ps3_ms_now();
-    while (ps3_ms_now() - t0 <= GCM_PARK_GRACE_MS + 10u) {
+    while (ps3_ms_now() - t0 <= ps3_cfg_gcm_park_grace_ms() + 10u) {
 #ifdef _WIN32
         Sleep(5);
 #else
@@ -129,6 +129,7 @@ int main(void)
     if (!vm_base) { puts("FAIL: guest VM alloc"); return 1; }
     ppu_vm_size = vm_size;
 
+    ps3_fixture_config()->gcm_park_resync = true;   /* the resync is Compatibility mode (gcm.park_resync) */
     u32 ctx_out = host_alloc(4, 4);
     (void)cellGcmSetupContext(ctx_out, CMD_SIZE, IO_SIZE, IO_ADDR, host_alloc, host_w32);
     const uint32_t ctrl = (uint32_t)(uintptr_t)cellGcmGetControlRegister();

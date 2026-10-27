@@ -22,8 +22,8 @@ with tempfile.TemporaryDirectory(prefix='gcm-park-reuse-') as tmp:
                     str(root / 'runtime/memory/label_window.c'),
                     str(root / 'libs/video/gcm_default_state.c'), *linker,
                     '-o', str(binary)], check=True)
-    result = subprocess.run([str(binary)], timeout=30, capture_output=True, text=True,
-                            env={**os.environ, 'GCM_PARK_RESYNC': '1'})   # the park resync is compatibility mode
+    # The fixture sets gcm.park_resync (Compatibility mode) in its stub configuration.
+    result = subprocess.run([str(binary)], timeout=30, capture_output=True, text=True)
     print(result.stdout.strip())
     if result.returncode:
         print(result.stderr[-2000:])

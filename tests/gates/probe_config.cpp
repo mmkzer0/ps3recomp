@@ -44,6 +44,10 @@ static void print_options()
             std::printf("%u", ps3_cfg_spu_dma_repeat_stop_secs());
         else if (!std::strcmp(o->section, "gcm") && !std::strcmp(o->key, "wait_timeout_ms"))
             std::printf("%u", ps3_cfg_gcm_wait_timeout_ms());
+        else if (!std::strcmp(o->section, "gcm") && !std::strcmp(o->key, "park_resync"))
+            std::printf("%s", ps3_cfg_gcm_park_resync() ? "true" : "false");
+        else if (!std::strcmp(o->section, "gcm") && !std::strcmp(o->key, "park_grace_ms"))
+            std::printf("%u", ps3_cfg_gcm_park_grace_ms());
         else if (!std::strcmp(o->section, "trophy") && !std::strcmp(o->key, "register_wait_cap_vblanks"))
             std::printf("%u", ps3_cfg_trophy_register_wait_cap_vblanks());
         else if (!std::strcmp(o->section, "video") && !std::strcmp(o->key, "resolutions"))
