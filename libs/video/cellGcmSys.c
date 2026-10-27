@@ -73,16 +73,32 @@ static rsx_class_id gcm_method_class(u32 subch, u32 m)
     return (rsx_class_id)s_subch_class[subch & 7u];
 }
 
-/* Whether the 3D register-file mirrors (the draw engine, the live-draw engine) take this word. Both mask
- * the subchannel off and keep one NV4097 register file, so a word from another class would be stored as
- * an NV4097 register: NV308A's 0x018C/0x0194/0x0198 are SET_CONTEXT_DMA_COLOR1/COLOR0/ZETA there, and a
- * 2D write to them silently moved the colour and depth surfaces to RSX local memory. They take methods
- * of a slot bound to NV4097, and the driver's own words (0xE9xx, 0xEBxx), whose address space is the
- * method number itself rather than a binding. */
+/* The driver's own words, decoded by their full address (LV1's, not an engine's; RPCS3 does the same):
+ * GCM_SET_USER_COMMAND 0xEB00/0xEB04, the flip queue 0xE944 and the flip head 0xE920/0xE924. Slot 7 is the
+ * driver's, and these are taken before any class route: whatever object a slot carries, they mean the same. */
+static int gcm_driver_word(u32 subch, u32 m)
+{
+    const u32 mfull = (subch << 13) | m;
+    return mfull == 0xEB00u || mfull == 0xEB04u || mfull == 0xE944u || mfull == 0xE920u || mfull == 0xE924u;
+}
+
+/* Whether the 3D register-file mirrors (the draw engine, the live-draw engine) take this word. Both keep
+ * one NV4097 register file, so a word from another class would be stored as an NV4097 register: NV308A's
+ * 0x018C/0x0194/0x0198 are SET_CONTEXT_DMA_COLOR1/COLOR0/ZETA there, and a 2D write to them silently moved
+ * the colour and depth surfaces to RSX local memory. They take methods of a slot bound to NV4097, and the
+ * driver's words. */
 static int gcm_feeds_3d_mirror(u32 subch, u32 m)
 {
-    if (((subch << 13) | m) >= 0xE000u) return 1;
+    if (gcm_driver_word(subch, m)) return 1;
     return m >= 0x100u && s_subch_class[subch & 7u] == RSX_CLASS_NV4097;
+}
+
+/* The address the mirrors get: a driver word keeps its full address (the engine reads 0xE9xx by it), any
+ * other word is an NV4097 method and goes by its own number, whatever slot NV4097 is bound to; with the
+ * subchannel left in, NV4097 on slot 7 would reach the engine's 0x1808 begin/end as 0xF808. */
+static u32 gcm_mirror_method(u32 subch, u32 m)
+{
+    return gcm_driver_word(subch, m) ? ((subch << 13) | m) : m;
 }
 
 /* The NV0039 (M2MF) object's registers. One object, whatever subchannel it is bound to. */
@@ -3401,7 +3417,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
              * capture step is closed here as it is at the end of the loop.
              * Never with a capture sink attached: the capture contract wants every consumed word a
              * step, in executed order, so the per-word path runs then. */
-            if (!wdiag && !s_cap && count && method >= 0x100u && s_subch_class[subch & 7u] == RSX_CLASS_NV4097 &&
+            if (!wdiag && !s_cap && count && method >= 0x100u && subch != 7 &&
+                s_subch_class[subch & 7u] == RSX_CLASS_NV4097 &&
                 ((s_fifo_getoff + 4) >> 20) == ((s_fifo_getoff + count * 4) >> 20)) {
                 const u32 dea = gcm_io2ea(s_fifo_getoff + 4);
                 if (dea) {
@@ -3435,7 +3452,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * the 3D register file or the live-draw mirror: NV0039's 0x0304-0x0328 are NV4097's
                  * alpha, blend and colour-mask state there. The puller's words (0 < m < 0x100) are
                  * NV406E on every subchannel, whatever is bound, and go the channel-control way below. */
-                if (s_subch_class[subch] == RSX_CLASS_NV0039 && (m == 0 || m >= 0x100u)) {
+                if (s_subch_class[subch] == RSX_CLASS_NV0039 && (m == 0 || m >= 0x100u) && !gcm_driver_word(subch, m)) {
                     gcm_method_verdict(subch, m, mdata, gcm_nv0039_method(m, mdata),
                                        s_fifo_getoff, s_fifo_getoff + 4 + i * 4);
                     continue;
@@ -3512,7 +3529,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * of a slot bound to NV4097 (and the driver's) may go. */
                 if (wdiag) { static int live = -1;
                   if (live < 0) live = rsx_live_draw_enabled();
-                  if (live && gcm_feeds_3d_mirror(subch, m)) rsx_live_draw_method((subch << 13) | m, vm_read32(dea)); }
+                  if (live && gcm_feeds_3d_mirror(subch, m)) rsx_live_draw_method(gcm_mirror_method(subch, m), vm_read32(dea)); }
                 /* GCM_METHOD_HIST=<secs>: every <secs>, the most frequent
                  * (subchannel, method) pairs dispatched since the last report --
                  * what a frame is actually made of when nothing draws. */
@@ -3544,7 +3561,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * same reason the live engine does, and masks them itself. */
                 if (wdiag) { static int eng = -1;
                   if (eng < 0) eng = rsx_draw_engine_enabled();
-                  if (eng && gcm_feeds_3d_mirror(subch, m)) rsx_draw_engine_method((subch << 13) | m, vm_read32(dea)); }
+                  if (eng && gcm_feeds_3d_mirror(subch, m)) rsx_draw_engine_method(gcm_mirror_method(subch, m), vm_read32(dea)); }
 
                 /* RSX_LIVE_FEED_DBG=1: what the FIFO actually carries. Counted
                  * for any run, live engine or not, so the method stream and the
@@ -3565,7 +3582,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 /* No object bound: no class decodes the method, so the console drops the write
                  * (envytools fifo/nv_object.xml: the subchannel's object is what gives a method its
                  * meaning). The driver words below are the LV1's, not an engine's, so subchannel 7 is
-                 * left alone; a bind or an LV1 word is not dropped. */
+                 * left alone; a bind or an LV1 word is not dropped. Fail-closed: a word that is not one of
+                 * the driver's (gcm_driver_word) on an unbound slot 7 is not exempt here, it ends as unknown. */
                 if (m >= 0x100u && subch != 7 && s_subch_class[subch] == RSX_CLASS_UNBOUND) {
                     gcm_method_unbound(subch, m, mdata);
                     continue;

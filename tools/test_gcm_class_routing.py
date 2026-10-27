@@ -30,8 +30,11 @@ with tempfile.TemporaryDirectory(prefix='gcm-class-routing-') as tmp:
                     str(root / 'runtime/memory/label_window.c'),
                     str(video / 'gcm_default_state.c'), *linker,
                     '-o', str(binary)], check=True)
-    result = subprocess.run([str(binary)], timeout=60, capture_output=True, text=True)
-    print(result.stdout.strip())
-    if result.returncode:
-        print(result.stderr[-2000:])
-        raise SystemExit('test_gcm_class_routing failed')
+    # Engine on (every walker path with the per-word mirrors), then the engine off with no diagnostic: the
+    # 3D-run fast path is eligible.
+    for args in ([], ['fast']):
+        result = subprocess.run([str(binary), *args], timeout=60, capture_output=True, text=True)
+        print(result.stdout.strip())
+        if result.returncode:
+            print(result.stderr[-2000:])
+            raise SystemExit('test_gcm_class_routing failed')

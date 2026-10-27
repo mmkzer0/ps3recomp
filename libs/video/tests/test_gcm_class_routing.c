@@ -131,8 +131,9 @@ static u32 t_depth_create(void* u, u32 w, u32 h) { (void)u; (void)w; (void)h; re
 static void t_release(void* u, u32 s) { (void)u; (void)s; }
 static void t_clear_color(void* u, u32 s, const float rgba[4]) { (void)u; (void)s; (void)rgba; }
 static void t_clear_depth(void* u, u32 d, u32 flags, float dv, u8 st) { (void)u; (void)d; (void)flags; (void)dv; (void)st; }
+static void t_present(void* u, u32 s) { (void)u; (void)s; }
 
-int main(void)
+int main(int argc, char** argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
     const uint32_t vm_size = ppu_hle_inject_base + 0x10000u;
@@ -140,20 +141,39 @@ int main(void)
     if (!vm_base) { puts("FAIL: guest VM alloc"); return 1; }
     ppu_vm_size = vm_size;
 
+    /* "fast": no engine and no per-word diagnostic, so the walker's 3D-run fast path is eligible. */
+    const int fast = argc > 1 && !strcmp(argv[1], "fast");
+
     /* The engine comes up before the first pass: the walker caches whether it is on. */
     /* The register file is what is read back, so the backend only has to give the default state's CLEAR
      * (mask 0) targets to clear: handles, and calls that do nothing. */
     static rsx_draw_backend be = {
         .color_target_create = t_color_create, .depth_target_create = t_depth_create,
         .color_target_release = t_release, .depth_target_release = t_release,
-        .clear_color = t_clear_color, .clear_depth_stencil = t_clear_depth,
+        .clear_color = t_clear_color, .clear_depth_stencil = t_clear_depth, .present = t_present,
     };
-    rsx_draw_engine_set_backend(&be);
-    rsx_draw_engine_set_default(1);
-    if (rsx_draw_engine_init(64, 64) != 0) { puts("FAIL: engine init"); return 1; }
+    if (!fast) {
+        rsx_draw_engine_set_backend(&be);
+        rsx_draw_engine_set_default(1);
+        if (rsx_draw_engine_init(64, 64) != 0) { puts("FAIL: engine init"); return 1; }
+    }
     u32 ctx_out = host_alloc(4, 4);
     (void)cellGcmSetupContext(ctx_out, CMD_SIZE, IO_SIZE, IO_ADDR, host_alloc, host_w32);
     const uint32_t ctrl = (uint32_t)(uintptr_t)cellGcmGetControlRegister();
+
+    if (fast) {
+        /* NV4097 bound on slot 7, a run of one word on the fast path's terms: 0xE944 is the driver's flip
+         * queue word, not NV4097 method 0x0944 (a vertex-texture register). */
+        gcm_bind_object(7, RSX_OBJ_NV4097);
+        const unsigned long long q0 = gcm_driver_event_count(GCM_DRV_EVENT_QUEUE_FLIP);
+        pkt(7, 0x0944, 6u);
+        walk(ctrl);
+        check(gcm_driver_event_count(GCM_DRV_EVENT_QUEUE_FLIP) == q0 + 1u && s_drv_flip_queue == 6u && t_legacy_n == 0,
+              "NV4097 bound on slot 7, fast path eligible: 0xE944 is the driver's flip queue word");
+        printf("[gcm_class_routing fast] %s (%d failed)\n", t_fails ? "FAIL" : "PASS", t_fails);
+        free(vm_base);
+        return t_fails ? 1 : 0;
+    }
 
     /* 0. libgcm's own default-state stream, the one every flip CALLs, through the walker with the engine on:
      * every word classified (an unknown one is a named stop that ends this fixture), and its 2D traffic
@@ -289,6 +309,36 @@ int main(void)
     walk(ctrl);
     check(s_gcm2d.pitch == 0x33334444u && stats().unbound == s5.unbound,
           "...the bind takes effect, and the slot decodes afterwards");
+
+    /* 6. Slot 7 is the driver's: its full-address words (0xEB00/0xEB04, 0xE944, 0xE920/0xE924) are decoded
+     * before any class route, whatever object the slot carries, and any other word on it means what its
+     * bound class says, at its own method number. */
+    /* NV4097 bound on slot 7: BEGIN_END reaches the engine as 0x1808, not as 0xF808. */
+    gcm_bind_object(7, RSX_OBJ_NV4097);
+    pkt(7, 0x1808, RSX_PRIMITIVE_TRIANGLES);
+    walk(ctrl);
+    check(g.rsx.in_begin_end && reg(0x1808) == RSX_PRIMITIVE_TRIANGLES,
+          "NV4097 bound on slot 7: BEGIN_END reaches the engine's begin/end, not 0xF808");
+    pkt(7, 0x1808, 0u);
+    walk(ctrl);
+    check(!g.rsx.in_begin_end, "...and END closes it");
+    /* ...and the driver's flip queue word on that same slot still takes the driver's route. */
+    const unsigned long long q0 = gcm_driver_event_count(GCM_DRV_EVENT_QUEUE_FLIP);
+    pkt(7, 0x0944, 5u);
+    walk(ctrl);
+    check(gcm_driver_event_count(GCM_DRV_EVENT_QUEUE_FLIP) == q0 + 1u && s_drv_flip_queue == 5u,
+          "NV4097 bound on slot 7, per-word path: 0xE944 is the driver's flip queue word");
+    /* NV0039 bound on slot 7: the driver's words are not the M2MF's. */
+    gcm_bind_object(7, RSX_OBJ_NV0039);
+    const GcmMethodStats n0 = stats();
+    const unsigned long long h0 = gcm_driver_event_count(GCM_DRV_EVENT_FLIP_HEAD);
+    pkt(7, 0x0944, 2u);                              /* 0xE944: flip queue */
+    pkt(7, 0x0924, 0x8000010Fu);                     /* 0xE924 with bit 31: flip head */
+    walk(ctrl);
+    check(s_drv_flip_queue == 2u && gcm_driver_event_count(GCM_DRV_EVENT_FLIP_HEAD) == h0 + 1u &&
+          stats().unknown == n0.unknown,
+          "NV0039 bound on slot 7: 0xE944 and 0xE924 are the driver's, not unknown M2MF methods");
+    gcm_bind_object(7, RSX_OBJ_DRIVER);
 
     printf("[gcm_class_routing] %s (%d failed)\n", t_fails ? "FAIL" : "PASS", t_fails);
     rsx_draw_engine_shutdown();
