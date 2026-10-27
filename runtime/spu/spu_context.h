@@ -1084,7 +1084,9 @@ static inline void spu_pchist_tick(const spu_context* ctx)
  * PS3_SPU_DIRECT=0 = always the trampoline; the diagnostics that watch each
  * drain step (SPU_LOCKSTEP, SPU_STEPTRACE, SPURS_PM_FLOW, ...) turn it off
  * too (spu_drain.c). */
-extern volatile int g_spu_direct;                /* spu_drain.c: -1 unread, 0 off, 1 on */
+/* spu_drain.c: -1 unread, 0 off, 1 on. Read and published with relaxed __atomic builtins: SPU worker
+ * threads race on the first run, and the value guards nothing but itself. */
+extern int g_spu_direct;
 extern uint8_t g_spu_stack_reset_hint[1024];     /* spu_channels.c, by (entry >> 2) & 1023 */
 void spu_direct_init(void);
 #if defined(__clang__) && defined(__has_attribute)
@@ -1096,7 +1098,7 @@ void spu_direct_init(void);
 #define SPU_DIRECT(ctx, PC, FN) do {                                          \
         const uint32_t _dpc = (uint32_t)(PC);                                 \
         (ctx)->pc = _dpc;                                                     \
-        if (__builtin_expect(g_spu_direct > 0, 1) && (_dpc & SPU_LS_MASK) &&  \
+        if (__builtin_expect(__atomic_load_n(&g_spu_direct, __ATOMIC_RELAXED) > 0, 1) && (_dpc & SPU_LS_MASK) && \
             (ctx)->steps && !g_spu_stack_reset_hint[(_dpc >> 2) & 1023u] &&    \
             !((ctx)->int_enable && ((ctx)->event_status & (ctx)->event_mask))) \
             __attribute__((musttail)) return FN(ctx);                         \

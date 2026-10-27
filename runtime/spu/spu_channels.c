@@ -317,7 +317,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
      * an earlier run would be restored over this job's arguments. */
     { extern void spu_irq_regs_forget(spu_context*); spu_irq_regs_forget(ctx); }
     ctx->steps = 0;   /* fresh run: step 0 is the entry */
-    if (g_spu_direct < 0) spu_direct_init();   /* PS3_SPU_DIRECT, spu_context.h */
+    if (__atomic_load_n(&g_spu_direct, __ATOMIC_RELAXED) < 0) spu_direct_init();   /* PS3_SPU_DIRECT, spu_context.h */
     /* The host stack is empty here by definition, so no lifted caller frame
      * is live. A persistent context (a SPURS policy module re-entered every
      * scheduling quantum) otherwise carries the depth its last quantum
@@ -476,8 +476,10 @@ static mfc_engine* mfc_for(spu_context* ctx)
     /* Looked up once. mfc_for runs on every MFC channel access, and with
      * SPU_PCSAMPLE unset `started` never became 1, so every access paid a
      * getenv: a tenth of all samples in a Twisted Metal profile. */
+    /* The fast check is a relaxed atomic load: SPU worker threads race here, and a plain read beside
+     * InterlockedExchange's atomic write is a data race (TSan, jq2_exec_*). */
     { static volatile LONG checked = 0;
-      if (!checked && !InterlockedExchange(&checked, 1)) {
+      if (!__atomic_load_n(&checked, __ATOMIC_RELAXED) && !InterlockedExchange(&checked, 1)) {
           const char* e = getenv("SPU_PCSAMPLE");
           if (e) CreateThread(NULL, 0, spu_pcsample_thread, (LPVOID)(uintptr_t)(atoi(e) * 1000), 0, NULL);
       } }

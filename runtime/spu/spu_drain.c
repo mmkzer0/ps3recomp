@@ -120,10 +120,10 @@ SPU_DRAIN_INLINE void spu_task_launch_check_inline(spu_context* ctx, void* fn,
  * SPU_LOCKSTEP (the quantum tick), SPU_TAILRET (SPU_DRAIN's return check),
  * SPU_PCHIST, SPU_NO_LS0_END, SPU_EXITTRACE, SPU_STEPTRACE, SPU_JOBDRAIN and
  * SPURS_PM_FLOW. */
-volatile int g_spu_direct = -1;
+int g_spu_direct = -1;
 void spu_direct_init(void)
 {
-    if (g_spu_direct >= 0) return;
+    if (__atomic_load_n(&g_spu_direct, __ATOMIC_RELAXED) >= 0) return;
     static const char* const diag[] = {
         "SPU_LOCKSTEP", "SPU_TAILRET", "SPU_PCHIST", "SPU_NO_LS0_END", "SPU_EXITTRACE",
         "SPU_STEPTRACE", "SPU_JOBDRAIN", "SPURS_PM_FLOW",
@@ -138,8 +138,12 @@ void spu_direct_init(void)
 #ifndef SPU_DIRECT_TAILCALLS
     on = 0; why = "no musttail in this compiler";
 #endif
-    if (!on) fprintf(stderr, "[spu] direct tail calls off (%s)\n", why);
-    g_spu_direct = on;
+    /* SPU worker threads reach this concurrently on their first run. Each computes the same value from the
+     * same environment; one CAS elects the thread that publishes it and logs. The value guards nothing else,
+     * so relaxed ordering is enough (SPU_DIRECT reads it relaxed too). */
+    int unread = -1;
+    if (__atomic_compare_exchange_n(&g_spu_direct, &unread, on, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED) && !on)
+        fprintf(stderr, "[spu] direct tail calls off (%s)\n", why);
 }
 
 static void spu_job_ls0_note(const spu_context* ctx)
@@ -549,7 +553,7 @@ extern spu_drain_fn spu_lookup(uint32_t addr, int image_id);
 
 void spu_drain_call(spu_context* ctx, uint32_t return_pc)
 {
-    if (__builtin_expect(g_spu_direct < 0, 0)) spu_direct_init();
+    if (__builtin_expect(__atomic_load_n(&g_spu_direct, __ATOMIC_RELAXED) < 0, 0)) spu_direct_init();
     spu_depth_guard_check(ctx);
     /* On the way out, the enclosing drain's return pc is the innermost one
      * again. It used to be 0 until that drain's next step re-set it, and with

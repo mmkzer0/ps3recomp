@@ -847,7 +847,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         { uint32_t e = (uint32_t)ea;
           int hitregion = (e < 0x40005000u && e + size > 0x40003000u);
           int haspoison = 0;
-          static int s_poison_watch = -1;
+          static SPU_THREAD_LOCAL int s_poison_watch = -1;   /* lazy getenv cache: per thread, no race */
           /* SPU_POISON_DMA_WATCH=1 (any value): scan every PUT payload for the
            * poison word and also log PUTs that carry it outside the region.
            * Unset, only PUTs into the region are scanned (their lines are
