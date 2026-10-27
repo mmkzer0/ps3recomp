@@ -2,6 +2,7 @@
  * The waiter, guest PPU atomic primitive, and coherence dispatcher are real. */
 #undef pthread_cond_timedwait
 #include "../runtime/ppu/ppu_memory.h"
+#include "../runtime/memory/reservation.h"   /* resv_lwarx32/resv_stcx32: the guest PPU atomic primitive */
 #include "../runtime/spu/spu_coherency.h"
 #include "../runtime/spu/spu_workload.h"
 #include "../runtime/spu/spu_dma.h"
