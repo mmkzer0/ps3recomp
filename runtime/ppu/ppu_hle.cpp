@@ -157,8 +157,27 @@ extern "C" std::atomic<const char*> g_hle_inflight[PS3_HLE_INFLIGHT_MAX] = { nul
  * providers on the stopping thread, so this is that thread's last import. */
 static thread_local uint32_t    t_last_hle_nid  = 0;
 static thread_local const char* t_last_hle_name = "";
+
+/* The import handler this thread is inside, which t_last_hle_* cannot say: it stays set after the call returns.
+ * A guest-memory fault names the handler only if it is raised while this is set on the faulting context
+ * (ppu_null_page_stop); the entry context is kept so a guest callback the handler runs, which has a context of
+ * its own, is not taken for the handler's own host code. Saved and restored by value, so a handler that
+ * dispatches another import leaves the outer one intact. Not set for the hle_fast forms (a hot path of
+ * hundreds of thousands of calls a frame; a fault in one keeps the guest-function attribution), nor around
+ * the real-PRX bridge, which runs lifted guest code on the caller's own context. */
+static thread_local ps3_stop_handler t_hle_handler = {};
+struct HleHandlerScope {
+    const ps3_stop_handler prev;
+    HleHandlerScope(ppu_context* ctx, uint32_t nid, const char* name) : prev(t_hle_handler)
+    {
+        t_hle_handler = { ctx, (uint32_t)ctx->lr, nid, name };
+    }
+    ~HleHandlerScope() { t_hle_handler = prev; }
+};
+
 static void hle_stop_frontier(uint64_t, ps3_stop_frontier* out)
 {
+    out->in_hle = t_hle_handler;
     if (!t_last_hle_nid) return;
     out->has_hle  = 1;
     out->hle_nid  = t_last_hle_nid;
@@ -755,7 +774,7 @@ extern "C" void ps3_hle_dispatch(uint32_t nid, ppu_context* ctx)   /* C linkage:
             t_last_hle_name = g_ctx[i].name;
             { const unsigned t = ppu_tid_diag_index(ctx->thread_id);
               if (t && t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t].store(g_ctx[i].name, std::memory_order_relaxed); }
-            g_ctx[i].fn(ctx);
+            { HleHandlerScope in_handler(ctx, nid, g_ctx[i].name); g_ctx[i].fn(ctx); }
             { const unsigned t = ppu_tid_diag_index(ctx->thread_id);
               if (t && t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t].store(nullptr, std::memory_order_relaxed); }
             return;
@@ -806,7 +825,7 @@ extern "C" void ps3_hle_dispatch(uint32_t nid, ppu_context* ctx)   /* C linkage:
     }
     /* The registered adapter derives this handler's own declared type
      * (ppu_hle_adapt.hpp) and has already written r3/f1 per it. */
-    e->fn(ctx);
+    { HleHandlerScope in_handler(ctx, nid, e->name); e->fn(ctx); }
     /* PS3_HLE_PTRCHECK: the guest stores HLE return values as guest pointers, so
      * an HLE returning a value outside guest RAM (>= 0x10000000) that is not a
      * CELL_ERROR code (0x8001xxxx / 0x8002xxxx) is leaking a truncated HOST

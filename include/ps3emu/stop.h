@@ -284,12 +284,26 @@ PS3_NORETURN void ps3_stop_rsx_unknown_method(const char* cls, uint32_t method, 
  * The runtime already tracks this where it dispatches (the last HLE import,
  * the lv2 syscall a thread is inside); a stop does not trace anything itself,
  * it asks whoever owns that state. */
+/* A host-side handler (an lv2 syscall or an HLE import) the stopping thread is inside right now. Unlike
+ * has_hle, which stays set after the import returns, this is empty outside a handler. `ctx` is the
+ * ppu_context the handler was entered with, so a guest callback the handler runs (a fresh context) is told
+ * apart from the handler's own host code; `lr` is that context's link register at entry, the guest call
+ * site (lifted code keeps no guest pc). NULL `ctx` = not inside one. */
+typedef struct ps3_stop_handler {
+    const void* ctx;
+    uint32_t    lr;
+    uint32_t    id;            /* the import's NID, or the syscall number */
+    const char* name;          /* the import's name; NULL for a syscall or an unnamed import */
+} ps3_stop_handler;
+
 typedef struct ps3_stop_frontier {
     int         has_hle;       /* last_hle_nid / last_hle are valid */
     uint32_t    hle_nid;
     const char* hle_name;      /* may be NULL or "" when unnamed */
     int         has_syscall;   /* syscall_num is valid */
     uint32_t    syscall_num;
+    ps3_stop_handler in_hle;       /* the import handler this thread is inside */
+    ps3_stop_handler in_syscall;   /* the lv2 syscall handler this thread is inside */
 } ps3_stop_frontier;
 
 /* `thread_id` is the stopping thread's guest id when `site` was given, else 0.
@@ -300,6 +314,10 @@ typedef void (*ps3_stop_frontier_fn)(uint64_t thread_id, ps3_stop_frontier* out)
 /* Register a provider (idempotent per function, at most 8). Safe to call from
  * a static initialiser: the registry needs no prior setup. */
 void ps3_stop_register_frontier(ps3_stop_frontier_fn fn);
+
+/* Runs every registered provider for `thread_id` and returns what they filled, without stopping. A fault
+ * raised from a host-side handler asks this to name the handler before it builds its own stop. */
+void ps3_stop_query_frontier(uint64_t thread_id, ps3_stop_frontier* out);
 
 #ifdef __cplusplus
 }

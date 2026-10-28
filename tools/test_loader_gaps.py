@@ -47,9 +47,9 @@ ppu_loader.cpp against that lift, and runs tests/test_loader_gaps.cpp:
     of them running at once are two owners to an lwmutex: one that holds it blocks
     the other, and the other's trylock is EBUSY and its unlock EPERM;
   - a guest load or store into the null page stops (guest-null-access, with
-    access/width/ea/fn and the site) at every width, below 0x10000 for loads and
+    access/width/ea/fn/site=guest and the site) at every width, below 0x10000 for loads and
     0x1000 for stores; ppu.null_page = "drop" keeps the legacy log, dropped
-    stores and sweep containment.
+    stores and sweep containment. (A host-side handler's access is tools/test_stop_attribution.py.)
 
 A line "RETURNED" from the fixture means the runtime carried on; every case that
 must stop treats it as failure.
@@ -359,6 +359,7 @@ def main():
             assert (f['access'], f['width'], f['ea'], f['tid']) == (
                 access, width, '0x%08X' % int(ea, 16), '1'), (access, ea, width, f)
             assert hexfn.match(f['fn']) and int(f['pc'], 16) == int(f['fn'], 16) and f['lr'] == '0x10100', f
+            assert f['site'] == 'guest' and 'in_syscall' not in f and 'in_hle' not in f, f
             assert '[null-read]' not in p.stderr and '[null-write]' not in p.stderr, p.stderr
         # the first store of a sweep stops; nothing is dropped and carried on from
         f = g.expect_stop(run('nullsweep', '0'), 'guest-null-access')
