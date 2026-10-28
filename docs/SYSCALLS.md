@@ -32,6 +32,15 @@ The LV2 kernel provides system services to PS3 games through the `sc` (System Ca
 
 **Implementation files:** `runtime/syscalls/sys_*.c` and `runtime/syscalls/sys_*.h`
 
+The per-slot audit against the **FW 4.93 stock lv2_kernel (PUP)** table,
+corroborated by the LV2 dump FW 4.81 REBUG/Cobra, and RPCS3 at its pinned
+commit, is [LV2-SYSCALL-STATUS.md](LV2-SYSCALL-STATUS.md). A slot the stock
+kernel leaves on the shared ENOSYS stub, and that neither the toolkit nor
+RPCS3 implements, is answered `CELL_ENOSYS` (`0x80010003`) per call as that
+stub does, instead of stopping. A stock handler the toolkit does not implement
+still stops with `unimplemented-syscall`, as does a slot stock says is ENOSYS
+but RPCS3 binds.
+
 ### Platform Mapping
 
 | PS3 Concept | Windows Implementation | POSIX Implementation |

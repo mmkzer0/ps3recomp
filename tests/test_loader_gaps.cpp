@@ -46,6 +46,8 @@
  *                                       and one far past it (ppu.null_page=drop)
  *   test_loader_gaps sc988 <r3> <r4>    lv2 syscall 988 with live pointers in r5..r10: the
  *                                       answer, the registers and guest memory afterwards
+ *   test_loader_gaps scenosys <num> [n] a firmware-ENOSYS slot, called n times in this
+ *                                       process: the answer, registers and guest memory
  */
 #include "ppu_recomp.h"
 #include <atomic>
@@ -656,6 +658,31 @@ int main(int argc, char** argv)
         bool mem = true;
         for (uint32_t i = 0; i < 0x100; i++) mem = mem && vm_base[SENT + i] == 0xA5;
         std::printf("SC988 regs_intact=%d memory_intact=%d\n", (int)regs, (int)mem);
+    } else if (!std::strcmp(argv[1], "scenosys") && argc >= 3) {
+        /* A slot the FW 4.93 stock lv2_kernel leaves on the shared ENOSYS
+         * stub: every call answers 0x80010003, and no register but r3 and no
+         * guest byte changes. `n` calls in one process prove the PS3_SCTRACE
+         * note is once per slot, not once per call. */
+        const int repeat = argc > 3 ? std::atoi(argv[3]) : 1;
+        CHECK(repeat >= 1);
+        constexpr uint32_t SENT = 0x201000;
+        std::memset(vm_base + SENT, 0x5C, 0x100);
+        const uint64_t keep[7] = {SENT + 0x30, SENT + 0x28, 0x1234, SENT + 0x14,
+                                  0x99, 0x192D0000, 0x192C0000};
+        bool answer_ok = true;
+        for (int r = 0; r < repeat; r++) {
+            ctx.gpr[3] = 0xDEADBEEF;
+            for (int i = 0; i < 7; i++) ctx.gpr[4 + i] = keep[i];
+            ctx.gpr[11] = arg;
+            lv2_syscall(&ctx);
+            answer_ok = answer_ok && ctx.gpr[3] == 0xFFFFFFFF80010003ull;
+        }
+        bool regs = ctx.gpr[11] == arg;
+        for (int i = 0; i < 7; i++) regs = regs && ctx.gpr[4 + i] == keep[i];
+        bool mem = true;
+        for (uint32_t i = 0; i < 0x100; i++) mem = mem && vm_base[SENT + i] == 0x5C;
+        std::printf("SCENOSYS regs_intact=%d memory_intact=%d answers_ok=%d\n",
+                    (int)regs, (int)mem, (int)answer_ok);
     } else {
         return 2;
     }
