@@ -158,6 +158,14 @@ void ps3_stop_register_frontier(ps3_stop_frontier_fn fn)
     exit_stopped();
 }
 
+void ps3_stop_query_frontier(uint64_t thread_id, ps3_stop_frontier* out)
+{
+    for (auto& slot : g_providers) {
+        ps3_stop_frontier_fn fn = slot.load(std::memory_order_acquire);
+        if (fn) fn(thread_id, out);
+    }
+}
+
 void ps3_stop(ps3_stop_kind kind, const char* what, const char* remedy,
               const ps3_stop_field* fields, size_t nfields,
               const ps3_stop_site* site)
@@ -177,10 +185,7 @@ void ps3_stop(ps3_stop_kind kind, const char* what, const char* remedy,
     std::fflush(nullptr);
 
     ps3_stop_frontier fr = {};
-    for (auto& slot : g_providers) {
-        ps3_stop_frontier_fn fn = slot.load(std::memory_order_acquire);
-        if (fn) fn(site ? site->thread_id : 0, &fr);
-    }
+    ps3_stop_query_frontier(site ? site->thread_id : 0, &fr);
 
     if (!what || !*what) what = "(no description: this is a bug in the caller)";
     if (!remedy || !*remedy) remedy = "(none given: this is a bug in the caller)";

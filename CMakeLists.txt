@@ -778,7 +778,11 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME loader_gaps
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_loader_gaps.py")
-        set_tests_properties(hle_unresolved loader_gaps PROPERTIES LABELS "ppu;t0" TIMEOUT 300)
+        # A null-page stop raised by a host-side syscall or import handler names the handler, not a guest function.
+        add_test(NAME stop_attribution
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_stop_attribution.py")
+        set_tests_properties(hle_unresolved loader_gaps stop_attribution PROPERTIES LABELS "ppu;t0" TIMEOUT 300)
         # #70: the HLE's flip/vblank handler delivery against the firmware's OPD contract (dossier T1-T3), through
         # cellGcmSys.c's pump and the real ppu_guest_call: a good descriptor runs, a zeroed or swapped one is the
         # named stop unresolved-guest-callback, never a skip or a call.

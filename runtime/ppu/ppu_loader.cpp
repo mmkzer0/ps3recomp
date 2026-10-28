@@ -1195,18 +1195,63 @@ static bool ppu_null_page_drops()
     return drop;
 }
 
-/* `width` is in bytes. The site's pc is the entry of the guest function the
- * access came from (resolved from the host return address): lifted code keeps
- * no guest pc, and ctx->lr is only as fresh as the last call that set it. */
+/* A fault in a host-side handler's own code: the handler (lv2 syscall or HLE import) the faulting thread is
+ * inside, entered with the context the access runs under. A guest callback the handler runs has a context of
+ * its own (ppu_guest_call), so its faults do not match; a thread with no active guest context cannot be in
+ * a callback, so any handler it is inside owns the access. */
+static bool ppu_in_handler(const ps3_stop_handler& h)
+{
+    return h.ctx && (!g_active_ctx || h.ctx == g_active_ctx);
+}
+
+/* `width` is in bytes. A guest access's pc is the entry of the guest function it came from (resolved from
+ * the host return address): lifted code keeps no guest pc, and ctx->lr is only as fresh as the last call
+ * that set it.
+ *
+ * An access made by a host-side handler has no such function. `ra` is then a runtime address, and the
+ * nearest lifted function below it is unrelated code: the #83 stop named a function the title never entered.
+ * The stop names the handler instead, with the guest call site it was entered from (its link register: pc
+ * and lr are both that, as in unimplemented-syscall and unresolved-nid) and no `fn`. */
 [[noreturn]] static void ppu_null_page_stop(const char* access, uint32_t ea, int width, void* ra)
 {
-    const uint32_t fn = ppu_prof_resolve_host(ra);
-    char width_s[8], ea_s[16], fn_s[16];
+    char width_s[8], ea_s[16], fn_s[16], in_s[160], sc_s[16];
     snprintf(width_s, sizeof width_s, "%d", width);
     snprintf(ea_s, sizeof ea_s, "0x%08X", ea);
+
+    ps3_stop_frontier fr = {};
+    ps3_stop_query_frontier(g_active_ctx ? g_active_ctx->thread_id : 0, &fr);
+    const bool in_hle = ppu_in_handler(fr.in_hle), in_sc = ppu_in_handler(fr.in_syscall);
+
+    if (in_hle || in_sc) {
+        const ps3_stop_handler& h = in_hle ? fr.in_hle : fr.in_syscall;
+        ppu_context* hctx = (ppu_context*)h.ctx;
+        ps3_stop_field f[5] = { {"access", access}, {"width", width_s}, {"ea", ea_s}, {"site", "host-handler"} };
+        size_t nf = 4;
+        if (in_sc) {
+            snprintf(sc_s, sizeof sc_s, "%u", fr.in_syscall.id);
+            f[nf++] = { "in_syscall", sc_s };
+        }
+        if (in_hle) {
+            snprintf(in_s, sizeof in_s, "%s/0x%08X", fr.in_hle.name && *fr.in_hle.name ? fr.in_hle.name : "unnamed",
+                     fr.in_hle.id);
+            f[nf++] = { "in_hle", in_s };
+        }
+        ps3_stop_site site = { h.lr, h.lr, hctx->thread_id };
+        ppu_dump_guest_stack(hctx, "null-access");
+        ps3_stop(PS3_STOP_GUEST_NULL_ACCESS, "a host-side handler reached the unmapped null page",
+                 "A syscall or import handler dereferenced a null (or near-null) guest address. 'in_syscall' or "
+                 "'in_hle' names the handler and 'lr' the guest call site that entered it. Find which pointer "
+                 "was null: an argument of that call, or one the handler read from guest state. Where the "
+                 "firmware tests it, the handler must return the firmware's own error; where the firmware "
+                 "stores or loads through it untested, the console faults as well. A title that must run past "
+                 "it sets ppu.null_page = \"drop\" in its config, with the reason written next to it.",
+                 f, nf, &site);
+    }
+
+    const uint32_t fn = ppu_prof_resolve_host(ra);
     snprintf(fn_s, sizeof fn_s, "0x%08X", fn);
     ps3_stop_field f[] = {
-        {"access", access}, {"width", width_s}, {"ea", ea_s}, {"fn", fn_s},
+        {"access", access}, {"width", width_s}, {"ea", ea_s}, {"fn", fn_s}, {"site", "guest"},
     };
     ps3_stop_site site = { fn, g_active_ctx ? g_active_ctx->lr : 0u,
                            g_active_ctx ? g_active_ctx->thread_id : 0u };
@@ -1218,7 +1263,7 @@ static bool ppu_null_page_drops()
              "Find the pointer that is null in the function 'fn' (its caller allocated or "
              "initialised nothing). A title that must run past it sets ppu.null_page = \"drop\" "
              "in its config, with the reason written next to it.",
-             f, 4, &site);
+             f, 5, &site);
 }
 
 static int vm_null_store_report(uint32_t a, uint32_t v, int width, void* ra)
@@ -2975,8 +3020,13 @@ extern "C" uint32_t g_sc_inflight[PS3_SC_INFLIGHT_MAX] = { 0 };
 
 /* A stop names the lv2 syscall the stopping thread is inside, from the table
  * above rather than a tracer of its own. */
+static PPU_THREAD_LOCAL ps3_stop_handler t_sc_handler = {};
 static void sc_stop_frontier(uint64_t thread_id, ps3_stop_frontier* out)
 {
+    /* The syscall handler this thread is inside, with the context it was entered with:
+     * ppu_null_page_stop uses it to tell a host handler's own fault from a guest callback's. Restored by
+     * value on exit, so a syscall a guest callback makes inside another leaves the outer one intact. */
+    out->in_syscall = t_sc_handler;
     const unsigned t = ppu_tid_diag_index(thread_id);
     if (!t || t >= PS3_SC_INFLIGHT_MAX || !g_sc_inflight[t]) return;
     out->has_syscall = 1;
@@ -3017,18 +3067,20 @@ extern "C" void lv2_syscall(ppu_context* ctx)
     /* It also closes the PS3_FTRACE span: how long this thread sat in the
      * syscall, and at which guest call site (lr at entry). */
     struct _ScGuard {
-        ppu_context* c; uint64_t num, t0; uint32_t lr;
+        ppu_context* c; uint64_t num, t0; uint32_t lr; ps3_stop_handler prev;
         ~_ScGuard() { const unsigned t = ppu_tid_diag_index(c->thread_id);
                       if (t && t < PS3_SC_INFLIGHT_MAX) g_sc_inflight[t] = 0;
+                      t_sc_handler = prev;
                       if (PS3_FT_ON() && t0) {
                           const uint64_t t1 = ps3_ft_now();
                           if (num == 141) ps3_ft_usleep(t, lr, t0, t1);   /* sys_timer_usleep */
                           else if (t1 - t0 >= ps3_ft_min_ns())
                               ps3_ft_span(PS3_FT_SYSCALL, t, (uint32_t)num, lr, t0, t1);
                       } }
-    } _sg{ ctx, num, PS3_FT_ON() ? ps3_ft_now() : 0, (uint32_t)ctx->lr };
+    } _sg{ ctx, num, PS3_FT_ON() ? ps3_ft_now() : 0, (uint32_t)ctx->lr, t_sc_handler };
     { const unsigned t = ppu_tid_diag_index(ctx->thread_id);
       if (t && t < PS3_SC_INFLIGHT_MAX) g_sc_inflight[t] = (uint32_t)num; }
+    t_sc_handler = { ctx, (uint32_t)ctx->lr, (uint32_t)num, nullptr };
     /* Guest-PC breadcrumb for the sampling profiler: record the syscall
      * callsite (lr) in the runtime-side thread info. cia itself is the thread
      * entry OPD (load-bearing for the entry trampoline) -- do not touch it. */
