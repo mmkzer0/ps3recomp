@@ -14,12 +14,14 @@
  * on the polling thread, in order; the call returns only after the completion
  * was consumed; a wait no poll serves ends at the counted cap with success and
  * the events are drained later, in order; destroying the context ends the
- * delivery; a vblank counter that never ticks is the named stop gcm-wait-timeout.
+ * delivery; sceNpTrophyAbortHandle makes the call return ABORT, before it, from
+ * the inline callback or while it waits; a vblank counter that never ticks is
+ * the named stop gcm-wait-timeout.
  *
  * The guest is a synthetic callback and the vblank counter a stub the test
  * advances, so no case sleeps to order events. Run with a case name ("status0",
  * "abort", "paced", "short", "interleave", "drain", "samethread", "destroy",
- * "threads", "novblank", "guards") to run one.
+ * "threads", "novblank", "guards", "aborthandle") to run one.
  */
 #undef NDEBUG
 #include <stdio.h>
@@ -43,9 +45,24 @@ void spu_lockline_unlock(void) {}
 void cellMsgDialog_tick(void) {}
 void np_psnr_pump(void) {}
 void ps3_np_eula_tick(void) {}
+/* In a forked child (case aborthandle) a named stop ends the process with the
+ * stop's exit status and a one-line machine report, as the real ps3_stop does;
+ * anywhere else a stop is a failure. */
+static int g_stop_child;
 void ps3_stop(ps3_stop_kind k, const char* w, const char* r,
               const ps3_stop_field* f, size_t n, const ps3_stop_site* s)
-{ (void)k; (void)w; (void)r; (void)f; (void)n; (void)s; abort(); }
+{
+    (void)w; (void)r; (void)s;
+    if (g_stop_child) {
+        fprintf(stderr, "PS3STOP v=1 kind=%s",
+                k == PS3_STOP_NP_TROPHY_UNMODELLED ? "np-trophy-unmodelled" : "other");
+        for (size_t i = 0; i < n; i++) fprintf(stderr, " %s=%s", f[i].key, f[i].value);
+        fputc('\n', stderr);
+        fflush(stderr);
+        _exit(PS3_STOP_EXIT_CODE);
+    }
+    abort();
+}
 
 /* The vblank counter. g_vb_auto > 0 makes every read advance it, for a thread
  * that waits with nobody ticking. */
@@ -92,6 +109,7 @@ static _Atomic unsigned g_nlog;
 static _Atomic int g_in_cb, g_max_in_cb;
 static unsigned g_max_pending;
 static s32 g_sync_ret;               /* what the callback returns for status 1..4 */
+static void (*g_inline_hook)(void);  /* run in the inline (first) status callback */
 
 /* The title's mailbox. valid is the byte the registration thread clears. */
 static struct { _Atomic int valid; u32 status, completed, total; } g_mbox;
@@ -115,6 +133,8 @@ static u64 guest_dispatch(u32 opd, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4,
     atomic_store(&g_mbox.valid, 1);
     atomic_fetch_sub(&g_in_cb, 1);
     atomic_store(&g_nlog, i + 1);
+    /* A guest that calls into the library from its first, inline callback. */
+    if (a1 <= SCE_NP_TROPHY_STATUS_REQUIRES_UPDATE && g_inline_hook) g_inline_hook();
     /* The processing statuses' return value is discarded by the firmware: a
      * guest that returns negative there must not stop the lifecycle. */
     return a1 >= SCE_NP_TROPHY_STATUS_PROCESSING_SETUP ? (u64)(s64)-1 : (u64)(s64)g_sync_ret;
@@ -517,6 +537,145 @@ static void case_destroy(void)
     store_remove("NPWR00006");
 }
 
+/* sceNpTrophyAbortHandle (FW 4.93 libsysutil_np_trophy 0x020014C4; the VSH's
+ * abort handler 0x001909DC marks the handle):
+ *  - before RegisterContext, or from its inline callback (before round trip 2):
+ *    the registration fails with ABORT (0x80022910). PROVEN: the 'i' handler
+ *    0x001902A4 looks the handle up (0x00190360), its error path 0x001905C8
+ *    stores 0x80022910, the library returns it (0x02003F00, 0x020019CC); RPCS3
+ *    sceNpTrophyRegisterContext re-checks the handle after statusCb (:647-653)
+ *    and agrees;
+ *  - while the call waits: the VSH cancel step 0x0018E22C wakes it and clears the
+ *    mark; what the woken call returns is not determined (the install engine's
+ *    result, 0x001905BC), so it is the named stop np-trophy-unmodelled, checked
+ *    in a forked child that must exit with the stop's status.
+ * Nothing is delivered after a failed call returns, the context stays
+ * unregistered, and a mark left by an abort that found nothing in flight stays
+ * until the handle is destroyed. */
+static void hook_abort_handle(void) { assert(sceNpTrophyAbortHandle(1) == CELL_OK); }
+/* A call that does not return the answer the case expects would wait on a
+ * vblank nobody ticks and end in the gcm-wait-timeout stop, which on the main
+ * thread ends the process with status 0; so the calls that must return at once
+ * run on a registration thread, whose stop the case sees as `!done`. */
+static s32 register_returns(void)
+{
+    atomic_store(&g_gcm_timeout_ms, 200);
+    Reg r; reg_start(&r);
+    reg_join(&r);
+    assert(!atomic_load(&g_stopped) && atomic_load(&r.done));
+    return r.rc;
+}
+/* Until the registration thread is inside the wait: it has named its handle
+ * under the lock, which is what an AbortHandle looks for. wait_started only
+ * says it owns its lifecycle, a moment before. */
+static void wait_waiting(void)
+{
+    wait_started();
+    for (unsigned i = 0; ; i++) {
+        assert(i < 50000000u);
+        life_lock();
+        const int waiting = s_contexts[1].life_wait_handle != 0;
+        life_unlock();
+        if (waiting) return;
+        sched_yield();
+    }
+}
+
+/* The forked child: a registration thread waits, the abort arrives, and the
+ * wait must end in the stop. The thread is detached because a process-ending
+ * stop leaves it unjoined (TSan would call that a leak and exit 134). The order
+ * is the library's own: the abort runs once the thread owns its lifecycle and
+ * has seen seven statuses delivered; no sleep orders anything. Falling off the
+ * loop means no stop came. */
+static void child_abort_blocked(void)
+{
+    g_stop_child = 1;
+    begin("NPWR00013");
+    Reg r; reg_start(&r);
+    assert(pthread_detach(r.th) == 0);
+    wait_waiting();
+    frames_until_log(7);
+    assert(sceNpTrophyAbortHandle(1) == CELL_OK);
+    for (unsigned i = 0; i < 50000000u; i++) sched_yield();
+    _exit(1);
+}
+static void expect_abort_stop(void)
+{
+    int fds[2];
+    assert(pipe(fds) == 0);
+    fflush(stdout); fflush(stderr);
+    const pid_t pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        close(fds[0]);
+        dup2(fds[1], STDERR_FILENO);
+        child_abort_blocked();
+    }
+    close(fds[1]);
+    char out[2048]; size_t len = 0; ssize_t got;
+    while (len < sizeof out - 1 && (got = read(fds[0], out + len, sizeof out - 1 - len)) > 0)
+        len += (size_t)got;
+    out[len] = 0;
+    close(fds[0]);
+    int status = 0;
+    assert(waitpid(pid, &status, 0) == pid);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == PS3_STOP_EXIT_CODE);
+    assert(strstr(out, "PS3STOP v=1 kind=np-trophy-unmodelled") != NULL);
+    assert(strstr(out, " func=sceNpTrophyRegisterContext") != NULL);
+    assert(strstr(out, " handle=1") != NULL && strstr(out, " context=1") != NULL);
+    assert(strstr(out, " reason=abort-during-registration") != NULL);
+}
+
+static void case_aborthandle(void)
+{
+    store_remove("NPWR00013");
+    begin("NPWR00013");
+    assert(sceNpTrophyAbortHandle(1) == CELL_OK);
+    assert(register_returns() == (s32)SCE_NP_TROPHY_ERROR_ABORT);
+    assert(atomic_load(&g_nlog) == 0);                    /* not even the inline callback */
+    assert(!s_contexts[1].registered && !store_exists("NPWR00013"));
+    /* The mark stays: the handle is unusable until destroyed, and destroying works. */
+    assert(sceNpTrophyAbortHandle(1) == (s32)SCE_NP_TROPHY_ERROR_ABORT);
+    assert(sceNpTrophyDestroyHandle(1) == CELL_OK);
+    assert(sceNpTrophyCreateHandle((void*)0x204) == CELL_OK);
+    end();
+
+    begin("NPWR00013");
+    g_inline_hook = hook_abort_handle;
+    assert(register_returns() == (s32)SCE_NP_TROPHY_ERROR_ABORT);
+    g_inline_hook = NULL;
+    assert(atomic_load(&g_nlog) == 1);                    /* the inline status only */
+    assert(!s_contexts[1].registered && !store_exists("NPWR00013"));   /* nothing installed */
+    for (int i = 0; i < 100; i++) { atomic_fetch_add(&g_vblank, 100); assert(poll_once() == 0); }
+    end();
+
+    /* An abort of another handle while a registration waits: the VSH marks it,
+     * signals its object (nobody sleeps there) and clears the mark (0x0018E290).
+     * The wait goes on, and the handle is left unmarked: a second abort is
+     * not ABORT. */
+    begin("NPWR00013");
+    assert(sceNpTrophyCreateHandle((void*)0x20C) == CELL_OK);          /* handle 2 */
+    Reg r; reg_start(&r);
+    wait_waiting();
+    frames_until_log(7);
+    assert(sceNpTrophyAbortHandle(2) == CELL_OK);
+    assert(sceNpTrophyAbortHandle(2) == CELL_OK);
+    life_lock();
+    assert(!s_handles[2].aborted && !s_handles[1].aborted && !s_contexts[1].life_abort_hit);
+    life_unlock();
+    assert(!atomic_load(&r.done));
+    assert(atomic_load(&g_nlog) == 7);                                 /* it still waits on its statuses */
+    assert(sceNpTrophyDestroyContext(1) == CELL_OK);                   /* ends the wait */
+    reg_join(&r);
+    assert(r.rc == (s32)SCE_NP_TROPHY_ERROR_UNKNOWN_CONTEXT);
+    end();
+    store_remove("NPWR00013");
+
+    /* An abort of the waiting handle: the named stop. */
+    expect_abort_stop();
+    store_remove("NPWR00013");
+}
+
 /* Several threads polling at once still see one status at a time, in order. */
 static _Atomic int g_stop_pollers;
 static void* poller_main(void* p)
@@ -597,6 +756,7 @@ int main(int argc, char** argv)
         {"short", case_short}, {"interleave", case_interleave}, {"drain", case_drain},
         {"samethread", case_samethread}, {"destroy", case_destroy},
         {"threads", case_threads}, {"novblank", case_novblank}, {"guards", case_guards},
+        {"aborthandle", case_aborthandle},
     };
     strcpy(g_root, "/tmp/ps3recomp-trophy-XXXXXX");
     assert(mkdtemp(g_root));

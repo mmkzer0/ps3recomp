@@ -129,7 +129,9 @@ extern "C" {
     /* A host path an HLE handler builds does not fit its buffer; a cut path names another directory. */ \
     X(HOST_PATH_LIMIT,          "host-path-limit")                                                         \
     /* S1: a FIFO method no class consumes and no allow-list entry cites. */                               \
-    X(RSX_UNKNOWN_METHOD,       "rsx-unknown-method")
+    X(RSX_UNKNOWN_METHOD,       "rsx-unknown-method")                                                      \
+    /* A sceNpTrophy situation whose console result the firmware does not determine (an abort that wakes a registration). */ \
+    X(NP_TROPHY_UNMODELLED,     "np-trophy-unmodelled")
 
 /* A fixed underlying type in C++ makes a kind outside the list (a caller's bug,
  * which the stop still reports as "invalid-kind") a well-defined value rather
