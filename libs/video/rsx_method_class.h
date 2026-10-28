@@ -495,10 +495,11 @@ static const rsx_method_rule rsx_method_rules[] = {
             "nv308a.cpp color::impl) and stops on a height above one row"),
     HANDLED(RSX_CLASS_NV308A, 0x030C, 1, RSX_EV_CONSUMER, "NV308A_SIZE_IN",
             "gcm_2d_method: s_gcm2d.size_in. RPCS3 stores it and nothing reads it (nv308a_size_in_x is "
-            "defined, never called); here only its height is read, by the same one-row stop as SIZE_OUT's"),
+            "defined, never called); here it is read to stop on a height above one row and on a width that is "
+            "not SIZE_OUT's (`nv308a-size-mismatch`), both outside what the oracle covers"),
     HANDLED(RSX_CLASS_NV308A, 0x0400, 0x700, RSX_EV_CONSUMER, "NV308A_COLOR[0:0x6FF]",
-            "cellGcmSys.c gcm_nv308a_color: the inline transfer itself, one word per pixel, up to 0x700 words "
-            "per packet (RPCS3 bind_array(NV308A_COLOR, 1, 256 * 7))"),
+            "cellGcmSys.c gcm_nv308a_color: the inline transfer itself, one word per pixel. 0x0400..0x1FFC is "
+            "the COLOR method window (RPCS3 bind_array(NV308A_COLOR, 1, 256 * 7)), not a measured maximum row"),
 
 /* ---- NV309E context surface swizzled -------------------------------------------------------- */
     HANDLED(RSX_CLASS_NV309E, 0x0000, 1, RSX_EV_CONSUMER, "NV309E_SET_OBJECT",

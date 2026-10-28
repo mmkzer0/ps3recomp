@@ -130,6 +130,8 @@ static struct {
 static unsigned s_mc_logged, s_miss_logged;
 
 static void gcm_2d_state_log(u32 subch, u32 method, u32 data);   /* the 2D engines' registers, defined with them */
+static void gcm_stop_fifo_dump(const char* why, u32 hdr_io, u32 stop_io, void (*state_fn)(char*, size_t));
+static void gcm_2d_state(char* out, size_t n);
 
 /* `handled` says a consumer took the method. Otherwise the (class, method) pair is looked up in the
  * table (rsx_method_class.h): INERT when the write carries the value the row pins, MISSING when the
@@ -180,6 +182,9 @@ static void gcm_method_verdict(u32 subch, u32 m, u32 data, int handled, u32 fifo
     if (s_cap) s_cap->note(RSX_CAP_NOTE_UNKNOWN_METHOD, subch, m, data);
     /* A stop inside an inline transfer carries the transfer's state: one run must say what the packet was. */
     if (cls == RSX_CLASS_NV3062 || cls == RSX_CLASS_NV308A) gcm_2d_state_log(subch, m, data);
+    /* The window of FIFO words around the stop word, for the analysis the run cannot be repeated for. */
+    gcm_stop_fifo_dump("rsx-unknown-method", fifo, word,
+                       (cls == RSX_CLASS_NV3062 || cls == RSX_CLASS_NV308A) ? gcm_2d_state : NULL);
     ps3_stop_rsx_unknown_method(rsx_class_name(cls), m, subch, fifo, word, data);
 }
 
@@ -1554,6 +1559,105 @@ static int gcm_span_ok(u64 ea, u64 size)
     return size && ea + size <= gcm_vm_limit();
 }
 
+/* ---------------------------------------------------------------------------
+ * The FIFO window of a stop (diagnostics only: no state of the walker or the engines changes)
+ *
+ * A stop on a command inside a long packet is hard to analyse after the fact: the words that built it live
+ * in a ring the guest keeps overwriting. Before an `rsx-unknown-method` stop and before an NV308A envelope
+ * stop, the raw words from max(stop word - 64 words, IO offset 0) up to min(PUT, stop word + 2048 words)
+ * are written to `$TMPDIR/rsx-stop-fifo.txt` (`/tmp` without TMPDIR; stderr, line by line, if the file
+ * cannot be written): IO offset, guest EA, the word, and for a header word the decoded header, for a data
+ * word the method and class it belongs to. A path is only a place for a diagnostic file, so TMPDIR is read
+ * as such and changes no behaviour. The IO offset 0 start is the start of the IO-mapped command window,
+ * which is where the title's first segment begins.
+ *
+ * The words are read as the walker reads them: gcm_io2ea, then the same 32-bit guest read, after a bound
+ * against guest memory (gcm_span_ok). The window ends at the first word the IO table does not map. Words
+ * before the stop's packet are framed from the window start and can be mis-framed (a ring has no framing
+ * marks); the packet header (`hdr_io`) re-synchronises the decode, so everything from there is exact.
+ * ---------------------------------------------------------------------------*/
+#define GCM_STOP_FIFO_BEFORE 64u
+#define GCM_STOP_FIFO_AFTER  2048u
+typedef void (*gcm_state_fn)(char* out, size_t n);
+
+/* The words of the packet the 2D paths are interpreting (set by the walker before it dispatches a 2D word),
+ * for a stop raised deep inside a transfer. */
+static u32 s_2d_hdr_io, s_2d_word_io;
+
+static void gcm_stop_fifo_dump(const char* why, u32 hdr_io, u32 stop_io, gcm_state_fn state_fn)
+{
+    const u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
+    const u32 lo = stop_io >= GCM_STOP_FIFO_BEFORE * 4u ? stop_io - GCM_STOP_FIFO_BEFORE * 4u : 0u;
+    u64 hi = (u64)stop_io + 4u + (u64)GCM_STOP_FIFO_AFTER * 4u;
+    if (put > stop_io && put < hi) hi = put;          /* behind the stop (a wrapped ring): the 2048 words stand */
+
+    char path[1024];
+    FILE* f = NULL;
+    const char* tmp = getenv("TMPDIR");
+    if (!tmp || !*tmp) tmp = "/tmp";
+    const int pn = snprintf(path, sizeof path, "%s/rsx-stop-fifo.txt", tmp);
+    if (pn > 0 && (size_t)pn < sizeof path) f = fopen(path, "w");
+    FILE* out = f ? f : stderr;
+    const char* pre = f ? "" : "[rsx-stop-fifo] ";
+
+    char state[640];
+    state[0] = 0;
+    if (state_fn) state_fn(state, sizeof state);
+    fprintf(out, "%sstop %s: stop word io=0x%08X in the packet at io=0x%08X, put=0x%08X, get=0x%08X\n", pre, why,
+            stop_io, hdr_io, put, s_fifo_getoff);
+    fprintf(out, "%swindow io=0x%08X..0x%08X (max(stop - 64 words, 0) .. min(put, stop + 2048 words))\n", pre, lo,
+            (u32)hi);
+    if (state[0]) fprintf(out, "%sstate %s\n", pre, state);
+
+    u32 rem = 0, m = 0, subch = 0, idx = 0, cnt = 0, words = 0;
+    int inc = 0;
+    u32 last = lo;
+    for (u64 io64 = lo; io64 < hi; io64 += 4) {
+        const u32 io = (u32)io64;
+        const u32 ea = gcm_io2ea(io);
+        if (!ea || !gcm_span_ok(ea, 4)) {
+            fprintf(out, "%sio=0x%08X: not mapped, the window ends here\n", pre, io);
+            break;
+        }
+        const u32 w = vm_read32(ea);
+        const char* mark = io == stop_io ? "   <-- stop word" : "";
+        if (io == hdr_io) rem = 0;
+        words++;
+        last = io;
+        if (rem) {
+            const u32 dm = inc ? m + idx * 4u : m;
+            fprintf(out, "%sio=0x%08X ea=0x%08X w=0x%08X    data %u/%u of sub%u %s method=0x%04X%s\n", pre, io, ea, w,
+                    idx + 1, cnt, subch, rsx_class_name(gcm_method_class(subch, dm)), dm, mark);
+            idx++; rem--;
+            continue;
+        }
+        const u32 type = w >> 29;
+        if (w == 0u) {
+            fprintf(out, "%sio=0x%08X ea=0x%08X w=0x%08X    NOP%s\n", pre, io, ea, w, mark);
+        } else if (w == 0x00020000u) {
+            fprintf(out, "%sio=0x%08X ea=0x%08X w=0x%08X    RET%s\n", pre, io, ea, w, mark);
+        } else if ((w & 0xFFFF0000u) == 0xFEAD0000u) {
+            fprintf(out, "%sio=0x%08X ea=0x%08X w=0x%08X    FLIP marker%s\n", pre, io, ea, w, mark);
+        } else if (type == 1 || (w & 3u) == 1u) {
+            fprintf(out, "%sio=0x%08X ea=0x%08X w=0x%08X    JUMP target=0x%08X%s\n", pre, io, ea, w, w & 0x1FFFFFFCu, mark);
+        } else if ((w & 3u) == 2u) {
+            fprintf(out, "%sio=0x%08X ea=0x%08X w=0x%08X    CALL target=0x%08X%s\n", pre, io, ea, w, w & 0x1FFFFFFCu, mark);
+        } else if (type == 0 || type == 2) {
+            cnt = (w >> 18) & 0x7FFu; m = w & 0x1FFCu; subch = (w >> 13) & 7u; inc = type == 0;
+            idx = 0; rem = cnt;
+            fprintf(out, "%sio=0x%08X ea=0x%08X w=0x%08X    METHOD %s count=%u subch=%u method=0x%04X (%s)%s\n", pre, io,
+                    ea, w, inc ? "incrementing" : "non-incrementing", cnt, subch, m,
+                    rsx_class_name(gcm_method_class(subch, m)), mark);
+        } else {
+            fprintf(out, "%sio=0x%08X ea=0x%08X w=0x%08X    unknown header (type %u)%s\n", pre, io, ea, w, type, mark);
+        }
+    }
+    fprintf(out, "%s%u words, io=0x%08X..0x%08X\n", pre, words, lo, last);
+    if (f) fclose(f);
+    fprintf(stderr, "[rsx-stop-fifo] %u words around the stop word io=0x%08X (put 0x%08X) written to %s\n", words, stop_io,
+            put, f ? path : "stderr (above)");
+}
+
 /* cellGcmSetWaitFlip (NID 0x983FB9AA, libgcm_sys 0x02001180) and cellGcmSetWaitFlipUnsafe (NID 0xDF6476BD,
  * 0x02001228; OPD 0x0200B93C): the firmware never waits on the CPU. It appends two method pairs to the
  * caller's command context and advances `current` by 16:
@@ -1811,8 +1915,8 @@ static u32 gcm_m2mf_location(u32 dma, const char* which)
 
 /* A guest-range stop. `state_fn`, when given, formats the transfer state of the engine that asked (the
  * NV308A path): it goes into the stop's `arg` value and onto its own log line, so one stop line carries the
- * packet state a second run would otherwise have to reproduce. It runs only on the way to the stop. */
-typedef void (*gcm_state_fn)(char* out, size_t n);
+ * packet state a second run would otherwise have to reproduce. The FIFO window around the word goes to
+ * the stop-window file as well. It runs only on the way to the stop. */
 static PS3_NORETURN void gcm_range_stop(const char* func, const char* which, gcm_state_fn state_fn, u64 ea, u64 size, u64 limit)
 {
     char arg[704], state[640];
@@ -1820,6 +1924,7 @@ static PS3_NORETURN void gcm_range_stop(const char* func, const char* which, gcm
         state_fn(state, sizeof state);
         fprintf(stderr, "[%s] range stop %s ea=0x%llX size=0x%llX limit=0x%llX | %s\n", func, which,
                 (unsigned long long)ea, (unsigned long long)size, (unsigned long long)limit, state);
+        gcm_stop_fifo_dump(which, s_2d_hdr_io, s_2d_word_io, state_fn);
         snprintf(arg, sizeof arg, "%s %s", which, state);
         which = arg;
     }
@@ -2163,9 +2268,10 @@ static void nv3089_blit(void)
 /* ---------------------------------------------------------------------------
  * NV308A image-from-CPU: the inline transfer (cellGcmSetInlineTransfer and friends)
  *
- * A COLOR word (method 0x0400..0x1FFC, one word per pixel) is written into the NV3062 destination. The
- * array is 0x700 words: 0x0400 + 0x700 * 4 is the end of the 13-bit method field, so one packet can carry
- * up to 0x700 of them. Evidence is RPCS3 d00d8023 Emu/RSX/NV47/HW/nv308a.cpp `color::impl`, rsx_methods.cpp:1723
+ * A COLOR word (method 0x0400..0x1FFC, one word per pixel) is written into the NV3062 destination. That range
+ * is the COLOR method window: RPCS3 binds 0x700 methods there and so does the walker. It is a fact of the
+ * method numbering the oracle uses, not a measured maximum row length. Evidence is RPCS3 d00d8023
+ * Emu/RSX/NV47/HW/nv308a.cpp `color::impl`, rsx_methods.cpp:1723
  * (`bind_array(NV308A_COLOR, 1, 256 * 7, ...)`) and rsx_methods.h:1137-1160/1247-1264, which this follows:
  *   - the word at index i of a packet lands at x = POINT.x + i, y = POINT.y;
  *   - a word whose index is at or beyond SIZE_OUT.x is dropped (SIZE_OUT.y and SIZE_IN are stored and read
@@ -2187,8 +2293,17 @@ static void nv3089_blit(void)
  *     swizzle path; only NV3089 reads NV309E);
  *   - a SIZE_OUT or SIZE_IN taller than one row: the hardware wraps the words onto the next row, RPCS3
  *     keeps them on POINT.y and drops the rest of the packet; the two disagree, so neither is chosen;
+ *   - a SIZE_IN width that is not SIZE_OUT's: RPCS3 reads only SIZE_OUT.x, what the console does with the
+ *     difference is unmeasured;
  *   - a DMA object other than local/main, a format RPCS3 cannot reach, and a destination word outside
  *     the RSX offset space, the local memory or the IO mapping.
+ * Every gcm-unmodelled stop above says it awaits hardware evidence (#63 stage B).
+ * The store goes out through gcm_row_store, the store path the NV0039 and NV3089 copies use: it kills an
+ * SPU reservation on the 128-byte lines it overwrites and raises the lost-reservation event. The walker
+ * runs the method in order on its own thread, so the bytes are in guest memory before any later method of
+ * the same FIFO executes; a following NV406E RELEASE (which fences, then stores the label) therefore
+ * publishes them. RPCS3 treats a one-word transfer as a possible sync primitive and, in strict mode,
+ * synchronises the GPU there; this walker has nothing asynchronous to synchronise with the guest memory.
  * The R5G6B5 store is big-endian like every guest 16-bit value; RPCS3 writes a host-endian u16 there
  * (`vm::_ptr<u16>`), which [INFERENCE] is a byte-order slip and not the console's behaviour. The channel
  * conversion is a truncation (r>>3, g>>2, b>>3): it equals RPCS3's (c * 32) / 255 for every c below 255,
@@ -2230,12 +2345,15 @@ static void gcm_2d_state_log(u32 subch, u32 method, u32 data)
     fprintf(stderr, "[nv308a] unknown method: %s\n", st);
 }
 
+/* Every NV308A stop outside the envelope RPCS3 covers is a stop on purpose: what the console does there
+ * is not in the oracle and not yet measured (#63 stage B, the hardware matrix), and the reason says so. */
 static PS3_NORETURN void gcm_nv308a_stop(const char* feature, const char* why)
 {
-    char st[640], reason[1024];
+    char st[640], reason[1152];
     gcm_2d_state(st, sizeof st);
-    fprintf(stderr, "[nv308a] stop %s: %s | %s\n", feature, why, st);
-    snprintf(reason, sizeof reason, "%s | %s", why, st);
+    fprintf(stderr, "[nv308a] stop %s: %s (awaits hardware evidence, #63 stage B) | %s\n", feature, why, st);
+    gcm_stop_fifo_dump(feature, s_2d_hdr_io, s_2d_word_io, gcm_2d_state);
+    snprintf(reason, sizeof reason, "%s (awaits hardware evidence, #63 stage B) | %s", why, st);
     ps3_stop_gcm_unmodelled(GCM_2D_FN, feature, reason);
 }
 
@@ -2247,7 +2365,7 @@ static void gcm_nv308a_color(u32 subch, u32 method, u32 data)
     s_gcm2d.words++;
     s_gcm2d.words_total++;
 
-    char why[192];
+    char why[320];
     if (s_gcm2d.operation != GCM_2D_OP_SRCCOPY) {
         snprintf(why, sizeof why, "NV308A OPERATION is %u; only SRCCOPY (3) is modelled", s_gcm2d.operation);
         gcm_nv308a_stop("nv308a-operation", why);
@@ -2263,6 +2381,12 @@ static void gcm_nv308a_color(u32 subch, u32 method, u32 data)
                  s_gcm2d.size_out & 0xFFFFu, s_gcm2d.size_out >> 16, s_gcm2d.size_in & 0xFFFFu,
                  s_gcm2d.size_in >> 16);
         gcm_nv308a_stop("nv308a-rows", why);
+    }
+    if ((s_gcm2d.size_in & 0xFFFFu) != (s_gcm2d.size_out & 0xFFFFu)) {
+        snprintf(why, sizeof why, "SIZE_IN width %u differs from SIZE_OUT width %u: only the clipping RPCS3 applies "
+                 "to a packet longer than SIZE_OUT is modelled, not a source/destination width mismatch",
+                 s_gcm2d.size_in & 0xFFFFu, s_gcm2d.size_out & 0xFFFFu);
+        gcm_nv308a_stop("nv308a-size-mismatch", why);
     }
     u32 bpp;
     switch (s_gcm2d.color_fmt) {
@@ -3890,6 +4014,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     handled = gcm_3d_method(&s_state, m, vm_read32(dea), legacy_state_live);
                 } else if (cls == RSX_CLASS_NV3062 || cls == RSX_CLASS_NV308A ||
                            cls == RSX_CLASS_NV309E || cls == RSX_CLASS_NV3089) {
+                    s_2d_hdr_io = s_fifo_getoff;                 /* where a stop inside this word reads its FIFO window */
+                    s_2d_word_io = s_fifo_getoff + 4 + i * 4;
                     handled = gcm_2d_method(subch, cls, m, vm_read32(dea)) || m == 0;
                 } else {
                     /* The driver object and a handle this table does not know decode no method but the
