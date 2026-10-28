@@ -566,6 +566,10 @@ The implementation reads raw bytes from guest memory (`vm_base + buf_addr`) and 
 
 **Why this matters:** The PS3 CRT prints diagnostic messages via `sys_tty_write` during initialization. Without this syscall, CRT error messages (like "not enough memory to initialize mutex") are silently lost, making debugging much harder.
 
+### Syscall 988 (0x3DC) is not a TTY call
+
+`runtime/syscalls/sys_dbg.c`. An SDK exit path issues it as `(r3, r4) = (1, 0)` with the other argument registers stale and discards the result, so a TTY writer reading `r4` as a buffer faulted on the null page. The handler takes no guest pointer and writes no guest memory. Contract (lv2 kernel dump FW 4.81 REBUG/Cobra, handler `0x8000000000277688`, assumed identical on stock firmware; RPCS3 `d00d80231af3f9b0286f38fd72f7513583f1a9d4` `lv2.cpp:961` binds the slot to `null_func` and agrees only on the success path): `r3` is a kind id of 1, 2, 4, 8 or 16 and `r4` a flag word that must be 0, each judged on its low 32 bits; anything else is `CELL_EINVAL`, otherwise `CELL_OK`. The firmware's `CELL_ESRCH` for an unresolvable calling process cannot occur here.
+
 ---
 
 ## Memory Layout

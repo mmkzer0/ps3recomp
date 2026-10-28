@@ -44,6 +44,8 @@
  *                                       first byte of memory afterwards
  *   test_loader_gaps nullsweep 0        a null-page store, one 0x1000 above it
  *                                       and one far past it (ppu.null_page=drop)
+ *   test_loader_gaps sc988 <r3> <r4>    lv2 syscall 988 with live pointers in r5..r10: the
+ *                                       answer, the registers and guest memory afterwards
  */
 #include "ppu_recomp.h"
 #include <atomic>
@@ -82,7 +84,16 @@ DWORD GetFileAttributesA(const char*) { return INVALID_FILE_ATTRIBUTES; }
 uint64_t ppu_thread_register_main(void) { return 1; }
 void (*g_ppu_thread_entry_trampoline)(uint32_t, uint64_t, uint32_t, uint64_t);
 uint32_t ps3_hle_count(void) { return 1; }
-int lv2_try_syscall(ppu_context*) { return 0; }   // no syscall is implemented here
+// The real table is lv2_register.c's. Its header cannot be included next to the lift's own ppu_context, so this
+// stand-in routes the one number under test to its handler (sys_dbg.c) and leaves every other number unimplemented;
+// as in the real lv2_try_syscall, a handler's result goes to r3.
+int64_t sys_dbg_988(ppu_context* ctx);
+int lv2_try_syscall(ppu_context* ctx)
+{
+    if ((uint32_t)ctx->gpr[11] != 988) return 0;
+    ctx->gpr[3] = (uint64_t)sys_dbg_988(ctx);
+    return 1;
+}
 // The syscall dispatcher's other collaborators; the gap paths below never reach them.
 void ppu_gcm_pump(void) {}
 void ppu_prof_stamp(void*, unsigned) {}
@@ -627,6 +638,24 @@ int main(int argc, char** argv)
         vm_write32(0x1010, 0x5A5A5A5Au);
         vm_write32(0x3000, 0x5A5A5A5Au);
         std::printf("SWEEP 10=%02X 1010=%02X 3000=%02X\n", vm_base[0x10], vm_base[0x1010], vm_base[0x3000]);
+    } else if (!std::strcmp(argv[1], "sc988") && argc == 4) {
+        /* lv2 syscall 988 with (r3, r4) = (<arg>, <argv[3]>) and r5..r10 as a caller
+         * leaves them, here pointers into live memory. The handler takes no pointer:
+         * no byte of guest memory may be read or written (a TTY writer reading r4 = 0
+         * as a buffer is a null-page stop) and no register but r3 may change. */
+        constexpr uint32_t SENT = 0x200000;
+        std::memset(vm_base + SENT, 0xA5, 0x100);
+        const uint64_t keep[7] = {std::strtoull(argv[3], nullptr, 0), SENT + 0x38, 0x77, SENT + 0x2C,
+                                  0x10, 0x192D0000, 0x192C0000};
+        ctx.gpr[3] = arg;
+        for (int i = 0; i < 7; i++) ctx.gpr[4 + i] = keep[i];
+        ctx.gpr[11] = 988;
+        lv2_syscall(&ctx);
+        bool regs = ctx.gpr[11] == 988;
+        for (int i = 0; i < 7; i++) regs = regs && ctx.gpr[4 + i] == keep[i];
+        bool mem = true;
+        for (uint32_t i = 0; i < 0x100; i++) mem = mem && vm_base[SENT + i] == 0xA5;
+        std::printf("SC988 regs_intact=%d memory_intact=%d\n", (int)regs, (int)mem);
     } else {
         return 2;
     }

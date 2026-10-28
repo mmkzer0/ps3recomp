@@ -7,6 +7,8 @@ ppu_loader.cpp against that lift, and runs tests/test_loader_gaps.cpp:
 
   - an lv2 syscall nobody implements: stop unimplemented-syscall, naming the
     number; allow-listed in [[lv2.stub]], it returns exactly the configured value;
+  - lv2 syscall 988 is the table's handler (kind id and flag, firmware contract),
+    not an inline TTY write: it reads no guest memory and changes only r3;
   - a call into a function the lift does not contain: unlifted-function, naming
     its address and the caller;
   - an indirect call to no function: unresolved-indirect-call at the first hit;
@@ -109,11 +111,15 @@ def main():
                        check=True, capture_output=True)
         flags = ['-Wl,-dead_strip'] if sys.platform == 'darwin' else ['-Wl,--gc-sections', '-pthread', '-ldl']
         binary = tmp / 'gaps'
+        # The handler under test is C11 (atomic_flag): an object, like the loader's other C dependencies.
+        sys_dbg_obj = tmp / 'sys_dbg.o'
+        subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-c', '-I' + str(ROOT / 'include'),
+                        str(ROOT / 'runtime/syscalls/sys_dbg.c'), '-o', str(sys_dbg_obj)], check=True)
         subprocess.run([os.environ.get('CXX', 'c++'), '-std=c++20', '-O1', '-w', '-ffunction-sections',
                         '-fdata-sections', '-I' + str(lift), '-I' + str(ROOT / 'include'),
                         '-I' + str(ROOT / 'runtime/ppu'), '-I' + str(ROOT / 'runtime/platform'),
                         str(ROOT / 'runtime/ppu/ppu_loader.cpp'), str(ROOT / 'tests/test_loader_gaps.cpp'),
-                        str(ROOT / 'runtime/syscalls/sys_lwsync.cpp'),
+                        str(ROOT / 'runtime/syscalls/sys_lwsync.cpp'), str(sys_dbg_obj),
                         str(lift / 'ppu_recomp.cpp'), *loader_support_sources(), *lifter_abi_sources(), *loader_support_objects(tmp),
                         *flags, '-o', str(binary)],
                        check=True, timeout=300)
@@ -211,6 +217,25 @@ def main():
         assert p.returncode == 0 and 'RETURNED r3=0xFFFFFFFF80010003' in p.stdout, (p.stdout, p.stderr)
         assert 'ALLOW-LISTED unimplemented syscall 999' in p.stderr and 'synthetic test gap' in p.stderr
         g.expect_stop(run('syscall', '998', cfg=cfg), 'unimplemented-syscall')   # only the listed number
+
+        # Syscall 988 is not sys_tty_write: with r4 = 0 and r5 pointing into live memory it
+        # reads no buffer. Contract from the lv2 handler (sys_dbg.c): kind ids 1, 2, 4, 8 and
+        # 16 with a zero flag answer CELL_OK, anything else CELL_EINVAL, judged on the low
+        # words; no register but r3 and no guest byte changes, nothing is printed.
+        EINVAL = 'RETURNED r3=0xFFFFFFFF80010002'
+        for r3, r4, want in [('1', '0', 'RETURNED r3=0x0'), ('4', '0', 'RETURNED r3=0x0'),
+                             ('2', '0', 'RETURNED r3=0x0'), ('8', '0', 'RETURNED r3=0x0'),
+                             ('16', '0', 'RETURNED r3=0x0'),
+                             ('0x100000001', '0', 'RETURNED r3=0x0'),       # id is the low word
+                             ('1', '0x100000000', 'RETURNED r3=0x0'),       # so is the flag
+                             ('0', '0', EINVAL), ('3', '0', EINVAL), ('12', '0', EINVAL),
+                             ('17', '0', EINVAL), ('0xFFFFFFFF', '0', EINVAL),
+                             ('1', '1', EINVAL), ('4', '0x80000000', EINVAL)]:
+            p = run('sc988', r3, r4)
+            where = (r3, r4, p.returncode, p.stdout, p.stderr)
+            assert p.returncode == 0 and 'PS3STOP' not in p.stdout + p.stderr, where
+            assert p.stdout.splitlines() == ['SC988 regs_intact=1 memory_intact=1', want], where
+            assert p.stderr == '', where
 
         # call into a function this lift does not contain
         p = run('unlifted', '0x12340')
