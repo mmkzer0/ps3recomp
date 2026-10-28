@@ -91,6 +91,14 @@ typedef struct {
     int                      life_complete_seen;
     u32                      life_complete_v;
     u64                      life_complete_poll;
+    /* The RegisterContext call blocked in trophy_run_lifecycle on this
+     * context names this handle (0: none) and owns lifecycle serial
+     * life_wait_serial, so a call that was superseded does not clear the
+     * newer one's entry; abort_hit is set by an AbortHandle that woke it.
+     * All under s_life_lock. */
+    s32                      life_wait_handle;
+    u64                      life_wait_serial;
+    int                      life_abort_hit;
 } TrophyContext;
 
 /* aborted is guarded by s_life_lock (see "Handle abort" below); in_use keeps
@@ -470,13 +478,23 @@ static void life_quiesce_locked(void)
  * trophy_handle_t::is_aborted and get_context_ex() answers ABORT from it, the
  * same, except that RPCS3's second AbortHandle answers CELL_OK.
  *
- * Open, not modelled (dossier ABORT-HANDLE.md O1, O2): the VSH cancel step
- * 0x0018E22C, which clears the flag and signals the handle's wait object when
- * a VSH session word is non-zero, is reached only while one of the short
- * session-holding requests is in flight; and what the VSH answers a
- * RegisterContext it interrupts is not shown by the firmware. The wait of
- * trophy_run_lifecycle answers ABORT, the VSH's own code for an aborted handle:
- * INFERRED, not observed.
+ * Proven by the VSH walk (dossier ABORT-HANDLE.md 3.3, 3.4): an abort before
+ * RegisterContext's second round trip (tag 'i', handler 0x001902A4: lookup
+ * 0x0018DC94 at 0x00190360, error path 0x001905C8 storing 0x80022910 at
+ * 0x001905D8) answers ABORT, and the library returns that result as is
+ * (0x02003F00, 0x020019C4..0x020019CC). An abort while the call waits in that
+ * round trip runs the cancel step 0x0018E22C: the session is held then, so it
+ * signals the handle's object (0x0018E288), which the 'i' handler sleeps on,
+ * and clears the byte again (0x0018E290), so the handle is not left marked.
+ * What the woken call returns is NOT determined: nothing re-checks the byte
+ * after the wake and the result is the install engine's return value
+ * (0x00190598..0x001905BC, callee 0x00172CAC), which could be ABORT through
+ * the mapper at 0x0018F6DC or CELL_OK. The toolkit does not invent it: the
+ * woken wait is the named stop np-trophy-unmodelled. The slot-299 status event
+ * the handler posts itself after the wake (0x0018F1EC) is not delivered: the
+ * stop comes first. The cancel step's other trigger, a short session-holding
+ * request in flight (CreateHandle and friends), is not modelled: those calls
+ * hold no session here.
  *
  * The flag is read by threads other than the one that sets it (a registration
  * thread blocked in RegisterContext), so it lives under s_life_lock.
@@ -578,16 +596,52 @@ static void trophy_poll(void)
     life_unlock();
 }
 
+/* Lock held. The waiting RegisterContext of lifecycle `serial` leaves its
+ * wait; a newer call on the same context keeps its own entry. */
+static void life_leave_wait_locked(TrophyContext* c, u64 serial)
+{
+    if (c->life_wait_serial == serial) {
+        c->life_wait_handle = 0;
+        c->life_wait_serial = 0;
+    }
+}
+
+/* The abort woke a RegisterContext that was waiting: the VSH cancel step
+ * signalled the object the registration sleeps on (0x0018E288) and the result
+ * the call then returns is the install engine's (0x001905BC), which the
+ * firmware does not show. Never reached with s_life_lock held. */
+static PS3_NORETURN void trophy_stop_abort_during_registration(s32 context,
+                                                                SceNpTrophyHandle handle)
+{
+    char h[16], c[16];
+    snprintf(h, sizeof h, "%d", handle);
+    snprintf(c, sizeof c, "%d", context);
+    const ps3_stop_field f[] = {
+        { "func", "sceNpTrophyRegisterContext" },
+        { "handle", h },
+        { "context", c },
+        { "reason", "abort-during-registration" },
+    };
+    ps3_stop(PS3_STOP_NP_TROPHY_UNMODELLED,
+             "sceNpTrophyAbortHandle woke a sceNpTrophyRegisterContext that was waiting for the VSH's install, and what the firmware then returns to that call is not determined",
+             "Do not abort a handle while its registration runs, or decode the VSH install engine's result (vsh 0x001905BC) and model it.",
+             f, sizeof f / sizeof f[0], NULL);
+}
+
 /* The wait of sceNpTrophyRegisterContext: until the completion has been
  * consumed and one step has passed, or the cap. Returns CELL_OK, ABORT when
- * the handle was aborted meanwhile, or the error of a context that was
- * destroyed or re-registered meanwhile. */
+ * the handle was already marked as the wait began, or the error of a context
+ * that was destroyed or re-registered meanwhile. An AbortHandle that arrives
+ * while it waits is the named stop (see "Handle abort"). */
 static s32 trophy_run_lifecycle(s32 context, SceNpTrophyHandle handle, u64 serial)
 {
     TrophyContext* c = &s_contexts[context];
     const u32 cap = ps3_cfg_trophy_register_wait_cap_vblanks();
     const u32 gcm_timeout_ms = ps3_cfg_gcm_wait_timeout_ms();
     life_lock();
+    c->life_wait_handle = handle;
+    c->life_wait_serial = serial;
+    c->life_abort_hit = 0;
     const u32 events = life_event_count(c->total_trophies);
     const u32 step = life_step_vblanks(events);
     const u32 start_vb = cellGcmGetVBlankCount();
@@ -597,16 +651,25 @@ static s32 trophy_run_lifecycle(s32 context, SceNpTrophyHandle handle, u64 seria
         if (c->life_serial != serial) {
             const s32 rc = c->in_use ? (s32)SCE_NP_TROPHY_ERROR_PROCESSING_ABORTED
                                      : (s32)SCE_NP_TROPHY_ERROR_UNKNOWN_CONTEXT;
+            life_leave_wait_locked(c, serial);
             life_unlock();
             return rc;
         }
-        /* AbortHandle during the wait. The registration fails: as the firmware
-         * does on any failure (0x02001B10..0x02001B4C zeroes the context's
-         * callback and argument), the lifecycle ends and no status runs after
-         * the call returns. The answer is INFERRED (see "Handle abort"). */
+        if (c->life_abort_hit) {
+            life_leave_wait_locked(c, serial);
+            c->life_abort_hit = 0;
+            life_unlock();
+            trophy_stop_abort_during_registration(context, handle);
+        }
+        /* The handle was marked before the wait began: the request of round
+         * trip 2 meets the mark (VSH 0x00190360) and answers ABORT. The
+         * registration fails as the firmware does on any failure
+         * (0x02001B10..0x02001B4C zeroes the context's callback and argument):
+         * the lifecycle ends and no status runs after the call returns. */
         if (s_handles[handle].in_use && s_handles[handle].aborted) {
             life_cancel_locked(c);
             c->registered = 0;
+            life_leave_wait_locked(c, serial);
             life_quiesce_locked();
             life_unlock();
             return (s32)SCE_NP_TROPHY_ERROR_ABORT;
@@ -619,6 +682,7 @@ static s32 trophy_run_lifecycle(s32 context, SceNpTrophyHandle handle, u64 seria
         if ((u32)(vb - start_vb) >= cap) {
             s_register_wait_caps++;
             const u32 posted = c->life_posted, delivered = c->life_delivered;
+            life_leave_wait_locked(c, serial);
             life_unlock();
             printf("[sceNpTrophy] register-wait-cap ctx=%d posted=%u consumed=%u events=%u "
                    "waited_vblanks=%u cap=%u: returning success, a later poll delivers the rest\n",
@@ -636,6 +700,7 @@ static s32 trophy_run_lifecycle(s32 context, SceNpTrophyHandle handle, u64 seria
         }
         life_wait(TROPHY_WAIT_SLICE_US);
     }
+    life_leave_wait_locked(c, serial);
     life_unlock();
     return CELL_OK;
 }
@@ -826,7 +891,19 @@ s32 sceNpTrophyAbortHandle(SceNpTrophyHandle handle)
         life_unlock();
         return SCE_NP_TROPHY_ERROR_ABORT;
     }
-    s_handles[handle].aborted = 1;       /* VSH 0x00190A2C */
+    /* VSH 0x00190A2C marks, then the cancel step 0x0018E22C runs: with a
+     * session in flight (here: a RegisterContext waiting) it signals the
+     * handle's object and clears the mark again (0x0018E290), else the mark
+     * stays. A woken registration is the named stop (see "Handle abort"). */
+    int inflight = 0;
+    for (s32 i = 1; i <= SCE_NP_TROPHY_MAX_CONTEXTS; i++)
+        if (s_contexts[i].life_wait_handle) inflight = 1;
+    if (inflight) {
+        for (s32 i = 1; i <= SCE_NP_TROPHY_MAX_CONTEXTS; i++)
+            if (s_contexts[i].life_wait_handle == handle) s_contexts[i].life_abort_hit = 1;
+    } else {
+        s_handles[handle].aborted = 1;
+    }
     life_wake();                         /* a registration thread re-reads it */
     life_unlock();
     printf("[sceNpTrophy] AbortHandle(handle=%d)\n", handle);
@@ -912,7 +989,7 @@ s32 sceNpTrophyRegisterContext(SceNpTrophyContext context,
      * 0x8002290A / 0x80022911. */
     if (!s_contexts[context].in_use) return SCE_NP_TROPHY_ERROR_UNKNOWN_CONTEXT;
     if (!s_handles[handle].in_use) return SCE_NP_TROPHY_ERROR_UNKNOWN_HANDLE;
-    /* ... and AbortHandle called from the callback (RPCS3 :653-659, "such as
+    /* ... and AbortHandle called from the callback (RPCS3 :647-653, "such as
      * if AbortHandle was called"). The registration did not complete. */
     {
         const s32 arc = trophy_handle_abort_rc(handle);
