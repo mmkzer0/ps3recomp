@@ -776,7 +776,14 @@ s32 cellRescCreateInterlaceTable(void* buf, float ea, u32 tableLen, s32 depth)
  * quad is rewritten when the vertex buffer is set and the configuration is progressive. */
 s32 cellRescAdjustAspectRatio(float horizontal, float vertical)
 {
-    printf("[cellResc] AdjustAspectRatio(h=%.2f, v=%.2f)\n", horizontal, vertical);
+    /* Titles call this every frame with unchanged values; logging each call buried every other
+     * line of a session log. Log only a changed request (per thread: diagnostic state only). */
+    { static _Thread_local float last_h = -1.0f, last_v = -1.0f;
+      if (horizontal != last_h || vertical != last_v) {
+          printf("[cellResc] AdjustAspectRatio(h=%.2f, v=%.2f)\n", horizontal, vertical);
+          last_h = horizontal;
+          last_v = vertical;
+      } }
 
     if (!s_initialized)
         return (s32)CELL_RESC_ERROR_NOT_INITIALIZED;
