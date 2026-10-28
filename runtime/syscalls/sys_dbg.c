@@ -7,9 +7,9 @@
  * page. The same SDK's real console write is syscall 403, issued a few
  * instructions after another 988 in one function: two different calls.
  *
- * Contract. Evidence order per AGENTS.md; the firmware tier is an lv2 kernel
- * dump of FW 4.81 REBUG/Cobra (not stock 4.93; the handler carries no Cobra
- * redirection, so stock is assumed identical), handler at lv2 VA
+ * Contract. Evidence order per AGENTS.md; the firmware tier is FW 4.93 stock
+ * lv2_kernel (from the official PUP): handler at the same VA as in the 4.81
+ * REBUG/Cobra dump, 88 instructions identical. It is the handler at lv2 VA
  * 0x8000000000277688 in the syscall array next to 402/403's, where the
  * unimplemented slots point at the shared ENOSYS stub 0x800000000026D2A0.
  * The handler takes no guest pointer and stores nothing to guest memory on
