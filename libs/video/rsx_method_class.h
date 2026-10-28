@@ -231,18 +231,16 @@ static const rsx_method_rule rsx_method_rules[] = {
             "rsx_draw_engine.c build_render_state: rs->s_write_mask (the front stencil write mask)"),
     HANDLED(RSX_CLASS_NV4097, 0x0348, 1, RSX_EV_CONSUMER, "NV4097_SET_TWO_SIDED_STENCIL_TEST_ENABLE",
             "rsx_draw_engine.c build_render_state: rs->stencil_two_sided"),
-    MISSING(RSX_CLASS_NV4097, 0x034C, 1, "NV4097_SET_BACK_STENCIL_MASK",
-            "S2: the back-face stencil write mask. The engine reads the front mask only; Metal's stencil "
-            "descriptor has per-face masks, so the fix is to carry the back three through "
-            "rsx_be_render_state's stencil fields"),
+    HANDLED(RSX_CLASS_NV4097, 0x034C, 1, RSX_EV_CONSUMER, "NV4097_SET_BACK_STENCIL_MASK",
+            "rsx_draw_engine.c build_render_state: rs->bs_write_mask (the back-face stencil write mask "
+            "under two-sided stencil)"),
     HANDLED(RSX_CLASS_NV4097, 0x0350, 1, RSX_EV_CONSUMER, "NV4097_SET_BACK_STENCIL_FUNC",
             "rsx_draw_engine.c build_render_state: rs->bs_func"),
-    MISSING(RSX_CLASS_NV4097, 0x0354, 1, "NV4097_SET_BACK_STENCIL_FUNC_REF",
-            "S2: with two-sided stencil the back faces compare against this reference; the engine passes one "
-            "reference (front) to the encoder. Metal shares the reference value between faces, so a "
-            "two-sided state that needs a different back reference cannot be expressed without emulation"),
-    MISSING(RSX_CLASS_NV4097, 0x0358, 1, "NV4097_SET_BACK_STENCIL_FUNC_MASK",
-            "S2: back-face compare mask, same row as 0x0354 (front mask is read, back is not)"),
+    HANDLED(RSX_CLASS_NV4097, 0x0354, 1, RSX_EV_CONSUMER, "NV4097_SET_BACK_STENCIL_FUNC_REF",
+            "rsx_draw_engine.c, the per-draw set_stencil_ref(front, back) under two-sided stencil; Metal "
+            "takes per-face references (setStencilFrontReferenceValue:backReferenceValue:)"),
+    HANDLED(RSX_CLASS_NV4097, 0x0358, 1, RSX_EV_CONSUMER, "NV4097_SET_BACK_STENCIL_FUNC_MASK",
+            "rsx_draw_engine.c build_render_state: rs->bs_func_mask (the back-face compare mask)"),
     HANDLED(RSX_CLASS_NV4097, 0x035C, 3, RSX_EV_CONSUMER, "NV4097_SET_BACK_STENCIL_OP_*",
             "rsx_draw_engine.c build_render_state: rs->bs_fail/bs_zfail/bs_zpass"),
     INERT_V(RSX_CLASS_NV4097, 0x0368, 1, 0x1D01, 0xFFFF, RSX_EV_ORACLE_VALUE, "NV4097_SET_SHADE_MODE",

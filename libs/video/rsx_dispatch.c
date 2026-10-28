@@ -138,7 +138,7 @@
 #define M_STENCIL_TEST_ENABLE   0x0328
 #define M_STENCIL_MASK          0x032C
 #define M_TWO_SIDED_STENCIL     0x0348
-#define M_BACK_STENCIL_FUNC     0x0350
+#define M_BACK_STENCIL_MASK     0x034C
 #define M_BACK_STENCIL_OPS      0x035C
 #define M_BLEND_ENABLE_MRT      0x036C
 #define M_DEPTH_BOUNDS_ENABLE   0x0380
@@ -225,7 +225,7 @@ static void dsp_fill_classes(dsp_class_table* t)
     mark_class(t, M_STENCIL_TEST_ENABLE, 8, RSX_DSP_CLASS_STATE);
     mark_class(t, M_STENCIL_MASK,        1, RSX_DSP_CLASS_STATE);
     mark_class(t, M_TWO_SIDED_STENCIL,   1, RSX_DSP_CLASS_STATE);
-    mark_class(t, M_BACK_STENCIL_FUNC,   1, RSX_DSP_CLASS_STATE);
+    mark_class(t, M_BACK_STENCIL_MASK,   4, RSX_DSP_CLASS_STATE); /* MASK, FUNC, FUNC_REF, FUNC_MASK */
     mark_class(t, M_BACK_STENCIL_OPS,    3, RSX_DSP_CLASS_STATE); /* FAIL, ZFAIL, ZPASS */
     mark_class(t, M_BLEND_ENABLE_MRT,    1, RSX_DSP_CLASS_STATE);
     mark_class(t, M_DEPTH_BOUNDS_ENABLE, 3, RSX_DSP_CLASS_STATE); /* ENABLE, MIN, MAX */

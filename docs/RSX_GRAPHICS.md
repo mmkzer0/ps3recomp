@@ -581,10 +581,10 @@ method, like the header.
 | NV4097 | 0x031C | `NV4097_SET_BLEND_COLOR` | missing | missing | S2: the constant blend colour. The engine builds every blend from the factors and equation  and never binds a constant colour, so a draw whose factor ... |
 | NV4097 | 0x032C | `NV4097_SET_STENCIL_MASK` | handled | consumer | rsx_draw_engine.c build_render_state: rs->s_write_mask (the front stencil write mask) |
 | NV4097 | 0x0348 | `NV4097_SET_TWO_SIDED_STENCIL_TEST_ENABLE` | handled | consumer | rsx_draw_engine.c build_render_state: rs->stencil_two_sided |
-| NV4097 | 0x034C | `NV4097_SET_BACK_STENCIL_MASK` | missing | missing | S2: the back-face stencil write mask. The engine reads the front mask only; Metal's stencil  descriptor has per-face masks, so the fix is to carry ... |
+| NV4097 | 0x034C | `NV4097_SET_BACK_STENCIL_MASK` | handled | consumer | rsx_draw_engine.c build_render_state: rs->bs_write_mask (the back-face stencil write mask under two-sided stencil) |
 | NV4097 | 0x0350 | `NV4097_SET_BACK_STENCIL_FUNC` | handled | consumer | rsx_draw_engine.c build_render_state: rs->bs_func |
-| NV4097 | 0x0354 | `NV4097_SET_BACK_STENCIL_FUNC_REF` | missing | missing | S2: with two-sided stencil the back faces compare against this reference; the engine passes one  reference (front) to the encoder. Metal shares the ... |
-| NV4097 | 0x0358 | `NV4097_SET_BACK_STENCIL_FUNC_MASK` | missing | missing | S2: back-face compare mask, same row as 0x0354 (front mask is read, back is not) |
+| NV4097 | 0x0354 | `NV4097_SET_BACK_STENCIL_FUNC_REF` | handled | consumer | rsx_draw_engine.c, the per-draw set_stencil_ref(front, back) under two-sided stencil; Metal takes per-face references (setStencilFrontReferenceValue:backReferenceValue:) |
+| NV4097 | 0x0358 | `NV4097_SET_BACK_STENCIL_FUNC_MASK` | handled | consumer | rsx_draw_engine.c build_render_state: rs->bs_func_mask (the back-face compare mask) |
 | NV4097 | 0x035C+2 | `NV4097_SET_BACK_STENCIL_OP_*` | handled | consumer | rsx_draw_engine.c build_render_state: rs->bs_fail/bs_zfail/bs_zpass |
 | NV4097 | 0x0368 | `NV4097_SET_SHADE_MODE` | inert | oracle-value | GL_SMOOTH at reset (0x1D01), which is what the MSL vertex outputs interpolate as. A flat shade  mode would need an interpolation qualifier per ... |
 | NV4097 | 0x036C | `NV4097_SET_BLEND_ENABLE_MRT` | handled | consumer | rsx_draw_engine.c build_render_state: rs->blend_mrt |
@@ -672,9 +672,10 @@ method, like the header.
 The 120 s Odin boot (`scratch/h1b-census`, the last `GCM_METHOD_STATS` block) carried 214 observations:
 NV4097 177, NV308A 10, NV309E 3, NV3062 2, NV3089 2, NV406E 1, driver 1, and 18 NV4097 methods seen
 before the first observed bind. Those 18 are the same methods as some of the 177, so the stream has 196
-distinct `(class, method)` pairs. Classified: **21 handled, 170 inert, 5 missing, 0 unknown**; the 18
+distinct `(class, method)` pairs. Classified: **24 handled, 170 inert, 2 missing, 0 unknown** (21/170/5
+before the three back-face stencil registers got their consumer); the 18
 pre-bind observations classify as the NV4097 rows they belong to. `libs/video/tests/test_rsx_method_census.c`
-replays the pair table through the real walker (214 writes + 7 binds: 34 handled, 180 inert, 7 missing,
+replays the pair table through the real walker (214 writes + 7 binds: 37 handled, 180 inert, 4 missing,
 0 unknown).
 
 ### Handled states the walker itself consumes
@@ -720,5 +721,4 @@ Tests: `rsx_depth_range` (host) and `depth_range_metal` (0.25/0.75 → depth buf
 |---|---|---|
 | `NV4097_SET_WINDOW_OFFSET` (`0x02B8`) | the window transform has a fixed zero offset | add a per-draw window offset to the viewport epilogue; needs RPCS3's `window_offset_x/y` semantics pinned first |
 | `NV4097_SET_SHADER_WINDOW` (`0x1D88`) | the NDC→window epilogue hard-codes a top-left origin and integer pixel centres | decode height/origin/pixel-centre and apply it in the epilogue; needs a reference frame to settle the convention (M3 non-goal) |
-| `NV4097_SET_BACK_STENCIL_MASK` / `_FUNC_REF` / `_FUNC_MASK` (`0x034C`, `0x0354`, `0x0358`) | two-sided stencil compares and writes with the front mask and reference | carry the back masks in `rsx_be_render_state`; Metal has per-face masks but one shared reference, so a differing back reference needs emulation |
 | `NV4097_SET_BLEND_COLOR` (`0x031C`) | constant blend factors use the host default instead of the guest's colour | add the four floats to the pipeline/encoder state |

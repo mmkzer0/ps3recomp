@@ -225,7 +225,7 @@ static void stub_scissor(void* u, u32 x, u32 y, u32 w, u32 h)
     stub.scissor[2] = w; stub.scissor[3] = h;
 }
 
-static void stub_stencil_ref(void* u, u32 r) { (void)u; stub.stencil_ref = r; }
+static void stub_stencil_ref(void* u, u32 r, u32 back) { (void)u; (void)back; stub.stencil_ref = r; }
 static void stub_depth_range(void* u, float near_z, float far_z)
 { (void)u; stub.depth_range[0] = near_z; stub.depth_range[1] = far_z; stub.n_depth_range++; }
 static void stub_depth_bounds(void* u, float lo, float hi)

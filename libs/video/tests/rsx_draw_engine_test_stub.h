@@ -150,7 +150,7 @@ static void stub_viewport(void* u, float x, float y, float w, float h)
 { (void)u; (void)x; (void)y; (void)w; (void)h; }
 static void stub_scissor(void* u, u32 x, u32 y, u32 w, u32 h)
 { (void)u; (void)x; (void)y; (void)w; (void)h; }
-static void stub_stencil_ref(void* u, u32 r) { (void)u; (void)r; }
+static void stub_stencil_ref(void* u, u32 r, u32 back) { (void)u; (void)r; (void)back; }
 
 static void stub_draw(void* u, rsx_topology topology, const void* verts,
                       u32 count, u32 stride, const u32* indices, u32 index_count)

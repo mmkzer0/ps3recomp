@@ -93,7 +93,10 @@ static void eng_cap_draw(u32 executed, u32 reason);
 #define M_STENCIL_OP_ZFAIL    0x0340
 #define M_STENCIL_OP_ZPASS    0x0344
 #define M_TWO_SIDED_STENCIL   0x0348
+#define M_BACK_STENCIL_MASK   0x034C
 #define M_BACK_STENCIL_FUNC   0x0350
+#define M_BACK_STENCIL_FUNC_REF  0x0354
+#define M_BACK_STENCIL_FUNC_MASK 0x0358
 #define M_BACK_STENCIL_OP_FAIL  0x035C
 #define M_BACK_STENCIL_OP_ZFAIL 0x0360
 #define M_BACK_STENCIL_OP_ZPASS 0x0364
@@ -606,7 +609,14 @@ void rsx_draw_engine_decode_render_state(const rsx_dispatch* rsx,
     rs->s_fail       = rsx_dsp_reg(rsx, M_STENCIL_OP_FAIL);
     rs->s_zfail      = rsx_dsp_reg(rsx, M_STENCIL_OP_ZFAIL);
     rs->s_zpass      = rsx_dsp_reg(rsx, M_STENCIL_OP_ZPASS);
+    /* The back block mirrors the front one register for register: SDK
+     * libgcm's back-stencil setters write 0x034C and the 0x0350..0x0358
+     * func/ref/mask burst (gcm_default_state.c:89-90); RPCS3 d00d8023 reads
+     * the back masks and reference only under two-sided stencil
+     * (GL/GLDraw.cpp:138-147, VK/VKDraw.cpp:187-201). */
     rs->bs_func      = rsx_dsp_reg(rsx, M_BACK_STENCIL_FUNC);
+    rs->bs_func_mask  =rsx_dsp_reg(rsx, M_BACK_STENCIL_FUNC_MASK) & 0xFF;
+    rs->bs_write_mask = rsx_dsp_reg(rsx, M_BACK_STENCIL_MASK) & 0xFF;
     rs->bs_fail      = rsx_dsp_reg(rsx, M_BACK_STENCIL_OP_FAIL);
     rs->bs_zfail     = rsx_dsp_reg(rsx, M_BACK_STENCIL_OP_ZFAIL);
     rs->bs_zpass     = rsx_dsp_reg(rsx, M_BACK_STENCIL_OP_ZPASS);
@@ -649,6 +659,8 @@ u64 rsx_draw_engine_hash_render_state(const rsx_be_render_state* rs, u64 hash)
     ENG_HASH_FIELD(s_zfail);
     ENG_HASH_FIELD(s_zpass);
     ENG_HASH_FIELD(bs_func);
+    ENG_HASH_FIELD(bs_func_mask);
+    ENG_HASH_FIELD(bs_write_mask);
     ENG_HASH_FIELD(bs_fail);
     ENG_HASH_FIELD(bs_zfail);
     ENG_HASH_FIELD(bs_zpass);
@@ -3552,9 +3564,16 @@ static void sink_end(void* user, const rsx_dispatch* r)
         eng_scissor_rect(&sf, g.surfaces[target].w, g.surfaces[target].h, sc);
         g.be->set_scissor(g.be->user, sc[0], sc[1], sc[2], sc[3]);
     }
-    /* Dynamic, and deliberately outside the pipeline key. */
-    g.be->set_stencil_ref(g.be->user,
-                          rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC_REF) & 0xFFu);
+    /* Dynamic, and deliberately outside the pipeline key. With two-sided
+     * stencil off the front reference applies to both faces (nv40; RPCS3
+     * d00d8023 VKDraw.cpp:187-201 sets FRONT_AND_BACK then). */
+    {
+        const u32 front = rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC_REF) & 0xFFu;
+        const u32 back = (rsx_dsp_reg(&g.rsx, M_TWO_SIDED_STENCIL) & 1)
+                             ? rsx_dsp_reg(&g.rsx, M_BACK_STENCIL_FUNC_REF) & 0xFFu
+                             : front;
+        g.be->set_stencil_ref(g.be->user, front, back);
+    }
     /* The bounds too: a deferred renderer moves them between its light and
      * sky passes without changing anything else. Raw floats, as written. */
     if (g.be->set_depth_bounds) {

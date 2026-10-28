@@ -398,27 +398,26 @@ int main(void)
     check(st.unbound == 0, "nothing is dropped: every subchannel the census used is bound");
     /* 22 census pairs are consumed by a named consumer, plus the seven SET_OBJECT writes that bind the
      * slots (each is a method the walker consumes). */
-    check(st.handled == 34, "34 writes are consumed by a named consumer");
+    check(st.handled == 37, "37 writes are consumed by a named consumer");
     check(st.inert == 180, "180 writes are allow-listed for the value they carry");
-    check(st.missing == 7, "7 writes are known gaps (5 distinct pairs), counted but not a stop");
+    check(st.missing == 4, "4 writes are known gaps (2 distinct pairs), counted but not a stop");
     check(st.handled + st.inert + st.missing == 221, "...and the three classes cover every write (214 pairs + 7 binds)");
 
     { GcmUnknownMethod u[8];
       check(gcm_unknown_methods(u, 8) == 0, "the unknown table is empty");
       GcmUnknownMethod m[8];
       const u32 n = gcm_missing_methods(m, 8);
-      /* The five known gaps the census carries: the window offset, the three back-face stencil
-       * registers, and the shader window. Each has an S2 row (docs/RSX_GRAPHICS.md). */
-      int seen[5] = { 0, 0, 0, 0, 0 };
-      static const u32 want[5] = { 0x02B8u, 0x034Cu, 0x0354u, 0x0358u, 0x1D88u };
+      /* The two known gaps the census carries: the window offset and the shader window. Each has an
+       * S2 row (docs/RSX_GRAPHICS.md); the back-face stencil registers have their consumer. */
+      int seen[2] = { 0, 0 };
+      static const u32 want[2] = { 0x02B8u, 0x1D88u };
       for (u32 i = 0; i < n && i < 8; i++) {
           printf("[census]   missing %s 0x%04X x%llu data 0x%08X\n",
                  gcm_method_class_name(m[i].cls), m[i].method, m[i].count, m[i].data);
-          for (unsigned k = 0; k < 5; k++)
+          for (unsigned k = 0; k < 2; k++)
               if (m[i].cls == RSX_CLASS_NV4097 && m[i].method == want[k]) seen[k] = 1;
       }
-      check(n == 5 && seen[0] && seen[1] && seen[2] && seen[3] && seen[4],
-            "exactly the five S2 gaps are reported missing, per pair"); }
+      check(n == 2 && seen[0] && seen[1], "exactly the two S2 gaps are reported missing, per pair"); }
 
     /* Fail-before for the stop: a pair with no row ends the walker with the four fields that locate it,
      * in a child so this process can continue. */

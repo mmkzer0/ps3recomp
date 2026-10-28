@@ -79,8 +79,9 @@ typedef struct rsx_be_sampler_desc {
 /* The NV4097 render state a pipeline is built from: rsx_live_draw.c's
  * render_state_t (1312-1327) with the D3D12 enums left undecoded, since the
  * guest values are the portable form and each backend has its own table.
- * The stencil REFERENCE is deliberately absent -- it is set on the encoder,
- * not baked into the pipeline, and so is not part of the pipeline key. */
+ * The stencil REFERENCES are deliberately absent -- they are set on the
+ * encoder, not baked into the pipeline, and so are not part of the pipeline
+ * key. */
 typedef struct rsx_be_render_state {
     u32 alpha_test_enable, alpha_func, alpha_ref_raw, alpha_ref_format;
     u32 blend_enable, sf_rgb, df_rgb, sf_a, df_a, eq_rgb, eq_a;
@@ -95,7 +96,9 @@ typedef struct rsx_be_render_state {
     u32 stencil_enable, stencil_two_sided;
     u32 depth_bounds_test;          /* SET_DEPTH_BOUNDS_TEST_ENABLE */
     u32 s_func, s_func_mask, s_write_mask, s_fail, s_zfail, s_zpass;
-    u32 bs_func, bs_fail, bs_zfail, bs_zpass;
+    /* Two-sided stencil's back faces (0x034C..0x0364); with two-sided off the
+     * front block applies to both faces and these are not used. */
+    u32 bs_func, bs_func_mask, bs_write_mask, bs_fail, bs_zfail, bs_zpass;
 } rsx_be_render_state;
 
 /* submit_and_wait reasons, for a backend that wants to log or count them. */
@@ -208,7 +211,9 @@ typedef struct rsx_draw_backend {
      * if the range were [0, 1], the reset value. */
     void (*set_depth_range)(void* user, float near_z, float far_z);
     void (*set_scissor)(void* user, u32 x, u32 y, u32 w, u32 h);
-    void (*set_stencil_ref)(void* user, u32 ref);
+    /* Both faces' references; `back` equals `front` unless two-sided stencil
+     * is on (SET_BACK_STENCIL_FUNC_REF). */
+    void (*set_stencil_ref)(void* user, u32 front, u32 back);
     /* Optional: the depth bounds for the next draw, called before every
      * draw like the stencil reference. The test itself is pipeline state
      * (rsx_be_render_state.depth_bounds_test); a backend that leaves this

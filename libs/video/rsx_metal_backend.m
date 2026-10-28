@@ -2561,7 +2561,7 @@ typedef struct {
     float vp[4];
     float vp_z[2];              /* SET_CLIP_MIN/MAX: the depth range the window z maps through */
     u32   sc[4];
-    u32   stencil_ref;
+    u32   stencil_ref, stencil_ref_back;
     float clear_rgba[4];
     u32   clear_flags;
     float clear_depth;
@@ -3449,8 +3449,8 @@ static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
             bsd.stencilFailureOperation   = gcm_stencil_op_to_metal(rs->bs_fail);
             bsd.depthFailureOperation     = gcm_stencil_op_to_metal(rs->bs_zfail);
             bsd.depthStencilPassOperation = gcm_stencil_op_to_metal(rs->bs_zpass);
-            bsd.readMask                  = rs->s_func_mask & 0xFFu;
-            bsd.writeMask                 = rs->s_write_mask & 0xFFu;
+            bsd.readMask                  = rs->bs_func_mask & 0xFFu;
+            bsd.writeMask                 = rs->bs_write_mask & 0xFFu;
             dd.backFaceStencil = bsd;
         } else {
             /* Two-sided off: nv40 applies the front state to both faces. */
@@ -3627,8 +3627,8 @@ static void eng_set_scissor(void* user, u32 x, u32 y, u32 w, u32 h)
     s_eng_pending.sc[2] = w; s_eng_pending.sc[3] = h;
 }
 
-static void eng_set_stencil_ref(void* user, u32 ref)
-{ (void)user; s_eng_pending.stencil_ref = ref; }
+static void eng_set_stencil_ref(void* user, u32 front, u32 back)
+{ (void)user; s_eng_pending.stencil_ref = front; s_eng_pending.stencil_ref_back = back; }
 
 /* Polygon offset. glPolygonOffset's units are steps of the guest depth
  * buffer, 2^-16 for Z16 and 2^-24 for Z24S8. Metal's depthBias on the
@@ -3741,7 +3741,7 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
     [enc setDepthStencilState:p->ds];
     [enc setCullMode:p->cull];
     [enc setFrontFacingWinding:p->winding];
-    [enc setStencilReferenceValue:r->stencil_ref];
+    [enc setStencilFrontReferenceValue:r->stencil_ref backReferenceValue:r->stencil_ref_back];
     [enc setDepthBias:r->depth_bias slopeScale:r->depth_slope clamp:0.0f];
     MTLViewport vp = { r->vp[0], r->vp[1], r->vp[2], r->vp[3],
                        (double)r->vp_z[0], (double)r->vp_z[1] };
