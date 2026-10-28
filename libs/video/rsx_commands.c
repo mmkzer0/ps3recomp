@@ -847,8 +847,9 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
     }
     if (method == NV4097_INVALIDATE_L2) {
-        /* Post-transform/L2 cache invalidate: the host keeps no such cache,
-         * nothing to drop. */
+        /* Post-transform/L2 cache invalidate. Not a no-op in substance: the draw engine
+         * rehashes a sampled texture at most once per frame, so an in-place rewrite after
+         * this method can still be sampled stale (#64, counted MISSING in the method table). */
         return 0;
     }
 
