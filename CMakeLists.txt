@@ -1269,9 +1269,9 @@ if(UNIX)
 
     # NV4097 method contracts read back from a real Metal device: each test
     # includes the engine and the backend and drives them with synthetic
-    # method words (#62). Skips (77) without a Metal device.
+    # method words (#62, #64). Skips (77) without a Metal device.
     if(APPLE AND PS3RECOMP_MSL_TRANSLATION)
-        foreach(gpu_test back_stencil window)
+        foreach(gpu_test back_stencil window invalidate_l2)
             add_executable(test_metal_${gpu_test}
                 libs/video/tests/test_metal_${gpu_test}.m
                 libs/video/rsx_shader_msl.cpp
@@ -1295,6 +1295,11 @@ if(UNIX)
                 LABELS "video;gpu;t0" SKIP_RETURN_CODE 77 TIMEOUT 120
                 ENVIRONMENT "PS3RECOMP_METAL_HEADLESS=1")
         endforeach()
+        # Red by design until #64 has a consumer: the engine rehashes a cached
+        # texture at most once per frame, so an in-frame rewrite stays stale
+        # with or without INVALIDATE_L2. Listed as "Disabled", never hidden;
+        # run build/dev/test_metal_invalidate_l2 to reproduce.
+        set_tests_properties(metal_invalidate_l2 PROPERTIES DISABLED TRUE)
     endif()
 
     # The RSX capture replay runner (docs/RSX_GRAPHICS.md, "Replay"): a ps3diff.rsx/1 capture through the
