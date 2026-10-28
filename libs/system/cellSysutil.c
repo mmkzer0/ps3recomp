@@ -6,6 +6,7 @@
  */
 
 #include "cellSysutil.h"
+#include "ps3emu/host_exit.h"
 #include "ps3emu/guest_call.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -761,13 +762,11 @@ s32 cellSysutilIsMeetingApp(void)
  *
  * What the console's "Quit Game" does first: every registered sysutil
  * callback gets CELL_SYSUTIL_REQUEST_EXITGAME, and the title tidies up and
- * calls sys_process_exit, which ends the process here (exit()). A title that
- * has not done so within PS3_QUIT_GRACE_MS (default 3000) is ended for it,
- * as the console does: once no save is being written (cellSaveData.c
- * ps3_savedata_busy, waited on for up to 10 s), with stdio flushed and the
- * atexit handlers run, exit(0) -- a normal end for whatever launched the
- * game. Runs on its own thread, so the caller (the main thread, the frame
- * clock) returns at once; a second request is ignored.
+ * calls sys_process_exit. If it has not exited within PS3_QUIT_GRACE_MS
+ * (default 3000), this thread waits for any save in flight, then calls
+ * ps3_host_exit(0): guest, RSX and audio threads are still live, so normal
+ * exit would run static destructors underneath them. This thread does not block
+ * its caller; a second quit request is ignored.
  * -----------------------------------------------------------------------*/
 #ifdef _WIN32
 static DWORD WINAPI host_quit_thread(LPVOID unused)
@@ -811,7 +810,7 @@ static void* host_quit_thread(void* unused)
     printf("[quit] the game did not exit on its own; ending it (save in flight: %s, waited %d ms) -> exit 0\n",
            ps3_savedata_busy() ? "yes, gave up" : "no", waited);
     fflush(NULL);
-    exit(0);
+    ps3_host_exit(0);
 #ifdef _WIN32
     return 0;
 #else
@@ -836,5 +835,5 @@ void ps3_host_quit(const char* why)
     if (pthread_create(&th, NULL, host_quit_thread, NULL) == 0) { pthread_detach(th); return; }
 #endif
     fflush(NULL);
-    exit(0);
+    ps3_host_exit(0);
 }

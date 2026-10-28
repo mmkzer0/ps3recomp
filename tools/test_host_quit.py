@@ -24,6 +24,7 @@ with tempfile.TemporaryDirectory(prefix="host-quit-") as temporary:
         "-ffunction-sections", "-fdata-sections", "-I" + str(root / "include"),
         str(root / "libs/system/tests/test_host_quit.c"),
         str(root / "libs/system/cellSysutil.c"),
+        str(root / "runtime/diag/host_exit.c"),
         "-pthread", gc_flag, "-o", str(binary),
     ], check=True, timeout=60, env=env, cwd=temporary)
     result = subprocess.run([str(binary)], timeout=10, env=env, cwd=temporary,

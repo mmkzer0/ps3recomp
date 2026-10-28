@@ -1,12 +1,11 @@
 /* macOS: clang -std=gnu17 -I include libs/system/tests/test_host_quit.c
- * libs/system/cellSysutil.c -Wl,-dead_strip -pthread -o /tmp/test_host_quit && /tmp/test_host_quit
- * (tools/test_host_quit.py runs it on macOS and Linux.)
+ * libs/system/cellSysutil.c runtime/diag/host_exit.c -Wl,-dead_strip -pthread
+ * -o /tmp/test_host_quit && /tmp/test_host_quit
  *
- * ps3_host_quit (cellSysutil.c): every registered sysutil callback gets
- * REQUEST_EXITGAME on the next poll; a title that does not exit by itself is
- * ended with status 0 after PS3_QUIT_GRACE_MS, but not while a save is being
- * written. The process exits from the quit thread, so the checks that need
- * the end run in an atexit handler; main returning means it never ended. */
+ * ps3_host_quit (cellSysutil.c) sends REQUEST_EXITGAME to each callback. The
+ * fallback waits for PS3_QUIT_GRACE_MS and any save in flight, then uses the
+ * quick-exit handler to verify delivery and save completion. Normal exit fails
+ * because the host threads still use global runtime state. */
 #include "../cellSysutil.h"
 #include "ps3emu/guest_call.h"
 #include <stdint.h>
@@ -43,6 +42,13 @@ static void at_end(void)
     if (!ok) _exit(1);
 }
 
+static void normal_exit_is_failure(void)
+{
+    puts("[FAIL] host quit ran normal exit handlers");
+    fflush(stdout);
+    _exit(1);
+}
+
 static unsigned long long ms_now(void)
 {
     struct timespec ts;
@@ -58,7 +64,8 @@ int main(void)
                                     (void*)(uintptr_t)0x4444u) != CELL_OK) {
         puts("[FAIL] register"); return 1;
     }
-    atexit(at_end);
+    atexit(normal_exit_is_failure);
+    at_quick_exit(at_end);
     if (ps3_host_quitting()) { puts("[FAIL] quitting before asked"); return 1; }
     ps3_host_quit("test");
     ps3_host_quit("test again");          /* ignored */
