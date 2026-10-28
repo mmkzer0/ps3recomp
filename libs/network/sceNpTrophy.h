@@ -156,6 +156,13 @@ s32 sceNpTrophyDestroyContext(SceNpTrophyContext context);
 s32 sceNpTrophyCreateHandle(SceNpTrophyHandle* handle);
 s32 sceNpTrophyDestroyHandle(SceNpTrophyHandle handle);
 
+/* FW 4.93 libsysutil_np_trophy 0x020014C4. Marks the handle aborted: until it
+ * is destroyed every operation naming it, a second abort included, answers
+ * SCE_NP_TROPHY_ERROR_ABORT, and a RegisterContext waiting on it returns that
+ * code. Checks no init flag; an id outside 1..4 is INVALID_ARGUMENT, one the
+ * table does not hold UNKNOWN_HANDLE. */
+s32 sceNpTrophyAbortHandle(SceNpTrophyHandle handle);
+
 /* Real ABI: (context, handle, statusCb, arg, options).  statusCb is a guest
  * OPD for SceNpTrophyStatusCallback(context, status, completed, total, arg);
  * the game blocks on registration-complete which is signalled via this cb. */

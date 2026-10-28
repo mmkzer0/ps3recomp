@@ -54,6 +54,15 @@ int main(void)
     assert(sceNpTrophyCreateHandle((void*)0x204) == E(0x02));
     assert(sceNpTrophyRegisterContext(1, 1, 0x300, 0, 0) == E(0x02));
 
+    /* AbortHandle tests no init flag (FW 4.93 0x020014C4 goes to the handle
+     * check 0x0200025C, which reads only the handle table): before Init the
+     * table is empty, so ids 1..4 are unknown and the rest invalid. */
+    assert(sceNpTrophyAbortHandle(1) == E(0x11));
+    assert(sceNpTrophyAbortHandle(4) == E(0x11));
+    assert(sceNpTrophyAbortHandle(0) == E(0x06));
+    assert(sceNpTrophyAbortHandle(5) == E(0x06));
+    assert(sceNpTrophyAbortHandle(-1) == E(0x06));
+
     assert(sceNpTrophyInit(NULL, 0, 0, 0) == CELL_OK);
     assert(sceNpTrophyInit(NULL, 0, 0, 0) == E(0x01));
 
@@ -101,10 +110,74 @@ int main(void)
      * SCE_NP_TROPHY_ERROR_PROCESSING_ABORTED. */
     assert((s32)SCE_NP_TROPHY_ERROR_PROCESSING_ABORTED == E(0x0F));
 
+    /* AbortHandle: the range / unknown split, then the mark. Handle 1 exists,
+     * 2 to 4 do not. */
+    assert(sceNpTrophyAbortHandle(0) == E(0x06));
+    assert(sceNpTrophyAbortHandle(5) == E(0x06));
+    assert(sceNpTrophyAbortHandle(-1) == E(0x06));
+    assert(sceNpTrophyAbortHandle(2) == E(0x11));
+    assert(sceNpTrophyAbortHandle(4) == E(0x11));
+    assert(sceNpTrophyCreateHandle((void*)0x20C) == CELL_OK);       /* handle 2 */
+    assert(vm_read32(0x20C) == 2);
+    s_contexts[1].registered = 0;      /* so ABORT is seen to precede NOT_REGISTERED */
+    assert(sceNpTrophyAbortHandle(1) == CELL_OK);
+    /* Until the handle is destroyed every operation naming it answers ABORT
+     * (VSH 0x0018DC94 -> 0x0018DC0C), a second AbortHandle included (RPCS3's
+     * answers CELL_OK there). The checks the library makes itself come first
+     * (FW 0x02001678..0x02001728): an unknown context, a missing callback, an
+     * option the library does not support. */
+    assert(sceNpTrophyAbortHandle(1) == E(0x10));
+    assert(sceNpTrophyRegisterContext(3, 1, 0x300, 0, 0) == E(0x0A));
+    assert(sceNpTrophyRegisterContext(1, 3, 0x300, 0, 0) == E(0x11));
+    assert(sceNpTrophyRegisterContext(1, 1, 0, 0, 0) == E(0x06));
+    assert(sceNpTrophyRegisterContext(1, 1, 0x300, 0, 2) == E(0x03));
+    assert(sceNpTrophyRegisterContext(1, 1, 0x300, 0, 0) == E(0x10));
+    assert(sceNpTrophyRegisterContext(1, 1, 0x300, 0, 1) == E(0x10));
+    assert(sceNpTrophyGetRequiredDiskSpace(1, 1, (u64*)(uintptr_t)0x300, 0) == E(0x10));
+    assert(sceNpTrophyGetGameInfo(1, 1, NULL, NULL) == E(0x10));
+    assert(sceNpTrophyGetTrophyInfo(1, 1, 0, NULL, NULL) == E(0x10));
+    assert(sceNpTrophyUnlockTrophy(1, 1, 0, NULL) == E(0x10));
+    assert(sceNpTrophyGetTrophyUnlockState(1, 1, (void*)(uintptr_t)0x300, (u32*)(uintptr_t)0x304) == E(0x10));
+    assert(sceNpTrophyGetGameProgress(1, 1, (s32*)(uintptr_t)0x308) == E(0x10));
+    /* A context the call does not hold is still the context's error. */
+    assert(sceNpTrophyGetGameInfo(3, 1, NULL, NULL) == E(0x0A));
+    /* Another handle is not affected; here the context is simply unregistered. */
+    assert(sceNpTrophyGetRequiredDiskSpace(1, 2, (u64*)(uintptr_t)0x300, 0) == CELL_OK);
+    assert(sceNpTrophyGetGameInfo(1, 2, NULL, NULL) == E(0x04));
+    assert(sceNpTrophyGetTrophyInfo(1, 2, 0, NULL, NULL) == E(0x04));
+    assert(sceNpTrophyUnlockTrophy(1, 2, 0, NULL) == E(0x04));
+    assert(sceNpTrophyGetTrophyUnlockState(1, 2, (void*)(uintptr_t)0x300, (u32*)(uintptr_t)0x304) == E(0x04));
+    assert(sceNpTrophyGetGameProgress(1, 2, (s32*)(uintptr_t)0x308) == E(0x04));
+    /* The destroy request never reads the flag (VSH 0x0018F110 -> 0x0018DDC0)
+     * and frees it with the entry (0x0018DD94): destroying succeeds, the id is
+     * unknown after, and a new handle that reuses the id starts clean. */
+    assert(sceNpTrophyDestroyHandle(1) == CELL_OK);
+    assert(sceNpTrophyAbortHandle(1) == E(0x11));
+    assert(sceNpTrophyDestroyHandle(1) == E(0x11));
+    assert(sceNpTrophyCreateHandle((void*)0x210) == CELL_OK);
+    assert(vm_read32(0x210) == 1);
+    assert(sceNpTrophyGetGameInfo(1, 1, NULL, NULL) == E(0x04));
+    assert(sceNpTrophyDestroyHandle(2) == CELL_OK);
+    s_contexts[1].registered = 1;
+
     assert(sceNpTrophyDestroyContext(1) == CELL_OK);
     assert(sceNpTrophyDestroyContext(1) == E(0x0A));
     assert(sceNpTrophyTerm() == CELL_OK);
     assert(sceNpTrophyTerm() == E(0x02));
+
+    /* Term empties the handle table with its flags (FW 0x02000BC8): a handle
+     * aborted before Term does not carry the mark into the next Init. */
+    assert(sceNpTrophyAbortHandle(1) == E(0x11));
+    assert(sceNpTrophyInit(NULL, 0, 0, 0) == CELL_OK);
+    assert(sceNpTrophyCreateContext((void*)0x200, (void*)0x100, (void*)0x108, 0) == CELL_OK);
+    assert(sceNpTrophyCreateHandle((void*)0x204) == CELL_OK);
+    assert(sceNpTrophyAbortHandle(1) == CELL_OK);
+    assert(sceNpTrophyTerm() == CELL_OK);
+    assert(sceNpTrophyInit(NULL, 0, 0, 0) == CELL_OK);
+    assert(sceNpTrophyCreateContext((void*)0x200, (void*)0x100, (void*)0x108, 0) == CELL_OK);
+    assert(sceNpTrophyCreateHandle((void*)0x204) == CELL_OK);
+    assert(sceNpTrophyGetGameInfo(1, 1, NULL, NULL) == E(0x04));
+    assert(sceNpTrophyTerm() == CELL_OK);
 
     char file[256]; snprintf(file, sizeof(file), "%s/NPWR00001.json", root);
     assert(unlink(file) == 0); assert(rmdir(root) == 0); free(vm_base);

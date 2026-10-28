@@ -93,8 +93,11 @@ typedef struct {
     u64                      life_complete_poll;
 } TrophyContext;
 
+/* aborted is guarded by s_life_lock (see "Handle abort" below); in_use keeps
+ * the module's unguarded convention. */
 typedef struct {
     int in_use;
+    int aborted;
 } TrophyHandle;
 
 /* ID zero is the firmware invalid sentinel; retain all four usable slots. */
@@ -444,6 +447,71 @@ static void life_quiesce_locked(void)
         life_wait(TROPHY_WAIT_SLICE_US);
 }
 
+/* ---------------------------------------------------------------------------
+ * Handle abort
+ *
+ * The library keeps no abort state. FW 4.93 libsysutil_np_trophy
+ * sceNpTrophyAbortHandle 0x020014C4 checks the handle (0x0200025C), sends the
+ * VSH an "abort" request {mem_context = handle} (PacketBegin channel 0, type
+ * 0x127, 0x02001500..0x020015A8), waits for the reply (0x020015C0 ->
+ * 0x02003DE4) and returns its "result" when negative, else 0 (0x02003EC8..
+ * 0x02003F00). It stores nothing in the library's tables.
+ *
+ * The state is the VSH's (vsh.elf FW 4.93). Its abort handler 0x001909DC
+ * resolves the handle with 0x0018DC94 and stores 1 in the entry's flag byte
+ * (+8, 0x00190A2C); the result it answers is 0. Every handle-taking request
+ * resolves the handle through the same 0x0018DC94, whose callee 0x0018DC0C
+ * reads that byte and answers 0x80022910 (ABORT) while it is set (0x0018DC4C..
+ * 0x0018DC6C). The destroy request ('9', 0x0018F110 -> 0x0018DDC0) resolves
+ * the entry itself, never reads the byte, and frees the entry and its flag
+ * (0x0018DD28, 0x0018DD94). So until the handle is destroyed, every operation
+ * naming it answers ABORT, a second AbortHandle included, and DestroyHandle
+ * still succeeds. RPCS3 d00d8023 sceNpTrophy.cpp sceNpTrophyAbortHandle sets
+ * trophy_handle_t::is_aborted and get_context_ex() answers ABORT from it, the
+ * same, except that RPCS3's second AbortHandle answers CELL_OK.
+ *
+ * Open, not modelled (dossier ABORT-HANDLE.md O1, O2): the VSH cancel step
+ * 0x0018E22C, which clears the flag and signals the handle's wait object when
+ * a VSH session word is non-zero, is reached only while one of the short
+ * session-holding requests is in flight; and what the VSH answers a
+ * RegisterContext it interrupts is not shown by the firmware. The wait of
+ * trophy_run_lifecycle answers ABORT, the VSH's own code for an aborted handle:
+ * INFERRED, not observed.
+ *
+ * The flag is read by threads other than the one that sets it (a registration
+ * thread blocked in RegisterContext), so it lives under s_life_lock.
+ * -----------------------------------------------------------------------*/
+
+/* FW 4.93 libsysutil_np_trophy 0x0200025C: an id outside 1..4 is
+ * INVALID_ARGUMENT (0x02000264..0x02000288), one the table does not hold
+ * UNKNOWN_HANDLE (0x0200028C..0x020002B0). It tests no init flag: the table
+ * is empty before Init and after Term (0x02000BC8 clears it), so ids 1..4 are
+ * UNKNOWN_HANDLE there. RPCS3 sceNpTrophyAbortHandle/DestroyHandle split the
+ * same way. */
+static s32 trophy_handle_lookup(SceNpTrophyHandle handle)
+{
+    if (handle <= 0 || handle > SCE_NP_TROPHY_MAX_HANDLES)
+        return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
+    if (!s_handles[handle].in_use)
+        return SCE_NP_TROPHY_ERROR_UNKNOWN_HANDLE;
+    return CELL_OK;
+}
+
+/* ABORT when `handle` names a live handle AbortHandle marked (VSH 0x0018DC0C),
+ * else CELL_OK. The operations that call this do not validate the handle
+ * themselves (they ignore it), so an id that names nothing is the caller's
+ * business and answers CELL_OK here: only an aborted handle changes their
+ * answer. */
+static s32 trophy_handle_abort_rc(SceNpTrophyHandle handle)
+{
+    if (handle <= 0 || handle > SCE_NP_TROPHY_MAX_HANDLES)
+        return CELL_OK;
+    life_lock();
+    const int aborted = s_handles[handle].in_use && s_handles[handle].aborted;
+    life_unlock();
+    return aborted ? (s32)SCE_NP_TROPHY_ERROR_ABORT : CELL_OK;
+}
+
 /* Lock held. Queue what is due at vblank `vb` and fits in the queue. */
 static void life_post_locked(TrophyContext* c, u32 vb)
 {
@@ -511,9 +579,10 @@ static void trophy_poll(void)
 }
 
 /* The wait of sceNpTrophyRegisterContext: until the completion has been
- * consumed and one step has passed, or the cap. Returns CELL_OK, or the error
- * of a context that was destroyed or re-registered meanwhile. */
-static s32 trophy_run_lifecycle(s32 context, u64 serial)
+ * consumed and one step has passed, or the cap. Returns CELL_OK, ABORT when
+ * the handle was aborted meanwhile, or the error of a context that was
+ * destroyed or re-registered meanwhile. */
+static s32 trophy_run_lifecycle(s32 context, SceNpTrophyHandle handle, u64 serial)
 {
     TrophyContext* c = &s_contexts[context];
     const u32 cap = ps3_cfg_trophy_register_wait_cap_vblanks();
@@ -530,6 +599,17 @@ static s32 trophy_run_lifecycle(s32 context, u64 serial)
                                      : (s32)SCE_NP_TROPHY_ERROR_UNKNOWN_CONTEXT;
             life_unlock();
             return rc;
+        }
+        /* AbortHandle during the wait. The registration fails: as the firmware
+         * does on any failure (0x02001B10..0x02001B4C zeroes the context's
+         * callback and argument), the lifecycle ends and no status runs after
+         * the call returns. The answer is INFERRED (see "Handle abort"). */
+        if (s_handles[handle].in_use && s_handles[handle].aborted) {
+            life_cancel_locked(c);
+            c->registered = 0;
+            life_quiesce_locked();
+            life_unlock();
+            return (s32)SCE_NP_TROPHY_ERROR_ABORT;
         }
         const u32 vb = cellGcmGetVBlankCount();
         life_post_locked(c, vb);
@@ -715,14 +795,42 @@ s32 sceNpTrophyDestroyHandle(SceNpTrophyHandle handle)
         return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
 
     /* RPCS3 sceNpTrophyDestroyHandle: the same split for the handle. */
-    if (handle <= 0 || handle > SCE_NP_TROPHY_MAX_HANDLES)
-        return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
-    if (!s_handles[handle].in_use)
-        return SCE_NP_TROPHY_ERROR_UNKNOWN_HANDLE;
+    const s32 rc = trophy_handle_lookup(handle);
+    if (rc != CELL_OK)
+        return rc;
 
+    /* The VSH frees the entry and its abort flag (0x0018DD28, 0x0018DD94). */
+    life_lock();
     s_handles[handle].in_use = 0;
+    s_handles[handle].aborted = 0;
+    life_unlock();
     printf("[sceNpTrophy] DestroyHandle(handle=%d)\n", handle);
     return CELL_OK;
+}
+
+s32 sceNpTrophyAbortHandle(SceNpTrophyHandle handle)
+{
+    /* FW 4.93 libsysutil_np_trophy 0x020014C4 goes straight to the handle
+     * check 0x0200025C; unlike RegisterContext (0x02001678) and CreateHandle
+     * (0x02000D44) it never reads the init flag 0x020001A4. RPCS3 leaves the
+     * init check out of sceNpTrophyAbortHandle too (a TODO there). */
+    const s32 rc = trophy_handle_lookup(handle);
+    if (rc != CELL_OK)
+        return rc;
+
+    life_lock();
+    if (s_handles[handle].aborted) {
+        /* VSH 0x0018DC94 -> 0x0018DC0C answers ABORT for a handle that is
+         * already marked, and the abort request returns that as its result
+         * (0x00190A4C); RPCS3 answers CELL_OK here. */
+        life_unlock();
+        return SCE_NP_TROPHY_ERROR_ABORT;
+    }
+    s_handles[handle].aborted = 1;       /* VSH 0x00190A2C */
+    life_wake();                         /* a registration thread re-reads it */
+    life_unlock();
+    printf("[sceNpTrophy] AbortHandle(handle=%d)\n", handle);
+    return CELL_OK;                      /* VSH result 0, 0x00190A40 */
 }
 
 s32 sceNpTrophyRegisterContext(SceNpTrophyContext context,
@@ -758,6 +866,14 @@ s32 sceNpTrophyRegisterContext(SceNpTrophyContext context,
     /* Only options 0 and 1 (show the error and exit on an abort) exist: FW 4.93
      * RegisterContext 0x02001664 area, RPCS3 options > SHOW_ERROR_EXIT. */
     if (options > 1) return SCE_NP_TROPHY_ERROR_NOT_SUPPORTED;
+
+    /* An aborted handle is the VSH's answer to the request, after every check
+     * the library makes itself (0x0018DC0C inside the VSH lookup); RPCS3
+     * get_context_ex() answers it before the callback and options checks. */
+    {
+        const s32 arc = trophy_handle_abort_rc(handle);
+        if (arc) return arc;
+    }
 
     trophy_require_bridge("sceNpTrophyRegisterContext has no guest callback bridge");
 
@@ -796,6 +912,15 @@ s32 sceNpTrophyRegisterContext(SceNpTrophyContext context,
      * 0x8002290A / 0x80022911. */
     if (!s_contexts[context].in_use) return SCE_NP_TROPHY_ERROR_UNKNOWN_CONTEXT;
     if (!s_handles[handle].in_use) return SCE_NP_TROPHY_ERROR_UNKNOWN_HANDLE;
+    /* ... and AbortHandle called from the callback (RPCS3 :653-659, "such as
+     * if AbortHandle was called"). The registration did not complete. */
+    {
+        const s32 arc = trophy_handle_abort_rc(handle);
+        if (arc) {
+            if (s_contexts[context].in_use) s_contexts[context].registered = 0;
+            return arc;
+        }
+    }
 
     /* The install: the store file now exists, so the next registration of
      * this community id reports INSTALLED. RPCS3 maps a failed install to
@@ -824,7 +949,7 @@ s32 sceNpTrophyRegisterContext(SceNpTrophyContext context,
         return SCE_NP_TROPHY_ERROR_OUT_OF_MEMORY;
     }
 
-    const s32 rc = trophy_run_lifecycle(context, serial);
+    const s32 rc = trophy_run_lifecycle(context, handle, serial);
     printf("[sceNpTrophy] RegisterContext(ctx=%d) -> 0x%08X\n", context, (u32)rc);
     return rc;
 }
@@ -833,7 +958,7 @@ s32 sceNpTrophyGetRequiredDiskSpace(SceNpTrophyContext context,
                                     SceNpTrophyHandle handle,
                                     u64* reqSpace, u64 options)
 {
-    (void)handle; (void)options;
+    (void)options;
 
     /* RPCS3 sceNpTrophy.cpp sceNpTrophyGetRequiredDiskSpace checks reqspace
      * before the init state. */
@@ -851,6 +976,10 @@ s32 sceNpTrophyGetRequiredDiskSpace(SceNpTrophyContext context,
     /* The table miss: SCE_NP_TROPHY_ERROR_UNKNOWN_CONTEXT (0x8002290A). */
     if (!s_contexts[context].in_use)
         return SCE_NP_TROPHY_ERROR_UNKNOWN_CONTEXT;
+    {
+        const s32 arc = trophy_handle_abort_rc(handle);   /* see "Handle abort" */
+        if (arc) return arc;
+    }
 
     reqSpace = GUEST_PTR(reqSpace, u64*);
 
@@ -878,14 +1007,16 @@ s32 sceNpTrophyGetGameInfo(SceNpTrophyContext context,
                            SceNpTrophyGameDetails* details,
                            SceNpTrophyGameData* data)
 {
-    (void)handle;
-
     if (!s_trophy_initialized)
         return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
 
     if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS ||
         !s_contexts[context].in_use)
         return SCE_NP_TROPHY_ERROR_UNKNOWN_CONTEXT;
+    {
+        const s32 arc = trophy_handle_abort_rc(handle);   /* see "Handle abort" */
+        if (arc) return arc;
+    }
 
     if (!s_contexts[context].registered)
         return SCE_NP_TROPHY_ERROR_CONTEXT_NOT_REGISTERED;
@@ -926,14 +1057,16 @@ s32 sceNpTrophyGetTrophyInfo(SceNpTrophyContext context,
                              SceNpTrophyDetails* details,
                              SceNpTrophyData* data)
 {
-    (void)handle;
-
     if (!s_trophy_initialized)
         return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
 
     if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS ||
         !s_contexts[context].in_use)
         return SCE_NP_TROPHY_ERROR_UNKNOWN_CONTEXT;
+    {
+        const s32 arc = trophy_handle_abort_rc(handle);   /* see "Handle abort" */
+        if (arc) return arc;
+    }
 
     if (!s_contexts[context].registered)
         return SCE_NP_TROPHY_ERROR_CONTEXT_NOT_REGISTERED;
@@ -969,14 +1102,16 @@ s32 sceNpTrophyUnlockTrophy(SceNpTrophyContext context,
                             SceNpTrophyId trophyId,
                             SceNpTrophyId* platinumId)
 {
-    (void)handle;
-
     if (!s_trophy_initialized)
         return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
 
     if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS ||
         !s_contexts[context].in_use)
         return SCE_NP_TROPHY_ERROR_UNKNOWN_CONTEXT;
+    {
+        const s32 arc = trophy_handle_abort_rc(handle);   /* see "Handle abort" */
+        if (arc) return arc;
+    }
 
     if (!s_contexts[context].registered)
         return SCE_NP_TROPHY_ERROR_CONTEXT_NOT_REGISTERED;
@@ -1015,8 +1150,6 @@ s32 sceNpTrophyGetTrophyUnlockState(SceNpTrophyContext context,
                                     SceNpTrophyFlagArray* flags,
                                     u32* count)
 {
-    (void)handle;
-
     /* RPCS3 sceNpTrophy.cpp sceNpTrophyGetTrophyUnlockState checks the output
      * pointers before the init state. */
     if (!flags || !count)
@@ -1033,6 +1166,11 @@ s32 sceNpTrophyGetTrophyUnlockState(SceNpTrophyContext context,
     /* The table miss: SCE_NP_TROPHY_ERROR_UNKNOWN_CONTEXT (0x8002290A). */
     if (!s_contexts[context].in_use)
         return SCE_NP_TROPHY_ERROR_UNKNOWN_CONTEXT;
+
+    {
+        const s32 arc = trophy_handle_abort_rc(handle);   /* see "Handle abort" */
+        if (arc) return arc;
+    }
 
     /* SCE_NP_TROPHY_ERROR_CONTEXT_NOT_REGISTERED (0x80022904). */
     if (!s_contexts[context].registered)
@@ -1058,14 +1196,16 @@ s32 sceNpTrophyGetGameProgress(SceNpTrophyContext context,
                                SceNpTrophyHandle handle,
                                s32* percentage)
 {
-    (void)handle;
-
     if (!s_trophy_initialized)
         return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
 
     if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS ||
         !s_contexts[context].in_use)
         return SCE_NP_TROPHY_ERROR_UNKNOWN_CONTEXT;
+    {
+        const s32 arc = trophy_handle_abort_rc(handle);   /* see "Handle abort" */
+        if (arc) return arc;
+    }
 
     if (!s_contexts[context].registered)
         return SCE_NP_TROPHY_ERROR_CONTEXT_NOT_REGISTERED;
