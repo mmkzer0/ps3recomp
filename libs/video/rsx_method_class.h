@@ -208,10 +208,9 @@ static const rsx_method_rule rsx_method_rules[] = {
           "fixed-function texture matrices, a T&L stage the VP replaces; RPCS3 has no decoder"),
     HANDLED(RSX_CLASS_NV4097, 0x0280, 4, RSX_EV_CONSUMER, "NV4097_SET_SURFACE_PITCH_C/D, COLOR_C/DOFFSET",
             "the same two consumers for the MRT targets C and D"),
-    MISSING(RSX_CLASS_NV4097, 0x02B8, 1, "NV4097_SET_WINDOW_OFFSET",
-            "S2: the shader-window offset every window coordinate is translated by. The engine's epilogue "
-            "hard-codes offset 0 (rsx_draw_engine.c xf[]), the value the census sees, but the register is "
-            "not read, so a title that sets it would move geometry silently. RPCS3 decodes it (window_offset_x/y)"),
+    HANDLED(RSX_CLASS_NV4097, 0x02B8, 1, RSX_EV_CONSUMER, "NV4097_SET_WINDOW_OFFSET",
+            "rsx_dispatch.c rsx_dsp_get_surface: advances every colour and zeta base by pitch * y + texel * x "
+            "(the raster origin in memory, RPCS3 RSXThread.cpp); 0 is the identity"),
     INERT(RSX_CLASS_NV4097, 0x02BC, 1, RSX_EV_ORACLE_NULL, "NV4097_SET_WINDOW_CLIP_TYPE",
           "selects whether the window clip rectangles below discard or only clip; RPCS3 has no decoder for "
           "any of the window-clip registers"),

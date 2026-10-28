@@ -56,6 +56,7 @@
 #define M_RT_HORIZ              0x0200
 #define M_RT_VERT               0x0204
 #define M_RT_FORMAT             0x0208
+#define M_WINDOW_OFFSET         0x02B8
 #define M_COLOR0_PITCH          0x020C
 #define M_COLOR0_OFFSET         0x0210
 #define M_ZETA_OFFSET           0x0214
@@ -223,6 +224,7 @@ static void dsp_fill_classes(dsp_class_table* t)
     /* The front-face stencil block 0x328..0x344 (enable, mask, func, ref, func mask, three ops) is read
      * by rsx_draw_engine.c build_render_state. */
     mark_class(t, M_STENCIL_TEST_ENABLE, 8, RSX_DSP_CLASS_STATE);
+    mark_class(t, M_WINDOW_OFFSET,       1, RSX_DSP_CLASS_STATE); /* rsx_dsp_get_surface */
     mark_class(t, M_STENCIL_MASK,        1, RSX_DSP_CLASS_STATE);
     mark_class(t, M_TWO_SIDED_STENCIL,   1, RSX_DSP_CLASS_STATE);
     mark_class(t, M_BACK_STENCIL_MASK,   4, RSX_DSP_CLASS_STATE); /* MASK, FUNC, FUNC_REF, FUNC_MASK */
@@ -592,6 +594,31 @@ void rsx_dsp_get_surface(const rsx_dispatch* rsx, rsx_dsp_surface* out)
     out->zeta_offset   = rsx_dsp_reg(rsx, M_ZETA_OFFSET);
     out->zeta_pitch    = rsx_dsp_reg(rsx, M_ZETA_PITCH);
     out->zeta_location = dma_to_location(rsx_dsp_reg(rsx, M_DMA_ZETA));
+
+    /* SET_WINDOW_OFFSET (x bits 0-15, y 16-31) moves the raster origin in
+     * memory: every target's base advances by pitch * y + texel * x, with the
+     * texel at the sample resolution. RPCS3 d00d8023 RSXThread.cpp:1826-1852
+     * (texel sizes 1514-1515) applies it this way, verified on a title that
+     * declares new framebuffers only through the offset; no firmware path
+     * touches it. The surface clip keeps its size. Offset 0, which RESC and
+     * the default state send, is the identity. */
+    const u32 win = rsx_dsp_reg(rsx, M_WINDOW_OFFSET);
+    if (win) {
+        const u32 ox = win & 0xFFFF, oy = win >> 16;
+        u32 texel;
+        switch (out->color_format) {
+        case 0x1: case 0x2: case 0x3: case 0xA: texel = 2;  break;  /* X1R5G5B5, R5G6B5, G8B8 */
+        case 0x9:                                texel = 1;  break;  /* B8 */
+        case 0xB:                                texel = 8;  break;  /* F_W16Z16Y16X16 */
+        case 0xC:                                texel = 16; break;  /* F_W32Z32Y32X32 */
+        default:                                 texel = 4;  break;
+        }
+        for (int i = 0; i < 4; i++)
+            out->color_offset[i] += out->color_pitch[i] * oy + texel * out->aa_sx * ox;
+        /* Z16 and its float form are 2 bytes, Z24S8 and its float form 4. */
+        const u32 ztexel = (out->depth_format == 1 || out->depth_format == 3) ? 2u : 4u;
+        out->zeta_offset += out->zeta_pitch * oy + ztexel * out->aa_sx * ox;
+    }
 }
 
 /* Depth range: the guest's window z (what the vertex program and the viewport transform produce) is

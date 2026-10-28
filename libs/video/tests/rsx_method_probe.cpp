@@ -67,8 +67,8 @@ int main(int argc, char** argv)
         check(rsx_method_check(RSX_CLASS_NV4097, 0x0300, 1u, nullptr) == RSX_METHOD_INERT &&
               rsx_method_check(RSX_CLASS_NV4097, 0x0300, 0u, nullptr) == RSX_METHOD_MISSING,
               "the rule finder and the value check agree without an out-parameter");
-        check(rsx_method_check(RSX_CLASS_NV4097, 0x02B8, 0u, nullptr) == RSX_METHOD_MISSING,
-              "an S2 gap is missing for every value (NV4097 0x02B8 window offset)");
+        check(rsx_method_check(RSX_CLASS_NV4097, 0x1D88, 0u, nullptr) == RSX_METHOD_MISSING,
+              "an S2 gap is missing for every value (NV4097 0x1D88 shader window)");
     }
 
     /* 3. A pair with no row is unknown. */

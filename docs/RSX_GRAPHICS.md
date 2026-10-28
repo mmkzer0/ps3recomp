@@ -574,7 +574,7 @@ method, like the header.
 | NV4097 | 0x0238+1 | `NV4097_SET_CYLINDRICAL_WRAP[0:1]` | inert | oracle-null | NV30-era cylindrical texture wrap; RPCS3 binds nullptr with no decoder; the sampler decodes wrap  from TEX_ADDRESS (rsx_dsp_get_texture.wrap), which ... |
 | NV4097 | 0x0240+3 | `NV4097_SET_TEX_MATRIX_ENABLE[0:3] (rnndb)` | inert | absent-stage | fixed-function texture matrices, a T&L stage the VP replaces; RPCS3 has no decoder |
 | NV4097 | 0x0280+3 | `NV4097_SET_SURFACE_PITCH_C/D, COLOR_C/DOFFSET` | handled | consumer | the same two consumers for the MRT targets C and D |
-| NV4097 | 0x02B8 | `NV4097_SET_WINDOW_OFFSET` | missing | missing | S2: the shader-window offset every window coordinate is translated by. The engine's epilogue  hard-codes offset 0 (rsx_draw_engine.c xf[]), the value ... |
+| NV4097 | 0x02B8 | `NV4097_SET_WINDOW_OFFSET` | handled | consumer | rsx_dispatch.c rsx_dsp_get_surface: advances every colour and zeta base by pitch * y + texel * x (the raster origin in memory, RPCS3 RSXThread.cpp); 0 is the identity |
 | NV4097 | 0x02BC | `NV4097_SET_WINDOW_CLIP_TYPE` | inert | oracle-null | selects whether the window clip rectangles below discard or only clip; RPCS3 has no decoder for  any of the window-clip registers |
 | NV4097 | 0x02C0+15 | `NV4097_SET_WINDOW_CLIP_HORIZONTAL/VERTICAL[0:7]` | inert | oracle-null | eight window clip rectangles (0x2C0..0x2FC); RPCS3 decodes none of them; the engine clips with  the surface clip (rsx_dsp_get_surface) and the ... |
 | NV4097 | 0x0300 | `NV4097_SET_DITHER_ENABLE` | inert | oracle-value | enabled at reset (rsx_state::init 0x300=1). A dither matrix maps a value the ROP already holds  at the target's precision (8-bit for the A8R8G8B8 ... |
@@ -672,10 +672,10 @@ method, like the header.
 The 120 s Odin boot (`scratch/h1b-census`, the last `GCM_METHOD_STATS` block) carried 214 observations:
 NV4097 177, NV308A 10, NV309E 3, NV3062 2, NV3089 2, NV406E 1, driver 1, and 18 NV4097 methods seen
 before the first observed bind. Those 18 are the same methods as some of the 177, so the stream has 196
-distinct `(class, method)` pairs. Classified: **24 handled, 170 inert, 2 missing, 0 unknown** (21/170/5
-before the three back-face stencil registers got their consumer); the 18
+distinct `(class, method)` pairs. Classified: **25 handled, 170 inert, 1 missing, 0 unknown** (21/170/5
+before the back-face stencil registers and the window offset got their consumers); the 18
 pre-bind observations classify as the NV4097 rows they belong to. `libs/video/tests/test_rsx_method_census.c`
-replays the pair table through the real walker (214 writes + 7 binds: 37 handled, 180 inert, 4 missing,
+replays the pair table through the real walker (214 writes + 7 binds: 39 handled, 180 inert, 2 missing,
 0 unknown).
 
 ### Handled states the walker itself consumes
@@ -719,6 +719,5 @@ Tests: `rsx_depth_range` (host) and `depth_range_metal` (0.25/0.75 → depth buf
 
 | State | What the renderer does today | S2 row |
 |---|---|---|
-| `NV4097_SET_WINDOW_OFFSET` (`0x02B8`) | the window transform has a fixed zero offset | add a per-draw window offset to the viewport epilogue; needs RPCS3's `window_offset_x/y` semantics pinned first |
 | `NV4097_SET_SHADER_WINDOW` (`0x1D88`) | the NDC→window epilogue hard-codes a top-left origin and integer pixel centres | decode height/origin/pixel-centre and apply it in the epilogue; needs a reference frame to settle the convention (M3 non-goal) |
 | `NV4097_SET_BLEND_COLOR` (`0x031C`) | constant blend factors use the host default instead of the guest's colour | add the four floats to the pipeline/encoder state |
