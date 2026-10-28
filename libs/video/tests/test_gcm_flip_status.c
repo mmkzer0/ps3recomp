@@ -6,7 +6,7 @@
  * ticker marks a completion pending, but the flip handler only runs when a
  * guest thread next pumps, and the title may have requested another flip by
  * then. That newer request must stay WAITING until a tick of its own
- * completes it, and so must one that outlives cellGcmSetWaitFlip's bound.
+ * completes it.
  */
 #include "../cellGcmSys.c"
 #include <assert.h>
@@ -52,15 +52,6 @@ int main(void)
     cellGcmTickFlip();
     ppu_gcm_pump();
     assert(flips == 3 && cellGcmGetFlipStatus() == CELL_GCM_FLIP_STATUS_DONE);
-
-    /* cellGcmSetWaitFlip gives up after its bound, but the flip it waited
-     * for is still outstanding and its handler still has to run. */
-    cellGcmResetFlipStatus();
-    cellGcmSetWaitFlip();
-    assert(cellGcmGetFlipStatus() == CELL_GCM_FLIP_STATUS_WAITING);
-    cellGcmTickFlip();
-    ppu_gcm_pump();
-    assert(flips == 4 && cellGcmGetFlipStatus() == CELL_GCM_FLIP_STATUS_DONE);
 
     puts("GCM flip status checks passed");
 }

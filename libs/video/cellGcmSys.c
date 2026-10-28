@@ -1189,30 +1189,6 @@ void cellGcmSetFlipMode(u32 mode)
     s_flip_mode = mode;
 }
 
-/* NID: 0x983FB9AA */
-void cellGcmSetWaitFlip(void)
-{
-    /* Block until the pending flip completes (the present thread marks it done
-     * via cellGcmTickFlip, ~once per display refresh). This throttles the title
-     * to vsync; without it the guest loops unthrottled and many frames batch
-     * into a single host present -> the console text stacks/duplicates. */
-#ifdef _WIN32
-    __declspec(dllimport) void __stdcall Sleep(unsigned long);
-#endif  /* elsewhere: runtime/platform/win32_compat.h */
-    for (int i = 0; i < 64 && s_flip_status == CELL_GCM_FLIP_STATUS_WAITING; i++)
-        Sleep(1);
-    /* A flip still WAITING after the bound is left to the tick. Forcing DONE
-     * here skipped its completion: the tick only completes WAITING flips, so
-     * the flip handler never ran for it, and inFAMOUS 2, whose handler writes
-     * the FIFO put it deferred, hung with get == put whenever a frame took
-     * longer than the bound. */
-}
-
-/* NID: 0xDF6476BD. The same wait without libgcm's command-buffer space check;
- * this HLE writes no command, so it is the same call. GH3 makes it ~36 times
- * a boot and got a faked CELL_OK (no wait at all) before this was registered. */
-void cellGcmSetWaitFlipUnsafe(void) { cellGcmSetWaitFlip(); }
-
 /* NID: 0xB2E761D4 */
 void cellGcmResetFlipStatus(void)
 {
@@ -1569,6 +1545,46 @@ static int gcm_span_ok(u64 ea, u64 size)
 {
     return size && ea + size <= gcm_vm_limit();
 }
+
+/* cellGcmSetWaitFlip (NID 0x983FB9AA, libgcm_sys 0x02001180) and cellGcmSetWaitFlipUnsafe (NID 0xDF6476BD,
+ * 0x02001228; OPD 0x0200B93C): the firmware never waits on the CPU. It appends two method pairs to the
+ * caller's command context and advances `current` by 16:
+ *   {0x00040064, 0x10}   NV406E SEMAPHORE_OFFSET: label 0x10, the flip-done label the flip command releases
+ *                        as 0xFFFFFFFF (cellGcm_emit_flip_command) in the semaphore context its `CALL 0`
+ *                        default state leaves selected (0x66616661, the label window)
+ *   {0x00040068, 0}      NV406E SEMAPHORE_ACQUIRE: the RSX holds here until the label is 0
+ * SetWaitFlip reserves the 16 bytes first (`current + 16 > end` calls callback(ctx, 4), then writes
+ * without looking again; cellGcm_ctx_reserve stops when the callback left no room). The Unsafe export
+ * is the same words at `current` with no space check.
+ *
+ * The wait is the walker's NV406E acquire. What sets label 0x10 back to 0 is the driver half, outside
+ * the firmware image: here the next vblank after a retired flip head (cellGcm_vblank_flip_label), which
+ * is RPCS3's flip completion on its driver (!isHLE) path (pinned d00d8023: rpcs3/Emu/RSX/RSXThread.cpp:
+ * 3725-3735 handle_emu_flip runs flip(), then emits sys_rsx_context_attribute(0xFEC);
+ * rpcs3/Emu/Cell/lv2/sys_rsx.cpp:1035-1046 stores
+ * u128{} at `label_addr + 0x10`). A SetWaitFlip with no flip outstanding passes at once (label 0).
+ * The old HLE slept up to 64 ms per call on the PPU, which the firmware does not. */
+static void gcm_wait_flip_group(const char* func, void* context, int reserve)
+{
+    const u32 ctx = (u32)(uintptr_t)context;
+    /* The context is read (+4 end, +8 current, +0xC callback) and written (+8) as one 16-byte object. */
+    if (!gcm_span_ok(ctx, sizeof(CellGcmContextData)))
+        ps3_stop_guest_range(func, "ctx", ctx, sizeof(CellGcmContextData), gcm_vm_limit());
+    if (reserve)
+        cellGcm_ctx_reserve(ctx, 4);
+    const u32 cur = vm_read32(ctx + 8);
+    if (!gcm_span_ok(cur, 16))
+        ps3_stop_guest_range(func, "current", cur, 16, gcm_vm_limit());
+    vm_write32(cur + 0, 0x00040064u);
+    vm_write32(cur + 4, GCM_LABEL_FLIP_DONE);
+    vm_write32(cur + 8, 0x00040068u);
+    vm_write32(cur + 12, 0u);
+    vm_write32(ctx + 8, cur + 16u);
+}
+
+void cellGcmSetWaitFlip(void* context) { gcm_wait_flip_group("cellGcmSetWaitFlip", context, 1); }
+
+void cellGcmSetWaitFlipUnsafe(void* context) { gcm_wait_flip_group("cellGcmSetWaitFlipUnsafe", context, 0); }
 
 /* Open the capture event for one walker step. */
 static void gcm_cap_step(u32 kind, u32 get, u32 put, const u32* words, u32 nwords,
@@ -4164,8 +4180,9 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
         s_flip_request_count++;
         s_flip_direct_pending = 1;
     }
-    /* Flip requested but not yet shown: a subsequent cellGcmSetWaitFlip blocks
-     * until the present thread's cellGcmTickFlip marks it done (vsync). */
+    /* Flip requested but not yet shown: the status stays WAITING until the present thread's
+     * cellGcmTickFlip marks it done (vsync). cellGcmSetWaitFlip does not look at it: its wait is the
+     * RSX's, on label 0x10. */
     FLIP_LOCK();
     s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
     s_flip_req_seq++;
@@ -4206,6 +4223,9 @@ int cellGcm_ctx_reserve(u32 ctx, u32 words)
     if (cur + words * 4u <= end)
         return 1;
     const u32 opd = vm_read32(ctx + 0xC);
+    /* The OPD is a guest pointer the firmware loads two words from (code, TOC). */
+    if (opd && !gcm_span_ok(opd, 8))
+        ps3_stop_guest_range("cellGcm_ctx_reserve", "callback", opd, 8, gcm_vm_limit());
     if (opd && vm_read32(opd) == GCM_FIFO_CALLBACK_SENTINEL_EA)
         cellGcm_fifo_recycle(ctx);                       /* the runtime's own ring */
     else if (opd)

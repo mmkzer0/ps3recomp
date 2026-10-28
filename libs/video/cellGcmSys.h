@@ -236,9 +236,11 @@ u32 cellGcmGetCurrentField(void);
 /* NID: 0x4AE8D215 */
 void cellGcmSetFlipMode(u32 mode);
 
-/* NID: 0x983FB9AA */
-void cellGcmSetWaitFlip(void);
-void cellGcmSetWaitFlipUnsafe(void);
+/* NID: 0x983FB9AA. `context` is the guest EA of a CellGcmContextData; the call appends the NV406E
+ * acquire of flip-done label 0x10 == 0 to it and returns, it does not wait on the CPU. */
+void cellGcmSetWaitFlip(void* context);
+/* NID: 0xDF6476BD: the same two pairs with no buffer-full check. */
+void cellGcmSetWaitFlipUnsafe(void* context);
 u32 cellGcmGetReport(u32 type, u32 index);
 
 /* NID: 0xB2E761D4 */
