@@ -301,8 +301,8 @@ static void verdicts(int with_missing)
     put1(0, 0x0100, 0);          /* NO_OPERATION: inert, allow-listed */
     put1(1, 0x0180, 0);          /* NV0039 DMA_NOTIFY: inert, allow-listed */
     if (with_missing) {
-        put1(0, 0x1D88, 0x12D0); /* shader window: an S2 gap, missing for its value */
-        put1(0, 0x1D88, 0x1000); /* ...twice, one distinct pair */
+        put1(0, 0x1FD8, 0x12D0); /* invalidate L2 (#64): a counted gap, missing for any value */
+        put1(0, 0x1FD8, 0x0001); /* ...twice, one distinct pair */
         put1(0, 0x0300, 0);      /* dither pinned to enabled=1: a different value is missing */
     }
     run();
@@ -322,8 +322,8 @@ static void verdicts(int with_missing)
         GcmUnknownMethod m[8];
         const u32 mn = gcm_missing_methods(m, 8);
         check(mn == 2 && m[0].cls == RSX_CLASS_NV4097 && m[0].method == 0x300 && m[0].count == 1 &&
-              m[0].data == 0 && m[1].method == 0x1D88 && m[1].count == 2 && m[1].data == 0x12D0,
-              "counted per pair: the off-value dither once, the shader window twice, with first data words");
+              m[0].data == 0 && m[1].method == 0x1FD8 && m[1].count == 2 && m[1].data == 0x12D0,
+              "counted per pair: the off-value dither once, the invalidate twice, with first data words");
         check(!strcmp(gcm_method_class_name(m[1].cls), "NV4097"), "the class has a name");
     } else {
         check(st.unknown == 0 && n == 0, "handled and allow-listed methods leave the unknown count at zero");

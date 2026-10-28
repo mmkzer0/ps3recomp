@@ -396,29 +396,21 @@ int main(void)
            st.handled, st.inert, st.missing, st.unknown, st.unbound);
     check(st.unknown == 0, "no census pair is unknown: the frame is valid and the live stop does not fire");
     check(st.unbound == 0, "nothing is dropped: every subchannel the census used is bound");
-    /* 22 census pairs are consumed by a named consumer, plus the seven SET_OBJECT writes that bind the
+    /* 34 census pairs are consumed by a named consumer, plus the seven SET_OBJECT writes that bind the
      * slots (each is a method the walker consumes). */
-    check(st.handled == 39, "39 writes are consumed by a named consumer");
+    check(st.handled == 41, "41 writes are consumed by a named consumer");
     check(st.inert == 180, "180 writes are allow-listed for the value they carry");
-    check(st.missing == 2, "2 writes are a known gap (1 pair), counted but not a stop");
+    check(st.missing == 0, "no census write is a known gap: the S2 gaps the census once carried all have consumers");
     check(st.handled + st.inert + st.missing == 221, "...and the three classes cover every write (214 pairs + 7 binds)");
 
     { GcmUnknownMethod u[8];
       check(gcm_unknown_methods(u, 8) == 0, "the unknown table is empty");
       GcmUnknownMethod m[8];
       const u32 n = gcm_missing_methods(m, 8);
-      /* The one known gap the census carries: the shader window, with its S2 row
-       * (docs/RSX_GRAPHICS.md); the window offset and the back-face stencil registers have their
-       * consumers. */
-      int seen[1] = { 0 };
-      static const u32 want[1] = { 0x1D88u };
-      for (u32 i = 0; i < n && i < 8; i++) {
+      for (u32 i = 0; i < n && i < 8; i++)
           printf("[census]   missing %s 0x%04X x%llu data 0x%08X\n",
                  gcm_method_class_name(m[i].cls), m[i].method, m[i].count, m[i].data);
-          for (unsigned k = 0; k < 1; k++)
-              if (m[i].cls == RSX_CLASS_NV4097 && m[i].method == want[k]) seen[k] = 1;
-      }
-      check(n == 1 && seen[0], "exactly the one S2 gap is reported missing, per pair"); }
+      check(n == 0, "the missing table is empty: the census has no S2 gap left"); }
 
     /* Fail-before for the stop: a pair with no row ends the walker with the four fields that locate it,
      * in a child so this process can continue. */

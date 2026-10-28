@@ -235,8 +235,9 @@ int main(int argc, char** argv)
     check(!s_nv309e.active, "...and NV308A's COLOR_FORMAT is not the swizzled surface's SET_FORMAT");
 
     /* 0b. The toolkit's own RESC convert-and-flip stream (resc_convert.c, the real generator) through the
-     * walker with the engine on: every word classified. It carries 0x1FD8 (NV4097_INVALIDATE_L2), which the
-     * legacy state machine took as an explicit no-op and the engine-on walker does not feed. */
+     * walker with the engine on: every word classified. It carries 0x1FD8 (NV4097_INVALIDATE_L2), a counted
+     * gap (#64): the title sends it every flip, so the walk must reach the end of the stream with it counted
+     * missing, not stop on it. */
     {
         RescConvertIn in;
         memset(&in, 0, sizeof in);
@@ -255,8 +256,9 @@ int main(int argc, char** argv)
         vm_write32(ctrl + 0, rend);
         cellGcm_rsx_process_fifo();
         const GcmMethodStats r1 = stats();
-        check(s_fifo_getoff == rend && r1.unknown == r0.unknown && r1.handled + r1.inert > r0.handled + r0.inert,
-              "the RESC convert stream is walked to its end with every word classified (0x1FD8 included)");
+        check(s_fifo_getoff == rend && r1.unknown == r0.unknown && r1.missing > r0.missing &&
+              r1.handled + r1.inert > r0.handled + r0.inert,
+              "the RESC convert stream is walked to its end with every word classified (0x1FD8 counted missing)");
     }
 
     /* 1. The census verdict of a register only the engine reads. The engine is on, no vtable backend is
