@@ -44,3 +44,22 @@ target_include_directories(test_gcm_setwaitflip PRIVATE
 set_target_properties(test_gcm_setwaitflip PROPERTIES LINKER_LANGUAGE CXX)
 add_test(NAME gcm_setwaitflip COMMAND test_gcm_setwaitflip)
 set_tests_properties(gcm_setwaitflip PROPERTIES LABELS "gcm;t0")
+
+# cellGcmGetVBlankCount returns the counter and does not advance it (RPCS3 cellGcmSys.cpp:889-894); each raised
+# vblank adds exactly 1; the handler's argument is that count; a vblank thread against a polling reader (tsan).
+add_executable(test_gcm_vblank_count
+    test_vblank_count.c
+    "${PROJECT_SOURCE_DIR}/runtime/host/host_stubs.c"
+)
+target_link_libraries(test_gcm_vblank_count PRIVATE ps3recomp_runtime Threads::Threads)
+if(NOT WIN32)
+    target_link_libraries(test_gcm_vblank_count PRIVATE m)
+endif()
+target_include_directories(test_gcm_vblank_count PRIVATE
+    "${PROJECT_SOURCE_DIR}/libs/video"
+    "${PROJECT_SOURCE_DIR}/include"
+    "${PROJECT_SOURCE_DIR}/runtime"
+)
+set_target_properties(test_gcm_vblank_count PROPERTIES LINKER_LANGUAGE CXX)
+add_test(NAME gcm_vblank_count COMMAND test_gcm_vblank_count)
+set_tests_properties(gcm_vblank_count PROPERTIES LABELS "gcm;t0;tsan")

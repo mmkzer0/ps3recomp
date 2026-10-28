@@ -577,8 +577,9 @@ static CellGcmSecondVHandler s_second_v_handler = NULL;
 /* Flip timing */
 static u64 s_last_flip_time = 0;
 
-/* VBlank counter (incremented on each flip as approximation) */
-static u32 s_vblank_count = 0;
+/* VBlank counter: vblanks raised since init. Written by the vblank thread (cellGcm_request_tick,
+ * cellGcm_vblank_signal) and read by any PPU thread (cellGcmGetVBlankCount) and by the handler pump. */
+static _Atomic u32 s_vblank_count = 0;
 
 /* IO map reservation tracking */
 static u32 s_io_map_reserved = 0;  /* bytes reserved for IO mapping */
@@ -964,7 +965,7 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
     s_flip_mode = CELL_GCM_DISPLAY_VSYNC;
     s_debug_level = CELL_GCM_DEBUG_LEVEL0;
-    s_vblank_count = 0;
+    atomic_store_explicit(&s_vblank_count, 0, memory_order_release);
     s_io_map_reserved = 0;
     s_default_fifo_mode = 0;
     s_graphics_handler = NULL;
@@ -1266,7 +1267,7 @@ static u32 s_fifo_getoff;   /* tentative: defined below */
 
 void cellGcm_request_tick(void)
 {
-    s_vblank_count++;
+    atomic_fetch_add_explicit(&s_vblank_count, 1, memory_order_release);
     GCM_VBLANK_POST();
     /* GCM_FLIP_NEEDS_FIFO=1: only mark a flip pending once the walker has
      * actually consumed up to `put`.
@@ -1339,17 +1340,20 @@ void ppu_gcm_pump(void)
       if (d) { calls++; if (p & 1) nv++; if (p & 2) nf++;
                if ((calls % 20000) == 0)
                    fprintf(stderr, "[gcm-pump] calls=%u vblank=%u flip=%u vcount=%u%c",
-                           calls, nv, nf, s_vblank_count, 10); } }
+                           calls, nv, nf, atomic_load_explicit(&s_vblank_count, memory_order_relaxed), 10); } }
     if (p & 1) {
         /* One call per vblank the driver raised since the last pump, not one for however many are pending: the
          * console's interrupt posts each vblank to the handler (RPCS3's vblank thread queues one handler call per
          * vblank it fires, late ones back to back). With one vblank pending this is the old single call. Each call
          * gets its own vblank number, the last one the current count. */
         const long n = (long)GCM_VBLANK_TAKE();
+        /* One load for the whole batch: the handler numbers of one pump stay consecutive when the vblank thread
+         * raises another while they are being delivered. */
+        const u32 vcount = atomic_load_explicit(&s_vblank_count, memory_order_acquire);
         if (s_vblank_handler_opd && g_ps3_guest_caller) {
             for (long i = 0; i < n; i++) {
                 ydkj_restore_handler_opd(s_vblank_handler_opd, s_vblank_handler_code);
-                g_ps3_guest_caller(s_vblank_handler_opd, (uint64_t)(s_vblank_count - (u32)(n - 1 - i)),
+                g_ps3_guest_caller(s_vblank_handler_opd, (uint64_t)(vcount - (u32)(n - 1 - i)),
                                    0, 0, 0, 0, 0, 0, 0);
             }
         }
@@ -1389,7 +1393,7 @@ void ppu_gcm_pump(void)
  * the head's ACQUIRE, so the present has to come first. cellGcmTickVBlank is the two in that order. */
 void cellGcm_vblank_signal(void)
 {
-    s_vblank_count++;
+    atomic_fetch_add_explicit(&s_vblank_count, 1, memory_order_release);
     GCM_VBLANK_POST();
     GCM_PENDING_SET(1);
 }
@@ -5262,7 +5266,7 @@ void cellGcmTerminate(void)
     s_flip_mode   = CELL_GCM_DISPLAY_VSYNC;
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
     s_debug_level = CELL_GCM_DEBUG_LEVEL0;
-    s_vblank_count = 0;
+    atomic_store_explicit(&s_vblank_count, 0, memory_order_release);
     s_io_map_reserved = 0;
     s_default_fifo_mode = 0;
     GCM_USER_STORE(0);
@@ -5337,11 +5341,21 @@ s32 cellGcmUnreserveIoMapSize(u32 size)
     return CELL_OK;
 }
 
-/* Return incrementing VBlank counter */
+/* The vblank counter, unchanged: the number of vblanks raised since init.
+ *
+ * FW 4.93 libgcm_sys (static RE): the export is a pure load of the head's vblank count from the driver-info block
+ * (`ld` at ctx + head*64 + 0x10E8), with no store and no syscall; nothing advances on read. RPCS3 (pinned
+ * d00d80231af3f9b0286f38fd72f7513583f1a9d4) rpcs3/Emu/Cell/Modules/cellGcmSys.cpp:883-888 agrees:
+ * `return rsx::get_current_renderer()->vblank_count;`. The count advances only where the vblank thread raises a
+ * vblank (cellGcm_request_tick / cellGcm_vblank_signal here). This body used to be `return s_vblank_count++`, so every
+ * query was a vblank: a caller that polls the count to pace itself (the sceNpTrophy status sequence) saw time pass
+ * as fast as it asked.
+ *
+ * Acquire pairs with the release fetch_add at the two vblank sites; the vblank thread and any PPU thread reach the
+ * counter, and a reader that sees a count also sees what the vblank thread did before raising it. */
 u32 cellGcmGetVBlankCount(void)
 {
-    /* Approximate: increment each time queried (games use this for timing) */
-    return s_vblank_count++;
+    return atomic_load_explicit(&s_vblank_count, memory_order_acquire);
 }
 
 /* Return tile info for a given index */
