@@ -24,6 +24,7 @@
 #include "sys_memory.h"
 #include "sys_vm.h"
 #include "sys_fs.h"
+#include "sys_dbg.h"
 extern void sys_rsx_init(lv2_syscall_table* tbl);   /* libs/video/sys_rsx.c */
 extern void sys_raw_spu_init(lv2_syscall_table* tbl);   /* runtime/spu/spu_raw.c */
 extern void spu_raw_note_image(uint32_t src_ea, uint32_t entry);
@@ -2572,10 +2573,8 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
     /* TTY (debug console I/O — used by CRT startup) */
     lv2_syscall_register(tbl, SYS_TTY_READ,  sys_tty_read);
     lv2_syscall_register(tbl, SYS_TTY_WRITE, sys_tty_write);
-    /* Some SDK-era CRTs (Tokyo Jungle, Sonic/Gunstar hubs, 4 Elements HD) issue
-     * sys_tty_write under the alternate number 988 (0x3DC) instead of 403; an
-     * unimplemented return derails the CRT init table-walk into abort(). Alias it. */
-    lv2_syscall_register(tbl, 988, sys_tty_write);
+    /* 988 is not a second number for sys_tty_write; see sys_dbg.c. */
+    sys_dbg_init(tbl);
 
     /* sys_ss_get_open_psid (console PSN/NP identity) — LBP 1.30 reads it during
      * boot; the unimplemented stub left the out-param as garbage. */

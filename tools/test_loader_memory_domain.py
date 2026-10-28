@@ -8,7 +8,7 @@ root=Path(__file__).resolve().parents[1]
 def main():
  if os.name=='nt':print('SKIP: standalone loader regression needs POSIX compiler');return 0
  src=(root/'runtime/ppu/ppu_loader.cpp').read_text()
- body=src[src.index('    case 330: {'):src.index('    case 988:',src.index('    case 330: {'))]
+ body=src[src.index('    case 330: {'):src.index('    case 403: {',src.index('    case 330: {'))]
  pre='''#include "sys_memory.h"
 #include <cstdio>
 #include <cstdlib>
