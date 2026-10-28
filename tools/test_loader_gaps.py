@@ -5,8 +5,14 @@ Lifts a synthetic image with the real ppu_lifter.py (one function that is fine,
 one that contains an instruction the lifter cannot translate), builds the real
 ppu_loader.cpp against that lift, and runs tests/test_loader_gaps.cpp:
 
-  - an lv2 syscall nobody implements: stop unimplemented-syscall, naming the
-    number; allow-listed in [[lv2.stub]], it returns exactly the configured value;
+  - an lv2 syscall the firmware implements and nobody here does: stop
+    unimplemented-syscall, naming the number; allow-listed in [[lv2.stub]] it
+    returns exactly the configured value, even when the firmware's slot is the
+    ENOSYS stub;
+  - a slot the FW 4.93 stock lv2_kernel leaves on the shared ENOSYS stub:
+    answered 0x80010003 per call, with r4..r10 and guest memory intact and the
+    PS3_SCTRACE note once per slot; a slot RPCS3 binds although stock says
+    ENOSYS keeps the stop;
   - lv2 syscall 988 is the table's handler (kind id and flag, firmware contract),
     not an inline TTY write: it reads no guest memory and changes only r3;
   - a call into a function the lift does not contain: unlifted-function, naming
@@ -206,17 +212,37 @@ def main():
         f = g.expect_stop(p, 'unlifted-function')
         assert f['target'] == '0x0000FF00', f
 
-        # unimplemented syscall
-        p = run('syscall', '999')
+        # A slot the firmware implements and the toolkit does not is still a
+        # named stop. Slot 2 has a handler in the FW 4.93 stock lv2_kernel
+        # table (docs/LV2-SYSCALL-STATUS.md).
+        p = run('syscall', '2')
         assert 'RETURNED' not in p.stdout, 'the runtime answered an unimplemented syscall'
         f = g.expect_stop(p, 'unimplemented-syscall')
-        assert f['num'] == '999' and f['caller_lr'] == '0x00010100', f
+        assert f['num'] == '2' and f['caller_lr'] == '0x00010100', f
+        # A slot stock 4.93 leaves on the kernel's shared ENOSYS stub is
+        # answered 0x80010003 per call, as the stub does; r4..r10 and guest
+        # memory stay. Slot 6 is one of the CFW-only handlers (present in the
+        # 4.81 REBUG/Cobra dump, ENOSYS on stock), so this pins the stock map
+        # as primary.
+        p = run('scenosys', '6')
+        assert p.returncode == 0, (p.stdout, p.stderr)
+        assert 'SCENOSYS regs_intact=1 memory_intact=1 answers_ok=1' in p.stdout, (p.stdout, p.stderr)
+        assert 'RETURNED r3=0xFFFFFFFF80010003' in p.stdout, (p.stdout, p.stderr)
+        assert 'lv2 ENOSYS slot' not in p.stderr, p.stderr
+        # The PS3_SCTRACE diagnostic says so once per slot, not once per call.
+        p = g.run([str(binary), 'scenosys', '6', '2'], env=g.clean_env(PS3_SCTRACE='1'))
+        assert p.returncode == 0, (p.stdout, p.stderr)
+        assert p.stderr.count('lv2 ENOSYS slot 6 answered 0x80010003') == 1, p.stderr
+        # RPCS3 binds slot 60 although the stock table says ENOSYS: the
+        # 4.93-vs-RPCS3 conflict keeps the stop.
+        g.expect_stop(run('syscall', '60'), 'unimplemented-syscall')
+        # The allow-list wins over the firmware ENOSYS answer.
         cfg = tmp / 'title.toml'
-        cfg.write_text('schema = 1\n[[lv2.stub]]\nnum = 999\nret = 0x80010003\nreason = "synthetic test gap"\n')
-        p = run('syscall', '999', cfg=cfg)
-        assert p.returncode == 0 and 'RETURNED r3=0xFFFFFFFF80010003' in p.stdout, (p.stdout, p.stderr)
-        assert 'ALLOW-LISTED unimplemented syscall 999' in p.stderr and 'synthetic test gap' in p.stderr
-        g.expect_stop(run('syscall', '998', cfg=cfg), 'unimplemented-syscall')   # only the listed number
+        cfg.write_text('schema = 1\n[[lv2.stub]]\nnum = 16\nret = 0x12345678\nreason = "synthetic test gap"\n')
+        p = run('syscall', '16', cfg=cfg)
+        assert p.returncode == 0 and 'RETURNED r3=0x12345678' in p.stdout, (p.stdout, p.stderr)
+        assert 'ALLOW-LISTED unimplemented syscall 16' in p.stderr and 'synthetic test gap' in p.stderr
+        g.expect_stop(run('syscall', '2', cfg=cfg), 'unimplemented-syscall')   # only the listed number
 
         # Syscall 988 is not sys_tty_write: with r4 = 0 and r5 pointing into live memory it
         # reads no buffer. Contract from the lv2 handler (sys_dbg.c): kind ids 1, 2, 4, 8 and

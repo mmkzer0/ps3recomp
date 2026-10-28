@@ -739,6 +739,12 @@ if(PS3RECOMP_BUILD_TESTS)
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_check_commit_msg.py")
         set_tests_properties(check_hygiene check_commit_msg PROPERTIES LABELS "tools;t0")
+        # The LV2 status generator: verdicts from a synthetic map, and the
+        # generated ENOSYS bitmap compiled and queried from C.
+        add_test(NAME lv2_syscall_status
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_lv2_syscall_status.py")
+        set_tests_properties(lv2_syscall_status PROPERTIES LABELS "tools;t0")
         # The lifter records the SHA-256 of the file it lifts; the runtime's
         # identity gate compares the loaded executable against it.
         add_test(NAME lifter_identity

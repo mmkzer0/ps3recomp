@@ -32,6 +32,15 @@ The LV2 kernel provides system services to PS3 games through the `sc` (System Ca
 
 **Implementation files:** `runtime/syscalls/sys_*.c` and `runtime/syscalls/sys_*.h`
 
+The per-slot audit against the **FW 4.93 stock lv2_kernel (PUP)** table,
+corroborated by the LV2 dump FW 4.81 REBUG/Cobra, and RPCS3 at its pinned
+commit, is [LV2-SYSCALL-STATUS.md](LV2-SYSCALL-STATUS.md). A slot the stock
+kernel leaves on the shared ENOSYS stub, and that neither the toolkit nor
+RPCS3 implements, is answered `CELL_ENOSYS` (`0x80010003`) per call as that
+stub does, instead of stopping. A stock handler the toolkit does not implement
+still stops with `unimplemented-syscall`, as does a slot stock says is ENOSYS
+but RPCS3 binds.
+
 ### Platform Mapping
 
 | PS3 Concept | Windows Implementation | POSIX Implementation |
@@ -568,7 +577,7 @@ The implementation reads raw bytes from guest memory (`vm_base + buf_addr`) and 
 
 ### Syscall 988 (0x3DC) is not a TTY call
 
-`runtime/syscalls/sys_dbg.c`. An SDK exit path issues it as `(r3, r4) = (1, 0)` with the other argument registers stale and discards the result, so a TTY writer reading `r4` as a buffer faulted on the null page. The handler takes no guest pointer and writes no guest memory. Contract (lv2 kernel dump FW 4.81 REBUG/Cobra, handler `0x8000000000277688`, assumed identical on stock firmware; RPCS3 `d00d80231af3f9b0286f38fd72f7513583f1a9d4` `lv2.cpp:961` binds the slot to `null_func` and agrees only on the success path): `r3` is a kind id of 1, 2, 4, 8 or 16 and `r4` a flag word that must be 0, each judged on its low 32 bits; anything else is `CELL_EINVAL`, otherwise `CELL_OK`. The firmware's `CELL_ESRCH` for an unresolvable calling process cannot occur here.
+`runtime/syscalls/sys_dbg.c`. An SDK exit path issues it as `(r3, r4) = (1, 0)` with the other argument registers stale and discards the result, so a TTY writer reading `r4` as a buffer faulted on the null page. The handler takes no guest pointer and writes no guest memory. Contract (FW 4.93 stock `lv2_kernel` from the official PUP: handler at the same VA as in the 4.81 REBUG/Cobra dump, `0x8000000000277688`, 88 instructions identical; RPCS3 `d00d80231af3f9b0286f38fd72f7513583f1a9d4` `lv2.cpp:961` binds the slot to `null_func` and agrees only on the success path): `r3` is a kind id of 1, 2, 4, 8 or 16 and `r4` a flag word that must be 0, each judged on its low 32 bits; anything else is `CELL_EINVAL`, otherwise `CELL_OK`. The firmware's `CELL_ESRCH` for an unresolvable calling process cannot occur here.
 
 ---
 

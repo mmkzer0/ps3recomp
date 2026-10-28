@@ -132,6 +132,7 @@ LOADER_SUPPORT_C_SOURCES = [
     "runtime/memory/reservation.c",
     "runtime/memory/label_window.c",         # ppu_store_window / ppu_set_store_hook (moved out of the loader)
     "runtime/syscalls/sdk_version_weak.c",   # g_ps3_sdk_version, which ppu_load_elf sets from PROC_PARAM
+    "runtime/syscalls/lv2_enosys_bitmap.c",  # lv2_enosys_default_answer, called by lv2_syscall's default path
 ]
 
 

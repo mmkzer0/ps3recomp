@@ -44,6 +44,7 @@
 #include "ps3emu/lifter_abi.h"   /* ps3_lifter_abi_check */
 #include "ps3emu/milestone.h"   /* ps3_ms / ps3_msf -- boot milestone log */     /* ppu_context, func decls, ppu_recomp_register */
 #include "../syscalls/ppu_thread_id.h"   /* ppu_tid_diag_index: the in-flight tables are indexed by table slot */
+#include "../syscalls/lv2_enosys_bitmap.h" /* generated: FW 4.93 stock lv2_kernel ENOSYS slots */
 #include "../memory/vm.h"   /* vm_commit -- sys_mmapper_search_and_map maps for real */
 #include "../memory/label_window.h"   /* the store window, shared with the SPU MFC path */
 #include "../platform/win32_compat.h"      /* Win32 types, interlocked ops, Sleep/QPC on POSIX */
@@ -283,13 +284,18 @@ extern "C" void ps3_install_guest_ptr_trap(void)
  * that returns an error is silent, and that is the harder failure to find:
  * middleware just prints its own complaint and tears down. Optionally filtered
  * to failures only with PS3_SCTRACE=fail. */
+static int s_sc_trace_mode = -1;   /* 0 off, 1 all, 2 failures only */
+static int sc_trace_enabled(void)
+{
+    if (s_sc_trace_mode < 0) { const char* e = getenv("PS3_SCTRACE");
+        s_sc_trace_mode = !e ? 0 : (strcmp(e, "fail") == 0 ? 2 : 1); }
+    return s_sc_trace_mode != 0;
+}
 static void sc_trace(uint64_t num, ppu_context* ctx, uint64_t a3, uint64_t a4,
                      uint64_t a5, uint64_t a6)
 {
-    static int mode = -1;
-    if (mode < 0) { const char* e = getenv("PS3_SCTRACE");
-        mode = !e ? 0 : (strcmp(e, "fail") == 0 ? 2 : 1); }
-    if (!mode) return;
+    if (!sc_trace_enabled()) return;
+    const int mode = s_sc_trace_mode;
     int64_t rv = (int64_t)ctx->gpr[3];
     if (mode == 2 && (rv == 0 || (uint64_t)rv < 0x80000000ull)) return;
     /* Resolve the GUEST function that made the call: walk the host stack and
@@ -3326,11 +3332,13 @@ extern "C" void lv2_syscall(ppu_context* ctx)
             }
         }
         /* No handler. Answering CELL_OK told the guest its own call succeeded; the
-         * default is now a named stop (unimplemented-syscall), and the only way
-         * on is a per-number [[lv2.stub]] entry with a return value and a reason
-         * (docs/CONFIG.md), reported once per number. The args are snapshotted
-         * before the return value overwrites r3, so PS3_SCTRACE still shows the
-         * gaps it is most wanted for. */
+         * default is a named stop (unimplemented-syscall). Two things go on
+         * instead: a slot the firmware's own table leaves on the shared ENOSYS
+         * stub gets that stub's answer (below), and a per-number [[lv2.stub]]
+         * entry returns a configured value and reason (docs/CONFIG.md), reported
+         * once per number. The allow-list wins over the ENOSYS answer. The args
+         * are snapshotted before the return value overwrites r3, so PS3_SCTRACE
+         * still shows the gaps it is most wanted for. */
         { uint64_t _a3 = ctx->gpr[3], _a4 = ctx->gpr[4],
                    _a5 = ctx->gpr[5], _a6 = ctx->gpr[6];
           if (const ps3_cfg_lv2_stub* s = ps3_config_find_lv2_stub((uint32_t)num)) {
@@ -3341,6 +3349,28 @@ extern "C" void lv2_syscall(ppu_context* ctx)
                           (unsigned long long)num, s->ret, s->reason,
                           ps3_config_file() ? ps3_config_file() : "?", s->line);
               ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)s->ret;
+              sc_trace(num, ctx, _a3, _a4, _a5, _a6);
+              return;
+          }
+          /* The FW 4.93 stock lv2_kernel (from the official PUP) leaves this
+           * slot on the shared ENOSYS stub, and neither the toolkit nor RPCS3
+           * at pin d00d8023 implements it. The stub returns CELL_ENOSYS, so
+           * answer the same per call instead of stopping: a title probing an
+           * unused number gets the answer hardware gives it. The allow-list
+           * above still wins. The bitmap is generated
+           * (tools/lv2_syscall_status.py) and its status table is
+           * docs/LV2-SYSCALL-STATUS.md. */
+          if (lv2_enosys_default_answer((uint32_t)num)) {
+              ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ENOSYS;
+              /* Once per slot, and only under the existing syscall tracer. */
+              if (sc_trace_enabled()) {
+                  static std::atomic<uint64_t> reported[16];
+                  const uint64_t bit = 1ull << (num & 63);
+                  if (!(reported[num >> 6].fetch_or(bit) & bit))
+                      fprintf(stderr, "[ppu] lv2 ENOSYS slot %llu answered 0x%08X "
+                              "(FW 4.93 stock lv2_kernel)\n",
+                              (unsigned long long)num, (unsigned)CELL_ENOSYS);
+              }
               sc_trace(num, ctx, _a3, _a4, _a5, _a6);
               return;
           }
