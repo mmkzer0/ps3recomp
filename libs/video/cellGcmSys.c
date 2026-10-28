@@ -129,6 +129,8 @@ static struct {
 } s_miss_tab[RSX_CLASS_COUNT][0x800];
 static unsigned s_mc_logged, s_miss_logged;
 
+static void gcm_2d_state_log(u32 subch, u32 method, u32 data);   /* the 2D engines' registers, defined with them */
+
 /* `handled` says a consumer took the method. Otherwise the (class, method) pair is looked up in the
  * table (rsx_method_class.h): INERT when the write carries the value the row pins, MISSING when the
  * row is an S2 gap or the write differs from the pinned value, and UNKNOWN when no row covers the pair
@@ -176,6 +178,8 @@ static void gcm_method_verdict(u32 subch, u32 m, u32 data, int handled, u32 fifo
         }
     }
     if (s_cap) s_cap->note(RSX_CAP_NOTE_UNKNOWN_METHOD, subch, m, data);
+    /* A stop inside an inline transfer carries the transfer's state: one run must say what the packet was. */
+    if (cls == RSX_CLASS_NV3062 || cls == RSX_CLASS_NV308A) gcm_2d_state_log(subch, m, data);
     ps3_stop_rsx_unknown_method(rsx_class_name(cls), m, subch, fifo, word, data);
 }
 
@@ -1639,6 +1643,10 @@ static u32 gcm_cap_read32(u32 off, u32 ea, u32 kind)
  * -----------------------------------------------------------------------*/
 extern u32 cellGcmResolveLocated(int local, u32 offset);
 
+/* The NV3062 destination and the NV308A inline-transfer registers. The NV3062 reset values are RPCS3's
+ * (rsx_methods.cpp:539-542, 667-670 at d00d8023: destination DMA 0xFEED0000, COLOR_FORMAT 0xA, PITCH
+ * 0x400040, OFFSET_DESTIN 0); the NV308A ones are what the libgcm default state writes every flip
+ * (gcm_default_state.c: surface context = the NV3062 handle, operation 3 = SRCCOPY, COLOR_FORMAT 4). */
 static struct {
     u32 dst_dma;      /* NV3062 0x0188 SET_CONTEXT_DMA_IMAGE_DESTIN */
     u32 color_fmt;    /* NV3062 0x0300 SET_COLOR_FORMAT             */
@@ -1646,7 +1654,19 @@ static struct {
     u32 dst_offset;   /* NV3062 0x030C SET_OFFSET_DESTIN            */
     u32 point;        /* NV308A 0x0304 SET_POINT ((y<<16)|x)        */
     u32 size_out;     /* NV308A 0x0308 SET_SIZE_OUT                 */
-} s_gcm2d;
+    u32 size_in;      /* NV308A 0x030C SET_SIZE_IN                  */
+    u32 ctx_surface;  /* NV308A 0x019C SET_CONTEXT_SURFACE          */
+    u32 operation;    /* NV308A 0x02FC SET_OPERATION                */
+    u32 src_fmt;      /* NV308A 0x0300 SET_COLOR_FORMAT             */
+    u32 words;        /* COLOR words since the last SIZE_IN write (this transfer) */
+    u64 words_total;  /* COLOR words ever seen */
+    u32 subch;        /* subchannel and method of the COLOR word in flight, for a stop's state */
+    u32 method;
+    u32 data;
+} s_gcm2d = {
+    .dst_dma = 0xFEED0000u, .color_fmt = 0xAu, .pitch = 0x400040u,
+    .ctx_surface = RSX_OBJ_NV3062, .operation = 3u, .src_fmt = 4u,
+};
 
 static struct {
     u32 src_dma, dst_surf, fmt, op, clip_pt, clip_sz, out_pt, out_sz;
@@ -1789,31 +1809,61 @@ static u32 gcm_m2mf_location(u32 dma, const char* which)
     ps3_stop_gcm_unmodelled(GCM_M2MF_FN, "m2mf-dma", why);
 }
 
+/* A guest-range stop. `state_fn`, when given, formats the transfer state of the engine that asked (the
+ * NV308A path): it goes into the stop's `arg` value and onto its own log line, so one stop line carries the
+ * packet state a second run would otherwise have to reproduce. It runs only on the way to the stop. */
+typedef void (*gcm_state_fn)(char* out, size_t n);
+static PS3_NORETURN void gcm_range_stop(const char* func, const char* which, gcm_state_fn state_fn, u64 ea, u64 size, u64 limit)
+{
+    char arg[704], state[640];
+    if (state_fn) {
+        state_fn(state, sizeof state);
+        fprintf(stderr, "[%s] range stop %s ea=0x%llX size=0x%llX limit=0x%llX | %s\n", func, which,
+                (unsigned long long)ea, (unsigned long long)size, (unsigned long long)limit, state);
+        snprintf(arg, sizeof arg, "%s %s", which, state);
+        which = arg;
+    }
+    ps3_stop_guest_range(func, which, ea, size, limit);
+}
+
+/* How a main-memory RSX offset becomes a guest EA. The first answers with cellGcmResolveLocated, which
+ * guesses VRAM for an offset the IO table does not map (the NV0039 path has always resolved this way); the
+ * second is the IO table alone, 0 for an unmapped offset, which is RPCS3's get_address answer ("RSXIO memory
+ * not mapped!"). */
+extern u32 cellGcmResolveIO(u32 offset);
+static u32 gcm_resolve_main_guess(u32 offset) { return cellGcmResolveLocated(0, offset); }
+
 /* The guest EA of RSX offset `lo` for the whole extent [lo, hi), which must lie in the 32-bit offset
  * space and map to one contiguous run of guest memory. Every bound is summed in 64 bits, before the first
  * byte moves, so nothing wraps. */
-static u64 gcm_m2mf_extent(const char* which, u32 loc, int64_t lo, int64_t hi)
+static u64 gcm_rsx_extent(const char* func, const char* which, gcm_state_fn state, u32 (*main_ea)(u32), u32 loc,
+                          int64_t lo, int64_t hi)
 {
     const u64 size = (u64)(hi - lo);
     if (lo < 0 || hi > (int64_t)0x100000000ll)
-        ps3_stop_guest_range(GCM_M2MF_FN, which, (u64)lo, size, 0x100000000ull);
+        gcm_range_stop(func, which, state, (u64)lo, size, 0x100000000ull);
     u64 ea;
     if (loc == RSX_CAP_LOC_LOCAL) {
         ea = cellGcmResolveLocated(1, (u32)lo);
         if (ea != (u64)s_config.localAddress + (u64)lo)    /* the helper's 32-bit sum wrapped */
-            ps3_stop_guest_range(GCM_M2MF_FN, which, (u64)s_config.localAddress + (u64)lo, size, gcm_vm_limit());
+            gcm_range_stop(func, which, state, (u64)s_config.localAddress + (u64)lo, size, gcm_vm_limit());
     } else {
-        ea = cellGcmResolveLocated(0, (u32)lo);
-        if (!ea) ps3_stop_guest_range(GCM_M2MF_FN, which, 0, size, gcm_vm_limit());
+        ea = main_ea((u32)lo);
+        if (!ea) gcm_range_stop(func, which, state, 0, size, gcm_vm_limit());
         /* IO pages map independently: a span that crosses one is contiguous in guest memory only if the
          * next page maps to the next 1 MiB. */
         const u64 first_page_ea = ea - ((u64)lo & 0xFFFFFull);
         for (u64 p = ((u64)lo >> 20) + 1; p <= ((u64)hi - 1) >> 20; p++)
-            if (cellGcmResolveLocated(0, (u32)(p << 20)) != first_page_ea + ((p - ((u64)lo >> 20)) << 20))
-                ps3_stop_guest_range(GCM_M2MF_FN, which, ea, size, gcm_vm_limit());
+            if (main_ea((u32)(p << 20)) != first_page_ea + ((p - ((u64)lo >> 20)) << 20))
+                gcm_range_stop(func, which, state, ea, size, gcm_vm_limit());
     }
-    if (!gcm_span_ok(ea, size)) ps3_stop_guest_range(GCM_M2MF_FN, which, ea, size, gcm_vm_limit());
+    if (!gcm_span_ok(ea, size)) gcm_range_stop(func, which, state, ea, size, gcm_vm_limit());
     return ea;
+}
+
+static u64 gcm_m2mf_extent(const char* which, u32 loc, int64_t lo, int64_t hi)
+{
+    return gcm_rsx_extent(GCM_M2MF_FN, which, NULL, gcm_resolve_main_guess, loc, lo, hi);
 }
 
 static void gcm_nv0039_copy(void)
@@ -2110,6 +2160,156 @@ static void nv3089_blit(void)
                out_w, out_h, f, src, in_pitch, dst, dst_pitch, out_x, out_y); } }
 }
 
+/* ---------------------------------------------------------------------------
+ * NV308A image-from-CPU: the inline transfer (cellGcmSetInlineTransfer and friends)
+ *
+ * A COLOR word (method 0x0400..0x1FFC, one word per pixel) is written into the NV3062 destination. The
+ * array is 0x700 words: 0x0400 + 0x700 * 4 is the end of the 13-bit method field, so one packet can carry
+ * up to 0x700 of them. Evidence is RPCS3 d00d8023 Emu/RSX/NV47/HW/nv308a.cpp `color::impl`, rsx_methods.cpp:1723
+ * (`bind_array(NV308A_COLOR, 1, 256 * 7, ...)`) and rsx_methods.h:1137-1160/1247-1264, which this follows:
+ *   - the word at index i of a packet lands at x = POINT.x + i, y = POINT.y;
+ *   - a word whose index is at or beyond SIZE_OUT.x is dropped (SIZE_OUT.y and SIZE_IN are stored and read
+ *     by nothing in RPCS3);
+ *   - the destination is NV3062 OFFSET_DESTIN + x * bpp + PITCH.dst * y in the DMA object
+ *     CONTEXT_DMA_IMAGE_DESTIN names, in NV3062 COLOR_FORMAT: A8R8G8B8 (10) and Y32 (11) are a verbatim
+ *     32-bit store, R5G6B5 (4) a conversion from the ARGB8 word. Any other format is the oracle's
+ *     "Unreachable" exception;
+ *   - the colour key, clip, pattern, ROP and beta contexts (0x0184..0x0198), COLOR_CONVERSION (0x02F8),
+ *     COLOR_FORMAT (0x0300) and SIZE_IN are read by no part of that function.
+ * A non-incrementing packet repeats one method, so every word has the same index and the last one stays,
+ * which is what RPCS3's "move the last 32 bits" branch writes.
+ *
+ * Where this goes beyond the oracle, it stops (kind gcm-unmodelled / hle-guest-range) instead of guessing:
+ *   - an operation other than SRCCOPY (3): the oracle copies whatever the operation is, but the hardware
+ *     blends or masks for the others, and nothing here applies them;
+ *   - a surface context other than the NV3062 object: 0x019C naming the swizzled surface would send the
+ *     words through NV309E's Morton layout, which RPCS3 never does for NV308A (its nv308a.cpp has no
+ *     swizzle path; only NV3089 reads NV309E);
+ *   - a SIZE_OUT or SIZE_IN taller than one row: the hardware wraps the words onto the next row, RPCS3
+ *     keeps them on POINT.y and drops the rest of the packet; the two disagree, so neither is chosen;
+ *   - a DMA object other than local/main, a format RPCS3 cannot reach, and a destination word outside
+ *     the RSX offset space, the local memory or the IO mapping.
+ * The R5G6B5 store is big-endian like every guest 16-bit value; RPCS3 writes a host-endian u16 there
+ * (`vm::_ptr<u16>`), which [INFERENCE] is a byte-order slip and not the console's behaviour. The channel
+ * conversion is a truncation (r>>3, g>>2, b>>3): it equals RPCS3's (c * 32) / 255 for every c below 255,
+ * and for 255 RPCS3's 32 overflows the 5-bit field where the truncation gives 31.
+ * -----------------------------------------------------------------------*/
+#define GCM_2D_FN         "cellGcm_rsx_process_fifo"
+#define GCM_2D_OP_SRCCOPY 3u
+#define GCM_2D_FMT_R5G6B5 4u
+#define GCM_2D_FMT_A8R8G8B8 10u
+#define GCM_2D_FMT_Y32    11u
+
+/* One line with everything an operator needs to rebuild the packet a stop interrupted: the transfer
+ * registers of both objects, the COLOR words seen (this transfer / ever) and what every subchannel is bound
+ * to. `sub`/`method`/`data` are the word in flight. */
+static void gcm_2d_state(char* out, size_t n)
+{
+    char bind[200];
+    size_t b = 0;
+    bind[0] = 0;
+    for (u32 s = 0; s < 8 && b < sizeof bind; s++)
+        b += (size_t)snprintf(bind + b, sizeof bind - b, "%s%u:%s", s ? "," : "", s,
+                              rsx_class_name((rsx_class_id)s_subch_class[s]));
+    snprintf(out, n,
+             "word=sub%u/0x%04X/0x%08X point=0x%08X size_out=0x%08X size_in=0x%08X color_words=%u/%llu "
+             "dst_offset=0x%08X dst_pitch=0x%08X dst_dma=0x%08X dst_format=0x%X operation=%u "
+             "surface=0x%08X src_format=%u bind=%s",
+             s_gcm2d.subch, s_gcm2d.method, s_gcm2d.data, s_gcm2d.point, s_gcm2d.size_out, s_gcm2d.size_in,
+             s_gcm2d.words, (unsigned long long)s_gcm2d.words_total, s_gcm2d.dst_offset, s_gcm2d.pitch,
+             s_gcm2d.dst_dma, s_gcm2d.color_fmt, s_gcm2d.operation, s_gcm2d.ctx_surface, s_gcm2d.src_fmt, bind);
+}
+
+/* The walker's stop on an unknown method of one of these two classes: the verdict is the table's, the state
+ * is this one's, and a second run must not be needed to see either. */
+static void gcm_2d_state_log(u32 subch, u32 method, u32 data)
+{
+    char st[640];
+    s_gcm2d.subch = subch; s_gcm2d.method = method; s_gcm2d.data = data;
+    gcm_2d_state(st, sizeof st);
+    fprintf(stderr, "[nv308a] unknown method: %s\n", st);
+}
+
+static PS3_NORETURN void gcm_nv308a_stop(const char* feature, const char* why)
+{
+    char st[640], reason[1024];
+    gcm_2d_state(st, sizeof st);
+    fprintf(stderr, "[nv308a] stop %s: %s | %s\n", feature, why, st);
+    snprintf(reason, sizeof reason, "%s | %s", why, st);
+    ps3_stop_gcm_unmodelled(GCM_2D_FN, feature, reason);
+}
+
+/* One COLOR word. Every check runs before the first byte moves. */
+static void gcm_nv308a_color(u32 subch, u32 method, u32 data)
+{
+    extern u8* vm_base;
+    s_gcm2d.subch = subch; s_gcm2d.method = method; s_gcm2d.data = data;
+    s_gcm2d.words++;
+    s_gcm2d.words_total++;
+
+    char why[192];
+    if (s_gcm2d.operation != GCM_2D_OP_SRCCOPY) {
+        snprintf(why, sizeof why, "NV308A OPERATION is %u; only SRCCOPY (3) is modelled", s_gcm2d.operation);
+        gcm_nv308a_stop("nv308a-operation", why);
+    }
+    if (s_gcm2d.ctx_surface != RSX_OBJ_NV3062) {
+        snprintf(why, sizeof why, "NV308A CONTEXT_SURFACE names 0x%08X%s, not the linear NV3062 object (0x%08X)",
+                 s_gcm2d.ctx_surface, s_gcm2d.ctx_surface == RSX_OBJ_NV309E ? " (the swizzled NV309E surface)" : "",
+                 (u32)RSX_OBJ_NV3062);
+        gcm_nv308a_stop("nv308a-surface-context", why);
+    }
+    if ((s_gcm2d.size_out >> 16) > 1u || (s_gcm2d.size_in >> 16) > 1u) {
+        snprintf(why, sizeof why, "SIZE_OUT %ux%u / SIZE_IN %ux%u: only one-row transfers are modelled",
+                 s_gcm2d.size_out & 0xFFFFu, s_gcm2d.size_out >> 16, s_gcm2d.size_in & 0xFFFFu,
+                 s_gcm2d.size_in >> 16);
+        gcm_nv308a_stop("nv308a-rows", why);
+    }
+    u32 bpp;
+    switch (s_gcm2d.color_fmt) {
+    case GCM_2D_FMT_A8R8G8B8: case GCM_2D_FMT_Y32: bpp = 4u; break;
+    case GCM_2D_FMT_R5G6B5: bpp = 2u; break;
+    default:
+        snprintf(why, sizeof why, "NV3062 COLOR_FORMAT 0x%X is not A8R8G8B8 (10), Y32 (11) or R5G6B5 (4)",
+                 s_gcm2d.color_fmt);
+        gcm_nv308a_stop("nv3062-color-format", why);
+    }
+    u32 loc;
+    if (s_gcm2d.dst_dma == 0xFEED0000u) loc = RSX_CAP_LOC_LOCAL;
+    else if (s_gcm2d.dst_dma == 0xFEED0001u) loc = RSX_CAP_LOC_MAIN;
+    else {
+        snprintf(why, sizeof why, "NV3062 destination DMA object 0x%08X is neither local (0xFEED0000) nor main "
+                 "(0xFEED0001)", s_gcm2d.dst_dma);
+        gcm_nv308a_stop("nv3062-dma", why);
+    }
+
+    /* A word past SIZE_OUT.x is dropped (nv308a.cpp: `index >= out_x_max`). */
+    const u32 index = (method - 0x0400u) >> 2;
+    if (index >= (s_gcm2d.size_out & 0xFFFFu)) return;
+
+    const u64 x = (u64)(s_gcm2d.point & 0xFFFFu) + index, y = s_gcm2d.point >> 16;
+    const int64_t lo = (int64_t)((u64)s_gcm2d.dst_offset + x * bpp + y * (u64)(s_gcm2d.pitch >> 16));
+    const int64_t hi = lo + (int64_t)bpp;
+    if (loc == RSX_CAP_LOC_LOCAL && (u64)hi > s_config.localSize)    /* get_address: offset + size <= local_mem_size */
+        gcm_range_stop(GCM_2D_FN, "nv308a-destination", gcm_2d_state, (u64)s_config.localAddress + (u64)lo, bpp,
+                       (u64)s_config.localAddress + s_config.localSize);
+    const u64 ea = gcm_rsx_extent(GCM_2D_FN, "nv308a-destination", gcm_2d_state, cellGcmResolveIO, loc, lo, hi);
+
+    u8 px[4];
+    if (bpp == 4u) {
+        px[0] = (u8)(data >> 24); px[1] = (u8)(data >> 16); px[2] = (u8)(data >> 8); px[3] = (u8)data;
+    } else {
+        const u32 v = (((data >> 16) & 0xFFu) >> 3) << 11 | (((data >> 8) & 0xFFu) >> 2) << 5 | ((data & 0xFFu) >> 3);
+        px[0] = (u8)(v >> 8); px[1] = (u8)v;
+    }
+    gcm_row_store((u32)ea, px, bpp);
+    if (s_cap) s_cap->write(loc, (u32)lo, (u32)ea, vm_base + ea, bpp, RSX_CAP_WRITE_DMA);
+    { static int n = 0;
+      if (PS3_LOG_FIRST(n, 6))
+          fprintf(stderr, "[NV308A] inline word %u at %llu,%llu: %s 0x%08X (%u bytes, format %u) = 0x%08X\n", index,
+                  (unsigned long long)x, (unsigned long long)y, loc ? "main" : "local", (u32)lo, bpp,
+                  s_gcm2d.color_fmt, data); }
+}
+
 static int gcm_2d_method(u32 subch, rsx_class_id cls, u32 method, u32 data)
 {
     /* GCM2D_TRACE=1: histogram of (subchannel, method) actually seen. The subchannel a title binds each 2D
@@ -2138,8 +2338,11 @@ static int gcm_2d_method(u32 subch, rsx_class_id cls, u32 method, u32 data)
      * 0xA400 headers), other versions use the classic 2 / 4. Only the four 2D classes reach here. Returns 1
      * when a case below consumed the method; the caller turns that into a verdict. */
     if (cls == RSX_CLASS_NV3062) {          /* context surface 2D */
+        /* 0x0184 is IMAGE_SOURCE and 0x0188 IMAGE_DESTIN (RPCS3 rsx_methods.h:1137-1140 reads only 0x0188,
+         * and the libgcm default state writes both). The source DMA is an allow-listed row; it used to be
+         * stored as the destination, so a title writing 0x0188 and then 0x0184 moved the destination. */
         switch (method) {
-        case 0x0184: case 0x0188: s_gcm2d.dst_dma = data; return 1;
+        case 0x0188: s_gcm2d.dst_dma    = data; return 1;
         case 0x0300: s_gcm2d.color_fmt  = data; return 1;
         case 0x0304: s_gcm2d.pitch      = data; return 1;
         case 0x030C: s_gcm2d.dst_offset = data; return 1;
@@ -2165,28 +2368,17 @@ static int gcm_2d_method(u32 subch, rsx_class_id cls, u32 method, u32 data)
      * NV309E bind). */
     if (cls == RSX_CLASS_NV308A) {
         switch (method) {
-        case 0x0304: s_gcm2d.point    = data; return 1;
-        case 0x0308: s_gcm2d.size_out = data; return 1;
-        /* SIZE_IN: ignored since the first NV308A path, with no evidence that nothing depends on it, so it
-         * is not allow-listed: it counts as an unknown method until S1 decides. */
-        case 0x030C: return 0;
+        case 0x019C: s_gcm2d.ctx_surface = data; return 1;
+        case 0x02FC: s_gcm2d.operation   = data; return 1;
+        case 0x0304: s_gcm2d.point       = data; return 1;
+        case 0x0308: s_gcm2d.size_out    = data; return 1;
+        case 0x030C: s_gcm2d.size_in = data; s_gcm2d.words = 0; return 1;
+        /* The source colour format is kept for a stop's state only; the verdict is the table's row (INERT for
+         * the default state's 4, missing for another value), because no transfer reads it. */
+        case 0x0300: s_gcm2d.src_fmt = data; return 0;
         }
-        if (method >= 0x0400 && method <= 0x07FC) {
-            /* COLOR data word: write into the destination surface. Inline
-             * transfers use format Y32 (4 bytes/px, one row per point.y).
-             * DMA 0xFEED0000 = local memory, 0xFEED0001 = main memory. */
-            u32 idx = (method - 0x0400) >> 2;
-            u32 px  = (s_gcm2d.point & 0xFFFF) + idx;
-            u32 py  = s_gcm2d.point >> 16;
-            u32 dst_pitch = s_gcm2d.pitch >> 16;
-            int local = (s_gcm2d.dst_dma != 0xFEED0001u);
-            u32 base = cellGcmResolveLocated(local, s_gcm2d.dst_offset);
-            { static int _it = 0;
-              if (PS3_LOG_FIRST(_it, 6))
-                  printf("[GCM2D] inline write dst=0x%08X (off=0x%X dma=0x%X pt=%u,%u pitch=%u) = 0x%08X\n",
-                         base + py * dst_pitch + px * 4, s_gcm2d.dst_offset,
-                         s_gcm2d.dst_dma, px, py, dst_pitch, data); }
-            vm_write32(base + py * dst_pitch + px * 4, data);
+        if (method >= 0x0400u && method <= 0x1FFCu) {   /* COLOR[0..0x6FF]: to the end of the 13-bit method field */
+            gcm_nv308a_color(subch, method, data);
             return 1;
         }
         return 0;

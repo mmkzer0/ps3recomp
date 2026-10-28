@@ -396,10 +396,12 @@ int main(void)
            st.handled, st.inert, st.missing, st.unknown, st.unbound);
     check(st.unknown == 0, "no census pair is unknown: the frame is valid and the live stop does not fire");
     check(st.unbound == 0, "nothing is dropped: every subchannel the census used is bound");
-    /* 34 census pairs are consumed by a named consumer, plus the seven SET_OBJECT writes that bind the
-     * slots (each is a method the walker consumes). */
-    check(st.handled == 41, "41 writes are consumed by a named consumer");
-    check(st.inert == 180, "180 writes are allow-listed for the value they carry");
+    /* 36 census pairs are consumed by a named consumer, plus the seven SET_OBJECT writes that bind the
+     * slots (each is a method the walker consumes). The two NV308A pairs over the 34 of before are the
+     * inline transfer's own state: SET_CONTEXT_SURFACE (0x019C) and SET_OPERATION (0x02FC), which
+     * gcm_nv308a_color reads (#81) and which were allow-listed while no transfer existed. */
+    check(st.handled == 43, "43 writes are consumed by a named consumer");
+    check(st.inert == 178, "178 writes are allow-listed for the value they carry");
     check(st.missing == 0, "no census write is a known gap: the S2 gaps the census once carried all have consumers");
     check(st.handled + st.inert + st.missing == 221, "...and the three classes cover every write (214 pairs + 7 binds)");
 

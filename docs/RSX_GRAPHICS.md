@@ -651,15 +651,22 @@ method, like the header.
 | NV0039 | 0x0328 | `NV0039_BUFFER_NOTIFY` | handled | consumer | gcm_nv0039_method: the copy trigger |
 | NV3062 | 0x0000 | `NV3062_SET_OBJECT` | handled | consumer | cellGcmSys.c gcm_bind_object: routes the slot's 2D methods |
 | NV3062 | 0x0180 | `NV3062_SET_CONTEXT_DMA_NOTIFIES` | inert | oracle-null | the 2D object's notify context; gcm_2d_method never raises a notify (the copy runs inline,  cellGcmSys.c) and RPCS3 binds nullptr with no decoder |
-| NV3062 | 0x0300 | `NV3062_SET_COLOR_FORMAT` | handled | consumer | gcm_2d_method: s_gcm2d.color_fmt |
-| NV3062 | 0x0304 | `NV3062_SET_PITCH` | handled | consumer | gcm_2d_method: s_gcm2d.pitch |
+| NV3062 | 0x0184 | `NV3062_SET_CONTEXT_DMA_IMAGE_SOURCE` | inert | oracle-null | the source DMA of a 2D blit. RPCS3 binds nullptr and reads no source register in the NV308A or NV3089 paths (`rsx_methods.h:1137-1160` decodes only the destination; NV3089 takes its source from `NV3089_SET_CONTEXT_DMA_IMAGE`). The inline transfer has no source in guest memory. It used to be stored as the destination DMA |
+| NV3062 | 0x0188 | `NV3062_SET_CONTEXT_DMA_IMAGE_DESTIN` | handled | consumer | gcm_2d_method: s_gcm2d.dst_dma, the location gcm_nv308a_color and nv3089_blit write to (RPCS3 `blit_engine_output_location_nv3062`) |
+| NV3062 | 0x0300 | `NV3062_SET_COLOR_FORMAT` | handled | consumer | gcm_2d_method: s_gcm2d.color_fmt, the destination's bytes per pixel in gcm_nv308a_color |
+| NV3062 | 0x0304 | `NV3062_SET_PITCH` | handled | consumer | gcm_2d_method: s_gcm2d.pitch, bits 16-31 are the destination pitch gcm_nv308a_color steps rows by |
 | NV3062 | 0x030C | `NV3062_SET_OFFSET_DESTIN` | handled | consumer | gcm_2d_method: s_gcm2d.dst_offset |
 | NV308A | 0x0000 | `NV308A_SET_OBJECT` | handled | consumer | cellGcmSys.c gcm_bind_object: routes the slot's 2D methods |
 | NV308A | 0x0180 | `NV308A_SET_CONTEXT_DMA_NOTIFIES` | inert | oracle-null | see NV3062 0x0180: the 2D path raises no notify and RPCS3 has no decoder |
-| NV308A | 0x0184+5 | `NV308A_SET_CONTEXT_COLOR_KEY..BETA4` | inert | no-transfer | the inline-transfer raster-op context (colour key, clip rectangle, pattern, ROP, beta). Odin  sends no NV308A_COLOR (0x400) and no SIZE_OUT/SIZE_IN ... |
-| NV308A | 0x019C | `NV308A_SET_CONTEXT_SURFACE` | inert | redundant | names the destination surface object; the 2D path has exactly one destination state, the NV3062  object's (s_gcm2d), which is the object this handle ... |
-| NV308A | 0x02FC | `NV308A_SET_OPERATION` | inert | no-transfer | the transfer's blend operation; see 0x0184: no transfer is issued by this object in the census |
-| NV308A | 0x0300 | `NV308A_SET_COLOR_FORMAT` | inert | redundant | the colour format of the inline-transfer words (the default state writes 4 on this slot every flip, ahead of the NV309E bind); the inline write stores 32-bit words into the destination surface, whose format is the NV3062 object's (s_gcm2d.color_fmt), and RPCS3 reads no NV308A_SET_COLOR_FORMAT. Pinned to the default state's value. Until the class keyed the handler this word was read as NV309E's SET_FORMAT |
+| NV308A | 0x0184+5 | `NV308A_SET_CONTEXT_COLOR_KEY..BETA4` | inert | oracle-null | the inline transfer's colour key, clip rectangle, pattern, ROP and beta objects. RPCS3's `nv308a::color::impl` reads none of them (it binds nullptr to each method and reads only POINT, SIZE_OUT and the NV3062 destination), so the reference transfer is an unconditional store. The row pins handle 0 (no object bound), which is what the default state writes and the only value for which that store is also the hardware's; another handle is reported missing |
+| NV308A | 0x019C | `NV308A_SET_CONTEXT_SURFACE` | handled | consumer | gcm_2d_method: s_gcm2d.ctx_surface; gcm_nv308a_color stops (`nv308a-surface-context`) unless it is the linear NV3062 object. RPCS3's nv308a.cpp has no swizzle path (only NV3089 reads NV309E), so no NV308A word goes through NV309E here |
+| NV308A | 0x02F8 | `NV308A_SET_COLOR_CONVERSION` | missing | missing | S2: the 8-to-5/6-bit conversion mode of a 16-bit destination (dither, truncate, subtract-truncate). RPCS3 binds nullptr and reads no mode; gcm_nv308a_color always truncates, which is its `(c * 32) / 255` for every channel value below 255. A 32-bit destination converts nothing. The default state does not write it, so it is a known gap and not a stop |
+| NV308A | 0x02FC | `NV308A_SET_OPERATION` | handled | consumer | gcm_2d_method: s_gcm2d.operation; gcm_nv308a_color stops (`nv308a-operation`) unless it is SRCCOPY (3, the default state's value). RPCS3 copies for every operation |
+| NV308A | 0x0300 | `NV308A_SET_COLOR_FORMAT` | inert | redundant | the colour format of the inline-transfer words (the default state writes 4 on this slot every flip, ahead of the NV309E bind); the inline write takes each COLOR word as one ARGB value and stores it in the destination surface's format, the NV3062 object's (s_gcm2d.color_fmt), and RPCS3 reads no NV308A_SET_COLOR_FORMAT. Pinned to the default state's value. Until the class keyed the handler this word was read as NV309E's SET_FORMAT |
+| NV308A | 0x0304 | `NV308A_POINT` | handled | consumer | gcm_2d_method: s_gcm2d.point; gcm_nv308a_color places word i at x = POINT.x + i, y = POINT.y |
+| NV308A | 0x0308 | `NV308A_SIZE_OUT` | handled | consumer | gcm_2d_method: s_gcm2d.size_out; gcm_nv308a_color drops the words at index >= SIZE_OUT.x (RPCS3 nv308a.cpp `color::impl`) and stops on a height above one row (`nv308a-rows`) |
+| NV308A | 0x030C | `NV308A_SIZE_IN` | handled | consumer | gcm_2d_method: s_gcm2d.size_in. RPCS3 stores it and nothing reads it (`nv308a_size_in_x` is defined and never called); here only its height is read, by the same one-row stop as SIZE_OUT's |
+| NV308A | 0x0400+1791 | `NV308A_COLOR[0:0x6FF]` | handled | consumer | cellGcmSys.c gcm_nv308a_color: the inline transfer itself, one word per pixel, up to 0x700 words per packet (RPCS3 `bind_array(NV308A_COLOR, 1, 256 * 7)`) |
 | NV309E | 0x0000 | `NV309E_SET_OBJECT` | handled | consumer | cellGcmSys.c gcm_bind_object: routes the slot's 2D methods |
 | NV309E | 0x0180 | `NV309E_SET_CONTEXT_DMA_NOTIFIES` | inert | oracle-null | see NV3062 0x0180 |
 | NV309E | 0x0184 | `NV309E_SET_CONTEXT_DMA_IMAGE` | inert | redundant | the destination image object; the swizzled path writes local memory unconditionally  (gcm_2d_method: cellGcmResolveLocated(1, s_nv309e.offset)), and ... |
@@ -675,8 +682,8 @@ before the first observed bind. Those 18 are the same methods as some of the 177
 distinct `(class, method)` pairs. Classified: **25 handled, 170 inert, 1 missing, 0 unknown** (21/170/5
 before the back-face stencil registers and the window offset got their consumers); the 18
 pre-bind observations classify as the NV4097 rows they belong to. `libs/video/tests/test_rsx_method_census.c`
-replays the pair table through the real walker (214 writes + 7 binds: 39 handled, 180 inert, 2 missing,
-0 unknown).
+replays the pair table through the real walker (214 writes + 7 binds: 43 handled, 178 inert, 0 missing,
+0 unknown; the NV308A `0x019C` and `0x02FC` writes are consumed by the inline transfer since #81).
 
 ### Handled states the walker itself consumes
 

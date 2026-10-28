@@ -1232,6 +1232,32 @@ if(UNIX)
         target_link_options(test_gcm_nv0039 PRIVATE "-Wl,--gc-sections")
         target_link_libraries(test_gcm_nv0039 PRIVATE m)
     endif()
+    # NV308A inline transfers (issue #81): the real walker over synthetic rings, destination bytes observed
+    # in guest memory; "stops" forks one child per way a transfer must end in a named stop that carries the
+    # transfer state.
+    add_executable(test_gcm_nv308a
+        libs/video/tests/test_gcm_nv308a.c
+        libs/video/rsx_dispatch.c
+        libs/video/rsx_capture.cpp
+        libs/video/gcm_default_state.c
+        runtime/memory/label_window.c
+        runtime/diag/stop.cpp
+        runtime/diag/sha256.cpp)
+    target_include_directories(test_gcm_nv308a PRIVATE ${RSX_CAPTURE_FIXTURE_INCLUDES})
+    target_compile_definitions(test_gcm_nv308a PRIVATE _GNU_SOURCE)
+    target_link_libraries(test_gcm_nv308a PRIVATE Threads::Threads)
+    set_target_properties(test_gcm_nv308a PROPERTIES LINKER_LANGUAGE CXX C_EXTENSIONS ON)
+    if(APPLE)
+        target_link_options(test_gcm_nv308a PRIVATE "-Wl,-dead_strip")
+    else()
+        target_compile_options(test_gcm_nv308a PRIVATE $<$<COMPILE_LANGUAGE:C>:-ffunction-sections -fdata-sections>)
+        target_link_options(test_gcm_nv308a PRIVATE "-Wl,--gc-sections")
+        target_link_libraries(test_gcm_nv308a PRIVATE m)
+    endif()
+    add_test(NAME gcm_nv308a COMMAND $<TARGET_FILE:test_gcm_nv308a> run)
+    set_tests_properties(gcm_nv308a PROPERTIES LABELS "gcm;t0" TIMEOUT 120)
+    add_test(NAME gcm_nv308a_stops COMMAND $<TARGET_FILE:test_gcm_nv308a> stops)
+    set_tests_properties(gcm_nv308a_stops PROPERTIES LABELS "gcm;t0" TIMEOUT 120)
     # The method classification against the census it must explain (issue #47): one synthetic FIFO with
     # every observed (class, method) pair, counted, plus the unclassified pair's named stop. The real
     # register-file class table is linked in, because that is the engine's consumer list.

@@ -444,8 +444,18 @@ static const rsx_method_rule rsx_method_rules[] = {
     INERT(RSX_CLASS_NV3062, 0x0180, 1, RSX_EV_ORACLE_NULL, "NV3062_SET_CONTEXT_DMA_NOTIFIES",
           "the 2D object's notify context; gcm_2d_method never raises a notify (the copy runs inline, "
           "cellGcmSys.c) and RPCS3 binds nullptr with no decoder"),
-    HANDLED(RSX_CLASS_NV3062, 0x0300, 1, RSX_EV_CONSUMER, "NV3062_SET_COLOR_FORMAT", "gcm_2d_method: s_gcm2d.color_fmt"),
-    HANDLED(RSX_CLASS_NV3062, 0x0304, 1, RSX_EV_CONSUMER, "NV3062_SET_PITCH", "gcm_2d_method: s_gcm2d.pitch"),
+    INERT(RSX_CLASS_NV3062, 0x0184, 1, RSX_EV_ORACLE_NULL, "NV3062_SET_CONTEXT_DMA_IMAGE_SOURCE",
+          "the source DMA of a 2D blit. RPCS3 binds nullptr and reads no source register in the NV308A or "
+          "NV3089 paths (rsx_methods.h:1137-1160 decodes only the destination; NV3089 takes its source from "
+          "NV3089_SET_CONTEXT_DMA_IMAGE). The inline transfer has no source in guest memory. It used to be "
+          "stored as the destination DMA"),
+    HANDLED(RSX_CLASS_NV3062, 0x0188, 1, RSX_EV_CONSUMER, "NV3062_SET_CONTEXT_DMA_IMAGE_DESTIN",
+            "gcm_2d_method: s_gcm2d.dst_dma, the location gcm_nv308a_color and nv3089_blit write to (RPCS3 "
+            "blit_engine_output_location_nv3062)"),
+    HANDLED(RSX_CLASS_NV3062, 0x0300, 1, RSX_EV_CONSUMER, "NV3062_SET_COLOR_FORMAT",
+            "gcm_2d_method: s_gcm2d.color_fmt, the destination's bytes per pixel in gcm_nv308a_color"),
+    HANDLED(RSX_CLASS_NV3062, 0x0304, 1, RSX_EV_CONSUMER, "NV3062_SET_PITCH",
+            "gcm_2d_method: s_gcm2d.pitch, bits 16-31 are the destination pitch gcm_nv308a_color steps rows by"),
     HANDLED(RSX_CLASS_NV3062, 0x030C, 1, RSX_EV_CONSUMER, "NV3062_SET_OFFSET_DESTIN", "gcm_2d_method: s_gcm2d.dst_offset"),
 
 /* ---- NV308A image from CPU ------------------------------------------------------------------ */
@@ -453,23 +463,42 @@ static const rsx_method_rule rsx_method_rules[] = {
             "cellGcmSys.c gcm_bind_object: routes the slot's 2D methods"),
     INERT(RSX_CLASS_NV308A, 0x0180, 1, RSX_EV_ORACLE_NULL, "NV308A_SET_CONTEXT_DMA_NOTIFIES",
           "see NV3062 0x0180: the 2D path raises no notify and RPCS3 has no decoder"),
-    INERT(RSX_CLASS_NV308A, 0x0184, 6, RSX_EV_NO_TRANSFER, "NV308A_SET_CONTEXT_COLOR_KEY..BETA4",
-          "the inline-transfer raster-op context (colour key, clip rectangle, pattern, ROP, beta). Odin "
-          "sends no NV308A_COLOR (0x400) and no SIZE_OUT/SIZE_IN write in the census, so this object "
-          "performs no transfer and applies no raster op; gcm_2d_method writes the COLOR words as a plain "
-          "copy when one does arrive"),
-    INERT(RSX_CLASS_NV308A, 0x019C, 1, RSX_EV_REDUNDANT, "NV308A_SET_CONTEXT_SURFACE",
-          "names the destination surface object; the 2D path has exactly one destination state, the NV3062 "
-          "object's (s_gcm2d), which is the object this handle names (value 0x313371C3)"),
-    INERT(RSX_CLASS_NV308A, 0x02FC, 1, RSX_EV_NO_TRANSFER, "NV308A_SET_OPERATION",
-          "the transfer's blend operation; see 0x0184: no transfer is issued by this object in the census"),
+    INERT_V(RSX_CLASS_NV308A, 0x0184, 6, 0, 0xFFFFFFFF, RSX_EV_ORACLE_NULL, "NV308A_SET_CONTEXT_COLOR_KEY..BETA4",
+            "the inline transfer's colour key, clip rectangle, pattern, ROP and beta objects. RPCS3's "
+            "nv308a::color::impl reads none of them (it binds nullptr to each method and reads only POINT, "
+            "SIZE_OUT and the NV3062 destination), so the reference transfer is an unconditional store. The "
+            "row pins handle 0, no object bound, which is what the default state writes and the only value "
+            "for which that store is also the hardware's; another handle is reported missing"),
+    HANDLED(RSX_CLASS_NV308A, 0x019C, 1, RSX_EV_CONSUMER, "NV308A_SET_CONTEXT_SURFACE",
+            "gcm_2d_method: s_gcm2d.ctx_surface; gcm_nv308a_color stops (nv308a-surface-context) unless it is "
+            "the linear NV3062 object. RPCS3's nv308a.cpp has no swizzle path (only NV3089 reads NV309E), so "
+            "no NV308A word goes through NV309E here"),
+    MISSING(RSX_CLASS_NV308A, 0x02F8, 1, "NV308A_SET_COLOR_CONVERSION",
+            "S2: the 8-to-5/6-bit conversion mode of a 16-bit destination (dither, truncate, subtract-truncate). "
+            "RPCS3 binds nullptr and reads no mode; gcm_nv308a_color always truncates, which is its "
+            "(c * 32) / 255 for every channel value below 255. A 32-bit destination converts nothing. The default "
+            "state does not write it, so it is a known gap and not a stop"),
+    HANDLED(RSX_CLASS_NV308A, 0x02FC, 1, RSX_EV_CONSUMER, "NV308A_SET_OPERATION",
+            "gcm_2d_method: s_gcm2d.operation; gcm_nv308a_color stops (nv308a-operation) unless it is SRCCOPY "
+            "(3, the default state's value). RPCS3 copies for every operation, which the hardware does not"),
     INERT_V(RSX_CLASS_NV308A, 0x0300, 1, 4, 0xFFFFFFFF, RSX_EV_REDUNDANT, "NV308A_SET_COLOR_FORMAT",
           "the colour format of the inline-transfer words; the default state writes 4 on this slot at every "
-          "flip, ahead of the NV309E bind. The inline write stores each COLOR word as a 32-bit value into the "
-          "destination surface, whose format is the NV3062 object's SET_COLOR_FORMAT (s_gcm2d.color_fmt), and "
-          "RPCS3 reads no NV308A_SET_COLOR_FORMAT (rsx_methods.cpp binds nullptr, no reader under Emu/RSX). "
-          "Pinned to the default state's value so a title that selects another source format is reported "
-          "missing. Until the class keyed the handler this word was read as NV309E's SET_FORMAT"),
+          "flip, ahead of the NV309E bind. The inline write takes each COLOR word as one ARGB value and stores "
+          "it in the destination surface's format, the NV3062 object's SET_COLOR_FORMAT (s_gcm2d.color_fmt), "
+          "and RPCS3 reads no NV308A_SET_COLOR_FORMAT (rsx_methods.cpp binds nullptr, no reader under "
+          "Emu/RSX). Pinned to the default state's value so a title that selects another source format is "
+          "reported missing. Until the class keyed the handler this word was read as NV309E's SET_FORMAT"),
+    HANDLED(RSX_CLASS_NV308A, 0x0304, 1, RSX_EV_CONSUMER, "NV308A_POINT",
+            "gcm_2d_method: s_gcm2d.point; gcm_nv308a_color places word i at x = POINT.x + i, y = POINT.y"),
+    HANDLED(RSX_CLASS_NV308A, 0x0308, 1, RSX_EV_CONSUMER, "NV308A_SIZE_OUT",
+            "gcm_2d_method: s_gcm2d.size_out; gcm_nv308a_color drops the words at index >= SIZE_OUT.x (RPCS3 "
+            "nv308a.cpp color::impl) and stops on a height above one row"),
+    HANDLED(RSX_CLASS_NV308A, 0x030C, 1, RSX_EV_CONSUMER, "NV308A_SIZE_IN",
+            "gcm_2d_method: s_gcm2d.size_in. RPCS3 stores it and nothing reads it (nv308a_size_in_x is "
+            "defined, never called); here only its height is read, by the same one-row stop as SIZE_OUT's"),
+    HANDLED(RSX_CLASS_NV308A, 0x0400, 0x700, RSX_EV_CONSUMER, "NV308A_COLOR[0:0x6FF]",
+            "cellGcmSys.c gcm_nv308a_color: the inline transfer itself, one word per pixel, up to 0x700 words "
+            "per packet (RPCS3 bind_array(NV308A_COLOR, 1, 256 * 7))"),
 
 /* ---- NV309E context surface swizzled -------------------------------------------------------- */
     HANDLED(RSX_CLASS_NV309E, 0x0000, 1, RSX_EV_CONSUMER, "NV309E_SET_OBJECT",
