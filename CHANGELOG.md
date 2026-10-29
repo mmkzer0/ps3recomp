@@ -1,6 +1,11 @@
 # Changelog
 
 ### Unreleased
+- **`ftrace_report.py` names the guest call site of every import wait, splits slow frames from fast ones and measures an import's cadence** (`tools/{ftrace_report.py,test_ftrace_report.py}`). Before, a 240 s battle timeline (9M spans) took 4.5 min, because every frame re-sliced the whole span list. The import table had no call sites, so "the main thread waits 8.8 ms per frame in `Port2Sync`" could not say where. Nothing showed what grows in the slow frames, or what an audio thread does between two polls.
+  - Each span is now binned once by bisection on the frame ends and shared out over the frames it overlaps: 43 s on the same timeline.
+  - New `--split MS`, `--cadence NID[@TID]` with `--gap MS`, and `--json`.
+  - Malformed or unreadable traces, too few flips and bad arguments exit 2 without a traceback.
+  - Test: `test_ftrace_report` builds a synthetic timeline. It checks a usleep shared across a frame edge, per-site import time, the split means, one long poll gap 80 % inside a job sync, and the exit-2 cases.
 - **Instruments recordings of a title can be reported from the command line** (`tools/{xctrace_xml.py,xctrace_profile.py,xctrace_audio.py}` with their `test_*.py`, `docs/TOOLS.md`). Before, an `xctrace` recording could only be read in the Instruments GUI. That GUI cannot group by lifted guest function and cannot show what a thread did while another one was silent.
   - `xctrace_xml.py` streams an `xcrun xctrace export` table. It resolves the interned `id`/`ref` values, sentinels and positional columns, and rejects a ref before its id, a row without a schema or a column-count mismatch.
   - `xctrace_profile.py` reports a Time Profiler export: per role, thread, function, line and guest function (`func_XXXXXXXX`), in time buckets, as sample gaps or as CPU bursts.
