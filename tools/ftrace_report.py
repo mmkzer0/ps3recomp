@@ -2,23 +2,43 @@
 """Frame-by-frame report of a PS3_FTRACE timeline.
 
   tools/ftrace_report.py <trace.txt> [--frames N] [--ms-per-col F] [--threads a,b]
+                         [--split MS] [--cadence NID[@TID]] [--gap MS] [--json]
 
 PS3_FTRACE=<start s>:<seconds>:<path> (toolkit, include/ps3emu/ps3_ftrace.h)
 records spans: PPU syscalls that blocked and merged usleep poll runs (with the
 guest call site), SPU busy/wait spans (busy tagged with the lifted image and the
 SPURS workload id), the RSX walker blocked on a semaphore ACQUIRE, FIFO drains,
-flips, presents and HLE import calls. A frame here is the time between two
-guest flip requests.
+flips, presents and HLE import calls (NID and guest call site). A frame here is
+the time between two guest flip requests.
 
-The report says, for the median frame, how each thread spent it, and draws a
-few frames as a timeline (one column per --ms-per-col ms):
+The report says, for the mean frame, how each thread spent it: blocking
+syscalls and usleep polls, and separately the time inside each HLE import,
+by import and guest call site (an import can wait without a syscall: an lwmutex,
+a job-queue sync). A span is shared out over the frames it overlaps.
+
+  --split MS          the same breakdown twice: frames shorter than MS, and the
+                      rest; what grows in the slow frames is the difference.
+  --cadence NID[@TID] the gaps between successive calls of one import (NID in
+                      hex), per calling thread or only TID; for every gap over
+                      --gap MS (default 20), what the thread was inside during
+                      it, as a share of the gap time; the worst gaps are listed.
+  --json              the summary (frames, breakdowns, cadence) as JSON on
+                      stdout instead of text; no timelines.
+
+Without --json it then draws a few frames as a timeline (one column per
+--ms-per-col ms):
   PPU   '#' running   '.' usleep poll   's' other blocking syscall
   SPU   '#' busy      ' ' waiting on a channel
   RSX   'S' blocked on ACQUIRE   'D' FIFO drain   'P' present   '|' flip reached
         inside D/P: 'E' Metal encode   'G' waiting for the GPU   'R' render-target readback
+
+Exit status: 0 report written; 2 unreadable or malformed trace, bad arguments,
+or fewer than 3 flip requests in the window.
 """
 import argparse
+import bisect
 import collections
+import json
 import statistics
 import sys
 
@@ -38,19 +58,29 @@ RSX_ROWS = ("acquire wait", "drain", "present", "encode (flush)", "encode (prese
             "gpu wait (flush)", "gpu wait (present)", "gpu wait (in-flight)", "readback")
 
 
+class BadInput(Exception):
+    pass
+
+
 def load(path):
     names, spans, header = {}, [], ""
-    with open(path) as f:
-        for line in f:
-            if line.startswith("#"):
-                header = line.strip()
-                continue
-            if line.startswith("T "):
-                _, tid, name = line.rstrip("\n").split(" ", 2)
-                names[int(tid)] = name
-                continue
-            k, who, a, b, t0, t1 = line.split()
-            spans.append((int(k), int(who), int(a, 16), int(b, 16), float(t0) / 1e3, float(t1) / 1e3))
+    try:
+        with open(path) as f:
+            for no, line in enumerate(f, 1):
+                if line.startswith("#"):
+                    header = line.strip()
+                    continue
+                if line.startswith("T "):
+                    _, tid, name = line.rstrip("\n").split(" ", 2)
+                    names[int(tid)] = name
+                    continue
+                try:
+                    k, who, a, b, t0, t1 = line.split()
+                    spans.append((int(k), int(who), int(a, 16), int(b, 16), float(t0) / 1e3, float(t1) / 1e3))
+                except ValueError:
+                    raise BadInput(f"{path}:{no}: not a span line: {line.strip()[:80]!r}") from None
+    except OSError as e:
+        raise BadInput(f"{path}: {e.strerror}") from None
     spans.sort(key=lambda s: s[4])
     return header, names, spans
 
@@ -59,104 +89,236 @@ def overlap(s0, s1, f0, f1):
     return max(0.0, min(s1, f1) - max(s0, f0))
 
 
+def nid_namer():
+    try:
+        import nid_database
+        db = nid_database.get_default_db()
+        db.load_implemented()
+    except Exception:
+        db = None
+
+    def name(nid):
+        e = db.lookup_nid(nid) if db else None
+        return e[1] if e else f"nid {nid:08X}"
+    return name
+
+
+def frame_key(k, who, a, b):
+    """What a span counts as in a frame breakdown, or None."""
+    if k == USLEEP:
+        return ("ppu", who, "usleep", b)
+    if k == SYSCALL:
+        return ("ppu", who, SYSCALL_NAMES.get(a, f"sc{a}"), b)
+    if k == HLE:
+        return ("hle", who, a, b)
+    if k == SPU_BUSY:
+        return ("spu", who)
+    if k in (SEMA, SEMA_GAVEUP):
+        return ("rsx", "acquire wait")
+    if k == DRAIN:
+        return ("rsx", "drain")
+    if k == PRESENT:
+        return ("rsx", "present")
+    if k == GPU_ENCODE:
+        return ("rsx", "encode (present)" if a else "encode (flush)")
+    if k == GPU_WAIT:
+        return ("rsx", GPU_WAIT_KIND.get(a, "gpu wait"))
+    if k == READBACK:
+        return ("rsx", "readback")
+    return None
+
+
+def per_frame(spans, frames):
+    """One {key: ms} per frame. Each span is binned once by bisection on the
+    frame ends and shared out over the frames it overlaps, so the cost is the
+    span count plus the overlaps, not frames times spans."""
+    ends = [f1 for _, f1 in frames]
+    acc = [collections.defaultdict(float) for _ in frames]
+    for k, who, a, b, t0, t1 in spans:
+        key = frame_key(k, who, a, b)
+        if key is None or t1 <= t0:
+            continue
+        i = bisect.bisect_right(ends, t0)
+        while i < len(frames) and frames[i][0] < t1:
+            o = overlap(t0, t1, frames[i][0], frames[i][1])
+            if o > 0:
+                acc[i][key] += o
+            i += 1
+    return acc
+
+
+def breakdown(acc, idx, names, name_of):
+    """Means over the frames idx (a frame where a key never happened counts 0)."""
+    n = len(idx)
+    tot = collections.defaultdict(float)
+    for i in idx:
+        for key, ms in acc[i].items():
+            tot[key] += ms
+    ppu = collections.defaultdict(list)
+    hle = collections.defaultdict(list)
+    spu, rsx = {}, {w: 0.0 for w in RSX_ROWS}
+    for key, ms in tot.items():
+        if key[0] == "ppu":
+            ppu[key[1]].append({"kind": key[2], "site": f"{key[3]:08X}", "ms": ms / n})
+        elif key[0] == "hle":
+            hle[key[1]].append({"import": name_of(key[2]), "nid": f"{key[2]:08X}",
+                                "site": f"{key[3]:08X}", "ms": ms / n})
+        elif key[0] == "spu":
+            spu[key[1]] = ms / n
+        else:
+            rsx[key[1]] = rsx.get(key[1], 0.0) + ms / n
+
+    def threads(d):
+        rows = [{"tid": t, "name": names.get(t, "?"), "ms": sum(r["ms"] for r in v),
+                 "sites": sorted(v, key=lambda r: -r["ms"])} for t, v in d.items()]
+        return sorted(rows, key=lambda r: -r["ms"])
+    return {"frames": n, "ppu_blocked": threads(ppu), "hle": threads(hle),
+            "spu_busy": {str(s): ms for s, ms in sorted(spu.items())}, "rsx": rsx}
+
+
+def cadence(spans, names, name_of, nid, only_tid, gap_ms, worst=8):
+    """Gaps between calls of one import per thread, and what the thread was
+    inside (other imports, usleep polls, blocking syscalls) during long gaps."""
+    calls = collections.defaultdict(list)
+    inside = collections.defaultdict(list)          # tid -> (t0, t1, label) on that thread
+    for k, who, a, b, t0, t1 in spans:
+        if k == HLE and a == nid:
+            calls[who].append(t0)
+        elif k in (HLE, USLEEP, SYSCALL):
+            label = name_of(a) if k == HLE else "usleep" if k == USLEEP else SYSCALL_NAMES.get(a, f"sc{a}")
+            inside[who].append((t0, t1, label))
+    out = []
+    for tid, ts in sorted(calls.items()):
+        if (only_tid is not None and tid != only_tid) or len(ts) < 3:
+            continue
+        gaps = [(b - a, a, b) for a, b in zip(ts, ts[1:])]
+        g = [x[0] for x in gaps]
+        q = statistics.quantiles(g, n=100)
+        its = sorted(inside[tid])
+        starts = [s[0] for s in its]
+        longest = max((s[1] - s[0] for s in its), default=0.0)
+
+        def what(a, b):
+            share = collections.defaultdict(float)
+            i = bisect.bisect_left(starts, a - longest)
+            while i < len(its) and its[i][0] < b:
+                o = overlap(its[i][0], its[i][1], a, b)
+                if o > 0:
+                    share[its[i][2]] += o
+                i += 1
+            return share
+        long_gaps = [x for x in gaps if x[0] > gap_ms]
+        total = collections.defaultdict(float)
+        for d, a, b in long_gaps:
+            for label, ms in what(a, b).items():
+                total[label] += ms
+        span = sum(x[0] for x in long_gaps) or 1.0
+        out.append({
+            "tid": tid, "name": names.get(tid, "?"), "calls": len(ts),
+            "gap_ms": {"median": statistics.median(g), "p90": q[89], "p99": q[98], "max": max(g)},
+            "over": {"ms": gap_ms, "count": len(long_gaps),
+                     "inside_share": {k: v / span for k, v in sorted(total.items(), key=lambda x: -x[1])}},
+            "worst": [{"gap_ms": d, "at_s": a / 1000,
+                       "inside_ms": dict(sorted(what(a, b).items(), key=lambda x: -x[1])[:4])}
+                      for d, a, b in sorted(gaps, reverse=True)[:worst]],
+        })
+    return out
+
+
+def print_breakdown(bd, title):
+    print(f"\n{title} (mean over {bd['frames']} frames, ms):")
+    print("  PPU threads (blocking syscalls and usleep polls, by kind and guest call site):")
+    for r in bd["ppu_blocked"][:12]:
+        desc = ", ".join(f"{s['kind']}@{s['site']} {s['ms']:.1f}" for s in r["sites"][:4])
+        print(f"    tid {r['tid']:3d} {r['name'][:28]:28s} blocked {r['ms']:5.1f}  ({desc})")
+    print("  HLE imports (time inside, by thread, import and guest call site):")
+    rows = [(s["ms"], r, s) for r in bd["hle"] for s in r["sites"]]
+    for ms, r, s in sorted(rows, key=lambda x: -x[0])[:14]:
+        print(f"    tid {r['tid']:3d} {r['name'][:28]:28s} {ms:5.1f}  {s['import']}@{s['site']}")
+    print("  SPUs (busy):")
+    for sp, ms in bd["spu_busy"].items():
+        print(f"    spu {sp:>3s} busy {ms:5.1f}")
+    print("  RSX / present thread:")
+    for what, ms in bd["rsx"].items():
+        print(f"    {what:20s} {ms:5.1f}")
+
+
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
     ap.add_argument("trace")
     ap.add_argument("--frames", type=int, default=3, help="frames drawn as a timeline")
     ap.add_argument("--ms-per-col", type=float, default=1.0)
     ap.add_argument("--threads", default="", help="PPU tids to draw (default: the six least blocked)")
+    ap.add_argument("--split", type=float, metavar="MS", help="break down frames < MS and >= MS separately")
+    ap.add_argument("--cadence", metavar="NID[@TID]", help="gaps between calls of one import (hex NID)")
+    ap.add_argument("--gap", type=float, default=20.0, metavar="MS", help="cadence gap threshold (default 20)")
+    ap.add_argument("--json", action="store_true", help="summary as JSON, no timelines")
     args = ap.parse_args()
+    cad_nid = cad_tid = None
+    if args.cadence:
+        try:
+            nid_s, _, tid_s = args.cadence.partition("@")
+            cad_nid = int(nid_s, 16)
+            cad_tid = int(tid_s) if tid_s else None
+        except ValueError:
+            ap.error(f"--cadence wants NID[@TID] with a hex NID, got {args.cadence!r}")
 
-    header, names, spans = load(args.trace)
-    print(header)
+    try:
+        header, names, spans = load(args.trace)
+    except BadInput as e:
+        print(f"ftrace_report: {e}", file=sys.stderr)
+        sys.exit(2)
     flips = [s[4] for s in spans if s[0] == FLIP_REQ]
     if len(flips) < 3:
-        sys.exit("fewer than 3 flip requests in the window")
+        print("ftrace_report: fewer than 3 flip requests in the window", file=sys.stderr)
+        sys.exit(2)
     frames = list(zip(flips, flips[1:]))
     durs = [b - a for a, b in frames]
-    print(f"{len(frames)} frames, median {statistics.median(durs):.1f} ms "
-          f"({1000 / statistics.median(durs):.1f} fps), min {min(durs):.1f}, max {max(durs):.1f}")
+    name_of = nid_namer()
+    acc = per_frame(spans, frames)
+    report = {"header": header,
+              "frames": {"count": len(frames), "median_ms": statistics.median(durs),
+                         "min_ms": min(durs), "max_ms": max(durs)},
+              "all": breakdown(acc, range(len(frames)), names, name_of)}
+    if args.split is not None:
+        fast = [i for i, d in enumerate(durs) if d < args.split]
+        slow = [i for i, d in enumerate(durs) if d >= args.split]
+        report["split"] = {"ms": args.split,
+                           "fast": breakdown(acc, fast, names, name_of) if fast else None,
+                           "slow": breakdown(acc, slow, names, name_of) if slow else None}
+    if cad_nid is not None:
+        report["cadence"] = {"nid": f"{cad_nid:08X}", "import": name_of(cad_nid),
+                             "threads": cadence(spans, names, name_of, cad_nid, cad_tid, args.gap)}
+    if args.json:
+        json.dump(report, sys.stdout, indent=1, sort_keys=True)
+        print()
+        return
 
-    # Per-frame totals, then the median of each.
-    ppu = collections.defaultdict(lambda: collections.defaultdict(list))   # tid -> (kind, site) -> [ms per frame]
-    spu_busy = collections.defaultdict(list)                                # spu -> [ms per frame]
-    spu_wid = collections.defaultdict(float)                                # (wid) -> ms total
-    spu_img = collections.defaultdict(float)
-    rsx = collections.defaultdict(list)
-    tids = sorted({s[1] for s in spans if s[0] in (SYSCALL, USLEEP)})
-    spus = sorted({s[1] for s in spans if s[0] in (SPU_BUSY, SPU_WAIT)})
-    lo = frames[0][0]
-    j0 = 0
-    for f0, f1 in frames:
-        acc = collections.defaultdict(float)
-        while j0 < len(spans) and spans[j0][5] < lo:
-            j0 += 1
-        for s in spans[j0:]:
-            k, who, a, b, t0, t1 = s
-            if t0 > f1:
-                break
-            o = overlap(t0, t1, f0, f1)
-            if o <= 0 and k not in (FLIP_FIFO,):
-                continue
-            if k == USLEEP:
-                acc[("ppu", who, "usleep", b)] += o
-            elif k == SYSCALL:
-                acc[("ppu", who, SYSCALL_NAMES.get(a, f"sc{a}"), b)] += o
-            elif k == SPU_BUSY:
-                acc[("spu", who)] += o
-                spu_wid[b] += o
-                spu_img[a] += o
-            elif k in (SEMA, SEMA_GAVEUP):
-                acc[("rsx", "acquire wait")] += o
-            elif k == DRAIN:
-                acc[("rsx", "drain")] += o
-            elif k == PRESENT:
-                acc[("rsx", "present")] += o
-            elif k == GPU_ENCODE:
-                acc[("rsx", "encode (present)" if a else "encode (flush)")] += o
-            elif k == GPU_WAIT:
-                acc[("rsx", GPU_WAIT_KIND.get(a, "gpu wait"))] += o
-            elif k == READBACK:
-                acc[("rsx", "readback")] += o
-        for t in tids:
-            keys = [key for key in acc if key[0] == "ppu" and key[1] == t]
-            for key in keys:
-                ppu[t][(key[2], key[3])].append(acc[key])
-        for sp in spus:
-            spu_busy[sp].append(acc[("spu", sp)])
-        for what in RSX_ROWS:
-            rsx[what].append(acc[("rsx", what)])
-        lo = f0
-
-    n = len(frames)
-    med = statistics.median(durs)
-
-    def mean(xs):
-        return sum(xs) / n   # frames where it never happened count as 0
-
-    print(f"\nPer frame (mean over {n} frames, ms; frame median {med:.1f}):")
-    print("  PPU threads (time blocked, by kind and guest call site):")
-    rows = []
-    for t in tids:
-        total = sum(mean(v) for v in ppu[t].values())
-        rows.append((total, t))
-    for total, t in sorted(rows, reverse=True)[:12]:
-        nm = names.get(t, "?")
-        sites = sorted(((mean(v), k) for k, v in ppu[t].items()), reverse=True)[:4]
-        desc = ", ".join(f"{kind}@{site:08X} {ms:.1f}" for ms, (kind, site) in sites)
-        print(f"    tid {t:3d} {nm[:28]:28s} blocked {total:5.1f}  ({desc})")
-    print("  SPUs (busy):")
-    for sp in spus:
-        print(f"    spu {sp:3d} busy {mean(spu_busy[sp]):5.1f}  ({100 * mean(spu_busy[sp]) / med:.0f}%)")
-    tot = sum(spu_wid.values()) or 1
-    print("  SPU busy time by SPURS workload id (LS 0x1DC) / lifted image:")
-    print("    " + ", ".join(f"wid {w:#x} {100 * v / tot:.0f}%" for w, v in sorted(spu_wid.items(), key=lambda x: -x[1])[:8]))
-    print("    " + ", ".join(f"img {i} {100 * v / tot:.0f}%" for i, v in sorted(spu_img.items(), key=lambda x: -x[1])[:8]))
-    print("  RSX / present thread:")
-    for what in RSX_ROWS:
-        print(f"    {what:20s} {mean(rsx[what]):5.1f}")
+    print(header)
+    fr = report["frames"]
+    print(f"{fr['count']} frames, median {fr['median_ms']:.1f} ms "
+          f"({1000 / fr['median_ms']:.1f} fps), min {fr['min_ms']:.1f}, max {fr['max_ms']:.1f}")
+    print_breakdown(report["all"], "Per frame")
+    if "split" in report:
+        for part, rel in (("fast", "<"), ("slow", ">=")):
+            if report["split"][part]:
+                print_breakdown(report["split"][part], f"Frames {rel} {args.split:g} ms")
+    if "cadence" in report:
+        c = report["cadence"]
+        print(f"\nCadence of {c['import']} ({c['nid']}):")
+        for t in c["threads"]:
+            g = t["gap_ms"]
+            print(f"  tid {t['tid']:3d} {t['name'][:28]:28s} calls {t['calls']}  gap median {g['median']:.1f}"
+                  f" p90 {g['p90']:.1f} p99 {g['p99']:.1f} max {g['max']:.1f} ms;"
+                  f" {t['over']['count']} gaps > {t['over']['ms']:g} ms")
+            share = ", ".join(f"{k} {100 * v:.0f}%" for k, v in list(t["over"]["inside_share"].items())[:5])
+            print(f"    inside those gaps: {share or 'nothing traced'}")
+            for w in t["worst"][:5]:
+                ins = ", ".join(f"{k} {v:.1f}" for k, v in w["inside_ms"].items())
+                print(f"    {w['gap_ms']:6.1f} ms at {w['at_s']:.3f} s: {ins or 'nothing traced'}")
 
     # GPU execution per command buffer (headless commits wait for each one).
+    n = len(frames)
     ex = [s for s in spans if s[0] == GPU_EXEC and flips[0] <= s[5] <= flips[-1]]
     if ex:
         print("  Metal command buffers (GPU's own execution time):")
@@ -170,29 +332,15 @@ def main():
                   f"  depth resolves {statistics.median([s[2] & 0xFFFF for s in xs]):.0f}"
                   f"  colour copies {statistics.median([s[2] >> 16 for s in xs]):.0f}")
 
-    # Time inside HLE import calls, which includes waits that no syscall span
-    # shows (an lwcond wait, a file read). Names come from the NIDs of the
-    # functions the toolkit implements.
-    hle = collections.defaultdict(float)
-    for s in spans:
-        if s[0] == HLE:
-            hle[(s[1], s[2])] += overlap(s[4], s[5], flips[0], flips[-1])
-    if hle:
-        try:
-            import nid_database
-            db = nid_database.get_default_db()
-            db.load_implemented()
-        except Exception:
-            db = None
-        print("  HLE import calls (time inside, by thread and import):")
-        for (t, nid), ms in sorted(hle.items(), key=lambda x: -x[1])[:12]:
-            e = db.lookup_nid(nid) if db else None
-            print(f"    tid {t:3d} {names.get(t, '?')[:28]:28s} {ms / n:5.1f}  {e[1] if e else f'nid {nid:08X}'}")
-
     # Timelines.
+    spus = sorted({s[1] for s in spans if s[0] in (SPU_BUSY, SPU_WAIT)})
     if args.threads:
-        draw = [int(x) for x in args.threads.split(",")]
+        try:
+            draw = [int(x) for x in args.threads.split(",")]
+        except ValueError:
+            ap.error(f"--threads wants comma-separated tids, got {args.threads!r}")
     else:
+        rows = [(r["ms"], r["tid"]) for r in report["all"]["ppu_blocked"]]
         draw = [t for _, t in sorted(rows)[:6]]   # the threads that work, not the idle ones
     pick = [frames[len(frames) // 2 + i] for i in range(args.frames) if len(frames) // 2 + i < len(frames)]
     for f0, f1 in pick:
@@ -212,9 +360,8 @@ def main():
                 if prio or row[c] in " #":
                     row[c] = ch
 
-        for k, who, a, b, t0, t1 in spans:
-            if t1 < f0 or t0 > f1:
-                continue
+        window = [s for s in spans if s[5] >= f0 and s[4] <= f1]
+        for k, who, a, b, t0, t1 in window:
             if k == USLEEP and ("ppu", who) in lines:
                 paint(lines[("ppu", who)], t0, t1, ".", True)
             elif k == SYSCALL and ("ppu", who) in lines:
@@ -229,9 +376,7 @@ def main():
                 paint(lines[("rsx",)], t0, t1, "P", True)
             elif k == FLIP_FIFO:
                 paint(lines[("rsx",)], t0, t0, "|", True)
-        for k, who, a, b, t0, t1 in spans:   # second pass: what the drain/present was doing
-            if t1 < f0 or t0 > f1:
-                continue
+        for k, who, a, b, t0, t1 in window:   # second pass: what the drain/present was doing
             if k == GPU_ENCODE:
                 paint(lines[("rsx",)], t0, t1, "E", True)
             elif k == GPU_WAIT:
