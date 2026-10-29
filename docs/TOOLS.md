@@ -18,7 +18,8 @@ Complete documentation for the Python-based recompilation pipeline tools in `too
 10. [generate_stubs.py — HLE Stub Generator](#generate_stubspy)
 11. [gen_imports.py / gen_hle_nids.py — firmware imports](#gen_importspy--gen_hle_nidspy)
 12. [ps3diff.py — trace schema, conversion and diff](#ps3diffpy)
-13. [Dependencies](#dependencies)
+13. [xctrace_profile.py / xctrace_audio.py — Instruments trace reports](#xctrace_profilepy--xctrace_audiopy)
+14. [Dependencies](#dependencies)
 
 ---
 
@@ -712,6 +713,38 @@ A canonical event/1 file round-trips byte for byte, or the converter refuses
 with the line number. `diff` aligns records per context by `ctx_seq`, ignores
 global interleaving and timing, and exits `0` identical, `1` divergent, `2`
 error, `3` zero records compared.
+
+---
+
+## xctrace_profile.py / xctrace_audio.py
+
+Reports on an Instruments recording of a recompiled title (macOS). Both read
+tables exported with `xcrun xctrace export`; `tools/xctrace_xml.py` is the
+shared reader. It resolves the export's interned `id`/`ref` values and its
+positional columns, so a report never sees them.
+
+```bash
+xcrun xctrace export --input run.trace --toc --output toc.xml
+xcrun xctrace export --input run.trace \
+    --xpath '/trace-toc/run[@number="1"]/data/table[@schema="time-profile"]' --output tp.xml
+python tools/xctrace_profile.py tp.xml --roles --timeline 1 --guest --runs 5
+python tools/xctrace_audio.py audio.*.xml --from 8 --to 10 --json
+```
+
+`xctrace_profile.py` (Time Profiler) assigns threads to roles by stack
+signature: SPU worker busy or idle, RSX, guest PPU, audio mix, main/ui, other.
+It reports per role, thread, function, source line or lifted guest function
+(the address parsed from `func_XXXXXXXX`), in time buckets, as gaps between
+one thread's samples, or as CPU bursts. `xctrace_audio.py` (Audio System
+Trace) reports per HAL IO cycle: period, budget, client IOProc time,
+overloads, POIs and zero-timestamp jitter. It also gives thread-state
+latencies and the cadence of one call found by stack.
+
+Both exit `0` on a report and `2` on malformed or unknown input.
+
+The `--toc` export holds the recording's process environment, which can
+include credentials. Keep it out of reports and commits, and delete it after
+use.
 
 ---
 
