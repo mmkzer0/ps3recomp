@@ -1311,7 +1311,7 @@ requires the opt-in `spu.dma_repeat_stop_secs` (default 0 = never stop); see
   `runtime/spu/spu_channels.c:607`  _(+2 more sites)_
 - **`SPU_MBOX_CHAIN`** — _(no description in source)_
   `runtime/spu/spu_raw.c:371`
-- **`SPU_MFC_LOOKUP_CACHE`** — SPU_MFC_LOOKUP_CACHE=1: bypass the per-context recent-engine cache and walk the MFC table on every lookup. **behavioural, not in the typed registry (#55)**
+- **`SPU_MFC_LOOKUP_CACHE`** — SPU_MFC_LOOKUP_CACHE=1: enable the per-host-thread recent-engine cache, so a repeated MFC lookup for the same context skips the registry read lock. Unset (the default), every MFC channel access takes `s_mfc_claim_lock` shared and walks the slot list. **behavioural, not in the typed registry (#55)**
   `runtime/spu/spu_channels.c:446`  _(+1 more sites)_
 - **`SPU_MFC_TRACE`** — SPU_MFC_TRACE: attribute silent DMA-poll loops (a wedged task whose host thread samples "in ntdll" because VirtualQuery dominates). Prints every 64k-th transfer per thread: enough to see the loop's pc/ea. */
   `runtime/spu/spu_dma.h:308`  _(+1 more sites)_
