@@ -4367,7 +4367,7 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
  * Headless submits have completed; windowed captures fence the same queue.
  *
  * The file name carries the present's identity -- `s<present_seq>` and
- * `f<flip_id>` (or `fnone` before the first flip head) -- so no dump
+ * `f<flip_id>` (or `fnone` before the first queued flip) -- so no dump
  * overwrites another (M3 gaps 3a/3b). The base is
  * PS3RECOMP_METAL_FRAME_DUMP; a trailing ".ppm" is replaced by the identity
  * suffix. Selection (all read once, like every diagnostic knob):

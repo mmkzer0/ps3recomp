@@ -391,6 +391,11 @@ static u32 s_head_guest_frame = RSX_FRAME_NO_FLIP;
  * names the scanout. */
 static u32 s_queued_buffer;
 static int s_queued_valid;
+/* A flip is queued (0xE944) and its head (0xE924) has not retired it yet. The
+ * scanout changes at the queue word, so every present in that window already
+ * shows the queued flip: it is the one the next head will count, not the last
+ * head's. */
+static int s_flip_queued_unretired;
 
 /* The last present's identity crosses threads -- the FIFO walker publishes it,
  * the metal backend and a gate or a test read it -- so it is a seqlock over
@@ -406,6 +411,18 @@ static _Atomic int s_identity_valid;
 static u32 eng_last_flip_id(void)
 {
     return s_flip_heads ? s_flip_heads - 1u : RSX_FRAME_NO_FLIP;
+}
+
+/* The flip whose scanout a present issued now shows. */
+static u32 eng_present_flip_id(void)
+{
+    return s_flip_queued_unretired ? s_flip_heads : eng_last_flip_id();
+}
+
+static u32 eng_present_guest_frame(void)
+{
+    if (s_flip_queued_unretired) return s_queue_flips - 1u;   /* a queue word was counted */
+    return s_head_guest_frame;
 }
 
 static void eng_identity_publish(u32 flip_id, u32 guest_frame, u32 present_seq, u32 buffer)
@@ -3804,13 +3821,14 @@ static void eng_present(u32 buffer_id)
     const u32 target = eng_present_surface(buffer_id);
     if (target == ENG_INVALID) return;
     g.surfaces[target].last_use = g.frames;
-    /* The present's identity: the flip ordinal is the GCM's
-     * (eng_last_flip_id), the present ordinal is the engine's, and the buffer
-     * is the one the guest queued for this flip -- the head's own word is a
-     * command, not a buffer id. */
+    /* The present's identity: it names the flip whose scanout it shows, which
+     * is the pending one between 0xE944 and its head (eng_present_flip_id).
+     * The present ordinal is the engine's, and the buffer is the one the guest
+     * queued for this flip -- the head's own word is a command, not a buffer
+     * id. */
     rsx_frame_identity fid;
-    fid.flip_id = eng_last_flip_id();
-    fid.guest_frame = s_head_guest_frame;
+    fid.flip_id = eng_present_flip_id();
+    fid.guest_frame = eng_present_guest_frame();
     fid.present_seq = g.frames;
     fid.display_buffer = s_queued_valid ? s_queued_buffer : (buffer_id & 7u);
     eng_identity_publish(fid.flip_id, fid.guest_frame, fid.present_seq, fid.display_buffer);
@@ -3830,7 +3848,11 @@ static void eng_present(u32 buffer_id)
     pd_present(target, &fid);
     g.last_present_surface = target;
     g.be->present(g.be->user, g.surfaces[target].handle);
-    if (s_capture && fid.flip_id != RSX_FRAME_NO_FLIP && fid.flip_id != s_cap_last_flip) {
+    /* The capture's frame is the flip head's: a present before the head names
+     * the flip too, but that flip is not retired, and the capture records one
+     * frame per head at the head's present. */
+    if (s_capture && !s_flip_queued_unretired && fid.flip_id != RSX_FRAME_NO_FLIP &&
+        fid.flip_id != s_cap_last_flip) {
         s_cap_last_flip = fid.flip_id;
         eng_cap_frame(&fid, target);
     }
@@ -3909,6 +3931,7 @@ int rsx_draw_engine_init(u32 width, u32 height)
     rsx_draw_engine_reset_draw_stats();
     s_flip_heads = 0;
     s_queued_buffer = 0;
+    s_flip_queued_unretired = 0;
     s_queued_valid = 0;
     s_queue_flips = 0;
     s_head_guest_frame = RSX_FRAME_NO_FLIP;
@@ -3969,10 +3992,12 @@ void rsx_draw_engine_method(u32 method, u32 arg)
     if (m == 0xE944u) {                 /* the queue flip names the scanout */
         s_queued_buffer = arg & 7u;
         s_queued_valid = 1;
+        s_flip_queued_unretired = 1;
         s_queue_flips++;
     }
     if (m == 0xE924u && (arg & 0x80000000u)) {
         s_flip_heads++;
+        s_flip_queued_unretired = 0;
         s_head_guest_frame = s_queue_flips ? s_queue_flips - 1u : RSX_FRAME_NO_FLIP;
     }
     rsx_dispatch_method(&g.rsx, m, arg);

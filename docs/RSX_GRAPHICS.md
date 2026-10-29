@@ -316,11 +316,11 @@ reached about three times per guest flip (the queued word `0xE944`, then the hea
 
 | field | meaning |
 |---|---|
-| `flip_id` | 0-based ordinal of the last GCM flip head retired *before* this present — the same ordinal `cellGcmSys` counts for `GCM_DRV_EVENT_FLIP_HEAD`, because the engine sees the same `0xE924` word with bit 31 in the same FIFO order. `RSX_FRAME_NO_FLIP` before the first head. The head's own present carries its own ordinal. |
+| `flip_id` | 0-based ordinal of the flip whose scanout this present shows — the same ordinal `cellGcmSys` counts for `GCM_DRV_EVENT_FLIP_HEAD`, because the engine sees the same `0xE924` word with bit 31 in the same FIFO order. The scanout changes at the queue word `0xE944`, so the present that word issues, the head's own present and every later present until the next `0xE944` all name the same flip; between a queue word and its head the flip is the pending one, the ordinal the head is about to count. `RSX_FRAME_NO_FLIP` before the first queue word. Consumers that take the last dump labelled *k* as flip *k*'s image get exactly that image. |
 | `present_seq` | 0-based engine present ordinal: the number the dump files are named by. |
 | `display_buffer` | the display buffer the guest queued for this flip (0..7); the head's word is a command, not a buffer id. |
 
-No counter is derived from the other, and no flip id is invented for a present that precedes a head.
+No counter is derived from the other, and no flip id is invented for a present that precedes the first queue word. `guest_frame` follows `flip_id` (the queued flip's ordinal between its queue word and head). The RSX capture is unchanged: it records one frame per head, read back at the head's present, so its `present_seq` is the head's.
 
 **Draw accounting.** Every `BEGIN_END` group is one *submitted* draw. It is either *executed* or dropped
 for exactly one reason from `rsx_drop_reason` (no packets, fetch failed, mixed sources, needs expansion,
@@ -343,8 +343,9 @@ line still stops at 32; the count does not.
 **Dumps.** Both dump families name their files by the frame identity, so no image overwrites another:
 
 - `RSX_ENGINE_PASS_DUMP`: `present_s<present_seq>_f<flip_id>.ppm`, and per pass
-  `s<present_seq>_f<flip_id>_pass<NNN>_t<K>.ppm` / `_z.pgm`. `fnone` before the first flip head. The
-  index (`passes.txt`) repeats `s=` and `flip=` on every line.
+  `s<present_seq>_f<flip_id>_pass<NNN>_t<K>.ppm` / `_z.pgm`. `fnone` before the first queued flip. The
+  index (`passes.txt`) repeats `s=` and `flip=` on every line. A *pass* is named by the last head counted
+  when it opened: the flip its frame will show is only known at the queue word, after the draws.
 - `PS3RECOMP_METAL_FRAME_DUMP`: `<base>_s<present_seq>_f<flip_id>.ppm`. Presents are selected by
   `PS3RECOMP_METAL_FRAME_DUMP_RANGE=<first>-<last>` or `PS3RECOMP_METAL_FRAME_DUMP_LIST=<a,b,c>` (at most 32
   entries; a longer list is a `config-invalid` stop naming the count), else

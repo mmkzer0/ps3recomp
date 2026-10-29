@@ -102,27 +102,31 @@ int main(void)
     /* Present 0 arms the dump (the arming present writes no image).
      * Presents 1, 2 and 3 follow with no draw pass between them: under the old
      * naming all three wrote one file. */
-    stub_flip(1);                                  /* 0: queue, 1: head flip 0 */
-    stub_flip(0);                                  /* 2: queue, 3: head flip 1 */
+    stub_flip(1);                                  /* 0: queue flip 0, 1: head */
+    stub_flip(0);                                  /* 2: queue flip 1, 3: head */
     stub_begin_end(RSX_PRIMITIVE_TRIANGLES);       /* a pass after them */
-    stub_flip(1);                                  /* 4: queue closes the pass, 5: head */
+    stub_flip(1);                                  /* 4: queue flip 2 closes the pass, 5: head */
     stub_engine_down();
 
+    /* A present is named by the flip whose scanout it shows: the queue word's
+     * present already shows the queued flip, ahead of its head. */
     CHECK(file_exists(dir, "present_s00001_f00000.ppm"),
           "present 1 is named by its own sequence and the flip head it follows");
-    CHECK(file_exists(dir, "present_s00002_f00000.ppm"),
-          "present 2 is a second file, not a rewrite of present 1");
+    CHECK(file_exists(dir, "present_s00002_f00001.ppm"),
+          "present 2 is a second file and names the flip it queued (1)");
     CHECK(file_exists(dir, "present_s00003_f00001.ppm"),
           "present 3 carries the head that retired with it (flip 1)");
-    CHECK(file_exists(dir, "present_s00004_f00001.ppm"),
-          "present 4 exists after the pass");
+    CHECK(file_exists(dir, "present_s00004_f00002.ppm"),
+          "present 4 exists after the pass and names the flip it queued (2)");
     CHECK(count_prefix(dir, "present_s00001_") + count_prefix(dir, "present_s00002_") +
           count_prefix(dir, "present_s00003_") == 3,
           "the three presents between the passes are three files");
     CHECK(count_prefix(dir, "present_s") == 5,
           "five present images in all (%d)", count_prefix(dir, "present_s"));
+    /* A pass is named by the last head counted when it opened, not by the
+     * flip its frame will show: that is only known at the queue word. */
     CHECK(file_exists(dir, "s00004_f00001_pass000_t0.ppm"),
-          "the pass image carries the frame identity too");
+          "the pass image carries the frame's present sequence and the head it follows");
 
     char* text = slurp(dir);
     CHECK(text && strstr(text, "present_s00001:") && strstr(text, "present_s00002:"),

@@ -908,7 +908,7 @@ not changed while a title runs.
   `libs/video/rsx_metal_backend.m:3890`
 - **`PS3RECOMP_METAL_FPS`** — _(no description in source)_
   `libs/video/rsx_metal_backend.m:152`
-- **`PS3RECOMP_METAL_FRAME_DUMP`** — Base path for the presented-surface readback. The image is named `<base>_s<present_seq>_f<flip_id>.ppm` (a trailing `.ppm` on the base is replaced; `fnone` before the first flip head), so no dump overwrites another. Every 120th present by default; see the RANGE and LIST knobs to select presents.
+- **`PS3RECOMP_METAL_FRAME_DUMP`** — Base path for the presented-surface readback. The image is named `<base>_s<present_seq>_f<flip_id>.ppm` (a trailing `.ppm` on the base is replaced; `fnone` before the first queued flip), so no dump overwrites another. Every 120th present by default; see the RANGE and LIST knobs to select presents.
   `libs/video/rsx_metal_backend.m:3776`  _(+1 more sites)_
 - **`PS3RECOMP_METAL_FRAME_DUMP_LIST`** — Comma-separated present sequence numbers to dump (`s` in the file name), for example `120,240,300`. At most 32: a longer list is a `config-invalid` stop at the first dump, naming the count, never a silent cut to the first 32. Takes precedence over RANGE.
   `libs/video/rsx_metal_backend.m:3725`
