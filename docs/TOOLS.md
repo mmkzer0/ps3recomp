@@ -19,7 +19,8 @@ Complete documentation for the Python-based recompilation pipeline tools in `too
 11. [gen_imports.py / gen_hle_nids.py — firmware imports](#gen_importspy--gen_hle_nidspy)
 12. [ps3diff.py — trace schema, conversion and diff](#ps3diffpy)
 13. [xctrace_profile.py / xctrace_audio.py — Instruments trace reports](#xctrace_profilepy--xctrace_audiopy)
-14. [Dependencies](#dependencies)
+14. [ftrace_report.py — PS3_FTRACE timeline report](#ftrace_reportpy)
+15. [Dependencies](#dependencies)
 
 ---
 
@@ -745,6 +746,46 @@ Both exit `0` on a report and `2` on malformed or unknown input.
 The `--toc` export holds the recording's process environment, which can
 include credentials. Keep it out of reports and commits, and delete it after
 use.
+
+---
+
+## ftrace_report.py
+
+Reports on a `PS3_FTRACE=<start s>:<seconds>:<file>` timeline
+(`include/ps3emu/ps3_ftrace.h`), a recording of who waits for whom between two
+guest flip requests. `PS3_FTRACE_MIN_US=0` keeps every span and
+`PS3_FTRACE_CAP=<count>` (a plain number) sizes the buffer; the header line
+says `dropped=<n>`.
+
+```bash
+PS3_FTRACE=90:240:/tmp/ftrace.txt PS3_FTRACE_MIN_US=0 PS3_FTRACE_CAP=25165824 ./title
+python tools/ftrace_report.py /tmp/ftrace.txt --frames 0
+python tools/ftrace_report.py /tmp/ftrace.txt --json --split 20
+```
+
+Per frame it breaks down blocking syscalls, usleep polls, HLE imports by guest
+call site, SPU busy time and the RSX/present thread; `--split MS` does so for
+frames shorter and longer than MS, `--cadence NID[@TID]` for the gaps between
+calls of one import. Two sections count per flip request, as sums over the
+whole trace divided by the number of flip requests (a present runs behind the
+request that asked for it), and print no rates when the header says
+`dropped` is above 0:
+
+- **Drawables** (kind 16, Metal `nextDrawable`): per flip, split into new
+  content (`b > 0`), no new content (`b == 0`, with the share that shows a
+  surface other than the last present's) and nil (image dropped), and the mean
+  wait. `a` bit 0 is nil, bit 1 another surface; `b` counts the records
+  encoded or open since the last display blit.
+- **Label-store waits** (kind 17, the guest's wait for an RSX walker pass at a
+  store to a label): waits and ms per flip, p50/p99/max, the share with more
+  than 64 spins and the share that began while a pass was open. Each instant of
+  a wait is charged to one walker span, in the fixed order drawable, in-flight
+  GPU wait (`GPU_WAIT` `a` = 2), encode, present, drain, rest, because a
+  drawable wait lies inside a drain pass.
+
+Both kinds are recorded whatever `PS3_FTRACE_MIN_US` says. Exit `0` on a
+report, `2` on an unreadable or malformed trace, bad arguments or fewer than
+three flip requests.
 
 ---
 

@@ -22,8 +22,24 @@ a job-queue sync). A span is shared out over the frames it overlaps.
                       hex), per calling thread or only TID; for every gap over
                       --gap MS (default 20), what the thread was inside during
                       it, as a share of the gap time; the worst gaps are listed.
-  --json              the summary (frames, breakdowns, cadence) as JSON on
-                      stdout instead of text; no timelines.
+  --json              the summary (frames, breakdowns, drawables, label waits,
+                      cadence) as JSON on stdout instead of text; no timelines.
+
+Two sections count per flip request (summed over the trace and divided by the
+number of FLIP_REQ spans; a present runs behind the request that asked for it, so
+frame windows would misplace it). A trace whose header says dropped > 0 gets counts
+and shares but no rates.
+  drawables   the Metal present's [CAMetalLayer nextDrawable] (kind 16): per flip
+              split into new content (b > 0), no new content (b == 0, with the share
+              that shows another surface than the last present) and nil (image
+              dropped); mean wait.
+  label_wait  a guest store to an RSX label that waited for a walker pass (kind 17):
+              waits and ms per flip, p50/p99/max (nearest rank), the share with more
+              than 64 spins (the wait had started to sleep) and the share that began
+              while a pass was open. Each instant of a wait is charged to one walker
+              span, in this order: drawable, gpu wait (in-flight), encode, present,
+              drain, rest -- a drawable wait lies inside a drain pass, so the order
+              keeps one millisecond from being counted twice.
 
 Without --json it then draws a few frames as a timeline (one column per
 --ms-per-col ms):
@@ -39,12 +55,16 @@ import argparse
 import bisect
 import collections
 import json
+import re
 import statistics
 import sys
 
 (SYSCALL, USLEEP, SPU_WAIT, SPU_BUSY, SEMA, SEMA_GAVEUP, DRAIN, FLIP_FIFO, FLIP_REQ, PRESENT,
- GPU_ENCODE, GPU_WAIT, READBACK, GPU_EXEC, HLE) = range(1, 16)
+ GPU_ENCODE, GPU_WAIT, READBACK, GPU_EXEC, HLE, DRAWABLE, LABEL_WAIT) = range(1, 18)
 GPU_WAIT_KIND = {0: "gpu wait (flush)", 1: "gpu wait (present)", 2: "gpu wait (in-flight)"}
+GPU_WAIT_INFLIGHT = 2
+SPINS_SLEEPING = 64      # cellGcmSys.c yields for 64 spins, then sleeps 1 ms per spin
+ATTRIBUTION = ("drawable", "gpu wait (in-flight)", "encode", "present", "drain", "rest")
 
 SYSCALL_NAMES = {   # runtime/syscalls/lv2_syscall_table.h
     43: "thread_yield", 44: "thread_join", 85: "event_flag_wait", 92: "semaphore_wait",
@@ -243,6 +263,166 @@ def print_breakdown(bd, title):
         print(f"    {what:20s} {ms:5.1f}")
 
 
+def merged(spans):
+    """Disjoint, sorted (t0, t1) intervals covering the spans."""
+    out = []
+    for t0, t1 in sorted(spans):
+        if out and t0 <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], t1)
+        else:
+            out.append([t0, t1])
+    return [(a, b) for a, b in out]
+
+
+def clipped(iv, starts, w0, w1):
+    """The part of the disjoint sorted intervals iv inside [w0, w1]; starts = their t0 list."""
+    i = max(0, bisect.bisect_right(starts, w0) - 1)
+    out = []
+    while i < len(iv) and iv[i][0] < w1:
+        a, b = max(iv[i][0], w0), min(iv[i][1], w1)
+        if b > a:
+            out.append((a, b))
+        i += 1
+    return out
+
+
+def minus(a, b):
+    """a without b; both disjoint and sorted."""
+    out, j = [], 0
+    for t0, t1 in a:
+        while j < len(b) and b[j][1] <= t0:
+            j += 1
+        k = j
+        while k < len(b) and b[k][0] < t1:
+            if b[k][0] > t0:
+                out.append((t0, b[k][0]))
+            t0 = max(t0, b[k][1])
+            k += 1
+        if t1 > t0:
+            out.append((t0, t1))
+    return out
+
+
+def length(iv):
+    return sum(b - a for a, b in iv)
+
+
+def nearest_rank(xs, p):
+    """The p-th percentile of the sorted xs by nearest rank (an observed value, not an interpolation)."""
+    return xs[max(1, -(-p * len(xs) // 100)) - 1]
+
+
+def header_dropped(header):
+    m = re.search(r"\bdropped=(\d+)", header)
+    return int(m.group(1)) if m else None
+
+
+def drawable_label_sections(spans, flip_requests, dropped):
+    """The drawable and label-store-wait sections.
+
+    Rates are sums over the whole trace divided by the number of flip requests, not
+    means over frame windows: a present runs behind the flip request that asked for
+    it, so a frame window holds the previous frame's present. A trace that dropped
+    spans has no honest sum, so it gets counts and shares but no rates.
+    """
+    rates = dropped == 0
+
+    def rate(x):
+        return x / flip_requests if rates else None
+
+    def share(x, n):
+        return x / n if n else None
+
+    draws = [s for s in spans if s[0] == DRAWABLE]
+    nil = [s for s in draws if s[2] & 1]
+    new = [s for s in draws if not s[2] & 1 and s[3] > 0]
+    held = [s for s in draws if not s[2] & 1 and s[3] == 0]
+    other = [s for s in held if s[2] & 2]
+    waits = [s[5] - s[4] for s in draws]
+    d = {"count": len(draws), "per_flip": rate(len(draws)),
+         "mean_wait_ms": sum(waits) / len(waits) if waits else None,
+         "new_content": {"count": len(new), "per_flip": rate(len(new))},
+         "held": {"count": len(held), "per_flip": rate(len(held)),
+                  "other_src": len(other), "other_src_share": share(len(other), len(held))},
+         "nil": {"count": len(nil), "per_flip": rate(len(nil))}}
+
+    lw = [s for s in spans if s[0] == LABEL_WAIT]
+    durs = sorted(s[5] - s[4] for s in lw)
+    total = sum(durs)
+    classes = (("drawable", [(s[4], s[5]) for s in spans if s[0] == DRAWABLE]),
+               ("gpu wait (in-flight)", [(s[4], s[5]) for s in spans
+                                         if s[0] == GPU_WAIT and s[2] == GPU_WAIT_INFLIGHT]),
+               ("encode", [(s[4], s[5]) for s in spans if s[0] == GPU_ENCODE]),
+               ("present", [(s[4], s[5]) for s in spans if s[0] == PRESENT]),
+               ("drain", [(s[4], s[5]) for s in spans if s[0] == DRAIN]))
+    classes = [(name, iv, [x[0] for x in iv]) for name, iv in ((n, merged(v)) for n, v in classes)]
+    ms = dict.fromkeys(ATTRIBUTION, 0.0)
+    for s in lw:
+        # Each instant of a wait belongs to the first class that covers it, in ATTRIBUTION
+        # order: a drawable wait lies inside a drain pass, so without a fixed order the
+        # same milliseconds would be counted twice.
+        left = [(s[4], s[5])]
+        for name, iv, starts in classes:
+            if not left:
+                break
+            rest = minus(left, clipped(iv, starts, s[4], s[5]))
+            ms[name] += length(left) - length(rest)
+            left = rest
+        ms["rest"] += length(left)
+    l = {"count": len(lw), "per_flip": rate(len(lw)), "total_ms": total,
+         "ms_per_flip": rate(total),
+         "p50_ms": nearest_rank(durs, 50) if durs else None,
+         "p99_ms": nearest_rank(durs, 99) if durs else None,
+         "max_ms": durs[-1] if durs else None,
+         "spins_over_64": share(sum(1 for s in lw if (s[3] & 0xFFFF) > SPINS_SLEEPING), len(lw)),
+         "mid_pass": share(sum(1 for s in lw if s[3] >> 16 & 1), len(lw)),
+         "attribution": {"ms_per_flip": {k: rate(v) for k, v in ms.items()},
+                         "share": {k: share(v, total) for k, v in ms.items()}}}
+    return {"flip_requests": flip_requests, "dropped": dropped, "rates": rates,
+            "drawables": d, "label_wait": l}
+
+
+def print_drawable_label(sec):
+    n, d, l = sec["flip_requests"], sec["drawables"], sec["label_wait"]
+    if not sec["rates"]:
+        why = "no header" if sec["dropped"] is None else f"{sec['dropped']} spans dropped"
+        print(f"\n({why}: per-flip rates withheld; counts and shares only. Raise PS3_FTRACE_CAP.)")
+
+    def per(x):
+        return f"{x:5.2f} /flip" if x is not None else "     n/a    "
+
+    def pct(x):
+        return f"{100 * x:.0f} %" if x is not None else "n/a"
+
+    print(f"\nDrawables (nextDrawable), per flip request ({n} flip requests):")
+    if not d["count"]:
+        print("  none recorded")
+    else:
+        print(f"  all                      {d['count']:7d}  {per(d['per_flip'])}  mean wait {d['mean_wait_ms']:.2f} ms")
+        print(f"  new content (b > 0)      {d['new_content']['count']:7d}  {per(d['new_content']['per_flip'])}")
+        h = d["held"]
+        print(f"  no new content (b == 0)  {h['count']:7d}  {per(h['per_flip'])}"
+              f"  of those another surface: {h['other_src']} ({pct(h['other_src_share'])})")
+        print(f"  nil (image dropped)      {d['nil']['count']:7d}  {per(d['nil']['per_flip'])}")
+    print("\nLabel-store waits (guest thread waiting for an RSX pass), per flip request:")
+    if not l["count"]:
+        print("  none recorded")
+        return
+    ms = f"{l['ms_per_flip']:.2f} ms/flip" if l["ms_per_flip"] is not None else f"{l['total_ms']:.1f} ms in all"
+    print(f"  {l['count']} waits  {per(l['per_flip'])}  {ms}")
+    print(f"  duration p50 {l['p50_ms']:.2f}  p99 {l['p99_ms']:.2f}  max {l['max_ms']:.2f} ms;"
+          f" spins > {SPINS_SLEEPING}: {pct(l['spins_over_64'])}; a pass already open: {pct(l['mid_pass'])}")
+    print("  where the wait time went (one span per instant, in this order):")
+    for k in ATTRIBUTION:
+        v = l["attribution"]["ms_per_flip"][k]
+        print(f"    {k:22s} {f'{v:6.2f} ms/flip' if v is not None else '      n/a      '}"
+              f"  {pct(l['attribution']['share'][k]):>6s}")
+    sh = l["attribution"]["share"]
+    if sh["drawable"] is not None:
+        print(f"  drawable + gpu wait (in-flight) explain {pct(sh['drawable'] + sh['gpu wait (in-flight)'])}"
+              " of the wait time")
+
+
 def main():
     ap = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
     ap.add_argument("trace")
@@ -286,6 +466,7 @@ def main():
         report["split"] = {"ms": args.split,
                            "fast": breakdown(acc, fast, names, name_of) if fast else None,
                            "slow": breakdown(acc, slow, names, name_of) if slow else None}
+    report.update(drawable_label_sections(spans, len(flips), header_dropped(header)))
     if cad_nid is not None:
         report["cadence"] = {"nid": f"{cad_nid:08X}", "import": name_of(cad_nid),
                              "threads": cadence(spans, names, name_of, cad_nid, cad_tid, args.gap)}
@@ -303,6 +484,7 @@ def main():
         for part, rel in (("fast", "<"), ("slow", ">=")):
             if report["split"][part]:
                 print_breakdown(report["split"][part], f"Frames {rel} {args.split:g} ms")
+    print_drawable_label(report)
     if "cadence" in report:
         c = report["cadence"]
         print(f"\nCadence of {c['import']} ({c['nid']}):")

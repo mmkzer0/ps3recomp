@@ -22,6 +22,7 @@ pump=fun('pump_messages_impl')+'\n'+fun('rsx_metal_backend_pump_messages')+'\nst
 #define TARGET_OS_IPHONE 0
 static NSWindow* s_window;static int s_headless,s_ready=1;
 static atomic_int s_closed;static id s_window_close_observer;
+void ps3_host_quit(const char* why){(void)why;}   /* Cmd+Q in the production pump (cellSysutil.c) */
 '''+helpers+'\n'+pump+r'''
 static int checks,failures;
 #define T(c,m) do{checks++;if(!(c)){failures++;fprintf(stderr,"FAIL %s\n",m);}}while(0)

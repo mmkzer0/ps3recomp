@@ -19,6 +19,7 @@
 #include "rsx_commands.h"                    /* rsx_state, rsx_process_command_buffer */
 #include "../../include/ps3emu/guest_call.h" /* g_ps3_guest_caller for direct handler dispatch */
 #include "../../include/ps3emu/ps3_ftrace.h"  /* PS3_FTRACE timeline */
+#include "../../runtime/syscalls/ppu_thread_id.h"  /* ppu_tid_diag_index: PS3_FTRACE names PPU threads by table slot */
 
 /* Guest EA of the GCM context (begin/end/current/callback) the title writes its
  * command stream into; recorded by cellGcmSetupContext, drained by the RSX. */
@@ -2904,13 +2905,25 @@ static void gcm_guest_label_store(u32 ea, u32 value)
     /* The next pass to begin: it takes the lock after this load, so it reads a `put` this thread has published. */
     const unsigned long long target = ps3_label_window_next_pass();
     const unsigned long long t0 = ps3_ms_now();
+    const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+    /* A pass already open does not count for this store (it began before the store was reached), so the wait is
+     * that pass's rest plus one whole pass: the report splits the waits on this bit. */
+    const unsigned ft_mid = ft_t0 && !ps3_label_window_pass_done(target - 1ull);
     /* Yield first (the walker is normally a pass away), then sleep; bounded like the segment-switch wait below. */
-    for (unsigned spin = 0; !ps3_label_window_pass_done(target); spin++) {
+    unsigned spin = 0;
+    for (; !ps3_label_window_pass_done(target); spin++) {
         const unsigned long long waited = ps3_ms_now() - t0;
         if (waited >= ps3_cfg_gcm_wait_timeout_ms())
             ps3_stop_gcm_wait_timeout("cellGcm_label_store", "rsx-walker-pass", ea - GCM_LABEL_GUEST_BASE, value,
                                       vm_read32(ea), (u32)waited);
         Sleep(spin < 64u ? 0u : 1u);
+    }
+    if (ft_t0) {
+        /* Every wait, however short: the report divides the total by the flips, so a filter would bias it. */
+        extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
+        const u32 tid = g_active_ctx ? (u32)ppu_tid_diag_index(g_active_ctx->thread_id) : 0u;
+        ps3_ft_span(PS3_FT_LABEL_WAIT, tid, ea - GCM_LABEL_GUEST_BASE,
+                    (spin < 0xFFFFu ? spin : 0xFFFFu) | ft_mid << 16, ft_t0, ps3_ft_now());
     }
 }
 
