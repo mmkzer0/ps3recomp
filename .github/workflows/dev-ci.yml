@@ -46,7 +46,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        preset: [dev, release, asan, tsan]
+        preset: [dev, release, asan, tsan, fiber-aarch64-asan, fiber-aarch64-tsan]
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
