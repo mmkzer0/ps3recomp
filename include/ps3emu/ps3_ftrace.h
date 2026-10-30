@@ -58,6 +58,14 @@ enum ps3_ft_kind {
                               * complete; who = render passes, a = depth resolves | colour copies << 16,
                               * b = 1 present / 0 flush */
     PS3_FT_HLE         = 15, /* who = PPU tid, a = NID, b = guest lr: an HLE import call */
+    PS3_FT_DRAWABLE    = 16, /* Metal: the wait inside [CAMetalLayer nextDrawable], never filtered by PS3_FTRACE_MIN_US;
+                              * who = 1 engine present / 2 legacy present,
+                              * a bit 0 = nextDrawable returned nil, bit 1 = the surface shown is not the one
+                              * shown last (engine only),
+                              * b = records encoded or still open since the last display blit (legacy: this frame's) */
+    PS3_FT_LABEL_WAIT  = 17, /* the guest-visible label-store wait in the GCM label writer, never filtered;
+                              * who = PPU tid (0 = host callback or unknown), a = label offset,
+                              * b = min(spins, 0xFFFF) | 1 << 16 if the RSX was mid-pass when it began */
 };
 
 #if defined(_MSC_VER)
