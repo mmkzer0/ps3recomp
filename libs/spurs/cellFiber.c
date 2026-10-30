@@ -9,6 +9,12 @@
 #define _XOPEN_SOURCE 600
 #define _DARWIN_C_SOURCE 1
 #endif
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#if TARGET_OS_IPHONE && !PS3RECOMP_FIBER_HOST_AARCH64
+#error "iOS: getcontext/swapcontext are ENOTSUP stubs; configure PS3RECOMP_FIBER_BACKEND=aarch64"
+#endif
+#endif
 #include "cellFiber.h"
 #include "../../runtime/ppu/ppu_memory.h"
 #include "../../runtime/ppu/ppu_dispatch_state.h"
@@ -28,6 +34,8 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#elif PS3RECOMP_FIBER_HOST_AARCH64
+#include "../../runtime/platform/host_fiber.h"
 #else
 #include <pthread.h>
 #include <ucontext.h>
@@ -49,6 +57,8 @@ typedef struct Fiber Fiber;
 typedef struct Runner {
 #ifdef _WIN32
     void* back;
+#elif PS3RECOMP_FIBER_HOST_AARCH64
+    ps3_host_runner back;
 #else
     ucontext_t back;
 #endif
@@ -68,6 +78,9 @@ struct Fiber {
 #ifdef _WIN32
     void* host_fiber;
     DWORD owner;
+#elif PS3RECOMP_FIBER_HOST_AARCH64
+    ps3_host_fiber host;
+    pthread_t owner;
 #else
     ucontext_t uc;
     void* host_stack;
@@ -243,6 +256,7 @@ static void lifetime_remove(Fiber* f)
     range("Exit", "next", next, 8); range("Exit", "previous", previous, 8);
     st32(next + 4, previous); st32(previous, next); st32(node, 0); st32(node + 4, 0);
 }
+#if !PS3RECOMP_FIBER_HOST_AARCH64
 #ifdef _WIN32
 #define FIBER_BACKEND "win32"
 #else
@@ -253,6 +267,7 @@ static PS3_NORETURN void host_failed(const char* op, const char* reason, const F
 {
     ps3_stop_fiber_host_context(FIBER_BACKEND, op, reason, f->ea, error, error_domain);
 }
+#endif
 static void fiber_body(Fiber* f);
 #ifdef _WIN32
 static VOID CALLBACK fiber_entry(void* p) { fiber_body(p); }
@@ -265,6 +280,15 @@ static void host_resume(Runner* r, Fiber* f)
     r->back = GetCurrentFiber(); SwitchToFiber(f->host_fiber);
 }
 static void host_yield(Fiber* f) { SwitchToFiber(f->runner->back); }
+#elif PS3RECOMP_FIBER_HOST_AARCH64
+static void fiber_entry(void* p) { fiber_body(p); }
+static int host_create(Fiber* f)
+{
+    return ps3_host_fiber_create(&f->host, FIBER_HOST_STACK, fiber_entry, f, f->ea) == 0;
+}
+static void host_destroy(Fiber* f) { ps3_host_fiber_destroy(&f->host); }
+static void host_resume(Runner* r, Fiber* f) { ps3_host_fiber_resume(&r->back, &f->host); }
+static void host_yield(Fiber* f) { ps3_host_fiber_yield(&f->host); }
 #else
 static void fiber_entry(unsigned hi, unsigned lo) { fiber_body((Fiber*)(((uintptr_t)hi << 32) | lo)); }
 static int host_create(Fiber* f)
@@ -307,6 +331,8 @@ static PS3_NORETURN void leave(Fiber* f)
 #ifdef _WIN32
     SwitchToFiber(f->runner->back);
     host_failed("exit", "resumed-after-exit", f, 0, "none");
+#elif PS3RECOMP_FIBER_HOST_AARCH64
+    ps3_host_fiber_exit(&f->host);
 #else
     setcontext(&f->runner->back);
     host_failed("exit", "setcontext", f, (uint32_t)errno, "posix");

@@ -32,13 +32,40 @@
       "displayName": "ThreadSanitizer",
       "inherits": "base",
       "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo", "PS3RECOMP_SANITIZE_THREAD": "ON" }
+    },
+    {
+      "name": "fiber-aarch64",
+      "inherits": "dev",
+      "cacheVariables": { "PS3RECOMP_FIBER_BACKEND": "aarch64" }
+    },
+    {
+      "name": "fiber-aarch64-asan",
+      "inherits": "asan",
+      "cacheVariables": { "PS3RECOMP_FIBER_BACKEND": "aarch64" }
+    },
+    {
+      "name": "fiber-aarch64-tsan",
+      "inherits": "tsan",
+      "cacheVariables": { "PS3RECOMP_FIBER_BACKEND": "aarch64" }
     }
   ],
   "buildPresets": [
     { "name": "dev", "configurePreset": "dev" },
     { "name": "release", "configurePreset": "release" },
     { "name": "asan", "configurePreset": "asan" },
-    { "name": "tsan", "configurePreset": "tsan" }
+    { "name": "tsan", "configurePreset": "tsan" },
+    {
+      "name": "fiber-aarch64", "configurePreset": "fiber-aarch64",
+      "targets": ["fiber_switch", "fiber_worker", "jq2_fiber", "sync2_semaphore", "test_host_fiber_aarch64"]
+    },
+    {
+      "name": "fiber-aarch64-asan", "configurePreset": "fiber-aarch64-asan",
+      "targets": ["fiber_switch", "fiber_worker", "jq2_fiber", "sync2_semaphore", "test_host_fiber_aarch64"]
+    },
+    {
+      "name": "fiber-aarch64-tsan", "configurePreset": "fiber-aarch64-tsan",
+      "targets": ["fiber_switch", "fiber_worker", "jq2_fiber", "sync2_semaphore", "test_host_fiber_aarch64"]
+    }
   ],
   "testPresets": [
     {
@@ -79,6 +106,22 @@
       "environment": {
         "TSAN_OPTIONS": "halt_on_error=1:second_deadlock_stack=1:suppressions=${sourceDir}/tests/tsan.supp"
       }
+    },
+    {
+      "name": "fiber-aarch64",
+      "inherits": "base", "configurePreset": "fiber-aarch64",
+      "filter": { "include": { "label": "^(fiber|sync2)$" } }
+    },
+    {
+      "name": "fiber-aarch64-asan",
+      "inherits": "asan", "configurePreset": "fiber-aarch64-asan",
+      "filter": { "include": { "label": "^(fiber|sync2)$" } },
+      "environment": { "ASAN_OPTIONS": "detect_leaks=0:strict_string_checks=1:detect_stack_use_after_return=1" }
+    },
+    {
+      "name": "fiber-aarch64-tsan",
+      "inherits": "tsan", "configurePreset": "fiber-aarch64-tsan",
+      "filter": { "include": { "label": "^(fiber|sync2)$" } }
     }
   ]
 }

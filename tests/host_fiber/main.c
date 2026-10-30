@@ -194,7 +194,8 @@ static void guard(const char* executable)
     int status; CHECK(waitpid(pid, &status, 0) == pid);
     fprintf(stderr, "guard child status=%d\n%s", status, output);
     CHECK((WIFSIGNALED(status) && (WTERMSIG(status) == SIGSEGV || WTERMSIG(status) == SIGBUS)) ||
-          (strstr(output, "AddressSanitizer: stack-overflow") &&
+          ((strstr(output, "AddressSanitizer: stack-overflow") ||
+            strstr(output, "ThreadSanitizer: stack-overflow")) &&
            ((WIFEXITED(status) && WEXITSTATUS(status) != 0) ||
             (WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT))));
 #else
