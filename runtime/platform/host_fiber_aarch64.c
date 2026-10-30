@@ -80,11 +80,14 @@ void ps3_host_fiber_resume(ps3_host_runner* r, ps3_host_fiber* f)
     if (__builtin_expect(f->state != PS3_HOST_FIBER_NEW &&
                          f->state != PS3_HOST_FIBER_SUSPENDED, 0))
         broke(f->ea, "resume", "state", 0);
+    /* r->ctx holds the runner's resume point: a second resume through it would
+     * overwrite that, and the later yield or exit would land in the wrong frame. */
+    if (__builtin_expect(r->active != NULL, 0)) broke(f->ea, "resume", "nested", 0);
     const pthread_t self = pthread_self();
     if (f->state == PS3_HOST_FIBER_NEW) f->owner = self;
     else if (__builtin_expect(!pthread_equal(f->owner, self), 0))
         broke(f->ea, "resume", "foreign-thread", 0);
-    f->runner = r; f->state = PS3_HOST_FIBER_RUNNING;
+    f->runner = r; r->active = f; f->state = PS3_HOST_FIBER_RUNNING;
 #if HF_ASAN
     __sanitizer_start_switch_fiber(&r->asan_fake, f->map + f->guard,
                                     f->map_size - f->guard);
@@ -94,6 +97,7 @@ void ps3_host_fiber_resume(ps3_host_runner* r, ps3_host_fiber* f)
     __tsan_switch_to_fiber(f->tsan, 0);
 #endif
     ps3_host_ctx_switch(&r->ctx, &f->ctx);
+    r->active = NULL;
 #if HF_ASAN
     __sanitizer_finish_switch_fiber(r->asan_fake, NULL, NULL);
 #endif

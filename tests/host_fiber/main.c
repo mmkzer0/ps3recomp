@@ -155,6 +155,26 @@ static void exit_entry(void* arg) { Case* c = arg; ++c->step; ps3_host_fiber_exi
 static void yield_entry(void* arg) { Case* c = arg; ps3_host_fiber_yield(&c->f); ps3_host_fiber_exit(&c->f); }
 static void returned_entry(void* arg) { (void)arg; }
 static void nested_entry(void* arg) { Case* c = arg; ps3_host_fiber_resume(&c->r, &c->f); }
+/* A second fiber, resumed from inside the first. */
+static Case nested_other;
+static void nested_runner_entry(void* arg)
+{ Case* c = arg; ps3_host_fiber_resume(&c->r, &nested_other.f); }
+static void nested_distinct_entry(void* arg)
+{
+    Case* c = arg;
+    ps3_host_fiber_resume(&nested_other.r, &nested_other.f);
+    CHECK(nested_other.f.state == PS3_HOST_FIBER_EXITED);
+    ++c->step; ps3_host_fiber_exit(&c->f);
+}
+/* Nesting is legal while each level has its own runner. */
+static void nested_distinct(void)
+{
+    Case c = {0}; nested_other = (Case){0}; nested_other.id = 1;
+    create(&c, nested_distinct_entry); create(&nested_other, exit_entry);
+    ps3_host_fiber_resume(&c.r, &c.f);
+    CHECK(c.step == 1 && nested_other.step == 1 && c.f.state == PS3_HOST_FIBER_EXITED);
+    ps3_host_fiber_destroy(&c.f); ps3_host_fiber_destroy(&nested_other.f);
+}
 static void* foreign(void* arg) { Case* c = arg; ps3_host_runner r = {0}; ps3_host_fiber_resume(&r, &c->f); return NULL; }
 /* One row per stop: the expected machine line, field by field. The ea differs
  * per row, so two stops that share op and reason cannot satisfy each other's
@@ -170,6 +190,7 @@ static const StopRow stops[] = {
     {"stop_destroy_suspended", "destroy", "state", 0x1006, 0},
     {"stop_foreign_thread", "resume", "foreign-thread", 0x1007, 0},
     {"stop_resume_destroyed", "resume", "state", 0x1008, 0},
+    {"stop_resume_nested", "resume", "nested", 0x100A, 0},
     {"stop_mprotect", "create", "mprotect", 0x1009, EACCES},
 };
 static const StopRow* stop_row(const char* mode)
@@ -190,8 +211,12 @@ static void stop_mode(const char* mode)
         hf_mprotect_errno = EACCES;
         (void)ps3_host_fiber_create(&c.f, STACK, exit_entry, &c, row->ea); CHECK(0);
     }
+    if (!strcmp(mode, "stop_resume_nested")) {
+        nested_other.id = c.id; c.id = 0x20; create(&nested_other, exit_entry);
+    }
     create(&c, !strcmp(mode, "stop_entry_returned") ? returned_entry :
                !strcmp(mode, "stop_resume_running") ? nested_entry :
+               !strcmp(mode, "stop_resume_nested") ? nested_runner_entry :
                !strcmp(mode, "stop_resume_exited") ? exit_entry : yield_entry);
     if (!strcmp(mode, "stop_resume_destroyed")) {
         ps3_host_fiber_destroy(&c.f); ps3_host_fiber_resume(&c.r, &c.f);
@@ -367,6 +392,7 @@ int main(int argc, char** argv)
     else if (!strcmp(mode, "annot")) annot();
     else if (!strcmp(mode, "noret")) noret();
     else if (!strcmp(mode, "tsan_destroy")) tsan_destroy();
+    else if (!strcmp(mode, "nested_distinct")) nested_distinct();
     else if (!strcmp(mode, "frame") || !strcmp(mode, "deep")) {
         Case c = {0}; create(&c, !strcmp(mode, "frame") ? frame_entry : deep_entry);
         ps3_host_fiber_resume(&c.r, &c.f);
