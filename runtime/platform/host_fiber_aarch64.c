@@ -106,10 +106,14 @@ void ps3_host_fiber_resume(ps3_host_runner* r, ps3_host_fiber* f)
 }
 static inline void on_own_stack(const ps3_host_fiber* f, const char* op)
 {
-    const unsigned char* fp = __builtin_frame_address(0);
+    /* The frame lies in another object than the mapping on a foreign stack, so
+     * a pointer comparison would be undefined; compare the addresses. */
+    const uintptr_t fp = (uintptr_t)__builtin_frame_address(0);
+    const uintptr_t low = (uintptr_t)f->map + f->guard;
+    const uintptr_t high = (uintptr_t)f->map + f->map_size;
     if (__builtin_expect(f->state != PS3_HOST_FIBER_RUNNING, 0))
         broke(f->ea, op, "state", 0);
-    if (__builtin_expect(fp < f->map + f->guard || fp >= f->map + f->map_size, 0))
+    if (__builtin_expect(fp < low || fp >= high, 0))
         broke(f->ea, op, "foreign-stack", 0);
 }
 void ps3_host_fiber_yield(ps3_host_fiber* f)
