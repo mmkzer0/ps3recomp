@@ -27,6 +27,41 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(PS3RECOMP_BUILD_TESTS "Build unit tests" OFF)
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/PS3RecompSanitizers.cmake")
 
+# iOS ucontext functions are ENOTSUP stubs; macOS keeps its existing default.
+set(_ps3_fiber_arm64 OFF)
+if(APPLE AND (CMAKE_OSX_ARCHITECTURES STREQUAL "arm64" OR
+   (NOT CMAKE_OSX_ARCHITECTURES AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")))
+    set(_ps3_fiber_arm64 ON)
+endif()
+if(PS3RECOMP_IOS)
+    set(_ps3_fiber_default aarch64)
+elseif(WIN32)
+    set(_ps3_fiber_default win32)
+else()
+    set(_ps3_fiber_default ucontext)
+endif()
+set(PS3RECOMP_FIBER_BACKEND "${_ps3_fiber_default}" CACHE STRING "cellFiber host context switch")
+set_property(CACHE PS3RECOMP_FIBER_BACKEND PROPERTY STRINGS ucontext win32 aarch64)
+if(PS3RECOMP_IOS AND NOT PS3RECOMP_FIBER_BACKEND STREQUAL "aarch64")
+    message(FATAL_ERROR "iOS requires PS3RECOMP_FIBER_BACKEND=aarch64 (ucontext is ENOTSUP)")
+endif()
+if(PS3RECOMP_FIBER_BACKEND STREQUAL "aarch64")
+    if(NOT _ps3_fiber_arm64)
+        message(FATAL_ERROR "The aarch64 fiber backend requires Apple single-arch arm64")
+    endif()
+    enable_language(ASM)
+elseif(PS3RECOMP_FIBER_BACKEND STREQUAL "win32")
+    if(NOT WIN32)
+        message(FATAL_ERROR "The win32 fiber backend requires Windows")
+    endif()
+elseif(PS3RECOMP_FIBER_BACKEND STREQUAL "ucontext")
+    if(WIN32 OR PS3RECOMP_IOS)
+        message(FATAL_ERROR "The ucontext fiber backend is unavailable on Windows and iOS")
+    endif()
+else()
+    message(FATAL_ERROR "Unknown PS3RECOMP_FIBER_BACKEND: ${PS3RECOMP_FIBER_BACKEND}")
+endif()
+
 # ---------------------------------------------------------------------------
 # Collect source files
 # ---------------------------------------------------------------------------
@@ -49,6 +84,11 @@ file(GLOB_RECURSE HLE_SOURCES
 )
 # Exclude test harnesses (e.g. libs/video/tests/*): they define their own main().
 list(FILTER HLE_SOURCES EXCLUDE REGEX "/tests/")
+if(PS3RECOMP_FIBER_BACKEND STREQUAL "aarch64")
+    list(APPEND HLE_SOURCES
+        "${CMAKE_CURRENT_SOURCE_DIR}/runtime/platform/host_fiber_aarch64.c"
+        "${CMAKE_CURRENT_SOURCE_DIR}/runtime/platform/host_fiber_aarch64.S")
+endif()
 
 # The Vulkan RSX backend is opt-in while it grows (stage V0: clear + present).
 # It loads libvulkan at run time, so building needs only the Vulkan headers --
@@ -111,6 +151,8 @@ file(GLOB_RECURSE RUNTIME_SOURCES
 #    call leaks one resolver frame per guest loop iteration. A port adds it to
 #    its own target; see templates/project/CMakeLists.txt.
 list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/tests/|/runtime/ppu/|/runtime/host/|/spu_dispatch_mt\.c$")
+# Selected explicitly above, never pulled into other platform backends.
+list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/host_fiber_aarch64\\.c$")
 
 # ---------------------------------------------------------------------------
 # Static library
@@ -175,6 +217,9 @@ add_library(ps3recomp_runtime STATIC
     $<TARGET_OBJECTS:ps3recomp_spurs_jq2_model_objs>
     $<TARGET_OBJECTS:ps3recomp_spurs_jq2_objs>
 )
+if(PS3RECOMP_FIBER_BACKEND STREQUAL "aarch64")
+    target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_FIBER_HOST_AARCH64=1)
+endif()
 
 target_include_directories(ps3recomp_runtime PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
@@ -533,14 +578,9 @@ if(PS3RECOMP_BUILD_TESTS)
     # the suite runs everywhere -- and is the arm64 memory-model regression
     # net for the lv2 sync primitives.
     add_subdirectory(tests/sync_stress)
-    # cellFiber switches contexts with Windows fibers on Windows and ucontext
-    # everywhere else. Apple deprecated the ucontext routines and gates both
-    # them and the shape of ucontext_t on _XOPEN_SOURCE, so whether that path
-    # works on arm64 is a question to answer rather than assume.
+    # Exercise the selected consumer backend and the standalone Apple ABI.
     add_subdirectory(tests/fiber_switch)
-    if(APPLE AND NOT PS3RECOMP_IOS AND
-       (CMAKE_OSX_ARCHITECTURES STREQUAL "arm64" OR
-        (NOT CMAKE_OSX_ARCHITECTURES AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")))
+    if(_ps3_fiber_arm64 AND NOT PS3RECOMP_IOS)
         add_subdirectory(tests/host_fiber)
     endif()
     add_subdirectory(tests/sync2_semaphore)

@@ -1,8 +1,8 @@
 # ps3recomp - tests/fiber_switch
 #
-# cellFiber's scheduler API on the host's own switching mechanism: Windows
-# fibers on Windows, ucontext elsewhere. Standalone project with its own build dir,
-# and also added from the top-level CMakeLists under PS3RECOMP_BUILD_TESTS.
+# cellFiber's scheduler API on the selected host context backend. Defaults stay
+# Windows fibers on Windows and ucontext on macOS/Linux; Apple arm64 also has
+# the explicit aarch64 override. Standalone or PS3RECOMP_BUILD_TESTS.
 #
 #   cmake -S tests/fiber_switch -B build-fiber -G Ninja
 #   cmake --build build-fiber && ./build-fiber/fiber_switch

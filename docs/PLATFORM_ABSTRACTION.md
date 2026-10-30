@@ -369,34 +369,50 @@ ps3_stat->st_ctime  = host_to_be64(host_stat.st_ctime);
 
 ## Fiber / Coroutine Support
 
-### Windows Fibers
+`PS3RECOMP_FIBER_BACKEND` selects how `cellFiber` switches host stacks:
 
-```c
-// Convert current thread to a fiber
-ConvertThreadToFiber(NULL);
+| Platform | Default | Allowed backends |
+|---|---|---|
+| Windows | `win32` | `win32` (Windows fibers) |
+| Linux / other POSIX hosts | `ucontext` | `ucontext` |
+| macOS | `ucontext` | `ucontext`; `aarch64` only as an explicit single-arch arm64 test override |
+| iOS device / Simulator | `aarch64` | `aarch64` (Apple arm64 only) |
 
-// Create a new fiber
-LPVOID fiber = CreateFiber(stack_size, fiber_proc, param);
+iOS's `getcontext`, `swapcontext` and `setcontext` are `ENOTSUP` stubs;
+`makecontext` does not establish a context. Deprecation alone is not the
+reason for the new backend: macOS still uses its working ucontext backend.
+Invalid platform/backend combinations fail during CMake configuration;
+direct iOS compilation without the AArch64 selection also fails at compile time.
 
-// Switch to fiber
-SwitchToFiber(fiber);
+The Apple switch preserves x19–x29, SP and the low 64 bits of v8–v15,
+never touches Apple's reserved x18, and starts with a terminating zero frame
+record. Each stack has an inaccessible lower guard page. Fibers are pinned
+to their first resumer's thread and cannot yield or exit from another stack.
+Destroy is idempotent after exit or before first entry. ASan fake-stack and
+TSan fiber annotations cover first entry, suspension, resumption and exit.
+Signal masks, FPCR/FPSR, arm64e pointer authentication, SME and tagged
+stacks are not switched or qualified. Stack overflow faults loudly; it does
+not yet have a named stop.
 
-// Delete fiber
-DeleteFiber(fiber);
+Failed host context calls and broken lifecycle invariants stop with
+`fiber-host-context` (status 70), carrying
+`backend op reason ea error error_domain`. POSIX and Win32 errors retain
+their own domains; invariant failures use `error=0 error_domain=none`.
+See [STOPS.md](STOPS.md).
+
+For the explicit macOS test override:
+
+```sh
+cmake --preset fiber-aarch64
+cmake --build --preset fiber-aarch64 -j8
+ctest --preset fiber-aarch64
 ```
 
-### POSIX ucontext
-
-```c
-ucontext_t ctx;
-getcontext(&ctx);
-ctx.uc_stack.ss_sp = stack_memory;
-ctx.uc_stack.ss_size = stack_size;
-ctx.uc_link = &return_context;
-makecontext(&ctx, fiber_proc, 1, param);
-
-// Switch to fiber
-swapcontext(&current, &ctx);
-```
-
-**Note:** `ucontext` is deprecated on macOS but still works. For production macOS builds, consider using `setjmp`/`longjmp` with manual stack management, or platform-specific alternatives.
+`fiber-aarch64-asan` and `fiber-aarch64-tsan` exercise the same consumer
+suites with sanitizers. `tests/host_fiber` is also a standalone CMake project
+for raw two-sided assembly ABI probes, lifecycle and guard tests, stop tests,
+and Simulator execution. `bench_host_fiber` is an optional release target
+comparing raw switch pairs, resume/yield pairs and ucontext pairs. Its
+`--warmup`, `--runs`, `--batches` and `--batch-size` parameters default to
+200000, 5, 2000 and 1000; output is JSON with environment and batch-mean
+percentiles. Tiny smoke runs are not performance-gate evidence.
