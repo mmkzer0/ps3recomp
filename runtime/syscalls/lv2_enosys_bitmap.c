@@ -9,12 +9,12 @@
  *
  * The kernel's shared ENOSYS stub returns CELL_ENOSYS (0x80010003). Answering
  * the same per call is reproducing that stub, not a compatibility choice for
- * one title. 375 slots are set. See docs/LV2-SYSCALL-STATUS.md.
+ * one title. 376 slots are set. See docs/LV2-SYSCALL-STATUS.md.
  */
 #include "lv2_enosys_bitmap.h"
 
 static const uint64_t k_lv2_enosys[16] = {
-    0x080001FF00138FC1ull,
+    0x080005FF00138FC1ull,
     0x000000000000E000ull,
     0x2080011400200000ull,
     0x800E003FFFDFFF08ull,

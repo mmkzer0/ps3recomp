@@ -56,8 +56,13 @@ extern uint32_t g_ps3_sdk_version;
 uint32_t ps3_process_sdk_version(void);
 
 
-#define SYS_PPU_THREAD_CREATE           41
-#define SYS_PPU_THREAD_EXIT             42
+/* 41 is _sys_ppu_thread_exit and 42 is the shared ENOSYS stub: the FW 4.93
+ * stock table has a handler at 41 and the stub at 42, and the 4.81 dump agrees;
+ * RPCS3 at pin d00d8023 (lv2.cpp) binds _sys_ppu_thread_exit at 41, uns_func at
+ * 42. Thread creation is two syscalls, _sys_ppu_thread_create (52) and
+ * sys_ppu_thread_start (53); their ABI is not the sysPrxForUser-shaped
+ * sys_ppu_thread_create, which is reached by NID, so neither is tabled here. */
+#define SYS_PPU_THREAD_EXIT             41
 #define SYS_PPU_THREAD_YIELD            43
 #define SYS_PPU_THREAD_JOIN             44
 #define SYS_PPU_THREAD_DETACH           45
