@@ -19,7 +19,8 @@ Complete documentation for the Python-based recompilation pipeline tools in `too
 11. [gen_imports.py / gen_hle_nids.py — firmware imports](#gen_importspy--gen_hle_nidspy)
 12. [ps3diff.py — trace schema, conversion and diff](#ps3diffpy)
 13. [xctrace_profile.py / xctrace_audio.py — Instruments trace reports](#xctrace_profilepy--xctrace_audiopy)
-14. [Dependencies](#dependencies)
+14. [ios_run.py — iOS Simulator and device runs](#ios_runpy)
+15. [Dependencies](#dependencies)
 
 ---
 
@@ -745,6 +746,64 @@ Both exit `0` on a report and `2` on malformed or unknown input.
 The `--toc` export holds the recording's process environment, which can
 include credentials. Keep it out of reports and commits, and delete it after
 use.
+
+---
+
+## ios_run.py
+
+Runs a test program in the iOS Simulator or on a connected device and turns
+its status into a result an operator or CI can gate on. Every run holds the
+host's shared run lock — `/tmp/ps3-metal.lock` by default, an exclusive
+`flock` — for boot, child and shutdown, so a tool run and the `lockf -k`
+shell recipe cannot overlap. A busy lock is exit 2, not a failed run.
+
+```bash
+# Spawn a built test program; the tool boots and shuts the simulator down
+python tools/ios_run.py sim --device 'iPhone 17' -- ./build/host_fiber --trials 2000
+
+# A run that must stop by name: the stop line plus exit status 70
+python tools/ios_run.py sim --device UDID --expect-stop fiber-host-context \
+    --timeout 120 -- ./build/host_fiber
+
+# Launch an installed app on a device, status read from the console
+python tools/ios_run.py device --udid UDID --bundle-id com.example.title --json
+```
+
+`sim` resolves the device by UDID or exact name from
+`xcrun simctl list devices available --json`, boots it when it is
+`Shutdown` (`boot` then `bootstatus -b`), spawns the program with
+`xcrun simctl spawn`, and shuts that simulator down again unless
+`--keep-booted` — also after a timeout or a failure. `devicectl`'s own exit
+status is not the app's, so `device` reads the app's exit code or signal from
+the console text (`The app terminated with the exit code N.`,
+`App terminated due to signal N.`); a run that prints neither line is a
+failure with no status.
+
+`--env K=V` becomes `SIMCTL_CHILD_K=V` or `DEVICECTL_CHILD_K=V`, the prefixes
+the platform tools strip before starting the program. Values are never
+printed; neither the report nor the summary line carries any environment.
+
+| Option | Meaning |
+|---|---|
+| `--timeout S` | Stop the child's process group after S seconds (default 600): SIGTERM, then SIGKILL 10 s later. `timed_out` is set and both status fields are null, because the status is the tool's kill and not the program's. |
+| `--lock PATH`, `--lock-wait S` | The shared run lock and how long to wait for it (defaults: `/tmp/ps3-metal.lock`, 600 s). |
+| `--log FILE` | Tee the child's merged output to FILE while it is streamed to stderr. |
+| `--expect-stop KIND` | Pass only if a `PS3STOP v=1 kind=KIND ...` line appeared and the exit status is 70. |
+
+The first `PS3STOP v=1 kind=<kind> <k>=<v> ...` line of a run is reported as
+`{"kind": ..., "fields": {...}, "line": "..."}`. Without `--expect-stop` any
+stop fails the run: a stop is a refusal, not a pass.
+
+`--json` writes exactly one object to stdout: `target`, `device`,
+`bundle_id`, `command`, `exit_code`, `signal`, `timed_out`, `ps3stop`,
+`expected_stop`, `outcome` (`pass`, `fail`, `error`), `log`, `duration_s`,
+`load_avg` and `booted_by_tool`. Without it, one summary line goes to stderr.
+
+Exit status: `0` the run passed, `1` it failed, `2` usage or environment
+error (bad arguments, `xcrun` missing, unknown simulator, busy lock, failed
+install). A usage error is a message, never a traceback.
+`tools/test_ios_run.py` proves the contract against a fake `xcrun` and never
+touches a simulator or a device.
 
 ---
 
