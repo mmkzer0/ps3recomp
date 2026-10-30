@@ -9,6 +9,17 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <TargetConditionals.h>
+#include <sys/resource.h>
+#ifndef __has_feature
+#define __has_feature(x) 0
+#endif
+#if __has_feature(address_sanitizer) || defined(__SANITIZE_ADDRESS__)
+#define HF_TEST_ASAN 1
+#endif
+#if __has_feature(thread_sanitizer) || defined(__SANITIZE_THREAD__)
+#define HF_TEST_TSAN 1
+#include <sanitizer/tsan_interface.h>
+#endif
 #define STACK (4u * 1024u * 1024u)
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #x); exit(1); } } while (0)
 ps3_host_ctx hf_abi_runner, hf_abi_peer, hf_abi_a, hf_abi_b, hf_abi_c;
@@ -44,7 +55,10 @@ static void abi(void)
     same(&hf_abi_c, &hf_abi_got_c);
     free(stack);
 }
-typedef struct Case { ps3_host_fiber f; ps3_host_runner r; unsigned step, id; } Case;
+typedef struct Case {
+    ps3_host_fiber f; ps3_host_runner r; unsigned step, id;
+    uintptr_t runner_frame; void* runner_fiber;
+} Case;
 static void create(Case* c, void (*entry)(void*))
 { CHECK(ps3_host_fiber_create(&c->f, STACK, entry, c, 0x1000 + c->id) == 0); }
 static void lifecycle_entry(void* arg)
@@ -166,6 +180,67 @@ static void handoff(void)
     }
     ps3_host_fiber_resume(&c.r, &c.f); ps3_host_fiber_destroy(&c.f);
 }
+/* Removing an annotation leaves every switch working, so only the state the
+ * sanitizer runtimes expose can tell a missing annotation from a present one.
+ * __builtin_frame_address: under detect_stack_use_after_return a local may sit
+ * in ASan's fake stack, outside the real runner stack the bounds describe. */
+static void annot_check(const Case* c)
+{
+#ifdef HF_TEST_ASAN
+    const uintptr_t lo = (uintptr_t)c->f.runner_bottom, hi = lo + c->f.runner_size;
+    const uintptr_t mine = (uintptr_t)__builtin_frame_address(0);
+    CHECK(lo && c->runner_frame >= lo && c->runner_frame < hi);
+    CHECK(mine < lo || mine >= hi);
+#endif
+#ifdef HF_TEST_TSAN
+    CHECK(c->f.tsan && __tsan_get_current_fiber() == c->f.tsan);
+    CHECK(c->runner_fiber != c->f.tsan && c->r.tsan_self == c->runner_fiber);
+#endif
+    (void)c;
+}
+static void annot_entry(void* arg)
+{
+    Case* c = arg;
+    for (unsigned i = 0; i < 3; ++i) { annot_check(c); ps3_host_fiber_yield(&c->f); }
+    annot_check(c); ps3_host_fiber_exit(&c->f);
+}
+static void annot(void)
+{
+    Case c = {0}; create(&c, annot_entry);
+    c.runner_frame = (uintptr_t)__builtin_frame_address(0);
+#ifdef HF_TEST_TSAN
+    c.runner_fiber = __tsan_get_current_fiber();
+#endif
+    for (unsigned i = 0; i < 4; ++i) {
+        ps3_host_fiber_resume(&c.r, &c.f);
+#ifdef HF_TEST_TSAN
+        CHECK(__tsan_get_current_fiber() == c.runner_fiber);
+#endif
+    }
+    CHECK(c.f.state == PS3_HOST_FIBER_EXITED); ps3_host_fiber_destroy(&c.f);
+}
+/* ASan drops a no-return unwind it cannot place on the current stack and
+ * prints a warning; a fiber whose bounds are right prints nothing. The test
+ * fails on that text, and exits 0 from the fiber otherwise. */
+static void noret_entry(void* arg)
+{ (void)arg; puts("PASS noret"); fflush(stdout); exit(0); }
+static void noret(void)
+{ Case c = {0}; create(&c, noret_entry); ps3_host_fiber_resume(&c.r, &c.f); CHECK(0); }
+/* An un-destroyed __tsan_create_fiber state costs tens of KiB, and nothing
+ * else observes it: the peak-RSS growth over many rounds is the signal. */
+static void tsan_destroy(void)
+{
+    struct rusage before, after;
+    CHECK(!getrusage(RUSAGE_SELF, &before));
+    for (unsigned round = 0; round < 6000; ++round) {
+        Case c = {0}; create(&c, exit_entry);
+        ps3_host_fiber_resume(&c.r, &c.f); ps3_host_fiber_destroy(&c.f);
+    }
+    CHECK(!getrusage(RUSAGE_SELF, &after));
+    const long grown = after.ru_maxrss - before.ru_maxrss; /* bytes on Apple */
+    fprintf(stderr, "peak RSS grew %ld bytes\n", grown);
+    CHECK(grown < 48l * 1024 * 1024);
+}
 static void guard_entry(void* arg)
 {
     Case* c = arg;
@@ -211,6 +286,9 @@ int main(int argc, char** argv)
     else if (!strcmp(mode, "lifecycle")) lifecycle();
     else if (!strcmp(mode, "many")) many();
     else if (!strcmp(mode, "tsan_handoff")) handoff();
+    else if (!strcmp(mode, "annot")) annot();
+    else if (!strcmp(mode, "noret")) noret();
+    else if (!strcmp(mode, "tsan_destroy")) tsan_destroy();
     else if (!strcmp(mode, "frame") || !strcmp(mode, "deep")) {
         Case c = {0}; create(&c, !strcmp(mode, "frame") ? frame_entry : deep_entry);
         ps3_host_fiber_resume(&c.r, &c.f);
