@@ -28,8 +28,8 @@ The stock map lists 632 slots with a real handler; 392 point at the shared ENOSY
 | verdict | slots |
 |---|---:|
 | `ok` | 164 |
-| `toolkit-handler-on-hw-enosys` | 1 |
-| `hw-enosys-unregistered` | 375 |
+| `toolkit-handler-on-hw-enosys` | 0 |
+| `hw-enosys-unregistered` | 376 |
 | `hw-real-unregistered` | 468 |
 | `conflict-4.93-vs-rpcs3` | 16 |
 | **total** | **1024** |
@@ -40,9 +40,7 @@ The 4.81 dump differs from stock. handler only in the dump: 6, 7, 8, 9, 10, 15. 
 
 ## `toolkit-handler-on-hw-enosys`
 
-| slot | handler | location |
-|---:|---|---|
-| 42 | `sys_ppu_thread_exit` | `runtime/syscalls/sys_ppu_thread.c:1516` |
+None.
 
 ## `conflict-4.93-vs-rpcs3`
 
@@ -94,7 +92,7 @@ The 4.81 dump differs from stock. handler only in the dump: 6, 7, 8, 9, 10, 15. 
 | 39 | enosys | enosys | null | none | hw-enosys-unregistered |
 | 40 | enosys | enosys | null | none | hw-enosys-unregistered |
 | 41 | handler | handler | bind | handler | ok |
-| 42 | enosys | enosys | null | handler | toolkit-handler-on-hw-enosys |
+| 42 | enosys | enosys | null | none | hw-enosys-unregistered |
 | 43 | handler | handler | bind | handler | ok |
 | 44 | handler | handler | bind | handler | ok |
 | 45 | handler | handler | bind | handler | ok |

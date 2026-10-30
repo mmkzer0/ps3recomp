@@ -25,5 +25,7 @@ with tempfile.TemporaryDirectory(prefix='ppu-thread-join-detach-') as tmp:
     subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-D_GNU_SOURCE', '-O1', '-UNDEBUG', *san,
                     '-ffunction-sections', '-fdata-sections',
                     '-I' + str(root / 'include'), '-I' + str(root / 'runtime'), '-I' + str(root / 'runtime/syscalls'),
-                    str(root / 'tests/test_ppu_thread_join_detach.c'), *linker, '-o', str(binary)], check=True)
+                    str(root / 'tests/test_ppu_thread_join_detach.c'),
+                    str(root / 'runtime/syscalls/lv2_enosys_bitmap.c'),
+                    *linker, '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True, timeout=120, stderr=subprocess.DEVNULL if os.environ.get('CI') else None)

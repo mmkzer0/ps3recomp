@@ -2,7 +2,8 @@
  *
  * lv2 (RPCS3 ppu_join_status): join -> EDEADLK on itself, EINVAL on a detached thread or one a join is already
  * waiting for, ESRCH on an id that no longer names a thread, a zombie is reaped at once; detach -> EINVAL on a
- * detached thread, EBUSY while a join waits, a zombie is reaped at once.
+ * detached thread, EBUSY while a join waits, a zombie is reaped at once. Slot 41 is _sys_ppu_thread_exit and slot
+ * 42 is a stock ENOSYS slot, dispatched through the table sys_ppu_thread_init builds.
  *
  * The races are ordered with ppu_thread_set_epilogue_hook: the hook runs on the worker after it has published its
  * end and released the table lock, and may park it there, so the test thread can join or detach in exactly the window
@@ -10,6 +11,7 @@
  * destructor, which runs after the thread procedure has returned. Nothing here sleeps to order two threads.
  */
 #include "../runtime/syscalls/sys_ppu_thread.c"
+#include "../runtime/syscalls/lv2_enosys_bitmap.h"
 #include <assert.h>
 #include <sys/mman.h>
 #include <time.h>
@@ -20,6 +22,8 @@ uint32_t ppu_vm_size;
 void ppu_ctx_register(ppu_context* c) { (void)c; }
 int ps3_intr_is_handler(unsigned long long tid) { (void)tid; return 0; }
 int ps3_intr_wait(unsigned long long tid) { (void)tid; return 0; }
+/* Only sys_ppu_thread_yield's opt-in diagnostics read it; no case here enables one. */
+uint32_t vm_read32(uint64_t a) { uint32_t v; memcpy(&v, vm_base + (uint32_t)a, 4); return v; }
 
 #define TEST_INITIAL_VSCR 0x00010000u
 uint32_t ps3_ppu_initial_vscr(void) { return TEST_INITIAL_VSCR; }
@@ -70,12 +74,39 @@ static void latch_open(latch* l)
 #define STATUS_BASE  0xC0DE0000ull
 #define ARG_SELFJOIN 7
 #define ARG_EXIT     9
+#define ARG_SC41      12
+#define ARG_SC42      13
+#define ARG_SPURIOUS  14
+#define EXIT_CODE_41  0x4C1ull
+#define JOINABLE      1u
 static latch g_gate[NGATE];
 static int   g_gate_used[NGATE];          /* written before the thread is created */
 static int   g_self_join_rc;              /* the worker's, read after the join that orders it */
+static lv2_syscall_table tbl;
+static int      g_returned41;             /* set only if sc 41 came back, which it never does */
+static uint64_t g_rc42;                   /* r3 after sc 42 */
+static int      g_returned42;
+static int      g_would_stop;             /* the loader's last arm: no handler and no ENOSYS slot */
 
 static void gate_close(int arg) { latch_init(&g_gate[arg]); g_gate_used[arg] = 1; }
 static void gate_open(int arg)  { latch_open(&g_gate[arg]); }
+
+/* ppu_loader.cpp's default path for a number its switch does not answer: a
+ * registered handler runs, else a stock-ENOSYS slot answers CELL_ENOSYS, else
+ * the process stops. The last arm is recorded instead of taken. */
+static void guest_syscall(ppu_context* ctx)
+{
+    const uint32_t num = (uint32_t)ctx->gpr[11];
+    if (tbl.handlers[num] != lv2_syscall_unimplemented) {
+        ctx->gpr[3] = (uint64_t)tbl.handlers[num](ctx);
+        return;
+    }
+    if (lv2_enosys_default_answer(num)) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ENOSYS;
+        return;
+    }
+    g_would_stop = 1;
+}
 
 static void guest_entry(ppu_context* ctx)
 {
@@ -92,6 +123,36 @@ static void guest_entry(ppu_context* ctx)
         ctx->gpr[3] = 0x77;
         sys_ppu_thread_exit(ctx);   /* unwinds to the epilogue, which reads r3 */
         ctx->gpr[3] = 0xBAD;        /* reached only if the unwind failed */
+        return;
+    }
+    if (arg == ARG_SC41) {
+        /* _sys_ppu_thread_exit(status): r11 = 41, r3 = the status. r4..r9 are whatever the guest left there; on
+         * the old table they were a valid sys_ppu_thread_create and started a foreign thread. */
+        ctx->gpr[11] = 41;
+        ctx->gpr[3]  = EXIT_CODE_41;
+        ctx->gpr[4]  = 0x10000;
+        ctx->gpr[5]  = ARG_SPURIOUS;
+        ctx->gpr[6]  = 1000;
+        ctx->gpr[7]  = VM_PPU_STACK_SIZE;
+        ctx->gpr[8]  = JOINABLE;
+        ctx->gpr[9]  = 0;
+        guest_syscall(ctx);
+        g_returned41 = 1;
+        ctx->gpr[3] = 0xBAD41;
+        return;
+    }
+    if (arg == ARG_SPURIOUS) {
+        ctx->gpr[3] = 0;
+        return;
+    }
+    if (arg == ARG_SC42) {
+        /* Stock 42 is the shared ENOSYS stub: the call answers CELL_ENOSYS and the thread runs on. */
+        ctx->gpr[11] = 42;
+        ctx->gpr[3]  = 0x77;
+        guest_syscall(ctx);
+        g_rc42 = ctx->gpr[3];
+        g_returned42 = 1;
+        ctx->gpr[3] = 0x42;
         return;
     }
     ctx->gpr[3] = STATUS_BASE + arg;
@@ -193,7 +254,6 @@ static int64_t create_thread(uint64_t flags, uint64_t arg, uint64_t* tid_out)
     }
     return rc;
 }
-#define JOINABLE 1u
 
 static int64_t join_as(uint64_t caller, uint64_t tid, uint32_t status_addr)
 {
@@ -250,6 +310,17 @@ static stacks_t stacks(void)
     s.next_addr = g_vm_stack_alloc.next_addr;
     table_unlock();
     return s;
+}
+
+/* Slots the table holds: main plus every thread that has not been reaped. */
+static int live_threads(void)
+{
+    int n = 0;
+    table_lock();
+    for (int i = 0; i < PPU_THREAD_MAX; i++)
+        if (g_ppu_threads[i].state != PPU_THREAD_STATE_FREE) n++;
+    table_unlock();
+    return n;
 }
 
 /* Poll the table, not the clock: returns once a join is registered on `tid`. */
@@ -469,13 +540,36 @@ static void case_detached_worker_parked_after_free(void)
     EXPECT_EQ(status_at(0x230), STATUS_BASE + 11);
 }
 
+/* (j) Slot 41 is _sys_ppu_thread_exit: the status in r3 ends the caller even though r4..r9 still hold a valid
+ * sys_ppu_thread_create, which must start nothing. Slot 42 is the stock ENOSYS stub: it answers CELL_ENOSYS and
+ * the thread runs on. */
+static void case_exit_and_enosys_slots(void)
+{
+    uint64_t t = 0;
+    EXPECT_EQ(live_threads(), 1);                         /* main */
+
+    EXPECT_EQ(create_thread(JOINABLE, ARG_SC41, &t), E_OK);
+    EXPECT_EQ(join_as(MAIN_TID, t, 0x248), E_OK);
+    EXPECT_EQ(status_at(0x248), EXIT_CODE_41);            /* the status in r3, not a CELL_OK from create */
+    EXPECT_EQ(g_returned41, 0);                           /* sc 41 does not return to the guest */
+    EXPECT_EQ(live_threads(), 1);                         /* ...and the stale registers started no thread */
+
+    EXPECT_EQ(create_thread(JOINABLE, ARG_SC42, &t), E_OK);
+    EXPECT_EQ(join_as(MAIN_TID, t, 0x250), E_OK);
+    EXPECT_EQ(g_returned42, 1);
+    EXPECT_EQ(g_rc42, E(CELL_ENOSYS));                    /* 0xFFFFFFFF80010003 */
+    EXPECT_EQ(status_at(0x250), 0x42);                    /* the thread ran on */
+    EXPECT_EQ(g_would_stop, 0);
+}
+
 int main(void)
 {
     vm_base = (uint8_t*)mmap(NULL, (size_t)VM_TOTAL_SIZE, PROT_READ | PROT_WRITE,
                              MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
     assert(vm_base != MAP_FAILED);
     ppu_vm_size = 0xE0000000u;
-    vm_stack_alloc_init(&g_vm_stack_alloc);
+    lv2_syscall_table_init(&tbl);
+    sys_ppu_thread_init(&tbl);                /* clears the table and initialises the stack allocator */
     g_ppu_thread_entry_trampoline = guest_entry;
     ppu_thread_register_main();
     assert(pthread_key_create(&g_exit_key, exit_dtor) == 0);
@@ -490,9 +584,11 @@ int main(void)
     case_self_join();
     case_second_detach();
     case_exit_status();
+    case_exit_and_enosys_slots();
 
     if (g_fails == 0) {
-        printf("PASS: PPU thread join/detach follow the lv2 state machine; the epilogue never touches a reaped slot\n");
+        printf("PASS: PPU thread join/detach follow the lv2 state machine; slot 41 exits and 42 is ENOSYS; the "
+               "epilogue never touches a reaped slot\n");
         return 0;
     }
     fprintf(stderr, "FAILED with %d error(s)\n", g_fails);

@@ -54,6 +54,10 @@
 #include "ps3emu/config.h"
 #define SMOKE_VSCR_NJ 0x00010000u
 
+/* sys_ppu_thread_create's import NID, computed the way the NID bridge computes
+ * it; the handler itself is registered by ppu_sysprx.cpp. */
+#include "ps3emu/nid.h"
+
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -136,9 +140,10 @@ extern unsigned int cellGcm_flip_request_count(void);
 #define SMOKE_FRAMES        3
 
 /* lv2 syscall numbers (runtime/syscalls/lv2_syscall_table.h). Spelled out
- * because a title has no header of ours: it puts the number in r11. */
-#define SC_PPU_THREAD_CREATE  41
-#define SC_PPU_THREAD_EXIT    42
+ * because a title has no header of ours: it puts the number in r11. Thread
+ * creation is not a table entry: lv2's 52/53 have another ABI, and a title
+ * reaches sys_ppu_thread_create by its sysPrxForUser import NID. */
+#define SC_PPU_THREAD_EXIT    41
 #define SC_PPU_THREAD_JOIN    44
 #define SC_TIMER_USLEEP      141
 #define SC_TTY_WRITE         403
@@ -510,9 +515,9 @@ void func_00010000(ppu_context* ctx)
                 "the GCM context does not begin at the command area (IO address + 0x1000)");
     smoke_mark(ctx, SMOKE_STEP_HLE);
 
-    /* A guest thread. The entry is an OPD address, which the runtime's thread
-     * trampoline resolves the same way ppu_run resolved ours. */
-    ctx->gpr[11] = SC_PPU_THREAD_CREATE;
+    /* A guest thread, through the sysPrxForUser import NID. The entry is an OPD
+     * address, which the runtime's thread trampoline resolves the same way
+     * ppu_run resolved ours. */
     ctx->gpr[3]  = SMOKE_SC_TID;          /* u64* thread id (out) */
     ctx->gpr[4]  = SMOKE_OPD_THREAD;      /* entry OPD           */
     ctx->gpr[5]  = SMOKE_THREAD_ARG;      /* the new thread's r3 */
@@ -520,7 +525,8 @@ void func_00010000(ppu_context* ctx)
     ctx->gpr[7]  = 0x10000;               /* stack size          */
     ctx->gpr[8]  = 1;                     /* flags: JOINABLE (joined below) */
     ctx->gpr[9]  = SMOKE_THREAD_NAME;
-    lv2_syscall(ctx);
+    ps3_hle_call(ps3_compute_nid("sys_ppu_thread_create"), ctx);
+    DRAIN_TRAMPOLINE(ctx);
     smoke_check((int32_t)ctx->gpr[3] == 0, "sys_ppu_thread_create failed");
     tid = vm_read64(SMOKE_SC_TID);
     smoke_check(tid != 0, "sys_ppu_thread_create returned thread id 0");

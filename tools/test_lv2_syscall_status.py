@@ -14,7 +14,8 @@ slots out of the real data:
   - 6     stock ENOSYS, dump handler only    -> bitmap, corroboration differs
   - 15    stock ENOSYS                       -> bitmap
   - 16    stock ENOSYS                       -> bitmap
-  - 42    stock ENOSYS, toolkit registers sys_ppu_thread_exit -> suspicious
+  - 42    stock ENOSYS, RPCS3 binds none     -> bitmap (thread exit is 41)
+  - 988   second map: stock ENOSYS, toolkit registers sys_dbg_988 -> suspicious
   - 60    stock ENOSYS, RPCS3 binds sys_trace_create -> conflict (stop kept)
 
 It then compiles the generated bitmap and checks the same slots from C.
@@ -98,24 +99,35 @@ def main() -> int:
                                       "handler", "ok"]
         assert doc_row(text, 0) == ["0", "enosys", "enosys", "null", "none",
                                     "hw-enosys-unregistered"]
-        assert doc_row(text, 42) == ["42", "enosys", "enosys", "null", "handler",
-                                     "toolkit-handler-on-hw-enosys"]
+        assert doc_row(text, 42) == ["42", "enosys", "enosys", "null", "none",
+                                     "hw-enosys-unregistered"]
         assert doc_row(text, 60) == ["60", "enosys", "enosys", "bind", "none",
                                      "conflict-4.93-vs-rpcs3"]
-        # The suspicious slot is named with its registration site.
-        assert "sys_ppu_thread_exit" in text
-        assert "runtime/syscalls/sys_ppu_thread.c:" in text
+        assert "## `toolkit-handler-on-hw-enosys`\n\nNone." in text
+
+        # The suspicious verdict needs a slot the toolkit implements and RPCS3
+        # binds nothing at. 988 is the only one, so a second map stubs it.
+        m2 = tmp / "stock-988.md"
+        m2.write_text(stock_map(STOCK_HANDLERS - {988}))
+        doc2 = tmp / "status-988.md"
+        subprocess.run([sys.executable, str(TOOL), str(m2), "--doc", str(doc2),
+                        "--c", str(tmp / "b2.c"), "--h", str(tmp / "b2.h")],
+                       check=True, capture_output=True)
+        text2 = doc2.read_text()
+        assert doc_row(text2, 988) == ["988", "enosys", "-", "null", "handler",
+                                       "toolkit-handler-on-hw-enosys"]
+        assert "| 988 | `sys_dbg_988` | `runtime/syscalls/sys_dbg.c:" in text2
 
         # The generated C answers from the same set: stock ENOSYS slots
-        # (including the CFW-only 6 and 15), but not the suspicious 42, the
-        # conflict 60, or an implemented slot; out-of-range is 0.
+        # (including the CFW-only 6 and 15, and 42), but not the conflict 60
+        # or an implemented slot; out-of-range is 0.
         prog = tmp / "check.c"
         prog.write_text(
             '#include <stdio.h>\n'
             '#include "lv2_enosys_bitmap.h"\n'
             'int main(void) {\n'
             '    static const unsigned num[] = {0, 6, 15, 16, 1023, 42, 60, 1, 2, 337, 988, 1024};\n'
-            '    static const int want[] = {1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0};\n'
+            '    static const int want[] = {1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0};\n'
             '    for (unsigned i = 0; i < sizeof num / sizeof num[0]; i++)\n'
             '        if (lv2_enosys_default_answer(num[i]) != want[i]) {\n'
             '            printf("slot %u -> %d\\n", num[i],\n'
