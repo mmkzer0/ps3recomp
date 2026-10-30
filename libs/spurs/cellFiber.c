@@ -21,6 +21,7 @@
 #include "ps3emu/stop.h"
 #include "ps3emu/fw_divergence.h"
 #include <stdatomic.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -242,6 +243,16 @@ static void lifetime_remove(Fiber* f)
     range("Exit", "next", next, 8); range("Exit", "previous", previous, 8);
     st32(next + 4, previous); st32(previous, next); st32(node, 0); st32(node + 4, 0);
 }
+#ifdef _WIN32
+#define FIBER_BACKEND "win32"
+#else
+#define FIBER_BACKEND "ucontext"
+#endif
+static PS3_NORETURN void host_failed(const char* op, const char* reason, const Fiber* f,
+                                     uint32_t error, const char* error_domain)
+{
+    ps3_stop_fiber_host_context(FIBER_BACKEND, op, reason, f->ea, error, error_domain);
+}
 static void fiber_body(Fiber* f);
 #ifdef _WIN32
 static VOID CALLBACK fiber_entry(void* p) { fiber_body(p); }
@@ -249,7 +260,8 @@ static int host_create(Fiber* f) { f->host_fiber = CreateFiberEx(0, FIBER_HOST_S
 static void host_destroy(Fiber* f) { if (f->host_fiber) DeleteFiber(f->host_fiber); f->host_fiber = NULL; }
 static void host_resume(Runner* r, Fiber* f)
 {
-    if (!IsThreadAFiber()) ConvertThreadToFiber(NULL);
+    if (!IsThreadAFiber() && !ConvertThreadToFiber(NULL))
+        host_failed("resume", "ConvertThreadToFiber", f, GetLastError(), "win32");
     r->back = GetCurrentFiber(); SwitchToFiber(f->host_fiber);
 }
 static void host_yield(Fiber* f) { SwitchToFiber(f->runner->back); }
@@ -259,15 +271,24 @@ static int host_create(Fiber* f)
 {
     f->host_stack = malloc(FIBER_HOST_STACK);
     if (!f->host_stack) return 0;
-    getcontext(&f->uc);
+    if (getcontext(&f->uc) != 0)
+        host_failed("create", "getcontext", f, (uint32_t)errno, "posix");
     f->uc.uc_stack.ss_sp = f->host_stack; f->uc.uc_stack.ss_size = FIBER_HOST_STACK; f->uc.uc_link = NULL;
     const uintptr_t p = (uintptr_t)f;
     makecontext(&f->uc, (void (*)(void))fiber_entry, 2, (unsigned)(p >> 32), (unsigned)p);
     return 1;
 }
 static void host_destroy(Fiber* f) { free(f->host_stack); f->host_stack = NULL; }
-static void host_resume(Runner* r, Fiber* f) { swapcontext(&r->back, &f->uc); }
-static void host_yield(Fiber* f) { swapcontext(&f->uc, &f->runner->back); }
+static void host_resume(Runner* r, Fiber* f)
+{
+    if (swapcontext(&r->back, &f->uc) != 0)
+        host_failed("resume", "swapcontext", f, (uint32_t)errno, "posix");
+}
+static void host_yield(Fiber* f)
+{
+    if (swapcontext(&f->uc, &f->runner->back) != 0)
+        host_failed("yield", "swapcontext", f, (uint32_t)errno, "posix");
+}
 #endif
 static void wake_control_locked(u32 ea);
 static void finish_locked(Fiber* f, s32 status)
@@ -285,10 +306,11 @@ static PS3_NORETURN void leave(Fiber* f)
 {
 #ifdef _WIN32
     SwitchToFiber(f->runner->back);
+    host_failed("exit", "resumed-after-exit", f, 0, "none");
 #else
     setcontext(&f->runner->back);
+    host_failed("exit", "setcontext", f, (uint32_t)errno, "posix");
 #endif
-    abort();
 }
 static void fiber_body(Fiber* f)
 {

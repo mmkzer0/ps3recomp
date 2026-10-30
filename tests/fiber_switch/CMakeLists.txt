@@ -88,3 +88,28 @@ if(UNIX AND NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR AND TARGET ps
         set_tests_properties(fiber_switch_worker_${mode} PROPERTIES LABELS "fiber;t0;tsan" TIMEOUT 30)
     endforeach()
 endif()
+
+# Reproduce each iOS ENOTSUP stub independently; the other calls stay libc's.
+if(UNIX AND NOT PS3RECOMP_FIBER_BACKEND STREQUAL "aarch64")
+    foreach(call getcontext swapcontext setcontext)
+        add_executable(fiber_host_failure_${call} main.c host_failure.c
+            "${PS3RECOMP_ROOT}/runtime/host/host_stubs.c")
+        target_compile_definitions(fiber_host_failure_${call} PRIVATE HF_FAIL_${call}=1)
+        target_include_directories(fiber_host_failure_${call} PRIVATE
+            "${PS3RECOMP_TREE_ROOT}/libs/spurs" "${PS3RECOMP_TREE_ROOT}/include")
+        target_link_libraries(fiber_host_failure_${call} PRIVATE ps3recomp_runtime Threads::Threads)
+        set_target_properties(fiber_host_failure_${call} PROPERTIES LINKER_LANGUAGE CXX)
+        if(call STREQUAL "getcontext")
+            set(op create)
+        elseif(call STREQUAL "swapcontext")
+            set(op resume)
+        else()
+            set(op exit)
+        endif()
+        add_test(NAME fiber_host_failure_${call} COMMAND fiber_host_failure_${call})
+        set_tests_properties(fiber_host_failure_${call} PROPERTIES
+            LABELS "runtime;fiber;t0" TIMEOUT 30
+            PASS_REGULAR_EXPRESSION
+            "PS3STOP v=1 kind=fiber-host-context[^\n]*backend=ucontext[^\n]*op=${op}[^\n]*reason=${call}[^\n]*error_domain=posix")
+    endforeach()
+endif()
