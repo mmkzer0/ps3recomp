@@ -10,6 +10,8 @@
 #include <unistd.h>
 #include <TargetConditionals.h>
 #include <sys/resource.h>
+#include <dlfcn.h>
+#include <sys/mman.h>
 #ifndef __has_feature
 #define __has_feature(x) 0
 #endif
@@ -22,6 +24,21 @@
 #endif
 #define STACK (4u * 1024u * 1024u)
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #x); exit(1); } } while (0)
+/* The backend's own mprotect call binds to this definition (same executable),
+ * so one split of a stack mapping can be made to fail. Any other call, and the
+ * sanitizer runtimes' own, reach libc. */
+static int hf_mprotect_errno;
+static void* hf_mprotect_addr;
+int mprotect(void* addr, size_t length, int prot)
+{
+    if (hf_mprotect_errno) {
+        hf_mprotect_addr = addr; errno = hf_mprotect_errno; hf_mprotect_errno = 0;
+        return -1;
+    }
+    static int (*real)(void*, size_t, int);
+    if (!real) *(void**)&real = dlsym(RTLD_NEXT, "mprotect");
+    return real(addr, length, prot);
+}
 ps3_host_ctx hf_abi_runner, hf_abi_peer, hf_abi_a, hf_abi_b, hf_abi_c;
 ps3_host_ctx hf_abi_got_a, hf_abi_got_b, hf_abi_got_c;
 extern void hf_abi_run(void);
@@ -142,17 +159,18 @@ static void* foreign(void* arg) { Case* c = arg; ps3_host_runner r = {0}; ps3_ho
 /* One row per stop: the expected machine line, field by field. The ea differs
  * per row, so two stops that share op and reason cannot satisfy each other's
  * test. A fiber made by the case carries ea 0x1000 + its id. */
-typedef struct StopRow { const char* mode, *op, *reason; uint32_t ea; } StopRow;
+typedef struct StopRow { const char* mode, *op, *reason; uint32_t ea; unsigned error; } StopRow;
 static const StopRow stops[] = {
-    {"stop_uncreated", "resume", "state", 0},
-    {"stop_size", "create", "size", 0x1001},
-    {"stop_entry_returned", "start", "entry-returned", 0x1002},
-    {"stop_resume_exited", "resume", "state", 0x1003},
-    {"stop_resume_running", "resume", "state", 0x1004},
-    {"stop_yield_foreign_stack", "yield", "foreign-stack", 0x1005},
-    {"stop_destroy_suspended", "destroy", "state", 0x1006},
-    {"stop_foreign_thread", "resume", "foreign-thread", 0x1007},
-    {"stop_resume_destroyed", "resume", "state", 0x1008},
+    {"stop_uncreated", "resume", "state", 0, 0},
+    {"stop_size", "create", "size", 0x1001, 0},
+    {"stop_entry_returned", "start", "entry-returned", 0x1002, 0},
+    {"stop_resume_exited", "resume", "state", 0x1003, 0},
+    {"stop_resume_running", "resume", "state", 0x1004, 0},
+    {"stop_yield_foreign_stack", "yield", "foreign-stack", 0x1005, 0},
+    {"stop_destroy_suspended", "destroy", "state", 0x1006, 0},
+    {"stop_foreign_thread", "resume", "foreign-thread", 0x1007, 0},
+    {"stop_resume_destroyed", "resume", "state", 0x1008, 0},
+    {"stop_mprotect", "create", "mprotect", 0x1009, EACCES},
 };
 static const StopRow* stop_row(const char* mode)
 {
@@ -167,6 +185,10 @@ static void stop_mode(const char* mode)
     if (!strcmp(mode, "stop_uncreated")) ps3_host_fiber_resume(&c.r, &c.f);
     if (!strcmp(mode, "stop_size")) {
         (void)ps3_host_fiber_create(&c.f, 1, exit_entry, &c, row->ea); CHECK(0);
+    }
+    if (!strcmp(mode, "stop_mprotect")) {
+        hf_mprotect_errno = EACCES;
+        (void)ps3_host_fiber_create(&c.f, STACK, exit_entry, &c, row->ea); CHECK(0);
     }
     create(&c, !strcmp(mode, "stop_entry_returned") ? returned_entry :
                !strcmp(mode, "stop_resume_running") ? nested_entry :
@@ -224,7 +246,8 @@ static void expect_stop(const char* executable, const char* mode)
     fprintf(stderr, "%s child status=%d\n%s", mode, status, output);
     char want[256];
     snprintf(want, sizeof want, "PS3STOP v=1 kind=fiber-host-context backend=aarch64 "
-             "op=%s reason=%s ea=0x%X error=0 error_domain=none\n", row->op, row->reason, row->ea);
+             "op=%s reason=%s ea=0x%X error=%u error_domain=%s\n", row->op, row->reason, row->ea,
+             row->error, row->error ? "posix" : "none");
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 70);
     const char* line = strstr(output, "PS3STOP v=1 ");
     CHECK(line && !strstr(line + 1, "PS3STOP v=1 "));
@@ -353,6 +376,13 @@ int main(int argc, char** argv)
         Case c = {0}; ps3_host_fiber before = c.f; errno = 0;
         CHECK(ps3_host_fiber_create(&c.f, SIZE_MAX / 4, exit_entry, &c, 0) == -1);
         CHECK(errno == ENOMEM && !memcmp(&before, &c.f, sizeof before));
+    } else if (!strcmp(mode, "enomem_mprotect")) {
+        /* The mapping must be gone too: a leak would be invisible otherwise. */
+        Case c = {0}; ps3_host_fiber before = c.f; errno = 0; hf_mprotect_errno = ENOMEM;
+        CHECK(ps3_host_fiber_create(&c.f, STACK, exit_entry, &c, 0) == -1);
+        CHECK(errno == ENOMEM && !memcmp(&before, &c.f, sizeof before));
+        /* msync fails with ENOMEM on an unmapped page; mincore does not on Apple. */
+        CHECK(hf_mprotect_addr && msync(hf_mprotect_addr, 1, MS_ASYNC) == -1 && errno == ENOMEM);
     } else if (!strcmp(mode, "guard")) guard(argv[0]);
     else if (!strcmp(mode, "guard_child")) {
         Case c = {0}; create(&c, guard_entry); ps3_host_fiber_resume(&c.r, &c.f);
