@@ -315,20 +315,54 @@ endif()
 # ---------------------------------------------------------------------------
 # The RSX decompilers emit HLSL for the D3D12 backend. Metal cannot compile
 # that, so libs/video/rsx_shader_msl.cpp lowers it with glslang (HLSL ->
-# SPIR-V) and spirv-cross (SPIR-V -> MSL). Both are optional: without them the
-# module compiles to a stub, rsx_hlsl_to_msl_available() says so, and the
-# Metal backend stays on its fixed-function path. The translation has no GPU
-# in it, so it is built and tested on Linux as well -- that is where the
-# decompilers' HLSL meets glslang's front end on every push.
+# SPIR-V) and spirv-cross (SPIR-V -> MSL). macOS/Linux discover their native
+# dependencies as before; iOS requires a target-built static prefix because
+# Homebrew macOS libraries cannot be linked into the Simulator application.
+# On macOS/Linux both dependencies are optional: without them the backend
+# stays on its fixed-function path. iOS requires the translator.
+# Translation is CPU-only and uses no GPU.
 #
 #   macOS:  brew install glslang spirv-cross
+#   iOS:    tools/build_ios_shader_deps.sh <absolute-prefix>
 #   Debian: apt install glslang-dev glslang-tools spirv-tools \
 #                       libspirv-cross-c-shared-dev
 #           (glslang-tools only because the packaged CMake config declares
 #           the standalone binary as an imported target and fails to load
 #           without it)
 set(PS3RECOMP_MSL_TRANSLATION OFF)
-if(UNIX AND NOT PS3RECOMP_IOS)
+if(PS3RECOMP_IOS)
+    if(CMAKE_VERSION VERSION_LESS 3.28)
+        message(FATAL_ERROR "iOS shader XCFrameworks require CMake 3.28 or newer")
+    endif()
+    set(_ios_shader_prefix "")
+    foreach(_prefix IN LISTS CMAKE_PREFIX_PATH)
+        if(EXISTS "${_prefix}/xcframeworks/glslang.xcframework/Info.plist")
+            set(_ios_shader_prefix "${_prefix}")
+            break()
+        endif()
+    endforeach()
+    if(NOT _ios_shader_prefix)
+        message(FATAL_ERROR "Run tools/build_ios_shader_deps.sh <prefix> and set -DCMAKE_PREFIX_PATH=<prefix>")
+    endif()
+    add_library(ps3recomp_msl_translation INTERFACE)
+    target_compile_definitions(ps3recomp_msl_translation INTERFACE
+        PS3RECOMP_HAVE_MSL_TRANSLATION=1)
+    foreach(_part glslang SPIRV MachineIndependent GenericCodeGen OSDependent
+            glslang-default-resource-limits SPIRV-Tools-opt SPIRV-Tools
+            spirv-cross-c spirv-cross-msl spirv-cross-glsl spirv-cross-core)
+        set(_framework "${_ios_shader_prefix}/xcframeworks/${_part}.xcframework")
+        if(NOT EXISTS "${_framework}/Info.plist")
+            message(FATAL_ERROR "Missing iOS shader XCFramework: ${_framework}")
+        endif()
+        target_link_libraries(ps3recomp_msl_translation INTERFACE "${_framework}")
+    endforeach()
+    # SPIRV-Cross uses a nested include directory; both SDKs share these headers.
+    target_include_directories(ps3recomp_msl_translation INTERFACE
+        "${_ios_shader_prefix}/iphonesimulator/include/spirv_cross")
+    target_link_libraries(ps3recomp_runtime PRIVATE ps3recomp_msl_translation)
+    set(PS3RECOMP_MSL_TRANSLATION ON)
+    message(STATUS "  Shaders:      guest programs translated to iOS MSL (${_ios_shader_prefix}/xcframeworks)")
+elseif(UNIX)
     find_package(glslang CONFIG QUIET)
 
     # spirv-cross's C API. Debian ships it as a shared library and Homebrew as
@@ -371,14 +405,11 @@ if(UNIX AND NOT PS3RECOMP_IOS)
             target_link_libraries(ps3recomp_msl_translation INTERFACE
                 glslang::glslang-default-resource-limits)
         endif()
-        # A static spirv-cross C API (Homebrew's) needs the backends it was
-        # built from, and neither pkg-config nor the library name says so:
-        # pick up the static siblings next to it. The shared one carries
-        # its own.
+        # A static SPIRV-Cross C API archive needs the backends it was built from.
         if(SPVC_LIBS MATCHES "\\.a$")
             foreach(part msl glsl hlsl cpp reflect util core)
                 find_library(SPVC_PART_${part} NAMES spirv-cross-${part}
-                    HINTS ${SPVC_LIBDIRS} NO_DEFAULT_PATH)
+                    HINTS ${SPVC_LIBDIRS} NO_DEFAULT_PATH NO_CMAKE_FIND_ROOT_PATH)
                 if(SPVC_PART_${part})
                     target_link_libraries(ps3recomp_msl_translation INTERFACE
                         ${SPVC_PART_${part}})

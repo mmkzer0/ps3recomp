@@ -29,6 +29,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
 
 #if defined(PS3RECOMP_HAVE_MSL_TRANSLATION)
 
@@ -156,9 +159,14 @@ bool spirv_to_msl(const std::vector<unsigned int>& spirv, bool vertex, char* out
         goto done;
     }
     /* MSL 2.1: arrays of textures need 2.0, and every Apple Silicon Mac
-     * speaks 2.3 or later, so nothing in range is excluded. */
+     * speaks 2.3 or later, so nothing in range is excluded.
+     * iOS uses the same language version with its own platform below. */
     spvc_compiler_options_set_uint(opt, SPVC_COMPILER_OPTION_MSL_VERSION, 20100u);
+#if TARGET_OS_IPHONE
+    spvc_compiler_options_set_uint(opt, SPVC_COMPILER_OPTION_MSL_PLATFORM, SPVC_MSL_PLATFORM_IOS);
+#else
     spvc_compiler_options_set_uint(opt, SPVC_COMPILER_OPTION_MSL_PLATFORM, SPVC_MSL_PLATFORM_MACOS);
+#endif
     spvc_compiler_options_set_bool(opt, SPVC_COMPILER_OPTION_MSL_ENABLE_DECORATION_BINDING, SPVC_TRUE);
     if (spvc_compiler_install_compiler_options(comp, opt) != SPVC_SUCCESS) {
         put_log(log, log_size, "MSL options install", spvc_context_get_last_error_string(ctx));
