@@ -135,7 +135,8 @@ extern "C" {
     /* An RSX driver word (flip head, driver queue) whose meaning the runtime cannot honour. */            \
     X(RSX_DRIVER_METHOD,        "rsx-driver-method")                                                       \
     /* A pad trace (pad.record / pad.replay) that cannot be written, or a replay file that is not a well-formed trace. */ \
-    X(PAD_TRACE,                "pad-trace")
+    X(PAD_TRACE,                "pad-trace")                                                               \
+    X(FIBER_HOST_CONTEXT,       "fiber-host-context")
 
 /* A fixed underlying type in C++ makes a kind outside the list (a caller's bug,
  * which the stop still reports as "invalid-kind") a well-defined value rather
@@ -191,6 +192,11 @@ PS3_NORETURN void ps3_stop(ps3_stop_kind kind, const char* what,
                            const char* remedy,
                            const ps3_stop_field* fields, size_t nfields,
                            const ps3_stop_site* site);
+
+/* Host context failure; no guest site. Fields are defined by this helper. */
+PS3_NORETURN void ps3_stop_fiber_host_context(const char* backend, const char* op,
+                                             const char* reason, uint32_t ea,
+                                             uint32_t error, const char* error_domain);
 
 /* Generic helper to raise PS3_STOP_HLE_GUEST_RANGE.
  * Fields: func, arg, ea, size, limit. */
