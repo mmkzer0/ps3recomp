@@ -149,5 +149,7 @@ void ps3_host_fiber_destroy(ps3_host_fiber* f)
     __asan_unpoison_memory_region(f->map, f->map_size);
 #endif
     if (munmap(f->map, f->map_size) != 0) broke(f->ea, "destroy", "munmap", errno);
-    f->map = NULL; f->map_size = 0;
+    /* A destroyed record has no stack: leave NEW and EXITED so a later resume
+     * stops by name instead of switching into the unmapped stack. */
+    f->map = NULL; f->map_size = 0; f->state = 0;
 }
