@@ -8,8 +8,10 @@ typedef enum ps3_host_fiber_state {
     PS3_HOST_FIBER_NEW = 1, PS3_HOST_FIBER_RUNNING,
     PS3_HOST_FIBER_SUSPENDED, PS3_HOST_FIBER_EXITED
 } ps3_host_fiber_state;
+/* Zero before first use. One runner serves one resume at a time. */
 typedef struct ps3_host_runner {
     ps3_host_ctx ctx;
+    struct ps3_host_fiber* active;
     void* asan_fake;
     void* tsan_self;
 } ps3_host_runner;

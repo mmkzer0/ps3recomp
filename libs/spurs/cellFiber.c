@@ -556,7 +556,9 @@ s32 cellFiberPpuRunFibers(CellFiberPpuScheduler* scheduler)
     LOCK(); Sched* s = find_sched(ea);
     if (!s) { UNLOCK(); return (s32)CELL_FIBER_ERROR_INVAL; }
     if (s->running || t_cur || s->utility) { UNLOCK(); return (s32)CELL_FIBER_ERROR_STAT; }
-    ++s->running; st8(ea + 0x40, 1); Runner runner;
+    ++s->running; st8(ea + 0x40, 1);
+    Runner runner;
+    memset(&runner, 0, sizeof runner);  /* the host backend keeps busy state in it */
     for (;;) {
         Fiber* f = take_runnable(s);
         if (!f) { if (all_done(s)) break; WAIT(); continue; }
@@ -764,6 +766,7 @@ s32 cellFiberPpuUtilWorkerControlRunFibers(u32 ea)
     const u32 bit = 1u << slot;
     st32(ea + 0x288, used | (0x80000000u >> slot)); ++s->running;
     Runner runner;
+    memset(&runner, 0, sizeof runner);  /* the host backend keeps busy state in it */
     for (;;) {
         Fiber* f = take_runnable(s);
         if (f) {
