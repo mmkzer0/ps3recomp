@@ -1,6 +1,12 @@
 # Changelog
 
 ### Unreleased
+- **`ftrace_report.py` counts drawables and label-store waits per flip request** (#94; `tools/{ftrace_report.py,test_ftrace_report.py}`, `docs/TOOLS.md`). The two new span kinds had no report, and a rate per frame window would have been wrong: a present runs behind the flip request that asked for it.
+  - `drawables`: per flip request, new content (`b > 0`), no new content (`b == 0`, with the share showing another surface than the last present) and nil; mean wait.
+  - `label_wait`: waits and ms per flip request, p50/p99/max, the share with more than 64 spins and the share that began mid-pass. Each instant of a wait is charged to one walker span in a fixed order: drawable, in-flight GPU wait, encode, present, drain, rest. The drawable wait lies inside a drain pass, so any other order counts it twice.
+  - Rates are sums over the trace divided by the number of `FLIP_REQ`. A trace whose header says `dropped` above 0 prints counts and shares and no rate.
+  - New `--json` keys: `flip_requests`, `dropped`, `rates`, `drawables`, `label_wait`.
+  - Test: `test_ftrace_report` builds a synthetic timeline whose per-flip rates, nearest-rank percentiles, attribution by span and dropped-span case are checked against hand-computed numbers.
 - **`PS3_FTRACE` spans the wait for a drawable and the guest's wait on the RSX at a label store** (#94; `include/ps3emu/ps3_ftrace.h`, `libs/video/{rsx_metal_backend.m,cellGcmSys.c}`). A windowed title ran at the display's refresh divided by three and nothing in the timeline showed where a flip's time went: the Metal present waits for `[CAMetalLayer nextDrawable]`, the guest waits in the GCM label store for one walker pass, and neither was a span.
   - `PS3_FT_DRAWABLE` (16) covers `nextDrawable` at both call sites (`who` 1 engine, 2 legacy path). `a` bit 0 is a nil drawable (the image is dropped), bit 1 a surface other than the one shown last, `b` the records encoded or still open since the last display blit.
   - `PS3_FT_LABEL_WAIT` (17) covers the wait for the walker pass in the label-store hook: `who` is the PPU thread, `a` the label offset, `b` the spin count (capped at `0xFFFF`) with bit 16 set when a pass was already open as the wait began.
