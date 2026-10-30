@@ -388,8 +388,12 @@ The Apple switch preserves x19–x29, SP and the low 64 bits of v8–v15,
 never touches Apple's reserved x18, and starts with a terminating zero frame
 record. Each stack has an inaccessible lower guard page. Fibers are pinned
 to their first resumer's thread and cannot yield or exit from another stack.
-Destroy is idempotent after exit or before first entry. ASan fake-stack and
-TSan fiber annotations cover first entry, suspension, resumption and exit.
+Destroy is idempotent after exit or before first entry, and a destroyed
+record stops when resumed. A runner serves one resume at a time: resuming
+through a busy runner stops with `reason=nested` (nesting through a second
+runner is fine). A stack mapping that fails with `ENOMEM`, at `mmap` or at
+the guard split, returns -1 and leaves the record untouched. ASan fake-stack
+and TSan fiber annotations cover first entry, suspension, resumption and exit.
 Signal masks, FPCR/FPSR, arm64e pointer authentication, SME and tagged
 stacks are not switched or qualified. Stack overflow faults loudly; it does
 not yet have a named stop.
