@@ -269,17 +269,21 @@ if(APPLE)
         "-framework QuartzCore"
         "-framework Foundation"
     )
+    # LANGUAGE is pinned: CMake maps `.m` to OBJCXX when a consumer enables
+    # OBJCXX in a scope that cannot see this directory's enable_language(OBJC),
+    # and the backend's C idioms (void* to typed pointer) do not compile as
+    # Objective-C++.
     if(PS3RECOMP_IOS)
         target_link_libraries(ps3recomp_runtime PUBLIC "-framework UIKit")
         set_source_files_properties(
             "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_metal_ios_display.m"
-            PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+            PROPERTIES LANGUAGE OBJC COMPILE_OPTIONS "-fobjc-arc")
     else()
         target_link_libraries(ps3recomp_runtime PUBLIC "-framework AppKit")
     endif()
     set_source_files_properties(
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_metal_backend.m"
-        PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+        PROPERTIES LANGUAGE OBJC COMPILE_OPTIONS "-fobjc-arc")
     message(STATUS "  Metal:        RSX backend enabled (rsx_metal_backend.m)")
 endif()
 
