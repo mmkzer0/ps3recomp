@@ -30,7 +30,8 @@ typedef struct ps3_host_fiber {
     void* tsan;
 } ps3_host_fiber;
 
-/* f is zeroed or destroyed. -1/ENOMEM leaves it untouched; other errors stop. */
+/* f is zeroed or destroyed. -1/ENOMEM from the stack mapping or its guard
+ * split leaves it untouched; other errors stop. */
 int ps3_host_fiber_create(ps3_host_fiber* f, size_t stack_size,
                           void (*entry)(void*), void* arg, uint32_t ea);
 /* Serialized by the consumer; first resume pins f to this host thread. */

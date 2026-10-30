@@ -51,8 +51,10 @@ int ps3_host_fiber_create(ps3_host_fiber* f, size_t stack_size,
         broke(ea, "create", "mmap", errno);
     }
     if (mprotect(map, page, PROT_NONE) != 0) {
+        /* Splitting the mapping can exhaust map resources exactly as mmap can. */
         const int err = errno;
         munmap(map, stack + page);
+        if (err == ENOMEM) { errno = ENOMEM; return -1; }
         broke(ea, "create", "mprotect", err);
     }
     memset(f, 0, sizeof *f);

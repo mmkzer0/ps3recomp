@@ -19,7 +19,7 @@ target_include_directories(test_host_fiber_aarch64 PRIVATE
 target_link_libraries(test_host_fiber_aarch64 PRIVATE Threads::Threads)
 target_compile_options(test_host_fiber_aarch64 PRIVATE
     "$<$<COMPILE_LANGUAGE:C,CXX>:-Wall;-Wextra;-Wpedantic;-fno-omit-frame-pointer>")
-foreach(mode abi frame lifecycle many deep enomem annot)
+foreach(mode abi frame lifecycle many deep enomem enomem_mprotect annot)
     add_test(NAME host_fiber_${mode} COMMAND test_host_fiber_aarch64 ${mode})
     set_tests_properties(host_fiber_${mode} PROPERTIES LABELS "runtime;fiber;t0;tsan" TIMEOUT 120)
 endforeach()
@@ -33,7 +33,7 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
     set_tests_properties(host_fiber_guard PROPERTIES LABELS "runtime;fiber;stress" TIMEOUT 30)
 endif()
 set(HF_STOPS entry_returned resume_exited resume_running resume_destroyed uncreated
-    yield_foreign_stack destroy_suspended foreign_thread size)
+    yield_foreign_stack destroy_suspended foreign_thread size mprotect)
 # The expected op, reason and ea of each stop live in main.c (stops[]). The
 # parent mode demands exit 70 and exactly one machine line; a
 # PASS_REGULAR_EXPRESSION would stand in for the exit status check instead.
