@@ -69,6 +69,7 @@
 #include "rsx_host_surface.h"
 #if TARGET_OS_IPHONE
 #  include "ps3emu/metal_ios_display.h"
+#include "rsx_metal_sampler_policy.h"
 #endif
 #include "rsx_commands.h"
 #include "rsx_metal_backend.h"
@@ -3069,6 +3070,28 @@ static void eng_submit_and_wait(void* user, u32 reason)
 
 /* ---- resources ----------------------------------------------------------- */
 
+#if TARGET_OS_IPHONE
+static BOOL s_ios_supports_border;
+
+static void eng_ios_feature_stop(const char* what, const char* remedy,
+                                 const ps3_stop_field* fields, size_t count)
+{
+    /* Like fdump_list_too_long, standalone fixtures can omit the stop module. */
+    typedef void (*stop_fn)(int, const char*, const char*, const ps3_stop_field*, size_t, const ps3_stop_site*);
+    const stop_fn stop = (stop_fn)dlsym(RTLD_DEFAULT, "ps3_stop");
+    if (stop)
+        stop((int)PS3_STOP_GCM_UNMODELLED, what, remedy, fields, count, NULL);
+    fprintf(stderr, "[STOP] gcm-unmodelled: %s (%s)\n", what, remedy);
+    fprintf(stderr, "PS3STOP v=1 kind=gcm-unmodelled");
+    /* All fields supplied here are fixed tokens or hex/decimal numbers. */
+    for (size_t i = 0; i < count; i++)
+        fprintf(stderr, " %s=%s", fields[i].key, fields[i].value);
+    fputc('\n', stderr);
+    fflush(stderr);
+    _Exit(PS3_STOP_EXIT_CODE);
+}
+
+#endif
 
 static u32 eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
                               u32 mips, u32 faces, u32 remap, u32 rsx_fmt)
@@ -3523,15 +3546,22 @@ static int eng_aniso(void)
     return a;
 }
 
+#if TARGET_OS_IPHONE
+static int eng_sampler_slot(const rsx_be_sampler_desc* d, MTLPixelFormat format)
+#else
 static int eng_sampler_slot(const rsx_be_sampler_desc* d)
+#endif
 {
-    const u64 key = (u64)d->min_linear | ((u64)d->mag_linear << 1)
+    u64 key = (u64)d->min_linear | ((u64)d->mag_linear << 1)
                   | ((u64)d->mip_linear << 2) | ((u64)d->mip_present << 3)
                   | ((u64)d->wrap_s << 4) | ((u64)d->wrap_t << 8)
                   | ((u64)d->wrap_r << 12)
                   | ((u64)(u32)(d->min_lod * 256.0f) << 16)
                   | ((u64)(u32)(d->max_lod * 256.0f) << 32)
                   | ((u64)(d->border & 3u) << 56);
+#if TARGET_OS_IPHONE
+    key |= (u64)rsx_metal_format_has_alpha(format) << 58;
+#endif
     for (u32 i = 0; i < s_eng_samp_count; i++)
         if (s_eng_samp[i].key == key) return (int)i;
     if (s_eng_samp_count >= ENG_MAX_SAMPLERS) return -1;
@@ -3557,9 +3587,40 @@ static int eng_sampler_slot(const rsx_be_sampler_desc* d)
         if (sd.tAddressMode == MTLSamplerAddressModeClampToBorderColor) sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
         if (sd.rAddressMode == MTLSamplerAddressModeClampToBorderColor) sd.rAddressMode = MTLSamplerAddressModeClampToEdge;
     }
+#if TARGET_OS_IPHONE
+    if (sd.sAddressMode == MTLSamplerAddressModeClampToBorderColor ||
+        sd.tAddressMode == MTLSamplerAddressModeClampToBorderColor ||
+        sd.rAddressMode == MTLSamplerAddressModeClampToBorderColor) {
+        const rsx_metal_border_mode mode =
+            rsx_metal_border_policy(format, d->border, s_ios_supports_border);
+        if (mode == RSX_METAL_BORDER_UNSUPPORTED) {
+            char pixel_format[16], border[16];
+            snprintf(pixel_format, sizeof pixel_format, "%lu", (unsigned long)format);
+            snprintf(border, sizeof border, "%u", d->border);
+            const ps3_stop_field fields[] = {
+                {"func", "eng_sampler_slot"}, {"feature", "sampler-border-unsupported"},
+                {"pixel_format", pixel_format}, {"border", border},
+                {"reason", "device-lacks-border-color"}
+            };
+            eng_ios_feature_stop("the Metal device cannot represent the guest sampler border",
+                "use a device with border-colour support or implement exact border sampling",
+                fields, sizeof fields / sizeof fields[0]);
+        }
+        if (mode == RSX_METAL_BORDER_ZERO) {
+            if (sd.sAddressMode == MTLSamplerAddressModeClampToBorderColor) sd.sAddressMode = MTLSamplerAddressModeClampToZero;
+            if (sd.tAddressMode == MTLSamplerAddressModeClampToBorderColor) sd.tAddressMode = MTLSamplerAddressModeClampToZero;
+            if (sd.rAddressMode == MTLSamplerAddressModeClampToBorderColor) sd.rAddressMode = MTLSamplerAddressModeClampToZero;
+        } else {
+            sd.borderColor = d->border == 2 ? MTLSamplerBorderColorOpaqueWhite
+                           : d->border == 1 ? MTLSamplerBorderColorOpaqueBlack
+                                            : MTLSamplerBorderColorTransparentBlack;
+        }
+    }
+#else
     sd.borderColor  = d->border == 2 ? MTLSamplerBorderColorOpaqueWhite
                     : d->border == 1 ? MTLSamplerBorderColorOpaqueBlack
                                      : MTLSamplerBorderColorTransparentBlack;
+#endif
     if (d->min_linear && d->mip_present && eng_aniso() > 1)
         sd.maxAnisotropy = (NSUInteger)eng_aniso();
     id<MTLSamplerState> s = [s_dev newSamplerStateWithDescriptor:sd];
@@ -3604,7 +3665,12 @@ static void eng_bind_textures(void* user, const u32* textures,
     (void)user;
     for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
         s_eng_pending.tex[u]  = ((mask >> u) & 1u) ? textures[u] : 0;
+#if TARGET_OS_IPHONE
+        s_eng_pending.samp[u] = ((mask >> u) & 1u) ?
+            eng_sampler_slot(&samplers[u], [eng_obj(textures[u]) pixelFormat]) : -1;
+#else
         s_eng_pending.samp[u] = ((mask >> u) & 1u) ? eng_sampler_slot(&samplers[u]) : -1;
+#endif
     }
 }
 
@@ -3614,7 +3680,12 @@ static void eng_bind_vertex_textures(void* user, const u32* textures,
     (void)user;
     for (u32 u = 0; u < RSX_BE_MAX_VERTEX_TEXTURES; u++) {
         s_eng_pending.vtex[u]  = ((mask >> u) & 1u) ? textures[u] : 0;
+#if TARGET_OS_IPHONE
+        s_eng_pending.vsamp[u] = ((mask >> u) & 1u) ?
+            eng_sampler_slot(&samplers[u], [eng_obj(textures[u]) pixelFormat]) : -1;
+#else
         s_eng_pending.vsamp[u] = ((mask >> u) & 1u) ? eng_sampler_slot(&samplers[u]) : -1;
+#endif
     }
 }
 
@@ -4724,6 +4795,10 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
             fprintf(stderr, "[RSX metal] no Metal device available\n");
             return -1;
         }
+#if TARGET_OS_IPHONE
+        /* Apple's Metal feature table: border colour starts at Apple7. */
+        s_ios_supports_border = [s_dev supportsFamily:MTLGPUFamilyApple7];
+#endif
         s_queue = [s_dev newCommandQueue];
         if (!s_queue) {
             fprintf(stderr, "[RSX metal] could not create command queue\n");

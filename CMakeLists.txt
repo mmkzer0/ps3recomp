@@ -1402,6 +1402,13 @@ if(UNIX)
     set(RSX_METHODS_TEST_ARGS $<TARGET_FILE:test_gcm_nv0039>)
     # The backend's dump-list parser, no GPU: the .m includes the backend and reaches only fdump_parse.
     if(APPLE)
+        add_executable(test_metal_sampler_policy libs/video/tests/test_metal_sampler_policy.m)
+        target_include_directories(test_metal_sampler_policy PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
+        target_link_libraries(test_metal_sampler_policy PRIVATE
+            "-framework Metal" "-framework Foundation")
+        add_test(NAME metal_sampler_policy COMMAND test_metal_sampler_policy)
+        set_tests_properties(metal_sampler_policy PROPERTIES LABELS "video;t0" TIMEOUT 30)
         add_executable(test_metal_frame_dump_list
             libs/video/tests/test_metal_frame_dump_list.m
             runtime/diag/stop.cpp)
