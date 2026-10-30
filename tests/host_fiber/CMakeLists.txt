@@ -32,8 +32,8 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
     add_test(NAME host_fiber_guard COMMAND test_host_fiber_aarch64 guard)
     set_tests_properties(host_fiber_guard PROPERTIES LABELS "runtime;fiber;stress" TIMEOUT 30)
 endif()
-set(HF_STOPS entry_returned resume_exited resume_running uncreated yield_foreign_stack
-    destroy_suspended foreign_thread size)
+set(HF_STOPS entry_returned resume_exited resume_running resume_destroyed uncreated
+    yield_foreign_stack destroy_suspended foreign_thread size)
 # The expected op, reason and ea of each stop live in main.c (stops[]). The
 # parent mode demands exit 70 and exactly one machine line; a
 # PASS_REGULAR_EXPRESSION would stand in for the exit status check instead.

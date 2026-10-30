@@ -152,6 +152,7 @@ static const StopRow stops[] = {
     {"stop_yield_foreign_stack", "yield", "foreign-stack", 0x1005},
     {"stop_destroy_suspended", "destroy", "state", 0x1006},
     {"stop_foreign_thread", "resume", "foreign-thread", 0x1007},
+    {"stop_resume_destroyed", "resume", "state", 0x1008},
 };
 static const StopRow* stop_row(const char* mode)
 {
@@ -170,6 +171,9 @@ static void stop_mode(const char* mode)
     create(&c, !strcmp(mode, "stop_entry_returned") ? returned_entry :
                !strcmp(mode, "stop_resume_running") ? nested_entry :
                !strcmp(mode, "stop_resume_exited") ? exit_entry : yield_entry);
+    if (!strcmp(mode, "stop_resume_destroyed")) {
+        ps3_host_fiber_destroy(&c.f); ps3_host_fiber_resume(&c.r, &c.f);
+    }
     ps3_host_fiber_resume(&c.r, &c.f);
     if (!strcmp(mode, "stop_resume_exited")) ps3_host_fiber_resume(&c.r, &c.f);
     if (!strcmp(mode, "stop_destroy_suspended")) ps3_host_fiber_destroy(&c.f);
