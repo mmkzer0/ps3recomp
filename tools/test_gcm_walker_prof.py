@@ -28,7 +28,9 @@ with tempfile.TemporaryDirectory(prefix='gcm-walker-prof-') as tmp:
                         ('on', {'RSX_WALKER_PROF': str(Path(tmp) / 'on.txt'),
                                 'RSX_WALKER_PROF_SECONDS': '1'})):
         out = str(Path(tmp) / (mode + '.txt'))
-        result = subprocess.run([str(binary), mode, out], timeout=60, capture_output=True,
+        # The fixture bounds its own wait on the sampler at 120 s; this only
+        # catches a hang outside that wait.
+        result = subprocess.run([str(binary), mode, out], timeout=180, capture_output=True,
                                 text=True, env={**base, **extra})
         print(result.stdout.strip())
         if result.returncode:

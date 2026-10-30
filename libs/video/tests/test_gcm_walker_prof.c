@@ -59,6 +59,11 @@ int  rsx_live_draw_resolve_blit(u32 a, u32 b, u32 c, u32 d, u32 e, u32 f, u32 g,
 
 void rsx_raise_user_cmd(uint32_t arg) { (void)arg; }
 
+/* About 3x the slowest sampler run measured (taskpolicy -b, ~40 s). The test
+ * returns as soon as the sampler is done, so the bound costs nothing when
+ * the host keeps up. tools/test_gcm_walker_prof.py's timeout covers it. */
+#define WPROF_FINISH_BOUND_S 120.0
+
 #define IO_ADDR   0x00100000u
 #define IO_SIZE   0x00100000u
 #define CMD_SIZE  0x00010000u
@@ -128,8 +133,16 @@ int main(int argc, char** argv)
         check(f == NULL, "without RSX_WALKER_PROF no profile is written");
         if (f) fclose(f);
     } else {
-        walker_loop(6.0);
-        check(atomic_load(&s_wprof_state) == 2, "the sampler finishes after RSX_WALKER_PROF_SECONDS");
+        /* The sampler ends after a tick count (1000 nanosleeps of 1 ms), not
+         * at a deadline, and a throttled or loaded host stretches each sleep:
+         * 1 ms took 32-39 ms under taskpolicy -b (~35 s for the whole run).
+         * So wait on the observable condition, the done state that
+         * walker_loop polls, bounded well past that rather than a fixed run
+         * time. */
+        const double t0 = now_s();
+        walker_loop(WPROF_FINISH_BOUND_S);
+        printf("  sampler finished after %.2f s\n", now_s() - t0);
+        check(atomic_load(&s_wprof_state) == 2, "the sampler finishes within the bound after RSX_WALKER_PROF_SECONDS");
         FILE* f = fopen(path, "r");
         check(f != NULL, "the profile file is written");
         int n = -1, lines = 0, frames_ok = 1;
