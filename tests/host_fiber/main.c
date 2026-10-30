@@ -39,8 +39,9 @@ int mprotect(void* addr, size_t length, int prot)
     if (!real) *(void**)&real = dlsym(RTLD_NEXT, "mprotect");
     return real(addr, length, prot);
 }
-ps3_host_ctx hf_abi_runner, hf_abi_peer, hf_abi_a, hf_abi_b, hf_abi_c;
+ps3_host_ctx hf_abi_runner, hf_abi_runner2, hf_abi_peer, hf_abi_peer2, hf_abi_a, hf_abi_b, hf_abi_c;
 ps3_host_ctx hf_abi_got_a, hf_abi_got_b, hf_abi_got_c;
+uintptr_t hf_abi_home;
 extern void hf_abi_run(void);
 extern void hf_abi_peer_entry(void);
 static uint64_t frames[3][2];
@@ -70,6 +71,13 @@ static void abi(void)
     hf_abi_run();
     same(&hf_abi_a, &hf_abi_got_a); same(&hf_abi_b, &hf_abi_got_b);
     same(&hf_abi_c, &hf_abi_got_c);
+    /* x30 is the only register whose loss shows up as a crash. Each switch saved
+     * its own return address, so the value in force after the matching return
+     * must equal what that switch recorded; a lost x30 fails here by name. */
+    CHECK(hf_abi_runner.lr && hf_abi_runner2.lr && hf_abi_runner.lr != hf_abi_runner2.lr);
+    CHECK(hf_abi_got_a.lr == hf_abi_runner.lr);
+    CHECK(hf_abi_got_c.lr == hf_abi_runner2.lr);
+    CHECK(hf_abi_peer.lr && hf_abi_peer2.lr && hf_abi_got_b.lr == hf_abi_peer.lr);
     free(stack);
 }
 typedef struct Case {
