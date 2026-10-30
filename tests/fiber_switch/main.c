@@ -29,6 +29,7 @@
 #include <string.h>
 #ifndef _WIN32
 #include <pthread.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #endif
 
@@ -450,7 +451,7 @@ static void case_errors(void)
 /* ---------------------------------------------------------------------------
  * main
  * -----------------------------------------------------------------------*/
-int main(void)
+static int run_cases(void)
 {
     /* A switch that lands on the wrong stack takes the process down, so keep the progress lines out of a buffer that
      * dies with it. */
@@ -475,4 +476,46 @@ int main(void)
 
     printf("=== RESULT: %s (fails=%d) ===\n", g_fails ? "FAIL" : "PASS", g_fails);
     return g_fails ? 1 : 0;
+}
+
+#ifdef HF_EXPECT_OP
+/* A stop ends the process, so the cases run in a child. The test passes only
+ * by that stop: exit 70 and exactly one machine line for this op and reason.
+ * A passing run or a crash cannot satisfy a regular expression on its output. */
+static int expect_host_stop(void)
+{
+    int pipes[2];
+    if (pipe(pipes)) return 1;
+    const pid_t pid = fork();
+    if (pid < 0) return 1;
+    if (pid == 0) {
+        close(pipes[0]); dup2(pipes[1], STDERR_FILENO); close(pipes[1]);
+        _exit(run_cases());
+    }
+    close(pipes[1]);
+    char output[16384]; size_t used = 0; ssize_t n;
+    while (used < sizeof output - 1 &&
+           (n = read(pipes[0], output + used, sizeof output - 1 - used)) > 0) used += (size_t)n;
+    close(pipes[0]); output[used] = 0;
+    int status;
+    if (waitpid(pid, &status, 0) != pid) return 1;
+    fprintf(stderr, "child status=%d\n%s", status, output);
+    static const char want[] = "PS3STOP v=1 kind=fiber-host-context backend=ucontext op=" HF_EXPECT_OP
+                               " reason=" HF_EXPECT_REASON " ea=0x";
+    const char* line = strstr(output, "PS3STOP v=1 ");
+    const int ok = WIFEXITED(status) && WEXITSTATUS(status) == 70 && line &&
+                   !strstr(line + 1, "PS3STOP v=1 ") && !strncmp(line, want, sizeof want - 1) &&
+                   strstr(line, " error_domain=posix\n") && !strstr(line, " error=0 ");
+    printf("=== RESULT: %s ===\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+#endif
+
+int main(void)
+{
+#ifdef HF_EXPECT_OP
+    return expect_host_stop();
+#else
+    return run_cases();
+#endif
 }
