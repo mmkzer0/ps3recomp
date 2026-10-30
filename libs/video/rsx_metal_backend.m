@@ -3071,6 +3071,7 @@ static void eng_submit_and_wait(void* user, u32 reason)
 /* ---- resources ----------------------------------------------------------- */
 
 #if TARGET_OS_IPHONE
+static BOOL s_ios_supports_bc;
 static BOOL s_ios_supports_border;
 
 static void eng_ios_feature_stop(const char* what, const char* remedy,
@@ -3091,6 +3092,24 @@ static void eng_ios_feature_stop(const char* what, const char* remedy,
     _Exit(PS3_STOP_EXIT_CODE);
 }
 
+static void eng_require_bc(void* user, u32 format, u32 location, u32 offset, u32 size)
+{
+    (void)user;
+    if (s_ios_supports_bc) return;
+    char fmt[16], loc[16], off[16], bytes[16];
+    snprintf(fmt, sizeof fmt, "0x%02X", format);
+    snprintf(loc, sizeof loc, "%u", location);
+    snprintf(off, sizeof off, "0x%08X", offset);
+    snprintf(bytes, sizeof bytes, "0x%08X", size);
+    const ps3_stop_field fields[] = {
+        {"func", "eng_texture_upload"}, {"feature", "bc-texture-unsupported"},
+        {"format", fmt}, {"location", loc}, {"offset", off}, {"size", bytes},
+        {"reason", "device-lacks-bc-textures"}
+    };
+    eng_ios_feature_stop("the Metal device cannot sample the guest's BC texture",
+        "use a device with BC texture support or implement BC decoding to RGBA",
+        fields, sizeof fields / sizeof fields[0]);
+}
 #endif
 
 static u32 eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
@@ -4717,6 +4736,9 @@ static const rsx_draw_backend s_engine_backend = {
     .texture_create       = eng_texture_create,
     .texture_upload       = eng_texture_upload,
     .texture_release      = eng_obj_release,
+#if TARGET_OS_IPHONE
+    .require_bc           = eng_require_bc,
+#endif
     .texture_create_3d    = eng_texture_create_3d,
     .texture_upload_3d    = eng_texture_upload_3d,
     .color_target_create  = eng_color_target_create,
@@ -4796,8 +4818,27 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
             return -1;
         }
 #if TARGET_OS_IPHONE
+        s_ios_supports_bc = [s_dev supportsBCTextureCompression];
         /* Apple's Metal feature table: border colour starts at Apple7. */
         s_ios_supports_border = [s_dev supportsFamily:MTLGPUFamilyApple7];
+        fprintf(stderr, "[RSX metal] supportsBCTextureCompression=%d\n", (int)s_ios_supports_bc);
+        unsigned apple_family = 0;
+        for (NSUInteger family = MTLGPUFamilyApple10; family >= MTLGPUFamilyApple1; family--) {
+            if ([s_dev supportsFamily:(MTLGPUFamily)family]) {
+                apple_family = (unsigned)(family - MTLGPUFamilyApple1 + 1);
+                break;
+            }
+        }
+        mach_task_basic_info_data_t memory;
+        mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+        const kern_return_t memory_status = task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                                                      (task_info_t)&memory, &count);
+        fprintf(stderr, "[RSX metal] borderColor=%d gpuFamilyApple=%u gpuFamilyMac2=%d"
+                        " vm_base=%p resident_bytes=%llu memory_status=%d\n",
+                (int)s_ios_supports_border, apple_family,
+                (int)[s_dev supportsFamily:MTLGPUFamilyMac2], (void*)vm_base,
+                memory_status == KERN_SUCCESS ? (unsigned long long)memory.resident_size : 0,
+                (int)memory_status);
 #endif
         s_queue = [s_dev newCommandQueue];
         if (!s_queue) {
