@@ -22,6 +22,9 @@
 #include "ps3emu/log_first.h"
 #include "ps3emu/config.h"
 #include "pad_trace.h"
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
 
 /* PAD_CLOCK=flips: PAD_SCRIPT and PAD_STICK times count guest flips instead of
  * wall-clock seconds. A loaded machine runs a title at a third of its usual
@@ -42,6 +45,9 @@ static double pad_clock(unsigned long long t0_ms)
 
 #if defined(PS3RECOMP_PAD_USE_SDL2)
   #define PAD_BACKEND_SDL2  1
+  #define PAD_BACKEND_XINPUT 0
+#elif TARGET_OS_IPHONE
+  #define PAD_BACKEND_SDL2  0
   #define PAD_BACKEND_XINPUT 0
 #elif defined(_WIN32)
   #define PAD_BACKEND_SDL2  0
@@ -753,6 +759,17 @@ static void pad_shutdown_backend(void)
 }
 
 #endif /* PAD_BACKEND_SDL2 */
+
+#if TARGET_OS_IPHONE
+/* Input is not part of the iOS PoC; cellPad's existing virtual pad remains
+ * neutral so guest reads still follow the library contract. */
+static void pad_init_backend(void)
+{
+    fprintf(stderr, "[cellPad] host input disabled for the iOS PoC\n");
+}
+
+static void pad_shutdown_backend(void) {}
+#endif
 
 /* ---------------------------------------------------------------------------
  * Poll dispatcher
