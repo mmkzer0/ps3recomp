@@ -35,6 +35,10 @@ _hf_abi_run:
     sub sp, sp, #HOST_CTX_SIZE
     mov x9, sp
     save x9
+    // A broken switch can return on the peer stack. Keep the way home so the
+    // epilogue still reaches the C checks, which then fail by name.
+    address x10, _hf_abi_home
+    str x9, [x10]
     address x9, _hf_abi_a
     mov x10, sp
     str x10, [x9, #HOST_CTX_SP]
@@ -48,12 +52,14 @@ _hf_abi_run:
     mov x10, sp
     str x10, [x9, #HOST_CTX_SP]
     load x9
-    address x0, _hf_abi_runner
+    address x0, _hf_abi_runner2
     address x1, _hf_abi_peer
     bl _ps3_host_ctx_switch
     address x9, _hf_abi_got_c
     save x9
-    mov x9, sp
+    address x9, _hf_abi_home
+    ldr x9, [x9]
+    mov sp, x9
     load x9
     ldr x30, [sp, #HOST_CTX_FP+8]
     add sp, sp, #HOST_CTX_SIZE
@@ -69,7 +75,7 @@ _hf_abi_peer_entry:
     bl _ps3_host_ctx_switch
     address x9, _hf_abi_got_b
     save x9
-    address x0, _hf_abi_peer
-    address x1, _hf_abi_runner
+    address x0, _hf_abi_peer2
+    address x1, _hf_abi_runner2
     bl _ps3_host_ctx_switch
     brk #1
