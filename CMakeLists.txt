@@ -8,6 +8,11 @@ project(ps3recomp_runtime
     DESCRIPTION "ps3recomp - Static recompilation runtime for PS3 games"
 )
 
+set(PS3RECOMP_IOS OFF)
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    set(PS3RECOMP_IOS ON)
+endif()
+
 # ---------------------------------------------------------------------------
 # Standards
 # ---------------------------------------------------------------------------
@@ -66,10 +71,14 @@ if(PS3RECOMP_RSX_VULKAN)
 endif()
 
 # The Metal backend is Objective-C and Apple-only, so it is added explicitly
-# rather than globbed. It needs no platform #ifdef of its own as a result.
+# rather than globbed. UIKit supplies the simulator display view; macOS keeps
+# its AppKit window implementation.
 if(APPLE)
     enable_language(OBJC)
     list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_metal_backend.m")
+    if(PS3RECOMP_IOS)
+        list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_metal_ios_display.m")
+    endif()
 endif()
 # The HLSL -> MSL translator is C++ (it drives glslang's C++ API) and compiles
 # to a stub wherever the shader tools are absent, so it is part of the
@@ -223,30 +232,35 @@ if(WIN32)
         bcrypt      # BCryptGenRandom for SSL RNG
     )
 else()
-    # cellPad and cellAudio select their SDL2 backends unconditionally off
-    # Windows (see PAD_BACKEND_SDL2 / AUDIO_BACKEND_SDL2), so SDL2 is required
-    # here -- docs/BUILDING.md already lists it as the Linux/macOS dependency.
-    find_package(SDL2 QUIET)
-    if(SDL2_FOUND)
-        if(TARGET SDL2::SDL2)
-            target_link_libraries(ps3recomp_runtime PRIVATE SDL2::SDL2)
-        else()
-            target_include_directories(ps3recomp_runtime PRIVATE ${SDL2_INCLUDE_DIRS})
-            target_link_libraries(ps3recomp_runtime PRIVATE ${SDL2_LIBRARIES})
-        endif()
-        message(STATUS "  SDL2:         found (input + audio backends enabled)")
-    else()
-        message(FATAL_ERROR
-            "SDL2 not found. It provides the cellPad and cellAudio backends on "
-            "non-Windows hosts.\n"
-            "  macOS:  brew install sdl2\n"
-            "  Debian: apt install libsdl2-dev\n"
-            "If SDL2 is installed in a non-standard prefix, pass "
-            "-DCMAKE_PREFIX_PATH=<prefix>.")
-    endif()
-
     find_package(Threads REQUIRED)
     target_link_libraries(ps3recomp_runtime PRIVATE Threads::Threads)
+    if(PS3RECOMP_IOS)
+        # Simulator builds use UIKit/Metal and do not link a macOS SDL2 binary.
+        # Host input and audio output are outside this rendering PoC.
+        message(STATUS "  SDL2:         skipped for iOS (no SDL-backed host input or audio output)")
+    else()
+        # cellPad and cellAudio select their SDL2 backends unconditionally off
+        # Windows (see PAD_BACKEND_SDL2 / AUDIO_BACKEND_SDL2), so SDL2 is required
+        # here -- docs/BUILDING.md already lists it as the Linux/macOS dependency.
+        find_package(SDL2 QUIET)
+        if(SDL2_FOUND)
+            if(TARGET SDL2::SDL2)
+                target_link_libraries(ps3recomp_runtime PRIVATE SDL2::SDL2)
+            else()
+                target_include_directories(ps3recomp_runtime PRIVATE ${SDL2_INCLUDE_DIRS})
+                target_link_libraries(ps3recomp_runtime PRIVATE ${SDL2_LIBRARIES})
+            endif()
+            message(STATUS "  SDL2:         found (input + audio backends enabled)")
+        else()
+            message(FATAL_ERROR
+                "SDL2 not found. It provides the cellPad and cellAudio backends on "
+                "non-Windows hosts.\n"
+                "  macOS:  brew install sdl2\n"
+                "  Debian: apt install libsdl2-dev\n"
+                "If SDL2 is installed in a non-standard prefix, pass "
+                "-DCMAKE_PREFIX_PATH=<prefix>.")
+        endif()
+    endif()
 endif()
 
 if(APPLE)
@@ -254,8 +268,15 @@ if(APPLE)
         "-framework Metal"
         "-framework QuartzCore"
         "-framework Foundation"
-        "-framework AppKit"
     )
+    if(PS3RECOMP_IOS)
+        target_link_libraries(ps3recomp_runtime PUBLIC "-framework UIKit")
+        set_source_files_properties(
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_metal_ios_display.m"
+            PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    else()
+        target_link_libraries(ps3recomp_runtime PUBLIC "-framework AppKit")
+    endif()
     set_source_files_properties(
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_metal_backend.m"
         PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
@@ -307,7 +328,7 @@ endif()
 #           the standalone binary as an imported target and fails to load
 #           without it)
 set(PS3RECOMP_MSL_TRANSLATION OFF)
-if(UNIX)
+if(UNIX AND NOT PS3RECOMP_IOS)
     find_package(glslang CONFIG QUIET)
 
     # spirv-cross's C API. Debian ships it as a shared library and Homebrew as
@@ -1442,7 +1463,10 @@ endif()
 #
 # The HLE NID table is generated exactly as a port generates it, so the smoke
 # title's firmware imports resolve through the same bridge a game's do.
-if(UNIX)
+# The smoke title is a host-side build/test helper, not a runtime dependency.
+# Its generated image feeds separate targets that Xcode's cross-build graph
+# cannot represent as independent consumers.
+if(UNIX AND NOT PS3RECOMP_IOS)
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(NOT Python3_Interpreter_FOUND)
         message(STATUS "  Boot smoke:   no python3; ps3recomp_boot_smoke not built")

@@ -1,6 +1,8 @@
 # Changelog
 
 ### Unreleased
+- **The RSX Metal backend can use a UIKit-owned `CAMetalLayer` on iOS Simulator** (`CMakeLists.txt`, `libs/video/rsx_metal_ios_display.m`, `include/ps3emu/metal_ios_display.h`, `libs/video/rsx_metal_backend.m`). The app owns its scene and display view; AppKit remains macOS-only. The PoC keeps neutral input and silent audio instead of linking macOS SDL2.
+- **Silent POSIX audio follows the monotonic audio-period clock** (`libs/audio/cellAudio.c`). Without a host backend, mixing and notifications run at 187.5 blocks/s and discard a backlog above 50 ms rather than bursting. SDL pacing is unchanged.
 - **`ftrace_report.py` names the guest call site of every import wait, splits slow frames from fast ones and measures an import's cadence** (`tools/{ftrace_report.py,test_ftrace_report.py}`). Before, a 240 s battle timeline (9M spans) took 4.5 min, because every frame re-sliced the whole span list. The import table had no call sites, so "the main thread waits 8.8 ms per frame in `Port2Sync`" could not say where. Nothing showed what grows in the slow frames, or what an audio thread does between two polls.
   - Each span is now binned once by bisection on the frame ends and shared out over the frames it overlaps: 43 s on the same timeline.
   - New `--split MS`, `--cadence NID[@TID]` with `--gap MS`, and `--json`.

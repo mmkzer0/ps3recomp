@@ -246,6 +246,7 @@ which is opt-in on Linux (`-DPS3RECOMP_RSX_VULKAN=ON`) while it grows:
 |------|---------|--------|--------|
 | Windows | **Direct3D 12** | `libs/video/rsx_d3d12_backend.c` | The reference path. Every in-tree port is developed and tested against it. |
 | macOS | Metal | `libs/video/rsx_metal_backend.m` | Linked against Metal / QuartzCore / Foundation / AppKit. |
+| iOS (Simulator PoC) | Metal in a UIKit `CAMetalLayer` view | `libs/video/rsx_metal_ios_display.m` | Experimental. The app owns UIKit; the RSX backend uses its drawable layer. |
 | Linux | null / headless software | `libs/video/` null path | The default. The guest command stream is executed and validated, but nothing is presented to a window. |
 | Linux (opt-in) | Vulkan | `libs/video/rsx_vulkan_backend.c` | Opt-in. With guest programs on (`PS3RECOMP_VK_GUEST_PROGRAMS=1`) it runs the title's shaders on the shared register-file draw engine, as Metal does; without them, the null backend's fixed-function contract. See below. |
 
@@ -435,6 +436,34 @@ library, runs all eight lifter suites plus the SPU helper tests, and drives
 **Link Libraries:**
 - `-lpthread` — POSIX threads (linked automatically by most CMake configurations)
 - `-lm` — Math library
+
+### iOS Simulator (experimental)
+
+The toolkit can be compiled for the iOS Simulator as a dependency of a title
+app. Select the Simulator SDK and a target architecture explicitly:
+
+```bash
+cmake -S . -B build/ios-simulator -G Xcode \
+  -DCMAKE_SYSTEM_NAME=iOS \
+  -DCMAKE_OSX_SYSROOT=iphonesimulator \
+  -DCMAKE_OSX_ARCHITECTURES=arm64 \
+  -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 \
+  -DPS3RECOMP_BUILD_TESTS=OFF
+cmake --build build/ios-simulator --config Debug \
+  --target ps3recomp_runtime --parallel 4
+```
+
+The iOS target links UIKit, QuartzCore, and Metal; it does not link AppKit or a
+Homebrew macOS SDL2 binary. SDL2 must be built for the target iOS SDK to supply
+host input or audio. This Simulator PoC skips SDL2: the guest still receives
+the neutral virtual pad, while host audio output is unavailable. The
+glslang/spirv-cross HLSL-to-MSL translator is also omitted because host-built
+libraries cannot be linked into the iOS app; the Metal backend uses its
+fixed-function fallback.
+
+Apple describes Simulator's Metal feature and texture limits in
+[Developing Metal apps that run in Simulator](https://developer.apple.com/documentation/metal/developing-metal-apps-that-run-in-simulator).
+Simulator is for workflow prototyping, not validation of device GPU behavior.
 
 ### macOS
 

@@ -62,9 +62,14 @@
 #include <unistd.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
-#include <servers/bootstrap.h>
+#if !TARGET_OS_IPHONE
+#  include <servers/bootstrap.h>
+#endif
 #include <IOSurface/IOSurfaceRef.h>
 #include "rsx_host_surface.h"
+#if TARGET_OS_IPHONE
+#  include "ps3emu/metal_ios_display.h"
+#endif
 #include "rsx_commands.h"
 #include "rsx_metal_backend.h"
 #include "rsx_vertex_fetch.h"
@@ -92,7 +97,9 @@ static id<MTLCommandQueue> s_queue;
 static CAMetalLayer*       s_layer;      /* windowed only   */
 static id<MTLTexture>      s_offscreen;  /* headless only   */
 static id<MTLTexture>      s_depth;      /* depth + stencil, both surfaces  */
+#if !TARGET_OS_IPHONE
 static NSWindow*           s_window;
+#endif
 static int                 s_headless;
 static atomic_int          s_closed;
 #if !TARGET_OS_IPHONE
@@ -109,10 +116,13 @@ static u32                 s_height = 720;
  * paced by the in-flight semaphore exactly as windowed ones are -- and s_window
  * stays nil, so everything that is about the window is skipped. */
 static int                 s_host;
+#if !TARGET_OS_IPHONE
 static rsx_host_control*   s_host_ctl;
 static mach_port_t         s_host_port;          /* the launcher's service */
+static u32                 s_host_w, s_host_h;
+#endif
 static id<MTLTexture>      s_host_tex[RSX_HOST_SLOTS];
-static u32                 s_host_w, s_host_h, s_host_gen;
+static u32                 s_host_gen;
 static dispatch_source_t   s_host_watch;          /* the launcher's exit */
 
 /* Each initialization owns its counters. A drawable callback retained by the
@@ -576,6 +586,7 @@ static int create_depth(void)
     return 0;
 }
 
+#if !TARGET_OS_IPHONE
 static int create_offscreen(void)
 {
     MTLTextureDescriptor* td =
@@ -587,6 +598,7 @@ static int create_offscreen(void)
     s_offscreen = [s_dev newTextureWithDescriptor:td];
     return s_offscreen ? 0 : -1;
 }
+#endif
 
 /* ---- host surfaces --------------------------------------------------------
  * PS3RECOMP_HOST_SURFACES=<bootstrap name>, set by the launcher
@@ -803,7 +815,6 @@ static void host_detach(void)
     s_host = 0;
 }
 #else
-static int  host_attach(u32 w, u32 h) { (void)w; (void)h; return -1; }
 static int  host_acquire(void) { return -1; }
 static void host_frame_done(int slot, u32 gen, int ok) { (void)slot; (void)gen; (void)ok; }
 static int  host_match_size(u32 w, u32 h) { (void)w; (void)h; return -1; }
@@ -3058,6 +3069,7 @@ static void eng_submit_and_wait(void* user, u32 reason)
 
 /* ---- resources ----------------------------------------------------------- */
 
+
 static u32 eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
                               u32 mips, u32 faces, u32 remap, u32 rsx_fmt)
 {
@@ -4720,8 +4732,11 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
 
         int rc;
 #if TARGET_OS_IPHONE
-        s_headless = 1;
-        rc = create_offscreen();
+        (void)title;
+        /* The app delegate installed the UIKit view before the guest starts. */
+        s_headless = 0;
+        s_layer = ps3recomp_metal_ios_configure_layer(s_dev, s_width, s_height);
+        rc = s_layer ? 0 : -1;
 #else
         /* Under a launcher (tools/host_window) the window is the launcher's.
          * Without an answer from it the run is not lost: it opens a window of

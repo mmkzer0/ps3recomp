@@ -23,6 +23,9 @@
 #include <math.h>
 #include "ps3emu/log_first.h"
 #include "ps3emu/thread_name.h"
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
 
 /* ---------------------------------------------------------------------------
  * Backend selection
@@ -30,6 +33,10 @@
 
 #if defined(PS3RECOMP_AUDIO_USE_SDL2)
   #define AUDIO_BACKEND_SDL2    1
+  #define AUDIO_BACKEND_WASAPI  0
+#elif TARGET_OS_IPHONE
+  /* No host output: the POSIX mix loop supplies the audio-period clock. */
+  #define AUDIO_BACKEND_SDL2    0
   #define AUDIO_BACKEND_WASAPI  0
 #elif defined(_WIN32)
   #define AUDIO_BACKEND_SDL2    0
@@ -407,6 +414,22 @@ static void audio_backend_wait(void)
 
 #endif /* AUDIO_BACKEND_WASAPI */
 
+#if !AUDIO_BACKEND_SDL2 && !AUDIO_BACKEND_WASAPI
+/* No host output is requested; the mixer still delivers clock-paced events. */
+static int audio_backend_init(void)
+{
+    printf("[cellAudio] host audio output disabled; using the monotonic clock\n");
+    return 0;
+}
+
+static void audio_backend_shutdown(void) {}
+static void audio_backend_submit(const float* samples, u32 count)
+{
+    (void)samples;
+    (void)count;
+}
+#endif
+
 /* ---------------------------------------------------------------------------
  * Mixing
  * -----------------------------------------------------------------------*/
@@ -652,17 +675,62 @@ static void* audio_mix_thread_func(void* arg)
     (void)arg;
     printf("[cellAudio] Mixing thread started\n");
 
+#if !AUDIO_BACKEND_SDL2 && !AUDIO_BACKEND_WASAPI
+    const uint64_t ns_per_second = 1000000000ull;
+    const uint64_t block_ns = CELL_AUDIO_BLOCK_SAMPLES * ns_per_second / CELL_AUDIO_SAMPLE_RATE;
+    const unsigned block_fraction = CELL_AUDIO_BLOCK_SAMPLES * ns_per_second % CELL_AUDIO_SAMPLE_RATE;
+    const uint64_t max_backlog_ns = ns_per_second / 20; /* 50 ms, as on WASAPI. */
+    struct timespec clock;
+    clock_gettime(CLOCK_MONOTONIC, &clock);
+    uint64_t next_ns = (uint64_t)clock.tv_sec * ns_per_second + clock.tv_nsec;
+    uint64_t rate_start_ns = next_ns;
+    unsigned fraction = 0;
+    uint64_t blocks = 0;
+    const int rate_enabled = getenv("AUDIO_RATE") != NULL;
+#endif
     while (s_mix_thread_running) {
+#if !AUDIO_BACKEND_SDL2 && !AUDIO_BACKEND_WASAPI
+        clock_gettime(CLOCK_MONOTONIC, &clock);
+        const uint64_t now_ns = (uint64_t)clock.tv_sec * ns_per_second + clock.tv_nsec;
+        if (now_ns < next_ns) {
+            const uint64_t wait_ns = next_ns - now_ns;
+            const struct timespec wait = { (time_t)(wait_ns / ns_per_second),
+                                           (long)(wait_ns % ns_per_second) };
+            nanosleep(&wait, NULL);
+            continue;
+        }
+        /* Do not burst guest notifications after a debugger pause or stall. */
+        if (now_ns - next_ns > max_backlog_ns) {
+            next_ns = now_ns;
+            fraction = 0;
+        }
+        next_ns += block_ns;
+        fraction += block_fraction;
+        if (fraction >= CELL_AUDIO_SAMPLE_RATE) {
+            next_ns++;
+            fraction -= CELL_AUDIO_SAMPLE_RATE;
+        }
+#endif
         audio_mix_one_block();
         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
         audio_notify_event_queues();
 
+#if AUDIO_BACKEND_SDL2
         u32 queued = audio_backend_queued_samples();
         if (queued > CELL_AUDIO_BLOCK_SAMPLES * 4) {
             usleep(5000);
         } else {
             usleep(2000);
         }
+#else
+        if (rate_enabled && now_ns - rate_start_ns >= 5 * ns_per_second) {
+            fprintf(stderr, "[audio-rate] %.1f blocks/s (real time 187.5), no host backend\n",
+                    blocks * (double)ns_per_second / (now_ns - rate_start_ns));
+            rate_start_ns = now_ns;
+            blocks = 0;
+        }
+        blocks++;
+#endif
     }
 
     printf("[cellAudio] Mixing thread stopped\n");
