@@ -139,12 +139,33 @@ static void yield_entry(void* arg) { Case* c = arg; ps3_host_fiber_yield(&c->f);
 static void returned_entry(void* arg) { (void)arg; }
 static void nested_entry(void* arg) { Case* c = arg; ps3_host_fiber_resume(&c->r, &c->f); }
 static void* foreign(void* arg) { Case* c = arg; ps3_host_runner r = {0}; ps3_host_fiber_resume(&r, &c->f); return NULL; }
+/* One row per stop: the expected machine line, field by field. The ea differs
+ * per row, so two stops that share op and reason cannot satisfy each other's
+ * test. A fiber made by the case carries ea 0x1000 + its id. */
+typedef struct StopRow { const char* mode, *op, *reason; uint32_t ea; } StopRow;
+static const StopRow stops[] = {
+    {"stop_uncreated", "resume", "state", 0},
+    {"stop_size", "create", "size", 0x1001},
+    {"stop_entry_returned", "start", "entry-returned", 0x1002},
+    {"stop_resume_exited", "resume", "state", 0x1003},
+    {"stop_resume_running", "resume", "state", 0x1004},
+    {"stop_yield_foreign_stack", "yield", "foreign-stack", 0x1005},
+    {"stop_destroy_suspended", "destroy", "state", 0x1006},
+    {"stop_foreign_thread", "resume", "foreign-thread", 0x1007},
+};
+static const StopRow* stop_row(const char* mode)
+{
+    for (size_t i = 0; i < sizeof stops / sizeof *stops; ++i)
+        if (!strcmp(stops[i].mode, mode)) return &stops[i];
+    fprintf(stderr, "FAIL no stop row for %s\n", mode); exit(1);
+}
 static void stop_mode(const char* mode)
 {
-    Case c = {0};
+    const StopRow* row = stop_row(mode);
+    Case c = {0}; c.id = row->ea ? row->ea - 0x1000 : 0;
     if (!strcmp(mode, "stop_uncreated")) ps3_host_fiber_resume(&c.r, &c.f);
     if (!strcmp(mode, "stop_size")) {
-        (void)ps3_host_fiber_create(&c.f, 1, exit_entry, &c, 0x1000); CHECK(0);
+        (void)ps3_host_fiber_create(&c.f, 1, exit_entry, &c, row->ea); CHECK(0);
     }
     create(&c, !strcmp(mode, "stop_entry_returned") ? returned_entry :
                !strcmp(mode, "stop_resume_running") ? nested_entry :
@@ -163,6 +184,50 @@ static void stop_mode(const char* mode)
         for (;;) pause();
     }
     CHECK(0);
+}
+#if !TARGET_OS_IPHONE
+/* Runs this executable in `mode` with stderr captured; returns the wait status. */
+static int run_child(const char* executable, const char* mode, char* output, size_t capacity)
+{
+    int pipes[2]; CHECK(!pipe(pipes));
+    posix_spawn_file_actions_t actions; CHECK(!posix_spawn_file_actions_init(&actions));
+    CHECK(!posix_spawn_file_actions_adddup2(&actions, pipes[1], STDERR_FILENO));
+    CHECK(!posix_spawn_file_actions_addclose(&actions, pipes[0]));
+    CHECK(!posix_spawn_file_actions_addclose(&actions, pipes[1]));
+    extern char** environ;
+    char* args[] = {(char*)executable, (char*)mode, NULL};
+    pid_t pid; CHECK(!posix_spawn(&pid, executable, &actions, NULL, args, environ));
+    CHECK(!posix_spawn_file_actions_destroy(&actions));
+    close(pipes[1]); size_t used = 0; ssize_t n;
+    char buffer[1024];
+    while ((n = read(pipes[0], buffer, sizeof buffer)) > 0) {
+        size_t keep = (size_t)n < capacity - 1 - used ? (size_t)n : capacity - 1 - used;
+        memcpy(output + used, buffer, keep); used += keep;
+    }
+    close(pipes[0]); output[used] = 0;
+    int status; CHECK(waitpid(pid, &status, 0) == pid);
+    return status;
+}
+#endif
+/* A stop test passes only by the stop: exit 70 and exactly one machine line
+ * that equals the row. A wrong cause with the right reason cannot pass. */
+static void expect_stop(const char* executable, const char* mode)
+{
+#if !TARGET_OS_IPHONE
+    const StopRow* row = stop_row(mode);
+    char output[65536];
+    const int status = run_child(executable, mode, output, sizeof output);
+    fprintf(stderr, "%s child status=%d\n%s", mode, status, output);
+    char want[256];
+    snprintf(want, sizeof want, "PS3STOP v=1 kind=fiber-host-context backend=aarch64 "
+             "op=%s reason=%s ea=0x%X error=0 error_domain=none\n", row->op, row->reason, row->ea);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 70);
+    const char* line = strstr(output, "PS3STOP v=1 ");
+    CHECK(line && !strstr(line + 1, "PS3STOP v=1 "));
+    CHECK(!strcmp(line, want));
+#else
+    (void)executable; (void)mode; CHECK(0 && "a device cannot spawn: run the stop_ modes directly");
+#endif
 }
 static void handoff_entry(void* arg)
 {
@@ -250,23 +315,8 @@ static void guard_entry(void* arg)
 static void guard(const char* executable)
 {
 #if !TARGET_OS_IPHONE
-    int pipes[2]; CHECK(!pipe(pipes));
-    posix_spawn_file_actions_t actions; CHECK(!posix_spawn_file_actions_init(&actions));
-    CHECK(!posix_spawn_file_actions_adddup2(&actions, pipes[1], STDERR_FILENO));
-    CHECK(!posix_spawn_file_actions_addclose(&actions, pipes[0]));
-    CHECK(!posix_spawn_file_actions_addclose(&actions, pipes[1]));
-    extern char** environ;
-    char* args[] = {(char*)executable, "guard_child", NULL};
-    pid_t pid; CHECK(!posix_spawn(&pid, executable, &actions, NULL, args, environ));
-    CHECK(!posix_spawn_file_actions_destroy(&actions));
-    close(pipes[1]); char output[65536]; size_t used = 0; ssize_t n;
-    char buffer[1024];
-    while ((n = read(pipes[0], buffer, sizeof buffer)) > 0) {
-        size_t keep = (size_t)n < sizeof output - 1 - used ? (size_t)n : sizeof output - 1 - used;
-        memcpy(output + used, buffer, keep); used += keep;
-    }
-    close(pipes[0]); output[used] = 0;
-    int status; CHECK(waitpid(pid, &status, 0) == pid);
+    char output[65536];
+    const int status = run_child(executable, "guard_child", output, sizeof output);
     fprintf(stderr, "guard child status=%d\n%s", status, output);
     CHECK((WIFSIGNALED(status) && (WTERMSIG(status) == SIGSEGV || WTERMSIG(status) == SIGBUS)) ||
           ((strstr(output, "AddressSanitizer: stack-overflow") ||
@@ -281,7 +331,8 @@ static void guard(const char* executable)
 int main(int argc, char** argv)
 {
     CHECK(argc == 2); const char* mode = argv[1];
-    if (!strncmp(mode, "stop_", 5)) stop_mode(mode);
+    if (!strncmp(mode, "expect_", 7)) expect_stop(argv[0], mode + 7);
+    else if (!strncmp(mode, "stop_", 5)) stop_mode(mode);
     else if (!strcmp(mode, "abi")) abi();
     else if (!strcmp(mode, "lifecycle")) lifecycle();
     else if (!strcmp(mode, "many")) many();

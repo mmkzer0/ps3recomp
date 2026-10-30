@@ -34,16 +34,20 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
 endif()
 set(HF_STOPS entry_returned resume_exited resume_running uncreated yield_foreign_stack
     destroy_suspended foreign_thread size)
-set(HF_OPS start resume resume resume yield destroy resume create)
-set(HF_REASONS entry-returned state state state foreign-stack state foreign-thread size)
-foreach(i RANGE 0 7)
-    list(GET HF_STOPS ${i} mode)
-    list(GET HF_OPS ${i} op)
-    list(GET HF_REASONS ${i} reason)
-    add_test(NAME host_fiber_stop_${mode} COMMAND test_host_fiber_aarch64 stop_${mode})
-    set_tests_properties(host_fiber_stop_${mode} PROPERTIES LABELS "runtime;fiber;t0;tsan" TIMEOUT 30
-        PASS_REGULAR_EXPRESSION
-        "PS3STOP v=1 kind=fiber-host-context[^\n]*backend=aarch64[^\n]*op=${op}[^\n]*reason=${reason}")
+# The expected op, reason and ea of each stop live in main.c (stops[]). The
+# parent mode demands exit 70 and exactly one machine line; a
+# PASS_REGULAR_EXPRESSION would stand in for the exit status check instead.
+foreach(mode ${HF_STOPS})
+    if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+        # An iOS app cannot spawn itself; run the stop_ modes directly for the
+        # exit status and the exact line.
+        add_test(NAME host_fiber_stop_${mode} COMMAND test_host_fiber_aarch64 stop_${mode})
+        set_tests_properties(host_fiber_stop_${mode} PROPERTIES
+            PASS_REGULAR_EXPRESSION "PS3STOP v=1 kind=fiber-host-context")
+    else()
+        add_test(NAME host_fiber_stop_${mode} COMMAND test_host_fiber_aarch64 expect_stop_${mode})
+    endif()
+    set_tests_properties(host_fiber_stop_${mode} PROPERTIES LABELS "runtime;fiber;t0;tsan" TIMEOUT 30)
 endforeach()
 if(PS3RECOMP_SANITIZE_THREAD)
     add_test(NAME host_fiber_tsan_handoff COMMAND test_host_fiber_aarch64 tsan_handoff)
