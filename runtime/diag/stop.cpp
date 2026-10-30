@@ -245,6 +245,24 @@ void ps3_stop(ps3_stop_kind kind, const char* what, const char* remedy,
     exit_stopped();
 }
 
+void ps3_stop_fiber_host_context(const char* backend, const char* op, const char* reason,
+                                 uint32_t ea, uint32_t error, const char* error_domain)
+{
+    char address[16], code[16];
+    std::snprintf(address, sizeof address, "0x%X", ea);
+    std::snprintf(code, sizeof code, "%u", error);
+    const ps3_stop_field fields[] = {
+        {"backend", backend}, {"op", op}, {"reason", reason},
+        {"ea", address}, {"error", code}, {"error_domain", error_domain},
+    };
+    ps3_stop(PS3_STOP_FIBER_HOST_CONTEXT,
+             "the host could not create or switch a guest fiber execution context",
+             "For a failed host call, select or port PS3RECOMP_FIBER_BACKEND "
+             "(docs/PLATFORM_ABSTRACTION.md). A broken invariant is a runtime defect: "
+             "report it with this line.",
+             fields, sizeof fields / sizeof fields[0], nullptr);
+}
+
 void ps3_stop_guest_range(const char* func, const char* arg,
                           uint64_t ea, uint64_t size, uint64_t limit)
 {

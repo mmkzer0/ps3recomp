@@ -131,7 +131,8 @@ extern "C" {
     /* S1: a FIFO method no class consumes and no allow-list entry cites. */                               \
     X(RSX_UNKNOWN_METHOD,       "rsx-unknown-method")                                                      \
     /* A sceNpTrophy situation whose console result the firmware does not determine (an abort that wakes a registration). */ \
-    X(NP_TROPHY_UNMODELLED,     "np-trophy-unmodelled")
+    X(NP_TROPHY_UNMODELLED,     "np-trophy-unmodelled")                        \
+    X(FIBER_HOST_CONTEXT,       "fiber-host-context")
 
 /* A fixed underlying type in C++ makes a kind outside the list (a caller's bug,
  * which the stop still reports as "invalid-kind") a well-defined value rather
@@ -187,6 +188,11 @@ PS3_NORETURN void ps3_stop(ps3_stop_kind kind, const char* what,
                            const char* remedy,
                            const ps3_stop_field* fields, size_t nfields,
                            const ps3_stop_site* site);
+
+/* Host context failure; no guest site. Fields are defined by this helper. */
+PS3_NORETURN void ps3_stop_fiber_host_context(const char* backend, const char* op,
+                                             const char* reason, uint32_t ea,
+                                             uint32_t error, const char* error_domain);
 
 /* Generic helper to raise PS3_STOP_HLE_GUEST_RANGE.
  * Fields: func, arg, ea, size, limit. */

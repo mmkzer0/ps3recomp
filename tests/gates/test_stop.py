@@ -25,7 +25,7 @@ KINDS = ["identity-mismatch", "lifter-abi", "config-invalid", "unresolved-nid",
          "spu-label-window",
          "hle-commit-failed", "spurs-task-halt", "spurs-dispatch-miss", "rsx-capture",
          "host-path-limit",
-         "rsx-unknown-method", "np-trophy-unmodelled"]
+         "rsx-unknown-method", "np-trophy-unmodelled", "fiber-host-context"]
 
 
 def probe(*args):
