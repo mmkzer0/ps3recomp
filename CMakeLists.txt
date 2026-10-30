@@ -538,6 +538,11 @@ if(PS3RECOMP_BUILD_TESTS)
     # them and the shape of ucontext_t on _XOPEN_SOURCE, so whether that path
     # works on arm64 is a question to answer rather than assume.
     add_subdirectory(tests/fiber_switch)
+    if(APPLE AND NOT PS3RECOMP_IOS AND
+       (CMAKE_OSX_ARCHITECTURES STREQUAL "arm64" OR
+        (NOT CMAKE_OSX_ARCHITECTURES AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")))
+        add_subdirectory(tests/host_fiber)
+    endif()
     add_subdirectory(tests/sync2_semaphore)
     # Differential harness (HLE vs lifted firmware); inert unless PS3RECOMP_DIFF_FW_DIR names a
     # lifted module kept outside the repository (tests/diff_harness/CMakeLists.txt).
