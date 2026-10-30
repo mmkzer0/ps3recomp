@@ -28,6 +28,7 @@
 #include <stdlib.h>
 #include <pthread.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include "../sceNpTrophy.c"
 #include <assert.h>
