@@ -56,8 +56,15 @@ if(PS3RECOMP_SANITIZE_THREAD)
     set_tests_properties(host_fiber_tsan_handoff PROPERTIES LABELS "runtime;fiber;t0;tsan" TIMEOUT 30)
 endif()
 if(PS3RECOMP_SANITIZE)
+    # A test-level ENVIRONMENT would replace the preset's ASAN_OPTIONS; append so
+    # its other flags survive. The property needs 3.22: older CMake would drop
+    # it silently, and with it the fake-stack coverage this suite depends on.
+    if(CMAKE_VERSION VERSION_LESS 3.22)
+        message(FATAL_ERROR "tests/host_fiber under ASan needs CMake 3.22 (ENVIRONMENT_MODIFICATION)")
+    endif()
     get_property(HF_TESTS DIRECTORY PROPERTY TESTS)
-    set_tests_properties(${HF_TESTS} PROPERTIES ENVIRONMENT "ASAN_OPTIONS=detect_stack_use_after_return=1")
+    set_tests_properties(${HF_TESTS} PROPERTIES
+        ENVIRONMENT_MODIFICATION "ASAN_OPTIONS=path_list_append:detect_stack_use_after_return=1")
 endif()
 add_executable(bench_host_fiber EXCLUDE_FROM_ALL bench.c ${HF_BACKEND})
 target_include_directories(bench_host_fiber PRIVATE "${HF_ROOT}/runtime/platform" "${HF_ROOT}/include")
