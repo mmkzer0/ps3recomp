@@ -19,10 +19,15 @@ target_include_directories(test_host_fiber_aarch64 PRIVATE
 target_link_libraries(test_host_fiber_aarch64 PRIVATE Threads::Threads)
 target_compile_options(test_host_fiber_aarch64 PRIVATE
     "$<$<COMPILE_LANGUAGE:C,CXX>:-Wall;-Wextra;-Wpedantic;-fno-omit-frame-pointer>")
-foreach(mode abi frame lifecycle many deep enomem)
+foreach(mode abi frame lifecycle many deep enomem annot)
     add_test(NAME host_fiber_${mode} COMMAND test_host_fiber_aarch64 ${mode})
     set_tests_properties(host_fiber_${mode} PROPERTIES LABELS "runtime;fiber;t0;tsan" TIMEOUT 120)
 endforeach()
+# A no-return call from a fiber must not make ASan print that it ignores the
+# unwind: that text means the fiber stack bounds it was given are wrong.
+add_test(NAME host_fiber_noret COMMAND test_host_fiber_aarch64 noret)
+set_tests_properties(host_fiber_noret PROPERTIES LABELS "runtime;fiber;t0;tsan" TIMEOUT 30
+    FAIL_REGULAR_EXPRESSION "ignoring requested __asan_handle_no_return")
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
     add_test(NAME host_fiber_guard COMMAND test_host_fiber_aarch64 guard)
     set_tests_properties(host_fiber_guard PROPERTIES LABELS "runtime;fiber;stress" TIMEOUT 30)
@@ -42,6 +47,8 @@ foreach(i RANGE 0 7)
 endforeach()
 if(PS3RECOMP_SANITIZE_THREAD)
     add_test(NAME host_fiber_tsan_handoff COMMAND test_host_fiber_aarch64 tsan_handoff)
+    add_test(NAME host_fiber_tsan_destroy COMMAND test_host_fiber_aarch64 tsan_destroy)
+    set_tests_properties(host_fiber_tsan_destroy PROPERTIES LABELS "runtime;fiber;t0;tsan" TIMEOUT 60)
     set_tests_properties(host_fiber_tsan_handoff PROPERTIES LABELS "runtime;fiber;t0;tsan" TIMEOUT 30)
 endif()
 if(PS3RECOMP_SANITIZE)
