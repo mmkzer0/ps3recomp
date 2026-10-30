@@ -679,6 +679,68 @@ static void test_texture_cache(void)
     engine_down();
 }
 
+static struct { u32 format, location, offset, size; int calls; } bc_request;
+
+static void stub_require_bc(void* user, u32 format, u32 location, u32 offset, u32 size)
+{
+    (void)user;
+    CHECK(stub.n_texture_create == 0, "BC capability checked before texture creation");
+    bc_request.format = format;
+    bc_request.location = location;
+    bc_request.offset = offset;
+    bc_request.size = size;
+    bc_request.calls++;
+}
+
+static void test_bc_capability(void)
+{
+    printf("-- BC capability request attribution\n");
+    for (u32 format = 0x86; format <= 0x88; format++) {
+        const u32 location = format == 0x87 ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN;
+        rsx_draw_backend backend = g_stub_backend;
+        backend.require_bc = stub_require_bc;
+        memset(&bc_request, 0, sizeof bc_request);
+        engine_up_with(&backend);
+        bind_texture_unit(location, TEX_OFFSET);
+        m(M_TEX_UNIT + 0x04, (location == RSX_LOCATION_MAIN ? 2u : 1u) |
+            (2u << 4) | ((format | 0x20u) << 8) | (1u << 16));
+        draw_triangle();
+        CHECK(bc_request.calls == 1 && bc_request.format == (format | 0x20u) &&
+              bc_request.location == location && bc_request.offset == TEX_OFFSET &&
+              bc_request.size == (format == 0x86 ? 8u : 16u),
+              "BC request carries guest format, address and byte span (0x%02X)", format);
+        CHECK(stub.n_texture_create == 1 && stub.n_texture_upload == 1,
+              "supported BC request reaches the existing upload path");
+        draw_triangle();
+        CHECK(bc_request.calls == 1, "cached BC texture does not repeat capability check");
+        /* Ordered uploads rewrite the resource; capability was checked when
+         * that resource was created, not every time guest bytes change. */
+        backend.texture_upload_ordered = 1;
+        rsx_draw_engine_present();
+        vm_base[(location == RSX_LOCATION_LOCAL ? GUEST_LOCAL_EA : 0) + TEX_OFFSET] ^= 1;
+        draw_triangle();
+        CHECK(stub.n_texture_create == 1 && stub.n_texture_upload == 2 &&
+              bc_request.calls == 1, "in-place BC refresh does not repeat the capability check");
+        engine_down();
+    }
+    engine_up();
+    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET);
+    m(M_TEX_UNIT + 0x04, 2u | (2u << 4) | (0xA6u << 8) | (1u << 16));
+    draw_triangle();
+    CHECK(stub.n_texture_create == 1 && stub.n_texture_upload == 1,
+          "absent capability callback preserves BC upload support");
+    engine_down();
+    rsx_draw_backend backend = g_stub_backend;
+    backend.require_bc = stub_require_bc;
+    memset(&bc_request, 0, sizeof bc_request);
+    engine_up_with(&backend);
+    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET);
+    draw_triangle();
+    CHECK(stub.n_texture_create == 1 && stub.n_texture_upload == 1 &&
+          bc_request.calls == 0, "ordinary RGBA upload does not require BC capability");
+    engine_down();
+}
+
 /* The cache remembers where each key was last found. Two keys that share a
  * remembered slot (these two offsets do, with every other field equal) must
  * still each find their own entry, however their binds interleave. */
@@ -2460,6 +2522,7 @@ int main(void)
     test_surface_aliasing();
     test_mrt_set();
     test_texture_cache();
+    test_bc_capability();
     test_texture_lookup_memo();
     test_texture_sparse_rehash();
     test_pipeline_key();

@@ -1579,6 +1579,8 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     const u8* src = eng_guest_ptr(NULL, location, offset, span);
     s_read_kind = RSX_CAP_READ_OTHER;
     if (!src) return 0;
+    if (!into && lv[0].tl.compressed && g.be->require_bc)
+        g.be->require_bc(g.be->user, fmt, location, offset, span);
 
     const u32 handle = into ? into
         : g.be->texture_create(g.be->user, eng_texfmt(lv[0].tl.fmt), w, h, nlv, faces, remap, fmt);
