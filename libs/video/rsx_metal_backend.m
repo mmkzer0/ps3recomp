@@ -4822,6 +4822,9 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
         /* Apple's Metal feature table: border colour starts at Apple7. */
         s_ios_supports_border = [s_dev supportsFamily:MTLGPUFamilyApple7];
         fprintf(stderr, "[RSX metal] supportsBCTextureCompression=%d\n", (int)s_ios_supports_bc);
+        fprintf(stderr, "[RSX metal] supports32BitFloatFiltering=%d supportsFamilyApple9=%d\n",
+                (int)[s_dev supports32BitFloatFiltering],
+                (int)[s_dev supportsFamily:MTLGPUFamilyApple9]);
         unsigned apple_family = 0;
         for (NSUInteger family = MTLGPUFamilyApple10; family >= MTLGPUFamilyApple1; family--) {
             if ([s_dev supportsFamily:(MTLGPUFamily)family]) {
