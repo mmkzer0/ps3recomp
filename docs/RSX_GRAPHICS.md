@@ -308,19 +308,48 @@ Maps RSX vertex attribute types (from `NV4097_SET_VERTEX_DATA_ARRAY_FORMAT`) to 
 **File:** `libs/video/rsx_draw_engine.{c,h}`
 
 The engine is the default path on macOS (`PS3RECOMP_RSX_ENGINE=dispatch`, the backend's default;
-`vtable` is the way back). Three contracts matter to anything that compares or captures its output.
+`vtable` is the way back). Four contracts matter to anything that compares or captures its output.
 
-**Frame identity.** The engine's present counter and the GCM's flip counter are separate: the flip sink is
-reached about three times per guest flip (the queued word `0xE944`, then the head `0xE924`, and `0xE920`).
+**Flip words (#101).** The driver's two word families are not one command. `GCM_DRIVER_QUEUE` (`0xE940`
+head 0, `0xE944` head 1) records which display buffer the head shows next, and presents nothing;
+`GCM_FLIP_HEAD` (`0xE920` head 0, `0xE924` head 1) is the present. Evidence: libgcm_sys `_cellGcmSetFlipCommand`
+emits `0xE944 = bufferId`, the NV406E semaphore handshake and `CALL 0`, then `0xE924 = 0x8000010F`, a constant, so
+the head word never names the buffer; RPCS3 (pin `d00d8023`, `gcm_enums.h`, `rsx_methods.cpp` `queue_flip` /
+`driver_flip`, `sys_rsx.cpp` `0x103` / `0x102`) records the head's last queued buffer at the queue word and flips at
+the head word. `rsx_dsp_resolve_flip()` (`rsx_dispatch.c`) is the one statement of what a head word scans out, and
+both draw consumers (`rsx_draw_engine.c`, `rsx_live_draw.c`) use it:
+
+| head word | scans out |
+|---|---|
+| bit 31 set, low nibble 0..7 | that display buffer |
+| bit 31 set, low nibble 8..15 (`0x8000010F`) | the buffer last queued **on that head**; none queued is the stop `rsx-driver-method` (`nothing-queued`) |
+| bit 31 clear | the registered display buffer whose offset the word equals; none is `offset-unmatched` |
+
+A buffer that is above 7 or has no registered display buffer is `unregistered-buffer`, and one the engine has
+rendered nothing at is `no-surface`: the engine never presents "whatever is bound" for a flip (an unregistered
+"buffer 7" used to resolve to the bound render target, and the queue word used to present a scanout the hardware
+does not show). RPCS3 only logs the nothing-queued case and flips buffer 0 for an unmatched offset; the runtime has
+no scanout for either, so it stops. `GCM_DRIVER_QUEUE` indices 2..7 (`0xE948..0xE95C`) have no known meaning
+(`gcm_enums.h`; RPCS3 asserts `head < 2`) and stop with `queue-index-unmodelled`. See `docs/STOPS.md`.
+
+The host's own present (`rsx_draw_engine_present()`, the backend's per-frame call, #94) is pacing, not a flip. With
+display buffers registered it shows the guest's last flipped buffer (buffer 0 before one) and, where nothing has
+been rendered at that buffer's address, presents nothing. With none registered, which is a host that never described
+its scanout (the harness, the boot smoke title), the current render target is the only image it has and is what it
+shows. `rsx_draw_engine_present_buffer()` names a buffer: with display buffers registered, an unregistered or
+unrendered one stops (`method=0x0000`).
+
+**Frame identity.** The engine's present counter and the GCM's flip counter are separate: a guest flip is one present, at
+its head word, and the host's own presents add more.
 `rsx_draw_engine_frame_identity()` returns `{flip_id, present_seq, display_buffer}` for the last present:
 
 | field | meaning |
 |---|---|
-| `flip_id` | 0-based ordinal of the flip whose scanout this present shows — the same ordinal `cellGcmSys` counts for `GCM_DRV_EVENT_FLIP_HEAD`, because the engine sees the same `0xE924` word with bit 31 in the same FIFO order. The scanout changes at the queue word `0xE944`, so the present that word issues, the head's own present and every later present until the next `0xE944` all name the same flip; between a queue word and its head the flip is the pending one, the ordinal the head is about to count. `RSX_FRAME_NO_FLIP` before the first queue word. Consumers that take the last dump labelled *k* as flip *k*'s image get exactly that image. |
+| `flip_id` | 0-based ordinal of the last flip a head retired — the same ordinal `cellGcmSys` counts for `GCM_DRV_EVENT_FLIP_HEAD`, because the engine sees the same `0xE924` word with bit 31 in the same FIFO order. The scanout changes at the head word and nowhere else, so every present from a head to the next head, host presents included, names the same flip, and a present between a queue word and its head still names the previous flip. `RSX_FRAME_NO_FLIP` before the first head. Head 0 (`0xE920`) flips present but are not counted, as `cellGcmSys` does not count them. Consumers that take the last dump labelled *k* as flip *k*'s image get exactly that image. |
 | `present_seq` | 0-based engine present ordinal: the number the dump files are named by. |
-| `display_buffer` | the display buffer the guest queued for this flip (0..7); the head's word is a command, not a buffer id. |
+| `display_buffer` | the display buffer this present showed (0..7): what the head word resolved to; for a host present, the guest's last flip. |
 
-No counter is derived from the other, and no flip id is invented for a present that precedes the first queue word. `guest_frame` follows `flip_id` (the queued flip's ordinal between its queue word and head). The RSX capture is unchanged: it records one frame per head, read back at the head's present, so its `present_seq` is the head's.
+No counter is derived from the other, and no flip id is invented for a present that precedes the first head. `guest_frame` is the ordinal of the last head-1 queue word (`0xE944`) when the head presented; an explicit-nibble head still reports it. The RSX capture records one frame per head, read back at the head's present from the display buffer's surface (not from the bound target), so its `present_seq` is the head's. Before #101 a head was the second of about three presents (`present_seq` 3k+1 for flip k); it is the first of the flip's FIFO presents now.
 
 **Draw accounting.** Every `BEGIN_END` group is one *submitted* draw. It is either *executed* or dropped
 for exactly one reason from `rsx_drop_reason` (no packets, fetch failed, mixed sources, needs expansion,
@@ -343,9 +372,9 @@ line still stops at 32; the count does not.
 **Dumps.** Both dump families name their files by the frame identity, so no image overwrites another:
 
 - `RSX_ENGINE_PASS_DUMP`: `present_s<present_seq>_f<flip_id>.ppm`, and per pass
-  `s<present_seq>_f<flip_id>_pass<NNN>_t<K>.ppm` / `_z.pgm`. `fnone` before the first queued flip. The
+  `s<present_seq>_f<flip_id>_pass<NNN>_t<K>.ppm` / `_z.pgm`. `fnone` before the first flip head. The
   index (`passes.txt`) repeats `s=` and `flip=` on every line. A *pass* is named by the last head counted
-  when it opened: the flip its frame will show is only known at the queue word, after the draws.
+  when it opened: the flip its frame will show is only known at its head word, after the draws.
 - `PS3RECOMP_METAL_FRAME_DUMP`: `<base>_s<present_seq>_f<flip_id>.ppm`. Presents are selected by
   `PS3RECOMP_METAL_FRAME_DUMP_RANGE=<first>-<last>` or `PS3RECOMP_METAL_FRAME_DUMP_LIST=<a,b,c>` (at most 32
   entries; a longer list is a `config-invalid` stop naming the count), else

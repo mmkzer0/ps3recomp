@@ -24,6 +24,7 @@
 #include <time.h>
 #include <stdatomic.h>
 #include "ps3emu/log_first.h"
+#include "ps3emu/stop.h"
 #include "rsx_capture.h"
 
 /* Guest memory and the RSX offset resolvers, declared the way every backend
@@ -48,8 +49,8 @@ void rsx_draw_engine_set_capture_sink(const rsx_capture_sink* sink) { s_capture 
 static u32 s_read_kind;
 /* The draw in progress ran the built-in pipeline (handed to the capture). */
 static u32 s_cap_fixed;
-/* The flip head the capture last wrote a frame for: a head is presented about
- * three times (0xE944, 0xE924, 0xE920), and only the first is its frame. */
+/* The flip head the capture last wrote a frame for: one frame per flip head
+ * (0xE924 with bit 31), recorded at that head's present. */
 static u32 s_cap_last_flip = 0xFFFFFFFFu;
 static void eng_cap_draw(u32 executed, u32 reason);
 
@@ -383,19 +384,10 @@ u32 rsx_draw_engine_pipeline_failures(rsx_pipeline_failure* out, u32 max)
  * ordinal. */
 static u32 s_flip_heads;
 /* The queued flips (0xE944 words) seen so far, and the one the latest flip
- * head presents: the identity's guest_frame. */
+ * head presents: the identity's guest_frame. Which buffer a queue word named
+ * is the dispatcher's (rsx_dispatch.queued_buffer), per head. */
 static u32 s_queue_flips;
 static u32 s_head_guest_frame = RSX_FRAME_NO_FLIP;
-/* The buffer the guest queued (0xE944) for the flip in progress: the head's own
- * word is a command (0x8000010F), not a buffer id, so the queued one is what
- * names the scanout. */
-static u32 s_queued_buffer;
-static int s_queued_valid;
-/* A flip is queued (0xE944) and its head (0xE924) has not retired it yet. The
- * scanout changes at the queue word, so every present in that window already
- * shows the queued flip: it is the one the next head will count, not the last
- * head's. */
-static int s_flip_queued_unretired;
 
 /* The last present's identity crosses threads -- the FIFO walker publishes it,
  * the metal backend and a gate or a test read it -- so it is a seqlock over
@@ -408,21 +400,15 @@ static _Atomic u32 s_identity_buffer;
 static _Atomic u32 s_identity_guest;
 static _Atomic int s_identity_valid;
 
+/* The flip a present shows: the last one a flip head retired. The queue word
+ * (0xE944) does not change the scanout -- firmware: _cellGcmSetFlipCommand
+ * emits it ahead of the label handshake and the head word, and RPCS3 (pin
+ * d00d8023, sys_rsx.cpp 0x103) only records the buffer and raises an event --
+ * so a present between a queue word and its head still shows the previous
+ * flip, and names it. */
 static u32 eng_last_flip_id(void)
 {
     return s_flip_heads ? s_flip_heads - 1u : RSX_FRAME_NO_FLIP;
-}
-
-/* The flip whose scanout a present issued now shows. */
-static u32 eng_present_flip_id(void)
-{
-    return s_flip_queued_unretired ? s_flip_heads : eng_last_flip_id();
-}
-
-static u32 eng_present_guest_frame(void)
-{
-    if (s_flip_queued_unretired) return s_queue_flips - 1u;   /* a queue word was counted */
-    return s_head_guest_frame;
 }
 
 static void eng_identity_publish(u32 flip_id, u32 guest_frame, u32 present_seq, u32 buffer)
@@ -2976,7 +2962,7 @@ static struct {
 
 /* A flip ordinal for a file name or the index: five digits, or "none" before
  * the first head, so the name is unique per present even when two presents
- * share a flip (which they do about three times per flip). */
+ * share a flip (a host present between two heads does). */
 static void pd_flip_name(char* out, size_t n, u32 flip_id)
 {
     if (flip_id == RSX_FRAME_NO_FLIP)
@@ -3744,20 +3730,33 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
     }
 }
 
-/* Resolve a flip's buffer id to a REGISTERED surface rather than whatever is
- * currently bound: the live target at that instant is often an offscreen
- * shadow or post-process surface, and copying it presents black despite the
- * scene's draws having executed (rsx_live_draw.c:7557-7570). */
-static u32 eng_present_surface(u32 buffer_id)
+/* The engine surface a registered display buffer shows, or ENG_INVALID when the engine has rendered
+ * nothing at its address. A flip names a display buffer, never "whatever is bound": the live target at
+ * that instant is often an offscreen shadow or post-process surface, and copying it presents black
+ * despite the scene's draws having executed (rsx_live_draw.c:7557-7570), or, for a head word read as a
+ * buffer id, a buffer the guest never selected (#101). */
+static u32 eng_display_surface(u32 buffer_id)
 {
-    if (buffer_id < 8 && g.display_buffers[buffer_id].valid) {
-        const eng_display_buffer* d = &g.display_buffers[buffer_id];
-        for (u32 i = 0; i < g.n_surfaces; i++)
-            if (g.surfaces[i].handle && g.surfaces[i].location == d->location &&
-                g.surfaces[i].offset == d->offset)
-                return i;
-    }
-    return eng_current_surface();
+    if (buffer_id >= 8 || !g.display_buffers[buffer_id].valid) return ENG_INVALID;
+    const eng_display_buffer* d = &g.display_buffers[buffer_id];
+    for (u32 i = 0; i < g.n_surfaces; i++)
+        if (g.surfaces[i].handle && g.surfaces[i].location == d->location &&
+            g.surfaces[i].offset == d->offset)
+            return i;
+    return ENG_INVALID;
+}
+
+static int eng_any_display_buffer(void)
+{
+    for (u32 i = 0; i < 8; i++)
+        if (g.display_buffers[i].valid) return 1;
+    return 0;
+}
+
+/* The surface a host-driven present shows (eng_host_present). */
+static u32 eng_host_present_surface(u32 buffer_id)
+{
+    return eng_any_display_buffer() ? eng_display_surface(buffer_id) : eng_current_surface();
 }
 
 /* One draw group's outcome, for the capture (rsx_capture.h). */
@@ -3817,7 +3816,8 @@ static void eng_cap_frame(const rsx_frame_identity* fid, u32 slot)
 
 /* Which entry point asked for the present in progress, and what it resolved
  * to, for the backend's PS3_FTRACE drawable span (#94 Gate B: which surface
- * each of the three presents per flip shows; #101: which FIFO method asked).
+ * a present shows; #101: which FIFO method asked). A flip is one present, at
+ * its head word; the queue words never present.
  * Thread-local because the backend reads it synchronously inside eng_present
  * on the same thread, and presents arrive from more than one thread. */
 enum { ENG_PRESENT_PATH_QUEUE = 1, ENG_PRESENT_PATH_HEAD = 2, ENG_PRESENT_PATH_HOST = 3 };
@@ -3832,22 +3832,21 @@ u32 rsx_draw_engine_present_diag(void)
     return t_present_diag;
 }
 
-static void eng_present(u32 buffer_id)
+/* Present `target`, the engine surface of display buffer `buffer_id`. */
+static void eng_present(u32 buffer_id, u32 target)
 {
     if (!g.ready) return;
-    const u32 target = eng_present_surface(buffer_id);
     if (target == ENG_INVALID) return;
     g.surfaces[target].last_use = g.frames;
-    /* The present's identity: it names the flip whose scanout it shows, which
-     * is the pending one between 0xE944 and its head (eng_present_flip_id).
-     * The present ordinal is the engine's, and the buffer is the one the guest
-     * queued for this flip -- the head's own word is a command, not a buffer
-     * id. */
+    /* The present's identity: it names the last flip a head retired
+     * (eng_last_flip_id), because the scanout changes at a head word and
+     * nowhere else. The present ordinal is the engine's, and the buffer is the
+     * display buffer this present shows. */
     rsx_frame_identity fid;
-    fid.flip_id = eng_present_flip_id();
-    fid.guest_frame = eng_present_guest_frame();
+    fid.flip_id = eng_last_flip_id();
+    fid.guest_frame = s_head_guest_frame;
     fid.present_seq = g.frames;
-    fid.display_buffer = s_queued_valid ? s_queued_buffer : (buffer_id & 7u);
+    fid.display_buffer = buffer_id & 7u;
     eng_identity_publish(fid.flip_id, fid.guest_frame, fid.present_seq, fid.display_buffer);
     char flip[16];
     eng_fmt_flip(flip, sizeof flip, fid.flip_id);
@@ -3869,11 +3868,10 @@ static void eng_present(u32 buffer_id)
     g.be->present(g.be->user, g.surfaces[target].handle);
     t_present_diag = 0;
     t_present_path = 0;
-    /* The capture's frame is the flip head's: a present before the head names
-     * the flip too, but that flip is not retired, and the capture records one
-     * frame per head at the head's present. */
-    if (s_capture && !s_flip_queued_unretired && fid.flip_id != RSX_FRAME_NO_FLIP &&
-        fid.flip_id != s_cap_last_flip) {
+    /* The capture's frame is the flip head's: one frame per retired flip,
+     * recorded at the first present that names it. A host present after the
+     * head names the same flip and is not a frame. */
+    if (s_capture && fid.flip_id != RSX_FRAME_NO_FLIP && fid.flip_id != s_cap_last_flip) {
         s_cap_last_flip = fid.flip_id;
         eng_cap_frame(&fid, target);
     }
@@ -3882,12 +3880,49 @@ static void eng_present(u32 buffer_id)
     g.guest_draws = 0;
 }
 
-static void sink_flip(void* user, const rsx_dispatch* r, u32 arg)
+/* GCM_DRIVER_QUEUE (0xE940 / 0xE944): the dispatcher recorded the head's buffer (rsx_dispatch.queued_*);
+ * nothing scans out until the head's flip word (rsx_dsp_resolve_flip). Only head 1's words are counted
+ * for the identity: they are the ones libgcm_sys writes and the ones cellGcmSys counts as
+ * GCM_DRV_EVENT_QUEUE_FLIP, so guest_frame stays that event's ordinal. */
+static void sink_queue(void* user, const rsx_dispatch* r, u32 head, u32 buffer)
+{
+    (void)user; (void)r; (void)buffer;
+    if (head == 1u) s_queue_flips++;
+}
+
+static void sink_flip(void* user, const rsx_dispatch* r, u32 head, u32 arg)
+{
+    (void)user;
+    rsx_dsp_display_ref refs[RSX_DSP_DISPLAY_BUFFERS];
+    for (u32 i = 0; i < RSX_DSP_DISPLAY_BUFFERS; i++) {
+        refs[i].valid = g.display_buffers[i].valid;
+        refs[i].offset = g.display_buffers[i].offset;
+    }
+    u32 buffer;
+    const rsx_dsp_flip_status st = rsx_dsp_resolve_flip(r, head, arg, refs, &buffer);
+    const u32 method = 0xE920u + 4u * head;
+    if (st != RSX_DSP_FLIP_OK)
+        ps3_stop_rsx_driver_method(method, head, arg, buffer, rsx_dsp_flip_status_name(st));
+    /* A registered buffer the engine has rendered nothing into has no scanout to show, and falling back
+     * to the bound target is the #101 defect (an unregistered "buffer 7" resolved to whatever was bound). */
+    const u32 target = eng_display_surface(buffer);
+    if (target == ENG_INVALID)
+        ps3_stop_rsx_driver_method(method, head, arg, buffer, "no-surface");
+    /* The flip-head ordinal is cellGcmSys's GCM_DRV_EVENT_FLIP_HEAD: a 0xE924 word with bit 31. */
+    if (head == 1u && (arg & 0x80000000u)) {
+        s_flip_heads++;
+        s_head_guest_frame = s_queue_flips ? s_queue_flips - 1u : RSX_FRAME_NO_FLIP;
+    }
+    g.last_flip_buffer = buffer;
+    t_present_path = ENG_PRESENT_PATH_HEAD;
+    eng_present(buffer, target);
+}
+
+static void sink_driver_unmodelled(void* user, const rsx_dispatch* r, u32 method, u32 arg)
 {
     (void)user; (void)r;
-    g.last_flip_buffer = arg & 7u;
-    t_present_path = ENG_PRESENT_PATH_HEAD;
-    eng_present(g.last_flip_buffer);
+    ps3_stop_rsx_driver_method(method, (method - 0xE940u) >> 2, arg, RSX_DSP_NO_BUFFER,
+                               "queue-index-unmodelled");
 }
 
 /* ---- public API ---------------------------------------------------------- */
@@ -3945,16 +3980,15 @@ int rsx_draw_engine_init(u32 width, u32 height)
     sink.draw_index_array = sink_draw_index;
     sink.inline_array     = sink_inline_array;
     sink.immediate_vertex = sink_immediate_vertex;
+    sink.queue            = sink_queue;
     sink.flip             = sink_flip;
+    sink.driver_unmodelled = sink_driver_unmodelled;
     rsx_dispatch_init(&g.rsx, &sink);
     g.ready = 1;
     /* A fresh engine starts at zero: the counters describe this run, not the
      * process. */
     rsx_draw_engine_reset_draw_stats();
     s_flip_heads = 0;
-    s_queued_buffer = 0;
-    s_flip_queued_unretired = 0;
-    s_queued_valid = 0;
     s_queue_flips = 0;
     s_head_guest_frame = RSX_FRAME_NO_FLIP;
     s_cap_last_flip = RSX_FRAME_NO_FLIP;
@@ -4007,21 +4041,6 @@ void rsx_draw_engine_method(u32 method, u32 arg)
      * (0xE9xx, 0xEBxx) encode the subchannel bits as part of the address;
      * preserve them with the wider mask. */
     u32 m = (method >= 0xE000u) ? (method & 0xFFFCu) : (method & 0x1FFCu);
-    /* A GCM flip head -- 0xE924 with bit 31 -- is the word cellGcmSys turns
-     * into GCM_DRV_EVENT_FLIP_HEAD (cellGcmSys.c:2611). Counting it here, in
-     * the same FIFO order, gives the identity the same ordinal the C3 event
-     * file reports for the flip. */
-    if (m == 0xE944u) {                 /* the queue flip names the scanout */
-        s_queued_buffer = arg & 7u;
-        s_queued_valid = 1;
-        s_flip_queued_unretired = 1;
-        s_queue_flips++;
-    }
-    if (m == 0xE924u && (arg & 0x80000000u)) {
-        s_flip_heads++;
-        s_flip_queued_unretired = 0;
-        s_head_guest_frame = s_queue_flips ? s_queue_flips - 1u : RSX_FRAME_NO_FLIP;
-    }
     if (m >= 0xE900u && m < 0xEA00u)    /* driver methods only: keep the draw path cheap */
         t_present_method = m == 0xE920u ? ENG_PRESENT_M_E920 : m == 0xE924u ? ENG_PRESENT_M_E924 :
                            m == 0xE940u ? ENG_PRESENT_M_E940 : m == 0xE944u ? ENG_PRESENT_M_E944 :
@@ -4049,23 +4068,49 @@ void rsx_draw_engine_flush(void)
         g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
 }
 
+/* A host-driven present: no FIFO word asked for it, so there is no flip to resolve and a scanout the
+ * engine has nothing for is not a stop. `explicit_buffer` is a runner that named the buffer
+ * (rsx_draw_engine_present_buffer); a pacing call (rsx_draw_engine_present, #94) takes the guest's last
+ * flip. Which surface (eng_host_present_surface):
+ *   - display buffers registered: that buffer's surface. No surface there yet means nothing the engine
+ *     rendered is on that scanout; the pacing call skips (the hardware would keep showing the previous
+ *     memory), and an explicit request stops, because the runner asked for exactly that buffer.
+ *   - none registered: a host that never described its scanout (the harness, the boot smoke title, a
+ *     single-surface test) has only the current target to show, as before. */
+static void eng_host_present(u32 buffer_id, int explicit_buffer)
+{
+    if (!g.ready) return;
+    t_present_path = explicit_buffer ? ENG_PRESENT_PATH_QUEUE : ENG_PRESENT_PATH_HOST;
+    const u32 target = eng_host_present_surface(buffer_id);
+    if (target == ENG_INVALID && eng_any_display_buffer()) {
+        t_present_path = 0;
+        if (explicit_buffer)
+            ps3_stop_rsx_driver_method(0, 0, buffer_id, buffer_id,
+                                       g.display_buffers[buffer_id].valid ? "no-surface"
+                                                                           : "unregistered-buffer");
+        static u32 skipped;
+        if (PS3_LOG_FIRST(skipped, 4))
+            fprintf(stderr, "[rsx engine] host present of display buffer %u skipped: "
+                            "no surface has been rendered at its address\n", buffer_id);
+        return;
+    }
+    eng_present(buffer_id, target);
+}
+
 void rsx_draw_engine_present(void)
 {
-    /* A host that drives the flip itself gets whichever buffer the guest's
-     * own last flip named, and display buffer 0 before there has been one:
-     * a runner that both consumes 0xE944 and calls here would otherwise
-     * re-present a double-buffered title's OTHER scanout. Presenting twice is
-     * harmless either way -- the engine never clears the surface, so a second
-     * present just blits the same image again. */
-    t_present_path = ENG_PRESENT_PATH_HOST;
-    eng_present(g.last_flip_buffer);
+    /* A host that drives the flip itself gets whichever buffer the guest's own last flip named, and
+     * display buffer 0 before there has been one: a runner that both consumes the FIFO's flip words and
+     * calls here would otherwise re-present a double-buffered title's OTHER scanout. Presenting twice is
+     * harmless either way -- the engine never clears the surface, so a second present just blits the
+     * same image again. */
+    eng_host_present(g.last_flip_buffer, 0);
 }
 
 void rsx_draw_engine_present_buffer(u32 buffer_id)
 {
     g.last_flip_buffer = buffer_id & 7u;
-    t_present_path = ENG_PRESENT_PATH_QUEUE;
-    eng_present(g.last_flip_buffer);
+    eng_host_present(g.last_flip_buffer, 1);
 }
 
 void rsx_draw_engine_note_flip(u32 buffer_id)

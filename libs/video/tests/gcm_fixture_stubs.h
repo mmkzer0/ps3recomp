@@ -67,4 +67,7 @@ PS3_NORETURN void ps3_stop_rsx_unknown_method(const char* cls, uint32_t method, 
     exit(70);
 }
 
+/* The draw engine ends an unresolvable flip in this (test_gcm_class_routing.c compiles the engine in). */
+#include "rsx_driver_stop_stub.h"
+
 #endif

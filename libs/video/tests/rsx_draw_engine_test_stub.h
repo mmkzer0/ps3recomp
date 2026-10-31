@@ -13,6 +13,9 @@
 #define PS3RECOMP_RSX_DRAW_ENGINE_TEST_STUB_H
 
 #include "rsx_draw_engine.h"
+#ifndef STUB_REAL_STOP    /* a fixture that expects the rsx-driver-method stop links stop.cpp */
+#include "rsx_driver_stop_stub.h"
+#endif
 #include "rsx_primitives.h"
 
 #include <stdio.h>
@@ -249,6 +252,10 @@ static void stub_engine_up(int with_surface)
         sm(M_SURFACE_CLIP_H, 64u << 16);
         sm(M_SURFACE_CLIP_V, 64u << 16);
         sm(M_COLOR_A_OFFSET, 0x40000u);
+        /* Every display buffer id shows that one surface: a flip names a registered display buffer
+         * (#101), and these tests care that it presents, not which of eight identical images. */
+        for (u32 i = 0; i < 8; i++)
+            rsx_draw_engine_set_display_buffer(i, RSX_LOCATION_LOCAL, 0x40000u, 64u * 4u, 64u, 64u);
     }
     sm(M_VTXFMT, 2u | (4u << 4) | (16u << 8));       /* float32 x4, stride 16 */
     sm(M_VTXBUF_OFFSET, 0x80000000u | STUB_VTX_OFFSET);

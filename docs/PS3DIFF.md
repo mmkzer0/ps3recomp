@@ -398,8 +398,9 @@ stop `rsx-capture` (`reason=readback-format`), never a skipped frame.
 A frame is a flip head, identified by `{flip_id, guest_frame, display_buffer}` (plus
 `present_seq`). `flip_id` is the zero-based ordinal of `0xE924` heads with bit 31, as C3 counts
 `GcmFlipHead`; `guest_frame` is the zero-based ordinal of the `0xE944` queue words
-(`GcmQueueFlip`) the head presents, `null` when it had none. A head is presented about three
-times; the frame is the first. `draws` obeys `submitted = executed + sum(dropped)` and
+(`GcmQueueFlip`) the head presents, `null` when it had none. A head is one present of the
+display buffer it resolved to (docs/RSX_GRAPHICS.md, "Flip words"); the host's own presents
+add more of the same flip, and the frame is the head's. `draws` obeys `submitted = executed + sum(dropped)` and
 `valid` is true exactly when `invalid` is empty: any dropped draw (`dropped-draws`), a draw on
 the built-in pipeline (`fixed-function`), a walker recovery that dropped commands
 (`fifo-resync`), a head with no queued flip (`no-queued-flip`) or a missing readback makes the

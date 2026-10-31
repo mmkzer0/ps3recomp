@@ -399,6 +399,9 @@ int main(int argc, char** argv)
           "NV4097 bound on slot 7, per-word path: 0xE944 is the driver's flip queue word");
     /* NV0039 bound on slot 7: the driver's words are not the M2MF's. */
     gcm_bind_object(7, RSX_OBJ_NV0039);
+    /* The engine resolves the flip head to a registered display buffer with a rendered surface (#101):
+     * buffer 2 is the 64x64 surface the default state's clear created at offset 0. */
+    check(cellGcmSetDisplayBuffer(2, 0, 64u * 4u, 64, 64) == CELL_OK, "display buffer 2 registered");
     const GcmMethodStats n0 = stats();
     const unsigned long long h0 = gcm_driver_event_count(GCM_DRV_EVENT_FLIP_HEAD);
     pkt(7, 0x0944, 2u);                              /* 0xE944: flip queue */

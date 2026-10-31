@@ -15,7 +15,7 @@
  *        -> rsx_live_draw_method(method, arg)               [this module]
  *           -> rsx_dispatch_method(...)  (register file + BEGIN/END/DRAW/FLIP)
  *              -> sink callbacks -> D3D12 PSO + draw into the flip surface
- *   flip method (0xE944) -> rsx_live_draw_present(buffer_id) -> Present()
+ *   flip head word (0xE920/0xE924) -> rsx_dsp_resolve_flip -> rsx_live_draw_present(buffer_id) -> Present()
  *
  * The whole path is gated by the RSX_DRAW env flag (see docs/FLAGS.md): when
  * unset/"0" the live draw engine is inert and the runtime keeps its existing
@@ -110,7 +110,7 @@ void rsx_live_draw_set_movie_mode(int on);
 void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h);
 
 /* Count of REAL game frames the live-draw engine has presented (the game's own
- * 0xE944 flips carrying accumulated draws) -- distinct from the null backend's
+ * flip-head words carrying accumulated draws) -- distinct from the null backend's
  * per-vblank "flips" present count, which keeps ticking even when t1 has stalled
  * and stopped producing. Cheap; safe to poll from the title path. */
 u32  rsx_live_draw_get_frames(void);

@@ -44,6 +44,7 @@ void spu_coh_notify_write(uint32_t a) { (void)a; }
 u32 cellGcmResolveLocated(int local, u32 offset) { (void)local; return offset; }
 u32 cellGcmResolveIO(u32 offset) { return offset < ppu_vm_size ? offset : 0; }
 void cellGcm_replay_display_buffers_to_engine(void) {}
+#include "rsx_driver_stop_stub.h"
 
 static void die(const char* f, const char* a, const char* r)
 {

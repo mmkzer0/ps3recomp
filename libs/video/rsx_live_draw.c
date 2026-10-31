@@ -23,6 +23,7 @@
 #include "ps3emu/yz_runtime_config.h"
 #include "ps3emu/yz_frontier_trace.h"
 #include "ps3emu/log_first.h"
+#include "ps3emu/stop.h"
 
 #if !defined(_WIN32)
 
@@ -8052,10 +8053,24 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
     }
 }
 
-static void sink_flip(void* user, const rsx_dispatch* r, u32 arg)
+/* GCM_DRIVER_QUEUE does nothing here: the dispatcher records the head's buffer
+ * (rsx_dispatch.queued_*), and only the head's flip word scans out. The queue
+ * word used to present through this file's single flip callback, and the
+ * flip-head word then read its own argument (0x8000010F in libgcm_sys's
+ * stream) as buffer 7 (#101). */
+static void sink_flip(void* user, const rsx_dispatch* r, u32 head, u32 arg)
 {
-    (void)user; (void)r;
-    const u32 buffer_id = arg & 7u;
+    (void)user;
+    rsx_dsp_display_ref refs[RSX_DSP_DISPLAY_BUFFERS];
+    for (u32 i = 0; i < RSX_DSP_DISPLAY_BUFFERS; i++) {
+        refs[i].valid = g.display_buffers[i].valid;
+        refs[i].offset = g.display_buffers[i].offset;
+    }
+    u32 buffer_id;
+    const rsx_dsp_flip_status st = rsx_dsp_resolve_flip(r, head, arg, refs, &buffer_id);
+    if (st != RSX_DSP_FLIP_OK)
+        ps3_stop_rsx_driver_method(0xE920u + 4u * head, head, arg, buffer_id,
+                                   rsx_dsp_flip_status_name(st));
     g_ld_flip_requested++;
     g_ld_last_requested_buffer = buffer_id;
     if (g_ld_movie_mode) {
@@ -8067,6 +8082,13 @@ static void sink_flip(void* user, const rsx_dispatch* r, u32 arg)
     rsx_live_draw_present(buffer_id);
     g_ld_flip_consumed++;
     g_ld_last_consumed_buffer = buffer_id;
+}
+
+static void sink_driver_unmodelled(void* user, const rsx_dispatch* r, u32 method, u32 arg)
+{
+    (void)user; (void)r;
+    ps3_stop_rsx_driver_method(method, (method - 0xE940u) >> 2, arg, RSX_DSP_NO_BUFFER,
+                               "queue-index-unmodelled");
 }
 
 /* ---------------------------------------------------------------------------
@@ -8503,6 +8525,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
     sink.inline_array = sink_inline_array;
     sink.draw_index_array = sink_draw_index;
     sink.flip = sink_flip;
+    sink.driver_unmodelled = sink_driver_unmodelled;
     rsx_dispatch_init(&g.rsx, &sink);
 
     g.ready = 1;

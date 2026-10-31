@@ -156,28 +156,29 @@ static void test_frame_identity(void)
     CHECK(fid.flip_id == RSX_FRAME_NO_FLIP,
           "no flip queued yet: flip_id is none (%u)", fid.flip_id);
 
-    /* The queue word presents the scanout it queues, so it names that flip
-     * although the head has not retired it. */
+    /* The queue word records the buffer and does not scan out (firmware: libgcm_sys writes it ahead of
+     * the flip-ready handshake; RPCS3 sys_rsx.cpp 0x103 only records it), so it presents nothing and
+     * the identity stays the host present's. */
     sm(M_GCM_QUEUE_FLIP, 2u);
-    CHECK(rsx_draw_engine_frame_identity(&fid) == 1, "the queue present has an identity");
-    CHECK(fid.present_seq == 1, "the queue present is seq 1 (%u)", fid.present_seq);
-    CHECK(fid.flip_id == 0, "the queue present names flip 0 (%u)", fid.flip_id);
-    CHECK(fid.display_buffer == 2, "the queued buffer is recorded (%u)", fid.display_buffer);
+    CHECK(stub.n_present == 1, "the queue word presents nothing (%d)", stub.n_present);
+    CHECK(rsx_draw_engine_frame_identity(&fid) == 1 && fid.present_seq == 0 &&
+          fid.flip_id == RSX_FRAME_NO_FLIP,
+          "so the identity is still the host present's (seq %u, flip %u)", fid.present_seq, fid.flip_id);
 
-    /* The head is the present that retires the flip: the same flip. */
+    /* The head word is the present that retires the flip, and it shows the buffer queued. */
     sm(M_GCM_FLIP_HEAD, 0x8000010Fu);
     CHECK(rsx_draw_engine_frame_identity(&fid) == 1, "the head present has an identity");
-    CHECK(fid.present_seq == 2, "the head present is seq 2 (%u)", fid.present_seq);
+    CHECK(fid.present_seq == 1, "the head present is seq 1 (%u)", fid.present_seq);
     CHECK(fid.flip_id == 0, "the head present carries flip 0 (%u)", fid.flip_id);
-    CHECK(fid.display_buffer == 2, "the head keeps the queued buffer (%u)", fid.display_buffer);
+    CHECK(fid.display_buffer == 2, "the head shows the queued buffer (%u)", fid.display_buffer);
 
     /* A second flip: the counters advance independently. */
     stub_flip(3u);
     CHECK(rsx_draw_engine_frame_identity(&fid) == 1 &&
-          fid.present_seq == 4 && fid.flip_id == 1 && fid.display_buffer == 3,
+          fid.present_seq == 2 && fid.flip_id == 1 && fid.display_buffer == 3,
           "second flip: seq %u flip %u buffer %u", fid.present_seq, fid.flip_id,
           fid.display_buffer);
-    CHECK(stub.n_present == 5, "five presents for two flips and a host present (%d)",
+    CHECK(stub.n_present == 3, "three presents for two flips and a host present (%d)",
           stub.n_present);
     check_sum("frame identity");
     stub_engine_down();
@@ -198,10 +199,9 @@ static void cap_frame(const rsx_cap_frame* f)
     g_n_cap++;
 }
 
-/* The present that follows 0xE944 already shows the queued scanout, so the
- * identity it publishes must name that flip, not the previous one (#78). The
- * flip head's own present, and any present while the flip is held, show the
- * same image and must name the same flip. */
+/* A flip is one present, at its head word, and it names that flip. The queue word presents nothing, and
+ * a host present while the flip is held shows the same image and names the same flip (#78, corrected by
+ * #101: the scanout changes at the head, not at the queue word). */
 static void test_present_names_shown_flip(void)
 {
     printf("-- a present names the flip whose scanout it shows\n");
@@ -214,39 +214,38 @@ static void test_present_names_shown_flip(void)
     g_n_cap = 0;
     rsx_draw_engine_set_capture_sink(&sink);
 
-    rsx_frame_identity q, h, held;
+    rsx_frame_identity h, held;
     u32 seq = 0;
     for (u32 k = 0; k < 3; k++) {
+        const int before = stub.n_present;
         sm(M_GCM_QUEUE_FLIP, bufs[k]);
-        CHECK(rsx_draw_engine_frame_identity(&q) == 1, "flip %u: the queue present has an identity", k);
+        CHECK(stub.n_present == before, "flip %u: the queue word presents nothing", k);
         sm(M_GCM_FLIP_HEAD, 0x8000010Fu);
+        CHECK(stub.n_present == before + 1, "flip %u: the head is one present (%d)", k,
+              stub.n_present - before);
         CHECK(rsx_draw_engine_frame_identity(&h) == 1, "flip %u: the head present has an identity", k);
         rsx_draw_engine_present();
         CHECK(rsx_draw_engine_frame_identity(&held) == 1, "flip %u: a held present has an identity", k);
 
-        CHECK(q.flip_id == k && h.flip_id == k && held.flip_id == k,
-              "flip %u: queue, head and held presents all name it (%u/%u/%u)",
-              k, q.flip_id, h.flip_id, held.flip_id);
-        CHECK(q.guest_frame == k && h.guest_frame == k && held.guest_frame == k,
-              "flip %u: and the same guest frame (%u/%u/%u)",
-              k, q.guest_frame, h.guest_frame, held.guest_frame);
-        CHECK(q.display_buffer == bufs[k] && h.display_buffer == bufs[k] &&
-              held.display_buffer == bufs[k],
-              "flip %u: and the same buffer %u (%u/%u/%u)", k, bufs[k],
-              q.display_buffer, h.display_buffer, held.display_buffer);
-        /* Three presents per flip: the queue word, the head, a held one. */
-        CHECK(q.present_seq == seq && h.present_seq == seq + 1 && held.present_seq == seq + 2,
-              "flip %u: presents %u, %u, %u keep their own ordinals (%u/%u/%u)", k,
-              seq, seq + 1, seq + 2, q.present_seq, h.present_seq, held.present_seq);
-        seq += 3;
+        CHECK(h.flip_id == k && held.flip_id == k,
+              "flip %u: the head and a held present both name it (%u/%u)", k, h.flip_id, held.flip_id);
+        CHECK(h.guest_frame == k && held.guest_frame == k,
+              "flip %u: and the same guest frame (%u/%u)", k, h.guest_frame, held.guest_frame);
+        CHECK(h.display_buffer == bufs[k] && held.display_buffer == bufs[k],
+              "flip %u: and the same buffer %u (%u/%u)", k, bufs[k], h.display_buffer, held.display_buffer);
+        /* Two presents per flip: the head, and the held one the host adds. */
+        CHECK(h.present_seq == seq && held.present_seq == seq + 1,
+              "flip %u: presents %u and %u keep their own ordinals (%u/%u)", k, seq, seq + 1,
+              h.present_seq, held.present_seq);
+        seq += 2;
     }
 
-    /* The capture's frame is the flip head's present: it records the same
-     * identity as before, once per flip, at the head's present_seq. */
+    /* The capture's frame is the flip head's present: one per flip, at the head's present_seq. The head
+     * used to be the second of three presents (seq 3k+1); it is the first of two now (seq 2k). */
     CHECK(g_n_cap == 3, "the capture saw one frame per flip (%d)", g_n_cap);
     for (int k = 0; k < 3 && k < g_n_cap; k++)
         CHECK(g_cap[k].flip == (u32)k && g_cap[k].guest == (u32)k &&
-              g_cap[k].buffer == bufs[k] && g_cap[k].seq == (u32)(3 * k + 1),
+              g_cap[k].buffer == bufs[k] && g_cap[k].seq == (u32)(2 * k),
               "capture frame %d: flip %u guest %u buffer %u present_seq %u", k,
               g_cap[k].flip, g_cap[k].guest, g_cap[k].buffer, g_cap[k].seq);
 
