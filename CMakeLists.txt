@@ -1174,6 +1174,35 @@ if(UNIX)
         set_tests_properties(${engine_test} PROPERTIES LABELS "gcm;t0" TIMEOUT 120)
     endforeach()
 
+    # What the driver's flip words mean (#101): synthetic FIFO streams through the real dispatcher and
+    # engine, one forked child per scenario so a stream that must end in the named stop can. Links the
+    # real runtime/diag/stop.cpp; the other engine fixtures stub the stop.
+    add_executable(test_rsx_flip_semantics
+        libs/video/tests/test_rsx_flip_semantics.c
+        libs/video/rsx_draw_engine.c
+        libs/video/rsx_dispatch.c
+        libs/video/rsx_vertex_compact.c
+        libs/video/rsx_texture_layout.c
+        libs/video/rsx_vp_decompiler.c
+        libs/video/rsx_fp_decompiler.c
+        runtime/diag/stop.cpp
+    )
+    target_include_directories(test_rsx_flip_semantics PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    )
+    target_compile_definitions(test_rsx_flip_semantics PRIVATE _GNU_SOURCE)
+    target_link_libraries(test_rsx_flip_semantics PRIVATE Threads::Threads)
+    set_target_properties(test_rsx_flip_semantics PROPERTIES LINKER_LANGUAGE CXX C_EXTENSIONS ON)
+    if(APPLE)
+        target_link_options(test_rsx_flip_semantics PRIVATE "-Wl,-dead_strip")
+    else()
+        target_link_libraries(test_rsx_flip_semantics PRIVATE m)
+    endif()
+    add_test(NAME test_rsx_flip_semantics COMMAND test_rsx_flip_semantics)
+    set_tests_properties(test_rsx_flip_semantics PROPERTIES LABELS "rsx;t0" TIMEOUT 120)
+
     # The RSX capture (ps3diff.rsx/1), producer side. Both fixtures leave a capture in a directory and
     # tools/test_rsx_capture.py checks it: the walker's (executed order, binds, labels, a wait that is
     # not an event) and the engine's (draws, the buffer as each draw consumed it, drops, frames).
