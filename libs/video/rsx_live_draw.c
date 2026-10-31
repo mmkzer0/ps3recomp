@@ -23,6 +23,7 @@
 #include "ps3emu/yz_runtime_config.h"
 #include "ps3emu/yz_frontier_trace.h"
 #include "ps3emu/log_first.h"
+#include "ps3emu/stop.h"
 
 #if !defined(_WIN32)
 
@@ -3625,6 +3626,21 @@ static u32 current_surface(void)
                                      : DXGI_FORMAT_R8G8B8A8_UNORM);
     if (slot != LD_INVALID_SURFACE) g.surfaces[slot].pitch = sf.color_pitch[0];
     return slot;
+}
+
+/* The surface a registered display buffer shows: one drawn at its address, or the one a scaled blit
+ * resolved into it (see note_resolve), else LD_INVALID_SURFACE. */
+static u32 ld_display_target(u32 buffer_id)
+{
+    if (buffer_id >= 8 || !g.display_buffers[buffer_id].valid)
+        return LD_INVALID_SURFACE;
+    const display_buffer_t* display = &g.display_buffers[buffer_id];
+    for (u32 i = 0; i < g.n_surfaces; i++)
+        if (g.surfaces[i].location == display->location && g.surfaces[i].offset == display->offset)
+            return i;
+    if (display->resolve_src > 0 && (u32)display->resolve_src <= g.n_surfaces)
+        return (u32)display->resolve_src - 1;
+    return LD_INVALID_SURFACE;
 }
 
 /* On RSX each zeta (depth) address is distinct memory. The offline renderer's
@@ -8052,10 +8068,33 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
     }
 }
 
-static void sink_flip(void* user, const rsx_dispatch* r, u32 arg)
+/* GCM_DRIVER_QUEUE does nothing here: the dispatcher records the head's buffer
+ * (rsx_dispatch.flip_queues), and only the head's flip word scans out. The queue
+ * word used to present through this file's single flip callback, and the
+ * flip-head word then read its own argument (0x8000010F in libgcm_sys's
+ * stream) as buffer 7 (#101). */
+static void sink_flip(void* user, const rsx_dispatch* r, u32 head, u32 arg)
 {
-    (void)user; (void)r;
-    const u32 buffer_id = arg & 7u;
+    (void)user;
+    rsx_dsp_display_ref refs[RSX_DSP_DISPLAY_BUFFERS];
+    for (u32 i = 0; i < RSX_DSP_DISPLAY_BUFFERS; i++) {
+        refs[i].valid = g.display_buffers[i].valid;
+        refs[i].offset = g.display_buffers[i].offset;
+    }
+    u32 buffer_id;
+    const rsx_dsp_flip_status st = rsx_dsp_resolve_flip(&r->flip_queues, head, arg, refs, &buffer_id);
+    if (st != RSX_DSP_FLIP_OK)
+        ps3_stop_rsx_driver_method(0xE920u + 4u * head, head, arg, buffer_id,
+                                   rsx_dsp_flip_status_name(st));
+    /* A FIFO flip shows its display buffer or stops, as the register-file engine does. The fallback to
+     * the bound target that rsx_live_draw_present keeps for a host caller was the #101 defect on this
+     * path, and its premise (a title that scans out through cellResc never matches a registered
+     * display buffer) does not hold here: the resolver above has already required a registered buffer,
+     * and a surface drawn at its address or a scaled blit into it (resolve_src) is its scanout. A
+     * registered buffer with neither is memory only the CPU, a DMA or the 2D path filled, which this
+     * engine cannot show: unmodelled, not invalid. Movie mode does not present, so it is exempt. */
+    if (!g_ld_movie_mode && ld_display_target(buffer_id) == LD_INVALID_SURFACE)
+        ps3_stop_rsx_driver_method(0xE920u + 4u * head, head, arg, buffer_id, "unmodelled-scanout");
     g_ld_flip_requested++;
     g_ld_last_requested_buffer = buffer_id;
     if (g_ld_movie_mode) {
@@ -8067,6 +8106,13 @@ static void sink_flip(void* user, const rsx_dispatch* r, u32 arg)
     rsx_live_draw_present(buffer_id);
     g_ld_flip_consumed++;
     g_ld_last_consumed_buffer = buffer_id;
+}
+
+static void sink_driver_unmodelled(void* user, const rsx_dispatch* r, u32 method, u32 arg)
+{
+    (void)user; (void)r;
+    ps3_stop_rsx_driver_method(method, (method - 0xE940u) >> 2, arg, RSX_DSP_NO_BUFFER,
+                               "queue-index-unmodelled");
 }
 
 /* ---------------------------------------------------------------------------
@@ -8503,6 +8549,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
     sink.inline_array = sink_inline_array;
     sink.draw_index_array = sink_draw_index;
     sink.flip = sink_flip;
+    sink.driver_unmodelled = sink_driver_unmodelled;
     rsx_dispatch_init(&g.rsx, &sink);
 
     g.ready = 1;
@@ -9267,21 +9314,7 @@ void rsx_live_draw_present(u32 buffer_id)
     /* A flip names a registered display buffer. The current color target may
      * be an offscreen shadow/postprocess surface at that instant; copying it
      * caused a010 to present black despite executing the scene's draws. */
-    u32 target = LD_INVALID_SURFACE;
-    if (buffer_id < 8 && g.display_buffers[buffer_id].valid) {
-        const display_buffer_t* display = &g.display_buffers[buffer_id];
-        for (u32 i = 0; i < g.n_surfaces; i++) {
-            if (g.surfaces[i].location == display->location &&
-                g.surfaces[i].offset == display->offset) {
-                target = i;
-                break;
-            }
-        }
-    }
-    if (target == LD_INVALID_SURFACE && buffer_id < 8 &&
-        g.display_buffers[buffer_id].valid && g.display_buffers[buffer_id].resolve_src > 0 &&
-        (u32)g.display_buffers[buffer_id].resolve_src <= g.n_surfaces)
-        target = (u32)g.display_buffers[buffer_id].resolve_src - 1;   /* see note_resolve */
+    u32 target = ld_display_target(buffer_id);
     if (target == LD_INVALID_SURFACE) {
         target = current_surface();
         static u32 fallback_logs = 0;

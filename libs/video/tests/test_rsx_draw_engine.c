@@ -15,6 +15,7 @@
 #include "rsx_draw_engine.h"
 #include "rsx_primitives.h"   /* RSX_PRIMITIVE_* */
 #include "rsx_test_programs.h"
+#include "rsx_driver_stop_stub.h"   /* the engine's flip stop; this fixture drives no flip word */
 
 #include <stdio.h>
 #include <stdlib.h>

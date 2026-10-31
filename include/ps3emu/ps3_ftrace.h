@@ -61,7 +61,7 @@ enum ps3_ft_kind {
     PS3_FT_DRAWABLE    = 16, /* Metal: the wait inside [CAMetalLayer nextDrawable], never filtered by PS3_FTRACE_MIN_US;
                               * who = 1 engine present / 2 legacy present,
                               * a bit 0 = nextDrawable returned nil, bit 1 = the surface shown is not the one
-                              * shown last (engine only),
+                              * shown last (engine only), bits 8-31 = rsx_draw_engine_present_diag() (engine only),
                               * b = records encoded or still open since the last display blit (legacy: this frame's) */
     PS3_FT_LABEL_WAIT  = 17, /* the guest-visible label-store wait in the GCM label writer, never filtered;
                               * who = PPU tid (0 = host callback or unknown), a = label offset,

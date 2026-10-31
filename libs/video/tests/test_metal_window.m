@@ -27,6 +27,7 @@ u8* vm_base; u32 ppu_vm_size;
 u32 cellGcmResolveLocated(int local, u32 offset) { (void)local; return offset; }
 u32 cellGcmResolveIO(u32 offset) { return offset < ppu_vm_size ? offset : 0; }
 void cellGcm_replay_display_buffers_to_engine(void) {}
+#include "rsx_driver_stop_stub.h"
 float cellAvconfExt_display_gamma(void) { return 1.0f; }
 u32 cellGcmResolveOffset(u32 offset) { return offset; }
 int cellGcmOffsetIsDisplay(u32 offset) { (void)offset; return 0; }

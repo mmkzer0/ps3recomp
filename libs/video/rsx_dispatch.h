@@ -78,10 +78,26 @@ extern "C" {
 #define RSX_LOCATION_LOCAL      0
 #define RSX_LOCATION_MAIN       1
 
+/* GCM_FLIP_HEAD 0xE920:0xE924 is head 0 or 1, and only the first two GCM_DRIVER_QUEUE indices (0xE940,
+ * 0xE944) prepare a head's display buffer (RPCS3 pin d00d8023, gcm_enums.h GCM_FLIP_HEAD /
+ * GCM_DRIVER_QUEUE). A display buffer id is 0..7 (CELL_GCM_MAX_DISPLAY_BUFFER_NUM). */
+#define RSX_DSP_FLIP_HEADS      2
+#define RSX_DSP_DISPLAY_BUFFERS 8
+
 /* Coverage classification for the report */
 #define RSX_DSP_CLASS_TODO      0   /* stored in the register file only     */
 #define RSX_DSP_CLASS_STATE     1   /* decoded by a getter the pipeline uses */
 #define RSX_DSP_CLASS_EXEC      2   /* triggers an execution callback        */
+
+/* The buffer each flip head's last GCM_DRIVER_QUEUE word named. A flip that takes "the last queued"
+ * buffer reads it; a flip does not consume it (RPCS3 sys_rsx.cpp 0x102 reads
+ * driverInfo.head[h].lastQueuedBufferId and leaves it, so a second flip with no new queue word shows the
+ * same buffer again). The dispatcher owns one; the FIFO walker keeps another for the guest-visible half of
+ * a flip, fed the same words and resolved by the same rsx_dsp_resolve_flip(). */
+typedef struct rsx_dsp_flip_queues {
+    u32 buffer[RSX_DSP_FLIP_HEADS];
+    u8  valid[RSX_DSP_FLIP_HEADS];
+} rsx_dsp_flip_queues;
 
 /* Cap on one INLINE_ARRAY stream. A stream is bounded by a single
  * BEGIN_END pair, and titles use inline arrays for small immediate-mode
@@ -111,7 +127,20 @@ typedef struct rsx_dispatch_sink {
      * see the note on M_INLINE_ARRAY in rsx_dispatch.c. Delivered at END. */
     void (*inline_array)(void* user, const rsx_dispatch* rsx,
                          const u8* data, u32 bytes);
-    void (*flip)(void* user, const rsx_dispatch* rsx, u32 arg);
+    /* GCM_DRIVER_QUEUE index 0 or 1 (0xE940 / 0xE944): the driver is told which display buffer `head`
+     * shows next. Nothing scans out here; the flip is the head's own word below. `buffer` is the
+     * argument unmasked (a value above 7 names no display buffer and resolves to an error). Firmware:
+     * libgcm_sys's _cellGcmSetFlipCommand writes 0xE944 = bufferId ahead of its label handshake. RPCS3
+     * (pin d00d8023, rsx_methods.cpp queue_flip, sys_rsx.cpp 0x103): records the head's last queued
+     * buffer and raises the queue event, and does not flip. */
+    void (*queue)(void* user, const rsx_dispatch* rsx, u32 head, u32 buffer);
+    /* GCM_FLIP_HEAD 0 or 1 (0xE920 / 0xE924): `head` scans out now. `arg` is the raw word; resolve it
+     * with rsx_dsp_resolve_flip(), which is the one statement of what it names. */
+    void (*flip)(void* user, const rsx_dispatch* rsx, u32 head, u32 arg);
+    /* A driver method the dispatcher does not model: GCM_DRIVER_QUEUE index 2..7 (0xE948..0xE95C).
+     * RPCS3 asserts on these (head < 2) and gcm_enums.h calls their meaning unknown, so a consumer ends
+     * the run with a named stop rather than drop the word. */
+    void (*driver_unmodelled)(void* user, const rsx_dispatch* rsx, u32 method, u32 arg);
     /* A completed ATTR0 DATA3F/DATA4F inside BEGIN emits one vertex.
      * Snapshot the current attributes now; later register writes replace them.
      * Array formats, offsets and frequencies do not describe this stream. */
@@ -130,6 +159,8 @@ struct rsx_dispatch {
 
     u32 inline_len;                   /* bytes accumulated this primitive   */
     u32 inline_dropped;               /* streams lost to the cap            */
+
+    rsx_dsp_flip_queues flip_queues;  /* per head, see rsx_dsp_flip_queues  */
 
     /* coverage accounting */
     u32 seen[RSX_DSP_NUM_REGS];       /* per-register write count           */
@@ -157,8 +188,100 @@ void rsx_dispatch_seed_registers(rsx_dispatch* rsx, const u32* regs, u32 count);
 void rsx_dispatch_seed_transform_program(rsx_dispatch* rsx, const u32* words, u32 count);
 void rsx_dispatch_seed_transform_constants(rsx_dispatch* rsx, const u32* words, u32 count);
 
-/* Dispatch one register write. */
+/* Dispatch one register write. GCM_DRIVER_QUEUE 0 and 1 (0xE940, 0xE944) and GCM_FLIP_HEAD 0 and 1
+ * (0xE920, 0xE924) reach the sink as queue() and flip() with the head named. */
 void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg);
+
+/* ---- the flip semantic ------------------------------------------------- */
+
+/* One registered display buffer, as the consumer holds it: the offset a flip's "offset form" matches. */
+typedef struct rsx_dsp_display_ref {
+    int valid;
+    u32 offset;
+} rsx_dsp_display_ref;
+
+typedef enum rsx_dsp_flip_status {
+    RSX_DSP_FLIP_OK = 0,
+    RSX_DSP_FLIP_BAD_HEAD,              /* a head other than 0 or 1                                  */
+    RSX_DSP_FLIP_NOTHING_QUEUED,        /* "last queued" asked for, and head has had no queue word   */
+    RSX_DSP_FLIP_BUFFER_UNREGISTERED,   /* the buffer it names is above 7 or has no display buffer   */
+    RSX_DSP_FLIP_OFFSET_UNMATCHED       /* offset form: no registered display buffer has that offset */
+} rsx_dsp_flip_status;
+
+#define RSX_DSP_NO_BUFFER 0xFFFFFFFFu
+
+/* What a GCM_FLIP_HEAD word scans out: the one resolver both draw consumers use.
+ *
+ *   bit 31 set    the low nibble names the buffer. 0..7 is that display buffer; 8..15 is the head's last
+ *                 queued buffer (libgcm_sys writes 0x8000010F). The head is the one the word arrived on:
+ *                 a queue on head 1 is not what a flip on head 0 takes.
+ *   bit 31 clear  the word is a display-buffer offset, and a registered display buffer must carry it.
+ *
+ * Firmware: libgcm_sys _cellGcmSetFlipCommand writes 0xE944 = bufferId and then 0xE924 = 0x8000010F, so
+ * the head word never carries the buffer itself. RPCS3 (pin d00d8023, sys_rsx.cpp 0x102): the same
+ * decode, but a flip of a buffer never queued is only logged, and an offset that matches nothing flips
+ * buffer 0; both are the oracle's tolerance, and here they are errors (an offset that is nothing the
+ * guest registered has no scanout the runtime can show).
+ *
+ * On RSX_DSP_FLIP_OK, *buffer is the display buffer id (0..7). On RSX_DSP_FLIP_BUFFER_UNREGISTERED it is
+ * the id the word named (may be above 7), for the stop that reports it; otherwise RSX_DSP_NO_BUFFER.
+ *
+ * Header-inline so every consumer (the draw engine, the live-draw engine, the FIFO walker) resolves with
+ * this one body without a link dependency on rsx_dispatch.c: several fixtures compile the walker with
+ * their own dispatch stubs. */
+static inline rsx_dsp_flip_status rsx_dsp_resolve_flip(const rsx_dsp_flip_queues* queues, u32 head, u32 arg,
+                                         const rsx_dsp_display_ref refs[RSX_DSP_DISPLAY_BUFFERS],
+                                         u32* buffer)
+{
+    *buffer = RSX_DSP_NO_BUFFER;
+    if (head >= RSX_DSP_FLIP_HEADS)
+        return RSX_DSP_FLIP_BAD_HEAD;
+
+    if (arg & 0x80000000u) {
+        /* The low nibble is the buffer; above 7 it is "the last queued" (0xF in libgcm_sys's word).
+         * RPCS3 sys_rsx.cpp 0x102 reads the head's own lastQueuedBufferId, and so does this. */
+        u32 id = arg & 0xFu;
+        if (id > 7u) {
+            if (!queues->valid[head])
+                return RSX_DSP_FLIP_NOTHING_QUEUED;
+            id = queues->buffer[head];
+        }
+        *buffer = id;
+        if (id >= RSX_DSP_DISPLAY_BUFFERS || !refs[id].valid)
+            return RSX_DSP_FLIP_BUFFER_UNREGISTERED;
+        return RSX_DSP_FLIP_OK;
+    }
+
+    for (u32 i = 0; i < RSX_DSP_DISPLAY_BUFFERS; i++) {
+        if (refs[i].valid && refs[i].offset == arg) {
+            *buffer = i;
+            return RSX_DSP_FLIP_OK;
+        }
+    }
+    return RSX_DSP_FLIP_OFFSET_UNMATCHED;
+}
+
+/* Record a GCM_DRIVER_QUEUE word (index 0 or 1) for its head; the argument is kept unmasked. */
+static inline void rsx_dsp_flip_queue_note(rsx_dsp_flip_queues* queues, u32 head, u32 buffer)
+{
+    if (head >= RSX_DSP_FLIP_HEADS) return;
+    queues->buffer[head] = buffer;
+    queues->valid[head] = 1;
+}
+
+/* Stable ids for the `reason` field of the stop: "bad-head", "nothing-queued", "unregistered-buffer",
+ * "offset-unmatched"; "ok" for RSX_DSP_FLIP_OK. */
+static inline const char* rsx_dsp_flip_status_name(rsx_dsp_flip_status status)
+{
+    switch (status) {
+    case RSX_DSP_FLIP_OK:                  return "ok";
+    case RSX_DSP_FLIP_BAD_HEAD:            return "bad-head";
+    case RSX_DSP_FLIP_NOTHING_QUEUED:      return "nothing-queued";
+    case RSX_DSP_FLIP_BUFFER_UNREGISTERED: return "unregistered-buffer";
+    case RSX_DSP_FLIP_OFFSET_UNMATCHED:    return "offset-unmatched";
+    }
+    return "invalid";
+}
 
 /* The coverage class (RSX_DSP_CLASS_*) this dispatcher gives a method number, whether or not any
  * instance exists. RSX_DSP_CLASS_TODO means no consumer of the register file is known to read it: the

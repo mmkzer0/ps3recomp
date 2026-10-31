@@ -456,4 +456,28 @@ void ps3_stop_rsx_unknown_method(const char* cls, uint32_t method, uint32_t subc
              f, sizeof f / sizeof f[0], nullptr);
 }
 
+void ps3_stop_rsx_driver_method(uint32_t method, uint32_t head, uint32_t arg, uint32_t buffer,
+                                const char* reason)
+{
+    char method_s[16], head_s[16], arg_s[16], buffer_s[16];
+    if (method == PS3_STOP_RSX_NONE) snprintf(method_s, sizeof method_s, "none");
+    else                             snprintf(method_s, sizeof method_s, "0x%04X", method);
+    if (head == PS3_STOP_RSX_NONE)   snprintf(head_s, sizeof head_s, "none");
+    else                             snprintf(head_s, sizeof head_s, "%u", head);
+    snprintf(arg_s, sizeof arg_s, "0x%08X", arg);
+    if (buffer == PS3_STOP_RSX_NONE) snprintf(buffer_s, sizeof buffer_s, "none");
+    else                             snprintf(buffer_s, sizeof buffer_s, "%u", buffer);
+    const ps3_stop_field f[] = {
+        {"method", method_s},
+        {"head", head_s},
+        {"arg", arg_s},
+        {"buffer", buffer_s},
+        {"reason", reason ? reason : "unknown"},
+    };
+    ps3_stop(PS3_STOP_RSX_DRIVER_METHOD,
+             "an RSX flip cannot be turned into a scanout: either the word names no display buffer the guest registered (nothing-queued, unregistered-buffer, offset-unmatched, a driver queue index with no known meaning), or it names a registered one the engine cannot show (unmodelled-scanout: the engine has no host surface for memory only the CPU, a DMA or the 2D path filled). Presenting anything else would show a surface the guest never selected",
+             "Read `reason`. For the first kind, fix the stream or the display-buffer registration (cellGcmSetDisplayBuffer); indices 2..7 of the driver queue (0xE948..0xE95C) have no known meaning (RPCS3 asserts on them), so a title that emits one needs evidence first. For unmodelled-scanout the gap is the engine's: see docs/RSX_GRAPHICS.md, \"Flip words\".",
+             f, sizeof f / sizeof f[0], nullptr);
+}
+
 } // extern "C"

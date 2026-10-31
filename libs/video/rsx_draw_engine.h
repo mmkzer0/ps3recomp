@@ -349,15 +349,32 @@ void rsx_draw_engine_set_display_buffer(u32 buffer_id, u32 location, u32 offset,
  * on its fence sees the GPU catch up. */
 void rsx_draw_engine_flush(void);
 
-/* Present whatever the frame has recorded, for a host that drives the flip
- * itself rather than through the FIFO's 0xE944. */
+/* Present for a host that drives the flip itself rather than through the
+ * FIFO's flip words. It is pacing, not a flip: with display buffers registered
+ * it shows the guest's last flipped buffer (buffer 0 before one) and, where the
+ * engine has rendered nothing at that buffer's address, presents nothing. With
+ * no display buffer registered at all (a host that never described its scanout:
+ * the harness, the boot smoke title) the only surface it can show is the
+ * current render target. Never a fallback for a FIFO flip (see sink_flip). */
 void rsx_draw_engine_present(void);
-/* A runner retiring a queued flip names the buffer explicitly. */
+/* A runner retiring a queued flip names the buffer explicitly. With display
+ * buffers registered, a buffer that is unregistered or has no rendered surface
+ * stops (rsx-driver-method, method 0); with none registered it is the current
+ * target, as for rsx_draw_engine_present(). */
 void rsx_draw_engine_present_buffer(u32 buffer_id);
-/* A flip the engine never sees as 0xE944 (a 0xFEAD driver word or the SetFlip
- * HLE, both handled by cellGcmSys): remember the buffer for the host's next
- * rsx_draw_engine_present() without presenting now. */
+/* A flip the engine never sees as a head word (a 0xFEAD driver word or the
+ * SetFlip HLE, both handled by cellGcmSys): remember the buffer for the host's
+ * next rsx_draw_engine_present() without presenting now. */
 void rsx_draw_engine_note_flip(u32 buffer_id);
+/* Diagnostics for the backend's PS3_FTRACE drawable span, valid only inside
+ * the backend's present callback on the presenting thread, else 0:
+ * bits 0-1 entry path (1 queue present, 2 FIFO head, 3 host present),
+ * bits 2-4 buffer id asked for, bits 5-12 engine surface slot,
+ * bits 13-15 FIFO method of a FIFO head present (1 0xE920, 2 0xE924,
+ * 3 0xE940, 4 0xE944, 5 another driver method; since #101 only codes 1 and 2
+ * present, the queue codes stay so the encoding is stable),
+ * bits 16-23 low bits of the surface handle. */
+u32 rsx_draw_engine_present_diag(void);
 
 /* ---- draw accounting (M3 gap 3e) ---------------------------------------- */
 
@@ -417,9 +434,10 @@ u32 rsx_draw_engine_pipeline_failures(rsx_pipeline_failure* out, u32 max);
 /* ---- frame identity (M3 gap 3d) ----------------------------------------- */
 
 /* The engine's present counter and the GCM's flip counter are not one
- * counter: the flip sink is reached about three times per guest flip (0xE944,
- * then 0xE924, and 0xE920), so the identity records both numbers instead of
- * deriving either from the other.
+ * counter: a flip is one present, at its head word (0xE924 / 0xE920; the queue
+ * word 0xE944 records the buffer and does not present), and the host's own
+ * presents (rsx_draw_engine_present) add more, so the identity records both
+ * numbers instead of deriving either from the other.
  *
  *   flip_id        0-based ordinal of the most recent GCM flip head -- the
  *                  same ordinal cellGcmSys counts for GCM_DRV_EVENT_FLIP_HEAD,
@@ -427,13 +445,17 @@ u32 rsx_draw_engine_pipeline_failures(rsx_pipeline_failure* out, u32 max);
  *                  the same FIFO order. RSX_FRAME_NO_FLIP before the first.
  *   present_seq    0-based ordinal of this engine present (the counter the
  *                  dump files are named by).
- *   guest_frame    0-based ordinal of the queued flip (each 0xE944 word, the
- *                  GcmQueueFlip event) that the most recent flip head
+ *   guest_frame    0-based ordinal of the queued flip (each head-1 0xE944 word,
+ *                  the GcmQueueFlip event) that the most recent flip head
  *                  presents; RSX_FRAME_NO_FLIP while a head has had none. The
  *                  engine counts the 0xE944 words it is fed, in walker order,
  *                  like flip_id, so a flip queued some other way (the 0xFEAD
- *                  marker, the SetFlip HLE) has no guest_frame.
- *   display_buffer the display buffer id this present used (0..7).
+ *                  marker, the SetFlip HLE) has no guest_frame. A head that
+ *                  names its buffer explicitly still reports the ordinal of the
+ *                  last queue word.
+ *   display_buffer the display buffer id this present showed (0..7): the one
+ *                  the head word resolved to (rsx_dsp_resolve_flip), for a
+ *                  host present the guest's last flip.
  *
  * The contract triple a capture carries is {flip_id, guest_frame,
  * display_buffer}; present_seq is an extra.

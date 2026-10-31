@@ -99,32 +99,34 @@ int main(void)
     stub_engine_up(1);
     stub_begin_end(RSX_PRIMITIVE_TRIANGLES);       /* guest_draws = 1 */
 
-    /* Present 0 arms the dump (the arming present writes no image).
-     * Presents 1, 2 and 3 follow with no draw pass between them: under the old
-     * naming all three wrote one file. */
-    stub_flip(1);                                  /* 0: queue flip 0, 1: head */
-    stub_flip(0);                                  /* 2: queue flip 1, 3: head */
+    /* Present 0 (flip 0's head) arms the dump (the arming present writes no
+     * image). A flip is one present, at its head word. Presents 1, 2 and 3
+     * follow with no draw pass between them: under the old naming all three
+     * wrote one file. */
+    stub_flip(1);                                  /* 0: flip 0's head */
+    stub_flip(0);                                  /* 1: flip 1's head */
+    rsx_draw_engine_present();                     /* 2: held on flip 1 */
+    rsx_draw_engine_present();                     /* 3: held again */
     stub_begin_end(RSX_PRIMITIVE_TRIANGLES);       /* a pass after them */
-    stub_flip(1);                                  /* 4: queue flip 2 closes the pass, 5: head */
+    stub_flip(1);                                  /* 4: flip 2's head closes the pass */
     stub_engine_down();
 
-    /* A present is named by the flip whose scanout it shows: the queue word's
-     * present already shows the queued flip, ahead of its head. */
-    CHECK(file_exists(dir, "present_s00001_f00000.ppm"),
-          "present 1 is named by its own sequence and the flip head it follows");
+    /* A present is named by the flip whose scanout it shows: the head that
+     * retires a flip, and the host presents that hold it. */
+    CHECK(file_exists(dir, "present_s00001_f00001.ppm"),
+          "present 1 is named by its own sequence and the flip its head retired (1)");
     CHECK(file_exists(dir, "present_s00002_f00001.ppm"),
-          "present 2 is a second file and names the flip it queued (1)");
+          "present 2 is a second file and names the flip it holds (1)");
     CHECK(file_exists(dir, "present_s00003_f00001.ppm"),
-          "present 3 carries the head that retired with it (flip 1)");
+          "present 3 is a third file for the same held flip");
     CHECK(file_exists(dir, "present_s00004_f00002.ppm"),
-          "present 4 exists after the pass and names the flip it queued (2)");
+          "present 4 exists after the pass and names the flip its head retired (2)");
     CHECK(count_prefix(dir, "present_s00001_") + count_prefix(dir, "present_s00002_") +
           count_prefix(dir, "present_s00003_") == 3,
           "the three presents between the passes are three files");
-    CHECK(count_prefix(dir, "present_s") == 5,
-          "five present images in all (%d)", count_prefix(dir, "present_s"));
-    /* A pass is named by the last head counted when it opened, not by the
-     * flip its frame will show: that is only known at the queue word. */
+    CHECK(count_prefix(dir, "present_s") == 4,
+          "four present images in all (%d)", count_prefix(dir, "present_s"));
+    /* A pass is named by the last head counted when it opened. */
     CHECK(file_exists(dir, "s00004_f00001_pass000_t0.ppm"),
           "the pass image carries the frame's present sequence and the head it follows");
 

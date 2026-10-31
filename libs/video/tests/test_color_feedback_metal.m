@@ -12,6 +12,7 @@ u8* vm_base;u32 ppu_vm_size;
 u32 cellGcmResolveLocated(int local,u32 offset){(void)local;return offset;}
 u32 cellGcmResolveIO(u32 offset){return offset<ppu_vm_size?offset:0;}
 void cellGcm_replay_display_buffers_to_engine(void){}
+#include "rsx_driver_stop_stub.h"
 static unsigned checks,failures;
 #define T(x,label) do{checks++;if(!(x)){failures++;if(failures<20)fprintf(stderr,"FAIL %s\n",label);}}while(0)
 static void method(u32 a,u32 v){rsx_draw_engine_method(a,v);}

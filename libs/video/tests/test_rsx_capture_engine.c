@@ -13,6 +13,7 @@
  * argv[2] names a scenario that must end in a stop (the process exits 70):
  *   bad-format   the presented surface is in a format the readback contract does not define
  */
+#define STUB_REAL_STOP   /* links runtime/diag/stop.cpp: the engine's rsx-driver-method stop is real */
 #include "rsx_draw_engine_test_stub.h"
 #include "rsx_capture.h"
 #include "ps3emu/config.h"
@@ -92,6 +93,9 @@ int main(int argc, char** argv)
     (void)rsx_capture_install(&env, &opt);
     g_sink->gcm_init(0x80000, 0x400000, 0x100000);
     g_sink->display_buffer(1, 0x40000, 256, 64, 64);
+    /* The engine resolves a flip against the display buffers it was told of (cellGcmSetDisplayBuffer
+     * tells both the capture and the engine in a live run). */
+    rsx_draw_engine_set_display_buffer(1, RSX_LOCATION_LOCAL, 0x40000, 256, 64, 64);
 
     cmd(M_CONTEXT_DMA_COLOR_A, DMA_LOCAL);
     cmd(M_SURFACE_CLIP_H, 64u << 16);

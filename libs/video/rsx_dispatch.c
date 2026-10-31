@@ -37,7 +37,11 @@
  *   0x1EFC VP_UPLOAD_CONST_ID (transform constant load pointer; NOT
  *          auto-advancing — every burst re-reads it)
  *   0x1F00..0x1F7C VP_UPLOAD_CONST window: word i -> slot load + i/4, lane i%4
- *   0xE944 gcm driver-queue flip (established empirically from this title)
+ *   0xE920/0xE924 GCM_FLIP_HEAD 0/1, 0xE940/0xE944 GCM_DRIVER_QUEUE 0/1: the LV1 driver's words, not an
+ *          NV4097 method. Firmware: libgcm_sys _cellGcmSetFlipCommand emits 0xE944 = bufferId, the NV406E
+ *          semaphore handshake and CALL 0, then 0xE924 = 0x8000010F. RPCS3 (pin d00d8023, gcm_enums.h,
+ *          rsx_methods.cpp queue_flip/driver_flip, sys_rsx.cpp 0x103/0x102): the queue word records the
+ *          head's buffer, the flip word scans out. See rsx_dsp_resolve_flip().
  */
 
 #include "rsx_dispatch.h"
@@ -101,7 +105,8 @@
 #define M_VP_UPLOAD_CONST       0x1F00
 #define M_GCM_FLIP_HEAD_0       0xE920
 #define M_GCM_FLIP_HEAD_1       0xE924
-#define M_GCM_DRIVER_FLIP       0xE944
+#define M_GCM_DRIVER_QUEUE_0    0xE940
+#define M_GCM_DRIVER_QUEUE_1    0xE944
 /* Primitive restart: a sentinel index value that breaks a TRIANGLE_STRIP/
  * FAN mid-draw with no connecting triangle (RPCS3 oracle: gcm_enums.h
  * NV4097_SET_RESTART_INDEX_ENABLE/NV4097_SET_RESTART_INDEX; semantics in
@@ -176,7 +181,7 @@ static void dsp_fill_classes(dsp_class_table* t)
     mark_class(t, M_VP_UPLOAD_CONST,  32, RSX_DSP_CLASS_EXEC);
     mark_class(t, M_GCM_FLIP_HEAD_0,   1, RSX_DSP_CLASS_EXEC);
     mark_class(t, M_GCM_FLIP_HEAD_1,   1, RSX_DSP_CLASS_EXEC);
-    mark_class(t, M_GCM_DRIVER_FLIP,   1, RSX_DSP_CLASS_EXEC);
+    mark_class(t, M_GCM_DRIVER_QUEUE_0, 2, RSX_DSP_CLASS_EXEC);
 
     /* State the getters decode */
     mark_class(t, M_DMA_COLOR1,        1, RSX_DSP_CLASS_STATE);
@@ -534,9 +539,27 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
 
     case M_GCM_FLIP_HEAD_0:
     case M_GCM_FLIP_HEAD_1:
-    case M_GCM_DRIVER_FLIP:
         if (rsx->sink.flip)
-            rsx->sink.flip(rsx->sink.user, rsx, arg);
+            rsx->sink.flip(rsx->sink.user, rsx, (method - M_GCM_FLIP_HEAD_0) >> 2, arg);
+        break;
+
+    case M_GCM_DRIVER_QUEUE_0:
+    case M_GCM_DRIVER_QUEUE_1: {
+        const u32 head = (method - M_GCM_DRIVER_QUEUE_0) >> 2;
+        rsx_dsp_flip_queue_note(&rsx->flip_queues, head, arg);
+        if (rsx->sink.queue)
+            rsx->sink.queue(rsx->sink.user, rsx, head, arg);
+        break;
+    }
+
+    case M_GCM_DRIVER_QUEUE_1 + 4:    /* 0xE948 .. 0xE95C: indices 2..7 */
+    case M_GCM_DRIVER_QUEUE_1 + 8:
+    case M_GCM_DRIVER_QUEUE_1 + 12:
+    case M_GCM_DRIVER_QUEUE_1 + 16:
+    case M_GCM_DRIVER_QUEUE_1 + 20:
+    case M_GCM_DRIVER_QUEUE_1 + 24:
+        if (rsx->sink.driver_unmodelled)
+            rsx->sink.driver_unmodelled(rsx->sink.user, rsx, method, arg);
         break;
 
     default:
