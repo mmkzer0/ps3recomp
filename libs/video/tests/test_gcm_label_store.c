@@ -96,6 +96,7 @@ PS3_NORETURN void ps3_stop_rsx_unknown_method(const char* cls, uint32_t method, 
            cls ? cls : "invalid", method, subchannel, fifo, word, data);
     exit(70);
 }
+#include "rsx_driver_stop_stub.h"   /* the walker's rsx-driver-method stop; no flip word here */
 
 PS3_NORETURN void ps3_stop_gcm_unmodelled(const char* func, const char* feature, const char* reason)
 {

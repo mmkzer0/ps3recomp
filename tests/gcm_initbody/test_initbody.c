@@ -292,6 +292,8 @@ static void flip_stream(int queued)
 static void test_flip_handshake(void)
 {
     scene();
+    /* The head word flips the queued buffer 3, so the walker needs it registered (#101). */
+    CHECK(cellGcmSetDisplayBuffer(3, 0x100000, 0x1400, 1280, 720) == 0, "SetDisplayBuffer 3");
     g_nevents = 0;
     gcm_set_driver_observer(observer);
     flip_stream(1);

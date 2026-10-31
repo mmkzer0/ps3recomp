@@ -214,6 +214,25 @@ static void sc_two_heads(void)
     CHECK(stub.last_present_surface == g_handle[1], "a later queue on head 0 does not move head 1's buffer");
 }
 
+/* A flip does not consume the queued buffer: RPCS3 sys_rsx.cpp 0x102 reads the head's lastQueuedBufferId
+ * and leaves it (the firmware does not describe a second head word with no queue word between), so a
+ * second 0x8000010F re-presents the same buffer, as a second flip. */
+static void sc_double_flip(void)
+{
+    up(1, 1);
+    sm(M_QUEUE1, 2u);
+    sm(M_FLIP1, LAST_QUEUED);
+    const int p0 = stub.n_present;
+    sm(M_FLIP1, LAST_QUEUED);
+    rsx_frame_identity id;
+    CHECK(stub.n_present == p0 + 1 && stub.last_present_surface == g_handle[2],
+          "the second head word presents the same buffer again (%d presents, surface %u, want %u)",
+          stub.n_present - p0, stub.last_present_surface, g_handle[2]);
+    CHECK(ident(&id) && id.flip_id == 1 && id.display_buffer == 2 && id.guest_frame == 0,
+          "and it is the next flip (flip %u buffer %u guest frame %u)", id.flip_id, id.display_buffer,
+          id.guest_frame);
+}
+
 /* A queue word does not change what is on screen: a host present between it and its head shows the
  * buffer the previous flip chose, and names the previous flip. */
 static void sc_queue_keeps_scanout(void)
@@ -256,6 +275,7 @@ static void sc_host_present_unregistered(void)
 
 static void st_nothing_queued(void)   { up(1, 1); sm(M_FLIP1, LAST_QUEUED); }
 static void st_other_head(void)       { up(1, 1); sm(M_QUEUE1, 1u); sm(M_FLIP0, LAST_QUEUED); }
+static void st_other_head_reverse(void) { up(1, 1); sm(M_QUEUE0, 1u); sm(M_FLIP1, LAST_QUEUED); }
 static void st_unregistered_idx(void) { up(1, 1); sm(M_QUEUE1, 1u); sm(M_FLIP1, 0x80000105u); }
 static void st_offset_unmatched(void) { up(1, 1); sm(M_QUEUE1, 1u); sm(M_FLIP1, 0x00012340u); }
 static void st_queue_index_2(void)    { up(1, 1); sm(0xE948u, 3u); }
@@ -272,6 +292,12 @@ static void st_no_surface(void)
 }
 
 static void st_present_buffer(void)   { up(1, 1); rsx_draw_engine_present_buffer(5); }
+static void st_present_buffer_unrendered(void)
+{
+    up(1, 1);
+    rsx_draw_engine_set_display_buffer(3, RSX_LOCATION_LOCAL, 0xE0000u, 64u * 4u, 64u, 64u);
+    rsx_draw_engine_present_buffer(3);
+}
 
 /* ---- the harness --------------------------------------------------------- */
 
@@ -345,6 +371,7 @@ int main(void)
     expect_runs("explicit low nibble presents that buffer", sc_explicit_nibble);
     expect_runs("offset form presents the matching display buffer", sc_offset_form);
     expect_runs("queue and flip are per head", sc_two_heads);
+    expect_runs("a second flip with no new queue shows the last queued buffer again", sc_double_flip);
     expect_runs("a queue word does not change the scanout", sc_queue_keeps_scanout);
     expect_runs("host present with no rendered scanout presents nothing", sc_host_present_without_scanout);
     expect_runs("host present with no display buffers shows the current target", sc_host_present_unregistered);
@@ -353,6 +380,8 @@ int main(void)
                 "method=0xE924 head=1 arg=0x8000010F buffer=none reason=nothing-queued");
     expect_stop("a queue on head 1 is not what a flip on head 0 takes", st_other_head,
                 "method=0xE920 head=0 arg=0x8000010F buffer=none reason=nothing-queued");
+    expect_stop("a queue on head 0 is not what a flip on head 1 takes", st_other_head_reverse,
+                "method=0xE924 head=1 arg=0x8000010F buffer=none reason=nothing-queued");
     expect_stop("an explicit buffer that is not registered", st_unregistered_idx,
                 "method=0xE924 head=1 arg=0x80000105 buffer=5 reason=unregistered-buffer");
     expect_stop("an offset no display buffer carries", st_offset_unmatched,
@@ -364,9 +393,11 @@ int main(void)
     expect_stop("a queued buffer above 7", st_queued_above_7,
                 "method=0xE924 head=1 arg=0x8000010F buffer=9 reason=unregistered-buffer");
     expect_stop("a registered buffer nothing was rendered at", st_no_surface,
-                "method=0xE924 head=1 arg=0x8000010F buffer=3 reason=no-surface");
+                "method=0xE924 head=1 arg=0x8000010F buffer=3 reason=unmodelled-scanout");
     expect_stop("a runner naming an unregistered buffer", st_present_buffer,
-                "method=0x0000 head=0 arg=0x00000005 buffer=5 reason=unregistered-buffer");
+                "method=none head=none arg=0x00000005 buffer=5 reason=unregistered-buffer");
+    expect_stop("a runner naming a registered buffer nothing was rendered at", st_present_buffer_unrendered,
+                "method=none head=none arg=0x00000003 buffer=3 reason=unmodelled-scanout");
 
     printf(g_failures ? "\n%d scenario(s) FAILED\n" : "\nall scenarios passed\n", g_failures);
     free(stub_guest);

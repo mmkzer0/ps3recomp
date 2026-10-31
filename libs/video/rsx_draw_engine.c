@@ -385,7 +385,7 @@ u32 rsx_draw_engine_pipeline_failures(rsx_pipeline_failure* out, u32 max)
 static u32 s_flip_heads;
 /* The queued flips (0xE944 words) seen so far, and the one the latest flip
  * head presents: the identity's guest_frame. Which buffer a queue word named
- * is the dispatcher's (rsx_dispatch.queued_buffer), per head. */
+ * is the dispatcher's (rsx_dispatch.flip_queues), per head. */
 static u32 s_queue_flips;
 static u32 s_head_guest_frame = RSX_FRAME_NO_FLIP;
 
@@ -3880,7 +3880,7 @@ static void eng_present(u32 buffer_id, u32 target)
     g.guest_draws = 0;
 }
 
-/* GCM_DRIVER_QUEUE (0xE940 / 0xE944): the dispatcher recorded the head's buffer (rsx_dispatch.queued_*);
+/* GCM_DRIVER_QUEUE (0xE940 / 0xE944): the dispatcher recorded the head's buffer (rsx_dispatch.flip_queues);
  * nothing scans out until the head's flip word (rsx_dsp_resolve_flip). Only head 1's words are counted
  * for the identity: they are the ones libgcm_sys writes and the ones cellGcmSys counts as
  * GCM_DRV_EVENT_QUEUE_FLIP, so guest_frame stays that event's ordinal. */
@@ -3899,15 +3899,18 @@ static void sink_flip(void* user, const rsx_dispatch* r, u32 head, u32 arg)
         refs[i].offset = g.display_buffers[i].offset;
     }
     u32 buffer;
-    const rsx_dsp_flip_status st = rsx_dsp_resolve_flip(r, head, arg, refs, &buffer);
+    const rsx_dsp_flip_status st = rsx_dsp_resolve_flip(&r->flip_queues, head, arg, refs, &buffer);
     const u32 method = 0xE920u + 4u * head;
     if (st != RSX_DSP_FLIP_OK)
         ps3_stop_rsx_driver_method(method, head, arg, buffer, rsx_dsp_flip_status_name(st));
-    /* A registered buffer the engine has rendered nothing into has no scanout to show, and falling back
-     * to the bound target is the #101 defect (an unregistered "buffer 7" resolved to whatever was bound). */
+    /* A registered buffer the engine has rendered nothing into: the word is valid (the hardware scans out
+     * display-buffer memory), the engine is the gap. It has no host surface for memory that only the CPU,
+     * a DMA or the 2D path filled, so it cannot show it, and it stops rather than present a surface the
+     * guest never selected. Falling back to the bound target is the #101 defect (an unregistered
+     * "buffer 7" resolved to whatever was bound); presenting black would be a made-up image. */
     const u32 target = eng_display_surface(buffer);
     if (target == ENG_INVALID)
-        ps3_stop_rsx_driver_method(method, head, arg, buffer, "no-surface");
+        ps3_stop_rsx_driver_method(method, head, arg, buffer, "unmodelled-scanout");
     /* The flip-head ordinal is cellGcmSys's GCM_DRV_EVENT_FLIP_HEAD: a 0xE924 word with bit 31. */
     if (head == 1u && (arg & 0x80000000u)) {
         s_flip_heads++;
@@ -4085,8 +4088,8 @@ static void eng_host_present(u32 buffer_id, int explicit_buffer)
     if (target == ENG_INVALID && eng_any_display_buffer()) {
         t_present_path = 0;
         if (explicit_buffer)
-            ps3_stop_rsx_driver_method(0, 0, buffer_id, buffer_id,
-                                       g.display_buffers[buffer_id].valid ? "no-surface"
+            ps3_stop_rsx_driver_method(PS3_STOP_RSX_NONE, PS3_STOP_RSX_NONE, buffer_id, buffer_id,
+                                       g.display_buffers[buffer_id].valid ? "unmodelled-scanout"
                                                                            : "unregistered-buffer");
         static u32 skipped;
         if (PS3_LOG_FIRST(skipped, 4))

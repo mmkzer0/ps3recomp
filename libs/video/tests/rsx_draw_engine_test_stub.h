@@ -252,9 +252,11 @@ static void stub_engine_up(int with_surface)
         sm(M_SURFACE_CLIP_H, 64u << 16);
         sm(M_SURFACE_CLIP_V, 64u << 16);
         sm(M_COLOR_A_OFFSET, 0x40000u);
-        /* Every display buffer id shows that one surface: a flip names a registered display buffer
-         * (#101), and these tests care that it presents, not which of eight identical images. */
-        for (u32 i = 0; i < 8; i++)
+        /* Display buffers 0..3 show that one surface: a flip names a registered display buffer (#101),
+         * and these tests care that it presents, not which of identical images. Only 0..3, so a flip
+         * that read the head word's low bits as the buffer (0x8000010F & 7 is 7) names an unregistered
+         * one and stops, instead of passing unnoticed. */
+        for (u32 i = 0; i < 4; i++)
             rsx_draw_engine_set_display_buffer(i, RSX_LOCATION_LOCAL, 0x40000u, 64u * 4u, 64u, 64u);
     }
     sm(M_VTXFMT, 2u | (4u << 4) | (16u << 8));       /* float32 x4, stride 16 */

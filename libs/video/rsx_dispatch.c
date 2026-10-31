@@ -546,8 +546,7 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
     case M_GCM_DRIVER_QUEUE_0:
     case M_GCM_DRIVER_QUEUE_1: {
         const u32 head = (method - M_GCM_DRIVER_QUEUE_0) >> 2;
-        rsx->queued_buffer[head] = arg;
-        rsx->queued_valid[head] = 1;
+        rsx_dsp_flip_queue_note(&rsx->flip_queues, head, arg);
         if (rsx->sink.queue)
             rsx->sink.queue(rsx->sink.user, rsx, head, arg);
         break;
@@ -566,54 +565,6 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
     default:
         break;
     }
-}
-
-/* ---- the flip semantic (rsx_dispatch.h) --------------------------------- */
-
-rsx_dsp_flip_status rsx_dsp_resolve_flip(const rsx_dispatch* rsx, u32 head, u32 arg,
-                                         const rsx_dsp_display_ref refs[RSX_DSP_DISPLAY_BUFFERS],
-                                         u32* buffer)
-{
-    *buffer = RSX_DSP_NO_BUFFER;
-    if (head >= RSX_DSP_FLIP_HEADS)
-        return RSX_DSP_FLIP_BAD_HEAD;
-
-    if (arg & 0x80000000u) {
-        /* The low nibble is the buffer; above 7 it is "the last queued" (0xF in libgcm_sys's word).
-         * RPCS3 sys_rsx.cpp 0x102 reads the head's own lastQueuedBufferId, and so does this. */
-        u32 id = arg & 0xFu;
-        if (id > 7u) {
-            if (!rsx->queued_valid[head])
-                return RSX_DSP_FLIP_NOTHING_QUEUED;
-            id = rsx->queued_buffer[head];
-        }
-        if (id >= RSX_DSP_DISPLAY_BUFFERS || !refs[id].valid) {
-            *buffer = id;
-            return RSX_DSP_FLIP_BUFFER_UNREGISTERED;
-        }
-        *buffer = id;
-        return RSX_DSP_FLIP_OK;
-    }
-
-    for (u32 i = 0; i < RSX_DSP_DISPLAY_BUFFERS; i++) {
-        if (refs[i].valid && refs[i].offset == arg) {
-            *buffer = i;
-            return RSX_DSP_FLIP_OK;
-        }
-    }
-    return RSX_DSP_FLIP_OFFSET_UNMATCHED;
-}
-
-const char* rsx_dsp_flip_status_name(rsx_dsp_flip_status status)
-{
-    switch (status) {
-    case RSX_DSP_FLIP_OK:                  return "ok";
-    case RSX_DSP_FLIP_BAD_HEAD:            return "bad-head";
-    case RSX_DSP_FLIP_NOTHING_QUEUED:      return "nothing-queued";
-    case RSX_DSP_FLIP_BUFFER_UNREGISTERED: return "unregistered-buffer";
-    case RSX_DSP_FLIP_OFFSET_UNMATCHED:    return "offset-unmatched";
-    }
-    return "invalid";
 }
 
 /* ---- getters ----------------------------------------------------------- */

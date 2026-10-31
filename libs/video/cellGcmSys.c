@@ -75,12 +75,14 @@ static rsx_class_id gcm_method_class(u32 subch, u32 m)
 }
 
 /* The driver's own words, decoded by their full address (LV1's, not an engine's; RPCS3 does the same):
- * GCM_SET_USER_COMMAND 0xEB00/0xEB04, the flip queue 0xE944 and the flip head 0xE920/0xE924. Slot 7 is the
- * driver's, and these are taken before any class route: whatever object a slot carries, they mean the same. */
+ * GCM_SET_USER_COMMAND 0xEB00/0xEB04, the flip heads 0xE920/0xE924 and the driver queue 0xE940..0xE95C
+ * (only 0xE940/0xE944 mean anything, see the walker). Slot 7 is the driver's, and these are taken before
+ * any class route: whatever object a slot carries, they mean the same. */
 static int gcm_driver_word(u32 subch, u32 m)
 {
     const u32 mfull = (subch << 13) | m;
-    return mfull == 0xEB00u || mfull == 0xEB04u || mfull == 0xE944u || mfull == 0xE920u || mfull == 0xE924u;
+    return mfull == 0xEB00u || mfull == 0xEB04u || mfull == 0xE920u || mfull == 0xE924u ||
+           (mfull >= 0xE940u && mfull <= 0xE95Cu);
 }
 
 /* Whether the 3D register-file mirrors (the draw engine, the live-draw engine) take this word. Both keep
@@ -353,6 +355,9 @@ static volatile int s_flip_pending = 0;
 /* The display buffer the last GCM_DRIVER_QUEUE (0xE944) method named; the next GCM_FLIP_HEAD
  * (0xE924, bit 31 set) presents it. */
 static u32 s_drv_flip_queue = 0;
+/* Each flip head's last queued buffer, as the walker saw the words: the same words the dispatcher records
+ * in the draw consumers, resolved by the same function. */
+static rsx_dsp_flip_queues s_flip_q;
 /* A flip _cellGcmSetFlipCommand queued in the FIFO: | bufferId, bit 8 = ours. */
 #define GCM_FLIP_MARKER 0xFEAD0100u
 /* Flips queued into the command stream by gcm_flip_into_fifo, and how many of
@@ -400,6 +405,15 @@ static void gcm_set_current_display_buffer(u32 bufferId)
     s_current_display_buffer_id = bufferId;
     if (rsx_draw_engine_enabled())
         rsx_draw_engine_note_flip(bufferId);
+}
+
+/* The display buffers the title registered, as rsx_dsp_resolve_flip() takes them. */
+static void gcm_display_refs(rsx_dsp_display_ref refs[RSX_DSP_DISPLAY_BUFFERS])
+{
+    for (u32 i = 0; i < RSX_DSP_DISPLAY_BUFFERS; i++) {
+        refs[i].valid = i < CELL_GCM_MAX_DISPLAY_BUFFER_NUM && s_display_buffer_set[i];
+        refs[i].offset = i < CELL_GCM_MAX_DISPLAY_BUFFER_NUM ? s_display_buffers[i].offset : 0;
+    }
 }
 
 
@@ -741,6 +755,7 @@ static void gcm_driver_events_reset(void)
     atomic_store(&s_driver_event_seq, 0ull);
     for (u32 k = 0; k < GCM_DRV_EVENT_KINDS; k++) atomic_store(&s_driver_event_count[k], 0ull);
     s_drv_queue_pending = 0;
+    memset(&s_flip_q, 0, sizeof s_flip_q);
     s_drv_flip_label_pending = 0;
     s_acquire_blocked = 0;
     s_acq_t0 = 0;
@@ -3999,30 +4014,52 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 if (mfull == 0xEB00u || mfull == 0xEB04u) {
                     gcm_driver_event(GCM_DRV_EVENT_USER_COMMAND, vm_read32(dea));
                     cellGcmQueueUserCommand(vm_read32(dea));
-                } else if (mfull == 0xE944u) {
-                    /* GCM_DRIVER_QUEUE index 1 (base 0xE940): the flip the next 0xE924 shows.
-                     * _cellGcmSetFlipCommand (libgcm_sys 0x02008948) writes the display buffer id
-                     * here, ahead of its label handshake and `CALL 0`. */
-                    s_drv_flip_queue = vm_read32(dea) & 0xFFu;
-                    s_drv_queue_pending = 1;
-                    gcm_driver_event(GCM_DRV_EVENT_QUEUE_FLIP, s_drv_flip_queue);
-                } else if (mfull == 0xE924u && (vm_read32(dea) & 0x80000000u)) {
-                    /* GCM_FLIP_HEAD index 1 (base 0xE920), argument 0x8000010F as libgcm_sys writes it
-                     * (bit 31 set): flip to the buffer 0xE944 queued. The same present half as the
-                     * 0xFEAD marker; the guest-visible half ran when the command was emitted
-                     * (cellGcm_emit_flip_command). */
-                    if (s_drv_flip_queue < CELL_GCM_MAX_DISPLAY_BUFFER_NUM &&
-                        s_display_buffer_set[s_drv_flip_queue]) {
-                        gcm_set_current_display_buffer(s_drv_flip_queue);
+                } else if (mfull >= 0xE940u && mfull <= 0xE95Cu) {
+                    /* GCM_DRIVER_QUEUE (base 0xE940). Only indices 0 and 1 mean anything: RPCS3 asserts
+                     * head < 2 and gcm_enums.h calls the rest unknown, so a consumer that took the word
+                     * has already stopped on it (rsx-driver-method); with no consumer it is stopped here,
+                     * whatever class the slot is bound to. */
+                    if (mfull > 0xE944u)
+                        ps3_stop_rsx_driver_method(mfull, (mfull - 0xE940u) >> 2, vm_read32(dea),
+                                                   PS3_STOP_RSX_NONE, "queue-index-unmodelled");
+                    const u32 head = (mfull - 0xE940u) >> 2;
+                    rsx_dsp_flip_queue_note(&s_flip_q, head, vm_read32(dea));
+                    if (head == 1u) {
+                        /* Index 1: the flip the next 0xE924 shows. _cellGcmSetFlipCommand (libgcm_sys
+                         * 0x02008948) writes the display buffer id here, ahead of its label handshake and
+                         * `CALL 0`; the handshake and the event are this index's alone. */
+                        s_drv_flip_queue = vm_read32(dea) & 0xFFu;
+                        s_drv_queue_pending = 1;
+                        gcm_driver_event(GCM_DRV_EVENT_QUEUE_FLIP, s_drv_flip_queue);
+                    }
+                } else if (mfull == 0xE920u || mfull == 0xE924u) {
+                    /* GCM_FLIP_HEAD 0/1: what it scans out is rsx_dsp_resolve_flip()'s, the statement
+                     * the draw consumers use too (the word's nibble or offset, the head's own queue), so
+                     * this half agrees with theirs. The host present follows rsx_draw_engine_note_flip,
+                     * which must name the buffer the engine presented. */
+                    const u32 head = (mfull - 0xE920u) >> 2, farg = vm_read32(dea);
+                    rsx_dsp_display_ref refs[RSX_DSP_DISPLAY_BUFFERS];
+                    gcm_display_refs(refs);
+                    u32 fbuf;
+                    const rsx_dsp_flip_status fst = rsx_dsp_resolve_flip(&s_flip_q, head, farg, refs, &fbuf);
+                    if (fst != RSX_DSP_FLIP_OK)
+                        ps3_stop_rsx_driver_method(mfull, head, farg, fbuf, rsx_dsp_flip_status_name(fst));
+                    if (mfull == 0xE924u && (farg & 0x80000000u)) {
+                        /* Argument 0x8000010F as libgcm_sys writes it (bit 31 set): flip to the buffer
+                         * 0xE944 queued. The same present half as the 0xFEAD marker; the guest-visible
+                         * half ran when the command was emitted (cellGcm_emit_flip_command). */
+                        gcm_set_current_display_buffer(fbuf);
                         s_flip_pending = 1;
                         s_flip_request_count++;
                         if (s_fifo_flips_reached != s_fifo_flips_queued) s_fifo_flips_reached++;
+                        gcm_driver_event(GCM_DRV_EVENT_FLIP_HEAD, fbuf);
+                        s_drv_flip_label_pending = 1;
+                        drv_flip = 1;
+                    } else {
+                        /* A flip nothing emitted a guest-visible half for (head 0, or the offset form):
+                         * do that half now, for the buffer the word names. */
+                        cellGcmSetFlipCommand(fbuf);
                     }
-                    gcm_driver_event(GCM_DRV_EVENT_FLIP_HEAD, s_drv_flip_queue);
-                    s_drv_flip_label_pending = 1;
-                    drv_flip = 1;
-                } else if (mfull == 0xE920u || mfull == 0xE924u) {
-                    cellGcmSetFlipCommand(vm_read32(dea) & 7u);
                 } else if (cls == RSX_CLASS_NV4097 || cls == RSX_CLASS_NV406E) {
                     handled = gcm_3d_method(&s_state, m, vm_read32(dea), legacy_state_live);
                 } else if (cls == RSX_CLASS_NV3062 || cls == RSX_CLASS_NV308A ||

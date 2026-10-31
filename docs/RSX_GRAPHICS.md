@@ -325,19 +325,32 @@ both draw consumers (`rsx_draw_engine.c`, `rsx_live_draw.c`) use it:
 | bit 31 set, low nibble 8..15 (`0x8000010F`) | the buffer last queued **on that head**; none queued is the stop `rsx-driver-method` (`nothing-queued`) |
 | bit 31 clear | the registered display buffer whose offset the word equals; none is `offset-unmatched` |
 
-A buffer that is above 7 or has no registered display buffer is `unregistered-buffer`, and one the engine has
-rendered nothing at is `no-surface`: the engine never presents "whatever is bound" for a flip (an unregistered
-"buffer 7" used to resolve to the bound render target, and the queue word used to present a scanout the hardware
-does not show). RPCS3 only logs the nothing-queued case and flips buffer 0 for an unmatched offset; the runtime has
-no scanout for either, so it stops. `GCM_DRIVER_QUEUE` indices 2..7 (`0xE948..0xE95C`) have no known meaning
-(`gcm_enums.h`; RPCS3 asserts `head < 2`) and stop with `queue-index-unmodelled`. See `docs/STOPS.md`.
+A buffer that is above 7 or has no registered display buffer is `unregistered-buffer`. One the engine has rendered
+nothing at is `unmodelled-scanout`: the word is valid and the hardware scans that memory out, but the engine has no
+host surface for memory only the CPU, a DMA or the 2D path filled (it never reads RSX local memory back), so it
+cannot show it. The engine never presents "whatever is bound" for a flip (an unregistered "buffer 7" used to
+resolve to the bound render target, and the queue word used to present a scanout the hardware does not show), and
+a black image would be a made-up one. RPCS3 only logs the nothing-queued case and flips buffer 0 for an unmatched
+offset; the runtime has no scanout for either, so it stops. `GCM_DRIVER_QUEUE` indices 2..7 (`0xE948..0xE95C`)
+have no known meaning (`gcm_enums.h`; RPCS3 asserts `head < 2`) and stop with `queue-index-unmodelled`. See
+`docs/STOPS.md`.
+
+The FIFO walker (`cellGcmSys.c`) takes the same words, so the guest-visible half of a flip (the current display
+buffer the host present follows, the flip request and status, the flip-head event) agrees with the presented
+buffer: it records `0xE940`/`0xE944` per head, resolves `0xE920`/`0xE924` with the same `rsx_dsp_resolve_flip`
+(one inline body in `rsx_dispatch.h`), and forwards `0xE940..0xE95C` to the draw consumers, whose dispatcher owns
+the queue semantics. A bit-31 `0xE924` keeps the flip-head event, the pending flip and the label handshake it had
+(libgcm_sys's own stream); any other flip word gets a plain flip request for the buffer it resolved to. Indices 2..7
+stop in the walker too when no draw consumer is on. A second head word with no new queue word in between is not an
+error: the last queued buffer is not consumed (RPCS3 `0x102` leaves `lastQueuedBufferId`), so it flips that buffer
+again.
 
 The host's own present (`rsx_draw_engine_present()`, the backend's per-frame call, #94) is pacing, not a flip. With
 display buffers registered it shows the guest's last flipped buffer (buffer 0 before one) and, where nothing has
 been rendered at that buffer's address, presents nothing. With none registered, which is a host that never described
 its scanout (the harness, the boot smoke title), the current render target is the only image it has and is what it
 shows. `rsx_draw_engine_present_buffer()` names a buffer: with display buffers registered, an unregistered or
-unrendered one stops (`method=0x0000`).
+unrendered one stops (`method=none head=none`, there being no FIFO word).
 
 **Frame identity.** The engine's present counter and the GCM's flip counter are separate: a guest flip is one present, at
 its head word, and the host's own presents add more.

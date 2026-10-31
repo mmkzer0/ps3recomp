@@ -280,12 +280,15 @@ PS3_NORETURN void ps3_stop_rsx_capture(const char* func, const char* reason, con
 PS3_NORETURN void ps3_stop_rsx_unknown_method(const char* cls, uint32_t method, uint32_t subchannel,
                                               uint32_t fifo, uint32_t word, uint32_t data);
 
-/* Generic helper to raise PS3_STOP_RSX_DRIVER_METHOD: an RSX driver word the draw consumers cannot honour,
- * so the scanout would be a guess. `method` is the FIFO address (0xE920/0xE924 flip head, 0xE940..0xE95C
- * driver queue), `head` the flip head it names (or the queue index for 0xE948..0xE95C), `arg` the word's
- * data, `buffer` the display buffer id the word resolved to or 0xFFFFFFFF when it resolved to none, and
- * `reason` a stable id: nothing-queued, unregistered-buffer, offset-unmatched, no-surface, bad-head,
- * queue-index-unmodelled. Fields: method, head, arg, buffer, reason. */
+/* Generic helper to raise PS3_STOP_RSX_DRIVER_METHOD: an RSX driver word, or a runner's explicit present,
+ * that the draw consumers cannot turn into a scanout. `method` is the FIFO address (0xE920/0xE924 flip
+ * head, 0xE940..0xE95C driver queue), `head` the flip head it names (the queue index for 0xE948..0xE95C),
+ * `arg` the word's data (a runner's present: the buffer id it asked for), `buffer` the display buffer id
+ * the word resolved to, and `reason` a stable id: nothing-queued, unregistered-buffer, offset-unmatched,
+ * unmodelled-scanout, bad-head, queue-index-unmodelled. PS3_STOP_RSX_NONE in `method` and `head` means
+ * there is no FIFO word (a runner's rsx_draw_engine_present_buffer); in `buffer` that the word resolved to
+ * none. Each prints as "none". Fields: method, head, arg, buffer, reason. */
+#define PS3_STOP_RSX_NONE 0xFFFFFFFFu
 PS3_NORETURN void ps3_stop_rsx_driver_method(uint32_t method, uint32_t head, uint32_t arg,
                                              uint32_t buffer, const char* reason);
 

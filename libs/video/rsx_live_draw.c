@@ -3628,6 +3628,21 @@ static u32 current_surface(void)
     return slot;
 }
 
+/* The surface a registered display buffer shows: one drawn at its address, or the one a scaled blit
+ * resolved into it (see note_resolve), else LD_INVALID_SURFACE. */
+static u32 ld_display_target(u32 buffer_id)
+{
+    if (buffer_id >= 8 || !g.display_buffers[buffer_id].valid)
+        return LD_INVALID_SURFACE;
+    const display_buffer_t* display = &g.display_buffers[buffer_id];
+    for (u32 i = 0; i < g.n_surfaces; i++)
+        if (g.surfaces[i].location == display->location && g.surfaces[i].offset == display->offset)
+            return i;
+    if (display->resolve_src > 0 && (u32)display->resolve_src <= g.n_surfaces)
+        return (u32)display->resolve_src - 1;
+    return LD_INVALID_SURFACE;
+}
+
 /* On RSX each zeta (depth) address is distinct memory. The offline renderer's
  * s31 fix proved that sharing one D3D depth resource across all of this game's
  * shadow, scene and post-processing passes cross-contaminates later depth
@@ -8054,7 +8069,7 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
 }
 
 /* GCM_DRIVER_QUEUE does nothing here: the dispatcher records the head's buffer
- * (rsx_dispatch.queued_*), and only the head's flip word scans out. The queue
+ * (rsx_dispatch.flip_queues), and only the head's flip word scans out. The queue
  * word used to present through this file's single flip callback, and the
  * flip-head word then read its own argument (0x8000010F in libgcm_sys's
  * stream) as buffer 7 (#101). */
@@ -8067,10 +8082,19 @@ static void sink_flip(void* user, const rsx_dispatch* r, u32 head, u32 arg)
         refs[i].offset = g.display_buffers[i].offset;
     }
     u32 buffer_id;
-    const rsx_dsp_flip_status st = rsx_dsp_resolve_flip(r, head, arg, refs, &buffer_id);
+    const rsx_dsp_flip_status st = rsx_dsp_resolve_flip(&r->flip_queues, head, arg, refs, &buffer_id);
     if (st != RSX_DSP_FLIP_OK)
         ps3_stop_rsx_driver_method(0xE920u + 4u * head, head, arg, buffer_id,
                                    rsx_dsp_flip_status_name(st));
+    /* A FIFO flip shows its display buffer or stops, as the register-file engine does. The fallback to
+     * the bound target that rsx_live_draw_present keeps for a host caller was the #101 defect on this
+     * path, and its premise (a title that scans out through cellResc never matches a registered
+     * display buffer) does not hold here: the resolver above has already required a registered buffer,
+     * and a surface drawn at its address or a scaled blit into it (resolve_src) is its scanout. A
+     * registered buffer with neither is memory only the CPU, a DMA or the 2D path filled, which this
+     * engine cannot show: unmodelled, not invalid. Movie mode does not present, so it is exempt. */
+    if (!g_ld_movie_mode && ld_display_target(buffer_id) == LD_INVALID_SURFACE)
+        ps3_stop_rsx_driver_method(0xE920u + 4u * head, head, arg, buffer_id, "unmodelled-scanout");
     g_ld_flip_requested++;
     g_ld_last_requested_buffer = buffer_id;
     if (g_ld_movie_mode) {
@@ -9290,21 +9314,7 @@ void rsx_live_draw_present(u32 buffer_id)
     /* A flip names a registered display buffer. The current color target may
      * be an offscreen shadow/postprocess surface at that instant; copying it
      * caused a010 to present black despite executing the scene's draws. */
-    u32 target = LD_INVALID_SURFACE;
-    if (buffer_id < 8 && g.display_buffers[buffer_id].valid) {
-        const display_buffer_t* display = &g.display_buffers[buffer_id];
-        for (u32 i = 0; i < g.n_surfaces; i++) {
-            if (g.surfaces[i].location == display->location &&
-                g.surfaces[i].offset == display->offset) {
-                target = i;
-                break;
-            }
-        }
-    }
-    if (target == LD_INVALID_SURFACE && buffer_id < 8 &&
-        g.display_buffers[buffer_id].valid && g.display_buffers[buffer_id].resolve_src > 0 &&
-        (u32)g.display_buffers[buffer_id].resolve_src <= g.n_surfaces)
-        target = (u32)g.display_buffers[buffer_id].resolve_src - 1;   /* see note_resolve */
+    u32 target = ld_display_target(buffer_id);
     if (target == LD_INVALID_SURFACE) {
         target = current_surface();
         static u32 fallback_logs = 0;
