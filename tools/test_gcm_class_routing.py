@@ -46,7 +46,7 @@ with tempfile.TemporaryDirectory(prefix='gcm-class-routing-') as tmp:
     # Engine on (every walker path with the per-word mirrors, the default-state and RESC streams), the
     # engine off with no diagnostic (the 3D-run fast path is eligible), and the legacy-handled methods'
     # verdicts.
-    for args in ([], ['fast'], ['legacy-handled', str(handled)]):
+    for args in ([], ['fast'], ['flip'], ['legacy-handled', str(handled)]):
         result = subprocess.run([str(binary), *args], timeout=60, capture_output=True, text=True)
         print(result.stdout.strip())
         if result.returncode:

@@ -28,6 +28,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
@@ -125,18 +127,129 @@ static GcmMethodStats stats(void) { GcmMethodStats s; gcm_method_stats(&s); retu
 #define DMA_LOCAL 0xFEED0000u
 
 /* The backend the engine needs to take the default state's CLEAR: surface handles and calls that draw nothing. */
-static u32 t_next_handle = 1;
+static u32 t_next_handle = 1, t_last_created;
 static u32 t_color_create(void* u, rsx_be_format f, u32 w, u32 h, const void* seed, u32 rb)
-{ (void)u; (void)f; (void)w; (void)h; (void)seed; (void)rb; return t_next_handle++; }
+{ (void)u; (void)f; (void)w; (void)h; (void)seed; (void)rb; return t_last_created = t_next_handle++; }
 static u32 t_depth_create(void* u, u32 w, u32 h) { (void)u; (void)w; (void)h; return t_next_handle++; }
 static void t_release(void* u, u32 s) { (void)u; (void)s; }
 static void t_clear_color(void* u, u32 s, const float rgba[4]) { (void)u; (void)s; (void)rgba; }
 static void t_clear_depth(void* u, u32 d, u32 flags, float dv, u8 st) { (void)u; (void)d; (void)flags; (void)dv; (void)st; }
-static void t_present(void* u, u32 s) { (void)u; (void)s; }
+static u32 t_presents, t_present_handle;
+static void t_present(void* u, u32 s) { (void)u; t_presents++; t_present_handle = s; }
 /* The RESC stream draws: a pipeline the engine cannot build is the documented drop, not a crash. */
 static u32 t_pipeline_create(void* u, const char* vs, const char* ps, const rsx_be_render_state* rs,
                              const rsx_vertex_layout_plan* l, u32 stride, rsx_be_format f, u32 n)
 { (void)u; (void)vs; (void)ps; (void)rs; (void)l; (void)stride; (void)f; (void)n; return 0; }
+
+static uint32_t g_ctrl;
+
+/* A child that walks one stream and must end in the stop status; its output says which stop. */
+static int child_stops(void (*stream)(void), const char* want)
+{
+    int fds[2];
+    if (pipe(fds)) return 0;
+    fflush(stdout);
+    const pid_t pid = fork();
+    if (pid == 0) {
+        close(fds[0]);
+        dup2(fds[1], 1);
+        stream();
+        walk(g_ctrl);
+        _exit(0);                       /* reaching here means the stream did not stop */
+    }
+    close(fds[1]);
+    char buf[4096];
+    size_t n = 0;
+    for (ssize_t r; n < sizeof buf - 1 && (r = read(fds[0], buf + n, sizeof buf - 1 - n)) > 0;) n += (size_t)r;
+    buf[n] = 0;
+    close(fds[0]);
+    int status = 0;
+    waitpid(pid, &status, 0);
+    const int ok = WIFEXITED(status) && WEXITSTATUS(status) == 70 && strstr(buf, want) != NULL;
+    if (!ok) printf("  status %d, child output: %s\n", status, buf);
+    return ok;
+}
+static void child_queue_index(void)    { pkt(7, 0x0948, 3u); }
+static void child_nothing_queued(void) { memset(&s_flip_q, 0, sizeof s_flip_q); pkt(7, 0x0924, 0x8000010Fu); }
+static void child_reverse_head(void)   { memset(&s_flip_q, 0, sizeof s_flip_q); pkt(7, 0x0940, 1u); pkt(7, 0x0924, 0x8000010Fu); }
+static void child_offset_unmatched(void) { pkt(7, 0x0924, 0x00012340u); }
+
+/* The driver's flip words through the REAL walker, with the engine on and three display buffers, each a
+ * surface of its own. What a head word scans out is rsx_dsp_resolve_flip()'s for every form, on both heads,
+ * and the guest-visible half (the current display buffer, the flip status, the events) follows it. */
+static void flip_walker(uint32_t ctrl)
+{
+    static const u32 off[3] = { 0x40000u, 0x60000u, 0x80000u };
+    u32 handle[3];
+    g_ctrl = ctrl;
+    for (u32 i = 0; i < 3; i++) {
+        rsx_draw_engine_method(0x0194, DMA_LOCAL);
+        rsx_draw_engine_method(0x0200, 64u << 16);
+        rsx_draw_engine_method(0x0204, 64u << 16);
+        rsx_draw_engine_method(0x0210, off[i]);
+        rsx_draw_engine_method(0x1D94, 0u);          /* a clear (mask 0) makes the surface current */
+        handle[i] = t_last_created;
+        check(cellGcmSetDisplayBuffer(i, off[i], 64u * 4u, 64, 64) == CELL_OK, "display buffer registered");
+    }
+    check(handle[0] != handle[1] && handle[1] != handle[2], "three surfaces, one per display buffer");
+
+    /* The firmware's stream: 0xE944 = 1, 0xE924 = 0x8000010F. */
+    const unsigned long long q0 = gcm_driver_event_count(GCM_DRV_EVENT_QUEUE_FLIP);
+    const unsigned long long h0 = gcm_driver_event_count(GCM_DRV_EVENT_FLIP_HEAD);
+    const u32 r0 = s_flip_request_count, p0 = t_presents;
+    pkt(7, 0x0944, 1u);
+    pkt(7, 0x0924, 0x8000010Fu);
+    walk(ctrl);
+    check(t_presents == p0 + 1 && t_present_handle == handle[1] && s_current_display_buffer_id == 1u,
+          "0xE944 = 1, 0xE924 = 0x8000010F: one present of buffer 1, which is the current display buffer");
+    check(gcm_driver_event_count(GCM_DRV_EVENT_QUEUE_FLIP) == q0 + 1u &&
+          gcm_driver_event_count(GCM_DRV_EVENT_FLIP_HEAD) == h0 + 1u && s_flip_request_count == r0 + 1u &&
+          s_flip_pending && s_drv_flip_label_pending,
+          "...with one queue event, one flip-head event, one flip request, the flip pending and the label owed");
+
+    /* The offset form: the word is the offset of buffer 2. The old decode took offset & 7 as the buffer. */
+    s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+    const unsigned long long h1 = gcm_driver_event_count(GCM_DRV_EVENT_FLIP_HEAD);
+    const u32 r1 = s_flip_request_count;
+    pkt(7, 0x0924, off[2]);
+    walk(ctrl);
+    check(t_present_handle == handle[2] && s_current_display_buffer_id == 2u && g.last_flip_buffer == 2u,
+          "an offset-form 0xE924 presents buffer 2 and names it current, so the host present follows it");
+    check(s_flip_request_count == r1 + 1u && s_flip_status == CELL_GCM_FLIP_STATUS_WAITING &&
+          gcm_driver_event_count(GCM_DRV_EVENT_FLIP_HEAD) == h1,
+          "...as a flip request with the status waiting, and no flip-head event (that is bit 31's)");
+    const u32 pn = t_presents;
+    rsx_draw_engine_present();
+    check(t_presents == pn + 1 && t_present_handle == handle[2], "...and the host present shows buffer 2");
+
+    /* An explicit nibble, with another buffer queued. */
+    pkt(7, 0x0944, 2u);
+    pkt(7, 0x0924, 0x80000101u);
+    walk(ctrl);
+    check(t_present_handle == handle[1] && s_current_display_buffer_id == 1u && g.last_flip_buffer == 1u,
+          "0xE924 = 0x80000101 with buffer 2 queued presents buffer 1 and names buffer 1 current");
+
+    /* Head 0: its own queue (0xE940) and flip (0xE920), the dispatcher and the walker both. */
+    const unsigned long long q1 = gcm_driver_event_count(GCM_DRV_EVENT_QUEUE_FLIP);
+    pkt(7, 0x0940, 2u);
+    pkt(7, 0x0920, 0x8000010Fu);
+    walk(ctrl);
+    check(t_present_handle == handle[2] && s_current_display_buffer_id == 2u &&
+          gcm_driver_event_count(GCM_DRV_EVENT_QUEUE_FLIP) == q1,
+          "0xE940 = 2, 0xE920 = 0x8000010F: head 0 presents buffer 2 (the queue event is index 1's)");
+    pkt(7, 0x0924, 0x8000010Fu);
+    walk(ctrl);
+    check(t_present_handle == handle[2], "head 1 still takes its own queue (buffer 2 from the 0xE944 above)");
+
+    check(child_stops(child_nothing_queued, "reason nothing-queued"),
+          "a flip with nothing queued stops");
+    check(child_stops(child_reverse_head, "reason nothing-queued"),
+          "a queue on head 0 is not what a flip on head 1 takes");
+    check(child_stops(child_offset_unmatched, "reason offset-unmatched"),
+          "an offset no display buffer carries stops");
+    check(child_stops(child_queue_index, "reason queue-index-unmodelled"),
+          "0xE948 reaches the dispatcher and stops (queue-index-unmodelled)");
+}
 
 int main(int argc, char** argv)
 {
@@ -148,6 +261,8 @@ int main(int argc, char** argv)
 
     /* "fast": no engine and no per-word diagnostic, so the walker's 3D-run fast path is eligible. */
     const int fast = argc > 1 && !strcmp(argv[1], "fast");
+    /* "flip": the engine on, display buffers registered, driver flip words through the walker. */
+    const int flipm = argc > 1 && !strcmp(argv[1], "flip");
     /* "legacy-handled <file>": no engine; the methods the state machine takes (see below). */
     const int masked = argc > 2 && !strcmp(argv[1], "legacy-handled");
 
@@ -203,7 +318,22 @@ int main(int argc, char** argv)
         free(vm_base);
         return t_fails ? 1 : 0;
     }
+    if (flipm) {
+        flip_walker(ctrl);
+        printf("[gcm_class_routing flip] %s (%d failed)\n", t_fails ? "FAIL" : "PASS", t_fails);
+        rsx_draw_engine_shutdown();
+        free(vm_base);
+        return t_fails ? 1 : 0;
+    }
     if (fast) {
+        /* Driver queue index 2 (0xE948) has no known meaning. With no draw consumer to take it the walker
+         * itself ends the run in rsx-driver-method, whatever class slot 7 is bound to (NV4097's 0x0948 is
+         * a vertex-texture register). */
+        gcm_bind_object(7, RSX_OBJ_NV4097);
+        g_ctrl = ctrl;
+        check(child_stops(child_queue_index, "reason queue-index-unmodelled"),
+              "no consumer: 0xE948 stops in the walker (rsx-driver-method, queue-index-unmodelled)");
+        gcm_bind_object(7, RSX_OBJ_DRIVER);
         /* NV4097 bound on slot 7, a run of one word on the fast path's terms: 0xE944 is the driver's flip
          * queue word, not NV4097 method 0x0944 (a vertex-texture register). */
         gcm_bind_object(7, RSX_OBJ_NV4097);
