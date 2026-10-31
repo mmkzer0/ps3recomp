@@ -456,4 +456,28 @@ void ps3_stop_rsx_unknown_method(const char* cls, uint32_t method, uint32_t subc
              f, sizeof f / sizeof f[0], nullptr);
 }
 
+void ps3_stop_rsx_driver_method(uint32_t method, uint32_t head, uint32_t arg, uint32_t buffer,
+                                const char* reason)
+{
+    char method_s[16], head_s[16], arg_s[16], buffer_s[16];
+    snprintf(method_s, sizeof method_s, "0x%04X", method);
+    snprintf(head_s, sizeof head_s, "%u", head);
+    snprintf(arg_s, sizeof arg_s, "0x%08X", arg);
+    if (buffer == 0xFFFFFFFFu)
+        snprintf(buffer_s, sizeof buffer_s, "none");
+    else
+        snprintf(buffer_s, sizeof buffer_s, "%u", buffer);
+    const ps3_stop_field f[] = {
+        {"method", method_s},
+        {"head", head_s},
+        {"arg", arg_s},
+        {"buffer", buffer_s},
+        {"reason", reason ? reason : "unknown"},
+    };
+    ps3_stop(PS3_STOP_RSX_DRIVER_METHOD,
+             "an RSX driver word (flip head or driver queue) names a scanout the runtime cannot resolve: presenting anything would show a surface the guest never selected",
+             "Fix the stream or the display-buffer registration (cellGcmSetDisplayBuffer) the named reason points at; see docs/RSX_GRAPHICS.md, \"Frame identity\". Indices 2..7 of the driver queue (0xE948..0xE95C) have no known meaning (RPCS3 asserts on them), so a title that emits one needs evidence first.",
+             f, sizeof f / sizeof f[0], nullptr);
+}
+
 } // extern "C"
