@@ -98,10 +98,14 @@ def main():
 
     imports = replace_once(imports, '#include "rsx_live_draw.h"',
         '#include "rsx_draw_engine.h"\nextern "C" void cellGcmQueueUserCommand(uint32_t);\n#include "rsx_live_draw.h"', 'Metal draw engine include')
+    # Every method reaches the engine. 0xE944 was once dropped here because the old engine presented
+    # at the queue word. The engine now presents at the flip head (0xE920/0xE924) and the queue word
+    # only records which buffer the head shows (#101), so dropping one half of the pair makes the
+    # head stop (nothing-queued).
     imports = replace_once(imports, '    rsx_live_draw_method(method, arg);',
         '''    rsx_live_draw_method(method, arg);
 #ifdef __APPLE__
-    if (rsx_draw_engine_enabled() && method != 0xE944u)
+    if (rsx_draw_engine_enabled())
         rsx_draw_engine_method(method, arg);
 #endif''', 'Metal FIFO feed')
     imports = replace_once(imports,
