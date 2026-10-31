@@ -4308,7 +4308,8 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
                 const uint64_t ft_d0 = PS3_FT_ON() ? ps3_ft_now() : 0;
                 drawable = [s_layer nextDrawable];
                 if (ft_d0)
-                    ps3_ft_span(PS3_FT_DRAWABLE, 1, (drawable ? 0u : 1u) | (present_dst != s_eng_shown ? 2u : 0u),
+                    ps3_ft_span(PS3_FT_DRAWABLE, 1, (drawable ? 0u : 1u) | (present_dst != s_eng_shown ? 2u : 0u) |
+                                                        (rsx_draw_engine_present_diag() << 8),
                                 s_eng_recs_since_blit + s_eng_rec_count, ft_d0, ps3_ft_now());
                 if (!drawable) {           /* compositor is busy; skip */
                     dispatch_semaphore_signal(s_inflight);

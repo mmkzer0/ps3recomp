@@ -358,6 +358,14 @@ void rsx_draw_engine_present_buffer(u32 buffer_id);
  * HLE, both handled by cellGcmSys): remember the buffer for the host's next
  * rsx_draw_engine_present() without presenting now. */
 void rsx_draw_engine_note_flip(u32 buffer_id);
+/* Diagnostics for the backend's PS3_FTRACE drawable span, valid only inside
+ * the backend's present callback on the presenting thread, else 0:
+ * bits 0-1 entry path (1 queue present, 2 FIFO head, 3 host present),
+ * bits 2-4 buffer id asked for, bits 5-12 engine surface slot,
+ * bits 13-15 FIFO method of a FIFO head present (1 0xE920, 2 0xE924,
+ * 3 0xE940, 4 0xE944, 5 another driver method), bits 16-23 low bits of the
+ * surface handle. */
+u32 rsx_draw_engine_present_diag(void);
 
 /* ---- draw accounting (M3 gap 3e) ---------------------------------------- */
 

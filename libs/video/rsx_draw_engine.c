@@ -3815,6 +3815,23 @@ static void eng_cap_frame(const rsx_frame_identity* fid, u32 slot)
     free(buf);
 }
 
+/* Which entry point asked for the present in progress, and what it resolved
+ * to, for the backend's PS3_FTRACE drawable span (#94 Gate B: which surface
+ * each of the three presents per flip shows; #101: which FIFO method asked).
+ * Thread-local because the backend reads it synchronously inside eng_present
+ * on the same thread, and presents arrive from more than one thread. */
+enum { ENG_PRESENT_PATH_QUEUE = 1, ENG_PRESENT_PATH_HEAD = 2, ENG_PRESENT_PATH_HOST = 3 };
+enum { ENG_PRESENT_M_E920 = 1, ENG_PRESENT_M_E924, ENG_PRESENT_M_E940, ENG_PRESENT_M_E944,
+       ENG_PRESENT_M_OTHER };
+static _Thread_local u32 t_present_path;
+static _Thread_local u32 t_present_method;
+static _Thread_local u32 t_present_diag;
+
+u32 rsx_draw_engine_present_diag(void)
+{
+    return t_present_diag;
+}
+
 static void eng_present(u32 buffer_id)
 {
     if (!g.ready) return;
@@ -3847,7 +3864,11 @@ static void eng_present(u32 buffer_id)
     }
     pd_present(target, &fid);
     g.last_present_surface = target;
+    t_present_diag = (t_present_path & 3u) | ((buffer_id & 7u) << 2) | ((target & 0xFFu) << 5) |
+                     ((t_present_method & 7u) << 13) | ((g.surfaces[target].handle & 0xFFu) << 16);
     g.be->present(g.be->user, g.surfaces[target].handle);
+    t_present_diag = 0;
+    t_present_path = 0;
     /* The capture's frame is the flip head's: a present before the head names
      * the flip too, but that flip is not retired, and the capture records one
      * frame per head at the head's present. */
@@ -3865,6 +3886,7 @@ static void sink_flip(void* user, const rsx_dispatch* r, u32 arg)
 {
     (void)user; (void)r;
     g.last_flip_buffer = arg & 7u;
+    t_present_path = ENG_PRESENT_PATH_HEAD;
     eng_present(g.last_flip_buffer);
 }
 
@@ -4000,7 +4022,12 @@ void rsx_draw_engine_method(u32 method, u32 arg)
         s_flip_queued_unretired = 0;
         s_head_guest_frame = s_queue_flips ? s_queue_flips - 1u : RSX_FRAME_NO_FLIP;
     }
+    if (m >= 0xE900u && m < 0xEA00u)    /* driver methods only: keep the draw path cheap */
+        t_present_method = m == 0xE920u ? ENG_PRESENT_M_E920 : m == 0xE924u ? ENG_PRESENT_M_E924 :
+                           m == 0xE940u ? ENG_PRESENT_M_E940 : m == 0xE944u ? ENG_PRESENT_M_E944 :
+                                          ENG_PRESENT_M_OTHER;
     rsx_dispatch_method(&g.rsx, m, arg);
+    t_present_method = 0;
 }
 
 void rsx_draw_engine_set_display_buffer(u32 buffer_id, u32 location, u32 offset,
@@ -4030,12 +4057,14 @@ void rsx_draw_engine_present(void)
      * re-present a double-buffered title's OTHER scanout. Presenting twice is
      * harmless either way -- the engine never clears the surface, so a second
      * present just blits the same image again. */
+    t_present_path = ENG_PRESENT_PATH_HOST;
     eng_present(g.last_flip_buffer);
 }
 
 void rsx_draw_engine_present_buffer(u32 buffer_id)
 {
     g.last_flip_buffer = buffer_id & 7u;
+    t_present_path = ENG_PRESENT_PATH_QUEUE;
     eng_present(g.last_flip_buffer);
 }
 
