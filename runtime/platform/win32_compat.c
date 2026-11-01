@@ -49,7 +49,12 @@
  * while all that is wanted here is the ucontext_t a signal handler is given. */
 #  include <sys/ucontext.h>
 #  include <mach/mach.h>
-#  include <mach/mach_vm.h>
+#  include <TargetConditionals.h>
+#  if TARGET_OS_IPHONE
+#    include <mach/vm_map.h>
+#  else
+#    include <mach/mach_vm.h>
+#  endif
 #  include <mach/thread_act.h>
 #  include <pthread/qos.h>
 #else
@@ -1547,13 +1552,24 @@ static int os_region(uintptr_t addr, uintptr_t* base, size_t* size, int* prot,
     /* mach_vm_region searches UPWARDS from the address it is given and reports
      * where it landed, so one call answers both questions: a base above the
      * address means nothing is mapped at it, and that base is the gap's end. */
+#if TARGET_OS_IPHONE
+    /* iOS omits mach_vm.h; its public VM-map interface provides the 64-bit query. */
+    vm_address_t a = (vm_address_t)addr;
+    vm_size_t    sz = 0;
+#else
     mach_vm_address_t a = (mach_vm_address_t)addr;
     mach_vm_size_t    sz = 0;
+#endif
     vm_region_basic_info_data_64_t info;
     mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
     mach_port_t name = MACH_PORT_NULL;
+#if TARGET_OS_IPHONE
+    kern_return_t kr = vm_region_64(mach_task_self(), &a, &sz, VM_REGION_BASIC_INFO_64,
+                                    (vm_region_info_64_t)&info, &cnt, &name);
+#else
     kern_return_t kr = mach_vm_region(mach_task_self(), &a, &sz, VM_REGION_BASIC_INFO_64,
                                       (vm_region_info_t)&info, &cnt, &name);
+#endif
     if (name != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), name);
     if (kr != KERN_SUCCESS) return 0;             /* nothing at or above it */
     if ((uintptr_t)a > addr) { *next = (uintptr_t)a; return 0; }

@@ -1,8 +1,8 @@
 # ps3recomp - tests/fiber_switch
 #
-# cellFiber's scheduler API on the host's own switching mechanism: Windows
-# fibers on Windows, ucontext elsewhere. Standalone project with its own build dir,
-# and also added from the top-level CMakeLists under PS3RECOMP_BUILD_TESTS.
+# cellFiber's scheduler API on the selected host context backend. Defaults stay
+# Windows fibers on Windows and ucontext on macOS/Linux; Apple arm64 also has
+# the explicit aarch64 override. Standalone or PS3RECOMP_BUILD_TESTS.
 #
 #   cmake -S tests/fiber_switch -B build-fiber -G Ninja
 #   cmake --build build-fiber && ./build-fiber/fiber_switch
@@ -86,5 +86,30 @@ if(UNIX AND NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR AND TARGET ps
     foreach(mode init attributes lifecycle dispatch)
         add_test(NAME fiber_switch_worker_${mode} COMMAND fiber_worker "${mode}")
         set_tests_properties(fiber_switch_worker_${mode} PROPERTIES LABELS "fiber;t0;tsan" TIMEOUT 30)
+    endforeach()
+endif()
+
+# Reproduce each iOS ENOTSUP stub independently; the other calls stay libc's.
+if(UNIX AND NOT PS3RECOMP_FIBER_BACKEND STREQUAL "aarch64")
+    foreach(call getcontext swapcontext setcontext)
+        add_executable(fiber_host_failure_${call} main.c host_failure.c
+            "${PS3RECOMP_ROOT}/runtime/host/host_stubs.c")
+        if(call STREQUAL "getcontext")
+            set(op create)
+        elseif(call STREQUAL "swapcontext")
+            set(op resume)
+        else()
+            set(op exit)
+        endif()
+        # The reason names the failed call. main.c forks, runs the cases in the
+        # child and checks exit 70 and the exact stop line there.
+        target_compile_definitions(fiber_host_failure_${call} PRIVATE HF_FAIL_${call}=1
+            HF_EXPECT_OP="${op}" HF_EXPECT_REASON="${call}")
+        target_include_directories(fiber_host_failure_${call} PRIVATE
+            "${PS3RECOMP_TREE_ROOT}/libs/spurs" "${PS3RECOMP_TREE_ROOT}/include")
+        target_link_libraries(fiber_host_failure_${call} PRIVATE ps3recomp_runtime Threads::Threads)
+        set_target_properties(fiber_host_failure_${call} PROPERTIES LINKER_LANGUAGE CXX)
+        add_test(NAME fiber_host_failure_${call} COMMAND fiber_host_failure_${call})
+        set_tests_properties(fiber_host_failure_${call} PROPERTIES LABELS "runtime;fiber;t0" TIMEOUT 30)
     endforeach()
 endif()

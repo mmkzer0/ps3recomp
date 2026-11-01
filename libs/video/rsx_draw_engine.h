@@ -311,6 +311,12 @@ typedef struct rsx_draw_backend {
                                      float depth_value, u8 stencil,
                                      u32 x, u32 y, u32 w, u32 h);
 
+    /* Optional. Called before creating a BC1/2/3 texture, with its guest
+     * format byte, address domain/offset, and total compressed byte span.
+     * Returns only if supported; otherwise stops with the request metadata.
+     * NULL preserves the backend's existing assumption of BC support. */
+    void (*require_bc)(void* user, u32 format, u32 location, u32 offset, u32 size);
+
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */

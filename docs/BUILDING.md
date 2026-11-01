@@ -246,6 +246,7 @@ which is opt-in on Linux (`-DPS3RECOMP_RSX_VULKAN=ON`) while it grows:
 |------|---------|--------|--------|
 | Windows | **Direct3D 12** | `libs/video/rsx_d3d12_backend.c` | The reference path. Every in-tree port is developed and tested against it. |
 | macOS | Metal | `libs/video/rsx_metal_backend.m` | Linked against Metal / QuartzCore / Foundation / AppKit. |
+| iOS (Simulator PoC) | Metal in a UIKit `CAMetalLayer` view | `libs/video/rsx_metal_ios_display.m` | Experimental. The app owns UIKit; the RSX backend uses its drawable layer. |
 | Linux | null / headless software | `libs/video/` null path | The default. The guest command stream is executed and validated, but nothing is presented to a window. |
 | Linux (opt-in) | Vulkan | `libs/video/rsx_vulkan_backend.c` | Opt-in. With guest programs on (`PS3RECOMP_VK_GUEST_PROGRAMS=1`) it runs the title's shaders on the shared register-file draw engine, as Metal does; without them, the null backend's fixed-function contract. See below. |
 
@@ -435,6 +436,61 @@ library, runs all eight lifter suites plus the SPU helper tests, and drives
 **Link Libraries:**
 - `-lpthread` — POSIX threads (linked automatically by most CMake configurations)
 - `-lm` — Math library
+
+### iOS / iOS Simulator (experimental)
+
+The toolkit can be compiled as a dependency of an iOS title app. CMake 3.28+
+is required for direct XCFramework linking (the development host's 4.4.5
+supports SDK slice selection). Build both SDKs once into one external prefix:
+
+```sh
+IOS_DEPS=/absolute/path/to/ios-shaders
+tools/build_ios_shader_deps.sh "$IOS_DEPS"
+cmake -S . -B build/ios-simulator -G Xcode \
+  -DCMAKE_SYSTEM_NAME=iOS \
+  -DCMAKE_OSX_SYSROOT=iphonesimulator \
+  -DCMAKE_OSX_ARCHITECTURES=arm64 \
+  -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 \
+  -DCMAKE_PREFIX_PATH="$IOS_DEPS" \
+  -DPS3RECOMP_BUILD_TESTS=OFF
+cmake --build build/ios-simulator --config Debug \
+  --target ps3recomp_runtime --parallel 4
+```
+
+`build_ios_shader_deps.sh` fetches upstream source outside the repository and
+checks these pins before building static arm64 libraries for both SDKs:
+
+| Dependency | Upstream ref | Commit |
+|---|---|---|
+| glslang 16.6.0 | `16.6.0` | `e1b562a8bed273a02f30b59b66a5d499793cede5` |
+| SPIRV-Cross 1.4.363.0 | `vulkan-sdk-1.4.363.0` | `f11ba9f0b21ba8fc15153d50a2a1ae31ab1cf8f7` |
+| SPIRV-Tools | glslang `known_good.json` | `ef96ed763b43b59b33b31b362f09a02b729fa1c9` |
+| SPIRV-Headers | glslang `known_good.json` | `496543121ce6419f23d6fa5d7194ba66c36212d2` |
+
+The prefix contains `src`, `build/<sdk>`, `<sdk>/include`, `<sdk>/lib`, and
+`xcframeworks/*.xcframework`. Each XCFramework contains separate `iphoneos`
+and `iphonesimulator` arm64 archives, never a lipo merge. The script may be
+rerun against the same prefix; it prints each built or unchanged package.
+It builds glslang with HLSL and optimizer support, and SPIRV-Cross with its
+C API, GLSL and MSL backends, without CLI tools or tests. SPIRV-Tools' shared
+target is neither built nor packaged. CMake links the full static dependency
+closure, including glslang's SPIRV/OSDependent parts and optimizer.
+
+The iOS CMake search is restricted to `CMAKE_PREFIX_PATH`; it never falls
+back to Homebrew macOS libraries. For device builds use `iphoneos` instead
+of `iphonesimulator` with the same prefix. Signing belongs to the title app.
+The target keeps `SPVC_MSL_PLATFORM_IOS` and the same register-file renderer
+as macOS. SDL2 is omitted: input is neutral and there is no host audio output.
+
+These are local development builds only, not redistribution approval.
+The handoff flags composite glslang and SPIRV-Cross license metadata
+(including GPL-3.0-or-later for glslang's package); review the actual upstream
+components and license obligations before redistributing any title binary.
+The macOS Homebrew dependency path is unchanged.
+
+Apple describes Simulator's Metal feature and texture limits in
+[Developing Metal apps that run in Simulator](https://developer.apple.com/documentation/metal/developing-metal-apps-that-run-in-simulator).
+Simulator is for workflow prototyping, not validation of device GPU behavior.
 
 ### macOS
 

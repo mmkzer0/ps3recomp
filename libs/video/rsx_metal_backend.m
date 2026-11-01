@@ -63,9 +63,15 @@
 #include <unistd.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
-#include <servers/bootstrap.h>
+#if !TARGET_OS_IPHONE
+#  include <servers/bootstrap.h>
+#endif
 #include <IOSurface/IOSurfaceRef.h>
 #include "rsx_host_surface.h"
+#if TARGET_OS_IPHONE
+#  include "ps3emu/metal_ios_display.h"
+#include "rsx_metal_sampler_policy.h"
+#endif
 #include "rsx_commands.h"
 #include "rsx_metal_backend.h"
 #include "rsx_vertex_fetch.h"
@@ -93,7 +99,9 @@ static id<MTLCommandQueue> s_queue;
 static CAMetalLayer*       s_layer;      /* windowed only   */
 static id<MTLTexture>      s_offscreen;  /* headless only   */
 static id<MTLTexture>      s_depth;      /* depth + stencil, both surfaces  */
+#if !TARGET_OS_IPHONE
 static NSWindow*           s_window;
+#endif
 static int                 s_headless;
 static atomic_int          s_closed;
 #if !TARGET_OS_IPHONE
@@ -110,10 +118,13 @@ static u32                 s_height = 720;
  * paced by the in-flight semaphore exactly as windowed ones are -- and s_window
  * stays nil, so everything that is about the window is skipped. */
 static int                 s_host;
+#if !TARGET_OS_IPHONE
 static rsx_host_control*   s_host_ctl;
 static mach_port_t         s_host_port;          /* the launcher's service */
+static u32                 s_host_w, s_host_h;
+#endif
 static id<MTLTexture>      s_host_tex[RSX_HOST_SLOTS];
-static u32                 s_host_w, s_host_h, s_host_gen;
+static u32                 s_host_gen;
 static dispatch_source_t   s_host_watch;          /* the launcher's exit */
 
 /* Each initialization owns its counters. A drawable callback retained by the
@@ -503,6 +514,10 @@ static void mtl_latch_state(void* ud, const rsx_state* state)
 static void mtl_draw_arrays(void*, u32, u32, u32);
 static void mtl_draw_indexed(void*, u32, u32, u32);
 
+#if TARGET_OS_IPHONE
+/* Registered on macOS only: iOS refuses the vtable path (see init). */
+__attribute__((unused))
+#endif
 static rsx_backend s_backend_vtable = {
     .userdata           = NULL,
     .clear              = mtl_clear,
@@ -577,6 +592,7 @@ static int create_depth(void)
     return 0;
 }
 
+#if !TARGET_OS_IPHONE
 static int create_offscreen(void)
 {
     MTLTextureDescriptor* td =
@@ -588,6 +604,7 @@ static int create_offscreen(void)
     s_offscreen = [s_dev newTextureWithDescriptor:td];
     return s_offscreen ? 0 : -1;
 }
+#endif
 
 /* ---- host surfaces --------------------------------------------------------
  * PS3RECOMP_HOST_SURFACES=<bootstrap name>, set by the launcher
@@ -804,7 +821,6 @@ static void host_detach(void)
     s_host = 0;
 }
 #else
-static int  host_attach(u32 w, u32 h) { (void)w; (void)h; return -1; }
 static int  host_acquire(void) { return -1; }
 static void host_frame_done(int slot, u32 gen, int ok) { (void)slot; (void)gen; (void)ok; }
 static int  host_match_size(u32 w, u32 h) { (void)w; (void)h; return -1; }
@@ -3071,6 +3087,48 @@ static void eng_submit_and_wait(void* user, u32 reason)
 
 /* ---- resources ----------------------------------------------------------- */
 
+#if TARGET_OS_IPHONE
+static BOOL s_ios_supports_bc;
+static BOOL s_ios_supports_border;
+
+static void eng_ios_feature_stop(const char* what, const char* remedy,
+                                 const ps3_stop_field* fields, size_t count)
+{
+    /* Like fdump_list_too_long, standalone fixtures can omit the stop module. */
+    typedef void (*stop_fn)(int, const char*, const char*, const ps3_stop_field*, size_t, const ps3_stop_site*);
+    const stop_fn stop = (stop_fn)dlsym(RTLD_DEFAULT, "ps3_stop");
+    if (stop)
+        stop((int)PS3_STOP_GCM_UNMODELLED, what, remedy, fields, count, NULL);
+    fprintf(stderr, "[STOP] gcm-unmodelled: %s (%s)\n", what, remedy);
+    fprintf(stderr, "PS3STOP v=1 kind=gcm-unmodelled");
+    /* All fields supplied here are fixed tokens or hex/decimal numbers. */
+    for (size_t i = 0; i < count; i++)
+        fprintf(stderr, " %s=%s", fields[i].key, fields[i].value);
+    fputc('\n', stderr);
+    fflush(stderr);
+    _Exit(PS3_STOP_EXIT_CODE);
+}
+
+static void eng_require_bc(void* user, u32 format, u32 location, u32 offset, u32 size)
+{
+    (void)user;
+    if (s_ios_supports_bc) return;
+    char fmt[16], loc[16], off[16], bytes[16];
+    snprintf(fmt, sizeof fmt, "0x%02X", format);
+    snprintf(loc, sizeof loc, "%u", location);
+    snprintf(off, sizeof off, "0x%08X", offset);
+    snprintf(bytes, sizeof bytes, "0x%08X", size);
+    const ps3_stop_field fields[] = {
+        {"func", "eng_texture_upload"}, {"feature", "bc-texture-unsupported"},
+        {"format", fmt}, {"location", loc}, {"offset", off}, {"size", bytes},
+        {"reason", "device-lacks-bc-textures"}
+    };
+    eng_ios_feature_stop("the Metal device cannot sample the guest's BC texture",
+        "use a device with BC texture support or implement BC decoding to RGBA",
+        fields, sizeof fields / sizeof fields[0]);
+}
+#endif
+
 static u32 eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
                               u32 mips, u32 faces, u32 remap, u32 rsx_fmt)
 {
@@ -3524,15 +3582,22 @@ static int eng_aniso(void)
     return a;
 }
 
+#if TARGET_OS_IPHONE
+static int eng_sampler_slot(const rsx_be_sampler_desc* d, MTLPixelFormat format)
+#else
 static int eng_sampler_slot(const rsx_be_sampler_desc* d)
+#endif
 {
-    const u64 key = (u64)d->min_linear | ((u64)d->mag_linear << 1)
+    u64 key = (u64)d->min_linear | ((u64)d->mag_linear << 1)
                   | ((u64)d->mip_linear << 2) | ((u64)d->mip_present << 3)
                   | ((u64)d->wrap_s << 4) | ((u64)d->wrap_t << 8)
                   | ((u64)d->wrap_r << 12)
                   | ((u64)(u32)(d->min_lod * 256.0f) << 16)
                   | ((u64)(u32)(d->max_lod * 256.0f) << 32)
                   | ((u64)(d->border & 3u) << 56);
+#if TARGET_OS_IPHONE
+    key |= (u64)rsx_metal_format_has_alpha(format) << 58;
+#endif
     for (u32 i = 0; i < s_eng_samp_count; i++)
         if (s_eng_samp[i].key == key) return (int)i;
     if (s_eng_samp_count >= ENG_MAX_SAMPLERS) return -1;
@@ -3558,9 +3623,40 @@ static int eng_sampler_slot(const rsx_be_sampler_desc* d)
         if (sd.tAddressMode == MTLSamplerAddressModeClampToBorderColor) sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
         if (sd.rAddressMode == MTLSamplerAddressModeClampToBorderColor) sd.rAddressMode = MTLSamplerAddressModeClampToEdge;
     }
+#if TARGET_OS_IPHONE
+    if (sd.sAddressMode == MTLSamplerAddressModeClampToBorderColor ||
+        sd.tAddressMode == MTLSamplerAddressModeClampToBorderColor ||
+        sd.rAddressMode == MTLSamplerAddressModeClampToBorderColor) {
+        const rsx_metal_border_mode mode =
+            rsx_metal_border_policy(format, d->border, s_ios_supports_border);
+        if (mode == RSX_METAL_BORDER_UNSUPPORTED) {
+            char pixel_format[16], border[16];
+            snprintf(pixel_format, sizeof pixel_format, "%lu", (unsigned long)format);
+            snprintf(border, sizeof border, "%u", d->border);
+            const ps3_stop_field fields[] = {
+                {"func", "eng_sampler_slot"}, {"feature", "sampler-border-unsupported"},
+                {"pixel_format", pixel_format}, {"border", border},
+                {"reason", "device-lacks-border-color"}
+            };
+            eng_ios_feature_stop("the Metal device cannot represent the guest sampler border",
+                "use a device with border-colour support or implement exact border sampling",
+                fields, sizeof fields / sizeof fields[0]);
+        }
+        if (mode == RSX_METAL_BORDER_ZERO) {
+            if (sd.sAddressMode == MTLSamplerAddressModeClampToBorderColor) sd.sAddressMode = MTLSamplerAddressModeClampToZero;
+            if (sd.tAddressMode == MTLSamplerAddressModeClampToBorderColor) sd.tAddressMode = MTLSamplerAddressModeClampToZero;
+            if (sd.rAddressMode == MTLSamplerAddressModeClampToBorderColor) sd.rAddressMode = MTLSamplerAddressModeClampToZero;
+        } else {
+            sd.borderColor = d->border == 2 ? MTLSamplerBorderColorOpaqueWhite
+                           : d->border == 1 ? MTLSamplerBorderColorOpaqueBlack
+                                            : MTLSamplerBorderColorTransparentBlack;
+        }
+    }
+#else
     sd.borderColor  = d->border == 2 ? MTLSamplerBorderColorOpaqueWhite
                     : d->border == 1 ? MTLSamplerBorderColorOpaqueBlack
                                      : MTLSamplerBorderColorTransparentBlack;
+#endif
     if (d->min_linear && d->mip_present && eng_aniso() > 1)
         sd.maxAnisotropy = (NSUInteger)eng_aniso();
     id<MTLSamplerState> s = [s_dev newSamplerStateWithDescriptor:sd];
@@ -3605,7 +3701,12 @@ static void eng_bind_textures(void* user, const u32* textures,
     (void)user;
     for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
         s_eng_pending.tex[u]  = ((mask >> u) & 1u) ? textures[u] : 0;
+#if TARGET_OS_IPHONE
+        s_eng_pending.samp[u] = ((mask >> u) & 1u) ?
+            eng_sampler_slot(&samplers[u], [eng_obj(textures[u]) pixelFormat]) : -1;
+#else
         s_eng_pending.samp[u] = ((mask >> u) & 1u) ? eng_sampler_slot(&samplers[u]) : -1;
+#endif
     }
 }
 
@@ -3615,7 +3716,12 @@ static void eng_bind_vertex_textures(void* user, const u32* textures,
     (void)user;
     for (u32 u = 0; u < RSX_BE_MAX_VERTEX_TEXTURES; u++) {
         s_eng_pending.vtex[u]  = ((mask >> u) & 1u) ? textures[u] : 0;
+#if TARGET_OS_IPHONE
+        s_eng_pending.vsamp[u] = ((mask >> u) & 1u) ?
+            eng_sampler_slot(&samplers[u], [eng_obj(textures[u]) pixelFormat]) : -1;
+#else
         s_eng_pending.vsamp[u] = ((mask >> u) & 1u) ? eng_sampler_slot(&samplers[u]) : -1;
+#endif
     }
 }
 
@@ -4709,6 +4815,9 @@ static const rsx_draw_backend s_engine_backend = {
     .texture_create       = eng_texture_create,
     .texture_upload       = eng_texture_upload,
     .texture_release      = eng_obj_release,
+#if TARGET_OS_IPHONE
+    .require_bc           = eng_require_bc,
+#endif
     .texture_create_3d    = eng_texture_create_3d,
     .texture_upload_3d    = eng_texture_upload_3d,
     .color_target_create  = eng_color_target_create,
@@ -4781,12 +4890,50 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
 
         const char* hl = getenv("PS3RECOMP_METAL_HEADLESS");
         s_headless = (hl && *hl && *hl != '0');
+#if TARGET_OS_IPHONE
+        /* There is no offscreen path on iOS: the surface is the UIKit view.
+         * A headless request that was ignored would run windowed while the
+         * title's frame clock, which reads the same variable, paced a
+         * headless run. Refuse it by name, as every init failure here does. */
+        if (s_headless) {
+            s_headless = 0;
+            fprintf(stderr, "[RSX metal] PS3RECOMP_METAL_HEADLESS is set, but iOS has no "
+                            "offscreen path; unset it\n");
+            return -1;
+        }
+#endif
 
         s_dev = MTLCreateSystemDefaultDevice();
         if (!s_dev) {
             fprintf(stderr, "[RSX metal] no Metal device available\n");
             return -1;
         }
+#if TARGET_OS_IPHONE
+        s_ios_supports_bc = [s_dev supportsBCTextureCompression];
+        /* Apple's Metal feature table: border colour starts at Apple7. */
+        s_ios_supports_border = [s_dev supportsFamily:MTLGPUFamilyApple7];
+        fprintf(stderr, "[RSX metal] supportsBCTextureCompression=%d\n", (int)s_ios_supports_bc);
+        fprintf(stderr, "[RSX metal] supports32BitFloatFiltering=%d supportsFamilyApple9=%d\n",
+                (int)[s_dev supports32BitFloatFiltering],
+                (int)[s_dev supportsFamily:MTLGPUFamilyApple9]);
+        unsigned apple_family = 0;
+        for (NSUInteger family = MTLGPUFamilyApple10; family >= MTLGPUFamilyApple1; family--) {
+            if ([s_dev supportsFamily:(MTLGPUFamily)family]) {
+                apple_family = (unsigned)(family - MTLGPUFamilyApple1 + 1);
+                break;
+            }
+        }
+        mach_task_basic_info_data_t memory;
+        mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+        const kern_return_t memory_status = task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                                                      (task_info_t)&memory, &count);
+        fprintf(stderr, "[RSX metal] borderColor=%d gpuFamilyApple=%u gpuFamilyMac2=%d"
+                        " vm_base=%p resident_bytes=%llu memory_status=%d\n",
+                (int)s_ios_supports_border, apple_family,
+                (int)[s_dev supportsFamily:MTLGPUFamilyMac2], (void*)vm_base,
+                memory_status == KERN_SUCCESS ? (unsigned long long)memory.resident_size : 0,
+                (int)memory_status);
+#endif
         s_queue = [s_dev newCommandQueue];
         if (!s_queue) {
             fprintf(stderr, "[RSX metal] could not create command queue\n");
@@ -4795,8 +4942,10 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
 
         int rc;
 #if TARGET_OS_IPHONE
-        s_headless = 1;
-        rc = create_offscreen();
+        (void)title;
+        /* The app delegate installed the UIKit view before the guest starts. */
+        s_layer = ps3recomp_metal_ios_configure_layer(s_dev, s_width, s_height);
+        rc = s_layer ? 0 : -1;
 #else
         /* Under a launcher (tools/host_window) the window is the launcher's.
          * Without an answer from it the run is not lost: it opens a window of
@@ -4861,12 +5010,34 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
          * passes both ways. PS3RECOMP_RSX_ENGINE=vtable is the way back, and
          * it stays that way until the vtable path has nothing left to say. */
         rsx_draw_engine_set_default(1);
+#if TARGET_OS_IPHONE
+        /* The BC and border-sampler guards live on the engine path only. The
+         * vtable path would hand a BC texture to a device that cannot hold it
+         * and end in a Metal validation abort, so on iOS it is not an option,
+         * neither by PS3RECOMP_RSX_ENGINE=vtable nor as a fallback. */
+        if (!rsx_draw_engine_enabled()) {
+            fprintf(stderr, "[RSX metal] PS3RECOMP_RSX_ENGINE selects the vtable path, which "
+                            "has no BC or border-sampler guard; iOS runs the draw engine only\n");
+            s_ready = 0;
+            rsx_draw_engine_set_backend(NULL);
+            return -1;
+        }
+        if (rsx_draw_engine_init(s_width, s_height) != 0) {
+            fprintf(stderr, "[RSX metal] draw engine init failed; iOS has no vtable fallback "
+                            "(it has no BC or border-sampler guard)\n");
+            s_ready = 0;
+            rsx_draw_engine_set_backend(NULL);
+            return -1;
+        }
+        s_eng_active = 1;
+#else
         if (rsx_draw_engine_enabled() &&
             rsx_draw_engine_init(s_width, s_height) == 0) {
             s_eng_active = 1;
         } else {
             rsx_set_backend(&s_backend_vtable);
         }
+#endif
         if (s_eng_active && rsx_capture_install_from_config) {
             rsx_capture_environment env;
             rsx_metal_backend_capture_environment(&env);
