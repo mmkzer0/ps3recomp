@@ -291,6 +291,7 @@ with tempfile.TemporaryDirectory() as tmp:
 
 # jq2 job queues: queue, worker and seq live in who/a/b; a fiber wait has no waiter id.
 JQ2_PUSH, JQ2_JOB, JQ2_CREDIT, JQ2_SYNC_WAIT, JQ2_IDLE = 22, 23, 24, 25, 26
+JQ2_HELD, JQ2_BARRIER = 27, 28
 EVF, FIBER = 1, 2
 
 
@@ -518,13 +519,159 @@ with tempfile.TemporaryDirectory() as tmp:
     check(c["parked_while_pending"] == {"count": 2, "total_ms": 2},
           f"jq2 clip: the parked-while-pending total is clipped too {c['parked_while_pending']}")
 
-    # A trace without kinds 22-26 prints no section and has a null key.
+    # A trace without kinds 22-28 prints no section and has a null key.
     plain = [span(FLIP_REQ, 1, 0, 0, t, t) for t in (0, 20, 40)]
     rc, out, err = run(tmp, trace(plain), "--json")
     check(rc == 0 and json.loads(out)["jq2"] is None, "jq2: trace without the kinds has a null key")
     rc, out, err = run(tmp, trace(plain))
     check(rc == 0 and "SPURS job queues" not in out and "jq2" not in out,
           "jq2: trace without the kinds prints no section")
+
+# Kinds 27/28: held vs ready wait, park reasons, depth buckets, barriers and the legacy note, all
+# hand-counted. seq 1 is never held, seq 2 and 3 each wait for a SYNC barrier, seq 4 has no job, seq 5 has
+# no push, seq 6 has no job; the parks cover every reason plus a legacy 0. Queue 1 holds one job admissible
+# for 20 ms while its two workers cover every kind of ready wait: a worker parked, both workers in a JOB
+# span, and neither.
+park = [span(FLIP_REQ, 1, 0, 0, t, t) for t in (0, 100, 200)]
+park += [
+    span(JQ2_PUSH, 1, 1, 0 | 1 << 8, 0, 1),                          # seq 1, depth 1
+    span(JQ2_HELD, qword(0, 0), 1, 0, 0.5, 0.5),                     # never held
+    span(JQ2_JOB, qword(0, 0), 1, 1000, 2, 6),                       # ready wait 1.5, wall 4
+    span(JQ2_PUSH, 1, 2, 0 | 3 << 8, 10, 11),                        # seq 2, depth 3
+    span(JQ2_HELD, qword(0, 1), 2, 1 | 1 << 4 | 2 << 8, 10.5, 16),   # tag 1, held 5.5, mask 0x0002
+    span(JQ2_JOB, qword(0, 1), 2, 500, 20, 22),                      # ready wait 4
+    span(JQ2_PUSH, 1, 3, 0 | 2 << 8, 30, 31),                        # seq 3, depth 2
+    span(JQ2_HELD, qword(0, 0), 3, 2 | 1 << 4 | 4 << 8, 30.5, 40),   # tag 2, held 9.5, mask 0x0004
+    span(JQ2_JOB, qword(0, 0), 3, 500, 45, 46),                      # ready wait 5
+    span(JQ2_PUSH, 1, 4, 0 | 1 << 8, 50, 51),                        # seq 4: no job
+    span(JQ2_JOB, qword(0, 1), 5, 500, 60, 61),                      # seq 5: no push, no HELD
+    span(JQ2_HELD, qword(0, 0), 6, 0, 12, 14),                       # seq 6: held 2, no job
+    span(JQ2_BARRIER, qword(0, 0), 2 | 2 << 16, 0 | 1 << 8, 11, 15),
+    span(JQ2_BARRIER, qword(0, 1), 4 | 4 << 16, 0 | 3 << 8, 31, 39.5),
+    span(JQ2_IDLE, qword(0, 0), 0 | 1 << 24, 0, 0, 5),               # reason 1 empty, 5 ms
+    span(JQ2_IDLE, qword(0, 1), 2 | 5 << 24, 0, 12, 14),             # reason 5 paused, 2 ms
+    span(JQ2_IDLE, qword(0, 0), 3 | 3 << 24, 0, 18, 19.5),           # reason 3 held, 1.5 ms
+    span(JQ2_IDLE, qword(0, 1), 1 | 4 << 24, 0, 41, 44),             # reason 4 no-slot, 3 ms
+    span(JQ2_IDLE, qword(0, 0), 0, 0, 100, 105),                     # legacy reason 0, 5 ms
+    span(JQ2_IDLE, qword(0, 1), 2 | 2 << 24, 0, 150, 160),           # reason 2 unwritten, 10 ms
+    # Queue 1: 100-102, 104-106 and 110-120 have neither worker parked and not both busy (transition),
+    # 102-104 has a worker parked, and 106-110 and 116-118 have both workers inside a JOB span (capacity).
+    span(JQ2_PUSH, 1, 1, 1 | 1 << 8, 98, 99),                        # queue 1, seq 1, depth 1
+    span(JQ2_HELD, qword(1, 0), 1, 0 | 1 << 4 | 1 << 8, 98.5, 100),  # tag 0, cause 1, mask 0x0001
+    span(JQ2_JOB, qword(1, 0), 1, 500, 120, 122),                    # ready wait 20 ms, w0
+    span(JQ2_JOB, qword(1, 1), 2, 500, 104, 112),                    # w1 busy 104-112
+    span(JQ2_JOB, qword(1, 0), 3, 500, 106, 110),                    # w0 busy 106-110
+    span(JQ2_JOB, qword(1, 0), 4, 500, 116, 118),                    # w0 busy 116-118
+    span(JQ2_JOB, qword(1, 1), 5, 500, 116, 118),                    # w1 busy 116-118
+    span(JQ2_IDLE, qword(1, 0), 1 | 3 << 24, 0, 102, 104),           # w0 parked with work pending, 2 ms
+]
+
+with tempfile.TemporaryDirectory() as tmp:
+    rc, out, err = run(tmp, jq2_trace(park), "--json")
+    check(rc == 0, f"jq2 parking: exit 0: {err}")
+    p = json.loads(out)["jq2"]["queues"][0]
+    check(p["decomposition_available"] is True, "jq2 parking: the decomposition is available")
+    reasons = {r["reason"]: r for r in p["park_reasons"]}
+    check(sorted(reasons) == [0, 1, 2, 3, 4, 5], f"jq2 parking: reasons {sorted(reasons)}")
+    idle_total = 26.5
+    check(close(reasons[0]["total_ms"], 5) and close(reasons[1]["total_ms"], 5) and
+          close(reasons[2]["total_ms"], 10) and close(reasons[3]["total_ms"], 1.5) and
+          close(reasons[4]["total_ms"], 3) and close(reasons[5]["total_ms"], 2),
+          f"jq2 parking: reason totals {[reasons[r]['total_ms'] for r in sorted(reasons)]}")
+    check(close(reasons[0]["share"], 5 / idle_total) and close(reasons[2]["share"], 10 / idle_total),
+          "jq2 parking: reason shares of the idle time")
+    check(reasons[0]["pending_count"] == 0 and reasons[1]["pending_count"] == 0 and
+          reasons[2]["pending_count"] == 1 and close(reasons[2]["pending_ms"], 10) and
+          reasons[3]["pending_count"] == 1 and close(reasons[3]["pending_ms"], 1.5) and
+          reasons[4]["pending_count"] == 1 and reasons[5]["pending_count"] == 1,
+          "jq2 parking: the depth in the low 24 bits decides pending")
+    check(p["parked_while_pending"] == {"count": 4, "total_ms": 16.5},
+          f"jq2 parking: parked while pending {p['parked_while_pending']}")
+
+    dec = p["latency_decomposition"]
+    held, ready = dec["held_ms"], dec["ready_wait_ms"]
+    check(held["count"] == 3 and close(held["mean"], 5) and close(held["p50"], 5.5) and
+          close(held["p95"], 9.5) and close(held["max"], 9.5), f"jq2 parking: held {held}")
+    check(ready["count"] == 3 and close(ready["mean"], 3.5) and close(ready["p50"], 4) and
+          close(ready["p95"], 5) and close(ready["max"], 5), f"jq2 parking: ready wait {ready}")
+    check(close(dec["held_share"], 15 / 25.5) and close(dec["ready_share"], 10.5 / 25.5),
+          f"jq2 parking: held/ready shares {dec['held_share']} {dec['ready_share']}")
+    check(dec["ready_wait_clamped"] == 0, "jq2 parking: no ready wait clamped")
+    rs = dec["ready_wait_split"]
+    check(close(rs["parked_ms"], 6) and close(rs["all_busy_ms"], 0) and
+          close(rs["transition_ms"], 4.5) and close(rs["total_ms"], 10.5) and
+          close(rs["parked_share"], 6 / 10.5) and close(rs["all_busy_share"], 0) and
+          close(rs["transition_share"], 4.5 / 10.5),
+          f"jq2 parking: ready wait split {rs}")
+    check(dec["join_failures"] == {"held_without_job": 1, "job_without_held": 1},
+          f"jq2 parking: held joins {dec['join_failures']}")
+    ct = p["counts_over_time"]
+    check(close(ct["held"]["mean"], 17 / 200) and ct["held"]["max"] == 2,
+          f"jq2 parking: held jobs over time {ct['held']}")
+    check(close(ct["ready"]["mean"], 10.5 / 200) and ct["ready"]["max"] == 1,
+          f"jq2 parking: admissible jobs over time {ct['ready']}")
+    buckets = {b["bucket"]: b for b in p["depth_buckets"]}
+    check(sorted(buckets) == ["1", "17-64", "2-4", "5-16", "65+"], f"jq2 parking: buckets {sorted(buckets)}")
+    check(buckets["1"]["jobs"] == 1 and buckets["1"]["held_jobs"] == 1 and
+          buckets["1"]["held_by_barrier"] == 0 and
+          close(buckets["1"]["mean_held_ms"], 0) and close(buckets["1"]["mean_ready_wait_ms"], 1.5),
+          f"jq2 parking: depth 1 {buckets['1']}")
+    check(buckets["2-4"]["jobs"] == 2 and buckets["2-4"]["held_jobs"] == 2 and
+          buckets["2-4"]["held_by_barrier"] == 2 and close(buckets["2-4"]["mean_held_ms"], 7.5) and
+          close(buckets["2-4"]["mean_ready_wait_ms"], 4.5), f"jq2 parking: depth 2-4 {buckets['2-4']}")
+    check(buckets["5-16"]["jobs"] == 0 and buckets["5-16"]["mean_held_ms"] is None,
+          "jq2 parking: an empty depth bucket keeps its slot")
+    bd = p["barriers"]
+    check(bd["count"] == 2 and close(bd["rate_per_s"], 10), f"jq2 parking: barrier count and rate {bd}")
+    check(close(bd["duration_ms"]["mean"], 6.25) and close(bd["duration_ms"]["p50"], 4) and
+          close(bd["duration_ms"]["p95"], 8.5) and close(bd["duration_ms"]["max"], 8.5) and
+          close(bd["waited_mean"], 2), f"jq2 parking: barrier durations {bd}")
+    masks = bd["top_masks"]
+    check([m["mask"] for m in masks] == [4, 2] and close(masks[0]["total_held_ms"], 9.5) and
+          close(masks[1]["total_held_ms"], 5.5) and masks[0]["jobs"] == 1,
+          f"jq2 parking: top masks {masks}")
+
+    # Queue 1 covers the three-way split: 20 ms of ready wait, 2 ms with a worker parked, 6 ms with both
+    # workers in a JOB span and 12 ms with neither.
+    q1 = json.loads(out)["jq2"]["queues"][1]
+    check(q1["pushes"] == 1 and q1["jobs"] == 5 and q1["workers"] == 2,
+          f"jq2 split queue: {q1['pushes']} pushes, {q1['jobs']} jobs, {q1['workers']} workers")
+    dec1 = q1["latency_decomposition"]
+    rs1 = dec1["ready_wait_split"]
+    check(close(rs1["total_ms"], 20) and close(rs1["parked_ms"], 2) and
+          close(rs1["all_busy_ms"], 6) and close(rs1["transition_ms"], 12),
+          f"jq2 three-way split: {rs1}")
+    check(close(rs1["parked_share"], 0.1) and close(rs1["all_busy_share"], 0.3) and
+          close(rs1["transition_share"], 0.6), f"jq2 three-way split shares: {rs1}")
+    check(dec1["join_failures"] == {"held_without_job": 0, "job_without_held": 4},
+          f"jq2 split queue joins: {dec1['join_failures']}")
+    b1 = {b["bucket"]: b for b in q1["depth_buckets"]}["1"]
+    check(b1["jobs"] == 1 and b1["held_jobs"] == 1 and b1["held_by_barrier"] == 1 and
+          close(b1["mean_held_ms"], 1.5) and close(b1["mean_ready_wait_ms"], 20),
+          f"jq2 depth 1 with a HELD span: {b1}")
+
+    rc, out, err = run(tmp, jq2_trace(park))
+    check(rc == 0 and "park reason  3 held" in out and "held (visible->admissible)" in out and
+          "ready wait split: 6.00 ms with a worker parked = 57 %; 0.00 ms with every worker busy = 0 %;"
+          " 4.50 ms in transition = 43 %" in out and
+          "ready wait split: 2.00 ms with a worker parked = 10 %; 6.00 ms with every worker busy = 30 %;"
+          " 12.00 ms in transition = 60 %" in out and
+          "1 with a HELD span (0 held by a barrier)" in out and
+          "2 with a HELD span (2 held by a barrier)" in out and
+          "1 with a HELD span (1 held by a barrier)" in out and
+          "barriers: 2 = 10.00/s" in out and "held/admissible decomposition needs" not in out,
+          "jq2 parking text: the decomposition rows")
+
+    # A trace without kinds 27/28 keeps the old section and says the decomposition needs them.
+    rc, out, err = run(tmp, jq2_trace(jq2))
+    check(rc == 0 and "held/admissible decomposition needs kinds 27-28" in out and "park reason" not in out,
+          "jq2 legacy text: one note line, no decomposition rows")
+    rc, out, err = run(tmp, jq2_trace(jq2), "--json")
+    legacy = json.loads(out)["jq2"]["queues"][0]
+    check(legacy["decomposition_available"] is False and legacy["latency_decomposition"] is None and
+          legacy["park_reasons"] == [] and legacy["barriers"] is None and
+          legacy["counts_over_time"] is None and legacy["depth_buckets"] is None,
+          "jq2 legacy: the decomposition keys carry nothing")
 
 print("ftrace_report: %s" % ("ok" if not failures else "%d failed" % failures))
 sys.exit(1 if failures else 0)

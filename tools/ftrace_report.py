@@ -41,7 +41,7 @@ and shares but no rates.
               drain, rest -- a drawable wait lies inside a drain pass, so the order
               keeps one millisecond from being counted twice.
 
-A third section, SPURS job queues (jq2, kinds 22-26), splits a job's wait into
+A third section, SPURS job queues (jq2, kinds 22-28), splits a job's wait into
 its links, per queue: pushes and push rate; queue latency (JOB t0 - PUSH t1),
 execution wall and thread CPU time, completion delay (CREDIT t0 - JOB t1) and
 sync latency (CREDIT t1 to the blocked thread running again), each with count,
@@ -50,15 +50,27 @@ the recorder's window (the header's start_us..end_us, one denominator for every
 queue, so the shares compare; the queue's own extent only when the header names
 none, and which one was used is printed), each busy or idle span clipped to
 that window before it is summed; the number of workers seen; queue depth from
-the push; parks while work was pending; sync waits per PPU tid.
+the push; parks while work was pending; sync waits per PPU tid. IDLE's a is a
+depth in its low 24 bits and a park reason in the top byte (0 unrecorded, 1
+empty, 2 unwritten, 3 held, 4 no-slot, 5 paused, 15 unclassified), reported as
+count, time and share of idle time per reason. HELD and BARRIER (kinds 27, 28)
+split the queue wait into held (guest ordering: a SYNC barred the job's tag)
+and ready wait (host: admissible and not admitted), each with mean/p50/p95 and
+its share, the ready wait split per job into time with a worker of the queue
+parked (avoidable host scheduling), time with every worker in a JOB span
+(capacity) and the rest (workers in transition), the number of held and
+admissible jobs over time, the same by depth at push with how many of those
+jobs a barrier actually held, and the barriers with their rate, duration and
+the masks that held the most time.
 Push, job and credit are joined on (q, seq): seq counts per queue, so a join on
 seq alone pairs one queue's push with another's job. Sync latency joins on
 (q, waiter) against the last event-flag credit inside the wait; a fiber wait
 carries no waiter id (0xFF, wake 2), so it is reported apart and is not a join
 failure. A queue latency is clamped at 0 when a worker admitted a job before
 the push span ended, and the clamped joins are counted. A join that finds no
-partner is counted, never dropped. A trace without kinds 22-26 prints no such
-section and its JSON key is null.
+partner is counted, never dropped. A trace without kinds 22-28 prints no such
+section and its JSON key is null; a trace without kinds 27-28 prints the
+section it always did plus a line that the decomposition needs them.
 
 Without --json it then draws a few frames as a timeline (one column per
 --ms-per-col ms):
@@ -81,9 +93,13 @@ import sys
 (SYSCALL, USLEEP, SPU_WAIT, SPU_BUSY, SEMA, SEMA_GAVEUP, DRAIN, FLIP_FIFO, FLIP_REQ, PRESENT,
  GPU_ENCODE, GPU_WAIT, READBACK, GPU_EXEC, HLE, DRAWABLE, LABEL_WAIT,
  AUDIO_MIX, AUDIO_PACE, AUDIO_UNDERRUN, AUDIO_STALE,
- JQ2_PUSH, JQ2_JOB, JQ2_CREDIT, JQ2_SYNC_WAIT, JQ2_IDLE) = range(1, 27)
+ JQ2_PUSH, JQ2_JOB, JQ2_CREDIT, JQ2_SYNC_WAIT, JQ2_IDLE, JQ2_HELD, JQ2_BARRIER) = range(1, 29)
 AUDIO_PACE_REASON = {1: "queue full", 2: "clock pacing", 3: "backend wait"}
 JQ2_FIBER_WAKE = 2       # wake field of a fiber wait or wake; it carries waiter 0xFF, so it cannot be joined
+JQ2_PARK_REASONS = {0: "unrecorded", 1: "empty", 2: "unwritten", 3: "held", 4: "no-slot", 5: "paused",
+                    15: "unclassified"}   # kind 26's top byte, first match wins
+JQ2_DEPTH_BUCKETS = ("1", "2-4", "5-16", "17-64", "65+")  # PUSH depth, b >> 8
+JQ2_IDLE_DEPTH = 0xFFFFFF  # kind 26: depth at park | reason << 24
 GPU_WAIT_KIND = {0: "gpu wait (flush)", 1: "gpu wait (present)", 2: "gpu wait (in-flight)"}
 GPU_WAIT_INFLIGHT = 2
 SPINS_SLEEPING = 64      # cellGcmSys.c yields for 64 spins, then sleeps 1 ms per spin
@@ -796,8 +812,69 @@ def jq2_ranks(xs):
     return nearest_rank(s, 50), nearest_rank(s, 95), nearest_rank(s, 99)
 
 
+def jq2_depth_bucket(depth):
+    """The contract's PUSH depth buckets: 1, 2-4, 5-16, 17-64, 65+."""
+    if depth <= 1:
+        return "1"
+    if depth <= 4:
+        return "2-4"
+    if depth <= 16:
+        return "5-16"
+    if depth <= 64:
+        return "17-64"
+    return "65+"
+
+
+def jq2_open_counts(intervals, w0, w1):
+    """Time-weighted mean and max of the number of `intervals` open at once over [w0, w1].
+
+    The intervals are half-open, so a job admissible at t is not counted as held at t and the
+    boundary where one job's held interval ends and its ready interval begins counts neither.
+    """
+    events = []
+    for a, b in intervals:
+        a, b = max(a, w0), min(b, w1)
+        if b > a:
+            events.append((a, 1))
+            events.append((b, -1))
+    events.sort()
+    area, cur, peak, last = 0.0, 0, 0, None
+    for t, delta in events:
+        if last is not None and cur > 0:
+            area += cur * (t - last)
+        last, cur = t, cur + delta
+        peak = max(peak, cur)
+    return {"mean": area / (w1 - w0) if w1 > w0 else None, "max": peak}
+
+
+def jq2_overlap_len(a0, a1, iv):
+    """The time of [a0, a1] inside the disjoint sorted intervals iv."""
+    total = 0.0
+    for b0, b1 in iv:
+        if b1 <= a0:
+            continue
+        if b0 >= a1:
+            break
+        total += min(a1, b1) - max(a0, b0)
+    return total
+
+
+def jq2_intersect(a, b):
+    """The intersection of two disjoint sorted interval lists, as a disjoint sorted list."""
+    out, i, j = [], 0, 0
+    while i < len(a) and j < len(b):
+        lo, hi = max(a[i][0], b[j][0]), min(a[i][1], b[j][1])
+        if hi > lo:
+            out.append((lo, hi))
+        if a[i][1] < b[j][1]:
+            i += 1
+        else:
+            j += 1
+    return out
+
+
 def jq2_section(spans, header, names=None):
-    """The SPURS job queue (jq2) section, or None when the trace has no kinds 22-26.
+    """The SPURS job queue (jq2) section, or None when the trace has no kinds 22-28.
 
     Queue latency, execution wall and CPU, and completion delay are keyed on (q, seq):
     seq counts per queue and every queue starts at 1, so a join that ignores q pairs one
@@ -808,12 +885,22 @@ def jq2_section(spans, header, names=None):
     reported apart rather than miscounted against the event flag. A join that finds no
     partner is counted, never dropped: a span cut off at a window edge loses its
     partner, and hiding that would make the latencies look better than the trace is.
+
+    Kinds 27 (HELD) and 28 (BARRIER) split a job's wait into the part the guest ordered
+    (a SYNC barrier held its tag) and the part the host owes (it was admissible and a
+    worker did not take it): held = HELD.t1 - HELD.t0, ready wait = JOB.t0 - HELD.t1,
+    both joined on (q, seq). The ready wait is split per job by the queue's own spans:
+    time with a worker parked (IDLE), time with every worker of the queue in a JOB span
+    (capacity), and the rest (workers in transition). Per job, so the three parts add
+    up to the summed ready wait inside the recorder's window. A trace without the two
+    kinds (a recording made before them) reports the old section and says the
+    decomposition needs them.
     """
-    js = [s for s in spans if JQ2_PUSH <= s[0] <= JQ2_IDLE]
+    js = [s for s in spans if JQ2_PUSH <= s[0] <= JQ2_BARRIER]
     if not js:
         return None
     by_q = collections.defaultdict(lambda: {"push": [], "job": [], "credit": [], "wait": [],
-                                            "idle": [], "bounds": []})
+                                            "idle": [], "held": [], "barrier": [], "bounds": []})
     for k, who, a, b, t0, t1 in js:
         if k == JQ2_PUSH:                 # who = tid, a = seq, b = q | depth << 8
             g = by_q[b & 0xFF]
@@ -821,22 +908,29 @@ def jq2_section(spans, header, names=None):
         elif k == JQ2_SYNC_WAIT:          # who = tid, a = waiter | wake << 8 | mode << 16, b = q
             g = by_q[b & 0xFF]
             g["wait"].append((who, a & 0xFF, a >> 8 & 0xFF, t0, t1))
-        else:                             # who = q << 8 | w, a = seq
+        else:                             # who = q << 8 | w
             g = by_q[who >> 8]
-            if k == JQ2_JOB:              # b = thread CPU time, us
+            if k == JQ2_JOB:              # a = seq, b = thread CPU time, us
                 g["job"].append((who & 0xFF, a, b, t0, t1))
-            elif k == JQ2_CREDIT:         # b = waiter | wake << 8 | due << 16
+            elif k == JQ2_CREDIT:         # a = seq, b = waiter | wake << 8 | due << 16
                 g["credit"].append((who & 0xFF, a, b, t0, t1))
-            else:                         # JQ2_IDLE: a = depth at park, b = depth at wake
+            elif k == JQ2_HELD:           # a = seq, b = tag | cause << 4 | mask << 8
+                g["held"].append((who & 0xFF, a, b, t0, t1))
+            elif k == JQ2_BARRIER:        # a = tags | mask << 16, b = q | waited << 8
+                g["barrier"].append((who & 0xFF, a, b, t0, t1))
+            else:                         # JQ2_IDLE: a = depth | reason << 24, b = depth at wake
                 g["idle"].append((who & 0xFF, a, b, t0, t1))
         g["bounds"].append((t0, t1))
 
     queues = []
     hw = header_window(header)
+    # Kind 27 and 28 are what the decomposition rests on; a trace that predates them has neither, and its
+    # section stays as it was plus one note line.
+    has_decomp = any(k in (JQ2_HELD, JQ2_BARRIER) for k, _, _, _, _, _ in js)
     for q in sorted(by_q):
         g = by_q[q]
         pushes, jobs, credits = g["push"], g["job"], g["credit"]
-        waits, idles = g["wait"], g["idle"]
+        waits, idles, held, barriers = g["wait"], g["idle"], g["held"], g["barrier"]
         w0 = min(t0 for t0, _ in g["bounds"])
         w1 = max(t1 for _, t1 in g["bounds"])
         # One window for every queue: the recorder's, so the shares compare; the queue's
@@ -904,13 +998,119 @@ def jq2_section(spans, header, names=None):
         for w, _, _, it0, it1 in idles:
             idle_ms[w] += overlap(it0, it1, win_start, win_end)
         workers = sorted(set(busy) | set(idle_ms))
-        parked = [overlap(t0, t1, win_start, win_end) for _, depth, _, t0, t1 in idles if depth > 0]
+        parked = [overlap(t0, t1, win_start, win_end) for _, a, _, t0, t1 in idles
+                  if a & JQ2_IDLE_DEPTH]  # depth at park is the low 24 bits of a
 
         depths = sorted(p[3] for p in pushes)
         waits_by_tid = collections.defaultdict(list)
         for tid, _, _, t0, t1 in waits:
             waits_by_tid[tid].append(t1 - t0)
         total_wall = sum(wall)
+
+        # Park reasons (kind 26's top byte), summed in the same clipped window as the idle time above
+        # so the shares add up to the idle the report shows.
+        idle_total = sum(idle_ms.values())
+        parks = {}
+        for _, a, _, it0, it1 in idles:
+            row = parks.setdefault(a >> 24, {"count": 0, "total_ms": 0.0, "pending_count": 0,
+                                             "pending_ms": 0.0})
+            span_ms = overlap(it0, it1, win_start, win_end)
+            row["count"] += 1
+            row["total_ms"] += span_ms
+            if a & JQ2_IDLE_DEPTH:
+                row["pending_count"] += 1
+                row["pending_ms"] += span_ms
+        park_reasons = [
+            {"reason": reason, "name": JQ2_PARK_REASONS.get(reason, f"reason {reason}"),
+             "count": v["count"], "total_ms": v["total_ms"],
+             "share": (v["total_ms"] / idle_total) if idle_total > 0 else None,
+             "pending_count": v["pending_count"], "pending_ms": v["pending_ms"],
+             "pending_share": (v["pending_ms"] / idle_total) if idle_total > 0 else None}
+            for reason, v in sorted(parks.items())]
+
+        # Kind 27 and 28 are what the decomposition rests on. Availability is a property of the trace: a queue
+        # with no held job of its own still belongs to a recording that has the kinds.
+        available = has_decomp
+        held_by_seq = {}
+        for _, seq, hb, ht0, ht1 in held:
+            held_by_seq.setdefault(seq, (hb, ht0, ht1))
+        held_ms, ready_wait = [], []
+        ready_clamped = 0
+        for _, seq, _, jt0, _ in jobs:
+            hb = held_by_seq.get(seq)
+            if hb is None:
+                continue  # HELD without JOB: the join failure below counts it
+            held_ms.append(hb[2] - hb[1])
+            d = jt0 - hb[2]
+            if d < 0.0:  # impossible by construction; a clock that went backwards is counted, not hidden
+                d, ready_clamped = 0.0, ready_clamped + 1
+            ready_wait.append(d)
+        held_sum, ready_sum = sum(held_ms), sum(ready_wait)
+        both = held_sum + ready_sum
+
+        # The ready wait split by the queue's own spans, per job interval: time with at least one worker
+        # of the queue parked (host scheduling it could have avoided), time with every worker of the queue
+        # inside a JOB span (capacity: all busy), and the rest (workers in transition: intake pass,
+        # admission, credit). Weighted per job, so the three parts add up to the summed ready wait inside
+        # the window. "Every worker" is the workers list above: distinct in JOB or IDLE for this queue.
+        idle_union = merged([(t0, t1) for _, _, _, t0, t1 in idles])
+        busy_by_worker = collections.defaultdict(list)
+        for w, _, _, jt0, jt1 in jobs:
+            busy_by_worker[w].append((jt0, jt1))
+        all_busy = None
+        for w in workers:
+            interval = merged(busy_by_worker.get(w, []))
+            all_busy = interval if all_busy is None else jq2_intersect(all_busy, interval)
+        all_busy = all_busy or []
+        parked_ready = all_busy_ready = transition_ready = open_ready = 0.0
+        for _, seq, _, jt0, _ in jobs:
+            hb = held_by_seq.get(seq)
+            if hb is None:
+                continue
+            r0, r1 = max(hb[2], win_start), min(jt0, win_end)
+            if r1 <= r0:
+                continue
+            open_ready += r1 - r0
+            rest = minus([(r0, r1)], idle_union)
+            parked_ready += (r1 - r0) - sum(b - a for a, b in rest)
+            for a0, a1 in rest:
+                # busy_part, not busy: the per-worker busy sums collected above are read by per_worker below.
+                busy_part = jq2_overlap_len(a0, a1, all_busy)
+                all_busy_ready += busy_part
+                transition_ready += (a1 - a0) - busy_part
+
+        depth_of = {seq: d for seq, _, _, d in pushes}
+        buckets = {label: {"jobs": 0, "held": [], "ready": [], "held_by_barrier": 0}
+                   for label in JQ2_DEPTH_BUCKETS}
+        for _, seq, _, jt0, _ in jobs:
+            depth = depth_of.get(seq)
+            if depth is None:
+                continue  # JOB without PUSH: already counted as a join failure
+            bucket = buckets[jq2_depth_bucket(depth)]
+            bucket["jobs"] += 1
+            hb = held_by_seq.get(seq)
+            if hb is not None:
+                bucket["held"].append(hb[2] - hb[1])
+                bucket["ready"].append(max(0.0, jt0 - hb[2]))
+                if (hb[0] >> 4) & 0xF == 1:
+                    bucket["held_by_barrier"] += 1
+
+        # HELD's mask is the SYNC mask of the barrier that held the job, which attributes held time to the
+        # barriers the guest pushed.
+        mask_held = {}
+        for _, seq, hb, ht0, ht1 in held:
+            if (hb >> 4) & 0xF != 1:
+                continue  # cause 0: never held, no mask
+            row = mask_held.setdefault((hb >> 8) & 0xFFFF, {"jobs": 0, "total_ms": 0.0})
+            row["jobs"] += 1
+            row["total_ms"] += ht1 - ht0
+        top_masks = [{"mask": mask, "jobs": v["jobs"], "total_held_ms": v["total_ms"],
+                      "mean_held_ms": v["total_ms"] / v["jobs"]}
+                     for mask, v in sorted(mask_held.items(),
+                                           key=lambda kv: (-kv[1]["total_ms"], kv[0]))[:5]]
+
+        barrier_ms = [t1 - t0 for _, _, _, t0, t1 in barriers]
+        barrier_waited = [b >> 8 for _, _, b, _, _ in barriers]
 
         queues.append({
             "q": q,
@@ -938,6 +1138,44 @@ def jq2_section(spans, header, names=None):
                       "p50": nearest_rank(depths, 50) if depths else None,
                       "p95": nearest_rank(depths, 95) if depths else None,
                       "max": depths[-1] if depths else None},
+            "park_reasons": park_reasons if available else [],
+            "decomposition_available": available,
+            "latency_decomposition": {
+                "held_ms": jq2_stats(held_ms),
+                "ready_wait_ms": jq2_stats(ready_wait),
+                "held_share": (held_sum / both) if both > 0 else None,
+                "ready_share": (ready_sum / both) if both > 0 else None,
+                "ready_wait_clamped": ready_clamped,
+                "ready_wait_split": {
+                    "parked_ms": parked_ready, "all_busy_ms": all_busy_ready,
+                    "transition_ms": transition_ready, "total_ms": open_ready,
+                    "parked_share": (parked_ready / open_ready) if open_ready > 0 else None,
+                    "all_busy_share": (all_busy_ready / open_ready) if open_ready > 0 else None,
+                    "transition_share": (transition_ready / open_ready) if open_ready > 0 else None},
+                "join_failures": {"held_without_job": len(held) - len(ready_wait),
+                                  "job_without_held": len(jobs) - len(ready_wait)},
+            } if available else None,
+            "counts_over_time": {
+                # Every HELD span is a job that waited, including one cut off from its JOB at a window edge;
+                # a ready interval exists only where the join found both ends.
+                "held": jq2_open_counts([(ht0, ht1) for _, _, _, ht0, ht1 in held], win_start, win_end),
+                "ready": jq2_open_counts([(held_by_seq[s][2], jt0) for _, s, _, jt0, _ in jobs
+                                          if s in held_by_seq], win_start, win_end),
+            } if available else None,
+            "depth_buckets": [
+                {"bucket": label, "jobs": v["jobs"], "held_jobs": len(v["held"]),
+                 "held_by_barrier": v["held_by_barrier"],
+                 "mean_held_ms": (sum(v["held"]) / len(v["held"])) if v["held"] else None,
+                 "mean_ready_wait_ms": (sum(v["ready"]) / len(v["ready"])) if v["ready"] else None}
+                for label, v in buckets.items()
+            ] if available else None,
+            "barriers": {
+                "count": len(barriers),
+                "rate_per_s": len(barriers) / (window / 1000.0) if window > 0 else None,
+                "duration_ms": jq2_stats(barrier_ms),
+                "waited_mean": (sum(barrier_waited) / len(barrier_waited)) if barrier_waited else None,
+                "top_masks": top_masks,
+            } if available else None,
             "sync_wait_by_tid": [
                 {"tid": tid, "name": (names or {}).get(tid, "?"), "count": len(v),
                  "total_ms": sum(v), "p50": jq2_ranks(v)[0], "p95": jq2_ranks(v)[1],
@@ -958,7 +1196,7 @@ def jq2_section(spans, header, names=None):
                                  "credit_without_wait": due_total - len(used)},
             },
         })
-    return {"dropped": header_dropped(header), "queues": queues}
+    return {"dropped": header_dropped(header), "decomposition_available": has_decomp, "queues": queues}
 
 
 def print_jq2_section(jq):
@@ -1019,8 +1257,43 @@ def print_jq2_section(jq):
               f" ({cd['job_without_credit']} job without a credit, {cd['credit_without_job']} credit"
               f" without a job); credit->wait"
               f" {sl['wait_without_credit'] + sl['credit_without_wait']}"
-              f" ({sl['wait_without_credit']} wait without a credit,"
+              f" {sl['wait_without_credit']} wait without a credit,"
               f" {sl['credit_without_wait']} due credit without a wait)")
+        dec = qd["latency_decomposition"]
+        if dec is None:
+            continue
+        for row in qd["park_reasons"]:
+            print(f"    park reason {row['reason']:2d} {row['name']:12s} n {row['count']:5d}"
+                  f"  {row['total_ms']:8.2f} ms = {pct(row['share'])} of idle"
+                  f"; pending > 0: n {row['pending_count']}, {row['pending_ms']:.2f} ms"
+                  f" = {pct(row['pending_share'])} of idle")
+        stat("held (visible->admissible)", dec["held_ms"])
+        stat("ready wait (admissible->job)", dec["ready_wait_ms"])
+        print(f"    held vs ready share: {pct(dec['held_share'])} / {pct(dec['ready_share'])}"
+              f"  ({dec['ready_wait_clamped']} ready waits clamped at 0)")
+        rs = dec["ready_wait_split"]
+        print(f"    ready wait split: {rs['parked_ms']:.2f} ms with a worker parked"
+              f" = {pct(rs['parked_share'])}; {rs['all_busy_ms']:.2f} ms with every worker busy"
+              f" = {pct(rs['all_busy_share'])}; {rs['transition_ms']:.2f} ms in transition"
+              f" = {pct(rs['transition_share'])}")
+        ct = qd["counts_over_time"]
+        print(f"    jobs over time: held mean {ms(ct['held']['mean'])}, max {ct['held']['max']};"
+              f" admissible mean {ms(ct['ready']['mean'])}, max {ct['ready']['max']}")
+        for b in qd["depth_buckets"]:
+            print(f"    depth {b['bucket']:5s}: {b['jobs']:5d} jobs, {b['held_jobs']:5d} with a HELD span"
+                  f" ({b['held_by_barrier']} held by a barrier), mean held {ms(b['mean_held_ms'])} ms,"
+                  f" mean ready wait {ms(b['mean_ready_wait_ms'])} ms")
+        bd = qd["barriers"]
+        print(f"    barriers: {bd['count']} = {ms(bd['rate_per_s'])}/s, mean duration"
+              f" {ms(bd['duration_ms']['mean'])} ms, mean waited {ms(bd['waited_mean'])}")
+        for m in bd["top_masks"]:
+            print(f"      mask 0x{m['mask']:04X}: {m['jobs']} jobs held, {m['total_held_ms']:.2f} ms held,"
+                  f" mean {ms(m['mean_held_ms'])} ms")
+        jf = dec["join_failures"]
+        print(f"    held joins: {jf['held_without_job']} HELD without a job,"
+              f" {jf['job_without_held']} job without a HELD")
+    if not jq.get("decomposition_available", False):
+        print("  held/admissible decomposition needs kinds 27-28 (HELD, BARRIER); this trace has none")
 
 
 def main():

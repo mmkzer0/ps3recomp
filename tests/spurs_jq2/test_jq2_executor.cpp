@@ -65,9 +65,10 @@
  *   push-nonblock  flags bit 2 on a full ring is AGAIN: nothing written, B rolled back
  *   push-flags  PushJob flags & ~7, CopyPush flags & ~3, PushSync flags & ~4: A02, first
  *   stop-push-block-shutdown  Shutdown while a pusher is parked: jq2-unmodelled
- *   trace-spans, trace-sync, trace-queues, trace-concurrent, trace-off  the ftrace jq2 kinds 22-26 (ps3_ftrace.h):
- *               PUSH/JOB/CREDIT per (q, seq), SYNC_WAIT keyed by waiter, IDLE, the q of each queue and its
- *               creation line, seq unique under concurrent pushers; nothing recorded with tracing off
+ *   trace-spans, trace-sync, trace-queues, trace-concurrent, trace-held, trace-off  the ftrace jq2 kinds 22-28
+ *               (ps3_ftrace.h): PUSH/JOB/CREDIT per (q, seq), SYNC_WAIT keyed by waiter, IDLE and its reason
+ *               byte, HELD and BARRIER for a job a SYNC held, the q of each queue and its creation line, seq
+ *               unique under concurrent pushers; nothing recorded with tracing off
  */
 #include "jq2/executor.hpp"
 #include "jq2/jq2.h"
@@ -2311,7 +2312,7 @@ void mode_stop_push_block_shutdown()
         "jq2-unmodelled", {"reason=push-blocked-at-shutdown"});
 }
 
-/* ---- jq2 ftrace spans (ps3_ftrace.h kinds 22-26) ---------------------------- */
+/* ---- jq2 ftrace spans (ps3_ftrace.h kinds 22-28) ---------------------------- */
 
 /* The recorder is read after every thread that can emit has been joined (Rig::teardown joins the
  * workers; a test joins its own threads), so the records need no synchronisation. */
@@ -2444,7 +2445,7 @@ void mode_trace_spans()
         bool parked_with_work = false;
         for (const ps3_ft_rec& r : idle) {
             CHECK(r.who >> 8 == 0 && (r.who & 0xFFu) < 2 && r.t1 >= r.t0, "IDLE who 0x%X", r.who);
-            if (r.who == w) parked_with_work = parked_with_work || (r.a == kJobs && r.b <= kJobs);
+            if (r.who == w) parked_with_work = parked_with_work || ((r.a & 0xFFFFFFu) == kJobs && r.b <= kJobs);
         }
         CHECK(parked_with_work, "worker %u: no IDLE span that began with %u jobs pending", w, kJobs);
     }
@@ -2626,6 +2627,119 @@ void mode_trace_concurrent()
     for (unsigned t = 0; t < kThreads; ++t) check_push_order(ppu_tid_diag_index(ppu_tid_make(t, t)), 0, kEach);
 }
 
+/* A SYNC that reaches the ring while a job on its tag is in flight bars the tag, and the job pushed behind it
+ * waits for the release. HELD names the tag, the cause and the SYNC's mask; BARRIER spans the end of the pass
+ * that barred the tag to the release; a worker parks with reason 3 (held) and a depth above 0 while the
+ * barrier is up, and one that parked on the empty ring before any push has reason 1 (empty). */
+void mode_trace_held()
+{
+    g_lifted = kLiftedBusy;
+    build_image(IMAGE, Prog::transform);
+    install_hooks();
+    /* The first job stays in flight until the other worker has consumed the SYNC and parked on the job behind
+     * it, so the barrier is up before that job can finish: no step of this mode depends on a sleep. */
+    {
+        std::lock_guard<std::mutex> lk(g_probe.mu);
+        g_probe.on_admit = [](const JobStart& js) {
+            if (serial_of(js) != 0) return;
+            CHECK(wait_for(
+                      [] {
+                          const auto v = observe_queue(QUEUE);
+                          return v && v->settled >= 1;
+                      },
+                      10000),
+                  "the other worker parks on the held job");
+        };
+    }
+    ppu_context ppu{};
+    ppu.thread_id = ppu_tid_make(0, 0);
+    g_active_ctx = &ppu;
+
+    CHECK(PS3_FT_ON(), "tracing is on"); /* before any worker: a hook sees "off" while another thread initialises */
+    Rig rig({128, 2, false});
+    CHECK(wait_for([] {
+              const auto v = observe_queue(QUEUE);
+              return v && v->settled == 2;
+          }),
+          "both workers park on the empty ring");
+    CHECK(set_intake_paused(QUEUE, true), "pause");
+    const JobSpec a = spec(0), b = spec(1);
+    rig.push_wait(a.desc, 64, 0); /* seq 1, tag 0 */
+    rig.sync_tags_wait(1u << 0);  /* bars tag 0 while seq 1 is in flight */
+    rig.push_wait(b.desc, 64, 0); /* seq 2, tag 0, behind the SYNC */
+    CHECK(set_intake_paused(QUEUE, false), "resume");
+    CHECK(jq2_port_sync(PORT, 0) == 0, "sync");
+    CHECK(job_ok(a) && job_ok(b), "outputs");
+    {
+        std::lock_guard<std::mutex> lk(g_probe.mu);
+        g_probe.on_admit = nullptr;
+    }
+    rig.teardown();
+    g_active_ctx = nullptr;
+
+    const SeqMap held = by_seq(PS3_FT_JQ2_HELD, 0), job = by_seq(PS3_FT_JQ2_JOB, 0);
+    CHECK(held.size() == 2 && job.size() == 2, "q0: %zu HELD spans over %zu JOB spans, want 2 each", held.size(),
+          job.size());
+    const auto h1 = held.find(1), j1 = job.find(1), h2 = held.find(2), j2 = job.find(2);
+    const bool one1 = h1 != held.end() && h1->second.size() == 1 && j1 != job.end() && j1->second.size() == 1;
+    const bool one2 = h2 != held.end() && h2->second.size() == 1 && j2 != job.end() && j2->second.size() == 1;
+    CHECK(one1 && one2, "seq 1: %d, seq 2: %d, want one HELD and one JOB each", one1 ? 1 : 0, one2 ? 1 : 0);
+    const std::uint64_t job1_end = one1 ? j1->second[0].t1 : 0;
+
+    /* seq 1 was admitted before the SYNC: never held, no mask, a zero-length span. */
+    if (one1) {
+        const ps3_ft_rec& r = h1->second[0];
+        CHECK(r.a == 1 && (r.who >> 8) == 0 && (r.who & 0xFFu) < 2, "seq 1: HELD a=%u who=0x%X", r.a, r.who);
+        CHECK(r.b == 0, "seq 1: HELD b=0x%X, want tag 0, cause 0, mask 0", r.b);
+        CHECK(r.t1 == r.t0, "seq 1: HELD is %llu ns long, want 0 (never held)", (unsigned long long)(r.t1 - r.t0));
+    }
+    /* seq 2 waited for the SYNC's barrier on tag 0: cause 1, mask 1 << 0, t1 the release, and t1 <= JOB.t0. */
+    if (one2) {
+        const ps3_ft_rec& r = h2->second[0];
+        CHECK(r.a == 2 && (r.who >> 8) == 0 && (r.who & 0xFFu) < 2, "seq 2: HELD a=%u who=0x%X", r.a, r.who);
+        CHECK((r.b & 0xFu) == 0, "seq 2: HELD tag %u, want 0", r.b & 0xFu);
+        CHECK(((r.b >> 4) & 0xFu) == 1, "seq 2: HELD cause %u, want 1 (held by a barrier)", (r.b >> 4) & 0xFu);
+        CHECK((r.b >> 8) == 0x0001u, "seq 2: HELD mask 0x%X, want 0x0001 (the SYNC's)", r.b >> 8);
+        CHECK(r.t0 <= r.t1 && r.t1 <= j2->second[0].t0, "seq 2: HELD %llu-%llu is not inside [t0, JOB.t0 %llu]",
+              (unsigned long long)r.t0, (unsigned long long)r.t1, (unsigned long long)j2->second[0].t0);
+        CHECK(r.t1 >= job1_end, "seq 2 became admissible at %llu, before seq 1 ended at %llu",
+              (unsigned long long)r.t1, (unsigned long long)job1_end);
+    }
+
+    /* One barrier: the pass that consumed the SYNC barred tag 0 with the SYNC's mask while seq 1 was in
+     * flight, and the complete() of seq 1 released it. */
+    const std::vector<ps3_ft_rec> barrier = ft_kind(PS3_FT_JQ2_BARRIER);
+    CHECK(barrier.size() == 1, "%zu BARRIER spans, want 1", barrier.size());
+    if (barrier.size() == 1) {
+        const ps3_ft_rec& r = barrier[0];
+        CHECK((r.who >> 8) == 0 && (r.who & 0xFFu) < 2, "BARRIER who=0x%X", r.who);
+        CHECK((r.a & 0xFFFFu) == 0x0001u, "BARRIER tags=0x%X, want 0x0001 (tag 0)", r.a & 0xFFFFu);
+        CHECK((r.a >> 16) == 0x0001u, "BARRIER mask=0x%X, want 0x0001", r.a >> 16);
+        CHECK((r.b & 0xFFu) == 0, "BARRIER q=%u, want 0", r.b & 0xFFu);
+        CHECK((r.b >> 8) == 1, "BARRIER waited=%u, want 1 (seq 1 was in flight)", r.b >> 8);
+        CHECK(r.t0 <= r.t1, "BARRIER ends before it starts");
+    }
+
+    /* Parks: one on the empty ring (reason 1) and one on the held job (reason 3, depth 1) while the barrier
+     * was up. */
+    bool empty_park = false, held_park = false, held_park_while_up = false;
+    for (const ps3_ft_rec& r : ft_kind(PS3_FT_JQ2_IDLE)) {
+        CHECK((r.who >> 8) == 0 && (r.who & 0xFFu) < 2, "IDLE who=0x%X", r.who);
+        const std::uint32_t reason = r.a >> 24, depth = r.a & 0xFFFFFFu;
+        if (reason == 1 && depth == 0) empty_park = true;
+        if (reason == 3 && depth > 0) {
+            held_park = true;
+            if (barrier.size() == 1)
+                held_park_while_up = held_park_while_up || (r.t0 <= barrier[0].t1 && r.t1 >= barrier[0].t0);
+        }
+    }
+    CHECK(empty_park, "no IDLE span with reason 1 (empty) and depth 0 on the empty ring");
+    CHECK(held_park, "no IDLE span with reason 3 (held) and depth > 0");
+    CHECK(held_park_while_up, "the held park does not overlap the barrier");
+
+    for (const ps3_ft_rec& r : ft_kind(PS3_FT_JQ2_CREDIT)) check_credit_fields(r);
+}
+
 /* Tracing off: the same traffic records nothing. */
 void mode_trace_off()
 {
@@ -2646,7 +2760,7 @@ void mode_trace_off()
     for (const JobSpec& s : specs) CHECK(job_ok(s), "job %u output", s.serial);
     CHECK(!PS3_FT_ON(), "tracing is off");
     CHECK(g_ps3_ft.n == 0 && g_ps3_ft.buf == nullptr, "no span was recorded (n=%u)", g_ps3_ft.n);
-    for (int kind = PS3_FT_JQ2_PUSH; kind <= PS3_FT_JQ2_IDLE; ++kind) CHECK(ft_kind(kind).empty(), "kind %d recorded", kind);
+    for (int kind = PS3_FT_JQ2_PUSH; kind <= PS3_FT_JQ2_BARRIER; ++kind) CHECK(ft_kind(kind).empty(), "kind %d recorded", kind);
 }
 
 }  // namespace
@@ -2715,6 +2829,7 @@ int main(int argc, char** argv)
     else if (mode == "trace-sync") mode_trace_sync();
     else if (mode == "trace-queues") mode_trace_queues();
     else if (mode == "trace-concurrent") mode_trace_concurrent();
+    else if (mode == "trace-held") mode_trace_held();
     else if (mode == "trace-off") mode_trace_off();
     else {
         std::printf("unknown mode %s\n", mode.c_str());

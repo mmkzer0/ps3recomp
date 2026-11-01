@@ -784,7 +784,7 @@ request that asked for it), and print no rates when the header says
   GPU wait (`GPU_WAIT` `a` = 2), encode, present, drain, rest, because a
   drawable wait lies inside a drain pass.
 
-A third section, **SPURS job queues** (kinds 22-26, the jq2 path in
+A third section, **SPURS job queues** (kinds 22-28, the jq2 path in
 `libs/spurs/jq2`), splits one job's wait into its links, per queue: pushes and
 push rate; queue latency (`JOB` t0 - `PUSH` t1), execution wall and thread CPU
 time, completion delay (`CREDIT` t0 - `JOB` t1) and sync latency (`CREDIT` t1 to
@@ -796,13 +796,32 @@ which), each busy or idle span clipped to that window before it is summed so a
 park that started before the recording opened cannot charge time it does not
 own; the number of workers seen; queue depth from the push; parks while work
 was pending; sync waits per PPU tid; and the recorder's `dropped` count from the
-header. Push, job and credit are joined on `(q, seq)` -- `seq` counts per
-queue, so a join on it alone pairs one queue's push with another's job. Sync
-waits join on `(q, waiter)`; a fiber wait carries no waiter (`0xFF`, wake 2) and
-is reported apart. Queue latency is clamped at 0 when a worker admitted a job
-before the push span ended, and the clamped joins are counted. A join with no
-partner -- a span cut off at a window edge -- is counted too. A trace without
-the five kinds prints no such section.
+header. `IDLE`'s `a` carries the depth at park in its low 24 bits and a park
+reason in the top byte: 0 unrecorded (a recording made before the byte), 1
+empty, 2 unwritten, 3 held, 4 no-slot, 5 paused, 15 unclassified. Each reason
+is reported with its count, time and share of the idle time, and the same
+restricted to parks with pending work. `HELD` and `BARRIER` (kinds 27 and 28)
+split the queue wait into **held** (guest ordering: a SYNC barred the job's
+tag) and **ready wait** (host: admissible and not yet admitted), each with
+mean, p50, p95 and its share of the two; the ready wait is split per job into
+time with a worker of the queue parked (avoidable host scheduling), time with
+every worker of the queue in a `JOB` span (capacity: all busy) and the rest
+(workers in transition: intake pass, admission, credit), each in ms and as a
+share of the summed ready wait. The section also reports the time-weighted mean
+and max of held and admissible jobs, the same split by the depth each push saw
+(1, 2-4, 5-16, 17-64, 65+), with how many jobs of the bucket have a `HELD` span
+and how many of those a barrier actually held, and the barriers: count and
+rate, duration, jobs in flight when the barrier was set, and the five SYNC
+masks that held the most time. Push, job and credit are
+joined on `(q, seq)`: `seq` counts per queue, so a join on it alone pairs one
+queue's push with another's job. Sync waits join on `(q, waiter)`; a fiber wait
+carries no waiter (`0xFF`, wake 2) and is reported apart. Queue latency is
+clamped at 0 when a worker admitted a job before the push span ended, and the
+clamped joins are counted, as are HELD without a JOB and JOB without a HELD. A
+join with no partner (a span cut off at a window edge) is counted too. A trace
+without the seven kinds prints no such section; a trace without kinds 27-28
+prints the section it always did plus one line that the decomposition needs
+them.
 
 Both kinds are recorded whatever `PS3_FTRACE_MIN_US` says. Exit `0` on a
 report, `2` on an unreadable or malformed trace, bad arguments or fewer than

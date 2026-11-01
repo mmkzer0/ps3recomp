@@ -239,6 +239,12 @@ struct PassResult {
     std::uint16_t read_after = 0;
     unsigned syncs_consumed = 0;   /* SYNCs consumed by this pass */
     unsigned entries_retained = 0; /* barred JOBs and re-armed SYNCs skipped */
+    /* Entries outstanding when the pass read the index word; also set for no_free_slot, where the pass
+     * returns before it reads the ring. */
+    std::uint16_t outstanding = 0;
+    /* The pass stopped at an outstanding slot whose phase bit says the writer has not finished it, as
+     * opposed to running out of outstanding entries. */
+    bool reached_unwritten = false;
 };
 
 class Scheduler {
