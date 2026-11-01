@@ -478,12 +478,12 @@ def audio_section(spans, dropped, name_of=None):
         u_rate = None
 
     stale_count = len(stale_spans)
-    stale_audible = [s for s in stale_spans if s[3] != 0]
-    stale_silent = [s for s in stale_spans if s[3] == 0]
-    stale_audible_count = len(stale_audible)
-    stale_silent_count = len(stale_silent)
+    run_starts = [s for s in stale_spans if s[3] == 1]
+    gap_runs_count = len(run_starts)
+    longest_run_blocks = max((s[3] for s in stale_spans), default=0)
+    longest_run_ms = longest_run_blocks * (16.0 / 3.0)
     if rates:
-        stale_rate = (stale_audible_count / audio_dur_s) if audio_dur_s > 0 else (0.0 if stale_audible_count == 0 else None)
+        stale_rate = (gap_runs_count / audio_dur_s) if audio_dur_s > 0 else (0.0 if gap_runs_count == 0 else None)
     else:
         stale_rate = None
 
@@ -491,13 +491,15 @@ def audio_section(spans, dropped, name_of=None):
     for s in stale_spans:
         p = str(s[1])
         if p not in stale_by_port:
-            stale_by_port[p] = {"count": 0, "audible": 0, "silent": 0}
+            stale_by_port[p] = {"count": 0, "total_blocks": 0, "runs": 0,
+                                "longest_run_blocks": 0, "longest_run_ms": 0.0}
         stale_by_port[p]["count"] += 1
-        if s[3] != 0:
-            stale_by_port[p]["audible"] += 1
-        else:
-            stale_by_port[p]["silent"] += 1
-
+        stale_by_port[p]["total_blocks"] += 1
+        if s[3] == 1:
+            stale_by_port[p]["runs"] += 1
+        if s[3] > stale_by_port[p]["longest_run_blocks"]:
+            stale_by_port[p]["longest_run_blocks"] = s[3]
+            stale_by_port[p]["longest_run_ms"] = s[3] * (16.0 / 3.0)
     # 3. Pacing totals by reason
     pacing_totals = {}
     for code, name in AUDIO_PACE_REASON.items():
@@ -585,7 +587,6 @@ def audio_section(spans, dropped, name_of=None):
     stale_overlap_count = 0
     for s in stale_spans:
         s_t = s[4]
-        is_aud = (s[3] != 0)
         nearest_gap_ms = None
         if frame_gaps:
             def dist_to_gap(gap):
@@ -611,7 +612,7 @@ def audio_section(spans, dropped, name_of=None):
                     has_overlap = True
                     break
 
-        if is_aud and has_overlap:
+        if s[3] == 1 and has_overlap:
             stale_overlap_count += 1
 
         hle_waits = []
@@ -628,13 +629,13 @@ def audio_section(spans, dropped, name_of=None):
             "at_s": s_t / 1000.0,
             "port": s[1],
             "block": s[2],
-            "audible": is_aud,
+            "run_len": s[3],
             "nearest_frame_gap_ms": nearest_gap_ms,
             "overlap": has_overlap,
             "hle_waits": hle_waits,
         })
 
-    stale_overlap_share = (stale_overlap_count / stale_audible_count) if stale_audible_count > 0 else None
+    stale_overlap_share = (stale_overlap_count / gap_runs_count) if gap_runs_count > 0 else None
 
     hle_counts = collections.defaultdict(int)
     for ev in underruns_detail + stale_detail:
@@ -658,8 +659,11 @@ def audio_section(spans, dropped, name_of=None):
         "underrun_rate": u_rate,
         "stale": {
             "count": stale_count,
-            "audible_count": stale_audible_count,
-            "silent_count": stale_silent_count,
+            "total_blocks": stale_count,
+            "runs": gap_runs_count,
+            "gap_runs": gap_runs_count,
+            "longest_run_blocks": longest_run_blocks,
+            "longest_run_ms": longest_run_ms,
             "rate": stale_rate,
             "per_s": stale_rate,
             "by_port": stale_by_port,
@@ -668,7 +672,9 @@ def audio_section(spans, dropped, name_of=None):
             "overlap_share": stale_overlap_share,
         },
         "stale_count": stale_count,
-        "stale_audible_count": stale_audible_count,
+        "stale_runs": gap_runs_count,
+        "stale_total_blocks": stale_count,
+        "stale_longest_run_ms": longest_run_ms,
         "stale_rate": stale_rate,
         "pacing": {
             "total_ms": total_pacing_ms,
@@ -709,10 +715,11 @@ def print_audio_section(aud):
     print(f"  queue depth p1 {ms_fmt(qd['p1'])} p5 {ms_fmt(qd['p5'])} p50 {ms_fmt(qd['p50'])} ms")
     rate_str = f"{u['rate']:.1f} /s" if u['rate'] is not None else "n/a"
     print(f"  underruns: {u['count']} ({rate_str})")
-    st_rate_str = f"{st['rate']:.1f} /s" if st['rate'] is not None else "n/a"
-    print(f"  stale blocks: {st['count']} ({st['audible_count']} audible, {st_rate_str}, {st['silent_count']} silent)")
+    st_rate_str = f"{st['rate']:.1f} runs/s" if st['rate'] is not None else "n/a"
+    print(f"  stale blocks: {st['total_blocks']} across {st['runs']} audible gap run(s)"
+          f" ({st_rate_str}, longest {st['longest_run_blocks']} blk / {ms_fmt(st['longest_run_ms'])} ms)")
     if st["by_port"]:
-        port_strs = [f"port {p}: {info['audible']} audible, {info['silent']} silent ({info['count']} total)"
+        port_strs = [f"port {p}: {info['runs']} run(s), {info['total_blocks']} block(s), max {info['longest_run_blocks']} blk ({ms_fmt(info['longest_run_ms'])} ms)"
                      for p, info in sorted(st["by_port"].items())]
         print(f"    by port: {', '.join(port_strs)}")
     print(f"  pacing wait: {p['total_ms']:.1f} ms in all")
@@ -725,9 +732,9 @@ def print_audio_section(aud):
         if u["count"]:
             pct = f"{100 * c['overlap_share']:.0f}%" if c['overlap_share'] is not None else "n/a"
             print(f"    underruns overlapping a >40 ms frame gap or drawable/label wait: {pct} ({c['overlap_count']}/{u['count']})")
-        if st["audible_count"]:
+        if st["runs"]:
             pct = f"{100 * st['overlap_share']:.0f}%" if st['overlap_share'] is not None else "n/a"
-            print(f"    audible stale blocks overlapping a >40 ms frame gap or drawable/label wait: {pct} ({st['overlap_count']}/{st['audible_count']})")
+            print(f"    audible gap runs overlapping a >40 ms frame gap or drawable/label wait: {pct} ({st['overlap_count']}/{st['runs']})")
         if c["top_hle_waits"]:
             print("    top overlapping long guest waits (>10 ms HLE):")
             for h in c["top_hle_waits"][:6]:

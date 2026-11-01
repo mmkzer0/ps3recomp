@@ -230,51 +230,62 @@ with tempfile.TemporaryDirectory() as tmp:
     check(abs(aud["correlation"]["overlap_share"] - 2 / 3) < 1e-4, "correlation overlap_share is 2/3")
     check(aud["correlation"]["overlap_count"] == 2, "correlation overlap_count is 2")
 
-    # Stale port blocks: silent vs non-silent, aligned vs unaligned with long HLE spans
+    # Stale port blocks: gap after playing audio with growing run length, resets on refill,
+    # aligned vs unaligned with long HLE spans
     stale_frames = [0, 20, 40, 100, 120, 140, 160, 180, 200, 220, 240, 260, 280, 300]
     stale_test_lines = [span(FLIP_REQ, 1, 0, 0, t, t) for t in (0, 20, 40, 60)]
     for t in stale_frames:
         stale_test_lines.append(span(PRESENT, 0, 0, 0, t, t + 1))
     stale_test_lines.append(span(AUDIO_MIX, 0, 1, 500, 0, 1))
+
     # Long HLE span (25 ms > 10 ms) on tid 2 in Port2Sync (0xFACB3CED) at 70..95 ms
     stale_test_lines.append(span(HLE, 2, 0xFACB3CED, 0x1000, 70, 95))
-    # Event 1: Port 0, block 2, AUDIBLE (b=1), at t = 80 ms: aligned with 60ms gap & long HLE
+
+    # Gap run 1 on Port 0: growing run length 1, 2, 3 (at 80, 85, 90 ms)
+    # Event 1 (run start, b=1) at 80 ms: overlaps 60ms frame gap [40, 100] and long HLE [70, 95]
     stale_test_lines.append(span(AUDIO_STALE, 0, 2, 1, 80, 80))
-    # Event 2: Port 0, block 3, SILENT (b=0), at t = 90 ms: silent block
-    stale_test_lines.append(span(AUDIO_STALE, 0, 3, 0, 90, 90))
-    # Event 3: Port 1, block 5, AUDIBLE (b=1), at t = 210 ms: 20ms gaps, no HLE
+    stale_test_lines.append(span(AUDIO_STALE, 0, 3, 2, 85, 85))
+    stale_test_lines.append(span(AUDIO_STALE, 0, 4, 3, 90, 90))
+
+    # Gap run 2 on Port 1: growing run length 1, 2 (at 210, 215 ms)
+    # Event 4 (run start, b=1) at 210 ms: unaligned with >40ms gap (20ms gaps) and no HLE
     stale_test_lines.append(span(AUDIO_STALE, 1, 5, 1, 210, 210))
+    stale_test_lines.append(span(AUDIO_STALE, 1, 6, 2, 215, 215))
 
     rc, out, err = run(tmp, trace(stale_test_lines), "--json")
     r = json.loads(out)
     aud = r["audio"]
     st = aud["stale"]
-    check(st["count"] == 3, "stale count: 3")
-    check(st["audible_count"] == 2, "stale audible: 2")
-    check(st["silent_count"] == 1, "stale silent: 1")
-    check(st["by_port"]["0"]["count"] == 2 and st["by_port"]["0"]["audible"] == 1 and st["by_port"]["0"]["silent"] == 1,
-          "stale port 0 counts")
-    check(st["by_port"]["1"]["count"] == 1 and st["by_port"]["1"]["audible"] == 1 and st["by_port"]["1"]["silent"] == 0,
-          "stale port 1 counts")
+    check(st["total_blocks"] == 5, "stale total blocks: 5")
+    check(st["runs"] == 2, "stale runs: 2")
+    check(st["longest_run_blocks"] == 3, "stale longest run blocks: 3")
+    check(abs(st["longest_run_ms"] - 3 * (16.0 / 3.0)) < 1e-4, "stale longest run ms: 16.0")
+    check(st["by_port"]["0"]["runs"] == 1 and st["by_port"]["0"]["total_blocks"] == 3 and st["by_port"]["0"]["longest_run_blocks"] == 3,
+          "stale port 0: 1 run, 3 blocks, longest 3")
+    check(st["by_port"]["1"]["runs"] == 1 and st["by_port"]["1"]["total_blocks"] == 2 and st["by_port"]["1"]["longest_run_blocks"] == 2,
+          "stale port 1: 1 run, 2 blocks, longest 2")
     st_evs = st["events"]
-    check(len(st_evs) == 3, "stale events: 3")
-    # Event 1 (audible, at 80ms)
-    check(abs(st_evs[0]["nearest_frame_gap_ms"] - 60.0) < 1e-4, "stale 1: nearest gap 60 ms")
-    check(st_evs[0]["overlap"] is True, "stale 1: overlap True")
+    check(len(st_evs) == 5, "stale events: 5")
+    check(st_evs[0]["run_len"] == 1 and st_evs[1]["run_len"] == 2 and st_evs[2]["run_len"] == 3,
+          "growing run length 1, 2, 3")
+    check(st_evs[3]["run_len"] == 1 and st_evs[4]["run_len"] == 2, "run resets to 1, 2 on next gap")
+    # Event 1 (run start at 80ms)
+    check(abs(st_evs[0]["nearest_frame_gap_ms"] - 60.0) < 1e-4, "stale run 1: nearest gap 60 ms")
+    check(st_evs[0]["overlap"] is True, "stale run 1: overlap True")
     check(len(st_evs[0]["hle_waits"]) == 1 and st_evs[0]["hle_waits"][0]["nid"] == "FACB3CED",
-          "stale 1: long HLE wait overlap Port2Sync")
-    # Event 3 (audible, at 210ms)
-    check(abs(st_evs[2]["nearest_frame_gap_ms"] - 20.0) < 1e-4, "stale 3: nearest gap 20 ms")
-    check(st_evs[2]["overlap"] is False, "stale 3: overlap False")
-    check(len(st_evs[2]["hle_waits"]) == 0, "stale 3: no HLE wait overlap")
-    check(abs(st["overlap_share"] - 0.5) < 1e-4, "stale audible overlap_share is 0.5")
+          "stale run 1: long HLE wait overlap Port2Sync")
+    # Event 4 (run start at 210ms)
+    check(abs(st_evs[3]["nearest_frame_gap_ms"] - 20.0) < 1e-4, "stale run 2: nearest gap 20 ms")
+    check(st_evs[3]["overlap"] is False, "stale run 2: overlap False")
+    check(len(st_evs[3]["hle_waits"]) == 0, "stale run 2: no HLE wait overlap")
+    check(abs(st["overlap_share"] - 0.5) < 1e-4, "stale gap runs overlap_share is 0.5 (1/2)")
     check(len(aud["correlation"]["top_hle_waits"]) >= 1 and
           aud["correlation"]["top_hle_waits"][0]["nid"] == "FACB3CED",
           "top_hle_waits names Port2Sync")
 
     rc, out, err = run(tmp, trace(stale_test_lines))
-    check(rc == 0 and "stale blocks: 3 (2 audible" in out and "port 0: 1 audible, 1 silent" in out,
-          "stale blocks text report")
+    check(rc == 0 and "stale blocks: 5 across 2 audible gap run(s)" in out, "stale blocks text report")
+    check(rc == 0 and "port 0: 1 run(s), 3 block(s), max 3 blk" in out, "port 0 text report")
     check(rc == 0 and "top overlapping long guest waits" in out and "Port2Sync" in out,
           "text report names overlapping HLE import")
 print("ftrace_report: %s" % ("ok" if not failures else "%d failed" % failures))
