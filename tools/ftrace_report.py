@@ -60,7 +60,9 @@ import statistics
 import sys
 
 (SYSCALL, USLEEP, SPU_WAIT, SPU_BUSY, SEMA, SEMA_GAVEUP, DRAIN, FLIP_FIFO, FLIP_REQ, PRESENT,
- GPU_ENCODE, GPU_WAIT, READBACK, GPU_EXEC, HLE, DRAWABLE, LABEL_WAIT) = range(1, 18)
+ GPU_ENCODE, GPU_WAIT, READBACK, GPU_EXEC, HLE, DRAWABLE, LABEL_WAIT,
+ AUDIO_MIX, AUDIO_PACE, AUDIO_UNDERRUN, AUDIO_STALE) = range(1, 22)
+AUDIO_PACE_REASON = {1: "queue full", 2: "clock pacing", 3: "backend wait"}
 GPU_WAIT_KIND = {0: "gpu wait (flush)", 1: "gpu wait (present)", 2: "gpu wait (in-flight)"}
 GPU_WAIT_INFLIGHT = 2
 SPINS_SLEEPING = 64      # cellGcmSys.c yields for 64 spins, then sleeps 1 ms per spin
@@ -423,6 +425,323 @@ def print_drawable_label(sec):
               " of the wait time")
 
 
+def audio_section(spans, dropped, name_of=None):
+    if name_of is None:
+        name_of = lambda nid: f"nid {nid:08X}"
+    mix_spans = [s for s in spans if s[0] == AUDIO_MIX]
+    pace_spans = [s for s in spans if s[0] == AUDIO_PACE]
+    underrun_spans = [s for s in spans if s[0] == AUDIO_UNDERRUN]
+    stale_spans = [s for s in spans if s[0] == AUDIO_STALE]
+
+    if not (mix_spans or pace_spans or underrun_spans or stale_spans):
+        return None
+
+    rates = dropped == 0
+
+    # 1. Blocks/s and mix intervals
+    if mix_spans:
+        mix_times = [s[4] for s in mix_spans]
+        intervals = [b - a for a, b in zip(mix_times, mix_times[1:])]
+        sorted_intervals = sorted(intervals)
+        total_blocks = sum(s[2] for s in mix_spans)
+        if len(intervals) > 0 and sum(intervals) > 0:
+            blocks_per_s = len(intervals) / (sum(intervals) / 1000.0) * (total_blocks / len(mix_spans))
+        else:
+            blocks_per_s = 0.0
+        mix_interval = {
+            "p50": nearest_rank(sorted_intervals, 50) if sorted_intervals else None,
+            "p90": nearest_rank(sorted_intervals, 90) if sorted_intervals else None,
+            "p99": nearest_rank(sorted_intervals, 99) if sorted_intervals else None,
+            "max": sorted_intervals[-1] if sorted_intervals else None,
+        }
+        # Queue depth p1/p5/p50 in ms (48 frames per ms at 48 kHz)
+        depths_ms = sorted(s[3] / 48.0 for s in mix_spans)
+        queue_depth = {
+            "p1": nearest_rank(depths_ms, 1) if depths_ms else None,
+            "p5": nearest_rank(depths_ms, 5) if depths_ms else None,
+            "p50": nearest_rank(depths_ms, 50) if depths_ms else None,
+        }
+    else:
+        blocks_per_s = 0.0
+        mix_interval = {"p50": None, "p90": None, "p99": None, "max": None}
+        queue_depth = {"p1": None, "p5": None, "p50": None}
+
+    # 2. Underrun and stale counts and rates
+    audio_all = mix_spans + pace_spans + underrun_spans + stale_spans
+    t_min = min(s[4] for s in audio_all)
+    t_max = max(s[5] for s in audio_all)
+    audio_dur_s = (t_max - t_min) / 1000.0 if t_max > t_min else 0.0
+    u_count = len(underrun_spans)
+    if rates:
+        u_rate = (u_count / audio_dur_s) if audio_dur_s > 0 else (0.0 if u_count == 0 else None)
+    else:
+        u_rate = None
+
+    stale_count = len(stale_spans)
+    run_starts = [s for s in stale_spans if s[3] == 1]
+    gap_runs_count = len(run_starts)
+    longest_run_blocks = max((s[3] for s in stale_spans), default=0)
+    longest_run_ms = longest_run_blocks * (16.0 / 3.0)
+    if rates:
+        stale_rate = (gap_runs_count / audio_dur_s) if audio_dur_s > 0 else (0.0 if gap_runs_count == 0 else None)
+    else:
+        stale_rate = None
+
+    stale_by_port = {}
+    for s in stale_spans:
+        p = str(s[1])
+        if p not in stale_by_port:
+            stale_by_port[p] = {"count": 0, "total_blocks": 0, "runs": 0,
+                                "longest_run_blocks": 0, "longest_run_ms": 0.0}
+        stale_by_port[p]["count"] += 1
+        stale_by_port[p]["total_blocks"] += 1
+        if s[3] == 1:
+            stale_by_port[p]["runs"] += 1
+        if s[3] > stale_by_port[p]["longest_run_blocks"]:
+            stale_by_port[p]["longest_run_blocks"] = s[3]
+            stale_by_port[p]["longest_run_ms"] = s[3] * (16.0 / 3.0)
+    # 3. Pacing totals by reason
+    pacing_totals = {}
+    for code, name in AUDIO_PACE_REASON.items():
+        sp = [s for s in pace_spans if s[2] == code]
+        tot_ms = sum(s[5] - s[4] for s in sp)
+        pacing_totals[name] = {"count": len(sp), "ms": tot_ms, "total_ms": tot_ms}
+    total_pacing_ms = sum(s[5] - s[4] for s in pace_spans)
+
+    # 4. Correlation with frame gaps, DRAWABLE/LABEL_WAIT spans, and long HLE waits (>10 ms)
+    frame_spans = [s for s in spans if s[0] in (PRESENT, DRAWABLE)]
+    if frame_spans:
+        raw_times = sorted(s[4] for s in frame_spans)
+        frame_events = []
+        for t in raw_times:
+            if not frame_events or t - frame_events[-1] > 5.0:
+                frame_events.append(t)
+    else:
+        flip_spans = [s for s in spans if s[0] == FLIP_REQ]
+        frame_events = sorted(s[4] for s in flip_spans)
+
+    frame_gaps = []
+    for i in range(len(frame_events) - 1):
+        g0 = frame_events[i]
+        g1 = frame_events[i + 1]
+        frame_gaps.append((g0, g1, g1 - g0))
+
+    d_lw_spans = [s for s in spans if s[0] in (DRAWABLE, LABEL_WAIT)]
+    long_hle_spans = [s for s in spans if s[0] == HLE and (s[5] - s[4]) > 10.0]
+
+    underruns_detail = []
+    overlap_count = 0
+    for u in underrun_spans:
+        u_t = u[4]
+        nearest_gap_ms = None
+        if frame_gaps:
+            def dist_to_gap(gap):
+                g0, g1, _ = gap
+                if g0 <= u_t <= g1:
+                    return 0.0
+                if u_t < g0:
+                    return g0 - u_t
+                return u_t - g1
+            nearest = min(frame_gaps, key=dist_to_gap)
+            nearest_gap_ms = nearest[2]
+
+        w0 = u_t - 50.0
+        w1 = u_t
+        has_overlap = False
+        for g0, g1, dur in frame_gaps:
+            if dur > 40.0 and overlap(g0, g1, w0, w1) > 0:
+                has_overlap = True
+                break
+        if not has_overlap:
+            for s in d_lw_spans:
+                if overlap(s[4], s[5], w0, w1) > 0:
+                    has_overlap = True
+                    break
+
+        if has_overlap:
+            overlap_count += 1
+
+        hle_waits = []
+        for h in long_hle_spans:
+            if overlap(h[4], h[5], w0, w1) > 0:
+                hle_waits.append({
+                    "import": name_of(h[2]),
+                    "nid": f"{h[2]:08X}",
+                    "tid": h[1],
+                    "dur_ms": h[5] - h[4],
+                })
+
+        underruns_detail.append({
+            "at_s": u_t / 1000.0,
+            "depth_frames": u[2],
+            "depth_ms": u[2] / 48.0,
+            "blocks_since": u[3],
+            "nearest_frame_gap_ms": nearest_gap_ms,
+            "overlap": has_overlap,
+            "hle_waits": hle_waits,
+        })
+
+    overlap_share = (overlap_count / u_count) if u_count > 0 else None
+
+    stale_detail = []
+    stale_overlap_count = 0
+    for s in stale_spans:
+        s_t = s[4]
+        nearest_gap_ms = None
+        if frame_gaps:
+            def dist_to_gap(gap):
+                g0, g1, _ = gap
+                if g0 <= s_t <= g1:
+                    return 0.0
+                if s_t < g0:
+                    return g0 - s_t
+                return s_t - g1
+            nearest = min(frame_gaps, key=dist_to_gap)
+            nearest_gap_ms = nearest[2]
+
+        w0 = s_t - 50.0
+        w1 = s_t
+        has_overlap = False
+        for g0, g1, dur in frame_gaps:
+            if dur > 40.0 and overlap(g0, g1, w0, w1) > 0:
+                has_overlap = True
+                break
+        if not has_overlap:
+            for d in d_lw_spans:
+                if overlap(d[4], d[5], w0, w1) > 0:
+                    has_overlap = True
+                    break
+
+        if s[3] == 1 and has_overlap:
+            stale_overlap_count += 1
+
+        hle_waits = []
+        for h in long_hle_spans:
+            if overlap(h[4], h[5], w0, w1) > 0:
+                hle_waits.append({
+                    "import": name_of(h[2]),
+                    "nid": f"{h[2]:08X}",
+                    "tid": h[1],
+                    "dur_ms": h[5] - h[4],
+                })
+
+        stale_detail.append({
+            "at_s": s_t / 1000.0,
+            "port": s[1],
+            "block": s[2],
+            "run_len": s[3],
+            "nearest_frame_gap_ms": nearest_gap_ms,
+            "overlap": has_overlap,
+            "hle_waits": hle_waits,
+        })
+
+    stale_overlap_share = (stale_overlap_count / gap_runs_count) if gap_runs_count > 0 else None
+
+    hle_counts = collections.defaultdict(int)
+    for ev in underruns_detail + stale_detail:
+        for hw in ev["hle_waits"]:
+            hle_counts[(hw["nid"], hw["import"], hw["tid"])] += 1
+
+    top_hle = [{"import": imp, "nid": nid, "tid": tid, "count": count}
+               for (nid, imp, tid), count in sorted(hle_counts.items(), key=lambda x: -x[1])]
+
+    return {
+        "blocks_per_s": blocks_per_s,
+        "blocks_s": blocks_per_s,
+        "mix_interval_ms": mix_interval,
+        "queue_depth_ms": queue_depth,
+        "underruns": {
+            "count": u_count,
+            "rate": u_rate,
+            "per_s": u_rate,
+        },
+        "underrun_count": u_count,
+        "underrun_rate": u_rate,
+        "stale": {
+            "count": stale_count,
+            "total_blocks": stale_count,
+            "runs": gap_runs_count,
+            "gap_runs": gap_runs_count,
+            "longest_run_blocks": longest_run_blocks,
+            "longest_run_ms": longest_run_ms,
+            "rate": stale_rate,
+            "per_s": stale_rate,
+            "by_port": stale_by_port,
+            "events": stale_detail,
+            "overlap_count": stale_overlap_count,
+            "overlap_share": stale_overlap_share,
+        },
+        "stale_count": stale_count,
+        "stale_runs": gap_runs_count,
+        "stale_total_blocks": stale_count,
+        "stale_longest_run_ms": longest_run_ms,
+        "stale_rate": stale_rate,
+        "pacing": {
+            "total_ms": total_pacing_ms,
+            "by_reason": pacing_totals,
+        },
+        "pacing_by_reason": pacing_totals,
+        "correlation": {
+            "underruns": underruns_detail,
+            "stale": stale_detail,
+            "overlap_count": overlap_count,
+            "overlap_share": overlap_share,
+            "stale_overlap_count": stale_overlap_count,
+            "stale_overlap_share": stale_overlap_share,
+            "top_hle_waits": top_hle,
+        },
+        "overlap_share": overlap_share,
+        "top_hle_waits": top_hle,
+    }
+
+
+def print_audio_section(aud):
+    print("\nAudio:")
+    if aud is None:
+        print("  no audio spans")
+        return
+    fr = aud["mix_interval_ms"]
+    qd = aud["queue_depth_ms"]
+    u = aud["underruns"]
+    st = aud["stale"]
+    p = aud["pacing"]
+    c = aud["correlation"]
+
+    def ms_fmt(x):
+        return f"{x:.2f}" if x is not None else "n/a"
+
+    print(f"  {aud['blocks_per_s']:.1f} blocks/s, mix interval p50 {ms_fmt(fr['p50'])}"
+          f" p90 {ms_fmt(fr['p90'])} p99 {ms_fmt(fr['p99'])} max {ms_fmt(fr['max'])} ms")
+    print(f"  queue depth p1 {ms_fmt(qd['p1'])} p5 {ms_fmt(qd['p5'])} p50 {ms_fmt(qd['p50'])} ms")
+    rate_str = f"{u['rate']:.1f} /s" if u['rate'] is not None else "n/a"
+    print(f"  underruns: {u['count']} ({rate_str})")
+    st_rate_str = f"{st['rate']:.1f} runs/s" if st['rate'] is not None else "n/a"
+    print(f"  stale blocks: {st['total_blocks']} across {st['runs']} audible gap run(s)"
+          f" ({st_rate_str}, longest {st['longest_run_blocks']} blk / {ms_fmt(st['longest_run_ms'])} ms)")
+    if st["by_port"]:
+        port_strs = [f"port {p}: {info['runs']} run(s), {info['total_blocks']} block(s), max {info['longest_run_blocks']} blk ({ms_fmt(info['longest_run_ms'])} ms)"
+                     for p, info in sorted(st["by_port"].items())]
+        print(f"    by port: {', '.join(port_strs)}")
+    print(f"  pacing wait: {p['total_ms']:.1f} ms in all")
+    for name, r in p["by_reason"].items():
+        print(f"    {name:14s} {r['ms']:6.1f} ms ({r['count']} waits)")
+    if not u["count"] and not st["count"]:
+        print("  correlation: no underruns or stale blocks")
+    else:
+        print("  correlation (50 ms before event):")
+        if u["count"]:
+            pct = f"{100 * c['overlap_share']:.0f}%" if c['overlap_share'] is not None else "n/a"
+            print(f"    underruns overlapping a >40 ms frame gap or drawable/label wait: {pct} ({c['overlap_count']}/{u['count']})")
+        if st["runs"]:
+            pct = f"{100 * st['overlap_share']:.0f}%" if st['overlap_share'] is not None else "n/a"
+            print(f"    audible gap runs overlapping a >40 ms frame gap or drawable/label wait: {pct} ({st['overlap_count']}/{st['runs']})")
+        if c["top_hle_waits"]:
+            print("    top overlapping long guest waits (>10 ms HLE):")
+            for h in c["top_hle_waits"][:6]:
+                print(f"      tid {h['tid']:3d} {h['import']} ({h['nid']}): {h['count']}")
+        else:
+            print("    overlapping long guest waits (>10 ms HLE): none")
+
 def main():
     ap = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
     ap.add_argument("trace")
@@ -467,6 +786,7 @@ def main():
                            "fast": breakdown(acc, fast, names, name_of) if fast else None,
                            "slow": breakdown(acc, slow, names, name_of) if slow else None}
     report.update(drawable_label_sections(spans, len(flips), header_dropped(header)))
+    report["audio"] = audio_section(spans, header_dropped(header), name_of)
     if cad_nid is not None:
         report["cadence"] = {"nid": f"{cad_nid:08X}", "import": name_of(cad_nid),
                              "threads": cadence(spans, names, name_of, cad_nid, cad_tid, args.gap)}
@@ -485,6 +805,7 @@ def main():
             if report["split"][part]:
                 print_breakdown(report["split"][part], f"Frames {rel} {args.split:g} ms")
     print_drawable_label(report)
+    print_audio_section(report["audio"])
     if "cadence" in report:
         c = report["cadence"]
         print(f"\nCadence of {c['import']} ({c['nid']}):")

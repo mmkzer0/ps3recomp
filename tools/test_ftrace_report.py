@@ -8,6 +8,7 @@ from pathlib import Path
 
 TOOL = Path(__file__).resolve().parent / "ftrace_report.py"
 FLIP_REQ, USLEEP, HLE, PRESENT = 9, 2, 15, 10
+AUDIO_MIX, AUDIO_PACE, AUDIO_UNDERRUN, AUDIO_STALE = 18, 19, 20, 21
 LOCK, SYNC, POLL = 0x1573DC3F, 0xFACB3CED, 0x74A66AF0     # lwmutex_lock, Port2Sync, GetPortConfig
 
 failures = 0
@@ -158,6 +159,134 @@ with tempfile.TemporaryDirectory() as tmp:
           r["label_wait"]["count"] == 0 and r["label_wait"]["p50_ms"] is None, "no such spans: zero counts, no statistics")
     rc, out, err = run(tmp, trace(lines))
     check(rc == 0 and out.count("none recorded") == 2, "text report: both sections say none recorded")
+    check(r.get("audio") is None, "trace without audio spans: audio key is None")
+    check(rc == 0 and "no audio spans" in out, "text report: says no audio spans")
 
+    # Steady 187.5 blocks/s with deep queue (0 underruns)
+    flips = [span(FLIP_REQ, 1, 0, 0, t, t) for t in (0, 200, 400, 600)]
+    steady_lines = list(flips)
+    dt = 16.0 / 3.0
+    for i in range(96):
+        t0 = i * dt
+        t1 = t0 + 0.5
+        steady_lines.append(span(AUDIO_MIX, 0, 1, 1024, t0, t1))
+        steady_lines.append(span(AUDIO_PACE, 0, 1, 1024, t1, t1 + 4.8))
+
+    rc, out, err = run(tmp, trace(steady_lines), "--json")
+    r = json.loads(out)
+    aud = r["audio"]
+    check(abs(aud["blocks_per_s"] - 187.5) < 0.01, "steady audio: exactly 187.5 blocks/s")
+    check(aud["underruns"]["count"] == 0, "steady audio: 0 underruns")
+    check(aud["underruns"]["rate"] == 0.0, "steady audio: 0.0 underrun rate")
+    check(abs(aud["queue_depth_ms"]["p50"] - 1024 / 48.0) < 1e-4, "steady audio: queue depth p50 ~21.33 ms")
+    check(abs(aud["mix_interval_ms"]["p50"] - dt) < 0.01, "steady audio: mix interval p50 ~5.33 ms")
+    check(aud["pacing"]["by_reason"]["queue full"]["count"] == 96, "steady audio: 96 pacing waits")
+    check(abs(aud["pacing"]["by_reason"]["queue full"]["ms"] - 96 * 4.8) < 1e-4, "steady audio: pacing total ms")
+    rc, out, err = run(tmp, trace(steady_lines))
+    check(rc == 0 and "187.5 blocks/s" in out and "underruns: 0" in out, "steady audio text report")
+
+    # Starving queue with periodic underruns
+    starve_lines = list(flips)
+    for i in range(60):
+        t0 = i * dt
+        t1 = t0 + 0.5
+        if i > 0 and i % 10 == 0:
+            starve_lines.append(span(AUDIO_UNDERRUN, 0, 80, 10, t0, t0))
+        starve_lines.append(span(AUDIO_MIX, 0, 1, 100, t0, t1))
+        starve_lines.append(span(AUDIO_PACE, 0, 3, 100, t1, t1 + 4.8))
+
+    rc, out, err = run(tmp, trace(starve_lines), "--json")
+    r = json.loads(out)
+    aud = r["audio"]
+    check(aud["underruns"]["count"] == 5, "starving queue: 5 underruns")
+    check(aud["underruns"]["rate"] is not None and aud["underruns"]["rate"] > 0, "starving queue: positive underrun rate")
+    check(abs(aud["queue_depth_ms"]["p1"] - 100 / 48.0) < 1e-4, "starving queue: p1 depth ~2.08 ms")
+
+    # Underruns aligned with long frame gaps vs not aligned
+    corr_frames = [0, 20, 40, 100, 120, 140, 160, 180, 200, 220, 240, 260]
+    corr_lines = [span(FLIP_REQ, 1, 0, 0, t, t) for t in corr_frames[:4]]
+    for t in corr_frames:
+        corr_lines.append(span(PRESENT, 0, 0, 0, t, t + 1))
+    # Underrun 1 at t = 80 ms: inside 60ms gap (40..100). Window [30, 80] overlaps 60ms gap. ALIGNED.
+    corr_lines.append(span(AUDIO_UNDERRUN, 0, 0, 10, 80, 80))
+    # Underrun 2 at t = 200 ms: window [150, 200], all gaps are 20ms <= 40ms, no drawable/label_wait. NOT ALIGNED.
+    corr_lines.append(span(AUDIO_UNDERRUN, 0, 0, 20, 200, 200))
+    # DRAWABLE span at 235..240 ms
+    corr_lines.append(span(DRAWABLE, 1, 0, 0, 235, 240))
+    # Underrun 3 at t = 250 ms: window [200, 250] overlaps DRAWABLE at 235..240. ALIGNED.
+    corr_lines.append(span(AUDIO_UNDERRUN, 0, 0, 10, 250, 250))
+    corr_lines.append(span(AUDIO_MIX, 0, 1, 500, 0, 1))
+
+    rc, out, err = run(tmp, trace(corr_lines), "--json")
+    r = json.loads(out)
+    aud = r["audio"]
+    u_dets = aud["correlation"]["underruns"]
+    check(len(u_dets) == 3, "correlation: 3 underruns")
+    check(abs(u_dets[0]["nearest_frame_gap_ms"] - 60.0) < 1e-4, "underrun 1: nearest gap 60 ms")
+    check(u_dets[0]["overlap"] is True, "underrun 1: overlap True")
+    check(abs(u_dets[1]["nearest_frame_gap_ms"] - 20.0) < 1e-4, "underrun 2: nearest gap 20 ms")
+    check(u_dets[1]["overlap"] is False, "underrun 2: overlap False")
+    check(u_dets[2]["overlap"] is True, "underrun 3: overlap True via DRAWABLE")
+    check(abs(aud["correlation"]["overlap_share"] - 2 / 3) < 1e-4, "correlation overlap_share is 2/3")
+    check(aud["correlation"]["overlap_count"] == 2, "correlation overlap_count is 2")
+
+    # Stale port blocks: gap after playing audio with growing run length, resets on refill,
+    # aligned vs unaligned with long HLE spans
+    stale_frames = [0, 20, 40, 100, 120, 140, 160, 180, 200, 220, 240, 260, 280, 300]
+    stale_test_lines = [span(FLIP_REQ, 1, 0, 0, t, t) for t in (0, 20, 40, 60)]
+    for t in stale_frames:
+        stale_test_lines.append(span(PRESENT, 0, 0, 0, t, t + 1))
+    stale_test_lines.append(span(AUDIO_MIX, 0, 1, 500, 0, 1))
+
+    # Long HLE span (25 ms > 10 ms) on tid 2 in Port2Sync (0xFACB3CED) at 70..95 ms
+    stale_test_lines.append(span(HLE, 2, 0xFACB3CED, 0x1000, 70, 95))
+
+    # Gap run 1 on Port 0: growing run length 1, 2, 3 (at 80, 85, 90 ms)
+    # Event 1 (run start, b=1) at 80 ms: overlaps 60ms frame gap [40, 100] and long HLE [70, 95]
+    stale_test_lines.append(span(AUDIO_STALE, 0, 2, 1, 80, 80))
+    stale_test_lines.append(span(AUDIO_STALE, 0, 3, 2, 85, 85))
+    stale_test_lines.append(span(AUDIO_STALE, 0, 4, 3, 90, 90))
+
+    # Gap run 2 on Port 1: growing run length 1, 2 (at 210, 215 ms)
+    # Event 4 (run start, b=1) at 210 ms: unaligned with >40ms gap (20ms gaps) and no HLE
+    stale_test_lines.append(span(AUDIO_STALE, 1, 5, 1, 210, 210))
+    stale_test_lines.append(span(AUDIO_STALE, 1, 6, 2, 215, 215))
+
+    rc, out, err = run(tmp, trace(stale_test_lines), "--json")
+    r = json.loads(out)
+    aud = r["audio"]
+    st = aud["stale"]
+    check(st["total_blocks"] == 5, "stale total blocks: 5")
+    check(st["runs"] == 2, "stale runs: 2")
+    check(st["longest_run_blocks"] == 3, "stale longest run blocks: 3")
+    check(abs(st["longest_run_ms"] - 3 * (16.0 / 3.0)) < 1e-4, "stale longest run ms: 16.0")
+    check(st["by_port"]["0"]["runs"] == 1 and st["by_port"]["0"]["total_blocks"] == 3 and st["by_port"]["0"]["longest_run_blocks"] == 3,
+          "stale port 0: 1 run, 3 blocks, longest 3")
+    check(st["by_port"]["1"]["runs"] == 1 and st["by_port"]["1"]["total_blocks"] == 2 and st["by_port"]["1"]["longest_run_blocks"] == 2,
+          "stale port 1: 1 run, 2 blocks, longest 2")
+    st_evs = st["events"]
+    check(len(st_evs) == 5, "stale events: 5")
+    check(st_evs[0]["run_len"] == 1 and st_evs[1]["run_len"] == 2 and st_evs[2]["run_len"] == 3,
+          "growing run length 1, 2, 3")
+    check(st_evs[3]["run_len"] == 1 and st_evs[4]["run_len"] == 2, "run resets to 1, 2 on next gap")
+    # Event 1 (run start at 80ms)
+    check(abs(st_evs[0]["nearest_frame_gap_ms"] - 60.0) < 1e-4, "stale run 1: nearest gap 60 ms")
+    check(st_evs[0]["overlap"] is True, "stale run 1: overlap True")
+    check(len(st_evs[0]["hle_waits"]) == 1 and st_evs[0]["hle_waits"][0]["nid"] == "FACB3CED",
+          "stale run 1: long HLE wait overlap Port2Sync")
+    # Event 4 (run start at 210ms)
+    check(abs(st_evs[3]["nearest_frame_gap_ms"] - 20.0) < 1e-4, "stale run 2: nearest gap 20 ms")
+    check(st_evs[3]["overlap"] is False, "stale run 2: overlap False")
+    check(len(st_evs[3]["hle_waits"]) == 0, "stale run 2: no HLE wait overlap")
+    check(abs(st["overlap_share"] - 0.5) < 1e-4, "stale gap runs overlap_share is 0.5 (1/2)")
+    check(len(aud["correlation"]["top_hle_waits"]) >= 1 and
+          aud["correlation"]["top_hle_waits"][0]["nid"] == "FACB3CED",
+          "top_hle_waits names Port2Sync")
+
+    rc, out, err = run(tmp, trace(stale_test_lines))
+    check(rc == 0 and "stale blocks: 5 across 2 audible gap run(s)" in out, "stale blocks text report")
+    check(rc == 0 and "port 0: 1 run(s), 3 block(s), max 3 blk" in out, "port 0 text report")
+    check(rc == 0 and "top overlapping long guest waits" in out and "Port2Sync" in out,
+          "text report names overlapping HLE import")
 print("ftrace_report: %s" % ("ok" if not failures else "%d failed" % failures))
 sys.exit(1 if failures else 0)

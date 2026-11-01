@@ -23,6 +23,7 @@
 #include <math.h>
 #include "ps3emu/log_first.h"
 #include "ps3emu/thread_name.h"
+#include "ps3emu/ps3_ftrace.h"
 
 /* ---------------------------------------------------------------------------
  * Backend selection
@@ -124,7 +125,8 @@ typedef struct {
 
 static int            s_audio_initialized = 0;
 static AudioPortSlot  s_ports[CELL_AUDIO_PORT_MAX];
-
+static uint8_t        s_audio_port_prev_non_silent[CELL_AUDIO_PORT_MAX];
+static uint32_t       s_audio_port_unrefill_run[CELL_AUDIO_PORT_MAX];
 /* Event queue notification */
 typedef struct {
     int  in_use;
@@ -404,8 +406,27 @@ static void audio_backend_wait(void)
     else Sleep(1);
 }
 
+static u32 audio_backend_queued_samples(void)
+{
+    if (!s_wasapi_client) return 0;
+    UINT32 padding = 0;
+    const HRESULT hr = s_wasapi_client->lpVtbl->GetCurrentPadding(s_wasapi_client, &padding);
+    if (FAILED(hr)) return 0;
+    return padding;
+}
 
 #endif /* AUDIO_BACKEND_WASAPI */
+
+static inline int audio_backend_has_device(void)
+{
+#if AUDIO_BACKEND_SDL2
+    return s_sdl_audio_dev != 0;
+#elif AUDIO_BACKEND_WASAPI
+    return s_wasapi_client != NULL;
+#else
+    return 0;
+#endif
+}
 
 /* ---------------------------------------------------------------------------
  * Mixing
@@ -464,6 +485,28 @@ static void audio_mix_one_block(void)
         u32 block_idx = (u32)(port->read_index % nblock);
         u32 block_offset = block_idx * CELL_AUDIO_BLOCK_SAMPLES * nch;
         float* src = port->buffer + block_offset;
+        /* Firmware clears a ring-buffer block after consuming it (see memset
+         * below). An all-zero block at read therefore means the producer has
+         * not rewritten it since the previous cycle (or wrote exact silence).
+         * Emit PS3_FT_AUDIO_STALE only when the port's previous mixed block was
+         * non-silent (the stream was playing, so the missed refill causes an
+         * audible gap). b records the run length of consecutive unrefilled blocks,
+         * which resets at the next non-zero block. */
+        if (PS3_FT_ON()) {
+            int non_silent = 0;
+            for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * nch; i++) {
+                if (src[i] != 0.0f) { non_silent = 1; break; }
+            }
+            if (non_silent) {
+                s_audio_port_prev_non_silent[p] = 1;
+                s_audio_port_unrefill_run[p] = 0;
+            } else if (s_audio_port_prev_non_silent[p]) {
+                s_audio_port_unrefill_run[p]++;
+                const uint64_t now_ft = ps3_ft_now();
+                ps3_ft_span(PS3_FT_AUDIO_STALE, (uint32_t)p, block_idx,
+                            s_audio_port_unrefill_run[p], now_ft, now_ft);
+            }
+        }
 
         /* AUDIO_PEAK diag: which blocks of this port's WHOLE ring hold data,
          * vs which block the read cursor is on -- distinguishes "writer never
@@ -585,9 +628,17 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
      * With no device, pace on the performance counter instead. */
     LARGE_INTEGER qf, q0; QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&q0);
     unsigned long long blocks = 0;
+    uint32_t win_blocks_since_underrun = 0;
     while (s_mix_thread_running) {
         const int room = audio_backend_room();
-        if (room >= 0 && room < CELL_AUDIO_BLOCK_SAMPLES) { audio_backend_wait(); continue; }
+        if (room >= 0 && room < CELL_AUDIO_BLOCK_SAMPLES) {
+            const uint64_t pace_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+            const u32 queued = audio_backend_queued_samples();
+            audio_backend_wait();
+            if (pace_t0)
+                ps3_ft_span(PS3_FT_AUDIO_PACE, 0, (uint32_t)PS3_FT_AUDIO_PACE_QUEUE_FULL, queued, pace_t0, ps3_ft_now());
+            continue;
+        }
 #if AUDIO_BACKEND_WASAPI
         /* Device queue under half a block: it is about to play silence (an
          * audible click/stutter). AUDIO_RATE reports how often. */
@@ -598,14 +649,32 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
             LARGE_INTEGER now; QueryPerformanceCounter(&now);
             const long long due = q0.QuadPart +
                 (long long)(blocks * CELL_AUDIO_BLOCK_SAMPLES * qf.QuadPart / CELL_AUDIO_SAMPLE_RATE);
-            if (now.QuadPart < due) { Sleep(1); continue; }
+            if (now.QuadPart < due) {
+                const uint64_t pace_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+                Sleep(1);
+                if (pace_t0)
+                    ps3_ft_span(PS3_FT_AUDIO_PACE, 0, (uint32_t)PS3_FT_AUDIO_PACE_CLOCK, 0, pace_t0, ps3_ft_now());
+                continue;
+            }
             /* More than 50 ms behind (device just went away, a debugger
              * stop): drop the backlog instead of mixing it in a burst. */
             if (now.QuadPart - due > qf.QuadPart / 20)
                 q0.QuadPart = now.QuadPart -
                     (long long)(blocks * CELL_AUDIO_BLOCK_SAMPLES * qf.QuadPart / CELL_AUDIO_SAMPLE_RATE);
         }
+        const uint64_t mix_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+        if (audio_backend_has_device()) {
+            const u32 depth_before = audio_backend_queued_samples();
+            if (depth_before < CELL_AUDIO_BLOCK_SAMPLES) {
+                if (PS3_FT_ON()) {
+                    const uint64_t now_ft = ps3_ft_now();
+                    ps3_ft_span(PS3_FT_AUDIO_UNDERRUN, 0, depth_before, win_blocks_since_underrun, now_ft, now_ft);
+                }
+                win_blocks_since_underrun = 0;
+            }
+        }
         blocks++;
+        win_blocks_since_underrun++;
         /* Mix and submit one block */
         audio_mix_one_block();
         /* AUDIO_PEAK=1: report the mixed block's peak amplitude periodically so
@@ -622,6 +691,10 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
           if (_wf == (FILE*)-1) { const char* e = getenv("AUDIO_WAV"); _wf = e ? fopen(e, "wb") : NULL; }
           if (_wf) fwrite(s_mix_buffer, sizeof(float), CELL_AUDIO_BLOCK_SAMPLES * 2, _wf); }
         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
+        const u32 depth_after = audio_backend_has_device() ? audio_backend_queued_samples() : 0;
+        if (mix_t0) {
+            ps3_ft_span(PS3_FT_AUDIO_MIX, 0, 1, depth_after, mix_t0, ps3_ft_now());
+        }
         /* AUDIO_RATE=1: blocks mixed vs real time, and frames dropped. */
         { static int on = -1; if (on < 0) on = getenv("AUDIO_RATE") ? 1 : 0;
           if (on) { static ULONGLONG t0; static unsigned n, z; static unsigned long long d0, u0;
@@ -651,17 +724,45 @@ static void* audio_mix_thread_func(void* arg)
 {
     (void)arg;
     printf("[cellAudio] Mixing thread started\n");
+    uint32_t blocks_since_underrun = 0;
 
     while (s_mix_thread_running) {
+        const uint64_t mix_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
         audio_mix_one_block();
+
+        if (audio_backend_has_device()) {
+            const u32 depth_before = audio_backend_queued_samples();
+            if (depth_before < CELL_AUDIO_BLOCK_SAMPLES) {
+                if (PS3_FT_ON()) {
+                    const uint64_t now_ft = ps3_ft_now();
+                    ps3_ft_span(PS3_FT_AUDIO_UNDERRUN, 0, depth_before, blocks_since_underrun, now_ft, now_ft);
+                }
+                blocks_since_underrun = 0;
+            }
+        }
         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
+        blocks_since_underrun++;
+
+        const u32 depth_after = audio_backend_has_device() ? audio_backend_queued_samples() : 0;
+        if (mix_t0) {
+            ps3_ft_span(PS3_FT_AUDIO_MIX, 0, 1, depth_after, mix_t0, ps3_ft_now());
+        }
         audio_notify_event_queues();
 
-        u32 queued = audio_backend_queued_samples();
+        const uint64_t pace_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+        const u32 queued = audio_backend_queued_samples();
+        const uint32_t reason = !audio_backend_has_device()
+                                    ? (uint32_t)PS3_FT_AUDIO_PACE_CLOCK
+                                    : (queued > CELL_AUDIO_BLOCK_SAMPLES * 4
+                                           ? (uint32_t)PS3_FT_AUDIO_PACE_QUEUE_FULL
+                                           : (uint32_t)PS3_FT_AUDIO_PACE_BACKEND_WAIT);
         if (queued > CELL_AUDIO_BLOCK_SAMPLES * 4) {
             usleep(5000);
         } else {
             usleep(2000);
+        }
+        if (pace_t0) {
+            ps3_ft_span(PS3_FT_AUDIO_PACE, 0, reason, queued, pace_t0, ps3_ft_now());
         }
     }
 
@@ -727,6 +828,8 @@ s32 cellAudioInit(void)
         return CELL_AUDIO_ERROR_ALREADY_INIT;
 
     memset(s_ports, 0, sizeof(s_ports));
+    memset(s_audio_port_prev_non_silent, 0, sizeof(s_audio_port_prev_non_silent));
+    memset(s_audio_port_unrefill_run, 0, sizeof(s_audio_port_unrefill_run));
     memset(s_notify_queues, 0, sizeof(s_notify_queues));
     mutex_init(&s_audio_mutex);
 
@@ -770,7 +873,8 @@ s32 cellAudioQuit(void)
         s_ports[i].in_use = 0;
         s_ports[i].running = 0;
     }
-
+    memset(s_audio_port_prev_non_silent, 0, sizeof(s_audio_port_prev_non_silent));
+    memset(s_audio_port_unrefill_run, 0, sizeof(s_audio_port_unrefill_run));
     mutex_destroy(&s_audio_mutex);
     s_audio_initialized = 0;
     return CELL_OK;
@@ -829,7 +933,8 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
     port->param.nBlock   = nblk;
     port->read_index  = 0;
     port->write_index = 0;
-
+    s_audio_port_prev_non_silent[found] = 0;
+    s_audio_port_unrefill_run[found] = 0;
     /* Allocate the audio buffer in GUEST memory so portAddr/readIndexAddr are
      * real guest addresses (the game's mixer -- FMOD here -- writes PCM there
      * and validates them as 1 MB-aligned guest pointers; a host pointer trips
@@ -888,6 +993,8 @@ s32 cellAudioPortClose(u32 portNum)
 
     s_ports[portNum].in_use  = 0;
     s_ports[portNum].running = 0;
+    s_audio_port_prev_non_silent[portNum] = 0;
+    s_audio_port_unrefill_run[portNum] = 0;
 
     mutex_unlock(&s_audio_mutex);
     return CELL_OK;
@@ -916,8 +1023,9 @@ s32 cellAudioPortStart(u32 portNum)
 
     mutex_lock(&s_audio_mutex);
     s_ports[portNum].running = 1;
+    s_audio_port_prev_non_silent[portNum] = 0;
+    s_audio_port_unrefill_run[portNum] = 0;
     mutex_unlock(&s_audio_mutex);
-
     return CELL_OK;
 }
 
@@ -936,6 +1044,8 @@ s32 cellAudioPortStop(u32 portNum)
 
     mutex_lock(&s_audio_mutex);
     s_ports[portNum].running = 0;
+    s_audio_port_prev_non_silent[portNum] = 0;
+    s_audio_port_unrefill_run[portNum] = 0;
     mutex_unlock(&s_audio_mutex);
 
     return CELL_OK;
