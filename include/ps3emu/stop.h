@@ -133,7 +133,9 @@ extern "C" {
     /* A sceNpTrophy situation whose console result the firmware does not determine (an abort that wakes a registration). */ \
     X(NP_TROPHY_UNMODELLED,     "np-trophy-unmodelled")                                                    \
     /* An RSX driver word (flip head, driver queue) whose meaning the runtime cannot honour. */            \
-    X(RSX_DRIVER_METHOD,        "rsx-driver-method")
+    X(RSX_DRIVER_METHOD,        "rsx-driver-method")                                                       \
+    /* A pad trace (pad.record / pad.replay) that cannot be written, or a replay file that is not a well-formed trace. */ \
+    X(PAD_TRACE,                "pad-trace")
 
 /* A fixed underlying type in C++ makes a kind outside the list (a caller's bug,
  * which the stop still reports as "invalid-kind") a well-defined value rather
@@ -291,6 +293,18 @@ PS3_NORETURN void ps3_stop_rsx_unknown_method(const char* cls, uint32_t method, 
 #define PS3_STOP_RSX_NONE 0xFFFFFFFFu
 PS3_NORETURN void ps3_stop_rsx_driver_method(uint32_t method, uint32_t head, uint32_t arg,
                                              uint32_t buffer, const char* reason);
+
+/* Generic helper to raise PS3_STOP_PAD_TRACE: the pad recorder or replayer (libs/input/pad_trace.h) met
+ * something that would make a trace untrustworthy, so the run ends instead of recording a file that only
+ * looks complete or replaying input the guest was never given: an output it cannot create or write, an
+ * existing output it will not overwrite, a replay file with a malformed header, an unknown version, a
+ * malformed or truncated line, keys that go backwards, or a port outside the header's range. `role` is
+ * "record" or "replay", `path` the file, `line` its 1-based line (0 when none applies: an open or a write),
+ * `reason` a stable id (header, version, syntax, unknown-key, duplicate-key, value, record-kind,
+ * keys-backwards, port-range, after-end, truncated, exists, io) and `detail` free text. Fields: role, path,
+ * line, reason, detail. */
+PS3_NORETURN void ps3_stop_pad_trace(const char* role, const char* path, uint32_t line,
+                                     const char* reason, const char* detail);
 
 /* ---- frontier ---------------------------------------------------------- */
 
