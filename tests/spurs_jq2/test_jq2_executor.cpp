@@ -65,6 +65,9 @@
  *   push-nonblock  flags bit 2 on a full ring is AGAIN: nothing written, B rolled back
  *   push-flags  PushJob flags & ~7, CopyPush flags & ~3, PushSync flags & ~4: A02, first
  *   stop-push-block-shutdown  Shutdown while a pusher is parked: jq2-unmodelled
+ *   trace-spans, trace-sync, trace-queues, trace-concurrent, trace-off  the ftrace jq2 kinds 22-26 (ps3_ftrace.h):
+ *               PUSH/JOB/CREDIT per (q, seq), SYNC_WAIT keyed by waiter, IDLE, the q of each queue and its
+ *               creation line, seq unique under concurrent pushers; nothing recorded with tracing off
  */
 #include "jq2/executor.hpp"
 #include "jq2/jq2.h"
@@ -75,6 +78,8 @@
 #include "spu_observe.h"
 #include "spu_coherency.h"
 #include "syscalls/sys_event.h"
+#include "ps3emu/ps3_ftrace.h"
+#include "syscalls/ppu_thread_id.h"
 #include "memory/reservation.h"
 
 #include <sys/mman.h>
@@ -82,6 +87,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -98,6 +104,7 @@
 extern "C" {
 uint8_t* vm_base;
 extern uint32_t ppu_vm_size; /* runtime/host/host_stubs.c */
+extern PPU_THREAD_LOCAL ppu_context* g_active_ctx; /* runtime/host/host_stubs.c */
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value);
 u128 spu_rdch(spu_context* ctx, uint32_t channel);
 void spu_halt(spu_context* ctx);
@@ -382,7 +389,7 @@ void hook_done(void*, const JobStart& js)
 }
 
 /* The job bodies a test selects; 0 leaves the interpreter. */
-enum LiftedKind { kNoLifted = 0, kLiftedNormal, kLiftedHalt, kLiftedJmCall };
+enum LiftedKind { kNoLifted = 0, kLiftedNormal, kLiftedHalt, kLiftedJmCall, kLiftedBusy };
 int g_lifted = kNoLifted;
 
 /* A lifted-style body, written the way tools/spu_lifter.py emits code: channel
@@ -432,6 +439,19 @@ void lifted_job(spu_context* c, bool halt)
 void lifted_normal_entry(spu_context* c) { lifted_job(c, false); }
 void lifted_halt_entry(spu_context* c) { lifted_job(c, true); }
 
+/* The transform, then 2 ms of this thread's own CPU time: a job whose CPU time the JOB span must report. */
+void lifted_busy_entry(spu_context* c)
+{
+    lifted_job(c, false);
+    timespec t0;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t0);
+    for (;;) {
+        timespec t;
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t);
+        if ((t.tv_sec - t0.tv_sec) * 1000000000ll + (t.tv_nsec - t0.tv_nsec) >= 2000000) break;
+    }
+}
+
 /* A lifted body that calls jm word 0 the way lifted code calls through a
  * register (the bisl bracket): the resolver finds no lifted function at 0x1500
  * and interprets the planted stop word. */
@@ -456,6 +476,7 @@ JobBody hook_select(void*, const JobStart&)
 {
     switch (g_lifted) {
     case kLiftedHalt: return JobBody{&lifted_halt_entry, -1};
+    case kLiftedBusy: return JobBody{&lifted_busy_entry, -1};
     case kLiftedJmCall: return JobBody{&lifted_jm_call_entry, -1};
     default: return JobBody{&lifted_normal_entry, -1};
     }
@@ -2290,6 +2311,342 @@ void mode_stop_push_block_shutdown()
         "jq2-unmodelled", {"reason=push-blocked-at-shutdown"});
 }
 
+/* ---- jq2 ftrace spans (ps3_ftrace.h kinds 22-26) ---------------------------- */
+
+/* The recorder is read after every thread that can emit has been joined (Rig::teardown joins the
+ * workers; a test joins its own threads), so the records need no synchronisation. */
+std::vector<ps3_ft_rec> ft_kind(int kind)
+{
+    std::vector<ps3_ft_rec> out;
+    const std::uint32_t n = std::min(g_ps3_ft.n, g_ps3_ft.cap);
+    for (std::uint32_t i = 0; i < n; ++i)
+        if (g_ps3_ft.buf[i].kind == static_cast<std::uint32_t>(kind)) out.push_back(g_ps3_ft.buf[i]);
+    return out;
+}
+
+/* The queue a span belongs to. */
+std::uint32_t ft_q(const ps3_ft_rec& r)
+{
+    switch (r.kind) {
+    case PS3_FT_JQ2_PUSH: return r.b & 0xFFu;
+    case PS3_FT_JQ2_SYNC_WAIT: return r.b;
+    default: return r.who >> 8;
+    }
+}
+
+using SeqMap = std::map<std::uint32_t, std::vector<ps3_ft_rec>>;
+SeqMap by_seq(int kind, std::uint32_t q)
+{
+    SeqMap m;
+    for (const ps3_ft_rec& r : ft_kind(kind))
+        if (ft_q(r) == q) m[r.a].push_back(r);
+    return m;
+}
+
+/* Every job pushed on queue `q` (n of them) has exactly one PUSH, JOB and CREDIT under one (q, seq), seq
+ * runs 1..n, and the three spans follow each other in time. With `paused_pushes` every push finished before
+ * any worker could admit, so the queue latency is not negative either. */
+void check_job_spans(std::uint32_t q, std::uint32_t n, bool paused_pushes, std::uint32_t workers)
+{
+    const SeqMap push = by_seq(PS3_FT_JQ2_PUSH, q), job = by_seq(PS3_FT_JQ2_JOB, q),
+                 credit = by_seq(PS3_FT_JQ2_CREDIT, q);
+    CHECK(push.size() == n && job.size() == n && credit.size() == n, "q%u: PUSH %zu JOB %zu CREDIT %zu, want %u each",
+          q, push.size(), job.size(), credit.size(), n);
+    for (std::uint32_t seq = 1; seq <= n; ++seq) {
+        const auto p = push.find(seq), j = job.find(seq), c = credit.find(seq);
+        const bool one = p != push.end() && p->second.size() == 1 && j != job.end() && j->second.size() == 1 &&
+                         c != credit.end() && c->second.size() == 1;
+        CHECK(one, "q%u seq %u: not exactly one PUSH, JOB and CREDIT", q, seq);
+        if (!one) continue;
+        const ps3_ft_rec &pr = p->second[0], &jr = j->second[0], &cr = c->second[0];
+        CHECK(pr.t1 >= pr.t0 && jr.t1 >= jr.t0 && cr.t1 >= cr.t0, "q%u seq %u: a span ends before it starts", q, seq);
+        if (paused_pushes) CHECK(jr.t0 >= pr.t1, "q%u seq %u: JOB starts before PUSH ends", q, seq);
+        CHECK(cr.t0 >= jr.t1, "q%u seq %u: CREDIT starts before JOB ends", q, seq);
+        CHECK((jr.who & 0xFFu) < workers && cr.who == jr.who, "q%u seq %u: worker JOB %u CREDIT %u", q, seq, jr.who,
+              cr.who);
+    }
+}
+
+/* A thread's pushes in time order carry increasing seq: the number is assigned under the queue lock at the push. */
+void check_push_order(std::uint32_t tid, std::uint32_t q, std::uint32_t n)
+{
+    std::vector<ps3_ft_rec> mine;
+    for (const ps3_ft_rec& r : ft_kind(PS3_FT_JQ2_PUSH))
+        if (r.who == tid && ft_q(r) == q) mine.push_back(r);
+    std::sort(mine.begin(), mine.end(), [](const ps3_ft_rec& a, const ps3_ft_rec& b) { return a.t0 < b.t0; });
+    CHECK(mine.size() == n, "tid %u: %zu PUSH spans, want %u", tid, mine.size(), n);
+    for (std::size_t i = 1; i < mine.size(); ++i)
+        CHECK(mine[i].a > mine[i - 1].a, "tid %u: seq %u after %u", tid, mine[i].a, mine[i - 1].a);
+}
+
+/* A CREDIT's wake fields agree with each other. */
+void check_credit_fields(const ps3_ft_rec& r)
+{
+    const std::uint32_t waiter = r.b & 0xFFu, wake = (r.b >> 8) & 0xFFu, due = (r.b >> 16) & 0xFFu;
+    if (due == 0) CHECK(wake == 0 && waiter == 0xFF, "q%u seq %u: no wake but b=0x%X", ft_q(r), r.a, r.b);
+    else CHECK(wake == 1 && waiter >= 1 && waiter < 64, "q%u seq %u: due but b=0x%X", ft_q(r), r.a, r.b);
+}
+
+/* Six jobs pushed while intake is paused, then released: ordered PUSH -> JOB -> CREDIT per (q, seq), the
+ * depth each push saw, the thread CPU time of the job against its wall time, and the idle spans of workers
+ * that had parked with work pending. */
+void mode_trace_spans()
+{
+    constexpr std::uint32_t kJobs = 6;
+    g_lifted = kLiftedBusy;
+    build_image(IMAGE, Prog::transform);
+    install_hooks();
+    {
+        std::lock_guard<std::mutex> lk(g_probe.mu);
+        g_probe.on_admit = nullptr;
+    }
+    ppu_context ppu{};
+    ppu.thread_id = ppu_tid_make(0, 0);
+    g_active_ctx = &ppu;
+    CHECK(PS3_FT_ON(), "tracing is on");
+
+    Rig rig({128, 2, false});
+    CHECK(set_intake_paused(QUEUE, true), "pause");
+    std::vector<JobSpec> specs;
+    for (std::uint32_t j = 0; j < kJobs; ++j) {
+        specs.push_back(spec(j));
+        rig.push_wait(specs.back().desc, 64, j % 3);
+    }
+    /* Parked on the generation of the last push: the workers wake for the first time when intake resumes. */
+    CHECK(wait_for([] {
+              const auto v = observe_queue(QUEUE);
+              return v && v->settled == 2;
+          }),
+          "both workers park with the jobs pending");
+    CHECK(set_intake_paused(QUEUE, false), "resume");
+    CHECK(jq2_port_sync(PORT, 0) == 0, "sync");
+    for (const JobSpec& s : specs) CHECK(job_ok(s), "job %u output", s.serial);
+    rig.teardown();
+    g_active_ctx = nullptr;
+
+    check_job_spans(0, kJobs, true, 2);
+    check_push_order(ppu_tid_diag_index(ppu.thread_id), 0, kJobs);
+    for (const ps3_ft_rec& r : ft_kind(PS3_FT_JQ2_PUSH)) {
+        CHECK(r.who == ppu_tid_diag_index(ppu.thread_id), "PUSH tid %u", r.who);
+        CHECK((r.b >> 8) == r.a, "PUSH seq %u saw depth %u; nothing was admitted yet", r.a, r.b >> 8);
+    }
+    for (const ps3_ft_rec& r : ft_kind(PS3_FT_JQ2_JOB)) {
+        const std::uint64_t wall_us = (r.t1 - r.t0) / 1000;
+        CHECK(r.b >= 2000 && r.b <= wall_us + 2000, "seq %u: CPU %u us over a wall of %llu us (the body spins 2 ms)", r.a,
+              r.b, (unsigned long long)wall_us);
+    }
+    for (const ps3_ft_rec& r : ft_kind(PS3_FT_JQ2_CREDIT)) check_credit_fields(r);
+
+    const std::vector<ps3_ft_rec> idle = ft_kind(PS3_FT_JQ2_IDLE);
+    for (std::uint32_t w = 0; w < 2; ++w) {
+        bool parked_with_work = false;
+        for (const ps3_ft_rec& r : idle) {
+            CHECK(r.who >> 8 == 0 && (r.who & 0xFFu) < 2 && r.t1 >= r.t0, "IDLE who 0x%X", r.who);
+            if (r.who == w) parked_with_work = parked_with_work || (r.a == kJobs && r.b <= kJobs);
+        }
+        CHECK(parked_with_work, "worker %u: no IDLE span that began with %u jobs pending", w, kJobs);
+    }
+    CHECK(ft_kind(PS3_FT_JQ2_SYNC_WAIT).size() <= 1, "at most the one blocking Sync");
+}
+
+/* A blocking Port2Sync emits one SYNC_WAIT, keyed by the waiter id the port line carries, and the CREDIT
+ * that woke it names the same waiter. A Sync that does not block emits none. */
+void mode_trace_sync()
+{
+    build_image(IMAGE, Prog::transform);
+    install_hooks();
+    {
+        std::lock_guard<std::mutex> lk(g_probe.mu);
+        g_probe.on_admit = nullptr;
+    }
+    CHECK(PS3_FT_ON(), "tracing is on");
+    Rig rig({128, 1, false});
+    CHECK(set_intake_paused(QUEUE, true), "pause");
+    const JobSpec a = spec(0);
+    CHECK(rig.push(a.desc, 64, 0) == 0, "push");
+
+    ppu_context waiter_ppu{};
+    waiter_ppu.thread_id = ppu_tid_make(1, 2);
+    std::atomic<std::int32_t> rc{-1};
+    std::thread t([&] {
+        g_active_ctx = &waiter_ppu;
+        rc = jq2_port_sync(PORT, 0);
+        g_active_ctx = nullptr;
+    });
+    CHECK(wait_for([] { return (port_a() & 0x80000000u) != 0; }), "the Sync registered its wait");
+    const std::uint32_t id = get32(PORT + 4);
+    CHECK(id >= 1 && id < 64, "waiter id %u", id);
+    CHECK(set_intake_paused(QUEUE, false), "resume");
+    t.join();
+    CHECK(rc == 0, "sync rc 0x%X", unsigned(rc.load()));
+
+    CHECK(jq2_port_sync(PORT, 0) == 0, "a Sync with nothing pending completes without blocking");
+    CHECK(jq2_port_sync(PORT, 4) == 0, "a poll completes");
+    rig.teardown();
+
+    const std::vector<ps3_ft_rec> waits = ft_kind(PS3_FT_JQ2_SYNC_WAIT);
+    CHECK(waits.size() == 1, "%zu SYNC_WAIT spans, want 1 (the Syncs that did not block emit none)", waits.size());
+    std::vector<ps3_ft_rec> due;
+    for (const ps3_ft_rec& r : ft_kind(PS3_FT_JQ2_CREDIT)) {
+        check_credit_fields(r);
+        if ((r.b >> 16) & 0xFFu) due.push_back(r);
+    }
+    CHECK(due.size() == 1, "%zu due CREDIT spans, want 1", due.size());
+    if (waits.size() == 1 && due.size() == 1) {
+        const ps3_ft_rec &w = waits[0], &c = due[0];
+        CHECK(w.who == ppu_tid_diag_index(waiter_ppu.thread_id), "SYNC_WAIT tid %u", w.who);
+        CHECK(w.a == (id | 1u << 8 | 0u << 16), "SYNC_WAIT waiter/wake/mode 0x%X, want waiter %u event flag mode 0", w.a, id);
+        CHECK(w.b == 0, "SYNC_WAIT queue %u", w.b);
+        CHECK((c.b & 0xFFu) == id && ((c.b >> 8) & 0xFFu) == 1, "the due CREDIT names waiter %u (b=0x%X)", id, c.b);
+        /* The waiter resumes inside or just after the credit that woke it; it cannot resume before the credit began. */
+        CHECK(w.t1 >= c.t0 && w.t1 >= w.t0, "the wait ended at %llu before the CREDIT began at %llu",
+              (unsigned long long)w.t1, (unsigned long long)c.t0);
+    }
+}
+
+/* stderr of `fn`, for the one-line diagnostics the executor prints. */
+std::string capture_stderr(const std::function<void()>& fn)
+{
+    std::fflush(stderr);
+    const int saved = dup(2);
+    std::FILE* tmp = std::tmpfile();
+    CHECK(saved >= 0 && tmp != nullptr, "capture stderr");
+    dup2(fileno(tmp), 2);
+    fn();
+    std::fflush(stderr);
+    dup2(saved, 2);
+    close(saved);
+    std::string text;
+    std::rewind(tmp);
+    char buf[512];
+    for (std::size_t n; (n = std::fread(buf, 1, sizeof buf, tmp)) != 0;) text.append(buf, n);
+    std::fclose(tmp);
+    return text;
+}
+
+std::size_t count_of(const std::string& hay, const std::string& needle)
+{
+    std::size_t n = 0;
+    for (std::size_t at = hay.find(needle); at != std::string::npos; at = hay.find(needle, at + 1)) ++n;
+    return n;
+}
+
+/* Queues get q in creation order, each with its own seq from 1; the creation line names q, EA, workers and
+ * depth; the 257th queue keeps 255 and says so. */
+void mode_trace_queues()
+{
+    constexpr std::uint32_t QUEUE2 = 0x80000, RING2 = 0x90000, PORT2 = 0x74000;
+    build_image(IMAGE, Prog::transform);
+    install_hooks();
+    {
+        std::lock_guard<std::mutex> lk(g_probe.mu);
+        g_probe.on_admit = nullptr;
+    }
+    CHECK(PS3_FT_ON(), "tracing is on");
+
+    std::unique_ptr<Rig> rig;
+    std::string log = capture_stderr([&] { rig = std::make_unique<Rig>(Opts{128, 3, false}); });
+    log += capture_stderr([&] {
+        CHECK(jq2_queue_create(1, 0x360001, SPURS, QUEUE2, ATTR, 0, 0, 0, RING2, 64, 1, 0) == 0, "second queue");
+    });
+    CHECK(jq2_port_create(PORT2, QUEUE2) == 0, "second port");
+    CHECK(log.find("[jq2] queue q=0 ea=0x00010000 workers=3 depth=128\n") != std::string::npos, "first creation line in:\n%s",
+          log.c_str());
+    CHECK(log.find("[jq2] queue q=1 ea=0x00080000 workers=1 depth=64\n") != std::string::npos, "second creation line in:\n%s",
+          log.c_str());
+
+    std::vector<JobSpec> specs;
+    for (std::uint32_t j = 0; j < 5; ++j) specs.push_back(spec(j));
+    for (std::uint32_t j = 0; j < 3; ++j) rig->push_wait(specs[j].desc, 64, 0);
+    for (std::uint32_t j = 3; j < 5; ++j) CHECK(jq2_port_push_job(PORT2, specs[j].desc, 64, 0, 1) == 0, "push on q1");
+    CHECK(jq2_port_sync(PORT, 0) == 0 && jq2_port_sync(PORT2, 0) == 0, "syncs");
+    rig->teardown();
+    CHECK(jq2_port_destroy(PORT2) == 0 && jq2_queue_shutdown(QUEUE2) == 0, "second queue shutdown");
+    std::uint32_t exit_value = 0;
+    CHECK(jq2_queue_join(QUEUE2, &exit_value) == 0, "second queue join");
+    for (const JobSpec& s : specs) CHECK(job_ok(s), "job %u output", s.serial);
+    check_job_spans(0, 3, false, 3);
+    check_job_spans(1, 2, false, 1);
+
+    /* Queues 3..257 of the process: only creation order counts, so create and join one at a time. */
+    const std::string many = capture_stderr([&] {
+        for (unsigned i = 0; i < 255; ++i) {
+            CHECK(jq2_queue_create(1, 0x360001, SPURS, QUEUE2, ATTR, 0, 0, 0, RING2, 16, 1, 0) == 0, "queue %u", i);
+            CHECK(jq2_queue_shutdown(QUEUE2) == 0 && jq2_queue_join(QUEUE2, &exit_value) == 0, "join %u", i);
+        }
+    });
+    CHECK(count_of(many, "[jq2] queue q=255 ea=0x00080000 workers=1 depth=16\n") == 2, "the 256th and 257th queue are q=255");
+    CHECK(count_of(many, "[jq2] queue q saturated at 255: ea=0x00080000 is queue number 257\n") == 1,
+          "the 257th queue logs that q saturated:\n%s", many.c_str() + many.size() - std::min<std::size_t>(many.size(), 300));
+    CHECK(count_of(many, "saturated") == 1, "only the 257th logs a saturation");
+}
+
+/* Four threads push at once onto two workers: seq stays unique and gapless, and every job keeps its own
+ * PUSH, JOB and CREDIT under it. */
+void mode_trace_concurrent()
+{
+    constexpr unsigned kThreads = 4, kEach = 40;
+    constexpr std::uint32_t kJobs = kThreads * kEach;
+    build_image(IMAGE, Prog::transform);
+    install_hooks();
+    {
+        std::lock_guard<std::mutex> lk(g_probe.mu);
+        g_probe.on_admit = nullptr;
+    }
+    CHECK(PS3_FT_ON(), "tracing is on");
+    Rig rig({128, 2, false});
+    std::vector<JobSpec> specs;
+    for (std::uint32_t j = 0; j < kJobs; ++j) specs.push_back(spec(j));
+
+    std::atomic<unsigned> refused{0};
+    std::atomic<bool> go{false};
+    std::vector<std::thread> pushers;
+    for (unsigned t = 0; t < kThreads; ++t) {
+        pushers.emplace_back([&, t] {
+            ppu_context ctx{};
+            ctx.thread_id = ppu_tid_make(t, t);
+            g_active_ctx = &ctx;
+            while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
+            for (unsigned k = 0; k < kEach; ++k) {
+                const JobSpec& s = specs[t * kEach + k];
+                if (jq2_port_push_job(PORT, s.desc, 64, (t + k) % 3, 1) != 0) refused.fetch_add(1);
+            }
+            g_active_ctx = nullptr;
+        });
+    }
+    go.store(true, std::memory_order_release);
+    for (std::thread& t : pushers) t.join();
+    CHECK(refused == 0, "%u pushes refused", refused.load());
+    CHECK(jq2_port_sync(PORT, 0) == 0, "sync");
+    rig.teardown();
+
+    check_job_spans(0, kJobs, false, 2);
+    for (unsigned t = 0; t < kThreads; ++t) check_push_order(ppu_tid_diag_index(ppu_tid_make(t, t)), 0, kEach);
+}
+
+/* Tracing off: the same traffic records nothing. */
+void mode_trace_off()
+{
+    build_image(IMAGE, Prog::transform);
+    install_hooks();
+    {
+        std::lock_guard<std::mutex> lk(g_probe.mu);
+        g_probe.on_admit = nullptr;
+    }
+    Rig rig({128, 2, false});
+    std::vector<JobSpec> specs;
+    for (std::uint32_t j = 0; j < 8; ++j) {
+        specs.push_back(spec(j));
+        rig.push_wait(specs.back().desc, 64, j % 3);
+    }
+    CHECK(jq2_port_sync(PORT, 0) == 0, "sync");
+    rig.teardown();
+    for (const JobSpec& s : specs) CHECK(job_ok(s), "job %u output", s.serial);
+    CHECK(!PS3_FT_ON(), "tracing is off");
+    CHECK(g_ps3_ft.n == 0 && g_ps3_ft.buf == nullptr, "no span was recorded (n=%u)", g_ps3_ft.n);
+    for (int kind = PS3_FT_JQ2_PUSH; kind <= PS3_FT_JQ2_IDLE; ++kind) CHECK(ft_kind(kind).empty(), "kind %d recorded", kind);
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
@@ -2300,6 +2657,15 @@ int main(int argc, char** argv)
     }
     guest_init();
     const std::string mode = argv[1];
+    /* The recorder reads its window once, at the first hook: the trace modes say so before any hook runs. */
+    if (mode.rfind("trace-", 0) == 0) {
+        if (mode == "trace-off") {
+            unsetenv("PS3_FTRACE");
+        } else {
+            setenv("PS3_FTRACE", "0:100000:/dev/null", 1);
+            setenv("PS3_FTRACE_CAP", "65536", 1);
+        }
+    }
     if (mode == "premature") mode_premature();
     else if (mode == "copy") mode_copy();
     else if (mode == "credit") mode_credit();
@@ -2343,6 +2709,11 @@ int main(int argc, char** argv)
     else if (mode == "push-block-copy") mode_push_block_copy();
     else if (mode == "push-flags") mode_push_flags();
     else if (mode == "stop-push-block-shutdown") mode_stop_push_block_shutdown();
+    else if (mode == "trace-spans") mode_trace_spans();
+    else if (mode == "trace-sync") mode_trace_sync();
+    else if (mode == "trace-queues") mode_trace_queues();
+    else if (mode == "trace-concurrent") mode_trace_concurrent();
+    else if (mode == "trace-off") mode_trace_off();
     else {
         std::printf("unknown mode %s\n", mode.c_str());
         return 2;

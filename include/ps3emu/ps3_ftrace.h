@@ -79,6 +79,30 @@ enum ps3_ft_kind {
     PS3_FT_AUDIO_STALE    = 21, /* instant (t0 == t1): port block was not refilled after consumption
                               * while audio was playing, never filtered; who = port index,
                               * a = block index read, b = run length of consecutive not-refilled blocks */
+    /* SPURS job queue (jq2) spans, never filtered by PS3_FTRACE_MIN_US. Identities: q = host queue index in
+     * creation order (8 bits, 255 saturates), w = worker index inside the queue (8 bits), seq = per-queue job
+     * sequence number (32 bits, first job 1, assigned at push under the queue lock), waiter = the Port2Sync
+     * event-flag waiter id (0..127), tid = PPU thread id. A PushSync emits no PUSH and takes no seq; a push
+     * without the port-accounting flag has a PUSH and a JOB but no CREDIT. */
+    PS3_FT_JQ2_PUSH       = 22, /* caller (PPU), entry of the host enqueue -> job visible to workers (after the kick);
+                              * who = tid, a = seq, b = q | depth << 8, depth = jobs of this queue pushed and not yet
+                              * admitted after this push, saturated at 2^24-1. A busy worker can admit the job between
+                              * the ring write and the kick, so a JOB.t0 slightly before this t1 is possible: a
+                              * consumer clamps the queue latency at 0 and counts the cases */
+    PS3_FT_JQ2_JOB        = 23, /* worker, admitted by the worker -> job body returned, before the credit;
+                              * who = q << 8 | w, a = seq, b = thread CPU time of the job in us
+                              * (CLOCK_THREAD_CPUTIME_ID delta over the same interval), saturated at 2^32-1 */
+    PS3_FT_JQ2_CREDIT     = 24, /* worker, start of the completion credit -> wake delivered (evf_set or fiber notify
+                              * returned), or credit done when nobody waits; who = q << 8 | w, a = seq,
+                              * b = waiter | wake << 8 | due << 16: wake 0 none, 1 event flag, 2 fiber; due 1 when
+                              * this credit woke a waiter; waiter 0xFF when none and for a fiber (a fiber has no
+                              * waiter id, so fiber waits cannot be joined on waiter) */
+    PS3_FT_JQ2_SYNC_WAIT  = 25, /* the blocked PPU thread, entry of the blocking wait -> the thread runs again (only the
+                              * blocking part of Port2Sync; a sync that completes without blocking emits nothing);
+                              * who = tid, a = waiter | wake << 8 | mode << 16 (wake 1 event flag, 2 fiber; waiter
+                              * 0xFF for a fiber; mode = the sync mode), b = q */
+    PS3_FT_JQ2_IDLE       = 26, /* worker, parks (cv wait in) -> wakes; who = q << 8 | w, a = depth at park,
+                              * b = depth at wake, depth as in PUSH */
 };
 
 enum ps3_ft_audio_pace_reason {
