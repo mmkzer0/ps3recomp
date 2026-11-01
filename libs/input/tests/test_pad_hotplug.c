@@ -14,6 +14,7 @@
  * keeps seeing the switched-off controller.
  */
 #include "../cellPad.c"
+#include "pad_trace_off.h"
 #include <assert.h>
 #include <unistd.h>
 #include <sys/mman.h>

@@ -58,6 +58,10 @@ static void print_options()
             std::printf("\"%s\"", ps3_cfg_video_rsx_capture_dir());
         else if (!std::strcmp(o->section, "video") && !std::strcmp(o->key, "rsx_capture_frames"))
             std::printf("%u", ps3_cfg_video_rsx_capture_frames());
+        else if (!std::strcmp(o->section, "pad") && !std::strcmp(o->key, "record"))
+            std::printf("\"%s\"", ps3_cfg_pad_record());
+        else if (!std::strcmp(o->section, "pad") && !std::strcmp(o->key, "replay"))
+            std::printf("\"%s\"", ps3_cfg_pad_replay());
         else if (!std::strcmp(o->section, "title") && !std::strcmp(o->key, "elf_sha256"))
             std::printf("\"%s\"", ps3_cfg_title_elf_sha256());
         else if (!std::strcmp(o->section, "diag") && !std::strcmp(o->key, "dump_config"))

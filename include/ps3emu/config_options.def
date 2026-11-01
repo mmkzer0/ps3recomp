@@ -169,6 +169,28 @@ PS3_CFG_U32(video, rsx_capture_frames, 0, 0, 1000000,
     "title keeps running. 0 captures until the process exits normally; a process that is "
     "killed leaves capture.ndjson.partial, which no tool accepts.")
 
+/* ---- pad ---------------------------------------------------------------- */
+
+PS3_CFG_STR(pad, record, "", 1023, PS3_CFG_V_PAD_RECORD_PATH,
+    "Record what the guest is handed by cellPadGetData (and the connection state it is told by "
+    "cellPadGetInfo/GetInfo2/cellPadPeriphGetInfo) into this file, as a ps3recomp-pad-trace the "
+    "pad.replay option plays back (docs/MODULES_REFERENCE.md, \"cellPad: record and replay\"). "
+    "The words are the ones stored to guest memory, after the host pad, the keyboard and the "
+    "PAD_SCRIPT, PAD_FILE, PAD_STICK and PAD_AUTOPRESS injectors, keyed by (flip, poll); only a "
+    "change of state is written. The file is created and never overwritten: a path that exists, "
+    "or one in a directory that is missing or not writable, is a config error. Empty (the "
+    "default) records nothing. May be set together with pad.replay to record the replayed input.")
+
+PS3_CFG_STR(pad, replay, "", 1023, PS3_CFG_V_PAD_REPLAY_PATH,
+    "Play back a pad trace recorded with pad.record: every cellPadGetData answers with the "
+    "recorded state of the latest record at or before the poll's (flip, poll), a neutral pad "
+    "before the first record of a port and after the end of the trace, and the info calls report "
+    "the recorded connection. The host pad and every injector are ignored. A malformed file, an "
+    "unknown version or keys that go backwards end the run with kind pad-trace; a path that is "
+    "not a readable file is a config error. A summary of how closely the guest followed the "
+    "recording is printed at the end of the trace and at exit. Empty (the default) plays back "
+    "nothing.")
+
 /* ---- title -------------------------------------------------------------- */
 
 PS3_CFG_STR(title, elf_sha256, "", 64, PS3_CFG_V_SHA256_OR_EMPTY,

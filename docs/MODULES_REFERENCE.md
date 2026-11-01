@@ -275,6 +275,71 @@ struct CellPadData {
 };
 ```
 
+#### cellPad: record and replay
+
+**Files:** `libs/input/pad_trace.{h,c}` (format, writer, reader, lookup), the hooks in `libs/input/cellPad.c`.
+**Options:** `pad.record`, `pad.replay` (`docs/CONFIG.md`). Both empty, the default, costs one branch per poll.
+
+A battle is only comparable between two runs if the same input reaches the guest at the same point of the run.
+Record the controller of one run (`pad.record = "battle.padtrace"`), then replay it into later ones
+(`pad.replay = "battle.padtrace"`); no person is needed at the controller. Both may be set at once to record
+while replaying, which gives a trace of what a replayed run was actually handed.
+
+**What is recorded.** The result of every `cellPadGetData`, per port, as the words stored to guest memory
+(host order, before the big-endian store), after the host backend, the keyboard and every injector
+(`PAD_SCRIPT`, `PAD_FILE`, `PAD_STICK`, `PAD_AUTOPRESS`). Each record is keyed by `(flip, poll)`: `flip` is the
+guest's flip-request count at the call (the `PAD_CLOCK=flips` clock: it does not depend on how fast the host
+runs the title), `poll` the ordinal of this port's `GetData` call since that count last changed. A record is
+written when the state of a port differs from its last record, plus once for the first poll of each port, so a
+trace is a list of presses and releases. `len` is the packet length of a connected port (0 for one with no
+device), not whether that one poll was fresh: freshness follows the host's 4 ms report clock, which differs from
+run to run. `cellPadGetInfo`, `GetInfo2` and `PeriphGetInfo` are recorded as the connection they reported, when it
+changes. The writer flushes within 100 ms of a record, at `cellPadEnd` and at exit (`atexit` and `at_quick_exit`,
+because a guest exit leaves through `quick_exit`), always at a line boundary, so a killed run loses only the last
+interval.
+
+**Replay.** The host pad and every injector are ignored. A poll is answered with the state of the latest record of
+its port at or before its `(flip, poll)`; before the port's first record the answer is a neutral pad (port 0: the
+connected virtual pad with centred sticks, any other port: no device). The first poll of a port after a flip, and any
+poll whose state differs from the previous one it served, is a fresh packet (`len > 0`); the others report `len = 0`
+with the same words, which is what ends a title's `while (GetData(..) == OK && len > 0)` drain loop. The info
+calls report the recorded connection (port 0 only until the trace says more) and flag a change with
+`CELL_PAD_STATUS_ASSIGN_CHANGES` once. Past the last flip of the recording the pad is neutral, and the end of the
+trace is logged once with the divergence summary.
+
+**Divergence.** A replayed run diverges when the guest polls differently from the recording. The summary
+(`[cellPad] pad replay: the trace ended at flip N; ... polls=.. exact=.. held=.. recorded_changes=..
+reached_exactly=.. first_poll_count_divergence=..`, and again at exit) counts the polls whose `(flip, poll)` has a record
+of its own (`exact`) against the ones answered from an earlier record or the neutral pad (`held`; most polls, since
+only changes are recorded), the recorded changes the guest reached at exactly their poll, and the first flip whose
+poll count for some port differs from the recording. It is a diagnostic, not a stop.
+
+**File format, version 1.** One JSON object per line, no host paths and no timestamps. Keys are exactly these;
+anything else is refused.
+
+```
+{"format":"ps3recomp-pad-trace","version":1,"ports":7}        header, line 1
+{"flip":12,"poll":0,"port":0,"len":8,"words":[0,116,0,64,128,128,128,128]}   state of a port from this poll on
+{"flip":12,"conn":[1,0,0,0,0,0,0]}                             ports the info calls reported connected
+{"flip":12,"port":0,"polls":3}                                 from flip 12 the port is polled 3 times per flip
+{"end":true,"flip":40}                                         last line: the last flip of the run
+```
+
+`words` is `CellPadData.button` up to its last non-zero word. The poll-count steps (run-length: they hold until the
+next step of that port, `0` for flips the guest did not poll) only feed the divergence summary. A run that was
+killed has no end record and ends at its last record.
+
+**Fail closed.** `flip` never decreases over state, connection and end records, and `(flip, poll)` strictly increases
+per port. A malformed header, a version other than 1, a malformed or truncated line, an unknown or repeated key, keys
+that go backwards, a port the header does not declare or a line after the end record is the `pad-trace` stop (`role`,
+`path`, `line`, `reason`; `docs/STOPS.md`), raised when `cellPadInit` opens the file and not later. So is a record file
+that cannot be written. The config checks an existing record path, an unwritable directory and an unreadable replay
+file at load (`config-invalid`).
+
+**Not covered.** The sensor and pressure words are recorded as they are, and replay assumes the title sets the same
+port settings as in the recording. The other pad calls (`cellPadSetActDirect`, `cellPadClearBuf`,
+`cellPadGetCapabilityInfo`, the mode setters) answer as before and are not recorded.
+
 ### cellKb
 
 **File:** `libs/input/cellKb.c`

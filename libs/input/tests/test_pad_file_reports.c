@@ -8,6 +8,7 @@ static int fixture_clock_gettime(clockid_t id,struct timespec* ts)
 #define clock_gettime fixture_clock_gettime
 #include "../cellPad.c"
 #undef clock_gettime
+#include "pad_trace_off.h"
 #include <assert.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
