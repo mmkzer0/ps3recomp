@@ -31,6 +31,14 @@ Output is decoded per line with replacement, so undecodable bytes become
 U+FFFD in the log and on stderr instead of stopping the reader.  SIGINT and
 SIGTERM stop the child's process group, shut down a simulator this run
 booted, release the lock and exit 2.
+
+Stopping devicectl does not stop the app: it keeps running on the device.  A
+device run that the host ends (timeout, SIGINT/SIGTERM, devicectl gone
+without the app's status) therefore finds the app's process by its
+executable inside the installed bundle, asks it to end (SIGTERM), waits a
+bounded grace, kills it (SIGKILL) and checks the process list again.  The
+report says which step ended it, or that the cleanup failed, which fails the
+run.
 """
 
 import argparse
@@ -39,14 +47,17 @@ import errno
 import fcntl
 import json
 import os
+import posixpath
 import re
 import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
+from urllib.parse import unquote, urlparse
 
 EXIT_OK = 0
 EXIT_FAIL = 1
@@ -60,6 +71,12 @@ DEFAULT_LOCK_WAIT = 600.0
 KILL_GRACE_S = 10.0
 READER_JOIN_S = 5.0
 LOCK_POLL_S = 0.05
+CLEANUP_GRACE_S = 10.0
+CLEANUP_CALL_S = 20.0
+CLEANUP_POLL_S = 1.0
+TRACK_POLL_S = 1.0
+CALL_POLL_S = 0.1
+CALL_SLACK_S = 2.0
 
 LOCK_BUSY_ERRNOS = frozenset((errno.EACCES, errno.EAGAIN))
 
@@ -72,12 +89,19 @@ STOP_RE = re.compile(r"PS3STOP v=1 kind=(\S+)(?: (.*))?$")
 DEVICE_EXIT_RE = re.compile(r"The app terminated with the exit code (-?\d+)\b")
 DEVICE_SIGNAL_RE = re.compile(r"App terminated due to signal (-?\d+)\b")
 
+# devicectl prints this once the app is running, before it waits on it.
+LAUNCHED_RE = re.compile(r"Launched application with \S+ bundle identifier")
+
 EPILOG = """\
 The run holds --lock (an exclusive flock, which lockf(1) also takes) across
 boot, child and shutdown, and records the load average and its own duration
 in the report.
 
 sim needs `-- EXE [ARG...]`; device takes `[-- ARG...]` for the app.
+
+A device run that the host ends also stops the app on the device: SIGTERM,
+then SIGKILL, checked against the device's process list; the report's
+app_cleanup says which step ended it.
 
 Exit status:
   0  the run passed
@@ -157,6 +181,25 @@ class Interrupts:
                 self.pending = False
                 raise Interrupted(self.signum)
 
+    def run_deferred(self, work):
+        """Run work so that no interruption can start it late or cut it short.
+
+        A signal that lands before the block is entered is retried, not lost,
+        and one that lands inside it waits for the block's end; the
+        interruption is raised only after the work is done.
+        """
+        done = False
+        pending = None
+        while not done:
+            try:
+                with self.deferring():
+                    work()
+                    done = True
+            except Interrupted as exc:
+                pending = exc
+        if pending is not None:
+            raise pending
+
 
 INTERRUPTS = Interrupts()
 
@@ -192,6 +235,7 @@ class Watcher:
         self.console_status = console_status
         self.ps3stop = None
         self.console = None
+        self.launched = threading.Event()
         self.reader_errors = []
         self.closing = False
 
@@ -201,6 +245,8 @@ class Watcher:
             self.ps3stop = parse_stop(text)
         if not self.console_status:
             return
+        if LAUNCHED_RE.search(text):
+            self.launched.set()
         code = matched_int(DEVICE_EXIT_RE, text)
         if code is not None:
             self.console = ("exit", code)
@@ -538,12 +584,270 @@ def run_child(command, env, timeout, log, watcher):
     return observation(proc.returncode, timed_out, watcher)
 
 
+class DeviceCtlError(Exception):
+    """A devicectl query or request did not complete; the message says why."""
+
+
+def last_line(text):
+    """The last non-empty line of text, cut to a reportable length."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return lines[-1][:200] if lines else ""
+
+
+def ctl_call(command, limit, cancel=None):
+    """Run one devicectl call, bounded by limit seconds. -> (status, text)
+
+    The call gets its own session so the kill reaches whatever xcrun started.
+    cancel ends it early for a poller that is being stopped.
+    """
+    try:
+        proc = subprocess.Popen(command, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                start_new_session=True)
+    except OSError as exc:
+        raise DeviceCtlError("cannot run %s: %s" % (command[0], exc.strerror or exc))
+    deadline = time.monotonic() + limit + CALL_SLACK_S
+    try:
+        while True:
+            try:
+                out, _ = proc.communicate(timeout=CALL_POLL_S)
+                return proc.returncode, out.decode("utf-8", errors="replace")
+            except subprocess.TimeoutExpired:
+                pass
+            if cancel is not None and cancel.is_set():
+                raise DeviceCtlError("cancelled")
+            if time.monotonic() >= deadline:
+                raise DeviceCtlError("timed out after %gs" % limit)
+    except BaseException:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        proc.communicate()
+        raise
+
+
+def file_path(value):
+    """The normalised absolute path of a devicectl file URL or plain path."""
+    path = unquote(urlparse(value).path) if value.startswith("file:") else value
+    if not path.startswith("/"):
+        raise ValueError("not an absolute path: %s" % value)
+    return posixpath.normpath(path)
+
+
+def bundle_processes(listing, bundle):
+    """{pid: path} of the listed processes whose executable is the bundle's own.
+
+    Only a file directly inside the .app directory counts: an app extension
+    runs from a subdirectory and is not the app.
+    """
+    return {pid: path for pid, path in listing.items()
+            if path is not None and posixpath.dirname(path) + "/" == bundle}
+
+
+class AppControl:
+    """The devicectl calls that find and stop one app on one device."""
+
+    def __init__(self, xcrun, udid, bundle_id, limit):
+        self.xcrun = xcrun
+        self.udid = udid
+        self.bundle_id = bundle_id
+        self.limit = limit
+
+    def run(self, words, cancel=None, json_path=None):
+        command = [self.xcrun, "devicectl", "device"] + words + [
+            "--device", self.udid, "--timeout", "%g" % self.limit]
+        if json_path is not None:
+            command += ["--json-output", json_path]
+        what = " ".join(words[:2])
+        try:
+            status, text = ctl_call(command, self.limit, cancel)
+        except DeviceCtlError as exc:
+            raise DeviceCtlError("%s: %s" % (what, exc))
+        if status != 0:
+            detail = last_line(text)
+            raise DeviceCtlError("%s exited %d%s"
+                                 % (what, status, ": " + detail if detail else ""))
+
+    def query(self, words, cancel=None):
+        """The "result" object of a devicectl JSON answer."""
+        with tempfile.TemporaryDirectory(prefix="ios-run-") as tmp:
+            path = os.path.join(tmp, "result.json")
+            self.run(words, cancel, path)
+            try:
+                with open(path, encoding="utf-8") as handle:
+                    return json.load(handle)["result"]
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                raise DeviceCtlError("%s: no usable JSON result (%s: %s)"
+                                     % (" ".join(words[:2]), type(exc).__name__, exc))
+
+    def bundle_dir(self):
+        """The installed bundle's directory, with a trailing slash."""
+        result = self.query(["info", "apps", "--bundle-id", self.bundle_id])
+        try:
+            for app in result["apps"]:
+                if app["bundleIdentifier"] == self.bundle_id:
+                    return file_path(app["url"]) + "/"
+        except (KeyError, TypeError, AttributeError, ValueError) as exc:
+            raise DeviceCtlError("info apps: unexpected result (%s: %s)"
+                                 % (type(exc).__name__, exc))
+        raise DeviceCtlError("%s is not in the device's app list" % self.bundle_id)
+
+    def listing(self, cancel=None):
+        """{pid: executable path, or None when not given} of every process."""
+        result = self.query(["info", "processes"], cancel)
+        try:
+            entries = result["runningProcesses"]
+            processes = {}
+            for entry in entries:
+                pid = entry["processIdentifier"]
+                exe = entry.get("executable")
+                if not isinstance(pid, int) or isinstance(pid, bool):
+                    raise TypeError("processIdentifier %r" % (pid,))
+                processes[pid] = file_path(exe) if isinstance(exe, str) else None
+            return processes
+        except (KeyError, TypeError, AttributeError, ValueError) as exc:
+            raise DeviceCtlError("info processes: unexpected result (%s: %s)"
+                                 % (type(exc).__name__, exc))
+
+    def gone(self, pid, path, grace):
+        """(True, None) once pid is no longer the app's process, else (False, why).
+
+        A pid listed with another executable was reused after the app ended.
+        An unreadable listing never counts as gone: the end was not seen.
+        """
+        deadline = time.monotonic() + grace
+        poll = min(CLEANUP_POLL_S, grace / 4)
+        while True:
+            why = None
+            try:
+                running = self.listing().get(pid) == path
+            except DeviceCtlError as exc:
+                running, why = True, "cannot verify: %s" % exc
+            if not running:
+                return True, None
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False, why
+            time.sleep(min(poll, remaining))
+
+    def stop_app(self, bundle, tracked, grace):
+        """(pid, result, detail) of ending the app's process.
+
+        result is exited (already gone), sigterm or sigkill (the step after
+        which the pid left the list), unmatched (no process of the bundle is
+        listed, nothing was signalled) or failed.  tracked is the (pid, path)
+        recorded at launch, or None.  Only a pid whose executable is the
+        bundle's is ever signalled.
+        """
+        try:
+            listing = self.listing()
+        except DeviceCtlError as exc:
+            return (tracked[0] if tracked else None, "failed",
+                    "cannot list the device's processes: %s" % exc)
+        live = bundle_processes(listing, bundle)
+        if tracked is not None:
+            pid, path = tracked
+            if listing.get(pid) != path:
+                others = sorted(set(live) - {pid})
+                if others:
+                    return pid, "failed", (
+                        "pid %d of the launched app is gone but pid %d of the "
+                        "same bundle is listed; not touched" % (pid, others[0]))
+                reused = listing.get(pid)
+                return pid, "exited", (
+                    "pid %d now runs %s; not touched" % (pid, reused)
+                    if reused is not None else None)
+        elif len(live) == 1:
+            pid, path = next(iter(live.items()))
+        elif live:
+            return None, "failed", (
+                "several processes of the bundle are listed (pids %s); none was "
+                "signalled" % ", ".join(str(p) for p in sorted(live)))
+        else:
+            return None, "unmatched", (
+                "no process runs from %s; nothing was signalled" % bundle)
+        notes = []
+        steps = (("sigterm", ["process", "terminate", "--pid", str(pid)]),
+                 ("sigkill", ["process", "signal", "--signal", "SIGKILL",
+                              "--pid", str(pid)]))
+        for name, words in steps:
+            try:
+                self.run(words)
+            except DeviceCtlError as exc:
+                notes.append("%s request: %s" % (name, exc))
+            ended, why = self.gone(pid, path, grace)
+            if ended:
+                return pid, name, "; ".join(notes) or None
+            if why:
+                notes.append("after %s %s" % (name, why))
+        notes.insert(0, "pid %d is still listed after SIGKILL" % pid)
+        return pid, "failed", "; ".join(notes)
+
+
+class AppTracker:
+    """Records the app's pid once devicectl reports the launch.
+
+    The console attach blocks until the app ends, so the lookup runs on a
+    thread of its own.  A failed lookup is not an error here: the cleanup
+    asks again and reports its own failure.
+    """
+
+    def __init__(self, control, bundle, watcher):
+        self.control = control
+        self.bundle = bundle
+        self.watcher = watcher
+        self.cancel = threading.Event()
+        self.lock = threading.Lock()
+        self.found = None
+        self.thread = threading.Thread(target=self.run, daemon=True)
+
+    def start(self):
+        self.thread.start()
+
+    def run(self):
+        while not self.cancel.is_set():
+            if self.watcher.launched.wait(CALL_POLL_S):
+                try:
+                    live = bundle_processes(self.control.listing(self.cancel),
+                                            self.bundle)
+                except DeviceCtlError:
+                    live = {}
+                if len(live) == 1:
+                    with self.lock:
+                        self.found = next(iter(live.items()))
+                    return
+                self.cancel.wait(TRACK_POLL_S)
+
+    def stop(self):
+        """End the lookup, and return the recorded (pid, path) or None."""
+        self.cancel.set()
+        self.thread.join(timeout=READER_JOIN_S)
+        with self.lock:
+            return self.found
+
+
 def apply_observation(report, observed):
     report["exit_code"] = observed.exit_code
     report["signal"] = observed.signal
     report["timed_out"] = observed.timed_out
     report["ps3stop"] = observed.ps3stop
     report["reader_errors"] = observed.reader_errors
+
+
+def settle_app(report, control, bundle, tracker, watcher, observed, interrupted,
+               grace):
+    """Stop the app when the host ended the run without the app's own status."""
+    tracked = tracker.stop()
+    report["app_pid"] = tracked[0] if tracked else None
+    timed_out = observed is not None and observed.timed_out
+    if watcher.console is not None and not timed_out:
+        return
+    if not (timed_out or interrupted or watcher.launched.is_set()):
+        return
+    pid, result, detail = control.stop_app(bundle, tracked, grace)
+    if pid is not None:
+        report["app_pid"] = pid
+    report["app_cleanup"] = result
+    report["app_cleanup_detail"] = detail
 
 
 def shutdown(xcrun, udid):
@@ -585,14 +889,36 @@ def run_device(args, report, xcrun, log):
     if args.app:
         require_step(devicectl + ["install", "app", "--device", args.udid,
                                   args.app], "devicectl install")
+    # Resolved before the launch: an app that cannot be found again cannot be
+    # stopped again, and such a run must not start.
+    control = AppControl(xcrun, args.udid, args.bundle_id,
+                         args.cleanup_call_timeout)
+    try:
+        bundle = control.bundle_dir()
+    except DeviceCtlError as exc:
+        raise UsageError("cannot resolve the installed bundle of %s: %s"
+                         % (args.bundle_id, exc))
     command = devicectl + ["process", "launch", "--device", args.udid,
                            "--terminate-existing", "--console",
                            args.bundle_id] + args.child
     report["command"] = command
     watcher = Watcher(console_status=True)
-    apply_observation(report, run_child(
-        command, child_env(args.env, "DEVICECTL_CHILD_"), args.timeout,
-        log, watcher))
+    tracker = AppTracker(control, bundle, watcher)
+    observed = None
+    interrupted = False
+    try:
+        tracker.start()
+        observed = run_child(
+            command, child_env(args.env, "DEVICECTL_CHILD_"), args.timeout,
+            log, watcher)
+    except Interrupted:
+        interrupted = True
+        raise
+    finally:
+        INTERRUPTS.run_deferred(lambda: settle_app(
+            report, control, bundle, tracker, watcher, observed, interrupted,
+            args.cleanup_grace))
+    apply_observation(report, observed)
 
 
 def decide_stop(report):
@@ -608,15 +934,42 @@ def decide_stop(report):
     return "pass", "ok"
 
 
+def cleanup_note(report):
+    """The app cleanup as a clause of a reason, or "" when there was none."""
+    result = report["app_cleanup"]
+    if result is None:
+        return ""
+    text = {"exited": "the app had already exited",
+            "sigterm": "the app ended after SIGTERM",
+            "sigkill": "the app ended only after SIGKILL",
+            "unmatched": "no app process was found",
+            "failed": "app cleanup failed"}[result]
+    if report["app_pid"] is not None:
+        text += " (pid %d)" % report["app_pid"]
+    if report["app_cleanup_detail"]:
+        text += ": " + report["app_cleanup_detail"]
+    return text
+
+
+def with_cleanup(report, reason):
+    """reason, followed by what became of the app when the run had to stop it."""
+    note = cleanup_note(report)
+    return "%s; %s" % (reason, note) if note else reason
+
+
 def decide_outcome(report):
     """(outcome, reason) for a run that reached the child.
 
     A run whose output could not be read completely never passes: the stop or
-    status it would be judged on may be the part that was lost.
+    status it would be judged on may be the part that was lost.  A cleanup
+    that did not end the app fails the run whatever the app's status was.
     """
     outcome, reason = decide_observed(report)
     if outcome == "pass" and report["reader_errors"]:
-        return "fail", "output not fully read: " + report["reader_errors"][0]
+        outcome, reason = "fail", "output not fully read: " + report["reader_errors"][0]
+    reason = with_cleanup(report, reason)
+    if report["app_cleanup"] == "failed":
+        outcome = "fail"
     return outcome, reason
 
 
@@ -650,6 +1003,9 @@ def new_report(args):
         "duration_s": 0.0,
         "load_avg": load_average(),
         "booted_by_tool": False,
+        "app_pid": None,
+        "app_cleanup": None,
+        "app_cleanup_detail": None,
     }
 
 
@@ -721,6 +1077,15 @@ def build_parser():
     device.add_argument("--app", metavar="PATH",
                         help="install this .app before launching")
     add_run_options(device)
+    device.add_argument("--cleanup-grace", type=float, default=CLEANUP_GRACE_S,
+                        metavar="S",
+                        help="after a timeout or interruption, wait S seconds"
+                             " for the app to leave the process list after"
+                             " SIGTERM, then after SIGKILL (default %(default)s)")
+    device.add_argument("--cleanup-call-timeout", type=float,
+                        default=CLEANUP_CALL_S, metavar="S",
+                        help="bound each devicectl query or request about the"
+                             " app at S seconds (default %(default)s)")
     return parser
 
 
@@ -769,14 +1134,19 @@ def main(argv=None):
             if args.target == "sim" and not args.child:
                 raise UsageError("sim: missing program after '--'")
             parse_env(args.env)
+            if args.target == "device" and (args.cleanup_grace < 0
+                                            or args.cleanup_call_timeout <= 0):
+                raise UsageError("--cleanup-grace needs S >= 0 and "
+                                 "--cleanup-call-timeout needs S > 0")
             log = open_log(args.log)
             run_target(args, report, log)
             report["outcome"], reason = decide_outcome(report)
     except UsageError as exc:
-        report["outcome"], reason = "error", str(exc)
+        report["outcome"], reason = "error", with_cleanup(report, str(exc))
     except Interrupted as exc:
         report["outcome"] = "error"
-        reason = "interrupted by %s" % signal.Signals(exc.signum).name
+        reason = with_cleanup(
+            report, "interrupted by %s" % signal.Signals(exc.signum).name)
     finally:
         if log is not None:
             log.close()
