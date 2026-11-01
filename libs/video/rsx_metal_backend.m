@@ -55,6 +55,7 @@
 
 #include <pthread.h>
 #include "metal_frame_rate.h"
+#include "rsx_present_policy.h"
 #include <stdatomic.h>
 #include <dlfcn.h>
 #include <errno.h>
@@ -2624,9 +2625,10 @@ static id<MTLTexture>             s_eng_fxaa_tex;
 /* What the display last showed: the surface it blitted, and the records encoded since that blit (open ones are
  * counted by the reader). s_eng_rec_count cannot say this: every flush commit zeroes it, so a frame the guest drew
  * across a flush would look like a re-present of the last image. The held reference keeps the object alive, so
- * "the same texture" compares identities that cannot be recycled. */
+ * "the same texture" compares identities that cannot be recycled. The rest of the decision (records since the blit,
+ * whether it reached the screen, the layer geometry) is rsx_present_policy.h's, which a test drives without a GPU. */
 static id<MTLTexture> s_eng_shown;
-static u32            s_eng_recs_since_blit;
+static rsx_display_state s_eng_display;
 
 static float eng_sharpen_from(const char* e)
 {
@@ -2993,7 +2995,7 @@ static int eng_init(void* user, u32 width, u32 height)
     (void)user; (void)width; (void)height;
     s_eng_encoding_failed = 0;
     s_eng_shown = nil;
-    s_eng_recs_since_blit = 0;
+    rsx_display_reset(&s_eng_display);
     if (!s_dev) return -1;
     NSError* err = nil;
     s_eng_helper_lib = [s_dev newLibraryWithSource:kEngHelperMSL options:nil error:&err];
@@ -3055,7 +3057,7 @@ static void eng_shutdown(void* user)
     s_eng_encoding_failed = 0;
     s_eng_checked_completed = 0;
     s_eng_shown = nil;
-    s_eng_recs_since_blit = 0;
+    rsx_display_reset(&s_eng_display);
     s_eng_depth_staging = nil;
 }
 
@@ -4269,6 +4271,21 @@ static int eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
     return 1;
 }
 
+/* The layer geometry and display gamma the blit to a drawable depends on, for rsx_display_can_skip. The size and
+ * scale are the layer's own, not s_width/s_height: the drawable the compositor holds is that size. */
+static rsx_display_view eng_display_view(void)
+{
+    extern float cellAvconfExt_display_gamma(void);
+    rsx_display_view v;
+    const CGSize sz = [s_layer drawableSize];
+    v.width       = (u32)sz.width;
+    v.height      = (u32)sz.height;
+    v.scale_milli = (u32)([s_layer contentsScale] * 1000.0 + 0.5);
+    const float g = cellAvconfExt_display_gamma();
+    memcpy(&v.gamma_bits, &g, sizeof v.gamma_bits);
+    return v;
+}
+
 /* Encode everything recorded so far and commit it.
  *
  * The staging arena is recycled the moment this returns, which is safe
@@ -4288,6 +4305,34 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
         int host_slot = -1;
         const u32 host_gen = s_host_gen;
         const int windowed_present = (present_dst && !s_headless);
+        const int layer_present = (windowed_present && !s_host);
+        rsx_display_view view = {0};
+        if (layer_present) {
+            view = eng_display_view();
+            /* #94: [CAMetalLayer nextDrawable] waits for a display refresh, so a present that would put the picture
+             * already on the layer back on it costs the walker a refresh for nothing. The host's frame clock presents
+             * once more after every flip head; that second acquisition (two per guest flip, three before #101) held
+             * the guest to 30 fps at 60 Hz (measured). When the surface, its records, the layer geometry and the
+             * gamma are all as at the last shown blit, there is no drawable, no blit, no presentDrawable, and no
+             * wait on the in-flight semaphore either, since nothing is submitted.
+             *
+             * Only host drawable work is skipped. The draw engine publishes the present's identity before it calls
+             * the backend and counts the present and records the capture frame after it, neither depending on the
+             * drawable; the frame dump reads the engine surface under its own fence, and a capture's readback goes
+             * through a flush with no present_dst. The flip's completion and vblank belong to the title's frame
+             * clock and wait on no drawable. What is lost is
+             * addPresentedHandler's sample for this present: the PS3RECOMP_METAL_FPS "display" figure counts screen
+             * updates, not host presents. A staged upload or a dropped record means the picture may differ, so
+             * those never skip. */
+            if (!s_eng_stage_used && !s_eng_dropped &&
+                rsx_display_can_skip(&s_eng_display, present_dst == s_eng_shown, s_eng_rec_count, &view)) {
+                /* The ENCODE span stays, empty, so the reports still count one per present; there is no DRAWABLE
+                 * span, so drawables per flip are counted directly. */
+                if (PS3_FT_ON()) { const uint64_t t = ps3_ft_now(); ps3_ft_span(PS3_FT_GPU_ENCODE, 0, 1u, 0, t, t); }
+                eng_collect_retired_objects();
+                return;
+            }
+        }
         { const uint64_t w0 = PS3_FT_ON() ? ps3_ft_now() : 0;
           if (windowed_present) dispatch_semaphore_wait(s_inflight, DISPATCH_TIME_FOREVER);
           if (w0 && windowed_present) { const uint64_t w1 = ps3_ft_now();
@@ -4310,8 +4355,9 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
                 if (ft_d0)
                     ps3_ft_span(PS3_FT_DRAWABLE, 1, (drawable ? 0u : 1u) | (present_dst != s_eng_shown ? 2u : 0u) |
                                                         (rsx_draw_engine_present_diag() << 8),
-                                s_eng_recs_since_blit + s_eng_rec_count, ft_d0, ps3_ft_now());
+                                rsx_display_pending(&s_eng_display, s_eng_rec_count), ft_d0, ps3_ft_now());
                 if (!drawable) {           /* compositor is busy; skip */
+                    rsx_display_note_missed(&s_eng_display);
                     dispatch_semaphore_signal(s_inflight);
                     return;
                 }
@@ -4323,6 +4369,7 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
         id<MTLCommandBuffer> cb = [s_queue commandBuffer];
         if (!cb || (s_eng_stage_used && !stage)) {
             s_eng_encoding_failed = 1;
+            if (layer_present) rsx_display_note_missed(&s_eng_display);
             host_frame_done(host_slot, host_gen, 0);
             if (windowed_present) dispatch_semaphore_signal(s_inflight);
             return;
@@ -4330,11 +4377,15 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
         const uint64_t ft_e0 = PS3_FT_ON() ? ps3_ft_now() : 0;
         const u32 ft_nrec = s_eng_rec_count;
         eng_encode_records(cb, stage);
-        s_eng_recs_since_blit += ft_nrec;
+        rsx_display_note_encoded(&s_eng_display, ft_nrec);
         /* Only a blit that was encoded counts as a show: one that bailed out left the display as it was. */
-        if (present_dst && dst && eng_blit_to_display(cb, present_dst, dst)) {
-            s_eng_shown = present_dst;
-            s_eng_recs_since_blit = 0;
+        if (present_dst && dst) {
+            if (eng_blit_to_display(cb, present_dst, dst)) {
+                s_eng_shown = present_dst;
+                rsx_display_note_shown(&s_eng_display, &view);
+            } else {
+                rsx_display_note_missed(&s_eng_display);
+            }
         }
         if (drawable) { fps_track_drawable(drawable); [cb presentDrawable:drawable]; }
         if (ft_e0) ps3_ft_span(PS3_FT_GPU_ENCODE, 0, present_dst ? 1u : 0u, ft_nrec, ft_e0, ps3_ft_now());
