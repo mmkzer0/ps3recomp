@@ -60,7 +60,9 @@ import statistics
 import sys
 
 (SYSCALL, USLEEP, SPU_WAIT, SPU_BUSY, SEMA, SEMA_GAVEUP, DRAIN, FLIP_FIFO, FLIP_REQ, PRESENT,
- GPU_ENCODE, GPU_WAIT, READBACK, GPU_EXEC, HLE, DRAWABLE, LABEL_WAIT) = range(1, 18)
+ GPU_ENCODE, GPU_WAIT, READBACK, GPU_EXEC, HLE, DRAWABLE, LABEL_WAIT,
+ AUDIO_MIX, AUDIO_PACE, AUDIO_UNDERRUN) = range(1, 21)
+AUDIO_PACE_REASON = {1: "queue full", 2: "clock pacing", 3: "backend wait"}
 GPU_WAIT_KIND = {0: "gpu wait (flush)", 1: "gpu wait (present)", 2: "gpu wait (in-flight)"}
 GPU_WAIT_INFLIGHT = 2
 SPINS_SLEEPING = 64      # cellGcmSys.c yields for 64 spins, then sleeps 1 ms per spin
@@ -423,6 +425,186 @@ def print_drawable_label(sec):
               " of the wait time")
 
 
+def audio_section(spans, dropped):
+    mix_spans = [s for s in spans if s[0] == AUDIO_MIX]
+    pace_spans = [s for s in spans if s[0] == AUDIO_PACE]
+    underrun_spans = [s for s in spans if s[0] == AUDIO_UNDERRUN]
+
+    if not (mix_spans or pace_spans or underrun_spans):
+        return None
+
+    rates = dropped == 0
+
+    # 1. Blocks/s and mix intervals
+    if mix_spans:
+        mix_times = [s[4] for s in mix_spans]
+        intervals = [b - a for a, b in zip(mix_times, mix_times[1:])]
+        sorted_intervals = sorted(intervals)
+        total_blocks = sum(s[2] for s in mix_spans)
+        if len(intervals) > 0 and sum(intervals) > 0:
+            blocks_per_s = len(intervals) / (sum(intervals) / 1000.0) * (total_blocks / len(mix_spans))
+        else:
+            blocks_per_s = 0.0
+        mix_interval = {
+            "p50": nearest_rank(sorted_intervals, 50) if sorted_intervals else None,
+            "p90": nearest_rank(sorted_intervals, 90) if sorted_intervals else None,
+            "p99": nearest_rank(sorted_intervals, 99) if sorted_intervals else None,
+            "max": sorted_intervals[-1] if sorted_intervals else None,
+        }
+        # Queue depth p1/p5/p50 in ms (48 frames per ms at 48 kHz)
+        depths_ms = sorted(s[3] / 48.0 for s in mix_spans)
+        queue_depth = {
+            "p1": nearest_rank(depths_ms, 1) if depths_ms else None,
+            "p5": nearest_rank(depths_ms, 5) if depths_ms else None,
+            "p50": nearest_rank(depths_ms, 50) if depths_ms else None,
+        }
+    else:
+        blocks_per_s = 0.0
+        mix_interval = {"p50": None, "p90": None, "p99": None, "max": None}
+        queue_depth = {"p1": None, "p5": None, "p50": None}
+
+    # 2. Underrun count and rate
+    audio_all = mix_spans + pace_spans + underrun_spans
+    t_min = min(s[4] for s in audio_all)
+    t_max = max(s[5] for s in audio_all)
+    audio_dur_s = (t_max - t_min) / 1000.0 if t_max > t_min else 0.0
+    u_count = len(underrun_spans)
+    if rates:
+        u_rate = (u_count / audio_dur_s) if audio_dur_s > 0 else (0.0 if u_count == 0 else None)
+    else:
+        u_rate = None
+
+    # 3. Pacing totals by reason
+    pacing_totals = {}
+    for code, name in AUDIO_PACE_REASON.items():
+        sp = [s for s in pace_spans if s[2] == code]
+        tot_ms = sum(s[5] - s[4] for s in sp)
+        pacing_totals[name] = {"count": len(sp), "ms": tot_ms, "total_ms": tot_ms}
+    total_pacing_ms = sum(s[5] - s[4] for s in pace_spans)
+
+    # 4. Correlation with frame gaps and DRAWABLE/LABEL_WAIT spans
+    frame_spans = [s for s in spans if s[0] in (PRESENT, DRAWABLE)]
+    if frame_spans:
+        raw_times = sorted(s[4] for s in frame_spans)
+        frame_events = []
+        for t in raw_times:
+            if not frame_events or t - frame_events[-1] > 5.0:
+                frame_events.append(t)
+    else:
+        flip_spans = [s for s in spans if s[0] == FLIP_REQ]
+        frame_events = sorted(s[4] for s in flip_spans)
+
+    frame_gaps = []
+    for i in range(len(frame_events) - 1):
+        g0 = frame_events[i]
+        g1 = frame_events[i + 1]
+        frame_gaps.append((g0, g1, g1 - g0))
+
+    d_lw_spans = [s for s in spans if s[0] in (DRAWABLE, LABEL_WAIT)]
+
+    underruns_detail = []
+    overlap_count = 0
+    for u in underrun_spans:
+        u_t = u[4]
+        nearest_gap_ms = None
+        if frame_gaps:
+            def dist_to_gap(gap):
+                g0, g1, _ = gap
+                if g0 <= u_t <= g1:
+                    return 0.0
+                if u_t < g0:
+                    return g0 - u_t
+                return u_t - g1
+            nearest = min(frame_gaps, key=dist_to_gap)
+            nearest_gap_ms = nearest[2]
+
+        w0 = u_t - 50.0
+        w1 = u_t
+        has_overlap = False
+        for g0, g1, dur in frame_gaps:
+            if dur > 40.0 and overlap(g0, g1, w0, w1) > 0:
+                has_overlap = True
+                break
+        if not has_overlap:
+            for s in d_lw_spans:
+                if overlap(s[4], s[5], w0, w1) > 0:
+                    has_overlap = True
+                    break
+
+        if has_overlap:
+            overlap_count += 1
+
+        underruns_detail.append({
+            "at_s": u_t / 1000.0,
+            "depth_frames": u[2],
+            "depth_ms": u[2] / 48.0,
+            "blocks_since": u[3],
+            "nearest_frame_gap_ms": nearest_gap_ms,
+            "overlap": has_overlap,
+        })
+
+    overlap_share = (overlap_count / u_count) if u_count > 0 else None
+
+    return {
+        "blocks_per_s": blocks_per_s,
+        "blocks_s": blocks_per_s,
+        "mix_interval_ms": mix_interval,
+        "queue_depth_ms": queue_depth,
+        "underruns": {
+            "count": u_count,
+            "rate": u_rate,
+            "per_s": u_rate,
+        },
+        "underrun_count": u_count,
+        "underrun_rate": u_rate,
+        "pacing": {
+            "total_ms": total_pacing_ms,
+            "by_reason": pacing_totals,
+        },
+        "pacing_by_reason": pacing_totals,
+        "correlation": {
+            "underruns": underruns_detail,
+            "overlap_count": overlap_count,
+            "overlap_share": overlap_share,
+        },
+        "overlap_share": overlap_share,
+    }
+
+
+def print_audio_section(aud):
+    print("\nAudio:")
+    if aud is None:
+        print("  no audio spans")
+        return
+    fr = aud["mix_interval_ms"]
+    qd = aud["queue_depth_ms"]
+    u = aud["underruns"]
+    p = aud["pacing"]
+    c = aud["correlation"]
+
+    def ms_fmt(x):
+        return f"{x:.2f}" if x is not None else "n/a"
+
+    print(f"  {aud['blocks_per_s']:.1f} blocks/s, mix interval p50 {ms_fmt(fr['p50'])}"
+          f" p90 {ms_fmt(fr['p90'])} p99 {ms_fmt(fr['p99'])} max {ms_fmt(fr['max'])} ms")
+    print(f"  queue depth p1 {ms_fmt(qd['p1'])} p5 {ms_fmt(qd['p5'])} p50 {ms_fmt(qd['p50'])} ms")
+    rate_str = f"{u['rate']:.1f} /s" if u['rate'] is not None else "n/a"
+    print(f"  underruns: {u['count']} ({rate_str})")
+    print(f"  pacing wait: {p['total_ms']:.1f} ms in all")
+    for name, r in p["by_reason"].items():
+        print(f"    {name:14s} {r['ms']:6.1f} ms ({r['count']} waits)")
+    if not u["count"]:
+        print("  correlation: no underruns")
+    else:
+        print("  correlation (50 ms before underrun):")
+        for d in c["underruns"][:8]:
+            ov = "yes" if d["overlap"] else "no"
+            gap = f"{d['nearest_frame_gap_ms']:.1f} ms" if d['nearest_frame_gap_ms'] is not None else "n/a"
+            print(f"    at {d['at_s']:.3f} s: depth {d['depth_frames']} frames ({d['depth_ms']:.1f} ms),"
+                  f" {d['blocks_since']} blocks since prev, nearest frame gap {gap}, overlap: {ov}")
+        pct = f"{100 * c['overlap_share']:.0f}%" if c['overlap_share'] is not None else "n/a"
+        print(f"  underruns overlapping a >40 ms frame gap or drawable/label wait: {pct} ({c['overlap_count']}/{u['count']})")
+
 def main():
     ap = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
     ap.add_argument("trace")
@@ -467,6 +649,7 @@ def main():
                            "fast": breakdown(acc, fast, names, name_of) if fast else None,
                            "slow": breakdown(acc, slow, names, name_of) if slow else None}
     report.update(drawable_label_sections(spans, len(flips), header_dropped(header)))
+    report["audio"] = audio_section(spans, header_dropped(header))
     if cad_nid is not None:
         report["cadence"] = {"nid": f"{cad_nid:08X}", "import": name_of(cad_nid),
                              "threads": cadence(spans, names, name_of, cad_nid, cad_tid, args.gap)}
@@ -485,6 +668,7 @@ def main():
             if report["split"][part]:
                 print_breakdown(report["split"][part], f"Frames {rel} {args.split:g} ms")
     print_drawable_label(report)
+    print_audio_section(report["audio"])
     if "cadence" in report:
         c = report["cadence"]
         print(f"\nCadence of {c['import']} ({c['nid']}):")

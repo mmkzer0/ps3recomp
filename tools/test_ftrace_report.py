@@ -8,6 +8,7 @@ from pathlib import Path
 
 TOOL = Path(__file__).resolve().parent / "ftrace_report.py"
 FLIP_REQ, USLEEP, HLE, PRESENT = 9, 2, 15, 10
+AUDIO_MIX, AUDIO_PACE, AUDIO_UNDERRUN = 18, 19, 20
 LOCK, SYNC, POLL = 0x1573DC3F, 0xFACB3CED, 0x74A66AF0     # lwmutex_lock, Port2Sync, GetPortConfig
 
 failures = 0
@@ -158,6 +159,75 @@ with tempfile.TemporaryDirectory() as tmp:
           r["label_wait"]["count"] == 0 and r["label_wait"]["p50_ms"] is None, "no such spans: zero counts, no statistics")
     rc, out, err = run(tmp, trace(lines))
     check(rc == 0 and out.count("none recorded") == 2, "text report: both sections say none recorded")
+    check(r.get("audio") is None, "trace without audio spans: audio key is None")
+    check(rc == 0 and "no audio spans" in out, "text report: says no audio spans")
 
+    # Steady 187.5 blocks/s with deep queue (0 underruns)
+    flips = [span(FLIP_REQ, 1, 0, 0, t, t) for t in (0, 200, 400, 600)]
+    steady_lines = list(flips)
+    dt = 16.0 / 3.0
+    for i in range(96):
+        t0 = i * dt
+        t1 = t0 + 0.5
+        steady_lines.append(span(AUDIO_MIX, 0, 1, 1024, t0, t1))
+        steady_lines.append(span(AUDIO_PACE, 0, 1, 1024, t1, t1 + 4.8))
+
+    rc, out, err = run(tmp, trace(steady_lines), "--json")
+    r = json.loads(out)
+    aud = r["audio"]
+    check(abs(aud["blocks_per_s"] - 187.5) < 0.01, "steady audio: exactly 187.5 blocks/s")
+    check(aud["underruns"]["count"] == 0, "steady audio: 0 underruns")
+    check(aud["underruns"]["rate"] == 0.0, "steady audio: 0.0 underrun rate")
+    check(abs(aud["queue_depth_ms"]["p50"] - 1024 / 48.0) < 1e-4, "steady audio: queue depth p50 ~21.33 ms")
+    check(abs(aud["mix_interval_ms"]["p50"] - dt) < 0.01, "steady audio: mix interval p50 ~5.33 ms")
+    check(aud["pacing"]["by_reason"]["queue full"]["count"] == 96, "steady audio: 96 pacing waits")
+    check(abs(aud["pacing"]["by_reason"]["queue full"]["ms"] - 96 * 4.8) < 1e-4, "steady audio: pacing total ms")
+    rc, out, err = run(tmp, trace(steady_lines))
+    check(rc == 0 and "187.5 blocks/s" in out and "underruns: 0" in out, "steady audio text report")
+
+    # Starving queue with periodic underruns
+    starve_lines = list(flips)
+    for i in range(60):
+        t0 = i * dt
+        t1 = t0 + 0.5
+        if i > 0 and i % 10 == 0:
+            starve_lines.append(span(AUDIO_UNDERRUN, 0, 80, 10, t0, t0))
+        starve_lines.append(span(AUDIO_MIX, 0, 1, 100, t0, t1))
+        starve_lines.append(span(AUDIO_PACE, 0, 3, 100, t1, t1 + 4.8))
+
+    rc, out, err = run(tmp, trace(starve_lines), "--json")
+    r = json.loads(out)
+    aud = r["audio"]
+    check(aud["underruns"]["count"] == 5, "starving queue: 5 underruns")
+    check(aud["underruns"]["rate"] is not None and aud["underruns"]["rate"] > 0, "starving queue: positive underrun rate")
+    check(abs(aud["queue_depth_ms"]["p1"] - 100 / 48.0) < 1e-4, "starving queue: p1 depth ~2.08 ms")
+
+    # Underruns aligned with long frame gaps vs not aligned
+    corr_frames = [0, 20, 40, 100, 120, 140, 160, 180, 200, 220, 240, 260]
+    corr_lines = [span(FLIP_REQ, 1, 0, 0, t, t) for t in corr_frames[:4]]
+    for t in corr_frames:
+        corr_lines.append(span(PRESENT, 0, 0, 0, t, t + 1))
+    # Underrun 1 at t = 80 ms: inside 60ms gap (40..100). Window [30, 80] overlaps 60ms gap. ALIGNED.
+    corr_lines.append(span(AUDIO_UNDERRUN, 0, 0, 10, 80, 80))
+    # Underrun 2 at t = 200 ms: window [150, 200], all gaps are 20ms <= 40ms, no drawable/label_wait. NOT ALIGNED.
+    corr_lines.append(span(AUDIO_UNDERRUN, 0, 0, 20, 200, 200))
+    # DRAWABLE span at 235..240 ms
+    corr_lines.append(span(DRAWABLE, 1, 0, 0, 235, 240))
+    # Underrun 3 at t = 250 ms: window [200, 250] overlaps DRAWABLE at 235..240. ALIGNED.
+    corr_lines.append(span(AUDIO_UNDERRUN, 0, 0, 10, 250, 250))
+    corr_lines.append(span(AUDIO_MIX, 0, 1, 500, 0, 1))
+
+    rc, out, err = run(tmp, trace(corr_lines), "--json")
+    r = json.loads(out)
+    aud = r["audio"]
+    u_dets = aud["correlation"]["underruns"]
+    check(len(u_dets) == 3, "correlation: 3 underruns")
+    check(abs(u_dets[0]["nearest_frame_gap_ms"] - 60.0) < 1e-4, "underrun 1: nearest gap 60 ms")
+    check(u_dets[0]["overlap"] is True, "underrun 1: overlap True")
+    check(abs(u_dets[1]["nearest_frame_gap_ms"] - 20.0) < 1e-4, "underrun 2: nearest gap 20 ms")
+    check(u_dets[1]["overlap"] is False, "underrun 2: overlap False")
+    check(u_dets[2]["overlap"] is True, "underrun 3: overlap True via DRAWABLE")
+    check(abs(aud["correlation"]["overlap_share"] - 2 / 3) < 1e-4, "correlation overlap_share is 2/3")
+    check(aud["correlation"]["overlap_count"] == 2, "correlation overlap_count is 2")
 print("ftrace_report: %s" % ("ok" if not failures else "%d failed" % failures))
 sys.exit(1 if failures else 0)
