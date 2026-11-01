@@ -961,6 +961,50 @@ if(PS3RECOMP_BUILD_TESTS)
         target_sources(hle_dialog_callbacks PRIVATE libs/system/cellSysutil.c)
         target_link_libraries(hle_dialog_callbacks PRIVATE Threads::Threads)
 
+        # pad.record / pad.replay (libs/input/pad_trace.h): the writer, the reader, the lookup, and the
+        # malformed-file stops. A stop case ends the process with exit 70 and one PS3STOP line, which is
+        # what its PASS_REGULAR_EXPRESSION matches. Synthetic data only.
+        add_executable(test_pad_trace
+            libs/input/tests/test_pad_trace.c
+            libs/input/pad_trace.c
+            runtime/diag/stop.cpp)
+        target_include_directories(test_pad_trace PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+        target_compile_definitions(test_pad_trace PRIVATE _GNU_SOURCE)
+        target_link_libraries(test_pad_trace PRIVATE Threads::Threads)
+        set_target_properties(test_pad_trace PROPERTIES LINKER_LANGUAGE CXX)
+        foreach(c roundtrip lookup changes poll-counts record-replay errors record-refusals)
+            add_test(NAME pad_trace_${c} COMMAND test_pad_trace ${c})
+            set_tests_properties(pad_trace_${c} PROPERTIES LABELS "input;t0" TIMEOUT 60)
+        endforeach()
+        add_test(NAME pad_trace_threads COMMAND test_pad_trace threads)
+        set_tests_properties(pad_trace_threads PROPERTIES LABELS "input;t0;tsan" TIMEOUT 120)
+        # name|line|reason of the replay file's first wrong line (the same table as k_bad in the test).
+        foreach(row IN ITEMS
+                "empty|1|header" "garbage-header|1|header" "wrong-format|1|header" "bad-ports|1|header"
+                "version-2|1|version" "truncated|2|truncated" "syntax|2|syntax" "blank-line|2|syntax"
+                "unknown-key|2|unknown-key" "duplicate-key|2|duplicate-key" "value-len|2|value"
+                "value-word|2|value" "conn-length|2|value" "record-kind|2|record-kind"
+                "poll-backwards|3|keys-backwards" "same-key|3|keys-backwards" "flip-backwards|3|keys-backwards"
+                "step-backwards|3|keys-backwards" "end-backwards|3|keys-backwards" "port-range|2|port-range"
+                "after-end|3|after-end")
+            string(REPLACE "|" ";" parts "${row}")
+            list(GET parts 0 case_name)
+            list(GET parts 1 case_line)
+            list(GET parts 2 case_reason)
+            add_test(NAME pad_trace_stop_${case_name} COMMAND test_pad_trace stop ${case_name})
+            set_tests_properties(pad_trace_stop_${case_name} PROPERTIES
+                PASS_REGULAR_EXPRESSION "PS3STOP v=1 kind=pad-trace role=replay [^\n]*line=${case_line} reason=${case_reason}( |\n)"
+                LABELS "input;t0" TIMEOUT 60)
+        endforeach()
+        add_test(NAME pad_trace_stop_record-exists COMMAND test_pad_trace stop record-exists)
+        set_tests_properties(pad_trace_stop_record-exists PROPERTIES
+            PASS_REGULAR_EXPRESSION "PS3STOP v=1 kind=pad-trace role=record [^\n]*line=0 reason=exists( |\n)"
+            LABELS "input;t0" TIMEOUT 60)
+        add_test(NAME pad_trace_stop_record-io COMMAND test_pad_trace stop record-io)
+        set_tests_properties(pad_trace_stop_record-io PROPERTIES
+            PASS_REGULAR_EXPRESSION "PS3STOP v=1 kind=pad-trace role=record [^\n]*line=0 reason=io( |\n)"
+            LABELS "input;t0" TIMEOUT 60)
+
         if(SDL2_FOUND)
             ps3recomp_add_hle_check_test(hle_audio_ring
                 libs/audio/tests/test_audio_ring.c)
