@@ -2367,13 +2367,15 @@ void check_job_spans(std::uint32_t q, std::uint32_t n, bool paused_pushes, std::
     }
 }
 
-/* A thread's pushes in time order carry increasing seq: the number is assigned under the queue lock at the push. */
+/* A thread's pushes in time order carry increasing seq: the number is assigned under the queue lock at the push.
+ * Time order is the buffer order of the thread's own records (each claims its slot after the previous one), not t0:
+ * macOS CLOCK_MONOTONIC ticks in microseconds, so back-to-back pushes share a t0 and a sort by it is a tie. */
 void check_push_order(std::uint32_t tid, std::uint32_t q, std::uint32_t n)
 {
     std::vector<ps3_ft_rec> mine;
     for (const ps3_ft_rec& r : ft_kind(PS3_FT_JQ2_PUSH))
         if (r.who == tid && ft_q(r) == q) mine.push_back(r);
-    std::sort(mine.begin(), mine.end(), [](const ps3_ft_rec& a, const ps3_ft_rec& b) { return a.t0 < b.t0; });
+    std::stable_sort(mine.begin(), mine.end(), [](const ps3_ft_rec& a, const ps3_ft_rec& b) { return a.t0 < b.t0; });
     CHECK(mine.size() == n, "tid %u: %zu PUSH spans, want %u", tid, mine.size(), n);
     for (std::size_t i = 1; i < mine.size(); ++i)
         CHECK(mine[i].a > mine[i - 1].a, "tid %u: seq %u after %u", tid, mine[i].a, mine[i - 1].a);
