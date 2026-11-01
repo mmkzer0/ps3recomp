@@ -20,6 +20,8 @@
 #include "../../runtime/platform/win32_compat.h"   /* GetTickCount64 on POSIX */
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host */
 #include "ps3emu/log_first.h"
+#include "ps3emu/config.h"
+#include "pad_trace.h"
 
 /* PAD_CLOCK=flips: PAD_SCRIPT and PAD_STICK times count guest flips instead of
  * wall-clock seconds. A loaded machine runs a title at a third of its usual
@@ -157,6 +159,96 @@ static u32 pad_status_take(u32 port)
     if (port >= PAD_MAX_HOST_PORTS) return 0;
     const int ch = __atomic_exchange_n(&s_port_changed[port], 0, __ATOMIC_RELAXED);
     return ch ? CELL_PAD_STATUS_ASSIGN_CHANGES : 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Record and replay (pad_trace.h; pad.record, pad.replay)
+ *
+ * Both off is the default: s_trace stays NULL and every hook below is one
+ * branch. Replay answers the guest from the trace and never from the host pad
+ * or an injector, so a replayed run sees the same input however the machine
+ * behaves.
+ * -------------------------------------------------------------------------*/
+
+_Static_assert(CELL_PAD_MAX_CODES == PAD_TRACE_MAX_WORDS, "pad trace words follow CellPadData.button");
+_Static_assert(CELL_PAD_MAX_PORT_NUM == PAD_TRACE_MAX_PORTS, "pad trace ports follow the pad ports");
+
+static PadTrace* s_trace;   /* published by cellPadInit; NULL when neither option is set */
+static int s_replay_conn[CELL_PAD_MAX_PORT_NUM];   /* 0 unseen, 1 off, 2 on: what GetInfo last said */
+
+static PadTrace* pad_trace_get(void) { return __atomic_load_n(&s_trace, __ATOMIC_ACQUIRE); }
+
+static void pad_trace_attach(void)
+{
+    PadTraceOptions o;
+    o.record_path = ps3_cfg_pad_record();
+    o.replay_path = ps3_cfg_pad_replay();
+    o.flip = cellGcm_flip_request_count;
+    __atomic_store_n(&s_trace, pad_trace_global(&o), __ATOMIC_RELEASE);
+}
+
+/* What a connected pad that nothing touches reports, byte for byte as the live
+ * path below builds it: port 0 is always a (virtual) pad, any other port has no
+ * device and reports an empty packet. Replay serves it where the trace has no
+ * state, and a recording that never polled yet must not show a stick pushed to
+ * the corner. */
+static void pad_neutral_state(u32 port, PadTraceState* st)
+{
+    memset(st, 0, sizeof *st);
+    if (port != 0) return;
+    const u32 setting = s_port_setting[port];
+    s32 len = CELL_PAD_LEN_CHANGE_DEFAULT;
+    if (setting & CELL_PAD_SETTING_SENSOR_ON)     len = CELL_PAD_LEN_CHANGE_SENSOR_ON;
+    else if (setting & CELL_PAD_SETTING_PRESS_ON) len = CELL_PAD_LEN_CHANGE_PRESS_ON;
+    st->len = len;
+    st->words[1] = (u16)(0x70 | ((len / 2) & 0xF));
+    st->words[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X] = st->words[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_Y] = 128;
+    st->words[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X]  = st->words[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y]  = 128;
+    if (setting & CELL_PAD_SETTING_SENSOR_ON) {
+        st->words[CELL_PAD_BTN_OFFSET_SENSOR_X] = 512;
+        st->words[CELL_PAD_BTN_OFFSET_SENSOR_Y] = 399;
+        st->words[CELL_PAD_BTN_OFFSET_SENSOR_Z] = 512;
+        st->words[CELL_PAD_BTN_OFFSET_SENSOR_G] = 512;
+    }
+}
+
+/* One replayed cellPadGetData. `fresh` is the replayer's answer to "does the
+ * guest get a new packet": without it a held state would be a new packet on
+ * every poll, and a title that drains the pad until len is 0 would never leave
+ * its loop (see the emission contract at the end of cellPadGetData). */
+static void pad_replay_get(PadTrace* tr, u32 port, CellPadData* data)
+{
+    PadTraceState st, neutral;
+    int fresh = 1;
+    pad_neutral_state(port, &neutral);
+    st = neutral;
+    pad_trace_poll(tr, port, &st, &neutral, &fresh);
+    data->len = fresh ? st.len : 0;
+    memcpy(data->button, st.words, sizeof data->button);
+}
+
+/* Which ports the info calls report connected. Port 0 is always one (the
+ * virtual pad); another is connected when a host device is. Replaying, the host
+ * is ignored and the trace says; recording, what is reported is what is written. */
+static void pad_conn_snapshot(u8 on[CELL_PAD_MAX_PORT_NUM])
+{
+    PadTrace* tr = pad_trace_get();
+    const int replaying = tr && pad_trace_replaying(tr);
+    for (u32 i = 0; i < CELL_PAD_MAX_PORT_NUM; i++)
+        on[i] = replaying ? (i == 0) : ((i < PAD_MAX_HOST_PORTS && s_host_state[i].connected) || i == 0);
+    if (tr) pad_trace_conn(tr, on);
+}
+
+/* The CELL_PAD_STATUS_ASSIGN_CHANGES bit for `port`. Live it is the host's
+ * hot-plug flag; replaying it is a change of the replayed connection since the
+ * last info call, the first call being the baseline. */
+static u32 pad_status_for(u32 port, u8 on)
+{
+    PadTrace* tr = pad_trace_get();
+    if (!(tr && pad_trace_replaying(tr))) return pad_status_take(port);
+    const int now = on ? 2 : 1;
+    const int was = __atomic_exchange_n(&s_replay_conn[port], now, __ATOMIC_RELAXED);
+    return (was && was != now) ? CELL_PAD_STATUS_ASSIGN_CHANGES : 0;
 }
 
 /* ---------------------------------------------------------------------------
@@ -737,6 +829,8 @@ s32 cellPadInit(u32 max_connect)
     if (max_connect == 0 || max_connect > CELL_MAX_PADS)
         return CELL_PAD_ERROR_INVALID_PARAMETER;
 
+    pad_trace_attach();   /* a bad trace file ends the run here, before the guest polls */
+
     s_pad_initialized = 1;
     s_max_connect = max_connect > CELL_PAD_MAX_PORT_NUM ? CELL_PAD_MAX_PORT_NUM : max_connect;
     memset(s_port_setting, 0, sizeof(s_port_setting));
@@ -765,6 +859,7 @@ s32 cellPadEnd(void)
 
     if (!s_pad_initialized)
         return CELL_PAD_ERROR_NOT_OPENED;
+    { PadTrace* tr = pad_trace_get(); if (tr) pad_trace_flush(tr); }
 
     pad_lock();
     pad_shutdown_backend();
@@ -810,6 +905,13 @@ s32 cellPadGetData(u32 port_no, CellPadData* data_guest)
     /* Build in a local host struct, then copy to guest memory big-endian. */
     CellPadData _d; CellPadData* data = &_d;
     memset(data, 0, sizeof(CellPadData));
+
+    PadTrace* const tr = pad_trace_get();
+    s32 rec_len = 0;   /* a connected port's packet length, whatever freshness does to data->len below */
+    if (tr && pad_trace_replaying(tr)) {
+        pad_replay_get(tr, port_no, data);
+        goto store;
+    }
 
     /* Poll fresh state */
     pad_poll_backend();
@@ -876,6 +978,7 @@ skip_inject: ;
         len = CELL_PAD_LEN_CHANGE_PRESS_ON;
 
     data->len = len;
+    rec_len = len;
     /* Finalize this call's packet freshness before any injected hold budget
      * advances. len=0 drain reads still build the ordinary payload, but do
      * not consume a PAD_FILE report. See the emission contract below. */
@@ -1131,6 +1234,16 @@ emit:
      * attack firing once.
      *
      * PAD_ALWAYS_CHANGE=1 restores the old always-a-packet behaviour. */
+    if (tr && !pad_trace_replaying(tr)) {
+        /* Recorded after every source above, from the words that are stored below. len is the packet
+         * length, not data->len: whether a poll is fresh depends on the host's 4 ms report clock. */
+        PadTraceState st;
+        int fresh;
+        st.len = rec_len;
+        memcpy(st.words, data->button, sizeof st.words);
+        pad_trace_poll(tr, port_no, &st, NULL, &fresh);
+    }
+store: ;
     {
         unsigned int ea = (unsigned int)(uintptr_t)data_guest;
         vm_write32((unsigned long long)ea + 0, (unsigned int)data->len);   /* len (s32) */
@@ -1167,9 +1280,11 @@ s32 cellPadGetInfo(CellPadInfo2* info)
      * not detected", took the auto-OK, and opened it again -- forever, before
      * it ever finished booting. Both entry points describe the same hardware
      * and have to answer the same way. */
+    u8 on[CELL_PAD_MAX_PORT_NUM];
+    pad_conn_snapshot(on);
     u32 connected = 0;
     for (u32 i = 0; i < s_max_connect && i < PAD_MAX_HOST_PORTS; i++)
-        if (s_host_state[i].connected || i == 0) connected++;
+        if (on[i]) connected++;
 
     vm_write32(gaddr + 0x00, s_max_connect);
     vm_write32(gaddr + 0x04, connected);
@@ -1179,11 +1294,10 @@ s32 cellPadGetInfo(CellPadInfo2* info)
      * Packed for 7 ports, status landed at 0x28 and GH3 -- which reads
      * info+0x208+port -- saw port 0 disconnected and never polled the pad. */
     for (u32 i = 0; i < CELL_PAD_MAX_PORT_NUM; i++) {
-        int on = (i < s_max_connect && i < PAD_MAX_HOST_PORTS &&
-                  (s_host_state[i].connected || i == 0));
-        vm_write16(gaddr + 0x00C + i * 2, on ? 0x054C : 0);   /* vendor: Sony  */
-        vm_write16(gaddr + 0x10A + i * 2, on ? 0x0268 : 0);   /* product: DS3  */
-        vm_write8(gaddr + 0x208 + i, (u8)((on ? CELL_PAD_STATUS_CONNECTED : 0) | pad_status_take(i)));
+        int up = (i < s_max_connect && i < PAD_MAX_HOST_PORTS && on[i]);
+        vm_write16(gaddr + 0x00C + i * 2, up ? 0x054C : 0);   /* vendor: Sony  */
+        vm_write16(gaddr + 0x10A + i * 2, up ? 0x0268 : 0);   /* product: DS3  */
+        vm_write8(gaddr + 0x208 + i, (u8)((up ? CELL_PAD_STATUS_CONNECTED : 0) | pad_status_for(i, (u8)up)));
     }
     return CELL_OK;
 }
@@ -1206,13 +1320,15 @@ s32 cellPadGetInfo2(CellPadInfo2* info_guest)
     memset(info, 0, sizeof(CellPadInfo2));
     info->max_connect = s_max_connect;
 
+    u8 on[CELL_PAD_MAX_PORT_NUM];
+    pad_conn_snapshot(on);
     u32 connected = 0;
     for (u32 i = 0; i < s_max_connect && i < PAD_MAX_HOST_PORTS; i++) {
         /* Always present a virtual pad on port 0 (standard emulator behavior) so
          * boot flows that block until a controller is connected can proceed even
          * with no physical device attached. */
-        if (s_host_state[i].connected || i == 0) {
-            info->port_status[i]       = CELL_PAD_STATUS_CONNECTED | pad_status_take(i);
+        if (on[i]) {
+            info->port_status[i]       = CELL_PAD_STATUS_CONNECTED | pad_status_for(i, on[i]);
             info->port_setting[i]      = s_port_setting[i];
             info->device_capability[i] = CELL_PAD_CAPABILITY_PS3_CONFORMITY
                                        | CELL_PAD_CAPABILITY_PRESS_MODE
@@ -1222,7 +1338,7 @@ s32 cellPadGetInfo2(CellPadInfo2* info_guest)
             info->device_type[i]       = CELL_PAD_DEV_TYPE_STANDARD;
             connected++;
         } else {
-            info->port_status[i] = CELL_PAD_STATUS_DISCONNECTED | pad_status_take(i);
+            info->port_status[i] = CELL_PAD_STATUS_DISCONNECTED | pad_status_for(i, on[i]);
         }
     }
     info->now_connect = connected;
@@ -1262,12 +1378,14 @@ s32 cellPadPeriphGetInfo(CellPadPeriphInfo* info_guest)
     info->max_connect = s_max_connect;
     info->system_info = 0;
 
+    u8 on[CELL_PAD_MAX_PORT_NUM];
+    pad_conn_snapshot(on);
     u32 connected = 0;
     for (u32 i = 0; i < s_max_connect && i < CELL_PAD_MAX_PORT_NUM; i++) {
         /* Same virtual-pad-on-port-0 rule as cellPadGetInfo2, so both views of
          * the ports agree (a game that cross-checks them must see one truth). */
-        if ((i < PAD_MAX_HOST_PORTS && s_host_state[i].connected) || i == 0) {
-            info->port_status[i]       = CELL_PAD_STATUS_CONNECTED | pad_status_take(i);
+        if (on[i]) {
+            info->port_status[i]       = CELL_PAD_STATUS_CONNECTED | pad_status_for(i, on[i]);
             info->port_setting[i]      = s_port_setting[i];
             info->device_capability[i] = CELL_PAD_CAPABILITY_PS3_CONFORMITY
                                        | CELL_PAD_CAPABILITY_PRESS_MODE
@@ -1279,7 +1397,7 @@ s32 cellPadPeriphGetInfo(CellPadPeriphInfo* info_guest)
             info->pclass_profile[i]    = 0;
             connected++;
         } else {
-            info->port_status[i] = CELL_PAD_STATUS_DISCONNECTED | pad_status_take(i);
+            info->port_status[i] = CELL_PAD_STATUS_DISCONNECTED | pad_status_for(i, on[i]);
         }
     }
     info->now_connect = connected;

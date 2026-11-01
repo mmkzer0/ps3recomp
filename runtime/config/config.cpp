@@ -26,11 +26,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -38,10 +40,13 @@
 #include <vector>
 
 #if defined(_WIN32)
+#  include <io.h>
 #  include <stdlib.h>   /* _environ */
 #elif defined(__APPLE__)
 #  include <crt_externs.h>
+#  include <unistd.h>
 #else
+#  include <unistd.h>
 extern "C" char** environ;
 #endif
 
@@ -246,6 +251,35 @@ std::string check_string(const Option& o, std::string& s)
     case PS3_CFG_V_NULL_PAGE:
         if (s == "stop" || s == "drop") return {};
         return "expected \"stop\" or \"drop\", found \"" + s + "\"";
+    case PS3_CFG_V_PAD_RECORD_PATH: {
+        /* Checked here so a mistyped path fails at startup rather than minutes into a run.
+         * pad_trace.c creates the file exclusively, which settles a race with another writer. */
+        if (s.empty()) return {};
+        std::error_code ec;
+        const std::filesystem::path p(s);
+        if (std::filesystem::exists(std::filesystem::symlink_status(p, ec)))
+            return "\"" + s + "\" already exists; the recorder never overwrites a recording";
+        const std::filesystem::path dir = p.has_parent_path() ? p.parent_path() : std::filesystem::path(".");
+        if (!std::filesystem::is_directory(dir, ec))
+            return "the directory \"" + dir.string() + "\" does not exist";
+#if defined(_WIN32)
+        if (_access(dir.string().c_str(), 2) != 0)
+#else
+        if (access(dir.c_str(), W_OK | X_OK) != 0)
+#endif
+            return "the directory \"" + dir.string() + "\" is not writable";
+        return {};
+    }
+    case PS3_CFG_V_PAD_REPLAY_PATH: {
+        if (s.empty()) return {};
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(std::filesystem::path(s), ec))
+            return "\"" + s + "\" is not a regular file";
+        std::FILE* f = std::fopen(s.c_str(), "rb");
+        if (!f) return "\"" + s + "\" cannot be read: " + std::strerror(errno);
+        std::fclose(f);
+        return {};
+    }
     case PS3_CFG_V_VIDEO_RESOLUTIONS: {
         /* The cellVideoOut resolution ids (libs/video/cellVideoOut.h). */
         static const unsigned kIds[] = {1, 2, 4, 5, 10, 11, 12, 13};

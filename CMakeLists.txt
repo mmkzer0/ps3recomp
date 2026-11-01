@@ -1020,6 +1020,34 @@ if(PS3RECOMP_BUILD_TESTS)
                 target_link_libraries(hle_pad_rumble PRIVATE ${SDL2_LIBRARIES})
             endif()
             target_link_libraries(hle_pad_rumble PRIVATE m)
+
+            # cellPad with pad.record / pad.replay (libs/input/pad_trace.h): the real cellPadGetData
+            # and info calls over a synthetic trace. One process per case, because the injectors read
+            # the environment once and the trace is opened once.
+            add_executable(test_pad_replay
+                libs/input/tests/test_pad_replay.c
+                libs/input/pad_trace.c
+                runtime/diag/stop.cpp)
+            target_include_directories(test_pad_replay PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+            target_compile_definitions(test_pad_replay PRIVATE _GNU_SOURCE)
+            if(TARGET SDL2::SDL2)
+                target_link_libraries(test_pad_replay PRIVATE SDL2::SDL2)
+            else()
+                target_include_directories(test_pad_replay PRIVATE ${SDL2_INCLUDE_DIRS})
+                target_link_libraries(test_pad_replay PRIVATE ${SDL2_LIBRARIES})
+            endif()
+            target_link_libraries(test_pad_replay PRIVATE m Threads::Threads)
+            set_target_properties(test_pad_replay PROPERTIES LINKER_LANGUAGE CXX)
+            if(APPLE)
+                target_link_options(test_pad_replay PRIVATE "-Wl,-dead_strip")
+            else()
+                target_compile_options(test_pad_replay PRIVATE -ffunction-sections -fdata-sections)
+                target_link_options(test_pad_replay PRIVATE "-Wl,--gc-sections")
+            endif()
+            foreach(c control replay replay-info record)
+                add_test(NAME pad_replay_${c} COMMAND test_pad_replay ${c} pad_replay_${c}.trace)
+                set_tests_properties(pad_replay_${c} PROPERTIES LABELS "input;t0" TIMEOUT 60)
+            endforeach()
         endif()
     endif()
 endif()

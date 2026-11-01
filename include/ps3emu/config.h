@@ -55,6 +55,8 @@ enum {
     PS3_CFG_V_SHA256_OR_EMPTY,   /* "" or 64 hex digits; stored lower case */
     PS3_CFG_V_VIDEO_RESOLUTIONS, /* "" or comma-separated cellVideoOut resolution ids; stored sorted, unique */
     PS3_CFG_V_NULL_PAGE,         /* "stop" or "drop" */
+    PS3_CFG_V_PAD_RECORD_PATH,   /* "" or a path that does not exist, in a writable directory */
+    PS3_CFG_V_PAD_REPLAY_PATH,   /* "" or a readable regular file */
 };
 
 /* ---- typed storage ------------------------------------------------------- */

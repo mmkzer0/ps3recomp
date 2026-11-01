@@ -9,6 +9,7 @@
  *         -o /tmp/test_pad_sensor_mode && /tmp/test_pad_sensor_mode
  */
 #include "../cellPad.c"
+#include "pad_trace_off.h"
 #include <assert.h>
 #include <sys/mman.h>
 uint8_t* vm_base;

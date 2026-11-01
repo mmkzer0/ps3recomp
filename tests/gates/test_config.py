@@ -88,6 +88,8 @@ def test_defaults_without_file_or_environment():
         "video.rsx_capture": ("false", "default"),
         "video.rsx_capture_dir": ('""', "default"),
         "video.rsx_capture_frames": ("0", "default"),
+        "pad.record": ('""', "default"),
+        "pad.replay": ('""', "default"),
         "title.elf_sha256": ('""', "default"),
         "diag.dump_config": ("false", "default"),
     }, o
@@ -179,6 +181,8 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
             "video.rsx_capture": "default",
             "video.rsx_capture_dir": "default",
             "video.rsx_capture_frames": "default",
+            "pad.record": "default",
+            "pad.replay": "default",
             "title.elf_sha256": "env:PS3RECOMP_TITLE_ELF_SHA256",
             "diag.dump_config": "env:PS3RECOMP_DIAG_DUMP_CONFIG",
         }, src
@@ -195,6 +199,7 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
                            "trophy": {"register_wait_cap_vblanks": 1024},
                            "video": {"resolutions": "", "rsx_capture": False, "rsx_capture_dir": "",
                                      "rsx_capture_frames": 0},
+                           "pad": {"record": "", "replay": ""},
                            "title": {"elf_sha256": SHA_A}, "diag": {"dump_config": False}}, doc
 
 
@@ -288,6 +293,47 @@ def test_null_page_is_stop_or_drop_from_file_and_environment():
     with Cfg("schema = 1", "[ppu]", "null_page = true") as c:      # a bool is the wrong type
         f = config_invalid(probe("--load", c.path, "get"))
         assert f["key"] == "ppu.null_page" and f["line"] == "3", f
+
+
+def test_pad_trace_paths_are_checked_at_load():
+    # A mistyped path must end the run at startup, not minutes into it; and the recorder must never
+    # overwrite a recording.
+    with tempfile.TemporaryDirectory(prefix="ps3pad-") as d:
+        fresh = os.path.join(d, "fresh.trace")
+        existing = os.path.join(d, "existing.trace")
+        with open(existing, "w") as f:
+            f.write("keep\n")
+        with Cfg("schema = 1", "[pad]", f'record = "{fresh}"', f'replay = "{existing}"') as c:
+            o = options(probe("--load", c.path, "get"))
+            assert o["pad.record"] == (f'"{fresh}"', f"file:{c.path}"), o
+            assert o["pad.replay"] == (f'"{existing}"', f"file:{c.path}"), o
+        assert not os.path.exists(fresh), "validating a record path must not create it"
+        bad = [("record", existing, "already exists"),
+               ("record", os.path.join(d, "no", "dir", "x.trace"), "does not exist"),
+               ("replay", os.path.join(d, "missing.trace"), "not a regular file"),
+               ("replay", d, "not a regular file")]
+        if os.name == "posix" and os.geteuid() != 0:
+            ro = os.path.join(d, "ro")
+            os.mkdir(ro)
+            os.chmod(ro, 0o555)
+            secret = os.path.join(d, "secret.trace")
+            with open(secret, "w") as f:
+                f.write("x\n")
+            os.chmod(secret, 0)
+            bad += [("record", os.path.join(ro, "x.trace"), "not writable"),
+                    ("replay", secret, "cannot be read")]
+        try:
+            for key, path, needle in bad:
+                with Cfg("schema = 1", "[pad]", f'{key} = "{path}"') as c:
+                    f = config_invalid(probe("--load", c.path, "get"))
+                    assert f["key"] == f"pad.{key}" and f["line"] == "3", (key, path, f)
+                    assert needle in f["detail"], (key, path, f)
+            f = config_invalid(probe("get", PS3RECOMP_PAD_RECORD=existing))
+            assert f["env"] == "PS3RECOMP_PAD_RECORD" and f["key"] == "pad.record", f
+        finally:
+            for p in (os.path.join(d, "ro"), os.path.join(d, "secret.trace")):
+                if os.path.exists(p):
+                    os.chmod(p, 0o755)
 
 
 def test_schema_mismatch_missing_and_mistyped_stop():
