@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ftrace_report: frame binning, import call sites, split, cadence, drawables, label-store waits, bad input."""
+"""ftrace_report: frame binning, import call sites, split, cadence, drawables, label-store waits, jq2 job queues, bad input."""
 import json
 import subprocess
 import sys
@@ -288,5 +288,187 @@ with tempfile.TemporaryDirectory() as tmp:
     check(rc == 0 and "port 0: 1 run(s), 3 block(s), max 3 blk" in out, "port 0 text report")
     check(rc == 0 and "top overlapping long guest waits" in out and "Port2Sync" in out,
           "text report names overlapping HLE import")
+
+# jq2 job queues: queue, worker and seq live in who/a/b; a fiber wait has no waiter id.
+JQ2_PUSH, JQ2_JOB, JQ2_CREDIT, JQ2_SYNC_WAIT, JQ2_IDLE = 22, 23, 24, 25, 26
+EVF, FIBER = 1, 2
+
+
+def close(a, b, tol=1e-9):
+    return a is not None and abs(a - b) <= tol
+
+
+def qword(q, w):
+    return q << 8 | w
+
+
+def jq2_trace(lines, dropped=0):
+    head = [f"# ps3_ftrace start_us=0 end_us=200000 spans=0 dropped={dropped}",
+            "T 1 main", "T 2 audio", "T 10 encoder"]
+    return "\n".join(head + lines) + "\n"
+
+
+# Two queues with two workers each, both numbering their jobs from 1. Queue 0's window
+# is 0-40 ms (3 pushes, 3 jobs, 3 credited), queue 1's is 100-115.5 ms (2 pushes, 2 jobs).
+# Waiter 3 is handed out twice in queue 0, so the second wait must pair with the second
+# credit, not the first.
+jq2 = [span(FLIP_REQ, 1, 0, 0, t, t) for t in (0, 100, 200)]
+jq2 += [span(JQ2_PUSH, 1, 1, 0 | 1 << 8, 0, 1),                       # seq 1, depth 1
+        span(JQ2_JOB, qword(0, 0), 1, 2000, 2, 6),                    # latency 1, wall 4, CPU 2 ms
+        span(JQ2_CREDIT, qword(0, 0), 1, 3 | EVF << 8 | 1 << 16, 6.2, 6.5),
+        span(JQ2_SYNC_WAIT, 1, 3 | EVF << 8, 0, 6.1, 8.6),            # sync latency 2.1, wait 2.5
+        span(JQ2_PUSH, 1, 2, 0 | 2 << 8, 10, 11),
+        span(JQ2_JOB, qword(0, 1), 2, 3000, 12, 18),                  # latency 1, wall 6, CPU 3 ms
+        span(JQ2_CREDIT, qword(0, 1), 2, 4 | EVF << 8 | 1 << 16, 18.1, 18.25),
+        span(JQ2_SYNC_WAIT, 2, 4 | EVF << 8, 0, 18.05, 19.3),         # sync latency 1.05, wait 1.25
+        span(JQ2_PUSH, 1, 3, 0 | 1 << 8, 30, 31),
+        span(JQ2_JOB, qword(0, 0), 3, 1000, 32.5, 34.5),              # latency 1.5, wall 2, CPU 1 ms
+        span(JQ2_CREDIT, qword(0, 0), 3, 3 | EVF << 8 | 1 << 16, 34.6, 34.7),
+        span(JQ2_SYNC_WAIT, 1, 3 | EVF << 8, 0, 34.55, 35.8),         # waiter 3 again, sync latency 1.1
+        span(JQ2_IDLE, qword(0, 0), 1, 0, 6.4, 9.4),                  # parked with work pending: 3 ms
+        span(JQ2_IDLE, qword(0, 1), 0, 0, 18.5, 40)]                  # idle 21.5 ms, no depth: not parked
+jq2 += [span(JQ2_PUSH, 10, 1, 1 | 1 << 8, 100, 101),                  # queue 1, seq 1 again
+        span(JQ2_PUSH, 10, 2, 1 | 2 << 8, 110, 111),
+        span(JQ2_JOB, qword(1, 0), 1, 4000, 103, 109),                # latency 2, wall 6, CPU 4 ms
+        span(JQ2_CREDIT, qword(1, 0), 1, 5 | EVF << 8 | 1 << 16, 109.5, 109.8),
+        span(JQ2_SYNC_WAIT, 10, 5 | EVF << 8, 1, 109.4, 112.9),        # sync latency 3.1
+        span(JQ2_JOB, qword(1, 1), 2, 500, 112, 113),                 # latency 1, wall 1, CPU 0.5 ms
+        span(JQ2_CREDIT, qword(1, 1), 2, 0xFF, 113.2, 113.3),         # nobody waited
+        span(JQ2_IDLE, qword(1, 0), 0, 0, 113.5, 115.5)]              # idle 2 ms
+
+with tempfile.TemporaryDirectory() as tmp:
+    rc, out, err = run(tmp, jq2_trace(jq2), "--json")
+    check(rc == 0, f"jq2 trace: exit 0: {err}")
+    r = json.loads(out)
+    jq = r["jq2"]
+    check(jq["dropped"] == 0 and [q["q"] for q in jq["queues"]] == [0, 1],
+          "jq2: two queues, in queue order, no dropped spans")
+    q0, q1 = jq["queues"]
+    need = {"q", "window", "pushes", "push_rate_per_s", "jobs", "workers", "queue_latency_ms",
+            "queue_latency_clamped", "exec_wall_ms", "exec_cpu_ms", "completion_delay_ms",
+            "sync_latency_ms", "cpu_wall", "per_worker", "parked_while_pending", "depth",
+            "sync_wait_by_tid", "fiber_sync_wait", "join_failures"}
+    check(need <= set(q0), f"jq2 keys present: {sorted(need - set(q0))}")
+    stats = {"count", "mean", "p50", "p95", "p99", "max"}
+    check(all(stats <= set(q0[k]) for k in ("queue_latency_ms", "exec_wall_ms", "exec_cpu_ms",
+                                            "completion_delay_ms", "sync_latency_ms")),
+          "jq2 latency rows carry count, mean, p50, p95, p99 and max")
+    check(q0["pushes"] == 3 and q0["jobs"] == 3 and q0["workers"] == 2, "q0: 3 pushes, 3 jobs, 2 workers")
+    check(close(q0["window"]["start_ms"], 0) and close(q0["window"]["ms"], 40) and
+          close(q0["push_rate_per_s"], 75), "q0: window 0-40 ms, 75 pushes/s")
+    lat = q0["queue_latency_ms"]
+    check(lat["count"] == 3 and close(lat["mean"], 3.5 / 3) and close(lat["p50"], 1) and
+          close(lat["p95"], 1.5) and close(lat["max"], 1.5), f"q0 queue latency {lat}")
+    check(q0["queue_latency_clamped"] == 0, "q0: no queue latency clamped")
+    wall, cpu = q0["exec_wall_ms"], q0["exec_cpu_ms"]
+    check(wall["count"] == 3 and close(wall["mean"], 4) and close(wall["p95"], 6) and close(wall["max"], 6),
+          f"q0 execution wall {wall}")
+    check(cpu["count"] == 3 and close(cpu["mean"], 2) and close(cpu["p50"], 2) and close(cpu["max"], 3),
+          f"q0 execution CPU {cpu}")
+    comp = q0["completion_delay_ms"]
+    check(comp["count"] == 3 and close(comp["mean"], 0.4 / 3) and close(comp["p50"], 0.1) and
+          close(comp["p95"], 0.2) and close(comp["max"], 0.2), f"q0 completion delay {comp}")
+    syn = q0["sync_latency_ms"]
+    check(syn["count"] == 3 and close(syn["mean"], 4.25 / 3) and close(syn["p50"], 1.1) and
+          close(syn["p95"], 2.1) and close(syn["max"], 2.1), f"q0 sync latency {syn}")
+    check(close(q0["cpu_wall"], 0.5), f"q0 cpu/wall {q0['cpu_wall']}")
+    by_w = {p["w"]: p for p in q0["per_worker"]}
+    check(sorted(by_w) == [0, 1] and by_w[0]["jobs"] == 2 and by_w[1]["jobs"] == 1, "q0: both workers seen")
+    check(close(by_w[0]["busy_ms"], 6) and close(by_w[0]["utilisation"], 6 / 40) and
+          close(by_w[0]["idle_ms"], 3) and close(by_w[0]["idle_fraction"], 3 / 40),
+          f"q0 worker 0 busy/idle {by_w[0]}")
+    check(close(by_w[1]["busy_ms"], 6) and close(by_w[1]["utilisation"], 6 / 40) and
+          close(by_w[1]["idle_ms"], 21.5) and close(by_w[1]["idle_fraction"], 21.5 / 40),
+          f"q0 worker 1 busy/idle {by_w[1]}")
+    pk = q0["parked_while_pending"]
+    check(pk["count"] == 1 and close(pk["total_ms"], 3), f"q0 parked while pending {pk}")
+    dep = q0["depth"]
+    check(dep["count"] == 3 and close(dep["p50"], 1) and close(dep["p95"], 2) and close(dep["max"], 2),
+          f"q0 queue depth {dep}")
+    waits = {row["tid"]: row for row in q0["sync_wait_by_tid"]}
+    check(sorted(waits) == [1, 2] and waits[1]["name"] == "main" and waits[1]["count"] == 2 and
+          close(waits[1]["total_ms"], 3.75) and close(waits[1]["p50"], 1.25) and
+          close(waits[1]["p95"], 2.5) and close(waits[1]["p99"], 2.5),
+          f"q0 sync waits on tid 1 {waits.get(1)}")
+    check(waits[2]["count"] == 1 and close(waits[2]["total_ms"], 1.25), f"q0 sync waits on tid 2 {waits.get(2)}")
+    check(q0["fiber_sync_wait"]["count"] == 0 and q0["fiber_sync_wait"]["p50"] is None,
+          "q0: no fiber waits")
+    jf = q0["join_failures"]
+    check(jf["queue_latency"] == {"matched": 3, "push_without_job": 0, "job_without_push": 0} and
+          jf["completion_delay"] == {"matched": 3, "job_without_credit": 0, "credit_without_job": 0} and
+          jf["sync_latency"] == {"matched": 3, "wait_without_credit": 0, "credit_without_wait": 0},
+          f"q0: every join found its partner {jf}")
+
+    # The same seq numbers in queue 1: a join on seq alone would pair these with queue 0's.
+    check(q1["pushes"] == 2 and q1["jobs"] == 2 and q1["workers"] == 2, "q1: 2 pushes, 2 jobs, 2 workers")
+    check(close(q1["window"]["ms"], 15.5) and close(q1["push_rate_per_s"], 2 / 0.0155),
+          "q1: window 15.5 ms and its push rate")
+    check(close(q1["queue_latency_ms"]["mean"], 1.5) and close(q1["queue_latency_ms"]["p50"], 1) and
+          close(q1["queue_latency_ms"]["p95"], 2) and q1["queue_latency_clamped"] == 0,
+          f"q1 queue latency {q1['queue_latency_ms']}")
+    check(close(q1["exec_wall_ms"]["mean"], 3.5) and close(q1["exec_wall_ms"]["max"], 6) and
+          close(q1["exec_cpu_ms"]["mean"], 2.25) and close(q1["exec_cpu_ms"]["max"], 4),
+          "q1 execution wall and CPU")
+    check(close(q1["completion_delay_ms"]["mean"], 0.35) and close(q1["sync_latency_ms"]["mean"], 3.1) and
+          close(q1["cpu_wall"], 4.5 / 7), "q1 completion delay, sync latency, cpu/wall")
+    check([row["tid"] for row in q1["sync_wait_by_tid"]] == [10] and
+          q1["sync_wait_by_tid"][0]["name"] == "encoder" and
+          close(q1["sync_wait_by_tid"][0]["total_ms"], 3.5), "q1: sync wait on the encoder thread")
+
+    rc, out, err = run(tmp, jq2_trace(jq2))
+    check(rc == 0 and "SPURS job queues (jq2):" in out and "recorder dropped spans: 0" in out and
+          "queue 0: 3 pushes, 3 jobs, 2 workers" in out and "queue latency (push->job)" in out and
+          "cpu/wall 0.50" in out, "jq2 text: section with queue 0's counts and cpu/wall")
+    check("worker 0: 2 jobs, busy 6.00 ms = 15 %, idle 3.00 ms = 8 %" in out and
+          "parked while work was pending: 1 spans, 3.00 ms" in out and
+          "fiber sync waits (no waiter, not joined): n 0" in out,
+          "jq2 text: worker utilisation, parked-while-pending, fiber row")
+    check("join failures: push->job 0 (0 push without a job, 0 job without a push)" in out,
+          "jq2 text: join failures")
+
+    rc, out, err = run(tmp, jq2_trace(jq2, dropped=7), "--json")
+    check(json.loads(out)["jq2"]["dropped"] == 7, "jq2: dropped spans come from the trace header")
+    rc, out, err = run(tmp, jq2_trace(jq2, dropped=7))
+    check(rc == 0 and "recorder dropped spans: 7" in out, "jq2 text names the recorder's dropped count")
+
+    # Window edges, a clamped queue latency and the fiber path: everything that cannot be joined.
+    edge = [span(FLIP_REQ, 1, 0, 0, t, t) for t in (0, 20, 40)]
+    edge += [span(JQ2_PUSH, 1, 1, 0 | 1 << 8, 0, 1),
+             span(JQ2_JOB, qword(0, 0), 2, 1000, 2, 3),                    # no push: seq 2 never pushed
+             span(JQ2_PUSH, 1, 3, 0 | 1 << 8, 4, 5),
+             span(JQ2_JOB, qword(0, 0), 3, 500, 4.5, 6.5),                 # admitted before the push ended
+             span(JQ2_CREDIT, qword(0, 0), 3, 0xFF, 6.6, 6.7),
+             span(JQ2_PUSH, 1, 4, 0 | 1 << 8, 28, 29),                     # no job: cut at the window end
+             span(JQ2_SYNC_WAIT, 1, 7 | EVF << 8, 0, 10, 12),              # event-flag wait, no credit
+             span(JQ2_SYNC_WAIT, 1, 0xFF | FIBER << 8, 0, 14, 17),         # fiber wait: not joined
+             span(JQ2_CREDIT, qword(0, 0), 9, 0xFF | FIBER << 8 | 1 << 16, 20, 20.5),
+             span(JQ2_IDLE, qword(0, 0), 0, 0, 7, 30)]
+    rc, out, err = run(tmp, jq2_trace(edge), "--json")
+    check(rc == 0, f"jq2 edges: exit 0: {err}")
+    e = json.loads(out)["jq2"]["queues"][0]
+    check(e["queue_latency_ms"]["count"] == 1 and close(e["queue_latency_ms"]["p50"], 0) and
+          e["queue_latency_clamped"] == 1, "jq2: a job admitted before its push ends clamps to 0")
+    check(e["join_failures"]["queue_latency"] == {"matched": 1, "push_without_job": 2, "job_without_push": 1},
+          f"jq2: pushes and jobs cut at the window edges count as failures {e['join_failures']}")
+    check(e["join_failures"]["completion_delay"] == {"matched": 1, "job_without_credit": 1,
+                                                     "credit_without_job": 1},
+          "jq2: a job without a credit and a credit without a job are both counted")
+    check(e["join_failures"]["sync_latency"] == {"matched": 0, "wait_without_credit": 1,
+                                                 "credit_without_wait": 0},
+          f"jq2: an event-flag wait with no credit fails the join; the fiber wake does not {e['join_failures']}")
+    fib = e["fiber_sync_wait"]
+    check(fib["count"] == 1 and close(fib["total_ms"], 3) and close(fib["p50"], 3) and
+          close(fib["p99"], 3), f"jq2: fiber waits reported apart {fib}")
+    check(close(e["per_worker"][0]["busy_ms"], 3) and close(e["per_worker"][0]["utilisation"], 0.1),
+          "jq2: worker busy time and utilisation of the window")
+
+    # A trace without kinds 22-26 prints no section and has a null key.
+    plain = [span(FLIP_REQ, 1, 0, 0, t, t) for t in (0, 20, 40)]
+    rc, out, err = run(tmp, trace(plain), "--json")
+    check(rc == 0 and json.loads(out)["jq2"] is None, "jq2: trace without the kinds has a null key")
+    rc, out, err = run(tmp, trace(plain))
+    check(rc == 0 and "SPURS job queues" not in out and "jq2" not in out,
+          "jq2: trace without the kinds prints no section")
+
 print("ftrace_report: %s" % ("ok" if not failures else "%d failed" % failures))
 sys.exit(1 if failures else 0)

@@ -784,6 +784,22 @@ request that asked for it), and print no rates when the header says
   GPU wait (`GPU_WAIT` `a` = 2), encode, present, drain, rest, because a
   drawable wait lies inside a drain pass.
 
+A third section, **SPURS job queues** (kinds 22-26, the jq2 path in
+`libs/spurs/jq2`), splits one job's wait into its links, per queue: pushes and
+push rate; queue latency (`JOB` t0 - `PUSH` t1), execution wall and thread CPU
+time, completion delay (`CREDIT` t0 - `JOB` t1) and sync latency (`CREDIT` t1 to
+the blocked PPU thread running again), each with count, mean, p50/p95/p99/max;
+CPU/wall; per-worker utilisation and idle share of the queue's window and the
+number of workers seen; queue depth from the push; parks while work was
+pending; sync waits per PPU tid; and the recorder's `dropped` count from the
+header. Push, job and credit are joined on `(q, seq)` -- `seq` counts per
+queue, so a join on it alone pairs one queue's push with another's job. Sync
+waits join on `(q, waiter)`; a fiber wait carries no waiter (`0xFF`, wake 2) and
+is reported apart. Queue latency is clamped at 0 when a worker admitted a job
+before the push span ended, and the clamped joins are counted. A join with no
+partner -- a span cut off at a window edge -- is counted too. A trace without
+the five kinds prints no such section.
+
 Both kinds are recorded whatever `PS3_FTRACE_MIN_US` says. Exit `0` on a
 report, `2` on an unreadable or malformed trace, bad arguments or fewer than
 three flip requests.
