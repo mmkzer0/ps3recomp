@@ -514,6 +514,10 @@ static void mtl_latch_state(void* ud, const rsx_state* state)
 static void mtl_draw_arrays(void*, u32, u32, u32);
 static void mtl_draw_indexed(void*, u32, u32, u32);
 
+#if TARGET_OS_IPHONE
+/* Registered on macOS only: iOS refuses the vtable path (see init). */
+__attribute__((unused))
+#endif
 static rsx_backend s_backend_vtable = {
     .userdata           = NULL,
     .clear              = mtl_clear,
@@ -4886,6 +4890,18 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
 
         const char* hl = getenv("PS3RECOMP_METAL_HEADLESS");
         s_headless = (hl && *hl && *hl != '0');
+#if TARGET_OS_IPHONE
+        /* There is no offscreen path on iOS: the surface is the UIKit view.
+         * A headless request that was ignored would run windowed while the
+         * title's frame clock, which reads the same variable, paced a
+         * headless run. Refuse it by name, as every init failure here does. */
+        if (s_headless) {
+            s_headless = 0;
+            fprintf(stderr, "[RSX metal] PS3RECOMP_METAL_HEADLESS is set, but iOS has no "
+                            "offscreen path; unset it\n");
+            return -1;
+        }
+#endif
 
         s_dev = MTLCreateSystemDefaultDevice();
         if (!s_dev) {
@@ -4928,7 +4944,6 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
 #if TARGET_OS_IPHONE
         (void)title;
         /* The app delegate installed the UIKit view before the guest starts. */
-        s_headless = 0;
         s_layer = ps3recomp_metal_ios_configure_layer(s_dev, s_width, s_height);
         rc = s_layer ? 0 : -1;
 #else
@@ -4995,12 +5010,34 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
          * passes both ways. PS3RECOMP_RSX_ENGINE=vtable is the way back, and
          * it stays that way until the vtable path has nothing left to say. */
         rsx_draw_engine_set_default(1);
+#if TARGET_OS_IPHONE
+        /* The BC and border-sampler guards live on the engine path only. The
+         * vtable path would hand a BC texture to a device that cannot hold it
+         * and end in a Metal validation abort, so on iOS it is not an option,
+         * neither by PS3RECOMP_RSX_ENGINE=vtable nor as a fallback. */
+        if (!rsx_draw_engine_enabled()) {
+            fprintf(stderr, "[RSX metal] PS3RECOMP_RSX_ENGINE selects the vtable path, which "
+                            "has no BC or border-sampler guard; iOS runs the draw engine only\n");
+            s_ready = 0;
+            rsx_draw_engine_set_backend(NULL);
+            return -1;
+        }
+        if (rsx_draw_engine_init(s_width, s_height) != 0) {
+            fprintf(stderr, "[RSX metal] draw engine init failed; iOS has no vtable fallback "
+                            "(it has no BC or border-sampler guard)\n");
+            s_ready = 0;
+            rsx_draw_engine_set_backend(NULL);
+            return -1;
+        }
+        s_eng_active = 1;
+#else
         if (rsx_draw_engine_enabled() &&
             rsx_draw_engine_init(s_width, s_height) == 0) {
             s_eng_active = 1;
         } else {
             rsx_set_backend(&s_backend_vtable);
         }
+#endif
         if (s_eng_active && rsx_capture_install_from_config) {
             rsx_capture_environment env;
             rsx_metal_backend_capture_environment(&env);

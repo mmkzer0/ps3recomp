@@ -1,3 +1,4 @@
+#import <stdio.h>
 #import "ps3emu/metal_ios_display.h"
 
 #import <QuartzCore/QuartzCore.h>
@@ -38,8 +39,16 @@ CAMetalLayer *ps3recomp_metal_ios_configure_layer(id<MTLDevice> device,
 {
     __block CAMetalLayer *result = nil;
     void (^configure)(void) = ^{
-        if (!s_view || !device || !width || !height)
+        if (!s_view) {
+            fprintf(stderr, "[RSX metal] no UIKit view: the app must call "
+                            "ps3recomp_metal_ios_view on the main thread before the guest starts\n");
             return;
+        }
+        if (!device || !width || !height) {
+            fprintf(stderr, "[RSX metal] UIKit layer needs a device and a non-zero size "
+                            "(device %p, %ux%u)\n", (__bridge void *)device, width, height);
+            return;
+        }
         CAMetalLayer *layer = (CAMetalLayer *)s_view.layer;
         layer.device = device;
         layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
