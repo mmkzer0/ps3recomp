@@ -353,6 +353,8 @@ struct RefPass {
     unsigned retained = 0;
     std::uint64_t read_before = 0;
     std::uint64_t read_after = 0;
+    std::uint64_t outstanding = 0; /* entries outstanding when the pass read the index word */
+    bool reached_unwritten = false;
 };
 
 struct RefModel {
@@ -412,6 +414,7 @@ struct RefModel {
     {
         RefPass r;
         r.read_before = r.read_after = read;
+        r.outstanding = seq.size() - read;
         if (instance >= instances) { r.end = PassEnd::invalid_instance; return r; }
         unsigned free_slots = 0;
         for (bool b : busy[instance]) free_slots += b ? 0u : 1u;
@@ -422,7 +425,10 @@ struct RefModel {
         r.end = PassEnd::ring_not_written;
         for (std::uint64_t s = read; s < seq.size(); ++s) {
             RefEntry& e = seq[s];
-            if (!e.written) break; /* stall: the writer has not finished this entry */
+            if (!e.written) {      /* stall: the writer has not finished this entry */
+                r.reached_unwritten = true;
+                break;
+            }
             if (e.consumed) {      /* consumed by an earlier pass, behind a since-resolved retained entry */
                 if (!behind_retained) advance_to = s + 1;
                 continue;
@@ -519,6 +525,9 @@ struct Property {
         if (got.read_before != want.read_before % ref.depth ||
             got.read_after != want.read_after % ref.depth)
             return fail("read index trajectory differs from the oracle");
+        if (got.outstanding != want.outstanding) return fail("outstanding of the pass differs from the oracle");
+        if (got.reached_unwritten != want.reached_unwritten)
+            return fail("reached-unwritten of the pass differs from the oracle");
         if (got.dispatched.has_value() != (want.label >= 0)) return fail("dispatch differs from the oracle");
         if (got.dispatched) {
             const Dispatch& d = *got.dispatched;
@@ -871,6 +880,57 @@ void test_wrong_phase_intake()
 }
 
 /* ------------------------------------------------------------------------ */
+/* PassResult::outstanding and reached_unwritten                             */
+/* ------------------------------------------------------------------------ */
+
+/* The two additive fields the executor's IDLE reason byte rests on: how much was outstanding when the pass read
+ * the index word, and whether the pass stopped at a slot whose writer had not finished it. The executor writes
+ * the ring under the queue lock every pass takes, so reached_unwritten is a falsifier there, not noise. */
+void test_pass_result_fields()
+{
+    /* Empty ring: nothing outstanding, nothing unwritten. */
+    {
+        Rig rig(8);
+        const PassResult r = rig.pass(0);
+        CHECK(r.end == PassEnd::ring_not_written && !r.dispatched);
+        CHECK(r.outstanding == 0 && !r.reached_unwritten);
+    }
+
+    /* An entry pushed with the wrong phase: the pass stops at it and says the writer has not finished. */
+    {
+        Rig rig(8);
+        CHECK(rig.sched.push_with_phase(make_job(0, 0), !kInitialPhase).ok());
+        const PassResult r = rig.pass(0);
+        CHECK(r.end == PassEnd::ring_not_written && !r.dispatched);
+        CHECK(r.outstanding == 1 && r.reached_unwritten);
+    }
+
+    /* A pass over only held entries: retained, nothing dispatched, and no unwritten slot to blame. */
+    {
+        Rig rig(8);
+        CHECK(rig.job(0, 0).ok());  /* 0: runs on instance 0 */
+        CHECK(rig.sync(1).ok());    /* 1: bars tag 0 while A is in flight */
+        CHECK(rig.job(0, 1).ok());  /* 2: held behind the SYNC */
+        CHECK(rig.pass(0).end == PassEnd::job_dispatched);  /* A */
+        CHECK(rig.pass(1).end == PassEnd::sync_incomplete); /* the SYNC, tag 0 barred */
+        const PassResult r = rig.pass(1);
+        CHECK(r.end == PassEnd::ring_not_written && !r.dispatched);
+        CHECK(r.outstanding == 1 && r.entries_retained > 0 && !r.reached_unwritten);
+    }
+
+    /* No free slot: the pass returns before it reads the ring, and still reports what was outstanding. */
+    {
+        Rig busy(8, 1, 1);
+        CHECK(busy.job(0, 0).ok());
+        CHECK(busy.job(1, 1).ok());
+        CHECK(busy.pass(0).end == PassEnd::job_dispatched);
+        const PassResult full = busy.pass(0);
+        CHECK(full.end == PassEnd::no_free_slot && !full.dispatched);
+        CHECK(full.outstanding == 1 && !full.reached_unwritten);
+    }
+}
+
+/* ------------------------------------------------------------------------ */
 /* Ring bookkeeping and the assumption points                                */
 /* ------------------------------------------------------------------------ */
 
@@ -1127,6 +1187,7 @@ int main()
     test_single_spu_unbarred();
     test_wrap_with_flag();
     test_wrong_phase_intake();
+    test_pass_result_fields();
     test_properties();
 
     if (g_failures != 0) {

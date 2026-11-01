@@ -246,6 +246,11 @@ PassResult Scheduler::intake_pass(unsigned instance)
     const RingIndices ix = ring_->indices();
     result.read_before = ix.read;
     result.read_after = ix.read;
+    /* The write index is read once: an entry a writer reserves later is the
+     * next pass's. Recorded before the early returns, so a pass that ran out of
+     * job slots still reports what was outstanding. */
+    const unsigned outstanding = ring_outstanding(ix, depth_);
+    result.outstanding = static_cast<std::uint16_t>(outstanding);
     if (instance >= instances_) {
         result.end = PassEnd::invalid_instance;
         return result;
@@ -255,9 +260,6 @@ PassResult Scheduler::intake_pass(unsigned instance)
         return result;
     }
 
-    /* The write index is read once: an entry a writer reserves later is the
-     * next pass's. */
-    const unsigned outstanding = ring_outstanding(ix, depth_);
     bool behind_retained = false;
     unsigned in_order = 0; /* entries consumed contiguously from the read index */
     result.end = PassEnd::ring_not_written;
@@ -270,6 +272,7 @@ PassResult Scheduler::intake_pass(unsigned instance)
         const Decoded decoded = decode(ring_->load(index));
         if (!pm_accepts_phase(decoded.writer_bit, expected)) {
             result.end = PassEnd::ring_not_written;
+            result.reached_unwritten = true;
             break;
         }
 
