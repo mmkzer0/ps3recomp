@@ -123,6 +123,20 @@ foreach(mode premature copy credit wrap barrier sync join observer validate lift
     set_tests_properties(jq2_exec_${name} PROPERTIES LABELS "spurs;t0;tsan" TIMEOUT 300)
 endforeach()
 
+# The jq2 ftrace spans (ps3_ftrace.h kinds 22-26), read back from the recorder's buffer after the threads that
+# write it are joined. The mode sets PS3_FTRACE itself (trace-off clears it): the recorder reads it once.
+#
+#   jq2_exec_trace_spans       PUSH/JOB/CREDIT per (q, seq), depth, thread CPU time, IDLE of parked workers
+#   jq2_exec_trace_sync        one SYNC_WAIT per blocking Port2Sync, keyed by waiter; none without blocking
+#   jq2_exec_trace_queues      q per queue in creation order, the creation line, q saturating at 255
+#   jq2_exec_trace_concurrent  four pushing threads: seq unique and gapless
+#   jq2_exec_trace_off         no span recorded with tracing off
+foreach(mode trace-spans trace-sync trace-queues trace-concurrent trace-off)
+    string(REPLACE "-" "_" name "${mode}")
+    add_test(NAME jq2_exec_${name} COMMAND test_jq2_executor ${mode})
+    set_tests_properties(jq2_exec_${name} PROPERTIES LABELS "spurs;t0;tsan" TIMEOUT 300)
+endforeach()
+
 # cellSpursJq HLE surface: the 17 firmware imports through ps3_hle_call.
 # The table is generated from cellSpursJq.c, so the test's dispatch is exactly
 # the build's: 17 ps3_hle_register lines, typed adapters, save-area args.

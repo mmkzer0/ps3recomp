@@ -106,6 +106,7 @@ struct JobStart {
     bool copy = false;
     unsigned worker = 0;
     std::uint32_t dispatch_id = 0;
+    std::uint32_t seq = 0;           /* per-queue job sequence number assigned at push (ps3_ftrace.h JQ2 kinds) */
     /* The descriptor as it was when the job was admitted. */
     std::span<const std::uint8_t> descriptor;
 };
@@ -159,6 +160,7 @@ struct QueueView {
     RingIndices indices;
     unsigned outstanding = 0;
     unsigned running = 0;                           /* jobs admitted and not yet completed */
+    unsigned settled = 0;                           /* workers parked on the current generation: parked until a push, completion, pause change or Shutdown */
     std::uint16_t barred = 0;                       /* per-tag barrier set */
     std::array<unsigned, kTagCount> inflight{};     /* admitted and not yet completed, per tag */
     std::vector<std::uint16_t> out_of_order;        /* ring indices carrying the mark */

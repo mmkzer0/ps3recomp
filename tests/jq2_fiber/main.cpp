@@ -25,6 +25,7 @@
 #include <thread>
 #include <sys/mman.h>
 #include <sys/wait.h>
+#include "ps3emu/ps3_ftrace.h"
 #include <unistd.h>
 #include "ps3emu/lifter_abi.h"   /* the lifted-code ABI this fixture is written in */
 
@@ -729,6 +730,44 @@ void stop_push_wait()
     }, {"reason=push-room-wait", "rc=0x8076000F"});
 }
 
+/* ps3_ftrace.h kinds 24 and 25 for a fiber waiter: a fiber has no waiter id, so its blocked Sync and the credit
+ * that wakes it carry waiter 0xFF with wake 2 (fiber), and nothing joins them on the waiter. Read after the
+ * workers are joined (teardown). */
+void trace_fiber()
+{
+    CHECK(PS3_FT_ON()); /* before any worker: a hook sees "off" while another thread initialises */
+    boot(1);
+    CHECK(set_intake_paused(QUEUE, true));
+    build_job(0);
+    make_fiber(arg_of(R_SYNC, 0));
+    make_fiber(arg_of(R_OTHER));
+    start_workers(1);
+    CHECK(until([] { return second_ran.load(); })); /* the first fiber is parked in Sync */
+    CHECK(waiting());
+    CHECK(set_intake_paused(QUEUE, false));
+    CHECK(until([] { return fibers_done == 2; }));
+    teardown();
+
+    unsigned waits = 0, credits = 0, jobs = 0;
+    const uint32_t n = g_ps3_ft.n < g_ps3_ft.cap ? g_ps3_ft.n : g_ps3_ft.cap;
+    for (uint32_t i = 0; i < n; ++i) {
+        const ps3_ft_rec& r = g_ps3_ft.buf[i];
+        if (r.kind == PS3_FT_JQ2_SYNC_WAIT) {
+            ++waits;
+            CHECK(r.a == (0xFFu | 2u << 8 | 0u << 16)); /* waiter none, wake fiber, mode 0 */
+            CHECK(r.b == 0);                            /* q */
+            CHECK(r.t1 >= r.t0);
+        } else if (r.kind == PS3_FT_JQ2_CREDIT) {
+            ++credits;
+            CHECK(r.b == (0xFFu | 2u << 8 | 1u << 16)); /* due, woke a fiber, no waiter id */
+            CHECK(r.a == 1 && (r.who >> 8) == 0);
+        } else if (r.kind == PS3_FT_JQ2_JOB) {
+            ++jobs;
+        }
+    }
+    CHECK(waits == 1 && credits == 1 && jobs == 1);
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
@@ -741,6 +780,11 @@ int main(int argc, char** argv)
     g_ppu_thread_entry_trampoline = trampoline;
     ppu_register_function(ENTRY, fiber_main);
     const std::string mode = argv[1];
+    /* The recorder reads its window once, at the first hook (the first HLE call). */
+    if (mode == "trace") {
+        setenv("PS3_FTRACE", "0:100000:/dev/null", 1);
+        setenv("PS3_FTRACE_CAP", "65536", 1);
+    }
     if (mode == "kind0") kind0();
     else if (mode == "spurious") spurious();
     else if (mode == "mixed") mixed();
@@ -750,6 +794,7 @@ int main(int argc, char** argv)
     else if (mode == "stop-wait") stop_wait();
     else if (mode == "push-full") push_full();
     else if (mode == "stop-push-wait") stop_push_wait();
+    else if (mode == "trace") trace_fiber();
     else return 2;
     std::printf("%s %s\n", failures ? "FAIL" : "PASS", argv[1]);
     return failures ? 1 : 0;

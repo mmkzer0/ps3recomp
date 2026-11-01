@@ -25,6 +25,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "memory/reservation.h"
@@ -35,9 +36,13 @@
 #include "spu/spu_workload.h"
 #include "cellFiber.h"
 #include "syscalls/sys_event.h"
+#include "ps3emu/ps3_ftrace.h"
+#include "ps3emu/thread_name.h"
+#include "syscalls/ppu_thread_id.h"
 
 extern "C" {
 extern uint8_t* vm_base;
+extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
 void spurs_job_set_spu_num(uint32_t n);
 }
 
@@ -113,6 +118,25 @@ inline void st16(std::uint32_t ea, std::uint16_t v)
 }
 
 constexpr bool aligned(std::uint32_t ea, std::uint32_t to) { return (ea & (to - 1)) == 0; }
+
+/* ---- ftrace (ps3_ftrace.h kinds 22-26) ---------------------------------- */
+
+/* The calling PPU thread's trace id, keyed as every other PPU kind (0: no guest thread). */
+inline std::uint32_t ft_tid() { return g_active_ctx ? ppu_tid_diag_index(g_active_ctx->thread_id) : 0u; }
+
+/* CPU time of the calling thread, ns; 0 where the host has no per-thread clock. */
+inline std::uint64_t thread_cpu_ns()
+{
+#ifdef CLOCK_THREAD_CPUTIME_ID
+    timespec ts;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) return 0;
+    return static_cast<std::uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<std::uint64_t>(ts.tv_nsec);
+#else
+    return 0;
+#endif
+}
+
+constexpr std::uint32_t sat(std::uint64_t v, std::uint32_t max) { return v > max ? max : static_cast<std::uint32_t>(v); }
 
 /* ---- named stops ------------------------------------------------------- */
 
@@ -351,6 +375,12 @@ struct Counters {
     std::atomic<std::uint64_t> pushed{0}, dispatched{0}, executed{0}, credited{0}, uncredited{0};
 };
 
+/* What a worker took when it admitted a job, for the JOB span; t0 == 0: tracing was off. */
+struct JobTrace {
+    std::uint64_t t0 = 0;
+    std::uint64_t cpu0 = 0;
+};
+
 class Queue {
 public:
     Queue(std::uint32_t ea, std::uint32_t ring_ea, std::uint16_t depth, std::uint32_t max_descriptor,
@@ -358,6 +388,8 @@ public:
         : ea_(ea), ring_ea_(ring_ea), depth_(depth), max_descriptor_(max_descriptor), workers_(workers),
           hooks_(hooks)
     {
+        slot_seq_.assign(depth, 0);
+        parked_seen_.assign(workers, UINT64_MAX);
         auto ring = std::make_unique<GuestRing>(ea, ring_ea, depth);
         ring_ = ring.get();
         SchedConfig config;
@@ -370,6 +402,9 @@ public:
     bool valid() const { return sched_.has_value(); }
 
     std::uint32_t ea() const { return ea_; }
+    std::uint8_t index() const { return index_; }
+    void set_index(std::uint8_t index) { index_ = index; }
+    std::uint32_t ft_who(unsigned worker) const { return std::uint32_t{index_} << 8 | worker; }
     std::uint32_t max_descriptor() const { return max_descriptor_; }
     GuestRing& ring() { return *ring_; }
     Counters& counters() { return counters_; }
@@ -442,6 +477,11 @@ public:
     struct Pushed {
         std::optional<PushResult> result;
         bool waited = false;
+        /* A JOB or COPY that landed (a SYNC is no job): its seq and the queue's pending depth after it,
+         * both assigned under mu_. */
+        bool job = false;
+        std::uint32_t seq = 0;
+        std::uint32_t depth = 0;
     };
 
     /* The ring write of every push, ordered against Shutdown by mu_: Shutdown
@@ -461,6 +501,12 @@ public:
             const PushResult r = ring_push(*ring_, entry, true);
             if (r.error != PushError::ring_full || !block) {
                 out.result = r;
+                if (r.ok() && !std::holds_alternative<SyncEntry>(entry)) {
+                    out.job = true;
+                    out.seq = ++next_seq_;
+                    out.depth = ++pending_jobs_;
+                    slot_seq_[r.index] = out.seq;
+                }
                 return out;
             }
             const bool first = !out.waited; /* a wake that finds the ring full again is not a new park */
@@ -519,6 +565,8 @@ public:
         v.indices = ring_->indices();
         v.outstanding = sched_->outstanding();
         v.running = running_;
+        for (const std::uint64_t seen : parked_seen_)
+            if (seen == gen_) ++v.settled;
         v.barred = sched_->barred_mask();
         for (unsigned t = 0; t < kTagCount; ++t) v.inflight[t] = sched_->inflight(t);
         for (std::uint16_t i = 0; i < depth_; ++i)
@@ -672,6 +720,7 @@ private:
 
     void worker_loop(unsigned instance)
     {
+        ps3_thread_name("jq2 q%u w%u", static_cast<unsigned>(index_), instance);
         spurs_job_set_spu_num(instance);
         std::vector<std::uint8_t> desc;
         std::unique_lock<std::mutex> lk(mu_);
@@ -690,6 +739,8 @@ private:
                 }
                 if (pass.dispatched) {
                     const Dispatch d = *pass.dispatched;
+                    const std::uint64_t ft0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+                    const JobTrace ft{ft0, ft0 != 0 ? thread_cpu_ns() : 0};
                     JobStart js = admit(d, instance, desc);
                     const std::optional<jq2_job_observer> obs = observer_;
                     ++running_;
@@ -701,7 +752,7 @@ private:
                     const std::vector<std::uint32_t> room = take_room_fibers();
                     lk.unlock();
                     signal_room_fibers(room);
-                    run_job(js, obs);
+                    run_job(js, obs, ft);
                     lk.lock();
                     if (!sched_->complete(d.id)) {
                         stop_with(PS3_STOP_JQ2_STATE, "a finished job is not in flight in the scheduler",
@@ -729,7 +780,13 @@ private:
                 }
             }
             if (stopping_ && running_ == 0 && sched_->outstanding() == 0) break;
+            const std::uint64_t ft0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+            const std::uint32_t depth_at_park = pending_jobs_;
+            parked_seen_[instance] = seen;
             cv_.wait(lk, [&] { return gen_ != seen; });
+            parked_seen_[instance] = UINT64_MAX;
+            if (ft0 != 0)
+                ps3_ft_span(PS3_FT_JQ2_IDLE, ft_who(instance), depth_at_park, pending_jobs_, ft0, ps3_ft_now());
         }
     }
 
@@ -744,6 +801,7 @@ private:
          * bound is the one rule in jq2.h (over vm_range_ok). */
         if (ea == 0 || size == 0 || !jq2_guest_range_ok(ea, size)) stop_ring_entry("descriptor", d);
         desc.assign(host(ea), host(ea) + size);
+        if (pending_jobs_ != 0) --pending_jobs_;
 
         JobStart js;
         js.queue_ea = ea_;
@@ -754,11 +812,12 @@ private:
         js.copy = d.copy;
         js.worker = instance;
         js.dispatch_id = d.id;
+        js.seq = slot_seq_[d.ring_index];
         js.descriptor = desc;
         return js;
     }
 
-    void run_job(const JobStart& js, const std::optional<jq2_job_observer>& obs);
+    void run_job(const JobStart& js, const std::optional<jq2_job_observer>& obs, const JobTrace& ft);
     void credit(const JobStart& js);
     void wake(const Wakeup& w, const JobStart& js);
 
@@ -780,6 +839,17 @@ private:
     std::optional<jq2_job_observer> observer_; /* under mu_ */
     unsigned running_ = 0;
     std::atomic<bool> shut_{false};
+
+    /* The jq2 trace identity (ps3_ftrace.h kinds 22-26). index_ is set once, before the queue is published
+     * and its workers start; the rest is under mu_. slot_seq_ holds the seq of the job written into each ring
+     * slot until a worker admits it; the ring index only addresses it, it is not the identity. */
+    std::uint8_t index_ = 0;
+    std::uint32_t next_seq_ = 0;
+    std::uint32_t pending_jobs_ = 0; /* jobs pushed and not yet admitted */
+    std::vector<std::uint32_t> slot_seq_;
+    /* Per worker: the gen_ it parked on, or UINT64_MAX when it is not in the idle wait. Under mu_. A worker
+     * whose value equals gen_ stays parked until something bumps gen_ (QueueView::settled). */
+    std::vector<std::uint64_t> parked_seen_;
 
     Counters counters_;
     std::array<std::uint32_t, 2> flag_ids_{};
@@ -863,7 +933,7 @@ void interpreter_entry(spu_context* ctx)
     require_normal_return(ctx);
 }
 
-void Queue::run_job(const JobStart& js, const std::optional<jq2_job_observer>& obs)
+void Queue::run_job(const JobStart& js, const std::optional<jq2_job_observer>& obs, const JobTrace& ft)
 {
     if (hooks_.on_admit != nullptr) hooks_.on_admit(hooks_.user, js);
 
@@ -933,6 +1003,8 @@ void Queue::run_job(const JobStart& js, const std::optional<jq2_job_observer>& o
                              &hooks);
     }
     t_job = nullptr;
+    const std::uint64_t ft1 = ft.t0 != 0 ? ps3_ft_now() : 0;
+    const std::uint64_t cpu1 = ft.t0 != 0 ? thread_cpu_ns() : 0;
     if (rc != 0) {
         /* The loader could not stage the job: nothing ran. */
         stop_with(PS3_STOP_JQ2_JOB_END, "the SPURS job loader refused a JobQueue2 job",
@@ -940,6 +1012,8 @@ void Queue::run_job(const JobStart& js, const std::optional<jq2_job_observer>& o
                   {hex("queue", ea_), hex("job", js.descriptor_ea), dec("tag", js.tag), text("reason", "loader"),
                    dec("rc", static_cast<std::uint32_t>(rc))});
     }
+    if (ft.t0 != 0)
+        ps3_ft_span(PS3_FT_JQ2_JOB, ft_who(js.worker), js.seq, sat((cpu1 - ft.cpu0) / 1000, UINT32_MAX), ft.t0, ft1);
     counters_.executed.fetch_add(1);
     if (hooks_.on_done != nullptr) hooks_.on_done(hooks_.user, js);
 
@@ -964,9 +1038,18 @@ void Queue::credit(const JobStart& js)
     /* Counted first: a Sync that sees the credit must see the count, and the
      * count must never exceed the runs. */
     counters_.credited.fetch_add(1);
+    const std::uint64_t ft0 = PS3_FT_ON() ? ps3_ft_now() : 0;
     Port p = *port;
     const Wakeup w = p.credit_completion();
     if (w.due) wake(w, js);
+    if (ft0 != 0) {
+        const bool event_flag = w.due && w.kind == static_cast<std::uint32_t>(WaitKind::event_flag);
+        const std::uint32_t wake_code = !w.due ? 0u : event_flag ? 1u : 2u;
+        /* A fiber has no waiter id: 0xFF with wake 2 (see PS3_FT_JQ2_CREDIT). */
+        const std::uint32_t waiter = event_flag ? (w.id & 0xFFu) : 0xFFu;
+        ps3_ft_span(PS3_FT_JQ2_CREDIT, ft_who(js.worker), js.seq,
+                    waiter | wake_code << 8 | (w.due ? 1u : 0u) << 16, ft0, ps3_ft_now());
+    }
 }
 
 void Queue::wake(const Wakeup& w, const JobStart& js)
@@ -1002,6 +1085,9 @@ void Queue::wake(const Wakeup& w, const JobStart& js)
 }
 
 /* ---- the registry ------------------------------------------------------- */
+
+/* Queues created so far, under g_registry_mu: the next queue's trace index q. */
+std::uint32_t g_queues_created = 0;
 
 std::mutex g_registry_mu;
 std::unordered_map<std::uint32_t, std::shared_ptr<Queue>> g_queues;
@@ -1099,6 +1185,9 @@ int bitmap_rmw(std::uint8_t* line, void* user)
  * AGAIN (FW 4.93 ring writer 0x02001138). */
 std::int32_t enqueue(Queue& q, std::uint32_t port_ea, const Entry& entry, bool accounted, bool block)
 {
+    const std::uint64_t ft0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+    bool job = false;
+    std::uint32_t seq = 0, depth = 0;
     q.push_checked(port_ea);
     const auto write = [&]() -> std::uint32_t {
         const Queue::Pushed pushed = q.push_unless_shut(entry, block, port_ea);
@@ -1124,6 +1213,9 @@ std::int32_t enqueue(Queue& q, std::uint32_t port_ea, const Entry& entry, bool a
         const PushResult& r = *pushed.result;
         if (r.ok()) {
             q.counters().pushed.fetch_add(1);
+            job = pushed.job;
+            seq = pushed.seq;
+            depth = pushed.depth;
             return 0;
         }
         /* Only a non-blocking push (flags bit 2) gets here with a full ring. */
@@ -1141,6 +1233,8 @@ std::int32_t enqueue(Queue& q, std::uint32_t port_ea, const Entry& entry, bool a
         rc = write();
     }
     if (rc == 0) q.kick();
+    if (ft0 != 0 && job)
+        ps3_ft_span(PS3_FT_JQ2_PUSH, ft_tid(), seq, q.index() | sat(depth, 0xFFFFFFu) << 8, ft0, ps3_ft_now());
     return static_cast<std::int32_t>(rc);
 }
 
@@ -1205,6 +1299,10 @@ PushCheck check_push(std::uint32_t port, std::uint32_t descriptor, std::uint32_t
  * before the registration; a poll or a completed Sync never asks). */
 struct PortWait {
     Queue& q;
+    std::uint32_t mode;
+    /* One SYNC_WAIT per Sync: the first block() starts the span (a wake that finds the line still waiting
+     * loops in sync() and blocks again), release() ends it. Zero: tracing was off, or the Sync did not block. */
+    std::uint64_t ft0 = 0;
     Waiter acquire()
     {
         const auto self = static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(cellFiberPpuSelf()));
@@ -1213,6 +1311,7 @@ struct PortWait {
     }
     void block(const Waiter& w)
     {
+        if (ft0 == 0 && PS3_FT_ON()) ft0 = ps3_ft_now();
         if (w.kind == WaitKind::event_flag) {
             q.block_on(w.id);
             return;
@@ -1228,7 +1327,14 @@ struct PortWait {
     }
     void release(const Waiter& w)
     {
-        if (w.kind == WaitKind::event_flag) q.release_waiter(w.id);
+        const bool event_flag = w.kind == WaitKind::event_flag;
+        if (ft0 != 0) {
+            /* A fiber has no waiter id (its identity is its EA): 0xFF, never a value that could join. */
+            const std::uint32_t waiter = event_flag ? (w.id & 0xFFu) : 0xFFu;
+            ps3_ft_span(PS3_FT_JQ2_SYNC_WAIT, ft_tid(), waiter | (event_flag ? 1u : 2u) << 8 | mode << 16,
+                        q.index(), ft0, ps3_ft_now());
+        }
+        if (event_flag) q.release_waiter(w.id);
     }
 };
 
@@ -1271,7 +1377,7 @@ int32_t jq2_queue_create(uint32_t revision, uint32_t sdk_version, uint32_t spurs
                          uint32_t pool, uint32_t pool_attr, uint32_t name, uint32_t command_ring,
                          uint32_t command_depth, uint32_t worker_count, uint32_t extra)
 {
-    (void)name;  /* only names the workload in the firmware; the workers are anonymous */
+    (void)name;  /* only names the workload in the firmware; the workers are named by queue and worker index */
     (void)extra; /* the firmware body does not read it */
 
     /* 1. 0x020003D0 spurs == 0, 0x020004C0 queue == 0, 0x020004C8 attr == 0,
@@ -1378,13 +1484,21 @@ int32_t jq2_queue_create(uint32_t revision, uint32_t sdk_version, uint32_t spurs
     st32(queue + kQSdk, sdk_version);
     st32(queue + kQRevision, revision);
 
+    std::uint32_t created;
     {
         std::lock_guard<std::mutex> lk(g_registry_mu);
+        created = g_queues_created;
+        q->set_index(static_cast<std::uint8_t>(std::min(created, 255u)));
         if (!g_queues.emplace(queue, q).second) {
             q->destroy_flags();
             return JQ2_ERR_STAT;
         }
+        ++g_queues_created;
     }
+    std::fprintf(stderr, "[jq2] queue q=%u ea=0x%08X workers=%u depth=%u\n", static_cast<unsigned>(q->index()),
+                 queue, worker_count, command_depth);
+    if (created > 255)
+        std::fprintf(stderr, "[jq2] queue q saturated at 255: ea=0x%08X is queue number %u\n", queue, created + 1);
     if (!q->start()) {
         stop_with(PS3_STOP_JQ2_STATE, "a JobQueue2 worker thread could not be started",
                   "The host refused a thread; check the process's thread limit.",
@@ -1547,7 +1661,7 @@ int32_t jq2_port_sync(uint32_t port, uint32_t mode)
     const PortRef ref = resolve_port(port);
     if (ref.error != JQ2_OK) return ref.error;
     std::optional<Port> p = bind_port(port);
-    PortWait wait{*ref.queue};
+    PortWait wait{*ref.queue, mode};
     return static_cast<std::int32_t>(p->sync(mode, wait));
 }
 
