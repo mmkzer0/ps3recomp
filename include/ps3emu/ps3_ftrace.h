@@ -66,6 +66,22 @@ enum ps3_ft_kind {
     PS3_FT_LABEL_WAIT  = 17, /* the guest-visible label-store wait in the GCM label writer, never filtered;
                               * who = PPU tid (0 = host callback or unknown), a = label offset,
                               * b = min(spins, 0xFFFF) | 1 << 16 if the RSX was mid-pass when it began */
+    PS3_FT_AUDIO_MIX   = 18, /* one mixer iteration that produced a block, never filtered;
+                              * who = 0, a = blocks mixed this iteration,
+                              * b = backend queue depth in frames right after queueing
+                              * (SDL queued frames; WASAPI padding; 0 if no backend) */
+    PS3_FT_AUDIO_PACE  = 19, /* the mixer's pacing wait (sleep or backend wait), never filtered;
+                              * who = 0, a = reason code (1 queue full, 2 clock pacing, 3 backend wait),
+                              * b = queue depth in frames before the wait */
+    PS3_FT_AUDIO_UNDERRUN = 20, /* instant (t0 == t1): queue depth was below one block right before
+                              * queueing, never filtered; who = 0,
+                              * a = depth in frames, b = blocks queued since the previous underrun */
+};
+
+enum ps3_ft_audio_pace_reason {
+    PS3_FT_AUDIO_PACE_QUEUE_FULL   = 1, /* queue above target depth / waiting for room */
+    PS3_FT_AUDIO_PACE_CLOCK        = 2, /* clock pacing (no backend or pacing against clock) */
+    PS3_FT_AUDIO_PACE_BACKEND_WAIT = 3, /* waiting on backend / short sleep when below target depth */
 };
 
 #if defined(_MSC_VER)
