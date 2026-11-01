@@ -1,6 +1,10 @@
 # Changelog
 
 ### Unreleased
+- **`PS3_FTRACE` flags port blocks mixed without a guest refill and reports stale replay correlation** (`include/ps3emu/ps3_ftrace.h`, `libs/audio/cellAudio.c`, `tools/{ftrace_report.py,test_ftrace_report.py}`). The host device queue cannot detect guest-side stall where the guest fails to write fresh PCM to a port block:
+  - `PS3_FT_AUDIO_STALE` (21): instant (t0 == t1) emitted when the mixer reads a block matching its hash from the previous ring cycle (unrefilled block); `who` = port index, `a` = block index read, `b` = 1 if non-silent (audible replay) else 0.
+  - `audio_mix_one_block` tracks per-port 64-bit FNV-1a block hashes across ring cycles when `PS3_FT_ON()`.
+  - `ftrace_report.py` reports stale blocks, non-silent count and rate, per-port breakdown, correlation with >40 ms frame gaps / DRAWABLE / LABEL_WAIT spans, and correlates both underruns and stale events with long guest waits (>10 ms HLE spans in 50 ms before).
 - **`PS3_FTRACE` spans audio mix iterations, pacing waits and underruns, and `ftrace_report.py` reports audio pacing and correlation** (`include/ps3emu/ps3_ftrace.h`, `libs/audio/cellAudio.c`, `tools/{ftrace_report.py,test_ftrace_report.py}`). Gameplay audio micro-stutter investigations had no timeline spans in the audio subsystem:
   - `PS3_FT_AUDIO_MIX` (18): one mixer iteration producing a block; `who` = 0, `a` = blocks mixed this iteration, `b` = backend queue depth in frames right after queueing (SDL queued frames, WASAPI padding, 0 for no backend).
   - `PS3_FT_AUDIO_PACE` (19): the mixer's pacing wait; `who` = 0, `a` = reason code (1 queue full, 2 clock pacing, 3 backend wait), `b` = queue depth in frames before wait.

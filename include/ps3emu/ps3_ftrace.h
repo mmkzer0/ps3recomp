@@ -76,6 +76,9 @@ enum ps3_ft_kind {
     PS3_FT_AUDIO_UNDERRUN = 20, /* instant (t0 == t1): queue depth was below one block right before
                               * queueing, never filtered; who = 0,
                               * a = depth in frames, b = blocks queued since the previous underrun */
+    PS3_FT_AUDIO_STALE    = 21, /* instant (t0 == t1): port block was not rewritten since its
+                              * previous read, never filtered; who = port index,
+                              * a = block index read, b = 1 if non-silent (audible replay) else 0 */
 };
 
 enum ps3_ft_audio_pace_reason {

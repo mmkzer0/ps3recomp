@@ -8,7 +8,7 @@ from pathlib import Path
 
 TOOL = Path(__file__).resolve().parent / "ftrace_report.py"
 FLIP_REQ, USLEEP, HLE, PRESENT = 9, 2, 15, 10
-AUDIO_MIX, AUDIO_PACE, AUDIO_UNDERRUN = 18, 19, 20
+AUDIO_MIX, AUDIO_PACE, AUDIO_UNDERRUN, AUDIO_STALE = 18, 19, 20, 21
 LOCK, SYNC, POLL = 0x1573DC3F, 0xFACB3CED, 0x74A66AF0     # lwmutex_lock, Port2Sync, GetPortConfig
 
 failures = 0
@@ -229,5 +229,53 @@ with tempfile.TemporaryDirectory() as tmp:
     check(u_dets[2]["overlap"] is True, "underrun 3: overlap True via DRAWABLE")
     check(abs(aud["correlation"]["overlap_share"] - 2 / 3) < 1e-4, "correlation overlap_share is 2/3")
     check(aud["correlation"]["overlap_count"] == 2, "correlation overlap_count is 2")
+
+    # Stale port blocks: silent vs non-silent, aligned vs unaligned with long HLE spans
+    stale_frames = [0, 20, 40, 100, 120, 140, 160, 180, 200, 220, 240, 260, 280, 300]
+    stale_test_lines = [span(FLIP_REQ, 1, 0, 0, t, t) for t in (0, 20, 40, 60)]
+    for t in stale_frames:
+        stale_test_lines.append(span(PRESENT, 0, 0, 0, t, t + 1))
+    stale_test_lines.append(span(AUDIO_MIX, 0, 1, 500, 0, 1))
+    # Long HLE span (25 ms > 10 ms) on tid 2 in Port2Sync (0xFACB3CED) at 70..95 ms
+    stale_test_lines.append(span(HLE, 2, 0xFACB3CED, 0x1000, 70, 95))
+    # Event 1: Port 0, block 2, AUDIBLE (b=1), at t = 80 ms: aligned with 60ms gap & long HLE
+    stale_test_lines.append(span(AUDIO_STALE, 0, 2, 1, 80, 80))
+    # Event 2: Port 0, block 3, SILENT (b=0), at t = 90 ms: silent block
+    stale_test_lines.append(span(AUDIO_STALE, 0, 3, 0, 90, 90))
+    # Event 3: Port 1, block 5, AUDIBLE (b=1), at t = 210 ms: 20ms gaps, no HLE
+    stale_test_lines.append(span(AUDIO_STALE, 1, 5, 1, 210, 210))
+
+    rc, out, err = run(tmp, trace(stale_test_lines), "--json")
+    r = json.loads(out)
+    aud = r["audio"]
+    st = aud["stale"]
+    check(st["count"] == 3, "stale count: 3")
+    check(st["audible_count"] == 2, "stale audible: 2")
+    check(st["silent_count"] == 1, "stale silent: 1")
+    check(st["by_port"]["0"]["count"] == 2 and st["by_port"]["0"]["audible"] == 1 and st["by_port"]["0"]["silent"] == 1,
+          "stale port 0 counts")
+    check(st["by_port"]["1"]["count"] == 1 and st["by_port"]["1"]["audible"] == 1 and st["by_port"]["1"]["silent"] == 0,
+          "stale port 1 counts")
+    st_evs = st["events"]
+    check(len(st_evs) == 3, "stale events: 3")
+    # Event 1 (audible, at 80ms)
+    check(abs(st_evs[0]["nearest_frame_gap_ms"] - 60.0) < 1e-4, "stale 1: nearest gap 60 ms")
+    check(st_evs[0]["overlap"] is True, "stale 1: overlap True")
+    check(len(st_evs[0]["hle_waits"]) == 1 and st_evs[0]["hle_waits"][0]["nid"] == "FACB3CED",
+          "stale 1: long HLE wait overlap Port2Sync")
+    # Event 3 (audible, at 210ms)
+    check(abs(st_evs[2]["nearest_frame_gap_ms"] - 20.0) < 1e-4, "stale 3: nearest gap 20 ms")
+    check(st_evs[2]["overlap"] is False, "stale 3: overlap False")
+    check(len(st_evs[2]["hle_waits"]) == 0, "stale 3: no HLE wait overlap")
+    check(abs(st["overlap_share"] - 0.5) < 1e-4, "stale audible overlap_share is 0.5")
+    check(len(aud["correlation"]["top_hle_waits"]) >= 1 and
+          aud["correlation"]["top_hle_waits"][0]["nid"] == "FACB3CED",
+          "top_hle_waits names Port2Sync")
+
+    rc, out, err = run(tmp, trace(stale_test_lines))
+    check(rc == 0 and "stale blocks: 3 (2 audible" in out and "port 0: 1 audible, 1 silent" in out,
+          "stale blocks text report")
+    check(rc == 0 and "top overlapping long guest waits" in out and "Port2Sync" in out,
+          "text report names overlapping HLE import")
 print("ftrace_report: %s" % ("ok" if not failures else "%d failed" % failures))
 sys.exit(1 if failures else 0)

@@ -61,7 +61,7 @@ import sys
 
 (SYSCALL, USLEEP, SPU_WAIT, SPU_BUSY, SEMA, SEMA_GAVEUP, DRAIN, FLIP_FIFO, FLIP_REQ, PRESENT,
  GPU_ENCODE, GPU_WAIT, READBACK, GPU_EXEC, HLE, DRAWABLE, LABEL_WAIT,
- AUDIO_MIX, AUDIO_PACE, AUDIO_UNDERRUN) = range(1, 21)
+ AUDIO_MIX, AUDIO_PACE, AUDIO_UNDERRUN, AUDIO_STALE) = range(1, 22)
 AUDIO_PACE_REASON = {1: "queue full", 2: "clock pacing", 3: "backend wait"}
 GPU_WAIT_KIND = {0: "gpu wait (flush)", 1: "gpu wait (present)", 2: "gpu wait (in-flight)"}
 GPU_WAIT_INFLIGHT = 2
@@ -425,12 +425,15 @@ def print_drawable_label(sec):
               " of the wait time")
 
 
-def audio_section(spans, dropped):
+def audio_section(spans, dropped, name_of=None):
+    if name_of is None:
+        name_of = lambda nid: f"nid {nid:08X}"
     mix_spans = [s for s in spans if s[0] == AUDIO_MIX]
     pace_spans = [s for s in spans if s[0] == AUDIO_PACE]
     underrun_spans = [s for s in spans if s[0] == AUDIO_UNDERRUN]
+    stale_spans = [s for s in spans if s[0] == AUDIO_STALE]
 
-    if not (mix_spans or pace_spans or underrun_spans):
+    if not (mix_spans or pace_spans or underrun_spans or stale_spans):
         return None
 
     rates = dropped == 0
@@ -463,8 +466,8 @@ def audio_section(spans, dropped):
         mix_interval = {"p50": None, "p90": None, "p99": None, "max": None}
         queue_depth = {"p1": None, "p5": None, "p50": None}
 
-    # 2. Underrun count and rate
-    audio_all = mix_spans + pace_spans + underrun_spans
+    # 2. Underrun and stale counts and rates
+    audio_all = mix_spans + pace_spans + underrun_spans + stale_spans
     t_min = min(s[4] for s in audio_all)
     t_max = max(s[5] for s in audio_all)
     audio_dur_s = (t_max - t_min) / 1000.0 if t_max > t_min else 0.0
@@ -474,6 +477,27 @@ def audio_section(spans, dropped):
     else:
         u_rate = None
 
+    stale_count = len(stale_spans)
+    stale_audible = [s for s in stale_spans if s[3] != 0]
+    stale_silent = [s for s in stale_spans if s[3] == 0]
+    stale_audible_count = len(stale_audible)
+    stale_silent_count = len(stale_silent)
+    if rates:
+        stale_rate = (stale_audible_count / audio_dur_s) if audio_dur_s > 0 else (0.0 if stale_audible_count == 0 else None)
+    else:
+        stale_rate = None
+
+    stale_by_port = {}
+    for s in stale_spans:
+        p = str(s[1])
+        if p not in stale_by_port:
+            stale_by_port[p] = {"count": 0, "audible": 0, "silent": 0}
+        stale_by_port[p]["count"] += 1
+        if s[3] != 0:
+            stale_by_port[p]["audible"] += 1
+        else:
+            stale_by_port[p]["silent"] += 1
+
     # 3. Pacing totals by reason
     pacing_totals = {}
     for code, name in AUDIO_PACE_REASON.items():
@@ -482,7 +506,7 @@ def audio_section(spans, dropped):
         pacing_totals[name] = {"count": len(sp), "ms": tot_ms, "total_ms": tot_ms}
     total_pacing_ms = sum(s[5] - s[4] for s in pace_spans)
 
-    # 4. Correlation with frame gaps and DRAWABLE/LABEL_WAIT spans
+    # 4. Correlation with frame gaps, DRAWABLE/LABEL_WAIT spans, and long HLE waits (>10 ms)
     frame_spans = [s for s in spans if s[0] in (PRESENT, DRAWABLE)]
     if frame_spans:
         raw_times = sorted(s[4] for s in frame_spans)
@@ -501,6 +525,7 @@ def audio_section(spans, dropped):
         frame_gaps.append((g0, g1, g1 - g0))
 
     d_lw_spans = [s for s in spans if s[0] in (DRAWABLE, LABEL_WAIT)]
+    long_hle_spans = [s for s in spans if s[0] == HLE and (s[5] - s[4]) > 10.0]
 
     underruns_detail = []
     overlap_count = 0
@@ -534,6 +559,16 @@ def audio_section(spans, dropped):
         if has_overlap:
             overlap_count += 1
 
+        hle_waits = []
+        for h in long_hle_spans:
+            if overlap(h[4], h[5], w0, w1) > 0:
+                hle_waits.append({
+                    "import": name_of(h[2]),
+                    "nid": f"{h[2]:08X}",
+                    "tid": h[1],
+                    "dur_ms": h[5] - h[4],
+                })
+
         underruns_detail.append({
             "at_s": u_t / 1000.0,
             "depth_frames": u[2],
@@ -541,9 +576,73 @@ def audio_section(spans, dropped):
             "blocks_since": u[3],
             "nearest_frame_gap_ms": nearest_gap_ms,
             "overlap": has_overlap,
+            "hle_waits": hle_waits,
         })
 
     overlap_share = (overlap_count / u_count) if u_count > 0 else None
+
+    stale_detail = []
+    stale_overlap_count = 0
+    for s in stale_spans:
+        s_t = s[4]
+        is_aud = (s[3] != 0)
+        nearest_gap_ms = None
+        if frame_gaps:
+            def dist_to_gap(gap):
+                g0, g1, _ = gap
+                if g0 <= s_t <= g1:
+                    return 0.0
+                if s_t < g0:
+                    return g0 - s_t
+                return s_t - g1
+            nearest = min(frame_gaps, key=dist_to_gap)
+            nearest_gap_ms = nearest[2]
+
+        w0 = s_t - 50.0
+        w1 = s_t
+        has_overlap = False
+        for g0, g1, dur in frame_gaps:
+            if dur > 40.0 and overlap(g0, g1, w0, w1) > 0:
+                has_overlap = True
+                break
+        if not has_overlap:
+            for d in d_lw_spans:
+                if overlap(d[4], d[5], w0, w1) > 0:
+                    has_overlap = True
+                    break
+
+        if is_aud and has_overlap:
+            stale_overlap_count += 1
+
+        hle_waits = []
+        for h in long_hle_spans:
+            if overlap(h[4], h[5], w0, w1) > 0:
+                hle_waits.append({
+                    "import": name_of(h[2]),
+                    "nid": f"{h[2]:08X}",
+                    "tid": h[1],
+                    "dur_ms": h[5] - h[4],
+                })
+
+        stale_detail.append({
+            "at_s": s_t / 1000.0,
+            "port": s[1],
+            "block": s[2],
+            "audible": is_aud,
+            "nearest_frame_gap_ms": nearest_gap_ms,
+            "overlap": has_overlap,
+            "hle_waits": hle_waits,
+        })
+
+    stale_overlap_share = (stale_overlap_count / stale_audible_count) if stale_audible_count > 0 else None
+
+    hle_counts = collections.defaultdict(int)
+    for ev in underruns_detail + stale_detail:
+        for hw in ev["hle_waits"]:
+            hle_counts[(hw["nid"], hw["import"], hw["tid"])] += 1
+
+    top_hle = [{"import": imp, "nid": nid, "tid": tid, "count": count}
+               for (nid, imp, tid), count in sorted(hle_counts.items(), key=lambda x: -x[1])]
 
     return {
         "blocks_per_s": blocks_per_s,
@@ -557,6 +656,20 @@ def audio_section(spans, dropped):
         },
         "underrun_count": u_count,
         "underrun_rate": u_rate,
+        "stale": {
+            "count": stale_count,
+            "audible_count": stale_audible_count,
+            "silent_count": stale_silent_count,
+            "rate": stale_rate,
+            "per_s": stale_rate,
+            "by_port": stale_by_port,
+            "events": stale_detail,
+            "overlap_count": stale_overlap_count,
+            "overlap_share": stale_overlap_share,
+        },
+        "stale_count": stale_count,
+        "stale_audible_count": stale_audible_count,
+        "stale_rate": stale_rate,
         "pacing": {
             "total_ms": total_pacing_ms,
             "by_reason": pacing_totals,
@@ -564,10 +677,15 @@ def audio_section(spans, dropped):
         "pacing_by_reason": pacing_totals,
         "correlation": {
             "underruns": underruns_detail,
+            "stale": stale_detail,
             "overlap_count": overlap_count,
             "overlap_share": overlap_share,
+            "stale_overlap_count": stale_overlap_count,
+            "stale_overlap_share": stale_overlap_share,
+            "top_hle_waits": top_hle,
         },
         "overlap_share": overlap_share,
+        "top_hle_waits": top_hle,
     }
 
 
@@ -579,6 +697,7 @@ def print_audio_section(aud):
     fr = aud["mix_interval_ms"]
     qd = aud["queue_depth_ms"]
     u = aud["underruns"]
+    st = aud["stale"]
     p = aud["pacing"]
     c = aud["correlation"]
 
@@ -590,20 +709,31 @@ def print_audio_section(aud):
     print(f"  queue depth p1 {ms_fmt(qd['p1'])} p5 {ms_fmt(qd['p5'])} p50 {ms_fmt(qd['p50'])} ms")
     rate_str = f"{u['rate']:.1f} /s" if u['rate'] is not None else "n/a"
     print(f"  underruns: {u['count']} ({rate_str})")
+    st_rate_str = f"{st['rate']:.1f} /s" if st['rate'] is not None else "n/a"
+    print(f"  stale blocks: {st['count']} ({st['audible_count']} audible, {st_rate_str}, {st['silent_count']} silent)")
+    if st["by_port"]:
+        port_strs = [f"port {p}: {info['audible']} audible, {info['silent']} silent ({info['count']} total)"
+                     for p, info in sorted(st["by_port"].items())]
+        print(f"    by port: {', '.join(port_strs)}")
     print(f"  pacing wait: {p['total_ms']:.1f} ms in all")
     for name, r in p["by_reason"].items():
         print(f"    {name:14s} {r['ms']:6.1f} ms ({r['count']} waits)")
-    if not u["count"]:
-        print("  correlation: no underruns")
+    if not u["count"] and not st["count"]:
+        print("  correlation: no underruns or stale blocks")
     else:
-        print("  correlation (50 ms before underrun):")
-        for d in c["underruns"][:8]:
-            ov = "yes" if d["overlap"] else "no"
-            gap = f"{d['nearest_frame_gap_ms']:.1f} ms" if d['nearest_frame_gap_ms'] is not None else "n/a"
-            print(f"    at {d['at_s']:.3f} s: depth {d['depth_frames']} frames ({d['depth_ms']:.1f} ms),"
-                  f" {d['blocks_since']} blocks since prev, nearest frame gap {gap}, overlap: {ov}")
-        pct = f"{100 * c['overlap_share']:.0f}%" if c['overlap_share'] is not None else "n/a"
-        print(f"  underruns overlapping a >40 ms frame gap or drawable/label wait: {pct} ({c['overlap_count']}/{u['count']})")
+        print("  correlation (50 ms before event):")
+        if u["count"]:
+            pct = f"{100 * c['overlap_share']:.0f}%" if c['overlap_share'] is not None else "n/a"
+            print(f"    underruns overlapping a >40 ms frame gap or drawable/label wait: {pct} ({c['overlap_count']}/{u['count']})")
+        if st["audible_count"]:
+            pct = f"{100 * st['overlap_share']:.0f}%" if st['overlap_share'] is not None else "n/a"
+            print(f"    audible stale blocks overlapping a >40 ms frame gap or drawable/label wait: {pct} ({st['overlap_count']}/{st['audible_count']})")
+        if c["top_hle_waits"]:
+            print("    top overlapping long guest waits (>10 ms HLE):")
+            for h in c["top_hle_waits"][:6]:
+                print(f"      tid {h['tid']:3d} {h['import']} ({h['nid']}): {h['count']}")
+        else:
+            print("    overlapping long guest waits (>10 ms HLE): none")
 
 def main():
     ap = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
@@ -649,7 +779,7 @@ def main():
                            "fast": breakdown(acc, fast, names, name_of) if fast else None,
                            "slow": breakdown(acc, slow, names, name_of) if slow else None}
     report.update(drawable_label_sections(spans, len(flips), header_dropped(header)))
-    report["audio"] = audio_section(spans, header_dropped(header))
+    report["audio"] = audio_section(spans, header_dropped(header), name_of)
     if cad_nid is not None:
         report["cadence"] = {"nid": f"{cad_nid:08X}", "import": name_of(cad_nid),
                              "threads": cadence(spans, names, name_of, cad_nid, cad_tid, args.gap)}

@@ -125,7 +125,19 @@ typedef struct {
 
 static int            s_audio_initialized = 0;
 static AudioPortSlot  s_ports[CELL_AUDIO_PORT_MAX];
+static uint64_t       s_audio_port_block_hash[CELL_AUDIO_PORT_MAX][CELL_AUDIO_BLOCK_32];
+static uint8_t        s_audio_port_block_valid[CELL_AUDIO_PORT_MAX][CELL_AUDIO_BLOCK_32];
 
+static inline uint64_t audio_fnv1a64(const void* data, size_t len)
+{
+    const uint8_t* p = (const uint8_t*)data;
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i < len; i++) {
+        h ^= (uint64_t)p[i];
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
 /* Event queue notification */
 typedef struct {
     int  in_use;
@@ -484,6 +496,28 @@ static void audio_mix_one_block(void)
         u32 block_idx = (u32)(port->read_index % nblock);
         u32 block_offset = block_idx * CELL_AUDIO_BLOCK_SAMPLES * nch;
         float* src = port->buffer + block_offset;
+        /* Check if the block has been rewritten since its previous read.
+         * If the guest stalled (e.g. SPURS job delay) and did not refill this
+         * ring slot since the previous cycle, the block bytes match what was read
+         * last time (equal hash => not rewritten). An intentionally identical
+         * refill (e.g. sustained silence) is why b distinguishes non-silent
+         * blocks where a replay is audible. Endian-neutral byte hashing. */
+        if (PS3_FT_ON() && block_idx < CELL_AUDIO_BLOCK_32) {
+            const size_t blk_bytes = (size_t)CELL_AUDIO_BLOCK_SAMPLES * nch * sizeof(float);
+            const uint64_t h = audio_fnv1a64(src, blk_bytes);
+            if (s_audio_port_block_valid[p][block_idx] &&
+                s_audio_port_block_hash[p][block_idx] == h) {
+                int non_silent = 0;
+                for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * nch; i++) {
+                    if (src[i] != 0.0f) { non_silent = 1; break; }
+                }
+                const uint64_t now_ft = ps3_ft_now();
+                ps3_ft_span(PS3_FT_AUDIO_STALE, (uint32_t)p, block_idx,
+                            non_silent ? 1u : 0u, now_ft, now_ft);
+            }
+            s_audio_port_block_hash[p][block_idx] = h;
+            s_audio_port_block_valid[p][block_idx] = 1;
+        }
 
         /* AUDIO_PEAK diag: which blocks of this port's WHOLE ring hold data,
          * vs which block the read cursor is on -- distinguishes "writer never
@@ -805,6 +839,8 @@ s32 cellAudioInit(void)
         return CELL_AUDIO_ERROR_ALREADY_INIT;
 
     memset(s_ports, 0, sizeof(s_ports));
+    memset(s_audio_port_block_hash, 0, sizeof(s_audio_port_block_hash));
+    memset(s_audio_port_block_valid, 0, sizeof(s_audio_port_block_valid));
     memset(s_notify_queues, 0, sizeof(s_notify_queues));
     mutex_init(&s_audio_mutex);
 
@@ -848,7 +884,8 @@ s32 cellAudioQuit(void)
         s_ports[i].in_use = 0;
         s_ports[i].running = 0;
     }
-
+    memset(s_audio_port_block_hash, 0, sizeof(s_audio_port_block_hash));
+    memset(s_audio_port_block_valid, 0, sizeof(s_audio_port_block_valid));
     mutex_destroy(&s_audio_mutex);
     s_audio_initialized = 0;
     return CELL_OK;
@@ -907,7 +944,8 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
     port->param.nBlock   = nblk;
     port->read_index  = 0;
     port->write_index = 0;
-
+    memset(s_audio_port_block_hash[found], 0, sizeof(s_audio_port_block_hash[found]));
+    memset(s_audio_port_block_valid[found], 0, sizeof(s_audio_port_block_valid[found]));
     /* Allocate the audio buffer in GUEST memory so portAddr/readIndexAddr are
      * real guest addresses (the game's mixer -- FMOD here -- writes PCM there
      * and validates them as 1 MB-aligned guest pointers; a host pointer trips
@@ -966,6 +1004,8 @@ s32 cellAudioPortClose(u32 portNum)
 
     s_ports[portNum].in_use  = 0;
     s_ports[portNum].running = 0;
+    memset(s_audio_port_block_hash[portNum], 0, sizeof(s_audio_port_block_hash[portNum]));
+    memset(s_audio_port_block_valid[portNum], 0, sizeof(s_audio_port_block_valid[portNum]));
 
     mutex_unlock(&s_audio_mutex);
     return CELL_OK;
