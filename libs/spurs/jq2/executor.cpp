@@ -119,7 +119,7 @@ inline void st16(std::uint32_t ea, std::uint16_t v)
 
 constexpr bool aligned(std::uint32_t ea, std::uint32_t to) { return (ea & (to - 1)) == 0; }
 
-/* ---- ftrace (ps3_ftrace.h kinds 22-26) ---------------------------------- */
+/* ---- ftrace (ps3_ftrace.h kinds 22-28) ---------------------------------- */
 
 /* The calling PPU thread's trace id, keyed as every other PPU kind (0: no guest thread). */
 inline std::uint32_t ft_tid() { return g_active_ctx ? ppu_tid_diag_index(g_active_ctx->thread_id) : 0u; }
@@ -389,6 +389,7 @@ public:
           hooks_(hooks)
     {
         slot_seq_.assign(depth, 0);
+        slot_push_ns_.assign(depth, 0);
         parked_seen_.assign(workers, UINT64_MAX);
         auto ring = std::make_unique<GuestRing>(ea, ring_ea, depth);
         ring_ = ring.get();
@@ -506,6 +507,9 @@ public:
                     out.seq = ++next_seq_;
                     out.depth = ++pending_jobs_;
                     slot_seq_[r.index] = out.seq;
+                    /* The job is visible to a worker from here (under mu_); HELD starts at this time. A
+                     * push while tracing is off records 0 and emits no HELD span. */
+                    slot_push_ns_[r.index] = PS3_FT_ON() ? ps3_ft_now() : 0;
                 }
                 return out;
             }
@@ -726,8 +730,15 @@ private:
         std::unique_lock<std::mutex> lk(mu_);
         for (;;) {
             const std::uint64_t seen = gen_;
+            /* The pass of this iteration, kept for the IDLE reason byte; a paused worker runs none. */
+            PassResult pass;
+            bool ran_pass = false;
             if (!paused_) {
-                const PassResult pass = sched_->intake_pass(instance);
+                ran_pass = true;
+                const bool ft_on = PS3_FT_ON();
+                const std::uint16_t barred_before = ft_on ? sched_->barred_mask() : 0;
+                pass = sched_->intake_pass(instance);
+                if (ft_on) note_new_barriers(barred_before);
                 if (pass.end == PassEnd::unsupported_entry) {
                     const std::uint32_t at = ring_ea_ + 8u * pass.read_after;
                     stop_with(PS3_STOP_JQ2_RING_ENTRY,
@@ -742,6 +753,7 @@ private:
                     const std::uint64_t ft0 = PS3_FT_ON() ? ps3_ft_now() : 0;
                     const JobTrace ft{ft0, ft0 != 0 ? thread_cpu_ns() : 0};
                     JobStart js = admit(d, instance, desc);
+                    emit_held(d, js, instance);
                     const std::optional<jq2_job_observer> obs = observer_;
                     ++running_;
                     counters_.dispatched.fetch_add(1);
@@ -754,11 +766,20 @@ private:
                     signal_room_fibers(room);
                     run_job(js, obs, ft);
                     lk.lock();
+                    /* complete() releases the barriers it satisfies and zeroes their masks, so the masks of
+                     * the barred tags are read first (BARRIER, ps3_ftrace.h kind 28). */
+                    const bool ft_release = PS3_FT_ON();
+                    const std::uint16_t barred_at_release = ft_release ? sched_->barred_mask() : 0;
+                    std::array<std::uint16_t, kTagCount> masks{};
+                    if (ft_release)
+                        for (unsigned t = 0; t < kTagCount; ++t)
+                            if ((barred_at_release & (1u << t)) != 0) masks[t] = sched_->barrier_mask(t);
                     if (!sched_->complete(d.id)) {
                         stop_with(PS3_STOP_JQ2_STATE, "a finished job is not in flight in the scheduler",
                                   "An executor invariant broke; this is a bug in the executor.",
                                   {hex("queue", ea_), dec("dispatch", d.id)});
                     }
+                    if (ft_release) note_released_barriers(instance, barred_at_release, masks);
                     --running_;
                     ++gen_;
                     cv_.notify_all();
@@ -780,14 +801,94 @@ private:
                 }
             }
             if (stopping_ && running_ == 0 && sched_->outstanding() == 0) break;
+            /* Why this park: the pass of this iteration, first match wins (ps3_ftrace.h kind 26). */
+            std::uint32_t reason = 15; /* unclassified: expected never */
+            if (!ran_pass) reason = 5; /* paused: no pass ran */
+            else if (pass.end == PassEnd::no_free_slot) reason = 4;
+            else if (pass.outstanding == 0) reason = 1; /* empty */
+            else if (pass.reached_unwritten) reason = 2;
+            else if (pass.entries_retained != 0) reason = 3; /* every entry reached was held */
             const std::uint64_t ft0 = PS3_FT_ON() ? ps3_ft_now() : 0;
-            const std::uint32_t depth_at_park = pending_jobs_;
+            const std::uint32_t depth_at_park = sat(pending_jobs_, 0xFFFFFFu);
             parked_seen_[instance] = seen;
             cv_.wait(lk, [&] { return gen_ != seen; });
             parked_seen_[instance] = UINT64_MAX;
             if (ft0 != 0)
-                ps3_ft_span(PS3_FT_JQ2_IDLE, ft_who(instance), depth_at_park, pending_jobs_, ft0, ps3_ft_now());
+                ps3_ft_span(PS3_FT_JQ2_IDLE, ft_who(instance), depth_at_park | reason << 24, pending_jobs_, ft0,
+                            ps3_ft_now());
         }
+    }
+
+    /* Under mu_: a pass that left tags barred records when it ended, its SYNC mask and the jobs in flight on
+     * that mask, for the BARRIER span's t0 and waited (ps3_ftrace.h kind 28). A tag barred before tracing
+     * started keeps set time 0 and its release emits no span. */
+    void note_new_barriers(std::uint16_t before)
+    {
+        const std::uint16_t gained = static_cast<std::uint16_t>(sched_->barred_mask() & ~before);
+        if (gained == 0) return;
+        const std::uint64_t now = ps3_ft_now();
+        for (unsigned t = 0; t < kTagCount; ++t) {
+            if ((gained & (1u << t)) == 0) continue;
+            const std::uint16_t mask = sched_->barrier_mask(t);
+            std::uint32_t waited = 0;
+            for (unsigned u = 0; u < kTagCount; ++u)
+                if ((mask & (1u << u)) != 0) waited += sched_->inflight(u);
+            tag_set_ns_[t] = now;
+            tag_set_mask_[t] = mask;
+            tag_set_wait_[t] = waited;
+        }
+    }
+
+    /* Under mu_: complete() released the barriers on the tags `before` names that are no longer barred. Store
+     * each released tag's free time and mask for HELD, then emit one BARRIER span per group of tags released
+     * with one set time and mask. A tag set before tracing started (set time 0) still becomes free for HELD
+     * but emits no span. */
+    void note_released_barriers(unsigned instance, std::uint16_t before,
+                                const std::array<std::uint16_t, kTagCount>& masks)
+    {
+        const std::uint16_t released = static_cast<std::uint16_t>(before & ~sched_->barred_mask());
+        if (released == 0) return;
+        const std::uint64_t now = ps3_ft_now();
+        for (unsigned t = 0; t < kTagCount; ++t) {
+            if ((released & (1u << t)) == 0) continue;
+            tag_free_ns_[t] = now;
+            tag_free_mask_[t] = masks[t];
+        }
+        /* The tags one SYNC barred share its mask and its set time, and complete() releases them together. */
+        std::uint16_t emitted = 0;
+        for (unsigned t = 0; t < kTagCount; ++t) {
+            if ((released & (1u << t)) == 0 || tag_set_ns_[t] == 0 || (emitted & (1u << t)) != 0) continue;
+            std::uint16_t tags = 0;
+            for (unsigned u = t; u < kTagCount; ++u)
+                if ((released & (1u << u)) != 0 && (emitted & (1u << u)) == 0 &&
+                    tag_set_ns_[u] == tag_set_ns_[t] && tag_set_mask_[u] == tag_set_mask_[t])
+                    tags = static_cast<std::uint16_t>(tags | (1u << u));
+            emitted = static_cast<std::uint16_t>(emitted | tags);
+            ps3_ft_span(PS3_FT_JQ2_BARRIER, ft_who(instance),
+                        std::uint32_t{tags} | std::uint32_t{tag_set_mask_[t]} << 16,
+                        std::uint32_t{index_} | sat(tag_set_wait_[t], 0xFFFFFFu) << 8, tag_set_ns_[t], now);
+        }
+        for (unsigned t = 0; t < kTagCount; ++t) {
+            if ((released & (1u << t)) == 0) continue;
+            tag_set_ns_[t] = 0;
+            tag_set_mask_[t] = 0;
+            tag_set_wait_[t] = 0;
+        }
+    }
+
+    /* Under mu_, right after admit(): the job's visible time to the release of the barrier on its tag, a
+     * zero-length span when it was never held (ps3_ftrace.h kind 27). The slot's time belongs to this
+     * admission and is cleared here. */
+    void emit_held(const Dispatch& d, const JobStart& js, unsigned instance)
+    {
+        const std::uint64_t visible = slot_push_ns_[d.ring_index];
+        slot_push_ns_[d.ring_index] = 0;
+        if (visible == 0) return; /* tracing was off at the push: no visible time, no span */
+        const bool held = tag_free_ns_[js.tag] > visible;
+        const std::uint32_t mask = held ? tag_free_mask_[js.tag] : 0u;
+        ps3_ft_span(PS3_FT_JQ2_HELD, ft_who(instance), js.seq,
+                    std::uint32_t{js.tag} | (held ? 1u : 0u) << 4 | std::uint32_t{mask} << 8, visible,
+                    held ? tag_free_ns_[js.tag] : visible);
     }
 
     /* Under mu_: read the descriptor of a job just admitted. This is the
@@ -840,13 +941,24 @@ private:
     unsigned running_ = 0;
     std::atomic<bool> shut_{false};
 
-    /* The jq2 trace identity (ps3_ftrace.h kinds 22-26). index_ is set once, before the queue is published
+    /* The jq2 trace identity (ps3_ftrace.h kinds 22-28). index_ is set once, before the queue is published
      * and its workers start; the rest is under mu_. slot_seq_ holds the seq of the job written into each ring
-     * slot until a worker admits it; the ring index only addresses it, it is not the identity. */
+     * slot until a worker admits it; the ring index only addresses it, it is not the identity. slot_push_ns_
+     * holds the time of that write (0 when tracing was off at the push), the start of the job's HELD span.
+     * tag_set_ns_/tag_set_mask_/tag_set_wait_ hold a barred tag's barrier: when the pass that set it ended, its
+     * SYNC mask and the jobs in flight on that mask then; tag_free_ns_/tag_free_mask_ the last release of a
+     * barrier on that tag. All of these are diagnostics only: written and read under mu_, and only while
+     * PS3_FT_ON(). */
     std::uint8_t index_ = 0;
     std::uint32_t next_seq_ = 0;
     std::uint32_t pending_jobs_ = 0; /* jobs pushed and not yet admitted */
     std::vector<std::uint32_t> slot_seq_;
+    std::vector<std::uint64_t> slot_push_ns_;
+    std::array<std::uint64_t, kTagCount> tag_set_ns_{};
+    std::array<std::uint16_t, kTagCount> tag_set_mask_{};
+    std::array<std::uint32_t, kTagCount> tag_set_wait_{};
+    std::array<std::uint64_t, kTagCount> tag_free_ns_{};
+    std::array<std::uint16_t, kTagCount> tag_free_mask_{};
     /* Per worker: the gen_ it parked on, or UINT64_MAX when it is not in the idle wait. Under mu_. A worker
      * whose value equals gen_ stays parked until something bumps gen_ (QueueView::settled). */
     std::vector<std::uint64_t> parked_seen_;

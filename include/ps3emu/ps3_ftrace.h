@@ -101,8 +101,27 @@ enum ps3_ft_kind {
                               * blocking part of Port2Sync; a sync that completes without blocking emits nothing);
                               * who = tid, a = waiter | wake << 8 | mode << 16 (wake 1 event flag, 2 fiber; waiter
                               * 0xFF for a fiber; mode = the sync mode), b = q */
-    PS3_FT_JQ2_IDLE       = 26, /* worker, parks (cv wait in) -> wakes; who = q << 8 | w, a = depth at park,
-                              * b = depth at wake, depth as in PUSH */
+    PS3_FT_JQ2_IDLE       = 26, /* worker, parks (cv wait in) -> wakes; who = q << 8 | w,
+                              * a = sat(depth at park, 2^24-1) | reason << 24, b = depth at wake, depth as in
+                              * PUSH. reason, first match wins: 0 unrecorded (a trace written before this byte
+                              * existed), 5 paused (no pass ran), 4 no free slot, 1 empty (nothing
+                              * outstanding), 2 unwritten (the pass stopped at a slot the writer has not
+                              * finished), 3 held (every entry the pass reached was held by a barrier),
+                              * 15 unclassified (expected never; a consumer counts it) */
+    PS3_FT_JQ2_HELD       = 27, /* worker, a job became visible to workers (the ring write in push_unless_shut)
+                              * -> it became admissible (the release of the barrier on its tag, the visible
+                              * time itself when it was never held); who = q << 8 | w, a = seq,
+                              * b = tag | cause << 4 | mask << 8: cause 0 never held, 1 held by a barrier;
+                              * mask = the SYNC mask of that barrier (0 when cause 0), bits 24-31 are 0.
+                              * t1 <= JOB.t0: the release was recorded in an earlier critical section than
+                              * the admission. No span when tracing was off at the push */
+    PS3_FT_JQ2_BARRIER    = 28, /* worker, the end of the intake pass that consumed a SYNC and left its tags
+                              * barred -> the release of those tags in complete(); who = q << 8 | w of the
+                              * releasing worker, a = tags | mask << 16 (the tags this SYNC barred, released
+                              * together; its SYNC mask), b = q | sat(waited, 2^24-1) << 8, waited = jobs in
+                              * flight on the mask's tags when the barrier was set. Tags released together
+                              * with one set time and mask form one span; a barrier set before tracing
+                              * started emits none */
 };
 
 enum ps3_ft_audio_pace_reason {
