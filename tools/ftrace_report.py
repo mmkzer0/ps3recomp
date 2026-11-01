@@ -41,6 +41,25 @@ and shares but no rates.
               drain, rest -- a drawable wait lies inside a drain pass, so the order
               keeps one millisecond from being counted twice.
 
+A third section, SPURS job queues (jq2, kinds 22-26), splits a job's wait into
+its links, per queue: pushes and push rate; queue latency (JOB t0 - PUSH t1),
+execution wall and thread CPU time, completion delay (CREDIT t0 - JOB t1) and
+sync latency (CREDIT t1 to the blocked thread running again), each with count,
+mean, p50/p95/p99 and max; CPU/wall; per-worker utilisation and idle share of
+the recorder's window (the header's start_us..end_us, one denominator for every
+queue, so the shares compare; the queue's own extent only when the header names
+none, and which one was used is printed), each busy or idle span clipped to
+that window before it is summed; the number of workers seen; queue depth from
+the push; parks while work was pending; sync waits per PPU tid.
+Push, job and credit are joined on (q, seq): seq counts per queue, so a join on
+seq alone pairs one queue's push with another's job. Sync latency joins on
+(q, waiter) against the last event-flag credit inside the wait; a fiber wait
+carries no waiter id (0xFF, wake 2), so it is reported apart and is not a join
+failure. A queue latency is clamped at 0 when a worker admitted a job before
+the push span ended, and the clamped joins are counted. A join that finds no
+partner is counted, never dropped. A trace without kinds 22-26 prints no such
+section and its JSON key is null.
+
 Without --json it then draws a few frames as a timeline (one column per
 --ms-per-col ms):
   PPU   '#' running   '.' usleep poll   's' other blocking syscall
@@ -61,8 +80,10 @@ import sys
 
 (SYSCALL, USLEEP, SPU_WAIT, SPU_BUSY, SEMA, SEMA_GAVEUP, DRAIN, FLIP_FIFO, FLIP_REQ, PRESENT,
  GPU_ENCODE, GPU_WAIT, READBACK, GPU_EXEC, HLE, DRAWABLE, LABEL_WAIT,
- AUDIO_MIX, AUDIO_PACE, AUDIO_UNDERRUN, AUDIO_STALE) = range(1, 22)
+ AUDIO_MIX, AUDIO_PACE, AUDIO_UNDERRUN, AUDIO_STALE,
+ JQ2_PUSH, JQ2_JOB, JQ2_CREDIT, JQ2_SYNC_WAIT, JQ2_IDLE) = range(1, 27)
 AUDIO_PACE_REASON = {1: "queue full", 2: "clock pacing", 3: "backend wait"}
+JQ2_FIBER_WAKE = 2       # wake field of a fiber wait or wake; it carries waiter 0xFF, so it cannot be joined
 GPU_WAIT_KIND = {0: "gpu wait (flush)", 1: "gpu wait (present)", 2: "gpu wait (in-flight)"}
 GPU_WAIT_INFLIGHT = 2
 SPINS_SLEEPING = 64      # cellGcmSys.c yields for 64 spins, then sleeps 1 ms per spin
@@ -317,6 +338,20 @@ def nearest_rank(xs, p):
 def header_dropped(header):
     m = re.search(r"\bdropped=(\d+)", header)
     return int(m.group(1)) if m else None
+
+
+def header_window(header):
+    """The recorder's window in ms from the trace header, or None when it names none.
+
+    The spans use the same microsecond origin as start_us/end_us, so the window is one
+    denominator for every queue; without it a queue whose spans happen to bracket a
+    shorter stretch would look busier than one that ran the whole recording.
+    """
+    m = re.search(r"\bstart_us=([0-9.]+)\s+end_us=([0-9.]+)", header)
+    if not m:
+        return None
+    start, end = float(m.group(1)) / 1000.0, float(m.group(2)) / 1000.0
+    return (start, end) if end > start else None
 
 
 def drawable_label_sections(spans, flip_requests, dropped):
@@ -742,6 +777,252 @@ def print_audio_section(aud):
         else:
             print("    overlapping long guest waits (>10 ms HLE): none")
 
+
+def jq2_stats(xs):
+    """count, mean, nearest-rank p50/p95/p99 and max of xs; None where there is nothing to average."""
+    s = sorted(xs)
+    if not s:
+        return {"count": 0, "mean": None, "p50": None, "p95": None, "p99": None, "max": None}
+    return {"count": len(s), "mean": sum(s) / len(s),
+            "p50": nearest_rank(s, 50), "p95": nearest_rank(s, 95),
+            "p99": nearest_rank(s, 99), "max": s[-1]}
+
+
+def jq2_ranks(xs):
+    """nearest-rank (p50, p95, p99) of xs, or (None, None, None) when there is nothing to rank."""
+    s = sorted(xs)
+    if not s:
+        return None, None, None
+    return nearest_rank(s, 50), nearest_rank(s, 95), nearest_rank(s, 99)
+
+
+def jq2_section(spans, header, names=None):
+    """The SPURS job queue (jq2) section, or None when the trace has no kinds 22-26.
+
+    Queue latency, execution wall and CPU, and completion delay are keyed on (q, seq):
+    seq counts per queue and every queue starts at 1, so a join that ignores q pairs one
+    queue's push with another queue's job and reports a latency neither saw. Sync
+    latency is the wait for a completion signal to reach the blocked PPU thread, joined
+    on (q, waiter) against the last event-flag credit that landed inside that wait; the
+    fiber path has no waiter id (0xFF, wake 2), so a fiber wait cannot be joined and is
+    reported apart rather than miscounted against the event flag. A join that finds no
+    partner is counted, never dropped: a span cut off at a window edge loses its
+    partner, and hiding that would make the latencies look better than the trace is.
+    """
+    js = [s for s in spans if JQ2_PUSH <= s[0] <= JQ2_IDLE]
+    if not js:
+        return None
+    by_q = collections.defaultdict(lambda: {"push": [], "job": [], "credit": [], "wait": [],
+                                            "idle": [], "bounds": []})
+    for k, who, a, b, t0, t1 in js:
+        if k == JQ2_PUSH:                 # who = tid, a = seq, b = q | depth << 8
+            g = by_q[b & 0xFF]
+            g["push"].append((a, t0, t1, b >> 8))
+        elif k == JQ2_SYNC_WAIT:          # who = tid, a = waiter | wake << 8 | mode << 16, b = q
+            g = by_q[b & 0xFF]
+            g["wait"].append((who, a & 0xFF, a >> 8 & 0xFF, t0, t1))
+        else:                             # who = q << 8 | w, a = seq
+            g = by_q[who >> 8]
+            if k == JQ2_JOB:              # b = thread CPU time, us
+                g["job"].append((who & 0xFF, a, b, t0, t1))
+            elif k == JQ2_CREDIT:         # b = waiter | wake << 8 | due << 16
+                g["credit"].append((who & 0xFF, a, b, t0, t1))
+            else:                         # JQ2_IDLE: a = depth at park, b = depth at wake
+                g["idle"].append((who & 0xFF, a, b, t0, t1))
+        g["bounds"].append((t0, t1))
+
+    queues = []
+    hw = header_window(header)
+    for q in sorted(by_q):
+        g = by_q[q]
+        pushes, jobs, credits = g["push"], g["job"], g["credit"]
+        waits, idles = g["wait"], g["idle"]
+        w0 = min(t0 for t0, _ in g["bounds"])
+        w1 = max(t1 for _, t1 in g["bounds"])
+        # One window for every queue: the recorder's, so the shares compare; the queue's
+        # own extent only stands in when the header names no window.
+        win_start, win_end = hw if hw is not None else (w0, w1)
+        window = win_end - win_start
+
+        push_end = {seq: t1 for seq, _, t1, _ in pushes}
+        latency, clamped = [], 0
+        for _, seq, _, jt0, _ in jobs:
+            end = push_end.get(seq)
+            if end is None:
+                continue
+            d = jt0 - end
+            if d < 0.0:                   # a busy worker admitted the job before its push span ended
+                d, clamped = 0.0, clamped + 1
+            latency.append(d)
+        paired = {seq for _, seq, _, _, _ in jobs if seq in push_end}
+
+        credit_start = {seq: c0 for _, seq, _, c0, _ in credits}
+        completion = [credit_start[seq] - jt1 for _, seq, _, _, jt1 in jobs if seq in credit_start]
+        credited = {seq for _, seq, _, _, _ in jobs if seq in credit_start}
+
+        wall = [jt1 - jt0 for _, _, _, jt0, jt1 in jobs]
+        cpu = [us / 1000.0 for _, _, us, _, _ in jobs]
+
+        # A due event-flag credit is the only thing that can end an event-flag wait. The
+        # last one inside the wait is the wake it saw; credits are consumed as they pair,
+        # because one wake ends one wait and a reused waiter id must not reuse a credit.
+        due = collections.defaultdict(list)
+        for i, (_, _, b, _, c1) in enumerate(credits):
+            if b >> 16 & 1 and (b >> 8) & 0xFF != JQ2_FIBER_WAKE:
+                due[b & 0xFF].append((c1, i))
+        for v in due.values():
+            v.sort()
+        used, sync, wait_without_credit = set(), [], 0
+        fiber = [t1 - t0 for _, _, wake, t0, t1 in waits if wake == JQ2_FIBER_WAKE]
+        for _, waiter, wake, wt0, wt1 in sorted(waits, key=lambda s: s[3]):
+            if wake == JQ2_FIBER_WAKE:
+                continue
+            hit = None
+            for c1, i in reversed(due.get(waiter, ())):
+                if c1 > wt1:
+                    continue
+                if c1 < wt0:
+                    break
+                if i not in used:
+                    hit = (c1, i)
+                    break
+            if hit is None:
+                wait_without_credit += 1
+            else:
+                used.add(hit[1])
+                sync.append(wt1 - hit[0])
+        due_total = sum(len(v) for v in due.values())
+
+        # A worker that parked before the recorder opened, or whose span was still open when
+        # it closed, reaches past the window; summed whole it charges time the window does
+        # not own, and busy + idle can pass the window itself. Clip first.
+        busy, idle_ms, job_count = (collections.defaultdict(float), collections.defaultdict(float),
+                                    collections.Counter())
+        for w, _, _, jt0, jt1 in jobs:
+            busy[w] += overlap(jt0, jt1, win_start, win_end)
+            job_count[w] += 1
+        for w, _, _, it0, it1 in idles:
+            idle_ms[w] += overlap(it0, it1, win_start, win_end)
+        workers = sorted(set(busy) | set(idle_ms))
+        parked = [overlap(t0, t1, win_start, win_end) for _, depth, _, t0, t1 in idles if depth > 0]
+
+        depths = sorted(p[3] for p in pushes)
+        waits_by_tid = collections.defaultdict(list)
+        for tid, _, _, t0, t1 in waits:
+            waits_by_tid[tid].append(t1 - t0)
+        total_wall = sum(wall)
+
+        queues.append({
+            "q": q,
+            "window": {"start_ms": win_start, "end_ms": win_end, "ms": window},
+            "window_source": "header" if hw is not None else "extent",
+            "pushes": len(pushes),
+            "push_rate_per_s": len(pushes) / (window / 1000.0) if window > 0 else None,
+            "jobs": len(jobs),
+            "workers": len(workers),
+            "queue_latency_ms": jq2_stats(latency),
+            "queue_latency_clamped": clamped,
+            "exec_wall_ms": jq2_stats(wall),
+            "exec_cpu_ms": jq2_stats(cpu),
+            "completion_delay_ms": jq2_stats(completion),
+            "sync_latency_ms": jq2_stats(sync),
+            "cpu_wall": sum(cpu) / total_wall if total_wall > 0 else None,
+            "per_worker": [
+                {"w": w, "jobs": job_count[w], "busy_ms": busy[w],
+                 "utilisation": busy[w] / window if window > 0 else None,
+                 "idle_ms": idle_ms[w],
+                 "idle_fraction": idle_ms[w] / window if window > 0 else None}
+                for w in workers],
+            "parked_while_pending": {"count": len(parked), "total_ms": sum(parked)},
+            "depth": {"count": len(depths),
+                      "p50": nearest_rank(depths, 50) if depths else None,
+                      "p95": nearest_rank(depths, 95) if depths else None,
+                      "max": depths[-1] if depths else None},
+            "sync_wait_by_tid": [
+                {"tid": tid, "name": (names or {}).get(tid, "?"), "count": len(v),
+                 "total_ms": sum(v), "p50": jq2_ranks(v)[0], "p95": jq2_ranks(v)[1],
+                 "p99": jq2_ranks(v)[2]}
+                for tid, v in sorted(waits_by_tid.items())],
+            "fiber_sync_wait": {"count": len(fiber), "total_ms": sum(fiber),
+                                "p50": jq2_ranks(fiber)[0], "p95": jq2_ranks(fiber)[1],
+                                "p99": jq2_ranks(fiber)[2]},
+            "join_failures": {
+                "queue_latency": {"matched": len(paired),
+                                  "push_without_job": len(pushes) - len(paired),
+                                  "job_without_push": len(jobs) - len(paired)},
+                "completion_delay": {"matched": len(credited),
+                                     "job_without_credit": len(jobs) - len(credited),
+                                     "credit_without_job": len(credits) - len(credited)},
+                "sync_latency": {"matched": len(sync),
+                                 "wait_without_credit": wait_without_credit,
+                                 "credit_without_wait": due_total - len(used)},
+            },
+        })
+    return {"dropped": header_dropped(header), "queues": queues}
+
+
+def print_jq2_section(jq):
+    if jq is None:
+        return
+
+    def ms(x):
+        return "n/a" if x is None else f"{x:.2f}"
+
+    def stat(label, st, extra=""):
+        print(f"    {label:30s} n {st['count']:5d}  mean {ms(st['mean']):>7s}"
+              f"  p50 {ms(st['p50']):>7s}  p95 {ms(st['p95']):>7s}"
+              f"  p99 {ms(st['p99']):>7s}  max {ms(st['max']):>7s} ms{extra}")
+
+    def pct(x):
+        return "n/a" if x is None else f"{100 * x:.0f} %"
+
+    dropped = jq["dropped"]
+    print("\nSPURS job queues (jq2):")
+    print("  recorder dropped spans: " + ("no header" if dropped is None else str(dropped)))
+    for qd in jq["queues"]:
+        w = qd["window"]
+        rate = (f"{qd['push_rate_per_s']:.2f} pushes/s" if qd["push_rate_per_s"] is not None
+                else "rate n/a")
+        print(f"  queue {qd['q']}: {qd['pushes']} pushes, {qd['jobs']} jobs, {qd['workers']} workers,"
+              f" window {w['start_ms']:.2f}-{w['end_ms']:.2f} ms ({w['ms']:.2f} ms,"
+              f" {qd['window_source']}), {rate}")
+        stat("queue latency (push->job)", qd["queue_latency_ms"],
+             f"  ({qd['queue_latency_clamped']} clamped at 0)")
+        stat("execution wall (job)", qd["exec_wall_ms"])
+        stat("execution CPU (thread)", qd["exec_cpu_ms"])
+        stat("completion delay (job->credit)", qd["completion_delay_ms"])
+        stat("sync latency (credit->resume)", qd["sync_latency_ms"])
+        print(f"    cpu/wall {ms(qd['cpu_wall'])}")
+        for pw in qd["per_worker"]:
+            print(f"    worker {pw['w']}: {pw['jobs']} jobs, busy {pw['busy_ms']:.2f} ms"
+                  f" = {pct(pw['utilisation'])}, idle {pw['idle_ms']:.2f} ms"
+                  f" = {pct(pw['idle_fraction'])}")
+        pk = qd["parked_while_pending"]
+        print(f"    parked while work was pending: {pk['count']} spans, {pk['total_ms']:.2f} ms")
+        d = qd["depth"]
+        print(f"    queue depth: p50 {ms(d['p50'])}  p95 {ms(d['p95'])}  max {ms(d['max'])}"
+              f"  ({d['count']} pushes)")
+        for row in qd["sync_wait_by_tid"]:
+            print(f"    sync wait tid {row['tid']:3d} {row['name'][:28]:28s} n {row['count']:5d}"
+                  f"  {row['total_ms']:8.2f} ms  p50 {ms(row['p50'])}"
+                  f"  p95 {ms(row['p95'])}  p99 {ms(row['p99'])} ms")
+        fs = qd["fiber_sync_wait"]
+        print(f"    fiber sync waits (no waiter, not joined): n {fs['count']}"
+              f"  {fs['total_ms']:.2f} ms  p50 {ms(fs['p50'])}  p95 {ms(fs['p95'])}"
+              f"  p99 {ms(fs['p99'])} ms")
+        ql = qd["join_failures"]["queue_latency"]
+        cd = qd["join_failures"]["completion_delay"]
+        sl = qd["join_failures"]["sync_latency"]
+        print(f"    join failures: push->job {ql['push_without_job'] + ql['job_without_push']}"
+              f" ({ql['push_without_job']} push without a job, {ql['job_without_push']} job without a"
+              f" push); job->credit {cd['job_without_credit'] + cd['credit_without_job']}"
+              f" ({cd['job_without_credit']} job without a credit, {cd['credit_without_job']} credit"
+              f" without a job); credit->wait"
+              f" {sl['wait_without_credit'] + sl['credit_without_wait']}"
+              f" ({sl['wait_without_credit']} wait without a credit,"
+              f" {sl['credit_without_wait']} due credit without a wait)")
+
+
 def main():
     ap = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
     ap.add_argument("trace")
@@ -787,6 +1068,7 @@ def main():
                            "slow": breakdown(acc, slow, names, name_of) if slow else None}
     report.update(drawable_label_sections(spans, len(flips), header_dropped(header)))
     report["audio"] = audio_section(spans, header_dropped(header), name_of)
+    report["jq2"] = jq2_section(spans, header, names)
     if cad_nid is not None:
         report["cadence"] = {"nid": f"{cad_nid:08X}", "import": name_of(cad_nid),
                              "threads": cadence(spans, names, name_of, cad_nid, cad_tid, args.gap)}
@@ -806,6 +1088,7 @@ def main():
                 print_breakdown(report["split"][part], f"Frames {rel} {args.split:g} ms")
     print_drawable_label(report)
     print_audio_section(report["audio"])
+    print_jq2_section(report["jq2"])
     if "cadence" in report:
         c = report["cadence"]
         print(f"\nCadence of {c['import']} ({c['nid']}):")
