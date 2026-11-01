@@ -2403,8 +2403,8 @@ void mode_trace_spans()
     ppu_context ppu{};
     ppu.thread_id = ppu_tid_make(0, 0);
     g_active_ctx = &ppu;
-    CHECK(PS3_FT_ON(), "tracing is on");
 
+    CHECK(PS3_FT_ON(), "tracing is on"); /* before any worker: a hook sees "off" while another thread initialises */
     Rig rig({128, 2, false});
     CHECK(set_intake_paused(QUEUE, true), "pause");
     std::vector<JobSpec> specs;
@@ -2459,7 +2459,7 @@ void mode_trace_sync()
         std::lock_guard<std::mutex> lk(g_probe.mu);
         g_probe.on_admit = nullptr;
     }
-    CHECK(PS3_FT_ON(), "tracing is on");
+    CHECK(PS3_FT_ON(), "tracing is on"); /* before any worker: a hook sees "off" while another thread initialises */
     Rig rig({128, 1, false});
     CHECK(set_intake_paused(QUEUE, true), "pause");
     const JobSpec a = spec(0);
@@ -2542,9 +2542,9 @@ void mode_trace_queues()
         std::lock_guard<std::mutex> lk(g_probe.mu);
         g_probe.on_admit = nullptr;
     }
-    CHECK(PS3_FT_ON(), "tracing is on");
 
     std::unique_ptr<Rig> rig;
+    CHECK(PS3_FT_ON(), "tracing is on"); /* before any worker: a hook sees "off" while another thread initialises */
     std::string log = capture_stderr([&] { rig = std::make_unique<Rig>(Opts{128, 3, false}); });
     log += capture_stderr([&] {
         CHECK(jq2_queue_create(1, 0x360001, SPURS, QUEUE2, ATTR, 0, 0, 0, RING2, 64, 1, 0) == 0, "second queue");
@@ -2593,7 +2593,7 @@ void mode_trace_concurrent()
         std::lock_guard<std::mutex> lk(g_probe.mu);
         g_probe.on_admit = nullptr;
     }
-    CHECK(PS3_FT_ON(), "tracing is on");
+    CHECK(PS3_FT_ON(), "tracing is on"); /* before any worker: a hook sees "off" while another thread initialises */
     Rig rig({128, 2, false});
     std::vector<JobSpec> specs;
     for (std::uint32_t j = 0; j < kJobs; ++j) specs.push_back(spec(j));

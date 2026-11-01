@@ -226,11 +226,22 @@ static inline int ps3_ft_init(void)
     return on == 2;
 }
 
+/* Recording? ps3_ft_init writes buf, cap, start, end, min and merge and then publishes on = 2 with a RELEASE
+ * store. A thread that read 2 with a relaxed load is not ordered after those writes, and on arm64 may read a
+ * stale buf. So the off path stays one relaxed load, and only a thread that read 2 pays for an ACQUIRE load of
+ * the same word, which pairs with that release store. (A fence would order it on hardware, but
+ * ThreadSanitizer does not model fences.) */
+static inline int ps3_ft_recording(void)
+{
+    if (__builtin_expect(__atomic_load_n(&g_ps3_ft.on, __ATOMIC_RELAXED) != 2, 1)) return 0;
+    return __atomic_load_n(&g_ps3_ft.on, __ATOMIC_ACQUIRE) == 2;
+}
+
 /* The hook guard: one load when off. */
 static inline int ps3_ft_on(void)
 {
     const int on = __atomic_load_n(&g_ps3_ft.on, __ATOMIC_RELAXED);
-    if (__builtin_expect(on == 2, 0)) return 1;
+    if (__builtin_expect(on == 2, 0)) return ps3_ft_recording();
     if (__builtin_expect(on != 0, 1)) return 0;
     return ps3_ft_init();
 }
@@ -242,7 +253,7 @@ static inline void ps3_ft_span(int kind, uint32_t who, uint32_t a, uint32_t b,
                                uint64_t t0, uint64_t t1)
 {
     ps3_ft_state* s = &g_ps3_ft;
-    if (__atomic_load_n(&s->on, __ATOMIC_RELAXED) != 2) return;
+    if (!ps3_ft_recording()) return;
     if (t1 < s->start) return;
     if (t0 > s->end) { ps3_ft_dump(); return; }
     const uint32_t i = __atomic_fetch_add(&s->n, 1, __ATOMIC_RELAXED);
@@ -257,7 +268,7 @@ static inline void ps3_ft_span(int kind, uint32_t who, uint32_t a, uint32_t b,
 static inline void ps3_ft_usleep(uint32_t tid, uint32_t lr, uint64_t t0, uint64_t t1)
 {
     ps3_ft_state* s = &g_ps3_ft;
-    if (tid >= PS3_FT_TIDS || __atomic_load_n(&s->on, __ATOMIC_RELAXED) != 2) return;
+    if (tid >= PS3_FT_TIDS || !ps3_ft_recording()) return;
     if (s->us[tid].n && s->us[tid].lr == lr && t0 - s->us[tid].t1 <= s->merge) {
         s->us[tid].t1 = t1; s->us[tid].n++;
         return;

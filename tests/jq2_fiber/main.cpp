@@ -735,8 +735,7 @@ void stop_push_wait()
  * workers are joined (teardown). */
 void trace_fiber()
 {
-    /* The recorder's first hook initialises it; do that before any thread that emits can start. */
-    CHECK(PS3_FT_ON());
+    CHECK(PS3_FT_ON()); /* before any worker: a hook sees "off" while another thread initialises */
     boot(1);
     CHECK(set_intake_paused(QUEUE, true));
     build_job(0);

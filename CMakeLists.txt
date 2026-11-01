@@ -633,6 +633,14 @@ if(PS3RECOMP_BUILD_TESTS)
     target_include_directories(test_log_first PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
     add_test(NAME log_first COMMAND test_log_first)
     set_tests_properties(log_first PROPERTIES LABELS "runtime;t0")
+    # The recorder's state reaches threads that did not initialise it (ps3_ft_recording's acquire).
+    if(UNIX)
+        add_executable(test_ftrace_publish tests/test_ftrace_publish.c)
+        target_include_directories(test_ftrace_publish PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+        target_link_libraries(test_ftrace_publish PRIVATE Threads::Threads)
+        add_test(NAME ftrace_publish COMMAND test_ftrace_publish)
+        set_tests_properties(ftrace_publish PROPERTIES LABELS "runtime;t0;tsan" TIMEOUT 120)
+    endif()
 
     # cellSync.h from C++, with <stdatomic.h> included first: the generated NID
     # table includes the header that way and no other in-tree TU did, so this
