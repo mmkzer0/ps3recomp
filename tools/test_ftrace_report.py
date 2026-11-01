@@ -492,6 +492,32 @@ with tempfile.TemporaryDirectory() as tmp:
           e["window_source"] == "header",
           "jq2: worker busy time and utilisation of the header window")
 
+    # Spans reaching past the recorder's window are clipped before they are summed: a worker
+    # that parked before start_us, or was still parked at end_us, must not charge time the
+    # window does not own.
+    clip = [span(FLIP_REQ, 1, 0, 0, t, t) for t in (0, 20, 40)]
+    clip += [span(JQ2_JOB, qword(0, 0), 1, 0, 12, 24),          # 12 ms inside a 10-40 ms window
+             span(JQ2_IDLE, qword(0, 0), 0, 0, 24, 48),         # ends 8 ms after it: counts 16
+             span(JQ2_IDLE, qword(0, 1), 2, 1, 4, 12),          # starts 6 ms before it: counts 2
+             span(JQ2_IDLE, qword(0, 1), 1, 1, 0, 5)]           # wholly before it: counts 0
+    rc, out, err = run(tmp, jq2_trace(clip, header="# ps3_ftrace start_us=10000 end_us=40000"
+                                                  " spans=0 dropped=0"), "--json")
+    check(rc == 0, f"jq2 clip: exit 0: {err}")
+    c = json.loads(out)["jq2"]["queues"][0]
+    check(close(c["window"]["start_ms"], 10) and close(c["window"]["ms"], 30) and
+          c["window_source"] == "header", f"jq2 clip: a 10-40 ms header window {c['window']}")
+    cw = {p["w"]: p for p in c["per_worker"]}
+    check(close(cw[0]["busy_ms"], 12) and cw[0]["jobs"] == 1 and close(cw[0]["utilisation"], 12 / 30),
+          f"jq2 clip: worker 0 busy {cw.get(0)}")
+    check(close(cw[0]["idle_ms"], 16) and close(cw[0]["idle_fraction"], 16 / 30),
+          f"jq2 clip: an idle span ending after the window counts only to its end {cw.get(0)}")
+    check(close(cw[1]["idle_ms"], 2) and close(cw[1]["idle_fraction"], 2 / 30),
+          f"jq2 clip: an idle span starting before the window counts only from its start {cw.get(1)}")
+    check(all(p["busy_ms"] + p["idle_ms"] <= c["window"]["ms"] + 1e-9 for p in c["per_worker"]),
+          f"jq2 clip: busy + idle never exceeds the window {c['per_worker']}")
+    check(c["parked_while_pending"] == {"count": 2, "total_ms": 2},
+          f"jq2 clip: the parked-while-pending total is clipped too {c['parked_while_pending']}")
+
     # A trace without kinds 22-26 prints no section and has a null key.
     plain = [span(FLIP_REQ, 1, 0, 0, t, t) for t in (0, 20, 40)]
     rc, out, err = run(tmp, trace(plain), "--json")

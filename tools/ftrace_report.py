@@ -48,8 +48,9 @@ sync latency (CREDIT t1 to the blocked thread running again), each with count,
 mean, p50/p95/p99 and max; CPU/wall; per-worker utilisation and idle share of
 the recorder's window (the header's start_us..end_us, one denominator for every
 queue, so the shares compare; the queue's own extent only when the header names
-none, and which one was used is printed) and the number of workers seen; queue
-depth from the push; parks while work was pending; sync waits per PPU tid.
+none, and which one was used is printed), each busy or idle span clipped to
+that window before it is summed; the number of workers seen; queue depth from
+the push; parks while work was pending; sync waits per PPU tid.
 Push, job and credit are joined on (q, seq): seq counts per queue, so a join on
 seq alone pairs one queue's push with another's job. Sync latency joins on
 (q, waiter) against the last event-flag credit inside the wait; a fiber wait
@@ -892,15 +893,18 @@ def jq2_section(spans, header, names=None):
                 sync.append(wt1 - hit[0])
         due_total = sum(len(v) for v in due.values())
 
+        # A worker that parked before the recorder opened, or whose span was still open when
+        # it closed, reaches past the window; summed whole it charges time the window does
+        # not own, and busy + idle can pass the window itself. Clip first.
         busy, idle_ms, job_count = (collections.defaultdict(float), collections.defaultdict(float),
                                     collections.Counter())
         for w, _, _, jt0, jt1 in jobs:
-            busy[w] += jt1 - jt0
+            busy[w] += overlap(jt0, jt1, win_start, win_end)
             job_count[w] += 1
         for w, _, _, it0, it1 in idles:
-            idle_ms[w] += it1 - it0
+            idle_ms[w] += overlap(it0, it1, win_start, win_end)
         workers = sorted(set(busy) | set(idle_ms))
-        parked = [t1 - t0 for _, depth, _, t0, t1 in idles if depth > 0]
+        parked = [overlap(t0, t1, win_start, win_end) for _, depth, _, t0, t1 in idles if depth > 0]
 
         depths = sorted(p[3] for p in pushes)
         waits_by_tid = collections.defaultdict(list)

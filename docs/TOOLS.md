@@ -792,7 +792,9 @@ the blocked PPU thread running again), each with count, mean, p50/p95/p99/max;
 CPU/wall; per-worker utilisation and idle share of the recorder's window
 (`start_us`..`end_us` from the header, one denominator for every queue; the
 queue's own span extent when the header names none, and `window_source` says
-which); the number of workers seen; queue depth from the push; parks while work
+which), each busy or idle span clipped to that window before it is summed so a
+park that started before the recording opened cannot charge time it does not
+own; the number of workers seen; queue depth from the push; parks while work
 was pending; sync waits per PPU tid; and the recorder's `dropped` count from the
 header. Push, job and credit are joined on `(q, seq)` -- `seq` counts per
 queue, so a join on it alone pairs one queue's push with another's job. Sync
