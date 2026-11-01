@@ -901,6 +901,9 @@ static int run_spurs_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_e
 
     /* ---- enter the job -------------------------------------------------- */
     spu_context ctx;
+    /* Every jq2 job gets spu_id 0 here, whichever worker runs it, so spu_id does
+     * not identify a worker on this path. The ftrace jq2 kinds carry the queue
+     * and worker index (q, w) instead; changing spu_id is tracked in #107. */
     spu_context_init(&ctx, 0);
     ctx.image_id = image_id;
     ctx.job_rt_ls = q ? SPU_JQ2_JM_CALL_LS : (crt == 14 ? JOB_RT_LS : 0);
