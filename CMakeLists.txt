@@ -623,6 +623,7 @@ if(PS3RECOMP_BUILD_TESTS)
     target_include_directories(test_rsx_present_policy PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
     add_test(NAME rsx_present_policy COMMAND test_rsx_present_policy)
+    set_tests_properties(rsx_present_policy PROPERTIES LABELS "gcm;t0")
 
 
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
