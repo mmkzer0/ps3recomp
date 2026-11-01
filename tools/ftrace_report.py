@@ -46,16 +46,18 @@ its links, per queue: pushes and push rate; queue latency (JOB t0 - PUSH t1),
 execution wall and thread CPU time, completion delay (CREDIT t0 - JOB t1) and
 sync latency (CREDIT t1 to the blocked thread running again), each with count,
 mean, p50/p95/p99 and max; CPU/wall; per-worker utilisation and idle share of
-the queue's window and the number of workers seen; queue depth from the push;
-parks while work was pending; sync waits per PPU tid. Push, job and credit are
-joined on (q, seq): seq counts per queue, so a join on seq alone pairs one
-queue's push with another's job. Sync latency joins on (q, waiter) against the
-last event-flag credit inside the wait; a fiber wait carries no waiter (0xFF,
-wake 2), is reported apart and is not a join failure. A queue latency is
-clamped at 0 when a worker admitted a job before the push span ended, and the
-clamped joins are counted. A join that finds no partner is counted, never
-dropped. A trace without kinds 22-26 prints no such section and its JSON key is
-null.
+the recorder's window (the header's start_us..end_us, one denominator for every
+queue, so the shares compare; the queue's own extent only when the header names
+none, and which one was used is printed) and the number of workers seen; queue
+depth from the push; parks while work was pending; sync waits per PPU tid.
+Push, job and credit are joined on (q, seq): seq counts per queue, so a join on
+seq alone pairs one queue's push with another's job. Sync latency joins on
+(q, waiter) against the last event-flag credit inside the wait; a fiber wait
+carries no waiter id (0xFF, wake 2), so it is reported apart and is not a join
+failure. A queue latency is clamped at 0 when a worker admitted a job before
+the push span ended, and the clamped joins are counted. A join that finds no
+partner is counted, never dropped. A trace without kinds 22-26 prints no such
+section and its JSON key is null.
 
 Without --json it then draws a few frames as a timeline (one column per
 --ms-per-col ms):
@@ -335,6 +337,20 @@ def nearest_rank(xs, p):
 def header_dropped(header):
     m = re.search(r"\bdropped=(\d+)", header)
     return int(m.group(1)) if m else None
+
+
+def header_window(header):
+    """The recorder's window in ms from the trace header, or None when it names none.
+
+    The spans use the same microsecond origin as start_us/end_us, so the window is one
+    denominator for every queue; without it a queue whose spans happen to bracket a
+    shorter stretch would look busier than one that ran the whole recording.
+    """
+    m = re.search(r"\bstart_us=([0-9.]+)\s+end_us=([0-9.]+)", header)
+    if not m:
+        return None
+    start, end = float(m.group(1)) / 1000.0, float(m.group(2)) / 1000.0
+    return (start, end) if end > start else None
 
 
 def drawable_label_sections(spans, flip_requests, dropped):
@@ -815,13 +831,17 @@ def jq2_section(spans, header, names=None):
         g["bounds"].append((t0, t1))
 
     queues = []
+    hw = header_window(header)
     for q in sorted(by_q):
         g = by_q[q]
         pushes, jobs, credits = g["push"], g["job"], g["credit"]
         waits, idles = g["wait"], g["idle"]
         w0 = min(t0 for t0, _ in g["bounds"])
         w1 = max(t1 for _, t1 in g["bounds"])
-        window = w1 - w0
+        # One window for every queue: the recorder's, so the shares compare; the queue's
+        # own extent only stands in when the header names no window.
+        win_start, win_end = hw if hw is not None else (w0, w1)
+        window = win_end - win_start
 
         push_end = {seq: t1 for seq, _, t1, _ in pushes}
         latency, clamped = [], 0
@@ -890,7 +910,8 @@ def jq2_section(spans, header, names=None):
 
         queues.append({
             "q": q,
-            "window": {"start_ms": w0, "end_ms": w1, "ms": window},
+            "window": {"start_ms": win_start, "end_ms": win_end, "ms": window},
+            "window_source": "header" if hw is not None else "extent",
             "pushes": len(pushes),
             "push_rate_per_s": len(pushes) / (window / 1000.0) if window > 0 else None,
             "jobs": len(jobs),
@@ -959,7 +980,8 @@ def print_jq2_section(jq):
         rate = (f"{qd['push_rate_per_s']:.2f} pushes/s" if qd["push_rate_per_s"] is not None
                 else "rate n/a")
         print(f"  queue {qd['q']}: {qd['pushes']} pushes, {qd['jobs']} jobs, {qd['workers']} workers,"
-              f" window {w['start_ms']:.2f}-{w['end_ms']:.2f} ms ({w['ms']:.2f} ms), {rate}")
+              f" window {w['start_ms']:.2f}-{w['end_ms']:.2f} ms ({w['ms']:.2f} ms,"
+              f" {qd['window_source']}), {rate}")
         stat("queue latency (push->job)", qd["queue_latency_ms"],
              f"  ({qd['queue_latency_clamped']} clamped at 0)")
         stat("execution wall (job)", qd["exec_wall_ms"])

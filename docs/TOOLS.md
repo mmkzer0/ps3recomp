@@ -789,9 +789,11 @@ A third section, **SPURS job queues** (kinds 22-26, the jq2 path in
 push rate; queue latency (`JOB` t0 - `PUSH` t1), execution wall and thread CPU
 time, completion delay (`CREDIT` t0 - `JOB` t1) and sync latency (`CREDIT` t1 to
 the blocked PPU thread running again), each with count, mean, p50/p95/p99/max;
-CPU/wall; per-worker utilisation and idle share of the queue's window and the
-number of workers seen; queue depth from the push; parks while work was
-pending; sync waits per PPU tid; and the recorder's `dropped` count from the
+CPU/wall; per-worker utilisation and idle share of the recorder's window
+(`start_us`..`end_us` from the header, one denominator for every queue; the
+queue's own span extent when the header names none, and `window_source` says
+which); the number of workers seen; queue depth from the push; parks while work
+was pending; sync waits per PPU tid; and the recorder's `dropped` count from the
 header. Push, job and credit are joined on `(q, seq)` -- `seq` counts per
 queue, so a join on it alone pairs one queue's push with another's job. Sync
 waits join on `(q, waiter)`; a fiber wait carries no waiter (`0xFF`, wake 2) and

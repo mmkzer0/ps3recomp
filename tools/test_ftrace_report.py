@@ -302,8 +302,8 @@ def qword(q, w):
     return q << 8 | w
 
 
-def jq2_trace(lines, dropped=0):
-    head = [f"# ps3_ftrace start_us=0 end_us=200000 spans=0 dropped={dropped}",
+def jq2_trace(lines, dropped=0, header=None):
+    head = [header or f"# ps3_ftrace start_us=0 end_us=200000 spans=0 dropped={dropped}",
             "T 1 main", "T 2 audio", "T 10 encoder"]
     return "\n".join(head + lines) + "\n"
 
@@ -344,7 +344,8 @@ with tempfile.TemporaryDirectory() as tmp:
     check(jq["dropped"] == 0 and [q["q"] for q in jq["queues"]] == [0, 1],
           "jq2: two queues, in queue order, no dropped spans")
     q0, q1 = jq["queues"]
-    need = {"q", "window", "pushes", "push_rate_per_s", "jobs", "workers", "queue_latency_ms",
+    need = {"q", "window", "window_source", "pushes", "push_rate_per_s", "jobs", "workers",
+            "queue_latency_ms",
             "queue_latency_clamped", "exec_wall_ms", "exec_cpu_ms", "completion_delay_ms",
             "sync_latency_ms", "cpu_wall", "per_worker", "parked_while_pending", "depth",
             "sync_wait_by_tid", "fiber_sync_wait", "join_failures"}
@@ -354,8 +355,9 @@ with tempfile.TemporaryDirectory() as tmp:
                                             "completion_delay_ms", "sync_latency_ms")),
           "jq2 latency rows carry count, mean, p50, p95, p99 and max")
     check(q0["pushes"] == 3 and q0["jobs"] == 3 and q0["workers"] == 2, "q0: 3 pushes, 3 jobs, 2 workers")
-    check(close(q0["window"]["start_ms"], 0) and close(q0["window"]["ms"], 40) and
-          close(q0["push_rate_per_s"], 75), "q0: window 0-40 ms, 75 pushes/s")
+    check(q0["window_source"] == "header" and close(q0["window"]["start_ms"], 0) and
+          close(q0["window"]["end_ms"], 200) and close(q0["window"]["ms"], 200) and
+          close(q0["push_rate_per_s"], 15), "q0: the header's 0-200 ms window, 15 pushes/s")
     lat = q0["queue_latency_ms"]
     check(lat["count"] == 3 and close(lat["mean"], 3.5 / 3) and close(lat["p50"], 1) and
           close(lat["p95"], 1.5) and close(lat["max"], 1.5), f"q0 queue latency {lat}")
@@ -374,12 +376,12 @@ with tempfile.TemporaryDirectory() as tmp:
     check(close(q0["cpu_wall"], 0.5), f"q0 cpu/wall {q0['cpu_wall']}")
     by_w = {p["w"]: p for p in q0["per_worker"]}
     check(sorted(by_w) == [0, 1] and by_w[0]["jobs"] == 2 and by_w[1]["jobs"] == 1, "q0: both workers seen")
-    check(close(by_w[0]["busy_ms"], 6) and close(by_w[0]["utilisation"], 6 / 40) and
-          close(by_w[0]["idle_ms"], 3) and close(by_w[0]["idle_fraction"], 3 / 40),
-          f"q0 worker 0 busy/idle {by_w[0]}")
-    check(close(by_w[1]["busy_ms"], 6) and close(by_w[1]["utilisation"], 6 / 40) and
-          close(by_w[1]["idle_ms"], 21.5) and close(by_w[1]["idle_fraction"], 21.5 / 40),
-          f"q0 worker 1 busy/idle {by_w[1]}")
+    check(close(by_w[0]["busy_ms"], 6) and close(by_w[0]["utilisation"], 6 / 200) and
+          close(by_w[0]["idle_ms"], 3) and close(by_w[0]["idle_fraction"], 3 / 200),
+          f"q0 worker 0 busy/idle over the header window {by_w[0]}")
+    check(close(by_w[1]["busy_ms"], 6) and close(by_w[1]["utilisation"], 6 / 200) and
+          close(by_w[1]["idle_ms"], 21.5) and close(by_w[1]["idle_fraction"], 21.5 / 200),
+          f"q0 worker 1 busy/idle over the header window {by_w[1]}")
     pk = q0["parked_while_pending"]
     check(pk["count"] == 1 and close(pk["total_ms"], 3), f"q0 parked while pending {pk}")
     dep = q0["depth"]
@@ -401,8 +403,13 @@ with tempfile.TemporaryDirectory() as tmp:
 
     # The same seq numbers in queue 1: a join on seq alone would pair these with queue 0's.
     check(q1["pushes"] == 2 and q1["jobs"] == 2 and q1["workers"] == 2, "q1: 2 pushes, 2 jobs, 2 workers")
-    check(close(q1["window"]["ms"], 15.5) and close(q1["push_rate_per_s"], 2 / 0.0155),
-          "q1: window 15.5 ms and its push rate")
+    check(q0["window"] == q1["window"] and q1["window_source"] == "header" and
+          close(q1["window"]["ms"], 200) and close(q1["push_rate_per_s"], 2 / 0.2),
+          "q1: the same header window as queue 0, 10 pushes/s")
+    by_w1 = {p["w"]: p for p in q1["per_worker"]}
+    check(close(by_w1[0]["utilisation"], 6 / 200) and close(by_w1[1]["utilisation"], 1 / 200) and
+          close(by_w1[0]["idle_fraction"], 2 / 200),
+          f"q1: utilisation over the header window, not the queue's 15.5 ms extent {q1['per_worker']}")
     check(close(q1["queue_latency_ms"]["mean"], 1.5) and close(q1["queue_latency_ms"]["p50"], 1) and
           close(q1["queue_latency_ms"]["p95"], 2) and q1["queue_latency_clamped"] == 0,
           f"q1 queue latency {q1['queue_latency_ms']}")
@@ -419,12 +426,34 @@ with tempfile.TemporaryDirectory() as tmp:
     check(rc == 0 and "SPURS job queues (jq2):" in out and "recorder dropped spans: 0" in out and
           "queue 0: 3 pushes, 3 jobs, 2 workers" in out and "queue latency (push->job)" in out and
           "cpu/wall 0.50" in out, "jq2 text: section with queue 0's counts and cpu/wall")
-    check("worker 0: 2 jobs, busy 6.00 ms = 15 %, idle 3.00 ms = 8 %" in out and
+    check("window 0.00-200.00 ms (200.00 ms, header)" in out and
           "parked while work was pending: 1 spans, 3.00 ms" in out and
           "fiber sync waits (no waiter, not joined): n 0" in out,
-          "jq2 text: worker utilisation, parked-while-pending, fiber row")
+          "jq2 text: the header window and its source, parked-while-pending, fiber row")
     check("join failures: push->job 0 (0 push without a job, 0 job without a push)" in out,
           "jq2 text: join failures")
+
+    # Without a window in the header the shares fall back to each queue's own extent.
+    rc, out, err = run(tmp, jq2_trace(jq2, header="# ps3_ftrace spans=0 dropped=0"), "--json")
+    r = json.loads(out)
+    q0, q1 = r["jq2"]["queues"]
+    check(q0["window_source"] == "extent" and q1["window_source"] == "extent" and
+          close(q0["window"]["ms"], 40) and close(q1["window"]["ms"], 15.5),
+          "jq2: a header without a window falls back to each queue's extent")
+    check(close(q0["push_rate_per_s"], 75) and close(q1["push_rate_per_s"], 2 / 0.0155),
+          "jq2: push rate over the extent when the header names no window")
+    check(close(q0["per_worker"][0]["utilisation"], 6 / 40) and
+          close(q0["per_worker"][0]["idle_fraction"], 3 / 40) and
+          close(q1["per_worker"][0]["utilisation"], 6 / 15.5),
+          "jq2: utilisation and idle follow the extent without a header window")
+    rc, out, err = run(tmp, jq2_trace(jq2, header="# ps3_ftrace spans=0 dropped=0"))
+    check(rc == 0 and "window 0.00-40.00 ms (40.00 ms, extent)" in out and
+          "worker 0: 2 jobs, busy 6.00 ms = 15 %, idle 3.00 ms = 8 %" in out,
+          "jq2 text: the extent window and its shares")
+    rc, out, err = run(tmp, jq2_trace(jq2, header="# ps3_ftrace start_us=5 end_us=5 spans=0 dropped=0"),
+                       "--json")
+    check(json.loads(out)["jq2"]["queues"][0]["window_source"] == "extent",
+          "jq2: an empty header window counts as no window")
 
     rc, out, err = run(tmp, jq2_trace(jq2, dropped=7), "--json")
     check(json.loads(out)["jq2"]["dropped"] == 7, "jq2: dropped spans come from the trace header")
@@ -459,8 +488,9 @@ with tempfile.TemporaryDirectory() as tmp:
     fib = e["fiber_sync_wait"]
     check(fib["count"] == 1 and close(fib["total_ms"], 3) and close(fib["p50"], 3) and
           close(fib["p99"], 3), f"jq2: fiber waits reported apart {fib}")
-    check(close(e["per_worker"][0]["busy_ms"], 3) and close(e["per_worker"][0]["utilisation"], 0.1),
-          "jq2: worker busy time and utilisation of the window")
+    check(close(e["per_worker"][0]["busy_ms"], 3) and close(e["per_worker"][0]["utilisation"], 3 / 200) and
+          e["window_source"] == "header",
+          "jq2: worker busy time and utilisation of the header window")
 
     # A trace without kinds 22-26 prints no section and has a null key.
     plain = [span(FLIP_REQ, 1, 0, 0, t, t) for t in (0, 20, 40)]
