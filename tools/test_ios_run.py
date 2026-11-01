@@ -10,11 +10,14 @@ The fake's log is the observable contract: which commands ran, in what
 order, with which prefixed environment.
 """
 
+import contextlib
 import fcntl
+import io
 import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -23,9 +26,13 @@ import unittest
 
 TOOL = Path(__file__).resolve().with_name("ios_run.py")
 
+sys.path.insert(0, str(TOOL.parent))
+import ios_run  # noqa: E402  (pump and decide_outcome are exercised in-process)
+
 UDID = "AAAA1111-2222-3333-4444-555566667777"
 OTHER_UDID = "BBBB1111-2222-3333-4444-555566667777"
 RUNTIME = "com.apple.CoreSimulator.SimRuntime.iOS-26-0"
+OLD_RUNTIME = "com.apple.CoreSimulator.SimRuntime.iOS-17-5"
 
 CAT = shutil.which("cat") or "/bin/cat"
 ENV = shutil.which("env") or "/usr/bin/env"
@@ -54,6 +61,7 @@ case "$1 $2" in
   "simctl spawn")
     [ -n "$FAKE_OUT" ] && @CAT@ "$FAKE_OUT"
     [ -n "$FAKE_ERR" ] && @CAT@ "$FAKE_ERR" >&2
+    [ -n "$FAKE_PIDFILE" ] && echo $$ > "$FAKE_PIDFILE"
     [ -n "$FAKE_SLEEP" ] && @SLEEP@ "$FAKE_SLEEP"
     [ -n "$FAKE_SIGNAL" ] && kill -s "$FAKE_SIGNAL" $$
     exit "${FAKE_EXIT:-0}"
@@ -77,8 +85,8 @@ exit 64
 
 REPORT_KEYS = {
     "target", "device", "bundle_id", "command", "exit_code", "signal",
-    "timed_out", "ps3stop", "expected_stop", "outcome", "log", "duration_s",
-    "load_avg", "booted_by_tool",
+    "timed_out", "ps3stop", "reader_errors", "expected_stop", "outcome",
+    "log", "duration_s", "load_avg", "booted_by_tool",
 }
 
 STOP_LINE = ("PS3STOP v=1 kind=fiber-host-context op=create reason=getcontext "
@@ -133,6 +141,9 @@ class IosRunCase(unittest.TestCase):
 
     def write_devices(self, devices):
         self.devices.write_text(json.dumps({"devices": {RUNTIME: devices}}))
+
+    def write_runtimes(self, runtimes):
+        self.devices.write_text(json.dumps({"devices": runtimes}))
 
     def artifact(self, name, text):
         path = self.root / name
@@ -335,6 +346,143 @@ class SimTest(IosRunCase):
         self.assertEqual([cmd[1:3] for cmd in self.commands()],
                          [["simctl", "list"]])
 
+    def test_name_on_several_runtimes_needs_a_udid(self):
+        self.write_runtimes({
+            RUNTIME: [{"name": "iPhone Test", "udid": UDID, "state": "Shutdown"}],
+            OLD_RUNTIME: [{"name": "iPhone Test", "udid": OTHER_UDID,
+                           "state": "Shutdown"}]})
+        result = self.run_tool("sim", "--device", "iPhone Test", "--json", "--",
+                               "prog")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertNoTraceback(result)
+        self.assertIn(UDID, result.stderr)
+        self.assertIn(OTHER_UDID, result.stderr)
+        self.assertIn("iOS-26-0", result.stderr)
+        self.assertIn("iOS-17-5", result.stderr)
+        self.assertIn("pass one UDID", result.stderr)
+        self.assertEqual([cmd[1:3] for cmd in self.commands()],
+                         [["simctl", "list"]])
+
+    def test_udid_picks_one_of_several_runtimes(self):
+        self.write_runtimes({
+            RUNTIME: [{"name": "iPhone Test", "udid": UDID, "state": "Shutdown"}],
+            OLD_RUNTIME: [{"name": "iPhone Test", "udid": OTHER_UDID,
+                           "state": "Shutdown"}]})
+        result = self.run_tool("sim", "--device", OTHER_UDID, "--json", "--",
+                               "prog")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["device"], OTHER_UDID)
+
+    def test_name_on_several_runtimes_uses_the_one_booted(self):
+        self.write_runtimes({
+            OLD_RUNTIME: [{"name": "iPhone Test", "udid": OTHER_UDID,
+                           "state": "Shutdown"}],
+            RUNTIME: [{"name": "iPhone Test", "udid": UDID, "state": "Booted"}]})
+        result = self.run_tool("sim", "--device", "iPhone Test", "--json", "--",
+                               "prog")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["device"], UDID)
+        self.assertIs(report["booted_by_tool"], False)
+        self.assertIn("using the Booted one", result.stderr)
+        self.assertIn(UDID, result.stderr)
+        self.assertEqual([cmd[1:3] for cmd in self.commands()],
+                         [["simctl", "list"], ["simctl", "spawn"]])
+
+    def test_name_on_several_booted_runtimes_needs_a_udid(self):
+        self.write_runtimes({
+            RUNTIME: [{"name": "iPhone Test", "udid": UDID, "state": "Booted"}],
+            OLD_RUNTIME: [{"name": "iPhone Test", "udid": OTHER_UDID,
+                           "state": "Booted"}]})
+        result = self.run_tool("sim", "--device", "iPhone Test", "--json", "--",
+                               "prog")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("pass one UDID", result.stderr)
+
+    def test_undecodable_output_does_not_stall_the_child(self):
+        # More than a pipe buffer follows the bad bytes: a reader that died on
+        # them would leave the child blocked until the timeout.
+        noise = (b"\x83\x41\xff\xfe not utf-8\n" + b"x" * 200 + b"\n") * 600
+        path = self.root / "binary.out"
+        path.write_bytes(noise + STOP_LINE.encode() + b"\n")
+        self.assertGreater(path.stat().st_size, 100 * 1024)
+        result = self.run_tool("sim", "--device", UDID, "--json", "--timeout",
+                               "30", "--expect-stop", "fiber-host-context",
+                               "--", "prog",
+                               env={"FAKE_OUT": str(path), "FAKE_EXIT": "70"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertIs(report["timed_out"], False)
+        self.assertEqual(report["ps3stop"]["kind"], "fiber-host-context")
+        self.assertEqual(report["reader_errors"], [])
+        self.assertIn("\ufffd", result.stderr)
+
+    @unittest.skipUnless(os.path.exists("/dev/full"), "needs /dev/full")
+    def test_log_write_failure_is_reported(self):
+        out = self.artifact("out.txt", "hello\n")
+        result = self.run_tool("sim", "--device", UDID, "--json", "--log",
+                               "/dev/full", "--", "prog", env={"FAKE_OUT": out})
+        self.assertEqual(result.returncode, 1, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["outcome"], "fail")
+        self.assertTrue(report["reader_errors"][0].startswith("log: OSError"))
+
+    def interrupted_run(self, signum):
+        """Interrupt a tool whose child sleeps; (result, child pid)."""
+        pidfile = self.root / "child.pid"
+        pidfile.unlink(missing_ok=True)
+        proc = subprocess.Popen(
+            [sys.executable, str(TOOL), "sim", "--lock", str(self.lock),
+             "--device", UDID, "--json", "--timeout", "120", "--", "prog"],
+            env={**self.env, "FAKE_SLEEP": "120", "FAKE_PIDFILE": str(pidfile)},
+            cwd=str(self.root), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True)
+        self.addCleanup(proc.kill)
+        deadline = time.monotonic() + 30
+        while not (pidfile.exists() and pidfile.read_text().endswith("\n")):
+            self.assertLess(time.monotonic(), deadline, "child never started")
+            self.assertIsNone(proc.poll(), "tool exited before the child ran")
+            time.sleep(0.02)
+        child = int(pidfile.read_text())
+        self.addCleanup(self.kill_group, child)
+        proc.send_signal(signum)
+        out, err = proc.communicate(timeout=60)
+        return subprocess.CompletedProcess(proc.args, proc.returncode, out, err), child
+
+    @staticmethod
+    def kill_group(pgid):
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(pgid, signal.SIGKILL)
+
+    def group_is_gone(self, pgid):
+        for _ in range(250):
+            try:
+                os.killpg(pgid, 0)
+            except ProcessLookupError:
+                return True
+            time.sleep(0.02)
+        return False
+
+    def test_interrupt_stops_the_child_and_cleans_up(self):
+        for name in ("SIGINT", "SIGTERM"):
+            with self.subTest(signal=name):
+                self.calls_path.unlink(missing_ok=True)
+                result, child = self.interrupted_run(getattr(signal, name))
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertNoTraceback(result)
+                self.assertIn("interrupted by " + name, result.stderr)
+                report = json.loads(result.stdout)
+                self.assertEqual(report["outcome"], "error")
+                self.assertTrue(self.group_is_gone(child),
+                                "the child's process group outlived the tool")
+                # The tool booted the simulator, so it shuts it down again.
+                self.assertEqual(self.commands()[-1][1:3], ["simctl", "shutdown"])
+                fd = os.open(self.lock, os.O_RDWR)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                finally:
+                    os.close(fd)
+
     @unittest.skipUnless(sys.platform == "darwin",
                          "lockf(1) holding a lock is a macOS test")
     def test_lock_busy_exits_2(self):
@@ -519,6 +667,83 @@ class DeviceTest(IosRunCase):
                                "5", env={"FAKE_OUT": out})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.commands()[0][-2:], ["--trials", "5"])
+
+    def test_status_printed_by_the_app_is_not_devicectls(self):
+        # The app's words come first; devicectl's epilogue is the last line.
+        result = self.launch(console="The app terminated with the exit code 0.\n"
+                             "App terminated due to signal 11.\n")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["signal"], 11)
+        self.assertIsNone(report["exit_code"])
+
+    def test_signal_text_before_a_real_exit_code(self):
+        result = self.launch(console="App terminated due to signal 11.\n"
+                             "The app terminated with the exit code 0.\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["exit_code"], 0)
+        self.assertIsNone(report["signal"])
+
+    def test_launch_failure_without_status_exits_2(self):
+        result = self.launch(console="ERROR: The device is locked.\n",
+                             env={"FAKE_LAUNCH_EXIT": "1"})
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertNoTraceback(result)
+        self.assertIn("devicectl launch exited 1", result.stderr)
+        self.assertEqual(json.loads(result.stdout)["outcome"], "error")
+
+    def test_status_line_wins_over_devicectl_exit(self):
+        result = self.launch(console="The app terminated with the exit code 7.\n",
+                             env={"FAKE_LAUNCH_EXIT": "1"})
+        self.assertEqual(result.returncode, 1, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["exit_code"], 7)
+        self.assertEqual(report["outcome"], "fail")
+
+
+class ReaderTest(unittest.TestCase):
+    def pump(self, stream, log=None):
+        watcher = ios_run.Watcher(console_status=False)
+        with contextlib.redirect_stderr(io.StringIO()):
+            ios_run.pump(stream, log, watcher)
+        return watcher
+
+    def test_a_failing_log_does_not_stop_the_drain(self):
+        class FullLog:
+            def write(self, text):
+                raise OSError(28, "No space left on device")
+
+            def flush(self):
+                pass
+
+        stream = io.BytesIO(b"\xff\n" + STOP_LINE.encode() + b"\nmore\n")
+        watcher = self.pump(stream, FullLog())
+        self.assertEqual(watcher.ps3stop["kind"], "fiber-host-context")
+        self.assertEqual(len(watcher.reader_errors), 1)
+        self.assertTrue(watcher.reader_errors[0].startswith("log: OSError"))
+        self.assertEqual(stream.read(), b"")
+
+    def test_a_failing_read_is_recorded(self):
+        class Broken:
+            def __init__(self):
+                self.lines = [STOP_LINE.encode() + b"\n"]
+
+            def readline(self):
+                if self.lines:
+                    return self.lines.pop()
+                raise OSError(5, "Input/output error")
+
+        watcher = self.pump(Broken())
+        self.assertEqual(watcher.ps3stop["kind"], "fiber-host-context")
+        self.assertTrue(watcher.reader_errors[0].startswith("read: OSError"))
+
+    def test_an_unread_output_never_passes(self):
+        report = {"timed_out": False, "expected_stop": None, "ps3stop": None,
+                  "exit_code": 0, "signal": None, "reader_errors": ["log: x"]}
+        self.assertEqual(ios_run.decide_outcome(report)[0], "fail")
+        report["reader_errors"] = []
+        self.assertEqual(ios_run.decide_outcome(report)[0], "pass")
 
 
 if __name__ == "__main__":

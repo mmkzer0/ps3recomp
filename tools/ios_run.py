@@ -26,6 +26,11 @@ program.  The value is never printed, only passed on.
 
 Exit status: 0 the run passed, 1 it failed, 2 usage or environment error.
 A usage error is a message, never a traceback.
+
+Output is decoded per line with replacement, so undecodable bytes become
+U+FFFD in the log and on stderr instead of stopping the reader.  SIGINT and
+SIGTERM stop the child's process group, shut down a simulator this run
+booted, release the lock and exit 2.
 """
 
 import argparse
@@ -78,8 +83,9 @@ Exit status:
   0  the run passed
   1  it failed: non-zero exit, a signal, a timeout, an unexpected PS3STOP,
      or a stop that was not the expected one
-  2  usage or environment error: bad arguments, xcrun missing, an unknown
-     simulator, a busy lock, a failed install
+  2  usage or environment error: bad arguments, xcrun missing, an unknown or
+     ambiguous simulator name, a busy lock, a failed install, a devicectl
+     launch that failed before the app reported a status, an interruption
 
 Examples:
   ios_run.py sim --device 'iPhone 17' -- ./build/host_fiber
@@ -92,6 +98,69 @@ class UsageError(Exception):
     """The run cannot start or cannot be set up; the CLI maps it to exit 2."""
 
 
+class Interrupted(BaseException):
+    """SIGINT or SIGTERM reached the tool; unwinding runs the cleanup.
+
+    A BaseException, like KeyboardInterrupt, so no broad `except Exception`
+    swallows it on the way to the cleanup blocks.
+    """
+
+    def __init__(self, signum):
+        super().__init__(signum)
+        self.signum = signum
+
+
+class Interrupts:
+    """SIGINT/SIGTERM as an exception in the main thread.
+
+    The child runs in its own session, so a signal sent to the tool never
+    reaches it; the exception lets run_child stop the child's group before
+    run_sim shuts the simulator down and held_lock lets go.  The first signal
+    is the only one acted on: later ones are ignored so they cannot cut the
+    cleanup short.  Inside deferring() the exception waits for the block's
+    end, so a half-finished `simctl shutdown` cannot leave a simulator up.
+    """
+
+    SIGNALS = (signal.SIGINT, signal.SIGTERM)
+
+    def __init__(self):
+        self.deferred = 0
+        self.pending = False
+        self.signum = None
+
+    def handle(self, signum, frame):
+        for sig in self.SIGNALS:
+            signal.signal(sig, signal.SIG_IGN)
+        self.signum = signum
+        if self.deferred:
+            self.pending = True
+            return
+        raise Interrupted(signum)
+
+    @contextlib.contextmanager
+    def installed(self):
+        previous = [(sig, signal.signal(sig, self.handle)) for sig in self.SIGNALS]
+        try:
+            yield
+        finally:
+            for sig, handler in previous:
+                signal.signal(sig, handler)
+
+    @contextlib.contextmanager
+    def deferring(self):
+        self.deferred += 1
+        try:
+            yield
+        finally:
+            self.deferred -= 1
+            if not self.deferred and self.pending:
+                self.pending = False
+                raise Interrupted(self.signum)
+
+
+INTERRUPTS = Interrupts()
+
+
 @dataclass
 class Observation:
     """What one child run showed: its status and the stop it printed."""
@@ -100,21 +169,31 @@ class Observation:
     signal: int | None
     timed_out: bool
     ps3stop: dict | None
+    reader_errors: list
 
 
 class Watcher:
     """Per-line observations from the child's merged output.
 
     The stream is parsed while it is copied, so a stop or a devicectl status
-    line is kept even when no log is written.  Only the first of each is
-    kept: a run has one outcome, and the first stop is the one that ended it.
+    line is kept even when no log is written.  Only the first stop is kept: a
+    run has one outcome, and the first stop is the one that ended it.  The
+    devicectl status is the last status line instead: it is devicectl's
+    epilogue, printed after the app has ended, so an app that prints the same
+    words earlier cannot pose as the status.
+
+    Anything the reader itself fails on is recorded in reader_errors and the
+    drain goes on; decide_outcome turns a pass into a fail.
     """
+
+    MAX_READER_ERRORS = 8
 
     def __init__(self, console_status):
         self.console_status = console_status
         self.ps3stop = None
-        self.console_exit = None
-        self.console_signal = None
+        self.console = None
+        self.reader_errors = []
+        self.closing = False
 
     def feed(self, line):
         text = line.rstrip("\r\n")
@@ -122,10 +201,19 @@ class Watcher:
             self.ps3stop = parse_stop(text)
         if not self.console_status:
             return
-        if self.console_exit is None:
-            self.console_exit = matched_int(DEVICE_EXIT_RE, text)
-        if self.console_signal is None:
-            self.console_signal = matched_int(DEVICE_SIGNAL_RE, text)
+        code = matched_int(DEVICE_EXIT_RE, text)
+        if code is not None:
+            self.console = ("exit", code)
+        sig = matched_int(DEVICE_SIGNAL_RE, text)
+        if sig is not None:
+            self.console = ("signal", sig)
+
+    def note_error(self, where, exc):
+        message = "%s: %s: %s" % (where, type(exc).__name__, exc)
+        if (message not in self.reader_errors
+                and len(self.reader_errors) < self.MAX_READER_ERRORS):
+            self.reader_errors.append(message)
+            emit_stderr("ios_run.py: warning: reader %s\n" % message)
 
 
 def matched_int(pattern, text):
@@ -269,11 +357,17 @@ def held_lock(path, wait_s):
         os.close(fd)
 
 
+def short_runtime(runtime):
+    return runtime.rsplit(".SimRuntime.", 1)[-1]
+
+
 def resolve_device(xcrun, device):
     """(udid, state) for a simulator UDID or an exact device name.
 
-    Names repeat across installed runtimes, so matches are ordered by
-    (runtime, udid) and the first one wins.
+    A name can exist on several installed runtimes, and the lowest runtime
+    id is not the one a program was built for.  Several matches are therefore
+    an environment error naming them, unless exactly one is Booted: that one
+    is in use already and is taken, with a note.
     """
     result = capture([xcrun, "simctl", "list", "devices", "available", "--json"])
     if result.returncode != 0:
@@ -292,7 +386,19 @@ def resolve_device(xcrun, device):
     if not matches:
         raise UsageError("device not found: %s" % device)
     matches.sort()
-    return matches[0][1], matches[0][2]
+    if len(matches) == 1:
+        return matches[0][1], matches[0][2]
+    booted = [match for match in matches if match[2] == "Booted"]
+    if len(booted) == 1:
+        runtime, udid, state = booted[0]
+        print("ios_run.py: note: %s matches %d simulators; using the Booted "
+              "one, %s on %s" % (device, len(matches), udid,
+                                 short_runtime(runtime)), file=sys.stderr)
+        return udid, state
+    candidates = ", ".join("%s on %s (%s)" % (udid, short_runtime(runtime), state)
+                           for runtime, udid, state in matches)
+    raise UsageError("device name %s matches %d simulators: %s; pass one UDID"
+                     % (device, len(matches), candidates))
 
 
 def signal_group(proc, sig):
@@ -305,6 +411,16 @@ def signal_group(proc, sig):
         pass
 
 
+def stop_group(proc):
+    """SIGTERM the child's group, then SIGKILL it after the grace period."""
+    signal_group(proc, signal.SIGTERM)
+    try:
+        proc.wait(timeout=KILL_GRACE_S)
+    except subprocess.TimeoutExpired:
+        signal_group(proc, signal.SIGKILL)
+        proc.wait()
+
+
 def wait_child(proc, timeout):
     """Wait for the child; on timeout stop its group. -> timed_out."""
     try:
@@ -312,12 +428,7 @@ def wait_child(proc, timeout):
         return False
     except subprocess.TimeoutExpired:
         pass
-    signal_group(proc, signal.SIGTERM)
-    try:
-        proc.wait(timeout=KILL_GRACE_S)
-    except subprocess.TimeoutExpired:
-        signal_group(proc, signal.SIGKILL)
-        proc.wait()
+    stop_group(proc)
     return True
 
 
@@ -331,52 +442,99 @@ def emit_stderr(line):
 
 
 def pump(stream, log, watcher):
-    """Copy the merged output to the log and to stderr, parsing each line."""
-    try:
-        for line in stream:
-            if log is not None:
+    """Copy the merged output to the log and to stderr, parsing each line.
+
+    Bytes are decoded per line with replacement: the guest writes raw bytes
+    (Shift-JIS, a cut multibyte string), and a strict decoder would end the
+    reader, leave the pipe undrained and stall the child.  A failure in one
+    sink is recorded and the others and the drain carry on.
+    """
+    while True:
+        try:
+            raw = stream.readline()
+        except Exception as exc:
+            # run_child closes the pipe itself once the child is gone.
+            if not watcher.closing:
+                watcher.note_error("read", exc)
+            return
+        if not raw:
+            return
+        line = raw.decode("utf-8", errors="replace")
+        if log is not None:
+            try:
                 log.write(line)
                 log.flush()
+            except Exception as exc:
+                watcher.note_error("log", exc)
+                log = None
+        try:
             watcher.feed(line)
-            emit_stderr(line)
-    except (OSError, ValueError):
-        pass
+        except Exception as exc:
+            watcher.note_error("parse", exc)
+        emit_stderr(line)
+
+
+def describe_status(status):
+    """A child's wait status as a sentence part."""
+    if status < 0:
+        return "was killed by signal %d" % -status
+    return "exited %d" % status
 
 
 def observation(status, timed_out, watcher):
-    """The run's status, from the child for sim and its console for device."""
+    """The run's status, from the child for sim and its console for device.
+
+    devicectl that fails before the app ran (device locked, app missing, bad
+    bundle id) prints no status line and exits non-zero: that is the
+    environment, not a failed program, so it is exit 2.
+    """
+    code = sig = None
     if timed_out:
-        return Observation(None, None, True, watcher.ps3stop)
-    if watcher.console_status:
-        return Observation(watcher.console_exit, watcher.console_signal, False,
-                           watcher.ps3stop)
-    if status < 0:
-        return Observation(None, -status, False, watcher.ps3stop)
-    return Observation(status, None, False, watcher.ps3stop)
+        pass
+    elif watcher.console_status:
+        if watcher.console is not None:
+            kind, number = watcher.console
+            code, sig = (number, None) if kind == "exit" else (None, number)
+        elif status != 0:
+            raise UsageError("devicectl launch %s before the app reported a "
+                             "status" % describe_status(status))
+    elif status < 0:
+        sig = -status
+    else:
+        code = status
+    return Observation(code, sig, timed_out, watcher.ps3stop,
+                       list(watcher.reader_errors))
 
 
 def run_child(command, env, timeout, log, watcher):
     """Run the child, merging its output, and observe it.
 
     The child gets its own session, so a timeout can stop the whole process
-    group and cannot reach this tool.  The reader drains the pipe; wait()
+    group and cannot reach this tool; an interruption of the tool stops the
+    group here for the same reason.  The reader drains the pipe; wait()
     therefore never blocks on a full pipe.
     """
     try:
         proc = subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, bufsize=1, start_new_session=True)
+                                start_new_session=True)
     except OSError as exc:
         raise UsageError("cannot run %s: %s" % (command[0], exc.strerror or exc))
     reader = threading.Thread(target=pump, args=(proc.stdout, log, watcher),
                               daemon=True)
     reader.start()
-    timed_out = wait_child(proc, timeout)
-    reader.join(timeout=READER_JOIN_S)
     try:
-        proc.stdout.close()
-    except (OSError, ValueError):
-        pass
+        timed_out = wait_child(proc, timeout)
+    except BaseException:
+        stop_group(proc)
+        raise
+    finally:
+        reader.join(timeout=READER_JOIN_S)
+        watcher.closing = True
+        try:
+            proc.stdout.close()
+        except (OSError, ValueError):
+            pass
     return observation(proc.returncode, timed_out, watcher)
 
 
@@ -385,6 +543,7 @@ def apply_observation(report, observed):
     report["signal"] = observed.signal
     report["timed_out"] = observed.timed_out
     report["ps3stop"] = observed.ps3stop
+    report["reader_errors"] = observed.reader_errors
 
 
 def shutdown(xcrun, udid):
@@ -399,13 +558,14 @@ def run_sim(args, report, xcrun, log):
     udid, state = resolve_device(xcrun, args.device)
     report["device"] = udid
     booted_here = state == "Shutdown"
-    if booted_here:
-        require_step([xcrun, "simctl", "boot", udid], "simctl boot")
     report["booted_by_tool"] = booted_here
     command = [xcrun, "simctl", "spawn", udid] + args.child
     report["command"] = command
+    # The boot is inside the try: an interruption during `simctl boot` can
+    # leave a simulator booting, and only the finally block shuts it down.
     try:
         if booted_here:
+            require_step([xcrun, "simctl", "boot", udid], "simctl boot")
             require_step([xcrun, "simctl", "bootstatus", udid, "-b"],
                          "simctl bootstatus")
         watcher = Watcher(console_status=False)
@@ -414,7 +574,8 @@ def run_sim(args, report, xcrun, log):
             log, watcher))
     finally:
         if booted_here and not args.keep_booted:
-            shutdown(xcrun, udid)
+            with INTERRUPTS.deferring():
+                shutdown(xcrun, udid)
 
 
 def run_device(args, report, xcrun, log):
@@ -448,7 +609,18 @@ def decide_stop(report):
 
 
 def decide_outcome(report):
-    """(outcome, reason) for a run that reached the child."""
+    """(outcome, reason) for a run that reached the child.
+
+    A run whose output could not be read completely never passes: the stop or
+    status it would be judged on may be the part that was lost.
+    """
+    outcome, reason = decide_observed(report)
+    if outcome == "pass" and report["reader_errors"]:
+        return "fail", "output not fully read: " + report["reader_errors"][0]
+    return outcome, reason
+
+
+def decide_observed(report):
     if report["timed_out"]:
         return "fail", "timed out"
     if report["expected_stop"] is not None:
@@ -471,6 +643,7 @@ def new_report(args):
         "signal": None,
         "timed_out": False,
         "ps3stop": None,
+        "reader_errors": [],
         "expected_stop": args.expect_stop,
         "outcome": "error",
         "log": os.path.abspath(args.log) if args.log else None,
@@ -592,14 +765,18 @@ def main(argv=None):
     log = None
     reason = ""
     try:
-        if args.target == "sim" and not args.child:
-            raise UsageError("sim: missing program after '--'")
-        parse_env(args.env)
-        log = open_log(args.log)
-        run_target(args, report, log)
-        report["outcome"], reason = decide_outcome(report)
+        with INTERRUPTS.installed():
+            if args.target == "sim" and not args.child:
+                raise UsageError("sim: missing program after '--'")
+            parse_env(args.env)
+            log = open_log(args.log)
+            run_target(args, report, log)
+            report["outcome"], reason = decide_outcome(report)
     except UsageError as exc:
         report["outcome"], reason = "error", str(exc)
+    except Interrupted as exc:
+        report["outcome"] = "error"
+        reason = "interrupted by %s" % signal.Signals(exc.signum).name
     finally:
         if log is not None:
             log.close()

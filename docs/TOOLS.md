@@ -811,14 +811,35 @@ python tools/ios_run.py device --udid UDID --bundle-id com.example.title --json
 ```
 
 `sim` resolves the device by UDID or exact name from
-`xcrun simctl list devices available --json`, boots it when it is
-`Shutdown` (`boot` then `bootstatus -b`), spawns the program with
-`xcrun simctl spawn`, and shuts that simulator down again unless
-`--keep-booted` — also after a timeout or a failure. `devicectl`'s own exit
-status is not the app's, so `device` reads the app's exit code or signal from
-the console text (`The app terminated with the exit code N.`,
-`App terminated due to signal N.`); a run that prints neither line is a
-failure with no status.
+`xcrun simctl list devices available --json`. A name that exists on several
+installed runtimes is an environment error (exit 2) that lists the
+candidates and asks for a UDID, unless exactly one of them is `Booted`: that
+one is used and a note on stderr says so. A `Shutdown` simulator is booted
+(`boot` then `bootstatus -b`), the program is spawned with
+`xcrun simctl spawn`, and the simulator the tool booted is shut down again
+unless `--keep-booted` — also after a timeout, a failure or an interruption.
+`devicectl`'s own exit status is not the app's, so `device` reads the app's
+exit code or signal from the console text (`The app terminated with the exit
+code N.`, `App terminated due to signal N.`). The status is the **last** such
+line, devicectl's epilogue, so an app that prints those words earlier cannot
+pose as its own status. A run that prints neither line is a failure with no
+status when `devicectl` itself exited 0. When `devicectl` exited non-zero and
+printed no status line, the launch failed before the app reported anything
+(device locked, app not installed, wrong bundle id): that is exit 2, not a
+failed program.
+
+Output is decoded per line with replacement, so bytes that are not UTF-8
+(a guest writing Shift-JIS) appear as U+FFFD in the log and on stderr and
+never stop the reader. A failure inside the reader (a full log disk, say) is
+written to stderr, listed in the report's `reader_errors`, and the drain
+continues; a run with `reader_errors` never passes, because the stop or
+status it is judged on may be the part that was lost.
+
+SIGINT and SIGTERM stop the child's process group (SIGTERM, then SIGKILL
+after 10 s), shut down a simulator the run booted, release the lock only
+after the child is gone, and exit 2 with `outcome` `error` and the reason
+`interrupted by SIGINT` or `SIGTERM`. A second signal during that cleanup is
+ignored so it cannot cut the cleanup short.
 
 `--env K=V` becomes `SIMCTL_CHILD_K=V` or `DEVICECTL_CHILD_K=V`, the prefixes
 the platform tools strip before starting the program. Values are never
@@ -837,12 +858,15 @@ stop fails the run: a stop is a refusal, not a pass.
 
 `--json` writes exactly one object to stdout: `target`, `device`,
 `bundle_id`, `command`, `exit_code`, `signal`, `timed_out`, `ps3stop`,
-`expected_stop`, `outcome` (`pass`, `fail`, `error`), `log`, `duration_s`,
-`load_avg` and `booted_by_tool`. Without it, one summary line goes to stderr.
+`reader_errors`, `expected_stop`, `outcome` (`pass`, `fail`, `error`), `log`,
+`duration_s`, `load_avg` and `booted_by_tool`. Without it, one summary line
+goes to stderr.
 
 Exit status: `0` the run passed, `1` it failed, `2` usage or environment
-error (bad arguments, `xcrun` missing, unknown simulator, busy lock, failed
-install). A usage error is a message, never a traceback.
+error (bad arguments, `xcrun` missing, unknown or ambiguous simulator, busy
+lock, failed install, a `devicectl` launch that failed before the app
+reported a status, an interruption). A usage error is a message, never a
+traceback.
 `tools/test_ios_run.py` proves the contract against a fake `xcrun` and never
 touches a simulator or a device.
 
