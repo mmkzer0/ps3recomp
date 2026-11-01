@@ -1023,8 +1023,9 @@ s32 cellAudioPortStart(u32 portNum)
 
     mutex_lock(&s_audio_mutex);
     s_ports[portNum].running = 1;
+    s_audio_port_prev_non_silent[portNum] = 0;
+    s_audio_port_unrefill_run[portNum] = 0;
     mutex_unlock(&s_audio_mutex);
-
     return CELL_OK;
 }
 
@@ -1045,6 +1046,7 @@ s32 cellAudioPortStop(u32 portNum)
     s_ports[portNum].running = 0;
     s_audio_port_prev_non_silent[portNum] = 0;
     s_audio_port_unrefill_run[portNum] = 0;
+    mutex_unlock(&s_audio_mutex);
 
     return CELL_OK;
 }
