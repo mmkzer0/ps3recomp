@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ftrace_report: frame binning, import call sites, split, cadence, drawables, label-store waits, jq2 job queues, bad input."""
+"""ftrace_report: frame binning, import call sites, split, cadence, drawables, label-store waits, jq2 job queues, image identity and critical path, bad input."""
 import json
 import subprocess
 import sys
@@ -672,6 +672,446 @@ with tempfile.TemporaryDirectory() as tmp:
           legacy["park_reasons"] == [] and legacy["barriers"] is None and
           legacy["counts_over_time"] is None and legacy["depth_buckets"] is None,
           "jq2 legacy: the decomposition keys carry nothing")
+
+# Kinds 29 + J lines: job image identity, the critical path of every event-flag wait, the image
+# ranking and the audio stale attribution. Every scenario is hand-counted; each critical-path row
+# also asserts that its partition sums to the wait's total, so the invariant is checked per wait
+# (each synthetic wait is the only one of its thread).
+JQ2_IMAGE = 29
+FP_A, FP_B, FP_X = "00000000000000a1", "00000000000000c3", "00000000000000b2"
+IMG_HEADER = ("# ps3_ftrace start_us=0 end_us=200000 spans=0 dropped=0"
+              " jq2_images=2 jq2_image_overflow=0")
+
+
+def cp_row(r, tid=1, total=None):
+    rows = [row for row in r["jq2"]["critical_path"]["rows"] if row["tid"] == tid]
+    check(len(rows) == 1, f"one critical-path row for tid {tid}: {len(rows)}")
+    row = rows[0]
+    parts = row["partition_ms"]
+    check(close(sum(parts.values()), row["total_ms"]),
+          f"tid {tid}: the partition sums to the wait ({sum(parts.values())} vs {row['total_ms']})")
+    if total is not None:
+        check(close(row["total_ms"], total), f"tid {tid}: wait total {row['total_ms']} vs {total}")
+    return row
+
+
+# A barrier chain: job A is held on tag 0 until t=10; the BARRIER at t1=10 was released by worker 0
+# after job X ended at 9. A waits (1-20) and its due credit names A. The walk pays X's exec and the
+# barrier release, not just A's.
+barrier = [span(FLIP_REQ, 1, 0, 0, t, t) for t in (0, 100, 200)]
+barrier += [
+    span(JQ2_PUSH, 1, 1, 0 | 1 << 8, 0, 1),                        # job X: pushed, never held
+    span(JQ2_PUSH, 1, 2, 0 | 1 << 8, 0.5, 1.5),                    # job A: held by the barrier
+    span(JQ2_JOB, qword(0, 0), 1, 1000, 4, 9),                     # X: 0.5 ms identification
+    span(JQ2_IMAGE, qword(0, 0), 1, 1, 4.5, 5),
+    span(JQ2_JOB, qword(0, 0), 2, 2000, 11, 15),                   # A: 0.5 ms identification
+    span(JQ2_IMAGE, qword(0, 0), 2, 0, 11.5, 12),
+    span(JQ2_HELD, qword(0, 0), 2, 0 | 1 << 4 | 1 << 8, 0.5, 10),  # tag 0, cause 1, mask 0x0001
+    span(JQ2_BARRIER, qword(0, 0), 1 | 1 << 16, 0 | 1 << 8, 9, 10),
+    span(JQ2_CREDIT, qword(0, 0), 2, 5 | EVF << 8 | 1 << 16, 15.5, 16),
+    span(JQ2_SYNC_WAIT, 1, 5 | EVF << 8, 0, 1, 20),
+    span(AUDIO_STALE, 0, 7, 1, 12, 12),                            # run 1: inside the wait
+    span(AUDIO_STALE, 1, 9, 3, 25, 25),                            # run 3: after it
+    f"J 0 {FP_A} 00100000 4096",
+    f"J 1 {FP_X} 00200000 2048",
+]
+
+with tempfile.TemporaryDirectory() as tmp:
+    rc, out, err = run(tmp, jq2_trace(barrier, header=IMG_HEADER), "--json")
+    check(rc == 0, f"image barrier chain: exit 0: {err}")
+    r = json.loads(out)
+    jq = r["jq2"]
+    check(jq["images_available"] is True and jq["incomplete"] is False and
+          jq["jq2_images"] == 2 and jq["jq2_image_overflow"] == 0,
+          "image trace: header counters, complete")
+    row = cp_row(r, 1, 19)
+    p = row["partition_ms"]
+    check(close(p["credit_wake"], 5) and close(p["exec"], 8) and close(p["trace"], 1) and
+          close(p["admission"], 4) and close(p["parked"], 0) and
+          close(p["barrier_release"], 1) and close(p["push"], 0) and close(p["unresolved"], 0),
+          f"barrier chain partition {p}")
+    check(row["waits"] == 1 and row["fiber_waits"] == 0 and row["waits_without_credit"] == 0 and
+          close(row["mean_chain"], 2) and row["guard_hits"] == 0, "barrier chain counts")
+    check(close(row["partition_share"]["exec"], 8 / 19) and
+          close(row["partition_share"]["credit_wake"], 5 / 19), "barrier chain shares")
+    check(close(jq["critical_path"]["total_ms"], 19) and
+          jq["critical_path"]["per_queue"][0]["waits"] == 1,
+          "critical path: queue and overall totals")
+
+    imgs = jq["images"]
+    check(len(imgs["per_queue"]) == 1 and imgs["per_queue"][0]["q"] == 0, "images: one queue")
+    rows = {x["fingerprint"]: x for x in imgs["per_queue"][0]["rows"]}
+    a, x = rows[FP_A], rows[FP_X]
+    check(a["jobs"] == 1 and close(a["exec_wall_ms"]["total_ms"], 3.5) and
+          close(a["exec_wall_ms"]["mean_ms"], 3.5) and close(a["exec_wall_ms"]["p50_ms"], 3.5) and
+          close(a["exec_wall_ms"]["p95_ms"], 3.5) and close(a["cpu_ms"], 2),
+          f"image A: exec wall is JOB minus IMAGE, CPU is JOB.b {a}")
+    check(close(a["queue_latency_mean_ms"], 9.5) and close(a["held_mean_ms"], 9.5) and
+          close(a["ready_mean_ms"], 1), f"image A: latency, held and ready means {a}")
+    check(close(a["critical_path_ms"], 3.5) and close(a["critical_path_share"], 3.5 / 19) and
+          close(x["critical_path_ms"], 4.5) and close(x["critical_path_share"], 4.5 / 19),
+          "images: critical path is the exec time charged by the walks")
+    check(x["cp_rank"] == 1 and a["cp_rank"] == 2 and a["cpu_rank"] == 1 and x["cpu_rank"] == 2,
+          f"images: CP rank and CPU rank side by side; A {a['cp_rank']}/{a['cpu_rank']},"
+          f" X {x['cp_rank']}/{x['cpu_rank']}")
+    check(x["variants"] == [{"ea": 0x200000, "bytes": 2048}] and x["queues"] == [0],
+          f"image X: variant and queue {x['variants']}")
+    check(imgs["overall"][0]["fingerprint"] == FP_X and
+          imgs["overall"][1]["fingerprint"] == FP_A,
+          "images: overall table sorted by critical path")
+
+    aud = jq["audio_stale"]
+    check(aud["count"] == 2 and aud["blocks_in_wait"] == 1 and aud["blocks_not_in_wait"] == 1 and
+          aud["runs"] == 2 and aud["blocks"] == 4 and aud["runs_ge_2_blocks"] == 1 and
+          aud["open_at_start"] == 1,
+          f"audio stale: two blocks, one run of 1 and one open run of 3 {aud}")
+    check(len(aud["threads"]) == 1 and aud["threads"][0]["tid"] == 1 and
+          aud["threads"][0]["blocks_in_wait"] == 1 and
+          aud["threads"][0]["blocks_not_in_wait"] == 1 and
+          aud["threads"][0]["waits"] == 1, f"audio stale: per-thread counts {aud['threads']}")
+    ev = aud["events"][0]
+    check(ev["run_pos"] == 1 and ev["run_len"] == 1 and close(ev["run_ms"], 16 / 3) and
+          ev["band"] == "1" and
+          len(ev["waits"]) == 1 and ev["waits"][0]["q"] == 0 and ev["waits"][0]["seq"] == 2 and
+          ev["waits"][0]["terminal"]["fingerprint"] == FP_A and
+          ev["waits"][0]["dominant"]["fingerprint"] == FP_X and
+          close(ev["waits"][0]["waited_ms"], 11),
+          f"audio stale: terminal job and dominant image {ev}")
+    check(aud["events"][1]["waits"] == [] and aud["events"][1]["run_pos"] == 3 and
+          aud["events"][1]["run_len"] == 3 and aud["events"][1]["band"] == "3-4",
+          "audio stale: the block after the wait keeps its position and open run")
+    fps = {f["fingerprint"]: f for f in aud["fingerprints"]}
+    check(fps[FP_A]["terminal_blocks"] == 1 and fps[FP_A]["dominant_blocks"] == 0 and
+          fps[FP_X]["terminal_blocks"] == 0 and fps[FP_X]["dominant_blocks"] == 1,
+          f"audio stale: per-fingerprint block counts {aud['fingerprints']}")
+    hist = {h["band"]: h for h in aud["histogram"]}
+    check(hist["1"]["runs"] == 1 and hist["1"]["blocks"] == 1 and
+          hist["3-4"]["runs"] == 1 and hist["3-4"]["blocks"] == 3 and
+          close(hist["3-4"]["ms"], 3 * 16 / 3) and close(hist["9+"]["ms"], 0),
+          f"audio stale: run-length histogram counts runs, blocks are run lengths {hist}")
+
+    tc = jq["trace_cost"]
+    check(tc["dropped"] == 0 and tc["jq2_images"] == 2 and tc["jq2_image_overflow"] == 0 and
+          len(tc["image_ms"]) == 1 and tc["image_ms"][0]["q"] == 0 and
+          close(tc["image_ms"][0]["image_ms"], 1) and close(tc["image_ms"][0]["job_ms"], 9) and
+          close(tc["image_ms"][0]["share"], 1 / 9),
+          f"trace cost: IMAGE spans as a share of the queue's JOB time {tc}")
+
+    rc, out, err = run(tmp, jq2_trace(barrier, header=IMG_HEADER))
+    check(rc == 0 and "critical path of blocking waits" in out and
+          "credit+wake 5.00 ms (26 %)" in out and "barrier-release 1.00 ms (5 %)" in out and
+          "job images by fingerprint" in out and "CP rank 2, CPU rank 1" in out and
+          "audio stale attribution" in out and
+          f"terminal {FP_A}" in out and f"dominant {FP_X}" in out and
+          "image identification cost" in out and "q0: 1.00 ms of 9.00 ms job time = 11 %" in out,
+          "image text report: the new sections")
+
+    # AUDIO_STALE is one event per not-refilled block with b = its position in the run: port 0
+    # has a 3-block run then a 1-block run, port 1 a 2-block run interleaved with it, and port 2
+    # opens with b = 3 (a run that began before the window). The histogram is runs per band;
+    # its blocks are the run lengths, so the open run's earlier blocks count too.
+    blockstale = [span(FLIP_REQ, 1, 0, 0, t, t) for t in (0, 100, 200)]
+    blockstale += [
+        span(JQ2_PUSH, 1, 1, 0 | 1 << 8, 0, 1),
+        span(JQ2_JOB, qword(0, 0), 1, 1000, 2, 6),
+        span(JQ2_IMAGE, qword(0, 0), 1, 0, 2.2, 2.4),
+        span(JQ2_CREDIT, qword(0, 0), 1, 5 | EVF << 8 | 1 << 16, 6.2, 6.5),
+        span(JQ2_SYNC_WAIT, 1, 5 | EVF << 8, 0, 1, 10),
+        span(AUDIO_STALE, 0, 10, 1, 2, 2),                         # port 0 run 3, block 1
+        span(AUDIO_STALE, 1, 20, 1, 2.5, 2.5),                     # port 1 run 2, block 1
+        span(AUDIO_STALE, 0, 11, 2, 3, 3),                         # port 0 run 3, block 2
+        span(AUDIO_STALE, 1, 21, 2, 3.5, 3.5),                     # port 1 run 2, block 2
+        span(AUDIO_STALE, 0, 12, 3, 4, 4),                         # port 0 run 3, block 3
+        span(AUDIO_STALE, 2, 30, 3, 6, 6),                         # port 2: opened before 0
+        span(AUDIO_STALE, 0, 13, 1, 12, 12),                       # port 0: 1-block run
+        f"J 0 {FP_A} 00100000 4096",
+    ]
+    rc, out, err = run(tmp, jq2_trace(blockstale, header=IMG_HEADER), "--json")
+    check(rc == 0, f"stale runs: exit 0: {err}")
+    aud = json.loads(out)["jq2"]["audio_stale"]
+    check(aud["count"] == 7 and aud["runs"] == 4 and aud["blocks"] == 9 and
+          aud["runs_ge_2_blocks"] == 3 and aud["open_at_start"] == 1,
+          f"stale runs: 7 blocks, 4 runs, 9 run-length blocks, 3 of 2+ and 1 open {aud}")
+    check(aud["blocks_in_wait"] == 6 and aud["blocks_not_in_wait"] == 1,
+          f"stale runs: attribution stays per block {aud['blocks_in_wait']}/"
+          f"{aud['blocks_not_in_wait']}")
+    th = aud["threads"][0]
+    check(th["tid"] == 1 and th["waits"] == 1 and th["blocks_in_wait"] == 6 and
+          th["blocks_not_in_wait"] == 1, f"stale runs: per-thread blocks {th}")
+    hist = {h["band"]: h for h in aud["histogram"]}
+    check(hist["1"]["runs"] == 1 and hist["1"]["blocks"] == 1 and
+          hist["2"]["runs"] == 1 and hist["2"]["blocks"] == 2 and
+          hist["3-4"]["runs"] == 2 and hist["3-4"]["blocks"] == 6 and
+          hist["5-8"]["runs"] == 0 and hist["9+"]["runs"] == 0 and
+          close(hist["3-4"]["ms"], 32) and
+          sum(h["blocks"] for h in hist.values()) == 9,
+          f"stale runs: band runs and run-length blocks {hist}")
+    ports = {p["port"]: p for p in aud["per_port"]}
+    check(ports[0]["runs"] == 2 and ports[0]["blocks"] == 4 and
+          ports[0]["runs_ge_2_blocks"] == 1 and ports[0]["open_at_start"] == 0 and
+          ports[1]["runs"] == 1 and ports[1]["blocks"] == 2 and
+          ports[1]["runs_ge_2_blocks"] == 1 and
+          ports[2]["runs"] == 1 and ports[2]["blocks"] == 3 and
+          ports[2]["runs_ge_2_blocks"] == 1 and ports[2]["open_at_start"] == 1,
+          f"stale runs: per-port runs, blocks, 2+ and open at start {aud['per_port']}")
+    check(len(aud["events"]) == 7 and
+          aud["events"][0]["port"] == 0 and aud["events"][0]["run_pos"] == 1 and
+          aud["events"][0]["run_len"] == 3 and aud["events"][0]["band"] == "3-4" and
+          aud["events"][2]["run_pos"] == 2 and aud["events"][3]["port"] == 1 and
+          aud["events"][3]["run_pos"] == 2 and aud["events"][3]["run_len"] == 2 and
+          aud["events"][5]["port"] == 2 and aud["events"][5]["run_pos"] == 3 and
+          aud["events"][5]["run_len"] == 3 and aud["events"][6]["run_pos"] == 1 and
+          aud["events"][6]["run_len"] == 1 and aud["events"][6]["waits"] == [],
+          "stale runs: each block keeps its run position and its run's length")
+    fps = {f["fingerprint"]: f for f in aud["fingerprints"]}
+    check(fps[FP_A]["terminal_blocks"] == 6 and fps[FP_A]["dominant_blocks"] == 6,
+          f"stale runs: fingerprint block counts {aud['fingerprints']}")
+    rc, out, err = run(tmp, jq2_trace(blockstale, header=IMG_HEADER))
+    check(rc == 0 and
+          "runs: 4, 9 block(s), 3 run(s) of 2+ blocks (10.67 ms or more),"
+          " 1 open at the start" in out and
+          "run length 3-4:    2 run(s),      6 block(s),     32.00 ms" in out and
+          "port 2: 1 run(s), 3 block(s), 1 of 2+ blocks, 1 open at the start" in out and
+          "run pos 3 of 3" in out, "stale runs text: runs, bands, per port, positions")
+
+    # Base rate: a thread waits 5 of the 10 ms window (half), so 2 of 4 stale blocks in its
+    # waits is exactly chance. The two waits' terminal jobs split that 5 ms as 3 ms of fpA and
+    # 2 ms of fpB, so fpA expects 1.2 blocks and fpB 0.8.
+    base = [span(FLIP_REQ, 1, 0, 0, t, t) for t in (0, 5, 10)]
+    base += [
+        span(JQ2_PUSH, 1, 1, 0 | 1 << 8, 0, 0.5),
+        span(JQ2_JOB, qword(0, 0), 1, 1000, 1.5, 3.5),
+        span(JQ2_IMAGE, qword(0, 0), 1, 0, 1.8, 2),
+        span(JQ2_CREDIT, qword(0, 0), 1, 5 | EVF << 8 | 1 << 16, 3.6, 3.9),
+        span(JQ2_SYNC_WAIT, 1, 5 | EVF << 8, 0, 1, 4),             # 3 ms, terminal fpA
+        span(JQ2_PUSH, 1, 2, 0 | 1 << 8, 4.8, 5.1),
+        span(JQ2_JOB, qword(0, 0), 2, 1000, 5.2, 6.5),
+        span(JQ2_IMAGE, qword(0, 0), 2, 1, 5.4, 5.6),
+        span(JQ2_CREDIT, qword(0, 0), 2, 6 | EVF << 8 | 1 << 16, 6.6, 6.9),
+        span(JQ2_SYNC_WAIT, 1, 6 | EVF << 8, 0, 5, 7),             # 2 ms, terminal fpB
+        span(AUDIO_STALE, 0, 1, 1, 2, 2),                          # in W1
+        span(AUDIO_STALE, 0, 2, 1, 3, 3),                          # in W1
+        span(AUDIO_STALE, 0, 3, 1, 8, 8),                          # outside both
+        span(AUDIO_STALE, 0, 4, 1, 9, 9),                          # outside both
+        f"J 0 {FP_A} 00100000 4096", f"J 1 {FP_B} 00200000 32",
+    ]
+    base_header = ("# ps3_ftrace start_us=0 end_us=10000 spans=0 dropped=0"
+                   " jq2_images=2 jq2_image_overflow=0")
+    rc, out, err = run(tmp, jq2_trace(base, header=base_header), "--json")
+    check(rc == 0, f"base rate: exit 0: {err}")
+    aud = json.loads(out)["jq2"]["audio_stale"]
+    check(aud["window"]["source"] == "header" and close(aud["window"]["ms"], 10),
+          f"base rate: the header window {aud['window']}")
+    th = aud["threads"][0]
+    check(th["waits"] == 2 and th["blocks_in_wait"] == 2 and th["blocks_not_in_wait"] == 2 and
+          close(th["wait_share"], 0.5) and close(th["expected_blocks_in_wait"], 2.0) and
+          close(th["in_wait_ratio"], 1.0),
+          f"base rate: half the window, 2 of 4 blocks, ratio 1 {th}")
+    fps = {f["fingerprint"]: f for f in aud["fingerprints"]}
+    check(fps[FP_A]["terminal_blocks"] == 2 and
+          close(fps[FP_A]["terminal_expected_blocks"], 1.2) and
+          close(fps[FP_A]["terminal_ratio"], 2 / 1.2) and
+          fps[FP_B]["terminal_blocks"] == 0 and
+          close(fps[FP_B]["terminal_expected_blocks"], 0.8) and
+          close(fps[FP_B]["terminal_ratio"], 0),
+          f"base rate: fingerprint terminal expectations {aud['fingerprints']}")
+    rc, out, err = run(tmp, jq2_trace(base, header=base_header))
+    check(rc == 0 and "expected by chance 2.00 (wait share 50 %), ratio 1.00" in out and
+          "expected by chance 1.20 terminal, ratio 1.67" in out and
+          "expected by chance 0.80 terminal, ratio 0.00" in out,
+          "base rate text: expected counts, wait share and ratios")
+
+    # A capacity link: A was admissible at 6, but worker 0 was still running X until 9, so X's
+    # exec and the 9-10 admission are what A waited for.
+    capacity = [span(FLIP_REQ, 1, 0, 0, t, t) for t in (0, 100, 200)]
+    capacity += [
+        span(JQ2_PUSH, 1, 1, 0 | 1 << 8, 0, 0.5),
+        span(JQ2_PUSH, 1, 2, 0 | 1 << 8, 0, 1),
+        span(JQ2_JOB, qword(0, 0), 1, 1000, 5, 9),
+        span(JQ2_IMAGE, qword(0, 0), 1, 1, 5.5, 6),
+        span(JQ2_JOB, qword(0, 0), 2, 2000, 10, 15),
+        span(JQ2_IMAGE, qword(0, 0), 2, 0, 10.5, 11),
+        span(JQ2_HELD, qword(0, 0), 2, 0, 6, 6),                   # cause 0: never held
+        span(JQ2_CREDIT, qword(0, 0), 2, 5 | EVF << 8 | 1 << 16, 15.5, 16),
+        span(JQ2_SYNC_WAIT, 1, 5 | EVF << 8, 0, 1, 20),
+        f"J 0 {FP_A} 00100000 4096", f"J 1 {FP_X} 00200000 2048",
+    ]
+    rc, out, err = run(tmp, jq2_trace(capacity, header=IMG_HEADER), "--json")
+    check(rc == 0, f"capacity link: exit 0: {err}")
+    r = json.loads(out)
+    row = cp_row(r, 1, 19)
+    p = row["partition_ms"]
+    check(close(p["credit_wake"], 5) and close(p["exec"], 8) and close(p["trace"], 1) and
+          close(p["admission"], 5) and close(p["parked"], 0) and
+          close(p["barrier_release"], 0) and close(p["push"], 0), f"capacity partition {p}")
+    check(close(row["mean_chain"], 2), "capacity link: the chain has two jobs")
+    imgs = {x["fingerprint"]: x for x in r["jq2"]["images"]["per_queue"][0]["rows"]}
+    check(close(imgs[FP_A]["critical_path_ms"], 4.5) and
+          close(imgs[FP_X]["critical_path_ms"], 3.5) and
+          imgs[FP_A]["cp_rank"] == 1 and imgs[FP_X]["cp_rank"] == 2,
+          "capacity link: the previous job's image is charged its exec time")
+
+    # A push-gated chain whose push starts inside the wait: everything before the push's end is push.
+    pushgated = [span(FLIP_REQ, 1, 0, 0, t, t) for t in (0, 100, 200)]
+    pushgated += [
+        span(JQ2_PUSH, 1, 1, 0 | 1 << 8, 11, 12),
+        span(JQ2_JOB, qword(0, 0), 1, 1000, 13, 18),
+        span(JQ2_IMAGE, qword(0, 0), 1, 0, 13.5, 14),
+        span(JQ2_CREDIT, qword(0, 0), 1, 5 | EVF << 8 | 1 << 16, 18.2, 18.5),
+        span(JQ2_SYNC_WAIT, 1, 5 | EVF << 8, 0, 10, 25),
+        f"J 0 {FP_A} 00100000 4096",
+    ]
+    rc, out, err = run(tmp, jq2_trace(pushgated, header=IMG_HEADER), "--json")
+    check(rc == 0, f"push-gated chain: exit 0: {err}")
+    row = cp_row(json.loads(out), 1, 15)
+    p = row["partition_ms"]
+    check(close(p["credit_wake"], 7) and close(p["exec"], 4.5) and close(p["trace"], 0.5) and
+          close(p["admission"], 1) and close(p["parked"], 0) and close(p["push"], 2) and
+          close(p["barrier_release"], 0) and close(p["unresolved"], 0),
+          f"push-gated partition {p}")
+    check(close(row["mean_chain"], 1), "push-gated chain: one job")
+
+    # The admission [A, c] is split by the worker's IDLE spans: 2 ms parked, 2 ms admission.
+    parked = [span(FLIP_REQ, 1, 0, 0, t, t) for t in (0, 100, 200)]
+    parked += [
+        span(JQ2_PUSH, 1, 1, 0 | 1 << 8, 0, 1),
+        span(JQ2_JOB, qword(0, 0), 1, 1000, 5, 9),
+        span(JQ2_IMAGE, qword(0, 0), 1, 0, 5.5, 6),
+        span(JQ2_CREDIT, qword(0, 0), 1, 5 | EVF << 8 | 1 << 16, 9.2, 9.5),
+        span(JQ2_SYNC_WAIT, 1, 5 | EVF << 8, 0, 0, 12),
+        span(JQ2_IDLE, qword(0, 0), 0, 0, 2, 4),
+        f"J 0 {FP_A} 00100000 4096",
+    ]
+    rc, out, err = run(tmp, jq2_trace(parked, header=IMG_HEADER), "--json")
+    check(rc == 0, f"parked split: exit 0: {err}")
+    row = cp_row(json.loads(out), 1, 12)
+    p = row["partition_ms"]
+    check(close(p["credit_wake"], 3) and close(p["exec"], 3.5) and close(p["trace"], 0.5) and
+          close(p["admission"], 2) and close(p["parked"], 2) and close(p["push"], 1),
+          f"parked split partition {p}")
+
+    # A JOB that starts before its PUSH ends: the cursor must not move forward at A = P1, so the
+    # pre-job time stays 3.5 ms of push and the partition still sums to the 9 ms wait.
+    clamp = [span(FLIP_REQ, 1, 0, 0, t, t) for t in (0, 100, 200)]
+    clamp += [
+        span(JQ2_PUSH, 1, 1, 0 | 1 << 8, 4, 5),
+        span(JQ2_JOB, qword(0, 0), 1, 1000, 4.5, 8),
+        span(JQ2_IMAGE, qword(0, 0), 1, 0, 4.6, 4.8),
+        span(JQ2_CREDIT, qword(0, 0), 1, 5 | EVF << 8 | 1 << 16, 8.2, 8.5),
+        span(JQ2_SYNC_WAIT, 1, 5 | EVF << 8, 0, 1, 10),
+        f"J 0 {FP_A} 00100000 4096",
+    ]
+    rc, out, err = run(tmp, jq2_trace(clamp, header=IMG_HEADER), "--json")
+    check(rc == 0, f"cursor clamp: exit 0: {err}")
+    row = cp_row(json.loads(out), 1, 9)
+    p = row["partition_ms"]
+    check(close(p["credit_wake"], 2) and close(p["exec"], 3.3) and close(p["trace"], 0.2) and
+          close(p["admission"], 0) and close(p["push"], 3.5),
+          f"cursor clamp partition {p}")
+
+    # A fiber wait is counted and not walked; an event-flag wait without a due credit is unresolved.
+    fiber = [span(FLIP_REQ, 1, 0, 0, t, t) for t in (0, 100, 200)]
+    fiber += [
+        span(JQ2_PUSH, 1, 1, 0 | 1 << 8, 0, 1),
+        span(JQ2_JOB, qword(0, 0), 1, 1000, 2, 4),
+        span(JQ2_IMAGE, qword(0, 0), 1, 0, 2.2, 2.4),
+        span(JQ2_CREDIT, qword(0, 0), 1, 9 | EVF << 8 | 1 << 16, 3.8, 3.9),
+        span(JQ2_SYNC_WAIT, 2, 7 | EVF << 8, 0, 1, 5),
+        span(JQ2_SYNC_WAIT, 2, 0xFF | FIBER << 8, 0, 2, 3),
+        f"J 0 {FP_A} 00100000 4096",
+    ]
+    rc, out, err = run(tmp, jq2_trace(fiber, header=IMG_HEADER), "--json")
+    check(rc == 0, f"fiber and unresolved: exit 0: {err}")
+    r = json.loads(out)
+    row = cp_row(r, 2, 4)
+    check(row["waits"] == 1 and row["fiber_waits"] == 1 and row["waits_without_credit"] == 1 and
+          close(row["partition_ms"]["unresolved"], 4) and close(row["partition_ms"]["exec"], 0) and
+          row["mean_chain"] is None, f"fiber excluded, unresolved wait {row}")
+    qd = r["jq2"]["critical_path"]["per_queue"][0]
+    check(qd["fiber_waits"] == 1 and qd["waits_without_credit"] == 1, f"fiber count {qd}")
+
+    # Image identity: J lines group by fingerprint across EAs and queues; 0xFFFFFFFF and an index
+    # without a J line are one unknown row.
+    ident = [span(FLIP_REQ, 1, 0, 0, t, t) for t in (0, 100, 200)]
+    ident += [
+        span(JQ2_PUSH, 1, 1, 0 | 1 << 8, 0, 0.2),
+        span(JQ2_JOB, qword(0, 0), 1, 1000, 1, 3),
+        span(JQ2_IMAGE, qword(0, 0), 1, 0, 1.5, 2),
+        span(JQ2_PUSH, 1, 2, 0 | 1 << 8, 3, 3.2),
+        span(JQ2_JOB, qword(0, 0), 2, 1000, 4, 7),
+        span(JQ2_IMAGE, qword(0, 0), 2, 1, 4.5, 5.5),
+        span(JQ2_PUSH, 1, 3, 0 | 1 << 8, 7, 7.2),
+        span(JQ2_JOB, qword(0, 0), 3, 1000, 8, 9),
+        span(JQ2_IMAGE, qword(0, 0), 3, 0xFFFFFFFF, 8.2, 8.4),
+        span(JQ2_PUSH, 1, 4, 0 | 1 << 8, 9, 9.2),
+        span(JQ2_JOB, qword(0, 0), 4, 1000, 10, 12),
+        span(JQ2_IMAGE, qword(0, 0), 4, 7, 10.1, 10.2),
+        span(JQ2_PUSH, 10, 1, 1 | 1 << 8, 0, 1),
+        span(JQ2_JOB, qword(1, 0), 1, 500, 1, 2),
+        span(JQ2_IMAGE, qword(1, 0), 1, 2, 1.2, 1.4),
+        f"J 0 {FP_A} 00100000 64",
+        f"J 1 {FP_A} 00200000 64",
+        f"J 2 {FP_B} 00300000 32",
+    ]
+    header3 = ("# ps3_ftrace start_us=0 end_us=200000 spans=0 dropped=0"
+               " jq2_images=3 jq2_image_overflow=0")
+    rc, out, err = run(tmp, jq2_trace(ident, header=header3), "--json")
+    check(rc == 0, f"image identity: exit 0: {err}")
+    r = json.loads(out)
+    imgs = r["jq2"]["images"]
+    q0rows = {x["fingerprint"]: x for x in imgs["per_queue"][0]["rows"]}
+    check(set(q0rows) == {FP_A, None},
+          f"image identity: q0 groups by fingerprint {sorted(q0rows, key=lambda fp: fp or '')}")
+    check(q0rows[FP_A]["jobs"] == 2 and
+          q0rows[FP_A]["variants"] == [{"ea": 0x100000, "bytes": 64},
+                                       {"ea": 0x200000, "bytes": 64}],
+          f"image identity: one fingerprint, two EA/bytes variants {q0rows[FP_A]['variants']}")
+    check(q0rows[None]["jobs"] == 2 and q0rows[None]["unknown"] is True and
+          q0rows[None]["variants"] == [], "image identity: unknown jobs are one row")
+    check(close(q0rows[FP_A]["exec_wall_ms"]["total_ms"], 3.5) and
+          close(q0rows[None]["exec_wall_ms"]["total_ms"], 2.7),
+          "image identity: exec wall subtracts each IMAGE span")
+    overall = {x["fingerprint"]: x for x in imgs["overall"]}
+    check(overall[FP_A]["jobs"] == 2 and overall[FP_A]["queues"] == [0] and
+          overall[FP_B]["queues"] == [1] and overall[None]["jobs"] == 2,
+          f"image identity: overall table lists the queues {imgs['overall']}")
+    tc = {x["q"]: x for x in r["jq2"]["trace_cost"]["image_ms"]}
+    check(close(tc[0]["image_ms"], 1.8) and close(tc[0]["job_ms"], 8) and
+          close(tc[0]["share"], 1.8 / 8) and close(tc[1]["share"], 0.2),
+          f"image identity: identification cost per queue {tc}")
+    rc, out, err = run(tmp, jq2_trace(ident, header=header3))
+    check(rc == 0 and "image table: 3 entries, overflow 0" in out,
+          "image identity text: the header's table size")
+
+    # A loss counter or an image table overflow marks the section INCOMPLETE, in text and JSON.
+    lost = "# ps3_ftrace start_us=0 end_us=200000 spans=0 dropped=0 jq2_images=2 jq2_image_overflow=3"
+    rc, out, err = run(tmp, jq2_trace(barrier, header=lost), "--json")
+    check(rc == 0 and json.loads(out)["jq2"]["incomplete"] is True,
+          "image losses: overflow marks the JSON incomplete")
+    rc, out, err = run(tmp, jq2_trace(barrier, header=lost))
+    check(rc == 0 and "INCOMPLETE: 3 image table slot(s) lost" in out,
+          "image losses: overflow marks the text incomplete")
+    rc, out, err = run(tmp, jq2_trace(barrier, header="# ps3_ftrace start_us=0 end_us=200000"
+                                                " spans=0 dropped=7 jq2_images=2 jq2_image_overflow=0"))
+    check(rc == 0 and "INCOMPLETE: 7 span(s) dropped" in out,
+          "image losses: dropped spans mark the text incomplete")
+
+    # An old trace (no kind 29, no J lines) gets one legacy line and no new sections.
+    rc, out, err = run(tmp, jq2_trace(jq2), "--json")
+    check(rc == 0, f"old trace: exit 0: {err}")
+    jq = json.loads(out)["jq2"]
+    check(jq["images_available"] is False and jq["critical_path"] is None and jq["images"] is None and
+          jq["audio_stale"] is None and jq["trace_cost"] is None and jq["incomplete"] is None,
+          f"old trace: the new sections are null {jq.keys()}")
+    rc, out, err = run(tmp, jq2_trace(jq2))
+    check(rc == 0 and out.count("no image identity in this trace (kind 29)") == 1 and
+          "critical path of blocking waits" not in out and "job images by fingerprint" not in out and
+          "image table:" not in out and "INCOMPLETE" not in out,
+          "old trace: one legacy line, no image sections")
+
+    rc, out, err = run(tmp, jq2_trace(barrier + ["J 9 zz 00100000 4"]))
+    check(rc == 2 and "not an image line" in err and "Traceback" not in err,
+          "malformed J line: exit 2, no traceback")
 
 print("ftrace_report: %s" % ("ok" if not failures else "%d failed" % failures))
 sys.exit(1 if failures else 0)

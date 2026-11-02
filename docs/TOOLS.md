@@ -823,6 +823,107 @@ without the seven kinds prints no such section; a trace without kinds 27-28
 prints the section it always did plus one line that the decomposition needs
 them.
 
+A trace written with job image identity (kind 29 `IMAGE` and the `J` lines
+after the `T` lines) adds a second half to the section. An `IMAGE` span is
+`who = q << 8 | w`, `a = seq`, `b` = the image table index, `0xFFFFFFFF` when
+the table was full; the `J` line names the entry as
+`J <index> <fingerprint, 16 hex> <image_ea, 8 hex> <image_bytes, decimal>`.
+The fingerprint is FNV-1a-64 over the staged image bytes
+(`spu_workload_fingerprint()`), the same value a port registers a lifted image
+under, so a row names the port's image and not only its address. The header's
+optional `jq2_images=` and `jq2_image_overflow=` say how many slots were set
+and how many images were lost; an index of `0xFFFFFFFF` or an index without a
+`J` line is the unknown image and is counted as one row, never dropped.
+
+The **image table** groups jobs by fingerprint, per queue and overall, and
+lists the `(image_ea, image_bytes)` variants and the queues each fingerprint
+ran on. Per row: jobs; exec wall total, mean, p50 and p95 (`JOB` minus its
+`IMAGE` span, which is identification and not execution); CPU total (`JOB.b`,
+the job's thread CPU time, which includes the identification); queue latency
+mean; held and ready means (the same joins as the decomposition above); the
+**critical path** in ms and as a share of the queue's total blocking-wait
+time; and the CP rank next to the CPU rank, so a small image that blocked a
+thread outranks a large one that blocked nobody. Rows sort by critical path,
+then exec total.
+
+The **critical path** is a backward walk of every event-flag wait (`SYNC_WAIT`
+with wake 1), starting at the job the wait's due credit names and following the
+links that kept the thread blocked:
+
+- `credit+wake`: from the terminal job's end to the thread running again.
+- `exec`: the job's `JOB` time minus its `IMAGE` span, charged to that job's
+  fingerprint. A capacity link names the previous job of the same worker, the
+  one whose end is after the job became admissible, so the image charged is the
+  admitting worker's previous job.
+- `trace`: the `IMAGE` span inside that exec time.
+- `admission`: the job was admissible but no worker had it, less the parked
+  part. In a capacity link it is also the handoff between the predecessor's end
+  and the job's start.
+- `parked`: the part of the admission wait covered by an `IDLE` span of that
+  worker (the host could have run the job).
+- `barrier-release`: from the releasing job's end to the barrier release that
+  made the job admissible. The releaser is identified by the release time: the
+  `BARRIER` span of the same queue whose `t1` equals the `HELD` release exactly
+  and whose tag mask includes the job's tag, and on its releasing worker the
+  latest `JOB` ending at or before that release. Without such a barrier the
+  queue's latest job ending by the release stands in; when no releaser can be
+  established the rest is unresolved.
+- `push`: the time before the job was visible to workers.
+- `unresolved`: the chain could not be followed (no terminal credit or `JOB`,
+  neither `HELD` nor `PUSH`, no releaser, or the 100,000-step guard).
+
+Every segment is clipped to the wait and to a cursor that never increases, so
+the categories add up to the wait (within 1e-9 ms). Per `(queue, tid)` the
+report prints the waits, the fiber waits excluded, the waits without a terminal
+credit, the total wait ms, the partition in ms and percent, the mean chain
+length (jobs per resolved walk) and the number of guard hits.
+
+The **audio stale attribution** applies the same walks to every `AUDIO_STALE`
+block. The kind is emitted once per not-refilled block, with `b` the block's
+position in its run (1, 2, ..., n; a non-silent block resets it), so the report
+rebuilds each port's runs in time order: a run starts at `b == 1` and its length
+is the last `b` before the port's next run start or the window end; a port's
+first event in the window with `b > 1` opened before the window, is counted with
+the length seen and is flagged `open_at_start`. The histogram counts runs per
+length band (1, 2, 3-4, 5-8, 9+ blocks; a block is 256 samples at 48 kHz =
+16/3 ms = 5.33 ms), with each band's block total (the sum of its run lengths)
+and ms, per port and overall, plus the number of runs of 2 or more blocks
+(10.67 ms or more). Attribution stays per block: the block has a port, not a
+thread, so every thread with event-flag waits is asked whether the instant
+lies in one of its waits, and that wait's terminal job, its fingerprint, the
+time already waited and its dominant image (the fingerprint with the most exec
+ms in the wait's partition) are named. An event can fall in the waits of more
+than one thread, so it can be counted for each. The report also lists per
+thread the blocks in a wait and not in a wait, per fingerprint the blocks as
+terminal job and as dominant image, and the first 20 blocks in detail with
+their run position.
+
+The in-wait counts are a coincidence in time at the instant the mixer reads the
+block, not causation: a thread that waits a large share of the window is in a
+wait at that share of random instants. Each thread line therefore prints its
+wait share (its event-flag wait time clipped to the recorder's window divided by
+the window), the count expected by chance (wait share times the stale blocks)
+and the ratio of observed to expected; the fingerprint rows do the same for the
+terminal job (the share of the thread's wait time whose terminal job has that
+fingerprint, summed over threads). A ratio near 1 means no association: above 1
+the blocks fall inside that wait more often than chance, below 1 less often.
+
+**Trace cost and losses**: the top of the section names the recorder's
+`dropped` count and the image table's `jq2_image_overflow`; when either is
+above 0 the section is marked `INCOMPLETE` in the text and the `incomplete` key
+is true. The `IMAGE` spans are summed per queue in ms and as a share of that
+queue's `JOB` time, because the identification is measured inside the job.
+`--json` adds `jq2_images`, `jq2_image_overflow`, `images_available`,
+`incomplete`, `critical_path` (per queue and tid), `images` (per queue and
+overall), `audio_stale` and `trace_cost`.
+
+Limits: only event-flag waits are walked; a fiber wait (wake 2) carries no
+waiter id, so it is counted and excluded. The path is a model of the blocking
+chain built from the recorded spans, not a measurement of the host scheduler; a
+missing span (dropped, or cut at the recorder's edge) ends the walk as
+unresolved rather than guessing. A trace without kind 29 prints one line that
+it has no image identity and changes nothing else; the new keys are then null.
+
 Both kinds are recorded whatever `PS3_FTRACE_MIN_US` says. Exit `0` on a
 report, `2` on an unreadable or malformed trace, bad arguments or fewer than
 three flip requests.
