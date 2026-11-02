@@ -1118,15 +1118,22 @@ if(PS3RECOMP_BUILD_TESTS)
         if(SDL2_FOUND)
             ps3recomp_add_hle_check_test(hle_audio_ring
                 libs/audio/tests/test_audio_ring.c)
+            # PS3_FTRACE kinds 30/31 over the real mixer; labelled audio so `ctest -L audio` runs it.
+            ps3recomp_add_hle_check_test(hle_audio_ring_trace
+                libs/audio/tests/test_audio_ring_trace.c)
+            set_tests_properties(hle_audio_ring_trace PROPERTIES LABELS "audio;t0")
             ps3recomp_add_hle_check_test(hle_pad_rumble
                 libs/input/tests/test_pad_rumble.c)
             if(TARGET SDL2::SDL2)
                 target_link_libraries(hle_audio_ring PRIVATE SDL2::SDL2)
+                target_link_libraries(hle_audio_ring_trace PRIVATE SDL2::SDL2)
                 target_link_libraries(hle_pad_rumble PRIVATE SDL2::SDL2)
             else()
                 target_include_directories(hle_audio_ring PRIVATE ${SDL2_INCLUDE_DIRS})
+                target_include_directories(hle_audio_ring_trace PRIVATE ${SDL2_INCLUDE_DIRS})
                 target_include_directories(hle_pad_rumble PRIVATE ${SDL2_INCLUDE_DIRS})
                 target_link_libraries(hle_audio_ring PRIVATE ${SDL2_LIBRARIES})
+                target_link_libraries(hle_audio_ring_trace PRIVATE ${SDL2_LIBRARIES})
                 target_link_libraries(hle_pad_rumble PRIVATE ${SDL2_LIBRARIES})
             endif()
             target_link_libraries(hle_pad_rumble PRIVATE m)

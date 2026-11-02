@@ -127,6 +127,19 @@ enum ps3_ft_kind {
                               * staging, before the first instruction); who = q << 8 | w, a = seq,
                               * b = image table index (J lines), 0xFFFFFFFF when the table was full; one per job
                               * that has a JOB span, never filtered */
+    /* cellAudio port ring, both sides, never filtered by PS3_FTRACE_MIN_US. The two kinds share one packing of a:
+     * a = (tag & 0xFFFFFF) << 8 | (nblock - 1) << 3 | port. tag is the port's monotonic read counter
+     * (AudioPortSlot.read_index), nblock the port's nBlock (a power of two, 2..32, so it divides 2^24 and
+     * (a >> 8) % nblock == tag % nblock across the 24-bit wrap), port 0..7. b = filled mask: bit i is set when
+     * block i of the ring holds a non-zero 32-bit word. The test reads raw guest words (no float compare, no
+     * byte swap) and stops at a block's first non-zero word; exact silence written by a producer reads as empty. */
+    PS3_FT_AUDIO_RING     = 30, /* instant (t0 == t1): the mixer is about to read a port's block, under the audio
+                              * mutex; who = port, tag = read_index before the increment (the block read is
+                              * tag % nblock), mask as the ring stood before the read */
+    PS3_FT_AUDIO_RING_VIEW = 31, /* the guest's cellAudioGetPortConfig on a port that is open, started and has a
+                              * buffer, entry -> return of the success path; who = the caller's PPU trace tid (0: no
+                              * guest thread), tag and mask taken under the audio mutex. The index is as of the call:
+                              * a mixer tick before the guest's own read of readIndexAddr is a kind 30 between them */
 };
 
 enum ps3_ft_audio_pace_reason {
