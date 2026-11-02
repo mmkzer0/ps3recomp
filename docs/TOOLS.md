@@ -880,16 +880,55 @@ after the child is gone, and exit 2 with `outcome` `error` and the reason
 `interrupted by SIGINT` or `SIGTERM`. A second signal during that cleanup is
 ignored so it cannot cut the cleanup short.
 
+**Device app cleanup.** The child's process group is `devicectl`, not the app:
+ending `devicectl` leaves the app running on the device, rendering and holding
+the GPU. Before the launch, `device` resolves the installed bundle directory
+of `--bundle-id` (`devicectl device info apps --bundle-id`; a bundle that
+cannot be resolved is exit 2 and nothing is launched). When `devicectl` prints
+that the app launched, a lookup thread lists the device's processes
+(`devicectl device info processes --json-output`) and records the pid whose
+executable is a file directly inside that bundle directory; an app extension
+runs from a subdirectory and is not matched. The pid is the report's
+`app_pid`. When the run ends without the app's own status line (a timeout, an
+interruption, or `devicectl` gone after the launch) the tool lists the
+processes again and, only for a process of that bundle:
+
+1. sends `devicectl device process terminate --pid` (SIGTERM) and polls the
+   list for `--cleanup-grace` seconds (default 10);
+2. if the pid is still listed, sends `devicectl device process signal
+   --signal SIGKILL --pid` and polls for another `--cleanup-grace` seconds;
+3. reports the first step after which the pid was no longer listed.
+
+A pid that is listed with another executable (reused after the app ended) is
+gone, not a target. Every `devicectl` call is bounded by
+`--cleanup-call-timeout` (default 20 s) and its process group is killed when
+the bound passes. The whole cleanup runs inside the signal deferral, so a
+second Ctrl-C cannot skip it. A run in which the app reported its own status
+sends no terminate or signal request.
+
+The report's `app_cleanup` is `null` when no cleanup was needed, else one of:
+`exited` (the app was already gone), `sigterm` or `sigkill` (the step after
+which the pid left the list), `unmatched` (no process of the bundle was
+listed, so nothing was signalled) or `failed` (the listing could not be read,
+the pid was still listed after SIGKILL, or the result could not be verified).
+`app_cleanup_detail` carries the specifics, and the reason line repeats them.
+`failed` fails the run (exit 1 after a timeout; an interruption stays exit 2),
+and a timeout is always a failure whatever the cleanup did: the reason reads
+`timed out; the app ended after SIGTERM (pid N)`, never a clean pass. An
+`unmatched` run after a launch means the tool could not find the app and it
+may still be running.
+
 `--env K=V` becomes `SIMCTL_CHILD_K=V` or `DEVICECTL_CHILD_K=V`, the prefixes
 the platform tools strip before starting the program. Values are never
 printed; neither the report nor the summary line carries any environment.
 
 | Option | Meaning |
 |---|---|
-| `--timeout S` | Stop the child's process group after S seconds (default 600): SIGTERM, then SIGKILL 10 s later. `timed_out` is set and both status fields are null, because the status is the tool's kill and not the program's. |
+| `--timeout S` | Stop the child's process group after S seconds (default 600): SIGTERM, then SIGKILL 10 s later. `timed_out` is set and both status fields are null, because the status is the tool's kill and not the program's. On a device the app is stopped as well, see above. |
 | `--lock PATH`, `--lock-wait S` | The shared run lock and how long to wait for it (defaults: `/tmp/ps3-metal.lock`, 600 s). |
 | `--log FILE` | Tee the child's merged output to FILE while it is streamed to stderr. |
 | `--expect-stop KIND` | Pass only if a `PS3STOP v=1 kind=KIND ...` line appeared and the exit status is 70. |
+| `--cleanup-grace S`, `--cleanup-call-timeout S` | `device` only: seconds to wait for the app to leave the process list after each of SIGTERM and SIGKILL (default 10), and the bound on each `devicectl` query or request about the app (default 20). |
 
 The first `PS3STOP v=1 kind=<kind> <k>=<v> ...` line of a run is reported as
 `{"kind": ..., "fields": {...}, "line": "..."}`. Without `--expect-stop` any
@@ -898,14 +937,15 @@ stop fails the run: a stop is a refusal, not a pass.
 `--json` writes exactly one object to stdout: `target`, `device`,
 `bundle_id`, `command`, `exit_code`, `signal`, `timed_out`, `ps3stop`,
 `reader_errors`, `expected_stop`, `outcome` (`pass`, `fail`, `error`), `log`,
-`duration_s`, `load_avg` and `booted_by_tool`. Without it, one summary line
-goes to stderr.
+`duration_s`, `load_avg`, `booted_by_tool`, `app_pid`, `app_cleanup` and
+`app_cleanup_detail` (the last three are `null` for `sim`). Without it, one
+summary line goes to stderr.
 
 Exit status: `0` the run passed, `1` it failed, `2` usage or environment
 error (bad arguments, `xcrun` missing, unknown or ambiguous simulator, busy
-lock, failed install, a `devicectl` launch that failed before the app
-reported a status, an interruption). A usage error is a message, never a
-traceback.
+lock, failed install, a bundle that cannot be resolved, a `devicectl` launch
+that failed before the app reported a status, an interruption). A usage error
+is a message, never a traceback.
 `tools/test_ios_run.py` proves the contract against a fake `xcrun` and never
 touches a simulator or a device.
 

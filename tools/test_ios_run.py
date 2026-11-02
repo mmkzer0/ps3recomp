@@ -38,6 +38,33 @@ CAT = shutil.which("cat") or "/bin/cat"
 ENV = shutil.which("env") or "/usr/bin/env"
 SLEEP = shutil.which("sleep") or "/bin/sleep"
 
+BUNDLE_ID = "com.example.title"
+BUNDLE_DIR = "/private/var/containers/Bundle/Application/1234ABCD/My Title.app/"
+APP_PID = 4242
+
+
+def file_url(path):
+    return "file://" + path.replace(" ", "%20")
+
+
+APP_EXE = file_url(BUNDLE_DIR + "Title")
+PLUGIN_EXE = file_url(BUNDLE_DIR + "PlugIns/Share.appex/Share")
+OTHER_EXE = file_url("/private/var/containers/Bundle/Application/9999FFFF/Other.app/Other")
+LAUNCHD_EXE = "file:///sbin/launchd"
+LAUNCHED = ("Launched application with %s bundle identifier.\n"
+            "Waiting for the application to terminate...\n" % BUNDLE_ID)
+
+
+def apps_json():
+    return json.dumps({"result": {"apps": [
+        {"bundleIdentifier": BUNDLE_ID, "url": file_url(BUNDLE_DIR)}]}})
+
+
+def procs_json(entries):
+    return json.dumps({"result": {"runningProcesses": [
+        {"processIdentifier": pid, "executable": exe} for pid, exe in entries]}})
+
+
 # The fake answers only these commands.  Anything else exits 64, so a test
 # that sees a new command fails loudly instead of pretending it worked.
 FAKE = """#!/bin/sh
@@ -67,15 +94,48 @@ case "$1 $2" in
     exit "${FAKE_EXIT:-0}"
     ;;
   "devicectl device")
-    case "$3" in
-      install)
+    out=""
+    prev=""
+    for arg in "$@"; do
+      [ "$prev" = "--json-output" ] && out="$arg"
+      prev="$arg"
+    done
+    case "$3 $4" in
+      "install app")
         exit "${FAKE_INSTALL_EXIT:-0}"
         ;;
-      process)
+      "info apps")
+        [ -n "$out" ] && @CAT@ "$FAKE_APPS" > "$out"
+        exit "${FAKE_APPS_EXIT:-0}"
+        ;;
+      "info processes")
+        src="$FAKE_PROCS"
+        [ -e "$FAKE_STATE/dead" ] && src="$FAKE_PROCS_DEAD"
+        [ -n "$out" ] && @CAT@ "$src" > "$out"
+        exit "${FAKE_PROCS_EXIT:-0}"
+        ;;
+      "process launch")
         [ -n "$FAKE_OUT" ] && @CAT@ "$FAKE_OUT"
+        [ -n "$FAKE_PIDFILE" ] && echo $$ > "$FAKE_PIDFILE"
         [ -n "$FAKE_SLEEP" ] && @SLEEP@ "$FAKE_SLEEP"
         [ -n "$FAKE_SIGNAL" ] && kill -s "$FAKE_SIGNAL" $$
         exit "${FAKE_LAUNCH_EXIT:-0}"
+        ;;
+      "process terminate")
+        case "${FAKE_TERM:-die}" in
+          die) : > "$FAKE_STATE/dead" ;;
+          fail) exit 1 ;;
+          hang) @SLEEP@ 60 ;;
+        esac
+        exit 0
+        ;;
+      "process signal")
+        case "${FAKE_KILL:-die}" in
+          die) : > "$FAKE_STATE/dead" ;;
+          fail) exit 1 ;;
+          hang) @SLEEP@ 60 ;;
+        esac
+        exit 0
         ;;
     esac
     ;;
@@ -86,7 +146,8 @@ exit 64
 REPORT_KEYS = {
     "target", "device", "bundle_id", "command", "exit_code", "signal",
     "timed_out", "ps3stop", "reader_errors", "expected_stop", "outcome",
-    "log", "duration_s", "load_avg", "booted_by_tool",
+    "log", "duration_s", "load_avg", "booted_by_tool", "app_pid",
+    "app_cleanup", "app_cleanup_detail",
 }
 
 STOP_LINE = ("PS3STOP v=1 kind=fiber-host-context op=create reason=getcontext "
@@ -135,9 +196,23 @@ class IosRunCase(unittest.TestCase):
         fake.write_text(FAKE.replace("@CAT@", CAT).replace("@ENV@", ENV)
                         .replace("@SLEEP@", SLEEP))
         fake.chmod(0o755)
+        self.state = self.root / "state"
+        self.state.mkdir()
         self.env = {"PATH": str(self.bin),
                     "FAKE_LOG": str(self.calls_path),
-                    "FAKE_DEVICES": str(self.devices)}
+                    "FAKE_DEVICES": str(self.devices),
+                    "FAKE_STATE": str(self.state),
+                    "FAKE_APPS": self.artifact("apps.json", apps_json()),
+                    "FAKE_PROCS": str(self.root / "procs.json"),
+                    "FAKE_PROCS_DEAD": str(self.root / "procs-dead.json")}
+        self.set_procs([(1, LAUNCHD_EXE), (APP_PID, APP_EXE), (4243, PLUGIN_EXE)])
+
+    def set_procs(self, alive, dead=None):
+        """The process list while the app runs, and after the fake kills it."""
+        if dead is None:
+            dead = [entry for entry in alive if entry[0] != APP_PID]
+        Path(self.env["FAKE_PROCS"]).write_text(procs_json(alive))
+        Path(self.env["FAKE_PROCS_DEAD"]).write_text(procs_json(dead))
 
     def write_devices(self, devices):
         self.devices.write_text(json.dumps({"devices": {RUNTIME: devices}}))
@@ -529,6 +604,9 @@ class SimTest(IosRunCase):
         for value in report["load_avg"]:
             self.assertIsInstance(value, float)
         self.assertIs(report["booted_by_tool"], True)
+        self.assertIsNone(report["app_pid"])
+        self.assertIsNone(report["app_cleanup"])
+        self.assertIsNone(report["app_cleanup_detail"])
 
     def test_summary_is_one_line(self):
         result = self.run_tool("sim", "--device", UDID, "--", "prog")
@@ -586,6 +664,13 @@ class DeviceTest(IosRunCase):
                              "com.example.title", "--json", *extra,
                              env={**(env or {}), "FAKE_OUT": self.console(console)})
 
+    def launch_call(self, env=False):
+        """The launch call's argv (or its environment), None without one."""
+        for call in self.calls():
+            if call["argv"][1:5] == ["devicectl", "device", "process", "launch"]:
+                return call["env"] if env else call["argv"]
+        return None
+
     def test_exit_code_line(self):
         result = self.launch(console="The app terminated with the exit code 7.\n")
         self.assertEqual(result.returncode, 1, result.stderr)
@@ -634,10 +719,10 @@ class DeviceTest(IosRunCase):
         self.assertEqual(commands[0][1:5], ["devicectl", "device", "install", "app"])
         self.assertIn("--device", commands[0])
         self.assertIn(app, commands[0])
-        self.assertEqual(commands[1][1:5],
-                         ["devicectl", "device", "process", "launch"])
-        self.assertIn("--terminate-existing", commands[1])
-        self.assertEqual(commands[1][-2:], ["--console", "com.example.title"])
+        self.assertEqual(commands[1][1:5], ["devicectl", "device", "info", "apps"])
+        launch = self.launch_call()
+        self.assertIn("--terminate-existing", launch)
+        self.assertEqual(launch[-2:], ["--console", "com.example.title"])
         report = json.loads(result.stdout)
         self.assertEqual(report["bundle_id"], "com.example.title")
         self.assertEqual(report["device"], UDID)
@@ -655,7 +740,7 @@ class DeviceTest(IosRunCase):
         result = self.launch("--env", "HOME=/tmp/x",
                              console="The app terminated with the exit code 0.\n")
         self.assertEqual(result.returncode, 0, result.stderr)
-        env = self.child_env_of(("devicectl", "device"), 0)
+        env = self.launch_call(env=True)
         self.assertEqual(env["DEVICECTL_CHILD_HOME"], "/tmp/x")
         self.assertNotIn("/tmp/x", result.stdout)
         self.assertNotIn("/tmp/x", result.stderr)
@@ -666,7 +751,7 @@ class DeviceTest(IosRunCase):
                                "com.example.title", "--json", "--", "--trials",
                                "5", env={"FAKE_OUT": out})
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.commands()[0][-2:], ["--trials", "5"])
+        self.assertEqual(self.launch_call()[-2:], ["--trials", "5"])
 
     def test_status_printed_by_the_app_is_not_devicectls(self):
         # The app's words come first; devicectl's epilogue is the last line.
@@ -700,6 +785,196 @@ class DeviceTest(IosRunCase):
         report = json.loads(result.stdout)
         self.assertEqual(report["exit_code"], 7)
         self.assertEqual(report["outcome"], "fail")
+
+    # Host-ended runs: the app outlives devicectl, so the tool stops it itself.
+
+    def stop_calls(self):
+        """[(verb, signal, pid)] of every terminate and signal request."""
+        calls = []
+        for argv in self.commands():
+            if argv[1:4] == ["devicectl", "device", "process"] and argv[4] in (
+                    "terminate", "signal"):
+                sig = argv[argv.index("--signal") + 1] if "--signal" in argv else None
+                calls.append((argv[4], sig, int(argv[argv.index("--pid") + 1])))
+        return calls
+
+    def hung_run(self, *extra, env=None):
+        """A launch that never ends on its own; the tool's timeout ends it."""
+        return self.launch("--timeout", "2", "--cleanup-grace", "1",
+                           "--cleanup-call-timeout", "3", *extra,
+                           console=LAUNCHED,
+                           env={"FAKE_SLEEP": "30", **(env or {})})
+
+    def test_app_that_exits_by_itself_is_left_alone(self):
+        result = self.launch(console=LAUNCHED
+                             + "The app terminated with the exit code 0.\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["outcome"], "pass")
+        self.assertIsNone(report["app_cleanup"])
+        self.assertEqual(self.stop_calls(), [])
+
+    def test_timeout_ends_the_app_with_sigterm(self):
+        result = self.hung_run()
+        self.assertEqual(result.returncode, 1, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertIs(report["timed_out"], True)
+        self.assertEqual(report["outcome"], "fail")
+        self.assertEqual(report["app_cleanup"], "sigterm")
+        self.assertEqual(report["app_pid"], APP_PID)
+        self.assertIsNone(report["app_cleanup_detail"])
+        self.assertEqual(self.stop_calls(), [("terminate", None, APP_PID)])
+        terminate = [argv for argv in self.commands() if argv[4:5] == ["terminate"]][0]
+        self.assertEqual(terminate[terminate.index("--device") + 1], UDID)
+
+    def test_ignored_sigterm_is_followed_by_sigkill(self):
+        result = self.hung_run(env={"FAKE_TERM": "ignore"})
+        self.assertEqual(result.returncode, 1, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertIs(report["timed_out"], True)
+        self.assertEqual(report["outcome"], "fail")
+        self.assertEqual(report["app_cleanup"], "sigkill")
+        self.assertEqual(self.stop_calls(),
+                         [("terminate", None, APP_PID),
+                          ("signal", "SIGKILL", APP_PID)])
+
+    def test_a_kill_that_does_not_end_the_app_fails_the_run(self):
+        for how in ("fail", "ignore"):
+            with self.subTest(kill=how):
+                self.calls_path.unlink(missing_ok=True)
+                (self.state / "dead").unlink(missing_ok=True)
+                env = {"FAKE_TERM": "ignore", "FAKE_KILL": how}
+                result = self.hung_run(env=env)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                report = json.loads(result.stdout)
+                self.assertEqual(report["outcome"], "fail")
+                self.assertEqual(report["app_cleanup"], "failed")
+                self.assertIn("still listed after SIGKILL",
+                              report["app_cleanup_detail"])
+                self.assertEqual(report["app_pid"], APP_PID)
+                self.assertEqual(len(self.stop_calls()), 2)
+
+    def test_the_reason_names_a_failed_cleanup(self):
+        result = self.run_tool(
+            "device", "--udid", UDID, "--bundle-id", BUNDLE_ID, "--timeout", "2",
+            "--cleanup-grace", "1",
+            env={"FAKE_SLEEP": "30", "FAKE_TERM": "ignore", "FAKE_KILL": "ignore",
+                 "FAKE_OUT": self.console(LAUNCHED)})
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("outcome=fail", result.stderr)
+        self.assertIn("timed out", result.stderr)
+        self.assertIn("app cleanup failed", result.stderr)
+        self.assertIn("pid %d is still listed after SIGKILL" % APP_PID, result.stderr)
+
+    def test_a_listing_without_the_app_signals_nothing(self):
+        cases = {
+            "another bundle": [(1, LAUNCHD_EXE), (APP_PID, OTHER_EXE)],
+            "an extension only": [(1, LAUNCHD_EXE), (4243, PLUGIN_EXE)],
+            "no executable": [(1, LAUNCHD_EXE)],
+        }
+        for name, listing in cases.items():
+            with self.subTest(listing=name):
+                self.calls_path.unlink(missing_ok=True)
+                self.set_procs(listing, listing)
+                result = self.hung_run()
+                self.assertEqual(result.returncode, 1, result.stderr)
+                report = json.loads(result.stdout)
+                self.assertIs(report["timed_out"], True)
+                self.assertEqual(report["outcome"], "fail")
+                self.assertEqual(report["app_cleanup"], "unmatched")
+                self.assertIsNone(report["app_pid"])
+                self.assertIn("nothing was signalled", report["app_cleanup_detail"])
+                self.assertEqual(self.stop_calls(), [])
+
+    def test_a_reused_pid_is_not_signalled(self):
+        # The tracker recorded the app's pid; by cleanup that pid runs
+        # another executable, so it is not the app and must not be touched.
+        pidfile = self.root / "child.pid"
+        proc = subprocess.Popen(
+            [sys.executable, str(TOOL), "device", "--lock", str(self.lock),
+             "--udid", UDID, "--bundle-id", BUNDLE_ID, "--json", "--timeout", "6",
+             "--cleanup-grace", "1"],
+            env={**self.env, "FAKE_SLEEP": "30", "FAKE_OUT": self.console(LAUNCHED),
+                 "FAKE_PIDFILE": str(pidfile)},
+            cwd=str(self.root), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True)
+        self.addCleanup(proc.kill)
+        deadline = time.monotonic() + 30
+        while not any(argv[3:5] == ["info", "processes"] for argv in self.commands()):
+            self.assertLess(time.monotonic(), deadline, "tracker never listed")
+            time.sleep(0.05)
+        time.sleep(0.5)
+        self.set_procs([(1, LAUNCHD_EXE), (APP_PID, OTHER_EXE)],
+                       [(1, LAUNCHD_EXE), (APP_PID, OTHER_EXE)])
+        out, err = proc.communicate(timeout=60)
+        self.assertEqual(proc.returncode, 1, err)
+        report = json.loads(out)
+        self.assertEqual(report["app_cleanup"], "exited")
+        self.assertEqual(report["app_pid"], APP_PID)
+        self.assertIn("not touched", report["app_cleanup_detail"])
+        self.assertEqual(self.stop_calls(), [])
+
+    def test_a_devicectl_call_that_hangs_is_bounded(self):
+        result = self.launch("--timeout", "2", "--cleanup-grace", "1",
+                             "--cleanup-call-timeout", "1", console=LAUNCHED,
+                             env={"FAKE_SLEEP": "30", "FAKE_TERM": "hang"})
+        self.assertEqual(result.returncode, 1, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["app_cleanup"], "sigkill")
+        self.assertIn("timed out after 1s", report["app_cleanup_detail"])
+        self.assertEqual([call[0] for call in self.stop_calls()],
+                         ["terminate", "signal"])
+
+    def test_a_hung_kill_fails_the_run(self):
+        result = self.launch("--timeout", "2", "--cleanup-grace", "1",
+                             "--cleanup-call-timeout", "1", console=LAUNCHED,
+                             env={"FAKE_SLEEP": "30", "FAKE_TERM": "hang",
+                                  "FAKE_KILL": "hang"})
+        self.assertEqual(result.returncode, 1, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["app_cleanup"], "failed")
+        self.assertIn("timed out after 1s", report["app_cleanup_detail"])
+
+    def test_an_unreadable_listing_fails_the_run(self):
+        result = self.hung_run(env={"FAKE_PROCS_EXIT": "1"})
+        self.assertEqual(result.returncode, 1, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["app_cleanup"], "failed")
+        self.assertIn("cannot list", report["app_cleanup_detail"])
+        self.assertEqual(self.stop_calls(), [])
+
+    def test_an_unresolvable_bundle_stops_before_the_launch(self):
+        result = self.launch(console=LAUNCHED, env={"FAKE_APPS_EXIT": "1"})
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("cannot resolve the installed bundle", result.stderr)
+        self.assertIsNone(self.launch_call())
+
+    def test_interrupt_stops_the_app(self):
+        pidfile = self.root / "child.pid"
+        proc = subprocess.Popen(
+            [sys.executable, str(TOOL), "device", "--lock", str(self.lock),
+             "--udid", UDID, "--bundle-id", BUNDLE_ID, "--json", "--timeout", "120",
+             "--cleanup-grace", "1"],
+            env={**self.env, "FAKE_SLEEP": "120", "FAKE_OUT": self.console(LAUNCHED),
+                 "FAKE_PIDFILE": str(pidfile)},
+            cwd=str(self.root), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True)
+        self.addCleanup(proc.kill)
+        deadline = time.monotonic() + 30
+        while not (pidfile.exists() and pidfile.read_text().endswith("\n")):
+            self.assertLess(time.monotonic(), deadline, "launch never started")
+            self.assertIsNone(proc.poll(), "tool exited before the launch")
+            time.sleep(0.02)
+        self.addCleanup(SimTest.kill_group, int(pidfile.read_text()))
+        proc.send_signal(signal.SIGINT)
+        out, err = proc.communicate(timeout=60)
+        self.assertEqual(proc.returncode, 2, err)
+        self.assertIn("interrupted by SIGINT", err)
+        self.assertIn("the app ended after SIGTERM", err)
+        report = json.loads(out)
+        self.assertEqual(report["outcome"], "error")
+        self.assertEqual(report["app_cleanup"], "sigterm")
+        self.assertEqual(self.stop_calls(), [("terminate", None, APP_PID)])
 
 
 class ReaderTest(unittest.TestCase):
@@ -740,7 +1015,9 @@ class ReaderTest(unittest.TestCase):
 
     def test_an_unread_output_never_passes(self):
         report = {"timed_out": False, "expected_stop": None, "ps3stop": None,
-                  "exit_code": 0, "signal": None, "reader_errors": ["log: x"]}
+                  "exit_code": 0, "signal": None, "reader_errors": ["log: x"],
+                  "app_cleanup": None, "app_pid": None,
+                  "app_cleanup_detail": None}
         self.assertEqual(ios_run.decide_outcome(report)[0], "fail")
         report["reader_errors"] = []
         self.assertEqual(ios_run.decide_outcome(report)[0], "pass")
