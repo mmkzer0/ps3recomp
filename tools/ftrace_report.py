@@ -72,6 +72,20 @@ partner is counted, never dropped. A trace without kinds 22-28 prints no such
 section and its JSON key is null; a trace without kinds 27-28 prints the
 section it always did plus a line that the decomposition needs them.
 
+A trace that carries job image identity (kind 29, the `J` image lines, and the
+header's `jq2_images`/`jq2_image_overflow`) adds, per queue: the image table
+and the IMAGE time as a share of the queue's JOB time; the critical path of
+every event-flag wait, a backward walk from the job its due credit names
+through the capacity, barrier-release and push links that kept the thread
+blocked, partitioned into credit+wake, exec, image (trace), admission, parked,
+barrier-release, push and unresolved; the images grouped by fingerprint and
+ranked by their share of that blocking time next to their CPU time; and the
+attribution of every audio stale block (one event per not-refilled block, `b` =
+its position in the run) to the job the waiting threads were blocked on, with
+the run-length histogram rebuilt per port. A loss counter or a full image table
+marks the section INCOMPLETE. A trace without kind 29 prints one line saying it
+has no image identity and changes nothing else.
+
 Without --json it then draws a few frames as a timeline (one column per
 --ms-per-col ms):
   PPU   '#' running   '.' usleep poll   's' other blocking syscall
@@ -93,13 +107,23 @@ import sys
 (SYSCALL, USLEEP, SPU_WAIT, SPU_BUSY, SEMA, SEMA_GAVEUP, DRAIN, FLIP_FIFO, FLIP_REQ, PRESENT,
  GPU_ENCODE, GPU_WAIT, READBACK, GPU_EXEC, HLE, DRAWABLE, LABEL_WAIT,
  AUDIO_MIX, AUDIO_PACE, AUDIO_UNDERRUN, AUDIO_STALE,
- JQ2_PUSH, JQ2_JOB, JQ2_CREDIT, JQ2_SYNC_WAIT, JQ2_IDLE, JQ2_HELD, JQ2_BARRIER) = range(1, 29)
+ JQ2_PUSH, JQ2_JOB, JQ2_CREDIT, JQ2_SYNC_WAIT, JQ2_IDLE, JQ2_HELD, JQ2_BARRIER,
+ JQ2_IMAGE) = range(1, 30)
 AUDIO_PACE_REASON = {1: "queue full", 2: "clock pacing", 3: "backend wait"}
 JQ2_FIBER_WAKE = 2       # wake field of a fiber wait or wake; it carries waiter 0xFF, so it cannot be joined
 JQ2_PARK_REASONS = {0: "unrecorded", 1: "empty", 2: "unwritten", 3: "held", 4: "no-slot", 5: "paused",
                     15: "unclassified"}   # kind 26's top byte, first match wins
 JQ2_DEPTH_BUCKETS = ("1", "2-4", "5-16", "17-64", "65+")  # PUSH depth, b >> 8
 JQ2_IDLE_DEPTH = 0xFFFFFF  # kind 26: depth at park | reason << 24
+JQ2_IMAGE_UNKNOWN = 0xFFFFFFFF  # kind 29 b: the image table was full, so the job has no J line
+JQ2_WALK_LIMIT = 100000  # steps of the backward critical-path walk per wait, then the rest is unresolved
+JQ2_CP_CATEGORIES = ("credit_wake", "exec", "trace", "admission", "parked", "barrier_release",
+                     "push", "unresolved")   # the partition of a wait's [S0, S1]
+JQ2_CP_LABELS = {"credit_wake": "credit+wake", "exec": "exec (job minus image)",
+                 "trace": "trace (image)", "admission": "admission", "parked": "parked",
+                 "barrier_release": "barrier-release", "push": "push", "unresolved": "unresolved"}
+AUDIO_BLOCK_MS = 16.0 / 3.0  # the firmware's 256-sample block at 48 kHz; the stale report's unit
+AUDIO_STALE_BANDS = ((1, 1, "1"), (2, 2, "2"), (3, 4, "3-4"), (5, 8, "5-8"), (9, None, "9+"))
 GPU_WAIT_KIND = {0: "gpu wait (flush)", 1: "gpu wait (present)", 2: "gpu wait (in-flight)"}
 GPU_WAIT_INFLIGHT = 2
 SPINS_SLEEPING = 64      # cellGcmSys.c yields for 64 spins, then sleeps 1 ms per spin
@@ -122,7 +146,7 @@ class BadInput(Exception):
 
 
 def load(path):
-    names, spans, header = {}, [], ""
+    names, spans, images, header = {}, [], {}, ""
     try:
         with open(path) as f:
             for no, line in enumerate(f, 1):
@@ -133,6 +157,15 @@ def load(path):
                     _, tid, name = line.rstrip("\n").split(" ", 2)
                     names[int(tid)] = name
                     continue
+                if line.startswith("J "):
+                    # kind 29's image table: J <index> <fp, 16 hex> <image_ea, 8 hex> <bytes, decimal>.
+                    # It is not a span; a trace written before kind 29 has none.
+                    try:
+                        _, index, fp, ea, nbytes = line.split()
+                        images[int(index)] = (int(fp, 16), int(ea, 16), int(nbytes))
+                    except ValueError:
+                        raise BadInput(f"{path}:{no}: not an image line: {line.strip()[:80]!r}") from None
+                    continue
                 try:
                     k, who, a, b, t0, t1 = line.split()
                     spans.append((int(k), int(who), int(a, 16), int(b, 16), float(t0) / 1e3, float(t1) / 1e3))
@@ -141,7 +174,7 @@ def load(path):
     except OSError as e:
         raise BadInput(f"{path}: {e.strerror}") from None
     spans.sort(key=lambda s: s[4])
-    return header, names, spans
+    return header, names, spans, images
 
 
 def overlap(s0, s1, f0, f1):
@@ -353,6 +386,18 @@ def nearest_rank(xs, p):
 
 def header_dropped(header):
     m = re.search(r"\bdropped=(\d+)", header)
+    return int(m.group(1)) if m else None
+
+
+def header_jq2_images(header):
+    """The image table's set slots from the header, or None for a trace written before it."""
+    m = re.search(r"\bjq2_images=(\d+)", header)
+    return int(m.group(1)) if m else None
+
+
+def header_jq2_image_overflow(header):
+    """The image table's lost-slot count from the header, or None when it names none."""
+    m = re.search(r"\bjq2_image_overflow=(\d+)", header)
     return int(m.group(1)) if m else None
 
 
@@ -873,7 +918,394 @@ def jq2_intersect(a, b):
     return out
 
 
-def jq2_section(spans, header, names=None):
+def jq2_job_before(entry, t, exclude=None):
+    """The latest job of one worker (or of the queue) ending at or before t; None when none.
+
+    entry is (jobs sorted by end, their ends). A tie on the end keeps the job that started
+    later, so a zero-length predecessor cannot hide the one that actually ran. `exclude` is
+    the seq of the job being walked: a zero-length job must not be its own predecessor.
+    """
+    if entry is None:
+        return None
+    jobs, ends = entry
+    i = bisect.bisect_right(ends, t) - 1
+    while i >= 0 and exclude is not None and jobs[i][1] == exclude:
+        i -= 1
+    return jobs[i] if i >= 0 else None
+
+
+def jq2_barrier_releaser(ctx, tag, release, job_seq):
+    """The job whose completion released the barrier that held `tag` at `release`.
+
+    The release time is recorded once, so the barrier is the span of this queue whose t1
+    equals the release exactly and whose tag set includes the tag; the releaser is its
+    releasing worker's latest job ending at or before the release. A trace without kinds
+    28 falls back to the queue's latest job ending by the release. None when the releaser
+    cannot be established: a wrong guess would put another job's image on the critical
+    path. The released job is never its own releaser.
+    """
+    for barrier in ctx["barriers_by_t1"].get(release, ()):
+        if barrier[1] & (1 << tag):
+            return jq2_job_before(ctx["jobs_of_worker"].get(barrier[0]), release, job_seq)
+    return jq2_job_before(ctx["jobs_all"], release, job_seq)
+
+
+def jq2_walk(ctx, s0, s1, terminal_seq):
+    """One event-flag wait's backward walk over the jobs and barriers that kept it blocked.
+
+    The walk starts at the terminal job (the (q, seq) of the due credit that ended the wait)
+    and follows, per contract, whichever link kept each job from starting earlier: capacity
+    (the previous job of the same worker was still running when the job was admissible), the
+    release of the barrier that held its tag, or the push that made it visible. Every
+    segment is clipped to [s0, s1] and to a cursor that only decreases, so the categories
+    add up to s1 - s0; a link that cannot be followed leaves the rest unresolved instead of
+    guessing. The image identification span of every job on the chain is `trace`, the rest
+    of its JOB span is `exec` and is charged to that job's fingerprint.
+
+    Returns the partition, the exec milliseconds per fingerprint, the number of jobs walked,
+    and whether the step guard fired.
+    """
+    parts = dict.fromkeys(JQ2_CP_CATEGORIES, 0.0)
+    fp_exec = collections.defaultdict(float)
+    job = ctx["job_of_seq"].get(terminal_seq)
+    result = {"parts": parts, "fp_exec": fp_exec, "chain": 0, "guard": False,
+              "terminal_seq": terminal_seq, "has_terminal": True,
+              "terminal_fp": None if job is None else ctx["fp_of_seq"].get(terminal_seq)}
+    if job is None:
+        # The credit names a (q, seq) with no JOB span: the wait is attributed to that job by
+        # seq, but there is no interval to walk.
+        parts["unresolved"] += s1 - s0
+        return result
+
+    c = s1
+    chain, steps, guard, first = 0, 0, False, True
+
+    def adv(raw):
+        nonlocal c
+        c = min(c, raw)
+
+    def take(cat, a, b):
+        lo, hi = max(a, s0), min(b, c, s1)
+        if hi > lo:
+            parts[cat] += hi - lo
+
+    def take_exec(j):
+        lo, hi = max(j[3], s0), min(c, s1)
+        if hi > lo:
+            img = ctx["image_of_seq"].get(j[1])
+            cut = (max(img[1], lo), min(img[2], hi)) if img is not None else None
+            if cut is not None and cut[1] > cut[0]:
+                parts["trace"] += cut[1] - cut[0]
+                pieces = ((lo, cut[0]), (cut[1], hi))
+            else:
+                pieces = ((lo, hi),)
+            fp = ctx["fp_of_seq"].get(j[1])
+            for a, b in pieces:
+                if b > a:
+                    parts["exec"] += b - a
+                    fp_exec[fp] += b - a
+        adv(j[3])
+
+    while True:
+        steps += 1
+        if steps > JQ2_WALK_LIMIT:
+            guard = True
+            take("unresolved", s0, c)
+            adv(s0)
+            break
+        if first:
+            take("credit_wake", job[4], c)
+            adv(job[4])
+            first = False
+        chain += 1
+        take_exec(job)
+        if c <= s0:
+            break
+        held = ctx["held_of_seq"].get(job[1])
+        push = ctx["push_of_seq"].get(job[1])
+        if held is not None:
+            a = held[2]
+        elif push is not None:
+            a = push[1]
+        else:
+            take("unresolved", s0, c)
+            adv(s0)
+            break
+        w = job[0]
+        k = jq2_job_before(ctx["jobs_of_worker"].get(w), job[3], job[1])
+        if k is not None and k[4] > a:
+            take("admission", k[4], c)
+            adv(k[4])
+            job = k
+            continue
+        a = min(a, c)
+        lo = max(a, s0)
+        if c > lo:
+            parked = jq2_overlap_len(lo, c, ctx["idle_of_worker"].get(w, ()))
+            parts["parked"] += parked
+            parts["admission"] += (c - lo) - parked
+        adv(a)
+        if c <= s0:
+            break
+        if held is not None and (held[0] >> 4) & 0xF == 1:
+            r = jq2_barrier_releaser(ctx, held[0] & 0xF, held[2], job[1])
+            if r is None:
+                take("unresolved", s0, c)
+                adv(s0)
+                break
+            take("barrier_release", r[4], c)
+            adv(r[4])
+            job = r
+            continue
+        take("push", s0, c)
+        adv(s0)
+        break
+    result["chain"] = chain
+    result["guard"] = guard
+    return result
+
+
+def jq2_mean(xs):
+    return sum(xs) / len(xs) if xs else None
+
+
+def jq2_exec_stats(walls):
+    """total, mean, nearest-rank p50 and p95 of the exec walls."""
+    xs = sorted(walls)
+    total = sum(xs)
+    return {"total_ms": total, "mean_ms": total / len(xs) if xs else None,
+            "p50_ms": nearest_rank(xs, 50) if xs else None,
+            "p95_ms": nearest_rank(xs, 95) if xs else None}
+
+
+def jq2_image_rows(jobs, cp_exec, total_wait_ms):
+    """The image table of one queue (or of all queues): jobs grouped by fingerprint.
+
+    A fingerprint can run from more than one (ea, bytes) triple and on more than one queue;
+    the rows list every variant and the queues the jobs were seen on. `cp_exec` is the exec
+    time the walks charged to each fingerprint, so the share is of the blocking-wait time,
+    not of CPU: a short image that blocks a thread outranks a long one that blocks nobody.
+    The image identification span is already out of the exec wall (JOB minus IMAGE); CPU is
+    JOB.b and does include it. Rows sort by critical path, then exec total; cp_rank follows
+    that order and cpu_rank the CPU total, so the two are side by side.
+    """
+    groups = {}
+    for j in jobs:
+        g = groups.setdefault(j["fp"], {"jobs": 0, "walls": [], "cpu": 0.0, "lat": [], "held": [],
+                                        "ready": [], "variants": set(), "queues": set(), "clamped": 0})
+        g["jobs"] += 1
+        g["walls"].append(j["wall"])
+        g["cpu"] += j["cpu"]
+        g["clamped"] += 1 if j["clamped"] else 0
+        if j["lat"] is not None:
+            g["lat"].append(j["lat"])
+        if j["held"] is not None:
+            g["held"].append(j["held"])
+        if j["ready"] is not None:
+            g["ready"].append(j["ready"])
+        if j["variant"] is not None:
+            g["variants"].add(j["variant"])
+        g["queues"].add(j["q"])
+    rows = []
+    for fp, g in groups.items():
+        cp = cp_exec.get(fp, 0.0)
+        rows.append({
+            "fingerprint": fp, "unknown": fp is None,
+            "variants": [{"ea": ea, "bytes": nb} for ea, nb in sorted(g["variants"])],
+            "queues": sorted(g["queues"]), "jobs": g["jobs"],
+            "exec_wall_ms": jq2_exec_stats(g["walls"]), "exec_wall_clamped": g["clamped"],
+            "cpu_ms": g["cpu"],
+            "queue_latency_mean_ms": jq2_mean(g["lat"]), "queue_latency_count": len(g["lat"]),
+            "held_mean_ms": jq2_mean(g["held"]), "held_count": len(g["held"]),
+            "ready_mean_ms": jq2_mean(g["ready"]), "ready_count": len(g["ready"]),
+            "critical_path_ms": cp,
+            "critical_path_share": cp / total_wait_ms if total_wait_ms > 0 else None,
+        })
+    rows.sort(key=lambda r: (-r["critical_path_ms"], -r["exec_wall_ms"]["total_ms"],
+                             r["fingerprint"] or ""))
+    for rank, i in enumerate(sorted(range(len(rows)),
+                                    key=lambda i: (-rows[i]["cpu_ms"], rows[i]["fingerprint"] or "")), 1):
+        rows[i]["cpu_rank"] = rank
+    for rank, row in enumerate(rows, 1):
+        row["cp_rank"] = rank
+    return rows, sum(row["exec_wall_clamped"] for row in rows)
+
+
+def jq2_audio_stale(stale_spans, wait_records, names, window=None, window_source="extent"):
+    """Attribute every AUDIO_STALE block to the job waits of the threads that have them.
+
+    AUDIO_STALE is emitted once per not-refilled block, with b = the block's position in its
+    run (1, 2, ..., n; a non-silent block resets it), so the runs are rebuilt per port in time
+    order: a run starts at b == 1 and its length is the last b before the port's next run start
+    or the window end. A port's first event in the window with b > 1 opened before the window;
+    it is counted with the length seen and flagged open_at_start, so the histogram's block
+    total (the sum of the run lengths) can exceed the number of events in the window.
+
+    Attribution stays per block: the block has a port, not a thread, so every thread with
+    event-flag waits is asked whether the instant lies in one of its waits; a thread whose wait
+    covers it names the terminal job and the wait's dominant image (the fingerprint with the
+    most exec ms in that wait's partition). The block is the firmware's 256 samples at 48 kHz =
+    16/3 ms. Fiber waits are not waits that a job can be named for and are not consulted.
+
+    An in-wait block is a coincidence in time, not proof of causation: a thread that waits a
+    large share of the window is in a wait at that share of random instants. Each thread row
+    therefore carries its wait share (its event-flag wait time clipped to the window divided by
+    the window), the count expected from that share times the stale blocks, and the ratio of
+    observed to expected; the fingerprint rows do the same for their share of the terminal-job
+    wait time, summed over threads. A ratio near 1 is no association.
+    """
+    total = len(stale_spans)
+    win0, win1 = window if window is not None else (None, None)
+    window_ms = (win1 - win0) if window is not None else None
+    window_ok = window_ms is not None and window_ms > 0
+    wait_ms_by_tid = collections.Counter()
+    terminal_wait_by_tid = collections.defaultdict(collections.Counter)
+    if window_ok:
+        for rec in wait_records:
+            dur = overlap(rec["s0"], rec["s1"], win0, win1)
+            if dur > 0:
+                wait_ms_by_tid[rec["tid"]] += dur
+                if rec["has_terminal"]:
+                    terminal_wait_by_tid[rec["tid"]][rec["terminal_fp"]] += dur
+    by_port = collections.defaultdict(list)
+    for i, ev in enumerate(stale_spans):
+        by_port[ev[1]].append((i, ev))
+
+    def band_of(n):
+        for i, (lo, hi, _) in enumerate(AUDIO_STALE_BANDS):
+            if n >= lo and (hi is None or n <= hi):
+                return i
+        return 0 if n < 1 else len(AUDIO_STALE_BANDS) - 1
+
+    def new_hist():
+        return [{"band": label, "min_blocks": lo, "max_blocks": hi, "runs": 0, "blocks": 0}
+                for lo, hi, label in AUDIO_STALE_BANDS]
+
+    def fill_hist(selected):
+        hist = new_hist()
+        for run in selected:
+            h = hist[band_of(run["length"])]
+            h["runs"] += 1
+            h["blocks"] += run["length"]
+        for h in hist:
+            h["ms"] = h["blocks"] * AUDIO_BLOCK_MS
+            h["mean_ms"] = h["ms"] / h["runs"] if h["runs"] else None
+        return hist
+
+    # Rebuild each port's runs. A b == 1 closes the previous run with the last position seen;
+    # a first event with b > 1 is a run that began before the window.
+    runs, run_of_block = [], {}
+    for port in sorted(by_port):
+        cur = None
+        for i, ev in by_port[port]:
+            pos = ev[3]
+            if pos == 1:
+                if cur is not None:
+                    runs.append(cur)
+                cur = {"port": port, "length": 0, "open_at_start": False}
+            elif cur is None:
+                cur = {"port": port, "length": 0, "open_at_start": True}
+            cur["length"] = pos
+            run_of_block[i] = cur
+        if cur is not None:
+            runs.append(cur)
+
+    overall_hist = fill_hist(runs)
+    per_port = []
+    for port in sorted(by_port):
+        port_runs = [r for r in runs if r["port"] == port]
+        per_port.append({
+            "port": port, "runs": len(port_runs),
+            "blocks": sum(r["length"] for r in port_runs),
+            "runs_ge_2_blocks": sum(1 for r in port_runs if r["length"] >= 2),
+            "open_at_start": sum(1 for r in port_runs if r["open_at_start"]),
+            "histogram": fill_hist(port_runs),
+        })
+
+    waits_by_tid = collections.defaultdict(list)
+    for rec in wait_records:
+        waits_by_tid[rec["tid"]].append(rec)
+    starts = {}
+    for tid, recs in waits_by_tid.items():
+        recs.sort(key=lambda r: r["s0"])
+        starts[tid] = [r["s0"] for r in recs]
+
+    def wait_at(tid, t):
+        recs = waits_by_tid.get(tid)
+        if not recs:
+            return None
+        i = bisect.bisect_right(starts[tid], t) - 1
+        return recs[i] if i >= 0 and t <= recs[i]["s1"] else None
+
+    threads = [{"tid": tid, "name": (names or {}).get(tid, "?"), "waits": len(recs),
+                "blocks_in_wait": 0, "blocks_not_in_wait": 0,
+                "wait_share": (wait_ms_by_tid[tid] / window_ms) if window_ok else None,
+                "expected_blocks_in_wait": ((wait_ms_by_tid[tid] / window_ms) * total
+                                            if window_ok else None),
+                "in_wait_ratio": None}
+               for tid, recs in sorted(waits_by_tid.items())]
+    thread_of = {row["tid"]: row for row in threads}
+    fp_counts = collections.defaultdict(lambda: {"terminal_blocks": 0, "dominant_blocks": 0})
+    events, in_any = [], 0
+    for i, ev in enumerate(stale_spans):
+        t, pos = ev[4], ev[3]
+        run = run_of_block[i]
+        hits = []
+        for tid in sorted(waits_by_tid):
+            rec = wait_at(tid, t)
+            if rec is None:
+                thread_of[tid]["blocks_not_in_wait"] += 1
+                continue
+            thread_of[tid]["blocks_in_wait"] += 1
+            if rec["has_terminal"]:
+                fp_counts[rec["terminal_fp"]]["terminal_blocks"] += 1
+            if rec["has_exec"]:
+                fp_counts[rec["dominant_fp"]]["dominant_blocks"] += 1
+            hits.append({
+                "tid": tid, "q": rec["q"], "seq": rec["terminal_seq"],
+                "terminal": ({"fingerprint": rec["terminal_fp"], "unknown": rec["terminal_fp"] is None}
+                             if rec["has_terminal"] else None),
+                "waited_ms": t - rec["s0"],
+                "dominant": ({"fingerprint": rec["dominant_fp"], "unknown": rec["dominant_fp"] is None}
+                             if rec["has_exec"] else None),
+            })
+        if hits:
+            in_any += 1
+        events.append({"at_ms": t, "port": ev[1], "block": ev[2], "run_pos": pos,
+                       "run_len": run["length"], "run_ms": pos * AUDIO_BLOCK_MS,
+                       "band": AUDIO_STALE_BANDS[band_of(run["length"])][2], "waits": hits})
+    for row in threads:
+        exp = row["expected_blocks_in_wait"]
+        row["in_wait_ratio"] = (row["blocks_in_wait"] / exp) if exp else None
+    fp_expected = collections.Counter()
+    if window_ok:
+        for by_fp in terminal_wait_by_tid.values():
+            for fp, ms in by_fp.items():
+                fp_expected[fp] += (ms / window_ms) * total
+    fingerprints = []
+    for fp in sorted(set(fp_counts) | set(fp_expected),
+                     key=lambda fp: (-(fp_counts.get(fp, {}).get("terminal_blocks", 0) +
+                                       fp_counts.get(fp, {}).get("dominant_blocks", 0)),
+                                     fp is None, fp or "")):
+        v = fp_counts.get(fp, {"terminal_blocks": 0, "dominant_blocks": 0})
+        exp = fp_expected[fp] if window_ok else None
+        fingerprints.append({"fingerprint": fp, "unknown": fp is None,
+                             "terminal_blocks": v["terminal_blocks"],
+                             "dominant_blocks": v["dominant_blocks"],
+                             "terminal_expected_blocks": exp,
+                             "terminal_ratio": (v["terminal_blocks"] / exp) if exp else None})
+    return {"count": total, "block_ms": AUDIO_BLOCK_MS,
+            "window": {"start_ms": win0, "end_ms": win1, "ms": window_ms,
+                       "source": window_source if window_ok else None},
+            "runs": len(runs), "blocks": sum(r["length"] for r in runs),
+            "runs_ge_2_blocks": sum(1 for r in runs if r["length"] >= 2),
+            "open_at_start": sum(1 for r in runs if r["open_at_start"]),
+            "histogram": overall_hist, "per_port": per_port,
+            "blocks_in_wait": in_any, "blocks_not_in_wait": total - in_any,
+            "threads": threads, "fingerprints": fingerprints, "events": events[:20]}
+
+
+def jq2_section(spans, header, names=None, images=None):
     """The SPURS job queue (jq2) section, or None when the trace has no kinds 22-28.
 
     Queue latency, execution wall and CPU, and completion delay are keyed on (q, seq):
@@ -895,12 +1327,22 @@ def jq2_section(spans, header, names=None):
     up to the summed ready wait inside the recorder's window. A trace without the two
     kinds (a recording made before them) reports the old section and says the
     decomposition needs them.
+
+    Kind 29 (IMAGE) and the `J` lines add image identity: `b` is the image table index, the
+    `J` line names (fingerprint, image_ea, image_bytes), and 0xFFFFFFFF or an index without a
+    `J` line is the unknown image. Every event-flag wait then gets a backward walk from the
+    job its due credit names through the capacity, barrier-release and push links that kept
+    it blocked, which is how an image is charged with the blocking time it caused rather than
+    with the CPU it used. A trace without kind 29 prints no image sections.
     """
-    js = [s for s in spans if JQ2_PUSH <= s[0] <= JQ2_BARRIER]
+    js = [s for s in spans if JQ2_PUSH <= s[0] <= JQ2_IMAGE]
     if not js:
         return None
+    has_images = any(k == JQ2_IMAGE for k, _, _, _, _, _ in js)
+    img_table = images or {}
     by_q = collections.defaultdict(lambda: {"push": [], "job": [], "credit": [], "wait": [],
-                                            "idle": [], "held": [], "barrier": [], "bounds": []})
+                                            "idle": [], "held": [], "barrier": [], "image": [],
+                                            "bounds": []})
     for k, who, a, b, t0, t1 in js:
         if k == JQ2_PUSH:                 # who = tid, a = seq, b = q | depth << 8
             g = by_q[b & 0xFF]
@@ -918,11 +1360,18 @@ def jq2_section(spans, header, names=None):
                 g["held"].append((who & 0xFF, a, b, t0, t1))
             elif k == JQ2_BARRIER:        # a = tags | mask << 16, b = q | waited << 8
                 g["barrier"].append((who & 0xFF, a, b, t0, t1))
+            elif k == JQ2_IMAGE:          # a = seq, b = image table index (J lines)
+                g["image"].append((who & 0xFF, a, b, t0, t1))
             else:                         # JQ2_IDLE: a = depth | reason << 24, b = depth at wake
                 g["idle"].append((who & 0xFF, a, b, t0, t1))
         g["bounds"].append((t0, t1))
 
     queues = []
+    cp_rows_all, cp_queue_rows, images_per_queue, trace_cost_rows = [], [], [], []
+    all_image_jobs, all_wait_records = [], []
+    overall_cp_exec = collections.defaultdict(float)
+    overall_cp_total = 0.0
+    image_clamped_total = 0
     hw = header_window(header)
     # Kind 27 and 28 are what the decomposition rests on; a trace that predates them has neither, and its
     # section stays as it was plus one note line.
@@ -967,8 +1416,9 @@ def jq2_section(spans, header, names=None):
         for v in due.values():
             v.sort()
         used, sync, wait_without_credit = set(), [], 0
+        paired_waits = []   # (tid, t0, t1, waiter, terminal credit or None), in wait order
         fiber = [t1 - t0 for _, _, wake, t0, t1 in waits if wake == JQ2_FIBER_WAKE]
-        for _, waiter, wake, wt0, wt1 in sorted(waits, key=lambda s: s[3]):
+        for tid, waiter, wake, wt0, wt1 in sorted(waits, key=lambda s: s[3]):
             if wake == JQ2_FIBER_WAKE:
                 continue
             hit = None
@@ -982,10 +1432,144 @@ def jq2_section(spans, header, names=None):
                     break
             if hit is None:
                 wait_without_credit += 1
+                paired_waits.append((tid, wt0, wt1, waiter, None))
             else:
                 used.add(hit[1])
                 sync.append(wt1 - hit[0])
+                paired_waits.append((tid, wt0, wt1, waiter, credits[hit[1]]))
         due_total = sum(len(v) for v in due.values())
+
+        # Kind 29 joins to JOB by (q, seq); the image table's index -> (fp, ea, bytes) turns it
+        # into the fingerprint a port registers a lifted image under. 0xFFFFFFFF (the table was
+        # full) and an index without a J line are the unknown image, counted as one row, never
+        # dropped.
+        image_by_seq = {}
+        for _, seq, index, it0, it1 in g["image"]:
+            image_by_seq.setdefault(seq, (index, it0, it1))
+        fp_of_seq = {}
+        for seq, (index, _, _) in image_by_seq.items():
+            entry = None if index == JQ2_IMAGE_UNKNOWN else img_table.get(index)
+            fp_of_seq[seq] = f"{entry[0]:016x}" if entry is not None else None
+        held_by_seq = {}
+        for _, seq, hb, ht0, ht1 in held:
+            held_by_seq.setdefault(seq, (hb, ht0, ht1))
+        push_of_seq = {seq: (p0, p1, depth) for seq, p0, p1, depth in pushes}
+
+        # The walk asks for the latest job of a worker (capacity) or of the queue (a barrier
+        # releaser without its own BARRIER span) ending at or before a time, and for the idle
+        # spans of a worker (parked admission), all of one queue.
+        jobs_sorted = sorted(jobs, key=lambda j: (j[4], j[3]))
+        per_worker = collections.defaultdict(list)
+        for j in jobs_sorted:
+            per_worker[j[0]].append(j)
+        jobs_of_worker = {w: (v, [j[4] for j in v]) for w, v in per_worker.items()}
+        idle_of_worker = collections.defaultdict(list)
+        for w, _, _, it0, it1 in idles:
+            idle_of_worker[w].append((it0, it1))
+        barriers_by_t1 = collections.defaultdict(list)
+        for barrier in barriers:
+            barriers_by_t1[barrier[4]].append(barrier)
+        ctx = {"job_of_seq": {j[1]: j for j in jobs}, "fp_of_seq": fp_of_seq,
+               "image_of_seq": image_by_seq, "held_of_seq": held_by_seq,
+               "push_of_seq": push_of_seq, "jobs_of_worker": jobs_of_worker,
+               "jobs_all": (jobs_sorted, [j[4] for j in jobs_sorted]),
+               "barriers_by_t1": barriers_by_t1,
+               "idle_of_worker": {w: merged(v) for w, v in idle_of_worker.items()}}
+
+        # Section 1: every event-flag wait is walked back from its terminal job, so the
+        # partition and the exec time charged to each image are per (q, tid).
+        q_cp_exec = collections.defaultdict(float)
+        cp_by_tid = collections.defaultdict(lambda: {"waits": 0, "without_credit": 0,
+                                                     "total_ms": 0.0,
+                                                     "parts": dict.fromkeys(JQ2_CP_CATEGORIES, 0.0),
+                                                     "chains": [], "guard_hits": 0})
+        wait_records = []
+        q_cp_total = 0.0
+        for tid, wt0, wt1, _, credit in paired_waits:
+            row = cp_by_tid[tid]
+            row["waits"] += 1
+            row["total_ms"] += wt1 - wt0
+            q_cp_total += wt1 - wt0
+            if credit is None:
+                row["without_credit"] += 1
+                row["parts"]["unresolved"] += wt1 - wt0
+                wait_records.append({"q": q, "tid": tid, "s0": wt0, "s1": wt1,
+                                     "terminal_seq": None, "terminal_fp": None,
+                                     "has_terminal": False, "has_exec": False, "dominant_fp": None})
+                continue
+            walk = jq2_walk(ctx, wt0, wt1, credit[1])
+            for cat, ms in walk["parts"].items():
+                row["parts"][cat] += ms
+            row["chains"].append(walk["chain"])
+            row["guard_hits"] += 1 if walk["guard"] else 0
+            for fp, ms in walk["fp_exec"].items():
+                q_cp_exec[fp] += ms
+            fp_exec = walk["fp_exec"]
+            has_exec = bool(fp_exec)
+            dominant = (max(fp_exec.items(), key=lambda kv: (kv[1], kv[0] is not None, kv[0] or ""))[0]
+                        if has_exec else None)
+            wait_records.append({"q": q, "tid": tid, "s0": wt0, "s1": wt1,
+                                 "terminal_seq": walk["terminal_seq"],
+                                 "terminal_fp": walk["terminal_fp"], "has_terminal": True,
+                                 "has_exec": has_exec, "dominant_fp": dominant})
+        fiber_by_tid = collections.Counter(tid for tid, _, wake, _, _ in waits
+                                           if wake == JQ2_FIBER_WAKE)
+        cp_rows = []
+        for tid in sorted(set(cp_by_tid) | set(fiber_by_tid)):
+            row = cp_by_tid.get(tid)
+            if row is None:
+                row = {"waits": 0, "without_credit": 0, "total_ms": 0.0,
+                       "parts": dict.fromkeys(JQ2_CP_CATEGORIES, 0.0), "chains": [],
+                       "guard_hits": 0}
+            total = row["total_ms"]
+            cp_rows.append({
+                "q": q, "tid": tid, "name": (names or {}).get(tid, "?"),
+                "waits": row["waits"], "fiber_waits": fiber_by_tid.get(tid, 0),
+                "waits_without_credit": row["without_credit"], "total_ms": total,
+                "partition_ms": dict(row["parts"]),
+                "partition_share": {cat: (row["parts"][cat] / total if total > 0 else None)
+                                    for cat in JQ2_CP_CATEGORIES},
+                "mean_chain": jq2_mean(row["chains"]), "guard_hits": row["guard_hits"],
+            })
+        cp_queue_rows.append({"q": q, "waits": len(paired_waits),
+                              "fiber_waits": sum(fiber_by_tid.values()),
+                              "waits_without_credit": sum(r["waits_without_credit"] for r in cp_rows),
+                              "total_ms": q_cp_total,
+                              "guard_hits": sum(r["guard_hits"] for r in cp_rows)})
+        cp_rows_all.extend(cp_rows)
+        overall_cp_total += q_cp_total
+
+        # Section 2: one row per fingerprint that ran on this queue. Exec wall is the JOB span
+        # minus its IMAGE span (identification is reported as trace cost, section 4); CPU is
+        # JOB.b and includes that span.
+        image_jobs = []
+        for w, seq, cpu_us, jt0, jt1 in jobs:
+            img = image_by_seq.get(seq)
+            entry = None
+            if img is not None and img[0] != JQ2_IMAGE_UNKNOWN:
+                entry = img_table.get(img[0])
+            ident = (img[2] - img[1]) if img is not None else 0.0
+            raw_wall = (jt1 - jt0) - ident
+            pushed = push_of_seq.get(seq)
+            hb = held_by_seq.get(seq)
+            image_jobs.append({
+                "fp": f"{entry[0]:016x}" if entry is not None else None,
+                "wall": max(0.0, raw_wall), "clamped": raw_wall < 0.0,
+                "cpu": cpu_us / 1000.0,
+                "lat": None if pushed is None else max(0.0, jt0 - pushed[1]),
+                "held": None if hb is None else hb[2] - hb[1],
+                "ready": None if hb is None else max(0.0, jt0 - hb[2]),
+                "variant": (entry[1], entry[2]) if entry is not None else None, "q": q})
+        image_rows, image_clamped = jq2_image_rows(image_jobs, q_cp_exec, q_cp_total)
+        images_per_queue.append({"q": q, "rows": image_rows})
+        all_image_jobs.extend(image_jobs)
+        image_clamped_total += image_clamped
+        for fp, ms in q_cp_exec.items():
+            overall_cp_exec[fp] += ms
+        trace_cost_rows.append({"q": q,
+                                "image_ms": sum(img[4] - img[3] for img in g["image"]),
+                                "job_ms": sum(j[4] - j[3] for j in jobs)})
+        all_wait_records.extend(wait_records)
 
         # A worker that parked before the recorder opened, or whose span was still open when
         # it closed, reaches past the window; summed whole it charges time the window does
@@ -1031,9 +1615,6 @@ def jq2_section(spans, header, names=None):
         # Kind 27 and 28 are what the decomposition rests on. Availability is a property of the trace: a queue
         # with no held job of its own still belongs to a recording that has the kinds.
         available = has_decomp
-        held_by_seq = {}
-        for _, seq, hb, ht0, ht1 in held:
-            held_by_seq.setdefault(seq, (hb, ht0, ht1))
         held_ms, ready_wait = [], []
         ready_clamped = 0
         for _, seq, _, jt0, _ in jobs:
@@ -1196,7 +1777,145 @@ def jq2_section(spans, header, names=None):
                                  "credit_without_wait": due_total - len(used)},
             },
         })
-    return {"dropped": header_dropped(header), "decomposition_available": has_decomp, "queues": queues}
+    dropped = header_dropped(header)
+    overflow = header_jq2_image_overflow(header)
+    result = {"dropped": dropped, "decomposition_available": has_decomp,
+              "images_available": has_images, "jq2_images": header_jq2_images(header),
+              "jq2_image_overflow": overflow, "incomplete": None, "critical_path": None,
+              "images": None, "audio_stale": None, "trace_cost": None, "queues": queues}
+    if not has_images:
+        return result
+    # A loss counter or a full image table makes the image sections incomplete; saying so is
+    # the only honest reading of a trace whose jobs or images are missing.
+    result["incomplete"] = (dropped or 0) > 0 or (overflow or 0) > 0
+    overall_rows, _ = jq2_image_rows(all_image_jobs, overall_cp_exec, overall_cp_total)
+    result["critical_path"] = {"total_ms": overall_cp_total, "rows": cp_rows_all,
+                               "per_queue": cp_queue_rows}
+    result["images"] = {"exec_wall_clamped": image_clamped_total, "overall": overall_rows,
+                        "per_queue": images_per_queue}
+    # The base rate's denominator is the recorder's window, the same one the queue shares use;
+    # without one in the header, the traced extent stands in so the share has a stated source.
+    audio_window, audio_source = hw, "header"
+    if audio_window is None:
+        t0, t1 = min(s[4] for s in spans), max(s[5] for s in spans)
+        audio_window, audio_source = ((t0, t1) if t1 > t0 else None), "extent"
+    result["audio_stale"] = jq2_audio_stale([s for s in spans if s[0] == AUDIO_STALE],
+                                           all_wait_records, names, audio_window, audio_source)
+    result["trace_cost"] = {
+        "dropped": dropped, "jq2_images": result["jq2_images"], "jq2_image_overflow": overflow,
+        "image_ms": [{"q": r["q"], "image_ms": r["image_ms"], "job_ms": r["job_ms"],
+                      "share": (r["image_ms"] / r["job_ms"]) if r["job_ms"] > 0 else None}
+                     for r in trace_cost_rows]}
+    return result
+
+
+def _jq2_ms(x):
+    return "n/a" if x is None else f"{x:.2f}"
+
+
+def _jq2_pct(x):
+    return "n/a" if x is None else f"{100 * x:.0f} %"
+
+
+def _jq2_ratio(x):
+    return "n/a" if x is None else f"{x:.2f}"
+
+
+def print_jq2_critical_path(cp):
+    print("  critical path of blocking waits (event-flag waits; fiber waits excluded):")
+    if not cp["rows"]:
+        print("    none recorded")
+        return
+    for row in cp["rows"]:
+        print(f"    q{row['q']} tid {row['tid']:3d} {row['name'][:20]:20s}: {row['waits']} wait(s),"
+              f" {row['fiber_waits']} fiber excluded, {row['waits_without_credit']} without a"
+              f" terminal credit, {row['total_ms']:.2f} ms")
+        print("      partition: " + ", ".join(
+            f"{JQ2_CP_LABELS[cat]} {row['partition_ms'][cat]:.2f} ms"
+            f" ({_jq2_pct(row['partition_share'][cat])})" for cat in JQ2_CP_CATEGORIES))
+        print(f"      mean chain {_jq2_ms(row['mean_chain'])} jobs, {row['guard_hits']} guard hits")
+
+
+def print_jq2_images(images):
+    print("  job images by fingerprint (CPU is the job's thread CPU time and includes"
+          " identification):")
+
+    def table(title, rows):
+        print(f"    {title}:")
+        if not rows:
+            print("      none recorded")
+            return
+        for r in rows:
+            ex = r["exec_wall_ms"]
+            print(f"      {r['fingerprint'] or 'unknown':16s}  jobs {r['jobs']:4d}"
+                  f"  exec {ex['total_ms']:8.2f} ms (mean {_jq2_ms(ex['mean_ms'])},"
+                  f" p50 {_jq2_ms(ex['p50_ms'])}, p95 {_jq2_ms(ex['p95_ms'])})"
+                  f"  CPU {r['cpu_ms']:8.2f} ms")
+            print(f"        latency mean {_jq2_ms(r['queue_latency_mean_ms'])} ms,"
+                  f" held mean {_jq2_ms(r['held_mean_ms'])} ms,"
+                  f" ready mean {_jq2_ms(r['ready_mean_ms'])} ms")
+            print(f"        critical path {r['critical_path_ms']:.2f} ms"
+                  f" = {_jq2_pct(r['critical_path_share'])} of the blocking wait"
+                  f"  CP rank {r['cp_rank']}, CPU rank {r['cpu_rank']}")
+            variants = ", ".join(f"ea 0x{v['ea']:08x} / {v['bytes']} B" for v in r["variants"])
+            print(f"        image {variants or 'unknown'}; queues"
+                  f" {', '.join(str(q) for q in r['queues']) or 'none'}")
+    for qd in images["per_queue"]:
+        table(f"q{qd['q']}", qd["rows"])
+    table("overall", images["overall"])
+
+
+def print_jq2_audio_stale(aud):
+    w = aud["window"]
+    where = ("window n/a" if w["ms"] is None else
+             f"window {w['start_ms']:.2f}-{w['end_ms']:.2f} ms ({w['source']})")
+    print(f"  audio stale attribution ({where}; block = 256 samples at 48 kHz ="
+          f" {AUDIO_BLOCK_MS:.2f} ms; b = the block's position in its run):")
+    print(f"    {aud['count']} stale block(s): {aud['blocks_in_wait']} in a wait,"
+          f" {aud['blocks_not_in_wait']} not")
+    if not aud["count"]:
+        return
+    print(f"    runs: {aud['runs']}, {aud['blocks']} block(s),"
+          f" {aud['runs_ge_2_blocks']} run(s) of 2+ blocks (10.67 ms or more),"
+          f" {aud['open_at_start']} open at the start")
+    for h in aud["histogram"]:
+        print(f"    run length {h['band']:3s}: {h['runs']:4d} run(s), {h['blocks']:6d} block(s),"
+              f" {h['ms']:9.2f} ms, mean {_jq2_ms(h['mean_ms'])} ms")
+    for p in aud["per_port"]:
+        print(f"    port {p['port']}: {p['runs']} run(s), {p['blocks']} block(s),"
+              f" {p['runs_ge_2_blocks']} of 2+ blocks, {p['open_at_start']} open at the start;"
+              " by length " + ", ".join(f"{h['band']} {h['runs']}/{h['blocks']}"
+                                        for h in p["histogram"]))
+    for t in aud["threads"]:
+        print(f"    tid {t['tid']:3d} {t['name'][:20]:20s}: {t['blocks_in_wait']} block(s) in a"
+              f" wait, {t['blocks_not_in_wait']} not; expected by chance"
+              f" {_jq2_ms(t['expected_blocks_in_wait'])} (wait share {_jq2_pct(t['wait_share'])})"
+              f", ratio {_jq2_ratio(t['in_wait_ratio'])}")
+    for f in aud["fingerprints"]:
+        print(f"    fp {f['fingerprint'] or 'unknown'}: {f['terminal_blocks']} block(s) as terminal"
+              f" job, {f['dominant_blocks']} as dominant image; expected by chance"
+              f" {_jq2_ms(f['terminal_expected_blocks'])} terminal,"
+              f" ratio {_jq2_ratio(f['terminal_ratio'])}")
+    print(f"    first {len(aud['events'])} block(s):")
+    for e in aud["events"]:
+        hits = "; ".join(
+            f"tid {h['tid']} q{h['q']} seq {h['seq']}"
+            f" terminal {h['terminal']['fingerprint'] if h['terminal'] else 'none'}"
+            f" dominant {h['dominant']['fingerprint'] if h['dominant'] else 'none'}"
+            f" waited {h['waited_ms']:.2f} ms" for h in e["waits"])
+        print(f"      {e['at_ms']:9.2f} ms port {e['port']} block {e['block']}"
+              f" run pos {e['run_pos']} of {e['run_len']} ({e['run_ms']:.2f} ms, {e['band']}):"
+              f" {hits or 'no thread in a wait'}")
+
+
+def print_jq2_trace_cost(tc):
+    print("  image identification cost (IMAGE spans, as a share of the queue's JOB time):")
+    if not tc["image_ms"]:
+        print("    none recorded")
+        return
+    for r in tc["image_ms"]:
+        print(f"    q{r['q']}: {r['image_ms']:.2f} ms of {r['job_ms']:.2f} ms job time"
+              f" = {_jq2_pct(r['share'])}")
 
 
 def print_jq2_section(jq):
@@ -1217,6 +1936,18 @@ def print_jq2_section(jq):
     dropped = jq["dropped"]
     print("\nSPURS job queues (jq2):")
     print("  recorder dropped spans: " + ("no header" if dropped is None else str(dropped)))
+    if jq.get("images_available", False):
+        entries = jq["jq2_images"]
+        overflow = jq["jq2_image_overflow"]
+        print(f"  image table: {'n/a' if entries is None else entries} entries,"
+              f" overflow {'not recorded' if overflow is None else overflow}")
+        if jq["incomplete"]:
+            lost = []
+            if dropped:
+                lost.append(f"{dropped} span(s) dropped")
+            if overflow:
+                lost.append(f"{overflow} image table slot(s) lost")
+            print("  INCOMPLETE: " + ", ".join(lost))
     for qd in jq["queues"]:
         w = qd["window"]
         rate = (f"{qd['push_rate_per_s']:.2f} pushes/s" if qd["push_rate_per_s"] is not None
@@ -1294,6 +2025,13 @@ def print_jq2_section(jq):
               f" {jf['job_without_held']} job without a HELD")
     if not jq.get("decomposition_available", False):
         print("  held/admissible decomposition needs kinds 27-28 (HELD, BARRIER); this trace has none")
+    if not jq.get("images_available", False):
+        print("  no image identity in this trace (kind 29)")
+        return
+    print_jq2_critical_path(jq["critical_path"])
+    print_jq2_images(jq["images"])
+    print_jq2_audio_stale(jq["audio_stale"])
+    print_jq2_trace_cost(jq["trace_cost"])
 
 
 def main():
@@ -1317,7 +2055,7 @@ def main():
             ap.error(f"--cadence wants NID[@TID] with a hex NID, got {args.cadence!r}")
 
     try:
-        header, names, spans = load(args.trace)
+        header, names, spans, images = load(args.trace)
     except BadInput as e:
         print(f"ftrace_report: {e}", file=sys.stderr)
         sys.exit(2)
@@ -1341,7 +2079,7 @@ def main():
                            "slow": breakdown(acc, slow, names, name_of) if slow else None}
     report.update(drawable_label_sections(spans, len(flips), header_dropped(header)))
     report["audio"] = audio_section(spans, header_dropped(header), name_of)
-    report["jq2"] = jq2_section(spans, header, names)
+    report["jq2"] = jq2_section(spans, header, names, images)
     if cad_nid is not None:
         report["cadence"] = {"nid": f"{cad_nid:08X}", "import": name_of(cad_nid),
                              "threads": cadence(spans, names, name_of, cad_nid, cad_tid, args.gap)}
