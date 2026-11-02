@@ -9,6 +9,7 @@
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
 uint32_t g_ww_lo, g_ww_hi;
+PPU_THREAD_LOCAL ppu_context* g_active_ctx;   /* cellAudioGetPortConfig names the caller for PS3_FTRACE */
 void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
 int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
 void spu_coh_notify_write(uint32_t a) { (void)a; }

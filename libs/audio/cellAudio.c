@@ -24,6 +24,8 @@
 #include "ps3emu/log_first.h"
 #include "ps3emu/thread_name.h"
 #include "ps3emu/ps3_ftrace.h"
+#include "../../runtime/ppu/ppu_context.h"      /* ppu_context, PPU_THREAD_LOCAL */
+#include "../../runtime/syscalls/ppu_thread_id.h"  /* ppu_tid_diag_index: PS3_FTRACE names PPU threads by table slot */
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
 #endif
@@ -470,6 +472,29 @@ static inline float ld_be_f32(const float* p)
     return f;
 }
 
+/* PS3_FT_AUDIO_RING / _VIEW share one packing: the tag's low 24 bits, nblock - 1, the port. nblock divides 2^24,
+ * so (a >> 8) % nblock stays tag % nblock across the 24-bit wrap. */
+static inline uint32_t audio_ring_trace_a(uint64_t tag, uint32_t nblock, uint32_t port)
+{
+    return (uint32_t)(tag & 0xFFFFFFu) << 8 | (nblock - 1u) << 3 | port;
+}
+
+/* Bit i: block i of the ring holds a non-zero 32-bit word. Raw guest words: no float compare (-0.0f and NaN
+ * patterns count as filled) and no byte swap (a word is zero in either order). Caller holds s_audio_mutex. */
+static uint32_t audio_ring_filled_mask(const AudioPortSlot* port)
+{
+    const uint32_t nblock = (uint32_t)port->param.nBlock;
+    const uint32_t words = CELL_AUDIO_BLOCK_SAMPLES * (uint32_t)port->param.nChannel;
+    uint32_t mask = 0;
+    for (uint32_t b = 0; b < nblock; b++) {
+        const uint32_t* w = (const uint32_t*)(const void*)(port->buffer + (size_t)b * words);
+        for (uint32_t i = 0; i < words; i++) {
+            if (w[i]) { mask |= 1u << b; break; }
+        }
+    }
+    return mask;
+}
+
 /* Mix one block from all active ports into s_mix_buffer (stereo float) */
 static void audio_mix_one_block(void)
 {
@@ -504,6 +529,13 @@ static void audio_mix_one_block(void)
         float level = port->param.level;
         if (level <= 0.0f) level = 1.0f;
         if (level > 1.0f) level = 1.0f;
+
+        /* The ring as the guest could last have seen it: before the read and before the clear below. */
+        if (PS3_FT_ON()) {
+            const uint64_t now_ft = ps3_ft_now();
+            ps3_ft_span(PS3_FT_AUDIO_RING, (uint32_t)p, audio_ring_trace_a(port->read_index, nblock, (uint32_t)p),
+                        audio_ring_filled_mask(port), now_ft, now_ft);
+        }
 
         /* Read one block at the current read_index */
         u32 block_idx = (u32)(port->read_index % nblock);
@@ -1274,6 +1306,8 @@ s32 cellAudioRemoveNotifyEventQueue(u64 key)
 
 s32 cellAudioGetPortConfig(u32 portNum, CellAudioPortConfig* config)
 {
+    const int ft_on = PS3_FT_ON();
+    const uint64_t ft_t0 = ft_on ? ps3_ft_now() : 0;
     /* RPCS3 cellAudio.cpp cellAudioGetPortConfig: init -> NOT_INIT. */
     if (!s_audio_initialized)
         return CELL_AUDIO_ERROR_NOT_INIT;
@@ -1290,6 +1324,14 @@ s32 cellAudioGetPortConfig(u32 portNum, CellAudioPortConfig* config)
 
     mutex_lock(&s_audio_mutex);
     AudioPortSlot* port = &s_ports[portNum];
+    /* Under the mutex, so the tag and the mask are one state of the ring. */
+    int ft_view = 0;
+    uint32_t ft_a = 0, ft_mask = 0;
+    if (ft_on && port->in_use && port->running && port->buffer) {
+        ft_view = 1;
+        ft_a = audio_ring_trace_a(port->read_index, (uint32_t)port->param.nBlock, portNum);
+        ft_mask = audio_ring_filled_mask(port);
+    }
 
     /* CellAudioPortConfig (cell/audio.h). sys_addr_t is uintptr_t, which on the
      * 32-bit PPU ABI is FOUR bytes -- not eight. Writing the two sys_addr_t
@@ -1318,6 +1360,11 @@ s32 cellAudioGetPortConfig(u32 portNum, CellAudioPortConfig* config)
                 (u32)port->port_addr, (u32)port->read_idx_addr); }
 
     mutex_unlock(&s_audio_mutex);
+    if (ft_view) {
+        extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
+        const u32 tid = g_active_ctx ? (u32)ppu_tid_diag_index(g_active_ctx->thread_id) : 0u;
+        ps3_ft_span(PS3_FT_AUDIO_RING_VIEW, tid, ft_a, ft_mask, ft_t0, ps3_ft_now());
+    }
     return CELL_OK;
 }
 

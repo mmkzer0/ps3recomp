@@ -924,6 +924,87 @@ missing span (dropped, or cut at the recorder's edge) ends the walk as
 unresolved rather than guessing. A trace without kind 29 prints one line that
 it has no image identity and changes nothing else; the new keys are then null.
 
+**Audio ring** (kinds 30-31) is its own section: it reads both sides of the
+cellAudio port ring, per port, and answers whether a stale run was the producer
+falling a lap behind or the consumer reading a block too early. Both kinds pack
+`a = tag << 8 | (nblock - 1) << 3 | port`, so `port = a & 7`,
+`nblock = ((a >> 3) & 31) + 1`, `tag` is the port's monotonic read counter
+(`read_index`), and the read block is `tag % nblock`. `b` is the fill mask, bit
+`i` set when block `i` holds at least one non-zero 32-bit word, so exact
+silence written by a producer reads as empty. Kind 30 is the mixer's read of a
+block (instant, `who` = port, emitted before the read); kind 31 is a
+`cellAudioGetPortConfig` call from the producer (entry to return, `who` = PPU
+tid, 0 when no guest thread), its tag and mask taken under the audio mutex.
+The tags are unwrapped per port from their 24 bits, a decrease being a lap;
+kind-31 tags unwrap against the read index at the call. A zero read is a
+kind-30 read whose own block bit is clear.
+
+Per port the section reports:
+
+- reads and zero reads, and the **runs**: maximal sequences of consecutive-tag
+  zero reads that follow a non-zero read, the rule of kind 21 (`AUDIO_STALE`
+  `b`). The exact count of each run length and the share of runs whose length
+  is a multiple of `nblock` (a lap of that port). A tag jump (a dropped read)
+  breaks a sequence, and a zero read that does not follow a known non-zero
+  read opens no run.
+- the **lead at read**: the consecutive set blocks from the read block
+  forward, wrapping, counting the read block (0..nblock), as an exact
+  histogram and a max. The max approximates the producer's own lead limit.
+- the **views** per tid: count, rate, interval p50/p90/p99 and the share whose
+  read block was empty. The **producer tid** is the tid with the most views on
+  the port; the other view tids are listed with their counts.
+- the **writes inferred** by replaying reads and views in time order with a
+  known mask. A read clears its block in the known mask; a bit set in an
+  observed mask but clear in the known one is a write in (previous
+  observation, this one], so the count is the writes seen and the median width
+  of that interval is how precisely their landing time is known. Bits set in
+  the first observation predate the trace and are not counted.
+
+Rates divide by the recorder's window (`start_us`..`end_us` from the header),
+else the port's own traced extent; `window.source` says which.
+
+**Catch classes**, one per run. `R` is the run's first zero read, at tag `T`
+(it reads block `T % nblock`), and `R'` is the read at tag `T - 1`, which
+published `T`:
+
+- **boundary**: some view `V` with `R'.t1 < V.t0 <= R.t0`, `V.tag == T` and
+  block `T % nblock` clear: the producer looked at the index in time and the
+  block was empty.
+- **late**: no such view. The lateness (the producer's first view after
+  `R.t0` minus `R.t0`) is reported as p50/p90; a run with no producer view
+  after it is counted with no lateness.
+- **write-after-read**, independent of the two: block `T % nblock` reappears
+  set in an observation after `R` and before the read at tag
+  `T + nblock - L_max`, where `L_max` is the port's lead max at read (at
+  least 1, reported as `catch.write_after_read_bound_lead`). A producer whose
+  lead never exceeds `L_max` can already write the next lap's block from that
+  read on, so a reappearance at or after the bound is an ordinary next-lap
+  write and is not counted; only one before it landed in the lap the consumer
+  had read empty. A missing read at that tag is replaced by the next read at a
+  tag of at least that value; when no such read exists the run is not counted.
+- **views during the run**: the producer's views from `R.t0` to the run's last
+  zero read, and how many saw their read block empty.
+
+**Attribution, with a base rate.** For a late catch the gap runs from the
+producer's last view before `R.t0` to its first view after it. The producer
+tid's time in that gap is partitioned by duration, one instant charged once,
+in this order: usleep (kind 2, `who == tid`), jq2 sync wait (kind 25,
+`who == tid`), other HLE (kind 15, `who == tid`, excluding
+`cellAudioGetPortConfig`, NID `0x74A66AF0`), other. The report prints the same
+partition over **all** of that tid's view-to-view gaps on the port, and their
+gap-length p50/p90, as the base: a large usleep share after a late catch says
+little if the same thread spends the same share of every gap asleep, and a
+share means nothing without its base. The base is the population the catch
+gaps are drawn from (the producer tid's gaps on that port), not the gaps of
+other threads or other ports.
+
+A trace whose header says `dropped > 0` marks the section `INCOMPLETE`, as the
+jq2 section does, because a rate over a lossy trace is not an honest sum.
+`--json` adds the top-level key `audio_ring` with `ports` (one object per port
+carrying the items above, the first 20 runs in detail in `events`) and
+`incomplete`; a trace without kinds 30-31 prints one line for the section and
+the key is null.
+
 Both kinds are recorded whatever `PS3_FTRACE_MIN_US` says. Exit `0` on a
 report, `2` on an unreadable or malformed trace, bad arguments or fewer than
 three flip requests.

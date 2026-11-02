@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ftrace_report: frame binning, import call sites, split, cadence, drawables, label-store waits, jq2 job queues, image identity and critical path, bad input."""
+"""ftrace_report: frame binning, import call sites, split, cadence, drawables, label-store waits, jq2 job queues, image identity and critical path, audio ring, bad input."""
 import json
 import subprocess
 import sys
@@ -1112,6 +1112,310 @@ with tempfile.TemporaryDirectory() as tmp:
     rc, out, err = run(tmp, jq2_trace(barrier + ["J 9 zz 00100000 4"]))
     check(rc == 2 and "not an image line" in err and "Traceback" not in err,
           "malformed J line: exit 2, no traceback")
+
+# Kinds 30/31: both sides of the cellAudio port ring. a = tag << 8 | (nblock - 1) << 3 | port,
+# b = the filled mask (bit i set when block i holds a non-zero word); kind 30 is the mixer's
+# read (instant), kind 31 a cellAudioGetPortConfig call from the producer (entry to return).
+AUDIO_RING, AUDIO_RING_VIEW = 30, 31
+GETPORT = 0x74A66AF0
+RING_FLIPS = [span(FLIP_REQ, 1, 0, 0, t, t) for t in (0, 20, 40)]
+
+
+def ring_a(port, nblock, tag):
+    return (tag & 0xFFFFFF) << 8 | (nblock - 1) << 3 | port
+
+
+def ring(kind, who, port, nblock, tag, mask, t0, t1=None):
+    return span(kind, who, ring_a(port, nblock, tag), mask, t0, t0 if t1 is None else t1)
+
+
+def ring_port(r, port):
+    rows = [p for p in r["audio_ring"]["ports"] if p["port"] == port]
+    check(len(rows) == 1, f"one audio ring row for port {port}: {len(rows)}")
+    return rows[0]
+
+
+# The lead at a read is the run of set blocks from the read block forward, wrapping, the read
+# block counted. Tag T reads block T % 8, and each mask is chosen to give the lead of its tag.
+lead = list(RING_FLIPS)
+lead += [ring(AUDIO_RING, 0, 0, 8, 0, 0x00, 0.1),   # block 0 clear: 0
+         ring(AUDIO_RING, 0, 0, 8, 1, 0x02, 0.2),   # block 1: 1
+         ring(AUDIO_RING, 0, 0, 8, 2, 0x0C, 0.3),   # blocks 2-3: 2
+         ring(AUDIO_RING, 0, 0, 8, 3, 0x38, 0.4),   # blocks 3-5: 3
+         ring(AUDIO_RING, 0, 0, 8, 4, 0xF0, 0.5),   # blocks 4-7: 4
+         ring(AUDIO_RING, 0, 0, 8, 5, 0xE3, 0.6),   # blocks 5-1 (wrap): 5
+         ring(AUDIO_RING, 0, 0, 8, 6, 0xCF, 0.7),   # blocks 6-3 (wrap): 6
+         ring(AUDIO_RING, 0, 0, 8, 7, 0xBF, 0.8),   # blocks 7-5 (wrap): 7
+         ring(AUDIO_RING, 0, 0, 8, 8, 0xFF, 0.9)]   # the whole ring: 8
+
+with tempfile.TemporaryDirectory() as tmp:
+    rc, out, err = run(tmp, trace(lead), "--json")
+    check(rc == 0, f"audio ring lead: exit 0: {err}")
+    r = json.loads(out)
+    check(r["audio_ring"]["incomplete"] is False and r["audio_ring"]["dropped"] == 0,
+          "audio ring lead: complete, no drops")
+    p0 = ring_port(r, 0)
+    check(p0["nblock"] == 8 and p0["reads"] == 9 and p0["zero_reads"] == 1,
+          f"audio ring lead: 9 reads, 1 zero {p0['reads']}/{p0['zero_reads']}")
+    check(p0["lead"]["histogram"] == {str(n): 1 for n in range(9)} and p0["lead"]["max"] == 8,
+          f"audio ring lead: the exact histogram 0..8 {p0['lead']}")
+    check(p0["runs"]["count"] == 0 and p0["runs"]["lengths"] == {} and p0["runs"]["blocks"] == 0,
+          "audio ring lead: a zero read with no refilled read before it opens no run")
+    check(p0["views"] == [] and p0["producer_tid"] is None and p0["late_attribution"] is None and
+          p0["catch"]["boundary"] == 0 and p0["catch"]["late"] == 0,
+          "audio ring lead: no views, no producer, nothing to attribute")
+    rc, out, err = run(tmp, trace(lead))
+    check(rc == 0 and "Audio ring (cellAudio port ring" in out and "lead at read: max 8 of 8;" in out,
+          "audio ring lead text: the section and its lead line")
+
+# Runs of 8, 16 and 3 on an 8-block port, a 16-block port alongside it, and two view tids: tid 2
+# views twice (the producer by count) and catches the 8-block run at its boundary; tid 3 once.
+# The 16-block run is one lap of that port and a multiple of its nBlock, the 3-block run is not
+# a multiple of 8, and the 16-block run on port 0 is two laps.
+runs = list(RING_FLIPS)
+for tag in range(10):
+    runs.append(ring(AUDIO_RING, 0, 0, 8, tag, 1 << (tag % 8), 1.0 + 0.1 * tag))
+for tag in range(10, 18):
+    runs.append(ring(AUDIO_RING, 0, 0, 8, tag, 0, 1.0 + 0.1 * tag))
+runs.append(ring(AUDIO_RING, 0, 0, 8, 18, 1 << (18 % 8), 1.0 + 0.1 * 18))
+for tag in (19, 20, 21):
+    runs.append(ring(AUDIO_RING, 0, 0, 8, tag, 0, 1.0 + 0.1 * tag))
+runs.append(ring(AUDIO_RING, 0, 0, 8, 22, 1 << (22 % 8), 1.0 + 0.1 * 22))
+for tag in range(23, 39):
+    runs.append(ring(AUDIO_RING, 0, 0, 8, tag, 0, 1.0 + 0.1 * tag))
+runs.append(ring(AUDIO_RING, 0, 0, 8, 39, 1 << (39 % 8), 1.0 + 0.1 * 39))
+runs.append(ring(AUDIO_RING, 0, 1, 16, 0, 1, 5.0))
+for tag in range(1, 17):
+    runs.append(ring(AUDIO_RING, 0, 1, 16, tag, 0, 5.0 + 0.1 * tag))
+runs.append(ring(AUDIO_RING, 0, 1, 16, 17, 2, 5.0 + 0.1 * 17))
+runs.append(ring(AUDIO_RING_VIEW, 3, 0, 8, 0, 0, 0.5))
+runs.append(ring(AUDIO_RING_VIEW, 2, 0, 8, 10, 0, 1.95))   # tag T=10, block 2 clear: boundary
+runs.append(ring(AUDIO_RING_VIEW, 2, 0, 8, 31, 0, 4.05))   # inside the 16-block run
+
+with tempfile.TemporaryDirectory() as tmp:
+    rc, out, err = run(tmp, trace(runs), "--json")
+    check(rc == 0, f"audio ring runs: exit 0: {err}")
+    r = json.loads(out)
+    check([p["port"] for p in r["audio_ring"]["ports"]] == [0, 1], "audio ring runs: ports 0 and 1")
+    p0, p1 = ring_port(r, 0), ring_port(r, 1)
+    check(p0["nblock"] == 8 and p1["nblock"] == 16, "audio ring runs: nBlock per port from the packing")
+    check(p0["reads"] == 40 and p0["zero_reads"] == 27, "audio ring runs: 40 reads, 27 of them zero")
+    check(p0["runs"]["count"] == 3 and p0["runs"]["blocks"] == 27 and
+          p0["runs"]["lengths"] == {"3": 1, "8": 1, "16": 1} and
+          p0["runs"]["multiple_of_nblock"] == 2 and close(p0["runs"]["multiple_share"], 2 / 3),
+          f"audio ring runs: runs of 8, 16 and 3, two a multiple of nBlock {p0['runs']}")
+    check([e["length"] for e in p0["events"]] == [8, 3, 16] and
+          [e["class"] for e in p0["events"]] == ["boundary", "late", "late"],
+          f"audio ring runs: the catch class of each run {p0['events']}")
+    check(p0["catch"]["boundary"] == 1 and p0["catch"]["late"] == 2 and
+          p0["catch"]["write_after_read"] == 0 and
+          p0["catch"]["write_after_read_bound_lead"] == 1 and
+          close(p0["catch"]["late_lateness_ms"]["p50"], 0.75) and
+          close(p0["catch"]["late_lateness_ms"]["p90"], 1.15),
+          f"audio ring runs: one boundary catch, two late, no write-after-read {p0['catch']}")
+    check(p0["catch"]["views_during_run"] == 1 and p0["catch"]["views_during_run_empty"] == 1,
+          "audio ring runs: the producer view inside the 16-block run saw its block empty")
+    check(p0["lead"] == {"histogram": {"0": 27, "1": 13}, "max": 1},
+          f"audio ring runs: the lead histogram of a one-word producer {p0['lead']}")
+    check(p0["producer_tid"] == 2 and p0["views_total"] == 3 and
+          [(v["tid"], v["count"]) for v in p0["views"]] == [(2, 2), (3, 1)],
+          f"audio ring runs: the producer tid is the one with the most views {p0['views']}")
+    v2, v3 = p0["views"]
+    check(close(v2["rate"], 10) and close(v2["interval_ms"]["p50"], 2.1) and
+          close(v2["empty_share"], 1.0) and close(v3["rate"], 5) and
+          v3["interval_ms"]["p50"] is None, "audio ring runs: per-tid rate, interval and empty share")
+    check(p0["writes"]["count"] == 13 and close(p0["writes"]["median_interval_ms"], 0.1) and
+          close(p0["writes"]["rate"], 65),
+          f"audio ring runs: writes inferred from the masks {p0['writes']}")
+    check(p0["late_attribution"]["count"] == 2 and
+          close(p0["late_attribution"]["gap_ms"], 4.2) and
+          close(p0["late_attribution"]["partition_ms"]["other"], 4.2) and
+          close(p0["late_attribution"]["base"]["gaps"], 1) and
+          close(p0["late_attribution"]["base"]["gap_ms"]["p50"], 2.1),
+          f"audio ring runs: both late gaps are the same 2.1 ms view gap {p0['late_attribution']}")
+    check(p1["reads"] == 18 and p1["zero_reads"] == 16 and p1["runs"]["count"] == 1 and
+          p1["runs"]["lengths"] == {"16": 1} and p1["runs"]["multiple_of_nblock"] == 1 and
+          close(p1["runs"]["multiple_share"], 1.0) and
+          p1["catch"]["boundary"] == 0 and p1["catch"]["late"] == 1 and
+          p1["catch"]["late_lateness_ms"]["p50"] is None and
+          p1["views"] == [] and p1["producer_tid"] is None and p1["late_attribution"] is None,
+          f"audio ring runs: a 16-block port with a lap-long run and no views {p1}")
+    rc, out, err = run(tmp, trace(runs))
+    check(rc == 0 and "runs: 3 (27 block(s)); lengths 3 blk x1, 8 blk x1, 16 blk x1;" in out and
+          "2 a multiple of nBlock (67 %)" in out and
+          "catches: 1 boundary, 2 late (lateness p50 0.75 p90 1.15 ms), 0 write-after-read" in out and
+          "port 1: nBlock 16" in out,
+          "audio ring runs text: run lengths, the nBlock share and the catch counts")
+
+# A late catch with a hand-counted partition against its base. The producer views at 0, 1, 2, 3
+# and 10 ms; the 1-block run's first zero read is at 5 ms, so the last view before it is at 3 and
+# the first after it at 10: a 7 ms gap, lateness 5 ms. In that gap: usleep 3.5-5.5, a jq2 sync
+# wait 6-9, an HLE import 9.2-9.7, so 2 + 3 + 0.5 + 1.5 ms. The base is all four view-to-view
+# gaps (10 ms in all), and the GetPortConfig call at 2.2-2.6 is "other", not "other HLE".
+late = list(RING_FLIPS)
+late += [ring(AUDIO_RING, 0, 0, 8, 0, 0x01, 0.2),
+         ring(AUDIO_RING, 0, 0, 8, 1, 0x02, 0.4),
+         ring(AUDIO_RING, 0, 0, 8, 2, 0x04, 3.4),
+         ring(AUDIO_RING, 0, 0, 8, 3, 0x00, 5.0),
+         ring(AUDIO_RING, 0, 0, 8, 4, 0x10, 10.5),
+         ring(AUDIO_RING_VIEW, 2, 0, 8, 0, 0, 0),
+         ring(AUDIO_RING_VIEW, 2, 0, 8, 1, 0, 1),
+         ring(AUDIO_RING_VIEW, 2, 0, 8, 2, 0, 2),
+         ring(AUDIO_RING_VIEW, 2, 0, 8, 2, 0, 3),
+         ring(AUDIO_RING_VIEW, 2, 0, 8, 4, 0, 10),
+         span(USLEEP, 2, 1, 0x3000, 3.5, 5.5),
+         span(HLE, 2, GETPORT, 0x1000, 2.2, 2.6),
+         span(JQ2_SYNC_WAIT, 2, 3 | 1 << 8, 0, 6, 9),
+         span(HLE, 2, 0x1234, 0x1100, 9.2, 9.7)]
+
+with tempfile.TemporaryDirectory() as tmp:
+    rc, out, err = run(tmp, trace(late), "--json")
+    check(rc == 0, f"audio ring late: exit 0: {err}")
+    p0 = ring_port(json.loads(out), 0)
+    check(p0["reads"] == 5 and p0["zero_reads"] == 1 and p0["runs"]["count"] == 1 and
+          p0["runs"]["lengths"] == {"1": 1} and p0["runs"]["multiple_of_nblock"] == 0 and
+          close(p0["runs"]["multiple_share"], 0.0),
+          f"audio ring late: a single 1-block run, not a multiple of 8 {p0['runs']}")
+    v = p0["views"]
+    check(len(v) == 1 and v[0]["tid"] == 2 and v[0]["count"] == 5 and close(v[0]["rate"], 25) and
+          close(v[0]["interval_ms"]["p50"], 1) and close(v[0]["interval_ms"]["p90"], 7) and
+          close(v[0]["interval_ms"]["p99"], 7) and close(v[0]["empty_share"], 1.0),
+          f"audio ring late: five views, gap p50 1 p90/p99 7 ms {v}")
+    check(p0["catch"]["boundary"] == 0 and p0["catch"]["late"] == 1 and
+          close(p0["catch"]["late_lateness_ms"]["p50"], 5) and
+          close(p0["catch"]["late_lateness_ms"]["p90"], 5) and
+          p0["catch"]["write_after_read"] == 0 and p0["catch"]["views_during_run"] == 0,
+          f"audio ring late: one late catch, lateness 5 ms {p0['catch']}")
+    at = p0["late_attribution"]
+    check(at["count"] == 1 and close(at["gap_ms"], 7) and
+          at["partition_ms"] == {"usleep": 2, "jq2 sync wait": 3, "other HLE": 0.5, "other": 1.5} and
+          close(at["partition_share"]["usleep"], 2 / 7) and
+          close(at["partition_share"]["jq2 sync wait"], 3 / 7) and
+          close(at["partition_share"]["other HLE"], 0.5 / 7) and
+          close(at["partition_share"]["other"], 1.5 / 7),
+          f"audio ring late: the gap partition {at}")
+    base = at["base"]
+    check(base["gaps"] == 4 and close(base["gap_ms"]["p50"], 1) and close(base["gap_ms"]["p90"], 7) and
+          base["partition_ms"] == {"usleep": 2, "jq2 sync wait": 3, "other HLE": 0.5, "other": 4.5} and
+          close(base["partition_share"]["usleep"], 0.2) and
+          close(base["partition_share"]["jq2 sync wait"], 0.3) and
+          close(base["partition_share"]["other HLE"], 0.05) and
+          close(base["partition_share"]["other"], 0.45),
+          f"audio ring late: the base over all view-to-view gaps {base}")
+    check(p0["writes"]["count"] == 4 and close(p0["writes"]["median_interval_ms"], 0.3) and
+          close(p0["writes"]["rate"], 20),
+          f"audio ring late: four writes, landing precision 0.3 ms {p0['writes']}")
+    rc, out, err = run(tmp, trace(late))
+    check(rc == 0 and
+          "late: usleep 2.00 ms (29 %), jq2 sync wait 3.00 ms (43 %), other HLE 0.50 ms (7 %),"
+          " other 1.50 ms (21 %)" in out and
+          "late catch attribution: 1 of 1 late catch(es) with a producer view on both sides,"
+          " 7.00 ms in their gaps" in out and
+          "base: all 4 view-to-view gap(s) of the producer tid, p50 1.00 p90 7.00 ms:"
+          " usleep 20 %, jq2 sync wait 30 %, other HLE 5 %, other 45 %" in out,
+          "audio ring late text: the gap partition next to its base")
+
+# Write-after-read is bounded by the port's lead max L_max: a producer whose lead never exceeds
+# L_max may already write the next lap's block up to L_max reads before the reader returns, so
+# only a reappearance before the read at tag T + n - L_max counts. L_max here is 1 (every fill
+# is one word at its own block). Run 1 (tag 1, block 1) sees block 1 set at 2.2, before the bound
+# read at tag 7; run 2 (tag 5, block 5) sees block 5 only at 7.2, after the bound read at tag 12:
+# the normal next-lap write, not counted.
+war = list(RING_FLIPS)
+war += [ring(AUDIO_RING, 0, 0, 8, 0, 0x01, 1.0),
+        ring(AUDIO_RING, 0, 0, 8, 1, 0x00, 1.5),
+        ring(AUDIO_RING, 0, 0, 8, 2, 0x00, 2.0),
+        ring(AUDIO_RING_VIEW, 2, 0, 8, 2, 0x02, 2.2),      # block 1 set inside the bound
+        ring(AUDIO_RING, 0, 0, 8, 3, 0x00, 2.5),
+        ring(AUDIO_RING, 0, 0, 8, 4, 0x10, 3.0),
+        ring(AUDIO_RING, 0, 0, 8, 5, 0x00, 3.5),
+        ring(AUDIO_RING, 0, 0, 8, 6, 0x00, 4.0),
+        ring(AUDIO_RING, 0, 0, 8, 7, 0x00, 4.5),
+        ring(AUDIO_RING, 0, 0, 8, 8, 0x01, 5.0),
+        ring(AUDIO_RING, 0, 0, 8, 9, 0x02, 5.5),
+        ring(AUDIO_RING, 0, 0, 8, 10, 0x04, 6.0),
+        ring(AUDIO_RING, 0, 0, 8, 11, 0x08, 6.5),
+        ring(AUDIO_RING, 0, 0, 8, 12, 0x10, 7.0),
+        ring(AUDIO_RING_VIEW, 2, 0, 8, 13, 0x20, 7.2)]     # block 5 at the next lap
+
+with tempfile.TemporaryDirectory() as tmp:
+    rc, out, err = run(tmp, trace(war), "--json")
+    check(rc == 0, f"audio ring write-after-read: exit 0: {err}")
+    p0 = ring_port(json.loads(out), 0)
+    check(p0["runs"]["count"] == 2 and p0["runs"]["blocks"] == 6 and
+          p0["runs"]["lengths"] == {"3": 2} and p0["zero_reads"] == 6 and
+          p0["lead"] == {"histogram": {"0": 6, "1": 7}, "max": 1},
+          f"audio ring write-after-read: two runs of 3, lead max 1 {p0['runs']} {p0['lead']}")
+    check(p0["catch"]["write_after_read"] == 1 and
+          p0["catch"]["write_after_read_bound_lead"] == 1 and
+          [e["tag"] for e in p0["events"]] == [1, 5] and
+          [e["write_after_read"] for e in p0["events"]] == [True, False] and
+          p0["catch"]["views_during_run"] == 1 and p0["catch"]["views_during_run_empty"] == 1,
+          f"audio ring write-after-read: inside the bound counts, at the bound does not {p0['catch']}")
+    check(p0["catch"]["boundary"] == 0 and p0["catch"]["late"] == 2 and
+          close(p0["catch"]["late_lateness_ms"]["p50"], 0.7) and
+          close(p0["catch"]["late_lateness_ms"]["p90"], 3.7),
+          "audio ring write-after-read: both catches are late, by 0.7 and 3.7 ms")
+    check(p0["views"][0]["count"] == 2 and close(p0["views"][0]["interval_ms"]["p50"], 5.0) and
+          close(p0["views"][0]["empty_share"], 0.5) and
+          p0["late_attribution"]["count"] == 1 and
+          close(p0["late_attribution"]["gap_ms"], 5.0) and
+          close(p0["late_attribution"]["base"]["gaps"], 1),
+          f"audio ring write-after-read: one 5 ms view gap {p0['views']} {p0['late_attribution']}")
+    rc, out, err = run(tmp, trace(war))
+    check(rc == 0 and "catches: 0 boundary, 2 late (lateness p50 0.70 p90 3.70 ms),"
+          " 1 write-after-read (L_max 1)" in out and
+          "views during runs: 1, 1 saw their read block empty" in out,
+          "audio ring write-after-read text: the class, the bound and the views in the run")
+
+# A 24-bit tag wrap inside the trace: reads 0xFFFFFD..0x000001 unwrap to consecutive tags, the
+# run of 3 spans the wrap, and the view at tag 0xFFFFFE unwraps to the run's first tag (boundary).
+wrap = list(RING_FLIPS)
+wrap += [ring(AUDIO_RING, 0, 0, 8, 0xFFFFFD, 1 << 5, 1.0),
+         ring(AUDIO_RING, 0, 0, 8, 0xFFFFFE, 0, 2.0),
+         ring(AUDIO_RING, 0, 0, 8, 0xFFFFFF, 0, 3.0),
+         ring(AUDIO_RING, 0, 0, 8, 0x000000, 0, 4.0),
+         ring(AUDIO_RING, 0, 0, 8, 0x000001, 1 << 1, 5.0),
+         ring(AUDIO_RING_VIEW, 2, 0, 8, 0xFFFFFE, 0, 1.5),
+         ring(AUDIO_RING_VIEW, 2, 0, 8, 0x000000, 0, 3.5)]
+
+with tempfile.TemporaryDirectory() as tmp:
+    rc, out, err = run(tmp, trace(wrap), "--json")
+    check(rc == 0, f"audio ring wrap: exit 0: {err}")
+    p0 = ring_port(json.loads(out), 0)
+    check(p0["runs"]["count"] == 1 and p0["runs"]["lengths"] == {"3": 1} and
+          p0["runs"]["blocks"] == 3 and p0["runs"]["multiple_of_nblock"] == 0,
+          f"audio ring wrap: one run of 3 across the wrap {p0['runs']}")
+    ev = p0["events"][0]
+    check(ev["tag"] == 0xFFFFFE and ev["block"] == 6 and ev["length"] == 3 and
+          ev["class"] == "boundary", f"audio ring wrap: the unwrapped tag, block and class {ev}")
+    check(p0["catch"]["boundary"] == 1 and p0["catch"]["late"] == 0 and
+          p0["catch"]["views_during_run"] == 1,
+          f"audio ring wrap: the boundary view across the wrap {p0['catch']}")
+    check(p0["lead"] == {"histogram": {"0": 3, "1": 2}, "max": 1} and
+          p0["views"][0]["count"] == 2 and close(p0["views"][0]["interval_ms"]["p50"], 2) and
+          close(p0["views"][0]["empty_share"], 1.0),
+          f"audio ring wrap: lead and the two unwrapped views {p0['lead']} {p0['views']}")
+
+# A dropped-span header marks the section INCOMPLETE, in text and JSON.
+with tempfile.TemporaryDirectory() as tmp:
+    rc, out, err = run(tmp, trace(runs, dropped=3), "--json")
+    check(rc == 0 and json.loads(out)["audio_ring"]["incomplete"] is True and
+          json.loads(out)["audio_ring"]["dropped"] == 3,
+          "audio ring losses: dropped spans mark the JSON incomplete")
+    rc, out, err = run(tmp, trace(runs, dropped=3))
+    check(rc == 0 and "INCOMPLETE: 3 span(s) dropped" in out,
+          "audio ring losses: dropped spans mark the text incomplete")
+
+    # A trace without the kinds prints exactly one line for the section and leaves the key null.
+    rc, out, err = run(tmp, trace(RING_FLIPS), "--json")
+    check(rc == 0 and json.loads(out)["audio_ring"] is None,
+          "audio ring absent: the JSON key is null")
+    rc, out, err = run(tmp, trace(RING_FLIPS))
+    check(rc == 0 and out.count("Audio ring") == 1 and
+          "no kind 30/31 (AUDIO_RING, AUDIO_RING_VIEW) records in this trace" in out and
+          "Audio ring (cellAudio port ring" not in out,
+          "audio ring absent: one line saying so, no section")
 
 print("ftrace_report: %s" % ("ok" if not failures else "%d failed" % failures))
 sys.exit(1 if failures else 0)
