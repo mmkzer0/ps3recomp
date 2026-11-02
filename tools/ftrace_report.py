@@ -86,6 +86,17 @@ the run-length histogram rebuilt per port. A loss counter or a full image table
 marks the section INCOMPLETE. A trace without kind 29 prints one line saying it
 has no image identity and changes nothing else.
 
+A fourth section, audio ring (kinds 30-31), reads both sides of the cellAudio
+port ring, per port: the reads and the runs of blocks read empty (consecutive
+tags, after a read that was filled), the producer's lead at each read, the
+writes inferred from the observed fill masks, the views per tid, and per run
+whether the producer looked at the index in time (boundary) or was late, and
+whether the block was written after the lap had passed (write-after-read); a
+late catch is charged to what the producer tid was doing in its gap, against
+the same partition over all of that tid's view-to-view gaps (the base rate). A
+header `dropped > 0` marks the section INCOMPLETE; a trace without the kinds
+prints one line.
+
 Without --json it then draws a few frames as a timeline (one column per
 --ms-per-col ms):
   PPU   '#' running   '.' usleep poll   's' other blocking syscall
@@ -108,7 +119,7 @@ import sys
  GPU_ENCODE, GPU_WAIT, READBACK, GPU_EXEC, HLE, DRAWABLE, LABEL_WAIT,
  AUDIO_MIX, AUDIO_PACE, AUDIO_UNDERRUN, AUDIO_STALE,
  JQ2_PUSH, JQ2_JOB, JQ2_CREDIT, JQ2_SYNC_WAIT, JQ2_IDLE, JQ2_HELD, JQ2_BARRIER,
- JQ2_IMAGE) = range(1, 30)
+ JQ2_IMAGE, AUDIO_RING, AUDIO_RING_VIEW) = range(1, 32)
 AUDIO_PACE_REASON = {1: "queue full", 2: "clock pacing", 3: "backend wait"}
 JQ2_FIBER_WAKE = 2       # wake field of a fiber wait or wake; it carries waiter 0xFF, so it cannot be joined
 JQ2_PARK_REASONS = {0: "unrecorded", 1: "empty", 2: "unwritten", 3: "held", 4: "no-slot", 5: "paused",
@@ -124,6 +135,8 @@ JQ2_CP_LABELS = {"credit_wake": "credit+wake", "exec": "exec (job minus image)",
                  "barrier_release": "barrier-release", "push": "push", "unresolved": "unresolved"}
 AUDIO_BLOCK_MS = 16.0 / 3.0  # the firmware's 256-sample block at 48 kHz; the stale report's unit
 AUDIO_STALE_BANDS = ((1, 1, "1"), (2, 2, "2"), (3, 4, "3-4"), (5, 8, "5-8"), (9, None, "9+"))
+AUDIO_GET_PORT_CONFIG_NID = 0x74A66AF0  # cellAudioGetPortConfig: the producer's own view is not "other HLE"
+AUDIO_RING_ATTRIBUTION = ("usleep", "jq2 sync wait", "other HLE", "other")  # one instant charged once
 GPU_WAIT_KIND = {0: "gpu wait (flush)", 1: "gpu wait (present)", 2: "gpu wait (in-flight)"}
 GPU_WAIT_INFLIGHT = 2
 SPINS_SLEEPING = 64      # cellGcmSys.c yields for 64 spins, then sleeps 1 ms per spin
@@ -837,6 +850,414 @@ def print_audio_section(aud):
                 print(f"      tid {h['tid']:3d} {h['import']} ({h['nid']}): {h['count']}")
         else:
             print("    overlapping long guest waits (>10 ms HLE): none")
+
+
+def audio_ring_packing(a):
+    """port, nBlock and the 24-bit tag of a kind 30/31 record: (tag & 0xFFFFFF) << 8 | (nblock - 1) << 3 | port."""
+    return a & 7, ((a >> 3) & 31) + 1, a >> 8
+
+
+def audio_ring_share(part, total):
+    return part / total if total > 0 else None
+
+
+def audio_ring_rate(count, window_ms):
+    return count / (window_ms / 1000.0) if window_ms > 0 else None
+
+
+def audio_ring_unwrap_reads(reads):
+    """Unwrap a port's kind-30 tags: the read counter rises by 1 per read, so a decrease is a 24-bit wrap.
+
+    A dropped read shows as a jump of more than 1, which the run rule treats as a broken
+    sequence: the trace cannot show the reads it lost were zero.
+    """
+    offset = 0
+    prev = None
+    for r in reads:
+        if prev is not None and r["tag24"] < prev:
+            offset += 1 << 24
+        prev = r["tag24"]
+        r["tag"] = r["tag24"] + offset
+
+
+def audio_ring_unwrap_views(views, reads):
+    """Unwrap a port's kind-31 tags against the read index at the view's time.
+
+    A view's tag is the port's read_index as of the call, so it lies at or just past the
+    last read at or before it; the 24-bit candidate nearest that index is the right decode.
+    Without reads (a trace cut before the first kind 30) consecutive views carry the wrap
+    instead, a decrease being one lap.
+    """
+    times = [r["t0"] for r in reads]
+    tags = [r["tag"] for r in reads]
+    offset = 0
+    prev24 = None
+    for v in views:
+        t24 = v["tag24"]
+        if tags:
+            i = bisect.bisect_right(times, v["t0"]) - 1
+            base = tags[i] + 1 if i >= 0 else tags[0]
+            v["tag"] = t24 + (((base - t24 + (1 << 23)) >> 24) << 24)
+        else:
+            if prev24 is not None and t24 < prev24:
+                offset += 1 << 24
+            v["tag"] = t24 + offset
+        prev24 = t24
+
+
+def audio_ring_lead(mask, block, nblock):
+    """The consecutive set blocks from the read block forward, wrapping, the read block counted."""
+    n = 0
+    while n < nblock and (mask >> ((block + n) % nblock)) & 1:
+        n += 1
+    return n
+
+
+def audio_ring_runs(reads, nblock):
+    """A port's runs: maximal sequences of consecutive-tag zero reads following a non-zero read.
+
+    This is the rule of kind 21. A read is zero when its own block bit is clear in `b`.
+    A tag jump breaks the sequence (a read is missing), and a zero read whose predecessor
+    at tag - 1 is not a known non-zero read starts no run: the kinds only show that the
+    block was empty at the read, so a run needs the refilled read before it to know the
+    consumer, not a dropped read, opened it.
+    """
+    runs = []
+    cur = None
+    prev = None
+    prev_zero = False
+    for r in reads:
+        zero = not ((r["mask"] >> (r["tag"] % nblock)) & 1)
+        consecutive = prev is not None and r["tag"] == prev["tag"] + 1
+        if zero and consecutive and (cur is not None or not prev_zero):
+            if cur is None:
+                cur = {"tag": r["tag"], "reads": [r]}
+                runs.append(cur)
+            else:
+                cur["reads"].append(r)
+        else:
+            cur = None
+        prev, prev_zero = r, zero
+    return runs
+
+
+def audio_ring_intervals(spans, tid):
+    """The spans of one tid the late-catch partition asks for, disjoint per class."""
+    def own(kind, exclude_nid=None):
+        return merged([(s[4], s[5]) for s in spans
+                       if s[0] == kind and s[1] == tid and (exclude_nid is None or s[2] != exclude_nid)])
+    out = {"usleep": own(USLEEP), "jq2 sync wait": own(JQ2_SYNC_WAIT),
+           "other HLE": own(HLE, AUDIO_GET_PORT_CONFIG_NID)}
+    return {name: (iv, [a for a, _ in iv]) for name, iv in out.items()}
+
+
+def audio_ring_partition(g0, g1, iv):
+    """The parts of [g0, g1] the producer tid spent in usleep, jq2 sync wait, other HLE and other.
+
+    One instant is charged once, in that order: a jq2 sync wait lies inside its own HLE
+    import span, so without the order the same milliseconds would be counted twice.
+    """
+    parts = dict.fromkeys(AUDIO_RING_ATTRIBUTION, 0.0)
+    left = [(g0, g1)] if g1 > g0 else []
+    for name in AUDIO_RING_ATTRIBUTION[:-1]:
+        if not left:
+            break
+        rest = minus(left, clipped(iv[name][0], iv[name][1], g0, g1))
+        parts[name] = length(left) - length(rest)
+        left = rest
+    parts["other"] = length(left)
+    return parts
+
+
+def audio_ring_section(spans, header, names=None):
+    """The cellAudio port ring section (kinds 30 and 31), or None when the trace has neither.
+
+    Kind 30 is one mixer read of a port block, `a = tag << 8 | (nblock - 1) << 3 | port`,
+    `b` the filled mask before the read; kind 31 is one cellAudioGetPortConfig call from
+    the producer, the same `a`, `b` the mask under the mutex. The report unwraps the
+    24-bit tag per port. A zero read is one whose own block bit is clear; a run is a
+    sequence of consecutive-tag zero reads after a non-zero read (the rule of kind 21),
+    with the contract's catch classes: boundary (a view between the refilled read and the
+    first zero read saw the same tag with the block empty), late (no such view; the
+    lateness is its first view after the read minus the read's time), write-after-read
+    (the block reappears set before the read L_max reads short of one lap, where L_max is
+    the port's lead max: later appearances are the next lap, not a write into the lap the
+    consumer read empty) and the producer views inside the run.
+
+    A late catch is attributed to what the producer tid was doing between its last view
+    before the first zero read and its first view after it, as a share of that gap; the
+    same partition over all of that tid's view-to-view gaps on the port is the base, and a
+    share means nothing without it. Writes are inferred by replaying reads and views with
+    a known mask: a read clears its block, and a bit set in an observation but clear in
+    the known mask is a write in (previous observation, this one], the interval's width
+    being the precision of its landing time.
+
+    A header `dropped > 0` marks the section incomplete. Rates divide by the recorder's
+    window (the header's start_us..end_us, else the port's own extent), the denominator
+    the jq2 section uses so shares compare.
+    """
+    recs = [s for s in spans if s[0] in (AUDIO_RING, AUDIO_RING_VIEW)]
+    if not recs:
+        return None
+    names = names or {}
+    dropped = header_dropped(header)
+    hw = header_window(header)
+    by_port = collections.defaultdict(lambda: {"reads": [], "views": []})
+    for k, who, a, b, t0, t1 in recs:
+        port, nblock, tag24 = audio_ring_packing(a)
+        rec = {"who": who, "nblock": nblock, "tag24": tag24, "mask": b, "t0": t0, "t1": t1,
+               "is_read": k == AUDIO_RING}
+        by_port[port]["reads" if k == AUDIO_RING else "views"].append(rec)
+
+    ports = []
+    tid_intervals = {}
+    for port in sorted(by_port):
+        g = by_port[port]
+        reads, views = g["reads"], g["views"]
+        nblock = (reads or views)[0]["nblock"]
+        if hw is not None:
+            win0, win1, source = hw[0], hw[1], "header"
+        else:
+            win0 = min(r["t0"] for r in reads + views)
+            win1 = max(r["t1"] for r in reads + views)
+            source = "extent"
+        window = win1 - win0 if win1 > win0 else 0.0
+
+        audio_ring_unwrap_reads(reads)
+        audio_ring_unwrap_views(views, reads)
+        zero_reads = sum(1 for r in reads if not ((r["mask"] >> (r["tag"] % nblock)) & 1))
+        runs = audio_ring_runs(reads, nblock)
+        lengths = collections.Counter(len(run["reads"]) for run in runs)
+        multiples = sum(1 for run in runs if len(run["reads"]) % nblock == 0)
+        lead_hist = collections.Counter(audio_ring_lead(r["mask"], r["tag"] % nblock, nblock)
+                                        for r in reads)
+        # The producer's lead limit as the reads saw it; a lead of 0 (only empty reads) still
+        # bounds the next lap no earlier than the last read block, so the bound is at least 1.
+        bound_lead = max(max(lead_hist, default=1), 1)
+
+        view_rows = []
+        for tid in sorted({v["who"] for v in views}):
+            tv = [v for v in views if v["who"] == tid]
+            ts = [v["t0"] for v in tv]
+            sg = sorted(ts[i + 1] - ts[i] for i in range(len(ts) - 1))
+            empty = sum(1 for v in tv if not ((v["mask"] >> (v["tag"] % nblock)) & 1))
+            view_rows.append({
+                "tid": tid, "name": names.get(tid, "?"), "count": len(tv),
+                "rate": audio_ring_rate(len(tv), window),
+                "interval_ms": {"p50": nearest_rank(sg, 50) if sg else None,
+                                "p90": nearest_rank(sg, 90) if sg else None,
+                                "p99": nearest_rank(sg, 99) if sg else None},
+                "read_block_empty": empty, "empty_share": audio_ring_share(empty, len(tv)),
+            })
+        producer_tid = producer_name = None
+        if view_rows:
+            top = max(view_rows, key=lambda r: (r["count"], -r["tid"]))
+            producer_tid, producer_name = top["tid"], top["name"]
+        prod_views = [v for v in views if v["who"] == producer_tid]
+        prod_times = [v["t0"] for v in prod_views]
+
+        # The known mask starts at the first observation: bits set there predate the trace
+        # and carry no landing interval, so only later appearances are writes the trace saw.
+        writes, widths = 0, []
+        known, prev_t = None, None
+        for rec in sorted(reads + views, key=lambda r: r["t0"]):
+            mask = rec["mask"] & ((1 << nblock) - 1)
+            if known is None:
+                known = mask
+            else:
+                new = (mask & ~known).bit_count()
+                if new:
+                    writes += new
+                    widths.extend([rec["t0"] - prev_t] * new)
+                known = mask
+            if rec["is_read"]:
+                known &= ~(1 << (rec["tag"] % nblock))
+            prev_t = rec["t0"]
+
+        by_tag = {r["tag"]: r for r in reads}
+        read_tags = sorted(by_tag)
+        obs = sorted(reads + views, key=lambda r: r["t0"])
+        obs_times = [o["t0"] for o in obs]
+        view_times = [v["t0"] for v in views]
+        events, lateness, late_gaps = [], [], []
+        boundary = late = war = views_in_runs = views_in_runs_empty = 0
+        for run in runs:
+            tag = run["tag"]
+            block = tag % nblock
+            first, last = run["reads"][0], run["reads"][-1]
+            refilled = by_tag.get(tag - 1)
+            caught = False
+            if refilled is not None:
+                i = bisect.bisect_right(view_times, refilled["t1"])
+                while i < len(views) and views[i]["t0"] <= first["t0"]:
+                    v = views[i]
+                    if v["tag"] == tag and not ((v["mask"] >> block) & 1):
+                        caught = True
+                        break
+                    i += 1
+            if caught:
+                boundary += 1
+            else:
+                late += 1
+            j = bisect.bisect_right(prod_times, first["t0"])
+            lateness_ms = prod_views[j]["t0"] - first["t0"] if j < len(prod_views) else None
+            if not caught:
+                if lateness_ms is not None:
+                    lateness.append(lateness_ms)
+                if j > 0 and j < len(prod_views):
+                    late_gaps.append((prod_views[j - 1]["t0"], prod_views[j]["t0"]))
+            # Under the producer's protocol its next-lap write of this block may land up to
+            # L_max reads before T + nblock, so only a reappearance before that read landed in
+            # the lap the consumer read empty. A missing read at the bound tag is replaced by
+            # the next read at a tag of at least that value; with none, it is not counted.
+            b = bisect.bisect_left(read_tags, tag + nblock - bound_lead)
+            wrote = False
+            if b < len(read_tags):
+                end = by_tag[read_tags[b]]["t0"]
+                i = bisect.bisect_right(obs_times, first["t0"])
+                while i < len(obs) and obs[i]["t0"] < end:
+                    if (obs[i]["mask"] >> block) & 1:
+                        wrote = True
+                        break
+                    i += 1
+            if wrote:
+                war += 1
+            during = [v for v in prod_views if first["t0"] <= v["t0"] <= last["t0"]]
+            during_empty = sum(1 for v in during if not ((v["mask"] >> (v["tag"] % nblock)) & 1))
+            views_in_runs += len(during)
+            views_in_runs_empty += during_empty
+            events.append({"at_ms": first["t0"], "tag": tag, "block": block,
+                           "length": len(run["reads"]),
+                           "class": "boundary" if caught else "late",
+                           "lateness_ms": None if caught else lateness_ms,
+                           "write_after_read": wrote, "views_during_run": len(during),
+                           "views_during_run_empty": during_empty})
+
+        late_parts = dict.fromkeys(AUDIO_RING_ATTRIBUTION, 0.0)
+        base_parts = dict.fromkeys(AUDIO_RING_ATTRIBUTION, 0.0)
+        late_total = base_total = 0.0
+        base_gaps = [prod_views[i + 1]["t0"] - prod_views[i]["t0"]
+                     for i in range(len(prod_views) - 1)]
+        attribution = None
+        if producer_tid is not None:
+            if producer_tid not in tid_intervals:
+                tid_intervals[producer_tid] = audio_ring_intervals(spans, producer_tid)
+            iv = tid_intervals[producer_tid]
+            for g0, g1 in late_gaps:
+                for name, ms in audio_ring_partition(g0, g1, iv).items():
+                    late_parts[name] += ms
+                late_total += g1 - g0
+            for i in range(len(prod_views) - 1):
+                g0, g1 = prod_views[i]["t0"], prod_views[i + 1]["t0"]
+                for name, ms in audio_ring_partition(g0, g1, iv).items():
+                    base_parts[name] += ms
+                base_total += g1 - g0
+            sg = sorted(base_gaps)
+            attribution = {
+                "count": len(late_gaps), "late": late, "gap_ms": late_total,
+                "partition_ms": late_parts,
+                "partition_share": {k: audio_ring_share(v, late_total) for k, v in late_parts.items()},
+                "base": {
+                    "gaps": len(base_gaps),
+                    "gap_ms": {"p50": nearest_rank(sg, 50) if sg else None,
+                               "p90": nearest_rank(sg, 90) if sg else None},
+                    "partition_ms": base_parts,
+                    "partition_share": {k: audio_ring_share(v, base_total)
+                                        for k, v in base_parts.items()},
+                },
+            }
+
+        ports.append({
+            "port": port, "nblock": nblock,
+            "window": {"start_ms": win0, "end_ms": win1, "ms": window, "source": source},
+            "reads": len(reads), "zero_reads": zero_reads,
+            "runs": {"count": len(runs), "blocks": sum(len(run["reads"]) for run in runs),
+                     "lengths": {str(n): c for n, c in sorted(lengths.items())},
+                     "multiple_of_nblock": multiples,
+                     "multiple_share": audio_ring_share(multiples, len(runs))},
+            "lead": {"histogram": {str(n): c for n, c in sorted(lead_hist.items())},
+                     "max": max(lead_hist) if lead_hist else None},
+            "views": view_rows, "views_total": len(views),
+            "producer_tid": producer_tid, "producer_name": producer_name,
+            "writes": {"count": writes, "rate": audio_ring_rate(writes, window),
+                       "median_interval_ms": statistics.median(widths) if widths else None},
+            "catch": {"boundary": boundary, "late": late,
+                      "late_lateness_ms": {
+                          "p50": nearest_rank(sorted(lateness), 50) if lateness else None,
+                          "p90": nearest_rank(sorted(lateness), 90) if lateness else None},
+                      "write_after_read": war,
+                      "write_after_read_bound_lead": bound_lead,
+                      "views_during_run": views_in_runs,
+                      "views_during_run_empty": views_in_runs_empty},
+            "late_attribution": attribution,
+            "events": events[:20],
+        })
+    return {"dropped": dropped, "incomplete": (dropped or 0) > 0, "block_ms": AUDIO_BLOCK_MS,
+            "ports": ports}
+
+
+def _ring_ms(x):
+    return "n/a" if x is None else f"{x:.2f}"
+
+
+def _ring_pct(x):
+    return "n/a" if x is None else f"{100 * x:.0f} %"
+
+
+def print_audio_ring_section(ring):
+    if ring is None:
+        print("\nAudio ring: no kind 30/31 (AUDIO_RING, AUDIO_RING_VIEW) records in this trace")
+        return
+    print("\nAudio ring (cellAudio port ring, kinds 30/31; a port block is 256 samples at"
+          f" 48 kHz = {ring['block_ms']:.2f} ms):")
+    if ring["incomplete"]:
+        print(f"  INCOMPLETE: {ring['dropped']} span(s) dropped")
+    for p in ring["ports"]:
+        w, runs, c, at = p["window"], p["runs"], p["catch"], p["late_attribution"]
+        print(f"  port {p['port']}: nBlock {p['nblock']}, window {w['start_ms']:.2f}-{w['end_ms']:.2f} ms"
+              f" ({w['source']})")
+        print(f"    reads: {p['reads']}, {p['zero_reads']} zero"
+              f" ({_ring_pct(audio_ring_share(p['zero_reads'], p['reads']))})")
+        lens = ", ".join(f"{k} blk x{v}" for k, v in runs["lengths"].items())
+        print(f"    runs: {runs['count']} ({runs['blocks']} block(s)); lengths {lens or 'none'};"
+              f" {runs['multiple_of_nblock']} a multiple of nBlock"
+              f" ({_ring_pct(runs['multiple_share'])})")
+        hist = ", ".join(f"{k} {v}" for k, v in p["lead"]["histogram"].items())
+        lead_max = p["lead"]["max"]
+        print(f"    lead at read: max {'n/a' if lead_max is None else lead_max} of {p['nblock']};"
+              f" histogram {hist or 'none'}")
+        if not p["views"]:
+            print("    views: none")
+        else:
+            print(f"    views: {p['views_total']} from {len(p['views'])} tid(s); producer tid"
+                  f" {p['producer_tid']} ({p['producer_name']})")
+            for row in p["views"]:
+                iv = row["interval_ms"]
+                print(f"      tid {row['tid']:3d} {row['name'][:20]:20s}: {row['count']:5d} view(s),"
+                      f" {_ring_ms(row['rate'])}/s, interval p50 {_ring_ms(iv['p50'])}"
+                      f" p90 {_ring_ms(iv['p90'])} p99 {_ring_ms(iv['p99'])} ms,"
+                      f" read block empty {_ring_pct(row['empty_share'])}")
+        write = p["writes"]
+        print(f"    writes inferred: {write['count']} ({_ring_ms(write['rate'])}/s), landing interval"
+              f" median {_ring_ms(write['median_interval_ms'])} ms")
+        print(f"    catches: {c['boundary']} boundary, {c['late']} late (lateness p50"
+              f" {_ring_ms(c['late_lateness_ms']['p50'])}"
+              f" p90 {_ring_ms(c['late_lateness_ms']['p90'])} ms),"
+              f" {c['write_after_read']} write-after-read"
+              f" (L_max {c['write_after_read_bound_lead']})")
+        print(f"    views during runs: {c['views_during_run']}, {c['views_during_run_empty']} saw"
+              " their read block empty")
+        if at is None:
+            print("    late catch attribution: no producer views to attribute to")
+            continue
+        base = at["base"]
+        print(f"    late catch attribution: {at['count']} of {c['late']} late catch(es) with a"
+              f" producer view on both sides, {at['gap_ms']:.2f} ms in their gaps")
+        print("      late: " + ", ".join(f"{k} {v:.2f} ms ({_ring_pct(at['partition_share'][k])})"
+                                         for k, v in at["partition_ms"].items()))
+        print(f"      base: all {base['gaps']} view-to-view gap(s) of the producer tid, p50"
+              f" {_ring_ms(base['gap_ms']['p50'])} p90 {_ring_ms(base['gap_ms']['p90'])} ms: "
+              + ", ".join(f"{k} {_ring_pct(v)}" for k, v in base["partition_share"].items()))
 
 
 def jq2_stats(xs):
@@ -2080,6 +2501,7 @@ def main():
     report.update(drawable_label_sections(spans, len(flips), header_dropped(header)))
     report["audio"] = audio_section(spans, header_dropped(header), name_of)
     report["jq2"] = jq2_section(spans, header, names, images)
+    report["audio_ring"] = audio_ring_section(spans, header, names)
     if cad_nid is not None:
         report["cadence"] = {"nid": f"{cad_nid:08X}", "import": name_of(cad_nid),
                              "threads": cadence(spans, names, name_of, cad_nid, cad_tid, args.gap)}
@@ -2100,6 +2522,7 @@ def main():
     print_drawable_label(report)
     print_audio_section(report["audio"])
     print_jq2_section(report["jq2"])
+    print_audio_ring_section(report["audio_ring"])
     if "cadence" in report:
         c = report["cadence"]
         print(f"\nCadence of {c['import']} ({c['nid']}):")
