@@ -39,6 +39,11 @@ typedef void (*spu_lifted_entry_fn)(spu_context*);
  * title passes to cellSpurs line up. */
 uint64_t spu_workload_fingerprint(const void* data, size_t n);
 
+/* Word-wise content hash of a byte range: several times faster than the byte-serial fingerprint, so a
+ * caller can remember a fingerprint and reuse it while this still matches. A change detector, not an
+ * identity: it is not stable across versions and must never be stored or shown as a fingerprint. */
+uint64_t spu_workload_content_hash(const uint8_t* p, size_t n);
+
 /* Register one lifted SPU binary under its image fingerprint. `name` is borrowed
  * (kept by pointer for logging — pass a string literal / static). Idempotent on
  * fingerprint: a second register of the same fp updates the entry. */

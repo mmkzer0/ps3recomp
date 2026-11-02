@@ -311,7 +311,7 @@ const char* spu_task_elf_halt_reason(uint32_t elf_ea, size_t* size_out)
  * address and size, and reuse one only while a word-wise content hash --
  * several times faster than the byte-serial fingerprint -- still matches the
  * bytes. */
-static uint64_t spu_workload_content_hash(const uint8_t* p, size_t n)
+uint64_t spu_workload_content_hash(const uint8_t* p, size_t n)
 {
     uint64_t h[4] = { 0x9E3779B97F4A7C15ull, 0xC2B2AE3D27D4EB4Full, 0x165667B19E3779F9ull, 0x27D4EB2F165667C5ull };
     size_t i = 0;
