@@ -69,6 +69,11 @@
  *               (ps3_ftrace.h): PUSH/JOB/CREDIT per (q, seq), SYNC_WAIT keyed by waiter, IDLE and its reason
  *               byte, HELD and BARRIER for a job a SYNC held, the q of each queue and its creation line, seq
  *               unique under concurrent pushers; nothing recorded with tracing off
+ *   trace-image-two, -same, -changed, -moved, -overflow, -concurrent, -off, -observer  the ftrace job image
+ *               identity (kind 29, the J table): two images two entries, the same image the same index, bytes
+ *               changed in place a new entry, the same bytes at a second EA the same fingerprint, the 1024-slot
+ *               table and its dump, four workers racing on a shared table, nothing with tracing off, the
+ *               observer's loader path
  */
 #include "jq2/executor.hpp"
 #include "jq2/jq2.h"
@@ -78,6 +83,7 @@
 #include "spu_helpers.h"
 #include "spu_observe.h"
 #include "spu_coherency.h"
+#include "spu_workload.h"
 #include "syscalls/sys_event.h"
 #include "ps3emu/ps3_ftrace.h"
 #include "syscalls/ppu_thread_id.h"
@@ -94,6 +100,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <memory>
@@ -2763,6 +2770,347 @@ void mode_trace_off()
     for (int kind = PS3_FT_JQ2_PUSH; kind <= PS3_FT_JQ2_BARRIER; ++kind) CHECK(ft_kind(kind).empty(), "kind %d recorded", kind);
 }
 
+/* ---- jq2 job image identity (ps3_ftrace.h kind 29, the J table) -------------- */
+
+/* The images are the transform program with one byte of the zero gap between its header and its code set to
+ * `variant`: the same behaviour, a different fingerprint. */
+constexpr std::uint32_t kTweak = 0x800;
+void build_variant(std::uint32_t ea, std::uint8_t variant)
+{
+    build_image(ea, Prog::transform);
+    vm_base[ea + kTweak] = variant;
+}
+
+std::uint64_t fp_at(std::uint32_t ea) { return spu_workload_fingerprint(vm_base + ea, kImageSize); }
+
+/* Tracing on, hooks in place, nothing extra on admission. */
+void trace_prologue()
+{
+    install_hooks();
+    {
+        std::lock_guard<std::mutex> lk(g_probe.mu);
+        g_probe.on_admit = nullptr;
+    }
+    CHECK(PS3_FT_ON(), "tracing is on"); /* before any worker: a hook sees "off" while another thread initialises */
+}
+
+/* One job on the image at `ea`, pushed alone and waited out: the test owns the image bytes between jobs. */
+void run_job_on(Rig& rig, std::uint32_t j, std::uint32_t ea)
+{
+    const JobSpec s = spec(j, ea);
+    rig.push_wait(s.desc, 64, 0);
+    CHECK(jq2_port_sync(PORT, 0) == 0, "sync after job %u", j);
+    CHECK(job_ok(s), "job %u output", j);
+}
+
+struct ImageEntry {
+    std::uint64_t fp;
+    std::uint32_t ea, bytes;
+};
+using ImageTable = std::map<std::uint32_t, ImageEntry>;
+
+/* The recorder's image table, set slots only, read after the threads that write it are joined. */
+ImageTable ft_images()
+{
+    ImageTable t;
+    for (std::uint32_t i = 0; i < PS3_FT_JQ2_IMAGES; ++i)
+        if (g_ps3_ft.jq2_img[i].set) t[i] = {g_ps3_ft.jq2_img[i].fp, g_ps3_ft.jq2_img[i].ea, g_ps3_ft.jq2_img[i].bytes};
+    return t;
+}
+
+constexpr std::uint32_t kNoImage = 0xFFFFFFFEu;
+
+/* Every job of queue `q` (seq 1..n) has exactly one IMAGE span, on its JOB's worker and inside the JOB. Returns
+ * the table index each carries, by seq - 1 (kNoImage where the span is missing). */
+std::vector<std::uint32_t> check_image_spans(std::uint32_t q, std::uint32_t n)
+{
+    const SeqMap job = by_seq(PS3_FT_JQ2_JOB, q), image = by_seq(PS3_FT_JQ2_IMAGE, q);
+    CHECK(job.size() == n && image.size() == n, "q%u: JOB %zu IMAGE %zu, want %u each", q, job.size(), image.size(), n);
+    std::vector<std::uint32_t> index(n, kNoImage);
+    for (std::uint32_t seq = 1; seq <= n; ++seq) {
+        const auto j = job.find(seq), i = image.find(seq);
+        const bool one = j != job.end() && j->second.size() == 1 && i != image.end() && i->second.size() == 1;
+        CHECK(one, "q%u seq %u: not exactly one JOB and one IMAGE", q, seq);
+        if (!one) continue;
+        const ps3_ft_rec &jr = j->second[0], &ir = i->second[0];
+        CHECK(ir.who == jr.who, "q%u seq %u: IMAGE on worker 0x%X, JOB on 0x%X", q, seq, ir.who, jr.who);
+        CHECK(jr.t0 <= ir.t0 && ir.t0 <= ir.t1 && ir.t1 <= jr.t1, "q%u seq %u: IMAGE [%llu, %llu] is not inside JOB [%llu, %llu]",
+              q, seq, (unsigned long long)ir.t0, (unsigned long long)ir.t1, (unsigned long long)jr.t0,
+              (unsigned long long)jr.t1);
+        index[seq - 1] = ir.b;
+    }
+    return index;
+}
+
+/* The entry job `seq` named, with the table's own check that the index exists. */
+const ImageEntry* entry_of(const ImageTable& t, std::uint32_t index)
+{
+    const auto it = t.find(index);
+    CHECK(it != t.end(), "image index %u has no J entry", index);
+    return it == t.end() ? nullptr : &it->second;
+}
+
+/* Two different images: two entries, each fingerprint is the FNV of the bytes the loader staged, and each job's
+ * IMAGE names its own image. */
+void mode_trace_image_two()
+{
+    constexpr std::uint32_t A = IMAGE, B = IMAGE + 0x1000;
+    build_variant(A, 1);
+    build_variant(B, 2);
+    trace_prologue();
+    Rig rig({128, 1, false});
+    run_job_on(rig, 0, A);
+    run_job_on(rig, 1, B);
+    rig.teardown();
+
+    const ImageTable table = ft_images();
+    CHECK(table.size() == 2, "%zu image entries, want 2", table.size());
+    CHECK(g_ps3_ft.jq2_image_overflow == 0, "overflow %u", g_ps3_ft.jq2_image_overflow);
+    const std::vector<std::uint32_t> idx = check_image_spans(0, 2);
+    CHECK(idx[0] == 0 && idx[1] == 1, "indices %u %u, want 0 1 (dense, first seen first)", idx[0], idx[1]);
+    const std::uint32_t ea[2] = {A, B};
+    for (unsigned k = 0; k < 2; ++k) {
+        const ImageEntry* e = entry_of(table, idx[k]);
+        if (e == nullptr) continue;
+        CHECK(e->ea == ea[k] && e->bytes == kImageSize, "job %u: entry ea 0x%X bytes 0x%X", k, e->ea, e->bytes);
+        CHECK(e->fp == fp_at(ea[k]), "job %u: fingerprint 0x%016llx, want 0x%016llx", k, (unsigned long long)e->fp,
+              (unsigned long long)fp_at(ea[k]));
+    }
+    CHECK(fp_at(A) != fp_at(B), "the two images must differ");
+}
+
+/* The same image at the same EA, run again and again: one entry, the same index every time. */
+void mode_trace_image_same()
+{
+    build_variant(IMAGE, 1);
+    trace_prologue();
+    Rig rig({128, 1, false});
+    for (std::uint32_t j = 0; j < 4; ++j) run_job_on(rig, j, IMAGE);
+    rig.teardown();
+
+    const ImageTable table = ft_images();
+    CHECK(table.size() == 1, "%zu image entries, want 1", table.size());
+    const std::vector<std::uint32_t> idx = check_image_spans(0, 4);
+    for (std::uint32_t j = 0; j < 4; ++j) CHECK(idx[j] == 0, "job %u: index %u, want 0", j, idx[j]);
+    const ImageEntry* e = entry_of(table, 0);
+    CHECK(e != nullptr && e->fp == fp_at(IMAGE) && e->ea == IMAGE && e->bytes == kImageSize, "the one entry");
+}
+
+/* The same EA and size does not mean the same code: bytes changed in place between jobs give a new entry with a
+ * new fingerprint, and restoring them finds the first entry again. A job that follows without a change reuses
+ * the entry it just got. */
+void mode_trace_image_changed()
+{
+    build_variant(IMAGE, 1);
+    const std::uint64_t fp1 = fp_at(IMAGE);
+    trace_prologue();
+    Rig rig({128, 1, false});
+    run_job_on(rig, 0, IMAGE);
+    vm_base[IMAGE + kTweak] = 2;
+    const std::uint64_t fp2 = fp_at(IMAGE);
+    run_job_on(rig, 1, IMAGE);
+    run_job_on(rig, 2, IMAGE);
+    vm_base[IMAGE + kTweak] = 1;
+    run_job_on(rig, 3, IMAGE);
+    rig.teardown();
+
+    CHECK(fp1 != fp2, "the two byte states must differ");
+    const ImageTable table = ft_images();
+    CHECK(table.size() == 2, "%zu image entries, want 2", table.size());
+    const std::vector<std::uint32_t> idx = check_image_spans(0, 4);
+    CHECK(idx[0] == 0 && idx[1] == 1 && idx[2] == 1 && idx[3] == 0, "indices %u %u %u %u, want 0 1 1 0", idx[0], idx[1],
+          idx[2], idx[3]);
+    const ImageEntry *e0 = entry_of(table, 0), *e1 = entry_of(table, 1);
+    if (e0 != nullptr && e1 != nullptr) {
+        CHECK(e0->ea == IMAGE && e1->ea == IMAGE && e0->bytes == kImageSize && e1->bytes == kImageSize,
+              "both entries at the one EA and size");
+        CHECK(e0->fp == fp1 && e1->fp == fp2, "fingerprints 0x%016llx 0x%016llx, want 0x%016llx 0x%016llx",
+              (unsigned long long)e0->fp, (unsigned long long)e1->fp, (unsigned long long)fp1, (unsigned long long)fp2);
+    }
+}
+
+/* The same bytes at a second EA: a new entry with the same fingerprint (the report groups by fingerprint). */
+void mode_trace_image_moved()
+{
+    constexpr std::uint32_t A = IMAGE, B = IMAGE + 0x1000;
+    build_variant(A, 3);
+    build_variant(B, 3);
+    trace_prologue();
+    Rig rig({128, 1, false});
+    run_job_on(rig, 0, A);
+    run_job_on(rig, 1, B);
+    run_job_on(rig, 2, A);
+    run_job_on(rig, 3, B);
+    rig.teardown();
+
+    const ImageTable table = ft_images();
+    CHECK(table.size() == 2, "%zu image entries, want 2", table.size());
+    const std::vector<std::uint32_t> idx = check_image_spans(0, 4);
+    CHECK(idx[0] == 0 && idx[1] == 1 && idx[2] == 0 && idx[3] == 1, "indices %u %u %u %u, want 0 1 0 1", idx[0], idx[1],
+          idx[2], idx[3]);
+    const ImageEntry *e0 = entry_of(table, 0), *e1 = entry_of(table, 1);
+    if (e0 != nullptr && e1 != nullptr) {
+        CHECK(e0->ea == A && e1->ea == B, "entry EAs 0x%X 0x%X", e0->ea, e1->ea);
+        CHECK(e0->fp == e1->fp && e0->fp == fp_at(A), "one fingerprint for both EAs: 0x%016llx 0x%016llx",
+              (unsigned long long)e0->fp, (unsigned long long)e1->fp);
+    }
+}
+
+std::string overflow_trace_path() { return "/tmp/jq2_image_overflow_" + std::to_string(getpid()) + ".ftrace"; }
+
+/* The table is 1024 slots: index 1024 and beyond store nothing and count, and the dump has the 1024 J lines
+ * and both header fields. Through the recorder directly: no queue is involved. */
+void mode_trace_image_overflow()
+{
+    constexpr std::uint32_t kSlots = PS3_FT_JQ2_IMAGES, kExtra = 3;
+    CHECK(PS3_FT_ON(), "tracing is on");
+    auto fp_of = [](std::uint32_t i) { return 0xABCD000000000000ull | i; };
+    auto ea_of = [](std::uint32_t i) { return 0x100000u + 0x10u * i; };
+    for (std::uint32_t i = 0; i < kSlots; ++i) ps3_ft_jq2_image(i, fp_of(i), ea_of(i), 0x1000u + i);
+    CHECK(g_ps3_ft.jq2_image_overflow == 0, "overflow %u before the table is full", g_ps3_ft.jq2_image_overflow);
+    ps3_ft_jq2_image(kSlots, 0x1111, 0x2000, 8);
+    ps3_ft_jq2_image(kSlots + 1, 0x2222, 0x3000, 8);
+    ps3_ft_jq2_image(0x7FFFFFFFu, 0x3333, 0x4000, 8);
+    CHECK(g_ps3_ft.jq2_image_overflow == kExtra, "overflow %u, want %u", g_ps3_ft.jq2_image_overflow, kExtra);
+    CHECK(ft_images().size() == kSlots, "%zu slots set, want %u", ft_images().size(), kSlots);
+
+    const std::string path = g_ps3_ft.path;
+    ps3_ft_dump();
+    std::ifstream in(path);
+    CHECK(in.good(), "cannot read %s", path.c_str());
+    std::string line;
+    std::getline(in, line);
+    const std::string want_tail = " jq2_images=1024 jq2_image_overflow=3";
+    CHECK(line.rfind("# ps3_ftrace ", 0) == 0 && line.find(" dropped=0" + want_tail) != std::string::npos &&
+              line.size() >= want_tail.size() && line.compare(line.size() - want_tail.size(), want_tail.size(), want_tail) == 0,
+          "header: %s", line.c_str());
+    std::uint32_t j_lines = 0;
+    bool in_order = true;
+    while (std::getline(in, line)) {
+        if (line.rfind("J ", 0) != 0) continue;
+        char want[64];
+        std::snprintf(want, sizeof want, "J %u %016llx %08x %u", j_lines, (unsigned long long)fp_of(j_lines), ea_of(j_lines),
+                      0x1000u + j_lines);
+        in_order = in_order && line == want;
+        if (line != want) CHECK(false, "J line %u: '%s', want '%s'", j_lines, line.c_str(), want);
+        ++j_lines;
+    }
+    CHECK(j_lines == kSlots && in_order, "%u J lines, want %u in index order", j_lines, kSlots);
+    in.close();
+    std::remove(path.c_str());
+}
+
+/* Four workers race on a mix of shared and distinct images: every (fingerprint, ea, bytes) triple has exactly
+ * one index and no index has two triples, whichever worker saw it first. Six EAs carry four distinct byte
+ * states, so two fingerprints are shared by two EAs. */
+void mode_trace_image_concurrent()
+{
+    constexpr std::uint32_t kJobs = 240, kImages = 6, kWorkers = 4;
+    constexpr std::uint8_t kVariant[kImages] = {1, 2, 3, 4, 1, 2};
+    for (std::uint32_t i = 0; i < kImages; ++i) build_variant(IMAGE + 0x1000 * i, kVariant[i]);
+    trace_prologue();
+    Rig rig({128, kWorkers, false});
+    std::vector<JobSpec> specs;
+    for (std::uint32_t j = 0; j < kJobs; ++j) {
+        specs.push_back(spec(j, IMAGE + 0x1000 * (j % kImages)));
+        rig.push_wait(specs.back().desc, 64, j % 3);
+    }
+    CHECK(jq2_port_sync(PORT, 0) == 0, "sync");
+    rig.teardown();
+    for (const JobSpec& s : specs) CHECK(job_ok(s), "job %u output", s.serial);
+
+    const ImageTable table = ft_images();
+    CHECK(table.size() == kImages, "%zu image entries, want %u", table.size(), kImages);
+    CHECK(g_ps3_ft.jq2_image_overflow == 0, "overflow %u", g_ps3_ft.jq2_image_overflow);
+    for (std::uint32_t i = 0; i < kImages; ++i) CHECK(table.count(i) == 1, "index %u is not in the table (dense from 0)", i);
+    for (auto a = table.begin(); a != table.end(); ++a)
+        for (auto b = std::next(a); b != table.end(); ++b)
+            CHECK(a->second.ea != b->second.ea, "indices %u and %u are the same triple", a->first, b->first);
+    std::map<std::uint64_t, unsigned> per_fp;
+    for (const auto& [index, e] : table) {
+        CHECK(e.bytes == kImageSize && e.fp == fp_at(e.ea), "index %u: ea 0x%X fingerprint 0x%016llx", index, e.ea,
+              (unsigned long long)e.fp);
+        ++per_fp[e.fp];
+    }
+    CHECK(per_fp.size() == 4, "%zu distinct fingerprints, want 4", per_fp.size());
+
+    /* seq is the push order of the one pushing thread, so job j is seq j + 1 on image j % kImages. */
+    const std::vector<std::uint32_t> idx = check_image_spans(0, kJobs);
+    std::map<std::uint32_t, std::uint32_t> index_of_image;
+    for (std::uint32_t j = 0; j < kJobs; ++j) {
+        const ImageEntry* e = entry_of(table, idx[j]);
+        if (e == nullptr) continue;
+        const std::uint32_t ea = IMAGE + 0x1000 * (j % kImages);
+        CHECK(e->ea == ea, "job %u: IMAGE names ea 0x%X, the job ran 0x%X", j, e->ea, ea);
+        const auto [it, fresh] = index_of_image.try_emplace(ea, idx[j]);
+        CHECK(fresh || it->second == idx[j], "ea 0x%X carries indices %u and %u", ea, it->second, idx[j]);
+    }
+}
+
+/* Tracing off: nothing is identified or recorded, and the jobs run as before. */
+void mode_trace_image_off()
+{
+    build_variant(IMAGE, 1);
+    build_variant(IMAGE + 0x1000, 2);
+    install_hooks();
+    {
+        std::lock_guard<std::mutex> lk(g_probe.mu);
+        g_probe.on_admit = nullptr;
+    }
+    Rig rig({128, 2, false});
+    std::vector<JobSpec> specs;
+    for (std::uint32_t j = 0; j < 8; ++j) {
+        specs.push_back(spec(j, IMAGE + 0x1000 * (j % 2)));
+        rig.push_wait(specs.back().desc, 64, j % 3);
+    }
+    CHECK(jq2_port_sync(PORT, 0) == 0, "sync");
+    rig.teardown();
+    for (const JobSpec& s : specs) CHECK(job_ok(s), "job %u output", s.serial);
+    CHECK(!PS3_FT_ON(), "tracing is off");
+    CHECK(ft_kind(PS3_FT_JQ2_IMAGE).empty(), "an IMAGE span was recorded");
+    CHECK(ft_images().empty(), "an image table entry was recorded");
+    CHECK(g_ps3_ft.jq2_image_overflow == 0 && g_ps3_ft.n == 0 && g_ps3_ft.buf == nullptr, "the recorder was touched");
+}
+
+/* The observer's loader path identifies the image too, and the observer still sees exactly what it did before:
+ * its job_start gets the staged local store, whose fingerprint is the one the J line carries. */
+struct Staged {
+    std::vector<std::uint64_t> fp;
+};
+void staged_start(void* user, spu_context* ctx, const jq2_job_info* job)
+{
+    static_cast<Staged*>(user)->fp.push_back(spu_workload_fingerprint(ctx->ls + job->image_ls, job->image_bytes));
+}
+
+void mode_trace_image_observer()
+{
+    constexpr std::uint32_t A = IMAGE, B = IMAGE + 0x1000;
+    build_variant(A, 1);
+    build_variant(B, 2);
+    trace_prologue();
+    Rig rig({128, 1, false});
+    run_job_on(rig, 0, A); /* the plain path */
+    run_job_on(rig, 1, B);
+    Staged staged;
+    const jq2_job_observer obs{&staged, &staged_start, nullptr};
+    CHECK(jq2_set_job_observer(QUEUE, &obs) == 0, "install the observer");
+    run_job_on(rig, 2, A); /* the observer path */
+    run_job_on(rig, 3, B);
+    rig.teardown();
+
+    const ImageTable table = ft_images();
+    CHECK(table.size() == 2, "%zu image entries, want 2", table.size());
+    const std::vector<std::uint32_t> idx = check_image_spans(0, 4);
+    CHECK(idx[0] == 0 && idx[1] == 1 && idx[2] == 0 && idx[3] == 1, "indices %u %u %u %u, want 0 1 0 1", idx[0], idx[1],
+          idx[2], idx[3]);
+    CHECK(staged.fp.size() == 2, "the observer saw %zu job starts, want 2", staged.fp.size());
+    if (staged.fp.size() == 2) {
+        const ImageEntry *e0 = entry_of(table, 0), *e1 = entry_of(table, 1);
+        CHECK(e0 != nullptr && e1 != nullptr && staged.fp[0] == e0->fp && staged.fp[1] == e1->fp,
+              "the staged fingerprints differ from the J lines");
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
@@ -2775,10 +3123,11 @@ int main(int argc, char** argv)
     const std::string mode = argv[1];
     /* The recorder reads its window once, at the first hook: the trace modes say so before any hook runs. */
     if (mode.rfind("trace-", 0) == 0) {
-        if (mode == "trace-off") {
+        if (mode == "trace-off" || mode == "trace-image-off") {
             unsetenv("PS3_FTRACE");
         } else {
-            setenv("PS3_FTRACE", "0:100000:/dev/null", 1);
+            const std::string where = mode == "trace-image-overflow" ? overflow_trace_path() : "/dev/null";
+            setenv("PS3_FTRACE", ("0:100000:" + where).c_str(), 1);
             setenv("PS3_FTRACE_CAP", "65536", 1);
         }
     }
@@ -2831,6 +3180,14 @@ int main(int argc, char** argv)
     else if (mode == "trace-concurrent") mode_trace_concurrent();
     else if (mode == "trace-held") mode_trace_held();
     else if (mode == "trace-off") mode_trace_off();
+    else if (mode == "trace-image-two") mode_trace_image_two();
+    else if (mode == "trace-image-same") mode_trace_image_same();
+    else if (mode == "trace-image-changed") mode_trace_image_changed();
+    else if (mode == "trace-image-moved") mode_trace_image_moved();
+    else if (mode == "trace-image-overflow") mode_trace_image_overflow();
+    else if (mode == "trace-image-concurrent") mode_trace_image_concurrent();
+    else if (mode == "trace-image-off") mode_trace_image_off();
+    else if (mode == "trace-image-observer") mode_trace_image_observer();
     else {
         std::printf("unknown mode %s\n", mode.c_str());
         return 2;

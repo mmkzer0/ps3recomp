@@ -138,6 +138,26 @@ foreach(mode trace-spans trace-sync trace-queues trace-concurrent trace-held tra
     set_tests_properties(jq2_exec_${name} PROPERTIES LABELS "spurs;t0;tsan" TIMEOUT 300)
 endforeach()
 
+# Job image identity (kind 29 and the J table in the dump): the image of each job, fingerprinted from the bytes the
+# loader staged, in a process-wide table of (fingerprint, image EA, size).
+#
+#   jq2_exec_trace_image_two         two images, two entries; fingerprints are the FNV of the staged bytes; IMAGE inside JOB
+#   jq2_exec_trace_image_same        one image run again: one entry, the same index
+#   jq2_exec_trace_image_changed     bytes changed in place at one EA and size: a new entry, restored bytes find the first
+#   jq2_exec_trace_image_moved       the same bytes at a second EA: a new entry, the same fingerprint
+#   jq2_exec_trace_image_overflow    1024-slot table through the recorder: overflow counted, J lines and header in the dump
+#   jq2_exec_trace_image_concurrent  four workers on shared and distinct images: one index per triple, one triple per index
+#   jq2_exec_trace_image_off         tracing off: no IMAGE span, no J entry, the jobs run
+#   jq2_exec_trace_image_observer    the observer's loader path identifies the image too, the observer still runs
+foreach(mode trace-image-two trace-image-same trace-image-changed trace-image-moved trace-image-overflow
+              trace-image-off trace-image-observer)
+    string(REPLACE "-" "_" name "${mode}")
+    add_test(NAME jq2_exec_${name} COMMAND test_jq2_executor ${mode})
+    set_tests_properties(jq2_exec_${name} PROPERTIES LABELS "spurs;t0" TIMEOUT 300)
+endforeach()
+add_test(NAME jq2_exec_trace_image_concurrent COMMAND test_jq2_executor trace-image-concurrent)
+set_tests_properties(jq2_exec_trace_image_concurrent PROPERTIES LABELS "spurs;t0;tsan" TIMEOUT 300)
+
 # cellSpursJq HLE surface: the 17 firmware imports through ps3_hle_call.
 # The table is generated from cellSpursJq.c, so the test's dispatch is exactly
 # the build's: 17 ps3_hle_register lines, typed adapters, save-area args.

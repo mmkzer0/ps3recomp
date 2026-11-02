@@ -21,8 +21,10 @@
 #include <cstdio>
 #include <cstring>
 #include <initializer_list>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <variant>
@@ -1037,6 +1039,64 @@ void require_normal_return(const spu_context* ctx)
     job_end_stop(ctx, reason);
 }
 
+/* ---- job image identity (PS3_FTRACE kind 29) ----------------------------- */
+
+/* The image table: one index per distinct (fingerprint, image_ea, image_bytes), dense from 0 in first-seen
+ * order, process-wide. The mutex also makes the recorder's one-writer-per-slot rule hold: an index is
+ * assigned and published under it, once. Only a thread-cache miss gets here, and only while tracing. */
+class ImageRegistry {
+public:
+    std::uint32_t index_of(std::uint64_t fp, std::uint32_t ea, std::uint32_t bytes)
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        const auto [it, added] = ids_.try_emplace(std::make_tuple(fp, ea, bytes), static_cast<std::uint32_t>(ids_.size()));
+        if (added) ps3_ft_jq2_image(it->second, fp, ea, bytes);
+        return it->second;
+    }
+
+private:
+    std::mutex mu_;
+    std::map<std::tuple<std::uint64_t, std::uint32_t, std::uint32_t>, std::uint32_t> ids_;
+};
+ImageRegistry g_images;
+
+/* What one worker last saw at an (image_ea, image_bytes): the same address does not imply the same code (a
+ * loader may restage a different binary there), so the entry is reused only while the word-wise content hash of
+ * the bytes still matches, and the byte-serial fingerprint is recomputed otherwise. */
+struct SeenImage {
+    std::uint64_t content;
+    std::uint32_t index;
+};
+thread_local std::map<std::pair<std::uint32_t, std::uint32_t>, SeenImage> t_seen_images;
+
+/* Filled by the loader's start hook of a traced job; t0 == 0: the hook did not run. */
+struct ImageStamp {
+    std::uint64_t t0 = 0, t1 = 0;
+    std::uint32_t index = 0;
+};
+
+/* The staged binary, as the loader left it in the job's local store. An index past the recorder's table is
+ * reported as 0xFFFFFFFF (the table was full), not as a slot a J line could not name. */
+void identify_image(ImageStamp& st, const spu_context* ctx, const spu_job_layout* l)
+{
+    st.t0 = ps3_ft_now();
+    const std::uint8_t* bytes = ctx->ls + l->image_ls;
+    const std::uint64_t content = spu_workload_content_hash(bytes, l->image_bytes);
+    const std::pair<std::uint32_t, std::uint32_t> key{l->image_ea, l->image_bytes};
+    auto it = t_seen_images.find(key);
+    if (it == t_seen_images.end()) {
+        it = t_seen_images
+                 .emplace(key, SeenImage{content, g_images.index_of(spu_workload_fingerprint(bytes, l->image_bytes),
+                                                                    l->image_ea, l->image_bytes)})
+                 .first;
+    } else if (it->second.content != content) {
+        it->second.content = content;
+        it->second.index = g_images.index_of(spu_workload_fingerprint(bytes, l->image_bytes), l->image_ea, l->image_bytes);
+    }
+    st.index = it->second.index < PS3_FT_JQ2_IMAGES ? it->second.index : UINT32_MAX;
+    st.t1 = ps3_ft_now();
+}
+
 void interpreter_entry(spu_context* ctx)
 {
     /* From the entry state the loader staged: pc is the image base (0x7C00 in
@@ -1061,11 +1121,18 @@ void Queue::run_job(const JobStart& js, const std::optional<jq2_job_observer>& o
 
     t_job = &js;
     int rc;
+    ImageStamp stamp;
     if (!obs) {
         /* The loader runs the body and calls `end` with the finished context,
          * where the job's ending is classified (require_normal_return). */
         spu_job_hooks hooks{};
         hooks.end = [](void*, spu_context* ctx) { require_normal_return(ctx); };
+        if (ft.t0 != 0) {
+            hooks.user = &stamp;
+            hooks.start = [](void* user, spu_context* ctx, const spu_job_layout* l) {
+                identify_image(*static_cast<ImageStamp*>(user), ctx, l);
+            };
+        }
         rc = spu_run_jq2_job(body.entry, body.image_id, js.descriptor_ea, js.descriptor.data(), js.size, &env,
                              &hooks);
     } else {
@@ -1074,7 +1141,8 @@ void Queue::run_job(const JobStart& js, const std::optional<jq2_job_observer>& o
         struct Observed {
             const jq2_job_observer* obs;
             jq2_job_info info;
-        } o{&*obs, {}};
+            ImageStamp* stamp; /* null while tracing is off */
+        } o{&*obs, {}, ft.t0 != 0 ? &stamp : nullptr};
         o.info.queue = js.queue_ea;
         o.info.port = js.port_ea;
         o.info.descriptor_ea = js.descriptor_ea;
@@ -1088,6 +1156,7 @@ void Queue::run_job(const JobStart& js, const std::optional<jq2_job_observer>& o
         hooks.user = &o;
         hooks.start = [](void* user, spu_context* ctx, const spu_job_layout* l) {
             auto& ob = *static_cast<Observed*>(user);
+            if (ob.stamp != nullptr) identify_image(*ob.stamp, ctx, l);
             jq2_job_info& i = ob.info;
             i.image_ea = l->image_ea;
             i.image_ls = l->image_ls;
@@ -1124,8 +1193,11 @@ void Queue::run_job(const JobStart& js, const std::optional<jq2_job_observer>& o
                   {hex("queue", ea_), hex("job", js.descriptor_ea), dec("tag", js.tag), text("reason", "loader"),
                    dec("rc", static_cast<std::uint32_t>(rc))});
     }
-    if (ft.t0 != 0)
+    if (ft.t0 != 0) {
+        if (stamp.t0 != 0)
+            ps3_ft_span(PS3_FT_JQ2_IMAGE, ft_who(js.worker), js.seq, stamp.index, stamp.t0, stamp.t1);
         ps3_ft_span(PS3_FT_JQ2_JOB, ft_who(js.worker), js.seq, sat((cpu1 - ft.cpu0) / 1000, UINT32_MAX), ft.t0, ft1);
+    }
     counters_.executed.fetch_add(1);
     if (hooks_.on_done != nullptr) hooks_.on_done(hooks_.user, js);
 

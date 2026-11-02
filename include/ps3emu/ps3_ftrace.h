@@ -5,8 +5,9 @@
  * syscall dispatcher, the SPU channel waits, the RSX FIFO walker and the Metal
  * backend for <seconds> starting <start s> after the first hook ran (~boot),
  * then writes them to <path> as text for tools/ftrace_report.py:
- *   # ps3_ftrace start_us=<n> end_us=<n> spans=<n> dropped=<n>
+ *   # ps3_ftrace start_us=<n> end_us=<n> spans=<n> dropped=<n> jq2_images=<n> jq2_image_overflow=<n>
  *   T <tid> <name>                         PPU thread names
+ *   J <index> <fp hex16> <ea hex8> <bytes> jq2 job image table (kind 29's b), ascending index
  *   <kind> <who> <a hex> <b hex> <t0 us> <t1 us>
  *
  * A sampling profile says where CPU time goes; it cannot say why a frame takes
@@ -122,6 +123,10 @@ enum ps3_ft_kind {
                               * flight on the mask's tags when the barrier was set. Tags released together
                               * with one set time and mask form one span; a barrier set before tracing
                               * started emits none */
+    PS3_FT_JQ2_IMAGE      = 29, /* worker, start -> end of the job's image identification, inside its JOB span (after
+                              * staging, before the first instruction); who = q << 8 | w, a = seq,
+                              * b = image table index (J lines), 0xFFFFFFFF when the table was full; one per job
+                              * that has a JOB span, never filtered */
 };
 
 enum ps3_ft_audio_pace_reason {
@@ -138,7 +143,7 @@ enum ps3_ft_audio_pace_reason {
 
 typedef struct { uint64_t t0, t1; uint32_t a, b, who, kind; } ps3_ft_rec;
 
-enum { PS3_FT_TIDS = 256 };
+enum { PS3_FT_TIDS = 256, PS3_FT_JQ2_IMAGES = 1024 };
 
 typedef struct {
     int on;              /* 0 unknown, 1 initialising, 2 recording, 3 off/done */
@@ -149,6 +154,9 @@ typedef struct {
     char path[1024];
     struct { uint64_t t0, t1; uint32_t lr, n; } us[PS3_FT_TIDS];   /* usleep run being merged */
     char names[PS3_FT_TIDS][28];
+    /* jq2 job images: each slot has one writer (the registry assigns an index once), published by `set`. */
+    struct { uint64_t fp; uint32_t ea, bytes; int set; } jq2_img[PS3_FT_JQ2_IMAGES];
+    uint32_t jq2_image_overflow;
 } ps3_ft_state;
 
 PS3_FT_SHARED ps3_ft_state g_ps3_ft = { 0 };
@@ -183,10 +191,19 @@ static inline void ps3_ft_dump(void)
     if (n > s->cap) n = s->cap;
     FILE* f = fopen(s->path, "w");
     if (!f) { fprintf(stderr, "[ftrace] cannot write %s\n", s->path); return; }
-    fprintf(f, "# ps3_ftrace start_us=%.3f end_us=%.3f spans=%u dropped=%u\n",
-            (double)(s->start - s->base) / 1e3, (double)(s->end - s->base) / 1e3, n, s->dropped);
+    uint32_t images = 0;
+    for (uint32_t i = 0; i < PS3_FT_JQ2_IMAGES; i++)
+        if (__atomic_load_n(&s->jq2_img[i].set, __ATOMIC_ACQUIRE)) images++;
+    fprintf(f, "# ps3_ftrace start_us=%.3f end_us=%.3f spans=%u dropped=%u jq2_images=%u jq2_image_overflow=%u\n",
+            (double)(s->start - s->base) / 1e3, (double)(s->end - s->base) / 1e3, n, s->dropped, images,
+            __atomic_load_n(&s->jq2_image_overflow, __ATOMIC_RELAXED));
     for (uint32_t t = 0; t < PS3_FT_TIDS; t++)
         if (s->names[t][0]) fprintf(f, "T %u %s\n", t, s->names[t]);
+    for (uint32_t i = 0; i < PS3_FT_JQ2_IMAGES; i++) {
+        if (!__atomic_load_n(&s->jq2_img[i].set, __ATOMIC_ACQUIRE)) continue;
+        fprintf(f, "J %u %016llx %08x %u\n", i, (unsigned long long)s->jq2_img[i].fp, s->jq2_img[i].ea,
+                s->jq2_img[i].bytes);
+    }
     for (uint32_t i = 0; i < n; i++) {
         const ps3_ft_rec* r = &s->buf[i];
         if (!r->kind) continue;   /* claimed but never filled: a writer raced the dump */
@@ -279,6 +296,20 @@ static inline void ps3_ft_span(int kind, uint32_t who, uint32_t a, uint32_t b,
     if (i >= s->cap) { __atomic_fetch_add(&s->dropped, 1, __ATOMIC_RELAXED); return; }
     ps3_ft_rec r = { t0, t1, a, b, who, (uint32_t)kind };
     s->buf[i] = r;
+}
+
+/* One job image table entry; the caller assigns each index once. An index past the table is counted, not
+ * stored: the consumer then knows the table is incomplete. Not window-gated: an image first seen before the
+ * window still names the jobs inside it. */
+static inline void ps3_ft_jq2_image(uint32_t index, uint64_t fp, uint32_t ea, uint32_t bytes)
+{
+    ps3_ft_state* s = &g_ps3_ft;
+    if (!ps3_ft_recording()) return;
+    if (index >= PS3_FT_JQ2_IMAGES) { __atomic_fetch_add(&s->jq2_image_overflow, 1, __ATOMIC_RELAXED); return; }
+    s->jq2_img[index].fp = fp;
+    s->jq2_img[index].ea = ea;
+    s->jq2_img[index].bytes = bytes;
+    __atomic_store_n(&s->jq2_img[index].set, 1, __ATOMIC_RELEASE);
 }
 
 /* sys_timer_usleep polls come tens of thousands a second; consecutive sleeps of
