@@ -30,7 +30,10 @@ def main():
     if bool(args.golden) != bool(args.divergences):
         ap.error("--golden and --divergences go together")
 
-    run = subprocess.run([args.runner, "--out", args.host_csv], check=False, capture_output=True, text=True)
+    # The longest case sleeps well under a second on the host; a hanging case (a handler that ignores its
+    # timeout) costs the whole watchdog, so keep it short enough for the t0 tier.
+    run = subprocess.run([args.runner, "--out", args.host_csv, "--timeout", "3"],
+                         check=False, capture_output=True, text=True)
     sys.stdout.write(run.stdout)
     sys.stderr.write(run.stderr)
     if run.returncode != 0:

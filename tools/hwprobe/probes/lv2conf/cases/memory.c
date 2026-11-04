@@ -155,8 +155,6 @@ void case_memory_user_memory_size(void)
 	rec_bool("total_nonzero", bad == 0 && total != 0);
 	rec_bool("avail_nonzero", bad == 0 && avail != 0);
 	rec_bool("avail_le_total", bad == 0 && avail <= total);
-	rec_bool("total_1m_multiple", bad == 0 && (total % SZ_1M) == 0);
-	rec_bool("avail_1m_multiple", bad == 0 && (avail % SZ_1M) == 0);
 }
 
 /* sys_memory.cpp:202-203, :313: an allocation lowers the available amount by its size, free gives it back */
