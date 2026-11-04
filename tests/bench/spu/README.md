@@ -64,3 +64,24 @@ traffic; it only stops folding across ops. Checked in the disassembly:
 `results/` keeps runs to compare against (`.txt` is the table, `.csv` the
 same numbers). `2026-10-06-m1pro-baseline` is the state before any SPU
 helper optimisation, on an M1 Pro with the machine otherwise loaded.
+
+## MFC lookup cache (`spu.mfc_lookup_cache`)
+
+A separate, multi-threaded benchmark: `mfc_lookup_bench.c` has several host
+threads drive their own SPU contexts through the real channel layer (the
+channel sequence of a small DMA, 8 writes and a read) and reports the summed
+per-thread CPU time. `run_mfc_lookup_bench.py` alternates the option off and on
+(one process each: the option is read once) and prints mean, standard
+deviation, min and max.
+
+```sh
+tests/bench/spu/run_mfc_lookup_bench.py --reps 7 --work 0 --iterations 50000      # lookup alone
+tests/bench/spu/run_mfc_lookup_bench.py --reps 7 --work 20000 --iterations 20000  # with SPU-like work between sequences
+tests/bench/spu/run_mfc_lookup_bench.py --reps 7 --work 20000 --iterations 20000 --churn 256
+```
+
+`--work` is a loop standing in for the SPU code between channel accesses;
+`--churn N` releases and re-creates a spare context every N sequences, so the
+cache's generation is bumped and every remembered engine dropped. The numbers
+depend on the core count and on the platform's rwlock; compare the two modes
+of one invocation, and say the power mode when you quote them.

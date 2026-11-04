@@ -92,6 +92,18 @@ PS3_CFG_U32(spu, dma_repeat_stop_secs, 0, 0, 86400,
     "or label for longer than any fixed deadline, and a wrong halt wedges the "
     "chain. This is a host watchdog, not PS3 hardware behaviour.")
 
+PS3_CFG_BOOL(spu, mfc_lookup_cache, 0,
+    "Remember, per host thread, the last SPU context whose MFC engine the thread "
+    "looked up, so a repeated lookup for the same context skips the registry's "
+    "read lock. Without it every MFC channel access takes that process-wide lock "
+    "and walks the slot list, and with several SPU worker threads the lock word "
+    "bounces between cores. A remembered engine is only returned while the "
+    "registry is unchanged: every release or forget of an engine publishes a new "
+    "generation that drops all remembered engines, and a generation counter that "
+    "would wrap turns the cache off for the rest of the process. Off (the "
+    "default) is the reference path. Timing only: both paths hand a context the "
+    "same engine. Read once, at the first MFC access.")
+
 /* ---- gcm ---------------------------------------------------------------- */
 
 PS3_CFG_U32(gcm, wait_timeout_ms, 10000, 1, 3600000,

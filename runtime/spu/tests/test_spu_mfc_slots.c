@@ -58,20 +58,22 @@ static int          g_timeout;               /* a barrier gave up             */
  * in two runs out of five. Released within a cache line's propagation of each
  * other, they collide in the first round or two of every run.
  *
- * It has a deadline, so a regression is a failing test and not a hanging one. */
+ * It has a deadline, so a regression is a failing test and not a hanging one.
+ * The generation is read with atomic loads: a plain read of a volatile beside
+ * the atomic increment is a data race to ThreadSanitizer. */
 static volatile LONG g_bar_arrived;
 static volatile LONG g_bar_gen;
 
 static void barrier_wait(void)
 {
-    LONG gen = g_bar_gen;
+    LONG gen = __atomic_load_n(&g_bar_gen, __ATOMIC_ACQUIRE);
     if (InterlockedIncrement(&g_bar_arrived) == NCTX) {
-        g_bar_arrived = 0;
+        __atomic_store_n(&g_bar_arrived, 0, __ATOMIC_RELAXED);
         InterlockedIncrement(&g_bar_gen);   /* releases the other threads */
         return;
     }
     ULONGLONG start = GetTickCount64();
-    while (g_bar_gen == gen) {
+    while (__atomic_load_n(&g_bar_gen, __ATOMIC_ACQUIRE) == gen) {
         if (GetTickCount64() - start > 10000) { g_timeout = 1; return; }
         YieldProcessor();
     }

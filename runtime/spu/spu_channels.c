@@ -421,7 +421,8 @@ static DWORD WINAPI spu_pcsample_thread(LPVOID p)
     }
 }
 
-/* Default-off memoization of the last virtual owner used by this host thread.
+/* Memoization of the last virtual owner used by this host thread, enabled by
+ * spu.mfc_lookup_cache (default off).
  * Engines remain registry-owned, not host-thread or physical-SPU-owned. A hit
  * borrows exactly the same pointer as the locked path; both require the owner
  * to stop before release/range cleanup. No context layout or memory is touched.
@@ -440,11 +441,14 @@ static SPU_TLS struct {
 } s_mfc_recent;
 static int spu_mfc_cache_enabled(void)
 {
+    /* The typed configuration is immutable once loaded, so every thread that
+     * fills this in stores the same value. The first MFC access reads it;
+     * after that the hot path is one relaxed load, as it was for the
+     * environment knob this replaced. */
     static atomic_int cached;
     int value = atomic_load_explicit(&cached, memory_order_relaxed);
     if (!value) {
-        const char* flag = getenv("SPU_MFC_LOOKUP_CACHE");
-        value = flag && !strcmp(flag, "1") ? 2 : 1;
+        value = ps3_cfg_spu_mfc_lookup_cache() ? 2 : 1;
         atomic_store_explicit(&cached, value, memory_order_relaxed);
     }
     return value == 2;

@@ -793,6 +793,25 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME spu_mfc_errors
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_mfc_errors.py")
+        # The per-thread MFC engine cache (spu.mfc_lookup_cache): the registry
+        # fixtures that reach the MFC and the cache fixtures, each run with the
+        # option off and on (one process per mode: the option is read once).
+        # Under the tsan preset the python drivers instrument the fixtures they
+        # build. The other registry fixtures (lock-line peers, allocation
+        # failure) stay in the full tools/test_spu_context_registries.py run.
+        add_test(NAME spu_mfc_lookup_cache
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_mfc_lookup_cache.py")
+        add_test(NAME spu_mfc_registries
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_context_registries.py"
+                test_spu_mfc_slots test_spu_mfc_shared_lookup test_spu_mfc_env_once)
+        set_tests_properties(spu_mfc_lookup_cache spu_mfc_registries
+            PROPERTIES LABELS "spu;t0;tsan" TIMEOUT 600)
+        if(PS3RECOMP_SANITIZE_THREAD)
+            set_tests_properties(spu_mfc_lookup_cache spu_mfc_registries
+                PROPERTIES ENVIRONMENT "SANITIZERS=thread")
+        endif()
         # An SPU PUT/PUTL into the registered guest store window (the RSX label
         # window) is counted and stops by name; a PUT outside it is untouched.
         add_test(NAME spu_label_window
