@@ -80,7 +80,7 @@ def test_defaults_without_file_or_environment():
         "ppu.null_page": ('"stop"', "default"),
         "spu.dma_repeat_limit": ("256", "default"),
         "spu.dma_repeat_stop_secs": ("0", "default"),
-        "spu.mfc_lookup_cache": ("false", "default"),
+        "spu.mfc_lookup_cache": ("true", "default"),
         "gcm.wait_timeout_ms": ("10000", "default"),
         "gcm.park_resync": ("false", "default"),
         "gcm.park_grace_ms": ("50", "default"),
@@ -197,7 +197,7 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
             assert doc == {"schema": 1,
                            "ppu": {"vscr_nj": False, "opd_swap_fixup": False, "null_page": "stop"},
                            "spu": {"dma_repeat_limit": 256, "dma_repeat_stop_secs": 0,
-                                   "mfc_lookup_cache": False},
+                                   "mfc_lookup_cache": True},
                            "gcm": {"wait_timeout_ms": 10000, "park_resync": False, "park_grace_ms": 50},
                            "trophy": {"register_wait_cap_vblanks": 1024},
                            "video": {"resolutions": "", "rsx_capture": False, "rsx_capture_dir": "",
@@ -411,11 +411,15 @@ def test_u32_options_accept_in_range_file_and_environment():
 
 
 def test_mfc_lookup_cache_comes_from_file_and_environment():
-    with Cfg("schema = 1", "[spu]", "mfc_lookup_cache = true") as c:
+    # The default is on (#88), so the reference path is what a file or the
+    # environment has to ask for.
+    with Cfg("schema = 1", "[spu]", "mfc_lookup_cache = false") as c:
         o = options(probe("--load", c.path, "get"))
-        assert o["spu.mfc_lookup_cache"] == ("true", f"file:{c.path}"), o
-        o = options(probe("--load", c.path, "get", PS3RECOMP_SPU_MFC_LOOKUP_CACHE="0"))
-        assert o["spu.mfc_lookup_cache"] == ("false", "env:PS3RECOMP_SPU_MFC_LOOKUP_CACHE"), o
+        assert o["spu.mfc_lookup_cache"] == ("false", f"file:{c.path}"), o
+        o = options(probe("--load", c.path, "get", PS3RECOMP_SPU_MFC_LOOKUP_CACHE="1"))
+        assert o["spu.mfc_lookup_cache"] == ("true", "env:PS3RECOMP_SPU_MFC_LOOKUP_CACHE"), o
+    o = options(probe("get", PS3RECOMP_SPU_MFC_LOOKUP_CACHE="0"))
+    assert o["spu.mfc_lookup_cache"] == ("false", "env:PS3RECOMP_SPU_MFC_LOOKUP_CACHE"), o
     o = options(probe("get", PS3RECOMP_SPU_MFC_LOOKUP_CACHE="1"))
     assert o["spu.mfc_lookup_cache"] == ("true", "env:PS3RECOMP_SPU_MFC_LOOKUP_CACHE"), o
     f = config_invalid(probe("get", PS3RECOMP_SPU_MFC_LOOKUP_CACHE="yes"))
