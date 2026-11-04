@@ -10,6 +10,7 @@
 #include "spu_helpers.h"
 #include "spu_observe.h"
 #include <stdio.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 
 /* Channel ABI (runtime/spu/spu_channels.c); the lifter emits these same protos
@@ -85,11 +86,18 @@ static void spu_decode1(uint32_t insn, uint32_t pc, spu_ins* d) {
 #define I   (d.imm)
 #define PREF(r) ((r)._u32[0])
 
-static int spu_step(spu_context* ctx) {
-    uint32_t pc = ctx->pc, m = pc & SPU_LS_MASK;
+/* The instruction word at ctx->pc. spu_step and the SPU_INTERP_OPSTATS counter
+ * both read it through here, so the histogram counts the op the step runs. */
+static inline uint32_t spu_fetch(const spu_context* ctx) {
+    uint32_t m = ctx->pc & SPU_LS_MASK;
     const uint8_t* p = ctx->ls;
-    uint32_t insn = ((uint32_t)p[m] << 24) | ((uint32_t)p[m+1] << 16)
-                  | ((uint32_t)p[m+2] << 8) | p[m+3];
+    return ((uint32_t)p[m] << 24) | ((uint32_t)p[m+1] << 16)
+         | ((uint32_t)p[m+2] << 8) | p[m+3];
+}
+
+static int spu_step(spu_context* ctx) {
+    uint32_t pc = ctx->pc;
+    uint32_t insn = spu_fetch(ctx);
     spu_ins d; spu_decode1(insn, pc, &d);
     uint32_t next = (pc + 4) & 0x3FFFC;
 
@@ -384,13 +392,16 @@ static SPU_INTERP_TLS int s_interp_depth;
 
 /* The diagnostic gates of spu_interp_run_inner, read from the environment on a
  * thread's first run (YDKJ_SPU_TRACE, SPU_STEPCAP, YDKJ_CRI_GATE1TRACE,
- * SPU_INTERP_STATS) and the counters that count down as traces are dumped. */
+ * SPU_INTERP_STATS, SPU_INTERP_OPSTATS) and the counters that count down as
+ * traces are dumped. */
 typedef struct interp_diag {
     int init;
     int tr;
     uint64_t cap;
     int g1, g1in;
     long is;
+    long ops;       /* SPU_INTERP_OPSTATS seconds; 0 = off */
+    int diag;       /* is > 0 || ops > 0: the one flag the hot loop tests for both */
 } interp_diag;
 static SPU_INTERP_TLS interp_diag t_interp_diag;
 
@@ -459,6 +470,112 @@ static void interp_stats_step(const spu_context* ctx)
     s_is_tot = 0; s_is_t0 = now;
 }
 
+/* SPU_INTERP_OPSTATS=<seconds>: instructions executed per op, printed every
+ * <seconds> as `[spu-ops] total=<N> <op>=<count> ...`, busiest op first, ops
+ * with no executions left out. The totals are cumulative since the first
+ * counted instruction. A profile of spu_step shows one big switch; this says
+ * which handlers the time belongs to. Counts are per interpreting thread and
+ * folded into the process-wide totals every OPS_FOLD instructions and when a
+ * run returns, as SPU_MFC_STATS does, so counting adds no cross-core traffic
+ * per instruction; a thread that is mid-run holds up to OPS_FOLD - 1
+ * instructions that a print does not show. The thread whose clock check wins a
+ * compare-exchange on the last-print time is the one that prints. The op is
+ * counted before the step runs: a stop or halt counts, and so does the
+ * instruction SPU_STEPCAP's one-shot dump returns in front of. Short runs
+ * (an unlifted call that returns at once) pay the fold on every return, which
+ * is part of the cost of asking. */
+enum { OPS_FOLD = 4096 };
+static _Atomic(uint64_t) s_ops_total[SPU_OP_COUNT];
+static _Atomic(uint64_t) s_ops_last_ms;      /* last print; 0 = clock not started */
+static SPU_INTERP_TLS uint32_t t_ops_local[SPU_OP_COUNT];
+static SPU_INTERP_TLS uint32_t t_ops_pending;
+
+typedef struct { uint64_t n; unsigned op; } ops_row;
+
+static int ops_row_cmp(const void* a, const void* b)
+{
+    const ops_row* x = (const ops_row*)a; const ops_row* y = (const ops_row*)b;
+    if (x->n != y->n) return x->n < y->n ? 1 : -1;
+    return (x->op > y->op) - (x->op < y->op);   /* equal counts: stable order */
+}
+
+/* One write per line: other threads log to the same stream. A mnemonic is at
+ * most 18 characters, so 40 bytes per row bound the line. */
+static void interp_opstats_report(FILE* out)
+{
+    size_t cap = 64 + (size_t)SPU_OP_COUNT * 40;
+    ops_row* rows = (ops_row*)malloc((size_t)SPU_OP_COUNT * sizeof *rows);
+    char* buf = (char*)malloc(cap);
+    if (!rows || !buf) {
+        fprintf(stderr, "[spu-ops] out of memory building the report\n");
+        free(rows); free(buf);
+        return;
+    }
+    size_t n = 0; uint64_t total = 0;
+    for (unsigned op = 0; op < SPU_OP_COUNT; op++) {
+        uint64_t c = atomic_load_explicit(&s_ops_total[op], memory_order_relaxed);
+        total += c;
+        if (c) { rows[n].n = c; rows[n].op = op; n++; }
+    }
+    qsort(rows, n, sizeof *rows, ops_row_cmp);
+    size_t len = (size_t)snprintf(buf, cap, "[spu-ops] total=%llu", (unsigned long long)total);
+    for (size_t i = 0; i < n; i++) {
+        const char* name = spu_op_name[rows[i].op];
+        len += (size_t)snprintf(buf + len, cap - len, " %s=%llu", name ? name : "?",
+                                (unsigned long long)rows[i].n);
+    }
+    buf[len++] = '\n'; buf[len] = '\0';
+    fputs(buf, out); fflush(out);
+    free(rows); free(buf);
+}
+
+static void interp_opstats_fold(void)
+{
+    for (unsigned op = 0; op < SPU_OP_COUNT; op++)
+        if (t_ops_local[op]) {
+            atomic_fetch_add_explicit(&s_ops_total[op], t_ops_local[op], memory_order_relaxed);
+            t_ops_local[op] = 0;
+        }
+    t_ops_pending = 0;
+}
+
+static void interp_opstats_tick(long period)
+{
+    struct timespec ts; timespec_get(&ts, TIME_UTC);   /* stdlib: fixtures link this file alone */
+    uint64_t now = (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+    uint64_t last = atomic_load_explicit(&s_ops_last_ms, memory_order_relaxed);
+    if (!last) {   /* first fold anywhere: start the clock */
+        atomic_compare_exchange_strong_explicit(&s_ops_last_ms, &last, now,
+                                                memory_order_relaxed, memory_order_relaxed);
+        return;
+    }
+    if (now < last + (uint64_t)period * 1000u) return;
+    if (atomic_compare_exchange_strong_explicit(&s_ops_last_ms, &last, now,
+                                                memory_order_relaxed, memory_order_relaxed))
+        interp_opstats_report(stderr);
+}
+
+static void interp_opstats_step(const spu_context* ctx, long period)
+{
+    t_ops_local[spu_decode_tab[spu_fetch(ctx) >> 21].op]++;
+    if (++t_ops_pending < OPS_FOLD) return;
+    interp_opstats_fold();
+    interp_opstats_tick(period);
+}
+
+static void interp_opstats_flush(long period)
+{
+    if (!t_ops_pending) return;
+    interp_opstats_fold();
+    interp_opstats_tick(period);
+}
+
+static void interp_diag_step(const spu_context* ctx, const interp_diag* dg)
+{
+    if (dg->is > 0) interp_stats_step(ctx);
+    if (dg->ops > 0) interp_opstats_step(ctx, dg->ops);
+}
+
 uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa) {
     if (interp_stats_on()) {
         /* Credit an entry inside a resident code region to the image that
@@ -473,6 +590,7 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
     int depth = ++s_interp_depth;
     uint32_t r = spu_interp_run_inner(ctx, start_lsa, stop_lsa, depth == 1);
     --s_interp_depth;
+    if (t_interp_diag.ops > 0) interp_opstats_flush(t_interp_diag.ops);
     return r;
 }
 
@@ -494,6 +612,8 @@ static uint32_t spu_interp_run_inner(spu_context* ctx, uint32_t start_lsa,
         e = getenv("SPU_STEPCAP");          dg->cap = e ? strtoull(e, 0, 0) : 0;
         e = getenv("YDKJ_CRI_GATE1TRACE");  dg->g1  = e ? atoi(e) : 0;
         e = getenv("SPU_INTERP_STATS");     dg->is  = e ? atol(e) : 0;
+        e = getenv("SPU_INTERP_OPSTATS");   dg->ops = e ? atol(e) : 0;
+        dg->diag = dg->is > 0 || dg->ops > 0;
     /* YDKJ_CRI_GATE1TRACE=N: cri decode task busy-spins in the validator func_00026E80
      * (LS 0x26E80..0x26F14), a straight-line leaf that returns r3 = 0 / 0x8041090F /
      * 0x80410909. Hand-decoding its selb/fsm/gb/ceqh lanes proved unreliable, so log the
@@ -556,7 +676,7 @@ static uint32_t spu_interp_run_inner(spu_context* ctx, uint32_t start_lsa,
         }
         if (dg->tr>0) { ring[rc&63]=ctx->pc; rc++; if(rn<64)rn++; }
         steps++;
-        if (dg->is > 0) interp_stats_step(ctx);
+        if (dg->diag) interp_diag_step(ctx, dg);
         /* SPU_STEPCAP=N: a task that never halts (infinite work/wait loop) never
          * dumps its ring. Force a one-shot dump after N steps to see where it loops. */
         if (dg->tr>0 && dg->cap && steps == dg->cap) {
