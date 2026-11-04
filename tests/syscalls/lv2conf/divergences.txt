@@ -1,0 +1,5 @@
+# lv2conf divergences: rows where the HLE is known to differ from the hardware golden (golden.csv).
+#
+# One entry per line:  <case_id> <key> #<issue> <short reason>
+# The key `*` covers every key of the case, for a case the HLE stops, crashes or hangs on. An entry
+# whose rows no longer differ fails the test: remove it when the HLE is fixed.

@@ -116,3 +116,62 @@ if(Python3_Interpreter_FOUND)
 else()
     message(STATUS "  syscalls:     no python3; event_delivery not registered")
 endif()
+
+# lv2conf: the conformance cases of tools/hwprobe/probes/lv2conf against the toolkit's HLE. The same
+# case sources run on the console as a hwprobe SELF; the hardware result is the golden file
+# (lv2conf/golden.csv), and compare_lv2conf.py holds the HLE result to it. test_lv2conf only runs the
+# cases, each in a forked child, so a named stop, a crash or a hang in one slot is recorded as that
+# case's result. fork, alarm and waitpid make it POSIX-only: the toolkit also builds on Windows, where
+# this target and test are not defined.
+#
+# LV2CONF_DIR names the directory holding conf.h and cases/. It is a cache variable so a build can point
+# at cases that are not merged yet.
+if(NOT WIN32 AND TARGET ps3recomp_runtime)
+    set(LV2CONF_DIR "${PS3RECOMP_ROOT}/tools/hwprobe/probes/lv2conf" CACHE PATH
+        "Directory with conf.h and cases/*.c of the lv2conf conformance suite")
+    if(EXISTS "${LV2CONF_DIR}/conf.h")
+        file(GLOB LV2CONF_CASE_SOURCES CONFIGURE_DEPENDS "${LV2CONF_DIR}/cases/*.c")
+        add_executable(test_lv2conf
+            test_lv2conf.c
+            lv2conf_host.c
+            "${PS3RECOMP_ROOT}/runtime/host/host_stubs.c"
+            ${LV2CONF_CASE_SOURCES}
+        )
+        target_include_directories(test_lv2conf PRIVATE
+            "${LV2CONF_DIR}"
+            "${CMAKE_CURRENT_SOURCE_DIR}"
+            "${PS3RECOMP_ROOT}/runtime"
+            "${PS3RECOMP_ROOT}/runtime/ppu"
+            "${PS3RECOMP_ROOT}/runtime/syscalls"
+            "${PS3RECOMP_ROOT}/include"
+        )
+        target_compile_options(test_lv2conf PRIVATE -Wall -Wextra -Wno-unused-parameter)
+        if(PS3RECOMP_TOOLKIT_SHA)
+            target_compile_definitions(test_lv2conf PRIVATE "LV2CONF_TOOLKIT_SHA=\"${PS3RECOMP_TOOLKIT_SHA}\"")
+        endif()
+        target_link_libraries(test_lv2conf PRIVATE ps3recomp_runtime)
+        # The runtime carries C++, so the C++ driver does the final link.
+        set_target_properties(test_lv2conf PROPERTIES LINKER_LANGUAGE CXX)
+
+        # The golden file is added after the hardware run; until it exists the driver only requires that
+        # every case ran, or was skipped with a reason.
+        if(Python3_Interpreter_FOUND)
+            set(LV2CONF_GOLDEN "${CMAKE_CURRENT_SOURCE_DIR}/lv2conf/golden.csv")
+            set(LV2CONF_ARGS $<TARGET_FILE:test_lv2conf> "${CMAKE_CURRENT_BINARY_DIR}/lv2conf_host.csv")
+            if(EXISTS "${LV2CONF_GOLDEN}")
+                list(APPEND LV2CONF_ARGS --golden "${LV2CONF_GOLDEN}"
+                     --divergences "${CMAKE_CURRENT_SOURCE_DIR}/lv2conf/divergences.txt")
+            endif()
+            add_test(NAME lv2conf_conformance
+                COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/run_lv2conf.py" ${LV2CONF_ARGS})
+            set_tests_properties(lv2conf_conformance PROPERTIES
+                LABELS "syscalls;t0"
+                TIMEOUT 900
+            )
+        else()
+            message(STATUS "  syscalls:     no python3; lv2conf_conformance not registered")
+        endif()
+    else()
+        message(WARNING "lv2conf: ${LV2CONF_DIR}/conf.h not found; lv2conf_conformance not registered")
+    endif()
+endif()
