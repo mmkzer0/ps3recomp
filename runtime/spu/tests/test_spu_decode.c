@@ -137,6 +137,10 @@ int main(void) {
         i = ri7(0x00F, 0, 9, 10);
         d = dec(i, 0);
         CHECK(d.op == SPU_rchcnt && d.ch == 9 && d.rt == 10 && d.imm == 0, "rchcnt", i);
+        /* The whole 7-bit channel field reaches spu_rdch/spu_wrch; SPU channels go up to 127. */
+        i = ri7(0x00D, 0, 0x7F, 1);
+        d = dec(i, 0);
+        CHECK(d.op == SPU_rdch && d.ch == 0x7F && d.rt == 1, "rdch channel 127", i);
         expect_imm("shli is not wrch", ri7(0x07B, 3, 5, 6), SPU_shli, 3);
     }
 
