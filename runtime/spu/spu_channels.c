@@ -468,14 +468,65 @@ static void spu_mfc_cache_invalidate(void)
         atomic_store_explicit(&s_mfc_cache_generation, generation + 1, memory_order_release);
 }
 
+/* SPU_MFC_STATS=<seconds>: running totals of how mfc_for resolves (calls,
+ * cache hits, shared and exclusive registry locks), printed every <seconds>.
+ * Profiled lock time alone cannot tell more lookups from costlier ones (#88);
+ * these counts are the denominator. Counters are thread-local and folded into
+ * the shared totals every 4096 events, so counting adds no cross-core traffic
+ * of its own to the path it measures; the unfolded remainder (< 4096 per
+ * thread and counter) is not in the printed totals. */
+enum { MFC_STAT_CALL, MFC_STAT_HIT, MFC_STAT_SHARED, MFC_STAT_EXCL, MFC_STAT_N };
+static _Atomic(uint64_t) s_mfc_stat_total[MFC_STAT_N];
+static SPU_TLS uint32_t s_mfc_stat_local[MFC_STAT_N];
+static atomic_int s_mfc_stat_period = -1;   /* seconds; 0 = off, -1 = not read yet */
+static DWORD WINAPI spu_mfc_stat_thread(LPVOID p)
+{
+    DWORD ms = (DWORD)(uintptr_t)p * 1000u;
+    for (;;) {
+        Sleep(ms);
+        fprintf(stderr, "[spu-mfc] calls=%llu hits=%llu shared=%llu exclusive=%llu\n",
+                (unsigned long long)atomic_load_explicit(&s_mfc_stat_total[MFC_STAT_CALL], memory_order_relaxed),
+                (unsigned long long)atomic_load_explicit(&s_mfc_stat_total[MFC_STAT_HIT], memory_order_relaxed),
+                (unsigned long long)atomic_load_explicit(&s_mfc_stat_total[MFC_STAT_SHARED], memory_order_relaxed),
+                (unsigned long long)atomic_load_explicit(&s_mfc_stat_total[MFC_STAT_EXCL], memory_order_relaxed));
+        fflush(stderr);
+    }
+    return 0;
+}
+static int spu_mfc_stat_on(void)
+{
+    int period = atomic_load_explicit(&s_mfc_stat_period, memory_order_relaxed);
+    if (period < 0) {
+        const char* e = getenv("SPU_MFC_STATS");
+        int want = e && atoi(e) > 0 ? atoi(e) : 0;
+        int expected = -1;
+        /* One thread wins the election and starts the printer exactly once. */
+        if (atomic_compare_exchange_strong_explicit(&s_mfc_stat_period, &expected, want,
+                                                    memory_order_relaxed, memory_order_relaxed) && want > 0)
+            CreateThread(NULL, 0, spu_mfc_stat_thread, (LPVOID)(uintptr_t)want, 0, NULL);
+        period = atomic_load_explicit(&s_mfc_stat_period, memory_order_relaxed);
+    }
+    return period > 0;
+}
+static void spu_mfc_stat(int stat_on, int k)
+{
+    if (!stat_on || ++s_mfc_stat_local[k] < 4096u) return;
+    atomic_fetch_add_explicit(&s_mfc_stat_total[k], s_mfc_stat_local[k], memory_order_relaxed);
+    s_mfc_stat_local[k] = 0;
+}
+
 static mfc_engine* mfc_for(spu_context* ctx)
 {
     int cache_enabled = spu_mfc_cache_enabled();
+    int stat_on = spu_mfc_stat_on();
+    spu_mfc_stat(stat_on, MFC_STAT_CALL);
     if (cache_enabled) {
         uint64_t generation = atomic_load_explicit(&s_mfc_cache_generation, memory_order_acquire);
         if (generation != UINT64_MAX && generation == s_mfc_recent.generation &&
-            ctx == s_mfc_recent.ctx)
+            ctx == s_mfc_recent.ctx) {
+            spu_mfc_stat(stat_on, MFC_STAT_HIT);
             return s_mfc_recent.engine;
+        }
     }
     /* Looked up once. mfc_for runs on every MFC channel access, and with
      * SPU_PCSAMPLE unset `started` never became 1, so every access paid a
@@ -487,6 +538,7 @@ static mfc_engine* mfc_for(spu_context* ctx)
           const char* e = getenv("SPU_PCSAMPLE");
           if (e) CreateThread(NULL, 0, spu_pcsample_thread, (LPVOID)(uintptr_t)(atoi(e) * 1000), 0, NULL);
       } }
+    spu_mfc_stat(stat_on, MFC_STAT_SHARED);
     AcquireSRWLockShared(&s_mfc_claim_lock);
     for (spu_mfc_slot* slot = s_mfc_slots; slot; slot = slot->next) {
         if (slot->ctx == ctx) {
@@ -499,6 +551,7 @@ static mfc_engine* mfc_for(spu_context* ctx)
 
     /* A concurrent miss may publish while the read lock is released. Recheck
      * under the writer lock before creating this context's private engine. */
+    spu_mfc_stat(stat_on, MFC_STAT_EXCL);
     AcquireSRWLockExclusive(&s_mfc_claim_lock);
     for (spu_mfc_slot* slot = s_mfc_slots; slot; slot = slot->next) {
         if (slot->ctx == ctx) {
