@@ -1,0 +1,9 @@
+# Build host for the PS3 PPU toolchain and PSL1GHT (hwprobe probes), see build-toolchain.sh.
+# Only the tool binaries land on the host side (in the prefix, bind-mounted at the same path).
+FROM docker.io/library/ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      autoconf automake bison flex gcc g++ make libelf-dev texinfo libncurses-dev patch \
+      python3 python-is-python3 wget ca-certificates zlib1g-dev libtool libtool-bin bzip2 xz-utils \
+      libgmp-dev pkg-config libssl-dev git file \
+    && rm -rf /var/lib/apt/lists/*

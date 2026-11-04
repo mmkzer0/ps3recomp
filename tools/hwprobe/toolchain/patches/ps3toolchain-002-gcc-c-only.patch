@@ -1,0 +1,13 @@
+diff --git a/scripts/002-gcc-newlib-PPU.sh b/scripts/002-gcc-newlib-PPU.sh
+index b6166ec..6d4b618 100755
+--- a/scripts/002-gcc-newlib-PPU.sh
++++ b/scripts/002-gcc-newlib-PPU.sh
+@@ -72,7 +72,7 @@ CFLAGS="-Wno-int-conversion" CXXFLAGS="-Wno-int-conversion" ../configure --prefi
+     --disable-nls \
+     --disable-shared \
+     --disable-win32-registry \
+-    --enable-languages="c,c++" \
++    --enable-languages="c" \
+     --enable-long-double-128 \
+     --enable-lto \
+     --enable-threads \
