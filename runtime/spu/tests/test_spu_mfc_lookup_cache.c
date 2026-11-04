@@ -75,8 +75,9 @@ int main(void)
     setvbuf(stdout, NULL, _IONBF, 0);
     if (cache_existing_main()) return 1;
     cache_fixture_lock = &s_mfc_claim_lock;
-    const char* flag = getenv("SPU_MFC_LOOKUP_CACHE");
-    int enabled = flag && !strcmp(flag, "1");
+    /* The mode under test is spu.mfc_lookup_cache, chosen by the harness through
+     * PS3RECOMP_SPU_MFC_LOOKUP_CACHE before the process starts. */
+    int enabled = ps3_cfg_spu_mfc_lookup_cache();
     spu_context* ctx = calloc(1, sizeof(*ctx)); CHECK(ctx != NULL);
     mfc_engine* original = mfc_for(ctx); original->tag_completed = 0x12345678;
     atomic_store(&cache_fixture_reads, 0);

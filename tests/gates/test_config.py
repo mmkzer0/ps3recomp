@@ -80,6 +80,7 @@ def test_defaults_without_file_or_environment():
         "ppu.null_page": ('"stop"', "default"),
         "spu.dma_repeat_limit": ("256", "default"),
         "spu.dma_repeat_stop_secs": ("0", "default"),
+        "spu.mfc_lookup_cache": ("false", "default"),
         "gcm.wait_timeout_ms": ("10000", "default"),
         "gcm.park_resync": ("false", "default"),
         "gcm.park_grace_ms": ("50", "default"),
@@ -173,6 +174,7 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
             "ppu.null_page": "default",
             "spu.dma_repeat_limit": "default",
             "spu.dma_repeat_stop_secs": "default",
+            "spu.mfc_lookup_cache": "default",
             "gcm.wait_timeout_ms": "default",
             "gcm.park_resync": "default",
             "gcm.park_grace_ms": "default",
@@ -194,7 +196,8 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
             doc = tomllib.loads(p.stdout)
             assert doc == {"schema": 1,
                            "ppu": {"vscr_nj": False, "opd_swap_fixup": False, "null_page": "stop"},
-                           "spu": {"dma_repeat_limit": 256, "dma_repeat_stop_secs": 0},
+                           "spu": {"dma_repeat_limit": 256, "dma_repeat_stop_secs": 0,
+                                   "mfc_lookup_cache": False},
                            "gcm": {"wait_timeout_ms": 10000, "park_resync": False, "park_grace_ms": 50},
                            "trophy": {"register_wait_cap_vblanks": 1024},
                            "video": {"resolutions": "", "rsx_capture": False, "rsx_capture_dir": "",
@@ -405,6 +408,18 @@ def test_u32_options_accept_in_range_file_and_environment():
         assert o["spu.dma_repeat_limit"] == (want, "env:PS3RECOMP_SPU_DMA_REPEAT_LIMIT"), (text, o)
     o = options(probe("get", PS3RECOMP_SPU_DMA_REPEAT_STOP_SECS="0"))
     assert o["spu.dma_repeat_stop_secs"] == ("0", "env:PS3RECOMP_SPU_DMA_REPEAT_STOP_SECS"), o
+
+
+def test_mfc_lookup_cache_comes_from_file_and_environment():
+    with Cfg("schema = 1", "[spu]", "mfc_lookup_cache = true") as c:
+        o = options(probe("--load", c.path, "get"))
+        assert o["spu.mfc_lookup_cache"] == ("true", f"file:{c.path}"), o
+        o = options(probe("--load", c.path, "get", PS3RECOMP_SPU_MFC_LOOKUP_CACHE="0"))
+        assert o["spu.mfc_lookup_cache"] == ("false", "env:PS3RECOMP_SPU_MFC_LOOKUP_CACHE"), o
+    o = options(probe("get", PS3RECOMP_SPU_MFC_LOOKUP_CACHE="1"))
+    assert o["spu.mfc_lookup_cache"] == ("true", "env:PS3RECOMP_SPU_MFC_LOOKUP_CACHE"), o
+    f = config_invalid(probe("get", PS3RECOMP_SPU_MFC_LOOKUP_CACHE="yes"))
+    assert f["key"] == "spu.mfc_lookup_cache", f
 
 
 def test_u32_out_of_range_file_values_stop():

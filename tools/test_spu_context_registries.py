@@ -3,6 +3,7 @@
 import os
 import signal
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -17,6 +18,12 @@ cflags = ['-std=gnu17', '-O1', '-UNDEBUG',
           '-I' + str(root / 'include'), '-I' + str(spu),
           '-I' + str(root / 'runtime/platform')]
 cxxflags = ['-std=c++20', '-O1', '-UNDEBUG', '-I' + str(root / 'include')]
+# SANITIZERS=thread (set by the tsan ctest preset) instruments every object.
+sanitize = []
+if os.environ.get('SANITIZERS'):
+    sanitize = ['-fsanitize=' + os.environ['SANITIZERS'], '-fno-sanitize-recover=all', '-g']
+    cflags += sanitize
+    cxxflags += sanitize
 common = ['spu_drain.c', 'spu_lockstep.c', 'spu_coherency.c', 'spu_workload.c',
           'spurs_policy.c', 'spurs_job.c', 'spu_tsp_weak.c', 'spu_vm_pagemap.c',
           'spurs_policy_blob_weak.c', 'spu_interp.c', '../memory/reservation.c']
@@ -38,7 +45,12 @@ with tempfile.TemporaryDirectory(prefix='spu-context-registry-') as tmp:
     variants = ['test_spu_mfc_slots', 'test_spu_mfc_shared_lookup', 'test_spu_coherency',
                 'test_spu_lockline_peer', 'test_spu_registry_allocation',
                 'test_spu_mfc_env_once']
-    for name in variants:
+    # Variant names on the command line select a subset (the ctest entry
+    # spu_mfc_registries runs the three that exercise the MFC registry).
+    unknown = [a for a in sys.argv[1:] if a not in variants]
+    if unknown:
+        raise SystemExit('unknown variant: ' + ', '.join(unknown))
+    for name in [v for v in variants if not sys.argv[1:] or v in sys.argv[1:]]:
         tag = name
         binary = tmp / tag
         sources = [str(spu / 'tests' / (name + '.c'))]
@@ -53,10 +65,10 @@ with tempfile.TemporaryDirectory(prefix='spu-context-registry-') as tmp:
                 obj = tmp / f'{tag}-{index}.o'
                 subprocess.run([cc, *cflags, '-c', src, '-o', str(obj)], check=True)
                 objects.append(str(obj))
-            subprocess.run([cxx, *objects, *runtime_objects, '-pthread', '-lm',
+            subprocess.run([cxx, *objects, *runtime_objects, *sanitize, '-pthread', '-lm',
                             '-o', str(binary)], check=True)
         else:
-            subprocess.run([cc, *cflags, *sources,
+            subprocess.run([cc, *cflags, *sources, *sanitize,
                             '-o', str(binary)], check=True)
         if name == 'test_spu_registry_allocation':
             for mode, diagnostic in [('mfc', 'cannot allocate private MFC engine'),
@@ -67,11 +79,20 @@ with tempfile.TemporaryDirectory(prefix='spu-context-registry-') as tmp:
                 assert diagnostic in result.stderr, result.stderr
                 print(name + '/' + mode + ': PASS (visible allocation failure)')
             continue
-        result = subprocess.run([str(binary)], timeout=30, capture_output=True, text=True)
-        print(tag + ': ' + ('PASS' if result.returncode == 0 else 'FAIL'))
-        print(result.stdout.strip())
-        if result.returncode:
-            print(result.stderr[-2500:])
-        if result.returncode: failed.append(tag)
+        # spu.mfc_lookup_cache is read once per process, so each mode is a run.
+        # The MFC fixtures run with it off (the reference path) and on.
+        modes = ('0', '1') if 'mfc' in name else (None,)
+        for mode in modes:
+            env = {k: v for k, v in os.environ.items() if not k.startswith('PS3RECOMP_SPU_MFC_')}
+            label = tag if mode is None else f'{tag}[spu.mfc_lookup_cache={mode}]'
+            if mode is not None:
+                env['PS3RECOMP_SPU_MFC_LOOKUP_CACHE'] = mode
+            result = subprocess.run([str(binary)], timeout=30, capture_output=True, text=True,
+                                    env=env)
+            print(label + ': ' + ('PASS' if result.returncode == 0 else 'FAIL'))
+            print(result.stdout.strip())
+            if result.returncode:
+                print(result.stderr[-2500:])
+                failed.append(label)
 if failed:
     raise SystemExit('Failed: ' + ', '.join(failed))
