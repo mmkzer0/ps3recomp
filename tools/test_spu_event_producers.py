@@ -12,4 +12,6 @@ with tempfile.TemporaryDirectory(prefix='spu-event-producers-') as tmp:
  # Every GETLLAR takes the lock-line lock; the optional lock-free variant and
  # the second bitmap it relied on are gone (#57).
  spu_fixture_link.build([s/'tests/test_spu_lockline_peer.c',*[s/(u+'.c') for u in units],r/'runtime/platform/win32_compat.c'],b,['-std=gnu17','-O1','-UNDEBUG','-I'+str(r/'include'),'-I'+str(s),'-I'+str(r/'runtime/platform')],tmp)
- subprocess.run([str(b)],check=True,timeout=30)
+ # The same lockline_peer fixture as test_spu_context_registries.py (#121): seconds
+ # locally, 30 s on a hosted macOS runner (#109). 120 s leaves room and a hang still fails.
+ subprocess.run([str(b)],check=True,timeout=120)
