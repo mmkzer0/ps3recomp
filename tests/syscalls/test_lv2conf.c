@@ -19,6 +19,11 @@
  * Exit status: 0 the cases ran, 1 the registry is malformed or a case finished and recorded nothing,
  * 2 usage or I/O error. A stopped, hung or crashed case is a result, not a failure.
  */
+/* glibc declares Dl_info and dladdr (handler_name) only under _GNU_SOURCE, which has to be set before
+ * the first system header of the translation unit. Darwin declares them unconditionally. */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#  define _GNU_SOURCE
+#endif
 #include <errno.h>
 #include <signal.h>
 #include <stdint.h>
