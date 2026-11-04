@@ -1140,12 +1140,40 @@ touches a simulator or a device.
 result files on the host. It is self-contained and needs no game binary: `toolchain/build-toolchain.sh` (PPU
 toolchain and PSL1GHT in a podman container, idempotent, `--check` verifies), `build.sh <probe> <layer>` (fake-signed
 SELF into `tools/hwprobe/out/`, SHA-256 printed), `ps3ftp.py` (copy to and from `/dev_hdd0/tmp/hwprobe/` over the
-console's FTP server), and per probe the analysis scripts under `probes/<probe>/`. Every result file starts with a
+console's FTP server), `ps3console.py` (run a probe on the console end to end, below), and per probe the analysis
+scripts under `probes/<probe>/`. Every result file starts with a
 versioned header (`HWPROBE,<version>` and `HDR,...` rows); the host readers reject an unknown version. The first probe,
 `ring110`, measures when the cellAudio port read index advances relative to the block being read (#110). Operator
 steps, the measurement-integrity rule for the on-screen status and how to add a probe: `tools/hwprobe/README.md`.
 Tests (standalone, no toolchain): `tools/test_hwprobe_ring110_analyze.py`, `tools/test_hwprobe_layer2.py`,
-`tools/test_hwprobe_pn.py`, `tools/test_hwprobe_ps3ftp.py`.
+`tools/test_hwprobe_pn.py`, `tools/test_hwprobe_ps3ftp.py`, `tools/test_hwprobe_console.py`,
+`tools/test_hwprobe_lv2conf.py`.
+
+`ps3console.py run <SELF> --prefix <probe> --run-window <s> [--cfg NAME FILE] [--runs N] [--timeout S] [--out DIR]`
+uploads the SELF and an optional config, mounts it through webMAN, plays, waits for the probe, fetches the result
+files and unmounts (`HWPROBE_CONSOLE` or `--host` names the console). Activity in `<probe>_runid.txt`,
+`<probe>_last.txt` or a result file means the probe started and play is never pressed again in that launch; with no
+activity for a whole `--run-window` it plays again (the first play after a finished run usually ends in XMB error
+`8001003A`), up to three times. A result counts as complete only when `<probe>_last.txt` names it. webMAN drops the
+FTP control connection a few seconds after a SELF starts, so every poll reconnects. The image is unmounted only after
+the results are fetched and is left mounted, with an error saying so, when the probe may still be running: leaving
+the mapped image ends the probe. Only the mount, unmount and play paths can be requested over HTTP; restart, reboot,
+shutdown and path traversal are refused.
+
+The second probe, `lv2conf` (#96, #114 to #120), settles lv2 syscall semantics against the console itself, where
+the HLE was only checked against RPCS3 and firmware reading. One set of case sources
+(`tools/hwprobe/probes/lv2conf/cases/`, 189 cases behind the small API in `conf.h`) runs as a hwprobe SELF on the
+console and, through a second backend (`tests/syscalls/lv2conf_host.c`), against the toolkit's registered syscall
+table; both write the rows of `probes/lv2conf/FORMAT.md`. `compare_lv2conf.py` compares the `CASE` rows (never
+`TIME` rows; a `SKIP` on one side is "not comparable"). The ctest `lv2conf_conformance` (`syscalls`, `t0`) runs the
+host side and compares it with `tests/syscalls/lv2conf/golden.csv`, a console run. Of the 171 cases both sides run
+(the 18 two-thread cases run on the console only) the HLE matches 80; every one of the 91 differences is a line in
+`tests/syscalls/lv2conf/divergences.txt` (`<case> <key|*> #<issue> <reason>`), so the test passes today and fails on
+a new difference and on a fixed one whose line was not removed. To refresh the golden, run the probe on the console
+(`tools/hwprobe/build.sh lv2conf layer1`, then `ps3console.py run ... --cfg lv2conf probes/lv2conf/cfg/full.cfg`;
+`probes/lv2conf/RUN.md` has the steps and the checks of a complete run), copy the result CSV to
+`tests/syscalls/lv2conf/golden.csv` and update `divergences.txt` to match. The suite leaves out the slots stock
+firmware leaves unassigned: CFW hooks some of them and one froze the console.
 
 ---
 

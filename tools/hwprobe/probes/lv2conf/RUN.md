@@ -117,9 +117,13 @@ Results, the per-group runs after the power-cycle and `SHA256SUMS` are in
 Cases per group: event 27, eventflag 19, threads 18, mutex 17, semaphore 16, rwlock 15, memory 15, timer 13,
 container 12, cond 12, time 7, slot96 6, process 6, ppu_thread 6 (189; 18 of them `CONF_THREADS`, 2 `CONF_TIMING`).
 
-Two defects of `tools/hwprobe/ps3console.py run` met on the way (its owner has been told): the FTP control connection
-opened before `/play.ps3` raises `EOFError('')` a few seconds after the SELF starts and `run_probe()` does not catch or
-reconnect, so the command prints `FATAL: ` and its `finally` unmounts the image; that exit request cut the first two runs
-of this probe short (`META,exit_requested,1`, `cases_run` 3 and 1 of the selected cases). The three full runs above were
-launched with `/mount.ps3/...` and `/play.ps3` over HTTP and fetched over FTP with a fresh connection per poll; the
-image was unmounted only after the result was fetched and the probe's hold time had passed.
+Two defects of an earlier `tools/hwprobe/ps3console.py run` cut the first two runs of this probe short
+(`META,exit_requested,1`, `cases_run` 3 and 1 of the selected cases): the FTP control connection raised `EOFError('')`
+a few seconds after the SELF started and was not retried, and the `finally` then unmounted the image. Both are fixed
+(`cd7b79fe`): every poll and fetch reconnects, and the image is unmounted only after the results are fetched, or left
+mounted with the error `console left mounted; probe may still be running` when the probe may still be running. The
+three full runs above were launched with `/mount.ps3/...` and `/play.ps3` over HTTP and fetched over FTP with a fresh
+connection per poll, the image unmounted only after the result was fetched and the probe's hold time had passed. Runs
+20 and 21 were launched with `ps3console.py run` (`--prefix lv2conf --cfg lv2conf <copy>`, where the copy is
+`cfg/full.cfg` plus `fw_version=4.81`, `fw_type=CEX REBUG Cobra 7.5`, `console_model=CECHC04`, so the header names the
+console); run 21 is the golden (`tests/syscalls/lv2conf/golden.csv`), and the `CASE` rows of runs 17 to 21 are identical.
