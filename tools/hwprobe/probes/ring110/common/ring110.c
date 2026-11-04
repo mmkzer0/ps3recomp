@@ -12,8 +12,8 @@
 #define R110_VERSION       "ring110-probe " R110_PROBE_VERSION " (PSL1GHT 7e1bd963)"
 #define EV_CAP       (1u << 19) /* 524288 records, 16 MiB */
 #define Q4_CAP       4096
-#define QT_CAP       (1u << 16) /* timestamp window scan rows, 17 per Q4 tick */
-#define QT_MAX_AGE   16         /* m = 3..16 are accepted on the console of the smoke runs, see scan_ts_window */
+#define QT_CAP       (1u << 16) /* timestamp window scan rows, 21 per Q4 tick */
+#define QT_MAX_AGE   20         /* m = 3..16 were accepted in the first campaign; 17..20 show the old edge */
 #define QE_CAP       8192
 
 /* ------------------------------------------------------------------ config */
@@ -149,9 +149,10 @@ static void take_sync(r110_ctx_t *c)
  * So after the three-block read, ask for the timestamp of tags that were the current block's m ticks
  * ago: tag(r) - m * step, step = tag(r+1) - tag(r) = 1 << shift (2 on the console of the smoke runs).
  * m = 0 is the tag of block r itself. The rows (QT) show which m the firmware accepts and what time
- * it reports for them: second smoke run, m = 0..2 refused, m = 3..16 accepted (the port's current tag
- * trails tag(r) by three steps; the firmware reading puts the old edge at m = 17, not reached by the
- * scan). Called after the Q4 bracket so it does not stretch tb1..tb2. */
+ * it reports for them: second smoke run and the campaign of 2026-11-04, m = 0..2 refused, m = 3..16
+ * accepted (the port's current tag trails tag(r) by three steps); the firmware reading puts the old
+ * edge at m = 17, which the scan now reaches (to m = 20). Called after the Q4 bracket so it does not
+ * stretch tb1..tb2. */
 static void scan_ts_window(r110_ctx_t *c, const r110_q4_t *q)
 {
 	u64 step, m;

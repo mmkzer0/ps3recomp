@@ -98,7 +98,7 @@ def synth_csv(*, x_ms, noise=(0.0, 0.0), hw_clear=True, n=8, nticks=2100, discar
             out.append(
                 f"Q4,{ordinal},{idxs[i]},{tb0},{int(st_of(tb0))},{tb1},{tb2},{int(st_of(tb2))},{tb3},"
                 f"{tags[0]},{tags[1]},{tags[2]},{ts[0]},{ts[1]},{ts[2]},0,0,0,0,0,0")
-            for m in range(17):
+            for m in range(21):
                 if i - m < 0 or tags[1] - m <= 0:
                     break
                 accepted = m in qt_accept

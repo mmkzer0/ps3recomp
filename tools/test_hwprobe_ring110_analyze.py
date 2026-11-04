@@ -140,7 +140,7 @@ class OtherObservations(unittest.TestCase):
         res = run_model(seed=46, **MODELS["B"])
         qt = res["qt"]
         self.assertEqual(qt["accepted_m"], list(range(1, 15)))
-        self.assertEqual(qt["refused_m"], [0, 15, 16])
+        self.assertEqual(qt["refused_m"], [0, *range(15, 21)])
         self.assertEqual(qt["per_m"][0]["rc"], {"0x8031070f": qt["per_m"][0]["n"]})
         # the time reported for a block m periods old is m periods before its own index change
         self.assertAlmostEqual(qt["ts_step_us"]["median"], P_MS * 1000.0, delta=100.0)
@@ -151,7 +151,7 @@ class OtherObservations(unittest.TestCase):
     def test_timestamp_window_with_no_accepted_age_is_reported_as_such(self):
         res = run_model(seed=47, qt_accept=(), **MODELS["B"])
         self.assertEqual(res["qt"]["accepted_m"], [])
-        self.assertEqual(len(res["qt"]["refused_m"]), 17)
+        self.assertEqual(len(res["qt"]["refused_m"]), 21)
         self.assertIn("accepted m: none", an.report(res))
 
     def test_no_qt_rows_without_q4(self):

@@ -31,7 +31,8 @@ CLASS_TEXT = {
     "intermediate": "intermediate: A with read delay x == B + prefetch e = P - x",
     "deeper": "deeper prefetch: the index runs ahead of the block being consumed by more than a period",
     "outside-table": "outside the section 6 table (x > P + 0.7 ms, or exactly on a class boundary)",
-    "undetermined": "undetermined by Layer 1: the hardware does not clear consumed blocks; Layer 2 is needed",
+    "undetermined": "undetermined by Layer 1: no repeated clears to time (with refills off the hardware zeroes each block once; "
+                    "if it never does, late writes would replay every lap); Layer 2 is needed",
 }
 
 # Named columns of the section 6 table: (label, x in ms)
@@ -571,7 +572,7 @@ def report(res):
     q2 = res["q2"]
     contaminated = " (Q4-contaminated, all ticks)" if q2["q4_contaminated"] else ""
     L.append("Q2 clear timing: {} ticks used{}, {} zero events, hardware clear: {}".format(
-        q2["ticks_used"], contaminated, q2["n_zero_events"], "yes" if res["hw_clear"] else "NO HARDWARE CLEAR"))
+        q2["ticks_used"], contaminated, q2["n_zero_events"], "yes" if res["hw_clear"] else "NO REPEATED CLEARS"))
     if res["hw_clear"]:
         for k in sorted(q2["per_k"]):
             s = q2["per_k"][k]
@@ -583,7 +584,8 @@ def report(res):
         ci_text = "" if ci is None else " [95% CI {:.3f}, {:.3f}]".format(*ci)
         L.append("   x_clear = {:.3f} ms{} (n={})".format(res["x_clear_ms"], ci_text, q2["x_clear_n"]))
     else:
-        L.append("   x_clear = n/a (late writes would be replayed every lap)")
+        L.append("   x_clear = n/a (fewer than 0.1 zero events per tick: the hardware zeroes a block once, or never, and nothing "
+                 "refills it, so there is no repeated clear to time)")
     q3 = res["q3"]
     L.append("Q3 content after read: hardware word changes {}".format(q3["hardware_word_changes"]))
     L.append("   sentinel word at one lap - P/2 after a zero: {}; hardware writes other than zero: {}".format(q3["state_one_lap_after_zero"], "YES {}".format(q3["other_values"]) if q3["hw_writes_other_than_zero"] else "no"))

@@ -19,6 +19,12 @@ The SELF lands in `/dev_hdd0/tmp/hwprobe/`. Start it from webMAN's file manager 
 icon in the XMB Game column), or with the two URLs in the README. If the fake-signed SELF does not start, upload
 `out/ring110_l1.self` (`make_self`) instead.
 
+**Remote start (webMAN MOD 1.47.50, observed 2026-11-04).** `/mount.ps3/dev_hdd0/tmp/hwprobe/<self>` then `/play.ps3`. The
+first `/play.ps3` after a probe has finished usually ends in an XMB error `8001003A` ("error during start-up") and no result
+file; calling `/play.ps3` a second time about 20 s later starts the probe (12 of 13 launches in one campaign; one first play worked).
+A driver should play once, wait about 22 s for a new CSV and play again, and unmount (`/mount.ps3/unmount`) between runs.
+Do not play a third time while the probe's screen is up.
+
 ## 2. Console state for every run
 
 1. Power off, wait 30 s, power on ("cold boot") before every run marked **cold** in section 4.
