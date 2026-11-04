@@ -88,7 +88,10 @@ with tempfile.TemporaryDirectory(prefix='spu-context-registry-') as tmp:
             label = tag if mode is None else f'{tag}[spu.mfc_lookup_cache={mode}]'
             if mode is not None:
                 env['PS3RECOMP_SPU_MFC_LOOKUP_CACHE'] = mode
-            result = subprocess.run([str(binary)], timeout=30, capture_output=True, text=True,
+            # The slowest fixture (test_spu_lockline_peer) takes 8-9 s on an M-series Mac in either
+            # cache mode and hit 30 s on a hosted macOS runner (#121); 120 s leaves room for a slow
+            # runner and still turns a hang into a failure.
+            result = subprocess.run([str(binary)], timeout=120, capture_output=True, text=True,
                                     env=env)
             print(label + ': ' + ('PASS' if result.returncode == 0 else 'FAIL'))
             print(result.stdout.strip())
