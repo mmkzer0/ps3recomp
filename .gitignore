@@ -115,3 +115,11 @@ fw_spu/
 
 # SPU differential test build products (runtime/spu/tests/build_diff_test.sh)
 runtime/spu/tests/build_diff/
+
+# hwprobe build outputs (tools/hwprobe/build.sh): SELFs and SHA256SUMS in out/, per-layer
+# build trees, link maps (*.elf and *.self are already ignored above) and fetched results
+tools/hwprobe/out/
+tools/hwprobe/results/
+tools/hwprobe/probes/*/layer*/build/
+tools/hwprobe/probes/*/layer*/*.map
+!tools/hwprobe/probes/*/layer*/Makefile

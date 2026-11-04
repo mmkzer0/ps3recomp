@@ -21,7 +21,8 @@ Complete documentation for the Python-based recompilation pipeline tools in `too
 13. [xctrace_profile.py / xctrace_audio.py — Instruments trace reports](#xctrace_profilepy--xctrace_audiopy)
 14. [ftrace_report.py — PS3_FTRACE timeline report](#ftrace_reportpy)
 15. [ios_run.py — iOS Simulator and device runs](#ios_runpy)
-16. [Dependencies](#dependencies)
+16. [hwprobe — homebrew probes for a real PS3](#hwprobe--homebrew-probes-for-a-real-ps3)
+17. [Dependencies](#dependencies)
 
 ---
 
@@ -1130,6 +1131,21 @@ that failed before the app reported a status, an interruption). A usage error
 is a message, never a traceback.
 `tools/test_ios_run.py` proves the contract against a fake `xcrun` and never
 touches a simulator or a device.
+
+---
+
+## hwprobe — homebrew probes for a real PS3
+
+`tools/hwprobe/` builds small PSL1GHT homebrew probes that settle HLE semantics against hardware, and analyses their
+result files on the host. It is self-contained and needs no game binary: `toolchain/build-toolchain.sh` (PPU
+toolchain and PSL1GHT in a podman container, idempotent, `--check` verifies), `build.sh <probe> <layer>` (fake-signed
+SELF into `tools/hwprobe/out/`, SHA-256 printed), `ps3ftp.py` (copy to and from `/dev_hdd0/tmp/hwprobe/` over the
+console's FTP server), and per probe the analysis scripts under `probes/<probe>/`. Every result file starts with a
+versioned header (`HWPROBE,<version>` and `HDR,...` rows); the host readers reject an unknown version. The first probe,
+`ring110`, measures when the cellAudio port read index advances relative to the block being read (#110). Operator
+steps, the measurement-integrity rule for the on-screen status and how to add a probe: `tools/hwprobe/README.md`.
+Tests (standalone, no toolchain): `tools/test_hwprobe_ring110_analyze.py`, `tools/test_hwprobe_pn.py`,
+`tools/test_hwprobe_ps3ftp.py`.
 
 ---
 
