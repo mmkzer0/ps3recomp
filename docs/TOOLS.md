@@ -1144,8 +1144,8 @@ console's FTP server), and per probe the analysis scripts under `probes/<probe>/
 versioned header (`HWPROBE,<version>` and `HDR,...` rows); the host readers reject an unknown version. The first probe,
 `ring110`, measures when the cellAudio port read index advances relative to the block being read (#110). Operator
 steps, the measurement-integrity rule for the on-screen status and how to add a probe: `tools/hwprobe/README.md`.
-Tests (standalone, no toolchain): `tools/test_hwprobe_ring110_analyze.py`, `tools/test_hwprobe_pn.py`,
-`tools/test_hwprobe_ps3ftp.py`.
+Tests (standalone, no toolchain): `tools/test_hwprobe_ring110_analyze.py`, `tools/test_hwprobe_layer2.py`,
+`tools/test_hwprobe_pn.py`, `tools/test_hwprobe_ps3ftp.py`.
 
 ---
 

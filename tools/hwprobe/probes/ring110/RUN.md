@@ -3,7 +3,7 @@
 The probe answers one question (issue #110): when does the cellAudio port's read index advance relative to the
 block being read, and when is a consumed block cleared (design: `PROBE.md`). It only calls the stock audio library;
 it patches nothing. Layer 1 needs no capture hardware and takes about 15 minutes for the whole set. Layer 2 needs
-a line-in recording of the console's audio (section 7) and its analysis is not written yet.
+a line-in recording of the console's audio (section 7); `analyze_layer2.py` reads that recording with the run's CSV.
 
 Build, copy and the console-side mechanics are in `tools/hwprobe/README.md`; commands below assume
 `export HWPROBE_CONSOLE=ADDR` and are run from the repository root with `PROBE=tools/hwprobe/probes/ring110`.
@@ -89,24 +89,65 @@ Sanity checks: `Q1 period` is about 5.333 ms; the warnings block is empty; `abor
 All `results/ring110_*.csv` (a few MB each), the analyzer output, the Audio Output Settings and output device, how
 the SELF was started, which runs were cold and which warm, and anything odd (sounds, black screen, warnings).
 
-## 7. Layer 2 (later): analog capture
+## 7. Layer 2: analog capture
 
 Layer 2 plays short noise bursts (+-0.5 full scale, `pn.py` for the codes) and needs the console's output recorded.
-With the AV cable into a line-in:
+
+**What you need.** An AV MULTI cable (the red and white plugs are the audio) into a **USB audio interface with a line
+input**: a MacBook's 3.5 mm jack is a headphone/microphone jack, not a line input (wrong level, and macOS may put
+AGC or a gate on it). On the interface: line level, no monitoring mix, no phantom power, 48 kHz (Audio MIDI Setup).
+`ffmpeg` on the Mac (`which ffmpeg`; `brew install ffmpeg` if it prints nothing) and Python 3; the analysis needs no
+other package.
 
 1. **Output:** Audio Output Settings: AV MULTI / SCART only, HDMI and optical unticked (stereo, 48 kHz).
 2. **Cabling:** only the left/right audio plugs to the line-in; HDMI audio must not be selected.
-3. **Recorder:** 48 kHz, 24 bit, 2 ch, no AGC, EQ, enhancement or gate, gain set once so that a full-scale 0.5 marker
-   peaks near -6 dBFS (adjust with `cfg/l2_c1.cfg`, then leave it). Start at least 5 s before the probe, stop at
-   least 5 s after it returns. One WAV per run.
-4. The D/A converter adds a constant delay and smears the bursts by tens of microseconds; that cancels in the
-   differences the analysis uses. Silence recorded before the run sets the detection threshold. A free-running
-   recorder clock is fine (only differences within 0.2 s are used).
-5. **Runs** (about 4 minutes of capture each): `cfg/l2_main.cfg` x3 cold, then once each `l2_shape16.cfg`, `l2_c1.cfg`,
-   `l2_c2.cfg`, `l2_c3.cfg`; then a finer pass with `l2_fine.cfg` (edit `omin_ms` / `omax_ms` around the located
-   threshold, one run per `jset`). No XMB sounds, trophies or PSN pop-ups during a run.
+3. **Record** one WAV per run, 48 kHz, 24 bit, 2 ch, started at least 5 s before the probe and stopped at least 5 s
+   after it returns (the first 3 s must be silent: they set the noise floor and the detection threshold):
 
-The Layer 2 analysis (marker detection, hit/miss classification, logistic fit) is not written yet.
+   ```
+   ffmpeg -f avfoundation -list_devices true -i ""                  # note the index of the interface under "audio devices"
+   ffmpeg -f avfoundation -i ":2" -ar 48000 -ac 2 -c:a pcm_s24le run1.wav     # ":2" = that index; Ctrl-C stops
+   ```
+
+   macOS asks once for microphone access for the terminal: allow it. An interface with more than two inputs needs
+   `-af "pan=stereo|c0=c0|c1=c1"` (the two channels the plugs are on) instead of the bare `-ac 2` downmix. No AGC,
+   EQ, enhancement or gate; set the gain once and leave it.
+4. **Level check** (once, and after any gain change): put `cfg/l2_c1.cfg` on the console, record the 8 s run, then
+
+   ```
+   python3 $PROBE/analyze_layer2.py results/ring110_L2_r001_n8c2_c1.csv c1.wav
+   ```
+
+   The line "marker level" should read about -6 dBFS (-12 to -3 is fine), with no "clips" or "is low" warning, a
+   marker-to-noise ratio of 40 dB or more, the same reference cosine on both channels, and the control line says
+   every write was a hit. Without the probe, `ffmpeg -i c1.wav -af volumedetect -f null -` should show a
+   `max_volume` near -6 dB. Change the interface's gain, never the console's volume.
+5. The D/A converter adds a constant delay and smears the bursts by tens of microseconds; that cancels in the
+   differences the analysis uses. A free-running recorder clock is fine (only differences within 0.2 s are used; the
+   analysis reports the drift against the console timebase as a check).
+6. **Runs** (about 4 minutes of capture each): `cfg/l2_main.cfg` x3 cold, then once each `l2_shape16.cfg`, `l2_c1.cfg`,
+   `l2_c2.cfg`, `l2_c3.cfg`; then a finer pass with `l2_fine.cfg` (edit `omin_ms` / `omax_ms` around the located
+   threshold, one run per `jset`). The main grid steps `o` by 0.5 ms, so its `x` is only as sharp as that;
+   the 0.1 ms pass is what fixes it to about 0.1 ms. No XMB sounds, trophies or PSN pop-ups during a run.
+
+**Analysis.** Copy the CSV (`ps3ftp.py get results --prefix ring110`) and run, for each run and its recording:
+
+```
+python3 $PROBE/analyze_layer2.py results/ring110_L2_r001_n8c2_main.csv main1.wav            # human summary
+python3 $PROBE/analyze_layer2.py results/ring110_L2_r001_n8c2_main.csv main1.wav --json     # the same, machine-readable
+```
+
+It measures the noise floor on the leading silence, finds every marker by matched filter, joins them to the trials
+by code, classifies each trial (hit, miss, or other: no marker, repeating, partial, wrong delay), fits the hit
+probability against the actual write offset for each `j`, and prints `x_latch = o50(j) - j*P` with its 95 %
+interval, whether the `j` agree within 0.5 ms, the recorder drift, the false alarms of the detector on the
+reference-only trials, and the class of PROBE.md section 6. Read the warnings first. If the markers repeat every lap
+the hardware does not clear consumed blocks: `--first-occurrence` then scores each trial by its first arrival.
+`l2_c2.cfg` (no trials) prints which of its two markers is heard first. Try the analysis without a console:
+
+```
+python3 $PROBE/synth_layer2.py /tmp/demo --x-ms 2.6 && python3 $PROBE/analyze_layer2.py /tmp/demo.csv /tmp/demo.wav
+```
 
 ## 8. If something goes wrong
 

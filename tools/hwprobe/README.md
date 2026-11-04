@@ -21,7 +21,7 @@ being read. See `probes/ring110/RUN.md`.
 | `probes/<probe>/` | one probe: sources, `cfg/`, `RUN.md`, format notes, analysis scripts |
 
 Tests (standalone, no toolchain or console): `python3 tools/test_hwprobe_ring110_analyze.py`,
-`python3 tools/test_hwprobe_pn.py`, `python3 tools/test_hwprobe_ps3ftp.py`.
+`python3 tools/test_hwprobe_layer2.py`, `python3 tools/test_hwprobe_pn.py`, `python3 tools/test_hwprobe_ps3ftp.py`.
 
 ## Prerequisites
 

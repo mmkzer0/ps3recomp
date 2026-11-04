@@ -48,3 +48,12 @@ The guest's own writes never produce a `SENT` row (the poller updates its cached
 128 samples of +-0.5 on channels 0 and 1, starting at sample 32 of the block. Code `id`:
 `s = (id * 2654435761) ^ 0x9E3779B9` (uint32), 8 warm-up xorshift32 steps (`13, 17, 5`), then per sample one step
 and `sign = +1 if bit 16 of s else -1`. `tools/test_hwprobe_pn.py` checks that the C header and `pn.py` agree.
+
+## What `analyze_layer2.py` reads
+
+From the CSV: `META,layer` (must be `L2`), `tbfreq`, `blocks`, `abort_reason`, `ev_drop`, `ui_overlaps`, `l2_preset`
+(`c1` and `c3` get a control line, `l2_c2` selects the C2 report), the `TRIAL` rows (`j`, `o_actual_ms`, `t_c`, `t_w`,
+`code`, `test_blk`, `ref_blk`, `t_ref`, `kind`, `done`), the `EV` kind 1 rows with word 0 (the hardware's clears: block
+and time, for `x_clear` without the capture), kind 3 (a polling gap logged at the same timebase value as a trial's
+`t_c` makes that trial's `t_c` uncertain) and `END`. From the WAV: 48 kHz integer PCM, 16, 24 or 32 bit, 1 or 2
+channels; the first seconds must be silent (`--silence-s`, default 3).
