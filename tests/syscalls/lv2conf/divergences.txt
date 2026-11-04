@@ -1,0 +1,96 @@
+# lv2conf divergences: rows where the HLE is known to differ from the hardware golden (golden.csv).
+#
+# One entry per line:  <case_id> <key> #<issue> <short reason>
+# The key `*` covers every key of the case, for a case the HLE stops, crashes or hangs on. An entry
+# whose rows no longer differ fails the test: remove it when the HLE is fixed.
+time.current_time_null_sec * #114 NULL pointer not rejected with EFAULT
+time.current_time_null_nsec * #114 NULL pointer not rejected with EFAULT
+mutex.create_null_id * #114 NULL pointer not rejected with EFAULT
+mutex.create_null_attr * #114 NULL pointer not rejected with EFAULT
+semaphore.create_null_id * #114 NULL pointer not rejected with EFAULT
+semaphore.create_null_attr * #114 NULL pointer not rejected with EFAULT
+semaphore.get_value_null * #114 NULL pointer not rejected with EFAULT
+rwlock.create_null_args * #114 NULL pointer not rejected with EFAULT
+eventflag.create_null_args * #114 NULL pointer not rejected with EFAULT
+eventflag.get_null * #114 NULL pointer not rejected with EFAULT
+memory.allocate_null_addr * #114 NULL pointer not rejected with EFAULT
+ppu_thread.get_join_state * #114 NULL pointer not rejected with EFAULT
+mutex.create_protocols * #115 invalid attribute accepted
+mutex.create_recursive_values * #115 invalid attribute accepted
+mutex.create_pshared_values * #115 invalid attribute accepted
+cond.create_pshared_values * #115 invalid attribute accepted
+semaphore.create_params * #115 invalid attribute accepted
+semaphore.create_protocols * #115 invalid attribute accepted
+semaphore.create_pshared_values * #115 invalid attribute accepted
+rwlock.create_protocols * #115 invalid attribute accepted
+event.queue_create_sizes * #115 invalid attribute accepted
+event.queue_create_protocols * #115 invalid attribute accepted
+event.queue_create_types * #115 invalid attribute accepted
+event.queue_destroy_modes * #115 invalid attribute accepted
+event.port_create_types * #115 invalid attribute accepted
+eventflag.create_protocols * #115 invalid attribute accepted
+eventflag.create_types * #115 invalid attribute accepted
+eventflag.bad_modes * #115 invalid attribute accepted
+mutex.object_count * #116 process object syscalls 12/13/18 missing
+cond.object_count * #116 process object syscalls 12/13/18 missing
+semaphore.object_count * #116 process object syscalls 12/13/18 missing
+rwlock.object_count * #116 process object syscalls 12/13/18 missing
+event.queue_object_count * #116 process object syscalls 12/13/18 missing
+event.port_create_destroy * #116 process object syscalls 12/13/18 missing
+eventflag.object_count * #116 process object syscalls 12/13/18 missing
+process.getppid * #116 process object syscalls 12/13/18 missing
+process.object_count * #116 process object syscalls 12/13/18 missing
+process.get_id_lists_mutex * #116 process object syscalls 12/13/18 missing
+process.get_id_unknown_type * #116 process object syscalls 12/13/18 missing
+timer.create_destroy * #116 process object syscalls 12/13/18 missing
+rwlock.readers_stack * #117 rwlock timeout, state checks, slot 126
+rwlock.trywlock_exclusive * #117 rwlock timeout, state checks, slot 126
+rwlock.trywlock_slot_148 * #117 rwlock timeout, state checks, slot 126
+rwlock.rlock_under_writer * #117 rwlock timeout, state checks, slot 126
+rwlock.wlock_under_reader * #117 rwlock timeout, state checks, slot 126
+rwlock.trywlock_under_reader * #117 rwlock timeout, state checks, slot 126
+rwlock.runlock_not_held * #117 rwlock timeout, state checks, slot 126
+rwlock.destroy_locked * #117 rwlock timeout, state checks, slot 126
+rwlock.invalid_id * #117 rwlock timeout, state checks, slot 126
+event.queue_tryreceive_errors * #118 event port/queue state and source
+event.queue_receive_errors * #118 event port/queue state and source
+event.port_connect_wrong_type * #118 event port/queue state and source
+event.port_destroy_connected * #118 event port/queue state and source
+event.port_send_default_source * #118 event port/queue state and source
+event.port_outlives_queue * #118 event port/queue state and source
+mutex.trylock_relock_nonrecursive * #119 sync binding, relock, trywait output
+cond.mutex_destroy_with_cond * #119 sync binding, relock, trywait output
+cond.signal_to_bogus_thread * #119 sync binding, relock, trywait output
+eventflag.trywait_and * #119 sync binding, relock, trywait output
+eventflag.trywait_or * #119 sync binding, relock, trywait output
+eventflag.cancel_no_waiters * #119 sync binding, relock, trywait output
+eventflag.invalid_id * #119 sync binding, relock, trywait output
+memory.allocate_bad_flags * #120 memory/timer/ppu_thread checks
+memory.allocate_size_zero * #120 memory/timer/ppu_thread checks
+memory.allocate_size_alignment * #120 memory/timer/ppu_thread checks
+memory.allocate_too_big * #120 memory/timer/ppu_thread checks
+memory.page_attribute * #120 memory/timer/ppu_thread checks
+memory.page_attribute_unmapped * #120 memory/timer/ppu_thread checks
+ppu_thread.get_priority_unknown * #120 memory/timer/ppu_thread checks
+ppu_thread.set_priority_checks * #120 memory/timer/ppu_thread checks
+timer.start_unconnected * #120 memory/timer/ppu_thread checks
+timer.start_checks * #120 memory/timer/ppu_thread checks
+timer.connect_disconnect * #120 memory/timer/ppu_thread checks
+timer.start_oneshot_in_past * #120 memory/timer/ppu_thread checks
+timer.get_information * #120 memory/timer/ppu_thread checks
+timer.get_information_invalid * #120 memory/timer/ppu_thread checks
+container.create_destroy * #96 slot identity (containers 341/342/350, stubs, 832)
+container.create_destroy_old_slots * #96 slot identity (containers 341/342/350, stubs, 832)
+container.slot_cross * #96 slot identity (containers 341/342/350, stubs, 832)
+container.create_sizes * #96 slot identity (containers 341/342/350, stubs, 832)
+container.create_too_big * #96 slot identity (containers 341/342/350, stubs, 832)
+container.changes_user_memory * #96 slot identity (containers 341/342/350, stubs, 832)
+container.invalid_id * #96 slot identity (containers 341/342/350, stubs, 832)
+container.allocate_from * #96 slot identity (containers 341/342/350, stubs, 832)
+container.allocate_exhaust * #96 slot identity (containers 341/342/350, stubs, 832)
+container.allocate_from_errors * #96 slot identity (containers 341/342/350, stubs, 832)
+container.neighbour_slots * #96 slot identity (containers 341/342/350, stubs, 832)
+slot96.spu_image_close_zeroed * #96 slot identity (containers 341/342/350, stubs, 832)
+slot96.spu_group_unknown * #96 slot identity (containers 341/342/350, stubs, 832)
+slot96.spu_thread_unknown * #96 slot identity (containers 341/342/350, stubs, 832)
+slot96.fs_ftruncate_bad_fd * #96 slot identity (containers 341/342/350, stubs, 832)
