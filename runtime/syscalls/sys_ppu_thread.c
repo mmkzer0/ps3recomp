@@ -149,7 +149,8 @@ static void reap_slot_locked(ppu_thread_info* t)
         t->stack_addr = 0;
         t->stack_size = 0;
     }
-    t->state = PPU_THREAD_STATE_FREE;
+    /* wait_first_block reads the state without the table lock; the release store pairs with its acquire load. */
+    __atomic_store_n(&t->state, PPU_THREAD_STATE_FREE, __ATOMIC_RELEASE);
 }
 
 /* Wake the thread's joiner. Must be called under the table lock, which is what orders it before the joiner's
@@ -184,6 +185,27 @@ void ppu_thread_set_epilogue_hook(ppu_thread_epilogue_hook_fn fn)
     InterlockedExchangePointer((PVOID volatile*)&s_epilogue_hook, (PVOID)fn);
 #else
     __atomic_store_n(&s_epilogue_hook, fn, __ATOMIC_RELEASE);
+#endif
+}
+
+/* The PS3_PRIO_START hook (ppu_thread_set_prio_start_hook), read by the creator when it waits. */
+static ppu_thread_prio_start_hook_fn s_prio_start_hook;
+
+static ppu_thread_prio_start_hook_fn prio_start_hook_load(void)
+{
+#if defined(_MSC_VER) && !defined(__clang__)
+    return (ppu_thread_prio_start_hook_fn)InterlockedCompareExchangePointer((PVOID volatile*)&s_prio_start_hook, NULL, NULL);
+#else
+    return __atomic_load_n(&s_prio_start_hook, __ATOMIC_ACQUIRE);
+#endif
+}
+
+void ppu_thread_set_prio_start_hook(ppu_thread_prio_start_hook_fn fn)
+{
+#if defined(_MSC_VER) && !defined(__clang__)
+    InterlockedExchangePointer((PVOID volatile*)&s_prio_start_hook, (PVOID)fn);
+#else
+    __atomic_store_n(&s_prio_start_hook, fn, __ATOMIC_RELEASE);
 #endif
 }
 
@@ -238,6 +260,8 @@ static int32_t creator_priority(uint64_t tid)
  * ppu_thread_note_block, so whatever `t` wrote before it blocked (the event queue key above) is visible here. */
 static void wait_first_block(const ppu_thread_info* t, uint64_t tid)
 {
+    ppu_thread_prio_start_hook_fn hook = prio_start_hook_load();
+    if (hook) hook(tid, 0);
     const ULONGLONG start = GetTickCount64();
     for (;;) {
         if (__atomic_load_n(&t->blocked, __ATOMIC_ACQUIRE)) return;
@@ -253,6 +277,7 @@ static void wait_first_block(const ppu_thread_info* t, uint64_t tid)
     }
     fprintf(stderr, "[SYS] PS3_PRIO_START: tid=%llu \"%s\" (prio %d) did not block within %d ms; its creator goes on\n",
             (unsigned long long)tid, t->name, t->priority, PRIO_START_TIMEOUT_MS);
+    if (hook) hook(tid, 1);
 }
 
 /* ---------------------------------------------------------------------------
@@ -342,7 +367,7 @@ static void* ppu_host_thread_proc(void* param)
 #endif
         reap_slot_locked(info);
     } else {
-        info->state = PPU_THREAD_STATE_ZOMBIE;
+        __atomic_store_n(&info->state, PPU_THREAD_STATE_ZOMBIE, __ATOMIC_RELEASE);   /* read lock-free by wait_first_block */
         if (joiner == PPU_JOIN_JOINING)
             wake_joiner_locked(info);
     }
