@@ -150,17 +150,20 @@ def is_probe_result(name: str, prefix: str) -> bool:
 class FtpSession:
     """Manages an FTP connection with reconnect-on-failure for poll operations."""
 
-    def __init__(self, connect_fn, deadline: float, backoff: float = 1.0):
+    def __init__(self, connect_fn, deadline: float, backoff: float = 1.0,
+                 clock=time.monotonic, sleep=time.sleep):
         self.connect_fn = connect_fn
         self.deadline = deadline
         self.backoff = backoff
+        self.clock = clock
+        self.sleep = sleep
         self.ftp = None
 
     def connect(self):
         """Connect to FTP, retrying with backoff until deadline."""
         self.close()
         last_error = None
-        while time.time() < self.deadline:
+        while self.clock() < self.deadline:
             try:
                 self.ftp = self.connect_fn()
                 ps3ftp.ensure_dir(self.ftp)
@@ -168,7 +171,7 @@ class FtpSession:
             except (ftplib.Error, OSError, EOFError) as e:
                 last_error = e
                 self.close()
-                time.sleep(self.backoff)
+                self.sleep(self.backoff)
         err_msg = repr(last_error) if last_error else "deadline exceeded"
         raise TimeoutError(f"TIMEOUT: failed to connect to console FTP before deadline ({err_msg})")
 
@@ -187,7 +190,7 @@ class FtpSession:
     def call(self, fn, *args, **kwargs):
         """Call fn(self.ftp, *args, **kwargs). If an FTP connection error occurs, reconnect and retry."""
         last_error = None
-        while time.time() < self.deadline:
+        while self.clock() < self.deadline:
             if self.ftp is None:
                 self.connect()
             try:
@@ -198,7 +201,7 @@ class FtpSession:
                 err_str = repr(e) if repr(e) else type(e).__name__
                 print(f"[console] FTP operation notice ({err_str}), reconnecting...")
                 self.close()
-                time.sleep(self.backoff)
+                self.sleep(self.backoff)
         err_msg = repr(last_error) if last_error else "deadline exceeded"
         raise TimeoutError(f"TIMEOUT: FTP operation failed and could not reconnect before deadline ({err_msg})")
 
@@ -220,6 +223,8 @@ def run_probe(
     poll_interval: float = 2.0,
     reconnect_backoff: float = 1.0,
     ftp_client: object | None = None,
+    clock=time.monotonic,
+    sleep=time.sleep,
 ) -> list:
     """Execute a probe SELF on the console end-to-end with 8001003A retry logic.
 
@@ -241,6 +246,9 @@ def run_probe(
       poll_interval: Frequency of FTP polling in seconds.
       reconnect_backoff: Delay in seconds before retrying FTP connection.
       ftp_client: Optional pre-connected/mock FTP client (for testing).
+      clock: Monotonic time source in seconds, used for every interval (run window,
+             overall timeout, FTP reconnect deadline). Injectable for tests.
+      sleep: Sleep function used for poll and FTP reconnect backoff delays.
 
     Returns:
       List of locally fetched result file paths on success.
@@ -269,7 +277,7 @@ def run_probe(
             raise FileNotFoundError(f"Config file not found: {cfg_path}")
         ps3ftp.check_name(cfg_name + ".cfg")
 
-    total_start = time.time()
+    total_start = clock()
     deadline = total_start + timeout
 
     if ftp_client is not None:
@@ -281,7 +289,7 @@ def run_probe(
         def connect_fn():
             return ps3ftp.connect(args_dummy)
 
-    session = FtpSession(connect_fn, deadline=deadline, backoff=reconnect_backoff)
+    session = FtpSession(connect_fn, deadline=deadline, backoff=reconnect_backoff, clock=clock, sleep=sleep)
 
     mounted = False
     probe_started = False
@@ -318,9 +326,9 @@ def run_probe(
         play_attempts = 1
         print("[console] play attempt 1/3 (/play.ps3)...")
         play(host, port=http_port)
-        launch_time = time.time()
+        launch_time = clock()
 
-        while time.time() - total_start < timeout:
+        while clock() - total_start < timeout:
             current_names = set(session.call(ps3ftp.list_names))
             current_runid = session.call(get_file_content, f"{probe_name}_runid.txt")
             current_last = session.call(get_file_content, f"{probe_name}_last.txt")
@@ -372,19 +380,19 @@ def run_probe(
                     break
 
             # 8001003A Retry logic:
-            if not probe_started and time.time() - launch_time >= run_window and play_attempts < 3:
+            if not probe_started and clock() - launch_time >= run_window and play_attempts < 3:
                 play_attempts += 1
                 print(
                     f"[console] no probe activity after run window ({run_window}s), "
                     f"retrying play ({play_attempts}/3)..."
                 )
                 play(host, port=http_port)
-                launch_time = time.time()
+                launch_time = clock()
 
-            time.sleep(poll_interval)
+            sleep(poll_interval)
 
         if not completed:
-            elapsed = time.time() - total_start
+            elapsed = clock() - total_start
             activity_note = "; console left mounted; probe may still be running" if probe_started else ""
             raise TimeoutError(
                 f"TIMEOUT: after {play_attempts} play attempts ({elapsed:.1f}s), "
