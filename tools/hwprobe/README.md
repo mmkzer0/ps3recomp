@@ -3,12 +3,14 @@
 Some behaviour of the HLE (when an index advances, when a block is consumed, what a timestamp means) cannot be
 read from the firmware or from an emulator; it can only be measured on hardware. `tools/hwprobe/` is the kit for
 that: a PPU cross toolchain in a container, a small C library every probe links, a build script that makes a
-fake-signed SELF, an FTP helper, and per probe the sources, the run instructions and the host-side analysis.
-It contains no game binary, no firmware and no title-specific material, and everything except the console run
-works on a Mac or Linux host.
+fake-signed SELF, an FTP helper, a console runner, and per probe the sources, the run instructions and the
+host-side analysis. It contains no game binary, no firmware and no title-specific material, and everything except
+the console run works on a Mac or Linux host.
 
 The first probe is `ring110` (issue #110): when does the cellAudio port read index advance relative to the block
-being read. See `probes/ring110/RUN.md`.
+being read. See `probes/ring110/RUN.md`. The second is `lv2conf` (#96, #114 to #120): lv2 syscall conformance cases
+that run on a console and against the toolkit's HLE, with a console run as the golden reference. See
+`probes/lv2conf/RUN.md` and `FORMAT.md`.
 
 | Path | What |
 |---|---|
@@ -24,7 +26,8 @@ being read. See `probes/ring110/RUN.md`.
 
 Tests (standalone, no toolchain or console): `python3 tools/test_hwprobe_ring110_analyze.py`,
 `python3 tools/test_hwprobe_layer2.py`, `python3 tools/test_hwprobe_pn.py`, `python3 tools/test_hwprobe_ps3ftp.py`,
-`python3 tools/test_hwprobe_console.py`.
+`python3 tools/test_hwprobe_console.py`, `python3 tools/test_hwprobe_lv2conf.py`.
+
 ## Prerequisites
 
 - A host with `podman` (macOS: `brew install podman`, `podman machine init && podman machine start`; the machine
@@ -93,7 +96,7 @@ http://ADDR/mount.ps3/unmount                                      # afterwards:
 ```
 
 Nothing here reboots or shuts the console down; do not use `/restart.ps3`, `/reboot.ps3`, `/shutdown.ps3`.
-
+`ps3console.py` (next section) does these steps for you.
 
 ### Automated run with ps3console.py
 
@@ -101,7 +104,8 @@ Nothing here reboots or shuts the console down; do not use `/restart.ps3`, `/reb
 
 ```
 export HWPROBE_CONSOLE=169.254.2.30
-tools/hwprobe/ps3console.py run tools/hwprobe/out/lv2conf.fake.self --prefix lv2conf --run-window 30 --out results
+tools/hwprobe/ps3console.py run tools/hwprobe/out/lv2conf_l1.fake.self --prefix lv2conf --run-window 30 \
+    --cfg lv2conf tools/hwprobe/probes/lv2conf/cfg/full.cfg --out results
 ```
 
 Options:
@@ -116,7 +120,10 @@ Safety, connection recovery, and allow-list:
 - **HTTP allow-list**: `ps3console.py` strictly restricts HTTP requests to `/mount.ps3/dev_hdd0/tmp/hwprobe/<name>`, `/play.ps3`, and `/mount.ps3/unmount`. Refuses destructive endpoints (`/restart.ps3`, `/reboot.ps3`, `/shutdown.ps3`) and path traversals.
 - **Connection recovery**: webMAN frequently drops the FTP control connection 4-6s after `/play.ps3` launches a SELF. All poll and fetch operations use an auto-reconnecting wrapper that catches disconnects (`EOFError`, `OSError`, `ftplib.all_errors`) and retries with backoff until `--timeout`.
 - **Safe unmount policy**: `/mount.ps3/unmount` is issued **only after** all result files have been verified complete and downloaded. It is **never** called while a probe may be running; if a timeout or error occurs after probe activity has been observed, the image remains mounted (`console left mounted; probe may still be running`) to avoid sending an exit signal to an active probe.
-**Direct cable.** With the console cabled straight to the host both sides fall back to link-local addresses
+
+### Direct cable
+
+With the console cabled straight to the host both sides fall back to link-local addresses
 (`169.254.x.y`), and macOS may have no usable route to the console's subnet even though the interface is up. Add a
 *network* route over the interface that carries the cable:
 
