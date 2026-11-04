@@ -17,12 +17,13 @@ being read. See `probes/ring110/RUN.md`.
 | `common/` | the library every probe links: timebase, result header and file writer, on-screen status, pad |
 | `mk/ppu_probe.mk` | shared make rules; a layer Makefile is five lines |
 | `ps3ftp.py` | copy SELFs and configs to the console, fetch and delete result files |
+| `ps3console.py` | automated console runner (upload, mount, play, poll with 8001003A retries, fetch, unmount) |
 | `hwprobe_format.py` | reader of the result header (used by every probe's analysis) |
 | `probes/<probe>/` | one probe: sources, `cfg/`, `RUN.md`, format notes, analysis scripts |
 
 Tests (standalone, no toolchain or console): `python3 tools/test_hwprobe_ring110_analyze.py`,
-`python3 tools/test_hwprobe_layer2.py`, `python3 tools/test_hwprobe_pn.py`, `python3 tools/test_hwprobe_ps3ftp.py`.
-
+`python3 tools/test_hwprobe_layer2.py`, `python3 tools/test_hwprobe_pn.py`, `python3 tools/test_hwprobe_ps3ftp.py`,
+`python3 tools/test_hwprobe_console.py`.
 ## Prerequisites
 
 - A host with `podman` (macOS: `brew install podman`, `podman machine init && podman machine start`; the machine
@@ -92,6 +93,28 @@ http://ADDR/mount.ps3/unmount                                      # afterwards:
 
 Nothing here reboots or shuts the console down; do not use `/restart.ps3`, `/reboot.ps3`, `/shutdown.ps3`.
 
+
+### Automated run with ps3console.py
+
+`ps3console.py` automates the entire upload, mount, play, poll, fetch, and unmount cycle:
+
+```
+export HWPROBE_CONSOLE=169.254.2.30
+tools/hwprobe/ps3console.py run tools/hwprobe/out/lv2conf.fake.self --prefix lv2conf --run-window 30 --out results
+```
+
+Options:
+- `--run-window S` (**required**): longest time one launch may take until its first result (seconds, known from probe's `RUN.md`). A `/play.ps3` retry is issued only if a full run window passes with zero file changes (recovering from XMB error 8001003A). As soon as any probe activity is detected (`<probe>_runid.txt`, `<probe>_last.txt`, or a result file), the probe is known to be running and `/play.ps3` is never pressed again in that launch.
+- `--probe NAME`: probe name for tracking files (`<probe>_runid.txt`, `<probe>_last.txt`). Defaults to `--prefix` (assumption: prefix == probe name, e.g. for `ring110` and `lv2conf`).
+- `--cfg NAME FILE`: upload configuration as `/dev_hdd0/tmp/hwprobe/NAME.cfg` before mounting.
+- `--runs N`: number of result files expected (default 1). Completion requires that N result files exist AND `<probe>_last.txt` names the last of them, preventing partial fetches while a result file is open.
+- `--timeout S`: overall timeout in seconds (default 120s).
+- `--out DIR`: local destination directory for fetched result CSVs (default `results/`).
+
+Safety, connection recovery, and allow-list:
+- **HTTP allow-list**: `ps3console.py` strictly restricts HTTP requests to `/mount.ps3/dev_hdd0/tmp/hwprobe/<name>`, `/play.ps3`, and `/mount.ps3/unmount`. Refuses destructive endpoints (`/restart.ps3`, `/reboot.ps3`, `/shutdown.ps3`) and path traversals.
+- **Connection recovery**: webMAN frequently drops the FTP control connection 4-6s after `/play.ps3` launches a SELF. All poll and fetch operations use an auto-reconnecting wrapper that catches disconnects (`EOFError`, `OSError`, `ftplib.all_errors`) and retries with backoff until `--timeout`.
+- **Safe unmount policy**: `/mount.ps3/unmount` is issued **only after** all result files have been verified complete and downloaded. It is **never** called while a probe may be running; if a timeout or error occurs after probe activity has been observed, the image remains mounted (`console left mounted; probe may still be running`) to avoid sending an exit signal to an active probe.
 **Direct cable.** With the console cabled straight to the host both sides fall back to link-local addresses
 (`169.254.x.y`), and macOS may have no usable route to the console's subnet even though the interface is up. Add a
 *network* route over the interface that carries the cable:
