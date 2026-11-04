@@ -729,6 +729,20 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME spu_decode COMMAND test_spu_decode)
         set_tests_properties(spu_decode PROPERTIES LABELS "spu;t0" TIMEOUT 30)
 
+        # SPU_INTERP_OPSTATS: per-op execution counts of a synthetic program,
+        # exact across the thread-local folds, several interpreting threads and
+        # the elected printer; unset, nothing is counted (one process per mode:
+        # the env is read once per thread).
+        add_executable(test_spu_opstats
+            runtime/spu/tests/test_spu_opstats.c)
+        target_include_directories(test_spu_opstats PRIVATE include runtime/spu)
+        target_compile_options(test_spu_opstats PRIVATE -UNDEBUG)
+        target_link_libraries(test_spu_opstats PRIVATE m Threads::Threads)
+        add_test(NAME spu_opstats COMMAND test_spu_opstats)
+        add_test(NAME spu_opstats_off COMMAND test_spu_opstats off)
+        set_tests_properties(spu_opstats spu_opstats_off
+            PROPERTIES LABELS "spu;t0;tsan" TIMEOUT 60)
+
         add_executable(test_spu_lockline_wait
             runtime/spu/tests/test_spu_lockline_wait.c)
         target_include_directories(test_spu_lockline_wait PRIVATE include)
