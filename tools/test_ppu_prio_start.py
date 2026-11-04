@@ -16,8 +16,17 @@ with tempfile.TemporaryDirectory(prefix='ppu-prio-start-') as tmp:
         '-ffunction-sections','-fdata-sections',
         '-I'+str(root/'include'),'-I'+str(root/'runtime'),'-I'+str(root/'runtime/syscalls'),
         str(root/'tests/test_ppu_prio_start.c'),*linker,'-o',str(binary)],check=True)
-    quiet=subprocess.DEVNULL if os.environ.get('CI') else None
     for on in (False, True):
         env={k:v for k,v in os.environ.items() if k!='PS3_PRIO_START'}
         if on: env['PS3_PRIO_START']='1'
-        subprocess.run([str(binary)],check=True,timeout=60,env=env,stderr=quiet)
+        # The fixture logs every thread it starts: keep that out of a passing run, but a failing one must say which
+        # check failed, so the stderr is captured and shown only then (a CI log with it suppressed names nothing).
+        try:
+            run=subprocess.run([str(binary)],timeout=60,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,errors='replace')
+        except subprocess.TimeoutExpired as e:
+            sys.stderr.write(e.stderr.decode(errors='replace') if isinstance(e.stderr,bytes) else (e.stderr or ''))
+            raise SystemExit(f"FAIL: PS3_PRIO_START {'on' if on else 'off'}: no result after {e.timeout} s")
+        if run.returncode:
+            sys.stderr.write(run.stderr)
+            raise SystemExit(f"FAIL: PS3_PRIO_START {'on' if on else 'off'}: exit status {run.returncode}")
+        sys.stdout.write(run.stdout)

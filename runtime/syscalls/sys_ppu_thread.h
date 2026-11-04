@@ -135,6 +135,14 @@ int64_t sys_ppu_thread_get_stack_information(ppu_context* ctx);
 typedef void (*ppu_thread_epilogue_hook_fn)(uint64_t tid, int joiner);
 void ppu_thread_set_epilogue_hook(ppu_thread_epilogue_hook_fn fn);
 
+/* Test seam for PS3_PRIO_START: called on the creator thread inside sys_ppu_thread_create, only when it waits for a
+ * thread it made at a higher priority. gave_up == 0: the wait is about to begin, before its first look at the new
+ * thread; gave_up == 1: the PRIO_START_TIMEOUT_MS cap ran out and the creator goes on. A test orders the new thread
+ * after the first call (the wait is then under way) and counts the calls, so it needs no sleep and no elapsed-time
+ * bound. NULL (the default) calls nothing. */
+typedef void (*ppu_thread_prio_start_hook_fn)(uint64_t tid, int gave_up);
+void ppu_thread_set_prio_start_hook(ppu_thread_prio_start_hook_fn fn);
+
 /* Registration */
 void sys_ppu_thread_init(lv2_syscall_table* tbl);
 
