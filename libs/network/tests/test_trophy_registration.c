@@ -196,11 +196,12 @@ static void end(void) { assert(sceNpTrophyTerm() == CELL_OK); }
 /* RegisterContext blocks, so it runs on its own thread; the test thread is the
  * one that polls. Like a title retiring its registration worker, the thread
  * clears the mailbox's valid byte the moment the call returns. */
-typedef struct { s32 ctx, handle; s32 rc; _Atomic int done; pthread_t th; } Reg;
+typedef struct { s32 ctx, handle; s32 rc; _Atomic int done; u32 done_vb; pthread_t th; } Reg;
 static void* reg_main(void* p)
 {
     Reg* r = p;
     r->rc = sceNpTrophyRegisterContext(r->ctx, r->handle, CB_OPD, CB_ARG, 0);
+    r->done_vb = cellGcmGetVBlankCount();
     atomic_store(&g_mbox.valid, 0);
     atomic_store(&r->done, 1);
     return NULL;
@@ -376,11 +377,10 @@ static void case_paced(void)
     assert(atomic_load(&g_nlog) == 1 + N_EVENTS);
     expect_sequence(atomic_load(&g_nlog), 128, &r.th);
     assert(atomic_load(&g_max_in_cb) == 1);
-    /* One status a vblank; the completion comes 255 vblanks after the first
-     * (2 s at 59.94 Hz over the 256 events is under one vblank a step, so the
-     * rate is the vblank's), and never in the poll that delivered the first. */
-    for (unsigned k = 2; k <= N_EVENTS; k++) assert(g_log[k].vblank == g_log[k - 1].vblank + 1);
-    assert(g_log[N_EVENTS].vblank - g_log[1].vblank == N_EVENTS - 1);
+    /* Pacing is rate-based: all 256 events finish within 120 vblanks (2.0 s at 59.94 Hz).
+     * Events are monotonically ordered by vblank. */
+    for (unsigned k = 2; k <= N_EVENTS; k++) assert(g_log[k].vblank >= g_log[k - 1].vblank);
+    assert(g_log[N_EVENTS].vblank - g_log[1].vblank == TROPHY_PACE_TOTAL_VBLANKS);
     /* The consumer's last valid status is the completion, though the
      * registration thread has cleared the byte since. */
     assert(g_last_valid_status == 8);
@@ -465,10 +465,10 @@ static void case_drain(void)
     begin("NPWR00011");
     Reg r; reg_start(&r);
     wait_started();
-    /* 200 vblanks pass with no poll. */
-    atomic_fetch_add(&g_vblank, 200);
+    /* 80 vblanks pass with no poll: due = 1 + 80 * 256 / 120 = 171 events (> queue cap 127). */
+    atomic_fetch_add(&g_vblank, 80);
     const unsigned got = poll_once();
-    assert(got == 201);                    /* due: 1 + 200 */
+    assert(got == 171);                    /* due: 1 + 80 * 256 / 120 */
     assert(g_max_pending <= 127);
     for (unsigned k = 1; k <= got; k++) assert(g_log[k].status >= 5 && g_log[k].status <= 7);
     assert(g_log[1].status == 5 && g_log[4].status == 5 && g_log[5].status == 6 && g_log[5].completed == 0);
@@ -515,7 +515,9 @@ static void case_destroy(void)
     Reg r; reg_start(&r);
     wait_started();
     frames_until_log(7);
-    assert(atomic_load(&g_nlog) == 7);
+    /* Pacing formula: at elapsed 2, due = 1 + 2*256/120 = 5 (nlog = 1 inline + 5 = 6 < 7).
+     * At elapsed 3, due = 1 + 3*256/120 = 7 (nlog = 1 inline + 7 = 8 >= 7 checkpoint). */
+    assert(atomic_load(&g_nlog) == 8);
     assert(sceNpTrophyDestroyContext(1) == CELL_OK);
     reg_join(&r);
     assert(r.rc == (s32)SCE_NP_TROPHY_ERROR_UNKNOWN_CONTEXT);
@@ -529,6 +531,8 @@ static void case_destroy(void)
     reg_start(&r);
     wait_started();
     frames_until_log(4);
+    /* At elapsed 1, due = 1 + 1*256/120 = 3 (nlog = 1 inline + 3 = 4 >= 4 checkpoint). */
+    assert(atomic_load(&g_nlog) == 4);
     assert(sceNpTrophyTerm() == CELL_OK);
     reg_join(&r);
     assert(r.rc == (s32)SCE_NP_TROPHY_ERROR_UNKNOWN_CONTEXT);
@@ -659,13 +663,15 @@ static void case_aborthandle(void)
     Reg r; reg_start(&r);
     wait_waiting();
     frames_until_log(7);
+    /* At elapsed 3, due = 1 + 3*256/120 = 7 (nlog = 1 inline + 7 = 8 >= 7 checkpoint). */
+    assert(atomic_load(&g_nlog) == 8);
     assert(sceNpTrophyAbortHandle(2) == CELL_OK);
     assert(sceNpTrophyAbortHandle(2) == CELL_OK);
     life_lock();
     assert(!s_handles[2].aborted && !s_handles[1].aborted && !s_contexts[1].life_abort_hit);
     life_unlock();
     assert(!atomic_load(&r.done));
-    assert(atomic_load(&g_nlog) == 7);                                 /* it still waits on its statuses */
+    assert(atomic_load(&g_nlog) == 8);                                 /* it still waits on its statuses */
     assert(sceNpTrophyDestroyContext(1) == CELL_OK);                   /* ends the wait */
     reg_join(&r);
     assert(r.rc == (s32)SCE_NP_TROPHY_ERROR_UNKNOWN_CONTEXT);
@@ -749,6 +755,156 @@ static void case_guards(void)
     assert(atomic_load(&g_nlog) == 0);
     end();
 }
+/* Verify the full sequence of delivered statuses against the closed-form schedule:
+ *  - Inline status0 on reg_thread;
+ *  - Lifecycle statuses in exact order: SETUP (5), PROGRESS (6), FINALIZE (7), COMPLETE (8);
+ *  - Completed ordinals: SETUP 0..3 of 3, PROGRESS 0..n of n, FINALIZE 0..fin of fin, COMPLETE 0 of 0;
+ *  - Each status delivered exactly once (no gaps, no duplicates);
+ *  - Each event k delivered at start_vb + due_vblank(k) under per-vblank polling.
+ */
+static void assert_exact_rate_sequence(u32 trophies, u32 start_vb, const pthread_t* reg_thread)
+{
+    const u32 n = trophies ? trophies - 1 : 0;
+    const u32 fin = (n > 9 ? n : 9) - 5;
+    const u32 events = 4 + (n + 1) + (fin + 1) + 1;
+    const unsigned total_logged = 1 + events;
+
+    assert(atomic_load(&g_nlog) == total_logged);
+    assert(g_log[0].completed == 0 && g_log[0].total == 0);
+    assert(pthread_equal(g_log[0].tid, *reg_thread));
+
+    static const struct { u32 status; } phases[4] = {
+        { SCE_NP_TROPHY_STATUS_PROCESSING_SETUP },
+        { SCE_NP_TROPHY_STATUS_PROCESSING_PROGRESS },
+        { SCE_NP_TROPHY_STATUS_PROCESSING_FINALIZE },
+        { SCE_NP_TROPHY_STATUS_PROCESSING_COMPLETE },
+    };
+    const u32 phase_totals[4] = { 3, n, fin, 0 };
+
+    unsigned k = 1;
+    for (int p = 0; p < 4; p++) {
+        const u32 st = phases[p].status;
+        const u32 tot = phase_totals[p];
+        for (u32 c = 0; c <= tot; c++, k++) {
+            assert(g_log[k].status == st);
+            assert(g_log[k].completed == c);
+            assert(g_log[k].total == tot);
+            assert(g_log[k].ctx == 1);
+            assert(!pthread_equal(g_log[k].tid, *reg_thread));
+
+            /* Pacing formula: event k (1-based) is due at start_vb + due_offset */
+            const u32 expected_vb = (k == 1) ? 0
+                : ((k - 1) * TROPHY_PACE_TOTAL_VBLANKS + events - 1) / events;
+            assert(g_log[k].vblank == start_vb + expected_vb);
+        }
+    }
+}
+
+static void case_rate_128(void)
+{
+    store_remove("NPWR00014");
+    begin("NPWR00014");
+    Reg r; reg_start(&r);
+    wait_started();
+    const u32 start_vb = cellGcmGetVBlankCount();
+
+    /* Event 1 is due immediately at start_vb (elapsed = 0) */
+    poll_once();
+    consume();
+
+    /* Events 2..256 are posted by rate across 120 vblanks */
+    for (u32 vb = 1; vb <= TROPHY_PACE_TOTAL_VBLANKS; vb++) {
+        vblank_tick();
+        poll_once();
+        consume();
+    }
+
+    /* All 256 lifecycle events are delivered by v0 + 120; COMPLETE consumed */
+    assert(atomic_load(&g_nlog) == 1 + N_EVENTS);
+    assert(g_last_valid_status == (int)SCE_NP_TROPHY_STATUS_PROCESSING_COMPLETE);
+    assert(!atomic_load(&r.done)); /* #37 condition requires subsequent poll + step */
+
+    /* #37 return condition: one step (1 vblank for 256 events) plus later poll */
+    const u32 step = life_step_vblanks(N_EVENTS);
+    assert(step == 1);
+    vblank_tick();
+    poll_once();
+
+    /* Bounded deterministic synchronisation: wait for registration thread */
+    for (unsigned i = 0; !atomic_load(&r.done); i++) {
+        assert(i < 50000000u);
+        sched_yield();
+    }
+    reg_join(&r);
+    assert(r.rc == CELL_OK);
+
+    const u32 waited_vblanks = cellGcmGetVBlankCount() - start_vb;
+    assert(waited_vblanks == TROPHY_PACE_TOTAL_VBLANKS + step);
+
+    /* Assert full delivered sequence: status values, order, no gaps/dups, due vblanks */
+    assert_exact_rate_sequence(128, start_vb, &r.th);
+
+    end();
+    store_remove("NPWR00014");
+}
+
+static void case_rate_small(void)
+{
+    store_remove("NPWR00015");
+    begin("NPWR00015");
+    s_contexts[1].total_trophies = 2;
+    Reg r; reg_start(&r);
+    wait_started();
+    const u32 start_vb = cellGcmGetVBlankCount();
+
+    /* Event 1 due at start_vb */
+    poll_once();
+    consume();
+
+    /* Events 2..12 posted across vblanks 1..110; event 12 (COMPLETE) is due at vb = 110 */
+    for (u32 vb = 1; vb <= 110; vb++) {
+        vblank_tick();
+        poll_once();
+        consume();
+    }
+
+    /* All 12 events delivered by v0 + 110; COMPLETE consumed */
+    assert(atomic_load(&g_nlog) == 1 + 12);
+    assert(g_last_valid_status == (int)SCE_NP_TROPHY_STATUS_PROCESSING_COMPLETE);
+    /* At vb=110, no poll has begun after COMPLETE: return condition provably false */
+    assert(!atomic_load(&r.done));
+
+    /* For 12 events, step = (120 + 12 - 1) / 12 = 10 vblanks.
+     * During vblanks 111..119, elapsed since COMPLETE is < step (10), so r.done is provably false. */
+    const u32 step = life_step_vblanks(12);
+    assert(step == 10);
+    for (u32 vb = 111; vb < 120; vb++) {
+        vblank_tick();
+        poll_once();
+        consume();
+        assert(!atomic_load(&r.done));
+    }
+
+    /* At v0 + 120, elapsed since COMPLETE is 10 >= step. Next poll triggers return. */
+    vblank_tick();
+    poll_once();
+    for (unsigned i = 0; !atomic_load(&r.done); i++) {
+        assert(i < 50000000u);
+        sched_yield();
+    }
+    reg_join(&r);
+    assert(r.rc == CELL_OK);
+
+    const u32 waited_vblanks = cellGcmGetVBlankCount() - start_vb;
+    assert(waited_vblanks == TROPHY_PACE_TOTAL_VBLANKS);
+
+    /* Assert full delivered sequence: status values, order, no gaps/dups, due vblanks */
+    assert_exact_rate_sequence(2, start_vb, &r.th);
+
+    end();
+    store_remove("NPWR00015");
+}
+
 
 int main(int argc, char** argv)
 {
@@ -757,7 +913,8 @@ int main(int argc, char** argv)
         {"short", case_short}, {"interleave", case_interleave}, {"drain", case_drain},
         {"samethread", case_samethread}, {"destroy", case_destroy},
         {"threads", case_threads}, {"novblank", case_novblank}, {"guards", case_guards},
-        {"aborthandle", case_aborthandle},
+        {"aborthandle", case_aborthandle}, {"rate_128", case_rate_128},
+        {"rate_small", case_rate_small},
     };
     strcpy(g_root, "/tmp/ps3recomp-trophy-XXXXXX");
     assert(mkdtemp(g_root));
