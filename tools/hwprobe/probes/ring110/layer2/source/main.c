@@ -301,6 +301,7 @@ static void apply_preset(r110_cfg_t *cfg)
 	static const int j4[] = { -1, 0, 1, 2 };
 	static const int j2[] = { -1, 0 };
 	static const int j0[] = { 0 };
+	static const int j3[] = { 3 };
 	static const int j01[] = { 0, 1 };
 	const char *p = cfg->preset;
 	if (!strcmp(p, "main"))
@@ -311,8 +312,8 @@ static void apply_preset(r110_cfg_t *cfg)
 		set_grid(cfg, 8, 8, j2, 2, 0.0, 6.0, 0.5, 10, 50);
 	else if (!strcmp(p, "fine"))
 		set_grid(cfg, 8, 2, j01, 2, 0.0, 0.0, 0.1, 10, 50); /* user sets omin_ms / omax_ms */
-	else if (!strcmp(p, "c1")) /* o = 3P = 16 ms, j = 0, always a hit */
-		set_grid(cfg, 8, 2, j0, 1, 16.0, 16.0, 1.0, 30, 10);
+	else if (!strcmp(p, "c1")) /* o = 2P = 10.67 ms, j = 3: block r+3 latches at x + 3P >= 16 ms, so always a hit */
+		set_grid(cfg, 8, 2, j3, 1, 10.6667, 10.6667, 1.0, 30, 10);
 	else if (!strcmp(p, "c3")) /* late write o = 20 ms, j = 0 */
 		set_grid(cfg, 8, 2, j0, 1, 20.0, 20.0, 1.0, 20, 10);
 	else if (!strcmp(p, "c2")) {
