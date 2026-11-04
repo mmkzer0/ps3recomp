@@ -3,7 +3,10 @@
 
 Each fixture runs three times: with spu.mfc_lookup_cache at its default (unset),
 and explicitly off and on through PS3RECOMP_SPU_MFC_LOOKUP_CACHE. The option is
-read once per process, so a mode is a process.
+read once per process, so a mode is a process. The fixture is told the behaviour
+to expect, not the option: unset must behave as on (the default is on, #88), so a
+default that changes back fails the unset run on the observable lock count and
+on the holder's cached engine, not on a copy of the default's value.
 """
 import os,subprocess,sys,tempfile
 from pathlib import Path
@@ -21,12 +24,12 @@ with tempfile.TemporaryDirectory(prefix='spu-mfc-cache-') as tmp:
  for name in fixtures:
   exe=Path(tmp)/name
   spu_fixture_link.build([spu/'tests'/(name+'.c'),*[spu/c for c in common],root/'runtime/platform/win32_compat.c'],exe,[*flags,'-I'+str(root/'include'),'-I'+str(spu),'-I'+str(root/'runtime/platform')],tmp)
-  for mode in (None,'0','1'):
+  for mode,expect in ((None,'on'),('0','off'),('1','on')):
    env={k:v for k,v in os.environ.items() if not k.startswith('PS3RECOMP_SPU_MFC_')}
    if mode is not None:env['PS3RECOMP_SPU_MFC_LOOKUP_CACHE']=mode
-   try:p=subprocess.run([str(exe)],env=env,capture_output=True,text=True,timeout=60)
+   try:p=subprocess.run([str(exe),expect],env=env,capture_output=True,text=True,timeout=60)
    except subprocess.TimeoutExpired as error:
     print('timeout',name,'mode',mode,'stdout',error.stdout,'stderr',error.stderr,flush=True)
     raise
-   print(name,'mode',mode,flush=True);print(p.stdout,flush=True)
+   print(name,'mode',mode,'expecting',expect,flush=True);print(p.stdout,flush=True)
    if p.returncode:print(p.stderr);raise SystemExit(p.returncode)

@@ -80,8 +80,9 @@ with tempfile.TemporaryDirectory(prefix='spu-context-registry-') as tmp:
                 print(name + '/' + mode + ': PASS (visible allocation failure)')
             continue
         # spu.mfc_lookup_cache is read once per process, so each mode is a run.
-        # The MFC fixtures run with it off (the reference path) and on.
-        modes = ('0', '1') if 'mfc' in name else (None,)
+        # The MFC fixtures run with it unset (the default, on), off (the
+        # reference path) and on.
+        modes = (None, '0', '1') if 'mfc' in name else (None,)
         for mode in modes:
             env = {k: v for k, v in os.environ.items() if not k.startswith('PS3RECOMP_SPU_MFC_')}
             label = tag if mode is None else f'{tag}[spu.mfc_lookup_cache={mode}]'

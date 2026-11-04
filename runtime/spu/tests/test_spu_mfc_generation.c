@@ -27,6 +27,8 @@
 #include "test_spu_mfc_slots.c"
 #undef main
 
+static int s_expect_cache;   /* the harness's "on"/"off" argument */
+
 typedef struct { pthread_mutex_t m; pthread_cond_t c; int open; } gate;
 static void gate_init(gate* g)
 {
@@ -111,7 +113,7 @@ static void* holder_thread(void* opaque)
     r->before = mfc_for(OWNER);
     /* With the cache on, the thread must really be holding OWNER here, or
      * the case would pass without testing anything. */
-    r->hit_precondition = !ps3_cfg_spu_mfc_lookup_cache() ||
+    r->hit_precondition = !s_expect_cache ||
                           (s_mfc_recent.ctx == OWNER && s_mfc_recent.engine == r->before);
     gate_open(&r->populated);
     gate_wait(&r->mutated);
@@ -162,14 +164,22 @@ static void run_scenario(const scenario* sc, uint64_t start)
     CHECK(s_mfc_slots == NULL);
 }
 
-int main(void)
+int main(int argc, char** argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
+    /* The expected mode comes from the harness, not from the configuration: with
+     * the option unset the holder must really hold the engine (the shipped
+     * default is on), which reading the option back would not check. */
+    if (argc != 2 || (strcmp(argv[1], "on") && strcmp(argv[1], "off"))) {
+        fprintf(stderr, "usage: %s on|off\n", argv[0]);
+        return 2;
+    }
+    s_expect_cache = !strcmp(argv[1], "on");
     static const uint64_t starts[] = { 1, UINT64_MAX - 1, UINT64_MAX };
     for (unsigned s = 0; s < sizeof(starts) / sizeof(starts[0]); ++s)
         for (unsigned i = 0; i < sizeof(scenarios) / sizeof(scenarios[0]); ++i)
             run_scenario(&scenarios[i], starts[s]);
     printf("SPU MFC cache generation (cache %d): %d passed, %d failed\n",
-           ps3_cfg_spu_mfc_lookup_cache(), g_pass, g_fail);
+           s_expect_cache, g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

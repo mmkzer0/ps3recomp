@@ -422,7 +422,8 @@ static DWORD WINAPI spu_pcsample_thread(LPVOID p)
 }
 
 /* Memoization of the last virtual owner used by this host thread, enabled by
- * spu.mfc_lookup_cache (default off).
+ * spu.mfc_lookup_cache (default on; off is the locked reference path, kept for
+ * comparison and as the way back if a title ever needs it).
  * Engines remain registry-owned, not host-thread or physical-SPU-owned. A hit
  * borrows exactly the same pointer as the locked path; both require the owner
  * to stop before release/range cleanup. No context layout or memory is touched.

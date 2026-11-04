@@ -70,14 +70,20 @@ static void cache_join(struct cache_request* request)
     CHECK(pthread_create(&thread, NULL, cache_worker, request) == 0);
     CHECK(pthread_join(thread, NULL) == 0);
 }
-int main(void)
+int main(int argc, char** argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
+    /* The harness names the behaviour it expects ("on" or "off") instead of the
+     * fixture asking the configuration: a run with the option unset must show
+     * the lock-counting behaviour of the shipped default, which a read of the
+     * option back could not tell from a default that had changed. */
+    if (argc != 2 || (strcmp(argv[1], "on") && strcmp(argv[1], "off"))) {
+        fprintf(stderr, "usage: %s on|off\n", argv[0]);
+        return 2;
+    }
+    int enabled = !strcmp(argv[1], "on");
     if (cache_existing_main()) return 1;
     cache_fixture_lock = &s_mfc_claim_lock;
-    /* The mode under test is spu.mfc_lookup_cache, chosen by the harness through
-     * PS3RECOMP_SPU_MFC_LOOKUP_CACHE before the process starts. */
-    int enabled = ps3_cfg_spu_mfc_lookup_cache();
     spu_context* ctx = calloc(1, sizeof(*ctx)); CHECK(ctx != NULL);
     mfc_engine* original = mfc_for(ctx); original->tag_completed = 0x12345678;
     atomic_store(&cache_fixture_reads, 0);
