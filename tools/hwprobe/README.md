@@ -19,6 +19,7 @@ being read. See `probes/ring110/RUN.md`.
 | `ps3ftp.py` | copy SELFs and configs to the console, fetch and delete result files |
 | `hwprobe_format.py` | reader of the result header (used by every probe's analysis) |
 | `probes/<probe>/` | one probe: sources, `cfg/`, `RUN.md`, format notes, analysis scripts |
+| `probes/lv2conf/` | lv2conf: one set of syscall conformance cases (`cases/`), run on a console by `layer1` (a hwprobe SELF) and on the host against the toolkit's HLE; both write the rows of `FORMAT.md`, so a console run is the golden reference for the toolkit (`RUN.md`) |
 
 Tests (standalone, no toolchain or console): `python3 tools/test_hwprobe_ring110_analyze.py`,
 `python3 tools/test_hwprobe_layer2.py`, `python3 tools/test_hwprobe_pn.py`, `python3 tools/test_hwprobe_ps3ftp.py`.
