@@ -390,8 +390,11 @@ static void life_segments(u32 trophies, u32 seg[TROPHY_STATUS_SEGMENTS])
     seg[3] = 0;                        /* COMPLETE */
 }
 
+/* Step in vblanks for the #37 return condition after COMPLETE is delivered.
+ * For <= 120 events this is ceil(120 / events); for > 120 events it clamps to 1. */
 static u32 life_step_vblanks(u32 events)
 {
+    if (!events) return 1;
     const u32 p = (TROPHY_PACE_TOTAL_VBLANKS + events - 1) / events;
     return p ? p : 1;
 }
@@ -530,12 +533,23 @@ static s32 trophy_handle_abort_rc(SceNpTrophyHandle handle)
     return aborted ? (s32)SCE_NP_TROPHY_ERROR_ABORT : CELL_OK;
 }
 
-/* Lock held. Queue what is due at vblank `vb` and fits in the queue. */
+/* Pacing: 120 vblanks (~2.0 s at 59.94 Hz) minimum total register time.
+ * Evidence:
+ *  - RPCS3 oracle: sceNpTrophy.cpp:766-832 @ d00d8023 (until_min = 2'000'000 / total_events).
+ *  - Static firmware: libsysutil_np_trophy.sprx RegisterContext 0x02001614 sends IPC tag
+ *    'i' (0x020018F8 -> vsh 0x001902A4) and blocks in PacketRead; VSH posts status events
+ *    over sysutil slot 299 (dispatch_status 0x020005E4 -> 0x0200049C). PRX has no timing.
+ * Paced by rate so all events are posted within TROPHY_PACE_TOTAL_VBLANKS (120):
+ *  event k (1-based) is due when elapsed * events >= (k - 1) * 120, i.e.:
+ *  due = 1 + elapsed * events / 120, clamped at events.
+ * Event 1 is due immediately at elapsed=0. Event k=events (COMPLETE) is due when
+ *  elapsed >= ceil((events - 1) * 120 / events) <= 120 vblanks. */
 static void life_post_locked(TrophyContext* c, u32 vb)
 {
     const u32 events = life_event_count(c->total_trophies);
-    const u32 step = life_step_vblanks(events);
-    u64 due = 1u + (u64)(u32)(vb - c->life_v0) / step;
+    if (!events) return;
+    const u32 elapsed = vb - c->life_v0;
+    u64 due = 1u + (u64)elapsed * (u64)events / TROPHY_PACE_TOTAL_VBLANKS;
     if (due > events) due = events;
     const u32 room = TROPHY_EVENT_QUEUE_CAP - (c->life_posted - c->life_delivered);
     u32 n = due > c->life_posted ? (u32)(due - c->life_posted) : 0;
@@ -593,6 +607,8 @@ static void trophy_poll(void)
         }
         life_wake();
     }
+    /* Wake waiters (trophy_run_lifecycle) whose s_life_polls > complete_poll condition is now met. */
+    life_wake();
     life_unlock();
 }
 

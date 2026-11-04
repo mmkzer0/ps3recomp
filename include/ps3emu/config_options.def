@@ -127,12 +127,13 @@ PS3_CFG_U32(trophy, register_wait_cap_vblanks, 1024, 1, 16777216,
     "The most vblanks sceNpTrophyRegisterContext waits for its status events to "
     "be consumed by cellSysutilCheckCallback before it returns success anyway, "
     "counting and logging the cap (register-wait-cap). The firmware blocks until "
-    "the VSH has finished installing; the HLE's wait is paced in vblanks, not "
-    "wall-clock time, like RPCS3's, whose worst case this default is: for the "
-    "256 events of a 128-trophy title, each step 1 vblank (2 s over the events at "
-    "59.94 Hz) plus 3 (RPCS3's 50 ms grace per event). A title that registers on "
-    "the thread that does the polling hits the cap, and the events are then "
-    "delivered by its later polls.")
+    "the VSH has finished installing; the HLE paces status delivery over 120 vblanks "
+    "(2.0 s at 59.94 Hz). The HLE's own worst case with per-vblank polling is "
+    "about 121 vblanks (120 vblanks of pacing plus the 1-vblank #37 return step), "
+    "longer only if the title polls rarely. The default of 1024 vblanks leaves "
+    "ample margin for slow pollers (RPCS3's oracle tolerates up to 50 ms grace per "
+    "event). A title that registers on the thread that does the polling hits the cap, "
+    "and the events are then delivered by its later polls.")
 
 /* ---- video -------------------------------------------------------------- */
 
