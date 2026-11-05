@@ -27,327 +27,406 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel);
 uint32_t g_spu_pending_evt[3];
 int      g_spu_pending_evt_valid;
 
-/* ---- decode: 32-bit insn -> fields (one lookup in spu_decode_tab) ---- */
+/* ---- decode: one table load, one dispatch ----
+ * Every opcode field is a prefix of bits 31..21, so the op is spu_decode_tab[
+ * insn >> 21] and the run loop switches on it once: each handler (OP below)
+ * reads the register fields it uses straight from the instruction word and
+ * binds the immediate or target its op's form defines. The form is the one the
+ * generator derived for that op (SPU_FORM_<op>), so a handler cannot read an
+ * operand of another form: I and TGT only exist where the form has them.
+ *
+ * spu_decode1 is the same binding with every field returned as data, for the
+ * code that wants them that way (test_spu_decode, the RPCS3 differential
+ * test). It visits the ops through SPU_OP_FORMS, so it returns what the handler
+ * of that op reads. The run loop does not call it. */
+/* spu_decode1 and spu_step below are reference entry points that tests include
+ * this file to reach; the run loop uses neither. */
+#if defined(__GNUC__) || defined(__clang__)
+#  define SPU_INTERP_REFERENCE static inline __attribute__((unused))
+#else
+#  define SPU_INTERP_REFERENCE static inline
+#endif
+
 typedef struct {
     spu_op   op;
     uint8_t  rt, ra, rb, rc, ch;
-    int32_t  imm;     /* sign/zero-extended immediate or shift, per format */
+    int32_t  imm;     /* sign/zero-extended immediate or shift, per form */
     uint32_t tgt;     /* absolute LS branch target (br-family) */
 } spu_ins;
 
-static int32_t sx(uint32_t v, int bits) {
-    uint32_t m = 1u << (bits - 1);
-    return (int32_t)((v ^ m) - m);
-}
-
-/* Every opcode field is a prefix of bits 31..21, so the op and the immediate
- * form come from one table load; the cascade precedence is baked into the
- * table by tools/gen_spu_interp.py. Only the fields the form needs are
- * computed. */
-static void spu_decode1(uint32_t insn, uint32_t pc, spu_ins* d) {
-    const spu_decode_ent e = spu_decode_tab[insn >> 21];
-    d->op = (spu_op)e.op;
+SPU_INTERP_REFERENCE void spu_decode1(uint32_t insn, uint32_t pc, spu_ins* d) {
+    d->op = (spu_op)spu_decode_tab[insn >> 21];
     d->rt = insn & 0x7F; d->ra = (insn >> 7) & 0x7F;
     d->rb = (insn >> 14) & 0x7F; d->rc = (insn >> 21) & 0x7F;
     d->ch = (insn >> 7) & 0x7F; d->imm = 0; d->tgt = 0;
 
-    switch ((spu_decode_form)e.form) {
-    case SPU_F_NONE: break;
-    case SPU_F_I18:   d->imm = (int32_t)((insn >> 7) & 0x3FFFF); break;
-    case SPU_F_I18LO: d->imm = (int32_t)((insn >> 7) & 0xFFFF); break;
-    case SPU_F_LQA:
-        d->tgt = ((((insn >> 7) & 0xFFFF) << 2)) & 0x3FFF0; break;
-    case SPU_F_LQR:
-        d->tgt = ((uint32_t)(sx((insn >> 7) & 0xFFFF, 16) * 4) + pc) & 0x3FFF0; break;
-    case SPU_F_BREL:
-        d->tgt = ((uint32_t)(sx((insn >> 7) & 0xFFFF, 16) * 4) + pc) & 0x3FFFF; break;
-    case SPU_F_BABS:
-        d->tgt = ((uint32_t)(sx((insn >> 7) & 0xFFFF, 16) * 4)) & 0x3FFFF; break;
-    case SPU_F_I16S:  d->imm = sx((insn >> 7) & 0xFFFF, 16); break;
-    case SPU_F_I16U:  d->imm = (int32_t)((insn >> 7) & 0xFFFF); break;
-    case SPU_F_I10:   d->imm = sx((insn >> 14) & 0x3FF, 10); break;
-    case SPU_F_I10Q:  d->imm = (int32_t)((uint32_t)sx((insn >> 14) & 0x3FF, 10) << 4); break;
-    case SPU_F_I8:    d->imm = (insn >> 14) & 0xFF; break;
-    case SPU_F_STOP:  d->imm = insn & 0x3FFF; break;
-    case SPU_F_I7S:   d->imm = sx(d->rb, 7); break;
-    case SPU_F_I7U:   d->imm = d->rb; break;
+    switch (d->op) {
+#define SPU_DECODE_CASE(name, form) \
+    case SPU_##name: { SPU_BIND_##form(insn, pc) SPU_SAVE_##form(d) break; }
+    SPU_OP_FORMS(SPU_DECODE_CASE)
+#undef SPU_DECODE_CASE
+    default: break;
     }
 }
 
 /* spu_lifted_lookup() is defined by spu_fn_registry.c (the single owner of the
  * lifted-function table + eviction). Declared in spu_interp.h. */
 
-/* ---- execute one instruction; returns 1 if the SPU stopped ---- */
-#define A   (ctx->gpr[d.ra])
-#define B   (ctx->gpr[d.rb])
-#define T   (ctx->gpr[d.rt])          /* also the 3rd source in RRR */
-#define DST (ctx->gpr[d.rt])          /* default destination */
-#define DSTC (ctx->gpr[d.rc])         /* RRR destination */
-#define I   (d.imm)
-#define PREF(r) ((r)._u32[0])
+/* Defined below: the call-trace ring that the br*sl handlers feed and the
+ * halt handlers dump. */
+void spu_trace_call(uint32_t from, uint32_t to);
+void spu_trace_dump(uint32_t at);
 
-/* The instruction word at ctx->pc. spu_step and the SPU_INTERP_OPSTATS counter
- * both read it through here, so the histogram counts the op the step runs.
- * One 32-bit load and a swap: four byte loads and shifts were four loads and
- * three ORs per executed instruction. memcpy keeps an unaligned pc (the 0xA70
- * return masks r0 with SPU_LS_MASK only) reading the same four bytes as before. */
-static inline uint32_t spu_fetch(const spu_context* ctx) {
-    uint32_t m = ctx->pc & SPU_LS_MASK, w;
+/* The instruction word at `pc`. spu_exec's caller and the SPU_INTERP_OPSTATS
+ * counter both read it through here, so the histogram counts the op the step
+ * runs. One 32-bit load and a swap: four byte loads and shifts were four loads
+ * and three ORs per executed instruction. memcpy keeps an unaligned pc (the
+ * 0xA70 return masks r0 with SPU_LS_MASK only) reading the same four bytes as
+ * before. */
+static inline uint32_t spu_fetch(const spu_context* ctx, uint32_t pc) {
+    uint32_t m = pc & SPU_LS_MASK, w;
     memcpy(&w, ctx->ls + m, sizeof w);
     return SPU_BSWAP32(w);
 }
 
-static int spu_step(spu_context* ctx) {
-    uint32_t pc = ctx->pc;
-    uint32_t insn = spu_fetch(ctx);
-    spu_ins d; spu_decode1(insn, pc, &d);
+/* ---- execute one instruction ---- */
+#define RT_ ((insn) & 0x7Fu)
+#define RA_ (((insn) >> 7) & 0x7Fu)
+#define RB_ (((insn) >> 14) & 0x7Fu)
+#define RC_ (((insn) >> 21) & 0x7Fu)
+#define CH_ RA_                       /* channel number shares ra's field */
+#define A   (ctx->gpr[RA_])
+#define B   (ctx->gpr[RB_])
+#define T   (ctx->gpr[RT_])           /* also the 3rd source in RRR */
+#define DST (ctx->gpr[RT_])           /* default destination */
+#define DSTC (ctx->gpr[RC_])          /* RRR destination */
+#define PREF(r) ((r)._u32[0])
+
+/* One case of spu_exec's switch, with the operand of the op's own form bound
+ * (SPU_FORM_<op> is the generator's form for the op). */
+#define SPU_BIND_FORM(form, insn, pc) SPU_BIND_FORM_(form, insn, pc)
+#define SPU_BIND_FORM_(form, insn, pc) SPU_BIND_##form(insn, pc)
+#define OP(name, ...) \
+    case SPU_##name: { SPU_BIND_FORM(SPU_FORM_##name, insn, pc) __VA_ARGS__ break; }
+
+#if defined(_MSC_VER)
+#  define SPU_EXEC_INLINE static __forceinline
+#else
+#  define SPU_EXEC_INLINE static inline __attribute__((always_inline))
+#endif
+
+/* The fast step is the common case; without the hint the compiler weighs the
+ * general prelude like it and spills `steps` to the stack around the dispatch. */
+#if defined(__GNUC__) || defined(__clang__)
+#  define SPU_LIKELY(x) __builtin_expect(!!(x), 1)
+#else
+#  define SPU_LIKELY(x) (x)
+#endif
+
+/* Every taken indirect branch (bi, bisl, bisled, iret and the conditional
+ * bi* forms) carries the interrupt enable/disable bits (E = 0x40000 sets
+ * int_enable, D = 0x80000 clears it), exactly as the lifter decodes them. */
+#define SPU_IED_BITS() do { \
+    if (insn & 0x40000u) ctx->int_enable = 1; \
+    else if (insn & 0x80000u) ctx->int_enable = 0; \
+} while (0)
+
+/* A taken transfer publishes its target in ctx->pc at once. Two diagnostics
+ * sample a running context's pc from another thread to say where an SPU that
+ * never answers is: the raw-SPU report while the PPU spins on Mbox_Stat
+ * (spu_raw.c) and the SPU_PCSAMPLE thread (spu_channels.c). Every loop is a
+ * cycle of taken transfers, so the value stays within one iteration of the
+ * truth, as it did when every step stored it; straight-line code in between
+ * stays unpublished. */
+#define SPU_JUMP(t) do { next = (t); ctx->pc = next; } while (0)
+
+/* Conditional halt (an assertion): stop the SPU when the condition holds. */
+#define SPU_HALT_IF(cond) do { if (cond) { \
+    spu_trace_dump(pc); \
+    ctx->pc = pc; ctx->stop_code = 0x1000; ctx->status = SPU_STATUS_STOPPED_BY_HALT; \
+    return 1; } } while (0)
+
+/* Execute the instruction `insn` found at `pc`; returns 1 if the SPU stopped.
+ * On return 0 *out_next is the pc to continue at.
+ *
+ * ctx->pc is NOT the current pc here: the run loop keeps it in a local, and a
+ * step that does not leave this function does not store it. A handler stores
+ * ctx->pc itself before anything that can observe it:
+ *   - the channel ops store pc (spu_rdch/spu_wrch/spu_rchcnt read it, a
+ *     blocking one longjmps out of the run through spu_halt, and an MFC command
+ *     can run a nested interpreter that overwrites it);
+ *   - the local-store accesses store pc (the SPU_LS_WATCH / LOWREAD / SMC
+ *     diagnostics print it);
+ *   - the taken branches store their target (SPU_JUMP);
+ *   - stop, stopd, the halts and the unimplemented-op trap, which leave the
+ *     stopping pc (stop: the next one) there for the caller.
+ * Every other handler is straight-line register work, a helper of values, or
+ * a call that takes its arguments by value (spu_trace_call, spu_trace_dump).
+ * After a channel op *general is raised if the context now has an image
+ * (image_id >= 0): an MFC command can switch it (spu_dma.h), and no other
+ * handler can, so this is the only place the run loop has to look. */
+SPU_EXEC_INLINE int spu_exec(spu_context* ctx, uint32_t pc, uint32_t insn,
+                             uint32_t* out_next, int* general) {
     uint32_t next = (pc + 4) & 0x3FFFC;
 
-    switch (d.op) {
+    switch (spu_decode_tab[insn >> 21]) {
     /* immediates / loads */
-    case SPU_il:  DST = spu_il(I); break;
-    case SPU_ilh: DST = spu_ilh((uint16_t)I); break;
-    case SPU_ilhu: DST = spu_splat_u32((uint32_t)I << 16); break;
-    case SPU_ila:  DST = spu_splat_u32((uint32_t)I & 0x3FFFF); break;
-    case SPU_iohl: DST = spu_ori(DST, (int32_t)((uint32_t)I & 0xFFFF)); break;
-    case SPU_fsmbi: DST = spu_fsmbi(I); break;
-    case SPU_lqd: case SPU_lqx: case SPU_lqa: case SPU_lqr: {
-        uint32_t a = (d.op==SPU_lqd) ? PREF(A)+ (uint32_t)I
-                   : (d.op==SPU_lqx) ? PREF(A)+PREF(B) : d.tgt;
-        DST = spu_ls_read128(ctx, a); break; }
-    case SPU_stqd: case SPU_stqx: case SPU_stqa: case SPU_stqr: {
-        uint32_t a = (d.op==SPU_stqd) ? PREF(A)+ (uint32_t)I
-                   : (d.op==SPU_stqx) ? PREF(A)+PREF(B) : d.tgt;
-        spu_ls_write128(ctx, a, DST); break; }
+    OP(il, DST = spu_il(I);)
+    OP(ilh, DST = spu_ilh((uint16_t)I);)
+    OP(ilhu, DST = spu_splat_u32((uint32_t)I << 16);)
+    OP(ila, DST = spu_splat_u32((uint32_t)I & 0x3FFFF);)
+    OP(iohl, DST = spu_ori(DST, (int32_t)((uint32_t)I & 0xFFFF));)
+    OP(fsmbi, DST = spu_fsmbi(I);)
+    OP(lqd, ctx->pc = pc; DST = spu_ls_read128(ctx, PREF(A) + (uint32_t)I);)
+    OP(lqx, ctx->pc = pc; DST = spu_ls_read128(ctx, PREF(A) + PREF(B));)
+    OP(lqa, ctx->pc = pc; DST = spu_ls_read128(ctx, TGT);)
+    OP(lqr, ctx->pc = pc; DST = spu_ls_read128(ctx, TGT);)
+    OP(stqd, ctx->pc = pc; spu_ls_write128(ctx, PREF(A) + (uint32_t)I, DST);)
+    OP(stqx, ctx->pc = pc; spu_ls_write128(ctx, PREF(A) + PREF(B), DST);)
+    OP(stqa, ctx->pc = pc; spu_ls_write128(ctx, TGT, DST);)
+    OP(stqr, ctx->pc = pc; spu_ls_write128(ctx, TGT, DST);)
     /* integer arithmetic */
-    case SPU_a:  DST = spu_a(A,B); break;
-    case SPU_ai: DST = spu_ai(A,I); break;
-    case SPU_sf: DST = spu_sf(A,B); break;
-    case SPU_sfi:DST = spu_sfi(A,I); break;
-    case SPU_ah: DST = spu_ah(A,B); break;
-    case SPU_ahi:DST = spu_ahi(A,I); break;
-    case SPU_sfh:DST = spu_sfh(A,B); break;
-    case SPU_sfhi:DST = spu_sfhi(A,I); break;
-    case SPU_addx: DST = spu_addx(A,B,DST); break;
-    case SPU_sfx:  DST = spu_sfx(A,B,DST); break;
-    case SPU_cg:   DST = spu_cg(A,B); break;
-    case SPU_cgx:  DST = spu_cgx(A,B,DST); break;
-    case SPU_mpyi: DST = spu_mpyi(A,I); break;
-    case SPU_mpyui: DST = spu_mpyui(A,I); break;
+    OP(a, DST = spu_a(A,B);)
+    OP(ai, DST = spu_ai(A,I);)
+    OP(sf, DST = spu_sf(A,B);)
+    OP(sfi, DST = spu_sfi(A,I);)
+    OP(ah, DST = spu_ah(A,B);)
+    OP(ahi, DST = spu_ahi(A,I);)
+    OP(sfh, DST = spu_sfh(A,B);)
+    OP(sfhi, DST = spu_sfhi(A,I);)
+    OP(addx, DST = spu_addx(A,B,DST);)
+    OP(sfx, DST = spu_sfx(A,B,DST);)
+    OP(cg, DST = spu_cg(A,B);)
+    OP(cgx, DST = spu_cgx(A,B,DST);)
+    OP(mpyi, DST = spu_mpyi(A,I);)
+    OP(mpyui, DST = spu_mpyui(A,I);)
     /* logical */
-    case SPU_and: DST = spu_and(A,B); break;
-    case SPU_or:  DST = spu_or(A,B); break;
-    case SPU_xor: DST = spu_xor(A,B); break;
-    case SPU_nand:DST = spu_nand(A,B); break;
-    case SPU_nor: DST = spu_nor(A,B); break;
-    case SPU_andc:DST = spu_andc(A,B); break;
-    case SPU_orc: DST = spu_orc(A,B); break;
-    case SPU_eqv: DST = spu_eqv(A,B); break;
-    case SPU_andi:DST = spu_andi(A,I); break;
-    case SPU_ori: DST = spu_ori(A,I); break;
-    case SPU_xori:DST = spu_xori(A,I); break;
-    case SPU_andbi:DST = spu_andbi(A,I); break;
-    case SPU_andhi:DST = spu_andhi(A,I); break;
-    case SPU_orhi: DST = spu_orhi(A,I); break;
-    case SPU_orbi: DST = spu_orbi(A,I); break;
-    case SPU_xorhi:DST = spu_xorhi(A,I); break;
-    case SPU_xorbi:DST = spu_xorbi(A,I); break;
-    case SPU_orx:  DST = spu_orx(A); break;
+    OP(and, DST = spu_and(A,B);)
+    OP(or, DST = spu_or(A,B);)
+    OP(xor, DST = spu_xor(A,B);)
+    OP(nand, DST = spu_nand(A,B);)
+    OP(nor, DST = spu_nor(A,B);)
+    OP(andc, DST = spu_andc(A,B);)
+    OP(orc, DST = spu_orc(A,B);)
+    OP(eqv, DST = spu_eqv(A,B);)
+    OP(andi, DST = spu_andi(A,I);)
+    OP(ori, DST = spu_ori(A,I);)
+    OP(xori, DST = spu_xori(A,I);)
+    OP(andbi, DST = spu_andbi(A,I);)
+    OP(andhi, DST = spu_andhi(A,I);)
+    OP(orhi, DST = spu_orhi(A,I);)
+    OP(orbi, DST = spu_orbi(A,I);)
+    OP(xorhi, DST = spu_xorhi(A,I);)
+    OP(xorbi, DST = spu_xorbi(A,I);)
+    OP(orx, DST = spu_orx(A);)
     /* compares */
-    case SPU_ceq: DST = spu_ceq(A,B); break;
-    case SPU_ceqh:DST = spu_ceqh(A,B); break;
-    case SPU_ceqb:DST = spu_ceqb(A,B); break;
-    case SPU_ceqi:DST = spu_ceqi(A,I); break;
-    case SPU_cgt: DST = spu_cgt(A,B); break;
-    case SPU_cgth:DST = spu_cgth(A,B); break;
-    case SPU_cgtb:DST = spu_cgtb(A,B); break;
-    case SPU_cgti:DST = spu_cgti(A,I); break;
-    case SPU_clgt: DST = spu_clgt(A,B); break;
-    case SPU_clgth:DST = spu_clgth(A,B); break;
-    case SPU_clgtb:DST = spu_clgtb(A,B); break;
-    case SPU_clgti:DST = spu_clgti(A,I); break;
+    OP(ceq, DST = spu_ceq(A,B);)
+    OP(ceqh, DST = spu_ceqh(A,B);)
+    OP(ceqb, DST = spu_ceqb(A,B);)
+    OP(ceqi, DST = spu_ceqi(A,I);)
+    OP(cgt, DST = spu_cgt(A,B);)
+    OP(cgth, DST = spu_cgth(A,B);)
+    OP(cgtb, DST = spu_cgtb(A,B);)
+    OP(cgti, DST = spu_cgti(A,I);)
+    OP(clgt, DST = spu_clgt(A,B);)
+    OP(clgth, DST = spu_clgth(A,B);)
+    OP(clgtb, DST = spu_clgtb(A,B);)
+    OP(clgti, DST = spu_clgti(A,I);)
     /* shifts / rotates */
-    case SPU_shl:  DST = spu_shl(A,B); break;
-    case SPU_shli: DST = spu_shli(A,I); break;
-    case SPU_shlh: DST = spu_shlh(A,B); break;
-    case SPU_shlhi:DST = spu_shlhi(A,I); break;
-    case SPU_rot:  DST = spu_rot(A,B); break;
-    case SPU_roti: DST = spu_roti(A,I); break;
-    case SPU_rotm: DST = spu_rotm(A,B); break;
-    case SPU_rotmi:DST = spu_rotmi(A,I); break;
-    case SPU_rotma:DST = spu_rotma(A,B); break;
-    case SPU_rotmai:DST = spu_rotmai(A,I); break;
-    case SPU_roth: DST = spu_roth(A,B); break;
-    case SPU_rothi:DST = spu_rothi(A,I); break;
-    case SPU_shlqbi: DST = spu_shlqbi(A,B); break;
-    case SPU_shlqbii:DST = spu_shlqbii(A,I); break;
-    case SPU_shlqby: DST = spu_shlqby(A,B); break;
-    case SPU_shlqbyi:DST = spu_shlqbyi(A,I); break;
-    case SPU_rotqbi: DST = spu_rotqbi(A,B); break;
-    case SPU_rotqbii:DST = spu_rotqbii(A,I); break;
-    case SPU_rotqby: DST = spu_rotqby(A,B); break;
-    case SPU_rotqbyi:DST = spu_rotqbyi(A,I); break;
-    case SPU_rotqmby: DST = spu_rotqmby(A,B); break;
-    case SPU_rotqmbyi:DST = spu_rotqmbyi(A,I); break;
+    OP(shl, DST = spu_shl(A,B);)
+    OP(shli, DST = spu_shli(A,I);)
+    OP(shlh, DST = spu_shlh(A,B);)
+    OP(shlhi, DST = spu_shlhi(A,I);)
+    OP(rot, DST = spu_rot(A,B);)
+    OP(roti, DST = spu_roti(A,I);)
+    OP(rotm, DST = spu_rotm(A,B);)
+    OP(rotmi, DST = spu_rotmi(A,I);)
+    OP(rotma, DST = spu_rotma(A,B);)
+    OP(rotmai, DST = spu_rotmai(A,I);)
+    OP(roth, DST = spu_roth(A,B);)
+    OP(rothi, DST = spu_rothi(A,I);)
+    OP(shlqbi, DST = spu_shlqbi(A,B);)
+    OP(shlqbii, DST = spu_shlqbii(A,I);)
+    OP(shlqby, DST = spu_shlqby(A,B);)
+    OP(shlqbyi, DST = spu_shlqbyi(A,I);)
+    OP(rotqbi, DST = spu_rotqbi(A,B);)
+    OP(rotqbii, DST = spu_rotqbii(A,I);)
+    OP(rotqby, DST = spu_rotqby(A,B);)
+    OP(rotqbyi, DST = spu_rotqbyi(A,I);)
+    OP(rotqmby, DST = spu_rotqmby(A,B);)
+    OP(rotqmbyi, DST = spu_rotqmbyi(A,I);)
     /* select / shuffle / masks / bitcount (RRR: dest=rc, srcs=ra,rb,rt) */
-    case SPU_selb:  DSTC = spu_selb(A,B,T); break;
-    case SPU_shufb: DSTC = spu_shufb(A,B,T); break;
-    case SPU_fsm:  DST = spu_fsm(A); break;
-    case SPU_fsmb: DST = spu_fsmb(A); break;
-    case SPU_fsmh: DST = spu_fsmh(A); break;
-    case SPU_gb:   DST = spu_gb(A); break;
-    case SPU_gbb:  DST = spu_gbb(A); break;
-    case SPU_gbh:  DST = spu_gbh(A); break;
-    case SPU_clz:  DST = spu_clz(A); break;
-    case SPU_cntb: DST = spu_cntb(A); break;
+    OP(selb, DSTC = spu_selb(A,B,T);)
+    OP(shufb, DSTC = spu_shufb(A,B,T);)
+    OP(fsm, DST = spu_fsm(A);)
+    OP(fsmb, DST = spu_fsmb(A);)
+    OP(fsmh, DST = spu_fsmh(A);)
+    OP(gb, DST = spu_gb(A);)
+    OP(gbb, DST = spu_gbb(A);)
+    OP(gbh, DST = spu_gbh(A);)
+    OP(clz, DST = spu_clz(A);)
+    OP(cntb, DST = spu_cntb(A);)
     /* gen-controls for insertion */
-    case SPU_cbd: DST = spu_cbd(A,I); break;
-    case SPU_chd: DST = spu_chd(A,I); break;
-    case SPU_cwd: DST = spu_cwd(A,I); break;
-    case SPU_cdd: DST = spu_cdd(A,I); break;
-    case SPU_cbx: DST = spu_cbx(A,B); break;
-    case SPU_chx: DST = spu_chx(A,B); break;
-    case SPU_cwx: DST = spu_cwx(A,B); break;
-    case SPU_cdx: DST = spu_cdx(A,B); break;
+    OP(cbd, DST = spu_cbd(A,I);)
+    OP(chd, DST = spu_chd(A,I);)
+    OP(cwd, DST = spu_cwd(A,I);)
+    OP(cdd, DST = spu_cdd(A,I);)
+    OP(cbx, DST = spu_cbx(A,B);)
+    OP(chx, DST = spu_chx(A,B);)
+    OP(cwx, DST = spu_cwx(A,B);)
+    OP(cdx, DST = spu_cdx(A,B);)
     /* multiply */
-    case SPU_mpy:  DST = spu_mpy(A,B); break;
-    case SPU_mpyu: DST = spu_mpyu(A,B); break;
-    case SPU_mpyh: DST = spu_mpyh(A,B); break;
-    case SPU_mpya: DSTC = spu_mpya(A,B,T); break;
+    OP(mpy, DST = spu_mpy(A,B);)
+    OP(mpyu, DST = spu_mpyu(A,B);)
+    OP(mpyh, DST = spu_mpyh(A,B);)
+    OP(mpya, DSTC = spu_mpya(A,B,T);)
     /* sign-extend */
-    case SPU_xsbh: DST = spu_xsbh(A); break;
-    case SPU_xshw: DST = spu_xshw(A); break;
-    case SPU_xswd: DST = spu_xswd(A); break;
+    OP(xsbh, DST = spu_xsbh(A);)
+    OP(xshw, DST = spu_xshw(A);)
+    OP(xswd, DST = spu_xswd(A);)
     /* float */
-    case SPU_fa: DST = spu_fa(A,B); break;
-    case SPU_fs: DST = spu_fs(A,B); break;
-    case SPU_fm: DST = spu_fm(A,B); break;
-    case SPU_fcgt: DST = spu_fcgt(A,B); break;
-    case SPU_fceq: DST = spu_fceq(A,B); break;
-    case SPU_cflts: DST = spu_cflts(A,I); break;
-    case SPU_cfltu: DST = spu_cfltu(A,I); break;
-    case SPU_csflt: DST = spu_csflt(A,I); break;
-    case SPU_cuflt: DST = spu_cuflt(A,I); break;
-    case SPU_frest:  DST = spu_frest(A); break;
-    case SPU_frsqest:DST = spu_frsqest(A); break;
-    case SPU_fi:     DST = spu_fi(A,B); break;
-    case SPU_fcmgt:  DST = spu_fcmgt(A,B); break;
-    case SPU_fcmeq:  DST = spu_fcmeq(A,B); break;
-    case SPU_fesd:   DST = spu_fesd(A); break;
-    case SPU_frds:   DST = spu_frds(A); break;
-    case SPU_fma:  DSTC = spu_fma(A,B,T); break;    /* RRR: dest=rc */
-    case SPU_fms:  DSTC = spu_fms(A,B,T); break;
-    case SPU_fnms: DSTC = spu_fnms(A,B,T); break;
+    OP(fa, DST = spu_fa(A,B);)
+    OP(fs, DST = spu_fs(A,B);)
+    OP(fm, DST = spu_fm(A,B);)
+    OP(fcgt, DST = spu_fcgt(A,B);)
+    OP(fceq, DST = spu_fceq(A,B);)
+    OP(cflts, DST = spu_cflts(A,I);)
+    OP(cfltu, DST = spu_cfltu(A,I);)
+    OP(csflt, DST = spu_csflt(A,I);)
+    OP(cuflt, DST = spu_cuflt(A,I);)
+    OP(frest, DST = spu_frest(A);)
+    OP(frsqest, DST = spu_frsqest(A);)
+    OP(fi, DST = spu_fi(A,B);)
+    OP(fcmgt, DST = spu_fcmgt(A,B);)
+    OP(fcmeq, DST = spu_fcmeq(A,B);)
+    OP(fesd, DST = spu_fesd(A);)
+    OP(frds, DST = spu_frds(A);)
+    OP(fma, DSTC = spu_fma(A,B,T);)    /* RRR: dest=rc */
+    OP(fms, DSTC = spu_fms(A,B,T);)
+    OP(fnms, DSTC = spu_fnms(A,B,T);)
     /* immediate byte/halfword compares */
-    case SPU_ceqbi: DST = spu_ceqbi(A,I); break;
-    case SPU_cgtbi: DST = spu_cgtbi(A,I); break;
-    case SPU_clgtbi:DST = spu_clgtbi(A,I); break;
-    case SPU_ceqhi: DST = spu_ceqhi(A,I); break;
-    case SPU_cgthi: DST = spu_cgthi(A,I); break;
-    case SPU_clgthi:DST = spu_clgthi(A,I); break;
+    OP(ceqbi, DST = spu_ceqbi(A,I);)
+    OP(cgtbi, DST = spu_cgtbi(A,I);)
+    OP(clgtbi, DST = spu_clgtbi(A,I);)
+    OP(ceqhi, DST = spu_ceqhi(A,I);)
+    OP(cgthi, DST = spu_cgthi(A,I);)
+    OP(clgthi, DST = spu_clgthi(A,I);)
     /* integer / byte extras */
-    case SPU_bg:    DST = spu_bg(A,B); break;
-    case SPU_bgx:   DST = spu_bgx(A,B,DST); break;   /* RR: rt is accumulator + dest */
-    case SPU_absdb: DST = spu_absdb(A,B); break;
-    case SPU_avgb:  DST = spu_avgb(A,B); break;
-    case SPU_sumb:  DST = spu_sumb(A,B); break;
-    case SPU_mpys:  DST = spu_mpys(A,B); break;
-    case SPU_mpyhh: DST = spu_mpyhh(A,B); break;
-    case SPU_mpyhhu:DST = spu_mpyhhu(A,B); break;
-    case SPU_mpyhha: DST = spu_mpyhha(A,B,DST); break;   /* RR (0x346): rt is accumulator + dest, NOT RRR */
-    case SPU_mpyhhau:DST = spu_mpyhhau(A,B,DST); break;
+    OP(bg, DST = spu_bg(A,B);)
+    OP(bgx, DST = spu_bgx(A,B,DST);)   /* RR: rt is accumulator + dest */
+    OP(absdb, DST = spu_absdb(A,B);)
+    OP(avgb, DST = spu_avgb(A,B);)
+    OP(sumb, DST = spu_sumb(A,B);)
+    OP(mpys, DST = spu_mpys(A,B);)
+    OP(mpyhh, DST = spu_mpyhh(A,B);)
+    OP(mpyhhu, DST = spu_mpyhhu(A,B);)
+    OP(mpyhha, DST = spu_mpyhha(A,B,DST);)   /* RR (0x346): rt is accumulator + dest, NOT RRR */
+    OP(mpyhhau, DST = spu_mpyhhau(A,B,DST);)
     /* rotate / shift extras */
-    case SPU_rothm:    DST = spu_rothm(A,B); break;
-    case SPU_rothmi:   DST = spu_rothmi(A,I); break;
-    case SPU_rotmah:   DST = spu_rothma(A,B); break;
-    case SPU_rotmahi:  DST = spu_rotmahi(A,I); break;
-    case SPU_rotqmbi:  DST = spu_rotqmbi(A,B); break;
-    case SPU_rotqmbii: DST = spu_rotqmbii(A,(int)I); break;
-    case SPU_rotqbybi: DST = spu_rotqbybi(A,B); break;
-    case SPU_rotqmbybi:DST = spu_rotqmbybi(A,B); break;
-    case SPU_shlqbybi: DST = spu_shlqbybi(A,B); break;
+    OP(rothm, DST = spu_rothm(A,B);)
+    OP(rothmi, DST = spu_rothmi(A,I);)
+    OP(rotmah, DST = spu_rothma(A,B);)
+    OP(rotmahi, DST = spu_rotmahi(A,I);)
+    OP(rotqmbi, DST = spu_rotqmbi(A,B);)
+    OP(rotqmbii, DST = spu_rotqmbii(A,(int)I);)
+    OP(rotqbybi, DST = spu_rotqbybi(A,B);)
+    OP(rotqmbybi, DST = spu_rotqmbybi(A,B);)
+    OP(shlqbybi, DST = spu_shlqbybi(A,B);)
     /* channels */
-    case SPU_wrch: spu_wrch(ctx, d.ch, DST); break;
-    case SPU_rdch: DST = spu_rdch(ctx, d.ch); break;
-    case SPU_rchcnt: DST = spu_pref_u32(spu_rchcnt(ctx, d.ch)); break;   /* count in the preferred word, rest zero (as the lifter) */
+    OP(wrch, ctx->pc = pc; spu_wrch(ctx, CH_, DST); *general |= ctx->image_id >= 0;)
+    OP(rdch, ctx->pc = pc; DST = spu_rdch(ctx, CH_); *general |= ctx->image_id >= 0;)
+    /* count in the preferred word, rest zero (as the lifter) */
+    OP(rchcnt, ctx->pc = pc; DST = spu_pref_u32(spu_rchcnt(ctx, CH_)); *general |= ctx->image_id >= 0;)
     /* hints / no-ops */
-    case SPU_nop: case SPU_lnop: case SPU_sync: case SPU_dsync:
-    case SPU_hbr: case SPU_hbra: case SPU_hbrr: case SPU_mtspr:
-    case SPU_fscrwr: break;
-    case SPU_mfspr: DST = spu_mfspr(A); break;      /* SPRs read as zero */
-    case SPU_fscrrd: DST = spu_fscrrd(A); break;    /* FPSCR reads as zero */
+    OP(nop,)
+    OP(lnop,)
+    OP(sync,)
+    OP(dsync,)
+    OP(hbr,)
+    OP(hbra,)
+    OP(hbrr,)
+    OP(mtspr,)
+    OP(fscrwr,)
+    OP(mfspr, DST = spu_mfspr(A);)      /* SPRs read as zero */
+    OP(fscrrd, DST = spu_fscrrd(A);)    /* FPSCR reads as zero */
     /* double precision */
-    case SPU_dfa:  DST = spu_dfa(A,B); break;
-    case SPU_dfs:  DST = spu_dfs(A,B); break;
-    case SPU_dfm:  DST = spu_dfm(A,B); break;
-    case SPU_dfma: DST = spu_dfma(A,B,DST); break;   /* RR: rt is accumulator + dest */
-    case SPU_dfms: DST = spu_dfms(A,B,DST); break;
-    case SPU_dfnms:DST = spu_dfnms(A,B,DST); break;
-    case SPU_dfnma:DST = spu_dfnma(A,B,DST); break;
-    case SPU_dfceq:  DST = spu_dfceq(A,B); break;
-    case SPU_dfcgt:  DST = spu_dfcgt(A,B); break;
-    case SPU_dfcmeq: DST = spu_dfcmeq(A,B); break;
-    case SPU_dfcmgt: DST = spu_dfcmgt(A,B); break;
-    case SPU_dftsv:  DST = spu_dftsv(A, (int32_t)(d.rb & 0x7F)); break;   /* I7 sits in the rb field */
+    OP(dfa, DST = spu_dfa(A,B);)
+    OP(dfs, DST = spu_dfs(A,B);)
+    OP(dfm, DST = spu_dfm(A,B);)
+    OP(dfma, DST = spu_dfma(A,B,DST);)   /* RR: rt is accumulator + dest */
+    OP(dfms, DST = spu_dfms(A,B,DST);)
+    OP(dfnms, DST = spu_dfnms(A,B,DST);)
+    OP(dfnma, DST = spu_dfnma(A,B,DST);)
+    OP(dfceq, DST = spu_dfceq(A,B);)
+    OP(dfcgt, DST = spu_dfcgt(A,B);)
+    OP(dfcmeq, DST = spu_dfcmeq(A,B);)
+    OP(dfcmgt, DST = spu_dfcmgt(A,B);)
+    OP(dftsv, DST = spu_dftsv(A, (int32_t)RB_);)   /* I7 sits in the rb field */
     /* control flow */
-    case SPU_br: case SPU_bra: next = d.tgt; break;
-    case SPU_brsl: case SPU_brasl: DST = spu_link((pc + 4) & 0x3FFFC); next = d.tgt;
-        { extern void spu_trace_call(uint32_t,uint32_t); spu_trace_call(pc, d.tgt); } break;
-    case SPU_brz:  if (PREF(DST) == 0) next = d.tgt; break;
-    case SPU_brnz: if (PREF(DST) != 0) next = d.tgt; break;
-    case SPU_brhz: if ((PREF(DST) & 0xFFFF) == 0) next = d.tgt; break;
-    case SPU_brhnz:if ((PREF(DST) & 0xFFFF) != 0) next = d.tgt; break;
-    /* Every taken indirect branch (bi, bisl, bisled, iret and the conditional
-     * bi* forms) carries the interrupt enable/disable bits (E = 0x40000 sets
-     * int_enable, D = 0x80000 clears it), exactly as the lifter decodes them. */
-    #define SPU_IED_BITS() do { \
-        if (insn & 0x40000u) ctx->int_enable = 1; \
-        else if (insn & 0x80000u) ctx->int_enable = 0; \
-    } while (0)
-    case SPU_bi:   next = PREF(A) & 0x3FFFC; SPU_IED_BITS(); break;
-    case SPU_bisl: { uint32_t tg = PREF(A) & 0x3FFFC;   /* read ra BEFORE the link write: rt may alias ra */
-        DST = spu_link((pc + 4) & 0x3FFFC); next = tg; SPU_IED_BITS(); break; }
-    case SPU_bisled: { uint32_t tg = PREF(A) & 0x3FFFC;   /* branch when an enabled event is pending */
-        DST = spu_link((pc + 4) & 0x3FFFC);
-        if ((__atomic_load_n(&ctx->event_status, __ATOMIC_ACQUIRE) & ctx->event_mask) != 0) {
-            next = tg;
-            SPU_IED_BITS(); }   /* E/D effective when taken, like the lift */
-        break; }
-    case SPU_iret: next = ctx->srr0 & 0x3FFFC;
-        /* The handler preserves every register: on a return to the point the
-         * interrupt was taken, restore the register file saved there. The
-         * lifted dispatch path does this in spu_irq_regs_maybe_restore; an iret
-         * executed here has to as well, or the snapshot stays armed and later
-         * lands on an unrelated dispatch. */
-        SPU_IED_BITS();
-        if (ctx->irq_saved && next == (ctx->irq_resume_pc & SPU_LS_MASK)) {
-            memcpy(ctx->gpr, ctx->irq_gpr, sizeof ctx->irq_gpr);
-            ctx->irq_saved = 0;
-        }
-        break;
-    case SPU_biz:  if (PREF(DST) == 0) { next = PREF(A) & 0x3FFFC; SPU_IED_BITS(); } break;
-    case SPU_binz: if (PREF(DST) != 0) { next = PREF(A) & 0x3FFFC; SPU_IED_BITS(); } break;
-    case SPU_bihz: if ((PREF(DST) & 0xFFFF) == 0) { next = PREF(A) & 0x3FFFC; SPU_IED_BITS(); } break;
-    case SPU_bihnz:if ((PREF(DST) & 0xFFFF) != 0) { next = PREF(A) & 0x3FFFC; SPU_IED_BITS(); } break;
-    case SPU_stop: case SPU_stopd:
-        ctx->pc = next; ctx->stop_code = (d.op == SPU_stopd) ? 0x3FFFu : (uint32_t)I;   /* stopd carries no code field: RPCS3 reports 0x3FFF */
-        ctx->status = SPU_STATUS_STOPPED_BY_STOP; return 1;
+    OP(br, SPU_JUMP(TGT);)
+    OP(bra, SPU_JUMP(TGT);)
+    OP(brsl, DST = spu_link((pc + 4) & 0x3FFFC); SPU_JUMP(TGT); spu_trace_call(pc, TGT);)
+    OP(brasl, DST = spu_link((pc + 4) & 0x3FFFC); SPU_JUMP(TGT); spu_trace_call(pc, TGT);)
+    OP(brz, if (PREF(DST) == 0) SPU_JUMP(TGT);)
+    OP(brnz, if (PREF(DST) != 0) SPU_JUMP(TGT);)
+    OP(brhz, if ((PREF(DST) & 0xFFFF) == 0) SPU_JUMP(TGT);)
+    OP(brhnz, if ((PREF(DST) & 0xFFFF) != 0) SPU_JUMP(TGT);)
+    OP(bi, SPU_JUMP(PREF(A) & 0x3FFFC); SPU_IED_BITS();)
+    OP(bisl,   /* read ra BEFORE the link write: rt may alias ra */
+       uint32_t tg = PREF(A) & 0x3FFFC;
+       DST = spu_link((pc + 4) & 0x3FFFC); SPU_JUMP(tg); SPU_IED_BITS();)
+    OP(bisled,   /* branch when an enabled event is pending */
+       uint32_t tg = PREF(A) & 0x3FFFC;
+       DST = spu_link((pc + 4) & 0x3FFFC);
+       if ((__atomic_load_n(&ctx->event_status, __ATOMIC_ACQUIRE) & ctx->event_mask) != 0) {
+           SPU_JUMP(tg);
+           SPU_IED_BITS(); })   /* E/D effective when taken, like the lift */
+    OP(iret,
+       SPU_JUMP(ctx->srr0 & 0x3FFFC);
+       /* The handler preserves every register: on a return to the point the
+        * interrupt was taken, restore the register file saved there. The
+        * lifted dispatch path does this in spu_irq_regs_maybe_restore; an iret
+        * executed here has to as well, or the snapshot stays armed and later
+        * lands on an unrelated dispatch. */
+       SPU_IED_BITS();
+       if (ctx->irq_saved && next == (ctx->irq_resume_pc & SPU_LS_MASK)) {
+           memcpy(ctx->gpr, ctx->irq_gpr, sizeof ctx->irq_gpr);
+           ctx->irq_saved = 0;
+       })
+    OP(biz, if (PREF(DST) == 0) { SPU_JUMP(PREF(A) & 0x3FFFC); SPU_IED_BITS(); })
+    OP(binz, if (PREF(DST) != 0) { SPU_JUMP(PREF(A) & 0x3FFFC); SPU_IED_BITS(); })
+    OP(bihz, if ((PREF(DST) & 0xFFFF) == 0) { SPU_JUMP(PREF(A) & 0x3FFFC); SPU_IED_BITS(); })
+    OP(bihnz, if ((PREF(DST) & 0xFFFF) != 0) { SPU_JUMP(PREF(A) & 0x3FFFC); SPU_IED_BITS(); })
+    OP(stop,
+       ctx->pc = next; ctx->stop_code = (uint32_t)I;
+       ctx->status = SPU_STATUS_STOPPED_BY_STOP; return 1;)
+    /* stopd carries no code field: RPCS3 reports 0x3FFF */
+    OP(stopd,
+       ctx->pc = next; ctx->stop_code = 0x3FFFu;
+       ctx->status = SPU_STATUS_STOPPED_BY_STOP; return 1;)
     /* conditional halts (assertions): stop the SPU when the condition holds,
      * else continue. The preferred word of ra is compared. */
-    case SPU_heq: case SPU_heqi: case SPU_hgt: case SPU_hgti:
-    case SPU_hlgt: case SPU_hlgti: {
-        uint32_t a = PREF(A), rhs = (d.op==SPU_heq||d.op==SPU_hgt||d.op==SPU_hlgt) ? PREF(B) : (uint32_t)I;
-        int hit = (d.op==SPU_heq||d.op==SPU_heqi)   ? (a == rhs)
-                : (d.op==SPU_hgt||d.op==SPU_hgti)   ? ((int32_t)a > (int32_t)rhs)
-                :                                     (a > rhs);      /* hlgt/hlgti */
-        if (hit) { extern void spu_trace_dump(uint32_t); spu_trace_dump(pc);
-                   ctx->pc = pc; ctx->stop_code = 0x1000; ctx->status = SPU_STATUS_STOPPED_BY_HALT; return 1; }
-        break; }
+    OP(heq, SPU_HALT_IF(PREF(A) == PREF(B));)
+    OP(heqi, SPU_HALT_IF(PREF(A) == (uint32_t)I);)
+    OP(hgt, SPU_HALT_IF((int32_t)PREF(A) > (int32_t)PREF(B));)
+    OP(hgti, SPU_HALT_IF((int32_t)PREF(A) > (int32_t)(uint32_t)I);)
+    OP(hlgt, SPU_HALT_IF(PREF(A) > PREF(B));)
+    OP(hlgti, SPU_HALT_IF(PREF(A) > (uint32_t)I);)
     default:
         fprintf(stderr, "[spu_interp] unimplemented op '%s' (0x%08X) at LS 0x%05X\n",
-                d.op < SPU_OP_COUNT ? spu_op_name[d.op] : "?", insn, pc);
+                spu_op_name[spu_decode_tab[insn >> 21]], insn, pc);
         ctx->pc = pc; ctx->status = SPU_STATUS_STOPPED_BY_HALT; return 1;
     }
+    *out_next = next;
+    return 0;
+}
+
+/* One instruction at ctx->pc through the context, for callers that step a
+ * context rather than run it (the RPCS3 differential test). */
+SPU_INTERP_REFERENCE int spu_step(spu_context* ctx) {
+    uint32_t pc = ctx->pc, next;
+    int general = 0;
+    if (spu_exec(ctx, pc, spu_fetch(ctx, pc), &next, &general)) return 1;
     ctx->pc = next;
     return 0;
 }
@@ -475,7 +554,7 @@ static void interp_stats_step(const spu_context* ctx)
 /* SPU_INTERP_OPSTATS=<seconds>: instructions executed per op, printed every
  * <seconds> as `[spu-ops] total=<N> <op>=<count> ...`, busiest op first, ops
  * with no executions left out. The totals are cumulative since the first
- * counted instruction. A profile of spu_step shows one big switch; this says
+ * counted instruction. A profile of the interpreter shows one big switch; this says
  * which handlers the time belongs to. Counts are per interpreting thread and
  * folded into the process-wide totals every OPS_FOLD instructions and when a
  * run returns, as SPU_MFC_STATS does, so counting adds no cross-core traffic
@@ -559,7 +638,7 @@ static void interp_opstats_tick(long period)
 
 static void interp_opstats_step(const spu_context* ctx, long period)
 {
-    t_ops_local[spu_decode_tab[spu_fetch(ctx) >> 21].op]++;
+    t_ops_local[spu_decode_tab[spu_fetch(ctx, ctx->pc) >> 21]]++;
     if (++t_ops_pending < OPS_FOLD) return;
     interp_opstats_fold();
     interp_opstats_tick(period);
@@ -601,6 +680,7 @@ static uint32_t spu_interp_run_inner(spu_context* ctx, uint32_t start_lsa,
     ctx->pc = start_lsa & 0x3FFFC;
     ctx->status = SPU_STATUS_RUNNING;
     uint64_t steps = 0;
+    uint32_t pc = ctx->pc, next = 0;
     /* YDKJ_SPU_TRACE=N: log the last N PCs into a ring buffer and dump them when the
      * interp halts -- shows the path to a branch-to-0 (the cri task/policy wall). */
     /* The env gates and their counters are per interpreting thread: they are
@@ -629,23 +709,42 @@ static uint32_t spu_interp_run_inner(spu_context* ctx, uint32_t start_lsa,
      * whether any of it can fire; while it is clear a step skips it, and the
      * loop re-tests only what a step can change:
      *   - pc == 0xA70: the HLE hook below needs the full iteration;
-     *   - image_id: a step can change it (the MFC command that DMAs the
-     *     taskset policy to LS 0xA00 does, spu_dma.h) and the rejoin check must
-     *     see the new value before the next instruction.
+     *   - image_id: only a channel op can change it (the MFC command that
+     *     DMAs the taskset policy to LS 0xA00 does, spu_dma.h), and the rejoin
+     *     check must see the new value before the next instruction. spu_exec
+     *     raises `general` after a channel op that leaves an image, so a step
+     *     that makes no channel access does not load image_id at all.
      * The observer is not re-read per step: a callback can only run, and so
      * only replace itself, while `general` is set; the driver installs one
      * between runs. The dg gates are fixed once the environment has been read
      * and only count down from a nonzero value, so they cannot arm mid-run.
-     * One spu_step call site serves both paths, which keeps it inlined.
+     * One spu_exec call site serves both paths, which keeps it inlined.
+     *
+     * `pc` and `steps` are locals. ctx->pc is written where something can read
+     * it; spu_exec lists its own writes (channel ops, local-store accesses,
+     * taken branches, stop/halt/trap). Here it is written at:
+     *   - the top of every general iteration, before anything below reads
+     *     ctx->pc: the HLE hook, the rejoin lookup, the observer, the
+     *     diagnostics and the STEPCAP/trace dumps (an observer may move it,
+     *     and `pc` is reloaded after the callback);
+     *   - the 0xA70 HLE return, which resumes at r0 through ctx->pc;
+     *   - the stop 0x110 service, after which `pc` is reloaded from the
+     *     ctx->pc that the stop left (the next instruction).
+     * A fast step stores nothing else, so between taken branches ctx->pc is
+     * stale while fast steps run; no code on this thread reads it then, and
+     * the one reader on another thread is served by SPU_JUMP.
+     * A longjmp out of the run (spu_halt from a channel op) leaves ctx->pc at
+     * the pc of the instruction that made the call, as it always did.
      *
      * g_spu_interp_steps / g_spu_interp_last_pc are read only after a run
      * returns (lv2_register.c), so a fast step does not store last_pc: the stop
      * return writes it (the pc of the last step issued), and the other returns
-     * are in the general path, which still stores it per step. */
+     * are in the general path, which still stores it per step. `steps` is
+     * published at every normal return and not by a longjmp, as before. */
     int general = 1;
     for (;;) {
-        uint32_t pc = ctx->pc;
-        if (!(general | (pc == 0xA70u) | (ctx->image_id >= 0))) { steps++; goto step; }
+        if (SPU_LIKELY(!(general | (pc == 0xA70u)))) { steps++; goto step; }
+        ctx->pc = pc;
         general = ctx->image_id >= 0 || ctx->observer || dg->g1 > 0 || dg->tr > 0 || dg->diag;
         if (!general && pc != 0xA70u) { steps++; goto step; }
         /* Match the lifted path: only synthetic HLE tasks may bypass the
@@ -660,6 +759,7 @@ static uint32_t spu_interp_run_inner(spu_context* ctx, uint32_t start_lsa,
                 spu_spurs_taskset_syscall(ctx);
                 ctx->image_id = _save;
                 ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;   /* resume at link r0 */
+                pc = ctx->pc;
                 continue;
             }
         }
@@ -719,7 +819,7 @@ static uint32_t spu_interp_run_inner(spu_context* ctx, uint32_t start_lsa,
             fflush(stderr); dg->tr--; SPU_RELAXED_STORE(&g_spu_interp_steps, steps); return 0x2000u;
         }
         step:
-        if (spu_step(ctx)) {
+        if (spu_exec(ctx, pc, spu_fetch(ctx, pc), &next, &general)) {
             /* stop 0x110 = SYS_SPU_THREAD_STOP_RECEIVE_EVENT. The worker writes
              * the SPU queue number to its out-mailbox, stops, and lv2 replies
              * with {CELL_OK, data1, data2, data3} in the in-mailbox -- which is
@@ -737,6 +837,7 @@ static uint32_t spu_interp_run_inner(spu_context* ctx, uint32_t start_lsa,
                 ctx->rcv_evt_n = 4; ctx->rcv_evt_i = 0;
                 g_spu_pending_evt_valid = 0;
                 ctx->status = SPU_STATUS_RUNNING;
+                pc = ctx->pc;   /* the stop stored the next pc there */
                 continue;
             }
             SPU_RELAXED_STORE(&g_spu_interp_steps, steps);
@@ -746,6 +847,7 @@ static uint32_t spu_interp_run_inner(spu_context* ctx, uint32_t start_lsa,
                 for(int k=rn;k>0;k--) fprintf(stderr," %05X", ring[(rc-k)&63]);
                 fprintf(stderr,"\n"); fflush(stderr); dg->tr--; }
             return ctx->stop_code; }
+        pc = next;
     }
 }
 
