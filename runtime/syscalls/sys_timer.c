@@ -157,8 +157,8 @@ static void write_be64(uint32_t addr, uint64_t val)
  * 0x00), THREAD_STANDARD_POLICY does not bring it back, and
  * pthread_set_qos_class_self_np then fails with EPERM for the rest of the
  * thread's life. NOTE_CRITICAL changes no thread state, so there is nothing to
- * restore (the QoS class and sched priority win32_compat.c's SetThreadPriority
- * set stay as they were).
+ * restore (the QoS class win32_compat.c's SetThreadPriority set stays as it
+ * was).
  *
  * The kqueue is created and closed inside the call: no per-thread state, so no
  * fd to leak when a guest thread ends and nothing stale in a forked child. It

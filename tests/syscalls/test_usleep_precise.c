@@ -220,11 +220,11 @@ static int run_state(void)
         if (i == 0) first = j.before;
         if (i == 3) last = j.before;
     }
-    /* The runtime's priority path reaches the host (the audio thread depends on it); if two levels read back
-     * the same, the equality above would be vacuous for the sched priority. */
+    /* SetThreadPriority reaches the host as a QoS class; if two levels read back the same, the equality above
+     * would be vacuous for it. The sched priority is not a lever there: setting it would cost the thread its
+     * class (see win32_compat.c). */
 #ifdef __APPLE__
-    CHECK(first.sched_prio != last.sched_prio, "TIME_CRITICAL and IDLE read back the same sched priority (%d)",
-          first.sched_prio);
+    CHECK(first.qos != last.qos, "TIME_CRITICAL and IDLE read back the same QoS class (0x%02x)", first.qos);
 #else
     (void)first; (void)last;
 #endif

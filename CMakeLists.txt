@@ -641,6 +641,19 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME ftrace_publish COMMAND test_ftrace_publish)
         set_tests_properties(ftrace_publish PROPERTIES LABELS "runtime;t0;tsan" TIMEOUT 120)
     endif()
+    # SetThreadPriority's QoS class on macOS (win32_compat.c): each level's class and relative priority for
+    # a thread that sets its own and one given a level before ResumeThread, and the two refusals that must
+    # be loud. The shim is compiled in directly, as the CI one-liner does.
+    if(UNIX)
+        add_executable(test_thread_qos
+            runtime/platform/tests/test_thread_qos.c
+            runtime/platform/win32_compat.c)
+        target_include_directories(test_thread_qos PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/runtime/platform")
+        target_compile_options(test_thread_qos PRIVATE -Wall -Wextra)
+        target_link_libraries(test_thread_qos PRIVATE Threads::Threads)
+        add_test(NAME thread_qos COMMAND test_thread_qos)
+        set_tests_properties(thread_qos PROPERTIES LABELS "runtime;t0;tsan" TIMEOUT 60)
+    endif()
 
     # cellSync.h from C++, with <stdatomic.h> included first: the generated NID
     # table includes the header that way and no other in-tree TU did, so this
