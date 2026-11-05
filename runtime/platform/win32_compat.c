@@ -100,6 +100,7 @@ typedef struct ps3_obj {
     int            started, done, suspend_count;
     int            adopted;            /* not created here; see thread_self() */
     int            priority;           /* THREAD_PRIORITY_*, applied at start too */
+    int            priority_set;       /* SetThreadPriority was called: NORMAL is then a request, not the default */
     DWORD_PTR      affinity;           /* 0 = unset */
     DWORD          exit_code;
     PS3_THREAD_FN  fn;
@@ -404,38 +405,60 @@ BOOL CancelWaitableTimer(HANDLE h)
 /* --- threads --------------------------------------------------------------- */
 
 /* Apply a THREAD_PRIORITY_* level to the calling thread (or `pt`/`tid` when
- * it is another one). Best effort on every host: the point is to keep the
- * PPU, SPU-worker and RSX threads ahead of housekeeping, not to promise a
- * scheduler class. */
-static void apply_priority(pthread_t pt, DWORD tid, int level, int is_self)
-{
+ * it is another one). Returns 0, or an errno value when the host refused the
+ * request, which the caller reports. Best effort elsewhere: the point is to
+ * keep the PPU, SPU-worker and RSX threads ahead of housekeeping, not to
+ * promise a scheduler class. */
 #if defined(__APPLE__)
-    struct sched_param sp; int policy = SCHED_OTHER;
-    if (pthread_getschedparam(pt, &policy, &sp) == 0) {
-        int lo = sched_get_priority_min(policy), hi = sched_get_priority_max(policy);
-        int def = (lo + hi) / 2;
-        int p;
-        if      (level >= THREAD_PRIORITY_TIME_CRITICAL) p = hi;
-        else if (level <= THREAD_PRIORITY_IDLE)          p = lo;
-        else                                             p = def + level * ((hi - def) / 4);
-        if (p < lo) p = lo;
-        if (p > hi) p = hi;
-        sp.sched_priority = p;
-        pthread_setschedparam(pt, policy, &sp);
+/* What Darwin takes the place of a priority. QoS decides P-core vs E-core on
+ * Apple Silicon, so the class is the part that must survive, and
+ * pthread_setschedparam is never called: any call to it, even with the value
+ * the thread already has, resets the thread to QoS 0x00 and every later
+ * pthread_set_qos_class_self_np fails with EPERM, in either order (probe:
+ * scratch/m4/qos/probe.c). The relative priority (-15..0) keeps the order
+ * between levels that share a class. */
+static void level_to_qos(int level, qos_class_t* q, int* rel)
+{
+    if      (level >= THREAD_PRIORITY_TIME_CRITICAL) { *q = QOS_CLASS_USER_INTERACTIVE; *rel =  0; }
+    else if (level >= THREAD_PRIORITY_HIGHEST)       { *q = QOS_CLASS_USER_INTERACTIVE; *rel = -1; }
+    else if (level >= THREAD_PRIORITY_ABOVE_NORMAL)  { *q = QOS_CLASS_USER_INTERACTIVE; *rel = -2; }
+    else if (level == THREAD_PRIORITY_NORMAL)        { *q = QOS_CLASS_USER_INITIATED;   *rel =  0; }
+    else if (level >= THREAD_PRIORITY_BELOW_NORMAL)  { *q = QOS_CLASS_UTILITY;          *rel =  0; }
+    else if (level >= THREAD_PRIORITY_LOWEST)        { *q = QOS_CLASS_UTILITY;          *rel = -1; }
+    else                                             { *q = QOS_CLASS_BACKGROUND;       *rel =  0; }
+}
+
+/* One stderr line per cause and process: a refused request is a different
+ * level of the same problem every time it recurs, and one line names it. */
+static void qos_refused_once(int cause, int level, qos_class_t q, int rel, int err)
+{
+    static int warned[2];
+    if (__atomic_exchange_n(&warned[cause], 1, __ATOMIC_RELAXED)) return;
+    if (cause == 0)
+        fprintf(stderr, "[win32_compat] SetThreadPriority(%d): pthread_set_qos_class_self_np(0x%02x, %d) failed: "
+                        "errno %d (%s); the thread keeps its QoS class\n",
+                level, (unsigned)q, rel, err, strerror(err));
+    else
+        fprintf(stderr, "[win32_compat] SetThreadPriority(%d) refused: a running thread's QoS class can only "
+                        "be set by that thread, and pthread_setschedparam would cost it the class\n", level);
+}
+
+static int apply_priority(pthread_t pt, DWORD tid, int level, int is_self)
+{
+    (void)pt; (void)tid;
+    if (!is_self) {
+        qos_refused_once(1, level, QOS_CLASS_UNSPECIFIED, 0, 0);
+        return ENOTSUP;
     }
-    /* QoS is what actually decides P-core vs E-core on Apple Silicon. Only the
-     * calling thread can set its own; a thread created suspended gets it from
-     * the trampoline, which runs on the new thread. */
-    if (is_self) {
-        qos_class_t q = QOS_CLASS_DEFAULT;
-        if      (level >= THREAD_PRIORITY_ABOVE_NORMAL) q = QOS_CLASS_USER_INTERACTIVE;
-        else if (level == THREAD_PRIORITY_NORMAL)       q = QOS_CLASS_USER_INITIATED;
-        else if (level >= THREAD_PRIORITY_LOWEST)       q = QOS_CLASS_UTILITY;
-        else                                            q = QOS_CLASS_BACKGROUND;
-        pthread_set_qos_class_self_np(q, 0);
-    }
-    (void)tid;
+    qos_class_t q; int rel;
+    level_to_qos(level, &q, &rel);
+    int err = pthread_set_qos_class_self_np(q, rel);
+    if (err) qos_refused_once(0, level, q, rel, err);
+    return err;
+}
 #elif defined(__linux__)
+static int apply_priority(pthread_t pt, DWORD tid, int level, int is_self)
+{
     /* SCHED_OTHER has no per-thread priority, only nice, which Linux applies
      * per thread through setpriority(PRIO_PROCESS, tid). Lowering nice below
      * zero needs CAP_SYS_NICE or an RLIMIT_NICE grant; without it the call
@@ -451,10 +474,15 @@ static void apply_priority(pthread_t pt, DWORD tid, int level, int is_self)
     if (is_self) tid = (DWORD)syscall(SYS_gettid);
     if (tid) setpriority(PRIO_PROCESS, (id_t)tid, nice);
     (void)pt;
-#else
-    (void)pt; (void)tid; (void)level; (void)is_self;
-#endif
+    return 0;
 }
+#else
+static int apply_priority(pthread_t pt, DWORD tid, int level, int is_self)
+{
+    (void)pt; (void)tid; (void)level; (void)is_self;
+    return 0;
+}
+#endif
 
 static void apply_affinity(pthread_t pt, DWORD_PTR mask)
 {
@@ -501,11 +529,21 @@ static void* thread_trampoline(void* p)
     thread_publish_self_locked(t);
     while (t->suspend_count > 0)                 /* CREATE_SUSPENDED gate */
         pthread_cond_wait(&t->cv, &s_lock);
+    /* The start priority is applied before `started` is published, both under
+     * s_lock: a SetThreadPriority that sees started==0 leaves its level for
+     * this code, and one that sees started==1 finds the thread already set up.
+     * Without that, a request landing in between would hit a running thread,
+     * whose QoS class nobody else can set. A refusal is reported by
+     * apply_priority. */
+#if defined(__APPLE__)
+    if (t->priority_set) apply_priority(pthread_self(), t->tid, t->priority, 1);
+#else
+    if (t->priority != THREAD_PRIORITY_NORMAL) apply_priority(pthread_self(), t->tid, t->priority, 1);
+#endif
     t->started = 1;
-    int prio = t->priority; DWORD_PTR aff = t->affinity;
+    DWORD_PTR aff = t->affinity;
     pthread_mutex_unlock(&s_lock);
 
-    if (prio != THREAD_PRIORITY_NORMAL) apply_priority(pthread_self(), t->tid, prio, 1);
     if (aff) apply_affinity(pthread_self(), aff);
 
     DWORD rc = t->fn ? t->fn(t->arg) : (DWORD)t->fn_crt(t->arg);
@@ -952,14 +990,27 @@ BOOL SetThreadPriority(HANDLE h, int priority)
 {
     pthread_t pt; DWORD tid; int self; ps3_obj* t;
     if (!resolve_thread(h, &pt, &tid, &self, &t)) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
-    int started = 1;
+    if (t) {
+        pthread_mutex_lock(&s_lock);
+        if (!t->started) {          /* the trampoline applies it on the new thread, which can */
+            t->priority = priority;
+            t->priority_set = 1;
+            pthread_mutex_unlock(&s_lock);
+            return TRUE;
+        }
+        pthread_mutex_unlock(&s_lock);
+    }
+    /* A running thread other than the caller is the case Darwin cannot do (see
+     * apply_priority); it fails here, loudly, and the recorded level stays
+     * what the thread really has. */
+    int err = apply_priority(pt, tid, priority, self);
+    if (err) { SetLastError(err == ENOTSUP ? ERROR_NOT_SUPPORTED : ERROR_GEN_FAILURE); return FALSE; }
     if (t) {
         pthread_mutex_lock(&s_lock);
         t->priority = priority;
-        started = t->started;
+        t->priority_set = 1;
         pthread_mutex_unlock(&s_lock);
     }
-    if (started) apply_priority(pt, tid, priority, self);   /* else the trampoline applies it */
     return TRUE;
 }
 

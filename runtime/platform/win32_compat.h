@@ -188,6 +188,7 @@ typedef struct {
 #define ERROR_INVALID_HANDLE   6u
 #define ERROR_NOT_ENOUGH_MEMORY 8u
 #define ERROR_GEN_FAILURE      31u
+#define ERROR_NOT_SUPPORTED    50u
 #define ERROR_INVALID_PARAMETER 87u
 #define ERROR_ALREADY_EXISTS   183u
 #define ERROR_TIMEOUT          1460u
