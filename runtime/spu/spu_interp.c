@@ -87,12 +87,14 @@ static void spu_decode1(uint32_t insn, uint32_t pc, spu_ins* d) {
 #define PREF(r) ((r)._u32[0])
 
 /* The instruction word at ctx->pc. spu_step and the SPU_INTERP_OPSTATS counter
- * both read it through here, so the histogram counts the op the step runs. */
+ * both read it through here, so the histogram counts the op the step runs.
+ * One 32-bit load and a swap: four byte loads and shifts were four loads and
+ * three ORs per executed instruction. memcpy keeps an unaligned pc (the 0xA70
+ * return masks r0 with SPU_LS_MASK only) reading the same four bytes as before. */
 static inline uint32_t spu_fetch(const spu_context* ctx) {
-    uint32_t m = ctx->pc & SPU_LS_MASK;
-    const uint8_t* p = ctx->ls;
-    return ((uint32_t)p[m] << 24) | ((uint32_t)p[m+1] << 16)
-         | ((uint32_t)p[m+2] << 8) | p[m+3];
+    uint32_t m = ctx->pc & SPU_LS_MASK, w;
+    memcpy(&w, ctx->ls + m, sizeof w);
+    return SPU_BSWAP32(w);
 }
 
 static int spu_step(spu_context* ctx) {
@@ -621,7 +623,31 @@ static uint32_t spu_interp_run_inner(spu_context* ctx, uint32_t start_lsa,
      * (pc left the fn), when r3 and the leaf's non-restored intermediates are still live. */
     }
     uint32_t ring[64]; int rc=0, rn=0;
+    /* Everything between the prelude below and `step:` is a no-op for pure
+     * interpretation (image_id < 0) with no observer and no diagnostic armed,
+     * which is nearly every instruction of a raw SPU job. `general` says
+     * whether any of it can fire; while it is clear a step skips it, and the
+     * loop re-tests only what a step can change:
+     *   - pc == 0xA70: the HLE hook below needs the full iteration;
+     *   - image_id: a step can change it (the MFC command that DMAs the
+     *     taskset policy to LS 0xA00 does, spu_dma.h) and the rejoin check must
+     *     see the new value before the next instruction.
+     * The observer is not re-read per step: a callback can only run, and so
+     * only replace itself, while `general` is set; the driver installs one
+     * between runs. The dg gates are fixed once the environment has been read
+     * and only count down from a nonzero value, so they cannot arm mid-run.
+     * One spu_step call site serves both paths, which keeps it inlined.
+     *
+     * g_spu_interp_steps / g_spu_interp_last_pc are read only after a run
+     * returns (lv2_register.c), so a fast step does not store last_pc: the stop
+     * return writes it (the pc of the last step issued), and the other returns
+     * are in the general path, which still stores it per step. */
+    int general = 1;
     for (;;) {
+        uint32_t pc = ctx->pc;
+        if (!(general | (pc == 0xA70u) | (ctx->image_id >= 0))) { steps++; goto step; }
+        general = ctx->image_id >= 0 || ctx->observer || dg->g1 > 0 || dg->tr > 0 || dg->diag;
+        if (!general && pc != 0xA70u) { steps++; goto step; }
         /* Match the lifted path: only synthetic HLE tasks may bypass the
          * resident policy. Real tasksets also store 0xA70 in their API table.
          * Preserve the legacy CRI return convention while invoking the HLE. */
@@ -659,7 +685,7 @@ static uint32_t spu_interp_run_inner(spu_context* ctx, uint32_t start_lsa,
               }
               return SPU_INTERP_YIELDED;
           } }
-        SPU_RELAXED_STORE(&g_spu_interp_last_pc, ctx->pc);
+        SPU_RELAXED_STORE(&g_spu_interp_last_pc, pc = ctx->pc);   /* an observer may have moved pc */
         if (dg->g1>0) {
             int inr = (ctx->pc >= 0x26E80u && ctx->pc < 0x26F14u);
             if (inr) { dg->g1in = 1; }
@@ -692,6 +718,7 @@ static uint32_t spu_interp_run_inner(spu_context* ctx, uint32_t start_lsa,
             #undef LB
             fflush(stderr); dg->tr--; SPU_RELAXED_STORE(&g_spu_interp_steps, steps); return 0x2000u;
         }
+        step:
         if (spu_step(ctx)) {
             /* stop 0x110 = SYS_SPU_THREAD_STOP_RECEIVE_EVENT. The worker writes
              * the SPU queue number to its out-mailbox, stops, and lv2 replies
@@ -713,6 +740,7 @@ static uint32_t spu_interp_run_inner(spu_context* ctx, uint32_t start_lsa,
                 continue;
             }
             SPU_RELAXED_STORE(&g_spu_interp_steps, steps);
+            SPU_RELAXED_STORE(&g_spu_interp_last_pc, pc);
             if (dg->tr>0) { fprintf(stderr,"[spu-trace] halt stop=0x%X pc=0x%05X after %llu steps; last %d PCs:",
                     ctx->stop_code, ctx->pc, (unsigned long long)steps, rn);
                 for(int k=rn;k>0;k--) fprintf(stderr," %05X", ring[(rc-k)&63]);

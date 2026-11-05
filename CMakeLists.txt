@@ -743,6 +743,18 @@ if(PS3RECOMP_BUILD_TESTS)
         set_tests_properties(spu_opstats spu_opstats_off
             PROPERTIES LABELS "spu;t0;tsan" TIMEOUT 60)
 
+        # The interpreter's fast loop (pure interpretation, nothing observing)
+        # against its general loop: registers, local store, pc, stop code and
+        # the step/last-pc diagnostics, across the 0xA70 HLE hook, the 0x110
+        # event stop and an image change mid-run.
+        add_executable(test_spu_interp_loop
+            runtime/spu/tests/test_spu_interp_loop.c)
+        target_include_directories(test_spu_interp_loop PRIVATE include runtime/spu)
+        target_compile_options(test_spu_interp_loop PRIVATE -UNDEBUG)
+        target_link_libraries(test_spu_interp_loop PRIVATE m Threads::Threads)
+        add_test(NAME spu_interp_loop COMMAND test_spu_interp_loop)
+        set_tests_properties(spu_interp_loop PROPERTIES LABELS "spu;t0" TIMEOUT 60)
+
         add_executable(test_spu_lockline_wait
             runtime/spu/tests/test_spu_lockline_wait.c)
         target_include_directories(test_spu_lockline_wait PRIVATE include)
