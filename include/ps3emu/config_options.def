@@ -75,6 +75,18 @@ PS3_CFG_STR(ppu, null_page, "stop", 4, PS3_CFG_V_NULL_PAGE,
     "defect and lets the run continue on state the console never produced; a "
     "title config that sets it must say why in a comment.")
 
+PS3_CFG_BOOL(ppu, precise_usleep, 1,
+    "Make sys_timer_usleep wake on time on macOS: a sleep of 20 us or more waits on a kevent "
+    "timer with NOTE_CRITICAL, which the kernel does not coalesce. nanosleep wakes late by a "
+    "quarter of the request or more (2.5 ms at 10 ms, 4.0 ms at 16 ms, p50 on the measuring "
+    "host), which makes a guest that paces itself with usleep(period - elapsed) miss its "
+    "deadline; the console's usleep is accurate. The option changes no thread state (the "
+    "QoS class and priority the runtime set stay), costs about 0.5 us a call and, if the host "
+    "refuses the timer, logs [usleep] precise-usleep-fallback once and sleeps that call with "
+    "nanosleep. Off is the nanosleep reference path, kept for A/B. Timing only, and only "
+    "macOS: the Windows (waitable timer, QPC tail) and Linux (nanosleep) paths are unchanged "
+    "and ignore it. Read once, at the first sleep.")
+
 /* ---- spu ---------------------------------------------------------------- */
 
 PS3_CFG_U32(spu, dma_repeat_limit, 256, 1, 4294967295,

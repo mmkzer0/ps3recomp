@@ -41,6 +41,12 @@ uint64_t ppu_timebase_now(void);
 uint64_t host_monotonic_ns(void);
 #endif
 
+/* Calls of sys_timer_usleep that slept on the macOS critical timer
+ * (ppu.precise_usleep, sys_timer.c) and completed. It is how a test tells that
+ * option off, a short sleep, or a host that refused the timer took nanosleep:
+ * the thread state is the same on both paths. 0 on every other host. */
+uint64_t sys_timer_usleep_precise_count(void);
+
 #ifdef _WIN32
 /* Sub-millisecond timed-wait support for the lv2 sync primitives.
  * SleepConditionVariableCS / WaitForSingleObject floor a timed wait to 1 ms,
