@@ -1329,8 +1329,8 @@ requires the opt-in `spu.dma_repeat_stop_secs` (default 0 = never stop); see
   `runtime/spu/spu_dma.h:535`
 - **`SPU_PCHIST`** — SPU_PCHIST=1: per-worker histogram of trampoline hops by the GPU module's symbol ranges, printed every 4M hops. The gate and counters are thread-local because every worker enters the tick on its first hop.
   `runtime/spu/spu_context.h:662`
-- **`SPU_PCSAMPLE`** — _(no description in source)_
-  `runtime/spu/spu_channels.c:334`
+- **`SPU_PCSAMPLE`** — SPU_PCSAMPLE=<secs>: every <secs>, print image, pc and a few registers of every context holding an MFC slot (every live SPU that has done DMA), to say which SPU task never returned and where it is. For an interpreting SPU the pc is the last one the interpreter published: a taken branch's target or one of the out-of-line points listed above `spu_exec` (`spu_interp.c`), not the instruction running now, so samples gather at basic-block starts. Good for "which loop", not for a hot instruction inside a block.
+  `runtime/spu/spu_channels.c:544`
 - **`SPU_POISON_DMA_WATCH`** — SPU_POISON_DMA_WATCH=1 (any value): scan every PUT payload for the poison word and also log PUTs that carry it outside the region. Unset, only PUTs into the region are scanned (their lines are unchanged): the scan is a second pass over every byte of every PUT. */
   `runtime/spu/spu_dma.h:742`
 - **`SPU_POLLTRACE`** — _(no description in source)_

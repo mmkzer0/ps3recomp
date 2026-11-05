@@ -400,7 +400,12 @@ static SRWLOCK s_mfc_claim_lock = SRWLOCK_INIT;
 
 /* SPU_PCSAMPLE=<secs>: every <secs>, print image and pc of every context
  * holding an MFC slot -- i.e. every live SPU that has done DMA. Answers
- * "which SPU task never returned, and where is it" without a debugger. */
+ * "which SPU task never returned, and where is it" without a debugger.
+ * For an interpreting SPU the pc read here is the last one the interpreter
+ * published: a taken branch's target or one of the out-of-line points listed
+ * above spu_exec (spu_interp.c), not the instruction running now. Samples
+ * therefore gather at basic-block starts; good for "which loop", not for a
+ * hot instruction inside a block. */
 static DWORD WINAPI spu_pcsample_thread(LPVOID p)
 {
     const DWORD ms = (DWORD)(uintptr_t)p;
