@@ -20,14 +20,17 @@ def main():
    if len(p) >= 3 and p[1] in 'tT': syms[p[2]] = int(p[0],16)
   lo = syms['_tprof_test_spin']; hi = min([v for v in syms.values() if v > lo],default=lo+0x100)
   results = []
-  # 256 records give each registered kind at least 100 samples. Five seconds
-  # bounds the sampler; the fixture waits for its completed dump, not a sleep.
+  # 256 records give each registered kind at least 100 samples. The sampler
+  # stops at that cap (about 1.3 s for 'slow' on an idle Mac); 30 s only bounds
+  # it. A hosted macOS runner managed one 10 ms round per ~52 ms (dev-ci run
+  # 41909391508), so the old 5 s bound ran out first. The fixture waits for the
+  # completed dump, not a sleep.
   for name, ppu, interval in [('spu',False,'1000'),('ppu',True,'1000'),('slow',True,'10000')]:
    prof = t/(name+'.txt')
    runenv = {**env,'PS3_TPROF':str(prof),'PS3_TPROF_TRIGGER':str(t/(name+'.go')),
-             'PS3_TPROF_SECONDS':'5','PS3_TPROF_CAP':'256','PS3_TPROF_INTERVAL_US':interval}
+             'PS3_TPROF_SECONDS':'30','PS3_TPROF_CAP':'256','PS3_TPROF_INTERVAL_US':interval}
    if ppu: runenv['PS3_TPROF_PPU'] = '1'
-   q = subprocess.run([str(exe)],env=runenv,capture_output=True,text=True,timeout=12)
+   q = subprocess.run([str(exe)],env=runenv,capture_output=True,text=True,timeout=60)
    assert q.returncode == 0, (name,q.stdout+q.stderr)
    hits = n = 0
    for line in prof.read_text().splitlines():
@@ -38,7 +41,7 @@ def main():
   # A genuinely insufficient profile must still fail the count assertions.
   q = subprocess.run([str(exe)],env={**runenv,'PS3_TPROF':str(t/'short.txt'),
                      'PS3_TPROF_TRIGGER':str(t/'short.go'),'PS3_TPROF_SECONDS':'0.01'},
-                     capture_output=True,text=True,timeout=12)
+                     capture_output=True,text=True,timeout=60)
   assert q.returncode != 0 and 'header=' in q.stdout and 'FAIL' in q.stdout, q.stdout+q.stderr
   print(json.dumps({'status':'PASS','profiles':results,'insufficient_profile':'rejected'}))
 if __name__ == '__main__': main()

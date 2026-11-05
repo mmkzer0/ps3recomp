@@ -53,7 +53,8 @@ int main(int argc, char** argv)
     pthread_create(&c, NULL, stranger, NULL);
     /* Register both kinds before releasing the sampler. Collect to its cap,
      * rather than requiring a hosted runner to meet a fixed sampling rate. */
-    const uint64_t deadline = ps3_ft_now() + 8000000000ull;
+    /* Covers registration plus PS3_TPROF_SECONDS (30 s in the driver). */
+    const uint64_t deadline = ps3_ft_now() + 45000000000ull;
     while (__atomic_load_n(&s_ready, __ATOMIC_ACQUIRE) != 3) {
         if (ps3_ft_now() >= deadline) { printf("FAIL: thread registration timeout\n"); return 1; }
         usleep(1000);
