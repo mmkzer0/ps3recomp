@@ -1,9 +1,10 @@
-/* The interpreter's decode contract: op and every field spu_decode1 hands to
- * the execute switch, for instructions at the opcode-width and immediate-form
- * boundaries. Encodings are built here from the SPU ISA field layouts (IBM SPU
- * ISA v1.2, ch. 2), not from the generated table, so a table whose precedence
- * or immediate forms drift fails against independent expectations. spu_decode1
- * is static, hence the include of the interpreter itself. */
+/* The interpreter's decode contract: op and every field spu_decode1 hands back
+ * for instructions at the opcode-width and immediate-form boundaries, and the
+ * operand each handler of the run loop binds for its own op's form. Encodings
+ * are built here from the SPU ISA field layouts (IBM SPU ISA v1.2, ch. 2), not
+ * from the generated table, so a table whose precedence or immediate forms
+ * drift fails against independent expectations. spu_decode1 and spu_step are
+ * static, hence the include of the interpreter itself. */
 #include "../spu_interp.c"
 #include <assert.h>
 #include <stdio.h>
@@ -62,6 +63,145 @@ static void expect_tgt(const char* what, uint32_t insn, uint32_t pc, spu_op op, 
     CHECK(d.op == op, what, insn);
     CHECK(d.tgt == tgt, what, insn);
     CHECK(d.imm == 0, what, insn);
+}
+
+/* ---- the handlers bind the same operands ----
+ * spu_decode1 above is the operand binding as data. The run loop never calls
+ * it: each handler binds the operand of its own op's form inline. So one
+ * instruction of every immediate form is also executed here (spu_step runs the
+ * same handlers as the run loop) and its effect compared with what the ISA
+ * defines, worked out below without the interpreter's helpers. The immediates
+ * are chosen so that a handler reading another form's field gets a different
+ * answer: bits above the low 7 set where the form is 10 bits wide, a value
+ * above 127 where the field is unsigned 8 bits, a negative immediate where the
+ * field is signed. */
+static spu_context g_ctx;
+static void be32(uint8_t* p, uint32_t v) { p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v; }
+static uint32_t rd32(uint32_t at) { const uint8_t* p = g_ctx.ls + at; return (uint32_t)p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3]; }
+static void fresh(uint32_t pc) {
+    memset(&g_ctx, 0, sizeof g_ctx);
+    spu_context_init(&g_ctx, 0);
+    g_ctx.pc = pc;
+}
+static int run1(uint32_t insn) {
+    be32(g_ctx.ls + (g_ctx.pc & SPU_LS_MASK), insn);
+    return spu_step(&g_ctx);
+}
+static void setw(int r, uint32_t v) { g_ctx.gpr[r] = spu_splat_u32(v); }
+static uint32_t W(int r, int lane) { return g_ctx.gpr[r]._u32[lane]; }
+static void all_lanes(const char* what, int r, uint32_t want, uint32_t insn) {
+    for (int l = 0; l < 4; l++) CHECK(W(r, l) == want, what, insn);
+}
+/* 16 bytes 00 01 .. 0F at `at` (a quadword of recognisable words). */
+static void pattern(uint32_t at) { for (int i = 0; i < 16; i++) g_ctx.ls[at + i] = (uint8_t)i; }
+static void expect_pattern(const char* what, int r, uint32_t insn) {
+    CHECK(W(r, 0) == 0x00010203u && W(r, 1) == 0x04050607u && W(r, 2) == 0x08090A0Bu &&
+          W(r, 3) == 0x0C0D0E0Fu, what, insn);
+}
+
+static void test_handler_operands(void) {
+    uint32_t i;
+
+    /* RI16 signed (il) and unsigned (ilh, ilhu, iohl, fsmbi) immediates. */
+    fresh(0x100); i = ri16(0x81, 0x8001, 5);
+    CHECK(!run1(i), "il runs", i); all_lanes("il sign-extends", 5, 0xFFFF8001u, i);
+    fresh(0x100); i = ri16(0x83, 0x8001, 5);
+    run1(i); all_lanes("ilh", 5, 0x80018001u, i);
+    fresh(0x100); i = ri16(0x82, 0x8001, 5);
+    run1(i); all_lanes("ilhu", 5, 0x80010000u, i);
+    fresh(0x100); setw(5, 0x12340000u); i = ri16(0xC1, 0x8001, 5);
+    run1(i); all_lanes("iohl zero-extends", 5, 0x12348001u, i);
+    fresh(0x100); i = ri16(0x65, 0xA000, 5);   /* bits 15..12 = 1010 select bytes 0 and 2 */
+    run1(i); CHECK(W(5, 0) == 0xFF00FF00u && W(5, 1) == 0 && W(5, 2) == 0 && W(5, 3) == 0, "fsmbi", i);
+
+    /* RI18: ila takes the whole 18-bit field. */
+    fresh(0x100); i = ri18(0x21, 0x2ABCD, 5);
+    run1(i); all_lanes("ila", 5, 0x2ABCDu, i);
+
+    /* RI10 signed: the immediate's bits above the low 7 matter. */
+    fresh(0x100); setw(4, 100); i = ri10(0x1C, (uint32_t)-300, 4, 5);
+    run1(i); all_lanes("ai -300", 5, (uint32_t)(100 - 300), i);
+    fresh(0x100); setw(4, 1); i = ri10(0x04, 0x200, 4, 5);   /* ori -512 */
+    run1(i); all_lanes("ori sign-extends", 5, 1u | 0xFFFFFE00u, i);
+    fresh(0x100); setw(4, 0xFFFFFFFFu); i = ri10(0x7C, 0x3FF, 4, 5);   /* ceqi -1 */
+    run1(i); all_lanes("ceqi -1", 5, 0xFFFFFFFFu, i);
+
+    /* RI10 scaled by 16: lqd/stqd. */
+    fresh(0x100); setw(4, 0x1000); pattern(0x1000 - 32); i = ri10(0x34, (uint32_t)-2, 4, 5);
+    run1(i); expect_pattern("lqd -2", 5, i);
+    fresh(0x100); setw(4, 0x1000); i = ri10(0x34, 0x155, 4, 5);   /* +341 * 16 = 0x1550 */
+    pattern(0x1000 + 0x1550); run1(i); expect_pattern("lqd +0x155", 5, i);
+    fresh(0x100); setw(4, 0x1000); g_ctx.gpr[5]._u32[0] = 0x00010203u; g_ctx.gpr[5]._u32[1] = 0x04050607u;
+    g_ctx.gpr[5]._u32[2] = 0x08090A0Bu; g_ctx.gpr[5]._u32[3] = 0x0C0D0E0Fu;
+    i = ri10(0x24, 3, 4, 5);
+    run1(i); CHECK(rd32(0x1030) == 0x00010203u && rd32(0x103C) == 0x0C0D0E0Fu, "stqd +3", i);
+
+    /* RI16 local-store addresses: absolute (lqa/stqa) and pc-relative (lqr/stqr). */
+    fresh(0x100); pattern((0x1234u << 2) & 0x3FFF0u); i = ri16(0x61, 0x1234, 5);
+    run1(i); expect_pattern("lqa", 5, i);
+    fresh(0x300); pattern(0x2F0); i = ri16(0x67, (uint32_t)-2, 5);   /* (0x300 - 8) & ~0xF */
+    run1(i); expect_pattern("lqr -2", 5, i);
+    fresh(0x4); pattern(0x3FFE0); i = ri16(0x67, (uint32_t)-8, 5);   /* wraps below 0 */
+    run1(i); expect_pattern("lqr wrap", 5, i);
+    fresh(0x100); setw(5, 0xA5A5A5A5u); i = ri16(0x41, 0x1234, 5);
+    run1(i); CHECK(rd32(0x48D0) == 0xA5A5A5A5u && rd32(0x48DC) == 0xA5A5A5A5u, "stqa", i);
+    fresh(0x300); setw(5, 0x5A5A5A5Au); i = ri16(0x47, (uint32_t)-2, 5);
+    run1(i); CHECK(rd32(0x2F0) == 0x5A5A5A5Au && rd32(0x2FC) == 0x5A5A5A5Au, "stqr -2", i);
+    fresh(0x100); setw(4, 0x1000); setw(3, 0x20); pattern(0x1020); i = ri7(0x1C4, 3, 4, 5);   /* lqx $5, $4, $3 */
+    run1(i); expect_pattern("lqx", 5, i);
+
+    /* Branches: pc-relative (wrapping at 256 KiB), absolute, and link. */
+    fresh(0x100); i = ri16(0x64, 3, 0);
+    run1(i); CHECK(g_ctx.pc == 0x10C, "br +3", i);
+    fresh(0x100); i = ri16(0x64, (uint32_t)-4, 0);
+    run1(i); CHECK(g_ctx.pc == 0xF0, "br -4", i);
+    fresh(0x4); i = ri16(0x64, (uint32_t)-2, 0);
+    run1(i); CHECK(g_ctx.pc == 0x3FFFC, "br wraps", i);
+    fresh(0x100); i = ri16(0x66, 0x40, 7);   /* brsl $7 */
+    run1(i); CHECK(g_ctx.pc == 0x200 && W(7, 0) == 0x104, "brsl", i);
+    fresh(0x100); i = ri16(0x60, 0x1234, 0);
+    run1(i); CHECK(g_ctx.pc == 0x48D0, "bra", i);
+    fresh(0x100); i = ri16(0x60, (uint32_t)-2, 0);
+    run1(i); CHECK(g_ctx.pc == 0x3FFF8, "bra -2", i);
+    fresh(0x100); i = ri16(0x62, 0x1234, 7);   /* brasl $7 */
+    run1(i); CHECK(g_ctx.pc == 0x48D0 && W(7, 0) == 0x104, "brasl", i);
+    fresh(0x100); setw(6, 1); i = ri16(0x42, 5, 6);   /* brnz taken */
+    run1(i); CHECK(g_ctx.pc == 0x114, "brnz taken", i);
+    fresh(0x100); setw(6, 0); i = ri16(0x42, 5, 6);
+    run1(i); CHECK(g_ctx.pc == 0x104, "brnz not taken", i);
+    fresh(0x100); setw(6, 0); i = ri16(0x40, 5, 6);   /* brz taken */
+    run1(i); CHECK(g_ctx.pc == 0x114, "brz taken", i);
+
+    /* RI8: unsigned scale, above 127. 3 / 2^(155-154) = 1.5; 3.0 * 2^(173-173) = 3. */
+    fresh(0x100); setw(4, 3); i = ri8(0x1DA, 154, 4, 5);
+    run1(i); all_lanes("csflt 154", 5, 0x3FC00000u, i);
+    fresh(0x100); setw(4, 0x40400000u); i = ri8(0x1D8, 173, 4, 5);
+    run1(i); all_lanes("cflts 173", 5, 3, i);
+
+    /* RI7: the field sits where an RR's rb does. cbd inserts 0x03 at byte (ra + i7) & 15. */
+    fresh(0x100); setw(4, 0x100); i = ri7(0x1F4, 0x7B, 4, 5);
+    run1(i); CHECK(W(5, 0) == 0x10111213u && W(5, 1) == 0x14151617u && W(5, 2) == 0x18191A03u &&
+                   W(5, 3) == 0x1C1D1E1Fu, "cbd", i);
+    fresh(0x100); setw(4, 0x80000001u); i = ri7(0x078, 0x23, 4, 5);   /* roti by 35 & 31 = 3 */
+    run1(i); all_lanes("roti", 5, 0x0Cu, i);
+
+    /* stop: the 14-bit code, and stopd, which has none. */
+    fresh(0x100); i = 0x2ABC;
+    CHECK(run1(i) == 1 && g_ctx.stop_code == 0x2ABC && g_ctx.pc == 0x104 &&
+          g_ctx.status == SPU_STATUS_STOPPED_BY_STOP, "stop", i);
+    fresh(0x100); i = 0x140u << 21;
+    CHECK(run1(i) == 1 && g_ctx.stop_code == 0x3FFF && g_ctx.pc == 0x104, "stopd", i);
+
+    /* A halt with an immediate: the immediate is signed 10 bits, and the halt
+     * leaves pc at the instruction. */
+    fresh(0x100); setw(4, 0xFFFFFFFFu); i = ri10(0x7F, 0x3FF, 4, 0);   /* heqi $4, -1 */
+    CHECK(run1(i) == 1 && g_ctx.stop_code == 0x1000 && g_ctx.pc == 0x100 &&
+          g_ctx.status == SPU_STATUS_STOPPED_BY_HALT, "heqi -1", i);
+
+    /* RRR: the destination is the high field; the third source is the low one. */
+    fresh(0x100); setw(6, 0xFF00FF00u); setw(7, 0x0F0F0F0Fu); setw(8, 0xFFFF0000u);
+    i = rrr(0x8, 9, 6, 7, 8);   /* selb: dest field 9, rb=6, ra=7, third source 8 */
+    run1(i); all_lanes("selb", 9, (0xFF00FF00u & 0xFFFF0000u) | (0x0F0F0F0Fu & ~0xFFFF0000u), i);
 }
 
 int main(void) {
@@ -186,7 +326,9 @@ int main(void) {
         CHECK(d.op == SPU_word && d.imm == 0 && d.tgt == 0, "invalid word", i);
     }
 
+    test_handler_operands();
+
     if (failures) { fprintf(stderr, "%d failure(s)\n", failures); return 1; }
-    printf("spu_decode1: all contract checks passed\n");
+    printf("spu_decode1: all contract checks passed; handler operand checks passed\n");
     return 0;
 }

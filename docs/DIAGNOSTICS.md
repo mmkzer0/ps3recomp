@@ -1200,7 +1200,7 @@ requires the opt-in `spu.dma_repeat_stop_secs` (default 0 = never stop); see
 - **`SPU_ATOM_FULL`** — _(no description in source)_
   `runtime/spu/spu_channels.c:366`
 - **`SPU_CALLTRACE`** — _(no description in source)_
-  `runtime/spu/spu_interp.c:329`
+  `runtime/spu/spu_interp.c:450`
 - **`SPU_CHHIST`** — SPU_CHHIST=1: which channels a job actually touches, and how often. A worker that never issues an MFC command is either not being handed its work descriptor or is waiting on a channel we never satisfy; the channel mix distinguishes those. */
   `runtime/spu/spu_channels.c:564`  _(+2 more sites)_
 - **`SPU_CH_BLOCK`** — _(no description in source)_
@@ -1267,10 +1267,10 @@ requires the opt-in `spu.dma_repeat_stop_secs` (default 0 = never stop); see
   `runtime/ppu/ppu_sysprx.cpp:701`
 - **`SPU_IMG_DUMP`** — _(no description in source)_
   `runtime/syscalls/lv2_register.c:573`
-- **`SPU_INTERP_OPSTATS`** — SPU_INTERP_OPSTATS=<seconds>: instructions the SPU interpreter executed per op, printed to stderr every `<seconds>` as `[spu-ops] total=<N> <op>=<count> ...`: ops with a nonzero count only, busiest first, mnemonics from `spu_op_name[]`, cumulative since the first counted instruction. It says which execute handlers of the one big `spu_step` switch are hot, which a profile of that function cannot. Counters are thread-local and folded into process-wide totals every 4096 instructions and when an interpreter run returns, so counting adds no cross-core traffic per instruction; a thread that is mid-run holds up to 4095 instructions not yet in a printed line. One thread, elected by compare-exchange on the last-print time, prints. Read once per interpreting thread; unset or 0, the hot loop pays no branch beyond the one `SPU_INTERP_STATS` already takes. Counting is diagnostic overhead: every run return pays a fold.
-  `runtime/spu/spu_interp.c:615`
+- **`SPU_INTERP_OPSTATS`** — SPU_INTERP_OPSTATS=<seconds>: instructions the SPU interpreter executed per op, printed to stderr every `<seconds>` as `[spu-ops] total=<N> <op>=<count> ...`: ops with a nonzero count only, busiest first, mnemonics from `spu_op_name[]`, cumulative since the first counted instruction. It says which execute handlers of the one big `spu_exec` switch are hot, which a profile of that function cannot. Counters are thread-local and folded into process-wide totals every 4096 instructions and when an interpreter run returns, so counting adds no cross-core traffic per instruction; a thread that is mid-run holds up to 4095 instructions not yet in a printed line. One thread, elected by compare-exchange on the last-print time, prints. Read once per interpreting thread; unset or 0, the hot loop pays no branch beyond the one `SPU_INTERP_STATS` already takes. Counting is diagnostic overhead: every run return pays a fold.
+  `runtime/spu/spu_interp.c:697`
 - **`SPU_INTERP_STATS`** — _(no description in source)_
-  `runtime/spu/spu_interp.c:447`
+  `runtime/spu/spu_interp.c:511`
 - **`SPU_INTERP_UNLIFTED`** — _(no description in source)_
   `runtime/spu/spu_channels.c:1767`
 - **`SPU_IRQWAIT_DIAG`** — SPU_IRQWAIT_DIAG: when an SPU waits on its interrupt mailbox far too long, name the event it is waiting for on stderr.
@@ -1368,7 +1368,7 @@ requires the opt-in `spu.dma_repeat_stop_secs` (default 0 = never stop); see
 - **`SPU_STACKEA_WATCH`** — SPU job a completion-word EA (param[4]) that lives on the PPU stack (0xD00Cxxxx = VM_STACK_BASE region); the job must DMA a nonzero word there on completion. This catches (a) any DMA whose EA targets the stack region -- a completion-write attempt -- and (b) any GET payload carrying a 0xD00Cxxxx dword -- the completion EA arriving in a loaded job buffer. Answers whether the EA ever reaches / is ever written by the SPU. */
   `runtime/spu/spu_dma.h:412`  _(+1 more sites)_
 - **`SPU_STEPCAP`** — _(no description in source)_
-  `runtime/spu/spu_interp.c:345`
+  `runtime/spu/spu_interp.c:694`
 - **`SPU_STEPTRACE`** — _(no description in source)_
   `runtime/spu/spu_drain.c:81`
 - **`SPU_STEPTRACE_FROM`** — _(no description in source)_
@@ -1654,7 +1654,7 @@ requires the opt-in `spu.dma_repeat_stop_secs` (default 0 = never stop); see
 - **`YDKJ_CRI_EXIT_HALT`** — _(no description in source)_
   `runtime/spu/spu_channels.c:1298`  _(+1 more sites)_
 - **`YDKJ_CRI_GATE1TRACE`** — YDKJ_CRI_GATE1TRACE=N: cri decode task busy-spins in the validator func_00026E80 (LS 0x26E80..0x26F14), a straight-line leaf that returns r3 = 0 / 0x8041090F / 0x80410909. Hand-decoding its selb/fsm/gb/ceqh lanes proved unreliable, so log the ACTUAL runtime result + inputs the first N times it returns. Fires on range-exit (pc left the fn), when r3 and the leaf's non-restored intermediates are still live. */
-  `runtime/spu/spu_interp.c:351`
+  `runtime/spu/spu_interp.c:695`
 - **`YDKJ_CRI_RESUME`** — so it polls the (concurrently PPU-updated) eaContext, finds no work, yields and exits before the PPU marks work-ready. Approximate the resume by re-running the task (fresh context re-read from eaContext) in a bounded loop until it actually DECODES (a >256B video GET sets g_cri_video_dma) or we time out. This does NOT fake data: the task only decodes if the PPU genuinely populated real work meanwhile. */
   `runtime/spu/spu_workload.c:648`
 - **`YDKJ_CRI_TASKSET`** — (image 22) calls the SPURS task-API via a jump table at LS 0x2700 and reads its task descriptor at LS 0x2FB0 — both POLICY-provided, not in the task ELF (so it branch-to-0's at func_00026DE0). Preload the policy module (libsre @0x30021480 -> LS 0xA00) and write the task descriptor {0xFFFFFFFF, 0x400, 0x2700, 0x3000} at 0x2FB0, then run the cri task, to see how much further it gets. Diagnostic only. */
@@ -1740,7 +1740,7 @@ requires the opt-in `spu.dma_repeat_stop_secs` (default 0 = never stop); see
 - **`YDKJ_SPU_LSDUMP`** — State-diff oracle: dump full LS + all GPRs at the branch-to-0 so it can be compared byte-for-byte against the RPCS3 savestate LS of the same (cri_mpv) task. Path from YDKJ_SPU_LSDUMP, else ./recomp_spu_ls.bin. */
   `runtime/spu/spu_channels.c:2093`
 - **`YDKJ_SPU_TRACE`** — YDKJ_SPU_TRACE=N: log the last N PCs into a ring buffer and dump them when the interp halts -- shows the path to a branch-to-0 (the cri task/policy wall). */
-  `runtime/spu/spu_interp.c:344`
+  `runtime/spu/spu_interp.c:693`
 - **`YDKJ_STOP_HALT`** — _(no description in source)_
   `runtime/spu/spu_channels.c:137`
 - **`YDKJ_SYNCLOG`** — _(no description in source)_
