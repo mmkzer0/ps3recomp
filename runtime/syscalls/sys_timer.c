@@ -16,6 +16,9 @@
 #include "ps3emu/log_first.h"
 #ifdef __APPLE__
 #include <mach/mach_time.h>
+#include <errno.h>
+#include <stdatomic.h>
+#include <sys/event.h>
 #endif
 #include "ps3emu/thread_name.h"
 
@@ -86,15 +89,21 @@ uint64_t ppu_timebase_now(void)
 uint64_t host_monotonic_ns(void)
 {
 #ifdef __APPLE__
-    static uint32_t numer, denom;
-    if (!denom) {                       /* benign race: same values either way */
+    /* sys_timer_usleep's precise path reads this clock on every guest thread, so the lazy init is atomic: the
+     * values are the same whoever stores them, but a plain store racing a plain load is a data race. */
+    static _Atomic uint32_t numer, denom;
+    uint32_t d = atomic_load_explicit(&denom, memory_order_acquire);
+    uint32_t n = atomic_load_explicit(&numer, memory_order_relaxed);
+    if (!d) {
         mach_timebase_info_data_t tb;
         mach_timebase_info(&tb);
-        numer = tb.numer; denom = tb.denom;
+        n = tb.numer; d = tb.denom;
+        atomic_store_explicit(&numer, n, memory_order_relaxed);
+        atomic_store_explicit(&denom, d, memory_order_release);
     }
     const uint64_t t = mach_absolute_time();
     /* Split so t * numer cannot overflow (numer is 125 on Apple silicon). */
-    return (t / denom) * numer + (t % denom) * numer / denom;
+    return (t / d) * n + (t % d) * n / d;
 #else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -128,6 +137,106 @@ static void write_be64(uint32_t addr, uint64_t val)
 #endif
     *p = val;
 }
+
+#ifdef __APPLE__
+/* ---------------------------------------------------------------------------
+ * Precise usleep on macOS (ppu.precise_usleep)
+ *
+ * nanosleep, mach_wait_until and an ordinary kevent timer are all coalesced by
+ * the kernel, which lets a timer fire late by a fraction of its length: a
+ * quarter of the request up to a cap of 4-5 ms (p50 on an M4 Pro, macOS 27:
+ * 29 us at 100 us, 0.51 ms at 2 ms, 2.5 ms at 10 ms, 4.0 ms at 16 ms). The
+ * console's usleep is accurate, so a guest that paces itself with
+ * usleep(period - elapsed) misses its deadline by the leeway. A kevent
+ * EVFILT_TIMER with NOTE_CRITICAL is exempt from the coalescing: p50 overshoot
+ * 20-50 us from 0.1 to 33 ms (scratch/m4/usleep/MEASURE.md in the recon tree).
+ *
+ * It is used instead of putting the thread into THREAD_TIME_CONSTRAINT_POLICY
+ * for the length of the sleep, which is equally accurate but not reversible:
+ * thread_policy_set(TIME_CONSTRAINT) drops the thread's QoS class (0x21 ->
+ * 0x00), THREAD_STANDARD_POLICY does not bring it back, and
+ * pthread_set_qos_class_self_np then fails with EPERM for the rest of the
+ * thread's life. NOTE_CRITICAL changes no thread state, so there is nothing to
+ * restore (the QoS class and sched priority win32_compat.c's SetThreadPriority
+ * set stay as they were).
+ *
+ * The kqueue is created and closed inside the call: no per-thread state, so no
+ * fd to leak when a guest thread ends and nothing stale in a forked child. It
+ * costs 2 extra syscalls, ~0.45 us in all against a sleep of at least 20 us.
+ *
+ * Below USLEEP_PRECISE_MIN_US nanosleep keeps the sleep: at 20 us the two are
+ * within 4 us of each other (7 us over against 3.6 us), and at 1 us the kevent
+ * timer is the slower (15 us over against 1.9 us).
+ *
+ * Windows (waitable timer, QPC busy tail) and Linux (nanosleep with the 50 us
+ * default timerslack) keep their paths.
+ * -----------------------------------------------------------------------*/
+enum { USLEEP_PRECISE_MIN_US = 20 };
+/* NOTE_NSECONDS carries the interval in an intptr_t. */
+#define USLEEP_PRECISE_MAX_US ((uint64_t)INT64_MAX / 1000u)
+
+static _Atomic uint64_t s_precise_usleeps;
+
+uint64_t sys_timer_usleep_precise_count(void)
+{
+    return atomic_load_explicit(&s_precise_usleeps, memory_order_relaxed);
+}
+
+static int precise_usleep_enabled(void)
+{
+    /* The typed configuration is immutable once loaded: every thread stores
+     * the same value. */
+    static atomic_int cached;
+    int value = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (!value) {
+        value = ps3_cfg_ppu_precise_usleep() ? 2 : 1;
+        atomic_store_explicit(&cached, value, memory_order_relaxed);
+    }
+    return value == 2;
+}
+
+/* A host aid, not guest-visible behaviour: a failure must not stop the title,
+ * and must not be silent. The call that failed sleeps the rest of its time with
+ * nanosleep, and the first failure of the process says so. */
+static void precise_usleep_failed(const char* what, int err)
+{
+    static _Atomic int warned;
+    if (atomic_exchange_explicit(&warned, 1, memory_order_relaxed)) return;
+    fprintf(stderr, "[usleep] precise-usleep-fallback: %s failed (errno %d: %s); sleeping with nanosleep "
+                    "instead, which oversleeps by the host's timer leeway. Later failures are not reported "
+                    "(ppu.precise_usleep=false selects nanosleep on purpose).\n",
+            what, err, strerror(err));
+}
+
+/* Sleeps `ns` on a critical timer. Returns the nanoseconds still to sleep: 0
+ * once the deadline taken at entry has passed, `ns` or less when the host
+ * would not give a timer (the caller finishes with nanosleep). */
+static uint64_t sleep_critical_timer(uint64_t ns)
+{
+    const uint64_t deadline = host_monotonic_ns() + ns;
+    const int kq = kqueue();
+    if (kq < 0) { precise_usleep_failed("kqueue", errno); return ns; }
+    uint64_t left = ns;
+    for (;;) {
+        struct kevent change, fired;
+        EV_SET(&change, 1, EVFILT_TIMER, EV_ADD | EV_ONESHOT, NOTE_NSECONDS | NOTE_CRITICAL, (intptr_t)left, NULL);
+        const int n = kevent(kq, &change, 1, &fired, 1, NULL);
+        if (n == 1 && !(fired.flags & EV_ERROR)) { left = 0; break; }
+        const int err = n == 1 ? (int)fired.data : errno;
+        /* A signal ends the wait early; the sleep runs to the deadline, as the
+         * absolute-deadline contract of the other hosts' paths does. */
+        const uint64_t now = host_monotonic_ns();
+        left = now >= deadline ? 0 : deadline - now;
+        if (n < 0 && err == EINTR && left) continue;
+        if (left) precise_usleep_failed("kevent", err);
+        break;
+    }
+    close(kq);
+    return left;
+}
+#else
+uint64_t sys_timer_usleep_precise_count(void) { return 0; }
+#endif /* __APPLE__ */
 
 /* ---------------------------------------------------------------------------
  * sys_timer_usleep
@@ -280,6 +389,17 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         struct timespec ts;
         ts.tv_sec  = (time_t)(usec / 1000000);
         ts.tv_nsec = (long)((usec % 1000000) * 1000);
+#ifdef __APPLE__
+        if (usec >= USLEEP_PRECISE_MIN_US && usec <= USLEEP_PRECISE_MAX_US && precise_usleep_enabled()) {
+            const uint64_t left = sleep_critical_timer(usec * 1000u);
+            if (!left) {
+                atomic_fetch_add_explicit(&s_precise_usleeps, 1, memory_order_relaxed);
+                return CELL_OK;
+            }
+            ts.tv_sec  = (time_t)(left / 1000000000u);
+            ts.tv_nsec = (long)(left % 1000000000u);
+        }
+#endif
         nanosleep(&ts, NULL);
     }
 #endif

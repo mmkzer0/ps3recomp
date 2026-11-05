@@ -175,3 +175,51 @@ if(NOT WIN32 AND TARGET ps3recomp_runtime)
         message(WARNING "lv2conf: ${LV2CONF_DIR}/conf.h not found; lv2conf_conformance not registered")
     endif()
 endif()
+
+# sys_timer_usleep's precise path (ppu.precise_usleep, macOS): thread state unchanged by a sleep, which path a
+# sleep took, the refused-timer fallback, no fd left behind, and 16 threads sleeping at once. It links the runtime
+# for the real handler, SetThreadPriority and the typed config. The runs name what they expect of the option; the
+# "on" runs leave it unset so a changed default fails them, the "off" runs set it.
+#
+# t0 holds no timing threshold (a sleep is only checked to last at least as long as asked). `timing` measures and
+# is stress tier; `concurrent` is 10 s of 16 threads, the TSan run for the path.
+if(NOT WIN32 AND TARGET ps3recomp_runtime)
+    add_executable(test_usleep_precise
+        test_usleep_precise.c
+        "${PS3RECOMP_ROOT}/runtime/host/host_stubs.c"
+    )
+    target_include_directories(test_usleep_precise PRIVATE
+        "${PS3RECOMP_ROOT}/runtime/syscalls"
+        "${PS3RECOMP_ROOT}/runtime"
+        "${PS3RECOMP_ROOT}/runtime/ppu"
+        "${PS3RECOMP_ROOT}/include"
+    )
+    target_compile_options(test_usleep_precise PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    target_link_libraries(test_usleep_precise PRIVATE ps3recomp_runtime)
+    # The runtime carries C++, so the C++ driver does the final link.
+    set_target_properties(test_usleep_precise PROPERTIES LINKER_LANGUAGE CXX)
+
+    foreach(_mode on off)
+        foreach(_case state fds fallback)
+            add_test(NAME usleep_precise_${_case}_${_mode}
+                     COMMAND test_usleep_precise ${_case} ${_mode})
+            set_tests_properties(usleep_precise_${_case}_${_mode} PROPERTIES
+                LABELS "runtime;syscalls;t0;tsan"
+                TIMEOUT 60)
+        endforeach()
+        add_test(NAME usleep_precise_concurrent_${_mode}
+                 COMMAND test_usleep_precise concurrent ${_mode} 10)
+        set_tests_properties(usleep_precise_concurrent_${_mode} PROPERTIES
+            LABELS "runtime;syscalls;stress;tsan"
+            TIMEOUT 120)
+        add_test(NAME usleep_precise_timing_${_mode}
+                 COMMAND test_usleep_precise timing ${_mode} 200)
+        set_tests_properties(usleep_precise_timing_${_mode} PROPERTIES
+            LABELS "runtime;syscalls;stress"
+            TIMEOUT 120)
+    endforeach()
+    foreach(_t IN ITEMS state fds fallback concurrent timing)
+        set_tests_properties(usleep_precise_${_t}_off PROPERTIES
+            ENVIRONMENT "PS3RECOMP_PPU_PRECISE_USLEEP=0")
+    endforeach()
+endif()

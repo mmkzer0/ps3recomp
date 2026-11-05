@@ -78,6 +78,7 @@ def test_defaults_without_file_or_environment():
         "ppu.vscr_nj": ("true", "default"),
         "ppu.opd_swap_fixup": ("false", "default"),
         "ppu.null_page": ('"stop"', "default"),
+        "ppu.precise_usleep": ("true", "default"),
         "spu.dma_repeat_limit": ("256", "default"),
         "spu.dma_repeat_stop_secs": ("0", "default"),
         "spu.mfc_lookup_cache": ("true", "default"),
@@ -172,6 +173,7 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
             "ppu.vscr_nj": f"file:{c.path}",
             "ppu.opd_swap_fixup": "default",
             "ppu.null_page": "default",
+            "ppu.precise_usleep": "default",
             "spu.dma_repeat_limit": "default",
             "spu.dma_repeat_stop_secs": "default",
             "spu.mfc_lookup_cache": "default",
@@ -195,7 +197,8 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
         if tomllib:
             doc = tomllib.loads(p.stdout)
             assert doc == {"schema": 1,
-                           "ppu": {"vscr_nj": False, "opd_swap_fixup": False, "null_page": "stop"},
+                           "ppu": {"vscr_nj": False, "opd_swap_fixup": False, "null_page": "stop",
+                                   "precise_usleep": True},
                            "spu": {"dma_repeat_limit": 256, "dma_repeat_stop_secs": 0,
                                    "mfc_lookup_cache": True},
                            "gcm": {"wait_timeout_ms": 10000, "park_resync": False, "park_grace_ms": 50},
@@ -563,6 +566,21 @@ def test_opd_swap_fixup_defaults_off_and_is_read_from_file_and_environment():
         assert o["ppu.opd_swap_fixup"] == ("true", f"file:{c.path}"), o
     o = options(probe("get", PS3RECOMP_PPU_OPD_SWAP_FIXUP="1"))
     assert o["ppu.opd_swap_fixup"] == ("true", "env:PS3RECOMP_PPU_OPD_SWAP_FIXUP"), o
+
+
+# ---- ppu.precise_usleep ----------------------------------------------------------
+
+def test_precise_usleep_defaults_on_and_is_read_from_file_and_environment():
+    # On by default: the reference nanosleep path is what a file or the environment asks for.
+    with Cfg("schema = 1", "[ppu]", "precise_usleep = false") as c:
+        o = options(probe("--load", c.path, "get"))
+        assert o["ppu.precise_usleep"] == ("false", f"file:{c.path}"), o
+        o = options(probe("--load", c.path, "get", PS3RECOMP_PPU_PRECISE_USLEEP="1"))
+        assert o["ppu.precise_usleep"] == ("true", "env:PS3RECOMP_PPU_PRECISE_USLEEP"), o
+    o = options(probe("get", PS3RECOMP_PPU_PRECISE_USLEEP="0"))
+    assert o["ppu.precise_usleep"] == ("false", "env:PS3RECOMP_PPU_PRECISE_USLEEP"), o
+    f = config_invalid(probe("get", PS3RECOMP_PPU_PRECISE_USLEEP="yes"))
+    assert f["key"] == "ppu.precise_usleep", f
 
 
 # ---- ppu.vscr_nj ---------------------------------------------------------------
