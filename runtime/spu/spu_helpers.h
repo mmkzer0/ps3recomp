@@ -463,7 +463,10 @@ static inline u128 spu_selb(u128 a, u128 b, u128 c) { return spu_selb_ref(a, b, 
  *   sel & 0xC0 == 0xC0 -> 0xFF
  *   sel & 0xC0 == 0x80 -> 0x00
  *   otherwise           -> concat{a,b}[sel & 0x1F] */
-#if defined(__SSE4_1__)
+/* The scalar build switches (SPU_SCALAR_HELPERS, SPU_SCALAR_INT) must leave no pshufb/tbl in
+ * the permute either: a "scalar" run that still executed the SIMD shufb compared the SIMD
+ * path with itself. */
+#if !defined(SPU_SCALAR_HELPERS) && !defined(SPU_SCALAR_INT) && defined(__SSE4_1__)
 #include <smmintrin.h>
 /* pshufb version: one of the hottest SPU ops (~11% of GH3's FMOD mixer task
  * as the byte loop). SPU byte P lives at host byte SPU_W(P), i.e. the bytes
@@ -483,7 +486,7 @@ static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
     r = _mm_shuffle_epi8(_mm_blendv_epi8(r, special, m80), sw);
     u128 out; memcpy(&out, &r, 16); return out;
 }
-#elif defined(__ARM_NEON)
+#elif !defined(SPU_SCALAR_HELPERS) && !defined(SPU_SCALAR_INT) && defined(__ARM_NEON)
 #include <arm_neon.h>
 /* NEON version: tbl over the 32-byte {a,b} concatenation. SPU byte P lives at
  * host byte P^3 (each word's bytes reversed), so rev32 into SPU order,
@@ -503,7 +506,7 @@ static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
     u128 out; vst1q_u8(out._u8, r); return out;
 }
 #endif
-#if defined(__SSE4_1__) || defined(__ARM_NEON)
+#if !defined(SPU_SCALAR_HELPERS) && !defined(SPU_SCALAR_INT) && (defined(__SSE4_1__) || defined(__ARM_NEON))
 /* The byte loop stays as the reference (tests/test_spu_shufb.c checks both). */
 static inline u128 spu_shufb_ref(u128 a, u128 b, u128 c) {
     /* shufb is defined on SPU byte positions. Our u128 is host-native LE, so SPU

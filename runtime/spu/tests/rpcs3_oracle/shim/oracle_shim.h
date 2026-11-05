@@ -80,8 +80,10 @@ struct spu_interpreter_precise
 
 /* sse2neon's _mm_srai_epi32 macro expands its count unparenthesised (`vdupq_n_s32(-imm)`), so RPCS3's
  * `_mm_srai_epi32(a, (0 - op.i7) & 0x3f)` (ROTMAI) negates the wrong thing on arm64. x86 semantics: */
+#if defined(ARCH_ARM64)
 #undef _mm_srai_epi32
 static inline __m128i _mm_srai_epi32(__m128i a, int imm) { return (imm & ~31) ? (__m128i)vshrq_n_s32((int32x4_t)a, 31) : (__m128i)vshlq_s32((int32x4_t)a, vdupq_n_s32(-(imm & 31))); }
+#endif
 
 /* x86-layout view of the host FP exception flags (what RPCS3's precise path reads from MXCSR) */
 static inline unsigned oracle_getcsr() {

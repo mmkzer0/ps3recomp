@@ -67,6 +67,8 @@ body = body[:i] + body[j+1:]
 k = next(i for i, l in enumerate(body) if l.startswith("template <typename IT>"))
 body = body[:k]
 src = "\n".join(body)
+# x86-64 builds of RPCS3 carry an asmjit-generated SHUFB (only referenced by the dispatch ctor we skip); drop it
+src = re.sub(r"\n#if defined\(ARCH_X64\)\nconst spu_intrp_func_t optimized_shufb\b.*?\n#endif\n", "\n", src, flags=re.DOTALL)
 assert src.count("\n#if 0\n") == 1
 src = src.replace("\n#if 0\n", "\n#if 1\n")
 # LUTs + imm tables from SPUThread.cpp
