@@ -2,7 +2,9 @@
  * references (spu_*_ref) for every input: random words, ordinary floats, the
  * normal/extended-range boundaries, zeros and denormals, mixed per lane.
  * Prints a rough speed comparison too. Build on arm64, or on x86 with AVX2 (-mavx2 -mfma):
- *   cc -O2 -I.. -I../.. -I../../.. test_spu_float_neon.c -o t && ./t */
+ *   cc -O2 -I.. -I../.. -I../../.. test_spu_float_neon.c -o t && ./t
+ * Exit 77 (CTest SKIP_RETURN_CODE) when no vector float path is compiled in (no NEON/AVX2, or
+ * SPU_SCALAR_HELPERS): spu_X is then spu_X_ref and the comparison would pass against itself. */
 #include "../spu_helpers.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,9 +33,9 @@ static uint32_t rnd_float(void)
 
 int main(void)
 {
-#if !defined(__ARM_NEON) && !(defined(__AVX2__) && !defined(SPU_SCALAR_HELPERS))
-    puts("test_spu_float_neon: no NEON or AVX2, nothing to compare");
-    return 0;
+#if !((defined(__ARM_NEON) || defined(__AVX2__)) && !defined(SPU_SCALAR_HELPERS))
+    puts("SKIP: test_spu_float_neon: no vector float helpers in this build, nothing to compare");
+    return 77;
 #else
     long bad = 0;
     const long N = 4000000;

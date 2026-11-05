@@ -53,6 +53,9 @@ u128 spu_rdch(spu_context* c, uint32_t ch) { (void)c; g_ch_last = ch; g_ch_n++; 
 void spu_wrch(spu_context* c, uint32_t ch, u128 v) { (void)c; g_ch_last = ch; g_ch_n++; g_ch_val = v; }
 uint32_t spu_rchcnt(spu_context* c, uint32_t ch) { (void)c; g_ch_last = ch; g_ch_n++; return g_ch_cnt; }
 int g_spu_ls_watch_n, g_spu_ls_probe, g_wws_read_probe, g_wws_code_probe, g_spu_smc_watch, g_spu_ls_dbg;
+#ifdef LIFTED_CASES_INC
+int g_spu_direct = 0; uint8_t g_spu_stack_reset_hint[1024];   /* lifted-call dispatch macros (spu_context.h): direct dispatch off */
+#endif
 spu_lifted_fn spu_lifted_lookup(const spu_context* c, uint32_t a) { (void)c;(void)a; return 0; }
 int (*g_spu_lv2_stop_hook)(spu_context*) = 0;   /* no lv2: stops end the step */
 void spu_spurs_taskset_syscall(spu_context* c) { (void)c; }
@@ -316,10 +319,13 @@ static Ref ref_exec(int op, uint32_t insn, uint32_t pc, const u128* regs, const 
     case R_FCGT: LANE4(f_of(a) > f_of(b) ? ~0u : 0); break;
     case R_FCMEQ: LANE4(fabsf(f_of(a)) == fabsf(f_of(b)) ? ~0u : 0); break;
     case R_FCMGT: LANE4(fabsf(f_of(a)) > fabsf(f_of(b)) ? ~0u : 0); break;
+    /* f_of is a raw IEEE bit-cast, so an exponent-255 word with a fraction is a NaN here. Casting it
+     * is undefined (0 or 0x80000000 or 0xFFFFFFFF by target and -march), so the reference pins it to 0:
+     * what AArch64 fcvtz* does and what the x86-64-v3 build happened to give. */
     case R_CFLTS: for (i = 0; i < 4; i++) { double v = trunc((double)f_of(W(A,i)) * ldexp(1.0, 173 - (int)i8));
-            sw(&r, i, v >= 2147483648.0 ? 0x7FFFFFFFu : v <= -2147483649.0 ? 0x80000000u : (uint32_t)(int32_t)v); } break;
+            sw(&r, i, v != v ? 0u : v >= 2147483648.0 ? 0x7FFFFFFFu : v <= -2147483649.0 ? 0x80000000u : (uint32_t)(int32_t)v); } break;
     case R_CFLTU: for (i = 0; i < 4; i++) { double v = trunc((double)f_of(W(A,i)) * ldexp(1.0, 173 - (int)i8));
-            sw(&r, i, v >= 4294967296.0 ? 0xFFFFFFFFu : v <= 0 ? 0 : (uint32_t)v); } break;
+            sw(&r, i, v != v ? 0u : v >= 4294967296.0 ? 0xFFFFFFFFu : v <= 0 ? 0 : (uint32_t)v); } break;
     case R_CSFLT: R.fuzzy = 1; for (i = 0; i < 4; i++) sw(&r, i, u_of((float)((double)(int32_t)W(A,i) * ldexp(1.0, (int)i8 - 155)))); break;
     case R_CUFLT: R.fuzzy = 1; for (i = 0; i < 4; i++) sw(&r, i, u_of((float)((double)W(A,i) * ldexp(1.0, (int)i8 - 155)))); break;
     /* double precision (IEEE nearest-even, fused FMA) */

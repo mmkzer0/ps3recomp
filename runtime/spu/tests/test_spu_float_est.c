@@ -2,7 +2,9 @@
  * to the scalar references (spu_*_ref) for every input: random words, ordinary floats, the
  * normal/extended-range boundaries, zeros and denormals, integers of every magnitude, and every
  * scale immediate. Prints a rough speed comparison too. Build on x86 with AVX2:
- *   cc -O2 -mavx2 -mfma -I../../../include -I.. test_spu_float_est.c -o t && ./t */
+ *   cc -O2 -mavx2 -mfma -I../../../include -I.. test_spu_float_est.c -o t && ./t
+ * Exit 77 (CTest SKIP_RETURN_CODE) without the AVX2 helpers: the comparison would be spu_X_ref
+ * against itself. */
 #include "../spu_helpers.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -63,8 +65,8 @@ static void report(const char* op, int imm, u128 a, u128 b, u128 got, u128 want)
 int main(void)
 {
 #if !(defined(__AVX2__) && !defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS))
-    puts("test_spu_float_est: no AVX2, nothing to compare");
-    return 0;
+    puts("SKIP: test_spu_float_est: no AVX2 helpers in this build, nothing to compare");
+    return 77;
 #else
     const long N = 2000000;
     for (long it = 0; it < N; it++) {

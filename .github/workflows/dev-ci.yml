@@ -12,7 +12,7 @@
 # Tiers come from CTest labels (CMakeLists.txt, "Tests"):
 #   - the dev, release and asan presets run `t0`;
 #   - the tsan preset runs `tsan`;
-#   - `stress` runs on request.
+#   - `stress` and `long` (the strided SPU exhaustive sweep) run on request.
 name: dev-ci
 
 on:
@@ -62,6 +62,9 @@ jobs:
       - name: Stress tier
         if: inputs.stress && matrix.preset == 'release'
         run: ctest --test-dir build/release -L '^stress$' --output-on-failure
+      - name: Long tier
+        if: inputs.stress && matrix.preset == 'release'
+        run: ctest --test-dir build/release -L '^long$' --output-on-failure
 
   tool-suites:
     name: macos-15 arm64 (tools/test_*.py)

@@ -8,17 +8,23 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 RPCS3="${RPCS3_SRC:-$HERE/../../../../rpcs3}"
 OUT="$HERE/build_diff"
 CC="${CC:-clang}"; CXX="${CXX:-clang++}"
+# Flags for the interpreter/lifter side (the thing under test): e.g. CFLAGS="-mavx2 -mfma", CFLAGS="-DSPU_SCALAR_HELPERS".
+CFLAGS="${CFLAGS:-}"
+# RPCS3's x86 simd.hpp routes float rounding through an asmjit JIT unless SSE4.1 is on; the oracle is fixed at SSE4.1.
+case "$(uname -m)" in x86_64|amd64) ORACLE_ARCH="${ORACLE_ARCH:--msse4.1}";; *) ORACLE_ARCH="${ORACLE_ARCH:-}";; esac
+# OUT may be overridden to keep several flag variants side by side (the oracle object is reused if present).
+OUT="${DIFF_OUT:-$OUT}"
 mkdir -p "$OUT"
 python3 "$HERE/rpcs3_oracle/extract.py" "$RPCS3" "$OUT/oracle_src.cpp"
-"$CXX" -std=c++20 -O2 -w -ffp-model=strict -c -I"$HERE/rpcs3_oracle/shim" -I"$HERE/rpcs3_oracle" -I"$OUT" \
+"$CXX" -std=gnu++20 -O2 -w -ffp-model=strict $ORACLE_ARCH -c -I"$HERE/rpcs3_oracle/shim" -I"$HERE/rpcs3_oracle" -I"$OUT" \
     -I"$RPCS3/rpcs3" -I"$RPCS3" -I"$RPCS3/3rdparty/asmjit/asmjit/src" "$OUT/oracle_src.cpp" -o "$OUT/oracle.o"
-"$CC" -std=gnu11 -O2 -w -I"$HERE/.." -I"$HERE/rpcs3_oracle" -I"$OUT" -c "$HERE/spu_interp_diff_test.c" -o "$OUT/diff_test.o"
+"$CC" -std=gnu11 -O2 -w $CFLAGS -I"$HERE/.." -I"$HERE/rpcs3_oracle" -I"$OUT" -c "$HERE/spu_interp_diff_test.c" -o "$OUT/diff_test.o"
 "$CXX" "$OUT/diff_test.o" "$OUT/oracle.o" -o "$OUT/spu_interp_diff_test" -lm
 echo "built $OUT/spu_interp_diff_test"
 # lifted mode: sample instruction words, lift each with tools/spu_lifter.py, compile that C into a second binary
 "$OUT/spu_interp_diff_test" --emit-cases "${CASE_SCALE:-1}" > "$OUT/cases.txt"
 python3 "$HERE/gen_lifted_cases.py" "$OUT/cases.txt" > "$OUT/lifted_cases.inc"
-"$CC" -std=gnu11 -O2 -fwrapv -w -DLIFTED_CASES_INC=\"lifted_cases.inc\" -I"$HERE/.." -I"$HERE/rpcs3_oracle" -I"$OUT" -c "$HERE/spu_interp_diff_test.c" -o "$OUT/diff_test_lifted.o"
+"$CC" -std=gnu11 -O2 -fwrapv -w $CFLAGS -DLIFTED_CASES_INC=\"lifted_cases.inc\" -I"$HERE/.." -I"$HERE/rpcs3_oracle" -I"$OUT" -c "$HERE/spu_interp_diff_test.c" -o "$OUT/diff_test_lifted.o"
 "$CXX" "$OUT/diff_test_lifted.o" "$OUT/oracle.o" -o "$OUT/spu_lifted_diff_test" -lm
 echo "built $OUT/spu_lifted_diff_test  (run with --lifted)"
 # --run: both modes. The single-precision float ops and conversions are judged

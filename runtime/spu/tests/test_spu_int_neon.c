@@ -1,6 +1,9 @@
 /* The NEON integer/permute helpers must be bit-identical to their scalar
  * references (spu_*_ref) for random operands and every shift amount. Build on
- * arm64:  cc -O2 -I.. -I../.. -I../../.. test_spu_int_neon.c -o t && ./t */
+ * arm64:  cc -O2 -I.. -I../.. -I../../.. test_spu_int_neon.c -o t && ./t
+ * Exit 77 (CTest SKIP_RETURN_CODE) where there is no NEON helper to compare: a host without
+ * NEON, or SPU_SCALAR_HELPERS/SPU_SCALAR_INT, where spu_X is spu_X_ref and every comparison
+ * would pass against itself. */
 #include "../spu_helpers.h"
 #include <stdio.h>
 
@@ -24,9 +27,9 @@ static void check(const char* op, u128 got, u128 ref, u128 a, u128 b, int imm)
 
 int main(void)
 {
-#if !defined(__ARM_NEON)
-    puts("test_spu_int_neon: no NEON, nothing to compare");
-    return 0;
+#if !defined(__ARM_NEON) || defined(SPU_SCALAR_HELPERS) || defined(SPU_SCALAR_INT)
+    puts("SKIP: test_spu_int_neon: no NEON helpers in this build, nothing to compare");
+    return 77;
 #else
     const long N = 200000;
     for (long it = 0; it < N; it++) {

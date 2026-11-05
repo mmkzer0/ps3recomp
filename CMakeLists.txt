@@ -776,6 +776,65 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME spu_lockline_wait COMMAND test_spu_lockline_wait)
         set_tests_properties(spu_lockline_wait PROPERTIES TIMEOUT 15)
 
+        # The SPU helper tests that were never in CTest (they ran only as hand-built CI
+        # steps), natively and, where the helper has a scalar form, with
+        # SPU_SCALAR_HELPERS. Exit 77 is SKIP_RETURN_CODE: a parity test whose vector
+        # path is not compiled in for this host (int_neon off arm64, float_est without
+        # AVX2, any of them under SPU_SCALAR_HELPERS) has nothing to compare and says so,
+        # where it used to print "nothing to compare" and pass.
+        # x86: spu_helpers.h's SIMD forms need -msse4.1 (integer) and -mavx2 -mfma (float);
+        # the AVX2 flags are used only where a probe binary built with them runs here, so
+        # a host without AVX2 skips instead of dying on an illegal instruction.
+        set(PS3RECOMP_SPU_TEST_ISA "")
+        if(PS3RECOMP_HAS_MSSE41)
+            list(APPEND PS3RECOMP_SPU_TEST_ISA -msse4.1)
+            include(CheckCSourceRuns)
+            set(CMAKE_REQUIRED_FLAGS "-mavx2 -mfma")
+            check_c_source_runs("#include <immintrin.h>\nint main(void){ __m256i v = _mm256_set1_epi32(1); return _mm256_extract_epi32(v, 0) != 1; }" PS3RECOMP_HOST_RUNS_AVX2)
+            unset(CMAKE_REQUIRED_FLAGS)
+            if(PS3RECOMP_HOST_RUNS_AVX2)
+                list(APPEND PS3RECOMP_SPU_TEST_ISA -mavx2 -mfma)
+            endif()
+        endif()
+        function(ps3recomp_add_spu_helper_test name source)
+            cmake_parse_arguments(A "" "" "DEFINES" ${ARGN})
+            add_executable(test_${name} runtime/spu/tests/${source})
+            target_include_directories(test_${name} PRIVATE include runtime runtime/spu)
+            # -O2: the sources size their case counts for an optimised build. No contraction:
+            # arm64 clang would fuse the float references' a*b+c and move their rounding.
+            target_compile_options(test_${name} PRIVATE -UNDEBUG -O2 -ffp-contract=off ${PS3RECOMP_SPU_TEST_ISA})
+            target_compile_definitions(test_${name} PRIVATE ${A_DEFINES})
+            target_link_libraries(test_${name} PRIVATE m)
+            add_test(NAME ${name} COMMAND test_${name})
+            set_tests_properties(${name} PROPERTIES LABELS "spu;t0" TIMEOUT 120 SKIP_RETURN_CODE 77)
+        endfunction()
+        ps3recomp_add_spu_helper_test(spu_helpers test_spu_helpers.c)
+        ps3recomp_add_spu_helper_test(spu_helpers_scalar test_spu_helpers.c DEFINES SPU_SCALAR_HELPERS)
+        ps3recomp_add_spu_helper_test(spu_shufb test_spu_shufb.c)
+        ps3recomp_add_spu_helper_test(spu_shufb_scalar test_spu_shufb.c DEFINES SPU_SCALAR_HELPERS)
+        ps3recomp_add_spu_helper_test(spu_numeric_semantics test_spu_numeric_semantics.c)
+        ps3recomp_add_spu_helper_test(spu_numeric_semantics_scalar test_spu_numeric_semantics.c DEFINES SPU_SCALAR_HELPERS)
+        ps3recomp_add_spu_helper_test(spu_int_neon test_spu_int_neon.c)
+        ps3recomp_add_spu_helper_test(spu_float_neon test_spu_float_neon.c)
+        ps3recomp_add_spu_helper_test(spu_float_est test_spu_float_est.c)
+
+        # Exhaustive cross-backend parity of the SPU helpers (runtime/spu/tests/spu_exh_gen.h):
+        # the one source built scalar (the reference), native, and native with three planted
+        # single-point bugs that the run must find. Registered below as spu_exhaustive, label
+        # `long`, with a short default stride; not part of t0.
+        foreach(variant scalar native mutant)
+            add_executable(test_spu_exhaustive_${variant} runtime/spu/tests/test_spu_exhaustive.c)
+            target_include_directories(test_spu_exhaustive_${variant} PRIVATE include runtime/spu runtime/spu/tests)
+            target_compile_options(test_spu_exhaustive_${variant} PRIVATE -O2 -ffp-contract=off
+                -Wno-unused-function -Wno-unused-variable ${PS3RECOMP_SPU_TEST_ISA})
+            target_link_libraries(test_spu_exhaustive_${variant} PRIVATE m)
+            set_target_properties(test_spu_exhaustive_${variant} PROPERTIES
+                OUTPUT_NAME test_spu_exhaustive.${variant}
+                RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/spu_exh")
+        endforeach()
+        target_compile_definitions(test_spu_exhaustive_scalar PRIVATE SPU_SCALAR_HELPERS SPU_SCALAR_INT)
+        target_compile_definitions(test_spu_exhaustive_mutant PRIVATE EXH_MUTANT)
+
     endif()
     add_executable(test_rsx_present_policy tests/test_rsx_present_policy.c)
     target_include_directories(test_rsx_present_policy PRIVATE
@@ -816,6 +875,23 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME spu_taskset_elf_flags
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_taskset_elf_flags.py")
+        # The scalar switches leave no pshufb/tbl in spu_shufb (compiled to assembly, both
+        # architectures where the compiler can target them).
+        add_test(NAME spu_scalar_no_simd
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_scalar_no_simd.py")
+        set_tests_properties(spu_scalar_no_simd PROPERTIES LABELS "spu;tools;t0" TIMEOUT 120
+            ENVIRONMENT "CC=${CMAKE_C_COMPILER}")
+        # Strided exhaustive parity sweep and its mutant self-test. Label `long`: run with
+        # `ctest -L long`. PS3RECOMP_SPU_EXH_STRIDE=1 is the full sweep (tens of minutes per build).
+        if(TARGET test_spu_exhaustive_native)
+            set(PS3RECOMP_SPU_EXH_STRIDE 16 CACHE STRING "spu_exhaustive: run every Nth block (1 = full sweep)")
+            add_test(NAME spu_exhaustive
+                COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu/tests/run_exhaustive_ctest.py"
+                    --bindir "${CMAKE_BINARY_DIR}/spu_exh" --stride ${PS3RECOMP_SPU_EXH_STRIDE})
+            set_tests_properties(spu_exhaustive PROPERTIES LABELS "spu;long" TIMEOUT 290)
+        endif()
         add_test(NAME spu_sdcrz
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_sdcrz.py")
