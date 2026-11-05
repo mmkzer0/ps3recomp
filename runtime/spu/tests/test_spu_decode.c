@@ -83,6 +83,11 @@ int main(void) {
         CHECK(d.rt == 9, "ila rt", 0);
     }
 
+    /* Hints (hbra/hbrr) are the other RI18 ops: only the low 16 bits of the
+     * 18-bit field are the immediate; the top two belong to the split ROH field. */
+    expect_imm("hbra low 16", ri18(0x08, 0x3FFFF, 3), SPU_hbra, 0xFFFF);
+    expect_imm("hbrr low 16", ri18(0x09, 0x2ABCD, 3), SPU_hbrr, 0xABCD);
+
     /* RI16 immediates: il sign-extends; ilh/ilhu/iohl/fsmbi zero-extend. */
     expect_imm("il negative", ri16(0x081, 0x8000, 4), SPU_il, -32768);
     expect_imm("il -1", ri16(0x081, 0xFFFF, 4), SPU_il, -1);
@@ -157,8 +162,10 @@ int main(void) {
     expect_imm("cwd 64 unsigned", ri7(0x1F6, 0x40, 1, 2), SPU_cwd, 64);
     expect_imm("cbd 127 unsigned", ri7(0x1F4, 0x7F, 1, 2), SPU_cbd, 127);
 
-    /* RI8: unsigned 8-bit scale. */
+    /* RI8: unsigned 8-bit scale, for all four conversions. */
     expect_imm("cflts 255", ri8(0x1D8, 0xFF, 1, 2), SPU_cflts, 255);
+    expect_imm("cfltu 255", ri8(0x1D9, 0xFF, 1, 2), SPU_cfltu, 255);
+    expect_imm("csflt 0x81", ri8(0x1DA, 0x81, 1, 2), SPU_csflt, 0x81);
     expect_imm("cuflt 0x80", ri8(0x1DB, 0x80, 1, 2), SPU_cuflt, 0x80);
 
     /* RR/LSX register forms. */
