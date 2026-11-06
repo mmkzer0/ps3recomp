@@ -65,6 +65,7 @@ connect, or a failed terminate after a supervisor end).
 | `spus=N` | SPU threads (1..6, default 6); fewer are used if the system refuses a group of that size |
 | `special_a=0\|1`, `a_ops=`, `special_b=0\|1`, `special_b_max=N`, `special_b_from=N`, `sweep=0\|1` | the two special probes and the sweep, each switchable; `special_b_from` resumes a lost probe B; `force_dpcmp=1` runs dfceq/dfcmeq/dfcgt/dfcmgt/dftsv in the sweep without probe A's acceptance |
 | `special_b_count=N`, `special_b_patterns=zero\|both` | probe B staging: stop after N words (0 = every word) and use only the zero operand pattern or both; the first B run is `special_b_count=1 special_b_patterns=zero` (one zero-pattern word) |
+| `lanes=OP:DOMAIN:BLOCK[:COUNT]` | per-lane dump of the first COUNT (default 64, max 1024) calls of a block, repeatable up to 16 times, see section 6a; set after `preset=` |
 | `stall_s` (120), `max_faults` (24), `case_timeout_ms` (2000), `b_timeout_ms` (600), `launch_timeout_ms` (10800000) | hang detection and limits. Every launch kind is bounded end to end: `case_timeout_ms`, `b_timeout_ms` and `launch_timeout_ms` must be positive (the probe rejects 0 and negatives at start-up); `stall_s >= 0` (0 = rely on the launch limit alone) |
 | `pad`, `hold_s`, `screen`, `tag`, `outdir`, `fw_version`, `fw_type`, `console_model`, `progress_file` | as the other probes (declare the console so it reaches the result header); `outdir` must stay inside `/dev_hdd0/tmp/hwprobe` |
 
@@ -198,6 +199,48 @@ Reading the three-way result:
 
 `compare_exhaustive.py` (the host harness' own tool) reads the hash rows of a result file with `--no-localise`: its reader
 takes four tab-separated fields and skips blank and `#` rows, so reduce a result file to the lines that contain a tab first.
+
+## 6a. Lanes: per-lane dumps of chosen blocks
+
+A hash says that a block differs, not how. `lanes=<op>:<domain>:<block>[:<count>]` (repeatable, at most 16 entries, `count`
+1..1024, default 64) makes the probe dump, for the first `count` generator calls of that block, the operands `a` `b` `c`, the
+immediate field value patched into the instruction word and the result register of the real instruction, as
+`LANE,<op>,<domain>,<block>,<call>,<a>,<b>,<c>,<imm>,<out>` rows (`FORMAT.md`). The op must be one the domain runs and the block
+must exist, or the configuration is rejected at start-up (`cflts@0:w32:0`: op names contain `@`, never `:`). Each entry is
+one launch on one SPU, bounded by `launch_timeout_ms` like a sweep launch (a lanes job runs for milliseconds: the config sets
+60000), with the same FATAL row when a launch cannot be contained; a faulting entry becomes a `LANES_FAULT` row and the next entry
+runs. Rows are flushed per entry. The generator, the op table, the immediate patching and the stub are the sweep's
+(`spu_main.c`: `gen_chunk`, `op_word`), so the dump sees the inputs the hashes saw. The dp compares (`dfceq` ...) follow the
+sweep's rule: only after probe A accepted them (or `force_dpcmp=1`), else a `SKIP` row. Lanes run after the special probes and
+before the sweep; `cfg/lanes_conv.cfg` runs lanes alone (`sweep=0 special_a=0 special_b=0 spus=1`) for the conversions the sweep
+found different from the toolkit: `cflts`/`cfltu` at I8 scale 0, 1, 2 on `w32` block 0 (256 calls), the scale-173 control
+(64 calls) and `fesd` on `w32e` block 0 (256 calls).
+
+Console run and comparison:
+
+```
+tools/hwprobe/build.sh spuexh layer1
+tools/hwprobe/ps3console.py run tools/hwprobe/out/spuexh_l1.fake.self --prefix spuexh --probe spuexh --run-window 60 \
+    --cfg spuexh tools/hwprobe/probes/spuexh/cfg/lanes_conv.cfg --timeout 300 --out results
+python3 tools/hwprobe/probes/spuexh/lanes_compare.py results/spuexh_r001_lanes_conv.csv \
+    --scalar-bin build/dev/spu_exh/test_spu_exhaustive.scalar --md lanes_conv.md
+```
+
+The dry run of the same configuration (the interpreter's lanes; needs the SPU ELF that `build.sh` left in `spu/`, and the host
+driver built as in `dryrun.sh`):
+
+```
+probes/spuexh/host/spuexh_host --elf probes/spuexh/spu/spuexh.elf --cfg probes/spuexh/cfg/lanes_conv.cfg --out lanes_dry.csv
+python3 tools/hwprobe/probes/spuexh/lanes_compare.py lanes_dry.csv --scalar-bin <scalar build> --only-diff
+```
+
+`lanes_compare.py` runs `<scalar-bin> --dump <op> <domain> <block> --dump-n <calls>` per group (`--dump-n` needs a harness at or
+after the commit that added it) and first checks that every dumped call has the generator's operands and immediate; a
+difference there (the generator on the SPU, or the op table, is at fault) exits 1 and makes the lanes of that group
+meaningless. Then it compares hardware with the harness' `out_fast` (the model the sweep hashes) per 32-bit lane - for `fesd`
+per 64-bit result lane, fed by input words 0 and 2 - and prints every lane (`--only-diff`: only the differing ones) with its input
+word, and per op how many lanes are equal or differ, with the differing lanes grouped by the input word's class read as an IEEE
+single (sign, exponent, fraction). Differences are the data: the exit status is 0 for them, 2 for a usage, file or format error.
 
 ## 7. Reading the special probes
 

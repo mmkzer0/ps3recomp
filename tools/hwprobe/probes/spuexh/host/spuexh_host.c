@@ -7,7 +7,7 @@
  * a difference is a defect of the SPU adapters, the generator on SPU, or the toolkit's interpreter.
  *
  *   spuexh_host --elf F [--preset P] [--set key=val]... [--cfg FILE] [--out FILE] [--no-sweep]
- *               [--special-a] [--special-b] [--plan] [--inject SPU:N]
+ *               [--special-a] [--special-b] [--plan] [--inject SPU:N]     (lanes=OP:DOM:BLOCK[:COUNT] keys: RUN.md "Lanes")
  *
  * The interpreter itself is host_interp.c (the repository's interpreter source, included there).
  */
@@ -207,7 +207,8 @@ int main(int argc, char **argv) {
         rc.dpcmp_known = 1; for (int q = 0; q < 5; q++) rc.dpcmp_ok[q] = acc[q];
     }
     if (rc.special_b) spuexh_run_special_b(&be, &rc, &sink);
-    if (rc.sweep) {
+    if (rc.nlanes && spuexh_run_lanes(&be, &rc, &sink) < 0) rcode = 1;
+    if (rc.sweep && !rcode) {
         spuexh_sweep_res_t r;
         rcode = spuexh_run_sweep(&be, &rc, &sink, &r);
         fprintf(out, "META,hashes,%llu\nMETA,jobs_done,%llu\nMETA,faults,%llu\nMETA,relaunches,%llu\nMETA,timing_overflows,%llu\nMETA,completed,%d\nMETA,aborted,%d\nMETA,wall_s,%.1f\n",

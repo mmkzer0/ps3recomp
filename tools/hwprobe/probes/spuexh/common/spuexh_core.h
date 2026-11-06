@@ -29,6 +29,8 @@ typedef struct {
     int force_dpcmp;                 /* run the DP compares in the sweep without probe A's acceptance */
     int dpcmp_known, dpcmp_ok[5];    /* result of probe A (set by the caller); the sweep skips unaccepted DP compares */
     char preset[16];
+    int nlanes;                      /* lanes= entries (see RUN.md "Lanes"): per-lane dumps of chosen (op, domain, block) triples */
+    struct { int op, dom, count; uint32_t blk; } lanes[SPUEXH_LANES_MAX_ENTRIES];   /* indexes into spuexh_ops / spuexh_dom_names */
     char ops[512], skip_ops[512], doms[256];
 } spuexh_runcfg_t;
 
@@ -107,6 +109,13 @@ int spuexh_run_special_a(spuexh_backend_t *be, const spuexh_runcfg_t *rc, const 
 /* Special probe B: decoder validity of every prefix the toolkit decodes as SPU_word (special_b_count/special_b_both
  * narrow it: the staging control for the first batches). Returns 0, 1 when the operator asked to stop, or -1 on FATAL. */
 int spuexh_run_special_b(spuexh_backend_t *be, const spuexh_runcfg_t *rc, const spuexh_sink_t *sink);
+
+/* Lanes jobs: for every lanes= entry one launch on one SPU (the supervisor's launch limit, FATAL row and META rows as
+ * everywhere) that dumps the operands, the patched immediate and the result of the first `count` generator calls of the
+ * entry's block (`LANES,...` header row, `LANE,...` rows, `LANES_DONE` or `LANES_FAULT`; FORMAT.md), flushed per entry.
+ * Returns 0, 1 when the operator asked to stop, or -1 when a launch could not be contained or no buffer could be
+ * allocated (FATAL row written). A fault costs the one entry (LANES_FAULT) and the run goes on. */
+int spuexh_run_lanes(spuexh_backend_t *be, const spuexh_runcfg_t *rc, const spuexh_sink_t *sink);
 
 /* Names of the five special-A ops, in order of the accepted[] array. */
 extern const char *const spuexh_dpcmp_names[5];

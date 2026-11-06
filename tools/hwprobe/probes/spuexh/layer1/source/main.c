@@ -137,7 +137,7 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 	spuexh_plan(&g_rc.wire, &plan);
-	snprintf(sum, sizeof(sum), "%s: %llu jobs, %llu hashes", g_rc.preset, (unsigned long long)plan.jobs, (unsigned long long)plan.hashes);
+	snprintf(sum, sizeof(sum), "%s: %llu jobs, %llu hashes, %d lanes entries", g_rc.preset, (unsigned long long)plan.jobs, (unsigned long long)plan.hashes, g_rc.nlanes);
 	hwp_ui_set_summary("%s", sum);
 	if (g_cfg.pad) {
 		hwp_ui_set_hint("Press START to run.");
@@ -203,6 +203,10 @@ int main(int argc, char *argv[])
 			hwp_ui_set_phase("special B: decoder");
 			if (spuexh_run_special_b(&spuexh_ppu_backend, &g_rc, &sink) < 0) fatal = 1;
 		}
+		if (g_rc.nlanes && !fatal && !hwp_exit_requested()) {
+			hwp_ui_set_phase("lanes");
+			if (spuexh_run_lanes(&spuexh_ppu_backend, &g_rc, &sink) < 0) fatal = 1;
+		}
 		if (g_rc.sweep && !fatal && !hwp_exit_requested()) {
 			hwp_ui_set_phase("sweep");
 			rv = spuexh_run_sweep(&spuexh_ppu_backend, &g_rc, &sink, &sr);
@@ -214,7 +218,7 @@ int main(int argc, char *argv[])
 			snprintf(sum, sizeof(sum), "hashes=%llu faults=%llu %s", (unsigned long long)sr.hashes, (unsigned long long)sr.faults,
 			         sr.completed ? "complete" : "INCOMPLETE");
 		} else {
-			snprintf(sum, sizeof(sum), fatal ? "FATAL: a launch could not be contained" : "special probes done");
+			snprintf(sum, sizeof(sum), fatal ? "FATAL: a launch could not be contained" : g_rc.nlanes ? "special probes and lanes done" : "special probes done");
 		}
 		if (fatal) {
 			rv = 1;

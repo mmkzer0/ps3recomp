@@ -18,7 +18,8 @@
  * immediate over thousands of calls). The same stub executes the special probes' words.
  *
  * MODES (spuexh_params_t.mode): MAIN sweep of the job plan; CASES a list of (word, a, b, c) with $rt recorded;
- * RAW one word with all 128 registers loaded and dumped (spuexh_rawexec_gen.S).
+ * RAW one word with all 128 registers loaded and dumped (spuexh_rawexec_gen.S); LANES the operands, patched immediate and
+ * result of the first calls of one (op, domain, block) of the sweep, through the same generator, op table and stub.
  *
  * This file is big-endian code (SPU): the wire structures are used without byte swapping.
  */
@@ -50,6 +51,7 @@ static union { spuexh_cfg_t c; uint8_t raw[512]; } CFGU __attribute__((aligned(1
 static spuexh_entry_t ENT[ENT_MAX] __attribute__((aligned(128)));
 static spuexh_case_t CASES[MAXCASES] __attribute__((aligned(128)));
 static spuexh_caseout_t CO __attribute__((aligned(128)));
+static spuexh_lane_t LB[CHUNK] __attribute__((aligned(128)));
 static vec_uint4 A[CHUNK], B[CHUNK], C[CHUNK];
 static int32_t IMM[CHUNK];
 
@@ -92,6 +94,22 @@ static inline V4 to_v4(vec_uint4 r) {
     return u.s;
 }
 
+/* The instruction word of an op with an immediate field for the call immediate `im` (the sweep and the lanes mode patch
+ * the stub with exactly this word). */
+static inline uint32_t op_word(const spuexh_op_t *op, int32_t im) {
+    return op->word | (((uint32_t)im & ((1u << op->imm_bits) - 1u)) << op->imm_shift);
+}
+
+/* The generator over calls [i, i+n) of domain d into A/B/C/IMM (the sweep and the lanes mode read the same arrays). */
+static void gen_chunk(const exh_dom *d, uint64_t i, int n, uint32_t need) {
+    G g __attribute__((aligned(16)));
+    for (int j = 0; j < n; j++) {
+        d->gen(d, i + (uint64_t)j, &g, need);
+        memcpy(&A[j], &g.a, 16); memcpy(&B[j], &g.b, 16); memcpy(&C[j], &g.c, 16);
+        IMM[j] = g.imm;
+    }
+}
+
 /* One op over a chunk of n calls; h = running block hash of this op. */
 static uint64_t op_chunk(const spuexh_op_t *op, int n, uint64_t h) {
     const stubfn_t fn = (stubfn_t)stubmem;
@@ -103,17 +121,35 @@ static uint64_t op_chunk(const spuexh_op_t *op, int n, uint64_t h) {
         for (int j = 0; j < n; j++) h = exh_fold(h, to_v4(fn(A[j], B[j], C[j])));
         return h;
     }
-    const uint32_t mask = (1u << op->imm_bits) - 1u;
     int32_t cur = 0; int have = 0;
     for (int j = 0; j < n; j++) {
         const int32_t im = op->fixed_imm >= 0 ? op->fixed_imm : IMM[j];
         if (!have || im != cur) {
-            stub_set(op->word | (((uint32_t)im & mask) << op->imm_shift), op->rt);
+            stub_set(op_word(op, im), op->rt);
             cur = im; have = 1;
         }
         h = exh_fold(h, to_v4(fn(A[j], B[j], C[j])));
     }
     return h;
+}
+
+/* One op over a chunk of n calls whose first generator call is `first`: records the operands, the patched immediate field and
+ * the result of every call in LB. The word is the sweep's (op_word); it is patched only when it changes. */
+static void op_lanes(const spuexh_op_t *op, int n, uint64_t first) {
+    const stubfn_t fn = (stubfn_t)stubmem;
+    uint32_t cur = 0; int have = 0;
+    for (int j = 0; j < n; j++) {
+        uint32_t word = op->word, im = 0;
+        if (op->imm_bits) {
+            const int32_t v = op->fixed_imm >= 0 ? op->fixed_imm : IMM[j];
+            word = op_word(op, v);
+            im = (uint32_t)v & ((1u << op->imm_bits) - 1u);
+        }
+        if (!have || word != cur) { stub_set(word, op->rt); cur = word; have = 1; }
+        const vec_uint4 r = fn(A[j], B[j], C[j]);
+        memcpy(LB[j].a, &A[j], 16); memcpy(LB[j].b, &B[j], 16); memcpy(LB[j].c, &C[j], 16); memcpy(LB[j].out, &r, 16);
+        LB[j].call = first + (uint64_t)j; LB[j].imm = im; LB[j].pad = 0;
+    }
 }
 
 /* ------------------------------------------------------------------ MAIN mode */
@@ -133,12 +169,7 @@ static void run_job(int di, uint64_t blk, const uint16_t *act, int na) {
     uint32_t dec_prev = 0xFFFFFFFFu, dec_wraps = 0;
     for (uint64_t i = lo; i < hi; i += CHUNK, chunks++) {
         const int n = (hi - i) < CHUNK ? (int)(hi - i) : CHUNK;
-        G g __attribute__((aligned(16)));
-        for (int j = 0; j < n; j++) {
-            d->gen(d, i + (uint64_t)j, &g, need);
-            memcpy(&A[j], &g.a, 16); memcpy(&B[j], &g.b, 16); memcpy(&C[j], &g.c, 16);
-            IMM[j] = g.imm;
-        }
+        gen_chunk(d, i, n, need);
         for (int q = 0; q < na; q++) h[q] = op_chunk(&spuexh_ops[act[q]], n, h[q]);
         { const uint32_t cur = spu_readch(SPU_RdDec); if (cur > dec_prev) dec_wraps++; dec_prev = cur; }
         if ((chunks & 63u) == 63u) {            /* heartbeat: lets the PPU tell a long job from a hang */
@@ -199,6 +230,34 @@ static void run_main(void) {
             if (ST.flags & 1u) return;
         }
     }
+}
+
+/* ------------------------------------------------------------------ LANES mode */
+static void run_lanes(void) {
+    exh_init();
+    if (P.lane_op >= SPUEXH_NOPS || P.lane_dom >= EXH_NDOMS || !P.lane_count || P.lane_count > SPUEXH_LANES_MAX_COUNT ||
+        P.lane_count > P.results_cap) { ST.flags |= 8u; return; }
+    const spuexh_op_t *op = &spuexh_ops[P.lane_op];
+    const exh_dom *d = &exh_doms[P.lane_dom];
+    const uint64_t lo = (uint64_t)P.lane_blk << EXH_BLOCK_LOG2;
+    if (lo >= d->ncalls) { ST.flags |= 8u; return; }
+    uint64_t hi = lo + P.lane_count;                 /* count <= 1024 < one block: the block's end needs no clip */
+    if (hi > d->ncalls) hi = d->ncalls;
+    ST.last_dom = P.lane_dom; ST.last_blk = P.lane_blk; ST.jobs_started = 1;
+    status_put();
+    uint32_t done = 0;
+    for (uint64_t i = lo; i < hi; i += CHUNK) {
+        const int n = (hi - i) < CHUNK ? (int)(hi - i) : CHUNK;
+        gen_chunk(d, i, n, op->need);
+        dma_wait();                                  /* the previous records are in main memory: LB is free */
+        op_lanes(op, n, i);
+        dma_put(LB, P.results_ea + (uint64_t)done * sizeof(spuexh_lane_t), (uint32_t)n * (uint32_t)sizeof(spuexh_lane_t), 0);
+        dma_wait();
+        done += (uint32_t)n;
+        ST.entries = done;
+        status_put();                                /* fenced after the records: a fault leaves exactly `entries` valid records */
+    }
+    ST.jobs_done = 1;
 }
 
 /* ------------------------------------------------------------------ CASES mode (special probe A) */
@@ -294,6 +353,7 @@ int main(uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4) {
     case SPUEXH_MODE_MAIN: run_main(); break;
     case SPUEXH_MODE_CASES: run_cases(); break;
     case SPUEXH_MODE_RAW: run_raw(); break;
+    case SPUEXH_MODE_LANES: run_lanes(); break;
     default: ST.flags |= 4u; break;
     }
     { const vec_uint4 f = spu_mffpscr(); memcpy(ST.fpscr_end, &f, 16); }

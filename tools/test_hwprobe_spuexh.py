@@ -28,6 +28,7 @@ sys.path.insert(0, os.path.join(TOOLS, "hwprobe"))
 import compare_spuexh as cmp
 import gen_tables as gt
 import hwprobe_format
+import lanes_compare
 
 _TMP = None
 
@@ -354,6 +355,151 @@ class TestCompare(unittest.TestCase):
         self.assertIn("resume a lost run with special_b_from=2", text)
 
 
+# ------------------------------------------------------------------------------------------------ lanes
+_SCALAR_BIN = []
+
+
+def scalar_bin():
+    """The host harness' scalar build (test_spu_exhaustive, the reference build of run_exhaustive.sh), built once with cc."""
+    if not _SCALAR_BIN:
+        out = os.path.join(_TMP, "test_spu_exhaustive.scalar")
+        subprocess.run(["cc", "-std=gnu11", "-O2", "-w", "-I", os.path.join(REPO, "runtime/spu"), "-I", os.path.join(REPO, "include"),
+                        "-DSPU_SCALAR_HELPERS", "-DSPU_SCALAR_INT", os.path.join(REPO, "runtime/spu/tests/test_spu_exhaustive.c"),
+                        "-lm", "-o", out], check=True, capture_output=True)
+        _SCALAR_BIN.append(out)
+    return _SCALAR_BIN[0]
+
+
+def run_lanes_compare(path, *extra):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = lanes_compare.main([path, "--scalar-bin", scalar_bin()] + list(extra))
+    return rc, out.getvalue() + err.getvalue()
+
+
+def synth_lanes(op, dom, blk, n, imm_bits, edit=None):
+    """A lanes result file whose hardware lanes are the harness' own model (so everything is equal), written from `--dump`.
+    edit(rows) may change the rows (a list of [call, a, b, c, imm, out]) before they are written."""
+    p = subprocess.run([scalar_bin(), "--dump", op, dom, str(blk), "--dump-n", str(n)], check=True, capture_output=True, text=True)
+    rows = []
+    for line in p.stdout.splitlines():
+        f = line.split()
+        imm = int(f[4]) & ((1 << imm_bits) - 1) if imm_bits else None
+        rows.append([int(f[0]), f[1], f[2], f[3], imm, f[5]])
+    if edit:
+        edit(rows)
+    lines = HDR + [f"LANES,{op},{dom},{blk},{n},{imm_bits}"]
+    for call, a, b, c, imm, out in rows:
+        lines.append(f"LANE,{op},{dom},{blk},{call},{a},{b},{c},{'-' if imm is None else imm},{out}")
+    lines.append(f"LANES_DONE,{op},{dom},{blk},{len(rows)}")
+    return write(lines)
+
+
+@unittest.skipUnless(shutil.which("cc"), "needs cc (it builds the host harness' scalar reference)")
+class TestLanesCompare(unittest.TestCase):
+    def test_lanes_equal_to_the_model_pass(self):
+        rc, text = run_lanes_compare(synth_lanes("cflts@2", "w32", 0, 16, 8))
+        self.assertEqual(rc, 0, text)
+        self.assertIn("lanes 64", text)
+        self.assertIn("equal 64    differ 0", text)
+        self.assertIn("generator check OK", text)
+
+    def test_a_differing_result_is_data_not_an_error(self):
+
+        def edit(rows):
+            rows[3][5] = rows[3][5][:8] + "deadbeef" + rows[3][5][16:]       # word 1 of call 3
+
+        rc, text = run_lanes_compare(synth_lanes("cflts@2", "w32", 0, 16, 8, edit), "--only-diff")
+        self.assertEqual(rc, 0, text)
+        self.assertIn("63 equal, 1 differ", text)
+        self.assertIn("call 3 lane 1:", text)
+        self.assertIn("hw=deadbeef", text)
+        diff_lines = [ln for ln in text.splitlines() if ln.endswith(" !=")]
+        self.assertEqual(len(diff_lines), 1)
+        self.assertFalse([ln for ln in text.splitlines() if ln.endswith(" ==")])          # --only-diff
+        rc, text = run_lanes_compare(synth_lanes("cflts@2", "w32", 0, 16, 8, edit))
+        self.assertTrue([ln for ln in text.splitlines() if ln.endswith(" ==")])
+
+    def test_the_differing_lane_is_classified_by_its_input_word(self):
+        sc = subprocess.run([scalar_bin(), "--dump", "cflts@2", "w32", "0", "--dump-n", "16"], check=True, capture_output=True, text=True)
+        a = sc.stdout.splitlines()[5].split()[1]
+        inw = int(a[16:24], 16)                                              # word 2 of call 5
+        sign, ec, fc = lanes_compare.classify(inw)
+
+        def edit(rows):
+            rows[5][5] = rows[5][5][:16] + "deadbeef" + rows[5][5][24:]
+
+        rc, text = run_lanes_compare(synth_lanes("cflts@2", "w32", 0, 16, 8, edit))
+        self.assertEqual(rc, 0, text)
+        self.assertIn(f"{sign} {ec} frac={fc}: 1 / ", text)
+        self.assertIn(f"call 5 lane 2: in={inw:08x}", text)
+
+    def test_fesd_lanes_are_doublewords_fed_by_the_even_words(self):
+
+        def edit(rows):
+            w = rows[2][5]
+            rows[2][5] = w[:31] + ("1" if w[31] == "0" else "0")          # the last word: the second doubleword
+
+        rc, text = run_lanes_compare(synth_lanes("fesd", "w32e", 0, 8, 0, edit), "--only-diff")
+        self.assertEqual(rc, 0, text)
+        self.assertIn("16 lanes: 15 equal, 1 differ", text)                  # 2 doubleword lanes per call
+        self.assertIn("call 2 lane 1:", text)
+
+    def test_a_wrong_call_index_or_operand_or_immediate_fails_the_generator_check(self):
+
+        def shifted(rows):
+            for r in rows:
+                r[0] += 1
+
+        def operand(rows):
+            rows[4][1] = "0" * 32
+
+        def imm(rows):
+            rows[1][4] = 3
+
+        for name, edit in (("call", shifted), ("operand", operand), ("imm", imm)):
+            rc, text = run_lanes_compare(synth_lanes("cflts@2", "w32", 0, 16, 8, edit))
+            self.assertEqual(rc, 1, (name, text))
+            self.assertIn("GENERATOR MISMATCH", text)
+            self.assertIn("generator check FAILED", text)
+        rc, text = run_lanes_compare(synth_lanes("cflts@2", "w32", 0, 16, 8))
+        self.assertEqual(rc, 0, text)
+
+    def test_a_signed_immediate_is_compared_as_the_patched_field(self):
+        f = lanes_compare._imm_equal
+        self.assertTrue(f(1023, -1, 10))                                      # ai: -1 in a 10-bit field
+        self.assertTrue(f(0, -1024, 10))
+        self.assertTrue(f(173, 173, 8))
+        self.assertFalse(f(172, 173, 8))
+        self.assertFalse(f(1022, -1, 10))
+        self.assertTrue(f(None, 5, 0))                                        # no field, nothing patched
+
+    def test_classes_of_a_single(self):
+        c = lanes_compare.classify
+        self.assertEqual(c(0x00000000), ("+", "zero", "0"))
+        self.assertEqual(c(0x80000001), ("-", "denormal", "other"))
+        self.assertEqual(c(0x3F800000), ("+", "2^0", "0"))
+        self.assertEqual(c(0xC2FFFFFF), ("-", "2^6", "all-ones"))
+        self.assertEqual(c(0x7FFFFFFF), ("+", "nan", "all-ones"))
+        self.assertEqual(c(0xFF800000), ("-", "inf", "0"))
+
+    def test_markdown_report_and_errors(self):
+        md = os.path.join(_TMP, "lanes.md")
+        rc, _ = run_lanes_compare(synth_lanes("cflts@2", "w32", 0, 4, 8), "--md", md)
+        self.assertEqual(rc, 0)
+        with open(md, encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn("| cflts@2 | w32 | 0 | 4 | 16 | 16 | 0 | OK |", text)
+        rc, text = run_lanes_compare(write(HDR + ["META,backend,ppu"]))
+        self.assertEqual(rc, 2)
+        self.assertIn("no LANES/LANE rows", text)
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = lanes_compare.main([synth_lanes("cflts@2", "w32", 0, 4, 8), "--scalar-bin", os.path.join(_TMP, "no_such_binary")])
+        self.assertEqual(rc, 2)
+        self.assertIn("cannot run", err.getvalue())
+
+
 # ------------------------------------------------------------------------------------------------ dry run
 def build_dry_run(workdir, mutant=False):
     """Builds the SPU ELF (make, native toolchain only) and the host driver; returns (elf, host_binary).
@@ -551,6 +697,68 @@ class TestDryRun(unittest.TestCase):
         tr = [l.split(",") for l in lines if l.startswith("SPECB_TRY,")]
         self.assertEqual(len(tr), 12)                               # every word is pre-logged before its launch
 
+    def lanes_run(self, sets, tag, extra=()):
+        out = os.path.join(_TMP, tag + ".csv")
+        p, lines = run_host(self.host, self.elf, ["sweep=0", "spus=1"] + sets, out, extra)
+        return out, p, lines
+
+    def test_lanes_of_the_interpreter_equal_the_model(self):
+        # the plumbing proof: the interpreter is the model, so every lane of every kind of op (fixed immediate, call
+        # immediate with signed values, no immediate, three operands, doubleword results) is equal
+        sets = ["lanes=cflts@2:w32:0:100", "lanes=ai:immw:0:200", "lanes=ila:immw:0:100", "lanes=fma:fpool3:0:70",
+                "lanes=a:wrand:0:130", "lanes=fesd:w32e:0:64"]
+        out, p, lines = self.lanes_run(sets, "l1")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        hdr = [i for i, l in enumerate(lines) if l.startswith("LANES,")]
+        self.assertEqual(len(hdr), 6)
+        self.assertIn("LANES,cflts@2,w32,0,100,8", lines)
+        self.assertIn("LANES,fesd,w32e,0,64,0", lines)
+        self.assertIn("LANES_DONE,ai,immw,0,200", lines)
+        self.assertEqual(sum(l.startswith("LANE,") for l in lines), 100 + 200 + 100 + 70 + 130 + 64)
+        self.assertEqual([l for l in lines if l.startswith("LANES_FAULT")], [])
+        self.assertIn("META,lanes,6", lines)
+        rc, text = run_lanes_compare(out)
+        self.assertEqual(rc, 0, text)
+        for g in lanes_compare.parse_result(out):
+            r = lanes_compare.compare_group(scalar_bin(), g)
+            self.assertEqual(r.n_input_errors, 0, g.key)         # the immediates, signed ones included, are the generator's
+            self.assertGreater(len(r.lanes), 0)
+            if g.op not in ("ai", "ila"):
+                # (a harness older than 742e288d does not cut call immediates to the field the instruction has: its model
+                # of the immediate-form ops differs from the instruction, which is why these two only check the inputs)
+                self.assertEqual(r.differ(), 0, g.key)
+
+    def test_lanes_conv_cfg_in_the_interpreter(self):
+        out, p, lines = self.lanes_run([], "l2", ["--cfg", os.path.join(PROBE, "cfg", "lanes_conv.cfg")])
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(len([l for l in lines if l.startswith("LANES_DONE,")]), 9)
+        self.assertEqual(sum(l.startswith("LANE,") for l in lines), 6 * 256 + 2 * 64 + 256)
+        self.assertFalse([k for k in self.hashes(lines)])                       # sweep=0: no hash rows
+        rc, text = run_lanes_compare(out)
+        self.assertEqual(rc, 0, text)
+        self.assertIn("equal 1024  differ 0", text)
+
+    def test_a_lanes_entry_that_faults_costs_that_entry_only(self):
+        # puts of the SPU: 1 initial status, 2 "in progress" status, 3 first record chunk: dying there loses entry 1
+        sets = ["lanes=cflts@173:w32:0:64", "lanes=cfltu@173:w32:0:64"]
+        out, p, lines = self.lanes_run(sets, "l3", ["--inject", "0:3"])
+        self.assertEqual(p.returncode, 0, p.stderr)
+        faults = [l for l in lines if l.startswith("LANES_FAULT,")]
+        self.assertEqual(len(faults), 1, lines)
+        self.assertTrue(faults[0].startswith("LANES_FAULT,cflts@173,w32,0,0,"), faults)
+        self.assertIn("LANES_DONE,cfltu@173,w32,0,64", lines)                  # the next entry ran
+        self.assertEqual(sum(l.startswith("LANE,cfltu@173") for l in lines), 64)
+        rc, text = run_lanes_compare(out)
+        self.assertEqual(rc, 0, text)
+        self.assertIn("LANES_FAULT", text)
+
+    def test_dp_compares_in_lanes_follow_the_sweeps_rule(self):
+        _out, p, lines = self.lanes_run(["lanes=dfceq:dpool2:0:10", "lanes=absdb:byte2:0:5"], "l4")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("SKIP,dfceq,special_a_not_run", lines)                    # the sweep's rule
+        self.assertFalse([l for l in lines if l.startswith("LANE,dfceq")])
+        self.assertEqual(sum(l.startswith("LANE,absdb,byte2") for l in lines), 5)
+
 
 @unittest.skipUnless(shutil.which("cc"), "needs cc")
 class TestHostWithoutConsole(unittest.TestCase):
@@ -599,6 +807,36 @@ class TestHostWithoutConsole(unittest.TestCase):
         p = subprocess.run([self.host, "--plan"], check=False, capture_output=True, text=True, timeout=60)
         self.assertEqual(p.returncode, 0, p.stderr)                 # parses with the defaults alone
         self.assertIn("plan preset=smoke", p.stdout)
+
+    def test_lanes_keys_are_validated_at_start_up(self):
+        bad = {
+            "lanes=nosuchop:w32:0": "unknown op",
+            "lanes=cflts@0:nosuchdom:0": "unknown domain",
+            "lanes=cflts@0:wrand:0": "is not run in domain",          # cflts@0 is a w32 op
+            "lanes=cflts@0:w32": "expected OP:DOMAIN:BLOCK",
+            "lanes=cflts@0:w32:0:64:1": "expected OP:DOMAIN:BLOCK",
+            "lanes=cflts@0:w32:x": "is not a block number",
+            "lanes=cflts@0:w32:-1": "is not a block number",
+            "lanes=cflts@0:w32:99999999": "is not a block number",
+            "lanes=cflts@0:w32:0:0": "count",
+            "lanes=cflts@0:w32:0:1025": "count",
+            "lanes=cflts@0:w32:0:12abc": "count",
+        }
+        for val, msg in bad.items():
+            p = subprocess.run([self.host, "--set", val], check=False, capture_output=True, text=True, timeout=60)
+            self.assertEqual(p.returncode, 2, (val, p.stdout, p.stderr))
+            self.assertIn(msg, p.stderr, val)
+        argv = [self.host] + [a for i in range(17) for a in ("--set", f"lanes=a:wrand:0:{i + 1}")]
+        p = subprocess.run(argv, check=False, capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("at most 16 lanes entries", p.stderr)
+        argv = [self.host, "--plan"] + [a for i in range(16) for a in ("--set", f"lanes=cflts@173:w32:0:{i + 1}")]
+        self.assertEqual(subprocess.run(argv, check=False, capture_output=True, text=True, timeout=60).returncode, 0)   # 16 are fine
+
+    def test_lanes_conv_cfg_parses(self):
+        p = subprocess.run([self.host, "--cfg", os.path.join(PROBE, "cfg", "lanes_conv.cfg"), "--plan"], check=False,
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, 0, p.stderr)
 
 
 # The outdir tests of tools/hwprobe/probes/spuexh/common/spuexh_core.c: spuexh_outdir_ok() is the console probe's

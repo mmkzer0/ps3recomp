@@ -102,6 +102,7 @@ static inline int spuexh_job_ops(const spuexh_cfg_t *c, int dom, uint64_t blk, u
 #define SPUEXH_MODE_MAIN  0     /* the exhaustive sweep */
 #define SPUEXH_MODE_CASES 1     /* special probe A: run a list of (word, a, b, c) cases, record $rt */
 #define SPUEXH_MODE_RAW   2     /* special probe B: one raw word with all 128 registers loaded and dumped */
+#define SPUEXH_MODE_LANES 3     /* lanes job: the inputs and the result of the first calls of one (op, domain, block) */
 
 typedef struct {                /* PPU -> SPU, 128 bytes, 128-byte aligned in main memory */
     uint32_t magic, mode, spu_index, spu_count;
@@ -114,7 +115,8 @@ typedef struct {                /* PPU -> SPU, 128 bytes, 128-byte aligned in ma
     uint64_t cfg_ea;            /* MAIN: spuexh_cfg_t */
     uint64_t cases_ea;          /* CASES/RAW: spuexh_case_t array */
     uint32_t cfg_size, flags;
-    uint32_t pad[14];
+    uint32_t lane_op, lane_dom, lane_blk, lane_count;   /* LANES: op table index, domain index, block, calls to dump */
+    uint32_t pad[10];
 } spuexh_params_t;
 
 typedef struct {                /* SPU -> PPU, 128 bytes, updated by DMA */
@@ -156,6 +158,20 @@ typedef struct {                /* CASES/RAW output, 512 bytes */
     uint32_t pad[SPUEXH_CASEOUT_SIZE / 4 - 12 - 8 * SPUEXH_RAW_MAXCH];
 } spuexh_caseout_t;
 
+/* LANES output: one record per call, 80 bytes (a multiple of 16, so a chunk of records is one legal DMA). The SPU keeps one
+ * chunk of records in local store (CHUNK x 80 bytes, 5 KiB, part of the image: the build guard still checks the image
+ * against arena A) and DMAs each finished chunk to the results region; status.entries counts the records that are in main memory. */
+#define SPUEXH_LANES_MAX_ENTRIES 16     /* lanes= keys per configuration */
+#define SPUEXH_LANES_MAX_COUNT 1024     /* calls dumped per entry */
+#define SPUEXH_LANES_DEFAULT_COUNT 64
+typedef struct {
+    uint32_t a[4], b[4], c[4];  /* the operands the generator produced (the host harness' --dump prints them as 8 hex digits per word) */
+    uint32_t out[4];            /* $rt after the instruction word */
+    uint64_t call;              /* generator call index within the domain (the first column of the harness' --dump) */
+    uint32_t imm;               /* the immediate field value patched into the word (call imm masked to the field width); 0 for an op without one */
+    uint32_t pad;
+} spuexh_lane_t;
+
 #define SPUEXH_ARENA_A 0x1E000u   /* LS arenas the raw-exec probe points registers into */
 #define SPUEXH_ARENA_A_SIZE 0x1000u
 #define SPUEXH_ARENA_B 0x3C000u
@@ -194,5 +210,6 @@ _Static_assert(sizeof(spuexh_status_t) == 128, "status wire size");
 _Static_assert(sizeof(spuexh_entry_t) == 16, "entry wire size");
 _Static_assert(sizeof(spuexh_case_t) == 64, "case wire size");
 _Static_assert(sizeof(spuexh_caseout_t) == SPUEXH_CASEOUT_SIZE, "caseout wire size");
+_Static_assert(sizeof(spuexh_lane_t) == 80, "lane wire size");
 
 #endif /* SPUEXH_H */

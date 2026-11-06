@@ -66,6 +66,55 @@ static int parse_dom_list(const char *val, uint32_t *tab, char *err, size_t cap)
     return 0;
 }
 
+static int parse_uint(const char *s, uint64_t max, uint64_t *out) {          /* decimal digits only, no sign, no trailing text */
+    char *end;
+    if (*s < '0' || *s > '9') return -1;
+    const unsigned long long v = strtoull(s, &end, 10);
+    if (*end || v > max) return -1;
+    *out = v;
+    return 0;
+}
+
+/* lanes=OP:DOMAIN:BLOCK[:COUNT]: op names (cflts@173) and domain names contain no colon. The op must be one the domain
+ * runs, the block must exist, so a typo fails at start-up instead of dumping inputs the sweep never sees. */
+static int parse_lanes(spuexh_runcfg_t *rc, const char *val, char *err, size_t cap) {
+    char buf[96], *f[4];
+    int nf = 0;
+    if (strlen(val) >= sizeof buf) { snprintf(err, cap, "lanes entry too long"); return -1; }
+    snprintf(buf, sizeof buf, "%s", val);
+    for (char *t = buf;;) {
+        if (nf == 4) { snprintf(err, cap, "lanes=%s: expected OP:DOMAIN:BLOCK[:COUNT]", val); return -1; }
+        f[nf++] = t;
+        char *c = strchr(t, ':');
+        if (!c) break;
+        *c = 0; t = c + 1;
+    }
+    if (nf < 3) { snprintf(err, cap, "lanes=%s: expected OP:DOMAIN:BLOCK[:COUNT]", val); return -1; }
+    if (rc->nlanes >= SPUEXH_LANES_MAX_ENTRIES) { snprintf(err, cap, "at most %d lanes entries", SPUEXH_LANES_MAX_ENTRIES); return -1; }
+    int op = -1;
+    for (int k = 0; k < SPUEXH_NOPS; k++) if (!strcmp(spuexh_ops[k].name, f[0])) op = k;
+    if (op < 0) { snprintf(err, cap, "lanes: unknown op '%s'", f[0]); return -1; }
+    const int dom = dom_index(f[1]);
+    if (dom < 0) { snprintf(err, cap, "lanes: unknown domain '%s'", f[1]); return -1; }
+    int member = 0;
+    for (int q = 0; q < 5; q++) member |= spuexh_ops[op].dom[q] == dom;
+    if (!member) { snprintf(err, cap, "lanes: op '%s' is not run in domain '%s'", f[0], f[1]); return -1; }
+    uint64_t blk = 0, count = SPUEXH_LANES_DEFAULT_COUNT;
+    if (parse_uint(f[2], exh_nblocks(&exh_doms[dom]) - 1, &blk) < 0) {
+        snprintf(err, cap, "lanes: block '%s' is not a block number of domain '%s' (0..%llu)", f[2], f[1],
+                 (unsigned long long)(exh_nblocks(&exh_doms[dom]) - 1));
+        return -1;
+    }
+    if (nf == 4 && (parse_uint(f[3], SPUEXH_LANES_MAX_COUNT, &count) < 0 || !count)) {
+        snprintf(err, cap, "lanes: count '%s' must be 1..%d", f[3], SPUEXH_LANES_MAX_COUNT);
+        return -1;
+    }
+    rc->lanes[rc->nlanes].op = op; rc->lanes[rc->nlanes].dom = dom;
+    rc->lanes[rc->nlanes].blk = (uint32_t)blk; rc->lanes[rc->nlanes].count = (int)count;
+    rc->nlanes++;
+    return 0;
+}
+
 int spuexh_runcfg_set(spuexh_runcfg_t *rc, const char *k, const char *v, char *err, size_t cap) {
     err[0] = 0;
     if (!strcmp(k, "preset")) {
@@ -96,6 +145,7 @@ int spuexh_runcfg_set(spuexh_runcfg_t *rc, const char *k, const char *v, char *e
     else if (!strcmp(k, "bmax")) rc->wire.bmax = W32((uint32_t)atoi(v));
     else if (!strcmp(k, "stride_dom")) return parse_dom_list(v, rc->wire.dom_stride, err, cap) < 0 ? -1 : 1;
     else if (!strcmp(k, "bmax_dom")) return parse_dom_list(v, rc->wire.dom_bmax, err, cap) < 0 ? -1 : 1;
+    else if (!strcmp(k, "lanes")) return parse_lanes(rc, v, err, cap) < 0 ? -1 : 1;
     else if (!strcmp(k, "ops")) snprintf(rc->ops, sizeof rc->ops, "%s", v);
     else if (!strcmp(k, "skip_ops")) snprintf(rc->skip_ops, sizeof rc->skip_ops, "%s", v);
     else if (!strcmp(k, "doms")) snprintf(rc->doms, sizeof rc->doms, "%s", v);
@@ -665,5 +715,81 @@ int spuexh_run_special_b(spuexh_backend_t *be, const spuexh_runcfg_t *rc, const 
         if (rc->special_b_count > 0 && done >= rc->special_b_count) break;
     }
     fflush(f);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ lanes jobs */
+int spuexh_run_lanes(spuexh_backend_t *be, const spuexh_runcfg_t *rc, const spuexh_sink_t *sink) {
+    FILE *f = sink->out;
+    if (!rc->nlanes) return 0;
+    uint64_t par_ea = 0, st_ea = 0, b_ea = 0;
+    spuexh_params_t *par = (spuexh_params_t *)be->alloc(be, sizeof *par, &par_ea);
+    volatile spuexh_status_t *st = NULL;
+    spuexh_lane_t *buf = NULL;
+    if (par) st = (volatile spuexh_status_t *)be->alloc(be, sizeof *st, &st_ea);
+    if (st) buf = (spuexh_lane_t *)be->alloc(be, (size_t)SPUEXH_LANES_MAX_COUNT * sizeof *buf, &b_ea);
+    fprintf(f, "META,lanes,%d\n", rc->nlanes);
+    if (!par || !st || !buf) { fprintf(f, "FATAL,lanes,allocation_failed\n"); fflush(f); return -1; }
+    for (int q = 0; q < rc->nlanes; q++) {
+        const spuexh_op_t *op = &spuexh_ops[rc->lanes[q].op];
+        const char *dn = spuexh_dom_names[rc->lanes[q].dom];
+        const uint32_t blk = rc->lanes[q].blk;
+        /* the sweep's rule for the DP compares: only when probe A showed that the SPU executes them (or forced) */
+        int skip = 0;
+        for (int k = 0; k < 5 && !rc->force_dpcmp; k++)
+            if (!strcmp(op->name, spuexh_dpcmp_names[k]) && !(rc->dpcmp_known && rc->dpcmp_ok[k])) {
+                fprintf(f, "SKIP,%s,%s\n", op->name, rc->dpcmp_known ? "rejected_by_special_a" : "special_a_not_run");
+                skip = 1;
+            }
+        if (skip) continue;
+        uint64_t avail = exh_doms[rc->lanes[q].dom].ncalls - ((uint64_t)blk << EXH_BLOCK_LOG2);
+        const uint32_t count = (uint64_t)rc->lanes[q].count < avail ? (uint32_t)rc->lanes[q].count : (uint32_t)avail;
+        /* pre-log: flushed before the launch, so a lost run names the entry that was being attempted */
+        fprintf(f, "LANES,%s,%s,%u,%u,%u\n", op->name, dn, blk, count, (unsigned)op->imm_bits);
+        fflush(f);
+
+        memset(buf, 0, (size_t)SPUEXH_LANES_MAX_COUNT * sizeof *buf);
+        memset((void *)st, 0, sizeof *st);
+        memset(par, 0, sizeof *par);
+        par->magic = W32(SPUEXH_PARAMS_MAGIC); par->mode = W32(SPUEXH_MODE_LANES); par->spu_index = 0; par->spu_count = W32(1u);
+        par->results_cap = W32((uint32_t)SPUEXH_LANES_MAX_COUNT); par->results_ea = W64(b_ea); par->status_ea = W64(st_ea);
+        par->lane_op = W32((uint32_t)rc->lanes[q].op); par->lane_dom = W32((uint32_t)rc->lanes[q].dom);
+        par->lane_blk = W32(blk); par->lane_count = W32(count);
+        __sync_synchronize();
+        const volatile spuexh_status_t *stp[1] = { st };
+        spuexh_thread_res_t tr;
+        memset(&tr, 0, sizeof tr);
+        const int rv = be->run(be, 1, &par_ea, stp, NULL, NULL, rc->launch_timeout_ms, &tr);
+        __sync_synchronize();
+        const uint64_t ln = ++g_launch_seq;
+        launch_meta(f, ln, &tr, 1);
+        fprintf(f, "META,launch%llu_spu0_fpscr,%08x.%08x.%08x.%08x\n", (unsigned long long)ln,
+                W32(st->fpscr_start[0]), W32(st->fpscr_start[1]), W32(st->fpscr_start[2]), W32(st->fpscr_start[3]));
+        if (rv == -3) { fatal_row(f, &tr, "launch"); return -1; }
+
+        const uint32_t state = W32(st->state), flags = W32(st->flags);
+        uint32_t rows = W32(st->entries);
+        if (rv < 0 || rows > count) rows = rv < 0 ? 0 : count;           /* nothing ran, or a status that cannot be right */
+        for (uint32_t k = 0; k < rows; k++) {
+            const spuexh_lane_t *L = &buf[k];
+            char a[40], b[40], c[40], o[40], im[16];
+            hex128(a, L->a); hex128(b, L->b); hex128(c, L->c); hex128(o, L->out);
+            if (op->imm_bits) snprintf(im, sizeof im, "%u", W32(L->imm)); else snprintf(im, sizeof im, "-");
+            fprintf(f, "LANE,%s,%s,%u,%llu,%s,%s,%s,%s,%s\n", op->name, dn, blk, (unsigned long long)W64(L->call), a, b, c, im, o);
+        }
+        if (rv == 0 && state == 2 && !(flags & 8u) && rows == count) {
+            fprintf(f, "LANES_DONE,%s,%s,%u,%u\n", op->name, dn, blk, rows);
+        } else {
+            char d1[200];
+            clean(d1, sizeof d1, tr.desc);
+            fprintf(f, "LANES_FAULT,%s,%s,%u,%u,rv_%d state_%u flags_%u %s\n", op->name, dn, blk, rows, rv, state, flags, d1);
+        }
+        fflush(f);
+        if (sink->ui) {
+            char s[96];
+            snprintf(s, sizeof s, "lanes: %s %s %u (%d/%d)", op->name, dn, blk, q + 1, rc->nlanes);
+            if (sink->ui(sink->uu, s)) return 1;
+        }
+    }
     return 0;
 }
