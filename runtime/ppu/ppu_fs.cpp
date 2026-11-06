@@ -1099,6 +1099,11 @@ static void cellFsAioWrite(ppu_context* ctx)
     uint32_t id_ptr = (uint32_t)ctx->gpr[4];
     uint32_t cb_opd = (uint32_t)ctx->gpr[5];
 
+    /* The CellFsAio fields read below (0x20 bytes) and the id written back are guest spans the title chose; guest_be32
+     * answers 0 for a bad one and vm_write32 does not look, so the span is bounded here, before either is touched. */
+    if (!fs_range_ok(aio, 0x20)) fs_range_stop("cellFsAioWrite", "aio", aio, 0x20);
+    if (id_ptr && !fs_range_ok(id_ptr, 4)) fs_range_stop("cellFsAioWrite", "id", id_ptr, 4);
+
     int      fd     = (int)guest_be32(aio + 0x00);
     uint64_t offset = guest_be64(aio + 0x08);
     uint32_t buf    = guest_be32(aio + 0x10);

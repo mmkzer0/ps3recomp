@@ -14,6 +14,7 @@
 #include "ppu_fs.cpp"
 #include "ps3emu/stop.h"
 #include <string>
+#include <functional>
 #include <thread>
 #include <vector>
 #include <sys/mman.h>
@@ -204,6 +205,62 @@ int main(int argc, char** argv)
                       "%s names itself and the buffer in the stop (got: %s)", fn, err.c_str());
             }
         }
+        memset(&ctx, 0, sizeof ctx); ctx.gpr[3] = fdw;
+        cellFsClose(&ctx);
+    }
+
+    /* 3b. cellFsAioWrite bounds what it reads and writes besides its data buffer: the CellFsAio block (0x20 bytes
+     *    read) and the id it stores. A block or id that leaves the arena is refused before the first access, where
+     *    the AIO block used to read back as zeros (fd 0, size 0) and the id was stored without a look. */
+    {
+        memset(&ctx, 0, sizeof ctx); ctx.gpr[3] = 0x100; ctx.gpr[4] = 1 /* O_WRONLY */; ctx.gpr[5] = 0x204;
+        cellFsOpen(&ctx);
+        const uint32_t fdw = rd32(0x204);
+        CHECK((uint32_t)ctx.gpr[3] == 0, "cellFsOpen(O_WRONLY) for the AIO write returns CELL_OK (fd %u)", fdw);
+        auto aio_write = [&](uint32_t aio, uint32_t id_ptr, uint32_t buf) {
+            if (aio + 0x20 <= MEM_BYTES) {   // a block that does not fit has nothing to fill in
+                wr32(aio + 0x00, fdw); wr64(aio + 0x08, 0); wr32(aio + 0x10, buf); wr64(aio + 0x18, 0x10);
+            }
+            ppu_context cc; memset(&cc, 0, sizeof cc);
+            cc.gpr[3] = aio; cc.gpr[4] = id_ptr; cc.gpr[5] = 0;
+            cellFsAioWrite(&cc);
+            return (uint32_t)cc.gpr[3];
+        };
+        const auto refused = [&](const char* what, const char* arg, const std::function<void()>& call) {
+            int fds[2];
+            CHECK(pipe(fds) == 0, "pipe for %s", what);
+            const pid_t pid = fork();
+            if (pid == 0) {
+                close(fds[0]); dup2(fds[1], STDERR_FILENO); close(fds[1]);
+                call();
+                _exit(1);   // returned: nothing was refused
+            }
+            close(fds[1]);
+            std::string err;
+            char bytes[512];
+            ssize_t n;
+            while ((n = read(fds[0], bytes, sizeof bytes)) > 0) err.append(bytes, (size_t)n);
+            close(fds[0]);
+            int status = 0;
+            waitpid(pid, &status, 0);
+            CHECK(WIFEXITED(status) && WEXITSTATUS(status) == PS3_STOP_EXIT_CODE,
+                  "cellFsAioWrite with %s stops (status 0x%X)", what, status);
+            CHECK(err.find("kind=hle-guest-range") != std::string::npos &&
+                  err.find("func=cellFsAioWrite") != std::string::npos &&
+                  err.find(std::string("arg=") + arg) != std::string::npos,
+                  "cellFsAioWrite names itself and %s in the stop (got: %s)", arg, err.c_str());
+        };
+        refused("an AIO block straddling the arena's end", "aio", [&] { aio_write(MEM_BYTES - 0x10, 0x500, 0x1000); });
+        refused("an AIO block past the arena", "aio", [&] { aio_write(MEM_BYTES + 0x1000, 0x500, 0x1000); });
+        refused("an id straddling the arena's end", "id", [&] { aio_write(0x300, MEM_BYTES - 2, 0x1000); });
+        refused("an id past the arena", "id", [&] { aio_write(0x300, MEM_BYTES + 0x1000, 0x1000); });
+        refused("a data buffer straddling the arena's end", "buf", [&] { aio_write(0x300, 0x500, MEM_BYTES - 8); });
+        /* What fits exactly is served: the block in the arena's last 0x20 bytes, the id in its last 4. */
+        wr32(0x500, 0);
+        CHECK(aio_write(MEM_BYTES - 0x20, MEM_BYTES - 4, 0x1000) == 0 && rd32(MEM_BYTES - 4) != 0,
+              "an AIO block and an id that end exactly at the arena's end are accepted and the id is stored");
+        CHECK(aio_write(0x300, 0x500, 0x1000) == 0 && rd32(0x500) != 0,
+              "a valid AIO write returns CELL_OK and stores its id");
         memset(&ctx, 0, sizeof ctx); ctx.gpr[3] = fdw;
         cellFsClose(&ctx);
     }
