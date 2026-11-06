@@ -19,7 +19,8 @@
  *
  * MODES (spuexh_params_t.mode): MAIN sweep of the job plan; CASES a list of (word, a, b, c) with $rt recorded;
  * RAW one word with all 128 registers loaded and dumped (spuexh_rawexec_gen.S); LANES the operands, patched immediate and
- * result of the first calls of one (op, domain, block) of the sweep, through the same generator, op table and stub.
+ * result of a range of calls of one (op, domain, block) of the sweep; LANESUM one hash per chunk of calls over a block
+ * (the sweep's block hash restricted to the chunk). Both go through the same generator, op table and stub.
  *
  * This file is big-endian code (SPU): the wire structures are used without byte swapping.
  */
@@ -232,17 +233,31 @@ static void run_main(void) {
     }
 }
 
-/* ------------------------------------------------------------------ LANES mode */
+/* ------------------------------------------------------------------ LANES / LANESUM modes */
+static spuexh_op_t LOP;                  /* the op of a lanes job: its table entry, with a request's conversion scale patched in */
+
+/* The request's op and domain, or NULL when the request is not one the PPU could have made (the job then ends with flag 8). */
+static const spuexh_op_t *lane_request(const exh_dom **dom) {
+    if (P.lane_op >= SPUEXH_NOPS || P.lane_dom >= EXH_NDOMS || !P.lane_count) return NULL;
+    LOP = spuexh_ops[P.lane_op];
+    if (P.lane_scale_p1) {                       /* a conversion at any I8 scale: the instruction takes 0..255 */
+        if (LOP.fixed_imm < 0 || LOP.imm_bits != 8 || P.lane_scale_p1 > 256u) return NULL;
+        LOP.fixed_imm = (int16_t)(P.lane_scale_p1 - 1u);
+    }
+    *dom = &exh_doms[P.lane_dom];
+    return &LOP;
+}
+
 static void run_lanes(void) {
     exh_init();
-    if (P.lane_op >= SPUEXH_NOPS || P.lane_dom >= EXH_NDOMS || !P.lane_count || P.lane_count > SPUEXH_LANES_MAX_COUNT ||
-        P.lane_count > P.results_cap) { ST.flags |= 8u; return; }
-    const spuexh_op_t *op = &spuexh_ops[P.lane_op];
-    const exh_dom *d = &exh_doms[P.lane_dom];
-    const uint64_t lo = (uint64_t)P.lane_blk << EXH_BLOCK_LOG2;
-    if (lo >= d->ncalls) { ST.flags |= 8u; return; }
-    uint64_t hi = lo + P.lane_count;                 /* count <= 1024 < one block: the block's end needs no clip */
-    if (hi > d->ncalls) hi = d->ncalls;
+    const exh_dom *d;
+    const spuexh_op_t *op = lane_request(&d);
+    if (!op || P.lane_count > SPUEXH_LANES_MAX_COUNT || P.lane_count > P.results_cap) { ST.flags |= 8u; return; }
+    const uint64_t blo = (uint64_t)P.lane_blk << EXH_BLOCK_LOG2;
+    uint64_t bhi = blo + EXH_BLOCK;
+    if (bhi > d->ncalls) bhi = d->ncalls;
+    const uint64_t lo = blo + P.lane_start, hi = lo + P.lane_count;
+    if (blo >= bhi || lo >= bhi || hi > bhi) { ST.flags |= 8u; return; }
     ST.last_dom = P.lane_dom; ST.last_blk = P.lane_blk; ST.jobs_started = 1;
     status_put();
     uint32_t done = 0;
@@ -256,6 +271,47 @@ static void run_lanes(void) {
         done += (uint32_t)n;
         ST.entries = done;
         status_put();                                /* fenced after the records: a fault leaves exactly `entries` valid records */
+    }
+    ST.jobs_done = 1;
+}
+
+/* One hash per chunk of P.lane_count calls over the whole block, through the sweep's op_chunk (so the hash of a chunk is the
+ * sweep's block hash restricted to the chunk's calls). */
+static void run_lanesum(void) {
+    static uint64_t HB[SPUEXH_LANESUM_BUF] __attribute__((aligned(128)));
+    exh_init();
+    const exh_dom *d;
+    const spuexh_op_t *op = lane_request(&d);
+    if (!op) { ST.flags |= 8u; return; }
+    const uint64_t chunk = P.lane_count, lo = (uint64_t)P.lane_blk << EXH_BLOCK_LOG2;
+    uint64_t hi = lo + EXH_BLOCK;
+    if (hi > d->ncalls) hi = d->ncalls;
+    if (lo >= hi || (hi - lo + chunk - 1) / chunk > SPUEXH_LANESUM_MAX_CHUNKS || (hi - lo + chunk - 1) / chunk > P.results_cap) {
+        ST.flags |= 8u;
+        return;
+    }
+    ST.last_dom = P.lane_dom; ST.last_blk = P.lane_blk; ST.jobs_started = 1;
+    status_put();
+    uint32_t done = 0, nb = 0;
+    for (uint64_t c = lo; c < hi; c += chunk) {
+        const uint64_t e = hi - c < chunk ? hi : c + chunk;
+        uint64_t h = EXH_FNV_OFFSET;
+        for (uint64_t i = c; i < e; i += CHUNK) {
+            const int n = (e - i) < CHUNK ? (int)(e - i) : CHUNK;
+            gen_chunk(d, i, n, op->need);
+            h = op_chunk(op, n, h);
+        }
+        HB[nb++] = h;
+        if (nb == SPUEXH_LANESUM_BUF || e == hi) {
+            const uint32_t cnt = nb;
+            if (nb & 1u) HB[nb++] = 0;               /* a DMA is a multiple of 16 bytes: one pad entry, outside `entries` */
+            dma_wait();
+            dma_put(HB, P.results_ea + (uint64_t)done * sizeof(uint64_t), nb * (uint32_t)sizeof(uint64_t), 0);
+            dma_wait();
+            done += cnt; nb = 0;
+            ST.entries = done;
+            status_put();
+        }
     }
     ST.jobs_done = 1;
 }
@@ -354,6 +410,7 @@ int main(uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4) {
     case SPUEXH_MODE_CASES: run_cases(); break;
     case SPUEXH_MODE_RAW: run_raw(); break;
     case SPUEXH_MODE_LANES: run_lanes(); break;
+    case SPUEXH_MODE_LANESUM: run_lanesum(); break;
     default: ST.flags |= 4u; break;
     }
     { const vec_uint4 f = spu_mffpscr(); memcpy(ST.fpscr_end, &f, 16); }

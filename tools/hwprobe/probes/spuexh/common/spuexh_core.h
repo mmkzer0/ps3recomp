@@ -30,7 +30,9 @@ typedef struct {
     int dpcmp_known, dpcmp_ok[5];    /* result of probe A (set by the caller); the sweep skips unaccepted DP compares */
     char preset[16];
     int nlanes;                      /* lanes= entries (see RUN.md "Lanes"): per-lane dumps of chosen (op, domain, block) triples */
-    struct { int op, dom, count; uint32_t blk; } lanes[SPUEXH_LANES_MAX_ENTRIES];   /* indexes into spuexh_ops / spuexh_dom_names */
+    struct { int op, scale, dom, count; uint32_t blk, start; } lanes[SPUEXH_LANES_MAX_ENTRIES];   /* op: index into spuexh_ops; scale: replacing I8 conversion scale or -1; dom: index into spuexh_dom_names */
+    int nsums;                       /* lanesum= entries: one hash per chunk of calls over a whole block */
+    struct { int op, scale, dom; uint32_t blk, chunk; } sums[SPUEXH_LANESUM_MAX_ENTRIES];
     char ops[512], skip_ops[512], doms[256];
 } spuexh_runcfg_t;
 

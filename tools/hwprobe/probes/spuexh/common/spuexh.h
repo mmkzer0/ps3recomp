@@ -102,7 +102,8 @@ static inline int spuexh_job_ops(const spuexh_cfg_t *c, int dom, uint64_t blk, u
 #define SPUEXH_MODE_MAIN  0     /* the exhaustive sweep */
 #define SPUEXH_MODE_CASES 1     /* special probe A: run a list of (word, a, b, c) cases, record $rt */
 #define SPUEXH_MODE_RAW   2     /* special probe B: one raw word with all 128 registers loaded and dumped */
-#define SPUEXH_MODE_LANES 3     /* lanes job: the inputs and the result of the first calls of one (op, domain, block) */
+#define SPUEXH_MODE_LANES 3     /* lanes job: the inputs and the result of a range of calls of one (op, domain, block) */
+#define SPUEXH_MODE_LANESUM 4   /* lanesum job: one hash per chunk of calls over a whole block */
 
 typedef struct {                /* PPU -> SPU, 128 bytes, 128-byte aligned in main memory */
     uint32_t magic, mode, spu_index, spu_count;
@@ -115,8 +116,10 @@ typedef struct {                /* PPU -> SPU, 128 bytes, 128-byte aligned in ma
     uint64_t cfg_ea;            /* MAIN: spuexh_cfg_t */
     uint64_t cases_ea;          /* CASES/RAW: spuexh_case_t array */
     uint32_t cfg_size, flags;
-    uint32_t lane_op, lane_dom, lane_blk, lane_count;   /* LANES: op table index, domain index, block, calls to dump */
-    uint32_t pad[10];
+    uint32_t lane_op, lane_dom, lane_blk, lane_count;   /* LANES/LANESUM: op table index, domain index, block, calls to dump (LANESUM: calls per chunk) */
+    uint32_t lane_start;        /* LANES: first call to dump, counted from the start of the block */
+    uint32_t lane_scale_p1;     /* LANES/LANESUM: I8 conversion scale + 1 that replaces the op's own (any 0..255), 0 = the op's own */
+    uint32_t pad[8];
 } spuexh_params_t;
 
 typedef struct {                /* SPU -> PPU, 128 bytes, updated by DMA */
@@ -171,6 +174,12 @@ typedef struct {
     uint32_t imm;               /* the immediate field value patched into the word (call imm masked to the field width); 0 for an op without one */
     uint32_t pad;
 } spuexh_lane_t;
+
+/* LANESUM output: one 64-bit hash per chunk of calls of a block (the sweep's block hash, FNV-1a-64 over the outputs, restricted
+ * to the chunk). The SPU gathers SPUEXH_LANESUM_BUF hashes (512 bytes) in local store and DMAs them to the results region. */
+#define SPUEXH_LANESUM_MAX_ENTRIES 16   /* lanesum= keys per configuration */
+#define SPUEXH_LANESUM_MAX_CHUNKS 4096  /* chunks per entry (an entry covers one block) */
+#define SPUEXH_LANESUM_BUF 64
 
 #define SPUEXH_ARENA_A 0x1E000u   /* LS arenas the raw-exec probe points registers into */
 #define SPUEXH_ARENA_A_SIZE 0x1000u

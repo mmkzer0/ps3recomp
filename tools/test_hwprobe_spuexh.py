@@ -29,6 +29,7 @@ import compare_spuexh as cmp
 import gen_tables as gt
 import hwprobe_format
 import lanes_compare
+import lanesum_compare
 
 _TMP = None
 
@@ -377,10 +378,12 @@ def run_lanes_compare(path, *extra):
     return rc, out.getvalue() + err.getvalue()
 
 
-def synth_lanes(op, dom, blk, n, imm_bits, edit=None):
+def synth_lanes(op, dom, blk, n, imm_bits, edit=None, start=0, header=7):
     """A lanes result file whose hardware lanes are the harness' own model (so everything is equal), written from `--dump`.
-    edit(rows) may change the rows (a list of [call, a, b, c, imm, out]) before they are written."""
-    p = subprocess.run([scalar_bin(), "--dump", op, dom, str(blk), "--dump-n", str(n)], check=True, capture_output=True, text=True)
+    edit(rows) may change the rows (a list of [call, a, b, c, imm, out]) before they are written. header=6 writes the LANES
+    row of the first lanes mode (without the start call)."""
+    p = subprocess.run([scalar_bin(), "--dump", op, dom, str(blk), "--dump-start", str(start), "--dump-n", str(n)], check=True,
+                       capture_output=True, text=True)
     rows = []
     for line in p.stdout.splitlines():
         f = line.split()
@@ -388,10 +391,31 @@ def synth_lanes(op, dom, blk, n, imm_bits, edit=None):
         rows.append([int(f[0]), f[1], f[2], f[3], imm, f[5]])
     if edit:
         edit(rows)
-    lines = HDR + [f"LANES,{op},{dom},{blk},{n},{imm_bits}"]
+    lines = HDR + [f"LANES,{op},{dom},{blk},{n},{imm_bits}" + (f",{start}" if header == 7 else "")]
     for call, a, b, c, imm, out in rows:
         lines.append(f"LANE,{op},{dom},{blk},{call},{a},{b},{c},{'-' if imm is None else imm},{out}")
     lines.append(f"LANES_DONE,{op},{dom},{blk},{len(rows)}")
+    return write(lines)
+
+
+def run_lanesum_compare(path, *extra):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = lanesum_compare.main([path, "--scalar-bin", scalar_bin()] + list(extra))
+    return rc, out.getvalue() + err.getvalue()
+
+
+def synth_lanesum(op, dom, blk, chunk, edit=None):
+    """A lanesum result file whose hardware hashes are the harness' own chunk hashes. edit(rows) may change the rows
+    (a list of [start, count, hash]) before they are written."""
+    p = subprocess.run([scalar_bin(), "--dump", op, dom, str(blk), "--dump-hash", str(chunk)], check=True, capture_output=True, text=True)
+    rows = [[int(f[0]), int(f[1]), int(f[2], 16)] for f in (ln.split() for ln in p.stdout.splitlines())]
+    n = len(rows)
+    if edit:
+        edit(rows)
+    lines = HDR + [f"LANESUM_BEGIN,{op},{dom},{blk},{chunk},{n}"]
+    lines += [f"LANESUM,{op},{dom},{blk},{s},{c},{h:016x}" for s, c, h in rows]
+    lines.append(f"LANESUM_DONE,{op},{dom},{blk},{len(rows)}")
     return write(lines)
 
 
@@ -496,6 +520,107 @@ class TestLanesCompare(unittest.TestCase):
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             rc = lanes_compare.main([synth_lanes("cflts@2", "w32", 0, 4, 8), "--scalar-bin", os.path.join(_TMP, "no_such_binary")])
+        self.assertEqual(rc, 2)
+        self.assertIn("cannot run", err.getvalue())
+
+    def test_a_range_that_starts_inside_the_block(self):
+        rc, text = run_lanes_compare(synth_lanes("cflts@45", "w32", 0, 16, 8, start=1000))
+        self.assertEqual(rc, 0, text)
+        self.assertIn("equal 64    differ 0", text)
+        rc, text = run_lanes_compare(synth_lanes("cflts@2", "w32", 0, 16, 8, header=6))        # a file of the first lanes mode
+        self.assertEqual(rc, 0, text)
+
+        def shifted(rows):
+            for r in rows:
+                r[0] += 1
+
+        rc, text = run_lanes_compare(synth_lanes("cflts@45", "w32", 0, 16, 8, shifted, start=1000))
+        self.assertEqual(rc, 1, text)
+        self.assertIn("GENERATOR MISMATCH", text)
+
+        # the entry asked for calls from 1000, the SPU dumped the first ones (it ignored the start): input errors, not equal lanes
+        with open(synth_lanes("cflts@45", "w32", 0, 16, 8), encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        lines[lines.index("LANES,cflts@45,w32,0,16,8,0")] = "LANES,cflts@45,w32,0,16,8,1000"
+        rc, text = run_lanes_compare(write(lines))
+        self.assertEqual(rc, 1, text)
+        self.assertIn("the entry asked for calls from 1000 of the block, the dump starts at call 0", text)
+
+    def test_the_harness_dumps_any_scale_from_a_start_call_and_chunk_hashes(self):
+        def dump(*argv):
+            return subprocess.run([scalar_bin(), "--dump", *argv], check=False, capture_output=True, text=True)
+
+        self.assertEqual(dump("cflts@45", "w32", "0", "--dump-n", "1").returncode, 0)
+        for bad in ("cflts@256", "cflts@", "cflts@-1", "cflts@4x", "fesd@3", "dfma@3", "cflts"):
+            p = dump(bad, "w32", "0", "--dump-n", "1")
+            self.assertEqual(p.returncode, 2, bad)
+        self.assertEqual(dump("cflts@173", "w32", "0", "--dump-start", "1048576").returncode, 2)      # beyond the block
+        # a table scale and the same scale spelled differently take the same path through the harness
+        self.assertEqual(dump("cflts@173", "w32", "0", "--dump-n", "64").stdout, dump("cflts@0173", "w32", "0", "--dump-n", "64").stdout)
+        # a range from a start call is the same lines as the same calls of a dump from the start
+        full = dump("cflts@45", "w32", "0", "--dump-n", "16").stdout.splitlines()
+        part = dump("cflts@45", "w32", "0", "--dump-start", "5", "--dump-n", "4").stdout.splitlines()
+        self.assertEqual(part, full[5:9])
+        self.assertEqual(part[0].split()[0], "5")
+        # chunk hashes: start counted from the block start, the last chunk is short, one chunk of the whole block is the sweep's hash
+        ch = dump("cflts@173", "w32", "0", "--dump-start", "10", "--dump-n", "10", "--dump-hash", "4").stdout.splitlines()
+        self.assertEqual([c.split()[:2] for c in ch], [["10", "4"], ["14", "4"], ["18", "2"]])
+        sweep = subprocess.run([scalar_bin(), "--ops", "cflts@173", "--doms", "w32", "--stride-all", "100000"], check=True,
+                               capture_output=True, text=True).stdout
+        block = [ln.split("\t")[3] for ln in sweep.splitlines() if ln.startswith("cflts@173\tw32\t0\t")]
+        whole = dump("cflts@173", "w32", "0", "--dump-hash", str(1 << 20)).stdout.split()
+        self.assertEqual((whole[0], whole[1], [whole[2]]), ("0", str(1 << 20), block))
+
+
+@unittest.skipUnless(shutil.which("cc"), "needs cc (it builds the host harness' scalar reference)")
+class TestLanesumCompare(unittest.TestCase):
+    def test_equal_chunks_pass(self):
+        rc, text = run_lanesum_compare(synth_lanesum("cflts@173", "w32", 0, 262144))
+        self.assertEqual(rc, 0, text)
+        self.assertIn("chunks 4     equal 4", text)
+        self.assertIn("4 chunks: 4 equal, 0 differ, 0 missing", text)
+
+    def test_a_differing_chunk_is_listed_with_its_calls_and_lanes_lines(self):
+        def edit(rows):
+            rows[2][2] ^= 1
+
+        rc, text = run_lanesum_compare(synth_lanesum("cflts@173", "w32", 0, 262144, edit))
+        self.assertEqual(rc, 0, text)                                           # differences are data
+        self.assertIn("4 chunks: 3 equal, 1 differ, 0 missing", text)
+        self.assertIn("524288..786431", text)
+        self.assertIn("lanes=cflts@173:w32:0:1024:524288", text)
+        self.assertIn("lanes=cflts@173:w32:0:1024:525312", text)
+        self.assertEqual(lanesum_compare.suggested_lanes(lanesum_compare.Group("fesd", "w32e", 0), 4096, 2500),
+                         ["lanes=fesd:w32e:0:1024:4096", "lanes=fesd:w32e:0:1024:5120", "lanes=fesd:w32e:0:452:6144"])
+
+    def test_a_missing_chunk_and_a_wrong_layout(self):
+        def drop(rows):
+            del rows[1]
+
+        rc, text = run_lanesum_compare(synth_lanesum("cflts@173", "w32", 0, 262144, drop))
+        self.assertEqual(rc, 0, text)
+        self.assertIn("4 chunks: 3 equal, 0 differ, 1 missing", text)
+        self.assertIn("262144..524287", text)
+
+        def shifted(rows):
+            rows[1][0] += 1
+
+        rc, text = run_lanesum_compare(synth_lanesum("cflts@173", "w32", 0, 262144, shifted))
+        self.assertEqual(rc, 1, text)
+        self.assertIn("LAYOUT MISMATCH", text)
+
+    def test_errors_and_markdown(self):
+        md = os.path.join(_TMP, "lanesum.md")
+        rc, _ = run_lanesum_compare(synth_lanesum("cflts@173", "w32", 0, 524288), "--md", md)
+        self.assertEqual(rc, 0)
+        with open(md, encoding="utf-8") as f:
+            self.assertIn("| cflts@173 | w32 | 0 | 524288 | 2 | 2 | 0 | 0 | OK |", f.read())
+        rc, text = run_lanesum_compare(write(HDR + ["META,backend,ppu"]))
+        self.assertEqual(rc, 2)
+        self.assertIn("no LANESUM rows", text)
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = lanesum_compare.main([synth_lanesum("cflts@173", "w32", 0, 524288), "--scalar-bin", os.path.join(_TMP, "no_such_binary")])
         self.assertEqual(rc, 2)
         self.assertIn("cannot run", err.getvalue())
 
@@ -711,8 +836,8 @@ class TestDryRun(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         hdr = [i for i, l in enumerate(lines) if l.startswith("LANES,")]
         self.assertEqual(len(hdr), 6)
-        self.assertIn("LANES,cflts@2,w32,0,100,8", lines)
-        self.assertIn("LANES,fesd,w32e,0,64,0", lines)
+        self.assertIn("LANES,cflts@2,w32,0,100,8,0", lines)
+        self.assertIn("LANES,fesd,w32e,0,64,0,0", lines)
         self.assertIn("LANES_DONE,ai,immw,0,200", lines)
         self.assertEqual(sum(l.startswith("LANE,") for l in lines), 100 + 200 + 100 + 70 + 130 + 64)
         self.assertEqual([l for l in lines if l.startswith("LANES_FAULT")], [])
@@ -758,6 +883,77 @@ class TestDryRun(unittest.TestCase):
         self.assertIn("SKIP,dfceq,special_a_not_run", lines)                    # the sweep's rule
         self.assertFalse([l for l in lines if l.startswith("LANE,dfceq")])
         self.assertEqual(sum(l.startswith("LANE,absdb,byte2") for l in lines), 5)
+
+    def test_lanes_from_a_start_call_and_at_any_conversion_scale(self):
+        sets = ["lanes=cflts@45:w32:0:100:1000", "lanes=cfltu@200:w32:0:64:500000", "lanes=csflt@7:w32:0:64", "lanes=cuflt@255:w32:0:64",
+                "lanes=cflts@173:w32:0:1024:1047552"]                    # the last entry ends exactly at the end of the block
+        out, p, lines = self.lanes_run(sets, "l5")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("LANES,cflts@45,w32,0,100,8,1000", lines)
+        self.assertIn("LANES,cuflt@255,w32,0,64,8,0", lines)
+        self.assertEqual([l for l in lines if l.startswith("LANES_FAULT")], [])
+        calls = [int(l.split(",")[4]) for l in lines if l.startswith("LANE,cflts@45,")]
+        self.assertEqual(calls, list(range(1000, 1100)))
+        calls = [int(l.split(",")[4]) for l in lines if l.startswith("LANE,cflts@173,")]
+        self.assertEqual((calls[0], calls[-1], len(calls)), (1047552, 1048575, 1024))
+        for g in lanes_compare.parse_result(out):
+            r = lanes_compare.compare_group(scalar_bin(), g)
+            self.assertEqual((r.n_input_errors, r.differ()), (0, 0), g.key)    # the interpreter is the model at every scale
+            self.assertGreater(len(r.lanes), 0)
+        rc, text = run_lanes_compare(out)
+        self.assertEqual(rc, 0, text)
+
+    def test_lanesum_chunk_accounting_and_the_model(self):
+        sets = ["lanesum=cflts@45:w32:0:300000", "lanesum=cflts@173:w32:0:262144"]
+        out, p, lines = self.lanes_run(sets, "s1")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("LANESUM_BEGIN,cflts@45,w32,0,300000,4", lines)
+        self.assertIn("LANESUM_DONE,cflts@45,w32,0,4", lines)
+        self.assertIn("META,lanesums,2", lines)
+        rows = [l.split(",") for l in lines if l.startswith("LANESUM,cflts@45,")]
+        self.assertEqual([int(r[4]) for r in rows], [0, 300000, 600000, 900000])
+        self.assertEqual([int(r[5]) for r in rows], [300000, 300000, 300000, 148576])    # the last chunk is short
+        self.assertEqual(sum(int(r[5]) for r in rows), 1 << 20)
+        self.assertEqual(self.hashes(lines), {})                                # no sweep rows
+        # one chunk of the block is the sweep's block hash itself: lanesum at chunk = block size is the sweep's hash
+        _out1, p, lines1 = self.lanes_run(["lanesum=cflts@173:w32:0:1048576"], "s2")
+        one = [l.split(",") for l in lines1 if l.startswith("LANESUM,")]
+        self.assertEqual(len(one), 1)
+        out2 = os.path.join(_TMP, "s2sweep.csv")
+        _, sw = run_host(self.host, self.elf, ["doms=w32", "ops=cflts@173", "spus=1", "bmax=1"], out2)
+        self.assertEqual(one[0][6], self.hashes(sw)[("cflts@173", "w32", "0")])
+        rc, text = run_lanesum_compare(out)
+        self.assertEqual(rc, 0, text)
+        self.assertIn("equal 4 ", text)
+
+    def test_a_lanesum_entry_that_faults_costs_that_entry_only(self):
+        # puts of the SPU: 1 initial status, 2 "in progress" status, 3 the hashes: dying there loses entry 1
+        sets = ["lanesum=cflts@173:w32:0:524288", "lanesum=cfltu@173:w32:0:524288"]
+        out, p, lines = self.lanes_run(sets, "s3", ["--inject", "0:3"])
+        self.assertEqual(p.returncode, 0, p.stderr)
+        faults = [l for l in lines if l.startswith("LANESUM_FAULT,")]
+        self.assertEqual(len(faults), 1, lines)
+        self.assertTrue(faults[0].startswith("LANESUM_FAULT,cflts@173,w32,0,0,"), faults)
+        self.assertIn("LANESUM_DONE,cfltu@173,w32,0,2", lines)
+        rc, text = run_lanesum_compare(out)
+        self.assertEqual(rc, 0, text)
+        self.assertIn("NOTE: LANESUM_FAULT", text)
+        self.assertIn("2 missing", text)
+
+    def test_the_conversion_and_fesd_cfgs_in_the_interpreter(self):
+        out, p, lines = self.lanes_run([], "c2", ["--cfg", os.path.join(PROBE, "cfg", "lanes_conv2.cfg")])
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(len([l for l in lines if l.startswith("LANES_DONE,")]), 16)
+        self.assertEqual(sum(l.startswith("LANE,") for l in lines), 16 * 256)
+        rc, text = run_lanes_compare(out)
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(text.count("equal 1024  differ 0"), 16)
+        out, p, lines = self.lanes_run([], "c3", ["--cfg", os.path.join(PROBE, "cfg", "lanesum_fesd.cfg")])
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(sum(l.startswith("LANESUM,") for l in lines), 256)
+        rc, text = run_lanesum_compare(out)
+        self.assertEqual(rc, 0, text)
+        self.assertIn("256 chunks: 256 equal, 0 differ, 0 missing", text)
 
 
 @unittest.skipUnless(shutil.which("cc"), "needs cc")
@@ -814,7 +1010,7 @@ class TestHostWithoutConsole(unittest.TestCase):
             "lanes=cflts@0:nosuchdom:0": "unknown domain",
             "lanes=cflts@0:wrand:0": "is not run in domain",          # cflts@0 is a w32 op
             "lanes=cflts@0:w32": "expected OP:DOMAIN:BLOCK",
-            "lanes=cflts@0:w32:0:64:1": "expected OP:DOMAIN:BLOCK",
+            "lanes=cflts@0:w32:0:64:1:1": "expected OP:DOMAIN:BLOCK",
             "lanes=cflts@0:w32:x": "is not a block number",
             "lanes=cflts@0:w32:-1": "is not a block number",
             "lanes=cflts@0:w32:99999999": "is not a block number",
@@ -837,6 +1033,46 @@ class TestHostWithoutConsole(unittest.TestCase):
         p = subprocess.run([self.host, "--cfg", os.path.join(PROBE, "cfg", "lanes_conv.cfg"), "--plan"], check=False,
                            capture_output=True, text=True, timeout=60)
         self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_lanes_start_scale_and_lanesum_keys_are_validated(self):
+        bad = {
+            "lanes=cflts@256:w32:0": "unknown op",                  # the I8 field is 8 bits wide
+            "lanes=cflts@:w32:0": "unknown op",
+            "lanes=cflts@-1:w32:0": "unknown op",
+            "lanes=cflts@1x:w32:0": "unknown op",
+            "lanes=dfma@3:dpool3:0": "unknown op",                  # only the conversions take a scale
+            "lanes=cflts@45:wrand:0": "is not run in domain",
+            "lanes=cflts@45:w32:0:64:1048576": "start",              # the block has 2^20 calls
+            "lanes=cflts@45:w32:0:64:x": "start",
+            "lanes=cflts@45:w32:0:64:-1": "start",
+            "lanes=cflts@45:w32:0:1024:1047553": "exceeds",
+            "lanes=cflts@45:w32:0:64:0:0": "expected OP:DOMAIN:BLOCK",
+            "lanesum=cflts@45:w32:0": "expected OP:DOMAIN:BLOCK:CHUNK",
+            "lanesum=cflts@45:w32:0:0": "chunk",
+            "lanesum=cflts@45:w32:0:99999999": "chunk",
+            "lanesum=cflts@45:w32:0:255": "at most 4096",               # 4113 chunks
+            "lanesum=cflts@256:w32:0:4096": "unknown op",
+            "lanesum=cflts@45:wrand:0:4096": "is not run in domain",
+            "lanesum=cflts@45:w32:99999999:4096": "is not a block number",
+        }
+        for val, msg in bad.items():
+            p = subprocess.run([self.host, "--set", val], check=False, capture_output=True, text=True, timeout=60)
+            self.assertEqual(p.returncode, 2, (val, p.stdout, p.stderr))
+            self.assertIn(msg, p.stderr, val)
+        argv = [self.host] + [a for i in range(17) for a in ("--set", f"lanesum=cflts@45:w32:0:{4096 + i}")]
+        p = subprocess.run(argv, check=False, capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("at most 16 lanesum entries", p.stderr)
+        for val in ("lanes=cflts@255:w32:0:1:0", "lanes=cflts@0:w32:0:1024:1047552", "lanes=csflt@7:w32:0:64:1000", "lanes=cflts@173:w32:0",
+                    "lanesum=cflts@45:w32:0:256", "lanesum=cuflt@200:w32:0:1048576", "lanesum=fesd:w32e:0:4096"):
+            p = subprocess.run([self.host, "--plan", "--set", val], check=False, capture_output=True, text=True, timeout=60)
+            self.assertEqual(p.returncode, 0, (val, p.stderr))
+
+    def test_new_cfgs_parse(self):
+        for name in ("lanes_conv2.cfg", "lanesum_fesd.cfg"):
+            p = subprocess.run([self.host, "--cfg", os.path.join(PROBE, "cfg", name), "--plan"], check=False,
+                               capture_output=True, text=True, timeout=60)
+            self.assertEqual(p.returncode, 0, (name, p.stderr))
 
 
 # The outdir tests of tools/hwprobe/probes/spuexh/common/spuexh_core.c: spuexh_outdir_ok() is the console probe's

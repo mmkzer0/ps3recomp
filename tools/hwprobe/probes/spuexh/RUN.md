@@ -65,7 +65,7 @@ connect, or a failed terminate after a supervisor end).
 | `spus=N` | SPU threads (1..6, default 6); fewer are used if the system refuses a group of that size |
 | `special_a=0\|1`, `a_ops=`, `special_b=0\|1`, `special_b_max=N`, `special_b_from=N`, `sweep=0\|1` | the two special probes and the sweep, each switchable; `special_b_from` resumes a lost probe B; `force_dpcmp=1` runs dfceq/dfcmeq/dfcgt/dfcmgt/dftsv in the sweep without probe A's acceptance |
 | `special_b_count=N`, `special_b_patterns=zero\|both` | probe B staging: stop after N words (0 = every word) and use only the zero operand pattern or both; the first B run is `special_b_count=1 special_b_patterns=zero` (one zero-pattern word) |
-| `lanes=OP:DOMAIN:BLOCK[:COUNT]` | per-lane dump of the first COUNT (default 64, max 1024) calls of a block, repeatable up to 16 times, see section 6a; set after `preset=` |
+| `lanes=OP:DOMAIN:BLOCK[:COUNT[:START]]`, `lanesum=OP:DOMAIN:BLOCK:CHUNK` | per-lane dump of COUNT (default 64, max 1024) calls of a block from call START (default 0), and one hash per chunk of CHUNK calls over a whole block; each repeatable up to 16 times, conversions at any I8 scale (`cflts@45`), see section 6a; set after `preset=` |
 | `stall_s` (120), `max_faults` (24), `case_timeout_ms` (2000), `b_timeout_ms` (600), `launch_timeout_ms` (10800000) | hang detection and limits. Every launch kind is bounded end to end: `case_timeout_ms`, `b_timeout_ms` and `launch_timeout_ms` must be positive (the probe rejects 0 and negatives at start-up); `stall_s >= 0` (0 = rely on the launch limit alone) |
 | `pad`, `hold_s`, `screen`, `tag`, `outdir`, `fw_version`, `fw_type`, `console_model`, `progress_file` | as the other probes (declare the console so it reaches the result header); `outdir` must stay inside `/dev_hdd0/tmp/hwprobe` |
 
@@ -202,8 +202,9 @@ takes four tab-separated fields and skips blank and `#` rows, so reduce a result
 
 ## 6a. Lanes: per-lane dumps of chosen blocks
 
-A hash says that a block differs, not how. `lanes=<op>:<domain>:<block>[:<count>]` (repeatable, at most 16 entries, `count`
-1..1024, default 64) makes the probe dump, for the first `count` generator calls of that block, the operands `a` `b` `c`, the
+A hash says that a block differs, not how. `lanes=<op>:<domain>:<block>[:<count>[:<start>]]` (repeatable, at most 16 entries,
+`count` 1..1024, default 64, `start` the first call counted from the start of the block, default 0, `start + count` inside the
+block) makes the probe dump, for `count` generator calls of that block from call `start`, the operands `a` `b` `c`, the
 immediate field value patched into the instruction word and the result register of the real instruction, as
 `LANE,<op>,<domain>,<block>,<call>,<a>,<b>,<c>,<imm>,<out>` rows (`FORMAT.md`). The op must be one the domain runs and the block
 must exist, or the configuration is rejected at start-up (`cflts@0:w32:0`: op names contain `@`, never `:`). Each entry is
@@ -234,13 +235,37 @@ probes/spuexh/host/spuexh_host --elf probes/spuexh/spu/spuexh.elf --cfg probes/s
 python3 tools/hwprobe/probes/spuexh/lanes_compare.py lanes_dry.csv --scalar-bin <scalar build> --only-diff
 ```
 
-`lanes_compare.py` runs `<scalar-bin> --dump <op> <domain> <block> --dump-n <calls>` per group (`--dump-n` needs a harness at or
-after the commit that added it) and first checks that every dumped call has the generator's operands and immediate; a
+`lanes_compare.py` runs `<scalar-bin> --dump <op> <domain> <block> --dump-start <first call> --dump-n <calls>` per group (the
+options need the harness of the commit that added them) and first checks that every dumped call has the generator's operands and
+immediate; a
 difference there (the generator on the SPU, or the op table, is at fault) exits 1 and makes the lanes of that group
 meaningless. Then it compares hardware with the harness' `out_fast` (the model the sweep hashes) per 32-bit lane - for `fesd`
 per 64-bit result lane, fed by input words 0 and 2 - and prints every lane (`--only-diff`: only the differing ones) with its input
 word, and per op how many lanes are equal or differ, with the differing lanes grouped by the input word's class read as an IEEE
 single (sign, exponent, fraction). Differences are the data: the exit status is 0 for them, 2 for a usage, file or format error.
+
+**Finding which calls differ: `lanesum=`.** A lanes dump covers at most 1024 calls per entry and 16 entries; a block has 2^20.
+`lanesum=<op>:<domain>:<block>:<chunk>` (repeatable, at most 16 entries, at most 4096 chunks per block, so `chunk` >= 256 for a
+full block) hashes the block in chunks of `chunk` calls on the SPU - with the sweep's own `op_chunk`, so a chunk's hash is the
+sweep's block hash restricted to the chunk (`chunk` = 2^20 is the sweep's hash) - and writes one
+`LANESUM,<op>,<domain>,<block>,<start>,<count>,<hash>` row per chunk. `lanesum_compare.py` gets the model's chunk hashes from
+`<scalar-bin> --dump <op> <domain> <block> --dump-hash <chunk>`, lists the differing chunks with their call ranges and prints the
+`lanes=` lines that dump the first differing chunk (exit 0 for differences, 1 when the hardware's chunking is not the harness',
+2 for errors). The usual loop: lanesum with chunk 4096, `lanes=...:1024:<start>` entries for a differing chunk, `lanes_compare.py`
+on that result.
+
+```
+tools/hwprobe/ps3console.py run tools/hwprobe/out/spuexh_l1.fake.self --prefix spuexh --probe spuexh --run-window 60 \
+    --cfg spuexh tools/hwprobe/probes/spuexh/cfg/lanesum_fesd.cfg --timeout 300 --out results
+python3 tools/hwprobe/probes/spuexh/lanesum_compare.py results/spuexh_r001_lanesum_fesd.csv \
+    --scalar-bin build/dev/spu_exh/test_spu_exhaustive.scalar --md lanesum_fesd.md
+```
+
+**Any conversion scale.** `cflts@N`, `cfltu@N`, `csflt@N` and `cuflt@N` take any N in 0..255 in `lanes=` and `lanesum=` (the I8
+field is patched into the instruction word; the sweep's table only has twelve scales); the host harness' `--dump` takes the same
+names. `cfg/lanes_conv2.cfg` dumps `cflts` at 3 10 20 30 40 44 45 46 47 60 100 125 and `cfltu` at 3 45 46 47 (w32 block 0, 256
+calls each) to find where the hardware's rule changes; `cfg/lanesum_fesd.cfg` hashes `fesd` on `w32e` block 0 in chunks of 4096 and
+holds a commented `lanes=` template for the chunks found.
 
 ## 7. Reading the special probes
 

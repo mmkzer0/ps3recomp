@@ -27,10 +27,13 @@ rows. The dry run writes `HDR,fw_type,host-interp` and `HDR,console_model,host`.
 | `SPECA_FAULT,op,word,case,a,b,text` | a case that stopped the SPU when run alone |
 | `SPECB_TRY,index,prefix,zero\|rand,word` | special probe B, pre-log: flushed before the word's thread group starts, so a lost run names the word that was being attempted even when no outcome row follows |
 | `SPECB,index,prefix,zero\|rand,word,outcome,nchanged,regs,arena,arena_addr,text` | special probe B outcome (below) |
-| `LANES,op,domain,block,count,imm_bits` | lanes job (RUN.md "Lanes"), pre-log: flushed before the entry's launch. `count` calls of the block will be dumped (the configured count, cut at the end of the domain), `imm_bits` is the width of the op's immediate field (0 = none) |
+| `LANES,op,domain,block,count,imm_bits,start` | lanes job (RUN.md "Lanes"), pre-log: flushed before the entry's launch. `count` calls of the block are dumped from call `start` of the block (`start` counts from the start of the block, `LANE` rows carry the call index within the domain, `block << 20` + position), `imm_bits` is the width of the op's immediate field (0 = none). `op` is the name as configured: a conversion at any I8 scale 0..255 (`cflts@45`) is accepted, not only the sweep's twelve scales. The first lanes mode wrote the row without `start`; `lanes_compare.py` reads both |
 | `LANE,op,domain,block,call,a,b,c,imm,out` | one dumped call of a lanes job: `call` is the generator call index within the domain (the first column of the host harness' `--dump`, so it includes `block << 20`), `a` `b` `c` the operands the generator produced and `out` the result register after the instruction, each a quadword as 32 hex digits in big-endian word order (word 0 first, as `--dump` prints them); `imm` is the immediate field value actually patched into the instruction word (the call's immediate modulo the field width, decimal), or `-` for an op without an immediate field |
 | `LANES_DONE,op,domain,block,rows` | the entry's launch finished and all `count` rows are above |
 | `LANES_FAULT,op,domain,block,rows,text` | the entry's launch did not finish cleanly (`rv_`, SPU `state_` and `flags_` words, what lv2 reported); `rows` records are valid (a record is in the file only after its chunk of up to 64 calls reached main memory) and the run goes on with the next entry. A `FATAL` row ends the probe as for the sweep. A lanes file without a closing row was lost mid-entry |
+| `LANESUM_BEGIN,op,domain,block,chunk,nchunks` | lanesum job (RUN.md "Lanes"), pre-log: flushed before the entry's launch. The block is hashed in `nchunks` chunks of `chunk` calls (the last one is shorter when `chunk` does not divide the block) |
+| `LANESUM,op,domain,block,start,count,hash16` | one chunk of a lanesum job: the sweep's block hash (FNV-1a-64 over the outputs, started from its offset basis for every chunk) restricted to the `count` calls from call `start` of the block (`start` counts from the start of the block, unlike the `call` of a `LANE` row). With `chunk` = the whole block it is the sweep's hash of that block |
+| `LANESUM_DONE,op,domain,block,rows` / `LANESUM_FAULT,op,domain,block,rows,text` | as `LANES_DONE` / `LANES_FAULT` for a lanesum entry: `rows` chunk hashes are valid (they reach main memory 64 at a time and at the end of the block) |
 
 The block hash is the host harness' (`runtime/spu/tests/spu_exh_gen.h`): FNV-1a-64 over the 64-bit words of the outputs of the
 2^20 calls of a block, `op` and `domain` are the host harness' names (`cflts@173` is `cflts` with the I8 field 173).
@@ -42,7 +45,7 @@ Values contain no commas (free text has them replaced by spaces) and no line bre
 
 ### META keys
 
-`backend` (`ppu`, `host-interp`), `build`, `run`, `preset`, `plan_jobs`, `plan_hashes`, `plan_calls`, `spus_requested`, `lanes` (number of `lanes=` entries),
+`backend` (`ppu`, `host-interp`), `build`, `run`, `preset`, `plan_jobs`, `plan_hashes`, `plan_calls`, `spus_requested`, `lanes` and `lanesums` (number of `lanes=` and `lanesum=` entries),
 `spus` (threads used), `spus_unavailable` (a thread count the system refused), `special_a`, `special_b`, `sweep`, `gen_seed`
 (`EXH_SEED`), `special_b_prefixes`, `special_b_from`, `special_b_patterns` (`zero`/`both`), `special_b_count`, per launch and
 thread `launchN_spuM_fpscr` (`fscrrd` words read back after the SPU program set the FPSCR to the defined state at thread

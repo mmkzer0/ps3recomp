@@ -75,43 +75,112 @@ static int parse_uint(const char *s, uint64_t max, uint64_t *out) {          /* 
     return 0;
 }
 
-/* lanes=OP:DOMAIN:BLOCK[:COUNT]: op names (cflts@173) and domain names contain no colon. The op must be one the domain
- * runs, the block must exist, so a typo fails at start-up instead of dumping inputs the sweep never sees. */
-static int parse_lanes(spuexh_runcfg_t *rc, const char *val, char *err, size_t cap) {
-    char buf[96], *f[4];
+/* Splits "a:b:c" in place into at most `max` fields; returns the field count, or -1 when there are more. */
+static int split_colon(char *buf, char **f, int max) {
     int nf = 0;
-    if (strlen(val) >= sizeof buf) { snprintf(err, cap, "lanes entry too long"); return -1; }
-    snprintf(buf, sizeof buf, "%s", val);
     for (char *t = buf;;) {
-        if (nf == 4) { snprintf(err, cap, "lanes=%s: expected OP:DOMAIN:BLOCK[:COUNT]", val); return -1; }
+        if (nf == max) return -1;
         f[nf++] = t;
         char *c = strchr(t, ':');
-        if (!c) break;
+        if (!c) return nf;
         *c = 0; t = c + 1;
     }
-    if (nf < 3) { snprintf(err, cap, "lanes=%s: expected OP:DOMAIN:BLOCK[:COUNT]", val); return -1; }
-    if (rc->nlanes >= SPUEXH_LANES_MAX_ENTRIES) { snprintf(err, cap, "at most %d lanes entries", SPUEXH_LANES_MAX_ENTRIES); return -1; }
-    int op = -1;
-    for (int k = 0; k < SPUEXH_NOPS; k++) if (!strcmp(spuexh_ops[k].name, f[0])) op = k;
-    if (op < 0) { snprintf(err, cap, "lanes: unknown op '%s'", f[0]); return -1; }
-    const int dom = dom_index(f[1]);
-    if (dom < 0) { snprintf(err, cap, "lanes: unknown domain '%s'", f[1]); return -1; }
+}
+
+/* The op of a lanes=/lanesum= entry: a table op, or a conversion at ANY I8 scale ("cflts@45": the instruction takes 0..255,
+ * the sweep only the twelve scales of its table), which runs the table's entry of that family with the scale replaced.
+ * *op is a table index, *scale the replacing scale or -1 for the op's own. */
+static int lane_resolve_op(const char *name, int *op, int *scale) {
+    for (int k = 0; k < SPUEXH_NOPS; k++) if (!strcmp(spuexh_ops[k].name, name)) { *op = k; *scale = -1; return 0; }
+    const char *at = strchr(name, '@');
+    uint64_t s;
+    if (!at || at == name || parse_uint(at + 1, 255, &s) < 0) return -1;
+    for (int k = 0; k < SPUEXH_NOPS; k++)
+        if (!strncmp(spuexh_ops[k].name, name, (size_t)(at - name) + 1) && spuexh_ops[k].fixed_imm >= 0 && spuexh_ops[k].imm_bits == 8) {
+            *op = k; *scale = (int)s;
+            return 0;
+        }
+    return -1;
+}
+
+static void lane_name(char *dst, size_t cap, int op, int scale) {
+    const char *n = spuexh_ops[op].name;
+    if (scale < 0) snprintf(dst, cap, "%s", n);
+    else snprintf(dst, cap, "%.*s@%d", (int)(strchr(n, '@') - n), n, scale);
+}
+
+/* OP:DOMAIN:BLOCK of a lanes=/lanesum= key. The op must be one the domain runs and the block must exist, so a typo fails at
+ * start-up instead of dumping inputs the sweep never sees. Fills the number of calls of the block. */
+static int lane_target(const char *what, char **f, int *op, int *scale, int *dom, uint64_t *blk, uint64_t *calls, char *err, size_t cap) {
+    if (lane_resolve_op(f[0], op, scale) < 0) { snprintf(err, cap, "%s: unknown op '%s'", what, f[0]); return -1; }
+    *dom = dom_index(f[1]);
+    if (*dom < 0) { snprintf(err, cap, "%s: unknown domain '%s'", what, f[1]); return -1; }
     int member = 0;
-    for (int q = 0; q < 5; q++) member |= spuexh_ops[op].dom[q] == dom;
-    if (!member) { snprintf(err, cap, "lanes: op '%s' is not run in domain '%s'", f[0], f[1]); return -1; }
-    uint64_t blk = 0, count = SPUEXH_LANES_DEFAULT_COUNT;
-    if (parse_uint(f[2], exh_nblocks(&exh_doms[dom]) - 1, &blk) < 0) {
-        snprintf(err, cap, "lanes: block '%s' is not a block number of domain '%s' (0..%llu)", f[2], f[1],
-                 (unsigned long long)(exh_nblocks(&exh_doms[dom]) - 1));
+    for (int q = 0; q < 5; q++) member |= spuexh_ops[*op].dom[q] == *dom;
+    if (!member) { snprintf(err, cap, "%s: op '%s' is not run in domain '%s'", what, f[0], f[1]); return -1; }
+    const uint64_t nb = exh_nblocks(&exh_doms[*dom]);
+    if (parse_uint(f[2], nb - 1, blk) < 0) {
+        snprintf(err, cap, "%s: block '%s' is not a block number of domain '%s' (0..%llu)", what, f[2], f[1], (unsigned long long)(nb - 1));
         return -1;
     }
-    if (nf == 4 && (parse_uint(f[3], SPUEXH_LANES_MAX_COUNT, &count) < 0 || !count)) {
+    *calls = exh_doms[*dom].ncalls - (*blk << EXH_BLOCK_LOG2);
+    if (*calls > EXH_BLOCK) *calls = EXH_BLOCK;
+    return 0;
+}
+
+/* lanes=OP:DOMAIN:BLOCK[:COUNT[:START]] (op names such as cflts@173 and domain names contain no colon): COUNT calls from call
+ * START of the block (defaults 64 and 0); START + COUNT must lie inside the block. */
+static int parse_lanes(spuexh_runcfg_t *rc, const char *val, char *err, size_t cap) {
+    char buf[96], *f[5];
+    if (strlen(val) >= sizeof buf) { snprintf(err, cap, "lanes entry too long"); return -1; }
+    snprintf(buf, sizeof buf, "%s", val);
+    const int nf = split_colon(buf, f, 5);
+    if (nf < 3) { snprintf(err, cap, "lanes=%s: expected OP:DOMAIN:BLOCK[:COUNT[:START]]", val); return -1; }
+    if (rc->nlanes >= SPUEXH_LANES_MAX_ENTRIES) { snprintf(err, cap, "at most %d lanes entries", SPUEXH_LANES_MAX_ENTRIES); return -1; }
+    int op, scale, dom;
+    uint64_t blk, calls, count = SPUEXH_LANES_DEFAULT_COUNT, start = 0;
+    if (lane_target("lanes", f, &op, &scale, &dom, &blk, &calls, err, cap) < 0) return -1;
+    if (nf >= 4 && (parse_uint(f[3], SPUEXH_LANES_MAX_COUNT, &count) < 0 || !count)) {
         snprintf(err, cap, "lanes: count '%s' must be 1..%d", f[3], SPUEXH_LANES_MAX_COUNT);
         return -1;
     }
-    rc->lanes[rc->nlanes].op = op; rc->lanes[rc->nlanes].dom = dom;
-    rc->lanes[rc->nlanes].blk = (uint32_t)blk; rc->lanes[rc->nlanes].count = (int)count;
+    if (nf == 5 && parse_uint(f[4], calls - 1, &start) < 0) {
+        snprintf(err, cap, "lanes: start '%s' must be 0..%llu (the block has %llu calls)", f[4], (unsigned long long)(calls - 1), (unsigned long long)calls);
+        return -1;
+    }
+    if (start + count > calls) {
+        snprintf(err, cap, "lanes: start %llu + count %llu exceeds the %llu calls of block %llu", (unsigned long long)start,
+                 (unsigned long long)count, (unsigned long long)calls, (unsigned long long)blk);
+        return -1;
+    }
+    rc->lanes[rc->nlanes].op = op; rc->lanes[rc->nlanes].scale = scale; rc->lanes[rc->nlanes].dom = dom;
+    rc->lanes[rc->nlanes].blk = (uint32_t)blk; rc->lanes[rc->nlanes].count = (int)count; rc->lanes[rc->nlanes].start = (uint32_t)start;
     rc->nlanes++;
+    return 0;
+}
+
+/* lanesum=OP:DOMAIN:BLOCK:CHUNK: one hash per chunk of CHUNK calls over the whole block, at most SPUEXH_LANESUM_MAX_CHUNKS chunks. */
+static int parse_lanesum(spuexh_runcfg_t *rc, const char *val, char *err, size_t cap) {
+    char buf[96], *f[4];
+    if (strlen(val) >= sizeof buf) { snprintf(err, cap, "lanesum entry too long"); return -1; }
+    snprintf(buf, sizeof buf, "%s", val);
+    if (split_colon(buf, f, 4) != 4) { snprintf(err, cap, "lanesum=%s: expected OP:DOMAIN:BLOCK:CHUNK", val); return -1; }
+    if (rc->nsums >= SPUEXH_LANESUM_MAX_ENTRIES) { snprintf(err, cap, "at most %d lanesum entries", SPUEXH_LANESUM_MAX_ENTRIES); return -1; }
+    int op, scale, dom;
+    uint64_t blk, calls, chunk;
+    if (lane_target("lanesum", f, &op, &scale, &dom, &blk, &calls, err, cap) < 0) return -1;
+    if (parse_uint(f[3], calls, &chunk) < 0 || !chunk) {
+        snprintf(err, cap, "lanesum: chunk '%s' must be 1..%llu (the block has that many calls)", f[3], (unsigned long long)calls);
+        return -1;
+    }
+    if ((calls + chunk - 1) / chunk > SPUEXH_LANESUM_MAX_CHUNKS) {
+        snprintf(err, cap, "lanesum: chunk %llu makes %llu chunks of the block's %llu calls (at most %d)", (unsigned long long)chunk,
+                 (unsigned long long)((calls + chunk - 1) / chunk), (unsigned long long)calls, SPUEXH_LANESUM_MAX_CHUNKS);
+        return -1;
+    }
+    rc->sums[rc->nsums].op = op; rc->sums[rc->nsums].scale = scale; rc->sums[rc->nsums].dom = dom;
+    rc->sums[rc->nsums].blk = (uint32_t)blk; rc->sums[rc->nsums].chunk = (uint32_t)chunk;
+    rc->nsums++;
     return 0;
 }
 
@@ -146,6 +215,7 @@ int spuexh_runcfg_set(spuexh_runcfg_t *rc, const char *k, const char *v, char *e
     else if (!strcmp(k, "stride_dom")) return parse_dom_list(v, rc->wire.dom_stride, err, cap) < 0 ? -1 : 1;
     else if (!strcmp(k, "bmax_dom")) return parse_dom_list(v, rc->wire.dom_bmax, err, cap) < 0 ? -1 : 1;
     else if (!strcmp(k, "lanes")) return parse_lanes(rc, v, err, cap) < 0 ? -1 : 1;
+    else if (!strcmp(k, "lanesum")) return parse_lanesum(rc, v, err, cap) < 0 ? -1 : 1;
     else if (!strcmp(k, "ops")) snprintf(rc->ops, sizeof rc->ops, "%s", v);
     else if (!strcmp(k, "skip_ops")) snprintf(rc->skip_ops, sizeof rc->skip_ops, "%s", v);
     else if (!strcmp(k, "doms")) snprintf(rc->doms, sizeof rc->doms, "%s", v);
@@ -719,75 +789,135 @@ int spuexh_run_special_b(spuexh_backend_t *be, const spuexh_runcfg_t *rc, const 
 }
 
 /* ------------------------------------------------------------------ lanes jobs */
+typedef struct {
+    spuexh_params_t *par;
+    volatile spuexh_status_t *st;
+    uint8_t *buf;                    /* results region: spuexh_lane_t records (LANES) or uint64 hashes (LANESUM) */
+    uint64_t par_ea, st_ea, b_ea;
+} lane_ctx_t;
+#define LANE_BUF_BYTES ((size_t)SPUEXH_LANES_MAX_COUNT * sizeof(spuexh_lane_t) + 128)   /* >= (max chunks + pad) hashes too */
+
+typedef struct {
+    int rv;
+    uint32_t state, flags, entries;
+    spuexh_thread_res_t tr;
+} lane_out_t;
+
+/* One launch of a lanes or lanesum job on SPU 0 with the configured launch limit (always positive: no unbounded launch), its
+ * launch META rows, and the status words read back. Returns -1 when the launch could not be contained (FATAL row written). */
+static int lane_launch(spuexh_backend_t *be, const spuexh_runcfg_t *rc, FILE *f, lane_ctx_t *x, uint32_t mode, int op, int scale,
+                       int dom, uint32_t blk, uint32_t start, uint32_t count, uint32_t cap, lane_out_t *o) {
+    spuexh_params_t *par = x->par;
+    memset(x->buf, 0, LANE_BUF_BYTES);
+    memset((void *)x->st, 0, sizeof *x->st);
+    memset(par, 0, sizeof *par);
+    par->magic = W32(SPUEXH_PARAMS_MAGIC); par->mode = W32(mode); par->spu_index = 0; par->spu_count = W32(1u);
+    par->results_cap = W32(cap); par->results_ea = W64(x->b_ea); par->status_ea = W64(x->st_ea);
+    par->lane_op = W32((uint32_t)op); par->lane_dom = W32((uint32_t)dom); par->lane_blk = W32(blk);
+    par->lane_count = W32(count); par->lane_start = W32(start); par->lane_scale_p1 = W32((uint32_t)(scale + 1));
+    __sync_synchronize();
+    const volatile spuexh_status_t *stp[1] = { x->st };
+    memset(&o->tr, 0, sizeof o->tr);
+    o->rv = be->run(be, 1, &x->par_ea, stp, NULL, NULL, rc->launch_timeout_ms, &o->tr);
+    __sync_synchronize();
+    const uint64_t ln = ++g_launch_seq;
+    launch_meta(f, ln, &o->tr, 1);
+    fprintf(f, "META,launch%llu_spu0_fpscr,%08x.%08x.%08x.%08x\n", (unsigned long long)ln, W32(x->st->fpscr_start[0]),
+            W32(x->st->fpscr_start[1]), W32(x->st->fpscr_start[2]), W32(x->st->fpscr_start[3]));
+    if (o->rv == -3) { fatal_row(f, &o->tr, "launch"); return -1; }
+    o->state = W32(x->st->state); o->flags = W32(x->st->flags); o->entries = W32(x->st->entries);
+    return 0;
+}
+
+static void lane_close_row(FILE *f, const char *kind, const char *on, const char *dn, uint32_t blk, uint32_t rows, int complete, const lane_out_t *o) {
+    if (complete) {
+        fprintf(f, "%s_DONE,%s,%s,%u,%u\n", kind, on, dn, blk, rows);
+    } else {
+        char d1[200];
+        clean(d1, sizeof d1, o->tr.desc);
+        fprintf(f, "%s_FAULT,%s,%s,%u,%u,rv_%d state_%u flags_%u %s\n", kind, on, dn, blk, rows, o->rv, o->state, o->flags, d1);
+    }
+    fflush(f);
+}
+
+/* The sweep's rule for the DP compares: only when probe A showed that the SPU executes them (or forced); else a SKIP row. */
+static int lane_dpcmp_skipped(const spuexh_runcfg_t *rc, FILE *f, int op, const char *on) {
+    int skip = 0;
+    for (int k = 0; k < 5 && !rc->force_dpcmp; k++)
+        if (!strcmp(spuexh_ops[op].name, spuexh_dpcmp_names[k]) && !(rc->dpcmp_known && rc->dpcmp_ok[k])) {
+            fprintf(f, "SKIP,%s,%s\n", on, rc->dpcmp_known ? "rejected_by_special_a" : "special_a_not_run");
+            skip = 1;
+        }
+    return skip;
+}
+
 int spuexh_run_lanes(spuexh_backend_t *be, const spuexh_runcfg_t *rc, const spuexh_sink_t *sink) {
     FILE *f = sink->out;
-    if (!rc->nlanes) return 0;
-    uint64_t par_ea = 0, st_ea = 0, b_ea = 0;
-    spuexh_params_t *par = (spuexh_params_t *)be->alloc(be, sizeof *par, &par_ea);
-    volatile spuexh_status_t *st = NULL;
-    spuexh_lane_t *buf = NULL;
-    if (par) st = (volatile spuexh_status_t *)be->alloc(be, sizeof *st, &st_ea);
-    if (st) buf = (spuexh_lane_t *)be->alloc(be, (size_t)SPUEXH_LANES_MAX_COUNT * sizeof *buf, &b_ea);
-    fprintf(f, "META,lanes,%d\n", rc->nlanes);
-    if (!par || !st || !buf) { fprintf(f, "FATAL,lanes,allocation_failed\n"); fflush(f); return -1; }
+    if (!rc->nlanes && !rc->nsums) return 0;
+    lane_ctx_t x;
+    memset(&x, 0, sizeof x);
+    x.par = (spuexh_params_t *)be->alloc(be, sizeof *x.par, &x.par_ea);
+    if (x.par) x.st = (volatile spuexh_status_t *)be->alloc(be, sizeof *x.st, &x.st_ea);
+    if (x.st) x.buf = (uint8_t *)be->alloc(be, LANE_BUF_BYTES, &x.b_ea);
+    fprintf(f, "META,lanes,%d\nMETA,lanesums,%d\n", rc->nlanes, rc->nsums);
+    if (!x.par || !x.st || !x.buf) { fprintf(f, "FATAL,lanes,allocation_failed\n"); fflush(f); return -1; }
+    lane_out_t o;
+
     for (int q = 0; q < rc->nlanes; q++) {
-        const spuexh_op_t *op = &spuexh_ops[rc->lanes[q].op];
-        const char *dn = spuexh_dom_names[rc->lanes[q].dom];
-        const uint32_t blk = rc->lanes[q].blk;
-        /* the sweep's rule for the DP compares: only when probe A showed that the SPU executes them (or forced) */
-        int skip = 0;
-        for (int k = 0; k < 5 && !rc->force_dpcmp; k++)
-            if (!strcmp(op->name, spuexh_dpcmp_names[k]) && !(rc->dpcmp_known && rc->dpcmp_ok[k])) {
-                fprintf(f, "SKIP,%s,%s\n", op->name, rc->dpcmp_known ? "rejected_by_special_a" : "special_a_not_run");
-                skip = 1;
-            }
-        if (skip) continue;
-        uint64_t avail = exh_doms[rc->lanes[q].dom].ncalls - ((uint64_t)blk << EXH_BLOCK_LOG2);
-        const uint32_t count = (uint64_t)rc->lanes[q].count < avail ? (uint32_t)rc->lanes[q].count : (uint32_t)avail;
+        const int op = rc->lanes[q].op, dom = rc->lanes[q].dom;
+        char on[24];
+        lane_name(on, sizeof on, op, rc->lanes[q].scale);
+        const char *dn = spuexh_dom_names[dom];
+        const uint32_t blk = rc->lanes[q].blk, start = rc->lanes[q].start, count = (uint32_t)rc->lanes[q].count;
+        if (lane_dpcmp_skipped(rc, f, op, on)) continue;
         /* pre-log: flushed before the launch, so a lost run names the entry that was being attempted */
-        fprintf(f, "LANES,%s,%s,%u,%u,%u\n", op->name, dn, blk, count, (unsigned)op->imm_bits);
+        fprintf(f, "LANES,%s,%s,%u,%u,%u,%u\n", on, dn, blk, count, (unsigned)spuexh_ops[op].imm_bits, start);
         fflush(f);
-
-        memset(buf, 0, (size_t)SPUEXH_LANES_MAX_COUNT * sizeof *buf);
-        memset((void *)st, 0, sizeof *st);
-        memset(par, 0, sizeof *par);
-        par->magic = W32(SPUEXH_PARAMS_MAGIC); par->mode = W32(SPUEXH_MODE_LANES); par->spu_index = 0; par->spu_count = W32(1u);
-        par->results_cap = W32((uint32_t)SPUEXH_LANES_MAX_COUNT); par->results_ea = W64(b_ea); par->status_ea = W64(st_ea);
-        par->lane_op = W32((uint32_t)rc->lanes[q].op); par->lane_dom = W32((uint32_t)rc->lanes[q].dom);
-        par->lane_blk = W32(blk); par->lane_count = W32(count);
-        __sync_synchronize();
-        const volatile spuexh_status_t *stp[1] = { st };
-        spuexh_thread_res_t tr;
-        memset(&tr, 0, sizeof tr);
-        const int rv = be->run(be, 1, &par_ea, stp, NULL, NULL, rc->launch_timeout_ms, &tr);
-        __sync_synchronize();
-        const uint64_t ln = ++g_launch_seq;
-        launch_meta(f, ln, &tr, 1);
-        fprintf(f, "META,launch%llu_spu0_fpscr,%08x.%08x.%08x.%08x\n", (unsigned long long)ln,
-                W32(st->fpscr_start[0]), W32(st->fpscr_start[1]), W32(st->fpscr_start[2]), W32(st->fpscr_start[3]));
-        if (rv == -3) { fatal_row(f, &tr, "launch"); return -1; }
-
-        const uint32_t state = W32(st->state), flags = W32(st->flags);
-        uint32_t rows = W32(st->entries);
-        if (rv < 0 || rows > count) rows = rv < 0 ? 0 : count;           /* nothing ran, or a status that cannot be right */
+        if (lane_launch(be, rc, f, &x, SPUEXH_MODE_LANES, op, rc->lanes[q].scale, dom, blk, start, count, SPUEXH_LANES_MAX_COUNT, &o) < 0) return -1;
+        uint32_t rows = o.entries;
+        if (o.rv < 0 || rows > count) rows = o.rv < 0 ? 0 : count;           /* nothing ran, or a status that cannot be right */
+        const spuexh_lane_t *recs = (const spuexh_lane_t *)x.buf;
         for (uint32_t k = 0; k < rows; k++) {
-            const spuexh_lane_t *L = &buf[k];
-            char a[40], b[40], c[40], o[40], im[16];
-            hex128(a, L->a); hex128(b, L->b); hex128(c, L->c); hex128(o, L->out);
-            if (op->imm_bits) snprintf(im, sizeof im, "%u", W32(L->imm)); else snprintf(im, sizeof im, "-");
-            fprintf(f, "LANE,%s,%s,%u,%llu,%s,%s,%s,%s,%s\n", op->name, dn, blk, (unsigned long long)W64(L->call), a, b, c, im, o);
+            const spuexh_lane_t *L = &recs[k];
+            char a[40], b[40], c[40], r[40], im[16];
+            hex128(a, L->a); hex128(b, L->b); hex128(c, L->c); hex128(r, L->out);
+            if (spuexh_ops[op].imm_bits) snprintf(im, sizeof im, "%u", W32(L->imm)); else snprintf(im, sizeof im, "-");
+            fprintf(f, "LANE,%s,%s,%u,%llu,%s,%s,%s,%s,%s\n", on, dn, blk, (unsigned long long)W64(L->call), a, b, c, im, r);
         }
-        if (rv == 0 && state == 2 && !(flags & 8u) && rows == count) {
-            fprintf(f, "LANES_DONE,%s,%s,%u,%u\n", op->name, dn, blk, rows);
-        } else {
-            char d1[200];
-            clean(d1, sizeof d1, tr.desc);
-            fprintf(f, "LANES_FAULT,%s,%s,%u,%u,rv_%d state_%u flags_%u %s\n", op->name, dn, blk, rows, rv, state, flags, d1);
-        }
-        fflush(f);
+        lane_close_row(f, "LANES", on, dn, blk, rows, o.rv == 0 && o.state == 2 && !(o.flags & 8u) && rows == count, &o);
         if (sink->ui) {
             char s[96];
-            snprintf(s, sizeof s, "lanes: %s %s %u (%d/%d)", op->name, dn, blk, q + 1, rc->nlanes);
+            snprintf(s, sizeof s, "lanes: %s %s %u (%d/%d)", on, dn, blk, q + 1, rc->nlanes);
+            if (sink->ui(sink->uu, s)) return 1;
+        }
+    }
+
+    for (int q = 0; q < rc->nsums; q++) {
+        const int op = rc->sums[q].op, dom = rc->sums[q].dom;
+        char on[24];
+        lane_name(on, sizeof on, op, rc->sums[q].scale);
+        const char *dn = spuexh_dom_names[dom];
+        const uint32_t blk = rc->sums[q].blk, chunk = rc->sums[q].chunk;
+        uint64_t calls = exh_doms[dom].ncalls - ((uint64_t)blk << EXH_BLOCK_LOG2);
+        if (calls > EXH_BLOCK) calls = EXH_BLOCK;
+        const uint32_t nchunks = (uint32_t)((calls + chunk - 1) / chunk);
+        if (lane_dpcmp_skipped(rc, f, op, on)) continue;
+        fprintf(f, "LANESUM_BEGIN,%s,%s,%u,%u,%u\n", on, dn, blk, chunk, nchunks);
+        fflush(f);
+        if (lane_launch(be, rc, f, &x, SPUEXH_MODE_LANESUM, op, rc->sums[q].scale, dom, blk, 0, chunk, SPUEXH_LANESUM_MAX_CHUNKS, &o) < 0) return -1;
+        uint32_t rows = o.entries;
+        if (o.rv < 0 || rows > nchunks) rows = o.rv < 0 ? 0 : nchunks;
+        const uint64_t *hs = (const uint64_t *)x.buf;
+        for (uint32_t k = 0; k < rows; k++) {
+            const uint64_t first = (uint64_t)k * chunk;
+            const uint64_t n = calls - first < chunk ? calls - first : chunk;
+            fprintf(f, "LANESUM,%s,%s,%u,%llu,%llu,%016llx\n", on, dn, blk, (unsigned long long)first, (unsigned long long)n,
+                    (unsigned long long)W64(hs[k]));
+        }
+        lane_close_row(f, "LANESUM", on, dn, blk, rows, o.rv == 0 && o.state == 2 && !(o.flags & 8u) && rows == nchunks, &o);
+        if (sink->ui) {
+            char s[96];
+            snprintf(s, sizeof s, "lanesum: %s %s %u (%d/%d)", on, dn, blk, q + 1, rc->nsums);
             if (sink->ui(sink->uu, s)) return 1;
         }
     }

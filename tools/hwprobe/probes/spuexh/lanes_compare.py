@@ -38,9 +38,9 @@ class FormatError(Exception):
 
 
 class Group:
-    def __init__(self, op, dom, blk, count=None, imm_bits=None):
+    def __init__(self, op, dom, blk, count=None, imm_bits=None, start=None):
         self.op, self.dom, self.blk = op, dom, blk
-        self.count, self.imm_bits = count, imm_bits       # from the LANES header row (None: a file without one)
+        self.count, self.imm_bits, self.start = count, imm_bits, start    # from the LANES header row (None: a file without one)
         self.rows = []                                      # (call, a, b, c, imm, out)
         self.status = None                                  # "done" | "fault: text" | None (no closing row: lost run)
 
@@ -68,10 +68,10 @@ def parse_result(path):
             p = line.split(",")
             kind = p[0]
             if kind == "LANES":
-                if len(p) != 6:
-                    raise FormatError(f"line {lineno}: LANES row needs 6 fields")
+                if len(p) not in (6, 7):                     # 7: with the start call (a file of the first lanes mode has 6)
+                    raise FormatError(f"line {lineno}: LANES row needs 6 or 7 fields")
                 try:
-                    cur = Group(p[1], p[2], int(p[3]), int(p[4]), int(p[5]))
+                    cur = Group(p[1], p[2], int(p[3]), int(p[4]), int(p[5]), int(p[6]) if len(p) == 7 else None)
                 except ValueError:
                     raise FormatError(f"line {lineno}: bad number in LANES row") from None
                 groups.append(cur)
@@ -93,9 +93,10 @@ def parse_result(path):
     return groups
 
 
-def run_scalar(binary, op, dom, blk, ncalls):
-    """{call: (a, b, c, imm, out_fast, out_ref)} of the first ncalls calls of the block from the host harness."""
-    argv = [binary, "--dump", op, dom, str(blk), "--dump-n", str(ncalls)]
+def run_scalar(binary, op, dom, blk, start, ncalls):
+    """{call: (a, b, c, imm, out_fast, out_ref)} of ncalls calls of the block, from call `start` (counted from the start of the
+    block), from the host harness."""
+    argv = [binary, "--dump", op, dom, str(blk), "--dump-start", str(start), "--dump-n", str(ncalls)]
     try:
         p = subprocess.run(argv, check=False, capture_output=True, text=True, timeout=600)
     except (OSError, subprocess.SubprocessError) as e:
@@ -152,12 +153,18 @@ def compare_group(binary, group):
     lo = group.blk << BLOCK_LOG2
     if not group.rows:
         return res
-    ncalls = max(r[0] for r in group.rows) - lo + 1
-    if ncalls < 1:
+    first = min(r[0] for r in group.rows)
+    if first < lo:
         res.n_input_errors += 1
-        res.input_errors.append(f"call {group.rows[0][0]} is outside block {group.blk}")
+        res.input_errors.append(f"call {first} is outside block {group.blk}")
         return res
-    sc = run_scalar(binary, group.op, group.dom, group.blk, ncalls)
+    if group.start is not None and first - lo != group.start:
+        # the entry asked for calls from `start`, the SPU dumped others: its handling of the request is at fault
+        res.n_input_errors += len(group.rows)
+        res.input_errors.append(f"the entry asked for calls from {group.start} of the block, the dump starts at call {first - lo}")
+        return res
+    ncalls = max(r[0] for r in group.rows) - first + 1
+    sc = run_scalar(binary, group.op, group.dom, group.blk, first - lo, ncalls)
     layout = LAYOUTS.get(group.op, DEFAULT_LAYOUT)
     for call, a, b, c, imm, out in group.rows:
         s = sc.get(call)
