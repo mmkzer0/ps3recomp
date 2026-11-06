@@ -83,9 +83,11 @@ void hwp_write_header(FILE *f, const hwp_header_t *h);
 /* Next run id of `probe` in `dir` (counter in <dir>/<probe>_runid.txt), 1 when absent. */
 int hwp_next_run_id(const char *dir, const char *probe);
 
-/* Creates `dir` if missing, opens <dir>/<name> for writing with a 64 KiB buffer. When
- * that fails, falls back to /dev_usb000/<name>. `path` receives the path actually used.
- * Returns NULL when both fail. One result file at a time (static buffer). */
+/* Creates `dir` if missing, opens <dir>/<name> for writing with a 64 KiB buffer.
+ * Returns NULL when that fails: there is no fallback device, because probes write only
+ * inside `dir` (/dev_hdd0/tmp/hwprobe) and a failed open must end the probe, not move the
+ * results elsewhere. `path` receives the path attempted. One result file at a time
+ * (static buffer). */
 FILE *hwp_result_open(const char *dir, const char *name, char *path, size_t cap);
 
 /* <dir>/<probe>_last.txt = result path + one summary line, for operators who only

@@ -1,7 +1,7 @@
 # ring110 CSV format (version 1)
 
-One file per run, `/dev_hdd0/tmp/hwprobe/ring110_<L1|L2>_r<run>_n<blocks>c<channels>[_<tag>].csv` (USB fallback
-`/dev_usb000/`), written after the polling loop ends (no file I/O and no drawing while measuring). The file starts
+One file per run, `/dev_hdd0/tmp/hwprobe/ring110_<L1|L2>_r<run>_n<blocks>c<channels>[_<tag>].csv` (no other
+location: a failed open stops the probe), written after the polling loop ends (no file I/O and no drawing while measuring). The file starts
 with the versioned hwprobe header (`HWPROBE,<version>` and `HDR,<key>,<value>` rows, see `tools/hwprobe/README.md`;
 `analyze_layer1.py` rejects a file without it or with an unknown version). After the header every line is
 `TYPE,field,...`; numbers are decimal unless shown as `0x...`. `tb` is the PPU timebase (`META,tbfreq` ticks per

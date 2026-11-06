@@ -89,14 +89,10 @@ FILE *hwp_result_open(const char *dir, const char *name, char *path, size_t cap)
 	snprintf(path, cap, "%s/%s", dir, name);
 	f = fopen(path, "w");
 	if (!f) {
+		/* Fail closed: probes must not write anywhere but `dir` (/dev_hdd0/tmp/hwprobe), so a failed
+		 * open ends the probe with an error instead of moving the results to another device. */
 		printf("cannot open %s\n", path);
-		snprintf(path, cap, "/dev_usb000/%s", name);
-		f = fopen(path, "w");
-		if (!f) {
-			printf("cannot open %s\n", path);
-			return NULL;
-		}
-		printf("writing %s instead\n", path);
+		return NULL;
 	}
 	setvbuf(f, iobuf, _IOFBF, sizeof(iobuf));
 	return f;

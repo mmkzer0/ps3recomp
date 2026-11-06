@@ -158,4 +158,4 @@ python3 $PROBE/synth_layer2.py /tmp/demo --x-ms 2.6 && python3 $PROBE/analyze_la
 | `abort_reason` 3 | you quit by hand; the data up to then is valid |
 | Warnings about polling gaps > 20 us | the polling thread was preempted (webMAN, system tasks): rerun after a cold boot; compare with a `screen=0` run (run 10) |
 | `ps3ftp.py` cannot connect | start webMAN/multiMAN FTP, check the address and, on a direct cable, the route (README) |
-| No `ring110_*.csv` but `ring110_last.txt` | the write failed; plug in a USB stick and rerun (the probe falls back to `/dev_usb000/`) |
+| No `ring110_*.csv` but `ring110_last.txt` | the write failed and the probe stopped (it writes nowhere but `/dev_hdd0/tmp/hwprobe/`); check free space on the HDD and rerun |
