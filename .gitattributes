@@ -1,0 +1,2 @@
+# Patch files carry blank context lines as a single space; the whitespace check must not strip them.
+tools/hwprobe/toolchain/patches/*.patch -whitespace

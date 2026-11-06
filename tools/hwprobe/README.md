@@ -51,6 +51,14 @@ build tools, native architecture, no emulation). Local deviations, all deliberat
 (C++ costs about 1 GB and 10 minutes and no probe uses it), the SPU toolchain, gdb and ps3libraries are skipped,
 PSL1GHT builds `install-ctrl`, `ppu` and `tools` only.
 
+**SPU part (opt-in).** `build-toolchain.sh --with-spu` (or `--spu-only` for the SPU part alone, `--check` combines with both)
+adds ps3toolchain steps 005 and 006 (binutils 2.22 and gcc 9.5.0 + newlib 1.20.0 for the `spu` target, the last gcc with an
+SPU backend) and PSL1GHT's `spu` libraries (`libsputhread`, `libspudma`, `libspuatomic`, the headers), same pins, C only
+(`patches/ps3toolchain-006-gcc-spu.patch`, which also fetches the gcc prerequisites over https because the stock script uses
+ftp). Without the flag nothing changes. `--native` runs the steps on a linux host that matches the container (Ubuntu 24.04
+with the Containerfile's packages) instead of in podman, `HWPROBE_JOBS=N` caps `make -j` there. A probe with SPU code
+(`probes/<probe>/spu/`) makes `build.sh` require the SPU part.
+
 The install prefix defaults to `~/ps3-dev/ps3dev-toolchain/ps3dev`; set `PS3DEV` to move it (the sources go next to
 it, override with `HWPROBE_TOOLCHAIN_ROOT`). A finished prefix is recognised from its artifacts and left alone: the
 script exits 0 without starting podman. A partial one gets only the missing steps. A source tree on another commit
