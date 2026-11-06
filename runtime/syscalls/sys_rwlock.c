@@ -8,10 +8,33 @@
 #include <string.h>
 #include <time.h>
 
+#ifdef PS3_SYNC_TEST_HOOKS
+extern int ps3_sync_test_hook(const char* point, uint32_t id);
+#ifndef _WIN32
+extern int ps3_sync_test_clock_gettime(clockid_t clock_id, struct timespec* ts);
+static int rw_clock_gettime(clockid_t clock_id, struct timespec* ts)
+{
+    return ps3_sync_test_clock_gettime(clock_id, ts);
+}
+#endif
+static int rw_test_poll(void)
+{
+    return ps3_sync_test_hook("rw.poll", 0);
+}
+#else
+#ifndef _WIN32
+static int rw_clock_gettime(clockid_t clock_id, struct timespec* ts)
+{
+    return clock_gettime(clock_id, ts);
+}
+#endif
+static int rw_test_poll(void) { return 0; }
+#endif
 /* ---------------------------------------------------------------------------
  * Globals
  * -----------------------------------------------------------------------*/
 sys_rwlock_info g_sys_rwlocks[SYS_RWLOCK_MAX];
+static uint32_t s_rw_operations[SYS_RWLOCK_MAX];
 
 /* Slot claim/release lock: create scanned for a free slot unlocked, so two
  * threads creating at once could take the same one. */
@@ -24,6 +47,27 @@ static pthread_mutex_t s_rw_table_lock = PTHREAD_MUTEX_INITIALIZER;
 static void rw_table_lock(void)   { pthread_mutex_lock(&s_rw_table_lock); }
 static void rw_table_unlock(void) { pthread_mutex_unlock(&s_rw_table_lock); }
 #endif
+static sys_rwlock_info* rw_operation_begin(uint32_t rwlock_id)
+{
+    if (rwlock_id == 0 || rwlock_id > SYS_RWLOCK_MAX)
+        return NULL;
+    rw_table_lock();
+    sys_rwlock_info* r = &g_sys_rwlocks[rwlock_id - 1];
+    if (!r->active) {
+        rw_table_unlock();
+        return NULL;
+    }
+    s_rw_operations[rwlock_id - 1]++;
+    rw_table_unlock();
+    return r;
+}
+
+static void rw_operation_end(uint32_t rwlock_id)
+{
+    rw_table_lock();
+    s_rw_operations[rwlock_id - 1]--;
+    rw_table_unlock();
+}
 
 /* One acquire attempt, shared (excl = 0) or exclusive. 1 = acquired. */
 static int rw_try(sys_rwlock_info* r, int excl)
@@ -51,25 +95,48 @@ static int rw_acquire(sys_rwlock_info* r, uint64_t timeout_us, int excl)
 #endif
         return 1;
     }
+    /* A successful try at the exact boundary wins; this is an inference from
+     * lv2's existing try-then-timeout polling convention, not a firmware probe. */
 #ifdef _WIN32
     const int64_t deadline = lv2_usec_deadline(timeout_us);
     for (;;) {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        if (now.QuadPart > deadline) return 0;
         if (rw_try(r, excl)) return 1;
         if (lv2_deadline_passed(deadline)) return 0;
-        if (timeout_us < 1000) SwitchToThread();
-        else                   Sleep(1);
+        const int test_poll = rw_test_poll();
+        if (test_poll == 2) return 0;
+        if (test_poll == 0) {
+            if (timeout_us < 1000) SwitchToThread();
+            else                   Sleep(1);
+        }
     }
 #else
-    struct timespec t0, now;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    struct timespec deadline, now;
+    rw_clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_sec += (time_t)(timeout_us / 1000000);
+    deadline.tv_nsec += (long)((timeout_us % 1000000) * 1000);
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
     for (;;) {
+        rw_clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec > deadline.tv_sec ||
+            (now.tv_sec == deadline.tv_sec && now.tv_nsec > deadline.tv_nsec))
+            return 0;
         if (rw_try(r, excl)) return 1;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        const int64_t elapsed_us = (int64_t)(now.tv_sec - t0.tv_sec) * 1000000 +
-                                   (now.tv_nsec - t0.tv_nsec) / 1000;
-        if (elapsed_us >= (int64_t)timeout_us) return 0;
-        struct timespec nap = { 0, 100 * 1000 };
-        nanosleep(&nap, NULL);
+        rw_clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec > deadline.tv_sec ||
+            (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec))
+            return 0;
+        const int test_poll = rw_test_poll();
+        if (test_poll == 2) return 0;
+        if (test_poll == 0) {
+            struct timespec nap = { 0, 100 * 1000 };
+            nanosleep(&nap, NULL);
+        }
     }
 #endif
 }
@@ -171,6 +238,10 @@ int64_t sys_rwlock_destroy(ppu_context* ctx)
         rw_table_unlock();
         return (int64_t)(int32_t)CELL_ESRCH;
     }
+    if (s_rw_operations[rwlock_id - 1] != 0) {
+        rw_table_unlock();
+        return (int64_t)(int32_t)CELL_EBUSY;
+    }
 
     /* lv2 refuses while any reader or the writer holds it (CELL_EBUSY). It used
      * to free the slot under the holders, whose later unlock then hit a
@@ -201,55 +272,55 @@ int64_t sys_rwlock_rlock(ppu_context* ctx)
     if (rwlock_id == 0 || rwlock_id > SYS_RWLOCK_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
 
-    sys_rwlock_info* r = &g_sys_rwlocks[rwlock_id - 1];
-    if (!r->active)
+    sys_rwlock_info* r = rw_operation_begin(rwlock_id);
+    if (!r)
         return (int64_t)(int32_t)CELL_ESRCH;
 
-    if (!rw_acquire(r, timeout, 0))
+    if (!rw_acquire(r, timeout, 0)) {
+        rw_operation_end(rwlock_id);
         return (int64_t)(int32_t)CELL_ETIMEDOUT;
+    }
 #ifdef _WIN32
     InterlockedIncrement(&r->readers);
 #else
     __atomic_add_fetch(&r->readers, 1, __ATOMIC_ACQ_REL);
 #endif
-
+    rw_operation_end(rwlock_id);
     return CELL_OK;
 }
-
 int64_t sys_rwlock_tryrlock(ppu_context* ctx)
 {
     uint32_t rwlock_id = LV2_ARG_U32(ctx, 0);
-
     if (rwlock_id == 0 || rwlock_id > SYS_RWLOCK_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
 
-    sys_rwlock_info* r = &g_sys_rwlocks[rwlock_id - 1];
-    if (!r->active)
+    sys_rwlock_info* r = rw_operation_begin(rwlock_id);
+    if (!r)
         return (int64_t)(int32_t)CELL_ESRCH;
-
 #ifdef _WIN32
-    if (!TryAcquireSRWLockShared(&r->srw))
+    if (!TryAcquireSRWLockShared(&r->srw)) {
+        rw_operation_end(rwlock_id);
         return (int64_t)(int32_t)CELL_EBUSY;
+    }
     InterlockedIncrement(&r->readers);
 #else
-    int rc = pthread_rwlock_tryrdlock(&r->rwl);
-    if (rc != 0)
+    if (pthread_rwlock_tryrdlock(&r->rwl) != 0) {
+        rw_operation_end(rwlock_id);
         return (int64_t)(int32_t)CELL_EBUSY;
+    }
     __atomic_add_fetch(&r->readers, 1, __ATOMIC_ACQ_REL);
 #endif
-
+    rw_operation_end(rwlock_id);
     return CELL_OK;
 }
-
 int64_t sys_rwlock_runlock(ppu_context* ctx)
 {
     uint32_t rwlock_id = LV2_ARG_U32(ctx, 0);
-
     if (rwlock_id == 0 || rwlock_id > SYS_RWLOCK_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
 
-    sys_rwlock_info* r = &g_sys_rwlocks[rwlock_id - 1];
-    if (!r->active)
+    sys_rwlock_info* r = rw_operation_begin(rwlock_id);
+    if (!r)
         return (int64_t)(int32_t)CELL_ESRCH;
 
     /* No read lock held -> CELL_EPERM. It used to decrement below zero and
@@ -258,8 +329,10 @@ int64_t sys_rwlock_runlock(ppu_context* ctx)
 #ifdef _WIN32
     for (;;) {
         LONG n = r->readers;
-        if (n <= 0)
+        if (n <= 0) {
+            rw_operation_end(rwlock_id);
             return (int64_t)(int32_t)CELL_EPERM;
+        }
         if (InterlockedCompareExchange(&r->readers, n - 1, n) == n)
             break;
     }
@@ -267,37 +340,40 @@ int64_t sys_rwlock_runlock(ppu_context* ctx)
 #else
     for (;;) {
         int32_t n = __atomic_load_n(&r->readers, __ATOMIC_ACQUIRE);
-        if (n <= 0)
+        if (n <= 0) {
+            rw_operation_end(rwlock_id);
             return (int64_t)(int32_t)CELL_EPERM;
+        }
         if (__atomic_compare_exchange_n(&r->readers, &n, n - 1, 0,
                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
             break;
     }
     pthread_rwlock_unlock(&r->rwl);
 #endif
-
+    rw_operation_end(rwlock_id);
     return CELL_OK;
 }
-
 int64_t sys_rwlock_wlock(ppu_context* ctx)
 {
     uint32_t rwlock_id  = LV2_ARG_U32(ctx, 0);
     uint64_t timeout    = LV2_ARG_U64(ctx, 1);   /* us, 0 = forever */
-
     if (rwlock_id == 0 || rwlock_id > SYS_RWLOCK_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
 
-    sys_rwlock_info* r = &g_sys_rwlocks[rwlock_id - 1];
-    if (!r->active)
+    sys_rwlock_info* r = rw_operation_begin(rwlock_id);
+    if (!r)
         return (int64_t)(int32_t)CELL_ESRCH;
-
 #ifdef _WIN32
     /* A thread that already holds the write lock re-acquiring it would deadlock
      * the (non-recursive) SRWLock. Real lv2 returns CELL_EDEADLK. */
-    if (r->writer && r->writer_tid == ctx->thread_id)
+    if (r->writer && r->writer_tid == ctx->thread_id) {
+        rw_operation_end(rwlock_id);
         return (int64_t)(int32_t)CELL_EDEADLK;
-    if (!rw_acquire(r, timeout, 1))
+    }
+    if (!rw_acquire(r, timeout, 1)) {
+        rw_operation_end(rwlock_id);
         return (int64_t)(int32_t)CELL_ETIMEDOUT;
+    }
     InterlockedExchange(&r->writer, 1);
     r->writer_tid = ctx->thread_id;
 #else
@@ -306,62 +382,69 @@ int64_t sys_rwlock_wlock(ppu_context* ctx)
      * it returns 0, which is worse: the guest is told it took a second lock
      * level that no unlock will ever match. Answer EDEADLK before touching
      * the lock, as the Win32 branch does. */
-    if (rwlock_writer(r) == ctx->thread_id)
+    if (rwlock_writer(r) == ctx->thread_id) {
+        rw_operation_end(rwlock_id);
         return (int64_t)(int32_t)CELL_EDEADLK;
-    if (!rw_acquire(r, timeout, 1))
+    }
+    if (!rw_acquire(r, timeout, 1)) {
+        rw_operation_end(rwlock_id);
         return (int64_t)(int32_t)CELL_ETIMEDOUT;
+    }
     rwlock_set_writer(r, ctx->thread_id);
 #endif
-
+    rw_operation_end(rwlock_id);
     return CELL_OK;
 }
-
 int64_t sys_rwlock_trywlock(ppu_context* ctx)
 {
     uint32_t rwlock_id = LV2_ARG_U32(ctx, 0);
-
     if (rwlock_id == 0 || rwlock_id > SYS_RWLOCK_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
 
-    sys_rwlock_info* r = &g_sys_rwlocks[rwlock_id - 1];
-    if (!r->active)
+    sys_rwlock_info* r = rw_operation_begin(rwlock_id);
+    if (!r)
         return (int64_t)(int32_t)CELL_ESRCH;
-
 #ifdef _WIN32
-    if (r->writer && r->writer_tid == ctx->thread_id)
+    if (r->writer && r->writer_tid == ctx->thread_id) {
+        rw_operation_end(rwlock_id);
         return (int64_t)(int32_t)CELL_EDEADLK;
-    if (!TryAcquireSRWLockExclusive(&r->srw))
+    }
+    if (!TryAcquireSRWLockExclusive(&r->srw)) {
+        rw_operation_end(rwlock_id);
         return (int64_t)(int32_t)CELL_EBUSY;
+    }
     InterlockedExchange(&r->writer, 1);
     r->writer_tid = ctx->thread_id;
 #else
-    if (rwlock_writer(r) == ctx->thread_id)
+    if (rwlock_writer(r) == ctx->thread_id) {
+        rw_operation_end(rwlock_id);
         return (int64_t)(int32_t)CELL_EDEADLK;
-    int rc = pthread_rwlock_trywrlock(&r->rwl);
-    if (rc != 0)
+    }
+    if (pthread_rwlock_trywrlock(&r->rwl) != 0) {
+        rw_operation_end(rwlock_id);
         return (int64_t)(int32_t)CELL_EBUSY;
+    }
     rwlock_set_writer(r, ctx->thread_id);
 #endif
-
+    rw_operation_end(rwlock_id);
     return CELL_OK;
 }
-
 int64_t sys_rwlock_wunlock(ppu_context* ctx)
 {
     uint32_t rwlock_id = LV2_ARG_U32(ctx, 0);
-
     if (rwlock_id == 0 || rwlock_id > SYS_RWLOCK_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
 
-    sys_rwlock_info* r = &g_sys_rwlocks[rwlock_id - 1];
-    if (!r->active)
+    sys_rwlock_info* r = rw_operation_begin(rwlock_id);
+    if (!r)
         return (int64_t)(int32_t)CELL_ESRCH;
-
 #ifdef _WIN32
     /* Only the owning thread may write-unlock (releasing an SRWLock not held in
      * exclusive mode by this thread is UB). Real lv2 returns CELL_EPERM. */
-    if (!r->writer || r->writer_tid != ctx->thread_id)
+    if (!r->writer || r->writer_tid != ctx->thread_id) {
+        rw_operation_end(rwlock_id);
         return (int64_t)(int32_t)CELL_EPERM;
+    }
     r->writer_tid = 0;
     InterlockedExchange(&r->writer, 0);
     ReleaseSRWLockExclusive(&r->srw);
@@ -370,21 +453,25 @@ int64_t sys_rwlock_wunlock(ppu_context* ctx)
      * from a write one, so without the owner check a stray wunlock releases
      * whatever the calling thread happens to hold, or somebody else's write
      * lock entirely. */
-    if (rwlock_writer(r) != ctx->thread_id)
+    if (rwlock_writer(r) != ctx->thread_id) {
+        rw_operation_end(rwlock_id);
         return (int64_t)(int32_t)CELL_EPERM;
+    }
     rwlock_set_writer(r, 0);
     pthread_rwlock_unlock(&r->rwl);
 #endif
-
+    rw_operation_end(rwlock_id);
     return CELL_OK;
 }
-
 /* ---------------------------------------------------------------------------
  * Registration
  * -----------------------------------------------------------------------*/
 void sys_rwlock_init(lv2_syscall_table* tbl)
 {
+    rw_table_lock();
     memset(g_sys_rwlocks, 0, sizeof(g_sys_rwlocks));
+    memset(s_rw_operations, 0, sizeof(s_rw_operations));
+    rw_table_unlock();
 
     lv2_syscall_register(tbl, SYS_RWLOCK_CREATE,   sys_rwlock_create);
     lv2_syscall_register(tbl, SYS_RWLOCK_DESTROY,  sys_rwlock_destroy);

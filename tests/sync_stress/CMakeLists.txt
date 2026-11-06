@@ -118,6 +118,7 @@ add_executable(test_sync_semantics
     "${RUNTIME_SYNC_DIR}/sys_cond.c"
     "${RUNTIME_SYNC_DIR}/sys_semaphore.c"
     "${RUNTIME_SYNC_DIR}/sys_rwlock.c")
+target_compile_definitions(test_sync_semantics PRIVATE PS3_SYNC_TEST_HOOKS)
 if(NOT WIN32)
     target_sources(test_sync_semantics PRIVATE
         "${PS3RECOMP_TREE_ROOT}/runtime/platform/win32_compat.c")
@@ -136,7 +137,7 @@ else()
     target_compile_options(test_sync_semantics PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
 add_test(NAME sync_semantics COMMAND test_sync_semantics)
-set_tests_properties(sync_semantics PROPERTIES LABELS "runtime;sync" TIMEOUT 60)
+set_tests_properties(sync_semantics PROPERTIES LABELS "runtime;sync;t0;tsan" TIMEOUT 60)
 
 # cellSyncMutex*: CELL_SYNC_ERROR_ALIGN for a mutex that is not 4-byte aligned.
 # Links libs/sync/cellSync.c alone; the SPU lock-line hooks are stubbed.
