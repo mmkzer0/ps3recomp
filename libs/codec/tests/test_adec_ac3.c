@@ -21,6 +21,7 @@
 
 #include <math.h>
 #include <stdlib.h>
+#include "../../../tests/guest_range_catch.h"
 
 /* What the runtime would provide (the same stand-ins test_vdec_decode.c uses). */
 uint8_t* vm_base;
@@ -195,6 +196,39 @@ static int mode_decode(int argc, char** argv)
 }
 #endif
 
+/* range: the guest spans cellAdecDecodeAu reads (the AU info block, the AC3 bytes at startAddr) are bounded by
+ * guest memory; a span that leaves it is the named stop hle-guest-range before AUDONE, before the copy. No
+ * media file is needed: the bytes are not decoded. */
+static int mode_range(void)
+{
+    open_adec(CELL_ADEC_TYPE_AC3);
+    const int before = s_nmsg;
+
+    GR_TRY(cellAdecDecodeAu(s_handle, (const CellAdecAuInfo*)(uintptr_t)(MEM_SIZE - 8)));
+    CHECK(gr_named("cellAdecDecodeAu", "auInfo"));
+    GR_TRY(cellAdecDecodeAu(s_handle, (const CellAdecAuInfo*)(uintptr_t)0xFFFFFFF0u));
+    CHECK(gr_named("cellAdecDecodeAu", "auInfo"));
+
+    vm_write32(G_AUINFO + 0, MEM_SIZE - 16);          /* startAddr: the AU runs 48 bytes past the arena */
+    vm_write32(G_AUINFO + 4, 64);
+    GR_TRY(cellAdecDecodeAu(s_handle, (const CellAdecAuInfo*)(uintptr_t)G_AUINFO));
+    CHECK(gr_named("cellAdecDecodeAu", "au"));
+    vm_write32(G_AUINFO + 0, 0xFFFFFF00u);            /* far outside, a size that fits u32 only by wrapping */
+    vm_write32(G_AUINFO + 4, 0x400);
+    GR_TRY(cellAdecDecodeAu(s_handle, (const CellAdecAuInfo*)(uintptr_t)G_AUINFO));
+    CHECK(gr_named("cellAdecDecodeAu", "au"));
+    CHECK(s_nmsg == before);                          /* no AUDONE, no PCMOUT for a refused AU */
+
+    /* A span that fits exactly is accepted: AUDONE, then PCMOUT. */
+    memset(vm_base + MEM_SIZE - 64, 0, 64);
+    vm_write32(G_AUINFO + 0, MEM_SIZE - 64);
+    vm_write32(G_AUINFO + 4, 64);
+    CHECK(cellAdecDecodeAu(s_handle, (const CellAdecAuInfo*)(uintptr_t)G_AUINFO) == CELL_OK);
+    CHECK(s_nmsg == before + 2);
+    printf("PASS cellAdecDecodeAu bounds its guest spans\n");
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -203,6 +237,7 @@ int main(int argc, char** argv)
     ppu_vm_size = MEM_SIZE;
     const char* mode = argc > 1 ? argv[1] : "stub";
     if (strcmp(mode, "stub") == 0) return mode_stub(argc, argv);
+    if (strcmp(mode, "range") == 0) return mode_range();
 #ifdef PS3RECOMP_FFMPEG_RUNTIME
     if (strcmp(mode, "decode") == 0) return mode_decode(argc, argv);
 #endif

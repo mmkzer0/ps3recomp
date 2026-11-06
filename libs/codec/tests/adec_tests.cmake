@@ -1,5 +1,14 @@
 # cellAdec AC3, driven through its guest API (test_adec_ac3.c). Included from
 # CMakeLists.txt. The streams are made by the ffmpeg program at test time.
+
+# Without FFmpeg: silence of the real AC3 frame size.
+add_executable(test_adec_stub test_adec_ac3.c)
+target_include_directories(test_adec_stub PRIVATE "${PROJECT_SOURCE_DIR}/include")
+target_link_libraries(test_adec_stub PRIVATE ${VDEC_TEST_LIBS})
+# The spans cellAdecDecodeAu reads are bounded by guest memory (a named stop, not a host access); no stream needed.
+add_test(NAME adec_ac3_range COMMAND test_adec_stub range)
+set_tests_properties(adec_ac3_range PROPERTIES LABELS "codec;t0")
+
 find_program(PS3RECOMP_FFMPEG_EXECUTABLE ffmpeg)
 if(NOT PS3RECOMP_FFMPEG_EXECUTABLE)
     message(STATUS "  FFmpeg:       no ffmpeg program; cellAdec AC3 tests not added")
@@ -12,10 +21,7 @@ add_test(NAME adec_media_gen COMMAND "${CMAKE_COMMAND}"
     -P "${CMAKE_CURRENT_SOURCE_DIR}/gen_adec_media.cmake")
 set_tests_properties(adec_media_gen PROPERTIES FIXTURES_SETUP adec_media)
 
-# Without FFmpeg: silence of the real AC3 frame size.
-add_executable(test_adec_stub test_adec_ac3.c)
-target_include_directories(test_adec_stub PRIVATE "${PROJECT_SOURCE_DIR}/include")
-target_link_libraries(test_adec_stub PRIVATE ${VDEC_TEST_LIBS})
+# The silence of the real AC3 frame size, against streams made by ffmpeg.
 add_test(NAME adec_ac3_stub COMMAND test_adec_stub stub
     ${ADEC_MEDIA}/t51.ac3 ${ADEC_MEDIA}/t20.ac3)
 set_tests_properties(adec_ac3_stub PROPERTIES FIXTURES_REQUIRED adec_media)

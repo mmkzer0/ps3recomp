@@ -17,7 +17,8 @@
 #include "../../runtime/ppu/ppu_context.h" /* g_active_ctx -> the guest lr */
 #include "../guest_struct.h"   /* GUEST_EA, guest_struct_load/store */
 #include "ps3emu/guest_call.h" /* g_ps3_guest_caller -- cbFunc is a GUEST OPD */
-#include "../../runtime/memory/vm.h"     /* VM_HLE_INJECT_BASE */
+#include "../../runtime/memory/vm.h"     /* VM_HLE_INJECT_BASE; vm_range_ok / vm_guest_limit */
+#include "ps3emu/stop.h"                 /* ps3_stop_guest_range */
 #include "ps3emu/log_first.h"
 #include "ffmpeg_runtime.h"   /* PS3FFmpeg; empty without PS3RECOMP_FFMPEG_RUNTIME */
 
@@ -422,6 +423,9 @@ s32 cellAdecDecodeAu(CellAdecHandle handle, const CellAdecAuInfo* auInfo)
 
     AdecSlot* a = &s_adec[handle];
     const u32 au = GUEST_EA(auInfo);
+    /* The 0x18 bytes read below, and the AC3 bytes copied from startAddr: guest EAs the title chose, added to
+     * vm_base without a bound, so a span that leaves guest memory is a named stop before the first access. */
+    if (!vm_range_ok(au, 0x18)) ps3_stop_guest_range("cellAdecDecodeAu", "auInfo", au, 0x18, vm_guest_limit());
     const u32 au_addr = vm_read32(au + (u32)offsetof(CellAdecAuInfo, startAddr));
     const u32 au_size = vm_read32(au + (u32)offsetof(CellAdecAuInfo, size));
     /* The AU info, read before AUDONE gives it back to the title. */
@@ -435,6 +439,8 @@ s32 cellAdecDecodeAu(CellAdecHandle handle, const CellAdecAuInfo* auInfo)
      * to the title's demuxer, which may refill it at once. */
     const u8* data = NULL;
     if (a->codecType == CELL_ADEC_TYPE_AC3 && au_addr && au_size && au_size <= 0x10000u) {
+        if (!vm_range_ok(au_addr, au_size))
+            ps3_stop_guest_range("cellAdecDecodeAu", "au", au_addr, au_size, vm_guest_limit());
         if (au_size > a->auCap) {
             u8* nb = (u8*)realloc(a->au, au_size);
             if (nb) { a->au = nb; a->auCap = au_size; }
