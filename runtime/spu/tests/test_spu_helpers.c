@@ -342,6 +342,61 @@ static void test_constant_generators(void) {
 }
 
 /* ===========================================================================
+ * cbx/chx/cwx/cdx: the insertion mask is addressed by the low bits of the
+ * 32-bit sum of the two PREFERRED words (RA word 0 + RB word 0). The expected
+ * quadword is built byte by byte from the ISA text, not from the helpers'
+ * position arithmetic: identity pattern 0x10..0x1F, then the element's bytes
+ * (03 / 02 03 / 00 01 02 03 / 00..07) at (sum & 0xF) rounded down to the
+ * element size. Every low-7-bit sum is run through four operand splits, so a
+ * helper that ignores an operand, adds an offset, masks the wrong number of
+ * bits or reads another word cannot pass; the non-preferred words carry junk.
+ * ===========================================================================*/
+static void test_indexed_insertion_masks(void) {
+    static const uint8_t elem[4][8] = {
+        {0x03, 0, 0, 0, 0, 0, 0, 0},
+        {0x02, 0x03, 0, 0, 0, 0, 0, 0},
+        {0x00, 0x01, 0x02, 0x03, 0, 0, 0, 0},
+        {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07},
+    };
+    static const int esz[4] = { 1, 2, 4, 8 };
+    static const char* const name[4] = { "cbx", "chx", "cwx", "cdx" };
+    static char label[96];
+    for (int op = 0; op < 4; op++) {
+        for (uint32_t s = 0; s < 128; s++) {
+            uint8_t exp[16];
+            for (int i = 0; i < 16; i++) exp[i] = (uint8_t)(0x10 + i);
+            const int start = (int)(s & 0xFu) & ~(esz[op] - 1);
+            for (int j = 0; j < esz[op]; j++) exp[start + j] = elem[op][j];
+            const u128 want = from_bytes(exp);
+
+            /* (ra word 0, rb word 0), each pair sums to s modulo 2^32 or differs from s only above bit 6 */
+            const uint32_t lo_a = (s * 3u) & 0x7Fu, lo_b = (s - lo_a) & 0x7Fu;
+            const uint32_t split[4][2] = {
+                { s, 0u },                                              /* all in RA */
+                { 0u, s },                                              /* all in RB */
+                { 0xFFFFFFF0u, s + 0x10u },                             /* carries out of bit 31 and wraps */
+                { 0xDEADBF00u | lo_a, 0x8765C480u | lo_b },             /* high bits in both */
+            };
+            static const char* const how[4] = { "RA only", "RB only", "32-bit wrap", "high bits in both" };
+            for (int k = 0; k < 4; k++) {
+                const u128 ra = make128_words(split[k][0], 0x13579BDFu, 0xFFFFFFFFu, 0x2468ACE0u);
+                const u128 rb = make128_words(split[k][1], 0x0F0F0F0Fu, 0x80000001u, 0xCAFEF00Du);
+                snprintf(label, sizeof label, "%s sum&0x7F=%u (%s)", name[op], (unsigned)s, how[k]);
+                TEST(label);
+                u128 got;
+                switch (op) {
+                case 0: got = spu_cbx(ra, rb); break;
+                case 1: got = spu_chx(ra, rb); break;
+                case 2: got = spu_cwx(ra, rb); break;
+                default: got = spu_cdx(ra, rb); break;
+                }
+                EXPECT_EQ(got, want);
+            }
+        }
+    }
+}
+
+/* ===========================================================================
  * fsmbi: bit-mask to byte-mask
  * ===========================================================================*/
 static void test_fsmbi(void) {
@@ -515,6 +570,7 @@ int main(void) {
     test_shufb();
     test_selb();
     test_constant_generators();
+    test_indexed_insertion_masks();
     test_fsmbi();
     test_sign_extend();
     test_float_fused();
