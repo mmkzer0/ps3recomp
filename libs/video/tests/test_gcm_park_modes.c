@@ -79,6 +79,10 @@ void rsx_raise_user_cmd(uint32_t arg) { (void)arg; }
 /* The registry, as gcm_fixture_stubs.h models it, and the stop the Reference mode ends in. A fixture stop
  * says what it was and ends the process with the runtime's stop status. */
 #include "gcm_fixture_stubs.h"
+#include "../rsx_tiling.c"        /* cellGcmSys.c publishes the bound tiles here and the 2D engines read them (v0.19.0 #569) */
+/* GCM_REPORT_SPU_HOLD_MS (gcm.report_spu_hold_ms) asks the SPU task layer whether a task round is
+ * running; there are no SPU tasks here. */
+int spu_taskset_round_busy(uint32_t* ts, uint32_t* tid) { (void)ts; (void)tid; return 0; }
 static int t_reference;
 #define IO_ADDR   0x00100000u
 #define IO_SIZE   0x00100000u

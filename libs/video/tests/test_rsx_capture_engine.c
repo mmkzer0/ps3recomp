@@ -13,6 +13,7 @@
  * argv[2] names a scenario that must end in a stop (the process exits 70):
  *   bad-format   the presented surface is in a format the readback contract does not define
  */
+#define RSX_STUB_OWN_CONFIG   /* ps3_config_get() below */
 #define STUB_REAL_STOP   /* links runtime/diag/stop.cpp: the engine's rsx-driver-method stop is real */
 #include "rsx_draw_engine_test_stub.h"
 #include "rsx_capture.h"
@@ -29,7 +30,7 @@ void cellGcm_set_capture_sink(const rsx_capture_sink* sink) { g_sink = sink; }
 
 const ps3_config* ps3_config_get(void)
 {
-    static ps3_config cfg;
+    static ps3_config cfg = { .eng_depth_clamp = true, .eng_depth_bounds = true };
     return &cfg;
 }
 

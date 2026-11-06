@@ -7,6 +7,7 @@
  * maps. With a bump pointer kept across Init a map made before it moved the pointer to 0x300000, and the next map
  * landed on io 0x300000 inside the Init window; first fit over the table cannot. */
 #include "../libs/video/cellGcmSys.c"
+#include "../libs/video/rsx_tiling.c"
 #include <assert.h>
 
 uint8_t* vm_base;

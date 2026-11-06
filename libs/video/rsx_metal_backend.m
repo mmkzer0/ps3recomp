@@ -81,6 +81,10 @@
 #include "rsx_shader_msl.h"
 #include "rsx_texture_layout.h"
 #include "../../include/ps3emu/ps3_ftrace.h"   /* PS3_FTRACE: encode / GPU wait / readback spans */
+/* SMAA (PS3_AA=smaa): its shaders and lookup textures, MIT, third_party/smaa. */
+#include "../../third_party/smaa/smaa_msl.h"
+#include "../../third_party/smaa/AreaTex.h"
+#include "../../third_party/smaa/SearchTex.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -107,6 +111,9 @@ static atomic_int          s_closed;
 #if !TARGET_OS_IPHONE
 static id                  s_window_close_observer;
 #endif
+/* The window's content size in device pixels, kept current by the message pump (main thread) and read
+ * by the present path, which sizes the drawable to it. 0 until the first pump. */
+static volatile u32        s_win_px_w, s_win_px_h;
 static int                 s_ready;
 static u32                 s_width  = 1280;
 static u32                 s_height = 720;
@@ -850,12 +857,50 @@ static void window_close_observer_start(NSWindow* window)
         }];
 }
 
+/* The menu's Quit item does what Cmd+Q does: it posts that key press, and the message pump (pump_messages_impl) turns it
+ * into ps3_host_quit. The one place that calls it is the pump, so a program that links the backend without the HLE
+ * modules (the Metal tests) needs no stub for it as long as it never pumps. */
+@interface RsxQuitTarget : NSObject
+- (void)quit:(id)sender;
+@end
+@implementation RsxQuitTarget
+- (void)quit:(id)sender
+{
+    (void)sender;
+    NSEvent* q = [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint
+                             modifierFlags:NSEventModifierFlagCommand timestamp:0 windowNumber:0 context:nil
+                                characters:@"q" charactersIgnoringModifiers:@"q" isARepeat:NO keyCode:0x0C];
+    [NSApp postEvent:q atStart:YES];
+}
+@end
+static RsxQuitTarget* s_quit_target;
+
 static int create_window_impl(const char* title)
 {
     [NSApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+    {   /* A plain run loop has no menu bar, so the app menu was empty: a "Quit <title>" item is all it gets. */
+        s_quit_target = [RsxQuitTarget new];
+        NSMenu* bar = [NSMenu new];
+        NSMenuItem* appItem = [NSMenuItem new];
+        [bar addItem:appItem];
+        NSMenu* appMenu = [NSMenu new];
+        NSString* quitTitle = [@"Quit " stringByAppendingString:[NSString stringWithUTF8String:(title ? title : "ps3recomp")]];
+        NSMenuItem* quit = [[NSMenuItem alloc] initWithTitle:quitTitle action:@selector(quit:) keyEquivalent:@"q"];
+        [quit setTarget:s_quit_target];
+        [appMenu addItem:quit];
+        [appItem setSubmenu:appMenu];
+        [NSApp setMainMenu:bar];
+    }
 
+    /* PS3RECOMP_METAL_WINDOW=<w>x<h>: initial content size in points (default: the game's size). */
     NSRect frame = NSMakeRect(0, 0, (CGFloat)s_width, (CGFloat)s_height);
+    {
+        unsigned ww = 0, wh = 0;
+        const char* ws = getenv("PS3RECOMP_METAL_WINDOW");
+        if (ws && sscanf(ws, "%ux%u", &ww, &wh) == 2 && ww >= 160 && wh >= 90 && ww <= 16384 && wh <= 16384)
+            frame.size = NSMakeSize((CGFloat)ww, (CGFloat)wh);
+    }
     s_window = [[NSWindow alloc]
         initWithContentRect:frame
                   styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
@@ -888,10 +933,17 @@ static int create_window_impl(const char* title)
     [view setWantsLayer:YES];
     [view setLayer:s_layer];
 
+    [s_window setCollectionBehavior:NSWindowCollectionBehaviorFullScreenPrimary];
     [s_window makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
     if (was_fullscreen) [s_window toggleFullScreen:nil];
     fps_start();
+    /* PS3RECOMP_FULLSCREEN=1, the same for every backend: start in fullscreen (a window handed over from another
+     * executable keeps the state it had); the picture is letterboxed as in a resized window. */
+    {
+        const char* fs = getenv("PS3RECOMP_FULLSCREEN");
+        if (!was_fullscreen && fs && fs[0] && fs[0] != '0') [s_window toggleFullScreen:nil];
+    }
     return 0;
 }
 
@@ -2534,6 +2586,7 @@ typedef struct {
     id<MTLDepthStencilState>   ds;
     MTLCullMode cull;
     MTLWinding  winding;
+    MTLDepthClipMode clip;      /* rs->depth_clamp: encoder state, set per draw */
 } EngPipeline;
 static EngPipeline s_eng_pipe[ENG_MAX_PIPES];
 static u32 s_eng_pipe_count;
@@ -2629,14 +2682,31 @@ static id<MTLDepthStencilState>   s_eng_clear_ds[4];
  * sample (and gamma) it always was.
  *   PS3_AA=fxaa        FXAA 3.11 (quality preset 29) on the display buffer,
  *                      at the guest's resolution, before the present
+ *   PS3_AA=smaa        SMAA 1x (high preset, luma edges) instead: three
+ *                      passes at the guest's resolution, sharper than FXAA
+ *                      on text and fine texture detail
  *   PS3_SHARPEN=0..1   contrast-adaptive sharpening (AMD FidelityFX CAS) in
  *                      the present pass; 0 = off, 1 = strongest
- * -1 = not read yet. */
+ *   PS3_VIBRANCE=-1..1 vibrance: saturation raised most on dull colours, so
+ *                      skin and sky do not blow out; negative mutes; 0 = off
+ *   PS3_CONTRAST=0.5..1.5  contrast around mid-grey; 1 = off. Both in the
+ *                      present pass, before the video out's gamma
+ * Out of range (-1, and -2 for the vibrance) = not read yet. */
 static int   s_eng_fxaa = -1;
+static int   s_eng_smaa;                 /* read with s_eng_fxaa */
 static float s_eng_sharpen = -1.0f;
+static float s_eng_vibrance = -2.0f;
+static float s_eng_contrast = -1.0f;
 static id<MTLRenderPipelineState> s_eng_fxaa_pso;
 static MTLPixelFormat             s_eng_fxaa_pso_fmt;
 static id<MTLTexture>             s_eng_fxaa_tex;
+/* PS3_AA=smaa: its library (third_party/smaa/smaa_msl.h), the three passes'
+ * pipelines, the two lookup textures and the per-size targets. */
+static id<MTLLibrary>             s_eng_smaa_lib;
+static id<MTLRenderPipelineState> s_eng_smaa_edge_pso, s_eng_smaa_weight_pso, s_eng_smaa_blend_pso;
+static MTLPixelFormat             s_eng_smaa_blend_fmt;
+static id<MTLTexture>             s_eng_smaa_area, s_eng_smaa_search;
+static id<MTLTexture>             s_eng_smaa_edges, s_eng_smaa_weights, s_eng_smaa_out;
 
 /* What the display last showed: the surface it blitted, and the records encoded since that blit (open ones are
  * counted by the reader). s_eng_rec_count cannot say this: every flush commit zeroes it, so a frame the guest drew
@@ -2652,20 +2722,37 @@ static float eng_sharpen_from(const char* e)
     const double v = strtod(e, NULL);
     return !(v > 0.0) ? 0.0f : v > 1.0 ? 1.0f : (float)v;
 }
+static float eng_vibrance_from(const char* e)
+{
+    if (!e || !*e) return 0.0f;
+    const double v = strtod(e, NULL);
+    return !(v == v) ? 0.0f : v < -1.0 ? -1.0f : v > 1.0 ? 1.0f : (float)v;
+}
+static float eng_contrast_from(const char* e)
+{
+    if (!e || !*e) return 1.0f;
+    const double v = strtod(e, NULL);
+    return !(v > 0.0) ? 1.0f : v < 0.5 ? 0.5f : v > 1.5 ? 1.5f : (float)v;
+}
 
 static void eng_post_options(void)
 {
     if (s_eng_fxaa < 0) {
         const char* e = getenv("PS3_AA");
         s_eng_fxaa = (e && !strcasecmp(e, "fxaa"));
-        if (e && *e && !s_eng_fxaa && strcasecmp(e, "off") && strcmp(e, "0"))
-            fprintf(stderr, "[RSX metal] PS3_AA=%s unknown (fxaa); off\n", e);
+        s_eng_smaa = (e && !strcasecmp(e, "smaa"));
+        if (e && *e && !s_eng_fxaa && !s_eng_smaa && strcasecmp(e, "off") && strcmp(e, "0"))
+            fprintf(stderr, "[RSX metal] PS3_AA=%s unknown (fxaa, smaa); off\n", e);
     }
     if (s_eng_sharpen < 0.0f) s_eng_sharpen = eng_sharpen_from(getenv("PS3_SHARPEN"));
+    if (s_eng_vibrance < -1.0f) s_eng_vibrance = eng_vibrance_from(getenv("PS3_VIBRANCE"));
+    if (s_eng_contrast < 0.0f) s_eng_contrast = eng_contrast_from(getenv("PS3_CONTRAST"));
     static int logged;
-    if (!logged++ && (s_eng_fxaa || s_eng_sharpen > 0.0f))
-        fprintf(stderr, "[RSX metal] present: AA %s, sharpen %.2f\n",
-                s_eng_fxaa ? "FXAA" : "off", (double)s_eng_sharpen);
+    if (!logged++ && (s_eng_fxaa || s_eng_smaa || s_eng_sharpen > 0.0f ||
+                      s_eng_vibrance != 0.0f || s_eng_contrast != 1.0f))
+        fprintf(stderr, "[RSX metal] present: AA %s, sharpen %.2f, vibrance %.2f, contrast %.2f\n",
+                s_eng_fxaa ? "FXAA" : s_eng_smaa ? "SMAA" : "off", (double)s_eng_sharpen,
+                (double)s_eng_vibrance, (double)s_eng_contrast);
 }
 
 static NSString* const kEngHelperMSL = @
@@ -2694,9 +2781,10 @@ static NSString* const kEngHelperMSL = @
 "}\n"
 /* The present: optional contrast-adaptive sharpening (AMD FidelityFX CAS,
  * the non-scaling form: a cross whose negative weight grows where the 3x3
- * neighbourhood has headroom), at the source's texel spacing, then the video
- * out's gamma. sharp = 0 is the plain sample. */
-"struct PresentP { float gamma; float sharp; float2 px; };\n"
+ * neighbourhood has headroom), at the source's texel spacing, then vibrance
+ * and contrast, then the video out's gamma. sharp = 0, vib = 0 and con = 1
+ * are the plain sample. */
+"struct PresentP { float gamma; float sharp; float2 px; float vib; float con; float2 pad; };\n"
 "fragment float4 eng_present_fs(BOut i [[stage_in]],\n"
 "                               texture2d<float> src [[texture(0)]],\n"
 "                               sampler s [[sampler(0)]],\n"
@@ -2721,6 +2809,15 @@ static NSString* const kEngHelperMSL = @
 "        float3 w = amp * (-1.0 / mix(8.0, 5.0, saturate(p.sharp)));\n"
 "        c.rgb = saturate((b * w + l * w + r * w + h * w + e) / (1.0 + 4.0 * w));\n"
 "    }\n"
+/* Vibrance: a saturation change scaled by how unsaturated the pixel already
+ * is (max - min of its channels), so grey and dull colours move most and a
+ * saturated one hardly at all. Contrast pivots on mid-grey. */
+"    if (p.vib != 0.0) {\n"
+"        float y = dot(c.rgb, float3(0.299, 0.587, 0.114));\n"
+"        float sat = max(c.r, max(c.g, c.b)) - min(c.r, min(c.g, c.b));\n"
+"        c.rgb = saturate(mix(float3(y), c.rgb, 1.0 + p.vib * (1.0 - sat)));\n"
+"    }\n"
+"    if (p.con != 1.0) c.rgb = saturate((c.rgb - 0.5) * p.con + 0.5);\n"
 "    if (p.gamma != 1.0) c.rgb = pow(max(c.rgb, 0.0), float3(p.gamma));\n"
 "    return c;\n"
 "}\n"
@@ -3069,6 +3166,10 @@ static void eng_shutdown(void* user)
     s_eng_linear_sampler = nil;
     s_eng_fxaa_pso = nil;
     s_eng_fxaa_tex = nil;
+    s_eng_smaa_lib = nil;
+    s_eng_smaa_edge_pso = s_eng_smaa_weight_pso = s_eng_smaa_blend_pso = nil;
+    s_eng_smaa_area = s_eng_smaa_search = nil;
+    s_eng_smaa_edges = s_eng_smaa_weights = s_eng_smaa_out = nil;
     s_eng_active = 0;
     s_eng_encoding_failed = 0;
     s_eng_checked_completed = 0;
@@ -3195,12 +3296,17 @@ static void eng_texture_upload_3d(void* user, u32 handle, u32 z, u32 mip,
     (void)user;
     id<MTLTexture> t = eng_obj(handle);
     if (!t || !src || !row_bytes) return;
+    /* A block-compressed slice is rows of 4x4 blocks. */
+    const MTLPixelFormat pf = [t pixelFormat];
+    const int bc = pf == MTLPixelFormatBC1_RGBA || pf == MTLPixelFormatBC2_RGBA ||
+                   pf == MTLPixelFormatBC3_RGBA;
+    const u32 rows = bc ? (h + 3u) / 4u : h;
     [t replaceRegion:MTLRegionMake3D(0, 0, z, w, h, 1)
          mipmapLevel:mip
                slice:0
            withBytes:src
          bytesPerRow:row_bytes
-       bytesPerImage:(NSUInteger)row_bytes * h];
+       bytesPerImage:(NSUInteger)row_bytes * rows];
 }
 
 static u32 eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 h,
@@ -3545,6 +3651,7 @@ static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
     s_eng_pipe[slot].winding = (rs->front_face == 0x0901u)
                                    ? MTLWindingCounterClockwise
                                    : MTLWindingClockwise;
+    s_eng_pipe[slot].clip = rs->depth_clamp ? MTLDepthClipModeClamp : MTLDepthClipModeClip;
     return slot + 1;
 }
 
@@ -3860,6 +3967,7 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
     [enc setDepthStencilState:p->ds];
     [enc setCullMode:p->cull];
     [enc setFrontFacingWinding:p->winding];
+    [enc setDepthClipMode:p->clip];
     [enc setStencilFrontReferenceValue:r->stencil_ref backReferenceValue:r->stencil_ref_back];
     [enc setDepthBias:r->depth_bias slopeScale:r->depth_slope clamp:0.0f];
     MTLViewport vp = { r->vp[0], r->vp[1], r->vp[2], r->vp[3],
@@ -4328,19 +4436,123 @@ static id<MTLTexture> eng_fxaa(id<MTLCommandBuffer> cb, id<MTLTexture> src)
     return s_eng_fxaa_tex;
 }
 
+/* PS3_AA=smaa: SMAA 1x on the display buffer -- luma edges into an RG8
+ * target, blending weights (AreaTex/SearchTex lookups) into an RGBA8 one,
+ * then the neighbourhood blend into a texture of src's size and format. nil
+ * (and the frame goes on without it) if any step cannot be set up. */
+static id<MTLRenderPipelineState> eng_smaa_pso(NSString* vs, NSString* fs, MTLPixelFormat fmt)
+{
+    MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
+    pd.vertexFunction   = [s_eng_smaa_lib newFunctionWithName:vs];
+    pd.fragmentFunction = [s_eng_smaa_lib newFunctionWithName:fs];
+    pd.colorAttachments[0].pixelFormat = fmt;
+    NSError* err = nil;
+    id<MTLRenderPipelineState> p = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+    if (!p) fprintf(stderr, "[rsx engine/metal] SMAA pipeline %s failed (SMAA off): %s\n",
+                    [fs UTF8String], [[err localizedDescription] UTF8String]);
+    return p;
+}
+static id<MTLTexture> eng_smaa_target(id<MTLTexture> t, MTLPixelFormat fmt, NSUInteger w, NSUInteger h)
+{
+    if (t && [t width] == w && [t height] == h && [t pixelFormat] == fmt) return t;
+    MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt
+                                                     width:w height:h mipmapped:NO];
+    td.usage       = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    td.storageMode = MTLStorageModePrivate;
+    return [s_dev newTextureWithDescriptor:td];
+}
+static id<MTLTexture> eng_smaa_lookup(MTLPixelFormat fmt, NSUInteger w, NSUInteger h,
+                                      const unsigned char* bytes, NSUInteger pitch)
+{
+    MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt
+                                                     width:w height:h mipmapped:NO];
+    td.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> t = [s_dev newTextureWithDescriptor:td];
+    [t replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:bytes bytesPerRow:pitch];
+    return t;
+}
+static int eng_smaa_pass(id<MTLCommandBuffer> cb, id<MTLTexture> dst, id<MTLRenderPipelineState> pso,
+                         id<MTLTexture> t0, id<MTLTexture> t1, id<MTLTexture> t2,
+                         id<MTLSamplerState> samp, const float* metrics, int clear)
+{
+    MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture     = dst;
+    rp.colorAttachments[0].loadAction  = clear ? MTLLoadActionClear : MTLLoadActionDontCare;
+    rp.colorAttachments[0].clearColor  = MTLClearColorMake(0, 0, 0, 0);
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+    if (!e) return 0;
+    [e setRenderPipelineState:pso];
+    [e setVertexBytes:metrics length:4 * sizeof(float) atIndex:0];
+    [e setFragmentBytes:metrics length:4 * sizeof(float) atIndex:0];
+    if (t0) [e setFragmentTexture:t0 atIndex:0];
+    if (t1) [e setFragmentTexture:t1 atIndex:1];
+    if (t2) [e setFragmentTexture:t2 atIndex:2];
+    [e setFragmentSamplerState:samp atIndex:0];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [e endEncoding];
+    return 1;
+}
+static id<MTLTexture> eng_smaa(id<MTLCommandBuffer> cb, id<MTLTexture> src)
+{
+    const MTLPixelFormat fmt = [src pixelFormat];
+    if (!s_eng_smaa_lib) {
+        NSError* err = nil;
+        s_eng_smaa_lib = [s_dev newLibraryWithSource:@(kSmaaMSL) options:nil error:&err];
+        if (!s_eng_smaa_lib) {
+            fprintf(stderr, "[rsx engine/metal] SMAA shaders failed to compile (SMAA off): %s\n",
+                    [[err localizedDescription] UTF8String]);
+            s_eng_smaa = 0;
+            return nil;
+        }
+        s_eng_smaa_edge_pso   = eng_smaa_pso(@"smaa_edge_vs", @"smaa_edge_ps", MTLPixelFormatRG8Unorm);
+        s_eng_smaa_weight_pso = eng_smaa_pso(@"smaa_weight_vs", @"smaa_weight_ps", MTLPixelFormatRGBA8Unorm);
+        s_eng_smaa_area   = eng_smaa_lookup(MTLPixelFormatRG8Unorm, AREATEX_WIDTH, AREATEX_HEIGHT,
+                                            areaTexBytes, AREATEX_PITCH);
+        s_eng_smaa_search = eng_smaa_lookup(MTLPixelFormatR8Unorm, SEARCHTEX_WIDTH, SEARCHTEX_HEIGHT,
+                                            searchTexBytes, SEARCHTEX_PITCH);
+        if (!s_eng_smaa_edge_pso || !s_eng_smaa_weight_pso || !s_eng_smaa_area || !s_eng_smaa_search) {
+            s_eng_smaa = 0;
+            return nil;
+        }
+    }
+    if (!s_eng_smaa_blend_pso || s_eng_smaa_blend_fmt != fmt) {
+        s_eng_smaa_blend_pso = eng_smaa_pso(@"smaa_blend_vs", @"smaa_blend_ps", fmt);
+        if (!s_eng_smaa_blend_pso) { s_eng_smaa = 0; return nil; }
+        s_eng_smaa_blend_fmt = fmt;
+    }
+    const NSUInteger w = [src width], h = [src height];
+    s_eng_smaa_edges   = eng_smaa_target(s_eng_smaa_edges, MTLPixelFormatRG8Unorm, w, h);
+    s_eng_smaa_weights = eng_smaa_target(s_eng_smaa_weights, MTLPixelFormatRGBA8Unorm, w, h);
+    s_eng_smaa_out     = eng_smaa_target(s_eng_smaa_out, fmt, w, h);
+    if (!s_eng_smaa_edges || !s_eng_smaa_weights || !s_eng_smaa_out) return nil;
+    const float metrics[4] = { 1.0f / (float)w, 1.0f / (float)h, (float)w, (float)h };
+    if (!eng_smaa_pass(cb, s_eng_smaa_edges, s_eng_smaa_edge_pso, src, nil, nil,
+                       s_eng_point_sampler, metrics, 1) ||
+        !eng_smaa_pass(cb, s_eng_smaa_weights, s_eng_smaa_weight_pso, s_eng_smaa_edges,
+                       s_eng_smaa_area, s_eng_smaa_search, s_eng_linear_sampler, metrics, 1) ||
+        !eng_smaa_pass(cb, s_eng_smaa_out, s_eng_smaa_blend_pso, src, s_eng_smaa_weights, nil,
+                       s_eng_linear_sampler, metrics, 0))
+        return nil;
+    return s_eng_smaa_out;
+}
+
 /* Put a surface on the drawable. A straight blit would need matching formats
  * and sizes; a full-screen sample needs neither, and the guest's surfaces are
  * routinely a different size from the window.
  *
- * With PS3_AA=fxaa the surface goes through FXAA first, at its own size; with
- * PS3_SHARPEN this pass sharpens it as it samples. Either one that is off or
- * fails is skipped. */
+ * With PS3_AA=fxaa (or smaa) the surface goes through FXAA (or SMAA) first,
+ * at its own size; with PS3_SHARPEN this pass sharpens it as it samples, and
+ * PS3_VIBRANCE / PS3_CONTRAST adjust it before the gamma. Any one that is off
+ * or fails is skipped. Returns 1 when the blit was encoded (the display
+ * bookkeeping counts only an encoded blit as a show), 0 when it bailed out. */
 static int eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
                                id<MTLTexture> dst)
 {
     if (!src || !dst || !s_eng_helper_lib) return 0;
     eng_post_options();
     if (s_eng_fxaa) { id<MTLTexture> t = eng_fxaa(cb, src); if (t) src = t; }
+    else if (s_eng_smaa) { id<MTLTexture> t = eng_smaa(cb, src); if (t) src = t; }
     if (!s_eng_blit_pso || s_eng_blit_pso_fmt != [dst pixelFormat]) {
         MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
         pd.vertexFunction   = [s_eng_helper_lib newFunctionWithName:@"eng_fullscreen_vs"];
@@ -4357,20 +4569,31 @@ static int eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
     }
     MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
     rp.colorAttachments[0].texture     = dst;
-    rp.colorAttachments[0].loadAction  = MTLLoadActionDontCare;
+    rp.colorAttachments[0].loadAction  = MTLLoadActionClear;
+    rp.colorAttachments[0].clearColor  = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
     id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
     if (!e) return 0;
+    /* In the window the picture keeps its aspect ratio: fitted into the drawable and centred, black around it. The
+     * headless and host-surface targets are the size the title asked for and are filled as before. */
+    const double dw = (double)[dst width], dh = (double)[dst height];
+    const double sw = (double)[src width], sh = (double)[src height];
+    const int fill = s_headless || s_host;
+    const double fit = fmin(dw / sw, dh / sh);
+    const double vw = fill ? dw : floor(sw * fit + 0.5), vh = fill ? dh : floor(sh * fit + 0.5);
+    [e setViewport:(MTLViewport){floor((dw - vw) * 0.5), floor((dh - vh) * 0.5), vw, vh, 0.0, 1.0}];
     [e setRenderPipelineState:s_eng_blit_pso];
     [e setFragmentTexture:src atIndex:0];
-    [e setFragmentSamplerState:s_eng_point_sampler atIndex:0];
+    const int scaled = !fill && (vw != sw || vh != sh);   /* a resized window filters; 1:1 and the fixed targets stay point-sampled */
+    [e setFragmentSamplerState:(scaled ? s_default_sampler : s_eng_point_sampler) atIndex:0];
     /* The video out's gamma (cellVideoOutSetGamma, the title's brightness
      * setting): out = in^gamma, as RPCS3's calibration pass applies it. The
      * sharpening taps are one source texel apart. */
     { extern float cellAvconfExt_display_gamma(void);
-      const struct { float gamma, sharp, px[2]; } p = {
+      const struct { float gamma, sharp, px[2], vib, con, pad[2]; } p = {
           cellAvconfExt_display_gamma(), s_eng_sharpen,
-          { 1.0f / (float)[src width], 1.0f / (float)[src height] } };
+          { 1.0f / (float)[src width], 1.0f / (float)[src height] },
+          s_eng_vibrance, s_eng_contrast, { 0.0f, 0.0f } };
       [e setFragmentBytes:&p length:sizeof p atIndex:0]; }
     [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [e endEncoding];
@@ -4390,6 +4613,20 @@ static rsx_display_view eng_display_view(void)
     const float g = cellAvconfExt_display_gamma();
     memcpy(&v.gamma_bits, &g, sizeof v.gamma_bits);
     return v;
+}
+
+/* The drawable is the window's size in device pixels, so the compositor does not stretch it;
+ * eng_blit_to_display fits the game picture into it. Called before eng_display_view reads the layer's
+ * size: a resize must reach the layer before rsx_display_can_skip compares the geometry, or a still
+ * picture would keep being skipped on the old size and the new one would never be set. */
+static void eng_sync_drawable_size(void)
+{
+    const u32 ww = s_win_px_w, wh = s_win_px_h;
+    const CGSize cur = s_layer.drawableSize;
+    if (ww && wh && ((u32)cur.width != ww || (u32)cur.height != wh)) {
+        s_layer.drawableSize = CGSizeMake((CGFloat)ww, (CGFloat)wh);
+        fprintf(stderr, "[RSX metal] drawable %ux%u (window)\n", ww, wh);
+    }
 }
 
 /* Encode everything recorded so far and commit it.
@@ -4414,6 +4651,7 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
         const int layer_present = (windowed_present && !s_host);
         rsx_display_view view = {0};
         if (layer_present) {
+            eng_sync_drawable_size();
             view = eng_display_view();
             /* #94: [CAMetalLayer nextDrawable] waits for a display refresh, so a present that would put the picture
              * already on the layer back on it costs the walker a refresh for nothing. The host's frame clock presents
@@ -4455,7 +4693,8 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
                 dst = s_host_tex[host_slot];
             } else {
                 /* Every present waits here for the compositor's next free drawable, so the span is never
-                 * filtered; the wait ends before the nil check so a dropped image shows up in the trace. */
+                 * filtered; the wait ends before the nil check so a dropped image shows up in the trace.
+                 * (The drawable already has the window's size: eng_sync_drawable_size, above.) */
                 const uint64_t ft_d0 = PS3_FT_ON() ? ps3_ft_now() : 0;
                 drawable = [s_layer nextDrawable];
                 if (ft_d0)
@@ -5115,10 +5354,11 @@ static int pump_messages_impl(void)
                                                 inMode:NSDefaultRunLoopMode
                                                dequeue:YES];
             if (!ev) break;
-            /* Cmd+Q quits. The host turns a plain run loop with no app menu,
-             * so AppKit has no Quit item to send it to and nothing happened.
-             * It ends the game the way the console's Quit Game does
-             * (cellSysutil.c ps3_host_quit: REQUEST_EXITGAME, then exit 0). */
+            /* Cmd+Q quits. A plain run loop has no app menu, so AppKit had no
+             * Quit item to send it to and nothing happened; it is taken here, before
+             * the menu's key equivalent could be, and ends the game the way the
+             * console's Quit Game does (cellSysutil.c ps3_host_quit: REQUEST_EXITGAME,
+             * then exit 0). The menu's Quit item (create_window_impl) does the same. */
             if ([ev type] == NSEventTypeKeyDown && ([ev keyCode] & 127u) == 0x0C /* Q */ &&
                 ([ev modifierFlags] & NSEventModifierFlagCommand)) {
                 if (![ev isARepeat]) {
@@ -5127,7 +5367,18 @@ static int pump_messages_impl(void)
                 }
                 continue;
             }
+            /* The pad reads the keyboard by polling (cellPad), so the other key events have no consumer here: the
+             * window would answer each with the system alert sound. */
+            if ([ev type] == NSEventTypeKeyDown || [ev type] == NSEventTypeKeyUp) {
+                continue;
+            }
             [NSApp sendEvent:ev];
+        }
+        if (s_window) {
+            NSView* v = [s_window contentView];
+            const NSSize px = [v convertSizeToBacking:[v bounds].size];
+            s_win_px_w = (u32)px.width;
+            s_win_px_h = (u32)px.height;
         }
     }
 #endif

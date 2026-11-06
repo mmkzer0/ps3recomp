@@ -1,6 +1,12 @@
 # Changelog
 
 ### Unreleased
+- **Upstream v0.19.0 is merged into `dev`** (`experimental/m19-int`; 227 paths, plan `V018-MERGE-PLAN.md` rules, area reports `M19_{RSX,SPU,PPU,INTEGRATION}.md` in the research repo): upstream's v0.18.0 to v0.19.0 range (83 merged PRs) came in through three area resolutions (RSX 43 hunks, SPU 28, PPU 27) and an integration pass. Our contracts win where the two disagree: named stops instead of clamps and halts, the reservation model as the only coherency authority, the FW-derived GcmIb ring, and typed config instead of new behavioural `getenv`.
+  - **Adopted.** Tiled main memory for every RSX access (#569; a capture open ends a tiled access in the `rsx-capture` stop `tiled-main-memory`, since a capture has no tile table), BC 3D textures, depth clamp and depth-bounds emulation on Metal (#693, #694), explicit current vertex colours, new-style JUMP decode, local memory 249 MiB, Metal resize/letterbox/SMAA/vibrance/contrast, SPU SSE4.1 four-lane float helpers and NEON `fi`/`cflts`, quadword LS, relocatable lifts, the SPU channel ordering and RdEventStat fixes, CellSpurs2/Taskset2 with named range stops, `argTaskset`, lv2 SPU group destroy/start errors, sys_fs SDK open flags and error codes, event-queue destroy modes and timed receives, mutex/rwlock/semaphore error returns, memory containers, executable primary priority, NP presence details and entitlements, Avc2, cellPamf, cellAdec AC3, `ps3_env_once`.
+  - **Converted.** `gcm.handler_thread` (#647) and `gcm.report_spu_hold_ms` (#635) are typed keys, off/0 by default. `eng.depth_clamp` and `eng.depth_bounds` (#693, #694) are typed keys, on by default as upstream; the registry's environment names are the upstream names. `game.free_space_raw` replaces `PS3_GAME_FREE_SPACE_RAW` (#692). `SPURS_IDLE_MAX` is the build-time constant 4. `SPU_RELOC_OFF` and `SPU_LOCKLINE_SLEEP` are dropped. The Metal-only host display knobs (`PS3_VIBRANCE`, `PS3_CONTRAST`, `PS3RECOMP_METAL_WINDOW`, `PS3RECOMP_FULLSCREEN`) stay environment and are documented in `docs/DIAGNOSTICS.md` with the other 12 new knobs; the existing `PS3RECOMP_ENG_*` kill switches are unchanged (#55).
+  - **Rejected or parallel.** `GCM_FIFO_SEGMENT` and the segment close on flip insertion (#566, #648): dev's GcmIb is the default, a full segment keeps the immediate-flip fallback until a flip-identity measurement; the 2048-entry SPU decode table (#688) and the coherency bitmap (#668): dev's decoder and reservation model; #623 and #627: dev's join epilogue and 64-bit stamps; D3D12 PRs are not built here. SPURS2/Taskset2 error codes are upstream's, not FW-checked (follow-up with libsre); NV0039 is not tiled.
+  - **Cross-area fixes.** `cellGamePatchCheck` kept at dev's validating form, `PT_PROC_PARAM` handled in one block (SDK version and primary priority), `test_spu_decode` registered once, the new targets (`gcm_tile_log`, `gcm_fifo_jump`, `vertex_current_color`, `spu_group_lifecycle`) registered, `docs/DIAGNOSTICS.md` and the NID-helper list brought up to date, `third_party/smaa/AreaTex.h` (1.17 MB, vendored MIT, reviewed) added to `tools/hygiene-allow.txt` with the rule reworded for reviewed vendored files, and the four upstream fixtures for the PPU loader and HLE bridge (`ppu_primary_priority`, `np_entitlements`, `np_presence_details`, `sail_memory_allocator`) ported to the dev runtime with every assertion kept.
+  - **Test.** Linux x86-64, clang, Debug, full ctest: 301/301 before, 315/315 after (14 new: `adec_ac3_stub`, `adec_media_gen`, `cellsync_mutex`, `event_queue_destroy`, `gcm_fifo_jump`, `gcm_tile_log_{quiet,verbose}`, `spu_fi_cflts_neon`, `spu_float_vector_scalar`, `spu_group_lifecycle`, `sync_semantics`, `sys_fs`, `vertex_current_color`, `vmx_fmaf`; `spu_int_neon` skips on x86 in both). `tools/test_*.py`: 171/172 before, 186/187 after (15 new; `test_ios_run` fails the same sub-test in both, `/dev/full` log write). The SPU differential test against RPCS3 gives the same counts before and after (interpreter 634 and lifted 1558 mismatches, all judged by the float referee, 0 unresolved), and the exhaustive short sweep's 2997 block hashes are identical before and after for scalar, SSE4.1 and AVX2. Upstream's `test_lwmutex_*.py` and `test_ppu_thread_join.c` scrape code this tree replaced and are not carried; `tests/lwsync` and `test_ppu_thread_join_detach` are the gates.
 - **`cflts`/`cfltu` follow the hardware at I8 >= 15 and stop below** (`runtime/spu/spu_helpers.h`, `runtime/spu/spu_interp.c`, `tools/spu_lifter.py`, `runtime/spu/tests/`, `docs/SPU_LIFTER.md`, #126): at scales above about 2^157 (I8 <= 15) a CBE SPU's result differs from the model. Compiler intrinsics emit I8 >= 46.
   - **Change.** An exponent-0 input (zero or denormal) has a zero significand but still saturates on the shift amount `be + 23 - I8`, as the hardware does: `cflts` at >= 8, `cfltu` at >= 9, both by sign. Scalar, AVX2 and oracle follow. For I8 <= 14 part of the input space gives values no fitted rule reproduces, so the interpreter and the lifter stop there with `unmodelled cflts/cfltu scale (I8=N, #126)`. The helpers keep a documented saturation for direct callers.
   - **Evidence and test.** Console lanes (`spuexh` r007/r008, CECHC04 4.81): 22551 of 22551 lanes in the modelled region match, scalar, gcc-16 and AVX2 (Rosetta) builds alike. `spu_numeric_semantics` pins measured exponent-0 lanes; `spu_interp_loop` expects the stop at I8 14 and execution at I8 15 in all four run modes; `test_spu_lifter_cfl_scale.py` expects the lifter stop. The old exponent-0 rule and a threshold of 13 each fail them.
@@ -347,6 +353,68 @@
   - the once-only dumps.
 - **JQ2 Port2Sync** accepts only modes 0 and 4, as the firmware does (PPU `0x020045E8`); every other mode is `0x80410A02` with the port untouched. A waiter the firmware's job manager could not wake (id 64 or above), a failed event-flag wait, and a push that races Shutdown each stop as `jq2-wake` or `jq2-state` with a `reason`.
 - **`hle-guest-range`**: an HLE argument whose guest span leaves guest memory stops by name instead of becoming a host out-of-bounds access. The firmware checks only null and alignment, so the stop comes after those checks, not in place of an error code. Every guest pointer the JQ2 surface takes is covered: queue, command ring, port, attributes, pool and Join's exit code.
+
+### v0.16.0 — *"Forty-Four"* (October 2026)
+
+*44 pull requests from six contributors, merged in #377. They come from
+inFAMOUS 2, Twisted Metal and SoulCalibur II HD, plus Tornado Outbreak.*
+
+**RSX and graphics**
+- **3D textures** in the draw engine (*[@erikomis](https://github.com/erikomis)*, #335).
+  The fragment decompiler also gains FACING, TC8 and TC9 (#328), the
+  perspective-correct flag on texcoord reads (#329), and signed results from
+  biased-remap and `_bx2` fetches (#331). Y16_X16/HILO8 crossbars present
+  R-G-R-G (#332).
+- **A flip in the command stream completes when the RSX reaches it**
+  (*[@Kurtisone](https://github.com/Kurtisone)*, #343), and a late flip
+  completion no longer marks a newer flip done (*@erikomis*, #354). Also:
+  get follows the walker across a JUMP (#347), the semaphore acquire is
+  bounded (#327), and GCM callbacks are delivered at `sys_timer_usleep`/`sleep`
+  (#353).
+- NV3089: the source origin is 12.4 fixed point, and copies were 256 times too
+  short (*[@n0madic](https://github.com/n0madic)*, #358). Unscaled blits copy
+  a row at a time (#334). 2D transfers read FP16 targets (#367) and convert a
+  pixel at a time (#348).
+- Speed: the D3D12 vertex program cache is keyed on the program instead of the
+  store behind it, which took most of the D3DCompile calls off the FIFO thread
+  (*@n0madic*, #361). HLSL to SPIR-V translations are cached (#346), cached
+  textures are re-hashed sparsely (#375), and the per-vertex span is found once
+  per draw (#357).
+- Vulkan: colour feedback snapshots for draws that sample their own target
+  (#352), and present on its own command buffer (#351).
+- Metal: per-MRT colour mask and blend (#330), `PS3_ANISO` (#373),
+  `PS3_AA=fxaa` and `PS3_SHARPEN` (#374), `cellVideoOutSetGamma` (#355), and
+  `precise::` math from spirv-cross (#356).
+- Diagnostics: `PS3_FTRACE`, a frame timeline of who waits for whom (#339), and
+  fragment-program debug knobs keyed by structural hash (#336).
+
+**SPU and SPURS**
+- An SPU thread starts in the lifted image its own bytes identify, instead of
+  whichever image registered first at that entry point (*@n0madic*, #362). An
+  SPU user event finds the port the PPU binds, and waits for it (#363).
+- A task's signalled bit is updated atomically against SPU commits (#340), and
+  a job's first frame stays below its cache buffers (#366)
+  (*@Kurtisone*).
+- Single-precision fast paths run four lanes at a time with AVX2 (#369) and
+  SSE2 (#370).
+- Syscall 14 classifies lock-line addresses by guest segment
+  (*[@kalpakprod](https://github.com/kalpakprod)*, #341).
+
+**System libraries**
+- cellFs: the `CELL_FS_O_*` flag values are corrected, so `O_CREAT` creates
+  (*@kalpakprod*, #349); `/dev_hdd1` maps to a writable host root (#350); and
+  an AIO read keeps the fd's position (*@Kurtisone*, #376).
+- `cellGameBootCheck` reports the game type from PARAM.SFO (#359), and
+  `CELL_MSGDIALOG_BUTTON_NONE`/`INVALID` are no longer swapped (#360)
+  (*@n0madic*). An HDD title's `/dev_hdd0/game/<id>/` now resolves to the
+  booted game tree, which kept Simpsons Arcade reading its data once #359
+  reported it as an HDD game.
+- `PS3_LANG` picks the system language (#333), and `PS3_GAMEDATA_ROOT` moves
+  saves and trophies out of the working directory (#338). The small rumble
+  motor runs at full strength (#372) (*@erikomis*).
+- Guest spinlocks use a 32-bit atomic on LP64 hosts, which fixes a fault on
+  arm64 (*[@tekulvw](https://github.com/tekulvw)*, #326).
+- Tornado Outbreak: the 2x zoomed frames from #281 are fixed (#344).
 
 ### v0.15.0 — *"Seventy-Six"* (October 2026)
 

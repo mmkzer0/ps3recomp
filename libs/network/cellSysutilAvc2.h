@@ -18,6 +18,15 @@ extern "C" {
 s32 cellSysutilAvc2InitParam(u16 version, u32 option);
 s32 cellSysutilAvc2LoadAsync(u16 ctxId, u32 container, u32 callback,
                              u32 userdata, u32 initParam);
+s32 cellSysutilAvc2Load(u16 ctxId, u32 container, u32 callback,
+                        u32 userdata, u32 initParam);
+s32 cellSysutilAvc2Unload(void);
+s32 cellSysutilAvc2SetAttribute(u32 attr);
+s32 cellSysutilAvc2SetSpeakerVolumeLevel(u32 level);
+s32 cellSysutilAvc2SetSpeakerMuting(u8 muting);
+s32 cellSysutilAvc2SetVoiceMuting(u8 muting);
+s32 cellSysutilAvc2StartVoiceDetection(void);
+s32 cellSysutilAvc2StopVoiceDetection(void);
 s32 cellSysutilAvc2UnloadAsync(void);
 s32 cellSysutilAvc2JoinChatRequest(u32 roomId);
 s32 cellSysutilAvc2LeaveChatRequest(void);

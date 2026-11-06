@@ -3,6 +3,9 @@
 #include "../cellGame.c"
 #include <assert.h>
 #include <unistd.h>
+/* The typed configuration cellGame.c reads (game.free_space_raw): the registry default. */
+static ps3_config s_cfg;
+const ps3_config* ps3_config_get(void) { return &s_cfg; }
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
 uint32_t g_ww_lo, g_ww_hi;

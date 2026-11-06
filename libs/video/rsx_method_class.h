@@ -358,9 +358,11 @@ static const rsx_method_rule rsx_method_rules[] = {
     INERT(RSX_CLASS_NV4097, 0x1D64, 1, RSX_EV_ORACLE_NULL, "NV4097_SET_INDEXED_CONSTANT_READ_LIMITS",
           "bounds the constant indices a VP may read (0x02000000 at reset); RPCS3 has no decoder, and the "
           "decompiler bounds every constant read to RSX_DSP_NUM_CONSTANTS (rsx_dispatch.c)"),
-    INERT_V(RSX_CLASS_NV4097, 0x1D78, 1, 1, 0xFFFF, RSX_EV_ORACLE_VALUE, "NV4097_SET_ZMIN_MAX_CONTROL",
-            "depth-test direction/rounding controls; the engine reads the engine-visible depth state from "
-            "DEPTH_FUNC/MASK/TEST (0x0A6C..0x0A74); RPCS3 binds set_zmin_max_control for the same purpose"),
+    HANDLED(RSX_CLASS_NV4097, 0x1D78, 1, RSX_EV_CONSUMER, "NV4097_SET_ZMIN_MAX_CONTROL",
+            "rsx_draw_engine.c rsx_draw_engine_decode_render_state rs->depth_clamp (bits 4-7 clamp the depth, "
+            "bits 0-3 clip at the near/far planes; reset value 1, seeded in rsx_dispatch_init): the backend's "
+            "depth clip mode per draw (v0.19.0 #693; this row was INERT with the value pinned to 1 before the "
+            "engine read it, so a clamp-on write counted as missing)"),
     INERT_V(RSX_CLASS_NV4097, 0x1D7C, 1, 0xFFFF0000, 0xFFFFFFFF, RSX_EV_ORACLE_VALUE,
             "NV4097_SET_ANTI_ALIASING_CONTROL",
             "AA sample placement; the engine takes the sample grid from the surface format's antialias field "

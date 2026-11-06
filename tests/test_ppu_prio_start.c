@@ -155,6 +155,9 @@ int main(void)
     g_ppu_thread_entry_trampoline = guest_entry;
     ppu_thread_set_prio_start_hook(prio_start_hook);
     ppu_thread_register_main();                 /* main runs at the default priority, 1000 */
+    /* These cases compare against priority 1000, independently of the
+     * executable/default main-thread priority (1001) the loader selects. */
+    set_main_priority(1000);
 
     /* 1. A higher-priority thread publishes, then blocks: with the option the creator sees what it published. The
      * thread cannot publish before the creator's wait has begun, so without the option it has not published when
@@ -192,6 +195,12 @@ int main(void)
         if (on) EXPECT(ms >= PRIO_START_TIMEOUT_MS - 5);
         finish_case();
     }
+
+    /* Priority zero is the highest valid priority, not an unset sentinel. */
+    set_main_priority(0);
+    create(400, BODY_WRITE_THEN_BLOCK);
+    EXPECT(__atomic_load_n(&g_published, __ATOMIC_RELAXED) == 0);
+    finish_case();
 
     /* 5. The creator's own priority counts once main has set one: at 300, a 400 thread no longer preempts it. */
     set_main_priority(300);

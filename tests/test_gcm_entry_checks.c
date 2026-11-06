@@ -10,6 +10,10 @@
  *   - What the firmware does not test and lv2 or undefined state answers (size 0, a map before Init, the runtime's own
  *     full mapping list) is a named stop, not an invented code. */
 #include "../libs/video/cellGcmSys.c"
+#include "../libs/video/rsx_tiling.c"
+/* GCM_REPORT_SPU_HOLD_MS (gcm.report_spu_hold_ms) asks the SPU task layer whether a task round is
+ * running; there are no SPU tasks here. */
+int spu_taskset_round_busy(uint32_t* ts, uint32_t* tid) { (void)ts; (void)tid; return 0; }
 #include <assert.h>
 #include <setjmp.h>
 

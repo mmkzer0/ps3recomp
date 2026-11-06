@@ -14,9 +14,12 @@
 
 #include "rsx_draw_engine.h"
 #ifndef STUB_REAL_STOP    /* a fixture that expects the rsx-driver-method stop links stop.cpp */
-#include "rsx_driver_stop_stub.h"
+#include "rsx_driver_stop_stub.h"   /* also provides ps3_config_get() unless RSX_STUB_OWN_CONFIG */
+#elif !defined(RSX_STUB_OWN_CONFIG)
+#include "rsx_engine_config_stub.h"
 #endif
 #include "rsx_primitives.h"
+#include "rsx_tiling.c"   /* the engine looks the bound tiles up there (v0.19.0 #569); one definition per executable */
 
 #include <stdio.h>
 #include <stdlib.h>

@@ -41,6 +41,8 @@ PS3_NORETURN void ps3_stop_guest_range(const char* func, const char* arg,
     _Exit(PS3_STOP_EXIT_CODE);
 }
 }
+/* ps3_dev_flash_path (runtime/platform), which host_path calls for /dev_flash: the real one, it needs nothing. */
+#include "../../platform/ps3_dev_flash.c"
 ps3_guest_caller_fn g_ps3_guest_caller = nullptr;
 const char* edat_resolve(const char* host_path, char* buf, size_t cap) { (void)buf; (void)cap; return host_path; }
 

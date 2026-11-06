@@ -26,7 +26,6 @@ rwlock.create_protocols * #115 invalid attribute accepted
 event.queue_create_sizes * #115 invalid attribute accepted
 event.queue_create_protocols * #115 invalid attribute accepted
 event.queue_create_types * #115 invalid attribute accepted
-event.queue_destroy_modes * #115 invalid attribute accepted
 event.port_create_types * #115 invalid attribute accepted
 eventflag.create_protocols * #115 invalid attribute accepted
 eventflag.create_types * #115 invalid attribute accepted
@@ -43,22 +42,16 @@ process.object_count * #116 process object syscalls 12/13/18 missing
 process.get_id_lists_mutex * #116 process object syscalls 12/13/18 missing
 process.get_id_unknown_type * #116 process object syscalls 12/13/18 missing
 timer.create_destroy * #116 process object syscalls 12/13/18 missing
-rwlock.readers_stack * #117 rwlock timeout, state checks, slot 126
 rwlock.trywlock_exclusive * #117 rwlock timeout, state checks, slot 126
 rwlock.trywlock_slot_148 * #117 rwlock timeout, state checks, slot 126
-rwlock.rlock_under_writer * #117 rwlock timeout, state checks, slot 126
 rwlock.wlock_under_reader * #117 rwlock timeout, state checks, slot 126
 rwlock.trywlock_under_reader * #117 rwlock timeout, state checks, slot 126
-rwlock.runlock_not_held * #117 rwlock timeout, state checks, slot 126
-rwlock.destroy_locked * #117 rwlock timeout, state checks, slot 126
 rwlock.invalid_id * #117 rwlock timeout, state checks, slot 126
 event.queue_tryreceive_errors * #118 event port/queue state and source
 event.queue_receive_errors * #118 event port/queue state and source
 event.port_connect_wrong_type * #118 event port/queue state and source
 event.port_destroy_connected * #118 event port/queue state and source
 event.port_send_default_source * #118 event port/queue state and source
-event.port_outlives_queue * #118 event port/queue state and source
-mutex.trylock_relock_nonrecursive * #119 sync binding, relock, trywait output
 cond.mutex_destroy_with_cond * #119 sync binding, relock, trywait output
 cond.signal_to_bogus_thread * #119 sync binding, relock, trywait output
 eventflag.trywait_and * #119 sync binding, relock, trywait output
@@ -80,7 +73,6 @@ timer.start_oneshot_in_past * #120 memory/timer/ppu_thread checks
 timer.get_information * #120 memory/timer/ppu_thread checks
 timer.get_information_invalid * #120 memory/timer/ppu_thread checks
 container.create_destroy * #96 slot identity (containers 341/342/350, stubs, 832)
-container.create_destroy_old_slots * #96 slot identity (containers 341/342/350, stubs, 832)
 container.slot_cross * #96 slot identity (containers 341/342/350, stubs, 832)
 container.create_sizes * #96 slot identity (containers 341/342/350, stubs, 832)
 container.create_too_big * #96 slot identity (containers 341/342/350, stubs, 832)

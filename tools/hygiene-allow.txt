@@ -10,6 +10,12 @@
 # allow-list entry without a written reason is how a leak becomes normal.
 # An entry suppresses only its own rule for matching paths.
 #
-# This repository must stay empty here:
+# An entry is for a file that was reviewed and is kept on purpose, such as a
+# vendored third-party file with its licence and provenance beside it (a
+# source.json naming the upstream commit and the file's sha256). Nothing else
+# belongs here: a file that merely trips a rule is fixed or removed, not
+# listed. Every other path must pass with no entry:
 #
 #     python3 tools/check_hygiene.py --tracked
+
+third_party/smaa/AreaTex.h oversize -- vendored SMAA area texture (iryoku/smaa, MIT, licence and commit in third_party/smaa/), 1.17 MB of generated table data, reviewed for v0.19.0 #470

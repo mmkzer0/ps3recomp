@@ -116,6 +116,11 @@ static void expect(const char* what, const int* want_modes, int n_want, int want
     }
     CHECK(avail((u32)st) == 1, "%s: the state's resolution %d is not available", what, st);
 
+    /* Stereoscopic 3D and dual-view ids (0x80 up; 0x81 is 720p frame packing) are never available, restricted
+     * or not: reporting one tells the title a 3D display is attached (v0.19.0 #642, MLB The Show 16). */
+    for (u32 id = 0x80; id <= 0x84; ++id)
+        CHECK(avail(id) == 0, "%s: id 0x%X (stereoscopic/dual-view) availability %d, want 0", what, id, avail(id));
+
     /* The refresh rate the vertical blank repeats at follows the refresh-rate flag GetState reports for the
      * mode (59.94 Hz = flag 1 = 60000 / 1001), for every mode the display can run. */
     {

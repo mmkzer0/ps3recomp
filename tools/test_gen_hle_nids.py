@@ -47,6 +47,7 @@ HOST_HELPERS = set("""
     cellGcmResolveOffset
     cellGcm_address_to_offset
     cellGcm_control_guest_addr
+    cellGcm_current_scanout
     cellGcm_ctx_emit
     cellGcm_ctx_reserve
     cellGcm_display_buffer_count

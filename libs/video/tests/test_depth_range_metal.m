@@ -17,6 +17,7 @@
 #define eng_texture_upload test_engine_texture_upload
 #define eng_present test_engine_present
 #include "rsx_draw_engine.c"
+#include "rsx_tiling.c"   /* the engine looks the bound tiles up there (v0.19.0 #569) */
 #undef eng_texture_upload
 #undef eng_present
 #include "rsx_test_programs.h"
@@ -44,6 +45,7 @@ void spu_coh_notify_write(uint32_t a) { (void)a; }
 u32 cellGcmResolveLocated(int local, u32 offset) { (void)local; return offset; }
 u32 cellGcmResolveIO(u32 offset) { return offset < ppu_vm_size ? offset : 0; }
 void cellGcm_replay_display_buffers_to_engine(void) {}
+#define RSX_STUB_OWN_CONFIG   /* ps3_config_get() below */
 #include "rsx_driver_stop_stub.h"
 
 static void die(const char* f, const char* a, const char* r)
@@ -67,6 +69,8 @@ const ps3_config* ps3_config_get(void)
 {
     static ps3_config cfg;
     cfg.gcm_wait_timeout_ms = 10000;
+    cfg.eng_depth_clamp = true;
+    cfg.eng_depth_bounds = true;
     return &cfg;
 }
 /* The backend's legacy vtable registration: this test drives the engine backend only. */

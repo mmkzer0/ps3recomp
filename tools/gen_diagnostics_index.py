@@ -15,7 +15,7 @@ NL = chr(10)
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ROOTS = [os.path.join(ROOT, r) for r in ('runtime', 'libs', 'tools')]
 DOC = os.path.join(ROOT, 'docs', 'DIAGNOSTICS.md')
-PAT = re.compile(r'getenv\(\s*"([A-Za-z_][A-Za-z_0-9]*)"\s*\)')
+PAT = re.compile(r'(?:getenv|ps3_env_once)\(\s*"([A-Za-z_][A-Za-z_0-9]*)"\s*\)')
 COMMENT = re.compile(r'^\s*(?:/\*|\*|//)\s?(.*)$')
 # A knob entry as the generator writes it: - **`NAME`** — description
 KNOB = re.compile(r'^- \*\*`([A-Za-z_][A-Za-z_0-9]*)`\*\*', re.M)

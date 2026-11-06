@@ -52,6 +52,16 @@ static void print_options()
             std::printf("%s", ps3_cfg_gcm_park_resync() ? "true" : "false");
         else if (!std::strcmp(o->section, "gcm") && !std::strcmp(o->key, "park_grace_ms"))
             std::printf("%u", ps3_cfg_gcm_park_grace_ms());
+        else if (!std::strcmp(o->section, "gcm") && !std::strcmp(o->key, "handler_thread"))
+            std::printf("%s", ps3_cfg_gcm_handler_thread() ? "true" : "false");
+        else if (!std::strcmp(o->section, "gcm") && !std::strcmp(o->key, "report_spu_hold_ms"))
+            std::printf("%u", ps3_cfg_gcm_report_spu_hold_ms());
+        else if (!std::strcmp(o->section, "eng") && !std::strcmp(o->key, "depth_clamp"))
+            std::printf("%s", ps3_cfg_eng_depth_clamp() ? "true" : "false");
+        else if (!std::strcmp(o->section, "eng") && !std::strcmp(o->key, "depth_bounds"))
+            std::printf("%s", ps3_cfg_eng_depth_bounds() ? "true" : "false");
+        else if (!std::strcmp(o->section, "game") && !std::strcmp(o->key, "free_space_raw"))
+            std::printf("%s", ps3_cfg_game_free_space_raw() ? "true" : "false");
         else if (!std::strcmp(o->section, "trophy") && !std::strcmp(o->key, "register_wait_cap_vblanks"))
             std::printf("%u", ps3_cfg_trophy_register_wait_cap_vblanks());
         else if (!std::strcmp(o->section, "video") && !std::strcmp(o->key, "resolutions"))

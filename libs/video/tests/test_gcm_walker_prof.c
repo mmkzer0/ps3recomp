@@ -1,22 +1,43 @@
 /* RSX_WALKER_PROF (cellGcmSys.c), the in-process walker sampler, on a host
  * fixture: with RSX_WALKER_PROF=<file> and RSX_WALKER_PROF_SECONDS=1 the
- * first thread to drain the FIFO is sampled and the file holds the samples;
- * without it nothing is armed and no file appears. macOS arm64 only (the
- * sampler is compiled out elsewhere and this test only checks that).
- * Diagnostic coverage; it never starts a graphics backend.
+ * first thread to drain the FIFO is sampled and the file holds the samples.
+ * The fixture stretches every nominal 1 ms sleep to prove the requested
+ * duration follows elapsed time rather than a count of sleeps. Without the
+ * variable nothing is armed and no file appears. macOS arm64 only (the sampler
+ * is compiled out elsewhere and this test only checks that). Diagnostic
+ * coverage; it never starts a graphics backend.
  *
  * clang -std=gnu17 -I include -I libs/video libs/video/tests/test_gcm_walker_prof.c
  *   -ffunction-sections -fdata-sections -Wl,-dead_strip -o /tmp/test_gcm_walker_prof
  * Run: /tmp/test_gcm_walker_prof on <file>   (RSX_WALKER_PROF=<file> RSX_WALKER_PROF_SECONDS=1)
  *      /tmp/test_gcm_walker_prof off <file>  (RSX_WALKER_PROF unset)
  */
+#include <time.h>
+#if defined(__APPLE__) && defined(__aarch64__)
+static int wprof_test_nanosleep(const struct timespec* req, struct timespec* rem);
+#define nanosleep wprof_test_nanosleep
+#endif
 #include "../cellGcmSys.c"
 #include "gcm_fixture_stubs.h"   /* ps3_config_get and the named stops cellGcmSys.c ends in */
+#if defined(__APPLE__) && defined(__aarch64__)
+#undef nanosleep
+/* Model timer coalescing: duration follows wall time, not 1000 sleeps. */
+static int wprof_test_nanosleep(const struct timespec* req, struct timespec* rem)
+{
+    struct timespec delayed = *req;
+    if (delayed.tv_sec == 0 && delayed.tv_nsec == 1000000)
+        delayed.tv_nsec = 5000000;
+    return nanosleep(&delayed, rem);
+}
+#endif
+#include "../rsx_tiling.c"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 #include <ctype.h>
+/* GCM_REPORT_SPU_HOLD_MS asks the SPU task layer whether a task round is
+ * running; there are no SPU tasks here. */
+int spu_taskset_round_busy(uint32_t* ts, uint32_t* tid) { (void)ts; (void)tid; return 0; }
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
 int g_resv_store_active;
@@ -133,12 +154,11 @@ int main(int argc, char** argv)
         check(f == NULL, "without RSX_WALKER_PROF no profile is written");
         if (f) fclose(f);
     } else {
-        /* The sampler ends after a tick count (1000 nanosleeps of 1 ms), not
-         * at a deadline, and a throttled or loaded host stretches each sleep:
-         * 1 ms took 32-39 ms under taskpolicy -b (~35 s for the whole run).
-         * So wait on the observable condition, the done state that
-         * walker_loop polls, bounded well past that rather than a fixed run
-         * time. */
+        /* The sampler ends at a deadline (#657: elapsed time, not a count of 1 ms sleeps), and the fixture
+         * stretches each nominal 1 ms sleep on macOS arm64 to prove it. A throttled or loaded host can still
+         * stretch the whole run (1 ms took 32-39 ms under taskpolicy -b), so wait on the observable
+         * condition, the done state walker_loop polls, bounded well past RSX_WALKER_PROF_SECONDS rather
+         * than for a fixed run time. */
         const double t0 = now_s();
         walker_loop(WPROF_FINISH_BOUND_S);
         printf("  sampler finished after %.2f s\n", now_s() - t0);
@@ -155,7 +175,7 @@ int main(int argc, char** argv)
         }
         if (f) fclose(f);
         printf("  %d samples, %d lines\n", n, lines);
-        check(n > 100 && lines == n, "about a sample per millisecond, one line each");
+        check(n >= 10 && lines == n, "periodic samples are written one per line");
         check(frames_ok, "every sample has frames");
     }
 #else

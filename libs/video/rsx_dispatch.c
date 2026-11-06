@@ -319,6 +319,13 @@ void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
      * (rsx_dsp_depth_range), so the reset has to be the hardware's. */
     rsx->regs[M_CLIP_MAX >> 2] = 0x3F800000u;
 
+    /* NV40 reset ZMIN_MAX_CONTROL (0x1D78) is 1: clip at the near and far
+     * planes, no depth clamp (RPCS3 rsx_methods.cpp; the GCM default of
+     * cellGcmSetZMinMaxControl(TRUE, FALSE, FALSE)). Seeded so a raw 0 means
+     * a title that turned clipping off. (v0.19.0 #693; the execution-method class marks that
+     * follow it upstream live in dsp_classes() here.) */
+    rsx->regs[0x1D78 >> 2] = 0x00000001u;
+
     memcpy(rsx->klass, dsp_classes()->klass, sizeof rsx->klass);
 }
 

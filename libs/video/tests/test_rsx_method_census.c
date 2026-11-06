@@ -16,6 +16,10 @@
 #endif
 #include "../cellGcmSys.c"
 #include "ps3emu/config.h"
+#include "../rsx_tiling.c"        /* cellGcmSys.c publishes the bound tiles here and the 2D engines read them (v0.19.0 #569) */
+/* GCM_REPORT_SPU_HOLD_MS (gcm.report_spu_hold_ms) asks the SPU task layer whether a task round is
+ * running; there are no SPU tasks here. */
+int spu_taskset_round_busy(uint32_t* ts, uint32_t* tid) { (void)ts; (void)tid; return 0; }
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -399,9 +403,11 @@ int main(void)
     /* 36 census pairs are consumed by a named consumer, plus the seven SET_OBJECT writes that bind the
      * slots (each is a method the walker consumes). The two NV308A pairs over the 34 of before are the
      * inline transfer's own state: SET_CONTEXT_SURFACE (0x019C) and SET_OPERATION (0x02FC), which
-     * gcm_nv308a_color reads (#81) and which were allow-listed while no transfer existed. */
-    check(st.handled == 43, "43 writes are consumed by a named consumer");
-    check(st.inert == 178, "178 writes are allow-listed for the value they carry");
+     * gcm_nv308a_color reads (#81) and which were allow-listed while no transfer existed. One more since
+     * v0.19.0 (#693): SET_ZMIN_MAX_CONTROL (0x1D78) is read by the engine's render state (depth clamp), so
+     * its row is a consumer, no longer an allow-listed value. */
+    check(st.handled == 44, "44 writes are consumed by a named consumer");
+    check(st.inert == 177, "177 writes are allow-listed for the value they carry");
     check(st.missing == 0, "no census write is a known gap: the S2 gaps the census once carried all have consumers");
     check(st.handled + st.inert + st.missing == 221, "...and the three classes cover every write (214 pairs + 7 binds)");
 

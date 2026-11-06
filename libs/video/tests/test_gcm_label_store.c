@@ -25,7 +25,12 @@
  *   -fdata-sections -Wl,--gc-sections -pthread -o /tmp/test_gcm_label_store
  *   (clang on macOS: -Wl,-dead_strip)   (tools/test_gcm_label_store.py)
  */
+#define RSX_STUB_OWN_CONFIG   /* ps3_config_get() below */
 #include "../cellGcmSys.c"
+#include "../rsx_tiling.c"        /* cellGcmSys.c publishes the bound tiles here and the 2D engines read them (v0.19.0 #569) */
+/* GCM_REPORT_SPU_HOLD_MS (gcm.report_spu_hold_ms) asks the SPU task layer whether a task round is
+ * running; there are no SPU tasks here. */
+int spu_taskset_round_busy(uint32_t* ts, uint32_t* tid) { (void)ts; (void)tid; return 0; }
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -77,6 +82,8 @@ const ps3_config* ps3_config_get(void)
 {
     static ps3_config cfg;
     cfg.gcm_wait_timeout_ms = g_timeout_ms;
+    cfg.eng_depth_clamp = true;
+    cfg.eng_depth_bounds = true;
     return &cfg;
 }
 void ps3_stop_gcm_wait_timeout(const char* func, const char* what, uint32_t offset, uint32_t value,

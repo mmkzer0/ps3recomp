@@ -25,6 +25,10 @@
 #include "../rsx_draw_engine.c"
 #include "../resc_convert.h"
 #include "gcm_fixture_stubs.h"   /* ps3_config_get and the named stops cellGcmSys.c ends in */
+#include "../rsx_tiling.c"        /* cellGcmSys.c publishes the bound tiles here and the 2D engines read them (v0.19.0 #569) */
+/* GCM_REPORT_SPU_HOLD_MS (gcm.report_spu_hold_ms) asks the SPU task layer whether a task round is
+ * running; there are no SPU tasks here. */
+int spu_taskset_round_busy(uint32_t* ts, uint32_t* tid) { (void)ts; (void)tid; return 0; }
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

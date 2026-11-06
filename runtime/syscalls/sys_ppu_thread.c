@@ -247,12 +247,13 @@ void ppu_thread_note_block(uint64_t tid)
         __atomic_store_n(blocked, 1, __ATOMIC_RELEASE);
 }
 
-/* Priority the creator runs at. Must be called under the table lock. Main registers with priority 0, which means
- * "never set" until it calls sys_ppu_thread_set_priority; it is treated as the default. */
+/* Priority the creator runs at. Must be called under the table lock. Main
+ * registration now initializes a real priority; zero is the highest valid
+ * priority and must not be treated as an unset/default sentinel. */
 static int32_t creator_priority(uint64_t tid)
 {
     const ppu_thread_info* c = find_thread(tid);
-    if (!c || (c == &g_ppu_threads[0] && c->priority == 0)) return PPU_DEFAULT_PRIORITY;
+    if (!c) return PPU_DEFAULT_PRIORITY;
     return c->priority;
 }
 
@@ -427,6 +428,7 @@ uint64_t ppu_thread_register_main(void)
         prof_store(&s_prof_tid[0], 1u);
         t->state    = PPU_THREAD_STATE_RUNNING;
         t->joiner   = PPU_JOIN_DETACHED;    /* nobody joins the main thread */
+        t->priority = 1001;                 /* default PS3 process priority (PROC_PARAM overrides it) */
         strncpy(t->name, "main", sizeof(t->name) - 1);
         ps3_ft_name(1, "main");
         ps3_tprof_thread('P', 1);
@@ -440,6 +442,36 @@ uint64_t ppu_thread_register_main(void)
     }
     table_unlock();
     return 1;
+}
+
+/* The ELF entry path may follow a host bootstrap which already claimed slot
+ * zero. Apply its process priority in either case, before guest dispatch. The
+ * legacy no-argument registration API remains available for other harnesses. */
+uint64_t ppu_thread_register_main_priority(int32_t priority)
+{
+    uint64_t id = ppu_thread_register_main();
+    table_lock();
+    g_ppu_threads[0].priority = (priority >= 0 && priority <= 3071) ? priority : 1001;
+    table_unlock();
+    return id;
+}
+
+/* Fill in the main thread's stack fields after the boot harness has chosen
+ * where the stack lives. register_main() memset()s the whole struct, so
+ * without this sys_ppu_thread_get_stack_information(49) finds tid 1 in the
+ * table with stack_addr/stack_size == 0 and reports a {0,0} stack -- a guest
+ * that dumps its own stack (RPCS3's dump_stack test) then calls
+ * cellFsWrite(fd, NULL, 0) and produces an empty file while the real kernel
+ * reports the actual region. RPCS3's main stack: base 0xD0010000, 1 MB. */
+void ppu_thread_set_main_stack(uint32_t stack_base, uint32_t stack_size)
+{
+    table_lock();
+    ppu_thread_info* t = &g_ppu_threads[0];
+    if (t->state != PPU_THREAD_STATE_FREE) {
+        t->stack_addr = stack_base;
+        t->stack_size = stack_size;
+    }
+    table_unlock();
 }
 
 /* ---------------------------------------------------------------------------
@@ -783,6 +815,11 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
     uint32_t status_addr  = LV2_ARG_PTR(ctx, 1);
     { static PPU_TLS int n=0; if(PS3_LOG_FIRST(n, 30)) fprintf(stderr,"[WAIT] ppu_thread_join(tid=%llu)\n", (unsigned long long)tid); }
     ppu_thread_note_block(ctx->thread_id);   /* PS3_PRIO_START */
+
+    /* Joining yourself is EDEADLK (it used to wait on its own finish event
+     * for good). */
+    if (tid == ctx->thread_id)
+        return (int64_t)(int32_t)CELL_EDEADLK;
 
     table_lock();
     ppu_thread_info* t = find_thread(tid);

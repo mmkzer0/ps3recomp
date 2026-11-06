@@ -24,6 +24,8 @@ static ps3_config* ps3_fixture_config(void)
         cfg.gcm_wait_timeout_ms = 10000;
         cfg.gcm_park_resync = false;
         cfg.gcm_park_grace_ms = 50;
+        cfg.eng_depth_clamp = true;     /* the draw engine, where a fixture links it (eng.*) */
+        cfg.eng_depth_bounds = true;
     }
     return &cfg;
 }
@@ -68,6 +70,7 @@ PS3_NORETURN void ps3_stop_rsx_unknown_method(const char* cls, uint32_t method, 
 }
 
 /* The draw engine ends an unresolvable flip in this (test_gcm_class_routing.c compiles the engine in). */
+#define RSX_STUB_OWN_CONFIG   /* ps3_fixture_config() above is the effective configuration */
 #include "rsx_driver_stop_stub.h"
 
 #endif

@@ -6,7 +6,8 @@
  * only well-formed flips (display buffers registered, a surface rendered) never reaches it, so it
  * stubs the symbol: a fixture that does reach it has a bug, says which word, and ends with the stop
  * status. A fixture that expects the stop links the real runtime/diag/stop.cpp instead
- * (test_rsx_flip_semantics.c) and does not include this header.
+ * (test_rsx_flip_semantics.c) and does not include this header (it includes rsx_engine_config_stub.h
+ * itself).
  *
  * Include it once per executable, like gcm_fixture_stubs.h.
  */
@@ -14,6 +15,9 @@
 #define PS3RECOMP_RSX_DRIVER_STOP_STUB_H
 
 #include "ps3emu/stop.h"
+#ifndef RSX_STUB_OWN_CONFIG   /* a fixture that defines its own ps3_config_get() defines this first */
+#include "rsx_engine_config_stub.h"   /* the engine reads eng.depth_clamp / eng.depth_bounds */
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>

@@ -147,6 +147,52 @@ PS3_CFG_U32(gcm, park_grace_ms, 50, 1, 60000,
     "loading its menu, took more than 50 ms between its append and its patch of the park, so a title "
     "that needs the Compatibility mode may need this longer.")
 
+PS3_CFG_BOOL(gcm, handler_thread, 0,
+    "Deliver the guest's vblank, flip and user handlers only on one dedicated host thread, as the "
+    "PS3 does on its GCM interrupt thread. Off, the handlers run at an HLE boundary, nested in whatever "
+    "guest thread made the call, and inherit its thread id: a handler that takes a lock that thread "
+    "already holds re-enters it instead of waiting (MLB The Show 16's lock wrappers record the owner "
+    "id and unlock only for the recorded owner; its flip handler, delivered inside its DisplayFlip "
+    "thread, cleared that record and the lock leaked, freezing the game). The handlers then run "
+    "concurrently with the guest threads, as on the console. Off by default: the guest-visible "
+    "ordering of handler delivery changes, and no title but that one is known to need it. A "
+    "compatibility mode, not PS3 behaviour of the runtime's own pump (v0.19.0 #647).")
+
+PS3_CFG_U32(gcm, report_spu_hold_ms, 0, 0, 60000,
+    "If non-zero, a GET_REPORT waits up to this many milliseconds while SPU tasks that work in "
+    "signal-driven rounds are in one (spu_taskset_round_busy). The real RSX spends a frame's time "
+    "drawing between two reports; the walker spends none, so a title that turns reports into task "
+    "signals can signal the next round while the last one still runs, and a signal sent to a task "
+    "that is still busy is taken by whatever wait it reaches next (God of War: Ascension's RsxSync). "
+    "Like an ACQUIRE, a held report stops the drain pass without consuming the method. The hold "
+    "gives up after this long with a logged line. 0 never holds. A compatibility timing policy, not "
+    "PS3 behaviour (v0.19.0 #635).")
+
+/* ---- eng (the RSX draw engine; PS3RECOMP_ENG_*) ------------------------- */
+
+PS3_CFG_BOOL(eng, depth_clamp, 1,
+    "Honour the depth-clamp field of NV4097_SET_ZMIN_MAX_CONTROL (0x1D78): a fragment beyond the near "
+    "or far plane is clamped to it instead of clipped, as on the RSX. False always clips at the near "
+    "and far planes, as before the register was honoured. On by default; a kill switch for diagnosing a title whose "
+    "geometry changes with the clamp (v0.19.0 #693).")
+
+PS3_CFG_BOOL(eng, depth_bounds, 1,
+    "Emulate the depth-bounds test (NV4097_SET_DEPTH_BOUNDS_TEST_ENABLE with the min and max registers) "
+    "on a backend with no native one: the draw's depth is snapshotted before it and the pixel is "
+    "discarded outside the bounds. False ignores the test, as before. On by default; a kill switch for "
+    "diagnosing a title that enables the test with bounds it does not mean (v0.19.0 #694).")
+
+/* ---- game --------------------------------------------------------------- */
+
+PS3_CFG_BOOL(game, free_space_raw, 0,
+    "Report the host disk's measured free space to the guest in every cellGame hddFreeSizeKB, capped "
+    "at INT32_MAX KB, instead of RPCS3's 40 GiB - 256 KiB once the measured value reaches 4 GiB. A "
+    "guest computes hddFreeSizeKB * 1024 in 32 bits, so 4 GiB or more wraps to a few MB and the "
+    "install check fails (inFAMOUS 2, with 41.7 GB free); the default keeps the measured value below "
+    "4 GiB, where it cannot wrap, and reports RPCS3's figure above it. The figure above 4 GiB is "
+    "RPCS3's, not a hardware measurement. On is for a title that must see the real number "
+    "(v0.19.0 #692).")
+
 /* ---- trophy ------------------------------------------------------------- */
 
 PS3_CFG_U32(trophy, register_wait_cap_vblanks, 1024, 1, 16777216,
