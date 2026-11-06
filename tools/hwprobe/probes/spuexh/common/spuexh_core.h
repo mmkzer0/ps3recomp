@@ -20,14 +20,11 @@ typedef struct {
     int special_b_from;              /* skip the first N prefixes (resume after a run that was lost in the middle) */
     int special_b_count;             /* stop after N words (0 = every word): the staging control for probe B batches */
     int special_b_both;              /* 1 = zero and random pattern per prefix, 0 = only the zero pattern */
-    char a_ops[64];                  /* probe A: comma list of its ops (default all five) */
+    char a_ops[64];                  /* probe A: comma list of its ops (default all five: dfceq dfcmeq dfcgt dfcmgt dftsv) */
     int case_timeout_ms;             /* wall limit of one special-A case (> 0: every launch is bounded) */
     int b_timeout_ms;                /* wall limit of one special-B word (> 0) */
     int launch_timeout_ms;           /* wall limit of one thread-group launch, sweep included (> 0) */
-    int auto_dpcmp;                  /* enable dfceq/dfcmeq/dfcgt/dfcmgt/dftsv in the sweep when probe A accepted them */
     int sweep;                       /* run the sweep at all (0: only the special probes) */
-    int force_dpcmp;                 /* run the DP compares in the sweep without probe A's acceptance */
-    int dpcmp_known, dpcmp_ok[5];    /* result of probe A (set by the caller); the sweep skips unaccepted DP compares */
     char preset[16];
     int nlanes;                      /* lanes= entries (see RUN.md "Lanes"): per-lane dumps of chosen (op, domain, block) triples */
     struct { int op, scale, dom, count; uint32_t blk, start; } lanes[SPUEXH_LANES_MAX_ENTRIES];   /* op: index into spuexh_ops; scale: replacing I8 conversion scale or -1; dom: index into spuexh_dom_names */
@@ -38,8 +35,9 @@ typedef struct {
 
 /* Fills `rc` with the defaults of `preset` ("smoke", "standard", "full"; NULL = smoke). Returns 0, or -1 for an unknown preset. */
 int spuexh_runcfg_defaults(spuexh_runcfg_t *rc, const char *preset);
-/* One key=value of the probe's configuration (the keys documented in RUN.md). Returns 1 if handled, 0 if the key
- * is not one of the sweep's (the caller handles pad/screen/tag/...), -1 on a bad value (message in err). */
+/* One key=value of the probe's configuration (the keys documented in RUN.md). Returns 1 if handled, 0 if the key is one the
+ * caller handles itself (pad, hold_s, screen, tag, outdir, fw_version, fw_type, console_model, progress_file), -1 on a bad
+ * value or an UNKNOWN key ("unknown key 'k'" in err): a misspelt key never falls back to a default, the caller must stop. */
 int spuexh_runcfg_set(spuexh_runcfg_t *rc, const char *key, const char *val, char *err, size_t errcap);
 /* Applies ops=/skip_ops=/doms= to the wire config. Returns 0, or -1 with a message. */
 int spuexh_runcfg_finish(spuexh_runcfg_t *rc, char *err, size_t errcap);
@@ -105,9 +103,10 @@ typedef struct {
 /* The sweep. */
 int spuexh_run_sweep(spuexh_backend_t *be, const spuexh_runcfg_t *rc, const spuexh_sink_t *sink, spuexh_sweep_res_t *res);
 
-/* Special probe A: dfceq dfcmeq dfcgt dfcmgt dftsv as raw words. Fills accepted[5] (1 = the SPU executed it).
+/* Special probe A: dfceq dfcmeq dfcgt dfcmgt dftsv as raw words (a fixed list in core.c: they are not in the op table). The
+ * retail SPU executes none of them; an `executed` SPECA_VALID row is a regression of the model (compare_spuexh.py reports it).
  * Returns 0, 1 when the operator asked to stop, or -1 when a launch could not be contained (FATAL row written). */
-int spuexh_run_special_a(spuexh_backend_t *be, const spuexh_runcfg_t *rc, const spuexh_sink_t *sink, int accepted[5]);
+int spuexh_run_special_a(spuexh_backend_t *be, const spuexh_runcfg_t *rc, const spuexh_sink_t *sink);
 /* Special probe B: decoder validity of every prefix the toolkit decodes as SPU_word (special_b_count/special_b_both
  * narrow it: the staging control for the first batches). Returns 0, 1 when the operator asked to stop, or -1 on FATAL. */
 int spuexh_run_special_b(spuexh_backend_t *be, const spuexh_runcfg_t *rc, const spuexh_sink_t *sink);
@@ -118,9 +117,6 @@ int spuexh_run_special_b(spuexh_backend_t *be, const spuexh_runcfg_t *rc, const 
  * Returns 0, 1 when the operator asked to stop, or -1 when a launch could not be contained or no buffer could be
  * allocated (FATAL row written). A fault costs the one entry (LANES_FAULT) and the run goes on. */
 int spuexh_run_lanes(spuexh_backend_t *be, const spuexh_runcfg_t *rc, const spuexh_sink_t *sink);
-
-/* Names of the five special-A ops, in order of the accepted[] array. */
-extern const char *const spuexh_dpcmp_names[5];
 
 double spuexh_now(void);             /* seconds, monotonic (core.c uses it for the stall clock) */
 

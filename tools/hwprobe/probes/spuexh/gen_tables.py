@@ -28,10 +28,7 @@ CVT = ["cflts", "cfltu", "csflt", "cuflt"]
 # host op names that are not the ISA mnemonic (the host helpers use the C-intrinsic style names)
 MNEMONIC_ALIAS = {"rothma": "rotmah", "rotmhi": "rothmi"}
 
-# the toolkit decodes dftsv's I7 itself (form NONE); the ISA format is RI7
-FORM_OVERRIDE = {"dftsv": "I7U"}
-
-IMM_DOMAINS = ("immb", "immh", "immw", "fsmbi", "dtsv")
+IMM_DOMAINS = ("immb", "immh", "immw", "fsmbi")
 
 # ops whose destination register is also an input (the host's third operand c is the old rt)
 RT_INPUT = {"addx", "sfx", "cgx", "bgx", "mpyhha", "mpyhhau", "dfma", "dfms", "dfnms", "dfnma"}   # DP multiply-add: rt = ra*rb (+-) rt
@@ -116,8 +113,6 @@ def encode_info(name, tab, forms):
     if pre != list(range(pre[0], pre[0] + n)) or pre[0] % n:
         raise SystemExit(f"op {name!r}: prefixes {pre} are not one aligned opcode block")
     form = forms.get(name, "NONE")
-    if name in FORM_OVERRIDE:
-        form = FORM_OVERRIDE[name]
     base = pre[0] << 21
     if n == 128:
         return {"kind": "RRR", "base": base, "imm_shift": 0, "imm_bits": 0}

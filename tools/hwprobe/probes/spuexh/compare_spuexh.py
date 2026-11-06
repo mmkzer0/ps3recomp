@@ -21,7 +21,8 @@ Only blocks present in both files are compared. Verdict per op (all domains toge
 A verdict also names the domains whose generator self-check did not validate ("gencheck unvalidated"): the
 comparison requires a #gencheck digest for every measured domain on both sides and fails (exit 1) when it is
 missing, disagrees, or the evidence sets are disjoint, because op verdicts there are not about the ops.
-Exit status: 0 when no op is HW!= and the generator evidence covers every measured domain, 1 otherwise,
+Exit status: 0 when no op is HW!=, the generator evidence covers every measured domain and no special-A op executed
+(the five DP compares must NOT execute: a SPECA_VALID `executed` row is a regression), 1 otherwise,
 2 on a usage or format error.
 """
 import argparse
@@ -182,12 +183,9 @@ def op_order_from(path_ref):
 
 
 # ---------------------------------------------------------------- special probes
-def _hexq(s):
-    return [int(s[i:i + 8], 16) for i in range(0, 32, 8)]
-
-
-def _dp(w, lane):
-    return (w[2 * lane] << 32) | w[2 * lane + 1]
+# The five words of special probe A (common/spuexh_core.c). A retail CBE SPU raises an invalid-instruction error for every
+# one of them (hardware, CECHC04 4.81, r002 specialA; issue #124), so the expected answer is NOT_executed.
+SPECA_OPS = ("dfceq", "dfcmeq", "dfcgt", "dfcmgt", "dftsv")
 
 
 def parse_speca(rows):
@@ -203,49 +201,31 @@ def parse_speca(rows):
     return d, valid, faults
 
 
+def special_a_regressions(hw_rows):
+    """The special-A ops the hardware executed: each one contradicts the toolkit's decode (invalid instruction)."""
+    _d, valid, _f = parse_speca(hw_rows)
+    return [op for op in SPECA_OPS if valid.get(op, ("",))[0] == "executed"]
+
+
 def special_a_report(hw_rows, ref_rows, name_ref="interp"):
-    """Lines describing probe A: acceptance per op and result differences against the reference run."""
+    """Lines describing probe A: the expected answer is that no op executes; an `executed` row is a regression."""
     hw, valid, faults = parse_speca(hw_rows)
-    lines = []
-    for op in ("dfceq", "dfcmeq", "dfcgt", "dfcmgt", "dftsv"):
-        v = valid.get(op)
-        if v is None:
-            lines.append(f"| {op} | not run | | |")
-            continue
-        lines.append(f"| {op} | {v[0]} ({v[1][:60]}) | | |")
-    out = ["#### Special probe A: DP compare / test-special-value as raw words", "",
+    ref = parse_speca(ref_rows)[0] if ref_rows is not None else None
+    out = ["#### Special probe A: DP compare / test-special-value as raw words (expected: NOT executed)", "",
            f"| op | hardware executed it | cases | differ from {name_ref} |", "|---|---|---|---|"]
-    ref = None
-    if ref_rows is not None:
-        ref, _, _ = parse_speca(ref_rows)
-    for op in ("dfceq", "dfcmeq", "dfcgt", "dfcmgt", "dftsv"):
+    for op in SPECA_OPS:
         v = valid.get(op)
         if v is None:
             out.append(f"| {op} | not run | 0 | |")
             continue
         cases = [k for k in hw if k[0] == op]
         diffs = [k for k in cases if ref is not None and k in ref and ref[k][2] != hw[k][2]]
-        out.append(f"| {op} | {'yes' if v[0] == 'executed' else 'NO: ' + v[1][:50]} | {len(cases)} | "
+        out.append(f"| {op} | {'YES (REGRESSION)' if v[0] == 'executed' else 'NO: ' + v[1][:50]} | {len(cases)} | "
                    f"{len(diffs) if ref is not None else 'n/a'} |")
-    # the denormal repros of EXHAUSTIVE.md 3.4 (host model: denormal operands are not flushed by the compares), then a count of the rest
-    repros = {("dfceq", 0x800A56DA8A8D5917, 0x8008000000000000), ("dfcgt", 0x000F6B9D2B8B96A2, 0x8008000000000000)}
-    shown, other = [], 0
-    for (op, word, cid), (a, b, r) in sorted(hw.items()):
-        aw, bw, rw = _hexq(a), _hexq(b), _hexq(r)
-        for lane in (0, 1):
-            av, bv, rv = _dp(aw, lane), _dp(bw, lane), _dp(rw, lane)
-            if (op, av, bv) in repros:
-                shown.append((op, av, bv, rv))
-            elif op in ("dfceq", "dfcgt", "dfcmeq", "dfcmgt") and (av & 0x7FF0000000000000) == 0 and (av & 0x000FFFFFFFFFFFFF) and \
-                    (bv & 0x7FF0000000000000) == 0:
-                other += 1
-    if shown:
-        out += ["", "Denormal repros of EXHAUSTIVE.md 3.4 (the host model answers `dfceq` 0 and `dfcgt` 1 for these; a compare that reads denormals as zero answers the opposite):",
-                "", "| op | a | b | hardware result (lane) |", "|---|---|---|---|"]
-        for op, av, bv, rv in shown[:8]:
-            out.append(f"| {op} | {av:016x} | {bv:016x} | {rv:016x} |")
-        out.append("")
-        out.append(f"{other} further cases with a non-zero denormal `a` and a denormal or zero `b` are in the file (SPECA rows).")
+    regs = special_a_regressions(hw_rows)
+    if regs:
+        out += ["", (f"**REGRESSION: the hardware executed {', '.join(regs)}, which the toolkit decodes as an invalid "
+                     "instruction (issue #124). The results are in the SPECA rows of the file.**")]
     for ln in faults[:10]:
         out.append("")
         out.append(f"fault row: `{ln[:200]}`")
@@ -314,7 +294,7 @@ def render(hw_hashes, hw_rows, hdr, refs, rows_by_ref, detail=False, max_diff=8,
         L.append(f"- timing overflow (job outlasted one decrementer period, ~53.8 s): `{ln[:80]}`")
     for ln in hw_rows.get("FATAL", []):
         L.append(f"- **FATAL (the probe stopped): `{ln[:160]}`**")
-    for ln in hw_rows.get("SKIP", [])[:20]:
+    for ln in hw_rows.get("SKIP", [])[:20]:        # not written any more; result files from before #124 carry them
         L.append(f"- skipped: `{ln[:120]}`")
     L += ["", "| op | hw blocks | " + " | ".join(f"vs {n} (cmp/diff)" for n in names) + " | verdict |",
           "|---|---|" + "---|" * len(names) + "---|"]
@@ -380,7 +360,7 @@ def main(argv=None):
         with open(a.md, "w", encoding="utf-8") as f:
             f.write(text)
     sys.stdout.write(text)
-    return 1 if any(r["verdict"].startswith("HW!=") for r in res) or gen_failed else 0
+    return 1 if any(r["verdict"].startswith("HW!=") for r in res) or gen_failed or special_a_regressions(hw_rows) else 0
 
 
 if __name__ == "__main__":
