@@ -279,6 +279,7 @@ We've written extensive docs covering every aspect of the project. Whether you'r
 | **[Prototype & Debug Builds](docs/PROTO_BUILDS.md)** | Why unencrypted, symbol-bearing prototype builds are the pipeline's ground truth |
 | **[Online Play](docs/ONLINE.md)** | Matchmaking, leaderboards and P2P play through a [psnr](https://github.com/sp00nznet/psnr) server — `--psnr host --username NAME` |
 | **[Regression Gate](docs/REGRESSION_GATE.md)** | How five ports are checked against recorded goldens before a shared-runtime change lands — and how to tell a real red from the four kinds of measurement artefact |
+| **[Upstream Divergences](docs/UPSTREAM-DIVERGENCES.md)** | Where `dev` deliberately differs from upstream, with the evidence for each row. Read it before resolving a sync hunk |
 
 ## Getting Started
 
