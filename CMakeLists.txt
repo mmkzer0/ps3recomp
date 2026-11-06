@@ -967,6 +967,11 @@ if(PS3RECOMP_BUILD_TESTS)
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_quick_exit.py"
                 $<TARGET_FILE:test_quick_exit>)
         set_tests_properties(quick_exit PROPERTIES LABELS "runtime;t0" TIMEOUT 120)
+        # cellSysutilNpEulaCheck (a compat answer of "accepted" with no EULA state) was removed: an import of it
+        # must stop at the unresolved NID, so the generated NID table must not register it again.
+        add_test(NAME hle_unregistered
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_hle_unregistered.py")
+        set_tests_properties(hle_unregistered PROPERTIES LABELS "hle;t0" TIMEOUT 120)
         add_test(NAME spinlock_word_width
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spinlock_word_width.py")

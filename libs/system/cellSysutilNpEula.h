@@ -42,7 +42,9 @@ s32 sceNpEulaAbort(void);
 /* NID 0x6599500D */
 s32 sceNpEulaShowCurrentEula(u32 communicationId, u64 arg2,
                              u32 cbFunc, u32 cbFuncArg);
-s32 cellSysutilNpEulaCheck(void* cb, void* arg);                      /* Legacy compatibility stub */
+/* cellSysutilNpEulaCheck (the legacy name, NID 0x024940F1) is not exported: v0.19.0 #616 answered 1 ("accepted")
+ * without consulting a callback or any EULA state, so a title read a terms answer nobody gave. An import of it
+ * stops at the unresolved NID, named. */
 
 /* Called by cellSysutilCheckCallback: moves a pending answer to the guest
  * callback queue, which that same poll drains (RPCS3's sysutil_register_cb). */

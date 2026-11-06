@@ -541,7 +541,7 @@ pass brings the sync, event, file and SPU-group syscalls closer to the SDK.*
 - **System and network**: cellGame reports 40 GiB − 256 KiB free above 4 GiB,
   so `hddFreeSizeKB * 1024` cannot wrap (*@erikomis*, #692). cellVideoOut
   reports stereoscopic 3D resolutions unavailable (*@MatRanc*, #642).
-  `cellSysutilNpEulaCheck` legacy stub (*@DriifterSelf*, #616). sceNp answers
+  sceNp answers
   presence details and entitlement lists offline (*@tekulvw*, #679);
   sceNpSignaling gives connections for Matching2 room members, with context ids
   from 1 and `ActivateConnection` (*@undecuple*, #690); cellSysutilAvc2
