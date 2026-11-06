@@ -3,10 +3,10 @@
 callbacks (libs/network/tests/test_trophy_registration.c, which compiles
 sceNpTrophy.c in and links cellSysutil.c)."""
 import os
-from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
 root = Path(__file__).resolve().parents[1]
 if os.name == 'nt':
@@ -20,7 +20,7 @@ with tempfile.TemporaryDirectory(prefix='trophy-registration-') as tmp:
                     str(root / 'libs/network/tests/test_trophy_registration.c'),
                     str(root / 'libs/system/cellSysutil.c'), *linker,
                     '-o', str(binary)], check=True)
-    result = subprocess.run([str(binary)], timeout=30, capture_output=True, text=True)
+    result = subprocess.run([str(binary)], check=False, timeout=30, capture_output=True, text=True)
     print(result.stdout.strip())
     if result.returncode:
         print(result.stderr[-2000:])

@@ -5,13 +5,13 @@ Builds runtime/spu/tests/test_spu_channel_semantics.c against the SPU channel
 layer (the build line of test_spu_decrementer.c) and runs it.
 """
 import os
-from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import spu_fixture_link  # noqa: E402
+import spu_fixture_link
 
 if os.name == 'nt':
     print('SKIP: fixture currently requires a POSIX C compiler')

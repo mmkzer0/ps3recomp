@@ -4,9 +4,17 @@
 Only temporary source copies acquire counters/publication observation points.
 --output-dir retains the exact compiled binaries, argv and output for review.
 """
-import argparse,json,os,pathlib,subprocess,sys,tempfile
+import argparse
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import tempfile
+
 sys.path.insert(0,str(pathlib.Path(__file__).resolve().parent))
 import spu_fixture_link
+
 if os.name == 'nt':
     print('SKIP: standalone runtime fixture requires a POSIX compiler')
     raise SystemExit(0)
@@ -50,12 +58,12 @@ def run(work):
         try:
             spu_fixture_link.build(csrc,exe,cflags,where,timeout=120)
         except subprocess.CalledProcessError as e:
-            raise AssertionError('fixture build failed: %s'%e)
+            raise AssertionError(f'fixture build failed: {e}')
         results=[]
         for mode in ['0','1','shadow']:
             for case in ['core','full']:
                 argv=[str(exe),case]
-                r=subprocess.run(argv,env=dict(env,SPU_DISPATCH_CACHE=mode),capture_output=True,text=True,timeout=15)
+                r=subprocess.run(argv,check=False,env=dict(env,SPU_DISPATCH_CACHE=mode),capture_output=True,text=True,timeout=15)
                 label=mode+'-'+case
                 (where/(label+'.stdout')).write_text(r.stdout);(where/(label+'.stderr')).write_text(r.stderr)
                 records.append({'name':name,'mode':mode,'case':case,'argv':argv,'returncode':r.returncode})

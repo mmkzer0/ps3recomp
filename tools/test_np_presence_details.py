@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
-import subprocess,sys,tempfile
+
 r=Path(__file__).resolve().parents[1]
 if sys.platform=='win32':
  print('SKIP: presence fixture needs POSIX C toolchain');raise SystemExit(0)

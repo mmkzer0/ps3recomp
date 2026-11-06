@@ -66,7 +66,7 @@ def main():
         cmd += ["-o", exe, FIXTURE]
         if "mingw" in os.path.basename(cxx):
             cmd += ["-static"]
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        r = subprocess.run(cmd, check=False, capture_output=True, text=True)
         if r.returncode != 0:
             print("FAIL: fixture did not build")
             print((r.stdout + r.stderr)[-4000:])
@@ -74,7 +74,7 @@ def main():
         if args.build_only:
             print(f"built {exe}")
             return 0
-        r = subprocess.run([exe, td], capture_output=True, text=True)
+        r = subprocess.run([exe, td], check=False, capture_output=True, text=True)
         sys.stdout.write(r.stdout)
         sys.stderr.write(r.stderr)
         return r.returncode

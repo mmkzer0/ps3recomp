@@ -7,7 +7,10 @@ Each entry point goes HLSL -> SPIR-V (glslangValidator -D -V -S <stage> -e
 <entry>) -> MSL 2.1 (spirv-cross --msl --msl-version 20100); the preamble and
 the SmaaParams block every translation repeats are emitted once.
 """
-import os, subprocess, sys, tempfile
+import os
+import subprocess
+import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENTRIES = [("smaa_edge_vs", "vert"), ("smaa_edge_ps", "frag"),
@@ -27,7 +30,7 @@ def c_lines(text):
     out = []
     for line in text.splitlines(keepends=True):
         body = line.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
-        out.append('    "%s"\n' % body)
+        out.append(f'    "{body}"\n')
     return "".join(out)
 
 def main():
@@ -45,9 +48,8 @@ def main():
             if not text.startswith(PREAMBLE):
                 sys.exit("unexpected spirv-cross preamble for " + entry)
             text = text[len(PREAMBLE):]
-            if text.startswith(PARAMS):
-                text = text[len(PARAMS):]
-            msl += "// ---- %s\n" % entry + text.rstrip("\n") + "\n"
+            text = text.removeprefix(PARAMS)
+            msl += f"// ---- {entry}\n" + text.rstrip("\n") + "\n"
     sys.stdout.write(HEADER + c_lines(msl) + '    "\\n";\n')
 
 if __name__ == "__main__":

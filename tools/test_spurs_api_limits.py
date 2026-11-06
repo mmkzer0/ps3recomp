@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """cellSpurs argument limits (maxContention clamp, RequestIdleSpu workload check)."""
-import os, platform, subprocess, tempfile
-from pathlib import Path
+import os
+import platform
+import subprocess
 import sys
+import tempfile
+from pathlib import Path
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import spu_fixture_link  # noqa: E402
+import spu_fixture_link
+
 if os.name == 'nt':
     print('SKIP: POSIX fixture'); raise SystemExit(0)
 r=Path(__file__).resolve().parents[1]

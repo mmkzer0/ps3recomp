@@ -2,10 +2,10 @@
 """NV3089 source origin, the engine write-back, and the 2D engines through a tile bound over main memory
 (libs/video/tests/test_nv3089_engine_read.c, which compiles cellGcmSys.c in)."""
 import os
-from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
 root = Path(__file__).resolve().parents[1]
 if os.name == 'nt':
@@ -21,7 +21,7 @@ with tempfile.TemporaryDirectory(prefix='nv3089-engine-read-') as tmp:
                     str(root / 'runtime/memory/label_window.c'),
                     str(root / 'libs/video/gcm_default_state.c'), *linker,
                     '-o', str(binary)], check=True)
-    result = subprocess.run([str(binary)], timeout=60, capture_output=True, text=True)
+    result = subprocess.run([str(binary)], check=False, timeout=60, capture_output=True, text=True)
     print(result.stdout.strip())
     if result.returncode:
         print(result.stderr[-2000:])

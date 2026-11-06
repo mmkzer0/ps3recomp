@@ -44,15 +44,15 @@ def main():
         exe = os.path.join(td, "test_pamf_uninit_reader")
         cmd = [cc, "-std=gnu17", "-w", "-I" + os.path.join(ROOT, "include"),
                "-o", exe] + SOURCES
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        r = subprocess.run(cmd, check=False, capture_output=True, text=True)
         if r.returncode != 0:
             print("FAIL: fixture did not build")
             print((r.stdout + r.stderr)[-4000:])
             return 1
-        r = subprocess.run([exe], capture_output=True, text=True)
+        r = subprocess.run([exe], check=False, capture_output=True, text=True)
         sys.stdout.write(r.stdout)
         if r.returncode < 0:
-            print("FAIL: fixture crashed (signal %d)" % -r.returncode)
+            print(f"FAIL: fixture crashed (signal {-r.returncode})")
             return 1
         return r.returncode
 

@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Compile the actual resolved guest-call body with an isolated function registry."""
-import os,subprocess,tempfile
+import os
+import subprocess
+import tempfile
 from pathlib import Path
+
 root=Path(__file__).resolve().parents[1]
 s=(root/'runtime/ppu/ppu_loader.cpp').read_text()
 def function(name):

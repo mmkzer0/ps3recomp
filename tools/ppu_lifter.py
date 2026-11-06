@@ -5731,7 +5731,7 @@ def main() -> None:
                     # the most frequent toc. The code half must be a detected
                     # function start, so incidental pointer data can't vote.
                     from collections import Counter
-                    _starts = set(s for s, _ in func_bounds)
+                    _starts = {s for s, _ in func_bounds}
                     _toc_freq = Counter()
                     for v0, v1, d in seg_map:
                         if v0 <= text_lo < v1:

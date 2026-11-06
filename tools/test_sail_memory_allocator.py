@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Compile/run real Sail and generated NID registration through the PPU HLE bridge."""
 import os
-from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
+
 from gen_hle_nids import scan
 
 root=Path(__file__).resolve().parents[1]

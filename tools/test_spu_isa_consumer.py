@@ -3,16 +3,16 @@
 import argparse
 import json
 import os
-from pathlib import Path
 import re
 import shutil
 import subprocess
 import tempfile
+from pathlib import Path
 
 ROOT=Path(__file__).resolve().parents[1]
 
 def run(command,**kwargs):
-    result=subprocess.run(command,capture_output=True,text=True,timeout=120,**kwargs)
+    result=subprocess.run(command,check=False,capture_output=True,text=True,timeout=120,**kwargs)
     assert result.returncode==0,(command,result.returncode,result.stdout,result.stderr)
     return result
 
@@ -55,7 +55,7 @@ endif()
                  '-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded',
                  *extra])
             cache=(build/'CMakeCache.txt').read_text()
-            enabled=bool(re.search(r'^PS3RECOMP_HAS_MSSE41:(?:INTERNAL|BOOL)=(?:1|ON|TRUE)$',cache,re.M))
+            enabled=bool(re.search(r'^PS3RECOMP_HAS_MSSE41:(?:INTERNAL|BOOL)=(?:1|ON|TRUE)$',cache,re.MULTILINE))
             commands=json.loads((build/'compile_commands.json').read_text())
             consumers=[row for row in commands if Path(row['file']).parent==out]
             assert len(consumers)==2

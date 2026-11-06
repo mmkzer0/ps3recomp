@@ -2,12 +2,18 @@
 """Real ELF loading and guest main-thread priority query; no game/GPU required."""
 import hashlib
 import os
-from pathlib import Path
 import struct
 import subprocess
 import sys
 import tempfile
-from check_ppu_scaffold import lifter_abi_sources, loader_support_objects, loader_support_sources, stub_header
+from pathlib import Path
+
+from check_ppu_scaffold import (
+    lifter_abi_sources,
+    loader_support_objects,
+    loader_support_sources,
+    stub_header,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 # Synthetic ELF PT_PROC_PARAM record; no bytes extracted from a title.
