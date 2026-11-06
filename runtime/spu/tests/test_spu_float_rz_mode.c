@@ -66,7 +66,7 @@ int main(void)
     return 0;
 }
 #else
-int main(void) { puts("SKIP: SPU_FLOAT_RZ is arm64 only"); return 0; }
+int main(void) { puts("SKIP: SPU_FLOAT_RZ is arm64 only"); return 77; }   /* ctest SKIP_RETURN_CODE */
 #endif
 
 /* Link-only boundaries outside this CPU-only fixture. Fail if any is reached. */
