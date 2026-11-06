@@ -345,7 +345,7 @@ def fesd(a, b, c, i):
     out = []
     for w in words(a)[0::2]:
         be = (w >> 23) & 255; f = w & 0x7FFFFF; sg = (w >> 31) << 63
-        if be == 0: u = 0 if f else sg
+        if be == 0: u = sg   # a denormal is a zero of its sign (CBE hardware, spuexh lanes)
         elif be == 255: u = 0x7FF8000000000000 if f else (sg | (0x7FF << 52))
         else: u = sg | ((be - 127 + 1023) << 52) | (f << 29)
         out.append(u)
