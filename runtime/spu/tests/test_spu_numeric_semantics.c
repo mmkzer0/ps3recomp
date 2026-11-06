@@ -15,6 +15,42 @@ int main(void)
     r=spu_cfltu(a,173);
     CHECK(r._u32[0]==1 && r._u32[1]==0 && r._u32[2]==42 && r._u32[3]==1024);
     r=spu_cflts(a,172); CHECK(r._s32[0]==2 && r._s32[1]==-5);
+    /* cflts/cfltu of an exponent-0 (zero/denormal) input: the significand is 0, but the
+     * hardware still saturates on the shift amount sh = be + 23 - i8 (signed at sh >= 8,
+     * unsigned at sh >= 9; sh == 8 does not saturate unsigned and a negative unsigned
+     * input stays 0). Hardware, direct: hwprobe `spuexh` lanes r007/r008 on a CECHC04
+     * with 4.81 REBUG, w32 block 0 -- every group dumps the same 1024 input words, so
+     * these three exponent-0 lanes are measured at each I8 below; issue #126, fit
+     * CONV_RULE.md. The I8 15/16 rows are the fit's prediction (no lanes taken there). */
+    u128 q=spu_zero();
+    q._u32[0]=0x00000000u;                         /* +0 */
+    q._u32[1]=0x803EA729u;                         /* -denormal */
+    q._u32[2]=0x80652112u;                         /* -denormal */
+    for (int i8=0; i8<=3; ++i8) {
+        r=spu_cflts(q,i8);                         /* sh = 20..23: measured saturating */
+        CHECK(r._u32[0]==0x7FFFFFFFu && r._u32[1]==0x80000000u
+              && r._u32[2]==0x80000000u && r._u32[3]==0x7FFFFFFFu);
+        r=spu_cfltu(q,i8);
+        CHECK(r._u32[0]==0xFFFFFFFFu && r._u32[1]==0 && r._u32[2]==0 && r._u32[3]==0xFFFFFFFFu);
+    }
+    r=spu_cflts(q,10);                             /* sh = 13: measured */
+    CHECK(r._u32[0]==0x7FFFFFFFu && r._u32[1]==0x80000000u
+          && r._u32[2]==0x80000000u && r._u32[3]==0x7FFFFFFFu);
+    r=spu_cflts(q,15);                             /* sh = 8: the signed threshold */
+    CHECK(r._u32[0]==0x7FFFFFFFu && r._u32[1]==0x80000000u
+          && r._u32[2]==0x80000000u && r._u32[3]==0x7FFFFFFFu);
+    r=spu_cfltu(q,15);                             /* sh = 8: unsigned does not saturate */
+    CHECK(r._u32[0]==0 && r._u32[1]==0 && r._u32[2]==0 && r._u32[3]==0);
+    r=spu_cflts(q,16);                             /* sh = 7: below both thresholds */
+    CHECK(r._u32[0]==0 && r._u32[1]==0 && r._u32[2]==0 && r._u32[3]==0);
+    r=spu_cfltu(q,16);
+    CHECK(r._u32[0]==0 && r._u32[1]==0 && r._u32[2]==0 && r._u32[3]==0);
+    /* A nonzero lane at I8 15 still converts: 1.0 * 2^158 saturates signed, and the
+     * exponent-0 lanes saturate too (sh = 8 for every be at this scale). */
+    a=spu_zero(); a._u32[0]=0x3F800000u; a._u32[1]=0x3F800000u;
+    r=spu_cflts(a,15);
+    CHECK(r._u32[0]==0x7FFFFFFFu && r._u32[1]==0x7FFFFFFFu
+          && r._u32[2]==0x7FFFFFFFu && r._u32[3]==0x7FFFFFFFu);
     a=spu_splat_u32(8); r=spu_csflt(a,155); CHECK(r._f32[0]==8.0f);
     r=spu_cuflt(a,156); CHECK(r._f32[0]==16.0f);
     r=spu_csflt(a,154); CHECK(r._f32[0]==4.0f);

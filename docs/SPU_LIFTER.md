@@ -300,6 +300,15 @@ Instructions the lifter accepts but does not fully model:
   cause 4 and the stopped thread's exit status reads `0x8001000F`; issue #124),
   so the interpreter decodes them as `.word` and the lifter emits the same stop
   at the word's own PC instead of a helper call.
+- **`cflts`/`cfltu` at I8 <= 14** are not lifted. With `sh = be + 23 - I8`, a
+  biased exponent `be >= 241 + I8` (reachable only at these scales) takes the
+  conversion past the hardware's saturating path into a region the fit could
+  not model (hardware probe `spuexh` lanes, CECHC04 with 4.81 REBUG: 489
+  measured lanes, no bit-exact rule; issue #126). The interpreter stops at the
+  word, so the lifter emits the same named stop at the word's own PC with the
+  scale (`unmodelled cflts/cfltu scale (I8=N, #126)`) instead of a helper call.
+  I8 >= 15 is exact over the whole input space and lifts normally; the helpers
+  keep a defined saturation for direct callers.
 
 ## Tracing (for §3 diff vs RPCS3)
 

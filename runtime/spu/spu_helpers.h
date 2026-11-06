@@ -1196,11 +1196,24 @@ static inline u128 spu_fcmgt(u128 a, u128 b) { return spu_fcmgt_ref(a, b); }
 
 /* cflts / cfltu: value * 2^(173 - i8), truncated toward zero, saturating to the integer range.
  * csflt / cuflt: integer / 2^(155 - i8) as an extended-range single (truncated). The ISA leaves
- * scales outside 0..127 undefined; these compute the same formula for them. */
+ * scales outside 0..127 undefined; these compute the same formula for them.
+ *
+ * cflts/cfltu do NOT convert an exponent-0 input (zero or denormal) to zero: its significand is 0,
+ * but the saturating conversion still saturates on the shift amount sh = be + 23 - i8, so sh >= 8
+ * gives 0x7FFFFFFF / 0x80000000 (signed, by sign) and sh >= 9 gives 0xFFFFFFFF (unsigned, sign 0;
+ * a negative input is 0 as always and sh == 8 does not saturate unsigned). Hardware, direct:
+ * hwprobe `spuexh` lanes r007/r008 on a CECHC04 with 4.81 REBUG measured the exponent-0 lanes at
+ * I8 0..3 and 10 (cflts) and 0..3 (cfltu); the fit is CONV_RULE.md in the private recon tree
+ * (issue #126). With m = 0 for be == 0 the rule needs no separate branch.
+ *
+ * sh >= 264 is NOT modelled (reachable only for I8 <= 14, be >= 241 + I8): the hardware leaves
+ * the saturating path there and neither the result nor a bit-exact formula is known (489 measured
+ * lanes). These helpers keep the saturation above for direct callers; the interpreter and the
+ * lifter stop instead of executing such a word (issue #126). */
 static inline uint32_t spu__cfl_lane(uint32_t x, int scale, int is_unsigned) {
-    uint32_t m; int e;
-    if (!spu__sf_split(x, &m, &e)) return 0;
-    const int sh = e + scale, neg = (x >> 31) != 0;
+    const uint32_t be = (x >> 23) & 0xFFu;
+    const uint32_t m = be ? ((x & 0x7FFFFFu) | 0x800000u) : 0u;   /* exponent 0: significand 0 */
+    const int sh = (int)be - 150 + scale, neg = (x >> 31) != 0;  /* = be + 23 - i8 */
     if (is_unsigned) {
         if (neg) return 0;
         if (sh >= 9) return 0xFFFFFFFFu;                   /* >= 2^32 */
@@ -1613,25 +1626,29 @@ SPU__XE_INLINE u128 spu_frsqest(u128 a) {
     rexp = _mm_blendv_epi8(rexp, _mm_set1_epi32(255), _mm_cmpeq_epi32(exp, _mm_setzero_si128()));
     return spu__xe_st(_mm_or_si128(_mm_slli_epi32(rexp, 23), frac));
 }
-/* cflts/cfltu: the 24-bit significand shifted by be - 150 + (173 - i8), saturated. */
+/* cflts/cfltu: the 24-bit significand shifted by be - 150 + (173 - i8), saturated. An exponent-0
+ * lane (zero/denormal) has significand 0 but still saturates on the shift amount (sh >= 8 signed,
+ * sh >= 9 unsigned; hardware direct, hwprobe spuexh lanes r007/r008, issue #126), which m = 0
+ * below models without masking the result afterwards. sh >= 264 (I8 <= 14) is not modelled: the
+ * interpreter and the lifter stop there (see spu__cfl_lane). */
 SPU__XE_INLINE __m128i spu__xe_cfl(u128 a, int i8, int is_unsigned) {
     const __m128i x = spu__xe_ld(a);
     const __m128i be = _mm_and_si128(_mm_srli_epi32(x, 23), _mm_set1_epi32(0xFF));
-    const __m128i m = _mm_or_si128(_mm_and_si128(x, _mm_set1_epi32(0x7FFFFF)), _mm_set1_epi32(0x800000));
+    const __m128i isz = _mm_cmpeq_epi32(be, _mm_setzero_si128());
+    const __m128i m = _mm_andnot_si128(isz, _mm_or_si128(_mm_and_si128(x, _mm_set1_epi32(0x7FFFFF)), _mm_set1_epi32(0x800000)));
     const __m128i sh = _mm_add_epi32(be, _mm_set1_epi32(23 - (i8 & 0xFF)));     /* be - 150 + 173 - i8 */
     const __m128i lsh = _mm_max_epi32(sh, _mm_setzero_si128());
     const __m128i rsh = _mm_max_epi32(_mm_sub_epi32(_mm_setzero_si128(), sh), _mm_setzero_si128());
     __m128i v = _mm_blendv_epi8(_mm_srlv_epi32(m, rsh), _mm_sllv_epi32(m, lsh),
                                 _mm_cmpgt_epi32(sh, _mm_set1_epi32(-1)));       /* counts >= 32 give 0 */
-    const __m128i neg = _mm_srai_epi32(x, 31), isz = _mm_cmpeq_epi32(be, _mm_setzero_si128());
+    const __m128i neg = _mm_srai_epi32(x, 31);
     if (is_unsigned) {
         v = _mm_or_si128(v, _mm_cmpgt_epi32(sh, _mm_set1_epi32(8)));              /* >= 2^32: all ones */
-        return _mm_andnot_si128(_mm_or_si128(neg, isz), v);                       /* negative or zero: 0 */
+        return _mm_andnot_si128(neg, v);                                           /* negative: 0 */
     }
     v = _mm_sub_epi32(_mm_xor_si128(v, neg), neg);                                /* negate the negative lanes */
     const __m128i sat = _mm_xor_si128(_mm_set1_epi32(0x7FFFFFFF), neg);           /* 0x7FFFFFFF / 0x80000000 */
-    v = _mm_blendv_epi8(v, sat, _mm_cmpgt_epi32(sh, _mm_set1_epi32(7)));
-    return _mm_andnot_si128(isz, v);
+    return _mm_blendv_epi8(v, sat, _mm_cmpgt_epi32(sh, _mm_set1_epi32(7)));
 }
 SPU__XE_INLINE u128 spu_cflts(u128 a, int i8) { return spu__xe_st(spu__xe_cfl(a, i8, 0)); }
 SPU__XE_INLINE u128 spu_cfltu(u128 a, int i8) { return spu__xe_st(spu__xe_cfl(a, i8, 1)); }

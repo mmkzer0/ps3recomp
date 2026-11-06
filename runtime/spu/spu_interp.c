@@ -146,6 +146,19 @@ static inline uint32_t spu_fetch(const spu_context* ctx, uint32_t pc) {
     ctx->pc = pc; ctx->stop_code = 0x1000; ctx->status = SPU_STATUS_STOPPED_BY_HALT; \
     return 1; } } while (0)
 
+/* cflts/cfltu at I8 <= 14: the conversion shifts by sh = be + 23 - I8, and sh >= 264 (reachable
+ * for be >= 241 + I8, i.e. only for I8 <= 14) leaves the hardware's saturating path for a result
+ * that is not modelled (489 measured lanes, no bit-exact rule; hwprobe `spuexh` lanes r007/r008 on
+ * a CECHC04 with 4.81 REBUG; issue #126). I8 >= 15 cannot reach it (max sh = 255 + 23 - 15 = 263)
+ * and is exact. Fail closed like the undecodable-word trap: stop at the word instead of running on
+ * a value the console never produced. */
+#define SPU_CFL_SCALE_TRAP(i8) do { \
+    if ((uint32_t)(i8) <= 14u) { \
+        fprintf(stderr, "[spu_interp] unmodelled cflts/cfltu scale (I8=%u, #126) (0x%08X) at LS 0x%05X\n", \
+                (unsigned)(i8), insn, pc); \
+        ctx->pc = pc; ctx->status = SPU_STATUS_STOPPED_BY_HALT; return 1; \
+    } } while (0)
+
 /* Execute the instruction `insn` found at `pc`; returns 1 if the SPU stopped.
  * On return 0 *out_next is the pc to continue at.
  *
@@ -290,8 +303,8 @@ SPU_EXEC_INLINE int spu_exec(spu_context* ctx, uint32_t pc, uint32_t insn,
     OP(fm, DST = spu_fm(A,B);)
     OP(fcgt, DST = spu_fcgt(A,B);)
     OP(fceq, DST = spu_fceq(A,B);)
-    OP(cflts, DST = spu_cflts(A,I);)
-    OP(cfltu, DST = spu_cfltu(A,I);)
+    OP(cflts, SPU_CFL_SCALE_TRAP(I); DST = spu_cflts(A,I);)
+    OP(cfltu, SPU_CFL_SCALE_TRAP(I); DST = spu_cfltu(A,I);)
     OP(csflt, DST = spu_csflt(A,I);)
     OP(cuflt, DST = spu_cuflt(A,I);)
     OP(frest, DST = spu_frest(A);)
