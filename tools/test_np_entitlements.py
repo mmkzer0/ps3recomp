@@ -15,5 +15,5 @@ with tempfile.TemporaryDirectory(prefix='np-entitlements-') as d:
  for s,o in [(r/'libs/network/sceNp.c',obj),(r/'tests/test_np_entitlements.c',test)]:
   subprocess.run(['cc','-std=gnu17','-O1','-UNDEBUG','-ffunction-sections','-fdata-sections','-I'+str(r/'include'),'-I'+str(r/'runtime/ppu'),'-c',str(s),'-o',str(o)],check=True)
  gc='-Wl,-dead_strip' if sys.platform=='darwin' else '-Wl,--gc-sections'
- exe=p/'fixture';subprocess.run(['c++','-I'+str(r),'-I'+str(r/'include'),'-I'+str(r/'runtime/ppu'),str(gen),str(obj),str(test),gc,'-o',str(exe)],check=True)
+ exe=p/'fixture';subprocess.run(['c++','-std=c++20','-I'+str(r),'-I'+str(r/'include'),'-I'+str(r/'runtime/ppu'),str(gen),str(obj),str(test),gc,'-o',str(exe)],check=True)
  subprocess.run([str(exe)],check=True,timeout=10)
