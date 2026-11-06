@@ -175,6 +175,8 @@ static SDL_AudioDeviceID s_sdl_audio_dev = 0;
 static int audio_backend_init(void)
 {
     if (SDL_WasInit(SDL_INIT_AUDIO) == 0) {
+        /* SIGINT/SIGTERM stay the host's (see pad_init_backend in cellPad.c). */
+        SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
         if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0) {
             printf("[cellAudio] SDL audio init failed: %s\n", SDL_GetError());
             return -1;
