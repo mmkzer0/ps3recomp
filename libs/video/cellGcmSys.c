@@ -4760,7 +4760,6 @@ int cellGcm_current_scanout(u32* offset, u32* pitch, u32* width, u32* height)
     return 1;
 }
 
-/* NID: 0xEAA52F23 */
 /* How many display buffers the title has actually registered. cellResc needs
  * it to know how far to rotate its flip target; nothing else about the set is
  * anyone else's business, so this stays a count rather than exposing the array. */
