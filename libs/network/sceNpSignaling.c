@@ -13,7 +13,17 @@
 #include <stdio.h>
 #include <string.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
+#include "../../runtime/memory/vm.h"        /* vm_range_ok / vm_guest_limit: the guest arena rule */
+#include "ps3emu/stop.h"                    /* ps3_stop_guest_range */
 #include "../system/cellSysutil.h"          /* cellSysutilQueueGuestCallbackArgs */
+
+/* The title's pointers arrive as raw guest EAs and the accessors below add vm_base without a bound, so every span
+ * a handler reads or writes is proved inside guest memory first. A span that leaves it is no firmware error code
+ * (the console would have faulted in its own copy): a named stop, before the first access. */
+static void sig_span(const char* func, const char* arg, u32 ea, u32 size)
+{
+    if (!vm_range_ok(ea, size)) ps3_stop_guest_range(func, arg, ea, size, vm_guest_limit());
+}
 
 /* Internal state */
 
@@ -154,6 +164,7 @@ s32 sceNpSignalingCreateCtx(const void* npId, SceNpSignalingHandler handler,
 
     if (!signaling_ready()) return (s32)SCE_NP_SIGNALING_ERROR_NOT_INITIALIZED;
     if (!ctxId) return (s32)SCE_NP_SIGNALING_ERROR_INVALID_ARGUMENT;
+    sig_span("sceNpSignalingCreateCtx", "ctxId", (u32)(uintptr_t)ctxId, 4);
 
     for (int i = 0; i < SCE_NP_SIGNALING_CTX_MAX; i++) {
         if (!s_ctx[i].in_use) {
@@ -199,6 +210,8 @@ s32 sceNpSignalingActivateConnection(SceNpSignalingCtxId ctxId,
 {
     if (!ctx_get(ctxId)) return (s32)SCE_NP_SIGNALING_ERROR_CTX_NOT_FOUND;
     if (!peerNpId || !connId) return (s32)SCE_NP_SIGNALING_ERROR_INVALID_ARGUMENT;
+    sig_span("sceNpSignalingActivateConnection", "peerNpId", (u32)(uintptr_t)peerNpId, 16);
+    sig_span("sceNpSignalingActivateConnection", "connId", (u32)(uintptr_t)connId, 4);
     char id[17] = {0};
     for (u32 o = 0; o < 16; o++) id[o] = (char)vm_read8((u32)(uintptr_t)peerNpId + o);
     const int idx = conn_find(id, 1);
@@ -229,6 +242,9 @@ s32 sceNpSignalingGetConnectionStatus(SceNpSignalingCtxId ctxId,
                                         u32* peerAddr, u16* peerPort)
 {
     (void)ctxId;
+    if (connStatus) sig_span("sceNpSignalingGetConnectionStatus", "connStatus", (u32)(uintptr_t)connStatus, 4);
+    if (peerAddr) sig_span("sceNpSignalingGetConnectionStatus", "peerAddr", (u32)(uintptr_t)peerAddr, 4);
+    if (peerPort) sig_span("sceNpSignalingGetConnectionStatus", "peerPort", (u32)(uintptr_t)peerPort, 2);
     const SignalingConn* c = conn_get(connId);
     if (connStatus) vm_write32((u32)(uintptr_t)connStatus, (u32)(c ? c->status : SCE_NP_SIGNALING_CONN_STATUS_INACTIVE));
     if (peerAddr) vm_write32((u32)(uintptr_t)peerAddr, c ? conn_addr(c) : 0u);
@@ -245,6 +261,18 @@ s32 sceNpSignalingGetConnectionInfo(SceNpSignalingCtxId ctxId,
     const SignalingConn* c = conn_get(connId);
     if (!c) return (s32)SCE_NP_SIGNALING_ERROR_CONN_NOT_FOUND;
     const u32 ea = (u32)(uintptr_t)info;
+    /* The member of the info union the code names; an unknown code writes nothing. */
+    u32 span = 0;
+    switch (code) {
+    case SCE_NP_SIGNALING_CONN_INFO_RTT:
+    case SCE_NP_SIGNALING_CONN_INFO_BANDWIDTH:
+    case SCE_NP_SIGNALING_CONN_INFO_PACKET_LOSS: span = 4; break;
+    case SCE_NP_SIGNALING_CONN_INFO_PEER_NPID: span = 36; break;
+    case SCE_NP_SIGNALING_CONN_INFO_PEER_ADDRESS:
+    case SCE_NP_SIGNALING_CONN_INFO_MAPPED_ADDRESS: span = 6; break;
+    default: return (s32)SCE_NP_SIGNALING_ERROR_INVALID_ARGUMENT;
+    }
+    sig_span("sceNpSignalingGetConnectionInfo", "info", ea, span);
     switch (code) {
     case SCE_NP_SIGNALING_CONN_INFO_RTT:         vm_write32(ea, 1000); break;        /* us; loopback/LAN */
     case SCE_NP_SIGNALING_CONN_INFO_BANDWIDTH:   vm_write32(ea, 10000000); break;    /* bits/s */
@@ -268,6 +296,8 @@ s32 sceNpSignalingGetConnectionFromNpId(SceNpSignalingCtxId ctxId, const void* n
 {
     (void)ctxId;
     if (!npId || !connId) return (s32)SCE_NP_SIGNALING_ERROR_INVALID_ARGUMENT;
+    sig_span("sceNpSignalingGetConnectionFromNpId", "npId", (u32)(uintptr_t)npId, 16);
+    sig_span("sceNpSignalingGetConnectionFromNpId", "connId", (u32)(uintptr_t)connId, 4);
     char id[17] = {0};
     for (u32 o = 0; o < 16; o++) id[o] = (char)vm_read8((u32)(uintptr_t)npId + o);
     for (int i = 0; i < SCE_NP_SIGNALING_CONN_MAX; i++)
@@ -280,6 +310,8 @@ s32 sceNpSignalingGetConnectionFromNpId(SceNpSignalingCtxId ctxId, const void* n
 
 s32 sceNpSignalingGetLocalNetInfo(u32* localAddr, u16* localPort)
 {
+    if (localAddr) sig_span("sceNpSignalingGetLocalNetInfo", "localAddr", (u32)(uintptr_t)localAddr, 4);
+    if (localPort) sig_span("sceNpSignalingGetLocalNetInfo", "localPort", (u32)(uintptr_t)localPort, 2);
     if (localAddr) vm_write32((u32)(uintptr_t)localAddr, (u32)0x7F000001); /* 127.0.0.1 */
     if (localPort) vm_write16((u32)(uintptr_t)localPort, (u16)0);
     return CELL_OK;
@@ -290,6 +322,8 @@ s32 sceNpSignalingGetPeerNetInfo(SceNpSignalingCtxId ctxId,
                                    u32* peerAddr, u16* peerPort)
 {
     (void)ctxId;
+    if (peerAddr) sig_span("sceNpSignalingGetPeerNetInfo", "peerAddr", (u32)(uintptr_t)peerAddr, 4);
+    if (peerPort) sig_span("sceNpSignalingGetPeerNetInfo", "peerPort", (u32)(uintptr_t)peerPort, 2);
     const SignalingConn* c = conn_get(connId);
     if (peerAddr) vm_write32((u32)(uintptr_t)peerAddr, c ? conn_addr(c) : 0u);
     if (peerPort) vm_write16((u32)(uintptr_t)peerPort, (u16)(c ? c->port : 0));

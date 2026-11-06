@@ -696,6 +696,18 @@ if(PS3RECOMP_BUILD_TESTS)
     add_test(NAME cell_sync_header COMMAND test_cell_sync_header)
     set_tests_properties(cell_sync_header PROPERTIES LABELS "hle;t0")
 
+    # HLE modules compiled whole into a fixture, with sysutil stubbed: sceNpSignaling's room connections and the
+    # guest spans its handlers bound (a named stop, tests/guest_range_catch.h), and cellSysutilAvc2's chat events.
+    if(UNIX)
+        foreach(_t IN ITEMS np_signaling_rooms avc2_load)
+            add_executable(test_${_t} libs/network/tests/test_${_t}.c)
+            target_include_directories(test_${_t} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+            target_compile_options(test_${_t} PRIVATE -UNDEBUG)
+            add_test(NAME ${_t} COMMAND test_${_t})
+            set_tests_properties(${_t} PROPERTIES LABELS "hle;t0" TIMEOUT 60)
+        endforeach()
+    endif()
+
     # The sysPrxForUser CRT shims bound the guest spans they copy: a span that
     # leaves the arena is a named stop (hle-guest-range) raised before the copy,
     # not a write past guest memory. The fixture maps an arena with a PROT_NONE

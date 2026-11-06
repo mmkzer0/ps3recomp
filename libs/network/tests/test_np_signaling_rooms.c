@@ -10,13 +10,17 @@
  * the handler and the extended handler as ESTABLISHED and the extended handler
  * also as EXT_PEER_ACTIVATED then EXT_MUTUAL_ACTIVATED, with the SDK values, that
  * the status, peer address, peer NP ID and FromNpId answers come from the member
- * record, and that "down" is DEAD.
+ * record, and that "down" is DEAD. Last, that every pointer a handler reads or
+ * writes is bounded by guest memory first: a span that leaves it is the named
+ * stop hle-guest-range (tests/guest_range_catch.h), not a host access.
  */
 #include "../sceNpSignaling.c"
 
 #include <assert.h>
+#include "../../../tests/guest_range_catch.h"
 
 uint8_t* vm_base;
+uint32_t ppu_vm_size;
 int g_resv_store_active;
 uint32_t g_ww_lo, g_ww_hi;
 void ppu_resv_break_store(uint64_t ea) { (void)ea; }
@@ -63,6 +67,7 @@ int main(void)
 {
     static uint8_t mem[0x10000];
     vm_base = mem;
+    ppu_vm_size = (u32)sizeof mem;
     const u32 H = 0x8000, HARG = 0x8100, X = 0x8200, XARG = 0x8300;   /* handler and extended handler descriptors */
     const u32 ctx_ea = 0x100, conn_ea = 0x104, st_ea = 0x108, addr_ea = 0x10C, port_ea = 0x110, info_ea = 0x200,
               npid_ea = 0x300;
@@ -131,6 +136,69 @@ int main(void)
     expect(before_down + 1, X, ctx, conn, 0, XARG);
     assert(sceNpSignalingGetConnectionStatus(ctx, conn, (s32*)EA(st_ea), NULL, NULL) == CELL_OK);
     assert(be32_at(st_ea) == SCE_NP_SIGNALING_CONN_STATUS_INACTIVE);
+
+    /* Guest spans. The arena is the 64 KiB of `mem`; each case puts the span across its end (or far beyond it) and
+     * must stop naming the function and the argument before anything is written. Valid neighbours still work. */
+    {
+        const u32 arena = (u32)sizeof mem, far_ea = 0xFFFFFFF0u;
+        memset(mem + arena - 64, 0x6B, 64);
+        GR_TRY(sceNpSignalingCreateCtx(NULL, (SceNpSignalingHandler)EA(H), EA(HARG), (SceNpSignalingCtxId*)EA(arena - 2)));
+        assert(gr_named("sceNpSignalingCreateCtx", "ctxId"));
+        GR_TRY(sceNpSignalingCreateCtx(NULL, (SceNpSignalingHandler)EA(H), EA(HARG), (SceNpSignalingCtxId*)EA(far_ea)));
+        assert(gr_named("sceNpSignalingCreateCtx", "ctxId"));
+        assert(mem[arena - 2] == 0x6B && mem[arena - 1] == 0x6B);
+
+        GR_TRY(sceNpSignalingActivateConnection(ctx, EA(arena - 8), (SceNpSignalingConnId*)EA(conn_ea)));
+        assert(gr_named("sceNpSignalingActivateConnection", "peerNpId"));
+        GR_TRY(sceNpSignalingActivateConnection(ctx, EA(far_ea), (SceNpSignalingConnId*)EA(conn_ea)));
+        assert(gr_named("sceNpSignalingActivateConnection", "peerNpId"));
+        GR_TRY(sceNpSignalingActivateConnection(ctx, EA(npid_ea), (SceNpSignalingConnId*)EA(arena - 2)));
+        assert(gr_named("sceNpSignalingActivateConnection", "connId"));
+        assert(mem[arena - 2] == 0x6B);
+
+        GR_TRY(sceNpSignalingGetConnectionStatus(ctx, conn, (s32*)EA(arena - 2), NULL, NULL));
+        assert(gr_named("sceNpSignalingGetConnectionStatus", "connStatus"));
+        GR_TRY(sceNpSignalingGetConnectionStatus(ctx, conn, NULL, (u32*)EA(arena - 2), NULL));
+        assert(gr_named("sceNpSignalingGetConnectionStatus", "peerAddr"));
+        GR_TRY(sceNpSignalingGetConnectionStatus(ctx, conn, NULL, NULL, (u16*)EA(arena - 1)));
+        assert(gr_named("sceNpSignalingGetConnectionStatus", "peerPort"));
+        /* An unknown connection still writes through the pointers, so they are bounded before the lookup. */
+        GR_TRY(sceNpSignalingGetConnectionStatus(ctx, conn + 9, (s32*)EA(far_ea), NULL, NULL));
+        assert(gr_named("sceNpSignalingGetConnectionStatus", "connStatus"));
+
+        GR_TRY(sceNpSignalingGetConnectionInfo(ctx, conn, SCE_NP_SIGNALING_CONN_INFO_RTT, EA(arena - 2)));
+        assert(gr_named("sceNpSignalingGetConnectionInfo", "info"));
+        GR_TRY(sceNpSignalingGetConnectionInfo(ctx, conn, SCE_NP_SIGNALING_CONN_INFO_PEER_NPID, EA(arena - 20)));
+        assert(gr_named("sceNpSignalingGetConnectionInfo", "info"));
+        GR_TRY(sceNpSignalingGetConnectionInfo(ctx, conn, SCE_NP_SIGNALING_CONN_INFO_PEER_ADDRESS, EA(arena - 4)));
+        assert(gr_named("sceNpSignalingGetConnectionInfo", "info"));
+        GR_TRY(sceNpSignalingGetConnectionInfo(ctx, conn, SCE_NP_SIGNALING_CONN_INFO_MAPPED_ADDRESS, EA(far_ea)));
+        assert(gr_named("sceNpSignalingGetConnectionInfo", "info"));
+        /* A code that writes nothing touches nothing, wherever the pointer is. */
+        g_gr_hit = 0;
+        assert(sceNpSignalingGetConnectionInfo(ctx, conn, 99, EA(arena - 2)) == (s32)SCE_NP_SIGNALING_ERROR_INVALID_ARGUMENT);
+        assert(!g_gr_hit && mem[arena - 20] == 0x6B);   /* nothing of the refused PEER_NPID above landed */
+        /* The spans that fit exactly are written in full. */
+        assert(sceNpSignalingGetConnectionInfo(ctx, conn, SCE_NP_SIGNALING_CONN_INFO_PEER_NPID, EA(arena - 36)) == CELL_OK);
+        assert(memcmp(mem + arena - 36, "peer-2", 7) == 0);
+        assert(sceNpSignalingGetConnectionInfo(ctx, conn, SCE_NP_SIGNALING_CONN_INFO_PEER_ADDRESS, EA(arena - 6)) == CELL_OK);
+        assert(be16_at(arena - 2) == 3659);
+
+        GR_TRY(sceNpSignalingGetConnectionFromNpId(ctx, EA(arena - 8), (SceNpSignalingConnId*)EA(conn_ea)));
+        assert(gr_named("sceNpSignalingGetConnectionFromNpId", "npId"));
+        GR_TRY(sceNpSignalingGetConnectionFromNpId(ctx, EA(npid_ea), (SceNpSignalingConnId*)EA(arena - 2)));
+        assert(gr_named("sceNpSignalingGetConnectionFromNpId", "connId"));
+
+        GR_TRY(sceNpSignalingGetLocalNetInfo((u32*)EA(arena - 2), NULL));
+        assert(gr_named("sceNpSignalingGetLocalNetInfo", "localAddr"));
+        GR_TRY(sceNpSignalingGetLocalNetInfo(NULL, (u16*)EA(far_ea)));
+        assert(gr_named("sceNpSignalingGetLocalNetInfo", "localPort"));
+        GR_TRY(sceNpSignalingGetPeerNetInfo(ctx, conn, (u32*)EA(arena - 2), NULL));
+        assert(gr_named("sceNpSignalingGetPeerNetInfo", "peerAddr"));
+        GR_TRY(sceNpSignalingGetPeerNetInfo(ctx, conn, NULL, (u16*)EA(arena - 1)));
+        assert(gr_named("sceNpSignalingGetPeerNetInfo", "peerPort"));
+        assert(sceNpSignalingGetPeerNetInfo(ctx, conn, (u32*)EA(arena - 4), (u16*)EA(arena - 6)) == CELL_OK);
+    }
 
     assert(sceNpSignalingDestroyCtx(ctx) == CELL_OK);
     assert(sceNpSignalingDestroyCtx(ctx) == (s32)SCE_NP_SIGNALING_ERROR_CTX_NOT_FOUND);
