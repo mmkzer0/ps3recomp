@@ -116,5 +116,27 @@ int main(void) {
     u32 heap=_sys_heap_create_heap(0,0,0,0);
     CHECK(heap!=0);
     CHECK(_sys_heap_delete_heap(heap)==CELL_OK);
+    /* Deleting a heap gives its blocks back: it used to answer CELL_OK and leave them in the window. The blocks of
+     * a heap come back to the free lists, a block freed on its own is not freed twice, and another heap's block
+     * stays allocated. */
+    reset();
+    u32 h1=_sys_heap_create_heap(0,0,0,0),h2=_sys_heap_create_heap(0,0,0,0);
+    CHECK(h1!=0 && h2!=0 && h1!=h2);
+    uint32_t a=(uint32_t)(uintptr_t)sys_heap_malloc(h1,1024);
+    uint32_t b=(uint32_t)(uintptr_t)sys_heap_malloc(h1,1024);
+    uint32_t other=(uint32_t)(uintptr_t)sys_heap_malloc(h2,1024);
+    CHECK(a && b && other);
+    CHECK(vm_read32(a-16)==h1 && vm_read32(b-16)==h1 && vm_read32(other-16)==h2);
+    CHECK(sys_heap_free(h1,(void*)(uintptr_t)b)==CELL_OK);
+    CHECK(_sys_heap_delete_heap(h1)==CELL_OK);
+    uint32_t d=(uint32_t)(uintptr_t)sys_heap_malloc(h2,1024);
+    uint32_t e=(uint32_t)(uintptr_t)sys_heap_malloc(h2,1024);
+    CHECK((d==a || d==b) && (e==a || e==b) && d!=e);   /* the deleted heap's two blocks, each on a free list once */
+    CHECK(other!=d && other!=e && vm_read32(other-12)==YZ_HEAP_MAGIC);
+    CHECK(_sys_heap_delete_heap(h1)==(s32)CELL_ESRCH);   /* it is gone */
+    /* A heap id this API never made leaves its blocks unowned: freed on their own, never by a delete. */
+    uint32_t f=(uint32_t)(uintptr_t)sys_heap_malloc(0x7777,64);
+    CHECK(f && vm_read32(f-16)==0);
+    CHECK(_sys_heap_delete_heap(0x7777)==(s32)CELL_ESRCH && vm_read32(f-12)==YZ_HEAP_MAGIC);
     vm_shutdown();printf("PASS %u mapper/HLE heap checks\n",checks);return 0;
 }
