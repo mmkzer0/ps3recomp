@@ -9,17 +9,17 @@
  *   - a timed receive runs to an absolute deadline: wake-ups that find the queue
  *     empty do not restart the timeout.
  *
- * Win32 host threads, through the shim off Windows. Links sys_event.c and
- * test_shims.c only. */
+ * Win32 host threads, through the shim off Windows. Exercises event queue
+ * lifecycle and the periodic timer producer's queue admission. */
 #include "runtime/platform/win32_compat.h"
 #include "runtime/syscalls/sys_event.h"
+#include "runtime/syscalls/sys_timer.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 uint8_t* vm_base;
 
-/* sys_event.c's title-diagnostic side paths reach for these; none can run here. */
 size_t spu_elf_image_size(const uint8_t* image, size_t max_avail) { (void)image; (void)max_avail; return 0; }
 int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size, uint32_t args_ea)
 { (void)image; (void)image_size; (void)args_ea; return 0; }
@@ -31,6 +31,61 @@ static int failures;
 #define CHECK_RC(call, want) do { int32_t _rc = (int32_t)(call); \
     if (_rc != (int32_t)(want)) { fprintf(stderr, "FAIL line %d: %s -> 0x%08X, want 0x%08X\n", \
         __LINE__, #call, (unsigned)_rc, (unsigned)(want)); failures++; } } while (0)
+
+static HANDLE s_receive_entered, s_release_receive;
+static HANDLE s_destroy_marked, s_release_destroy;
+static HANDLE s_destroy_waiting, s_destroy_done;
+static HANDLE s_waiters_ready;
+static HANDLE s_timer_entered, s_release_timer;
+static volatile int s_hook_queue, s_pause_receive, s_pause_destroy;
+static volatile int s_pause_timer, s_abort_timer;
+static volatile int s_wait_target, s_wait_count;
+static volatile int s_native_live[SYS_EVENT_QUEUE_MAX];
+static volatile int s_lifecycle_violation;
+
+#ifndef _WIN32
+void sys_timer_test_send_event(sys_timer_info* timer);
+#endif
+
+int ps3_sync_test_hook(const char* point, uint32_t id)
+{
+    if (strcmp(point, "event.native_init") == 0 && id > 0 && id <= SYS_EVENT_QUEUE_MAX) {
+        int expected = 0;
+        if (!__atomic_compare_exchange_n(&s_native_live[id - 1], &expected, 1, 0,
+                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            __atomic_store_n(&s_lifecycle_violation, 1, __ATOMIC_RELEASE);
+    } else if (strcmp(point, "event.native_destroy") == 0 && id > 0 && id <= SYS_EVENT_QUEUE_MAX) {
+        int expected = 1;
+        if (!__atomic_compare_exchange_n(&s_native_live[id - 1], &expected, 0, 0,
+                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            __atomic_store_n(&s_lifecycle_violation, 1, __ATOMIC_RELEASE);
+    } else if (strcmp(point, "event.receive.waiter_registered") == 0 &&
+               id == (uint32_t)__atomic_load_n(&s_hook_queue, __ATOMIC_ACQUIRE)) {
+        const int n = __atomic_add_fetch(&s_wait_count, 1, __ATOMIC_ACQ_REL);
+        if (n == __atomic_load_n(&s_wait_target, __ATOMIC_ACQUIRE))
+            SetEvent(s_waiters_ready);
+    } else if ((strcmp(point, "event.operation.pinned") == 0 ||
+                strcmp(point, "timer.queue.before_lock") == 0) &&
+               id == (uint32_t)__atomic_load_n(&s_hook_queue, __ATOMIC_ACQUIRE) &&
+               __atomic_load_n(&s_pause_timer, __ATOMIC_ACQUIRE)) {
+        SetEvent(s_timer_entered);
+        WaitForSingleObject(s_release_timer, 20000);
+        return __atomic_load_n(&s_abort_timer, __ATOMIC_ACQUIRE);
+    } else if (id == (uint32_t)__atomic_load_n(&s_hook_queue, __ATOMIC_ACQUIRE)) {
+        if (strcmp(point, "event.receive.before_lock") == 0 &&
+            __atomic_load_n(&s_pause_receive, __ATOMIC_ACQUIRE)) {
+            SetEvent(s_receive_entered);
+            WaitForSingleObject(s_release_receive, 20000);
+        } else if (strcmp(point, "event.destroy.waiting_for_operations") == 0) {
+            SetEvent(s_destroy_waiting);
+        } else if (strcmp(point, "event.destroy.inactive") == 0) {
+            SetEvent(s_destroy_marked);
+            if (__atomic_load_n(&s_pause_destroy, __ATOMIC_ACQUIRE))
+                WaitForSingleObject(s_release_destroy, 20000);
+        }
+    }
+    return 0;
+}
 
 typedef int64_t (*sc_fn)(ppu_context*);
 static int32_t call(sc_fn f, uint32_t tid, uint64_t a, uint64_t b, uint64_t c, uint64_t d)
@@ -58,7 +113,7 @@ typedef struct recv {
     uint32_t q;
     uint64_t timeout_us;
     uint32_t event_at;
-    volatile int32_t rc;
+    int32_t rc;
     double ms;
     HANDLE h;
 } recv_t;
@@ -66,27 +121,52 @@ static DWORD WINAPI recv_main(void* p)
 {
     recv_t* r = (recv_t*)p;
     const double t0 = now_ms();
-    r->rc = call(sys_event_queue_receive, 2, r->q, r->event_at, r->timeout_us, 0);
+    const int32_t rc = call(sys_event_queue_receive, 2, r->q, r->event_at, r->timeout_us, 0);
     r->ms = now_ms() - t0;
+    __atomic_store_n(&r->rc, rc, __ATOMIC_RELEASE);
     return 0;
 }
 static void recv_start(recv_t* r, uint32_t q, uint64_t timeout_us, uint32_t event_at)
 {
-    r->q = q; r->timeout_us = timeout_us; r->event_at = event_at; r->rc = -1; r->ms = 0;
+    r->q = q; r->timeout_us = timeout_us; r->event_at = event_at; r->ms = 0;
+    __atomic_store_n(&r->rc, -1, __ATOMIC_RELEASE);
     r->h = CreateThread(NULL, 0, recv_main, r, 0, NULL);
 }
 static void recv_join(recv_t* r) { WaitForSingleObject(r->h, 20000); CloseHandle(r->h); }
+
+typedef struct destroy {
+    uint32_t q;
+    int32_t rc;
+    HANDLE h;
+} destroy_t;
+static DWORD WINAPI destroy_main(void* p)
+{
+    destroy_t* d = (destroy_t*)p;
+    const int32_t rc = call(sys_event_queue_destroy, 1, d->q,
+                            SYS_EVENT_QUEUE_DESTROY_FORCE, 0, 0);
+    __atomic_store_n(&d->rc, rc, __ATOMIC_RELEASE);
+    SetEvent(s_destroy_done);
+    return 0;
+}
 
 static uint32_t make_queue(void)
 {
     CHECK_RC(call(sys_event_queue_create, 1, 0x200, 0, 0x1234, 8), CELL_OK);
     return be_read(0x200);
 }
-/* Wait until `n` receivers are inside the queue. */
+static void wait_waiters_start(uint32_t q, int n)
+{
+    __atomic_store_n(&s_hook_queue, (int)q, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_wait_count, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_wait_target, n, __ATOMIC_RELEASE);
+    ResetEvent(s_waiters_ready);
+}
 static void wait_waiters(uint32_t q, int n)
 {
-    for (int i = 0; i < 3000 && g_sys_event_queues[q - 1].waiters != n; i++) Sleep(1);
-    CHECK(g_sys_event_queues[q - 1].waiters == n);
+    (void)q;
+    CHECK(WaitForSingleObject(s_waiters_ready, 20000) == WAIT_OBJECT_0);
+    CHECK(__atomic_load_n(&s_wait_count, __ATOMIC_ACQUIRE) == n);
+    __atomic_store_n(&s_wait_target, 0, __ATOMIC_RELEASE);
 }
 
 static void test_destroy_modes(void)
@@ -105,7 +185,8 @@ static void test_destroy_modes(void)
     recv_t r1, r2;
     recv_start(&r1, q, 0, 0x300);
     recv_join(&r1);
-    CHECK(r1.rc == CELL_OK);
+    CHECK(__atomic_load_n(&r1.rc, __ATOMIC_ACQUIRE) == CELL_OK);
+    wait_waiters_start(q, 2);
     recv_start(&r1, q, 0, 0x300);
     recv_start(&r2, q, 0, 0x340);
     wait_waiters(q, 2);
@@ -113,14 +194,14 @@ static void test_destroy_modes(void)
     /* A plain destroy refuses and leaves them blocked. */
     CHECK_RC(call(sys_event_queue_destroy, 1, q, 0, 0, 0), CELL_EBUSY);
     CHECK(g_sys_event_queues[q - 1].active);
-    Sleep(50);
-    CHECK(r1.rc == -1 && r2.rc == -1);
+    CHECK(__atomic_load_n(&r1.rc, __ATOMIC_ACQUIRE) == -1 &&
+          __atomic_load_n(&r2.rc, __ATOMIC_ACQUIRE) == -1);
 
     /* FORCE wakes both with ECANCELED. */
     CHECK_RC(call(sys_event_queue_destroy, 1, q, SYS_EVENT_QUEUE_DESTROY_FORCE, 0, 0), CELL_OK);
     recv_join(&r1); recv_join(&r2);
-    CHECK(r1.rc == (int32_t)CELL_ECANCELED);
-    CHECK(r2.rc == (int32_t)CELL_ECANCELED);
+    CHECK(__atomic_load_n(&r1.rc, __ATOMIC_ACQUIRE) == (int32_t)CELL_ECANCELED);
+    CHECK(__atomic_load_n(&r2.rc, __ATOMIC_ACQUIRE) == (int32_t)CELL_ECANCELED);
     CHECK(!g_sys_event_queues[q - 1].active);
 
     /* The port no longer points at the dead queue, and a new queue in that slot
@@ -138,13 +219,111 @@ static void test_destroy_modes(void)
     CHECK_RC(call(sys_event_port_destroy, 1, port, 0, 0, 0), CELL_OK);
 }
 
+static void test_destroy_waits_for_prelock_receiver(void)
+{
+    const uint32_t q = make_queue();
+    recv_t r;
+    destroy_t d;
+    d.q = q;
+    __atomic_store_n(&d.rc, -1, __ATOMIC_RELEASE);
+    ResetEvent(s_receive_entered);
+    ResetEvent(s_release_receive);
+    ResetEvent(s_destroy_marked);
+    ResetEvent(s_release_destroy);
+    __atomic_store_n(&s_hook_queue, (int)q, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_pause_receive, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_pause_destroy, 1, __ATOMIC_RELEASE);
+    recv_start(&r, q, 0, 0x380);
+    CHECK(WaitForSingleObject(s_receive_entered, 20000) == WAIT_OBJECT_0);
+
+    d.h = CreateThread(NULL, 0, destroy_main, &d, 0, NULL);
+    CHECK(WaitForSingleObject(s_destroy_marked, 20000) == WAIT_OBJECT_0);
+    const uint32_t q2 = make_queue();
+    CHECK(q2 != q);  /* the retired slot cannot be reused before the old call exits */
+    CHECK(sys_event_queue_push_by_id(q2, 0xAA, 1, 2, 3) == 0);
+
+    SetEvent(s_release_receive);
+    recv_join(&r);
+    CHECK(__atomic_load_n(&r.rc, __ATOMIC_ACQUIRE) == (int32_t)CELL_ESRCH);
+    CHECK(g_sys_event_queues[q2 - 1].count == 1);  /* the stale receive did not take it */
+    CHECK_RC(call(sys_event_queue_receive, 1, q2, 0x3C0, 1000, 0), CELL_OK);
+
+    SetEvent(s_release_destroy);
+    CHECK(WaitForSingleObject(d.h, 20000) == WAIT_OBJECT_0);
+    CloseHandle(d.h);
+    CHECK(__atomic_load_n(&d.rc, __ATOMIC_ACQUIRE) == CELL_OK);
+    CHECK_RC(call(sys_event_queue_destroy, 1, q2, 0, 0, 0), CELL_OK);
+    __atomic_store_n(&s_pause_receive, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_pause_destroy, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_hook_queue, 0, __ATOMIC_RELEASE);
+}
+
+#ifndef _WIN32
+static DWORD WINAPI timer_send_main(void* p)
+{
+    sys_timer_test_send_event((sys_timer_info*)p);
+    return 0;
+}
+
+static void test_timer_send_is_quiesced(void)
+{
+    const uint32_t q = make_queue();
+    sys_timer_info timer;
+    memset(&timer, 0, sizeof timer);
+    timer.event_queue_id = (int32_t)q;
+    timer.source = 0x44;
+    timer.data1 = 1;
+    timer.data2 = 2;
+    timer.next_expire = 1000;
+    timer.period_usec = 50;
+
+    ResetEvent(s_timer_entered);
+    ResetEvent(s_release_timer);
+    ResetEvent(s_destroy_marked);
+    ResetEvent(s_destroy_waiting);
+    ResetEvent(s_destroy_done);
+    __atomic_store_n(&s_hook_queue, (int)q, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_pause_timer, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_abort_timer, 0, __ATOMIC_RELEASE);
+    HANDLE sender = CreateThread(NULL, 0, timer_send_main, &timer, 0, NULL);
+    CHECK(WaitForSingleObject(s_timer_entered, 20000) == WAIT_OBJECT_0);
+
+    destroy_t d;
+    d.q = q;
+    __atomic_store_n(&d.rc, -1, __ATOMIC_RELEASE);
+    d.h = CreateThread(NULL, 0, destroy_main, &d, 0, NULL);
+    CHECK(WaitForSingleObject(s_destroy_marked, 20000) == WAIT_OBJECT_0);
+    HANDLE quiescence[2] = { s_destroy_waiting, s_destroy_done };
+    const DWORD stage = WaitForMultipleObjects(2, quiescence, FALSE, 20000);
+    CHECK(stage == WAIT_OBJECT_0);  /* destroy observes the pinned timer send */
+
+    const uint32_t q2 = make_queue();
+    CHECK(q2 != q);
+    if (stage != WAIT_OBJECT_0)
+        __atomic_store_n(&s_abort_timer, 1, __ATOMIC_RELEASE);
+    SetEvent(s_release_timer);
+    CHECK(WaitForSingleObject(sender, 20000) == WAIT_OBJECT_0);
+    CloseHandle(sender);
+    CHECK(WaitForSingleObject(d.h, 20000) == WAIT_OBJECT_0);
+    CloseHandle(d.h);
+    CHECK(__atomic_load_n(&d.rc, __ATOMIC_ACQUIRE) == CELL_OK);
+    if (stage == WAIT_OBJECT_0) {
+        CHECK(timer.next_expire == 1050);
+        CHECK(g_sys_event_queues[q2 - 1].count == 0);
+    }
+    CHECK_RC(call(sys_event_queue_destroy, 1, q2, 0, 0, 0), CELL_OK);
+    __atomic_store_n(&s_pause_timer, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_hook_queue, 0, __ATOMIC_RELEASE);
+}
+#endif
+
 /* Spurious wake-ups (a broadcast that finds the queue empty) every 25 ms. */
 static volatile int s_stop_wakes;
 static uint32_t s_wake_q;
 static DWORD WINAPI waker(void* unused)
 {
     (void)unused;
-    while (!s_stop_wakes) {
+    while (!__atomic_load_n(&s_stop_wakes, __ATOMIC_ACQUIRE)) {
         Sleep(25);
         sys_event_queue_info* q = &g_sys_event_queues[s_wake_q - 1];
 #ifdef _WIN32
@@ -164,20 +343,21 @@ static void test_timed_receive(void)
     recv_t r;
     recv_start(&r, q, 60000, 0x300);
     recv_join(&r);
-    CHECK(r.rc == (int32_t)CELL_ETIMEDOUT);
+    CHECK(__atomic_load_n(&r.rc, __ATOMIC_ACQUIRE) == (int32_t)CELL_ETIMEDOUT);
     CHECK(r.ms >= 55.0 && r.ms < 500.0);
 
     /* A wake-up that finds nothing must not restart the timeout: with one every
      * 25 ms, a 120 ms receive still ends at about 120 ms (it used to start its
      * full wait over after each wake, and so never ended). */
-    s_wake_q = q; s_stop_wakes = 0;
+    s_wake_q = q; __atomic_store_n(&s_stop_wakes, 0, __ATOMIC_RELEASE);
     HANDLE w = CreateThread(NULL, 0, waker, NULL, 0, NULL);
     recv_start(&r, q, 120000, 0x300);
     recv_join(&r);
-    s_stop_wakes = 1;
+    __atomic_store_n(&s_stop_wakes, 1, __ATOMIC_RELEASE);
     WaitForSingleObject(w, 5000); CloseHandle(w);
-    printf("timed receive 120 ms with a wake every 25 ms: rc 0x%08X after %.1f ms\n", (unsigned)r.rc, r.ms);
-    CHECK(r.rc == (int32_t)CELL_ETIMEDOUT);
+    printf("timed receive 120 ms with a wake every 25 ms: rc 0x%08X after %.1f ms\n",
+           (unsigned)__atomic_load_n(&r.rc, __ATOMIC_ACQUIRE), r.ms);
+    CHECK(__atomic_load_n(&r.rc, __ATOMIC_ACQUIRE) == (int32_t)CELL_ETIMEDOUT);
     CHECK(r.ms >= 110.0 && r.ms < 400.0);
 
     CHECK_RC(call(sys_event_queue_destroy, 1, q, 0, 0, 0), CELL_OK);
@@ -187,8 +367,29 @@ int main(void)
 {
     vm_base = (uint8_t*)calloc(1, 65536);
     if (!vm_base) return 2;
+    s_receive_entered = CreateEventA(NULL, TRUE, FALSE, NULL);
+    s_release_receive = CreateEventA(NULL, TRUE, FALSE, NULL);
+    s_destroy_marked = CreateEventA(NULL, TRUE, FALSE, NULL);
+    s_release_destroy = CreateEventA(NULL, TRUE, FALSE, NULL);
+    s_destroy_waiting = CreateEventA(NULL, TRUE, FALSE, NULL);
+    s_destroy_done = CreateEventA(NULL, TRUE, FALSE, NULL);
+    s_timer_entered = CreateEventA(NULL, TRUE, FALSE, NULL);
+    s_release_timer = CreateEventA(NULL, TRUE, FALSE, NULL);
+    s_waiters_ready = CreateEventA(NULL, TRUE, FALSE, NULL);
     test_destroy_modes();
+    test_destroy_waits_for_prelock_receiver();
+#ifndef _WIN32
+    test_timer_send_is_quiesced();
+#endif
     test_timed_receive();
+    CHECK(!__atomic_load_n(&s_lifecycle_violation, __ATOMIC_ACQUIRE));
+    for (int i = 0; i < SYS_EVENT_QUEUE_MAX; i++)
+        CHECK(!__atomic_load_n(&s_native_live[i], __ATOMIC_ACQUIRE));
+    CloseHandle(s_receive_entered); CloseHandle(s_release_receive);
+    CloseHandle(s_destroy_marked); CloseHandle(s_release_destroy);
+    CloseHandle(s_destroy_waiting); CloseHandle(s_destroy_done);
+    CloseHandle(s_timer_entered); CloseHandle(s_release_timer);
+    CloseHandle(s_waiters_ready);
     printf("event queue destroy / timed receive: %s\n", failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;
 }

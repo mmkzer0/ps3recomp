@@ -192,18 +192,25 @@ if(WIN32)
     endforeach()
 endif()
 
-# sys_event_queue_destroy modes (EINVAL / EBUSY / FORCE -> ECANCELED), ports
-# disconnected from a destroyed queue, and the absolute deadline of a timed
-# receive. Links sys_event.c alone.
+# sys_event_queue_destroy modes and queue-slot reuse, including the periodic
+# timer producer's admission into a queue being destroyed.
 add_executable(test_event_queue_destroy
     test_event_queue_destroy.c test_shims.c
     "${RUNTIME_SYNC_DIR}/sys_event.c"
     # sys_event.c reaches ps3_stop (see sync_stress above); its implementation is C++.
     "${PS3RECOMP_ROOT}/runtime/diag/stop.cpp")
+target_compile_definitions(test_event_queue_destroy PRIVATE PS3_SYNC_TEST_HOOKS)
 set_target_properties(test_event_queue_destroy PROPERTIES LINKER_LANGUAGE CXX)
 if(NOT WIN32)
     target_sources(test_event_queue_destroy PRIVATE
-        "${PS3RECOMP_TREE_ROOT}/runtime/platform/win32_compat.c")
+        "${PS3RECOMP_TREE_ROOT}/runtime/platform/win32_compat.c"
+        "${RUNTIME_SYNC_DIR}/sys_timer.c")
+    target_compile_options(test_event_queue_destroy PRIVATE -ffunction-sections -fdata-sections)
+    if(APPLE)
+        target_link_options(test_event_queue_destroy PRIVATE "-Wl,-dead_strip")
+    else()
+        target_link_options(test_event_queue_destroy PRIVATE "-Wl,--gc-sections")
+    endif()
     find_package(Threads REQUIRED)
     target_link_libraries(test_event_queue_destroy PRIVATE Threads::Threads)
 endif()
@@ -217,4 +224,4 @@ else()
     target_compile_options(test_event_queue_destroy PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
 add_test(NAME event_queue_destroy COMMAND test_event_queue_destroy)
-set_tests_properties(event_queue_destroy PROPERTIES LABELS "runtime;sync" TIMEOUT 60)
+set_tests_properties(event_queue_destroy PROPERTIES LABELS "runtime;sync;t0;tsan" TIMEOUT 60)
