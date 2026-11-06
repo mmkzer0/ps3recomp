@@ -20,6 +20,7 @@
  * channel that runs a nested interpreter on the same context. */
 #include "../spu_interp.c"
 #include <pthread.h>
+#include <stdio.h>
 #include <string.h>
 #include <setjmp.h>
 
@@ -465,6 +466,53 @@ static void expect_trap(int mode, result r) {
     CHECK(r.steps == 2 && r.last_pc == 0x104 && R(2) == 5 && R(3) == 0);
 }
 
+/* dfceq, dfcmeq, dfcgt, dfcmgt and dftsv decode as invalid on this target: a
+ * retail CBE SPU raises an invalid-instruction error for each (hwprobe spuexh
+ * special A, CECHC04 4.81; issue #124), so each takes the same trap as a word
+ * no table claims -- the run stops at the word's own pc and what follows never
+ * runs. Same shape as the plain .word program, one word per run:
+ *   100 il r2,5 / 104 <word> / 108 il r3,1 / 10C stop 0 */
+static uint32_t dp_invalid_word(int k) {
+    static const uint32_t op11[5] = { 0x3C3, 0x3CB, 0x2C3, 0x2CB, 0x3BF };
+    return (op11[k] << 21) | (0x33u << 14) | (0x22u << 7) | 0x11u;
+}
+static int g_dp_invalid;
+static void load_dp_invalid_program(spu_context* c) {
+    put(c, 0x100, il(2, 5));
+    put(c, 0x104, dp_invalid_word(g_dp_invalid));
+    put(c, 0x108, il(3, 1));
+    put(c, 0x10C, stop(0));
+}
+static void expect_dp_invalid(int mode, result r) {
+    (void)mode;
+    CHECK(g_ctx.status == SPU_STATUS_STOPPED_BY_HALT && g_ctx.pc == 0x104);
+    CHECK(r.steps == 2 && r.last_pc == 0x104 && R(2) == 5 && R(3) == 0);
+}
+
+/* The neighbouring DP op keeps its execution: dfa runs and falls through.
+ *   100 il r5,0x200        base for the data quadwords
+ *   104 lqd r2,0(r5)       2.0 in every doubleword
+ *   108 lqd r3,16(r5)      3.0
+ *   10C dfa $4, $2, $3     5.0
+ *   110 stop 0 */
+static void load_dfa_program(spu_context* c) {
+    put(c, 0x100, il(5, 0x200));
+    put(c, 0x104, ri10(LQD, 0, 5, 2));
+    put(c, 0x108, ri10(LQD, 1, 5, 3));
+    put(c, 0x10C, (0x2CCu << 21) | (3u << 14) | (2u << 7) | 4u);
+    put(c, 0x110, stop(0));
+    put(c, 0x200, 0x40000000u); put(c, 0x204, 0); put(c, 0x208, 0x40000000u); put(c, 0x20C, 0);
+    put(c, 0x210, 0x40080000u); put(c, 0x214, 0); put(c, 0x218, 0x40080000u); put(c, 0x21C, 0);
+}
+static void expect_dfa(int mode, result r) {
+    (void)mode;
+    CHECK(r.ret == 0 && g_ctx.status == SPU_STATUS_STOPPED_BY_STOP && g_ctx.pc == 0x114);
+    CHECK(r.steps == 5 && r.last_pc == 0x110);
+    /* 5.0 = 0x4014000000000000 in the even word, 0 in the odd one, both lanes. */
+    CHECK(g_ctx.gpr[4]._u32[0] == 0x40140000u && g_ctx.gpr[4]._u32[1] == 0);
+    CHECK(g_ctx.gpr[4]._u32[2] == 0x40140000u && g_ctx.gpr[4]._u32[3] == 0);
+}
+
 /* The raw-SPU report (spu_raw.c) reads ctx->pc of an interpreting SPU from
  * another thread to say where a spinning SPU is. A fast step does not store it,
  * so a taken branch must: the spin below takes one every other step, and the
@@ -552,6 +600,12 @@ int main(void) {
     all_modes("halt/miss", load_halt_miss_program, 0, 0, expect_halt_miss);
     all_modes("halt/signed", load_halt_signed_program, 0, 0, expect_halt_signed);
     all_modes("trap/word", load_trap_program, 0, 0, expect_trap);
+    for (g_dp_invalid = 0; g_dp_invalid < 5; g_dp_invalid++) {
+        char nm[40];
+        snprintf(nm, sizeof nm, "trap/dp-invalid-%d", g_dp_invalid);
+        all_modes(nm, load_dp_invalid_program, 0, 0, expect_dp_invalid);
+    }
+    all_modes("dp/dfa-still-runs", load_dfa_program, 0, 0, expect_dfa);
     test_pc_sampled_from_another_thread();
 
     printf("test_spu_interp_loop: PASS\n");

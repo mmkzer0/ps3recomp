@@ -326,21 +326,9 @@ def dmodel(kind):
     return f
 for k in ("dfa", "dfs", "dfm"): reg(k, dmodel(k), "dpool2,drand2,dnear2")
 for k in ("dfma", "dfms", "dfnms", "dfnma"): reg(k, dmodel(k), "dpool3,drand3,dnear3")
-def dcmp(fn): return lambda a, b, c, i: undw([(1 << 64) - 1 if (d_cls(x) != "nan" and d_cls(y) != "nan" and fn(x, y)) else 0 for x, y in zip(dwords(a), dwords(b))])
-def dv(u): return float("inf") * (-1 if sgn(u) else 1) if d_cls(u) == "inf" else d_val(u)
-reg("dfceq", dcmp(lambda x, y: dv(x) == dv(y)), "dpool2,drand2,dnear2"); reg("dfcgt", dcmp(lambda x, y: dv(x) > dv(y)), "dpool2,drand2,dnear2")
-reg("dfcmeq", dcmp(lambda x, y: abs(dv(x)) == abs(dv(y))), "dpool2,drand2,dnear2"); reg("dfcmgt", dcmp(lambda x, y: abs(dv(x)) > abs(dv(y))), "dpool2,drand2,dnear2")
-def dftsv(a, b, c, imm):
-    out = []
-    for u in dwords(a):
-        e = (u >> 52) & 0x7FF; f = u & ((1 << 52) - 1); neg = u >> 63; t = 0; i7 = imm & 0x7F
-        if e == 0x7FF and f: t |= i7 & 0x40
-        if e == 0x7FF and not f: t |= i7 & (0x10 if neg else 0x20)
-        if e == 0 and not f: t |= i7 & (0x04 if neg else 0x08)
-        if e == 0 and f: t |= i7 & (0x01 if neg else 0x02)
-        out.append((1 << 64) - 1 if t else 0)
-    return undw(out)
-reg("dftsv", dftsv, "dtsv")
+# dfceq/dfcmeq/dfcgt/dfcmgt/dftsv are not modelled here either: a retail CBE SPU
+# raises an invalid-instruction error for them (hwprobe spuexh special A, issue
+# #124), so the sweep (test_spu_exhaustive.c) carries no rows to check.
 def fesd(a, b, c, i):
     out = []
     for w in words(a)[0::2]:

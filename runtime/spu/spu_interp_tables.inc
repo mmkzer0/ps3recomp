@@ -69,17 +69,12 @@ typedef enum {
     SPU_cwd,
     SPU_cwx,
     SPU_dfa,
-    SPU_dfceq,
-    SPU_dfcgt,
-    SPU_dfcmeq,
-    SPU_dfcmgt,
     SPU_dfm,
     SPU_dfma,
     SPU_dfms,
     SPU_dfnma,
     SPU_dfnms,
     SPU_dfs,
-    SPU_dftsv,
     SPU_dsync,
     SPU_eqv,
     SPU_fa,
@@ -273,17 +268,12 @@ static const char* const spu_op_name[SPU_OP_COUNT] = {
     [SPU_cwd] = "cwd",
     [SPU_cwx] = "cwx",
     [SPU_dfa] = "dfa",
-    [SPU_dfceq] = "dfceq",
-    [SPU_dfcgt] = "dfcgt",
-    [SPU_dfcmeq] = "dfcmeq",
-    [SPU_dfcmgt] = "dfcmgt",
     [SPU_dfm] = "dfm",
     [SPU_dfma] = "dfma",
     [SPU_dfms] = "dfms",
     [SPU_dfnma] = "dfnma",
     [SPU_dfnms] = "dfnms",
     [SPU_dfs] = "dfs",
-    [SPU_dftsv] = "dftsv",
     [SPU_dsync] = "dsync",
     [SPU_eqv] = "eqv",
     [SPU_fa] = "fa",
@@ -530,17 +520,12 @@ static inline int32_t spu_sx(uint32_t v, int bits) {
 #define SPU_FORM_cwd I7U
 #define SPU_FORM_cwx NONE
 #define SPU_FORM_dfa NONE
-#define SPU_FORM_dfceq NONE
-#define SPU_FORM_dfcgt NONE
-#define SPU_FORM_dfcmeq NONE
-#define SPU_FORM_dfcmgt NONE
 #define SPU_FORM_dfm NONE
 #define SPU_FORM_dfma NONE
 #define SPU_FORM_dfms NONE
 #define SPU_FORM_dfnma NONE
 #define SPU_FORM_dfnms NONE
 #define SPU_FORM_dfs NONE
-#define SPU_FORM_dftsv NONE
 #define SPU_FORM_dsync NONE
 #define SPU_FORM_eqv NONE
 #define SPU_FORM_fa NONE
@@ -731,17 +716,12 @@ static inline int32_t spu_sx(uint32_t v, int bits) {
     X(cwd, I7U) \
     X(cwx, NONE) \
     X(dfa, NONE) \
-    X(dfceq, NONE) \
-    X(dfcgt, NONE) \
-    X(dfcmeq, NONE) \
-    X(dfcmgt, NONE) \
     X(dfm, NONE) \
     X(dfma, NONE) \
     X(dfms, NONE) \
     X(dfnma, NONE) \
     X(dfnms, NONE) \
     X(dfs, NONE) \
-    X(dftsv, NONE) \
     X(dsync, NONE) \
     X(eqv, NONE) \
     X(fa, NONE) \
@@ -869,7 +849,11 @@ static inline int32_t spu_sx(uint32_t v, int bits) {
 
 _Static_assert(SPU_OP_COUNT <= 256, "spu_op must fit the uint8_t spu_decode_tab");
 
-/* Indexed by insn >> 21; precedence is documented in tools/gen_spu_interp.py. */
+/* Indexed by insn >> 21; precedence is documented in tools/gen_spu_interp.py.
+ * dfceq, dfcmeq, dfcgt, dfcmgt and dftsv decode as SPU_word here: the retail
+ * CBE SPU raises an invalid-instruction error for them (hwprobe spuexh
+ * special A, CECHC04 4.81; issue #124), so they take the undecodable-word
+ * trap in spu_interp.c instead of executing. */
 static const uint8_t spu_decode_tab[2048] = {
     /*000*/ SPU_stop, SPU_lnop, SPU_sync, SPU_dsync, SPU_word, SPU_word, SPU_word, SPU_word,
     /*008*/ SPU_word, SPU_word, SPU_word, SPU_word, SPU_mfspr, SPU_rdch, SPU_word, SPU_rchcnt,
@@ -959,8 +943,8 @@ static const uint8_t spu_decode_tab[2048] = {
     /*2A8*/ SPU_word, SPU_word, SPU_word, SPU_word, SPU_word, SPU_word, SPU_xshw, SPU_word,
     /*2B0*/ SPU_word, SPU_word, SPU_word, SPU_word, SPU_cntb, SPU_word, SPU_xsbh, SPU_word,
     /*2B8*/ SPU_word, SPU_word, SPU_word, SPU_word, SPU_word, SPU_word, SPU_word, SPU_word,
-    /*2C0*/ SPU_clgt, SPU_andc, SPU_fcgt, SPU_dfcgt, SPU_fa, SPU_fs, SPU_fm, SPU_word,
-    /*2C8*/ SPU_clgth, SPU_orc, SPU_fcmgt, SPU_dfcmgt, SPU_dfa, SPU_dfs, SPU_dfm, SPU_word,
+    /*2C0*/ SPU_clgt, SPU_andc, SPU_fcgt, SPU_word, SPU_fa, SPU_fs, SPU_fm, SPU_word,
+    /*2C8*/ SPU_clgth, SPU_orc, SPU_fcmgt, SPU_word, SPU_dfa, SPU_dfs, SPU_dfm, SPU_word,
     /*2D0*/ SPU_clgtb, SPU_word, SPU_word, SPU_word, SPU_word, SPU_word, SPU_word, SPU_word,
     /*2D8*/ SPU_hlgt, SPU_word, SPU_word, SPU_word, SPU_word, SPU_word, SPU_word, SPU_word,
     /*2E0*/ SPU_clgti, SPU_clgti, SPU_clgti, SPU_clgti, SPU_clgti, SPU_clgti, SPU_clgti, SPU_clgti,
@@ -990,9 +974,9 @@ static const uint8_t spu_decode_tab[2048] = {
     /*3A0*/ SPU_mpyi, SPU_mpyi, SPU_mpyi, SPU_mpyi, SPU_mpyi, SPU_mpyi, SPU_mpyi, SPU_mpyi,
     /*3A8*/ SPU_mpyui, SPU_mpyui, SPU_mpyui, SPU_mpyui, SPU_mpyui, SPU_mpyui, SPU_mpyui, SPU_mpyui,
     /*3B0*/ SPU_cflts, SPU_cflts, SPU_cfltu, SPU_cfltu, SPU_csflt, SPU_csflt, SPU_cuflt, SPU_cuflt,
-    /*3B8*/ SPU_fesd, SPU_frds, SPU_fscrwr, SPU_word, SPU_word, SPU_word, SPU_word, SPU_dftsv,
-    /*3C0*/ SPU_ceq, SPU_word, SPU_fceq, SPU_dfceq, SPU_mpy, SPU_mpyh, SPU_mpyhh, SPU_mpys,
-    /*3C8*/ SPU_ceqh, SPU_word, SPU_fcmeq, SPU_dfcmeq, SPU_mpyu, SPU_word, SPU_mpyhhu, SPU_word,
+    /*3B8*/ SPU_fesd, SPU_frds, SPU_fscrwr, SPU_word, SPU_word, SPU_word, SPU_word, SPU_word,
+    /*3C0*/ SPU_ceq, SPU_word, SPU_fceq, SPU_word, SPU_mpy, SPU_mpyh, SPU_mpyhh, SPU_mpys,
+    /*3C8*/ SPU_ceqh, SPU_word, SPU_fcmeq, SPU_word, SPU_mpyu, SPU_word, SPU_mpyhhu, SPU_word,
     /*3D0*/ SPU_ceqb, SPU_word, SPU_word, SPU_word, SPU_fi, SPU_word, SPU_word, SPU_word,
     /*3D8*/ SPU_heq, SPU_word, SPU_word, SPU_word, SPU_word, SPU_word, SPU_word, SPU_word,
     /*3E0*/ SPU_ceqi, SPU_ceqi, SPU_ceqi, SPU_ceqi, SPU_ceqi, SPU_ceqi, SPU_ceqi, SPU_ceqi,

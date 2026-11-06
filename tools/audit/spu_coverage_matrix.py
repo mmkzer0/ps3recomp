@@ -93,8 +93,11 @@ def mentions(h):
 
 # ---- class table: op -> (class, rpcs3 oracle, min exhaustive domain)
 RPCS3_PRECISE = {"fcgt", "fa", "fs", "fm", "fcmgt", "dfa", "dfs", "dfm", "dfma", "dfms", "dfnms", "dfnma", "fscrrd", "fesd", "frds", "fscrwr", "fceq", "fcmeq", "cflts", "cfltu", "csflt", "cuflt", "fnms", "fma", "fms"}
-HAND_ONLY = {"dfceq", "dfcgt", "dfcmeq", "dfcmgt", "dftsv"}
 NO_ORACLE = {"fi"}
+# dfceq/dfcmeq/dfcgt/dfcmgt/dftsv never appear: a retail CBE SPU raises an
+# invalid-instruction error for them (hwprobe spuexh special A, issue #124), so
+# the interpreter's generated enum has no rows for them and this matrix, which
+# is built from that enum, does not list them.
 def cls(op):
     g = lambda *s: op in s
     if g("word"): return ("pseudo", "-", "-")
@@ -131,7 +134,7 @@ def cls(op):
     if g("fi"): return ("float32 interpolate", "ra low 19 bits x rb 32 bits = 2^51", "rb exp irrelevant beyond 0/underflow: (base13,step10) 2^23 x y 2^19 = 2^42 sampled by y; exhaustive over (base,step) with y in {0,1,2^k,all-ones,random}")
     if g("cflts","cfltu","csflt","cuflt"): return ("int<->float", "2^32 data x i8 (128 defined scales)", "all 2^32 words x each of 128 defined scales = 2^39 lane-ops (~10-20 min AVX2); invalid scales > 127 are ISA-undefined")
     if g("fesd","frds"): return ("float<->double", "2^32 per lane", "fesd: all 2^32 floats; frds: 2^64 doubles -> exponent/rounding classes + 2^32 sweep of the high word")
-    if op.startswith("df"): return ("double", "2^64..2^192", "class-structured (exp, frac edges, specials); dftsv: 2^64 x 2^7 mask -> classify per 7 flags exhaustive over 11 class representatives")
+    if op.startswith("df"): return ("double", "2^64..2^192", "class-structured (exp, frac edges, specials)")
     if g("fscrrd","fscrwr","mfspr","mtspr"): return ("fpscr/spr", "-", "constant behaviour (reads zero)")
     if re.match(r"(lq|stq)", op): return ("ls access", "addr 2^18 x data", "all 16B-aligned addrs/wrap + masking low 4 bits: boundary classes")
     if re.match(r"(br|bi)", op) or op in ("iret",): return ("branch", "cond x target 2^16", "cond {0,nonzero,0x10000} x target classes (+E/D bits for bi*)")
@@ -144,7 +147,6 @@ def oracle(op, hs):
     if op == "word": return "-"
     o = []
     if op in NO_ORACLE: o.append("RPCS3: NONE (UNK, 0 trials)")
-    elif op in HAND_ONLY: o.append("hand ref_exec (RPCS3 lacks)")
     elif op in RPCS3_PRECISE: o.append("RPCS3 precise")
     else: o.append("RPCS3 fast")
     if any(has_ref(h) for h in hs): o.append("helper _ref")

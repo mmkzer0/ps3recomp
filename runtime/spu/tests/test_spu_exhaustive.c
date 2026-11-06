@@ -88,8 +88,10 @@ static V4 f_iohl_(const G* g) { return st(spu_iohl(ld(g->a), (uint16_t)E_I16U(g-
 A2(fa) A2(fs) A2(fm) A3(fma) A3(fms) A3(fnms) A2(fceq) A2(fcgt) A2(fcmeq) A2(fcmgt) A2(fi) A1(frest) A1(frsqest)
 R2(fa) R2(fs) R2(fm) R3(fma) R3(fms) R3(fnms) R2(fceq) R2(fcgt) R2(fcmeq) R2(fcmgt) R2(fi) R1(frest) R1(frsqest)
 AI(cflts, E_I8) AI(cfltu, E_I8) AI(csflt, E_I8) AI(cuflt, E_I8) RI(cflts, E_I8) RI(cfltu, E_I8) RI(csflt, E_I8) RI(cuflt, E_I8)
-/* double precision */
-A2(dfa) A2(dfs) A2(dfm) A3(dfma) A3(dfms) A3(dfnms) A3(dfnma) A2(dfceq) A2(dfcmeq) A2(dfcgt) A2(dfcmgt) A1(frds) A1(fesd) AI(dftsv, E_I7U)
+/* double precision (dfceq/dfcmeq/dfcgt/dfcmgt/dftsv have no rows: a retail CBE
+ * SPU raises an invalid-instruction error for them, hwprobe spuexh special A,
+ * issue #124 -- nothing models them) */
+A2(dfa) A2(dfs) A2(dfm) A3(dfma) A3(dfms) A3(dfnms) A3(dfnma) A1(frds) A1(fesd)
 
 typedef struct {
     const char* name; V4 (*fn)(const G*); V4 (*ref)(const G*); const char* doms;
@@ -144,9 +146,9 @@ static const OP g_ops[] = {
     OR_(fceq, 3, F2D), OR_(fcgt, 3, F2D), OR_(fcmeq, 3, F2D), OR_(fcmgt, 3, F2D),
     OR_(fi, 3, "fi"), OR_(frest, 1, "w32"), OR_(frsqest, 1, "w32"),
     /* double precision */
-    O(dfa, 3, D2D), O(dfs, 3, D2D), O(dfm, 3, D2D), O(dfceq, 3, D2D), O(dfcmeq, 3, D2D), O(dfcgt, 3, D2D), O(dfcmgt, 3, D2D),
+    O(dfa, 3, D2D), O(dfs, 3, D2D), O(dfm, 3, D2D),
     O(dfma, 7, "dpool3,drand3,dnear3"), O(dfms, 7, "dpool3,drand3,dnear3"), O(dfnms, 7, "dpool3,drand3,dnear3"), O(dfnma, 7, "dpool3,drand3,dnear3"),
-    O(frds, 1, "dfrds,dpool2,drand2"), O(fesd, 1, "w32e"), O(dftsv, 1, "dtsv"),
+    O(frds, 1, "dfrds,dpool2,drand2"), O(fesd, 1, "w32e"),
 };
 #define NBASE ((int)(sizeof g_ops / sizeof g_ops[0]))
 

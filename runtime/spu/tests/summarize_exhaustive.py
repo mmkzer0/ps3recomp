@@ -28,7 +28,7 @@ DOMS = {
  "dpool2": ("structured exhaustive", 2, "all pairs of 1024 doubles (128 exps x 4 fractions x 2 signs)"), "drand2": ("sampled", 2, "uniform random 64-bit pairs"),
  "dnear2": ("sampled structured", 2, "exponents within +-70, equal/neg/adjacent, extremes"), "dpool3": ("structured exhaustive", 2, "256^3 triples (32 exps x 4 fractions x 2 signs)"),
  "drand3": ("sampled", 2, "uniform random triples"), "dnear3": ("sampled structured", 2, "addend exponent within +-70 of product"),
- "dfrds": ("structured exhaustive", 2, "all 2048 exps x sign x 8 tie patterns x 32 high fractions"), "dtsv": ("exhaustive", 2, "128 I7 x all 16x16 special-class pairs"),
+ "dfrds": ("structured exhaustive", 2, "all 2048 exps x sign x 8 tie patterns x 32 high fractions"),
 }
 def load(p):
     h, cov = {}, {}

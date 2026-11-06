@@ -357,11 +357,6 @@ SPU_EXEC_INLINE int spu_exec(spu_context* ctx, uint32_t pc, uint32_t insn,
     OP(dfms, DST = spu_dfms(A,B,DST);)
     OP(dfnms, DST = spu_dfnms(A,B,DST);)
     OP(dfnma, DST = spu_dfnma(A,B,DST);)
-    OP(dfceq, DST = spu_dfceq(A,B);)
-    OP(dfcgt, DST = spu_dfcgt(A,B);)
-    OP(dfcmeq, DST = spu_dfcmeq(A,B);)
-    OP(dfcmgt, DST = spu_dfcmgt(A,B);)
-    OP(dftsv, DST = spu_dftsv(A, (int32_t)RB_);)   /* I7 sits in the rb field */
     /* control flow */
     OP(br, SPU_JUMP(TGT);)
     OP(bra, SPU_JUMP(TGT);)
@@ -412,6 +407,14 @@ SPU_EXEC_INLINE int spu_exec(spu_context* ctx, uint32_t pc, uint32_t insn,
     OP(hgti, SPU_HALT_IF((int32_t)PREF(A) > (int32_t)(uint32_t)I);)
     OP(hlgt, SPU_HALT_IF(PREF(A) > PREF(B));)
     OP(hlgti, SPU_HALT_IF(PREF(A) > (uint32_t)I);)
+    /* Unimplemented-op trap: the stopping pc is the word itself, not the next
+     * one. dfceq, dfcmeq, dfcgt, dfcmgt and dftsv land here by decode
+     * (gen_spu_interp.py maps their prefixes to SPU_word): a retail CBE SPU
+     * raises an invalid-instruction error for each, so the guest must not run
+     * on a result the console never produced -- hardware, direct: hwprobe
+     * `spuexh` special A ran each word alone on a CECHC04 with 4.81 REBUG, the
+     * thread group ended with join cause 4 and the stopped thread's exit
+     * status read 0x8001000F (CELL_ESTAT); issue #124. */
     default:
         fprintf(stderr, "[spu_interp] unimplemented op '%s' (0x%08X) at LS 0x%05X\n",
                 spu_op_name[spu_decode_tab[insn >> 21]], insn, pc);
