@@ -33,6 +33,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>   /* the stop cases fork: the fixture is POSIX only (the driver skips elsewhere) */
+#include <unistd.h>
 
 uint8_t* vm_base;
 uint32_t ppu_vm_size = 0x20000;
@@ -83,6 +85,42 @@ static int g_failures;
         }                                                                      \
     } while (0)
 
+/* A refused guest span ends the process in a named stop (kind=hle-guest-range), so the call runs in a forked child
+ * and the parent reads the machine line the stop prints on stderr. */
+static void flag_receiver_straddling(void) { _cellSpursWorkloadFlagReceiver(0x20000u - 0x80u, 0, 1); }
+static void flag_receiver_far(void) { _cellSpursWorkloadFlagReceiver(0x80000000u, 0, 1); }
+
+static void stops_with(const char* what, void (*call)(void), const char* func, const char* arg)
+{
+    int fds[2];
+    if (pipe(fds) != 0) { printf("FAIL %s: pipe\n", what); g_failures++; return; }
+    const pid_t pid = fork();
+    if (pid == 0) {
+        close(fds[0]); dup2(fds[1], STDERR_FILENO); close(fds[1]);
+        call();
+        _exit(1);   /* returned: the span was not refused */
+    }
+    close(fds[1]);
+    char out[4096];
+    size_t used = 0;
+    ssize_t n;
+    while (used < sizeof out - 1 && (n = read(fds[0], out + used, sizeof out - 1 - used)) > 0) used += (size_t)n;
+    out[used] = 0;
+    close(fds[0]);
+    int status = 0;
+    waitpid(pid, &status, 0);
+    char want[160];
+    snprintf(want, sizeof want, "func=%s arg=%s", func, arg);
+    const char* line = strstr(out, "PS3STOP v=1");
+    if (WIFEXITED(status) && WEXITSTATUS(status) == PS3_STOP_EXIT_CODE && line &&
+        strstr(line, "kind=hle-guest-range") && strstr(line, want))
+        printf("PASS %-42s stops: %s\n", what, want);
+    else {
+        printf("FAIL %-42s status 0x%X, stop line: %s\n", what, status, line ? line : "(none)");
+        g_failures++;
+    }
+}
+
 int main(void)
 {
     vm_base = (uint8_t*)calloc(1, 0x20000);
@@ -128,6 +166,20 @@ int main(void)
     CHECK_CODE("CELL_SPURS_JOB_ERROR_MEMORY_SIZE", CELL_SPURS_JOB_ERROR_MEMORY_SIZE, 0x80410A17u);
     CHECK_CODE("CELL_SPURS_JOB_ERROR_INVALID_BINARY", CELL_SPURS_JOB_ERROR_INVALID_BINARY, 0x80410A1Fu);
 
+
+    /* _cellSpursWorkloadFlagReceiver reads and writes the instance's mask, flag word and receiver byte at the EA it
+     * is given: past its null/alignment answers, a span that leaves guest memory is a named stop, and one that
+     * fits (the arena is 0x20000 bytes) is answered by the core codes. */
+    stops_with("_cellSpursWorkloadFlagReceiver(span straddles)", flag_receiver_straddling,
+               "_cellSpursWorkloadFlagReceiver", "spurs");
+    stops_with("_cellSpursWorkloadFlagReceiver(span far away)", flag_receiver_far,
+               "_cellSpursWorkloadFlagReceiver", "spurs");
+    CHECK_CODE("_cellSpursWorkloadFlagReceiver(NULL) [core]",
+               _cellSpursWorkloadFlagReceiver(0, 0, 1), CELL_SPURS_CORE_ERROR_NULL_POINTER);
+    CHECK_CODE("_cellSpursWorkloadFlagReceiver(...0x40) [align]",
+               _cellSpursWorkloadFlagReceiver(0x1040u, 0, 1), CELL_SPURS_CORE_ERROR_ALIGN);
+    CHECK_CODE("_cellSpursWorkloadFlagReceiver(fits, not enabled)",
+               _cellSpursWorkloadFlagReceiver(0x20000u - 0x100u, 0, 1), CELL_SPURS_CORE_ERROR_SRCH);
     free(vm_base);
     printf(g_failures ? "\n%d code(s) WRONG\n" : "\nall codes match the firmware\n", g_failures);
     return g_failures ? 1 : 0;

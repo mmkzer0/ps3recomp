@@ -43,6 +43,7 @@
 #include <time.h>
 #include "../platform/win32_compat.h"
 #include "ps3emu/log_first.h"
+#include "../memory/vm.h"      /* vm_range_ok / vm_guest_limit: the guest arena rule */
 
 #ifdef __cplusplus
 extern "C" {
@@ -2876,6 +2877,10 @@ void spu_indirect_branch(spu_context* ctx)
              * entry, and jobs that ran since may have overwritten it. */
             { const uint32_t sp = ((uint32_t)ctx->ls[0x1C4] << 24) | ((uint32_t)ctx->ls[0x1C5] << 16) |
                                   ((uint32_t)ctx->ls[0x1C6] << 8) | ctx->ls[0x1C7];
+              /* The EA comes out of the local store, which the policy module and the jobs it ran write: a line
+               * that is not inside guest memory is a named stop, not a host read past vm_base. */
+              if (sp && !vm_range_ok(sp, 0x80))
+                  ps3_stop_guest_range("spu_spurs_select_workload", "spurs", sp, 0x80, vm_guest_limit());
               if (sp) memcpy(ctx->ls + 0x100, vm_base + sp, 0x80); }
             ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
             return;

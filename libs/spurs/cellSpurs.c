@@ -1971,6 +1971,10 @@ s32 _cellSpursWorkloadFlagReceiver(u64 spurs_ea, u32 wid, u32 is_set)
     u32 ea = (u32)spurs_ea;
     if (!ea) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
     if (ea & 0x7Fu) return CELL_SPURS_CORE_ERROR_ALIGN;
+    /* The enabled mask, the flag word and its receiver byte are read and written at this EA (the title's SPURS
+     * instance, not necessarily one this HLE initialised): the span up to the mask is bounded before any of them. */
+    if (!spurs_guest_range_valid(ea, SPURS_WKL_ENABLED + 4u))
+        ps3_stop_guest_range("_cellSpursWorkloadFlagReceiver", "spurs", ea, SPURS_WKL_ENABLED + 4u, vm_guest_limit());
     const struct SpursInst* si = spurs_inst_find(ea);
     if (wid >= (si && si->is2 ? SPURS_MAX_WID : 16u)) return CELL_SPURS_CORE_ERROR_INVAL;
     if (!(vm_read32(ea + SPURS_WKL_ENABLED) & (0x80000000u >> wid)))
