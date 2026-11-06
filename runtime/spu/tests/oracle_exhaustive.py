@@ -188,6 +188,14 @@ def fi_lane(y, est):
     return sp_pack(-v if est >> 31 else v)
 reg("fi", lanes_sp2(lambda x, y: fi_lane(x, y)), "fi")
 def cflt(x, sc, uns):
+    # cflts/cfltu of an exponent-0 word (zero/denormal): the significand is 0, but the hardware
+    # still saturates on the shift amount sh = be + 23 - i8 = 23 - sc (spuexh lanes r007/r008,
+    # issue #126): signed at sh >= 8, unsigned at sh >= 9 (sh == 8 does not saturate, and a
+    # negative unsigned input is 0 as always).
+    if (x >> 23) & 255 == 0:
+        sh = 23 - sc
+        if uns: return 0 if (x >> 31) or sh < 9 else M32
+        return (0x80000000 if x >> 31 else 0x7FFFFFFF) if sh >= 8 else 0
     v = sp_val(x) * (F(2) ** (173 - sc)); t = int(v)          # int() truncates toward zero
     if uns: return 0 if t < 0 else min(t, M32)
     return max(-(1 << 31), min((1 << 31) - 1, t)) & M32

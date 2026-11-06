@@ -745,6 +745,25 @@ class SPULifter:
                     f"0x{insn.raw:08X}u, 0x{addr:05X}u, ctx->image_id); "
                     f"ctx->status = SPU_STATUS_STOPPED_BY_HALT; spu_halt(ctx); return; }}")
 
+        # cflts/cfltu at I8 <= 14: the conversion shifts by sh = be + 23 - I8, and
+        # sh >= 264 (reachable for be >= 241 + I8, i.e. only at these scales) leaves
+        # the hardware's saturating path for a result that is not modelled (489
+        # measured lanes, no bit-exact rule; hwprobe spuexh lanes r007/r008 on a
+        # CECHC04 with 4.81 REBUG; issue #126). I8 >= 15 cannot reach it (max
+        # sh = 263) and is exact. The interpreter stops at such a word; lifted code
+        # must stop the same way (fail closed, named with the scale, the word, its
+        # pc and the image), not call a helper and run on with a value the console
+        # never produced.
+        if mn in ("cflts", "cfltu"):
+            i8 = int(_imm(ops[2]), 0)
+            if i8 <= 14:
+                return (f"/* {mn}: unmodelled scale I8={i8} on the CBE SPU (hwprobe spuexh lanes, issue #126) */ "
+                        f"{{ extern void spu_halt(spu_context*); ctx->pc = 0x{addr:X}u; "
+                        f"fprintf(stderr, \"[spu] INVALID-OP {mn}: unmodelled cflts/cfltu scale (I8={i8}, #126) "
+                        f"(0x%08X) at LS 0x%05X img=%d\\n\", "
+                        f"0x{insn.raw:08X}u, 0x{addr:05X}u, ctx->image_id); "
+                        f"ctx->status = SPU_STATUS_STOPPED_BY_HALT; spu_halt(ctx); return; }}")
+
         # ---- integer arithmetic (register) ----
         rr_bin = {
             "a": "spu_a", "sf": "spu_sf", "ah": "spu_ah", "sfh": "spu_sfh",

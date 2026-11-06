@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <setjmp.h>
+#include <unistd.h>
 
 /* Channels play the out-of-line callers. They record the pc the context holds
  * when called (the instruction making the call), and act on a few numbers:
@@ -489,6 +490,69 @@ static void expect_dp_invalid(int mode, result r) {
     CHECK(r.steps == 2 && r.last_pc == 0x104 && R(2) == 5 && R(3) == 0);
 }
 
+/* cflts/cfltu at I8 <= 14 can reach the hardware's unmodelled shift region: with
+ * sh = be + 23 - I8, a biased exponent be >= 241 + I8 (reachable only for I8 <= 14)
+ * leaves the saturating path and the fit found no bit-exact rule (hwprobe spuexh
+ * lanes r007/r008 on a CECHC04 with 4.81 REBUG; issue #126). The run stops at the
+ * word instead of computing, like the unimplemented-op trap; the stderr line names
+ * the scale. I8 15 is the lowest modelled scale (max sh = 263) and runs.
+ *   100 il r2,5 / 104 cflts|cfltu r3,r2,<i8> / 108 il r4,1 / 10C stop 0 */
+static uint32_t ri8(uint32_t op10, uint32_t i8, uint32_t ra, uint32_t rt) {
+    return (op10 << 22) | ((i8 & 0xFF) << 14) | (ra << 7) | rt;
+}
+static uint32_t g_cfl_op, g_cfl_i8;
+static void load_cfl_trap_program(spu_context* c) {
+    put(c, 0x100, il(2, 5));
+    put(c, 0x104, ri8(g_cfl_op, g_cfl_i8, 2, 3));
+    put(c, 0x108, il(4, 1));
+    put(c, 0x10C, stop(0));
+}
+static void expect_cfl_trap(int mode, result r) {
+    (void)mode;
+    CHECK(g_ctx.status == SPU_STATUS_STOPPED_BY_HALT && g_ctx.pc == 0x104);
+    CHECK(r.steps == 2 && r.last_pc == 0x104 && R(2) == 5 && R(3) == 0 && R(4) == 0);
+}
+
+/* 100 il r2,5 / 104 cflts r3,r2,15 / 108 cfltu r4,r2,15 / 10C stop 0
+ * (0x00000005 is an exponent-0 word: sh = 8, so cflts saturates it signed and
+ * cfltu leaves it 0 -- the modelled exponent-0 rule, issue #126). */
+static void load_cfl15_program(spu_context* c) {
+    put(c, 0x100, il(2, 5));
+    put(c, 0x104, ri8(0x1D8, 15, 2, 3));
+    put(c, 0x108, ri8(0x1D9, 15, 2, 4));
+    put(c, 0x10C, stop(0));
+}
+static void expect_cfl15(int mode, result r) {
+    (void)mode;
+    CHECK(r.ret == 0 && g_ctx.status == SPU_STATUS_STOPPED_BY_STOP && g_ctx.pc == 0x110);
+    CHECK(r.steps == 4 && r.last_pc == 0x10C);
+    CHECK(R(3) == 0x7FFFFFFFu && R(4) == 0);
+}
+
+/* The stop must say why (fail loud with named errors): the stderr line names the
+ * scale and the issue. Capture stderr through a tmpfile for one run. */
+static void test_cfl_stop_names_itself(void) {
+    int saved = dup(2);
+    FILE* tf = tmpfile();
+    CHECK(saved >= 0 && tf != NULL);
+    fflush(stderr);
+    CHECK(dup2(fileno(tf), 2) >= 0);
+    g_case = "trap/cfl-message"; g_mode = "fast";
+    g_cfl_op = 0x1D8; g_cfl_i8 = 14;
+    obs_count oc = { 0 };
+    result r = run_mode(M_FAST, load_cfl_trap_program, 0, 0, &oc);
+    fflush(stderr);
+    CHECK(dup2(saved, 2) >= 0);
+    close(saved);
+    expect_cfl_trap(M_FAST, r);
+    rewind(tf);
+    char buf[512];
+    size_t n = fread(buf, 1, sizeof buf - 1, tf);
+    buf[n] = 0;
+    fclose(tf);
+    CHECK(strstr(buf, "unmodelled cflts/cfltu scale (I8=14, #126)") != NULL);
+}
+
 /* The neighbouring DP op keeps its execution: dfa runs and falls through.
  *   100 il r5,0x200        base for the data quadwords
  *   104 lqd r2,0(r5)       2.0 in every doubleword
@@ -605,6 +669,14 @@ int main(void) {
         snprintf(nm, sizeof nm, "trap/dp-invalid-%d", g_dp_invalid);
         all_modes(nm, load_dp_invalid_program, 0, 0, expect_dp_invalid);
     }
+    for (g_cfl_op = 0x1D8; g_cfl_op <= 0x1D9; g_cfl_op++) {
+        char nm[40];
+        snprintf(nm, sizeof nm, "trap/cfl-i8-14-%s", g_cfl_op == 0x1D8 ? "cflts" : "cfltu");
+        g_cfl_i8 = 14;
+        all_modes(nm, load_cfl_trap_program, 0, 0, expect_cfl_trap);
+    }
+    all_modes("cfl/i8-15-runs", load_cfl15_program, 0, 0, expect_cfl15);
+    test_cfl_stop_names_itself();
     all_modes("dp/dfa-still-runs", load_dfa_program, 0, 0, expect_dfa);
     test_pc_sampled_from_another_thread();
 
