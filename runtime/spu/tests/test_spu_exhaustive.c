@@ -31,11 +31,24 @@ static inline V4 st(u128 r) { V4 v; for (int k = 0; k < 4; k++) v.w[k] = r._u32[
 #define A1(n)  static V4 f_##n(const G* g) { return st(spu_##n(ld(g->a))); }
 #define A2(n)  static V4 f_##n(const G* g) { return st(spu_##n(ld(g->a), ld(g->b))); }
 #define A3(n)  static V4 f_##n(const G* g) { return st(spu_##n(ld(g->a), ld(g->b), ld(g->c))); }
-#define AI(n)  static V4 f_##n(const G* g) { return st(spu_##n(ld(g->a), g->imm)); }
+/* An immediate-form instruction can only carry its own field, so the generator's wide immediates (spu_exh_gen.h:
+ * -1024..1023 plus 128 wide values) are cut to that field before they reach a helper. Field widths and extension
+ * follow the decoder forms in spu_interp_tables.inc (I10/I7S/I16S sign-extend; I7U/I16U/I18 zero-extend); the
+ * generator stream itself stays untouched. */
+static inline int32_t enc_sx(int32_t v, int bits) { const uint32_t m = 1u << (bits - 1); return (int32_t)((((uint32_t)v & ((m << 1) - 1u)) ^ m) - m); }
+static inline int32_t enc_zx(int32_t v, int bits) { return (int32_t)((uint32_t)v & ((1u << bits) - 1u)); }
+#define E_I10(v)  enc_sx((v), 10)
+#define E_I7S(v)  enc_sx((v), 7)
+#define E_I7U(v)  enc_zx((v), 7)
+#define E_I8(v)   enc_zx((v), 8)
+#define E_I16S(v) enc_sx((v), 16)
+#define E_I16U(v) enc_zx((v), 16)
+#define E_I18(v)  enc_zx((v), 18)
+#define AI(n, E)  static V4 f_##n(const G* g) { return st(spu_##n(ld(g->a), E(g->imm))); }
 #define R1(n)  static V4 r_##n(const G* g) { return st(spu_##n##_ref(ld(g->a))); }
 #define R2(n)  static V4 r_##n(const G* g) { return st(spu_##n##_ref(ld(g->a), ld(g->b))); }
 #define R3(n)  static V4 r_##n(const G* g) { return st(spu_##n##_ref(ld(g->a), ld(g->b), ld(g->c))); }
-#define RI(n)  static V4 r_##n(const G* g) { return st(spu_##n##_ref(ld(g->a), g->imm)); }
+#define RI(n, E)  static V4 r_##n(const G* g) { return st(spu_##n##_ref(ld(g->a), E(g->imm))); }
 
 /* integer, word/half/byte binary */
 A2(a) A2(sf) A2(and) A2(or) A2(xor) A2(nand) A2(nor) A2(andc) A2(orc) A2(eqv) A2(ceq) A2(cgt) A2(clgt) A2(cg) A2(bg)
@@ -53,26 +66,30 @@ A2(cbx) A2(chx) A2(cwx) A2(cdx)
 A1(cntb) A1(xsbh) A1(xshw) A1(clz) A1(xswd) A1(orx) A1(gb) A1(gbh) A1(gbb) A1(fsm) A1(fsmh) A1(fsmb)
 R1(cntb) R1(xsbh) R1(xshw) R1(clz) R1(xswd) R1(orx) R1(gb) R1(gbh) R1(gbb) R1(fsm) R1(fsmh) R1(fsmb)
 /* immediate forms */
-AI(ai) AI(sfi) AI(andi) AI(ori) AI(xori) AI(ceqi) AI(cgti) AI(clgti) RI(ai) RI(sfi) RI(andi) RI(ori) RI(xori) RI(ceqi) RI(cgti) RI(clgti)
-AI(ahi) AI(sfhi) AI(ceqhi) AI(cgthi) AI(clgthi) AI(andhi) AI(orhi) AI(xorhi)
-RI(ahi) RI(sfhi) RI(ceqhi) RI(cgthi) RI(clgthi)
-AI(andbi) AI(orbi) AI(xorbi) AI(ceqbi) AI(cgtbi) AI(clgtbi) RI(ceqbi) RI(cgtbi) RI(clgtbi)
-AI(mpyi) AI(mpyui) RI(mpyi) RI(mpyui)
-AI(shli) AI(shlhi) AI(roti) AI(rothi) AI(rotmi) AI(rotmhi) AI(rothmi) AI(rotmai) AI(rotmahi) RI(roti) RI(rothi) RI(rotmai) RI(rotmahi)
-AI(shlqbii) AI(rotqbii) AI(rotqmbii) AI(shlqbyi) AI(rotqbyi) AI(rotqmbyi) RI(shlqbyi) RI(rotqbyi) RI(rotqmbyi)
-AI(cbd) AI(chd) AI(cwd) AI(cdd) RI(cwd) AI(iohl)
-static V4 f_fsmbi(const G* g) { return st(spu_fsmbi(g->imm)); }
-static V4 f_il(const G* g)   { return st(spu_il(g->imm)); }
-static V4 f_ila(const G* g)  { return st(spu_ila((uint32_t)g->imm)); }
-static V4 f_ilh(const G* g)  { return st(spu_ilh((uint16_t)g->imm)); }
-static V4 f_ilhu(const G* g) { return st(spu_ilhu((uint16_t)g->imm)); }
-static V4 f_iohl_(const G* g) { return st(spu_iohl(ld(g->a), (uint16_t)g->imm)); }
+AI(ai, E_I10) AI(sfi, E_I10) AI(andi, E_I10) AI(ori, E_I10) AI(xori, E_I10) AI(ceqi, E_I10) AI(cgti, E_I10) AI(clgti, E_I10)
+RI(ai, E_I10) RI(sfi, E_I10) RI(andi, E_I10) RI(ori, E_I10) RI(xori, E_I10) RI(ceqi, E_I10) RI(cgti, E_I10) RI(clgti, E_I10)
+AI(ahi, E_I10) AI(sfhi, E_I10) AI(ceqhi, E_I10) AI(cgthi, E_I10) AI(clgthi, E_I10) AI(andhi, E_I10) AI(orhi, E_I10) AI(xorhi, E_I10)
+RI(ahi, E_I10) RI(sfhi, E_I10) RI(ceqhi, E_I10) RI(cgthi, E_I10) RI(clgthi, E_I10)
+AI(andbi, E_I10) AI(orbi, E_I10) AI(xorbi, E_I10) AI(ceqbi, E_I10) AI(cgtbi, E_I10) AI(clgtbi, E_I10)
+RI(ceqbi, E_I10) RI(cgtbi, E_I10) RI(clgtbi, E_I10)
+AI(mpyi, E_I10) AI(mpyui, E_I10) RI(mpyi, E_I10) RI(mpyui, E_I10)
+AI(shli, E_I7S) AI(shlhi, E_I7S) AI(roti, E_I7S) AI(rothi, E_I7S) AI(rotmi, E_I7S) AI(rotmhi, E_I7S) AI(rothmi, E_I7S) AI(rotmai, E_I7S) AI(rotmahi, E_I7S)
+RI(roti, E_I7S) RI(rothi, E_I7S) RI(rotmai, E_I7S) RI(rotmahi, E_I7S)
+AI(shlqbii, E_I7S) AI(rotqbii, E_I7S) AI(rotqmbii, E_I7S) AI(shlqbyi, E_I7S) AI(rotqbyi, E_I7S) AI(rotqmbyi, E_I7S)
+RI(shlqbyi, E_I7S) RI(rotqbyi, E_I7S) RI(rotqmbyi, E_I7S)
+AI(cbd, E_I7U) AI(chd, E_I7U) AI(cwd, E_I7U) AI(cdd, E_I7U) RI(cwd, E_I7U)
+static V4 f_fsmbi(const G* g) { return st(spu_fsmbi(E_I16U(g->imm))); }
+static V4 f_il(const G* g)   { return st(spu_il(E_I16S(g->imm))); }
+static V4 f_ila(const G* g)  { return st(spu_ila((uint32_t)E_I18(g->imm))); }
+static V4 f_ilh(const G* g)  { return st(spu_ilh((uint16_t)E_I16U(g->imm))); }
+static V4 f_ilhu(const G* g) { return st(spu_ilhu((uint16_t)E_I16U(g->imm))); }
+static V4 f_iohl_(const G* g) { return st(spu_iohl(ld(g->a), (uint16_t)E_I16U(g->imm))); }
 /* single precision */
 A2(fa) A2(fs) A2(fm) A3(fma) A3(fms) A3(fnms) A2(fceq) A2(fcgt) A2(fcmeq) A2(fcmgt) A2(fi) A1(frest) A1(frsqest)
 R2(fa) R2(fs) R2(fm) R3(fma) R3(fms) R3(fnms) R2(fceq) R2(fcgt) R2(fcmeq) R2(fcmgt) R2(fi) R1(frest) R1(frsqest)
-AI(cflts) AI(cfltu) AI(csflt) AI(cuflt) RI(cflts) RI(cfltu) RI(csflt) RI(cuflt)
+AI(cflts, E_I8) AI(cfltu, E_I8) AI(csflt, E_I8) AI(cuflt, E_I8) RI(cflts, E_I8) RI(cfltu, E_I8) RI(csflt, E_I8) RI(cuflt, E_I8)
 /* double precision */
-A2(dfa) A2(dfs) A2(dfm) A3(dfma) A3(dfms) A3(dfnms) A3(dfnma) A2(dfceq) A2(dfcmeq) A2(dfcgt) A2(dfcmgt) A1(frds) A1(fesd) AI(dftsv)
+A2(dfa) A2(dfs) A2(dfm) A3(dfma) A3(dfms) A3(dfnms) A3(dfnma) A2(dfceq) A2(dfcmeq) A2(dfcgt) A2(dfcmgt) A1(frds) A1(fesd) AI(dftsv, E_I7U)
 
 typedef struct {
     const char* name; V4 (*fn)(const G*); V4 (*ref)(const G*); const char* doms;

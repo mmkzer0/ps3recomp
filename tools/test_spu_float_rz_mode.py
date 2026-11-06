@@ -7,7 +7,7 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import spu_fixture_link  # noqa: E402
+import spu_fixture_link
 
 if os.name == 'nt':
     print('SKIP: fixture currently requires the POSIX compiler/linker')
@@ -29,9 +29,11 @@ with tempfile.TemporaryDirectory(prefix='spu-float-rz-mode-') as tmp:
         env = {k: v for k, v in os.environ.items()
                if not k.startswith(('SPU_', 'SPURS_', 'YDKJ_', 'LBP_', 'GH3_'))}
         env['SPU_FLOAT_RZ'] = rz
-        result = subprocess.run([str(binary)], capture_output=True, text=True,
+        result = subprocess.run([str(binary)], capture_output=True, text=True, check=False,
                                 timeout=10, cwd=tmp, env=env)
         print(result.stdout.strip())
+        if result.returncode == 77:     # the fixture's SKIP (non-arm64 host): visible, and not a failure of the tools loop
+            raise SystemExit(0)
         if result.returncode:
             print(result.stderr[-2500:])
             raise SystemExit(f'FAILED with SPU_FLOAT_RZ={rz}')

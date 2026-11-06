@@ -4,11 +4,12 @@
  * ORACLE: rpcs3_oracle/ compiles rpcs3/rpcs3/Emu/Cell/SPUInterpreter.cpp's per-instruction
  * functions unmodified (see rpcs3_oracle/extract.py) against a stub spu_thread, decoded with
  * RPCS3's own spu_decoder. Integer/logical/shift/shuffle/memory/branch/channel ops and
- * FREST/FRSQEST/FI are RPCS3's live ("fast") interpreter functions; the floating-point
+ * FREST/FRSQEST are RPCS3's live ("fast") interpreter functions; the floating-point
  * arithmetic/compare/convert and double-precision ops are RPCS3's spu_interpreter_precise::*
  * implementations (the exact-semantics float path: round-toward-zero, denormal flush, extended
  * range). That block is `#if 0` dead code in this RPCS3 snapshot; extract.py enables it.
- * FI is a port of the SPU LLVM recompiler's spu_fi intrinsic (the interpreter's FI is a TODO).
+ * FI is not compared: RPCS3's interpreter FI is unimplemented (0 trials). The float-estimate checks are
+ * spu_fi_ref and the AVX2-vs-ref comparison in test_spu_float_est.c.
  * Ops RPCS3 does not implement (dfceq/dfcgt/dfcmeq/dfcmgt) fall back to the hand-written ISA
  * reference below (ref_exec); so does dftsv (RPCS3 stubs it as fatal), checked against the Cell SPU ISA.
  * --audit compares that hand-written reference with RPCS3 itself (they agree on every integer op;
@@ -319,13 +320,14 @@ static Ref ref_exec(int op, uint32_t insn, uint32_t pc, const u128* regs, const 
     case R_FCGT: LANE4(f_of(a) > f_of(b) ? ~0u : 0); break;
     case R_FCMEQ: LANE4(fabsf(f_of(a)) == fabsf(f_of(b)) ? ~0u : 0); break;
     case R_FCMGT: LANE4(fabsf(f_of(a)) > fabsf(f_of(b)) ? ~0u : 0); break;
-    /* f_of is a raw IEEE bit-cast, so an exponent-255 word with a fraction is a NaN here. Casting it
-     * is undefined (0 or 0x80000000 or 0xFFFFFFFF by target and -march), so the reference pins it to 0:
-     * what AArch64 fcvtz* does and what the x86-64-v3 build happened to give. */
+    /* f_of is a raw IEEE bit-cast, so an exponent-255 word with a fraction is a NaN here. The SPU has no NaN:
+     * exponent 255 is an extended-range magnitude (>= 2^128, still >= 2^46 after the largest down-scale), so
+     * every such word saturates by its sign bit, fraction or not. Casting the NaN would be undefined
+     * (0 or 0x80000000 or 0xFFFFFFFF by target and -march), so the reference takes the sign from the word. */
     case R_CFLTS: for (i = 0; i < 4; i++) { double v = trunc((double)f_of(W(A,i)) * ldexp(1.0, 173 - (int)i8));
-            sw(&r, i, v != v ? 0u : v >= 2147483648.0 ? 0x7FFFFFFFu : v <= -2147483649.0 ? 0x80000000u : (uint32_t)(int32_t)v); } break;
+            sw(&r, i, v != v ? (W(A,i) >> 31 ? 0x80000000u : 0x7FFFFFFFu) : v >= 2147483648.0 ? 0x7FFFFFFFu : v <= -2147483649.0 ? 0x80000000u : (uint32_t)(int32_t)v); } break;
     case R_CFLTU: for (i = 0; i < 4; i++) { double v = trunc((double)f_of(W(A,i)) * ldexp(1.0, 173 - (int)i8));
-            sw(&r, i, v != v ? 0u : v >= 4294967296.0 ? 0xFFFFFFFFu : v <= 0 ? 0 : (uint32_t)v); } break;
+            sw(&r, i, v != v ? (W(A,i) >> 31 ? 0u : 0xFFFFFFFFu) : v >= 4294967296.0 ? 0xFFFFFFFFu : v <= 0 ? 0 : (uint32_t)v); } break;
     case R_CSFLT: R.fuzzy = 1; for (i = 0; i < 4; i++) sw(&r, i, u_of((float)((double)(int32_t)W(A,i) * ldexp(1.0, (int)i8 - 155)))); break;
     case R_CUFLT: R.fuzzy = 1; for (i = 0; i < 4; i++) sw(&r, i, u_of((float)((double)W(A,i) * ldexp(1.0, (int)i8 - 155)))); break;
     /* double precision (IEEE nearest-even, fused FMA) */
