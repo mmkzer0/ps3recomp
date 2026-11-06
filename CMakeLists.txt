@@ -501,6 +501,10 @@ endif()
 # SPIR-V, so spirv-cross is not needed. Without glslang
 # libs/video/rsx_shader_spirv.cpp is a stub and the Vulkan backend stays on
 # its fixed-function path.
+# CI sets PS3RECOMP_SPIRV_REQUIRED=ON so a lost glslang is a configure error,
+# not a silently stubbed translator.
+option(PS3RECOMP_SPIRV_REQUIRED
+       "Fail configuration when PS3RECOMP_RSX_VULKAN cannot build the SPIR-V translator" OFF)
 if(PS3RECOMP_RSX_VULKAN)
     if(glslang_FOUND AND TARGET glslang::glslang AND TARGET glslang::SPIRV)
         set_source_files_properties(
@@ -515,6 +519,9 @@ if(PS3RECOMP_RSX_VULKAN)
         message(STATUS "  Vulkan:       guest programs available (glslang ${glslang_VERSION}); "
                        "opt in with PS3RECOMP_VK_GUEST_PROGRAMS=1")
     else()
+        if(PS3RECOMP_SPIRV_REQUIRED)
+            message(FATAL_ERROR "Vulkan guest programs need glslang (apt: glslang-dev glslang-tools spirv-tools)")
+        endif()
         message(STATUS "  Vulkan:       glslang not found; guest programs unavailable")
     endif()
 endif()

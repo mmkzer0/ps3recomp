@@ -120,7 +120,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ~/apt-archives
-          key: apt-ubuntu-24.04-v1
+          key: apt-ubuntu-24.04-v2
       - name: Install dependencies
         id: apt-install
         # The runners' Ubuntu mirror is at times very slow or hangs: on
@@ -134,7 +134,7 @@ jobs:
           mkdir -p "$HOME/apt-archives/partial"
           APT="-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"
           APT="$APT -o Dir::Cache::Archives=$HOME/apt-archives"
-          PKGS="ninja-build libsdl2-dev clang lld g++-14 glslang-dev glslang-tools spirv-tools
+          PKGS="ninja-build libsdl2-dev libvulkan-dev clang lld g++-14 glslang-dev glslang-tools spirv-tools
                 libspirv-cross-c-shared-dev gcc-powerpc64-linux-gnu g++-powerpc64-linux-gnu
                 binutils-powerpc64-linux-gnu"
           ok=0
@@ -153,12 +153,16 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ~/apt-archives
-          key: apt-ubuntu-24.04-v1
+          key: apt-ubuntu-24.04-v2
       - name: Configure
         # The synthetic synlib variants require the PowerPC64 cross toolchain
         # installed above: a missing one is a configure error here, never a
-        # silently skipped suite.
-        run: CC=${{ matrix.cc }} CXX=${{ matrix.cxx }} cmake --preset dev -DPS3RECOMP_DIFF_SYNTHETIC_REQUIRED=ON
+        # silently skipped suite. The Vulkan backend has no CI GPU, so it is
+        # built only; its SPIR-V translator must not fall back to the stub.
+        run: >-
+          CC=${{ matrix.cc }} CXX=${{ matrix.cxx }} cmake --preset dev
+          -DPS3RECOMP_DIFF_SYNTHETIC_REQUIRED=ON
+          -DPS3RECOMP_RSX_VULKAN=ON -DPS3RECOMP_SPIRV_REQUIRED=ON
       - name: Build
         run: cmake --build --preset dev
       - name: Test
