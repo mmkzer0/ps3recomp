@@ -1,0 +1,203 @@
+# Upstream divergences
+
+This is the register of where `dev` deliberately differs from upstream
+(`sp00nznet/ps3recomp`). Each row says what upstream does, what `dev` does,
+how well the `dev` side is evidenced, and where to look.
+
+## How to use it at a sync
+
+- Before resolving a hunk, find the area it touches in the tables below. If a
+  row covers it, the row decides. Keep the `dev` side, then port the upstream
+  change into it where the change is an improvement.
+- A hunk in a listed area that no row decides is new. Decide it with the
+  evidence order below and add a row in the same commit.
+- A change that introduces a new divergence adds its row in that commit. A
+  reviewer rejects the change without the row.
+- Remove a row when upstream adopts the `dev` behaviour. Move it to
+  [Converged](#converged) with the sync that settled it.
+- A row with tier `INF` or `RULE` and a pending issue is also listed under
+  [Open questions](#open-questions). Do not read such a row as verified.
+- The register holds no title material. Rows name issues, tests, files and
+  commits, never a title, a guest address or a hash of a title binary.
+
+## Evidence tiers
+
+Order of authority, highest first. Firmware wins over RPCS3.
+
+| Tier | Meaning |
+|---|---|
+| `FW` | Firmware reverse engineering (static read of the retail modules or the stock kernel syscall map). |
+| `HW` | A probe on a real console under `tools/hwprobe/`: `lv2conf` (syscall conformance), `spuexh` (SPU instruction sweep), `ring110` (audio ring). |
+| `RPCS3` | The RPCS3 oracle at the pinned commit (`d00d8023`). |
+| `RULE` | A repo rule, not a claim about the console: fail closed (named stop), guest span check before first access, no title answers, behaviour in typed config, no data races. |
+| `INF` | Inference, design choice or host measurement. No firmware, console or RPCS3 oracle backs the exact behaviour. |
+
+Columns: `Since` is the sync that first decided the row. `PR` says whether the
+`dev` behaviour is a candidate for an upstream pull request: `yes`, `later` or
+`no`, with one word for why.
+
+## Fork-wide contracts
+
+These apply to every hunk in every area. They are the reason many rows below
+exist.
+
+| ID | Area | Upstream does | dev does | Tier | Evidence | Since | PR |
+|---|---|---|---|---|---|---|---|
+| ALL-1 | Named stops | Logs and continues, clamps, halts the thread, or returns an invented code on an unmodelled or invalid case. v0.19.0 has no stop machinery. | Ends the run with a named stop (kind plus fields) and flushes both standard streams first. | `RULE` | `docs/STOPS.md`, `tests/gates/test_stop.py`, `1b535470` (#54) | v0.18.0 | no: fork architecture |
+| ALL-2 | Typed config | Reads behaviour from `getenv`. | Behaviour lives in `include/ps3emu/config_options.def`. A new behavioural `getenv` is converted or rejected. Diagnostic and host-display knobs may stay environment. | `RULE` | `docs/CONFIG.md`, `tests/gates/test_config.py`, #55 | v0.18.0 | no: fork architecture |
+| ALL-3 | Guest spans | Dereferences guest pointers with no span check in several handlers. | Checks the whole span before the first access and stops with `hle-guest-range` outside guest memory, after the firmware's own null and alignment checks. | `RULE` | `docs/STOPS.md`, #76, #25, row HLE-4 | v0.19.0 | yes: generic |
+| ALL-4 | Title answers | Carries answers and repairs written for one title (compat return values, title-prefixed env switches). | No title-specific answer in the toolkit. A title that needs one carries it in its own port. | `RULE` | #48, #55, #56, row HLE-2 | v0.18.0 | no: policy |
+
+## SPU
+
+| ID | Area | Upstream does | dev does | Tier | Evidence | Since | PR |
+|---|---|---|---|---|---|---|---|
+| SPU-1 | DP compares and `dftsv` (#124) | Decodes `dfceq`, `dfcmeq`, `dfcgt`, `dfcmgt` and `dftsv`; the interpreter and lifter compute a result. | The five decode as `.word`. The interpreter stops at the word's pc (unimplemented op). The lifter emits the same named stop. The helpers and sweep rows are gone. | `HW` | `spuexh` special probe A: join cause 4, exit status `0x8001000F`. #124, `c21c9000`, tests `spu_decode`, `spu_interp_loop`, `tools/test_spu_lifter_invalid_dp.py` | v0.19.0 | yes: console evidence |
+| SPU-2 | `fesd` denormal sign (#125) | A negative denormal single extends to +0.0. | It extends to a zero of its own sign (-0.0). | `HW` | `spuexh` sweep, 70 lanes. #125, `56f656df`, test `spu_numeric_semantics`, `runtime/spu/tests/oracle_exhaustive.py` | v0.19.0 | yes: console evidence |
+| SPU-3 | `cflts`/`cfltu` scale rule (#126) | The pre-#126 model: an exponent-0 input converts to 0 at every scale. NEON `fi` and `cflts` are adopted from upstream (#677). | An exponent-0 input saturates on the shift amount, as the console does: `cflts` at shift 8 or more, `cfltu` at 9 or more. At I8 14 and below the interpreter and the lifter stop with `unmodelled cflts/cfltu scale (I8=N, #126)`. Any helper taken from upstream must keep this rule; NEON `cflts` agrees with the #126 reference over 5.6M vectors. | `HW` | `spuexh` lanes r007 and r008. #126, `3bfd7a0c`, tests `spu_numeric_semantics`, `spu_interp_loop`, `tools/test_spu_lifter_cfl_scale.py`. The rule is fitted from data, so its mechanism is inference. | v0.19.0 | later: mechanism unproven below I8 15 |
+| SPU-4 | Reservation and coherency (#668, v0.18.0 bitmap) | A second reserved-line bitmap (`spu_coh_bitmap.h`), an inline store test in lifted stores, a lock-free GETLLAR and `ppu_resv_break_line`. | `runtime/memory/reservation.h` (per-line epoch, lock-line lock, label-window store hook) is the only authority. The bitmap, the lock-free GETLLAR and the inline test are removed. Every lifted store goes out of line. | `RULE` | One authority. The bitmap was published with a plain store and set with a plain read-modify-write (read from the code). `97cfb2d6`, #57, tests `tests/reservation`, `tools/test_spu_context_registries.py`. Limits 1 to 4 in `reservation.h` stay open: #2, #35, #57, #58. | v0.18.0 | later: line-granular epochs need the race proof first |
+| SPU-5 | Interpreter dispatch | The generic interpreter on the 2048-entry decode table (#688). | One dispatch per instruction, per-form operand macros, `pc` and `steps` in registers. Same table, regenerated byte for byte; the drift check passes. | `INF` | `a5146cde`, tests `spu_decode` (executes one instruction per immediate form), `spu_interp_loop`. The speedup was measured on one title replay, not on the console. | v0.19.0 | later: needs a workload and variance |
+| SPU-6 | DMA repeat watchdog | Telemetry, back-off and a per-thread episode clock. A repeated transfer can halt the process after a deadline. | Typed keys `spu.dma_repeat_limit` and `spu.dma_repeat_stop_secs` (default 0: the episode never halts). A repeated transfer is not proof of a deadlock. The back-off is upstream's: yield for 2 ms, then sleep 1 ms per repeat. | `RULE` | `include/ps3emu/config_options.def`, `docs/CONFIG.md`, `tools/test_spu_dma_repeat.py` | v0.18.0 | later: telemetry only |
+| SPU-7 | SPU writes into the RSX label window (#34, #51) | The label window state lives in the PPU loader. An SPU PUT, PUTL or atomic line store into it is not seen. | The window moved to the runtime library. A PUT or PUTL overlapping it, and PUTLLC, PUTLLUC or PUTQLLUC on an overlapping line, end in `spu-label-window` before any byte moves. | `RULE` | `e1050053`, `1d9dfd10`, `tools/test_spu_label_window.py`, `docs/STOPS.md` | v0.18.0 | no: window state is fork-owned |
+| SPU-8 | CellSpurs2 and Taskset2 guest-range failures (#629) | Answers a guest-range failure with the SPURS error code `0x8041090D`. | A bad span is a `ps3_stop_guest_range` stop. The firmware codes of dev's SPURS surface are kept. Workload ids are bounded by `SPURS_MAX_WID`. | `RULE` | `libs/spurs/cellSpurs.c`, `tests/test_spurs_error_codes.c`, `tests/spu_kernel_range` | v0.19.0 | yes: generic |
+| SPU-9 | MFC lookup cache (#88) | Opt-in through the environment switch `SPU_MFC_LOOKUP_CACHE`. | Typed key `spu.mfc_lookup_cache`, default on. | `INF` | `5fbbf5ec`, `2765c575`, #88 (the read-lock was 22 percent of SPU-worker samples in one measurement) | v0.18.0 | later: needs a before and after run |
+
+## lv2 and PPU runtime
+
+| ID | Area | Upstream does | dev does | Tier | Evidence | Since | PR |
+|---|---|---|---|---|---|---|---|
+| LV2-1 | `sys_ppu_thread_exit` slot (#86) | Registers it at slot 42, which is ENOSYS on the retail kernel. | Registers it at slot 41. Slot 42 stays ENOSYS. | `FW` | Stock kernel syscall map in `docs/LV2-SYSCALL-STATUS.md`. #86, `996fe022` | v0.19.0 | yes: slot identity |
+| LV2-2 | lwmutex and lwcond | `sys_lwmutex_*` and `sys_lwcond_*` in `runtime/ppu/ppu_sysprx.cpp`. `signal`, `signal_all` and `signal_to` answer 0 and wake nobody; `wait` is poll-style. | `runtime/syscalls/sys_lwsync.cpp` is the one authority: layout, ownership, recursion, waiter queues, `CELL_EPERM` order, real wakeups, EBUSY on trylock and destroy. The `ppu_sysprx.cpp` lwmutex hunks stay deleted. | `FW` | Decision text in `docs/RUNTIME.md` ("lwmutex and lwcond"). Tests `tests/lwsync`, ctest labels `sync2` and `runtime`. The FW read is cited by the v0.18.0 plan, not stored in the tree. | v0.18.0 | yes: uncontended fast path with fallback |
+| LV2-3 | Process primary priority and `PT_PROC_PARAM` (#651) | A separate block sets the primary priority and `continue`s before dev's SDK-version handler, so the SDK version fell back to the default. | One block handles SDK version and primary priority (0 to 3071; main defaults to 1001). | `INF` | Test `proc_param_sdk_version`, fixture `ppu_primary_priority` | v0.19.0 | no: integration |
+| LV2-4 | Guest null page | Logs `[null-read]` and returns what the flat VM held, or logs `[null-write]` and drops the store. | A load below `0x10000` or a store below `0x1000` stops with `guest-null-access`. `ppu.null_page = "drop"` keeps the old handling. | `RULE` | `docs/STOPS.md`, `docs/CONFIG.md` | v0.18.0 | no: fork stop kinds |
+| LV2-5 | Guest call completion (#652) | `ppu_guest_call_ct_checked` separates a completed call from a missing callback and returns 0 for the latter. | The checked API is kept, but a missing or zero callback is a named stop (`unresolved-guest-callback`), never a skip. | `RULE` | `tools/test_guest_call_completion.py`, `runtime/ppu/ppu_loader.cpp` | v0.19.0 | later: stop kinds are ours |
+| LV2-6 | HLE NID cache (#634) | Per-thread slot cache over upstream's NID table (`g_hle_nids`). | The same cache rebuilt on dev's private `g_hle[]` table; the cache generation `g_fn_gen` is bumped on every registration. | `INF` | `runtime/ppu/ppu_hle.cpp` | v0.19.0 | no: table differs |
+| LV2-7 | `vmx_fmaf` (#674) | Native `fmaf` only where `__FMA__` is defined. | Native `fmaf` on arm64 too (the double path is slower on Apple Silicon). | `INF` | `runtime/ppu/ppu_vmx.h`, test `vmx_fmaf` | v0.19.0 | yes: arm64 only |
+| LV2-8 | Slot bindings and `CELL_OK` stubs (#96) | Same as dev: slot 820 is bound to `sys_fs_ftruncate` (the firmware has `fsync` there). `sys_memory_container_*` is registered at 350 after #644. | Unchanged from upstream. The other mismatches (containers, stubs, slot 832) are listed in `tests/syscalls/lv2conf/divergences.txt` under #96. | `FW` | #96 (open), `docs/LV2-SYSCALL-STATUS.md`, test `lv2conf_conformance` | v0.19.0 | yes: after the rebind |
+
+## lv2 answers inherited from upstream that the console contradicts
+
+These handlers are upstream's lineage. No case-by-case comparison with
+upstream was made; what is recorded is that `dev` answers differently from the
+console. The hardware probe `lv2conf` is the evidence. Each line is tracked in
+`tests/syscalls/lv2conf/divergences.txt`; the ctest fails when a listed case
+stops differing, so a fix must remove its lines. A sync must not take upstream
+changes that move a case away from `tests/syscalls/lv2conf/golden.csv`.
+
+| ID | Area | Upstream does | dev does | Tier | Evidence | Since | PR |
+|---|---|---|---|---|---|---|---|
+| INH-1 | NULL out-pointers (#114) | Not compared. | Succeeds and may create the object. The console answers EFAULT (`0x8001000d`) and leaves outputs untouched. | `HW` | #114, `lv2conf` golden | v0.19.0 | yes: after fix |
+| INH-2 | Sync object attributes (#115) | Not compared. | Accepts protocol, recursive, pshared, type, size and mode values the console rejects with EINVAL. | `HW` | #115 | v0.19.0 | yes: after fix |
+| INH-3 | Process object syscalls 12, 13, 18 (#116) | Not compared. | Unimplemented: a guest call stops with `unimplemented-syscall`. The console counts and lists live objects. | `HW` | #116 | v0.19.0 | yes: after fix |
+| INH-4 | rwlock states and slots (#117) | Not compared. | A timed `wlock` under a reader, state checks and `trywlock` at slot 126 differ from the console. The destroy, unlock and timed-rlock cases moved toward the golden with #621 (row SYNC-2). | `HW` | #117 | v0.19.0 | yes: after fix |
+| INH-5 | Event port and queue state (#118) | Not compared. | Missing connection-state checks, default source 0, different receive errors. Destroy modes and "port outlives queue" moved toward the golden with #622 (row SYNC-1). | `HW` | #118 | v0.19.0 | yes: after fix |
+| INH-6 | Mutex, cond and event flag (#119) | Not compared. | Mutex destroy with a bound cond, `signal_to` on a missing thread, event flag trywait output and `sys_event_flag_cancel` differ. The non-recursive trylock relock moved toward the golden with #621. | `HW` | #119 | v0.19.0 | yes: after fix |
+| INH-7 | Memory, timer, ppu_thread arguments (#120) | Not compared. | Size, flag, alignment, page attribute, timer and priority checks differ; `sys_timer_get_information` is missing. `access_right` is a constant (#46). | `HW` | #120, #46 | v0.19.0 | yes: after fix |
+| INH-8 | Timed waits on the wall clock (#128) | The same: `CLOCK_REALTIME` in `sys_cond.c`, `sys_event.c`, `sys_mutex.c`, `sys_semaphore.c`, `sys_timer.c` at v0.19.0. | The deadline of event-queue receive, semaphore wait and condition wait is built on `CLOCK_REALTIME`. A host clock step changes a relative guest timeout. | `INF` | #128 (open), `runtime/syscalls/sys_event.c`, `sys_semaphore.c`, `sys_cond.c` | v0.19.0 | later: fix first |
+| INH-9 | Error answers without provenance (#127) | Brought them in with v0.19.0. | Kept unchanged. See [Open questions](#open-questions) for the list. | `INF` | #127 (open), `libs/codec/cellSail.c`, `libs/network/sceNpBasic.c`, `libs/spurs/cellSpurs.c` | v0.19.0 | later: after firmware RE |
+| INH-10 | Success answers for work not done | `sceNpSignalingDeactivateConnection`, `cellSpursAttributeEnableSystemWorkload`, `cellSpursSetMaxContention` (clamps instead of `CELL_SPURS_CORE_ERROR_INVAL`), the `cellAdec` silence fallback (`CELL_OK` with a silent block when no decoder is present). | Kept unchanged. | `RULE` | `libs/network/sceNpSignaling.c`, `libs/spurs/cellSpurs.c`, `libs/codec/cellAdec.c`, #130 | v0.19.0 | later: stop or model |
+| INH-11 | Shared state left as upstream wrote it | `s_spu_threads[].running` read through `volatile` where it gates a free, unlocked `s_ctx` and `s_conn` tables, a `volatile` tile mask. | Kept unchanged. | `RULE` | `runtime/syscalls/lv2_register.c`, `libs/network/sceNpSignaling.c`, `libs/video/rsx_tiling.c`, #131 | v0.19.0 | later: after a TSan run |
+
+## Sync and concurrency
+
+| ID | Area | Upstream does | dev does | Tier | Evidence | Since | PR |
+|---|---|---|---|---|---|---|---|
+| SYNC-1 | Event queue destroy modes (#622) | FORCE destroy retires a queue while a receiver or a timer send sits between its unlocked active check and the queue lock. A create can reuse the slot. | Every queue operation pins its slot to completion. FORCE destroy waits for the pins before it destroys the primitives or frees the slot. `timer_send_event` takes the same admission. | `RULE` | `978b3125`, test `event_queue_destroy` (t0, tsan) | v0.19.0 | yes: generic |
+| SYNC-2 | Semaphore and rwlock destroy (#621) | Decides "nobody blocked" from counts, so a destroy after a post can free a mutex the woken waiter holds. | Calls pin the slot through return. Destroy answers EBUSY while one is in flight. | `RULE` | `a6f26600`, test `sync_semantics` (t0, tsan) | v0.19.0 | yes: generic |
+| SYNC-3 | rwlock timed acquire at the deadline | Checks the lock before the clock after a sleep, so it can succeed past the deadline. | Times out once the deadline has passed. A try that succeeds exactly at the deadline wins. The tie rule is inference. | `INF` | `a6f26600`, test `sync_semantics` | v0.19.0 | later: tie needs firmware evidence |
+| SYNC-4 | Report hold and taskset registration (#635) | A signalled task clears its signal bit before it leaves the parked set. The busy query reads without the writers' synchronisation. Two `spu_taskset_register` calls can publish into one slot. The round slot is claimed without CAS. | The task leaves the parked set first. The query reads the slots atomically and the signal bit under the line lock. Registration publishes under its lock. The round slot is claimed by CAS. The hold is keyed on slot class NV4097 and decided before a capture step opens. | `RULE` | `41273d77`, test `spu_report_hold` (tsan), `libs/video/cellGcmSys.c` | v0.19.0 | yes: after the typed key |
+| SYNC-5 | PPU thread join and detach (#623) | Windows fix for a FINISHED-state race. A bounded wait on the host thread. | The lv2 state machine: joiner state `JOINABLE`, `JOINING(tid)`, `DETACHED`, slot states `RUNNING`, `ZOMBIE`, `FREE`. The epilogue's last slot access is one section under the table lock; exactly one party reaps. The upstream test `tests/syscalls/test_ppu_thread_join.c` is not built. The bounded wait is not adopted and is unverified on Windows. | `RULE` | `99d65a2d`, test `tests/test_ppu_thread_join_detach.c`, `runtime/syscalls/sys_ppu_thread.h` | v0.19.0 | no: model differs |
+| SYNC-6 | `sync_stress` stamps (#627) | 32-bit stamps with a modulo. | 64-bit stamps read with `ReadAcquire64`. | `RULE` | `c5b35723`, `tests/sync_stress/main.c` | v0.19.0 | no: dev's is not modular |
+| SYNC-7 | HLE to guest callback stack | A per-host-thread slab. When threads outnumber slots, the last slot is shared after one log line. | `ppu_cb_entry_sp`: per activation, the active guest context keeps its own `r1`, a slot is returned when its host thread exits, and exhaustion is a named stop. | `RULE` | `b3a75d98`, `48958fef`, `docs/RUNTIME.md` (host callback stack window), ctest label `ppu` | v0.18.0 | later: slot recycling only |
+
+## GCM, RSX and video
+
+| ID | Area | Upstream does | dev does | Tier | Evidence | Since | PR |
+|---|---|---|---|---|---|---|---|
+| GCM-1 | Command ring (#566, #648) | `GCM_FIFO_SEGMENT` hands the ring out in segments; the context end is a JUMP slot. | The ring built from the firmware's `InitBody` layout (`GcmIb`) is the default and subsumes #648. The environment switch, `s_seg_size` and `gcm_fifo_next_segment` are not carried. | `FW` | `3fa006f2`, `libs/video/cellGcmSys.c` (`gcm_segment_switch`), test `gcm_fifo_jump` (adapted to the ring start) | v0.19.0 | later: after the flip-identity measurement |
+| GCM-2 | Flip insertion on a full segment | Closes the segment when a flip is inserted. | A full segment keeps the immediate-flip fallback. | `INF` | `libs/video/cellGcmSys.c` (`gcm_flip_into_fifo` returns 0 on no room). The segment close waits for a flip-identity measurement. | v0.19.0 | later: measurement |
+| GCM-3 | `cellGcmSetWaitFlip` (#77) | Takes no context, enqueues nothing, sleeps the PPU up to 64 times 1 ms. | Takes the context and enqueues the NV406E acquire, advancing `current` by 16, with the buffer-full callback. Flip completion releases the label. The upstream CPU-bound block in the flip-status test is dropped. | `FW` | #77, `38dcb00f`, `tests/gcm_initbody/test_setwaitflip.c` | v0.18.0 | yes: firmware shape |
+| GCM-4 | Handler mask word (#68) | Rebuilds the whole word from three slots (`gcm_update_handler_mask`) with the flip bit at `0x04`. | Start value 4. One bit per setter, set or cleared by a compare-and-swap loop: vblank `0x2`, flip `0x10`, second vblank `0x800`, queue `0x40`, user `0x80`. Foreign bits survive. | `FW` | #68, `5a470174`, `libs/video/tests/test_gcm_handler_mask.c` | v0.18.0 | yes: firmware shape |
+| GCM-5 | Handler delivery (#70, #56) | A handler OPD with a zero code word logs "not registered" and the callback never fires. | The named stop `unresolved-guest-callback` (origin `opd`). A completed flip gets `r3 = 1`. | `FW` | #70, #56, `580d28c3`, `libs/video/tests/test_gcm_handler_contract.c` | v0.18.0 | yes: make the symptom loud |
+| GCM-6 | Method class routing (#47) | `gcm_3d_method` keeps fixed subchannel guards (`GCM_SUBCH1_2D`). | A method is interpreted in the class `SET_OBJECT` bound on its subchannel. NV0039 and the 2D classes never reach the NV4097 register file. A write on an unbound slot is dropped before it is interpreted. The driver words are decoded by full address first. `GCM_SUBCH1_2D` and `GCM2D_DBG` are removed. | `INF` | Measured on a census: a 2D class wrote the colour and depth surface handles every flip. #47, `ddf76ac4`, test `gcm_class_routing`, `docs/RSX_GRAPHICS.md` | v0.18.0 | yes: poisoning test |
+| GCM-7 | NV0039 and NV308A transfers (#569) | `gcm_store` and `gcm_row_copy`. | `gcm_row_store` and the modelled `gcm_nv308a_color`, with the tile write ported into them. NV0039 copies are not tiled on either side. | `INF` | `libs/video/cellGcmSys.c`, `tools/test_nv3089_engine_read.py` | v0.19.0 | no: functions differ |
+| GCM-8 | Tiled main memory (#569) | Every RSX access to tiled main memory is detiled. | Same, but a capture open ends a tiled access in the stop `rsx-capture` (`tiled-main-memory`), because the `ps3diff.rsx/1` schema has no tile table. Detiled reads never go through the capture sink. | `RULE` | `libs/video/rsx_draw_engine.c` (`eng_cap_tiled_stop`), tools tests `test_rsx_tiling.py`, `test_rsx_capture_engine` | v0.19.0 | later: tile table in the schema |
+| GCM-9 | Draw accounting | `sink_end` as upstream orders it (a hunk resolved by hand in the v0.19.0 sync). | `eng_submitted` and `eng_arena_reset` run before any early drop, so `submitted = executed + dropped` holds. | `RULE` | `libs/video/rsx_draw_engine.c`, `libs/video/tests/test_rsx_draw_accounting.c` | v0.19.0 | no: accounting is ours |
+| GCM-10 | Metal drawable size | Syncs the drawable size with no display-skip check ahead of it. | Syncs it before `eng_display_view`, otherwise the display-skip check (#94) never applies a resize on a still frame. | `INF` | `libs/video/rsx_metal_backend.m` (`eng_sync_drawable_size`), #94 | v0.19.0 | later: depends on #94 |
+| GCM-11 | VideoOut resolution ids (#642) | Ids from `0x80` up are unavailable. | The config-restricted list, and ids from `0x80` up are never available. | `INF` | `libs/video/cellVideoOut.c`, test `video_resolutions` | v0.19.0 | yes: combined rule |
+| GCM-12 | Depth state census | No method census. | Row `0x1D78` is HANDLED (the engine reads it, it was INERT); the census test moves from 43 and 178 to 44 and 177. | `INF` | `libs/video/rsx_dispatch.c`, test `gcm_class_routing` | v0.19.0 | no: census is ours |
+| GCM-13 | D3D12 and Windows-only changes | D3D12 backend PRs (#600, #617, #618, #669, #695) and the Windows paths in them. | Merged unbuilt. This host builds Metal and the null backend. | `INF` | `CHANGELOG.md` v0.19.0 sync entry ("D3D12 PRs are not built here") | v0.19.0 | no: not exercised |
+| GCM-14 | Vblank handler argument (#69) | Passes the vblank count in `r3`. | Same, inherited. The firmware passes the head index (0 or 1). | `FW` | #69 (open) | v0.18.0 | yes: after fix |
+
+## HLE modules
+
+| ID | Area | Upstream does | dev does | Tier | Evidence | Since | PR |
+|---|---|---|---|---|---|---|---|
+| HLE-1 | `cellGamePatchCheck` | Ignores both arguments and answers NOTPATCH. | Validates first (a reserved argument or NULL size is `PARAM`), then answers NOTPATCH. The runtime never boots a title as a patch. The source comment cites the firmware order; no firmware address is stored in the tree. | `FW` | `cbd083e4`, `tools/test_game_patchcheck.py` | v0.19.0 | yes: small |
+| HLE-2 | `cellSysutilNpEulaCheck` (#616) | Registers a compat answer: "accepted", callback ignored, no EULA state, written for one title. | Not registered. An import stops at the unresolved NID. The callback-based EULA status check stays. | `RULE` | `05c1621d`, `tests/check_hle_unregistered.py`, `docs/ONLINE.md` | v0.19.0 | yes: removal |
+| HLE-3 | `_sys_heap_delete_heap` (#625) | Returns `CELL_OK` and frees nothing. | Blocks record their heap; deleting or destroying a heap returns them to the free lists. An unknown id is ESRCH. | `RULE` | `c0463fc4`, `tests/test_mmapper_hle_heap.c` | v0.19.0 | yes: generic |
+| HLE-4 | Spans on v0.19.0 handlers | No span check in the `sceNpSignaling` handlers, the AC3 access unit and info block, `cellFsAioWrite` (it clamped an out-of-arena span), the `sys_memory` container out-pointers, `sys_spu_thread_get_spu_cfg`, the SPURS kernel's workload copy and `_cellSpursWorkloadFlagReceiver`. | Each span is checked before the first access: `hle-guest-range`, after lv2's own argument checks. `cellFsAioWrite`: NULL buffer is EFAULT, a span outside the arena is a stop, a bad fd is `CELL_FS_EBADF`. | `RULE` | `44272160`, `3239ce65`, `e8d47687`, `71d15884`, `df091854`; tests `np_signaling_rooms`, `adec_ac3_stub`, `test_fs_aio`, `test_user_memory_domain`, `spu_kernel_range`. Other modules stay open: #76, #25. | v0.19.0 | yes: generic |
+| HLE-5 | cellSaveData results (#48) | `AutoLoad` and `AutoLoad2` turn NODATA into `CELL_OK`, a compat return added for one title. A funcStat result `-4` becomes NODATA. | A funcStat result `-4` is `CBRESULT`, like every negative result. No `CELL_OK` mapping. The PARAM checks and `fileList` follow the firmware. | `FW` | #48, `ee585b0a`, test `savedata_cbresult` | v0.18.0 | yes: removal of the compat return |
+| HLE-6 | cellPad port checks (#60) | `CELL_PAD_ERROR_NO_DEVICE` is `0x80121105` and `CELL_MAX_PADS` is 7. | `NO_DEVICE` is `0x80121107`, `CELL_MAX_PADS` is 127. `GetData` and `ClearBuf` answer `INVALID_PARAMETER` only for a port above 126 or a NULL buffer, and `NO_DEVICE` for a port not connected. | `FW` | #60, `db7b09b0`, `libs/input/tests/test_pad_file_reports.c` | v0.18.0 | yes: first PR candidate |
+| HLE-7 | sceNpTrophy codes and registration (#37) | The invented `0x805516xx` family (`INVALID_ARGUMENT` is `0x80551603`). | The firmware's `0x800229xx` codes. `RegisterContext` blocks and its statuses arrive from `cellSysutilCheckCallback`, queued gradually. | `FW` | #37, `59f6a736`, `365fd411`, `libs/network/tests/test_trophy_errors.c`, `test_trophy_registration.c` | v0.18.0 | yes: firmware values |
+| HLE-8 | cellSysutilAvc2 (#689) | `Load` and `LoadAsync` store the callback and queue a synthetic `LOAD_SUCCEEDED`. `Unload` queues `UNLOAD_SUCCEEDED`. Six setters return `CELL_OK` and ignore their arguments. | Same file, unchanged. Kept as a documented model: voice chat loads, joins and streams, but carries no audio. | `RULE` | `libs/network/cellSysutilAvc2.c`, `docs/ONLINE.md`. It breaks the fake-success rule. See open questions. | v0.19.0 | later: needs a model or a stop |
+| HLE-9 | cellGame free space (#692) | Reports 40 GiB minus 256 KiB above 4 GiB, switched by an environment variable. | Typed key `game.free_space_raw`, default off. The measured value is used below the 4 GiB wrap. The 40 GiB figure is RPCS3's, not a console measurement. | `RPCS3` | `libs/system/cellGame.c`, `docs/CONFIG.md`, test `game_space` | v0.19.0 | yes: with the typed key |
+
+## Config
+
+| ID | Area | Upstream does | dev does | Tier | Evidence | Since | PR |
+|---|---|---|---|---|---|---|---|
+| CFG-1 | `GCM_HANDLER_THREAD` (#647) | Environment switch. | Typed key `gcm.handler_thread`, off. | `RULE` | `include/ps3emu/config_options.def`, `tests/gates/test_config.py` | v0.19.0 | no: registry is ours |
+| CFG-2 | `GCM_REPORT_SPU_HOLD_MS` (#635) | Environment switch. | Typed key `gcm.report_spu_hold_ms`, 0. | `RULE` | same | v0.19.0 | no: registry is ours |
+| CFG-3 | Depth clamp and bounds (#693, #694) | `PS3RECOMP_ENG_DEPTH_CLAMP`, `PS3RECOMP_ENG_DEPTH_BOUNDS` read in the engine. | Typed keys `eng.depth_clamp` and `eng.depth_bounds`, on by default as upstream. Section `eng`, so the registry's environment names are upstream's names. | `RULE` | `docs/CONFIG.md`, `libs/video/tests/rsx_engine_config_stub.h`, tests `test_metal_depth_clamp`, `test_metal_depth_bounds` | v0.19.0 | no: registry is ours |
+| CFG-4 | `PS3_GAME_FREE_SPACE_RAW` (#692) | Environment switch. | Typed key `game.free_space_raw` (environment `PS3RECOMP_GAME_FREE_SPACE_RAW`), no alias. | `RULE` | row HLE-9 | v0.19.0 | no: registry is ours |
+| CFG-5 | Park grace (v0.18.0) | `GCM_PARK_RESYNC` and `GCM_PARK_GRACE_MS`: after the grace the drain follows `put` and drops the commands between. | Typed `gcm.park_resync` and `gcm.park_grace_ms` (50 ms). Reference mode, the default, waits at a self-JUMP park and stops with `gcm-wait-timeout` (`what=jump-park`). Compatibility mode follows `put` after the grace and logs every intervention. | `RULE` | `a0e5f13e`, tests `gcm_park_modes`, `gcm_park_reuse`, `gcm_resync_labels` | v0.18.0 | no: heuristic stays opt-in |
+| CFG-6 | Dropped and constant knobs (#636, #666, #659) | `SPU_RELOC_OFF`, `SPU_LOCKLINE_SLEEP` and `SPURS_IDLE_MAX` read from the environment. | The first two are dropped. `SPURS_IDLE_MAX` is the build-time constant `SPURS_IDLE_MAX_DEFAULT` (4). | `RULE` | `libs/spurs/cellSpurs.c`, `runtime/spu/spu_coherency.c` (comment) | v0.19.0 | no: registry is ours |
+| CFG-7 | Host display knobs | `PS3_VIBRANCE`, `PS3_CONTRAST`, `PS3RECOMP_METAL_WINDOW`, `PS3RECOMP_FULLSCREEN` from the environment. | Same. They are host display options, not guest-visible, and are documented. The `PS3RECOMP_ENG_*` kill switches stay environment too. | `RULE` | `docs/DIAGNOSTICS.md`, #55 | v0.19.0 | no: classification |
+| CFG-8 | `SCANOUT_FB` | D3D12-only environment switch that turns the CPU-blit scan-out off. | Same. It is behavioural and not in the typed registry. Inert on this host. | `RULE` | `docs/DIAGNOSTICS.md` ("behavioural, not in the typed registry (#55)"), `libs/video/rsx_d3d12_backend.c` | v0.19.0 | no: Windows only |
+| CFG-9 | Remaining behavioural knobs (#55) | `SPU_DISPATCH_CACHE`, `SPU_FLOAT_RZ`, `SPU_LONGJMP_UNWIND`, `PS3_SPU_DIRECT`, `SPU_MISS_FATAL`, `SPU_POISON_DMA_WATCH`, `PS3_PRIO_START`, the `PS3RECOMP_ENG_*` switches, `PS3RECOMP_MSL_*`, `PS3_QUIT_GRACE_MS`, `PS3_AUDIO_BUF_MS`, `PS3_LICENSE_AREA`, the path and size knobs of `ppu_fs`. | Same, environment only. `ps3_env_once` (#515) is adopted and caches the lookup once per translation unit. | `RULE` | #55 (open), `docs/DIAGNOSTICS.md` marks each | v0.18.0 | no: conversion owed |
+| CFG-10 | Handler OPD repair (#56) | A title-prefixed environment switch rewrites a zeroed handler OPD code word. Default off. | Carried unchanged, default off. With it set the repair hides the stop. The OPD-swap redirect is `ppu.opd_swap_fixup` (off). Removal waits for the cause (#66 closed, #67 open). | `RULE` | #56 (open), #66, #67, `libs/video/cellGcmSys.c`, `runtime/ppu/ppu_loader.cpp` | v0.18.0 | no: policy, delete first |
+
+## Tests, CI and build
+
+| ID | Area | Upstream does | dev does | Tier | Evidence | Since | PR |
+|---|---|---|---|---|---|---|---|
+| TST-1 | Upstream tests that scrape replaced code | `tools/test_lwmutex_semantics.py`, `tools/test_lwmutex_trylock_busy.py` and `tests/syscalls/test_ppu_thread_join.c`. | Removed. They read lwmutex source out of `ppu_sysprx.cpp` or drive the FINISHED join states. The gates are `tests/lwsync` and `tests/test_ppu_thread_join_detach.c`. | `RULE` | rows LV2-2, SYNC-5 | v0.19.0 | no: code differs |
+| TST-2 | Upstream fixtures on dev's runtime | `ppu_primary_priority`, `np_entitlements`, `np_presence_details`, `sail_memory_allocator` link upstream's loader and HLE bridge. | Ported to dev's runtime with every assertion kept. A new upstream edit to these fixtures is ported, not copied. | `INF` | `tools/test_ppu_primary_priority.py`, `tools/test_np_*.py`, `tools/test_sail_memory_allocator.py` | v0.19.0 | no: port detail |
+| TST-3 | Fixture link contracts | Fixtures link their own config and stop stubs; some fixtures call `ps3_config_get`. | `libs/video/tests/rsx_engine_config_stub.h` with the opt-out `RSX_STUB_OWN_CONFIG`; `tests/guest_range_catch.h` catches `hle-guest-range` in-process; the `sys_fs` fixture arena is mapped because dev commits every guest span. | `INF` | those files, test `sys_fs` | v0.19.0 | no: port detail |
+| TST-4 | macOS and ld64 | Weak references in `sys_lwsync`; NP fixtures below C++17; ObjC units pulling `win32_compat.h`. | Strong references (ld64 loads the defining archive member for a weak one); NP fixtures built as C++20; Metal depth and polygon-offset fixtures run in ctest. | `INF` | `d3672353`, `b784a912`, `9bad5433`, `tests/lwsync/test_lwsync.cpp` | v0.19.0 | later: portable parts |
+| TST-5 | Hygiene allow-list | The vendored SMAA table `third_party/smaa/AreaTex.h` (1.17 MB) is over the size limit. | An entry in `tools/hygiene-allow.txt` with the reason; the rule is reworded for reviewed vendored files with licence and provenance beside them. | `RULE` | `tools/hygiene-allow.txt`, `tools/check_hygiene.py --tracked` | v0.19.0 | no: local rule |
+| TST-6 | lv2conf golden | No console golden. | `tests/syscalls/lv2conf/golden.csv` is the reference. A sync that moves a case away from it is wrong. A fixed case removes its line in `divergences.txt`. | `HW` | `lv2conf_conformance`, `tools/hwprobe/probes/lv2conf/`; the v0.19.0 sync removed 8 stale lines | v0.19.0 | yes: golden |
+| TST-7 | SPU helper tests | Not compared. | A helper test with no vector helper exits 77 (ctest SKIP) instead of printing `ok`. Each immediate form of the exhaustive sweep is cut to its own field. `spu_exhaustive` (`spu;long`) must find planted bugs. | `RULE` | `52843778`, `742e288d`, tests `spu_exhaustive`, `spu_helpers` | v0.19.0 | yes: generic |
+| TST-8 | SPU differential against RPCS3 | n/a (a gate, not a behaviour). | Interpreter 634 and lifted 1558 raw mismatches, all judged by the float referee, 0 unresolved. A sync keeps these counts or explains the change. | `RPCS3` | `CHANGELOG.md` v0.19.0 sync entry, `runtime/spu/tests/spu_interp_diff_test.c` | v0.19.0 | no: local gate |
+
+## Converged
+
+Rows removed because upstream and `dev` now agree.
+
+| Item | Settled | Note |
+|---|---|---|
+| 2048-entry SPU decode table (#688, contributed from this fork) | v0.19.0 | The table and its generator are identical on both sides. Dev's one-dispatch interpreter built on it stays (row SPU-5). |
+| lwmutex trylock answers EBUSY (#684) | v0.19.0 | Same answer on both sides. The code stays in `runtime/syscalls/sys_lwsync.cpp` (row LV2-2). |
+| Mutex trylock relock, rwlock, event-queue destroy modes, port outlives queue, memory container slots (#621, #622, #644) | v0.19.0 | They moved toward the `lv2conf` golden. Eight lines left `divergences.txt`. |
+| SPURS task error base | v0.19.0 | The family sits on `0x80410900` in both trees at v0.19.0 (`include/ps3emu/error_codes.h`). Check semantics of task creation were not re-compared. |
+
+## Open questions
+
+Rows whose `dev` behaviour is itself unverified, whose evidence is not stored
+in the tree, or where a rule is broken knowingly.
+
+| Row | Question | Pending |
+|---|---|---|
+| SPU-4 | Reservation limits 1 to 4 in `runtime/memory/reservation.h`: plain stores into lines no SPU reserved are caught by value only; stores through runtime-handed host pointers are invisible; filesystem reads into guest memory run no label hook (#58). Can the inline store path ask the reservation marks without widening limit 3? | #2, #35, #57, #58 |
+| INH-8 | Relative timed waits on `CLOCK_REALTIME`. #128 names three files; the grep also finds `sys_mutex.c` and `sys_timer.c`. | #128 |
+| INH-9 | Error answers without provenance. `cellSailMemAllocatorInitialize` returns `CELL_SAIL_ERROR_NOT_INITIALIZED` (`0x80610701`) for bad arguments, where the header's `INVALID_ARGUMENT` is `0x80610703`. The presence-details handler in `libs/network/sceNpBasic.c` returns `0x8002a665` and `0x8002a663`, where `sceNpBasic.h` defines `0x8002AA03` and `0x8002AA04`. `cellSpursRequestIdleSpu` bounds the workload id by 16 on a CellSpurs2 instance that has 32. The ALIGN, PERM and BUSY codes of the SPURS2, Taskset2 and flag-receiver calls are upstream's, not firmware-checked. The `sceNpSignaling` and `CELL_SYNC_ERROR_ALIGN` values have no provenance comment. | #127 |
+| INH-10 | Four answers report success for work they do not do. Keep, stop, or model. | #130 |
+| INH-11 | Shared state the merge review listed and the sync did not fix. | #131 |
+| HLE-8 | Avc2 keeps its documented silent model. It answers success for work it does not do. Keep it, give it a stop, or implement a real model. | no issue |
+| SYNC-5 | The bounded wait for a Windows join was not adopted. It is unverified on Windows. | no issue |
+| GCM-1, GCM-2 | Does closing a segment on flip insertion change the flip identity a consumer sees? | flip-identity measurement |
+| GCM-14 | The vblank handler gets the count (also upstream). The firmware passes the head index. | #69 |
+| CFG-9, CFG-10 | Behavioural environment knobs and the handler OPD repair stay until converted or their cause is found. | #55, #56 |
+| HLE-1 | The firmware order of the `cellGamePatchCheck` checks is cited by a source comment only; no address or report is stored in the tree. | no issue |
+| LV2-2 | The firmware read behind the lwmutex and lwcond semantics is cited by the v0.18.0 merge plan, not stored in the tree. | no issue |
