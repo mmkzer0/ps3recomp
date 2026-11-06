@@ -31,9 +31,9 @@ $CC "$OUT"/host_interp.o "$OUT"/spuexh_host.o "$OUT"/core.o -pthread -lm -o "$HO
 if [ -f "$CFG" ]; then SEL=(--cfg "$CFG"); else SEL=(--preset "$CFG"); fi
 DOMS="$("$HOST" "${SEL[@]}" "$@" --plan | awk '/^dom /{print $2}')"
 echo "dry run: $(echo $DOMS | wc -w) domains, $JOBS processes"
-# the DP compares have no special probe in the per-domain runs: force them (the special probes are run once, below)
+# the per-domain runs are sweeps only (special probes off; run special A/B with the host driver directly, see RUN.md)
 printf '%s\n' $DOMS | xargs -P "$JOBS" -I{} nice -n 10 "$HOST" --elf "$ELF" "${SEL[@]}" "$@" \
-    --set doms={} --set special_a=0 --set special_b=0 --set force_dpcmp=1 --set spus=1 --out "$OUT/dom/{}.txt"
+    --set doms={} --set special_a=0 --set special_b=0 --set spus=1 --out "$OUT/dom/{}.txt"
 python3 "$HERE/merge_dryrun.py" "$OUT/dom" "$OUT/dryrun.txt"
 if [ -n "${SCALAR:-}" ]; then
   python3 "$HERE/compare_spuexh.py" "$OUT/dryrun.txt" --scalar "$SCALAR" --md "$OUT/dryrun_vs_scalar.md" | sed -n '1,/^\*\*/p' | tail -4 || true

@@ -78,13 +78,18 @@ class TestGenTables(unittest.TestCase):
     def test_ops_come_from_the_host_harness(self):
         names = [r["name"] for r in self.rows]
         self.assertEqual(len(names), len(set(names)))
-        self.assertEqual(len(names), 198)                       # 150 table rows + 48 conversion ops
-        for n in ("absdb", "frest", "frsqest", "fi", "fma", "dfceq", "dftsv", "shufb", "cflts@173", "cuflt@255"):
+        self.assertEqual(len(names), 193)                       # 145 table rows + 48 conversion ops
+        for n in ("absdb", "frest", "frsqest", "fi", "fma", "dfa", "shufb", "cflts@173", "cuflt@255"):
             self.assertIn(n, names)
-        self.assertEqual(len(self.domains), 37)
+        # the five DP compares are decoded as invalid since #124: no op, no domain (special probe A has fixed words)
+        for n in ("dfceq", "dfcmeq", "dfcgt", "dfcmgt", "dftsv"):
+            self.assertNotIn(n, names)
+        self.assertEqual(len(self.domains), 36)
+        self.assertNotIn("dtsv", self.domains)
+        self.assertEqual(self.domains[-1], "dfrds")             # dtsv was the last domain: no other index moved
 
     def test_known_words(self):
-        # words assembled by spu-as 2.22 (verify_encodings.py checks all 198 against the assembler when it is installed)
+        # words assembled by spu-as 2.22 (verify_encodings.py checks all 193 against the assembler when it is installed)
         self.assertEqual(self.by["a"]["word"], 0x18010183)             # a $3,$3,$4
         self.assertEqual(self.by["ai"]["word"], 0x1C000183)            # ai $3,$3,0
         self.assertEqual(self.by["fma"]["word"], 0xE0610185)           # fma $3,$3,$4,$5
@@ -99,7 +104,7 @@ class TestGenTables(unittest.TestCase):
         self.assertEqual((self.by["il"]["imm_shift"], self.by["il"]["imm_bits"]), (7, 16))
         self.assertEqual((self.by["ila"]["imm_shift"], self.by["ila"]["imm_bits"]), (7, 18))
         self.assertEqual((self.by["cflts@0"]["imm_shift"], self.by["cflts@0"]["imm_bits"]), (14, 8))
-        self.assertEqual(self.by["dftsv"]["imm_bits"], 7)
+        self.assertEqual((self.by["shlqbii"]["imm_shift"], self.by["shlqbii"]["imm_bits"]), (14, 7))
         self.assertEqual(self.by["cflts@155"]["fixed_imm"], 155)
         self.assertEqual(self.by["cflts@173"]["heavy"], 0)
         self.assertEqual(self.by["cflts@0"]["heavy"], 1)
@@ -113,23 +118,29 @@ class TestGenTables(unittest.TestCase):
 
     def test_bad_prefix_list_is_the_undecoded_set(self):
         bad = [i for i, t in enumerate(self.tab) if t == "word"]
-        self.assertEqual(len(bad), 784)
-        known = {"stop", "ori", "a", "fma", "dfceq", "frest", "cflts"}
+        self.assertEqual(len(bad), 789)                                 # the 784 of before #124 and the five DP prefixes
+        known = {"stop", "ori", "a", "fma", "frest", "cflts"}
         self.assertFalse(known & {self.tab[i] for i in bad})
+        # dfceq 0x3c3, dfcmeq 0x3cb, dfcgt 0x2c3, dfcmgt 0x2cb, dftsv 0x3bf are undecoded, so probe B runs them too
+        self.assertEqual({0x3C3, 0x3CB, 0x2C3, 0x2CB, 0x3BF} - set(bad), set())
         out = os.path.join(_TMP, "gen")
         os.makedirs(out)
         gt.emit_badprefix(self.tab, os.path.join(out, "b.h"))
         with open(os.path.join(out, "b.h")) as f:
             text = f.read()
-        self.assertIn("SPUEXH_NBAD 784", text)
+        self.assertIn("SPUEXH_NBAD 789", text)
         self.assertIn("0x004", text)                                    # first undecoded prefix (stop/lnop/sync/dsync precede it)
+        self.assertIn("0x2c3", text)
 
-    def test_generator_rejects_a_table_that_does_not_match_the_host_ops(self):
-        # a decode table without 'dfceq' must make the generator stop, not silently drop the op
-        bad = list(self.tab)
-        bad = ["word" if t == "dfceq" else t for t in bad]
+    def test_generator_rejects_an_op_the_decode_table_does_not_have(self):
+        # the DP compares are not in the decode table since #124: asking for one must make the generator stop, not
+        # silently drop the op; the same for a table that lost a real op
+        for name in ("dfceq", "dftsv"):
+            with self.assertRaises(SystemExit):
+                gt.encode_info(name, self.tab, {})
+        bad = ["word" if t == "fceq" else t for t in self.tab]
         with self.assertRaises(SystemExit):
-            gt.encode_info("dfceq", bad, {})
+            gt.encode_info("fceq", bad, {})
 
     @unittest.skipUnless(SPU_AS_NATIVE, "needs a natively runnable spu-as (the toolchain is linux/arm64; macOS runs it only in podman)")
     def test_encodings_against_the_gnu_assembler(self):
@@ -316,21 +327,46 @@ class TestCompare(unittest.TestCase):
         self.assertEqual(len(h), 5)
         self.assertEqual(h[("fi", "fi", 0)], f"{0x31:016x}")
 
-    def test_special_a_report_flags_non_execution_and_denormal_results(self):
+    SPECA_FAULT_TEXT = "join 0x00000000 cause=4 status=0x7e57 exit=0xffffffff FAULT terminate-join event[src=ffffffff53505503 d1=403010000030100]"
+
+    def test_special_a_not_executed_is_the_expected_answer(self):
+        # the shape of the hardware's r002 result: all five ended as an invalid instruction
+        words = {"dfceq": "78610183", "dfcmeq": "79610183", "dfcgt": "58610183", "dfcmgt": "59610183", "dftsv": "77e00183"}
+        rows = [f"SPECA_VALID,{op},NOT_executed,word_{w},started_1,{self.SPECA_FAULT_TEXT}" for op, w in words.items()]
+        rc, out, _ = self.run_cmp(hw_file(extra=rows), scalar=ref_file())
+        self.assertEqual(rc, 0)
+        self.assertIn("(expected: NOT executed)", out)
+        self.assertIn("| dfceq | NO: join 0x00000000 cause=4", out)
+        self.assertIn("| dftsv | NO: join 0x00000000 cause=4", out)
+        self.assertNotIn("REGRESSION", out)
+        self.assertEqual(cmp.special_a_regressions(cmp.load_hashes(write(HDR + rows))[1]), [])
+
+    def test_special_a_not_run_is_not_a_regression(self):
+        rc, out, _ = self.run_cmp(hw_file(), scalar=ref_file())
+        self.assertEqual(rc, 0)
+        self.assertIn("| dfceq | not run | 0 | |", out)
+        self.assertIn("| dftsv | not run | 0 | |", out)
+
+    def test_special_a_executed_on_hardware_is_a_regression(self):
         zero = "0" * 32
         a = "800a56da8a8d5917" + "0" * 16
         b = "8008000000000000" + "0" * 16
         rows = ["SPECA_VALID,dfceq,executed,word_78610183,started_1,exit status 0x0",
                 "SPECA,dfceq,78610183,0,{},{},{}".format(a, b, "ffffffffffffffff" + "0" * 16),
-                "SPECA_VALID,dfcgt,NOT_executed,word_586103c3,started_1,FAULT event[src=1 d1=4]"]
+                f"SPECA_VALID,dfcgt,NOT_executed,word_58610183,started_1,{self.SPECA_FAULT_TEXT}"]
         hw = write(HDR + rows)
         ref_rows = cmp.load_hashes(write([f"SPECA,dfceq,78610183,0,{a},{b},{zero}"]))[1]
         text = "\n".join(cmp.special_a_report(cmp.load_hashes(hw)[1], ref_rows))
-        self.assertIn("| dfceq | yes | 1 | 1 |", text)
-        self.assertIn("| dfcgt | NO: FAULT", text)
+        self.assertIn("| dfceq | YES (REGRESSION) | 1 | 1 |", text)
+        self.assertIn("| dfcgt | NO: join 0x00000000", text)
         self.assertIn("| dfcmeq | not run | 0 | |", text)
-        self.assertIn("| dfceq | 800a56da8a8d5917 | 8008000000000000 | ffffffffffffffff |", text)
-        self.assertIn("0 further cases", text)
+        self.assertIn("**REGRESSION: the hardware executed dfceq, which the toolkit decodes as an invalid instruction", text)
+        self.assertEqual(cmp.special_a_regressions(cmp.load_hashes(hw)[1]), ["dfceq"])
+        rc, out, _ = self.run_cmp(hw_file(extra=rows), scalar=ref_file())      # everything else clean: the regression alone fails the run
+        self.assertEqual(rc, 1)
+        self.assertIn("REGRESSION", out)
+        rows = [r.replace("dfceq", "dftsv") for r in rows[:1]]
+        self.assertEqual(cmp.special_a_regressions(cmp.load_hashes(write(HDR + rows))[1]), ["dftsv"])
 
     def test_special_b_report_counts_outcomes(self):
         rows = ["SPECB,0,004,zero,00800000,no_return,0,,0,00000000,join 0x0 cause=4 FAULT",
@@ -709,7 +745,7 @@ class TestDryRun(unittest.TestCase):
         sim = {l.split("\t")[1]: l.split("\t")[2] for l in lines if l.startswith("#gencheck")}
         nat = subprocess.run([self.host, "--gencheck"], capture_output=True, text=True, check=True).stdout.splitlines()
         nat = {l.split("\t")[1]: l.split("\t")[2] for l in nat}
-        self.assertEqual(len(sim), 37)
+        self.assertEqual(len(sim), 36)
         self.assertEqual(sim, nat)
 
     def test_result_file_has_the_standard_header(self):
@@ -799,13 +835,6 @@ class TestDryRun(unittest.TestCase):
         self.assertIn("META,sweep_error,fatal_launch", lines)
         self.assertIn("META,completed,0", lines)
 
-    def test_unaccepted_dp_compares_are_not_run_in_the_sweep(self):
-        # probe A not run: the dfc* ops and dftsv are skipped with a SKIP row, not executed blind
-        _, lines = run_host(self.host, self.elf, ["doms=dpool2,dtsv", "ops=dfceq,dftsv,dfa", "spus=1", "bmax=1"], os.path.join(_TMP, "d5.txt"))
-        skips = [l for l in lines if l.startswith("SKIP,")]
-        self.assertEqual(sorted(skips), ["SKIP,dfceq,special_a_not_run", "SKIP,dftsv,special_a_not_run"])
-        self.assertFalse([k for k in self.hashes(lines) if k[0] in ("dfceq", "dftsv")])
-
     def test_special_probes_report_what_the_interpreter_does(self):
         argv = [self.host, "--elf", self.elf, "--preset", "smoke", "--no-sweep", "--special-a", "--special-b", "--set", "special_b_max=6",
                 "--out", os.path.join(_TMP, "d6.txt")]
@@ -813,14 +842,40 @@ class TestDryRun(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         with open(os.path.join(_TMP, "d6.txt")) as f:
             lines = f.read().splitlines()
-        valid = {l.split(",")[1]: l.split(",")[2] for l in lines if l.startswith("SPECA_VALID")}
-        self.assertEqual(valid, {"dfceq": "executed", "dfcmeq": "executed", "dfcgt": "executed", "dfcmgt": "executed", "dftsv": "executed"})
+        # the retail SPU executes none of the five DP compares (hardware, issue #124) and neither does the interpreter: the five
+        # words are probed at their fixed encodings (verify_encodings.py checks them against spu-as), none executes, no case row follows
+        speca = [l.split(",") for l in lines if l.startswith("SPECA_VALID")]
+        self.assertEqual([(r[1], r[2], r[3]) for r in speca],
+                         [("dfceq", "NOT_executed", "word_78610183"), ("dfcmeq", "NOT_executed", "word_79610183"),
+                          ("dfcgt", "NOT_executed", "word_58610183"), ("dfcmgt", "NOT_executed", "word_59610183"),
+                          ("dftsv", "NOT_executed", "word_77e00183")])
+        for r in speca:
+            self.assertIn("invalid instruction", ",".join(r[5:]))
+        self.assertEqual([l for l in lines if l.startswith(("SPECA,", "SPECA_FAULT"))], [])
         b = [l.split(",") for l in lines if l.startswith("SPECB,")]
         self.assertEqual(len(b), 12)                                # 6 prefixes x 2 patterns
         self.assertTrue(all(r[5] == "no_return" for r in b))        # the interpreter has no decode for them
         self.assertIn("invalid instruction", b[0][-1])
         tr = [l.split(",") for l in lines if l.startswith("SPECB_TRY,")]
         self.assertEqual(len(tr), 12)                               # every word is pre-logged before its launch
+
+    def test_special_a_ops_can_be_narrowed(self):
+        out = os.path.join(_TMP, "d6a.txt")
+        p = subprocess.run([self.host, "--elf", self.elf, "--preset", "smoke", "--no-sweep", "--special-a", "--set", "a_ops=dftsv,dfcgt",
+                            "--out", out], check=False, capture_output=True, text=True, timeout=300)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        with open(out) as f:
+            valid = [l.split(",")[1] for l in f.read().splitlines() if l.startswith("SPECA_VALID")]
+        self.assertEqual(valid, ["dfcgt", "dftsv"])                 # table order
+
+    def test_dp_compares_cannot_be_selected_in_the_sweep(self):
+        # the five ops are not in the op table since #124: ops=dfceq leaves no op, so the driver stops instead of running nothing
+        p = subprocess.run([self.host, "--preset", "smoke", "--set", "ops=dfceq,dftsv", "--plan"], check=False, capture_output=True, text=True, timeout=120)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("leave no op", p.stderr)
+        p = subprocess.run([self.host, "--preset", "smoke", "--set", "doms=dtsv", "--plan"], check=False, capture_output=True, text=True, timeout=120)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("matches no domain", p.stderr)
 
     def lanes_run(self, sets, tag, extra=()):
         out = os.path.join(_TMP, tag + ".csv")
@@ -877,12 +932,12 @@ class TestDryRun(unittest.TestCase):
         self.assertEqual(rc, 0, text)
         self.assertIn("LANES_FAULT", text)
 
-    def test_dp_compares_in_lanes_follow_the_sweeps_rule(self):
-        _out, p, lines = self.lanes_run(["lanes=dfceq:dpool2:0:10", "lanes=absdb:byte2:0:5"], "l4")
-        self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertIn("SKIP,dfceq,special_a_not_run", lines)                    # the sweep's rule
-        self.assertFalse([l for l in lines if l.startswith("LANE,dfceq")])
-        self.assertEqual(sum(l.startswith("LANE,absdb,byte2") for l in lines), 5)
+    def test_a_lanes_entry_for_a_dp_compare_fails_at_start_up(self):
+        # dfceq is not in the op table since #124: the entry names an unknown op and the host driver stops (rc 2) before any launch
+        p = subprocess.run([self.host, "--elf", self.elf, "--preset", "smoke", "--set", "sweep=0", "--set", "lanes=dfceq:dpool2:0:10",
+                            "--out", os.path.join(_TMP, "l4.csv")], check=False, capture_output=True, text=True, timeout=120)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("lanes: unknown op 'dfceq'", p.stderr)
 
     def test_lanes_from_a_start_call_and_at_any_conversion_scale(self):
         sets = ["lanes=cflts@45:w32:0:100:1000", "lanes=cfltu@200:w32:0:64:500000", "lanes=csflt@7:w32:0:64", "lanes=cuflt@255:w32:0:64",
@@ -998,6 +1053,39 @@ class TestHostWithoutConsole(unittest.TestCase):
         p = subprocess.run([self.host, "--set", "special_b_patterns=bogus"], check=False, capture_output=True, text=True, timeout=60)
         self.assertEqual(p.returncode, 2)
         self.assertIn("special_b_patterns must be zero or both", p.stderr)
+
+    def test_an_unknown_key_stops_the_driver_before_any_launch(self):
+        # a misspelt key (here the safety keys special_b, launch_timeout_ms, outdir) must not fall back to a default
+        out = os.path.join(_TMP, "unk.csv")
+        for key in ("special_bb", "special_B", "launch_timeout", "outdirr", "preset_", ""):
+            p = subprocess.run([self.host, "--elf", "/nonexistent.elf", "--out", out, "--set", f"{key}=1"], check=False,
+                               capture_output=True, text=True, timeout=60)
+            self.assertEqual(p.returncode, 2, (key, p.stdout, p.stderr))
+            self.assertIn(f"unknown key '{key}'", p.stderr)         # the config is checked before the ELF is even opened
+            self.assertFalse(os.path.exists(out), key)              # nothing was started, no result file
+        # the same in a cfg file, which also rejects a line without '=' instead of skipping it
+        for text, want in (("preset=smoke\nspecial_bb=1\n", "unknown key 'special_bb'"), ("preset=smoke\nspecial_b\n", "line without '='"),
+                           ("preset=smoke\nspecial_b=ture\n", "special_b must be 0 or 1, got 'ture'"),
+                           ("preset=smoke\n sweep=1\n", "unknown key ' sweep'")):
+            cfg = os.path.join(_TMP, "bad.cfg")
+            with open(cfg, "w") as f:
+                f.write(text)
+            p = subprocess.run([self.host, "--elf", "/nonexistent.elf", "--out", out, "--cfg", cfg], check=False,
+                               capture_output=True, text=True, timeout=60)
+            self.assertEqual(p.returncode, 2, (text, p.stderr))
+            self.assertIn(want, p.stderr)
+            self.assertFalse(os.path.exists(out), text)
+
+    def test_the_console_keys_are_accepted_and_every_shipped_cfg_loads(self):
+        for key in ("pad", "hold_s", "screen", "tag", "outdir", "fw_version", "fw_type", "console_model", "progress_file"):
+            p = subprocess.run([self.host, "--plan", "--set", f"{key}=0"], check=False, capture_output=True, text=True, timeout=60)
+            self.assertEqual(p.returncode, 0, (key, p.stderr))
+        cfgs = sorted(n for n in os.listdir(os.path.join(PROBE, "cfg")) if n.endswith(".cfg"))
+        self.assertGreaterEqual(len(cfgs), 11)
+        for name in cfgs:
+            p = subprocess.run([self.host, "--cfg", os.path.join(PROBE, "cfg", name), "--plan"], check=False, capture_output=True,
+                               text=True, timeout=60)
+            self.assertEqual(p.returncode, 0, (name, p.stderr))
 
     def test_special_b_staging_keys_default_to_every_word_both_patterns(self):
         p = subprocess.run([self.host, "--plan"], check=False, capture_output=True, text=True, timeout=60)

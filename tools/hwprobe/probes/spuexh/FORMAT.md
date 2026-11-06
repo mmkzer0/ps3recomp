@@ -20,8 +20,9 @@ rows. The dry run writes `HDR,fw_type,host-interp` and `HDR,console_model,host`.
 | `FAULT,spuN,domain,block,job_K,state_S,text` | an SPU thread did not finish and its job is lost: the job it was running, its state word (0 never started, 1 running) and what lv2 reported (join cause/status, exception event words, `hang:` when the supervisor ended it). Written only when the thread ended by itself or the operator stopped the probe; after a group-wide kill the unfinished workers are re-run alone first (below) |
 | `RETRY,spuN,job_K,ok` | a worker that was unfinished when its group died (exception or supervisor kill) re-ran its unfinished jobs alone and completed them: the group's death was collateral, no FAULT, the hashes are kept |
 | `FATAL,launch,text` | a launch could not be contained: the exception queue connect failed, or a terminate returned an error after the exception event / a launch that did not end by itself, so the probe did not join (join has no timeout) - it flushed the file, showed the error and stopped; the text names the lv2 error |
+| `FATAL,cfg,text` | the configuration was rejected at start-up (unknown key, line without `=`, bad value; RUN.md section 3): the probe wrote this row into a result file that holds only the header and stopped before any SPU launch. Not written when the error is a bad `outdir` |
 | `TIMING_OVERFLOW,domain,block` | the job ran past one decrementer period (~53.8 s at 79.8 MHz): its tick count would undercount, so it is not reported as a number (the job's hash rows are still valid); `META,timing_overflows` counts them |
-| `SKIP,op,reason` | an op the configuration enabled was not run: `rejected_by_special_a` (probe A: the SPU did not execute it), `special_a_not_run` |
+| `SKIP,op,reason` | no longer written. Result files from before #124 carry `SKIP,<op>,rejected_by_special_a` / `special_a_not_run` rows for the five DP compares, which the sweep then skipped; since #124 they are not sweep ops and nothing is skipped. `compare_spuexh.py` still lists them |
 | `SPECA_VALID,op,executed\|NOT_executed,word_W,started_K,text` | special probe A, first case of an op alone in its own thread group |
 | `SPECA,op,word,case,a,b,result` | special probe A case: instruction word (hex), case number, the operands in registers `$3` and `$4` (32 hex digits each, the quadword) and `$rt` after the instruction |
 | `SPECA_FAULT,op,word,case,a,b,text` | a case that stopped the SPU when run alone |
@@ -64,9 +65,12 @@ probe, it is data (an SPU instruction the hardware does not accept, or a hang), 
 
 ## Special probe A
 
-Executes `dfceq`, `dfcmeq`, `dfcgt`, `dfcmgt` and `dftsv` as raw words (the encodings come from the toolkit's decode table and
-were checked against the GNU SPU assembler, `verify_encodings.py`). For each op the first case runs alone in its own SPU thread
-group; if the SPU executes it (`SPECA_VALID ... executed`), the remaining cases run in batches (one group per at most 96
+Executes `dfceq`, `dfcmeq`, `dfcgt`, `dfcmgt` and `dftsv` as raw words. They are not ops of the sweep (the toolkit decodes them as
+an invalid instruction, #124): the five words are a fixed list in `common/spuexh_core.c` (opcodes of `tools/spu_disasm.py`,
+registers `$3`/`$4`, result in `$3`), which `verify_encodings.py` checks against the GNU SPU assembler. For each op the first case
+runs alone in its own SPU thread group; the expected answer is `SPECA_VALID ... NOT_executed` (hardware and interpreter agree). If
+a SPU executes it (`SPECA_VALID ... executed`: a regression of the toolkit's decode, `compare_spuexh.py` reports it), the remaining
+cases run in batches (one group per at most 96
 cases; a batch that does not complete is re-run case by case). The cases are all ordered pairs of 25 double values (both
 zeros, the minimum, a middle and the maximum denormal in both signs, the two denormals of the EXHAUSTIVE.md 3.4
 repros, the minimum normal, ordinary values, the maximum, both infinities, quiet and signalling NaNs), two lanes per call, and
@@ -74,12 +78,14 @@ for `dftsv` every 7-bit mask on the same values.
 
 ## Special probe B
 
-For each of the 784 11-bit prefixes the toolkit's decode table maps to `SPU_word` (generated from
+For each of the 789 11-bit prefixes the toolkit's decode table maps to `SPU_word` (784 before #124, plus the five prefixes of
+probe A's DP compares, `0x2c3 0x2cb 0x3bf 0x3c3 0x3cb`; generated from
 `runtime/spu/spu_interp_tables.inc` at build time, `spuexh_badprefix_gen.h`) two words are executed, each in its own thread
 group: the prefix with all operand bits zero (`zero`) and with a fixed pseudo-random operand pattern (`rand`). The staging
 keys narrow the batch: `special_b_count=N` stops after N words, `special_b_patterns=zero` runs only the zero pattern (the
 first run is one zero-pattern word; RUN.md section 4 has the batch sequence). A `SPECB_TRY` row is flushed before each
-word's group starts. The word runs
+word's group starts. The `index` of the `SPECB`/`SPECB_TRY` rows is the position of the prefix in the sorted list of 789 (a file
+from before #124 numbers 784: the same below `0x2c3`, shifted above it; compare by prefix, not index). The word runs
 with all 128 registers loaded with known values (word 0 of register n = `0x1E000 + 16n`, so a register used as an address
 points into scratch memory) and is followed by code that does not depend on any register: it stores all 128 registers and
 returns. Outcome:

@@ -158,15 +158,20 @@ int main(int argc, char **argv) {
         FILE *f = fopen(cfgp, "r"); char line[320];
         if (!f) { perror(cfgp); return 2; }
         while (fgets(line, sizeof line, f)) {
-            if (line[0] == '#' || line[0] == '\n') continue;
-            char *eq = strchr(line, '='); if (!eq) continue; *eq++ = 0; trim(eq);
+            trim(line);
+            if (!line[0] || line[0] == '#') continue;
+            char *eq = strchr(line, '=');
+            if (!eq) { fprintf(stderr, "%s: line without '=': %s\n", cfgp, line); return 2; }     /* a typo must not be skipped */
+            *eq++ = 0;
             int r = spuexh_runcfg_set(&rc, line, eq, err, sizeof err);
             if (r < 0) { fprintf(stderr, "%s: %s\n", cfgp, err); return 2; }
         }
         fclose(f);
     }
     for (int i = 0; i < nsets; i++) {
-        char *eq = strchr(sets[i], '='); if (!eq) return 2; *eq++ = 0;
+        char *eq = strchr(sets[i], '=');
+        if (!eq) { fprintf(stderr, "--set %s: expected key=value\n", sets[i]); return 2; }
+        *eq++ = 0;
         if (spuexh_runcfg_set(&rc, sets[i], eq, err, sizeof err) < 0) { fprintf(stderr, "--set %s: %s\n", sets[i], err); return 2; }
     }
     if (spuexh_runcfg_finish(&rc, err, sizeof err) < 0) { fprintf(stderr, "%s\n", err); return 2; }
@@ -201,11 +206,7 @@ int main(int argc, char **argv) {
     spuexh_backend_t be = { "host-interp", NULL, host_alloc, host_run };
     spuexh_sink_t sink = { out, NULL, NULL };
     int rcode = 0;
-    if (rc.special_a) {
-        int acc[5];
-        spuexh_run_special_a(&be, &rc, &sink, acc);
-        rc.dpcmp_known = 1; for (int q = 0; q < 5; q++) rc.dpcmp_ok[q] = acc[q];
-    }
+    if (rc.special_a) spuexh_run_special_a(&be, &rc, &sink);
     if (rc.special_b) spuexh_run_special_b(&be, &rc, &sink);
     if ((rc.nlanes || rc.nsums) && spuexh_run_lanes(&be, &rc, &sink) < 0) rcode = 1;
     if (rc.sweep && !rcode) {

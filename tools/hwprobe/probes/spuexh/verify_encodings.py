@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Independent check of the instruction words the probe executes: assemble every op of the generated table
-with the real SPU assembler (spu-as, GNU binutils) and compare the word with gen_tables.py's template.
+with the real SPU assembler (spu-as, GNU binutils) and compare the word with gen_tables.py's template; the five fixed
+words of special probe A (spuexh_core.c) are checked the same way.
 
     verify_encodings.py <repo-root> [--spu-as PATH]
 
@@ -59,6 +60,31 @@ def assemble(spu_as, lines):
         shutil.rmtree(d, ignore_errors=True)
 
 
+SPECIAL_A_SRC = "tools/hwprobe/probes/spuexh/common/spuexh_core.c"
+SPECIAL_A_OPS = ("dfceq", "dfcmeq", "dfcgt", "dfcmgt", "dftsv")
+
+
+def check_special_a(root, spu_as):
+    """The five words of special probe A are fixed in spuexh_core.c (the ops are not in the decode table any more): assemble
+    each with spu-as and compare. dftsv (RI7) is checked at i7 = 0 and 5 against the word with the mask OR-ed in at bit 14."""
+    with open(os.path.join(root, SPECIAL_A_SRC), encoding="utf-8") as f:
+        src = f.read()
+    table = re.findall(r'\{\s*"(\w+)",\s*0x([0-9A-Fa-f]{8})u,\s*([01])\s*\}', src)
+    if tuple(t[0] for t in table) != SPECIAL_A_OPS:
+        raise SystemExit(f"verify_encodings: the special-A table of {SPECIAL_A_SRC} lists {[t[0] for t in table]}, expected {list(SPECIAL_A_OPS)}")
+    bad = 0
+    for name, word, tsv in table:
+        word = int(word, 16)
+        samples = [0, 5] if tsv == "1" else [0]
+        lines = [f"{name} $3,$3,{s}" if tsv == "1" else f"{name} $3,$3,$4" for s in samples]
+        for s, w, ln in zip(samples, assemble(spu_as, lines), lines):
+            want = word | (s << 14)
+            if w != want:
+                bad += 1
+                print(f"MISMATCH special A {name:<8} imm={s} asm {w:08x}  table {want:08x}   ({ln})")
+    return len(table), bad
+
+
 def main(argv):
     root = argv[1]
     spu_as = shutil.which("spu-as") or os.path.join(os.environ.get("PS3DEV", ""), "spu/bin/spu-as")
@@ -88,7 +114,9 @@ def main(argv):
             if w != want:
                 bad += 1
                 print(f"MISMATCH {row['name']:<12} {k:<4} imm={s} asm {w:08x}  template {want:08x}   ({asm_line(row, s)})")
-    print(f"verify_encodings: {len(rows)} ops checked against {os.path.basename(spu_as)}, {bad} mismatches")
+    nspec, bad_spec = check_special_a(root, spu_as)
+    bad += bad_spec
+    print(f"verify_encodings: {len(rows)} ops and {nspec} special-A words checked against {os.path.basename(spu_as)}, {bad} mismatches")
     return 1 if bad else 0
 
 

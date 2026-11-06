@@ -35,6 +35,13 @@ static void copy_str(char *dst, size_t cap, const char *src)
 	snprintf(dst, cap, "%s", src);
 }
 
+/* The first config error wins; the probe stops after the whole file is read. */
+static void cfg_fail(const char *prefix, const char *what)
+{
+	if (!g_cfg_error[0])
+		snprintf(g_cfg_error, sizeof(g_cfg_error), "%s%s", prefix, what);
+}
+
 static void cfg_set(const char *k, const char *v)
 {
 	char err[200];
@@ -50,8 +57,7 @@ static void cfg_set(const char *k, const char *v)
 	else if (!strcmp(k, "console_model")) copy_str(g_cfg.console_model, sizeof(g_cfg.console_model), v);
 	else {
 		r = spuexh_runcfg_set(&g_rc, k, v, err, sizeof(err));
-		if (r < 0) copy_str(g_cfg_error, sizeof(g_cfg_error), err);
-		else if (r == 0) printf("spuexh.cfg: unknown key '%s'\n", k);
+		if (r < 0) cfg_fail("", err);                        /* a bad value or an unknown key */
 	}
 }
 
@@ -67,14 +73,16 @@ static int cfg_load(void)
 		return 0;
 	while (fgets(line, sizeof(line), f)) {
 		char *eq, *e;
-		if (line[0] == '#' || line[0] == '\n' || line[0] == '\r')
+		for (e = line + strlen(line); e > line && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' '); e--)
+			e[-1] = 0;
+		if (line[0] == '#' || line[0] == 0)
 			continue;
 		eq = strchr(line, '=');
-		if (!eq)
+		if (!eq) {
+			cfg_fail("line without '=': ", line);            /* a typo must not be skipped */
 			continue;
+		}
 		*eq++ = 0;
-		for (e = eq + strlen(eq); e > eq && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' '); e--)
-			e[-1] = 0;
 		cfg_set(line, eq);
 	}
 	fclose(f);
@@ -97,12 +105,35 @@ static int ui_cb(void *u, const char *summary)
 	return hwp_exit_requested();
 }
 
-int main(int argc, char *argv[])
+/* Opens the next result file of the run (name from the run id and the tag) and writes the standard header. NULL if it
+ * cannot be opened. */
+static FILE *open_result_file(int *run, char *path, size_t pathcap)
 {
-	char title[64], path[160], name[96], sum[200], err[200];
+	char name[96];
 	hwp_header_t h;
 	FILE *f;
-	int run, rv = 0, acc[5], i;
+	*run = hwp_next_run_id(g_cfg.outdir, PROBE_NAME);
+	snprintf(name, sizeof(name), "%s_r%03d%s%s.csv", PROBE_NAME, *run, g_cfg.tag[0] ? "_" : "", g_cfg.tag);
+	f = hwp_result_open(g_cfg.outdir, name, path, pathcap);
+	if (!f)
+		return NULL;
+	memset(&h, 0, sizeof(h));
+	h.probe = PROBE_NAME;
+	h.probe_version = PROBE_VERSION;
+	h.config = config_name();
+	h.fw_version = g_cfg.fw_version;
+	h.fw_type = g_cfg.fw_type;
+	h.console_model = g_cfg.console_model;
+	h.tbfreq = hwp_tb_freq();
+	hwp_write_header(f, &h);
+	return f;
+}
+
+int main(int argc, char *argv[])
+{
+	char title[64], path[160], sum[200], err[200];
+	FILE *f;
+	int run, rv = 0;
 	spuexh_sweep_res_t sr;
 	spuexh_sink_t sink;
 	spuexh_plan_t plan;
@@ -130,6 +161,15 @@ int main(int argc, char *argv[])
 	hwp_ui_set_run(0, 1);
 	hwp_ui_set_phase("ready");
 	if (g_cfg_error[0]) {
+		/* Fail closed before any SPU launch. The screen may be off (screen=0), so the error also goes into a result file
+		 * as FATAL,cfg,<text> - unless the outdir itself is the error: nothing is written outside the allowed directory. */
+		if (spuexh_outdir_ok(g_cfg.outdir)) {
+			FILE *ef = open_result_file(&run, path, sizeof(path));
+			if (ef) {
+				fprintf(ef, "FATAL,cfg,%s\n", g_cfg_error);
+				fclose(ef);
+			}
+		}
 		hwp_ui_set_error("config: %s", g_cfg_error);
 		hwp_ui_redraw();
 		hwp_wait_button(HWP_BTN_START, 20);
@@ -149,9 +189,7 @@ int main(int argc, char *argv[])
 		hwp_ui_set_hint("");
 	}
 
-	run = hwp_next_run_id(g_cfg.outdir, PROBE_NAME);
-	snprintf(name, sizeof(name), "%s_r%03d%s%s.csv", PROBE_NAME, run, g_cfg.tag[0] ? "_" : "", g_cfg.tag);
-	f = hwp_result_open(g_cfg.outdir, name, path, sizeof(path));
+	f = open_result_file(&run, path, sizeof(path));
 	if (!f) {
 		hwp_ui_set_error("cannot open a result file");
 		hwp_ui_redraw();
@@ -159,15 +197,6 @@ int main(int argc, char *argv[])
 		hwp_ui_shutdown();
 		return 1;
 	}
-	memset(&h, 0, sizeof(h));
-	h.probe = PROBE_NAME;
-	h.probe_version = PROBE_VERSION;
-	h.config = config_name();
-	h.fw_version = g_cfg.fw_version;
-	h.fw_type = g_cfg.fw_type;
-	h.console_model = g_cfg.console_model;
-	h.tbfreq = hwp_tb_freq();
-	hwp_write_header(f, &h);
 	fprintf(f, "META,backend,ppu\n");
 	fprintf(f, "META,build,%s %s\n", __DATE__, __TIME__);
 	fprintf(f, "META,run,%d\n", run);
@@ -193,11 +222,8 @@ int main(int argc, char *argv[])
 		hwp_ui_set_run(1, 1);
 		if (g_rc.special_a) {
 			hwp_ui_set_phase("special A: DP compares");
-			const int ra = spuexh_run_special_a(&spuexh_ppu_backend, &g_rc, &sink, acc);
+			const int ra = spuexh_run_special_a(&spuexh_ppu_backend, &g_rc, &sink);
 			if (ra < 0) fatal = 1;    /* -1: a launch could not be contained (FATAL row); 1: operator stop */
-			g_rc.dpcmp_known = 1;
-			for (i = 0; i < 5; i++)
-				g_rc.dpcmp_ok[i] = acc[i];
 		}
 		if (g_rc.special_b && !fatal && !hwp_exit_requested()) {
 			hwp_ui_set_phase("special B: decoder");

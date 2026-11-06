@@ -45,7 +45,7 @@ typedef struct {
 
 #include "spuexh_ops_gen.h"      /* generated: spuexh_ops[SPUEXH_NOPS], spuexh_dom_names[] */
 
-#if SPUEXH_NDOMS_GEN != 37
+#if SPUEXH_NDOMS_GEN != 36
 #error "domain table of the generator changed: regenerate and review"
 #endif
 
@@ -61,7 +61,7 @@ typedef struct {
     uint32_t dom_stride[SPUEXH_NDOMS_GEN];   /* 0 = stride_all */
     uint32_t dom_bmax[SPUEXH_NDOMS_GEN];     /* 0 = bmax */
     uint32_t op_en[SPUEXH_OPWORDS];    /* enabled ops */
-    uint32_t dom_en_lo, dom_en_hi;     /* enabled domains (bit k = domain k), 37 domains */
+    uint32_t dom_en_lo, dom_en_hi;     /* enabled domains (bit k = domain k), 36 domains */
 } spuexh_cfg_t;                        /* wire format: all fields W32 */
 
 static inline int spuexh_op_enabled(const spuexh_cfg_t *c, int k) { return (W32(c->op_en[k >> 5]) >> (k & 31)) & 1u; }

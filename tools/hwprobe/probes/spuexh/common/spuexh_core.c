@@ -7,7 +7,24 @@
 #include "spuexh_core.h"
 #include "spuexh_badprefix_gen.h"
 
-const char *const spuexh_dpcmp_names[5] = { "dfceq", "dfcmeq", "dfcgt", "dfcmgt", "dftsv" };
+/* Special probe A: the five double-precision compares/test the retail CBE SPU does not execute (decoded as invalid by the
+ * toolkit since #124). They are not in the generated op table (no decode-table entry, no harness op), so their words are
+ * fixed here. Opcodes of tools/spu_disasm.py: dfceq 0x3C3, dfcmeq 0x3CB, dfcgt 0x2C3, dfcmgt 0x2CB (RR: opcode<<21 | rb<<14 |
+ * ra<<7 | rt) and dftsv 0x3BF (RI7: opcode<<21 | i7<<14 | ra<<7 | rt; the toolkit never decoded its I7, the ISA format is RI7).
+ * Registers as the sweep's stubs use them: a = $3, b = $4, result in rt = $3. verify_encodings.py assembles these five lines
+ * with spu-as and compares them with the words below (it reads this table), so a typo cannot pass. Evidence tier: hardware
+ * (CECHC04, 4.81 REBUG, r002 specialA): all five end as an invalid instruction; the expected answer here is NOT_executed, and an
+ * `executed` row is a regression of the model that compare_spuexh.py reports. For dftsv the word has i7 = 0; the cases OR in
+ * every 7-bit mask at bit 14. */
+#define SPUEXH_DPCMP_RT 3
+#define SPUEXH_DPTSV_I7_SHIFT 14
+static const struct { const char *name; uint32_t word; int tsv; } spuexh_dpcmp[5] = {
+    { "dfceq",  0x78610183u, 0 },
+    { "dfcmeq", 0x79610183u, 0 },
+    { "dfcgt",  0x58610183u, 0 },
+    { "dfcmgt", 0x59610183u, 0 },
+    { "dftsv",  0x77E00183u, 1 },
+};
 
 /* ------------------------------------------------------------------ configuration */
 static void cfg_clear(spuexh_cfg_t *c) {
@@ -25,7 +42,7 @@ int spuexh_runcfg_defaults(spuexh_runcfg_t *rc, const char *preset) {
     rc->spus = 6; rc->stall_s = 120; rc->max_faults = 24;
     rc->special_a = 1; rc->special_b = 0; rc->special_b_max = 0; rc->case_timeout_ms = 2000; rc->b_timeout_ms = 600;
     rc->launch_timeout_ms = 10800000; rc->special_b_count = 0; rc->special_b_both = 1;
-    rc->auto_dpcmp = 1; rc->sweep = 1;
+    rc->sweep = 1;
     snprintf(rc->preset, sizeof rc->preset, "%s", preset);
     if (!strcmp(preset, "smoke")) { rc->wire.bmax = W32(1u); }                       /* block 0 of every domain, every op */
     else if (!strcmp(preset, "standard")) { rc->wire.stride_all = W32(64u); rc->wire.stride_heavy = W32(64u); }
@@ -184,6 +201,21 @@ static int parse_lanesum(spuexh_runcfg_t *rc, const char *val, char *err, size_t
     return 0;
 }
 
+/* The keys the layer around the sweep handles itself (RUN.md section 3): runcfg_set reports them as "not mine" (0). Every other
+ * key that is not a sweep key is a typo or a stale config and fails closed: a misspelt safety key must never fall back to its default. */
+static int is_console_key(const char *k) {
+    static const char *const keys[] = { "pad", "hold_s", "screen", "tag", "outdir", "fw_version", "fw_type", "console_model", "progress_file" };
+    for (size_t i = 0; i < sizeof keys / sizeof keys[0]; i++) if (!strcmp(k, keys[i])) return 1;
+    return 0;
+}
+
+/* A 0/1 switch: anything else ("ture", "2", "") is an error, not a silent 0 */
+static int parse_flag(const char *v, int *out, const char *key, char *err, size_t cap) {
+    if ((v[0] == '0' || v[0] == '1') && !v[1]) { *out = v[0] - '0'; return 0; }
+    snprintf(err, cap, "%s must be 0 or 1, got '%s'", key, v);
+    return -1;
+}
+
 int spuexh_runcfg_set(spuexh_runcfg_t *rc, const char *k, const char *v, char *err, size_t cap) {
     err[0] = 0;
     if (!strcmp(k, "preset")) {
@@ -192,8 +224,8 @@ int spuexh_runcfg_set(spuexh_runcfg_t *rc, const char *k, const char *v, char *e
     else if (!strcmp(k, "spus")) { rc->spus = atoi(v); if (rc->spus < 1 || rc->spus > 6) { snprintf(err, cap, "spus must be 1..6"); return -1; } }
     else if (!strcmp(k, "stall_s")) { rc->stall_s = atoi(v); if (rc->stall_s < 0) { snprintf(err, cap, "stall_s must be >= 0"); return -1; } }
     else if (!strcmp(k, "max_faults")) { rc->max_faults = atoi(v); if (rc->max_faults < 0) { snprintf(err, cap, "max_faults must be >= 0"); return -1; } }
-    else if (!strcmp(k, "special_a")) rc->special_a = atoi(v);
-    else if (!strcmp(k, "special_b")) rc->special_b = atoi(v);
+    else if (!strcmp(k, "special_a")) { if (parse_flag(v, &rc->special_a, "special_a", err, cap) < 0) return -1; }
+    else if (!strcmp(k, "special_b")) { if (parse_flag(v, &rc->special_b, "special_b", err, cap) < 0) return -1; }
     else if (!strcmp(k, "special_b_max")) rc->special_b_max = atoi(v);
     else if (!strcmp(k, "special_b_from")) { rc->special_b_from = atoi(v); if (rc->special_b_from < 0) { snprintf(err, cap, "special_b_from must be >= 0"); return -1; } }
     else if (!strcmp(k, "special_b_count")) { rc->special_b_count = atoi(v); if (rc->special_b_count < 0) { snprintf(err, cap, "special_b_count must be >= 0"); return -1; } }
@@ -207,8 +239,7 @@ int spuexh_runcfg_set(spuexh_runcfg_t *rc, const char *k, const char *v, char *e
     else if (!strcmp(k, "case_timeout_ms")) { rc->case_timeout_ms = atoi(v); if (rc->case_timeout_ms <= 0) { snprintf(err, cap, "case_timeout_ms must be > 0"); return -1; } }
     else if (!strcmp(k, "b_timeout_ms")) { rc->b_timeout_ms = atoi(v); if (rc->b_timeout_ms <= 0) { snprintf(err, cap, "b_timeout_ms must be > 0"); return -1; } }
     else if (!strcmp(k, "launch_timeout_ms")) { rc->launch_timeout_ms = atoi(v); if (rc->launch_timeout_ms <= 0) { snprintf(err, cap, "launch_timeout_ms must be > 0"); return -1; } }
-    else if (!strcmp(k, "sweep")) rc->sweep = atoi(v);
-    else if (!strcmp(k, "force_dpcmp")) rc->force_dpcmp = atoi(v);
+    else if (!strcmp(k, "sweep")) { if (parse_flag(v, &rc->sweep, "sweep", err, cap) < 0) return -1; }
     else if (!strcmp(k, "stride_all")) rc->wire.stride_all = W32((uint32_t)atoi(v));
     else if (!strcmp(k, "stride_heavy")) rc->wire.stride_heavy = W32((uint32_t)atoi(v));
     else if (!strcmp(k, "bmax")) rc->wire.bmax = W32((uint32_t)atoi(v));
@@ -219,7 +250,8 @@ int spuexh_runcfg_set(spuexh_runcfg_t *rc, const char *k, const char *v, char *e
     else if (!strcmp(k, "ops")) snprintf(rc->ops, sizeof rc->ops, "%s", v);
     else if (!strcmp(k, "skip_ops")) snprintf(rc->skip_ops, sizeof rc->skip_ops, "%s", v);
     else if (!strcmp(k, "doms")) snprintf(rc->doms, sizeof rc->doms, "%s", v);
-    else return 0;
+    else if (is_console_key(k)) return 0;
+    else { snprintf(err, cap, "unknown key '%s'", k); return -1; }
     return 1;
 }
 
@@ -462,33 +494,22 @@ static int sweep_verify_alone(sweep_t *s, int i, FILE *f, spuexh_sweep_res_t *re
     return 0;
 }
 
-int spuexh_run_sweep(spuexh_backend_t *be, const spuexh_runcfg_t *rc0, const spuexh_sink_t *sink, spuexh_sweep_res_t *res) {
+int spuexh_run_sweep(spuexh_backend_t *be, const spuexh_runcfg_t *rc, const spuexh_sink_t *sink, spuexh_sweep_res_t *res) {
     static sweep_t S;                                       /* large; one sweep at a time */
     memset(&S, 0, sizeof S);
     memset(res, 0, sizeof *res);
-    spuexh_runcfg_t rc = *rc0;                              /* the wire config gets the DP-compare filter below */
-    if (!rc.force_dpcmp) {
-        for (int q = 0; q < 5; q++) {
-            if (rc.dpcmp_known && rc.dpcmp_ok[q]) continue;
-            for (int k = 0; k < SPUEXH_NOPS; k++)
-                if (!strcmp(spuexh_ops[k].name, spuexh_dpcmp_names[q]) && spuexh_op_enabled(&rc.wire, k)) {
-                    spuexh_set_op(&rc.wire, k, 0);
-                    fprintf(sink->out, "SKIP,%s,%s\n", spuexh_ops[k].name, rc.dpcmp_known ? "rejected_by_special_a" : "special_a_not_run");
-                }
-        }
-    }
-    S.be = be; S.rc = &rc; S.sink = sink;
+    S.be = be; S.rc = rc; S.sink = sink;
     const double t_begin = spuexh_now();
     uint16_t act[SPUEXH_NOPS];
 
-    for (int spus = rc.spus; spus >= 1; spus--) {
+    for (int spus = rc->spus; spus >= 1; spus--) {
         /* ---- plan: entries each SPU will produce (upper bound = every job completes) */
         uint64_t ents[6] = {0}; uint32_t njobs[6] = {0}; uint32_t job = 0;
         for (int d = 0; d < SPUEXH_NDOMS_GEN; d++) {
-            if (!spuexh_dom_enabled(&rc.wire, d)) continue;
+            if (!spuexh_dom_enabled(&rc->wire, d)) continue;
             const uint64_t nb = exh_nblocks(&exh_doms[d]);
             for (uint64_t b = 0; b < nb; b++) {
-                const int na = spuexh_job_ops(&rc.wire, d, b, act);
+                const int na = spuexh_job_ops(&rc->wire, d, b, act);
                 if (!na) continue;
                 const int o = (int)(job++ % (uint32_t)spus);
                 ents[o] += (uint64_t)na + 1; njobs[o]++;
@@ -499,7 +520,7 @@ int spuexh_run_sweep(spuexh_backend_t *be, const spuexh_runcfg_t *rc0, const spu
         int ok = 1;
         void *cfgp = NULL; uint64_t cfg_ea = 0;
         cfgp = be->alloc(be, 512, &cfg_ea);
-        if (!cfgp) ok = 0; else memcpy(cfgp, &rc.wire, sizeof rc.wire);
+        if (!cfgp) ok = 0; else memcpy(cfgp, &rc->wire, sizeof rc->wire);
         for (int i = 0; ok && i < spus; i++) {
             S.par[i] = (spuexh_params_t *)be->alloc(be, sizeof(spuexh_params_t), &S.par_ea[i]);
             S.st[i] = (volatile spuexh_status_t *)be->alloc(be, sizeof(spuexh_status_t), &S.st_ea[i]);
@@ -521,7 +542,7 @@ int spuexh_run_sweep(spuexh_backend_t *be, const spuexh_runcfg_t *rc0, const spu
             int idx[6], n = 0;
             for (int i = 0; i < spus; i++) if (!S.finished[i] && !S.dead[i]) idx[n++] = i;
             if (!n) break;
-            if (attempt > rc.max_faults) { res->aborted = 1; fprintf(sink->out, "META,sweep_error,max_faults_reached\n"); break; }
+            if (attempt > rc->max_faults) { res->aborted = 1; fprintf(sink->out, "META,sweep_error,max_faults_reached\n"); break; }
             if (!launched_once) S.t0 = spuexh_now();
             spuexh_thread_res_t tr[6];
             const int rv = sweep_launch(&S, idx, n, tr);
@@ -598,11 +619,6 @@ typedef struct {
     spuexh_caseout_t out[96];
 } spec_buf_t;
 
-static const spuexh_op_t *find_op(const char *name) {
-    for (int k = 0; k < SPUEXH_NOPS; k++) if (!strcmp(spuexh_ops[k].name, name)) return &spuexh_ops[k];
-    return NULL;
-}
-
 /* Runs the n cases in one group (mode CASES or RAW). Returns the number of cases that reached state 2, -1 when the
  * group was stopped by the supervisor or faulted (the callers re-run the cases one by one), or -2 when the launch
  * could not be contained: the callers record the FATAL row the backend's res describes and stop the probe.
@@ -671,21 +687,21 @@ static const uint64_t DP_VALS[] = {
 
 static void putdp(uint32_t *q, int lane, uint64_t v) { q[2 * lane] = W32((uint32_t)(v >> 32)); q[2 * lane + 1] = W32((uint32_t)v); }
 
-int spuexh_run_special_a(spuexh_backend_t *be, const spuexh_runcfg_t *rc, const spuexh_sink_t *sink, int accepted[5]) {
+int spuexh_run_special_a(spuexh_backend_t *be, const spuexh_runcfg_t *rc, const spuexh_sink_t *sink) {
     static spuexh_case_t cs[96]; static spuexh_caseout_t outs[96]; static spuexh_thread_res_t tr;
     FILE *f = sink->out;
-    for (int q = 0; q < 5; q++) accepted[q] = 0;
     for (int q = 0; q < 5; q++) {
-        const spuexh_op_t *op = find_op(spuexh_dpcmp_names[q]);
-        if (!op) continue;
-        if (rc->a_ops[0] && !name_match(rc->a_ops, op->name)) continue;
+        const char *const name = spuexh_dpcmp[q].name;
+        const uint32_t word = spuexh_dpcmp[q].word;
+        const int tsv = spuexh_dpcmp[q].tsv;
+        if (rc->a_ops[0] && !name_match(rc->a_ops, name)) continue;
         /* case list of this op */
         static spuexh_case_t all[1700]; int nall = 0;
-        if (q < 4) {                             /* binary compares: every ordered pair of DP_VALS, two lanes per call */
+        if (!tsv) {                              /* binary compares: every ordered pair of DP_VALS, two lanes per call */
             const int pairs = NDP * NDP;
             for (int p = 0; p < pairs; p += 2) {
                 spuexh_case_t *c = &all[nall]; memset(c, 0, sizeof *c);
-                c->word = W32(op->word); c->flags = W32((uint32_t)op->rt); c->id = W32((uint32_t)nall);
+                c->word = W32(word); c->flags = W32((uint32_t)SPUEXH_DPCMP_RT); c->id = W32((uint32_t)nall);
                 putdp(c->a, 0, DP_VALS[p / NDP]); putdp(c->b, 0, DP_VALS[p % NDP]);
                 if (p + 1 < pairs) { putdp(c->a, 1, DP_VALS[(p + 1) / NDP]); putdp(c->b, 1, DP_VALS[(p + 1) % NDP]); }
                 nall++;
@@ -694,7 +710,7 @@ int spuexh_run_special_a(spuexh_backend_t *be, const spuexh_runcfg_t *rc, const 
             for (uint32_t i7 = 0; i7 < 128; i7++)
                 for (int p = 0; p < NDP; p += 2) {
                     spuexh_case_t *c = &all[nall]; memset(c, 0, sizeof *c);
-                    c->word = W32(op->word | (i7 << op->imm_shift)); c->flags = W32((uint32_t)op->rt); c->id = W32((uint32_t)nall);
+                    c->word = W32(word | (i7 << SPUEXH_DPTSV_I7_SHIFT)); c->flags = W32((uint32_t)SPUEXH_DPCMP_RT); c->id = W32((uint32_t)nall);
                     putdp(c->a, 0, DP_VALS[p]); if (p + 1 < NDP) putdp(c->a, 1, DP_VALS[p + 1]);
                     nall++;
                 }
@@ -704,10 +720,9 @@ int spuexh_run_special_a(spuexh_backend_t *be, const spuexh_runcfg_t *rc, const 
         int ok = run_cases(be, SPUEXH_MODE_CASES, &all[0], 1, rc->case_timeout_ms, outs, &tr, &started, f);
         if (ok == -2) { fatal_row(f, &tr, "launch"); return -1; }
         char d1[200]; clean(d1, sizeof d1, tr.desc);
-        fprintf(f, "SPECA_VALID,%s,%s,word_%08x,started_%u,%s\n", op->name, ok == 1 ? "executed" : "NOT_executed", W32(all[0].word), started, d1);
+        fprintf(f, "SPECA_VALID,%s,%s,word_%08x,started_%u,%s\n", name, ok == 1 ? "executed" : "NOT_executed", W32(all[0].word), started, d1);
         fflush(f);
         if (ok != 1) continue;
-        accepted[q] = 1;
         /* the rest in batches; a batch that does not complete is re-run case by case */
         for (int b0 = 0; b0 < nall; b0 += 96) {
             const int nb = nall - b0 < 96 ? nall - b0 : 96;
@@ -718,7 +733,7 @@ int spuexh_run_special_a(spuexh_backend_t *be, const spuexh_runcfg_t *rc, const 
                 for (int i = 0; i < nb; i++) {
                     char a[40], bb[40], r[40];
                     hex128(a, cs[i].a); hex128(bb, cs[i].b); hex128(r, outs[i].r);
-                    fprintf(f, "SPECA,%s,%08x,%u,%s,%s,%s\n", op->name, W32(cs[i].word), W32(cs[i].id), a, bb, r);
+                    fprintf(f, "SPECA,%s,%08x,%u,%s,%s,%s\n", name, W32(cs[i].word), W32(cs[i].id), a, bb, r);
                 }
             } else {
                 for (int i = 0; i < nb; i++) {
@@ -727,12 +742,12 @@ int spuexh_run_special_a(spuexh_backend_t *be, const spuexh_runcfg_t *rc, const 
                     if (k == -2) { fatal_row(f, &tr, "launch"); return -1; }
                     hex128(a, cs[i].a); hex128(bb, cs[i].b); hex128(r, o1.r);
                     clean(d1, sizeof d1, tr.desc);
-                    if (k == 1) fprintf(f, "SPECA,%s,%08x,%u,%s,%s,%s\n", op->name, W32(cs[i].word), W32(cs[i].id), a, bb, r);
-                    else fprintf(f, "SPECA_FAULT,%s,%08x,%u,%s,%s,%s\n", op->name, W32(cs[i].word), W32(cs[i].id), a, bb, d1);
+                    if (k == 1) fprintf(f, "SPECA,%s,%08x,%u,%s,%s,%s\n", name, W32(cs[i].word), W32(cs[i].id), a, bb, r);
+                    else fprintf(f, "SPECA_FAULT,%s,%08x,%u,%s,%s,%s\n", name, W32(cs[i].word), W32(cs[i].id), a, bb, d1);
                 }
             }
             fflush(f);
-            if (sink->ui) { char b[96]; snprintf(b, sizeof b, "special A: %s %d/%d", op->name, b0 + nb, nall); if (sink->ui(sink->uu, b)) return 1; }
+            if (sink->ui) { char b[96]; snprintf(b, sizeof b, "special A: %s %d/%d", name, b0 + nb, nall); if (sink->ui(sink->uu, b)) return 1; }
         }
     }
     return 0;
@@ -840,17 +855,6 @@ static void lane_close_row(FILE *f, const char *kind, const char *on, const char
     fflush(f);
 }
 
-/* The sweep's rule for the DP compares: only when probe A showed that the SPU executes them (or forced); else a SKIP row. */
-static int lane_dpcmp_skipped(const spuexh_runcfg_t *rc, FILE *f, int op, const char *on) {
-    int skip = 0;
-    for (int k = 0; k < 5 && !rc->force_dpcmp; k++)
-        if (!strcmp(spuexh_ops[op].name, spuexh_dpcmp_names[k]) && !(rc->dpcmp_known && rc->dpcmp_ok[k])) {
-            fprintf(f, "SKIP,%s,%s\n", on, rc->dpcmp_known ? "rejected_by_special_a" : "special_a_not_run");
-            skip = 1;
-        }
-    return skip;
-}
-
 int spuexh_run_lanes(spuexh_backend_t *be, const spuexh_runcfg_t *rc, const spuexh_sink_t *sink) {
     FILE *f = sink->out;
     if (!rc->nlanes && !rc->nsums) return 0;
@@ -869,7 +873,6 @@ int spuexh_run_lanes(spuexh_backend_t *be, const spuexh_runcfg_t *rc, const spue
         lane_name(on, sizeof on, op, rc->lanes[q].scale);
         const char *dn = spuexh_dom_names[dom];
         const uint32_t blk = rc->lanes[q].blk, start = rc->lanes[q].start, count = (uint32_t)rc->lanes[q].count;
-        if (lane_dpcmp_skipped(rc, f, op, on)) continue;
         /* pre-log: flushed before the launch, so a lost run names the entry that was being attempted */
         fprintf(f, "LANES,%s,%s,%u,%u,%u,%u\n", on, dn, blk, count, (unsigned)spuexh_ops[op].imm_bits, start);
         fflush(f);
@@ -901,7 +904,6 @@ int spuexh_run_lanes(spuexh_backend_t *be, const spuexh_runcfg_t *rc, const spue
         uint64_t calls = exh_doms[dom].ncalls - ((uint64_t)blk << EXH_BLOCK_LOG2);
         if (calls > EXH_BLOCK) calls = EXH_BLOCK;
         const uint32_t nchunks = (uint32_t)((calls + chunk - 1) / chunk);
-        if (lane_dpcmp_skipped(rc, f, op, on)) continue;
         fprintf(f, "LANESUM_BEGIN,%s,%s,%u,%u,%u\n", on, dn, blk, chunk, nchunks);
         fflush(f);
         if (lane_launch(be, rc, f, &x, SPUEXH_MODE_LANESUM, op, rc->sums[q].scale, dom, blk, 0, chunk, SPUEXH_LANESUM_MAX_CHUNKS, &o) < 0) return -1;

@@ -35,7 +35,7 @@ reaches arena A, and the arenas must be moved (constants in `spuexh.h`, used by 
 Independent check of the instruction words (every op is assembled with the GNU SPU assembler and compared):
 
 ```
-PS3DEV=<prefix> python3 tools/hwprobe/probes/spuexh/verify_encodings.py .      # 198 ops checked against spu-as, 0 mismatches
+PS3DEV=<prefix> python3 tools/hwprobe/probes/spuexh/verify_encodings.py .      # 193 ops and 5 special-A words checked against spu-as, 0 mismatches
 ```
 
 ## 2. Dry run without a console (do this first)
@@ -45,6 +45,10 @@ The very SPU ELF that goes into the SELF runs in the toolkit's interpreter and w
 ```
 PS3DEV=<prefix> tools/hwprobe/probes/spuexh/dryrun.sh smoke OUT_DIR       # builds the ELF and the driver, runs, compares with scalar.txt
 ```
+
+`dryrun.sh` runs the sweep one domain per process with the special probes off; probe A (expected in the interpreter: all five
+`NOT_executed`, like the hardware) runs with the driver directly: `host/spuexh_host --elf probes/spuexh/spu/spuexh.elf --cfg
+probes/spuexh/cfg/specialA.cfg --out specialA_dry.txt`.
 
 The driver `host/spuexh_host` accepts the same configuration keys (`--cfg FILE`, `--set key=value`, `--preset P`) plus
 `--plan` (jobs, hashes and calls of a configuration), `--no-sweep`, `--special-a`, `--special-b`, `--inject SPU:N`
@@ -63,11 +67,18 @@ connect, or a failed terminate after a supervisor end).
 | `stride_all`, `stride_heavy`, `bmax`, `stride_dom=NAME:S;NAME:S`, `bmax_dom=NAME:N` | a block is hashed when `block % stride == 0` (the host harness' rule; heavy = the 44 conversion scales other than 173/155); `bmax` keeps only blocks below it |
 | `ops=a,b*`, `skip_ops=`, `doms=` | comma lists of names; a trailing `*` is a prefix (`cflts*`) |
 | `spus=N` | SPU threads (1..6, default 6); fewer are used if the system refuses a group of that size |
-| `special_a=0\|1`, `a_ops=`, `special_b=0\|1`, `special_b_max=N`, `special_b_from=N`, `sweep=0\|1` | the two special probes and the sweep, each switchable; `special_b_from` resumes a lost probe B; `force_dpcmp=1` runs dfceq/dfcmeq/dfcgt/dfcmgt/dftsv in the sweep without probe A's acceptance |
+| `special_a=0\|1`, `a_ops=`, `special_b=0\|1`, `special_b_max=N`, `special_b_from=N`, `sweep=0\|1` | the two special probes and the sweep, each switchable; `a_ops` narrows probe A to a comma list of its five words; `special_b_from` resumes a lost probe B |
 | `special_b_count=N`, `special_b_patterns=zero\|both` | probe B staging: stop after N words (0 = every word) and use only the zero operand pattern or both; the first B run is `special_b_count=1 special_b_patterns=zero` (one zero-pattern word) |
 | `lanes=OP:DOMAIN:BLOCK[:COUNT[:START]]`, `lanesum=OP:DOMAIN:BLOCK:CHUNK` | per-lane dump of COUNT (default 64, max 1024) calls of a block from call START (default 0), and one hash per chunk of CHUNK calls over a whole block; each repeatable up to 16 times, conversions at any I8 scale (`cflts@45`), see section 6a; set after `preset=` |
 | `stall_s` (120), `max_faults` (24), `case_timeout_ms` (2000), `b_timeout_ms` (600), `launch_timeout_ms` (10800000) | hang detection and limits. Every launch kind is bounded end to end: `case_timeout_ms`, `b_timeout_ms` and `launch_timeout_ms` must be positive (the probe rejects 0 and negatives at start-up); `stall_s >= 0` (0 = rely on the launch limit alone) |
 | `pad`, `hold_s`, `screen`, `tag`, `outdir`, `fw_version`, `fw_type`, `console_model`, `progress_file` | as the other probes (declare the console so it reaches the result header); `outdir` must stay inside `/dev_hdd0/tmp/hwprobe` |
+
+**The configuration fails closed.** An unknown key (a typo such as `special_bb=1` or `launch_timeout=...`), a non-blank line
+without `=` and a bad value (`special_a`, `special_b` and `sweep` take exactly 0 or 1) stop the probe at start-up, before any SPU
+is started; the first error of the file is reported and nothing falls back to a default. On the console the error is shown on
+the screen and written as `FATAL,cfg,<text>` (for example `FATAL,cfg,unknown key 'special_bb'`) into a result file of its own
+(the screen may be off, `screen=0`); a bad `outdir` is the exception: nothing is written outside `/dev_hdd0/tmp/hwprobe`, so the
+error is only on the screen. The host driver exits 2 with the same text on stderr, before it opens the ELF or the output.
 
 ### Launch and termination policy
 
@@ -84,16 +95,16 @@ no timeout - so the probe does **not** join: it writes a `FATAL,launch,...` row 
 and process exit lets lv2 reclaim the live group. A launch whose exception-queue connect fails is a launch failure: the
 unstarted group is destroyed and nothing runs.
 
-What lv2 returns from `sysSpuThreadGetExitStatus` for a running or exception-stopped thread is **unverified in this
-tree** (PSL1GHT's `sys/spu.h` documents only "zero if no error occured, nonzero otherwise"): the probe records every
-non-zero code in `META,exit_status_pending,0x...` rows (first occurrence per code), so the first hardware run settles the
-semantics. Both the FATAL text and those rows are the evidence the strict policy is based on.
+What lv2 returns from `sysSpuThreadGetExitStatus` for an exception-stopped thread is **`0x8001000F` (`CELL_ESTAT`)**, measured
+on the console (r002, CECHC04 4.81 REBUG; section 7). PSL1GHT's `sys/spu.h` documents only "zero if no error occured, nonzero
+otherwise", so the probe keeps recording every non-zero code in `META,exit_status_pending,0x...` rows (first occurrence per
+code). Both the FATAL text and those rows are the evidence the strict policy is based on.
 
 The stage configs set `screen=0`: the on-screen status path can wait unboundedly (RSX label wait in `common/hwprobe_ui.c`,
 `rsxFinish` at shutdown), so a console stage runs without the screen; the result file is the record.
 
-The dp compares are only run in the sweep when probe A showed that the SPU executes them (an unaccepted op gets a
-`SKIP,<op>,rejected_by_special_a` row); with `special_a=0` they are skipped too (`special_a_not_run`).
+Probe A (the five DP compares, which the retail SPU does not execute) is independent of the sweep: they are not ops of the sweep
+and no row is skipped for them.
 
 Plan and cost per configuration. Jobs, hashes and op applications are exact (`spuexh_host --plan`); the time is an
 ESTIMATE from the number of SPU instructions the interpreter executes for one job of each domain (summed over the
@@ -101,11 +112,11 @@ plan, `estimate_runtime.py`), divided by 6 SPUs and by an assumed 0.5 to 1.0 ins
 
 | config | jobs | hashes | op applications | SPU instructions | estimated sweep time | note |
 |---|---|---|---|---|---|---|
-| `smoke` (block 0 of everything) | 37 | 315 | 2.7e8 | 8.4e10 | 4 to 9 s | |
-| `standard` (every 64th block) | 181 | 1445 | 1.5e9 | 4.2e11 | 22 to 44 s | |
-| `priority` (frest frsqest fi and the 48 conversions, every block) | 1056 | 51232 | 5.4e10 | 7.5e12 | 6.5 to 13 min | the ops no independent oracle exists for |
-| `full` (everything, every block) | 9988 | 79026 | 8.3e10 | 2.3e13 | 20 to 41 min | |
-| `special` (probes A and B, no sweep) | | | | | 1 to 15 min | about 1600 thread groups; the time is the group launch cost, unknown |
+| `smoke` (block 0 of everything) | 36 | 302 | 2.6e8 | 8.5e10 | 4 to 9 s | |
+| `standard` (every 64th block) | 180 | 1432 | 1.4e9 | 4.2e11 | 22 to 44 s | |
+| `priority` (frest frsqest fi and the 48 conversions, every block) | 1056 | 51232 | 5.4e10 | 7.6e12 | 6.6 to 13 min | the ops no independent oracle exists for |
+| `full` (everything, every block) | 9987 | 78989 | 8.3e10 | 2.4e13 | 21 to 41 min | |
+| `special` (probes A and B, no sweep) | | | | | 1 to 15 min | about 1600 thread groups (5 of probe A, 789 x 2 of probe B); the time is the group launch cost, unknown |
 
 (`estimate_runtime.py <dir of per-domain dry-run files> <spuexh_host> smoke standard cfg/priority.cfg full` reproduces the table.)
 The interpreter runs about 1.5e8 SPU instructions per second per host core, so `dryrun.sh standard` takes about 15 minutes
@@ -132,8 +143,8 @@ previous one was clean - `META,completed,1`, no `FATAL` row, expected hash count
 1. `stage0` (`cfg/stage0.cfg`): one SPU, integer-only domains and ops, block 0 of everything, no special probes.
    Proves the SPU program, the thread groups, the exception queue, the result file and bounded termination on
    known integer code.
-2. `specialA` (`cfg/specialA.cfg`): probe A alone (the five DP compares as raw words).
-3. `smoke` (`cfg/smoke.cfg`): block 0 of every domain and op, with probe A.
+2. `specialA` (`cfg/specialA.cfg`): probe A alone (the five DP compares as raw words; expected: none executes).
+3. `smoke` (`cfg/smoke.cfg`): block 0 of every domain and op, with probe A as the regression check.
 4. `standard` (`cfg/standard.cfg`), then `priority` (`cfg/priority.cfg`) and `full` (`cfg/full.cfg`) - set
    `--timeout` to 3600 or 7200 for these; the run window stays 60 because the probe creates its files at once.
 5. Probe B in batches, one `specialb*.cfg` at a time, each word in its own thread group: first exactly one word
@@ -195,7 +206,7 @@ Reading the three-way result:
   the scalar reference from a current toolkit.)
 - hardware != interp (== scalar or not): the toolkit's semantics of the op are wrong (or the console is not a plain Cell:
   see the per-launch `META,launchN_spuM_fpscr` rows).
-- the five ops of probe A and the 784 words of probe B have their own sections.
+- probe A (the five DP compares, expected NOT executed) and the 789 words of probe B have their own sections.
 
 `compare_exhaustive.py` (the host harness' own tool) reads the hash rows of a result file with `--no-localise`: its reader
 takes four tab-separated fields and skips blank and `#` rows, so reduce a result file to the lines that contain a tab first.
@@ -211,8 +222,8 @@ must exist, or the configuration is rejected at start-up (`cflts@0:w32:0`: op na
 one launch on one SPU, bounded by `launch_timeout_ms` like a sweep launch (a lanes job runs for milliseconds: the config sets
 60000), with the same FATAL row when a launch cannot be contained; a faulting entry becomes a `LANES_FAULT` row and the next entry
 runs. Rows are flushed per entry. The generator, the op table, the immediate patching and the stub are the sweep's
-(`spu_main.c`: `gen_chunk`, `op_word`), so the dump sees the inputs the hashes saw. The dp compares (`dfceq` ...) follow the
-sweep's rule: only after probe A accepted them (or `force_dpcmp=1`), else a `SKIP` row. Lanes run after the special probes and
+(`spu_main.c`: `gen_chunk`, `op_word`), so the dump sees the inputs the hashes saw. The five DP compares are not ops (probe A
+has them): a `lanes=dfceq:...` entry is an unknown op and the configuration is rejected at start-up. Lanes run after the special probes and
 before the sweep; `cfg/lanes_conv.cfg` runs lanes alone (`sweep=0 special_a=0 special_b=0 spus=1`) for the conversions the sweep
 found different from the toolkit: `cflts`/`cfltu` at I8 scale 0, 1, 2 on `w32` block 0 (256 calls), the scale-173 control
 (64 calls) and `fesd` on `w32e` block 0 (256 calls).
@@ -269,25 +280,46 @@ holds a commented `lanes=` template for the chunks found.
 
 ## 7. Reading the special probes
 
-**How the SPU reports an invalid instruction.** Not verified here (no hardware, no Sony documentation in this tree), so
-the probe records whatever comes back. What is expected: on a Cell SPU an instruction word the decoder does not know stops the
-SPU and sets the *invalid instruction* bit (0x20) of its SPU_Status register and raises the class 0 *SPU error* interrupt
-(Linux `arch/powerpc/include/asm/spu.h`, `SPU_STATUS_INVALID_INSTR 0x20`; libspe2 `SPE_SPU_INVALID_INSTR`); lv2 turns it into an
-event on the exception queue of the SPU thread group (cause `SPU_EXCEPTION_SPU_ERROR` 0x0004 in PSL1GHT's `sys/spu.h`). A thread
-group without a connected exception queue loses the whole process on such an event, which is why every group the probe starts has
-one (`sysSpuThreadGroupConnectEvent(group, queue, SPU_THREAD_GROUP_EVENT_EXCEPTION)`). A probe-B word that is valid on the hardware
-falls through and is recorded with the registers it changed; one that is not stops the thread, and the row's text holds
-the join cause and status and the event words (`event[src= d1= d2= d3=]`) exactly as lv2 delivered them. A `SPECB_TRY`
+**How the SPU reports an invalid instruction (measured).** Evidence tier: hardware, direct - the `specialA` run r002 on a CECHC04,
+firmware 4.81 REBUG (`CEX REBUG Cobra 7.5`), words `dfceq dfcmeq dfcgt dfcmgt dftsv` (`SPECA_VALID,<op>,NOT_executed` x 5). An
+instruction word the SPU does not decode stops that SPU thread and lv2 raises an **SPU error event on the thread group's
+exception queue** (`sysSpuThreadGroupConnectEvent(group, queue, SPU_THREAD_GROUP_EVENT_EXCEPTION)`, which every group the probe
+starts has; a group without it would lose the whole process). What r002 recorded per word:
+
+- the group did not end by itself: the probe took the terminate-then-join path (`META,terminate_join,launchN`), and the join
+  returned 0 with **cause 4** (`SPU_EXCEPTION_SPU_ERROR` in PSL1GHT's `sys/spu.h`), `status=0x7e57` and `exit=0xffffffff` (the
+  thread's exit-status field as the probe logged it for a thread that had not exited); the row text:
+  `join 0x00000000 cause=4 status=0x7e57 exit=0xffffffff FAULT terminate-join event[src=...]`;
+- the terminate itself succeeded (the row text ends `terminate 0x000...`; the text field is cut at 200 characters, so the
+  rest of the terminate code is not in the file);
+- `sysSpuThreadGetExitStatus` on the stopped thread returned **`0x8001000F` (`CELL_ESTAT`)**: one
+  `META,exit_status_pending,0x8001000f` row in the file. A stopped thread therefore does not report an exit status, and the
+  strict policy above never reads a non-zero code as a result;
+- the event words are `src=ffffffff53505503` and `d1` = `0x0403010000030100` for the first word (`dfceq`; the last bytes count up
+  per word), `d2=0x11fb400000004`, `d3=0`, as lv2 delivered them.
+
+Not measured: the SPU_Status register itself (no way to read it from the PPU after lv2 took the thread), and Sony documents no
+description of the event words in this tree; the Linux/libspe2 names (`SPU_STATUS_INVALID_INSTR 0x20`, `SPE_SPU_INVALID_INSTR`)
+are the analogue, not evidence for this lv2. A probe-B word that is valid on the hardware falls through and is recorded
+with the registers it changed; one that is not ends as above and the row's text holds the join cause and status and the event words
+(`event[src= d1= d2= d3=]`). A `SPECB_TRY`
 row (prefix index, pattern, exact word) is flushed before each word's group starts, so a lost run names the word that
 was being attempted even when no outcome row followed; resume with `special_b_from=<index of the last SPECB_TRY row + 1>`.
 
-**Probe A.** For each of `dfceq dfcmeq dfcgt dfcmgt dftsv` the first case runs alone: `SPECA_VALID,<op>,executed` means the
-SPU executed it; the `SPECA` rows hold the operands and the result quadword of every case. The denormal repros of
-EXHAUSTIVE.md 3.4 (`dfceq(0x800A56DA8A8D5917, 0x8008000000000000)`, `dfcgt(0x000F6B9D2B8B96A2, 0x8008000000000000)`) are among the
-cases; `compare_spuexh.py` prints them with the hardware result. A result that is neither all-ones nor zero per doubleword
-means the word did not act as a compare (an SPU that treats an unknown opcode as a no-op returns operand `a` unchanged).
+**Probe A.** The five words `dfceq dfcmeq dfcgt dfcmgt dftsv` are no longer ops of the sweep (the toolkit decodes them as an invalid
+instruction, #124), so probe A has them as a fixed list in `common/spuexh_core.c` (`0x78610183 0x79610183 0x58610183
+0x59610183 0x77E00183`, the last with the 7-bit mask at bit 14; `verify_encodings.py` assembles each with spu-as and compares).
+The first case of each runs alone: `SPECA_VALID,<op>,NOT_executed` is the expected answer (hardware, CECHC04 4.81, r002: all five
+end as an invalid instruction, and the interpreter's dry run gives the same). An `executed` row means the hardware executes a word
+the toolkit decodes as invalid: the remaining cases then run and their operands and result quadwords are in the `SPECA` rows, and
+`compare_spuexh.py` reports a REGRESSION and exits 1. The probe stays in `cfg/specialA.cfg`, `smoke`, `standard` and `full` as that
+regression check; it no longer gates anything in the sweep (no `SKIP` rows, no `force_dpcmp`).
 
-**Probe B.** One word per undecoded prefix and operand pattern; read the table in the comparison output.
+**Probe B.** One word per undecoded prefix and operand pattern; read the table in the comparison output. Since #124 the toolkit
+decodes the five DP prefixes of probe A (`0x2c3 0x2cb 0x3bf 0x3c3 0x3cb`) as undecoded too, so the list has **789** prefixes (the
+784 of before and these five) and probe B runs them as well. The prefix index of `special_b_from=N` and of the `SPECB`/`SPECB_TRY`
+rows is the position in that sorted list: indexes of a run from before #124 (784 prefixes) are the same below prefix `0x2c3` and
+shifted by one to five above it, so resume such a run by prefix, not by index.
 
 ## 8. Cautions
 
