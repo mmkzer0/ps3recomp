@@ -684,7 +684,7 @@ if(PS3RECOMP_BUILD_TESTS)
         target_compile_options(test_thread_qos PRIVATE -Wall -Wextra)
         target_link_libraries(test_thread_qos PRIVATE Threads::Threads)
         add_test(NAME thread_qos COMMAND test_thread_qos)
-        set_tests_properties(thread_qos PROPERTIES LABELS "runtime;t0;tsan" TIMEOUT 60)
+        set_tests_properties(thread_qos PROPERTIES LABELS "runtime;t0;tsan" TIMEOUT 120)
     endif()
 
     # cellSync.h from C++, with <stdatomic.h> included first: the generated NID

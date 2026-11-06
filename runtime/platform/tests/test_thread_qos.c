@@ -29,6 +29,11 @@
 #  include <pthread/qos.h>
 #endif
 
+/* The waits have no bound of their own: a thread at the IDLE level runs at the
+ * background QoS class, which a saturated host (the full suite at -j8) can
+ * starve for longer than 10 s. ctest's TIMEOUT bounds the run instead. */
+#define WAIT_MS INFINITE
+
 static int g_pass, g_fail;
 #define CHECK(cond) do { if (cond) g_pass++; else { g_fail++; \
     fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); } } while (0)
@@ -88,7 +93,7 @@ static void test_self(void)
         self_job j = { k_levels[i].level, FALSE, { 0, 0 }, 0 };
         HANDLE h = CreateThread(NULL, 0, self_worker, &j, 0, NULL);
         CHECK(h != NULL);
-        CHECK(WaitForSingleObject(h, 10000) == WAIT_OBJECT_0);
+        CHECK(WaitForSingleObject(h, WAIT_MS) == WAIT_OBJECT_0);
         CloseHandle(h);
         CHECKF(j.ok, "SetThreadPriority(self, %s) succeeds", k_levels[i].name);
         CHECKF(j.prio == k_levels[i].level, "%s: GetThreadPriority %d", k_levels[i].name, j.prio);
@@ -122,7 +127,7 @@ static void test_suspended(void)
         CHECK(SetThreadPriority(h, k_levels[other].level));
         CHECK(SetThreadPriority(h, k_levels[i].level));
         CHECK(ResumeThread(h) == 1);
-        CHECK(WaitForSingleObject(h, 10000) == WAIT_OBJECT_0);
+        CHECK(WaitForSingleObject(h, WAIT_MS) == WAIT_OBJECT_0);
         CloseHandle(h);
         CHECKF(j.prio == k_levels[i].level, "%s: GetThreadPriority %d", k_levels[i].name, j.prio);
 #ifdef __APPLE__
@@ -140,7 +145,7 @@ static void test_untouched(const qos_state* creator)
     HANDLE h = CreateThread(NULL, 0, susp_worker, &j, CREATE_SUSPENDED, NULL);
     CHECK(h != NULL);
     CHECK(ResumeThread(h) == 1);
-    CHECK(WaitForSingleObject(h, 10000) == WAIT_OBJECT_0);
+    CHECK(WaitForSingleObject(h, WAIT_MS) == WAIT_OBJECT_0);
     CloseHandle(h);
     CHECK(j.prio == THREAD_PRIORITY_NORMAL);
     CHECKF(j.start.qos == creator->qos && j.start.rel == creator->rel,
@@ -157,7 +162,7 @@ static DWORD WINAPI parked_worker(LPVOID arg)
     run_job* j = (run_job*)arg;
     j->before = read_qos();
     SetEvent(j->ready);
-    WaitForSingleObject(j->go, 10000);
+    WaitForSingleObject(j->go, WAIT_MS);
     j->after = read_qos();
     return 0;
 }
@@ -167,7 +172,7 @@ static void test_running_other(void)
     run_job j = { CreateEventW(NULL, TRUE, FALSE, NULL), CreateEventW(NULL, TRUE, FALSE, NULL), { 0, 0 }, { 0, 0 } };
     HANDLE h = CreateThread(NULL, 0, parked_worker, &j, 0, NULL);
     CHECK(h != NULL);
-    CHECK(WaitForSingleObject(j.ready, 10000) == WAIT_OBJECT_0);
+    CHECK(WaitForSingleObject(j.ready, WAIT_MS) == WAIT_OBJECT_0);
 
     /* Its class cannot be set from here, and the sched-param route would cost it the class. */
     SetLastError(0);
@@ -177,7 +182,7 @@ static void test_running_other(void)
     CHECK(GetThreadPriority(h) == THREAD_PRIORITY_NORMAL);  /* the record says what the thread has */
 
     SetEvent(j.go);
-    CHECK(WaitForSingleObject(h, 10000) == WAIT_OBJECT_0);
+    CHECK(WaitForSingleObject(h, WAIT_MS) == WAIT_OBJECT_0);
     CloseHandle(h);
     CHECKF(j.before.qos != 0 && j.after.qos == j.before.qos && j.after.rel == j.before.rel,
            "a refused request leaves the class alone: before 0x%02x rel %d, after 0x%02x rel %d",
@@ -208,7 +213,7 @@ static int test_locked(void)
     locked_job j = { 0, TRUE, 0, 0 };
     HANDLE h = CreateThread(NULL, 0, locked_worker, &j, 0, NULL);
     CHECK(h != NULL);
-    CHECK(WaitForSingleObject(h, 10000) == WAIT_OBJECT_0);
+    CHECK(WaitForSingleObject(h, WAIT_MS) == WAIT_OBJECT_0);
     CloseHandle(h);
     if (j.skipped) { fprintf(stderr, "SKIP: this host lets a thread with sched params set take a QoS class\n"); return 1; }
     CHECK(!j.ok);
