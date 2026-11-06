@@ -1538,6 +1538,28 @@ if(UNIX)
                 ps3recomp_msl_translation
                 "-framework Metal" "-framework QuartzCore" "-framework AppKit")
             target_link_options(test_metal_depth_clamp PRIVATE "-Wl,-dead_strip")
+
+            # Each fixture asserts different values with its engine switch off (macos.yml's second
+            # run), so the off arm is a test of its own. Skips (77) without a Metal device.
+            foreach(row IN ITEMS
+                    "poly_offset||" "poly_offset|off|PS3RECOMP_ENG_POLY_OFFSET=0"
+                    "depth_bounds||" "depth_bounds|off|PS3RECOMP_ENG_DEPTH_BOUNDS=0"
+                    "depth_clamp||" "depth_clamp|off|PS3RECOMP_ENG_DEPTH_CLAMP=0")
+                string(REPLACE "|" ";" parts "${row}")
+                list(GET parts 0 gpu_test)
+                list(GET parts 1 arm)
+                list(GET parts 2 arm_env)
+                set(gpu_env "PS3RECOMP_METAL_HEADLESS=1" ${arm_env})
+                if(NOT "${arm}" STREQUAL "")   # not if(arm): "off" is a false constant to CMake
+                    set(gpu_name metal_${gpu_test}_${arm})
+                else()
+                    set(gpu_name metal_${gpu_test})
+                endif()
+                add_test(NAME ${gpu_name} COMMAND test_metal_${gpu_test})
+                set_tests_properties(${gpu_name} PROPERTIES
+                    LABELS "video;gpu;t0" SKIP_RETURN_CODE 77 TIMEOUT 120
+                    ENVIRONMENT "${gpu_env}")
+            endforeach()
         endif()
     endif()
 
