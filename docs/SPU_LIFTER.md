@@ -292,8 +292,14 @@ Instructions the lifter accepts but does not fully model:
 - **`mfspr`** returns zero (`spu_mfspr` in `runtime/spu/spu_helpers.h`);
   **`mtspr`** emits a no-op comment.
 - **Double precision** (`dfa`, `dfs`, `dfm`, `dfma`, `dfms`, `dfnma`, `dfnms`,
-  `dfceq`, `dfcgt`, `dfcmeq`, `dfcmgt`, `dftsv`, `fesd`, `frds`) is lifted to
-  helpers in `runtime/spu/spu_helpers.h`; it is not a stub.
+  `fesd`, `frds`) is lifted to helpers in `runtime/spu/spu_helpers.h`; it is not
+  a stub.
+- **`dfceq`, `dfcmeq`, `dfcgt`, `dfcmgt`, `dftsv`** are not lifted at all. A
+  retail CBE SPU raises an invalid-instruction error for each (hardware probe
+  `spuexh` special A, CECHC04 with 4.81 REBUG: the thread group ends with join
+  cause 4 and the stopped thread's exit status reads `0x8001000F`; issue #124),
+  so the interpreter decodes them as `.word` and the lifter emits the same stop
+  at the word's own PC instead of a helper call.
 
 ## Tracing (for §3 diff vs RPCS3)
 

@@ -388,14 +388,9 @@ static void gen_dfrds(const exh_dom* d, uint64_t i, G* g, uint32_t need) {      
         exh_putd(&g->a, l, (s << 63) | (e << 52) | ((uint64_t)hi23 << 29) | TIE[tie]);
     }
 }
-static void gen_dtsv(const exh_dom* d, uint64_t i, G* g, uint32_t need) {              /* every I7 x every pair of special-value classes */
-    static const uint64_t CLS[16] = { 0, 0x8000000000000000ULL, 1, 0x8000000000000001ULL, 0x000FFFFFFFFFFFFFULL, 0x800FFFFFFFFFFFFFULL,
-        0x0010000000000000ULL, 0x3FF0000000000000ULL, 0xBFF0000000000000ULL, 0x7FF0000000000000ULL, 0xFFF0000000000000ULL,
-        0x7FF8000000000000ULL, 0x7FF0000000000001ULL, 0xFFF8000000000000ULL, 0xFFFFFFFFFFFFFFFFULL, 0x7FEFFFFFFFFFFFFFULL };
-    exh_zero(g);
-    exh_putd(&g->a, 0, CLS[i & 15u]); exh_putd(&g->a, 1, CLS[(i >> 4) & 15u]);
-    g->imm = (int32_t)(((uint32_t)(i >> 8) & 0x7Fu) | ((uint32_t)exh_r64(d, i, 0) & 0xFFFFFF80u));
-}
+/* dtsv is gone: a retail CBE SPU raises an invalid-instruction error for dftsv
+ * (hwprobe spuexh special A, issue #124), so the sweep has no rows for it and
+ * the domain has no generator. */
 
 /* ======================================================================================
  * domain table
@@ -438,7 +433,6 @@ static exh_dom exh_doms[] = {
     EXH_D("drand3",     1ULL << 21, gen_drand3,  0),
     EXH_D("dnear3",     1ULL << 21, gen_dnear3,  0),
     EXH_D("dfrds",      1ULL << 19, gen_dfrds,   0),
-    EXH_D("dtsv",       1ULL << 15, gen_dtsv,    0),
 };
 #define EXH_NDOMS ((int)(sizeof exh_doms / sizeof exh_doms[0]))
 static inline void exh_init(void) {

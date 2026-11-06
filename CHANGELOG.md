@@ -1,6 +1,9 @@
 # Changelog
 
 ### Unreleased
+- **`dfceq`, `dfcmeq`, `dfcgt`, `dfcmgt` and `dftsv` stop as invalid instructions** (`tools/gen_spu_interp.py`, `runtime/spu/spu_interp_tables.inc`, `runtime/spu/spu_interp.c`, `runtime/spu/spu_helpers.h`, `tools/spu_lifter.py`, `runtime/spu/tests/`, `docs/SPU_LIFTER.md`, #124): a CBE SPU raises an SPU error for each (hardware probe `spuexh` special A: join cause 4, exit status `0x8001000F`), but the interpreter and the lifter computed a result and ran on.
+  - **Change.** The five prefixes decode as `.word`, so the interpreter takes its unimplemented-op stop at the word's pc; the lifter emits the same named stop (word, pc, image) instead of a helper call. Their helpers, sweep rows and the `dtsv` generator domain are gone (the last domain, so no other hash changes).
+  - **Test.** `spu_decode` expects `.word` for the five and `dfa` still decoded; `spu_interp_loop` runs each word in all four run modes and expects the stop at its own pc; `test_spu_lifter_invalid_dp.py` expects the stop and no helper. Each fails with the five decoded again.
 - **`fesd` keeps the sign of a denormal input** (`runtime/spu/spu_helpers.h`, `runtime/spu/tests/oracle_exhaustive.py`, `runtime/spu/tests/test_spu_numeric_semantics.c`, #125): a negative denormal single extended to +0.0; a CBE SPU gives -0.0.
   - **Evidence.** Hardware sweep on a console (`tools/hwprobe` `spuexh`): 979 of 2048 `w32e` blocks differed; a lanes dump of the first differing chunks found 70 lanes, all `0x80xxxxxx` -> hw `-0.0`, model `+0.0`, every other input class equal.
   - **Test.** `spu_numeric_semantics` pins `0x80000001 -> -0.0` and `0x007FFFFF -> +0.0`, and fails on the old helper. With the fix, all 2048 `fesd` block hashes of the console's full sweep equal the scalar reference.

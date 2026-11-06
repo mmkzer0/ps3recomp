@@ -32,12 +32,28 @@ RI8 = {0x1d8: "cflts", 0x1d9: "cfltu", 0x1da: "csflt", 0x1db: "cuflt"}  # op10
 LSX = {0x1c4: "lqx", 0x144: "stqx"}
 CHANNEL = {0x00D: "rdch", 0x10D: "wrch", 0x00F: "rchcnt"}  # op11
 
+# These five RR double-precision compare/test mnemonics decode as `.word` for
+# the interpreter even though spu_disasm.py names them: a retail CBE SPU does
+# not implement them (they are later additions to the SPU ISA [INFERENCE]).
+# Executing one raises an SPU invalid-instruction error: the thread group ends
+# with join cause 4 after terminate and sys_spu_thread_get_exit_status reads
+# 0x8001000F (CELL_ESTAT) on the stopped thread. Hardware, direct: the hwprobe
+# `spuexh` special-A probe ran each word alone in its own thread group on a
+# CECHC04 with 4.81 REBUG and none executed (issue #124); RPCS3 does not
+# implement them either. spu_disasm.py keeps the mnemonics -- naming a word
+# (disassembly) is not executing it -- only the interpreter's decode remaps
+# them, so a guest that hits one stops exactly where any undecodable word
+# stops, at the word's own pc, instead of computing a result the console
+# never produced.
+DECODE_AS_INVALID = {"dfceq", "dfcmeq", "dfcgt", "dfcmgt", "dftsv"}
+
 # Every mnemonic the decoder can emit -> a stable enum. `.word` is the trap.
 all_mn = set()
 for t in (D.RRR_TABLE, D.RI18_TABLE, D.RI16_TABLE, D.RI10_TABLE, D.SPU_RR,
           RI7, RI8, LSX, CHANNEL):
     all_mn.update(t.values())
 all_mn.add(".word")
+all_mn -= DECODE_AS_INVALID
 mnems = sorted(all_mn)
 
 
@@ -142,6 +158,10 @@ def decode_prefix(p):
     for stage, bits, table in STAGES:
         mn = table.get(p >> (11 - bits))
         if mn is not None:
+            if mn in DECODE_AS_INVALID:
+                # The retail CBE SPU rejects these (DECODE_AS_INVALID above):
+                # same trap as a word no table claims, not an execution.
+                return ".word", "NONE"
             return mn, form_of(stage, mn)
     return ".word", "NONE"
 
@@ -211,7 +231,11 @@ for i, m in enumerate(mnems):
 w("")
 w('_Static_assert(SPU_OP_COUNT <= 256, "spu_op must fit the uint8_t spu_decode_tab");')
 w("")
-w("/* Indexed by insn >> 21; precedence is documented in tools/gen_spu_interp.py. */")
+w("/* Indexed by insn >> 21; precedence is documented in tools/gen_spu_interp.py.")
+w(" * dfceq, dfcmeq, dfcgt, dfcmgt and dftsv decode as SPU_word here: the retail")
+w(" * CBE SPU raises an invalid-instruction error for them (hwprobe spuexh")
+w(" * special A, CECHC04 4.81; issue #124), so they take the undecodable-word")
+w(" * trap in spu_interp.c instead of executing. */")
 w("static const uint8_t spu_decode_tab[2048] = {")
 for base in range(0, 2048, 8):
     cells = [enum_name(table[p]) + "," for p in range(base, base + 8)]

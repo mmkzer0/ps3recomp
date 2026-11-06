@@ -724,6 +724,27 @@ class SPULifter:
             return ("ctx->stop_code = 0x3FFFu; "
                     "ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;")
 
+        # dfceq, dfcmeq, dfcgt, dfcmgt, dftsv: the retail CBE SPU does not
+        # implement them (later additions to the SPU ISA [INFERENCE]); on the
+        # console executing one raises an SPU invalid-instruction error, the
+        # thread group ends with join cause 4 after terminate and the stopped
+        # thread's exit status reads 0x8001000F (CELL_ESTAT). Hardware, direct:
+        # the hwprobe `spuexh` special-A probe ran each word alone in its own
+        # thread group on a CECHC04 with 4.81 REBUG and none executed (issue
+        # #124). The interpreter decodes them as `.word` and stops at the word;
+        # lifted code must stop the same way, not call a helper and run on.
+        # This deliberately does NOT take the `.word` fallthrough at the end of
+        # this function: spu_unsupported tolerates data embedded in .text that
+        # never executes, while these are ISA-defined opcodes the console
+        # rejects, so any execution is a hard stop (fail closed), named with
+        # the word, its pc and the image.
+        if mn in ("dfceq", "dfcmeq", "dfcgt", "dfcmgt", "dftsv"):
+            return (f"/* {mn}: invalid on the CBE SPU (hwprobe spuexh special A, issue #124) */ "
+                    f"{{ extern void spu_halt(spu_context*); ctx->pc = 0x{addr:X}u; "
+                    f"fprintf(stderr, \"[spu] INVALID-OP {mn} (0x%08X) at LS 0x%05X img=%d\\n\", "
+                    f"0x{insn.raw:08X}u, 0x{addr:05X}u, ctx->image_id); "
+                    f"ctx->status = SPU_STATUS_STOPPED_BY_HALT; spu_halt(ctx); return; }}")
+
         # ---- integer arithmetic (register) ----
         rr_bin = {
             "a": "spu_a", "sf": "spu_sf", "ah": "spu_ah", "sfh": "spu_sfh",
@@ -738,10 +759,9 @@ class SPULifter:
             "fi": "spu_fi",   # floating interpolate (reciprocal refine)
             "fceq": "spu_fceq", "fcgt": "spu_fcgt",
             "fcmeq": "spu_fcmeq", "fcmgt": "spu_fcmgt",
-            # double-precision (2 doubles/reg) + double compares
+            # double-precision (2 doubles/reg); the double compares are above:
+            # invalid on the CBE SPU, so they never reach a helper
             "dfa": "spu_dfa", "dfs": "spu_dfs", "dfm": "spu_dfm",
-            "dfceq": "spu_dfceq", "dfcmeq": "spu_dfcmeq",
-            "dfcgt": "spu_dfcgt", "dfcmgt": "spu_dfcmgt",
             "mpyhhu": "spu_mpyhhu",
             "eqv": "spu_eqv", "absdb": "spu_absdb", "avgb": "spu_avgb",
             "cg": "spu_cg", "bg": "spu_bg",
@@ -798,7 +818,6 @@ class SPULifter:
             "andhi": "spu_andhi", "andbi": "spu_andbi",
             "orhi":  "spu_orhi",  "orbi":  "spu_orbi",
             "xorhi": "spu_xorhi", "xorbi": "spu_xorbi",
-            "dftsv": "spu_dftsv",
             # RI8 float<->int conversions with scale (i8 in ops[2])
             "cflts": "spu_cflts", "cfltu": "spu_cfltu",
             "csflt": "spu_csflt", "cuflt": "spu_cuflt",

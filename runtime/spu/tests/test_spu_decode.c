@@ -326,6 +326,26 @@ int main(void) {
         CHECK(d.op == SPU_word && d.imm == 0 && d.tgt == 0, "invalid word", i);
     }
 
+    /* dfceq, dfcmeq, dfcgt, dfcmgt and dftsv decode as the same trap on this
+     * target: a retail CBE SPU raises an invalid-instruction error for each
+     * (hwprobe spuexh special A, CECHC04 4.81; issue #124), so the generator
+     * maps their RR prefixes to SPU_word even though spu_disasm.py still names
+     * them. Every register field at its extreme proves the decode does not
+     * look at one. The neighbouring DP op keeps its decode: dfa is 0x2CC. */
+    {
+        static const uint32_t op11[5] = { 0x3C3, 0x3CB, 0x2C3, 0x2CB, 0x3BF };
+        for (unsigned k = 0; k < sizeof op11 / sizeof op11[0]; k++) {
+            uint32_t i = (op11[k] << 21) | (0x7Fu << 14) | (0x7Fu << 7) | 0x7Fu;
+            spu_ins d = dec(i, 0x40);
+            CHECK(d.op == SPU_word && d.imm == 0 && d.tgt == 0, "CBE-invalid DP op", i);
+        }
+        {
+            uint32_t i = ri7(0x2CC, 0x7F, 0x7F, 0x7F);   /* dfa (rb field = 0x7F) */
+            spu_ins d = dec(i, 0);
+            CHECK(d.op == SPU_dfa, "dfa still decodes", i);
+        }
+    }
+
     test_handler_operands();
 
     if (failures) { fprintf(stderr, "%d failure(s)\n", failures); return 1; }
