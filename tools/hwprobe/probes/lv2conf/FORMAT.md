@@ -81,5 +81,5 @@ hardware as a reference for later host support.
 
 ## Result file names
 
-`lv2conf_r<run>[_<tag>].csv` in `/dev_hdd0/tmp/hwprobe/` (or `/dev_usb000/` when that fails);
+`lv2conf_r<run>[_<tag>].csv` in `/dev_hdd0/tmp/hwprobe/` (nowhere else: a failed open stops the probe);
 `lv2conf_last.txt` names the last file, or, while a run is in progress, the case it is in.

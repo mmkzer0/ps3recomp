@@ -1,0 +1,24 @@
+diff --git a/scripts/006-gcc-newlib-SPU.sh b/scripts/006-gcc-newlib-SPU.sh
+index 625abf9..67d40e5 100755
+--- a/scripts/006-gcc-newlib-SPU.sh
++++ b/scripts/006-gcc-newlib-SPU.sh
+@@ -46,6 +46,9 @@ if [ ! -d ${GCC} ]; then
+   ln -s ../${NEWLIB}/libgloss libgloss
+ 
+   ## Download the prerequisites.
++  ## gcc 9.5.0's script fetches over ftp://, which proxied hosts cannot reach; the https mirror has the same files.
++  ## Run it through sh: sed -i on a podman/virtiofs mount of macOS rewrites the file as 0600 and drops its exec bit.
++  sed -i "s|^base_url='ftp://|base_url='https://|" contrib/download_prerequisites
+-  ./contrib/download_prerequisites
++  sh ./contrib/download_prerequisites
+ 
+   ## Leave the source code directory.
+@@ -75,7 +78,7 @@ CXXFLAGS="-Wno-int-conversion" \
+     --disable-nls \
+     --disable-shared \
+     --disable-win32-registry \
+-    --enable-languages="c,c++" \
++    --enable-languages="c" \
+     --enable-lto \
+     --enable-threads \
+     --with-newlib \

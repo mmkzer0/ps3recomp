@@ -6,6 +6,9 @@
 #   SOURCES    source directories relative to the Makefile (the shared library is added here)
 #   INCLUDES   extra include directories relative to the Makefile
 #   LIBS       extra libraries (the shared library's are added here)
+# Optional SPU program (a probe with SPU code): SPU_DIR (relative to the layer Makefile) holds an spu_rules Makefile
+# whose output is SPU_NAME.elf; it is built first and embedded in the SELF as SPU_NAME_spu.bin, i.e. the symbols
+# SPU_NAME_spu_bin / SPU_NAME_spu_bin_size declared in SPU_NAME_spu_bin.h (PSL1GHT bin2o convention).
 # build.sh passes HWP_GIT_DESCRIBE and HWP_SOURCE_SHA256 on the make command line; they end
 # up in the result header (common/hwprobe_result.c). Missing = "unknown" there.
 #
@@ -60,7 +63,7 @@ CFILES		:=	$(foreach dir,$(SOURCES),$(notdir $(wildcard $(if $(filter /%,$(dir))
 
 export LD	:=	$(CC)
 
-export OFILES	:=	$(CFILES:.c=.o)
+export OFILES	:=	$(CFILES:.c=.o) $(if $(SPU_NAME),$(SPU_NAME)_spu.bin.o)
 
 export INCLUDE	:=	$(foreach dir,$(INCLUDES), -I$(if $(filter /%,$(dir)),$(dir),$(CURDIR)/$(dir))) \
 					$(LIBPSL1GHT_INC) \
@@ -70,13 +73,25 @@ export LIBPATHS	:=	$(LIBPSL1GHT_LIB)
 
 .PHONY: $(BUILD) clean
 
-$(BUILD):
+$(BUILD): $(if $(SPU_DIR),spu-program)
 	@[ -d $@ ] || mkdir -p $@
 	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile
+
+ifneq ($(SPU_DIR),)
+.PHONY: spu-program
+spu-program:
+	@$(MAKE) --no-print-directory -C $(SPU_DIR)
+	@[ -d $(BUILD) ] || mkdir -p $(BUILD)
+	@cp -f $(SPU_DIR)/$(SPU_NAME).elf $(BUILD)/$(SPU_NAME)_spu.bin
+	@echo "extern const u8 $(SPU_NAME)_spu_bin_end[];" > $(BUILD)/$(SPU_NAME)_spu_bin.h
+	@echo "extern const u8 $(SPU_NAME)_spu_bin[];" >> $(BUILD)/$(SPU_NAME)_spu_bin.h
+	@echo "extern const u32 $(SPU_NAME)_spu_bin_size;" >> $(BUILD)/$(SPU_NAME)_spu_bin.h
+endif
 
 clean:
 	@echo clean ...
 	@rm -fr $(BUILD) $(OUTPUT).elf $(OUTPUT).self $(OUTPUT).fake.self
+	@$(if $(SPU_DIR),$(MAKE) --no-print-directory -C $(SPU_DIR) clean)
 
 #---------------------------------------------------------------------------------
 else
@@ -85,6 +100,11 @@ DEPENDS	:= $(OFILES:.o=.d)
 
 $(OUTPUT).self: $(OUTPUT).elf
 $(OUTPUT).elf: $(OFILES)
+
+# the header with the symbol declarations is written by the spu-program step above (before any C file is compiled)
+%.bin.o: %.bin
+	@echo $(notdir $<)
+	@bin2s -a 64 $< | $(AS) -o $@
 
 -include $(DEPENDS)
 

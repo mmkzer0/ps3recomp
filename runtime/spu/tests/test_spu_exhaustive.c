@@ -193,10 +193,39 @@ static int name_match(const char* pat, const char* s) {            /* comma list
     }
     return 0;
 }
-static uint64_t g_dump_n = 0;   /* --dump-n N: only the first N calls of the block */
-static void dump_block(const OP* op, const exh_dom* d, uint64_t blk) {
-    const uint64_t lo = blk << EXH_BLOCK_LOG2; uint64_t hi = lo + EXH_BLOCK; if (hi > d->ncalls) hi = d->ncalls;
+static uint64_t g_dump_n = 0;       /* --dump-n N: only N calls of the block (from --dump-start) */
+static uint64_t g_dump_start = 0;   /* --dump-start S: first call of the dump, counted from the start of the block */
+static uint64_t g_dump_hash = 0;    /* --dump-hash C: instead of the calls, one line "start count hash16" per chunk of C calls: the
+                                     * block hash (exh_fold, the sweep's) restricted to the chunk, start counted from the block start */
+/* --dump accepts a conversion at any I8 scale ("cflts@45": the instruction takes 0..255), not only the sweep's twelve. */
+static const OP* dump_op(const char* name, int nops) {
+    for (int k = 0; k < nops; k++) if (!strcmp(op_at(k)->name, name)) return op_at(k);
+    static OP sy; static char nb[16];
+    const char* at = strchr(name, '@'); char* e;
+    if (!at || at - name > 5 || at[1] < '0' || at[1] > '9' || strlen(name) >= sizeof nb) return NULL;
+    const long s = strtol(at + 1, &e, 10);
+    if (*e || s > 255) return NULL;
+    for (int k = 0; k < g_ncvt; k++) if (!strncmp(g_cvt[k].name, name, (size_t)(at - name) + 1)) {
+        sy = g_cvt[k]; snprintf(nb, sizeof nb, "%s", name); sy.name = nb; sy.imm = (int)s; return &sy;
+    }
+    return NULL;
+}
+static int dump_block(const OP* op, const exh_dom* d, uint64_t blk) {
+    const uint64_t blo = blk << EXH_BLOCK_LOG2; uint64_t hi = blo + EXH_BLOCK; if (hi > d->ncalls) hi = d->ncalls;
+    const uint64_t lo = blo + g_dump_start;
+    if (lo >= hi) { fprintf(stderr, "dump: start %llu is beyond the block (%llu calls)\n", (unsigned long long)g_dump_start, (unsigned long long)(hi - blo)); return -1; }
     if (g_dump_n && lo + g_dump_n < hi) hi = lo + g_dump_n;
+    if (g_dump_hash) {
+        for (uint64_t c = lo; c < hi; c += g_dump_hash) {
+            const uint64_t e = hi - c < g_dump_hash ? hi : c + g_dump_hash; uint64_t h = EXH_FNV_OFFSET;
+            for (uint64_t i = c; i < e; i++) {
+                G g; d->gen(d, i, &g, (uint32_t)op->need); if (op->has_imm) g.imm = op->imm;
+                V4 o = op->fn(&g); EXH_MUT(op, &g, &o); h = exh_fold(h, o);
+            }
+            printf("%llu %llu %016llx\n", (unsigned long long)(c - blo), (unsigned long long)(e - c), (unsigned long long)h);
+        }
+        return 0;
+    }
     for (uint64_t i = lo; i < hi; i++) {
         G g; d->gen(d, i, &g, (uint32_t)op->need); if (op->has_imm) g.imm = op->imm;
         V4 o = op->fn(&g); EXH_MUT(op, &g, &o); const V4 r = op->ref ? op->ref(&g) : o;
@@ -205,6 +234,7 @@ static void dump_block(const OP* op, const exh_dom* d, uint64_t blk) {
         for (int s = 0; s < 3; s++) printf(" %08x%08x%08x%08x", in[s]->w[0], in[s]->w[1], in[s]->w[2], in[s]->w[3]);
         printf(" %d %08x%08x%08x%08x %08x%08x%08x%08x\n", g.imm, o.w[0], o.w[1], o.w[2], o.w[3], r.w[0], r.w[1], r.w[2], r.w[3]);
     }
+    return 0;
 }
 
 int main(int argc, char** argv) {
@@ -224,6 +254,8 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--fpcr-rz")) rz = 1;
         else if (!strcmp(argv[i], "--list")) list = 1;
         else if (!strcmp(argv[i], "--dump-n") && i + 1 < argc) g_dump_n = strtoull(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "--dump-start") && i + 1 < argc) g_dump_start = strtoull(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "--dump-hash") && i + 1 < argc) { g_dump_hash = strtoull(argv[++i], NULL, 10); if (!g_dump_hash) { fprintf(stderr, "--dump-hash needs a chunk size > 0\n"); return 2; } }
         else if (!strcmp(argv[i], "--dump") && i + 3 < argc) { dump[0] = argv[++i]; dump[1] = argv[++i]; dump[2] = argv[++i]; }
         else { fprintf(stderr, "unknown arg %s\n", argv[i]); return 2; }
     }
@@ -239,10 +271,10 @@ int main(int argc, char** argv) {
 #endif
     }
     if (dump[0]) {
-        const OP* op = NULL; for (int k = 0; k < nops; k++) if (!strcmp(op_at(k)->name, dump[0])) op = op_at(k);
+        const OP* op = dump_op(dump[0], nops);
         exh_dom* d = exh_find_dom(dump[1]);
         if (!op || !d) { fprintf(stderr, "dump: unknown op/domain\n"); return 2; }
-        dump_block(op, d, strtoull(dump[2], NULL, 10)); return 0;
+        return dump_block(op, d, strtoull(dump[2], NULL, 10)) < 0 ? 2 : 0;
     }
     FILE* out = outp ? fopen(outp, "w") : stdout; if (!out) { perror("out"); return 2; }
     if (list) {

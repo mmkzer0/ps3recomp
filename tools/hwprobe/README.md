@@ -23,10 +23,11 @@ that run on a console and against the toolkit's HLE, with a console run as the g
 | `hwprobe_format.py` | reader of the result header (used by every probe's analysis) |
 | `probes/<probe>/` | one probe: sources, `cfg/`, `RUN.md`, format notes, analysis scripts |
 | `probes/lv2conf/` | lv2conf: one set of syscall conformance cases (`cases/`), run on a console by `layer1` (a hwprobe SELF) and on the host against the toolkit's HLE; both write the rows of `FORMAT.md`, so a console run is the golden reference for the toolkit (`RUN.md`) |
+| `probes/spuexh/` | spuexh: the SPU instruction sweep of the host harness (`runtime/spu/tests/test_spu_exhaustive.c`, same generator source, same block hashes) on the SPUs of a console, plus two special probes (do the SPUs execute `dfceq` and friends; which undecoded opcodes are valid), with a dry run of the same SPU program in the toolkit's interpreter (`probes/spuexh/RUN.md`, `FORMAT.md`) |
 
 Tests (standalone, no toolchain or console): `python3 tools/test_hwprobe_ring110_analyze.py`,
 `python3 tools/test_hwprobe_layer2.py`, `python3 tools/test_hwprobe_pn.py`, `python3 tools/test_hwprobe_ps3ftp.py`,
-`python3 tools/test_hwprobe_console.py`, `python3 tools/test_hwprobe_lv2conf.py`.
+`python3 tools/test_hwprobe_console.py`, `python3 tools/test_hwprobe_lv2conf.py`, `python3 tools/test_hwprobe_spuexh.py` (the dry-run tests need the SPU toolchain and skip without it).
 
 ## Prerequisites
 
@@ -50,6 +51,14 @@ It fetches `ps3dev/ps3toolchain` at `de85d7d5d11dc0a99d823ece3d440eea46c34d0f` (
 build tools, native architecture, no emulation). Local deviations, all deliberate: gcc is built for C only
 (C++ costs about 1 GB and 10 minutes and no probe uses it), the SPU toolchain, gdb and ps3libraries are skipped,
 PSL1GHT builds `install-ctrl`, `ppu` and `tools` only.
+
+**SPU part (opt-in).** `build-toolchain.sh --with-spu` (or `--spu-only` for the SPU part alone, `--check` combines with both)
+adds ps3toolchain steps 005 and 006 (binutils 2.22 and gcc 9.5.0 + newlib 1.20.0 for the `spu` target, the last gcc with an
+SPU backend) and PSL1GHT's `spu` libraries (`libsputhread`, `libspudma`, `libspuatomic`, the headers), same pins, C only
+(`patches/ps3toolchain-006-gcc-spu.patch`, which also fetches the gcc prerequisites over https because the stock script uses
+ftp). Without the flag nothing changes. `--native` runs the steps on a linux host that matches the container (Ubuntu 24.04
+with the Containerfile's packages) instead of in podman, `HWPROBE_JOBS=N` caps `make -j` there. A probe with SPU code
+(`probes/<probe>/spu/`) makes `build.sh` require the SPU part.
 
 The install prefix defaults to `~/ps3-dev/ps3dev-toolchain/ps3dev`; set `PS3DEV` to move it (the sources go next to
 it, override with `HWPROBE_TOOLCHAIN_ROOT`). A finished prefix is recognised from its artifacts and left alone: the
@@ -197,6 +206,11 @@ or line breaks.
 6. A host analysis that starts with `hwprobe_format.parse_header()`, a synthetic fixture generator and a standalone
    `tools/test_hwprobe_<name>_*.py` that needs no toolchain. Document the rows in `probes/<name>/FORMAT.md`.
 7. `tools/hwprobe/build.sh <name> layer1`, copy, run, fetch, analyze.
+
+A probe may carry an SPU program: `probes/<name>/spu/` (an spu_rules Makefile) and `SPU_DIR := ../spu`, `SPU_NAME := <elf name>`
+in the layer Makefile; `mk/ppu_probe.mk` builds it first and embeds the ELF as `<SPU_NAME>_spu_bin` (header
+`<SPU_NAME>_spu_bin.h` in the build directory). `probes/<name>/prebuild.sh`, if present, runs on the host before the
+container (for files the container cannot see, like the repository's `runtime/` tree, and for generated tables).
 
 ## Provenance and licences
 

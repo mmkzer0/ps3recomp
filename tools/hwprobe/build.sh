@@ -29,6 +29,10 @@ case "$PROBE$LAYER" in *[!A-Za-z0-9_.-]*) die "probe and layer must be plain dir
 SRC="$HERE/probes/$PROBE/$LAYER"
 [ -f "$SRC/Makefile" ] || die "no $SRC/Makefile"
 [ -x "$PS3DEV/bin/fself" ] || die "toolchain prefix $PS3DEV is not built; run toolchain/build-toolchain.sh"
+# A probe with SPU code (probes/<probe>/spu/) needs the SPU toolchain: build-toolchain.sh --with-spu
+if [ -d "$HERE/probes/$PROBE/spu" ] && [ ! -x "$PS3DEV/spu/bin/spu-gcc" ]; then
+  die "probe $PROBE has SPU code but $PS3DEV/spu/bin/spu-gcc is missing; run toolchain/build-toolchain.sh --with-spu"
+fi
 command -v podman >/dev/null || die "podman not found"
 podman image exists "$IMG" 2>/dev/null || die "podman image '$IMG' is missing or podman cannot be reached (macOS: 'podman machine start'); toolchain/build-toolchain.sh builds the image"
 
@@ -36,12 +40,15 @@ sha256() {
   if command -v sha256sum >/dev/null; then sha256sum "$@"; else shasum -a 256 "$@"; fi
 }
 
+# Host-side generation step of a probe (copies and tables derived from the repository; probes/<probe>/prebuild.sh)
+if [ -x "$HERE/probes/$PROBE/prebuild.sh" ]; then "$HERE/probes/$PROBE/prebuild.sh"; fi
+
 GIT_DESCRIBE="$(git -C "$HERE" describe --always --dirty --abbrev=12 2>/dev/null || true)"
 GIT_DESCRIBE="$(printf '%s' "${GIT_DESCRIBE:-unknown}" | tr -c 'A-Za-z0-9._-' '_')"
 # Hash of every file that goes into the binary: the shared library, the build rules and the probe
 # (sorted, so the order of the file system does not matter; outputs and results are not part of it).
 SRC_SHA="$(cd "$HERE" && LC_ALL=C find common mk "probes/$PROBE" -type f \
-  \( -name '*.c' -o -name '*.h' -o -name '*.mk' -o -name Makefile \) -not -path '*/build/*' \
+  \( -name '*.c' -o -name '*.h' -o -name '*.S' -o -name '*.mk' -o -name Makefile \) -not -path '*/build/*' \
   | LC_ALL=C sort | while read -r f; do sha256 "$f"; done | sha256 | cut -d' ' -f1)"
 
 TARGET="$(grep -E '^TARGET[[:space:]]*:?=' "$SRC/Makefile" | head -1 | cut -d= -f2 | tr -d ' \t')"
@@ -50,7 +57,7 @@ TARGET="$(grep -E '^TARGET[[:space:]]*:?=' "$SRC/Makefile" | head -1 | cut -d= -
 in_container() {
   podman run --rm -v "$HERE:$HERE" -v "$PS3DEV:$PS3DEV:ro" -w "$SRC" \
     -e PS3DEV="$PS3DEV" -e PSL1GHT="$PS3DEV" \
-    -e PATH="$PS3DEV/bin:$PS3DEV/ppu/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    -e PATH="$PS3DEV/bin:$PS3DEV/ppu/bin:$PS3DEV/spu/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
     "$IMG" "$@"
 }
 

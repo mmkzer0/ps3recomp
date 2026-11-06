@@ -122,4 +122,10 @@ tools/hwprobe/out/
 tools/hwprobe/results/
 tools/hwprobe/probes/*/layer*/build/
 tools/hwprobe/probes/*/layer*/*.map
+tools/hwprobe/probes/*/generated/
+tools/hwprobe/probes/*/spu/*.map
+tools/hwprobe/probes/*/layer*/*.elf
+tools/hwprobe/probes/*/layer*/*.self
+tools/hwprobe/probes/*/layer*/*.fake.self
 !tools/hwprobe/probes/*/layer*/Makefile
+!tools/hwprobe/probes/*/spu/Makefile
