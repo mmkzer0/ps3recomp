@@ -457,6 +457,8 @@ static void audio_backend_submit(const float* samples, u32 count)
     (void)count;
 }
 static u32 audio_backend_queued_samples(void) { return 0; }
+static int audio_backend_room(void) { return -1; }   /* no device: the mix loop paces on the clock */
+static void audio_backend_wait(void) {}
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -813,7 +815,13 @@ static void* audio_mix_thread_func(void* arg)
     printf("[cellAudio] Mixing thread started\n");
     uint32_t blocks_since_underrun = 0;
 
-#if !AUDIO_BACKEND_SDL2 && !AUDIO_BACKEND_WASAPI
+    /* Pace to the device clock, as the WASAPI loop does: with a device, wait
+     * while it holds four blocks (audio_backend_room). Fixed 2 and 5 ms sleeps
+     * after each block left the rate to usleep's overshoot; on Linux that was
+     * 197 blocks/s against the PS3's 187.5, so the SDL queue -- the sound's
+     * delay behind the picture -- grew by 50 ms every second, and the guest's
+     * audio clock ran 5 % fast. With no device, pace on CLOCK_MONOTONIC at the
+     * guest audio period. */
     const uint64_t ns_per_second = 1000000000ull;
     const uint64_t block_ns = CELL_AUDIO_BLOCK_SAMPLES * ns_per_second / CELL_AUDIO_SAMPLE_RATE;
     const unsigned block_fraction = CELL_AUDIO_BLOCK_SAMPLES * ns_per_second % CELL_AUDIO_SAMPLE_RATE;
@@ -825,35 +833,43 @@ static void* audio_mix_thread_func(void* arg)
     unsigned fraction = 0;
     uint64_t blocks = 0;
     const int rate_enabled = getenv("AUDIO_RATE") != NULL;
-#endif
     unsigned long peak_blocks = 0; float peak = 0.0f;   /* AUDIO_PEAK; `blocks` above is AUDIO_RATE's */
     while (s_mix_thread_running) {
-#if !AUDIO_BACKEND_SDL2 && !AUDIO_BACKEND_WASAPI
-        clock_gettime(CLOCK_MONOTONIC, &clock);
-        const uint64_t now_ns = (uint64_t)clock.tv_sec * ns_per_second + clock.tv_nsec;
-        if (now_ns < next_ns) {
+        const int room = audio_backend_room();
+        if (room >= 0 && room < CELL_AUDIO_BLOCK_SAMPLES) {
             const uint64_t pace_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
-            const uint64_t wait_ns = next_ns - now_ns;
-            const struct timespec wait = { (time_t)(wait_ns / ns_per_second),
-                                           (long)(wait_ns % ns_per_second) };
-            nanosleep(&wait, NULL);
-            if (pace_t0) {
-                ps3_ft_span(PS3_FT_AUDIO_PACE, 0, (uint32_t)PS3_FT_AUDIO_PACE_CLOCK, 0, pace_t0, ps3_ft_now());
-            }
+            const u32 queued = audio_backend_queued_samples();
+            audio_backend_wait();
+            if (pace_t0)
+                ps3_ft_span(PS3_FT_AUDIO_PACE, 0, (uint32_t)PS3_FT_AUDIO_PACE_QUEUE_FULL, queued, pace_t0, ps3_ft_now());
             continue;
         }
-        /* Do not burst guest notifications after a debugger pause or stall. */
-        if (now_ns - next_ns > max_backlog_ns) {
-            next_ns = now_ns;
-            fraction = 0;
+        clock_gettime(CLOCK_MONOTONIC, &clock);
+        const uint64_t now_ns = (uint64_t)clock.tv_sec * ns_per_second + clock.tv_nsec;
+        if (room < 0) {
+            if (now_ns < next_ns) {
+                const uint64_t pace_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+                const uint64_t wait_ns = next_ns - now_ns;
+                const struct timespec wait = { (time_t)(wait_ns / ns_per_second),
+                                               (long)(wait_ns % ns_per_second) };
+                nanosleep(&wait, NULL);
+                if (pace_t0) {
+                    ps3_ft_span(PS3_FT_AUDIO_PACE, 0, (uint32_t)PS3_FT_AUDIO_PACE_CLOCK, 0, pace_t0, ps3_ft_now());
+                }
+                continue;
+            }
+            /* Do not burst guest notifications after a debugger pause or stall. */
+            if (now_ns - next_ns > max_backlog_ns) {
+                next_ns = now_ns;
+                fraction = 0;
+            }
+            next_ns += block_ns;
+            fraction += block_fraction;
+            if (fraction >= CELL_AUDIO_SAMPLE_RATE) {
+                next_ns++;
+                fraction -= CELL_AUDIO_SAMPLE_RATE;
+            }
         }
-        next_ns += block_ns;
-        fraction += block_fraction;
-        if (fraction >= CELL_AUDIO_SAMPLE_RATE) {
-            next_ns++;
-            fraction -= CELL_AUDIO_SAMPLE_RATE;
-        }
-#endif
         const uint64_t mix_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
         audio_mix_one_block();
 
@@ -883,31 +899,18 @@ static void* audio_mix_thread_func(void* arg)
               if (++peak_blocks % 188 == 0) { fprintf(stderr, "[audio-peak] %lu s: peak %.4f\n", peak_blocks / 188, peak); peak = 0.0f; }
           } }
 
-#if AUDIO_BACKEND_SDL2
-        const uint64_t pace_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
-        const u32 queued = audio_backend_queued_samples();
-        const uint32_t reason = !audio_backend_has_device()
-                                    ? (uint32_t)PS3_FT_AUDIO_PACE_CLOCK
-                                    : (queued > CELL_AUDIO_BLOCK_SAMPLES * 4
-                                           ? (uint32_t)PS3_FT_AUDIO_PACE_QUEUE_FULL
-                                           : (uint32_t)PS3_FT_AUDIO_PACE_BACKEND_WAIT);
-        if (queued > CELL_AUDIO_BLOCK_SAMPLES * 4) {
-            usleep(5000);
-        } else {
-            usleep(2000);
-        }
-        if (pace_t0) {
-            ps3_ft_span(PS3_FT_AUDIO_PACE, 0, reason, queued, pace_t0, ps3_ft_now());
-        }
-#else
+        /* AUDIO_RATE=1: blocks mixed against real time, and the device's queue. */
         if (rate_enabled && now_ns - rate_start_ns >= 5 * ns_per_second) {
-            fprintf(stderr, "[audio-rate] %.1f blocks/s (real time 187.5), no host backend\n",
-                    blocks * (double)ns_per_second / (now_ns - rate_start_ns));
+            if (room < 0)
+                fprintf(stderr, "[audio-rate] %.1f blocks/s (real time 187.5), no host device\n",
+                        blocks * (double)ns_per_second / (now_ns - rate_start_ns));
+            else
+                fprintf(stderr, "[audio-rate] %.1f blocks/s (real time 187.5), device queue %u samples\n",
+                        blocks * (double)ns_per_second / (now_ns - rate_start_ns), depth_after);
             rate_start_ns = now_ns;
             blocks = 0;
         }
         blocks++;
-#endif
     }
 
     printf("[cellAudio] Mixing thread stopped\n");
