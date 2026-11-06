@@ -25,6 +25,12 @@
 #endif
 #include "ps3emu/thread_name.h"
 
+#ifdef PS3_SYNC_TEST_HOOKS
+extern int ps3_sync_test_hook(const char* point, uint32_t value);
+#define SPU_WORKLOAD_TEST_HOOK(point, value) ((void)ps3_sync_test_hook((point), (value)))
+#else
+#define SPU_WORKLOAD_TEST_HOOK(point, value) ((void)0)
+#endif
 static void spu_workload_report_miss(const char* path, uint64_t fp, uint32_t size,
                                      uint32_t owner_ea);   /* below */
 
@@ -1204,6 +1210,7 @@ static CONDITION_VARIABLE s_sig_cv;   /* zero-init == CONDITION_VARIABLE_INIT */
 static pthread_mutex_t s_sig_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  s_sig_cv   = PTHREAD_COND_INITIALIZER;
 #endif
+static uint64_t s_sig_generation;
 
 /* Which (taskset, task) pairs are currently parked in WAIT_SIGNAL.
  *
@@ -1222,8 +1229,8 @@ static pthread_cond_t  s_sig_cv   = PTHREAD_COND_INITIALIZER;
 void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId);  /* defined below */
 
 #define SPU_PARKED_MAX 64
-static volatile uint64_t s_parked[SPU_PARKED_MAX];   /* (taskset<<32)|(taskId+1), 0 = free */
-static volatile uint32_t s_parked_obj[SPU_PARKED_MAX];  /* LS[0x2FD0] wait object, 0 = unknown */
+static uint64_t s_parked[SPU_PARKED_MAX];   /* (taskset<<32)|(taskId+1), 0 = free */
+static uint32_t s_parked_obj[SPU_PARKED_MAX];  /* LS[0x2FD0] wait object, 0 = unknown */
 /* Bounds for spu_taskset_line_committed, which runs after every successful
  * PUTLLC/PUTLLUC on every SPU. Both are hints in the same racy sense as the
  * table, but err only towards visiting more:
@@ -1236,15 +1243,15 @@ static volatile uint32_t s_parked_obj[SPU_PARKED_MAX];  /* LS[0x2FD0] wait objec
  *    is stored and never lowered, so every parked task is below it whatever
  *    else is being parked or unparked at the same time. Slots are taken
  *    first-free, so it stays at the peak number of tasks parked at once. */
-static volatile int s_parked_count;
-static volatile int s_parked_hw;
+static int s_parked_count;
+static int s_parked_hw;
 
 /* Tasks that have waited for a signal at least once: they work in rounds, a
  * signal starts one and the next WAIT_SIGNAL ends it. A task that never waits
  * (a decoder streaming on its own) is not one, so it holds nothing up.
  * Same racy-hint rules as s_parked; an entry leaves when its task exits. */
 #define SPU_ROUND_MAX 64
-static volatile uint64_t s_round[SPU_ROUND_MAX];   /* (taskset<<32)|(taskId+1), 0 = free */
+static uint64_t s_round[SPU_ROUND_MAX];   /* (taskset<<32)|(taskId+1), 0 = free */
 
 static void spu_round_note(uint64_t key)
 {
@@ -1273,6 +1280,15 @@ void spu_taskset_round_drop(uint32_t taskset_ea, uint32_t taskId)
             __atomic_store_n(&s_round[i], 0, __ATOMIC_RELAXED);
 }
 
+static int spu_taskset_signalled_test(uint32_t taskset_ea, uint32_t taskId)
+{
+    extern void spu_lockline_lock(void);
+    extern void spu_lockline_unlock(void);
+    spu_lockline_lock();
+    const int signalled = spurs_bitset_test(taskset_ea + CSTS_SIGNALLED, taskId);
+    spu_lockline_unlock();
+    return signalled;
+}
 /* How many round tasks are busy: out of WAIT_SIGNAL, or parked with their
  * signal bit set (woken, not yet running: the bit is cleared after the wait
  * returns). The first busy one is returned in *taskset_ea / *taskId.
@@ -1285,9 +1301,10 @@ int spu_taskset_round_busy(uint32_t* taskset_ea, uint32_t* taskId)
         if (!key) continue;
         int parked = 0;
         const int hw = __atomic_load_n(&s_parked_hw, __ATOMIC_RELAXED);
-        for (int j = 0; j < hw && !parked; j++) parked = s_parked[j] == key;
+        for (int j = 0; j < hw && !parked; j++)
+            parked = __atomic_load_n(&s_parked[j], __ATOMIC_ACQUIRE) == key;
         const uint32_t ts = (uint32_t)(key >> 32), tid = (uint32_t)key - 1u;
-        if (parked && !spurs_bitset_test(ts + CSTS_SIGNALLED, tid)) continue;
+        if (parked && !spu_taskset_signalled_test(ts, tid)) continue;
         if (!busy++ && taskset_ea) { *taskset_ea = ts; *taskId = tid; }
     }
     return busy;
@@ -1298,7 +1315,7 @@ void spu_taskset_parked_add(uint32_t taskset_ea, uint32_t taskId, uint32_t wait_
     uint64_t key = ((uint64_t)taskset_ea << 32) | (uint64_t)(taskId + 1);
     spu_round_note(key);
     for (int i = 0; i < SPU_PARKED_MAX; i++)
-        if (s_parked[i] == 0) {
+        if (__atomic_load_n(&s_parked[i], __ATOMIC_ACQUIRE) == 0) {
             int hw = __atomic_load_n(&s_parked_hw, __ATOMIC_RELAXED);
             while (hw <= i && !__atomic_compare_exchange_n(&s_parked_hw, &hw, i + 1, 1,
                                                            __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
@@ -1308,7 +1325,7 @@ void spu_taskset_parked_add(uint32_t taskset_ea, uint32_t taskId, uint32_t wait_
             uint64_t expect = 0;
             if (!__atomic_compare_exchange_n(&s_parked[i], &expect, key, 0,
                                              __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) continue;
-            s_parked_obj[i] = wait_obj;
+            __atomic_store_n(&s_parked_obj[i], wait_obj, __ATOMIC_RELAXED);
             __atomic_fetch_add(&s_parked_count, 1, __ATOMIC_RELAXED);
             return;
         }
@@ -1318,8 +1335,8 @@ void spu_taskset_parked_del(uint32_t taskset_ea, uint32_t taskId)
 {
     uint64_t key = ((uint64_t)taskset_ea << 32) | (uint64_t)(taskId + 1);
     for (int i = 0; i < SPU_PARKED_MAX; i++)
-        if (s_parked[i] == key) {
-            s_parked_obj[i] = 0;   /* "unknown" until the next owner sets its own */
+        if (__atomic_load_n(&s_parked[i], __ATOMIC_ACQUIRE) == key) {
+            __atomic_store_n(&s_parked_obj[i], 0, __ATOMIC_RELAXED);
             __atomic_store_n(&s_parked[i], 0, __ATOMIC_RELEASE);
             __atomic_fetch_sub(&s_parked_count, 1, __ATOMIC_RELAXED);
             return;
@@ -1395,9 +1412,10 @@ int spu_taskset_signal_parked_obj(uint32_t taskset_ea, uint32_t wait_obj)
     if (!taskset_ea) return 0;
     int n = 0;
     for (int i = 0; i < SPU_PARKED_MAX; i++) {
-        uint64_t k = s_parked[i];
+        uint64_t k = __atomic_load_n(&s_parked[i], __ATOMIC_ACQUIRE);
         if (!k || (uint32_t)(k >> 32) != taskset_ea) continue;
-        if (wait_obj && s_parked_obj[i] && s_parked_obj[i] != wait_obj) continue;
+        const uint32_t parked_obj = __atomic_load_n(&s_parked_obj[i], __ATOMIC_RELAXED);
+        if (wait_obj && parked_obj && parked_obj != wait_obj) continue;
         spu_taskset_signal_task(taskset_ea, (uint32_t)(k & 0xFFFFFFFFu) - 1u);
         n++;
     }
@@ -1443,10 +1461,12 @@ static void spu_taskset_wake_written(void* opaque)
     (void)opaque;
 #ifdef _WIN32
     AcquireSRWLockExclusive(&s_sig_lock);
+    __atomic_add_fetch(&s_sig_generation, 1, __ATOMIC_RELEASE);
     WakeAllConditionVariable(&s_sig_cv);
     ReleaseSRWLockExclusive(&s_sig_lock);
 #else
     pthread_mutex_lock(&s_sig_lock);
+    __atomic_add_fetch(&s_sig_generation, 1, __ATOMIC_RELEASE);
     pthread_cond_broadcast(&s_sig_cv);
     pthread_mutex_unlock(&s_sig_lock);
 #endif
@@ -1507,17 +1527,44 @@ void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
  * taskset creates the next five in a sibling, and the main thread waits for
  * them. */
 #define SPU_TASKSETS_MAX 32
-static volatile uint32_t s_tasksets[SPU_TASKSETS_MAX];
-static volatile int s_n_tasksets;
+static uint32_t s_tasksets[SPU_TASKSETS_MAX];
+static int s_n_tasksets;
+static int s_taskset_registry_lock;
+
+static void spu_taskset_registry_lock(void)
+{
+    for (;;) {
+        int expected = 0;
+        if (__atomic_compare_exchange_n(&s_taskset_registry_lock, &expected, 1, 0,
+                                        __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+            return;
+    }
+}
+
+static void spu_taskset_registry_unlock(void)
+{
+    __atomic_store_n(&s_taskset_registry_lock, 0, __ATOMIC_RELEASE);
+}
 
 void spu_taskset_register(uint32_t ea)
 {
-    const int n = __atomic_load_n(&s_n_tasksets, __ATOMIC_ACQUIRE);
-    for (int i = 0; i < n; i++) if (s_tasksets[i] == ea) return;
+#ifdef PS3_SYNC_TEST_HOOKS
+    (void)__atomic_load_n(&s_n_tasksets, __ATOMIC_ACQUIRE);
+    SPU_WORKLOAD_TEST_HOOK("spu.taskset_register.after_count", ea);
+#endif
+    spu_taskset_registry_lock();
+    const int n = __atomic_load_n(&s_n_tasksets, __ATOMIC_RELAXED);
+    for (int i = 0; i < n; i++) {
+        if (__atomic_load_n(&s_tasksets[i], __ATOMIC_RELAXED) == ea) {
+            spu_taskset_registry_unlock();
+            return;
+        }
+    }
     if (n < SPU_TASKSETS_MAX) {
-        s_tasksets[n] = ea;
+        __atomic_store_n(&s_tasksets[n], ea, __ATOMIC_RELAXED);
         __atomic_store_n(&s_n_tasksets, n + 1, __ATOMIC_RELEASE);
     }
+    spu_taskset_registry_unlock();
 }
 
 void spu_taskset_line_committed(uint32_t line)
@@ -1527,7 +1574,11 @@ void spu_taskset_line_committed(uint32_t line)
     {
         const int n = __atomic_load_n(&s_n_tasksets, __ATOMIC_ACQUIRE);
         for (int i = 0; i < n; i++)
-            if (s_tasksets[i] == line) { spu_taskset_start_pending(line); break; }
+            if (__atomic_load_n(&s_tasksets[i], __ATOMIC_ACQUIRE) == line) {
+                SPU_WORKLOAD_TEST_HOOK("spu.taskset.line_match", line);
+                spu_taskset_start_pending(line);
+                break;
+            }
     }
     /* Nothing parked -- the whole run, for a title that never parks a taskset
      * task -- costs one load instead of a 64-slot scan; otherwise only the
@@ -1536,17 +1587,9 @@ void spu_taskset_line_committed(uint32_t line)
     if (!__atomic_load_n(&s_parked_count, __ATOMIC_RELAXED)) return;
     const int n = __atomic_load_n(&s_parked_hw, __ATOMIC_RELAXED);
     for (int i = 0; i < n; i++) {
-        const uint64_t k = s_parked[i];
+        const uint64_t k = __atomic_load_n(&s_parked[i], __ATOMIC_ACQUIRE);
         if (!k || (((uint32_t)(k >> 32) + CSTS_SIGNALLED) & ~127u) != line) continue;
-#ifdef _WIN32
-        AcquireSRWLockExclusive(&s_sig_lock);
-        WakeAllConditionVariable(&s_sig_cv);
-        ReleaseSRWLockExclusive(&s_sig_lock);
-#else
-        pthread_mutex_lock(&s_sig_lock);
-        pthread_cond_broadcast(&s_sig_cv);
-        pthread_mutex_unlock(&s_sig_lock);
-#endif
+        spu_taskset_wake_written(NULL);
         return;
     }
 }
@@ -1614,37 +1657,54 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
     spu_lockline_lock();
     spu_coh_watch_add(&watch, taskset_ea + CSTS_SIGNALLED, spu_taskset_wake_written, NULL);
     spu_lockline_unlock();
+    SPU_WORKLOAD_TEST_HOOK("spu.wait_signal.before_wait", taskset_ea);
 #ifdef _WIN32
-    AcquireSRWLockExclusive(&s_sig_lock);
-    while (!spurs_bitset_test(taskset_ea + CSTS_SIGNALLED, taskId)) {
-        if (!SleepConditionVariableSRW(&s_sig_cv, &s_sig_lock, 1000, 0)) {
-            static int _n = 0;
-            if (++secs && _n < 16) { _n++;
-                fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) sleeping "
-                        "%us in WAIT_SIGNAL\n", taskId, taskset_ea, secs); fflush(stderr); }
-            if (drain && secs >= drain) { drained = 1; break; }
+    for (;;) {
+        const uint64_t generation = __atomic_load_n(&s_sig_generation, __ATOMIC_ACQUIRE);
+        if (spu_taskset_signalled_test(taskset_ea, taskId)) break;
+        AcquireSRWLockExclusive(&s_sig_lock);
+        if (generation == __atomic_load_n(&s_sig_generation, __ATOMIC_ACQUIRE)) {
+            if (!SleepConditionVariableSRW(&s_sig_cv, &s_sig_lock, 1000, 0)) {
+                static int _n = 0;
+                if (++secs && _n < 16) { _n++;
+                    fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) sleeping "
+                            "%us in WAIT_SIGNAL\n", taskId, taskset_ea, secs); fflush(stderr); }
+                if (drain && secs >= drain) drained = 1;
+            }
         }
+        ReleaseSRWLockExclusive(&s_sig_lock);
+        if (drained) break;
     }
-    ReleaseSRWLockExclusive(&s_sig_lock);
 #else
-    pthread_mutex_lock(&s_sig_lock);
-    while (!spurs_bitset_test(taskset_ea + CSTS_SIGNALLED, taskId)) {
-        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_sec += 1;
-        if (pthread_cond_timedwait(&s_sig_cv, &s_sig_lock, &ts) != 0) {
-            static int _n = 0;
-            if (++secs && _n < 16) { _n++;
-                fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) sleeping "
-                        "%us in WAIT_SIGNAL\n", taskId, taskset_ea, secs); fflush(stderr); }
-            if (drain && secs >= drain) { drained = 1; break; }
+    for (;;) {
+        const uint64_t generation = __atomic_load_n(&s_sig_generation, __ATOMIC_ACQUIRE);
+        if (spu_taskset_signalled_test(taskset_ea, taskId)) break;
+        pthread_mutex_lock(&s_sig_lock);
+        if (generation == __atomic_load_n(&s_sig_generation, __ATOMIC_ACQUIRE)) {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_sec += 1;
+            if (pthread_cond_timedwait(&s_sig_cv, &s_sig_lock, &ts) != 0) {
+                static int _n = 0;
+                if (++secs && _n < 16) { _n++;
+                    fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) sleeping "
+                            "%us in WAIT_SIGNAL\n", taskId, taskset_ea, secs); fflush(stderr); }
+                if (drain && secs >= drain) drained = 1;
+            }
         }
+        pthread_mutex_unlock(&s_sig_lock);
+        if (drained) break;
     }
-    pthread_mutex_unlock(&s_sig_lock);
 #endif
     spu_lockline_lock();
     spu_coh_watch_remove(&watch);
     spu_lockline_unlock();
-    /* Signals coalesce in the bit, so consuming it outside s_sig_lock loses none. */
+    /* Leave the parked set before clearing the wake bit: the RSX report-hold
+     * reader treats a parked task with a clear bit as idle, but the channel
+     * caller removes its entry only after this function returns. */
+    spu_taskset_parked_del(taskset_ea, taskId);
     if (!drained) spu_signalled_update(taskset_ea, taskId, 0);
+    SPU_WORKLOAD_TEST_HOOK("spu.wait_signal.after_clear", taskset_ea);
     if (drained) { static int _d = 0; if (PS3_LOG_FIRST(_d, 24))
         fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) WS_DRAIN resume "
                 "after %us (no signal)\n", taskId, taskset_ea, secs); fflush(stderr); }

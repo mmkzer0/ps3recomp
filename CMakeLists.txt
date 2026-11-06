@@ -836,6 +836,29 @@ if(PS3RECOMP_BUILD_TESTS)
             add_test(NAME spu_group_lifecycle COMMAND test_spu_group_lifecycle)
             set_tests_properties(spu_group_lifecycle PROPERTIES LABELS "spu;t0" TIMEOUT 60)
         endif()
+        # Report-hold round state, signal-bit synchronization, and concurrent
+        # taskset registration in the SPU workload registry.
+        add_executable(test_spu_report_hold
+            runtime/spu/tests/test_spu_report_hold.c
+            runtime/spu/spu_drain.c
+            runtime/spu/spu_lockstep.c
+            runtime/spu/spu_coherency.c
+            runtime/memory/reservation.c
+            runtime/spu/spu_workload.c
+            runtime/spu/spurs_policy.c
+            runtime/spu/spurs_job.c
+            runtime/spu/spu_tsp_weak.c
+            runtime/spu/spu_vm_pagemap.c
+            runtime/spu/spurs_policy_blob_weak.c
+            runtime/spu/spu_interp.c
+            runtime/platform/win32_compat.c)
+        target_include_directories(test_spu_report_hold PRIVATE
+            include runtime runtime/spu runtime/platform)
+        target_compile_definitions(test_spu_report_hold PRIVATE PS3_SYNC_TEST_HOOKS)
+        target_compile_options(test_spu_report_hold PRIVATE -UNDEBUG)
+        target_link_libraries(test_spu_report_hold PRIVATE m Threads::Threads)
+        add_test(NAME spu_report_hold COMMAND test_spu_report_hold)
+        set_tests_properties(spu_report_hold PROPERTIES LABELS "spu;t0;tsan" TIMEOUT 60)
 
         # SPU_INTERP_OPSTATS: per-op execution counts of a synthetic program,
         # exact across the thread-local folds, several interpreting threads and
