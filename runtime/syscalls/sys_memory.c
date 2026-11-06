@@ -102,16 +102,24 @@ static uint32_t user_address(uint32_t size, uint32_t alignment)
     }
 }
 
+/* The out-pointers of the allocation and container syscalls are spans the title chose, and write_be32 adds them to
+ * vm_base without a bound: one that leaves guest memory is a named stop before the first access, not a host store. */
+static void memory_out_span(const char* func, const char* arg, uint32_t ea, uint64_t size)
+{
+    if (!vm_range_ok(ea, size)) ps3_stop_guest_range(func, arg, ea, size, vm_guest_limit());
+}
+
 /* sys_memory_allocate and sys_memory_allocate_from_container share this. cid 0
  * is the process's main pool; a container's allocations are also charged to
  * that container (its used_size), checked against its total. */
-static int64_t memory_allocate(uint64_t requested, uint32_t flags, uint32_t cid, uint32_t addr_out)
+static int64_t memory_allocate(const char* func, uint64_t requested, uint32_t flags, uint32_t cid, uint32_t addr_out)
 {
     uint32_t alignment = (flags & SYS_MEMORY_PAGE_SIZE_1M) ? 0x100000u : 0x10000u;
     uint64_t rounded = (requested + alignment - 1u) & ~(uint64_t)(alignment - 1u);
     if (!requested || requested > UINT32_MAX || !rounded || rounded > UINT32_MAX)
         return (int64_t)(int32_t)CELL_EINVAL;
     uint32_t size = (uint32_t)rounded;
+    if (addr_out) memory_out_span(func, "addr", addr_out, 4);
     bump_lock();
     if (size > SYS_MEM_USER_TOTAL - s_total_allocated) {
         bump_unlock(); return (int64_t)(int32_t)CELL_ENOMEM;
@@ -145,7 +153,7 @@ static int64_t memory_allocate(uint64_t requested, uint32_t flags, uint32_t cid,
 
 int64_t sys_memory_allocate(ppu_context* ctx)
 {
-    return memory_allocate(LV2_ARG_U64(ctx, 0), LV2_ARG_U32(ctx, 1), 0, LV2_ARG_PTR(ctx, 2));
+    return memory_allocate("sys_memory_allocate", LV2_ARG_U64(ctx, 0), LV2_ARG_U32(ctx, 1), 0, LV2_ARG_PTR(ctx, 2));
 }
 
 /* ---------------------------------------------------------------------------
@@ -162,10 +170,10 @@ int64_t sys_memory_allocate_from_container(ppu_context* ctx)
 {
     uint32_t cid = LV2_ARG_U32(ctx, 1);
     if (cid == SYS_MEMORY_CONTAINER_DEFAULT)
-        return memory_allocate(LV2_ARG_U64(ctx, 0), LV2_ARG_U32(ctx, 2), 0, LV2_ARG_PTR(ctx, 3));
+        return memory_allocate("sys_memory_allocate_from_container", LV2_ARG_U64(ctx, 0), LV2_ARG_U32(ctx, 2), 0, LV2_ARG_PTR(ctx, 3));
     if (cid == 0 || cid > SYS_MEMORY_CONTAINER_MAX || !g_sys_mem_containers[cid - 1].active)
         return (int64_t)(int32_t)CELL_ESRCH;
-    return memory_allocate(LV2_ARG_U64(ctx, 0), LV2_ARG_U32(ctx, 2), cid, LV2_ARG_PTR(ctx, 3));
+    return memory_allocate("sys_memory_allocate_from_container", LV2_ARG_U64(ctx, 0), LV2_ARG_U32(ctx, 2), cid, LV2_ARG_PTR(ctx, 3));
 }
 
 /* ---------------------------------------------------------------------------
@@ -272,6 +280,7 @@ int64_t sys_memory_container_create(ppu_context* ctx)
     if (slot < 0)
         return (int64_t)(int32_t)CELL_EAGAIN;
 
+    if (id_out_addr != 0) memory_out_span("sys_memory_container_create", "cid", id_out_addr, 4);
     sys_mem_container_info* c = &g_sys_mem_containers[slot];
     c->active     = 1;
     c->total_size = size;
@@ -324,6 +333,7 @@ int64_t sys_memory_container_get_size(ppu_context* ctx)
 
     if (container_id == SYS_MEMORY_CONTAINER_DEFAULT) {
         if (out_addr != 0) {
+            memory_out_span("sys_memory_container_get_size", "info", out_addr, 8);
             bump_lock();
             const uint32_t avail = SYS_MEM_USER_TOTAL - s_total_allocated;
             bump_unlock();
@@ -340,6 +350,7 @@ int64_t sys_memory_container_get_size(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
 
     if (out_addr != 0) {
+        memory_out_span("sys_memory_container_get_size", "info", out_addr, 8);
         write_be32(out_addr + 0, c->total_size);
         write_be32(out_addr + 4, c->total_size - c->used_size);
     }

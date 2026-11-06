@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "guest_range_catch.h"   /* sys_memory.c names a stop for an out-pointer outside guest memory; none is raised here */
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
 uint32_t ppu_hle_inject_base=0x70000000u;

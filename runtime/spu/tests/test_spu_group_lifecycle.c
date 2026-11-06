@@ -20,6 +20,7 @@ int64_t lv2_spu_lock_line_classify(uint32_t a, uint64_t f) { (void)a; (void)f; r
 #include "../../syscalls/lv2_register.c"
 #include <assert.h>
 #include <stdio.h>
+#include "../../../tests/guest_range_catch.h"
 
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
@@ -130,6 +131,14 @@ int main(void)
     CHECK(rd32(0x400) == 0 && rd32(0x404) == 3, "get_spu_cfg stores 3 through the pointer (0x%08X 0x%08X)",
           rd32(0x400), rd32(0x404));
     CHECK(vm_base[0x408] == 0xEE, "and nothing past the u64");
+    /* A pointer whose u64 leaves guest memory (the arena is 1 MiB here) is a named stop before the store, never a
+     * write past the arena; the span that fits exactly is stored. */
+    GR_TRY(sc(sys_spu_thread_get_spu_cfg_handler, t->tid, (1u << 20) - 4, 0, 0));
+    CHECK(gr_named("sys_spu_thread_get_spu_cfg", "value"), "get_spu_cfg with a u64 straddling the arena's end stops");
+    GR_TRY(sc(sys_spu_thread_get_spu_cfg_handler, t->tid, 0xFFFFFFF0u, 0, 0));
+    CHECK(gr_named("sys_spu_thread_get_spu_cfg", "value"), "get_spu_cfg with a pointer far outside the arena stops");
+    CHECK(sc(sys_spu_thread_get_spu_cfg_handler, t->tid, (1u << 20) - 8, 0, 0) == 0 &&
+          rd32((1u << 20) - 8) == 0 && rd32((1u << 20) - 4) == 3, "get_spu_cfg with a u64 ending at the arena's end is stored");
 
     /* group_destroy with the thread running: refused, nothing freed. */
     uint8_t* ls = t->local_store; struct spu_context* sctx = t->sctx;

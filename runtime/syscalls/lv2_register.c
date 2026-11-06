@@ -2509,6 +2509,10 @@ static int64_t sys_spu_thread_get_spu_cfg_handler(ppu_context* ctx)
      * r4. Setting r4 alone left the caller's u64 unwritten. r4 is still set, as
      * before. */
     { uint32_t out_ea = (uint32_t)ctx->gpr[4];
+      /* A title-chosen out-pointer, 8 bytes: one that leaves guest memory is a named stop before the store. The
+       * thread lookup's ESRCH above comes first. */
+      if (out_ea && !vm_range_ok(out_ea, 8))
+          ps3_stop_guest_range("sys_spu_thread_get_spu_cfg", "value", out_ea, 8, vm_guest_limit());
       if (out_ea) { vm_write_be32(out_ea, 0); vm_write_be32(out_ea + 4, (uint32_t)t->spu_cfg); } }
     ctx->gpr[4] = (uint64_t)t->spu_cfg;
     ctx->gpr[3] = 0;

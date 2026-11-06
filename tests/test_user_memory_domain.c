@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
+#include "guest_range_catch.h"
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
 uint32_t ppu_hle_inject_base=0x20000000u;
@@ -56,5 +57,30 @@ int main(void) {
  CHECK(reserve(UINT64_MAX,0x10000000)!=(int64_t)CELL_OK);
  reset(); CHECK(reserve(0x100000,3)!=(int64_t)CELL_OK);
  reset(); CHECK(allocate(0x10000,0x200)==CELL_OK);CHECK(out()==a);
+ /* The out-pointers are guest spans the title chose: one that leaves guest memory (here the end of the 4 GiB
+  * space) is a named stop before anything is allocated or written, not a host store. A refused call leaves no
+  * allocation or container behind. */
+ reset();
+ {
+  ppu_context s={0};
+  s.gpr[3]=0x10000;s.gpr[4]=0x200;s.gpr[5]=0xFFFFFFFEu;
+  GR_TRY(sys_memory_allocate(&s));CHECK(gr_named("sys_memory_allocate","addr"));
+  memset(&s,0,sizeof s);s.gpr[3]=0x10000;s.gpr[4]=0xFFFFFFFFu;s.gpr[5]=0x200;s.gpr[6]=0xFFFFFFFEu;
+  GR_TRY(sys_memory_allocate_from_container(&s));CHECK(gr_named("sys_memory_allocate_from_container","addr"));
+  CHECK(allocate(0x10000,0x200)==CELL_OK);CHECK(out()==a);   /* the first allocation is still the first */
+  memset(&s,0,sizeof s);s.gpr[3]=0xFFFFFFFEu;s.gpr[4]=0x100000;
+  GR_TRY(sys_memory_container_create(&s));CHECK(gr_named("sys_memory_container_create","cid"));
+  memset(&s,0,sizeof s);s.gpr[3]=0x10020;s.gpr[4]=0x100000;
+  CHECK(sys_memory_container_create(&s)==CELL_OK);   /* the refused call took no slot: this is container 1 */
+  const uint32_t cid=(uint32_t)((vm_base[0x10020]<<24)|(vm_base[0x10021]<<16)|(vm_base[0x10022]<<8)|vm_base[0x10023]);
+  CHECK(cid==1);
+  memset(&s,0,sizeof s);s.gpr[3]=0xFFFFFFF9u;s.gpr[4]=0xFFFFFFFFu;   /* the default container, 8 bytes at 4 GiB - 7 */
+  GR_TRY(sys_memory_container_get_size(&s));CHECK(gr_named("sys_memory_container_get_size","info"));
+  memset(&s,0,sizeof s);s.gpr[3]=0xFFFFFFFCu;s.gpr[4]=cid;          /* a real container, 8 bytes at 4 GiB - 4 */
+  GR_TRY(sys_memory_container_get_size(&s));CHECK(gr_named("sys_memory_container_get_size","info"));
+  memset(&s,0,sizeof s);s.gpr[3]=0x10040;s.gpr[4]=cid;
+  CHECK(sys_memory_container_get_size(&s)==CELL_OK);   /* and an in-range pointer still gets its answer */
+  CHECK(vm_base[0x10040]==0&&vm_base[0x10041]==0x10&&vm_base[0x10042]==0&&vm_base[0x10043]==0);   /* total 0x100000 */
+ }
  vm_shutdown();printf("PASS %u user/mapper allocation checks\n",checks);return 0;
 }

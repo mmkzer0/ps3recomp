@@ -15,6 +15,8 @@ def main():
 #include <cstring>
 extern "C" {
 uint8_t* vm_base; uint32_t ppu_vm_size; uint32_t ppu_hle_inject_base=0x20000000u;
+/* sys_memory.c names this stop for an out-pointer outside guest memory; no case here passes one. */
+[[noreturn]] void ps3_stop_guest_range(const char*,const char*,uint64_t,uint64_t,uint64_t){std::abort();}
 }
 uint32_t vm_read32(uint64_t a){auto p=vm_base+a;return (uint32_t(p[0])<<24)|(uint32_t(p[1])<<16)|(uint32_t(p[2])<<8)|p[3];}
 void vm_write32(uint64_t a,uint32_t x){auto p=vm_base+a;p[0]=x>>24;p[1]=x>>16;p[2]=x>>8;p[3]=x;}
