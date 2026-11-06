@@ -9,6 +9,7 @@
  * mixes generators per lane so that a vector with one odd lane still takes the fix-up path.
  * Build: cc -O2 -msse4.1 -ffp-contract=off -I runtime/spu -I include THIS -lm -o t && ./t [millions] */
 #include "spu_helpers.h"
+#include "../../../tests/spu_ls_watch_fixture.h"   /* gcc -O0 emits spu_context.h's unused spu_ls_read_diag, which calls these */
 #include <stdio.h>
 #include <stdlib.h>
 

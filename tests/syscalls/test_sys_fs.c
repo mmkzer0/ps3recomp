@@ -31,6 +31,8 @@ uint8_t* vm_base;
 uint32_t ppu_vm_size = 0x20000;           /* sys_fs_read clamps to it */
 const char* edat_resolve(const char* host_path, char* buf, size_t cap)
 { (void)buf; (void)cap; return host_path; }                 /* no EDATs here */
+/* sys_fs.c's weak reference to cellGame.c; Mach-O will not link an undefined one, so define it. No HDD game here. */
+const char* cellGame_get_hdd_title_id(void) { return NULL; }
 
 /* ---- harness ------------------------------------------------------------- */
 static int failures;

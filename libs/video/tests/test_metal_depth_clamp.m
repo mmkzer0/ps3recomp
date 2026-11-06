@@ -17,7 +17,7 @@
 #define eng_texture_upload test_engine_texture_upload
 #define eng_present test_engine_present
 #include "rsx_draw_engine.c"
-#include "rsx_engine_config_stub.h"   /* eng.depth_clamp: registry default, or PS3RECOMP_ENG_DEPTH_CLAMP=0 */
+#include "rsx_driver_stop_stub.h"     /* the engine's rsx-driver-method stop; eng.depth_clamp: registry default, or PS3RECOMP_ENG_DEPTH_CLAMP=0 */
 #undef eng_texture_upload
 #undef eng_present
 #include "rsx_test_programs.h"

@@ -1385,6 +1385,11 @@ if(PS3RECOMP_BUILD_TESTS)
                 target_link_libraries(hle_pad_rumble PRIVATE ${SDL2_LIBRARIES})
             endif()
             target_link_libraries(hle_pad_rumble PRIVATE m)
+            if(APPLE)
+                # cellPad.c polls the keyboard through CoreGraphics and AppKit on macOS; a fixture has no
+                # window, so read it through SDL (nothing focused, nothing pressed) like every other host.
+                target_compile_definitions(hle_pad_rumble PRIVATE PS3RECOMP_PAD_KEYBOARD_SDL)
+            endif()
 
             # cellPad with pad.record / pad.replay (libs/input/pad_trace.h): the real cellPadGetData
             # and info calls over a synthetic trace. One process per case, because the injectors read
@@ -1405,6 +1410,8 @@ if(PS3RECOMP_BUILD_TESTS)
             set_target_properties(test_pad_replay PROPERTIES LINKER_LANGUAGE CXX)
             if(APPLE)
                 target_link_options(test_pad_replay PRIVATE "-Wl,-dead_strip")
+                # No window here: read the keyboard through SDL, as on every other host (see hle_pad_rumble).
+                target_compile_definitions(test_pad_replay PRIVATE PS3RECOMP_PAD_KEYBOARD_SDL)
             else()
                 target_compile_options(test_pad_replay PRIVATE -ffunction-sections -fdata-sections)
                 target_link_options(test_pad_replay PRIVATE "-Wl,--gc-sections")
@@ -1549,6 +1556,7 @@ if(UNIX)
             libs/video/rsx_texture_layout.c
             libs/video/rsx_dispatch.c
             libs/video/rsx_vertex_compact.c
+            libs/video/rsx_tiling.c   # a C unit of its own: win32_compat.h clashes with the ObjC headers if included into the fixture
         )
         set_source_files_properties(libs/video/tests/test_resc_present_metal.m
             PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
@@ -1583,6 +1591,7 @@ if(UNIX)
                 libs/video/rsx_texture_layout.c
                 libs/video/rsx_vp_decompiler.c
                 libs/video/rsx_fp_decompiler.c
+                libs/video/rsx_tiling.c   # a C unit of its own: win32_compat.h clashes with the ObjC headers if included into the fixture
             )
             set_source_files_properties(libs/video/tests/test_metal_${gpu_test}.m
                 PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
@@ -1834,6 +1843,7 @@ if(UNIX)
             libs/video/rsx_texture_layout.c
             libs/video/rsx_vp_decompiler.c
             libs/video/rsx_fp_decompiler.c
+            libs/video/rsx_tiling.c   # a C unit of its own: win32_compat.h clashes with the ObjC headers if included into the fixture
             libs/video/rsx_capture.cpp
             libs/video/rsx_shader_msl.cpp
             runtime/diag/sha256.cpp)

@@ -12,6 +12,7 @@
  *         -o /tmp/test_spu_fi_cflts_neon runtime/spu/tests/test_spu_fi_cflts_neon.c
  */
 #include "spu_helpers.h"
+#include "../../../tests/spu_ls_watch_fixture.h"   /* gcc -O0 emits spu_context.h's unused spu_ls_read_diag, which calls these */
 #include <stdio.h>
 #include <stdlib.h>
 
