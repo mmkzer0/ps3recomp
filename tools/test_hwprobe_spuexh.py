@@ -30,6 +30,7 @@ import gen_tables as gt
 import hwprobe_format
 import lanes_compare
 import lanesum_compare
+import specialb_report
 
 _TMP = None
 
@@ -149,6 +150,90 @@ class TestGenTables(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             rc = verify_encodings.main(["verify", REPO])
         self.assertEqual(rc, 0, out.getvalue())
+
+
+class TestSpecialBReport(unittest.TestCase):
+    def analyze(self, rows):
+        return specialb_report.analyze_text("\n".join(rows) + "\n", root=REPO)
+
+    def _metadata(self):
+        return [
+            "META,special_b_prefixes,789",
+            "META,special_b_from,0",
+            "META,special_b_count,1",
+            "META,special_b_patterns,zero",
+        ]
+
+    def _try(self):
+        return "SPECB_TRY,0,004,zero,00800000"
+
+    def test_invalid_prefix_error_event_agrees_and_checks_completion(self):
+        report = self.analyze(self._metadata() + [
+            self._try(),
+            ("SPECB,0,004,zero,00800000,no_return,0,-,0,00000000,"
+             "join 0x00000000 cause=4 status=0x7e57 exit=0xffffffff FAULT "
+             "terminate-join event[src=ffffffff53505503 d1=0403010000030100]"),
+            "META,special_b_prefixes_done,1",
+            "META,special_b_completed,1",
+        ])
+        self.assertEqual(report["completion"], "complete")
+        self.assertEqual(len(report["rows"]), 1)
+        self.assertEqual(report["rows"][0]["expectation"], "invalid->stop")
+        self.assertEqual(report["rows"][0]["observed"], "SPU error event + cause=4")
+        self.assertEqual(report["rows"][0]["verdict"], "agree")
+        rendered = specialb_report.render_report(report)
+        self.assertIn("Completion marker: **complete**", rendered)
+        self.assertIn("| 0 | 0x004 | zero | 0x00800000 | invalid->stop | SPU error event + cause=4 | "
+                      "nchanged=0; regs=-; arena=0@0x00000000 | agree |", rendered)
+
+    def test_normal_return_differs_from_invalid_expectation(self):
+        report = self.analyze(self._metadata() + [
+            self._try(),
+            "SPECB,0,004,zero,00800000,executed,1,3:00000000000000000000000000000001,0,00000000,",
+            "META,special_b_prefixes_done,1",
+            "META,special_b_completed,1",
+        ])
+        self.assertEqual(report["rows"][0]["observed"], "normal return")
+        self.assertEqual(report["rows"][0]["verdict"], "differ")
+
+    def test_try_without_outcome_is_suspected_freeze(self):
+        report = self.analyze(self._metadata() + [self._try()])
+        self.assertEqual(report["rows"][0]["observed"], "suspected freeze")
+        self.assertEqual(report["rows"][0]["verdict"], "unknown")
+        self.assertEqual(report["completion"], "missing")
+
+    def test_fatal_after_try_is_unknown_and_incomplete(self):
+        report = self.analyze(self._metadata() + [
+            self._try(),
+            "FATAL,launch,sysSpuThreadGroupJoin rc=0x80010001",
+        ])
+        self.assertTrue(report["rows"][0]["observed"].startswith("FATAL:"))
+        self.assertEqual(report["rows"][0]["verdict"], "unknown")
+        self.assertEqual(report["completion"], "missing")
+
+    def test_timeout_and_halt_are_classified_as_unknown(self):
+        for text, expected in (
+            ("join 0x0 cause=4 status=0 LIMIT terminate-join", "timeout+terminate"),
+            ("join 0x0 cause=1 status=0", "halt"),
+        ):
+            report = self.analyze(self._metadata() + [
+                self._try(),
+                f"SPECB,0,004,zero,00800000,no_return,0,-,0,00000000,{text}",
+                "META,special_b_prefixes_done,1",
+                "META,special_b_completed,1",
+            ])
+            self.assertEqual(report["rows"][0]["observed"], expected)
+            self.assertEqual(report["rows"][0]["verdict"], "unknown")
+
+    def test_malformed_try_row_is_rejected(self):
+        with self.assertRaises(specialb_report.ReportError):
+            self.analyze(["SPECB_TRY,0,not-hex,zero,00800000"])
+
+    def test_try_must_match_the_selected_prefix_and_pattern_range(self):
+        with self.assertRaises(specialb_report.ReportError):
+            self.analyze(self._metadata() + ["SPECB_TRY,1,004,zero,00800000"])
+        with self.assertRaises(specialb_report.ReportError):
+            self.analyze(self._metadata() + ["SPECB_TRY,0,004,rand,0093ba28"])
 
 
 # ------------------------------------------------------------------------------------------------ comparison
@@ -377,7 +462,7 @@ class TestCompare(unittest.TestCase):
         self.assertIn("| executed | 2 |", text)
         self.assertIn("| no_return | 2 |", text)
         self.assertIn("valid there although the toolkit has no decode): 3c3", text)
-        self.assertIn("resume a lost run with special_b_from=2", text)
+        self.assertIn("resume at special_b_from=1 (inclusive)", text)
 
     def test_special_b_try_rows_pre_log_and_name_a_lost_run(self):
         # the pre-logged TRY row names the word a lost run was attempting; the last prefix lacks an outcome row
@@ -389,7 +474,7 @@ class TestCompare(unittest.TestCase):
                       text)
         self.assertIn("1 were started but never got one.", text)
         self.assertIn("Last word started: index 1 (prefix 3c3, pattern zero, word 78600000)", text)
-        self.assertIn("resume a lost run with special_b_from=2", text)
+        self.assertIn("resume at special_b_from=1 (inclusive)", text)
 
 
 # ------------------------------------------------------------------------------------------------ lanes
@@ -836,7 +921,8 @@ class TestDryRun(unittest.TestCase):
         self.assertIn("META,completed,0", lines)
 
     def test_special_probes_report_what_the_interpreter_does(self):
-        argv = [self.host, "--elf", self.elf, "--preset", "smoke", "--no-sweep", "--special-a", "--special-b", "--set", "special_b_max=6",
+        argv = [self.host, "--elf", self.elf, "--preset", "smoke", "--no-sweep", "--special-a", "--special-b",
+                "--set", "special_b_max=6", "--set", "special_b_count=4",
                 "--out", os.path.join(_TMP, "d6.txt")]
         p = subprocess.run(argv, check=False, capture_output=True, text=True, timeout=300)
         self.assertEqual(p.returncode, 0, p.stderr)
@@ -853,11 +939,15 @@ class TestDryRun(unittest.TestCase):
             self.assertIn("invalid instruction", ",".join(r[5:]))
         self.assertEqual([l for l in lines if l.startswith(("SPECA,", "SPECA_FAULT"))], [])
         b = [l.split(",") for l in lines if l.startswith("SPECB,")]
-        self.assertEqual(len(b), 12)                                # 6 prefixes x 2 patterns
+        self.assertEqual(len(b), 8)                                 # 4 prefixes x 2 patterns
+        self.assertEqual(len({r[1] for r in b}), 4)
+        self.assertEqual(len({(r[1], r[3]) for r in b}), 8)
         self.assertTrue(all(r[5] == "no_return" for r in b))        # the interpreter has no decode for them
         self.assertIn("invalid instruction", b[0][-1])
         tr = [l.split(",") for l in lines if l.startswith("SPECB_TRY,")]
-        self.assertEqual(len(tr), 12)                               # every word is pre-logged before its launch
+        self.assertEqual(len(tr), 8)                                # every word is pre-logged before its launch
+        self.assertIn("META,special_b_prefixes_done,4", lines)
+        self.assertIn("META,special_b_completed,1", lines)
 
     def test_special_a_ops_can_be_narrowed(self):
         out = os.path.join(_TMP, "d6a.txt")
@@ -883,8 +973,7 @@ class TestDryRun(unittest.TestCase):
         return out, p, lines
 
     def test_lanes_of_the_interpreter_equal_the_model(self):
-        # the plumbing proof: the interpreter is the model, so every lane of every kind of op (fixed immediate, call
-        # immediate with signed values, no immediate, three operands, doubleword results) is equal
+        # the plumbing proof covers normal lanes; #126 now stops cflts/cfltu at I8 <= 14 before modelled results exist.
         sets = ["lanes=cflts@2:w32:0:100", "lanes=ai:immw:0:200", "lanes=ila:immw:0:100", "lanes=fma:fpool3:0:70",
                 "lanes=a:wrand:0:130", "lanes=fesd:w32e:0:64"]
         out, p, lines = self.lanes_run(sets, "l1")
@@ -894,14 +983,21 @@ class TestDryRun(unittest.TestCase):
         self.assertIn("LANES,cflts@2,w32,0,100,8,0", lines)
         self.assertIn("LANES,fesd,w32e,0,64,0,0", lines)
         self.assertIn("LANES_DONE,ai,immw,0,200", lines)
-        self.assertEqual(sum(l.startswith("LANE,") for l in lines), 100 + 200 + 100 + 70 + 130 + 64)
-        self.assertEqual([l for l in lines if l.startswith("LANES_FAULT")], [])
+        done = [l for l in lines if l.startswith("LANES_DONE,")]
+        faults = [l for l in lines if l.startswith("LANES_FAULT,")]
+        self.assertEqual(len(done), 5)                            # #126 stops only the cflts@2 entry in this config.
+        self.assertEqual(len(faults), 1)
+        self.assertTrue(faults[0].startswith("LANES_FAULT,cflts@2,w32,0,0,"), faults)
+        self.assertEqual(sum(l.startswith("LANE,") for l in lines), 564)  # Its 100 calls stop before a 64-row chunk commits.
         self.assertIn("META,lanes,6", lines)
         rc, text = run_lanes_compare(out)
         self.assertEqual(rc, 0, text)
         for g in lanes_compare.parse_result(out):
             r = lanes_compare.compare_group(scalar_bin(), g)
             self.assertEqual(r.n_input_errors, 0, g.key)         # the immediates, signed ones included, are the generator's
+            if g.status and g.status.startswith("fault:"):
+                self.assertEqual((g.key[0], g.rows), ("cflts@2", []))
+                continue
             self.assertGreater(len(r.lanes), 0)
             if g.op not in ("ai", "ila"):
                 # (a harness older than 742e288d does not cut call immediates to the field the instruction has: its model
@@ -911,12 +1007,19 @@ class TestDryRun(unittest.TestCase):
     def test_lanes_conv_cfg_in_the_interpreter(self):
         out, p, lines = self.lanes_run([], "l2", ["--cfg", os.path.join(PROBE, "cfg", "lanes_conv.cfg")])
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertEqual(len([l for l in lines if l.startswith("LANES_DONE,")]), 9)
-        self.assertEqual(sum(l.startswith("LANE,") for l in lines), 6 * 256 + 2 * 64 + 256)
+        done = [l for l in lines if l.startswith("LANES_DONE,")]
+        faults = [l for l in lines if l.startswith("LANES_FAULT,")]
+        self.assertEqual(len(done), 3)                            # #126 stops the six cflts/cfltu I8=0..2 entries.
+        self.assertEqual(len(faults), 6)
+        self.assertEqual({l.split(",")[1] for l in faults},
+                         {"cflts@0", "cflts@1", "cflts@2", "cfltu@0", "cfltu@1", "cfltu@2"})
+        self.assertTrue(all(l.split(",")[4] == "0" for l in faults))
+        self.assertEqual(sum(l.startswith("LANE,") for l in lines), 384)  # Only the two I8=173 controls and fesd publish rows.
         self.assertFalse([k for k in self.hashes(lines)])                       # sweep=0: no hash rows
         rc, text = run_lanes_compare(out)
         self.assertEqual(rc, 0, text)
-        self.assertIn("equal 1024  differ 0", text)
+        self.assertEqual(text.count("equal 256   differ 0"), 2)
+        self.assertIn("equal 512   differ 0", text)
 
     def test_a_lanes_entry_that_faults_costs_that_entry_only(self):
         # puts of the SPU: 1 initial status, 2 "in progress" status, 3 first record chunk: dying there loses entry 1
@@ -998,11 +1101,16 @@ class TestDryRun(unittest.TestCase):
     def test_the_conversion_and_fesd_cfgs_in_the_interpreter(self):
         out, p, lines = self.lanes_run([], "c2", ["--cfg", os.path.join(PROBE, "cfg", "lanes_conv2.cfg")])
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertEqual(len([l for l in lines if l.startswith("LANES_DONE,")]), 16)
-        self.assertEqual(sum(l.startswith("LANE,") for l in lines), 16 * 256)
+        done = [l for l in lines if l.startswith("LANES_DONE,")]
+        faults = [l for l in lines if l.startswith("LANES_FAULT,")]
+        self.assertEqual(len(done), 13)                           # #126 stops cflts@3, cflts@10 and cfltu@3.
+        self.assertEqual(len(faults), 3)
+        self.assertEqual({l.split(",")[1] for l in faults}, {"cflts@3", "cflts@10", "cfltu@3"})
+        self.assertTrue(all(l.split(",")[4] == "0" for l in faults))
+        self.assertEqual(sum(l.startswith("LANE,") for l in lines), 13 * 256)  # Each stopped entry has no committed chunk.
         rc, text = run_lanes_compare(out)
         self.assertEqual(rc, 0, text)
-        self.assertEqual(text.count("equal 1024  differ 0"), 16)
+        self.assertEqual(text.count("equal 1024  differ 0"), 13)  # The remaining I8>=15 entries complete normally.
         out, p, lines = self.lanes_run([], "c3", ["--cfg", os.path.join(PROBE, "cfg", "lanesum_fesd.cfg")])
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual(sum(l.startswith("LANESUM,") for l in lines), 256)
@@ -1053,6 +1161,30 @@ class TestHostWithoutConsole(unittest.TestCase):
         p = subprocess.run([self.host, "--set", "special_b_patterns=bogus"], check=False, capture_output=True, text=True, timeout=60)
         self.assertEqual(p.returncode, 2)
         self.assertIn("special_b_patterns must be zero or both", p.stderr)
+
+    def test_special_b_numeric_values_are_decimal_and_bounded(self):
+        bad = [
+            ("special_b_from", "oops"), ("special_b_from", "-1"), ("special_b_from", "0junk"),
+            ("special_b_from", "2147483648"), ("special_b_from", "789"),
+            ("special_b_count", "oops"), ("special_b_count", "-1"), ("special_b_count", "1x"),
+            ("special_b_count", "2147483648"),
+            ("special_b_max", "oops"), ("special_b_max", "-1"), ("special_b_max", "8junk"),
+            ("special_b_max", "2147483648"),
+            ("case_timeout_ms", "600ms"), ("case_timeout_ms", "-1"), ("case_timeout_ms", "2147483648"),
+            ("b_timeout_ms", "600ms"), ("b_timeout_ms", "-1"), ("b_timeout_ms", "2147483648"),
+            ("launch_timeout_ms", "600ms"), ("launch_timeout_ms", "-1"), ("launch_timeout_ms", "2147483648"),
+            ("stall_s", "120s"), ("stall_s", "-1"), ("stall_s", "2147483648"),
+        ]
+        for key, value in bad:
+            p = subprocess.run([self.host, "--plan", "--set", f"{key}={value}"], check=False, capture_output=True,
+                               text=True, timeout=60)
+            self.assertEqual(p.returncode, 2, (key, value, p.stdout, p.stderr))
+            self.assertIn(key, p.stderr, (key, value, p.stderr))
+        p = subprocess.run([self.host, "--plan", "--set", "special_b_max=4", "--set", "special_b_from=4"], check=False,
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("special_b_from", p.stderr)
+
 
     def test_an_unknown_key_stops_the_driver_before_any_launch(self):
         # a misspelt key (here the safety keys special_b, launch_timeout_ms, outdir) must not fall back to a default

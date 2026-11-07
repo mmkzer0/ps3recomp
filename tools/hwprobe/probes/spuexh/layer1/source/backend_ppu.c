@@ -4,10 +4,10 @@
  * it a group exception can take the whole process down), initialise one thread per params block, start, then wait.
  * The wait ends when every thread has reported a final state in its status block, an exception event arrives, the
  * supervisor's progress callback asks to stop (hang) or the call's wall limit passes (limit_ms > 0 is required).
- * Join happens only when the group is known to be ending: after the event, after every thread finished, or after a
- * successful terminate. A failed terminate leaves a group of unknown state, so there is no join: the launch returns
- * -3 (fatal), the probe records a FATAL row and stops, and process exit lets lv2 reclaim the group. Whatever lv2
- * reports (join cause and status, the exception event words) is returned as text so the result file records it.
+ * Join is called only after every thread reports exited or a successful terminate. lv2 provides no join timeout. A failed
+ * terminate, join, group destroy or event-queue destroy returns -3 with the syscall and rc recorded in FATAL; an unknown
+ * or live group is left for process exit to reclaim rather than followed by another wait. Other lv2 results and exception
+ * event words are returned as text so the result file records them.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -71,6 +71,35 @@ static void note(char *desc, size_t cap, const char *fmt, ...)
 	vsnprintf(desc + n, cap - n, fmt, ap);
 	va_end(ap);
 }
+static int destroy_event_queue(sys_event_queue_t q, spuexh_thread_res_t *res)
+{
+	s32 r = sysEventQueueDestroy(q, SYS_EVENT_QUEUE_FORCE_DESTROY);
+	if (r != 0) {
+		res[0].fatal = 1;
+		snprintf(res[0].desc, sizeof(res[0].desc), "sysEventQueueDestroy rc=0x%08x", (unsigned)r);
+		return -1;
+	}
+	return 0;
+}
+
+static int destroy_group_and_queue(sys_spu_group_t gid, sys_event_queue_t q, spuexh_thread_res_t *res)
+{
+	s32 group_rc = sysSpuThreadGroupDestroy(gid);
+	s32 queue_rc = sysEventQueueDestroy(q, SYS_EVENT_QUEUE_FORCE_DESTROY);
+	if (group_rc == 0 && queue_rc == 0)
+		return 0;
+	res[0].fatal = 1;
+	res[0].desc[0] = 0;
+	if (group_rc != 0)
+		snprintf(res[0].desc, sizeof(res[0].desc), "sysSpuThreadGroupDestroy rc=0x%08x", (unsigned)group_rc);
+	if (queue_rc != 0) {
+		size_t n = strlen(res[0].desc);
+		snprintf(res[0].desc + n, sizeof(res[0].desc) - n, "%ssysEventQueueDestroy rc=0x%08x",
+		         group_rc != 0 ? "; " : "", (unsigned)queue_rc);
+	}
+	return -1;
+}
+
 
 static int ppu_run(spuexh_backend_t *be, int n, const uint64_t *param_ea, const volatile spuexh_status_t *const *st,
                    spuexh_progress_fn progress, void *pu, int limit_ms, spuexh_thread_res_t *res)
@@ -87,7 +116,7 @@ static int ppu_run(spuexh_backend_t *be, int n, const uint64_t *param_ea, const 
 	int i, nev = 0, all_done = 0, fault = 0, stopped = 0, timed = 0, created = 0, fatal = 0;
 	u32 cause = 0, status = 0;
 	s32 r;
-	char evtext[120] = "";
+	char evtext[192] = "";
 	(void)be;
 
 	/* No launch without a wall limit: limit_ms <= 0 would be an unbounded launch (RUN.md policy). */
@@ -99,24 +128,25 @@ static int ppu_run(spuexh_backend_t *be, int n, const uint64_t *param_ea, const 
 	memcpy(qa.name, "spuexh", 7);
 	r = sysEventQueueCreate(&q, &qa, SYS_EVENT_QUEUE_KEY_LOCAL, 32);
 	if (r != 0) {
-		snprintf(res[0].desc, sizeof(res[0].desc), "event queue create failed 0x%08x", (unsigned)r);
+		snprintf(res[0].desc, sizeof(res[0].desc), "sysEventQueueCreate rc=0x%08x", (unsigned)r);
 		res[0].fatal = 1;
 		return -3;                    /* not a matter of the thread count: do not retry this launch */
 	}
 	r = sysSpuThreadGroupCreate(&gid, (u32)n, 100, &ga);
 	if (r != 0) {
 		snprintf(res[0].desc, sizeof(res[0].desc), "thread group create (%d threads) failed 0x%08x", n, (unsigned)r);
-		sysEventQueueDestroy(q, SYS_EVENT_QUEUE_FORCE_DESTROY);
+		if (destroy_event_queue(q, res) < 0)
+			return -3;
 		return -2;
 	}
 	/* The exception queue is mandatory: without it a group exception can take the whole process down
 	 * (RUN.md). A failed connect is a launch failure - destroy the unstarted group, run nothing. */
 	r = sysSpuThreadGroupConnectEvent(gid, q, SPU_THREAD_GROUP_EVENT_EXCEPTION);
 	if (r != 0) {
-		snprintf(res[0].desc, sizeof(res[0].desc), "connect_event failed 0x%08x (group destroyed, nothing started)", (unsigned)r);
+		snprintf(res[0].desc, sizeof(res[0].desc), "sysSpuThreadGroupConnectEvent rc=0x%08x", (unsigned)r);
 		res[0].fatal = 1;
-		sysSpuThreadGroupDestroy(gid);
-		sysEventQueueDestroy(q, SYS_EVENT_QUEUE_FORCE_DESTROY);
+		if (destroy_group_and_queue(gid, q, res) < 0)
+			return -3;
 		return -3;
 	}
 	for (i = 0; i < n; i++) {
@@ -125,8 +155,8 @@ static int ppu_run(spuexh_backend_t *be, int n, const uint64_t *param_ea, const 
 		r = sysSpuThreadInitialize(&tid[i], gid, (u32)i, &g_image, &ta, &arg);
 		if (r != 0) {
 			snprintf(res[0].desc, sizeof(res[0].desc), "thread %d initialize failed 0x%08x", i, (unsigned)r);
-			sysSpuThreadGroupDestroy(gid);
-			sysEventQueueDestroy(q, SYS_EVENT_QUEUE_FORCE_DESTROY);
+			if (destroy_group_and_queue(gid, q, res) < 0)
+				return -3;
 			return -2;
 		}
 		created++;
@@ -134,8 +164,8 @@ static int ppu_run(spuexh_backend_t *be, int n, const uint64_t *param_ea, const 
 	r = sysSpuThreadGroupStart(gid);
 	if (r != 0) {
 		snprintf(res[0].desc, sizeof(res[0].desc), "thread group start failed 0x%08x", (unsigned)r);
-		sysSpuThreadGroupDestroy(gid);
-		sysEventQueueDestroy(q, SYS_EVENT_QUEUE_FORCE_DESTROY);
+		if (destroy_group_and_queue(gid, q, res) < 0)
+			return -3;
 		return -2;
 	}
 
@@ -202,7 +232,7 @@ static int ppu_run(spuexh_backend_t *be, int n, const uint64_t *param_ea, const 
 	}
 	if (fault || !exited_all) {
 		r = sysSpuThreadGroupTerminate(gid, 0x7E57);
-		note(evtext, sizeof(evtext), "terminate 0x%08x ", (unsigned)r);
+		note(evtext, sizeof(evtext), "sysSpuThreadGroupTerminate rc=0x%08x ", (unsigned)r);
 		if (r != 0) {
 			fatal = 1;
 			note(evtext, sizeof(evtext), "FATAL: no join after a failed terminate ");
@@ -213,7 +243,8 @@ static int ppu_run(spuexh_backend_t *be, int n, const uint64_t *param_ea, const 
 	}
 	if (fatal) {
 		for (i = 0; i < n; i++) {
-			snprintf(res[i].desc, sizeof(res[i].desc), "%s%s", fault ? "FAULT " : "", evtext);
+			snprintf(res[i].desc, sizeof(res[i].desc), "%sFATAL: sysSpuThreadGroupTerminate rc=0x%08x %s",
+			         fault ? "FAULT " : "", (unsigned)r, evtext);
 			res[i].fatal = 1;
 			res[i].timed_out = 1;
 			res[i].exit_status_pending = pend[i];
@@ -222,6 +253,13 @@ static int ppu_run(spuexh_backend_t *be, int n, const uint64_t *param_ea, const 
 		return -3;
 	}
 	r = sysSpuThreadGroupJoin(gid, &cause, &status);
+	if (r != 0) {
+		for (i = 0; i < n; i++) {
+			snprintf(res[i].desc, sizeof(res[i].desc), "sysSpuThreadGroupJoin rc=0x%08x", (unsigned)r);
+			res[i].fatal = 1;
+		}
+		return -3; /* a failed join does not prove the group ended, so do not destroy live resources */
+	}
 	for (i = 0; i < n; i++) {
 		s32 es = -1;
 		sysSpuThreadGetExitStatus(tid[i], &es);
@@ -234,8 +272,14 @@ static int ppu_run(spuexh_backend_t *be, int n, const uint64_t *param_ea, const 
 		res[i].exit_status_pending = pend[i];
 	}
 	(void)created;
-	sysSpuThreadGroupDestroy(gid);
-	sysEventQueueDestroy(q, SYS_EVENT_QUEUE_FORCE_DESTROY);
+	if (destroy_group_and_queue(gid, q, res) < 0) {
+		for (i = 0; i < n; i++) {
+			res[i].fatal = 1;
+			if (i > 0)
+				snprintf(res[i].desc, sizeof(res[i].desc), "%s", res[0].desc);
+		}
+		return -3;
+	}
 	return 0;
 }
 

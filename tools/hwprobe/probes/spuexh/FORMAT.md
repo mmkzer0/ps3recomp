@@ -19,15 +19,15 @@ rows. The dry run writes `HDR,fw_type,host-interp` and `HDR,console_model,host`.
 | `META,key,value` | facts about the run (below) |
 | `FAULT,spuN,domain,block,job_K,state_S,text` | an SPU thread did not finish and its job is lost: the job it was running, its state word (0 never started, 1 running) and what lv2 reported (join cause/status, exception event words, `hang:` when the supervisor ended it). Written only when the thread ended by itself or the operator stopped the probe; after a group-wide kill the unfinished workers are re-run alone first (below) |
 | `RETRY,spuN,job_K,ok` | a worker that was unfinished when its group died (exception or supervisor kill) re-ran its unfinished jobs alone and completed them: the group's death was collateral, no FAULT, the hashes are kept |
-| `FATAL,launch,text` | a launch could not be contained: the exception queue connect failed, or a terminate returned an error after the exception event / a launch that did not end by itself, so the probe did not join (join has no timeout) - it flushed the file, showed the error and stopped; the text names the lv2 error |
-| `FATAL,cfg,text` | the configuration was rejected at start-up (unknown key, line without `=`, bad value; RUN.md section 3): the probe wrote this row into a result file that holds only the header and stopped before any SPU launch. Not written when the error is a bad `outdir` |
+| `FATAL,launch,text` | a launch or cleanup could not be contained: event-queue create/connect, terminate, join, group destroy, or event-queue destroy failed. The row is flushed, names the failing syscall and rc, and stops the probe before another launch or B word; a failed join is not retried because lv2 provides no join timeout |
+| `FATAL,cfg,text` | the configuration was rejected at start-up (unknown key, line without `=`, non-decimal/overflowing number, or bad value; RUN.md section 3): the probe wrote this row into a result file that holds only the header and stopped before any SPU launch. Not written when the error is a bad `outdir` |
 | `TIMING_OVERFLOW,domain,block` | the job ran past one decrementer period (~53.8 s at 79.8 MHz): its tick count would undercount, so it is not reported as a number (the job's hash rows are still valid); `META,timing_overflows` counts them |
 | `SKIP,op,reason` | no longer written. Result files from before #124 carry `SKIP,<op>,rejected_by_special_a` / `special_a_not_run` rows for the five DP compares, which the sweep then skipped; since #124 they are not sweep ops and nothing is skipped. `compare_spuexh.py` still lists them |
 | `SPECA_VALID,op,executed\|NOT_executed,word_W,started_K,text` | special probe A, first case of an op alone in its own thread group |
 | `SPECA,op,word,case,a,b,result` | special probe A case: instruction word (hex), case number, the operands in registers `$3` and `$4` (32 hex digits each, the quadword) and `$rt` after the instruction |
 | `SPECA_FAULT,op,word,case,a,b,text` | a case that stopped the SPU when run alone |
-| `SPECB_TRY,index,prefix,zero\|rand,word` | special probe B, pre-log: flushed before the word's thread group starts, so a lost run names the word that was being attempted even when no outcome row follows |
-| `SPECB,index,prefix,zero\|rand,word,outcome,nchanged,regs,arena,arena_addr,text` | special probe B outcome (below) |
+| `SPECB_TRY,index,prefix,zero\|rand,word` | special probe B pre-log, flushed before the word's thread group starts. `index` is the inclusive prefix-list position used by `special_b_from`; if no matching `SPECB` or `FATAL` follows, the analyzer marks a suspected freeze |
+| `SPECB,index,prefix,zero\|rand,word,outcome,nchanged,regs,arena,arena_addr,text` | special probe B outcome (below); `special_b_count` counts prefixes, so `both` produces one row for each pattern of every selected prefix |
 | `LANES,op,domain,block,count,imm_bits,start` | lanes job (RUN.md "Lanes"), pre-log: flushed before the entry's launch. `count` calls of the block are dumped from call `start` of the block (`start` counts from the start of the block, `LANE` rows carry the call index within the domain, `block << 20` + position), `imm_bits` is the width of the op's immediate field (0 = none). `op` is the name as configured: a conversion at any I8 scale 0..255 (`cflts@45`) is accepted, not only the sweep's twelve scales. The first lanes mode wrote the row without `start`; `lanes_compare.py` reads both |
 | `LANE,op,domain,block,call,a,b,c,imm,out` | one dumped call of a lanes job: `call` is the generator call index within the domain (the first column of the host harness' `--dump`, so it includes `block << 20`), `a` `b` `c` the operands the generator produced and `out` the result register after the instruction, each a quadword as 32 hex digits in big-endian word order (word 0 first, as `--dump` prints them); `imm` is the immediate field value actually patched into the instruction word (the call's immediate modulo the field width, decimal), or `-` for an op without an immediate field |
 | `LANES_DONE,op,domain,block,rows` | the entry's launch finished and all `count` rows are above |
@@ -48,8 +48,9 @@ Values contain no commas (free text has them replaced by spaces) and no line bre
 
 `backend` (`ppu`, `host-interp`), `build`, `run`, `preset`, `plan_jobs`, `plan_hashes`, `plan_calls`, `spus_requested`, `lanes` and `lanesums` (number of `lanes=` and `lanesum=` entries),
 `spus` (threads used), `spus_unavailable` (a thread count the system refused), `special_a`, `special_b`, `sweep`, `gen_seed`
-(`EXH_SEED`), `special_b_prefixes`, `special_b_from`, `special_b_patterns` (`zero`/`both`), `special_b_count`, per launch and
-thread `launchN_spuM_fpscr` (`fscrrd` words read back after the SPU program set the FPSCR to the defined state at thread
+(`EXH_SEED`), `special_b_prefixes`, `special_b_from`, `special_b_patterns` (`zero`/`both`), `special_b_count` (prefixes, not words),
+`special_b_prefixes_done`, `special_b_completed` (1 only after the configured batch ends normally), per launch and thread
+`launchN_spuM_fpscr` (`fscrrd` words read back after the SPU program set the FPSCR to the defined state at thread
 start: all status bits clear, DP rounding round-to-nearest-even; one row per launch, the special probes included),
 `terminate_join` (`launchN`: the group had to be terminated before it could be joined - it had not ended by itself, or an
 exception event arrived), `exit_status_pending` (the non-zero code `sysSpuThreadGetExitStatus` returned for a thread that
@@ -80,15 +81,16 @@ for `dftsv` every 7-bit mask on the same values.
 
 For each of the 789 11-bit prefixes the toolkit's decode table maps to `SPU_word` (784 before #124, plus the five prefixes of
 probe A's DP compares, `0x2c3 0x2cb 0x3bf 0x3c3 0x3cb`; generated from
-`runtime/spu/spu_interp_tables.inc` at build time, `spuexh_badprefix_gen.h`) two words are executed, each in its own thread
-group: the prefix with all operand bits zero (`zero`) and with a fixed pseudo-random operand pattern (`rand`). The staging
-keys narrow the batch: `special_b_count=N` stops after N words, `special_b_patterns=zero` runs only the zero pattern (the
-first run is one zero-pattern word; RUN.md section 4 has the batch sequence). A `SPECB_TRY` row is flushed before each
-word's group starts. The `index` of the `SPECB`/`SPECB_TRY` rows is the position of the prefix in the sorted list of 789 (a file
-from before #124 numbers 784: the same below `0x2c3`, shifted above it; compare by prefix, not index). The word runs
-with all 128 registers loaded with known values (word 0 of register n = `0x1E000 + 16n`, so a register used as an address
-points into scratch memory) and is followed by code that does not depend on any register: it stores all 128 registers and
-returns. Outcome:
+`runtime/spu/spu_interp_tables.inc` at build time, `spuexh_badprefix_gen.h`) the probe can run zero-operand and fixed
+pseudo-random-operand words, each in its own thread group. `special_b_count=N` selects at most N prefixes (0 = all remaining);
+`special_b_patterns=zero` runs one word per selected prefix, and `both` runs both patterns per prefix. `special_b_from` is an
+inclusive index into the sorted prefix list and must be less than its effective total. A `SPECB_TRY` row is flushed before
+each word's group starts; resume an incomplete run at the same index to re-run the attempted word. In `both` mode, restarting
+that prefix runs zero and random again. The index is build-specific; use the logged hexadecimal prefix value as the stable
+identity and map it to the current list if the generated table changed. `META,special_b_completed,1` marks a normally finished
+batch; absence of that marker means the B result is incomplete. The word runs with all 128 registers loaded with known values
+(word 0 of register n = `0x1E000 + 16n`, so a register used as an address points into scratch memory) and is followed by code
+that does not depend on any register: it stores all 128 registers and returns. Outcome:
 
 | outcome | meaning |
 |---|---|

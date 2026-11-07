@@ -1,5 +1,6 @@
 /* spuexh_core.c - see spuexh_core.h. Plain C, no PSL1GHT and no host-only calls: compiled by ppu-gcc and by the host
  * driver. Time comes from spuexh_now(), defined by the layer. */
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -91,6 +92,16 @@ static int parse_uint(const char *s, uint64_t max, uint64_t *out) {          /* 
     *out = v;
     return 0;
 }
+static int parse_cfg_int(const char *s, int allow_zero, const char *key, int *out, char *err, size_t cap) {
+    uint64_t v;
+    if (parse_uint(s, INT_MAX, &v) < 0 || (!allow_zero && v == 0)) {
+        snprintf(err, cap, "%s must be %s and decimal-only (<= %d)", key, allow_zero ? ">= 0" : "> 0", INT_MAX);
+        return -1;
+    }
+    *out = (int)v;
+    return 0;
+}
+
 
 /* Splits "a:b:c" in place into at most `max` fields; returns the field count, or -1 when there are more. */
 static int split_colon(char *buf, char **f, int max) {
@@ -222,13 +233,13 @@ int spuexh_runcfg_set(spuexh_runcfg_t *rc, const char *k, const char *v, char *e
         if (spuexh_runcfg_defaults(rc, v) < 0) { snprintf(err, cap, "unknown preset '%s' (smoke, standard, full)", v); return -1; }
     }
     else if (!strcmp(k, "spus")) { rc->spus = atoi(v); if (rc->spus < 1 || rc->spus > 6) { snprintf(err, cap, "spus must be 1..6"); return -1; } }
-    else if (!strcmp(k, "stall_s")) { rc->stall_s = atoi(v); if (rc->stall_s < 0) { snprintf(err, cap, "stall_s must be >= 0"); return -1; } }
+    else if (!strcmp(k, "stall_s")) { if (parse_cfg_int(v, 1, k, &rc->stall_s, err, cap) < 0) return -1; }
     else if (!strcmp(k, "max_faults")) { rc->max_faults = atoi(v); if (rc->max_faults < 0) { snprintf(err, cap, "max_faults must be >= 0"); return -1; } }
     else if (!strcmp(k, "special_a")) { if (parse_flag(v, &rc->special_a, "special_a", err, cap) < 0) return -1; }
     else if (!strcmp(k, "special_b")) { if (parse_flag(v, &rc->special_b, "special_b", err, cap) < 0) return -1; }
-    else if (!strcmp(k, "special_b_max")) rc->special_b_max = atoi(v);
-    else if (!strcmp(k, "special_b_from")) { rc->special_b_from = atoi(v); if (rc->special_b_from < 0) { snprintf(err, cap, "special_b_from must be >= 0"); return -1; } }
-    else if (!strcmp(k, "special_b_count")) { rc->special_b_count = atoi(v); if (rc->special_b_count < 0) { snprintf(err, cap, "special_b_count must be >= 0"); return -1; } }
+    else if (!strcmp(k, "special_b_max")) { if (parse_cfg_int(v, 1, k, &rc->special_b_max, err, cap) < 0) return -1; }
+    else if (!strcmp(k, "special_b_from")) { if (parse_cfg_int(v, 1, k, &rc->special_b_from, err, cap) < 0) return -1; }
+    else if (!strcmp(k, "special_b_count")) { if (parse_cfg_int(v, 1, k, &rc->special_b_count, err, cap) < 0) return -1; }
     else if (!strcmp(k, "special_b_patterns")) {
         if (!strcmp(v, "both")) rc->special_b_both = 1;
         else if (!strcmp(v, "zero")) rc->special_b_both = 0;
@@ -236,9 +247,9 @@ int spuexh_runcfg_set(spuexh_runcfg_t *rc, const char *k, const char *v, char *e
     }
     else if (!strcmp(k, "a_ops")) snprintf(rc->a_ops, sizeof rc->a_ops, "%s", v);
     /* every launch kind is bounded: 0 or a negative limit would be an unbounded launch (RUN.md policy) */
-    else if (!strcmp(k, "case_timeout_ms")) { rc->case_timeout_ms = atoi(v); if (rc->case_timeout_ms <= 0) { snprintf(err, cap, "case_timeout_ms must be > 0"); return -1; } }
-    else if (!strcmp(k, "b_timeout_ms")) { rc->b_timeout_ms = atoi(v); if (rc->b_timeout_ms <= 0) { snprintf(err, cap, "b_timeout_ms must be > 0"); return -1; } }
-    else if (!strcmp(k, "launch_timeout_ms")) { rc->launch_timeout_ms = atoi(v); if (rc->launch_timeout_ms <= 0) { snprintf(err, cap, "launch_timeout_ms must be > 0"); return -1; } }
+    else if (!strcmp(k, "case_timeout_ms")) { if (parse_cfg_int(v, 0, k, &rc->case_timeout_ms, err, cap) < 0) return -1; }
+    else if (!strcmp(k, "b_timeout_ms")) { if (parse_cfg_int(v, 0, k, &rc->b_timeout_ms, err, cap) < 0) return -1; }
+    else if (!strcmp(k, "launch_timeout_ms")) { if (parse_cfg_int(v, 0, k, &rc->launch_timeout_ms, err, cap) < 0) return -1; }
     else if (!strcmp(k, "sweep")) { if (parse_flag(v, &rc->sweep, "sweep", err, cap) < 0) return -1; }
     else if (!strcmp(k, "stride_all")) rc->wire.stride_all = W32((uint32_t)atoi(v));
     else if (!strcmp(k, "stride_heavy")) rc->wire.stride_heavy = W32((uint32_t)atoi(v));
@@ -257,6 +268,11 @@ int spuexh_runcfg_set(spuexh_runcfg_t *rc, const char *k, const char *v, char *e
 
 int spuexh_runcfg_finish(spuexh_runcfg_t *rc, char *err, size_t cap) {
     err[0] = 0;
+    const int b_total = (rc->special_b_max > 0 && rc->special_b_max < SPUEXH_NBAD) ? rc->special_b_max : SPUEXH_NBAD;
+    if (rc->special_b_from >= b_total) {
+        snprintf(err, cap, "special_b_from must be < %d (prefix total)", b_total);
+        return -1;
+    }
     int nop = 0, ndom = 0;
     for (int d = 0; d < SPUEXH_NDOMS_GEN; d++) {
         int on = !rc->doms[0] || name_match(rc->doms, spuexh_dom_names[d]);
@@ -761,21 +777,44 @@ int spuexh_run_special_b(spuexh_backend_t *be, const spuexh_runcfg_t *rc, const 
     if (rc->special_b_from > 0) fprintf(f, "META,special_b_from,%d\n", rc->special_b_from);
     fprintf(f, "META,special_b_patterns,%s\nMETA,special_b_count,%d\n", rc->special_b_both ? "both" : "zero",
             rc->special_b_count);
-    int done = 0;
-    for (int i = rc->special_b_from > 0 ? rc->special_b_from : 0; i < total; i++) {
+    const int from = rc->special_b_from;
+    const int prefixes_left = total - from;
+    const int prefix_limit = rc->special_b_count > 0 && rc->special_b_count < prefixes_left ?
+                             rc->special_b_count : prefixes_left;
+    int prefixes_done = 0;
+    fflush(f);
+    if (sink->ui) {
+        char b[96];
+        snprintf(b, sizeof b, "special B: starting %03x (%d prefixes)", spuexh_bad_prefix[from], prefix_limit);
+        if (sink->ui(sink->uu, b)) return 1;
+    }
+    for (int i = from; i < total && (rc->special_b_count == 0 || prefixes_done < rc->special_b_count); i++) {
         const uint32_t pre = spuexh_bad_prefix[i];
         for (int pat = 0; pat < (rc->special_b_both ? 2 : 1); pat++) {
-            if (rc->special_b_count > 0 && done >= rc->special_b_count) { fflush(f); return 0; }
             const uint32_t operand = pat == 0 ? 0u : (uint32_t)exh_mix(0x5E5E000000000000ull + pre) & 0x1FFFFFu;
             const uint32_t word = (pre << 21) | operand;
             memset(&cs, 0, sizeof cs);
             cs.word = W32(word); cs.id = W32((uint32_t)(i * 2 + pat));
-            /* pre-log the word before its group starts: if this launch cannot be contained, the file names the one tried */
+            if (sink->ui) {
+                char b[96];
+                snprintf(b, sizeof b, "special B: trying %03x %s (%d/%d prefixes)", pre, pat ? "rand" : "zero",
+                         prefixes_done + 1, prefix_limit);
+                if (sink->ui(sink->uu, b)) return 1;
+            }
+            /* Keep a stuck word visible in both last.txt and the result file before its group can block. */
             fprintf(f, "SPECB_TRY,%d,%03x,%s,%08x\n", i, pre, pat ? "rand" : "zero", word);
             fflush(f);
             uint32_t started = 0;
             const int ok = run_cases(be, SPUEXH_MODE_RAW, &cs, 1, rc->b_timeout_ms, &o, &tr, &started, f);
-            if (ok == -2) { fatal_row(f, &tr, "launch"); return -1; }
+            if (ok == -2) {
+                fatal_row(f, &tr, "launch");
+                if (sink->ui) {
+                    char b[96];
+                    snprintf(b, sizeof b, "special B: FATAL prefix %03x %s", pre, pat ? "rand" : "zero");
+                    sink->ui(sink->uu, b);
+                }
+                return -1;
+            }
             const uint32_t state = W32(o.state);
             char d1[200], regs[160]; regs[0] = 0;
             clean(d1, sizeof d1, tr.desc);
@@ -792,13 +831,16 @@ int spuexh_run_special_b(spuexh_backend_t *be, const spuexh_runcfg_t *rc, const 
                     ok == 1 ? "executed" : (state == 1 ? "no_return" : "not_started"),
                     ok == 1 ? W32(o.nchanged) : 0u, regs, ok == 1 ? W32(o.arena_hit) : 0u, ok == 1 ? W32(o.arena_addr) : 0u, d1);
             fflush(f);                       /* every word: if the process is lost, the file names the last one tried */
-            done++;
-            if ((i * 2 + pat) % 32 == 31) {
-                if (sink->ui) { char b[96]; snprintf(b, sizeof b, "special B: %d/%d prefixes", i + 1, total); if (sink->ui(sink->uu, b)) return 1; }
+            if (sink->ui) {
+                char b[96];
+                snprintf(b, sizeof b, "special B: %03x %s (%d/%d prefixes)", pre, pat ? "rand" : "zero",
+                         prefixes_done + 1, prefix_limit);
+                if (sink->ui(sink->uu, b)) return 1;
             }
         }
-        if (rc->special_b_count > 0 && done >= rc->special_b_count) break;
+        prefixes_done++;
     }
+    fprintf(f, "META,special_b_prefixes_done,%d\nMETA,special_b_completed,1\n", prefixes_done);
     fflush(f);
     return 0;
 }
