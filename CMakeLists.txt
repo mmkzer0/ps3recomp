@@ -716,6 +716,17 @@ if(PS3RECOMP_BUILD_TESTS)
             set_tests_properties(${_t} PROPERTIES LABELS "hle;t0" TIMEOUT 60)
         endforeach()
 
+        # #130/#131: sceNpSignalingDeactivateConnection (state, no event, no stop) and the context/connection tables
+        # under Matching2's thread against the title's calls; `np_signaling_threads` is the one for ThreadSanitizer.
+        add_executable(test_np_signaling_sync libs/network/tests/test_np_signaling_sync.c)
+        target_include_directories(test_np_signaling_sync PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+        target_compile_options(test_np_signaling_sync PRIVATE -UNDEBUG)
+        target_link_libraries(test_np_signaling_sync PRIVATE Threads::Threads)
+        add_test(NAME np_signaling_deactivate COMMAND test_np_signaling_sync deactivate)
+        set_tests_properties(np_signaling_deactivate PROPERTIES LABELS "hle;t0" TIMEOUT 60)
+        add_test(NAME np_signaling_threads COMMAND test_np_signaling_sync threads)
+        set_tests_properties(np_signaling_threads PROPERTIES LABELS "hle;t0;tsan" TIMEOUT 300)
+
         # #131: the RSX tile mask read lock-free by the walker, against two threads binding tiles. rsx_tiling.c is
         # a unit of its own; the test links it. `tsan` runs it under ThreadSanitizer.
         add_executable(test_rsx_tiling_threads
