@@ -973,7 +973,7 @@ class TestDryRun(unittest.TestCase):
         return out, p, lines
 
     def test_lanes_of_the_interpreter_equal_the_model(self):
-        # the plumbing proof covers normal lanes; #126 now stops cflts/cfltu at I8 <= 14 before modelled results exist.
+        # the plumbing proof covers normal lanes; cflts@2 stops in its first chunk (a lane at sh >= 264, #126), so its entry has no rows.
         sets = ["lanes=cflts@2:w32:0:100", "lanes=ai:immw:0:200", "lanes=ila:immw:0:100", "lanes=fma:fpool3:0:70",
                 "lanes=a:wrand:0:130", "lanes=fesd:w32e:0:64"]
         out, p, lines = self.lanes_run(sets, "l1")
@@ -985,10 +985,11 @@ class TestDryRun(unittest.TestCase):
         self.assertIn("LANES_DONE,ai,immw,0,200", lines)
         done = [l for l in lines if l.startswith("LANES_DONE,")]
         faults = [l for l in lines if l.startswith("LANES_FAULT,")]
-        self.assertEqual(len(done), 5)                            # #126 stops only the cflts@2 entry in this config.
+        self.assertEqual(len(done), 5)                            # the cflts@2 entry stops (call 0 of its first chunk holds a lane at sh >= 264).
         self.assertEqual(len(faults), 1)
         self.assertTrue(faults[0].startswith("LANES_FAULT,cflts@2,w32,0,0,"), faults)
-        self.assertEqual(sum(l.startswith("LANE,") for l in lines), 564)  # Its 100 calls stop before a 64-row chunk commits.
+        self.assertIn("unmodelled cflts/cfltu lane (cflts I8=2 lane=1 in=0xFBAD11B4, #126)", p.stderr)   # the stop names op, scale, lane and word
+        self.assertEqual(sum(l.startswith("LANE,") for l in lines), 564)  # its 100 calls stop before a 64-row chunk commits.
         self.assertIn("META,lanes,6", lines)
         rc, text = run_lanes_compare(out)
         self.assertEqual(rc, 0, text)
@@ -1009,17 +1010,35 @@ class TestDryRun(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         done = [l for l in lines if l.startswith("LANES_DONE,")]
         faults = [l for l in lines if l.startswith("LANES_FAULT,")]
-        self.assertEqual(len(done), 3)                            # #126 stops the six cflts/cfltu I8=0..2 entries.
+        self.assertEqual(len(done), 3)                            # six entries stop: each first chunk holds a lane at sh >= 264 (cflts, cfltu positive).
         self.assertEqual(len(faults), 6)
         self.assertEqual({l.split(",")[1] for l in faults},
                          {"cflts@0", "cflts@1", "cflts@2", "cfltu@0", "cfltu@1", "cfltu@2"})
         self.assertTrue(all(l.split(",")[4] == "0" for l in faults))
-        self.assertEqual(sum(l.startswith("LANE,") for l in lines), 384)  # Only the two I8=173 controls and fesd publish rows.
+        self.assertEqual(sum(l.startswith("LANE,") for l in lines), 384)  # only the two I8=173 controls and fesd publish rows.
         self.assertFalse([k for k in self.hashes(lines)])                       # sweep=0: no hash rows
         rc, text = run_lanes_compare(out)
         self.assertEqual(rc, 0, text)
         self.assertEqual(text.count("equal 256   differ 0"), 2)
         self.assertIn("equal 512   differ 0", text)
+
+    def test_a_low_scale_runs_until_a_lane_is_unmodelled(self):
+        # #126: at I8 <= 14 only a lane at sh >= 264 stops the interpreter (cfltu: not a negative lane, not sh == 264).
+        # cfltu@14 over the first 256 calls of w32 block 0 holds no such lane (the console lanes of those calls are all
+        # covered by the rule), so the entry completes; cflts@14 stops at its first chunk, on the exponent-255 word of call 24.
+        out, p, lines = self.lanes_run(["lanes=cfltu@14:w32:0:256", "lanes=cflts@14:w32:0:64"], "l6")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("LANES_DONE,cfltu@14,w32,0,256", lines)
+        self.assertEqual(sum(l.startswith("LANE,cfltu@14,") for l in lines), 256)
+        faults = [l for l in lines if l.startswith("LANES_FAULT,")]
+        self.assertEqual(len(faults), 1, lines)
+        self.assertTrue(faults[0].startswith("LANES_FAULT,cflts@14,w32,0,0,"), faults)
+        self.assertEqual(sum(l.startswith("LANE,cflts@14,") for l in lines), 0)
+        self.assertIn("unmodelled cflts/cfltu lane (cflts I8=14 lane=3 in=0xFFABDE3D, #126)", p.stderr)
+        self.assertNotIn("cfltu I8=14", p.stderr)
+        rc, text = run_lanes_compare(out)
+        self.assertEqual(rc, 0, text)
+        self.assertIn("equal 1024  differ 0", text)
 
     def test_a_lanes_entry_that_faults_costs_that_entry_only(self):
         # puts of the SPU: 1 initial status, 2 "in progress" status, 3 first record chunk: dying there loses entry 1
@@ -1103,14 +1122,14 @@ class TestDryRun(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         done = [l for l in lines if l.startswith("LANES_DONE,")]
         faults = [l for l in lines if l.startswith("LANES_FAULT,")]
-        self.assertEqual(len(done), 13)                           # #126 stops cflts@3, cflts@10 and cfltu@3.
+        self.assertEqual(len(done), 13)                           # cflts@3, cflts@10 and cfltu@3 stop on a lane at sh >= 264.
         self.assertEqual(len(faults), 3)
         self.assertEqual({l.split(",")[1] for l in faults}, {"cflts@3", "cflts@10", "cfltu@3"})
         self.assertTrue(all(l.split(",")[4] == "0" for l in faults))
-        self.assertEqual(sum(l.startswith("LANE,") for l in lines), 13 * 256)  # Each stopped entry has no committed chunk.
+        self.assertEqual(sum(l.startswith("LANE,") for l in lines), 13 * 256)  # each stopped entry has no committed chunk.
         rc, text = run_lanes_compare(out)
         self.assertEqual(rc, 0, text)
-        self.assertEqual(text.count("equal 1024  differ 0"), 13)  # The remaining I8>=15 entries complete normally.
+        self.assertEqual(text.count("equal 1024  differ 0"), 13)  # the other 13 entries (I8 >= 20) complete normally.
         out, p, lines = self.lanes_run([], "c3", ["--cfg", os.path.join(PROBE, "cfg", "lanesum_fesd.cfg")])
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual(sum(l.startswith("LANESUM,") for l in lines), 256)

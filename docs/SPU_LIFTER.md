@@ -300,15 +300,19 @@ Instructions the lifter accepts but does not fully model:
   cause 4 and the stopped thread's exit status reads `0x8001000F`; issue #124),
   so the interpreter decodes them as `.word` and the lifter emits the same stop
   at the word's own PC instead of a helper call.
-- **`cflts`/`cfltu` at I8 <= 14** are not lifted. With `sh = be + 23 - I8`, a
-  biased exponent `be >= 241 + I8` (reachable only at these scales) takes the
-  conversion past the hardware's saturating path into a region the fit could
-  not model (hardware probe `spuexh` lanes, CECHC04 with 4.81 REBUG: 489
-  measured lanes, no bit-exact rule; issue #126). The interpreter stops at the
-  word, so the lifter emits the same named stop at the word's own PC with the
-  scale (`unmodelled cflts/cfltu scale (I8=N, #126)`) instead of a helper call.
-  I8 >= 15 is exact over the whole input space and lifts normally; the helpers
-  keep a defined saturation for direct callers.
+- **`cflts`/`cfltu` at I8 <= 14** lift with a per-lane stop. With
+  `sh = be + 23 - I8`, a lane with `sh >= 264` (`be >= 241 + I8`, reachable only
+  at these scales) takes the conversion past the hardware's saturating path into
+  a region no fit models. Every lane with `sh < 264` follows the rule in
+  `spu__cfl_lane`, and the `cfltu` lanes at `sh == 264` and every negative
+  `cfltu` lane were measured as well (hardware probe `spuexh` lanes, CECHC04
+  with 4.81 REBUG, 129024 lanes; issue #126). Which lane reaches the path
+  depends on the data, so the lifter emits the conversion behind a runtime check
+  (`spu_cfl_unmodelled_lane`, the interpreter's own predicate): a lane that is
+  not covered stops the run at the word's own PC with
+  `unmodelled cflts/cfltu lane (op I8=N lane=L in=0x........, #126)`, and no
+  result is written. I8 >= 15 cannot reach the path (largest `sh` 263), is exact
+  over the whole input space and lifts to the bare helper call with no check.
 
 ## Tracing (for §3 diff vs RPCS3)
 
