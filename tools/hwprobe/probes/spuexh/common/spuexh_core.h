@@ -17,8 +17,8 @@ typedef struct {
     int max_faults;                  /* relaunches after a fault before the sweep gives up */
     int special_a, special_b;        /* run the special probes before the sweep */
     int special_b_max;               /* 0 = every undecoded prefix, else only the first N */
-    int special_b_from;              /* skip the first N prefixes (resume after a run that was lost in the middle) */
-    int special_b_count;             /* stop after N words (0 = every word): the staging control for probe B batches */
+    int special_b_from;              /* first sorted prefix-list index to run; use the last SPECB_TRY index to retry it */
+    int special_b_count;             /* max prefixes in this batch (0 = every remaining prefix) */
     int special_b_both;              /* 1 = zero and random pattern per prefix, 0 = only the zero pattern */
     char a_ops[64];                  /* probe A: comma list of its ops (default all five: dfceq dfcmeq dfcgt dfcmgt dftsv) */
     int case_timeout_ms;             /* wall limit of one special-A case (> 0: every launch is bounded) */
@@ -107,8 +107,9 @@ int spuexh_run_sweep(spuexh_backend_t *be, const spuexh_runcfg_t *rc, const spue
  * retail SPU executes none of them; an `executed` SPECA_VALID row is a regression of the model (compare_spuexh.py reports it).
  * Returns 0, 1 when the operator asked to stop, or -1 when a launch could not be contained (FATAL row written). */
 int spuexh_run_special_a(spuexh_backend_t *be, const spuexh_runcfg_t *rc, const spuexh_sink_t *sink);
-/* Special probe B: decoder validity of every prefix the toolkit decodes as SPU_word (special_b_count/special_b_both
- * narrow it: the staging control for the first batches). Returns 0, 1 when the operator asked to stop, or -1 on FATAL. */
+/* Special probe B: decoder validity of every prefix the toolkit decodes as SPU_word. special_b_count limits prefixes;
+ * both patterns are always run for each selected prefix when special_b_both is set. special_b_from is inclusive so a lost
+ * batch retries its last SPECB_TRY prefix rather than silently skipping that word. Returns 0, 1 on operator stop, or -1 on FATAL. */
 int spuexh_run_special_b(spuexh_backend_t *be, const spuexh_runcfg_t *rc, const spuexh_sink_t *sink);
 
 /* Lanes jobs: for every lanes= entry one launch on one SPU (the supervisor's launch limit, FATAL row and META rows as

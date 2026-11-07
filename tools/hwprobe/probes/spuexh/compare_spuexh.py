@@ -255,9 +255,9 @@ def special_b_report(hw_rows):
     executed_txt = ", ".join(executed[:80]) + (" ..." if len(executed) > 80 else "") if executed else "none"
     out += ["", f"Prefixes that executed on hardware (valid there although the toolkit has no decode): {executed_txt}",
             "", f"Prefixes that did not complete (invalid instruction, hang or fault): {len(invalid)}"]
-    last = tries[-1] if tries else rows[-1]     # the pre-logged row names the word a lost run was attempting
+    last = tries[-1] if tries else rows[-1]
     out += ["", (f"Last word started: index {last[1]} (prefix {last[2]}, pattern {last[3]}, word {last[4]}); "
-                 f"resume a lost run with special_b_from={int(last[1]) + 1}")]
+                 f"resume at special_b_from={int(last[1])} (inclusive), using prefix {last[2]} as the identity")]
     descs = collections.Counter(",".join(r[10:])[:90] for r in rows if r[5] != "executed")
     out += ["", "How the non-completing words ended (first 8 distinct):", ""]
     for k, v in descs.most_common(8):
