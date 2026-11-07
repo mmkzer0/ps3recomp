@@ -8,6 +8,8 @@
 #ifndef PS3RECOMP_CELL_SPURS_H
 #define PS3RECOMP_CELL_SPURS_H
 
+#include <stddef.h>
+
 #include "ps3emu/ps3types.h"
 #include "ps3emu/error_codes.h"
 
@@ -178,16 +180,54 @@ typedef struct CellSpursWorkloadAttribute CellSpursWorkloadAttribute;
 typedef u32 CellSpursWorkloadId;
 typedef u32 CellSpursTaskId;
 
-/* SPURS attribute -- used to configure a SPURS instance before creation */
+/* SPURS attribute -- used to configure a SPURS instance before creation.
+ * The field order is the firmware's guest layout: libsre 4.81 reads nSpus at
+ * +0x08, exitIfNoWork at +0x14, flags at +0x28, and
+ * cellSpursAttributeEnableSystemWorkload (0x0200F518) writes swlPriority,
+ * swlMaxSpu and swlIsPreem at +0x38/+0x40/+0x44. RPCS3's CellSpursAttribute
+ * names the two words between container and swlPriority unk0/unk1 (the
+ * firmware reads neither). The struct is written and read only by this
+ * module's HLE (host byte order), never by lifted guest code, so the host
+ * layout stands in for the guest one; the asserts below pin every offset
+ * the firmware cites. The 0x200 byte span is what the firmware's
+ * initializers zero-fill and RPCS3 CHECK_SIZEs. */
+#define SPURS_ATTRIBUTE_SIZE 0x200
+
 struct CellSpursAttribute {
-    u32  nSpus;
-    s32  spuPriority[CELL_SPURS_MAX_SPU];
-    u8   prefix[16];
-    u32  prefixSize;
-    u32  flags;
-    u32  container;
-    u8   _padding[128];
+    u32  revision;                      /* +0x00 */
+    u32  sdkVersion;                    /* +0x04 */
+    u32  nSpus;                         /* +0x08 */
+    s32  spuPriority;                   /* +0x0C */
+    s32  ppuPriority;                   /* +0x10 */
+    u8   exitIfNoWork;                  /* +0x14 */
+    u8   prefix[15];                    /* +0x15 (not NTS in the firmware layout) */
+    u32  prefixSize;                    /* +0x24 */
+    u32  flags;                         /* +0x28, SPURS attribute flags */
+    u32  container;                     /* +0x2C */
+    u32  _unk30;                        /* +0x30, unread by libsre (RPCS3 unk0) */
+    u32  _unk34;                        /* +0x34, unread by libsre (RPCS3 unk1) */
+    u8   swlPriority[8];                /* +0x38 system workload priority */
+    u32  swlMaxSpu;                     /* +0x40 */
+    u32  swlIsPreem;                    /* +0x44, one bit per SPU */
 };
+
+typedef char cell_spurs_attribute_layout[
+    (offsetof(struct CellSpursAttribute, revision)     == 0x00 &&
+     offsetof(struct CellSpursAttribute, sdkVersion)   == 0x04 &&
+     offsetof(struct CellSpursAttribute, nSpus)        == 0x08 &&
+     offsetof(struct CellSpursAttribute, spuPriority)  == 0x0C &&
+     offsetof(struct CellSpursAttribute, ppuPriority)  == 0x10 &&
+     offsetof(struct CellSpursAttribute, exitIfNoWork) == 0x14 &&
+     offsetof(struct CellSpursAttribute, prefix)       == 0x15 &&
+     offsetof(struct CellSpursAttribute, prefixSize)   == 0x24 &&
+     offsetof(struct CellSpursAttribute, flags)        == 0x28 &&
+     offsetof(struct CellSpursAttribute, container)    == 0x2C &&
+     offsetof(struct CellSpursAttribute, _unk30)       == 0x30 &&
+     offsetof(struct CellSpursAttribute, _unk34)       == 0x34 &&
+     offsetof(struct CellSpursAttribute, swlPriority)  == 0x38 &&
+     offsetof(struct CellSpursAttribute, swlMaxSpu)    == 0x40 &&
+     offsetof(struct CellSpursAttribute, swlIsPreem)   == 0x44 &&
+     sizeof(struct CellSpursAttribute) <= SPURS_ATTRIBUTE_SIZE) ? 1 : -1];
 
 /* Main SPURS instance */
 struct CellSpurs {

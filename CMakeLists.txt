@@ -1018,6 +1018,11 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME spurs_error_codes
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spurs_error_codes.py")
+        # The argument limits of RequestIdleSpu/SetMaxContention/EnableSystemWorkload,
+        # each pinned against its libsre 4.81 check order (firmware RE, issue #127/#130).
+        add_test(NAME spurs_api_limits
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spurs_api_limits.py")
         # A task or job the SPURS HLE cannot dispatch (an image that is not an SPU ELF, a job with no
         # binary or one outside guest memory) ends in a named stop; a null or unaligned task ELF is the
         # firmware's error.
@@ -1091,7 +1096,7 @@ if(PS3RECOMP_BUILD_TESTS)
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spurs_job_crt.py")
         set_tests_properties(spinlock_word_width PROPERTIES LABELS "sync;t0")
         set_tests_properties(spurs_task_exit_code_initialize spurs_taskset_size spurs_error_codes
-            spurs_dispatch_miss spu_taskset_elf_flags PROPERTIES LABELS "spurs;t0")
+            spurs_api_limits spurs_dispatch_miss spu_taskset_elf_flags PROPERTIES LABELS "spurs;t0")
         set_tests_properties(spu_sdcrz spu_observe spu_dma_repeat spu_mfc_errors
             spu_label_window spurs_job_crt PROPERTIES LABELS "spu;t0")
         # Message passing between a PPU thread and an SPU through the real MFC

@@ -55,12 +55,61 @@ int main(void)
     puts("SPURS maxContention above 8 clamps instead of wrapping PASS");
 
     /* RequestIdleSpu on a slot that is not in use must fail and leave it alone. */
-    assert((u32)cellSpursRequestIdleSpu(0x1000,5,2)==CELL_SPURS_CORE_ERROR_SRCH);
+    assert((u32)cellSpursRequestIdleSpu(0x1000,5,2)==CELL_SPURS_POLICY_MODULE_ERROR_SRCH);
     assert(vm_read8(0x1000+SPURS_WKL_IDLE2+5)==0);
-    assert((u32)cellSpursRequestIdleSpu(0x1000,16,2)==CELL_SPURS_CORE_ERROR_INVAL);
+    assert((u32)cellSpursRequestIdleSpu(0x1000,16,2)==CELL_SPURS_POLICY_MODULE_ERROR_INVAL);
     assert(cellSpursRequestIdleSpu(0x1000,0,2)==0);
     assert(vm_read8(0x1000+SPURS_WKL_IDLE2)==2);
     puts("SPURS RequestIdleSpu rejects a workload slot that is not in use PASS");
+
+    /* libsre 4.81 0x0200AE80 answers this API in the policy module family
+     * (ori immediates 0x8xx), checks spurs & 0x7F (ALIGN), refuses count > 8
+     * (INVAL), and answers STAT outright on a CellSpurs2 -- the 32-workload
+     * flag at +0x74 means the idle-spu byte array at +0x10 does not exist
+     * there (it is the second set's ready counts). The pre-#127 code checked
+     * neither alignment nor count and answered the wid bound in the core
+     * family, so each pin below fails against it. */
+    assert((u32)cellSpursRequestIdleSpu(0x1001,0,1)==CELL_SPURS_POLICY_MODULE_ERROR_ALIGN);
+    assert((u32)cellSpursRequestIdleSpu(0x1000,0,9)==CELL_SPURS_POLICY_MODULE_ERROR_INVAL);
+    assert(vm_read8(0x1000+SPURS_WKL_IDLE2)==2);   /* the refused count wrote nothing */
+    assert((u32)cellSpursRequestIdleSpu(0x1000,0x20,1)==CELL_SPURS_POLICY_MODULE_ERROR_INVAL);
+
+    /* SetMaxContention (libsre 4.81 0x02008F88, core family): the INVAL
+     * contract is the workload id -- 16 on this instance, 32 on a CellSpurs2
+     * -- checked before the enabled mask (SRCH) and the exception word
+     * (STAT). */
+    assert((u32)cellSpursSetMaxContention((CellSpurs*)0x1000,16,1)==CELL_SPURS_CORE_ERROR_INVAL);
+    assert((u32)cellSpursSetMaxContention((CellSpurs*)0x1001,0,1)==CELL_SPURS_CORE_ERROR_ALIGN);
+    vm_write32(0x1000+SPURS_WKL_EXCEPTION,1);
+    assert((u32)cellSpursSetMaxContention((CellSpurs*)0x1000,0,1)==CELL_SPURS_CORE_ERROR_STAT);
+    assert((u32)cellSpursRequestIdleSpu(0x1000,0,1)==CELL_SPURS_POLICY_MODULE_ERROR_STAT);
+    vm_write32(0x1000+SPURS_WKL_EXCEPTION,0);
+    assert(cellSpursSetMaxContention((CellSpurs*)0x1000,0,5)==0);
+    assert(vm_read8(0x1000+SPURS_WKL_MAXCONT)==5);
+
+    /* A CellSpurs2 instance: the attribute is built by the 7-argument export,
+     * initialized with 2 through cellSpursInitializeWithAttribute2. */
+    {
+        assert(_cellSpursAttributeInitialize((CellSpursAttribute*)0x4000,1,0x00350001u,2,1,1,0)==0);
+        assert(cellSpursInitializeWithAttribute2((CellSpurs*)0x5000,(CellSpursAttribute*)0x4000)==0);
+        assert(cellSpursAddWorkload((CellSpurs*)0x5000,(u32*)0x8100,(void*)0x9000,16,0,NULL,1,8)==0);
+        /* RequestIdleSpu: STAT on a CellSpurs2 -- also for a wid the core
+         * bound would have taken (the pre-#127 code answered INVAL for
+         * wid >= 16 and SRCH below it). */
+        assert((u32)cellSpursRequestIdleSpu(0x5000,0,1)==CELL_SPURS_POLICY_MODULE_ERROR_STAT);
+        assert((u32)cellSpursRequestIdleSpu(0x5000,20,1)==CELL_SPURS_POLICY_MODULE_ERROR_STAT);
+        /* SetMaxContention accepts the second set's ids as far as 31; 32 is
+         * past the firmware bound. The workload table assigned id 1 here
+         * (0x1000 took 0), so the nibble check is that id's pair byte. */
+        /* The enabled gate holds for the second set too: 31 passes the id
+         * bound but is not enabled here, so it answers SRCH (libsre checks
+         * the mask at +0xB0 before the store). */
+        assert((u32)cellSpursSetMaxContention((CellSpurs*)0x5000,31,3)==CELL_SPURS_CORE_ERROR_SRCH);
+        assert((u32)cellSpursSetMaxContention((CellSpurs*)0x5000,32,1)==CELL_SPURS_CORE_ERROR_INVAL);
+        assert(cellSpursSetMaxContention((CellSpurs*)0x5000,1,3)==0);
+        assert(vm_read8(0x5000+SPURS_WKL_MAXCONT+1)==0x03);
+    }
+    finalize(0x5000);   /* the CellSpurs2 coordinator must stop before exit */
 
     atomic_store(&gate,1);
     finalize(0x1000);
