@@ -8,6 +8,12 @@ target_link_libraries(test_adec_stub PRIVATE ${VDEC_TEST_LIBS})
 # The spans cellAdecDecodeAu reads are bounded by guest memory (a named stop, not a host access); no stream needed.
 add_test(NAME adec_ac3_range COMMAND test_adec_stub range)
 set_tests_properties(adec_ac3_range PROPERTIES LABELS "codec;t0")
+# #130: with no decoder an AU is the stop adec-no-decoder, not CELL_OK and a silent block; adec.silence_fallback is the
+# allow-list. `stop` covers the AUs no decoder is open for, `stop-decoder` an AU an open decoder gives no PCM for. No
+# stream needed.
+add_test(NAME adec_ac3_stop COMMAND test_adec_stub stop)
+add_test(NAME adec_ac3_stop_decoder COMMAND test_adec_stub stop-decoder)
+set_tests_properties(adec_ac3_stop adec_ac3_stop_decoder PROPERTIES LABELS "codec;t0")
 
 find_program(PS3RECOMP_FFMPEG_EXECUTABLE ffmpeg)
 if(NOT PS3RECOMP_FFMPEG_EXECUTABLE)
@@ -52,6 +58,14 @@ add_test(NAME adec_ac3_disabled COMMAND test_adec_ffmpeg stub
     ${ADEC_MEDIA}/t51.ac3 ${ADEC_MEDIA}/t20.ac3)
 set_tests_properties(adec_ac3_disabled PROPERTIES
     ENVIRONMENT "PS3RECOMP_FFMPEG=0;${ADEC_LIB_ENV}" FIXTURES_REQUIRED adec_media)
+# The same stops with the real library: `stop` with it switched off, `stop-decoder` with a decoder that is open and
+# refuses the AU.
+add_test(NAME adec_ac3_disabled_stop COMMAND test_adec_ffmpeg stop)
+set_tests_properties(adec_ac3_disabled_stop PROPERTIES
+    ENVIRONMENT "PS3RECOMP_FFMPEG=0;${ADEC_LIB_ENV}" LABELS "codec;t0")
+add_test(NAME adec_ac3_decoder_stop COMMAND test_adec_ffmpeg stop-decoder)
+set_tests_properties(adec_ac3_decoder_stop PROPERTIES
+    ENVIRONMENT "${ADEC_LIB_ENV}" SKIP_RETURN_CODE 77 LABELS "codec;t0")
 add_test(NAME adec_ac3_decode COMMAND test_adec_ffmpeg decode
     ${ADEC_MEDIA}/t51.ac3 ${ADEC_MEDIA}/t51.f32)
 set_tests_properties(adec_ac3_decode PROPERTIES

@@ -62,6 +62,43 @@ static void fake_guest_call(uint32_t opd, uint64_t a0, uint64_t a1, uint64_t a2,
     if ((u32)a1 == CELL_ADEC_MSG_TYPE_AUDONE) memset(vm_base + G_AU, 0xA5, 0x10000);
     if (s_nmsg < 8192) s_msgs[s_nmsg++] = (u32)a1;
 }
+
+/* The configuration cellAdec.c reads (adec.silence_fallback, off by default: a zeroed ps3_config) and a ps3_stop that
+ * records the stop and returns to the test through longjmp, so one process refuses several AUs. A stop outside a
+ * STOP_TRY is a failure. */
+static ps3_config s_cfg;
+const ps3_config* ps3_config_get(void) { return &s_cfg; }
+
+static jmp_buf s_stop_jmp;
+static int s_stop_armed, s_stop_hit;
+static int s_stop_kind;
+static char s_stop_func[48], s_stop_codec[16], s_stop_reason[32];
+void ps3_stop(ps3_stop_kind kind, const char* what, const char* remedy, const ps3_stop_field* f, size_t n,
+              const ps3_stop_site* site)
+{
+    (void)what; (void)remedy; (void)site;
+    if (!s_stop_armed) { fprintf(stderr, "unexpected stop, kind %d\n", (int)kind); abort(); }
+    s_stop_kind = (int)kind;
+    for (size_t i = 0; i < n; i++) {
+        if (!strcmp(f[i].key, "func"))   snprintf(s_stop_func, sizeof s_stop_func, "%s", f[i].value);
+        if (!strcmp(f[i].key, "codec"))  snprintf(s_stop_codec, sizeof s_stop_codec, "%s", f[i].value);
+        if (!strcmp(f[i].key, "reason")) snprintf(s_stop_reason, sizeof s_stop_reason, "%s", f[i].value);
+    }
+    s_stop_armed = 0;
+    longjmp(s_stop_jmp, 1);
+}
+#define STOP_TRY(call) do { \
+        s_stop_hit = 0; s_stop_armed = 1; \
+        if (setjmp(s_stop_jmp) == 0) { (void)(call); s_stop_armed = 0; } else s_stop_hit = 1; \
+    } while (0)
+/* The call ended in adec-no-decoder from cellAdecDecodeAu, for this codec type and reason. */
+static int stop_is(u32 codec, const char* reason)
+{
+    char c[16];
+    snprintf(c, sizeof c, "%u", codec);
+    return s_stop_hit && s_stop_kind == (int)PS3_STOP_ADEC_NO_DECODER && !strcmp(s_stop_func, "cellAdecDecodeAu") &&
+           !strcmp(s_stop_codec, c) && !strcmp(s_stop_reason, reason);
+}
 ps3_guest_caller_fn g_ps3_guest_caller = fake_guest_call;
 
 static u8* read_file(const char* path, size_t* len)
@@ -120,6 +157,7 @@ static int all_zero(u32 ea, u32 n)
 static int mode_stub(int argc, char** argv)
 {
     CHECK(argc >= 4);
+    s_cfg.adec_silence_fallback = true;   /* this mode is about the silent block the allow-list keeps */
     size_t n6, n2;
     u8* a6 = read_file(argv[2], &n6);
     u8* a2 = read_file(argv[3], &n2);
@@ -202,6 +240,7 @@ static int mode_decode(int argc, char** argv)
 static int mode_range(void)
 {
     open_adec(CELL_ADEC_TYPE_AC3);
+    s_cfg.adec_silence_fallback = true;   /* the exact-fit AU below is not decoded; its silence is the allow-list's */
     const int before = s_nmsg;
 
     GR_TRY(cellAdecDecodeAu(s_handle, (const CellAdecAuInfo*)(uintptr_t)(MEM_SIZE - 8)));
@@ -229,6 +268,81 @@ static int mode_range(void)
     return 0;
 }
 
+/* stop: no decoder is open (every codec but AC3 here; AC3 when FFmpeg is absent or off), adec.silence_fallback off:
+ * cellAdecDecodeAu is the stop adec-no-decoder, reason no-decoder, before AUDONE and before anything is written for
+ * the guest: no callback, no PCM item. The same AU with the allow-list on is the silence the old code answered. */
+static void submit(u32 size)
+{
+    memset(vm_base + G_AU, 0, size);
+    vm_write32(G_AUINFO + 0, G_AU);
+    vm_write32(G_AUINFO + 4, size);
+}
+
+static int mode_stop(void)
+{
+    s_cfg.adec_silence_fallback = false;
+    const CellAdecAuInfo* au = (const CellAdecAuInfo*)(uintptr_t)G_AUINFO;
+    const CellAdecPcmItem** pi = (const CellAdecPcmItem**)(uintptr_t)G_ITEMPTR;
+    for (u32 codec = 0; codec < 2; codec++) {
+        const u32 type = codec ? CELL_ADEC_TYPE_AC3 : 5u;
+        open_adec(type);
+        CHECK(s_adec[s_handle].ff == NULL);
+        submit(64);
+        const int before = s_nmsg;
+        STOP_TRY(cellAdecDecodeAu(s_handle, au));
+        CHECK(stop_is(type, "no-decoder"));
+        CHECK(s_nmsg == before);                                   /* neither AUDONE nor PCMOUT */
+        CHECK(cellAdecGetPcmItem(s_handle, pi) == (s32)CELL_ADEC_ERROR_EMPTY);   /* no PCM item was produced */
+        CHECK(s_adec[s_handle].auCount == 0);
+        /* The allow-list is what turns the stop back into the silent block, AUDONE then PCMOUT. */
+        s_cfg.adec_silence_fallback = true;
+        STOP_TRY(cellAdecDecodeAu(s_handle, au));
+        CHECK(!s_stop_hit && s_nmsg == before + 2 && s_adec[s_handle].auCount == 1);
+        CHECK(cellAdecGetPcmItem(s_handle, pi) == CELL_OK);
+        s_cfg.adec_silence_fallback = false;
+        CHECK(cellAdecClose(s_handle) == CELL_OK);
+    }
+    printf("OK stop: no decoder is adec-no-decoder (no-decoder) before AUDONE; adec.silence_fallback allows the silence\n");
+    return 0;
+}
+
+/* stop-decoder: a decoder is open and the AU yields no PCM (reason not-decoded). An AU the decoder is never given (no
+ * bytes) stops before AUDONE; one it is given and fails on (garbage) stops after AUDONE, before PCMOUT and before the
+ * PCM item is written. Without FFmpeg a stand-in pointer marks the decoder open and the stub decode returns nothing. */
+static int mode_stop_decoder(void)
+{
+    s_cfg.adec_silence_fallback = false;
+    const CellAdecAuInfo* au = (const CellAdecAuInfo*)(uintptr_t)G_AUINFO;
+    const CellAdecPcmItem** pi = (const CellAdecPcmItem**)(uintptr_t)G_ITEMPTR;
+#ifdef PS3RECOMP_FFMPEG_RUNTIME
+    if (!ps3_ffmpeg_get()) { printf("SKIP: libavcodec not loadable\n"); return 77; }
+#endif
+    open_adec(CELL_ADEC_TYPE_AC3);
+#ifndef PS3RECOMP_FFMPEG_RUNTIME
+    s_adec[s_handle].ff = &s_cfg;
+#endif
+    CHECK(s_adec[s_handle].ff != NULL);
+    int before = s_nmsg;
+    submit(0);                                                     /* nothing to hand the decoder */
+    STOP_TRY(cellAdecDecodeAu(s_handle, au));
+    CHECK(stop_is(CELL_ADEC_TYPE_AC3, "not-decoded") && s_nmsg == before);
+    submit(64);                                                    /* handed over, nothing comes out */
+    STOP_TRY(cellAdecDecodeAu(s_handle, au));
+    CHECK(stop_is(CELL_ADEC_TYPE_AC3, "not-decoded"));
+    CHECK(s_nmsg == before + 1 && s_msgs[before] == CELL_ADEC_MSG_TYPE_AUDONE);   /* AUDONE only, no PCMOUT */
+    CHECK(cellAdecGetPcmItem(s_handle, pi) == (s32)CELL_ADEC_ERROR_EMPTY);
+    s_cfg.adec_silence_fallback = true;                            /* allow-listed: the silent frame, as before */
+    before = s_nmsg;
+    STOP_TRY(cellAdecDecodeAu(s_handle, au));
+    CHECK(!s_stop_hit && s_nmsg == before + 2 && cellAdecGetPcmItem(s_handle, pi) == CELL_OK);
+#ifndef PS3RECOMP_FFMPEG_RUNTIME
+    s_adec[s_handle].ff = NULL;
+#endif
+    CHECK(cellAdecClose(s_handle) == CELL_OK);
+    printf("OK stop-decoder: an AU with no PCM is adec-no-decoder (not-decoded); the allow-list restores the silence\n");
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -236,6 +350,8 @@ int main(int argc, char** argv)
     CHECK(vm_base);
     ppu_vm_size = MEM_SIZE;
     const char* mode = argc > 1 ? argv[1] : "stub";
+    if (strcmp(mode, "stop") == 0) return mode_stop();
+    if (strcmp(mode, "stop-decoder") == 0) return mode_stop_decoder();
     if (strcmp(mode, "stub") == 0) return mode_stub(argc, argv);
     if (strcmp(mode, "range") == 0) return mode_range();
 #ifdef PS3RECOMP_FFMPEG_RUNTIME

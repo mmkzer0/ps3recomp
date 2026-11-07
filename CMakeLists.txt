@@ -715,6 +715,29 @@ if(PS3RECOMP_BUILD_TESTS)
             add_test(NAME ${_t} COMMAND test_${_t})
             set_tests_properties(${_t} PROPERTIES LABELS "hle;t0" TIMEOUT 60)
         endforeach()
+
+        # #130/#131: sceNpSignalingDeactivateConnection (state, no event, no stop) and the context/connection tables
+        # under Matching2's thread against the title's calls; `np_signaling_threads` is the one for ThreadSanitizer.
+        add_executable(test_np_signaling_sync libs/network/tests/test_np_signaling_sync.c)
+        target_include_directories(test_np_signaling_sync PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+        target_compile_options(test_np_signaling_sync PRIVATE -UNDEBUG)
+        target_link_libraries(test_np_signaling_sync PRIVATE Threads::Threads)
+        add_test(NAME np_signaling_deactivate COMMAND test_np_signaling_sync deactivate)
+        set_tests_properties(np_signaling_deactivate PROPERTIES LABELS "hle;t0" TIMEOUT 60)
+        add_test(NAME np_signaling_threads COMMAND test_np_signaling_sync threads)
+        set_tests_properties(np_signaling_threads PROPERTIES LABELS "hle;t0;tsan" TIMEOUT 300)
+
+        # #131: the RSX tile mask read lock-free by the walker, against two threads binding tiles. rsx_tiling.c is
+        # a unit of its own; the test links it. `tsan` runs it under ThreadSanitizer.
+        add_executable(test_rsx_tiling_threads
+            libs/video/tests/test_rsx_tiling_threads.c
+            libs/video/rsx_tiling.c)
+        target_include_directories(test_rsx_tiling_threads PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
+        target_compile_options(test_rsx_tiling_threads PRIVATE -UNDEBUG)
+        target_link_libraries(test_rsx_tiling_threads PRIVATE Threads::Threads)
+        add_test(NAME rsx_tiling_threads COMMAND test_rsx_tiling_threads)
+        set_tests_properties(rsx_tiling_threads PROPERTIES LABELS "gcm;t0;tsan" TIMEOUT 300)
     endif()
 
     # The sysPrxForUser CRT shims bound the guest spans they copy: a span that
@@ -842,6 +865,28 @@ if(PS3RECOMP_BUILD_TESTS)
             target_link_libraries(test_spu_group_lifecycle PRIVATE m Threads::Threads)
             add_test(NAME spu_group_lifecycle COMMAND test_spu_group_lifecycle)
             set_tests_properties(spu_group_lifecycle PROPERTIES LABELS "spu;t0" TIMEOUT 60)
+
+            # #131: group_destroy against a host thread parked at its tail by the PS3_SYNC_TEST_HOOKS hook; `running`
+            # is an acquire/release atomic cleared last. Under the tsan preset a weaker `running` is a reported race.
+            add_executable(test_spu_group_destroy_race
+                runtime/spu/tests/test_spu_group_destroy_race.c)
+            target_include_directories(test_spu_group_destroy_race PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}/include"
+                "${CMAKE_CURRENT_SOURCE_DIR}/runtime"
+                "${CMAKE_CURRENT_SOURCE_DIR}/runtime/syscalls"
+                "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu"
+                "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
+            target_compile_definitions(test_spu_group_destroy_race PRIVATE _GNU_SOURCE PS3_SYNC_TEST_HOOKS)
+            target_compile_options(test_spu_group_destroy_race PRIVATE -UNDEBUG)
+            if(APPLE)
+                target_link_options(test_spu_group_destroy_race PRIVATE "-Wl,-dead_strip")
+            else()
+                target_compile_options(test_spu_group_destroy_race PRIVATE -ffunction-sections -fdata-sections)
+                target_link_options(test_spu_group_destroy_race PRIVATE "-Wl,--gc-sections")
+            endif()
+            target_link_libraries(test_spu_group_destroy_race PRIVATE m Threads::Threads)
+            add_test(NAME spu_group_destroy_race COMMAND test_spu_group_destroy_race)
+            set_tests_properties(spu_group_destroy_race PROPERTIES LABELS "spu;t0;tsan" TIMEOUT 120)
         endif()
         # Report-hold round state, signal-bit synchronization, and concurrent
         # taskset registration in the SPU workload registry.

@@ -46,6 +46,14 @@ extern void spu_raw_note_image(uint32_t src_ea, uint32_t entry);
 
 #include <stdio.h>
 #include <string.h>
+#include <stdatomic.h>
+
+#ifdef PS3_SYNC_TEST_HOOKS
+extern int ps3_sync_test_hook(const char* point, uint32_t id);
+#define SPU_TEST_HOOK(point, id) ((void)ps3_sync_test_hook((point), (id)))
+#else
+#define SPU_TEST_HOOK(point, id) ((void)0)
+#endif
 
 #include "../platform/win32_compat.h"   /* QueryPerformanceCounter shim for the SPU_SPEED timing */
 #include "ps3emu/log_first.h"
@@ -311,7 +319,7 @@ typedef struct {
      * thread. */
     spu_thread_handle_t host_thread;
     spu_thread_event_t  finish_event;
-    int                 running;
+    atomic_int          running;   /* spu_thread_set_running / spu_thread_running: acquire/release, see spu_thread_finish */
     spu_ppu_fallback_fn fb_handler;
     void*               fb_user;
     /* Live spu_context while a lifted worker is running on its host thread
@@ -364,6 +372,19 @@ static spu_thread_t s_spu_threads[MAX_SPU_THREADS];
 static uint32_t     s_spu_next_group_id  = 0x1000;
 static uint32_t     s_spu_next_thread_id = 0x2000;
 static int          s_spu_initialized    = 0;
+
+/* `running` is how the PPU side learns a host thread is done with its spu_thread_t and the context and local store it
+ * owns: group_destroy frees them once it reads 0, group_start / group_join / get_exit_status branch on it (#131). Read
+ * with acquire, written with release, so a reader that sees 0 also sees everything the thread wrote before clearing it
+ * (exit_status, the context, the local store). A volatile read orders nothing, and freeing on it raced the thread. */
+static int spu_thread_running(spu_thread_t* t)
+{
+    return atomic_load_explicit(&t->running, memory_order_acquire);
+}
+static void spu_thread_set_running(spu_thread_t* t, int v)
+{
+    atomic_store_explicit(&t->running, v, memory_order_release);
+}
 
 static spu_group_t* spu_find_group(uint32_t id)
 {
@@ -712,6 +733,27 @@ PS3_NODISCARD static int spu_spawn_host_thread(spu_thread_handle_t* out,
 }
 #endif
 
+/* A host thread's last act on its spu_thread_t: wake group_join, then clear `running`. Clearing is LAST, after the
+ * thread's final access to the slot, because a reader that sees 0 may destroy the group and reuse the slot (memset of
+ * the whole entry, finish_event included) at once; the old order cleared it before signalling, so the thread's own
+ * unlock and broadcast could land on a recycled mutex. The Windows event handle is copied first for the same reason. */
+static void spu_thread_finish(spu_thread_t* t)
+{
+#ifdef _WIN32
+    const HANDLE ev = t->finish_event;
+    SPU_TEST_HOOK("spu-thread-finish", t->tid);
+    spu_thread_set_running(t, 0);
+    SetEvent(ev);
+#else
+    pthread_mutex_lock(&t->finish_event.mu);
+    t->finish_event.done = 1;
+    pthread_cond_broadcast(&t->finish_event.cv);
+    pthread_mutex_unlock(&t->finish_event.mu);
+    SPU_TEST_HOOK("spu-thread-finish", t->tid);
+    spu_thread_set_running(t, 0);
+#endif
+}
+
 /* Host-thread entry for a thread running its image's own lifted SPU code.
  *
  * Everything SPU here is in runtime/spu/spu_lifted_thread.c; this is the part
@@ -743,16 +785,10 @@ static void* spu_exec_thread_proc(void* arg)
             g->cause = SPU_GROUP_CAUSE_GROUP_EXIT;
         }
     }
+    spu_thread_finish(t);
 #ifdef _WIN32
-    t->running = 0;
-    SetEvent(t->finish_event);
     return 0;
 #else
-    pthread_mutex_lock(&t->finish_event.mu);
-    t->running = 0;
-    t->finish_event.done = 1;
-    pthread_cond_broadcast(&t->finish_event.cv);
-    pthread_mutex_unlock(&t->finish_event.mu);
     return NULL;
 #endif
 }
@@ -787,16 +823,10 @@ static void* spu_fallback_thread_proc(void* arg)
                 t->tid, rc, t->connected_queue);
     }
     /* Mark complete and signal anyone waiting in group_join. */
+    spu_thread_finish(t);
 #ifdef _WIN32
-    t->running = 0;
-    SetEvent(t->finish_event);
     return 0;
 #else
-    pthread_mutex_lock(&t->finish_event.mu);
-    t->running = 0;
-    t->finish_event.done = 1;
-    pthread_cond_broadcast(&t->finish_event.cv);
-    pthread_mutex_unlock(&t->finish_event.mu);
     return NULL;
 #endif
 }
@@ -985,7 +1015,7 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
     for (uint32_t i = 0; i < g->num_threads && i < 8; i++) {
         uint32_t idx = g->thread_indices[i];
         if (idx < MAX_SPU_THREADS && s_spu_threads[idx].in_use &&
-            *(volatile int*)&s_spu_threads[idx].running && s_spu_threads[idx].sctx) {
+            spu_thread_running(&s_spu_threads[idx]) && s_spu_threads[idx].sctx) {
             fprintf(stderr, "[SPU] group_start id=0x%X: thread 0x%X still running -> CELL_ESTAT\n",
                     id, s_spu_threads[idx].tid);
             ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ESTAT;
@@ -1073,7 +1103,7 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
                 d.image_id = spu_thread_image_id(t);
                 for (int a = 0; a < 4; a++) d.args[a] = t->args[a];
                 spu_lifted_thread_setup(t->sctx, &d);
-                t->running = 1;
+                spu_thread_set_running(t, 1);
 #ifdef _WIN32
                 if (!t->finish_event)
                     t->finish_event = CreateEventA(NULL, TRUE, FALSE, NULL);
@@ -1094,7 +1124,7 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
                      * pthread_create did not write. */
                     pthread_mutex_destroy(&t->finish_event.mu);
                     pthread_cond_destroy(&t->finish_event.cv);
-                    t->running = 0;
+                    spu_thread_set_running(t, 0);
                     fprintf(stderr, "[SPU] group_start id=0x%X tid=0x%X: "
                             "host thread creation failed -> CELL_EAGAIN\n", id, t->tid);
                     fflush(stderr);
@@ -1177,13 +1207,13 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
         }
         if (!fb) {
             t->exit_status = 0;
-            t->running = 0;
+            spu_thread_set_running(t, 0);
             instant++; nofb++;
             continue;
         }
         t->fb_handler = fb;
         t->fb_user    = user;
-        t->running    = 1;
+        spu_thread_set_running(t, 1);
         /* Interpreted sim jobs are fire-and-forget compute (DMA in -> compute ->
          * DMA out -> stop) that don't block on PPU input mid-run. Running them on
          * an async host thread races the PPU's own use of the results (e.g. the
@@ -1201,7 +1231,7 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
          * parked, and which got it varied run to run. */
         if (fb == spu_interp_fallback && !getenv("RD_SPU_INTERP_ASYNC")) {
             t->exit_status = fb(t->tid, t->args_ea, t->args_size, user);
-            t->running = 0;
+            spu_thread_set_running(t, 0);
             instant++;
             continue;
         }
@@ -1224,7 +1254,7 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
              * whose pthread_t group_join would later join. */
             pthread_mutex_destroy(&t->finish_event.mu);
             pthread_cond_destroy(&t->finish_event.cv);
-            t->running = 0;
+            spu_thread_set_running(t, 0);
             fprintf(stderr, "[SPU] group_start id=0x%X tid=0x%X: "
                     "host thread creation failed -> CELL_EAGAIN\n", id, t->tid);
             fflush(stderr);
@@ -1246,7 +1276,7 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
          *
          * Bounded, so a worker that dies during init cannot hang group_start. */
         if (fb == spu_registry_fallback) {
-            for (int spin = 0; spin < 2000 && !t->live_ctx && t->running; spin++)
+            for (int spin = 0; spin < 2000 && !t->live_ctx && spu_thread_running(t); spin++)
 #ifdef _WIN32
                 Sleep(1);
 #else
@@ -1317,7 +1347,7 @@ static int64_t sys_spu_thread_group_join_handler(ppu_context* ctx)
             if (idx >= MAX_SPU_THREADS) continue;
             spu_thread_t* t = &s_spu_threads[idx];
             if (!t->in_use) continue;
-            if (t->running) {
+            if (spu_thread_running(t)) {
 #ifdef _WIN32
                 if (t->finish_event)
                     WaitForSingleObject(t->finish_event, INFINITE);
@@ -1413,7 +1443,7 @@ static int64_t sys_spu_thread_group_destroy_handler(ppu_context* ctx)
             for (int i = 0; i < 8 && i < (int)g->num_threads; i++) {
                 uint32_t idx = g->thread_indices[i];
                 if (idx < MAX_SPU_THREADS && s_spu_threads[idx].in_use &&
-                    *(volatile int*)&s_spu_threads[idx].running &&
+                    spu_thread_running(&s_spu_threads[idx]) &&
                     (s_spu_threads[idx].sctx || s_spu_threads[idx].local_store))
                     busy = 1;
             }
@@ -1483,7 +1513,7 @@ static int64_t sys_spu_thread_get_exit_status_handler(ppu_context* ctx)
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010005; /* CELL_ESRCH */
         return (int64_t)ctx->gpr[3];
     }
-    if (t->running) {
+    if (spu_thread_running(t)) {
         /* Still in flight — Sony's behaviour. Games that want the exit code
          * synchronously should call group_join first. */
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ESTAT;   /* was 0x80010003 = ENOSYS */

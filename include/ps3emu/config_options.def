@@ -207,6 +207,17 @@ PS3_CFG_U32(trophy, register_wait_cap_vblanks, 1024, 1, 16777216,
     "event). A title that registers on the thread that does the polling hits the cap, "
     "and the events are then delivered by its later polls.")
 
+/* ---- adec --------------------------------------------------------------- */
+
+PS3_CFG_BOOL(adec, silence_fallback, 0,
+    "Let cellAdecDecodeAu answer an AU it has no decoder for (every codec but AC3; AC3 without "
+    "FFmpeg, with PS3RECOMP_FFMPEG=0, or when libavcodec decodes nothing from it) with CELL_OK and "
+    "a block of silence of the codec's frame size, AUDONE and PCMOUT as for a decoded AU. Off, the "
+    "default: that AU ends the run with kind adec-no-decoder (func, codec, reason), because the "
+    "console decodes it and reporting success for audio that was never decoded hides the gap. The "
+    "silence keeps a title that only counts PCM against time running (a movie player, a CD-DA "
+    "reader); a title config that sets it must say why in a comment, and which codec it covers.")
+
 /* ---- video -------------------------------------------------------------- */
 
 PS3_CFG_STR(video, resolutions, "", 31, PS3_CFG_V_VIDEO_RESOLUTIONS,

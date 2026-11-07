@@ -5,8 +5,10 @@
  * AC3 decodes through FFmpeg loaded at run time (PS3RECOMP_FFMPEG_RUNTIME,
  * ffmpeg_runtime.c, the loader cellVdec uses) into interleaved big-endian
  * float PCM, one 1536-sample frame per AU in the stream's own channels.
- * Every other codec, and AC3 when FFmpeg is absent or PS3RECOMP_FFMPEG=0,
- * delivers silence of the codec's frame size.
+ * Every other codec, and AC3 when FFmpeg is absent or PS3RECOMP_FFMPEG=0, is
+ * the named stop adec-no-decoder (docs/STOPS.md): the console decodes it, so
+ * a block of silence would be success for work not done (#130). The title's
+ * config allow-lists the silence with adec.silence_fallback.
  */
 
 #include "cellAdec.h"
@@ -18,7 +20,8 @@
 #include "../guest_struct.h"   /* GUEST_EA, guest_struct_load/store */
 #include "ps3emu/guest_call.h" /* g_ps3_guest_caller -- cbFunc is a GUEST OPD */
 #include "../../runtime/memory/vm.h"     /* VM_HLE_INJECT_BASE; vm_range_ok / vm_guest_limit */
-#include "ps3emu/stop.h"                 /* ps3_stop_guest_range */
+#include "ps3emu/stop.h"                 /* ps3_stop_guest_range, ps3_stop */
+#include "ps3emu/config.h"               /* ps3_cfg_adec_silence_fallback */
 #include "ps3emu/log_first.h"
 #include "ffmpeg_runtime.h"   /* PS3FFmpeg; empty without PS3RECOMP_FFMPEG_RUNTIME */
 
@@ -46,8 +49,10 @@
  *    AU's PCM size from bsiInfo+0x14 needs the block to be the real frame:
  *    1024 stereo samples (8 KB) fed its 5.1 mixer a third of the audio an AU
  *    stands for.
- *  - the other codecs: 1024 stereo float samples of silence, the ATRAC3 frame
- *    the first title on this stub (codecType 5) decodes. */
+ *  - the other codecs, and AC3 without a decoder, under adec.silence_fallback
+ *    (otherwise the stop adec-no-decoder): 1024 stereo float samples of
+ *    silence, the ATRAC3 frame the first title on this stub (codecType 5)
+ *    decodes. */
 #define ADEC_PCM_SAMPLES  1024u
 #define ADEC_PCM_BYTES    (ADEC_PCM_SAMPLES * 2u * 4u)
 #define ADEC_AC3_SAMPLES  1536u
@@ -114,6 +119,26 @@ static u32 adec_ac3_channels(const u8* f, u32 n)
     if (acmod & 4u) pos += 2;                    /* surmixlev */
     if (acmod == 2u) pos += 2;                   /* dsurmod */
     return nfchans[acmod] + ((bits >> (15 - pos)) & 1u);
+}
+
+/* An AU the runtime cannot turn into PCM, with adec.silence_fallback off. The console decodes it: RPCS3
+ * cellAdec.cpp:1285-1317 (pinned oracle 6e4b784d1) maps every codec type to a core decoder module and runs the AU
+ * through it. This runtime has none for it or got nothing out of it, and CELL_OK with silence would let the guest
+ * play audio nobody decoded. */
+static PS3_NORETURN void adec_stop_no_pcm(u32 codec, const char* reason)
+{
+    char c[16];
+    snprintf(c, sizeof c, "%u", codec);
+    const ps3_stop_field f[] = {
+        { "func", "cellAdecDecodeAu" },
+        { "codec", c },
+        { "reason", reason },
+    };
+    ps3_stop(PS3_STOP_ADEC_NO_DECODER,
+             "cellAdecDecodeAu has an AU it cannot decode, and the console returns decoded PCM for it, not silence",
+             "Run with FFmpeg (PS3RECOMP_FFMPEG_RUNTIME, libavcodec) for AC3, implement the codec, or allow-list the silence "
+             "with adec.silence_fallback = true in the title's config, with the reason in a comment.",
+             f, sizeof f / sizeof f[0], NULL);
 }
 
 /* ---------------------------------------------------------------------------
@@ -451,20 +476,26 @@ s32 cellAdecDecodeAu(CellAdecHandle handle, const CellAdecAuInfo* auInfo)
         }
     }
 
+    /* No decoder, or an AU the decoder is never given, is known before AUDONE: stop without a guest callback having
+     * run. A decoder that is given the AU and returns nothing is the stop below, after AUDONE. */
+    const int silence_ok = ps3_cfg_adec_silence_fallback();
+    if (!silence_ok && (!a->ff || !data)) adec_stop_no_pcm(a->codecType, a->ff ? "not-decoded" : "no-decoder");
+
     /* Step 1: report the AU consumed. msgData is the AU INFO ADDRESS, not a
      * status -- see RPCS3 Modules/cellAdec.cpp:1345. A decoder that tracks its
      * outstanding AUs by address gets a null back if this is CELL_OK. */
     adec_notify(handle, CELL_ADEC_MSG_TYPE_AUDONE, (s32)au);
 
-    /* Step 2: the PCM. AC3 through libavcodec when it is there; otherwise
-     * silence of the codec's frame size (AC3: 1536 samples in the frame's
-     * channels), so a title that counts PCM against time still runs. */
+    /* Step 2: the PCM. AC3 through libavcodec when it is there. Otherwise the AU is the stop adec-no-decoder, or,
+     * with adec.silence_fallback (the title's allow-list), silence of the codec's frame size (AC3: 1536 samples
+     * in the frame's channels), so a title that counts PCM against time still runs. */
     a->auCount++;
     {
         const u32 it = a->itemEa;
         u32 ch = 0;
         u32 bytes = (a->ff && data) ? adec_ff_decode(a->ff, data, au_size, a->pcmEa, &ch) : 0;
         if (bytes == 0) {
+            if (!silence_ok) adec_stop_no_pcm(a->codecType, "not-decoded");
             if (a->codecType == CELL_ADEC_TYPE_AC3) {
                 ch = adec_ac3_channels(data, data ? au_size : 0);
                 bytes = ADEC_AC3_SAMPLES * (ch ? ch : 2u) * 4u;
