@@ -292,8 +292,10 @@ NVIDIA's L4T driver (Vulkan 1.2, Tegra X1).
 | Environment variable | Effect |
 |---|---|
 | `PS3RECOMP_VK_DEVICE=<n>` | Use physical device *n* instead of the first non-CPU one |
-| `PS3RECOMP_VK_DUMP=<path>` | Write each presented frame to *path* as a binary PPM |
+| `PS3RECOMP_VK_DUMP=<path>` | Write presented frames to *path* as a binary PPM: every present, one file overwritten each time, unless one of the next three selects |
 | `PS3RECOMP_VK_DUMP_EVERY=<n>` | With a dump: write only every *n*th presented frame (default 1). A full-frame write per present slows a running title noticeably |
+| `PS3RECOMP_VK_DUMP_LIST=<a,b,c>` | With a dump: write exactly those presents (present sequence numbers, at most 32), each to `<path>_s<present_seq>_f<flip_id>.ppm` (`fnone` before the first flip; a trailing `.ppm` on *path* is replaced), as the Metal backend names its `PS3RECOMP_METAL_FRAME_DUMP` files. The sequence is the draw engine's present count; on the fixed-function path, which has none, this backend's own. Beats `_RANGE`; a malformed or longer list is a `config-invalid` stop at start-up |
+| `PS3RECOMP_VK_DUMP_RANGE=<first>-<last>` | With a dump: the same, for every present in the inclusive range |
 | `PS3RECOMP_VK_WINDOW=1` | Also show frames in an SDL2 window; if it cannot, the run continues headless and says why |
 | `PS3RECOMP_VK_FULLSCREEN=1` | With a window: borderless full screen |
 | `PS3RECOMP_VK_HOLD=<sec>` | With a window: keep the last frame up for that long before exiting |

@@ -606,7 +606,7 @@ the hot loops are now all behind gates.*
   `MTLBuffer` (*[@tekulvw](https://github.com/tekulvw)*, #440) with one reused
   buffer for depth readback (#461).
 - **Vulkan**: per-target colour mask and blend enable for MRT sets (#516);
-  `VK_DRAW_BATCH=1` records engine draws, snapshots, uploads and clears into a
+  draw batching (`vk.draw_batch`, env `PS3RECOMP_VK_DRAW_BATCH=1`) records engine draws, snapshots, uploads and clears into a
   single submission (*[@MaChInEgUn3](https://github.com/MaChInEgUn3)*, #532),
   with readback staging reused and changed textures refreshed in place (#552).
 - **Draw engine**: a scissored `CLEAR_SURFACE` clears only the scissor (#560),

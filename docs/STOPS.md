@@ -46,7 +46,7 @@ Ids are stable kebab-case; a new gap gets a new kind, never a free-text variant.
 |---|---|
 | `identity-mismatch` | the executable loaded is not the one the runtime was lifted from, or does not match the `title.elf_sha256` pin |
 | `lifter-abi` | the lifted code was generated for a lifted-code ABI this runtime does not implement (`PPU_LIFTER_ABI` in the generated header against `PPU_RUNTIME_LIFTER_ABI`), so hooks the runtime assumes would not run |
-| `config-invalid` | the configuration is wrong: bad file, unknown key, wrong type, out of range, unknown `PS3RECOMP_*` variable; a diagnostic variable that names more than its table holds (`PS3RECOMP_METAL_FRAME_DUMP_LIST` with more than 32 present numbers: `env`, `count`, `max`) |
+| `config-invalid` | the configuration is wrong: bad file, unknown key, wrong type, out of range, unknown `PS3RECOMP_*` variable; a diagnostic variable that names more than its table holds (`PS3RECOMP_METAL_FRAME_DUMP_LIST` or `PS3RECOMP_VK_DUMP_LIST` with more than 32 present numbers: `env`, `count`, `max`) or that is not the form it takes (`PS3RECOMP_VK_DUMP_LIST` not a comma-separated list of present numbers, `PS3RECOMP_VK_DUMP_RANGE` not `<first>-<last>`: `env`, `value`) |
 | `unresolved-nid` | a firmware import has no handler and no `[[hle.stub]]` entry |
 | `unimplemented-syscall` | an lv2 syscall with no handler and no `[[lv2.stub]]` entry, other than a slot the firmware's own ENOSYS stub answers (`docs/LV2-SYSCALL-STATUS.md`) |
 | `unlifted-function` | a call into a function the lift does not contain |
