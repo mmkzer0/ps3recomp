@@ -38,8 +38,10 @@ extern "C" {
 #endif
 
 /* ---------------------------------------------------------------------------
- * Error codes
- * -----------------------------------------------------------------------*/
+ * Error codes. Firmware-verified against libsre 4.81, which carries the
+ * cellSync exports: cellSyncMutexInitialize (0x02000334) answers
+ * 0x80410111 for a null mutex and 0x80410110 for mutex & 3 -- the base and
+ * the ALIGN/NULL_POINTER offsets below (#127). */
 #define CELL_SYNC_ERROR_AGAIN                   (CELL_ERROR_BASE_SYNC | 0x01)
 #define CELL_SYNC_ERROR_INVAL                   (CELL_ERROR_BASE_SYNC | 0x02)
 #define CELL_SYNC_ERROR_NOSYS                   (CELL_ERROR_BASE_SYNC | 0x03)

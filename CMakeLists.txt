@@ -1023,6 +1023,16 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME spurs_api_limits
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spurs_api_limits.py")
+        # The NP presence import's unavailable answers and the header families the
+        # pre-#127 values had drifted into (RPCS3 sceNp.h is the oracle).
+        add_test(NAME np_presence_details
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_np_presence_details.py")
+        # The sail allocator's layout and its kept invalid-argument answer, with the
+        # RPCS3-evidenced header mapping (issue #127).
+        add_test(NAME sail_memory_allocator
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_sail_memory_allocator.py")
         # A task or job the SPURS HLE cannot dispatch (an image that is not an SPU ELF, a job with no
         # binary or one outside guest memory) ends in a named stop; a null or unaligned task ELF is the
         # firmware's error.
@@ -1097,6 +1107,8 @@ if(PS3RECOMP_BUILD_TESTS)
         set_tests_properties(spinlock_word_width PROPERTIES LABELS "sync;t0")
         set_tests_properties(spurs_task_exit_code_initialize spurs_taskset_size spurs_error_codes
             spurs_api_limits spurs_dispatch_miss spu_taskset_elf_flags PROPERTIES LABELS "spurs;t0")
+        set_tests_properties(np_presence_details sail_memory_allocator
+            PROPERTIES LABELS "hle;t0" TIMEOUT 120)
         set_tests_properties(spu_sdcrz spu_observe spu_dma_repeat spu_mfc_errors
             spu_label_window spurs_job_crt PROPERTIES LABELS "spu;t0")
         # Message passing between a PPU thread and an SPU through the real MFC

@@ -17,16 +17,20 @@ extern "C" {
 #endif
 
 /* ---------------------------------------------------------------------------
- * Error codes
- * -----------------------------------------------------------------------*/
-#define SCE_NP_BASIC_ERROR_NOT_INITIALIZED         0x8002AA01
-#define SCE_NP_BASIC_ERROR_ALREADY_INITIALIZED     0x8002AA02
-#define SCE_NP_BASIC_ERROR_INVALID_ARGUMENT        0x8002AA03
-#define SCE_NP_BASIC_ERROR_NOT_SUPPORTED           0x8002AA04
-#define SCE_NP_BASIC_ERROR_OUT_OF_MEMORY           0x8002AA05
-#define SCE_NP_BASIC_ERROR_EXCEEDS_MAX             0x8002AA06
-#define SCE_NP_BASIC_ERROR_NOT_CONNECTED           0x8002AA07
-#define SCE_NP_BASIC_ERROR_DATA_NOT_FOUND          0x8002AA08
+ * Error codes. The sceNpBasic module's own family is 0x8002A6xx
+ * (RPCS3 sceNp.h enum, tier RPCS3 -- the NP modules are not available
+ * decrypted). The 0x8002AAxx values this header used to carry are the
+ * sceNp core library's family (SCE_NP_ERROR_*), not Basic's (#127).
+ * DATA_NOT_FOUND has no entry under that name at the pinned oracle, so its
+ * v0.19.0 value stays: unverified (#127). */
+#define SCE_NP_BASIC_ERROR_ALREADY_INITIALIZED     0x8002A661
+#define SCE_NP_BASIC_ERROR_NOT_INITIALIZED         0x8002A662
+#define SCE_NP_BASIC_ERROR_NOT_SUPPORTED           0x8002A663
+#define SCE_NP_BASIC_ERROR_OUT_OF_MEMORY           0x8002A664
+#define SCE_NP_BASIC_ERROR_INVALID_ARGUMENT        0x8002A665
+#define SCE_NP_BASIC_ERROR_EXCEEDS_MAX             0x8002A66B
+#define SCE_NP_BASIC_ERROR_NOT_CONNECTED           0x8002A678
+#define SCE_NP_BASIC_ERROR_DATA_NOT_FOUND          0x8002AA08  /* unverified (#127) */
 
 /* ---------------------------------------------------------------------------
  * Constants

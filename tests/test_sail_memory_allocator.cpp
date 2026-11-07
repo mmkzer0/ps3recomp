@@ -51,9 +51,17 @@ static uint32_t call(uint32_t nid,uint64_t a=0,uint64_t b=0,uint64_t c=0,uint64_
  ctx.gpr[3]=a;ctx.gpr[4]=b;ctx.gpr[5]=c;ctx.gpr[6]=d;ctx.gpr[7]=e;
  ps3_hle_call(nid,&ctx);if(ctx.gpr[2]!=0x12345678)std::abort();return uint32_t(ctx.gpr[3]);
 }
-int main() {
+ int main() {
  static uint8_t memory[0x10000];vm_base=memory;ppu_hle_register_all();
- constexpr uint32_t INIT=0x346EBBA3,ARG=0x80610701;
+ /* The header's names carry the RPCS3 cellSail.h values (libsail is not
+  * available decrypted, tier RPCS3): the pre-#127 mapping named 0x80610701
+  * NOT_INITIALIZED and 0x80610703 INVALID_ARGUMENT, so a revert to it fails
+  * here. */
+ static_assert(CELL_SAIL_ERROR_INVALID_ARG==0x80610701u, "invalid arg");
+ static_assert(CELL_SAIL_ERROR_INVALID_STATE==0x80610702u, "invalid state");
+ static_assert(CELL_SAIL_ERROR_UNSUPPORTED_STREAM==0x80610703u, "unsupported stream");
+ static_assert(CELL_SAIL_ERROR_MEMORY==0x806107F0u, "memory");
+ constexpr uint32_t INIT=0x346EBBA3,ARG=CELL_SAIL_ERROR_INVALID_ARG;
  vm_write32(0x1000,0xDEADBEEF);vm_write32(0x1004,0xDEADBEEF);vm_write32(0x1008,0xDEADBEEF);vm_write32(0x100C,0x55667788);
  vm_write32(0x2000,0x3000);vm_write32(0x2004,0x4000);
  CHECK(ps3_hle_has(INIT));CHECK(call(INIT,0x1000,0x2000,0x11223344)==0);
