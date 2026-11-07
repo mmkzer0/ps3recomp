@@ -62,6 +62,8 @@ def main():
                 (spu / "tests/test_dma_repeat_main.c", cflags, "test.o"),
                 (spu / "spu_vm_pagemap.c", cflags, "pagemap.o"),
                 (ROOT / "runtime/memory/label_window.c", cflags, "label_window.o"),
+                (ROOT / "runtime/platform/host_clock.c", cflags, "host_clock.o"),
+                (ROOT / "runtime/platform/host_wait.c", cflags, "host_wait.o"),
                 (ROOT / "runtime/platform/win32_compat.c", cflags, "compat.o")):
             obj = tmp / out
             subprocess.run([cc, *flags, "-c", str(src), "-o", str(obj)], check=True)
@@ -86,7 +88,7 @@ def main():
                         str(tmp / "label_window.o")], check=True)
         partial = tmp / "test_dma_repeat_archive"
         subprocess.run([cxx, str(tmp / "test.o"), str(tmp / "pagemap.o"),
-                        str(tmp / "compat.o"), str(archive),
+                        str(tmp / "compat.o"), str(tmp / "host_clock.o"), str(tmp / "host_wait.o"), str(archive),
                         "-pthread", "-lm", "-o", str(partial)], check=True)
 
         p = g.run([str(binary)], env=env, timeout=60)
@@ -131,7 +133,7 @@ def repeat_log_fixture(cc, cxx, cflags, cxxflags, env):
               "spurs_policy_blob_weak.c", "spu_interp.c"]
     sources = ([spu / "tests/test_spu_dma_repeat.c"] + [spu / n for n in common] +
                [ROOT / "runtime/memory/reservation.c", ROOT / "runtime/memory/label_window.c",
-                ROOT / "runtime/platform/win32_compat.c"])
+                ROOT / "runtime/platform/win32_compat.c", ROOT / "runtime/platform/host_clock.c", ROOT / "runtime/platform/host_wait.c"])
     flags = cflags + shlex.split(os.environ.get("CFLAGS", ""))
     with tempfile.TemporaryDirectory(prefix="spu-dma-repeat-log-") as tmp:
         tmp = Path(tmp)

@@ -20,7 +20,7 @@ with tempfile.TemporaryDirectory(prefix='spurs-scheduler-') as tmp:
     c_sources=[r/'tests/test_spurs_scheduler.c',
                *[r/'runtime/spu'/f'{u}.c' for u in units],
                r/'runtime/memory/reservation.c', r/'runtime/memory/label_window.c',
-               r/'runtime/platform/win32_compat.c']
+               r/'runtime/platform/win32_compat.c', r/'runtime/platform/host_clock.c', r/'runtime/platform/host_wait.c']
     objects=[]
     for index,src in enumerate(c_sources):
         obj=tmp/f'{index}.o'

@@ -52,7 +52,7 @@ def main():
         exe = Path(tmp) / 'mfc_lookup_bench'
         spu_fixture_link.build(
             [ROOT / 'tests/bench/spu/mfc_lookup_bench.c', *[SPU / c for c in COMMON],
-             ROOT / 'runtime/platform/win32_compat.c'], exe,
+             ROOT / 'runtime/platform/win32_compat.c', ROOT / 'runtime/platform/host_clock.c', ROOT / 'runtime/platform/host_wait.c'], exe,
             ['-std=gnu17', '-O2', '-DNDEBUG', '-w', '-I' + str(ROOT / 'include'), '-I' + str(SPU),
              '-I' + str(ROOT / 'runtime/platform')], tmp)
         cmd = [str(exe), '--threads', str(args.threads), '--iterations', str(args.iterations),

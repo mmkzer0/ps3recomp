@@ -8,6 +8,9 @@
 #include "sys_cond.h"
 #include "sys_ppu_thread.h"   /* ppu_thread_note_block */
 #include "sys_timer.h"        /* lv2_usec_deadline: QPC deadline for timed waits */
+#ifndef _WIN32
+#include "../platform/host_wait.h"   /* the monotonic budget of a timed wait */
+#endif
 #include "../memory/vm.h"
 #include <string.h>
 #include <stdlib.h>
@@ -85,7 +88,7 @@ int64_t sys_cond_create(ppu_context* ctx)
 #else
             int rc = pthread_mutex_init(&c->signal_lock, NULL);
             if (rc) { table_unlock(); return (int32_t)CELL_EAGAIN; }
-            rc = pthread_cond_init(&c->cv, NULL);
+            rc = ps3_cond_init_monotonic(&c->cv);   /* timed waits run on the monotonic clock */
             if (rc) {
                 pthread_mutex_destroy(&c->signal_lock);
                 table_unlock(); return (int32_t)CELL_EAGAIN;
@@ -198,18 +201,12 @@ int64_t sys_cond_wait(ppu_context* ctx)
         }
     }
 #else
-    struct timespec deadline;
-    if (timeout) {
-        clock_gettime(CLOCK_REALTIME, &deadline);
-        deadline.tv_sec += (time_t)(timeout / 1000000);
-        deadline.tv_nsec += (long)((timeout % 1000000) * 1000);
-        if (deadline.tv_nsec >= 1000000000L) {
-            deadline.tv_sec++; deadline.tv_nsec -= 1000000000L;
-        }
-    }
+    /* One budget for the whole wait, outside the predicate loop: a wake that
+     * is not this waiter's signal goes back to sleep for what is left, never
+     * for the full timeout again. lv2: a timeout of 0 is infinite. */
+    const ps3_wait_budget budget = ps3_wait_budget_us(timeout, timeout == 0);
     while (!waiter.signalled) {
-        int rc = timeout ? pthread_cond_timedwait(&c->cv, &c->signal_lock, &deadline)
-                         : pthread_cond_wait(&c->cv, &c->signal_lock);
+        int rc = ps3_cond_wait_monotonic(&c->cv, &c->signal_lock, &budget);
         if (rc && !waiter.signalled) {
             result = (int32_t)(rc == ETIMEDOUT ? CELL_ETIMEDOUT : CELL_EFAULT);
             break;

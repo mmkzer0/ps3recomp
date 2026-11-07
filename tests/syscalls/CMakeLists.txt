@@ -71,6 +71,12 @@ else()
 endif()
 # sys_event.c now reaches ps3_stop, whose implementation is C++.
 set_target_properties(test_event_flag PROPERTIES LINKER_LANGUAGE CXX)
+if(NOT WIN32)
+    # sys_event.c's timed waits run on the monotonic budget of runtime/platform/host_wait.c.
+    target_sources(test_event_flag PRIVATE
+        "${PS3RECOMP_ROOT}/runtime/platform/host_clock.c"
+        "${PS3RECOMP_ROOT}/runtime/platform/host_wait.c")
+endif()
 
 add_test(NAME event_flag COMMAND test_event_flag)
 set_tests_properties(event_flag PROPERTIES
@@ -102,6 +108,11 @@ else()
     target_link_libraries(test_event_delivery PRIVATE Threads::Threads)
 endif()
 set_target_properties(test_event_delivery PROPERTIES LINKER_LANGUAGE CXX)
+if(NOT WIN32)
+    target_sources(test_event_delivery PRIVATE
+        "${PS3RECOMP_ROOT}/runtime/platform/host_clock.c"
+        "${PS3RECOMP_ROOT}/runtime/platform/host_wait.c")
+endif()
 
 find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)

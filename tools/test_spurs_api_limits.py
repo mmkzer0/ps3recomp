@@ -20,7 +20,7 @@ with tempfile.TemporaryDirectory(prefix='spurs-limits-') as tmp:
            'spurs_policy_blob_weak','spu_interp']
     spu_fixture_link.build(
         [r/'tests/test_spurs_api_limits.c', *[r/'runtime/spu'/f'{u}.c' for u in units],
-         r/'runtime/platform/win32_compat.c'], out,
+         r/'runtime/platform/win32_compat.c', r/'runtime/platform/host_clock.c', r/'runtime/platform/host_wait.c'], out,
         ['-std=gnu17','-O1','-UNDEBUG','-ffunction-sections','-fdata-sections',
          '-I'+str(r/'include'),'-I'+str(r/'runtime/spu'),'-I'+str(r/'runtime/platform')], tmp,
         ldflags=['-Wl,-dead_strip' if platform.system()=='Darwin' else '-Wl,--gc-sections'])

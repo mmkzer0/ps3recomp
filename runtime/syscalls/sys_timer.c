@@ -21,6 +21,10 @@
 #include <sys/event.h>
 #endif
 #include "ps3emu/thread_name.h"
+#ifndef _WIN32
+#include "../platform/host_wait.h"   /* the period wait of the timer thread */
+#include "ps3emu/stop.h"             /* ps3_stop_host_wait_error */
+#endif
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -85,32 +89,6 @@ uint64_t ppu_timebase_now(void)
 #endif
 }
 
-#ifndef _WIN32
-uint64_t host_monotonic_ns(void)
-{
-#ifdef __APPLE__
-    /* sys_timer_usleep's precise path reads this clock on every guest thread, so the lazy init is atomic: the
-     * values are the same whoever stores them, but a plain store racing a plain load is a data race. */
-    static _Atomic uint32_t numer, denom;
-    uint32_t d = atomic_load_explicit(&denom, memory_order_acquire);
-    uint32_t n = atomic_load_explicit(&numer, memory_order_relaxed);
-    if (!d) {
-        mach_timebase_info_data_t tb;
-        mach_timebase_info(&tb);
-        n = tb.numer; d = tb.denom;
-        atomic_store_explicit(&numer, n, memory_order_relaxed);
-        atomic_store_explicit(&denom, d, memory_order_release);
-    }
-    const uint64_t t = mach_absolute_time();
-    /* Split so t * numer cannot overflow (numer is 125 on Apple silicon). */
-    return (t / d) * n + (t % d) * n / d;
-#else
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
-#endif
-}
-#endif
 
 static void write_be32(uint32_t addr, uint32_t val)
 {
@@ -586,22 +564,24 @@ static void* timer_thread_proc(void* param)
 
     pthread_mutex_lock(&t->mtx);
     while (!t->stop_flag) {
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec  += (time_t)(t->period_usec / 1000000);
-        ts.tv_nsec += (long)((t->period_usec % 1000000) * 1000);
-        if (ts.tv_nsec >= 1000000000L) {
-            ts.tv_sec++;
-            ts.tv_nsec -= 1000000000L;
-        }
-
-        int rc = pthread_cond_timedwait(&t->cv, &t->mtx, &ts);
+        /* One budget per period, kept across every wake that is not the stop
+         * request: a false wake before the period is over neither delivers an
+         * event early nor starts the period again. The next period starts only
+         * after this one expired and its event was delivered. */
+        const ps3_wait_budget period = ps3_wait_budget_us(t->period_usec, 0);
+        int rc;
+        do {
+            rc = ps3_cond_wait_monotonic(&t->cv, &t->mtx, &period);
+        } while (rc == 0 && !t->stop_flag);
         if (t->stop_flag) break;
 
         if (rc == ETIMEDOUT) {
             pthread_mutex_unlock(&t->mtx);
             timer_send_event(t);
             pthread_mutex_lock(&t->mtx);
+        } else {
+            /* The host refused the wait: a timer that cannot wait would fire at once, forever. */
+            ps3_stop_host_wait_error("lv2-timer", rc);
         }
     }
     pthread_mutex_unlock(&t->mtx);
@@ -659,8 +639,15 @@ int64_t sys_timer_create(ppu_context* ctx)
     t->thread_handle = NULL;
     t->timer_handle  = NULL;
 #else
-    pthread_mutex_init(&t->mtx, NULL);
-    pthread_cond_init(&t->cv, NULL);
+    if (pthread_mutex_init(&t->mtx, NULL) != 0) {
+        t->active = 0;
+        return (int64_t)(int32_t)CELL_EAGAIN;
+    }
+    if (ps3_cond_init_monotonic(&t->cv) != 0) {   /* the period wait runs on the monotonic clock */
+        pthread_mutex_destroy(&t->mtx);
+        t->active = 0;
+        return (int64_t)(int32_t)CELL_EAGAIN;
+    }
     t->stop_flag = 0;
 #endif
 

@@ -54,6 +54,8 @@ done
 "$GCC" "${RTCFLAGS[@]}" -c "$REPO/runtime/memory/reservation.c" -o "$RT_DIR/reservation.o"
 "$GCC" "${RTCFLAGS[@]}" -c "$REPO/runtime/memory/label_window.c" -o "$RT_DIR/label_window.o"
 "$GCC" "${RTCFLAGS[@]}" -c "$REPO/runtime/platform/win32_compat.c" -o "$RT_DIR/win32_compat.o"
+"$GCC" "${RTCFLAGS[@]}" -c "$REPO/runtime/platform/host_clock.c" -o "$RT_DIR/host_clock.o"
+"$GCC" "${RTCFLAGS[@]}" -c "$REPO/runtime/platform/host_wait.c" -o "$RT_DIR/host_wait.o"
 "$GCC" "${RTCFLAGS[@]}" -c "$HERE/test_runtime_stubs.c" -o "$RT_DIR/test_runtime_stubs.o"
 "$CXX" -std=c++20 -O2 -I "$REPO/include" -c "$REPO/runtime/config/config.cpp" -o "$RT_DIR/config.o"
 "$CXX" -std=c++20 -O2 -I "$REPO/include" -c "$REPO/runtime/diag/stop.cpp" -o "$RT_DIR/stop.o"

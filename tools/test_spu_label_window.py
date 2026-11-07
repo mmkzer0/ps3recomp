@@ -70,7 +70,7 @@ def main():
         sources += [spu / name for name in runtime]
         sources += [ROOT / "runtime/memory/reservation.c",
                     ROOT / "runtime/memory/label_window.c",
-                    ROOT / "runtime/platform/win32_compat.c"]
+                    ROOT / "runtime/platform/win32_compat.c", ROOT / "runtime/platform/host_clock.c", ROOT / "runtime/platform/host_wait.c"]
         objects = []
         for index, src in enumerate(sources):
             obj = tmp / f"{index}-{src.stem}.o"

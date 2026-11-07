@@ -35,6 +35,8 @@
 #endif
 
 #include "win32_compat.h"
+#include "host_clock.h"
+#include "host_wait.h"
 
 #include <errno.h>
 #include <signal.h>
@@ -128,7 +130,11 @@ typedef struct ps3_obj {
 } ps3_obj;
 
 static pthread_mutex_t s_lock  = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t  s_multi = PTHREAD_COND_INITIALIZER;
+/* The multi-object waiters' condition variable has timed waits, so it cannot be
+ * PTHREAD_COND_INITIALIZER (that binds the default, REALTIME, clock on Linux).
+ * multi_cv() initialises it once; waiters AND the broadcasts of
+ * obj_changed_locked go through it. */
+PS3_STATIC_MONOTONIC_COND(multi_cv)
 static int             s_multi_waiters;
 static ps3_obj*        s_threads;                 /* the thread table head */
 
@@ -141,7 +147,11 @@ static ps3_obj* obj_new(int kind)
     o->magic = OBJ_MAGIC;
     o->kind  = kind;
     o->refs  = 1;
-    pthread_cond_init(&o->cv, NULL);
+    if (ps3_cond_init_monotonic(&o->cv) != 0) {
+        free(o);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
     return o;
 }
 
@@ -174,14 +184,18 @@ static void obj_release_locked(ps3_obj* o)
 static void obj_changed_locked(ps3_obj* o)
 {
     pthread_cond_broadcast(&o->cv);
-    if (s_multi_waiters) pthread_cond_broadcast(&s_multi);
+    if (s_multi_waiters) {
+        /* A multi waiter exists, so multi_cv() ran before it counted itself; the call is the gate. */
+        pthread_cond_t* multi = multi_cv();
+        if (multi) pthread_cond_broadcast(multi);
+    }
 }
 
+/* Monotonic nanoseconds: every deadline and timer due time of this file. The one
+ * platform clock (host_clock.h), the same one host_wait.c measures its budgets on. */
 static unsigned long long mono_ns(void)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
+    return host_monotonic_ns();
 }
 
 /* Now, in FILETIME units: 100 ns since 1601, which is what GetThreadTimes
@@ -242,29 +256,27 @@ static unsigned long long obj_next_due_locked(const ps3_obj* o)
 
 /* Wait on `cv` (with s_lock) until `deadline_ns` (monotonic; 0 = forever),
  * capped by `due_ns` when non-zero. Returns 0 on wake, ETIMEDOUT past the
- * deadline. Call with s_lock held. */
+ * deadline, or the host's error. Call with s_lock held. */
 static int wait_until_locked(pthread_cond_t* cv, unsigned long long deadline_ns,
                              unsigned long long due_ns)
 {
     unsigned long long target = deadline_ns;
     if (due_ns && (!target || due_ns < target)) target = due_ns;
-    if (!target) return pthread_cond_wait(cv, &s_lock);
+    if (!target) {
+        static const ps3_wait_budget forever = { 0, 0, 1 };
+        return ps3_cond_wait_monotonic(cv, &s_lock, &forever);
+    }
 
     unsigned long long now = mono_ns();
     if (deadline_ns && now >= deadline_ns) return ETIMEDOUT;
     if (now >= target) return 0;               /* a timer came due: re-check */
 
-    /* pthread_cond_timedwait takes an absolute CLOCK_REALTIME time (Darwin has
-     * no condattr clock), so convert the monotonic remainder. */
-    unsigned long long remain = target - now;
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_sec  += (time_t)(remain / 1000000000ull);
-    ts.tv_nsec += (long)(remain % 1000000000ull);
-    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
-    int rc = pthread_cond_timedwait(cv, &s_lock, &ts);
+    /* The remainder, on the monotonic clock the deadlines are on: a wall-clock
+     * step during the wait changes neither the duration nor the deadline. */
+    const ps3_wait_budget budget = ps3_wait_budget_ns(target - now, 0);
+    int rc = ps3_cond_wait_monotonic(cv, &s_lock, &budget);
     /* Only the caller's own deadline is a timeout. Waking at a timer's due
-     * time, or early through REALTIME/MONOTONIC jitter, means "look again". */
+     * time means "look again". */
     if (rc == ETIMEDOUT && (!deadline_ns || mono_ns() < deadline_ns)) rc = 0;
     return rc;
 }
@@ -1329,10 +1341,16 @@ DWORD WaitForSingleObject(HANDLE h, DWORD ms)
         unsigned long long now = mono_ns();
         if (obj_signaled_locked(o, now)) { obj_consume_locked(o, now); result = WAIT_OBJECT_0; break; }
         if (ms == 0) break;
-        if (wait_until_locked(&o->cv, deadline, obj_next_due_locked(o)) == ETIMEDOUT) {
+        const int rc = wait_until_locked(&o->cv, deadline, obj_next_due_locked(o));
+        if (rc == ETIMEDOUT) {
             /* One last look: the state may have changed exactly at the deadline. */
             now = mono_ns();
             if (obj_signaled_locked(o, now)) { obj_consume_locked(o, now); result = WAIT_OBJECT_0; }
+            break;
+        }
+        if (rc != 0) {                           /* the host refused the wait: not a wake, not a timeout */
+            result = WAIT_FAILED;
+            SetLastError(ERROR_GEN_FAILURE);
             break;
         }
     }
@@ -1354,6 +1372,8 @@ DWORD WaitForMultipleObjects(DWORD count, const HANDLE* handles, BOOL wait_all, 
         objs[i] = obj_of(handles[i]);
         if (!objs[i]) { SetLastError(ERROR_INVALID_HANDLE); return WAIT_FAILED; }
     }
+    pthread_cond_t* multi = multi_cv();   /* the gate, before this waiter counts itself */
+    if (!multi) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return WAIT_FAILED; }
     unsigned long long deadline = deadline_from_ms(ms);
     DWORD result = WAIT_TIMEOUT;
 
@@ -1382,7 +1402,13 @@ DWORD WaitForMultipleObjects(DWORD count, const HANDLE* handles, BOOL wait_all, 
             unsigned long long d = obj_next_due_locked(objs[i]);
             if (d && (!due || d < due)) due = d;
         }
-        if (wait_until_locked(&s_multi, deadline, due) == ETIMEDOUT) break;
+        const int rc = wait_until_locked(multi, deadline, due);
+        if (rc == ETIMEDOUT) break;
+        if (rc != 0) {
+            result = WAIT_FAILED;
+            SetLastError(ERROR_GEN_FAILURE);
+            break;
+        }
     }
     s_multi_waiters--;
     for (DWORD i = 0; i < count; i++) obj_release_locked(objs[i]);
@@ -1408,12 +1434,20 @@ BOOL CloseHandle(HANDLE h)
 #define PL_BUCKETS 64
 static struct { pthread_mutex_t m; pthread_cond_t c; } s_pl[PL_BUCKETS];
 static pthread_once_t s_pl_once = PTHREAD_ONCE_INIT;
+static int            s_pl_rc;                /* the outcome of pl_init, for every user */
 
 static void pl_init(void)
 {
-    for (int i = 0; i < PL_BUCKETS; i++) {
-        pthread_mutex_init(&s_pl[i].m, NULL);
-        pthread_cond_init(&s_pl[i].c, NULL);
+    int i = 0;
+    for (; i < PL_BUCKETS; i++) {
+        s_pl_rc = pthread_mutex_init(&s_pl[i].m, NULL);
+        if (s_pl_rc != 0) break;
+        s_pl_rc = ps3_cond_init_monotonic(&s_pl[i].c);
+        if (s_pl_rc != 0) { pthread_mutex_destroy(&s_pl[i].m); break; }
+    }
+    while (s_pl_rc != 0 && i-- > 0) {         /* a failed start leaves no bucket half-built */
+        pthread_cond_destroy(&s_pl[i].c);
+        pthread_mutex_destroy(&s_pl[i].m);
     }
 }
 static unsigned pl_bucket(const volatile void* a)
@@ -1440,26 +1474,31 @@ BOOL WaitOnAddress(volatile VOID* address, PVOID compare, SIZE_T size, DWORD ms)
         return FALSE;
     }
     pthread_once(&s_pl_once, pl_init);
+    if (s_pl_rc != 0) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return FALSE; }
     unsigned b = pl_bucket(address);
     pthread_mutex_lock(&s_pl[b].m);
     BOOL ok = TRUE;
+    DWORD error = ERROR_TIMEOUT;
     if (pl_equal(address, compare, size)) {
-        int rc;
-        if (ms == INFINITE) rc = pthread_cond_wait(&s_pl[b].c, &s_pl[b].m);
-        else { struct timespec ts = ps3__deadline_ms(ms); rc = pthread_cond_timedwait(&s_pl[b].c, &s_pl[b].m, &ts); }
+        /* One budget for this call: a wake or a spurious wake returns at once and
+         * the caller re-checks, so no loop here. INFINITE is an infinite budget. */
+        const ps3_wait_budget budget = ps3_wait_budget_ns((uint64_t)ms * 1000000ull, ms == INFINITE);
+        const int rc = ps3_cond_wait_monotonic(&s_pl[b].c, &s_pl[b].m, &budget);
         /* Woken (by a wake on this bucket, or spuriously): report success and
          * let the caller re-check, as the Win32 contract already demands. A
          * timeout with the value now different is still a success. */
         if (rc == ETIMEDOUT && pl_equal(address, compare, size)) ok = FALSE;
+        else if (rc != 0 && rc != ETIMEDOUT) { ok = FALSE; error = ERROR_GEN_FAILURE; }   /* the host refused */
     }
     pthread_mutex_unlock(&s_pl[b].m);
-    if (!ok) SetLastError(ERROR_TIMEOUT);
+    if (!ok) SetLastError(error);
     return ok;
 }
 
 void WakeByAddressAll(PVOID address)
 {
     pthread_once(&s_pl_once, pl_init);
+    if (s_pl_rc != 0) return;                 /* no bucket was ever built, so nobody waits on one */
     unsigned b = pl_bucket(address);
     pthread_mutex_lock(&s_pl[b].m);
     pthread_cond_broadcast(&s_pl[b].c);

@@ -150,8 +150,15 @@ static EventFlagSync* ef_sync_alloc(uint32_t ea)
             InitializeCriticalSection(&s_ef_sync[i].cs);
             InitializeConditionVariable(&s_ef_sync[i].cv);
 #else
-            pthread_mutex_init(&s_ef_sync[i].mtx, NULL);
-            pthread_cond_init(&s_ef_sync[i].cond, NULL);
+            if (pthread_mutex_init(&s_ef_sync[i].mtx, NULL) != 0) {
+                s_ef_sync[i].ea = 0;
+                return NULL;
+            }
+            if (ps3_cond_init_monotonic(&s_ef_sync[i].cond) != 0) {   /* the 2 ms poll runs on the monotonic clock */
+                pthread_mutex_destroy(&s_ef_sync[i].mtx);
+                s_ef_sync[i].ea = 0;
+                return NULL;
+            }
 #endif
             s_ef_sync[i].initialized = 1;
             return &s_ef_sync[i];
@@ -206,16 +213,18 @@ static inline void ef_unlock(EventFlagSync* s)
 #endif
 }
 
-/* Returns 1 if signaled, 0 if it timed out after `ms`. */
+/* Returns 1 if signaled, 0 if it timed out after `ms`. A poll tick, not a guest timeout: it stays
+ * interruptible (a commit wakes it) and the caller re-reads the event bits either way. */
 static inline int ef_wait_timed(EventFlagSync* s, unsigned ms)
 {
 #ifdef _WIN32
     return SleepConditionVariableCS(&s->cv, &s->cs, ms) ? 1 : 0;
 #else
-    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_sec += ms / 1000; ts.tv_nsec += (long)(ms % 1000) * 1000000L;
-    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
-    return pthread_cond_timedwait(&s->cond, &s->mtx, &ts) == 0 ? 1 : 0;
+    const ps3_wait_budget budget = ps3_wait_budget_us((uint64_t)ms * 1000u, 0);
+    const int rc = ps3_cond_wait_monotonic(&s->cond, &s->mtx, &budget);
+    /* Only a spent budget is a tick that found nothing; a refusal would make this loop spin. */
+    if (rc != 0 && rc != ETIMEDOUT) ps3_stop_host_wait_error("spurs-event-flag-poll", rc);
+    return rc == 0 ? 1 : 0;
 #endif
 }
 

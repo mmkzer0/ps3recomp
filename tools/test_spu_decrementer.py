@@ -23,7 +23,8 @@ sources = ['runtime/spu/tests/test_spu_decrementer.c',
            'runtime/spu/spurs_policy.c', 'runtime/spu/spurs_job.c',
            'runtime/spu/spu_tsp_weak.c', 'runtime/spu/spu_vm_pagemap.c',
            'runtime/spu/spurs_policy_blob_weak.c', 'runtime/spu/spu_interp.c',
-           'runtime/platform/win32_compat.c']
+           'runtime/platform/win32_compat.c', 'runtime/platform/host_clock.c',
+           'runtime/platform/host_wait.c']
 with tempfile.TemporaryDirectory(prefix='spu-decrementer-') as tmp:
     binary = Path(tmp) / 'test'
     spu_fixture_link.build([root / s for s in sources], binary,

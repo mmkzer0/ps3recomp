@@ -30,7 +30,7 @@ def build(tmp):
                  *[ROOT / "runtime/spu" / f"{u}.c" for u in UNITS],
                  ROOT / "libs/spurs/spurs_taskset.c",
                  ROOT / "runtime/memory/reservation.c", ROOT / "runtime/memory/label_window.c",
-                 ROOT / "runtime/platform/win32_compat.c"]
+                 ROOT / "runtime/platform/win32_compat.c", ROOT / "runtime/platform/host_clock.c", ROOT / "runtime/platform/host_wait.c"]
     objects = []
     for index, src in enumerate(c_sources):
         obj = tmp / f"{index}.o"

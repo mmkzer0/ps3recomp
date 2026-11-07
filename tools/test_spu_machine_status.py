@@ -26,7 +26,7 @@ with tempfile.TemporaryDirectory(prefix='spu-machine-status-') as tmp:
     # the fixture must link the typed configuration and the named-stop runtime.
     c_sources = [spu / 'tests/test_spu_machine_status.c',
                  *[spu / name for name in sources],
-                 root / 'runtime/platform/win32_compat.c']
+                 root / 'runtime/platform/win32_compat.c', root / 'runtime/platform/host_clock.c', root / 'runtime/platform/host_wait.c']
     objects = []
     for index, src in enumerate(c_sources):
         obj = tmp / f'{index}.o'

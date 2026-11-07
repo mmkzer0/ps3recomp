@@ -39,6 +39,7 @@
 #define PS3EMU_STOP_H
 
 #include <stddef.h>
+#include <stdio.h>      /* snprintf: ps3_stop_host_wait_error */
 #include <stdint.h>
 
 /* Marks a result that reports an error and must not be discarded: dropping one
@@ -138,7 +139,9 @@ extern "C" {
     X(PAD_TRACE,                "pad-trace")                                                               \
     X(FIBER_HOST_CONTEXT,       "fiber-host-context")                                                      \
     /* A cellAdec AU the runtime has no decoder for: the console decodes it, silence would be success for work not done. */ \
-    X(ADEC_NO_DECODER,          "adec-no-decoder")
+    X(ADEC_NO_DECODER,          "adec-no-decoder")                                                         \
+    /* A host wait the host refused (not a timeout, not a wake) in a runtime thread that has no caller to tell. */ \
+    X(HOST_WAIT_ERROR,          "host-wait-error")
 
 /* A fixed underlying type in C++ makes a kind outside the list (a caller's bug,
  * which the stop still reports as "invalid-kind") a well-defined value rather
@@ -194,6 +197,21 @@ PS3_NORETURN void ps3_stop(ps3_stop_kind kind, const char* what,
                            const char* remedy,
                            const ps3_stop_field* fields, size_t nfields,
                            const ps3_stop_site* site);
+
+/* A host condition wait or lock the host refused (EINVAL, EPERM, ...) in a runtime thread that polls or paces
+ * and has no caller to return the error to: the SPURS event-flag poll, the WAIT_SIGNAL and trophy-lifecycle
+ * slices, the event-timer thread. A refusal is neither a timeout nor a wake, and looping on it would spin
+ * forever on a broken primitive. `site` names the wait, `error` is the errno value. */
+PS3_NORETURN static inline void ps3_stop_host_wait_error(const char* site, int error)
+{
+    char code[16];
+    snprintf(code, sizeof code, "%d", error);
+    const ps3_stop_field fields[] = { {"site", site}, {"error", code} };
+    ps3_stop(PS3_STOP_HOST_WAIT_ERROR, "the host refused a wait the runtime depends on",
+             "A host primitive failed with the error shown: the process is in a state no run can trust. "
+             "Report the line.",
+             fields, 2, NULL);
+}
 
 /* Host context failure; no guest site. Fields are defined by this helper. */
 PS3_NORETURN void ps3_stop_fiber_host_context(const char* backend, const char* op,

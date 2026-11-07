@@ -53,7 +53,7 @@ def run(work):
         cflags=['-std=gnu17','-O2','-UNDEBUG']
         if sanitize:cflags+=['-fsanitize=undefined','-fno-sanitize-recover=all']
         cflags+=['-I'+str(where),'-I'+str(work),'-I'+str(ROOT/'include'),'-I'+str(SPU),'-I'+str(ROOT/'runtime/platform')]
-        csrc=[SPU/'tests/test_spu_overlay_allsize.c',*[SPU/(u+'.c') for u in units],ROOT/'runtime/platform/win32_compat.c']
+        csrc=[SPU/'tests/test_spu_overlay_allsize.c',*[SPU/(u+'.c') for u in units],ROOT/'runtime/platform/win32_compat.c', ROOT/'runtime/platform/host_clock.c', ROOT/'runtime/platform/host_wait.c']
         (where/'build-argv.json').write_text(json.dumps([str(c) for c in csrc]+cflags,indent=2)+'\n')
         try:
             spu_fixture_link.build(csrc,exe,cflags,where,timeout=120)

@@ -51,6 +51,8 @@ def main():
                 (spu / "tests/test_mfc_errors_main.c", cflags, "fixture.o"),
                 (spu / "spu_vm_pagemap.c", cflags, "pagemap.o"),
                 (ROOT / "runtime/memory/label_window.c", cflags, "label_window.o"),
+                (ROOT / "runtime/platform/host_clock.c", cflags, "host_clock.o"),
+                (ROOT / "runtime/platform/host_wait.c", cflags, "host_wait.o"),
                 (ROOT / "runtime/platform/win32_compat.c", cflags, "compat.o")):
             obj = tmp / out
             subprocess.run([cc, *flags, "-c", str(src), "-o", str(obj)], check=True)

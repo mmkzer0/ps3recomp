@@ -686,12 +686,77 @@ if(PS3RECOMP_BUILD_TESTS)
     if(UNIX)
         add_executable(test_thread_qos
             runtime/platform/tests/test_thread_qos.c
-            runtime/platform/win32_compat.c)
+            runtime/platform/win32_compat.c
+            runtime/platform/host_clock.c
+            runtime/platform/host_wait.c)
         target_include_directories(test_thread_qos PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/runtime/platform")
         target_compile_options(test_thread_qos PRIVATE -Wall -Wextra)
         target_link_libraries(test_thread_qos PRIVATE Threads::Threads)
         add_test(NAME thread_qos COMMAND test_thread_qos)
         set_tests_properties(thread_qos PROPERTIES LABELS "runtime;t0;tsan" TIMEOUT 120)
+    endif()
+
+    # Relative waits on the host monotonic clock (runtime/platform/host_wait.c, #128). The deterministic
+    # contract runs the real loop against a scripted clock and scripted native waits, once per backend (abs:
+    # Linux's absolute CLOCK_MONOTONIC deadline; rel: macOS's relative duration), so both run on any host. The
+    # native probe runs the same code against the real host.
+    if(UNIX)
+        foreach(_be IN ITEMS abs rel)
+            set(_rel 0)
+            if(_be STREQUAL "rel")
+                set(_rel 1)
+            endif()
+            add_executable(test_host_wait_monotonic_${_be}
+                runtime/platform/tests/test_host_wait_monotonic.c
+                runtime/platform/tests/host_wait_fake.c)
+            target_include_directories(test_host_wait_monotonic_${_be} PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}/runtime/platform")
+            target_compile_definitions(test_host_wait_monotonic_${_be} PRIVATE PS3_HW_RELATIVE=${_rel})
+            target_compile_options(test_host_wait_monotonic_${_be} PRIVATE -Wall -Wextra)
+            target_link_libraries(test_host_wait_monotonic_${_be} PRIVATE Threads::Threads)
+            add_test(NAME host_wait_monotonic_${_be} COMMAND test_host_wait_monotonic_${_be})
+            set_tests_properties(host_wait_monotonic_${_be} PROPERTIES LABELS "platform;t0;tsan" TIMEOUT 60)
+        endforeach()
+        add_executable(test_host_wait_native
+            runtime/platform/tests/test_host_wait_native.c
+            runtime/platform/host_wait.c
+            runtime/platform/host_clock.c)
+        target_include_directories(test_host_wait_native PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/runtime/platform")
+        target_compile_options(test_host_wait_native PRIVATE -Wall -Wextra)
+        target_link_libraries(test_host_wait_native PRIVATE Threads::Threads)
+        add_test(NAME host_wait_native COMMAND test_host_wait_native)
+        set_tests_properties(host_wait_native PROPERTIES LABELS "platform;t0;tsan" TIMEOUT 120)
+        # The Win32 shim's waits on the same scripted clock and native waits: win32_compat.c itself is linked
+        # against the fake backend, which is then also the only clock (HW_FAKE_DEFINES_HOST_CLOCK). Two cases
+        # must be the first to touch the shim's multi-object condition variable, so each runs in its own process.
+        foreach(_be IN ITEMS abs rel)
+            set(_rel 0)
+            if(_be STREQUAL "rel")
+                set(_rel 1)
+            endif()
+            add_executable(test_win32_compat_wait_${_be}
+                runtime/platform/tests/test_win32_compat_wait.c
+                runtime/platform/tests/host_wait_fake.c
+                runtime/platform/win32_compat.c)
+            target_include_directories(test_win32_compat_wait_${_be} PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}/runtime/platform")
+            target_compile_definitions(test_win32_compat_wait_${_be} PRIVATE
+                PS3_HW_RELATIVE=${_rel} HW_FAKE_DEFINES_HOST_CLOCK=1)
+            target_compile_options(test_win32_compat_wait_${_be} PRIVATE -Wall -Wextra)
+            target_link_libraries(test_win32_compat_wait_${_be} PRIVATE Threads::Threads)
+            add_test(NAME win32_compat_wait_${_be} COMMAND test_win32_compat_wait_${_be})
+            add_test(NAME win32_compat_wait_${_be}_init_race COMMAND test_win32_compat_wait_${_be} init-race)
+            add_test(NAME win32_compat_wait_${_be}_init_fail COMMAND test_win32_compat_wait_${_be} init-fail)
+            set_tests_properties(win32_compat_wait_${_be} win32_compat_wait_${_be}_init_race
+                win32_compat_wait_${_be}_init_fail PROPERTIES LABELS "platform;t0;tsan" TIMEOUT 60)
+        endforeach()
+        # Seeded bugs in the real wait code, each of which a named fixture must catch (builds a mirror with cc).
+        find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
+        if(Python3_Interpreter_FOUND)
+            add_test(NAME host_wait_mutants
+                COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_host_wait_mutants.py")
+            set_tests_properties(host_wait_mutants PROPERTIES LABELS "platform;tools;t0" TIMEOUT 600)
+        endif()
     endif()
 
     # cellSync.h from C++, with <stdatomic.h> included first: the generated NID
@@ -847,7 +912,9 @@ if(PS3RECOMP_BUILD_TESTS)
         # the rest, so it is built with section GC (the Windows stubs are a separate file there).
         if(UNIX)
             add_executable(test_spu_group_lifecycle
-                runtime/spu/tests/test_spu_group_lifecycle.c)
+                runtime/spu/tests/test_spu_group_lifecycle.c
+                runtime/platform/host_clock.c
+                runtime/platform/host_wait.c)
             target_include_directories(test_spu_group_lifecycle PRIVATE
                 "${CMAKE_CURRENT_SOURCE_DIR}/include"
                 "${CMAKE_CURRENT_SOURCE_DIR}/runtime"
@@ -903,7 +970,9 @@ if(PS3RECOMP_BUILD_TESTS)
             runtime/spu/spu_vm_pagemap.c
             runtime/spu/spurs_policy_blob_weak.c
             runtime/spu/spu_interp.c
-            runtime/platform/win32_compat.c)
+            runtime/platform/win32_compat.c
+            runtime/platform/host_clock.c
+            runtime/platform/host_wait.c)
         target_include_directories(test_spu_report_hold PRIVATE
             include runtime runtime/spu runtime/platform)
         target_compile_definitions(test_spu_report_hold PRIVATE PS3_SYNC_TEST_HOOKS)
@@ -1414,15 +1483,19 @@ if(PS3RECOMP_BUILD_TESTS)
         set_target_properties(test_savedata_cbresult PROPERTIES LINKER_LANGUAGE CXX)
         add_test(NAME savedata_cbresult COMMAND test_savedata_cbresult)
         set_tests_properties(savedata_cbresult PROPERTIES LABELS "hle;t0" TIMEOUT 60)
+        # sceNpTrophy.c's lifecycle wait runs on the monotonic budget (runtime/platform/host_wait.c).
         ps3recomp_add_hle_check_test(hle_trophy_start
-            libs/network/tests/test_trophy_start.c)
+            libs/network/tests/test_trophy_start.c
+            runtime/platform/host_clock.c runtime/platform/host_wait.c)
         ps3recomp_add_hle_check_test(hle_trophy_registration
-            libs/network/tests/test_trophy_registration.c)
+            libs/network/tests/test_trophy_registration.c
+            runtime/platform/host_clock.c runtime/platform/host_wait.c)
         target_sources(hle_trophy_registration PRIVATE libs/system/cellSysutil.c)
         target_link_libraries(hle_trophy_registration PRIVATE Threads::Threads)
         set_tests_properties(hle_trophy_registration PROPERTIES LABELS "hle;t0;tsan")
         ps3recomp_add_hle_check_test(hle_trophy_errors
-            libs/network/tests/test_trophy_errors.c)
+            libs/network/tests/test_trophy_errors.c
+            runtime/platform/host_clock.c runtime/platform/host_wait.c)
         target_sources(hle_trophy_errors PRIVATE libs/system/cellSysutil.c)
         target_link_libraries(hle_trophy_errors PRIVATE Threads::Threads)
         ps3recomp_add_hle_check_test(hle_dialog_callbacks
@@ -1483,7 +1556,8 @@ if(PS3RECOMP_BUILD_TESTS)
             set_tests_properties(hle_audio_ring_trace PROPERTIES LABELS "audio;t0")
             ps3recomp_add_hle_check_test(test_audio_pace
                 libs/audio/tests/test_audio_pace.c
-                runtime/syscalls/sys_timer.c)
+                runtime/syscalls/sys_timer.c
+                runtime/platform/host_clock.c)
             set_tests_properties(test_audio_pace PROPERTIES LABELS "audio;t0")
             target_include_directories(test_audio_pace PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/runtime/syscalls")
             ps3recomp_add_hle_check_test(hle_pad_rumble

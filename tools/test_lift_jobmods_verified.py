@@ -244,7 +244,7 @@ int main(void)
         import spu_fixture_link
         spu_fixture_link.build([driver, data, tmp / "out/jobmods_register.c", *lifted,
                                 *[spu / s for s in sources],
-                                ROOT / "runtime/platform/win32_compat.c"], binary,
+                                ROOT / "runtime/platform/win32_compat.c", ROOT / "runtime/platform/host_clock.c", ROOT / "runtime/platform/host_wait.c"], binary,
                                ["-std=gnu17", "-O1", "-UNDEBUG", "-w",
                                 "-I" + str(ROOT / "include"), "-I" + str(spu),
                                 "-I" + str(ROOT / "runtime/platform")], tmp)

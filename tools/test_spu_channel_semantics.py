@@ -23,7 +23,8 @@ sources = ['runtime/spu/tests/test_spu_channel_semantics.c',
            'runtime/spu/spurs_policy.c', 'runtime/spu/spurs_job.c',
            'runtime/spu/spu_tsp_weak.c', 'runtime/spu/spu_vm_pagemap.c',
            'runtime/spu/spurs_policy_blob_weak.c', 'runtime/spu/spu_interp.c',
-           'runtime/platform/win32_compat.c']
+           'runtime/platform/win32_compat.c', 'runtime/platform/host_clock.c',
+           'runtime/platform/host_wait.c']
 env = {k: v for k, v in os.environ.items()
        if not k.startswith(('SPU_', 'SPURS_', 'YDKJ_', 'LBP_', 'GH3_'))}
 with tempfile.TemporaryDirectory(prefix='spu-channel-semantics-') as tmp:

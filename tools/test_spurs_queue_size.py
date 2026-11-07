@@ -25,5 +25,5 @@ with tempfile.TemporaryDirectory(prefix='spurs-queue-size-') as tmp:
         str(root/'tests/test_spurs_queue_size.c'),
         *[str(root/'runtime/spu'/f'{u}.c') for u in units], str(root/'runtime/memory/reservation.c'),
         str(root/'runtime/memory/label_window.c'),
-        str(root/'runtime/platform/win32_compat.c'),'-pthread','-lm','-o',str(out)],check=True)
+        str(root/'runtime/platform/win32_compat.c'),str(root/'runtime/platform/host_clock.c'),str(root/'runtime/platform/host_wait.c'),'-pthread','-lm','-o',str(out)],check=True)
     subprocess.run([str(out)],check=True,timeout=15)

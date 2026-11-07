@@ -43,6 +43,7 @@ extern u64 ppu_guest_call(u32 opd_addr,
 #define PATH_SEP '\\'
 #else
 #include <pthread.h>
+#include "../../runtime/platform/host_wait.h"   /* the monotonic wait of the registration lifecycle */
 #include <unistd.h>
 #define mkdir_p(path) mkdir(path, 0755)
 #define PATH_SEP '/'
@@ -147,21 +148,27 @@ static u64 trophy_clock_real(void)
 }
 #else
 static pthread_mutex_t s_life_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t  s_life_cv   = PTHREAD_COND_INITIALIZER;
+/* life_wait is a timed wait, so the variable cannot be PTHREAD_COND_INITIALIZER (that binds the REALTIME clock on
+ * Linux). life_cv() initialises it once; the waiter and every wake go through it. */
+PS3_STATIC_MONOTONIC_COND(life_cv)
 typedef pthread_t trophy_tid;
 static trophy_tid trophy_self(void) { return pthread_self(); }
 static int trophy_tid_eq(trophy_tid a, trophy_tid b) { return pthread_equal(a, b); }
 static void life_lock(void)   { pthread_mutex_lock(&s_life_lock); }
 static void life_unlock(void) { pthread_mutex_unlock(&s_life_lock); }
-static void life_wake(void)   { pthread_cond_broadcast(&s_life_cv); }
+static pthread_cond_t* life_cv_or_stop(void)
+{
+    pthread_cond_t* cv = life_cv();
+    if (!cv) ps3_stop_host_wait_error("np-trophy-lifecycle-init", life_cv_rc);
+    return cv;
+}
+static void life_wake(void)   { pthread_cond_broadcast(life_cv_or_stop()); }
 static void life_wait(u64 us)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_sec  += (time_t)(us / 1000000u);
-    ts.tv_nsec += (long)(us % 1000000u) * 1000;
-    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
-    pthread_cond_timedwait(&s_life_cv, &s_life_lock, &ts);
+    /* A slice of the registration poll on the monotonic clock; the caller re-reads its state either way. */
+    const ps3_wait_budget budget = ps3_wait_budget_us(us, 0);
+    const int rc = ps3_cond_wait_monotonic(life_cv_or_stop(), &s_life_lock, &budget);
+    if (rc != 0 && rc != ETIMEDOUT) ps3_stop_host_wait_error("np-trophy-lifecycle", rc);
 }
 static u64 trophy_clock_real(void)
 {
