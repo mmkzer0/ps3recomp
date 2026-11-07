@@ -19,6 +19,7 @@ uint32_t sys_event_find_queue_by_key(uint64_t key) { (void)key; return 0; }
 void sys_event_queue_push_from_kernel(uint32_t q, uint64_t s, uint64_t d1,
                                       uint64_t d2, uint64_t d3, const char* p)
 { (void)q; (void)s; (void)d1; (void)d2; (void)d3; (void)p; }
+void ps3_host_sleep_ns(uint64_t ns) { (void)ns; }
 
 int main(void)
 {

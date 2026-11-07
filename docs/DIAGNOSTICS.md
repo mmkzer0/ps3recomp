@@ -1803,3 +1803,16 @@ empty resumes, GET/PUT copies, repark followed by completion, and concurrent
 resume admission. `MFC_TEST_SANITIZE=1` additionally runs them with UBSan on a
 compiler that supports it. The concurrent check verifies this dump's bound;
 it does not assert that unrelated existing diagnostic counters are race-free.
+
+## Audio pacing ftrace reasons
+
+Spans of `PS3_FT_AUDIO_PACE` (ftrace kind 19) carry the pacing reason in `a`
+(`include/ps3emu/ps3_ftrace.h`, `libs/audio/audio_pace.h`). The ids are stable:
+
+- `1` guard skip: at a deadline the device held 6 blocks (32 ms) or more, so the
+  period passed without a block.
+- `2` clock wait: the mixer slept to the next period deadline on the monotonic clock.
+- `3` retired, reserved: the old POSIX `SDL_Delay(1)` wait on a full queue.
+- `4` restart: the cadence restarted at now, either to catch up a device that held
+  fewer than 2 blocks before a deadline, or after the mixer woke more than 4
+  periods late (a host stall).

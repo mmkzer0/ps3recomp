@@ -120,7 +120,8 @@ import sys
  AUDIO_MIX, AUDIO_PACE, AUDIO_UNDERRUN, AUDIO_STALE,
  JQ2_PUSH, JQ2_JOB, JQ2_CREDIT, JQ2_SYNC_WAIT, JQ2_IDLE, JQ2_HELD, JQ2_BARRIER,
  JQ2_IMAGE, AUDIO_RING, AUDIO_RING_VIEW) = range(1, 32)
-AUDIO_PACE_REASON = {1: "queue full", 2: "clock pacing", 3: "backend wait"}
+# Labels are report keys that saved runs and scripts compare: keep them, append new reasons.
+AUDIO_PACE_REASON = {1: "queue full", 2: "clock pacing", 3: "backend wait", 4: "restart"}
 JQ2_FIBER_WAKE = 2       # wake field of a fiber wait or wake; it carries waiter 0xFF, so it cannot be joined
 JQ2_PARK_REASONS = {0: "unrecorded", 1: "empty", 2: "unwritten", 3: "held", 4: "no-slot", 5: "paused",
                     15: "unclassified"}   # kind 26's top byte, first match wins
