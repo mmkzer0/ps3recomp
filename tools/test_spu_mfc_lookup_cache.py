@@ -23,7 +23,7 @@ with tempfile.TemporaryDirectory(prefix='spu-mfc-cache-') as tmp:
  if os.environ.get('SANITIZERS'):flags+=['-fsanitize='+os.environ['SANITIZERS'],'-fno-sanitize-recover=all','-g']
  for name in fixtures:
   exe=Path(tmp)/name
-  spu_fixture_link.build([spu/'tests'/(name+'.c'),*[spu/c for c in common],root/'runtime/platform/win32_compat.c'],exe,[*flags,'-I'+str(root/'include'),'-I'+str(spu),'-I'+str(root/'runtime/platform')],tmp)
+  spu_fixture_link.build([spu/'tests'/(name+'.c'),*[spu/c for c in common],root/'runtime/platform/win32_compat.c', root/'runtime/platform/host_clock.c', root/'runtime/platform/host_wait.c'],exe,[*flags,'-I'+str(root/'include'),'-I'+str(spu),'-I'+str(root/'runtime/platform')],tmp)
   for mode,expect in ((None,'on'),('0','off'),('1','on')):
    env={k:v for k,v in os.environ.items() if not k.startswith('PS3RECOMP_SPU_MFC_')}
    if mode is not None:env['PS3RECOMP_SPU_MFC_LOOKUP_CACHE']=mode

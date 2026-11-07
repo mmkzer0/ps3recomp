@@ -50,6 +50,8 @@ add_executable(test_jq2_port
     "${JQ2_SPU_DIR}/spurs_job.c" "${JQ2_SPU_DIR}/spu_tsp_weak.c" "${JQ2_SPU_DIR}/spu_vm_pagemap.c"
     "${JQ2_SPU_DIR}/spurs_policy_blob_weak.c" "${JQ2_SPU_DIR}/spu_interp.c"
     "${PROJECT_SOURCE_DIR}/runtime/platform/win32_compat.c"
+    "${PROJECT_SOURCE_DIR}/runtime/platform/host_clock.c"
+    "${PROJECT_SOURCE_DIR}/runtime/platform/host_wait.c"
     # spu_dma.h calls the typed configuration and the named-stop runtime directly.
     "${PROJECT_SOURCE_DIR}/runtime/config/config.cpp"
     "${PROJECT_SOURCE_DIR}/runtime/diag/stop.cpp"

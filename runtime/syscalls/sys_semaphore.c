@@ -6,6 +6,9 @@
 #include "sys_ppu_thread.h"   /* ppu_thread_note_block */
 #include "../ps3_log.h"
 #include "sys_timer.h"   /* lv2_usec_deadline: sub-ms timed waits */
+#ifndef _WIN32
+#include "../platform/host_wait.h"   /* the monotonic budget of a timed wait */
+#endif
 #include "../memory/vm.h"
 #include <string.h>
 #include <stdlib.h>      /* getenv (else the pointer return is truncated to int) */
@@ -296,8 +299,17 @@ int64_t sys_semaphore_create(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_EAGAIN;
     }
 #else
-    pthread_mutex_init(&s->mtx, NULL);
-    pthread_cond_init(&s->cv, NULL);
+    if (pthread_mutex_init(&s->mtx, NULL) != 0) {
+        s->active = 0;
+        sem_table_unlock();
+        return (int64_t)(int32_t)CELL_EAGAIN;
+    }
+    if (ps3_cond_init_monotonic(&s->cv) != 0) {   /* timed waits run on the monotonic clock */
+        pthread_mutex_destroy(&s->mtx);
+        s->active = 0;
+        sem_table_unlock();
+        return (int64_t)(int32_t)CELL_EAGAIN;
+    }
 #endif
 
     uint32_t sem_id = (uint32_t)(slot + 1);
@@ -493,31 +505,24 @@ static int64_t sys_semaphore_wait_impl(ppu_context* ctx)
 #else
     pthread_mutex_lock(&s->mtx);
 
-    if (timeout_us == 0) {
-        while (s->value <= 0) {
-            s->waiters++;
-            SEM_TEST_HOOK("sem.wait.registered", sem_id);
-            pthread_cond_wait(&s->cv, &s->mtx);
-            s->waiters--;
+    /* One budget for the whole wait, outside the loop: a wake that finds no
+     * token (another waiter took it) sleeps again for what is left. lv2: a
+     * timeout of 0 is infinite. The registration hook is the infinite wait's. */
+    const ps3_wait_budget budget = ps3_wait_budget_us(timeout_us, timeout_us == 0);
+    while (s->value <= 0) {
+        s->waiters++;
+        if (timeout_us == 0) SEM_TEST_HOOK("sem.wait.registered", sem_id);
+        int rc = ps3_cond_wait_monotonic(&s->cv, &s->mtx, &budget);
+        s->waiters--;
+        if (rc == ETIMEDOUT) {
+            pthread_mutex_unlock(&s->mtx);
+            sem_operation_end(sem_id);
+            return (int64_t)(int32_t)CELL_ETIMEDOUT;
         }
-    } else {
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec  += (time_t)(timeout_us / 1000000);
-        ts.tv_nsec += (long)((timeout_us % 1000000) * 1000);
-        if (ts.tv_nsec >= 1000000000L) {
-            ts.tv_sec++;
-            ts.tv_nsec -= 1000000000L;
-        }
-        while (s->value <= 0) {
-            s->waiters++;
-            int rc = pthread_cond_timedwait(&s->cv, &s->mtx, &ts);
-            s->waiters--;
-            if (rc == ETIMEDOUT) {
-                pthread_mutex_unlock(&s->mtx);
-                sem_operation_end(sem_id);
-                return (int64_t)(int32_t)CELL_ETIMEDOUT;
-            }
+        if (rc != 0) {                             /* the host refused the wait */
+            pthread_mutex_unlock(&s->mtx);
+            sem_operation_end(sem_id);
+            return (int64_t)(int32_t)CELL_EFAULT;
         }
     }
 

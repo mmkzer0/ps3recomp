@@ -39,7 +39,8 @@
  *         runtime/spu/spu_vm_pagemap.c runtime/spu/spurs_policy_blob_weak.c \
  *         runtime/spu/spu_interp.c runtime/spu/spu_lifted_thread.c \
  *         runtime/syscalls/spu_fallback.c runtime/syscalls/sdk_version_weak.c \
- *         runtime/platform/win32_compat.c \
+ *         runtime/platform/win32_compat.c runtime/platform/host_clock.c \
+ *         runtime/platform/host_wait.c \
  *         -lpthread
  *
  * Exit code: 0 if all passed, 1 if any failed. Final line prints a summary.
@@ -48,6 +49,7 @@
 #include "spu_interp.h"
 #include "spu_overlay_residency.h"
 #include <pthread.h>
+#include "host_wait.h"     /* the barrier's 10 s bound runs on the monotonic clock */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -216,25 +218,26 @@ static observation g_obs[2];
 
 /* Barrier across the two SPU threads. A run that serialized them cannot get
  * both here, so this is what turns "they ran on their own host threads" into
- * something that fails rather than something taken on trust. It times out so
- * that a failure is a failing test and not a hung one. */
+ * something that fails rather than something taken on trust. It times out (10 s
+ * on the monotonic clock, one budget across spurious wakes) so that a failure
+ * is a failing test and not a hung one. */
 static pthread_mutex_t g_bar_mu  = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t  g_bar_cv  = PTHREAD_COND_INITIALIZER;
+PS3_STATIC_MONOTONIC_COND(bar_cv)   /* timed, so not PTHREAD_COND_INITIALIZER; both sides go through bar_cv() */
 static int             g_bar_n   = 0;
 
 static int barrier_wait_two(void)
 {
-    struct timespec deadline;
+    pthread_cond_t* cv = bar_cv();
+    if (!cv) return 0;
+    const ps3_wait_budget limit = ps3_wait_budget_us(10ull * 1000000ull, 0);
     int ok = 1;
-    clock_gettime(CLOCK_REALTIME, &deadline);
-    deadline.tv_sec += 10;
 
     pthread_mutex_lock(&g_bar_mu);
     if (++g_bar_n >= 2) {
-        pthread_cond_broadcast(&g_bar_cv);
+        pthread_cond_broadcast(cv);
     } else {
         while (g_bar_n < 2) {
-            if (pthread_cond_timedwait(&g_bar_cv, &g_bar_mu, &deadline) != 0) {
+            if (ps3_cond_wait_monotonic(cv, &g_bar_mu, &limit) != 0) {
                 ok = 0;
                 break;
             }

@@ -1208,7 +1208,10 @@ static SRWLOCK            s_sig_lock = SRWLOCK_INIT;
 static CONDITION_VARIABLE s_sig_cv;   /* zero-init == CONDITION_VARIABLE_INIT */
 #else
 static pthread_mutex_t s_sig_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t  s_sig_cv   = PTHREAD_COND_INITIALIZER;
+/* The WAIT_SIGNAL slice is a timed wait, so this cannot be PTHREAD_COND_INITIALIZER (that binds the REALTIME
+ * clock on Linux). sig_cv() initialises it once; the waiter and every wake go through it, a wake may arrive
+ * before the first wait. */
+PS3_STATIC_MONOTONIC_COND(sig_cv)
 #endif
 static uint64_t s_sig_generation;
 
@@ -1465,9 +1468,11 @@ static void spu_taskset_wake_written(void* opaque)
     WakeAllConditionVariable(&s_sig_cv);
     ReleaseSRWLockExclusive(&s_sig_lock);
 #else
+    pthread_cond_t* cv = sig_cv();
+    if (!cv) ps3_stop_host_wait_error("spu-wait-signal-init", sig_cv_rc);
     pthread_mutex_lock(&s_sig_lock);
     __atomic_add_fetch(&s_sig_generation, 1, __ATOMIC_RELEASE);
-    pthread_cond_broadcast(&s_sig_cv);
+    pthread_cond_broadcast(cv);
     pthread_mutex_unlock(&s_sig_lock);
 #endif
 }
@@ -1679,12 +1684,16 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
     for (;;) {
         const uint64_t generation = __atomic_load_n(&s_sig_generation, __ATOMIC_ACQUIRE);
         if (spu_taskset_signalled_test(taskset_ea, taskId)) break;
+        pthread_cond_t* cv = sig_cv();
+        if (!cv) ps3_stop_host_wait_error("spu-wait-signal-init", sig_cv_rc);
         pthread_mutex_lock(&s_sig_lock);
         if (generation == __atomic_load_n(&s_sig_generation, __ATOMIC_ACQUIRE)) {
-            struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            ts.tv_sec += 1;
-            if (pthread_cond_timedwait(&s_sig_cv, &s_sig_lock, &ts) != 0) {
+            /* A one-second report slice on the monotonic clock, not a guest timeout. A wake that is not the
+             * timeout ends the slice, and the generation is re-read at the top. */
+            const ps3_wait_budget slice = ps3_wait_budget_us(1000000, 0);
+            const int rc = ps3_cond_wait_monotonic(cv, &s_sig_lock, &slice);
+            if (rc != 0 && rc != ETIMEDOUT) ps3_stop_host_wait_error("spu-wait-signal", rc);
+            if (rc == ETIMEDOUT) {
                 static int _n = 0;
                 if (++secs && _n < 16) { _n++;
                     fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) sleeping "

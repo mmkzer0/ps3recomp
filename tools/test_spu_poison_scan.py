@@ -27,7 +27,7 @@ class PoisonScanTests(unittest.TestCase):
         # The PUT path raises named stops and reads typed configuration
         # (spu_dma.h), so the fixture links the C++ stop/config runtime.
         spu_fixture_link.build([ROOT / 'runtime/spu/tests/test_spu_poison_scan.c',
-                                ROOT / 'runtime/platform/win32_compat.c'], cls.exe,
+                                ROOT / 'runtime/platform/win32_compat.c', ROOT / 'runtime/platform/host_clock.c', ROOT / 'runtime/platform/host_wait.c'], cls.exe,
                                ['-std=gnu17', '-O2', '-I' + str(ROOT / 'include'),
                                 '-I' + str(ROOT / 'runtime/spu'),
                                 '-I' + str(ROOT / 'runtime/platform')], cls.tmp.name)

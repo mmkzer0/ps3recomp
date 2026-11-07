@@ -6,6 +6,9 @@
 #include "sys_ppu_thread.h"         /* ppu_thread_note_block */
 #include "../ps3_log.h"
 #include "sys_timer.h"             /* lv2_usec_deadline: sub-ms timed waits */
+#ifndef _WIN32
+#include "../platform/host_wait.h" /* the monotonic budget of a timed wait */
+#endif
 #include "../memory/vm.h"
 #include "../spu/spu_workload.h"   /* spu_elf_image_size, spu_workload_dispatch_async */
 #include <string.h>
@@ -131,7 +134,7 @@ static int event_queue_primitives_init(sys_event_queue_info* q, int slot)
 #else
     if (pthread_mutex_init(&q->lock, NULL) != 0)
         return 0;
-    if (pthread_cond_init(&q->not_empty, NULL) != 0) {
+    if (ps3_cond_init_monotonic(&q->not_empty) != 0) {   /* timed receives run on the monotonic clock */
         pthread_mutex_destroy(&q->lock);
         return 0;
     }
@@ -755,26 +758,22 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     q->waiters++;                       /* see the _WIN32 branch */
     EVT_TEST_HOOK("event.receive.waiter_registered", queue_id);
 
-    if (timeout_us == 0) {
-        while (q->count == 0 && q->active && !q->cancelled) {
-            pthread_cond_wait(&q->not_empty, &q->lock);
+    /* One budget for the whole receive, outside the loop: a wake that finds the
+     * queue empty (another receiver took the event) sleeps again for what is
+     * left. lv2: a timeout of 0 is infinite. An event that lands at the
+     * deadline is still taken (the loop re-tests the count before giving up). */
+    const ps3_wait_budget budget = ps3_wait_budget_us(timeout_us, timeout_us == 0);
+    while (q->count == 0 && q->active && !q->cancelled) {
+        int rc = ps3_cond_wait_monotonic(&q->not_empty, &q->lock, &budget);
+        if (rc == ETIMEDOUT && q->count == 0) {
+            q->waiters--;
+            pthread_mutex_unlock(&q->lock);
+            return event_queue_finish(queue_id, (int64_t)(int32_t)CELL_ETIMEDOUT);
         }
-    } else {
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec  += (time_t)(timeout_us / 1000000);
-        ts.tv_nsec += (long)((timeout_us % 1000000) * 1000);
-        if (ts.tv_nsec >= 1000000000L) {
-            ts.tv_sec++;
-            ts.tv_nsec -= 1000000000L;
-        }
-        while (q->count == 0 && q->active && !q->cancelled) {
-            int rc = pthread_cond_timedwait(&q->not_empty, &q->lock, &ts);
-            if (rc == ETIMEDOUT && q->count == 0) {
-                q->waiters--;
-                pthread_mutex_unlock(&q->lock);
-                return event_queue_finish(queue_id, (int64_t)(int32_t)CELL_ETIMEDOUT);
-            }
+        if (rc != 0 && rc != ETIMEDOUT) {      /* the host refused the wait */
+            q->waiters--;
+            pthread_mutex_unlock(&q->lock);
+            return event_queue_finish(queue_id, (int64_t)(int32_t)CELL_EFAULT);
         }
     }
 
@@ -1487,8 +1486,17 @@ int64_t sys_event_flag_create(ppu_context* ctx)
     InitializeCriticalSection(&f->lock);
     InitializeConditionVariable(&f->cv);
 #else
-    pthread_mutex_init(&f->lock, NULL);
-    pthread_cond_init(&f->cv, NULL);
+    if (pthread_mutex_init(&f->lock, NULL) != 0) {
+        f->active = 0;
+        evt_table_unlock();
+        return (int64_t)(int32_t)CELL_EAGAIN;
+    }
+    if (ps3_cond_init_monotonic(&f->cv) != 0) {   /* timed waits run on the monotonic clock */
+        pthread_mutex_destroy(&f->lock);
+        f->active = 0;
+        evt_table_unlock();
+        return (int64_t)(int32_t)CELL_EAGAIN;
+    }
 #endif
 
     uint32_t flag_id = (uint32_t)(slot + 1);
@@ -1740,39 +1748,29 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
 #else
     pthread_mutex_lock(&f->lock);
 
-    if (timeout_us == 0) {
-        if (!flag_check(f->pattern, bitpat, mode) && f->active) {
-            f->waiters++;
-            while (!flag_check(f->pattern, bitpat, mode) && f->active) {
-                pthread_cond_wait(&f->cv, &f->lock);
-            }
-            f->waiters--;
-        }
-    } else {
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec  += (time_t)(timeout_us / 1000000);
-        ts.tv_nsec += (long)((timeout_us % 1000000) * 1000);
-        if (ts.tv_nsec >= 1000000000L) {
-            ts.tv_sec++;
-            ts.tv_nsec -= 1000000000L;
-        }
-        if (!flag_check(f->pattern, bitpat, mode) && f->active) {
-            f->waiters++;
-            while (!flag_check(f->pattern, bitpat, mode) && f->active) {
-                int rc = pthread_cond_timedwait(&f->cv, &f->lock, &ts);
-                if (rc == ETIMEDOUT) {
-                    if (result_addr != 0) {
-                        uint64_t* out = (uint64_t*)vm_to_host(result_addr);
-                        *out = bswap64(f->pattern);
-                    }
-                    f->waiters--;
-                    pthread_mutex_unlock(&f->lock);
-                    return (int64_t)(int32_t)CELL_ETIMEDOUT;
+    if (!flag_check(f->pattern, bitpat, mode) && f->active) {
+        f->waiters++;
+        /* One budget for the whole wait, outside the loop. lv2: a timeout of 0
+         * is infinite. */
+        const ps3_wait_budget budget = ps3_wait_budget_us(timeout_us, timeout_us == 0);
+        while (!flag_check(f->pattern, bitpat, mode) && f->active) {
+            int rc = ps3_cond_wait_monotonic(&f->cv, &f->lock, &budget);
+            if (rc == ETIMEDOUT) {
+                if (result_addr != 0) {
+                    uint64_t* out = (uint64_t*)vm_to_host(result_addr);
+                    *out = bswap64(f->pattern);
                 }
+                f->waiters--;
+                pthread_mutex_unlock(&f->lock);
+                return (int64_t)(int32_t)CELL_ETIMEDOUT;
             }
-            f->waiters--;
+            if (rc != 0) {                         /* the host refused the wait */
+                f->waiters--;
+                pthread_mutex_unlock(&f->lock);
+                return (int64_t)(int32_t)CELL_EFAULT;
+            }
         }
+        f->waiters--;
     }
 
     uint64_t result = f->pattern;

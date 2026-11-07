@@ -3,7 +3,10 @@
  */
 
 #include "sys_mutex.h"
-#include "../platform/darwin_compat.h"
+#ifndef _WIN32
+#include <errno.h>                   /* ETIMEDOUT */
+#include "../platform/host_wait.h"   /* the monotonic timed lock */
+#endif
 #include "sys_timer.h"   /* lv2_usec_deadline: sub-ms timed waits */
 #include "../memory/vm.h"
 #include <string.h>
@@ -314,10 +317,13 @@ int64_t sys_mutex_lock(ppu_context* ctx)
          * is waiting on, so a guest deadlock names its two threads. */
         unsigned waited = 0;
         for (;;) {
-            struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            ts.tv_sec += 5;
-            if (pthread_mutex_timedlock(&m->mtx, &ts) == 0) break;
+            const ps3_wait_budget slice = ps3_wait_budget_ns(5ull * 1000000000ull, 0);   /* five monotonic seconds */
+            const int rc = ps3_mutex_lock_monotonic(&m->mtx, &slice);
+            if (rc == 0) break;
+            if (rc != ETIMEDOUT) {          /* the host refused the lock: not a report to make, not a lock taken */
+                __atomic_sub_fetch(&m->waiters, 1, __ATOMIC_SEQ_CST);
+                return (int64_t)(int32_t)CELL_EFAULT;
+            }
             waited += 5;
             fprintf(stderr, "[mutex] tid=%llu waiting %us on mutex %u '%.8s' "
                     "owner tid=%llu count=%u lr=0x%08X\n",
@@ -325,21 +331,15 @@ int64_t sys_mutex_lock(ppu_context* ctx)
                     (unsigned long long)m->owner_tid, (unsigned)m->lock_count,
                     (uint32_t)ctx->lr);
         }
-    } else if (timeout_us == 0) {
-        pthread_mutex_lock(&m->mtx);
     } else {
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec  += (time_t)(timeout_us / 1000000);
-        ts.tv_nsec += (long)((timeout_us % 1000000) * 1000);
-        if (ts.tv_nsec >= 1000000000L) {
-            ts.tv_sec++;
-            ts.tv_nsec -= 1000000000L;
-        }
-        int rc = pthread_mutex_timedlock(&m->mtx, &ts);
-        if (rc == ETIMEDOUT) {
+        /* lv2: a timeout of 0 is infinite (the native lock); anything else is a monotonic budget. */
+        const ps3_wait_budget budget = ps3_wait_budget_us(timeout_us, timeout_us == 0);
+        const int rc = ps3_mutex_lock_monotonic(&m->mtx, &budget);
+        if (rc != 0) {
+            /* ETIMEDOUT is the guest's timeout; anything else is the host refusing the lock, which must not
+             * be taken for an acquisition. */
             __atomic_sub_fetch(&m->waiters, 1, __ATOMIC_SEQ_CST);
-            return (int64_t)(int32_t)CELL_ETIMEDOUT;
+            return (int64_t)(int32_t)(rc == ETIMEDOUT ? CELL_ETIMEDOUT : CELL_EFAULT);
         }
     }
 #endif

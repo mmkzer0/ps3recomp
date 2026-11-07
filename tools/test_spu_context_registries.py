@@ -58,7 +58,7 @@ with tempfile.TemporaryDirectory(prefix='spu-context-registry-') as tmp:
         if name != 'test_spu_coherency':
             extra = [str(spu / c) for c in common if not
                      (name == 'test_spu_registry_allocation' and c == 'spu_coherency.c')]
-            sources += extra + [str(root / 'runtime/platform/win32_compat.c'),
+            sources += extra + [str(root/'runtime/platform/win32_compat.c'),str(root/'runtime/platform/host_clock.c'),str(root/'runtime/platform/host_wait.c'),
                                 str(root / 'runtime/memory/label_window.c')]
             objects = []
             for index, src in enumerate(sources):

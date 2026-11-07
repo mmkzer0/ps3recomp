@@ -380,7 +380,9 @@ PS3 time is measured in **timebase ticks** at 79,800,000 Hz (79.8 MHz). This is 
 
 **Platform time sources:**
 - Windows: `QueryPerformanceCounter` / `QueryPerformanceFrequency`
-- POSIX: `clock_gettime(CLOCK_MONOTONIC)` / `CLOCK_REALTIME`
+- POSIX: `host_monotonic_ns()` (`runtime/platform/host_clock.c`: `mach_absolute_time` on macOS, `CLOCK_MONOTONIC` elsewhere); `CLOCK_REALTIME` only for the calendar answer of `sys_time_get_current_time`
+
+**Timed waits.** Every timed lv2 wait on POSIX (`sys_event_queue_receive`, `sys_event_flag_wait`, `sys_semaphore_wait`, `sys_cond_wait`, `sys_mutex_lock`, and the event timer's period) measures its microsecond timeout as a budget on that monotonic clock (`runtime/platform/host_wait.h`), so a host wall-clock step cannot lengthen or shorten it. A timeout of 0 is infinite; expiry is `CELL_ETIMEDOUT`; a host refusal is `CELL_EFAULT`.
 
 ### Syscalls
 

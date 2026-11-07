@@ -17,12 +17,16 @@
  *
  *   - static inline functions with no shared state (types, interlocked ops,
  *     SRW locks, condition variables, critical sections, timing). These need
- *     nothing linked.
+ *     nothing linked, except the condition variables: their timed waits run on
+ *     the host monotonic clock (host_wait.h), so a translation unit that uses
+ *     SleepConditionVariable*, or lazily creates a condition variable, links
+ *     host_wait.c and host_clock.c as well.
  *   - functions that need state shared across translation units (waitable
  *     handles -- events, semaphores, threads, timers -- WaitOnAddress, and the
  *     VirtualAlloc region table). Those are declared here and implemented in
  *     win32_compat.c, which the runtime library compiles on every POSIX host.
- *     A standalone tool that calls one of them links that file too.
+ *     A standalone tool that calls one of them links that file, host_wait.c
+ *     and host_clock.c.
  *
  * IMPORTANT -- storage size. Win32 SRWLOCK and CONDITION_VARIABLE are exactly
  * pointer-sized and zero-initialise validly, so several structs (notably
@@ -67,6 +71,8 @@
 #include <wchar.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+
+#include "host_wait.h"     /* ps3_cond_init_monotonic, ps3_wait_budget_ns, ps3_cond_wait_monotonic */
 
 #ifdef __cplusplus
 extern "C" {
@@ -249,33 +255,21 @@ void  SetLastError(DWORD err);
  * other compiler tries). The builtins mean the same thing in both languages.
  * -----------------------------------------------------------------------*/
 static inline void* ps3_lazy_obj(void** slot, size_t sz,
-                                 void (*init)(void*))
+                                 int (*init)(void*))
 {
     void* cur = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
     if (cur) return cur;
     void* fresh = calloc(1, sz);
     if (!fresh) return NULL;
-    init(fresh);
+    /* A failed init publishes nothing: the slot stays empty, so a caller sees
+     * NULL instead of a half-built object, and the next use tries again. */
+    if (init(fresh) != 0) { free(fresh); return NULL; }
     void* expected = NULL;
     if (__atomic_compare_exchange_n(slot, &expected, fresh, 0 /* strong */,
                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
         return fresh;
     free(fresh);                 /* lost the race; use the winner's object */
     return expected;
-}
-
-/* Absolute CLOCK_REALTIME deadline `ms` from now, for pthread_cond_timedwait.
- * REALTIME rather than MONOTONIC because Darwin has no
- * pthread_condattr_setclock; a wall-clock step during a wait is the accepted
- * price of one code path on every host. */
-static inline struct timespec ps3__deadline_ms(DWORD ms)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_sec  += (time_t)(ms / 1000u);
-    ts.tv_nsec += (long)(ms % 1000u) * 1000000L;
-    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
-    return ts;
 }
 
 /* ---------------------------------------------------------------------------
@@ -460,7 +454,7 @@ typedef void*  SRWLOCK;
 typedef SRWLOCK* PSRWLOCK;
 #define SRWLOCK_INIT NULL
 
-static inline void ps3__rwl_init(void* p) { pthread_rwlock_init((pthread_rwlock_t*)p, NULL); }
+static inline int ps3__rwl_init(void* p) { return pthread_rwlock_init((pthread_rwlock_t*)p, NULL); }
 static inline pthread_rwlock_t* ps3_srw(SRWLOCK* l)
 { return (pthread_rwlock_t*)ps3_lazy_obj((void**)l, sizeof(pthread_rwlock_t), ps3__rwl_init); }
 
@@ -525,12 +519,16 @@ typedef CONDITION_VARIABLE* PCONDITION_VARIABLE;
 
 typedef struct { pthread_mutex_t m; pthread_cond_t c; unsigned gen; } ps3_condvar;
 
-static inline void ps3__cv_init(void* p)
+static inline int ps3__cv_init(void* p)
 {
     ps3_condvar* cv = (ps3_condvar*)p;
-    pthread_mutex_init(&cv->m, NULL);
-    pthread_cond_init(&cv->c, NULL);
+    int rc = pthread_mutex_init(&cv->m, NULL);
+    if (rc != 0) return rc;
+    /* Its timed waits run on the monotonic clock (host_wait.h). */
+    rc = ps3_cond_init_monotonic(&cv->c);
+    if (rc != 0) { pthread_mutex_destroy(&cv->m); return rc; }
     cv->gen = 0;
+    return 0;
 }
 static inline ps3_condvar* ps3_cv(CONDITION_VARIABLE* c)
 { return (ps3_condvar*)ps3_lazy_obj((void**)c, sizeof(ps3_condvar), ps3__cv_init); }
@@ -566,15 +564,20 @@ static inline BOOL ps3__cv_sleep(ps3_condvar* cv, DWORD ms,
     unlock(lock);
     int rc = 0;
     if (ms == INFINITE) {
-        while (cv->gen == g && rc == 0) rc = pthread_cond_wait(&cv->c, &cv->m);
+        static const ps3_wait_budget forever = { 0, 0, 1 };   /* a flag, never a huge duration */
+        while (cv->gen == g && rc == 0) rc = ps3_cond_wait_monotonic(&cv->c, &cv->m, &forever);
     } else {
-        struct timespec ts = ps3__deadline_ms(ms);
-        while (cv->gen == g && rc == 0) rc = pthread_cond_timedwait(&cv->c, &cv->m, &ts);
+        /* One budget for the whole wait: a wake that leaves the generation
+         * where it was (a spurious wake) goes back to sleep for what is left,
+         * on the monotonic clock. ms == 0 is already expired, as on Windows. */
+        const ps3_wait_budget budget = ps3_wait_budget_ns((uint64_t)ms * 1000000ull, 0);
+        while (cv->gen == g && rc == 0) rc = ps3_cond_wait_monotonic(&cv->c, &cv->m, &budget);
     }
     BOOL woke = (cv->gen != g);
     pthread_mutex_unlock(&cv->m);
     relock(lock);
-    if (!woke) SetLastError(ERROR_TIMEOUT);
+    /* ERROR_TIMEOUT only for a real timeout: a host refusal is its own error, never a timeout. */
+    if (!woke) SetLastError(rc == ETIMEDOUT ? ERROR_TIMEOUT : ERROR_GEN_FAILURE);
     return woke;
 }
 static inline void ps3__srw_unlock_x(void* l) { ReleaseSRWLockExclusive((SRWLOCK*)l); }
@@ -637,13 +640,16 @@ typedef struct {
     PVOID           context;
 } ps3_init_once;
 
-static inline void ps3__once_init(void* p)
+static inline int ps3__once_init(void* p)
 {
     ps3_init_once* o = (ps3_init_once*)p;
-    pthread_mutex_init(&o->m, NULL);
-    pthread_cond_init(&o->c, NULL);
+    int rc = pthread_mutex_init(&o->m, NULL);
+    if (rc != 0) return rc;
+    rc = pthread_cond_init(&o->c, NULL);    /* infinite waits only: nothing here ever times out */
+    if (rc != 0) { pthread_mutex_destroy(&o->m); return rc; }
     o->state   = PS3_ONCE_IDLE;
     o->context = NULL;
+    return 0;
 }
 static inline ps3_init_once* ps3_once(INIT_ONCE* once)
 { return (ps3_init_once*)ps3_lazy_obj((void**)&once->Ptr, sizeof(ps3_init_once), ps3__once_init); }

@@ -1,5 +1,5 @@
 /* The guest clocks on POSIX hosts come from one host clock, host_monotonic_ns
- * (runtime/syscalls/sys_timer.c): the PPU timebase (every lifted mftb),
+ * (runtime/platform/host_clock.c): the PPU timebase (every lifted mftb),
  * sys_time_get_system_time and the lv2 timers' expiration times. On macOS it
  * is mach_absolute_time, which costs a fraction of clock_gettime there.
  *

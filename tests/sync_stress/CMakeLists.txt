@@ -70,7 +70,9 @@ set_target_properties(sync_stress PROPERTIES LINKER_LANGUAGE CXX)
 if(NOT WIN32)
     # The Win32 handle, wait and thread API the harness drives.
     target_sources(sync_stress PRIVATE
-        "${PS3RECOMP_TREE_ROOT}/runtime/platform/win32_compat.c")
+        "${PS3RECOMP_TREE_ROOT}/runtime/platform/win32_compat.c"
+        "${PS3RECOMP_TREE_ROOT}/runtime/platform/host_clock.c"
+        "${PS3RECOMP_TREE_ROOT}/runtime/platform/host_wait.c")
 endif()
 
 target_include_directories(sync_stress PRIVATE
@@ -121,7 +123,9 @@ add_executable(test_sync_semantics
 target_compile_definitions(test_sync_semantics PRIVATE PS3_SYNC_TEST_HOOKS)
 if(NOT WIN32)
     target_sources(test_sync_semantics PRIVATE
-        "${PS3RECOMP_TREE_ROOT}/runtime/platform/win32_compat.c")
+        "${PS3RECOMP_TREE_ROOT}/runtime/platform/win32_compat.c"
+        "${PS3RECOMP_TREE_ROOT}/runtime/platform/host_clock.c"
+        "${PS3RECOMP_TREE_ROOT}/runtime/platform/host_wait.c")
     find_package(Threads REQUIRED)
     target_link_libraries(test_sync_semantics PRIVATE Threads::Threads)
 else()
@@ -164,7 +168,9 @@ add_executable(test_mutex_destroy
     "${RUNTIME_SYNC_DIR}/sys_cond.c")
 if(NOT WIN32)
     target_sources(test_mutex_destroy PRIVATE
-        "${PS3RECOMP_TREE_ROOT}/runtime/platform/win32_compat.c")
+        "${PS3RECOMP_TREE_ROOT}/runtime/platform/win32_compat.c"
+        "${PS3RECOMP_TREE_ROOT}/runtime/platform/host_clock.c"
+        "${PS3RECOMP_TREE_ROOT}/runtime/platform/host_wait.c")
     find_package(Threads REQUIRED)
     target_link_libraries(test_mutex_destroy PRIVATE Threads::Threads)
 endif()
@@ -205,6 +211,8 @@ set_target_properties(test_event_queue_destroy PROPERTIES LINKER_LANGUAGE CXX)
 if(NOT WIN32)
     target_sources(test_event_queue_destroy PRIVATE
         "${PS3RECOMP_TREE_ROOT}/runtime/platform/win32_compat.c"
+        "${PS3RECOMP_TREE_ROOT}/runtime/platform/host_clock.c"
+        "${PS3RECOMP_TREE_ROOT}/runtime/platform/host_wait.c"
         "${RUNTIME_SYNC_DIR}/sys_timer.c")
     target_compile_options(test_event_queue_destroy PRIVATE -ffunction-sections -fdata-sections)
     if(APPLE)
@@ -226,3 +234,60 @@ else()
 endif()
 add_test(NAME event_queue_destroy COMMAND test_event_queue_destroy)
 set_tests_properties(event_queue_destroy PROPERTIES LABELS "runtime;sync;t0;tsan" TIMEOUT 60)
+
+# The timed waits of the lv2 sync objects through an expiry, on the real sys_event/sys_semaphore/sys_cond/sys_mutex
+# against a scripted clock and scripted native waits: instead of runtime/platform/host_wait.c these link its fake
+# backend (the same file compiled with test seams, runtime/platform/tests/host_wait_fake.c), once per native backend
+# (abs: Linux's absolute CLOCK_MONOTONIC deadline, rel: macOS's relative duration). Nothing sleeps. The fake comes
+# from PS3RECOMP_TREE_ROOT with the rest, so a seeded-bug mirror can mutate host_wait.c too.
+if(NOT WIN32)
+    foreach(_be IN ITEMS abs rel)
+        set(_rel 0)
+        if(_be STREQUAL "rel")
+            set(_rel 1)
+        endif()
+        add_executable(test_timeout_monotonic_${_be}
+            test_timeout_monotonic.c test_shims.c
+            "${RUNTIME_SYNC_DIR}/sys_mutex.c"
+            "${RUNTIME_SYNC_DIR}/sys_cond.c"
+            "${RUNTIME_SYNC_DIR}/sys_semaphore.c"
+            "${RUNTIME_SYNC_DIR}/sys_event.c"
+            "${PS3RECOMP_ROOT}/runtime/diag/stop.cpp"
+            "${PS3RECOMP_TREE_ROOT}/runtime/platform/tests/host_wait_fake.c")
+        set_target_properties(test_timeout_monotonic_${_be} PROPERTIES LINKER_LANGUAGE CXX)
+        target_compile_definitions(test_timeout_monotonic_${_be} PRIVATE
+            PS3_HW_RELATIVE=${_rel} HW_FAKE_DEFINES_HOST_CLOCK=1)
+        target_include_directories(test_timeout_monotonic_${_be} PRIVATE
+            "${PS3RECOMP_TREE_ROOT}" "${PS3RECOMP_TREE_ROOT}/include"
+            "${RUNTIME_SYNC_DIR}" "${PS3RECOMP_TREE_ROOT}/runtime")
+        target_compile_options(test_timeout_monotonic_${_be} PRIVATE -Wall -Wextra -Wno-unused-parameter)
+        find_package(Threads REQUIRED)
+        target_link_libraries(test_timeout_monotonic_${_be} PRIVATE Threads::Threads)
+        add_test(NAME timeout_monotonic_${_be} COMMAND test_timeout_monotonic_${_be})
+        set_tests_properties(timeout_monotonic_${_be} PROPERTIES LABELS "runtime;sync;t0;tsan" TIMEOUT 60)
+        # The event timer's period wait (sys_timer.c) on the same fake backend: a false wake keeps the period's budget.
+        add_executable(test_timer_monotonic_${_be}
+            test_timer_monotonic.c test_shims.c
+            "${RUNTIME_SYNC_DIR}/sys_timer.c"
+            "${RUNTIME_SYNC_DIR}/sys_event.c"
+            "${PS3RECOMP_ROOT}/runtime/diag/stop.cpp"
+            "${PS3RECOMP_TREE_ROOT}/runtime/platform/win32_compat.c"
+            "${PS3RECOMP_TREE_ROOT}/runtime/platform/tests/host_wait_fake.c")
+        set_target_properties(test_timer_monotonic_${_be} PROPERTIES LINKER_LANGUAGE CXX)
+        target_compile_definitions(test_timer_monotonic_${_be} PRIVATE
+            PS3_HW_RELATIVE=${_rel} HW_FAKE_DEFINES_HOST_CLOCK=1)
+        target_include_directories(test_timer_monotonic_${_be} PRIVATE
+            "${PS3RECOMP_TREE_ROOT}" "${PS3RECOMP_TREE_ROOT}/include"
+            "${RUNTIME_SYNC_DIR}" "${PS3RECOMP_TREE_ROOT}/runtime")
+        target_compile_options(test_timer_monotonic_${_be} PRIVATE -Wall -Wextra -Wno-unused-parameter
+            -ffunction-sections -fdata-sections)
+        if(APPLE)
+            target_link_options(test_timer_monotonic_${_be} PRIVATE "-Wl,-dead_strip")
+        else()
+            target_link_options(test_timer_monotonic_${_be} PRIVATE "-Wl,--gc-sections")
+        endif()
+        target_link_libraries(test_timer_monotonic_${_be} PRIVATE Threads::Threads)
+        add_test(NAME timer_monotonic_${_be} COMMAND test_timer_monotonic_${_be})
+        set_tests_properties(timer_monotonic_${_be} PROPERTIES LABELS "runtime;sync;t0;tsan" TIMEOUT 60)
+    endforeach()
+endif()

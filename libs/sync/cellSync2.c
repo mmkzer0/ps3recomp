@@ -7,7 +7,7 @@
 
 #include "cellSync2.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host pointer */
-#include "../../runtime/platform/darwin_compat.h"
+#include "../../runtime/platform/host_wait.h"   /* the monotonic timed lock (nothing on Windows) */
 #include <stdio.h>
 #include <string.h>
 #include <stdatomic.h>
@@ -151,16 +151,14 @@ s32 cellSync2MutexLock(CellSync2Mutex* mutex, u64 timeoutUsec)
             SwitchToThread();
         }
 #else
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec += (time_t)(timeoutUsec / 1000000);
-        ts.tv_nsec += (long)((timeoutUsec % 1000000) * 1000);
-        if (ts.tv_nsec >= 1000000000L) {
-            ts.tv_sec++;
-            ts.tv_nsec -= 1000000000L;
-        }
-        if (pthread_mutex_timedlock(&m->mtx, &ts) != 0)
+        /* Relative to the monotonic clock, one budget (host_wait.h). Zero and
+         * (u64)-1 never get here: they are the try and the infinite lock above. */
+        const ps3_wait_budget budget = ps3_wait_budget_us(timeoutUsec, 0);
+        const int rc = ps3_mutex_lock_monotonic(&m->mtx, &budget);
+        if (rc == ETIMEDOUT)
             return CELL_SYNC2_ERROR_BUSY;
+        if (rc != 0)
+            return CELL_SYNC2_ERROR_STAT;
 #endif
     }
 
@@ -221,13 +219,15 @@ s32 cellSync2CondInit(CellSync2Cond* cond, CellSync2Mutex* mutex,
     Sync2CondInternal* c = (Sync2CondInternal*)cond;
     memset(c, 0, sizeof(Sync2CondInternal));
     c->mutex = (Sync2MutexInternal*)mutex;
-    c->initialized = 1;
 
 #ifdef _WIN32
     InitializeConditionVariable(&c->cv);
 #else
-    pthread_cond_init(&c->cv, NULL);
+    /* Timed waits run on the monotonic clock (host_wait.h); a variable that cannot be built is no object. */
+    if (ps3_cond_init_monotonic(&c->cv) != 0)
+        return CELL_SYNC2_ERROR_NOMEM;
 #endif
+    c->initialized = 1;
 
     return CELL_OK;
 }
@@ -245,21 +245,13 @@ s32 cellSync2CondWait(CellSync2Cond* cond, u64 timeoutUsec)
                ? CELL_SYNC2_ERROR_TIMEDOUT
                : CELL_SYNC2_ERROR_STAT;
 #else
-    if (timeoutUsec == 0) {
-        pthread_cond_wait(&c->cv, &c->mutex->mtx);
-    } else {
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec  += (time_t)(timeoutUsec / 1000000);
-        ts.tv_nsec += (long)((timeoutUsec % 1000000) * 1000);
-        if (ts.tv_nsec >= 1000000000L) {
-            ts.tv_sec++;
-            ts.tv_nsec -= 1000000000L;
-        }
-        int rc = pthread_cond_timedwait(&c->cv, &c->mutex->mtx, &ts);
-        if (rc == ETIMEDOUT)
-            return CELL_SYNC2_ERROR_TIMEDOUT;
-    }
+    /* One budget for this call; zero is the infinite wait (the library's contract). */
+    const ps3_wait_budget budget = ps3_wait_budget_us(timeoutUsec, timeoutUsec == 0);
+    const int rc = ps3_cond_wait_monotonic(&c->cv, &c->mutex->mtx, &budget);
+    if (rc == ETIMEDOUT)
+        return CELL_SYNC2_ERROR_TIMEDOUT;
+    if (rc != 0)
+        return CELL_SYNC2_ERROR_STAT;                /* the host refused the wait */
 #endif
 
     return CELL_OK;
@@ -683,7 +675,7 @@ s32 cellSync2QueueInit(CellSync2Queue* queue, void* buffer,
     q->depth = depth;
     q->elemSize = elemSize;
     q->buffer = (u8*)buffer;
-    q->initialized = 1;
+    /* initialized is set last: a queue whose host objects could not be built stays uninitialised. */
 
     memset(buffer, 0, (size_t)elemSize * depth);
 
@@ -692,10 +684,19 @@ s32 cellSync2QueueInit(CellSync2Queue* queue, void* buffer,
     InitializeConditionVariable(&q->notFull);
     InitializeConditionVariable(&q->notEmpty);
 #else
-    pthread_mutex_init(&q->mtx, NULL);
-    pthread_cond_init(&q->notFull, NULL);
-    pthread_cond_init(&q->notEmpty, NULL);
+    if (pthread_mutex_init(&q->mtx, NULL) != 0)
+        return CELL_SYNC2_ERROR_NOMEM;
+    if (ps3_cond_init_monotonic(&q->notFull) != 0) {
+        pthread_mutex_destroy(&q->mtx);
+        return CELL_SYNC2_ERROR_NOMEM;
+    }
+    if (ps3_cond_init_monotonic(&q->notEmpty) != 0) {
+        pthread_cond_destroy(&q->notFull);
+        pthread_mutex_destroy(&q->mtx);
+        return CELL_SYNC2_ERROR_NOMEM;
+    }
 #endif
+    q->initialized = 1;
 
     return CELL_OK;
 }
@@ -726,19 +727,14 @@ s32 cellSync2QueuePush(CellSync2Queue* queue, const void* data,
     LeaveCriticalSection(&q->cs);
 #else
     pthread_mutex_lock(&q->mtx);
+    /* One budget for the whole push, outside the loop: a wake that finds the queue still full waits on for
+     * what is left instead of restarting the full timeout. Zero is the infinite wait. */
+    const ps3_wait_budget budget = ps3_wait_budget_us(timeoutUsec, timeoutUsec == 0);
     while (q->count >= q->depth) {
-        if (timeoutUsec == 0) {
-            pthread_cond_wait(&q->notFull, &q->mtx);
-        } else {
-            struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            ts.tv_sec  += (time_t)(timeoutUsec / 1000000);
-            ts.tv_nsec += (long)((timeoutUsec % 1000000) * 1000);
-            if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
-            if (pthread_cond_timedwait(&q->notFull, &q->mtx, &ts) == ETIMEDOUT) {
-                pthread_mutex_unlock(&q->mtx);
-                return CELL_SYNC2_ERROR_TIMEDOUT;
-            }
+        const int rc = ps3_cond_wait_monotonic(&q->notFull, &q->mtx, &budget);
+        if (rc != 0) {
+            pthread_mutex_unlock(&q->mtx);
+            return rc == ETIMEDOUT ? CELL_SYNC2_ERROR_TIMEDOUT : CELL_SYNC2_ERROR_STAT;
         }
     }
 
@@ -821,19 +817,13 @@ s32 cellSync2QueuePop(CellSync2Queue* queue, void* data,
     LeaveCriticalSection(&q->cs);
 #else
     pthread_mutex_lock(&q->mtx);
+    /* One budget for the whole pop, outside the loop (see cellSync2QueuePush). */
+    const ps3_wait_budget budget = ps3_wait_budget_us(timeoutUsec, timeoutUsec == 0);
     while (q->count == 0) {
-        if (timeoutUsec == 0) {
-            pthread_cond_wait(&q->notEmpty, &q->mtx);
-        } else {
-            struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            ts.tv_sec  += (time_t)(timeoutUsec / 1000000);
-            ts.tv_nsec += (long)((timeoutUsec % 1000000) * 1000);
-            if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
-            if (pthread_cond_timedwait(&q->notEmpty, &q->mtx, &ts) == ETIMEDOUT) {
-                pthread_mutex_unlock(&q->mtx);
-                return CELL_SYNC2_ERROR_TIMEDOUT;
-            }
+        const int rc = ps3_cond_wait_monotonic(&q->notEmpty, &q->mtx, &budget);
+        if (rc != 0) {
+            pthread_mutex_unlock(&q->mtx);
+            return rc == ETIMEDOUT ? CELL_SYNC2_ERROR_TIMEDOUT : CELL_SYNC2_ERROR_STAT;
         }
     }
 

@@ -23,7 +23,7 @@ with tempfile.TemporaryDirectory(prefix='spu-event-ack-sn-') as tmp:
     binary = Path(tmp) / 'test'
     spu_fixture_link.build([spu/'tests/test_spu_event_ack_sn.c',
                             *[spu / name for name in sources],
-                            root/'runtime/platform/win32_compat.c'], binary,
+                            root/'runtime/platform/win32_compat.c', root/'runtime/platform/host_clock.c', root/'runtime/platform/host_wait.c'], binary,
                            ['-std=gnu17', '-O1', '-UNDEBUG',
                             '-I'+str(root/'include'), '-I'+str(spu),
                             '-I'+str(root/'runtime/platform')], tmp)

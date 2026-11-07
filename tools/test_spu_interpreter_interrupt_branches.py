@@ -29,5 +29,5 @@ with tempfile.TemporaryDirectory(prefix='spu-interrupt-branches-') as tmp:
  (tmp/'interrupt_branches_lifted.h').write_text('\n'.join(body)+'\n')
  for lifted in [False,True]:
   binary=tmp/('lifted' if lifted else 'interp')
-  spu_fixture_link.build([spu/'tests/test_spu_interpreter_interrupt_branches.c',*[spu/x for x in sources],root/'runtime/platform/win32_compat.c'],binary,['-std=gnu17','-O1','-UNDEBUG',*(['-DBRANCH_LIFTED'] if lifted else []),'-I'+str(tmp),'-I'+str(root/'include'),'-I'+str(spu),'-I'+str(root/'runtime/platform')],tmp)
+  spu_fixture_link.build([spu/'tests/test_spu_interpreter_interrupt_branches.c',*[spu/x for x in sources],root/'runtime/platform/win32_compat.c', root/'runtime/platform/host_clock.c', root/'runtime/platform/host_wait.c'],binary,['-std=gnu17','-O1','-UNDEBUG',*(['-DBRANCH_LIFTED'] if lifted else []),'-I'+str(tmp),'-I'+str(root/'include'),'-I'+str(spu),'-I'+str(root/'runtime/platform')],tmp)
   subprocess.run([str(binary)],check=True,timeout=5,env=env,cwd=tmp)

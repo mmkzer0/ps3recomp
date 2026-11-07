@@ -114,7 +114,7 @@ pthread_setschedparam(thread, SCHED_OTHER, &param);
 | **Type** | `CONDITION_VARIABLE` | `pthread_cond_t` |
 | **Init** | `InitializeConditionVariable()` | `pthread_cond_init()` |
 | **Wait** | `SleepConditionVariableCS()` | `pthread_cond_wait()` |
-| **Timed Wait** | `SleepConditionVariableCS(timeout)` | `pthread_cond_timedwait()` |
+| **Timed Wait** | `SleepConditionVariableCS(timeout)` | `ps3_cond_wait_monotonic()` (`runtime/platform/host_wait.h`): a relative budget on the host monotonic clock, not `pthread_cond_timedwait` on `CLOCK_REALTIME` (#128). Linux: condvar with a `CLOCK_MONOTONIC` condattr (`ps3_cond_init_monotonic`); macOS: `pthread_cond_timedwait_relative_np`. The budget is built once outside the predicate loop. |
 | **Signal** | `WakeConditionVariable()` | `pthread_cond_signal()` |
 | **Broadcast** | `WakeAllConditionVariable()` | `pthread_cond_broadcast()` |
 | **Destroy** | No-op (statically allocated) | `pthread_cond_destroy()` |
@@ -127,7 +127,7 @@ pthread_setschedparam(thread, SCHED_OTHER, &param);
 | **Create** | `CreateSemaphoreW(NULL, init, max, NULL)` | `sem_init(&sem, 0, init)` |
 | **Wait** | `WaitForSingleObject(h, INFINITE)` | `sem_wait(&sem)` |
 | **Try Wait** | `WaitForSingleObject(h, 0)` | `sem_trywait(&sem)` |
-| **Timed Wait** | `WaitForSingleObject(h, ms)` | `sem_timedwait(&sem, &ts)` |
+| **Timed Wait** | `WaitForSingleObject(h, ms)` | the waitable-handle engine in `win32_compat.c`, on the same monotonic budget; there is no `sem_timedwait` (Darwin has none) and `posix_sem.h` has no timed entry point |
 | **Post** | `ReleaseSemaphore(h, count, NULL)` | `sem_post(&sem)` × count |
 | **Destroy** | `CloseHandle(h)` | `sem_destroy(&sem)` |
 

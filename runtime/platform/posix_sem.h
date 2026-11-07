@@ -4,8 +4,8 @@
  * <semaphore.h> is the obvious tool and the wrong one: Darwin implements
  * sem_init as a stub that fails with ENOSYS (only named semaphores work), and
  * ships no sem_timedwait at all. A mutex and a condition variable give exact
- * semantics, a real timed wait, and one code path on every host -- so the
- * Linux CI run exercises the same lines a Mac executes.
+ * semantics and one code path on every host -- so the Linux CI run exercises
+ * the same lines a Mac executes.
  *
  * The pthread objects live in one heap block behind a pointer, not inline.
  * Some callers embed the semaphore in a guest-visible structure of fixed size
@@ -13,8 +13,9 @@
  * pthread_cond_t (48 B) do not fit there beside the caller's own fields. The
  * handle is eight bytes everywhere; zero-initialised means "not initialised".
  *
- * Deadlines are absolute CLOCK_REALTIME, matching sem_timedwait, so a caller
- * that computed one for sem_timedwait passes it here unchanged.
+ * There is no timed wait. The one that existed took an absolute CLOCK_REALTIME
+ * deadline (sem_timedwait's contract) and had no caller; a timed wait here would
+ * be a relative one on the monotonic clock (host_wait.h), not a revival of that.
  */
 #ifndef PS3RECOMP_POSIX_SEM_H
 #define PS3RECOMP_POSIX_SEM_H
@@ -95,21 +96,6 @@ static inline int ps3_sem_getvalue(ps3_sem_t* s, int* value)
     pthread_mutex_lock(&p->m);
     *value = (int)p->count;
     pthread_mutex_unlock(&p->m);
-    return 0;
-}
-
-/* Returns 0 on success, -1 with errno = ETIMEDOUT when the deadline passes. */
-static inline int ps3_sem_timedwait(ps3_sem_t* s, const struct timespec* abs_deadline)
-{
-    ps3_sem_impl* p = s->p;
-    pthread_mutex_lock(&p->m);
-    int rc = 0;
-    while (p->count == 0 && rc == 0)
-        rc = pthread_cond_timedwait(&p->c, &p->m, abs_deadline);
-    int ok = p->count > 0;         /* a post that raced the deadline still counts */
-    if (ok) p->count--;
-    pthread_mutex_unlock(&p->m);
-    if (!ok) { errno = ETIMEDOUT; return -1; }
     return 0;
 }
 

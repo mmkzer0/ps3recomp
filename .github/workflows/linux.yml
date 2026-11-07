@@ -447,7 +447,7 @@ jobs:
       # semaphores, joinable threads, WaitOnAddress, timers, VirtualAlloc.
       - name: Run the Win32 compatibility layer tests
         run: |
-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I runtime/platform -o /tmp/test_win32_compat runtime/platform/tests/test_win32_compat.c runtime/platform/win32_compat.c -lpthread
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I runtime/platform -o /tmp/test_win32_compat runtime/platform/tests/test_win32_compat.c runtime/platform/win32_compat.c runtime/platform/host_clock.c runtime/platform/host_wait.c -lpthread
           /tmp/test_win32_compat
 
       # Which signal an inaccessible guest window faults with, and whether one
@@ -466,7 +466,7 @@ jobs:
       # unhandled-exception filter; PS3_STDIO_UNBUFFERED=1 restores unbuffered.
       - name: Run the stdio flush test
         run: |
-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I runtime/platform -o /tmp/test_stdio_flush runtime/platform/tests/test_stdio_flush.c runtime/platform/ps3_stdio.c runtime/platform/win32_compat.c -lpthread
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I runtime/platform -o /tmp/test_stdio_flush runtime/platform/tests/test_stdio_flush.c runtime/platform/ps3_stdio.c runtime/platform/win32_compat.c runtime/platform/host_clock.c runtime/platform/host_wait.c -lpthread
           /tmp/test_stdio_flush
 
       # PS3_DEV_FLASH may name several roots; the first one that holds the file wins
@@ -524,6 +524,8 @@ jobs:
             runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
             runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
             runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+            runtime/platform/host_clock.c \
+            runtime/platform/host_wait.c \
             runtime/platform/win32_compat.c \
             -lpthread -lm
           /tmp/test_spu_lockline_peer
@@ -542,6 +544,8 @@ jobs:
             runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
             runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
             runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+            runtime/platform/host_clock.c \
+            runtime/platform/host_wait.c \
             runtime/platform/win32_compat.c \
             -lpthread -lm
           /tmp/test_spu_taskset_wake
@@ -560,6 +564,8 @@ jobs:
             runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
             runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
             runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+            runtime/platform/host_clock.c \
+            runtime/platform/host_wait.c \
             runtime/platform/win32_compat.c \
             -lpthread -lm
           /tmp/test_spurs_signalled_atomic
@@ -578,6 +584,8 @@ jobs:
             runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
             runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
             runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+            runtime/platform/host_clock.c \
+            runtime/platform/host_wait.c \
             runtime/platform/win32_compat.c \
             -lpthread -lm
           /tmp/test_spurs_taskset_bits_atomic
@@ -604,6 +612,8 @@ jobs:
             runtime/spu/spu_vm_pagemap.c runtime/spu/spurs_policy_blob_weak.c \
             runtime/spu/spu_interp.c runtime/spu/spu_lifted_thread.c \
             runtime/syscalls/spu_fallback.c runtime/syscalls/sdk_version_weak.c \
+            runtime/platform/host_clock.c \
+            runtime/platform/host_wait.c \
             runtime/platform/win32_compat.c \
             -lpthread -lm
           /tmp/test_spu_lifted_start
@@ -627,6 +637,8 @@ jobs:
             runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
             runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
             runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+            runtime/platform/host_clock.c \
+            runtime/platform/host_wait.c \
             runtime/platform/win32_compat.c \
             -lpthread -lm
           /tmp/test_spu_mfc_slots
@@ -646,6 +658,8 @@ jobs:
             runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
             runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
             runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+            runtime/platform/host_clock.c \
+            runtime/platform/host_wait.c \
             runtime/platform/win32_compat.c \
             -lpthread -lm
           /tmp/test_spurs_job_stack

@@ -23,8 +23,7 @@
 #include "../memory/vm.h"   /* VM_HLE_INJECT_BASE -- not platform-specific */
 #include "../syscalls/sys_lwsync.h"   /* ps3_lwsync_register */
 #ifndef _WIN32
-/* sys_timer.h: not included, its lv2 headers redefine ppu_context. */
-extern "C" uint64_t host_monotonic_ns(void);
+#include "../platform/host_clock.h"   /* host_monotonic_ns; sys_timer.h is not included, its lv2 headers redefine ppu_context */
 #endif
 #include "ps3emu/log_first.h"
 

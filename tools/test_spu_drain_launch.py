@@ -65,7 +65,7 @@ with tempfile.TemporaryDirectory(prefix='spu-drain-launch-') as td:
         try:
             spu_fixture_link.build([SPU / 'tests/test_spu_drain_launch.c', path,
                                     *[SPU / (unit + '.c') for unit in UNITS],
-                                    ROOT / 'runtime/platform/win32_compat.c'], exe, flags,
+                                    ROOT / 'runtime/platform/win32_compat.c', ROOT / 'runtime/platform/host_clock.c', ROOT / 'runtime/platform/host_wait.c'], exe, flags,
                                    tmp, timeout=120)
         except subprocess.CalledProcessError as error:
             raise AssertionError('fixture build failed: %s' % error)

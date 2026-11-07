@@ -14,7 +14,7 @@ with tempfile.TemporaryDirectory(prefix='spurs-signal-') as tmp:
              'spu_vm_pagemap', 'spurs_policy_blob_weak', 'spu_interp']
     spu_fixture_link.build([r/'tests/test_spurs_task_signal.c',
         *[r/'runtime/spu'/f'{u}.c' for u in units],
-        r/'runtime/platform/win32_compat.c'], out,
+        r/'runtime/platform/win32_compat.c', r/'runtime/platform/host_clock.c', r/'runtime/platform/host_wait.c'], out,
         ['-std=gnu17', '-O1', '-UNDEBUG', '-Dpthread_cond_timedwait=signal_test_cond_wait',
          '-ffunction-sections', '-fdata-sections',
          '-I'+str(r/'include'), '-I'+str(r/'runtime/spu'), '-I'+str(r/'runtime/platform')],

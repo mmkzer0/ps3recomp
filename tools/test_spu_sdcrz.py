@@ -36,7 +36,7 @@ with tempfile.TemporaryDirectory(prefix="spu-sdcrz-") as tmp:
     # a fixture that inlines mfc_submit() must link the typed configuration
     # and the named-stop runtime.
     c_sources = [spu / "tests/test_spu_sdcrz.c", *[spu / name for name in common],
-                 root / "runtime/platform/win32_compat.c"]
+                 root / "runtime/platform/win32_compat.c", root / "runtime/platform/host_clock.c", root / "runtime/platform/host_wait.c"]
     objects = []
     for index, src in enumerate(c_sources):
         obj = tmp / f"{index}.o"

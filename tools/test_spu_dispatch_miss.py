@@ -22,7 +22,7 @@ with tempfile.TemporaryDirectory(prefix='spu-dispatch-miss-') as tmp:
            'spurs_policy_blob_weak','spu_interp']
     spu_fixture_link.build([root/'tests/test_spu_dispatch_miss.c',
         *[root/'runtime/spu'/f'{u}.c' for u in units],
-        root/'runtime/platform/win32_compat.c'], out,
+        root/'runtime/platform/win32_compat.c', root/'runtime/platform/host_clock.c', root/'runtime/platform/host_wait.c'], out,
         ['-std=gnu17','-D_GNU_SOURCE','-O1','-UNDEBUG','-ffunction-sections','-fdata-sections',
          '-I'+str(root/'include'),'-I'+str(root/'runtime/spu'),'-I'+str(root/'runtime/platform')],
         tmp, ldflags=['-Wl,-dead_strip' if platform.system()=='Darwin' else '-Wl,--gc-sections'])

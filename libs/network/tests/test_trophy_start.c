@@ -1,8 +1,12 @@
-/* clang -std=gnu17 -I include libs/network/tests/test_trophy_start.c
- *   -Wl,-dead_strip -o /tmp/test_trophy_start && /tmp/test_trophy_start
+/* clang -std=gnu17 -I include libs/network/tests/test_trophy_start.c runtime/platform/host_clock.c
+ *   runtime/platform/host_wait.c -Wl,-dead_strip -o /tmp/test_trophy_start && /tmp/test_trophy_start
  */
 #include "../sceNpTrophy.c"
 #include <assert.h>
+/* Reached only by a refused host wait (life_wake / life_wait), which this run never sees. */
+void ps3_stop(ps3_stop_kind k, const char* w, const char* r,
+              const ps3_stop_field* f, size_t n, const ps3_stop_site* s)
+{ (void)k; (void)w; (void)r; (void)f; (void)n; (void)s; abort(); }
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
 uint32_t g_ww_lo, g_ww_hi;
