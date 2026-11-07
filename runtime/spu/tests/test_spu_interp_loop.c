@@ -490,27 +490,60 @@ static void expect_dp_invalid(int mode, result r) {
     CHECK(r.steps == 2 && r.last_pc == 0x104 && R(2) == 5 && R(3) == 0);
 }
 
-/* cflts/cfltu at I8 <= 14 can reach the hardware's unmodelled shift region: with
- * sh = be + 23 - I8, a biased exponent be >= 241 + I8 (reachable only for I8 <= 14)
- * leaves the saturating path and the fit found no bit-exact rule (hwprobe spuexh
- * lanes r007/r008 on a CECHC04 with 4.81 REBUG; issue #126). The run stops at the
- * word instead of computing, like the unimplemented-op trap; the stderr line names
- * the scale. I8 15 is the lowest modelled scale (max sh = 263) and runs.
- *   100 il r2,5 / 104 cflts|cfltu r3,r2,<i8> / 108 il r4,1 / 10C stop 0 */
+/* cflts/cfltu at I8 <= 14 reach the hardware's unmodelled shift region per lane: with
+ * sh = be + 23 - I8, a lane with sh >= 264 (be >= 241 + I8, reachable only for I8 <= 14)
+ * leaves the saturating path and the fit found no bit-exact rule (hwprobe spuexh lanes,
+ * CECHC04 4.81 REBUG, runs r014/r018/r019; issue #126). cfltu is the exception for a
+ * negative lane (0) and for sh == 264 (0xFFFFFFFF), both measured. The run stops at the
+ * word only when such a lane is there, like the unimplemented-op trap, and the stderr line
+ * names the op, the scale, the lane and its input word; every other word at I8 <= 14 runs.
+ *   100 il r5,0x200 / 104 lqd r2,0(r5) / 108 cflts|cfltu r3,r2,<i8> / 10C il r4,1 / 110 stop 0
+ * with the four words of r2 at 0x200. */
 static uint32_t ri8(uint32_t op10, uint32_t i8, uint32_t ra, uint32_t rt) {
     return (op10 << 22) | ((i8 & 0xFF) << 14) | (ra << 7) | rt;
 }
-static uint32_t g_cfl_op, g_cfl_i8;
-static void load_cfl_trap_program(spu_context* c) {
-    put(c, 0x100, il(2, 5));
-    put(c, 0x104, ri8(g_cfl_op, g_cfl_i8, 2, 3));
-    put(c, 0x108, il(4, 1));
-    put(c, 0x10C, stop(0));
+typedef struct {
+    const char* name; uint32_t op, i8, in[4];
+    int trap_lane;                  /* the lane the stop names, -1 = the word runs */
+    uint32_t want[4];               /* r3 of a run */
+} cfl_case;
+static const cfl_case g_cfl_cases[] = {
+    /* 0x3F800000 is 1.0 (sh = 150 - I8, modelled), 0x7F800000 a positive and 0xFFFFFFFF a negative
+     * exponent-255 word, 0x7F5BAACA / 0xFF66344D exponent 254 (sh 263 at I8 14, 264 at I8 13). */
+    { "cflts-14-sh264",    0x1D8, 14, { 0x3F800000u, 0x7F800000u, 0x3F800000u, 0xFFFFFFFFu }, 1, { 0 } },
+    { "cflts-14-sh263",    0x1D8, 14, { 0x3F800000u, 0x3F800000u, 0x7F5BAACAu, 0xFF66344Du }, -1,
+      { 0x7FFFFFFFu, 0x7FFFFFFFu, 0x7FFFFFFFu, 0x80000000u } },
+    { "cfltu-14-sh264",    0x1D9, 14, { 0x3F800000u, 0x7F800000u, 0x7F5BAACAu, 0xFFFFFFFFu }, -1,
+      { 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0 } },
+    { "cfltu-13-sh265",    0x1D9, 13, { 0x3F800000u, 0x7F800000u, 0x7F5BAACAu, 0xFFFFFFFFu }, 1, { 0 } },
+    { "cfltu-13-neg-is-0", 0x1D9, 13, { 0x3F800000u, 0xFFFFFFFFu, 0x7F5BAACAu, 0xFF66344Du }, -1,
+      { 0xFFFFFFFFu, 0, 0xFFFFFFFFu, 0 } },
+    { "cflts-0-sh263",     0x1D8, 0,  { 0x7878EB45u, 0xF84DEADEu, 0x3F800000u, 0x00000000u }, -1,
+      { 0x7FFFFFFFu, 0x80000000u, 0x7FFFFFFFu, 0x7FFFFFFFu } },
+    { "cflts-0-nan-lane3", 0x1D8, 0,  { 0x3F800000u, 0x7878EB45u, 0x3F800000u, 0xFFABDE3Du }, 3, { 0 } },
+    { "cfltu-0-sh265",     0x1D9, 0,  { 0x79607710u, 0x3F800000u, 0x3F800000u, 0x3F800000u }, 0, { 0 } },
+};
+static const cfl_case* g_cfl;
+static void load_cfl_lane_program(spu_context* c) {
+    put(c, 0x100, il(5, 0x200));
+    put(c, 0x104, ri10(LQD, 0, 5, 2));
+    put(c, 0x108, ri8(g_cfl->op, g_cfl->i8, 2, 3));
+    put(c, 0x10C, il(4, 1));
+    put(c, 0x110, stop(0));
+    for (int k = 0; k < 4; k++) put(c, 0x200 + 4 * (uint32_t)k, g_cfl->in[k]);
 }
-static void expect_cfl_trap(int mode, result r) {
+static void expect_cfl_lane_program(int mode, result r) {
     (void)mode;
-    CHECK(g_ctx.status == SPU_STATUS_STOPPED_BY_HALT && g_ctx.pc == 0x104);
-    CHECK(r.steps == 2 && r.last_pc == 0x104 && R(2) == 5 && R(3) == 0 && R(4) == 0);
+    if (g_cfl->trap_lane >= 0) {
+        CHECK(g_ctx.status == SPU_STATUS_STOPPED_BY_HALT && g_ctx.pc == 0x108);
+        CHECK(r.steps == 3 && r.last_pc == 0x108);
+        CHECK(R(4) == 0 && g_ctx.gpr[3]._u32[0] == 0 && g_ctx.gpr[3]._u32[1] == 0
+              && g_ctx.gpr[3]._u32[2] == 0 && g_ctx.gpr[3]._u32[3] == 0);   /* no result was written */
+    } else {
+        CHECK(r.ret == 0 && g_ctx.status == SPU_STATUS_STOPPED_BY_STOP && g_ctx.pc == 0x114);
+        CHECK(r.steps == 5 && r.last_pc == 0x110 && R(4) == 1);
+        for (int k = 0; k < 4; k++) CHECK(g_ctx.gpr[3]._u32[k] == g_cfl->want[k]);
+    }
 }
 
 /* 100 il r2,5 / 104 cflts r3,r2,15 / 108 cfltu r4,r2,15 / 10C stop 0
@@ -529,28 +562,37 @@ static void expect_cfl15(int mode, result r) {
     CHECK(R(3) == 0x7FFFFFFFu && R(4) == 0);
 }
 
-/* The stop must say why (fail loud with named errors): the stderr line names the
- * scale and the issue. Capture stderr through a tmpfile for one run. */
+/* The stop must say why (fail loud with named errors): the stderr line names the op, the
+ * scale, the lane, its input word, the issue, the word and its pc. Capture stderr through a
+ * tmpfile for one run of each stopping case. */
 static void test_cfl_stop_names_itself(void) {
-    int saved = dup(2);
-    FILE* tf = tmpfile();
-    CHECK(saved >= 0 && tf != NULL);
-    fflush(stderr);
-    CHECK(dup2(fileno(tf), 2) >= 0);
-    g_case = "trap/cfl-message"; g_mode = "fast";
-    g_cfl_op = 0x1D8; g_cfl_i8 = 14;
-    obs_count oc = { 0 };
-    result r = run_mode(M_FAST, load_cfl_trap_program, 0, 0, &oc);
-    fflush(stderr);
-    CHECK(dup2(saved, 2) >= 0);
-    close(saved);
-    expect_cfl_trap(M_FAST, r);
-    rewind(tf);
-    char buf[512];
-    size_t n = fread(buf, 1, sizeof buf - 1, tf);
-    buf[n] = 0;
-    fclose(tf);
-    CHECK(strstr(buf, "unmodelled cflts/cfltu scale (I8=14, #126)") != NULL);
+    for (size_t k = 0; k < sizeof g_cfl_cases / sizeof g_cfl_cases[0]; k++) {
+        const cfl_case* cs = &g_cfl_cases[k];
+        if (cs->trap_lane < 0) continue;
+        int saved = dup(2);
+        FILE* tf = tmpfile();
+        CHECK(saved >= 0 && tf != NULL);
+        fflush(stderr);
+        CHECK(dup2(fileno(tf), 2) >= 0);
+        g_case = "trap/cfl-message"; g_mode = "fast";
+        g_cfl = cs;
+        obs_count oc = { 0 };
+        result r = run_mode(M_FAST, load_cfl_lane_program, 0, 0, &oc);
+        fflush(stderr);
+        CHECK(dup2(saved, 2) >= 0);
+        close(saved);
+        expect_cfl_lane_program(M_FAST, r);
+        rewind(tf);
+        char buf[512];
+        size_t n = fread(buf, 1, sizeof buf - 1, tf);
+        buf[n] = 0;
+        fclose(tf);
+        char want[200];
+        snprintf(want, sizeof want, "unmodelled cflts/cfltu lane (%s I8=%u lane=%d in=0x%08X, #126) (0x%08X) at LS 0x00108",
+                 cs->op == 0x1D8 ? "cflts" : "cfltu", cs->i8, cs->trap_lane, cs->in[cs->trap_lane],
+                 ri8(cs->op, cs->i8, 2, 3));
+        CHECK(strstr(buf, want) != NULL);
+    }
 }
 
 /* The neighbouring DP op keeps its execution: dfa runs and falls through.
@@ -669,11 +711,11 @@ int main(void) {
         snprintf(nm, sizeof nm, "trap/dp-invalid-%d", g_dp_invalid);
         all_modes(nm, load_dp_invalid_program, 0, 0, expect_dp_invalid);
     }
-    for (g_cfl_op = 0x1D8; g_cfl_op <= 0x1D9; g_cfl_op++) {
-        char nm[40];
-        snprintf(nm, sizeof nm, "trap/cfl-i8-14-%s", g_cfl_op == 0x1D8 ? "cflts" : "cfltu");
-        g_cfl_i8 = 14;
-        all_modes(nm, load_cfl_trap_program, 0, 0, expect_cfl_trap);
+    for (size_t k = 0; k < sizeof g_cfl_cases / sizeof g_cfl_cases[0]; k++) {
+        char nm[60];
+        g_cfl = &g_cfl_cases[k];
+        snprintf(nm, sizeof nm, "%s/%s", g_cfl->trap_lane >= 0 ? "trap" : "cfl", g_cfl->name);
+        all_modes(nm, load_cfl_lane_program, 0, 0, expect_cfl_lane_program);
     }
     all_modes("cfl/i8-15-runs", load_cfl15_program, 0, 0, expect_cfl15);
     test_cfl_stop_names_itself();

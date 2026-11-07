@@ -1318,14 +1318,20 @@ static inline u128 spu_fcmgt(u128 a, u128 b) { return spu_fcmgt_ref(a, b); }
  * but the saturating conversion still saturates on the shift amount sh = be + 23 - i8, so sh >= 8
  * gives 0x7FFFFFFF / 0x80000000 (signed, by sign) and sh >= 9 gives 0xFFFFFFFF (unsigned, sign 0;
  * a negative input is 0 as always and sh == 8 does not saturate unsigned). Hardware, direct:
- * hwprobe `spuexh` lanes r007/r008 on a CECHC04 with 4.81 REBUG measured the exponent-0 lanes at
- * I8 0..3 and 10 (cflts) and 0..3 (cfltu); the fit is CONV_RULE.md in the private recon tree
- * (issue #126). With m = 0 for be == 0 the rule needs no separate branch.
+ * hwprobe `spuexh` lanes on a CECHC04 with 4.81 REBUG, 2026-11-07, issue #126: runs r007/r008
+ * measured the exponent-0 lanes at I8 0..3 and 10, and runs r014, r018 and r019 dumped 129024
+ * lanes of both ops at I8 0..16. The rule below is the fit of those 129024 lanes: it reproduces
+ * every lane with sh < 264 (125046 lanes, no exception), the cfltu lanes at sh == 264 and every
+ * negative cfltu lane, 126125 lanes in all, the 4096 lanes at I8 15/16 included. With m = 0 for
+ * be == 0 it needs no separate exponent-0 branch, and for i8 >= 15 (sh <= 263) it is the formula
+ * of this function as it always was.
  *
- * sh >= 264 is NOT modelled (reachable only for I8 <= 14, be >= 241 + I8): the hardware leaves
- * the saturating path there and neither the result nor a bit-exact formula is known (489 measured
- * lanes). These helpers keep the saturation above for direct callers; the interpreter and the
- * lifter stop instead of executing such a word (issue #126). */
+ * sh >= 264 is reachable only for i8 <= 14 (be >= 241 + i8). There the hardware leaves the
+ * saturating path and the result is NOT modelled: 2899 observed lanes (cflts at sh >= 264, cfltu
+ * at sh > 264 with the sign clear, NaN-class exponents included) fit no rule (2701 of them are
+ * no shift of the significand at all), and none of them equals the saturation below. Those lanes
+ * keep it for direct callers only; the interpreter and the lifter ask spu_cfl_unmodelled_lane()
+ * and stop at the word instead of executing it. */
 static inline uint32_t spu__cfl_lane(uint32_t x, int scale, int is_unsigned) {
     const uint32_t be = (x >> 23) & 0xFFu;
     const uint32_t m = be ? ((x & 0x7FFFFFu) | 0x800000u) : 0u;   /* exponent 0: significand 0 */
@@ -1338,6 +1344,23 @@ static inline uint32_t spu__cfl_lane(uint32_t x, int scale, int is_unsigned) {
     if (sh >= 8) return neg ? 0x80000000u : 0x7FFFFFFFu;   /* magnitude >= 2^31 */
     const uint32_t v = sh >= 0 ? m << sh : (sh <= -24 ? 0 : m >> -sh);
     return neg ? 0u - v : v;
+}
+/* The first lane (0..3) of `a` whose cflts (is_unsigned = 0) / cfltu (1) result at scale `i8` the
+ * model does not know, or -1 when every lane is modelled. A lane is unmodelled when sh >= 264,
+ * except for cfltu, where a negative lane (always 0) and the sh == 264 lane (0xFFFFFFFF) were
+ * measured (issue #126, spuexh runs above). sh <= 263 for i8 >= 15, so those scales return -1
+ * at once. The interpreter and the lifter use this to stop (fail closed) instead of guessing. */
+static inline int spu_cfl_unmodelled_lane(u128 a, int i8, int is_unsigned) {
+    i8 &= 0xFF;
+    if (i8 > 14) return -1;
+    for (int i = 0; i < 4; i++) {
+        const uint32_t x = a._u32[i];
+        const int sh = (int)((x >> 23) & 0xFFu) + 23 - i8;
+        if (sh < 264) continue;
+        if (is_unsigned && ((x >> 31) != 0 || sh == 264)) continue;
+        return i;
+    }
+    return -1;
 }
 static inline u128 spu_cflts_ref(u128 a, int i8) { u128 r; for (int i = 0; i < 4; i++) r._u32[i] = spu__cfl_lane(a._u32[i], 173 - (i8 & 0xFF), 0); return r; }
 static inline u128 spu_cfltu_ref(u128 a, int i8) { u128 r; for (int i = 0; i < 4; i++) r._u32[i] = spu__cfl_lane(a._u32[i], 173 - (i8 & 0xFF), 1); return r; }
@@ -1745,8 +1768,9 @@ SPU__XE_INLINE u128 spu_frsqest(u128 a) {
 /* cflts/cfltu: the 24-bit significand shifted by be - 150 + (173 - i8), saturated. An exponent-0
  * lane (zero/denormal) has significand 0 but still saturates on the shift amount (sh >= 8 signed,
  * sh >= 9 unsigned; hardware direct, hwprobe spuexh lanes r007/r008, issue #126), which m = 0
- * below models without masking the result afterwards. sh >= 264 (I8 <= 14) is not modelled: the
- * interpreter and the lifter stop there (see spu__cfl_lane). */
+ * below models without masking the result afterwards. A lane at sh >= 264 (I8 <= 14) keeps this
+ * saturation but is unmodelled unless spu_cfl_unmodelled_lane() says otherwise: the interpreter
+ * and the lifter stop on it (see spu__cfl_lane). */
 SPU__XE_INLINE __m128i spu__xe_cfl(u128 a, int i8, int is_unsigned) {
     const __m128i x = spu__xe_ld(a);
     const __m128i be = _mm_and_si128(_mm_srli_epi32(x, 23), _mm_set1_epi32(0xFF));

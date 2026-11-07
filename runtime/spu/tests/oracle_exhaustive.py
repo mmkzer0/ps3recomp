@@ -191,7 +191,9 @@ def cflt(x, sc, uns):
     # cflts/cfltu of an exponent-0 word (zero/denormal): the significand is 0, but the hardware
     # still saturates on the shift amount sh = be + 23 - i8 = 23 - sc (spuexh lanes r007/r008,
     # issue #126): signed at sh >= 8, unsigned at sh >= 9 (sh == 8 does not saturate, and a
-    # negative unsigned input is 0 as always).
+    # negative unsigned input is 0 as always). The lanes at sh >= 264 (scales 0..2 here, be >= 241 + sc)
+    # are the saturating model, not the console: the hardware leaves that path there (2899 observed
+    # lanes that no rule fits, the interpreter and the lifter stop on them; issue #126).
     if (x >> 23) & 255 == 0:
         sh = 23 - sc
         if uns: return 0 if (x >> 31) or sh < 9 else M32

@@ -102,15 +102,21 @@ static int target_invalid(int op) {
         || op == R_DFCMGT || op == R_DFTSV;
 }
 
-/* cflts/cfltu at I8 <= 14 can reach the unmodelled sh = be + 23 - I8 >= 264
- * region (hwprobe spuexh lanes, issue #126): the interpreter stops at such a
- * word, so a trial cannot be compared with RPCS3's model and the sweeps skip
- * those immediates. I8 15 is the lowest modelled scale (max sh = 263); its
- * exponent-0 lanes are hardware-specific and the ISA leaves scale 158
- * undefined, so spu_float_referee.py adjudicates them like the other
- * out-of-ISA scale deviations. */
-static int imm_unmodelled_cfl(int op, uint32_t imm) {
-    return (op == R_CFLTS || op == R_CFLTU) && imm <= 14u;
+/* cflts/cfltu at I8 <= 14 stop the interpreter (and the lifted code) on a lane with
+ * sh = be + 23 - I8 >= 264 that the model does not cover (hwprobe spuexh lanes, issue #126), so a
+ * trial whose operand has a lane with be >= 241 + I8 cannot be compared with RPCS3's model: the
+ * trial is skipped. The test does not decide which of those lanes the model covers; it only keeps
+ * out of the region where a stop is possible. Every other lane at I8 <= 14, and every lane at
+ * I8 >= 15 (max sh = 263), runs and is compared. The exponent-0 lanes of these ops are
+ * hardware-specific and the ISA leaves scales above 127 undefined, so spu_float_referee.py
+ * adjudicates them like the other out-of-ISA scale deviations. */
+static int cfl_stop_region(int op, uint32_t insn, const u128* regs) {
+    if (op != R_CFLTS && op != R_CFLTU) return 0;
+    const uint32_t i8 = (insn >> 14) & 0xFF;
+    if (i8 > 14u) return 0;
+    const u128* a = &regs[(insn >> 7) & 0x7F];
+    for (int i = 0; i < 4; i++) if (((a->_u32[i] >> 23) & 0xFFu) >= 241u + i8) return 1;
+    return 0;
 }
 
 /* ---- big-endian quadword model ---- */
@@ -581,6 +587,7 @@ static char g_hand_ops[1024], g_skip_ops[1024];
 
 /* Execute one trial. Returns 1 on mismatch. */
 static int one_trial(int op, uint32_t insn, uint32_t pc, backend_fn be, void* user, OpStat* st, int* printed, const char* nm) {
+    if (cfl_stop_region(op, insn, g_orig)) return 0;
     uint32_t m = pc & 0x3FFFC; uint8_t patch[4] = { insn >> 24, insn >> 16, insn >> 8, insn }, sv[4];
     uint32_t srr0 = rnd(), evt = rnd() & 1, ch_in = int_word(), ch_cnt = int_word();
     memcpy(sv, g_ls0 + m, 4);
@@ -655,7 +662,7 @@ static int run_op(int op, long scale, backend_fn be, void* user) {
     if (k == F_I18 || k == F_I16) { if (scale > 1) reps = scale; }
     long pat = 0;
     for (long im = 0; im < nimm; im++) for (long rp = 0; rp < reps; rp++) {
-        if (imm_unmodelled_cfl(op, (uint32_t)im)) continue;   /* interpreter stops (issue #126) */
+        /* (a trial in the stop region of issue #126 is skipped in one_trial) */
         int used[4]; int p = (int)(pat++ % NPAT_TOTAL);
         uint32_t insn = build_insn(op, p, (uint32_t)im, used);
         /* operands: refresh the registers named by the instruction and the alias registers */
@@ -751,7 +758,7 @@ static void emit_cases(long scale) {
                 else imm = rnd();
                 imm &= mask;
             }
-            if (imm_unmodelled_cfl(op, imm)) imm = 15u + imm % 241u;   /* modelled scales only (issue #126) */
+            /* (a trial in the stop region of issue #126 is skipped in one_trial) */
             int pat = (int)(c % NPAT_TOTAL);
             uint32_t insn = build_insn(op, pat, imm, used);
             switch (op) { case R_BI: case R_BISL: case R_IRET: case R_BISLED: case R_BIZ: case R_BINZ: case R_BIHZ: case R_BIHNZ:

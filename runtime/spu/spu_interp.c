@@ -147,18 +147,23 @@ static inline uint32_t spu_fetch(const spu_context* ctx, uint32_t pc) {
     ctx->pc = pc; ctx->stop_code = 0x1000; ctx->status = SPU_STATUS_STOPPED_BY_HALT; \
     return 1; } } while (0)
 
-/* cflts/cfltu at I8 <= 14: the conversion shifts by sh = be + 23 - I8, and sh >= 264 (reachable
- * for be >= 241 + I8, i.e. only for I8 <= 14) leaves the hardware's saturating path for a result
- * that is not modelled (489 measured lanes, no bit-exact rule; hwprobe `spuexh` lanes r007/r008 on
- * a CECHC04 with 4.81 REBUG; issue #126). I8 >= 15 cannot reach it (max sh = 255 + 23 - 15 = 263)
- * and is exact. Fail closed like the undecodable-word trap: stop at the word instead of running on
- * a value the console never produced. */
-#define SPU_CFL_SCALE_TRAP(i8) do { \
+/* cflts/cfltu at I8 <= 14: the conversion shifts by sh = be + 23 - I8, and a lane with sh >= 264
+ * (be >= 241 + I8, so only at these scales) leaves the hardware's saturating path for a result
+ * that is not modelled (spu_cfl_unmodelled_lane: cflts at every such lane; cfltu except negative
+ * lanes, which are 0, and sh == 264, which is 0xFFFFFFFF; hwprobe `spuexh` lanes on a CECHC04
+ * with 4.81 REBUG, runs r014/r018/r019, 2026-11-07; issue #126). Every other lane at I8 <= 14,
+ * and every lane at I8 >= 15 (max sh = 255 + 23 - 15 = 263), is exact. Fail closed like the
+ * undecodable-word trap, per instruction and only when a lane reaches that path: stop at the
+ * word, naming the op, the scale, the lane and its input word, instead of running on with a
+ * value the console never produced. The I8 test is the whole cost at I8 >= 15. */
+#define SPU_CFL_LANE_TRAP(opname, uns, a, i8) do { \
     if ((uint32_t)(i8) <= 14u) { \
-        fprintf(stderr, "[spu_interp] unmodelled cflts/cfltu scale (I8=%u, #126) (0x%08X) at LS 0x%05X\n", \
-                (unsigned)(i8), insn, pc); \
-        ctx->pc = pc; ctx->status = SPU_STATUS_STOPPED_BY_HALT; return 1; \
-    } } while (0)
+        const int cfl_lane_ = spu_cfl_unmodelled_lane((a), (int)(i8), (uns)); \
+        if (cfl_lane_ >= 0) { \
+            fprintf(stderr, "[spu_interp] unmodelled cflts/cfltu lane (%s I8=%u lane=%d in=0x%08X, #126) (0x%08X) at LS 0x%05X\n", \
+                    (opname), (unsigned)(i8), cfl_lane_, (unsigned)(a)._u32[cfl_lane_], insn, pc); \
+            ctx->pc = pc; ctx->status = SPU_STATUS_STOPPED_BY_HALT; return 1; \
+        } } } while (0)
 
 /* Execute the instruction `insn` found at `pc`; returns 1 if the SPU stopped.
  * On return 0 *out_next is the pc to continue at.
@@ -304,8 +309,8 @@ SPU_EXEC_INLINE int spu_exec(spu_context* ctx, uint32_t pc, uint32_t insn,
     OP(fm, DST = spu_fm(A,B);)
     OP(fcgt, DST = spu_fcgt(A,B);)
     OP(fceq, DST = spu_fceq(A,B);)
-    OP(cflts, SPU_CFL_SCALE_TRAP(I); DST = spu_cflts(A,I);)
-    OP(cfltu, SPU_CFL_SCALE_TRAP(I); DST = spu_cfltu(A,I);)
+    OP(cflts, SPU_CFL_LANE_TRAP("cflts", 0, A, I); DST = spu_cflts(A,I);)
+    OP(cfltu, SPU_CFL_LANE_TRAP("cfltu", 1, A, I); DST = spu_cfltu(A,I);)
     OP(csflt, DST = spu_csflt(A,I);)
     OP(cuflt, DST = spu_cuflt(A,I);)
     OP(frest, DST = spu_frest(A);)
