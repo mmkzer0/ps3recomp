@@ -64,7 +64,7 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 |---|---|---|---|
 | cellPamf | PAMF Container | **Complete** | Big-endian PAMF header parser, stream queries, entry points, AVC/ATRAC3+/LPCM/AC3 info |
 | cellVdec | Video Decode | Partial | H.264 and MPEG-2 decode through FFmpeg loaded at run time (`-DPS3RECOMP_FFMPEG_RUNTIME=ON`, libavcodec present): pictures in display order with PICOUT, pts/dts/userData and picture type in the PicItem, YUV420/UYVY/ARGB/RGBA output, EndSeq flush. Without FFmpeg: AUDONE+PICOUT per AU and a black picture, as before |
-| cellAdec | Audio Decode | Partial | Open/close, start/end seq, AU submit with AUDONE+PCMOUT callbacks (populated PcmItem), no actual AAC/ATRAC3+ decode (needs FFmpeg) |
+| cellAdec | Audio Decode | Partial | Open/close, start/end seq, AU submit with AUDONE+PCMOUT callbacks (populated PcmItem). AC3 decodes through FFmpeg loaded at run time; every other codec, and AC3 without a decoder, is the named stop `adec-no-decoder` unless the title's config sets `adec.silence_fallback` (a silent block of the codec's frame size, #130) |
 | cellDmux | Demuxer | Partial | Open/close, ES enable/disable, stream set with callback sequencing, AU retrieval, flush |
 | cellVpost | Video Post | **Complete** | Handle management, query, exec stub (no actual color conversion/scaling) |
 | cellJpgDec | JPEG Decode | **Complete** | Header parsing + stb_image decode, file/buffer sources |

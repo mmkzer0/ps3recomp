@@ -91,6 +91,7 @@ def test_defaults_without_file_or_environment():
         "eng.depth_bounds": ("true", "default"),
         "game.free_space_raw": ("false", "default"),
         "trophy.register_wait_cap_vblanks": ("1024", "default"),
+        "adec.silence_fallback": ("false", "default"),
         "video.resolutions": ('""', "default"),
         "video.rsx_capture": ("false", "default"),
         "video.rsx_capture_dir": ('""', "default"),
@@ -191,6 +192,7 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
             "eng.depth_bounds": "default",
             "game.free_space_raw": "default",
             "trophy.register_wait_cap_vblanks": "default",
+            "adec.silence_fallback": "default",
             "video.resolutions": "default",
             "video.rsx_capture": "default",
             "video.rsx_capture_dir": "default",
@@ -216,6 +218,7 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
                            "eng": {"depth_clamp": True, "depth_bounds": True},
                            "game": {"free_space_raw": False},
                            "trophy": {"register_wait_cap_vblanks": 1024},
+                           "adec": {"silence_fallback": False},
                            "video": {"resolutions": "", "rsx_capture": False, "rsx_capture_dir": "",
                                      "rsx_capture_frames": 0},
                            "pad": {"record": "", "replay": ""},
@@ -440,6 +443,19 @@ def test_mfc_lookup_cache_comes_from_file_and_environment():
     assert o["spu.mfc_lookup_cache"] == ("true", "env:PS3RECOMP_SPU_MFC_LOOKUP_CACHE"), o
     f = config_invalid(probe("get", PS3RECOMP_SPU_MFC_LOOKUP_CACHE="yes"))
     assert f["key"] == "spu.mfc_lookup_cache", f
+
+
+def test_adec_silence_fallback_comes_from_file_and_environment():
+    # Off by default (#130): the silent block is an allow-list a title's config asks for.
+    with Cfg("schema = 1", "[adec]", "silence_fallback = true") as c:
+        o = options(probe("--load", c.path, "get"))
+        assert o["adec.silence_fallback"] == ("true", f"file:{c.path}"), o
+        o = options(probe("--load", c.path, "get", PS3RECOMP_ADEC_SILENCE_FALLBACK="0"))
+        assert o["adec.silence_fallback"] == ("false", "env:PS3RECOMP_ADEC_SILENCE_FALLBACK"), o
+    o = options(probe("get", PS3RECOMP_ADEC_SILENCE_FALLBACK="1"))
+    assert o["adec.silence_fallback"] == ("true", "env:PS3RECOMP_ADEC_SILENCE_FALLBACK"), o
+    f = config_invalid(probe("get", PS3RECOMP_ADEC_SILENCE_FALLBACK="yes"))
+    assert f["key"] == "adec.silence_fallback", f
 
 
 def test_u32_out_of_range_file_values_stop():

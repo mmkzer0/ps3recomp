@@ -136,7 +136,9 @@ extern "C" {
     X(RSX_DRIVER_METHOD,        "rsx-driver-method")                                                       \
     /* A pad trace (pad.record / pad.replay) that cannot be written, or a replay file that is not a well-formed trace. */ \
     X(PAD_TRACE,                "pad-trace")                                                               \
-    X(FIBER_HOST_CONTEXT,       "fiber-host-context")
+    X(FIBER_HOST_CONTEXT,       "fiber-host-context")                                                      \
+    /* A cellAdec AU the runtime has no decoder for: the console decodes it, silence would be success for work not done. */ \
+    X(ADEC_NO_DECODER,          "adec-no-decoder")
 
 /* A fixed underlying type in C++ makes a kind outside the list (a caller's bug,
  * which the stop still reports as "invalid-kind") a well-defined value rather

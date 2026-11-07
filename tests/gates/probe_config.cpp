@@ -64,6 +64,8 @@ static void print_options()
             std::printf("%s", ps3_cfg_game_free_space_raw() ? "true" : "false");
         else if (!std::strcmp(o->section, "trophy") && !std::strcmp(o->key, "register_wait_cap_vblanks"))
             std::printf("%u", ps3_cfg_trophy_register_wait_cap_vblanks());
+        else if (!std::strcmp(o->section, "adec") && !std::strcmp(o->key, "silence_fallback"))
+            std::printf("%s", ps3_cfg_adec_silence_fallback() ? "true" : "false");
         else if (!std::strcmp(o->section, "video") && !std::strcmp(o->key, "resolutions"))
             std::printf("\"%s\"", ps3_cfg_video_resolutions());
         else if (!std::strcmp(o->section, "video") && !std::strcmp(o->key, "rsx_capture"))
