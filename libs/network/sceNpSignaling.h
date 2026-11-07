@@ -15,14 +15,17 @@
 extern "C" {
 #endif
 
-/* Error codes */
-#define SCE_NP_SIGNALING_ERROR_NOT_INITIALIZED       0x80022A01
-#define SCE_NP_SIGNALING_ERROR_ALREADY_INITIALIZED   0x80022A02
-#define SCE_NP_SIGNALING_ERROR_INVALID_ARGUMENT      0x80022A03
-#define SCE_NP_SIGNALING_ERROR_OUT_OF_MEMORY         0x80022A04
-#define SCE_NP_SIGNALING_ERROR_NOT_CONNECTED         0x80022A05
-#define SCE_NP_SIGNALING_ERROR_CTX_NOT_FOUND         0x80022A06
-#define SCE_NP_SIGNALING_ERROR_CONN_NOT_FOUND        0x80022A07
+/* Error codes. Values from RPCS3's sceNp.h Signaling block (tier RPCS3 --
+ * the NP modules are not available decrypted); the 0x80022A0x values this
+ * header used to carry had no provenance and match no NP family (#127).
+ * The signaling family has no NOT_CONNECTED entry at the pinned oracle; the
+ * old define on 0x80022A05 is dropped rather than kept unassigned. */
+#define SCE_NP_SIGNALING_ERROR_NOT_INITIALIZED       0x8002A801
+#define SCE_NP_SIGNALING_ERROR_ALREADY_INITIALIZED   0x8002A802
+#define SCE_NP_SIGNALING_ERROR_OUT_OF_MEMORY         0x8002A803
+#define SCE_NP_SIGNALING_ERROR_CTX_NOT_FOUND         0x8002A805
+#define SCE_NP_SIGNALING_ERROR_CONN_NOT_FOUND        0x8002A80E
+#define SCE_NP_SIGNALING_ERROR_INVALID_ARGUMENT      0x8002A815
 
 /* Constants */
 #define SCE_NP_SIGNALING_CTX_MAX           8

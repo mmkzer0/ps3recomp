@@ -442,6 +442,7 @@ enum {
     SPURS_WKL_STATE1   = 0x80,
     SPURS_WKL_ENABLED  = 0xB0,
     SPURS_SYSSRV_MSG   = 0xBD,
+    SPURS_WKL_EXCEPTION = 0xD6C,  /* be u32, set when an SPU raised an exception */
     SPURS_WKL_INFO1    = 0xB00,
     SPURS_WKL_INFO_SZ  = 0x20,
     /* CellSpurs2's second workload set (wid 16-31), and the flag that says
@@ -658,10 +659,23 @@ s32 cellSpursInitializeWithAttribute(CellSpurs* spurs,
                                      const CellSpursAttribute* attr)
 {
     /* fw libsre 0x0200849C, 0x020075E4 */
-    if (!spurs || !attr)
+    /* The attribute checks come first in the firmware: a null attr is
+     * 0x80410711 (0x0200849C), attr & 7 is 0x80410710 (0x020084A8) and a
+     * revision above 2 is 0x80410702 (0x02008500). The spurs checks live in
+     * the shared creator 0x020075DC: null 0x80410711 (0x020075E4), & 0x7F
+     * 0x80410710 (0x020076D0). All ori immediates are 0x7xx, the core
+     * family. */
+    u32 attr_ea = (u32)(uintptr_t)attr;
+    if (!attr_ea)
         return CELL_SPURS_CORE_ERROR_NULL_POINTER;
-    u32 spurs_ea = (u32)(uintptr_t)spurs;
+    if (attr_ea & 7u)
+        return CELL_SPURS_CORE_ERROR_ALIGN;
+    if (!spurs)
+        return CELL_SPURS_CORE_ERROR_NULL_POINTER;
     attr = GUEST_PTR(attr, const CellSpursAttribute*);
+    if (attr->revision > 2u)
+        return CELL_SPURS_CORE_ERROR_INVAL;
+    u32 spurs_ea = (u32)(uintptr_t)spurs;
     return spurs_initialize_common(spurs_ea, attr->nSpus, (const char*)attr->prefix,
                                    SPURS_INST_SIZE);
 }
@@ -671,16 +685,30 @@ s32 cellSpursInitializeWithAttribute(CellSpurs* spurs,
 s32 cellSpursInitializeWithAttribute2(CellSpurs* spurs,
                                       const CellSpursAttribute* attr)
 {
-    if (!spurs || !attr)
+    /* fw libsre 4.81 0x020083AC: the attribute is checked before spurs --
+     * null attr 0x80410711, attr & 7 0x80410710 (0x020083C0), attr revision
+     * above 2 0x80410702 (0x02008418). The spurs pointer itself is validated
+     * by the shared creator 0x020075DC: null 0x80410711 (0x020075E4),
+     * spurs & 0x7F 0x80410710 (0x020076D0) -- so the alignment code is
+     * firmware-checked, one call down. The creator clears 0x2000 bytes
+     * (0x02007738), the CellSpurs2 span this stop bounds. */
+    u32 attr_ea = (u32)(uintptr_t)attr;
+    if (!attr_ea)
         return CELL_SPURS_CORE_ERROR_NULL_POINTER;
+    if (attr_ea & 7u)
+        return CELL_SPURS_CORE_ERROR_ALIGN;
+    if (!spurs)
+        return CELL_SPURS_CORE_ERROR_NULL_POINTER;
+    attr = GUEST_PTR(attr, const CellSpursAttribute*);
+    if (attr->revision > 2u)
+        return CELL_SPURS_CORE_ERROR_INVAL;
     u32 spurs_ea = (u32)(uintptr_t)spurs;
     if (spurs_ea & 0x7Fu) return CELL_SPURS_CORE_ERROR_ALIGN;
     /* A span the host cannot back is a stop, never a fabricated code (libsre 4.93
-     * returns none for it). The alignment code is upstream's, not firmware-checked. */
+     * returns none for it). */
     if (!spurs_guest_range_valid(spurs_ea, SPURS_INST2_SIZE))
         ps3_stop_guest_range("cellSpursInitializeWithAttribute2", "spurs", spurs_ea,
                              SPURS_INST2_SIZE, vm_guest_limit());
-    attr = GUEST_PTR(attr, const CellSpursAttribute*);
     return spurs_initialize_common(spurs_ea, attr->nSpus, (const char*)attr->prefix,
                                    SPURS_INST2_SIZE);
 }
@@ -711,37 +739,55 @@ s32 cellSpursAttributeInitialize(CellSpursAttribute* attr, s32 nSpus,
                                  s32 spuPriority, s32 ppuPriority,
                                  u8 exitIfNoWork)
 {
-    (void)ppuPriority; (void)exitIfNoWork;
-
     if (!attr)
         return CELL_SPURS_CORE_ERROR_NULL_POINTER;
 
     /* `attr` is a GUEST address (generic HLE adapter passes r3 raw). */
     attr = GUEST_PTR(attr, CellSpursAttribute*);
     memset(attr, 0, sizeof(CellSpursAttribute));
+    /* The SDK's cellSpursAttributeInitialize() is an inline that calls the
+     * 7-argument export with revision 1; the export stores whatever revision
+     * it is handed (libsre 4.81 0x0200747C) and cellSpursInitializeWithAttribute
+     * rejects a revision above 2 (0x02008500), so 1 is the value this five
+     * argument entry point stands for. */
+    attr->revision = 1;
     attr->nSpus = (nSpus > 0 && nSpus <= CELL_SPURS_MAX_SPU)
                   ? (u32)nSpus : 1;
-
-    for (int i = 0; i < CELL_SPURS_MAX_SPU; i++)
-        attr->spuPriority[i] = spuPriority;
+    attr->spuPriority = spuPriority;
+    attr->ppuPriority = ppuPriority;
+    attr->exitIfNoWork = exitIfNoWork;
 
     printf("[cellSpurs] AttributeInitialize(nSpus=%d)\n", nSpus);
     return CELL_OK;
 }
 
 /* The SDK's cellSpursAttributeInitialize() is an inline wrapper over this
- * internal export (NID 0x95180230), whose arguments are (attr, revision,
- * sdkVersion, nSpus, spuPriority, ppuPriority, exitIfNoWork). Reading them with
- * the public five-argument prototype took the revision (2) as nSpus, the SDK
- * version as spuPriority and the real nSpus as ppuPriority. */
+ * internal export (NID 0x95180230, libsre 4.81 0x020073C4), whose arguments
+ * are (attr, revision, sdkVersion, nSpus, spuPriority, ppuPriority,
+ * exitIfNoWork). Reading them with the public five-argument prototype took
+ * the revision (2) as nSpus, the SDK version as spuPriority and the real
+ * nSpus as ppuPriority. The export null-checks attr (0x80410711), checks
+ * attr & 7 (0x80410710), zero-fills 512 bytes and stores the fields at
+ * +0x00..+0x14; the exitIfNoWork byte lands at +0x14. */
 s32 _cellSpursAttributeInitialize(CellSpursAttribute* attr, u32 revision,
                                   u32 sdkVersion, s32 nSpus, s32 spuPriority,
                                   s32 ppuPriority, u8 exitIfNoWork)
 {
-    (void)revision;
-    (void)sdkVersion;
-    return cellSpursAttributeInitialize(attr, nSpus, spuPriority,
-                                        ppuPriority, exitIfNoWork);
+    if (!attr)
+        return CELL_SPURS_CORE_ERROR_NULL_POINTER;
+    if (((u32)(uintptr_t)attr) & 7u)
+        return CELL_SPURS_CORE_ERROR_ALIGN;
+
+    attr = GUEST_PTR(attr, CellSpursAttribute*);
+    memset(attr, 0, sizeof(CellSpursAttribute));   /* the export clears 0x200 bytes */
+    attr->revision     = revision;
+    attr->sdkVersion   = sdkVersion;
+    attr->nSpus        = (nSpus > 0 && nSpus <= CELL_SPURS_MAX_SPU)
+                         ? (u32)nSpus : 1;
+    attr->spuPriority  = spuPriority;
+    attr->ppuPriority  = ppuPriority;
+    attr->exitIfNoWork = exitIfNoWork;
+    return CELL_OK;
 }
 
 s32 cellSpursAttributeSetNamePrefix(CellSpursAttribute* attr,
@@ -779,14 +825,50 @@ s32 cellSpursAttributeEnableSpuPrintfIfAvailable(CellSpursAttribute* attr)
 }
 
 /* (attr, const u8 priority[8], u32 maxSpu, const bool isPreemptible[8]).
- * The system workload is the firmware's own service work (exception and trace
- * handling); the runtime has none to run, so enabling it changes nothing. */
+ * Firmware contract (libsre 4.81 0x0200F518): the call validates and records
+ * the system-workload configuration in the attribute; the instance-side part
+ * runs firmware service workloads this runtime has none of, so the recorded
+ * configuration stays unused at init (spurs_initialize_common models nothing
+ * from it) -- recording it is what the answer is measured against.
+ * Order of checks, each with its code: null attr 0x80410711 (0x0200F520),
+ * attr & 7 0x80410710 (0x0200F538), nSpus 0 0x80410702 (0x0200F554), no
+ * priority[i] == 1 below nSpus 0x80410702 (0x0200F594), maxSpu 0 0x80410702
+ * (0x0200F594 via 0x0200F5A0), nSpus 1 0x80410709 (0x0200F5A8), exitIfNoWork
+ * set 0x80410709 (0x0200F5BC, reads +0x14), already enabled 0x8041070A
+ * (0x0200F5D8, flag bit 0x02000000 at +0x28). All ori immediates are 0x7xx,
+ * the core family. On success it sets that flag,
+ * copies the 8 priority bytes to +0x38, and stores maxSpu at +0x40 and the
+ * isPreemptible bitmask over the first nSpus entries at +0x44
+ * (0x0200F5E0..0x0200F65C). Like the firmware, priority is dereferenced
+ * without a null check: a null EA reads the zero page and fails the
+ * priority check. */
+#define SPURS_SAF_SYSTEM_WORKLOAD_ENABLED 0x02000000u
 s32 cellSpursAttributeEnableSystemWorkload(u64 attr_ea, u64 priority_ea, u32 maxSpu,
                                            u64 preemptible_ea)
 {
-    (void)maxSpu; (void)preemptible_ea;
-    if (!attr_ea || !priority_ea) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
+    if (!attr_ea) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
     if (attr_ea & 7u) return CELL_SPURS_CORE_ERROR_ALIGN;
+    CellSpursAttribute* attr = GUEST_PTR((void*)(uintptr_t)attr_ea, CellSpursAttribute*);
+    const u8* priority = GUEST_PTR((const void*)(uintptr_t)priority_ea, const u8*);
+    const u8* preemptible = GUEST_PTR((const void*)(uintptr_t)preemptible_ea, const u8*);
+
+    if (!attr->nSpus) return CELL_SPURS_CORE_ERROR_INVAL;
+    int found = 0;
+    for (u32 i = 0; i < attr->nSpus && i < CELL_SPURS_MAX_SPU; i++)
+        if (priority[i] == 1) { found = 1; break; }
+    if (!found) return CELL_SPURS_CORE_ERROR_INVAL;
+    if (!maxSpu) return CELL_SPURS_CORE_ERROR_INVAL;
+    if (attr->nSpus == 1) return CELL_SPURS_CORE_ERROR_PERM;
+    if (attr->exitIfNoWork) return CELL_SPURS_CORE_ERROR_PERM;
+    if (attr->flags & SPURS_SAF_SYSTEM_WORKLOAD_ENABLED) return CELL_SPURS_CORE_ERROR_BUSY;
+
+    attr->flags |= SPURS_SAF_SYSTEM_WORKLOAD_ENABLED;
+    for (int i = 0; i < 8; i++) attr->swlPriority[i] = priority[i];
+    attr->swlMaxSpu = maxSpu;
+    u32 preem = 0;
+    for (u32 i = 0; i < attr->nSpus && i < 32; i++)
+        if (preemptible[i]) preem |= 1u << i;
+    attr->swlIsPreem = preem;
     return CELL_OK;
 }
 
@@ -806,9 +888,14 @@ s32 cellSpursGetNumSpuThread(const CellSpurs* spurs, u32* nThreads)
     return CELL_OK;
 }
 
-/* The instance keeps maxContention in one byte and no workload can occupy more
- * than CELL_SPURS_MAX_SPU SPUs, so larger values clamp: a bare (u8) cast turned
- * 256 into 0. */
+/* The instance keeps maxContention in one byte as nibble pairs and the
+ * firmware clamps a larger value to 8, it does not reject it: libsre 4.81
+ * 0x02009028 loads 8 and 0x02009050 keeps min(maxContention, 8) (the store
+ * nibble at 0x02009034 shifts by (3-(wid&3))*4 with the word selected by
+ * wid & 0xC, which wkl_count_set models). The CELL_SPURS_CORE_ERROR_INVAL
+ * contract of this call is the workload id: 0x02008FBC..0x02008FE0 bound the
+ * id by the 32-workload flag (flags1 bit 0x40 at +0x74) -- 16 on a CellSpurs,
+ * 32 on a CellSpurs2 -- before the store. */
 static u32 spurs_clamp_contention(u32 c)
 {
     return c > CELL_SPURS_MAX_SPU ? CELL_SPURS_MAX_SPU : c;
@@ -817,13 +904,24 @@ static u32 spurs_clamp_contention(u32 c)
 s32 cellSpursSetMaxContention(CellSpurs* spurs, CellSpursWorkloadId wid,
                               u32 maxContention)
 {
+    /* fw libsre 4.81 0x02008F88: null 0x80410711 (0x02008F90), & 0x7F
+     * 0x80410710 (0x02008FA8), then the id bound 0x80410702, the enabled mask
+     * at +0xB0 0x80410705 (0x02008FE4..0x02009000) and the exception word at
+     * +0xD6C 0x8041070F (0x02009004) before the store. All ori immediates
+     * here are 0x7xx, the core family. */
     if (!spurs) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
-    if (wid >= SPURS_MAX_WID) return CELL_SPURS_CORE_ERROR_INVAL;
+    if (((u32)(uintptr_t)spurs) & 0x7Fu) return CELL_SPURS_CORE_ERROR_ALIGN;
     struct SpursInst* si;
     s32 rc = spurs_api_lock((u32)(uintptr_t)spurs, &si);
     if (rc) return rc;
+    if (wid >= (si->is2 ? SPURS_MAX_WID : 16u)) {
+        spurs_api_unlock(si); return CELL_SPURS_CORE_ERROR_INVAL;
+    }
     if (!s_workloads[wid].in_use || s_workloads[wid].spurs_ea != si->ea) {
         spurs_api_unlock(si); return CELL_SPURS_CORE_ERROR_SRCH;
+    }
+    if (vm_read32(si->ea + SPURS_WKL_EXCEPTION)) {
+        spurs_api_unlock(si); return CELL_SPURS_CORE_ERROR_STAT;
     }
 
     maxContention = spurs_clamp_contention(maxContention);
@@ -1065,11 +1163,13 @@ s32 cellSpursCreateTasksetWithAttribute(CellSpurs* spurs,
                                 attr_h->args, NULL, 0, size);
 }
 
-/* CellSpursTasksetAttribute2 (128 bytes, big-endian in guest memory):
+/* CellSpursTasksetAttribute2 (512 bytes, big-endian in guest memory):
  * +0x00 revision u32, +0x04 name char*, +0x08 args u64, +0x10 priority u8[8],
- * +0x18 maxContention u32, +0x1C enableClearLs s32, +0x20 taskNameBuffer. */
+ * +0x18 maxContention u32, +0x1C enableClearLs s32, +0x20 taskNameBuffer.
+ * The export that fills it clears 0x200 bytes (libsre 4.81 0x0201486C) and
+ * RPCS3's CellSpursTasksetAttribute2 is CHECK_SIZE'd 512. */
 enum {
-    TS2ATTR_SIZE        = 0x80,
+    TS2ATTR_SIZE        = 0x200,
     TS2ATTR_REVISION    = 0x00,
     TS2ATTR_ARGS        = 0x08,
     TS2ATTR_PRIORITY    = 0x10,
@@ -1080,6 +1180,9 @@ enum {
 
 s32 _cellSpursTasksetAttribute2Initialize(u64 attr_ea, u32 revision)
 {
+    /* fw libsre 4.81 0x02014858: null attr 0x80410911, clears 0x200 bytes,
+     * stores the revision at +0x00, the eight priority bytes at +0x10 set to 1
+     * and maxContention 8 at +0x18; everything else stays zero. */
     if (!attr_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
     if (!spurs_guest_range_valid((u32)attr_ea, TS2ATTR_SIZE))
         ps3_stop_guest_range("_cellSpursTasksetAttribute2Initialize", "attr", attr_ea,
@@ -1095,8 +1198,20 @@ s32 _cellSpursTasksetAttribute2Initialize(u64 attr_ea, u32 revision)
  * a null attr means the defaults above. */
 s32 cellSpursCreateTaskset2(CellSpurs* spurs, CellSpursTaskset* taskset, u64 attr_ea)
 {
+    /* The argument checks live in the shared creator libsre 4.81 0x02014A58:
+     * null spurs 0x80410911 (0x02014A5C), null taskset 0x80410911
+     * (0x02014B08), spurs & 0x7F 0x80410910 (0x02014B10), taskset & 0x7F
+     * 0x80410910 (0x02014B2C). The task-name buffer alignment check is
+     * CreateTaskset2's own: attr + 0x20 & 0xF answers 0x80410910 after a
+     * successful creation (0x020152D0); this checks it first, which answers
+     * the same code without creating a taskset the firmware would leave
+     * behind. */
     u64 args = 0;
     u32 maxContention = 8;
+    u32 spurs_ea = (u32)(uintptr_t)spurs;
+    if (!spurs_ea || !(u32)(uintptr_t)taskset) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    if (spurs_ea & 0x7Fu) return CELL_SPURS_TASK_ERROR_ALIGN;
+    if (((u32)(uintptr_t)taskset) & 0x7Fu) return CELL_SPURS_TASK_ERROR_ALIGN;
     if (attr_ea) {
         if (!spurs_guest_range_valid((u32)attr_ea, TS2ATTR_SIZE))
             ps3_stop_guest_range("cellSpursCreateTaskset2", "attr", attr_ea,
@@ -1105,7 +1220,6 @@ s32 cellSpursCreateTaskset2(CellSpurs* spurs, CellSpursTaskset* taskset, u64 att
         maxContention = vm_read32((u32)attr_ea + TS2ATTR_MAX_CONT);
         if (vm_read32((u32)attr_ea + TS2ATTR_NAME_BUF) & 0xFu) return CELL_SPURS_TASK_ERROR_ALIGN;
     }
-    if (((u32)(uintptr_t)taskset) & 0x7Fu) return CELL_SPURS_TASK_ERROR_ALIGN;
     s32 rc = spurs_create_taskset("cellSpursCreateTaskset2", spurs, taskset, args, NULL,
                                   maxContention, SPURS_TASKSET2_SIZE);
     if (rc == CELL_OK) {
@@ -1622,9 +1736,11 @@ enum {
 
 s32 _cellSpursTaskAttribute2Initialize(u64 attr_ea, u32 revision)
 {
+    /* fw libsre 4.81 0x02010C0C: null attr 0x80410911, clears 0x100 bytes and
+     * stores the revision at +0x00; the span below is what the clear touches. */
     if (!attr_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
-    if (!spurs_guest_range_valid((u32)attr_ea, 0x24))
-        ps3_stop_guest_range("_cellSpursTaskAttribute2Initialize", "attr", attr_ea, 0x24,
+    if (!spurs_guest_range_valid((u32)attr_ea, 0x100))
+        ps3_stop_guest_range("_cellSpursTaskAttribute2Initialize", "attr", attr_ea, 0x100,
                              vm_guest_limit());
     vm_write32((u32)attr_ea + TASK2ATTR_REVISION, revision);
     vm_write32((u32)attr_ea + TASK2ATTR_SIZE_CTX, 0);
@@ -1645,12 +1761,34 @@ s32 _cellSpursTaskAttribute2Initialize(u64 attr_ea, u32 revision)
 s32 cellSpursCreateTask2(CellSpursTaskset* taskset, u64 id_ea, u64 elf_ea,
                          u64 argument_ea, u64 attr_ea)
 {
-    if (!taskset || !id_ea || !elf_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
-    u32 context_ea = 0, size_context = 0, ls_pattern_ea = 0;
+    /* fw libsre 4.81 0x02011F60, in order: null task id 0x80410911
+     * (0x02011F60), null taskset 0x80410911 (0x02011FE0), taskset & 0x7F
+     * 0x80410910 (0x02011FE8), attr revision at +0x00 non-zero 0x80410902
+     * (0x02012014, the null-attr default fills revision 0 via
+     * _cellSpursTaskAttribute2Initialize 0x020121BC). Then the taskset gates:
+     * a size field at +0x1890 of 0x28FF or less (a Taskset1) and a taskset
+     * whose event flag ids at +0x1898/+0x189C are both zero answer
+     * 0x80410909 (0x02012028..0x020121E0). A taskset whose header span this
+     * host cannot back is a stop, never a fabricated code. */
+    u32 ts_ea = (u32)(uintptr_t)taskset;
+    if (!id_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    if (!ts_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+    if (ts_ea & 0x7Fu) return CELL_SPURS_TASK_ERROR_ALIGN;
+    if (!spurs_guest_range_valid(ts_ea, CSTS_EVENT_FLAG_ID2 + 4u))
+        ps3_stop_guest_range("cellSpursCreateTask2", "taskset", ts_ea,
+                             CSTS_EVENT_FLAG_ID2 + 4u, vm_guest_limit());
     if (attr_ea) {
         if (!spurs_guest_range_valid((u32)attr_ea, 0x24))
             ps3_stop_guest_range("cellSpursCreateTask2", "attr", attr_ea, 0x24,
                                  vm_guest_limit());
+        if (vm_read32((u32)attr_ea + TASK2ATTR_REVISION) != 0)
+            return CELL_SPURS_TASK_ERROR_INVAL;
+    }
+    if (vm_read32(ts_ea + CSTS_SIZE_FIELD) <= 0x28FFu ||
+        (!vm_read32(ts_ea + CSTS_EVENT_FLAG_ID1) && !vm_read32(ts_ea + CSTS_EVENT_FLAG_ID2)))
+        return CELL_SPURS_TASK_ERROR_PERM;
+    u32 context_ea = 0, size_context = 0, ls_pattern_ea = 0;
+    if (attr_ea) {
         size_context  = vm_read32((u32)attr_ea + TASK2ATTR_SIZE_CTX);
         context_ea    = (u32)vm_read64((u32)attr_ea + TASK2ATTR_EA_CTX);
         ls_pattern_ea = (u32)attr_ea + TASK2ATTR_LS_PAT;
@@ -1968,22 +2106,35 @@ s32 cellSpursGetWorkloadFlag(u64 spurs_ea, u64 flag_pp)
  * the workload a raised flag makes ready. One receiver at a time. */
 s32 _cellSpursWorkloadFlagReceiver(u64 spurs_ea, u32 wid, u32 is_set)
 {
+    /* fw libsre 4.81 0x0200F260, in order: null spurs 0x80410811
+     * (0x0200F268), spurs & 0x7F 0x80410810 (0x0200F27C), wid past the
+     * 32-workload bound (flags1 bit 0x40 at +0x74: 16 on a CellSpurs, 32 on a
+     * CellSpurs2) 0x80410802 (0x0200F294..0x0200F2B8), enabled mask at +0xB0
+     * 0x80410805 (0x0200F2BC), exception word at +0xD6C 0x8041080F
+     * (0x0200F2DC), then under a reservation on the flag word: is_set with a
+     * receiver already named 0x8041080A (0x0200F394), clear with a receiver
+     * that is not wid 0x80410809 (0x0200F388), success writing 0xFFFFFFFF to
+     * the flag word at +0x6C and the receiver byte at +0x77 (0x0200F31C). */
     u32 ea = (u32)spurs_ea;
-    if (!ea) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
-    if (ea & 0x7Fu) return CELL_SPURS_CORE_ERROR_ALIGN;
-    /* The enabled mask, the flag word and its receiver byte are read and written at this EA (the title's SPURS
-     * instance, not necessarily one this HLE initialised): the span up to the mask is bounded before any of them. */
-    if (!spurs_guest_range_valid(ea, SPURS_WKL_ENABLED + 4u))
-        ps3_stop_guest_range("_cellSpursWorkloadFlagReceiver", "spurs", ea, SPURS_WKL_ENABLED + 4u, vm_guest_limit());
-    const struct SpursInst* si = spurs_inst_find(ea);
-    if (wid >= (si && si->is2 ? SPURS_MAX_WID : 16u)) return CELL_SPURS_CORE_ERROR_INVAL;
+    if (!ea) return CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER;
+    if (ea & 0x7Fu) return CELL_SPURS_POLICY_MODULE_ERROR_ALIGN;
+    /* The instance bytes from the 32-workload flag to the exception word, the
+     * flag word and its receiver byte are read and written at this EA (the
+     * title's SPURS instance, not necessarily one this HLE initialised): the
+     * whole span is bounded before any of them. */
+    if (!spurs_guest_range_valid(ea, SPURS_WKL_EXCEPTION + 4u))
+        ps3_stop_guest_range("_cellSpursWorkloadFlagReceiver", "spurs", ea, SPURS_WKL_EXCEPTION + 4u, vm_guest_limit());
+    if (wid >= (vm_read8(ea + SPURS_FLAGS1) & SPURS_SF1_32_WORKLOADS ? SPURS_MAX_WID : 16u))
+        return CELL_SPURS_POLICY_MODULE_ERROR_INVAL;
     if (!(vm_read32(ea + SPURS_WKL_ENABLED) & (0x80000000u >> wid)))
-        return CELL_SPURS_CORE_ERROR_SRCH;
+        return CELL_SPURS_POLICY_MODULE_ERROR_SRCH;
+    if (vm_read32(ea + SPURS_WKL_EXCEPTION))
+        return CELL_SPURS_POLICY_MODULE_ERROR_STAT;
     s32 rc = CELL_OK;
     spu_lockline_lock();
     u8 receiver = vm_read8(ea + SPURS_WKL_FLAG_RECV);
     if (is_set ? receiver != 0xFF : receiver != wid) {
-        rc = is_set ? CELL_SPURS_CORE_ERROR_BUSY : CELL_SPURS_CORE_ERROR_PERM;
+        rc = is_set ? CELL_SPURS_POLICY_MODULE_ERROR_BUSY : CELL_SPURS_POLICY_MODULE_ERROR_PERM;
     } else {
         ef_w32(ea + SPURS_WKL_FLAG_WORD, 0xFFFFFFFFu);
         *(vm_base + ea + SPURS_WKL_FLAG_RECV) = is_set ? (u8)wid : 0xFF;
@@ -3615,14 +3766,36 @@ s32 cellSpursQueuePushBody(u64 queue_ea, u64 data_ea, u32 isBlocking)
  * kernel reads (SPURS_WKL_IDLE2). */
 s32 cellSpursRequestIdleSpu(u64 spurs_ea, u64 wid64, u64 count64)
 {
+    /* fw libsre 4.81 0x0200AE80, in order: null spurs 0x80410811
+     * (0x0200AE8C), spurs & 0x7F 0x80410810 (0x0200AE9C), the 32-workload
+     * flag (flags1 bit 0x40 at +0x74) 0x8041080F (0x0200AEB0) -- the idle
+     * byte array does not exist on a CellSpurs2, whose bytes at +0x10 are the
+     * second set's ready counts -- wid > 15 0x80410802 (0x0200AED0), count > 8
+     * 0x80410802 (0x0200AEE4), enabled mask at +0xB0 0x80410805
+     * (0x0200AEEC..0x0200AF08), exception word at +0xD6C 0x8041080F
+     * (0x0200AF0C). The store is a byte at spurs + 0x10 + wid (0x0200AF24).
+     * Every ori immediate here is 0x8xx: this API answers in the policy
+     * module family, unlike SetMaxContention next to it (0x7xx, core). */
     const u32 wid = (u32)wid64, count = (u32)count64;
-    if (!spurs_ea) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
-    if (wid >= CELL_SPURS_MAX_WORKLOAD) return CELL_SPURS_CORE_ERROR_INVAL;
+    if (!spurs_ea) return CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER;
+    if (spurs_ea & 0x7Fu) return CELL_SPURS_POLICY_MODULE_ERROR_ALIGN;
     struct SpursInst* si;
     s32 rc = spurs_api_lock((u32)spurs_ea, &si);
     if (rc) return rc;
+    if (si->is2) {
+        spurs_api_unlock(si); return CELL_SPURS_POLICY_MODULE_ERROR_STAT;
+    }
+    if (wid >= CELL_SPURS_MAX_WORKLOAD) {
+        spurs_api_unlock(si); return CELL_SPURS_POLICY_MODULE_ERROR_INVAL;
+    }
+    if (count > 8) {
+        spurs_api_unlock(si); return CELL_SPURS_POLICY_MODULE_ERROR_INVAL;
+    }
     if (!s_workloads[wid].in_use || s_workloads[wid].spurs_ea != si->ea) {
-        spurs_api_unlock(si); return CELL_SPURS_CORE_ERROR_SRCH;   /* same as SetMaxContention */
+        spurs_api_unlock(si); return CELL_SPURS_POLICY_MODULE_ERROR_SRCH;
+    }
+    if (vm_read32(si->ea + SPURS_WKL_EXCEPTION)) {
+        spurs_api_unlock(si); return CELL_SPURS_POLICY_MODULE_ERROR_STAT;
     }
     vm_write8(si->ea + SPURS_WKL_IDLE2 + wid, (u8)count);
     static int _n = 0;

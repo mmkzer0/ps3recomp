@@ -62,7 +62,7 @@ s32 cellSailInit(void)
 {
     printf("[cellSail] Init()\n");
     if (s_initialized)
-        return (s32)CELL_SAIL_ERROR_ALREADY_INITIALIZED;
+        return (s32)CELL_SAIL_ERROR_INVALID_STATE;
     memset(s_players, 0, sizeof(s_players));
     s_initialized = 1;
     return CELL_OK;
@@ -86,8 +86,11 @@ s32 cellSailPlayerCreate(const CellSailPlayerAttribute* attr,
     (void)attr; (void)resource;
     printf("[cellSail] PlayerCreate()\n");
 
-    if (!s_initialized) return (s32)CELL_SAIL_ERROR_NOT_INITIALIZED;
-    if (!handle) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    /* State guards answer the family's invalid-state code; RPCS3's sail
+     * guards return CELL_SAIL_ERROR_INVALID_STATE for init/registration
+     * problems (cellSail.cpp cellSailSoundAdapterInitialize and friends). */
+    if (!s_initialized) return (s32)CELL_SAIL_ERROR_INVALID_STATE;
+    if (!handle) return (s32)CELL_SAIL_ERROR_INVALID_ARG;
 
     for (int i = 0; i < CELL_SAIL_PLAYER_MAX; i++) {
         if (!s_players[i].in_use) {
@@ -100,7 +103,7 @@ s32 cellSailPlayerCreate(const CellSailPlayerAttribute* attr,
             return CELL_OK;
         }
     }
-    return (s32)CELL_SAIL_ERROR_OUT_OF_MEMORY;
+    return (s32)CELL_SAIL_ERROR_MEMORY;
 }
 
 s32 cellSailPlayerDestroy(CellSailPlayerHandle handle)
@@ -108,7 +111,7 @@ s32 cellSailPlayerDestroy(CellSailPlayerHandle handle)
     printf("[cellSail] PlayerDestroy(%u)\n", handle);
     const int _sp = sail_player_slot((u32)handle);
     if (_sp < 0)
-        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+        return (s32)CELL_SAIL_ERROR_INVALID_ARG;
     s_sail_players[_sp].in_use = 0;
     s_sail_players[_sp].state = CELL_SAIL_PLAYER_STATE_CLOSED;
     return CELL_OK;
@@ -158,7 +161,7 @@ s32 cellSailPlayerBoot(CellSailPlayerHandle handle, u64 userParam)
     printf("[cellSail] PlayerBoot(%u)\n", handle);
     const int _sp = sail_player_slot((u32)handle);
     if (_sp < 0)
-        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+        return (s32)CELL_SAIL_ERROR_INVALID_ARG;
     s_sail_players[_sp].state = CELL_SAIL_PLAYER_STATE_RUNNING;
     sail_call(_sp, SAIL_CALL_BOOT, SAIL_ST_BOOT_TRANSITION, SAIL_ST_CLOSED, userParam);
     return CELL_OK;
@@ -184,7 +187,7 @@ s32 cellSailPlayerOpenStream(CellSailPlayerHandle handle, const char* path)
            path ? path_host : "null");
     const int _sp = sail_player_slot((u32)handle);
     if (_sp < 0)
-        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+        return (s32)CELL_SAIL_ERROR_INVALID_ARG;
     /* Stub: don't actually open anything */
     sail_call(_sp, SAIL_CALL_OPEN_STREAM, SAIL_ST_OPEN_TRANSITION, SAIL_ST_OPENED, 0);
     return CELL_OK;
@@ -194,7 +197,7 @@ s32 cellSailPlayerCloseStream(CellSailPlayerHandle handle)
 {
     const int _sp = sail_player_slot((u32)handle);
     if (_sp < 0)
-        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+        return (s32)CELL_SAIL_ERROR_INVALID_ARG;
     sail_call(_sp, SAIL_CALL_CLOSE_STREAM, SAIL_ST_CLOSE_TRANSITION, SAIL_ST_CLOSED, 0);
     return CELL_OK;
 }
@@ -204,7 +207,7 @@ s32 cellSailPlayerStart(CellSailPlayerHandle handle)
     printf("[cellSail] PlayerStart(%u)\n", handle);
     const int _sp = sail_player_slot((u32)handle);
     if (_sp < 0)
-        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+        return (s32)CELL_SAIL_ERROR_INVALID_ARG;
     s_sail_players[_sp].state = CELL_SAIL_PLAYER_STATE_RUNNING;
     /* Immediately signal finished since we don't play anything */
     s_sail_players[_sp].state = CELL_SAIL_PLAYER_STATE_FINISHED;
@@ -222,7 +225,7 @@ s32 cellSailPlayerStop(CellSailPlayerHandle handle)
     printf("[cellSail] PlayerStop(%u)\n", handle);
     const int _sp = sail_player_slot((u32)handle);
     if (_sp < 0)
-        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+        return (s32)CELL_SAIL_ERROR_INVALID_ARG;
     s_sail_players[_sp].state = CELL_SAIL_PLAYER_STATE_FINISHED;
     sail_call(_sp, SAIL_CALL_STOP, SAIL_ST_STOP_TRANSITION, SAIL_ST_OPENED, 0);
     return CELL_OK;
@@ -232,7 +235,7 @@ s32 cellSailPlayerPause(CellSailPlayerHandle handle)
 {
     const int _sp = sail_player_slot((u32)handle);
     if (_sp < 0)
-        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+        return (s32)CELL_SAIL_ERROR_INVALID_ARG;
     s_sail_players[_sp].state = CELL_SAIL_PLAYER_STATE_PAUSE;
     return CELL_OK;
 }
@@ -241,8 +244,8 @@ s32 cellSailPlayerGetState(CellSailPlayerHandle handle, s32* state)
 {
     const int _sp = sail_player_slot((u32)handle);
     if (_sp < 0)
-        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
-    if (!state) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+        return (s32)CELL_SAIL_ERROR_INVALID_ARG;
+    if (!state) return (s32)CELL_SAIL_ERROR_INVALID_ARG;
     vm_write32((u32)(uintptr_t)state, (u32)s_sail_players[_sp].state);
     return CELL_OK;
 }
@@ -251,8 +254,8 @@ s32 cellSailPlayerGetStreamNum(CellSailPlayerHandle handle, u32* streamNum)
 {
     const int _sp = sail_player_slot((u32)handle);
     if (_sp < 0)
-        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
-    if (!streamNum) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+        return (s32)CELL_SAIL_ERROR_INVALID_ARG;
+    if (!streamNum) return (s32)CELL_SAIL_ERROR_INVALID_ARG;
     vm_write32((u32)(uintptr_t)streamNum, 0);   /* no streams in stub */
     return CELL_OK;
 }
@@ -263,9 +266,12 @@ s32 cellSailPlayerGetStreamInfo(CellSailPlayerHandle handle, u32 streamIndex,
     (void)streamIndex;
     const int _sp = sail_player_slot((u32)handle);
     if (_sp < 0)
-        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
-    if (!info) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
-    return (s32)CELL_SAIL_ERROR_NOT_FOUND;
+        return (s32)CELL_SAIL_ERROR_INVALID_ARG;
+    if (!info) return (s32)CELL_SAIL_ERROR_INVALID_ARG;
+    /* No streams exist in this stub and the family has no evidenced
+     * "not found" code at the pinned oracle (RPCS3 cellSail.h has none), so
+     * the v0.19.0 value is kept: unverified (#127). */
+    return (s32)0x80610706u;
 }
 
 /* r3 is a CellSailPlayer* -- a GUEST POINTER, the same `pSelf` that
@@ -285,7 +291,7 @@ s32 cellSailPlayerSetSoundAdapter(CellSailPlayerHandle handle, u32 index, void* 
     for (int i = 0; i < CELL_SAIL_PLAYER_MAX; i++)
         if (s_sail_players[i].in_use && s_sail_players[i].self_ea == self_ea)
             return CELL_OK;
-    return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    return (s32)CELL_SAIL_ERROR_INVALID_ARG;
 }
 
 /* r3 is a CellSailPlayer* -- a GUEST POINTER, the same `pSelf` that
@@ -305,14 +311,14 @@ s32 cellSailPlayerSetGraphicsAdapter(CellSailPlayerHandle handle, u32 index, voi
     for (int i = 0; i < CELL_SAIL_PLAYER_MAX; i++)
         if (s_sail_players[i].in_use && s_sail_players[i].self_ea == self_ea)
             return CELL_OK;
-    return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    return (s32)CELL_SAIL_ERROR_INVALID_ARG;
 }
 
 s32 cellSailPlayerCancel(CellSailPlayerHandle handle)
 {
     const int _sp = sail_player_slot((u32)handle);
     if (_sp < 0)
-        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+        return (s32)CELL_SAIL_ERROR_INVALID_ARG;
     s_sail_players[_sp].state = CELL_SAIL_PLAYER_STATE_FINISHED;
     return CELL_OK;
 }
@@ -331,7 +337,7 @@ s32 cellSailPlayerSetRepeatMode(CellSailPlayerHandle handle, s32 repeatMode, voi
     printf("[cellSail] SetRepeatMode(%u, %d)\n", handle, repeatMode);
     const int _sp = sail_player_slot((u32)handle);
     if (_sp < 0)
-        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+        return (s32)CELL_SAIL_ERROR_INVALID_ARG;
     /* Real ABI returns the (now-set) repeat mode in r3, not an error code. */
     return repeatMode;
 }
@@ -378,7 +384,7 @@ s32 cellSailPlayerCreateDescriptor(CellSailPlayerHandle handle,
 
     printf("[cellSail] CreateDescriptor(player=%u, type=%d, uri=\"%s\")\n", handle,
            streamType, uri ? uri_host : "null");
-    if (!desc) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    if (!desc) return (s32)CELL_SAIL_ERROR_INVALID_ARG;
 
     for (int i = 0; i < MAX_DESCRIPTORS; i++) {
         if (!s_descs[i].in_use) {
@@ -391,7 +397,7 @@ s32 cellSailPlayerCreateDescriptor(CellSailPlayerHandle handle,
             return CELL_OK;
         }
     }
-    return (s32)CELL_SAIL_ERROR_OUT_OF_MEMORY;
+    return (s32)CELL_SAIL_ERROR_MEMORY;
 }
 
 s32 cellSailPlayerDestroyDescriptor(CellSailPlayerHandle handle,
@@ -399,7 +405,7 @@ s32 cellSailPlayerDestroyDescriptor(CellSailPlayerHandle handle,
 {
     (void)handle;
     if (desc >= MAX_DESCRIPTORS || !s_descs[desc].in_use)
-        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+        return (s32)CELL_SAIL_ERROR_INVALID_ARG;
     s_descs[desc].in_use = 0;
     return CELL_OK;
 }
@@ -410,7 +416,7 @@ s32 cellSailPlayerAddDescriptor(CellSailPlayerHandle handle,
     (void)handle;
     printf("[cellSail] AddDescriptor(player=%u, desc=%u)\n", handle, desc);
     if (desc >= MAX_DESCRIPTORS || !s_descs[desc].in_use)
-        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+        return (s32)CELL_SAIL_ERROR_INVALID_ARG;
     return CELL_OK;
 }
 
@@ -419,7 +425,7 @@ s32 cellSailPlayerRemoveDescriptor(CellSailPlayerHandle handle,
 {
     (void)handle;
     if (desc >= MAX_DESCRIPTORS || !s_descs[desc].in_use)
-        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+        return (s32)CELL_SAIL_ERROR_INVALID_ARG;
     return CELL_OK;
 }
 
@@ -429,21 +435,21 @@ s32 cellSailDescriptorCreateDatabase(CellSailDescriptorHandle desc,
     (void)dbAddr; (void)dbSize; (void)arg;
     printf("[cellSail] DescriptorCreateDatabase(desc=%u)\n", desc);
     if (desc >= MAX_DESCRIPTORS || !s_descs[desc].in_use)
-        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+        return (s32)CELL_SAIL_ERROR_INVALID_ARG;
     return CELL_OK;
 }
 
 s32 cellSailDescriptorDestroyDatabase(CellSailDescriptorHandle desc)
 {
     if (desc >= MAX_DESCRIPTORS || !s_descs[desc].in_use)
-        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+        return (s32)CELL_SAIL_ERROR_INVALID_ARG;
     return CELL_OK;
 }
 
 s32 cellSailDescriptorGetStreamType(CellSailDescriptorHandle desc, s32* type)
 {
     if (desc >= MAX_DESCRIPTORS || !s_descs[desc].in_use || !type)
-        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+        return (s32)CELL_SAIL_ERROR_INVALID_ARG;
     vm_write32((u32)(uintptr_t)type, (u32)s_descs[desc].streamType);
     return CELL_OK;
 }
@@ -452,14 +458,14 @@ s32 cellSailDescriptorSetAutoSelection(CellSailDescriptorHandle desc, s32 enable
 {
     (void)enable;
     if (desc >= MAX_DESCRIPTORS || !s_descs[desc].in_use)
-        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+        return (s32)CELL_SAIL_ERROR_INVALID_ARG;
     return CELL_OK;
 }
 
 s32 cellSailDescriptorGetUri(CellSailDescriptorHandle desc, char* uri, u32 maxLen)
 {
     if (desc >= MAX_DESCRIPTORS || !s_descs[desc].in_use || !uri)
-        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+        return (s32)CELL_SAIL_ERROR_INVALID_ARG;
     strncpy(GUEST_PTR(uri, char*), s_descs[desc].uri, maxLen - 1);
     uri[maxLen - 1] = '\0';
     return CELL_OK;
@@ -497,7 +503,7 @@ s32 cellSailPlayerInitialize2(u32 pSelf, u32 pAllocator, u32 pCallback,
     (void)pAttribute; (void)pResource;
     printf("[cellSail] PlayerInitialize2(self=0x%08X alloc=0x%08X cb=0x%08X)\n",
            pSelf, pAllocator, pCallback);
-    if (!pSelf) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    if (!pSelf) return (s32)CELL_SAIL_ERROR_INVALID_ARG;
 
     /* PS3_NO_SAIL=1: report that the player cannot be created. On hardware
      * this call spawns the SAIL player's own worker threads, and a title that
@@ -506,7 +512,7 @@ s32 cellSailPlayerInitialize2(u32 pSelf, u32 pAllocator, u32 pCallback,
      * "no video" path instead of deadlocking during setup. */
     if (getenv("PS3_NO_SAIL")) {
         printf("[cellSail] PS3_NO_SAIL -- reporting player creation failure\n");
-        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+        return (s32)CELL_SAIL_ERROR_INVALID_ARG;
     }
 
     sail_zero_guest(pSelf, SAIL_PLAYER_CLEAR);
@@ -530,7 +536,7 @@ s32 cellSailSoundAdapterInitialize(u32 pSelf, u32 pCallbacks, u32 pArg)
 {
     printf("[cellSail] SoundAdapterInitialize(self=0x%08X funcs=0x%08X)\n",
            pSelf, pCallbacks);
-    if (!pSelf) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    if (!pSelf) return (s32)CELL_SAIL_ERROR_INVALID_ARG;
     sail_zero_guest(pSelf, SAIL_ADAPTER_CLEAR);
     return CELL_OK;
 }
@@ -547,7 +553,7 @@ s32 cellSailGraphicsAdapterInitialize(u32 pSelf, u32 pCallbacks, u32 pArg)
     (void)pArg;
     printf("[cellSail] GraphicsAdapterInitialize(self=0x%08X funcs=0x%08X)\n",
            pSelf, pCallbacks);
-    if (!pSelf) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    if (!pSelf) return (s32)CELL_SAIL_ERROR_INVALID_ARG;
     sail_zero_guest(pSelf, SAIL_ADAPTER_CLEAR);
     return CELL_OK;
 }
@@ -561,7 +567,7 @@ s32 cellSailGraphicsAdapterSetPreferredFormat(u32 pSelf, u32 pFormat)
 {
     printf("[cellSail] GraphicsAdapterSetPreferredFormat(self=0x%08X fmt=0x%08X)\n",
            pSelf, pFormat);
-    if (!pSelf) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    if (!pSelf) return (s32)CELL_SAIL_ERROR_INVALID_ARG;
     return CELL_OK;
 }
 
@@ -570,7 +576,11 @@ s32 cellSailMemAllocatorInitialize(CellSailMemAllocator* allocator,
 {
     /* These arguments are guest EAs, not host records. Copy the two callback
      * OPDs by value and preserve the third argument in the twelve-byte record.
-     * Read both callbacks first so overlapping input/output remains safe. */
+     * Read both callbacks first so overlapping input/output remains safe.
+     * Neither oracle answers bad arguments here: libsail is not available
+     * decrypted, and RPCS3's cellSailMemAllocatorInitialize (cellSail.cpp)
+     * stores the callback pointer without any check. The family's
+     * invalid-argument code is kept for them: unverified (#127). */
     const u64 alloc_ea = (u64)(uintptr_t)allocator;
     const u64 funcs_ea = (u64)(uintptr_t)pFuncs;
     extern u32 ppu_vm_size;
@@ -578,7 +588,7 @@ s32 cellSailMemAllocatorInitialize(CellSailMemAllocator* allocator,
     if (!vm_base || !alloc_ea || !funcs_ea || (alloc_ea & 3) || (funcs_ea & 3) ||
         alloc_ea > limit || funcs_ea > limit ||
         12 > limit - alloc_ea || 8 > limit - funcs_ea)
-        return (s32)0x80610701u;
+        return (s32)CELL_SAIL_ERROR_INVALID_ARG;
     const u32 alloc_opd = vm_read32((u32)funcs_ea);
     const u32 free_opd = vm_read32((u32)funcs_ea + 4);
     vm_write32((u32)alloc_ea, alloc_opd);

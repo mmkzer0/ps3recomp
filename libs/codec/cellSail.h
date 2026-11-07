@@ -15,14 +15,23 @@
 extern "C" {
 #endif
 
-/* Error codes */
-#define CELL_SAIL_ERROR_NOT_INITIALIZED       0x80610701
-#define CELL_SAIL_ERROR_ALREADY_INITIALIZED   0x80610702
-#define CELL_SAIL_ERROR_INVALID_ARGUMENT      0x80610703
-#define CELL_SAIL_ERROR_INVALID_STATE         0x80610704
-#define CELL_SAIL_ERROR_NOT_SUPPORTED         0x80610705
-#define CELL_SAIL_ERROR_NOT_FOUND             0x80610706
-#define CELL_SAIL_ERROR_OUT_OF_MEMORY         0x80610707
+/* Error codes. Names and values from RPCS3's cellSail.h enum CellSailError
+ * (libsail is not available decrypted, tier RPCS3): 0x80610701 is the family's
+ * invalid-argument code, 0x80610702 the invalid-state one. The old names
+ * NOT_INITIALIZED/ALREADY_INITIALIZED/INVALID_ARGUMENT on these values had no
+ * provenance (#127). */
+#define CELL_SAIL_ERROR_INVALID_ARG           0x80610701
+#define CELL_SAIL_ERROR_INVALID_STATE         0x80610702
+#define CELL_SAIL_ERROR_UNSUPPORTED_STREAM    0x80610703
+#define CELL_SAIL_ERROR_INDEX_OUT_OF_RANGE    0x80610704
+#define CELL_SAIL_ERROR_EMPTY                 0x80610705
+#define CELL_SAIL_ERROR_FULLED                0x80610706
+#define CELL_SAIL_ERROR_USING                 0x80610707
+#define CELL_SAIL_ERROR_NOT_AVAILABLE         0x80610708
+#define CELL_SAIL_ERROR_CANCEL                0x80610709
+#define CELL_SAIL_ERROR_MEMORY                0x806107F0
+#define CELL_SAIL_ERROR_INVALID_FD            0x806107F1
+#define CELL_SAIL_ERROR_FATAL                 0x806107FF
 
 /* Constants */
 #define CELL_SAIL_PLAYER_MAX    4

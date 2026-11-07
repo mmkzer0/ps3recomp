@@ -164,12 +164,17 @@ s32 sceNpBasicSetPresence(const SceNpBasicPresence* presence)
 s32 sceNpBasicSetPresenceDetails(const void* presence, u32 options)
 {
     /* Retail imports this independently of the older local presence cache.
-     * The exact Basic errors differ from this header's legacy placeholders.
-     * Do not fabricate a successful publication or dereference unused payloads. */
+     * Error answers per RPCS3's sceNpBasicSetPresenceDetails (sceNp.cpp,
+     * tier RPCS3): options outside 1..3 is SCE_NP_BASIC_ERROR_INVALID_ARGUMENT
+     * (0x8002A665) and the presence pointer itself is not checked by the API
+     * at all (the console dereferences it), so this guard's answer has no
+     * oracle: unverified (#127). The runtime cannot publish presence, so the
+     * unavailable answer is the family's SCE_NP_BASIC_ERROR_NOT_SUPPORTED
+     * (0x8002A663, value per RPCS3 sceNp.h). */
     if (!presence || options < 1 || options > 3)
-        return (s32)0x8002a665u; /* SCE_NP_BASIC_ERROR_INVALID_ARGUMENT */
+        return (s32)SCE_NP_BASIC_ERROR_INVALID_ARGUMENT;
     printf("[sceNpBasic] SetPresenceDetails: publishing unavailable (options=%u)\n", options);
-    return (s32)0x8002a663u; /* SCE_NP_BASIC_ERROR_NOT_SUPPORTED */
+    return (s32)SCE_NP_BASIC_ERROR_NOT_SUPPORTED;
 }
 
 s32 sceNpBasicSendMessage(const SceNpOnlineId* to,
