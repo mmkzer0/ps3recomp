@@ -842,6 +842,28 @@ if(PS3RECOMP_BUILD_TESTS)
             target_link_libraries(test_spu_group_lifecycle PRIVATE m Threads::Threads)
             add_test(NAME spu_group_lifecycle COMMAND test_spu_group_lifecycle)
             set_tests_properties(spu_group_lifecycle PROPERTIES LABELS "spu;t0" TIMEOUT 60)
+
+            # #131: group_destroy against a host thread parked at its tail by the PS3_SYNC_TEST_HOOKS hook; `running`
+            # is an acquire/release atomic cleared last. Under the tsan preset a weaker `running` is a reported race.
+            add_executable(test_spu_group_destroy_race
+                runtime/spu/tests/test_spu_group_destroy_race.c)
+            target_include_directories(test_spu_group_destroy_race PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}/include"
+                "${CMAKE_CURRENT_SOURCE_DIR}/runtime"
+                "${CMAKE_CURRENT_SOURCE_DIR}/runtime/syscalls"
+                "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu"
+                "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
+            target_compile_definitions(test_spu_group_destroy_race PRIVATE _GNU_SOURCE PS3_SYNC_TEST_HOOKS)
+            target_compile_options(test_spu_group_destroy_race PRIVATE -UNDEBUG)
+            if(APPLE)
+                target_link_options(test_spu_group_destroy_race PRIVATE "-Wl,-dead_strip")
+            else()
+                target_compile_options(test_spu_group_destroy_race PRIVATE -ffunction-sections -fdata-sections)
+                target_link_options(test_spu_group_destroy_race PRIVATE "-Wl,--gc-sections")
+            endif()
+            target_link_libraries(test_spu_group_destroy_race PRIVATE m Threads::Threads)
+            add_test(NAME spu_group_destroy_race COMMAND test_spu_group_destroy_race)
+            set_tests_properties(spu_group_destroy_race PROPERTIES LABELS "spu;t0;tsan" TIMEOUT 120)
         endif()
         # Report-hold round state, signal-bit synchronization, and concurrent
         # taskset registration in the SPU workload registry.
