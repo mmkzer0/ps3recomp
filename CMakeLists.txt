@@ -1275,7 +1275,7 @@ if(PS3RECOMP_BUILD_TESTS)
     # source and define the host stubs themselves.
     if(UNIX)
         function(ps3recomp_add_hle_check_test name source)
-            add_executable(${name} ${source})
+            add_executable(${name} ${source} ${ARGN})
             target_include_directories(${name} PRIVATE
                 "${CMAKE_CURRENT_SOURCE_DIR}/include")
             # The fixtures compile HLE sources that reach win32_backtrace.h
@@ -1419,6 +1419,11 @@ if(PS3RECOMP_BUILD_TESTS)
             ps3recomp_add_hle_check_test(hle_audio_ring_trace
                 libs/audio/tests/test_audio_ring_trace.c)
             set_tests_properties(hle_audio_ring_trace PROPERTIES LABELS "audio;t0")
+            ps3recomp_add_hle_check_test(test_audio_pace
+                libs/audio/tests/test_audio_pace.c
+                runtime/syscalls/sys_timer.c)
+            set_tests_properties(test_audio_pace PROPERTIES LABELS "audio;t0")
+            target_include_directories(test_audio_pace PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/runtime/syscalls")
             ps3recomp_add_hle_check_test(hle_pad_rumble
                 libs/input/tests/test_pad_rumble.c)
             if(TARGET SDL2::SDL2)

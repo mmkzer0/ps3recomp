@@ -1746,6 +1746,8 @@ static void vk_window_drop(const char* why)
 static void vk_window_open(const char* title)
 {
     if (!vk_env_on("PS3RECOMP_VK_WINDOW")) return;
+    /* SIGINT/SIGTERM stay the host's (see pad_init_backend in cellPad.c); a window close is still SDL_QUIT. */
+    SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
     if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
         VK_LOG("window disabled, continuing headless: SDL video init failed: %s\n", SDL_GetError());
         return;

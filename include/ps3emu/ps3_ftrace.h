@@ -72,7 +72,7 @@ enum ps3_ft_kind {
                               * b = backend queue depth in frames right after queueing
                               * (SDL queued frames; WASAPI padding; 0 if no backend) */
     PS3_FT_AUDIO_PACE  = 19, /* the mixer's pacing wait (sleep or backend wait), never filtered;
-                              * who = 0, a = reason code (1 queue full, 2 clock pacing, 3 backend wait),
+                              * who = 0, a = reason code (1 guard skip, 2 clock wait, 3 backend wait [retired], 4 catch-up/re-anchor),
                               * b = queue depth in frames before the wait */
     PS3_FT_AUDIO_UNDERRUN = 20, /* instant (t0 == t1): queue depth was below one block right before
                               * queueing, never filtered; who = 0,
@@ -143,9 +143,10 @@ enum ps3_ft_kind {
 };
 
 enum ps3_ft_audio_pace_reason {
-    PS3_FT_AUDIO_PACE_QUEUE_FULL   = 1, /* queue above target depth / waiting for room */
-    PS3_FT_AUDIO_PACE_CLOCK        = 2, /* clock pacing (no backend or pacing against clock) */
-    PS3_FT_AUDIO_PACE_BACKEND_WAIT = 3, /* waiting on backend / short sleep when below target depth */
+    PS3_FT_AUDIO_PACE_QUEUE_FULL   = 1, /* guard skip: queue >= HI, skipping period */
+    PS3_FT_AUDIO_PACE_CLOCK        = 2, /* clock wait: pacing against clock deadline */
+    PS3_FT_AUDIO_PACE_BACKEND_WAIT = 3, /* retired (reserved; previously SDL_Delay(1) wait) */
+    PS3_FT_AUDIO_PACE_CATCHUP      = 4, /* guard catch-up / re-anchor: queue < LO or stall re-anchor */
 };
 
 /* selectany (a COMDAT "any": one definition kept, every object sees the same

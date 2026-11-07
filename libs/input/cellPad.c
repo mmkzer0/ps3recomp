@@ -824,6 +824,12 @@ static void pad_init_backend(void)
              * cared. SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=0 in the
              * environment still wins over this. */
             SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+            /* SDL turns SIGINT and SIGTERM into an SDL_QUIT event that no
+             * headless run pumps, so the process outlived both signals
+             * (seen on Linux). Keep the host's own handling; every SDL init
+             * site sets this, whichever runs first. SDL_NO_SIGNAL_HANDLERS=0
+             * in the environment still wins. */
+            SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
             SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
         }
         s_sdl_inited = 1;

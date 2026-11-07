@@ -47,6 +47,14 @@ uint64_t host_monotonic_ns(void);
  * the thread state is the same on both paths. 0 on every other host. */
 uint64_t sys_timer_usleep_precise_count(void);
 
+#ifndef _WIN32
+/* Sleep `ns` on the host for a runtime thread that keeps a cadence. On macOS
+ * it takes the critical timer under the same rule as sys_timer_usleep
+ * (ppu.precise_usleep, 20 us and up) without counting as a guest usleep;
+ * otherwise nanosleep, resumed after a signal. */
+void ps3_host_sleep_ns(uint64_t ns);
+#endif
+
 #ifdef _WIN32
 /* Sub-millisecond timed-wait support for the lv2 sync primitives.
  * SleepConditionVariableCS / WaitForSingleObject floor a timed wait to 1 ms,

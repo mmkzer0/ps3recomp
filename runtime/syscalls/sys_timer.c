@@ -237,6 +237,27 @@ static uint64_t sleep_critical_timer(uint64_t ns)
 #else
 uint64_t sys_timer_usleep_precise_count(void) { return 0; }
 #endif /* __APPLE__ */
+#ifndef _WIN32
+/* Host-side sleep for runtime threads that keep a cadence (the cellAudio mixer).
+ * It takes the same coalescing-free timer as sys_timer_usleep, but it is not a
+ * guest usleep, so it leaves s_precise_usleeps alone. */
+void ps3_host_sleep_ns(uint64_t ns)
+{
+    if (ns == 0) return;
+#ifdef __APPLE__
+    if (ns >= (uint64_t)USLEEP_PRECISE_MIN_US * 1000u && ns <= (uint64_t)USLEEP_PRECISE_MAX_US * 1000u &&
+        precise_usleep_enabled()) {
+        ns = sleep_critical_timer(ns);
+        if (!ns) return;
+    }
+#endif
+    struct timespec ts;
+    ts.tv_sec  = (time_t)(ns / 1000000000u);
+    ts.tv_nsec = (long)(ns % 1000000000u);
+    while (nanosleep(&ts, &ts) < 0 && errno == EINTR) {}
+}
+#endif
+
 
 /* ---------------------------------------------------------------------------
  * sys_timer_usleep
