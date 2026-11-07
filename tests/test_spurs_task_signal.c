@@ -1,5 +1,6 @@
 /* Missing guest-CAS notification must fail the prompt-completion assertion.
  * The waiter, guest PPU atomic primitive, and coherence dispatcher are real. */
+#undef pthread_cond_timedwait_relative_np
 #undef pthread_cond_timedwait
 #include "../runtime/ppu/ppu_memory.h"
 #include "../runtime/memory/reservation.h"   /* resv_lwarx32/resv_stcx32: the guest PPU atomic primitive */
@@ -37,7 +38,11 @@ int signal_test_cond_wait(pthread_cond_t* cv,pthread_mutex_t* lock,const struct 
         atomic_store(&at_wait,1);
         while(!atomic_load(&release_wait)) usleep(100);
     }
+    #ifdef __APPLE__
+    return pthread_cond_timedwait_relative_np(cv,lock,ts);
+    #else
     return pthread_cond_timedwait(cv,lock,ts);
+    #endif
 }
 typedef struct { uint32_t taskset,task; atomic_int entered,done; } waiter;
 static void* wait_main(void* arg)

@@ -18,7 +18,10 @@ with tempfile.TemporaryDirectory(prefix='trophy-registration-') as tmp:
     subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG',
                     '-ffunction-sections', '-fdata-sections', '-I' + str(root / 'include'),
                     str(root / 'libs/network/tests/test_trophy_registration.c'),
-                    str(root / 'libs/system/cellSysutil.c'), *linker,
+                    str(root / 'libs/system/cellSysutil.c'),
+                    str(root / 'runtime/platform/win32_compat.c'),
+                    str(root / 'runtime/platform/host_clock.c'),
+                    str(root / 'runtime/platform/host_wait.c'), *linker,
                     '-o', str(binary)], check=True)
     result = subprocess.run([str(binary)], check=False, timeout=30, capture_output=True, text=True)
     print(result.stdout.strip())

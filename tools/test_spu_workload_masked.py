@@ -17,8 +17,12 @@ with tempfile.TemporaryDirectory(prefix='spu-workload-masked-') as tmp:
     binary = Path(tmp) / 'test'
     # spu_workload.c raises named stops (spurs-task-halt, spurs-dispatch-miss),
     # so the fixture links the named-stop and typed-configuration runtime.
-    spu_fixture_link.build([root / 'runtime/spu/tests/test_spu_workload_masked.c'], binary,
+    spu_fixture_link.build([root / 'runtime/spu/tests/test_spu_workload_masked.c',
+                            root / 'runtime/platform/win32_compat.c',
+                            root / 'runtime/platform/host_clock.c',
+                            root / 'runtime/platform/host_wait.c'], binary,
                            ['-std=gnu17', '-O1', '-UNDEBUG',
                             '-I' + str(root / 'include'), '-I' + str(root / 'runtime'),
-                            '-I' + str(root / 'runtime/spu')], tmp, runtime_c=False)
+                            '-I' + str(root / 'runtime/spu'), '-I' + str(root / 'runtime/platform')], tmp,
+                           runtime_c=False)
     subprocess.run([str(binary)], check=True, timeout=30, cwd=tmp)
