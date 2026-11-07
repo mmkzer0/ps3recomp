@@ -146,7 +146,7 @@ def main(argv=None):
     finally:
         try:
             ftp.quit()
-        except (ftplib.all_errors, OSError):
+        except (*ftplib.all_errors, OSError):
             pass
     return 0
 
