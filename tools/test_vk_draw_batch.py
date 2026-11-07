@@ -51,8 +51,11 @@ def dumps(directory):
 
 def main():
     if len(sys.argv) != 2:
-        print(__doc__)
-        return 2
+        # dev-ci's tool loop runs every tools/test_*.py bare; this one needs the host binary that
+        # ctest (vk_draw_batch) passes, so a bare run is a visible skip, not a failure of the loop.
+        print("SKIP: tools/test_vk_draw_batch.py needs a ps3recomp_host built with "
+              "PS3RECOMP_RSX_VULKAN=ON (ctest vk_draw_batch passes it)")
+        return 0
     host = sys.argv[1]
     with tempfile.TemporaryDirectory(prefix="vk-draw-batch-") as tmp:
         made = []
