@@ -883,8 +883,7 @@ class TestDryRun(unittest.TestCase):
         return out, p, lines
 
     def test_lanes_of_the_interpreter_equal_the_model(self):
-        # the plumbing proof: the interpreter is the model, so every lane of every kind of op (fixed immediate, call
-        # immediate with signed values, no immediate, three operands, doubleword results) is equal
+        # the plumbing proof covers normal lanes; #126 now stops cflts/cfltu at I8 <= 14 before modelled results exist.
         sets = ["lanes=cflts@2:w32:0:100", "lanes=ai:immw:0:200", "lanes=ila:immw:0:100", "lanes=fma:fpool3:0:70",
                 "lanes=a:wrand:0:130", "lanes=fesd:w32e:0:64"]
         out, p, lines = self.lanes_run(sets, "l1")
@@ -894,14 +893,21 @@ class TestDryRun(unittest.TestCase):
         self.assertIn("LANES,cflts@2,w32,0,100,8,0", lines)
         self.assertIn("LANES,fesd,w32e,0,64,0,0", lines)
         self.assertIn("LANES_DONE,ai,immw,0,200", lines)
-        self.assertEqual(sum(l.startswith("LANE,") for l in lines), 100 + 200 + 100 + 70 + 130 + 64)
-        self.assertEqual([l for l in lines if l.startswith("LANES_FAULT")], [])
+        done = [l for l in lines if l.startswith("LANES_DONE,")]
+        faults = [l for l in lines if l.startswith("LANES_FAULT,")]
+        self.assertEqual(len(done), 5)                            # #126 stops only the cflts@2 entry in this config.
+        self.assertEqual(len(faults), 1)
+        self.assertTrue(faults[0].startswith("LANES_FAULT,cflts@2,w32,0,0,"), faults)
+        self.assertEqual(sum(l.startswith("LANE,") for l in lines), 564)  # Its 100 calls stop before a 64-row chunk commits.
         self.assertIn("META,lanes,6", lines)
         rc, text = run_lanes_compare(out)
         self.assertEqual(rc, 0, text)
         for g in lanes_compare.parse_result(out):
             r = lanes_compare.compare_group(scalar_bin(), g)
             self.assertEqual(r.n_input_errors, 0, g.key)         # the immediates, signed ones included, are the generator's
+            if g.status and g.status.startswith("fault:"):
+                self.assertEqual((g.key[0], g.rows), ("cflts@2", []))
+                continue
             self.assertGreater(len(r.lanes), 0)
             if g.op not in ("ai", "ila"):
                 # (a harness older than 742e288d does not cut call immediates to the field the instruction has: its model
@@ -911,12 +917,19 @@ class TestDryRun(unittest.TestCase):
     def test_lanes_conv_cfg_in_the_interpreter(self):
         out, p, lines = self.lanes_run([], "l2", ["--cfg", os.path.join(PROBE, "cfg", "lanes_conv.cfg")])
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertEqual(len([l for l in lines if l.startswith("LANES_DONE,")]), 9)
-        self.assertEqual(sum(l.startswith("LANE,") for l in lines), 6 * 256 + 2 * 64 + 256)
+        done = [l for l in lines if l.startswith("LANES_DONE,")]
+        faults = [l for l in lines if l.startswith("LANES_FAULT,")]
+        self.assertEqual(len(done), 3)                            # #126 stops the six cflts/cfltu I8=0..2 entries.
+        self.assertEqual(len(faults), 6)
+        self.assertEqual({l.split(",")[1] for l in faults},
+                         {"cflts@0", "cflts@1", "cflts@2", "cfltu@0", "cfltu@1", "cfltu@2"})
+        self.assertTrue(all(l.split(",")[4] == "0" for l in faults))
+        self.assertEqual(sum(l.startswith("LANE,") for l in lines), 384)  # Only the two I8=173 controls and fesd publish rows.
         self.assertFalse([k for k in self.hashes(lines)])                       # sweep=0: no hash rows
         rc, text = run_lanes_compare(out)
         self.assertEqual(rc, 0, text)
-        self.assertIn("equal 1024  differ 0", text)
+        self.assertEqual(text.count("equal 256   differ 0"), 2)
+        self.assertIn("equal 512   differ 0", text)
 
     def test_a_lanes_entry_that_faults_costs_that_entry_only(self):
         # puts of the SPU: 1 initial status, 2 "in progress" status, 3 first record chunk: dying there loses entry 1
@@ -998,11 +1011,16 @@ class TestDryRun(unittest.TestCase):
     def test_the_conversion_and_fesd_cfgs_in_the_interpreter(self):
         out, p, lines = self.lanes_run([], "c2", ["--cfg", os.path.join(PROBE, "cfg", "lanes_conv2.cfg")])
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertEqual(len([l for l in lines if l.startswith("LANES_DONE,")]), 16)
-        self.assertEqual(sum(l.startswith("LANE,") for l in lines), 16 * 256)
+        done = [l for l in lines if l.startswith("LANES_DONE,")]
+        faults = [l for l in lines if l.startswith("LANES_FAULT,")]
+        self.assertEqual(len(done), 13)                           # #126 stops cflts@3, cflts@10 and cfltu@3.
+        self.assertEqual(len(faults), 3)
+        self.assertEqual({l.split(",")[1] for l in faults}, {"cflts@3", "cflts@10", "cfltu@3"})
+        self.assertTrue(all(l.split(",")[4] == "0" for l in faults))
+        self.assertEqual(sum(l.startswith("LANE,") for l in lines), 13 * 256)  # Each stopped entry has no committed chunk.
         rc, text = run_lanes_compare(out)
         self.assertEqual(rc, 0, text)
-        self.assertEqual(text.count("equal 1024  differ 0"), 16)
+        self.assertEqual(text.count("equal 1024  differ 0"), 13)  # The remaining I8>=15 entries complete normally.
         out, p, lines = self.lanes_run([], "c3", ["--cfg", os.path.join(PROBE, "cfg", "lanesum_fesd.cfg")])
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual(sum(l.startswith("LANESUM,") for l in lines), 256)
