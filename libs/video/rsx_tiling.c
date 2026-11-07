@@ -4,6 +4,7 @@
  */
 #include "rsx_tiling.h"
 #include "rsx_dispatch.h"                     /* RSX_LOCATION_MAIN */
+#include <stdatomic.h>
 #include "../../runtime/platform/win32_compat.h"
 #include "ps3emu/log_first.h"
 #include <stdio.h>
@@ -13,12 +14,14 @@
  * is IO-mapped in 1 MB pages, and each page is contiguous in guest memory. */
 #define RSX_TILING_PAGE 0x100000u
 
-/* Written from the PPU thread (cellGcmSetTile), read by the FIFO walker and
- * the draw engine. s_rsx_tiles_bound has a bit per bound tile, so a client checks it
- * without the lock while nothing is bound. */
+/* Written from the PPU thread (cellGcmSetTile), read by the FIFO walker and the draw engine. s_rsx_tiles_bound
+ * has a bit per bound tile, so a client checks it without the lock while nothing is bound. Writers are serialised by
+ * the lock and publish the mask with a release store after the tile entry is written; the lock-free readers load it
+ * with acquire. A volatile read was no synchronisation (a data race against the interlocked store), and
+ * whether a reader that skips the lock has seen the entry a bit announces rests on this pair. */
 static rsx_tile s_rsx_tiles[RSX_TILE_COUNT];
 static SRWLOCK s_rsx_tiles_lock = SRWLOCK_INIT;
-static volatile LONG s_rsx_tiles_bound;
+static atomic_uint s_rsx_tiles_bound;
 
 void rsx_tiling_set(u32 index, u32 location, u32 offset, u32 size, u32 pitch, u32 bank)
 {
@@ -29,19 +32,20 @@ void rsx_tiling_set(u32 index, u32 location, u32 offset, u32 size, u32 pitch, u3
     }
     AcquireSRWLockExclusive(&s_rsx_tiles_lock);
     s_rsx_tiles[index] = t;
-    const LONG bit = (LONG)(1u << index);
-    InterlockedExchange(&s_rsx_tiles_bound, t.size ? (s_rsx_tiles_bound | bit) : (s_rsx_tiles_bound & ~bit));
+    const unsigned bit = 1u << index;
+    const unsigned cur = atomic_load_explicit(&s_rsx_tiles_bound, memory_order_relaxed);   /* writers hold the lock */
+    atomic_store_explicit(&s_rsx_tiles_bound, t.size ? (cur | bit) : (cur & ~bit), memory_order_release);
     ReleaseSRWLockExclusive(&s_rsx_tiles_lock);
 }
 
 int rsx_tiling_active(void)
 {
-    return s_rsx_tiles_bound != 0;
+    return atomic_load_explicit(&s_rsx_tiles_bound, memory_order_acquire) != 0;
 }
 
 int rsx_tiling_find(u32 location, u32 offset, u32 len, rsx_tile* out)
 {
-    if (location != RSX_LOCATION_MAIN || !len || !s_rsx_tiles_bound) return 0;
+    if (location != RSX_LOCATION_MAIN || !len || !atomic_load_explicit(&s_rsx_tiles_bound, memory_order_acquire)) return 0;
     const u64 end = (u64)offset + len;
     int found = 0;
     AcquireSRWLockShared(&s_rsx_tiles_lock);

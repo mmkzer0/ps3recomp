@@ -715,6 +715,18 @@ if(PS3RECOMP_BUILD_TESTS)
             add_test(NAME ${_t} COMMAND test_${_t})
             set_tests_properties(${_t} PROPERTIES LABELS "hle;t0" TIMEOUT 60)
         endforeach()
+
+        # #131: the RSX tile mask read lock-free by the walker, against two threads binding tiles. rsx_tiling.c is
+        # a unit of its own; the test links it. `tsan` runs it under ThreadSanitizer.
+        add_executable(test_rsx_tiling_threads
+            libs/video/tests/test_rsx_tiling_threads.c
+            libs/video/rsx_tiling.c)
+        target_include_directories(test_rsx_tiling_threads PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
+        target_compile_options(test_rsx_tiling_threads PRIVATE -UNDEBUG)
+        target_link_libraries(test_rsx_tiling_threads PRIVATE Threads::Threads)
+        add_test(NAME rsx_tiling_threads COMMAND test_rsx_tiling_threads)
+        set_tests_properties(rsx_tiling_threads PROPERTIES LABELS "gcm;t0;tsan" TIMEOUT 300)
     endif()
 
     # The sysPrxForUser CRT shims bound the guest spans they copy: a span that
