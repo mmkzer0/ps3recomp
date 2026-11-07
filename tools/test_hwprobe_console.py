@@ -23,13 +23,16 @@ blocks on each request until the handler (including its callback) has finished.
 
 Run: python3 tools/test_hwprobe_console.py
 """
+import contextlib
 import ftplib
 import http.server
+import io
 import os
 import sys
 import tempfile
 import threading
 import unittest
+import urllib.error
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "hwprobe"))
 
@@ -532,6 +535,35 @@ class TestConsoleRunner(unittest.TestCase):
             self.assertGreaterEqual(self.clock.now, 80.0)
         finally:
             http_server.stop()
+
+
+class TestCliErrors(unittest.TestCase):
+    """main() maps a console failure to a FATAL line and exit 2, whatever its class."""
+
+    def run_main_raising(self, exc):
+        def boom(**_):
+            raise exc
+        saved = ps3console.run_probe
+        ps3console.run_probe = boom
+        try:
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                rc = ps3console.main(["--host", "192.0.2.1", "run", "x.self", "--prefix", "p",
+                                      "--run-window", "1"])
+        finally:
+            ps3console.run_probe = saved
+        return rc, err.getvalue()
+
+    def test_ftp_error_is_fatal_not_a_type_error(self):
+        rc, err = self.run_main_raising(ftplib.error_temp("421 service not available"))
+        self.assertEqual(rc, 2)
+        self.assertIn("FATAL: 421 service not available", err)
+
+    def test_http_and_socket_errors_are_fatal(self):
+        for exc in (urllib.error.URLError("refused"), ConnectionResetError("reset")):
+            rc, err = self.run_main_raising(exc)
+            self.assertEqual(rc, 2, exc)
+            self.assertIn("FATAL:", err)
+
 
 
 if __name__ == "__main__":

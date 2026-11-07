@@ -128,7 +128,7 @@ def get_file_size(ftp, name: str):
         if str(e).startswith("550"):
             return None
         raise
-    except (AttributeError, ftplib.all_errors):
+    except (AttributeError, *ftplib.all_errors):
         return None
 
 
@@ -179,11 +179,11 @@ class FtpSession:
         if self.ftp is not None:
             try:
                 self.ftp.quit()
-            except (ftplib.all_errors, OSError) as e:
+            except (*ftplib.all_errors, OSError) as e:
                 sys.stderr.write(f"[console] FTP quit notice: {e!r}\n")
                 try:
                     self.ftp.close()
-                except (ftplib.all_errors, OSError) as e2:
+                except (*ftplib.all_errors, OSError) as e2:
                     sys.stderr.write(f"[console] FTP close notice: {e2!r}\n")
             self.ftp = None
 
@@ -525,7 +525,9 @@ def main(argv=None):
         err_str = str(e) if str(e) else repr(e)
         sys.stderr.write(f"ERROR: {err_str}\n")
         return 1
-    except (urllib.error.URLError, http.client.HTTPException, OSError, ftplib.all_errors, RuntimeError) as e:
+    # ftplib.all_errors is a tuple: unpack it. A nested tuple in an except clause is a
+    # TypeError on Python 3.15, which masked the real error and skipped the unmount.
+    except (urllib.error.URLError, http.client.HTTPException, OSError, *ftplib.all_errors, RuntimeError) as e:
         err_str = str(e) if str(e) else repr(e)
         sys.stderr.write(f"FATAL: {err_str}\n")
         return 2
