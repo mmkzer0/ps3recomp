@@ -43,7 +43,10 @@
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 
+#include "ps3emu/config.h"
 #include "rsx_vulkan_backend.h"
+#include "rsx_frame_select.h"
+#include "ps3emu/stop.h"
 #include "rsx_vertex_fetch.h"
 #include "rsx_texture_layout.h"
 #include "rsx_vp_decompiler.h"
@@ -234,8 +237,14 @@ typedef struct vk_state {
     u32              clear_argb;
     u32              last_center;
     u32              presented;
-    const char*      dump_path;
-    u32              dump_every;       /* write every nth presented frame */
+    const char*      dump_path;        /* PS3RECOMP_VK_DUMP                 */
+    u32              dump_every;       /* unnamed dump: every nth present, one file, overwritten */
+    int              dump_named;       /* LIST or RANGE given: <base>_s<seq>_f<flip>.ppm per selected present */
+    rsx_frame_select dump_sel;
+    /* The engine's identity of the present in flight, taken under present_mu when its copy is recorded
+     * (the walker may have moved on by the time the copy is read back). */
+    rsx_frame_identity present_fid;
+    int              present_fid_valid;
 } vk_state;
 
 static vk_state s_vk;
@@ -448,7 +457,7 @@ static int vk_create_image(vk_image* im, VkFormat fmt, u32 w, u32 h,
 
 static void vk_present_wait_gpu(void);
 
-/* VK_DRAW_BATCH (vk_eng_draw): draws recorded into s_vk.cmd and not yet
+/* vk.draw_batch (vk_eng_draw): draws recorded into s_vk.cmd and not yet
  * submitted. Anything that records other work, destroys an object or reads
  * results flushes them first, so everything else keeps the invariant that
  * all earlier work has completed. */
@@ -2006,14 +2015,68 @@ static void vk_present_window(void)
     else if (r != VK_SUCCESS) VK_LOG("vkQueuePresentKHR failed (VkResult %d)\n", (int)r);
 }
 
-static void vk_dump_ppm(const unsigned char* rgba)
+/* PS3RECOMP_VK_DUMP_LIST / _RANGE select presents by number and name the files by identity, as the Metal
+ * backend does; a malformed value ends the run at start-up, where a typo would otherwise cost the whole
+ * replay's worth of frames. */
+static void vk_dump_select_init(void)
 {
-    FILE* f = fopen(s_vk.dump_path, "wb");
-    if (!f) { VK_LOG("cannot open %s for the frame dump\n", s_vk.dump_path); return; }
+    unsigned count = 0;
+    const rsx_frame_select_status st = rsx_frame_select_parse(
+        &s_vk.dump_sel, getenv("PS3RECOMP_VK_DUMP_RANGE"), getenv("PS3RECOMP_VK_DUMP_LIST"), &count);
+    if (st == RSX_FRAME_SELECT_OK) {
+        s_vk.dump_named = s_vk.dump_sel.have_list || s_vk.dump_sel.have_range;
+        return;
+    }
+    char n[16], max[16], what[192];
+    const char* env = st == RSX_FRAME_SELECT_BAD_RANGE ? "PS3RECOMP_VK_DUMP_RANGE" : "PS3RECOMP_VK_DUMP_LIST";
+    const char* remedy;
+    ps3_stop_field f[3] = { { "env", env }, { "value", getenv(env) }, { NULL, NULL } };
+    size_t nf = 2;
+    if (st == RSX_FRAME_SELECT_LIST_TOO_LONG) {
+        snprintf(n, sizeof n, "%u", count);
+        snprintf(max, sizeof max, "%u", RSX_FRAME_SELECT_LIST_MAX);
+        snprintf(what, sizeof what, "invalid configuration: PS3RECOMP_VK_DUMP_LIST names %u present numbers; at most %u are kept",
+                 count, RSX_FRAME_SELECT_LIST_MAX);
+        remedy = "name at most 32 present numbers, or select a span with PS3RECOMP_VK_DUMP_RANGE";
+        f[1] = (ps3_stop_field){ "count", n };
+        f[2] = (ps3_stop_field){ "max", max };
+        nf = 3;
+    } else if (st == RSX_FRAME_SELECT_BAD_RANGE) {
+        snprintf(what, sizeof what, "invalid configuration: PS3RECOMP_VK_DUMP_RANGE is not <first>-<last> with first <= last");
+        remedy = "write the range as 120-180 (decimal, or 0x hex; both ends at most 4294967295)";
+    } else {
+        snprintf(what, sizeof what, "invalid configuration: PS3RECOMP_VK_DUMP_LIST is not a comma-separated list of present numbers");
+        remedy = "write the list as 120,240,300 (decimal, or 0x hex; no empty entry, sign or trailing text)";
+    }
+    ps3_stop(PS3_STOP_CONFIG_INVALID, what, remedy, f, nf, NULL);
+}
+
+/* present_mu held; `rgba` is the readback of the present just completed (s_vk.presented counts it). */
+static void vk_dump_present(const unsigned char* rgba)
+{
+    char named[1200];
+    const char* path = s_vk.dump_path;
+    if (s_vk.dump_named) {
+        /* The fixed-function path has no engine identity: its present ordinal is this backend's count. */
+        const u32 seq  = s_vk.present_fid_valid ? s_vk.present_fid.present_seq : s_vk.presented - 1u;
+        const u32 flip = s_vk.present_fid_valid ? s_vk.present_fid.flip_id : RSX_FRAME_NO_FLIP;
+        if (!rsx_frame_select_wanted(&s_vk.dump_sel, seq)) return;
+        if (rsx_frame_dump_name(named, sizeof named, s_vk.dump_path, seq, flip, RSX_FRAME_NO_FLIP) >= sizeof named) {
+            VK_LOG("frame dump: the name for present %u does not fit %zu bytes, not written\n", seq, sizeof named);
+            return;
+        }
+        path = named;
+    } else if ((s_vk.presented % s_vk.dump_every) != 0) {
+        return;
+    }
+    FILE* f = fopen(path, "wb");
+    if (!f) { VK_LOG("cannot open %s for the frame dump\n", path); return; }
     fprintf(f, "P6\n%u %u\n255\n", s_vk.width, s_vk.height);
     for (size_t i = 0; i < (size_t)s_vk.width * s_vk.height; i++)
         fwrite(rgba + i * 4, 1, 3, f);
-    fclose(f);
+    const int werr = ferror(f);
+    if (fclose(f) != 0 || werr) VK_LOG("writing %s for the frame dump failed\n", path);
+    else if (s_vk.dump_named) VK_LOG("frame dump: %s\n", path);
 }
 
 /* ---------------------------------------------------------------------------
@@ -2055,7 +2118,7 @@ static void vk_present_complete_locked(void)
     size_t c = ((size_t)(s_vk.height / 2) * s_vk.width + s_vk.width / 2) * 4;
     s_vk.last_center = ((u32)px[c] << 16) | ((u32)px[c + 1] << 8) | (u32)px[c + 2];
     s_vk.presented++;
-    if (s_vk.dump_path && (s_vk.presented % s_vk.dump_every) == 0) vk_dump_ppm(px);
+    if (s_vk.dump_path) vk_dump_present(px);
     vk_present_window();
 }
 
@@ -2064,6 +2127,7 @@ static void vk_present_complete_locked(void)
 static VkCommandBuffer vk_present_record_begin(void)
 {
     vk_present_complete_locked();
+    s_vk.present_fid_valid = 0;
     VkCommandBuffer cb = s_vk.present_cmd;
     if (pvkResetCommandBuffer(cb, 0) != VK_SUCCESS) return VK_NULL_HANDLE;
     VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -2257,7 +2321,7 @@ static int vk_eng_upload_region(VkImage img, u32 layer, u32 mip, u32 x, u32 y,
                                 const void* src, u32 row_bytes)
 {
     if (tight > row_bytes) tight = row_bytes;
-    {   /* VK_DRAW_BATCH: staged in a ring and recorded into the open batch. */
+    {   /* vk.draw_batch: staged in a ring and recorded into the open batch. */
         VkBufferImageCopy region = {
             .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, mip, layer, 1 },
             .imageOffset = { (int32_t)x, (int32_t)y, 0 },
@@ -2545,6 +2609,7 @@ static void vk_eng_present(void* user, u32 surface)
     pthread_mutex_lock(&s_vk.present_mu);
     VkCommandBuffer cb = vk_present_record_begin();
     if (cb) {
+        s_vk.present_fid_valid = rsx_draw_engine_frame_identity(&s_vk.present_fid);
         if (o) {
             vk_barrier_image_on(cb, o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
             vk_barrier_image_on(cb, s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
@@ -3548,7 +3613,7 @@ static VkImageView vk_eng_dummy_cube_view(void)
 }
 
 /* ---------------------------------------------------------------------------
- * Draw batching (VK_DRAW_BATCH=1)
+ * Draw batching (vk.draw_batch)
  *
  * Every vk_eng_draw used to submit its own command buffer and wait on a
  * fence, because the vertex, index and uniform buffers and the descriptor set
@@ -3562,13 +3627,15 @@ static VkImageView vk_eng_dummy_cube_view(void)
  * present and the engine's own submit point call it first, so all other work
  * keeps seeing everything before it complete. Between batched draws a full
  * memory barrier keeps render-to-texture ordering without tracking.
- * VK_DRAW_BATCH_MAX (default 512) caps the draws per submission.
+ * vk.draw_batch_max (default 512, at most VK_EB_MAX_SETS) caps the operations per submission.
+ * Both keys are read once, in vk_eb_on's first call per engine run; nothing on a per-draw path
+ * reads the registry.
  * -------------------------------------------------------------------------*/
 #define VK_EB_VB_BYTES   (64u << 20)
 #define VK_EB_IB_BYTES   (16u << 20)
 #define VK_EB_UB_BYTES   (32u << 20)
 #define VK_EB_SB_BYTES   (64u << 20)   /* texture upload staging */
-#define VK_EB_MAX_SETS   1024u
+#define VK_EB_MAX_SETS   1024u         /* the maximum of vk.draw_batch_max in config_options.def */
 
 static struct {
     int              on;            /* -1 undecided, 0 off, 1 on */
@@ -3583,12 +3650,9 @@ static struct {
 static int vk_eb_on(void)
 {
     if (s_eb.on >= 0) return s_eb.on;
-    const char* e = getenv("VK_DRAW_BATCH");
     s_eb.on = 0;
-    if (!e || *e != '1' || !s_g.on) return 0;
-    const char* m = getenv("VK_DRAW_BATCH_MAX");
-    s_eb.max_draws = m && atoi(m) > 0 ? (u32)atoi(m) : 512u;
-    if (s_eb.max_draws > VK_EB_MAX_SETS) s_eb.max_draws = VK_EB_MAX_SETS;
+    if (!ps3_cfg_vk_draw_batch() || !s_g.on) return 0;
+    s_eb.max_draws = ps3_cfg_vk_draw_batch_max();
     VkPhysicalDeviceProperties p;
     pvkGetPhysicalDeviceProperties(s_vk.phys, &p);
     s_eb.ub_align = p.limits.minUniformBufferOffsetAlignment ? p.limits.minUniformBufferOffsetAlignment : 256;
@@ -3939,11 +4003,13 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     s_vk.width  = width  ? width  : 1280;
     s_vk.height = height ? height : 720;
     s_vk.dump_path = getenv("PS3RECOMP_VK_DUMP");
+    if (s_vk.dump_path && !*s_vk.dump_path) s_vk.dump_path = NULL;
     /* Writing a full frame to disk on every present costs more than the
      * present itself and slows a title enough to change what it does; a
      * live title wants one now and then, not all of them. */
     { const char* e = getenv("PS3RECOMP_VK_DUMP_EVERY");
       s_vk.dump_every = (e && atoi(e) > 0) ? (u32)atoi(e) : 1; }
+    if (s_vk.dump_path) vk_dump_select_init();
 
     vk_window_open(title);           /* no-op unless PS3RECOMP_VK_WINDOW is set */
     if (vk_load_library()) return -1;

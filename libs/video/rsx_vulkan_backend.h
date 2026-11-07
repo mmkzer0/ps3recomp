@@ -32,8 +32,17 @@
  * Environment:
  *   PS3RECOMP_VK_DEVICE=<n>   pick physical device n (vkEnumeratePhysicalDevices
  *                             order) instead of the first non-CPU device.
- *   PS3RECOMP_VK_DUMP=<path>  write every presented frame to <path> as a
- *                             binary PPM (overwritten each present).
+ *   PS3RECOMP_VK_DUMP=<path>  write presented frames to <path> as a binary
+ *                             PPM: with PS3RECOMP_VK_DUMP_EVERY=<n> every nth
+ *                             present (default every one), one file overwritten
+ *                             each time.
+ *   PS3RECOMP_VK_DUMP_LIST=<a,b,c> | PS3RECOMP_VK_DUMP_RANGE=<first>-<last>
+ *                             instead dump exactly those presents (at most 32
+ *                             in a list; a list wins over a range), each to
+ *                             <path>_s<present_seq>_f<flip_id>.ppm as the Metal
+ *                             backend names its PS3RECOMP_METAL_FRAME_DUMP
+ *                             files (rsx_frame_select.h). A malformed value is
+ *                             a config-invalid stop at init.
  *   PS3RECOMP_VK_WINDOW=1     also show each presented frame in an SDL2
  *                             window. Rendering and readback are unchanged, so
  *                             every test gives the same result with or without

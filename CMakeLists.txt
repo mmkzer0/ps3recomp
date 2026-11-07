@@ -1640,6 +1640,16 @@ if(UNIX)
     # C++ driver must do the final link or the standard library goes missing.
     set_target_properties(ps3recomp_host PROPERTIES LINKER_LANGUAGE CXX)
 
+    # The Vulkan backend's typed switches (vk.draw_batch, vk.draw_batch_max) and its presented-frame dump
+    # (PS3RECOMP_VK_DUMP_LIST / _RANGE), through the real backend on the host's own device. Exit 77 without
+    # one (or without the guest-program translator): a host with no Vulkan lists it as skipped.
+    if(PS3RECOMP_RSX_VULKAN AND Python3_FOUND)
+        add_test(NAME vk_draw_batch
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_vk_draw_batch.py"
+                $<TARGET_FILE:ps3recomp_host>)
+        set_tests_properties(vk_draw_batch PROPERTIES LABELS "video;gpu;t0" SKIP_RETURN_CODE 77 TIMEOUT 300)
+    endif()
+
     # Guest shader translation, decompilers -> HLSL -> MSL, with no GPU: the
     # regression net for the Metal backend's shader path on every platform.
     if(PS3RECOMP_MSL_TRANSLATION)
@@ -1879,6 +1889,15 @@ if(UNIX)
         add_test(NAME ${engine_test} COMMAND ${engine_test})
         set_tests_properties(${engine_test} PROPERTIES LABELS "gcm;t0" TIMEOUT 120)
     endforeach()
+
+    # Which presents a frame dump writes and what it calls the file (PS3RECOMP_VK_DUMP_LIST / _RANGE).
+    # Pure parsing and naming, so no GPU and no backend: the Vulkan backend links the same source.
+    add_executable(test_rsx_frame_select
+        libs/video/tests/test_rsx_frame_select.c
+        libs/video/rsx_frame_select.c)
+    target_include_directories(test_rsx_frame_select PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
+    add_test(NAME test_rsx_frame_select COMMAND test_rsx_frame_select)
+    set_tests_properties(test_rsx_frame_select PROPERTIES LABELS "rsx;t0" TIMEOUT 60)
 
     # What the driver's flip words mean (#101): synthetic FIFO streams through the real dispatcher and
     # engine, one forked child per scenario so a stream that must end in the named stop can. Links the

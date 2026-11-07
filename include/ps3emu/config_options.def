@@ -182,6 +182,27 @@ PS3_CFG_BOOL(eng, depth_bounds, 1,
     "discarded outside the bounds. False ignores the test, as before. On by default; a kill switch for "
     "diagnosing a title that enables the test with bounds it does not mean (v0.19.0 #694).")
 
+/* ---- vk (the Vulkan backend; PS3RECOMP_VK_*) ---------------------------- */
+
+PS3_CFG_BOOL(vk, draw_batch, 0,
+    "Record the draw engine's draws, snapshots, texture uploads and clears into one Vulkan command "
+    "buffer per submission instead of a submit and a fence wait for each (libs/video/"
+    "rsx_vulkan_backend.c, \"Draw batching\"). The vertex, index and uniform data of every draw "
+    "sit in host-coherent rings, and a full memory barrier between recorded draws keeps "
+    "render-to-texture ordering; the batch is submitted and waited for at a present, a readback, an "
+    "object destroy, a full ring or vk.draw_batch_max operations. It is meant to change only when "
+    "work is submitted, not what is drawn; off by default until a pixel diff of presented frames, "
+    "on against off, is clean (#129). The rings are 176 MiB of host-visible memory (vertex 64, "
+    "index 16, uniform 32, upload staging 64), and a device that cannot give host-coherent memory "
+    "for them stays off with a logged line. Read once, when the draw engine first draws. Replaces "
+    "the environment switch VK_DRAW_BATCH=1.")
+
+PS3_CFG_U32(vk, draw_batch_max, 512, 1, 1024,
+    "The most operations (draws, snapshots, uploads, clears) recorded into one batched submission "
+    "when vk.draw_batch is on. 1024 is the descriptor pool's set count, so a larger value could not "
+    "be honoured: it is a config error, where VK_DRAW_BATCH_MAX once capped it silently. Read once, "
+    "with vk.draw_batch. Replaces the environment variable VK_DRAW_BATCH_MAX.")
+
 /* ---- game --------------------------------------------------------------- */
 
 PS3_CFG_BOOL(game, free_space_raw, 0,
@@ -316,6 +337,8 @@ PS3_CFG_LEGACY_ENV("PS3RECOMP_SPIRV_CACHE")
 PS3_CFG_LEGACY_ENV("PS3RECOMP_VK_DEVICE")
 PS3_CFG_LEGACY_ENV("PS3RECOMP_VK_DUMP")
 PS3_CFG_LEGACY_ENV("PS3RECOMP_VK_DUMP_EVERY")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_VK_DUMP_LIST")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_VK_DUMP_RANGE")
 PS3_CFG_LEGACY_ENV("PS3RECOMP_VK_FULLSCREEN")
 PS3_CFG_LEGACY_ENV("PS3RECOMP_VK_GUEST_PROGRAMS")
 PS3_CFG_LEGACY_ENV("PS3RECOMP_VK_HOLD")

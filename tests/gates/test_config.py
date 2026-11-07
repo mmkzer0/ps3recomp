@@ -89,6 +89,8 @@ def test_defaults_without_file_or_environment():
         "gcm.report_spu_hold_ms": ("0", "default"),
         "eng.depth_clamp": ("true", "default"),
         "eng.depth_bounds": ("true", "default"),
+        "vk.draw_batch": ("false", "default"),
+        "vk.draw_batch_max": ("512", "default"),
         "game.free_space_raw": ("false", "default"),
         "trophy.register_wait_cap_vblanks": ("1024", "default"),
         "adec.silence_fallback": ("false", "default"),
@@ -190,6 +192,8 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
             "gcm.report_spu_hold_ms": "default",
             "eng.depth_clamp": "default",
             "eng.depth_bounds": "default",
+            "vk.draw_batch": "default",
+            "vk.draw_batch_max": "default",
             "game.free_space_raw": "default",
             "trophy.register_wait_cap_vblanks": "default",
             "adec.silence_fallback": "default",
@@ -216,6 +220,7 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
                            "gcm": {"wait_timeout_ms": 10000, "park_resync": False, "park_grace_ms": 50,
                                    "handler_thread": False, "report_spu_hold_ms": 0},
                            "eng": {"depth_clamp": True, "depth_bounds": True},
+                           "vk": {"draw_batch": False, "draw_batch_max": 512},
                            "game": {"free_space_raw": False},
                            "trophy": {"register_wait_cap_vblanks": 1024},
                            "adec": {"silence_fallback": False},
@@ -456,6 +461,38 @@ def test_adec_silence_fallback_comes_from_file_and_environment():
     assert o["adec.silence_fallback"] == ("true", "env:PS3RECOMP_ADEC_SILENCE_FALLBACK"), o
     f = config_invalid(probe("get", PS3RECOMP_ADEC_SILENCE_FALLBACK="yes"))
     assert f["key"] == "adec.silence_fallback", f
+
+
+def test_vk_draw_batch_comes_from_file_and_environment():
+    # Off by default until the pixel diff of #129 is clean; the registry's names are PS3RECOMP_VK_*
+    # (VK_DRAW_BATCH=1 was the unregistered switch this replaces).
+    with Cfg("schema = 1", "[vk]", "draw_batch = true", "draw_batch_max = 64") as c:
+        o = options(probe("--load", c.path, "get"))
+        assert o["vk.draw_batch"] == ("true", f"file:{c.path}"), o
+        assert o["vk.draw_batch_max"] == ("64", f"file:{c.path}"), o
+        o = options(probe("--load", c.path, "get", PS3RECOMP_VK_DRAW_BATCH="0", PS3RECOMP_VK_DRAW_BATCH_MAX="1024"))
+        assert o["vk.draw_batch"] == ("false", "env:PS3RECOMP_VK_DRAW_BATCH"), o
+        assert o["vk.draw_batch_max"] == ("1024", "env:PS3RECOMP_VK_DRAW_BATCH_MAX"), o
+    o = options(probe("get", PS3RECOMP_VK_DRAW_BATCH="1"))
+    assert o["vk.draw_batch"] == ("true", "env:PS3RECOMP_VK_DRAW_BATCH"), o
+    assert o["vk.draw_batch_max"] == ("512", "default"), o
+    o = options(probe("get", PS3RECOMP_VK_DRAW_BATCH_MAX="0x20"))
+    assert o["vk.draw_batch_max"] == ("32", "env:PS3RECOMP_VK_DRAW_BATCH_MAX"), o
+    f = config_invalid(probe("get", PS3RECOMP_VK_DRAW_BATCH="yes"))
+    assert f["env"] == "PS3RECOMP_VK_DRAW_BATCH" and f["key"] == "vk.draw_batch", f
+
+
+def test_vk_draw_batch_max_is_bounded_by_the_descriptor_pool():
+    # 1024 is the backend's descriptor-set count; VK_DRAW_BATCH_MAX used to cap a larger value silently.
+    for bad in ("0", "1025", "4294967295"):
+        f = config_invalid(probe("get", PS3RECOMP_VK_DRAW_BATCH_MAX=bad))
+        assert f["env"] == "PS3RECOMP_VK_DRAW_BATCH_MAX" and f["key"] == "vk.draw_batch_max", (bad, f)
+        assert "out of range" in f["detail"], (bad, f)
+    for bad in ("0", "1025"):
+        with Cfg("schema = 1", "[vk]", f"draw_batch_max = {bad}") as c:
+            f = config_invalid(probe("--load", c.path, "get"))
+            assert f["key"] == "vk.draw_batch_max" and f["line"] == "3", (bad, f)
+            assert "out of range" in f["detail"], (bad, f)
 
 
 def test_u32_out_of_range_file_values_stop():

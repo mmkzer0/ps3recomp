@@ -60,6 +60,10 @@ static void print_options()
             std::printf("%s", ps3_cfg_eng_depth_clamp() ? "true" : "false");
         else if (!std::strcmp(o->section, "eng") && !std::strcmp(o->key, "depth_bounds"))
             std::printf("%s", ps3_cfg_eng_depth_bounds() ? "true" : "false");
+        else if (!std::strcmp(o->section, "vk") && !std::strcmp(o->key, "draw_batch"))
+            std::printf("%s", ps3_cfg_vk_draw_batch() ? "true" : "false");
+        else if (!std::strcmp(o->section, "vk") && !std::strcmp(o->key, "draw_batch_max"))
+            std::printf("%u", ps3_cfg_vk_draw_batch_max());
         else if (!std::strcmp(o->section, "game") && !std::strcmp(o->key, "free_space_raw"))
             std::printf("%s", ps3_cfg_game_free_space_raw() ? "true" : "false");
         else if (!std::strcmp(o->section, "trophy") && !std::strcmp(o->key, "register_wait_cap_vblanks"))
