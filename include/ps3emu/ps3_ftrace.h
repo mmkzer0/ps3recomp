@@ -428,8 +428,11 @@ static inline void ps3_ft_dump(void)
     pid_t child = -1;
     struct sigaction old_pipe;
     if (s->zst) {
-        snprintf(partial, sizeof partial, "%s.partial", s->path);
-        f = ps3_ft_zstd_begin(s, partial, &child, &old_pipe);
+        /* Cannot truncate (partial has 16 bytes over a NUL-terminated path); the check keeps GCC's
+         * -Wformat-truncation quiet in every includer and fails closed if the sizes ever change. */
+        const int w = snprintf(partial, sizeof partial, "%s.partial", s->path);
+        f = (w > 0 && (size_t)w < sizeof partial) ? ps3_ft_zstd_begin(s, partial, &child, &old_pipe) : NULL;
+        if (w <= 0 || (size_t)w >= sizeof partial) fprintf(stderr, "[ftrace] path too long for %s.partial\n", s->path);
     } else
 #endif
     f = fopen(s->path, "w");
@@ -486,9 +489,13 @@ static inline int ps3_ft_init(void)
         if (sscanf(e, "%lf:%lf:%n", &start, &secs, &used) < 2 || !used || secs <= 0) {
             fprintf(stderr, "[ftrace] PS3_FTRACE=<start s>:<seconds>:<path>, got '%s'\n", e);
         } else {
-            snprintf(s->path, sizeof s->path, "%s", e + used);
-            s->zst = ps3_ft_is_zst(s->path);
-            if (s->zst && !ps3_ft_zstd_check(s)) {
+            /* A cut path names another file: refuse it rather than record somewhere else (host-path-limit). */
+            const int w = snprintf(s->path, sizeof s->path, "%s", e + used);
+            s->zst = (w > 0 && (size_t)w < sizeof s->path) ? ps3_ft_is_zst(s->path) : 0;
+            if (w <= 0 || (size_t)w >= sizeof s->path) {
+                fprintf(stderr, "[ftrace] PS3_FTRACE path is empty or longer than %zu bytes; recording is off\n",
+                        sizeof s->path - 1);
+            } else if (s->zst && !ps3_ft_zstd_check(s)) {
                 /* The named error is printed; recording stays off, so the run is not left to fail at exit. */
             } else {
                 const char* m = getenv("PS3_FTRACE_MIN_US");
