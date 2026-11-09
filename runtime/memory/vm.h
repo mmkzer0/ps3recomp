@@ -379,8 +379,13 @@ static inline int32_t vm_protect(uint32_t addr, uint32_t size, int read, int wri
     else if (read)             prot = PAGE_READONLY;
     else if (exec)             prot = PAGE_EXECUTE;
 
+    /* A port's arena that commits on first touch (templates/project/main.cpp) leaves most of the guest
+     * space reserved, and VirtualProtect refuses a page that is not committed, where mprotect has no
+     * such state: every guest thread's stack guard failed on it. Commit the span with the protection
+     * asked for instead, which sets it on committed pages too. */
     DWORD old;
-    if (!VirtualProtect(vm_base + addr, size, prot, &old))
+    if (!VirtualProtect(vm_base + addr, size, prot, &old) &&
+        !VirtualAlloc(vm_base + addr, size, MEM_COMMIT, prot))
         return CELL_EFAULT;
 #else
     int prot = PROT_NONE;

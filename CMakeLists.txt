@@ -91,18 +91,20 @@ if(PS3RECOMP_FIBER_BACKEND STREQUAL "aarch64")
 endif()
 
 # The Vulkan RSX backend is opt-in while it grows (stage V0: clear + present).
-# It loads libvulkan at run time, so building needs only the Vulkan headers --
-# no target-architecture libvulkan, which keeps cross-compiling simple.
-option(PS3RECOMP_RSX_VULKAN "Build the Vulkan RSX backend (Linux)" OFF)
+# It loads the Vulkan loader at run time, so building needs only the Vulkan
+# headers -- no target-architecture libvulkan, which keeps cross-compiling
+# simple. On Windows the headers come with the Vulkan SDK (VULKAN_SDK).
+option(PS3RECOMP_RSX_VULKAN "Build the Vulkan RSX backend (Linux, Windows)" OFF)
 list(FILTER HLE_SOURCES EXCLUDE REGEX "rsx_vulkan_backend\\.c$")
 if(PS3RECOMP_RSX_VULKAN)
-    if(WIN32 OR APPLE)
-        message(FATAL_ERROR "PS3RECOMP_RSX_VULKAN is Linux-only for now")
+    if(APPLE)
+        message(FATAL_ERROR "PS3RECOMP_RSX_VULKAN is for Linux and Windows; Apple hosts draw through Metal")
     endif()
-    find_path(PS3RECOMP_VULKAN_INCLUDE_DIR vulkan/vulkan.h)
+    find_path(PS3RECOMP_VULKAN_INCLUDE_DIR vulkan/vulkan.h HINTS "$ENV{VULKAN_SDK}/Include")
     if(NOT PS3RECOMP_VULKAN_INCLUDE_DIR)
         message(FATAL_ERROR "Vulkan headers not found. Debian/Ubuntu: "
-            "libvulkan-dev, Fedora: vulkan-headers -- or pass "
+            "libvulkan-dev, Fedora: vulkan-headers, Windows: the Vulkan SDK "
+            "(scoop install vulkan), which sets VULKAN_SDK -- or pass "
             "-DPS3RECOMP_VULKAN_INCLUDE_DIR=<dir containing vulkan/vulkan.h>")
     endif()
     list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_vulkan_backend.c")
@@ -283,6 +285,33 @@ if(WIN32)
         ole32       # COM for WASAPI audio
         bcrypt      # BCryptGenRandom for SSL RNG
     )
+    # The Vulkan backend's window is SDL2's, and with SDL2 linked cellPad reads
+    # controllers through it as on Linux and macOS: XInput knows Xbox pads only,
+    # SDL2's game controllers also the DualShock 4 and DualSense. cellAudio
+    # stays on WASAPI. Found by its header and import library, as scoop's sdl2
+    # installs it (include/SDL2/SDL.h, lib/SDL2.lib and SDL2.dll) and as the
+    # sources include it. The DLL is the imported location, so a port can copy
+    # it with $<TARGET_RUNTIME_DLLS>.
+    if(PS3RECOMP_RSX_VULKAN)
+        find_path(PS3RECOMP_SDL2_INCLUDE_DIR SDL2/SDL.h)
+        find_library(PS3RECOMP_SDL2_LIBRARY SDL2)
+        find_file(PS3RECOMP_SDL2_DLL SDL2.dll PATH_SUFFIXES lib bin)
+        if(NOT PS3RECOMP_SDL2_INCLUDE_DIR OR NOT PS3RECOMP_SDL2_LIBRARY OR NOT PS3RECOMP_SDL2_DLL)
+            message(FATAL_ERROR
+                "SDL2 not found. The Vulkan backend opens its window through it.\n"
+                "  Windows: scoop install extras/sdl2 (it adds itself to CMAKE_PREFIX_PATH)\n"
+                "Otherwise pass -DCMAKE_PREFIX_PATH=<prefix with include/SDL2/SDL.h and lib/SDL2.lib>.")
+        endif()
+        add_library(SDL2::SDL2 SHARED IMPORTED GLOBAL)
+        set_target_properties(SDL2::SDL2 PROPERTIES
+            IMPORTED_IMPLIB "${PS3RECOMP_SDL2_LIBRARY}"
+            IMPORTED_LOCATION "${PS3RECOMP_SDL2_DLL}"
+            INTERFACE_INCLUDE_DIRECTORIES "${PS3RECOMP_SDL2_INCLUDE_DIR}")
+        target_link_libraries(ps3recomp_runtime PRIVATE SDL2::SDL2)
+        set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/libs/input/cellPad.c"
+            PROPERTIES COMPILE_DEFINITIONS PS3RECOMP_PAD_USE_SDL2)
+        message(STATUS "  SDL2:         found (the Vulkan backend's window and cellPad; ${PS3RECOMP_SDL2_DLL})")
+    endif()
 else()
     find_package(Threads REQUIRED)
     target_link_libraries(ps3recomp_runtime PRIVATE Threads::Threads)
@@ -506,6 +535,31 @@ endif()
 option(PS3RECOMP_SPIRV_REQUIRED
        "Fail configuration when PS3RECOMP_RSX_VULKAN cannot build the SPIR-V translator" OFF)
 if(PS3RECOMP_RSX_VULKAN)
+    # The section above looks for glslang on Unix hosts only. On Windows it is
+    # the Vulkan SDK's, whose package configs cannot be used: they sit a
+    # directory deeper than their own relative paths assume (Lib/cmake/glslang/
+    # glslang/ includes Lib/lib/cmake/...), and they import RelWithDebInfo
+    # only. The libraries are named here instead, as the glslang:: targets the
+    # rest of this file links: the static closure of the HLSL front end and its
+    # SPIRV-Tools optimiser, with the SDK's d-suffixed builds for Debug, since
+    # the debug and release C runtimes do not link together.
+    if(WIN32 AND NOT glslang_FOUND AND DEFINED ENV{VULKAN_SDK})
+        file(TO_CMAKE_PATH "$ENV{VULKAN_SDK}" _vk_sdk)
+        if(EXISTS "${_vk_sdk}/Include/glslang/build_info.h" AND EXISTS "${_vk_sdk}/Lib/glslang.lib")
+            add_library(glslang::glslang INTERFACE IMPORTED GLOBAL)
+            add_library(glslang::SPIRV INTERFACE IMPORTED GLOBAL)
+            target_include_directories(glslang::glslang INTERFACE "${_vk_sdk}/Include")
+            foreach(_lib glslang SPIRV MachineIndependent GenericCodeGen OSDependent
+                    glslang-default-resource-limits SPIRV-Tools-opt SPIRV-Tools)
+                target_link_libraries(glslang::glslang INTERFACE "${_vk_sdk}/Lib/${_lib}$<$<CONFIG:Debug>:d>.lib")
+            endforeach()
+            file(STRINGS "${_vk_sdk}/Include/glslang/build_info.h" _glslang_ver
+                 REGEX "#define GLSLANG_VERSION_(MAJOR|MINOR|PATCH) ")
+            string(REGEX REPLACE "[^0-9;]*([0-9]+)" "\\1" _glslang_ver "${_glslang_ver}")
+            string(JOIN "." glslang_VERSION ${_glslang_ver})
+            set(glslang_FOUND TRUE)
+        endif()
+    endif()
     if(glslang_FOUND AND TARGET glslang::glslang AND TARGET glslang::SPIRV)
         set_source_files_properties(
             "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_spirv.cpp"
@@ -520,7 +574,8 @@ if(PS3RECOMP_RSX_VULKAN)
                        "opt in with PS3RECOMP_VK_GUEST_PROGRAMS=1")
     else()
         if(PS3RECOMP_SPIRV_REQUIRED)
-            message(FATAL_ERROR "Vulkan guest programs need glslang (apt: glslang-dev glslang-tools spirv-tools)")
+            message(FATAL_ERROR "Vulkan guest programs need glslang (apt: glslang-dev glslang-tools spirv-tools; "
+                                "Windows: the Vulkan SDK)")
         endif()
         message(STATUS "  Vulkan:       glslang not found; guest programs unavailable")
     endif()
@@ -530,15 +585,28 @@ endif()
 # Compiler flags
 # ---------------------------------------------------------------------------
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+    # clang-cl (the Windows build) reads -Wall as /Wall, which is -Weverything:
+    # thousands of warnings a build, the ones that matter among them. /W4 is
+    # its -Wall -Wextra. It also drops a GCC-style -f option it does not know
+    # with nothing but a warning, so those go through /clang:.
+    if(CMAKE_C_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+        set(_ps3_gnu /clang:)
+        set(_ps3_warnings /W4)
+        # The CRT's "use the _s variant" deprecations, as the cl branch below.
+        target_compile_definitions(ps3recomp_runtime PRIVATE _CRT_SECURE_NO_WARNINGS)
+    else()
+        set(_ps3_gnu "")
+        set(_ps3_warnings -Wall -Wextra)
+    endif()
     target_compile_options(ps3recomp_runtime PRIVATE
-        -Wall -Wextra -Wno-unused-parameter
+        ${_ps3_warnings} -Wno-unused-parameter
         -fno-strict-aliasing
         # No spontaneous fused multiply-add. MSVC never contracts, and x86-64
         # without -mfma has nothing to contract into, so every validated
         # result came from separate multiplies and adds; arm64 has FMA in
         # the base ISA and Clang fuses by default there. A PPC fmadd is
         # spelt as one where the lifter means one.
-        -ffp-contract=off
+        ${_ps3_gnu}-ffp-contract=off
         # Explicit, because the per-config defaults cannot be trusted: this
         # tree's caches carry CMAKE_C_FLAGS_RELEASE="" and CMAKE_CXX_FLAGS_RELEASE="",
         # and clang-cl with no /O flag compiles at /Od -- a "Release" runtime

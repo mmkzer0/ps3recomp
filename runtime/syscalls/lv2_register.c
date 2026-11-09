@@ -2230,24 +2230,13 @@ static int64_t sys_spu_image_import_handler(ppu_context* ctx)
     /* LBP retries this import in a tight loop (134x observed) with no other
      * syscall in between -- something it derives from the filled struct keeps
      * it unsatisfied. Print the guest caller chain for the first few so the
-     * retry loop can be identified. */
+     * retry loop can be identified. Through the loader's hook, as the tty path
+     * above does: the lifted function_table it walks is not in this library,
+     * and naming it here left every game-less Windows link undefined. */
     { static int _bt_n = 0;
       if (PS3_LOG_FIRST(_bt_n, 3)) {
-          /* Matches func_entry in the generated ppu_recomp.h. */
-          struct lv2_bt_fentry { uint64_t addr; void* func; const char* name; };
-          extern const struct lv2_bt_fentry function_table[];
-          extern const uint64_t function_table_count;
-          void* bt[24]; unsigned short fr = RtlCaptureStackBackTrace(0, 24, bt, 0);
-          char ln[800]; int p = snprintf(ln, sizeof ln, "[SPU]   import bt:");
-          for (int i = 0; i < fr; i++) {
-              uintptr_t t = (uintptr_t)bt[i]; uint32_t bg = 0; uintptr_t bh = 0;
-              for (uint64_t k = 0; k < function_table_count; k++) {
-                  uintptr_t h = (uintptr_t)function_table[k].func;
-                  if (h <= t && h > bh) { bh = h; bg = (uint32_t)function_table[k].addr; }
-              }
-              if (bg && (t - bh) < 0x14000) p += snprintf(ln + p, sizeof(ln) - p, " %08X", bg);
-          }
-          fprintf(stderr, "%s\n", ln);
+          extern void ppu_guest_callstack(const char*);
+          ppu_guest_callstack("spu-import");
       } }
 #endif
     fflush(stderr);

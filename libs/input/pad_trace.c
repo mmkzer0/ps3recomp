@@ -35,14 +35,30 @@
 #include "pad_trace.h"
 
 #include <errno.h>
-#include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+/* One lock per trace and one around the process-wide trace. Neither is ever taken recursively, so an SRW
+ * lock serves on Windows, which has no pthread.h. */
 #ifdef _WIN32
 #  include <windows.h>
+typedef SRWLOCK trace_lock;
+#  define TRACE_LOCK_INIT          SRWLOCK_INIT
+#  define trace_lock_init(l)       InitializeSRWLock(l)
+#  define trace_lock_destroy(l)    ((void)(l))
+#  define trace_lock_acquire(l)    AcquireSRWLockExclusive(l)
+#  define trace_lock_release(l)    ReleaseSRWLockExclusive(l)
+#else
+#  include <pthread.h>
+typedef pthread_mutex_t trace_lock;
+#  define TRACE_LOCK_INIT          PTHREAD_MUTEX_INITIALIZER
+#  define trace_lock_init(l)       pthread_mutex_init((l), NULL)
+#  define trace_lock_destroy(l)    pthread_mutex_destroy(l)
+#  define trace_lock_acquire(l)    pthread_mutex_lock(l)
+#  define trace_lock_release(l)    pthread_mutex_unlock(l)
 #endif
 
 #include "ps3emu/stop.h"
@@ -70,7 +86,7 @@ typedef struct { uint32_t flip, polls; } Step;
 typedef struct { uint32_t cur_flip, cur_count; int any; } Tracker;
 
 struct PadTrace {
-    pthread_mutex_t lock;
+    trace_lock      lock;
     uint32_t      (*flip_fn)(void);
     uint32_t        max_flip;     /* highest flip any call has seen */
     Tracker         trk[PAD_TRACE_MAX_PORTS];
@@ -603,7 +619,7 @@ static void destroy_storage(PadTrace* t)
     free(t->record_path);
     free(t->replay_path);
     if (t->wf) fclose(t->wf);
-    pthread_mutex_destroy(&t->lock);
+    trace_lock_destroy(&t->lock);
     free(t);
 }
 
@@ -619,7 +635,7 @@ int pad_trace_create(const PadTraceOptions* o, PadTrace** out, PadTraceError* er
     if (!rec && !rep) return 0;
     t = (PadTrace*)calloc(1, sizeof *t);
     if (!t) { set_err(err, PAD_TRACE_ROLE_RECORD, 0, "io", "out of memory"); return -1; }
-    pthread_mutex_init(&t->lock, NULL);
+    trace_lock_init(&t->lock);
     t->flip_fn = o->flip;
     t->stats.first_div_flip = -1;
 
@@ -667,7 +683,7 @@ PadTrace* pad_trace_open(const PadTraceOptions* o)
 }
 
 static PadTrace* g_trace;
-static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+static trace_lock g_lock = TRACE_LOCK_INIT;
 static int g_opened;
 
 static void exit_hook(void)
@@ -679,7 +695,7 @@ static void exit_hook(void)
 PadTrace* pad_trace_global(const PadTraceOptions* o)
 {
     PadTrace* t;
-    pthread_mutex_lock(&g_lock);
+    trace_lock_acquire(&g_lock);
     if (!g_opened) {
         g_trace = pad_trace_open(o);
         g_opened = 1;
@@ -689,7 +705,7 @@ PadTrace* pad_trace_global(const PadTraceOptions* o)
         }
     }
     t = g_trace;
-    pthread_mutex_unlock(&g_lock);
+    trace_lock_release(&g_lock);
     return t;
 }
 
@@ -701,7 +717,7 @@ void pad_trace_poll(PadTrace* t, uint32_t port, PadTraceState* st, const PadTrac
         if (t->replaying) *st = *neutral;
         return;
     }
-    pthread_mutex_lock(&t->lock);
+    trace_lock_acquire(&t->lock);
     flip = t->flip_fn();
     poll = advance_poll(t, port, flip);
 
@@ -744,13 +760,13 @@ void pad_trace_poll(PadTrace* t, uint32_t port, PadTraceState* st, const PadTrac
         }
         flush_if_due(t);
     }
-    pthread_mutex_unlock(&t->lock);
+    trace_lock_release(&t->lock);
 }
 
 void pad_trace_conn(PadTrace* t, uint8_t on[PAD_TRACE_MAX_PORTS])
 {
     uint32_t flip;
-    pthread_mutex_lock(&t->lock);
+    trace_lock_acquire(&t->lock);
     flip = t->flip_fn();
     if (flip > t->max_flip) t->max_flip = flip;
     if (t->replaying && t->nconns) {
@@ -778,15 +794,15 @@ void pad_trace_conn(PadTrace* t, uint8_t on[PAD_TRACE_MAX_PORTS])
         }
         flush_if_due(t);
     }
-    pthread_mutex_unlock(&t->lock);
+    trace_lock_release(&t->lock);
 }
 
 void pad_trace_flush(PadTrace* t)
 {
     if (!t) return;
-    pthread_mutex_lock(&t->lock);
+    trace_lock_acquire(&t->lock);
     if (t->wf && !t->wclosed) wflush(t);
-    pthread_mutex_unlock(&t->lock);
+    trace_lock_release(&t->lock);
 }
 
 void pad_trace_close(PadTrace* t)
@@ -794,7 +810,7 @@ void pad_trace_close(PadTrace* t)
     char sum[256];
     int say = 0;
     if (!t) return;
-    pthread_mutex_lock(&t->lock);
+    trace_lock_acquire(&t->lock);
     if (t->wf && !t->wclosed) {
         uint32_t end = t->flip_fn();
         if (end < t->max_flip) end = t->max_flip;
@@ -811,7 +827,7 @@ void pad_trace_close(PadTrace* t)
         summary(t, sum, sizeof sum);
         say = 1;
     }
-    pthread_mutex_unlock(&t->lock);
+    trace_lock_release(&t->lock);
     if (say) {
         printf("[cellPad] pad replay summary: %s\n", sum);
         fflush(stdout);
@@ -827,7 +843,7 @@ void pad_trace_destroy(PadTrace* t)
 
 void pad_trace_stats(PadTrace* t, PadTraceStats* out)
 {
-    pthread_mutex_lock(&t->lock);
+    trace_lock_acquire(&t->lock);
     *out = t->stats;
-    pthread_mutex_unlock(&t->lock);
+    trace_lock_release(&t->lock);
 }

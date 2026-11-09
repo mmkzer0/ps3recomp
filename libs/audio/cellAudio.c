@@ -79,6 +79,8 @@
   DEFINE_AUDIO_GUID(ps3r_IID_IMMDeviceEnumerator,  0xA95664D2,0x9614,0x4F35,0xA7,0x46,0xDE,0x8D,0xB6,0x36,0x17,0xE6);
   DEFINE_AUDIO_GUID(ps3r_IID_IAudioClient,         0x1CB9AD4C,0xDBFA,0x4c32,0xB1,0x78,0xC2,0xF5,0x68,0xA7,0x03,0xB2);
   DEFINE_AUDIO_GUID(ps3r_IID_IAudioRenderClient,   0xF294ACFC,0x3146,0x4483,0xA7,0xBF,0xAD,0xDC,0xA7,0xC2,0x60,0xE2);
+  DEFINE_AUDIO_GUID(ps3r_IID_IMMNotificationClient,0x7991EEC9,0x7E89,0x4D85,0x83,0x90,0x6C,0x70,0x3C,0xEC,0x60,0xC0);
+  DEFINE_AUDIO_GUID(ps3r_IID_IUnknown,             0x00000000,0x0000,0x0000,0xC0,0x00,0x00,0x00,0x00,0x00,0x00,0x46);
 
   /* Map to the names used in the code */
   #define IID_IMMDeviceEnumerator  ps3r_IID_IMMDeviceEnumerator
@@ -238,28 +240,71 @@ static IAudioRenderClient*  s_wasapi_render = NULL;
 static HANDLE               s_wasapi_event  = NULL;
 static UINT32               s_wasapi_buf_frames = 0;
 
+/* Following the default output device. A stream opened through IMMDevice::Activate stays on the device
+ * it was opened on: when Windows changed the default (a USB headset or a DualSense plugged in, a choice
+ * in the volume flyout) the title went on playing into the old device, and once that device went away
+ * GetCurrentPadding failed with AUDCLNT_E_DEVICE_INVALIDATED and the mix fell back to clock pacing for
+ * the rest of the run, silent. The endpoint notification only raises s_wasapi_reopen; the mix thread,
+ * which owns the stream, reopens it on the new default between two blocks (wasapi_reopen). */
+static IMMDeviceEnumerator* s_wasapi_enum   = NULL;
+static volatile LONG        s_wasapi_reopen = 0;
+
+static HRESULT STDMETHODCALLTYPE wasapi_nc_query(IMMNotificationClient* self, REFIID riid, void** out)
+{
+    if (IsEqualIID(riid, &ps3r_IID_IUnknown) || IsEqualIID(riid, &ps3r_IID_IMMNotificationClient)) {
+        *out = self;
+        return S_OK;
+    }
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+/* The client is a static object: counting references to it has nothing to free. */
+static ULONG STDMETHODCALLTYPE wasapi_nc_addref(IMMNotificationClient* self)  { (void)self; return 1; }
+static ULONG STDMETHODCALLTYPE wasapi_nc_release(IMMNotificationClient* self) { (void)self; return 1; }
+static HRESULT STDMETHODCALLTYPE wasapi_nc_state(IMMNotificationClient* self, LPCWSTR id, DWORD state)
+{ (void)self; (void)id; (void)state; return S_OK; }
+static HRESULT STDMETHODCALLTYPE wasapi_nc_added(IMMNotificationClient* self, LPCWSTR id)
+{ (void)self; (void)id; return S_OK; }
+static HRESULT STDMETHODCALLTYPE wasapi_nc_removed(IMMNotificationClient* self, LPCWSTR id)
+{ (void)self; (void)id; return S_OK; }
+static HRESULT STDMETHODCALLTYPE wasapi_nc_default(IMMNotificationClient* self, EDataFlow flow, ERole role, LPCWSTR id)
+{
+    (void)self; (void)id;
+    if (flow == eRender && role == eConsole) InterlockedExchange(&s_wasapi_reopen, 1);
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE wasapi_nc_property(IMMNotificationClient* self, LPCWSTR id, const PROPERTYKEY key)
+{ (void)self; (void)id; (void)key; return S_OK; }
+
+static IMMNotificationClientVtbl s_wasapi_nc_vtbl = {
+    wasapi_nc_query, wasapi_nc_addref, wasapi_nc_release, wasapi_nc_state,
+    wasapi_nc_added, wasapi_nc_removed, wasapi_nc_default, wasapi_nc_property,
+};
+static IMMNotificationClient s_wasapi_nc = { &s_wasapi_nc_vtbl };
+
+/* Runs on the mix thread, which owns the stream from open to close: WASAPI
+ * requires IAudioRenderClient to be released on the thread that called
+ * GetService, and wasapi_reopen replaces the stream from that thread. The
+ * thread also holds the COM apartment (audio_mix_thread_func). */
 static int audio_backend_init(void)
 {
     HRESULT hr;
 
-    hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
-    if (FAILED(hr) && hr != S_FALSE && hr != RPC_E_CHANGED_MODE) {
-        printf("[cellAudio] CoInitializeEx failed: 0x%08lX\n", hr);
-        return -1;
-    }
-
-    IMMDeviceEnumerator* enumerator = NULL;
-    hr = CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL,
-                          &IID_IMMDeviceEnumerator, (void**)&enumerator);
-    if (FAILED(hr)) {
-        printf("[cellAudio] Failed to create device enumerator: 0x%08lX\n", hr);
-        return -1;
+    /* Kept for the run: it carries the default-device notification. */
+    if (!s_wasapi_enum) {
+        hr = CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL,
+                              &IID_IMMDeviceEnumerator, (void**)&s_wasapi_enum);
+        if (FAILED(hr)) {
+            printf("[cellAudio] Failed to create device enumerator: 0x%08lX\n", hr);
+            s_wasapi_enum = NULL;
+            return -1;
+        }
+        s_wasapi_enum->lpVtbl->RegisterEndpointNotificationCallback(s_wasapi_enum, &s_wasapi_nc);
     }
 
     IMMDevice* device = NULL;
-    hr = enumerator->lpVtbl->GetDefaultAudioEndpoint(enumerator, eRender,
-                                                      eConsole, &device);
-    enumerator->lpVtbl->Release(enumerator);
+    hr = s_wasapi_enum->lpVtbl->GetDefaultAudioEndpoint(s_wasapi_enum, eRender,
+                                                         eConsole, &device);
     if (FAILED(hr)) {
         printf("[cellAudio] Failed to get default audio endpoint: 0x%08lX\n", hr);
         return -1;
@@ -343,7 +388,8 @@ static int audio_backend_init(void)
     return 0;
 }
 
-static void audio_backend_shutdown(void)
+/* The stream alone: the enumerator and its notification stay for wasapi_reopen. */
+static void wasapi_close_stream(void)
 {
     if (s_wasapi_client) {
         s_wasapi_client->lpVtbl->Stop(s_wasapi_client);
@@ -360,6 +406,47 @@ static void audio_backend_shutdown(void)
         CloseHandle(s_wasapi_event);
         s_wasapi_event = NULL;
     }
+}
+
+static void audio_backend_shutdown(void)
+{
+    wasapi_close_stream();
+    if (s_wasapi_enum) {
+        s_wasapi_enum->lpVtbl->UnregisterEndpointNotificationCallback(s_wasapi_enum, &s_wasapi_nc);
+        s_wasapi_enum->lpVtbl->Release(s_wasapi_enum);
+        s_wasapi_enum = NULL;
+    }
+}
+
+/* The default output changed, or the stream's device went away: reopen on the default. With no output
+ * device at all the mix stays on clock pacing until the next change brings one. */
+static void wasapi_reopen(void)
+{
+    InterlockedExchange(&s_wasapi_reopen, 0);
+    wasapi_close_stream();
+    if (audio_backend_init() == 0)
+        printf("[cellAudio] WASAPI: the default output device changed; the stream follows it\n");
+    else
+        printf("[cellAudio] WASAPI: no default output device; clock pacing until one appears\n");
+}
+
+/* The mix thread's side of the stream's life: the COM apartment and the
+ * stream are opened and closed there (audio_backend_init). Returns what
+ * wasapi_thread_close needs to balance the apartment. */
+static HRESULT wasapi_thread_open(void)
+{
+    const HRESULT com = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    if (FAILED(com) && com != RPC_E_CHANGED_MODE)
+        printf("[cellAudio] CoInitializeEx failed: 0x%08lX\n", com);
+    else if (audio_backend_init() < 0)
+        printf("[cellAudio] WARNING: Audio backend init failed, continuing silently\n");
+    return com;
+}
+
+static void wasapi_thread_close(HRESULT com)
+{
+    audio_backend_shutdown();
+    if (SUCCEEDED(com)) CoUninitialize();
 }
 
 static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
@@ -398,8 +485,10 @@ static int audio_backend_room(void)
     UINT32 padding = 0;
     const HRESULT hr = s_wasapi_client->lpVtbl->GetCurrentPadding(s_wasapi_client, &padding);
     if (FAILED(hr)) {
-        /* Device gone (AUDCLNT_E_DEVICE_INVALIDATED on a default-device
-         * change, sleep, ...): pace on the clock rather than spin. */
+        /* Device gone (AUDCLNT_E_DEVICE_INVALIDATED: unplugged, disabled,
+         * sleep): reopen on the default; until then pace on the clock
+         * rather than spin. */
+        if (hr == AUDCLNT_E_DEVICE_INVALIDATED) InterlockedExchange(&s_wasapi_reopen, 1);
         static int _n = 0; if (PS3_LOG_FIRST(_n, 4))
             fprintf(stderr, "[cellAudio] GetCurrentPadding failed 0x%08lX -- clock pacing%c", (unsigned long)hr, 10);
         return -1;
@@ -706,6 +795,10 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
       if (set_mm && !set_mm(L"Pro Audio", &task))
           fprintf(stderr, "[cellAudio] MMCSS Pro Audio unavailable (%lu)%c", (unsigned long)GetLastError(), 10); }
 
+#if AUDIO_BACKEND_WASAPI
+    const HRESULT com = wasapi_thread_open();
+#endif
+
     /* Pace to the device clock. The PS3 consumes one block every 5.33 ms;
      * the old Sleep(2)/Sleep(5) loop keyed on a queue depth the 1056-frame
      * WASAPI buffer can never reach, so it mixed ~225 blocks/s and the device
@@ -716,6 +809,9 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
     unsigned long long blocks = 0;
     uint32_t win_blocks_since_underrun = 0;
     while (s_mix_thread_running) {
+#if AUDIO_BACKEND_WASAPI
+        if (s_wasapi_reopen) wasapi_reopen();
+#endif
         const int room = audio_backend_room();
         if (room >= 0 && room < CELL_AUDIO_BLOCK_SAMPLES) {
             const uint64_t pace_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
@@ -797,6 +893,9 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
         audio_notify_event_queues();
     }
 
+#if AUDIO_BACKEND_WASAPI
+    wasapi_thread_close(com);
+#endif
     printf("[cellAudio] Mixing thread stopped\n");
     return 0;
 }
@@ -977,10 +1076,12 @@ s32 cellAudioInit(void)
     memset(s_notify_queues, 0, sizeof(s_notify_queues));
     mutex_init(&s_audio_mutex);
 
+#if !AUDIO_BACKEND_WASAPI   /* WASAPI's stream is opened by the mix thread */
     if (audio_backend_init() < 0) {
         printf("[cellAudio] WARNING: Audio backend init failed, continuing silently\n");
         /* Don't fail -- games should still run without audio */
     }
+#endif
 
 
 #ifdef _WIN32
@@ -1008,7 +1109,9 @@ s32 cellAudioQuit(void)
         return CELL_AUDIO_ERROR_NOT_INIT;
 
     audio_stop_mix_thread();
+#if !AUDIO_BACKEND_WASAPI   /* the mix thread closed WASAPI's stream as it stopped */
     audio_backend_shutdown();
+#endif
 
     /* Port buffers live in the guest vm_base arena (bump-allocated, not host
      * malloc) -- just drop the references; never free() them. */

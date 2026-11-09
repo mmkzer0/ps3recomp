@@ -118,11 +118,21 @@ unsigned cellGcm_flip_request_count(void);
 /* ---------------------------------------------------------------------------
  * RSX present backend
  * -----------------------------------------------------------------------*/
-/* D3D12 on Windows, Metal on Apple, and the null backend's headless software
- * path anywhere else -- the same selection runtime/host/host_posix.c and the
- * toolkit's boot harness make. All three expose the same three entry points,
- * so the frame clock below is backend-agnostic. */
-#if defined(_WIN32)
+/* Vulkan when the toolkit builds it (-DPS3RECOMP_RSX_VULKAN=ON, Linux or
+ * Windows), else D3D12 on Windows, Metal on Apple, and the null backend's
+ * headless software path anywhere else -- the same selection
+ * runtime/host/host_posix.c and the toolkit's boot harness make. All of them
+ * expose the same three entry points, so the frame clock below is
+ * backend-agnostic. */
+#if defined(PS3RECOMP_RSX_VULKAN)
+extern "C" int  rsx_vulkan_backend_init(uint32_t w, uint32_t h, const char* title);
+extern "C" void rsx_vulkan_backend_present(void);
+extern "C" int  rsx_vulkan_backend_pump_messages(void);
+#  define rsx_backend_init    rsx_vulkan_backend_init
+#  define rsx_backend_present rsx_vulkan_backend_present
+#  define rsx_backend_pump    rsx_vulkan_backend_pump_messages
+#  define RSX_BACKEND_NAME    "Vulkan"
+#elif defined(_WIN32)
 extern "C" int  rsx_d3d12_backend_init(uint32_t w, uint32_t h, const char* title);
 extern "C" void rsx_d3d12_backend_present(void);
 extern "C" int  rsx_d3d12_backend_pump_messages(void);
@@ -138,14 +148,6 @@ extern "C" int  rsx_metal_backend_pump_messages(void);
 #  define rsx_backend_present rsx_metal_backend_present
 #  define rsx_backend_pump    rsx_metal_backend_pump_messages
 #  define RSX_BACKEND_NAME    "Metal"
-#elif defined(PS3RECOMP_RSX_VULKAN)
-extern "C" int  rsx_vulkan_backend_init(uint32_t w, uint32_t h, const char* title);
-extern "C" void rsx_vulkan_backend_present(void);
-extern "C" int  rsx_vulkan_backend_pump_messages(void);
-#  define rsx_backend_init    rsx_vulkan_backend_init
-#  define rsx_backend_present rsx_vulkan_backend_present
-#  define rsx_backend_pump    rsx_vulkan_backend_pump_messages
-#  define RSX_BACKEND_NAME    "Vulkan"
 #else
 extern "C" int  rsx_null_backend_init(uint32_t w, uint32_t h, const char* title);
 extern "C" void rsx_null_backend_present(void);
@@ -297,19 +299,48 @@ static void derive_vfs_root(const char* eboot)
 /* Demand-paging for the flat VM: reserve the whole 4 GB guest space, which
  * costs no commit, and commit each 64 KB page on first access. Every 32-bit
  * guest offset is then valid, so a garbage guest pointer reads zero instead of
- * killing the process. Faults outside the arena fall through untouched. */
+ * killing the process. Faults outside the arena fall through untouched.
+ *
+ * Only the reserved pages of the block are committed: VirtualAlloc over a
+ * committed page also resets its protection, and a guest stack's guard page
+ * (vm_stack_allocate leaves it committed and inaccessible) beside the fault
+ * would quietly become writable. */
+static bool vm_commit_reserved_block(uintptr_t fault)
+{
+    const uintptr_t end = (fault & ~(uintptr_t)0xFFFF) + 0x10000;
+    for (uintptr_t p = fault & ~(uintptr_t)0xFFFF; p < end;) {
+        MEMORY_BASIC_INFORMATION mi;
+        if (!VirtualQuery((void*)p, &mi, sizeof mi))
+            return false;
+        uintptr_t run_end = (uintptr_t)mi.BaseAddress + mi.RegionSize;
+        if (run_end > end) run_end = end;
+        if (mi.State == MEM_RESERVE &&
+            !VirtualAlloc((void*)p, run_end - p, MEM_COMMIT, PAGE_READWRITE))
+            return false;
+        p = run_end;
+    }
+    return true;
+}
+
+/* A fault on a committed page is a real access violation, a guard hit among
+ * them, and falls through as well -- except where another guest thread
+ * faulting on the same block committed the page between the fault and the
+ * query: a read or write to a read-write page cannot fault, so that access is
+ * retried. */
 static LONG WINAPI vm_commit_veh(EXCEPTION_POINTERS* ep)
 {
-    if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
-        ULONG_PTR fault = ep->ExceptionRecord->ExceptionInformation[1];
-        uintptr_t base  = (uintptr_t)vm_base;
-        if (vm_base && fault >= base && fault < base + VM_SIZE) {
-            void* page = (void*)(fault & ~(uintptr_t)0xFFFF);
-            if (VirtualAlloc(page, 0x10000, MEM_COMMIT, PAGE_READWRITE))
-                return EXCEPTION_CONTINUE_EXECUTION;
-        }
-    }
-    return EXCEPTION_CONTINUE_SEARCH;
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
+        return EXCEPTION_CONTINUE_SEARCH;
+    ULONG_PTR access = ep->ExceptionRecord->ExceptionInformation[0];   /* 0 read, 1 write */
+    ULONG_PTR fault  = ep->ExceptionRecord->ExceptionInformation[1];
+    uintptr_t base   = (uintptr_t)vm_base;
+    MEMORY_BASIC_INFORMATION mi;
+    if (!vm_base || fault < base || fault >= base + VM_SIZE ||
+        !VirtualQuery((void*)fault, &mi, sizeof mi))
+        return EXCEPTION_CONTINUE_SEARCH;
+    const bool raced       = mi.State == MEM_COMMIT && access <= 1 && mi.Protect == PAGE_READWRITE;
+    const bool first_touch = mi.State == MEM_RESERVE && vm_commit_reserved_block(fault);
+    return raced || first_touch ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
 }
 #endif
 

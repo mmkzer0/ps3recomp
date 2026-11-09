@@ -249,19 +249,22 @@ cmake -B build -DPS3_MODULE_MAX_FUNCS=1024
 
 Everything under `libs/video/` is compiled into `ps3recomp_runtime` and the
 backend is selected by host platform. The one exception is the Vulkan backend,
-which is opt-in on Linux (`-DPS3RECOMP_RSX_VULKAN=ON`) while it grows:
+which is opt-in on Linux and Windows (`-DPS3RECOMP_RSX_VULKAN=ON`) while it
+grows:
 
 | Host | Backend | Source | Status |
 |------|---------|--------|--------|
-| Windows | **Direct3D 12** | `libs/video/rsx_d3d12_backend.c` | The reference path. Every in-tree port is developed and tested against it. |
+| Windows | **Direct3D 12** | `libs/video/rsx_d3d12_backend.c` | The default, and the path the upstream in-tree ports are developed against. It decodes draws itself and does not run on the shared register-file draw engine, so a title whose fixes live in the engine draws nothing visible on it: *Odin Sphere Leifthrasir* runs at 60 flips a second into a black window. Moving it onto the engine is planned in [`d3d12-draw-engine.md`](d3d12-draw-engine.md). |
+| Windows (opt-in) | Vulkan | `libs/video/rsx_vulkan_backend.c` | The same backend as on Linux, on the draw engine with guest programs on. See below. |
 | macOS | Metal | `libs/video/rsx_metal_backend.m` | Linked against Metal / QuartzCore / Foundation / AppKit. |
 | iOS (Simulator PoC) | Metal in a UIKit `CAMetalLayer` view | `libs/video/rsx_metal_ios_display.m` | Experimental. The app owns UIKit; the RSX backend uses its drawable layer. |
 | Linux | null / headless software | `libs/video/` null path | The default. The guest command stream is executed and validated, but nothing is presented to a window. |
 | Linux (opt-in) | Vulkan | `libs/video/rsx_vulkan_backend.c` | Opt-in. With guest programs on (`PS3RECOMP_VK_GUEST_PROGRAMS=1`) it runs the title's shaders on the shared register-file draw engine, as Metal does; without them, the null backend's fixed-function contract. See below. |
 
-So on Windows a plain `cmake --build` already gives you the working renderer --
-there is nothing to switch on. If you are bringing up a port and want frames on
-screen, build on Windows.
+So on Windows a plain `cmake --build` gives you a renderer with nothing to
+switch on, the one the upstream ports use. A title that depends on the draw
+engine's behaviour, as the register-file titles on Metal and Linux do, needs
+the Vulkan backend there too.
 
 ### Exercising the backend without a game
 
@@ -274,7 +277,7 @@ cmake --build build --target ps3recomp_host
 ./build/ps3recomp_host
 ```
 
-### The Vulkan backend (Linux, opt-in)
+### The Vulkan backend (Linux and Windows, opt-in)
 
 ```bash
 # Headers only -- Debian/Ubuntu: libvulkan-dev, Fedora: vulkan-headers
@@ -286,8 +289,30 @@ cmake --build build --target ps3recomp_host
 `libvulkan` is loaded at run time, so building needs only the headers, which
 also keeps cross-compiling for aarch64 simple (point
 `-DPS3RECOMP_VULKAN_INCLUDE_DIR=` at them if the cross sysroot has none). Only
-Vulkan 1.0 entry points are used; it has been run on Mesa's lavapipe and on
-NVIDIA's L4T driver (Vulkan 1.2, Tegra X1).
+Vulkan 1.0 entry points are used; it has been run on Mesa's lavapipe, on
+NVIDIA's L4T driver (Vulkan 1.2, Tegra X1) and on Windows 11 with an RTX 4060
+(NVIDIA's driver).
+
+**On Windows** the backend loads `vulkan-1.dll`, which the GPU driver
+installs. Building needs the Vulkan SDK, for the headers and for glslang and
+SPIRV-Tools, and SDL2, for the window. Both install without administrator
+rights through scoop, and both make themselves known to CMake: the SDK sets
+`VULKAN_SDK`, and SDL2 adds itself to `CMAKE_PREFIX_PATH`.
+
+```powershell
+scoop install vulkan extras/sdl2
+# in a new shell, from the developer environment (see "Windows" below):
+cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DPS3RECOMP_RSX_VULKAN=ON
+```
+
+The SDK's glslang package configs cannot be used: they sit one directory deeper
+than their own relative paths assume, and they import RelWithDebInfo only. So
+`CMakeLists.txt` names the static libraries itself, with the SDK's `d`-suffixed
+builds for Debug. `SDL2.dll` is the imported location of the `SDL2::SDL2`
+target; a title copies it beside its executable with `$<TARGET_RUNTIME_DLLS>`.
+With SDL2 linked, `cellPad` reads controllers through SDL2's game controller
+API, as it does on Linux and macOS: XInput knows Xbox pads only, SDL2 also the
+DualShock 4 and DualSense. `cellAudio` stays on WASAPI.
 
 | Environment variable | Effect |
 |---|---|
@@ -401,11 +426,20 @@ path for a game target. Older guidance said plain MSVC could not compile the
 runtime because of `__builtin_bswap*` and `__attribute__((weak))`; those are
 guarded now (see `include/ps3emu/endian.h`) and that is no longer true.
 
+**clang-cl takes MSVC's spellings.** It reads `-Wall` as `/Wall`, which is
+`-Weverything` (3266 warnings in one title build), and drops a GCC-style `-f`
+option it does not know with only a warning, which is how `-fwrapv` and
+`-ffp-contract=off` once went missing from a lift. `CMakeLists.txt` passes
+`/W4` and prefixes those options with `/clang:` when
+`CMAKE_C_COMPILER_FRONTEND_VARIANT` is `MSVC`; a title's own flags need the
+same treatment.
+
 **Link Libraries (auto-linked by CMake):**
 - `ws2_32` — Winsock2 for networking (sys_net, cellHttp, cellNet)
 - `xinput` — XInput for gamepad (cellPad)
 - `ole32` — COM initialization for WASAPI audio (cellAudio)
 - `bcrypt` — BCryptGenRandom for cryptographic RNG (cellSsl)
+- `SDL2` — with `PS3RECOMP_RSX_VULKAN`: the Vulkan window and cellPad's controllers
 
 **MSVC Compiler Flags:**
 - `/W3` — Warning level 3
@@ -417,6 +451,25 @@ guarded now (see `include/ps3emu/endian.h`) and that is no longer true.
 
 **Definitions:**
 - `_CRT_SECURE_NO_WARNINGS` — Suppress MSVC CRT security warnings
+
+**Host behaviour a port relies on:**
+- *Guest memory that commits on first touch.* `templates/project/main.cpp`
+  reserves the 4 GB guest space and commits a 64 KB block in a vectored
+  exception handler. The handler commits only the block's reserved pages, so a
+  guest stack's guard page next to the fault stays a guard, and it retries an
+  access to a page another thread committed between the fault and its query.
+  `vm_protect` commits a reserved span with the protection asked for, because
+  `VirtualProtect` refuses pages that are not committed.
+- *Audio follows the default output device.* WASAPI keeps a stream on the
+  device it was opened on; cellAudio registers for default-device changes and
+  reopens the stream on the new default from the mix thread, which owns it from
+  open to close.
+- *Controllers connect at any time.* SDL's Windows joystick drivers get device
+  and RAWINPUT messages through a hidden window of the thread that initialises
+  them, here a guest thread that never pumps messages. cellPad sets
+  `SDL_JOYSTICK_THREAD=1`, so SDL pumps them on a thread of its own. Without it
+  an Xbox controller over Bluetooth was opened at start and then never moved,
+  and a controller connected later was never seen.
 
 > **`dirent.h` is supplied in-tree.** The PPU boot scaffold's filesystem layer
 > walks host directories with `opendir`/`readdir`/`closedir`, none of which
@@ -432,7 +485,7 @@ Clang, Debug and Release on every push). That workflow builds the runtime
 library, runs all eight lifter suites plus the SPU helper tests, and drives
 `ps3recomp_host` end to end against the headless software backend.
 
-> **Renderer:** the opt-in Vulkan backend (see [below](#the-vulkan-backend-linux-opt-in)).
+> **Renderer:** the opt-in Vulkan backend (see [below](#the-vulkan-backend-linux-and-windows-opt-in)).
 > The default is the null backend's headless software path
 > (`libs/video/rsx_null_backend.c`), which rasterises into host memory: a
 > correctness probe for CI, not a renderer. Running a recompiled title from

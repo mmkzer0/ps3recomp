@@ -29,6 +29,7 @@
 
 #include <algorithm>
 #include <deque>
+#include <filesystem>
 #include <map>
 #include <set>
 #include <string>
@@ -192,14 +193,12 @@ std::string current_input_hash()
 
 // ---- directories and blobs ----------------------------------------------------
 
+/* std::filesystem, not mkdir(2): Windows has no POSIX mkdir, and a drive letter is not a directory to make. */
 void mkdir_p(const std::string& path)
 {
-    for (size_t i = 1; i <= path.size(); i++) {
-        if (i != path.size() && path[i] != '/') continue;
-        const std::string part = path.substr(0, i);
-        if (mkdir(part.c_str(), 0777) != 0 && errno != EEXIST)
-            fail("io", "mkdir " + part + ": " + strerror(errno));
-    }
+    std::error_code ec;
+    std::filesystem::create_directories(path, ec);
+    if (ec) fail("io", "mkdir " + path + ": " + ec.message());
 }
 
 bool exists(const std::string& p)
