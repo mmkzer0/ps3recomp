@@ -2,7 +2,7 @@
  * ps3recomp - Vulkan RSX Backend. See rsx_vulkan_backend.h.
  *
  * The file, in order:
- *   loader and device      libvulkan by dlopen, Vulkan 1.0 entry points only;
+ *   loader and device      the Vulkan loader opened at run time, Vulkan 1.0 entry points only;
  *                          device choice, BC textures when the device has them
  *   memory, images, submit helpers
  *   vtable fallback path   the null backend's fixed-function contract:
@@ -38,7 +38,31 @@
  * with spaces.
  */
 
-#ifndef _WIN32
+/* The Vulkan loader and the two locks are the only platform code: the loader
+ * library is opened at run time (vulkan-1.dll on Windows, libvulkan elsewhere),
+ * and neither lock is ever taken recursively, so an SRW lock serves where
+ * there is no pthread.h. */
+#ifdef _WIN32
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+typedef HMODULE vk_lib_handle;
+typedef SRWLOCK vk_mutex;
+static void vk_mutex_init(vk_mutex* m)    { InitializeSRWLock(m); }
+static void vk_mutex_destroy(vk_mutex* m) { (void)m; }
+static void vk_mutex_lock(vk_mutex* m)    { AcquireSRWLockExclusive(m); }
+static void vk_mutex_unlock(vk_mutex* m)  { ReleaseSRWLockExclusive(m); }
+#else
+#  include <dlfcn.h>
+#  include <pthread.h>
+typedef void* vk_lib_handle;
+typedef pthread_mutex_t vk_mutex;
+static void vk_mutex_init(vk_mutex* m)    { pthread_mutex_init(m, NULL); }
+static void vk_mutex_destroy(vk_mutex* m) { pthread_mutex_destroy(m); }
+static void vk_mutex_lock(vk_mutex* m)    { pthread_mutex_lock(m); }
+static void vk_mutex_unlock(vk_mutex* m)  { pthread_mutex_unlock(m); }
+#endif
 
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
@@ -56,13 +80,12 @@
 #include "vulkan/rsx_vk_fallback_vert.spv.h"
 #include "vulkan/rsx_vk_fallback_frag.spv.h"
 
-/* SDL2 is already required off Windows (cellPad, cellAudio); here it only
- * opens the optional window. Same include style as those two. */
+/* SDL2 opens the optional window; off Windows it is required anyway (cellPad,
+ * cellAudio), on Windows only this backend links it. Same include style as
+ * those two. */
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_vulkan.h>
 
-#include <dlfcn.h>
-#include <pthread.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -149,7 +172,7 @@ typedef struct vk_image {
 #define VK_PIPELINE_SLOTS (2 * 2 * 8)   /* ztest x zwrite x compare op */
 
 typedef struct vk_state {
-    void*            lib;
+    vk_lib_handle    lib;
     VkInstance       instance;
     VkPhysicalDevice phys;
     VkDevice         device;
@@ -208,8 +231,8 @@ typedef struct vk_state {
     int              present_inflight;/* copy submitted, not yet finished      */
     int              present_split;   /* inside rsx_vulkan_backend_present_begin */
     int              present_order;   /* the walker's next command buffer waits */
-    pthread_mutex_t  queue_mu;
-    pthread_mutex_t  present_mu;
+    vk_mutex         queue_mu;
+    vk_mutex         present_mu;
 
     /* Optional window (PS3RECOMP_VK_WINDOW=1). Rendering stays offscreen
      * either way -- readback and the tests are unchanged -- and a present
@@ -261,6 +284,15 @@ static vk_state s_vk;
  * -------------------------------------------------------------------------*/
 static int vk_load_library(void)
 {
+#ifdef _WIN32
+    s_vk.lib = LoadLibraryA("vulkan-1.dll");
+    if (!s_vk.lib) {
+        VK_LOG("no Vulkan loader found (LoadLibrary vulkan-1.dll: error %lu)\n", GetLastError());
+        return -1;
+    }
+    pvkGetInstanceProcAddr =
+        (PFN_vkGetInstanceProcAddr)(void (*)(void))GetProcAddress(s_vk.lib, "vkGetInstanceProcAddr");
+#else
     static const char* names[] = { "libvulkan.so.1", "libvulkan.so" };
     for (size_t i = 0; i < sizeof names / sizeof names[0] && !s_vk.lib; i++)
         s_vk.lib = dlopen(names[i], RTLD_NOW | RTLD_LOCAL);
@@ -270,7 +302,8 @@ static int vk_load_library(void)
     }
     pvkGetInstanceProcAddr =
         (PFN_vkGetInstanceProcAddr)dlsym(s_vk.lib, "vkGetInstanceProcAddr");
-    if (!pvkGetInstanceProcAddr) { VK_LOG("libvulkan has no vkGetInstanceProcAddr\n"); return -1; }
+#endif
+    if (!pvkGetInstanceProcAddr) { VK_LOG("the Vulkan loader has no vkGetInstanceProcAddr\n"); return -1; }
 #define LOAD_G(name) \
     if (!(p##name = (PFN_##name)pvkGetInstanceProcAddr(VK_NULL_HANDLE, #name))) \
         { VK_LOG("missing global function " #name "\n"); return -1; }
@@ -561,26 +594,26 @@ static void vk_invalidate(vk_buffer* b)
  * -------------------------------------------------------------------------*/
 static VkResult vk_queue_submit(const VkSubmitInfo* si, VkFence fence)
 {
-    pthread_mutex_lock(&s_vk.queue_mu);
+    vk_mutex_lock(&s_vk.queue_mu);
     const VkResult r = pvkQueueSubmit(s_vk.queue, 1, si, fence);
-    pthread_mutex_unlock(&s_vk.queue_mu);
+    vk_mutex_unlock(&s_vk.queue_mu);
     return r;
 }
 
 static VkResult vk_queue_present(const VkPresentInfoKHR* pi)
 {
-    pthread_mutex_lock(&s_vk.queue_mu);
+    vk_mutex_lock(&s_vk.queue_mu);
     const VkResult r = pvkQueuePresentKHR(s_vk.queue, pi);
-    pthread_mutex_unlock(&s_vk.queue_mu);
+    vk_mutex_unlock(&s_vk.queue_mu);
     return r;
 }
 
 static void vk_device_idle(void)
 {
     if (!s_vk.device || !pvkDeviceWaitIdle) return;
-    pthread_mutex_lock(&s_vk.queue_mu);
+    vk_mutex_lock(&s_vk.queue_mu);
     pvkDeviceWaitIdle(s_vk.device);
-    pthread_mutex_unlock(&s_vk.queue_mu);
+    vk_mutex_unlock(&s_vk.queue_mu);
 }
 
 /* A full execution and memory dependency on everything submitted before
@@ -2172,10 +2205,10 @@ static void vk_cb_present(void* ud, u32 buffer_id)
 {
     (void)ud; (void)buffer_id;
     if (!s_vk.device) return;
-    pthread_mutex_lock(&s_vk.present_mu);
+    vk_mutex_lock(&s_vk.present_mu);
     VkCommandBuffer cb = vk_present_record_begin();
     if (cb) vk_present_record_end(cb);
-    pthread_mutex_unlock(&s_vk.present_mu);
+    vk_mutex_unlock(&s_vk.present_mu);
     s_g.last_draws = s_g.draws;
     s_g.draws = 0;
 }
@@ -2606,7 +2639,7 @@ static void vk_eng_present(void* user, u32 surface)
     if (!s_vk.device) return;
     if (s_eb_pending) vk_eng_flush();   /* the present records on its own buffer */
     vk_eng_obj* o = vk_eng_get(surface, VK_ENG_COLOR);
-    pthread_mutex_lock(&s_vk.present_mu);
+    vk_mutex_lock(&s_vk.present_mu);
     VkCommandBuffer cb = vk_present_record_begin();
     if (cb) {
         s_vk.present_fid_valid = rsx_draw_engine_frame_identity(&s_vk.present_fid);
@@ -2626,7 +2659,7 @@ static void vk_eng_present(void* user, u32 surface)
         }
         vk_present_record_end(cb);
     }
-    pthread_mutex_unlock(&s_vk.present_mu);
+    vk_mutex_unlock(&s_vk.present_mu);
     s_g.last_draws = s_g.draws;
     s_g.draws = 0;
 }
@@ -3998,8 +4031,8 @@ static rsx_backend s_vulkan_backend = {
  * -------------------------------------------------------------------------*/
 static int vk_init_all(u32 width, u32 height, const char* title)
 {
-    pthread_mutex_init(&s_vk.queue_mu, NULL);
-    pthread_mutex_init(&s_vk.present_mu, NULL);
+    vk_mutex_init(&s_vk.queue_mu);
+    vk_mutex_init(&s_vk.present_mu);
     s_vk.width  = width  ? width  : 1280;
     s_vk.height = height ? height : 720;
     s_vk.dump_path = getenv("PS3RECOMP_VK_DUMP");
@@ -4217,10 +4250,14 @@ void rsx_vulkan_backend_shutdown(void)
         pvkDestroyDevice(s_vk.device, NULL);
     }
     if (s_vk.instance && pvkDestroyInstance) pvkDestroyInstance(s_vk.instance, NULL);
+#ifdef _WIN32
+    if (s_vk.lib) FreeLibrary(s_vk.lib);
+#else
     if (s_vk.lib) dlclose(s_vk.lib);
+#endif
     free(s_vk.cpu_verts);
-    pthread_mutex_destroy(&s_vk.queue_mu);
-    pthread_mutex_destroy(&s_vk.present_mu);
+    vk_mutex_destroy(&s_vk.queue_mu);
+    vk_mutex_destroy(&s_vk.present_mu);
     memset(&s_vk, 0, sizeof s_vk);
 }
 
@@ -4267,9 +4304,9 @@ void rsx_vulkan_backend_present_begin(void)
 void rsx_vulkan_backend_present_finish(void)
 {
     if (!s_vk.device) return;
-    pthread_mutex_lock(&s_vk.present_mu);
+    vk_mutex_lock(&s_vk.present_mu);
     vk_present_complete_locked();
-    pthread_mutex_unlock(&s_vk.present_mu);
+    vk_mutex_unlock(&s_vk.present_mu);
 }
 
 u32 rsx_vulkan_backend_presented_center(void)
@@ -4294,5 +4331,3 @@ int rsx_vulkan_backend_depth_bounds(void)
 {
     return s_vk.eng_active && s_vk.depth_bounds_ok;
 }
-
-#endif /* !_WIN32 */
