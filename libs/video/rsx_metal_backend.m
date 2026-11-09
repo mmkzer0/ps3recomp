@@ -5286,8 +5286,10 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
         }
 #endif
         if (s_eng_active && rsx_capture_install_from_config) {
-            rsx_capture_environment env;
-            rsx_metal_backend_capture_environment(&env);
+            /* Zeroed: if the fill fails, the capture refuses an environment with no backend by name
+             * instead of reading stack garbage (rsx_capture_install). */
+            rsx_capture_environment env = {0};
+            (void)rsx_metal_backend_capture_environment(&env);
             rsx_capture_install_from_config(&env);
         }
         fprintf(stderr, "[RSX metal] %s on %s (%ux%u), guest shaders %s, %s path\n",
