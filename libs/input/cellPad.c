@@ -830,6 +830,18 @@ static void pad_init_backend(void)
              * site sets this, whichever runs first. SDL_NO_SIGNAL_HANDLERS=0
              * in the environment still wins. */
             SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
+#ifdef _WIN32
+            /* SDL's Windows joystick drivers learn of devices, and RAWINPUT
+             * of their input, through messages to a hidden window of the
+             * thread that initialises them: this one, a guest thread, which
+             * never pumps messages. An Xbox controller over Bluetooth, which
+             * SDL reads through RAWINPUT, was opened at start and then never
+             * moved, and a controller connected later was never seen (the
+             * DualSense, read by HIDAPI, was not affected). With this hint
+             * SDL pumps those messages on a thread of its own.
+             * SDL_JOYSTICK_THREAD=0 in the environment still wins. */
+            SDL_SetHint(SDL_HINT_JOYSTICK_THREAD, "1");
+#endif
             SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
         }
         s_sdl_inited = 1;
