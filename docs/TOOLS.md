@@ -755,9 +755,10 @@ use.
 
 Reports on a `PS3_FTRACE=<start s>:<seconds>:<file>` timeline
 (`include/ps3emu/ps3_ftrace.h`), a recording of who waits for whom between two
-guest flip requests. `PS3_FTRACE_MIN_US=0` keeps every span and
-`PS3_FTRACE_CAP=<count>` (a plain number) sizes the buffer; the header line
-says `dropped=<n>`.
+guest flip requests. The file is text or zstd (see
+[Compressed traces](#compressed-traces)). `PS3_FTRACE_MIN_US=0` keeps every
+span and `PS3_FTRACE_CAP=<count>` (a plain number) sizes the buffer; the
+header line says `dropped=<n>`.
 
 ```bash
 PS3_FTRACE=90:240:/tmp/ftrace.txt PS3_FTRACE_MIN_US=0 PS3_FTRACE_CAP=25165824 ./title
@@ -1007,8 +1008,34 @@ carrying the items above, the first 20 runs in detail in `events`) and
 the key is null.
 
 Both kinds are recorded whatever `PS3_FTRACE_MIN_US` says. Exit `0` on a
-report, `2` on an unreadable or malformed trace, bad arguments or fewer than
-three flip requests.
+report, `2` on an unreadable, truncated, corrupt or malformed trace, a zstd
+trace with no decoder, bad arguments or fewer than three flip requests.
+
+### Compressed traces
+
+A trace is 100-400 MB of text and is kept zstd-compressed. `ftrace_report.py`
+reads either form from the file's content, not its
+name: a file that starts with the zstd frame magic `28 B5 2F FD` is decoded,
+anything else is read as text exactly as before. A zstd trace is decoded line
+by line while it is read: nothing is unpacked to disk and the file is not read
+into memory first. The decoder is, in order, the standard library's
+`compression.zstd` (Python 3.14+) or a `zstd -dc` child (an argument list, no
+shell, its exit status checked at the end of the stream); with neither, the
+tool exits `2` naming both. A truncated or corrupt stream is exit `2` from
+either decoder, never a report built from the part that decoded.
+
+A `PS3_FTRACE` path ending in `.zst` makes the recorder write a zstd stream:
+`PS3_FTRACE=90:240:/tmp/run1.ftrace.zst`. The header stays free of a libzstd
+link, so the text is piped into a `zstd` child (found on `PATH` when recording
+starts; not found is a `[ftrace]` error and recording stays off). The dump
+writes `<path>.partial` and renames it to `<path>` only when `zstd` exits `0`;
+otherwise it names the status, writes nothing at `<path>` (a file from an
+earlier run stays as it was) and removes the `.partial`. The child gets no
+descriptor beyond stdin, stdout and stderr
+(macOS, and glibc 2.34+ with `_GNU_SOURCE`), and the process ignores `SIGPIPE`
+only while it writes, so a child that died is an error line, not a killed
+process. Windows refuses a `.zst` path at start (`[ftrace] .zst output is not
+supported on Windows; use a text path`).
 
 ---
 
