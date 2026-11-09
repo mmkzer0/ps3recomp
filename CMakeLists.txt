@@ -530,15 +530,28 @@ endif()
 # Compiler flags
 # ---------------------------------------------------------------------------
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+    # clang-cl (the Windows build) reads -Wall as /Wall, which is -Weverything:
+    # thousands of warnings a build, the ones that matter among them. /W4 is
+    # its -Wall -Wextra. It also drops a GCC-style -f option it does not know
+    # with nothing but a warning, so those go through /clang:.
+    if(CMAKE_C_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+        set(_ps3_gnu /clang:)
+        set(_ps3_warnings /W4)
+        # The CRT's "use the _s variant" deprecations, as the cl branch below.
+        target_compile_definitions(ps3recomp_runtime PRIVATE _CRT_SECURE_NO_WARNINGS)
+    else()
+        set(_ps3_gnu "")
+        set(_ps3_warnings -Wall -Wextra)
+    endif()
     target_compile_options(ps3recomp_runtime PRIVATE
-        -Wall -Wextra -Wno-unused-parameter
+        ${_ps3_warnings} -Wno-unused-parameter
         -fno-strict-aliasing
         # No spontaneous fused multiply-add. MSVC never contracts, and x86-64
         # without -mfma has nothing to contract into, so every validated
         # result came from separate multiplies and adds; arm64 has FMA in
         # the base ISA and Clang fuses by default there. A PPC fmadd is
         # spelt as one where the lifter means one.
-        -ffp-contract=off
+        ${_ps3_gnu}-ffp-contract=off
         # Explicit, because the per-config defaults cannot be trusted: this
         # tree's caches carry CMAKE_C_FLAGS_RELEASE="" and CMAKE_CXX_FLAGS_RELEASE="",
         # and clang-cl with no /O flag compiles at /Od -- a "Release" runtime

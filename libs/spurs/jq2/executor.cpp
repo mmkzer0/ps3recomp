@@ -13,7 +13,12 @@
 #include "jq2/port.hpp"
 #include "jq2/sched.hpp"
 
+#ifdef _WIN32
+#include <process.h> /* _beginthreadex: the workers need a stack size std::thread cannot set */
+#include <windows.h>
+#else
 #include <pthread.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -424,11 +429,22 @@ public:
 
     bool start()
     {
+#ifdef _WIN32
+        for (unsigned i = 0; i < workers_; ++i) {
+            auto* arg = new WorkerArg{this, i};
+            const auto t = reinterpret_cast<HANDLE>(_beginthreadex(
+                nullptr, kWorkerStack, &Queue::worker_entry, arg, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr));
+            if (!t) {
+                delete arg;
+                return false;
+            }
+            threads_.push_back(t);
+        }
+        return true;
+#else
         pthread_attr_t attr;
         pthread_attr_init(&attr);
-        /* The loader keeps a whole spu_context (256 KB of local store) on the
-         * worker's stack. */
-        pthread_attr_setstacksize(&attr, 8u << 20);
+        pthread_attr_setstacksize(&attr, kWorkerStack);
         for (unsigned i = 0; i < workers_; ++i) {
             auto* arg = new WorkerArg{this, i};
             pthread_t t;
@@ -441,6 +457,7 @@ public:
         }
         pthread_attr_destroy(&attr);
         return true;
+#endif
     }
 
     /* Workers re-examine the ring: a push or a completion happened. */
@@ -541,7 +558,14 @@ public:
 
     void join_workers()
     {
+#ifdef _WIN32
+        for (HANDLE t : threads_) {
+            WaitForSingleObject(t, INFINITE);
+            CloseHandle(t);
+        }
+#else
         for (pthread_t t : threads_) pthread_join(t, nullptr);
+#endif
         threads_.clear();
     }
 
@@ -672,12 +696,23 @@ private:
         unsigned instance;
     };
 
+    /* The loader keeps a whole spu_context (256 KB of local store) on the worker's stack. */
+    static constexpr unsigned kWorkerStack = 8u << 20;
+
     static void* worker_thunk(void* p)
     {
         std::unique_ptr<WorkerArg> arg(static_cast<WorkerArg*>(p));
         arg->q->worker_loop(arg->instance);
         return nullptr;
     }
+
+#ifdef _WIN32
+    static unsigned __stdcall worker_entry(void* p)
+    {
+        worker_thunk(p);
+        return 0;
+    }
+#endif
 
     [[noreturn]] void stop_ring_entry(const char* reason, const Dispatch& d) const
     {
@@ -967,7 +1002,11 @@ private:
 
     Counters counters_;
     std::array<std::uint32_t, 2> flag_ids_{};
+#ifdef _WIN32
+    std::vector<HANDLE> threads_;
+#else
     std::vector<pthread_t> threads_;
+#endif
 
     std::mutex port_mu_; /* port slot allocation and the attached count */
 
@@ -1672,7 +1711,8 @@ int32_t jq2_queue_create(uint32_t revision, uint32_t sdk_version, uint32_t spurs
     {
         std::lock_guard<std::mutex> lk(g_registry_mu);
         created = g_queues_created;
-        q->set_index(static_cast<std::uint8_t>(std::min(created, 255u)));
+        /* (std::min): vm.h brings in <windows.h>, whose min macro would expand a bare std::min( */
+        q->set_index(static_cast<std::uint8_t>((std::min)(created, 255u)));
         if (!g_queues.emplace(queue, q).second) {
             q->destroy_flags();
             return JQ2_ERR_STAT;
