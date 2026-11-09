@@ -371,7 +371,7 @@ def main():
             assert f['origin'] == 'stack' and 'left its host callback stack slot' in f['hint'], (below, f)
 
         # A guest load or store into the null page is a named stop by default. The
-        # accesses are the ones the Odin canary made (NULL+0x0..0x38 and
+        # accesses are the ones a title made (NULL+0x0..0x38 and
         # NULL+0x5B0..0x5DC), at every width, through the same inline load path
         # the lifted code uses: below 0x10000 it falls back to the checked accessor.
         hexfn = re.compile(r'^0x[0-9A-F]{8}$')

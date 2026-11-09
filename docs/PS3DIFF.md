@@ -326,7 +326,7 @@ Divergence cases (changed ret, masked field, missing tail, interleaving,
 zero overlap) are derived from those fixtures in the test.
 
 The local T1 check additionally round-trips every
-`odin-sphere-m0/fw/trace/*.ndjson` (3,490 call + 3,485 ret records) and
+`fw/trace/*.ndjson` of a private title workspace (3,490 call + 3,485 ret records) and
 compares the result byte for byte; those traces never enter this repository.
 
 ---

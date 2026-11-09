@@ -591,8 +591,8 @@ off), `0x1C0..0x1CF` zero with the SPU number at `0x1C8` and the DMA tag (20) at
 when it is zero, returns `0x80410A11` and stops before `main`. The job manager
 supplies two entries there; the loader does the same from the job runtime area:
 
-- word 0 (the job manager's scheduler switch) is never called by the Odin Sphere
-  images. It points at a `stop 0x3B0E` trap: a call ends the run in the named
+- word 0 (the job manager's scheduler switch) is never called by the images of one
+  title. It points at a `stop 0x3B0E` trap: a call ends the run in the named
   stop `spu-job-jm-entry`.
 - word 1 (the coroutine context swap) is called with the tag status in `r3`
   when a DMA tag the job waits on is not complete. There is no other context to

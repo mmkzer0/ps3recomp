@@ -3,7 +3,7 @@
 
 Everything here is synthetic: the fixtures under ps3diff/fixtures/ carry
 invented labels, hashes of invented bytes, and no game or firmware material.
-The real traces in odin-sphere-m0 are used only for the local T1 round-trip,
+The real traces of a private title workspace are used only for the local T1 round-trip,
 never as a fixture.
 
 The properties under test are the A4 gate: event/1 converts losslessly,

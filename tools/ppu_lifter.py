@@ -5416,7 +5416,7 @@ def main() -> None:
     # Get instructions (and keep the raw executable blobs for worker processes)
     seg_blobs: list[tuple[int, bytes]] = []
     # Start of the executable code, not the executable segment: an ELF's R-X
-    # PT_LOAD begins at the ELF header (Odin: 0x10000, first function 0x10200),
+    # PT_LOAD begins at the ELF header (the first function sits a little past it),
     # so the segment base covers headers and padding that are not code. Filled
     # from the lowest SHF_EXECINSTR section below; None = fall back to the
     # first function bound.
@@ -5806,7 +5806,7 @@ def main() -> None:
             enclosed_cases = set()
             # F4e: only targets inside the executable window may become (or
             # extend) a function. A table entry pointing below .text is data
-            # (Odin: the ELF header at 0x10000), and the bctr lowering stops
+            # (the ELF header at the segment base), and the bctr lowering stops
             # on it instead of trampolining into a bogus func_X.
             jt_targets = {t for t in jt_targets if code_lo <= t < text_hi}
             for disp, cases in tables.items():
@@ -5947,7 +5947,7 @@ def main() -> None:
         lifter.toc_base = toc_candidates[0]
     # The window always needs its start: with --code-end it used to stay 0, so
     # every target below .text was "in code" and a data word misread as a branch
-    # could seed a function below the text start (Odin: 0xFD8/0x6664/0xC664).
+    # could seed a function below the text start (seen: three targets far below it).
     lifter.code_lo = code_lo
     lifter.code_hi = code_hi
     lifter.hle_stub_nids = hle_stubs

@@ -42,12 +42,12 @@ def main():
         return
     code = (PT_LOAD, 0x10000, b'\x60\x00\x00\x00' * 16)
     cases = {
-        'odin-like sdk 4.75': ([code, (PT_PROC_PARAM, 0xB0D2E0, proc_param(0x00475001))], 0x00475001),
-        'other title sdk 3.30': ([code, (PT_PROC_PARAM, 0xB0D2E0, proc_param(0x00330001))], 0x00330001),
-        'sdk 0x280000, the library threshold': ([code, (PT_PROC_PARAM, 0xB0D2E0, proc_param(0x00280000))], 0x00280000),
+        'sdk 4.75': ([code, (PT_PROC_PARAM, 0x600000, proc_param(0x00475001))], 0x00475001),
+        'other title sdk 3.30': ([code, (PT_PROC_PARAM, 0x600000, proc_param(0x00330001))], 0x00330001),
+        'sdk 0x280000, the library threshold': ([code, (PT_PROC_PARAM, 0x600000, proc_param(0x00280000))], 0x00280000),
         'no PROC_PARAM': ([code], SENTINEL),
-        'bad magic': ([code, (PT_PROC_PARAM, 0xB0D2E0, proc_param(0x00475001, magic=0x12345678))], SENTINEL),
-        'too short': ([code, (PT_PROC_PARAM, 0xB0D2E0, proc_param(0x00475001, size=8))], SENTINEL),
+        'bad magic': ([code, (PT_PROC_PARAM, 0x600000, proc_param(0x00475001, magic=0x12345678))], SENTINEL),
+        'too short': ([code, (PT_PROC_PARAM, 0x600000, proc_param(0x00475001, size=8))], SENTINEL),
     }
     with tempfile.TemporaryDirectory(prefix='proc-param-') as tmp:
         tmp = Path(tmp)

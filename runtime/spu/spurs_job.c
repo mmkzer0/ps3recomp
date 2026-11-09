@@ -241,7 +241,7 @@ static void job_rt_plant(uint8_t* ls)
  *           r0, and leaves the tag mask channel at -1) is the swap's whole
  *           observable effect, as docs/JQ2.md argues from the PM's swap.
  *   0x1500  the scheduler switch: a `stop` with SPU_JQ2_JM_CALL_STOP. The
- *           executor names it (jq2-jm-call); no Odin Sphere image calls it. */
+ *           executor names it (jq2-jm-call); no job image examined calls it. */
 static void job_jq2_plant(uint8_t* ls)
 {
     ls32(ls, SPU_JQ2_JM_CALL_LS, SPU_JQ2_JM_CALL_STOP);
@@ -775,7 +775,7 @@ static int run_spurs_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_e
     /* sizeJobDescriptor:4 is the first bitfield of a big-endian u32, so it
      * occupies the TOP 4 bits. 0 means 64 bytes, otherwise n*128. */
     /* The low 28 bits are not padding to a "JOBCRT Ver13"/"Ver14" crt (WWS and
-     * Edge jobs, Twisted Metal's JobQueue jobs, Odin Sphere's): the job manager
+     * Edge jobs, Twisted Metal's JobQueue jobs, and a third title's): the job manager
      * parks an LS pointer to its jm interface there, and the crt returns
      * 0x80410A11 and STOPs before main when it is 0 -- so the job never runs
      * and never clears its completion counter. The interface is the 16 bytes
@@ -997,7 +997,7 @@ static int run_spurs_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_e
         ps3_stop_site site = { ctx.job_rt_ls + JOB_RT_TRAP, ctx.gpr[0]._u32[0] & SPU_LS_MASK, 0 };
         ps3_stop(PS3_STOP_SPU_JOB_JM_ENTRY,
                  "a Ver14 SPURS job called the jm interface's scheduler-switch entry",
-                 "No Odin Sphere job image does; the entry stands for the job manager's "
+                 "No job image examined so far does; the entry stands for the job manager's "
                  "scheduler, which a single job run does not model.",
                  f, sizeof f / sizeof f[0], &site);
     }

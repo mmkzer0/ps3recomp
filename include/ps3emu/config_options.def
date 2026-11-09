@@ -57,7 +57,7 @@ PS3_CFG_BOOL(ppu, opd_swap_fixup, 0,
     "Redirect an indirect call whose ctr is not a lifted function but whose r2 "
     "(the TOC register) is: the guest wrote a function descriptor as {toc, code} "
     "instead of {code, toc}, so the two words are swapped. Off by default. This "
-    "compensates for a title's malformed descriptor (Odin Sphere's flOw-style "
+    "compensates for a title's malformed descriptor (flOw-style "
     "handler tables and teardown vtables are written this way by func_0036FA74); "
     "a swapped OPD is not a PPC ABI guarantee and the redirect can silently run "
     "the wrong function. Off, the call stops as unresolved-indirect-call and its "

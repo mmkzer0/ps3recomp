@@ -258,7 +258,7 @@ static void attribute_tests(Guest& g, uint32_t attr)
     CHECK_EQ(rd32(attr + 0x04), 1u);
     CHECK_EQ(rd32(attr + 0x10), 0u);
     CHECK_EQ(rd8(attr + 0x13), 0u);
-    CHECK_EQ(g.call(0xE70F874Eu, attr, 255, 4), 0u); /* Odin's values */
+    CHECK_EQ(g.call(0xE70F874Eu, attr, 255, 4), 0u); /* one title's values */
 
     /* One byte each, no value validation (firmware stores the low byte). */
     struct Flag {
