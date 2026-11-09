@@ -1,4 +1,4 @@
-/* The FIFO walker's side of an RSX capture (rsx_capture.h, ps3diff.rsx/1).
+/* The FIFO walker's side of an RSX capture (rsx_capture.h, ps3diff.rsx/2).
  *
  * Runs the real cellGcm_rsx_process_fifo over a synthetic ring with a capture open, and leaves the
  * capture in the directory named by argv[1] for tools/test_rsx_capture.py to check:
@@ -101,7 +101,10 @@ int main(int argc, char** argv)
     ppu_vm_size = vm_size;
 
     rsx_capture_options opt = { argv[1], 0 };
-    rsx_capture_environment env = { "synthetic", "n/a", "n/a", "Debug", "n/a", "n/a", "synthetic", "n/a" };
+    rsx_capture_environment env = {
+        .os = "n/a", .os_version = "n/a", .backend = "metal", .device = "synthetic", .driver = "n/a",
+        .build = "Debug", .glslang = "n/a", .spirv_cross = "n/a", .toolkit_sha = "synthetic", .title_sha = "n/a",
+    };
     (void)rsx_capture_install(&env, &opt);
 
     const u32 ring0 = 0x1000;                          /* the first segment: GET after SetupContext */

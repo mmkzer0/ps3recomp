@@ -1,4 +1,4 @@
-/* The draw engine's side of an RSX capture (rsx_capture.h, ps3diff.rsx/1).
+/* The draw engine's side of an RSX capture (rsx_capture.h, ps3diff.rsx/2).
  *
  * The engine runs against the recording stub backend and a synthetic guest memory, driven by the
  * capture's own sink the way the FIFO walker drives it: one step per method packet, the engine's
@@ -90,7 +90,10 @@ int main(int argc, char** argv)
     if (rsx_draw_engine_init(64, 64) != 0) { puts("[FAIL] engine init"); return 1; }
 
     rsx_capture_options opt = { argv[1], 0 };
-    rsx_capture_environment env = { "synthetic", "n/a", "n/a", "Debug", "n/a", "n/a", "synthetic", "n/a" };
+    rsx_capture_environment env = {
+        .os = "n/a", .os_version = "n/a", .backend = "metal", .device = "synthetic", .driver = "n/a",
+        .build = "Debug", .glslang = "n/a", .spirv_cross = "n/a", .toolkit_sha = "synthetic", .title_sha = "n/a",
+    };
     (void)rsx_capture_install(&env, &opt);
     g_sink->gcm_init(0x80000, 0x400000, 0x100000);
     g_sink->display_buffer(1, 0x40000, 256, 64, 64);

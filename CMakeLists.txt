@@ -1911,9 +1911,9 @@ if(UNIX)
         endforeach()
     endif()
 
-    # The RSX capture replay runner (docs/RSX_GRAPHICS.md, "Replay"): a ps3diff.rsx/1 capture through the
-    # real FIFO walker, draw engine and headless Metal backend, with no title. It links the whole runtime
-    # library, like ps3recomp_host, so it runs the code the title runs, not a copy of it.
+    # The RSX capture replay runner (docs/RSX_GRAPHICS.md, "Replay") reads ps3diff.rsx/1 and /2 captures
+    # through the real FIFO walker, draw engine and headless Metal backend, with no title. It links the whole
+    # runtime library, like ps3recomp_host, so it runs the code the title runs, not a copy of it.
     if(APPLE AND PS3RECOMP_MSL_TRANSLATION)
         add_executable(rsx_replay
             tools/rsx_replay/rsx_replay.cpp
@@ -2008,7 +2008,7 @@ if(UNIX)
     add_test(NAME test_rsx_flip_semantics COMMAND test_rsx_flip_semantics)
     set_tests_properties(test_rsx_flip_semantics PROPERTIES LABELS "rsx;t0" TIMEOUT 120)
 
-    # The RSX capture (ps3diff.rsx/1), producer side. Both fixtures leave a capture in a directory and
+    # The RSX capture (ps3diff.rsx/2) writer side. Both fixtures leave a capture in a directory and
     # tools/test_rsx_capture.py checks it: the walker's (executed order, binds, labels, a wait that is
     # not an event) and the engine's (draws, the buffer as each draw consumed it, drops, frames).
     # No GPU, no game content. They link only what they test, like the other single-TU fixtures.

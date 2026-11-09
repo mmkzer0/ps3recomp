@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""rsx_replay: capture -> replay on a Metal device, determinism, and every way a replay must refuse.
+"""rsx_replay: /2 writer, /1 compatibility, and synthetic capture replay/refusal behavior.
 
 usage: test_rsx_replay.py <rsx_replay> <test_rsx_replay_scene>
 
@@ -30,6 +30,8 @@ from ps3diff.schema import canonical_json, read_ndjson  # noqa: E402
 REPLAY = SCENE = None
 FAILS = 0
 INPUT_EVENTS = {"capture-start", "gcm-init", "gcm-state", "fifo-method", "fifo-branch", "fifo-word", "fifo-nop"}
+SCHEMA_V1 = "ps3diff.rsx/1"
+SCHEMA_V2 = "ps3diff.rsx/2"
 
 
 def check(ok, what):
@@ -82,7 +84,7 @@ def write_records(cap, recs, rehash=True):
         for r in recs:
             line = canonical_json(r)
             if r["event"] in INPUT_EVENTS:
-                h.update(line.encode("ascii") + b"\n")
+                h.update(line.replace(f'"schema":"{SCHEMA_V2}"', f'"schema":"{SCHEMA_V1}"', 1).encode("ascii") + b"\n")
             elif r["event"] in ("frame-complete", "capture-end"):
                 r["capture_hash"]["value"] = h.hexdigest()
     (Path(cap) / "capture.ndjson").write_text("".join(canonical_json(r) + "\n" for r in recs))
@@ -93,6 +95,23 @@ def mutate(src, dst, edit, rehash=True):
     recs = records(dst)
     edit(recs)
     write_records(dst, recs, rehash)
+    return dst
+
+
+def legacy_capture(src, dst):
+    shutil.copytree(src, dst)
+    recs = records(dst)
+    for rec in recs:
+        rec["schema"] = SCHEMA_V1
+        if rec["event"] == "environment":
+            machine = rec["machine"]
+            rec["machine"] = {
+                "gpu": machine["device"],
+                "macos": machine["os_version"],
+                "metal": machine["driver"],
+                **{key: machine[key] for key in ("build", "glslang", "spirv_cross", "toolkit_sha", "title_sha")},
+            }
+    write_records(dst, recs, rehash=True)
     return dst
 
 
@@ -135,6 +154,26 @@ def test_round_trip(tmp, live):
         check(s == 0 and "equal" in text, f"ps3diff rsx-compare live {mf}: equal ({s})")
     s, text = cli("rsx-compare", str(Path(tmp) / "r1.manifest" / "capture.ndjson"), str(Path(tmp) / "r2.manifest" / "capture.ndjson"))
     check(s == 0, f"ps3diff rsx-compare r1 r2: equal ({s})")
+
+    legacy = legacy_capture(live, Path(tmp) / "legacy")
+    status, text = cli("validate", str(legacy / "capture.ndjson"))
+    check(status == 0, f"the /1 fixture validates ({text.strip()})")
+    status, text = cli("rsx-compare", str(legacy / "capture.ndjson"), str(legacy / "capture.ndjson"), "--json")
+    report = json.loads(text)
+    check(status == 0 and report["schema_a"] == SCHEMA_V1 and report["schema_b"] == SCHEMA_V1,
+          "the /1 fixture compares with itself")
+    legacy_status, legacy_report, _ = replay(tmp, legacy, "legacy")
+    check(legacy_status == 0 and legacy_report and legacy_report["status"] == "equal",
+          f"rsx_replay accepts the /1 fixture ({legacy_status}, {legacy_report and legacy_report['status']})")
+    manifest = Path(tmp) / "legacy.manifest"
+    manifest_records = records(manifest)
+    check(all(rec["schema"] == SCHEMA_V2 for rec in manifest_records),
+          "replaying /1 writes a /2 manifest")
+    status, text = cli("rsx-compare", str(legacy / "capture.ndjson"),
+                       str(manifest / "capture.ndjson"), "--json")
+    report = json.loads(text)
+    check(status == 0 and report["schema_a"] == SCHEMA_V1 and report["schema_b"] == SCHEMA_V2,
+          f"the /1 capture compares equal with the /2 replay manifest ({status})")
 
     s, r, _ = replay(tmp, live, "range", "--frames", "1")
     check(s == 0 and r["compared"] == 1 and r["frames"] == {"from": 1, "to": 1}, f"--frames 1 compares the one frame ({s})")
@@ -219,14 +258,13 @@ def test_manifest_edits(tmp, live):
     check(s == 1 and r["status"] == "differ" and r["first"].startswith("flip 1: frame_hash"),
           f"a frame hash the replay does not reproduce is a difference, exit 1 ({s}, {r and r['first']})")
 
-    # The environment is somebody else's machine.
-    def gpu(recs):
+    def device(recs):
         e = next(x for x in recs if x["event"] == "environment")
-        e["machine"]["gpu"] = "Some Other GPU"
-    mutate(live, Path(tmp) / "env", gpu, rehash=False)
+        e["machine"]["device"] = "Some Other GPU"
+    mutate(live, Path(tmp) / "env", device, rehash=False)
     s, r, err = replay(tmp, Path(tmp) / "env", "env")
-    check(s == 4 and r["status"] == "not-comparable" and r["environment"]["differs"] == ["gpu"] and "not comparable" in err,
-          f"an environment mismatch reports not comparable, exit 4 ({s}, {r and r['status']})")
+    check(s == 4 and r["status"] == "not-comparable" and r["environment"]["differs"] == ["device"] and "not comparable" in err,
+          f"a normalized machine mismatch reports not comparable, exit 4 ({s}, {r and r['status']})")
     check(r["results"] == [] and r["steps"] == 0, "...and nothing was replayed")
 
     # A capture that was never closed.
@@ -264,6 +302,13 @@ def patch_method(cap, old, new):
 def test_refusals(tmp, live):
     s, r, _ = replay(tmp, live, "fixed-function", env={"PS3RECOMP_METAL_FIXED_FUNCTION": "1"})
     check(s == 2 and error_of(r) == "fixed-function", f"a fixed-function fallback is refused by name ({s}, {error_of(r)})")
+
+    unknown_schema = mutate(
+        live, Path(tmp) / "unknown-schema", lambda recs: [rec.update(schema="ps3diff.rsx/9") for rec in recs],
+        rehash=False)
+    s, _, err = replay(tmp, unknown_schema, "unknown-schema")
+    check(s == 70 and "kind=rsx-capture" in err and "reason=unknown-schema" in err and "ps3diff.rsx/9" in err,
+          f"an unknown capture schema stops by name ({s})")
 
     # Fail-before/after for the live stop, on the same capture: one method number differs.
     unk = scene(tmp, "unknown")

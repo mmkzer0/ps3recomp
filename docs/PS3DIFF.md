@@ -333,6 +333,10 @@ compares the result byte for byte; those traces never enter this repository.
 
 ## `ps3diff.rsx/1`: an RSX capture
 
+`/1` is the legacy capture envelope. It remains readable and is not deprecated; new writers emit
+only `/2`, described below. `/1` will not be deprecated until `/2` has carried a full title A/B
+comparison (#129), and no deprecation warning is emitted now.
+
 A sibling schema in the same package for slice H1b (M3): the command stream the RSX
 consumed and every guest-memory input it consumed with it, recorded at the moment of
 consumption. The envelope rules are event/2's (strict fields, strictly increasing `seq`,
@@ -435,9 +439,9 @@ macOS only (CMake target `rsx_replay`, built with the Metal backend and the shad
 replays the capture through the same FIFO walker, draw engine and headless Metal backend the title
 ran, with guest shaders on; a build or run that would fall back to the fixed-function pipeline is
 refused by name (`fixed-function`). The replay is itself captured by the same writer: its
-**manifest** (`DIR`, default `<report>.manifest`, else a temporary directory) is a `ps3diff.rsx/1`
-capture, so `ps3diff rsx-compare live/capture.ndjson DIR/capture.ndjson` works on it, and a replay
-that reproduced the inputs has the live capture's input hash frame for frame.
+**manifest** (`DIR`, default `<report>.manifest`, else a temporary directory) is a `ps3diff.rsx/2`
+capture. It compares directly with either a `/1` or `/2` input capture, and a replay that reproduced
+the inputs has the live capture's input hash frame for frame.
 
 `--frames a-b` (or `a`) names the flips to compare, by `flip_id`. A replay always starts at the
 clean reset and runs through the last frame named, because the register file, the surfaces and
@@ -484,3 +488,45 @@ The report is `ps3diff.rsx.replay/1` JSON: `status`, `exit`, `capture_hash`, `ga
 `environment` (live, replay, differs), `error`, `first`, and per frame the identity,
 `present_seq` (live and replay), `result` and the hashes of both sides. The environment's
 `title_sha` is carried over from the capture (it names who produced the inputs, not what renders them).
+
+## `ps3diff.rsx/2`: the current RSX capture
+
+The writer (`libs/video/rsx_capture.cpp`) emits only `ps3diff.rsx/2`. The envelope, events and replay
+semantics are those defined for `/1` above; the schema string and the `environment.machine` record
+are the changes. A capture must use one schema on every record. A mixed-schema capture is invalid,
+and an unsupported schema is named rather than guessed.
+
+### Machine record
+
+`environment.machine` has exactly these non-empty string fields:
+
+| Field | Meaning |
+|---|---|
+| `os` | Host operating system name, such as `macOS` |
+| `os_version` | Host operating system version |
+| `backend` | Rendering backend: `metal` or `vulkan` |
+| `device` | GPU or rendering device name |
+| `driver` | Graphics driver or API version; `n/a` when unavailable |
+| `build` | Toolkit build type |
+| `glslang` | glslang version, or `n/a` when unavailable |
+| `spirv_cross` | SPIRV-Cross version, or `n/a` when unavailable |
+| `toolkit_sha` | Toolkit source revision |
+| `title_sha` | Title executable fingerprint that produced the inputs |
+
+`ps3diff.rsx/1` records are normalized losslessly to the same in-memory machine model: `os` is
+`macOS`, `os_version` comes from `macos`, `backend` is `metal`, `device` comes from `gpu`, and
+`driver` comes from `metal`; `build`, `glslang`, `spirv_cross`, `toolkit_sha` and `title_sha` retain
+their names and values. `validate`, `rsx-compare` and replay use this normalized model. Comparison
+therefore works across `/1` and `/2`; different normalized machine fields still mean
+**not comparable**, not a pass or a failure. Both input schema names appear in the comparison
+report.
+
+The `input-events/v1` capture hash is stable across the envelope change: `/2` hashes each canonical
+input line with only its `schema` value normalized to `ps3diff.rsx/1`. Thus an equivalent `/1`
+capture retains its input hash. The strings `ps3diff.rsx/1 draw-state/v1` and
+`ps3diff.rsx/1 frame-state/v1` likewise remain byte-identical: those tags version state-hash
+semantics, not the capture envelope.
+
+Replay accepts `/1` and `/2` captures and always writes its manifest as `/2`, so the manifest can
+be compared directly with the replayed capture. `/1` remains readable without a deprecation
+warning; deprecation waits until `/2` has carried a full title A/B comparison (#129).

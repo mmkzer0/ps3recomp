@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ps3diff.rsx/1: the producer's captures, the validator's failure paths, the comparison.
+"""ps3diff.rsx/2 writer and compatibility reader: captures, validation and comparison.
 
 usage: test_rsx_capture.py <test_rsx_capture_walker> <test_rsx_capture_engine>
 
@@ -23,6 +23,10 @@ sys.path.insert(0, str(ROOT / "tools"))
 from ps3diff.cli import main as cli_main  # noqa: E402
 from ps3diff.rsx import validate_rsx  # noqa: E402
 from ps3diff.schema import Ps3DiffError, canonical_json, read_ndjson  # noqa: E402
+
+SCHEMA_V1 = "ps3diff.rsx/1"
+SCHEMA_V2 = "ps3diff.rsx/2"
+INPUT_EVENTS = {"capture-start", "gcm-init", "gcm-state", "fifo-method", "fifo-branch", "fifo-word", "fifo-nop"}
 
 WALKER = ENGINE = None
 FAILS = 0
@@ -76,11 +80,40 @@ def rewrite(src, dst, edit):
     edit(recs)
     p.write_text("".join(canonical_json(r) + "\n" for r in recs))
 
+def hash_input_line(record):
+    line = canonical_json(record)
+    return line.replace(f'"schema":"{SCHEMA_V2}"', f'"schema":"{SCHEMA_V1}"', 1)
+
+
+def legacy_capture(src, dst):
+    """Make a /1 fixture from the same synthetic content, preserving its legacy input hashes."""
+    shutil.copytree(src, dst)
+    path = Path(dst) / "capture.ndjson"
+    recs = [rec for _, _, rec in read_ndjson(str(path))]
+    for rec in recs:
+        rec["schema"] = SCHEMA_V1
+        if rec["event"] == "environment":
+            machine = rec["machine"]
+            rec["machine"] = {
+                "gpu": machine["device"],
+                "macos": machine["os_version"],
+                "metal": machine["driver"],
+                **{key: machine[key] for key in ("build", "glslang", "spirv_cross", "toolkit_sha", "title_sha")},
+            }
+    running = hashlib.sha256()
+    for rec in recs:
+        if rec["event"] in INPUT_EVENTS:
+            running.update(hash_input_line(rec).encode("ascii") + b"\n")
+        elif rec["event"] in ("frame-complete", "capture-end"):
+            rec["capture_hash"]["value"] = running.hexdigest()
+    path.write_text("".join(canonical_json(rec) + "\n" for rec in recs))
+    return path
+
 
 # ------------------------------------------------------------------ synthetic captures, built here
 
 class Builder:
-    """Writes a minimal valid capture the way the C writer does, to break one rule at a time."""
+    """Writes a minimal valid /2 capture the way the C writer does, to break one rule at a time."""
 
     IO_EA = 0x100000
 
@@ -90,21 +123,24 @@ class Builder:
         self.lines = []
         self.seq = 0
         self.consume = 0
+        self.frames = 0
         self.running = hashlib.sha256()
         self.add("capture-start", bootstrap={"mode": "clean-reset"}, producer="ps3recomp")
-        self.add("environment", machine={k: "synthetic" for k in
-                                         ("gpu", "macos", "metal", "build", "glslang", "spirv_cross",
-                                          "toolkit_sha", "title_sha")}, _input=False)
+        self.add("environment", machine={
+            "os": "macOS", "os_version": "Synthetic OS", "backend": "metal", "device": "synthetic GPU",
+            "driver": "Synthetic Metal", "build": "Debug", "glslang": "synthetic", "spirv_cross": "synthetic",
+            "toolkit_sha": "synthetic", "title_sha": "n/a",
+        }, _input=False)
 
     def add(self, event, _input=True, **fields):
-        rec = {"schema": "ps3diff.rsx/1", "seq": self.seq, "ctx_seq": self.seq, "t": 0.0, "thread": "rsx",
+        rec = {"schema": SCHEMA_V2, "seq": self.seq, "ctx_seq": self.seq, "t": 0.0, "thread": "rsx",
                "event": event, "ctx": {"kind": "ppu", "id": "rsx"}}
         rec.update(fields)
         self.seq += 1
         line = canonical_json(rec)
         self.lines.append(line)
         if _input:
-            self.running.update(line.encode() + b"\n")
+            self.running.update(hash_input_line(rec).encode("ascii") + b"\n")
 
     def blob(self, data, offset, kind="fifo"):
         sha = hashlib.sha256(data).hexdigest()
@@ -133,17 +169,75 @@ class Builder:
         word = {"jump": 0x20000000 | target, "call": target | 2, "ret": 0x00020000}[kind]
         self.fifo(get, [word], "fifo-branch", call_ret, kind=kind, target=f"0x{target:08x}")
 
+    def frame(self):
+        self.add("frame-complete", _input=False,
+                 frame={"flip_id": self.frames, "guest_frame": self.frames, "display_buffer": 0,
+                        "present_seq": self.frames},
+                 capture_hash={"algo": "sha256", "scope": "input-events/v1", "value": self.running.hexdigest()},
+                 state_hash={"algo": "sha256", "scope": "frame-state/v1", "value": "a" * 64},
+                 frame_hash={"algo": "sha256", "scope": "raw-readback/v1",
+                             "value": hashlib.sha256(bytes(4)).hexdigest()},
+                 readback={"format": "rgba8-unorm", "channel_order": "rgba", "row_pitch": 4, "alpha": "kept",
+                           "colorspace": "linear", "clamp": "none", "width": 1, "height": 1},
+                 draws={"submitted": 0, "executed": 0, "dropped": {}, "fixed_function": 0},
+                 unknown_methods=0, resyncs=0, valid=True, invalid=[])
+        self.frames += 1
+
     def finish(self):
-        self.add("capture-end", _input=False, frames=0, events=self.seq,
+        self.add("capture-end", _input=False, frames=self.frames, events=self.seq,
                  capture_hash={"algo": "sha256", "scope": "input-events/v1", "value": self.running.hexdigest()})
         (self.root / "capture.ndjson").write_text("\n".join(self.lines) + "\n")
         return self.root / "capture.ndjson"
+
 
 
 def synth(tmp, name, body):
     b = Builder(Path(tmp) / name)
     body(b)
     return b.finish()
+
+
+def test_schema_versions(tmp):
+    def framed(builder):
+        builder.gcm_init()
+        builder.frame()
+
+    v2 = synth(tmp, "schema-v2", framed)
+    check(validation_error(v2) is None, "a synthetic /2 writer capture validates")
+
+    v1 = legacy_capture(Path(v2).parent, Path(tmp) / "schema-v1")
+    check(validation_error(v1) is None, "a synthetic /1 fixture validates")
+    status, text = cli("rsx-compare", str(v1), str(v1), "--json")
+    report = json.loads(text)
+    check(status == 0 and report["status"] == "equal" and report["schema_a"] == SCHEMA_V1 and
+          report["schema_b"] == SCHEMA_V1, "a /1 capture compares with itself and reports both schemas")
+
+    status, text = cli("rsx-compare", str(v1), str(v2), "--json")
+    report = json.loads(text)
+    check(status == 0 and report["status"] == "equal" and report["schema_a"] == SCHEMA_V1 and
+          report["schema_b"] == SCHEMA_V2, "identical /1 and /2 content compares equal and names both schemas")
+
+    def device_mismatch(records):
+        records[1]["machine"]["device"] = "another GPU"
+    mismatch = Path(tmp) / "schema-mismatch"
+    rewrite(Path(v2).parent, mismatch, device_mismatch)
+    status, text = cli("rsx-compare", str(v1), str(mismatch / "capture.ndjson"), "--json")
+    report = json.loads(text)
+    check(status == 4 and report["status"] == "not-comparable" and "device" in report["environment"],
+          "a normalized machine mismatch is not comparable across schemas")
+
+    mixed = Path(tmp) / "schema-mixed"
+    rewrite(Path(v2).parent, mixed, lambda records: records[1].update(schema=SCHEMA_V1))
+    error = validation_error(mixed / "capture.ndjson")
+    check(error and "mixed schemas" in error and SCHEMA_V1 in error and SCHEMA_V2 in error,
+          f"mixed schemas are rejected by name ({error})")
+
+    unknown = Path(tmp) / "schema-unknown"
+    rewrite(Path(v2).parent, unknown, lambda records: records[0].update(schema="ps3diff.rsx/9"))
+    error = validation_error(unknown / "capture.ndjson")
+    status, text = cli("validate", str(unknown / "capture.ndjson"))
+    check(error and "ps3diff.rsx/9" in error and status == 2 and "ps3diff.rsx/9" in text,
+          f"an unknown schema is a named validation error ({error})")
 
 
 def test_validator_failure_paths(tmp):
@@ -223,6 +317,9 @@ def test_walker(tmp):
     names = [e["event"] for e in ev]
     check(names[:3] == ["capture-start", "environment", "gcm-init"], "capture-start, environment, gcm-init open it")
     check(ev[-1]["event"] == "capture-end" and ev[-1]["frames"] == 0, "capture-end closes it")
+    check(all(rec["schema"] == SCHEMA_V2 for rec in ev) and set(ev[1]["machine"]) ==
+          {"os", "os_version", "backend", "device", "driver", "build", "glslang", "spirv_cross", "toolkit_sha",
+           "title_sha"}, "the native writer emits only /2 with the fixed machine fields")
     steps = [e for e in ev if e["event"].startswith("fifo-")]
     seq = [(e["event"], e.get("method") or e.get("kind") or e.get("words")) for e in steps]
     check(seq == [("fifo-method", "0x0000"), ("fifo-method", "0x0200"), ("fifo-nop", 3), ("fifo-method", "0x0000"),
@@ -318,12 +415,12 @@ def test_engine(tmp):
     # The environment decides whether a comparison means anything.
     e = Path(tmp) / "engine-env"
 
-    def gpu(recs):
-        recs[1]["machine"]["gpu"] = "another gpu"
-    rewrite(a, e, gpu)
+    def device(recs):
+        recs[1]["machine"]["device"] = "another gpu"
+    rewrite(a, e, device)
     s, text = cli("rsx-compare", str(a / "capture.ndjson"), str(e / "capture.ndjson"))
-    check(s == 4 and "not-comparable" in text and "gpu" in text,
-          f"differing environment records are 'not comparable', neither pass nor fail ({s})")
+    check(s == 4 and "not-comparable" in text and "device" in text,
+          f"differing normalized machine records are 'not comparable', neither pass nor fail ({s})")
 
     # Failure paths of the validator, on this capture.
     def blob_path(sha):
@@ -423,6 +520,7 @@ def main():
     if have_fixtures:
         WALKER, ENGINE = sys.argv[1], sys.argv[2]
     with tempfile.TemporaryDirectory(prefix="rsx-capture-") as tmp:
+        test_schema_versions(tmp)
         test_validator_failure_paths(tmp)
         if have_fixtures:
             test_walker(tmp)

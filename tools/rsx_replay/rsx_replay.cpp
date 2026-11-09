@@ -1,11 +1,11 @@
 /*
  * rsx_replay <capture-dir> [--frames a-b] [--out report.json] [--manifest dir] [--accept-unknown-methods]
  *
- * Replays a ps3diff.rsx/1 capture (docs/PS3DIFF.md) through the same FIFO walker, register-file draw engine
+ * Replays a ps3diff.rsx/1 or /2 capture (docs/PS3DIFF.md) through the same FIFO walker, register-file draw engine
  * and headless Metal backend the title ran, without the title. Per recorded step: write the step's blobs to
  * their guest addresses, run the walker over exactly that step (cellGcm_rsx_replay_step), and check what the
  * RSX wrote back (label RELEASE, report, NV0039 destination) against the recording. The replay is itself
- * captured by the same writer, so its manifest is a ps3diff.rsx/1 file `ps3diff rsx-compare` accepts.
+ * captured by the current writer, so its manifest is a ps3diff.rsx/2 file `ps3diff rsx-compare` accepts.
  *
  * Determinism: one thread does everything (the title runs the walker, the engine and the backend on one
  * thread too); the host clock reaches the replay nowhere (GET_REPORT timers are the recorded ones, see
@@ -23,6 +23,7 @@
 #include "rsx_metal_backend.h"
 #include "ps3emu/config.h"
 #include "ps3emu/sha256.h"
+#include "ps3emu/stop.h"
 
 #include <sys/mman.h>
 #include <errno.h>
@@ -50,6 +51,9 @@ namespace {
 
 constexpr u32 kVmSize = 0xE0000000u;        /* what the title maps: local memory ends at 0xD0000000 */
 constexpr u64 kBlobCacheCap = 512ull << 20;
+
+constexpr const char* kSchemaV1 = "ps3diff.rsx/1";
+constexpr const char* kSchemaV2 = "ps3diff.rsx/2";
 
 struct Err {
     std::string name, detail;
@@ -100,6 +104,88 @@ struct J {
     }
 };
 
+J string_value(const char* value)
+{
+    J out;
+    out.t = J::Str;
+    out.s = value;
+    return out;
+}
+
+void add_field(J& object, const char* key, const J& value)
+{
+    object.o.emplace_back(key, value);
+}
+
+void validate_machine(const J& machine, const char* const* fields, size_t count)
+{
+    if (machine.t != J::Obj || machine.o.size() != count)
+        fail("capture-format", "environment.machine has the wrong number of fields");
+    for (size_t i = 0; i < count; i++) {
+        const J* value = machine.find(fields[i]);
+        if (!value || value->t != J::Str || value->s.empty())
+            fail("capture-format", std::string("environment.machine.") + fields[i] + " must be a non-empty string");
+    }
+}
+
+J read_v1_machine(const J& record)
+{
+    static const char* const fields[] = {
+        "gpu", "macos", "metal", "build", "glslang", "spirv_cross", "toolkit_sha", "title_sha",
+    };
+    const J& machine = record.at("machine");
+    validate_machine(machine, fields, sizeof fields / sizeof fields[0]);
+    J normalized;
+    normalized.t = J::Obj;
+    add_field(normalized, "os", string_value("macOS"));
+    add_field(normalized, "os_version", machine.at("macos"));
+    add_field(normalized, "backend", string_value("metal"));
+    add_field(normalized, "device", machine.at("gpu"));
+    add_field(normalized, "driver", machine.at("metal"));
+    add_field(normalized, "build", machine.at("build"));
+    add_field(normalized, "glslang", machine.at("glslang"));
+    add_field(normalized, "spirv_cross", machine.at("spirv_cross"));
+    add_field(normalized, "toolkit_sha", machine.at("toolkit_sha"));
+    add_field(normalized, "title_sha", machine.at("title_sha"));
+    return normalized;
+}
+
+J read_v2_machine(const J& record)
+{
+    static const char* const fields[] = {
+        "os", "os_version", "backend", "device", "driver", "build", "glslang", "spirv_cross", "toolkit_sha",
+        "title_sha",
+    };
+    const J& machine = record.at("machine");
+    validate_machine(machine, fields, sizeof fields / sizeof fields[0]);
+    const std::string& backend = machine.at("backend").s;
+    if (backend != "metal" && backend != "vulkan")
+        fail("capture-format", "environment.machine.backend must be 'metal' or 'vulkan'");
+    return machine;
+}
+
+struct CaptureReader {
+    const char* schema;
+    J (*read_machine)(const J&);
+};
+
+const CaptureReader* capture_reader(const std::string& schema)
+{
+    static const CaptureReader readers[] = {
+        {kSchemaV1, read_v1_machine},
+        {kSchemaV2, read_v2_machine},
+    };
+    for (const CaptureReader& reader : readers)
+        if (schema == reader.schema) return &reader;
+    return nullptr;
+}
+
+[[noreturn]] void unsupported_schema(const std::string& schema)
+{
+    const std::string detail = "unsupported capture schema " + schema;
+    ps3_stop_rsx_capture("rsx_replay", "unknown-schema", detail.c_str());
+}
+
 struct Parser {
     const char* p;
     const char* e;
@@ -118,6 +204,8 @@ struct Parser {
                 ws();
                 J k = value();
                 if (k.t != J::Str) bad("object key");
+                for (const auto& field : v.o)
+                    if (field.first == k.s) bad("duplicate object key");
                 ws();
                 if (p >= e || *p++ != ':') bad("missing ':'");
                 J val = value();
@@ -279,7 +367,8 @@ private:
 
 struct Capture {
     std::string dir;
-    J machine;                                  /* the environment record */
+    std::string schema;
+    J machine;                                  /* normalized environment record */
     bool have_env = false, have_end = false;
     std::vector<J> frames;                      /* every frame-complete record, in order */
     std::string end_hash;
@@ -303,6 +392,34 @@ const std::string& hash_value(const J& rec, const char* name)
     return h.str("value");
 }
 
+std::string record_schema(const std::string& line)
+{
+    static constexpr char prefix[] = "{\"schema\":\"";
+    if (line.compare(0, sizeof(prefix) - 1, prefix) != 0)
+        fail("capture-format", "a record does not begin with its schema field");
+    const size_t begin = sizeof(prefix) - 1;
+    const size_t end = line.find('"', begin);
+    if (end == std::string::npos) fail("capture-format", "a record has an unterminated schema");
+    return line.substr(begin, end - begin);
+}
+
+void hash_input_line(ps3_sha256_ctx* hash, const std::string& line, const std::string& schema)
+{
+    if (schema == kSchemaV1) {
+        ps3_sha256_update(hash, line.data(), line.size());
+    } else {
+        const size_t schema_at = line.find(kSchemaV2);
+        if (schema_at == std::string::npos)
+            fail("capture-format", "an input line does not match its declared schema");
+        static constexpr char prefix[] = "ps3diff.rsx/";
+        const size_t version_at = schema_at + sizeof(prefix) - 1;
+        ps3_sha256_update(hash, line.data(), version_at);
+        ps3_sha256_update(hash, "1", 1);
+        ps3_sha256_update(hash, line.data() + version_at + 1, line.size() - version_at - 1);
+    }
+    ps3_sha256_update(hash, "\n", 1);
+}
+
 // The whole file once, parsing only what a replay needs before it starts: the environment, the frame records,
 // and the guest address the live process kept its labels at.
 Capture scan(const std::string& dir)
@@ -316,14 +433,24 @@ Capture scan(const std::string& dir)
         if (part) fail("unfinished-capture", dir + " holds capture.ndjson.partial: the process that wrote it did not close it");
         fail("no-capture", "no capture.ndjson in " + dir);
     }
-    std::string line;
+    std::string line, previous_event;
     bool first = true;
     while (next_line(f, line)) {
+        const std::string schema = record_schema(line);
+        const CaptureReader* reader = capture_reader(schema);
+        if (!reader) unsupported_schema(schema);
+        if (c.schema.empty()) c.schema = schema;
+        else if (schema != c.schema)
+            fail("mixed-schema", "capture contains both " + c.schema + " and " + schema);
+
         const std::string ev = event_of(line);
         if (first && ev != "capture-start") fail("capture-format", "the first record is not capture-start");
+        if (c.have_end) fail("capture-format", "records follow capture-end");
         first = false;
         if (ev == "environment") {
-            c.machine = parse_line(line).at("machine");
+            if (c.have_env || previous_event != "capture-start")
+                fail("capture-format", "environment must follow capture-start exactly once");
+            c.machine = reader->read_machine(parse_line(line));
             c.have_env = true;
         } else if (ev == "frame-complete") {
             c.frames.push_back(parse_line(line));
@@ -347,6 +474,7 @@ Capture scan(const std::string& dir)
                 }
             }
         }
+        previous_event = ev;
     }
     if (first) fail("capture-format", "an empty capture");
     if (!c.have_end) fail("truncated-capture", "capture.ndjson has no capture-end");
@@ -390,7 +518,9 @@ struct Options {
     bool accept_unknown = false;
 };
 
-const char* const kMachineFields[8] = {"gpu", "macos", "metal", "build", "glslang", "spirv_cross", "toolkit_sha", "title_sha"};
+const char* const kMachineFields[10] = {
+    "os", "os_version", "backend", "device", "driver", "build", "glslang", "spirv_cross", "toolkit_sha", "title_sha",
+};
 
 struct Row {
     J live, replay;
@@ -529,8 +659,9 @@ void run(Report& rep)
     {
         // What this build and machine write into the manifest is what the capture must have been made on.
         const rsx_capture_environment* e = rsx_capture_environment_record();
-        const char* mine[8] = {e->gpu, e->macos, e->metal, e->build, e->glslang, e->spirv_cross, e->toolkit_sha, e->title_sha};
-        for (int i = 0; i < 8; i++) {
+        const char* mine[10] = {e->os, e->os_version, e->backend, e->device, e->driver, e->build, e->glslang,
+                                e->spirv_cross, e->toolkit_sha, e->title_sha};
+        for (int i = 0; i < 10; i++) {
             rep.env_live.emplace_back(kMachineFields[i], cap.machine.str(kMachineFields[i]));
             rep.env_replay.emplace_back(kMachineFields[i], mine[i]);
             if (rep.env_live.back().second != mine[i]) rep.env_differs.push_back(kMachineFields[i]);
@@ -558,10 +689,7 @@ void run(Report& rep)
                            ev == "fifo-branch" || ev == "fifo-word" || ev == "fifo-nop";
         const J rec = parse_line(line);
         const u64 seq = (u64)rec.at("seq").i;
-        if (input) {
-            ps3_sha256_update(&running, line.data(), line.size());
-            ps3_sha256_update(&running, "\n", 1);
-        }
+        if (input) hash_input_line(&running, line, cap.schema);
         if (ev == "capture-start") {
             if (rec.at("bootstrap").str("mode") != "clean-reset")
                 fail("bootstrap", "only a clean-reset capture can be replayed");

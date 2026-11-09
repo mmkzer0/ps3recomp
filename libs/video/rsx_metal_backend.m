@@ -5095,23 +5095,31 @@ static const rsx_draw_backend s_engine_backend = {
 
 /* ---- what a capture and a replay record about this machine ---------------- */
 
-/* The record every capture carries: byte equality of two renders holds only on equal GPU, OS, Metal,
- * build and translator versions (M3-SCOPE H1, machine scope). The strings are copied: they outlive the
- * NSStrings they come from. */
+/* The record every capture carries: byte equality of two renders holds only on equal device, OS,
+ * backend, build and translator versions. These strings outlive the NSStrings they come from. */
 int rsx_metal_backend_capture_environment(rsx_capture_environment* env)
 {
-    static char gpu[128], macos[128], metal[96], glslang[32], spirv_cross[32];
+    static char device[128], os_version[128], driver[96], glslang[32], spirv_cross[32];
     if (!s_dev) return -1;
     @autoreleasepool {
         rsx_hlsl_to_msl_versions(glslang, sizeof glslang, spirv_cross, sizeof spirv_cross);
-        snprintf(gpu, sizeof gpu, "%s", [[s_dev name] UTF8String]);
-        snprintf(macos, sizeof macos, "%s", [[[NSProcessInfo processInfo] operatingSystemVersionString] UTF8String]);
-        snprintf(metal, sizeof metal, "n/a");
+        snprintf(device, sizeof device, "%s", [[s_dev name] UTF8String]);
+        snprintf(os_version, sizeof os_version, "%s",
+                 [[[NSProcessInfo processInfo] operatingSystemVersionString] UTF8String]);
+        snprintf(driver, sizeof driver, "n/a");
         if (@available(macOS 14.0, *))
-            snprintf(metal, sizeof metal, "%s", [[[s_dev architecture] name] UTF8String]);
+            snprintf(driver, sizeof driver, "%s", [[[s_dev architecture] name] UTF8String]);
     }
-    env->gpu = gpu; env->macos = macos; env->metal = metal; env->build = NULL;
-    env->glslang = glslang; env->spirv_cross = spirv_cross; env->toolkit_sha = NULL; env->title_sha = NULL;
+    env->os = "macOS";
+    env->os_version = os_version;
+    env->backend = "metal";
+    env->device = device;
+    env->driver = driver;
+    env->build = NULL;
+    env->glslang = glslang;
+    env->spirv_cross = spirv_cross;
+    env->toolkit_sha = NULL;
+    env->title_sha = NULL;
     return 0;
 }
 
