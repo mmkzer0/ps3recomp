@@ -10,15 +10,24 @@ every finding here has to be explainable to the person about to commit.
     python3 tools/check_hygiene.py --staged         # local pre-commit hook
     python3 tools/check_hygiene.py --tracked        # whole index
     python3 tools/check_hygiene.py --paths dist/    # files, no git needed
+    python3 tools/check_hygiene.py --tracked --deny-list ~/private/terms.txt
 
 `--staged` and `--tracked` read content from the index, never from the
 working tree: a clean checkout of a bad commit must still fail, and a dirty
 tree must not fail a commit that is clean.
 
+`--deny-list FILE` adds a fifth check that no tracked file name or text line
+names a title, a private port or a private workspace.  The names themselves
+cannot live in the repository, so the list is a file outside it: one
+case-insensitive term or regex per line, `#` starts a comment line.  A term
+matches only where no letter or digit touches it (`cat` does not hit
+`concatenate`).  Without the flag the check says on stderr that it did not run.
+
 Exit status: 0 clean, 1 findings, 2 usage or environment error.
 """
 
 import argparse
+import bisect
 import fnmatch
 import json
 import os
@@ -62,7 +71,16 @@ FORBIDDEN_BASENAMES = (
     ("*.rif", "*.rif"),
 )
 
-RULE_IDS = ("forbidden-name", "magic", "oversize", "symlink")
+DENY_RULE = "deny-list"
+RULE_IDS = ("forbidden-name", "magic", "oversize", "symlink", DENY_RULE)
+
+# A deny-list term must stand alone: letters and digits on either side mean a
+# different word (`cat` in `concatenate`), while `_`, `-` and `.` keep an
+# identifier or a file name such as `<term>.mask.json` a hit.
+DENY_BOUNDARY_BEFORE = r"(?<![A-Za-z0-9])"
+DENY_BOUNDARY_AFTER = r"(?![A-Za-z0-9])"
+# A NUL in the first bytes marks a binary blob, which has no lines to report.
+BINARY_PROBE_BYTES = 8192
 
 # Signatures at offset 0.  `SCE\0` is the SELF/SPRX envelope; the eight-byte
 # `SCEUF` form is the firmware update package, and the two do not overlap.
@@ -97,6 +115,20 @@ class Finding:
     path: str
     rule: str
     detail: str
+    line: int = 0
+
+
+@dataclass(frozen=True)
+class DenyTerm:
+    number: int  # line of the deny-list file, so a report can name the entry
+    pattern: "re.Pattern[str]"
+
+
+def json_finding(item):
+    entry = {"path": item.path, "rule": item.rule, "detail": item.detail}
+    if item.line:
+        entry["line"] = item.line
+    return entry
 
 
 @dataclass(frozen=True)
@@ -296,8 +328,9 @@ def index_entries(root, staged):
     return entries
 
 
-def entry_findings(reader, entry, max_bytes):
+def entry_findings(reader, entry, max_bytes, deny):
     findings = name_findings(entry.path)
+    findings.extend(deny_name_findings(entry.path, deny))
     if entry.oid.strip("0") == "":
         # Intent-to-add: the index has a path but no blob yet.
         return findings
@@ -312,19 +345,23 @@ def entry_findings(reader, entry, max_bytes):
             if detail is not None:
                 findings.append(Finding(entry.path, "symlink", detail))
     elif (entry.mode & 0o170000) == REGULAR_FILE:
-        size, head = reader.prefix(entry.oid, HEAD_BYTES)
-        findings.extend(content_findings(entry.path, size, head, max_bytes))
+        # The deny-list check reads every line, the other rules only a prefix.
+        limit = sys.maxsize if deny else HEAD_BYTES
+        size, data = reader.prefix(entry.oid, limit)
+        findings.extend(
+            content_findings(entry.path, size, data[:HEAD_BYTES], max_bytes))
+        findings.extend(deny_content_findings(entry.path, data, deny))
     # Submodule entries (0o160000) have no blob in this repository.
     return findings
 
 
-def git_findings(root, staged, max_bytes):
+def git_findings(root, staged, max_bytes, deny):
     entries = index_entries(root, staged)
     findings = []
     reader = BlobReader(root)
     try:
         for entry in entries:
-            findings.extend(entry_findings(reader, entry, max_bytes))
+            findings.extend(entry_findings(reader, entry, max_bytes, deny))
     finally:
         reader.close()
     return len({entry.path for entry in entries}), findings
@@ -377,7 +414,7 @@ def repo_path(root, absolute):
     return relative.replace(os.sep, "/")
 
 
-def path_findings(root, paths, max_bytes):
+def path_findings(root, paths, max_bytes, deny):
     seen = set()
     findings = []
     for absolute, kind in walk_paths(paths):
@@ -386,6 +423,7 @@ def path_findings(root, paths, max_bytes):
             continue
         seen.add(path)
         findings.extend(name_findings(path))
+        findings.extend(deny_name_findings(path, deny))
         if kind == "link":
             try:
                 target = os.readlink(absolute)
@@ -399,10 +437,12 @@ def path_findings(root, paths, max_bytes):
         try:
             size = os.path.getsize(absolute)
             with open(absolute, "rb") as handle:
-                head = handle.read(HEAD_BYTES)
+                data = handle.read() if deny else handle.read(HEAD_BYTES)
         except OSError as exc:
             raise CheckError(f"cannot read {absolute}: {exc.strerror or exc}")
-        findings.extend(content_findings(path, size, head, max_bytes))
+        findings.extend(
+            content_findings(path, size, data[:HEAD_BYTES], max_bytes))
+        findings.extend(deny_content_findings(path, data, deny))
     return len(seen), findings
 
 
@@ -453,6 +493,61 @@ def apply_allow(findings, allow):
     return kept, suppressed
 
 
+def parse_deny(path):
+    """The deny list as compiled patterns; any doubt is an error, not a pass."""
+    try:
+        with open(path, encoding="utf-8", errors="surrogateescape") as handle:
+            lines = handle.read().splitlines()
+    except OSError as exc:
+        raise CheckError(f"cannot read deny list {path}: {exc.strerror or exc}")
+    terms = []
+    for number, raw in enumerate(lines, 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            pattern = re.compile(
+                DENY_BOUNDARY_BEFORE + "(?:" + line + ")" + DENY_BOUNDARY_AFTER,
+                re.IGNORECASE | re.MULTILINE)
+        except re.error as exc:
+            raise CheckError(f"{path}:{number}: invalid deny-list pattern: {exc}")
+        if pattern.search(""):
+            # Such an entry would hit every line and hide the real ones.
+            raise CheckError(
+                f"{path}:{number}: deny-list pattern matches the empty string")
+        terms.append(DenyTerm(number, pattern))
+    if not terms:
+        # An empty list passes everything, which is how a typo becomes a leak.
+        raise CheckError(f"deny list {path} has no entries")
+    return terms
+
+
+def deny_name_findings(path, deny):
+    if not deny:
+        return []
+    return [Finding(path, DENY_RULE, f"path matches deny-list entry {term.number}")
+            for term in deny if term.pattern.search(path)]
+
+
+def deny_content_findings(path, data, deny):
+    """One finding per (line, entry); the entry is named by its list line so a
+    report can be shared without repeating the term."""
+    if not deny or b"\0" in data[:BINARY_PROBE_BYTES]:
+        return []
+    text = data.decode("utf-8", errors="replace")
+    newlines = None
+    findings = []
+    for term in deny:
+        for match in term.pattern.finditer(text):
+            if newlines is None:
+                newlines = [hit.start() for hit in re.finditer("\n", text)]
+            line = bisect.bisect_left(newlines, match.start()) + 1
+            findings.append(Finding(
+                path, DENY_RULE, f"matches deny-list entry {term.number}",
+                line))
+    return findings
+
+
 def byte_count(text):
     try:
         value = int(text)
@@ -476,21 +571,29 @@ def run(args):
     else:
         root = base
     allow = load_allow(root, args.allow)
+    deny = None if args.deny_list is None else parse_deny(args.deny_list)
+    if deny is None:
+        # Never a silent pass: the list lives outside the repository, so a
+        # run without it checked less than a run with it.
+        print("check_hygiene: the deny-list check did not run "
+              "(no --deny-list given)", file=sys.stderr)
     if args.paths is None:
-        checked, findings = git_findings(root, args.staged, args.max_bytes)
+        checked, findings = git_findings(root, args.staged, args.max_bytes,
+                                         deny)
     else:
-        checked, findings = path_findings(root, args.paths, args.max_bytes)
+        checked, findings = path_findings(root, args.paths, args.max_bytes,
+                                          deny)
     findings = sorted(set(findings), key=lambda item: (
-        item.path, item.rule, item.detail))
+        item.path, item.line, item.rule, item.detail))
     kept, suppressed = apply_allow(findings, allow)
     if args.json:
-        json.dump([{"path": item.path, "rule": item.rule,
-                    "detail": item.detail} for item in kept],
+        json.dump([json_finding(item) for item in kept],
                   sys.stdout, indent=2)
         sys.stdout.write("\n")
     else:
         for item in kept:
-            print(f"{item.path}: {item.rule}: {item.detail}")
+            where = f"{item.path}:{item.line}" if item.line else item.path
+            print(f"{where}: {item.rule}: {item.detail}")
         print(f"checked {checked} path(s): {len(kept)} finding(s), "
               f"{suppressed} allowed")
     return 1 if kept else 0
@@ -519,6 +622,12 @@ def main(argv=None):
     parser.add_argument(
         "--max-bytes", type=byte_count, default=DEFAULT_MAX_BYTES, metavar="N",
         help=f"largest allowed blob (default: {DEFAULT_MAX_BYTES})")
+    parser.add_argument(
+        "--deny-list", metavar="FILE",
+        help="file outside the repository, one case-insensitive term or "
+             "regex per line (# comments): fail on any tracked name or line "
+             "that matches; without it the check is skipped, with a note "
+             "on stderr")
     parser.add_argument(
         "--json", action="store_true", help="print a JSON array of findings")
     args = parser.parse_args(argv)

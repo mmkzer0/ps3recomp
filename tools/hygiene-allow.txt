@@ -6,7 +6,7 @@
 #
 # <glob> is matched with fnmatch() against the repository-relative POSIX
 # path, so `dist/*.bin` also matches nested paths.  <rule-id> is one of
-# forbidden-name, magic, oversize, symlink.  The reason is mandatory: an
+# forbidden-name, magic, oversize, symlink, deny-list.  The reason is mandatory: an
 # allow-list entry without a written reason is how a leak becomes normal.
 # An entry suppresses only its own rule for matching paths.
 #
