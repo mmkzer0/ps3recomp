@@ -747,6 +747,18 @@ if(PS3RECOMP_BUILD_TESTS)
         target_link_libraries(test_ftrace_publish PRIVATE Threads::Threads)
         add_test(NAME ftrace_publish COMMAND test_ftrace_publish)
         set_tests_properties(ftrace_publish PROPERTIES LABELS "runtime;t0;tsan" TIMEOUT 120)
+        # PS3_FTRACE=...:<path>.zst: the zstd child, its failures and the files left behind. One process per
+        # scenario (the recorder reads its environment once); tests/run_ftrace_zst.py drives and inspects.
+        find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
+        if(Python3_Interpreter_FOUND)
+            add_executable(test_ftrace_zst tests/test_ftrace_zst.c)
+            target_include_directories(test_ftrace_zst PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+            target_compile_definitions(test_ftrace_zst PRIVATE _GNU_SOURCE)
+            add_test(NAME ftrace_zst
+                COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_ftrace_zst.py"
+                    $<TARGET_FILE:test_ftrace_zst>)
+            set_tests_properties(ftrace_zst PROPERTIES LABELS "runtime;t0" TIMEOUT 120)
+        endif()
     endif()
     # SetThreadPriority's QoS class on macOS (win32_compat.c): each level's class and relative priority for
     # a thread that sets its own and one given a level before ResumeThread, and the two refusals that must

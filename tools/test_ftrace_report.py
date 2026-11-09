@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """ftrace_report: frame binning, import call sites, split, cadence, drawables, label-store waits, jq2 job queues, image identity and critical path, audio ring, bad input."""
+import contextlib
+import io
 import json
 import subprocess
 import sys
@@ -1416,6 +1418,104 @@ with tempfile.TemporaryDirectory() as tmp:
           "no kind 30/31 (AUDIO_RING, AUDIO_RING_VIEW) records in this trace" in out and
           "Audio ring (cellAudio port ring" not in out,
           "audio ring absent: one line saying so, no section")
+
+# --- zstd traces ---------------------------------------------------------------------------------
+# The reader takes a text or a zstd trace, told apart by the frame magic. Each backend is selected
+# through ftrace_report.ZSTD_BACKENDS (an in-process seam; there is no environment switch).
+sys.path.insert(0, str(TOOL.parent))
+import ftrace_report as fr
+
+
+def raw_zstd(data, block=1 << 16):
+    """A valid zstd frame of raw blocks: the decoders under test need no compressor to be fed."""
+    out = bytearray(b"\x28\xb5\x2f\xfd\x00\x58")   # magic, no single-segment/checksum/dictionary, 2 MiB window
+    chunks = [data[i:i + block] for i in range(0, len(data), block)] or [b""]
+    for n, c in enumerate(chunks):
+        out += ((len(c) << 3) | (1 if n == len(chunks) - 1 else 0)).to_bytes(3, "little") + c
+    return bytes(out)
+
+
+def run_inproc(backends, *args):
+    saved_backends, saved_argv = fr.ZSTD_BACKENDS, sys.argv
+    fr.ZSTD_BACKENDS, sys.argv = backends, ["ftrace_report.py", *args]
+    out, err, code = io.StringIO(), io.StringIO(), 0
+    try:
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                fr.main()
+            except SystemExit as e:
+                code = e.code or 0
+    finally:
+        fr.ZSTD_BACKENDS, sys.argv = saved_backends, saved_argv
+    return code, out.getvalue(), err.getvalue()
+
+
+def backend_available(name):
+    saved = fr.ZSTD_BACKENDS
+    fr.ZSTD_BACKENDS = (name,)
+    try:
+        return fr.zstd_backend() is not None
+    finally:
+        fr.ZSTD_BACKENDS = saved
+
+
+HAVE_STDLIB = backend_available("stdlib")
+HAVE_COMMAND = backend_available("subprocess")
+
+with tempfile.TemporaryDirectory() as tmp:
+    text = trace(lines).encode()
+    # The names lie on purpose: the magic decides, not the suffix.
+    zpath, tpath = Path(tmp) / "looks-like-text.txt", Path(tmp) / "looks-like-zstd.zst"
+    zpath.write_bytes(raw_zstd(text, block=700))     # several blocks, so the decode is a stream
+    tpath.write_bytes(text)
+    rc, want, err = run(tmp, trace(lines), "--json", "--split", "30")
+    check(rc == 0, f"zstd: the text baseline reports: {err}")
+    code, out, err = run_inproc((), str(tpath), "--json", "--split", "30")
+    check(code == 0 and out == want, f"zstd: a text trace named .zst is read as text (exit {code}: {err})")
+
+    for name, available, why in (("stdlib", HAVE_STDLIB, "Python < 3.14 has no compression.zstd"),
+                                 ("subprocess", HAVE_COMMAND, "no zstd command on PATH")):
+        if not available:
+            print(f"SKIP: zstd {name} backend: {why}")
+            continue
+        code, out, err = run_inproc((name,), str(zpath), "--json", "--split", "30")
+        check(code == 0 and out == want, f"zstd {name}: --json equals the text trace's (exit {code}: {err})")
+        code, out, err = run_inproc((name,), str(zpath))
+        check(code == 0 and "Per frame" in out and "frame at" in out, f"zstd {name}: text report")
+
+        z = zpath.read_bytes()
+        bad = {"truncated in a block": z[:len(z) - 100], "cut well before the last block": z[:len(z) - 700 - 2],
+               "corrupt frame header": z[:4] + b"\xff" + z[5:], "trailing garbage": z + b"not a frame"}
+        for what, blob in bad.items():
+            p = Path(tmp) / "bad.zst"
+            p.write_bytes(blob)
+            code, out, err = run_inproc((name,), str(p), "--json")
+            check(code == 2 and out == "" and "truncated or corrupt zstd stream" in err and "Traceback" not in err,
+                  f"zstd {name}: {what} is exit 2 with no report (exit {code}: {err[:120]})")
+
+        if HAVE_COMMAND:
+            # A real compressor's output (entropy-coded blocks), not only raw ones.
+            p = Path(tmp) / "real.zst"
+            p.write_bytes(subprocess.run(["zstd", "-q", "-c"], input=text, capture_output=True, check=True).stdout)
+            code, out, err = run_inproc((name,), str(p), "--json", "--split", "30")
+            check(code == 0 and out == want, f"zstd {name}: a compressed trace gives the same --json ({err})")
+            blob = p.read_bytes()
+            p.write_bytes(blob[:len(blob) // 2])
+            code, out, err = run_inproc((name,), str(p), "--json")
+            check(code == 2 and out == "" and "truncated or corrupt zstd stream" in err,
+                  f"zstd {name}: a compressed trace cut in half is exit 2")
+
+    code, out, err = run_inproc((), str(zpath), "--json")
+    check(code == 2 and out == "" and "compression.zstd" in err and "`zstd` command" in err and "Traceback" not in err,
+          f"zstd: no backend is exit 2 naming both options ({err})")
+    code, out, err = run_inproc((), str(tpath), "--json")
+    check(code == 0, "zstd: a text trace needs no backend")
+
+    # Through the real command line, default backend order.
+    if HAVE_STDLIB or HAVE_COMMAND:
+        q = subprocess.run([sys.executable, str(TOOL), str(zpath), "--json", "--split", "30"],
+                           capture_output=True, text=True, timeout=60, check=False)
+        check(q.returncode == 0 and q.stdout == want, f"zstd: the command line reads a zstd trace ({q.stderr})")
 
 print("ftrace_report: %s" % ("ok" if not failures else "%d failed" % failures))
 sys.exit(1 if failures else 0)

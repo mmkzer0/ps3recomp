@@ -20,9 +20,10 @@ Complete documentation for the Python-based recompilation pipeline tools in `too
 12. [ps3diff.py — trace schema, conversion and diff](#ps3diffpy)
 13. [xctrace_profile.py / xctrace_audio.py — Instruments trace reports](#xctrace_profilepy--xctrace_audiopy)
 14. [ftrace_report.py — PS3_FTRACE timeline report](#ftrace_reportpy)
-15. [ios_run.py — iOS Simulator and device runs](#ios_runpy)
-16. [hwprobe — homebrew probes for a real PS3](#hwprobe--homebrew-probes-for-a-real-ps3)
-17. [Dependencies](#dependencies)
+15. [ftrace_bundle.py — bundle traces, joint report, safe-to-delete list](#ftrace_bundlepy)
+16. [ios_run.py — iOS Simulator and device runs](#ios_runpy)
+17. [hwprobe — homebrew probes for a real PS3](#hwprobe--homebrew-probes-for-a-real-ps3)
+18. [Dependencies](#dependencies)
 
 ---
 
@@ -755,9 +756,10 @@ use.
 
 Reports on a `PS3_FTRACE=<start s>:<seconds>:<file>` timeline
 (`include/ps3emu/ps3_ftrace.h`), a recording of who waits for whom between two
-guest flip requests. `PS3_FTRACE_MIN_US=0` keeps every span and
-`PS3_FTRACE_CAP=<count>` (a plain number) sizes the buffer; the header line
-says `dropped=<n>`.
+guest flip requests. The file is text or zstd (see
+[Compressed traces](#compressed-traces)). `PS3_FTRACE_MIN_US=0` keeps every
+span and `PS3_FTRACE_CAP=<count>` (a plain number) sizes the buffer; the
+header line says `dropped=<n>`.
 
 ```bash
 PS3_FTRACE=90:240:/tmp/ftrace.txt PS3_FTRACE_MIN_US=0 PS3_FTRACE_CAP=25165824 ./title
@@ -1007,8 +1009,122 @@ carrying the items above, the first 20 runs in detail in `events`) and
 the key is null.
 
 Both kinds are recorded whatever `PS3_FTRACE_MIN_US` says. Exit `0` on a
-report, `2` on an unreadable or malformed trace, bad arguments or fewer than
-three flip requests.
+report, `2` on an unreadable, truncated, corrupt or malformed trace, a zstd
+trace with no decoder, bad arguments or fewer than three flip requests.
+
+### Compressed traces
+
+A trace is 100-400 MB of text and is kept zstd-compressed. `ftrace_report.py`
+(and `ftrace_bundle.py`) read either form from the file's content, not its
+name: a file that starts with the zstd frame magic `28 B5 2F FD` is decoded,
+anything else is read as text exactly as before. A zstd trace is decoded line
+by line while it is read: nothing is unpacked to disk and the file is not read
+into memory first. The decoder is, in order, the standard library's
+`compression.zstd` (Python 3.14+) or a `zstd -dc` child (an argument list, no
+shell, its exit status checked at the end of the stream); with neither, the
+tool exits `2` naming both. A truncated or corrupt stream is exit `2` from
+either decoder, never a report built from the part that decoded.
+
+A `PS3_FTRACE` path ending in `.zst` makes the recorder write a zstd stream:
+`PS3_FTRACE=90:240:/tmp/run1.ftrace.zst`. The header stays free of a libzstd
+link, so the text is piped into a `zstd` child (found on `PATH` when recording
+starts; not found is a `[ftrace]` error and recording stays off). The dump
+writes `<path>.partial` and renames it to `<path>` only when `zstd` exits `0`;
+otherwise it names the status, writes nothing at `<path>` (a file from an
+earlier run stays as it was) and removes the `.partial`. The child gets no
+descriptor beyond stdin, stdout and stderr
+(macOS, and glibc 2.34+ with `_GNU_SOURCE`), and the process ignores `SIGPIPE`
+only while it writes, so a child that died is an error line, not a killed
+process. Windows refuses a `.zst` path at start (`[ftrace] .zst output is not
+supported on Windows; use a text path`).
+
+---
+
+## ftrace_bundle.py
+
+Bundles the traces of several runs, reports on them together and says which
+loose traces are safe to delete. It reads traces through `ftrace_report.py`, so
+text and zstd both work and a zstd trace needs a decoder
+([Compressed traces](#compressed-traces)); storing a text trace needs a zstd
+encoder, `compression.zstd` or the `zstd` command. The tool never deletes a
+trace.
+
+```bash
+# a text file, a run directory with ftrace.txt.zst, a run directory with ftrace.txt
+python tools/ftrace_bundle.py create /data/bundles/before-after /tmp/a.txt /data/run-b /data/run-c
+python tools/ftrace_bundle.py verify /data/bundles/before-after
+# the loose traces the bundle covers, byte for byte; you choose how to remove them
+python tools/ftrace_bundle.py prunable /data/bundles/before-after -0 | xargs -0 trash
+```
+
+**`create OUT RUN...`** takes each RUN as a trace file or a run directory that
+holds exactly one of `ftrace.txt` and `ftrace.txt.zst` (both or neither is
+exit `2`). A run is named after its directory or, for a file, its name without
+`.zst` and `.txt` (a file called `ftrace.*` takes its directory's name); the
+name must be unique, compared without regard to case, and match
+`[A-Za-z0-9][A-Za-z0-9._-]*`. `OUT` must not exist. The bundle is built in
+`OUT.partial` and renamed at the end, so a failure (a bad or truncated trace, a
+run with fewer than three flip requests, no encoder) leaves neither. A leftover
+`OUT.partial` from a killed run is refused, not deleted.
+
+```
+OUT/manifest.json          schema ps3recomp.ftrace-bundle/1
+OUT/traces/<name>.ftrace.zst   a byte copy of a zstd source, or a compressed copy
+                           of a text source; decoded again and checked against
+                           the source's decoded sha256 (not with --reports-only)
+OUT/runs/<name>/report.json    exactly what ftrace_report.py --json prints
+OUT/report.json, REPORT.md     headline metrics per run, n/mean/min/max across runs
+```
+
+The manifest holds, per run, its name, the source path as given and the
+absolute path of the trace file, the size and sha256 of that file, the sha256
+of the decoded text, the parsed header fields (`start_us`, `end_us`, `spans`,
+`dropped`, `jq2_images`, ...), the stored paths; the creation time (UTC); the
+toolkit git sha (`unknown` outside a git checkout); and the size and sha256 of
+every other file in the bundle.
+
+Headline metrics, all keys of the `ftrace_report.py --json` summary. A metric
+a run does not have (a null in its report, a section its trace lacks) is null
+for that run, shown as `n/a`, and is left out of `n`, mean, min and max; it is
+never counted as 0.
+
+| Metric | Report key |
+|--------|------------|
+| frame time: count, median, min, max (ms) | `frames.count`, `frames.median_ms`, `frames.min_ms`, `frames.max_ms` |
+| flip requests, dropped spans | `flip_requests`, `dropped` |
+| drawable waits per flip, mean wait | `drawables.per_flip`, `drawables.mean_wait_ms` |
+| label-store wait: per flip, p99, max | `label_wait.ms_per_flip`, `label_wait.p99_ms`, `label_wait.max_ms` |
+| audio underruns: count, per second | `audio.underruns.count`, `audio.underruns.rate` |
+| audio stale blocks, stale runs, longest run | `audio.stale.count`, `audio.stale.runs`, `audio.stale.longest_run_ms` |
+| audio blocks mixed per second, mix interval p99 | `audio.blocks_per_s`, `audio.mix_interval_ms.p99` |
+| jq2 sync wait p50/p95/p99, per queue | `jq2.q<N>.sync_latency_ms.p50`, `.p95`, `.p99` |
+
+The report has no percentiles of frame time and no flips-per-second key, so the
+table has none (`frames.median_ms` is the inverse of the latter).
+`audio.blocks_per_s` is `n/a` when the trace has no mix spans, where the report
+says 0.0. `jq2.q<N>` is one row per SPURS job queue, numbered in creation
+order; a run without that queue has `n/a`.
+
+**`verify OUT`** checks the manifest schema, that every file it lists is inside
+the bundle (no `..`, no link out) and that each has the recorded size and
+sha256. Exit `0` when everything matches, `1` on any mismatch, missing file,
+bad schema or missing manifest; one line per problem on stderr. A file in the
+bundle that the manifest does not list is a warning.
+
+**`prunable OUT [-0] [--allow-reports-only]`** prints, one per line (NUL-ended
+with `-0`), the trace files the bundle covers whose current sha256 still equals
+the manifest's. For a run given as a directory that is the trace file in it.
+It prints nothing, and exits `1`, unless the bundle verifies. A source that is
+missing, changed since the bundle was made, or inside the bundle itself is left
+off, with the reason on stderr. A `--reports-only` bundle has no stored traces
+to fall back on, so it prints nothing unless `--allow-reports-only` says the
+reports are all you want to keep.
+
+Exit status: `0` done; `1` a bundle that does not verify (`verify`,
+`prunable`); `2` usage error or bad input (OUT exists, name collision, a bad
+run directory, an unreadable, truncated or malformed trace, a zstd file with no
+decoder). Standard output carries data only (`create` prints the bundle path);
+progress and errors go to standard error.
 
 ---
 

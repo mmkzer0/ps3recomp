@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """Frame-by-frame report of a PS3_FTRACE timeline.
 
-  tools/ftrace_report.py <trace.txt> [--frames N] [--ms-per-col F] [--threads a,b]
+  tools/ftrace_report.py <trace.txt|trace.zst> [--frames N] [--ms-per-col F] [--threads a,b]
                          [--split MS] [--cadence NID[@TID]] [--gap MS] [--json]
+
+The trace is read as text or as a zstd stream, told apart by the zstd frame magic and not by
+the file name; a zstd trace is decoded line by line, never unpacked to disk or read whole.
+It needs Python 3.14+ (compression.zstd) or the `zstd` command on PATH. A PS3_FTRACE path
+ending in .zst makes the recorder write that form.
 
 PS3_FTRACE=<start s>:<seconds>:<path> (toolkit, include/ps3emu/ps3_ftrace.h)
 records spans: PPU syscalls that blocked and merged usleep poll runs (with the
@@ -104,16 +109,22 @@ Without --json it then draws a few frames as a timeline (one column per
   RSX   'S' blocked on ACQUIRE   'D' FIFO drain   'P' present   '|' flip reached
         inside D/P: 'E' Metal encode   'G' waiting for the GPU   'R' render-target readback
 
-Exit status: 0 report written; 2 unreadable or malformed trace, bad arguments,
-or fewer than 3 flip requests in the window.
+Exit status: 0 report written; 2 unreadable, truncated, corrupt or malformed trace, a zstd
+trace with no decoder, bad arguments, or fewer than 3 flip requests in the window.
 """
 import argparse
 import bisect
 import collections
+import contextlib
+import io
+import itertools
 import json
 import re
+import shutil
 import statistics
+import subprocess
 import sys
+import tempfile
 
 (SYSCALL, USLEEP, SPU_WAIT, SPU_BUSY, SEMA, SEMA_GAVEUP, DRAIN, FLIP_FIFO, FLIP_REQ, PRESENT,
  GPU_ENCODE, GPU_WAIT, READBACK, GPU_EXEC, HLE, DRAWABLE, LABEL_WAIT,
@@ -159,10 +170,150 @@ class BadInput(Exception):
     pass
 
 
+ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+ZSTD_COMMAND = "zstd"
+# Decoder (and, for ftrace_bundle, encoder) backends in the order they are tried. A test narrows this
+# tuple to reach one backend; it is not an environment switch.
+ZSTD_BACKENDS = ("stdlib", "subprocess")
+ZSTD_NO_BACKEND = ("a zstd trace needs a decoder: Python 3.14 or newer (compression.zstd) "
+                   f"or the `{ZSTD_COMMAND}` command on PATH; neither is available")
+
+
+def zstd_backend():
+    """(name, handle) of the first available backend in ZSTD_BACKENDS, or None.
+
+    "stdlib" carries the compression.zstd module, "subprocess" the path of the zstd command."""
+    for name in ZSTD_BACKENDS:
+        if name == "stdlib":
+            try:
+                from compression import zstd
+            except ImportError:
+                continue
+            return name, zstd
+        if name == "subprocess":
+            exe = shutil.which(ZSTD_COMMAND)
+            if exe:
+                return name, exe
+    return None
+
+
+class _StdlibZstdReader(io.RawIOBase):
+    """The decoded bytes of an open zstd file through compression.zstd."""
+
+    def __init__(self, zstd, path, src):
+        self._path = path
+        self._error = zstd.ZstdError
+        self._f = zstd.ZstdFile(src)
+
+    def readable(self):
+        return True
+
+    def readinto(self, b):
+        try:
+            return self._f.readinto(b)
+        # A stream cut short is an EOFError, a damaged one a ZstdError; neither may end in a report
+        # built from the part that decoded.
+        except (EOFError, self._error) as e:
+            raise BadInput(f"{self._path}: truncated or corrupt zstd stream ({e})") from None
+
+    def close(self):
+        try:
+            self._f.close()
+        finally:
+            super().close()
+
+
+class _ZstdCommandReader(io.RawIOBase):
+    """The decoded bytes of a zstd file from `zstd -dc`, read as the child writes them.
+
+    The child's exit status is checked when its output ends: a truncated or corrupt stream is the
+    child's non-zero exit, and the decoded bytes before it must not be taken for a whole trace."""
+
+    def __init__(self, exe, path):
+        self._path = path
+        self._files = contextlib.ExitStack()
+        # stderr to a file: a pipe nobody drains could stall the child
+        self._err = self._files.enter_context(tempfile.TemporaryFile())  # noqa: SIM115 - closed with the reader
+        self._done = False
+        self._proc = None
+        try:
+            self._proc = subprocess.Popen([exe, "-dc", "--", path], stdin=subprocess.DEVNULL,
+                                          stdout=subprocess.PIPE, stderr=self._err, bufsize=0)
+        except OSError as e:
+            self._files.close()
+            raise BadInput(f"{path}: cannot run {exe}: {e.strerror}") from None
+
+    def readable(self):
+        return True
+
+    def readinto(self, b):
+        n = self._proc.stdout.readinto(b)
+        if n:
+            return n
+        if not self._done:
+            self._done = True
+            rc = self._proc.wait()
+            if rc != 0:
+                self._err.seek(0)
+                why = self._err.read(1000).decode("utf-8", "replace").strip()
+                raise BadInput(f"{self._path}: truncated or corrupt zstd stream (zstd exited {rc}: {why})")
+        return 0
+
+    def close(self):
+        if not self.closed and self._proc is not None:
+            try:
+                if self._proc.poll() is None:
+                    self._proc.kill()
+                self._proc.wait()
+            finally:
+                self._proc.stdout.close()
+                self._files.close()
+        super().close()
+
+
+@contextlib.contextmanager
+def _open_trace(path):
+    """(binary stream of the decoded bytes, whether the file was zstd). Streaming: nothing is
+    unpacked to disk or read whole."""
+    with contextlib.ExitStack() as files:
+        try:
+            raw = files.enter_context(open(path, "rb"))
+        except OSError as e:
+            raise BadInput(f"{path}: {e.strerror}") from None
+        if raw.peek(len(ZSTD_MAGIC))[:len(ZSTD_MAGIC)] != ZSTD_MAGIC:
+            yield raw, False
+            return
+        backend = zstd_backend()
+        if backend is None:
+            raise BadInput(f"{path}: {ZSTD_NO_BACKEND}")
+        name, handle = backend
+        reader = _StdlibZstdReader(handle, path, raw) if name == "stdlib" else _ZstdCommandReader(handle, path)
+        stream = io.BufferedReader(reader, 1 << 20)
+        try:
+            yield stream, True
+        finally:
+            stream.close()
+
+
+@contextlib.contextmanager
+def open_trace_bytes(path):
+    """The trace's bytes as ftrace_report reads them: the file itself for text, the decoded stream
+    for zstd. Raises BadInput when the stream ends early or is damaged (at the read that finds it)."""
+    with _open_trace(path) as (stream, _):
+        yield stream
+
+
+@contextlib.contextmanager
+def open_trace(path):
+    """The trace's lines. A text file is read exactly as open(path) reads it; a zstd stream is UTF-8."""
+    with _open_trace(path) as (stream, is_zstd):
+        yield io.TextIOWrapper(stream, encoding="utf-8" if is_zstd else None)
+
+
 def load(path):
     names, spans, images, header = {}, [], {}, ""
     try:
-        with open(path) as f:
+        with open_trace(path) as f:
             for no, line in enumerate(f, 1):
                 if line.startswith("#"):
                     header = line.strip()
@@ -187,6 +338,8 @@ def load(path):
                     raise BadInput(f"{path}:{no}: not a span line: {line.strip()[:80]!r}") from None
     except OSError as e:
         raise BadInput(f"{path}: {e.strerror}") from None
+    except UnicodeDecodeError as e:
+        raise BadInput(f"{path}: not text: {e.reason}") from None
     spans.sort(key=lambda s: s[4])
     return header, names, spans, images
 
@@ -2456,6 +2609,41 @@ def print_jq2_section(jq):
     print_jq2_trace_cost(jq["trace_cost"])
 
 
+def build_report(header, names, spans, images, split=None, cad=(None, None), gap=20.0):
+    """The summary dict `--json` prints (without --split/--cadence by default); BadInput when the
+    trace has fewer than 3 flip requests. cad = (NID, TID or None); a None NID adds no cadence."""
+    flips = [s[4] for s in spans if s[0] == FLIP_REQ]
+    if len(flips) < 3:
+        raise BadInput("fewer than 3 flip requests in the window")
+    frames = list(itertools.pairwise(flips))
+    durs = [b - a for a, b in frames]
+    name_of = nid_namer()
+    acc = per_frame(spans, frames)
+    report = {"header": header,
+              "frames": {"count": len(frames), "median_ms": statistics.median(durs),
+                         "min_ms": min(durs), "max_ms": max(durs)},
+              "all": breakdown(acc, range(len(frames)), names, name_of)}
+    if split is not None:
+        fast = [i for i, d in enumerate(durs) if d < split]
+        slow = [i for i, d in enumerate(durs) if d >= split]
+        report["split"] = {"ms": split,
+                           "fast": breakdown(acc, fast, names, name_of) if fast else None,
+                           "slow": breakdown(acc, slow, names, name_of) if slow else None}
+    report.update(drawable_label_sections(spans, len(flips), header_dropped(header)))
+    report["audio"] = audio_section(spans, header_dropped(header), name_of)
+    report["jq2"] = jq2_section(spans, header, names, images)
+    report["audio_ring"] = audio_ring_section(spans, header, names)
+    cad_nid, cad_tid = cad
+    if cad_nid is not None:
+        report["cadence"] = {"nid": f"{cad_nid:08X}", "import": name_of(cad_nid),
+                             "threads": cadence(spans, names, name_of, cad_nid, cad_tid, gap)}
+    return report
+
+
+def report_json(report):
+    return json.dumps(report, indent=1, sort_keys=True) + "\n"
+
+
 def main():
     ap = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
     ap.add_argument("trace")
@@ -2478,38 +2666,16 @@ def main():
 
     try:
         header, names, spans, images = load(args.trace)
+        report = build_report(header, names, spans, images, args.split, (cad_nid, cad_tid), args.gap)
     except BadInput as e:
         print(f"ftrace_report: {e}", file=sys.stderr)
         sys.exit(2)
-    flips = [s[4] for s in spans if s[0] == FLIP_REQ]
-    if len(flips) < 3:
-        print("ftrace_report: fewer than 3 flip requests in the window", file=sys.stderr)
-        sys.exit(2)
-    frames = list(zip(flips, flips[1:]))
-    durs = [b - a for a, b in frames]
-    name_of = nid_namer()
-    acc = per_frame(spans, frames)
-    report = {"header": header,
-              "frames": {"count": len(frames), "median_ms": statistics.median(durs),
-                         "min_ms": min(durs), "max_ms": max(durs)},
-              "all": breakdown(acc, range(len(frames)), names, name_of)}
-    if args.split is not None:
-        fast = [i for i, d in enumerate(durs) if d < args.split]
-        slow = [i for i, d in enumerate(durs) if d >= args.split]
-        report["split"] = {"ms": args.split,
-                           "fast": breakdown(acc, fast, names, name_of) if fast else None,
-                           "slow": breakdown(acc, slow, names, name_of) if slow else None}
-    report.update(drawable_label_sections(spans, len(flips), header_dropped(header)))
-    report["audio"] = audio_section(spans, header_dropped(header), name_of)
-    report["jq2"] = jq2_section(spans, header, names, images)
-    report["audio_ring"] = audio_ring_section(spans, header, names)
-    if cad_nid is not None:
-        report["cadence"] = {"nid": f"{cad_nid:08X}", "import": name_of(cad_nid),
-                             "threads": cadence(spans, names, name_of, cad_nid, cad_tid, args.gap)}
     if args.json:
-        json.dump(report, sys.stdout, indent=1, sort_keys=True)
-        print()
+        sys.stdout.write(report_json(report))
         return
+
+    flips = [s[4] for s in spans if s[0] == FLIP_REQ]
+    frames = list(itertools.pairwise(flips))
 
     print(header)
     fr = report["frames"]
