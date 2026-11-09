@@ -254,7 +254,7 @@ grows:
 
 | Host | Backend | Source | Status |
 |------|---------|--------|--------|
-| Windows | **Direct3D 12** | `libs/video/rsx_d3d12_backend.c` | The default, and the path the upstream in-tree ports are developed against. It decodes draws itself and does not run on the shared register-file draw engine, so a title whose fixes live in the engine draws nothing visible on it: *Odin Sphere Leifthrasir* runs at 60 flips a second into a black window. Moving it onto the engine is planned in [`d3d12-draw-engine.md`](d3d12-draw-engine.md). |
+| Windows | **Direct3D 12** | `libs/video/rsx_d3d12_backend.c` | The default, and the path the upstream in-tree ports are developed against. It decodes draws itself and does not run on the shared register-file draw engine, so a title whose fixes live in the engine draws nothing visible on it: one title runs at 60 flips a second into a black window. Moving it onto the engine is planned in [`d3d12-draw-engine.md`](d3d12-draw-engine.md). |
 | Windows (opt-in) | Vulkan | `libs/video/rsx_vulkan_backend.c` | The same backend as on Linux, on the draw engine with guest programs on. See below. |
 | macOS | Metal | `libs/video/rsx_metal_backend.m` | Linked against Metal / QuartzCore / Foundation / AppKit. |
 | iOS (Simulator PoC) | Metal in a UIKit `CAMetalLayer` view | `libs/video/rsx_metal_ios_display.m` | Experimental. The app owns UIKit; the RSX backend uses its drawable layer. |

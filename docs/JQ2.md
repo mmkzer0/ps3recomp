@@ -568,7 +568,7 @@ is `spurs;stress`):
   same line; final `A`, `B` and claim exact, the PPU counters exact, a 20 s
   no-progress watchdog.
 
-The Odin-backed check is `tests/test_jq2_port_replay.cpp` in leifthrasir-recomp:
+The title-backed check is `tests/test_jq2_port_replay.cpp` in that title's private port:
 it replays the `(A, B)` sequences of `jq-boot`, `closure` and `stall2` through
 `LocalPort`.
 

@@ -616,7 +616,7 @@ void register_cases(std::vector<Case>& out)
     {
         std::vector<Step> v = qp([](CA& a) { a.depth = Arg(4); });
         for (int i = 0; i < 12; ++i) v.push_back(push(PORT, DESC, 256, 0, 1));
-        add("s15e_flags1_pushes_block_when_full", "S15", v, Expect::Inconclusive, "Odin's flags (1): a full ring blocks; both sides time out at the same step", nullptr, 2);
+        add("s15e_flags1_pushes_block_when_full", "S15", v, Expect::Inconclusive, "A title's flags (1): a full ring blocks; both sides time out at the same step", nullptr, 2);
     }
     {
         std::vector<Step> v = qp([](CA& a) { a.depth = Arg(4); });

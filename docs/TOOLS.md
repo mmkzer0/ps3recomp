@@ -710,7 +710,7 @@ job replay needs. `docs/PS3DIFF.md` is the contract.
 python tools/ps3diff.py convert --to 2 trace.ndjson -o trace.v2.ndjson
 python tools/ps3diff.py convert --to 1 trace.v2.ndjson -o trace.v1.ndjson
 python tools/ps3diff.py validate trace.v2.ndjson
-python tools/ps3diff.py diff ref.v2.ndjson new.v2.ndjson --json --mask odin.mask.json
+python tools/ps3diff.py diff ref.v2.ndjson new.v2.ndjson --json --mask title.mask.json
 ```
 
 A canonical event/1 file round-trips byte for byte, or the converter refuses
@@ -1125,6 +1125,38 @@ Exit status: `0` done; `1` a bundle that does not verify (`verify`,
 run directory, an unreadable, truncated or malformed trace, a zstd file with no
 decoder). Standard output carries data only (`create` prints the bundle path);
 progress and errors go to standard error.
+
+---
+
+## check_hygiene.py
+
+Refuses game and firmware material in the index (`--staged`, `--tracked`) or in
+files (`--paths`): forbidden names, signatures at offset 0, oversize blobs,
+symlinks that leave the repository. `dev-ci` runs it with `--tracked`.
+
+`--deny-list FILE` adds a check that no file name or text line names a title, a
+private port or a private workspace. The names cannot be written into the
+repository, so the list lives outside it: one case-insensitive term or regex per
+line, `#` starts a comment line (escape a leading `#` as `\#`). A term matches
+only where no letter or digit touches it, so `cat` hits `cat.json`, `cat_x` and
+`cat's` but not `concatenate`; for a name that is also written run together or
+in camel case, add the other spelling as its own line. Each finding is
+`path:line: deny-list: matches deny-list entry N`, where `N` is the line of the
+list file (the report never repeats the term). `tools/hygiene-allow.txt` can
+allow a reviewed path with the rule id `deny-list`. Binary blobs (a NUL in the
+first 8 KiB) have no lines and are skipped; their names are still checked.
+
+Without the flag the check runs as before and prints
+`check_hygiene: the deny-list check did not run (no --deny-list given)` on
+stderr, so a run without the list never reads as a full pass. An unreadable
+list, an empty list, an invalid regex and a regex that matches the empty
+string are exit 2.
+
+```bash
+python3 tools/check_hygiene.py --tracked --deny-list ~/private/terms.txt
+```
+
+Exit status: `0` clean, `1` findings, `2` usage or environment error.
 
 ---
 

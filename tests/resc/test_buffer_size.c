@@ -127,22 +127,22 @@ int main(void)
     CHECK((u32)cellRescGetBufferSize(NULL, NULL, NULL) == 0x80210301u, "before init");
     CHECK((u32)cellRescSetDsts(4, (const CellRescDsts*)(uintptr_t)DSTS_EA) == 0x80210301u, "SetDsts before init");
 
-    /* Odin: 720p only, minimum GPU load, config size 28, PAL_60_DROP, SDK 4.75. Dsts set after
+    /* A title's configuration: 720p only, minimum GPU load, config size 28, PAL_60_DROP, SDK 4.75. Dsts set after
      * SetDisplayMode, as the title does (rescg-002: pitch 0x1400, heightAlign 0x40). */
     sdk("0x475001");
-    Cfg odin = {28, 2, 4, 1, 0, 0};
-    init(&odin);
+    Cfg cfg_720p_min_load = {28, 2, 4, 1, 0, 0};
+    init(&cfg_720p_min_load);
     CHECK(cellRescSetDisplayMode(4) == 0, "SetDisplayMode");
     CHECK(set_dsts(4, 0x1400, 0x40) == 0, "SetDsts");
-    get("odin", buffer(4, 0x1400, 0x40) * 2, 768);
-    CHECK(buffer(4, 0x1400, 0x40) * 2 == 0x780000, "odin literal: the oracle's second tile (RPCS3 general seq 64)");
+    get("720p min load", buffer(4, 0x1400, 0x40) * 2, 768);
+    CHECK(buffer(4, 0x1400, 0x40) * 2 == 0x780000, "720p min-load literal: the oracle's second tile (RPCS3 general seq 64)");
     cellRescGetBufferSize(NULL, NULL, NULL);   /* every output is optional */
     memset(vm_base + OUT_EA, 0xEE, 12);
     CHECK(cellRescGetBufferSize((u32*)(uintptr_t)OUT_EA, NULL, NULL) == 0 && gr32(OUT_EA) == 0x780000 &&
           gr32(OUT_EA + 4) == 0xEEEEEEEEu && gr32(OUT_EA + 8) == 0xEEEEEEEEu, "only colour requested");
 
     /* No SetDsts: the colour size comes from the default records Init installed. */
-    init(&odin);
+    init(&cfg_720p_min_load);
     get("default dsts", dcolor(4, 1), 768);
     CHECK(dsize(4) == 720u * 0x1400u, "the default 720p size is the plain frame size");
 
@@ -153,7 +153,7 @@ int main(void)
     set_dsts(8, 0x2000, 0x40);
     get("720+1080", buffer(8, 0x2000, 0x40) * 2, 768);
     /* A record of an unsupported mode is ignored. */
-    init(&odin);
+    init(&cfg_720p_min_load);
     set_dsts(4, 0x1400, 0x40);
     set_dsts(8, 0x2000, 0x40);
     get("1080 record ignored", buffer(4, 0x1400, 0x40) * 2, 768);
@@ -185,7 +185,7 @@ int main(void)
     }
 
     /* SetDsts argument checks: NULL, and a mode that is not 1/2/4/8. */
-    init(&odin);
+    init(&cfg_720p_min_load);
     CHECK((u32)cellRescSetDsts(4, NULL) == 0x80210304u, "SetDsts NULL");
     for (u32 mode = 0; mode <= 16; ++mode) {
         if (mode == 1 || mode == 2 || mode == 4 || mode == 8) continue;

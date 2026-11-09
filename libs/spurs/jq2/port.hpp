@@ -85,7 +85,7 @@
  * Tracing evidence: every traced port dump (jq-boot 1802, closure 1224, stall2
  * 1080 records) has bits 31:29 of A, the waiter word and the claim word all
  * zero, i.e. no traced Sync reached the registration path; B3's T1 replay
- * (leifthrasir-recomp tests/test_jq2_port_replay.cpp) checks the rest.
+ * (the title port's tests/test_jq2_port_replay.cpp) checks the rest.
  *
  * Layers:
  *   PortWords      the four words in host order and every transition as a pure

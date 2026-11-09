@@ -33,7 +33,7 @@ _EXAMPLES_DIFF = """\
 examples:
   ps3diff diff ref.ndjson new.ndjson
   ps3diff diff ref.v2.ndjson new.v2.ndjson --json
-  ps3diff diff ref.v2.ndjson new.v2.ndjson --mask odin.mask.json
+  ps3diff diff ref.v2.ndjson new.v2.ndjson --mask title.mask.json
   ps3diff diff ref.v2.ndjson new.v2.ndjson --ctx-map threads.json
 """
 _EXAMPLES_RSX_COMPARE = """\

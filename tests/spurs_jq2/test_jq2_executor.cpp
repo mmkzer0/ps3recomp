@@ -1564,7 +1564,7 @@ void mode_stop_unmodelled()
                   [](const JobSpec& a) { put32(a.desc + 0x2C, 0x06000000u); });
     stop_scenario(Prog::transform, "spu-job-dma-list", "reason=binary-bit1",
                   [](const JobSpec& a) { put32(a.desc + 4, IMAGE | 3u); });
-    /* jobType 0x04 (bit 2: the ELF flag every Odin image carries) alone is fine; three cache entries are not */
+    /* jobType 0x04 (bit 2: the ELF flag every job image examined carries) alone is fine; three cache entries are not */
     stop_scenario(Prog::transform, "spu-job-dma-list", "reason=cache-count", [](const JobSpec& a) {
         put32(a.desc + 0x2C, 0x04000000u);
         put32(a.desc + 0x24, 24);

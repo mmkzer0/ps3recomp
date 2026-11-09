@@ -720,7 +720,7 @@ method, like the header.
 
 ### Census
 
-The 120 s Odin boot (`scratch/h1b-census`, the last `GCM_METHOD_STATS` block) carried 214 observations:
+One title's 120 s boot (`scratch/h1b-census`, the last `GCM_METHOD_STATS` block) carried 214 observations:
 NV4097 177, NV308A 10, NV309E 3, NV3062 2, NV3089 2, NV406E 1, driver 1, and 18 NV4097 methods seen
 before the first observed bind. Those 18 are the same methods as some of the 177, so the stream has 196
 distinct `(class, method)` pairs. Classified: **25 handled, 170 inert, 1 missing, 0 unknown** (21/170/5

@@ -3,8 +3,8 @@
 # The JobQueue2 ring-entry codec and the reference scheduler are the standalone
 # target ps3recomp_spurs_jq2_model, so these tests link it alone (no HLE runtime)
 # and prove the bit layout and the scheduling contract on synthetic entries.
-# Guest and trace bytes are out of scope for this repository; the Odin-backed
-# check lives in leifthrasir-recomp.
+# Guest and trace bytes are out of scope for this repository; the title-backed
+# check lives in that title's private port.
 #
 # The port line (libs/spurs/jq2/port.hpp) adds one test program with four
 # modes. It needs guest memory, the reservation model and the SPU channel path,

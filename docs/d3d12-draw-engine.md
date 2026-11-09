@@ -1,6 +1,6 @@
 # D3D12 on the register-file draw engine
 
-Status: planned, not started (noted 2026-11-09, during the Windows bring-up of *Odin Sphere Leifthrasir*).
+Status: planned, not started (noted 2026-11-09, during the Windows bring-up of a private title).
 
 ## Why
 
@@ -9,7 +9,7 @@ Windows has two RSX backends, and they draw by different models:
 - `rsx_d3d12_backend.c` is the upstream reference path, the one the in-tree ports were built against. It decodes draws itself through the vtable callbacks and has none of the register-file engine's state handling.
 - `rsx_vulkan_backend.c` (Windows since the bring-up, `-DPS3RECOMP_RSX_VULKAN=ON`) runs on `rsx_draw_engine`. Metal does too. The engine owns surfaces, render-to-texture, MRT, depth textures, cube maps, vertex compaction and pipeline keys. The fork's title fixes live there: the framebuffer sRGB rule, colour feedback and texture gamma (`docs/rsx-*.md`).
 
-*Odin* on the legacy D3D12 path: the title runs at 60 flips a second and the backend executes its draws, but the window stays black. On Vulkan the same build draws the title screen. Windows therefore depends on the Vulkan SDK and SDL2 for now, and Microsoft's own graphics stack goes unused (PIX, the D3D12 debug layer, no extra runtime DLL).
+One title on the legacy D3D12 path: the title runs at 60 flips a second and the backend executes its draws, but the window stays black. On Vulkan the same build draws the title screen. Windows therefore depends on the Vulkan SDK and SDL2 for now, and Microsoft's own graphics stack goes unused (PIX, the D3D12 debug layer, no extra runtime DLL).
 
 ## Shape
 
@@ -29,5 +29,5 @@ Submission: start where Vulkan's draw batching stands (`vk.draw_batch`), so the 
 ## Acceptance
 
 - `ps3recomp_host` scenes pass on the D3D12 engine path. That needs the host harness to build on Windows first.
-- *Odin*: the title screen and the first scenes match the Vulkan backend's frame dumps (`PS3RECOMP_VK_DUMP_LIST` against the same present numbers), and it holds 60 flips a second where Vulkan does.
+- One title: the title screen and the first scenes match the Vulkan backend's frame dumps (`PS3RECOMP_VK_DUMP_LIST` against the same present numbers), and it holds 60 flips a second where Vulkan does.
 - Selected with `PS3RECOMP_RSX_ENGINE=dispatch` like the other engine backends; the legacy path stays the default until the engine path covers the in-tree ports.

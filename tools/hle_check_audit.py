@@ -3,7 +3,7 @@
 
 Every early error return or fail-closed stop in an HLE handler is a claim about
 the firmware.  A check the firmware does not make is a divergence: the poolAttr
-alignment check (f1a51f1) failed Odin's second queue because libspurs_jq's
+alignment check (f1a51f1) failed one title's second queue because libspurs_jq's
 CreateCommon never aligns the pool attribute, and the JQ2 create order/codes
 (fe3a78f) returned invented codes for pool/pool_attr pairings.  This tool finds
 the checks and classifies the comment that justifies each one, so the ones with

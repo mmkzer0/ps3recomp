@@ -332,5 +332,139 @@ class HygieneOutput(RepoTestCase):
         self.assert_exit(result, 2)
 
 
+class HygieneDenyList(RepoTestCase):
+    """Synthetic terms only: the real list lives outside the repository."""
+
+    def deny_file(self, text, name="deny.txt"):
+        path = Path(self._tmp.name) / name  # outside the repository
+        path.write_text(text)
+        return str(path)
+
+    def tracked(self, name, text):
+        self.write(name, text)
+        self.add(name)
+
+    def test_hit_is_reported_with_file_and_line(self):
+        self.tracked("docs/a.md", "clean\nclean\nthe zzfoo port\n")
+        result = self.run_tool("--tracked", "--deny-list",
+                               self.deny_file("zzfoo\n"))
+        self.assert_exit(result, 1)
+        self.assertEqual(self.findings(result), [
+            ("docs/a.md:3", "deny-list", "matches deny-list entry 1")])
+        self.assertNotIn("zzfoo", result.stdout)
+        self.assertNotIn("did not run", result.stderr)
+
+    def test_match_is_case_insensitive_and_takes_regexes(self):
+        self.tracked("a.txt", "ZzFoo\nzzbaz\nzzqux\n")
+        result = self.run_tool("--tracked", "--deny-list",
+                               self.deny_file("zzfoo\nzzba[rz]\n"))
+        self.assert_exit(result, 1)
+        self.assertEqual(
+            [(path, detail) for path, _, detail in self.findings(result)],
+            [("a.txt:1", "matches deny-list entry 1"),
+             ("a.txt:2", "matches deny-list entry 2")])
+
+    def test_a_term_inside_a_longer_word_is_not_a_hit(self):
+        self.tracked("a.txt", "xzzfoo\nzzfoox\nzzfoo2\nzzfoos\n9zzfoo\n")
+        result = self.run_tool("--tracked", "--deny-list",
+                               self.deny_file("zzfoo\n"))
+        self.assert_exit(result, 0)
+        self.assertIn("0 finding(s)", result.stdout)
+
+    def test_punctuation_and_identifier_joins_are_hits(self):
+        self.tracked("a.txt", "zzfoo's\nzzfoo_bar\nuse zzfoo.mask.json\n(zzfoo)\n")
+        result = self.run_tool("--tracked", "--deny-list",
+                               self.deny_file("zzfoo\n"))
+        self.assert_exit(result, 1)
+        self.assertEqual([path for path, _, _ in self.findings(result)],
+                         ["a.txt:1", "a.txt:2", "a.txt:3", "a.txt:4"])
+
+    def test_comments_and_blank_lines_are_not_terms(self):
+        self.tracked("a.txt", "zzfoo\nzzbar\n")
+        listing = self.deny_file("# zzfoo is only named in a comment\n\n"
+                                 "   \nzzbar\n")
+        result = self.run_tool("--tracked", "--deny-list", listing)
+        self.assert_exit(result, 1)
+        # The entry is named by its line in the list file.
+        self.assertEqual(self.findings(result), [
+            ("a.txt:2", "deny-list", "matches deny-list entry 4")])
+
+    def test_a_file_name_is_checked_too(self):
+        self.tracked("tools/zzfoo.mask.json", "{}\n")
+        result = self.run_tool("--tracked", "--deny-list",
+                               self.deny_file("zzfoo\n"))
+        self.assert_exit(result, 1)
+        self.assertEqual(self.findings(result), [
+            ("tools/zzfoo.mask.json", "deny-list",
+             "path matches deny-list entry 1")])
+
+    def test_binary_blobs_have_no_lines_and_are_skipped(self):
+        self.write("data.bin", b"\x00\x01zzfoo\n")
+        self.add("data.bin")
+        result = self.run_tool("--tracked", "--deny-list",
+                               self.deny_file("zzfoo\n"))
+        self.assert_exit(result, 0)
+
+    def test_content_comes_from_the_index_not_the_working_tree(self):
+        self.tracked("a.txt", "clean\n")
+        self.write("a.txt", "zzfoo\n")  # unstaged edit
+        result = self.run_tool("--tracked", "--deny-list",
+                               self.deny_file("zzfoo\n"))
+        self.assert_exit(result, 0)
+
+    def test_paths_mode_scans_files(self):
+        self.write("out/a.txt", "x\nzzfoo\n")
+        result = self.run_tool("--paths", "out", "--deny-list",
+                               self.deny_file("zzfoo\n"))
+        self.assert_exit(result, 1)
+        self.assertEqual(self.findings(result), [
+            ("out/a.txt:2", "deny-list", "matches deny-list entry 1")])
+
+    def test_allow_list_suppresses_by_path_and_rule(self):
+        self.tracked("docs/a.md", "zzfoo\n")
+        self.write("allow.txt",
+                   "docs/a.md deny-list -- synthetic reviewed mention\n")
+        result = self.run_tool("--tracked", "--allow", "allow.txt",
+                               "--deny-list", self.deny_file("zzfoo\n"))
+        self.assert_exit(result, 0)
+        self.assertIn("1 allowed", result.stdout)
+
+    def test_json_findings_carry_the_line(self):
+        self.tracked("a.txt", "x\nzzfoo\n")
+        result = self.run_tool("--tracked", "--json", "--deny-list",
+                               self.deny_file("zzfoo\n"))
+        self.assert_exit(result, 1)
+        self.assertEqual(json.loads(result.stdout), [{
+            "path": "a.txt", "rule": "deny-list",
+            "detail": "matches deny-list entry 1", "line": 2}])
+
+    def test_no_list_says_so_on_stderr(self):
+        self.tracked("a.txt", "zzfoo\n")
+        for extra in ((), ("--json",)):
+            result = self.run_tool("--tracked", *extra)
+            self.assert_exit(result, 0)
+            self.assertIn("deny-list check did not run", result.stderr)
+
+    def test_missing_list_exits_2_and_names_the_file(self):
+        result = self.run_tool("--tracked", "--deny-list", "no-such-deny.txt")
+        self.assert_exit(result, 2)
+        self.assertIn("cannot read deny list no-such-deny.txt", result.stderr)
+
+    def test_unusable_lists_exit_2(self):
+        cases = (
+            ("# only comments\n\n", "no entries"),
+            ("zzfoo\n(unclosed\n", ":2: invalid deny-list pattern"),
+            ("zzfoo\n(zz)*\n", ":2: deny-list pattern matches the empty string"),
+            ("a*\n", ":1: deny-list pattern matches the empty string"),
+        )
+        for text, expected in cases:
+            with self.subTest(text=text):
+                result = self.run_tool("--tracked", "--deny-list",
+                                       self.deny_file(text))
+                self.assert_exit(result, 2)
+                self.assertIn(expected, result.stderr)
+
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -112,7 +112,7 @@ source sha256 `be3da1c7181d4b65c3f48d5860e7a35815c0be7ef99b3c900f9927cbae12b337`
 byte-identical in all three; `TIME` rows differ. Each full run takes about 15 s once the SELF starts; the first
 `/play.ps3` after a finished run ended in XMB error `8001003A` all three times and the second one, 28 s later, started it.
 Results, the per-group runs after the power-cycle and `SHA256SUMS` are in
-`~/ps3-recon/odin-sphere-m0/scratch/m4/lv2conf/hw/2026-11-04/` (private recon tree, not in the repository).
+a private recon workspace (not in the repository), under `scratch/m4/lv2conf/hw/2026-11-04/`.
 
 Cases per group: event 27, eventflag 19, threads 18, mutex 17, semaphore 16, rwlock 15, memory 15, timer 13,
 container 12, cond 12, time 7, slot96 6, process 6, ppu_thread 6 (189; 18 of them `CONF_THREADS`, 2 `CONF_TIMING`).

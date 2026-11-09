@@ -1042,7 +1042,7 @@ thread_local const JobStart* t_job = nullptr;
     const ps3_stop_site site{SPU_JQ2_JM_CALL_LS, ctx->gpr[0]._u32[0] & SPU_LS_MASK, js ? js->worker : 0};
     stop_with(PS3_STOP_JQ2_JM_CALL,
               "a JobQueue2 job called jm interface word 0, the policy module's scheduler switch",
-              "No Odin Sphere job image does; the executor runs one job per worker and has no manager to yield an "
+              "No job image examined so far does; the executor runs one job per worker and has no manager to yield an "
               "Execute slot to. The port was not credited.",
               {hex("queue", js ? js->queue_ea : 0), hex("job", js ? js->descriptor_ea : 0),
                hex("port", js ? js->port_ea : 0), dec("tag", js ? js->tag : 0), dec("worker", js ? js->worker : 0),
@@ -1613,7 +1613,7 @@ int32_t jq2_queue_create(uint32_t revision, uint32_t sdk_version, uint32_t spurs
 
     /* 3. 0x020004E8..0x02000530: 128-byte alignment of spurs, queue, command_ring,
      *    and pool if non-null, gives ALIGN (0x80410A10). pool_attr is never
-     *    alignment-checked (Odin passes a 16-byte-aligned stack poolAttr). */
+     *    alignment-checked (one title passes a 16-byte-aligned stack poolAttr). */
     if (!aligned(spurs, 128) || !aligned(queue, 128) || !aligned(command_ring, 128)) return JQ2_ERR_ALIGN;
     if (pool != 0 && !aligned(pool, 128)) return JQ2_ERR_ALIGN;
 
