@@ -1,14 +1,11 @@
-"""ps3diff.rsx/1: an RSX capture, its validator and its comparison.
+"""Versioned RSX capture readers, validation and comparison.
 
 A capture is `capture.ndjson` plus `blobs/sha256/<2 hex>/<64 hex>` beside it
-(docs/PS3DIFF.md, "ps3diff.rsx/1"). The envelope rules are event/2's: strict
-fields, strictly increasing `seq`, contiguous `ctx_seq`, canonical JSON. This
-module adds the event registry, the blob checks and the replay-relevant
-invariants (the FIFO walk in executed order, CALL/RET balance, the IO map, the
-draw accounting, the three hashes), and compares two captures frame by frame.
+(docs/PS3DIFF.md). Schema-specific readers normalize records into one model;
+the shared validator checks the FIFO walk, blobs, draw accounting and hashes.
 
 Nothing here renders anything; the replay runner (tools/rsx_replay) does that
-through the same walker, engine and Metal backend the title uses.
+through the same walker, engine and backend the title uses.
 """
 
 from __future__ import annotations
@@ -27,7 +24,9 @@ from .schema import (
     read_ndjson,
 )
 
-SCHEMA_RSX = "ps3diff.rsx/1"
+SCHEMA_RSX_V1 = "ps3diff.rsx/1"
+SCHEMA_RSX = "ps3diff.rsx/2"
+RSX_SCHEMA_PREFIX = "ps3diff.rsx/"
 
 #: Process status of `rsx-compare` when the environments differ: neither pass nor fail.
 EXIT_NOT_COMPARABLE = 4
@@ -62,7 +61,9 @@ GCM_STATE_OPS = {
     "display-buffer": frozenset({"id", "offset", "pitch", "width", "height"}),
 }
 
-MACHINE_FIELDS = ("gpu", "macos", "metal", "build", "glslang", "spirv_cross", "toolkit_sha", "title_sha")
+LEGACY_MACHINE_FIELDS = ("gpu", "macos", "metal", "build", "glslang", "spirv_cross", "toolkit_sha", "title_sha")
+MACHINE_FIELDS = ("os", "os_version", "backend", "device", "driver", "build", "glslang", "spirv_cross",
+                  "toolkit_sha", "title_sha")
 
 READ_KINDS = frozenset({"other", "fifo", "label", "vertex", "index", "texture", "program", "dma-source"})
 WRITE_KINDS = frozenset({"other", "label", "report", "dma-destination"})
@@ -94,6 +95,48 @@ def _show(v: object) -> str:
 def _need(cond: bool, where: str, message: str) -> None:
     if not cond:
         raise RecordProblem(where, message)
+
+
+def _read_v1_machine(value: object) -> dict:
+    _need(isinstance(value, dict) and set(value) == set(LEGACY_MACHINE_FIELDS), "machine",
+          f"must have exactly {list(LEGACY_MACHINE_FIELDS)}")
+    for key in LEGACY_MACHINE_FIELDS:
+        _need(isinstance(value[key], str) and value[key], f"machine.{key}", "must be a non-empty string")
+    return {
+        "os": "macOS",
+        "os_version": value["macos"],
+        "backend": "metal",
+        "device": value["gpu"],
+        "driver": value["metal"],
+        **{key: value[key] for key in MACHINE_FIELDS[5:]},
+    }
+
+
+def _read_v2_machine(value: object) -> dict:
+    _need(isinstance(value, dict) and set(value) == set(MACHINE_FIELDS), "machine",
+          f"must have exactly {list(MACHINE_FIELDS)}")
+    for key in MACHINE_FIELDS:
+        _need(isinstance(value[key], str) and value[key], f"machine.{key}", "must be a non-empty string")
+    _need(value["backend"] in ("metal", "vulkan"), "machine.backend", "must be 'metal' or 'vulkan'")
+    return dict(value)
+
+
+# Both readers return the same normalized environment used by comparison.
+RSX_READERS = {SCHEMA_RSX_V1: _read_v1_machine, SCHEMA_RSX: _read_v2_machine}
+
+
+def _hash_input_line(raw: str, schema: str) -> str:
+    # /2 retains the /1 input-hash domain: the envelope version is not input semantics.
+    if schema == SCHEMA_RSX_V1:
+        return raw
+    return raw.replace(f'"schema":"{schema}"', f'"schema":"{SCHEMA_RSX_V1}"', 1)
+
+
+def _reader_for(path: str, lineno: int, schema: object):
+    reader = RSX_READERS.get(schema) if isinstance(schema, str) else None
+    if reader is None:
+        raise Ps3DiffError(f"{path}: line {lineno}: schema: unknown RSX schema {_show(schema)}")
+    return reader
 
 
 def _addr(rec: dict, name: str) -> int:
@@ -152,10 +195,11 @@ class _Blobs:
 
 
 class RsxCapture:
-    """What `validate` learned about a capture."""
+    """The normalized model produced by a schema reader and the shared validator."""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, schema: str):
         self.path = path
+        self.schema = schema
         self.machine: dict = {}
         self.frames: list[dict] = []        # one dict per frame-complete record, in file order
         self.events = 0
@@ -215,10 +259,12 @@ def validate_rsx(path: str, entries: list[tuple[int, str, dict]] | None = None) 
         entries = read_ndjson(path)
     if not entries:
         raise Ps3DiffError(f"{path}: empty file: a capture starts with capture-start")
-    cap = RsxCapture(path)
+    schema = entries[0][2].get("schema")
+    reader = _reader_for(path, entries[0][0], schema)
+    cap = RsxCapture(path, schema)
     blobs = _Blobs(Path(path).resolve().parent)
     try:
-        _walk(path, entries, cap, blobs)
+        _walk(path, entries, cap, blobs, reader)
     except _Located as exc:
         raise Ps3DiffError(f"{path}: line {exc.lineno}: {exc.problem.where}: {exc.problem.message}") from None
     return cap
@@ -230,7 +276,7 @@ class _Located(Exception):
         self.problem = problem
 
 
-def _walk(path: str, entries: list[tuple[int, str, dict]], cap: RsxCapture, blobs: _Blobs) -> None:
+def _walk(path: str, entries: list[tuple[int, str, dict]], cap: RsxCapture, blobs: _Blobs, reader) -> None:
     seq_prev = -1
     ctx_prev = -1
     running = hashlib.sha256()
@@ -247,7 +293,7 @@ def _walk(path: str, entries: list[tuple[int, str, dict]], cap: RsxCapture, blob
 
     for lineno, raw, rec in entries:
         try:
-            ev = _envelope(rec, seq_prev, ctx_prev)
+            ev = _envelope(rec, seq_prev, ctx_prev, cap.schema)
             if canonical_json(rec) != raw:
                 raise RecordProblem("line", "is not canonical JSON (compact separators, ASCII, the writer's key order)")
             if seen_end:
@@ -271,12 +317,7 @@ def _walk(path: str, entries: list[tuple[int, str, dict]], cap: RsxCapture, blob
                 _need(not seen_env and prev_event == "capture-start", "event",
                       "environment follows capture-start, once")
                 seen_env = True
-                m = rec["machine"]
-                _need(isinstance(m, dict) and set(m) == set(MACHINE_FIELDS), "machine",
-                      f"must have exactly {list(MACHINE_FIELDS)}")
-                for k in MACHINE_FIELDS:
-                    _need(isinstance(m[k], str) and m[k], f"machine.{k}", "must be a non-empty string")
-                cap.machine = dict(m)
+                cap.machine = reader(rec.get("machine"))
             elif ev == "gcm-init":
                 cmd = _uint(rec, "cmd_size")
                 size = _uint(rec, "io_size")
@@ -338,7 +379,7 @@ def _walk(path: str, entries: list[tuple[int, str, dict]], cap: RsxCapture, blob
                 cap.events = rec["events"]
             prev_event = ev
             if ev in INPUT_EVENTS:
-                running.update(raw.encode("ascii") + b"\n")
+                running.update(_hash_input_line(raw, cap.schema).encode("ascii") + b"\n")
         except RecordProblem as problem:
             raise _Located(lineno, problem) from None
     if not seen_end:
@@ -347,9 +388,11 @@ def _walk(path: str, entries: list[tuple[int, str, dict]], cap: RsxCapture, blob
         raise Ps3DiffError(f"{path}: no environment record: a baseline without one cannot be compared")
 
 
-def _envelope(rec: dict, seq_prev: int, ctx_prev: int) -> str:
-    _need(rec.get("schema") == SCHEMA_RSX, "schema",
-          f"must be {SCHEMA_RSX!r}, found {_show(rec.get('schema'))}")
+def _envelope(rec: dict, seq_prev: int, ctx_prev: int, schema: str) -> str:
+    actual = rec.get("schema")
+    _need(isinstance(actual, str) and actual in RSX_READERS, "schema",
+          f"unknown RSX schema {_show(actual)}")
+    _need(actual == schema, "schema", f"mixed schemas: expected {schema!r}, found {actual!r}")
     ev = rec.get("event")
     _need(isinstance(ev, str) and ev in EVENTS, "event", f"unknown event {_show(ev)}")
     _need(_is_int(rec.get("seq")) and rec["seq"] > seq_prev, "seq", f"must be an integer > {seq_prev}")
@@ -579,7 +622,8 @@ def compare_files(a_path: str, b_path: str, flip: int | None = None) -> tuple[di
     """
     a = validate_rsx(a_path)
     b = validate_rsx(b_path)
-    report: dict = {"schema": "ps3diff.rsx.report/1", "a": str(a_path), "b": str(b_path), "status": "",
+    report: dict = {"schema": "ps3diff.rsx.report/1", "a": str(a_path), "b": str(b_path),
+                    "schema_a": a.schema, "schema_b": b.schema, "status": "",
                     "compared": 0, "frames": [], "first": None}
     diff_env = {k: [a.machine.get(k), b.machine.get(k)] for k in MACHINE_FIELDS if a.machine.get(k) != b.machine.get(k)}
     if diff_env:
@@ -638,7 +682,7 @@ def _first(report: dict, flip_id: int, field: str, a, b) -> None:
 
 
 def report_text(report: dict) -> str:
-    lines = [f"rsx-compare {report['a']} vs {report['b']}: {report['status']}"]
+    lines = [f"rsx-compare {report['a']} ({report['schema_a']}) vs {report['b']} ({report['schema_b']}): {report['status']}"]
     if report["status"] == "not-comparable":
         lines.append("  the environment records differ, so byte equality proves nothing either way:")
         for k, (x, y) in sorted(report["environment"].items()):

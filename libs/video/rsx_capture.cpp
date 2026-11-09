@@ -1,5 +1,5 @@
 /*
- * ps3recomp - RSX capture writer (ps3diff.rsx/1), see rsx_capture.h and docs/PS3DIFF.md.
+ * ps3recomp - RSX capture writer (ps3diff.rsx/2), see rsx_capture.h and docs/PS3DIFF.md.
  *
  * One event is written per FIFO step the walker took, in the order it took
  * them, with every guest-memory span the step consumed as a content-addressed
@@ -45,7 +45,7 @@
 
 namespace {
 
-constexpr const char* kSchema = "ps3diff.rsx/1";
+constexpr const char* kSchema = "ps3diff.rsx/2";
 constexpr u32 kNoFlip = 0xFFFFFFFFu;
 
 const char* const kReadKind[RSX_CAP_READ_KIND_COUNT] = {
@@ -119,7 +119,7 @@ struct Cap {
     ps3_sha256_ctx in_hash;
     std::unordered_set<std::string> blobs;
     rsx_capture_environment env_copy;
-    std::string env_strs[8];
+    std::string env_strs[10];
 
     // The open step.
     bool in_step = false;
@@ -156,7 +156,14 @@ void write_line(const std::string& line, bool input)
     if (fwrite(line.data(), 1, line.size(), C.f) != line.size() || fputc('\n', C.f) == EOF)
         fail("io", std::string("write ") + C.dir + "/capture.ndjson.partial: " + strerror(errno));
     if (input) {
-        ps3_sha256_update(&C.in_hash, line.data(), line.size());
+        // /2 keeps the /1 input hash domain: only the envelope's schema value is normalized.
+        const size_t schema_at = line.find(kSchema);
+        if (schema_at == std::string::npos) fail("capture-format", "an input line lacks its schema");
+        static constexpr char prefix[] = "ps3diff.rsx/";
+        const size_t version_at = schema_at + sizeof(prefix) - 1;
+        ps3_sha256_update(&C.in_hash, line.data(), version_at);
+        ps3_sha256_update(&C.in_hash, "1", 1);
+        ps3_sha256_update(&C.in_hash, line.data() + version_at + 1, line.size() - version_at - 1);
         ps3_sha256_update(&C.in_hash, "\n", 1);
     }
     C.events++;
@@ -320,7 +327,8 @@ void flush_nop()
 std::string machine_json()
 {
     const rsx_capture_environment& e = C.env_copy;
-    return std::string("{\"gpu\":") + jstr(e.gpu) + ",\"macos\":" + jstr(e.macos) + ",\"metal\":" + jstr(e.metal) +
+    return std::string("{\"os\":") + jstr(e.os) + ",\"os_version\":" + jstr(e.os_version) +
+           ",\"backend\":" + jstr(e.backend) + ",\"device\":" + jstr(e.device) + ",\"driver\":" + jstr(e.driver) +
            ",\"build\":" + jstr(e.build) + ",\"glslang\":" + jstr(e.glslang) +
            ",\"spirv_cross\":" + jstr(e.spirv_cross) + ",\"toolkit_sha\":" + jstr(e.toolkit_sha) +
            ",\"title_sha\":" + jstr(e.title_sha) + "}";
@@ -525,6 +533,7 @@ void s_draw(const rsx_dispatch* r, u32 executed, u32 reason, const char* name, u
     else C.dropped[name]++;
     ps3_sha256_ctx h;
     ps3_sha256_init(&h);
+    // Draw/frame tags encode hash semantics, not the envelope version; keep their /1 bytes for /2 captures.
     static const char tag[] = "ps3diff.rsx/1 draw-state/v1";
     ps3_sha256_update(&h, tag, sizeof tag);
     digest_state(&h, r);
@@ -638,6 +647,10 @@ const rsx_capture_environment* rsx_capture_environment_record(void) { return C.o
 int rsx_capture_install(const rsx_capture_environment* env, const rsx_capture_options* opt)
 {
     if (C.open) return 1;
+    if (!env || !env->backend || !*env->backend)
+        fail("environment", "backend must be 'metal' or 'vulkan'");
+    if (strcmp(env->backend, "metal") && strcmp(env->backend, "vulkan"))
+        fail("environment", std::string("unknown backend ") + env->backend);
     if (!opt || !opt->dir || !*opt->dir)
         fail("output", "no output directory");
     C.dir = opt->dir;
@@ -654,13 +667,14 @@ int rsx_capture_install(const rsx_capture_environment* env, const rsx_capture_op
     static const char ctag[] = "ps3diff.rsx/1 frame-state/v1";
     ps3_sha256_update(&C.chain, ctag, sizeof ctag);
 
-    const char* src[8] = { env ? env->gpu : 0, env ? env->macos : 0, env ? env->metal : 0, env ? env->build : 0,
-                           env ? env->glslang : 0, env ? env->spirv_cross : 0, env ? env->toolkit_sha : 0,
-                           env ? env->title_sha : 0 };
-    const char* dflt[8] = { "n/a", "n/a", "n/a", PS3RECOMP_BUILD_TYPE, "n/a", "n/a", PS3RECOMP_TOOLKIT_SHA, "n/a" };
-    for (int i = 0; i < 8; i++) C.env_strs[i] = (src[i] && *src[i]) ? src[i] : dflt[i];
+    const char* src[10] = { env->os, env->os_version, env->backend, env->device, env->driver, env->build,
+                           env->glslang, env->spirv_cross, env->toolkit_sha, env->title_sha };
+    const char* dflt[10] = { "n/a", "n/a", "n/a", "n/a", "n/a", PS3RECOMP_BUILD_TYPE,
+                             "n/a", "n/a", PS3RECOMP_TOOLKIT_SHA, "n/a" };
+    for (int i = 0; i < 10; i++) C.env_strs[i] = (src[i] && *src[i]) ? src[i] : dflt[i];
     C.env_copy = { C.env_strs[0].c_str(), C.env_strs[1].c_str(), C.env_strs[2].c_str(), C.env_strs[3].c_str(),
-                   C.env_strs[4].c_str(), C.env_strs[5].c_str(), C.env_strs[6].c_str(), C.env_strs[7].c_str() };
+                   C.env_strs[4].c_str(), C.env_strs[5].c_str(), C.env_strs[6].c_str(), C.env_strs[7].c_str(),
+                   C.env_strs[8].c_str(), C.env_strs[9].c_str() };
     C.open = true;
     emit("capture-start", ",\"bootstrap\":{\"mode\":\"clean-reset\"},\"producer\":\"ps3recomp\"", true);
     emit("environment", ",\"machine\":" + machine_json(), false);

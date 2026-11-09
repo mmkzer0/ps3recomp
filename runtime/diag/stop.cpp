@@ -447,7 +447,7 @@ void ps3_stop_rsx_capture(const char* func, const char* reason, const char* deta
     };
     ps3_stop(PS3_STOP_RSX_CAPTURE,
              "an RSX capture or replay cannot be trusted: continuing would write or replay a capture that only looks complete",
-             "Fix the named cause (docs/PS3DIFF.md, \"ps3diff.rsx/1\") and capture again; a capture that stopped is never a baseline.",
+             "Fix the named cause (docs/PS3DIFF.md, \"ps3diff.rsx/2\") and capture again; a capture that stopped is never a baseline.",
              f, sizeof f / sizeof f[0], nullptr);
 }
 

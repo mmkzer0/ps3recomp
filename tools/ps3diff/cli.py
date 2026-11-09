@@ -8,7 +8,8 @@ import sys
 
 from .convert import convert_file
 from .diff import diff_files, report_text
-from .rsx import SCHEMA_RSX, compare_files, report_text as rsx_report_text, validate_rsx
+from .rsx import RSX_SCHEMA_PREFIX, compare_files, validate_rsx
+from .rsx import report_text as rsx_report_text
 from .schema import (
     Ps3DiffError,
     context_keys,
@@ -26,7 +27,7 @@ _EXAMPLES_VALIDATE = """\
 examples:
   ps3diff validate trace.v2.ndjson
   ps3diff validate trace.ndjson                # event/1 is checked too
-  ps3diff validate captures/h1/capture.ndjson  # ps3diff.rsx/1, blobs checked
+  ps3diff validate captures/h1/capture.ndjson  # ps3diff.rsx/2 (or readable /1), blobs checked
 """
 _EXAMPLES_DIFF = """\
 examples:
@@ -96,7 +97,7 @@ def _parser() -> argparse.ArgumentParser:
     diff.set_defaults(func=_cmd_diff)
 
     rsx = sub.add_parser(
-        "rsx-compare", help="compare two ps3diff.rsx/1 captures frame by frame",
+        "rsx-compare", help="compare ps3diff.rsx/1 and /2 captures frame by frame",
         description="Validate both captures, then compare the frames they share by flip_id: identity, "
                     "capture hash (inputs), state hash, readback descriptor and frame hash (pixels), "
                     "in that order. Differing environment records are 'not comparable', never a pass "
@@ -117,10 +118,10 @@ def _cmd_convert(args: argparse.Namespace) -> int:
 
 def _cmd_validate(args: argparse.Namespace) -> int:
     entries = read_ndjson(args.file)
-    if entries and entries[0][2].get("schema") == SCHEMA_RSX:
+    if entries and str(entries[0][2].get("schema", "")).startswith(RSX_SCHEMA_PREFIX):
         cap = validate_rsx(args.file, entries)
         print(f"{args.file}: valid: {len(entries)} records, {len(cap.frames)} frames, "
-              f"{sum(1 for f in cap.frames if f['valid'])} valid ({SCHEMA_RSX})")
+              f"{sum(1 for f in cap.frames if f['valid'])} valid ({cap.schema})")
         return 0
     schema = validate_entries(args.file, entries)
     contexts = context_keys(schema, [rec for _, _, rec in entries])

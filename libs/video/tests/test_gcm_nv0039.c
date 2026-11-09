@@ -151,7 +151,10 @@ static void setup(const char* capture_dir)
     ppu_vm_size = vm_size;
     if (capture_dir) {
         rsx_capture_options opt = { capture_dir, 0 };
-        rsx_capture_environment env = { "synthetic", "n/a", "n/a", "Debug", "n/a", "n/a", "synthetic", "n/a" };
+        rsx_capture_environment env = {
+            .os = "n/a", .os_version = "n/a", .backend = "metal", .device = "synthetic", .driver = "n/a",
+            .build = "Debug", .glslang = "n/a", .spirv_cross = "n/a", .toolkit_sha = "synthetic", .title_sha = "n/a",
+        };
         (void)rsx_capture_install(&env, &opt);
     }
     u32 ctx_out = host_alloc(4, 4);

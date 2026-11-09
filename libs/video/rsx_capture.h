@@ -1,10 +1,10 @@
 /*
- * ps3recomp - RSX capture (ps3diff.rsx/1), the producer side
+ * ps3recomp - RSX capture (ps3diff.rsx/2), the producer side
  *
  * A capture is the command stream the RSX consumed and every guest-memory
  * input it consumed with it, recorded at the moment of consumption, so that
- * rsx_replay can feed the same walker, draw engine and Metal backend again
- * without the title. Format and rules: docs/PS3DIFF.md, "ps3diff.rsx/1".
+ * rsx_replay can feed the same walker, draw engine and backend again
+ * without the title. Format and rules: docs/PS3DIFF.md, "ps3diff.rsx/2".
  *
  * The walker (cellGcmSys.c) and the draw engine (rsx_draw_engine.c) never
  * call into the capture module directly. Each owns one `const rsx_capture_sink*`
@@ -142,9 +142,11 @@ typedef struct rsx_capture_sink {
 } rsx_capture_sink;
 
 typedef struct rsx_capture_environment {
-    const char* gpu;
-    const char* macos;
-    const char* metal;
+    const char* os;
+    const char* os_version;
+    const char* backend;      /* "metal" or "vulkan" */
+    const char* device;
+    const char* driver;       /* driver or API version; "n/a" when unknown */
     const char* build;
     const char* glslang;
     const char* spirv_cross;
@@ -165,8 +167,9 @@ int  rsx_capture_install(const rsx_capture_environment* env, const rsx_capture_o
  * a no-op returning 0 while video.rsx_capture is off. */
 int  rsx_capture_install_from_config(const rsx_capture_environment* env);
 
-/* The environment record the open capture carries, defaults filled in (build type, toolkit sha, "n/a"),
- * or NULL while none is open. rsx_replay compares it with the capture it replays. */
+/* The environment record the open capture carries. Backend is required; absent optional host/version
+ * strings default to "n/a", while build type and toolkit revision come from this build. rsx_replay
+ * compares it with the capture. */
 const rsx_capture_environment* rsx_capture_environment_record(void);
 
 /* Write capture-end and publish capture.ndjson. Idempotent; also runs at normal

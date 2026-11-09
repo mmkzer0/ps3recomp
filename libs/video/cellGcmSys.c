@@ -3759,8 +3759,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
          * skip is a faster decode, not a bigger tick, and VF5 depends on the
          * walker yielding at the cap (it lost 7 milestones when a whole run
          * cost one word). */
-        /* A capture records every word the walker consumes, in executed order (ps3diff.rsx/1): with a
-         * sink attached the run is walked word by word, whatever the draw engine's state. */
+        /* A capture records every word the walker consumes, in executed order (the versioned ps3diff.rsx format):
+         * with a sink attached the run is walked word by word, whatever the draw engine's state. */
         if (!w && !wdiag && !s_cap) {
             const u32 page_end = (s_fifo_getoff | 0xFFFFFu) + 1u;
             const u32 lim = (put > s_fifo_getoff && put < page_end) ? put : page_end;
