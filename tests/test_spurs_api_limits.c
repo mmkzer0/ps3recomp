@@ -109,9 +109,11 @@ int main(void)
         assert(cellSpursSetMaxContention((CellSpurs*)0x5000,1,3)==0);
         assert(vm_read8(0x5000+SPURS_WKL_MAXCONT+1)==0x03);
     }
-    finalize(0x5000);   /* the CellSpurs2 coordinator must stop before exit */
-
+    /* Both instances run hold_policy (the same image at 0x9000), so an SPU of
+     * either may sit in it; finalize answers BUSY until the gate lets it exit.
+     * Open the gate before the first finalize, not between them. */
     atomic_store(&gate,1);
+    finalize(0x5000);   /* the CellSpurs2 coordinator must stop before exit */
     finalize(0x1000);
     free(vm_base);return 0;
 }
