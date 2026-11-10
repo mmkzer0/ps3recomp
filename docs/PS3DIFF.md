@@ -435,13 +435,15 @@ Byte equality holds only on equal GPU, macOS, Metal, build and translator versio
 rsx_replay <capture-dir> [--frames a-b] [--out report.json] [--manifest DIR] [--accept-unknown-methods]
 ```
 
-macOS only (CMake target `rsx_replay`, built with the Metal backend and the shader translator). It
-replays the capture through the same FIFO walker, draw engine and headless Metal backend the title
-ran, with guest shaders on; a build or run that would fall back to the fixed-function pipeline is
-refused by name (`fixed-function`). The replay is itself captured by the same writer: its
-**manifest** (`DIR`, default `<report>.manifest`, else a temporary directory) is a `ps3diff.rsx/2`
-capture. It compares directly with either a `/1` or `/2` input capture, and a replay that reproduced
-the inputs has the live capture's input hash frame for frame.
+macOS+MSL builds provide `rsx_replay` with the Metal backend. Linux/Windows builds with
+`PS3RECOMP_RSX_VULKAN` and SPIR-V translation provide it with Vulkan. The runner selects the backend at
+build time, forces headless rendering, and requires the register-file engine and guest shaders; a missing
+requirement is refused by name (`backend` or `fixed-function`). It replays through the same FIFO walker,
+draw engine and backend the title ran, without the title. The replay is itself captured by the same writer:
+its **manifest** (`DIR`, default `<report>.manifest`, else a temporary directory) is a `ps3diff.rsx/2`
+capture. Machine comparison uses the normalized `/2` fields, so `/1` input captures remain comparable.
+It compares directly with either a `/1` or `/2` input capture, and a replay that reproduced the inputs has the
+live capture's input hash frame for frame.
 
 `--frames a-b` (or `a`) names the flips to compare, by `flip_id`. A replay always starts at the
 clean reset and runs through the last frame named, because the register file, the surfaces and

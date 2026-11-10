@@ -130,6 +130,21 @@ int  rsx_vulkan_backend_depth_bounds(void);
  * rsx_state path instead. Opt-in while the path grows; needs no initialised
  * backend. */
 int  rsx_vulkan_backend_guest_programs(void);
+/* What rsx_vulkan_backend_init settled on (rsx_replay refuses any other path). */
+#define RSX_VULKAN_HEADLESS       1u   /* offscreen, no window */
+#define RSX_VULKAN_GUEST_SHADERS  2u   /* guest programs translated and active */
+#define RSX_VULKAN_ENGINE_PATH    4u   /* the register-file draw engine drives the backend */
+u32  rsx_vulkan_backend_status(void);
+
+/* Machine fields for ps3diff.rsx/2. build, toolkit_sha and title_sha are left NULL
+ * for the capture writer; strings returned through env outlive this call. */
+struct rsx_capture_environment;
+int  rsx_vulkan_backend_capture_environment(struct rsx_capture_environment* env);
+
+#if defined(PS3RECOMP_RSX_VULKAN_TEST_SEAMS)
+/* Fail the next `count` register-file engine submissions. Test builds only. */
+void rsx_vulkan_backend_test_fail_next_engine_submissions(u32 count);
+#endif
 
 #ifdef __cplusplus
 }

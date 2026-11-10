@@ -397,19 +397,20 @@ line still stops at 32; the count does not.
 
 ---
 
-## Replay: `rsx_replay` (macOS)
+## Replay: `rsx_replay` (Metal or Vulkan)
 
 **Files:** `tools/rsx_replay/rsx_replay.cpp`, `cellGcm_rsx_replay_step` in `libs/video/cellGcmSys.c`,
-`rsx_metal_backend_status` / `rsx_metal_backend_capture_environment` in `libs/video/rsx_metal_backend.m`.
+the selected backend's `status` / `capture_environment` functions.
 
 A `ps3diff.rsx/1` or `/2` capture (docs/PS3DIFF.md) is replayed through the code the title runs, not a copy of
 it: `rsx_replay` maps a synthetic guest address space, replays `gcm-init` (`cellGcmSetupContext`) and the
-state events (`cellGcmMapEaIoAddress`, `cellGcmUnmapEaIoAddress`, `cellGcmSetDisplayBuffer`), brings up
-`rsx_metal_backend` headless, and then feeds the FIFO walker one recorded step at a time. The walker
-entry `cellGcm_rsx_replay_step` does three things and nothing else: it checks the walker stands where the step
-began (GET and the CALL return slot), it runs the walker with the PUT the live pass saw but stops where
-the step left the walker, and it hands a GET_REPORT the recorded timer instead of the host clock. Everything
-between (method decoding, the class table, the draw engine, the readback) is the live path.
+state events (`cellGcmMapEaIoAddress`, `cellGcmUnmapEaIoAddress`, `cellGcmSetDisplayBuffer`), brings up the
+build-selected backend headless, and then feeds the FIFO walker one recorded step at a time. macOS+MSL builds
+use Metal; builds with `PS3RECOMP_RSX_VULKAN` and SPIR-V translation use Vulkan on Linux/Windows. Vulkan replay
+forces the existing window switch off and requires the register-file engine and guest shaders; otherwise it
+refuses the run by name. The walker entry `cellGcm_rsx_replay_step` checks the GET and CALL return slot, runs
+the walker with the recorded PUT until the recorded landing point, and supplies recorded GET_REPORT timers.
+Everything between (method decoding, the class table, the draw engine and readback) is the live path.
 
 The replay's manifest is written as `/2`. Its `capture_hash` matches the input capture across schema
 versions: `/2` normalizes only the envelope's `schema` value to `/1` when hashing input events. Equal

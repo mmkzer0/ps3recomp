@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
-"""rsx_replay: /2 writer, /1 compatibility, and synthetic capture replay/refusal behavior.
+"""rsx_replay: /2 writer, /1 compatibility, synthetic scene replay and refusal behavior.
 
-usage: test_rsx_replay.py <rsx_replay> <test_rsx_replay_scene>
+usage: test_rsx_replay.py <rsx_replay> <test_rsx_replay_scene> [vulkan]
 
-The scene fixture (libs/video/tests/test_rsx_replay_scene.c) is a synthetic live run through the real
-walker, draw engine and headless Metal backend: a clear, a triangle, a CALL/RET and a JUMP, a NV0039
-copy, a rebind, a textured strip and two flips. rsx_replay replays what it captured. Each failure path
-mutates a copy of a capture that replays cleanly, so the unmutated capture is the control: the named
-error comes from the mutation and nothing else.
+The scene fixture runs the real FIFO walker and register-file draw engine through the selected headless backend.
+On Vulkan it also checks that batching off, max 512 and max 1 produce byte-identical replay manifests, and that
+a test-seamed failed submission makes only its frame unreadable.
 
-Run bare (the CI tool-suite job runs every tools/test_*.py that way) there is no binary to run, so the
-whole test is skipped by name. CTest passes both binaries; the fixture exits 77 without a Metal device.
+Run bare (the CI tool-suite job runs every tools/test_*.py that way) there is no binary to run, so the whole test
+is skipped by name. CTest passes both binaries; the fixture exits 77 when no suitable GPU backend is available.
 """
 import hashlib
 import json
@@ -28,6 +26,7 @@ from ps3diff.cli import main as cli_main  # noqa: E402
 from ps3diff.schema import canonical_json, read_ndjson  # noqa: E402
 
 REPLAY = SCENE = None
+BACKEND = "metal"
 FAILS = 0
 INPUT_EVENTS = {"capture-start", "gcm-init", "gcm-state", "fifo-method", "fifo-branch", "fifo-word", "fifo-nop"}
 SCHEMA_V1 = "ps3diff.rsx/1"
@@ -49,9 +48,11 @@ def cli(*args):
     return status, out.getvalue() + err.getvalue()
 
 
-def scene(tmp, name, *extra):
+def scene(tmp, name, *extra, env=None):
     d = Path(tmp) / name
-    p = subprocess.run([SCENE, str(d), *extra], capture_output=True, text=True, timeout=120)
+    e = dict(os.environ)
+    e.update(env or {})
+    p = subprocess.run([SCENE, str(d), *extra], check=False, capture_output=True, text=True, timeout=120, env=e)
     if p.returncode == 77:
         print("[rsx_replay] SKIP: " + p.stdout.strip().splitlines()[-1])
         sys.exit(77)
@@ -155,6 +156,28 @@ def test_round_trip(tmp, live):
     s, text = cli("rsx-compare", str(Path(tmp) / "r1.manifest" / "capture.ndjson"), str(Path(tmp) / "r2.manifest" / "capture.ndjson"))
     check(s == 0, f"ps3diff rsx-compare r1 r2: equal ({s})")
 
+    if BACKEND == "vulkan":
+        variants = (
+            ("batch-off", {"PS3RECOMP_VK_DRAW_BATCH": "0", "PS3RECOMP_VK_DRAW_BATCH_MAX": "512"}, None),
+            ("batch-512", {"PS3RECOMP_VK_DRAW_BATCH": "1", "PS3RECOMP_VK_DRAW_BATCH_MAX": "512"},
+             "draw batching: on (up to 512 draws per submission)"),
+            ("batch-1", {"PS3RECOMP_VK_DRAW_BATCH": "1", "PS3RECOMP_VK_DRAW_BATCH_MAX": "1"},
+             "draw batching: on (up to 1 draws per submission)"),
+        )
+        manifests = []
+        for name, env, log in variants:
+            status, report, stderr = replay(tmp, live, name, env=env)
+            check(status == 0 and report and report["status"] == "equal",
+                  f"Vulkan replay with {name} is equal ({status})")
+            check((log is None and "draw batching: on" not in stderr) or
+                  (log is not None and log in stderr), f"{name} selects the requested batching mode")
+            manifest = Path(tmp) / f"{name}.manifest" / "capture.ndjson"
+            manifests.append(manifest)
+            compared, text = cli("rsx-compare", str(live / "capture.ndjson"), str(manifest))
+            check(compared == 0 and "equal" in text, f"ps3diff rsx-compare live {name}: equal ({compared})")
+        check(manifests[0].read_bytes() == manifests[1].read_bytes() == manifests[2].read_bytes(),
+              "batching off, max 512 and max 1 write byte-identical replay manifests")
+
     legacy = legacy_capture(live, Path(tmp) / "legacy")
     status, text = cli("validate", str(legacy / "capture.ndjson"))
     check(status == 0, f"the /1 fixture validates ({text.strip()})")
@@ -163,17 +186,23 @@ def test_round_trip(tmp, live):
     check(status == 0 and report["schema_a"] == SCHEMA_V1 and report["schema_b"] == SCHEMA_V1,
           "the /1 fixture compares with itself")
     legacy_status, legacy_report, _ = replay(tmp, legacy, "legacy")
-    check(legacy_status == 0 and legacy_report and legacy_report["status"] == "equal",
-          f"rsx_replay accepts the /1 fixture ({legacy_status}, {legacy_report and legacy_report['status']})")
-    manifest = Path(tmp) / "legacy.manifest"
-    manifest_records = records(manifest)
-    check(all(rec["schema"] == SCHEMA_V2 for rec in manifest_records),
-          "replaying /1 writes a /2 manifest")
-    status, text = cli("rsx-compare", str(legacy / "capture.ndjson"),
-                       str(manifest / "capture.ndjson"), "--json")
-    report = json.loads(text)
-    check(status == 0 and report["schema_a"] == SCHEMA_V1 and report["schema_b"] == SCHEMA_V2,
-          f"the /1 capture compares equal with the /2 replay manifest ({status})")
+    if BACKEND == "vulkan":
+        # A /1 machine record names macOS and Metal by schema, so no Vulkan replay can match it.
+        differs = legacy_report and legacy_report["environment"]["differs"]
+        check(legacy_status == 4 and legacy_report["status"] == "not-comparable" and "backend" in differs,
+              f"a Vulkan replay of the /1 fixture is not comparable by backend ({legacy_status}, {differs})")
+    else:
+        check(legacy_status == 0 and legacy_report and legacy_report["status"] == "equal",
+              f"rsx_replay accepts the /1 fixture ({legacy_status}, {legacy_report and legacy_report['status']})")
+        manifest = Path(tmp) / "legacy.manifest"
+        manifest_records = records(manifest)
+        check(all(rec["schema"] == SCHEMA_V2 for rec in manifest_records),
+              "replaying /1 writes a /2 manifest")
+        status, text = cli("rsx-compare", str(legacy / "capture.ndjson"),
+                           str(manifest / "capture.ndjson"), "--json")
+        report = json.loads(text)
+        check(status == 0 and report["schema_a"] == SCHEMA_V1 and report["schema_b"] == SCHEMA_V2,
+              f"the /1 capture compares equal with the /2 replay manifest ({status})")
 
     s, r, _ = replay(tmp, live, "range", "--frames", "1")
     check(s == 0 and r["compared"] == 1 and r["frames"] == {"from": 1, "to": 1}, f"--frames 1 compares the one frame ({s})")
@@ -300,8 +329,24 @@ def patch_method(cap, old, new):
 
 
 def test_refusals(tmp, live):
-    s, r, _ = replay(tmp, live, "fixed-function", env={"PS3RECOMP_METAL_FIXED_FUNCTION": "1"})
-    check(s == 2 and error_of(r) == "fixed-function", f"a fixed-function fallback is refused by name ({s}, {error_of(r)})")
+    if BACKEND == "vulkan":
+        s, r, _ = replay(tmp, live, "fixed-function",
+                         env={"PS3RECOMP_VK_GUEST_PROGRAMS": "0", "PS3RECOMP_RSX_ENGINE": "dispatch"})
+        check(s == 2 and error_of(r) == "fixed-function",
+              f"a Vulkan fixed-function replay is refused by name ({s}, {error_of(r)})")
+        fault = scene(tmp, "fault", "fault", env={"PS3RECOMP_VK_DRAW_BATCH": "1",
+                                                   "PS3RECOMP_VK_DRAW_BATCH_MAX": "1"})
+        frames = [rec for rec in records(fault) if rec.get("event") == "frame-complete"]
+        check(len(frames) == 2 and frames[0].get("readback") is None and
+              frames[0].get("frame_hash") is None and "readback-incomplete" in frames[0].get("invalid", []),
+              "a failed batched submission marks the faulted frame unreadable without a frame hash")
+        check(len(frames) == 2 and frames[1].get("readback") is not None and
+              frames[1].get("frame_hash") is not None and "readback-incomplete" not in frames[1].get("invalid", []),
+              "the capture check consumes the fault latch before the next clean frame")
+    else:
+        s, r, _ = replay(tmp, live, "fixed-function", env={"PS3RECOMP_METAL_FIXED_FUNCTION": "1"})
+        check(s == 2 and error_of(r) == "fixed-function",
+              f"a fixed-function fallback is refused by name ({s}, {error_of(r)})")
 
     unknown_schema = mutate(
         live, Path(tmp) / "unknown-schema", lambda recs: [rec.update(schema="ps3diff.rsx/9") for rec in recs],
@@ -354,12 +399,17 @@ def test_refusals(tmp, live):
 
 
 def main():
-    global REPLAY, SCENE
-    if len(sys.argv) != 3:
-        print("[rsx_replay] SKIP the replay runner and the scene fixture: run through ctest (rsx_replay), which builds them")
+    global REPLAY, SCENE, BACKEND
+    if len(sys.argv) not in (3, 4):
+        print("[rsx_replay] SKIP the replay runner and scene fixture: run through ctest (rsx_replay)")
         print("[rsx_replay] PASS (0 failed, everything skipped by name)")
         return 0
     REPLAY, SCENE = sys.argv[1], sys.argv[2]
+    if len(sys.argv) == 4:
+        if sys.argv[3] != "vulkan":
+            print("[rsx_replay] FAIL: unsupported backend mode")
+            return 2
+        BACKEND = "vulkan"
     with tempfile.TemporaryDirectory(prefix="rsx-replay-") as tmp:
         live = scene(tmp, "live")
         test_round_trip(tmp, live)

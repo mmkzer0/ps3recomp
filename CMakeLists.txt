@@ -572,6 +572,8 @@ if(PS3RECOMP_RSX_VULKAN)
         set(PS3RECOMP_SPIRV_TRANSLATION ON)
         message(STATUS "  Vulkan:       guest programs available (glslang ${glslang_VERSION}); "
                        "opt in with PS3RECOMP_VK_GUEST_PROGRAMS=1")
+        set_property(SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_vulkan_backend.c" APPEND PROPERTY
+            COMPILE_DEFINITIONS "PS3RECOMP_GLSLANG_VERSION=\"${glslang_VERSION}\"")
     else()
         if(PS3RECOMP_SPIRV_REQUIRED)
             message(FATAL_ERROR "Vulkan guest programs need glslang (apt: glslang-dev glslang-tools spirv-tools; "
@@ -2261,6 +2263,47 @@ if(UNIX)
                 set_tests_properties(rsx_replay PROPERTIES ENVIRONMENT
                     "ASAN_OPTIONS=detect_leaks=0:strict_string_checks=1:detect_container_overflow=0")
             endif()
+        endif()
+    endif()
+endif()
+
+# Vulkan replay uses the same runtime and walker as the title. Its scene and
+# test seam are test-only; rsx_replay itself is available in translator builds.
+if(PS3RECOMP_RSX_VULKAN AND PS3RECOMP_SPIRV_TRANSLATION)
+    add_executable(rsx_replay
+        tools/rsx_replay/rsx_replay.cpp
+        runtime/host/host_stubs.c
+    )
+    target_include_directories(rsx_replay PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/runtime"
+    )
+    target_link_libraries(rsx_replay PRIVATE ps3recomp_runtime)
+    set_target_properties(rsx_replay PROPERTIES LINKER_LANGUAGE CXX)
+
+    if(PS3RECOMP_BUILD_TESTS)
+        target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_RSX_VULKAN_TEST_SEAMS)
+        add_executable(test_rsx_replay_scene
+            libs/video/tests/test_rsx_replay_scene.c
+            runtime/host/host_stubs.c
+        )
+        target_include_directories(test_rsx_replay_scene PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/runtime"
+        )
+        target_compile_definitions(test_rsx_replay_scene PRIVATE PS3RECOMP_RSX_VULKAN_TEST_SEAMS)
+        target_link_libraries(test_rsx_replay_scene PRIVATE ps3recomp_runtime)
+        set_target_properties(test_rsx_replay_scene PROPERTIES LINKER_LANGUAGE CXX)
+        find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
+        if(Python3_Interpreter_FOUND)
+            add_test(NAME rsx_replay
+                COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_rsx_replay.py"
+                    $<TARGET_FILE:rsx_replay> $<TARGET_FILE:test_rsx_replay_scene> vulkan)
+            set_tests_properties(rsx_replay PROPERTIES
+                LABELS "video;gpu;t0" SKIP_RETURN_CODE 77 TIMEOUT 300
+                ENVIRONMENT "PS3RECOMP_VK_GUEST_PROGRAMS=1;PS3RECOMP_VK_WINDOW=0")
         endif()
     endif()
 endif()

@@ -62,11 +62,15 @@ static void vk_mutex_init(vk_mutex* m)    { pthread_mutex_init(m, NULL); }
 static void vk_mutex_destroy(vk_mutex* m) { pthread_mutex_destroy(m); }
 static void vk_mutex_lock(vk_mutex* m)    { pthread_mutex_lock(m); }
 static void vk_mutex_unlock(vk_mutex* m)  { pthread_mutex_unlock(m); }
+#  include <sys/utsname.h>
 #endif
+
+#include <stdatomic.h>
 
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 
+#include "rsx_capture.h"
 #include "ps3emu/config.h"
 #include "rsx_vulkan_backend.h"
 #include "rsx_frame_select.h"
@@ -271,6 +275,28 @@ typedef struct vk_state {
 } vk_state;
 
 static vk_state s_vk;
+/* The capture check consumes this sticky fault bit; submissions never clear it. */
+static atomic_int s_eng_fault = ATOMIC_VAR_INIT(0);
+/* A failed fence wait leaves accepted work potentially in flight. */
+static atomic_int s_eng_submission_pending = ATOMIC_VAR_INIT(0);
+#if defined(PS3RECOMP_RSX_VULKAN_TEST_SEAMS)
+static atomic_uint s_test_fail_submissions = ATOMIC_VAR_INIT(0);
+static int vk_test_consume_submission_failure(void)
+{
+    unsigned count = atomic_load_explicit(&s_test_fail_submissions, memory_order_relaxed);
+    while (count) {
+        if (atomic_compare_exchange_weak_explicit(&s_test_fail_submissions, &count, count - 1u,
+                                                  memory_order_relaxed, memory_order_relaxed))
+            return 1;
+    }
+    return 0;
+}
+#endif
+
+static void vk_engine_latch_fault(void)
+{
+    if (s_vk.eng_active) atomic_store_explicit(&s_eng_fault, 1, memory_order_release);
+}
 
 #define VK_LOG(...)  fprintf(stderr, "[RSX vulkan] " __VA_ARGS__)
 #define VK_CHECK(call, what)                                               \
@@ -495,7 +521,7 @@ static void vk_present_wait_gpu(void);
  * results flushes them first, so everything else keeps the invariant that
  * all earlier work has completed. */
 static u32 s_eb_pending;
-static void vk_eng_flush(void);
+static int vk_eng_flush(void);
 static int vk_eb_active(void);       /* batching decided on and on */
 static u32 vk_eb_max(void);
 static void vk_eb_recorded(void);   /* one more command in the open batch */
@@ -608,12 +634,18 @@ static VkResult vk_queue_present(const VkPresentInfoKHR* pi)
     return r;
 }
 
-static void vk_device_idle(void)
+static int vk_device_idle(void)
 {
-    if (!s_vk.device || !pvkDeviceWaitIdle) return;
+    if (!s_vk.device || !pvkDeviceWaitIdle) return 0;
     vk_mutex_lock(&s_vk.queue_mu);
-    pvkDeviceWaitIdle(s_vk.device);
+    const VkResult r = pvkDeviceWaitIdle(s_vk.device);
     vk_mutex_unlock(&s_vk.queue_mu);
+    if (r != VK_SUCCESS) {
+        VK_LOG("vkDeviceWaitIdle failed (VkResult %d)\n", (int)r);
+        return -1;
+    }
+    atomic_store_explicit(&s_eng_submission_pending, 0, memory_order_release);
+    return 0;
 }
 
 /* A full execution and memory dependency on everything submitted before
@@ -627,13 +659,25 @@ static void vk_cmd_after_everything(VkCommandBuffer cb)
                           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
 }
 
+static int vk_engine_check_result(VkResult r, const char* what)
+{
+    if (r == VK_SUCCESS) return 0;
+    VK_LOG("%s failed (VkResult %d)\n", what, (int)r);
+    vk_engine_latch_fault();
+    return -1;
+}
+
 static int vk_begin(void)
 {
-    if (s_eb_pending) vk_eng_flush();
-    VK_CHECK(pvkResetCommandBuffer(s_vk.cmd, 0), "vkResetCommandBuffer");
+    if (s_vk.eng_active && atomic_load_explicit(&s_eng_submission_pending, memory_order_acquire)) {
+        vk_engine_latch_fault();
+        return -1;
+    }
+    if (s_eb_pending && vk_eng_flush()) return -1;
+    if (vk_engine_check_result(pvkResetCommandBuffer(s_vk.cmd, 0), "vkResetCommandBuffer")) return -1;
     VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                     .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
-    VK_CHECK(pvkBeginCommandBuffer(s_vk.cmd, &bi), "vkBeginCommandBuffer");
+    if (vk_engine_check_result(pvkBeginCommandBuffer(s_vk.cmd, &bi), "vkBeginCommandBuffer")) return -1;
     /* A present's copy may still be reading the surface this frame is about
      * to draw over: order everything here after it. Set only by a present,
      * which never runs alongside the walker's recording. */
@@ -643,12 +687,32 @@ static int vk_begin(void)
 
 static int vk_submit_and_wait(void)
 {
-    VK_CHECK(pvkEndCommandBuffer(s_vk.cmd), "vkEndCommandBuffer");
+    if (s_vk.eng_active && atomic_load_explicit(&s_eng_submission_pending, memory_order_acquire)) {
+        vk_engine_latch_fault();
+        return -1;
+    }
+    if (vk_engine_check_result(pvkEndCommandBuffer(s_vk.cmd), "vkEndCommandBuffer")) return -1;
+#if defined(PS3RECOMP_RSX_VULKAN_TEST_SEAMS)
+    /* This seam fails after recording but before queue ownership, so the test
+     * can exercise the frame latch without leaving GPU work in flight. */
+    if (s_vk.eng_active && vk_test_consume_submission_failure()) {
+        VK_LOG("test seam: failing an engine submission before queue submit\n");
+        vk_engine_latch_fault();
+        return -1;
+    }
+#endif
     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
                         .commandBufferCount = 1, .pCommandBuffers = &s_vk.cmd };
-    VK_CHECK(pvkResetFences(s_vk.device, 1, &s_vk.fence), "vkResetFences");
-    VK_CHECK(vk_queue_submit(&si, s_vk.fence), "vkQueueSubmit");
-    VK_CHECK(pvkWaitForFences(s_vk.device, 1, &s_vk.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+    if (vk_engine_check_result(pvkResetFences(s_vk.device, 1, &s_vk.fence), "vkResetFences")) return -1;
+    if (vk_engine_check_result(vk_queue_submit(&si, s_vk.fence), "vkQueueSubmit")) return -1;
+    const VkResult waited = pvkWaitForFences(s_vk.device, 1, &s_vk.fence, VK_TRUE, UINT64_MAX);
+    if (waited != VK_SUCCESS) {
+        if (s_vk.eng_active)
+            atomic_store_explicit(&s_eng_submission_pending, 1, memory_order_release);
+        VK_LOG("vkWaitForFences failed (VkResult %d)\n", (int)waited);
+        vk_engine_latch_fault();
+        return -1;
+    }
     return 0;
 }
 
@@ -2509,6 +2573,10 @@ static void vk_eng_snapshot_pool_drain(void);
 
 static void vk_eng_shutdown(void* user)
 {
+    /* Retire an unresolved submission before releasing objects it may use. */
+    if (s_eb_pending) (void)vk_eng_flush();
+    if (atomic_load_explicit(&s_eng_submission_pending, memory_order_acquire))
+        (void)vk_device_idle();
     vk_eng2_shutdown(user);
     for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++) vk_eng_release(user, i);
     vk_eng_snapshot_pool_drain();
@@ -2520,7 +2588,9 @@ static void vk_eng_shutdown(void* user)
 static void vk_eng_submit_and_wait(void* user, u32 reason)
 {
     (void)user; (void)reason;      /* every other submission has already completed */
-    if (s_eb_pending) vk_eng_flush();
+    if (s_eb_pending) (void)vk_eng_flush();
+    else if (atomic_load_explicit(&s_eng_submission_pending, memory_order_acquire))
+        vk_engine_latch_fault();
 }
 
 static u32 vk_eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 h,
@@ -3757,15 +3827,31 @@ static int vk_eb_upload(VkImage img, VkBufferImageCopy* region, const void* src,
     return 0;
 }
 
-static void vk_eng_flush(void)
+static int vk_eng_flush(void)
 {
-    if (!s_eb_pending) return;
+    if (atomic_load_explicit(&s_eng_submission_pending, memory_order_acquire)) {
+        vk_engine_latch_fault();
+        return -1;
+    }
+    if (!s_eb_pending) return 0;
     s_eb_pending = 0;               /* first: the submit below must not re-enter */
-    vk_submit_and_wait();
+    if (vk_submit_and_wait()) {
+        /* Do not rewind any ring head or pool state: the GPU may still own
+         * this batch. Later slices, if any, start after the abandoned data. */
+        if ((++s_eb.flushes & 0x3FFFu) == 0)
+            VK_LOG("draw batching: %llu draws in %llu submissions\n", s_eb.draws, s_eb.flushes);
+        return -1;
+    }
     s_eb.vb_head = s_eb.ib_head = s_eb.ub_head = s_eb.sb_head = 0;
-    if (s_eb.sets) { pvkResetDescriptorPool(s_vk.device, s_eb.pool, 0); s_eb.sets = 0; }
+    if (s_eb.sets) {
+        if (vk_engine_check_result(pvkResetDescriptorPool(s_vk.device, s_eb.pool, 0),
+                                   "vkResetDescriptorPool(draw batch)"))
+            return -1;
+        s_eb.sets = 0;
+    }
     if ((++s_eb.flushes & 0x3FFFu) == 0)
         VK_LOG("draw batching: %llu draws in %llu submissions\n", s_eb.draws, s_eb.flushes);
+    return 0;
 }
 
 static VkDeviceSize vk_eb_take(VkDeviceSize* head, VkDeviceSize cap, VkDeviceSize bytes, VkDeviceSize align)
@@ -3974,6 +4060,14 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     s_eb.draws++;
     if (++s_eb_pending >= s_eb.max_draws) vk_eng_flush();
 }
+/* Capture calls this after its flush: atomic exchange reports and clears faults
+ * from all engine submissions since the prior check; successes do not clear it. */
+static int vk_eng_last_commit_ok(void* user)
+{
+    (void)user;
+    return atomic_exchange_explicit(&s_eng_fault, 0, memory_order_acq_rel) == 0;
+}
+
 
 static const rsx_draw_backend s_vk_engine_backend = {
     .user                 = NULL,
@@ -4007,6 +4101,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .clear_depth_stencil  = vk_eng_clear_depth_stencil,
     .present              = vk_eng_present,
     .readback             = vk_eng_readback,
+    .last_commit_ok       = vk_eng_last_commit_ok,
     .depth_readback       = vk_eng_depth_readback,
     .color_target_write   = vk_eng_color_target_write,
     /* Every draw and every upload submits and waits, so an upload runs after
@@ -4176,9 +4271,97 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     }
     return 0;
 }
+u32 rsx_vulkan_backend_status(void)
+{
+    return (!s_vk.windowed ? RSX_VULKAN_HEADLESS : 0u) |
+           (s_g.on ? RSX_VULKAN_GUEST_SHADERS : 0u) |
+           (s_vk.eng_active ? RSX_VULKAN_ENGINE_PATH : 0u);
+}
+
+int rsx_vulkan_backend_capture_environment(rsx_capture_environment* env)
+{
+    static char device[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
+    static char os_version[128], driver[128], glslang[32];
+    if (!env || !s_vk.phys) return -1;
+    VkPhysicalDeviceProperties p;
+    pvkGetPhysicalDeviceProperties(s_vk.phys, &p);
+    snprintf(device, sizeof device, "%s", p.deviceName);
+#ifdef _WIN32
+    {
+        OSVERSIONINFOEXA v;
+        memset(&v, 0, sizeof v);
+        v.dwOSVersionInfoSize = sizeof v;
+#if defined(_MSC_VER)
+#  pragma warning(push)
+#  pragma warning(disable:4996)
+#endif
+        const BOOL ok = GetVersionExA((OSVERSIONINFOA*)&v);
+#if defined(_MSC_VER)
+#  pragma warning(pop)
+#endif
+        if (ok)
+            snprintf(os_version, sizeof os_version, "%lu.%lu.%lu",
+                     (unsigned long)v.dwMajorVersion, (unsigned long)v.dwMinorVersion,
+                     (unsigned long)v.dwBuildNumber);
+        else
+            snprintf(os_version, sizeof os_version, "n/a");
+    }
+    env->os = "Windows";
+#else
+    {
+        struct utsname host;
+        if (uname(&host) == 0) snprintf(os_version, sizeof os_version, "%s", host.release);
+        else snprintf(os_version, sizeof os_version, "n/a");
+    }
+#  if defined(__APPLE__)
+    env->os = "macOS";
+#  else
+    env->os = "Linux";
+#  endif
+#endif
+    if (p.vendorID == 0x10DEu) {
+        snprintf(driver, sizeof driver, "Vulkan %u.%u.%u / NVIDIA %u.%u.%u.%u",
+                 VK_API_VERSION_MAJOR(p.apiVersion), VK_API_VERSION_MINOR(p.apiVersion),
+                 VK_API_VERSION_PATCH(p.apiVersion), p.driverVersion >> 22,
+                 (p.driverVersion >> 14) & 0xFFu, (p.driverVersion >> 6) & 0xFFu,
+                 p.driverVersion & 0x3Fu);
+    } else {
+        snprintf(driver, sizeof driver, "Vulkan %u.%u.%u / 0x%08X",
+                 VK_API_VERSION_MAJOR(p.apiVersion), VK_API_VERSION_MINOR(p.apiVersion),
+                 VK_API_VERSION_PATCH(p.apiVersion), p.driverVersion);
+    }
+#if defined(PS3RECOMP_GLSLANG_VERSION)
+    snprintf(glslang, sizeof glslang, "%s", PS3RECOMP_GLSLANG_VERSION);
+#else
+    snprintf(glslang, sizeof glslang, "n/a");
+#endif
+    env->os_version = os_version;
+    env->backend = "vulkan";
+    env->device = device;
+    env->driver = driver;
+    env->build = NULL;
+    env->glslang = glslang;
+    env->spirv_cross = "n/a";
+    env->toolkit_sha = NULL;
+    env->title_sha = NULL;
+    return 0;
+}
+
+#if defined(PS3RECOMP_RSX_VULKAN_TEST_SEAMS)
+void rsx_vulkan_backend_test_fail_next_engine_submissions(u32 count)
+{
+    atomic_store_explicit(&s_test_fail_submissions, count, memory_order_relaxed);
+}
+#endif
+
 
 int rsx_vulkan_backend_init(u32 width, u32 height, const char* title)
 {
+    atomic_store_explicit(&s_eng_fault, 0, memory_order_relaxed);
+    atomic_store_explicit(&s_eng_submission_pending, 0, memory_order_relaxed);
+#if defined(PS3RECOMP_RSX_VULKAN_TEST_SEAMS)
+    atomic_store_explicit(&s_test_fail_submissions, 0, memory_order_relaxed);
+#endif
     memset(&s_vk, 0, sizeof s_vk);
     if (vk_init_all(width, height, title)) {
         rsx_vulkan_backend_shutdown();
@@ -4199,6 +4382,11 @@ int rsx_vulkan_backend_init(u32 width, u32 height, const char* title)
         s_vk.eng_active = 1;
     else
         rsx_set_backend(&s_vulkan_backend);
+    if (s_vk.eng_active) {
+        rsx_capture_environment env;
+        if (rsx_vulkan_backend_capture_environment(&env) == 0)
+            (void)rsx_capture_install_from_config(&env);
+    }
     VK_LOG("%s path\n", s_vk.eng_active ? "register-file draw engine" : "vtable");
     VK_LOG("offscreen target %ux%u ready, depth format %d (%s)\n",
            s_vk.width, s_vk.height, (int)s_vk.depth_format, title ? title : "");
