@@ -67,6 +67,7 @@ static void vk_mutex_unlock(vk_mutex* m)  { pthread_mutex_unlock(m); }
 
 #include <stdatomic.h>
 
+#define VK_ENABLE_BETA_EXTENSIONS
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 
@@ -97,9 +98,9 @@ static void vk_mutex_unlock(vk_mutex* m)  { pthread_mutex_unlock(m); }
 #include <string.h>
 
 /* ---------------------------------------------------------------------------
- * Run-time loaded entry points (Vulkan 1.0 core only)
+ * Run-time loaded entry points (Vulkan 1.0 core plus optional 1.1 queries)
  * -------------------------------------------------------------------------*/
-#define VK_GLOBAL_FNS(X) X(vkCreateInstance)
+#define VK_GLOBAL_FNS(X) X(vkCreateInstance) X(vkEnumerateInstanceExtensionProperties)
 #define VK_INSTANCE_FNS(X) \
     X(vkDestroyInstance) X(vkEnumeratePhysicalDevices) \
     X(vkGetPhysicalDeviceProperties) X(vkGetPhysicalDeviceQueueFamilyProperties) \
@@ -143,6 +144,9 @@ static void vk_mutex_unlock(vk_mutex* m)  { pthread_mutex_unlock(m); }
 
 #define VK_DECLARE(name) static PFN_##name p##name;
 static PFN_vkGetInstanceProcAddr pvkGetInstanceProcAddr;
+static PFN_vkEnumerateInstanceVersion pvkEnumerateInstanceVersion;
+static PFN_vkGetPhysicalDeviceFeatures2 pvkGetPhysicalDeviceFeatures2;
+static PFN_vkGetPhysicalDeviceProperties2 pvkGetPhysicalDeviceProperties2;
 VK_GLOBAL_FNS(VK_DECLARE)
 VK_INSTANCE_FNS(VK_DECLARE)
 VK_DEVICE_FNS(VK_DECLARE)
@@ -183,6 +187,12 @@ typedef struct vk_state {
     VkQueue          queue;
     u32              queue_family;
     VkPhysicalDeviceMemoryProperties memprops;
+    u32              api_version;
+    char             driver_name[VK_MAX_DRIVER_NAME_SIZE];
+    char             driver_info[VK_MAX_DRIVER_INFO_SIZE];
+    int              driver_properties_valid;
+    int              driver_properties_extension;
+    int              portability_subset;
 
     u32              width, height;
     vk_image         color;           /* R8G8B8A8_UNORM                 */
@@ -248,8 +258,9 @@ typedef struct vk_state {
     int              indep_blend_ok;  /* independentBlend: per-target MRT state */
     u32              max_dim;         /* maxImageDimension2D of the device  */
     int              windowed;
+    int              sdl_vulkan_loaded;
     SDL_Window*      window;
-    const char*      inst_exts[16];
+    const char*      inst_exts[32];
     u32              inst_ext_count;
     VkSurfaceKHR     surface;
     VkSwapchainKHR   swapchain;
@@ -319,6 +330,29 @@ static int vk_load_library(void)
     pvkGetInstanceProcAddr =
         (PFN_vkGetInstanceProcAddr)(void (*)(void))GetProcAddress(s_vk.lib, "vkGetInstanceProcAddr");
 #else
+#  ifdef __APPLE__
+    static const char* generic = "libvulkan.1.dylib";
+    char generic_error[256];
+    s_vk.lib = dlopen(generic, RTLD_NOW | RTLD_LOCAL);
+    if (!s_vk.lib) {
+        const char* error = dlerror();
+        snprintf(generic_error, sizeof generic_error, "%s", error ? error : "unknown loader error");
+#    ifdef PS3RECOMP_VULKAN_LOADER_PATH
+        s_vk.lib = dlopen(PS3RECOMP_VULKAN_LOADER_PATH, RTLD_NOW | RTLD_LOCAL);
+        if (!s_vk.lib) {
+            error = dlerror();
+            VK_LOG("no Vulkan loader found; tried dlopen(\"%s\"): %s; dlopen(\"%s\"): %s\n",
+                   generic, generic_error, PS3RECOMP_VULKAN_LOADER_PATH,
+                   error ? error : "unknown loader error");
+            return -1;
+        }
+#    else
+        VK_LOG("no Vulkan loader found; tried dlopen(\"%s\"): %s; no configure-time "
+               "loader path was provided\n", generic, generic_error);
+        return -1;
+#    endif
+    }
+#  else
     static const char* names[] = { "libvulkan.so.1", "libvulkan.so" };
     for (size_t i = 0; i < sizeof names / sizeof names[0] && !s_vk.lib; i++)
         s_vk.lib = dlopen(names[i], RTLD_NOW | RTLD_LOCAL);
@@ -326,6 +360,7 @@ static int vk_load_library(void)
         VK_LOG("no Vulkan loader found (dlopen libvulkan.so.1: %s)\n", dlerror());
         return -1;
     }
+#  endif
     pvkGetInstanceProcAddr =
         (PFN_vkGetInstanceProcAddr)dlsym(s_vk.lib, "vkGetInstanceProcAddr");
 #endif
@@ -334,6 +369,47 @@ static int vk_load_library(void)
     if (!(p##name = (PFN_##name)pvkGetInstanceProcAddr(VK_NULL_HANDLE, #name))) \
         { VK_LOG("missing global function " #name "\n"); return -1; }
     VK_GLOBAL_FNS(LOAD_G)
+    pvkEnumerateInstanceVersion =
+        (PFN_vkEnumerateInstanceVersion)pvkGetInstanceProcAddr(VK_NULL_HANDLE, "vkEnumerateInstanceVersion");
+    return 0;
+}
+
+static int vk_has_instance_extension(const char* name)
+{
+    u32 count = 0;
+    VkResult r = pvkEnumerateInstanceExtensionProperties(NULL, &count, NULL);
+    if (r != VK_SUCCESS) {
+        VK_LOG("vkEnumerateInstanceExtensionProperties(count) failed (VkResult %d)\n", (int)r);
+        return -1;
+    }
+    if (!count) return 0;
+    VkExtensionProperties* extensions = (VkExtensionProperties*)malloc((size_t)count * sizeof *extensions);
+    if (!extensions) {
+        VK_LOG("out of memory enumerating Vulkan instance extensions\n");
+        return -1;
+    }
+    r = pvkEnumerateInstanceExtensionProperties(NULL, &count, extensions);
+    if (r != VK_SUCCESS) {
+        VK_LOG("vkEnumerateInstanceExtensionProperties(list) failed (VkResult %d)\n", (int)r);
+        free(extensions);
+        return -1;
+    }
+    int found = 0;
+    for (u32 i = 0; i < count && !found; i++)
+        found = strcmp(extensions[i].extensionName, name) == 0;
+    free(extensions);
+    return found;
+}
+
+static int vk_add_instance_extension(const char* name)
+{
+    for (u32 i = 0; i < s_vk.inst_ext_count; i++)
+        if (strcmp(s_vk.inst_exts[i], name) == 0) return 0;
+    if (s_vk.inst_ext_count >= sizeof s_vk.inst_exts / sizeof s_vk.inst_exts[0]) {
+        VK_LOG("too many Vulkan instance extensions for %s\n", name);
+        return -1;
+    }
+    s_vk.inst_exts[s_vk.inst_ext_count++] = name;
     return 0;
 }
 
@@ -343,6 +419,14 @@ static int vk_load_instance_functions(void)
     if (!(p##name = (PFN_##name)pvkGetInstanceProcAddr(s_vk.instance, #name))) \
         { VK_LOG("missing instance function " #name "\n"); return -1; }
     VK_INSTANCE_FNS(LOAD_I)
+    if (s_vk.api_version >= VK_API_VERSION_1_1) {
+        pvkGetPhysicalDeviceFeatures2 =
+            (PFN_vkGetPhysicalDeviceFeatures2)pvkGetInstanceProcAddr(s_vk.instance,
+                                                                      "vkGetPhysicalDeviceFeatures2");
+        pvkGetPhysicalDeviceProperties2 =
+            (PFN_vkGetPhysicalDeviceProperties2)pvkGetInstanceProcAddr(s_vk.instance,
+                                                                        "vkGetPhysicalDeviceProperties2");
+    }
     return 0;
 }
 
@@ -405,15 +489,94 @@ static int vk_find_graphics_queue(VkPhysicalDevice pd, u32* family)
 static int vk_has_device_extension(VkPhysicalDevice pd, const char* name)
 {
     u32 n = 0;
-    if (pvkEnumerateDeviceExtensionProperties(pd, NULL, &n, NULL) != VK_SUCCESS || n == 0) return 0;
-    VkExtensionProperties* e = (VkExtensionProperties*)malloc(n * sizeof *e);
-    if (!e) return 0;
+    VkResult r = pvkEnumerateDeviceExtensionProperties(pd, NULL, &n, NULL);
+    if (r != VK_SUCCESS) {
+        VK_LOG("vkEnumerateDeviceExtensionProperties(count) failed (VkResult %d)\n", (int)r);
+        return -1;
+    }
+    if (n == 0) return 0;
+    VkExtensionProperties* e = (VkExtensionProperties*)malloc((size_t)n * sizeof *e);
+    if (!e) {
+        VK_LOG("out of memory enumerating Vulkan device extensions\n");
+        return -1;
+    }
+    r = pvkEnumerateDeviceExtensionProperties(pd, NULL, &n, e);
+    if (r != VK_SUCCESS) {
+        VK_LOG("vkEnumerateDeviceExtensionProperties(list) failed (VkResult %d)\n", (int)r);
+        free(e);
+        return -1;
+    }
     int found = 0;
-    if (pvkEnumerateDeviceExtensionProperties(pd, NULL, &n, e) == VK_SUCCESS)
-        for (u32 i = 0; i < n && !found; i++) found = strcmp(e[i].extensionName, name) == 0;
+    for (u32 i = 0; i < n && !found; i++)
+        found = strcmp(e[i].extensionName, name) == 0;
     free(e);
     return found;
 }
+
+static int vk_prepare_selected_device(const VkPhysicalDeviceProperties* p)
+{
+    const int has_subset =
+        vk_has_device_extension(s_vk.phys, VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME);
+    if (has_subset < 0) return -1;
+    s_vk.portability_subset = has_subset;
+    s_vk.driver_properties_valid = 0;
+    s_vk.driver_properties_extension = 0;
+    s_vk.driver_name[0] = '\0';
+    s_vk.driver_info[0] = '\0';
+
+    if (s_vk.api_version >= VK_API_VERSION_1_1) {
+        const int core_driver_properties =
+            s_vk.api_version >= VK_API_VERSION_1_2 && p->apiVersion >= VK_API_VERSION_1_2;
+        int extension_driver_properties = 0;
+        if (!core_driver_properties) {
+            extension_driver_properties =
+                vk_has_device_extension(s_vk.phys, VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME);
+            if (extension_driver_properties < 0) return -1;
+        }
+        if (core_driver_properties || extension_driver_properties) {
+            s_vk.driver_properties_extension = extension_driver_properties && !core_driver_properties;
+            if (pvkGetPhysicalDeviceProperties2) {
+                VkPhysicalDeviceDriverProperties driver = {
+                    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES,
+                };
+                VkPhysicalDeviceProperties2 props = {
+                    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+                    .pNext = &driver,
+                };
+                pvkGetPhysicalDeviceProperties2(s_vk.phys, &props);
+                if (driver.driverName[0]) {
+                    snprintf(s_vk.driver_name, sizeof s_vk.driver_name, "%s", driver.driverName);
+                    snprintf(s_vk.driver_info, sizeof s_vk.driver_info, "%s", driver.driverInfo);
+                    s_vk.driver_properties_valid = 1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+#define VK_DRIVER_IDENTITY_SIZE (VK_MAX_DRIVER_NAME_SIZE + VK_MAX_DRIVER_INFO_SIZE + 64)
+static void vk_format_driver_identity(char* out, size_t out_size,
+                                      const VkPhysicalDeviceProperties* p)
+{
+    if (s_vk.driver_properties_valid) {
+        snprintf(out, out_size, "Vulkan %u.%u.%u / %s%s%s%s",
+                 VK_API_VERSION_MAJOR(p->apiVersion), VK_API_VERSION_MINOR(p->apiVersion),
+                 VK_API_VERSION_PATCH(p->apiVersion), s_vk.driver_name,
+                 s_vk.driver_info[0] ? " (" : "",
+                 s_vk.driver_info, s_vk.driver_info[0] ? ")" : "");
+    } else if (p->vendorID == 0x10DEu) {
+        snprintf(out, out_size, "Vulkan %u.%u.%u / NVIDIA %u.%u.%u.%u",
+                 VK_API_VERSION_MAJOR(p->apiVersion), VK_API_VERSION_MINOR(p->apiVersion),
+                 VK_API_VERSION_PATCH(p->apiVersion), p->driverVersion >> 22,
+                 (p->driverVersion >> 14) & 0xFFu, (p->driverVersion >> 6) & 0xFFu,
+                 p->driverVersion & 0x3Fu);
+    } else {
+        snprintf(out, out_size, "Vulkan %u.%u.%u / 0x%08X",
+                 VK_API_VERSION_MAJOR(p->apiVersion), VK_API_VERSION_MINOR(p->apiVersion),
+                 VK_API_VERSION_PATCH(p->apiVersion), p->driverVersion);
+    }
+}
+
 
 static int vk_pick_device(void)
 {
@@ -430,9 +593,13 @@ static int vk_pick_device(void)
         VkPhysicalDeviceProperties p;
         pvkGetPhysicalDeviceProperties(devs[i], &p);
         u32 fam;
-        int usable = vk_find_graphics_queue(devs[i], &fam) == 0 &&
-                     (!s_vk.windowed ||
-                      vk_has_device_extension(devs[i], VK_KHR_SWAPCHAIN_EXTENSION_NAME));
+        int usable = vk_find_graphics_queue(devs[i], &fam) == 0;
+        if (usable && s_vk.windowed) {
+            const int has_swapchain =
+                vk_has_device_extension(devs[i], VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+            if (has_swapchain < 0) return -1;
+            usable = has_swapchain;
+        }
         VK_LOG("device %u: %s (type %d, api %u.%u.%u)%s\n", i, p.deviceName,
                (int)p.deviceType, VK_API_VERSION_MAJOR(p.apiVersion),
                VK_API_VERSION_MINOR(p.apiVersion), VK_API_VERSION_PATCH(p.apiVersion),
@@ -459,7 +626,10 @@ static int vk_pick_device(void)
     /* Vulkan guarantees 4096; the engine's targets and textures may use what
      * the device really has (a title's 4608-wide target on RADV). */
     s_vk.max_dim = p.limits.maxImageDimension2D >= 4096u ? p.limits.maxImageDimension2D : 4096u;
-    VK_LOG("using device %d: %s\n", best, p.deviceName);
+    if (vk_prepare_selected_device(&p)) return -1;
+    char driver[VK_DRIVER_IDENTITY_SIZE];
+    vk_format_driver_identity(driver, sizeof driver, &p);
+    VK_LOG("using device %d: %s (driver %s)\n", best, p.deviceName, driver);
     return 0;
 }
 
@@ -1812,8 +1982,8 @@ static void vk_cb_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
  *
  * An SDL2 window with a Vulkan swapchain. Rendering still targets the
  * offscreen image, so readback and every test are unchanged; a present then
- * also blits that image into the next swapchain image. Any failure on this
- * path drops back to headless with a message instead of failing the run.
+ * also blits that image into the next swapchain image. Runtime failures drop
+ * back to headless; macOS reports an unavailable requested surface at init.
  * -------------------------------------------------------------------------*/
 static int vk_env_on(const char* name)
 {
@@ -1837,10 +2007,12 @@ static void vk_window_drop(const char* why)
     }
     if (s_vk.surface && s_vk.instance && pvkDestroySurfaceKHR)
         pvkDestroySurfaceKHR(s_vk.instance, s_vk.surface, NULL);
-    if (s_vk.window) {
-        SDL_DestroyWindow(s_vk.window);
-        SDL_QuitSubSystem(SDL_INIT_VIDEO);
+    if (s_vk.window) SDL_DestroyWindow(s_vk.window);
+    if (s_vk.sdl_vulkan_loaded) {
+        SDL_Vulkan_UnloadLibrary();
+        s_vk.sdl_vulkan_loaded = 0;
     }
+    if (s_vk.windowed) SDL_QuitSubSystem(SDL_INIT_VIDEO);
     s_vk.window = NULL;
     s_vk.surface = VK_NULL_HANDLE;
     s_vk.swapchain = VK_NULL_HANDLE;
@@ -1849,15 +2021,42 @@ static void vk_window_drop(const char* why)
     s_vk.windowed = 0;
 }
 
-static void vk_window_open(const char* title)
+static int vk_window_fail(const char* why)
 {
-    if (!vk_env_on("PS3RECOMP_VK_WINDOW")) return;
+#ifdef __APPLE__
+    VK_LOG("window initialization failed: %s\n", why);
+    vk_window_drop(NULL);
+    return -1;
+#else
+    vk_window_drop(why);
+    return 0;
+#endif
+}
+
+static int vk_window_open(const char* title)
+{
+    if (!vk_env_on("PS3RECOMP_VK_WINDOW")) return 0;
     /* SIGINT/SIGTERM stay the host's (see pad_init_backend in cellPad.c); a window close is still SDL_QUIT. */
     SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
     if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
-        VK_LOG("window disabled, continuing headless: SDL video init failed: %s\n", SDL_GetError());
-        return;
+        char why[256];
+        snprintf(why, sizeof why, "SDL_InitSubSystem(SDL_INIT_VIDEO) failed: %s", SDL_GetError());
+        return vk_window_fail(why);
     }
+    s_vk.windowed = 1;          /* SDL video must be cleaned up on every later failure */
+#ifdef __APPLE__
+#  ifdef PS3RECOMP_VULKAN_LOADER_PATH
+    if (SDL_Vulkan_LoadLibrary(PS3RECOMP_VULKAN_LOADER_PATH) != 0) {
+        char why[256];
+        snprintf(why, sizeof why, "SDL_Vulkan_LoadLibrary(%s) failed: %s",
+                 PS3RECOMP_VULKAN_LOADER_PATH, SDL_GetError());
+        return vk_window_fail(why);
+    }
+    s_vk.sdl_vulkan_loaded = 1;
+#  else
+    return vk_window_fail("PS3RECOMP_VULKAN_LOADER_PATH was not set at configure time");
+#  endif
+#endif
     /* Resizable and maximizable; F11 or Alt+Enter switches to borderless fullscreen and back. The frame keeps its
      * aspect ratio inside whatever size the window has (vk_window_fit). */
     Uint32 flags = SDL_WINDOW_VULKAN | SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE;
@@ -1866,28 +2065,34 @@ static void vk_window_open(const char* title)
     s_vk.window = SDL_CreateWindow(title && title[0] ? title : "ps3recomp",
                                    SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                    (int)s_vk.width, (int)s_vk.height, flags);
-    s_vk.windowed = 1;          /* so vk_window_drop also shuts SDL video down */
     if (!s_vk.window) {
         char why[256];
         snprintf(why, sizeof why, "SDL_CreateWindow failed: %s", SDL_GetError());
-        vk_window_drop(why);
-        return;
+        return vk_window_fail(why);
     }
     SDL_SetWindowMinimumSize(s_vk.window, 320, 180);
     if (flags & SDL_WINDOW_FULLSCREEN_DESKTOP) SDL_ShowCursor(SDL_DISABLE);
     unsigned n = 0;
-    if (!SDL_Vulkan_GetInstanceExtensions(s_vk.window, &n, NULL) || n == 0 || n > 16 ||
+    if (!SDL_Vulkan_GetInstanceExtensions(s_vk.window, &n, NULL) || n == 0 ||
+        n > sizeof s_vk.inst_exts / sizeof s_vk.inst_exts[0] ||
         !SDL_Vulkan_GetInstanceExtensions(s_vk.window, &n, s_vk.inst_exts)) {
         char why[256];
-        snprintf(why, sizeof why, "no Vulkan surface extensions (%s)", SDL_GetError());
-        vk_window_drop(why);
-        return;
+        snprintf(why, sizeof why, "SDL_Vulkan_GetInstanceExtensions failed: %s", SDL_GetError());
+        return vk_window_fail(why);
     }
     s_vk.inst_ext_count = n;
+#ifdef __APPLE__
+    int metal_surface = 0;
+    for (u32 i = 0; i < s_vk.inst_ext_count; i++)
+        if (strcmp(s_vk.inst_exts[i], "VK_EXT_metal_surface") == 0) metal_surface = 1;
+    if (!metal_surface)
+        return vk_window_fail("SDL_Vulkan_GetInstanceExtensions did not provide VK_EXT_metal_surface");
+#endif
     const char* hold = getenv("PS3RECOMP_VK_HOLD");
     s_vk.hold_seconds = hold ? atof(hold) : 0.0;
     VK_LOG("window: SDL video driver '%s', %u surface extension(s)\n",
            SDL_GetCurrentVideoDriver(), n);
+    return 0;
 }
 
 /* 0 on success, 1 when the window has no drawable area right now (the old swapchain is kept), -1 on failure. */
@@ -4139,39 +4344,70 @@ static int vk_init_all(u32 width, u32 height, const char* title)
       s_vk.dump_every = (e && atoi(e) > 0) ? (u32)atoi(e) : 1; }
     if (s_vk.dump_path) vk_dump_select_init();
 
-    vk_window_open(title);           /* no-op unless PS3RECOMP_VK_WINDOW is set */
     if (vk_load_library()) return -1;
+    if (vk_window_open(title)) return -1;
 
+    const char* portability_extension = VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME;
+    const int portability_enumeration =
+        vk_has_instance_extension(portability_extension);
+    if (portability_enumeration < 0) return -1;
+    if (portability_enumeration && vk_add_instance_extension(portability_extension)) return -1;
+
+    u32 loader_version = VK_API_VERSION_1_0;
+    if (pvkEnumerateInstanceVersion) {
+        VkResult vr = pvkEnumerateInstanceVersion(&loader_version);
+        if (vr != VK_SUCCESS) {
+            VK_LOG("vkEnumerateInstanceVersion failed (VkResult %d); requesting Vulkan 1.0\n",
+                   (int)vr);
+            loader_version = VK_API_VERSION_1_0;
+        }
+    }
     VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
                               .pApplicationName = "ps3recomp", .pEngineName = "ps3recomp RSX",
                               .apiVersion = VK_API_VERSION_1_0 };
-    VkInstanceCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-                                .pApplicationInfo = &app };
-    if (s_vk.windowed) {
-        ci.enabledExtensionCount   = s_vk.inst_ext_count;
-        ci.ppEnabledExtensionNames = s_vk.inst_exts;
-    }
+    if (loader_version >= VK_API_VERSION_1_2)
+        app.apiVersion = VK_API_VERSION_1_2;
+    else if (loader_version >= VK_API_VERSION_1_1)
+        app.apiVersion = VK_API_VERSION_1_1;
+    s_vk.api_version = app.apiVersion;
+    VK_LOG("loader API %u.%u.%u; requesting %u.%u.%u\n",
+           VK_API_VERSION_MAJOR(loader_version), VK_API_VERSION_MINOR(loader_version),
+           VK_API_VERSION_PATCH(loader_version), VK_API_VERSION_MAJOR(app.apiVersion),
+           VK_API_VERSION_MINOR(app.apiVersion), VK_API_VERSION_PATCH(app.apiVersion));
+
+    VkInstanceCreateInfo ci = {
+        .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+        .flags = portability_enumeration ? VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR : 0,
+        .pApplicationInfo = &app,
+        .enabledExtensionCount = s_vk.inst_ext_count,
+        .ppEnabledExtensionNames = s_vk.inst_ext_count ? s_vk.inst_exts : NULL,
+    };
+    if (portability_enumeration)
+        VK_LOG("enabling instance extension VK_KHR_portability_enumeration and setting "
+               "VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR\n");
     VkResult ir = pvkCreateInstance(&ci, NULL, &s_vk.instance);
     if (ir != VK_SUCCESS && s_vk.windowed) {
-        vk_window_drop("vkCreateInstance with the surface extensions failed");
-        ci.enabledExtensionCount = 0;
-        ci.ppEnabledExtensionNames = NULL;
+        if (vk_window_fail("vkCreateInstance with SDL surface extensions failed")) return -1;
+        ci.enabledExtensionCount = portability_enumeration ? 1u : 0u;
+        ci.ppEnabledExtensionNames = portability_enumeration ? &portability_extension : NULL;
         ir = pvkCreateInstance(&ci, NULL, &s_vk.instance);
     }
     if (ir != VK_SUCCESS) { VK_LOG("vkCreateInstance failed (VkResult %d)\n", (int)ir); return -1; }
+    if (portability_enumeration)
+        VK_LOG("enabled instance extension VK_KHR_portability_enumeration\n");
     if (vk_load_instance_functions()) return -1;
     if (s_vk.windowed) {
         if (vk_load_wsi_instance_functions()) {
-            vk_window_drop("the driver has no surface functions");
+            if (vk_window_fail("the driver has no Vulkan surface functions")) return -1;
         } else if (!SDL_Vulkan_CreateSurface(s_vk.window, s_vk.instance, &s_vk.surface)) {
             char why[256];
             snprintf(why, sizeof why, "SDL_Vulkan_CreateSurface failed: %s", SDL_GetError());
-            vk_window_drop(why);
+            if (vk_window_fail(why)) return -1;
         }
     }
     if (vk_pick_device()) {
         if (!s_vk.windowed) return -1;
-        vk_window_drop("no device can present to the window");
+        if (vk_window_fail("no device can present to the SDL surface")) return -1;
         if (vk_pick_device()) return -1;
     }
 
@@ -4179,7 +4415,17 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     VkDeviceQueueCreateInfo qci = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
                                     .queueFamilyIndex = s_vk.queue_family,
                                     .queueCount = 1, .pQueuePriorities = &prio };
-    static const char* dev_exts[] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
+    const char* dev_exts[3];
+    u32 dev_ext_count = 0;
+    if (s_vk.windowed) dev_exts[dev_ext_count++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
+    if (s_vk.portability_subset) {
+        dev_exts[dev_ext_count++] = VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME;
+        VK_LOG("enabling device extension VK_KHR_portability_subset\n");
+    }
+    if (s_vk.driver_properties_extension) {
+        dev_exts[dev_ext_count++] = VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME;
+        VK_LOG("enabling device extension VK_KHR_driver_properties\n");
+    }
     /* DXT (BC1-3) is how PS3 titles ship most textures; Vulkan gates it
      * behind a feature, enabled only when the device reports it. */
     VkPhysicalDeviceFeatures have, want;
@@ -4202,15 +4448,60 @@ static int vk_init_all(u32 width, u32 height, const char* title)
      * have their own); without it every target takes target A's. */
     want.independentBlend = have.independentBlend;
     s_vk.indep_blend_ok = have.independentBlend ? 1 : 0;
-    VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-                               .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci,
-                               .enabledExtensionCount = s_vk.windowed ? 1u : 0u,
-                               .ppEnabledExtensionNames = s_vk.windowed ? dev_exts : NULL,
-                               .pEnabledFeatures = &want };
+
+    VkPhysicalDevicePortabilitySubsetFeaturesKHR subset_enabled = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR,
+    };
+    if (s_vk.portability_subset) {
+        if (!pvkGetPhysicalDeviceFeatures2) {
+            VK_LOG("cannot query VK_KHR_portability_subset: vkGetPhysicalDeviceFeatures2 "
+                   "requires Vulkan 1.1 instance support\n");
+            return -1;
+        }
+        VkPhysicalDevicePortabilitySubsetFeaturesKHR subset_have = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR,
+        };
+        VkPhysicalDeviceFeatures2 features2 = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+            .pNext = &subset_have,
+        };
+        pvkGetPhysicalDeviceFeatures2(s_vk.phys, &features2);
+        VK_LOG("portability subset feature imageViewFormatSwizzle=%s "
+               "(guest texture component remapping)\n",
+               subset_have.imageViewFormatSwizzle ? "true" : "false");
+        VK_LOG("portability subset feature separateStencilMaskRef=%s "
+               "(independent front/back guest stencil state)\n",
+               subset_have.separateStencilMaskRef ? "true" : "false");
+        if (!subset_have.imageViewFormatSwizzle) {
+            VK_LOG("cannot initialize: VK_KHR_portability_subset imageViewFormatSwizzle is false; "
+                   "guest texture component remapping requires it\n");
+            return -1;
+        }
+        if (!subset_have.separateStencilMaskRef) {
+            VK_LOG("cannot initialize: VK_KHR_portability_subset separateStencilMaskRef is false; "
+                   "independent front/back guest stencil state requires it\n");
+            return -1;
+        }
+        subset_enabled.imageViewFormatSwizzle = VK_TRUE;
+        subset_enabled.separateStencilMaskRef = VK_TRUE;
+    }
+    VkDeviceCreateInfo dci = {
+        .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+        .pNext = s_vk.portability_subset ? &subset_enabled : NULL,
+        .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci,
+        .enabledExtensionCount = dev_ext_count,
+        .ppEnabledExtensionNames = dev_ext_count ? dev_exts : NULL,
+        .pEnabledFeatures = &want,
+    };
     VK_CHECK(pvkCreateDevice(s_vk.phys, &dci, NULL, &s_vk.device), "vkCreateDevice");
+    if (s_vk.portability_subset)
+        VK_LOG("enabled device extension VK_KHR_portability_subset\n");
+    if (s_vk.driver_properties_extension)
+        VK_LOG("enabled device extension VK_KHR_driver_properties\n");
     if (vk_load_device_functions()) return -1;
-    if (s_vk.windowed && vk_load_wsi_device_functions())
-        vk_window_drop("the driver has no swapchain functions");
+    if (s_vk.windowed && vk_load_wsi_device_functions()) {
+        if (vk_window_fail("the driver has no Vulkan swapchain functions")) return -1;
+    }
     pvkGetDeviceQueue(s_vk.device, s_vk.queue_family, 0, &s_vk.queue);
 
     VkCommandPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -4266,8 +4557,9 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     if (s_vk.windowed) {
         VkSemaphoreCreateInfo semi = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
         if (pvkCreateSemaphore(s_vk.device, &semi, NULL, &s_vk.sem_acquire) != VK_SUCCESS ||
-            vk_create_swapchain())
-            vk_window_drop("the swapchain could not be created");
+            vk_create_swapchain()) {
+            if (vk_window_fail("the initial Vulkan swapchain could not be created")) return -1;
+        }
     }
     return 0;
 }
@@ -4281,7 +4573,9 @@ u32 rsx_vulkan_backend_status(void)
 int rsx_vulkan_backend_capture_environment(rsx_capture_environment* env)
 {
     static char device[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
-    static char os_version[128], driver[128], glslang[32];
+    static char os_version[128];
+    static char driver[VK_DRIVER_IDENTITY_SIZE];
+    static char glslang[32];
     if (!env || !s_vk.phys) return -1;
     VkPhysicalDeviceProperties p;
     pvkGetPhysicalDeviceProperties(s_vk.phys, &p);
@@ -4319,17 +4613,7 @@ int rsx_vulkan_backend_capture_environment(rsx_capture_environment* env)
     env->os = "Linux";
 #  endif
 #endif
-    if (p.vendorID == 0x10DEu) {
-        snprintf(driver, sizeof driver, "Vulkan %u.%u.%u / NVIDIA %u.%u.%u.%u",
-                 VK_API_VERSION_MAJOR(p.apiVersion), VK_API_VERSION_MINOR(p.apiVersion),
-                 VK_API_VERSION_PATCH(p.apiVersion), p.driverVersion >> 22,
-                 (p.driverVersion >> 14) & 0xFFu, (p.driverVersion >> 6) & 0xFFu,
-                 p.driverVersion & 0x3Fu);
-    } else {
-        snprintf(driver, sizeof driver, "Vulkan %u.%u.%u / 0x%08X",
-                 VK_API_VERSION_MAJOR(p.apiVersion), VK_API_VERSION_MINOR(p.apiVersion),
-                 VK_API_VERSION_PATCH(p.apiVersion), p.driverVersion);
-    }
+    vk_format_driver_identity(driver, sizeof driver, &p);
 #if defined(PS3RECOMP_GLSLANG_VERSION)
     snprintf(glslang, sizeof glslang, "%s", PS3RECOMP_GLSLANG_VERSION);
 #else

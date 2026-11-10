@@ -90,22 +90,27 @@ if(PS3RECOMP_FIBER_BACKEND STREQUAL "aarch64")
         "${CMAKE_CURRENT_SOURCE_DIR}/runtime/platform/host_fiber_aarch64.S")
 endif()
 
-# The Vulkan RSX backend is opt-in while it grows (stage V0: clear + present).
-# It loads the Vulkan loader at run time, so building needs only the Vulkan
-# headers -- no target-architecture libvulkan, which keeps cross-compiling
-# simple. On Windows the headers come with the Vulkan SDK (VULKAN_SDK).
-option(PS3RECOMP_RSX_VULKAN "Build the Vulkan RSX backend (Linux, Windows)" OFF)
+# Vulkan is opt-in; the loader is opened at run time. macOS also records the
+# CMake-found loader path for dlopen because dyld does not search Homebrew's lib.
+option(PS3RECOMP_RSX_VULKAN "Build the Vulkan RSX backend (Linux, Windows, macOS)" OFF)
 list(FILTER HLE_SOURCES EXCLUDE REGEX "rsx_vulkan_backend\\.c$")
 if(PS3RECOMP_RSX_VULKAN)
-    if(APPLE)
-        message(FATAL_ERROR "PS3RECOMP_RSX_VULKAN is for Linux and Windows; Apple hosts draw through Metal")
-    endif()
-    find_path(PS3RECOMP_VULKAN_INCLUDE_DIR vulkan/vulkan.h HINTS "$ENV{VULKAN_SDK}/Include")
+    find_path(PS3RECOMP_VULKAN_INCLUDE_DIR vulkan/vulkan.h
+        HINTS "$ENV{VULKAN_SDK}/Include" "$ENV{HOMEBREW_PREFIX}/include"
+            /opt/homebrew/include /usr/local/include)
     if(NOT PS3RECOMP_VULKAN_INCLUDE_DIR)
         message(FATAL_ERROR "Vulkan headers not found. Debian/Ubuntu: "
             "libvulkan-dev, Fedora: vulkan-headers, Windows: the Vulkan SDK "
-            "(scoop install vulkan), which sets VULKAN_SDK -- or pass "
+            "(scoop install vulkan), macOS: brew install vulkan-headers -- or pass "
             "-DPS3RECOMP_VULKAN_INCLUDE_DIR=<dir containing vulkan/vulkan.h>")
+    endif()
+    if(APPLE)
+        find_library(PS3RECOMP_VULKAN_LOADER NAMES vulkan.1 vulkan
+            HINTS "$ENV{HOMEBREW_PREFIX}/lib" /opt/homebrew/lib /usr/local/lib)
+        if(NOT PS3RECOMP_VULKAN_LOADER)
+            message(FATAL_ERROR "Vulkan loader not found. macOS: brew install vulkan-loader "
+                "-- or pass -DPS3RECOMP_VULKAN_LOADER=<path to libvulkan.1.dylib>")
+        endif()
     endif()
     list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_vulkan_backend.c")
     # HLSL -> SPIR-V for guest programs: a stub unless glslang is found below.
@@ -375,6 +380,10 @@ if(PS3RECOMP_RSX_VULKAN)
     # PUBLIC: ps3recomp_host selects its backend on this definition.
     target_compile_definitions(ps3recomp_runtime PUBLIC PS3RECOMP_RSX_VULKAN)
     target_link_libraries(ps3recomp_runtime PUBLIC ${CMAKE_DL_LIBS})
+    if(APPLE)
+        target_compile_definitions(ps3recomp_runtime PRIVATE
+            "PS3RECOMP_VULKAN_LOADER_PATH=\"${PS3RECOMP_VULKAN_LOADER}\"")
+    endif()
     message(STATUS "  Vulkan:       RSX backend enabled (rsx_vulkan_backend.c, headers in ${PS3RECOMP_VULKAN_INCLUDE_DIR})")
 endif()
 
@@ -1701,9 +1710,8 @@ endif()
 # ---------------------------------------------------------------------------
 # Drives the cellGcm -> RSX -> backend bridge with no lifted game, so a backend
 # can be brought up and regression-tested without a game binary or a recompiler
-# run. Builds on any POSIX host: it picks Metal on Apple and the null backend's
-# headless software path everywhere else, so Linux -- which has no real backend
-# yet -- can still run the whole guest command stream end to end in CI.
+# run. It selects Vulkan when explicitly enabled; otherwise macOS defaults to
+# Metal and other POSIX hosts use the null backend's headless software path.
 if(UNIX)
     add_executable(ps3recomp_host
         runtime/host/host_posix.c
@@ -1918,7 +1926,7 @@ if(UNIX)
     # The RSX capture replay runner (docs/RSX_GRAPHICS.md, "Replay") reads ps3diff.rsx/1 and /2 captures
     # through the real FIFO walker, draw engine and headless Metal backend, with no title. It links the whole
     # runtime library, like ps3recomp_host, so it runs the code the title runs, not a copy of it.
-    if(APPLE AND PS3RECOMP_MSL_TRANSLATION)
+    if(APPLE AND PS3RECOMP_MSL_TRANSLATION AND NOT PS3RECOMP_RSX_VULKAN)
         add_executable(rsx_replay
             tools/rsx_replay/rsx_replay.cpp
             runtime/host/host_stubs.c
@@ -2255,7 +2263,7 @@ if(UNIX)
     # Capture -> replay on a real Metal device (tools/test_rsx_replay.py): the scene fixture is a synthetic
     # live run through the real walker, engine and backend; rsx_replay replays what it captured. Labelled
     # `gpu` so a host without Metal (every Linux job) lists the test as skipped, never as passed.
-    if(APPLE AND PS3RECOMP_MSL_TRANSLATION)
+    if(APPLE AND PS3RECOMP_MSL_TRANSLATION AND NOT PS3RECOMP_RSX_VULKAN)
         add_executable(test_rsx_replay_scene
             libs/video/tests/test_rsx_replay_scene.c
             runtime/host/host_stubs.c

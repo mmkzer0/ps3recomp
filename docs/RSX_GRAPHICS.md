@@ -29,7 +29,7 @@ RSX Command Processor             ← libs/video/rsx_commands.c
   ├──▶ D3D12 Backend              ← libs/video/rsx_d3d12_backend.c
   │    Real GPU rendering (Windows) with compiled shaders
   │
-  └──▶ Vulkan Backend             ← opt-in (Linux; PS3RECOMP_RSX_VULKAN)
+  └──▶ Vulkan Backend             ← opt-in (Linux, macOS, Windows; PS3RECOMP_RSX_VULKAN)
        Guest shaders on the shared draw engine
 
 Supporting files:
@@ -406,9 +406,9 @@ A `ps3diff.rsx/1` or `/2` capture (docs/PS3DIFF.md) is replayed through the code
 it: `rsx_replay` maps a synthetic guest address space, replays `gcm-init` (`cellGcmSetupContext`) and the
 state events (`cellGcmMapEaIoAddress`, `cellGcmUnmapEaIoAddress`, `cellGcmSetDisplayBuffer`), brings up the
 build-selected backend headless, and then feeds the FIFO walker one recorded step at a time. macOS+MSL builds
-use Metal; builds with `PS3RECOMP_RSX_VULKAN` and SPIR-V translation use Vulkan on Linux/Windows. Vulkan replay
-forces the existing window switch off and requires the register-file engine and guest shaders; otherwise it
-refuses the run by name. The walker entry `cellGcm_rsx_replay_step` checks the GET and CALL return slot, runs
+use Metal unless `PS3RECOMP_RSX_VULKAN` is enabled; builds with that option and SPIR-V translation use Vulkan
+on macOS, Linux and Windows. Vulkan replay forces the existing window switch off and requires the
+register-file engine and guest shaders; otherwise it refuses the run by name. The walker entry `cellGcm_rsx_replay_step` checks the GET and CALL return slot, runs
 the walker with the recorded PUT until the recorded landing point, and supplies recorded GET_REPORT timers.
 Everything between (method decoding, the class table, the draw engine and readback) is the live path.
 
