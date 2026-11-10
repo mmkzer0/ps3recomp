@@ -67,9 +67,14 @@ int main(int argc, char** argv)
         check(rsx_method_check(RSX_CLASS_NV4097, 0x0300, 1u, nullptr) == RSX_METHOD_INERT &&
               rsx_method_check(RSX_CLASS_NV4097, 0x0300, 0u, nullptr) == RSX_METHOD_MISSING,
               "the rule finder and the value check agree without an out-parameter");
-        check(rsx_method_check(RSX_CLASS_NV4097, 0x1FD8, 0u, nullptr) == RSX_METHOD_MISSING &&
-              rsx_method_check(RSX_CLASS_NV4097, 0x1FD8, 1u, nullptr) == RSX_METHOD_MISSING,
-              "an S2 gap is missing for every value (NV4097 0x1FD8 invalidate L2, #64)");
+        check(rsx_method_check(RSX_CLASS_NV4097, 0x031C, 0u, nullptr) == RSX_METHOD_MISSING &&
+              rsx_method_check(RSX_CLASS_NV4097, 0x031C, 1u, nullptr) == RSX_METHOD_MISSING,
+              "an S2 gap is missing for every value (NV4097 0x031C blend colour)");
+        const rsx_method_rule* l2 = nullptr;
+        check(rsx_method_check(RSX_CLASS_NV4097, 0x1FD8, 0u, &l2) == RSX_METHOD_HANDLED && l2 &&
+              has(l2->consumer, "rsx_draw_engine_method") &&
+              rsx_method_check(RSX_CLASS_NV4097, 0x1FD8, 1u, nullptr) == RSX_METHOD_HANDLED,
+              "NV4097 0x1FD8 invalidate L2 is handled for every value, by the draw engine (#64)");
     }
 
     /* 3. A pair with no row is unknown. */

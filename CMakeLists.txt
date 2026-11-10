@@ -1884,9 +1884,9 @@ if(UNIX)
 
     # NV4097 method contracts read back from a real Metal device: each test
     # includes the engine and the backend and drives them with synthetic
-    # method words (#62). Skips (77) without a Metal device.
+    # method words (#62, #64). Skips (77) without a Metal device.
     if(APPLE AND PS3RECOMP_MSL_TRANSLATION)
-        foreach(gpu_test back_stencil window)
+        foreach(gpu_test back_stencil window invalidate_l2)
             add_executable(test_metal_${gpu_test}
                 libs/video/tests/test_metal_${gpu_test}.m
                 libs/video/rsx_shader_msl.cpp
@@ -1911,6 +1911,8 @@ if(UNIX)
                 LABELS "video;gpu;t0" SKIP_RETURN_CODE 77 TIMEOUT 120
                 ENVIRONMENT "PS3RECOMP_METAL_HEADLESS=1")
         endforeach()
+        # The fixture of #64 is a gcm contract as well as a GPU one.
+        set_property(TEST metal_invalidate_l2 APPEND PROPERTY LABELS gcm)
     endif()
 
     # The RSX capture replay runner (docs/RSX_GRAPHICS.md, "Replay") reads ps3diff.rsx/1 and /2 captures
@@ -1971,6 +1973,24 @@ if(UNIX)
         add_test(NAME ${engine_test} COMMAND ${engine_test})
         set_tests_properties(${engine_test} PROPERTIES LABELS "gcm;t0" TIMEOUT 120)
     endforeach()
+
+    # When the engine rechecks a cached texture (#64): drives eng_texture_slot against the recording
+    # stub, so it includes the engine source instead of linking it.
+    add_executable(test_rsx_texture_epoch
+        libs/video/tests/test_rsx_texture_epoch.c
+        libs/video/rsx_dispatch.c
+        libs/video/rsx_vertex_compact.c
+        libs/video/rsx_texture_layout.c
+        libs/video/rsx_vp_decompiler.c
+        libs/video/rsx_fp_decompiler.c
+    )
+    target_include_directories(test_rsx_texture_epoch PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    )
+    add_test(NAME test_rsx_texture_epoch COMMAND test_rsx_texture_epoch)
+    set_tests_properties(test_rsx_texture_epoch PROPERTIES LABELS "gcm;t0" TIMEOUT 120)
 
     # Which presents a frame dump writes and what it calls the file (PS3RECOMP_VK_DUMP_LIST / _RANGE).
     # Pure parsing and naming, so no GPU and no backend: the Vulkan backend links the same source.
