@@ -170,11 +170,14 @@ struct J {
     long long i = 0;
     std::string s;
     std::vector<J> a;
-    std::vector<std::pair<std::string, J>> o;
+    // Object members as parallel vectors: libstdc++ rejects std::pair<std::string, J> while J is still
+    // incomplete, and std::vector<J> is the one container the standard allows here (C++17).
+    std::vector<std::string> keys;
+    std::vector<J> vals;
 
     const J* find(const char* k) const
     {
-        for (const auto& kv : o) if (kv.first == k) return &kv.second;
+        for (size_t n = 0; n < keys.size(); n++) if (keys[n] == k) return &vals[n];
         return nullptr;
     }
     const J& at(const char* k) const
@@ -216,12 +219,13 @@ J string_value(const char* value)
 
 void add_field(J& object, const char* key, const J& value)
 {
-    object.o.emplace_back(key, value);
+    object.keys.emplace_back(key);
+    object.vals.push_back(value);
 }
 
 void validate_machine(const J& machine, const char* const* fields, size_t count)
 {
-    if (machine.t != J::Obj || machine.o.size() != count)
+    if (machine.t != J::Obj || machine.keys.size() != count)
         fail("capture-format", "environment.machine has the wrong number of fields");
     for (size_t i = 0; i < count; i++) {
         const J* value = machine.find(fields[i]);
@@ -306,12 +310,13 @@ struct Parser {
                 ws();
                 J k = value();
                 if (k.t != J::Str) bad("object key");
-                for (const auto& field : v.o)
-                    if (field.first == k.s) bad("duplicate object key");
+                for (const std::string& key : v.keys)
+                    if (key == k.s) bad("duplicate object key");
                 ws();
                 if (p >= e || *p++ != ':') bad("missing ':'");
                 J val = value();
-                v.o.emplace_back(std::move(k.s), std::move(val));
+                v.keys.push_back(std::move(k.s));
+                v.vals.push_back(std::move(val));
                 ws();
                 if (p < e && *p == ',') { p++; continue; }
                 if (p < e && *p == '}') { p++; break; }
@@ -395,7 +400,7 @@ std::string dump(const J& v)
     }
     case J::Obj: {
         std::string s = "{";
-        for (size_t i = 0; i < v.o.size(); i++) { if (i) s += ','; s += quote(v.o[i].first) + ":" + dump(v.o[i].second); }
+        for (size_t i = 0; i < v.keys.size(); i++) { if (i) s += ','; s += quote(v.keys[i]) + ":" + dump(v.vals[i]); }
         return s + "}";
     }
     }
