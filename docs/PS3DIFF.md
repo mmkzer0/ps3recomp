@@ -435,11 +435,12 @@ Byte equality holds only on equal GPU, macOS, Metal, build and translator versio
 rsx_replay <capture-dir> [--frames a-b] [--out report.json] [--manifest DIR] [--accept-unknown-methods]
 ```
 
-macOS+MSL builds provide `rsx_replay` with the Metal backend. Linux/Windows builds with
-`PS3RECOMP_RSX_VULKAN` and SPIR-V translation provide it with Vulkan. The runner selects the backend at
-build time, forces headless rendering, and requires the register-file engine and guest shaders; a missing
-requirement is refused by name (`backend` or `fixed-function`). It replays through the same FIFO walker,
-draw engine and backend the title ran, without the title. The replay is itself captured by the same writer:
+macOS+MSL builds provide `rsx_replay` with Metal unless `PS3RECOMP_RSX_VULKAN` is enabled. Linux/Windows
+builds with that option and SPIR-V translation use Vulkan; macOS does too, and CMake defines only one replay
+backend per build. The runner selects the backend at build time, forces headless rendering, and requires the
+register-file engine and guest shaders; a missing requirement is refused by name (`backend` or
+`fixed-function`). It replays through the same FIFO walker, draw engine and backend the title ran, without
+the title. The replay is itself captured by the same writer:
 its **manifest** (`DIR`, default `<report>.manifest`, else a temporary directory) is a `ps3diff.rsx/2`
 capture. Machine comparison uses the normalized `/2` fields, so `/1` input captures remain comparable.
 It compares directly with either a `/1` or `/2` input capture, and a replay that reproduced the inputs has the
@@ -508,12 +509,17 @@ and an unsupported schema is named rather than guessed.
 | `os_version` | Host operating system version |
 | `backend` | Rendering backend: `metal` or `vulkan` |
 | `device` | GPU or rendering device name |
-| `driver` | Graphics driver or API version; `n/a` when unavailable |
+| `driver` | Graphics driver identity and Vulkan API version when Vulkan driver properties are available; otherwise the backend's driver/API version string, or `n/a` |
 | `build` | Toolkit build type |
 | `glslang` | glslang version, or `n/a` when unavailable |
 | `spirv_cross` | SPIRV-Cross version, or `n/a` when unavailable |
 | `toolkit_sha` | Toolkit source revision |
 | `title_sha` | Title executable fingerprint that produced the inputs |
+
+For Vulkan, the driver identity uses `VkPhysicalDeviceDriverProperties` (`driverName` and, when present,
+`driverInfo`) with the reported Vulkan API version, for example `Vulkan 1.4.318 / llvmpipe (Mesa 25.x)`.
+If the instance or device does not support those properties, the backend retains its previous API/driver
+version string. This distinguishes implementations that expose the same device name.
 
 `ps3diff.rsx/1` records are normalized losslessly to the same in-memory machine model: `os` is
 `macOS`, `os_version` comes from `macos`, `backend` is `metal`, `device` comes from `gpu`, and

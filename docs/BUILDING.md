@@ -141,7 +141,7 @@ objects are the same ones compiled into the runtime archive and are not installe
 | CMake Option | Default | Description |
 |---|---|---|
 | `PS3RECOMP_BUILD_TESTS` | `OFF` | Build and register runtime tests |
-| `PS3RECOMP_RSX_VULKAN` | `OFF` | Linux: build the Vulkan RSX backend (early -- see [Graphics Backends](#graphics-backends)) |
+| `PS3RECOMP_RSX_VULKAN` | `OFF` | Opt in to the Vulkan RSX backend on Linux, Windows, or macOS; macOS keeps Metal as the default |
 | `PS3RECOMP_FFMPEG_RUNTIME` | `OFF` | Decode video (cellVdec: H.264, MPEG-2) through FFmpeg loaded at run time -- see [FFmpeg](#ffmpeg-run-time-loaded-opt-in) |
 | `CMAKE_BUILD_TYPE` | — | `Debug`, `Release`, `RelWithDebInfo`, `MinSizeRel` |
 | `CMAKE_INSTALL_PREFIX` | platform default | Installation directory |
@@ -248,15 +248,16 @@ cmake -B build -DPS3_MODULE_MAX_FUNCS=1024
 ## Graphics Backends
 
 Everything under `libs/video/` is compiled into `ps3recomp_runtime` and the
-backend is selected by host platform. The one exception is the Vulkan backend,
-which is opt-in on Linux and Windows (`-DPS3RECOMP_RSX_VULKAN=ON`) while it
-grows:
+backend is selected by the host platform. Vulkan is an opt-in (`-DPS3RECOMP_RSX_VULKAN=ON`)
+test and run path on Linux, Windows, and macOS. On macOS, Metal remains the
+default when this option is off:
 
 | Host | Backend | Source | Status |
 |------|---------|--------|--------|
 | Windows | **Direct3D 12** | `libs/video/rsx_d3d12_backend.c` | The default, and the path the upstream in-tree ports are developed against. It decodes draws itself and does not run on the shared register-file draw engine, so a title whose fixes live in the engine draws nothing visible on it: one title runs at 60 flips a second into a black window. Moving it onto the engine is planned in [`d3d12-draw-engine.md`](d3d12-draw-engine.md). |
 | Windows (opt-in) | Vulkan | `libs/video/rsx_vulkan_backend.c` | The same backend as on Linux, on the draw engine with guest programs on. See below. |
-| macOS | Metal | `libs/video/rsx_metal_backend.m` | Linked against Metal / QuartzCore / Foundation / AppKit. |
+| macOS | **Metal** | `libs/video/rsx_metal_backend.m` | The default. Linked against Metal / QuartzCore / Foundation / AppKit. |
+| macOS (opt-in) | Vulkan | `libs/video/rsx_vulkan_backend.c` | A test path selected for the whole build directory; host, replay and titles use Vulkan. |
 | iOS (Simulator PoC) | Metal in a UIKit `CAMetalLayer` view | `libs/video/rsx_metal_ios_display.m` | Experimental. The app owns UIKit; the RSX backend uses its drawable layer. |
 | Linux | null / headless software | `libs/video/` null path | The default. The guest command stream is executed and validated, but nothing is presented to a window. |
 | Linux (opt-in) | Vulkan | `libs/video/rsx_vulkan_backend.c` | Opt-in. With guest programs on (`PS3RECOMP_VK_GUEST_PROGRAMS=1`) it runs the title's shaders on the shared register-file draw engine, as Metal does; without them, the null backend's fixed-function contract. See below. |
@@ -277,21 +278,55 @@ cmake --build build --target ps3recomp_host
 ./build/ps3recomp_host
 ```
 
-### The Vulkan backend (Linux and Windows, opt-in)
+### The Vulkan backend (opt-in)
+
+The option selects one backend for a build directory. On macOS the default
+remains Metal; a Vulkan build selects Vulkan for `ps3recomp_host`,
+`rsx_replay`, its scene test and projects generated from the toolkit template.
+The Metal backend and its independent tests still build. Do not reuse a build
+directory while switching this option.
 
 ```bash
-# Headers only -- Debian/Ubuntu: libvulkan-dev, Fedora: vulkan-headers
-cmake -S . -B build -G Ninja -DPS3RECOMP_RSX_VULKAN=ON
-cmake --build build --target ps3recomp_host
-./build/ps3recomp_host --draw
+# Debian/Ubuntu: install libvulkan-dev; Fedora: vulkan-headers.
+# macOS: brew install vulkan-headers vulkan-loader glslang sdl2
+cmake -S . -B build/vk -G Ninja -DPS3RECOMP_BUILD_TESTS=ON \
+  -DPS3RECOMP_RSX_VULKAN=ON -DPS3RECOMP_SPIRV_REQUIRED=ON
+cmake --build build/vk
+VK_DRIVER_FILES=/path/to/icd.json ctest --test-dir build/vk \
+  -R '^rsx_replay$|vk_draw_batch' --output-on-failure
 ```
 
-`libvulkan` is loaded at run time, so building needs only the headers, which
-also keeps cross-compiling for aarch64 simple (point
-`-DPS3RECOMP_VULKAN_INCLUDE_DIR=` at them if the cross sysroot has none). Only
-Vulkan 1.0 entry points are used; it has been run on Mesa's lavapipe, on
-NVIDIA's L4T driver (Vulkan 1.2, Tegra X1) and on Windows 11 with an RTX 4060
-(NVIDIA's driver).
+On macOS CMake finds the Homebrew Vulkan headers and loader. The backend first
+tries `libvulkan.1.dylib` through `dlopen`, then the absolute loader path found
+at configure time; no loader library is linked into the executable. Keep
+`PS3RECOMP_RSX_VULKAN=OFF` for the normal Metal build.
+
+`libvulkan` is loaded at run time, so non-Apple builds need only the headers,
+which also keeps cross-compiling for aarch64 simple (point
+`-DPS3RECOMP_VULKAN_INCLUDE_DIR=` at them if the cross sysroot has none). The
+backend uses Vulkan 1.0 entry points for rendering and requests up to Vulkan
+1.2 when the loader reports support, for driver identity and portability
+feature queries.
+
+**On macOS, choose the ICD per run with the loader's `VK_DRIVER_FILES`
+environment variable** (supported by the installed loader):
+
+```bash
+VK_DRIVER_FILES=/path/to/icd.json ctest --test-dir build/vk \
+  -R '^rsx_replay$|vk_draw_batch' --output-on-failure
+```
+
+The ICD controls which conformant implementation the loader exposes; for
+example, MoltenVK needs portability enumeration and the portability subset
+device extension. No backend-selection or driver-selection switch is added
+to the toolkit. `PS3RECOMP_VK_WINDOW=1` requests an SDL2 window; macOS uses
+SDL's `VK_EXT_metal_surface` path and reports an initialization error if the
+surface path is unavailable instead of silently starting headless.
+
+On a portability-subset device the backend checks and enables the subset
+features it uses: `imageViewFormatSwizzle` for guest texture component
+remapping and `separateStencilMaskRef` for independent front/back guest
+stencil state. A missing required feature stops initialization with its name.
 
 **On Windows** the backend loads `vulkan-1.dll`, which the GPU driver
 installs. Building needs the Vulkan SDK, for the headers and for glslang and
@@ -321,7 +356,7 @@ DualShock 4 and DualSense. `cellAudio` stays on WASAPI.
 | `PS3RECOMP_VK_DUMP_EVERY=<n>` | With a dump: write only every *n*th presented frame (default 1). A full-frame write per present slows a running title noticeably |
 | `PS3RECOMP_VK_DUMP_LIST=<a,b,c>` | With a dump: write exactly those presents (present sequence numbers, at most 32), each to `<path>_s<present_seq>_f<flip_id>.ppm` (`fnone` before the first flip; a trailing `.ppm` on *path* is replaced), as the Metal backend names its `PS3RECOMP_METAL_FRAME_DUMP` files. The sequence is the draw engine's present count; on the fixed-function path, which has none, this backend's own. Beats `_RANGE`; a malformed or longer list is a `config-invalid` stop at start-up |
 | `PS3RECOMP_VK_DUMP_RANGE=<first>-<last>` | With a dump: the same, for every present in the inclusive range |
-| `PS3RECOMP_VK_WINDOW=1` | Also show frames in an SDL2 window; if it cannot, the run continues headless and says why |
+| `PS3RECOMP_VK_WINDOW=1` | Also show frames in an SDL2 window; failures continue headless on Linux/Windows, while a macOS Vulkan build fails initialization with the SDL surface reason |
 | `PS3RECOMP_VK_FULLSCREEN=1` | With a window: borderless full screen |
 | `PS3RECOMP_VK_HOLD=<sec>` | With a window: keep the last frame up for that long before exiting |
 
@@ -485,7 +520,7 @@ Clang, Debug and Release on every push). That workflow builds the runtime
 library, runs all eight lifter suites plus the SPU helper tests, and drives
 `ps3recomp_host` end to end against the headless software backend.
 
-> **Renderer:** the opt-in Vulkan backend (see [below](#the-vulkan-backend-linux-and-windows-opt-in)).
+> **Renderer:** the opt-in Vulkan backend (see [below](#the-vulkan-backend-opt-in)).
 > The default is the null backend's headless software path
 > (`libs/video/rsx_null_backend.c`), which rasterises into host memory: a
 > correctness probe for CI, not a renderer. Running a recompiled title from

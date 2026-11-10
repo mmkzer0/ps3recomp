@@ -24,11 +24,10 @@
 #include "../memory/vm.h"           /* VM_HLE_INJECT_BASE */
 #include "rsx_commands.h"
 
-/* Backend selection. Metal where there is one, otherwise the null backend's
- * headless software path -- which is what lets this harness run on Linux,
- * where no real backend exists yet. Both expose the same four entry points
- * plus the same two test hooks, so the body below is backend-agnostic. */
-#if defined(__APPLE__)
+/* Backend selection. Vulkan is explicit; Metal is the Apple default, and the
+ * null backend keeps the harness headless where neither is selected. Both
+ * expose the same four entry points plus the same two test hooks. */
+#if defined(__APPLE__) && !defined(PS3RECOMP_RSX_VULKAN)
 #  include "rsx_metal_backend.h"
 #  define HOST_BACKEND_NAME     "Metal"
 #  define HOST_BACKEND_GUEST_SHADERS 1
@@ -1615,7 +1614,7 @@ int main(int argc, char** argv)
            got, CLEAR_ARGB, got == CLEAR_ARGB ? "OK" : "MISMATCH");
 
     if (do_draw == 13) {
-#if defined(PS3RECOMP_RSX_VULKAN) && !defined(__APPLE__)
+#if defined(PS3RECOMP_RSX_VULKAN)
         cellGcmSetFlipCommand(0);
         cellGcmTickVBlank();
         cellGcmTickFlip();
