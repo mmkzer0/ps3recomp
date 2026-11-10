@@ -252,14 +252,14 @@ typedef struct {
     u32 cubemap;
     ID3D12Resource* tex;
     u64 content_hash;
-    u32 last_hash_frame;
+    u32 last_hash_epoch;
     u64 last_use_serial;
 } texcache_t;
 typedef struct {
     u32 location, offset, format, width, height, pitch;
     ID3D12Resource* tex;
     u64 content_hash;
-    u32 last_hash_frame;
+    u32 last_hash_epoch;
 } vtexcache_t;
 typedef struct { u64 key; ID3D12PipelineState* pso; } psocache_t;
 typedef struct {
@@ -439,6 +439,20 @@ static const char* ld_fp_constant_mode_name(void)
 
 static int g_ld_dred_dumped = 0;
 static u32 g_ld_frames = 0;
+/* The texture epoch (#64; the same contract as the draw engine's s_tex_epoch in rsx_draw_engine.c):
+ * a cached texture is rechecked against guest memory at most once per epoch. It advances at every
+ * guest flip (with g_ld_frames) and at every NV4097_INVALIDATE_L2, which rsx_live_draw_method counts
+ * before it dispatches. The method (FIFO walker) and a flip (the present path) may be on different
+ * threads, so the advance is interlocked; it publishes no data, so the read needs no more than that. */
+static volatile LONG g_ld_tex_epoch = 0;
+static u32 ld_tex_epoch(void)
+{
+    return (u32)InterlockedCompareExchange(&g_ld_tex_epoch, 0, 0);
+}
+static void ld_tex_epoch_advance(void)
+{
+    InterlockedIncrement(&g_ld_tex_epoch);
+}
 static ID3D12InfoQueue* g_ld_info_queue = NULL;
 static int g_ld_debug_layer_enabled = 0;
 
@@ -2479,8 +2493,10 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
             entry->height != t->height || entry->pitch != t->pitch ||
             entry->remap != remap || entry->cubemap != t->cubemap)
             continue;
+        /* Read before the hash: a bump that lands during it is then still pending. */
+        const u32 epoch = ld_tex_epoch();
         if (refresh_enabled && entry->tex &&
-            entry->last_hash_frame != g_ld_frames) {
+            entry->last_hash_epoch != epoch) {
             int readable = 0;
             const u64 hash = texture_content_hash(t, &readable);
             /* LD_TEX_RACE=1: hash the SAME source twice, back to back. The two
@@ -2527,7 +2543,7 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
                               texture_source_span(t), t->width, t->height,
                               t->pitch);
               } }
-            entry->last_hash_frame = g_ld_frames;
+            entry->last_hash_epoch = epoch;
             if (readable && hash != entry->content_hash) {
                 ID3D12Resource* replacement =
                     decode_guest_texture_profiled(t, remap);
@@ -2593,7 +2609,7 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
     replacement.pitch = t->pitch;
     replacement.remap = remap;
     replacement.cubemap = t->cubemap;
-    replacement.last_hash_frame = g_ld_frames;
+    replacement.last_hash_epoch = ld_tex_epoch();
     replacement.last_use_serial = ++g_ld_texture_use_serial;
     {
         int readable = 0;
@@ -2791,9 +2807,10 @@ static u32 vertex_texture_srv_slot(const rsx_dsp_vertex_texture* vt)
             e->format != vt->format || e->width != vt->width ||
             e->height != vt->height || e->pitch != vt->pitch)
             continue;
-        if (e->tex && e->last_hash_frame != g_ld_frames) {
+        const u32 epoch = ld_tex_epoch();
+        if (e->tex && e->last_hash_epoch != epoch) {
             const u64 hash = vertex_texture_hash(vt, NULL, NULL);
-            e->last_hash_frame = g_ld_frames;
+            e->last_hash_epoch = epoch;
             if (hash && hash != e->content_hash) {
                 u64 replacement_hash = 0;
                 ID3D12Resource* replacement =
@@ -2820,7 +2837,7 @@ static u32 vertex_texture_srv_slot(const rsx_dsp_vertex_texture* vt)
     e->width = vt->width;
     e->height = vt->height;
     e->pitch = vt->pitch;
-    e->last_hash_frame = g_ld_frames;
+    e->last_hash_epoch = ld_tex_epoch();
     e->tex = decode_vertex_texture(vt, &e->content_hash);
     if (e->tex) {
         write_vertex_texture_srv(index, e->tex);
@@ -6317,6 +6334,7 @@ static void ld_movie_capture_overlay(void)
     /* A guest flip still marks a new texture-generation boundary even though
      * the guest surface is not sent to the swap chain. */
     g_ld_frames++;
+    ld_tex_epoch_advance();
     ld_movie_reset_rings();
 }
 
@@ -8619,6 +8637,12 @@ void rsx_live_draw_method(u32 method, u32 arg)
         }
     }
 
+    /* NV4097_INVALIDATE_L2 (#64): counted ahead of the movie and serialization branches, so a word they
+     * drop still invalidates; over-invalidating only costs a hash. The address is masked as the draw
+     * engine masks it (a driver word keeps its subchannel bits). */
+    if (((method >= 0xE000u) ? (method & 0xFFFCu) : (method & 0x1FFCu)) == 0x1FD8u)
+        ld_tex_epoch_advance();
+
     const int composite = ld_movie_composite_ui_enabled();
     const int serialized = composite || g_ld_debug_layer_enabled;
     if (serialized) {
@@ -9511,6 +9535,7 @@ void rsx_live_draw_present(u32 buffer_id)
       g_ld_last_frame_draws = (u32)(g_ld_stats.packets_seen - packets_at_last_frame);
       packets_at_last_frame = g_ld_stats.packets_seen; }
     g_ld_frames++;
+    ld_tex_epoch_advance();
 #if defined(YZ_PERF_PROFILE)
     ld_profile_present(g_ld_frames);
 #endif

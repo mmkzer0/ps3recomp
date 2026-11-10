@@ -405,16 +405,20 @@ static const rsx_method_rule rsx_method_rules[] = {
           "emits the hardware's reset routing directly (o0=HPOS, o1=COL0, o7..o15=TEX0..8; "
           "rsx_vp_decompiler.c header), which is the value the driver writes; RPCS3 has no decoder for these "
           "because it names the VP's outputs itself"),
-    MISSING(RSX_CLASS_NV4097, 0x1FD8, 1, "NV4097_INVALIDATE_L2",
-            "#64: drop the texture/post-transform cache (psl1ght NV40TCL_TEX_CACHE_CTL; the RESC convert "
-            "stream, resc_convert.c, emits it every flip, after the texture state and before the programs). Not "
-            "inert: the engine keeps a texture cache and nothing drops it. eng_texture_slot (rsx_draw_engine.c) "
-            "rehashes a cached texture at most once per presented frame (last_hash_frame != g.frames), so a "
-            "guest rewrite of the same offset, format and size after the first sample in a frame stays stale "
-            "until the next flip, with or without this method (#64 holds the Metal fixture that shows it). "
-            "Counted missing and logged once, never a stop, so a title that sends it every flip keeps running. "
-            "RPCS3 only flags the shader dirty (rsx_methods.cpp:1707 -> nv4097::set_shader_program_dirty) and "
-            "its FIFO marks the method always_ignore (RSXFIFO.h:80-93)"),
+    HANDLED(RSX_CLASS_NV4097, 0x1FD8, 1, RSX_EV_CONSUMER, "NV4097_INVALIDATE_L2",
+            "#64: rsx_draw_engine.c rsx_draw_engine_method advances the texture epoch (s_tex_epoch), the gate "
+            "eng_texture_slot compares to decide whether a cached texture is rehashed against guest memory "
+            "(the epoch also advances at every presented frame), so the next sample of every cached texture "
+            "rechecks it; any argument does. Evidence (no firmware RE of the method): the driver call in "
+            "psl1ght, cellGcmSetInvalidateTextureCache -> NV40TCL_TEX_CACHE_CTL, type 1 fragment texture, 2 "
+            "vertex texture (gcm_sys.h GCM_INVALIDATE_TEXTURE/_VERTEX_TEXTURE), and the RESC convert stream "
+            "(resc_convert.c) sending it every flip. The engine cannot see a guest rewrite of a texture's "
+            "bytes in place, so without this method it stays stale until the next flip. RPCS3 at 6e4b784d1 "
+            "is no model for it: it only flags the shader dirty (rsx_methods.cpp:1743, "
+            "nv4097::set_shader_program_dirty) and its FIFO marks the method always_ignore (RSXFIFO.h:90), "
+            "because RPCS3 finds texture writes through memory protection, which this runtime does not have. "
+            "The check an entry gets is the per-frame one (sparse sample hash, full hash on the schedule), "
+            "not a forced full hash"),
     INERT(RSX_CLASS_NV4097, 0x1FE0, 1, RSX_EV_ORACLE_NULL, "NV4097_SET_REDUCE_DST_COLOR",
           "whether the reduce stage may read the destination; RPCS3 has no decoder; value 1 = reset"),
     INERT(RSX_CLASS_NV4097, 0x1FE8, 1, RSX_EV_ORACLE_NULL, "NV4097_SET_NO_PARANOID_TEXTURE_FETCHES",

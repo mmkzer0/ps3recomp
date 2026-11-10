@@ -165,7 +165,7 @@ typedef struct {
     u64 content_hash;
     u64 sparse_hash;            /* eng_texture_sparse_hash, the per-frame check */
     u32 last_full_frame;        /* g.frames of the last full content hash */
-    u32 last_hash_frame;
+    u32 last_hash_epoch;        /* s_tex_epoch when it was last checked against guest memory */
     u64 last_use_serial;
     u32 depth;                  /* slices of a 3D texture, else 1 */
     u32 levels;                 /* SET_TEXTURE_FORMAT mipmap count it was built with */
@@ -1587,6 +1587,36 @@ static void eng_unvtc_3d_slice(u8* dst, const u8* src, u32 blocks, u32 d, u32 z,
                base + ((size_t)i * n + (z & 3)) * block_bytes, block_bytes);
 }
 
+/* The texture epoch: a cached texture is checked against guest memory at most
+ * once per epoch. It advances at every presented frame and at every
+ * NV4097_INVALIDATE_L2 (#64). The guest changes a texture's bytes in place
+ * with no event the engine could see (RPCS3 learns of it from page protection,
+ * which this runtime does not have), so the method is the one signal that the
+ * driver wants the texture cache dropped: psl1ght's cellGcmSetInvalidateTextureCache
+ * (NV40TCL_TEX_CACHE_CTL, type 1 texture, 2 vertex texture). One word for the
+ * whole cache, so the method costs nothing and each entry notices at its next
+ * sample; any argument invalidates, since over-invalidating only costs a hash.
+ *
+ * The method (rsx_draw_engine_method, the FIFO walker's thread), the sample
+ * (eng_texture_slot, a sink callback inside that same call) and the FIFO flip
+ * (eng_present, the same call chain) all run on that thread. The host's pacing
+ * present (rsx_draw_engine_present) may run on another, so the epoch is an
+ * atomic read-modify-write: a lost increment would be a lost invalidate. It
+ * publishes no data, so relaxed is enough: the guest's rewrite is ordered
+ * before the method by the FIFO put it was submitted behind, and the rehash
+ * that follows the method reads guest memory after that. A concurrent bump
+ * only causes one more rehash. Never reset: entries die with the engine. */
+#define ENG_METHOD_INVALIDATE_L2 0x1FD8u
+static _Atomic u32 s_tex_epoch;
+static inline u32 eng_tex_epoch(void)
+{
+    return atomic_load_explicit(&s_tex_epoch, memory_order_relaxed);
+}
+static inline void eng_tex_epoch_advance(void)
+{
+    atomic_fetch_add_explicit(&s_tex_epoch, 1u, memory_order_relaxed);
+}
+
 /* One hash per cached texture per presented frame. Word-at-a-time FNV over
  * the whole span is deliberately cheap: this is a mutation detector, not a
  * content id (rsx_live_draw.c:2002-2026). */
@@ -1758,7 +1788,8 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
 
 /* The cache slot for a texture unit's bytes, keyed on where they are and what
  * the registers say they are. An already-cached entry is re-hashed at most
- * once per presented frame and re-decoded when the guest changed it, which is
+ * once per texture epoch (a presented frame or INVALIDATE_L2) and re-decoded
+ * when the guest changed it, which is
  * what makes an animated UI or a video texture update at all. A miss with the
  * cache full evicts the least recently used entry rather than returning
  * nothing: returning white "made the recovered orphanage render as flat
@@ -1798,7 +1829,8 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
 #undef ENG_TEXTURE_KEY_MATCHES
     if (hit) {
         eng_texture* e = hit;
-        if (e->handle && e->last_hash_frame != g.frames) {
+        const u32 epoch = eng_tex_epoch();
+        if (e->handle && e->last_hash_epoch != epoch) {
             /* Every cached texture used to be hashed in full every frame;
              * in a big scene that is hundreds of MB a second for the few
              * that change. Now the sparse check every frame, and the full
@@ -1821,7 +1853,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                 e->last_full_frame = g.frames;
             }
             if (readable) e->sparse_hash = sparse;
-            e->last_hash_frame = g.frames;
+            e->last_hash_epoch = epoch;
             if (readable && hash != e->content_hash) {
                 /* In place when the backend orders the upload after the draws
                  * that sampled the old bytes; a volume keeps create-and-swap,
@@ -1860,7 +1892,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     e.location = location; e.offset = offset; e.format = fmt;
     e.width = w; e.height = h; e.pitch = pitch;
     e.remap = remap; e.cubemap = (u32)(cube != 0); e.depth = depth; e.levels = levels;
-    e.last_hash_frame = g.frames;
+    e.last_hash_epoch = eng_tex_epoch();
     e.last_full_frame = g.frames - (index & (ENG_TEXHASH_FULL_EVERY - 1u));
     e.last_use_serial = ++g.texture_use_serial;
     { int readable = 0;
@@ -1891,7 +1923,7 @@ static void eng_textures_touch(u32 location, u32 offset, u32 bytes)
     for (u32 i = 0; i < g.n_textures; i++) {
         eng_texture* e = &g.textures[i];
         if (e->location == location && e->offset >= offset && e->offset - offset < bytes) {
-            e->last_hash_frame = g.frames - 1u;
+            e->last_hash_epoch = eng_tex_epoch() - 1u;
             e->last_full_frame = g.frames - ENG_TEXHASH_FULL_EVERY;   /* hash it all */
             e->rewritten = 1;
         }
@@ -4161,6 +4193,7 @@ static void eng_present(u32 buffer_id, u32 target)
         eng_cap_frame(&fid, target);
     }
     g.frames++;
+    eng_tex_epoch_advance();
     g.last_guest_draws = g.guest_draws;
     g.guest_draws = 0;
 }
@@ -4334,6 +4367,7 @@ void rsx_draw_engine_method(u32 method, u32 arg)
         t_present_method = m == 0xE920u ? ENG_PRESENT_M_E920 : m == 0xE924u ? ENG_PRESENT_M_E924 :
                            m == 0xE940u ? ENG_PRESENT_M_E940 : m == 0xE944u ? ENG_PRESENT_M_E944 :
                                           ENG_PRESENT_M_OTHER;
+    if (m == ENG_METHOD_INVALIDATE_L2) eng_tex_epoch_advance();
     rsx_dispatch_method(&g.rsx, m, arg);
     t_present_method = 0;
 }
