@@ -20,14 +20,25 @@
  */
 #include "cellGcmSys.h"
 #include "rsx_capture.h"
-#include "rsx_metal_backend.h"
+#if defined(PS3RECOMP_RSX_VULKAN)
+#  include "rsx_vulkan_backend.h"
+#else
+#  include "rsx_metal_backend.h"
+#endif
 #include "rsx_method_class.h"
 #include "rsx_test_programs.h"
 
-#include <sys/mman.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+#else
+#  include <sys/mman.h>
+#endif
 void cellGcm_rsx_process_fifo(void);   /* the walker: libs/video/cellGcmSys.c has no header entry for it */
 
 uint8_t* vm_base;
@@ -63,6 +74,14 @@ static void check(int ok, const char* what)
 {
     printf("[%s] %s\n", ok ? "PASS" : "FAIL", what);
     g_fail += !ok;
+}
+static int scene_setenv(const char* name, const char* value)
+{
+#ifdef _WIN32
+    return _putenv_s(name, value);
+#else
+    return setenv(name, value, 1);
+#endif
 }
 
 static u32 g_heap = 0x00800000u;
@@ -127,24 +146,64 @@ static void run_to(u32 put)
 int main(int argc, char** argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
-    if (argc < 2) { fprintf(stderr, "usage: %s <capture dir> [unknown] [report]\n", argv[0]); return 2; }
-    int unknown = 0, report = 0;
-    for (int i = 2; i < argc; i++) { unknown |= !strcmp(argv[i], "unknown"); report |= !strcmp(argv[i], "report"); }
+    if (argc < 2) { fprintf(stderr, "usage: %s <capture dir> [unknown] [report] [fault]\n", argv[0]); return 2; }
+    int unknown = 0, report = 0, fault = 0;
+    for (int i = 2; i < argc; i++) {
+        unknown |= !strcmp(argv[i], "unknown");
+        report |= !strcmp(argv[i], "report");
+        fault |= !strcmp(argv[i], "fault");
+    }
 
+#ifdef _WIN32
+    void* p = VirtualAlloc(NULL, VM_SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
     void* p = mmap(NULL, VM_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
-    if (p == MAP_FAILED) { puts("FAIL: guest VM"); return 1; }
+    if (p == MAP_FAILED) p = NULL;
+#endif
+    if (!p) { puts("FAIL: guest VM"); return 1; }
     vm_base = (uint8_t*)p;
     ppu_vm_size = VM_SIZE;
-    ppu_hle_inject_base = 0x40300000u;   /* not the library default: a replay has to find it from the labels */
+    ppu_hle_inject_base = 0x40300000u;
 
-    setenv("PS3RECOMP_METAL_HEADLESS", "1", 1);
-    if (rsx_metal_backend_init(1280, 720, "rsx_replay scene") != 0) { puts("SKIP: no Metal device"); return 77; }
-    if (!(rsx_metal_backend_status() & RSX_METAL_GUEST_SHADERS) || !(rsx_metal_backend_status() & RSX_METAL_ENGINE_PATH)) {
-        puts("SKIP: guest shader translation or the draw engine is unavailable");
+#if defined(PS3RECOMP_RSX_VULKAN)
+    if (scene_setenv("PS3RECOMP_VK_WINDOW", "0") != 0 ||
+        rsx_vulkan_backend_init(1280, 720, "rsx_replay scene") != 0) {
+        puts("SKIP: no Vulkan device");
+        return 77;
+    }
+    const u32 status = rsx_vulkan_backend_status();
+    if (!(status & RSX_VULKAN_HEADLESS) || !(status & RSX_VULKAN_GUEST_SHADERS) ||
+        !(status & RSX_VULKAN_ENGINE_PATH)) {
+        puts("SKIP: headless guest-shader draw engine is unavailable");
+        rsx_vulkan_backend_shutdown();
         return 77;
     }
     rsx_capture_environment env;
-    rsx_metal_backend_capture_environment(&env);
+    if (rsx_vulkan_backend_capture_environment(&env) != 0) {
+        puts("FAIL: Vulkan machine record");
+        rsx_vulkan_backend_shutdown();
+        return 1;
+    }
+#else
+    (void)fault;
+    if (scene_setenv("PS3RECOMP_METAL_HEADLESS", "1") != 0 ||
+        rsx_metal_backend_init(1280, 720, "rsx_replay scene") != 0) {
+        puts("SKIP: no Metal device");
+        return 77;
+    }
+    const u32 status = rsx_metal_backend_status();
+    if (!(status & RSX_METAL_GUEST_SHADERS) || !(status & RSX_METAL_ENGINE_PATH)) {
+        puts("SKIP: guest shader translation or the draw engine is unavailable");
+        rsx_metal_backend_shutdown();
+        return 77;
+    }
+    rsx_capture_environment env;
+    if (rsx_metal_backend_capture_environment(&env) != 0) {
+        puts("FAIL: Metal machine record");
+        rsx_metal_backend_shutdown();
+        return 1;
+    }
+#endif
     rsx_capture_options opt = { argv[1], 0 };
     (void)rsx_capture_install(&env, &opt);
 
@@ -152,6 +211,9 @@ int main(int argc, char** argv)
     check(cellGcmSetupContext(ctx_out, CMD_SIZE, IO_SIZE, IO_EA, host_alloc, host_w32) != 0, "cellGcmSetupContext");
     check(cellGcmSetDisplayBuffer(1, SURF_OFF, W * 4, W, H) == 0, "display buffer 1 is the colour surface");
     check(cellGcmMapEaIoAddress(WIN2_EA, WIN2_IO, 0x100000u) == 0, "a second main-memory window is mapped");
+#if defined(PS3RECOMP_RSX_VULKAN_TEST_SEAMS)
+    if (fault) rsx_vulkan_backend_test_fail_next_engine_submissions(1);
+#endif
 
     /* ---- guest data, written before the RSX consumes any of it ---- */
     const float red[4] = {1, 0, 0, 1}, green[4] = {0, 1, 0, 1}, blue[4] = {0, 0, 1, 1}, white[4] = {1, 1, 1, 1};
@@ -231,7 +293,11 @@ int main(int argc, char** argv)
     run_to(far_end);
 
     rsx_capture_finish();
+#if defined(PS3RECOMP_RSX_VULKAN)
+    rsx_vulkan_backend_shutdown();
+#else
     rsx_metal_backend_shutdown();
+#endif
 
     check(vm_read32(LABEL_EA(5)) == 7u, "the RELEASE reached the label");
     check(vm_read32(WIN2_EA + (TEX_DST - WIN2_IO)) == vm_read32(WIN2_EA + (TEX_SRC - WIN2_IO)), "the NV0039 copy reached the destination");

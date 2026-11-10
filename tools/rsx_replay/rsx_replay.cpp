@@ -20,17 +20,31 @@
  */
 #include "cellGcmSys.h"
 #include "rsx_capture.h"
-#include "rsx_metal_backend.h"
 #include "ps3emu/config.h"
 #include "ps3emu/sha256.h"
 #include "ps3emu/stop.h"
+#if defined(PS3RECOMP_RSX_VULKAN)
+#  include "rsx_vulkan_backend.h"
+#else
+#  include "rsx_metal_backend.h"
+#endif
 
-#include <sys/mman.h>
 #include <errno.h>
 #include <stdio.h>
-#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#else
+#  include <sys/mman.h>
+#  include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <fstream>
@@ -59,6 +73,94 @@ struct Err {
     std::string name, detail;
 };
 [[noreturn]] void fail(const std::string& name, const std::string& detail) { throw Err{name, detail}; }
+static int replay_setenv(const char* name, const char* value)
+{
+#ifdef _WIN32
+    return _putenv_s(name, value);
+#else
+    return setenv(name, value, 1);
+#endif
+}
+
+static void* replay_guest_memory(void)
+{
+#ifdef _WIN32
+    return VirtualAlloc(nullptr, kVmSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* p = mmap(nullptr, kVmSize, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+    return p == MAP_FAILED ? nullptr : p;
+#endif
+}
+
+static std::string replay_temp_manifest_dir(void)
+{
+#ifdef _WIN32
+    char temp[MAX_PATH + 1], name[MAX_PATH + 1];
+    const DWORD n = GetTempPathA(MAX_PATH, temp);
+    if (!n || n > MAX_PATH || !GetTempFileNameA(temp, "rsx", 0, name))
+        fail("manifest", "cannot select a temporary manifest path");
+    if (!DeleteFileA(name)) fail("manifest", "cannot reserve the temporary manifest path");
+    return name;
+#else
+    const char* t = getenv("TMPDIR");
+    std::string tmpl = std::string(t && *t ? t : "/tmp") + "/rsx_replay.XXXXXX";
+    std::vector<char> b(tmpl.begin(), tmpl.end());
+    b.push_back(0);
+    if (!mkdtemp(b.data())) fail("manifest", std::string("mkdtemp: ") + strerror(errno));
+    const std::string result = b.data();
+    rmdir(result.c_str());   // the writer creates it; mkdtemp only chose a free name
+    return result;
+#endif
+}
+
+static int replay_backend_init(u32 width, u32 height, const char* title)
+{
+#if defined(PS3RECOMP_RSX_VULKAN)
+    if (replay_setenv("PS3RECOMP_VK_WINDOW", "0") != 0) return -1;
+    return rsx_vulkan_backend_init(width, height, title);
+#else
+    if (replay_setenv("PS3RECOMP_METAL_HEADLESS", "1") != 0) return -1;
+    return rsx_metal_backend_init(width, height, title);
+#endif
+}
+
+static u32 replay_backend_status(void)
+{
+#if defined(PS3RECOMP_RSX_VULKAN)
+    return rsx_vulkan_backend_status();
+#else
+    return rsx_metal_backend_status();
+#endif
+}
+
+static int replay_backend_capture_environment(rsx_capture_environment* env)
+{
+#if defined(PS3RECOMP_RSX_VULKAN)
+    return rsx_vulkan_backend_capture_environment(env);
+#else
+    return rsx_metal_backend_capture_environment(env);
+#endif
+}
+
+static void replay_backend_shutdown(void)
+{
+#if defined(PS3RECOMP_RSX_VULKAN)
+    rsx_vulkan_backend_shutdown();
+#else
+    rsx_metal_backend_shutdown();
+#endif
+}
+
+#if defined(PS3RECOMP_RSX_VULKAN)
+constexpr u32 kBackendHeadless = RSX_VULKAN_HEADLESS;
+constexpr u32 kBackendGuestShaders = RSX_VULKAN_GUEST_SHADERS;
+constexpr u32 kBackendEnginePath = RSX_VULKAN_ENGINE_PATH;
+#else
+constexpr u32 kBackendHeadless = RSX_METAL_HEADLESS;
+constexpr u32 kBackendGuestShaders = RSX_METAL_GUEST_SHADERS;
+constexpr u32 kBackendEnginePath = RSX_METAL_ENGINE_PATH;
+#endif
 
 // ---- JSON: the subset the capture writer emits (integers, booleans, null, ASCII strings) -------------------
 
@@ -614,25 +716,30 @@ void run(Report& rep)
     if (opt.accept_unknown) rep.gate_valid = false;
 
     // ---- guest memory and the backend
-    void* p = mmap(nullptr, kVmSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
-    if (p == MAP_FAILED) fail("guest-memory", std::string("mmap: ") + strerror(errno));
+    void* p = replay_guest_memory();
+    if (!p) fail("guest-memory", "the replay guest address space could not be allocated");
     vm_base = (uint8_t*)p;
     ppu_vm_size = kVmSize;
     if (cap.have_label) ppu_hle_inject_base = cap.hle_base;
     g_scratch = ppu_hle_inject_base + 0x4000u;
 
-    setenv("PS3RECOMP_METAL_HEADLESS", "1", 1);
-    if (rsx_metal_backend_init(1280, 720, "rsx_replay") != 0)
-        fail("backend", "the Metal backend did not initialise");
-    const u32 st = rsx_metal_backend_status();
-    if (!(st & RSX_METAL_ENGINE_PATH))
+    if (replay_backend_init(1280, 720, "rsx_replay") != 0)
+        fail("backend", "the rendering backend did not initialise headless");
+    const u32 st = replay_backend_status();
+    if (!(st & kBackendHeadless))
+        fail("backend", "the rendering backend did not settle on headless mode");
+    if (!(st & kBackendEnginePath))
         fail("backend", "the register-file draw engine is not driving the backend (PS3RECOMP_RSX_ENGINE?)");
-    if (!(st & RSX_METAL_GUEST_SHADERS))
+    if (!(st & kBackendGuestShaders))
+#if defined(PS3RECOMP_RSX_VULKAN)
+        fail("fixed-function", "guest shaders are off (translator missing or PS3RECOMP_VK_GUEST_PROGRAMS is off)");
+#else
         fail("fixed-function", "guest shaders are off (translator missing, or PS3RECOMP_METAL_FIXED_FUNCTION set): "
                                "a fixed-function replay is not a baseline");
+#endif
 
     rsx_capture_environment env;
-    if (rsx_metal_backend_capture_environment(&env) != 0) fail("backend", "no machine record");
+    if (replay_backend_capture_environment(&env) != 0) fail("backend", "no machine record");
     // The title that produced the inputs is provenance, not a rendering input: the manifest carries it on.
     const std::string title_sha = cap.machine.str("title_sha");
     env.title_sha = title_sha.c_str();
@@ -643,13 +750,7 @@ void run(Report& rep)
     if (mdir.empty()) {
         if (!opt.out.empty()) mdir = opt.out + ".manifest";
         else {
-            const char* t = getenv("TMPDIR");
-            std::string tmpl = std::string(t && *t ? t : "/tmp") + "/rsx_replay.XXXXXX";
-            std::vector<char> b2(tmpl.begin(), tmpl.end());
-            b2.push_back(0);
-            if (!mkdtemp(b2.data())) fail("manifest", std::string("mkdtemp: ") + strerror(errno));
-            mdir = b2.data();
-            rmdir(mdir.c_str());   // the writer creates it; mkdtemp only chose a free name
+            mdir = replay_temp_manifest_dir();
         }
     }
     rep.manifest = mdir;
@@ -771,7 +872,7 @@ void run(Report& rep)
         }
     }
     rsx_capture_finish();
-    rsx_metal_backend_shutdown();
+    replay_backend_shutdown();
 
     // ---- what the replay produced, against what the capture recorded
     const std::vector<J> mine = read_frames(mdir + "/capture.ndjson");
