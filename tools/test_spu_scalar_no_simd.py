@@ -6,34 +6,32 @@ the vector helpers. spu_shufb's pshufb / NEON tbl branch used to ignore them, so
 shufb run compared the SIMD path with itself and no host-independent test could tell.
 
 The contract is about emitted code, so this compiles runtime/spu/tests/test_spu_shufb.c to
-assembly (-S) and looks for the permute instruction:
+assembly and looks for the permute instruction:
   - with the scalar switch: none;
   - without it: at least one, otherwise the instruction pattern or the build is blind and an
     empty result above would prove nothing.
+The compiler's own vectorizers are off for every build: they turn the scalar byte loop's
+fixed byte reorder (SPU_W) into a pshufb of their own on Win64, where a u128 argument arrives
+in memory. That is the scalar algorithm compiled, not the SIMD helper the switch removes.
 On macOS both architectures are checked from either host (clang -arch); elsewhere the host's.
+The compiler is CC (CTest passes CMake's), spelled for its driver (tools/host_cc.py).
 Run:  python3 tools/test_spu_scalar_no_simd.py
 """
 import os
 import platform
 import re
-import shutil
-import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
+from host_cc import c_compiler
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "runtime/spu/tests/test_spu_shufb.c"
 # pshufb/vpshufb (x86 byte permute), tbl/tbx (NEON table lookup).
 X86 = ("x86_64", ["-msse4.1"], re.compile(r"^\s*(?:v?pshufb)\b", re.MULTILINE))
 ARM = ("arm64", [], re.compile(r"^\s*tb[lx]\b", re.MULTILINE))
-
-
-def compiler():
-    for cand in (os.environ.get("CC"), "clang", "gcc", "cc"):
-        if cand and shutil.which(cand.split()[0]):
-            return cand.split()
-    return None
+NO_AUTOVEC = ["-fno-tree-vectorize", "-fno-tree-slp-vectorize"]   # gcc and clang both
 
 
 def targets():
@@ -54,18 +52,20 @@ def targets():
 
 def asm(cc, flags, defines, tmp):
     out = Path(tmp) / "out.s"
-    cmd = cc + ["-std=gnu17", "-O2", "-S", "-I", str(ROOT / "include"), "-I", str(ROOT / "runtime/spu")] \
-        + flags + defines + [str(SRC), "-o", str(out)]
-    r = subprocess.run(cmd, capture_output=True, text=True, check=False)   # a failing build is reported by the caller
-    return out.read_text() if r.returncode == 0 else None, r.stderr
+    novec = ["/clang:" + f for f in NO_AUTOVEC] if cc.msvc else NO_AUTOVEC
+    r = cc.run(cc.asm(SRC, out, std="gnu17", includes=[ROOT / "include", ROOT / "runtime/spu"],
+                      defines=defines, flags=["-O2", *novec, *flags]))
+    # a failing build is reported by the caller
+    return out.read_text(encoding="utf-8", errors="replace") if r.returncode == 0 else None, r.stderr + r.stdout
 
 
 def main():
-    cc = compiler()
-    if cc is None:
+    cc = c_compiler()
+    if cc is None or cc.kind == "cl":
+        why = "no C compiler" if cc is None else "plain cl cannot target SSE4.1 by flag"
         if os.environ.get("CI"):
-            sys.exit("FAILED: no C compiler")
-        print("skip test_spu_scalar_no_simd: no C compiler")
+            sys.exit(f"FAILED: {why}")
+        print(f"skip test_spu_scalar_no_simd: {why}")
         return
     failed = False
     checked = 0
@@ -84,7 +84,7 @@ def main():
                 failed = True
                 continue
             for define in ("SPU_SCALAR_HELPERS", "SPU_SCALAR_INT"):
-                text, err = asm(cc, flags, ["-D" + define], tmp)
+                text, err = asm(cc, flags, [define], tmp)
                 if text is None:
                     print(f"FAILED {name} -D{define}: build failed\n{err[-1500:]}")
                     failed = True
