@@ -88,7 +88,7 @@ def write_records(cap, recs, rehash=True):
                 h.update(line.replace(f'"schema":"{SCHEMA_V2}"', f'"schema":"{SCHEMA_V1}"', 1).encode("ascii") + b"\n")
             elif r["event"] in ("frame-complete", "capture-end"):
                 r["capture_hash"]["value"] = h.hexdigest()
-    (Path(cap) / "capture.ndjson").write_text("".join(canonical_json(r) + "\n" for r in recs))
+    (Path(cap) / "capture.ndjson").write_text("".join(canonical_json(r) + "\n" for r in recs), newline="\n")
 
 
 def mutate(src, dst, edit, rehash=True):

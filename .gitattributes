@@ -1,2 +1,6 @@
 # Patch files carry blank context lines as a single space; the whitespace check must not strip them.
 tools/hwprobe/toolchain/patches/*.patch -whitespace
+
+# ps3diff files are canonical lines ending in LF, and the tools check that byte for byte; a
+# CRLF checkout (core.autocrlf, Git for Windows' default) would make every fixture non-canonical.
+*.ndjson text eol=lf

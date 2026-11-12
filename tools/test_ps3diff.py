@@ -41,7 +41,7 @@ def read_records(path):
 def write_records(path, records):
     path = Path(path)
     path.write_text("".join(json.dumps(rec, separators=(",", ":")) + "\n"
-                            for rec in records), encoding="utf-8")
+                            for rec in records), encoding="utf-8", newline="\n")
     return path
 
 
@@ -142,7 +142,7 @@ class Convert(ToolTestCase):
         mixed = self.path("mixed.ndjson")
         first = (FIXTURES / "v1-basic.ndjson").read_text(encoding="utf-8").splitlines()[0]
         second = (FIXTURES / "v2-basic.ndjson").read_text(encoding="utf-8").splitlines()[0]
-        mixed.write_text(first + "\n" + second + "\n", encoding="utf-8")
+        mixed.write_text(first + "\n" + second + "\n", encoding="utf-8", newline="\n")
         result = run_tool("convert", "--to", 2, mixed, "-o", self.path("out"))
         self.assert_exit(result, 2)
         self.assertIn("line 2", result.stderr)

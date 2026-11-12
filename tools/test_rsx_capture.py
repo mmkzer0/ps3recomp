@@ -78,7 +78,7 @@ def rewrite(src, dst, edit):
     p = Path(dst) / "capture.ndjson"
     recs = [rec for _, _, rec in read_ndjson(str(p))]
     edit(recs)
-    p.write_text("".join(canonical_json(r) + "\n" for r in recs))
+    p.write_text("".join(canonical_json(r) + "\n" for r in recs), newline="\n")
 
 def hash_input_line(record):
     line = canonical_json(record)
@@ -106,7 +106,7 @@ def legacy_capture(src, dst):
             running.update(hash_input_line(rec).encode("ascii") + b"\n")
         elif rec["event"] in ("frame-complete", "capture-end"):
             rec["capture_hash"]["value"] = running.hexdigest()
-    path.write_text("".join(canonical_json(rec) + "\n" for rec in recs))
+    path.write_text("".join(canonical_json(rec) + "\n" for rec in recs), newline="\n")
     return path
 
 
@@ -186,7 +186,7 @@ class Builder:
     def finish(self):
         self.add("capture-end", _input=False, frames=self.frames, events=self.seq,
                  capture_hash={"algo": "sha256", "scope": "input-events/v1", "value": self.running.hexdigest()})
-        (self.root / "capture.ndjson").write_text("\n".join(self.lines) + "\n")
+        (self.root / "capture.ndjson").write_text("\n".join(self.lines) + "\n", newline="\n")
         return self.root / "capture.ndjson"
 
 
@@ -296,7 +296,7 @@ def test_validator_failure_paths(tmp):
     p = synth(tmp, "count", bad_count)
     recs = events(Path(p).parent)
     recs[3]["count"] = 1
-    Path(p).write_text("".join(canonical_json(r) + "\n" for r in recs))
+    Path(p).write_text("".join(canonical_json(r) + "\n" for r in recs), newline="\n")
     err = validation_error(p)
     check(err and "count" in err, f"a count that disagrees with the header word is named ({err})")
 
