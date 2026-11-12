@@ -695,7 +695,10 @@ if(PS3RECOMP_BUILD_TESTS)
     if(_ps3_fiber_arm64 AND NOT PS3RECOMP_IOS)
         add_subdirectory(tests/host_fiber)
     endif()
-    add_subdirectory(tests/sync2_semaphore)
+    # sync2_semaphore maps its guest memory with mmap: POSIX only for now.
+    if(NOT WIN32)
+        add_subdirectory(tests/sync2_semaphore)
+    endif()
     # Differential harness (HLE vs lifted firmware); inert unless PS3RECOMP_DIFF_FW_DIR names a
     # lifted module kept outside the repository (tests/diff_harness/CMakeLists.txt).
     add_subdirectory(tests/diff_harness)
@@ -896,44 +899,48 @@ if(PS3RECOMP_BUILD_TESTS)
         set_tests_properties(rsx_tiling_threads PROPERTIES LABELS "gcm;t0;tsan" TIMEOUT 300)
     endif()
 
-    # The sysPrxForUser CRT shims bound the guest spans they copy: a span that
-    # leaves the arena is a named stop (hle-guest-range) raised before the copy,
-    # not a write past guest memory. The fixture maps an arena with a PROT_NONE
-    # guard page after it, so a copy that gets through faults instead. Compiled
-    # against the shim's own source (the rest of the runtime asks for a whole
-    # host layer) with the real stop implementation.
-    add_executable(test_sysprx_guest_range
-        tests/test_sysprx_guest_range.c
-        libs/system/sysPrxForUser.c
-        runtime/diag/stop.cpp)
-    target_include_directories(test_sysprx_guest_range PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/include"
-        "${CMAKE_CURRENT_SOURCE_DIR}/libs/system"
-        "${CMAKE_CURRENT_SOURCE_DIR}/runtime")
-    set_target_properties(test_sysprx_guest_range PROPERTIES LINKER_LANGUAGE CXX)
-    add_test(NAME sysprx_guest_range COMMAND test_sysprx_guest_range)
-    set_tests_properties(sysprx_guest_range PROPERTIES LABELS "runtime;t0" TIMEOUT 60)
+    # Both fixtures put guest memory in an mmap arena with a PROT_NONE guard page, so they are POSIX only
+    # for now: the toolkit also builds on Windows, where these targets and tests are not defined.
+    if(NOT WIN32)
+        # The sysPrxForUser CRT shims bound the guest spans they copy: a span that
+        # leaves the arena is a named stop (hle-guest-range) raised before the copy,
+        # not a write past guest memory. The fixture maps an arena with a PROT_NONE
+        # guard page after it, so a copy that gets through faults instead. Compiled
+        # against the shim's own source (the rest of the runtime asks for a whole
+        # host layer) with the real stop implementation.
+        add_executable(test_sysprx_guest_range
+            tests/test_sysprx_guest_range.c
+            libs/system/sysPrxForUser.c
+            runtime/diag/stop.cpp)
+        target_include_directories(test_sysprx_guest_range PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/system"
+            "${CMAKE_CURRENT_SOURCE_DIR}/runtime")
+        set_target_properties(test_sysprx_guest_range PROPERTIES LINKER_LANGUAGE CXX)
+        add_test(NAME sysprx_guest_range COMMAND test_sysprx_guest_range)
+        set_tests_properties(sysprx_guest_range PROPERTIES LABELS "runtime;t0" TIMEOUT 60)
 
-    # sys_fs_read/sys_fs_write hand the host a guest span and the 8-byte
-    # nread/nwrite out-pointers. A span that leaves guest memory, or a size
-    # whose u64 bound the old (uint32_t) truncation lost, is a named stop
-    # (hle-guest-range) raised before the transfer; a bad fd is CELL_EBADF
-    # before any pointer is looked at. The fixture maps an arena with a
-    # PROT_NONE guard page after it, so a check that misses faults instead,
-    # and it links the real stop implementation.
-    add_executable(test_sys_fs_guest_range
-        tests/test_sys_fs_guest_range.c
-        runtime/syscalls/sys_fs.c
-        runtime/platform/ps3_dev_flash.c
-        libs/filesystem/edat.c
-        runtime/diag/stop.cpp)
-    target_include_directories(test_sys_fs_guest_range PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/include"
-        "${CMAKE_CURRENT_SOURCE_DIR}/runtime"
-        "${CMAKE_CURRENT_SOURCE_DIR}/runtime/syscalls")
-    set_target_properties(test_sys_fs_guest_range PROPERTIES LINKER_LANGUAGE CXX)
-    add_test(NAME sys_fs_guest_range COMMAND test_sys_fs_guest_range)
-    set_tests_properties(sys_fs_guest_range PROPERTIES LABELS "runtime;t0" TIMEOUT 60)
+        # sys_fs_read/sys_fs_write hand the host a guest span and the 8-byte
+        # nread/nwrite out-pointers. A span that leaves guest memory, or a size
+        # whose u64 bound the old (uint32_t) truncation lost, is a named stop
+        # (hle-guest-range) raised before the transfer; a bad fd is CELL_EBADF
+        # before any pointer is looked at. The fixture maps an arena with a
+        # PROT_NONE guard page after it, so a check that misses faults instead,
+        # and it links the real stop implementation.
+        add_executable(test_sys_fs_guest_range
+            tests/test_sys_fs_guest_range.c
+            runtime/syscalls/sys_fs.c
+            runtime/platform/ps3_dev_flash.c
+            libs/filesystem/edat.c
+            runtime/diag/stop.cpp)
+        target_include_directories(test_sys_fs_guest_range PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/runtime"
+            "${CMAKE_CURRENT_SOURCE_DIR}/runtime/syscalls")
+        set_target_properties(test_sys_fs_guest_range PROPERTIES LINKER_LANGUAGE CXX)
+        add_test(NAME sys_fs_guest_range COMMAND test_sys_fs_guest_range)
+        set_tests_properties(sys_fs_guest_range PROPERTIES LABELS "runtime;t0" TIMEOUT 60)
+    endif()
 
     # A guest exit ends the host process while the PPU, SPU, RSX and audio host
     # threads are still running, so the runtime exits with quick_exit(): no
