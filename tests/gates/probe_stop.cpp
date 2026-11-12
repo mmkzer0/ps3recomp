@@ -47,8 +47,15 @@ static void logging_stopping_provider(uint64_t, ps3_stop_frontier*)
     ps3_stop(PS3_STOP_CONFIG_INVALID, "provider stopped", "none", nullptr, 0, nullptr);
 }
 
+// Each provider must be a distinct function: identical empty bodies are folded into one by the
+// linker's identical-code folding (link /OPT:ICF in a Release clang-cl build), and the table then
+// takes the one address once and never fills. A distinct store per N keeps them apart.
 template <int N>
-static void idle_provider(uint64_t, ps3_stop_frontier*) {}
+static void idle_provider(uint64_t, ps3_stop_frontier*)
+{
+    static volatile int calls;
+    calls = N;
+}
 
 template <int... N>
 static void register_providers(std::integer_sequence<int, N...>)
