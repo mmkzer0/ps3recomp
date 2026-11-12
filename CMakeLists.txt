@@ -2334,6 +2334,20 @@ if(PS3RECOMP_RSX_VULKAN AND PS3RECOMP_SPIRV_TRANSLATION)
                 ENVIRONMENT "PS3RECOMP_VK_GUEST_PROGRAMS=1;PS3RECOMP_VK_WINDOW=0")
         endif()
     endif()
+
+    # The runtime imports SDL2.dll on Windows (the window and cellPad), and Windows looks for
+    # it beside the executable: without the copy both programs fail to start (0xC0000135),
+    # which a test run sees as a hang behind the loader's error box.
+    if(WIN32)
+        foreach(replay_exe rsx_replay test_rsx_replay_scene)
+            if(TARGET ${replay_exe})
+                add_custom_command(TARGET ${replay_exe} POST_BUILD
+                    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                        $<TARGET_RUNTIME_DLLS:${replay_exe}> $<TARGET_FILE_DIR:${replay_exe}>
+                    COMMAND_EXPAND_LISTS)
+            endif()
+        endforeach()
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
