@@ -506,6 +506,26 @@ same treatment.
   an Xbox controller over Bluetooth was opened at start and then never moved,
   and a controller connected later was never seen.
 
+**Tests.** `-DPS3RECOMP_BUILD_TESTS=ON` builds and registers every test that
+runs on Windows; the fixtures that need POSIX (an `mmap` guest arena with a
+`PROT_NONE` guard page, pthreads, `fork`) are not defined there. The tests
+that shell out to a compiler get CMake's (`CC`, `CXX`) and spell its flags for
+the driver (`tools/host_cc.py`), so a clang-cl build checks clang-cl's output.
+The gpu tests (`ctest -L gpu`, `rsx_replay` on Windows) need a Vulkan device;
+without one they skip. Mesa's lavapipe stands in for a GPU: point
+`VK_DRIVER_FILES` at its `lvp_icd.x86_64.json` (pal1000's mesa-dist-win MSVC
+build) and the loader uses nothing else. An elevated process's loader ignores
+that variable; there the manifest has to be registered under
+`HKLM\SOFTWARE\Khronos\Vulkan\Drivers`, as an installed driver is.
+
+**CI.** `.github/workflows/dev-ci-windows.yml`, dispatched like `dev-ci`
+(`gh workflow run dev-ci-windows.yml --ref dev`), builds the `dev` and
+`release` presets with clang-cl, the Vulkan backend and its required SPIR-V
+translator on `windows-2022`, runs the t0 tier, then the gpu tests on lavapipe
+(registered, since the runner is elevated) through a Khronos loader built
+from the SDK's tag. A gpu test that skips there, or runs on anything but
+llvmpipe, fails the job.
+
 > **`dirent.h` is supplied in-tree.** The PPU boot scaffold's filesystem layer
 > walks host directories with `opendir`/`readdir`/`closedir`, none of which
 > MSVC ships, so game ports used to vendor their own Win32 shim on the include
