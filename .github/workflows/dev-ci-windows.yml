@@ -21,8 +21,6 @@ name: dev-ci-windows
 
 on:
   workflow_dispatch:
-  push:
-    branches: [ ci/windows ]
 
 permissions:
   contents: read
