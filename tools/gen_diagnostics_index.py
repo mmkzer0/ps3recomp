@@ -24,6 +24,15 @@ HEADER = re.compile(r'\*\*(\d+) knobs across (\d+) groups\.\*\*')
 GROUP_ROW = re.compile(r'^\| `([A-Za-z0-9]+)_\*` \| (\d+) \|$', re.M)
 
 
+def shown(path):
+    """path relative to the tree, for messages. A --doc in a temporary directory can sit on another
+    drive on Windows, where relpath raises; it is shown as given."""
+    try:
+        return os.path.relpath(path, ROOT)
+    except ValueError:
+        return path
+
+
 def strip_comments(text, python):
     """Blank out comments but keep every newline, so line numbers stay true.
 
@@ -117,7 +126,7 @@ def check(hits, doc):
     try:
         text = open(doc, encoding='utf-8', errors='replace').read()
     except FileNotFoundError:
-        print('FAIL: %s does not exist' % os.path.relpath(doc, ROOT), file=sys.stderr)
+        print('FAIL: %s does not exist' % shown(doc), file=sys.stderr)
         return 1
     listed = KNOB.findall(text)
     source = set(hits)
@@ -145,20 +154,20 @@ def check(hits, doc):
     if missing or extra or dupes or bad_counts:
         for name in missing:
             print('FAIL: `%s` is read by the sources but missing from %s'
-                  % (name, os.path.relpath(doc, ROOT)), file=sys.stderr)
+                  % (name, shown(doc)), file=sys.stderr)
         for name in extra:
             print('FAIL: `%s` is listed in %s but no source reads it'
-                  % (name, os.path.relpath(doc, ROOT)), file=sys.stderr)
+                  % (name, shown(doc)), file=sys.stderr)
         for name in dupes:
             print('FAIL: `%s` is listed more than once in %s'
-                  % (name, os.path.relpath(doc, ROOT)), file=sys.stderr)
+                  % (name, shown(doc)), file=sys.stderr)
         for msg in bad_counts:
             print('FAIL: %s' % msg, file=sys.stderr)
         print('%d missing, %d stale, %d duplicated, %d count mismatch(es)'
               % (len(missing), len(extra), len(dupes), len(bad_counts)), file=sys.stderr)
         return 1
     print('OK: %s lists all %d knobs the sources read'
-          % (os.path.relpath(doc, ROOT), len(source)))
+          % (shown(doc), len(source)))
     return 0
 
 
@@ -177,7 +186,7 @@ def main():
     with open(args.doc, 'w', encoding='utf-8') as f:
         f.write(generate(hits))
     print('wrote %s: %d knobs, %d groups'
-          % (os.path.relpath(args.doc, ROOT), len(hits),
+          % (shown(args.doc), len(hits),
              len({name.split('_')[0] for name in hits})))
     described = sum(1 for n in hits if hits[n][0][2])
     print('with a description from source:', described, '(%d%%)' % (100 * described // len(hits)))

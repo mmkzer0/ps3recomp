@@ -21,6 +21,12 @@ def probe(*args, env=None, **extra_env):
     return g.run([PROBE, *args], env=e)
 
 
+def toml_str(s):
+    """s as a TOML basic string. A Windows path's backslashes are escapes there, so a path is never
+    pasted between quotes as it is."""
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
 class Cfg:
     """A temporary config file, written from lines so line numbers are exact."""
 
@@ -330,7 +336,7 @@ def test_pad_trace_paths_are_checked_at_load():
         existing = os.path.join(d, "existing.trace")
         with open(existing, "w") as f:
             f.write("keep\n")
-        with Cfg("schema = 1", "[pad]", f'record = "{fresh}"', f'replay = "{existing}"') as c:
+        with Cfg("schema = 1", "[pad]", f"record = {toml_str(fresh)}", f"replay = {toml_str(existing)}") as c:
             o = options(probe("--load", c.path, "get"))
             assert o["pad.record"] == (f'"{fresh}"', f"file:{c.path}"), o
             assert o["pad.replay"] == (f'"{existing}"', f"file:{c.path}"), o
@@ -351,7 +357,7 @@ def test_pad_trace_paths_are_checked_at_load():
                     ("replay", secret, "cannot be read")]
         try:
             for key, path, needle in bad:
-                with Cfg("schema = 1", "[pad]", f'{key} = "{path}"') as c:
+                with Cfg("schema = 1", "[pad]", f"{key} = {toml_str(path)}") as c:
                     f = config_invalid(probe("--load", c.path, "get"))
                     assert f["key"] == f"pad.{key}" and f["line"] == "3", (key, path, f)
                     assert needle in f["detail"], (key, path, f)

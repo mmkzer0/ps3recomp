@@ -50,39 +50,36 @@ set_tests_properties(lock_line PROPERTIES
     LABELS "runtime;syscalls;t0"
     TIMEOUT 30
 )
-add_executable(test_event_flag
-    test_event_flag.c
-    "${PS3RECOMP_ROOT}/runtime/syscalls/sys_event.c"
-    "${PS3RECOMP_ROOT}/runtime/diag/stop.cpp"
-    "${PS3RECOMP_ROOT}/tests/sync_stress/test_shims.c"
-)
-target_include_directories(test_event_flag PRIVATE
-    "${PS3RECOMP_ROOT}/runtime/syscalls"
-    "${PS3RECOMP_ROOT}/runtime"
-    "${PS3RECOMP_ROOT}/runtime/ppu"
-    "${PS3RECOMP_ROOT}/include"
-)
-if(MSVC)
-    target_compile_definitions(test_event_flag PRIVATE _CRT_SECURE_NO_WARNINGS)
-else()
+# The event flag test drives its waiters with pthreads, so it is POSIX only for now: the toolkit also builds on
+# Windows, where this target and test are not defined.
+if(NOT WIN32)
+    add_executable(test_event_flag
+        test_event_flag.c
+        "${PS3RECOMP_ROOT}/runtime/syscalls/sys_event.c"
+        "${PS3RECOMP_ROOT}/runtime/diag/stop.cpp"
+        "${PS3RECOMP_ROOT}/tests/sync_stress/test_shims.c"
+        # sys_event.c's timed waits run on the monotonic budget of runtime/platform/host_wait.c.
+        "${PS3RECOMP_ROOT}/runtime/platform/host_clock.c"
+        "${PS3RECOMP_ROOT}/runtime/platform/host_wait.c"
+    )
+    target_include_directories(test_event_flag PRIVATE
+        "${PS3RECOMP_ROOT}/runtime/syscalls"
+        "${PS3RECOMP_ROOT}/runtime"
+        "${PS3RECOMP_ROOT}/runtime/ppu"
+        "${PS3RECOMP_ROOT}/include"
+    )
     target_compile_options(test_event_flag PRIVATE -Wall -Wextra -Wno-unused-parameter)
     find_package(Threads REQUIRED)
     target_link_libraries(test_event_flag PRIVATE Threads::Threads)
-endif()
-# sys_event.c now reaches ps3_stop, whose implementation is C++.
-set_target_properties(test_event_flag PROPERTIES LINKER_LANGUAGE CXX)
-if(NOT WIN32)
-    # sys_event.c's timed waits run on the monotonic budget of runtime/platform/host_wait.c.
-    target_sources(test_event_flag PRIVATE
-        "${PS3RECOMP_ROOT}/runtime/platform/host_clock.c"
-        "${PS3RECOMP_ROOT}/runtime/platform/host_wait.c")
-endif()
+    # sys_event.c now reaches ps3_stop, whose implementation is C++.
+    set_target_properties(test_event_flag PROPERTIES LINKER_LANGUAGE CXX)
 
-add_test(NAME event_flag COMMAND test_event_flag)
-set_tests_properties(event_flag PROPERTIES
-    LABELS "runtime;t0;tsan"
-    TIMEOUT 30
-)
+    add_test(NAME event_flag COMMAND test_event_flag)
+    set_tests_properties(event_flag PROPERTIES
+        LABELS "runtime;t0;tsan"
+        TIMEOUT 30
+    )
+endif()
 
 # A push_by_id failure with no sender to report it to (SPU completion, mailbox,
 # group-stop) is a named stop, not a dropped event. The stop ends the probe, so

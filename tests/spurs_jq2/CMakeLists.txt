@@ -38,127 +38,131 @@ target_link_libraries(test_jq2_sched PRIVATE ps3recomp_spurs_jq2_model)
 add_test(NAME jq2_sched COMMAND test_jq2_sched)
 set_tests_properties(jq2_sched PROPERTIES LABELS "spurs;t0")
 
-set(JQ2_SPU_DIR "${PROJECT_SOURCE_DIR}/runtime/spu")
-add_executable(test_jq2_port
-    test_jq2_port.cpp
-    jq2_port_harness.c
-    "${PROJECT_SOURCE_DIR}/libs/spurs/jq2/port.cpp"
-    "${PROJECT_SOURCE_DIR}/runtime/memory/reservation.c"
-    "${PROJECT_SOURCE_DIR}/runtime/memory/label_window.c"
-    "${JQ2_SPU_DIR}/spu_channels.c" "${JQ2_SPU_DIR}/spu_drain.c" "${JQ2_SPU_DIR}/spu_lockstep.c"
-    "${JQ2_SPU_DIR}/spu_coherency.c" "${JQ2_SPU_DIR}/spu_workload.c" "${JQ2_SPU_DIR}/spurs_policy.c"
-    "${JQ2_SPU_DIR}/spurs_job.c" "${JQ2_SPU_DIR}/spu_tsp_weak.c" "${JQ2_SPU_DIR}/spu_vm_pagemap.c"
-    "${JQ2_SPU_DIR}/spurs_policy_blob_weak.c" "${JQ2_SPU_DIR}/spu_interp.c"
-    "${PROJECT_SOURCE_DIR}/runtime/platform/win32_compat.c"
-    "${PROJECT_SOURCE_DIR}/runtime/platform/host_clock.c"
-    "${PROJECT_SOURCE_DIR}/runtime/platform/host_wait.c"
-    # spu_dma.h calls the typed configuration and the named-stop runtime directly.
-    "${PROJECT_SOURCE_DIR}/runtime/config/config.cpp"
-    "${PROJECT_SOURCE_DIR}/runtime/diag/stop.cpp"
-)
-target_include_directories(test_jq2_port PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}"
-    "${PROJECT_SOURCE_DIR}/runtime"
-    "${PROJECT_SOURCE_DIR}/runtime/memory"
-    "${JQ2_SPU_DIR}"
-    "${PROJECT_SOURCE_DIR}/runtime/ppu"
-    "${PROJECT_SOURCE_DIR}/runtime/platform"
-    "${PROJECT_SOURCE_DIR}/include"
-)
-find_package(Threads REQUIRED)
-target_link_libraries(test_jq2_port PRIVATE ps3recomp_spurs_jq2_model Threads::Threads m)
-# The runtime sources include C++ (config, stop): link with the C++ driver.
-set_target_properties(test_jq2_port PROPERTIES LINKER_LANGUAGE CXX)
+# The port line and the executor are POSIX only for now (aligned_alloc, sys/mman.h guest arenas, fork for
+# the stop modes): the toolkit also builds on Windows, where these targets and tests are not defined.
+if(NOT WIN32)
+    set(JQ2_SPU_DIR "${PROJECT_SOURCE_DIR}/runtime/spu")
+    add_executable(test_jq2_port
+        test_jq2_port.cpp
+        jq2_port_harness.c
+        "${PROJECT_SOURCE_DIR}/libs/spurs/jq2/port.cpp"
+        "${PROJECT_SOURCE_DIR}/runtime/memory/reservation.c"
+        "${PROJECT_SOURCE_DIR}/runtime/memory/label_window.c"
+        "${JQ2_SPU_DIR}/spu_channels.c" "${JQ2_SPU_DIR}/spu_drain.c" "${JQ2_SPU_DIR}/spu_lockstep.c"
+        "${JQ2_SPU_DIR}/spu_coherency.c" "${JQ2_SPU_DIR}/spu_workload.c" "${JQ2_SPU_DIR}/spurs_policy.c"
+        "${JQ2_SPU_DIR}/spurs_job.c" "${JQ2_SPU_DIR}/spu_tsp_weak.c" "${JQ2_SPU_DIR}/spu_vm_pagemap.c"
+        "${JQ2_SPU_DIR}/spurs_policy_blob_weak.c" "${JQ2_SPU_DIR}/spu_interp.c"
+        "${PROJECT_SOURCE_DIR}/runtime/platform/win32_compat.c"
+        "${PROJECT_SOURCE_DIR}/runtime/platform/host_clock.c"
+        "${PROJECT_SOURCE_DIR}/runtime/platform/host_wait.c"
+        # spu_dma.h calls the typed configuration and the named-stop runtime directly.
+        "${PROJECT_SOURCE_DIR}/runtime/config/config.cpp"
+        "${PROJECT_SOURCE_DIR}/runtime/diag/stop.cpp"
+    )
+    target_include_directories(test_jq2_port PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${PROJECT_SOURCE_DIR}/runtime"
+        "${PROJECT_SOURCE_DIR}/runtime/memory"
+        "${JQ2_SPU_DIR}"
+        "${PROJECT_SOURCE_DIR}/runtime/ppu"
+        "${PROJECT_SOURCE_DIR}/runtime/platform"
+        "${PROJECT_SOURCE_DIR}/include"
+    )
+    find_package(Threads REQUIRED)
+    target_link_libraries(test_jq2_port PRIVATE ps3recomp_spurs_jq2_model Threads::Threads m)
+    # The runtime sources include C++ (config, stop): link with the C++ driver.
+    set_target_properties(test_jq2_port PROPERTIES LINKER_LANGUAGE CXX)
 
-add_test(NAME jq2_port_model COMMAND test_jq2_port model)
-add_test(NAME jq2_port_guest COMMAND test_jq2_port guest)
-add_test(NAME jq2_port_claim COMMAND test_jq2_port claim)
-add_test(NAME jq2_port_race COMMAND test_jq2_port race 200000)
-set_tests_properties(jq2_port_model jq2_port_guest jq2_port_claim jq2_port_race
-    PROPERTIES LABELS "spurs;t0;tsan" TIMEOUT 300)
+    add_test(NAME jq2_port_model COMMAND test_jq2_port model)
+    add_test(NAME jq2_port_guest COMMAND test_jq2_port guest)
+    add_test(NAME jq2_port_claim COMMAND test_jq2_port claim)
+    add_test(NAME jq2_port_race COMMAND test_jq2_port race 200000)
+    set_tests_properties(jq2_port_model jq2_port_guest jq2_port_claim jq2_port_race
+        PROPERTIES LABELS "spurs;t0;tsan" TIMEOUT 300)
 
-add_test(NAME jq2_port_race_stress COMMAND test_jq2_port race 10000000)
-set_tests_properties(jq2_port_race_stress PROPERTIES LABELS "spurs;stress" TIMEOUT 7200)
+    add_test(NAME jq2_port_race_stress COMMAND test_jq2_port race 10000000)
+    set_tests_properties(jq2_port_race_stress PROPERTIES LABELS "spurs;stress" TIMEOUT 7200)
 
-# The HLE executor (libs/spurs/jq2/executor.cpp) through jq2.h, on the runtime
-# library it links (SPU interpreter, SPURS job loader, LV2 event flags, named
-# stops). One mode per process. The stop modes fork and expect exit status 70.
-#
-#   jq2_exec_premature  S2: a store before admission reaches the job, after it does not
-#   jq2_exec_copy       S3 and the descriptor pool: snapshot at push, slots return
-#   jq2_exec_credit     1000 jobs, 2 workers, 3 tags: dispatched == executed == credited
-#   jq2_exec_wrap       a depth-4 ring wraps under two workers
-#   jq2_exec_barrier    SYNC order, overtaking, the out-of-order mark in guest memory
-#   jq2_exec_sync       Port2Sync modes 0 and 4, BUSY, INVAL for every other mode
-#   jq2_exec_sync_concurrent  several PPU threads blocked in mode 0 at once, each woken by its own credits
-#   jq2_exec_join       Shutdown / Join with outstanding jobs (L1), caller-owned buffers (L2)
-#   jq2_exec_stop_waiter_id, _waiter_alloc, _wait, _fiber_notify  jq2-wake: a waiter id above 63, a 64th blocked Sync, a failed wait, a kind-0 waiter that is no fiber
-#   jq2_exec_stop_push_shutdown, _copy_push_shutdown  jq2-state: a push that lands after Shutdown
-#   jq2_exec_desc_sizes  every descriptor size the firmware accepts (64, 128..896) through ring, admission and loader on a maxDescriptor 896 queue
-#   jq2_exec_stop_push_size0, _copy_push_size0  jq2-unmodelled: the firmware accepts size 0, the HLE models no 0-byte descriptor
-#   jq2_exec_push_block, _pushsync_block, _push_block_copy  a push without flags bit 2 on a full ring waits (a pusher parked by ExecutorHooks::on_push_blocked, released when intake resumes) and lands in order
-#   jq2_exec_push_nonblock  flags bit 2 on a full ring: AGAIN, nothing written, B rolled back
-#   jq2_exec_push_flags  PushJob flags & ~7, CopyPush flags & ~3, PushSync flags & ~4 are A02 first
-#   jq2_exec_stop_push_block_shutdown  jq2-unmodelled: a pusher parked on a full ring when Shutdown runs
-#   jq2_exec_stop_push_flag1, _copy_push_flag1  jq2-unmodelled: flag bit 1, stored for the PM by the firmware, is not decoded
-#   jq2_exec_observer   the job observer: layout at start, r3 at end, off when removed
-#   jq2_exec_validate   every guard and status code of jq2.h
-#   jq2_exec_lifted     a lifted-style body returns normally: executed and credited once
-#   jq2_exec_stop_*     a job that stops or halts (interpreted or lifted), another CRT, a ring entry nobody models
-# host_stubs.c satisfies the PPU-loader symbols the runtime's HLE modules name,
-# as a game-less host does.
-add_executable(test_jq2_executor test_jq2_executor.cpp
-    "${PROJECT_SOURCE_DIR}/runtime/host/host_stubs.c")
-target_include_directories(test_jq2_executor PRIVATE "${PROJECT_SOURCE_DIR}/runtime/spu"
-    "${PROJECT_SOURCE_DIR}/runtime" "${PROJECT_SOURCE_DIR}/include")
-target_link_libraries(test_jq2_executor PRIVATE ps3recomp_spurs_jq2 Threads::Threads)
-# The runtime carries C++ and Objective-C, so the C++ driver links.
-set_target_properties(test_jq2_executor PROPERTIES LINKER_LANGUAGE CXX)
-foreach(mode premature copy credit wrap barrier sync join observer validate lifted layout layout-896 jm-wait heap-fit
-              stop-job stop-halt stop-jm stop-jm-lifted stop-heap stop-unmodelled stop-crt stop-ring
-              sync-concurrent waiter-fresh waiter-63 stop-waiter-id waiter-64-nowake stop-waiter-64-wake stop-wait stop-fiber-notify
-              stop-push-shutdown stop-copy-push-shutdown desc-sizes stop-push-size0 stop-copy-push-size0
-              push-block push-nonblock pushsync-block push-block-copy push-flags stop-push-block-shutdown
-              stop-push-flag1 stop-copy-push-flag1)
-    string(REPLACE "-" "_" name "${mode}")
-    add_test(NAME jq2_exec_${name} COMMAND test_jq2_executor ${mode})
-    set_tests_properties(jq2_exec_${name} PROPERTIES LABELS "spurs;t0;tsan" TIMEOUT 300)
-endforeach()
+    # The HLE executor (libs/spurs/jq2/executor.cpp) through jq2.h, on the runtime
+    # library it links (SPU interpreter, SPURS job loader, LV2 event flags, named
+    # stops). One mode per process. The stop modes fork and expect exit status 70.
+    #
+    #   jq2_exec_premature  S2: a store before admission reaches the job, after it does not
+    #   jq2_exec_copy       S3 and the descriptor pool: snapshot at push, slots return
+    #   jq2_exec_credit     1000 jobs, 2 workers, 3 tags: dispatched == executed == credited
+    #   jq2_exec_wrap       a depth-4 ring wraps under two workers
+    #   jq2_exec_barrier    SYNC order, overtaking, the out-of-order mark in guest memory
+    #   jq2_exec_sync       Port2Sync modes 0 and 4, BUSY, INVAL for every other mode
+    #   jq2_exec_sync_concurrent  several PPU threads blocked in mode 0 at once, each woken by its own credits
+    #   jq2_exec_join       Shutdown / Join with outstanding jobs (L1), caller-owned buffers (L2)
+    #   jq2_exec_stop_waiter_id, _waiter_alloc, _wait, _fiber_notify  jq2-wake: a waiter id above 63, a 64th blocked Sync, a failed wait, a kind-0 waiter that is no fiber
+    #   jq2_exec_stop_push_shutdown, _copy_push_shutdown  jq2-state: a push that lands after Shutdown
+    #   jq2_exec_desc_sizes  every descriptor size the firmware accepts (64, 128..896) through ring, admission and loader on a maxDescriptor 896 queue
+    #   jq2_exec_stop_push_size0, _copy_push_size0  jq2-unmodelled: the firmware accepts size 0, the HLE models no 0-byte descriptor
+    #   jq2_exec_push_block, _pushsync_block, _push_block_copy  a push without flags bit 2 on a full ring waits (a pusher parked by ExecutorHooks::on_push_blocked, released when intake resumes) and lands in order
+    #   jq2_exec_push_nonblock  flags bit 2 on a full ring: AGAIN, nothing written, B rolled back
+    #   jq2_exec_push_flags  PushJob flags & ~7, CopyPush flags & ~3, PushSync flags & ~4 are A02 first
+    #   jq2_exec_stop_push_block_shutdown  jq2-unmodelled: a pusher parked on a full ring when Shutdown runs
+    #   jq2_exec_stop_push_flag1, _copy_push_flag1  jq2-unmodelled: flag bit 1, stored for the PM by the firmware, is not decoded
+    #   jq2_exec_observer   the job observer: layout at start, r3 at end, off when removed
+    #   jq2_exec_validate   every guard and status code of jq2.h
+    #   jq2_exec_lifted     a lifted-style body returns normally: executed and credited once
+    #   jq2_exec_stop_*     a job that stops or halts (interpreted or lifted), another CRT, a ring entry nobody models
+    # host_stubs.c satisfies the PPU-loader symbols the runtime's HLE modules name,
+    # as a game-less host does.
+    add_executable(test_jq2_executor test_jq2_executor.cpp
+        "${PROJECT_SOURCE_DIR}/runtime/host/host_stubs.c")
+    target_include_directories(test_jq2_executor PRIVATE "${PROJECT_SOURCE_DIR}/runtime/spu"
+        "${PROJECT_SOURCE_DIR}/runtime" "${PROJECT_SOURCE_DIR}/include")
+    target_link_libraries(test_jq2_executor PRIVATE ps3recomp_spurs_jq2 Threads::Threads)
+    # The runtime carries C++ and Objective-C, so the C++ driver links.
+    set_target_properties(test_jq2_executor PROPERTIES LINKER_LANGUAGE CXX)
+    foreach(mode premature copy credit wrap barrier sync join observer validate lifted layout layout-896 jm-wait heap-fit
+                  stop-job stop-halt stop-jm stop-jm-lifted stop-heap stop-unmodelled stop-crt stop-ring
+                  sync-concurrent waiter-fresh waiter-63 stop-waiter-id waiter-64-nowake stop-waiter-64-wake stop-wait stop-fiber-notify
+                  stop-push-shutdown stop-copy-push-shutdown desc-sizes stop-push-size0 stop-copy-push-size0
+                  push-block push-nonblock pushsync-block push-block-copy push-flags stop-push-block-shutdown
+                  stop-push-flag1 stop-copy-push-flag1)
+        string(REPLACE "-" "_" name "${mode}")
+        add_test(NAME jq2_exec_${name} COMMAND test_jq2_executor ${mode})
+        set_tests_properties(jq2_exec_${name} PROPERTIES LABELS "spurs;t0;tsan" TIMEOUT 300)
+    endforeach()
 
-# The jq2 ftrace spans (ps3_ftrace.h kinds 22-28), read back from the recorder's buffer after the threads that
-# write it are joined. The mode sets PS3_FTRACE itself (trace-off clears it): the recorder reads it once.
-#
-#   jq2_exec_trace_spans       PUSH/JOB/CREDIT per (q, seq), depth, thread CPU time, IDLE of parked workers
-#   jq2_exec_trace_sync        one SYNC_WAIT per blocking Port2Sync, keyed by waiter; none without blocking
-#   jq2_exec_trace_queues      q per queue in creation order, the creation line, q saturating at 255
-#   jq2_exec_trace_concurrent  four pushing threads: seq unique and gapless
-#   jq2_exec_trace_held        HELD and BARRIER for a job a SYNC held, IDLE's reason byte (empty and held)
-#   jq2_exec_trace_off         no span recorded with tracing off
-foreach(mode trace-spans trace-sync trace-queues trace-concurrent trace-held trace-off)
-    string(REPLACE "-" "_" name "${mode}")
-    add_test(NAME jq2_exec_${name} COMMAND test_jq2_executor ${mode})
-    set_tests_properties(jq2_exec_${name} PROPERTIES LABELS "spurs;t0;tsan" TIMEOUT 300)
-endforeach()
+    # The jq2 ftrace spans (ps3_ftrace.h kinds 22-28), read back from the recorder's buffer after the threads that
+    # write it are joined. The mode sets PS3_FTRACE itself (trace-off clears it): the recorder reads it once.
+    #
+    #   jq2_exec_trace_spans       PUSH/JOB/CREDIT per (q, seq), depth, thread CPU time, IDLE of parked workers
+    #   jq2_exec_trace_sync        one SYNC_WAIT per blocking Port2Sync, keyed by waiter; none without blocking
+    #   jq2_exec_trace_queues      q per queue in creation order, the creation line, q saturating at 255
+    #   jq2_exec_trace_concurrent  four pushing threads: seq unique and gapless
+    #   jq2_exec_trace_held        HELD and BARRIER for a job a SYNC held, IDLE's reason byte (empty and held)
+    #   jq2_exec_trace_off         no span recorded with tracing off
+    foreach(mode trace-spans trace-sync trace-queues trace-concurrent trace-held trace-off)
+        string(REPLACE "-" "_" name "${mode}")
+        add_test(NAME jq2_exec_${name} COMMAND test_jq2_executor ${mode})
+        set_tests_properties(jq2_exec_${name} PROPERTIES LABELS "spurs;t0;tsan" TIMEOUT 300)
+    endforeach()
 
-# Job image identity (kind 29 and the J table in the dump): the image of each job, fingerprinted from the bytes the
-# loader staged, in a process-wide table of (fingerprint, image EA, size).
-#
-#   jq2_exec_trace_image_two         two images, two entries; fingerprints are the FNV of the staged bytes; IMAGE inside JOB
-#   jq2_exec_trace_image_same        one image run again: one entry, the same index
-#   jq2_exec_trace_image_changed     bytes changed in place at one EA and size: a new entry, restored bytes find the first
-#   jq2_exec_trace_image_moved       the same bytes at a second EA: a new entry, the same fingerprint
-#   jq2_exec_trace_image_overflow    1024-slot table through the recorder: overflow counted, J lines and header in the dump
-#   jq2_exec_trace_image_concurrent  four workers on shared and distinct images: one index per triple, one triple per index
-#   jq2_exec_trace_image_off         tracing off: no IMAGE span, no J entry, the jobs run
-#   jq2_exec_trace_image_observer    the observer's loader path identifies the image too, the observer still runs
-foreach(mode trace-image-two trace-image-same trace-image-changed trace-image-moved trace-image-overflow
-              trace-image-off trace-image-observer)
-    string(REPLACE "-" "_" name "${mode}")
-    add_test(NAME jq2_exec_${name} COMMAND test_jq2_executor ${mode})
-    set_tests_properties(jq2_exec_${name} PROPERTIES LABELS "spurs;t0" TIMEOUT 300)
-endforeach()
-add_test(NAME jq2_exec_trace_image_concurrent COMMAND test_jq2_executor trace-image-concurrent)
-set_tests_properties(jq2_exec_trace_image_concurrent PROPERTIES LABELS "spurs;t0;tsan" TIMEOUT 300)
+    # Job image identity (kind 29 and the J table in the dump): the image of each job, fingerprinted from the bytes the
+    # loader staged, in a process-wide table of (fingerprint, image EA, size).
+    #
+    #   jq2_exec_trace_image_two         two images, two entries; fingerprints are the FNV of the staged bytes; IMAGE inside JOB
+    #   jq2_exec_trace_image_same        one image run again: one entry, the same index
+    #   jq2_exec_trace_image_changed     bytes changed in place at one EA and size: a new entry, restored bytes find the first
+    #   jq2_exec_trace_image_moved       the same bytes at a second EA: a new entry, the same fingerprint
+    #   jq2_exec_trace_image_overflow    1024-slot table through the recorder: overflow counted, J lines and header in the dump
+    #   jq2_exec_trace_image_concurrent  four workers on shared and distinct images: one index per triple, one triple per index
+    #   jq2_exec_trace_image_off         tracing off: no IMAGE span, no J entry, the jobs run
+    #   jq2_exec_trace_image_observer    the observer's loader path identifies the image too, the observer still runs
+    foreach(mode trace-image-two trace-image-same trace-image-changed trace-image-moved trace-image-overflow
+                  trace-image-off trace-image-observer)
+        string(REPLACE "-" "_" name "${mode}")
+        add_test(NAME jq2_exec_${name} COMMAND test_jq2_executor ${mode})
+        set_tests_properties(jq2_exec_${name} PROPERTIES LABELS "spurs;t0" TIMEOUT 300)
+    endforeach()
+    add_test(NAME jq2_exec_trace_image_concurrent COMMAND test_jq2_executor trace-image-concurrent)
+    set_tests_properties(jq2_exec_trace_image_concurrent PROPERTIES LABELS "spurs;t0;tsan" TIMEOUT 300)
+endif()
 
 # cellSpursJq HLE surface: the 17 firmware imports through ps3_hle_call.
 # The table is generated from cellSpursJq.c, so the test's dispatch is exactly
@@ -215,15 +219,19 @@ target_link_libraries(test_jq2_pool PRIVATE ps3recomp_spurs_jq2 Threads::Threads
 add_test(NAME jq2_pool COMMAND test_jq2_pool)
 set_tests_properties(jq2_pool PROPERTIES LABELS "spurs;t0;tsan" TIMEOUT 120)
 
-add_executable(test_jq2_range test_jq2_range.cpp
-    "${PROJECT_SOURCE_DIR}/runtime/host/host_stubs.c")
-target_include_directories(test_jq2_range PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}"
-    "${PROJECT_SOURCE_DIR}/libs/spurs"
-    "${PROJECT_SOURCE_DIR}/runtime/spu"
-    "${PROJECT_SOURCE_DIR}/include"
-)
-target_link_libraries(test_jq2_range PRIVATE ps3recomp_spurs_jq2 ps3recomp_runtime Threads::Threads)
-set_target_properties(test_jq2_range PROPERTIES LINKER_LANGUAGE CXX)
-add_test(NAME jq2_range COMMAND test_jq2_range)
-set_tests_properties(jq2_range PROPERTIES LABELS "spurs;t0" TIMEOUT 120)
+# POSIX only for now (sys/mman.h guest arena): the toolkit also builds on Windows, where this target and
+# test are not defined.
+if(NOT WIN32)
+    add_executable(test_jq2_range test_jq2_range.cpp
+        "${PROJECT_SOURCE_DIR}/runtime/host/host_stubs.c")
+    target_include_directories(test_jq2_range PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${PROJECT_SOURCE_DIR}/libs/spurs"
+        "${PROJECT_SOURCE_DIR}/runtime/spu"
+        "${PROJECT_SOURCE_DIR}/include"
+    )
+    target_link_libraries(test_jq2_range PRIVATE ps3recomp_spurs_jq2 ps3recomp_runtime Threads::Threads)
+    set_target_properties(test_jq2_range PROPERTIES LINKER_LANGUAGE CXX)
+    add_test(NAME jq2_range COMMAND test_jq2_range)
+    set_tests_properties(jq2_range PROPERTIES LABELS "spurs;t0" TIMEOUT 120)
+endif()

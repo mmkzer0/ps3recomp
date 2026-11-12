@@ -1,0 +1,166 @@
+# Windows CI for this fork's `dev` branch. Like dev-ci.yml it runs only when
+# someone dispatches it:
+#
+#   gh workflow run dev-ci-windows.yml --ref dev
+#
+# The toolkit as a Windows port builds it: clang-cl from Visual Studio 2022,
+# Ninja, the Vulkan backend with its SPIR-V translator (the Vulkan SDK's
+# glslang) and SDL2 for its window. CTest's t0 tier then runs, for Debug (dev)
+# and Release. Tests whose fixtures are POSIX-only (mmap guest arenas, pthreads,
+# fork) are not defined on Windows; every test that is defined must pass.
+#
+# The runner has no GPU, so the Vulkan tests (label gpu) run on Mesa's lavapipe,
+# a CPU Vulkan driver, through a Khronos loader built from its SDK tag. They
+# must run there: a gpu test that skips, or that did not pick lavapipe, fails
+# the job.
+#
+# Every input is synthetic and lives in the tree. No game, firmware or other
+# such material is downloaded; the only downloads are the SDKs and drivers
+# below, pinned by version and SHA-256 (or tag), and cached.
+name: dev-ci-windows
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dev-ci-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The SDK that docs/BUILDING.md's scoop install gives; scoop's manifest has the same hash.
+  VULKAN_SDK_VERSION: 1.4.363.1
+  VULKAN_SDK_SHA256: c02932bd9a968b22d404536108adaacac908c081cd6b0113f5bfefc523dd0a6a
+  # The SDK installs no loader (vulkan-1.dll) with copy_only, and a runner has none.
+  VULKAN_LOADER_TAG: vulkan-sdk-1.4.363.0
+  SDL2_VERSION: 2.32.10
+  SDL2_SHA256: af347939395a58b365846aaea27391e69f9ec9d4dd650d6ac40802159b418a6e
+  # pal1000/mesa-dist-win's MSVC build; the hash is the one GitHub lists for the asset.
+  MESA_VERSION: 26.2.6
+  MESA_SHA256: b2e00615feaba45942343c265cc8c5f576142ca682c1ac6661922d4b72492877
+  DEPS: C:\deps
+
+jobs:
+  windows:
+    name: windows-2022 x64 clang-cl (${{ matrix.preset }})
+    runs-on: windows-2022
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [dev, release]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # cl's headers and libraries, which clang-cl compiles and links against, and
+      # clang-cl itself (Visual Studio's LLVM component).
+      - name: Set up the MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install Ninja
+        run: choco install ninja -y --no-progress
+
+      - name: Restore the dependency cache
+        id: deps-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.DEPS }}
+          key: windows-deps-vk${{ env.VULKAN_SDK_VERSION }}-${{ env.VULKAN_LOADER_TAG }}-sdl${{ env.SDL2_VERSION }}-mesa${{ env.MESA_VERSION }}-v2
+
+      # The Vulkan SDK installs as scoop installs it (copy only: no system runtime, no registry).
+      # SDL2 is laid out as scoop's sdl2 lays it out, the prefix CMakeLists.txt looks in:
+      # include/SDL2/SDL.h, lib/SDL2.lib, lib/SDL2.dll. Of Mesa only lavapipe is kept.
+      - name: Download the Vulkan SDK, SDL2 and lavapipe
+        if: steps.deps-cache.outputs.cache-hit != 'true'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          function Get-Pinned($url, $sha, $out) {
+            Invoke-WebRequest $url -OutFile $out -UserAgent 'Mozilla/5.0'
+            $got = (Get-FileHash $out -Algorithm SHA256).Hash
+            if ($got -ne $sha) { throw "${out}: SHA-256 $got, expected $sha" }
+          }
+          $v = $env:VULKAN_SDK_VERSION
+          Get-Pinned "https://sdk.lunarg.com/sdk/download/$v/windows/vulkansdk-windows-X64-$v.exe" $env:VULKAN_SDK_SHA256 vksdk.exe
+          $p = Start-Process .\vksdk.exe -Wait -PassThru -ArgumentList @(
+            '--root', "$env:DEPS\vulkan", '--accept-licenses', '--accept-messages',
+            '--confirm-command', 'install', 'copy_only=1')
+          if ($p.ExitCode -ne 0) { throw "Vulkan SDK installer: exit $($p.ExitCode)" }
+          if (-not (Test-Path "$env:DEPS\vulkan\Lib\glslang.lib")) { throw 'Vulkan SDK: no glslang.lib' }
+
+          $s = $env:SDL2_VERSION
+          Get-Pinned "https://github.com/libsdl-org/SDL/releases/download/release-$s/SDL2-devel-$s-VC.zip" $env:SDL2_SHA256 sdl2.zip
+          Expand-Archive sdl2.zip -DestinationPath sdl2-src
+          New-Item -ItemType Directory -Force "$env:DEPS\sdl2\include\SDL2", "$env:DEPS\sdl2\lib" | Out-Null
+          Copy-Item "sdl2-src\SDL2-$s\include\*.h" "$env:DEPS\sdl2\include\SDL2"
+          Copy-Item "sdl2-src\SDL2-$s\lib\x64\*" "$env:DEPS\sdl2\lib"
+
+          $m = $env:MESA_VERSION
+          Get-Pinned "https://github.com/pal1000/mesa-dist-win/releases/download/$m/mesa3d-$m-release-msvc.7z" $env:MESA_SHA256 mesa.7z
+          7z x -y "-o$env:DEPS\mesa" mesa.7z 'x64/*lvp*'
+          if ($LASTEXITCODE -ne 0) { throw "7z: exit $LASTEXITCODE" }
+          foreach ($f in 'vulkan_lvp.dll', 'lvp_icd.x86_64.json') {
+            if (-not (Test-Path "$env:DEPS\mesa\x64\$f")) { throw "mesa: no x64\$f extracted" }
+          }
+
+      - name: Build the Vulkan loader
+        if: steps.deps-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone -q --depth 1 -b $env:VULKAN_LOADER_TAG https://github.com/KhronosGroup/Vulkan-Loader vk-loader
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          cmake -S vk-loader -B vk-loader/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DUPDATE_DEPS=ON -DBUILD_TESTS=OFF
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          cmake --build vk-loader/build
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          New-Item -ItemType Directory -Force "$env:DEPS\vulkan-loader" | Out-Null
+          Copy-Item vk-loader/build/loader/vulkan-1.dll "$env:DEPS\vulkan-loader"
+
+      - name: Point CMake at the SDKs
+        run: |
+          "VULKAN_SDK=$env:DEPS\vulkan" >> $env:GITHUB_ENV
+          "CMAKE_PREFIX_PATH=$env:DEPS\sdl2" >> $env:GITHUB_ENV
+
+      - name: Show the toolchain
+        run: |
+          clang-cl --version
+          ninja --version
+          cmake --version
+
+      # PS3RECOMP_SPIRV_REQUIRED: a lost glslang is a configure error, never a stubbed translator.
+      - name: Configure
+        run: >-
+          cmake --preset ${{ matrix.preset }}
+          -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl
+          -DPS3RECOMP_RSX_VULKAN=ON -DPS3RECOMP_SPIRV_REQUIRED=ON
+
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }}
+
+      - name: Test
+        # As in dev-ci.yml: the dev configure preset's tier-filtered test preset is `t0`.
+        run: ctest --preset ${{ matrix.preset == 'dev' && 't0' || matrix.preset }} -LE '^gpu$'
+
+      # The loader goes beside the test programs, which Windows searches before anything else. The
+      # runner's processes are elevated, and an elevated loader ignores VK_DRIVER_FILES, so lavapipe is
+      # registered where an installed driver would be; the runner has no other.
+      - name: Vulkan tests on lavapipe
+        run: |
+          Copy-Item "$env:DEPS\vulkan-loader\vulkan-1.dll" "build\${{ matrix.preset }}"
+          $drivers = 'HKLM:\SOFTWARE\Khronos\Vulkan\Drivers'
+          if (-not (Test-Path $drivers)) { New-Item -Path $drivers -Force | Out-Null }
+          New-ItemProperty -Path $drivers -Name "$env:DEPS\mesa\x64\lvp_icd.x86_64.json" -PropertyType DWord -Value 0 -Force | Out-Null
+          $log = ctest --test-dir "build/${{ matrix.preset }}" -L '^gpu$' --no-tests=error -V 2>&1
+          $rc = $LASTEXITCODE
+          $log
+          if ($rc -ne 0) { exit 1 }
+          # A gpu test that skipped never reached a device; one that ran elsewhere proves nothing here.
+          if ($log -match '\*\*\*Skipped') { Write-Output '::error::a gpu test skipped on lavapipe'; exit 1 }
+          if (-not ($log -match 'using device \d+: llvmpipe')) { Write-Output '::error::no gpu test ran on llvmpipe'; exit 1 }

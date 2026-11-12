@@ -57,3 +57,8 @@ gates_py_test(lifter_abi runtime test_lifter_abi.py
     $<TARGET_FILE:probe_lifter_abi_match>
     $<TARGET_FILE:probe_lifter_abi_mismatch>
     ${PROJECT_SOURCE_DIR})
+if(TEST lifter_abi)
+    # The link case builds with the compilers this tree is configured with, not whatever `cc` is.
+    set_property(TEST lifter_abi APPEND PROPERTY ENVIRONMENT
+        "CC=${CMAKE_C_COMPILER}" "CXX=${CMAKE_CXX_COMPILER}")
+endif()
