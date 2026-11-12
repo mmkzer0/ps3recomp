@@ -1372,7 +1372,8 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME lv2_syscall_status
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_lv2_syscall_status.py")
-        set_tests_properties(lv2_syscall_status PROPERTIES LABELS "tools;t0")
+        set_tests_properties(lv2_syscall_status PROPERTIES LABELS "tools;t0"
+            ENVIRONMENT "CC=${CMAKE_C_COMPILER}")
         # The lifter records the SHA-256 of the file it lifts; the runtime's
         # identity gate compares the loaded executable against it.
         add_test(NAME lifter_identity

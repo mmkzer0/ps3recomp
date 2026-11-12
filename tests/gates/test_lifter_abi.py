@@ -7,16 +7,18 @@ usage: test_lifter_abi.py <probe_match> <probe_mismatch> <source-root>
 
 The probes are the same source plus a stamp; the mismatch one is built with the
 stamp set to PPU_RUNTIME_LIFTER_ABI + 1, so it stays a mismatch when the ABI
-moves. The link case compiles the runtime's check and the probe without a stamp.
+moves. The link case compiles the runtime's check and the probe without a stamp,
+with the compilers CTest passes (CC, CXX), spelled for their driver.
 """
-import os
 import re
-import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
 import gates_common as g
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
+from host_cc import EXE, c_compiler, cxx_compiler  # noqa: E402
 
 MATCH = None
 MISMATCH = None
@@ -50,34 +52,29 @@ def test_mismatched_abi_stops_by_name():
     assert re.search(rf"^\s+got\s+{re.escape(f['got'])}$", p.stderr, re.M), p.stderr
 
 
-def _build(compiler, std, src, obj, include):
-    r = subprocess.run([compiler, std, "-O0", "-I", str(include), "-c", str(src),
-                        "-o", str(obj)], capture_output=True, text=True)
-    assert r.returncode == 0, f"compiling {src} failed:\n{r.stderr}"
-
-
 def test_lift_without_the_stamp_does_not_link():
     # The "sources lifted before the stamp existed" case: the runtime references
     # ppu_lifter_abi and the lift defines nothing, so the link must fail and name
     # the symbol -- a run that silently skipped the check would be the bug.
-    cc = os.environ.get("CC", "cc")
-    cxx = os.environ.get("CXX", "c++")
+    cc, cxx = c_compiler(), cxx_compiler()
+    assert cc and cxx, "no C or C++ compiler (CC/CXX unset and none on PATH)"
     include = Path(ROOT) / "include"
     with tempfile.TemporaryDirectory(prefix="lifter-abi-") as tmp:
         tmp = Path(tmp)
         objs = []
         for src, compiler, std, name in [
-            (Path(ROOT) / "runtime" / "diag" / "lifter_abi.c", cc, "-std=c11", "lifter_abi.o"),
-            (Path(ROOT) / "runtime" / "diag" / "stop.cpp", cxx, "-std=c++17", "stop.o"),
-            (Path(__file__).with_name("probe_lifter_abi.c"), cc, "-std=c11", "probe.o"),
+            (Path(ROOT) / "runtime" / "diag" / "lifter_abi.c", cc, "c11", "lifter_abi.o"),
+            (Path(ROOT) / "runtime" / "diag" / "stop.cpp", cxx, "c++17", "stop.o"),
+            (Path(__file__).with_name("probe_lifter_abi.c"), cc, "c11", "probe.o"),
         ]:
             obj = tmp / name
-            _build(compiler, std, src, obj, include)
+            r = compiler.run(compiler.obj(src, obj, std=std, includes=[include]))
+            assert r.returncode == 0, f"compiling {src} failed:\n{r.stdout}{r.stderr}"
             objs.append(obj)
-        r = subprocess.run([cxx, "-pthread", *map(str, objs), "-o", str(tmp / "probe")],
-                           capture_output=True, text=True)
+        r = cxx.run(cxx.exe(objs, tmp / ("probe" + EXE), flags=[] if cxx.msvc else ["-pthread"]))
+        out = r.stdout + r.stderr          # link.exe reports on stdout
         assert r.returncode != 0, "a lift without the ABI stamp linked; the gate can be skipped silently"
-        assert "ppu_lifter_abi" in r.stderr, r.stderr
+        assert "ppu_lifter_abi" in out, out
 
 
 if __name__ == "__main__":

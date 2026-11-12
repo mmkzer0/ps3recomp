@@ -20,11 +20,12 @@ slots out of the real data:
 
 It then compiles the generated bitmap and checks the same slots from C.
 """
-import os
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
+from host_cc import EXE, c_compiler
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOL = ROOT / "tools/lv2_syscall_status.py"
@@ -137,10 +138,11 @@ def main() -> int:
             '    puts("ok");\n'
             '    return 0;\n'
             '}\n')
-        exe = tmp / "check"
-        cc = os.environ.get("CC", "cc")
-        subprocess.run([cc, "-std=gnu17", "-I", str(tmp), str(prog), str(src),
-                        "-o", str(exe)], check=True)
+        exe = tmp / ("check" + EXE)
+        cc = c_compiler()
+        assert cc is not None, "no C compiler (CC unset and none on PATH)"
+        r = cc.run(cc.exe([prog, src], exe, std="gnu17", includes=[tmp]))
+        assert r.returncode == 0, f"compiling the bitmap check failed:\n{r.stdout}{r.stderr}"
         p = subprocess.run([str(exe)], capture_output=True, text=True)
         assert p.returncode == 0 and p.stdout.strip() == "ok", (p.stdout, p.stderr)
 
