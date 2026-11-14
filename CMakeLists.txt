@@ -1349,6 +1349,53 @@ if(PS3RECOMP_BUILD_TESTS)
             set_tests_properties(spu_runtime_tests PROPERTIES
                 LABELS "spu;t0" TIMEOUT 300
                 ENVIRONMENT "PYTHON=${Python3_EXECUTABLE}")
+            # The effect port seam: one synthetic job, generated and lifted at
+            # build time, run interpreted and lifted against the real runtime.
+            set(XDIFF_PORT_DIR "${CMAKE_BINARY_DIR}/spu_effect_port")
+            add_custom_command(
+                OUTPUT "${XDIFF_PORT_DIR}/xdiff_port_job.elf" "${XDIFF_PORT_DIR}/xdiff_port_job.h"
+                COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu/tests/gen_xdiff_port_job.py" "${XDIFF_PORT_DIR}"
+                DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu/tests/gen_xdiff_port_job.py"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tools/wrap_spu_elf.py"
+                VERBATIM)
+            add_custom_command(
+                OUTPUT "${XDIFF_PORT_DIR}/lift/spu_recomp.c" "${XDIFF_PORT_DIR}/lift/spu_recomp.h"
+                COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/spu_lifter.py"
+                    --auto-functions "${XDIFF_PORT_DIR}/xdiff_port_job.elf"
+                    --output "${XDIFF_PORT_DIR}/lift"
+                DEPENDS "${XDIFF_PORT_DIR}/xdiff_port_job.elf"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tools/spu_lifter.py"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tools/find_spu_functions.py"
+                VERBATIM)
+            add_executable(test_spu_effect_port
+                runtime/spu/tests/test_spu_effect_port.c
+                "${XDIFF_PORT_DIR}/lift/spu_recomp.c"
+                runtime/spu/spu_workload.c
+                runtime/spu/spurs_policy.c
+                runtime/spu/spurs_job.c
+                runtime/spu/spu_tsp_weak.c
+                runtime/spu/spurs_policy_blob_weak.c
+                runtime/spu/spu_channels.c
+                runtime/spu/spu_interp.c
+                runtime/spu/spu_coherency.c
+                runtime/spu/spu_lockstep.c
+                runtime/spu/spu_drain.c
+                runtime/spu/spu_vm_pagemap.c
+                runtime/memory/reservation.c
+                runtime/memory/label_window.c
+                runtime/platform/win32_compat.c
+                runtime/platform/host_clock.c
+                runtime/platform/host_wait.c
+                runtime/diag/lifter_abi.c
+                runtime/config/config.cpp
+                runtime/diag/stop.cpp)
+            target_include_directories(test_spu_effect_port PRIVATE
+                include runtime runtime/spu runtime/platform "${XDIFF_PORT_DIR}")
+            target_link_libraries(test_spu_effect_port PRIVATE m Threads::Threads)
+            add_test(NAME spu_effect_port COMMAND test_spu_effect_port)
+            set_tests_properties(spu_effect_port PROPERTIES LABELS "spu;t0" TIMEOUT 120)
         endif()
     endif()
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)

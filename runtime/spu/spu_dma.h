@@ -249,6 +249,8 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         for (uint32_t offset = 0; offset < size; offset += 128u)
             spu_coh_notify_write_except((uint32_t)ea + offset, spu);
         spu_lockline_unlock();
+        /* SDCRZ has no local-store operand: nothing is offered, `size` bytes of EA space are zeroed. */
+        spu_port_tap_xfer(spu, ea, 0, size, cmd & 0xFFFFu, tag, SPU_XFER_ZERO_EA, 0);
         return 0;
     }
     /* SPU_DMA_WATCH=<hex>: report any transfer whose destination RANGE covers
@@ -620,6 +622,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                 fprintf(stderr, "[nulldma] img%u GET ea=0x%08X size=%u -> ZEROED (skipped)\n",
                         spu->image_id, (uint32_t)ea, size);
             memset(ls_ptr, 0, size);
+            spu_port_tap_xfer(spu, ea, lsa, size, cmd & 0xFFFFu, tag, SPU_XFER_TO_LS, 0);   /* it changed local store */
             return 0;
         }
     }
@@ -866,6 +869,13 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
           } }
     }
 
+    /* One report per transfer that moved bytes, after they moved: a recorder reads them from
+     * local store at `lsa` (a GET landed, a PUT's source is still there). A zero-size transfer
+     * returned above; a command that is neither a GET nor a PUT moved nothing. */
+    if (mfc_is_get(cmd))
+        spu_port_tap_xfer(spu, ea, lsa, size, cmd & 0xFFFFu, tag, SPU_XFER_TO_LS, 0);
+    else if (mfc_is_put(cmd))
+        spu_port_tap_xfer(spu, ea, lsa, size, cmd & 0xFFFFu, tag, SPU_XFER_FROM_LS, 0);
     return 0;
 }
 
