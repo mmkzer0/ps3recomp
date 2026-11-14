@@ -955,7 +955,7 @@ line there and one row in `docs/CONFIG.md` (`:63`, `:185-186`).
 | `spu.xdiff_on_divergence` | `report` \| `stop` | `report` | what a `differ` does to the run |
 | `spu.xdiff_budget` | u32, 1.. | 2^28 | the shadow's budget (section 10) |
 | `spu.xdiff_dir` | path or empty | empty | where fixtures are written; empty: none |
-| `spu.xdiff_capture` | u32 | 0 | also write the first N sampled fixtures of each image, for a corpus |
+| `spu.xdiff_capture` | u32 | 0 | also write the first N fixtures of each image, for a corpus; with `spu.xdiff=off` the worker records the authority and no shadow runs (commit 10a) |
 
 **Roles are symmetric.** The authority is tapped; the other tier replays.
 `job_body=interp, xdiff=all` is the audit mode of #87; `job_body=lifted,
@@ -1123,10 +1123,10 @@ What is still missing, and what section 5.5 relies on:
 - **A compact inventory in the registration.** Today the report is a file
   for tools, and a registration carries only fingerprint, entry and image
   id. For the offline runner, which can read `inventory.json`, carrying it is
-  optional. For in-run xdiff (commit 10) it is required: the runtime can
-  refuse an image before its first job only for what its registration told
-  it. The same record would give `spu_xdiff_body_id` its `code_end` and
-  `lift_options`.
+  optional. For recording in a run and for in-run xdiff (commits 10a and
+  10b) it is required: the runtime can refuse an image before its first job
+  only for what its registration told it. The same record would give
+  `spu_xdiff_body_id` its `code_end` and `lift_options`.
 
 An inventory is an upper bound on a run. It never excuses a check at run
 time.
@@ -1195,7 +1195,7 @@ synthetic images (`runtime/spu/tests/gen_test_workload.py:1-33`,
 
 ## 14. Trace records
 
-*Decided; commits 10 and 11.* Two new kinds after the last one in use
+*Decided; commits 10b and 11.* Two new kinds after the last one in use
 (`PS3_FT_AUDIO_RING_VIEW = 31`, `ps3_ftrace.h:167`), in the existing 32-byte
 record (`:191`), both never filtered by duration, like kind 29:
 
@@ -1236,26 +1236,34 @@ standalone.
 | 1 | dropped | | | The headers land with their consumers (commits 4, 7 and 8). Real consumers compile them in C and C++, so a compile-check unit would test nothing they do not. The number stays so that the others do not move. |
 | 2 | **landed** `1b4eac28`, merged as `fd3e043f`: `spu: gate lifted code with a pinned ABI` | `tools/spu_lifter.py`, `tools/build_spu_workloads.py`, `tools/check_spu_lifter_abi.py`, `include/ps3emu/lifter_abi.h`, `runtime/diag/{lifter_abi.c,stop.cpp}`, `include/ps3emu/stop.h`, `runtime/spu/spu_workload.c`, `cmake/PS3RecompSPU.cmake`, `runtime/spu/tests/out_*`, `docs/STOPS.md`, `docs/SPU_LIFTER.md` | `tests/gates/test_spu_lifter_abi.py`: a matching ABI runs; a mismatched one stops with `lifter-abi` during registration; the (ABI, pin) pair holds; the Win64 pin matches a cross-compiled layout | section 12.1 |
 | 3 | **landed** `3d4f0596`, merged as `682d040f`: `tools: register raw SPU job images from a manifest` | `tools/spu_program_pipeline.py`, `tools/build_spu_workloads.py`, `tools/find_spu_functions.py`, `tools/gen_test_raw_job.py`, `tools/test_spu_program_pipeline.py`, `docs/SPU_LIFTER.md` | `tools/test_spu_program_pipeline.py`: a synthetic raw image registers under its whole-blob fingerprint with its channel and MFC inventory; a wrong `sha256` and a `code_end` past the blob are named errors; `code_end` reaches the lifter | sections 12.2 and 12.3 |
-| 3b | `tools: spu_program_pipeline reports event branches` | `tools/spu_program_pipeline.py`, `tools/gen_test_raw_job.py` (variants), `tools/test_spu_program_pipeline.py`, `docs/SPU_LIFTER.md`; before commit 10 also `tools/build_spu_workloads.py` (registry writer) and `runtime/spu/spu_workload.{c,h}` (a compact inventory in the registration, with the lift's `code_end` and options hash) | a synthetic raw image with `bisled`, one with a bi-family E or D branch and one with `iret` each list the site under `event_branches`; an image with none lists none | the tool test; the raw-image tests of commit 3 unchanged; with the registration part, a registered image reports its flags to the runtime |
+| 3b | `tools: spu_program_pipeline reports event branches` | `tools/spu_program_pipeline.py`, `tools/gen_test_raw_job.py` (variants), `tools/test_spu_program_pipeline.py`, `docs/SPU_LIFTER.md`; with commit 10a also `tools/build_spu_workloads.py` (registry writer) and `runtime/spu/spu_workload.{c,h}` (a compact inventory in the registration, with the lift's `code_end` and options hash) | a synthetic raw image with `bisled`, one with a bi-family E or D branch and one with `iret` each list the site under `event_branches`; an image with none lists none | the tool test; the raw-image tests of commit 3 unchanged; with the registration part, a registered image reports its flags to the runtime |
 | 4 | `spu: effect port seam in the channel runtime` | `runtime/spu/spu_effect_port.h` (new: the draft without its `spu_effect_inventory` block), `runtime/spu/spu_context.h` (`port`, `lift_miss`), `spu_channels.c` (seam; `MFC_WrTagMask` below the port test, today's inline store kept for `port == NULL`; `spu_port_*` and `spu_port_serve_halt`; closed resolver path; the latch static assertions), `spu_dma.h`, `spu_interp.c`, `runtime/spu/tests/test_spu_effect_port.c` (new), `tests/bench/spu/` (driver) | `spu_effect_port`: a tap sees every effect of a synthetic job in order, list elements, an atomic and `MFC_WrTagMask` included; a served context completes with `vm_base == NULL` and no MFC engine created; a served context that branches to unlifted local store ends its run with `lift_miss == 1` and nothing interpreted; a serve callback that cannot answer ends the run under `spu_run_with_halt`, and with no landing pad armed the process aborts instead of continuing with a value (a child-process test) | the test, interpreted and lifted; all `spu` and `spurs` suites; the bench rows of section 18 within noise of the baseline; `tests/gates/test_spu_lifter_abi.py` green with the pin unchanged; with no port `MFC_WrTagMask` does not take the MFC registry lock |
 | 5 | `jq2: classify a job's end without stopping` | `libs/spurs/jq2/executor.cpp`, `runtime/spu/spurs_job.c` (shared classifier), `tests/spurs_jq2/test_jq2_executor.cpp` | each end (return in both tiers, stop, halt, jm call) yields its class; the existing `jq2-job-end` and `jq2-jm-call` stop tests stay green | `ctest -R jq2_exec`; `--preset tsan -R jq2_exec` |
 | 6 | `jq2: select a job body by its staged bytes` | `libs/spurs/jq2/executor.{cpp,hpp}`, `include/ps3emu/config_options.def`, `include/ps3emu/config.h`, `runtime/config/`, `docs/CONFIG.md`, `docs/JQ2.md` | a registered image runs lifted under `spu.job_body=lifted`; other bytes staged from the same EA and size run interpreted; `interp` never runs a registered body | the executor tests; kind-29 cost reported from a synthetic trace; `gcc-16`; tsan |
 | 7 | `spu: record a job's transcript and write its fixture` | `runtime/spu/spu_xdiff.h` (new: the container, section, identity, unit, effect and end layouts of 7.1 to 7.6, and `spu_job_tier`), `runtime/spu/xdiff/` (new: fixture reader and writer, recorder tap), `spu_channels.c` (a query for the latched float mode), tests | a synthetic job with GET, PUT, a list, a stalled list resumed by `MFC_WrListStallAck`, GETLLAR/PUTLLC and a mailbox write records the expected transcript, the remaining list bytes at the ack included; the fixture reads back the expected record and payload bytes; each rejection of section 7.8 is reported as `fixture-format` (a `VRDT` section is bounds-checked only until commit 8) | the test, interpreted and lifted; `asan` preset over the reader with truncated and corrupt fixtures, among them one with a flipped header byte (the checksum covers the whole header); `gcc-16`; `SPU_XDIFF_LS_BYTES` equals `SPU_LS_SIZE` by static assertion |
 | 8 | `spu: replay port, shadow contexts and spu_job_replay` | `runtime/spu/spu_xdiff.h` (verdict, reason and match enums, `VRDT`), `runtime/spu/xdiff/` (replay serve table, shadow context, runner), `spu_channels.c` and `spu_interp.c` (`spu_run_with_halt` saves the interpreter's nesting depth before `setjmp` and restores it in the halt cases), `tools/test_spu_context_census.py` (new), `tools/spu_xdiff_corpus.py` (new), tests | T0 against the lift on the fixture of commit 7: `equal`; a lift with one changed instruction: `differ` naming the first effect; a lift that writes another tag mask before a wait and then overwrites the register: `differ` / `effect-request`; a lift that rewrites the remaining elements of a stalled list before the ack and later overwrites them: `differ` / `effect-request`; a stop inside a nested lifted call: `differ` (section 5.1); T0 over its budget by the instruction observer: `void`; a T0 shadow that ends by serve-halt, then a second T0 shadow on the same thread that exhausts its budget: `void` / `budget`, not an abort (section 9); a fixture whose `float_rz` is not the runner's mode: `malformed` / `fixture-identity`; a behaviour-changing knob set: exit status 1; a new `spu_context` member without a class: the census test fails | runner exit codes 0, 1, 2, 3, 4, 5; `gcc-16`; `asan` |
 | 9 | `spu_lifter: count backward transfers under SPU_LIFT_BUDGET` | `tools/spu_lifter.py`, `tools/build_spu_workloads.py` (twin entry), `runtime/spu/spu_context.h`, `spu_drain.c`, and the ABI bump of section 12.1: `budget` joins the member list of `include/ps3emu/lifter_abi.h`, `SPU_RUNTIME_LIFTER_ABI` and `SPU_LIFTER_ABI` go up, both data-model pins are recomputed, `EXPECTED_ABI` in `tests/gates/test_spu_lifter_abi.py` follows, and `runtime/spu/tests/out_*` are regenerated | a lifted loop without effects: `void` / `budget` and the process goes on; the same source without the definition contains no check (object comparison) | `asan` and `tsan` presets with `--repeat until-fail:10`; SPU bench unchanged for the production object; `tests/gates/test_spu_lifter_abi.py` and the SPU runtime tests over the regenerated lifts |
-| 10 | `jq2: in-run xdiff with sampled shadows` | `libs/spurs/jq2/` (audit thread, queue), `runtime/spu/spurs_job.c` (staging store hand-over), `include/ps3emu/stop.h`, `docs/STOPS.md`, `tests/gates/test_stop.py`, `include/ps3emu/ps3_ftrace.h`, config keys, `docs/CONFIG.md` | a seeded divergence is reported, its fixture written and replayable, the guest-visible result unchanged; `stop` exits by `spu-xdiff-divergence`; a full queue drops and counts in `sample` and blocks in `all` (ordered by hooks, never by sleeps) | `tsan` preset `-R jq2_xdiff --repeat until-fail:10`; the stop gate; `gcc-16` |
+| 10a | `jq2: record an image's fixtures without a shadow` | `libs/spurs/jq2/` (start and end hooks record on the worker; fixtures written synchronously), the registration part of 3b, `include/ps3emu/config_options.def` and `include/ps3emu/config.h` (`spu.xdiff_dir`, `spu.xdiff_capture`), `docs/CONFIG.md` | a registered synthetic image run N+1 times under `spu.xdiff_capture=N` writes N fixtures, each with the job's identity, effects and end, and the guest-visible results are those of a run without capture; an image whose registration lists event branches writes none and is counted ineligible; a fixture that cannot be written is a named diagnostic and the run goes on | the jq2 executor tests; `spu_job_replay --tier interp` on each written fixture: `equal`; `tsan` preset `-R jq2_exec`; `gcc-16` |
+| 10b | `jq2: in-run xdiff with sampled shadows` | `libs/spurs/jq2/` (audit thread, queue), `runtime/spu/spurs_job.c` (staging store hand-over), `include/ps3emu/stop.h`, `docs/STOPS.md`, `tests/gates/test_stop.py`, `include/ps3emu/ps3_ftrace.h`, config keys, `docs/CONFIG.md` | a seeded divergence is reported, its fixture written and replayable, the guest-visible result unchanged; `stop` exits by `spu-xdiff-divergence`; a full queue drops and counts in `sample` and blocks in `all` (ordered by hooks, never by sleeps) | `tsan` preset `-R jq2_xdiff --repeat until-fail:10`; the stop gate; `gcc-16` |
 | 11 | `ftrace_report: per-image tier and xdiff counters` | `tools/ftrace_report.py`, `tools/test_ftrace_report.py`, `docs/TOOLS.md` | a synthetic trace with kinds 32 and 33 yields the per-image counts and the sampled share; a trace without them reports the columns absent | the tool test; `ftrace_bundle.py verify` on a bundle with the new kinds |
 
-The order carries two constraints. Event-branch detection (3b) comes before
-anything that shadows a job: the offline runner reads its report, and the
-in-run mode (10) needs it in the registration. And the lifted budget (9)
-comes before any shadow runs inside a game (10): until then a lifted subject
+The plan runs offline first, so that the first lifted image is compared and
+not only run. The order is 3b, 4 and 5 (independent of each other), then 7,
+8 and 10a; then, in the title's own repository, register the first image,
+record a corpus with `spu.xdiff_capture`, and replay it with
+`spu_job_replay --tier registered`; the verdicts and the lift's block
+coverage (section 12.4) are the evidence. After that come 6, 9, 10b and 11.
+
+Three constraints fix this order. Event-branch detection (3b) comes before
+anything that shadows or records a job: the offline runner reads its report,
+and 10a needs it in the registration. The end classification (5) comes
+before 10a, whose fixtures carry the job's end. And the lifted budget (9)
+comes before any shadow runs inside a game (10b): until then a lifted subject
 runs only under the offline runner, in its own process, where a loop without
 effects is a timeout and not a hung title.
 
-After commit 10, in the title's own repository: register the first image, run
-an `xdiff=all` session, replay the corpus offline, then compare power and
-frame time with `xdiff=off`.
+After commit 10b, in the title's repository: run an `xdiff=all` session,
+then compare power and frame time with `xdiff=off`.
 
 ## 17. The open questions
 
@@ -1281,8 +1289,8 @@ settles it:
 |---|---|---|
 | the real path is unchanged by the seam | the channel, `dma` and `atomic` rows of the SPU operation benchmark, lifted and interpreted, before and after commit 4; fastest of 25 runs each, as the bench already takes (`tests/bench/spu/README.md:21-39`) against `results/2026-10-06-m1pro-baseline.csv` | commit 4. The driver script the README names is not in the tree; the commit restores one |
 | identifying the staged image is cheap | the kind-29 spans of an existing play trace, per image: mean and p95 against the job's own span | `ftrace_report.py`, before commit 6 |
-| recording costs a few percent of a job | job spans with `xdiff=off` against `xdiff=all`, same scene, same build; and kind 32 spans; the byte-serial check of a sampled job's image is part of this cost | after commit 10 |
-| a fixture is about 100 KiB | sizes of a captured corpus, raw and zstd | after commit 10 |
+| recording costs a few percent of a job | job spans with `xdiff=off` against `xdiff=all`, same scene, same build; and kind 32 spans; the byte-serial check of a sampled job's image is part of this cost | after commit 10b |
+| a fixture is about 100 KiB | sizes of a captured corpus, raw and zstd | after commit 10a |
 | the budgeted twin is close to the production object | the SPU bench over both objects | commit 9 |
 | T0 under an instruction observer is fast enough to shadow | interpreter steps per second with and without the counting observer | commit 8 |
 
