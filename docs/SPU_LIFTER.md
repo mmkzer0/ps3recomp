@@ -415,3 +415,100 @@ mode, and limitations. A `registered` status confirms generation and table
 coverage; it does not establish correct execution of the program. The standalone
 lifter's optional `--report PATH` emits function ranges, unsupported instruction
 counts, and direct branch/call targets for tools consuming its output.
+
+### Raw local-store job images
+
+A JobQueue2 job image is not an ELF. The PPU copies `sizeBinary << 4` bytes of
+guest memory (the descriptor's `eaBinary`) straight into local store, and the
+runtime stages that copy at LS 0x7C00 (`SPU_JQ2_IMAGE_LS` in
+`runtime/spu/spu_workload.h`; see `runtime/spu/spurs_job.c`). Such a blob has no
+program headers, entry field or symbols, so the pipeline needs a manifest for
+the facts the bytes cannot carry:
+
+```bash
+python tools/build_spu_workloads.py --raw-images /path/to/raw_images.json \
+    --lifted /path/to/generated_spu/raw --out /path/to/generated_spu/raw/spu_workloads.c
+```
+
+`--raw-images` takes a non-empty JSON list; relative `path` values resolve
+against the manifest's directory:
+
+```json
+[
+  {
+    "path": "images/audio-job.bin",
+    "sha256": "0123…(64 hex)…cdef",
+    "ls_base": "0x7C00",
+    "code_end": "0x16168",
+    "extra_entry_points": ["0xA2C"]
+  }
+]
+```
+
+- `sha256` is checked against the blob before anything is lifted. A mismatch is
+  a named error and fails the run, `--allow-partial` included: these are the
+  bytes the registration key will be computed from, so accepting a different
+  file would silently register the wrong image.
+- `ls_base` is the local-store address the image is staged at (0x7C00 for a
+  JobQueue2 job, 0 for some other loaders). It must be 4-byte aligned and keep
+  the whole blob inside the 256 KB local store.
+- `code_end` is optional and is passed unchanged to the lifter's existing
+  `--code-end`: it drops function bounds at or past the address and caps the
+  last one, leaving an embedded rodata/const tail undisassembled. It must be a
+  4-byte-aligned address inside `(ls_base, ls_base + len(blob)]`; an address past
+  the blob is a named error.
+- `extra_entry_points` are optional LS addresses passed to `--extra-funcs`, for
+  entries the branch analysis cannot see (interrupt vectors, jump-table
+  handlers). They must be 4-byte aligned and below `code_end` when that is set.
+
+The registration fingerprint is the FNV-1a-64 over the **whole blob** — which is
+exactly the staged bytes and therefore exactly what
+`spu_workload_fingerprint(image, image_bytes)` hashes at run time. It is not the
+ELF-extent rule (`spu_elf_image_size`) and there is no separate text-segment
+alias: a raw job is dispatched by those bytes and nothing else. The pipeline
+tests compile the runtime's fingerprint function against the generated blob and
+assert the C and Python values agree.
+
+Function discovery runs `find_spu_functions.py`'s `raw=True` mode at `ls_base`,
+so every seed comes from the entry base and the branch/call analysis. The same
+post-lift gates as an ELF apply unchanged: no unsupported instructions, the
+entry function generated, every direct branch/call target backed by a generated
+function, and generated functions inside the image. A raw image that fails one
+of them is `unsupported` and is never registered silently.
+
+### Static effect inventory
+
+Every successfully lifted raw image carries an `effects` object in
+`inventory.json` describing what the lifted function ranges contain:
+
+```json
+"effects": {
+  "channels": [
+    {"channel": 21, "name": "MFC_Cmd", "read": 0, "write": 5, "count": 0,
+     "sites": {"read": [], "write": [31852, 31900, 31948, 32000, 32020], "count": []}}
+  ],
+  "mfc_commands": [
+    {"command": 64, "name": "GET", "count": 1, "sites": [31852]}
+  ],
+  "unresolved": [
+    {"channel": 21, "access": "write", "site": 32020, "register": "$r11",
+     "reason": "command value is not a same-block immediate"}
+  ]
+}
+```
+
+Channel instructions are counted by channel number and by `rdch` (read),
+`wrch` (write) or `rchcnt` (count). A `wrch MFC_Cmd` counts as a resolved
+command constant only when its source register holds an `il` immediate from the
+same straight-line run — no branch, branch target or other register write in
+between. Everything else is listed under `unresolved` with its site and register
+and is still included in the channel-21 write count. Resolution is deliberately
+block-local: a false "resolved" could hide an atomic or mailbox access, while an
+unresolved site is visible and reviewable. Command names mirror the
+`MFC_*_CMD` constants in `runtime/spu/spu_context.h`.
+
+`tools/gen_test_raw_job.py` builds the synthetic image these tests use: a
+job-header-shaped blob with an immediate prefix, branch stub, `JOBCRT Ver14`
+marker, and code carrying a GET, a PUT, a GETLLAR/PUTLLC pair and a mailbox
+write, plus one command write that is deliberately not statically resolvable.
+No SPU toolchain and no guest bytes are involved.
