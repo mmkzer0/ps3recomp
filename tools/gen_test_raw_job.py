@@ -36,10 +36,21 @@ ILA = 0x021
 BR = 0x064
 BRNZ = 0x042
 BI = 0x1A8
+BISL = 0x1A9
+IRET = 0x1AA
+BISLED = 0x1AB
 RDCH = 0x00D
 WRCH = 0x10D
 LQD = 0x034
 NOP = 0x201
+
+# E/D interrupt bits of the bi family (runtime/spu/spu_interp.c:127-132):
+# E sets int_enable and D clears it when the branch is taken.
+INTERRUPT_ENABLE = 0x40000
+INTERRUPT_DISABLE = 0x80000
+# `default` is the byte-identical job image; the others add one event branch
+# for the static effect inventory tests.
+VARIANTS = ('default', 'bisled', 'disable', 'iret')
 
 MFC_LSA, MFC_EAH, MFC_EAL, MFC_Size, MFC_TagID, MFC_Cmd = 16, 17, 18, 19, 20, 21
 MFC_RdAtomicStat, SPU_WrOutMbox = 27, 28
@@ -92,16 +103,23 @@ def _dma(cmd, lsa, size):
     return words
 
 
-def build(base=LS_BASE, tail_words=0):
+def build(base=LS_BASE, tail_words=0, variant='default'):
     """Return one synthetic raw job image at `base`.
 
     `tail_words` appends `nop` words after the returning code, reachable only
     by the not-taken-at-entry `brnz $r0` in front of the return. It exists so a
     test can observe the lifter's `--code-end` bound: the tail function runs to
     the end of the blob only when no code end is supplied.
+
+    `variant` picks the final control transfer, for the event-branch inventory:
+    `bisled` inserts a `bisled $r0, $r2` before the return, `disable` sets the
+    D bit on the `bi $r0` return (`bid`), and `iret` replaces the return with
+    `iret`. The default image is unchanged.
     """
     if base % 4:
         raise ValueError('base must be 4-byte aligned')
+    if variant not in VARIANTS:
+        raise ValueError(f'unknown variant {variant!r}; expected one of {VARIANTS}')
     header = bytearray(CODE_START)
     # The four executed immediate words real jq2 images carry at +0x00. Their
     # immediates are deliberately outside this image: the detector seeds every
@@ -123,11 +141,19 @@ def build(base=LS_BASE, tail_words=0):
     # the inventory must report this as unresolved rather than drop it.
     code += [_ri10(LQD, 0, 0, 11), _channel(WRCH, MFC_Cmd, 11)]
 
+    if variant == 'bisled':
+        # Link in $r0, target $r2: taken only while an event is pending.
+        code.append(_rr(BISLED, ra=2))
     if tail_words:
         brnz_addr = base + CODE_START + 4 * len(code)
-        tail_start = brnz_addr + 8          # brnz and the `bi $r0` after it
+        tail_start = brnz_addr + 8          # brnz and the transfer after it
         code.append(_ri16(BRNZ, (tail_start - brnz_addr) // 4, 0))
-    code.append(_rr(BI, 0, 0, 0))           # bi $r0: the SPU ABI return
+    if variant == 'disable':
+        code.append(_rr(BI, 0, 0, 0) | INTERRUPT_DISABLE)   # bid $r0
+    elif variant == 'iret':
+        code.append(_rr(IRET))              # interrupt return through SRR0
+    else:
+        code.append(_rr(BI, 0, 0, 0))       # bi $r0: the SPU ABI return
     if tail_words:
         code.extend([_rr(NOP)] * tail_words)
 
@@ -144,10 +170,12 @@ def main():
     parser.add_argument('--base', type=lambda x: int(x, 0), default=LS_BASE)
     parser.add_argument('--tail-words', type=int, default=0,
                         help='append N nop words reachable only via a not-taken branch')
+    parser.add_argument('--variant', choices=VARIANTS, default='default',
+                        help='event-branch word to add or substitute at the end')
     parser.add_argument('--manifest', help='also write a --raw-images manifest entry')
     args = parser.parse_args()
 
-    image = build(args.base, args.tail_words)
+    image = build(args.base, args.tail_words, args.variant)
     with open(args.output, 'wb') as out:
         out.write(image)
     if args.manifest:

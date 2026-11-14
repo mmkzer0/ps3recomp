@@ -521,6 +521,7 @@ Every successfully lifted raw image carries an `effects` object in
   "mfc_commands": [
     {"command": 64, "name": "GET", "count": 1, "sites": [31852]}
   ],
+  "event_branches": [],
   "unresolved": [
     {"channel": 21, "access": "write", "site": 32020, "register": "$r11",
      "reason": "command value is not a same-block immediate"}
@@ -538,8 +539,20 @@ block-local: a false "resolved" could hide an atomic or mailbox access, while an
 unresolved site is visible and reviewable. Command names mirror the
 `MFC_*_CMD` constants in `runtime/spu/spu_context.h`.
 
+`event_branches` names every instruction that transfers control on an SPU event
+or interrupt: `bisled`, `iret`, and any `bi`, `bisl`, `biz`, `binz`, `bihz` or
+`bihnz` whose E (enable) or D (disable) interrupt bit is set. Each entry is
+`{"site": <LS address>, "mnemonic": <decoded name>, "enable": <E bit>,
+"disable": <D bit>}`. The key is always present; an image with no such site has
+`"event_branches": []`. `bisled` and `iret` are listed even with both bits
+false. An image with a nonempty list cannot be shadowed or recorded faithfully
+(`docs/SPU_XDIFF.md` section 12.3), so it is not eligible for xdiff; it may
+still run as an authority.
+
 `tools/gen_test_raw_job.py` builds the synthetic image these tests use: a
 job-header-shaped blob with an immediate prefix, branch stub, `JOBCRT Ver14`
 marker, and code carrying a GET, a PUT, a GETLLAR/PUTLLC pair and a mailbox
 write, plus one command write that is deliberately not statically resolvable.
-No SPU toolchain and no guest bytes are involved.
+`build(..., variant=...)` additionally emits a `bisled`, a D-bit `bi` return
+(`bid`) or an `iret` at the end of that code for the event-branch tests; the
+default variant is unchanged. No SPU toolchain and no guest bytes are involved.
