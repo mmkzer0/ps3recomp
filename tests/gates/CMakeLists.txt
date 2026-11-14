@@ -73,10 +73,15 @@ gates_probe(probe_spu_lifter_abi_mismatch probe_spu_lifter_abi.c stamp_lifter_ab
 target_compile_definitions(probe_spu_lifter_abi_mismatch PRIVATE
     SPU_PROBE_ABI=2u PPU_PROBE_ABI=PPU_RUNTIME_LIFTER_ABI)
 
-gates_probe(probe_spu_lifter_layout probe_spu_lifter_layout.c stamp_lifter_abi.c)
+# The probe prints a compile-time signature: it needs the headers, not the
+# runtime. Linking the archive made GNU ld pull unrelated runtime objects for
+# their own undefined symbols (vm_base, ppu_vfs_root, ...); macOS's linker
+# tolerated that, Linux's did not.
+add_executable(probe_spu_lifter_layout probe_spu_lifter_layout.c)
 target_compile_definitions(probe_spu_lifter_layout PRIVATE
     PPU_PROBE_ABI=PPU_RUNTIME_LIFTER_ABI)
-target_include_directories(probe_spu_lifter_layout PRIVATE "${PROJECT_SOURCE_DIR}/runtime/spu")
+target_include_directories(probe_spu_lifter_layout PRIVATE
+    "${PROJECT_SOURCE_DIR}/include" "${PROJECT_SOURCE_DIR}/runtime/spu")
 
 # Compile-only: the selected data-model pin must equal the context layout. The
 # gate test also cross-compiles this file for Windows x64, where it selects the
