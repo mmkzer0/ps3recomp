@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """SPU lift ABI mismatch, context-layout pin, and cross-data-model pin gates."""
+import os
 import re
 import shutil
+import subprocess
 import struct
 import sys
 import tempfile
@@ -11,7 +13,6 @@ import gates_common as g
 
 MATCH = None
 MISMATCH = None
-LAYOUT = None
 ROOT = None
 EXPECTED_ABI = 1
 LP64_LAYOUT_SIGNATURE = 0x8B375EA16245430D
@@ -78,13 +79,25 @@ def test_context_layout_is_pinned_to_the_lifter_abi():
     assert pins[model] == expected, (
         f"update the {model} SPU layout pin: expected 0x{expected:016X}, "
         f"found 0x{pins[model]:016X}")
-    p = g.run([LAYOUT])
-    assert p.returncode == 0, f"exit {p.returncode}\nstderr:\n{p.stderr}"
-    actual = int(p.stdout.strip(), 16)
-    assert actual == expected, (
-        f"SPU context layout used by lifted code changed: pinned 0x{expected:016X}, "
-        f"computed 0x{actual:016X}; bump SPU_RUNTIME_LIFTER_ABI and update the "
-        f"{model} layout pin together")
+    # Compile only: `probe_spu_lifter_layout_pin.c` holds the same comparison as
+    # a static assert, so a layout change without an ABI/pin update fails here
+    # with the assert's message. Linking the runtime for a printed value made the
+    # probe drag in every runtime object (vm_base, g_spu_ls_watch_n, ...), which
+    # is not part of the contract being checked and failed GNU ld.
+    cc = os.environ.get("CC") or shutil.which("cc")
+    assert cc, "no C compiler (CC unset and no cc on PATH)"
+    with tempfile.TemporaryDirectory() as tmp:
+        obj = Path(tmp) / "probe_spu_lifter_layout_pin.o"
+        p = subprocess.run(
+            [cc, "-std=gnu17", "-c", "-o", str(obj),
+             "-I", str(Path(ROOT) / "include"),
+             "-I", str(Path(ROOT) / "runtime" / "spu"),
+             str(Path(ROOT) / "tests" / "gates" / "probe_spu_lifter_layout_pin.c")],
+            capture_output=True, text=True)
+        assert p.returncode == 0, (
+            f"the {model} context layout no longer matches its pin; bump "
+            f"SPU_RUNTIME_LIFTER_ABI and update the {model} layout pin together:\n"
+            f"{p.stdout}{p.stderr}")
 
 
 def test_windows_x64_pin_matches_cross_compiled_layout():
@@ -110,10 +123,10 @@ def test_windows_x64_pin_matches_cross_compiled_layout():
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 5:
-        print("usage: test_spu_lifter_abi.py <match> <mismatch> <layout> <source-root>",
+    if len(sys.argv) != 4:
+        print("usage: test_spu_lifter_abi.py <match> <mismatch> <source-root>",
               file=sys.stderr)
         sys.exit(2)
-    MATCH, MISMATCH, LAYOUT, ROOT = sys.argv[1:]
+    MATCH, MISMATCH, ROOT = sys.argv[1:]
     sys.exit(g.main([(name, fn) for name, fn in sorted(globals().items())
                      if name.startswith("test_")]))
