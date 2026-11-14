@@ -41,6 +41,7 @@
  * exact.
  */
 
+#include "spurs_job.h"
 #include "spu_coherency.h"
 #include "spu_dma.h"
 #include "spu_workload.h"
@@ -249,6 +250,38 @@ static void job_jq2_plant(uint8_t* ls)
         ls32(ls, SPU_JQ2_JM_SWAP_LS + i * 4u, s_job_rt_swap[i]);
     ls32(ls, SPU_JQ2_JM_LS,      SPU_JQ2_JM_CALL_LS);
     ls32(ls, SPU_JQ2_JM_LS + 4u, SPU_JQ2_JM_SWAP_LS);
+}
+
+/* How a job body ended (spurs_job.h). The order is the executor's policy of
+ * old, now a pure function of the finished context: a call of jm word 0 is
+ * named before the return tests because both end on a `stop`, and the status
+ * tests use equality so that a context carrying both bits is `other`, as the
+ * stop's `status` reason always reported it. A lifted job is halted by the
+ * resolver when it branches to the link (spu_channels.c, SPU_JOB_RETURN_LS),
+ * which no instruction of the job executes: pc at the link with neither bit
+ * set is that return. */
+spu_job_end spu_job_classify_end(const spu_context* ctx)
+{
+    spu_job_end e;
+    e.stop_code = ctx->stop_code;
+    e.pc        = ctx->pc & SPU_LS_MASK;
+    e.status    = ctx->status;
+    if (ctx->status == SPU_STATUS_STOPPED_BY_STOP && ctx->stop_code == SPU_JQ2_JM_CALL_STOP &&
+        e.pc == SPU_JQ2_JM_CALL_LS + 4u)
+        e.end_class = SPU_JOB_END_JM_CALL;
+    else if (ctx->status == SPU_STATUS_STOPPED_BY_STOP && ctx->stop_code == 0 &&
+             e.pc == SPU_JOB_RETURN_LINK_LS + 4u)
+        e.end_class = SPU_JOB_END_RETURN;
+    else if (e.pc == SPU_JOB_RETURN_LINK_LS &&
+             (ctx->status & (SPU_STATUS_STOPPED_BY_STOP | SPU_STATUS_STOPPED_BY_HALT)) == 0)
+        e.end_class = SPU_JOB_END_RETURN;
+    else if (ctx->status == SPU_STATUS_STOPPED_BY_HALT)
+        e.end_class = SPU_JOB_END_HALT;
+    else if (ctx->status == SPU_STATUS_STOPPED_BY_STOP)
+        e.end_class = SPU_JOB_END_STOP;
+    else
+        e.end_class = SPU_JOB_END_OTHER;
+    return e;
 }
 
 /* Local store of the most recent job, kept alive past the run.
@@ -918,7 +951,7 @@ static int run_spurs_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_e
          * saved slots (r1 + 0x20 / + 0x30), r126 = the entry. The PM also stores
          * its link and r126 at those slots; the job never reads them, and our
          * link is not the PM's, so they are not written. */
-        ctx.gpr[0]._u32[0]   = 0x3FF00u;               /* SPU_JOB_RETURN_LS */
+        ctx.gpr[0]._u32[0]   = SPU_JOB_RETURN_LINK_LS;
         ctx.gpr[1]._u32[0]   = stack_top - 0x60u;
         /* r1 is a vector in the SPU ABI: word 0 the stack pointer, words 1..3
          * the stack bytes left below it (the job's stack-limit code subtracts
@@ -946,7 +979,7 @@ static int run_spurs_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_e
     /* Link register: where the job returns when it is done. The job manager
      * would pass an address inside itself; 0 makes the job re-enter its own
      * entry at LS 0 and run a bogus second lap. */
-    ctx.gpr[0]._u32[0] = 0x3FF00u;                   /* SPU_JOB_RETURN_LS */
+    ctx.gpr[0]._u32[0] = SPU_JOB_RETURN_LINK_LS;
     ctx.gpr[3]._u32[0] = ctx_ls;                     /* CellSpursJobContext2* */
     ctx.gpr[4]._u32[0] = desc_ls;                    /* CellSpursJob256*      */
     }

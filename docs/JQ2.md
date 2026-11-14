@@ -672,6 +672,11 @@ from LS 0); `ExecutorHooks::select_body` is the plug for lifted bodies once the
 job-image registry exists. A job counts as returned only when it executes the
 `stop 0` at the link address the loader plants (`0x3FF00`); any other stop, a
 halt, or a loader refusal is the named stop `jq2-job-end` and credits nothing.
+How a body ended is one shared classification (`spu_job_classify_end`,
+`runtime/spu/spurs_job.h`): `return` (interpreted or lifted), `stop`, `halt`,
+`jm-call` or `other`, the end classes of `docs/SPU_XDIFF.md` section 7.6.
+`ExecutorHooks::on_end` receives it with the finished context for every end,
+before the policy above stops the process for all but `return`.
 
 **Completion.** After the run: pool slot back (COPY), then `credit_completion()`
 on the port line, and the `Wakeup` it returns is performed: kind 2 with an id

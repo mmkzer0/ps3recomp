@@ -40,6 +40,7 @@
 #include "ps3emu/stop.h"
 #include "spu/spu_context.h"
 #include "spu/spu_interp.h"
+#include "spu/spurs_job.h"
 #include "spu/spu_workload.h"
 #include "cellFiber.h"
 #include "syscalls/sys_event.h"
@@ -1017,6 +1018,8 @@ private:
 /* ---- running a job ------------------------------------------------------ */
 
 thread_local const JobStart* t_job = nullptr;
+thread_local const ExecutorHooks* t_job_hooks = nullptr; /* the hooks of the queue t_job belongs to */
+static_assert(kJobReturnLs == SPU_JOB_RETURN_LINK_LS, "the classifier and the header name one link address");
 
 [[noreturn]] void job_end_stop(const spu_context* ctx, const char* reason)
 {
@@ -1050,9 +1053,10 @@ thread_local const JobStart* t_job = nullptr;
               &site);
 }
 
-/* The one definition of a job's normal return, for every job body. The job
- * returns through the link register the loader plants (kJobReturnLs, 0x3FF00),
- * and the two kinds of body arrive there differently:
+/* The one definition of a job's normal return, for every job body: the shared
+ * classifier (spurs_job.h) says how the body ended, the executor reports the
+ * class, and then applies its policy, which is that only a return goes on. The
+ * two kinds of body reach the link differently:
  *   interpreted  local store at the link is zero: `stop 0`, status STOP, stop
  *                code 0, pc just past it;
  *   lifted       the resolver (spu_indirect_branch, SPU_JOB_RETURN_LS) halts the
@@ -1061,21 +1065,21 @@ thread_local const JobStart* t_job = nullptr;
  * spu_run_with_halt reports a halt for the lifted return as well as for a
  * lifted `heq`/`hgt` assertion, so its result cannot tell them apart; the
  * context can. Anything else - a `stop` with another code, a halt-assertion
- * (status HALT), a run that ended elsewhere - ended the job without returning. */
+ * (status HALT), a run that ended elsewhere - ended the job without returning.
+ * The report comes first: a job that did not return is a named stop, and the
+ * process does not live to report it afterwards. */
 void require_normal_return(const spu_context* ctx)
 {
-    const std::uint32_t pc = ctx->pc & SPU_LS_MASK;
-    /* The stop word the loader planted at jm word 0, reached by an interpreted
-     * job or, through the resolver's interpretation of the live bytes, a lifted one. */
-    if (ctx->status == SPU_STATUS_STOPPED_BY_STOP && ctx->stop_code == SPU_JQ2_JM_CALL_STOP &&
-        pc == SPU_JQ2_JM_CALL_LS + 4u)
-        jm_call_stop(ctx);
-    if (ctx->status == SPU_STATUS_STOPPED_BY_STOP && ctx->stop_code == 0 && pc == kJobReturnLs + 4u) return;
-    if (pc == kJobReturnLs && (ctx->status & (SPU_STATUS_STOPPED_BY_STOP | SPU_STATUS_STOPPED_BY_HALT)) == 0) return;
-    const char* reason = ctx->status == SPU_STATUS_STOPPED_BY_HALT   ? "halt"
-                         : ctx->status == SPU_STATUS_STOPPED_BY_STOP ? "stop"
-                                                                     : "status";
-    job_end_stop(ctx, reason);
+    const spu_job_end end = spu_job_classify_end(ctx);
+    if (t_job != nullptr && t_job_hooks != nullptr && t_job_hooks->on_end != nullptr)
+        t_job_hooks->on_end(t_job_hooks->user, *t_job, ctx, end);
+    switch (end.end_class) {
+    case SPU_JOB_END_RETURN: return;
+    case SPU_JOB_END_JM_CALL: jm_call_stop(ctx);
+    case SPU_JOB_END_HALT: job_end_stop(ctx, "halt");
+    case SPU_JOB_END_STOP: job_end_stop(ctx, "stop");
+    default: job_end_stop(ctx, "status");
+    }
 }
 
 /* ---- job image identity (PS3_FTRACE kind 29) ----------------------------- */
@@ -1139,9 +1143,8 @@ void identify_image(ImageStamp& st, const spu_context* ctx, const spu_job_layout
 void interpreter_entry(spu_context* ctx)
 {
     /* From the entry state the loader staged: pc is the image base (0x7C00 in
-     * the JQ2 profile), not LS 0. */
+     * the JQ2 profile), not LS 0. The loader's end hook classifies the end. */
     spu_interp_run(ctx, ctx->pc);
-    require_normal_return(ctx);
 }
 
 void Queue::run_job(const JobStart& js, const std::optional<jq2_job_observer>& obs, const JobTrace& ft)
@@ -1159,6 +1162,7 @@ void Queue::run_job(const JobStart& js, const std::optional<jq2_job_observer>& o
                           js.worker};
 
     t_job = &js;
+    t_job_hooks = &hooks_;
     int rc;
     ImageStamp stamp;
     if (!obs) {
@@ -1223,6 +1227,7 @@ void Queue::run_job(const JobStart& js, const std::optional<jq2_job_observer>& o
                              &hooks);
     }
     t_job = nullptr;
+    t_job_hooks = nullptr;
     const std::uint64_t ft1 = ft.t0 != 0 ? ps3_ft_now() : 0;
     const std::uint64_t cpu1 = ft.t0 != 0 ? thread_cpu_ns() : 0;
     if (rc != 0) {
