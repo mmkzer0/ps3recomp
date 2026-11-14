@@ -18,6 +18,7 @@ def raw_job_tools():
     """The synthetic raw builder, imported once TOOLS is on sys.path."""
     from gen_test_raw_job import LS_BASE, build
     return LS_BASE, build
+INCLUDE = TOOLS.parent / 'include'
 
 
 def elf(value=7, *, bad_bounds=False, unsupported=False, multi=False, rodata=False):
@@ -93,7 +94,11 @@ class Pipeline(unittest.TestCase):
         workload = (runtime / 'spu_workload.c').read_text()
         workload = workload[workload.index('uint64_t spu_workload_fingerprint('):
                             workload.index('/* ---- dispatch')]
-        (self.root / 'workload.c').write_text('#include "spu_workload.h"\n#include <stdio.h>\n#include <string.h>\n' + workload)
+        (self.root / 'workload.c').write_text(
+            '#include "spu_workload.h"\n#include "ps3emu/lifter_abi.h"\n'
+            '#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n'
+            'void ps3_spu_lifter_abi_check(uint32_t got) { '
+            'if (got != SPU_RUNTIME_LIFTER_ABI) abort(); }\n' + workload)
         channels = (runtime / 'spu_channels.c').read_text()
         channels = channels[channels.index('typedef void (*spu_fn)'):
                             channels.index('/* Which image registered')]
@@ -264,7 +269,7 @@ class Pipeline(unittest.TestCase):
                     'assert(ctx.gpr[3]._u32[0] == 7); return 0; }\n')
                 (self.root / 'overlap_control.c').write_text(control)
                 binary = self.root / ('overlap_control.exe' if sys.platform == 'win32' else 'overlap_control')
-                compiled = subprocess.run([cc, '-std=c11', '-I' + str(runtime),
+                compiled = subprocess.run([cc, '-std=c11', '-I' + str(runtime), '-I' + str(INCLUDE),
                                 str(self.root / 'overlap_control.c'), str(self.root / 'workload.c'),
                                 str(self.root / 'registry.c'), str(output / 'registry.c'),
                                 str(output / 'sample' / 'spu_recomp.c'), '-o', str(binary)],
@@ -314,7 +319,7 @@ class Pipeline(unittest.TestCase):
         cmake_source += 'include("${PS3RECOMP_DIR}/cmake/PS3RecompSPU.cmake")\n'
         cmake_source += 'ps3recomp_generate_spu("${CMAKE_CURRENT_BINARY_DIR}/spu" "${CMAKE_CURRENT_SOURCE_DIR}/input.bin")\n'
         cmake_source += 'add_executable(proof proof.c workload.c registry.c ${SPU_GENERATED_SOURCES})\n'
-        cmake_source += f'target_include_directories(proof PRIVATE "{runtime.as_posix()}")\n'
+        cmake_source += f'target_include_directories(proof PRIVATE "{runtime.as_posix()}" "{INCLUDE.as_posix()}")\n'
         (self.root / 'CMakeLists.txt').write_text(cmake_source)
         build = self.root / 'build'
         # Visual Studio generators select their own toolset instead of this
@@ -494,7 +499,7 @@ class Pipeline(unittest.TestCase):
             '}\n'
             + '\n'.join(body) + '\n')
         binary = self.root / ('raw_proof.exe' if sys.platform == 'win32' else 'raw_proof')
-        compiled = subprocess.run([cc, '-std=c11', '-I' + str(runtime),
+        compiled = subprocess.run([cc, '-std=c11', '-I' + str(runtime), '-I' + str(INCLUDE),
                                    str(self.root / 'proof.c'), str(self.root / 'workload.c'),
                                    str(self.root / 'registry.c'),
                                    str(self.output / 'spu_workloads.c'),
@@ -548,6 +553,128 @@ class Pipeline(unittest.TestCase):
         program = self.manifest()['programs'][0]
         functions = {start: end for start, end in program['diagnostics']['functions']}
         self.assertEqual(functions[tail], RAW_BASE + len(blob))
+    def legacy_images(self):
+        images = self.root / 'images'
+        images.mkdir(exist_ok=True)
+        (images / 'sample.elf').write_bytes(elf())
+        return images
+
+    def legacy_run(self, images, output, *extra):
+        command = [sys.executable, str(TOOLS / 'build_spu_workloads.py'),
+                   '--images', str(images), '--lifted', str(output),
+                   '--out', str(output / 'registry.c')] + list(extra)
+        return subprocess.run(command, capture_output=True, text=True)
+
+    def test_reuse_and_skip_lift_reject_pre_stamp_lift(self):
+        # A pre-stamp lift is what a port has before it re-runs the current
+        # lifter. Both reuse paths must fail before a registry exists.
+        images = self.legacy_images()
+        output = self.root / 'lifted'
+        first = self.legacy_run(images, output)
+        self.assertEqual(first.returncode, 0, first.stderr + first.stdout)
+        header = output / 'sample' / 'spu_recomp.h'
+        source = output / 'sample' / 'spu_recomp.c'
+        header_text = header.read_text()
+        source_text = source.read_text()
+        self.assertIn('#define SPU_LIFTER_ABI 1u', header_text)
+        self.assertIn('ps3_spu_lifter_abi_check(SPU_LIFTER_ABI);', source_text)
+        header.write_text(header_text.replace('#define SPU_LIFTER_ABI 1u\n', ''))
+        source.write_text(source_text.replace(
+            '    ps3_spu_lifter_abi_check(SPU_LIFTER_ABI);\n', ''))
+        for extra in ((), ('--skip-lift',)):
+            with self.subTest(extra=extra):
+                (output / 'registry.c').unlink(missing_ok=True)
+                result = self.legacy_run(images, output, *extra)
+                output_text = result.stderr + result.stdout
+                self.assertNotEqual(result.returncode, 0, output_text)
+                self.assertIn('SPU_LIFTER_ABI', output_text)
+                self.assertIn('re-lift', output_text)
+                self.assertFalse((output / 'registry.c').exists())
+
+    def test_reuse_of_stamped_lift_still_succeeds(self):
+        images = self.legacy_images()
+        output = self.root / 'lifted'
+        first = self.legacy_run(images, output)
+        self.assertEqual(first.returncode, 0, first.stderr + first.stdout)
+        second = self.legacy_run(images, output)  # no --relift: reuse
+        self.assertEqual(second.returncode, 0, second.stderr + second.stdout)
+        self.assertTrue((output / 'registry.c').exists())
+
+    def test_custom_lifter_without_stamp_fails(self):
+        images = self.legacy_images()
+        output = self.root / 'custom_lift'
+        fake = self.root / 'fake_lifter.py'
+        fake.write_text(
+            "import pathlib, sys\n"
+            "out = pathlib.Path(sys.argv[sys.argv.index('-o') + 1])\n"
+            "out.mkdir(parents=True, exist_ok=True)\n"
+            "(out / 'spu_recomp.h').write_text('#pragma once\\n"
+            "#include \"spu_context.h\"\\n"
+            "void sample_spu_recomp_register(void);\\n')\n"
+            "(out / 'spu_recomp.c').write_text('#include \"spu_recomp.h\"\\n"
+            "void sample_spu_recomp_register(void) {}\\n')\n")
+        result = self.legacy_run(images, output, '--lifter', str(fake))
+        output_text = result.stderr + result.stdout
+        self.assertNotEqual(result.returncode, 0, output_text)
+        self.assertIn('ps3_spu_lifter_abi_check', output_text)
+        self.assertIn('re-lift', output_text)
+        self.assertFalse((output / 'registry.c').exists())
+
+    def test_prebuilt_spu_dir_helper_rejects_pre_stamp_lift(self):
+        # The template's SPU_DIR branch calls this helper; configure must fail
+        # before a pre-stamp image reaches the target.
+        cmake = shutil.which('cmake')
+        if not cmake:
+            if __import__('os').environ.get('CI'):
+                self.fail('CMake required in CI')
+            self.skipTest('CMake unavailable')
+        project = self.root / 'spu_prebuilt'
+        image = project / 'spu' / 'sample'
+        image.mkdir(parents=True)
+        (project / 'main.c').write_text('int main(void) { return 0; }\n')
+
+        def write_lift(stamped):
+            header = '#pragma once\n#include "spu_context.h"\n'
+            source = '#include "spu_recomp.h"\n'
+            if stamped:
+                header += ('#define SPU_LIFTER_ABI 1u\n'
+                           'void ps3_spu_lifter_abi_check(uint32_t got);\n')
+                source += ('void sample_spu_recomp_register(void) { '
+                           'ps3_spu_lifter_abi_check(SPU_LIFTER_ABI); '
+                           'spu_register_function(0, 0); }\n')
+            else:
+                header += 'void sample_spu_recomp_register(void);\n'
+                source += ('void sample_spu_recomp_register(void) { '
+                           'spu_register_function(0, 0); }\n')
+            (image / 'spu_recomp.h').write_text(header)
+            (image / 'spu_recomp.c').write_text(source)
+
+        (project / 'CMakeLists.txt').write_text(
+            'cmake_minimum_required(VERSION 3.20)\n'
+            'project(spu_prebuilt C)\n'
+            f'set(PS3RECOMP_DIR "{TOOLS.parent.as_posix()}")\n'
+            'include("${PS3RECOMP_DIR}/cmake/PS3RecompSPU.cmake")\n'
+            'ps3recomp_spu_prebuilt_sources(SPU_PREBUILT_SOURCES SPU_IMAGE_COUNT '
+            '"${CMAKE_CURRENT_SOURCE_DIR}/spu")\n'
+            'add_executable(proof main.c ${SPU_PREBUILT_SOURCES})\n')
+
+        write_lift(False)
+        configured = subprocess.run(
+            [cmake, '-S', str(project), '-B', str(self.root / 'build_stale'),
+             '-DPython3_EXECUTABLE=' + sys.executable],
+            capture_output=True, text=True)
+        output_text = configured.stdout + configured.stderr
+        self.assertNotEqual(configured.returncode, 0, output_text)
+        self.assertIn('SPU_LIFTER_ABI', output_text)
+        self.assertIn('Re-lift', output_text)
+
+        write_lift(True)
+        configured = subprocess.run(
+            [cmake, '-S', str(project), '-B', str(self.root / 'build_stamped'),
+             '-DPython3_EXECUTABLE=' + sys.executable],
+            capture_output=True, text=True)
+        self.assertEqual(configured.returncode, 0,
+                         configured.stdout + configured.stderr)
 
     def test_legacy_images_mode_still_builds(self):
         images = self.root / 'images'

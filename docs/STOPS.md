@@ -45,7 +45,7 @@ Ids are stable kebab-case; a new gap gets a new kind, never a free-text variant.
 | Kind | Raised when |
 |---|---|
 | `identity-mismatch` | the executable loaded is not the one the runtime was lifted from, or does not match the `title.elf_sha256` pin |
-| `lifter-abi` | the lifted code was generated for a lifted-code ABI this runtime does not implement (`PPU_LIFTER_ABI` in the generated header against `PPU_RUNTIME_LIFTER_ABI`), so hooks the runtime assumes would not run |
+| `lifter-abi` | the lifted code was generated for a lifted-code ABI this runtime does not implement (`PPU_LIFTER_ABI` or `SPU_LIFTER_ABI` in the generated header against its `PPU_RUNTIME_LIFTER_ABI` or `SPU_RUNTIME_LIFTER_ABI`), so hooks or context accesses the runtime assumes would not work |
 | `config-invalid` | the configuration is wrong: bad file, unknown key, wrong type, out of range, unknown `PS3RECOMP_*` variable; a diagnostic variable that names more than its table holds (`PS3RECOMP_METAL_FRAME_DUMP_LIST` or `PS3RECOMP_VK_DUMP_LIST` with more than 32 present numbers: `env`, `count`, `max`) or that is not the form it takes (`PS3RECOMP_VK_DUMP_LIST` not a comma-separated list of present numbers, `PS3RECOMP_VK_DUMP_RANGE` not `<first>-<last>`: `env`, `value`) |
 | `unresolved-nid` | a firmware import has no handler and no `[[hle.stub]]` entry |
 | `unimplemented-syscall` | an lv2 syscall with no handler and no `[[lv2.stub]]` entry, other than a slot the firmware's own ENOSYS stub answers (`docs/LV2-SYSCALL-STATUS.md`) |
@@ -96,7 +96,7 @@ Where each is raised, and what it carries beyond `pc lr tid`:
 | Kind | Raised in | Fields |
 |---|---|---|
 | `identity-mismatch` | `ppu_load_elf` | `path size expected actual expected_from [pin_source]` |
-| `lifter-abi` | `ps3_lifter_abi_check` (`runtime/diag/lifter_abi.c`), called from `ppu_load_elf` before the file is read | `expected got` (the runtime's ABI and the lift's) |
+| `lifter-abi` | `ps3_lifter_abi_check` (`runtime/diag/lifter_abi.c`), called from `ppu_load_elf` before the file is read; `ps3_spu_lifter_abi_check`, emitted at the start of each generated `spu_recomp_register` before function-table insertion | `processor expected got` |
 | `config-invalid` | `ps3_config_*` | `file line col key env detail` |
 | `unresolved-nid` | `ps3_hle_call` (`runtime/ppu/ppu_hle.cpp`) | `nid name caller_lr` (`name` is `unknown`: the lift keeps only the NID) |
 | `unimplemented-syscall` | `lv2_syscall` (`ppu_loader.cpp`) | `num caller_lr` |

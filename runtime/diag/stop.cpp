@@ -378,17 +378,21 @@ void ps3_stop_spu_label_window(const char* func, uint32_t cmd, uint64_t ea,
              f, sizeof f / sizeof f[0], site);
 }
 
-void ps3_stop_lifter_abi(uint32_t expected, uint32_t got)
+void ps3_stop_lifter_abi(const char* processor, uint32_t expected, uint32_t got)
 {
     char exp_s[24], got_s[24];
     std::snprintf(exp_s, sizeof exp_s, "%u", expected);
     std::snprintf(got_s, sizeof got_s, "%u", got);
-    const ps3_stop_field f[] = { {"expected", exp_s}, {"got", got_s} };
+    const ps3_stop_field f[] = {
+        {"processor", processor ? processor : "unknown"},
+        {"expected", exp_s},
+        {"got", got_s},
+    };
     ps3_stop(PS3_STOP_LIFTER_ABI,
-             "the lifted code was generated for a different lifted-code ABI than this runtime implements; "
-             "running it would silently skip hooks the runtime assumes (a changed store-hook ABI, for example)",
-             "Re-lift the executable with this runtime's tools/ppu_lifter.py (and regenerate its header), "
-             "or build the runtime that matches the lift.",
+             "lifted code was generated for a different PPU or SPU ABI than this runtime implements",
+             "Re-lift the affected image with the matching tools/ppu_lifter.py or "
+             "tools/spu_lifter.py and regenerate its registration, or build the runtime "
+             "that matches the lift.",
              f, sizeof f / sizeof f[0], nullptr);
 }
 

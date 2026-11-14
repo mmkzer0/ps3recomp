@@ -76,7 +76,11 @@ exact-image SHA256, runtime fingerprints, generated image IDs, per-program
 status, and tool/input/output provenance. Configure fails if a candidate is
 invalid or unsupported, so a partial registration table cannot silently pass.
 With no supplied inputs, the existing manually generated `SPU_DIR` workflow
-continues to work.
+continues to work. Those prebuilt images must carry the current
+`SPU_LIFTER_ABI` stamp and its registration check: configure validates them
+with `tools/check_spu_lifter_abi.py` and fails rather than compile a
+pre-stamp lift. Re-lift with the current toolkit's `tools/spu_lifter.py` after
+updating.
 
 This scans only supplied files. It does not decrypt, decompress, infer raw
 job-module boundaries, or promise that a generated program can run correctly.

@@ -120,26 +120,19 @@ if(PORT_ENABLE_SPU AND PORT_SPU_INPUTS)
     list(APPEND SPU_SOURCES ${SPU_GENERATED_SOURCES}
          "${PS3RECOMP_DIR}/runtime/spu/spu_dispatch_mt.c")
 elseif(PORT_ENABLE_SPU)
-    file(GLOB SPU_LIFTED CONFIGURE_DEPENDS "${SPU_DIR}/*/spu_recomp.c")
-    if(SPU_LIFTED)
-        list(LENGTH SPU_LIFTED SPU_IMAGE_COUNT)
+    # The helper validates every prebuilt lift's ABI stamp/check before its
+    # source reaches the target; a pre-stamp image fails configuration.
+    include("${PS3RECOMP_DIR}/cmake/PS3RecompSPU.cmake")
+    ps3recomp_spu_prebuilt_sources(SPU_PREBUILT_SOURCES SPU_IMAGE_COUNT "${SPU_DIR}")
+    if(SPU_IMAGE_COUNT GREATER 0)
         message(STATUS "Lifted SPU:      ${SPU_IMAGE_COUNT} image(s)")
         # The musttail indirect-branch fast path. Excluded from the runtime
         # library on purpose (see the SDK root CMakeLists): it must be built
         # here, by clang, or the tail call degrades to a plain call and a guest
         # loop that branches indirectly walks the thread stack off its guard
         # page a few thousand iterations in.
-        list(APPEND SPU_SOURCES ${SPU_LIFTED}
+        list(APPEND SPU_SOURCES ${SPU_PREBUILT_SOURCES}
              "${PS3RECOMP_DIR}/runtime/spu/spu_dispatch_mt.c")
-        # Generated beside the lift; each is present only once its generator
-        # has been run, so each is included only if it is actually here.
-        foreach(gen IN ITEMS spu_workloads.c jobmods_register.c taskset_policy_bytes.c)
-            if(EXISTS "${SPU_DIR}/${gen}")
-                list(APPEND SPU_SOURCES "${SPU_DIR}/${gen}")
-            else()
-                message(STATUS "  (no ${gen} -- not registered)")
-            endif()
-        endforeach()
     else()
         message(STATUS "Lifted SPU:      none found in ${SPU_DIR}")
     endif()

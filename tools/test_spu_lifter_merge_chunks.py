@@ -53,6 +53,7 @@ BOUNDS = [(0x00, 0x04), (0x04, 0x18)]
 
 DRIVER = r'''
 #include "lifted.h"
+#include "ps3emu/lifter_abi.h"
 #include <assert.h>
 #include <stdio.h>
 SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*);
@@ -61,6 +62,7 @@ uint8_t g_spu_stack_reset_hint[1024];
 static int returned;
 void spu_indirect_branch(spu_context* ctx) { (void)ctx; returned = 1; }
 void spu_register_function(uint32_t addr, void (*fn)(spu_context*)) { (void)addr; (void)fn; }
+void ps3_spu_lifter_abi_check(uint32_t got) { assert(got == SPU_RUNTIME_LIFTER_ABI); }
 int main(void) {
     static spu_context c;
     uint32_t taken_at = 0;
@@ -126,7 +128,8 @@ class MergeChunkInterrupts(unittest.TestCase):
                 '../../runtime/spu/spu_helpers.h', helpers))
             (root / 'driver.c').write_text(DRIVER)
             exe = root / ('proof.exe' if sys.platform == 'win32' else 'proof')
-            built = subprocess.run([cc, '-O1', '-I', str(RUNTIME), '-o', str(exe),
+            built = subprocess.run([cc, '-O1', '-I', str(RUNTIME), '-I',
+                                    str(TOOLS.parent / 'include'), '-o', str(exe),
                                     str(root / 'lifted.c'), str(root / 'driver.c')],
                                    capture_output=True, text=True)
             self.assertEqual(built.returncode, 0, built.stderr)

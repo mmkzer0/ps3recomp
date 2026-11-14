@@ -24,6 +24,15 @@
 #include "../platform/win32_compat.h"   /* LONG, InterlockedExchange, Sleep */
 #endif
 #include "ps3emu/thread_name.h"
+#include "ps3emu/lifter_abi.h"
+
+/* The registration runtime is built on every supported host. A generated SPU
+ * lift dereferences the pinned context fields directly, so a layout drift must
+ * fail here, at build time, before any prebuilt registry can ship. */
+_Static_assert(SPU_RUNTIME_LIFTER_CONTEXT_LAYOUT_SIGNATURE(spu_context) ==
+               SPU_RUNTIME_LIFTER_CONTEXT_LAYOUT_SIGNATURE_PIN,
+               "spu_context layout used by lifted code changed: bump SPU_LIFTER_ABI "
+               "and update the data-model layout pin");
 
 #ifdef PS3_SYNC_TEST_HOOKS
 extern int ps3_sync_test_hook(const char* point, uint32_t value);
