@@ -62,3 +62,31 @@ if(TEST lifter_abi)
     set_property(TEST lifter_abi APPEND PROPERTY ENVIRONMENT
         "CC=${CMAKE_C_COMPILER}" "CXX=${CMAKE_CXX_COMPILER}")
 endif()
+# SPU lifts carry the ABI in each generated header and check it from their
+# generated registration function. The layout probe keeps the context fields
+# that generated code dereferences pinned to the ABI.
+gates_probe(probe_spu_lifter_abi_match probe_spu_lifter_abi.c stamp_lifter_abi.c)
+target_compile_definitions(probe_spu_lifter_abi_match PRIVATE
+    SPU_PROBE_ABI=1u PPU_PROBE_ABI=PPU_RUNTIME_LIFTER_ABI)
+
+gates_probe(probe_spu_lifter_abi_mismatch probe_spu_lifter_abi.c stamp_lifter_abi.c)
+target_compile_definitions(probe_spu_lifter_abi_mismatch PRIVATE
+    SPU_PROBE_ABI=2u PPU_PROBE_ABI=PPU_RUNTIME_LIFTER_ABI)
+
+gates_probe(probe_spu_lifter_layout probe_spu_lifter_layout.c stamp_lifter_abi.c)
+target_compile_definitions(probe_spu_lifter_layout PRIVATE
+    PPU_PROBE_ABI=PPU_RUNTIME_LIFTER_ABI)
+target_include_directories(probe_spu_lifter_layout PRIVATE "${PROJECT_SOURCE_DIR}/runtime/spu")
+
+# Compile-only: the selected data-model pin must equal the context layout. The
+# gate test also cross-compiles this file for Windows x64, where it selects the
+# Win64/LLP64 pin.
+add_library(probe_spu_lifter_layout_pin OBJECT probe_spu_lifter_layout_pin.c)
+target_include_directories(probe_spu_lifter_layout_pin PRIVATE
+    "${PROJECT_SOURCE_DIR}/include" "${PROJECT_SOURCE_DIR}/runtime/spu")
+
+gates_py_test(spu_lifter_abi runtime test_spu_lifter_abi.py
+    $<TARGET_FILE:probe_spu_lifter_abi_match>
+    $<TARGET_FILE:probe_spu_lifter_abi_mismatch>
+    $<TARGET_FILE:probe_spu_lifter_layout>
+    ${PROJECT_SOURCE_DIR})

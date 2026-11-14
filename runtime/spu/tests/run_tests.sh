@@ -36,7 +36,19 @@ command -v "$PYTHON" >/dev/null || {
 # defines g_cri_video_dma, which the fixtures define too (spu_dma.h's inline
 # writes it in every TU), so the runtime copy is renamed as well.
 RT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/spu-tests-runtime.XXXXXX")
-trap 'rm -rf "$RT_DIR"' EXIT
+cleanup()
+{
+    if command -v trash >/dev/null 2>&1; then
+        trash "$RT_DIR"
+    elif command -v trash-put >/dev/null 2>&1; then
+        trash-put "$RT_DIR"
+    elif command -v gio >/dev/null 2>&1; then
+        gio trash "$RT_DIR"
+    else
+        printf '[spu-tests] temporary runtime objects retained at %s (no trash utility)\n' "$RT_DIR" >&2
+    fi
+}
+trap cleanup EXIT
 RTCFLAGS=(-std=gnu17 -O2 -w -pthread -I "$RUNTIME_SPU" -I "$REPO/include"
           -I "$REPO/runtime/platform")
 RT_RENAMES=(-Dspu_rdch=rt_spu_rdch -Dspu_rchcnt=rt_spu_rchcnt
@@ -59,6 +71,7 @@ done
 "$GCC" "${RTCFLAGS[@]}" -c "$HERE/test_runtime_stubs.c" -o "$RT_DIR/test_runtime_stubs.o"
 "$CXX" -std=c++20 -O2 -I "$REPO/include" -c "$REPO/runtime/config/config.cpp" -o "$RT_DIR/config.o"
 "$CXX" -std=c++20 -O2 -I "$REPO/include" -c "$REPO/runtime/diag/stop.cpp" -o "$RT_DIR/stop.o"
+"$GCC" "${RTCFLAGS[@]}" -c "$REPO/runtime/diag/lifter_abi.c" -o "$RT_DIR/lifter_abi.o"
 
 pass=0
 fail=0
@@ -71,12 +84,11 @@ for gen in "$HERE"/gen_test_*.py; do
     [ -f "$main" ] || { echo "[skip] $name: no test_${name}_main.c"; continue; }
 
     elf="$HERE/test_${name}.elf"
-    # Use an `out_` prefix for generated dirs so `gen_test_*.py` and
-    # `out_*` never collide under a `rm -rf gen_*` glob.
+    # Generated C stays checked in at out_<name>; compiler objects and binaries
+    # live under RT_DIR so re-running the producer never removes user files.
     gen_out="$HERE/out_${name}"
-    exe="$HERE/test_${name}.exe"
-
-    rm -rf "$gen_out"
+    obj_dir="$RT_DIR/$name"
+    exe="$RT_DIR/test_${name}.exe"
     "$PYTHON" "$gen" > /dev/null
     "$PYTHON" "$TOOLS/spu_lifter.py" --auto-functions "$elf" \
         --output "$gen_out" > /dev/null
@@ -86,12 +98,12 @@ for gen in "$HERE"/gen_test_*.py; do
     # set EXTRA="..." (e.g. to link a libs/ HLE module like cellSync.c).
     EXTRA=""
     [ -f "$HERE/test_${name}.deps" ] && . "$HERE/test_${name}.deps"
-
-    if ( cd "$gen_out" &&
+    mkdir "$obj_dir"
+    if ( cd "$obj_dir" &&
          "$GCC" -std=gnu17 -O2 -w -I "$gen_out" -I "$RUNTIME_SPU" \
              -I "$REPO/include" -I "$REPO/runtime/platform" -I "$REPO/libs/sync" \
              -c "$gen_out/spu_recomp.c" "$main" $EXTRA &&
-         "$CXX" "$gen_out"/*.o "$RT_DIR"/*.o \
+         "$CXX" ./*.o "$RT_DIR"/*.o \
              -pthread -lm -o "$exe" ) 2> "$HERE/build_${name}.log"; then
         if out=$(SPU_DMA_LAX=1 "$exe" 2>&1); then rc=0; else rc=$?; fi
         if [ "$rc" -eq 0 ]; then
@@ -99,7 +111,9 @@ for gen in "$HERE"/gen_test_*.py; do
             pass=$((pass+1))
         else
             echo "[FAIL] $name (exit $rc)"
-            echo "$out" | sed 's/^/   /'
+            while IFS= read -r line; do
+                printf '   %s\n' "$line"
+            done <<< "$out"
             failed_tests+=("$name")
             fail=$((fail+1))
         fi

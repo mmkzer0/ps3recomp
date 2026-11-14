@@ -25,6 +25,7 @@ static const spu_func_entry spu_function_table[] = {
 };
 
 void spu_recomp_register(void) {
+    ps3_spu_lifter_abi_check(SPU_LIFTER_ABI);
     for (const spu_func_entry* e = spu_function_table; e->func; ++e)
         spu_register_function(e->addr, e->func);
 }

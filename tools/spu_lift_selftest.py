@@ -87,6 +87,8 @@ STUBS = r'''
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdlib.h>
+#include "ps3emu/lifter_abi.h"
 uint8_t* vm_base = 0;
 u128 spu_rdch(spu_context* c, uint32_t ch){ (void)c;(void)ch; return spu_zero(); }
 uint32_t spu_rchcnt(spu_context* c, uint32_t ch){ (void)c;(void)ch; return 1; }
@@ -95,6 +97,10 @@ void spu_indirect_branch(spu_context* c){ (void)c; fprintf(stderr,"unexpected in
 void spu_register_function(uint32_t a, void(*f)(spu_context*)){ (void)a;(void)f; }
 void spu_stop(spu_context* c){ (void)c; }
 void spu_halt(spu_context* c){ (void)c; }
+void ps3_spu_lifter_abi_check(uint32_t got)
+{
+    if (got != SPU_RUNTIME_LIFTER_ABI) abort();
+}
 /* The lifter grew references to these runtime hooks, and the standalone driver
  * did not follow -- the validation has not linked since. Stub them so the test
  * runs again; none affect the arithmetic being checked. */
@@ -193,6 +199,7 @@ def main() -> int:
     open(driver, "w").write(gen_driver(meta))
     exe = os.path.join(work, "spulift.exe")
     sh([args.host_cc, "-std=c11", "-O2", "-w", "-I", gen, "-I", RUNTIME_SPU,
+        "-I", os.path.join(REPO, "include"),
         os.path.join(gen, "spu_recomp.c"), driver, "-o", exe])
     out = subprocess.run([exe], capture_output=True, text=True)
     print(out.stdout, end="")

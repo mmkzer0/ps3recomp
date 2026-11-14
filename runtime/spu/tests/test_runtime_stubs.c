@@ -11,6 +11,11 @@
 #include <time.h>
 
 #include "spu_context.h"
+#include "ps3emu/lifter_abi.h"
+
+/* The shared diagnostic object contains the PPU check too; these fixtures
+ * exercise SPU registration, so give its unused PPU reference the runtime ABI. */
+const uint32_t ppu_lifter_abi = PPU_RUNTIME_LIFTER_ABI;
 
 /* runtime/ppu/ppu_loader.cpp and runtime/host/host_stubs.c */
 uint32_t ppu_vm_size = 0;

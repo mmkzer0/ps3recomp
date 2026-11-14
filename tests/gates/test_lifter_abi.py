@@ -46,6 +46,7 @@ def test_mismatched_abi_stops_by_name():
     p = g.run([MISMATCH])
     f = g.expect_stop(p, "lifter-abi")
     assert f["expected"] == expected, f
+    assert f["processor"] == "ppu", f
     assert f["got"] != expected, f
     # The banner names both sides so a reader knows which pair is wrong.
     assert re.search(rf"^\s+expected\s+{re.escape(expected)}$", p.stderr, re.M), p.stderr

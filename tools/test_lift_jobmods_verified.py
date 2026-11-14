@@ -175,6 +175,7 @@ with tempfile.TemporaryDirectory(prefix="lift-jobmods-verified-") as tmp:
         driver = tmp / "driver.c"
         driver.write_text(r'''
 #include "spu_interp.h"
+#include "ps3emu/lifter_abi.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -184,6 +185,9 @@ extern const unsigned char mod_a[], mod_b[];
 extern const unsigned mod_a_len, mod_b_len;
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
+void ps3_spu_lifter_abi_check(uint32_t got) {
+    if (got != SPU_RUNTIME_LIFTER_ABI) abort();
+}
 void spu_thread_publish_ctx(uint32_t tid, void* c) { (void)tid; (void)c; abort(); }
 void ppu_resv_break_store(uint64_t ea) { (void)ea; abort(); }
 void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; abort(); }

@@ -38,6 +38,37 @@ Targets the ABI in `runtime/spu/spu_context.h` (`u128 gpr[128]`, 256 KB
 local store, channels, MFC staging) and the `u128` union in
 `include/ps3emu/ps3types.h`.
 
+## Generated-code ABI
+
+Each generated header carries `SPU_LIFTER_ABI`; its `spu_recomp_register()`
+checks that value against `SPU_RUNTIME_LIFTER_ABI` before adding any functions.
+A mismatch stops with `lifter-abi` and identifies the SPU processor, expected
+ABI, and generated ABI. The pinned layout signature in
+`include/ps3emu/lifter_abi.h` covers the fields accessed by generated code and
+its inline helpers/macros: `gpr`, `pc`, `status`, `stop_code`, `image_id`,
+`event_status`, `event_mask`, `srr0`, `int_enable`, `host_depth`, `reloc_delta`,
+`ls`, `policy_mode`, and `steps`. A changed member offset or size requires
+updating the signature pin and bumping the runtime ABI together;
+`tests/gates/test_spu_lifter_abi.py` enforces the pin.
+
+The signature is per host data model: `spu_channel.lock` is a `volatile long`,
+so LP64 (macOS arm64, Linux x86_64) and Win64/LLP64 lay out every later pinned
+field differently. `include/ps3emu/lifter_abi.h` carries a measured pin for each
+model and rejects an unverified model at compile time. The always-built SPU
+registration runtime (`runtime/spu/spu_workload.c`) asserts the selected pin,
+and `tests/gates/probe_spu_lifter_layout_pin.c` is also cross-compiled for
+Windows x64 by the gate test. Running the Windows runtime is the Windows t0
+job's coverage, not a local macOS check.
+
+Prebuilt lifts are validated before they are compiled:
+`tools/check_spu_lifter_abi.py` requires `SPU_LIFTER_ABI` in each generated
+header and the `ps3_spu_lifter_abi_check` call before the registration's first
+`spu_register_function` call. `tools/build_spu_workloads.py` runs it before
+writing a registry, which covers an existing `spu_recomp.c`, `--skip-lift`,
+`--relift` and a caller-supplied `--lifter`; the template's `SPU_DIR` helper
+runs it at configure time. A lift from before the gate therefore fails the
+build instead of linking without a check.
+
 ## Relationship to the PPU fallback approach (read `SPU_FALLBACK.md` first)
 
 The project's **current** SPU strategy is *not* execution — it is the
