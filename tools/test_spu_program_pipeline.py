@@ -2,6 +2,7 @@
 """Synthetic discovery -> generated registration coverage, no guest assets."""
 import json
 from pathlib import Path
+import hashlib
 import shutil
 import struct
 import subprocess
@@ -10,6 +11,13 @@ import tempfile
 import unittest
 
 TOOLS = Path(__file__).resolve().parent
+sys.path.insert(0, str(TOOLS))
+
+
+def raw_job_tools():
+    """The synthetic raw builder, imported once TOOLS is on sys.path."""
+    from gen_test_raw_job import LS_BASE, build
+    return LS_BASE, build
 
 
 def elf(value=7, *, bad_bounds=False, unsupported=False, multi=False, rodata=False):
@@ -60,6 +68,23 @@ class Pipeline(unittest.TestCase):
 
     def manifest(self):
         return json.loads((self.output / 'inventory.json').read_text())
+
+    def run_raw(self, entries):
+        manifest = self.root / 'raw_images.json'
+        manifest.write_text(json.dumps(entries))
+        command = [sys.executable, str(TOOLS / 'build_spu_workloads.py'),
+                   '--raw-images', str(manifest),
+                   '--lifted', str(self.output), '--out', str(self.output / 'spu_workloads.c')]
+        return subprocess.run(command, capture_output=True, text=True, check=False)
+
+    def raw_entry(self, blob, name='raw-job.bin', **overrides):
+        ls_base, _ = raw_job_tools()
+        path = self.root / name
+        path.write_bytes(blob)
+        entry = {'path': str(path), 'sha256': hashlib.sha256(blob).hexdigest(),
+                 'ls_base': hex(ls_base)}
+        entry.update(overrides)
+        return entry
 
     def write_runtime_blocks(self):
         runtime = TOOLS.parent / 'runtime' / 'spu'
@@ -359,6 +384,170 @@ class Pipeline(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(self.manifest()['complete'])
         self.assertTrue(any('not discovered' in e for e in self.manifest()['errors']))
+
+    def test_synthetic_raw_job_registers_and_reports_its_effects(self):
+        RAW_BASE, build_raw_job = raw_job_tools()
+        sys.path.insert(0, str(TOOLS))
+        from spu_elf import fnv1a64
+        blob = build_raw_job()
+        result = self.run_raw([self.raw_entry(blob)])
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        report = self.manifest()
+        self.assertTrue(report['complete'])
+        self.assertEqual(len(report['programs']), 1)
+        program = report['programs'][0]
+        self.assertEqual(program['status'], 'registered')
+        self.assertEqual(program['image_kind'], 'raw')
+        self.assertEqual(program['entry'], RAW_BASE)
+        self.assertEqual(program['ls_base'], RAW_BASE)
+        self.assertIsNone(program['code_end'])
+        self.assertEqual(program['occurrences'][0]['kind'], 'raw')
+        # The registration fingerprint is the runtime's hash over the whole
+        # staged blob, not an ELF extent or the executable text slice.
+        self.assertEqual(program['fingerprint'], f'{fnv1a64(blob):016X}')
+        self.assertNotIn('text_fingerprint', program)
+
+        effects = program['effects']
+        channels = {entry['channel']: (entry['read'], entry['write'], entry['count'])
+                    for entry in effects['channels']}
+        self.assertEqual(channels, {16: (0, 4, 0), 17: (0, 4, 0), 18: (0, 4, 0),
+                                    19: (0, 4, 0), 20: (0, 4, 0), 21: (0, 5, 0),
+                                    27: (2, 0, 0), 28: (0, 1, 0)})
+        self.assertEqual({entry['command']: entry['count'] for entry in effects['mfc_commands']},
+                         {0x20: 1, 0x40: 1, 0xB4: 1, 0xD0: 1})
+        self.assertEqual({entry['command']: entry['name'] for entry in effects['mfc_commands']},
+                         {0x20: 'PUT', 0x40: 'GET', 0xB4: 'PUTLLC', 0xD0: 'GETLLAR'})
+        # One `wrch MFC_Cmd` takes its command from LS: remembered as
+        # unresolved and still counted as a channel-21 write.
+        self.assertEqual(len(effects['unresolved']), 1)
+        unresolved = effects['unresolved'][0]
+        self.assertEqual((unresolved['channel'], unresolved['access'], unresolved['register']),
+                         (21, 'write', '$r11'))
+        sites = {entry['channel']: entry['sites'] for entry in effects['channels']}
+        self.assertIn(unresolved['site'], sites[21]['write'])
+
+        cc = shutil.which('clang') or shutil.which('cc')
+        if not cc:
+            if __import__('os').environ.get('CI'):
+                self.fail('C compiler required for the raw registration harness in CI')
+            self.skipTest('C compiler unavailable')
+        runtime = self.write_runtime_blocks()
+        lifted = self.output / program['name']
+        body = [
+            'unsigned char image[] = {' + ','.join(str(x) for x in blob) + '};',
+            'int main(void) {',
+            '    uint64_t fp = spu_workload_fingerprint(image, sizeof image);',
+            f'    assert(fp == 0x{program["fingerprint"]}ULL);',
+            '    spu_register_all();',
+            '    assert(spu_workload_count() == 1);',
+            '    int id = 0; spu_lifted_entry_fn f = spu_workload_find_img(fp, &id);',
+            f'    assert(f && id == {program["image_id"]});',
+            f'    assert(spu_lookup(0x{RAW_BASE:X}, id) == f);',
+            '    static spu_context ctx;',
+            '    ctx.ls = ctx.ls_store;',
+            '    f(&ctx);',
+            # A cross-function branch is a trampoline transfer in the port's
+            # execution model; drain it. `spu_indirect_branch` here is the
+            # top-level `bi $r0` return (host_depth 0), not a dispatch.
+            '    while (g_spu_trampoline_fn && g_spu_trampoline_fn != spu_indirect_branch) {',
+            '        spu_lifted_entry_fn next = g_spu_trampoline_fn;',
+            '        g_spu_trampoline_fn = 0;',
+            '        next(&ctx);',
+            '    }',
+            '    assert(s_writes[16] == 4 && s_writes[17] == 4 && s_writes[18] == 4);',
+            '    assert(s_writes[19] == 4 && s_writes[20] == 4 && s_writes[21] == 5);',
+            '    assert(s_writes[27] == 2 && s_writes[28] == 1);',
+            '    assert(s_ncommands == 5);',
+            '    assert(s_commands[0] == 0x40u && s_commands[1] == 0x20u);',
+            '    assert(s_commands[2] == 0xD0u && s_commands[3] == 0xB4u);',
+            '    assert(s_commands[4] == 0u);   /* lqd from the zeroed local store */',
+            '    return 0;',
+            '}',
+        ]
+        (self.root / 'proof.c').write_text(
+            '#include "spu_workload.h"\n#include <assert.h>\n#include <string.h>\n'
+            'extern void spu_register_all(void);\n'
+            'extern spu_lifted_entry_fn spu_lookup(uint32_t, int);\n'
+            'SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*);\n'
+            'int g_spu_direct = 0;\n'
+            'uint8_t g_spu_stack_reset_hint[1024];\n'
+            'int g_spu_ls_watch_n = 0;\n'
+            'void spu_ls_watch_slow(uint32_t lsa, int is_write, const uint8_t* p,\n'
+            '                       uint32_t pc, uint32_t lr) {\n'
+            '    (void)lsa; (void)is_write; (void)p; (void)pc; (void)lr; assert(0);\n'
+            '}\n'
+            'static unsigned s_writes[64];\n'
+            'static uint32_t s_commands[8];\n'
+            'static unsigned s_ncommands;\n'
+            'void spu_indirect_branch(spu_context* ctx) { (void)ctx; assert(0); }\n'
+            'void spu_wrch(spu_context* ctx, uint32_t channel, u128 value) {\n'
+            '    (void)ctx; assert(channel < 64); s_writes[channel]++;\n'
+            '    if (channel == 21) { assert(s_ncommands < 8);\n'
+            '        s_commands[s_ncommands++] = value._u32[0]; }\n'
+            '}\n'
+            'u128 spu_rdch(spu_context* ctx, uint32_t channel) {\n'
+            '    (void)ctx; assert(channel < 64); s_writes[channel]++;\n'
+            '    u128 value; memset(&value, 0, sizeof value); return value;\n'
+            '}\n'
+            'uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel) {\n'
+            '    (void)ctx; (void)channel; return 0;\n'
+            '}\n'
+            + '\n'.join(body) + '\n')
+        binary = self.root / ('raw_proof.exe' if sys.platform == 'win32' else 'raw_proof')
+        compiled = subprocess.run([cc, '-std=c11', '-I' + str(runtime),
+                                   str(self.root / 'proof.c'), str(self.root / 'workload.c'),
+                                   str(self.root / 'registry.c'),
+                                   str(self.output / 'spu_workloads.c'),
+                                   str(lifted / 'spu_recomp.c'), '-o', str(binary)],
+                                  capture_output=True, text=True, check=False)
+        self.assertEqual(compiled.returncode, 0, compiled.stderr + compiled.stdout)
+        subprocess.run([str(binary)], check=True)
+
+    def test_raw_image_sha256_mismatch_is_named(self):
+        _, build_raw_job = raw_job_tools()
+        blob = build_raw_job()
+        result = self.run_raw([self.raw_entry(blob, sha256='0' * 64)])
+        self.assertNotEqual(result.returncode, 0)
+        report = self.manifest()
+        self.assertFalse(report['complete'])
+        self.assertTrue(any('sha256 mismatch' in error for error in report['errors']),
+                        report['errors'])
+        self.assertFalse((self.output / 'spu_workloads.c').exists())
+        self.assertIn('sha256 mismatch', result.stderr)
+
+    def test_raw_image_code_end_past_blob_is_named(self):
+        RAW_BASE, build_raw_job = raw_job_tools()
+        blob = build_raw_job()
+        result = self.run_raw([self.raw_entry(blob,
+                                              code_end=hex(RAW_BASE + len(blob) + 16))])
+        self.assertNotEqual(result.returncode, 0)
+        report = self.manifest()
+        self.assertFalse(report['complete'])
+        self.assertTrue(any('code_end' in error and 'past the image end' in error
+                            for error in report['errors']), report['errors'])
+        self.assertFalse((self.output / 'spu_workloads.c').exists())
+
+    def test_raw_code_end_reaches_the_lifter(self):
+        RAW_BASE, build_raw_job = raw_job_tools()
+        blob = build_raw_job(tail_words=4)
+        tail = RAW_BASE + len(blob) - 16
+        code_end = tail + 8
+        result = self.run_raw([self.raw_entry(blob, code_end=hex(code_end),
+                                              extra_entry_points=[hex(tail + 4)])])
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        program = self.manifest()['programs'][0]
+        self.assertEqual(program['code_end'], code_end)
+        self.assertEqual(program['extra_entry_points'], [tail + 4])
+        functions = {start: end for start, end in program['diagnostics']['functions']}
+        self.assertEqual(functions[tail], tail + 4)
+        self.assertEqual(functions[tail + 4], code_end)
+        self.assertIn('code-end', (self.output / program['name'] / 'lift.log').read_text())
+        # Without the boundary the same tail function runs to the blob end.
+        result = self.run_raw([self.raw_entry(blob)])
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        program = self.manifest()['programs'][0]
+        functions = {start: end for start, end in program['diagnostics']['functions']}
+        self.assertEqual(functions[tail], RAW_BASE + len(blob))
 
     def test_legacy_images_mode_still_builds(self):
         images = self.root / 'images'

@@ -23,11 +23,23 @@ fingerprint computed here is byte-identical to runtime/spu/spu_workload.c's
 spu_workload_fingerprint() over spu_elf_image_size() bytes, so registrations and
 the images the title passes to cellSpurs line up.
 
+A JobQueue2 job image has no ELF container: the PPU stages `sizeBinary << 4`
+bytes of guest memory at LS 0x7C00. Those blobs are supplied through
+--raw-images, a JSON list of {path, sha256, ls_base, code_end?,
+extra_entry_points?}. Their registration fingerprint is the FNV-1a-64 over the
+whole staged blob (exactly what the runtime hashes), and the inventory reports
+the channels and MFC commands the lifted code contains.
+
 Example:
   python tools/build_spu_workloads.py \
       --images <port>/spu/images --lifted <port>/spu \
       --out <port>/spu/spu_workloads.c \
       --register-fn port_spu_register_all --constructor --title <port>
+
+  python tools/build_spu_workloads.py \
+      --raw-images <port>/spu/raw_images.json --lifted <port>/spu/raw \
+      --out <port>/spu/raw/spu_workloads.c \
+      --register-fn port_spu_register_all --title <port>
 """
 import argparse, glob, os, re, subprocess, sys
 
@@ -102,9 +114,16 @@ def debase_includes(path):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    inputs = ap.add_mutually_exclusive_group(required=True)
+    inputs = ap.add_mutually_exclusive_group()
     inputs.add_argument("--input", action="append", help="Discover every embedded SPU ELF in supplied files (repeatable)")
     inputs.add_argument("--images", help="dir containing SPU ELFs (*.elf)")
+    ap.add_argument("--raw-images", metavar="JSON",
+                    help="JSON list of raw local-store job images (a JobQueue2 job blob is "
+                         "not an ELF); usable alone or with --input. Each entry names path, "
+                         "sha256, ls_base (0x7C00 for JobQueue2 jobs), optional code_end "
+                         "(passed to the lifter's --code-end) and optional "
+                         "extra_entry_points. A blob whose sha256 does not match the "
+                         "manifest fails the run.")
     ap.add_argument("--lifted", required=True, help="output dir for per-image lifted C (one subdir per image)")
     ap.add_argument("--out", required=True, help="output registration C file")
     ap.add_argument("--register-fn", default="spu_register_all",
@@ -140,7 +159,11 @@ def main():
                          "image id. A registered program missing from the map is an error, so "
                          "ids are reviewed and stable instead of content-derived")
     args = ap.parse_args()
-    if args.input:
+    if args.raw_images and args.images:
+        ap.error("--raw-images is a --input pipeline option; it cannot be combined with --images")
+    if not args.input and not args.raw_images and not args.images:
+        ap.error("one of --input, --raw-images or --images is required")
+    if args.input or args.raw_images:
         from spu_program_pipeline import build_programs
         sys.exit(build_programs(args, write_registry))
 

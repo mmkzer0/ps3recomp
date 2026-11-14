@@ -611,9 +611,9 @@ def detect_functions(buf, base_override=None, verbose=True, raw=False):
         # from its own data files as a flat code+data blob rather than as an
         # embedded ELF. There is no program header, no entry field and no
         # symbol table -- the whole file is .text at `base`, and every seed has
-        # to come from the branch/call analysis below. Discovered via
-        # spu_workload's SPU_DUMP_MISS, which is the only place these bytes
-        # exist in one piece.
+        # to come from the branch/call analysis below. The bytes come from
+        # spu_workload's SPU_DUMP_MISS or from a --raw-images manifest in
+        # build_spu_workloads.py.
         base = base_override if base_override is not None else 0
         elf = {"entry": base, "phs": [{"type": 1, "flags": 1, "off": 0,
                                        "vaddr": base, "filesz": len(buf),
