@@ -81,6 +81,7 @@
 #include <span>
 
 struct spu_context;
+struct spu_job_end; /* runtime/spu/spurs_job.h */
 
 namespace ps3recomp::spurs::jq2 {
 
@@ -121,6 +122,11 @@ struct ExecutorHooks {
     JobBody (*select_body)(void* user, const JobStart&) = nullptr;
     /* A job was admitted and its descriptor copied; the job has not started. */
     void (*on_admit)(void* user, const JobStart&) = nullptr;
+    /* A job body ended, however it ended, before the executor applies its policy to the end: a job that
+     * did not return is a named stop right after this call (jq2-job-end, jq2-jm-call), so this is the
+     * only place a caller sees such an end. `ctx` is the finished context, `end` its class
+     * (spu_job_classify_end). The job has been neither credited nor released. Runs on the worker. */
+    void (*on_end)(void* user, const JobStart&, const ::spu_context* ctx, const ::spu_job_end& end) = nullptr;
     /* A job returned; nothing has been credited or released yet. */
     void (*on_done)(void* user, const JobStart&) = nullptr;
     /* A push (job, copy or sync) has passed its checks and is about to take the
@@ -144,8 +150,8 @@ struct ExecutorHooks {
 /* Install hooks for the queues created after this call. */
 void set_executor_hooks(const ExecutorHooks& hooks);
 
-/* The body that interprets the job image from LS 0 and accepts only a return to
- * the job manager (pc just past the stop at the return address). */
+/* The body that interprets the job image from LS 0. The executor accepts only a return to the job
+ * manager from any body (pc just past the stop at the return address, for this one). */
 [[nodiscard]] JobBody interpreter_body() noexcept;
 
 /* The link address spu_run_spurs_job_snapshot plants for a job to return to:

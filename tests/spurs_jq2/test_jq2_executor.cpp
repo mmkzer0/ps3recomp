@@ -42,6 +42,11 @@
  *               port is not credited
  *   stop-crt    a job image with another CRT: the loader's named stop, no credit
  *   stop-ring   an entry the executor does not model: named stop jq2-ring-entry
+ *   end-return, end-return-lifted, end-stop, end-halt, end-jm-call  the end class of docs/SPU_XDIFF.md 7.6 that
+ *               ExecutorHooks::on_end reports before the executor's policy runs: return (interpreted and
+ *               lifted, with and without an observer), stop with its code, halt, jm call (interpreted and
+ *               lifted); the stopping ends still stop with the same kinds and fields
+ *   end-classify  spu_job_classify_end on hand-built contexts: every class and the neighbours of each rule
  *   sync-concurrent  several PPU threads block in mode 0 on different ports at
  *               once, each woken by its own credits
  *   stop-waiter-id   a credit finds an event-flag waiter with id 64: jq2-wake
@@ -83,6 +88,7 @@
 #include "spu_helpers.h"
 #include "spu_observe.h"
 #include "spu_coherency.h"
+#include "spurs_job.h"
 #include "spu_workload.h"
 #include "syscalls/sys_event.h"
 #include "ps3emu/ps3_ftrace.h"
@@ -396,6 +402,26 @@ void hook_done(void*, const JobStart& js)
     g_probe.done[serial_of(js)] = ++g_probe.clock;
 }
 
+/* What ExecutorHooks::on_end reported, in guest memory: the arena is MAP_SHARED, so the record of a job that
+ * ended in a named stop (a forked child) is still there for the parent to read. One job per run. */
+constexpr std::uint32_t END_REC = 0xE00000;
+struct EndRec {
+    std::uint32_t count, end_class, stop_code, pc, status;
+};
+void hook_end(void*, const JobStart&, const spu_context*, const spu_job_end& e)
+{
+    put32(END_REC + 4, e.end_class);
+    put32(END_REC + 8, e.stop_code);
+    put32(END_REC + 12, e.pc);
+    put32(END_REC + 16, e.status);
+    put32(END_REC, get32(END_REC) + 1);
+}
+EndRec end_rec()
+{
+    return {get32(END_REC), get32(END_REC + 4), get32(END_REC + 8), get32(END_REC + 12), get32(END_REC + 16)};
+}
+void end_rec_clear() { std::memset(vm_base + END_REC, 0, 32); }
+
 /* The job bodies a test selects; 0 leaves the interpreter. */
 enum LiftedKind { kNoLifted = 0, kLiftedNormal, kLiftedHalt, kLiftedJmCall, kLiftedBusy };
 int g_lifted = kNoLifted;
@@ -519,6 +545,7 @@ void install_hooks()
     h.on_push_checked = &hook_push_checked;
     h.on_push_blocked = &hook_push_blocked;
     h.on_done = &hook_done;
+    h.on_end = &hook_end;
     if (g_lifted != kNoLifted) h.select_body = &hook_select;
     set_executor_hooks(h);
 }
@@ -1311,6 +1338,129 @@ void mode_lifted()
     CHECK(s.dispatched == 1 && s.executed == 1 && s.credited == 1, "counts %llu/%llu/%llu",
           (unsigned long long)s.dispatched, (unsigned long long)s.executed, (unsigned long long)s.credited);
     rig.teardown();
+}
+
+/* ---- the end class (docs/SPU_XDIFF.md 7.6) -------------------------------------- */
+
+/* One job runs to a return; the record ExecutorHooks::on_end left is the class and the context fields the tier
+ * left. An interpreted job returns by executing the `stop 0` at the link (status STOP, pc link + 4); a lifted
+ * one is halted by the resolver on the branch to the link (pc the link, neither STOP nor HALT). Both are the
+ * one class `return`. A second job runs with an observer installed: the loader's observed path reports too. */
+void end_return_scenario(int lifted)
+{
+    g_lifted = lifted;
+    build_image(IMAGE, Prog::transform);
+    install_hooks();
+    Rig rig({128, 1, false});
+    end_rec_clear();
+    const JobSpec a = spec(0);
+    rig.push(a.desc, 64, 0);
+    CHECK(jq2_port_sync(PORT, 0) == 0, "sync");
+    CHECK(job_ok(a), "the job's output");
+    EndRec r = end_rec();
+    CHECK(r.count == 1, "%u end reports, want 1", r.count);
+    CHECK(r.end_class == 1, "class %u, want 1 (return)", r.end_class);
+    CHECK(r.stop_code == 0, "stop code 0x%X", r.stop_code);
+    if (lifted == kNoLifted) {
+        CHECK(r.pc == 0x3FF04 && r.status == SPU_STATUS_STOPPED_BY_STOP, "interpreted end pc 0x%X status 0x%X",
+              r.pc, r.status);
+    } else {
+        CHECK(r.pc == 0x3FF00 && (r.status & (SPU_STATUS_STOPPED_BY_STOP | SPU_STATUS_STOPPED_BY_HALT)) == 0,
+              "lifted end pc 0x%X status 0x%X", r.pc, r.status);
+    }
+
+    const jq2_job_observer obs{nullptr, nullptr, nullptr};
+    CHECK(jq2_set_job_observer(QUEUE, &obs) == 0, "observer");
+    end_rec_clear();
+    const JobSpec b = spec(1);
+    rig.push(b.desc, 64, 0);
+    CHECK(jq2_port_sync(PORT, 0) == 0, "sync observed");
+    CHECK(job_ok(b), "the observed job's output");
+    r = end_rec();
+    CHECK(r.count == 1 && r.end_class == 1, "observed: %u reports, class %u", r.count, r.end_class);
+    jq2_stats s{};
+    CHECK(jq2_queue_stats(QUEUE, &s) == 0, "stats");
+    CHECK(s.executed == 2 && s.credited == 2, "counts %llu/%llu", (unsigned long long)s.executed,
+          (unsigned long long)s.credited);
+    rig.teardown();
+}
+void mode_end_return() { end_return_scenario(kNoLifted); }
+void mode_end_return_lifted() { end_return_scenario(kLiftedNormal); }
+
+/* A job that ends otherwise is a named stop as before, and the class was reported first: the record is in the
+ * shared arena when the child dies. */
+EndRec end_after_stop(Prog prog, const char* kind, const char* needle)
+{
+    end_rec_clear();
+    stop_scenario(prog, kind, needle);
+    return end_rec();
+}
+
+void mode_end_stop()
+{
+    const EndRec r = end_after_stop(Prog::stop_early, "jq2-job-end", "stop_code=0x2222");
+    CHECK(r.count == 1, "%u end reports, want 1", r.count);
+    CHECK(r.end_class == 2, "class %u, want 2 (stop)", r.end_class);
+    CHECK(r.stop_code == 0x2222, "stop code 0x%X", r.stop_code);
+    CHECK(r.status == SPU_STATUS_STOPPED_BY_STOP, "status 0x%X", r.status);
+}
+
+void mode_end_halt()
+{
+    g_lifted = kLiftedHalt;
+    const EndRec r = end_after_stop(Prog::transform, "jq2-job-end", "reason=halt");
+    CHECK(r.count == 1, "%u end reports, want 1", r.count);
+    CHECK(r.end_class == 3, "class %u, want 3 (halt)", r.end_class);
+    CHECK(r.status == SPU_STATUS_STOPPED_BY_HALT, "status 0x%X", r.status);
+}
+
+void mode_end_jm_call()
+{
+    for (const int lifted : {int(kNoLifted), int(kLiftedJmCall)}) {
+        g_lifted = lifted;
+        const EndRec r = end_after_stop(Prog::jm_call, "jq2-jm-call", "request=0x1234");
+        CHECK(r.count == 1, "lifted=%d: %u end reports, want 1", lifted, r.count);
+        CHECK(r.end_class == 4, "lifted=%d: class %u, want 4 (jm-call)", lifted, r.end_class);
+        CHECK(r.stop_code == 0x3B0F && r.pc == 0x1504, "lifted=%d: stop code 0x%X pc 0x%X", lifted, r.stop_code, r.pc);
+    }
+}
+
+/* The classifier alone, on contexts built by hand from the contract of section 7.6: every class, and the
+ * neighbours of each rule that must not change class (a stop that is not at the link or the jm word, a halt at
+ * the link, both status bits, the pc's local-store mask). It reads the context and nothing else. */
+void mode_end_classify()
+{
+    constexpr std::uint32_t STOP = SPU_STATUS_STOPPED_BY_STOP, HALT = SPU_STATUS_STOPPED_BY_HALT;
+    struct Case {
+        const char* what;
+        std::uint32_t status, code, pc, want;
+    };
+    const Case cases[] = {
+        {"interpreted return", STOP, 0, 0x3FF04, 1},
+        {"lifted return", 0, 0, 0x3FF00, 1},
+        {"lifted return, pc beyond the local-store mask", 0, 0x77, 0x3FF00 | 0x40000, 1},
+        {"stop 0 elsewhere", STOP, 0, 0x7C10, 2},
+        {"stop 0 at the link itself", STOP, 0, 0x3FF00, 2},
+        {"stop with a code at the link", STOP, 0x2222, 0x3FF04, 2},
+        {"jm call", STOP, 0x3B0F, 0x1504, 4},
+        {"the jm code elsewhere", STOP, 0x3B0F, 0x1508, 2},
+        {"another code at the jm word", STOP, 0x3B0E, 0x1504, 2},
+        {"halt", HALT, 0, 0x7C20, 3},
+        {"halt at the link", HALT, 0, 0x3FF00, 3},
+        {"halt just past the link", HALT, 0, 0x3FF04, 3},
+        {"run ended elsewhere", 0, 0, 0x7C20, 5},
+        {"stop and halt both set", STOP | HALT, 0, 0x3FF00, 5},
+    };
+    for (const Case& c : cases) {
+        const std::unique_ptr<spu_context> ctx(new spu_context{});
+        ctx->status = c.status;
+        ctx->stop_code = c.code;
+        ctx->pc = c.pc;
+        const spu_job_end e = spu_job_classify_end(ctx.get());
+        CHECK(e.end_class == c.want, "%s: class %u, want %u", c.what, e.end_class, c.want);
+        CHECK(e.stop_code == c.code && e.status == c.status && e.pc == (c.pc & SPU_LS_MASK),
+              "%s: record code 0x%X status 0x%X pc 0x%X", c.what, e.stop_code, e.status, e.pc);
+    }
 }
 
 /* ---- the JQ2 job profile (docs/JQ2.md, "JQ2 job ABI") -------------------------- */
@@ -3141,6 +3291,12 @@ int main(int argc, char** argv)
     else if (mode == "observer") mode_observer();
     else if (mode == "validate") mode_validate();
     else if (mode == "lifted") mode_lifted();
+    else if (mode == "end-return") mode_end_return();
+    else if (mode == "end-return-lifted") mode_end_return_lifted();
+    else if (mode == "end-stop") mode_end_stop();
+    else if (mode == "end-halt") mode_end_halt();
+    else if (mode == "end-jm-call") mode_end_jm_call();
+    else if (mode == "end-classify") mode_end_classify();
     else if (mode == "stop-job") mode_stop_job();
     else if (mode == "stop-halt") mode_stop_halt();
     else if (mode == "stop-crt") mode_stop_crt();

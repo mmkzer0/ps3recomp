@@ -108,6 +108,7 @@ if(NOT WIN32)
     #   jq2_exec_validate   every guard and status code of jq2.h
     #   jq2_exec_lifted     a lifted-style body returns normally: executed and credited once
     #   jq2_exec_stop_*     a job that stops or halts (interpreted or lifted), another CRT, a ring entry nobody models
+    #   jq2_exec_end_*      the end class of every end (return in both tiers, stop, halt, jm call) reported by ExecutorHooks::on_end, and the classifier alone
     # host_stubs.c satisfies the PPU-loader symbols the runtime's HLE modules name,
     # as a game-less host does.
     add_executable(test_jq2_executor test_jq2_executor.cpp
@@ -122,7 +123,8 @@ if(NOT WIN32)
                   sync-concurrent waiter-fresh waiter-63 stop-waiter-id waiter-64-nowake stop-waiter-64-wake stop-wait stop-fiber-notify
                   stop-push-shutdown stop-copy-push-shutdown desc-sizes stop-push-size0 stop-copy-push-size0
                   push-block push-nonblock pushsync-block push-block-copy push-flags stop-push-block-shutdown
-                  stop-push-flag1 stop-copy-push-flag1)
+                  stop-push-flag1 stop-copy-push-flag1
+                  end-return end-return-lifted end-stop end-halt end-jm-call end-classify)
         string(REPLACE "-" "_" name "${mode}")
         add_test(NAME jq2_exec_${name} COMMAND test_jq2_executor ${mode})
         set_tests_properties(jq2_exec_${name} PROPERTIES LABELS "spurs;t0;tsan" TIMEOUT 300)
