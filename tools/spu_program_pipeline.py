@@ -15,7 +15,7 @@ import subprocess
 import sys
 import tempfile
 
-from spu_disasm import CHANNEL_NAMES, disassemble_spu
+from spu_disasm import CHANNEL_NAMES, SPU_RR, disassemble_spu
 from spu_elf import fnv1a64, scan_spu_candidates
 
 
@@ -170,16 +170,29 @@ _NO_RT_WRITE = {'stqd', 'stqa', 'stqr', 'stqx', 'nop', 'lnop', 'sync', 'syncc',
                 'dsync', 'wrch', 'mtspr', 'fscrwr'}
 # RRR-format ops write bits 21-27; the low 7 bits are their RC source.
 _RRR_DEST = {'selb', 'shufb', 'mpya', 'fnms', 'fma', 'fms'}
+# Bi-family opcode values from the decoder table (spu_disasm.py SPU_RR):
+# bi, bisl, iret, bisled and biz/binz/bihz/bihnz. The E (0x40000) and D
+# (0x80000) bits set/clear int_enable when the branch is taken
+# (runtime/spu/spu_interp.c:127-132, mirrored by spu_lifter.py's `_ied`).
+# `iret` returns from an interrupt and `bisled` branches only on a pending
+# event, so either is an event branch even without its own E/D bit.
+_BI_FAMILY = frozenset(SPU_RR[opcode] for opcode in
+                       (0x1A8, 0x1A9, 0x1AA, 0x1AB, 0x128, 0x129, 0x12A, 0x12B))
+_ALWAYS_EVENT = frozenset({'bisled', 'iret'})
+_INTERRUPT_ENABLE = 0x40000
+_INTERRUPT_DISABLE = 0x80000
 
 
 def effects_inventory(image, base, functions):
-    """Channels and MFC commands reachable from the lifted function ranges.
+    """Channels, MFC commands and event branches in the lifted ranges.
 
     `functions` are the lifter's generated [start, end) LS ranges, so the
     inventory describes the code that was actually lifted, not the data tail.
     A `wrch MFC_Cmd` counts as resolved only when its source register holds an
     immediate from the same straight-line run; everything else is reported in
-    `unresolved` with its site, never dropped.
+    `unresolved` with its site, never dropped. `event_branches` lists every
+    bi-family word that transfers control on an SPU event or interrupt, so an
+    image that cannot be shadowed faithfully is visible before it is run.
     """
     from find_spu_functions import collect_branch_targets
     insns = disassemble_spu(image, base)
@@ -187,6 +200,7 @@ def effects_inventory(image, base, functions):
     ranges = sorted((int(start), int(end)) for start, end in functions)
     channels = {}
     commands = {}
+    events = []
     unresolved = []
     index = 0
     consts = {}
@@ -201,6 +215,11 @@ def effects_inventory(image, base, functions):
             consts.clear()
             high.clear()
         mnemonic = ins.mnemonic
+        if mnemonic in _BI_FAMILY and (mnemonic in _ALWAYS_EVENT or
+                                       ins.raw & (_INTERRUPT_ENABLE | _INTERRUPT_DISABLE)):
+            events.append({'site': ins.addr, 'mnemonic': mnemonic,
+                           'enable': bool(ins.raw & _INTERRUPT_ENABLE),
+                           'disable': bool(ins.raw & _INTERRUPT_DISABLE)})
         if mnemonic in _CHANNEL_ACCESS:
             channel = (ins.raw >> 7) & 0x7F
             bucket = channels.setdefault(channel, {'read': [], 'write': [], 'count': []})
@@ -259,6 +278,7 @@ def effects_inventory(image, base, functions):
         'mfc_commands': [{'command': value, 'name': MFC_COMMAND_NAMES.get(value),
                           'count': len(sites), 'sites': sites}
                          for value, sites in sorted(commands.items())],
+        'event_branches': sorted(events, key=lambda entry: entry['site']),
         'unresolved': sorted(unresolved, key=lambda entry: entry['site'])}
 
 

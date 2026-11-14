@@ -508,6 +508,37 @@ class Pipeline(unittest.TestCase):
         self.assertEqual(compiled.returncode, 0, compiled.stderr + compiled.stdout)
         subprocess.run([str(binary)], check=True)
 
+    def raw_event_branches(self, blob, name):
+        result = self.run_raw([self.raw_entry(blob, name=name)])
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        program = self.manifest()['programs'][0]
+        self.assertEqual(program['status'], 'registered')
+        return program['effects']['event_branches']
+
+    def test_raw_job_event_branches_are_reported(self):
+        from gen_test_raw_job import BI, BISLED, INTERRUPT_DISABLE, IRET
+        RAW_BASE, build_raw_job = raw_job_tools()
+        # variant: encoded word, decoded mnemonic, E bit, D bit.
+        cases = [('bisled', (BISLED << 21) | (2 << 7), 'bisled', False, False),
+                 ('disable', (BI << 21) | INTERRUPT_DISABLE, 'bi', False, True),
+                 ('iret', IRET << 21, 'iret', False, False)]
+        for variant, word, mnemonic, enable, disable in cases:
+            with self.subTest(variant=variant):
+                blob = build_raw_job(variant=variant)
+                encoded = struct.pack('>I', word)
+                # The word identifies its own site: the inventory must report
+                # that LS address, not the start of the function or blob.
+                self.assertEqual(blob.count(encoded), 1)
+                site = RAW_BASE + blob.index(encoded)
+                self.assertEqual(site % 4, 0)
+                self.assertEqual(self.raw_event_branches(blob, f'raw-{variant}.bin'),
+                                 [{'site': site, 'mnemonic': mnemonic,
+                                   'enable': enable, 'disable': disable}])
+
+    def test_raw_job_without_event_branches_lists_none(self):
+        _, build_raw_job = raw_job_tools()
+        self.assertEqual(self.raw_event_branches(build_raw_job(), 'raw-default.bin'), [])
+
     def test_raw_image_sha256_mismatch_is_named(self):
         _, build_raw_job = raw_job_tools()
         blob = build_raw_job()
