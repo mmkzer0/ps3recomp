@@ -42,8 +42,10 @@ typedef struct spu_xdiff_replay_options {
  * float mode against this process's (`malformed` / `fixture-identity`), the
  * pair of tiers (spu_xdiff_match_for), a registered body for a lifted subject
  * (`not-found` / `no-body`). Then it runs the subject under spu_run_with_halt
- * and compares. Runs in the calling process: a subject that faults takes it
- * down; spu_job_replay_main supervises that. */
+ * and compares. Runs in the calling process: a subject that faults takes it down; spu_job_replay_main supervises
+ * that. A named stop the subject raises (ps3_stop on this thread) does not: it is diverted for the run (ps3_stop_divert_begin) and
+ * unwinds through the halt landing pad into `void` / `host-fault`, which is what lets the in-run audit (libs/spurs/jq2/xdiff_audit.hpp)
+ * run a subject inside a title's process. abort(), a signal or a direct exit() are not stops and are not diverted. */
 uint32_t spu_xdiff_replay(const spu_xdiff_fixture* f, const spu_xdiff_replay_options* opt,
                           spu_xdiff_shadow* s, spu_xdiff_verdict_record* out);
 

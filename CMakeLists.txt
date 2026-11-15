@@ -210,6 +210,7 @@ add_library(ps3recomp_spurs_jq2_objs OBJECT
     libs/spurs/jq2/pool.cpp
     libs/spurs/jq2/executor.cpp
     libs/spurs/jq2/xdiff_capture.cpp
+    libs/spurs/jq2/xdiff_audit.cpp
 )
 target_include_directories(ps3recomp_spurs_jq2_objs PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/libs/spurs"

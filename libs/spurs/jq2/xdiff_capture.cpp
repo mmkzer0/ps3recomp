@@ -26,6 +26,7 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <map>
 #include <memory>
@@ -81,6 +82,11 @@ std::once_flag g_configured;
 std::atomic<const Settings*> g_settings{nullptr}; /* published by capture_configure; never freed */
 std::atomic<std::uint32_t> g_payload_limit{64u << 20};
 std::atomic<std::uint64_t> g_fingerprint_fault{0};
+/* Whether any consumer wants a job recorded: one relaxed load is all a job pays with capture and the audit both off. Set
+ * before any worker exists (capture_configure, capture_publish_audit_recording), so a worker that starts afterwards sees
+ * it without ordering. */
+std::atomic<bool> g_record_on{false};
+std::atomic<std::uint64_t> g_failed_peak{0}; /* a test seam: the most capacity a failed audit recording had grown to */
 
 /* ---- per image ----------------------------------------------------------- */
 
@@ -91,6 +97,7 @@ struct ImageCapture {
     std::atomic<std::uint64_t> captured{0}, captured_unresolved{0}, failed{0}, ineligible{0};
     std::atomic<std::uint64_t> no_inventory{0}, event_branches{0}, unknown_body{0}, table_full{0}, collision{0};
     std::atomic<std::uint64_t> cache_misses{0};
+    ImageAudit audit; /* what the audit counts for this image (xdiff_audit.hpp) */
 };
 
 struct Table {
@@ -162,8 +169,12 @@ struct AddrCache {
 struct WorkerCapture {
     spu_xdiff_fixture fixture{}; /* zeroed until the first recording; two local stores, never shared */
     spu_xdiff_recorder recorder{};
-    bool active = false;
+    bool active = false;         /* a recording is open: the capture or the audit wanted this job */
+    bool want_capture = false, want_sample = false; /* who the open recording is for */
     bool unresolved = false;     /* the recorded image's inventory lists unresolved MFC sites */
+    bool sample_pending = false; /* the audit's sample is complete in `fixture`, waiting for capture_hand_over */
+    Disposition disposition = kNotSampled; /* what became of this job's sample */
+    std::uint8_t authority_tier = 0;
     ImageCapture* image = nullptr;
     std::uint64_t fingerprint = 0;
     std::uint32_t queue = 0, seq = 0;
@@ -297,6 +308,19 @@ void count_unattributed(bool no_inventory)
     ImageCapture& u = table().unattributed;
     u.ineligible.fetch_add(1, kRelaxed);
     (no_inventory ? u.no_inventory : u.table_full).fetch_add(1, kRelaxed);
+    if (audit_active()) audit_note_not_eligible(u.audit, 0, ShadowCheck::ok);
+}
+
+/* The recorder or the fixture buffer failed for a job: the capture's failure line when it wanted the job, the audit's
+ * void verdict when it did. */
+void record_failed(WorkerCapture& w, ImageCapture& image, std::uint64_t fingerprint, bool capture, bool sample,
+                   std::uint32_t reason, const char* detail)
+{
+    if (capture) fail(w, image, fingerprint, reason, detail);
+    if (sample) {
+        audit_note_void(image.audit, fingerprint, w.queue, w.seq, reason, detail);
+        w.disposition = kNotEligible;
+    }
 }
 
 bool directory_is_usable(const std::string& dir, std::string& why)
@@ -354,6 +378,7 @@ void capture_configure()
                 s->limit = 0;
             }
         }
+        if (s->limit != 0) g_record_on.store(true, kRelaxed);
         g_settings.store(s, std::memory_order_release);
     });
 }
@@ -369,17 +394,29 @@ bool capture_active()
     return settings != nullptr && settings->limit != 0;
 }
 
+bool record_active() { return g_record_on.load(kRelaxed); }
+
+void capture_publish_audit_recording() { g_record_on.store(true, kRelaxed); }
+
+std::uint64_t capture_failed_peak_capacity() { return g_failed_peak.load(kRelaxed); }
+
+bool xdiff_dir_usable(const std::string& dir, std::string& why) { return directory_is_usable(dir, why); }
+
 void capture_job_start(const CaptureJob& job, ::spu_context* ctx, const ::spu_job_layout* l, StagedImage* staged)
 {
+    if (!record_active()) return;
     const Settings* settings = g_settings.load(std::memory_order_acquire);
-    if (settings == nullptr || settings->limit == 0) return;
-    const std::uint32_t limit = settings->limit;
+    const std::uint32_t limit = settings != nullptr ? settings->limit : 0;
     const JobStart& js = *job.job;
 
     WorkerCapture& w = t_capture;
     /* A job that began recording always reaches its end hook or ends the process; if it did not, its
      * context is gone and there is nothing to remove from it. */
     w.active = false;
+    w.want_capture = false;
+    w.want_sample = false;
+    w.sample_pending = false; /* a sample the previous job closed and never handed over (it ended the process) is gone */
+    w.disposition = kNotSampled;
     w.queue = job.queue;
     w.seq = js.seq;
 
@@ -416,10 +453,12 @@ void capture_job_start(const CaptureJob& job, ::spu_context* ctx, const ::spu_jo
     case Verdict::no_inventory:
         count_unattributed(true);
         name_ineligible(addr, content.reason, l, fingerprint);
+        w.disposition = audit_active() ? kNotEligible : kNotSampled;
         return;
     case Verdict::table_full:
         count_unattributed(false);
         name_ineligible(addr, content.reason, l, fingerprint);
+        w.disposition = audit_active() ? kNotEligible : kNotSampled;
         return;
     case Verdict::refused: {
         ImageCapture& image = *content.image;
@@ -427,6 +466,10 @@ void capture_job_start(const CaptureJob& job, ::spu_context* ctx, const ::spu_jo
         if (content.reason != kInventoryFlags) image.event_branches.fetch_add(1, kRelaxed);
         if (content.reason != kEventBranches) image.no_inventory.fetch_add(1, kRelaxed); /* flag bits of another build */
         name_ineligible(addr, content.reason, l, fingerprint);
+        if (audit_active()) {
+            audit_note_not_eligible(image.audit, fingerprint, ShadowCheck::ok);
+            w.disposition = kNotEligible;
+        }
         return;
     }
     case Verdict::eligible: break;
@@ -434,7 +477,11 @@ void capture_job_start(const CaptureJob& job, ::spu_context* ctx, const ::spu_jo
 
     ImageCapture& image = *content.image;
     const spu_workload_inventory& inv = content.inv;
-    if (image.attempted.load(kRelaxed) >= limit) return; /* this image has its N */
+    const bool audit_on = audit_active();
+    /* The audit's ordinal of this job within its image, taken before any rejection: a job that is not recorded (an unknown
+     * body, say) still counts for the period, so the sampled jobs do not depend on which bodies ran. */
+    const std::uint64_t ordinal = audit_on ? image.audit.jobs.fetch_add(1, kRelaxed) : 0;
+    if (!audit_on && image.attempted.load(kRelaxed) >= limit) return; /* this image has its N and nothing else wants a recording */
 
     /* The body that runs is the authority the fixture names: T0 for the interpreter, T1 only for the
      * body registered under this fingerprint (section 3), with the lift identity of its registration. */
@@ -450,18 +497,46 @@ void capture_job_start(const CaptureJob& job, ::spu_context* ctx, const ::spu_jo
         image.ineligible.fetch_add(1, kRelaxed);
         image.unknown_body.fetch_add(1, kRelaxed);
         name_ineligible(addr, kUnknownBody, l, fingerprint);
+        if (audit_on) {
+            audit_note_not_eligible(image.audit, fingerprint, ShadowCheck::ok);
+            w.disposition = kNotEligible;
+        }
         return;
     }
+    w.authority_tier = authority.tier;
 
-    /* Reserve one of the N attempts: several workers on one image race here. The count publishes nothing
-     * (the buffer a winner fills is its own), so the CAS needs atomicity and no ordering. */
-    for (std::uint64_t n = image.attempted.load(kRelaxed);;) {
-        if (n >= limit) return;
-        if (image.attempted.compare_exchange_weak(n, n + 1, kRelaxed, kRelaxed)) break;
+    /* Who wants this job recorded. The capture wants the first N of an image. The audit counts every job of the image
+     * for its period; a job it cannot shadow (no registered body, or no twin to bound a lifted shadow) is counted and
+     * named, never recorded for it. */
+    bool want_capture = limit != 0 && image.attempted.load(kRelaxed) < limit;
+    bool want_sample = false;
+    if (audit_on) {
+        const std::uint64_t n = ordinal;
+        const ShadowCheck check = audit_shadow_check(fingerprint, job.interpreted);
+        if (check != ShadowCheck::ok) {
+            audit_note_not_eligible(image.audit, fingerprint, check);
+            w.disposition = kNotEligible;
+        } else if (audit_sampled(n)) {
+            image.audit.sampled.fetch_add(1, kRelaxed);
+            want_sample = true;
+        }
     }
+    if (want_capture) {
+        /* Reserve one of the N attempts: several workers on one image race here. The count publishes nothing
+         * (the buffer a winner fills is its own), so the CAS needs atomicity and no ordering. */
+        for (std::uint64_t n = image.attempted.load(kRelaxed);;) {
+            if (n >= limit) {
+                want_capture = false;
+                break;
+            }
+            if (image.attempted.compare_exchange_weak(n, n + 1, kRelaxed, kRelaxed)) break;
+        }
+    }
+    if (!want_capture && !want_sample) return;
 
-    if (w.fixture.ls0 == nullptr && spu_xdiff_fixture_init(&w.fixture) != 0) {
-        fail(w, image, fingerprint, SPU_XDIFF_R_CAPTURE_LIMIT, "out of memory for the worker's fixture buffer");
+    if (w.fixture.ls0 == nullptr && !(audit_on && audit_fixture_take(&w.fixture)) && spu_xdiff_fixture_init(&w.fixture) != 0) {
+        record_failed(w, image, fingerprint, want_capture, want_sample, SPU_XDIFF_R_CAPTURE_LIMIT,
+                      "out of memory for the worker's fixture buffer");
         return;
     }
 
@@ -493,11 +568,14 @@ void capture_job_start(const CaptureJob& job, ::spu_context* ctx, const ::spu_jo
     unit.origin_descriptor_ea = js.descriptor_ea;
 
     if (spu_xdiff_recorder_begin(&w.recorder, &w.fixture, ctx, &unit, &authority, nullptr, nullptr,
-                                 g_payload_limit.load(kRelaxed)) != 0) {
-        fail(w, image, fingerprint, w.recorder.error.reason, w.recorder.error.detail);
+                                 want_capture ? g_payload_limit.load(kRelaxed) : audit_blob_limit()) != 0) {
+        record_failed(w, image, fingerprint, want_capture, want_sample, w.recorder.error.reason, w.recorder.error.detail);
         spu_xdiff_fixture_free(&w.fixture);
         return;
     }
+    /* The sample's memory is bounded while it grows, not after: the recorder stops at the live limit, and its two
+     * allocations never grow past it. The capture, which wants the whole transcript, has its own bound. */
+    if (!want_capture) w.fixture.live_limit = audit_blob_limit();
     if (w.fixture.identity.image_fingerprint != fingerprint) {
         /* The remembered fingerprint was not the one of these bytes: a collision of the content hash. The
          * fixture is dropped, never written under a fingerprint that is not its own, and the memory is
@@ -509,6 +587,10 @@ void capture_job_start(const CaptureJob& job, ::spu_context* ctx, const ::spu_jo
         staged->stale = true; /* the executor's memory of these bytes' fingerprint is wrong too */
         image.ineligible.fetch_add(1, kRelaxed);
         image.collision.fetch_add(1, kRelaxed);
+        if (want_sample) {
+            audit_note_not_eligible(image.audit, fingerprint, ShadowCheck::ok);
+            w.disposition = kNotEligible;
+        }
         std::fprintf(stderr,
                      "[jq2-xdiff] capture-ineligible image=%s reason=fingerprint-collision ea=0x%08X bytes=%u "
                      "detail=the staged bytes hash to %s, not to the remembered fingerprint; nothing recorded\n",
@@ -516,46 +598,100 @@ void capture_job_start(const CaptureJob& job, ::spu_context* ctx, const ::spu_jo
         return;
     }
     w.active = true;
+    w.want_capture = want_capture;
+    w.want_sample = want_sample;
     w.unresolved = (inv.flags & SPU_WORKLOAD_INV_UNRESOLVED_MFC) != 0;
     w.image = &image;
     w.fingerprint = fingerprint;
 }
 
-void capture_job_end(::spu_context* ctx)
+bool capture_job_end(::spu_context* ctx)
 {
-    /* With capture off the thread-local state is not even constructed. */
-    const Settings* settings = g_settings.load(std::memory_order_acquire);
-    if (settings == nullptr || settings->limit == 0) return;
+    /* With neither consumer on, the thread-local state is not even constructed. */
+    if (!record_active()) return false;
     WorkerCapture& w = t_capture;
-    if (!w.active) return;
+    if (!w.active) return false;
     w.active = false;
     ImageCapture& image = *w.image;
+    const bool sample = w.want_sample;
 
     /* The loader's classification, the one the executor applies its policy to (spu_job_classify_end). */
     const spu_job_end end = spu_job_classify_end(ctx);
     const std::uint32_t failed = spu_xdiff_recorder_end(&w.recorder, ctx, end.end_class, end.stop_code);
     if (failed != static_cast<std::uint32_t>(SPU_XDIFF_R_NONE)) {
-        fail(w, image, w.fingerprint, failed, w.recorder.error.detail);
+        record_failed(w, image, w.fingerprint, w.want_capture, sample, failed, w.recorder.error.detail);
+        if (sample) {
+            const std::uint64_t cap = std::uint64_t{w.fixture.blob_cap} + std::uint64_t{w.fixture.effect_cap} * sizeof(spu_xdiff_effect);
+            if (cap > g_failed_peak.load(kRelaxed)) g_failed_peak.store(cap, kRelaxed);
+        }
         spu_xdiff_fixture_free(&w.fixture); /* re-initialised by the next recording */
-        return;
+        return sample;
     }
 
-    char name[64];
-    spu_xdiff_fixture_name(name, sizeof name, w.fingerprint, w.queue, w.seq);
-    std::string path = settings->dir;
-    if (path.back() != '/') path += '/';
-    path += name;
-    spu_xdiff_error err{};
-    const bool written = spu_xdiff_fixture_write(&w.fixture, path.c_str(), &err) == 0;
-    if (!written) {
-        fail(w, image, w.fingerprint, err.reason, err.detail);
-    } else {
-        image.captured.fetch_add(1, kRelaxed);
-        if (w.unresolved) image.captured_unresolved.fetch_add(1, kRelaxed);
-        std::fprintf(stderr, "[jq2-xdiff] captured image=%s queue=%u seq=%u end=%s path=%s\n",
-                     fingerprint_text(w.fingerprint).c_str(), w.queue, w.seq, spu_xdiff_end_id(end.end_class), path.c_str());
+    bool written = false;
+    if (w.want_capture) {
+        const Settings* settings = g_settings.load(std::memory_order_acquire);
+        char name[64];
+        spu_xdiff_fixture_name(name, sizeof name, w.fingerprint, w.queue, w.seq);
+        std::string path = settings->dir;
+        if (path.back() != '/') path += '/';
+        path += name;
+        spu_xdiff_error err{};
+        written = spu_xdiff_fixture_write(&w.fixture, path.c_str(), &err) == 0;
+        if (!written) {
+            fail(w, image, w.fingerprint, err.reason, err.detail);
+        } else {
+            image.captured.fetch_add(1, kRelaxed);
+            if (w.unresolved) image.captured_unresolved.fetch_add(1, kRelaxed);
+            std::fprintf(stderr, "[jq2-xdiff] captured image=%s queue=%u seq=%u end=%s path=%s\n",
+                         fingerprint_text(w.fingerprint).c_str(), w.queue, w.seq, spu_xdiff_end_id(end.end_class), path.c_str());
+        }
     }
-    if (!written || oversized(w.fixture)) spu_xdiff_fixture_free(&w.fixture);
+    if (sample) {
+        /* A recording over the audit's bound is never partially compared: it is a verdict of its own. */
+        const std::size_t bytes = audit_sample_bytes(w.fixture);
+        if (bytes > audit_sample_limit()) {
+            char detail[96];
+            std::snprintf(detail, sizeof detail, "the recording holds %zu bytes, over the audit's bound of %zu", bytes,
+                          audit_sample_limit());
+            audit_note_void(image.audit, w.fingerprint, w.queue, w.seq, SPU_XDIFF_R_CAPTURE_LIMIT, detail);
+            w.disposition = kNotEligible;
+        } else {
+            w.sample_pending = true; /* stays in w.fixture until capture_hand_over */
+        }
+    }
+    if (!w.sample_pending && (!written || oversized(w.fixture))) spu_xdiff_fixture_free(&w.fixture);
+    return sample;
+}
+
+Disposition capture_hand_over(std::uint32_t who)
+{
+    if (!record_active()) return kNotSampled;
+    WorkerCapture& w = t_capture;
+    Disposition disposition = w.disposition;
+    w.disposition = kNotSampled;
+    if (!w.sample_pending) return disposition;
+    w.sample_pending = false;
+
+    auto s = std::make_unique<Sample>();
+    s->fixture = w.fixture; /* the buffer changes hands; this worker takes another from the pool for its next recording */
+    std::memset(&w.fixture, 0, sizeof w.fixture);
+    s->image = &w.image->audit;
+    s->fingerprint = w.fingerprint;
+    s->queue = w.queue;
+    s->seq = w.seq;
+    s->who = who;
+    s->authority_tier = w.authority_tier;
+    s->bytes = audit_sample_charge(s->fixture);
+    disposition = audit_submit(s);
+    if (s) { /* dropped: the buffer is still this worker's, unless it is more than a sample may hold */
+        if (audit_sample_charge(s->fixture) - 2 * std::size_t{SPU_XDIFF_LS_BYTES} - 2 * std::size_t{SPU_XDIFF_REG_BYTES} <=
+            audit_sample_limit()) {
+            w.fixture = s->fixture;
+            std::memset(&s->fixture, 0, sizeof s->fixture);
+        }
+    }
+    return disposition;
 }
 
 namespace {
@@ -593,5 +729,20 @@ std::optional<CaptureCounters> capture_counters(std::uint64_t fingerprint)
 }
 
 CaptureCounters capture_unattributed() { return snapshot(table().unattributed); }
+
+std::optional<AuditCounters> audit_counters(std::uint64_t fingerprint)
+{
+    Table& t = table();
+    const ImageCapture* image;
+    {
+        std::lock_guard<std::mutex> lk(t.mu);
+        const auto it = t.images.find(fingerprint);
+        if (it == t.images.end()) return std::nullopt;
+        image = it->second.get();
+    }
+    return audit_snapshot(image->audit);
+}
+
+AuditCounters audit_unattributed() { return audit_snapshot(table().unattributed.audit); }
 
 }  // namespace ps3recomp::spurs::jq2

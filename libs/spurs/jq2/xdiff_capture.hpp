@@ -4,9 +4,15 @@
  * Commit 10a of docs/SPU_XDIFF.md (section 16): with `spu.xdiff_capture` = N and
  * `spu.xdiff_dir` set, the first N jobs of each registered image are recorded by
  * a tap on the effect port (runtime/spu/xdiff/spu_xdiff_recorder.h) and written,
- * synchronously, as `<dir>/<fingerprint>-q<queue>-s<seq>.spujob`. No shadow runs
- * (that is commit 10b); the job's guest-visible results are those of a run
- * without capture, because the recorder only listens.
+ * synchronously, as `<dir>/<fingerprint>-q<queue>-s<seq>.spujob`. The job's
+ * guest-visible results are those of a run without capture, because the recorder
+ * only listens.
+ *
+ * Commit 10b (xdiff_audit.hpp) shares this recording: with `spu.xdiff` = sample or
+ * all the same tap, the same content cache and the same eligibility serve the
+ * audit, so a job is recorded once however many consumers want it. The worker
+ * hands the finished recording to the audit queue after it has credited the job
+ * (capture_hand_over); the capture's own write has happened by then.
  *
  * The executor calls capture_configure when a queue is created, capture_job_start
  * from the loader's start hook (after the job is staged, before its first
@@ -51,9 +57,11 @@
 #define PS3RECOMP_SPURS_JQ2_XDIFF_CAPTURE_HPP
 
 #include "jq2/executor.hpp"
+#include "jq2/xdiff_audit.hpp"
 
 #include <cstdint>
 #include <optional>
+#include <string>
 
 struct spu_context;
 struct spu_job_layout;
@@ -81,7 +89,18 @@ void capture_configure();
  * capture_configure has run. */
 [[nodiscard]] bool capture_active();
 
-/* Starts recording the job on this worker thread when capture is on and the job qualifies; a no-op
+/* True when a job needs identifying and recording on this worker: capture is on, or the audit is. The executor
+ * asks before it touches a job's staged bytes. Valid once audit_configure has run. */
+[[nodiscard]] bool record_active();
+
+/* Called by audit_configure once the audit thread runs: from here on record_active() is true. Before any worker exists. */
+void capture_publish_audit_recording();
+
+/* A test seam: the most allocated capacity (transcript plus payload stores, bytes) any recording that failed for the audit
+ * had grown to before it was freed. With the live limit enforced while recording it never exceeds the limit. */
+[[nodiscard]] std::uint64_t capture_failed_peak_capacity();
+
+/* Starts recording the job on this worker thread when capture or the audit wants it and the job qualifies; a no-op
  * otherwise. Must be called with `ctx` at its entry state, as the loader's start hook has it. `image` is the
  * staged image's identity, which the executor took once for this job; the tap takes no second pass over the
  * bytes. It may be null only when the layout lies outside local store, which the tap reports and refuses
@@ -89,10 +108,21 @@ void capture_configure();
  * sets `image->stale` and the worker forgets the remembered result. */
 void capture_job_start(const CaptureJob& job, ::spu_context* ctx, const ::spu_job_layout* layout, StagedImage* image);
 
-/* Ends the recording this thread started for its job, if any, and writes the fixture. Call it first in
- * the end hook, before the executor applies its policy to the end: a job that is about to stop the
- * process still leaves its fixture. */
-void capture_job_end(::spu_context* ctx);
+/* Ends the recording this thread started for its job, if any: writes the fixture when the capture wanted it, and
+ * closes the sample the audit wanted, which stays with this thread until capture_hand_over. Call it first in the
+ * end hook, before the executor applies its policy to the end: a job that is about to stop the process still
+ * leaves its fixture. Returns whether a recording was closed for the audit (the executor's kind-32 span is the
+ * time spent here for such a job). */
+bool capture_job_end(::spu_context* ctx);
+
+/* After the job was credited: hands the sample this job closed to the audit queue (xdiff_audit.hpp) and returns
+ * what became of the job's sample. `who` is the job's trace identity, q << 8 | w. kNotSampled for a job the audit
+ * did not choose, kNotEligible for one it cannot shadow, kQueued or kDropped for one it chose. With the audit off
+ * this does nothing and returns kNotSampled. */
+Disposition capture_hand_over(std::uint32_t who);
+
+/* The capture's directory check (exists, a directory, writable) for any consumer of spu.xdiff_dir. */
+[[nodiscard]] bool xdiff_dir_usable(const std::string& dir, std::string& why);
 
 /* What the run counted for one image under capture. `ineligible` counts jobs; its reasons overlap (an
  * image with event branches and unknown flag bits is in both). */

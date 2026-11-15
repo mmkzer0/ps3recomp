@@ -150,8 +150,8 @@ static void spu_job_ls0_note(const spu_context* ctx)
 {
     static SPU_THREAD_LOCAL int _n = 0;
     if (PS3_LOG_FIRST(_n, 8))
-        fprintf(stderr, "[spurs-job] img=%d branched to LS 0 -- job complete\n",
-                ctx->image_id);
+        fprintf(stderr, "%s[spurs-job] img=%d branched to LS 0 -- job complete\n",
+                spu_diag_tag(), ctx->image_id);
 }
 
 void spu_task_launch_check(spu_context* ctx, void* fn)
@@ -450,9 +450,9 @@ void (*spu_take_interrupt(spu_context* ctx,
     } else {
         static SPU_THREAD_LOCAL int _w = 0;
         if (PS3_LOG_FIRST(_w, 4))
-            fprintf(stderr, "[spu-int] pending (st=0x%X mask=0x%X) but LS0 word "
+            fprintf(stderr, "%s[spu-int] pending (st=0x%X mask=0x%X) but LS0 word "
                     "0x%08X is no branch -- not taken\n",
-                    ctx->event_status, ctx->event_mask, w);
+                    spu_diag_tag(), ctx->event_status, ctx->event_mask, w);
         return tf;
     }
     ctx->srr0 = ctx->pc;             /* resume point for iret */
@@ -509,11 +509,11 @@ SPU_DRAIN_COLD void spu_depth_guard(spu_context* ctx)
     static SPU_THREAD_LOCAL int s_reported = 0;
     if (s_reported < 1) {   /* one report: five SPU threads all trip together */
         s_reported++;
-        fprintf(stderr, "[spu-depth] img=%d pc=0x%05X lr=0x%05X host_depth=%u"
+        fprintf(stderr, "%s[spu-depth] img=%d pc=0x%05X lr=0x%05X host_depth=%u"
                         " -- lifted call recursion, halting the SPU\n",
-                ctx->image_id, (uint32_t)ctx->pc & SPU_LS_MASK,
+                spu_diag_tag(), ctx->image_id, (uint32_t)ctx->pc & SPU_LS_MASK,
                 ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->host_depth);
-        fprintf(stderr, "[spu-depth] recent drain sites (oldest first):");
+        fprintf(stderr, "%s[spu-depth] recent drain sites (oldest first):", spu_diag_tag());
         uint32_t start = (s_n > RING) ? (s_n - RING) : 0;
         for (uint32_t k = start; k < s_n; k++)
             fprintf(stderr, " %05X", s_ring[k % RING]);
@@ -534,9 +534,9 @@ SPU_DRAIN_COLD void spu_lift_budget_exhausted(spu_context* ctx)
 {
     ctx->status = SPU_STATUS_BUDGET_EXHAUSTED;
     spu_halt(ctx);
-    fprintf(stderr, "[spu-budget] context %p (image=%d pc=0x%05X) is out of budget and no halt landing pad is "
+    fprintf(stderr, "%s[spu-budget] context %p (image=%d pc=0x%05X) is out of budget and no halt landing pad is "
                     "armed (run the budgeted twin under spu_run_with_halt) -- aborting\n",
-            (void*)ctx, ctx->image_id, (unsigned)(ctx->pc & SPU_LS_MASK));
+            spu_diag_tag(), (void*)ctx, ctx->image_id, (unsigned)(ctx->pc & SPU_LS_MASK));
     fflush(stderr);
     abort();
 }
@@ -643,8 +643,8 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
             if (!fn) fn = spu_lookup(pc, ctx->image_id);
             if (fn) {
                 { static SPU_THREAD_LOCAL int _n = 0; if (PS3_LOG_FIRST(_n, 8))
-                    fprintf(stderr, "[spu] drain-resume return_pc=0x%05X at lifted entry 0x%05X img=%d depth=%d ovl=%d\n",
-                            (unsigned)(return_pc & SPU_LS_MASK), pc, ctx->image_id, ctx->host_depth,
+                    fprintf(stderr, "%s[spu] drain-resume return_pc=0x%05X at lifted entry 0x%05X img=%d depth=%d ovl=%d\n",
+                            spu_diag_tag(), (unsigned)(return_pc & SPU_LS_MASK), pc, ctx->image_id, ctx->host_depth,
                             (int)ctx->resident_ovl); }
                 *tramp = spu_indirect_branch;
                 continue;

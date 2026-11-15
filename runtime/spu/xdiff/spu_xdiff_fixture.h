@@ -39,6 +39,7 @@ typedef struct spu_xdiff_fixture {
     uint8_t*           blob;                      /* payload bytes the effects refer to, owned */
     uint32_t           blob_bytes;
     uint32_t           blob_cap;
+    uint32_t           live_limit;                /* 0: none. Else the most effects * 40 + blob_bytes may reach while recording; also bounds both allocations. Set after the recorder begins (clear zeroes it) */
     uint8_t            reg1[SPU_XDIFF_REG_BYTES]; /* the authority's end registers */
     uint8_t*           ls1;                       /* its end local store, owned */
     spu_xdiff_end      end;

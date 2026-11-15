@@ -91,6 +91,11 @@ def test_defaults_without_file_or_environment():
         "spu.job_body": ('"interp"', "default"),
         "spu.xdiff_dir": ('""', "default"),
         "spu.xdiff_capture": ("0", "default"),
+        "spu.xdiff": ('"off"', "default"),
+        "spu.xdiff_period": ("64", "default"),
+        "spu.xdiff_on_divergence": ('"report"', "default"),
+        "spu.xdiff_on_latent": ('"report"', "default"),
+        "spu.xdiff_budget": ("268435456", "default"),
         "gcm.wait_timeout_ms": ("10000", "default"),
         "gcm.park_resync": ("false", "default"),
         "gcm.park_grace_ms": ("50", "default"),
@@ -197,6 +202,11 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
             "spu.job_body": "default",
             "spu.xdiff_dir": "default",
             "spu.xdiff_capture": "default",
+            "spu.xdiff": "default",
+            "spu.xdiff_period": "default",
+            "spu.xdiff_on_divergence": "default",
+            "spu.xdiff_on_latent": "default",
+            "spu.xdiff_budget": "default",
             "gcm.wait_timeout_ms": "default",
             "gcm.park_resync": "default",
             "gcm.park_grace_ms": "default",
@@ -229,7 +239,9 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
                                    "precise_usleep": True},
                            "spu": {"dma_repeat_limit": 256, "dma_repeat_stop_secs": 0,
                                    "mfc_lookup_cache": True, "job_body": "interp", "xdiff_dir": "",
-                                   "xdiff_capture": 0},
+                                   "xdiff_capture": 0, "xdiff": "off", "xdiff_period": 64,
+                                   "xdiff_on_divergence": "report", "xdiff_on_latent": "report",
+                                   "xdiff_budget": 268435456},
                            "gcm": {"wait_timeout_ms": 10000, "park_resync": False, "park_grace_ms": 50,
                                    "handler_thread": False, "report_spu_hold_ms": 0},
                            "eng": {"depth_clamp": True, "depth_bounds": True},
@@ -353,6 +365,43 @@ def test_job_body_is_interp_or_lifted_from_file_and_environment():
     with Cfg("schema = 1", "[spu]", "job_body = true") as c:      # a bool is the wrong type
         f = config_invalid(probe("--load", c.path, "get"))
         assert f["key"] == "spu.job_body" and f["line"] == "3", f
+
+
+def test_xdiff_enumerations_and_bounds_from_file_and_environment():
+    # spu.xdiff and the two actions are enumerations (a validator each), the period and the budget are u32 >= 1.
+    with Cfg("schema = 1", "[spu]", 'xdiff = "sample"', "xdiff_period = 8", 'xdiff_on_divergence = "stop"',
+             'xdiff_on_latent = "stop"', "xdiff_budget = 1000") as c:
+        o = options(probe("--load", c.path, "get"))
+        assert o["spu.xdiff"] == ('"sample"', f"file:{c.path}"), o
+        assert o["spu.xdiff_period"] == ("8", f"file:{c.path}"), o
+        assert o["spu.xdiff_on_divergence"] == ('"stop"', f"file:{c.path}"), o
+        assert o["spu.xdiff_on_latent"] == ('"stop"', f"file:{c.path}"), o
+        assert o["spu.xdiff_budget"] == ("1000", f"file:{c.path}"), o
+        o = options(probe("--load", c.path, "get", PS3RECOMP_SPU_XDIFF="all"))
+        assert o["spu.xdiff"] == ('"all"', "env:PS3RECOMP_SPU_XDIFF"), o
+    o = options(probe("get", PS3RECOMP_SPU_XDIFF_ON_DIVERGENCE="stop", PS3RECOMP_SPU_XDIFF_PERIOD="1"))
+    assert o["spu.xdiff_on_divergence"] == ('"stop"', "env:PS3RECOMP_SPU_XDIFF_ON_DIVERGENCE"), o
+    assert o["spu.xdiff_period"] == ("1", "env:PS3RECOMP_SPU_XDIFF_PERIOD"), o
+    for key, env, detail, values in (
+            ("xdiff", "PS3RECOMP_SPU_XDIFF", '"off", "sample" or "all"', ("on", "Sample", "ALL", "", "true")),
+            ("xdiff_on_divergence", "PS3RECOMP_SPU_XDIFF_ON_DIVERGENCE", '"report" or "stop"', ("halt", "Stop", "")),
+            ("xdiff_on_latent", "PS3RECOMP_SPU_XDIFF_ON_LATENT", '"report" or "stop"', ("ignore", "REPORT", ""))):
+        for bad in values:
+            with Cfg("schema = 1", "[spu]", f'{key} = "{bad}"') as c:
+                f = config_invalid(probe("--load", c.path, "get"))
+                assert f["key"] == f"spu.{key}" and f["line"] == "3", (key, bad, f)
+                assert detail in f["detail"], (key, bad, f)
+            f = config_invalid(probe("get", **{env: bad}))
+            assert f["env"] == env and f["key"] == f"spu.{key}", (key, bad, f)
+        with Cfg("schema = 1", "[spu]", f"{key} = true") as c:      # a bool is the wrong type
+            f = config_invalid(probe("--load", c.path, "get"))
+            assert f["key"] == f"spu.{key}" and f["line"] == "3", (key, f)
+    for key in ("xdiff_period", "xdiff_budget"):
+        for bad in ("0", "4294967296", "-1"):
+            with Cfg("schema = 1", "[spu]", f"{key} = {bad}") as c:
+                f = config_invalid(probe("--load", c.path, "get"))
+                assert f["key"] == f"spu.{key}" and f["line"] == "3", (key, bad, f)
+                assert "out of range" in f["detail"], (key, bad, f)
 
 
 def test_pad_trace_paths_are_checked_at_load():

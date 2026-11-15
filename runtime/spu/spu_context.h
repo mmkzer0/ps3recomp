@@ -103,6 +103,16 @@ static inline int64_t spu_diag_num(int64_t* cache, const char* name, int base)
     return v;
 }
 
+/* A shadow run (docs/SPU_XDIFF.md section 9) is the subject tier of an xdiff comparison, executed in process
+ * beside the real run. Its diagnostics must not read as the authority's: the thread that runs it sets this
+ * flag around the run (spu_diag_shadow_set), and the diagnostics that can fire inside a run, which are the
+ * ones that end a run or name a defect, start with spu_diag_tag() -- "[shadow] " inside a shadow run, "" at
+ * any other time. Two out-of-line functions, because the flag is per thread and a per-thread read costs a
+ * call on some hosts; none of the callers is a hot path. Diagnostics that do not print the tag (the
+ * env-gated tracing, mostly) read as the authority's inside a shadow run. */
+void spu_diag_shadow_set(int on);
+const char* spu_diag_tag(void);
+
 /* Local store size: 256 KB */
 #define SPU_LS_SIZE         (256 * 1024)
 #define SPU_LS_MASK         (SPU_LS_SIZE - 1)

@@ -168,6 +168,20 @@ enum ps3_ft_kind {
                               * buffer, entry -> return of the success path; who = the caller's PPU trace tid (0: no
                               * guest thread), tag and mask taken under the audio mutex. The index is as of the call:
                               * a mixer tick before the guest's own read of readIndexAddr is a kind 30 between them */
+    /* In-run xdiff (docs/SPU_XDIFF.md sections 11 and 14), never filtered by PS3_FTRACE_MIN_US, like kind 29. q, w
+     * and seq as for the jq2 kinds above; kind 32 joins kind 29 on (who, a), which names the image. */
+    PS3_FT_JQ2_BODY       = 32, /* worker, once per job that has a JOB span, when spu.job_body is not interp or spu.xdiff
+                              * is not off; the span is the end hook's work for the sample (the recording's close and the
+                              * capture), zero length when the job was not sampled; who = q << 8 | w, a = seq,
+                              * b = tier | disposition << 8 | sat(lift_miss, 255) << 16: tier of the authority that ran
+                              * (0 interpreter, 1 lifted: spu_job_tier), disposition 0 not sampled, 1 queued for the
+                              * audit thread, 2 dropped (full queue, or shutdown), 3 not eligible (no inventory, event
+                              * branches, an unknown body, no registered body or no twin for a lifted shadow, or a recording the
+                              * audit refuses: over its bound, or one the recorder could not complete), lift_miss the
+                              * authority's count of indirect branches no lifted code covered, saturated at 255 */
+    PS3_FT_JQ2_XDIFF      = 33, /* audit thread, once per shadow run; the span is the subject's run; who = q << 8 | w of the
+                              * job, a = seq, b = verdict | reason << 8 | subject tier << 16 (spu_xdiff_verdict and
+                              * spu_xdiff_reason ids, spu_job_tier of the shadow) */
 };
 
 enum ps3_ft_audio_pace_reason {

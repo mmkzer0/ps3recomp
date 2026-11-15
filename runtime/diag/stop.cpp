@@ -38,6 +38,10 @@ std::atomic<ps3_stop_frontier_fn> g_providers[kMaxProviders];
 std::mutex g_stop_lock;
 thread_local bool t_stopping = false;
 
+/* The calling thread's divert (ps3_stop_divert_begin): null when none is installed. */
+thread_local ps3_stop_divert_fn t_divert_fn = nullptr;
+thread_local void* t_divert_user = nullptr;
+
 const char* const kReservedKeys[] = {
     "v", "kind", "pc", "lr", "tid", "last_hle_nid", "last_hle", "syscall",
 };
@@ -166,10 +170,31 @@ void ps3_stop_query_frontier(uint64_t thread_id, ps3_stop_frontier* out)
     }
 }
 
+void ps3_stop_divert_begin(ps3_stop_divert_fn fn, void* user)
+{
+    t_divert_fn = fn;
+    t_divert_user = user;
+}
+
+void ps3_stop_divert_end(void)
+{
+    t_divert_fn = nullptr;
+    t_divert_user = nullptr;
+}
+
 void ps3_stop(ps3_stop_kind kind, const char* what, const char* remedy,
               const ps3_stop_field* fields, size_t nfields,
               const ps3_stop_site* site)
 {
+    /* A diverted stop belongs to a sample, not to the run. Cleared before the call so a stop inside the
+     * diversion is a real one, and before anything is locked, printed or flushed: the diversion unwinds. A
+     * diversion that returns falls into the real stop below. */
+    if (t_divert_fn != nullptr) {
+        const ps3_stop_divert_fn fn = t_divert_fn;
+        void* const user = t_divert_user;
+        ps3_stop_divert_end();
+        fn(user, kind, what);
+    }
     const char* id = ps3_stop_kind_id(kind);
 
     if (t_stopping) {

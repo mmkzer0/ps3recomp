@@ -130,8 +130,8 @@ PS3_CFG_STR(spu, job_body, "interp", 6, PS3_CFG_V_JOB_BODY,
     "interpreted. A hit of that memory is a claim, not a proof (section 4). A title's own "
     "ExecutorHooks::select_body, when it returns a body, still wins and is not checked against the "
     "bytes. Identification costs one content hash a job, and its byte-serial fingerprint when the "
-    "worker has not seen those bytes; \"interp\" pays it only while tracing (kind 29) or fixture "
-    "capture is on. A lifted body is a different implementation of the same program, not a "
+    "worker has not seen those bytes; \"interp\" pays it only while tracing (kind 29), fixture "
+    "capture or spu.xdiff is on. A lifted body is a different implementation of the same program, not a "
     "guarantee: run xdiff on a corpus before relying on it. Read once, at the first job.")
 
 PS3_CFG_STR(spu, xdiff_dir, "", 1023, PS3_CFG_V_NONE,
@@ -139,8 +139,9 @@ PS3_CFG_STR(spu, xdiff_dir, "", 1023, PS3_CFG_V_NONE,
     "one file per job, named <image fingerprint>-q<queue>-s<seq>.spujob. Empty (the default) "
     "writes none. The directory must exist and be writable: the runtime does not create it, "
     "and a fixture that cannot be written is one named diagnostic line "
-    "([jq2-xdiff] capture-failed, with the image, the reason and the detail) while the job and "
-    "the run go on. Only spu.xdiff_capture makes anything write here today.")
+    "([jq2-xdiff] capture-failed or differ, with the image, the reason and the detail) while the "
+    "job and the run go on. Written by spu.xdiff_capture (the first N jobs of each image) and by "
+    "spu.xdiff (a fixture with a VRDT section for a difference, at most 16 per image).")
 
 PS3_CFG_U32(spu, xdiff_capture, 0, 0, 4294967295,
     "Record the first N jobs of each registered SPU job image into spu.xdiff_dir, for a corpus "
@@ -160,6 +161,48 @@ PS3_CFG_U32(spu, xdiff_capture, 0, 0, 4294967295,
     "is created: with N > 0 and an empty or unusable spu.xdiff_dir (missing, not a directory, "
     "not writable) one line says so and nothing is recorded for the process. Recording perturbs "
     "timing: benchmarks run with 0.")
+
+PS3_CFG_STR(spu, xdiff, "off", 6, PS3_CFG_V_XDIFF_MODE,
+    "Whether the other tier shadows a JobQueue2 job (docs/SPU_XDIFF.md section 11): \"off\" (the "
+    "default) runs nothing beside the job, \"sample\" records every spu.xdiff_period-th job of an "
+    "image and checks it on an audit thread below normal priority, never waiting for it (a full "
+    "queue drops the sample and counts it), \"all\" records every job and the workers wait for "
+    "queue room. The authority is the body that runs (spu.job_body); the shadow is the other tier, "
+    "run in process on the authority's recorded world with every effect served from the "
+    "transcript. A lifted shadow runs only through the image's budgeted twin: an image without "
+    "one is counted not eligible. The authority's result is always the one the guest sees; a "
+    "difference never changes the run unless spu.xdiff_on_divergence or spu.xdiff_on_latent "
+    "says stop. Only an image whose registration carries an effects inventory with no event "
+    "branches is shadowed, as for spu.xdiff_capture. Recording perturbs timing: benchmarks run "
+    "with \"off\". Read once, when the first JobQueue2 queue is created.")
+
+PS3_CFG_U32(spu, xdiff_period, 64, 1, 4294967295,
+    "With spu.xdiff = \"sample\": every N-th job of an image is shadowed, counted per image from "
+    "its first job (jobs 1, N+1, 2N+1, ...). 1 shadows every job. Ignored for \"all\" and \"off\". "
+    "Read once, when the first JobQueue2 queue is created.")
+
+PS3_CFG_STR(spu, xdiff_on_divergence, "report", 6, PS3_CFG_V_XDIFF_ACTION,
+    "What a visible difference between the authority and the shadow does to the run "
+    "(docs/SPU_XDIFF.md sections 8.4 and 11): \"report\" (the default) names it on standard "
+    "error, counts it and writes a fixture with the verdict when spu.xdiff_dir is set; \"stop\" "
+    "also ends the run with kind spu-xdiff-divergence from the audit thread, after the job was "
+    "credited. A visible difference is one the world saw: every effect difference, a different "
+    "end class, and an end register or local store difference the loader keeps. A void verdict "
+    "(budget, capture limit, a stop inside the shadow, ...) never stops a run. Read once, when "
+    "the first JobQueue2 queue is created.")
+
+PS3_CFG_STR(spu, xdiff_on_latent, "report", 6, PS3_CFG_V_XDIFF_ACTION,
+    "What a latent difference does to the run: \"report\" (the default) or \"stop\" as for "
+    "spu.xdiff_on_divergence. A latent difference is an end register or local store difference "
+    "in state the JobQueue2 loader destroys (docs/SPU_XDIFF.md section 8.4); it is a defect of the "
+    "lift the input did not expose, and blocks promotion exactly like a visible one. Read once, "
+    "when the first JobQueue2 queue is created.")
+
+PS3_CFG_U32(spu, xdiff_budget, 268435456, 1, 4294967295,
+    "The shadow's budget before a void verdict with reason budget (docs/SPU_XDIFF.md section 10): "
+    "interpreted instructions for a T0 shadow, backward and cross-function transfers of the "
+    "image's budgeted twin for a lifted one. It bounds a loop with no effects, which no "
+    "transcript ends. Read once, when the first JobQueue2 queue is created.")
 
 /* ---- gcm ---------------------------------------------------------------- */
 

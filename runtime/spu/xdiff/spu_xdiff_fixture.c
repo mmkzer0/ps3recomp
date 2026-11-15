@@ -890,7 +890,8 @@ uint32_t spu_xdiff_fixture_add_blob(spu_xdiff_fixture* f, const void* bytes, uin
 
     uint64_t limit = max_blob_bytes ? max_blob_bytes : SPU_XDIFF_MAX_BLOB_BYTES;
     if (limit > SPU_XDIFF_MAX_BLOB_BYTES) limit = SPU_XDIFF_MAX_BLOB_BYTES;
-    if ((uint64_t)f->blob_bytes + size > limit) {
+    if ((uint64_t)f->blob_bytes + size > limit ||
+        (f->live_limit && (uint64_t)f->effect_count * sizeof(spu_xdiff_effect) + f->blob_bytes + size > f->live_limit)) {
         ix->failed = 1;
         return SPU_XDIFF_NO_BLOB;
     }
@@ -900,6 +901,8 @@ uint32_t spu_xdiff_fixture_add_blob(spu_xdiff_fixture* f, const void* bytes, uin
         uint64_t want = f->blob_cap ? (uint64_t)f->blob_cap * 2u : 4096u;
         if (want < need) want = need;
         if (want > SPU_XDIFF_MAX_BLOB_BYTES) want = SPU_XDIFF_MAX_BLOB_BYTES;
+        /* The allocation is bounded by the live limit too: doubling must not retain twice what may be used. */
+        if (f->live_limit && want > f->live_limit) want = f->live_limit;
         uint8_t* grown = want >= need ? (uint8_t*)realloc(f->blob, (size_t)want) : NULL;
         if (!grown) {
             ix->failed = 1;
@@ -939,10 +942,13 @@ int spu_xdiff_fixture_add_effect(spu_xdiff_fixture* f, const spu_xdiff_effect* e
 {
     if (!f || !e) return -1;
     if (f->effect_count >= SPU_XDIFF_MAX_EFFECTS) return -1;
+    if (f->live_limit &&
+        ((uint64_t)f->effect_count + 1) * sizeof *e + f->blob_bytes > f->live_limit) return -1;
     if (f->effect_count != 0 && !f->effects) return -1;
     if (f->effect_count == f->effect_cap) {
         uint32_t want = f->effect_cap ? f->effect_cap * 2u : 64u;
         if (want > SPU_XDIFF_MAX_EFFECTS || want < f->effect_cap) want = SPU_XDIFF_MAX_EFFECTS;
+        if (f->live_limit && want > f->live_limit / sizeof *e) want = f->live_limit / (uint32_t)sizeof *e;
         if (want <= f->effect_cap) return -1;
         spu_xdiff_effect* grown =
             (spu_xdiff_effect*)realloc(f->effects, (size_t)want * sizeof *grown);

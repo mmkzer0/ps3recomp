@@ -52,6 +52,16 @@ static void print_options()
             std::printf("\"%s\"", ps3_cfg_spu_xdiff_dir());
         else if (!std::strcmp(o->section, "spu") && !std::strcmp(o->key, "xdiff_capture"))
             std::printf("%u", ps3_cfg_spu_xdiff_capture());
+        else if (!std::strcmp(o->section, "spu") && !std::strcmp(o->key, "xdiff"))
+            std::printf("\"%s\"", ps3_cfg_spu_xdiff());
+        else if (!std::strcmp(o->section, "spu") && !std::strcmp(o->key, "xdiff_period"))
+            std::printf("%u", ps3_cfg_spu_xdiff_period());
+        else if (!std::strcmp(o->section, "spu") && !std::strcmp(o->key, "xdiff_on_divergence"))
+            std::printf("\"%s\"", ps3_cfg_spu_xdiff_on_divergence());
+        else if (!std::strcmp(o->section, "spu") && !std::strcmp(o->key, "xdiff_on_latent"))
+            std::printf("\"%s\"", ps3_cfg_spu_xdiff_on_latent());
+        else if (!std::strcmp(o->section, "spu") && !std::strcmp(o->key, "xdiff_budget"))
+            std::printf("%u", ps3_cfg_spu_xdiff_budget());
         else if (!std::strcmp(o->section, "gcm") && !std::strcmp(o->key, "wait_timeout_ms"))
             std::printf("%u", ps3_cfg_gcm_wait_timeout_ms());
         else if (!std::strcmp(o->section, "gcm") && !std::strcmp(o->key, "park_resync"))

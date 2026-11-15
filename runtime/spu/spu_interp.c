@@ -160,8 +160,8 @@ static inline uint32_t spu_fetch(const spu_context* ctx, uint32_t pc) {
     if ((uint32_t)(i8) <= 14u) { \
         const int cfl_lane_ = spu_cfl_unmodelled_lane((a), (int)(i8), (uns)); \
         if (cfl_lane_ >= 0) { \
-            fprintf(stderr, "[spu_interp] unmodelled cflts/cfltu lane (%s I8=%u lane=%d in=0x%08X, #126) (0x%08X) at LS 0x%05X\n", \
-                    (opname), (unsigned)(i8), cfl_lane_, (unsigned)(a)._u32[cfl_lane_], insn, pc); \
+            fprintf(stderr, "%s[spu_interp] unmodelled cflts/cfltu lane (%s I8=%u lane=%d in=0x%08X, #126) (0x%08X) at LS 0x%05X\n", \
+                    spu_diag_tag(), (opname), (unsigned)(i8), cfl_lane_, (unsigned)(a)._u32[cfl_lane_], insn, pc); \
             ctx->pc = pc; ctx->status = SPU_STATUS_STOPPED_BY_HALT; return 1; \
         } } } while (0)
 
@@ -435,8 +435,8 @@ SPU_EXEC_INLINE int spu_exec(spu_context* ctx, uint32_t pc, uint32_t insn,
      * thread group ended with join cause 4 and the stopped thread's exit
      * status read 0x8001000F (CELL_ESTAT); issue #124. */
     default:
-        fprintf(stderr, "[spu_interp] unimplemented op '%s' (0x%08X) at LS 0x%05X\n",
-                spu_op_name[spu_decode_tab[insn >> 21]], insn, pc);
+        fprintf(stderr, "%s[spu_interp] unimplemented op '%s' (0x%08X) at LS 0x%05X\n",
+                spu_diag_tag(), spu_op_name[spu_decode_tab[insn >> 21]], insn, pc);
         ctx->pc = pc; ctx->status = SPU_STATUS_STOPPED_BY_HALT; return 1;
     }
     *out_next = next;
@@ -498,6 +498,12 @@ static SPU_INTERP_TLS int s_interp_depth;
  * (docs/SPU_XDIFF.md section 9). Per thread, like the counter. */
 int spu_interp_depth_get(void) { return s_interp_depth; }
 void spu_interp_depth_set(int depth) { s_interp_depth = depth; }
+
+/* The calling thread is running a shadow (spu_context.h, spu_diag_shadow_set). Here and not in spu_channels.c because
+ * every target that runs the interpreter links this file, and the interpreter's own diagnostics print the tag. */
+static SPU_INTERP_TLS int s_shadow_diag;
+void spu_diag_shadow_set(int on) { s_shadow_diag = on != 0; }
+const char* spu_diag_tag(void) { return s_shadow_diag ? "[shadow] " : ""; }
 
 /* The diagnostic gates of spu_interp_run_inner, read from the environment on a
  * thread's first run (YDKJ_SPU_TRACE, SPU_STEPCAP, YDKJ_CRI_GATE1TRACE,
@@ -818,10 +824,10 @@ static uint32_t spu_interp_run_inner(spu_context* ctx, uint32_t start_lsa,
         { const spu_observer* obs = ctx->observer;
           if (obs && obs->on_insn && obs->on_insn(obs->user, ctx, ctx->pc)) {
               if (!outermost) {
-                  fprintf(stderr, "[spu-interp] observer yield at LS 0x%05X inside a nested "
+                  fprintf(stderr, "%s[spu-interp] observer yield at LS 0x%05X inside a nested "
                                   "interpreter run (host depth %d); unsupported -- see "
                                   "spu_observe.h\n",
-                          ctx->pc & SPU_LS_MASK, s_interp_depth);
+                          spu_diag_tag(), ctx->pc & SPU_LS_MASK, s_interp_depth);
                   fflush(stderr);
                   abort();
               }
