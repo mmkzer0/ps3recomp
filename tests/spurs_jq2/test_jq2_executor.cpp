@@ -483,22 +483,31 @@ std::uint32_t ls_word(const spu_context* c, std::uint32_t lsa)
     return be32(v);
 }
 
-void lifted_job(spu_context* c, bool halt)
+/* The transform's work in the lifted style, without the end: the GET, the four
+ * words and the PUT. */
+void lifted_transform(spu_context* c)
 {
     const std::uint32_t d = c->gpr[4]._u32[0];
     const std::uint32_t out = ls_word(c, d + 0x30), in = ls_word(c, d + 0x34);
     const std::uint32_t k[4] = {ls_word(c, d + 0x38), ls_word(c, d + 0x3C), out, in};
     lifted_dma(c, kLsIn, in, MFC_GET_CMD);
-    if (halt) {
-        c->status = SPU_STATUS_STOPPED_BY_HALT;
-        spu_halt(c);
-        return;
-    }
     for (std::uint32_t i = 0; i < 4; ++i) {
         const std::uint32_t v = be32(ls_word(c, kLsIn + 4 * i) + k[i]);
         std::memcpy(c->ls + kLsOut + 4 * i, &v, 4);
     }
     lifted_dma(c, kLsOut, out, MFC_PUT_CMD);
+}
+
+void lifted_job(spu_context* c, bool halt)
+{
+    if (halt) {
+        /* the halt lands between the GET and the output store */
+        lifted_dma(c, kLsIn, ls_word(c, c->gpr[4]._u32[0] + 0x34), MFC_GET_CMD);
+        c->status = SPU_STATUS_STOPPED_BY_HALT;
+        spu_halt(c);
+        return;
+    }
+    lifted_transform(c);
     SPU_RET(c);
 }
 void lifted_normal_entry(spu_context* c) { lifted_job(c, false); }
@@ -535,6 +544,35 @@ void lifted_jm_call_entry(spu_context* c)
     spu_drain_call(c, kRet);
     c->host_depth--;
     spu_img_restore(c, saved);
+}
+
+/* A registered body that calls through r84 into two words it plants in local
+ * store, where no lift holds them: the production resolver's microstep executes
+ * the `il` and the `bi` and counts the arrival. The branch links through r84, not
+ * r0, so the job's own return link stays what the loader planted. */
+constexpr std::uint32_t kMissStub = 0x2000; /* between the jm areas, below the taskset and kernel ranges, outside the image */
+constexpr std::uint32_t kMissLink = 0x2F0;  /* no lift holds it; the drain bracket compares it and returns to this host frame */
+constexpr std::uint32_t kMissMark = 0x5A5A; /* positive, so `il`'s sign extension leaves this value in the word */
+void lifted_miss_entry(spu_context* c)
+{
+    lifted_transform(c);
+    const std::uint32_t stub[2] = {be32(e_il(10, kMissMark)), be32((0x1A8u << 21) | (84u << 7))}; /* il $r10 ; bi $r84 */
+    std::memcpy(c->ls + kMissStub, stub, sizeof stub);
+    c->gpr[84] = spu_link(kMissLink);
+    c->pc = kMissStub;
+    c->host_depth++;
+    spu_indirect_branch(c);
+    spu_drain_call(c, kMissLink);
+    c->host_depth--;
+    if (c->gpr[10]._u32[0] != kMissMark) {
+        /* The stub did not run as interpreted code. End the job on a stop, not a
+         * return, so the run fails loudly instead of reporting a tier. */
+        c->status = SPU_STATUS_STOPPED_BY_STOP;
+        c->stop_code = 0xBAD0u;
+        spu_halt(c);
+        return;
+    }
+    SPU_RET(c);
 }
 
 JobBody hook_select(void*, const JobStart&)
@@ -4426,6 +4464,39 @@ void mode_xdiff_select_lifted()
           (unsigned long long)(capture_unattributed().fingerprint_cache_misses - misses_before));
 }
 
+/* The tier names the body that ran; a registered lift that reaches code its lift does not hold is still `lifted`, and
+ * lift_miss beside it carries how many arrivals the resolver served in the interpreter. Kind 32 has both fields
+ * (ps3_ftrace.h), so both records come from one run: odd jobs run the body with the unlifted stub, even ones the fully
+ * lifted body. */
+void mode_xdiff_select_miss()
+{
+    constexpr std::uint32_t kJobs = 4, kImageB = IMAGE + 0x1000;
+    build_image(IMAGE, Prog::transform);
+    build_variant(kImageB, 1); /* other bytes, so the two images are two registrations and two fingerprints */
+    sel_register(fp_at(IMAGE), &lifted_miss_entry, kImageIdA, "miss-stub");
+    sel_register(fp_at(kImageB), &lifted_normal_entry, kImageIdB, "miss-none");
+    CHECK(PS3_FT_ON(), "tracing is on");
+    const std::vector<JobSpec> specs =
+        xd_run(kJobs, 1, {}, [](std::uint32_t j) { return (j % 2) == 0 ? std::uint32_t(IMAGE) : kImageB; });
+    for (const JobSpec& s : specs) CHECK(job_ok(s), "job %u output", s.serial);
+
+    const std::vector<ps3_ft_rec> bodies = ft_kind(PS3_FT_JQ2_BODY);
+    CHECK(bodies.size() == kJobs, "%zu kind-32 records for %u jobs", bodies.size(), kJobs);
+    std::map<std::uint32_t, ps3_ft_rec> by_seq;
+    for (const ps3_ft_rec& r : bodies) by_seq[r.a] = r;
+    for (std::uint32_t seq = 1; seq <= kJobs; ++seq) {
+        const auto it = by_seq.find(seq);
+        CHECK(it != by_seq.end(), "no kind 32 for seq %u", seq);
+        if (it == by_seq.end()) continue;
+        const ps3_ft_rec& r = it->second;
+        const bool stub = (seq % 2) == 1;
+        const std::uint32_t tier = r.b & 0xFFu, miss = (r.b >> 16) & 0xFFu;
+        CHECK(tier == std::uint32_t{SPU_TIER_LIFTED}, "seq %u: tier %u, wanted lifted", seq, tier);
+        CHECK(stub ? miss >= 1 : miss == 0, "seq %u: lift_miss %u, wanted %s", seq, miss, stub ? "at least 1" : "0");
+        CHECK(((r.b >> 8) & 0xFFu) == std::uint32_t{kNotSampled}, "seq %u: disposition %u", seq, (r.b >> 8) & 0xFFu);
+    }
+}
+
 /* All three consumers of a job's identity at once (spu.job_body=lifted, capture, kind-29 tracing): still one content
  * hash a job and one fingerprint for the one content. The IMAGE span keeps measuring that identification; its mean and
  * the JOB span's are printed for the report (nanoseconds). */
@@ -5204,7 +5275,8 @@ void mode_audit_trace()
 }
 
 /* spu.job_body=lifted with the audit off still emits kind 32 for each job (the tier that ran, never sampled, the
- * authority's lift misses saturated at 255) and no kind 33. */
+ * authority's lift misses saturated at 255) and no kind 33. The tier stays lifted: a registered body that reports a
+ * miss is still T1, and the count beside it is what says the resolver served some of the job in the interpreter. */
 void mode_audit_trace_lifted()
 {
     constexpr std::uint32_t kJobs = 3;
@@ -5411,6 +5483,7 @@ void xd_prologue(const std::string& mode)
     else if (mode == "xdiff-observer") n = 2;
     else if (mode == "xdiff-concurrent") n = 5;
     else if (mode == "xdiff-stop") n = 1;
+    else if (mode == "xdiff-select-miss") n = 0; /* the tier record is the subject: no capture, no fixture */
     setenv("PS3RECOMP_SPU_XDIFF_CAPTURE", std::to_string(n).c_str(), 1);
     if (dir.empty()) unsetenv("PS3RECOMP_SPU_XDIFF_DIR");
     else setenv("PS3RECOMP_SPU_XDIFF_DIR", dir.c_str(), 1);
@@ -5429,9 +5502,11 @@ int main(int argc, char** argv)
     guest_init();
     const std::string mode = argv[1];
     /* The recorder reads its window once, at the first hook: the trace modes say so before any hook runs. */
-    if (mode == "xdiff-select-trace") {
+    if (mode == "xdiff-select-trace" || mode == "xdiff-select-miss") {
         setenv("PS3_FTRACE", "0:100000:/dev/null", 1);
         setenv("PS3_FTRACE_CAP", "65536", 1);
+        /* The tier record needs neither a capture nor an audit: the job must run the production authority. */
+        if (mode == "xdiff-select-miss") setenv("PS3RECOMP_SPU_XDIFF", "off", 1);
     }
     /* spu.job_body is read at the first job: the select modes set it first. */
     if (mode.rfind("select-", 0) == 0) {
@@ -5548,6 +5623,7 @@ int main(int argc, char** argv)
     else if (mode == "select-concurrent-hook") mode_select_concurrent_hook();
     else if (mode == "xdiff-select-collision") mode_xdiff_select_collision();
     else if (mode == "xdiff-select-lifted") mode_xdiff_select_lifted();
+    else if (mode == "xdiff-select-miss") mode_xdiff_select_miss();
     else if (mode == "xdiff-select-trace") mode_xdiff_select_trace();
     else if (mode == "audit-divergence") mode_audit_divergence();
     else if (mode == "audit-latent") mode_audit_latent();

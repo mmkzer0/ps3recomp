@@ -217,14 +217,17 @@ if(NOT WIN32)
     #   jq2_exec_select_promoted_interp  the same two images under interp: neither body runs
     #   jq2_exec_xdiff_select_lifted  lifted + capture: fixtures name tier lifted with the registration's code_end and options;
     #                                 one identification serves the choice and the capture
+    #   jq2_exec_xdiff_select_miss   a registered lift that calls into local store no lift holds: the resolver interprets
+    #                                 the stub and counts the arrival, so kind 32 says lifted with lift_miss; the fully
+    #                                 lifted job of the same run says lifted with 0
     #   jq2_exec_xdiff_select_trace   lifted + capture + kind-29 trace: still one content hash a job
     #   jq2_exec_select_concurrent_hook  two workers hold a chosen, not yet running body at once (a gate in the observer's
     #                                 job_start): each job still runs its own image's body (the choice is thread-local)
     #   jq2_exec_xdiff_select_collision  a remembered fingerprint that is not the staged bytes' (seam): the capture finds it,
     #                                 the executor re-fingerprints and chooses again before the entry, the memory is repaired
     foreach(mode select-lifted select-other-bytes select-interp select-forced select-observer select-concurrent
-                  select-concurrent-hook select-promoted select-promoted-interp xdiff-select-lifted xdiff-select-trace
-                  xdiff-select-collision)
+                  select-concurrent-hook select-promoted select-promoted-interp xdiff-select-lifted xdiff-select-miss
+                  xdiff-select-trace xdiff-select-collision)
         string(REPLACE "-" "_" name "${mode}")
         add_test(NAME jq2_exec_${name} COMMAND test_jq2_executor ${mode})
         set_tests_properties(jq2_exec_${name} PROPERTIES LABELS "spurs;t0;tsan" TIMEOUT 300)
@@ -258,7 +261,8 @@ if(NOT WIN32)
     #   jq2_exec_xdiff_audit_lifted        spu.job_body=lifted: the registered body is the authority, the interpreter the shadow
     #   jq2_exec_xdiff_audit_period        period 3 counts per image from its first job
     #   jq2_exec_xdiff_audit_trace         kinds 32 and 33
-    #   jq2_exec_xdiff_audit_trace_lifted  kind 32 under job_body=lifted with the audit off
+    #   jq2_exec_xdiff_audit_trace_lifted  kind 32 under job_body=lifted with the audit off; a body that reports a
+    #                                      resolver miss stays lifted, with the count saturated beside it
     #   jq2_exec_xdiff_audit_trace_none    neither kind at the defaults
     #   jq2_exec_xdiff_audit_shared        capture and audit on: one identification, one recording
     #   jq2_exec_xdiff_audit_refused       a behaviour-changing knob refuses the audit

@@ -1207,8 +1207,9 @@ with tempfile.TemporaryDirectory() as tmp:
     check(a["body"]["sampled"] == 2 and a["body"]["queued"] == 1 and a["body"]["dropped"] == 1 and
           a["body"]["not_eligible"] == 0 and close(a["body"]["sampled_share"], 2 / 3),
           f"xdiff q0 image A: sampled, dropped, not eligible and the share {a['body']}")
-    check(a["body"]["resolver_misses"] == 3 + 255 and a["body"]["resolver_miss_saturated"] == 1,
-          f"xdiff q0 image A: resolver misses sum, one job saturated {a['body']}")
+    check(a["body"]["resolver_misses"] == 3 + 255 and a["body"]["resolver_miss_jobs"] == 2 and
+          a["body"]["resolver_miss_saturated"] == 1,
+          f"xdiff q0 image A: resolver misses sum and job count, one job saturated {a['body']}")
     check(a["verdicts"]["total"] == 2 and a["verdicts"]["by_verdict"] == {"equal": 1, "void": 1} and
           [(e["verdict"], e["reason"], e["count"]) for e in a["verdicts"]["by_reason"]] ==
           [("equal", "none", 1), ("void", "budget", 1)],
@@ -1227,7 +1228,8 @@ with tempfile.TemporaryDirectory() as tmp:
     check(u["unknown"] is True and u["jobs"] == 1 and u["body"]["tiers"]["native"] == 1 and
           u["body"]["sampled"] == 0 and close(u["body"]["sampled_share"], 0.0),
           f"xdiff: the job without an image is the unknown row {u['body']}")
-    check(u["body"]["resolver_misses"] == 255 and u["body"]["resolver_miss_saturated"] == 1,
+    check(u["body"]["resolver_misses"] == 255 and u["body"]["resolver_miss_jobs"] == 1 and
+          u["body"]["resolver_miss_saturated"] == 1,
           f"xdiff: a miss field above 255 saturates at 255 {u['body']}")
     check(u["verdicts"]["total"] == 3 and
           [(e["verdict"], e["reason"], e["count"]) for e in u["verdicts"]["by_reason"]] ==
@@ -1237,6 +1239,7 @@ with tempfile.TemporaryDirectory() as tmp:
 
     a1 = xd_rows(r, 1)[FP_A]
     check(a1["jobs"] == 1 and a1["body"]["tiers"]["interp"] == 1 and a1["body"]["resolver_misses"] == 1 and
+          a1["body"]["resolver_miss_jobs"] == 1 and
           [(e["verdict"], e["reason"]) for e in a1["verdicts"]["by_reason"]] == [("differ", "end-regs")],
           f"xdiff q1: joined on (who, seq), not seq alone {a1['body']}")
 
@@ -1245,18 +1248,19 @@ with tempfile.TemporaryDirectory() as tmp:
           oa["body"]["tiers"] == {"interp": 1, "lifted": 2, "partial": 1, "native": 0} and
           oa["body"]["sampled"] == 3 and oa["body"]["queued"] == 2 and oa["body"]["dropped"] == 1 and
           close(oa["body"]["sampled_share"], 0.75) and oa["body"]["resolver_misses"] == 259 and
+          oa["body"]["resolver_miss_jobs"] == 3 and
           oa["verdicts"]["total"] == 3 and
           [e["verdict"] for e in oa["verdicts"]["by_reason"]] == ["equal", "differ", "void"],
           f"xdiff overall image A: the queues add up {oa['body']} {oa['verdicts']}")
 
     rc, out, err = run(tmp, jq2_trace(XD_FULL, header=IMG_HEADER))
     check(rc == 0, f"xdiff text: exit 0: {err}")
-    check(out.count("        tiers: interp 0, lifted 2, partial 1, native 0; resolver misses 258"
+    check(out.count("        tiers: interp 0, lifted 2, partial 1, native 0; resolver misses 258 in 2 job(s)"
                     " (lower bound: 1 job(s) at 255)\n") == 1 and
           out.count("        sampled 2 (share 66.7 % of 3 jobs), queued 1, dropped 1, not eligible 0\n") == 1 and
           out.count("        verdicts: equal/none 1, void/budget 1\n") == 1,
           "xdiff text: q0 image A columns")
-    check(out.count("        tiers: interp 1, lifted 2, partial 1, native 0; resolver misses 259"
+    check(out.count("        tiers: interp 1, lifted 2, partial 1, native 0; resolver misses 259 in 3 job(s)"
                     " (lower bound: 1 job(s) at 255)\n") == 1 and
           out.count("        sampled 3 (share 75.0 % of 4 jobs), queued 2, dropped 1, not eligible 0\n") == 1 and
           out.count("        verdicts: equal/none 1, differ/end-regs 1, void/budget 1\n") == 1,
@@ -1266,6 +1270,8 @@ with tempfile.TemporaryDirectory() as tmp:
           out.count("        verdicts: differ/end-ls 1, differ/unknown reason 99 1,"
                     " unknown verdict 9/unknown reason 0 1\n") == 2,
           "xdiff text: image X and the unknown row, per queue and overall")
+    check(out.count("; resolver misses 0\n") == 2 and "in 0 job(s)" not in out,
+          "xdiff text: a row with no resolver miss prints the sum without a job count")
 
     # Partial presence: what is there is shown, the other kind's columns are absent.
     only32 = [l for l in XD_FULL if not l.startswith("33 ")]

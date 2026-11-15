@@ -11,8 +11,9 @@
  *   (b) a served context completes with vm_base == NULL and no MFC engine, in
  *       the state the real run reached, with the same transcript;
  *   (c) a served lifted context that branches to local store no lift holds ends
- *       with lift_miss == 1 and nothing interpreted (an unserved one
- *       interprets it, so the check can fail);
+ *       with lift_miss == 1 and nothing interpreted; the unserved one interprets
+ *       the target and counts the same one arrival (so the served check can
+ *       fail), and an unserved context with no lift (image_id -1) counts none;
  *   (d) a serve callback that cannot answer ends the run under
  *       spu_run_with_halt, and without a landing pad the process aborts (child
  *       processes: this program re-executes itself with an argument).
@@ -440,15 +441,30 @@ static void test_miss(void)
     spu_context* c = &g_ctx;
     int halted;
 
-    /* unserved: the resolver interprets the live bytes, so the served check below can fail */
+    /* unserved: the resolver interprets the live bytes and counts the one
+     * arrival at code the lift does not hold, so the served check below can
+     * fail; the job still runs the interpreted stop. */
     fill_world(g_mem);
     ctx_setup(c, 1, XJ_MISS_ENTRY);
     plant_miss_target(c);
     halted = run_job(c, 1, XJ_MISS_ENTRY);
-    CHECK(!halted && c->lift_miss == 0 && c->gpr[10]._u32[0] == XJ_MISS_MARK &&
+    CHECK(!halted && c->lift_miss == 1 && c->gpr[10]._u32[0] == XJ_MISS_MARK &&
           c->stop_code == XJ_MISS_STOP_CODE,
-          "unserved lifted miss: the real resolver did not interpret the target (halted %d r10 0x%X code 0x%X)",
-          halted, c->gpr[10]._u32[0], c->stop_code);
+          "unserved lifted miss: the real resolver did not interpret the target and count it "
+          "(halted %d lift_miss %u r10 0x%X code 0x%X)",
+          halted, c->lift_miss, c->gpr[10]._u32[0], c->stop_code);
+    ctx_teardown(c);
+
+    /* unserved and no lift (image_id -1, e.g. an image with no registration):
+     * the resolver still interprets the target, but there is no lift to miss,
+     * so the arrival is not counted. */
+    fill_world(g_mem);
+    ctx_setup(c, 1, XJ_MISS_ENTRY);
+    c->image_id = -1;
+    plant_miss_target(c);
+    halted = run_job(c, 1, XJ_MISS_ENTRY);
+    CHECK(!halted && c->lift_miss == 0 && c->gpr[10]._u32[0] == XJ_MISS_MARK && c->stop_code == XJ_MISS_STOP_CODE,
+          "unserved no-lift miss: lift_miss %u r10 0x%X code 0x%X", c->lift_miss, c->gpr[10]._u32[0], c->stop_code);
     ctx_teardown(c);
 
     /* (c) served and lifted: counted, ended, nothing interpreted */

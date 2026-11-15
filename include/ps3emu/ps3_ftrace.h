@@ -173,12 +173,14 @@ enum ps3_ft_kind {
     PS3_FT_JQ2_BODY       = 32, /* worker, once per job that has a JOB span, when spu.job_body is not interp or spu.xdiff
                               * is not off; the span is the end hook's work for the sample (the recording's close and the
                               * capture), zero length when the job was not sampled; who = q << 8 | w, a = seq,
-                              * b = tier | disposition << 8 | sat(lift_miss, 255) << 16: tier of the authority that ran
-                              * (0 interpreter, 1 lifted: spu_job_tier), disposition 0 not sampled, 1 queued for the
-                              * audit thread, 2 dropped (full queue, or shutdown), 3 not eligible (no inventory, event
-                              * branches, an unknown body, no registered body or no twin for a lifted shadow, or a recording the
-                              * audit refuses: over its bound, or one the recorder could not complete), lift_miss the
-                              * authority's count of indirect branches no lifted code covered, saturated at 255 */
+                              * b = tier | disposition << 8 | sat(lift_miss, 255) << 16: tier of the body that ran
+                              * (0 interpreter, 1 lifted: spu_job_tier; a lift that interpreted keeps it), disposition
+                              * 0 not sampled, 1 queued for the audit thread, 2 dropped (full queue, or shutdown),
+                              * 3 not eligible (no inventory, event branches, an unknown body, no registered body or
+                              * no twin for a lifted shadow, or a recording the audit refuses: over its bound, or one
+                              * the recorder could not complete), lift_miss the job's arrivals at local store no
+                              * lifted code covered: the production resolver served them in the interpreter, and a
+                              * served (replay) run ended on them, one per arrival, saturated at 255 */
     PS3_FT_JQ2_XDIFF      = 33, /* audit thread, once per shadow run; the span is the subject's run; who = q << 8 | w of the
                               * job, a = seq, b = verdict | reason << 8 | subject tier << 16 (spu_xdiff_verdict and
                               * spu_xdiff_reason ids, spu_job_tier of the shadow) */
