@@ -1596,7 +1596,9 @@ if(PS3RECOMP_BUILD_TESTS)
                     "${XDIFF_POISON_DIR}/xp_frame.spujob")
             set_tests_properties(spu_job_replay_poison_frame PROPERTIES LABELS "spu;t0" TIMEOUT 60
                 FIXTURES_REQUIRED spu_xdiff_poison_fixture
-                PASS_REGULAR_EXPRESSION "^differ poison effect=[0-9]+ function=0x00040 below_sp=0x20 ")
+                # Anchored at a line, not at the output: ctest matches the whole output, and a compiler
+                # without musttail prints a `[spu] direct tail calls off` line to stderr first.
+                PASS_REGULAR_EXPRESSION "(^|\n)differ poison effect=[0-9]+ function=0x00040 below_sp=0x20 ")
             add_test(NAME spu_job_replay_poison_usage
                 COMMAND spu_job_replay --poison "${XDIFF_POISON_DIR}/xp_ok.json" "${XDIFF_POISON_DIR}/xp_ok.spujob")
             set_tests_properties(spu_job_replay_poison_usage PROPERTIES LABELS "spu;t0" TIMEOUT 60
