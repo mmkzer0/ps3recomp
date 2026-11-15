@@ -16,6 +16,7 @@ import sys
 import tempfile
 
 from spu_disasm import CHANNEL_NAMES, SPU_RR, disassemble_spu
+from find_spu_functions import image_delta, immediate_ls_addresses, immediate_values_naming
 from spu_elf import fnv1a64, scan_spu_candidates
 
 
@@ -133,6 +134,18 @@ def load_raw_images(manifest_path):
             if code_end <= base or code_end & 3:
                 raise ValueError(f'{source}: code_end 0x{code_end:X} must be a '
                                  f'4-byte-aligned address after ls_base 0x{base:X}')
+        # The image's own link address, when it differs from where it is
+        # staged: a position-independent job is linked at 0 and its immediates
+        # name image-relative addresses (find_spu_functions.image_delta).
+        link_base = None
+        if entry.get('link_base') is not None:
+            link_base = _manifest_int(entry['link_base'], 'link_base', source)
+            if link_base < 0 or link_base & 15:
+                raise ValueError(f'{source}: link_base 0x{link_base:X} must be a '
+                                 '16-byte-aligned, non-negative address')
+            if link_base > base:
+                raise ValueError(f'{source}: link_base 0x{link_base:X} is after '
+                                 f'ls_base 0x{base:X}')
         extra = entry.get('extra_entry_points', [])
         if not isinstance(extra, list):
             extra = None
@@ -153,7 +166,8 @@ def load_raw_images(manifest_path):
                 raise ValueError(f'{source}: {field} must be a boolean')
             flags[field] = value
         out.append({'digest': digest, 'blob': blob, 'path': str(blob_path), 'size': len(blob),
-                    'ls_base': base, 'code_end': code_end, 'extra_entry_points': points,
+                    'ls_base': base, 'code_end': code_end, 'link_base': link_base,
+                    'extra_entry_points': points,
                     'return_entries': flags['return_entries'], 'promoted': flags['promoted']})
     return out
 
@@ -238,8 +252,12 @@ def _operand_addresses(ins):
             if token.startswith('0x')]
 
 
-def _immediate_address(insns, target):
-    """(site, mnemonic) of the first instruction that forms `target`, else None.
+def _immediate_address(insns, targets):
+    """(site, mnemonic) of the first instruction that forms one of `targets`, else None.
+
+    `targets` are the immediate values that name the address in question
+    (`immediate_values_naming`: the address itself, plus its image-relative
+    value when the image declares a link base).
 
     A function reached through a register that code materialised (`ila`, an
     `il`, or `ilhu`+`iohl`) can be entered without a direct call, so a set of
@@ -248,6 +266,7 @@ def _immediate_address(insns, target):
     form, and an over-approximation only keeps a site unresolved.
     """
     high = {}
+    lows = {target & 0xFFFF for target in targets}
     for ins in insns:
         mnemonic, register = ins.mnemonic, ins.raw & 0x7F
         if mnemonic == 'ila':
@@ -256,7 +275,7 @@ def _immediate_address(insns, target):
             value = _il_value(ins)
         elif mnemonic == 'ilhu':
             high[register] = ((ins.raw >> 7) & 0xFFFF) << 16
-            if high[register] == target:
+            if high[register] in targets:
                 return ins.addr, mnemonic
             continue
         elif mnemonic == 'iohl':
@@ -266,7 +285,7 @@ def _immediate_address(insns, target):
                 # The high half is not visible here, so this iohl may still
                 # have completed the target: treat a matching low half as
                 # evidence rather than claim the function is only called.
-                if low == target & 0xFFFF:
+                if low in lows:
                     return ins.addr, mnemonic
                 continue
             value |= low
@@ -275,21 +294,22 @@ def _immediate_address(insns, target):
             if written is not None:
                 high.pop(written, None)
             continue
-        if value == target:
+        if value in targets:
             return ins.addr, mnemonic
         high.pop(register, None)
     return None
 
 
-def _data_word(blob, target):
-    """First aligned 32-bit word in `blob` equal to `target`, else None.
+def _data_word(blob, targets):
+    """First aligned 32-bit word in `blob` equal to one of `targets`, else None.
 
     A function-pointer table holds entry addresses; the bytes cannot say
     whether such a word is data or an instruction operand, so every occurrence
-    counts as an indirect reference.
+    counts as an indirect reference. `targets` are the word values that name
+    the address (`immediate_values_naming`).
     """
     for offset in range(0, len(blob) - 3, 4):
-        if int.from_bytes(blob[offset:offset + 4], 'big') == target:
+        if int.from_bytes(blob[offset:offset + 4], 'big') in targets:
             return offset
     return None
 
@@ -765,7 +785,8 @@ class _FlowRegion:
         return state
 
 
-def _entry_values(blob, insns, address, register, entry, extra_entry_points, call_sites):
+def _entry_values(blob, insns, address, register, entry, extra_entry_points, call_sites,
+                  delta=0):
     """Constants every caller passes in `register` at an entry, or a refusal.
 
     A region entry is observed from outside: every reference must be a direct
@@ -773,15 +794,21 @@ def _entry_values(blob, insns, address, register, entry, extra_entry_points, cal
     reachable indirectly (a materialised immediate, a pointer-table word, the
     image entry or an extra entry point). A caller that computes the argument,
     or a call from outside the lifted ranges, proves nothing.
+
+    In a position-independent image (`delta` non-zero) an immediate or word
+    holding `address - delta` names the entry as well: code adds the load
+    delta to it before branching. Both readings refuse, so a PIC image can only
+    lose resolutions against the delta-free rule, never gain one.
     """
     if address == entry:
         return 'is the image entry'
     if address in extra_entry_points:
         return 'is an extra entry point'
-    word = _data_word(blob, address)
+    names = immediate_values_naming(address, delta)
+    word = _data_word(blob, names)
     if word is not None:
         return f'appears as a data word at 0x{word:X}'
-    materialised = _immediate_address(insns, address)
+    materialised = _immediate_address(insns, names)
     if materialised is not None:
         return f'is materialised by {materialised[1]} at 0x{materialised[0]:X}'
     callers = []
@@ -806,18 +833,22 @@ def _entry_values(blob, insns, address, register, entry, extra_entry_points, cal
     return {value: sorted(sites) for value, sites in values.items()}
 
 
-def _materialised_addresses(insns):
+def _materialised_addresses(insns, delta=0):
     """Candidate addresses code forms as immediates, mapped to their first site.
 
     The same linear over-approximation as `_immediate_address`: an `ilhu`'s
     high half, a matching lone `iohl` low half and the completed pair are all
-    candidates, so this can only add references, never hide one.
+    candidates, so this can only add references, never hide one. A
+    position-independent image (`delta` non-zero) also names `value + delta`:
+    both readings are candidates, and every consumer only uses membership to
+    refuse or to cut a straight-line run, so the extra reading is conservative.
     """
     found = {}
     high = {}
 
     def note(value, ins):
-        found.setdefault(value & 0xFFFFFFFF, (ins.addr, ins.mnemonic))
+        for address in immediate_ls_addresses(value & 0xFFFFFFFF, delta):
+            found.setdefault(address, (ins.addr, ins.mnemonic))
 
     for ins in insns:
         mnemonic, register = ins.mnemonic, ins.raw & 0x7F
@@ -842,7 +873,7 @@ def _materialised_addresses(insns):
 
 
 def _resolve_sites(blob, insns, functions, regions, call_sites, entry,
-                   extra_entry_points, unresolved, registers, computed_jumps):
+                   extra_entry_points, unresolved, registers, computed_jumps, delta=0):
     """Resolve `wrch MFC_Cmd` sites the block-local pass left unresolved.
 
     The site belongs to a branch-connected region (one procedure, however many
@@ -899,9 +930,10 @@ def _resolve_sites(blob, insns, functions, regions, call_sites, entry,
                 references.setdefault(target, []).append(ins)
     cuts = {target for target, refs in references.items()
             if any(not _pc_getter(ref) for ref in refs)}
-    materialised = _materialised_addresses(insns)
-    data_words = {int.from_bytes(blob[offset:offset + 4], 'big')
-                  for offset in range(0, len(blob) - 3, 4)}
+    materialised = _materialised_addresses(insns, delta)
+    data_words = {address for offset in range(0, len(blob) - 3, 4)
+                  for address in immediate_ls_addresses(
+                      int.from_bytes(blob[offset:offset + 4], 'big'), delta)}
     # A chunk start no branch names can still be entered by the loader, the
     # lifter's seed list or a computed transfer, so a run must not cross it. A
     # chunk start only a PC-getter names is the dispatch idiom's own
@@ -1013,7 +1045,7 @@ def _resolve_sites(blob, insns, functions, regions, call_sites, entry,
             key = (address, origin)
             if key not in proofs:
                 proofs[key] = _entry_values(blob, insns, address, origin, entry,
-                                            extra, call_sites)
+                                            extra, call_sites, delta)
             result = proofs[key]
             if isinstance(result, str):
                 refusal = f'entry 0x{address:X} {result}'
@@ -1044,7 +1076,8 @@ def _resolve_sites(blob, insns, functions, regions, call_sites, entry,
     return entries, remaining, modelled
 
 
-def effects_inventory(image, base, functions, entry=None, extra_entry_points=()):
+def effects_inventory(image, base, functions, entry=None, extra_entry_points=(),
+                      link_base=None):
     """Channels, MFC commands and event branches in the lifted ranges.
 
     `functions` are the lifter's generated [start, end) LS ranges, so the
@@ -1168,7 +1201,8 @@ def effects_inventory(image, base, functions, entry=None, extra_entry_points=())
     if entry is not None and unresolved:
         resolved, unresolved, modelled = _resolve_sites(
             image, insns, functions, _flow_regions(insns, ranges), call_sites,
-            entry, extra_entry_points, unresolved, registers, computed_jumps)
+            entry, extra_entry_points, unresolved, registers, computed_jumps,
+            image_delta(base, link_base))
     else:
         resolved = []
         for item in unresolved:
@@ -1199,7 +1233,8 @@ def effects_inventory(image, base, functions, entry=None, extra_entry_points=())
         'unresolved': sorted(unresolved, key=lambda entry: entry['site'])}
 
 
-def lift_options_string(code_end, extra_entry_points, merge_chunks, return_entries=False):
+def lift_options_string(code_end, extra_entry_points, merge_chunks, return_entries=False,
+                        link_base=None):
     """The lifter options that change one image's generated code, canonically.
 
     Fixed order, lowercase hex, sorted extra entry points, an absent option
@@ -1208,10 +1243,15 @@ def lift_options_string(code_end, extra_entry_points, merge_chunks, return_entri
     `--functions`, `--symbol-prefix`, `--report` and `--output` are not lift
     options in this sense -- for one image they follow from its own bytes (the
     manifest or the ELF, the detector, the fingerprint) or only name paths.
+    `link_base` is one: it changes the function starts the detector seeds from
+    the image's immediates, so the same bytes lifted with and without it are
+    different bodies.
     """
     parts = []
     if code_end is not None:
         parts.append(f'code_end=0x{code_end:x}')
+    if link_base is not None:
+        parts.append(f'link_base=0x{link_base:x}')
     if extra_entry_points:
         parts.append('extra=' + ','.join(f'0x{address:x}' for address in sorted(extra_entry_points)))
     if merge_chunks:
@@ -1304,12 +1344,13 @@ def build_programs(args, registry_writer):
                     raise ValueError('raw image blobs must be outside the owned output directory')
                 previous = raw_specs.get(spec['digest'])
                 if previous is not None:
-                    if ((previous['ls_base'], previous['code_end'], previous['return_entries'],
-                         previous['promoted'])
-                            != (spec['ls_base'], spec['code_end'], spec['return_entries'],
-                                spec['promoted'])):
+                    if ((previous['ls_base'], previous['code_end'], previous['link_base'],
+                         previous['return_entries'], previous['promoted'])
+                            != (spec['ls_base'], spec['code_end'], spec['link_base'],
+                                spec['return_entries'], spec['promoted'])):
                         raise ValueError('raw image ' + spec['path'] + ': the same bytes are listed '
-                                         'with a different ls_base/code_end/return_entries/promoted')
+                                         'with a different ls_base/code_end/link_base/'
+                                         'return_entries/promoted')
                     previous['extra_entry_points'] = sorted(
                         set(previous['extra_entry_points']) | set(spec['extra_entry_points']))
                     previous['paths'].append(spec['path'])
@@ -1365,6 +1406,7 @@ def build_programs(args, registry_writer):
                  'image_id': image_id, 'fingerprint': f'{fnv1a64(spec["blob"]):016X}',
                  'status': 'discovered', 'occurrences': occurrences, 'image_kind': 'raw',
                  'ls_base': spec['ls_base'], 'code_end': spec['code_end'],
+                 'link_base': spec['link_base'],
                  'extra_entry_points': spec['extra_entry_points'],
                  'return_entries': spec['return_entries'], 'promoted': spec['promoted']}
             unique[digest], blobs[digest] = p, spec['blob']
@@ -1424,7 +1466,8 @@ def build_programs(args, registry_writer):
                     ls_base, code_end = program['ls_base'], program['code_end']
                     ranges = [(ls_base, ls_base + len(blob))]
                     functions, (offset, base, size) = detect_functions(
-                        blob, verbose=False, raw=True, base_override=ls_base)
+                        blob, verbose=False, raw=True, base_override=ls_base,
+                        link_base=program['link_base'])
                 else:
                     ranges = code_ranges(info)
                     functions, (offset, base, size) = detect_functions(blob, verbose=False)
@@ -1445,7 +1488,8 @@ def build_programs(args, registry_writer):
                 merge_chunks = bool(getattr(args, 'merge_chunks', False))
                 return_entries = bool(program.get('return_entries', False))
                 program['lift_options_string'] = lift_options_string(
-                    code_end if raw else None, entries, merge_chunks, return_entries)
+                    code_end if raw else None, entries, merge_chunks, return_entries,
+                    program['link_base'] if raw else None)
                 program['lift_options'] = lift_options_digest(program['lift_options_string'])
                 (outdir / 'code.bin').write_bytes(blob[offset:offset + size])
                 (outdir / 'functions.json').write_text(json.dumps([dict(start=s, end=e) for s, e in bounds]))
@@ -1491,7 +1535,8 @@ def build_programs(args, registry_writer):
                     program['effects'] = effects_inventory(blob, program['ls_base'],
                                                            diagnostics['functions'],
                                                            entry=program['entry'],
-                                                           extra_entry_points=entries)
+                                                           extra_entry_points=entries,
+                                                           link_base=program['link_base'])
             except (ValueError, OSError, KeyError, SystemExit) as error:
                 program.update(status='unsupported', reason=str(error))
                 continue

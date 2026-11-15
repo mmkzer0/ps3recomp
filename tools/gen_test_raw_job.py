@@ -49,8 +49,11 @@ ORI = 0x004
 ANDI = 0x014
 AI = 0x01C
 ROTMI = 0x079
+SHLI = 0x07B
 AND = 0x0C1
 A = 0x0C0
+LQX = 0x1C4
+ROTQBY = 0x1DC
 NOP = 0x201
 
 # E/D interrupt bits of the bi family (runtime/spu/spu_interp.c:127-132):
@@ -62,20 +65,23 @@ INTERRUPT_DISABLE = 0x80000
 # commands from a helper that takes the command word in $r8, so the inventory
 # has to prove the command through the image's own call sites. The `flow*`
 # variants put one function's command immediate and its `wrch` in different
-# blocks, for the function-wide reaching-value pass.
+# blocks, for the function-wide reaching-value pass. The `pic-*` variants and
+# `calls-pic-materialised` are position-independent: their immediates are
+# image-relative (the image is linked at 0 and staged at `base`), see
+# `pic_layout`.
 VARIANTS = ('default', 'bisled', 'disable', 'iret',
             'calls', 'calls-computed', 'calls-materialised', 'calls-rewrite',
             'calls-data-word', 'calls-forward', 'calls-forward-computed',
-            'calls-dispatch',
+            'calls-dispatch', 'calls-pic-materialised',
             'flow-dominates', 'flow-loop', 'flow-split', 'flow-one-path', 'flow-sibling',
             'flow-dispatch', 'flow-dispatch-pc', 'flow-dispatch-and',
             'flow-dispatch-wide', 'flow-dispatch-outside',
             'flow-loop-live', 'flow-tail-call', 'flow-link-arg',
             'flow-extra-entry', 'flow-ila-landing', 'flow-mid-landing',
-            'default-dispatch', 'flow-r0-identity')
+            'default-dispatch', 'flow-r0-identity', 'pic-jump-table')
 CALL_VARIANTS = ('calls', 'calls-computed', 'calls-materialised', 'calls-rewrite',
                  'calls-data-word', 'calls-forward', 'calls-forward-computed',
-                 'calls-dispatch')
+                 'calls-dispatch', 'calls-pic-materialised')
 FORWARD_VARIANTS = ('calls-forward', 'calls-forward-computed')
 FLOW_VARIANTS = ('flow-dominates', 'flow-loop', 'flow-split', 'flow-one-path',
                  'flow-sibling', 'flow-dispatch', 'flow-dispatch-pc',
@@ -164,7 +170,7 @@ def _call_body(base, variant):
     second_arg = (_ri10(LQD, 0, 3, 8) if variant == 'calls-computed'
                   else _ri16(IL, MFC_PUT, 8))
     main = [_ri16(IL, MFC_GET, 8), 0, second_arg, 0]
-    if variant == 'calls-materialised':
+    if variant in ('calls-materialised', 'calls-pic-materialised'):
         main.append(0)                                  # ila $r5, <helper>
     main += [_ri16(IL, 0x1234, 10), _channel(WRCH, SPU_WrOutMbox, 10)]
     main += [_ri10(LQD, 0, 0, 11), _channel(WRCH, MFC_Cmd, 11)]
@@ -179,6 +185,10 @@ def _call_body(base, variant):
     main[3] = _ri16(BRSL, (address - (code_start + 12)) // 4, 0)
     if variant == 'calls-materialised':
         main[4] = _ri18(ILA, address, 5)
+    elif variant == 'calls-pic-materialised':
+        # Linked at 0: the immediate is the helper's offset in the image, and
+        # the code adds the load delta (`a $r5,$r5,$r126`) before it branches.
+        main[4] = _ri18(ILA, address - base, 5)
     return main, helper, address
 
 
@@ -236,6 +246,62 @@ def default_extra_entry(base=LS_BASE):
     code's return, so a caller lists this address as an extra entry point.
     """
     return base + len(build(variant='default'))
+
+
+def pic_layout(base=LS_BASE):
+    """Addresses inside the `pic-jump-table` image, as LS addresses.
+
+    `table` is the jump table (its words are TABLE-relative), `cases` the four
+    case bodies it names, `pointer` the function whose image-relative address
+    an `ila` materialises, and `delta` the load delta the code computes
+    (`base`: the image is linked at 0).
+    """
+    return _pic_body(base)[1]
+
+
+def _pic_body(base):
+    """(words, layout) of the `pic-jump-table` variant.
+
+    The shape a position-independent job compiles to (docs/SPU_LIFTER.md, raw
+    manifest `link_base`):
+
+        brsl $r126, .+4 ; ai $r126, $r126, -0x44   <- the load delta
+        ila  $r20, <fn - base> ; a $r20,$r20,$r126 ; bisl $r0, $r20
+        ila  $r14, <table - base> ; a $r10,$r14,$r126
+        shli ; lqx ; rotqby ; a $r2,$r3,$r10 ; bi $r2
+        table: case_k - table   (table-relative words)
+
+    Neither the table nor the pointer target is named by an absolute address
+    anywhere, so a reader that takes every immediate as an LS address sees
+    neither the four case bodies nor the function.
+    """
+    cases = 4
+    code_start = base + CODE_START
+    head = 12                                           # words before the table
+    table = code_start + 4 * head
+    first_case = table + 4 * cases
+    case_addrs = [first_case + 8 * k for k in range(cases)]
+    pointer = first_case + 8 * cases
+    words = [
+        _ri16(BRSL, 1, 126),                            # PC-getter
+        _ri10(AI, -(CODE_START + 4), 126, 126),         # delta = base
+        _ri18(ILA, pointer - base, 20),
+        _rr(A, 126, 20, 20),
+        _rr(BISL, 0, 20, 0),
+        _ri18(ILA, table - base, 14),
+        _rr(A, 126, 14, 10),
+        _ri7(SHLI, 2, 15, 13),
+        _rr(LQX, 10, 13, 11),
+        _rr(ROTQBY, 13, 11, 3),
+        _rr(A, 10, 3, 2),
+        _rr(BI, 0, 2, 0),
+    ]
+    assert len(words) == head
+    words += [(address - table) & 0xFFFFFFFF for address in case_addrs]
+    for k in range(cases):
+        words += [_ri16(IL, k, 3), _rr(BI, 0, 0, 0)]
+    words += [_ri16(IL, 99, 3), _rr(BI, 0, 0, 0)]
+    return words, {'table': table, 'cases': case_addrs, 'pointer': pointer, 'delta': base}
 
 
 def _flow_body(variant, base):
@@ -455,6 +521,14 @@ def build(base=LS_BASE, tail_words=0, variant='default'):
             # `bi $r5`: a register-targeted transfer, reachable only when the
             # image lists its address as an extra entry point.
             image += _be32(_rr(BI, ra=5))
+        if base + len(image) > LS_SIZE:
+            raise ValueError('image does not fit the local store')
+        return image
+
+    if variant == 'pic-jump-table':
+        if tail_words:
+            raise ValueError('tail_words applies to the default image only')
+        image = bytes(header) + b''.join(_be32(word) for word in _pic_body(base)[0])
         if base + len(image) > LS_SIZE:
             raise ValueError('image does not fit the local store')
         return image
