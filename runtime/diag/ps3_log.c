@@ -780,9 +780,20 @@ void ps3_log_configure(void)
     at_quick_exit(at_exit);
 }
 
+/* A spent site is the common case on a hot path (the old PS3_LOG_FIRST was a thread-local increment there):
+ * one relaxed load of `emitted`, which stops at the limit, then one relaxed fetch_add on the site's count.
+ * No gate, no reservation. A call that sees a free slot goes the slow way and may still lose the race for
+ * it; the CAS in reserve() keeps the limit exact. A suppression counted here after the closer's snapshot is a
+ * line that raced the end of the process, like any other. */
 int ps3_log_site_admit(ps3_log_site* site, ps3_log_level lvl)
 {
     if ((int)lvl > __atomic_load_n(&g_level, __ATOMIC_RELAXED)) return 0;
+    if (site->limit && __atomic_load_n(&site->emitted, __ATOMIC_RELAXED) >= site->limit) {
+        register_site(site);
+        if (__atomic_fetch_add(&site->suppressed, 1u, __ATOMIC_RELAXED) == UINT_MAX)
+            __atomic_store_n(&site->suppressed, UINT_MAX, __ATOMIC_RELAXED);   /* saturate, never wrap */
+        return 0;
+    }
     if (!gate_enter()) return 0;
     if (!reserve(site)) {
         gate_leave();
