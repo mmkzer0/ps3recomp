@@ -70,6 +70,7 @@
 #include "rsx_host_surface.h"
 #if TARGET_OS_IPHONE
 #  include "ps3emu/metal_ios_display.h"
+#  include <os/proc.h>   /* os_proc_available_memory: the allocation-failure log */
 #include "rsx_metal_sampler_policy.h"
 #endif
 #include "rsx_commands.h"
@@ -91,10 +92,82 @@
 #include "ps3emu/log_first.h"
 #include "rsx_capture.h"
 #include "ps3emu/stop.h"
+#include "ps3emu/host_gpu_gate.h"
+#include <time.h>
 #include <dlfcn.h>
 /* The capture module is optional in a link (tests build this file without it):
  * a weak reference to its installer keeps this backend linking either way. */
 __attribute__((weak_import)) int rsx_capture_install_from_config(const rsx_capture_environment* env);
+/* Likewise the FIFO walker's wait clock (cellGcmSys.c): a link without it has no wait timeouts to pause. */
+__attribute__((weak_import)) void cellGcm_set_host_pause_clock(unsigned long long (*paused_ms)(void));
+
+/* While the host does not let this process use the GPU (iOS: the screen locked or dimmed, the app switcher, the
+ * background), every path that allocates a resource or commits a command buffer for the guest waits here first
+ * (include/ps3emu/host_gpu_gate.h). The RSX thread is the one that waits, so the guest's graphics stall with it.
+ * The UIKit lifecycle observers (rsx_metal_ios_display.m) suspend and resume it; macOS never does. */
+static host_gpu_gate s_gpu_gate = HOST_GPU_GATE_INIT;
+
+/* How long suspend() waits for the sections open at will-resign-active to leave, and how long an allocation that
+ * failed with the gate steady waits for the host's notification before it calls the refusal the device's. Both are
+ * bounds, not expectations.
+ *
+ * A counted section only ever holds bounded CPU work up to its commit: the unbounded stages (the in-flight
+ * semaphore, nextDrawable, a command buffer's waitUntilCompleted) run outside it, between a leave and an enter
+ * (which blocks while the gate is closed). So the drain waits for milliseconds of encoding, not for the GPU or the
+ * display, and 5 s is far beyond any section; one that exceeds it is logged loudly (the one way a commit can then
+ * follow will-resign-active). UIKit posts will-resign-active on the main thread before the GPU is taken away, and
+ * the refusal an allocation sees can only come after the OS decided, so it races no more than the main thread's
+ * delivery of the notification; a second is far beyond a responsive main thread, and a main thread that stalls
+ * longer is itself a fault the stop should name. [INFERENCE: the ordering is UIKit's documented sequence, not
+ * measured here.] */
+#define ENG_GATE_DRAIN_NS  5000000000ull
+#define ENG_GATE_GRACE_NS  1000000000ull
+
+/* How long the gate has held the RSX thread, for cellGcm_set_host_pause_clock: the guest's wait timeouts
+ * (gcm.wait_timeout_ms) must not run while the walker cannot move. Milliseconds on CLOCK_MONOTONIC, the clock of
+ * ps3_ms_now, with a pause in progress counted. A suspend starts the interval before it closes the gate and a
+ * resume ends it before it opens the gate, so the clock never stands still while the gate is closed. */
+static pthread_mutex_t s_pause_lock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned long long s_pause_total_ms, s_pause_since_ms;
+static int s_pausing;
+
+static unsigned long long eng_monotonic_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000ull + (unsigned long long)ts.tv_nsec / 1000000ull;
+}
+
+static unsigned long long eng_host_paused_ms(void)
+{
+    pthread_mutex_lock(&s_pause_lock);
+    const unsigned long long v = s_pause_total_ms + (s_pausing ? eng_monotonic_ms() - s_pause_since_ms : 0ull);
+    pthread_mutex_unlock(&s_pause_lock);
+    return v;
+}
+
+void rsx_metal_backend_gpu_suspend(void)
+{
+    pthread_mutex_lock(&s_pause_lock);
+    if (!s_pausing) { s_pausing = 1; s_pause_since_ms = eng_monotonic_ms(); }
+    pthread_mutex_unlock(&s_pause_lock);
+    /* On the main thread, inside will-resign-active, where iOS still allows GPU work: close the gate and let the
+     * commits and allocations already open finish. Nothing in a section waits for the main thread on iOS (the
+     * only dispatch_sync to it, ps3recomp_metal_ios_configure_layer, runs from backend init, outside any
+     * section), so the drain is not a deadlock; the bound is for a section that is merely slow. */
+    if (!host_gpu_gate_suspend(&s_gpu_gate, ENG_GATE_DRAIN_NS))
+        fprintf(stderr, "[RSX metal] !!!! app inactive: a GPU section was still open after %llu ms; its commit may "
+                        "follow will-resign-active (and be refused by the host)\n",
+                (unsigned long long)(ENG_GATE_DRAIN_NS / 1000000ull));
+}
+
+void rsx_metal_backend_gpu_resume(void)
+{
+    pthread_mutex_lock(&s_pause_lock);
+    if (s_pausing) { s_pausing = 0; s_pause_total_ms += eng_monotonic_ms() - s_pause_since_ms; }
+    pthread_mutex_unlock(&s_pause_lock);
+    host_gpu_gate_resume(&s_gpu_gate);
+}
 
 /* ------------------------------------------------------------------------- */
 
@@ -2950,14 +3023,276 @@ static const char* kEngDepthColorMSL =
 "    return float4(float(eng_depth_round(src.read(uint2(i.pos.xy)), 16u)) / 65535.0, 0.0, 0.0, 1.0);\n"
 "}\n";
 
+/* The stop machinery is optional in a link (see fdump_list_too_long): a fixture that includes this file without
+ * runtime/diag/stop.cpp still ends the process with the same line. All fields passed here are fixed tokens or
+ * numbers, so the fallback line needs no quoting. */
+static PS3_NORETURN void eng_stop_standalone(ps3_stop_kind kind, const char* kind_id, const char* what,
+                                             const char* remedy, const ps3_stop_field* fields, size_t count)
+{
+    typedef void (*stop_fn)(int, const char*, const char*, const ps3_stop_field*, size_t, const ps3_stop_site*);
+    const stop_fn stop = (stop_fn)dlsym(RTLD_DEFAULT, "ps3_stop");
+    if (stop)
+        stop((int)kind, what, remedy, fields, count, NULL);
+    fprintf(stderr, "[STOP] %s: %s (%s)\n", kind_id, what, remedy);
+    fprintf(stderr, "PS3STOP v=1 kind=%s", kind_id);
+    for (size_t i = 0; i < count; i++)
+        fprintf(stderr, " %s=%s", fields[i].key, fields[i].value);
+    fputc('\n', stderr);
+    fflush(stderr);
+    _Exit(PS3_STOP_EXIT_CODE);
+}
+
+static void eng_gpu_numbers(unsigned long long* gpu_mib, unsigned long long* working_set_mib,
+                            unsigned long long* proc_available_mib)
+{
+    unsigned long long avail = 0;
+#if TARGET_OS_IPHONE
+    avail = (unsigned long long)os_proc_available_memory();
+#endif
+    *gpu_mib = (unsigned long long)[s_dev currentAllocatedSize] >> 20;
+    *working_set_mib = (unsigned long long)[s_dev recommendedMaxWorkingSetSize] >> 20;
+    *proc_available_mib = avail >> 20;
+}
+
+/* A failed allocation used to vanish into a 0 handle: the engine then drops
+ * the draw (no-targets) or samples nothing, and the frame loses whole layers
+ * without a word. Say which limit was hit, with the device's own numbers,
+ * so a run on a smaller GPU (an 8 GB iPad) tells memory from table size. */
+static void eng_alloc_failed(const char* what, NSUInteger w, NSUInteger h)
+{
+    static u32 n = 0, logs = 0;
+    ++n;
+    if (!PS3_LOG_FIRST(logs, 16) && (n & (n - 1))) return;   /* first 16, then powers of two */
+    unsigned long long gpu, ws, avail;
+    eng_gpu_numbers(&gpu, &ws, &avail);
+    fprintf(stderr, "[RSX metal] %s failed (%lux%lu): count=%u objects=%u free=%u"
+                    " gpu_allocated=%llu MiB working_set=%llu MiB proc_available=%llu MiB\n",
+            what, (unsigned long)w, (unsigned long)h, n, s_eng_obj_count, s_eng_obj_free_count, gpu, ws, avail);
+}
+
+/* What the device was asked for, kept whole: an active refusal can be a descriptor this GPU rejects (the M1's
+ * Apple7 refused one the Mac's Apple9 accepts), and the stop is how the next device run names it. */
+typedef struct EngAllocDesc {
+    int is_buffer;
+    NSUInteger type, pixel_format, w, h, depth, mips, array_len, samples, usage, storage;
+} EngAllocDesc;
+
+static EngAllocDesc eng_desc_of_texture_descriptor(MTLTextureDescriptor* td)
+{
+    EngAllocDesc d = { 0, [td textureType], [td pixelFormat], [td width], [td height], [td depth],
+                       [td mipmapLevelCount], [td arrayLength], [td sampleCount], [td usage], [td storageMode] };
+    return d;
+}
+
+static EngAllocDesc eng_desc_of_texture(id<MTLTexture> t)
+{
+    EngAllocDesc d = { 0, [t textureType], [t pixelFormat], [t width], [t height], [t depth],
+                       [t mipmapLevelCount], [t arrayLength], [t sampleCount], [t usage], [t storageMode] };
+    return d;
+}
+
+static const char* eng_pixel_format_name(NSUInteger pf)
+{
+    switch ((MTLPixelFormat)pf) {
+    case MTLPixelFormatR8Unorm:       return "R8Unorm";
+    case MTLPixelFormatRG8Unorm:      return "RG8Unorm";
+    case MTLPixelFormatRGBA8Unorm:    return "RGBA8Unorm";
+    case MTLPixelFormatBGRA8Unorm:    return "BGRA8Unorm";
+    case MTLPixelFormatR16Unorm:      return "R16Unorm";
+    case MTLPixelFormatRG16Unorm:     return "RG16Unorm";
+    case MTLPixelFormatRG16Float:     return "RG16Float";
+    case MTLPixelFormatRGBA16Float:   return "RGBA16Float";
+    case MTLPixelFormatR32Float:      return "R32Float";
+    case MTLPixelFormatRGBA32Float:   return "RGBA32Float";
+    case MTLPixelFormatBC1_RGBA:      return "BC1_RGBA";
+    case MTLPixelFormatBC2_RGBA:      return "BC2_RGBA";
+    case MTLPixelFormatBC3_RGBA:      return "BC3_RGBA";
+    case MTLPixelFormatDepth32Float:  return "Depth32Float";
+    case MTLPixelFormatDepth32Float_Stencil8: return "Depth32Float_Stencil8";
+    default:                          return "other";
+    }
+}
+
+/* The highest MTLGPUFamilyApple<n> the device supports (0 when none: a Mac that is not Apple silicon). */
+static unsigned eng_highest_apple_family(void)
+{
+    for (unsigned n = 10; n >= 1; n--)
+        if ([s_dev supportsFamily:(MTLGPUFamily)(MTLGPUFamilyApple1 + (n - 1))]) return n;
+    return 0;
+}
+
+/* The host GPU refused an allocation and the gate stood active across the call (and a bounded grace for the
+ * host's notification), so it is the device's own refusal, not a lifecycle race; or the engine's own object table
+ * (ENG_MAX_OBJECTS) has no slot for a texture the device did create (`table_full`). Either way carrying on would
+ * hand the guest a 0 handle it waits on forever (the run that lost its render targets to a screen lock flipped at
+ * 60 fps with two records a frame, black, for good); a draw or a pass built on a 0 handle is dropped just as
+ * silently. Exactly one of `td`, `tex` and `buffer_len` describes the object. The log line before the stop and the
+ * stop's fields carry the whole descriptor. */
+static PS3_NORETURN void eng_alloc_stop(const char* what, MTLTextureDescriptor* td, id<MTLTexture> tex,
+                                        NSUInteger buffer_len, int table_full)
+{
+    EngAllocDesc d = { 0 };
+    if (td) d = eng_desc_of_texture_descriptor(td);
+    else if (tex) d = eng_desc_of_texture(tex);
+    else { d.is_buffer = 1; d.w = buffer_len; d.h = 1; d.depth = 1; }
+    eng_alloc_failed(what, d.w, d.h);
+    unsigned long long gpu, ws, avail;
+    eng_gpu_numbers(&gpu, &ws, &avail);
+    const char* pf_name = d.is_buffer ? "none" : eng_pixel_format_name(d.pixel_format);
+    const int bc_supported =
+#if TARGET_OS_IPHONE
+        (int)[s_dev supportsBCTextureCompression];
+#else
+        1;   /* macOS GPUs sample BC natively */
+#endif
+    const unsigned family = eng_highest_apple_family();
+    fprintf(stderr, "[RSX metal] rejected %s: type=%lu pixelFormat=%lu(%s) size=%lux%lux%lu mips=%lu array=%lu"
+                    " samples=%lu usage=0x%lX storage=%lu bc_supported=%d apple_family=%u\n",
+            d.is_buffer ? "buffer" : "descriptor", (unsigned long)d.type, (unsigned long)d.pixel_format, pf_name,
+            (unsigned long)d.w, (unsigned long)d.h, (unsigned long)d.depth, (unsigned long)d.mips,
+            (unsigned long)d.array_len, (unsigned long)d.samples, (unsigned long)d.usage,
+            (unsigned long)d.storage, bc_supported, family);
+    char cw[24], ch[24], cdepth[24], ctype[24], cpf[24], cmips[24], carray[24], csamples[24], cusage[24],
+         cstorage[24], cbc[24], cfam[24], cgpu[24], cws[24], cavail[24], cobj[24], cfree[24];
+    snprintf(cw, sizeof cw, "%lu", (unsigned long)d.w);
+    snprintf(ch, sizeof ch, "%lu", (unsigned long)d.h);
+    snprintf(cdepth, sizeof cdepth, "%lu", (unsigned long)d.depth);
+    snprintf(ctype, sizeof ctype, "%lu", (unsigned long)d.type);
+    snprintf(cpf, sizeof cpf, "%lu", (unsigned long)d.pixel_format);
+    snprintf(cmips, sizeof cmips, "%lu", (unsigned long)d.mips);
+    snprintf(carray, sizeof carray, "%lu", (unsigned long)d.array_len);
+    snprintf(csamples, sizeof csamples, "%lu", (unsigned long)d.samples);
+    snprintf(cusage, sizeof cusage, "0x%lX", (unsigned long)d.usage);
+    snprintf(cstorage, sizeof cstorage, "%lu", (unsigned long)d.storage);
+    snprintf(cbc, sizeof cbc, "%d", bc_supported);
+    snprintf(cfam, sizeof cfam, "%u", family);
+    snprintf(cgpu, sizeof cgpu, "%llu", gpu);
+    snprintf(cws, sizeof cws, "%llu", ws);
+    snprintf(cavail, sizeof cavail, "%llu", avail);
+    snprintf(cobj, sizeof cobj, "%u", s_eng_obj_count - s_eng_obj_free_count);
+    snprintf(cfree, sizeof cfree, "%u", s_eng_obj_free_count);
+    const ps3_stop_field fields[] = {
+        {"what", what}, {"w", cw}, {"h", ch}, {"depth", cdepth}, {"texture_type", ctype},
+        {"pixel_format", cpf}, {"pixel_format_name", pf_name}, {"mips", cmips}, {"array_length", carray},
+        {"sample_count", csamples}, {"usage", cusage}, {"storage_mode", cstorage},
+        {"bc_supported", cbc}, {"apple_family", cfam},
+        {"gpu_allocated_mib", cgpu}, {"working_set_mib", cws}, {"proc_available_mib", cavail},
+        {"objects", cobj}, {"free", cfree}
+    };
+    if (table_full)
+        eng_stop_standalone(PS3_STOP_HOST_GPU_ALLOC, "host-gpu-alloc",
+            "the draw engine's object table is full: a texture was created and has no handle",
+            "the table (ENG_MAX_OBJECTS) holds every live texture, target and snapshot at once; `objects` against "
+            "that limit says whether the title keeps that many alive (raise the limit) or the engine leaks handles "
+            "(report this line)",
+            fields, sizeof fields / sizeof fields[0]);
+    eng_stop_standalone(PS3_STOP_HOST_GPU_ALLOC, "host-gpu-alloc",
+        "the host GPU refused an allocation while the host allowed GPU use",
+        "the descriptor above is what the device refused: a format, usage or size this GPU family rejects (compare "
+        "apple_family and bc_supported with the machine that accepts it), or, with gpu_allocated_mib near "
+        "working_set_mib, memory (lower the render size or free memory)",
+        fields, sizeof fields / sizeof fields[0]);
+}
+
+/* After a call inside a section failed: should it be waited out and tried again? Decided by
+ * host_gpu_alloc_failed from the ticket taken once the section was open (`before`) and the one now; a grace for the
+ * host's notification when the gate stood steady. A suspended failure is never final, and only a retry taken with
+ * the gate active uses up the one allowance. */
+static int eng_gate_should_retry(uint32_t before, unsigned* retries)
+{
+    const uint32_t after = host_gpu_gate_ticket(&s_gpu_gate);
+    host_gpu_alloc_verdict v = host_gpu_alloc_failed(before, after, *retries);
+    if (v == HOST_GPU_ALLOC_GRACE && host_gpu_gate_wait_change(&s_gpu_gate, after, ENG_GATE_GRACE_NS))
+        v = HOST_GPU_ALLOC_WAIT_RETRY;
+    if (v != HOST_GPU_ALLOC_WAIT_RETRY) return 0;
+    if (host_gpu_ticket_active(after) && *retries < HOST_GPU_ALLOC_MAX_RETRIES) (*retries)++;
+    return 1;
+}
+
+/* Every Metal object the engine creates on the RSX thread for the guest goes through here: the gate's section
+ * is open for the call (so the host cannot cut the GPU mid-call: suspend() waits for it), and a nil is judged by
+ * eng_gate_should_retry: a lifecycle race is waited out and tried once more; anything else after that is the
+ * device's. `stop_on_failure` stops with host-gpu-alloc; without it (a pipeline, whose nil is also what a program
+ * the translator got wrong returns, and which every site names itself; a state object) the nil goes back to the
+ * caller as it always did, after the same wait, one retry and grace. */
+static id eng_gated_create(id (^make)(void), int stop_on_failure, const char* what,
+                           MTLTextureDescriptor* td, NSUInteger buffer_len)
+{
+    unsigned retries = 0;
+    for (;;) {
+        host_gpu_gate_enter(&s_gpu_gate);
+        const uint32_t before = host_gpu_gate_ticket(&s_gpu_gate);
+        id obj = make();
+        host_gpu_gate_leave(&s_gpu_gate);
+        if (obj) return obj;
+        if (eng_gate_should_retry(before, &retries)) continue;
+        if (stop_on_failure) eng_alloc_stop(what, td, nil, buffer_len, 0);
+        return nil;
+    }
+}
+
+/* The same discipline for a bootstrap step that creates several objects and reports 0 or -1 (backend init: the
+ * command queue, the depth texture, the placeholders): an app started in the background, or one that went inactive
+ * during init, waits here for the gate instead of failing init for good. Never call it around the layer
+ * configuration, which is a dispatch_sync to the main thread: a section may not wait for the thread that drains it. */
+static int eng_gated_step(int (^step)(void))
+{
+    unsigned retries = 0;
+    for (;;) {
+        host_gpu_gate_enter(&s_gpu_gate);
+        const uint32_t before = host_gpu_gate_ticket(&s_gpu_gate);
+        const int rc = step();
+        host_gpu_gate_leave(&s_gpu_gate);
+        if (rc == 0 || !eng_gate_should_retry(before, &retries)) return rc;
+    }
+}
+
+static id<MTLTexture> eng_new_texture(MTLTextureDescriptor* td, const char* what)
+{
+    return (id<MTLTexture>)eng_gated_create(^id{ return [s_dev newTextureWithDescriptor:td]; }, 1, what, td, 0);
+}
+
+/* The same for the engine's buffers: the stop reports the byte length as the width. */
+static id<MTLBuffer> eng_new_buffer(NSUInteger length, const char* what)
+{
+    return (id<MTLBuffer>)eng_gated_create(^id{
+        return [s_dev newBufferWithLength:length options:MTLResourceStorageModeShared];
+    }, 1, what, nil, length);
+}
+
+static id<MTLRenderPipelineState> eng_new_pso(MTLRenderPipelineDescriptor* pd, NSError* __strong * err)
+{
+    return (id<MTLRenderPipelineState>)eng_gated_create(^id{
+        NSError* e = nil;
+        id<MTLRenderPipelineState> pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&e];
+        *err = e;
+        return pso;
+    }, 0, "pipeline", nil, 0);
+}
+
+static id<MTLDepthStencilState> eng_new_depth_stencil(MTLDepthStencilDescriptor* dd)
+{
+    return (id<MTLDepthStencilState>)eng_gated_create(^id{
+        return [s_dev newDepthStencilStateWithDescriptor:dd];
+    }, 0, "depth-stencil state", nil, 0);
+}
+
+static id<MTLSamplerState> eng_new_sampler(MTLSamplerDescriptor* sd)
+{
+    return (id<MTLSamplerState>)eng_gated_create(^id{
+        return [s_dev newSamplerStateWithDescriptor:sd];
+    }, 0, "sampler state", nil, 0);
+}
+
 static u32 eng_obj_add(id<MTLTexture> t)
 {
-    if (!t) return 0;
+    if (!t) { eng_alloc_failed("texture allocation", 0, 0); return 0; }
     u32 slot;
     if (s_eng_obj_free_count) {
         slot = s_eng_obj_free[--s_eng_obj_free_count];
     } else {
-        if (s_eng_obj_count >= ENG_MAX_OBJECTS) return 0;
+        if (s_eng_obj_count >= ENG_MAX_OBJECTS)
+            eng_alloc_stop("object table (ENG_MAX_OBJECTS)", nil, t, 0, 1);
         slot = s_eng_obj_count++;
     }
     s_eng_obj[slot] = t;
@@ -3033,7 +3368,7 @@ static id<MTLBuffer> eng_stage_buffer_acquire(u32 cap)
             break;
         }
     pthread_mutex_unlock(&s_eng_stage_pool_lock);
-    if (!buf) buf = [s_dev newBufferWithLength:cap options:MTLResourceStorageModeShared];
+    if (!buf) buf = eng_new_buffer(cap, "staging buffer");
     return buf;
 }
 
@@ -3122,10 +3457,10 @@ static int eng_init(void* user, u32 width, u32 height)
     sd.magFilter = MTLSamplerMinMagFilterNearest;
     sd.sAddressMode = MTLSamplerAddressModeClampToEdge;
     sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
-    s_eng_point_sampler = [s_dev newSamplerStateWithDescriptor:sd];
+    s_eng_point_sampler = eng_new_sampler(sd);
     sd.minFilter = MTLSamplerMinMagFilterLinear;
     sd.magFilter = MTLSamplerMinMagFilterLinear;
-    s_eng_linear_sampler = [s_dev newSamplerStateWithDescriptor:sd];
+    s_eng_linear_sampler = eng_new_sampler(sd);
     return s_eng_point_sampler && s_eng_linear_sampler ? 0 : -1;
 }
 
@@ -3192,22 +3527,10 @@ static void eng_submit_and_wait(void* user, u32 reason)
 static BOOL s_ios_supports_bc;
 static BOOL s_ios_supports_border;
 
-static void eng_ios_feature_stop(const char* what, const char* remedy,
-                                 const ps3_stop_field* fields, size_t count)
+static PS3_NORETURN void eng_ios_feature_stop(const char* what, const char* remedy,
+                                              const ps3_stop_field* fields, size_t count)
 {
-    /* Like fdump_list_too_long, standalone fixtures can omit the stop module. */
-    typedef void (*stop_fn)(int, const char*, const char*, const ps3_stop_field*, size_t, const ps3_stop_site*);
-    const stop_fn stop = (stop_fn)dlsym(RTLD_DEFAULT, "ps3_stop");
-    if (stop)
-        stop((int)PS3_STOP_GCM_UNMODELLED, what, remedy, fields, count, NULL);
-    fprintf(stderr, "[STOP] gcm-unmodelled: %s (%s)\n", what, remedy);
-    fprintf(stderr, "PS3STOP v=1 kind=gcm-unmodelled");
-    /* All fields supplied here are fixed tokens or hex/decimal numbers. */
-    for (size_t i = 0; i < count; i++)
-        fprintf(stderr, " %s=%s", fields[i].key, fields[i].value);
-    fputc('\n', stderr);
-    fflush(stderr);
-    _Exit(PS3_STOP_EXIT_CODE);
+    eng_stop_standalone(PS3_STOP_GCM_UNMODELLED, "gcm-unmodelled", what, remedy, fields, count);
 }
 
 static void eng_require_bc(void* user, u32 format, u32 location, u32 offset, u32 size)
@@ -3249,7 +3572,7 @@ static u32 eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
     td.swizzle = MTLTextureSwizzleChannelsMake(
         swizzle_sel(sel[1]), swizzle_sel(sel[2]),
         swizzle_sel(sel[3]), swizzle_sel(sel[0]));
-    return eng_obj_add([s_dev newTextureWithDescriptor:td]);
+    return eng_obj_add(eng_new_texture(td, "texture allocation"));
 }
 
 static void eng_texture_upload(void* user, u32 handle, u32 face, u32 mip,
@@ -3287,7 +3610,7 @@ static u32 eng_texture_create_3d(void* user, rsx_be_format fmt, u32 w, u32 h,
     td.swizzle = MTLTextureSwizzleChannelsMake(
         swizzle_sel(sel[1]), swizzle_sel(sel[2]),
         swizzle_sel(sel[3]), swizzle_sel(sel[0]));
-    return eng_obj_add([s_dev newTextureWithDescriptor:td]);
+    return eng_obj_add(eng_new_texture(td, "3D texture allocation"));
 }
 
 static void eng_texture_upload_3d(void* user, u32 handle, u32 z, u32 mip,
@@ -3322,8 +3645,7 @@ static u32 eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 h,
      * TEXTURE_CONTROL1 crossbar as a view swizzle. */
     td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead |
                MTLTextureUsagePixelFormatView;
-    id<MTLTexture> t = [s_dev newTextureWithDescriptor:td];
-    if (!t) return 0;
+    id<MTLTexture> t = eng_new_texture(td, "render target allocation");
     if (seed && seed_row_bytes)
         [t replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0
                withBytes:seed bytesPerRow:seed_row_bytes];
@@ -3373,7 +3695,7 @@ static u32 eng_color_snapshot(void* user, u32 surface)
                          width:[src width] height:[src height] mipmapped:NO];
     td.storageMode = MTLStorageModePrivate;
     td.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
-    const u32 copy = eng_obj_add([s_dev newTextureWithDescriptor:td]);
+    const u32 copy = eng_obj_add(eng_new_texture(td, "color snapshot allocation"));
     if (!copy) { s_eng_dropped++; return 0; }
     EngRecord* r = &s_eng_rec[s_eng_rec_count++];
     memset(r, 0, sizeof *r);
@@ -3395,7 +3717,7 @@ static u32 eng_depth_target_create(void* user, u32 w, u32 h)
      * pass that samples this as a depth2d, so it cannot be write-only. */
     td.usage       = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
     td.storageMode = MTLStorageModePrivate;
-    return eng_obj_add([s_dev newTextureWithDescriptor:td]);
+    return eng_obj_add(eng_new_texture(td, "depth target allocation"));
 }
 
 /* The sampleable copy of a depth target. The copy is a record in the stream,
@@ -3412,7 +3734,7 @@ static u32 eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
         pd.fragmentFunction = [s_eng_helper_lib newFunctionWithName:@"eng_depth_fs"];
         pd.colorAttachments[0].pixelFormat = MTLPixelFormatR32Float;
         NSError* err = nil;
-        s_eng_depth_pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+        s_eng_depth_pso = eng_new_pso(pd, &err);
         if (!s_eng_depth_pso) {
             fprintf(stderr, "[rsx engine/metal] depth resolve pipeline failed: %s\n",
                     [[err localizedDescription] UTF8String]);
@@ -3424,7 +3746,7 @@ static u32 eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
                                                            width:w height:h
                                                        mipmapped:NO];
     td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-    const u32 dst = eng_obj_add([s_dev newTextureWithDescriptor:td]);
+    const u32 dst = eng_obj_add(eng_new_texture(td, "depth resolve allocation"));
     if (!dst) return 0;
 
     EngRecord* r = &s_eng_rec[s_eng_rec_count++];
@@ -3453,7 +3775,7 @@ static u32 eng_depth_as_color(void* user, u32 depth, u32 w, u32 h, u32 rsx_fmt)
         pd.vertexFunction   = [lib newFunctionWithName:@"eng_depth_color_vs"];
         pd.fragmentFunction = [lib newFunctionWithName:k ? @"eng_depth_d16_fs" : @"eng_depth_argb_fs"];
         pd.colorAttachments[0].pixelFormat = formats[k];
-        if (lib) s_eng_depth_color_pso[k] = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+        if (lib) s_eng_depth_color_pso[k] = eng_new_pso(pd, &err);
         if (!s_eng_depth_color_pso[k]) {
             fprintf(stderr, "[rsx engine/metal] depth-as-colour pipeline failed: %s\n",
                     [[err localizedDescription] UTF8String]);
@@ -3469,7 +3791,7 @@ static u32 eng_depth_as_color(void* user, u32 depth, u32 w, u32 h, u32 rsx_fmt)
     td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead |
                MTLTextureUsagePixelFormatView;
     td.storageMode = MTLStorageModePrivate;
-    const u32 dst = eng_obj_add([s_dev newTextureWithDescriptor:td]);
+    const u32 dst = eng_obj_add(eng_new_texture(td, "depth-as-colour allocation"));
     if (!dst) return 0;
 
     EngRecord* r = &s_eng_rec[s_eng_rec_count++];
@@ -3597,8 +3919,7 @@ static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
     }
 
     NSError* err = nil;
-    id<MTLRenderPipelineState> pso =
-        [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+    id<MTLRenderPipelineState> pso = eng_new_pso(pd, &err);
     if (!pso) {
         fprintf(stderr, "[rsx engine/metal] pipeline state failed: %s\n",
                 [[err localizedDescription] UTF8String]);
@@ -3634,7 +3955,7 @@ static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
             dd.backFaceStencil = fsd;
         }
     }
-    id<MTLDepthStencilState> ds = [s_dev newDepthStencilStateWithDescriptor:dd];
+    id<MTLDepthStencilState> ds = eng_new_depth_stencil(dd);
     if (!ds) return 0;
 
     const u32 slot = s_eng_pipe_count++;
@@ -3766,7 +4087,7 @@ static int eng_sampler_slot(const rsx_be_sampler_desc* d)
 #endif
     if (d->min_linear && d->mip_present && eng_aniso() > 1)
         sd.maxAnisotropy = (NSUInteger)eng_aniso();
-    id<MTLSamplerState> s = [s_dev newSamplerStateWithDescriptor:sd];
+    id<MTLSamplerState> s = eng_new_sampler(sd);
     if (!s) return -1;
     const int slot = (int)s_eng_samp_count++;
     s_eng_samp[slot].key  = key;
@@ -4071,7 +4392,7 @@ static id<MTLRenderPipelineState> eng_clear_pipeline(MTLPixelFormat fmt, int dep
         pd.colorAttachments[0].pixelFormat = fmt;
     }
     NSError* err = nil;
-    id<MTLRenderPipelineState> pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+    id<MTLRenderPipelineState> pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];   /* in the commit section */
     if (!pso) {
         fprintf(stderr, "[rsx engine/metal] rectangle clear pipeline failed: %s\n",
                 [[err localizedDescription] UTF8String]);
@@ -4127,7 +4448,7 @@ static int eng_encode_clear_rect(id<MTLCommandBuffer> cb, const EngRecord* r)
             st.writeMask = (k & RSX_BE_CLEAR_STENCIL) ? 0xFF : 0x00;
             dd.frontFaceStencil = st;
             dd.backFaceStencil  = st;
-            s_eng_clear_ds[k] = [s_dev newDepthStencilStateWithDescriptor:dd];
+            s_eng_clear_ds[k] = [s_dev newDepthStencilStateWithDescriptor:dd];   /* in the commit section */
         }
         ds = s_eng_clear_ds[k];
         if (!ds) return 0;
@@ -4401,7 +4722,7 @@ static id<MTLTexture> eng_fxaa(id<MTLCommandBuffer> cb, id<MTLTexture> src)
         pd.fragmentFunction = [s_eng_helper_lib newFunctionWithName:@"eng_fxaa_fs"];
         pd.colorAttachments[0].pixelFormat = fmt;
         NSError* err = nil;
-        s_eng_fxaa_pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+        s_eng_fxaa_pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];   /* in the commit section */
         if (!s_eng_fxaa_pso) {
             fprintf(stderr, "[rsx engine/metal] FXAA pipeline failed (FXAA off): %s\n",
                     [[err localizedDescription] UTF8String]);
@@ -4417,7 +4738,7 @@ static id<MTLTexture> eng_fxaa(id<MTLCommandBuffer> cb, id<MTLTexture> src)
                                                               height:[src height] mipmapped:NO];
         td.usage       = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
         td.storageMode = MTLStorageModePrivate;
-        s_eng_fxaa_tex = [s_dev newTextureWithDescriptor:td];
+        s_eng_fxaa_tex = [s_dev newTextureWithDescriptor:td];   /* in the commit section */
         if (!s_eng_fxaa_tex) return nil;
     }
     MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -4447,7 +4768,7 @@ static id<MTLRenderPipelineState> eng_smaa_pso(NSString* vs, NSString* fs, MTLPi
     pd.fragmentFunction = [s_eng_smaa_lib newFunctionWithName:fs];
     pd.colorAttachments[0].pixelFormat = fmt;
     NSError* err = nil;
-    id<MTLRenderPipelineState> p = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+    id<MTLRenderPipelineState> p = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];   /* in the commit section */
     if (!p) fprintf(stderr, "[rsx engine/metal] SMAA pipeline %s failed (SMAA off): %s\n",
                     [fs UTF8String], [[err localizedDescription] UTF8String]);
     return p;
@@ -4459,7 +4780,7 @@ static id<MTLTexture> eng_smaa_target(id<MTLTexture> t, MTLPixelFormat fmt, NSUI
                                                      width:w height:h mipmapped:NO];
     td.usage       = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
     td.storageMode = MTLStorageModePrivate;
-    return [s_dev newTextureWithDescriptor:td];
+    return [s_dev newTextureWithDescriptor:td];   /* in the commit section */
 }
 static id<MTLTexture> eng_smaa_lookup(MTLPixelFormat fmt, NSUInteger w, NSUInteger h,
                                       const unsigned char* bytes, NSUInteger pitch)
@@ -4467,7 +4788,7 @@ static id<MTLTexture> eng_smaa_lookup(MTLPixelFormat fmt, NSUInteger w, NSUInteg
     MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt
                                                      width:w height:h mipmapped:NO];
     td.usage = MTLTextureUsageShaderRead;
-    id<MTLTexture> t = [s_dev newTextureWithDescriptor:td];
+    id<MTLTexture> t = [s_dev newTextureWithDescriptor:td];   /* in the commit section */
     [t replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:bytes bytesPerRow:pitch];
     return t;
 }
@@ -4559,7 +4880,7 @@ static int eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
         pd.fragmentFunction = [s_eng_helper_lib newFunctionWithName:@"eng_present_fs"];
         pd.colorAttachments[0].pixelFormat = [dst pixelFormat];
         NSError* err = nil;
-        s_eng_blit_pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+        s_eng_blit_pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];   /* in the commit section */
         if (!s_eng_blit_pso) {
             fprintf(stderr, "[rsx engine/metal] present pipeline failed: %s\n",
                     [[err localizedDescription] UTF8String]);
@@ -4629,7 +4950,7 @@ static void eng_sync_drawable_size(void)
     }
 }
 
-/* Encode everything recorded so far and commit it.
+/* Encode everything recorded so far and commit it, as one gate section (eng_encode_and_commit, below).
  *
  * The staging arena is recycled the moment this returns, which is safe
  * without a wait: the arena's MTLBuffer goes with the command buffer, back to
@@ -4638,9 +4959,15 @@ static void eng_sync_drawable_size(void)
  * frame -- there the stall is the point. A windowed present is paced by the
  * in-flight semaphore instead, the same bound the vtable path uses, because
  * waiting on every frame is the one pattern where a driver cannot hide its
- * encoding work. */
-static void eng_encode_and_commit(id<MTLTexture> present_dst)
+ * encoding work.
+ *
+ * Everything here, from the in-flight semaphore through nextDrawable, the encodes (clear rectangles, FXAA, SMAA
+ * and the present blit create their pipelines, state objects and intermediate textures straight on the device,
+ * since they only run under this function) and the commit, is inside the section, so the host's will-resign-active
+ * cannot take the GPU away in the middle: suspend() waits for it. */
+static void eng_encode_and_commit_section(id<MTLTexture> present_dst)
 {
+    /* Callers go through eng_encode_and_commit; the section is already open. */
     s_eng_checked_completed = 0;
     @autoreleasepool {
         id<CAMetalDrawable> drawable = nil;
@@ -4678,7 +5005,11 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
             }
         }
         { const uint64_t w0 = PS3_FT_ON() ? ps3_ft_now() : 0;
-          if (windowed_present) dispatch_semaphore_wait(s_inflight, DISPATCH_TIME_FOREVER);
+          if (windowed_present) {
+              host_gpu_gate_leave(&s_gpu_gate);       /* unbounded: not inside a counted section */
+              dispatch_semaphore_wait(s_inflight, DISPATCH_TIME_FOREVER);
+              host_gpu_gate_enter(&s_gpu_gate);       /* blocks while the app is inactive */
+          }
           if (w0 && windowed_present) { const uint64_t w1 = ps3_ft_now();
               if (w1 - w0 >= ps3_ft_min_ns()) ps3_ft_span(PS3_FT_GPU_WAIT, 0, 2, 0, w0, w1); } }
         if (present_dst) {
@@ -4696,7 +5027,9 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
                  * filtered; the wait ends before the nil check so a dropped image shows up in the trace.
                  * (The drawable already has the window's size: eng_sync_drawable_size, above.) */
                 const uint64_t ft_d0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+                host_gpu_gate_leave(&s_gpu_gate);       /* nextDrawable waits for the display: outside the section */
                 drawable = [s_layer nextDrawable];
+                host_gpu_gate_enter(&s_gpu_gate);
                 if (ft_d0)
                     ps3_ft_span(PS3_FT_DRAWABLE, 1, (drawable ? 0u : 1u) | (present_dst != s_eng_shown ? 2u : 0u) |
                                                         (rsx_draw_engine_present_diag() << 8),
@@ -4743,12 +5076,16 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
                 dispatch_semaphore_signal(sem);
             }];
             eng_stage_hand_off(cb, stage);
+            host_gpu_gate_checkpoint(&s_gpu_gate);   /* the encode took time: nothing is submitted while closed */
             [cb commit];
         } else {
             const uint64_t ft_w0 = PS3_FT_ON() ? ps3_ft_now() : 0;
             eng_stage_hand_off(cb, stage);
+            host_gpu_gate_checkpoint(&s_gpu_gate);
             [cb commit];
+            host_gpu_gate_leave(&s_gpu_gate);   /* the GPU's time is not counted: only the CPU work up to the commit is */
             [cb waitUntilCompleted];
+            host_gpu_gate_enter(&s_gpu_gate);   /* the bookkeeping below is inside again; blocks while inactive */
             if (ft_w0) {
                 const uint64_t w1 = ps3_ft_now();
                 ps3_ft_span(PS3_FT_GPU_WAIT, 0, present_dst ? 1u : 0u,
@@ -4781,6 +5118,16 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
         s_eng_stage_used = 0;
         eng_collect_retired_objects();
     }
+}
+
+/* The choke point of the commit side: every commit the engine makes (a present, a flush, a full arena, a depth
+ * readback's resolve) is this function. A suspended gate holds the RSX thread here until resume; a suspend that
+ * arrives while the section is open waits for it to leave. */
+static void eng_encode_and_commit(id<MTLTexture> present_dst)
+{
+    host_gpu_gate_enter(&s_gpu_gate);
+    eng_encode_and_commit_section(present_dst);
+    host_gpu_gate_leave(&s_gpu_gate);
 }
 
 /* Opt-in readback of the game surface, useful on a locked Mac or in CI.
@@ -4929,8 +5276,11 @@ static void eng_dump_frame(id<MTLTexture> src, const rsx_frame_identity* fid)
     unsigned char* rgba = malloc(w * h * 4);
     if (!rgba) return;
     if (!s_headless) {
+        host_gpu_gate_enter(&s_gpu_gate);   /* the fence is a commit of its own */
         id<MTLCommandBuffer> fence = [s_queue commandBuffer];
+        host_gpu_gate_checkpoint(&s_gpu_gate);
         [fence commit];
+        host_gpu_gate_leave(&s_gpu_gate);
         [fence waitUntilCompleted];
     }
     [src getBytes:rgba bytesPerRow:w * 4
@@ -5013,8 +5363,7 @@ static int eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
         return -1;
     @autoreleasepool {
         if (!s_eng_depth_staging || [s_eng_depth_staging length] < copy_pitch * h)
-            s_eng_depth_staging = [s_dev newBufferWithLength:copy_pitch * h
-                                                     options:MTLResourceStorageModeShared];
+            s_eng_depth_staging = eng_new_buffer(copy_pitch * h, "depth readback buffer");
         id<MTLBuffer> staging = s_eng_depth_staging;
         if (!staging || ![staging contents]) return -1;
         const u32 snap = eng_depth_snapshot(user, depth, (u32)[src width],
@@ -5023,17 +5372,21 @@ static int eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
         eng_encode_and_commit(nil);
         if (!s_eng_checked_completed) { eng_obj_release(user, snap); return -1; }
         id<MTLTexture> resolved = eng_obj(snap);
+        host_gpu_gate_enter(&s_gpu_gate);   /* the encode above left its section; this commit is another */
         id<MTLCommandBuffer> cb = [s_queue commandBuffer];
         id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
         if (!resolved || [resolved pixelFormat] != MTLPixelFormatR32Float || !cb || !blit) {
-            [blit endEncoding]; eng_obj_release(user, snap); return -1;
+            [blit endEncoding]; host_gpu_gate_leave(&s_gpu_gate); eng_obj_release(user, snap); return -1;
         }
         [blit copyFromTexture:resolved sourceSlice:0 sourceLevel:0
                 sourceOrigin:MTLOriginMake(x, y, 0) sourceSize:MTLSizeMake(w, h, 1)
                     toBuffer:staging destinationOffset:0
          destinationBytesPerRow:copy_pitch destinationBytesPerImage:copy_pitch * h];
         [blit endEncoding];
-        [cb commit]; [cb waitUntilCompleted];
+        host_gpu_gate_checkpoint(&s_gpu_gate);
+        [cb commit];
+        host_gpu_gate_leave(&s_gpu_gate);
+        [cb waitUntilCompleted];
         const int ok = [cb status] == MTLCommandBufferStatusCompleted && ![cb error];
         if (ok) {
             const u8* bytes = [staging contents];
@@ -5181,8 +5534,9 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
                 memory_status == KERN_SUCCESS ? (unsigned long long)memory.resident_size : 0,
                 (int)memory_status);
 #endif
-        s_queue = [s_dev newCommandQueue];
-        if (!s_queue) {
+        /* A section of its own, retried across a lifecycle race: an app started in the background (or one that
+         * went inactive during init) waits for the gate here instead of failing init for good. */
+        if (eng_gated_step(^int{ s_queue = [s_dev newCommandQueue]; return s_queue ? 0 : -1; }) != 0) {
             fprintf(stderr, "[RSX metal] could not create command queue\n");
             return -1;
         }
@@ -5206,17 +5560,17 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
                 host_detach();
             }
         }
-        rc = s_headless ? create_offscreen() : s_host ? 0 : create_window(title);
+        rc = s_headless ? eng_gated_step(^int{ return create_offscreen(); }) : s_host ? 0 : create_window(title);
 #endif
         if (rc != 0) {
             fprintf(stderr, "[RSX metal] surface creation failed\n");
             return -1;
         }
-        if (create_depth() != 0) {
+        if (eng_gated_step(^int{ return create_depth(); }) != 0) {
             fprintf(stderr, "[RSX metal] depth/stencil buffer creation failed\n");
             return -1;
         }
-        if (create_placeholders() != 0) {
+        if (eng_gated_step(^int{ return create_placeholders(); }) != 0) {
             fprintf(stderr, "[RSX metal] placeholder texture creation failed\n");
             return -1;
         }
@@ -5252,6 +5606,7 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
          * the path that uses it: the FIFO walker feeds both models, so leaving
          * both live would record every draw twice. */
         s_ready  = 1;
+        if (cellGcm_set_host_pause_clock) cellGcm_set_host_pause_clock(eng_host_paused_ms);
         rsx_draw_engine_set_backend(&s_engine_backend);
         /* The engine is this backend's default now that every host mode
          * passes both ways. PS3RECOMP_RSX_ENGINE=vtable is the way back, and
@@ -5305,6 +5660,9 @@ void rsx_metal_backend_shutdown(void)
 {
     @autoreleasepool {
         if (s_ready) rsx_set_backend(NULL);
+        /* Nothing is left to protect, and a thread parked at the gate would hold the final flush for as long as the
+         * host keeps the app inactive. A flush the host then refuses fails and is logged, as at any exit. */
+        rsx_metal_backend_gpu_resume();
         if (s_eng_active) rsx_draw_engine_shutdown();
         rsx_draw_engine_set_backend(NULL);
         /* Reclaim every in-flight slot so no command buffer is still
@@ -5411,6 +5769,8 @@ int rsx_metal_backend_pump_messages(void)
 #endif
 }
 
+static void legacy_present_section(void);
+
 void rsx_metal_backend_present(void)
 {
     if (!s_ready) return;
@@ -5423,11 +5783,23 @@ void rsx_metal_backend_present(void)
         if (ft_t0) ps3_ft_span(PS3_FT_PRESENT, 0, 0, 0, ft_t0, ps3_ft_now());
         return;
     }
+    /* The vtable path: its own commit and drawable, one section. */
+    host_gpu_gate_enter(&s_gpu_gate);
+    legacy_present_section();
+    host_gpu_gate_leave(&s_gpu_gate);
+}
+
+static void legacy_present_section(void)
+{
     /* This path renders straight into the target, so a host surface has to
      * be the display's size; a resize waits for the frames in flight first. */
     if (s_host && host_match_size(s_width, s_height) != 0) return;
     /* Block only when MTL_MAX_INFLIGHT frames are already queued. */
-    if (!s_headless) dispatch_semaphore_wait(s_inflight, DISPATCH_TIME_FOREVER);
+    if (!s_headless) {
+        host_gpu_gate_leave(&s_gpu_gate);   /* unbounded: not inside a counted section */
+        dispatch_semaphore_wait(s_inflight, DISPATCH_TIME_FOREVER);
+        host_gpu_gate_enter(&s_gpu_gate);
+    }
     @autoreleasepool {
         id<MTLTexture> target = nil;
         id<CAMetalDrawable> drawable = nil;
@@ -5445,7 +5817,9 @@ void rsx_metal_backend_present(void)
             target = s_host_tex[host_slot];
         } else {
             const uint64_t ft_d0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+            host_gpu_gate_leave(&s_gpu_gate);       /* nextDrawable waits for the display: outside the section */
             drawable = [s_layer nextDrawable];
+            host_gpu_gate_enter(&s_gpu_gate);
             /* This path draws a frame into the drawable every time, so its "records since the last blit" are the
              * frame's own and the shown-texture bit stays clear. */
             if (ft_d0)
@@ -5522,8 +5896,11 @@ void rsx_metal_backend_present(void)
 
         if (s_headless) {
             /* The readback below must see a completed frame. */
+            host_gpu_gate_checkpoint(&s_gpu_gate);
             [cb commit];
+            host_gpu_gate_leave(&s_gpu_gate);
             [cb waitUntilCompleted];
+            host_gpu_gate_enter(&s_gpu_gate);
         } else {
             dispatch_semaphore_t sem = s_inflight;
             [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
@@ -5532,6 +5909,7 @@ void rsx_metal_backend_present(void)
                                     [done status] == MTLCommandBufferStatusCompleted);
                 dispatch_semaphore_signal(sem);
             }];
+            host_gpu_gate_checkpoint(&s_gpu_gate);
             [cb commit];        /* no wait: the CPU goes on to the next frame */
         }
 

@@ -1609,6 +1609,28 @@ unsigned long long ps3_ms_now(void)
 #endif
 }
 
+/* The host's pause (iOS: the app is not active and the backend holds the RSX thread, host_gpu_gate.h), in
+ * milliseconds on ps3_ms_now's clock, since the process began. The backend registers it; 0 forever without one. */
+static _Atomic(unsigned long long (*)(void)) s_host_paused_ms_fn;
+
+void cellGcm_set_host_pause_clock(unsigned long long (*paused_ms)(void))
+{
+    atomic_store_explicit(&s_host_paused_ms_fn, paused_ms, memory_order_release);
+}
+
+/* The clock every gcm.wait_timeout_ms (and park grace) interval is measured on: ps3_ms_now() without the time the
+ * host held the RSX thread. While the app is inactive the walker cannot consume the FIFO, so a guest thread
+ * waiting for it (a label store waiting for a walker pass, the segment callback waiting for `get`) and the
+ * walker's own acquire and park clocks would all run out during a long screen lock and end the run with
+ * gcm-wait-timeout for a pause the host imposed. The paused time is subtracted from every reading, so an
+ * interval measured across a pause does not contain it. */
+static unsigned long long gcm_wait_clock_ms(void)
+{
+    unsigned long long (*paused)(void) = atomic_load_explicit(&s_host_paused_ms_fn, memory_order_acquire);
+    const unsigned long long paused_ms = paused ? paused() : 0ull;
+    return ps3_ms_now() - paused_ms;
+}
+
 static u32 s_sema_offset = 0;   /* NV406E semaphore offset (label window) */
 static int s_sema_blocked_pass = 0;   /* this drain stopped on a semaphore acquire */
 static int s_park_pass = 0;           /* this drain stopped on a self-JUMP park */
@@ -3129,12 +3151,11 @@ static void gcm_rsx_process_fifo_unlocked(void);
 
 static void gcm_guest_label_store(u32 ea, u32 value)
 {
-    extern unsigned long long ps3_ms_now(void);
     if (ps3_label_window_on_walker()) return;
     if (vm_read32(GCM_CONTROL_GUEST_ADDR + 0) == vm_read32(GCM_CONTROL_GUEST_ADDR + 4)) return;
     /* The next pass to begin: it takes the lock after this load, so it reads a `put` this thread has published. */
     const unsigned long long target = ps3_label_window_next_pass();
-    const unsigned long long t0 = ps3_ms_now();
+    const unsigned long long t0 = gcm_wait_clock_ms();
     const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
     /* A pass already open does not count for this store (it began before the store was reached), so the wait is
      * that pass's rest plus one whole pass: the report splits the waits on this bit. */
@@ -3142,7 +3163,7 @@ static void gcm_guest_label_store(u32 ea, u32 value)
     /* Yield first (the walker is normally a pass away), then sleep; bounded like the segment-switch wait below. */
     unsigned spin = 0;
     for (; !ps3_label_window_pass_done(target); spin++) {
-        const unsigned long long waited = ps3_ms_now() - t0;
+        const unsigned long long waited = gcm_wait_clock_ms() - t0;
         if (waited >= ps3_cfg_gcm_wait_timeout_ms())
             ps3_stop_gcm_wait_timeout("cellGcm_label_store", "rsx-walker-pass", ea - GCM_LABEL_GUEST_BASE, value,
                                       vm_read32(ea), (u32)waited);
@@ -3887,8 +3908,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                    * has stood with the same put for longer than any title
                    * takes between the two stores. */
                   if (put != s_fifo_getoff) {
-                      extern unsigned long long ps3_ms_now(void);
-                      const unsigned long long now = ps3_ms_now();
+                      const unsigned long long now = gcm_wait_clock_ms();
                       if (park_off != s_fifo_getoff || park_put != put) {
                           park_off = s_fifo_getoff; park_put = put; park_since = now;
                       } else if (ps3_cfg_gcm_park_resync()) {
@@ -4062,8 +4082,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                             vm_write32(la, v);
                             if (s_cap) s_cap->write(RSX_CAP_LOC_MAIN, s_sema_offset, la, vm_base + la, 4, RSX_CAP_WRITE_LABEL);
                         } else {
-                            extern unsigned long long ps3_ms_now(void);
-                            const unsigned long long now = ps3_ms_now();
+                            const unsigned long long now = gcm_wait_clock_ms();
                             if (!s_acq_t0 || s_acq_off != s_sema_offset || s_acq_val != v) {
                                 s_acq_off = s_sema_offset; s_acq_val = v; s_acq_t0 = now;
                             }
@@ -4573,7 +4592,6 @@ static u32 gcm_ea2io(u32 ea)
  * firmware-derived form and the default, so gcm_fifo_next_segment/gcm_ctx_room are not carried.) */
 static void gcm_segment_switch(u32 ctx)
 {
-    extern unsigned long long ps3_ms_now(void);
     const u32 cur = vm_read32(ctx + 0x8), end = vm_read32(ctx + 0x4);
     const u32 cur_off = gcm_ea2io(cur);
     if (cur_off != 0xFFFFFFFFu) {
@@ -4595,14 +4613,14 @@ static void gcm_segment_switch(u32 ctx)
     atomic_thread_fence(memory_order_release);
     vm_write32(ctx + 0x8, start);
 
-    const unsigned long long t0 = ps3_ms_now();
+    const unsigned long long t0 = gcm_wait_clock_ms();
     s_fifo_recycle_waiting = 1;
     for (;;) {
         const u32 get = vm_read32(GCM_CONTROL_GUEST_ADDR + 4);
         const int in_segment = get >= start_off && get <= end_off;
         const int outside    = get < s_ib.first_begin_off || get > s_ib.last_end_off;
         if (!in_segment && !outside) break;
-        const unsigned long long waited = ps3_ms_now() - t0;
+        const unsigned long long waited = gcm_wait_clock_ms() - t0;
         if (waited >= ps3_cfg_gcm_wait_timeout_ms()) {
             s_fifo_recycle_waiting = 0;
             ps3_stop_gcm_wait_timeout("gcm-segment-callback", "segment-busy", start_off, end_off,

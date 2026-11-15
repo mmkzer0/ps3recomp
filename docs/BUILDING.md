@@ -611,6 +611,70 @@ Apple describes Simulator's Metal feature and texture limits in
 [Developing Metal apps that run in Simulator](https://developer.apple.com/documentation/metal/developing-metal-apps-that-run-in-simulator).
 Simulator is for workflow prototyping, not validation of device GPU behavior.
 
+#### When the app is not active
+
+iOS refuses GPU allocation and command submission to an app that is not
+active: the screen locks or dims, the app switcher opens, the app goes to the
+background. The display view (`libs/video/rsx_metal_ios_display.m`) observes
+`UIApplicationWillResignActiveNotification` and
+`UIApplicationDidEnterBackgroundNotification` and pauses the GPU, and
+`UIApplicationDidBecomeActiveNotification` resumes it. The pause is a gate
+(`include/ps3emu/host_gpu_gate.h`): the RSX thread waits in front of every
+Metal allocation and every command-buffer commit, so the guest's graphics
+stall for as long as the app is inactive and go on from the same frame when it
+is active again. Nothing is dropped. The guest's other threads (audio, timers)
+are not paused. macOS never suspends the gate.
+
+The gate is coordinated with the notification. Each allocation, and each
+encode-and-commit, is a section that enters and leaves the gate. A section only
+ever holds bounded CPU work up to its commit: the unbounded stages (the
+in-flight semaphore, `nextDrawable`, a command buffer's `waitUntilCompleted`)
+run outside it, between a leave and an enter, and the enter blocks while the app
+is inactive. The suspend runs on the main thread inside will-resign-active,
+while iOS still allows GPU work: it closes the gate, then waits up to five
+seconds for the open sections to leave, so every call that began while the app
+was active has finished when the host takes the GPU away. Nothing in a section
+waits for the main thread, so this cannot deadlock, and a thread waiting for the
+semaphore or the display does not delay the suspend at all. The wait is kept
+(rather than only marking the gate) because marking alone would leave a commit
+that was mid-call when the notification arrived to race the host's denial.
+
+A checkpoint precedes every commit (the present and flush commit, the frame-dump
+fence, the depth-readback resolve): on a closed gate the thread leaves its
+section and waits for the resume. A commit can therefore follow
+will-resign-active only if a section's CPU work outlasts the five-second drain
+(or the thread is descheduled between its checkpoint and the commit call); that
+case is logged (`[RSX metal] !!!! app inactive: a GPU section was still open`).
+Backend init (the command queue, the depth texture, the placeholders, the
+engine's samplers) is gated the same way, outside the main-thread layer
+configuration, so an app started in the background waits there and initialises
+once it is active.
+
+Bounds are measured on a monotonic clock (`pthread_cond_timedwait_relative_np`
+on Apple), not the wall clock.
+
+The `gcm.wait_timeout_ms` clocks (`cellGcmSys.c`, `gcm_wait_clock_ms`) do not
+count the time the gate held the RSX thread, so a long screen lock does not end
+the run in `gcm-wait-timeout`: the guest threads waiting on the paused walker
+and the walker's own acquire and park waits all resume with their budget intact.
+
+An allocation can still race the notification. One that fails while the app
+was not active, or became inactive or active during the call, waits for the
+gate and is retried once. One that fails with the gate steady is first given
+one second for the notification to arrive (Metal can refuse before the main
+thread has delivered it); if the gate then closes, that is the one retry. A
+failure whose own state shows the gate closed is always the host's and waits
+for the resume, however many retries were spent. Only a failure with the gate
+active, after that one retry, is the device's own refusal (out of memory, a
+size it cannot hold, a descriptor this GPU family rejects) and ends the run with
+the named stop `host-gpu-alloc`, which carries the whole texture descriptor,
+the device's GPU family and BC support, and its allocated, working-set and
+available memory ([`STOPS.md`](STOPS.md)). The draw engine's object table
+filling up stops the same way. Without the stop the guest would wait forever on
+render targets that were never created. A pipeline, depth-stencil or sampler
+state that fails goes through the same wait, retry and grace and then returns
+nothing, as before: the site that asked logs it.
+
 ### macOS
 
 Builds and is covered by CI (`.github/workflows/macos.yml`, arm64, Debug and

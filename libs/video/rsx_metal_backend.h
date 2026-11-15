@@ -59,6 +59,13 @@ void rsx_metal_backend_present(void);
  * does not claim any display presentations and leaves the tracker disabled. */
 void rsx_metal_backend_note_guest_frame(void);
 
+/* The host stopped letting this process use the GPU (iOS: the app resigned active or entered the background),
+ * or gave it back. While suspended, the RSX thread waits in front of every allocation and every commit, so the
+ * guest's graphics stall instead of failing; see include/ps3emu/host_gpu_gate.h. Idempotent, callable from any
+ * thread (the UIKit lifecycle observers call them on the main thread); neither blocks. macOS never calls them. */
+void rsx_metal_backend_gpu_suspend(void);
+void rsx_metal_backend_gpu_resume(void);
+
 /* --- test hooks ---------------------------------------------------------- */
 
 /* The clear colour most recently set via NV4097_SET_COLOR_CLEAR_VALUE, in the
