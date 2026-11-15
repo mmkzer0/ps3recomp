@@ -840,12 +840,34 @@ broadcast its `WAIT_SIGNAL` condition (`spu_workload.c:1468-1484`,
 commit hooks (`spu_channels.c:1009-1010`, `:1063-1086`). The transcript
 records transfer bytes and atomic status, not the peer recipients or watcher
 wakes. Reordering, splitting or merging a write cannot be declared
-contract-equivalent until these notifications are represented. Close this
-with a synthetic concurrent-peer fixture: reserve a line and register a
-watcher, then vary an overlapping write and verify the recipient set and
-event order. Until then, the contract rule is a proposal, not a promotion
-gate. For same-program T0/T1, exact command and XFER matching invokes the
-same runtime path; the shadow intentionally does not issue live peer wakes.
+contract-equivalent until these notifications are represented.
+
+*The recipients are pinned* by `runtime/spu/tests/test_spu_coh_peers.c`
+(`spu_coh_peers`, `spu;t0`): context A reserves line L with GETLLAR and has
+`SPU_EVENT_LR` enabled, a watcher is registered on L, and context B (or A
+itself) writes. Each case runs the real channel path on one thread:
+
+| Write against the reservation | A's reservation | `SPU_EVENT_LR` in A | watcher wakes | line-commit hook | observable order |
+|---|---|---|---|---|---|
+| PUT, 128 B over L | cleared | raised | 1 | — | watcher first |
+| PUT, 128 B to the next line only | held | — | 0 | — | — |
+| PUT, 256 B over L and the next line | cleared | raised | 1 | — | watcher first |
+| PUTLLC on L, succeeds | cleared | raised | 1 | 1 | watcher, then holders, then hook |
+| PUTLLUC on L | cleared | raised | 1 | 1 | watcher, then holders, then hook |
+| PUT by A itself over L | held | — | 1 | — | watcher first |
+
+A watcher runs after the write's bytes are in guest memory and before any
+holder is touched; the hook runs after the holder walk. The order inside the
+walk (event bit, reservation clear, host wake) has no observation point, so
+only its end state is pinned. A writer's own reservation survives its own
+PUT, but its watchers still wake.
+
+What remains open is representation: a transcript records none of these
+recipients, so a contract rule that reorders, splits or merges a write still
+cannot be shown equivalent. The table is the set such a record has to carry.
+Until it does, the contract rule is a proposal, not a promotion gate. For
+same-program T0/T1, exact command and XFER matching invokes the same runtime
+path; the shadow intentionally does not issue live peer wakes.
 
 ### 8.3 Verdicts
 
@@ -1333,7 +1355,7 @@ then compare power and frame time with `xdiff=off`.
 | # | Question | Answer | State |
 |---|---|---|---|
 | 1 | Fixture encoding | one self-contained file; header, section table, typed sections; extents for local store; payloads deduplicated inside a fixture; no compression in the format, zstd accepted around it (section 7) | closed |
-| 2 | Contract matching for T2 and T3 | epoch rule and falsifiers in section 8.2 | proposed, and not a promotion gate until a synthetic peer-reservation test captures notification recipients and event order, then a T3 corpus replay confirms the relaxations |
+| 2 | Contract matching for T2 and T3 | epoch rule and falsifiers in section 8.2 | proposed; the recipients and their order are pinned (`spu_coh_peers`, section 8.2). Not a promotion gate until the transcript carries them and a T3 corpus replay confirms the relaxations |
 | 3 | Equivalence of T0 and T1 | every register, all of local store, the end class; the argument is in section 8.1 | closed |
 | 4 | Sanitising a shadow context | nothing is copied, so nothing is sanitised; the census test and the driver check enforce it (section 9) | closed |
 | 5 | Budget for lifted code | a back-edge macro that exists only in a second compilation; unwinding by the existing halt; evidence for `longjmp` under the sanitizers in section 10 | closed for soundness; the twin's cost is owed |
