@@ -41,7 +41,7 @@ def instrument(text):
     text=text[:start]+body.replace(needle,needle+'\n        allsize_sig_published();')+text[end:]
     return 'static unsigned allsize_scans;\nvoid allsize_sig_published(void);\n'+text
 def run(work):
-    fixture=(SPU/'tests/test_spu_mfc_slots.c').read_text()
+    fixture=(SPU/'tests/test_spu_mfc_contexts.c').read_text()
     fixture=fixture.replace('#include "../spu_channels.c"','#include "allsize_channels.c"')
     fixture=fixture.replace('#include "../spu_lifted_job.h"','#include "'+str(SPU/'spu_lifted_job.h')+'"')
     (work/'allsize_fixture.h').write_text(fixture)

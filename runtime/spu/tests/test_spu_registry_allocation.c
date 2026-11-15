@@ -17,13 +17,14 @@ int main(int argc, char** argv)
     spu_context* ctx = calloc(1, sizeof(*ctx));
     if (!ctx || argc != 2) return 2;
     fail_allocation = 1;
-    if (!strcmp(argv[1], "mfc")) (void)mfc_for(ctx);
-    else {
-        spu_lockline_lock();
-        spu_coh_reserve(ctx, 0x10000);
-        spu_lockline_unlock();
+    if (!strcmp(argv[1], "mfc")) {
+        mfc_engine* engine = mfc_for(ctx);
+        return engine == &ctx->mfc && spu_mfc_has_engine(ctx) ? 0 : 1;
     }
-    return 0; /* surviving allocation failure would fabricate working state */
+    spu_lockline_lock();
+    spu_coh_reserve(ctx, 0x10000);
+    spu_lockline_unlock();
+    return 0; /* surviving coherence allocation failure fabricates a holder */
 }
 void ps3_ww_report_inline(uint32_t a, uint64_t v, int w)
 {

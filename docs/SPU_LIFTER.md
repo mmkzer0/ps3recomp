@@ -47,8 +47,10 @@ ABI, and generated ABI. The pinned layout signature in
 `include/ps3emu/lifter_abi.h` covers the fields accessed by generated code and
 its inline helpers/macros: `gpr`, `pc`, `status`, `stop_code`, `image_id`,
 `event_status`, `event_mask`, `srr0`, `int_enable`, `host_depth`, `reloc_delta`,
-`ls`, `policy_mode`, `steps`, and `budget` (the last member of the context; ABI 2).
-A changed member offset or size requires
+`ls`, `policy_mode`, `steps`, and `budget` (the last member addressed by
+generated code; ABI 2). The runtime-only MFC marker and inline engine follow
+it without changing any pinned member offset or size.
+A changed pinned member offset or size requires
 updating the signature pin and bumping the runtime ABI together;
 `tests/gates/test_spu_lifter_abi.py` enforces the pin.
 
@@ -247,8 +249,9 @@ Implements the externs the lifter declares:
   `mfc_channel_write`/`mfc_channel_read` from `spu_dma.h`, and mailbox /
   signal / event / decrementer / SRR0 channels through the
   `spu_channel_*` helpers + `spu_context` fields.
-- A small `spu_context* → mfc_engine` registry holds per-SPU DMA state
-  (the engine isn't embedded in `spu_context`).
+- Each `spu_context` embeds its own `mfc_engine`; `mfc_for()` returns that
+  storage directly. The optional `SPU_PCSAMPLE` list is diagnostic-only and
+  its lock is not part of MFC channel lookup.
 - `spu_indirect_branch` resolves `ctx->pc` via a flat address-keyed
   registry of `spu_func_*`. The lifter now emits a `spu_recomp_register()`
   that populates the registry from `spu_function_table[]` — call it once

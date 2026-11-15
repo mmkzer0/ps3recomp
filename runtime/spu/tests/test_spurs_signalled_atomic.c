@@ -50,7 +50,7 @@ uint32_t ppu_vm_size = 0;
 
 #include "../spu_channels.c"
 
-/* The runtime beyond the SPU layer, stubbed as in test_spu_mfc_slots.c. None
+/* The runtime beyond the SPU layer, stubbed as in test_spu_mfc_contexts.c. None
  * of it is on the path this test drives. */
 void ps3_ww_report_inline(uint32_t a, uint64_t v, int w)
 {

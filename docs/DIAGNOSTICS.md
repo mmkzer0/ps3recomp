@@ -1356,8 +1356,8 @@ requires the opt-in `spu.dma_repeat_stop_secs` (default 0 = never stop); see
   `runtime/spu/spu_channels.c:607`  _(+2 more sites)_
 - **`SPU_MBOX_CHAIN`** — _(no description in source)_
   `runtime/spu/spu_raw.c:371`
-- **`SPU_MFC_STATS`** — SPU_MFC_STATS=<seconds>: running totals of how `mfc_for` resolves an MFC channel access (calls, lookup-cache hits, shared and exclusive registry locks), printed to stderr as `[spu-mfc] calls=… hits=… shared=… exclusive=…` every `<seconds>`. The denominator for profiled MFC lock time (#88): it separates more lookups from costlier ones. Counters are thread-local and folded into the totals every 4096 events, so up to 4095 events per thread and counter are not yet in a printed line.
-  `runtime/spu/spu_channels.c:500`
+- **`SPU_MFC_STATS`** — SPU_MFC_STATS=<seconds>: running totals of MFC lookup calls and first-use engine initializations, printed to stderr as `[spu-mfc] calls=… initialized=…` every `<seconds>`. Counters are thread-local and folded into shared totals every 4096 events, so up to 4095 events per thread and counter are not yet in a printed line.
+  `runtime/spu/spu_channels.c:603`
 - **`SPU_MFC_TRACE`** — SPU_MFC_TRACE: attribute silent DMA-poll loops (a wedged task whose host thread samples "in ntdll" because VirtualQuery dominates). Prints every 64k-th transfer per thread: enough to see the loop's pc/ea. */
   `runtime/spu/spu_dma.h:308`  _(+1 more sites)_
 - **`SPU_MISS_DUMP_IMG`** — _(no description in source)_
@@ -1372,8 +1372,8 @@ requires the opt-in `spu.dma_repeat_stop_secs` (default 0 = never stop); see
   `runtime/spu/spu_dma.h:535`
 - **`SPU_PCHIST`** — SPU_PCHIST=1: per-worker histogram of trampoline hops by the GPU module's symbol ranges, printed every 4M hops. The gate and counters are thread-local because every worker enters the tick on its first hop.
   `runtime/spu/spu_context.h:662`
-- **`SPU_PCSAMPLE`** — SPU_PCSAMPLE=<secs>: every <secs>, print image, pc and a few registers of every context holding an MFC slot (every live SPU that has done DMA), to say which SPU task never returned and where it is. For an interpreting SPU the pc is the last one the interpreter published: a taken branch's target or one of the out-of-line points listed above `spu_exec` (`spu_interp.c`), not the instruction running now, so samples gather at basic-block starts. Good for "which loop", not for a hot instruction inside a block.
-  `runtime/spu/spu_channels.c:544`
+- **`SPU_PCSAMPLE`** — SPU_PCSAMPLE=<secs>: every <secs>, print image, pc and a few registers of every context holding an initialized MFC engine, to say which SPU task never returned and where it is. The list exists only for this diagnostic; normal MFC lookup does not use its lock. For an interpreting SPU the pc is the last one the interpreter published: a taken branch's target or one of the out-of-line points listed above `spu_exec` (`spu_interp.c`), not the instruction running now, so samples gather at basic-block starts. Good for "which loop", not for a hot instruction inside a block.
+  `runtime/spu/spu_channels.c:509`
 - **`SPU_POISON_DMA_WATCH`** — SPU_POISON_DMA_WATCH=1 (any value): scan every PUT payload for the poison word and also log PUTs that carry it outside the region. Unset, only PUTs into the region are scanned (their lines are unchanged): the scan is a second pass over every byte of every PUT. */
   `runtime/spu/spu_dma.h:742`
 - **`SPU_POLLTRACE`** — _(no description in source)_

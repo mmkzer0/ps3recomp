@@ -34,7 +34,7 @@
  * lock-free variant upstream added is gone (#57).
  *
  * spu_channels.c is compiled in rather than linked, because spu_mfc_atomic()
- * is file-static: the same reason test_spu_mfc_slots.c does it.
+ * is file-static: the same reason test_spu_mfc_contexts.c does it.
  *
  * Build:
  *   clang -std=gnu17 -I include -I runtime/spu -I runtime/platform \

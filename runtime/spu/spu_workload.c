@@ -5,6 +5,9 @@
  * it with the SPURS task ABI. cellSpurs's AddWorkload/CreateTask call
  * spu_workload_dispatch(); the registry is populated by the title's lifted set.
  */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
 #include "spu_workload.h"
 #include "spu_lifted_job.h"   /* spu_run_lifted_job */
 #include "../ps3_log.h"      /* ps3_log_verbose */
@@ -1205,6 +1208,47 @@ static void spu_async_run(spu_async_job* j)
     free(j);
 }
 
+#ifndef _WIN32
+static void spu_async_forget_mfc_stack(void)
+{
+    uintptr_t lo, hi;
+#ifdef __APPLE__
+    const uintptr_t top = (uintptr_t)pthread_get_stackaddr_np(pthread_self());
+    const size_t size = pthread_get_stacksize_np(pthread_self());
+    if (!top || !size || size > top) {
+        fprintf(stderr, "[spu] cannot determine worker stack bounds for MFC cleanup\n");
+        abort();
+    }
+    lo = top - size;
+    hi = top;
+#elif defined(__linux__)
+    pthread_attr_t attr;
+    int error = pthread_getattr_np(pthread_self(), &attr);
+    if (error) {
+        fprintf(stderr, "[spu] cannot get worker stack attributes for MFC cleanup: %d\n", error);
+        abort();
+    }
+    void* base = NULL;
+    size_t size = 0;
+    error = pthread_attr_getstack(&attr, &base, &size);
+    pthread_attr_destroy(&attr);
+    lo = (uintptr_t)base;
+    if (error || !base || !size || size > UINTPTR_MAX - lo) {
+        fprintf(stderr, "[spu] cannot determine worker stack bounds for MFC cleanup: %d\n", error);
+        abort();
+    }
+    hi = lo + size;
+#else
+#error "SPU worker stack bounds are required for MFC exit cleanup"
+#endif
+    if (hi <= lo) {
+        fprintf(stderr, "[spu] invalid worker stack bounds for MFC cleanup\n");
+        abort();
+    }
+    spu_mfc_forget_range(lo, hi);
+}
+#endif
+
 #ifdef _WIN32
 static DWORD WINAPI spu_async_thread(LPVOID p) {
     ps3_thread_name("spu job");
@@ -1213,7 +1257,7 @@ static DWORD WINAPI spu_async_thread(LPVOID p) {
      * instead of killing the process silently with 0x80000001. */
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
     spu_async_run((spu_async_job*)p);
-    /* Nothing on this stack may stay in the lock-line reserver set. */
+    /* Nothing on this stack may stay in either cross-thread registry. */
     { ULONG_PTR lo, hi; GetCurrentThreadStackLimits(&lo, &hi);
       extern void spu_coh_forget_range(uintptr_t, uintptr_t);
       spu_coh_forget_range((uintptr_t)lo, (uintptr_t)hi);
@@ -1221,7 +1265,12 @@ static DWORD WINAPI spu_async_thread(LPVOID p) {
     return 0;
 }
 #else
-static void* spu_async_thread(void* p) { spu_async_run((spu_async_job*)p); return NULL; }
+static void* spu_async_thread(void* p)
+{
+    spu_async_run((spu_async_job*)p);
+    spu_async_forget_mfc_stack();
+    return NULL;
+}
 #endif
 
 int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,

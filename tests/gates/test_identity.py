@@ -127,11 +127,11 @@ def test_the_pin_can_come_from_the_config_file():
     with tempfile.TemporaryDirectory(prefix="ps3id-cfg-") as d:
         cfg = os.path.join(d, "title.toml")
         with open(cfg, "w") as fh:
-            fh.write(f'schema = 1\n[title]\nelf_sha256 = "{other}"\n')
+            fh.write(f'schema = 2\n[title]\nelf_sha256 = "{other}"\n')
         f = g.expect_stop(boot(GOOD_PATH, PS3RECOMP_CONFIG=cfg), "identity-mismatch")
         assert f["expected_from"] == "config" and f["pin_source"] == f"file:{cfg}", f
         with open(cfg, "w") as fh:
-            fh.write(f'schema = 1\n[title]\nelf_sha256 = "{GOOD_SHA}"\n')
+            fh.write(f'schema = 2\n[title]\nelf_sha256 = "{GOOD_SHA}"\n')
         booted(boot(GOOD_PATH, PS3RECOMP_CONFIG=cfg))
 
 

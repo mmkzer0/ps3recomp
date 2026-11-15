@@ -73,23 +73,23 @@ traffic; it only stops folding across ops. Checked in the disassembly:
 same numbers). `2026-10-06-m1pro-baseline` is the state before any SPU
 helper optimisation, on an M1 Pro with the machine otherwise loaded.
 
-## MFC lookup cache (`spu.mfc_lookup_cache`)
+## MFC context-lifetime contention
 
-A separate, multi-threaded benchmark: `mfc_lookup_bench.c` has several host
-threads drive their own SPU contexts through the real channel layer (the
-channel sequence of a small DMA, 8 writes and a read) and reports the summed
-per-thread CPU time. `run_mfc_lookup_bench.py` alternates the option off and on
-(one process each: the option is read once) and prints mean, standard
-deviation, min and max.
+`mfc_lookup_bench.c` runs many short synthetic jobs on 13 host workers. Each
+job uses the real channel layer for a 128-byte GET and PUT, reads tag status,
+then retires its context engine. The benchmark sums worker CPU time, measures
+wall time and verifies both DMA payloads. It is not part of a ctest tier.
+
+Build the baseline binary before the runtime change and retain it; after the
+change, build the candidate with the same benchmark source and flags:
 
 ```sh
-tests/bench/spu/run_mfc_lookup_bench.py --reps 7 --work 0 --iterations 50000      # lookup alone
-tests/bench/spu/run_mfc_lookup_bench.py --reps 7 --work 20000 --iterations 20000  # with SPU-like work between sequences
-tests/bench/spu/run_mfc_lookup_bench.py --reps 7 --work 20000 --iterations 20000 --churn 256
+tests/bench/spu/run_mfc_lookup_bench.py --output /tmp/mfc-before --build-only
+tests/bench/spu/run_mfc_lookup_bench.py --output /tmp/mfc-after --build-only
+tests/bench/spu/run_mfc_lookup_bench.py --compare /tmp/mfc-before /tmp/mfc-after \
+    --rounds 3 --threads 13 --iterations 100000
 ```
 
-`--work` is a loop standing in for the SPU code between channel accesses;
-`--churn N` releases and re-creates a spare context every N sequences, so the
-cache's generation is bumped and every remembered engine dropped. The numbers
-depend on the core count and on the platform's rwlock; compare the two modes
-of one invocation, and say the power mode when you quote them.
+`--compare` runs the before binary followed by the after binary in each round
+and reports median CPU and wall time. Each executable validates the GET/PUT
+payloads; the comparison is specific to this host and build.

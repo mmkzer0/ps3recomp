@@ -286,6 +286,8 @@ static void raw_spu_run(raw_spu* s)
     s->int_stat |= 0x2u;
     if (s->int_stat & s->int_mask) ps3_intr_raise(s->intrtag);
     publish(s);
+    /* The raw context is reset at the next start, after this owner stops. */
+    spu_mfc_release(c);
     RAW_XCHG(&s->started, 0);
 
     fprintf(stderr, "[spu-raw] spu%u stopped: halted=%d pc=0x%05X lr=0x%05X "

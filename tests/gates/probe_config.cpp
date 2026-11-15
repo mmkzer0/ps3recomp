@@ -44,8 +44,6 @@ static void print_options()
             std::printf("%u", ps3_cfg_spu_dma_repeat_limit());
         else if (!std::strcmp(o->section, "spu") && !std::strcmp(o->key, "dma_repeat_stop_secs"))
             std::printf("%u", ps3_cfg_spu_dma_repeat_stop_secs());
-        else if (!std::strcmp(o->section, "spu") && !std::strcmp(o->key, "mfc_lookup_cache"))
-            std::printf("%s", ps3_cfg_spu_mfc_lookup_cache() ? "true" : "false");
         else if (!std::strcmp(o->section, "spu") && !std::strcmp(o->key, "job_body"))
             std::printf("\"%s\"", ps3_cfg_spu_job_body());
         else if (!std::strcmp(o->section, "spu") && !std::strcmp(o->key, "xdiff_dir"))

@@ -14,7 +14,7 @@ static char* counting_getenv(const char* name)
 
 #define getenv counting_getenv
 #define main registry_previous_main
-#include "test_spu_mfc_slots.c"
+#include "test_spu_mfc_contexts.c"
 #undef main
 #undef getenv
 
