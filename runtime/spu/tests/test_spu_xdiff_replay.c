@@ -661,7 +661,7 @@ static void check_json_fields(const char* what, const char* j)
         "\"match\":", "\"class\":", "\"fixture\":{\"path\":", "\"image_fingerprint\":", "\"authority_tier\":", "\"effects\":",
         "\"toolkit_commit\":", "\"subject\":{\"tier\":", "\"lifter_abi\":", "\"code_end\":", "\"lift_options\":", "\"native_rev\":",
         "\"first\":{\"effect_index\":", "\"authority\":", "\"subject\":", "\"where\":", "\"want\":", "\"got\":",
-        "\"budget\":{\"limit\":", "\"spent\":", "\"seconds\":" };
+        "\"subject_pc\":", "\"budget\":{\"limit\":", "\"spent\":", "\"seconds\":" };
     CHECK(json_valid(j), "%s: the output is not one JSON object on one line: %s", what, j);
     const char* p = j;
     for (size_t i = 0; i < sizeof k_keys / sizeof k_keys[0]; i++) {

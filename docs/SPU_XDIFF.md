@@ -1255,7 +1255,9 @@ spu_job_replay [--tier interp|registered] [--budget N] [--timeout S] [--json] FI
   `exit_code`, `reason`, `match`, `class` (section 8.4), `fixture {path,
   image_fingerprint, authority_tier, effects, toolkit_commit}`, `subject
   {tier, lifter_abi, code_end, lift_options, native_rev}`, `first
-  {effect_index, authority, subject, where, want, got}`, `budget {limit,
+  {effect_index, authority, subject, where, want, got}`, `subject_pc` (the
+  subject's local store pc when the verdict was reached; for
+  `unlifted-branch` the address no lifted code covers), `budget {limit,
   spent}`, `seconds`. Addresses, identities and bytes are hex strings; a
   field that does not apply is `null`. Diagnostics go to standard error. The
   exit status is the verdict (section 8.3); 1 is a usage error or a refused

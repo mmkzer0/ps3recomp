@@ -361,7 +361,11 @@ static void print_json(FILE* o, const runner_args* a, const spu_xdiff_fixture* f
     } else {
         fputs(",\"where\":null,\"want\":null,\"got\":null", o);
     }
-    fprintf(o, "},\"budget\":{\"limit\":%llu,\"spent\":%llu},\"seconds\":%.6f}\n", (unsigned long long)v->budget,
+    /* Where the subject stood when the verdict was reached: for `unlifted-branch` the local store address no
+     * lifted code covers, which is what a coverage report needs to name. */
+    fputs("},\"subject_pc\":", o);
+    js_hex(o, v->subject_pc, 8);
+    fprintf(o, ",\"budget\":{\"limit\":%llu,\"spent\":%llu},\"seconds\":%.6f}\n", (unsigned long long)v->budget,
             (unsigned long long)v->budget_spent, seconds);
 }
 
@@ -372,6 +376,7 @@ static void print_line(FILE* o, const runner_args* a, const spu_xdiff_fixture* f
     if (v->effect_index != SPU_XDIFF_NO_EFFECT) fprintf(o, " effect=%u", (unsigned)v->effect_index);
     if (v->verdict == (uint32_t)SPU_XDIFF_DIFFER && has_bytes(v->reason) && v->where != SPU_XDIFF_NO_WHERE)
         fprintf(o, " where=0x%X", (unsigned)v->where);
+    if (v->reason == (uint32_t)SPU_XDIFF_R_UNLIFTED_BRANCH) fprintf(o, " pc=0x%05X", (unsigned)v->subject_pc);
     fprintf(o, " %s", a->path);
     if (klass == (uint32_t)SPU_XDIFF_CLASS_LATENT) fputs(" (latent)", o);
     fputc('\n', o);
