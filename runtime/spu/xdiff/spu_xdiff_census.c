@@ -56,7 +56,7 @@ static const spu_xdiff_member s_members[] = {
     M(resv_ea,                ZERO),    /* reservation state follows from the atomics in the transcript */
     M(resv_valid,             ZERO),
     M(atomic_stat,            ZERO),    /* the last atomic's status; the atomics are in the transcript */
-    M(dbg_getllar,            ZERO),    /* SPU_PUTLLC_WHY diagnostic counter */
+    M(dbg_getllar,            HOST),    /* SPU_PUTLLC_WHY diagnostic counter; no job reads it */
     M(resv_line,              ZERO),    /* GETLLAR's snapshot; the same line arrives as an XFER payload */
     M(resv_epoch,             ZERO),
     M(policy_mode,            ZERO),    /* only a policy-module run sets it; a job enters with 0 */
@@ -90,6 +90,8 @@ static const spu_xdiff_member s_members[] = {
     M(observer,               HOST),    /* the shadow driver installs its own; init leaves NULL */
     M(port,                   HOST),    /* the replay installs its serve table; init leaves NULL */
     M(lift_miss,              ZERO),    /* the closed resolver counts branches; a built context starts at 0 */
+    M(getllar_spin_ea,        HOST),    /* the GETLLAR spin detector (spu_mfc_atomic): a diagnostic, never reached by a served context */
+    M(getllar_spin_n,         HOST),
     M(job_rt_ls,              CARRIED), /* UNIT.job_rt_ls (spurs_job.c:943) */
     M(job_rt_ls2,             CARRIED), /* UNIT.job_rt_ls2 (spurs_job.c:944) */
     M(stop_request,           HOST),    /* written by another host thread; init clears it */
