@@ -359,8 +359,6 @@ if(APPLE)
         "-framework Metal"
         "-framework QuartzCore"
         "-framework Foundation"
-        "-framework AppKit"
-        "-framework ApplicationServices"
     )
     # LANGUAGE is pinned: CMake maps `.m` to OBJCXX when a consumer enables
     # OBJCXX in a scope that cannot see this directory's enable_language(OBJC),
@@ -372,7 +370,10 @@ if(APPLE)
             "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_metal_ios_display.m"
             PROPERTIES LANGUAGE OBJC COMPILE_OPTIONS "-fobjc-arc")
     else()
-        target_link_libraries(ps3recomp_runtime PUBLIC "-framework AppKit")
+        # AppKit for the window; ApplicationServices for cellPad's keyboard
+        # fallback (CGEventSourceKeyState). Neither framework exists on iOS.
+        target_link_libraries(ps3recomp_runtime PUBLIC
+            "-framework AppKit" "-framework ApplicationServices")
     endif()
     set_source_files_properties(
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_metal_backend.m"
