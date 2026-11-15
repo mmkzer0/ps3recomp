@@ -94,13 +94,13 @@ has no image identity and changes nothing else.
 A trace that also carries the xdiff kinds (32 JQ2_BODY, 33 JQ2_XDIFF; docs/SPU_XDIFF.md section
 14) adds to every image row, per queue and overall: the jobs per tier (interp, lifted, partial,
 native), how many were sampled (queued, dropped) and how many could not be sampled (not eligible),
-the sampled share of the row's jobs, the resolver misses (the sum of kind 32's lift_miss, which
-the recorder saturates at 255 per job, so a total with saturated jobs is a lower bound) and the
-verdicts by verdict and reason. Both kinds join kind 29 on (who, a); a record without a match
-is counted under the unknown image row. A column whose kind the trace lacks prints as `-`,
-never 0 (kind 32 gives tiers, sampled, dropped, not eligible, misses and the share; kind 33 the
-verdicts). An id the tool's tables do not know is named as unknown, not dropped. Kinds 32 and
-33 are never duration-filtered, like kind 29.
+the sampled share of the row's jobs, the resolver misses (the sum of kind 32's lift_miss and how
+many jobs carried any, which the recorder saturates at 255 per job, so a total with saturated
+jobs is a lower bound) and the verdicts by verdict and reason. Both kinds join kind 29 on
+(who, a); a record without a match is counted under the unknown image row. A column whose kind
+the trace lacks prints as `-`, never 0 (kind 32 gives tiers, sampled, dropped, not eligible,
+misses and the share; kind 33 the verdicts). An id the tool's tables do not know is named as
+unknown, not dropped. Kinds 32 and 33 are never duration-filtered, like kind 29.
 
 A fourth section, audio ring (kinds 30-31), reads both sides of the cellAudio
 port ring, per port: the reads and the runs of blocks read empty (consecutive
@@ -1696,11 +1696,12 @@ def jq2_body_counts(recs, jobs):
     `sampled` or the sampled share. A tier or disposition id the tables do not know is counted
     apart (other_tier, other_disposition) and is in no tier and not in `sampled`. The recorder
     saturates lift_miss at 255 per job, so resolver_misses is a lower bound when
-    resolver_miss_saturated is above 0.
+    resolver_miss_saturated is above 0. resolver_miss_jobs is how many jobs carried any:
+    the sum alone does not say whether one job paid or many.
     """
     c = {"records": len(recs), "tiers": dict.fromkeys(JQ2_BODY_TIERS.values(), 0), "other_tier": 0,
          "sampled": 0, "queued": 0, "dropped": 0, "not_eligible": 0, "other_disposition": 0,
-         "resolver_misses": 0, "resolver_miss_saturated": 0}
+         "resolver_misses": 0, "resolver_miss_saturated": 0, "resolver_miss_jobs": 0}
     for b in recs:
         tier = JQ2_BODY_TIERS.get(b & 0xFF)
         if tier is None:
@@ -1715,6 +1716,7 @@ def jq2_body_counts(recs, jobs):
             c["other_disposition"] += 1
         miss = min(b >> 16, JQ2_MISS_SAT)
         c["resolver_misses"] += miss
+        c["resolver_miss_jobs"] += miss > 0
         c["resolver_miss_saturated"] += miss == JQ2_MISS_SAT
     c["sampled_share"] = c["sampled"] / jobs if jobs else None
     return c
@@ -2551,6 +2553,8 @@ def jq2_xdiff_lines(r):
         if body["other_tier"]:
             tiers += f", other tier {body['other_tier']}"
         misses = f"{body['resolver_misses']}"
+        if body["resolver_miss_jobs"]:
+            misses += f" in {body['resolver_miss_jobs']} job(s)"
         if body["resolver_miss_saturated"]:
             misses += f" (lower bound: {body['resolver_miss_saturated']} job(s) at {JQ2_MISS_SAT})"
         tiers += f"; resolver misses {misses}"

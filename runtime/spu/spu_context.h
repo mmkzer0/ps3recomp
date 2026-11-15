@@ -521,10 +521,16 @@ typedef struct spu_context {
      * `steps` (include/ps3emu/lifter_abi.h) and none of them moves. */
     const struct spu_effect_port* port;
 
-    /* Branches a served context made to local store with no lifted code. The
-     * closed resolver path (spu_indirect_branch) counts one and ends the run
-     * without interpreting anything: a served context must never run code the
-     * lift does not hold. Zero for every context that has no serve table. */
+    /* Arrivals at local store with no lifted code. The served resolver path
+     * (spu_indirect_branch_served) counts one and ends the run without
+     * interpreting anything: a served context must never run code the lift does
+     * not hold. The open resolver counts the arrivals it interprets instead
+     * (spu_channels.c, spu_lift_miss: the microstep, its interpreter hand-off,
+     * opt-in runtime-loaded code), so a production job whose registered lift ran
+     * part of itself in the interpreter carries that count in its kind-32 record
+     * beside a tier that still names the lift (libs/spurs/jq2/executor.cpp). A
+     * job's legitimate end is not counted. Zero from spu_context_init; lifted
+     * code never reads it. */
     uint32_t lift_miss;
 
     /* The GETLLAR spin detector's state (spu_channels.c, spu_mfc_atomic): the

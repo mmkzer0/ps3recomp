@@ -945,9 +945,11 @@ verdicts: equal/none 2, differ/end-regs 1
   its own and is neither in `sampled` nor in the share. The **share** is
   sampled divided by the row's `JOB` count, so a drop-when-full run shows how
   much of a busy phase it did not check.
-- **resolver misses**: the sum of kind 32's `lift_miss`, which the recorder
-  saturates at 255 per job. A job at 255 is counted in
-  `resolver_miss_saturated` and the printed total says it is a lower bound.
+- **resolver misses**: the sum of kind 32's `lift_miss` and, as `in N job(s)`,
+  how many jobs carried a nonzero count -- the sum alone does not say whether
+  one job paid or many. The recorder saturates `lift_miss` at 255 per job; a
+  job at 255 is counted in `resolver_miss_saturated` and the printed total says
+  it is a lower bound.
 - **verdicts**: the kind 33 records by verdict and reason. The verdict ids are
   the offline runner's exit statuses (0 equal, 2 malformed, 3 not-found, 4
   differ, 5 void); a reason id is the stable value of `SPU_XDIFF_REASONS` in

@@ -3072,6 +3072,32 @@ static void spu_indirect_branch_served(spu_context* ctx)
     spu_port_serve_halt(ctx, "branch to local store with no lifted code");
 }
 
+/* One arrival at local store no lifted code covers, on a context that runs a
+ * registered image. The served resolver above counts the same arrival and ends
+ * the run there; the open resolver interprets the bytes instead (the microstep,
+ * its interpreter hand-off, or the opt-in runtime-loaded-code path), so a job
+ * whose authority is a registered lift can execute part of itself in the
+ * interpreter. The executor carries this count beside the body's tier in the
+ * job's kind-32 record, where the job used to show a miss count of 0
+ * (libs/spurs/jq2/executor.cpp; docs/SPU_XDIFF.md section 3), so every
+ * interpretation hand-off below takes it and no other path does.
+ *
+ * A served context never reaches here: spu_indirect_branch hands it to
+ * spu_indirect_branch_served first, so the replay's `unlifted-branch` verdict
+ * (spu_xdiff_replay.c) still comes only from the closed resolver's count. And a
+ * context whose body is the interpreter (image_id < 0: the staged image has no
+ * registration) has no lift to miss -- the interpreter runs its branch targets
+ * itself and does not come through this resolver for them.
+ *
+ * A job's legitimate end is not a miss and is not counted: the planted return
+ * link, the jm interface's runtime area (spurs_job.c plants it as the job's
+ * contract, not as lifted code), a synthesised `stop` the CRT assembled, and a
+ * branch to LS 0 (the jm2 hand-back; see each site below). */
+static void spu_lift_miss(spu_context* ctx)
+{
+    if (ctx->image_id >= 0) ctx->lift_miss++;
+}
+
 void spu_indirect_branch(spu_context* ctx)
 {
     /* Real SPU bi/bisl mask the target to the 256 KB local store; the high bits
@@ -3263,7 +3289,10 @@ void spu_indirect_branch(spu_context* ctx)
      * return landed on LS 0, which is the job's OWN entry, and it ran a second
      * lap with dead registers: re-reading its parameters through a now-zero
      * context pointer and spinning on a DMA to what were really its own
-     * opcodes. The work is already done by the time it returns. */
+     * opcodes. The work is already done by the time it returns.
+     *
+     * The job's legitimate end: no interpretation follows, so this arrival is
+     * no resolver miss and is not counted (spu_lift_miss). */
     if (!ctx->policy_mode && ctx->pc == SPU_JOB_RETURN_LS) {
         static SPU_THREAD_LOCAL int _n = 0;
         if (PS3_LOG_FIRST(_n, 4))
@@ -3278,7 +3307,11 @@ void spu_indirect_branch(spu_context* ctx)
      * image, so there is no lifted function behind them. Interpret the live
      * bytes until the routine returns to its caller -- the lifted bisl bracket
      * then resumes at the return address -- or stops at the trap, which ends
-     * the run for spu_run_spurs_job to name. */
+     * the run for spu_run_spurs_job to name.
+     *
+     * This is the job's own end, not a lift miss: the runtime planted the area
+     * itself as the job's jm contract (spurs_job.c), and the served resolver
+     * likewise ends here without counting. Not counted (spu_lift_miss). */
     if (!fn && !ctx->policy_mode && SPU_JOB_RT_HAS(ctx, ctx->pc)) {
         spu_interp_run_until(ctx, ctx->pc, ctx->gpr[0]._u32[0] & SPU_LS_MASK);
         if (ctx->status & (SPU_STATUS_STOPPED_BY_STOP | SPU_STATUS_STOPPED_BY_HALT))
@@ -3309,7 +3342,9 @@ void spu_indirect_branch(spu_context* ctx)
      * guard below called a clean exit "branched into unlifted LS 0x3FFB0 -- ending
      * the job" and reported stop_code 0, which reads as a runaway and sent a long
      * chase after phantom memory corruption. Decode the target word instead: a
-     * `stop` is opcode 0 in the top 11 bits, so this is unambiguous. */
+     * a `stop` is opcode 0 in the top 11 bits, so this is unambiguous.
+     *
+     * The job's own end, not a lift miss: it is not counted (spu_lift_miss). */
     if (!fn) {
         uint32_t p0 = ctx->pc & SPU_LS_MASK;
         if (p0 + 3 < SPU_LS_SIZE) {
@@ -3374,6 +3409,9 @@ void spu_indirect_branch(spu_context* ctx)
               if (PS3_LOG_FIRST(_n, 8))
                   fprintf(stderr, "[spu] img=%d interpreting unlifted LS 0x%05X "
                           "(runtime-loaded code)\n", ctx->image_id, p);
+              /* This job's own bytes run in the interpreter from here: one
+               * arrival, counted once (spu_lift_miss). */
+              spu_lift_miss(ctx);
               spu_interp_run(ctx, p);
               return;
           } }
@@ -3608,7 +3646,8 @@ void spu_indirect_branch(spu_context* ctx)
      * The work was already finished before the jump; the second lap is noise.
      *
      * The initial entry is called directly, not through here, so any arrival at
-     * LS 0 in this path is a re-entry. Treat it as job end. */
+     * LS 0 in this path is a re-entry. Treat it as job end -- the legitimate
+     * jm2 hand-back, so it is not counted (spu_lift_miss). */
     if (!ctx->policy_mode && ctx->pc == 0 && ctx->image_id > 0) {
         static SPU_THREAD_LOCAL int _n = 0;
         if (PS3_LOG_FIRST(_n, 8))
@@ -3650,7 +3689,13 @@ void spu_indirect_branch(spu_context* ctx)
     /* No lifted function at this PC: it may be RUNTIME-GENERATED code (the
      * WWS jobmanager writes a save/restore stub above its static
      * image and calls it). Interpret the live LS bytes; on success the next
-     * branch re-enters lifted code via the trampoline. */
+     * branch re-enters lifted code via the trampoline.
+     *
+     * The microstep, and its hand-off to the interpreter, execute this job's
+     * own bytes outside any lift: one arrival, counted once (spu_lift_miss).
+     * The increment is on this miss path only, so a resolved branch, which
+     * returned above, pays nothing. */
+    spu_lift_miss(ctx);
     if (spu_smc_microstep(ctx))
         return;
     /* Cap the unresolved-branch log PER IMAGE: a global cap let one noisy

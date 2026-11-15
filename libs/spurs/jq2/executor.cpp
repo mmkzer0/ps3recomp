@@ -1241,8 +1241,8 @@ bool job_body_lifted()
 struct BodyNote {
     bool trace = false;          /* tracing is on and the job has a JOB span, and spu.job_body or spu.xdiff is not off */
     bool sampled = false;        /* the end hook closed a recording for the audit */
-    std::uint8_t tier = 0;       /* the authority that ran: spu_job_tier */
-    std::uint32_t lift_miss = 0; /* the authority's count of branches no lifted code covered */
+    std::uint8_t tier = 0;       /* the body that ran: spu_job_tier */
+    std::uint32_t lift_miss = 0; /* its arrivals at code no lifted function covered */
     std::uint64_t t0 = 0, t1 = 0;
 };
 
@@ -1339,6 +1339,9 @@ struct StartCtl {
         n.t0 = ps3_ft_now();
         n.sampled = capture_job_end(ctx);
         n.t1 = ps3_ft_now();
+        /* The tier names the body that ran, T0 or T1: a registered lift that reached code its lift does not hold
+         * is still T1, and the resolver's count of those arrivals travels beside it in lift_miss (spu_channels.c,
+         * spu_lift_miss; docs/SPU_XDIFF.md section 3). SPU_TIER_PARTIAL stays reserved for T2's native overrides. */
         n.tier = cap.interpreted ? SPU_TIER_INTERP : SPU_TIER_LIFTED;
         n.lift_miss = ctx->lift_miss;
     }

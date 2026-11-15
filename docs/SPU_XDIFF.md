@@ -91,6 +91,20 @@ Every tier reaches the world through the same three functions (section 5), so
 every tier records and replays the same transcript, and one fixture corpus
 serves correctness, performance and reverse engineering.
 
+Kind 32's tier is the body that ran, T0 or T1; it does not change because the
+resolver had to interpret part of the job. A T1 job whose lift does not hold
+some of its own code is still T1, and the count of those arrivals -- code the
+production resolver served in the interpreter, one per arrival -- travels beside
+it in the same record's `lift_miss`, saturated at 255 per job; the reporter
+prints the sum and the number of jobs that carried any. T2 stays reserved for
+native overrides of single functions. A job's legitimate end is not such an
+arrival -- the planted return link, the jm interface's runtime area
+(`spurs_job.c` plants it as the job's contract), a synthesised `stop` and a
+branch to LS 0 are the job's own end -- and a served context scores a miss and
+ends on it instead of interpreting, so there `lift_miss` is a run that was cut
+short, not a job that ran (section 9). The fixture's `authority.tier` names the
+same body (sections 4 and 7.1).
+
 `spu_xdiff_match_for(authority, subject)` is the whole rule for which
 comparison applies: T0 and T1 execute the same SPU instructions and are held
 to the same program; a pair with native code in it is held to the contract;
