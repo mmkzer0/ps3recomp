@@ -164,6 +164,40 @@ if(NOT WIN32)
     endforeach()
     add_test(NAME jq2_exec_trace_image_concurrent COMMAND test_jq2_executor trace-image-concurrent)
     set_tests_properties(jq2_exec_trace_image_concurrent PROPERTIES LABELS "spurs;t0;tsan" TIMEOUT 300)
+
+    # Fixture capture on the worker (docs/SPU_XDIFF.md commit 10a; spu.xdiff_capture, spu.xdiff_dir). Each mode sets the
+    # two options in its own environment before the configuration is first read, in a directory it makes and removes.
+    #
+    #   jq2_exec_xdiff_capture     N+1 jobs under capture=N: N fixtures named per 7.2, each with the job's identity, effects
+    #                              and end, each replaying equal on the interpreter; guest memory as the run without capture
+    #   jq2_exec_xdiff_lifted      a body registered for the image is the authority T1, with its inventory's code_end and options hash
+    #   jq2_exec_xdiff_body_none, _body_other  a forced body that is not the interpreter and not the image's registered one: nothing recorded
+    #   jq2_exec_xdiff_observer    the loader's observed path records too, the observer still sees every command
+    #   jq2_exec_xdiff_concurrent  three workers, two images, a barrier at admission: exactly N per image, at least two workers recorded
+    #   jq2_exec_xdiff_stop        a job that stops the process leaves its fixture (end class stop, with its code)
+    #   jq2_exec_xdiff_event, _both, _unknown  an image whose registration lists event branches (alone or with unresolved sites)
+    #                              or carries no inventory: counted ineligible, named once, nothing written
+    #   jq2_exec_xdiff_unresolved  unresolved MFC sites do not refuse an image: recorded, counted apart
+    #   jq2_exec_xdiff_varying     two buffers alternating through one address (A, B, A, B): both record, one fingerprint each
+    #   jq2_exec_xdiff_nonrepeating  bytes that never repeat, no inventory: one hash and fingerprint a job, no slot, one line
+    #   jq2_exec_xdiff_starvation  300 images with no inventory take no slot: a registered image after them still records
+    #   jq2_exec_xdiff_failure_lines  32 ineligible lines spent, a write failure still prints capture-failed
+    #   jq2_exec_xdiff_collision   the remembered fingerprint is not the bytes' (seam): dropped, attempt spent, line printed
+    #   jq2_exec_xdiff_bounded     260 registered event-branch images: 256 tracked, 4 counted together, 32 lines and one saying the rest are suppressed
+    #   jq2_exec_xdiff_baddir      a directory missing at the first queue (capture=1000): one line, capture off
+    #   jq2_exec_xdiff_writefail   a directory that disappears after the check: one named diagnostic per attempt, the run goes on
+    #   jq2_exec_xdiff_payload     a recording over the payload bound: counted capture-limit failures, the run goes on
+    #   jq2_exec_xdiff_queue256    the 257th queue is q256 in the fixture's name and unit
+    #   jq2_exec_xdiff_off         capture=0: nothing said, counted or written
+    #   jq2_exec_xdiff_nodir       capture=N without a directory: nothing recorded, one line says so
+    foreach(mode xdiff-capture xdiff-lifted xdiff-body-none xdiff-body-other xdiff-observer xdiff-concurrent xdiff-stop
+                  xdiff-event xdiff-unresolved xdiff-both xdiff-unknown xdiff-varying xdiff-nonrepeating xdiff-starvation
+                  xdiff-failure-lines xdiff-collision xdiff-bounded xdiff-baddir
+                  xdiff-writefail xdiff-payload xdiff-queue256 xdiff-off xdiff-nodir)
+        string(REPLACE "-" "_" name "${mode}")
+        add_test(NAME jq2_exec_${name} COMMAND test_jq2_executor ${mode})
+        set_tests_properties(jq2_exec_${name} PROPERTIES LABELS "spurs;t0;tsan" TIMEOUT 300)
+    endforeach()
 endif()
 
 # cellSpursJq HLE surface: the 17 firmware imports through ps3_hle_call.

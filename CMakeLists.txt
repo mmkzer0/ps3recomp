@@ -209,6 +209,7 @@ add_library(ps3recomp_spurs_jq2_objs OBJECT
     libs/spurs/jq2/port.cpp
     libs/spurs/jq2/pool.cpp
     libs/spurs/jq2/executor.cpp
+    libs/spurs/jq2/xdiff_capture.cpp
 )
 target_include_directories(ps3recomp_spurs_jq2_objs PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/libs/spurs"
@@ -1115,6 +1116,39 @@ if(PS3RECOMP_BUILD_TESTS)
         target_link_libraries(test_spu_lockline_wait PRIVATE Threads::Threads)
         add_test(NAME spu_lockline_wait COMMAND test_spu_lockline_wait)
         set_tests_properties(spu_lockline_wait PROPERTIES TIMEOUT 15)
+
+        # Peer notification across a shared line: for each kind of overlapping
+        # write (a PUT over the reserved line, a PUT to the neighbour only, a PUT
+        # spanning both, a committing PUTLLC, a PUTLLUC, and a context's own PUT)
+        # the fixture pins who is told -- the peer's reservation and SPU_EVENT_LR,
+        # a registered line watcher, the atomic line-commit hook -- and the order
+        # the runtime makes observable (docs/SPU_XDIFF.md section 8.2). The
+        # fixture includes spu_channels.c, so it is not listed as a source.
+        add_executable(test_spu_coh_peers
+            runtime/spu/tests/test_spu_coh_peers.c
+            runtime/spu/spu_drain.c
+            runtime/spu/spu_lockstep.c
+            runtime/spu/spu_coherency.c
+            runtime/spu/spu_workload.c
+            runtime/spu/spurs_policy.c
+            runtime/spu/spurs_job.c
+            runtime/spu/spu_tsp_weak.c
+            runtime/spu/spu_vm_pagemap.c
+            runtime/spu/spurs_policy_blob_weak.c
+            runtime/spu/spu_interp.c
+            runtime/memory/reservation.c
+            runtime/memory/label_window.c
+            runtime/platform/win32_compat.c
+            runtime/platform/host_clock.c
+            runtime/platform/host_wait.c
+            runtime/config/config.cpp
+            runtime/diag/stop.cpp)
+        target_include_directories(test_spu_coh_peers PRIVATE
+            include runtime runtime/spu runtime/platform)
+        target_compile_options(test_spu_coh_peers PRIVATE -UNDEBUG)
+        target_link_libraries(test_spu_coh_peers PRIVATE m Threads::Threads)
+        add_test(NAME spu_coh_peers COMMAND test_spu_coh_peers)
+        set_tests_properties(spu_coh_peers PROPERTIES LABELS "spu;t0" TIMEOUT 60)
 
         # The SPU helper tests that were never in CTest (they ran only as hand-built CI
         # steps), natively and, where the helper has a scalar form, with

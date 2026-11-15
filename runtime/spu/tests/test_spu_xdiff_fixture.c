@@ -24,6 +24,25 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <dirent.h> /* the test is built on POSIX hosts only (CMakeLists.txt, NOT WIN32) */
+
+/* Temp files of `path` the writer left in the current directory: `<path>.<pid>.<n>.partial`. */
+static int count_partials(const char* path)
+{
+    const size_t plen = strlen(path);
+    int found = 0;
+    DIR* d = opendir(".");
+    if (!d) return -1;
+    for (struct dirent* e; (e = readdir(d)) != NULL;) {
+        const size_t len = strlen(e->d_name);
+        if (len > plen + sizeof ".partial" && strncmp(e->d_name, path, plen) == 0 && e->d_name[plen] == '.' &&
+            strcmp(e->d_name + len - (sizeof ".partial" - 1), ".partial") == 0)
+            found++;
+    }
+    closedir(d);
+    return found;
+}
+
 /* ---- harness ------------------------------------------------------------ */
 
 #define REQUIRE(cond, ...)                                                                 \
@@ -664,19 +683,13 @@ static void test_name(void)
 static void test_files(void)
 {
     const char* path = "test_spu_xdiff_fixture.spujob";
-    const char* partial = "test_spu_xdiff_fixture.spujob.partial";
     spu_xdiff_fixture f, g;
     spu_xdiff_error err;
 
     build_full(&f, 1);
     remove(path);
-    remove(partial);
     REQUIRE(spu_xdiff_fixture_write(&f, path, &err) == 0, "write: %s", err.detail);
-    {
-        FILE* leftover = fopen(partial, "rb");
-        REQUIRE(leftover == NULL, "the .partial file was left behind");
-        if (leftover) fclose(leftover);
-    }
+    REQUIRE(count_partials(path) == 0, "%d temp file(s) of %s left behind", count_partials(path), path);
     REQUIRE(spu_xdiff_fixture_read(path, &g, &err) == 0, "read: %s", err.detail);
     compare_fixtures(&f, &g);
     spu_xdiff_fixture_free(&g);
@@ -704,7 +717,7 @@ static void test_files(void)
     }
     remove(path);
     spu_xdiff_fixture_free(&f);
-    printf("ok write/read through <path>.partial\n");
+    printf("ok write/read through a per-process temp file\n");
 }
 
 /* The encoder refuses what the decoder refuses: it never writes a file its own

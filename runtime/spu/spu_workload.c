@@ -217,6 +217,53 @@ spu_lifted_entry_fn spu_workload_find_img_masked(const void* data, size_t n,
 
 unsigned spu_workload_count(void) { return s_registry_count; }
 
+/* ---- static effects inventory ------------------------------------------- */
+
+/* Its own table, not a field of spu_workload_entry: an inventory is a property of the image bytes
+ * and registered next to a body, but an image that runs only interpreted still has one. Written by
+ * registration at init, read without a lock afterwards (spu_workload.h). */
+typedef struct {
+    uint64_t               fp;
+    spu_workload_inventory inv;
+} spu_workload_inventory_entry;
+
+static spu_workload_inventory_entry s_inventory[SPU_WORKLOAD_MAX];
+static unsigned                     s_inventory_count = 0;
+
+void spu_workload_set_inventory(uint64_t fingerprint, uint32_t flags, uint32_t code_end,
+                                uint64_t lift_options)
+{
+    for (unsigned i = 0; i < s_inventory_count; i++) {
+        if (s_inventory[i].fp == fingerprint) {
+            s_inventory[i].inv.flags = flags;
+            s_inventory[i].inv.code_end = code_end;
+            s_inventory[i].inv.lift_options = lift_options;
+            return;
+        }
+    }
+    if (s_inventory_count >= SPU_WORKLOAD_MAX) {
+        fprintf(stderr, "[spu_workload] inventory table full (%u); image 0x%016llX stays unknown\n",
+                SPU_WORKLOAD_MAX, (unsigned long long)fingerprint);
+        return;
+    }
+    s_inventory[s_inventory_count].fp = fingerprint;
+    s_inventory[s_inventory_count].inv.flags = flags;
+    s_inventory[s_inventory_count].inv.code_end = code_end;
+    s_inventory[s_inventory_count].inv.lift_options = lift_options;
+    s_inventory_count++;
+}
+
+int spu_workload_find_inventory(uint64_t fingerprint, spu_workload_inventory* out)
+{
+    for (unsigned i = 0; i < s_inventory_count; i++) {
+        if (s_inventory[i].fp == fingerprint) {
+            if (out) *out = s_inventory[i].inv;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* ---- SPU ELF loader (32-bit big-endian) -------------------------------- */
 
 static uint16_t rd_be16(const uint8_t* p) { return (uint16_t)((p[0] << 8) | p[1]); }

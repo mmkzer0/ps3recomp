@@ -547,8 +547,12 @@ def build_programs(args, registry_writer):
                                                           for p in report['programs'])
         usable = not report['errors'] and (report['complete'] or args.allow_partial)
         if usable:
+            # The writer carries each registered image's effects inventory into the registration
+            # (build_spu_workloads.registration_inventory); inventory.json gets the same records below.
             registry_args = type('RegistryArgs', (), dict(out=str(stage / registry.name), title='discovered SPU programs',
-                                                        register_fn=args.register_fn, constructor=args.constructor))()
+                                                        register_fn=args.register_fn, constructor=args.constructor,
+                                                        programs={p['name']: p for p in report['programs']
+                                                                  if p.get('status') == 'registered'}))()
             registry_writer(registry_args, imgs, text_fps, image_ids)
             sources = [destination / name / 'spu_recomp.c' for name, _, _, _ in imgs] + [registry]
             # Bracket arguments preserve spaces and avoid expansion of $ in paths.

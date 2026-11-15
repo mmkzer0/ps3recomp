@@ -13,8 +13,13 @@ import sys
 
 NL = chr(10)
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ROOTS = [os.path.join(ROOT, r) for r in ('runtime', 'libs', 'tools')]
+# include/ holds header-only readers (ps3_ftrace.h reads PS3_FTRACE*), so a run harness that
+# checks names against the index refused them while the runtime honoured them.
+ROOTS = [os.path.join(ROOT, r) for r in ('runtime', 'libs', 'include', 'tools')]
 DOC = os.path.join(ROOT, 'docs', 'DIAGNOSTICS.md')
+# Variables of the host environment the runtime consults, not knobs it defines: ps3_ftrace.h
+# searches PATH for zstd. A run harness passes them through; listing them would invite setting them.
+HOST_VARS = frozenset({'PATH'})
 # spu_diag_knob / spu_diag_num (runtime/spu/spu_context.h) read the variable named by their second argument.
 PAT = re.compile(r'(?:getenv|ps3_env_once)\(\s*"([A-Za-z_][A-Za-z_0-9]*)"\s*\)'
                  r'|spu_diag_(?:knob|num)\(\s*[^,()"]*,\s*"([A-Za-z_][A-Za-z_0-9]*)"')
@@ -68,6 +73,8 @@ def scan():
                 for i, l in enumerate(code):
                     for m in PAT.finditer(l):
                         name = m.group(1) or m.group(2)
+                        if name in HOST_VARS:
+                            continue
                         # nearest preceding comment block, up to 6 lines back
                         desc = ''
                         for j in range(i - 1, max(-1, i - 7), -1):

@@ -384,7 +384,21 @@ static void check_state(const char* tier, int lifted, const spu_xdiff_fixture* f
           f->identity.context_census);
     CHECK(f->identity.host_arch == SPU_XDIFF_HOST_ARM64 || f->identity.host_arch == SPU_XDIFF_HOST_X86_64,
           "%s: host_arch %u", tier, f->identity.host_arch);
-    CHECK(f->identity.host_isa != 0, "%s: host_isa is empty", tier);
+    /* An x86-64 baseline build (no -mssse3 and up, no scalar switch) compiles none of the optional helper
+     * paths, so 0 is a valid word there; what the word must never do is name a path of the other
+     * architecture or a bit the header does not define. */
+    {
+        const uint32_t known = SPU_XDIFF_ISA_NEON | SPU_XDIFF_ISA_SSSE3 | SPU_XDIFF_ISA_SSE41 | SPU_XDIFF_ISA_AVX2 |
+                               SPU_XDIFF_ISA_FMA | SPU_XDIFF_ISA_SCALAR;
+        const uint32_t x86 = SPU_XDIFF_ISA_SSSE3 | SPU_XDIFF_ISA_SSE41 | SPU_XDIFF_ISA_AVX2;
+        const uint32_t isa = f->identity.host_isa;
+        CHECK((isa & ~known) == 0, "%s: host_isa 0x%X has undefined bits", tier, isa);
+        CHECK(f->identity.host_arch == SPU_XDIFF_HOST_ARM64 ? (isa & x86) == 0 : (isa & SPU_XDIFF_ISA_NEON) == 0,
+              "%s: host_isa 0x%X names a path of the other architecture", tier, isa);
+#if defined(__ARM_NEON)
+        CHECK((isa & SPU_XDIFF_ISA_NEON) != 0, "%s: a NEON build recorded host_isa 0x%X", tier, isa);
+#endif
+    }
     CHECK(f->identity.float_rz == (spu_float_rz_mode() ? 1 : 0), "%s: float_rz %u", tier, f->identity.float_rz);
     CHECK(!memcmp(f->identity.toolkit_commit, zero20, 20) && f->identity.toolkit_dirty == 0 &&
               f->identity.reserved[0] == 0 && f->identity.reserved[1] == 0,

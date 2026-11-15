@@ -25,6 +25,25 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
+
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#include <process.h>
+#include <sys/stat.h>
+#define XD_GETPID _getpid
+#define XD_OPEN_EXCL(p) _open((p), _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY, _S_IREAD | _S_IWRITE)
+#define XD_FDOPEN(fd) _fdopen((fd), "wb")
+#define XD_CLOSE _close
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#define XD_GETPID getpid
+#define XD_OPEN_EXCL(p) open((p), O_WRONLY | O_CREAT | O_EXCL, 0666)
+#define XD_FDOPEN(fd) fdopen((fd), "wb")
+#define XD_CLOSE close
+#endif
 
 /* The fixture's fixed-width records are the context's, and a drift is a format
  * change, not a build detail. */
@@ -1345,12 +1364,20 @@ int spu_xdiff_fixture_write(const spu_xdiff_fixture* f, const char* path, spu_xd
     if (!err) err = &local;
     if (!path) return fail(err, SPU_XDIFF_R_CAPTURE_LIMIT, "write: no path");
 
+    /* The temp name is the process's and this attempt's own, and it is created exclusively: two processes
+     * that share a directory (two runs of one title, a restart over a leftover) never write into one file,
+     * so a reader of the final name sees one writer's complete bytes or none. A crash can leave a stray
+     * `.partial`; nothing reads those. The final name stays `path`: when it already exists the rename below
+     * replaces it (the same fingerprint, queue and seq of an earlier run). */
+    static _Atomic unsigned s_attempt;
+    const unsigned long long pid = (unsigned long long)XD_GETPID();
+    const unsigned attempt = atomic_fetch_add_explicit(&s_attempt, 1u, memory_order_relaxed); /* uniqueness only */
     const size_t plen = strlen(path);
-    char* partial = (char*)malloc(plen + sizeof ".partial");
+    const size_t pcap = plen + 1 + 20 + 1 + 10 + sizeof ".partial";
+    char* partial = (char*)malloc(pcap);
     if (!partial)
         return fail(err, SPU_XDIFF_R_CAPTURE_LIMIT, "write: out of memory for the path");
-    memcpy(partial, path, plen);
-    memcpy(partial + plen, ".partial", sizeof ".partial");
+    snprintf(partial, pcap, "%s.%llu.%u.partial", path, pid, attempt);
 
     uint8_t* bytes = NULL;
     size_t n = 0;
@@ -1360,12 +1387,22 @@ int spu_xdiff_fixture_write(const spu_xdiff_fixture* f, const char* path, spu_xd
     }
 
     /* No fsync: the rename is what keeps a reader from seeing half a file. */
-    FILE* fp = fopen(partial, "wb");
+    FILE* fp = NULL;
+    int open_errno = 0;
+    {
+        const int fd = XD_OPEN_EXCL(partial);
+        if (fd < 0) {
+            open_errno = errno;
+        } else if ((fp = XD_FDOPEN(fd)) == NULL) {
+            open_errno = errno;
+            XD_CLOSE(fd);
+            remove(partial);
+        }
+    }
     if (!fp) {
-        const int e = errno;
         free(bytes);
         const int rc = fail(err, SPU_XDIFF_R_CAPTURE_LIMIT, "%s: cannot create: %s", partial,
-                            strerror(e));
+                            strerror(open_errno));
         free(partial);
         return rc;
     }
