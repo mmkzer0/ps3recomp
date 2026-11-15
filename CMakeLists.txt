@@ -1703,10 +1703,15 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME ppu_store_hook
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_store_hook.py")
+        # The guest store family's short path (no store diagnostic armed) against the full one, and
+        # every diagnostic that can arm itself still seeing a store.
+        add_test(NAME ppu_store_path
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_store_path.py")
         add_test(NAME gcm_label_store
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_gcm_label_store.py")
-        set_tests_properties(ppu_store_hook gcm_label_store
+        set_tests_properties(ppu_store_hook ppu_store_path gcm_label_store
             PROPERTIES LABELS "ppu;t0" TIMEOUT 300)
         add_test(NAME ppu_lift_conformance
             COMMAND "${Python3_EXECUTABLE}"

@@ -70,6 +70,7 @@
 #include <stdint.h>
 
 #include "../ppu/ppu_context.h"
+#include "resv_mark.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -105,7 +106,9 @@ void resv_bump(uint32_t ea);
 void resv_mark_spu(uint32_t ea);
 
 /* Is the line marked? One load of a global that stays zero until the first
- * GETLLAR, so a title that runs no SPU code pays one predictable branch. */
+ * GETLLAR, so a title that runs no SPU code pays one predictable branch.
+ * Out-of-line; the guest store path reads the same state inline through
+ * resv_marked_spu_inl (resv_mark.h). */
 int resv_marked_spu(uint32_t ea);
 
 /* ---- 128-byte line copies ----------------------------------------------- */

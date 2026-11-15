@@ -247,10 +247,11 @@ void spu_coh_forget_range(uintptr_t lo, uintptr_t hi)
 int spu_coh_is_reserved(uint32_t addr)
 {
     /* The one authority: the reservation model's mark (reservation.h), set
-     * under the lock-line lock with an atomic OR and read with an atomic
-     * load, so a PPU store locks and notifies exactly the SPUs that hold the
-     * line. */
-    return resv_marked_spu(addr);
+     * under the lock-line lock with an atomic OR and read with relaxed loads,
+     * so a PPU store locks and notifies exactly the SPUs that hold the line.
+     * The guest store path reads the same mark inline (resv_marked_spu_inl);
+     * this is the answer for the callers that are not on one. */
+    return resv_marked_spu_inl(addr);
 }
 
 /* ===========================================================================

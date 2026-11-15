@@ -36,7 +36,6 @@ void spu_coh_notify_write(uint32_t ea);
 /* ===========================================================================
  * Line cells
  * ===========================================================================*/
-#define RESV_LINE_SHIFT   7
 #define RESV_CHUNK_SHIFT  12
 #define RESV_CHUNK_LINES  (1u << RESV_CHUNK_SHIFT)
 #define RESV_DIR_ENTRIES  (1u << (32 - RESV_LINE_SHIFT - RESV_CHUNK_SHIFT))
@@ -134,28 +133,28 @@ void resv_bump(uint32_t ea)
  * 0x40000000 and the raw-SPU windows are all reservable, and a line outside a
  * hardcoded range would be silently non-coherent.
  * ===========================================================================*/
-#define RESV_MARK_BYTES (1u << (32 - RESV_LINE_SHIFT - 3))
-
-static _Atomic unsigned char s_marks[RESV_MARK_BYTES];
+/* The bitmap and the flag are declared in resv_mark.h, where the store path
+ * reads them inline. Explicit zero initialisers: a tentative definition would
+ * be a common symbol, and a 4 MiB common symbol makes Mach-O links warn about
+ * the section's alignment. */
+unsigned char resv_spu_marks[RESV_MARK_BYTES] = {0};
 
 /* Zero until the first GETLLAR anywhere: keeps the PPU store paths off the
  * bitmap entirely for a title that runs no SPU code. A stale zero read by a
  * store racing the very first reservation costs at most that one event. */
-static _Atomic int s_marks_armed;
+int resv_spu_armed = 0;
 
 void resv_mark_spu(uint32_t ea)
 {
     uint32_t line = ea >> RESV_LINE_SHIFT;
-    atomic_fetch_or_explicit(&s_marks[line >> 3], (unsigned char)(1u << (line & 7)),
-                             memory_order_relaxed);
-    atomic_store_explicit(&s_marks_armed, 1, memory_order_relaxed);
+    __atomic_fetch_or(&resv_spu_marks[line >> 3], (unsigned char)(1u << (line & 7)),
+                      __ATOMIC_RELAXED);
+    __atomic_store_n(&resv_spu_armed, 1, __ATOMIC_RELAXED);
 }
 
 int resv_marked_spu(uint32_t ea)
 {
-    if (!atomic_load_explicit(&s_marks_armed, memory_order_relaxed)) return 0;
-    uint32_t line = ea >> RESV_LINE_SHIFT;
-    return (atomic_load_explicit(&s_marks[line >> 3], memory_order_relaxed) >> (line & 7)) & 1u;
+    return resv_marked_spu_inl(ea);
 }
 
 /* ===========================================================================
