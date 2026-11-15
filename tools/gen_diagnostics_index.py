@@ -15,7 +15,9 @@ NL = chr(10)
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ROOTS = [os.path.join(ROOT, r) for r in ('runtime', 'libs', 'tools')]
 DOC = os.path.join(ROOT, 'docs', 'DIAGNOSTICS.md')
-PAT = re.compile(r'(?:getenv|ps3_env_once)\(\s*"([A-Za-z_][A-Za-z_0-9]*)"\s*\)')
+# spu_diag_knob / spu_diag_num (runtime/spu/spu_context.h) read the variable named by their second argument.
+PAT = re.compile(r'(?:getenv|ps3_env_once)\(\s*"([A-Za-z_][A-Za-z_0-9]*)"\s*\)'
+                 r'|spu_diag_(?:knob|num)\(\s*[^,()"]*,\s*"([A-Za-z_][A-Za-z_0-9]*)"')
 COMMENT = re.compile(r'^\s*(?:/\*|\*|//)\s?(.*)$')
 # A knob entry as the generator writes it: - **`NAME`** — description
 KNOB = re.compile(r'^- \*\*`([A-Za-z_][A-Za-z_0-9]*)`\*\*', re.M)
@@ -65,7 +67,7 @@ def scan():
                 code = strip_comments(text, f.endswith('.py')).split(NL)
                 for i, l in enumerate(code):
                     for m in PAT.finditer(l):
-                        name = m.group(1)
+                        name = m.group(1) or m.group(2)
                         # nearest preceding comment block, up to 6 lines back
                         desc = ''
                         for j in range(i - 1, max(-1, i - 7), -1):

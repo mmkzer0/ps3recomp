@@ -60,6 +60,49 @@ extern "C" {
 #  define SPU_NOINLINE_COLD __attribute__((noinline, cold))
 #endif
 
+/* A diagnostic gate read from the environment: 0 when `name` is unset, else 1
+ * (count_default == 0, a presence flag) or the variable's positive integer
+ * value (count_default otherwise, for the knobs that mean "print every N").
+ * `cache` holds -1 until the first call. The value is a function of the
+ * process environment, so one copy serves every thread: a racing first call
+ * computes the same value, and the relaxed publish carries no other data.
+ * Do not make this per-thread: on Mach-O every __thread access is a getter
+ * call, and the gates sit on the per-operation channel and DMA paths. */
+static SPU_NOINLINE_COLD int spu_diag_knob_read(int* cache, const char* name, int count_default)
+{
+    const char* e = getenv(name);
+    int v = 0;
+    if (e) v = count_default == 0 ? 1 : (atoi(e) > 0 ? atoi(e) : count_default);
+    SPU_RELAXED_STORE(cache, v);
+    return v;
+}
+static inline int spu_diag_knob(int* cache, const char* name, int count_default)
+{
+    int v = SPU_RELAXED_LOAD(cache);
+    if (SPU_PORT_UNLIKELY(v < 0)) v = spu_diag_knob_read(cache, name, count_default);
+    return v;
+}
+
+/* The same for a gate that carries a number (SPU_WATCHEA=<hex EA>, SPU_SMC_WATCH=<image>):
+ * 0 when `name` is unset; else bit 32 is set and the low word holds the value,
+ * so a variable set to 0 is still armed. Read the number with (uint32_t); `base`
+ * is the strtoul base, or 10 for atoi (which is how the decimal knobs parsed).
+ * -1 cannot be a result: it marks "not read yet". */
+static SPU_NOINLINE_COLD int64_t spu_diag_num_read(int64_t* cache, const char* name, int base)
+{
+    const char* e = getenv(name);
+    int64_t v = 0;
+    if (e) v = ((int64_t)1 << 32) | (int64_t)(uint32_t)(base == 10 ? (unsigned long)atoi(e) : strtoul(e, 0, base));
+    SPU_RELAXED_STORE(cache, v);
+    return v;
+}
+static inline int64_t spu_diag_num(int64_t* cache, const char* name, int base)
+{
+    int64_t v = SPU_RELAXED_LOAD(cache);
+    if (SPU_PORT_UNLIKELY(v < 0)) v = spu_diag_num_read(cache, name, base);
+    return v;
+}
+
 /* Local store size: 256 KB */
 #define SPU_LS_SIZE         (256 * 1024)
 #define SPU_LS_MASK         (SPU_LS_SIZE - 1)
@@ -470,6 +513,16 @@ typedef struct spu_context {
      * without interpreting anything: a served context must never run code the
      * lift does not hold. Zero for every context that has no serve table. */
     uint32_t lift_miss;
+
+    /* The GETLLAR spin detector's state (spu_channels.c, spu_mfc_atomic): the
+     * line this context last GETLLAR'd and how many times running it has asked
+     * for that same line. They were thread-local, which on Mach-O is a getter
+     * call per GETLLAR. A thread could run several contexts, so per context is
+     * the sharper attribution of "this SPU spins on one line". Zero from
+     * spu_context_init's memset; not copied or inherited. Behind `lift_miss`
+     * with `port`, outside the members the lifted code addresses. */
+    uint32_t getllar_spin_ea;
+    uint32_t getllar_spin_n;
 
     /* LS base of the SPURS job runtime area spurs_job.c planted (the code the
      * Ver14 jm interface points into), 0 when this context runs no such job.
