@@ -984,11 +984,6 @@ static int run_spurs_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_e
     ctx.gpr[4]._u32[0] = desc_ls;                    /* CellSpursJob256*      */
     }
 
-    { static SPURS_JOB_TLS int _n = 0;
-      if (PS3_LOG_FIRST(_n, 4))
-          fprintf(stderr, "[spurs-job] ENTER r3=%08X r4=%08X r1=%08X entry-fn image=%d\n",
-                  ctx.gpr[3]._u32[0], ctx.gpr[4]._u32[0], ctx.gpr[1]._u32[0],
-                  image_id); }
     /* NOTE: after its work the job's runtime jumps to LS 0 ("return to the
      * jm2 kernel" -- real layout has the kernel at 0, jobs above; we load the
      * job at 0). That second lap re-enters the job's crt with dead registers
@@ -1003,6 +998,12 @@ static int run_spurs_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_e
             s_ls, size_scr, size_stk, ctx.gpr[1]._u32[0], ctx_ls };
         hooks->start(hooks->user, &ctx, &layout);
     }
+    /* After the start hook: a hook may choose the body and write the context's image id. */
+    { static SPURS_JOB_TLS int _n = 0;
+      if (PS3_LOG_FIRST(_n, 4))
+          fprintf(stderr, "[spurs-job] ENTER r3=%08X r4=%08X r1=%08X entry-fn image=%d\n",
+                  ctx.gpr[3]._u32[0], ctx.gpr[4]._u32[0], ctx.gpr[1]._u32[0],
+                  ctx.image_id); }
     /* The runner's result (halted or returned) is not a completion test and is
      * not consulted here. A lifted job's normal return is itself reported as a
      * halt (the resolver halts the lifted run when the interpreted stub at the
@@ -1024,7 +1025,7 @@ static int run_spurs_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_e
         (ctx.pc & SPU_LS_MASK) == ctx.job_rt_ls + JOB_RT_TRAP + 4u) {
         char job_s[16], img_s[16], ent_s[16];
         snprintf(job_s, sizeof job_s, "0x%08X", job_ea);
-        snprintf(img_s, sizeof img_s, "%d", image_id);
+        snprintf(img_s, sizeof img_s, "%d", ctx.image_id); /* the body that ran, not the loader's argument */
         snprintf(ent_s, sizeof ent_s, "0x%05X", ctx.job_rt_ls + JOB_RT_TRAP);
         ps3_stop_field f[] = { {"job", job_s}, {"image", img_s}, {"entry", ent_s} };
         ps3_stop_site site = { ctx.job_rt_ls + JOB_RT_TRAP, ctx.gpr[0]._u32[0] & SPU_LS_MASK, 0 };
@@ -1053,10 +1054,10 @@ static int run_spurs_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_e
       static SPURS_JOB_TLS int n = 0;
       const char* c = e ? strchr(e, ':') : 0;
       const uint32_t lsa = c ? (uint32_t)strtoul(c + 1, 0, 16) : 0;
-      if (e && atoi(e) == image_id && PS3_LOG_FIRST(n, 3)) {
+      if (e && atoi(e) == ctx.image_id && PS3_LOG_FIRST(n, 3)) {
           const uint8_t* q = ctx.ls + (lsa & 0x3FFFC);
           uint32_t v = ((uint32_t)q[0] << 24) | ((uint32_t)q[1] << 16) | ((uint32_t)q[2] << 8) | q[3];
-          fprintf(stderr, "[lsword] img=%d job=0x%08X LS[0x%05X]=0x%08X io=0x%05X also at:", image_id, job_ea, lsa, v, io_ls);
+          fprintf(stderr, "[lsword] img=%d job=0x%08X LS[0x%05X]=0x%08X io=0x%05X also at:", ctx.image_id, job_ea, lsa, v, io_ls);
           for (uint32_t o = 0; o + 4 <= SPU_LS_SIZE; o += 4) {
               const uint8_t* p = ctx.ls + o;
               if (o != (lsa & 0x3FFFC) && ((uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]) == v)

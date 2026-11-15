@@ -32,8 +32,9 @@
  *
  * Bounded state. A process whose staged bytes vary (a loader that restages an
  * address with a new binary for every job) must not grow tables or logs without
- * bound. A worker remembers, per (EA, size), the last four contents it saw with
- * their fingerprints and verdicts (LRU): alternating buffers stay cheap and
+ * bound. The executor identifies a job's staged bytes once (StagedImage, executor.cpp) and a worker
+ * remembers, per (EA, size), the last four contents it saw with their fingerprints (LRU); this tap keeps,
+ * per such content, the registration's verdict. Alternating buffers stay cheap and
  * recordable, and contents that never repeat cost one hash and one fingerprint a
  * job and nothing else. An image slot (at most 256) is allocated only for an image
  * whose registration carries an inventory; every other job is counted together.
@@ -60,8 +61,10 @@ struct spu_job_layout;
 namespace ps3recomp::spurs::jq2 {
 
 /* What the tap needs of a job, handed to the loader's hooks by pointer. `queue` is the queue's creation
- * number (the q of a fixture's name; not the saturating trace index), `entry` the body about to run and
- * `interpreted` whether that is the SPU interpreter. */
+ * number (the q of a fixture's name; not the saturating trace index), `entry` the body that runs and
+ * `interpreted` whether that is the SPU interpreter. Under spu.job_body=lifted the body is chosen from the
+ * staged bytes in the start hook, so the executor fills `entry` and `interpreted` before it calls
+ * capture_job_start: the T1 rule below judges the body actually chosen. */
 struct CaptureJob {
     const JobStart* job;
     std::uint32_t queue;
@@ -74,9 +77,17 @@ struct CaptureJob {
  * why. Called by queue creation, before any worker exists. */
 void capture_configure();
 
+/* True when capture is on for the process (spu.xdiff_capture > 0 with a usable spu.xdiff_dir). Valid once
+ * capture_configure has run. */
+[[nodiscard]] bool capture_active();
+
 /* Starts recording the job on this worker thread when capture is on and the job qualifies; a no-op
- * otherwise. Must be called with `ctx` at its entry state, as the loader's start hook has it. */
-void capture_job_start(const CaptureJob& job, ::spu_context* ctx, const ::spu_job_layout* layout);
+ * otherwise. Must be called with `ctx` at its entry state, as the loader's start hook has it. `image` is the
+ * staged image's identity, which the executor took once for this job; the tap takes no second pass over the
+ * bytes. It may be null only when the layout lies outside local store, which the tap reports and refuses
+ * before it reads `image`. A tap that finds the recorder's own fingerprint disagrees with `image->fingerprint`
+ * sets `image->stale` and the worker forgets the remembered result. */
+void capture_job_start(const CaptureJob& job, ::spu_context* ctx, const ::spu_job_layout* layout, StagedImage* image);
 
 /* Ends the recording this thread started for its job, if any, and writes the fixture. Call it first in
  * the end hook, before the executor applies its policy to the end: a job that is about to stop the

@@ -78,6 +78,8 @@ typedef struct {
     /* Masked registrations only (var_len != 0): the image is `size` bytes and
      * its fingerprint takes [var_off, var_off + var_len) as zero. */
     uint32_t            size, var_off, var_len;
+    /* Set by spu_workload_promote_img at init, like an inventory: read without a lock afterwards. */
+    int                 promoted;
 } spu_workload_entry;
 
 static spu_workload_entry s_registry[SPU_WORKLOAD_MAX];
@@ -178,6 +180,29 @@ spu_lifted_entry_fn spu_workload_find_img_masked(const void* data, size_t n,
 }
 
 unsigned spu_workload_count(void) { return s_registry_count; }
+
+/* ---- promotion ----------------------------------------------------------- */
+
+void spu_workload_promote_img(uint64_t fingerprint)
+{
+    for (unsigned i = 0; i < s_registry_count; i++) {
+        if (s_registry[i].fp == fingerprint) {
+            s_registry[i].promoted = 1;
+            return;
+        }
+    }
+    /* The registry is generated, so a promotion of an image that is not in it is a generator or ordering
+     * fault: say so, and promote nothing (the image would never have run lifted anyway). */
+    fprintf(stderr, "[spu_workload] promote-unregistered image=0x%016llX: no body is registered under that "
+                    "fingerprint; nothing promoted\n", (unsigned long long)fingerprint);
+}
+
+int spu_workload_is_promoted(uint64_t fingerprint)
+{
+    for (unsigned i = 0; i < s_registry_count; i++)
+        if (s_registry[i].fp == fingerprint) return s_registry[i].promoted;
+    return 0;
+}
 
 /* ---- static effects inventory ------------------------------------------- */
 

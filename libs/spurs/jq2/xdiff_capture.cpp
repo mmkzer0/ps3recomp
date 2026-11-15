@@ -67,7 +67,7 @@ constexpr auto kRelaxed = std::memory_order_relaxed;
 constexpr std::size_t kMaxImages = 256;        /* image slots; the rest are counted together */
 constexpr std::size_t kMaxNamed = 1024;        /* distinct (address, size, reason) the ineligible line has named */
 constexpr std::uint32_t kMaxLines = 32;        /* capture-ineligible lines per process */
-constexpr std::size_t kMaxAddresses = 256;     /* per worker; the table is cleared, not grown, past this */
+constexpr std::size_t kMaxAddresses = 256;     /* per worker; past this the least recently used address is evicted */
 constexpr std::size_t kContents = 4;           /* contents remembered per address */
 constexpr std::size_t kKeepFixtureBytes = 8u << 20; /* a worker's fixture buffer above this is freed after the job */
 
@@ -134,10 +134,10 @@ enum class Verdict : std::uint8_t {
 };
 
 /* The fingerprint of an image is the byte-serial FNV over its staged bytes, about a millisecond for a
- * large one, and every job would pay it. A worker therefore remembers it by (EA, size) and content hash, and
- * with it everything the registration says about that fingerprint (docs/SPU_XDIFF.md section 4). The hit is a
- * claim, not a proof: a fixture is only written after the recorder's own byte-serial fingerprint of the entry
- * local store agrees with it. */
+ * large one. The executor takes it once per job, and remembers it by (EA, size) and content hash (StagedImage);
+ * this cache keeps, per content, what the registration says about that fingerprint (docs/SPU_XDIFF.md
+ * section 4). The hit is a claim, not a proof: a fixture is only written after the recorder's own byte-serial
+ * fingerprint of the entry local store agrees with it. */
 struct Content {
     bool valid = false;
     std::uint64_t content = 0;
@@ -156,6 +156,7 @@ struct AddrCache {
     std::array<Content, kContents> contents;
     std::uint64_t tick = 0;
     unsigned named = 0;
+    std::uint64_t used = 0; /* LRU tick of this address among the worker's */
 };
 
 struct WorkerCapture {
@@ -167,6 +168,7 @@ struct WorkerCapture {
     std::uint64_t fingerprint = 0;
     std::uint32_t queue = 0, seq = 0;
     std::unordered_map<std::uint64_t, AddrCache> seen;
+    std::uint64_t seen_tick = 0; /* LRU tick of the addresses in `seen` */
 
     WorkerCapture() = default;
     WorkerCapture(const WorkerCapture&) = delete;
@@ -259,11 +261,11 @@ void judge(Content& c)
     c.verdict = Verdict::eligible;
 }
 
-/* The content at this job's (address, size): remembered, or hashed, fingerprinted and judged now. */
-Content& seen_content(AddrCache& a, const spu_context* ctx, const spu_job_layout* l)
+/* The content at this job's (address, size): remembered, or judged now from the identity the executor took. A
+ * miss of the executor's memory (`computed`) is a byte-serial fingerprint paid for these bytes: it is counted. */
+Content& seen_content(AddrCache& a, const StagedImage& staged)
 {
-    const std::uint8_t* bytes = ctx->ls + l->image_ls;
-    const std::uint64_t content = spu_workload_content_hash(bytes, l->image_bytes);
+    const std::uint64_t content = staged.content;
     Content* victim = &a.contents[0];
     for (Content& c : a.contents) {
         if (c.valid && c.content == content) {
@@ -278,10 +280,15 @@ Content& seen_content(AddrCache& a, const spu_context* ctx, const spu_job_layout
     c.valid = true;
     c.content = content;
     c.used = ++a.tick;
-    c.fingerprint = spu_workload_fingerprint(bytes, l->image_bytes) ^ g_fingerprint_fault.load(kRelaxed);
-    table().unattributed.cache_misses.fetch_add(1, kRelaxed);
+    c.fingerprint = staged.fingerprint ^ g_fingerprint_fault.load(kRelaxed);
     judge(c);
     return c;
+}
+
+/* A job that took the byte-serial pass is counted whether or not this worker's verdict cache had the content. */
+void count_fingerprint(const StagedImage& staged)
+{
+    if (staged.computed) table().unattributed.cache_misses.fetch_add(1, kRelaxed);
 }
 
 /* Counts a job on the shared bucket of jobs no image slot was kept for. */
@@ -356,7 +363,13 @@ void set_capture_fingerprint_fault(std::uint64_t mask) { g_fingerprint_fault.sto
 
 /* ---- the job --------------------------------------------------------------- */
 
-void capture_job_start(const CaptureJob& job, ::spu_context* ctx, const ::spu_job_layout* l)
+bool capture_active()
+{
+    const Settings* settings = g_settings.load(std::memory_order_acquire);
+    return settings != nullptr && settings->limit != 0;
+}
+
+void capture_job_start(const CaptureJob& job, ::spu_context* ctx, const ::spu_job_layout* l, StagedImage* staged)
 {
     const Settings* settings = g_settings.load(std::memory_order_acquire);
     if (settings == nullptr || settings->limit == 0) return;
@@ -381,9 +394,22 @@ void capture_job_start(const CaptureJob& job, ::spu_context* ctx, const ::spu_jo
         return;
     }
     const std::uint64_t key = (static_cast<std::uint64_t>(l->image_ea) << 32) | l->image_bytes;
-    if (w.seen.size() >= kMaxAddresses && w.seen.find(key) == w.seen.end()) w.seen.clear();
-    AddrCache& addr = w.seen[key];
-    Content& content = seen_content(addr, ctx, l);
+    auto at = w.seen.find(key);
+    if (at == w.seen.end()) {
+        if (w.seen.size() >= kMaxAddresses) {
+            /* The least recently used address goes, not all of them: a loader that cycles through many addresses
+             * keeps the recent ones. */
+            auto lru = w.seen.begin();
+            for (auto it = w.seen.begin(); it != w.seen.end(); ++it)
+                if (it->second.used < lru->second.used) lru = it;
+            w.seen.erase(lru);
+        }
+        at = w.seen.try_emplace(key).first;
+    }
+    AddrCache& addr = at->second;
+    addr.used = ++w.seen_tick;
+    count_fingerprint(*staged);
+    Content& content = seen_content(addr, *staged);
     const std::uint64_t fingerprint = content.fingerprint;
 
     switch (content.verdict) {
@@ -480,6 +506,7 @@ void capture_job_start(const CaptureJob& job, ::spu_context* ctx, const ::spu_jo
         spu_xdiff_recorder_end(&w.recorder, ctx, SPU_XDIFF_END_OTHER, 0); /* removes the tap; the fixture is dropped */
         const std::uint64_t actual = w.fixture.identity.image_fingerprint;
         content = Content{};
+        staged->stale = true; /* the executor's memory of these bytes' fingerprint is wrong too */
         image.ineligible.fetch_add(1, kRelaxed);
         image.collision.fetch_add(1, kRelaxed);
         std::fprintf(stderr,

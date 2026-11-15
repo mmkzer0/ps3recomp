@@ -251,6 +251,9 @@ std::string check_string(const Option& o, std::string& s)
     case PS3_CFG_V_NULL_PAGE:
         if (s == "stop" || s == "drop") return {};
         return "expected \"stop\" or \"drop\", found \"" + s + "\"";
+    case PS3_CFG_V_JOB_BODY:
+        if (s == "interp" || s == "lifted") return {};
+        return "expected \"interp\" or \"lifted\", found \"" + s + "\"";
     case PS3_CFG_V_PAD_RECORD_PATH: {
         /* Checked here so a mistyped path fails at startup rather than minutes into a run.
          * pad_trace.c creates the file exclusively, which settles a race with another writer. */

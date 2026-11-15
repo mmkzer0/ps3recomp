@@ -22,6 +22,7 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdio>
@@ -37,6 +38,7 @@
 #include <vector>
 
 #include "memory/reservation.h"
+#include "ps3emu/config.h"
 #include "ps3emu/endian.h"
 #include "ps3emu/stop.h"
 #include "spu/spu_context.h"
@@ -1107,14 +1109,44 @@ private:
 };
 ImageRegistry g_images;
 
-/* What one worker last saw at an (image_ea, image_bytes): the same address does not imply the same code (a
- * loader may restage a different binary there), so the entry is reused only while the word-wise content hash of
- * the bytes still matches, and the byte-serial fingerprint is recomputed otherwise. */
+/* What one worker remembers of the images staged at an (image_ea, image_bytes). The same address does not imply
+ * the same code (a loader may restage a different binary there, and one image is staged from several
+ * addresses), so a content is reused only while the word-wise content hash of the staged bytes still matches,
+ * and the byte-serial fingerprint is taken only for a content the worker has not seen. The last four contents
+ * of an address are kept (LRU), so a loader that alternates buffers is fingerprinted once per buffer. This is
+ * the ONE place a job's staged bytes are hashed: body selection (spu.job_body), the kind-29 span and the
+ * capture's verdicts all take what this returns (StagedImage), none hashes again. Per thread, so no lock. */
+constexpr std::size_t kSeenAddresses = 256; /* per worker; past this the least recently used address is evicted */
+constexpr std::size_t kSeenContents = 4;    /* contents remembered per address */
+
 struct SeenImage {
-    std::uint64_t content;
-    std::uint32_t index;
+    bool valid = false;
+    bool has_index = false;    /* the trace index below is filled: only while tracing needs it */
+    std::uint32_t index = 0;
+    std::uint64_t content = 0;
+    std::uint64_t fingerprint = 0;
+    std::uint64_t used = 0;    /* LRU tick */
 };
-thread_local std::map<std::pair<std::uint32_t, std::uint32_t>, SeenImage> t_seen_images;
+struct SeenAddress {
+    std::array<SeenImage, kSeenContents> contents;
+    std::uint64_t tick = 0;  /* LRU tick of the contents */
+    std::uint64_t used = 0;  /* LRU tick of this address among the worker's */
+};
+thread_local std::unordered_map<std::uint64_t, SeenAddress> t_seen_images;
+thread_local std::uint64_t t_seen_tick = 0;
+
+/* A test seam (set_identify_fingerprint_override): the fingerprint a worker remembers for a content it has not
+ * seen, in place of the one it takes, so that a remembered fingerprint can be wrong the way a content-hash
+ * collision makes it wrong. 0: off. */
+std::atomic<std::uint64_t> g_identify_fp_override{0};
+
+/* What identify_counts reports. One cache line per shard so that workers do not bounce a counter between cores
+ * for a statistic: a worker uses the shard of its index. */
+constexpr unsigned kIdShards = 64;
+struct alignas(64) IdShard {
+    std::atomic<std::uint64_t> content_hashes{0}, fingerprints{0};
+};
+IdShard g_id_shards[kIdShards];
 
 /* Filled by the loader's start hook of a traced job; t0 == 0: the hook did not run. */
 struct ImageStamp {
@@ -1122,26 +1154,63 @@ struct ImageStamp {
     std::uint32_t index = 0;
 };
 
-/* The staged binary, as the loader left it in the job's local store. An index past the recorder's table is
- * reported as 0xFFFFFFFF (the table was full), not as a slot a J line could not name. */
-void identify_image(ImageStamp& st, const spu_context* ctx, const spu_job_layout* l)
+/* The staged binary, as the loader left it in the job's local store, identified once: its content hash, and
+ * its fingerprint from the worker's memory or, on a miss, from the bytes. `want_index` also gives the content
+ * its slot in the trace's image table. The caller has checked that [image_ls, +image_bytes) lies inside local
+ * store. */
+SeenImage& identify_staged(const spu_context* ctx, const spu_job_layout* l, unsigned worker, bool want_index,
+                           StagedImage& out)
 {
-    st.t0 = ps3_ft_now();
+    IdShard& shard = g_id_shards[worker % kIdShards];
     const std::uint8_t* bytes = ctx->ls + l->image_ls;
     const std::uint64_t content = spu_workload_content_hash(bytes, l->image_bytes);
-    const std::pair<std::uint32_t, std::uint32_t> key{l->image_ea, l->image_bytes};
-    auto it = t_seen_images.find(key);
-    if (it == t_seen_images.end()) {
-        it = t_seen_images
-                 .emplace(key, SeenImage{content, g_images.index_of(spu_workload_fingerprint(bytes, l->image_bytes),
-                                                                    l->image_ea, l->image_bytes)})
-                 .first;
-    } else if (it->second.content != content) {
-        it->second.content = content;
-        it->second.index = g_images.index_of(spu_workload_fingerprint(bytes, l->image_bytes), l->image_ea, l->image_bytes);
+    shard.content_hashes.fetch_add(1, std::memory_order_relaxed);
+
+    const std::uint64_t key = (static_cast<std::uint64_t>(l->image_ea) << 32) | l->image_bytes;
+    auto at = t_seen_images.find(key);
+    if (at == t_seen_images.end()) {
+        if (t_seen_images.size() >= kSeenAddresses) {
+            /* A loader that stages from many addresses keeps its recent ones: evict the least recently used. */
+            auto lru = t_seen_images.begin();
+            for (auto it = t_seen_images.begin(); it != t_seen_images.end(); ++it)
+                if (it->second.used < lru->second.used) lru = it;
+            t_seen_images.erase(lru);
+        }
+        at = t_seen_images.try_emplace(key).first;
     }
-    st.index = it->second.index < PS3_FT_JQ2_IMAGES ? it->second.index : UINT32_MAX;
-    st.t1 = ps3_ft_now();
+    SeenAddress& a = at->second;
+    a.used = ++t_seen_tick;
+
+    SeenImage* hit = nullptr;
+    SeenImage* victim = &a.contents[0];
+    for (SeenImage& c : a.contents) {
+        if (c.valid && c.content == content) {
+            hit = &c;
+            break;
+        }
+        if (!c.valid) victim = &c; /* an empty slot beats the least recently used */
+        else if (victim->valid && c.used < victim->used) victim = &c;
+    }
+    out.computed = hit == nullptr;
+    if (hit == nullptr) {
+        hit = victim;
+        *hit = SeenImage{};
+        hit->valid = true;
+        hit->content = content;
+        hit->fingerprint = spu_workload_fingerprint(bytes, l->image_bytes);
+        if (const std::uint64_t forced = g_identify_fp_override.load(std::memory_order_relaxed); forced != 0)
+            hit->fingerprint = forced;
+        shard.fingerprints.fetch_add(1, std::memory_order_relaxed);
+    }
+    hit->used = ++a.tick;
+    if (want_index && !hit->has_index) {
+        hit->index = g_images.index_of(hit->fingerprint, l->image_ea, l->image_bytes);
+        hit->has_index = true;
+    }
+    out.content = content;
+    out.fingerprint = hit->fingerprint;
+    out.stale = false;
+    return *hit;
 }
 
 void interpreter_entry(spu_context* ctx)
@@ -1151,13 +1220,119 @@ void interpreter_entry(spu_context* ctx)
     spu_interp_run(ctx, ctx->pc);
 }
 
+/* spu.job_body = lifted: the body is chosen from the staged bytes, which exist only after the loader has
+ * staged the job, and the loader is handed its entry BEFORE that. So the loader runs `chosen_entry`, a
+ * trampoline, and the start hook (the first thing that sees the staged bytes, and the only one that may still
+ * write the context) stores the choice here, on the worker's own thread, with the registration's image id in
+ * ctx->image_id: the interpreter rejoins lifted code only for image_id >= 0 (spu_interp.c). The choice cannot
+ * be made from the descriptor: its image EA does not identify the bytes. Costs one indirect call per job. */
+thread_local JobEntryFn t_chosen = nullptr;
+void chosen_entry(spu_context* ctx) { t_chosen(ctx); }
+
+/* spu.job_body, read once: the configuration is immutable after load. */
+bool job_body_lifted()
+{
+    static const bool lifted = std::strcmp(ps3_cfg_spu_job_body(), "lifted") == 0;
+    return lifted;
+}
+
+/* What the loader's start hook does about the job's image, for both loader paths: identify the staged bytes
+ * once, when something needs them (the trace span, the choice of body, the capture), stamp the trace span with
+ * that identification, choose the body, and hand the same identification to the capture. With none of the
+ * three on (spu.job_body = interp, no trace, no capture) it does nothing and the job pays nothing. */
+struct StartCtl {
+    ImageStamp* stamp; /* null while tracing is off */
+    CaptureJob cap;    /* entry and interpreted are replaced by the choice when `choose` */
+    bool choose;       /* spu.job_body = lifted and no forced body */
+    StagedImage img{};
+    SeenImage* seen = nullptr; /* this job's slot in the worker's memory; null until identified */
+
+    /* image_id is the registration's for a lifted body and -1 for the interpreter, which also undoes an
+     * earlier choice when repair() chooses again. */
+    void use(spu_context* ctx, JobEntryFn fn, int image_id)
+    {
+        t_chosen = fn;
+        cap.entry = fn;
+        cap.interpreted = fn == &interpreter_entry;
+        ctx->image_id = image_id;
+    }
+
+    /* The body for the fingerprint in `img`. Registered is enough to capture an image and replay it; only a
+     * promoted body runs here (docs/SPU_XDIFF.md section 12.4). The lookup is by the exact whole-blob
+     * fingerprint: a `.text` registration (ELF images) or a masked one (spu_workload_register_img_masked) is
+     * never selected and its job runs interpreted, which fails closed. */
+    void select(spu_context* ctx)
+    {
+        int image_id = -1;
+        const JobEntryFn lifted = spu_workload_find_img(img.fingerprint, &image_id);
+        if (lifted != nullptr && spu_workload_is_promoted(img.fingerprint)) use(ctx, lifted, image_id);
+        else use(ctx, &interpreter_entry, -1);
+    }
+
+    /* Before the observer and the capture: the job is staged and at its entry state. */
+    void identify(spu_context* ctx, const spu_job_layout* l)
+    {
+        if (stamp == nullptr && !choose && !capture_active()) return;
+        if (static_cast<std::uint64_t>(l->image_ls) + l->image_bytes > SPU_LS_SIZE) {
+            /* The loader validated the layout. A body cannot be chosen from bytes outside local store; the
+             * capture names the fault. */
+            if (choose) use(ctx, &interpreter_entry, -1);
+            return;
+        }
+        if (stamp != nullptr) stamp->t0 = ps3_ft_now();
+        seen = &identify_staged(ctx, l, cap.job->worker, stamp != nullptr, img);
+        if (stamp != nullptr) {
+            stamp->index = seen->index < PS3_FT_JQ2_IMAGES ? seen->index : UINT32_MAX;
+            stamp->t1 = ps3_ft_now();
+        }
+        if (choose) select(ctx);
+    }
+
+    /* The capture found the remembered fingerprint is not these bytes' (a content-hash collision, section 4):
+     * take the byte-serial fingerprint of the staged bytes now, replace the worker's memory with it, and choose
+     * the body again, all before the entry runs, so no job runs the body of another image. */
+    void repair(spu_context* ctx, const spu_job_layout* l)
+    {
+        g_id_shards[cap.job->worker % kIdShards].fingerprints.fetch_add(1, std::memory_order_relaxed);
+        seen->fingerprint = spu_workload_fingerprint(ctx->ls + l->image_ls, l->image_bytes);
+        seen->has_index = false;
+        if (stamp != nullptr) {
+            seen->index = g_images.index_of(seen->fingerprint, l->image_ea, l->image_bytes);
+            seen->has_index = true;
+            stamp->index = seen->index < PS3_FT_JQ2_IMAGES ? seen->index : UINT32_MAX;
+            stamp->t1 = ps3_ft_now();
+        }
+        img.fingerprint = seen->fingerprint;
+        img.computed = true;
+        img.stale = false;
+        if (choose) select(ctx);
+    }
+
+    /* After the observer, which may have installed itself on the context. */
+    void capture(spu_context* ctx, const spu_job_layout* l)
+    {
+        if (!capture_active()) return;
+        capture_job_start(cap, ctx, l, seen != nullptr ? &img : nullptr);
+        if (seen != nullptr && img.stale) repair(ctx, l);
+    }
+};
+
 void Queue::run_job(const JobStart& js, const std::optional<jq2_job_observer>& obs, const JobTrace& ft)
 {
     if (hooks_.on_admit != nullptr) hooks_.on_admit(hooks_.user, js);
 
+    /* A title's own select_body wins, for any job, and is not checked against the bytes (docs/SPU_XDIFF.md
+     * section 4). Otherwise spu.job_body decides: `interp` runs the interpreter; `lifted` runs `chosen_entry`
+     * and the start hook picks the body from the staged bytes (see t_chosen). */
     JobBody body;
     if (hooks_.select_body != nullptr) body = hooks_.select_body(hooks_.user, js);
-    if (body.entry == nullptr) body = interpreter_body();
+    const bool choose = body.entry == nullptr && job_body_lifted();
+    if (choose) {
+        body = JobBody{&chosen_entry, -1};
+        t_chosen = &interpreter_entry; /* what runs if the start hook does not choose */
+    } else if (body.entry == nullptr) {
+        body = interpreter_body();
+    }
 
     /* What the queue contributes to the PM's staging (spu_workload.h), from the
      * queue block as the PM reads it: maxDescriptor, the SPURS EA, the
@@ -1169,21 +1344,20 @@ void Queue::run_job(const JobStart& js, const std::optional<jq2_job_observer>& o
     t_job_hooks = &hooks_;
     int rc;
     ImageStamp stamp;
-    const CaptureJob cap{&js, number_, body.entry, body.entry == &interpreter_entry};
+    /* Under `choose` the start hook replaces the entry with the body it picked, before the capture sees it. */
+    const JobEntryFn cap_entry = choose ? &interpreter_entry : body.entry;
+    const CaptureJob cap{&js, number_, cap_entry, cap_entry == &interpreter_entry};
     if (!obs) {
         /* The loader runs the body and calls `end` with the finished context,
          * where the job's ending is classified (require_normal_return). The
          * capture tap (xdiff_capture.hpp) is off unless spu.xdiff_capture is set. */
-        struct Plain {
-            ImageStamp* stamp; /* null while tracing is off */
-            CaptureJob cap;
-        } p{ft.t0 != 0 ? &stamp : nullptr, cap};
+        StartCtl p{ft.t0 != 0 ? &stamp : nullptr, cap, choose};
         spu_job_hooks hooks{};
         hooks.user = &p;
         hooks.start = [](void* user, spu_context* ctx, const spu_job_layout* l) {
-            auto& pl = *static_cast<Plain*>(user);
-            if (pl.stamp != nullptr) identify_image(*pl.stamp, ctx, l);
-            capture_job_start(pl.cap, ctx, l);
+            auto& ctl = *static_cast<StartCtl*>(user);
+            ctl.identify(ctx, l);
+            ctl.capture(ctx, l);
         };
         hooks.end = [](void*, spu_context* ctx) {
             capture_job_end(ctx); /* before the policy: a job that stops the process still leaves its fixture */
@@ -1197,9 +1371,8 @@ void Queue::run_job(const JobStart& js, const std::optional<jq2_job_observer>& o
         struct Observed {
             const jq2_job_observer* obs;
             jq2_job_info info;
-            ImageStamp* stamp; /* null while tracing is off */
-            CaptureJob cap;
-        } o{&*obs, {}, ft.t0 != 0 ? &stamp : nullptr, cap};
+            StartCtl ctl;
+        } o{&*obs, {}, StartCtl{ft.t0 != 0 ? &stamp : nullptr, cap, choose}};
         o.info.queue = js.queue_ea;
         o.info.port = js.port_ea;
         o.info.descriptor_ea = js.descriptor_ea;
@@ -1213,7 +1386,7 @@ void Queue::run_job(const JobStart& js, const std::optional<jq2_job_observer>& o
         hooks.user = &o;
         hooks.start = [](void* user, spu_context* ctx, const spu_job_layout* l) {
             auto& ob = *static_cast<Observed*>(user);
-            if (ob.stamp != nullptr) identify_image(*ob.stamp, ctx, l);
+            ob.ctl.identify(ctx, l);
             jq2_job_info& i = ob.info;
             i.image_ea = l->image_ea;
             i.image_ls = l->image_ls;
@@ -1231,7 +1404,7 @@ void Queue::run_job(const JobStart& js, const std::optional<jq2_job_observer>& o
             i.r1 = l->r1;
             i.ctx_ls = l->ctx_ls;
             if (ob.obs->job_start != nullptr) ob.obs->job_start(ob.obs->user, ctx, &i);
-            capture_job_start(ob.cap, ctx, l);
+            ob.ctl.capture(ctx, l);
         };
         hooks.end = [](void* user, spu_context* ctx) {
             capture_job_end(ctx); /* before the policy: a job that stops the process still leaves its fixture */
@@ -1593,6 +1766,21 @@ void set_executor_hooks(const ExecutorHooks& hooks)
 }
 
 JobBody interpreter_body() noexcept { return {&interpreter_entry, -1}; }
+
+IdentifyCounts identify_counts() noexcept
+{
+    IdentifyCounts c;
+    for (const IdShard& s : g_id_shards) {
+        c.content_hashes += s.content_hashes.load(std::memory_order_relaxed);
+        c.fingerprints += s.fingerprints.load(std::memory_order_relaxed);
+    }
+    return c;
+}
+
+void set_identify_fingerprint_override(std::uint64_t fingerprint) noexcept
+{
+    g_identify_fp_override.store(fingerprint, std::memory_order_relaxed);
+}
 
 bool set_intake_paused(std::uint32_t queue_ea, bool paused)
 {

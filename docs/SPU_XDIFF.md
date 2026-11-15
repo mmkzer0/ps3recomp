@@ -126,14 +126,14 @@ a tweak has no rule and yields `malformed` / `not-comparable`.
   not checked against the staged bytes.
 - **Finding the fingerprint is cheap; a cache hit is a claim, not a proof.**
   Hashing the staged bytes byte by byte costs about a millisecond for a large
-  image, so three places remember a result by address and size and reuse it
+  image, so two places remember a result by address and size and reuse it
   while a word-wise content hash of the bytes still matches: the dispatcher
-  (eight slots, `spu_workload.c:347-380`); for traces, the per-worker table
-  of `identify_image` (`executor.cpp:1119-1137`), which runs only while a
-  trace is recorded (`:1170-1173`, `:1198`); and, while fixtures are
-  captured, a per-worker cache of the last four contents at each address
-  (`xdiff_capture.cpp`, `seen_content`), so a loader that alternates buffers
-  is fingerprinted once per buffer. The content hash is a change
+  (eight slots, `spu_workload.c:347-380`) and the JobQueue2 worker's
+  `identify_staged` (`executor.cpp`), which keeps the last four contents of
+  each of up to 256 addresses and hashes a job's staged bytes once for
+  everything that needs the image: body selection under
+  `spu.job_body=lifted`, the kind-29 trace record and capture. Under
+  `interp` with neither trace nor capture it does not run. The content hash is a change
   detector, never an identity (`spu_workload.h:42-45`, `spu_workload.c:332-346`):
   it is 64 bits of a non-cryptographic fold. A hit says the bytes are
   probably the ones the fingerprint was taken from; it does not say they are.
@@ -153,9 +153,8 @@ a tweak has no rule and yields `malformed` / `not-comparable`.
     excludes a structured collision. Whether a byte-serial check on every hit
     that selects a registered body is affordable is a measurement (section
     18); if it is, the rule becomes "every such hit verifies".
-  The cost of the identification itself is already in every trace as the
-  span of kind 29 (`executor.cpp:1237`, `ps3_ftrace.h:154-157`), so "measure
-  first" is a report over an existing trace (section 18).
+  The cost of the identification itself is in every trace as the span of
+  kind 29 (`ps3_ftrace.h:154-157`), and section 18 reports it.
 - **A fixture also names who recorded it and what ran.** `spu_xdiff_identity`
   (section 7.3) carries the effect-port ABI, the context census, the host and
   the toolkit commit; `spu_xdiff_body_id` carries a body's tier and, for a
@@ -1229,15 +1228,26 @@ Neither is acceptable as a surprise. A context counts its resolver misses
 (`lift_miss`, commit 4), and a shadow ends on the first one with `void` /
 `unlifted-branch`.
 
-The toolkit keeps no promotion state: registering a body is the port's
-statement that it is promoted. The evidence a port should hold before it
-sets `spu.job_body=lifted` for an image:
+Registration and promotion are separate. Every lifted image is registered,
+with its inventory, so that capture can record it and the offline runner can
+replay its lift (`--tier registered`). Promotion is one more call in the
+generated registry, `spu_workload_promote_img`, emitted for an image whose
+raw manifest entry says `promoted: true`; under `spu.job_body=lifted` only a
+promoted image runs its lifted body, and every other job is interpreted. The
+toolkit keeps no evidence: the manifest entry is the port's statement, and
+the evidence it should hold before it writes it is
 
 1. sessions with `job_body=interp, xdiff=all` in which every job of the
    image was sampled, with no `differ`, no `void`, no drop;
 2. the corpus captured in those sessions replays `equal` offline against the
    production object;
 3. afterwards `job_body=lifted, xdiff=sample` stays on in development builds.
+
+Until commit 10b samples in a run, the first two collapse into one: a corpus
+captured with `spu.xdiff_capture` that replays `equal` at `--tier registered`,
+with no `void`. The first title image promoted that way also runs under
+`job_body=lifted` in a bounded session whose guest-visible checks (the
+title's event gate) agree with an interpreted session.
 
 ## 13. Offline replay, synthetic worlds, corpora
 

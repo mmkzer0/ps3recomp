@@ -668,8 +668,10 @@ the lock through `spu_run_spurs_job_snapshot`, which reads the header, the DMA
 and cache lists and the user words from that copy and never from guest memory
 again: an overwrite after admission does not reach the job, one before it does,
 exactly as on the PM. The job body is `interpreter_body()` (the SPU interpreter
-from LS 0); `ExecutorHooks::select_body` is the plug for lifted bodies once the
-job-image registry exists. A job counts as returned only when it executes the
+from LS 0), or, under `spu.job_body = lifted` (`docs/CONFIG.md`), the body
+registered with `spu_workload_register_img` for the fingerprint of the bytes the
+loader staged (below); `ExecutorHooks::select_body` forces a body for a test.
+A job counts as returned only when it executes the
 `stop 0` at the link address the loader plants (`0x3FF00`); any other stop, a
 halt, or a loader refusal is the named stop `jq2-job-end` and credits nothing.
 How a body ended is one shared classification (`spu_job_classify_end`,
@@ -677,6 +679,47 @@ How a body ended is one shared classification (`spu_job_classify_end`,
 `jm-call` or `other`, the end classes of `docs/SPU_XDIFF.md` section 7.6.
 `ExecutorHooks::on_end` receives it with the finished context for every end,
 before the policy above stops the process for all but `return`.
+
+**Which body runs (`spu.job_body`).** `interp` (the default) runs the
+interpreter and never a registered body. `lifted` runs a registered body only
+for a **promoted** image (`spu_workload_promote_img`; the generated registration
+emits it for an image whose pipeline program record says `promoted: true`):
+registration alone lets the capture and the offline runner use an image, and
+promotion says a corpus proved it, so a registered but unpromoted image runs
+interpreted. It picks the body after staging,
+from the staged bytes (`docs/SPU_XDIFF.md` section 4): the descriptor's image EA
+does not identify an image, since one EA holds different binaries over time and
+one binary is staged from several EAs, so different bytes at the same EA and
+size run interpreted, and the same bytes at another EA run the registered body
+(when promoted).
+The loader is handed its entry before the bytes exist, so under `lifted` it runs
+a trampoline (`chosen_entry`) and the loader's start hook, the first place that
+sees the staged local store and the only one that may still write the context,
+stores the choice for the trampoline (a worker's own thread-local) and writes the
+registration's image id to `ctx->image_id`: the interpreter rejoins lifted code
+only for `image_id >= 0` (`spu_interp.c`). A body forced by `select_body` wins,
+skips the identification and is not checked against the bytes. The capture
+(`docs/SPU_XDIFF.md` commit 10a) is handed the entry the hook chose, so its T1
+rule (`spu_workload_find_img(fingerprint) == entry`) judges the body that runs.
+
+The identification is done once per job and shared. A worker hashes the staged
+bytes once (the word-wise content hash) and remembers the fingerprint by
+(EA, size, content hash), four contents per EA (`StagedImage`, `executor.cpp`);
+the byte-serial fingerprint is taken only for contents it has not seen. The
+body choice, the kind-29 `IMAGE` span (which keeps measuring exactly this work)
+and the capture all take that one result; none hashes the bytes again, and with
+`interp` and neither trace nor capture on, nothing is identified. A hit is a
+claim, not a proof; an unsampled job that runs a registered body trusts it
+(section 4). When the capture's own byte-serial fingerprint of the staged bytes
+disagrees with the remembered one (a content-hash collision), the executor
+takes the fingerprint of the staged bytes, replaces the worker's memory with it
+and chooses the body again before the entry runs, so no job runs another
+image's body; the capture drops that job and counts the collision. A worker
+keeps 256 addresses and evicts the least recently used. A `.text` or masked
+registration is never selected (the lookup is by the exact whole-blob
+fingerprint) and its job runs interpreted, which fails closed.
+`identify_counts()` reports the hashes and fingerprints taken, for
+tests.
 
 **Completion.** After the run: pool slot back (COPY), then `credit_completion()`
 on the port line, and the `Wakeup` it returns is performed: kind 2 with an id
@@ -922,3 +965,28 @@ channel layer and LV2 event flags; labels `spurs;t0;tsan`:
   `spu-job-memory` (region `stack`, `p`, `limit = D0`).
 - `stop-jm`, `stop-jm-lifted`, `stop-unmodelled`: `jq2-jm-call` (interpreted and
   lifted) with the request word; `jobtype-bit1`, `binary-bit1`, `cache-count`.
+- `select-promoted`, `select-promoted-interp`: two registered images, one
+  promoted. Under `lifted` only the promoted image runs its body and the other
+  runs interpreted; under `interp` neither runs; promoting a fingerprint nothing
+  is registered under is the named line `promote-unregistered` and promotes
+  nothing.
+- `select-lifted`, `select-other-bytes`, `select-interp`, `select-forced`,
+  `select-observer`, `select-concurrent`, `xdiff-select-lifted`,
+  `xdiff-select-trace` (`spu.job_body`): registered bodies mark the jobs they
+  run. `lifted` runs the registered body under the registration's image id and
+  leaves the arena a run with `interp` leaves; other bytes at the same EA and
+  size run interpreted while restored bytes, and the same bytes at another EA,
+  run the body; `interp` runs no registered body and identifies nothing; a
+  forced body wins; the observed loader path chooses too; two workers on two
+  images, each job on its own image's body; with capture the fixtures name tier
+  lifted with the registration's `code_end` and options hash; with capture and
+  kind-29 tracing on as well, still one content hash a job and one fingerprint
+  per content (`identify_counts()`).
+- `select-concurrent-hook`, `xdiff-select-collision`: a gate in the observer's
+  `job_start` holds two workers between the choice and the entry, and each job
+  still runs its own image's body (the choice is thread-local); a remembered
+  fingerprint that is another image's (`set_identify_fingerprint_override`) is
+  found by the capture and repaired, the job runs the right body, and the next
+  jobs take no fingerprint. The select modes also check the image id each job's
+  context ended with: the registration's for a chosen body, -1 for an
+  interpreted job.

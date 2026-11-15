@@ -118,6 +118,22 @@ PS3_CFG_BOOL(spu, mfc_lookup_cache, 1,
     "reference path, every lookup under the lock. Timing only: both paths hand a "
     "context the same engine. Read once, at the first MFC access.")
 
+PS3_CFG_STR(spu, job_body, "interp", 6, PS3_CFG_V_JOB_BODY,
+    "Which body runs a JobQueue2 job (docs/SPU_XDIFF.md sections 3, 4 and 11): \"interp\" (the default) "
+    "always the SPU interpreter, so a lifted body registered with spu_workload_register_img never runs "
+    "here; \"lifted\" the body registered for the job's image when there is one AND the image is "
+    "promoted (spu_workload_promote_img: registration alone is enough to capture an image and to replay "
+    "it offline, promotion says a corpus proved the body), the interpreter for any other job. The "
+    "image is identified by the bytes the loader staged, after staging (FNV-1a-64 of "
+    "the sizeBinary << 4 bytes, remembered per worker by address, size and a word-wise content hash), "
+    "never by the descriptor's address: a different binary staged at the same address and size runs "
+    "interpreted. A hit of that memory is a claim, not a proof (section 4). A title's own "
+    "ExecutorHooks::select_body, when it returns a body, still wins and is not checked against the "
+    "bytes. Identification costs one content hash a job, and its byte-serial fingerprint when the "
+    "worker has not seen those bytes; \"interp\" pays it only while tracing (kind 29) or fixture "
+    "capture is on. A lifted body is a different implementation of the same program, not a "
+    "guarantee: run xdiff on a corpus before relying on it. Read once, at the first job.")
+
 PS3_CFG_STR(spu, xdiff_dir, "", 1023, PS3_CFG_V_NONE,
     "The directory SPU job fixtures (docs/SPU_XDIFF.md, ps3recomp.spujob/1) are written into, "
     "one file per job, named <image fingerprint>-q<queue>-s<seq>.spujob. Empty (the default) "
