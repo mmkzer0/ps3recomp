@@ -47,6 +47,8 @@
 #include "../syscalls/lv2_enosys_bitmap.h" /* generated: FW 4.93 stock lv2_kernel ENOSYS slots */
 #include "../memory/vm.h"   /* vm_commit -- sys_mmapper_search_and_map maps for real */
 #include "../memory/label_window.h"   /* the store window, shared with the SPU MFC path */
+#include "../memory/resv_mark.h"      /* resv_marked_spu_inl: the SPU reservation mark, read inline by the stores */
+#include "ppu_store_diag.h"           /* which guest-store write watches are armed */
 #include "../platform/win32_compat.h"      /* Win32 types, interlocked ops, Sleep/QPC on POSIX */
 #include "../platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
 #include "../platform/ps3_stdio.h"        /* ps3_stdio_init -- buffered stdout/stderr, timed flush */
@@ -873,10 +875,9 @@ extern "C" void ppu_log_host_chain(const char* tag);  /* fwd decl (defined below
  * to serialize through the SPU lock-line lock, or it can land inside a PUTLLC's
  * compare and be written straight back over; and it has to raise SPU_EVENT_LR,
  * which is how an SPURS idle service parked in `rdch SPU_RdEventStat` finds out
- * work was posted. spu_coh_is_reserved answers from the reservation model
- * (runtime/memory/reservation.h), the one authority for SPU-reserved lines;
+ * work was posted. The mark is read inline (resv_marked_spu_inl,
+ * runtime/memory/resv_mark.h), the one authority for SPU-reserved lines;
  * the merge's second bitmap was dropped with the inline store path (#57). */
-extern "C" int  spu_coh_is_reserved(uint32_t addr);
 extern "C" void spu_lockline_lock(void);
 extern "C" void spu_lockline_unlock(void);
 extern "C" void spu_coh_notify_write(uint32_t addr);
@@ -1450,7 +1451,7 @@ extern "C" void resv_keep_own(ppu_context* ctx, uint32_t ea);
  * into the line it reserved does not cost it the reservation. */
 #define VM_WRITE_COH(a, src, n)                                               \
     do {                                                                      \
-        if (spu_coh_is_reserved((uint32_t)(a))) {                             \
+        if (resv_marked_spu_inl((uint32_t)(a))) {                             \
             spu_lockline_lock();                                              \
             memcpy(vm_base + (uint32_t)(a), (src), (n));                      \
             spu_coh_notify_write((uint32_t)(a));                              \
@@ -1602,6 +1603,10 @@ static struct VmInlineInit {
         int sd = 0;
         for (int i = 0; svars[i]; i++) if (getenv(svars[i])) sd = 1;
         vm_inline_st_ok = !sd;
+        /* The out-of-line store family reads its watch environment lazily, on the
+         * first guest store it sees (ppu_store_diag_resolve); until then it is
+         * not known to be disarmed. */
+        ppu_store_diag_arm(PPU_STORE_DIAG_UNREAD);
     }
 } s_vm_inline_init;
 
@@ -1824,6 +1829,33 @@ static void ww_arm_inline_window(uint32_t ww)
 /* -1 until read; 0 when neither PPU_WVAL nor PPU_WWATCH is set, which with no
  * sync-line probe armed leaves every guest store one load and one compare. */
 static int s_store_watch = -1;
+static int store_watch_read(void)
+{
+    if (s_store_watch < 0) s_store_watch = getenv("PPU_WVAL") || getenv("PPU_WWATCH") ? 1 : 0;
+    return s_store_watch;
+}
+
+extern "C" uint32_t ppu_store_diag = 0;
+
+/* Which of the write watches can fire, as bits in ppu_store_diag (ppu_store_diag.h), so the store
+ * family below pays one load and one branch while none can. The watches are PPU_WVAL, PPU_WWATCH
+ * and, on Windows, the PT detector; the sync-line probe (g_barrier_sync_watch) is written by other
+ * threads and by a title's lifted code, so it is not a bit and store_diag_armed reads it too.
+ * The environment is read once, by the first guest store that finds the UNREAD bit, exactly when
+ * the watches used to read it; the bits are set before UNREAD is cleared, so the word never reads
+ * zero while a watch is armed. */
+static __attribute__((noinline)) void ppu_store_diag_resolve(void)
+{
+    if (store_watch_read()) ppu_store_diag_arm(PPU_STORE_DIAG_WATCH);
+#ifdef _WIN32
+    if (getenv("PT")) ppu_store_diag_arm(PPU_STORE_DIAG_PT);
+#endif
+    ppu_store_diag_disarm(PPU_STORE_DIAG_UNREAD);
+}
+static inline int store_diag_armed(void)
+{
+    return __builtin_expect((ppu_store_diag_load() | g_barrier_sync_watch) != 0, 0);
+}
 static __attribute__((noinline)) void barrier_watch_hit_slow(uint32_t a, uint32_t v, int width, void* ra);
 static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra)
 {
@@ -1832,7 +1864,7 @@ static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra
 }
 static __attribute__((noinline)) void barrier_watch_hit_slow(uint32_t a, uint32_t v, int width, void* ra)
 {
-    if (s_store_watch < 0) s_store_watch = getenv("PPU_WVAL") || getenv("PPU_WWATCH") ? 1 : 0;
+    store_watch_read();
     /* PPU_WVAL=<hexvalue>: log every PPU store that WRITES this value, wherever
      * it lands. PPU_WWATCH answers "who writes this address"; when a bad value is
      * copied from node to node down a list, that only ever catches the copy.
@@ -2071,7 +2103,50 @@ extern "C" int ppu_stdcx64(ppu_context* ctx, uint64_t ea, uint64_t val)
     }
     return ok;
 }
-void vm_write8 (uint64_t a, uint8_t  v) { barrier_watch_hit((uint32_t)a, v, 1, __builtin_return_address(0)); if (vm_oob((uint32_t)a,1) || vm_null_store((uint32_t)a, v, 1, __builtin_return_address(0))) return;
+/* The guest store family, vm_write8/16/32/64: what lifted code calls for every store.
+ *
+ * Each has two bodies. The `_full` body is the whole sequence the family always ran, in this order:
+ * the write watches, the bounds check, the null page, the store window's hook, the bytes (under the
+ * lock-line lock, reported to the model, on a line an SPU has reserved), and the raw SPU register
+ * side effect. A stop in the hook is before the store.
+ *
+ * The public function is a leaf that handles only the store that needs none of that: it asks, with
+ * loads and compares that have no side effect, whether any step would do something (a watch is
+ * armed, the address is out of bounds, in the null page or in the sweep a null-page drop contains,
+ * the window's hook may overlap it, an SPU has reserved the line, a raw SPU register is the target),
+ * and if so tail-calls `_full`, which then runs from the top and decides for itself; otherwise it
+ * stores the bytes. So a store that takes the short path is one whose every skipped step is a no-op,
+ * and every other store runs the unchanged sequence. No call on the short path means no frame: a
+ * guest store is a handful of instructions.
+ *
+ * The window's hook is not behind the watch flag: the RSX label window is registered by every title
+ * that drives GCM, so the flag would be set for all of them; the overlap test is inline instead
+ * (ps3_label_window_maybe: one acquire load, one compare). */
+static inline int vm_oob_possible(uint32_t a, uint32_t n)
+{
+    return ppu_vm_size != 0 && (uint64_t)a + n > ppu_vm_size;
+}
+static inline int store_needs_full_path(uint32_t a, uint32_t n)
+{
+    return store_diag_armed() || vm_oob_possible(a, n) || a < 0x1000u || g_null_sweep_hi != 0 ||
+           ps3_label_window_maybe(a, n);
+}
+/* The leaf reads the SPU reservation mark LAST: the value is already big-endian and the destination
+ * computed, so nothing but the store follows the load (marked: tail-call `_full`, which locks and
+ * reports; unmarked: store). The empty asm only pins that order in the generated code (value and
+ * destination are ready before the load); it emits no instruction. A GETLLAR that marks the line between the mark load and the store still lets an
+ * unlocked store land without a notify: that window is the one the old VM_WRITE_COH had (check, then
+ * plain store) and is not widened here; closing it needs a GETLLAR-side protocol (fork issue #142,
+ * PPU store vs GETLLAR mark window). */
+#define STORE_MARK_LAST_FENCE(raw, dst) __asm__ __volatile__("" : "+r"(raw), "+r"(dst) : : "memory")
+static inline void store_diag_enter(void)
+{
+    if (__builtin_expect(ppu_store_diag_load() & PPU_STORE_DIAG_UNREAD, 0)) ppu_store_diag_resolve();
+}
+static __attribute__((noinline)) void vm_write8_full(uint64_t a, uint8_t v, void* ra)
+{
+    store_diag_enter();
+    barrier_watch_hit((uint32_t)a, v, 1, ra); if (vm_oob((uint32_t)a,1) || vm_null_store((uint32_t)a, v, 1, ra)) return;
     ppu_store_hook((uint32_t)a, 1, v);
 #ifdef _WIN32
     /* PT detector: does this byte-write turn its word into the hunted truncated value? */
@@ -2081,11 +2156,19 @@ void vm_write8 (uint64_t a, uint8_t  v) { barrier_watch_hit((uint32_t)a, v, 1, _
         if(nw==(uint32_t)g_pt_val && cur!=(uint32_t)g_pt_val) pt_record(wa);
         else if(((uint32_t)a&3)==0 && v!=0) pt_restore(wa); /* MSB byte set non-zero = restored */ } }
 #endif
-    VM_WRITE_COH(a, &v, 1); }
-void vm_write16(uint64_t a, uint16_t v) { barrier_watch_hit((uint32_t)a, v, 2, __builtin_return_address(0)); if (vm_oob((uint32_t)a,2) || vm_null_store((uint32_t)a, v, 2, __builtin_return_address(0))) return;
+    VM_WRITE_COH(a, &v, 1);
+}
+static __attribute__((noinline)) void vm_write16_full(uint64_t a, uint16_t v, void* ra)
+{
+    store_diag_enter();
+    barrier_watch_hit((uint32_t)a, v, 2, ra); if (vm_oob((uint32_t)a,2) || vm_null_store((uint32_t)a, v, 2, ra)) return;
     ppu_store_hook((uint32_t)a, 2, v);
-    v = __builtin_bswap16(v); VM_WRITE_COH(a, &v, 2); }
-void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, __builtin_return_address(0)); if (vm_oob((uint32_t)a,4) || vm_null_store((uint32_t)a, v, 4, __builtin_return_address(0))) return;
+    v = __builtin_bswap16(v); VM_WRITE_COH(a, &v, 2);
+}
+static __attribute__((noinline)) void vm_write32_full(uint64_t a, uint32_t v, void* ra)
+{
+    store_diag_enter();
+    barrier_watch_hit((uint32_t)a, v, 4, ra); if (vm_oob((uint32_t)a,4) || vm_null_store((uint32_t)a, v, 4, ra)) return;
     ppu_store_hook((uint32_t)a, 4, v);
 #ifdef _WIN32
     /* PT restore: a full-word store of a valid pointer (high byte set) to a
@@ -2097,18 +2180,66 @@ void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, _
       /* Raw SPU problem state: run control, mailboxes and signal notification
        * have side effects. The plain store above still happens -- the registers
        * are guest memory and the PPU reads most of them straight back. */
-      if (spu_raw_is_reg((uint32_t)a)) spu_raw_reg_store((uint32_t)a, _v, 4); } }
-void vm_write64(uint64_t a, uint64_t v) {
+      if (spu_raw_is_reg((uint32_t)a)) spu_raw_reg_store((uint32_t)a, _v, 4); }
+}
+static __attribute__((noinline)) void vm_write64_full(uint64_t a, uint64_t v, void* ra)
+{
+    store_diag_enter();
     /* PPU_WWATCH covers the 64-bit store too. It did not, which made the watch
      * blind to exactly the code that matters most for it: every bignum and
      * every 64-bit struct field is written with std, so a watch on one would
      * report nothing and read as "nobody writes this". Two halves so an
      * 8-byte store still shows up when only its low or high word is watched. */
-    barrier_watch_hit((uint32_t)a,     (uint32_t)(v >> 32), 4, __builtin_return_address(0));
-    barrier_watch_hit((uint32_t)a + 4, (uint32_t)v,         4, __builtin_return_address(0));
-    if (vm_oob((uint32_t)a,8) || vm_null_store((uint32_t)a, (uint32_t)(v >> 32), 8, __builtin_return_address(0))) return;
+    barrier_watch_hit((uint32_t)a,     (uint32_t)(v >> 32), 4, ra);
+    barrier_watch_hit((uint32_t)a + 4, (uint32_t)v,         4, ra);
+    if (vm_oob((uint32_t)a,8) || vm_null_store((uint32_t)a, (uint32_t)(v >> 32), 8, ra)) return;
     ppu_store_hook((uint32_t)a, 8, (uint32_t)v);
-    v = __builtin_bswap64(v); VM_WRITE_COH(a, &v, 8); }
+    v = __builtin_bswap64(v); VM_WRITE_COH(a, &v, 8);
+}
+void vm_write8 (uint64_t a, uint8_t  v)
+{
+    if (__builtin_expect(store_needs_full_path((uint32_t)a, 1), 0)) {
+        vm_write8_full(a, v, __builtin_return_address(0)); return; }
+    uint8_t raw = v;
+    uint8_t* dst = vm_base + (uint32_t)a;
+    STORE_MARK_LAST_FENCE(raw, dst);
+    if (__builtin_expect(resv_marked_spu_inl((uint32_t)a), 0)) {
+        vm_write8_full(a, v, __builtin_return_address(0)); return; }
+    memcpy(dst, &raw, 1);
+}
+void vm_write16(uint64_t a, uint16_t v)
+{
+    if (__builtin_expect(store_needs_full_path((uint32_t)a, 2), 0)) {
+        vm_write16_full(a, v, __builtin_return_address(0)); return; }
+    uint16_t raw = __builtin_bswap16(v);
+    uint8_t* dst = vm_base + (uint32_t)a;
+    STORE_MARK_LAST_FENCE(raw, dst);
+    if (__builtin_expect(resv_marked_spu_inl((uint32_t)a), 0)) {
+        vm_write16_full(a, v, __builtin_return_address(0)); return; }
+    memcpy(dst, &raw, 2);
+}
+void vm_write32(uint64_t a, uint32_t v)
+{
+    if (__builtin_expect(store_needs_full_path((uint32_t)a, 4) || spu_raw_is_reg((uint32_t)a), 0)) {
+        vm_write32_full(a, v, __builtin_return_address(0)); return; }
+    uint32_t raw = __builtin_bswap32(v);
+    uint8_t* dst = vm_base + (uint32_t)a;
+    STORE_MARK_LAST_FENCE(raw, dst);
+    if (__builtin_expect(resv_marked_spu_inl((uint32_t)a), 0)) {
+        vm_write32_full(a, v, __builtin_return_address(0)); return; }
+    memcpy(dst, &raw, 4);
+}
+void vm_write64(uint64_t a, uint64_t v)
+{
+    if (__builtin_expect(store_needs_full_path((uint32_t)a, 8), 0)) {
+        vm_write64_full(a, v, __builtin_return_address(0)); return; }
+    uint64_t raw = __builtin_bswap64(v);
+    uint8_t* dst = vm_base + (uint32_t)a;
+    STORE_MARK_LAST_FENCE(raw, dst);
+    if (__builtin_expect(resv_marked_spu_inl((uint32_t)a), 0)) {
+        vm_write64_full(a, v, __builtin_return_address(0)); return; }
+    memcpy(dst, &raw, 8);
+}
 }
 
 /* ---- malloc allocation tracker (PS3_ALLOCTAG) -------------------------------

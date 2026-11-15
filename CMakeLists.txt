@@ -1723,10 +1723,15 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME ppu_store_hook
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_store_hook.py")
+        # The guest store family's short path (no store diagnostic armed) against the full one, and
+        # every diagnostic that can arm itself still seeing a store.
+        add_test(NAME ppu_store_path
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_store_path.py")
         add_test(NAME gcm_label_store
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_gcm_label_store.py")
-        set_tests_properties(ppu_store_hook gcm_label_store
+        set_tests_properties(ppu_store_hook ppu_store_path gcm_label_store
             PROPERTIES LABELS "ppu;t0" TIMEOUT 300)
         add_test(NAME ppu_lift_conformance
             COMMAND "${Python3_EXECUTABLE}"
@@ -2333,6 +2338,17 @@ if(UNIX)
     )
     add_test(NAME test_rsx_texture_epoch COMMAND test_rsx_texture_epoch)
     set_tests_properties(test_rsx_texture_epoch PROPERTIES LABELS "gcm;t0" TIMEOUT 120)
+
+    # The full texture change hash (rsx_texhash.h): a changed byte anywhere changes it. Header only,
+    # no engine. The old-against-new throughput bench is tests/bench/video/bench_texhash.c.
+    add_executable(test_rsx_texhash libs/video/tests/test_rsx_texhash.c)
+    target_include_directories(test_rsx_texhash PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
+    add_test(NAME test_rsx_texhash COMMAND test_rsx_texhash)
+    set_tests_properties(test_rsx_texhash PROPERTIES LABELS "gcm;t0" TIMEOUT 120)
+    # Old-against-new throughput; timing only, so no test, and not part of `all`:
+    # cmake --build <dir> --target bench_texhash && <dir>/bench_texhash
+    add_executable(bench_texhash EXCLUDE_FROM_ALL tests/bench/video/bench_texhash.c)
+    target_include_directories(bench_texhash PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
 
     # Which presents a frame dump writes and what it calls the file (PS3RECOMP_VK_DUMP_LIST / _RANGE).
     # Pure parsing and naming, so no GPU and no backend: the Vulkan backend links the same source.

@@ -16,6 +16,7 @@
 #include "rsx_primitives.h"
 #include "rsx_restart_cuts.h"
 #include "rsx_tiling.h"
+#include "rsx_texhash.h"
 #include "rsx_vertex_formats.h"
 #include "rsx_vp_decompiler.h"
 
@@ -1617,9 +1618,10 @@ static inline void eng_tex_epoch_advance(void)
     atomic_fetch_add_explicit(&s_tex_epoch, 1u, memory_order_relaxed);
 }
 
-/* One hash per cached texture per presented frame. Word-at-a-time FNV over
- * the whole span is deliberately cheap: this is a mutation detector, not a
- * content id (rsx_live_draw.c:2002-2026). */
+/* One hash per cached texture per presented frame: rsx_texhash.h (eight independent
+ * accumulators; the old single FNV chain ran at the multiply's latency and was a third of the
+ * FIFO walker's time). A mutation detector, not a content id (rsx_live_draw.c:2002-2026); the value
+ * is only compared with the same texture's previous one in this process. */
 static u64 eng_texture_content_hash(u32 location, u32 offset, u32 span,
                                     int* readable)
 {
@@ -1627,17 +1629,8 @@ static u64 eng_texture_content_hash(u32 location, u32 offset, u32 span,
     if (rsx_tiling_active()) rsx_tiling_footprint(location, offset, span, &offset, &span);
     const u8* src = span ? eng_guest_ptr_raw(NULL, location, offset, span) : NULL;
     if (!src) { *readable = 0; return 0; }
-    u64 hash = 1469598103934665603ull;
-    u32 i = 0;
-    for (; i + 8 <= span; i += 8) {
-        u64 word;
-        memcpy(&word, src + i, sizeof(word));
-        hash ^= word;
-        hash *= 1099511628211ull;
-    }
-    for (; i < span; i++) { hash ^= src[i]; hash *= 1099511628211ull; }
     *readable = 1;
-    return hash;
+    return rsx_texhash(src, span);
 }
 
 /* The cheap per-frame change check: 64 bytes out of every 2 KB, plus the
