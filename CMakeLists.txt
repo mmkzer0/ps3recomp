@@ -1396,6 +1396,41 @@ if(PS3RECOMP_BUILD_TESTS)
             target_link_libraries(test_spu_effect_port PRIVATE m Threads::Threads)
             add_test(NAME spu_effect_port COMMAND test_spu_effect_port)
             set_tests_properties(spu_effect_port PROPERTIES LABELS "spu;t0" TIMEOUT 120)
+            # xdiff (docs/SPU_XDIFF.md): the same synthetic job recorded into a
+            # fixture in both tiers (row 7).
+            set(SPU_XDIFF_RUNTIME_SOURCES
+                "${XDIFF_PORT_DIR}/lift/spu_recomp.c"
+                runtime/spu/spu_workload.c
+                runtime/spu/spurs_policy.c
+                runtime/spu/spurs_job.c
+                runtime/spu/spu_tsp_weak.c
+                runtime/spu/spurs_policy_blob_weak.c
+                runtime/spu/spu_channels.c
+                runtime/spu/spu_interp.c
+                runtime/spu/spu_coherency.c
+                runtime/spu/spu_lockstep.c
+                runtime/spu/spu_drain.c
+                runtime/spu/spu_vm_pagemap.c
+                runtime/memory/reservation.c
+                runtime/memory/label_window.c
+                runtime/platform/win32_compat.c
+                runtime/platform/host_clock.c
+                runtime/platform/host_wait.c
+                runtime/diag/lifter_abi.c
+                runtime/config/config.cpp
+                runtime/diag/stop.cpp)
+            set(SPU_XDIFF_SOURCES
+                runtime/spu/xdiff/spu_xdiff_fixture.c
+                runtime/spu/xdiff/spu_xdiff_census.c
+                runtime/spu/xdiff/spu_xdiff_recorder.c)
+            add_executable(test_spu_xdiff_record
+                runtime/spu/tests/test_spu_xdiff_record.c
+                ${SPU_XDIFF_SOURCES} ${SPU_XDIFF_RUNTIME_SOURCES})
+            target_include_directories(test_spu_xdiff_record PRIVATE
+                include runtime runtime/spu runtime/platform "${XDIFF_PORT_DIR}")
+            target_link_libraries(test_spu_xdiff_record PRIVATE m Threads::Threads)
+            add_test(NAME spu_xdiff_record COMMAND test_spu_xdiff_record)
+            set_tests_properties(spu_xdiff_record PROPERTIES LABELS "spu;t0" TIMEOUT 120)
             # The fixture codec on its own: round trips and every rejection of
             # docs/SPU_XDIFF.md section 7.8, on crafted inputs (asan preset).
             add_executable(test_spu_xdiff_fixture

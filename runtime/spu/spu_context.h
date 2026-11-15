@@ -550,6 +550,7 @@ typedef struct spu_context {
 void spu_mfc_release(spu_context* ctx);
 int spu_mfc_has_engine(const spu_context* ctx);   /* a private MFC engine exists for ctx (a served context must have none) */
 void spu_mfc_forget_range(uintptr_t lo, uintptr_t hi);
+int spu_float_rz_mode(void);   /* 1: SPU code runs in round toward zero (SPU_FLOAT_RZ, latched on first use) */
 
 static inline void spu_context_init(spu_context* ctx, uint32_t spu_id)
 {

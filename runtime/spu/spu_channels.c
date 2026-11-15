@@ -306,8 +306,10 @@ void spu_stop(spu_context* ctx)
  * happen synchronously on a PPU thread (a workload dispatched from the PPU caller), whose
  * lifted floating point must keep round to nearest with denormals. Double precision restores
  * the default around itself inside a run. arm64 only; elsewhere the exact forms always run.
- * Returns the FPCR to restore, or ~0 when nothing was changed. */
-static uint64_t spu_float_mode_enter(void)
+ * The mode is latched on first use, process-wide: a fixture records the mode its run used
+ * (docs/SPU_XDIFF.md 7.3, `float_rz`), and a replay under another one would compare a
+ * different program (8.1). Returns 1 when SPU code runs in round toward zero. */
+int spu_float_rz_mode(void)
 {
 #if defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
     static int s_on = -1;
@@ -317,7 +319,17 @@ static uint64_t spu_float_mode_enter(void)
         on = e && e[0] == '1' && !e[1];
         __atomic_store_n(&s_on, on, __ATOMIC_RELAXED);
     }
-    if (!on) return ~0ull;
+    return on;
+#else
+    return 0;
+#endif
+}
+
+/* Returns the FPCR to restore, or ~0 when nothing was changed. */
+static uint64_t spu_float_mode_enter(void)
+{
+#if defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
+    if (!spu_float_rz_mode()) return ~0ull;
     uint64_t v;
     __asm__ volatile("mrs %0, fpcr" : "=r"(v));
     if (v == SPU_FPCR_RZFZ) return ~0ull;   /* nested run: the outer one restores */
