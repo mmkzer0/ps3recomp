@@ -79,6 +79,20 @@
  *               changed in place a new entry, the same bytes at a second EA the same fingerprint, the 1024-slot
  *               table and its dump, four workers racing on a shared table, nothing with tracing off, the
  *               observer's loader path
+ *   xdiff-capture, -lifted, -observer, -concurrent, -stop, -event, -unresolved, -both, -unknown, -body-none, -body-other,
+ *   -varying, -bounded, -baddir, -writefail, -payload, -queue256, -off, -nodir
+ *               fixture capture on the worker (docs/SPU_XDIFF.md commit 10a; spu.xdiff_capture = N, spu.xdiff_dir):
+ *               N+1 jobs write exactly N fixtures named per 7.2 that decode, carry the job's identity, effects and
+ *               end, and replay `equal` on the interpreter, and leave guest memory as the same run without capture;
+ *               a body registered for the image is recorded as T1 with its inventory's lift identity, any other
+ *               body records nothing; the observer's path records too; three workers and two images, held at a
+ *               barrier, write exactly N per image between them; a job that stops the process leaves its fixture
+ *               (end class stop); an image whose inventory lists event branches, or has none, is counted
+ *               ineligible, named once and not recorded, while unresolved MFC sites are recorded and counted
+ *               apart; bytes that change every job and images past the table bound are counted together, with
+ *               at most 32 lines; the 257th queue is q256 in the name; a payload over the bound and a directory
+ *               that cannot be written are named failures and the run goes on; a directory missing at the first
+ *               queue is one line and capture off; capture off, or on without a directory, records nothing
  */
 #include "jq2/executor.hpp"
 #include "jq2/jq2.h"
@@ -94,6 +108,9 @@
 #include "ps3emu/ps3_ftrace.h"
 #include "syscalls/ppu_thread_id.h"
 #include "memory/reservation.h"
+#include "jq2/xdiff_capture.hpp"
+#include "ps3emu/lifter_abi.h"
+#include "xdiff/spu_xdiff_replay.h"
 
 #include <sys/mman.h>
 #include <sys/wait.h>
@@ -106,9 +123,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <map>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -3261,6 +3280,763 @@ void mode_trace_image_observer()
     }
 }
 
+/* ---- fixture capture (docs/SPU_XDIFF.md section 16, commit 10a) ---------------------------------- */
+
+namespace fs = std::filesystem;
+
+/* The capture directory of this process. main() creates it and sets the two options in the environment
+ * before anything reads the configuration, which is immutable after its first read: one mode, one
+ * configuration. A mode that needs a reference run without capture forks it first. */
+std::string g_xd_dir;
+constexpr std::uint32_t kXdN = 3; /* spu.xdiff_capture of the modes that record, unless main() says otherwise */
+
+/* The registration of the transform image: what the pipeline's generated registration would pass. */
+void xd_register(std::uint32_t flags, std::uint32_t code_end = 0, std::uint64_t lift_options = 0)
+{
+    spu_workload_set_inventory(fp_at(IMAGE), flags, code_end, lift_options);
+}
+
+/* `jobs` transform jobs, job j with seq j + 1, on a queue of `workers` workers. With one worker each job is pushed
+ * and synced alone, so the sequence and the guest memory it leaves are deterministic; with more they are pushed in a
+ * row and synced once. `image_ea` names job j's image (default IMAGE) and `before_job` runs before job j is described
+ * (to change the image's bytes). Every job's output and the queue's counters are checked. */
+std::vector<JobSpec> xd_run(std::uint32_t jobs, std::uint32_t workers = 1, const std::function<void()>& after_create = {},
+                            const std::function<std::uint32_t(std::uint32_t)>& image_ea = {},
+                            const std::function<void(std::uint32_t)>& before_job = {})
+{
+    build_image(IMAGE, Prog::transform);
+    install_hooks();
+    {
+        std::lock_guard<std::mutex> lk(g_probe.mu);
+        g_probe.on_admit = nullptr;
+    }
+    Rig rig({128, workers, false});
+    if (after_create) after_create();
+    std::vector<JobSpec> specs;
+    for (std::uint32_t j = 0; j < jobs; ++j) {
+        if (before_job) before_job(j);
+        specs.push_back(spec(j, image_ea ? image_ea(j) : std::uint32_t(IMAGE)));
+        rig.push_wait(specs.back().desc, 64, 0);
+        if (workers == 1) CHECK(jq2_port_sync(PORT, 0) == 0, "sync after job %u", j);
+    }
+    if (workers != 1) CHECK(jq2_port_sync(PORT, 0) == 0, "sync");
+    for (const JobSpec& s : specs) CHECK(job_ok(s), "job %u output", s.serial);
+    const jq2_stats st = rig.stats();
+    CHECK(st.dispatched == jobs && st.executed == jobs && st.credited == jobs, "counts %llu/%llu/%llu, wanted %u",
+          (unsigned long long)st.dispatched, (unsigned long long)st.executed, (unsigned long long)st.credited, jobs);
+    rig.teardown();
+    return specs;
+}
+
+/* All of guest memory, the one thing a job and its capture could share. */
+std::uint64_t xd_arena_digest() { return spu_workload_content_hash(vm_base, kMem); }
+
+/* What the capture directory holds, sorted; empty when it is gone. */
+std::vector<std::string> xd_files()
+{
+    std::vector<std::string> names;
+    std::error_code ec;
+    for (fs::directory_iterator it(g_xd_dir, ec); !ec && it != fs::directory_iterator(); it.increment(ec))
+        names.push_back(it->path().filename().string());
+    std::sort(names.begin(), names.end());
+    return names;
+}
+
+std::string join(const std::vector<std::string>& v)
+{
+    std::string s;
+    for (const std::string& x : v) s += (s.empty() ? "" : " ") + x;
+    return s;
+}
+
+/* The file name of section 7.2, spelled out here rather than asked of the writer. */
+std::string xd_name(std::uint64_t fp, std::uint32_t q, std::uint32_t seq)
+{
+    char b[96];
+    std::snprintf(b, sizeof b, "%016llx-q%u-s%u.spujob", (unsigned long long)fp, q, seq);
+    return b;
+}
+
+std::string xd_fp_hex(std::uint64_t fp)
+{
+    char b[24];
+    std::snprintf(b, sizeof b, "0x%016llX", (unsigned long long)fp);
+    return b;
+}
+
+struct Fx {
+    spu_xdiff_fixture f{};
+    ~Fx() { spu_xdiff_fixture_free(&f); }
+};
+
+bool xd_read(const std::string& name, Fx& fx)
+{
+    spu_xdiff_error err{};
+    const std::string path = g_xd_dir + "/" + name;
+    const int rc = spu_xdiff_fixture_read(path.c_str(), &fx.f, &err);
+    CHECK(rc == 0, "decode %s: %s (%s)", name.c_str(), spu_xdiff_reason_id(err.reason), err.detail);
+    return rc == 0;
+}
+
+/* A fixture of the transform job `s` on the image at `image_ea`, recorded as job `seq` of queue `queue` by a body of
+ * tier `tier`. */
+void xd_check_job(const spu_xdiff_fixture& f, const JobSpec& s, std::uint32_t seq, std::uint32_t tier,
+                  std::uint32_t image_ea = IMAGE, std::uint32_t queue = 0)
+{
+    const spu_xdiff_unit& u = f.unit;
+    CHECK(f.identity.image_fingerprint == fp_at(image_ea), "fingerprint 0x%llX", (unsigned long long)f.identity.image_fingerprint);
+    CHECK(f.identity.authority.tier == tier, "authority tier %u, wanted %u", f.identity.authority.tier, tier);
+    CHECK(f.identity.effect_port_abi == SPU_EFFECT_PORT_ABI, "port abi %u", f.identity.effect_port_abi);
+    CHECK(u.kind == SPU_XDIFF_UNIT_JOB && u.profile == SPU_XDIFF_PROFILE_JQ2, "unit kind %u profile %u", u.kind, u.profile);
+    CHECK(u.entry_pc == kBase && u.return_ls == kJobReturnLs, "entry 0x%X link 0x%X", u.entry_pc, u.return_ls);
+    CHECK(u.image_ea == image_ea && u.image_ls == kBase && u.image_bytes == kImageSize && u.bss_bytes == kBssQuads * 16,
+          "image ea 0x%X ls 0x%X bytes 0x%X bss 0x%X", u.image_ea, u.image_ls, u.image_bytes, u.bss_bytes);
+    CHECK(u.desc_bytes == 64 && u.ctx_ls == SPU_JQ2_CTX_LS, "descriptor copy %u bytes, context 0x%X", u.desc_bytes, u.ctx_ls);
+    CHECK(u.job_rt_ls == SPU_JQ2_JM_CALL_LS && u.job_rt_ls2 == SPU_JQ2_JM_SWAP_LS, "jm interface 0x%X 0x%X", u.job_rt_ls,
+          u.job_rt_ls2);
+    CHECK(u.origin_queue == queue && u.origin_worker == 0 && u.origin_seq == seq && u.origin_descriptor_ea == s.desc,
+          "origin q%u w%u seq %u desc 0x%X, wanted q%u w0 seq %u desc 0x%X", u.origin_queue, u.origin_worker, u.origin_seq,
+          u.origin_descriptor_ea, queue, seq, s.desc);
+
+    /* The transcript: the job's GET and PUT, each followed by the bytes it moved. */
+    std::vector<const spu_xdiff_effect*> cmds, xfers;
+    for (std::uint32_t i = 0; i < f.effect_count; ++i) {
+        if (f.effects[i].kind == SPU_FX_MFC_CMD) cmds.push_back(&f.effects[i]);
+        if (f.effects[i].kind == SPU_FX_XFER) xfers.push_back(&f.effects[i]);
+    }
+    CHECK(cmds.size() == 2 && xfers.size() == 2, "transcript: %zu commands, %zu transfers", cmds.size(), xfers.size());
+    if (cmds.size() != 2 || xfers.size() != 2) return;
+    CHECK((cmds[0]->value & 0xFFFFu) == MFC_GET_CMD && cmds[0]->ea == s.in && cmds[0]->lsa == kLsIn && cmds[0]->size == 16,
+          "the GET: cmd 0x%X ea 0x%llX lsa 0x%X size %u", cmds[0]->value, (unsigned long long)cmds[0]->ea, cmds[0]->lsa,
+          cmds[0]->size);
+    CHECK((cmds[1]->value & 0xFFFFu) == MFC_PUT_CMD && cmds[1]->ea == s.out && cmds[1]->lsa == kLsOut && cmds[1]->size == 16,
+          "the PUT: cmd 0x%X ea 0x%llX lsa 0x%X size %u", cmds[1]->value, (unsigned long long)cmds[1]->ea, cmds[1]->lsa,
+          cmds[1]->size);
+    auto payload_is = [&f](const spu_xdiff_effect& e, std::uint32_t dir, std::uint32_t ea) {
+        return e.dir == dir && e.ea == ea && e.size == 16 && e.blob != SPU_XDIFF_NO_BLOB &&
+               std::uint64_t{e.blob} + e.size <= f.blob_bytes && std::memcmp(f.blob + e.blob, vm_base + ea, 16) == 0;
+    };
+    CHECK(payload_is(*xfers[0], SPU_XFER_TO_LS, s.in), "the GET's bytes are the input");
+    CHECK(payload_is(*xfers[1], SPU_XFER_FROM_LS, s.out), "the PUT's bytes are the output");
+}
+
+/* The authoritative end of an interpreted job that returned: class return, the stop 0 at the link executed. */
+void xd_check_interp_end(const spu_xdiff_fixture& f)
+{
+    CHECK(f.end.end_class == SPU_XDIFF_END_RETURN && f.end.stop_code == 0 && f.end.pc == kJobReturnLs + 4,
+          "end class %u code %u pc 0x%X", f.end.end_class, f.end.stop_code, f.end.pc);
+}
+
+/* The interpreter against the transcript of `f`. */
+void xd_replay_equal(const spu_xdiff_fixture& f, const std::string& what)
+{
+    spu_xdiff_shadow* shadow = spu_xdiff_shadow_new();
+    CHECK(shadow != nullptr, "shadow");
+    if (shadow == nullptr) return;
+    spu_xdiff_replay_options opt{};
+    opt.subject_tier = SPU_TIER_INTERP;
+    spu_xdiff_verdict_record v{};
+    const std::uint32_t verdict = spu_xdiff_replay(&f, &opt, shadow, &v);
+    CHECK(verdict == SPU_XDIFF_EQUAL, "%s: replay is %s / %s", what.c_str(), spu_xdiff_verdict_id(verdict),
+          spu_xdiff_reason_id(v.reason));
+    spu_xdiff_shadow_free(shadow);
+}
+
+std::vector<std::string> xd_names(std::uint64_t fp, std::uint32_t first_seq, std::uint32_t n, std::uint32_t queue = 0)
+{
+    std::vector<std::string> names;
+    for (std::uint32_t seq = first_seq; seq < first_seq + n; ++seq) names.push_back(xd_name(fp, queue, seq));
+    return names;
+}
+
+/* N + 1 jobs under capture = N: exactly N fixtures, named per 7.2, each with the job's identity, effects and end,
+ * each replaying equal on the interpreter, and the guest memory of the run is that of the same run without capture. */
+void mode_xdiff_capture()
+{
+    constexpr std::uint32_t kJobs = kXdN + 1;
+    build_image(IMAGE, Prog::transform);
+    xd_register(0);
+    const std::uint64_t fp = fp_at(IMAGE);
+
+    /* The reference: the same sequence with capture off, in a child (forked before any thread exists and before
+     * anything has read the configuration, which the child sets differently). It leaves its guest memory's digest
+     * in a page both share, outside the arena. */
+    auto* digest = static_cast<std::uint64_t*>(mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0));
+    CHECK(digest != MAP_FAILED, "mmap");
+    if (digest == MAP_FAILED) return;
+    std::string child_log;
+    const int rc = run_child(
+        [digest] {
+            setenv("PS3RECOMP_SPU_XDIFF_CAPTURE", "0", 1);
+            xd_run(kJobs);
+            *digest = xd_arena_digest();
+            if (g_fail != 0) _exit(1);
+        },
+        child_log);
+    CHECK(rc == 0, "the reference run without capture failed (status %d): %s", rc, child_log.c_str());
+    CHECK(child_log.find("[jq2-xdiff]") == std::string::npos, "capture off said something: %s", child_log.c_str());
+    CHECK(xd_files().empty(), "capture off wrote %s", join(xd_files()).c_str());
+    std::memset(vm_base, 0, kMem); /* the arena as the child found it */
+
+    const std::vector<JobSpec> specs = xd_run(kJobs);
+    CHECK(xd_arena_digest() == *digest, "guest memory after the capturing run differs from the run without capture");
+
+    CHECK(xd_files() == xd_names(fp, 1, kXdN), "fixtures: %s", join(xd_files()).c_str());
+    const auto c = capture_counters(fp);
+    CHECK(c && c->captured == kXdN && c->captured_with_unresolved == 0 && c->failed == 0 && c->ineligible == 0,
+          "counters %llu/%llu/%llu", (unsigned long long)(c ? c->captured : 0), (unsigned long long)(c ? c->failed : 0),
+          (unsigned long long)(c ? c->ineligible : 0));
+    for (std::uint32_t seq = 1; seq <= kXdN; ++seq) {
+        Fx fx;
+        if (!xd_read(xd_name(fp, 0, seq), fx)) continue;
+        xd_check_job(fx.f, specs[seq - 1], seq, SPU_TIER_INTERP);
+        xd_check_interp_end(fx.f);
+        CHECK(fx.f.identity.authority.lifter_abi == 0 && fx.f.identity.authority.code_end == 0 &&
+                  fx.f.identity.authority.lift_options == 0,
+              "the interpreter carries no lift identity");
+        xd_replay_equal(fx.f, xd_name(fp, 0, seq));
+    }
+}
+
+/* A body registered for the image's fingerprint is the authority T1, with the lift identity of its registration. */
+void mode_xdiff_lifted()
+{
+    constexpr std::uint32_t kCodeEnd = 0x8000;
+    constexpr std::uint64_t kOptions = 0x1122334455667788ull;
+    g_lifted = kLiftedNormal;
+    build_image(IMAGE, Prog::transform);
+    xd_register(0, kCodeEnd, kOptions);
+    spu_workload_register_img(fp_at(IMAGE), &lifted_normal_entry, 5, "xd-lifted");
+    const std::uint64_t fp = fp_at(IMAGE);
+    const std::vector<JobSpec> specs = xd_run(kXdN + 1);
+    CHECK(xd_files() == xd_names(fp, 1, kXdN), "fixtures: %s", join(xd_files()).c_str());
+    for (std::uint32_t seq = 1; seq <= kXdN; ++seq) {
+        Fx fx;
+        if (!xd_read(xd_name(fp, 0, seq), fx)) continue;
+        xd_check_job(fx.f, specs[seq - 1], seq, SPU_TIER_LIFTED);
+        const spu_xdiff_body_id& b = fx.f.identity.authority;
+        CHECK(b.lifter_abi == SPU_RUNTIME_LIFTER_ABI && b.code_end == kCodeEnd && b.lift_options == kOptions,
+              "lift identity abi %u code_end 0x%X options 0x%llX", b.lifter_abi, b.code_end, (unsigned long long)b.lift_options);
+        CHECK(fx.f.end.end_class == SPU_XDIFF_END_RETURN, "end class %u", fx.f.end.end_class);
+    }
+}
+
+/* A body that is neither the interpreter nor the one registered for the image records nothing: the fixture would
+ * name a tier that did not run. `registered_other`: a different body is registered for the fingerprint; otherwise
+ * none is. The job runs either way. */
+void xd_unknown_body(bool registered_other)
+{
+    constexpr std::uint32_t kJobs = kXdN + 1;
+    g_lifted = kLiftedNormal;
+    build_image(IMAGE, Prog::transform);
+    xd_register(0);
+    if (registered_other) spu_workload_register_img(fp_at(IMAGE), &lifted_halt_entry, 5, "xd-other");
+    const std::uint64_t fp = fp_at(IMAGE);
+    const std::string log = capture_stderr([] { xd_run(kJobs); });
+    CHECK(xd_files().empty(), "an unknown body wrote %s", join(xd_files()).c_str());
+    const auto c = capture_counters(fp);
+    CHECK(c && c->captured == 0 && c->failed == 0 && c->ineligible == kJobs && c->ineligible_unknown_body == kJobs &&
+              c->ineligible_no_inventory == 0 && c->ineligible_event_branches == 0,
+          "counters: captured %llu ineligible %llu unknown-body %llu", (unsigned long long)(c ? c->captured : 0),
+          (unsigned long long)(c ? c->ineligible : 0), (unsigned long long)(c ? c->ineligible_unknown_body : 0));
+    CHECK(count_of(log, "capture-ineligible") == 1 && log.find("image=" + xd_fp_hex(fp) + " reason=unknown-body") != std::string::npos,
+          "one line names the image and the reason:\n%s", log.c_str());
+    CHECK(count_of(log, "captured image=") == 0, "something was recorded");
+}
+void mode_xdiff_body_none() { xd_unknown_body(false); }
+void mode_xdiff_body_other() { xd_unknown_body(true); }
+
+/* The loader's observed path records too, and the observer still sees every command the job issues. */
+void mode_xdiff_observer()
+{
+    constexpr std::uint32_t kJobs = 3, kRecorded = 2; /* main() sets spu.xdiff_capture = 2 */
+    build_image(IMAGE, Prog::transform);
+    xd_register(0);
+    const std::uint64_t fp = fp_at(IMAGE);
+    const jq2_job_observer obs{nullptr, &obs_start, &obs_end};
+    const std::vector<JobSpec> specs =
+        xd_run(kJobs, 1, [&obs] { CHECK(jq2_set_job_observer(QUEUE, &obs) == 0, "install observer"); });
+    CHECK(xd_files() == xd_names(fp, 1, kRecorded), "fixtures: %s", join(xd_files()).c_str());
+    {
+        std::lock_guard<std::mutex> lk(g_obs.mu);
+        CHECK(g_obs.starts == int(kJobs) && g_obs.ends == int(kJobs), "observer start/end %d/%d", g_obs.starts, g_obs.ends);
+        CHECK(g_obs.mfc.size() == 2 * kJobs, "the observer saw %zu commands", g_obs.mfc.size());
+    }
+    for (std::uint32_t seq = 1; seq <= kRecorded; ++seq) {
+        Fx fx;
+        if (!xd_read(xd_name(fp, 0, seq), fx)) continue;
+        xd_check_job(fx.f, specs[seq - 1], seq, SPU_TIER_INTERP);
+        xd_check_interp_end(fx.f);
+        xd_replay_equal(fx.f, xd_name(fp, 0, seq));
+    }
+}
+
+/* Three workers, two images, N = 5 each. The first three jobs are held at admission until every worker holds one (a
+ * barrier, not a sleep), so all three workers are in the executor's job path together; it does not force the
+ * reservation race itself, which stays a matter of timing. What it checks does not depend on timing: between the
+ * workers exactly N fixtures per image are written, each with its own job's identity, and more than one worker
+ * recorded (the three held jobs are the first three attempts, on three different workers). */
+void mode_xdiff_concurrent()
+{
+    constexpr std::uint32_t kJobs = 24, kWorkers = 3, kRecorded = 5; /* main() sets spu.xdiff_capture = 5 */
+    constexpr std::uint32_t kImageA = IMAGE, kImageB = IMAGE + 0x1000;
+    build_image(IMAGE, Prog::transform);
+    build_variant(kImageB, 1);
+    xd_register(0);
+    spu_workload_set_inventory(fp_at(kImageB), 0, 0, 0);
+    const std::uint64_t fpa = fp_at(kImageA), fpb = fp_at(kImageB);
+    CHECK(fpa != fpb, "the two images have one fingerprint");
+    auto image_of_job = [](std::uint32_t j) { return (j % 2) != 0 ? kImageB : kImageA; };
+
+    struct Gate {
+        std::mutex mu;
+        std::condition_variable cv;
+        unsigned arrived = 0;
+    } gate;
+    const std::vector<JobSpec> specs = xd_run(
+        kJobs, kWorkers,
+        [&gate] {
+            std::lock_guard<std::mutex> lk(g_probe.mu);
+            g_probe.on_admit = [&gate](const JobStart&) {
+                std::unique_lock<std::mutex> lk(gate.mu);
+                if (gate.arrived >= kWorkers) return;
+                ++gate.arrived;
+                gate.cv.notify_all();
+                gate.cv.wait(lk, [&gate] { return gate.arrived >= kWorkers; });
+            };
+        },
+        image_of_job);
+    {
+        std::lock_guard<std::mutex> lk(g_probe.mu);
+        g_probe.on_admit = nullptr;
+    }
+    CHECK(gate.arrived == kWorkers, "the barrier saw %u workers", gate.arrived);
+
+    const std::vector<std::string> files = xd_files();
+    CHECK(files.size() == 2 * kRecorded, "fixtures: %s", join(files).c_str());
+    for (const std::uint64_t fp : {fpa, fpb}) {
+        const auto c = capture_counters(fp);
+        CHECK(c && c->captured == kRecorded && c->failed == 0 && c->ineligible == 0, "counters of 0x%llX: %llu/%llu",
+              (unsigned long long)fp, (unsigned long long)(c ? c->captured : 0), (unsigned long long)(c ? c->failed : 0));
+    }
+    std::set<std::uint32_t> workers;
+    std::set<std::uint32_t> seqs;
+    for (const std::string& name : files) {
+        Fx fx;
+        if (!xd_read(name, fx)) continue;
+        const std::uint32_t seq = fx.f.unit.origin_seq;
+        CHECK(seq >= 1 && seq <= kJobs && fx.f.unit.origin_worker < kWorkers, "seq %u worker %u", seq, fx.f.unit.origin_worker);
+        if (seq < 1 || seq > kJobs) continue;
+        const std::uint32_t ea = image_of_job(seq - 1);
+        CHECK(name == xd_name(fp_at(ea), 0, seq), "%s is not the name of seq %u on image 0x%X", name.c_str(), seq, ea);
+        CHECK(seqs.insert(seq).second, "seq %u recorded twice", seq);
+        workers.insert(fx.f.unit.origin_worker);
+        /* xd_check_job expects worker 0; the worker is whichever admitted the job, so check the rest by hand. */
+        spu_xdiff_fixture g = fx.f;
+        g.unit.origin_worker = 0;
+        xd_check_job(g, specs[seq - 1], seq, SPU_TIER_INTERP, ea);
+        xd_check_interp_end(fx.f);
+        xd_replay_equal(fx.f, name);
+    }
+    CHECK(seqs.size() == 2 * kRecorded, "%zu distinct jobs recorded", seqs.size());
+    CHECK(workers.size() >= 2, "only %zu worker(s) recorded", workers.size());
+}
+
+/* A job that ends the process leaves its fixture first: end class stop, with its code. */
+void mode_xdiff_stop()
+{
+    build_image(IMAGE, Prog::stop_early);
+    const std::uint64_t fp = fp_at(IMAGE);
+    std::string err;
+    const int rc = run_child(
+        [] {
+            build_image(IMAGE, Prog::stop_early);
+            xd_register(0);
+            install_hooks();
+            Rig rig({128, 1, false});
+            const JobSpec a = spec(0);
+            rig.push(a.desc, 64, 0);
+            jq2_port_sync(PORT, 0); /* never returns: the worker stops the process */
+            std::fprintf(stderr, "the stop did not happen\n");
+        },
+        err);
+    CHECK(rc == 70, "exit status %d, wanted 70 (a named stop)", rc);
+    CHECK(err.find("kind=jq2-job-end") != std::string::npos, "stderr names the stop");
+    CHECK(err.find("the stop did not happen") == std::string::npos, "the Sync returned");
+    CHECK(xd_files() == xd_names(fp, 1, 1), "fixtures: %s", join(xd_files()).c_str());
+    Fx fx;
+    if (xd_read(xd_name(fp, 0, 1), fx)) {
+        CHECK(fx.f.end.end_class == SPU_XDIFF_END_STOP && fx.f.end.stop_code == 0x2222, "end class %u code 0x%X",
+              fx.f.end.end_class, fx.f.end.stop_code);
+        CHECK(fx.f.effect_count == 0, "a job with no channel access has %u effects", fx.f.effect_count);
+    }
+}
+
+/* An image the registration does not clear is counted, named once and never recorded: `flags` is its inventory
+ * (`registered` false: none was registered, which is unknown and not clean). */
+void xd_ineligible(bool registered, std::uint32_t flags, const char* reason, std::uint64_t events, std::uint64_t unknown)
+{
+    constexpr std::uint32_t kJobs = kXdN + 1;
+    build_image(IMAGE, Prog::transform);
+    if (registered) xd_register(flags);
+    const std::uint64_t fp = fp_at(IMAGE);
+    const std::string log = capture_stderr([] { xd_run(kJobs); });
+    CHECK(xd_files().empty(), "an ineligible image wrote %s", join(xd_files()).c_str());
+    const auto c = capture_counters(fp);
+    if (!registered) {
+        /* No inventory, no slot: the jobs are counted in the shared bucket. */
+        const CaptureCounters u = capture_unattributed();
+        CHECK(!c.has_value(), "an unregistered image took a slot");
+        CHECK(u.ineligible == kJobs && u.ineligible_no_inventory == kJobs, "unattributed: ineligible %llu no-inventory %llu",
+              (unsigned long long)u.ineligible, (unsigned long long)u.ineligible_no_inventory);
+    } else {
+        CHECK(c.has_value(), "the image was never looked at");
+    }
+    if (c) {
+        CHECK(c->captured == 0 && c->captured_with_unresolved == 0 && c->failed == 0, "captured %llu failed %llu",
+              (unsigned long long)c->captured, (unsigned long long)c->failed);
+        CHECK(c->ineligible == kJobs, "ineligible jobs %llu, wanted %u", (unsigned long long)c->ineligible, kJobs);
+        CHECK(c->ineligible_event_branches == events && c->ineligible_no_inventory == 0 && c->ineligible_unknown_body == 0,
+              "reasons: events %llu unknown %llu", (unsigned long long)c->ineligible_event_branches,
+              (unsigned long long)c->ineligible_no_inventory);
+    }
+    /* One line for the image, whatever the number of jobs, and it names the image and why. */
+    CHECK(count_of(log, "capture-ineligible") == 1, "%zu capture-ineligible lines", count_of(log, "capture-ineligible"));
+    CHECK(log.find("image=" + xd_fp_hex(fp) + " reason=" + reason) != std::string::npos, "the line names image and reason: %s",
+          log.c_str());
+    CHECK(count_of(log, "captured image=") == 0 && count_of(log, "capture-failed") == 0, "nothing was recorded or failed");
+}
+
+void mode_xdiff_event() { xd_ineligible(true, SPU_WORKLOAD_INV_EVENT_BRANCHES, "event-branches", kXdN + 1, 0); }
+/* Unresolved MFC sites are not a reason: the image is recorded, and its fixtures are counted apart (section 12.3). */
+void mode_xdiff_unresolved()
+{
+    build_image(IMAGE, Prog::transform);
+    xd_register(SPU_WORKLOAD_INV_UNRESOLVED_MFC);
+    const std::uint64_t fp = fp_at(IMAGE);
+    const std::vector<JobSpec> specs = xd_run(kXdN + 1);
+    CHECK(xd_files() == xd_names(fp, 1, kXdN), "fixtures: %s", join(xd_files()).c_str());
+    const auto c = capture_counters(fp);
+    CHECK(c && c->captured == kXdN && c->captured_with_unresolved == kXdN && c->failed == 0 && c->ineligible == 0,
+          "counters %llu/%llu/%llu/%llu", (unsigned long long)(c ? c->captured : 0),
+          (unsigned long long)(c ? c->captured_with_unresolved : 0), (unsigned long long)(c ? c->failed : 0),
+          (unsigned long long)(c ? c->ineligible : 0));
+    for (std::uint32_t seq = 1; seq <= kXdN; ++seq) {
+        Fx fx;
+        if (!xd_read(xd_name(fp, 0, seq), fx)) continue;
+        xd_check_job(fx.f, specs[seq - 1], seq, SPU_TIER_INTERP);
+        xd_replay_equal(fx.f, xd_name(fp, 0, seq));
+    }
+}
+/* Event branches refuse the image whatever else its inventory says; the unresolved flag is not a second reason. */
+void mode_xdiff_both()
+{
+    xd_ineligible(true, SPU_WORKLOAD_INV_EVENT_BRANCHES | SPU_WORKLOAD_INV_UNRESOLVED_MFC, "event-branches", kXdN + 1, 0);
+}
+void mode_xdiff_unknown() { xd_ineligible(false, 0, "no-inventory", 0, kXdN + 1); }
+
+/* A loader that alternates two buffers through one address (A, B, A, B, ...): each is fingerprinted once, then
+ * remembered by its content, and both record, N fixtures per image. */
+void mode_xdiff_varying()
+{
+    constexpr std::uint32_t kJobs = 12;
+    build_variant(IMAGE, 1);
+    const std::uint64_t fpa = fp_at(IMAGE);
+    build_variant(IMAGE, 2);
+    const std::uint64_t fpb = fp_at(IMAGE);
+    spu_workload_set_inventory(fpa, 0, 0, 0);
+    spu_workload_set_inventory(fpb, 0, 0, 0);
+    xd_run(kJobs, 1, {}, {}, [](std::uint32_t j) { vm_base[IMAGE + kTweak] = (j % 2) != 0 ? 2 : 1; });
+    /* Job j has seq j + 1: A on the odd seqs, B on the even ones, the first N of each. */
+    std::vector<std::string> want;
+    for (std::uint32_t k = 0; k < kXdN; ++k) {
+        want.push_back(xd_name(fpa, 0, 2 * k + 1));
+        want.push_back(xd_name(fpb, 0, 2 * k + 2));
+    }
+    std::sort(want.begin(), want.end());
+    CHECK(xd_files() == want, "fixtures: %s", join(xd_files()).c_str());
+    for (const std::uint64_t fp : {fpa, fpb}) {
+        const auto c = capture_counters(fp);
+        CHECK(c && c->captured == kXdN && c->failed == 0 && c->ineligible == 0, "counters of 0x%llX", (unsigned long long)fp);
+    }
+    CHECK(capture_unattributed().fingerprint_cache_misses == 2, "%llu fingerprints computed, wanted one per content",
+          (unsigned long long)capture_unattributed().fingerprint_cache_misses);
+    for (const std::string& name : xd_files()) {
+        Fx fx;
+        if (!xd_read(name, fx)) continue;
+        CHECK(name == xd_name(fx.f.identity.image_fingerprint, 0, fx.f.unit.origin_seq), "%s names its own fingerprint and seq",
+              name.c_str());
+        xd_replay_equal(fx.f, name);
+    }
+}
+
+/* Bytes that never repeat and no inventory: each job costs one hash and one fingerprint and nothing else. No image
+ * slot is taken, the jobs are counted together, and the address is named once. */
+void mode_xdiff_nonrepeating()
+{
+    constexpr std::uint32_t kJobs = 12;
+    std::vector<std::uint64_t> fps;
+    for (std::uint32_t j = 0; j < kJobs; ++j) {
+        build_variant(IMAGE, std::uint8_t(j + 1));
+        fps.push_back(fp_at(IMAGE));
+    }
+    const std::string log = capture_stderr([] {
+        xd_run(kJobs, 1, {}, {}, [](std::uint32_t j) { vm_base[IMAGE + kTweak] = std::uint8_t(j + 1); });
+    });
+    CHECK(xd_files().empty(), "unregistered bytes wrote %s", join(xd_files()).c_str());
+    for (std::uint32_t j = 0; j < kJobs; ++j)
+        CHECK(!capture_counters(fps[j]).has_value(), "job %u: an unregistered image must not take a slot", j);
+    const CaptureCounters u = capture_unattributed();
+    CHECK(u.ineligible == kJobs && u.ineligible_no_inventory == kJobs && u.ineligible_table_full == 0 &&
+              u.fingerprint_cache_misses == kJobs,
+          "unattributed: ineligible %llu no-inventory %llu misses %llu", (unsigned long long)u.ineligible,
+          (unsigned long long)u.ineligible_no_inventory, (unsigned long long)u.fingerprint_cache_misses);
+    CHECK(count_of(log, "capture-ineligible image=") == 1 && count_of(log, "reason=no-inventory ea=0x00100000 bytes=4096") == 1,
+          "the address is named once:\n%s", log.c_str());
+}
+
+constexpr std::uint32_t kXdFirst = 0x600000; /* images the capture modes stage one per job, 0x1000 apart */
+
+/* `n` images at kXdFirst + 0x1000 * i, each with its own fingerprint. */
+void xd_build_images(std::uint32_t n)
+{
+    for (std::uint32_t i = 0; i < n; ++i) {
+        const std::uint32_t ea = kXdFirst + 0x1000 * i;
+        build_image(ea, Prog::transform);
+        vm_base[ea + kTweak] = std::uint8_t(i & 0xFF);
+        vm_base[ea + kTweak + 1] = std::uint8_t(i >> 8);
+        vm_base[ea + kTweak + 2] = 0x5A; /* never the bytes of the transform image at IMAGE */
+    }
+}
+
+/* Images with no inventory take no slot: after 300 of them, an image the registration cleared still records. */
+void mode_xdiff_starvation()
+{
+    constexpr std::uint32_t kUnknown = 300, kJobs = kUnknown + kXdN + 1;
+    xd_build_images(kUnknown);
+    build_image(IMAGE, Prog::transform);
+    xd_register(0);
+    const std::uint64_t fp = fp_at(IMAGE);
+    capture_stderr([] {
+        xd_run(kJobs, 1, {}, [](std::uint32_t j) { return j < kUnknown ? kXdFirst + 0x1000 * j : std::uint32_t(IMAGE); });
+    });
+    CHECK(xd_files() == xd_names(fp, kUnknown + 1, kXdN), "fixtures: %s", join(xd_files()).c_str());
+    const auto c = capture_counters(fp);
+    CHECK(c && c->captured == kXdN && c->failed == 0, "the registered image: captured %llu", (unsigned long long)(c ? c->captured : 0));
+    const CaptureCounters u = capture_unattributed();
+    CHECK(u.ineligible == kUnknown && u.ineligible_no_inventory == kUnknown && u.ineligible_table_full == 0,
+          "unattributed: ineligible %llu no-inventory %llu table-full %llu", (unsigned long long)u.ineligible,
+          (unsigned long long)u.ineligible_no_inventory, (unsigned long long)u.ineligible_table_full);
+}
+
+/* The 32-line budget is for capture-ineligible only: after 40 images have used it, a fixture that cannot be written
+ * still prints its capture-failed line (every one of them consumes an attempt, so they are bounded by N). */
+void mode_xdiff_failure_lines()
+{
+    constexpr std::uint32_t kUnknown = 40, kJobs = kUnknown + kXdN + 1, kLines = 32;
+    xd_build_images(kUnknown);
+    build_image(IMAGE, Prog::transform);
+    xd_register(0);
+    const std::string log = capture_stderr([] {
+        xd_run(
+            kJobs, 1,
+            [] {
+                std::error_code ec;
+                fs::remove_all(g_xd_dir, ec); /* fine at the first queue, gone before the first fixture */
+            },
+            [](std::uint32_t j) { return j < kUnknown ? kXdFirst + 0x1000 * j : std::uint32_t(IMAGE); });
+    });
+    CHECK(count_of(log, "capture-ineligible image=") == kLines && count_of(log, "capture-lines-suppressed") == 1,
+          "%zu ineligible lines, %zu suppression lines", count_of(log, "capture-ineligible image="),
+          count_of(log, "capture-lines-suppressed"));
+    CHECK(count_of(log, "capture-failed image=" + xd_fp_hex(fp_at(IMAGE))) == kXdN, "%zu capture-failed lines after the budget:\n%s",
+          count_of(log, "capture-failed image="), log.c_str());
+}
+
+/* Images the registration cleared are tracked (256 slots, as many as the registry has inventories); the others are
+ * counted together without a slot; the ineligible lines stop at 32 with one line that says so. */
+void mode_xdiff_bounded()
+{
+    constexpr std::uint32_t kImages = 260, kTable = 256, kLines = 32;
+    xd_build_images(kImages);
+    for (std::uint32_t i = 0; i < kTable; ++i) /* the registry holds 256 inventories: the last four images have none */
+        spu_workload_set_inventory(fp_at(kXdFirst + 0x1000 * i), SPU_WORKLOAD_INV_EVENT_BRANCHES, 0, 0);
+    const std::string log = capture_stderr([] {
+        xd_run(kImages, 1, {}, [](std::uint32_t j) { return kXdFirst + 0x1000 * j; });
+    });
+    CHECK(xd_files().empty(), "event-branch images wrote %s", join(xd_files()).c_str());
+    std::uint32_t tracked = 0;
+    for (std::uint32_t i = 0; i < kImages; ++i)
+        if (capture_counters(fp_at(kXdFirst + 0x1000 * i))) ++tracked;
+    CHECK(tracked == kTable, "%u fingerprints tracked, wanted %u", tracked, kTable);
+    const CaptureCounters u = capture_unattributed();
+    CHECK(u.ineligible == kImages - kTable && u.ineligible_no_inventory == kImages - kTable && u.ineligible_table_full == 0,
+          "unattributed: ineligible %llu no-inventory %llu table-full %llu", (unsigned long long)u.ineligible,
+          (unsigned long long)u.ineligible_no_inventory, (unsigned long long)u.ineligible_table_full);
+    CHECK(count_of(log, "capture-ineligible image=") == kLines, "%zu capture-ineligible lines, wanted %u",
+          count_of(log, "capture-ineligible image="), kLines);
+    CHECK(count_of(log, "capture-lines-suppressed") == 1, "%zu suppression lines", count_of(log, "capture-lines-suppressed"));
+}
+
+/* The collision branch: the fingerprint a worker remembers is not the one of the staged bytes (a seam makes it so).
+ * The recorder notices, the fixture is dropped, the attempt is spent, and the line is not budgeted. */
+void mode_xdiff_collision()
+{
+    constexpr std::uint64_t kMask = 0x00FF00FF00FF00FFull;
+    build_image(IMAGE, Prog::transform);
+    const std::uint64_t fp = fp_at(IMAGE), remembered = fp ^ kMask;
+    spu_workload_set_inventory(remembered, 0, 0, 0);
+    set_capture_fingerprint_fault(kMask);
+    const std::string log = capture_stderr([] { xd_run(kXdN + 1); });
+    CHECK(xd_files().empty(), "a collision wrote %s", join(xd_files()).c_str());
+    const auto c = capture_counters(remembered);
+    CHECK(c && c->ineligible_collision == kXdN && c->ineligible == kXdN && c->captured == 0 && c->failed == 0,
+          "counters: collisions %llu ineligible %llu", (unsigned long long)(c ? c->ineligible_collision : 0),
+          (unsigned long long)(c ? c->ineligible : 0));
+    CHECK(!capture_counters(fp).has_value(), "the real fingerprint was never remembered");
+    CHECK(count_of(log, "reason=fingerprint-collision") == kXdN, "%zu collision lines:\n%s", count_of(log, "reason=fingerprint-collision"),
+          log.c_str());
+    CHECK(count_of(log, "captured image=") == 0, "something was recorded");
+}
+
+/* spu.xdiff_dir missing at the first queue (capture = 1000): one line, capture is off for the process, nothing else is
+ * said or counted, and the jobs run. main() points the option at a directory that does not exist. */
+void mode_xdiff_baddir()
+{
+    build_image(IMAGE, Prog::transform);
+    xd_register(0);
+    const std::uint64_t fp = fp_at(IMAGE);
+    const std::string log = capture_stderr([] { xd_run(kXdN + 1); }); /* xd_run checks every output and the counts */
+    CHECK(count_of(log, "[jq2-xdiff]") == 1, "%zu [jq2-xdiff] lines:\n%s", count_of(log, "[jq2-xdiff]"), log.c_str());
+    CHECK(count_of(log, "capture-off reason=bad-dir") == 1 && log.find("does not exist") != std::string::npos,
+          "the line names the directory problem:\n%s", log.c_str());
+    CHECK(!capture_counters(fp).has_value(), "capture is off, yet the image was counted");
+    CHECK(xd_files().empty(), "the parent holds %s", join(xd_files()).c_str());
+}
+
+/* A directory that was fine at the first queue and cannot be written when a fixture is: one named diagnostic per
+ * attempt (the attempts are the N), the jobs and the run go on, nothing is left behind. */
+void mode_xdiff_writefail()
+{
+    constexpr std::uint32_t kJobs = kXdN + 1;
+    build_image(IMAGE, Prog::transform);
+    xd_register(0);
+    const std::uint64_t fp = fp_at(IMAGE);
+    const std::string log = capture_stderr([] {
+        xd_run(kJobs, 1, [] {
+            std::error_code ec;
+            fs::remove_all(g_xd_dir, ec); /* gone after the queue's check, before the first fixture */
+        });
+    });
+    CHECK(count_of(log, "capture-off") == 0, "capture was switched off:\n%s", log.c_str());
+    CHECK(count_of(log, "capture-failed") == kXdN, "%zu capture-failed lines:\n%s", count_of(log, "capture-failed"), log.c_str());
+    CHECK(count_of(log, "capture-failed image=" + xd_fp_hex(fp) + " queue=0 seq=") == kXdN, "the lines name the image and the queue");
+    CHECK(count_of(log, "reason=capture-limit detail=") == kXdN && count_of(log, "cannot create") == kXdN,
+          "the lines carry reason and detail:\n%s", log.c_str());
+    CHECK(count_of(log, "captured image=") == 0, "something was recorded");
+    const auto c = capture_counters(fp);
+    CHECK(c && c->failed == kXdN && c->captured == 0 && c->ineligible == 0, "counters %llu/%llu/%llu",
+          (unsigned long long)(c ? c->captured : 0), (unsigned long long)(c ? c->failed : 0),
+          (unsigned long long)(c ? c->ineligible : 0));
+}
+
+/* The payload bound: a recording that would pass it is a counted capture-limit failure, the job runs on. The job moves
+ * 16 bytes in and 16 different bytes out; a bound of 24 admits the first payload and not the second. */
+void mode_xdiff_payload()
+{
+    constexpr std::uint32_t kJobs = kXdN + 1;
+    set_capture_payload_limit(24);
+    build_image(IMAGE, Prog::transform);
+    xd_register(0);
+    const std::uint64_t fp = fp_at(IMAGE);
+    const std::string log = capture_stderr([] { xd_run(kJobs); });
+    CHECK(xd_files().empty(), "a recording over the bound wrote %s", join(xd_files()).c_str());
+    CHECK(count_of(log, "capture-failed image=" + xd_fp_hex(fp)) == kXdN && count_of(log, "reason=capture-limit") == kXdN,
+          "%u failures named, by capture-limit:\n%s", kXdN, log.c_str());
+    const auto c = capture_counters(fp);
+    CHECK(c && c->failed == kXdN && c->captured == 0, "counters %llu/%llu", (unsigned long long)(c ? c->captured : 0),
+          (unsigned long long)(c ? c->failed : 0));
+}
+
+/* The queue number in a fixture's name is the creation number, not the saturating trace index: the 257th queue of the
+ * process is q256 in the name and in the fixture. */
+void mode_xdiff_queue256()
+{
+    constexpr std::uint32_t QUEUE2 = 0x80000, RING2 = 0x90000, kQueue = 256;
+    build_image(IMAGE, Prog::transform);
+    xd_register(0);
+    const std::uint64_t fp = fp_at(IMAGE);
+    put32(ATTR + 4, 8);
+    put32(ATTR + 8, 256);
+    capture_stderr([] {
+        for (unsigned i = 0; i < kQueue; ++i) {
+            CHECK(jq2_queue_create(1, 0x360001, SPURS, QUEUE2, ATTR, 0, 0, 0, RING2, 16, 1, 0) == 0, "queue %u", i);
+            std::uint32_t exit_value = 0;
+            CHECK(jq2_queue_shutdown(QUEUE2) == 0 && jq2_queue_join(QUEUE2, &exit_value) == 0, "join %u", i);
+        }
+    });
+    const std::vector<JobSpec> specs = xd_run(kXdN + 1); /* the 257th queue */
+    CHECK(xd_files() == xd_names(fp, 1, kXdN, kQueue), "fixtures: %s", join(xd_files()).c_str());
+    for (std::uint32_t seq = 1; seq <= kXdN; ++seq) {
+        Fx fx;
+        if (!xd_read(xd_name(fp, kQueue, seq), fx)) continue;
+        xd_check_job(fx.f, specs[seq - 1], seq, SPU_TIER_INTERP, IMAGE, kQueue);
+    }
+}
+
+/* spu.xdiff_capture = 0: no tap, no line, no counter, no file. */
+void mode_xdiff_off()
+{
+    build_image(IMAGE, Prog::transform);
+    xd_register(0);
+    const std::uint64_t fp = fp_at(IMAGE);
+    const std::string log = capture_stderr([] { xd_run(2); });
+    CHECK(log.find("[jq2-xdiff]") == std::string::npos, "capture off said something: %s", log.c_str());
+    CHECK(xd_files().empty(), "capture off wrote %s", join(xd_files()).c_str());
+    CHECK(!capture_counters(fp).has_value(), "capture off counted the image");
+}
+
+/* spu.xdiff_capture = 2 with no directory: nothing recorded, and the first queue says so, once. */
+void mode_xdiff_nodir()
+{
+    build_image(IMAGE, Prog::transform);
+    xd_register(0);
+    const std::uint64_t fp = fp_at(IMAGE);
+    const std::string log = capture_stderr([] { xd_run(3); });
+    CHECK(count_of(log, "capture-off reason=no-dir") == 1, "%zu no-dir lines:\n%s", count_of(log, "capture-off reason=no-dir"),
+          log.c_str());
+    CHECK(xd_files().empty(), "no directory, yet %s", join(xd_files()).c_str());
+    CHECK(!capture_counters(fp).has_value(), "no directory, yet the image was counted");
+}
+
+/* The options of an xdiff mode, in the environment before anything reads the configuration. */
+void xd_prologue(const std::string& mode)
+{
+    std::string tmpl = (fs::temp_directory_path() / "jq2_xdiff.XXXXXX").string();
+    if (mkdtemp(tmpl.data()) == nullptr) {
+        std::perror("mkdtemp");
+        std::exit(2);
+    }
+    g_xd_dir = tmpl;
+    std::uint32_t n = kXdN;
+    std::string dir = g_xd_dir;
+    if (mode == "xdiff-off") n = 0;
+    else if (mode == "xdiff-nodir") {
+        n = 2;
+        dir.clear();
+    }
+    else if (mode == "xdiff-baddir") {
+        n = 1000;
+        dir += "/missing";
+    }
+    else if (mode == "xdiff-observer") n = 2;
+    else if (mode == "xdiff-concurrent") n = 5;
+    else if (mode == "xdiff-stop") n = 1;
+    setenv("PS3RECOMP_SPU_XDIFF_CAPTURE", std::to_string(n).c_str(), 1);
+    if (dir.empty()) unsetenv("PS3RECOMP_SPU_XDIFF_DIR");
+    else setenv("PS3RECOMP_SPU_XDIFF_DIR", dir.c_str(), 1);
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
@@ -3281,6 +4057,8 @@ int main(int argc, char** argv)
             setenv("PS3_FTRACE_CAP", "65536", 1);
         }
     }
+    /* The capture options are read when the first job starts and never again: the xdiff modes set them first. */
+    if (mode.rfind("xdiff-", 0) == 0) xd_prologue(mode);
     if (mode == "premature") mode_premature();
     else if (mode == "copy") mode_copy();
     else if (mode == "credit") mode_credit();
@@ -3344,10 +4122,35 @@ int main(int argc, char** argv)
     else if (mode == "trace-image-concurrent") mode_trace_image_concurrent();
     else if (mode == "trace-image-off") mode_trace_image_off();
     else if (mode == "trace-image-observer") mode_trace_image_observer();
+    else if (mode == "xdiff-capture") mode_xdiff_capture();
+    else if (mode == "xdiff-lifted") mode_xdiff_lifted();
+    else if (mode == "xdiff-observer") mode_xdiff_observer();
+    else if (mode == "xdiff-concurrent") mode_xdiff_concurrent();
+    else if (mode == "xdiff-stop") mode_xdiff_stop();
+    else if (mode == "xdiff-event") mode_xdiff_event();
+    else if (mode == "xdiff-unresolved") mode_xdiff_unresolved();
+    else if (mode == "xdiff-both") mode_xdiff_both();
+    else if (mode == "xdiff-unknown") mode_xdiff_unknown();
+    else if (mode == "xdiff-baddir") mode_xdiff_baddir();
+    else if (mode == "xdiff-body-none") mode_xdiff_body_none();
+    else if (mode == "xdiff-body-other") mode_xdiff_body_other();
+    else if (mode == "xdiff-varying") mode_xdiff_varying();
+    else if (mode == "xdiff-bounded") mode_xdiff_bounded();
+    else if (mode == "xdiff-writefail") mode_xdiff_writefail();
+    else if (mode == "xdiff-payload") mode_xdiff_payload();
+    else if (mode == "xdiff-queue256") mode_xdiff_queue256();
+    else if (mode == "xdiff-nonrepeating") mode_xdiff_nonrepeating();
+    else if (mode == "xdiff-starvation") mode_xdiff_starvation();
+    else if (mode == "xdiff-failure-lines") mode_xdiff_failure_lines();
+    else if (mode == "xdiff-collision") mode_xdiff_collision();
+    else if (mode == "xdiff-off") mode_xdiff_off();
+    else if (mode == "xdiff-nodir") mode_xdiff_nodir();
     else {
         std::printf("unknown mode %s\n", mode.c_str());
         return 2;
     }
+    std::error_code ignored;
+    if (!g_xd_dir.empty()) fs::remove_all(g_xd_dir, ignored);
     if (g_fail != 0) {
         std::printf("FAIL: %d check(s)\n", g_fail);
         return 1;

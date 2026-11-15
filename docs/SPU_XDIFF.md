@@ -126,11 +126,14 @@ a tweak has no rule and yields `malformed` / `not-comparable`.
   not checked against the staged bytes.
 - **Finding the fingerprint is cheap; a cache hit is a claim, not a proof.**
   Hashing the staged bytes byte by byte costs about a millisecond for a large
-  image, so two places remember a result by address and size and reuse it
+  image, so three places remember a result by address and size and reuse it
   while a word-wise content hash of the bytes still matches: the dispatcher
-  (eight slots, `spu_workload.c:347-380`) and, for traces, the per-worker table
+  (eight slots, `spu_workload.c:347-380`); for traces, the per-worker table
   of `identify_image` (`executor.cpp:1119-1137`), which runs only while a
-  trace is recorded (`:1170-1173`, `:1198`). The content hash is a change
+  trace is recorded (`:1170-1173`, `:1198`); and, while fixtures are
+  captured, a per-worker cache of the last four contents at each address
+  (`xdiff_capture.cpp`, `seen_content`), so a loader that alternates buffers
+  is fingerprinted once per buffer. The content hash is a change
   detector, never an identity (`spu_workload.h:42-45`, `spu_workload.c:332-346`):
   it is 64 bits of a non-cryptographic fold. A hit says the bytes are
   probably the ones the fingerprint was taken from; it does not say they are.
@@ -573,7 +576,7 @@ recomputes it and answers `malformed` / `fixture-identity` on a mismatch.
 | 72 | `stack_bytes` | the stack's size |
 | 76 | `r1` | the stack pointer at entry |
 | 80 | `ctx_ls` | the `CellSpursJobContext2` |
-| 84 | `origin_queue` | queue index; `origin_*` join the fixture with the trace of its run and are 0 for a synthetic fixture |
+| 84 | `origin_queue` | the queue's creation number in the process, as in the file name; the trace's queue index is the same number up to 255 and saturates there. `origin_*` join the fixture with the trace of its run and are 0 for a synthetic fixture |
 | 88 | `origin_worker` | worker index |
 | 92 | `origin_seq` | the job's per-queue sequence number |
 | 96 | `origin_descriptor_ea` | the descriptor's guest EA |
