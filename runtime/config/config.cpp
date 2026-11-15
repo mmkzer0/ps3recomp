@@ -254,6 +254,12 @@ std::string check_string(const Option& o, std::string& s)
     case PS3_CFG_V_JOB_BODY:
         if (s == "interp" || s == "lifted") return {};
         return "expected \"interp\" or \"lifted\", found \"" + s + "\"";
+    case PS3_CFG_V_XDIFF_MODE:
+        if (s == "off" || s == "sample" || s == "all") return {};
+        return "expected \"off\", \"sample\" or \"all\", found \"" + s + "\"";
+    case PS3_CFG_V_XDIFF_ACTION:
+        if (s == "report" || s == "stop") return {};
+        return "expected \"report\" or \"stop\", found \"" + s + "\"";
     case PS3_CFG_V_PAD_RECORD_PATH: {
         /* Checked here so a mistyped path fails at startup rather than minutes into a run.
          * pad_trace.c creates the file exclusively, which settles a race with another writer. */

@@ -26,7 +26,8 @@ KINDS = ["identity-mismatch", "lifter-abi", "config-invalid", "unresolved-nid",
          "hle-commit-failed", "spurs-task-halt", "spurs-dispatch-miss", "rsx-capture",
          "host-path-limit",
          "rsx-unknown-method", "np-trophy-unmodelled", "rsx-driver-method",
-         "pad-trace", "fiber-host-context", "adec-no-decoder", "host-wait-error"]
+         "pad-trace", "fiber-host-context", "adec-no-decoder", "host-wait-error",
+         "spu-xdiff-divergence"]
 
 
 def probe(*args):

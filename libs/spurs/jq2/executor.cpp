@@ -1236,16 +1236,27 @@ bool job_body_lifted()
     return lifted;
 }
 
+/* What the end hook leaves for the job's kind 32 record (ps3_ftrace.h), which is emitted after the credit, when the
+ * disposition of the job's sample is known. Written on the worker, by the loader's end hook, and read by it. */
+struct BodyNote {
+    bool trace = false;          /* tracing is on and the job has a JOB span, and spu.job_body or spu.xdiff is not off */
+    bool sampled = false;        /* the end hook closed a recording for the audit */
+    std::uint8_t tier = 0;       /* the authority that ran: spu_job_tier */
+    std::uint32_t lift_miss = 0; /* the authority's count of branches no lifted code covered */
+    std::uint64_t t0 = 0, t1 = 0;
+};
+
 /* What the loader's start hook does about the job's image, for both loader paths: identify the staged bytes
- * once, when something needs them (the trace span, the choice of body, the capture), stamp the trace span with
- * that identification, choose the body, and hand the same identification to the capture. With none of the
- * three on (spu.job_body = interp, no trace, no capture) it does nothing and the job pays nothing. */
+ * once, when something needs them (the trace span, the choice of body, the capture, the audit), stamp the trace span
+ * with that identification, choose the body, and hand the same identification to the capture. With none of the
+ * four on (spu.job_body = interp, no trace, no capture, spu.xdiff = off) it does nothing and the job pays nothing. */
 struct StartCtl {
     ImageStamp* stamp; /* null while tracing is off */
     CaptureJob cap;    /* entry and interpreted are replaced by the choice when `choose` */
     bool choose;       /* spu.job_body = lifted and no forced body */
     StagedImage img{};
     SeenImage* seen = nullptr; /* this job's slot in the worker's memory; null until identified */
+    BodyNote* note = nullptr;  /* the job's kind-32 note, filled by end() */
 
     /* image_id is the registration's for a lifted body and -1 for the interpreter, which also undoes an
      * earlier choice when repair() chooses again. */
@@ -1272,7 +1283,7 @@ struct StartCtl {
     /* Before the observer and the capture: the job is staged and at its entry state. */
     void identify(spu_context* ctx, const spu_job_layout* l)
     {
-        if (stamp == nullptr && !choose && !capture_active()) return;
+        if (stamp == nullptr && !choose && !record_active()) return;
         if (static_cast<std::uint64_t>(l->image_ls) + l->image_bytes > SPU_LS_SIZE) {
             /* The loader validated the layout. A body cannot be chosen from bytes outside local store; the
              * capture names the fault. */
@@ -1311,9 +1322,25 @@ struct StartCtl {
     /* After the observer, which may have installed itself on the context. */
     void capture(spu_context* ctx, const spu_job_layout* l)
     {
-        if (!capture_active()) return;
+        if (!record_active()) return;
         capture_job_start(cap, ctx, l, seen != nullptr ? &img : nullptr);
         if (seen != nullptr && img.stale) repair(ctx, l);
+    }
+
+    /* The loader's end hook, before the executor applies its policy to the end: closes the recording a job that stops
+     * the process still leaves, and notes what the job's kind-32 record needs. */
+    void end(spu_context* ctx)
+    {
+        BodyNote& n = *note;
+        if (!n.trace) {
+            capture_job_end(ctx);
+            return;
+        }
+        n.t0 = ps3_ft_now();
+        n.sampled = capture_job_end(ctx);
+        n.t1 = ps3_ft_now();
+        n.tier = cap.interpreted ? SPU_TIER_INTERP : SPU_TIER_LIFTED;
+        n.lift_miss = ctx->lift_miss;
     }
 };
 
@@ -1344,6 +1371,8 @@ void Queue::run_job(const JobStart& js, const std::optional<jq2_job_observer>& o
     t_job_hooks = &hooks_;
     int rc;
     ImageStamp stamp;
+    BodyNote note;
+    note.trace = ft.t0 != 0 && (job_body_lifted() || audit_active());
     /* Under `choose` the start hook replaces the entry with the body it picked, before the capture sees it. */
     const JobEntryFn cap_entry = choose ? &interpreter_entry : body.entry;
     const CaptureJob cap{&js, number_, cap_entry, cap_entry == &interpreter_entry};
@@ -1352,6 +1381,7 @@ void Queue::run_job(const JobStart& js, const std::optional<jq2_job_observer>& o
          * where the job's ending is classified (require_normal_return). The
          * capture tap (xdiff_capture.hpp) is off unless spu.xdiff_capture is set. */
         StartCtl p{ft.t0 != 0 ? &stamp : nullptr, cap, choose};
+        p.note = &note;
         spu_job_hooks hooks{};
         hooks.user = &p;
         hooks.start = [](void* user, spu_context* ctx, const spu_job_layout* l) {
@@ -1359,8 +1389,8 @@ void Queue::run_job(const JobStart& js, const std::optional<jq2_job_observer>& o
             ctl.identify(ctx, l);
             ctl.capture(ctx, l);
         };
-        hooks.end = [](void*, spu_context* ctx) {
-            capture_job_end(ctx); /* before the policy: a job that stops the process still leaves its fixture */
+        hooks.end = [](void* user, spu_context* ctx) {
+            static_cast<StartCtl*>(user)->end(ctx);
             require_normal_return(ctx);
         };
         rc = spu_run_jq2_job(body.entry, body.image_id, js.descriptor_ea, js.descriptor.data(), js.size, &env,
@@ -1373,6 +1403,7 @@ void Queue::run_job(const JobStart& js, const std::optional<jq2_job_observer>& o
             jq2_job_info info;
             StartCtl ctl;
         } o{&*obs, {}, StartCtl{ft.t0 != 0 ? &stamp : nullptr, cap, choose}};
+        o.ctl.note = &note;
         o.info.queue = js.queue_ea;
         o.info.port = js.port_ea;
         o.info.descriptor_ea = js.descriptor_ea;
@@ -1407,9 +1438,9 @@ void Queue::run_job(const JobStart& js, const std::optional<jq2_job_observer>& o
             ob.ctl.capture(ctx, l);
         };
         hooks.end = [](void* user, spu_context* ctx) {
-            capture_job_end(ctx); /* before the policy: a job that stops the process still leaves its fixture */
-            require_normal_return(ctx);
             auto& ob = *static_cast<Observed*>(user);
+            ob.ctl.end(ctx); /* before the policy: a job that stops the process still leaves its fixture */
+            require_normal_return(ctx);
             if (ob.obs->job_end != nullptr) ob.obs->job_end(ob.obs->user, ctx, ctx->gpr[3]._u32[0], &ob.info);
         };
         rc = spu_run_jq2_job(body.entry, body.image_id, js.descriptor_ea, js.descriptor.data(), js.size, &env,
@@ -1438,6 +1469,14 @@ void Queue::run_job(const JobStart& js, const std::optional<jq2_job_observer>& o
      * credited, so a Sync that returns also sees the slot free. */
     if (js.copy) pool_->release(js.descriptor_ea);
     credit(js);
+
+    /* The audit's sample goes to the audit thread only now: whatever it finds, the job is credited and the guest has
+     * the authority's result (docs/SPU_XDIFF.md section 11). Kind 32 says what became of the sample. */
+    const Disposition disposition = capture_hand_over(ft_who(js.worker));
+    if (note.trace && note.t0 != 0)
+        ps3_ft_span(PS3_FT_JQ2_BODY, ft_who(js.worker), js.seq,
+                    std::uint32_t{note.tier} | std::uint32_t{disposition} << 8 | sat(note.lift_miss, 255) << 16, note.t0,
+                    note.sampled ? note.t1 : note.t0);
 }
 
 void Queue::credit(const JobStart& js)
@@ -1865,8 +1904,10 @@ int32_t jq2_queue_create(uint32_t revision, uint32_t sdk_version, uint32_t spurs
         ps3_stop_guest_range("jq2_queue_create", "command_ring", command_ring, ring_size, jq2_guest_limit());
     }
 
-    /* The capture options are read here, once, before any worker exists; a bad directory is found now. */
+    /* The capture and audit options are read here, once, before any worker exists; a bad directory is found now. The
+     * audit reads after the capture: it starts its thread, and it shares the capture's directory check. */
     capture_configure();
+    audit_configure();
 
     ExecutorHooks hooks;
     {

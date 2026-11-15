@@ -229,6 +229,47 @@ if(NOT WIN32)
         add_test(NAME jq2_exec_${name} COMMAND test_jq2_executor ${mode})
         set_tests_properties(jq2_exec_${name} PROPERTIES LABELS "spurs;t0;tsan" TIMEOUT 300)
     endforeach()
+
+    # In-run xdiff (docs/SPU_XDIFF.md commit 10b; spu.xdiff and its options): the worker records a sampled job, credits it,
+    # and an audit thread runs the other tier on the recording. Each mode sets the options in its own environment before
+    # the configuration is first read; the audit thread and the workers are ordered by hooks (set_audit_hooks), never by
+    # sleeping. The registered bodies are the interpreter wrapped as a body (equal to T0 in everything) and bodies that
+    # differ from it in one thing.
+    #
+    #   jq2_exec_xdiff_audit_divergence    a registered body that differs in the PUT's payload: reported once as a visible
+    #                                      effect-payload, its fixture (with VRDT) replays `differ` with spu_job_replay and
+    #                                      the guest-visible result equals a run with xdiff off
+    #   jq2_exec_xdiff_audit_latent        a difference of destroyed state only: latent end-ls, written, counted; no stop
+    #                                      under on_divergence=stop
+    #   jq2_exec_xdiff_audit_stop          on_divergence=stop: exit 70 by spu-xdiff-divergence with its fields, after the job
+    #                                      was credited and the fixture written
+    #   jq2_exec_xdiff_audit_stop_latent   on_latent=stop for a latent difference
+    #   jq2_exec_xdiff_audit_full          `sample` with the audit thread held: eight samples queue, the next is dropped and
+    #                                      counted while its job completes
+    #   jq2_exec_xdiff_audit_all           `all` with the audit thread held: the worker waits for room and goes on when it is
+    #                                      released; every job is shadowed
+    #   jq2_exec_xdiff_audit_concurrent    `all` under three workers
+    #   jq2_exec_xdiff_audit_oversize      a recording over the bound is void / capture-limit, counted, named once, never a stop
+    #   jq2_exec_xdiff_audit_shutdown      shutdown drops the queued samples and counts them; the shadow in flight finishes
+    #   jq2_exec_xdiff_audit_ineligible    no twin, no body, no inventory, event branches: counted, named once, never queued
+    #   jq2_exec_xdiff_audit_host_fault    a named stop inside a shadow is void / host-fault and the run goes on
+    #   jq2_exec_xdiff_audit_fixtures_cap  16 fixtures per image, the rest counted
+    #   jq2_exec_xdiff_audit_baddir        an unusable directory: one line, differences named without a fixture
+    #   jq2_exec_xdiff_audit_lifted        spu.job_body=lifted: the registered body is the authority, the interpreter the shadow
+    #   jq2_exec_xdiff_audit_period        period 3 counts per image from its first job
+    #   jq2_exec_xdiff_audit_trace         kinds 32 and 33
+    #   jq2_exec_xdiff_audit_trace_lifted  kind 32 under job_body=lifted with the audit off
+    #   jq2_exec_xdiff_audit_trace_none    neither kind at the defaults
+    #   jq2_exec_xdiff_audit_shared        capture and audit on: one identification, one recording
+    #   jq2_exec_xdiff_audit_refused       a behaviour-changing knob refuses the audit
+    foreach(mode audit-divergence audit-latent audit-stop audit-stop-latent audit-full audit-all audit-concurrent audit-oversize
+                  audit-shutdown audit-ineligible audit-host-fault audit-fixtures-cap audit-baddir audit-lifted audit-period
+                  audit-trace audit-trace-lifted audit-trace-none audit-shared audit-refused audit-ordinal audit-alloc-fail)
+        string(REPLACE "audit-" "xdiff-audit-" mode_name "${mode}")
+        string(REPLACE "-" "_" name "${mode_name}")
+        add_test(NAME jq2_exec_${name} COMMAND test_jq2_executor ${mode})
+        set_tests_properties(jq2_exec_${name} PROPERTIES LABELS "spurs;t0;tsan" TIMEOUT 300)
+    endforeach()
 endif()
 
 # cellSpursJq HLE surface: the 17 firmware imports through ps3_hle_call.

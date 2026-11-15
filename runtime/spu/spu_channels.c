@@ -169,7 +169,7 @@ void spu_restart_dispatch(spu_context* ctx)
 {
     g_spu_trampoline_fn = 0;
     if (s_spu_halt_armed) SPU_LONGJMP(s_spu_halt_env, 2);
-    fprintf(stderr, "[spu] non-local return outside execution driver at 0x%05X\n", ctx->pc);
+    fprintf(stderr, "%s[spu] non-local return outside execution driver at 0x%05X\n", spu_diag_tag(), ctx->pc);
     ctx->status = SPU_STATUS_STOPPED_BY_HALT;
 }
 
@@ -198,7 +198,7 @@ void spu_halt(spu_context* ctx)
      * names exactly which input is wrong. */
     { static SPU_THREAD_LOCAL int _n = 0;
       if (_n < 6 && ctx->status == SPU_STATUS_STOPPED_BY_HALT) { _n++;
-        fprintf(stderr, "[spu-halt] img=%d pc=0x%05X regs:", ctx->image_id,
+        fprintf(stderr, "%s[spu-halt] img=%d pc=0x%05X regs:", spu_diag_tag(), ctx->image_id,
                 ctx->pc & SPU_LS_MASK);
         for (int r = 3; r <= 16; r++)
             fprintf(stderr, " r%d=%08X", r, ctx->gpr[r]._u32[0]);
@@ -228,9 +228,9 @@ void spu_port_set(spu_context* ctx, const spu_effect_port* port)
     if (sv && (!sv->wrch || !sv->rdch || !sv->rchcnt)) {
         /* A missing member could only fall through to the runtime's own body,
          * which is the leak a serve table exists to prevent. */
-        fprintf(stderr, "[spu-port] spu_port_set: serve table for context %p lacks%s%s%s; "
+        fprintf(stderr, "%s[spu-port] spu_port_set: serve table for context %p lacks%s%s%s; "
                 "a context must not run against the real world by accident -- aborting\n",
-                (void*)ctx, sv->wrch ? "" : " wrch", sv->rdch ? "" : " rdch", sv->rchcnt ? "" : " rchcnt");
+                spu_diag_tag(), (void*)ctx, sv->wrch ? "" : " wrch", sv->rdch ? "" : " rdch", sv->rchcnt ? "" : " rchcnt");
         fflush(stderr);
         abort();
     }
@@ -253,9 +253,9 @@ void spu_port_serve_halt(spu_context* ctx, const char* reason)
     spu_halt(ctx);   /* leaves through the spu_run_with_halt landing pad while one is armed */
     /* No pad: spu_halt returned. Going on would answer the context with a value
      * nobody recorded, so the process ends here and names the context. */
-    fprintf(stderr, "[spu-port] served context %p (spu_id=%u image=%d pc=0x%05X) cannot go on: %s; "
+    fprintf(stderr, "%s[spu-port] served context %p (spu_id=%u image=%d pc=0x%05X) cannot go on: %s; "
             "no halt landing pad is armed (run it under spu_run_with_halt) -- aborting\n",
-            (void*)ctx, (unsigned)ctx->spu_id, ctx->image_id, (unsigned)(ctx->pc & SPU_LS_MASK), reason);
+            spu_diag_tag(), (void*)ctx, (unsigned)ctx->spu_id, ctx->image_id, (unsigned)(ctx->pc & SPU_LS_MASK), reason);
     fflush(stderr);
     abort();
 }
@@ -3014,9 +3014,9 @@ static int spu_smc_microstep(spu_context* ctx)
          * decompression job it was running never completes. */
         { static SPU_THREAD_LOCAL int _n = 0;
           if (PS3_LOG_FIRST(_n, 8))
-              fprintf(stderr, "[spu-smc] microstep img=%d pc=0x%05X word 0x%08X not in the"
+              fprintf(stderr, "%s[spu-smc] microstep img=%d pc=0x%05X word 0x%08X not in the"
                       " microstep set -- handing to the interpreter (steps=%d)\n",
-                      ctx->image_id, pc, w, steps); }
+                      spu_diag_tag(), ctx->image_id, pc, w, steps); }
         ctx->pc = pc;
         /* Stop at the drain's return point too: it sits mid-function, so it is
          * no lifted entry, and a job's return would otherwise run on through
@@ -3037,8 +3037,8 @@ static int spu_smc_microstep(spu_context* ctx)
         return result ? 1 : 0;
     }
     { static SPU_THREAD_LOCAL int _n = 0; if (PS3_LOG_FIRST(_n, 4))
-        fprintf(stderr, "[spu-smc] microstep img=%d runaway (4096 steps from 0x%05X)\n",
-                ctx->image_id, ctx->pc & SPU_LS_MASK); }
+        fprintf(stderr, "%s[spu-smc] microstep img=%d runaway (4096 steps from 0x%05X)\n",
+                spu_diag_tag(), ctx->image_id, ctx->pc & SPU_LS_MASK); }
     return 0;
 }
 
@@ -3267,8 +3267,8 @@ void spu_indirect_branch(spu_context* ctx)
     if (!ctx->policy_mode && ctx->pc == SPU_JOB_RETURN_LS) {
         static SPU_THREAD_LOCAL int _n = 0;
         if (PS3_LOG_FIRST(_n, 4))
-            fprintf(stderr, "[spurs-job] img=%d returned to the job manager \n",
-                    ctx->image_id);
+            fprintf(stderr, "%s[spurs-job] img=%d returned to the job manager \n",
+                    spu_diag_tag(), ctx->image_id);
         spu_halt(ctx);
         return;
     }
@@ -3319,8 +3319,8 @@ void spu_indirect_branch(spu_context* ctx)
                 ctx->stop_code = w & 0x3FFFu;
                 static SPU_THREAD_LOCAL int _n = 0;
                 if (PS3_LOG_FIRST(_n, 8))
-                    fprintf(stderr, "[spu] img=%d exit: synthesised stop 0x%04X at LS 0x%05X\n",
-                            ctx->image_id, ctx->stop_code, p0);
+                    fprintf(stderr, "%s[spu] img=%d exit: synthesised stop 0x%04X at LS 0x%05X\n",
+                            spu_diag_tag(), ctx->image_id, ctx->stop_code, p0);
                 spu_halt(ctx);
                 return;
             }
@@ -3333,10 +3333,10 @@ void spu_indirect_branch(spu_context* ctx)
         for (int i = 0; i < n_seen; i++) if (seen[i] == ctx->pc) { known = 1; break; }
         if (!known && n_seen < 16) {
             seen[n_seen++] = ctx->pc;
-            fprintf(stderr, "[spu] img=%d branched into unlifted LS 0x%05X "
+            fprintf(stderr, "%s[spu] img=%d branched into unlifted LS 0x%05X "
                     "(lr=0x%05X) -- ending the job\n",
-                    ctx->image_id, ctx->pc, ctx->gpr[0]._u32[0] & SPU_LS_MASK);
-            { fprintf(stderr, "      last dispatched PCs (oldest first):");
+                    spu_diag_tag(), ctx->image_id, ctx->pc, ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+            { fprintf(stderr, "%s      last dispatched PCs (oldest first):", spu_diag_tag());
               for (unsigned q = 0; q < 8; q++) {
                   unsigned idx = (g_spu_pch_n + q) & 7u;
                   if (g_spu_pch_n > q || g_spu_pch[idx]) fprintf(stderr, " 0x%05X", g_spu_pch[idx]);
@@ -3348,7 +3348,7 @@ void spu_indirect_branch(spu_context* ctx)
             { uint32_t a[2]; a[0] = ctx->pc & SPU_LS_MASK;
               a[1] = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
               for (int k = 0; k < 2; k++) {
-                  fprintf(stderr, "      LS[0x%05X]:", a[k]);
+                  fprintf(stderr, "%s      LS[0x%05X]:", spu_diag_tag(), a[k]);
                   for (uint32_t o = 0; o < 32 && a[k] + o + 3 < SPU_LS_SIZE; o += 4)
                       fprintf(stderr, " %02X%02X%02X%02X",
                               ctx->ls[a[k]+o], ctx->ls[a[k]+o+1],

@@ -141,7 +141,9 @@ extern "C" {
     /* A cellAdec AU the runtime has no decoder for: the console decodes it, silence would be success for work not done. */ \
     X(ADEC_NO_DECODER,          "adec-no-decoder")                                                         \
     /* A host wait the host refused (not a timeout, not a wake) in a runtime thread that has no caller to tell. */ \
-    X(HOST_WAIT_ERROR,          "host-wait-error")
+    X(HOST_WAIT_ERROR,          "host-wait-error")                                                         \
+    /* An in-run xdiff shadow disagreed with the authority and spu.xdiff_on_divergence / spu.xdiff_on_latent says stop. */ \
+    X(SPU_XDIFF_DIVERGENCE,     "spu-xdiff-divergence")
 
 /* A fixed underlying type in C++ makes a kind outside the list (a caller's bug,
  * which the stop still reports as "invalid-kind") a well-defined value rather
@@ -373,6 +375,19 @@ void ps3_stop_register_frontier(ps3_stop_frontier_fn fn);
 /* Runs every registered provider for `thread_id` and returns what they filled, without stopping. A fault
  * raised from a host-side handler asks this to name the handler before it builds its own stop. */
 void ps3_stop_query_frontier(uint64_t thread_id, ps3_stop_frontier* out);
+
+/* A stop raised on this thread that must not end the process: an in-run xdiff shadow (docs/SPU_XDIFF.md
+ * section 9) runs the subject tier on the audit thread, and whatever the subject reaches, a named stop
+ * included, is the sample's problem and not the run's. While a divert is installed, ps3_stop on THIS thread
+ * calls `fn(user, kind, what)` first and before it takes the stop lock, prints or flushes anything. `fn`
+ * must leave by a non-local exit (the replay unwinds to its halt landing pad); if it returns, the stop goes
+ * on as if no divert were installed, so a divert that cannot unwind fails closed into the real stop. The
+ * divert is one-shot (cleared before `fn` runs: a stop inside `fn` is a real stop), per thread (a stop on
+ * any other thread is untouched) and never nests: installing one while one is installed replaces it.
+ * Not a way to survive a stop: abort(), a signal or a direct exit() are not stops and are not diverted. */
+typedef void (*ps3_stop_divert_fn)(void* user, ps3_stop_kind kind, const char* what);
+void ps3_stop_divert_begin(ps3_stop_divert_fn fn, void* user);
+void ps3_stop_divert_end(void);
 
 #ifdef __cplusplus
 }

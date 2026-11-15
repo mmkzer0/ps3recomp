@@ -104,8 +104,10 @@
 #include "spu_coherency.h"
 #include "spurs_job.h"
 #include "spu_workload.h"
+#include "spu_interp.h"
 #include "syscalls/sys_event.h"
 #include "ps3emu/ps3_ftrace.h"
+#include "ps3emu/stop.h"
 #include "syscalls/ppu_thread_id.h"
 #include "memory/reservation.h"
 #include "jq2/xdiff_capture.hpp"
@@ -4453,6 +4455,939 @@ void mode_xdiff_select_trace()
     std::printf("kind 29: %u jobs, mean IMAGE span %llu ns, mean JOB span %llu ns\n", kJobs, image_sum / kJobs, job_sum / kJobs);
 }
 
+/* ---- in-run xdiff: sampled shadows on an audit thread (docs/SPU_XDIFF.md section 16, commit 10b) ------------------ */
+
+/* The bodies. The interpreter wrapped as a registered body is the cheapest T1 that equals T0 in every effect, register
+ * and local-store byte; each of the others differs from it in one thing. Registered as a body they are T1 authorities
+ * (spu.job_body = lifted); registered as a twin they are T1 shadows of an interpreted job. */
+void au_interp_body(spu_context* c)
+{
+    const std::int32_t saved = c->image_id;
+    c->image_id = -1; /* pure interpretation: no rejoin of another image's lifted functions */
+    spu_interp_run(c, c->pc);
+    c->image_id = saved;
+}
+
+/* The transform program with `extra` added to the first word of its sum: the PUT's payload differs from the
+ * interpreter's, which a world sees. */
+void au_transform(spu_context* c, std::uint32_t extra)
+{
+    const std::uint32_t d = c->gpr[4]._u32[0];
+    const std::uint32_t out = ls_word(c, d + 0x30), in = ls_word(c, d + 0x34);
+    const std::uint32_t k[4] = {ls_word(c, d + 0x38) + extra, ls_word(c, d + 0x3C), out, in};
+    lifted_dma(c, kLsIn, in, MFC_GET_CMD);
+    for (std::uint32_t i = 0; i < 4; ++i) {
+        const std::uint32_t v = be32(ls_word(c, kLsIn + 4 * i) + k[i]);
+        std::memcpy(c->ls + kLsOut + 4 * i, &v, 4);
+    }
+    lifted_dma(c, kLsOut, out, MFC_PUT_CMD);
+    SPU_RET(c);
+}
+void au_bad_body(spu_context* c) { au_transform(c, 1); }
+
+/* The interpreter, then one store into local store the loader destroys: every effect equals T0's and only the end
+ * state differs, which under the JobQueue2 profile is a latent difference (section 8.4). */
+constexpr std::uint32_t kAuLatentLs = 0x30000;
+void au_store_body(spu_context* c)
+{
+    au_interp_body(c);
+    c->ls[kAuLatentLs] ^= 0x5A;
+}
+
+/* A body that raises a named stop: a subject is code under test, and a stop it reaches belongs to its sample. */
+void au_stop_body(spu_context*)
+{
+    ps3_stop(PS3_STOP_JQ2_STATE, "a test body raised a stop inside a shadow", "none: this is a test", nullptr, 0, nullptr);
+}
+
+/* The interpreter and a count of branches no lifted code covered, past the one byte kind 32 gives it. */
+void au_miss_body(spu_context* c)
+{
+    au_interp_body(c);
+    c->lift_miss = 300;
+}
+
+/* An image's registration the way a title's generated one makes it: its inventory (no flags: nothing refuses it), its
+ * body, its budgeted twin (a lifted shadow needs one), and promotion for the images job_body=lifted may run. */
+void au_register(std::uint32_t ea, spu_lifted_entry_fn body, spu_lifted_entry_fn twin, std::int32_t id = 40, bool promote = false,
+                 std::uint32_t flags = 0)
+{
+    const std::uint64_t fp = fp_at(ea);
+    spu_workload_set_inventory(fp, flags, 0, 0);
+    if (body != nullptr) {
+        spu_workload_register_img(fp, body, id, "au-body");
+        if (promote) spu_workload_promote_img(fp);
+    }
+    if (twin != nullptr) spu_workload_register_twin(fp, twin, id + 100);
+}
+
+/* What the audit hooks leave for a test, so that the audit thread and the workers are ordered by hooks and never by
+ * sleeping. `hold` parks the audit thread at on_start; `started` counts the samples it took, `waiting` the workers that
+ * found the queue full under `all`, `done` the verdicts. */
+struct AuditProbe {
+    std::mutex mu;
+    std::condition_variable cv;
+    bool hold = false;
+    unsigned started = 0, waiting = 0;
+    struct Done {
+        std::uint64_t fp;
+        std::uint32_t queue, seq, verdict, reason;
+    };
+    std::vector<Done> done;
+    std::function<void(const AuditEvent&, std::uint32_t, std::uint32_t)> extra; /* run after a verdict, without the lock */
+};
+AuditProbe g_ap;
+
+void ap_start(void*, const AuditEvent&)
+{
+    std::unique_lock<std::mutex> lk(g_ap.mu);
+    ++g_ap.started;
+    g_ap.cv.notify_all();
+    g_ap.cv.wait(lk, [] { return !g_ap.hold; });
+}
+void ap_wait(void*, const AuditEvent&)
+{
+    std::lock_guard<std::mutex> lk(g_ap.mu);
+    ++g_ap.waiting;
+    g_ap.cv.notify_all();
+}
+void ap_done(void*, const AuditEvent& ev, std::uint32_t verdict, std::uint32_t reason)
+{
+    std::function<void(const AuditEvent&, std::uint32_t, std::uint32_t)> extra;
+    {
+        std::lock_guard<std::mutex> lk(g_ap.mu);
+        g_ap.done.push_back({ev.fingerprint, ev.queue, ev.seq, verdict, reason});
+        extra = g_ap.extra;
+        g_ap.cv.notify_all();
+    }
+    if (extra) extra(ev, verdict, reason);
+}
+template <class P>
+void ap_wait_for(P pred, const char* what)
+{
+    std::unique_lock<std::mutex> lk(g_ap.mu);
+    CHECK(g_ap.cv.wait_for(lk, std::chrono::seconds(60), pred), "timed out waiting for %s", what);
+}
+void ap_hold(bool on)
+{
+    {
+        std::lock_guard<std::mutex> lk(g_ap.mu);
+        g_ap.hold = on;
+    }
+    g_ap.cv.notify_all();
+}
+void ap_wait_done(std::size_t n) { ap_wait_for([n] { return g_ap.done.size() >= n; }, "the verdicts"); }
+
+/* Hooks in place, the audit's seams installed. */
+void au_begin()
+{
+    install_hooks();
+    {
+        std::lock_guard<std::mutex> lk(g_probe.mu);
+        g_probe.on_admit = nullptr;
+    }
+    AuditHooks h;
+    h.on_wait = &ap_wait;
+    h.on_start = &ap_start;
+    h.on_done = &ap_done;
+    set_audit_hooks(h);
+}
+
+/* One job on the image at `ea`, pushed alone and waited out: the guest has its result when this returns. */
+JobSpec au_job(Rig& rig, std::uint32_t j, std::uint32_t ea = IMAGE)
+{
+    const JobSpec s = spec(j, ea);
+    rig.push_wait(s.desc, 64, 0);
+    CHECK(jq2_port_sync(PORT, 0) == 0, "sync after job %u", j);
+    return s;
+}
+
+/* The transform's output with `extra` added to the first word of the sum. */
+bool au_out_is(const JobSpec& s, std::uint32_t extra)
+{
+    const std::uint32_t k[4] = {s.add + extra, s.serial, s.out, s.in};
+    for (std::uint32_t i = 0; i < 4; ++i)
+        if (get32(s.out + 4 * i) != get32(s.in + 4 * i) + k[i]) return false;
+    return true;
+}
+
+std::vector<std::string> au_lines(const std::string& log, const std::string& needle)
+{
+    std::vector<std::string> lines;
+    std::size_t at = 0;
+    while (at < log.size()) {
+        std::size_t end = log.find('\n', at);
+        if (end == std::string::npos) end = log.size();
+        const std::string line = log.substr(at, end - at);
+        if (line.find(needle) != std::string::npos) lines.push_back(line);
+        at = end + 1;
+    }
+    return lines;
+}
+
+/* The audit's counters of `fp`, or zeros when it has none (checked by the caller). */
+AuditCounters au_counters(std::uint64_t fp)
+{
+    const auto c = audit_counters(fp);
+    CHECK(c.has_value(), "the audit counted nothing for image 0x%016llX", (unsigned long long)fp);
+    return c.value_or(AuditCounters{});
+}
+
+constexpr std::uint32_t kAuRec = 0xE00100; /* what a forked child tells its parent, in the shared arena */
+
+/* A seeded divergence: the interpreter is the authority and the image's registered body (and twin) adds one to the
+ * first word of the sum. The difference is reported once with its class, its fixture is written and replays `differ`
+ * offline, and the guest sees exactly what a run without xdiff leaves. */
+void mode_audit_divergence()
+{
+    auto* digest = static_cast<std::uint64_t*>(mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0));
+    CHECK(digest != MAP_FAILED, "mmap");
+    if (digest == MAP_FAILED) return;
+    std::string child_log;
+    const int rc = run_child(
+        [digest] {
+            setenv("PS3RECOMP_SPU_XDIFF", "off", 1); /* the same jobs with the audit off, before anything read the configuration */
+            au_begin();
+            build_image(IMAGE, Prog::transform);
+            Rig rig({128, 1, false});
+            au_job(rig, 0);
+            rig.teardown();
+            *digest = xd_arena_digest();
+            if (g_fail != 0) _exit(1);
+        },
+        child_log);
+    CHECK(rc == 0, "the reference run without xdiff failed (status %d): %s", rc, child_log.c_str());
+    CHECK(child_log.find("[jq2-xdiff]") == std::string::npos, "xdiff off said something: %s", child_log.c_str());
+    std::memset(vm_base, 0, kMem);
+
+    build_image(IMAGE, Prog::transform);
+    au_register(IMAGE, &au_bad_body, &au_bad_body);
+    const std::uint64_t fp = fp_at(IMAGE);
+    JobSpec s{};
+    const std::string log = capture_stderr([&] {
+        au_begin();
+        build_image(IMAGE, Prog::transform);
+        Rig rig({128, 1, false});
+        s = au_job(rig, 0);
+        ap_wait_done(1);
+        rig.teardown();
+    });
+    CHECK(job_ok(s), "the guest sees the interpreter's output");
+    CHECK(xd_arena_digest() == *digest, "guest memory with the audit on differs from the run without it");
+
+    const auto lines = au_lines(log, "[jq2-xdiff] differ ");
+    CHECK(lines.size() == 1, "%zu differ lines, wanted one:\n%s", lines.size(), log.c_str());
+    const std::string path = g_xd_dir + "/" + xd_name(fp, 0, 1);
+    if (lines.size() == 1) {
+        const std::string& l = lines[0];
+        CHECK(l.find("image=" + xd_fp_hex(fp) + " queue=0 seq=1 reason=effect-payload class=visible effect=") != std::string::npos,
+              "the line: %s", l.c_str());
+        CHECK(l.find(" where=0x") != std::string::npos, "the line names where: %s", l.c_str());
+        CHECK(l.find(" authority=interp subject=lifted fixture=" + path) != std::string::npos, "the line: %s", l.c_str());
+    }
+    const AuditCounters c = au_counters(fp);
+    CHECK(c.jobs == 1 && c.sampled == 1 && c.queued == 1 && c.dropped == 0 && c.shadowed == 1, "counts jobs %llu sampled %llu queued %llu",
+          (unsigned long long)c.jobs, (unsigned long long)c.sampled, (unsigned long long)c.queued);
+    CHECK(c.differ == 1 && c.differ_visible == 1 && c.differ_latent == 0 && c.equal == 0 && c.voided == 0, "differ %llu visible %llu",
+          (unsigned long long)c.differ, (unsigned long long)c.differ_visible);
+    CHECK(c.reason[SPU_XDIFF_R_EFFECT_PAYLOAD] == 1 && c.fixtures == 1 && c.fixtures_over == 0, "payload %llu fixtures %llu",
+          (unsigned long long)c.reason[SPU_XDIFF_R_EFFECT_PAYLOAD], (unsigned long long)c.fixtures);
+
+    Fx fx;
+    CHECK(xd_files() == std::vector<std::string>{xd_name(fp, 0, 1)}, "fixtures: %s", join(xd_files()).c_str());
+    if (xd_read(xd_name(fp, 0, 1), fx)) {
+        CHECK(fx.f.has_verdict != 0 && fx.f.verdict.verdict == SPU_XDIFF_DIFFER && fx.f.verdict.reason == SPU_XDIFF_R_EFFECT_PAYLOAD,
+              "the fixture's VRDT: verdict %u reason %u", fx.f.verdict.verdict, fx.f.verdict.reason);
+        CHECK(fx.f.verdict.subject_body.tier == SPU_TIER_LIFTED && fx.f.identity.authority.tier == SPU_TIER_INTERP, "the tiers");
+        xd_check_job(fx.f, s, 1, SPU_TIER_INTERP);
+    }
+    /* Offline: the runner's own entry, on the registered body, and on the interpreter. */
+    std::string p = path;
+    char a0[] = "spu_job_replay", a1[] = "--tier", a2[] = "registered", a3[] = "interp";
+    char* registered[] = {a0, a1, a2, p.data()};
+    char* interp[] = {a0, a1, a3, p.data()};
+    std::fflush(stdout);
+    CHECK(spu_job_replay_main(4, registered) == int(SPU_XDIFF_DIFFER), "spu_job_replay on the registered body is not `differ`");
+    CHECK(spu_job_replay_main(4, interp) == int(SPU_XDIFF_EQUAL), "spu_job_replay on the interpreter is not `equal`");
+}
+
+/* A latent difference is reported with its class, counted and written, and stops nothing under
+ * on_divergence=stop (on_latent stays report): the body differs from the interpreter in one store of destroyed state. */
+void mode_audit_latent()
+{
+    constexpr std::uint32_t kJobs = 2;
+    build_image(IMAGE, Prog::transform);
+    au_register(IMAGE, &au_store_body, &au_store_body);
+    const std::uint64_t fp = fp_at(IMAGE);
+    std::vector<JobSpec> specs;
+    const std::string log = capture_stderr([&] {
+        au_begin();
+        build_image(IMAGE, Prog::transform);
+        Rig rig({128, 1, false});
+        for (std::uint32_t j = 0; j < kJobs; ++j) specs.push_back(au_job(rig, j));
+        ap_wait_done(kJobs);
+        rig.teardown();
+    });
+    for (const JobSpec& s : specs) CHECK(job_ok(s), "job %u output", s.serial);
+    const auto lines = au_lines(log, "[jq2-xdiff] differ ");
+    CHECK(lines.size() == kJobs, "%zu differ lines:\n%s", lines.size(), log.c_str());
+    for (const std::string& l : lines)
+        CHECK(l.find("reason=end-ls class=latent effect=none where=0x30000") != std::string::npos, "the line: %s", l.c_str());
+    const AuditCounters c = au_counters(fp);
+    CHECK(c.differ == kJobs && c.differ_latent == kJobs && c.differ_visible == 0 && c.reason[SPU_XDIFF_R_END_LS] == kJobs &&
+              c.fixtures == kJobs,
+          "differ %llu latent %llu end-ls %llu fixtures %llu", (unsigned long long)c.differ, (unsigned long long)c.differ_latent,
+          (unsigned long long)c.reason[SPU_XDIFF_R_END_LS], (unsigned long long)c.fixtures);
+    Fx fx;
+    if (xd_read(xd_name(fp, 0, 1), fx))
+        CHECK(fx.f.has_verdict != 0 && spu_xdiff_differ_class_of(fx.f.verdict.reason, fx.f.unit.profile) == SPU_XDIFF_CLASS_LATENT,
+              "the fixture's verdict is a latent end-ls difference");
+}
+
+/* A stop of the run: the audit thread ends it with the new kind after the job was credited, with the fields of
+ * docs/STOPS.md, the fixture already written. `latent`: the body differs only in destroyed state and on_latent says stop
+ * (on_divergence stays report); otherwise a visible difference under on_divergence=stop. */
+void audit_stop_scenario(bool latent)
+{
+    std::memset(vm_base + kAuRec, 0, 16);
+    build_image(IMAGE, Prog::transform);
+    const std::uint64_t fp = fp_at(IMAGE);
+    const std::function<void()> child = [latent] {
+        arm_child_watchdog(120);
+        build_image(IMAGE, Prog::transform);
+        au_register(IMAGE, latent ? &au_store_body : &au_bad_body, latent ? &au_store_body : &au_bad_body);
+        au_begin();
+        {
+            std::lock_guard<std::mutex> lk(g_ap.mu);
+            g_ap.extra = [](const AuditEvent&, std::uint32_t, std::uint32_t) {
+                /* On the audit thread, after the verdict and before the stop: what the queue had credited by then. */
+                jq2_stats st{};
+                jq2_queue_stats(QUEUE, &st);
+                put32(kAuRec, std::uint32_t(st.credited));
+                put32(kAuRec + 4, std::uint32_t(st.executed));
+                put32(kAuRec + 8, 1);
+            };
+        }
+        Rig rig({128, 1, false});
+        const JobSpec s = spec(0);
+        rig.push(s.desc, 64, 0);
+        jq2_port_sync(PORT, 0);
+        for (;;) pause(); /* the audit thread ends the process */
+    };
+    std::string err;
+    const int rc = run_child(child, err);
+    CHECK(rc == 70, "exit status %d, wanted 70 (a named stop)", rc);
+    const std::string path = g_xd_dir + "/" + xd_name(fp, 0, 1);
+    const std::string want = std::string("PS3STOP v=1 kind=spu-xdiff-divergence image=") + xd_fp_hex(fp) +
+                             " reason=" + (latent ? "end-ls" : "effect-payload") + " effect=" + (latent ? "none" : "") ;
+    CHECK(err.find(want) != std::string::npos, "stderr carries the stop line:\n%s", err.c_str());
+    CHECK(err.find(" authority=interp subject=lifted queue=0 seq=1 fixture=" + path) != std::string::npos,
+          "the stop names tiers, queue, seq and fixture:\n%s", err.c_str());
+    CHECK(err.find("the stop did not happen") == std::string::npos, "the child ran past the stop");
+    CHECK(get32(kAuRec + 8) == 1 && get32(kAuRec) == 1 && get32(kAuRec + 4) == 1, "at the verdict the queue had executed %u and credited %u jobs",
+          get32(kAuRec + 4), get32(kAuRec));
+    CHECK(au_out_is(JobSpec{DESC, IN, OUT, 1, 0}, 0), "the guest has the authority's output");
+    Fx fx;
+    CHECK(xd_files() == std::vector<std::string>{xd_name(fp, 0, 1)}, "fixtures: %s", join(xd_files()).c_str());
+    if (xd_read(xd_name(fp, 0, 1), fx)) CHECK(fx.f.has_verdict != 0, "the fixture carries its verdict");
+}
+void mode_audit_stop() { audit_stop_scenario(false); }
+void mode_audit_stop_latent() { audit_stop_scenario(true); }
+
+/* `sample` never waits: with the audit thread held at its first sample, eight more queue and the tenth is dropped and
+ * counted while its job completes; released, every queued sample is shadowed and equal. */
+void mode_audit_full()
+{
+    constexpr std::uint32_t kQueue = 8;
+    build_image(IMAGE, Prog::transform);
+    au_register(IMAGE, &au_interp_body, &au_interp_body);
+    const std::uint64_t fp = fp_at(IMAGE);
+    au_begin();
+    ap_hold(true);
+    Rig rig({128, 1, false});
+    std::vector<JobSpec> specs;
+    specs.push_back(au_job(rig, 0));
+    ap_wait_for([] { return g_ap.started >= 1; }, "the audit thread to take the first sample");
+    for (std::uint32_t j = 1; j <= kQueue; ++j) specs.push_back(au_job(rig, j));
+    CHECK(audit_queued() == kQueue, "%zu samples queued, wanted %u", audit_queued(), kQueue);
+    specs.push_back(au_job(rig, kQueue + 1)); /* the queue is full: this job completes, its sample is dropped */
+    AuditCounters c = au_counters(fp);
+    CHECK(c.sampled == kQueue + 2 && c.queued == kQueue + 1 && c.dropped == 1 && c.shadowed == 0,
+          "sampled %llu queued %llu dropped %llu shadowed %llu", (unsigned long long)c.sampled, (unsigned long long)c.queued,
+          (unsigned long long)c.dropped, (unsigned long long)c.shadowed);
+    ap_hold(false);
+    ap_wait_done(kQueue + 1);
+    rig.teardown();
+    for (const JobSpec& s : specs) CHECK(job_ok(s), "job %u output", s.serial);
+    c = au_counters(fp);
+    CHECK(c.shadowed == kQueue + 1 && c.equal == kQueue + 1 && c.differ == 0 && c.dropped == 1, "shadowed %llu equal %llu dropped %llu",
+          (unsigned long long)c.shadowed, (unsigned long long)c.equal, (unsigned long long)c.dropped);
+    std::set<std::uint32_t> seqs;
+    for (const auto& d : g_ap.done) seqs.insert(d.seq);
+    CHECK(seqs.size() == kQueue + 1 && seqs.count(kQueue + 2) == 0, "the dropped job (seq %u) was shadowed", kQueue + 2);
+}
+
+/* `all` waits for room: the audit thread held at its first sample, eight more fill the queue, and the worker that has
+ * the tenth parks in its hand-over (on_wait) after crediting it, so the eleventh job cannot start until the audit
+ * thread is released; then every one of the eleven is shadowed. Ordered by hooks: the audit thread alone can make
+ * room, and it is held. */
+void mode_audit_all()
+{
+    constexpr std::uint32_t kQueue = 8;
+    build_image(IMAGE, Prog::transform);
+    au_register(IMAGE, &au_interp_body, &au_interp_body);
+    const std::uint64_t fp = fp_at(IMAGE);
+    au_begin();
+    ap_hold(true);
+    Rig rig({128, 1, false});
+    std::vector<JobSpec> specs;
+    specs.push_back(au_job(rig, 0));
+    ap_wait_for([] { return g_ap.started >= 1; }, "the audit thread to take the first sample");
+    for (std::uint32_t j = 1; j <= kQueue; ++j) specs.push_back(au_job(rig, j));
+    CHECK(audit_queued() == kQueue, "%zu samples queued, wanted %u", audit_queued(), kQueue);
+    specs.push_back(au_job(rig, kQueue + 1)); /* credited; its worker now waits for room */
+    ap_wait_for([] { return g_ap.waiting >= 1; }, "the worker to wait for queue room");
+    specs.push_back(spec(kQueue + 2));
+    rig.push_wait(specs.back().desc, 64, 0); /* the only worker is parked: this job is admitted when the audit thread makes room */
+    AuditCounters c = au_counters(fp);
+    CHECK(c.dropped == 0 && c.queued == kQueue + 1, "dropped %llu queued %llu while the worker waits", (unsigned long long)c.dropped,
+          (unsigned long long)c.queued);
+    ap_hold(false);
+    CHECK(jq2_port_sync(PORT, 0) == 0, "sync");
+    ap_wait_done(kQueue + 3);
+    rig.teardown();
+    for (const JobSpec& s : specs) CHECK(job_ok(s), "job %u output", s.serial);
+    c = au_counters(fp);
+    CHECK(c.sampled == kQueue + 3 && c.queued == kQueue + 3 && c.dropped == 0 && c.shadowed == kQueue + 3 && c.equal == kQueue + 3,
+          "sampled %llu queued %llu dropped %llu shadowed %llu equal %llu", (unsigned long long)c.sampled, (unsigned long long)c.queued,
+          (unsigned long long)c.dropped, (unsigned long long)c.shadowed, (unsigned long long)c.equal);
+}
+
+/* `all` under three workers: every job is shadowed, none is dropped, every verdict is equal. For the sanitizers. */
+void mode_audit_concurrent()
+{
+    constexpr std::uint32_t kJobs = 36;
+    build_image(IMAGE, Prog::transform);
+    au_register(IMAGE, &au_interp_body, &au_interp_body);
+    const std::uint64_t fp = fp_at(IMAGE);
+    au_begin();
+    Rig rig({128, 3, false});
+    std::vector<JobSpec> specs;
+    for (std::uint32_t j = 0; j < kJobs; ++j) {
+        specs.push_back(spec(j));
+        rig.push_wait(specs.back().desc, 64, 0);
+    }
+    CHECK(jq2_port_sync(PORT, 0) == 0, "sync");
+    ap_wait_done(kJobs);
+    rig.teardown();
+    for (const JobSpec& s : specs) CHECK(job_ok(s), "job %u output", s.serial);
+    const AuditCounters c = au_counters(fp);
+    CHECK(c.jobs == kJobs && c.queued == kJobs && c.dropped == 0 && c.shadowed == kJobs && c.equal == kJobs,
+          "jobs %llu queued %llu dropped %llu shadowed %llu equal %llu", (unsigned long long)c.jobs, (unsigned long long)c.queued,
+          (unsigned long long)c.dropped, (unsigned long long)c.shadowed, (unsigned long long)c.equal);
+}
+
+/* A recording over the bound is a void / capture-limit, counted and named once, never compared and never a stop (the
+ * options say stop for both classes). Two ways over: a payload that does not fit the recorder's share of the bound
+ * (the recording stops), and a transcript that fits the recorder and not the queue (the finished recording is refused). */
+void mode_audit_oversize()
+{
+    constexpr std::uint32_t kJobs = 3;
+    constexpr std::uint32_t kFixed = 2 * SPU_XDIFF_LS_BYTES + 2 * SPU_XDIFF_REG_BYTES;
+    build_image(IMAGE, Prog::transform);
+    au_register(IMAGE, &au_interp_body, &au_interp_body);
+    const std::uint64_t fp = fp_at(IMAGE);
+    std::vector<JobSpec> specs;
+    std::string log = capture_stderr([&] {
+        au_begin();
+        Rig rig({128, 1, false});
+        set_audit_sample_limit(kFixed); /* no payload fits */
+        for (std::uint32_t j = 0; j < kJobs; ++j) specs.push_back(au_job(rig, j));
+        AuditCounters c = au_counters(fp);
+        CHECK(c.voided == kJobs && c.reason[SPU_XDIFF_R_CAPTURE_LIMIT] == kJobs && c.not_eligible == kJobs && c.queued == 0 && c.shadowed == 0,
+              "early: voided %llu capture-limit %llu not eligible %llu queued %llu", (unsigned long long)c.voided,
+              (unsigned long long)c.reason[SPU_XDIFF_R_CAPTURE_LIMIT], (unsigned long long)c.not_eligible, (unsigned long long)c.queued);
+        set_audit_sample_limit(kFixed + 200); /* the payloads fit, the ten transcript records (400 bytes) do not */
+        for (std::uint32_t j = kJobs; j < 2 * kJobs; ++j) specs.push_back(au_job(rig, j));
+        c = au_counters(fp);
+        CHECK(c.voided == 2 * kJobs && c.reason[SPU_XDIFF_R_CAPTURE_LIMIT] == 2 * kJobs && c.not_eligible == 2 * kJobs && c.queued == 0,
+              "late: voided %llu capture-limit %llu queued %llu", (unsigned long long)c.voided,
+              (unsigned long long)c.reason[SPU_XDIFF_R_CAPTURE_LIMIT], (unsigned long long)c.queued);
+        set_audit_sample_limit(SPU_XDIFF_MAX_LIVE_SAMPLE_BYTES);
+        specs.push_back(au_job(rig, 2 * kJobs)); /* a sample inside the bound still goes through */
+        ap_wait_done(1);
+        rig.teardown();
+    });
+    for (const JobSpec& s : specs) CHECK(job_ok(s), "job %u output", s.serial);
+    const AuditCounters c = au_counters(fp);
+    CHECK(c.shadowed == 1 && c.equal == 1 && c.sampled == 2 * kJobs + 1, "shadowed %llu equal %llu sampled %llu", (unsigned long long)c.shadowed,
+          (unsigned long long)c.equal, (unsigned long long)c.sampled);
+    const auto lines = au_lines(log, "[jq2-xdiff] void ");
+    CHECK(lines.size() == 1 && lines[0].find("image=" + xd_fp_hex(fp) + " ") != std::string::npos &&
+              lines[0].find("reason=capture-limit") != std::string::npos,
+          "%zu void lines:\n%s", lines.size(), log.c_str());
+    CHECK(au_lines(log, "PS3STOP").empty(), "a void stopped the run");
+    /* Effect-heavy against the bound: each store grew to at most the live limit (kFixed + 200 left 200 bytes: five
+     * records, a 200-byte payload store), never to the doubling's 64 records or 4 KiB, and was freed with the failed
+     * recording. */
+    CHECK(capture_failed_peak_capacity() <= 2 * 200, "a failed recording had grown to %llu bytes, past its bound of 400",
+          (unsigned long long)capture_failed_peak_capacity());
+}
+
+/* Shutdown drops what is queued and counts it, lets the shadow in flight finish and never waits for it; a sample handed
+ * over afterwards is dropped and counted. */
+void mode_audit_shutdown()
+{
+    constexpr std::uint32_t kQueue = 4;
+    build_image(IMAGE, Prog::transform);
+    au_register(IMAGE, &au_interp_body, &au_interp_body);
+    const std::uint64_t fp = fp_at(IMAGE);
+    au_begin();
+    ap_hold(true);
+    Rig rig({128, 1, false});
+    std::vector<JobSpec> specs;
+    specs.push_back(au_job(rig, 0));
+    ap_wait_for([] { return g_ap.started >= 1; }, "the audit thread to take the first sample");
+    for (std::uint32_t j = 1; j <= kQueue; ++j) specs.push_back(au_job(rig, j));
+    CHECK(audit_queued() == kQueue, "%zu samples queued", audit_queued());
+    audit_shutdown(); /* returns although a shadow is held in flight */
+    CHECK(audit_queued() == 0, "shutdown left %zu samples queued", audit_queued());
+    AuditCounters c = au_counters(fp);
+    CHECK(c.queued == kQueue + 1 && c.shutdown_dropped == kQueue && c.shadowed == 0, "queued %llu shutdown-dropped %llu shadowed %llu",
+          (unsigned long long)c.queued, (unsigned long long)c.shutdown_dropped, (unsigned long long)c.shadowed);
+    specs.push_back(au_job(rig, kQueue + 1)); /* handed over after shutdown */
+    c = au_counters(fp);
+    CHECK(c.dropped == 1 && c.queued == kQueue + 1, "dropped %llu queued %llu after shutdown", (unsigned long long)c.dropped,
+          (unsigned long long)c.queued);
+    ap_hold(false);
+    ap_wait_done(1);
+    rig.teardown();
+    for (const JobSpec& s : specs) CHECK(job_ok(s), "job %u output", s.serial);
+    c = au_counters(fp);
+    CHECK(c.shadowed == 1 && c.equal == 1 && c.shutdown_dropped == kQueue, "the shadow in flight finished: shadowed %llu", (unsigned long long)c.shadowed);
+    audit_shutdown(); /* twice is harmless */
+    CHECK(g_ap.done.size() == 1, "%zu shadows ran after shutdown", g_ap.done.size());
+}
+
+/* A job the audit cannot shadow is counted and named once: an image with a body and no budgeted twin (an unbounded lifted
+ * shadow could hang the audit thread), one with an inventory and no body, one with no inventory, one with event branches.
+ * None is queued, shadowed or recorded for the audit, and all run. */
+void mode_audit_ineligible()
+{
+    constexpr std::uint32_t kJobs = 3;
+    const std::uint32_t ea[4] = {IMAGE, IMAGE + 0x1000, IMAGE + 0x2000, IMAGE + 0x3000};
+    build_image(ea[0], Prog::transform);
+    for (std::uint8_t v = 1; v < 4; ++v) build_variant(ea[v], v);
+    au_register(ea[0], &au_interp_body, nullptr, 40);              /* a body, no twin */
+    au_register(ea[1], nullptr, nullptr);                          /* an inventory, no body */
+    /* ea[2]: no inventory at all */
+    au_register(ea[3], &au_interp_body, &au_interp_body, 60, false, SPU_WORKLOAD_INV_EVENT_BRANCHES);
+    std::uint64_t fp[4];
+    for (int i = 0; i < 4; ++i) fp[i] = fp_at(ea[i]);
+    std::vector<JobSpec> specs;
+    const std::string log = capture_stderr([&] {
+        au_begin();
+        Rig rig({128, 1, false});
+        for (std::uint32_t j = 0; j < 4 * kJobs; ++j) specs.push_back(au_job(rig, j, ea[j % 4]));
+        rig.teardown();
+    });
+    for (const JobSpec& s : specs) CHECK(job_ok(s), "job %u output", s.serial);
+    const AuditCounters a = au_counters(fp[0]), b = au_counters(fp[1]), d = au_counters(fp[3]);
+    CHECK(a.not_eligible == kJobs && a.no_twin == kJobs && a.no_body == 0 && a.sampled == 0 && a.queued == 0 && a.shadowed == 0,
+          "no twin: not eligible %llu no-twin %llu sampled %llu", (unsigned long long)a.not_eligible, (unsigned long long)a.no_twin,
+          (unsigned long long)a.sampled);
+    CHECK(b.not_eligible == kJobs && b.no_body == kJobs && b.no_twin == 0 && b.sampled == 0 && b.queued == 0, "no body: not eligible %llu no-body %llu",
+          (unsigned long long)b.not_eligible, (unsigned long long)b.no_body);
+    CHECK(!audit_counters(fp[2]).has_value() && audit_unattributed().not_eligible == kJobs, "no inventory: %llu counted together",
+          (unsigned long long)audit_unattributed().not_eligible);
+    CHECK(d.not_eligible == kJobs && d.no_body == 0 && d.no_twin == 0 && d.queued == 0 && d.shadowed == 0, "event branches: not eligible %llu",
+          (unsigned long long)d.not_eligible);
+    CHECK(audit_queued() == 0, "a job nobody can shadow was queued");
+    CHECK(au_lines(log, "audit-ineligible").size() == 2, "audit-ineligible lines:\n%s", log.c_str());
+    CHECK(au_lines(log, "audit-ineligible image=" + xd_fp_hex(fp[0]) + " reason=no-twin").size() == 1, "the no-twin line:\n%s", log.c_str());
+    CHECK(au_lines(log, "audit-ineligible image=" + xd_fp_hex(fp[1]) + " reason=no-body").size() == 1, "the no-body line:\n%s", log.c_str());
+    CHECK(au_lines(log, "[jq2-xdiff] differ").empty(), "something was compared");
+}
+
+/* A named stop raised by the subject inside a shadow is void / host-fault for that sample, not a stop of the process: the
+ * run goes on, the audit thread is reusable afterwards (the next shadow of another image is equal), and the line the
+ * subject's stop leaves is the shadow's. The options say stop for both classes: a void never stops. */
+void mode_audit_host_fault()
+{
+    constexpr std::uint32_t kStopping = 3, kFine = 2;
+    const std::uint32_t ea[2] = {IMAGE, IMAGE + 0x1000};
+    build_image(ea[0], Prog::transform);
+    build_variant(ea[1], 1);
+    au_register(ea[0], &au_interp_body, &au_stop_body, 40);
+    au_register(ea[1], &au_interp_body, &au_interp_body, 50);
+    const std::uint64_t fpa = fp_at(ea[0]), fpb = fp_at(ea[1]);
+    CHECK(std::strcmp(spu_diag_tag(), "") == 0, "the tag outside a shadow is empty");
+    spu_diag_shadow_set(1);
+    CHECK(std::strcmp(spu_diag_tag(), "[shadow] ") == 0, "the tag inside a shadow");
+    spu_diag_shadow_set(0);
+    std::vector<JobSpec> specs;
+    const std::string log = capture_stderr([&] {
+        au_begin();
+        Rig rig({128, 1, false});
+        for (std::uint32_t j = 0; j < kStopping; ++j) specs.push_back(au_job(rig, j, ea[0]));
+        for (std::uint32_t j = kStopping; j < kStopping + kFine; ++j) specs.push_back(au_job(rig, j, ea[1]));
+        ap_wait_done(kStopping + kFine);
+        rig.teardown();
+    });
+    for (const JobSpec& s : specs) CHECK(job_ok(s), "job %u output", s.serial);
+    const AuditCounters a = au_counters(fpa), b = au_counters(fpb);
+    CHECK(a.shadowed == kStopping && a.voided == kStopping && a.reason[SPU_XDIFF_R_HOST_FAULT] == kStopping && a.differ == 0,
+          "stopping image: shadowed %llu void %llu host-fault %llu", (unsigned long long)a.shadowed, (unsigned long long)a.voided,
+          (unsigned long long)a.reason[SPU_XDIFF_R_HOST_FAULT]);
+    CHECK(b.shadowed == kFine && b.equal == kFine, "the audit thread after the diverted stops: shadowed %llu equal %llu",
+          (unsigned long long)b.shadowed, (unsigned long long)b.equal);
+    CHECK(au_lines(log, "PS3STOP").empty(), "the process stopped:\n%s", log.c_str());
+    CHECK(au_lines(log, "[shadow] [spu-xdiff] the subject raised a named stop (kind=jq2-state").size() == kStopping, "the shadow's lines:\n%s",
+          log.c_str());
+    CHECK(au_lines(log, "[jq2-xdiff] void image=" + xd_fp_hex(fpa) + " ").size() == 1, "the void is named once per image and reason:\n%s",
+          log.c_str());
+}
+
+/* The most a difference writes: 16 fixtures per image, the rest counted, every difference named. */
+void mode_audit_fixtures_cap()
+{
+    constexpr std::uint32_t kJobs = 20, kCap = 16;
+    build_image(IMAGE, Prog::transform);
+    au_register(IMAGE, &au_bad_body, &au_bad_body);
+    const std::uint64_t fp = fp_at(IMAGE);
+    std::vector<JobSpec> specs;
+    const std::string log = capture_stderr([&] {
+        au_begin();
+        Rig rig({128, 1, false});
+        for (std::uint32_t j = 0; j < kJobs; ++j) specs.push_back(au_job(rig, j));
+        ap_wait_done(kJobs);
+        rig.teardown();
+    });
+    for (const JobSpec& s : specs) CHECK(job_ok(s), "job %u output", s.serial);
+    const AuditCounters c = au_counters(fp);
+    CHECK(c.differ == kJobs && c.fixtures == kCap && c.fixtures_over == kJobs - kCap, "differ %llu fixtures %llu over %llu",
+          (unsigned long long)c.differ, (unsigned long long)c.fixtures, (unsigned long long)c.fixtures_over);
+    std::vector<std::string> want_files = xd_names(fp, 1, kCap);
+    std::sort(want_files.begin(), want_files.end()); /* xd_files() is sorted as strings: s10 before s2 */
+    CHECK(xd_files() == want_files, "fixtures: %s", join(xd_files()).c_str());
+    CHECK(au_lines(log, "[jq2-xdiff] differ ").size() == kJobs, "differ lines:\n%s", log.c_str());
+    CHECK(au_lines(log, "fixture=none").size() == kJobs - kCap, "the lines past the bound name no fixture");
+}
+
+/* A directory that cannot be used is one line and no fixtures; the difference is still named and counted. */
+void mode_audit_baddir()
+{
+    build_image(IMAGE, Prog::transform);
+    au_register(IMAGE, &au_bad_body, &au_bad_body);
+    const std::uint64_t fp = fp_at(IMAGE);
+    JobSpec s{};
+    const std::string log = capture_stderr([&] {
+        au_begin();
+        Rig rig({128, 1, false});
+        s = au_job(rig, 0);
+        ap_wait_done(1);
+        rig.teardown();
+    });
+    CHECK(job_ok(s), "output");
+    CHECK(au_lines(log, "[jq2-xdiff] fixtures-off reason=bad-dir").size() == 1, "one line says the directory is unusable:\n%s", log.c_str());
+    const auto lines = au_lines(log, "[jq2-xdiff] differ ");
+    CHECK(lines.size() == 1 && lines[0].find(" fixture=none") != std::string::npos, "the difference without a fixture:\n%s", log.c_str());
+    const AuditCounters c = au_counters(fp);
+    CHECK(c.differ == 1 && c.fixtures == 0 && c.fixtures_over == 0, "differ %llu fixtures %llu", (unsigned long long)c.differ, (unsigned long long)c.fixtures);
+}
+
+/* The roles are symmetric: under spu.job_body=lifted the registered body is the authority and the interpreter the
+ * shadow, with no twin needed. A body that differs puts ITS output into the guest and is reported with the tiers the
+ * other way round; one that equals the interpreter is `equal`. */
+void mode_audit_lifted()
+{
+    const std::uint32_t ea[2] = {IMAGE, IMAGE + 0x1000};
+    build_image(ea[0], Prog::transform);
+    build_variant(ea[1], 1);
+    au_register(ea[0], &au_bad_body, nullptr, 40, true);
+    au_register(ea[1], &au_interp_body, nullptr, 50, true);
+    const std::uint64_t fpa = fp_at(ea[0]), fpb = fp_at(ea[1]);
+    std::vector<JobSpec> specs;
+    const std::string log = capture_stderr([&] {
+        au_begin();
+        Rig rig({128, 1, false});
+        for (std::uint32_t j = 0; j < 4; ++j) specs.push_back(au_job(rig, j, ea[j / 2]));
+        ap_wait_done(4);
+        rig.teardown();
+    });
+    for (std::uint32_t j = 0; j < 4; ++j) CHECK(au_out_is(specs[j], j < 2 ? 1u : 0u), "job %u: the guest has the authority's output", j);
+    const AuditCounters a = au_counters(fpa), b = au_counters(fpb);
+    CHECK(a.shadowed == 2 && a.differ == 2 && a.differ_visible == 2 && a.reason[SPU_XDIFF_R_EFFECT_PAYLOAD] == 2 && a.no_twin == 0,
+          "bad body: shadowed %llu differ %llu", (unsigned long long)a.shadowed, (unsigned long long)a.differ);
+    CHECK(b.shadowed == 2 && b.equal == 2 && b.not_eligible == 0, "equal body: shadowed %llu equal %llu", (unsigned long long)b.shadowed,
+          (unsigned long long)b.equal);
+    const auto lines = au_lines(log, "[jq2-xdiff] differ ");
+    CHECK(lines.size() == 2 && lines[0].find(" authority=lifted subject=interp fixture=") != std::string::npos, "the lines:\n%s", log.c_str());
+    Fx fx;
+    if (xd_read(xd_name(fpa, 0, 1), fx)) {
+        const spu_xdiff_body_id& body = fx.f.identity.authority;
+        CHECK(body.tier == SPU_TIER_LIFTED && body.lifter_abi == SPU_RUNTIME_LIFTER_ABI && fx.f.verdict.subject_body.tier == SPU_TIER_INTERP,
+              "tiers: authority %u abi %u subject %u", body.tier, body.lifter_abi, fx.f.verdict.subject_body.tier);
+    }
+}
+
+/* spu.xdiff_period = 3 counts per image from its first job: of seven jobs of each of two interleaved images the first,
+ * fourth and seventh are shadowed. */
+void mode_audit_period()
+{
+    constexpr std::uint32_t kPerImage = 7;
+    const std::uint32_t ea[2] = {IMAGE, IMAGE + 0x1000};
+    build_image(ea[0], Prog::transform);
+    build_variant(ea[1], 1);
+    au_register(ea[0], &au_interp_body, &au_interp_body, 40);
+    au_register(ea[1], &au_interp_body, &au_interp_body, 50);
+    const std::uint64_t fp[2] = {fp_at(ea[0]), fp_at(ea[1])};
+    au_begin();
+    Rig rig({128, 1, false});
+    std::vector<JobSpec> specs;
+    for (std::uint32_t j = 0; j < 2 * kPerImage; ++j) specs.push_back(au_job(rig, j, ea[j % 2]));
+    ap_wait_done(6);
+    rig.teardown();
+    for (const JobSpec& s : specs) CHECK(job_ok(s), "job %u output", s.serial);
+    std::set<std::pair<std::uint64_t, std::uint32_t>> got, want;
+    for (const auto& d : g_ap.done) got.insert({d.fp, d.seq});
+    /* One worker, the jobs in order: job j has seq j + 1 and is the (j / 2)-th job of its image. */
+    for (std::uint32_t j = 0; j < 2 * kPerImage; ++j)
+        if ((j / 2) % 3 == 0) want.insert({fp[j % 2], j + 1});
+    CHECK(got == want, "%zu samples shadowed, wanted the %zu of jobs 1, 4 and 7 of each image", got.size(), want.size());
+    for (const std::uint64_t f : fp) {
+        const AuditCounters c = au_counters(f);
+        CHECK(c.jobs == kPerImage && c.sampled == 3 && c.queued == 3 && c.dropped == 0 && c.shadowed == 3 && c.equal == 3,
+              "image 0x%016llX: jobs %llu sampled %llu shadowed %llu", (unsigned long long)f, (unsigned long long)c.jobs,
+              (unsigned long long)c.sampled, (unsigned long long)c.shadowed);
+    }
+}
+
+/* The trace of a job under the audit (ps3_ftrace.h; docs/SPU_XDIFF.md section 14): kind 32 once per job with a JOB span,
+ * zero length when it was not sampled, with the authority's tier and what became of the sample; kind 33 once per shadow
+ * run with its verdict, reason and tier. Period 2: jobs 1 and 3 are queued, 2 and 4 not sampled. */
+void mode_audit_trace()
+{
+    constexpr std::uint32_t kJobs = 4;
+    build_image(IMAGE, Prog::transform);
+    au_register(IMAGE, &au_interp_body, &au_interp_body);
+    CHECK(PS3_FT_ON(), "tracing is on"); /* before any worker: a hook sees "off" while another thread initialises */
+    au_begin();
+    Rig rig({128, 1, false});
+    for (std::uint32_t j = 0; j < kJobs; ++j) au_job(rig, j);
+    ap_wait_done(2);
+    rig.teardown();
+    const std::vector<ps3_ft_rec> bodies = ft_kind(PS3_FT_JQ2_BODY);
+    CHECK(bodies.size() == kJobs, "%zu kind-32 records for %u jobs", bodies.size(), kJobs);
+    std::map<std::uint32_t, ps3_ft_rec> by_seq32;
+    for (const ps3_ft_rec& r : bodies) by_seq32[r.a] = r;
+    for (std::uint32_t seq = 1; seq <= kJobs; ++seq) {
+        const auto it = by_seq32.find(seq);
+        CHECK(it != by_seq32.end(), "no kind 32 for seq %u", seq);
+        if (it == by_seq32.end()) continue;
+        const ps3_ft_rec& r = it->second;
+        const std::uint32_t disposition = seq % 2 == 1 ? kQueued : kNotSampled;
+        CHECK(r.who == 0 && r.b == (std::uint32_t{SPU_TIER_INTERP} | disposition << 8), "seq %u: who 0x%X b 0x%X, wanted disposition %u", seq, r.who, r.b,
+              disposition);
+        CHECK(disposition != kNotSampled || r.t0 == r.t1, "seq %u: a job that was not sampled has a span of %llu ns", seq, (unsigned long long)(r.t1 - r.t0));
+        CHECK(r.t1 >= r.t0, "seq %u: the span runs backwards", seq);
+    }
+    const std::vector<ps3_ft_rec> shadows = ft_kind(PS3_FT_JQ2_XDIFF);
+    std::set<std::uint32_t> seqs;
+    for (const ps3_ft_rec& r : shadows) {
+        seqs.insert(r.a);
+        CHECK(r.who == 0 && r.b == (std::uint32_t{SPU_XDIFF_EQUAL} | std::uint32_t{SPU_XDIFF_R_NONE} << 8 | std::uint32_t{SPU_TIER_LIFTED} << 16),
+              "seq %u: kind 33 who 0x%X b 0x%X", r.a, r.who, r.b);
+        CHECK(r.t1 >= r.t0, "the subject's span runs backwards");
+    }
+    CHECK(shadows.size() == 2 && seqs == std::set<std::uint32_t>({1, 3}), "%zu kind-33 records", shadows.size());
+}
+
+/* spu.job_body=lifted with the audit off still emits kind 32 for each job (the tier that ran, never sampled, the
+ * authority's lift misses saturated at 255) and no kind 33. */
+void mode_audit_trace_lifted()
+{
+    constexpr std::uint32_t kJobs = 3;
+    build_image(IMAGE, Prog::transform);
+    au_register(IMAGE, &au_miss_body, nullptr, 40, true);
+    CHECK(PS3_FT_ON(), "tracing is on");
+    au_begin();
+    Rig rig({128, 1, false});
+    for (std::uint32_t j = 0; j < kJobs; ++j) au_job(rig, j);
+    rig.teardown();
+    const std::vector<ps3_ft_rec> bodies = ft_kind(PS3_FT_JQ2_BODY);
+    CHECK(bodies.size() == kJobs, "%zu kind-32 records for %u jobs", bodies.size(), kJobs);
+    for (const ps3_ft_rec& r : bodies) {
+        CHECK(r.b == (std::uint32_t{SPU_TIER_LIFTED} | std::uint32_t{kNotSampled} << 8 | 255u << 16), "seq %u: b 0x%X", r.a, r.b);
+        CHECK(r.t0 == r.t1, "a job that was not sampled has a span");
+    }
+    CHECK(ft_kind(PS3_FT_JQ2_XDIFF).empty(), "a shadow ran with the audit off");
+}
+
+/* The default (interpreter, audit off) emits neither kind, and the jobs still have their JOB spans. */
+void mode_audit_trace_none()
+{
+    constexpr std::uint32_t kJobs = 3;
+    build_image(IMAGE, Prog::transform);
+    CHECK(PS3_FT_ON(), "tracing is on");
+    install_hooks();
+    Rig rig({128, 1, false});
+    for (std::uint32_t j = 0; j < kJobs; ++j) au_job(rig, j);
+    rig.teardown();
+    CHECK(ft_kind(PS3_FT_JQ2_JOB).size() == kJobs, "the jobs have no JOB spans");
+    CHECK(ft_kind(PS3_FT_JQ2_BODY).empty() && ft_kind(PS3_FT_JQ2_XDIFF).empty(), "a record of the body or a shadow with both options at default");
+    CHECK(!record_active(), "a job pays for recording with capture and the audit both off");
+}
+
+/* One recording serves the capture and the audit: with both on, a job is identified once (one content hash, one
+ * fingerprint for the one content), the capture writes its fixture, and the audit shadows every job. */
+void mode_audit_shared()
+{
+    constexpr std::uint32_t kJobs = 3;
+    build_image(IMAGE, Prog::transform);
+    au_register(IMAGE, &au_interp_body, &au_interp_body);
+    const std::uint64_t fp = fp_at(IMAGE);
+    const IdentifyCounts before = identify_counts();
+    au_begin();
+    Rig rig({128, 1, false});
+    std::vector<JobSpec> specs;
+    for (std::uint32_t j = 0; j < kJobs; ++j) specs.push_back(au_job(rig, j));
+    ap_wait_done(kJobs);
+    rig.teardown();
+    for (const JobSpec& s : specs) CHECK(job_ok(s), "job %u output", s.serial);
+    check_identified(before, kJobs, 1, "capture + audit");
+    CHECK(xd_files() == xd_names(fp, 1, 1), "fixtures: %s", join(xd_files()).c_str());
+    const auto cap = capture_counters(fp);
+    CHECK(cap && cap->captured == 1 && cap->failed == 0, "captured %llu", (unsigned long long)(cap ? cap->captured : 0));
+    const AuditCounters c = au_counters(fp);
+    CHECK(c.queued == kJobs && c.shadowed == kJobs && c.equal == kJobs && c.dropped == 0, "queued %llu shadowed %llu equal %llu",
+          (unsigned long long)c.queued, (unsigned long long)c.shadowed, (unsigned long long)c.equal);
+    Fx fx;
+    if (xd_read(xd_name(fp, 0, 1), fx)) {
+        CHECK(fx.f.has_verdict == 0, "an equal shadow wrote a verdict into the captured fixture");
+        xd_check_job(fx.f, specs[0], 1, SPU_TIER_INTERP);
+    }
+}
+
+/* A knob that changes what the interpreter computes refuses the audit for the process, once, and the jobs run: a shadow
+ * under it would compare another program. */
+void mode_audit_refused()
+{
+    build_image(IMAGE, Prog::transform);
+    au_register(IMAGE, &au_interp_body, &au_interp_body);
+    const std::uint64_t fp = fp_at(IMAGE);
+    std::vector<JobSpec> specs;
+    const std::string log = capture_stderr([&] {
+        au_begin();
+        Rig rig({128, 1, false});
+        for (std::uint32_t j = 0; j < 2; ++j) specs.push_back(au_job(rig, j));
+        rig.teardown();
+    });
+    for (const JobSpec& s : specs) CHECK(job_ok(s), "job %u output", s.serial);
+    CHECK(au_lines(log, "[jq2-xdiff] audit-off reason=refused-knob detail=SPU_TAILRET").size() == 1, "the refusal:\n%s", log.c_str());
+    CHECK(!audit_active() && !audit_counters(fp).has_value() && audit_queued() == 0 && g_ap.done.empty(), "the audit ran");
+}
+
+/* The audit's ordinal of a job counts every job of its image, recorded or not: with the odd jobs running an unknown body
+ * (a forced body that is neither the interpreter nor the registered one), period 2 still shadows jobs 1, 3, 5 and 7, as
+ * it would had every job been eligible. */
+JobBody au_alternate_select(void*, const JobStart& js)
+{
+    return serial_of(js) % 2 != 0 ? JobBody{&lifted_normal_entry, -1} : JobBody{};
+}
+void mode_audit_ordinal()
+{
+    constexpr std::uint32_t kJobs = 8;
+    build_image(IMAGE, Prog::transform);
+    au_register(IMAGE, &au_interp_body, &au_interp_body);
+    const std::uint64_t fp = fp_at(IMAGE);
+    au_begin();
+    ExecutorHooks h;
+    h.on_admit = &hook_admit;
+    h.on_done = &hook_done;
+    h.on_end = &hook_end;
+    h.select_body = &au_alternate_select;
+    set_executor_hooks(h);
+    Rig rig({128, 1, false});
+    std::vector<JobSpec> specs;
+    for (std::uint32_t j = 0; j < kJobs; ++j) specs.push_back(au_job(rig, j));
+    ap_wait_done(kJobs / 2);
+    rig.teardown();
+    for (const JobSpec& s : specs) CHECK(job_ok(s), "job %u output", s.serial);
+    std::set<std::uint32_t> seqs;
+    for (const auto& d : g_ap.done) seqs.insert(d.seq);
+    CHECK(seqs == std::set<std::uint32_t>({1, 3, 5, 7}), "%zu shadowed jobs, wanted seqs 1 3 5 7", seqs.size());
+    const AuditCounters c = au_counters(fp);
+    const auto cap = capture_counters(fp);
+    CHECK(c.jobs == kJobs && c.sampled == kJobs / 2 && c.shadowed == kJobs / 2 && c.equal == kJobs / 2, "jobs %llu sampled %llu shadowed %llu",
+          (unsigned long long)c.jobs, (unsigned long long)c.sampled, (unsigned long long)c.shadowed);
+    CHECK(cap && cap->ineligible_unknown_body == kJobs / 2, "%llu unknown-body jobs", (unsigned long long)(cap ? cap->ineligible_unknown_body : 0));
+}
+
+/* A host that cannot allocate the shadow context turns the audit off at configure, with one line: no producer records, no
+ * thread runs, and the jobs are untouched. */
+void mode_audit_alloc_fail()
+{
+    build_image(IMAGE, Prog::transform);
+    au_register(IMAGE, &au_interp_body, &au_interp_body);
+    const std::uint64_t fp = fp_at(IMAGE);
+    set_audit_shadow_alloc_fail(true);
+    std::vector<JobSpec> specs;
+    const std::string log = capture_stderr([&] {
+        au_begin();
+        Rig rig({128, 1, false});
+        for (std::uint32_t j = 0; j < 2; ++j) specs.push_back(au_job(rig, j));
+        rig.teardown();
+    });
+    for (const JobSpec& s : specs) CHECK(job_ok(s), "job %u output", s.serial);
+    CHECK(au_lines(log, "[jq2-xdiff] audit-off reason=no-memory").size() == 1, "the line:\n%s", log.c_str());
+    CHECK(!audit_active() && !record_active() && !audit_counters(fp).has_value() && audit_queued() == 0 && g_ap.done.empty() && g_ap.started == 0,
+          "the audit ran");
+}
+
+/* The options of an audit mode, in the environment before anything reads the configuration. */
+void au_prologue(const std::string& mode)
+{
+    std::string tmpl = (fs::temp_directory_path() / "jq2_audit.XXXXXX").string();
+    if (mkdtemp(tmpl.data()) == nullptr) {
+        std::perror("mkdtemp");
+        std::exit(2);
+    }
+    g_xd_dir = tmpl;
+    const char* xdiff = "sample";
+    std::string period = "1", on_divergence = "report", on_latent = "report", job_body = "interp", capture = "0", dir = g_xd_dir;
+    /* `sample` drops a sample while the audit thread lags and eight are queued, which a test with more samples than that
+     * must not depend on: it runs under `all`, which waits for room. */
+    if (mode == "audit-all" || mode == "audit-concurrent" || mode == "audit-fixtures-cap") xdiff = "all";
+    else if (mode == "audit-shared") {
+        xdiff = "all";
+        capture = "1";
+    } else if (mode == "audit-period") period = "3";
+    else if (mode == "audit-ordinal") period = "2";
+    else if (mode == "audit-trace") period = "2";
+    else if (mode == "audit-latent" || mode == "audit-stop") on_divergence = "stop";
+    else if (mode == "audit-stop-latent") on_latent = "stop";
+    else if (mode == "audit-oversize" || mode == "audit-host-fault") on_divergence = on_latent = "stop"; /* a void never stops */
+    else if (mode == "audit-lifted") job_body = "lifted";
+    else if (mode == "audit-baddir") dir += "/missing";
+    else if (mode == "audit-trace-lifted") {
+        xdiff = "off";
+        job_body = "lifted";
+    } else if (mode == "audit-trace-none") xdiff = "off";
+    else if (mode == "audit-refused") setenv("SPU_TAILRET", "0", 1);
+    setenv("PS3RECOMP_SPU_XDIFF", xdiff, 1);
+    setenv("PS3RECOMP_SPU_XDIFF_PERIOD", period.c_str(), 1);
+    setenv("PS3RECOMP_SPU_XDIFF_ON_DIVERGENCE", on_divergence.c_str(), 1);
+    setenv("PS3RECOMP_SPU_XDIFF_ON_LATENT", on_latent.c_str(), 1);
+    setenv("PS3RECOMP_SPU_JOB_BODY", job_body.c_str(), 1);
+    setenv("PS3RECOMP_SPU_XDIFF_CAPTURE", capture.c_str(), 1);
+    setenv("PS3RECOMP_SPU_XDIFF_DIR", dir.c_str(), 1);
+    if (mode.rfind("audit-trace", 0) == 0) {
+        setenv("PS3_FTRACE", "0:100000:/dev/null", 1);
+        setenv("PS3_FTRACE_CAP", "65536", 1);
+    }
+}
+
 /* The options of an xdiff mode, in the environment before anything reads the configuration. */
 void xd_prologue(const std::string& mode)
 {
@@ -4514,6 +5449,8 @@ int main(int argc, char** argv)
     }
     /* The capture options are read when the first job starts and never again: the xdiff modes set them first. */
     if (mode.rfind("xdiff-", 0) == 0) xd_prologue(mode);
+    /* The audit options likewise: read at the first queue. */
+    if (mode.rfind("audit-", 0) == 0) au_prologue(mode);
     if (mode == "premature") mode_premature();
     else if (mode == "copy") mode_copy();
     else if (mode == "credit") mode_credit();
@@ -4612,6 +5549,28 @@ int main(int argc, char** argv)
     else if (mode == "xdiff-select-collision") mode_xdiff_select_collision();
     else if (mode == "xdiff-select-lifted") mode_xdiff_select_lifted();
     else if (mode == "xdiff-select-trace") mode_xdiff_select_trace();
+    else if (mode == "audit-divergence") mode_audit_divergence();
+    else if (mode == "audit-latent") mode_audit_latent();
+    else if (mode == "audit-stop") mode_audit_stop();
+    else if (mode == "audit-stop-latent") mode_audit_stop_latent();
+    else if (mode == "audit-full") mode_audit_full();
+    else if (mode == "audit-all") mode_audit_all();
+    else if (mode == "audit-concurrent") mode_audit_concurrent();
+    else if (mode == "audit-oversize") mode_audit_oversize();
+    else if (mode == "audit-shutdown") mode_audit_shutdown();
+    else if (mode == "audit-ineligible") mode_audit_ineligible();
+    else if (mode == "audit-host-fault") mode_audit_host_fault();
+    else if (mode == "audit-fixtures-cap") mode_audit_fixtures_cap();
+    else if (mode == "audit-baddir") mode_audit_baddir();
+    else if (mode == "audit-lifted") mode_audit_lifted();
+    else if (mode == "audit-period") mode_audit_period();
+    else if (mode == "audit-trace") mode_audit_trace();
+    else if (mode == "audit-trace-lifted") mode_audit_trace_lifted();
+    else if (mode == "audit-trace-none") mode_audit_trace_none();
+    else if (mode == "audit-ordinal") mode_audit_ordinal();
+    else if (mode == "audit-alloc-fail") mode_audit_alloc_fail();
+    else if (mode == "audit-shared") mode_audit_shared();
+    else if (mode == "audit-refused") mode_audit_refused();
     else {
         std::printf("unknown mode %s\n", mode.c_str());
         return 2;

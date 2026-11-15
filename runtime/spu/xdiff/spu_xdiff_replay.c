@@ -18,6 +18,7 @@
 #include "../spurs_job.h"
 #include "spu_xdiff_census.h"
 #include "ps3emu/lifter_abi.h"
+#include "ps3emu/stop.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -99,8 +100,10 @@ struct poison_run;
 typedef struct replay {
     const spu_xdiff_fixture* f;
     spu_xdiff_verdict_record* v;
+    spu_context* ctx;    /* the shadow's context, for the stop diversion */
     uint32_t cursor;     /* the next transcript record */
     int      failed;     /* the serve table filled the verdict and ended the run */
+    int      host_fault; /* a named stop was raised inside the subject and diverted */
     uint64_t budget;     /* T0 instruction budget; 0: none */
     uint64_t spent;
     int      over_budget;
@@ -425,6 +428,23 @@ static void entry_interp(spu_context* ctx)
     spu_interp_run(ctx, ctx->pc);
 }
 
+/* ---- a named stop inside the subject (section 10) ----------------------------- */
+
+/* The subject is code under test: a lifted body or the interpreter reaching ps3_stop is a fault of the
+ * subject, not a reason to end a process that has a game in it (the audit thread runs in a title's process).
+ * Installed on the calling thread for the run only, so a stop raised anywhere else is untouched. It leaves
+ * through the halt landing pad the run is under (spu_port_serve_halt), which also restores the interpreter's
+ * nesting depth; if no pad were armed it aborts there, and so fails closed. */
+static void stop_diverted(void* user, ps3_stop_kind kind, const char* what)
+{
+    replay* r = (replay*)user;
+    r->host_fault = 1;
+    fprintf(stderr, "%s[spu-xdiff] the subject raised a named stop (kind=%s: %s); it is void / host-fault for this run, "
+                    "not a stop of the process\n",
+            spu_diag_tag(), ps3_stop_kind_id(kind), what ? what : "");
+    spu_port_serve_halt(r->ctx, "a named stop was raised inside the subject");
+}
+
 /* ---- the shadow ------------------------------------------------------------- */
 
 spu_xdiff_shadow* spu_xdiff_shadow_new(void)
@@ -543,6 +563,7 @@ static uint32_t replay_core(const spu_xdiff_fixture* f, const spu_xdiff_replay_o
     memset(r, 0, sizeof *r);
     r->f = f;
     r->v = out;
+    r->ctx = ctx;
     s->port.serve = &k_serve;
     s->port.serve_user = r;
     s->port.tap = NULL;
@@ -563,7 +584,9 @@ static uint32_t replay_core(const spu_xdiff_fixture* f, const spu_xdiff_replay_o
         spu_observer_set(ctx, &s->obs);
     }
 
+    ps3_stop_divert_begin(stop_diverted, r);
     const int halted = spu_run_with_halt(entry, ctx);
+    ps3_stop_divert_end();
     /* The twin's own counter is the context's: what is left of the budget, and the unwind's status. */
     if (twin) {
         out->budget_spent = opt->budget - ctx->budget;
@@ -583,6 +606,7 @@ static uint32_t replay_core(const spu_xdiff_fixture* f, const spu_xdiff_replay_o
         abort();
     }
 
+    if (r->host_fault) return verdict_of(out, SPU_XDIFF_R_HOST_FAULT);   /* a stop inside the subject, diverted */
     if (r->failed) return out->verdict;   /* the serve table filled the record */
     if (r->over_budget) return verdict_of(out, SPU_XDIFF_R_BUDGET);
     if (ctx->lift_miss) return verdict_of(out, SPU_XDIFF_R_UNLIFTED_BRANCH);

@@ -1067,7 +1067,7 @@ line there and one row in `docs/CONFIG.md` (`:63`, `:185-186`).
 |---|---|---|---|
 | `spu.job_body` | `interp` \| `lifted` | `interp` | which tier is the authority: T0, or the image's registered body |
 | `spu.xdiff` | `off` \| `sample` \| `all` | `off` | whether the other tier shadows |
-| `spu.xdiff_period` | u32, 1.. | 64 | `sample`: every N-th job of an image, counted per image from its first job |
+| `spu.xdiff_period` | u32, 1.. | 64 | `sample`: every N-th job of an image, counted per image from its first job (jobs 1, N+1, 2N+1, ...) |
 | `spu.xdiff_on_divergence` | `report` \| `stop` | `report` | what a visible `differ` does to the run (section 8.4) |
 | `spu.xdiff_on_latent` | `report` \| `stop` | `report` | what a latent `differ` does to the run |
 | `spu.xdiff_budget` | u32, 1.. | 2^28 | the shadow's budget (section 10) |
@@ -1142,7 +1142,27 @@ credit the job                     -- queue -->  build the shadow context
   `void` never stops a run; it is counted.
 - **Shutdown** drops what is queued and counts it. The audit thread never
   delays an exit.
-- **Benchmarks run with `xdiff=off`.** Recording perturbs timing.
+- **Benchmarks run with `xdiff=off`.** Recording perturbs timing. With
+  `off` the worker's job path does not touch audit state (measured with
+  commit 10b: a 6000-job loop within its run-to-run noise of the base).
+- **A T1 shadow needs the budgeted twin.** An unbounded lifted shadow could
+  hold the audit thread for ever, so a T0 authority is shadowed only when
+  the image has a registered body and a registered twin (row 9,
+  `--budget-twin`); otherwise the image is named once as `no-body` or
+  `no-twin` and counted not eligible.
+- **A shadow cannot end the process, and does not speak as the
+  authority.** While the subject runs, the audit thread holds a one-shot,
+  thread-local stop divert (`ps3_stop_divert_begin`, `runtime/diag/stop.cpp`):
+  a `ps3_stop` reached by the subject unwinds to the replay's landing pad
+  and the sample is `void` / `host-fault`; the audit thread's own
+  `spu-xdiff-divergence` stop is outside the divert. Diagnostics the SPU
+  runtime prints unconditionally on a shadow-reachable path carry the
+  thread's tag (`spu_diag_shadow_set`, `spu_diag_tag`: `[shadow] `).
+  Environment-gated traces (`SPU_TRACE` and its siblings, `SPU_CHHIST`,
+  `SPU_IRQTRACE`, the `[pchist]`, `[spu-lowread]` and `[wws-*]` probes) and
+  the lifted code's own prints are not tagged: they are diagnostics a
+  developer turns on for one run, and a shadow running beside them is
+  visible from the `[jq2-xdiff]` lines around it.
 
 ## 12. Build-time contract
 

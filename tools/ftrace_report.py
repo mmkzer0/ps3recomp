@@ -142,8 +142,8 @@ import tempfile
  AUDIO_MIX, AUDIO_PACE, AUDIO_UNDERRUN, AUDIO_STALE,
  JQ2_PUSH, JQ2_JOB, JQ2_CREDIT, JQ2_SYNC_WAIT, JQ2_IDLE, JQ2_HELD, JQ2_BARRIER,
  JQ2_IMAGE, AUDIO_RING, AUDIO_RING_VIEW, JQ2_BODY, JQ2_XDIFF) = range(1, 34)
-# Kinds 32 and 33 are numbered here until include/ps3emu/ps3_ftrace.h gets them with the xdiff
-# runtime commit; this tuple is then the one place the tool owns the numbers.
+# The numbers mirror include/ps3emu/ps3_ftrace.h (PS3_FT_*, 32 and 33 included); the tool reads text
+# traces without the header, so a new kind is added in both places.
 # Labels are report keys that saved runs and scripts compare: keep them, append new reasons.
 AUDIO_PACE_REASON = {1: "queue full", 2: "clock pacing", 3: "backend wait", 4: "restart"}
 JQ2_FIBER_WAKE = 2       # wake field of a fiber wait or wake; it carries waiter 0xFF, so it cannot be joined
