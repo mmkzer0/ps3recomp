@@ -488,7 +488,9 @@ against the manifest's directory:
     "sha256": "0123…(64 hex)…cdef",
     "ls_base": "0x7C00",
     "code_end": "0x16168",
-    "extra_entry_points": ["0xA2C"]
+    "extra_entry_points": ["0xA2C"],
+    "return_entries": true,
+    "promoted": true
   }
 ]
 ```
@@ -508,6 +510,20 @@ against the manifest's directory:
 - `extra_entry_points` are optional LS addresses passed to `--extra-funcs`, for
   entries the branch analysis cannot see (interrupt vectors, jump-table
   handlers). They must be 4-byte aligned and below `code_end` when that is set.
+- `return_entries` is an optional boolean (default `false`) passed to the
+  lifter's `--return-entries`, which makes every call's return address an entry
+  point of its own. Code that is *resumed* rather than returned to needs it:
+  setjmp/longjmp-style coroutines in a job abandon the lifted call's host frame,
+  so the return site is reached through dispatch later.
+- `promoted` is an optional boolean (default `false`) copied into the image's
+  program record; it changes no lift. It is the port's statement that the
+  evidence of `docs/SPU_XDIFF.md` section 12.4 is held for this image, and the
+  generated registry marks it promoted (under `spu.job_body=lifted` only
+  promoted images run their lifted body).
+
+Both booleans are strict: a JSON number, string or null is a named manifest
+error, never an implicit true. They are copied to the program record, so a
+reader of `inventory.json` sees what the port decided about the image.
 
 The registration fingerprint is the FNV-1a-64 over the **whole blob** — which is
 exactly the staged bytes and therefore exactly what
@@ -516,6 +532,28 @@ ELF-extent rule (`spu_elf_image_size`) and there is no separate text-segment
 alias: a raw job is dispatched by those bytes and nothing else. The pipeline
 tests compile the runtime's fingerprint function against the generated blob and
 assert the C and Python values agree.
+
+Each program record also carries the lift's options, as
+`lift_options_string` (the canonical form) and `lift_options` (its hash). The
+canonical string lists, in this fixed order, the options that change one image's
+generated code: `code_end`, `extra` (the sorted extra entry points the lifter
+received), `merge_chunks` and `return_entries`, lowercase hex, `;`-separated, an
+absent option omitted:
+
+```text
+code_end=0x16168;extra=0xa2c,0xb00;merge_chunks=1;return_entries=1
+```
+
+`lift_options` is the FNV-1a-64 of those ASCII bytes as 16 hex digits (the
+empty string for a lift that passed none of the four, which still hashes to a
+nonzero value, so the field never reads as "unknown lift"). It is what
+`spu_xdiff_body_id.lift_options` records and what the registration carries
+(`registration_inventory` formats it into `spu_workload_set_inventory`). The
+lifter's `--base`, `--functions`, `--symbol-prefix`, `--report` and `--output`
+are deliberately not part of it: for one image's bytes they follow from the
+image itself (the manifest or the ELF, the detector, the fingerprint) or only
+name paths. `promoted` is not part of it either: it records a port decision,
+not a generated body.
 
 Function discovery runs `find_spu_functions.py`'s `raw=True` mode at `ls_base`,
 so every seed comes from the entry base and the branch/call analysis. The same

@@ -144,8 +144,17 @@ def load_raw_images(manifest_path):
             if not (base <= point < limit) or point & 3:
                 raise ValueError(f'{source}: extra entry point 0x{point:X} is outside '
                                  'the code range')
+        # Both flags change what a port does with the image, so a truthy
+        # non-boolean is a manifest mistake, never an implicit true.
+        flags = {}
+        for field in ('return_entries', 'promoted'):
+            value = entry.get(field, False)
+            if type(value) is not bool:
+                raise ValueError(f'{source}: {field} must be a boolean')
+            flags[field] = value
         out.append({'digest': digest, 'blob': blob, 'path': str(blob_path), 'size': len(blob),
-                    'ls_base': base, 'code_end': code_end, 'extra_entry_points': points})
+                    'ls_base': base, 'code_end': code_end, 'extra_entry_points': points,
+                    'return_entries': flags['return_entries'], 'promoted': flags['promoted']})
     return out
 
 
@@ -282,6 +291,38 @@ def effects_inventory(image, base, functions):
         'unresolved': sorted(unresolved, key=lambda entry: entry['site'])}
 
 
+def lift_options_string(code_end, extra_entry_points, merge_chunks, return_entries=False):
+    """The lifter options that change one image's generated code, canonically.
+
+    Fixed order, lowercase hex, sorted extra entry points, an absent option
+    omitted: two lifts of the same bytes with the same knobs hash equal, and
+    any knob that changes the generated code changes the digest. `--base`,
+    `--functions`, `--symbol-prefix`, `--report` and `--output` are not lift
+    options in this sense -- for one image they follow from its own bytes (the
+    manifest or the ELF, the detector, the fingerprint) or only name paths.
+    """
+    parts = []
+    if code_end is not None:
+        parts.append(f'code_end=0x{code_end:x}')
+    if extra_entry_points:
+        parts.append('extra=' + ','.join(f'0x{address:x}' for address in sorted(extra_entry_points)))
+    if merge_chunks:
+        parts.append('merge_chunks=1')
+    if return_entries:
+        parts.append('return_entries=1')
+    return ';'.join(parts)
+
+
+def lift_options_digest(text):
+    """`lift_options` for a registration: FNV-1a-64 of the canonical string.
+
+    16 hex digits, the runtime's width. A lift that passes none of the options
+    hashes the empty string, which is still nonzero, so the field never reads
+    as "unknown lift".
+    """
+    return f'{fnv1a64(text.encode("ascii")):016X}'
+
+
 def publish(stage, destination):
     """Replace owned output as a unit, never reuse a previous generated lift."""
     backup = destination.with_name(destination.name + '.previous')
@@ -355,9 +396,12 @@ def build_programs(args, registry_writer):
                     raise ValueError('raw image blobs must be outside the owned output directory')
                 previous = raw_specs.get(spec['digest'])
                 if previous is not None:
-                    if (previous['ls_base'], previous['code_end']) != (spec['ls_base'], spec['code_end']):
+                    if ((previous['ls_base'], previous['code_end'], previous['return_entries'],
+                         previous['promoted'])
+                            != (spec['ls_base'], spec['code_end'], spec['return_entries'],
+                                spec['promoted'])):
                         raise ValueError('raw image ' + spec['path'] + ': the same bytes are listed '
-                                         'with a different ls_base/code_end')
+                                         'with a different ls_base/code_end/return_entries/promoted')
                     previous['extra_entry_points'] = sorted(
                         set(previous['extra_entry_points']) | set(spec['extra_entry_points']))
                     previous['paths'].append(spec['path'])
@@ -413,7 +457,8 @@ def build_programs(args, registry_writer):
                  'image_id': image_id, 'fingerprint': f'{fnv1a64(spec["blob"]):016X}',
                  'status': 'discovered', 'occurrences': occurrences, 'image_kind': 'raw',
                  'ls_base': spec['ls_base'], 'code_end': spec['code_end'],
-                 'extra_entry_points': spec['extra_entry_points']}
+                 'extra_entry_points': spec['extra_entry_points'],
+                 'return_entries': spec['return_entries'], 'promoted': spec['promoted']}
             unique[digest], blobs[digest] = p, spec['blob']
             report['programs'].append(p)
 
@@ -486,6 +531,14 @@ def build_programs(args, registry_writer):
                     elif not any(a <= address < b and address % 4 == 0 for a, b in ranges):
                         raise ValueError('extra function address is outside executable ranges')
                 program['executable_ranges'] = ranges
+                # The lift's options are recorded before it runs: they are what
+                # the command below passes, and they identify the generated
+                # body even when generation fails.
+                merge_chunks = bool(getattr(args, 'merge_chunks', False))
+                return_entries = bool(program.get('return_entries', False))
+                program['lift_options_string'] = lift_options_string(
+                    code_end if raw else None, entries, merge_chunks, return_entries)
+                program['lift_options'] = lift_options_digest(program['lift_options_string'])
                 (outdir / 'code.bin').write_bytes(blob[offset:offset + size])
                 (outdir / 'functions.json').write_text(json.dumps([dict(start=s, end=e) for s, e in bounds]))
                 command = [sys.executable, args.lifter, str(outdir / 'code.bin'), '--base', str(base),
@@ -495,8 +548,10 @@ def build_programs(args, registry_writer):
                     command += ['--extra-funcs', ','.join(hex(a) for a in entries)]
                 if raw and code_end is not None:
                     command += ['--code-end', str(code_end)]
-                if getattr(args, 'merge_chunks', False):
+                if merge_chunks:
                     command += ['--merge-chunks']
+                if return_entries:
+                    command += ['--return-entries']
                 result = subprocess.run(command, capture_output=True, text=True)
                 (outdir / 'lift.log').write_text(result.stdout + result.stderr)
                 if result.returncode:

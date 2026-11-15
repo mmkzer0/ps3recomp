@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Synthetic discovery -> generated registration coverage, no guest assets."""
 import json
+import re
 from pathlib import Path
 import hashlib
 import shutil
@@ -70,13 +71,13 @@ class Pipeline(unittest.TestCase):
     def manifest(self):
         return json.loads((self.output / 'inventory.json').read_text())
 
-    def run_raw(self, entries):
+    def run_raw(self, entries, *extra):
         manifest = self.root / 'raw_images.json'
         manifest.write_text(json.dumps(entries))
         command = [sys.executable, str(TOOLS / 'build_spu_workloads.py'),
                    '--raw-images', str(manifest),
                    '--lifted', str(self.output), '--out', str(self.output / 'spu_workloads.c')]
-        return subprocess.run(command, capture_output=True, text=True, check=False)
+        return subprocess.run(command + list(extra), capture_output=True, text=True, check=False)
 
     def raw_entry(self, blob, name='raw-job.bin', **overrides):
         ls_base, _ = raw_job_tools()
@@ -445,6 +446,13 @@ class Pipeline(unittest.TestCase):
             f'    assert(fp == 0x{program["fingerprint"]}ULL);',
             '    spu_register_all();',
             '    assert(spu_workload_count() == 1);',
+            # The registration carries the inventory: this image has one unresolved MFC site and no
+            # event branch; an unregistered fingerprint is unknown, not clean. The lift record
+            # names its options even when it passes none (the empty string's FNV-1a-64 is nonzero).
+            '    spu_workload_inventory inv = {0};',
+            '    assert(spu_workload_find_inventory(fp, &inv));',
+            f'    assert(inv.flags == SPU_WORKLOAD_INV_UNRESOLVED_MFC && inv.code_end == 0 && inv.lift_options == 0x{program["lift_options"]}ULL);',
+            '    assert(!spu_workload_find_inventory(fp ^ 1u, &inv));',
             '    int id = 0; spu_lifted_entry_fn f = spu_workload_find_img(fp, &id);',
             f'    assert(f && id == {program["image_id"]});',
             f'    assert(spu_lookup(0x{RAW_BASE:X}, id) == f);',
@@ -584,6 +592,152 @@ class Pipeline(unittest.TestCase):
         program = self.manifest()['programs'][0]
         functions = {start: end for start, end in program['diagnostics']['functions']}
         self.assertEqual(functions[tail], RAW_BASE + len(blob))
+
+    def test_raw_promoted_is_copied_to_the_record(self):
+        _, build_raw_job = raw_job_tools()
+        blob = build_raw_job()
+        for promoted, want in ((False, False), (True, True)):
+            with self.subTest(promoted=promoted):
+                result = self.run_raw([self.raw_entry(blob, name='raw-promoted.bin',
+                                                      promoted=promoted)])
+                self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+                program = self.manifest()['programs'][0]
+                self.assertEqual(program['promoted'], want)
+                # The flag does not change the lift, so the options stay empty.
+                self.assertEqual(program['lift_options_string'], '')
+        result = self.run_raw([self.raw_entry(blob, name='raw-promoted.bin',
+                                             return_entries=False)])
+        self.assertEqual(self.manifest()['programs'][0]['return_entries'], False)
+
+    def test_raw_manifest_flags_must_be_booleans(self):
+        _, build_raw_job = raw_job_tools()
+        blob = build_raw_job()
+        for field in ('return_entries', 'promoted'):
+            for value in (1, 0, 'true', None):
+                with self.subTest(field=field, value=value):
+                    result = self.run_raw([self.raw_entry(blob, name='raw-flag.bin',
+                                                          **{field: value})])
+                    self.assertNotEqual(result.returncode, 0)
+                    report = self.manifest()
+                    self.assertFalse(report['complete'])
+                    self.assertTrue(any(field in error and 'must be a boolean' in error
+                                        for error in report['errors']), report['errors'])
+
+    def test_lift_options_identify_the_generated_body(self):
+        from spu_program_pipeline import lift_options_digest, lift_options_string
+        # Canonical form: fixed order, lowercase hex, sorted entry points, an
+        # absent option omitted.
+        self.assertEqual(lift_options_string(0x16168, [0xB00, 0xA2C], True),
+                         'code_end=0x16168;extra=0xa2c,0xb00;merge_chunks=1')
+        self.assertEqual(lift_options_string(None, [], False), '')
+        self.assertEqual(lift_options_string(0x100, [], False), 'code_end=0x100')
+        self.assertEqual(lift_options_string(None, [0x7C64], False), 'extra=0x7c64')
+        self.assertEqual(lift_options_string(None, [], True, True),
+                         'merge_chunks=1;return_entries=1')
+        # The empty string still hashes to a value, so a lift that passed no
+        # option never reads as "unknown lift".
+        self.assertNotEqual(lift_options_digest(''), '0' * 16)
+        self.assertEqual(lift_options_digest('extra=0x7c64'),
+                         lift_options_digest(lift_options_string(None, [0x7C64], False)))
+
+        RAW_BASE, build_raw_job = raw_job_tools()
+        from gen_test_raw_job import CODE_START
+        entry = RAW_BASE + CODE_START
+
+        def lift(variant='default', **overrides):
+            image = build_raw_job(variant=variant)
+            result = self.run_raw([self.raw_entry(image, name='raw-lift.bin', **overrides)])
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            return self.manifest()['programs'][0]
+
+        plain = lift()
+        self.assertEqual(plain['lift_options_string'], '')
+        self.assertEqual(plain['lift_options'], lift_options_digest(''))
+        # The value names the options, not the bytes: another image lifted with
+        # the same options agrees.
+        self.assertEqual(lift('bisled')['lift_options'], plain['lift_options'])
+        # One extra entry point changes the value and the string says which.
+        extra = lift(extra_entry_points=[hex(entry)])
+        self.assertEqual(extra['lift_options_string'], f'extra=0x{entry:x}')
+        self.assertNotEqual(extra['lift_options'], plain['lift_options'])
+        self.assertEqual(self.registered_inventory()[0][3], int(extra['lift_options'], 16))
+        # A code end and the return-entry option are recorded the same way.
+        code_end = RAW_BASE + len(build_raw_job())
+        bounded = lift(code_end=hex(code_end))
+        self.assertEqual(bounded['lift_options_string'], f'code_end=0x{code_end:x}')
+        resumed = lift(return_entries=True)
+        self.assertEqual(resumed['lift_options_string'], 'return_entries=1')
+        self.assertNotEqual(resumed['lift_options'], plain['lift_options'])
+
+    def test_raw_return_entries_reach_the_lifter(self):
+        _, build_raw_job = raw_job_tools()
+        blob = build_raw_job()
+        result = self.run_raw([self.raw_entry(blob, name='raw-return.bin', return_entries=True)])
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        program = self.manifest()['programs'][0]
+        self.assertTrue(program['return_entries'])
+        self.assertEqual(program['lift_options_string'], 'return_entries=1')
+        # The flag reached the lifter: it reports the return entries it split.
+        self.assertIn('return entries', (self.output / program['name'] / 'lift.log').read_text())
+        result = self.run_raw([self.raw_entry(blob, name='raw-return.bin')])
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        plain = self.manifest()['programs'][0]
+        self.assertFalse(plain['return_entries'])
+        self.assertEqual(plain['lift_options_string'], '')
+        self.assertNotEqual(plain['lift_options'], program['lift_options'])
+
+    def registered_inventory(self):
+        """(fingerprint, flags names, code_end) of every spu_workload_set_inventory call in the
+        generated registration."""
+        calls = re.findall(r'spu_workload_set_inventory\(0x([0-9A-F]{16})ULL, ([^,]+), 0x([0-9A-F]+)u, '
+                           r'0x([0-9A-F]{16})ULL\);', (self.output / 'spu_workloads.c').read_text())
+        return [(fp, flags.strip(), int(code_end, 16), int(options, 16)) for fp, flags, code_end, options in calls]
+
+    def test_raw_registration_carries_the_inventory_flags(self):
+        _, build_raw_job = raw_job_tools()
+        for variant in ('default', 'bisled'):
+            with self.subTest(variant=variant):
+                blob = build_raw_job(variant=variant)
+                result = self.run_raw([self.raw_entry(blob, name=f'raw-{variant}.bin')])
+                self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+                program = self.manifest()['programs'][0]
+                effects = program['effects']
+                # The synthetic job has one `wrch MFC_Cmd` whose word comes from local store.
+                self.assertEqual(len(effects['unresolved']), 1)
+                want = ['SPU_WORKLOAD_INV_UNRESOLVED_MFC']
+                if effects['event_branches']:
+                    want.insert(0, 'SPU_WORKLOAD_INV_EVENT_BRANCHES')
+                self.assertEqual(bool(effects['event_branches']), variant == 'bisled')
+                self.assertEqual(self.registered_inventory(),
+                                 [(program['fingerprint'], ' | '.join(want), 0,
+                                   int(program['lift_options'], 16))])
+
+    def test_raw_registration_carries_code_end(self):
+        RAW_BASE, build_raw_job = raw_job_tools()
+        blob = build_raw_job(tail_words=4)
+        code_end = RAW_BASE + len(blob) - 8
+        result = self.run_raw([self.raw_entry(blob, code_end=hex(code_end))])
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        [(_, _, registered_end, _)] = self.registered_inventory()
+        self.assertEqual(registered_end, code_end)
+
+    def test_elf_registration_has_no_inventory(self):
+        # An ELF image gets no effects inventory from the pipeline: it must stay unknown to the
+        # runtime, never be registered as clean.
+        result = self.run_pipeline(('input.bin', elf(7)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('spu_workload_register_img', (self.output / 'spu_workloads.c').read_text())
+        self.assertNotIn('spu_workload_set_inventory', (self.output / 'spu_workloads.c').read_text())
+
+    def test_inventory_without_event_branch_list_is_no_inventory(self):
+        # An inventory from before event-branch detection says nothing about event branches.
+        from build_spu_workloads import registration_inventory
+        self.assertIsNone(registration_inventory({'effects': {'unresolved': []}}))
+        self.assertIsNone(registration_inventory({}))
+        self.assertIsNone(registration_inventory(None))
+        self.assertEqual(registration_inventory({'effects': {'event_branches': [], 'unresolved': []},
+                                                 'code_end': None}), (0, 0, 0))
+
     def legacy_images(self):
         images = self.root / 'images'
         images.mkdir(exist_ok=True)
