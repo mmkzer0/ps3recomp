@@ -34,14 +34,23 @@ CRT_MARKER = b'JOBCRT Ver14'   # 12 bytes, at header+0x30
 IL = 0x081
 ILA = 0x021
 BR = 0x064
+BRZ = 0x040
+BRSL = 0x066
 BRNZ = 0x042
 BI = 0x1A8
 BISL = 0x1A9
 IRET = 0x1AA
 BISLED = 0x1AB
+BIZ = 0x128
 RDCH = 0x00D
 WRCH = 0x10D
 LQD = 0x034
+ORI = 0x004
+ANDI = 0x014
+AI = 0x01C
+ROTMI = 0x079
+AND = 0x0C1
+A = 0x0C0
 NOP = 0x201
 
 # E/D interrupt bits of the bi family (runtime/spu/spu_interp.c:127-132):
@@ -49,8 +58,30 @@ NOP = 0x201
 INTERRUPT_ENABLE = 0x40000
 INTERRUPT_DISABLE = 0x80000
 # `default` is the byte-identical job image; the others add one event branch
-# for the static effect inventory tests.
-VARIANTS = ('default', 'bisled', 'disable', 'iret')
+# for the static effect inventory tests. The `calls*` variants issue their MFC
+# commands from a helper that takes the command word in $r8, so the inventory
+# has to prove the command through the image's own call sites. The `flow*`
+# variants put one function's command immediate and its `wrch` in different
+# blocks, for the function-wide reaching-value pass.
+VARIANTS = ('default', 'bisled', 'disable', 'iret',
+            'calls', 'calls-computed', 'calls-materialised', 'calls-rewrite',
+            'calls-data-word', 'calls-forward', 'calls-forward-computed',
+            'calls-dispatch',
+            'flow-dominates', 'flow-loop', 'flow-split', 'flow-one-path', 'flow-sibling',
+            'flow-dispatch', 'flow-dispatch-pc', 'flow-dispatch-and',
+            'flow-dispatch-wide', 'flow-dispatch-outside',
+            'flow-loop-live', 'flow-tail-call', 'flow-link-arg',
+            'flow-extra-entry', 'flow-ila-landing', 'flow-mid-landing',
+            'default-dispatch', 'flow-r0-identity')
+CALL_VARIANTS = ('calls', 'calls-computed', 'calls-materialised', 'calls-rewrite',
+                 'calls-data-word', 'calls-forward', 'calls-forward-computed',
+                 'calls-dispatch')
+FORWARD_VARIANTS = ('calls-forward', 'calls-forward-computed')
+FLOW_VARIANTS = ('flow-dominates', 'flow-loop', 'flow-split', 'flow-one-path',
+                 'flow-sibling', 'flow-dispatch', 'flow-dispatch-pc',
+                 'flow-dispatch-and', 'flow-dispatch-wide', 'flow-dispatch-outside',
+                 'flow-loop-live', 'flow-tail-call', 'flow-link-arg',
+                 'flow-extra-entry', 'flow-ila-landing', 'flow-mid-landing')
 
 MFC_LSA, MFC_EAH, MFC_EAL, MFC_Size, MFC_TagID, MFC_Cmd = 16, 17, 18, 19, 20, 21
 MFC_RdAtomicStat, SPU_WrOutMbox = 27, 28
@@ -73,6 +104,10 @@ def _ri18(op7, i18, rt=0):
 
 def _ri10(op8, i10, ra=0, rt=0):
     return ((op8 & 0xFF) << 24) | ((i10 & 0x3FF) << 14) | ((ra & 0x7F) << 7) | (rt & 0x7F)
+
+
+def _ri7(op11, i7, ra=0, rt=0):
+    return ((op11 & 0x7FF) << 21) | ((i7 & 0x7F) << 14) | ((ra & 0x7F) << 7) | (rt & 0x7F)
 
 
 def _rr(op11, rb=0, ra=0, rt=0):
@@ -103,6 +138,272 @@ def _dma(cmd, lsa, size):
     return words
 
 
+def _dma_helper():
+    """A DMA helper: command word in $r8, a fixed transfer, six channel writes.
+
+    It never writes $r8, so its command register still holds the caller's
+    argument at the `wrch MFC_Cmd` site -- the shape the interprocedural
+    pass is allowed to resolve.
+    """
+    words = [_ri16(IL, 0, 3), _ri16(IL, 0, 4), _ri16(IL, 0x800, 5),
+             _ri16(IL, 128, 6), _ri16(IL, 0, 7)]
+    words += [_channel(WRCH, MFC_LSA, 3), _channel(WRCH, MFC_EAH, 4),
+              _channel(WRCH, MFC_EAL, 5), _channel(WRCH, MFC_Size, 6),
+              _channel(WRCH, MFC_TagID, 7), _channel(WRCH, MFC_Cmd, 8)]
+    return words
+
+
+def _call_body(base, variant):
+    """(main words, helper words, helper LS address) of a `calls*` variant.
+
+    One shape decides the helper's address, so the two call displacements and
+    the one instruction that names the helper are encoded after the layout is
+    known. The mailbox write and the local-store command write stay in main:
+    they are what the default image already proves, and neither may move.
+    """
+    second_arg = (_ri10(LQD, 0, 3, 8) if variant == 'calls-computed'
+                  else _ri16(IL, MFC_PUT, 8))
+    main = [_ri16(IL, MFC_GET, 8), 0, second_arg, 0]
+    if variant == 'calls-materialised':
+        main.append(0)                                  # ila $r5, <helper>
+    main += [_ri16(IL, 0x1234, 10), _channel(WRCH, SPU_WrOutMbox, 10)]
+    main += [_ri10(LQD, 0, 0, 11), _channel(WRCH, MFC_Cmd, 11)]
+    main.append(_rr(BI, 0, 0, 0))                       # main returns first
+    helper = _dma_helper()
+    if variant == 'calls-rewrite':
+        helper.insert(0, _ri10(LQD, 0, 3, 8))           # the helper redefines $r8
+    helper.append(_rr(BI, 0, 0, 0))
+    address = base + CODE_START + 4 * len(main)
+    code_start = base + CODE_START
+    main[1] = _ri16(BRSL, (address - (code_start + 4)) // 4, 0)
+    main[3] = _ri16(BRSL, (address - (code_start + 12)) // 4, 0)
+    if variant == 'calls-materialised':
+        main[4] = _ri18(ILA, address, 5)
+    return main, helper, address
+
+
+def _forward_body(base, variant):
+    """(main words, helper words, helper LS address) of a forwarding variant.
+
+    The caller passes the command in $r7 and the helper copies it to $r14 with
+    `ori $r14, $r7, 0` before the channel writes, so the inventory has to keep
+    the copy's provenance to name the register the caller set. The computed
+    variant loads the second argument instead of materialising it.
+    """
+    second_arg = (_ri10(LQD, 0, 3, 7) if variant == 'calls-forward-computed'
+                  else _ri16(IL, MFC_PUT, 7))
+    main = [_ri16(IL, MFC_GET, 7), 0, second_arg, 0]
+    main += [_ri16(IL, 0x1234, 10), _channel(WRCH, SPU_WrOutMbox, 10)]
+    main += [_ri10(LQD, 0, 0, 11), _channel(WRCH, MFC_Cmd, 11)]
+    main.append(_rr(BI, 0, 0, 0))                       # main returns first
+    helper = [_ri10(ORI, 0, 7, 14)]                     # ori $r14, $r7, 0
+    helper += [_ri16(IL, 0, 3), _ri16(IL, 0, 4), _ri16(IL, 0x800, 5),
+               _ri16(IL, 128, 6), _ri16(IL, 0, 10)]
+    helper += [_channel(WRCH, MFC_LSA, 3), _channel(WRCH, MFC_EAH, 4),
+               _channel(WRCH, MFC_EAL, 5), _channel(WRCH, MFC_Size, 6),
+               _channel(WRCH, MFC_TagID, 10), _channel(WRCH, MFC_Cmd, 14)]
+    helper.append(_rr(BI, 0, 0, 0))
+    address = base + CODE_START + 4 * len(main)
+    code_start = base + CODE_START
+    main[1] = _ri16(BRSL, (address - (code_start + 4)) // 4, 0)
+    main[3] = _ri16(BRSL, (address - (code_start + 12)) // 4, 0)
+    return main, helper, address
+
+
+def call_helper(base=LS_BASE, variant='calls'):
+    """LS address of the helper the `calls*` variants call."""
+    if variant not in CALL_VARIANTS:
+        raise ValueError(f'{variant!r} is not a calls variant')
+    if variant in FORWARD_VARIANTS:
+        return _forward_body(base, variant)[2]
+    return _call_body(base, variant)[2]
+
+
+def dispatch_entry(base=LS_BASE):
+    """LS address of the trailing `bi $r5` a `calls-dispatch` image appends.
+
+    It is one word past every generated function, so a caller lists it as an
+    extra entry point to lift it; it exists so the inventory sees an image with
+    a register-targeted transfer next to sites it resolves.
+    """
+    return base + len(build(variant='calls'))
+
+
+def default_extra_entry(base=LS_BASE):
+    """LS address of the words a default-image dispatch variant appends.
+
+    Both `default-dispatch` and `flow-r0-identity` put them past the default
+    code's return, so a caller lists this address as an extra entry point.
+    """
+    return base + len(build(variant='default'))
+
+
+def _flow_body(variant, base):
+    """Words of a `flow*` variant: one function with internal control flow.
+
+    `flow-dominates` puts the command immediate in a block that dominates the
+    site (the branch target is outside the function, so the pipeline lifts the
+    function as one chunk and the pass has to reach across blocks);
+    `flow-split` defines two different immediates on two paths into the site;
+    `flow-one-path` defines it on one path only; `flow-sibling` defines it in
+    a branch that never reaches the site. `flow-loop-live` keeps the definition
+    on every loop path, so the state at the head must converge instead of
+    growing a second atom each iteration; `flow-tail-call` enters a helper both
+    by a direct call and by a tail branch; `flow-link-arg` calls through the
+    register the helper reads, so the caller's block never set it;
+    `flow-extra-entry` enters the site's chunk at a manifest extra entry point;
+    `flow-ila-landing` seeds the site's chunk through an `ila` target and
+    reaches it with a different command; `flow-mid-landing` reaches the site
+    through a computed conditional `biz` whose target (an `ila` of the body's
+    start plus an `ai` offset) is no chunk start, so only the dispatch rule can
+    see that PUT arrives there. Labels are patched once the layout is known.
+    """
+    words, labels = [], {}
+
+    def emit(*items):
+        words.extend(items)
+
+    def label(name):
+        labels[name] = len(words)
+
+    def branch(opcode, name, rt=0):
+        words.append((opcode, name, rt))
+
+    if variant == 'flow-dominates':
+        emit(_ri16(IL, MFC_GET, 8))
+        branch(BRZ, 'elsewhere')
+        emit(_channel(WRCH, MFC_Cmd, 8))
+        emit(_rr(BI, 0, 0, 0))
+        label('elsewhere')
+        emit(_rr(BI, 0, 0, 0))
+    elif variant == 'flow-loop':
+        # The preheader defines the register; the loop head (the site's block)
+        # is a branch target, so the block-local run cannot carry the value
+        # across, while the preheader dominates every re-entry.
+        emit(_ri16(IL, MFC_GET, 8))
+        label('loop')
+        emit(_channel(WRCH, MFC_Cmd, 8))
+        branch(BRZ, 'exit')
+        branch(BR, 'loop')
+        label('exit')
+        emit(_rr(BI, 0, 0, 0))
+    elif variant == 'flow-split':
+        branch(BRZ, 'left')
+        emit(_ri16(IL, MFC_GET, 8))
+        branch(BR, 'join')
+        label('left')
+        emit(_ri16(IL, MFC_PUT, 8))
+        label('join')
+        emit(_channel(WRCH, MFC_Cmd, 8), _rr(BI, 0, 0, 0))
+    elif variant == 'flow-one-path':
+        branch(BRZ, 'skip')
+        emit(_ri16(IL, MFC_GET, 8))
+        label('skip')
+        emit(_channel(WRCH, MFC_Cmd, 8), _rr(BI, 0, 0, 0))
+    elif variant == 'flow-sibling':
+        branch(BRZ, 'side')
+        emit(_channel(WRCH, MFC_Cmd, 8), _rr(BI, 0, 0, 0))
+        label('side')
+        emit(_ri16(IL, MFC_GET, 8), _rr(BI, 0, 0, 0))
+    elif variant == 'flow-dispatch':
+        # A register-targeted transfer on a reachable path: its successors are
+        # unknown, so the region proves nothing.
+        branch(BRZ, 'body')
+        emit(_rr(BI, ra=5))
+        label('body')
+        emit(_channel(WRCH, MFC_Cmd, 8), _rr(BI, 0, 0, 0))
+    elif variant.startswith('flow-dispatch-'):
+        # The masked PC-relative dispatch: `brsl $r7, .+4` gives a constant
+        # link, `andi` supplies a small exact offset set, and `bi $r7` jumps
+        # into the run after the branch.
+        if variant == 'flow-dispatch-outside':
+            emit(_channel(WRCH, MFC_Cmd, 8))            # site, live-in
+        else:
+            emit(_ri16(IL, MFC_GET, 8))                 # the command value
+        brsl = len(words)
+        emit(0)                                         # brsl $r7, .+4
+        if variant == 'flow-dispatch-and':
+            emit(_rr(AND, rb=5, ra=6, rt=6))            # a register mask
+        else:
+            emit(_ri10(ANDI, 127 if variant == 'flow-dispatch-wide' else 112, 6, 6))
+        emit(_ri7(ROTMI, -2, 6, 4))                     # rotmi $r4, $r6, -2
+        emit(_ri10(AI, 36, 7, 7))                       # ai $r7, $r7, 36
+        emit(_rr(A, rb=4, ra=7, rt=7))                  # a $r7, $r7, $r4
+        emit(_rr(BI, ra=7))                             # bi $r7
+        words[brsl] = _ri16(BRSL, 1, 7)                 # link = pc+4 into $r7
+        if variant != 'flow-dispatch-outside':
+            first = brsl + 10                           # link + 36 = pc+40
+            while len(words) < first + 8:               # padding and the targets
+                words.append(_rr(NOP))
+            words.append(_channel(WRCH, MFC_Cmd, 8))    # reached from every target
+            words.append(_rr(BI, 0, 0, 0))
+    elif variant == 'flow-loop-live':
+        # The preheader dominates the head and the back edge defines the same
+        # constant, so every iteration reaches the site with one value.
+        emit(_ri16(IL, MFC_GET, 8))
+        branch(BR, 'head')
+        label('head')
+        emit(_channel(WRCH, MFC_Cmd, 8), _ri16(IL, MFC_GET, 8),
+             _channel(RDCH, 29, 4))
+        branch(BRNZ, 'head', 4)
+        emit(_rr(BI, 0, 0, 0))
+    elif variant == 'flow-tail-call':
+        # One helper, entered by a direct call with 0x20 and by a tail branch
+        # with 0x40: no single caller value proves the site.
+        emit(_ri16(IL, MFC_PUT, 8))
+        branch(BRSL, 'helper')
+        branch(BRSL, 'other')
+        emit(_rr(BI, 0, 0, 0))
+        label('other')
+        emit(_ri16(IL, MFC_GET, 8), (BR, 'helper', 0))
+        label('helper')
+        emit(_channel(WRCH, MFC_Cmd, 8), _rr(BI, 0, 0, 0))
+    elif variant == 'flow-link-arg':
+        # `brsl $r8, helper` leaves the return address in the register the
+        # helper reads: the call site never set $r8 to a command word.
+        emit(_ri16(IL, MFC_GET, 8), (BRSL, 'helper', 8))
+        emit(_rr(BI, 0, 0, 0))
+        label('helper')
+        emit(_channel(WRCH, MFC_Cmd, 8), _rr(BI, 0, 0, 0))
+    elif variant == 'flow-extra-entry':
+        # The site's chunk start is a manifest extra entry point: code can
+        # enter there without the preceding immediate running.
+        emit(_ri16(IL, MFC_GET, 8))
+        label('site')
+        emit(_channel(WRCH, MFC_Cmd, 8), _rr(BI, 0, 0, 0))
+    elif variant == 'flow-ila-landing':
+        # `ila` seeds the site's chunk start as an entry; the seeded path
+        # arrives with PUT, the fall-through path with GET.
+        emit(_channel(RDCH, 29, 4), (BRNZ, 'dispatch', 4),
+             _ri16(IL, MFC_GET, 8))
+        label('site')
+        emit(_channel(WRCH, MFC_Cmd, 8), _rr(BI, 0, 0, 0))
+        label('dispatch')
+        emit(_ri16(IL, MFC_PUT, 8), (ILA, 'site', 5), _rr(BI, ra=5))
+    elif variant == 'flow-mid-landing':
+        # `biz $r4,$r5` jumps over the GET straight to the wrch when $r4 is 0,
+        # so the site issues PUT on that path; nothing names the site's address.
+        label('start')
+        emit(_ri16(IL, MFC_PUT, 8), (ILA, 'start', 5), ('AI_TO', 'site', 'start'),
+             _channel(RDCH, 29, 4), _rr(BIZ, 0, 5, 4), _ri16(IL, MFC_GET, 8))
+        label('site')
+        emit(_channel(WRCH, MFC_Cmd, 8), _rr(BI, 0, 0, 0))
+    else:
+        raise ValueError(f'{variant!r} is not a flow variant')
+    for index, word in enumerate(words):
+        if isinstance(word, tuple):
+            opcode, name, rt = word
+            if opcode == ILA:
+                # An absolute target, unlike the PC-relative branch forms.
+                words[index] = _ri18(ILA, base + CODE_START + 4 * labels[name], rt)
+            elif opcode == 'AI_TO':
+                # $r5 += the byte distance from `rt`'s label to `name`'s.
+                words[index] = _ri10(AI, 4 * (labels[name] - labels[rt]), 5, 5)
+            else:
+                words[index] = _ri16(opcode, labels[name] - index, rt)
+    return words
+
+
 def build(base=LS_BASE, tail_words=0, variant='default'):
     """Return one synthetic raw job image at `base`.
 
@@ -114,7 +415,13 @@ def build(base=LS_BASE, tail_words=0, variant='default'):
     `variant` picks the final control transfer, for the event-branch inventory:
     `bisled` inserts a `bisled $r0, $r2` before the return, `disable` sets the
     D bit on the `bi $r0` return (`bid`), and `iret` replaces the return with
-    `iret`. The default image is unchanged.
+    `iret`. The default image is unchanged. The `calls*` variants instead issue
+    both transferred commands from one helper called with the command word in
+    $r8 (see `_call_body`); `calls-data-word` additionally appends the helper's
+    address as a data word past the code, for a caller that supplies it only
+    the `code_end` that ends the code before it. `default-dispatch` and
+    `flow-r0-identity` append their transfer past the default code's return
+    (see `default_extra_entry`).
     """
     if base % 4:
         raise ValueError('base must be 4-byte aligned')
@@ -131,6 +438,35 @@ def build(base=LS_BASE, tail_words=0, variant='default'):
     struct.pack_into('>I', header, 0x10, _ri16(BR, (CODE_START - 0x10) // 4))
     header[0x30:0x30 + len(CRT_MARKER)] = CRT_MARKER
     struct.pack_into('>I', header, 0x3C, CODE_START - 0x10)
+
+    if variant in CALL_VARIANTS:
+        if tail_words:
+            raise ValueError('tail_words applies to the default image only')
+        if variant in FORWARD_VARIANTS:
+            main, helper, address = _forward_body(base, variant)
+        else:
+            main, helper, address = _call_body(base, variant)
+        image = bytes(header) + b''.join(_be32(word) for word in main + helper)
+        if variant == 'calls-data-word':
+            # Aligned and past every generated function, so only the blob-wide
+            # data scan sees it.
+            image += _be32(address)
+        if variant == 'calls-dispatch':
+            # `bi $r5`: a register-targeted transfer, reachable only when the
+            # image lists its address as an extra entry point.
+            image += _be32(_rr(BI, ra=5))
+        if base + len(image) > LS_SIZE:
+            raise ValueError('image does not fit the local store')
+        return image
+
+    if variant in FLOW_VARIANTS:
+        if tail_words:
+            raise ValueError('tail_words applies to the default image only')
+        image = bytes(header) + b''.join(
+            _be32(word) for word in _flow_body(variant, base))
+        if base + len(image) > LS_SIZE:
+            raise ValueError('image does not fit the local store')
+        return image
 
     code = []
     for cmd in COMMANDS:
@@ -156,6 +492,15 @@ def build(base=LS_BASE, tail_words=0, variant='default'):
         code.append(_rr(BI, 0, 0, 0))       # bi $r0: the SPU ABI return
     if tail_words:
         code.extend([_rr(NOP)] * tail_words)
+    if variant == 'default-dispatch':
+        # `bi $r5`: a register-targeted transfer the block-local pass cannot
+        # see as an entry; reachable only through a manifest extra entry.
+        code.append(_rr(BI, ra=5))
+    elif variant == 'flow-r0-identity':
+        # The interrupt-window idiom's shape: `bi $r0` whose nearest write is
+        # an identity move over an `ila` is a computed dispatch, not a return.
+        # Its target is outside the lifted ranges, so it stays unmodelled.
+        code += [_ri18(ILA, 0x3F000, 0), _ri10(AI, 0, 0, 0), _rr(BI, ra=0)]
 
     image = bytes(header) + b''.join(_be32(word) for word in code)
     if base + len(image) > LS_SIZE:
@@ -171,7 +516,8 @@ def main():
     parser.add_argument('--tail-words', type=int, default=0,
                         help='append N nop words reachable only via a not-taken branch')
     parser.add_argument('--variant', choices=VARIANTS, default='default',
-                        help='event-branch word to add or substitute at the end')
+                        help='event-branch word to add or substitute at the end, or a '
+                             'calls*/flow* code shape for the resolution passes')
     parser.add_argument('--manifest', help='also write a --raw-images manifest entry')
     args = parser.parse_args()
 

@@ -570,29 +570,150 @@ Every successfully lifted raw image carries an `effects` object in
 ```json
 "effects": {
   "channels": [
-    {"channel": 21, "name": "MFC_Cmd", "read": 0, "write": 5, "count": 0,
-     "sites": {"read": [], "write": [31852, 31900, 31948, 32000, 32020], "count": []}}
+    {"channel": 21, "name": "MFC_Cmd", "read": 0, "write": 4, "count": 0,
+     "sites": {"read": [], "write": [31852, 31948, 32020, 32120], "count": []}}
   ],
   "mfc_commands": [
-    {"command": 64, "name": "GET", "count": 1, "sites": [31852]}
+    {"command": 32, "name": "PUT", "count": 1, "sites": [32020],
+     "via": "call-sites", "callers": [32100]},
+    {"command": 64, "name": "GET", "count": 1, "sites": [31852]},
+    {"command": 64, "name": "GET", "count": 1, "sites": [31948], "via": "function"}
   ],
   "event_branches": [],
   "unresolved": [
-    {"channel": 21, "access": "write", "site": 32020, "register": "$r11",
-     "reason": "command value is not a same-block immediate"}
+    {"channel": 21, "access": "write", "site": 32120, "register": "$r11",
+     "reason": "command value is not a same-block immediate",
+     "function": "definition at 0x7D10 (lqd) is not a constant",
+     "call_sites": "not reached"}
   ]
 }
 ```
 
 Channel instructions are counted by channel number and by `rdch` (read),
-`wrch` (write) or `rchcnt` (count). A `wrch MFC_Cmd` counts as a resolved
-command constant only when its source register holds an `il` immediate from the
-same straight-line run — no branch, branch target or other register write in
-between. Everything else is listed under `unresolved` with its site and register
-and is still included in the channel-21 write count. Resolution is deliberately
-block-local: a false "resolved" could hide an atomic or mailbox access, while an
-unresolved site is visible and reviewable. Command names mirror the
-`MFC_*_CMD` constants in `runtime/spu/spu_context.h`.
+`wrch` (write) or `rchcnt` (count). A `wrch MFC_Cmd` is resolved in three steps,
+in this order, and each step runs only when the previous one did not resolve
+the site:
+
+1. **Same block** (no `via` key): the source register holds an `il` immediate,
+   or an `ilhu`+`iohl` pair, from the same straight-line run. No branch, branch
+   target, lifted chunk start or other register write may be in between: the
+   lifter and the loader's entry list can enter a chunk start without the
+   instructions before it running.
+2. **Region** (`"via": "function"`): reaching values over the branch-connected
+   region the site belongs to, not over one lifted chunk. A raw lift generates
+   one chunk per branch target, so a procedure is many ranges; ranges joined by
+   a direct branch or by a fall-through are one region (a call is not an edge —
+   its callee is another region), and that graph is the procedure's control
+   flow. `ori $rD, $rS, 0` and `ai $rD, $rS, 0` copy the source value with its
+   provenance, so a copy of the function's argument is still the caller's
+   register. A call may write any caller-visible register, so every tracked
+   value is unknown at the return. A direct branch out of the region leaves it;
+   `bi $r0` and the conditional `biz`/`binz`/`bihz`/`bihnz ... $r0` are the ABI
+   returns the generated code emits as host returns, unless the generated code
+   emits an indirect dispatch for that address (the lifter's
+   `compute_bi_r0_jumps`: the nearest preceding write to `$r0` materialised the
+   address). That set is computed over the whole image, not one region, and it
+   looks through identity moves, so the interrupt-window idiom (`ila $r0,
+   <resume>`, `ai $r0, $r0, 0`, `bid $r0`) is an indirect dispatch even where
+   this pass cannot enumerate its target set. Branch hints are no-ops; a
+   non-resuming stop ends the path; `iret` and every other register-targeted
+   branch are indirect dispatches with unknown successors. The step resolves
+   only when every path arrives with one constant. Two constants on two paths,
+   a non-constant definition, or a reachable indirect dispatch keep the site
+   unresolved.
+
+   A register-directed `bi`/conditional branch is **modelled exactly** when its
+   target register is built only from a `brsl $rN, .+4` link constant,
+   `il`/`ila` immediates, `andi` with a constant mask, constant
+   `shli`/`roti`/`rotmi` shifts, and `ai`/`a` sums of those over the
+   straight-line run ending at the branch — the PC-getter idiom a Duff's-device
+   dispatch uses. The run is cut image-wide at every target of a branch other
+   than a PC-getter, at every chunk start no reference names, and at every
+   extra entry point; a PC-getter's own target is exempt, because the link it
+   reads flows straight on into the run. `andi` with an unknown source is exact
+   over the 32-bit domain:
+   the image is the set of subsets of the mask's bits, so a mask with at most
+   six bits stays within the 64-value bound. Every target must be word-aligned
+   and inside the region; then the branch's successors are exactly those
+   blocks, and a resolution in a region that used one carries
+   `"dispatch": "masked-pc-relative"`. A register mask, a set over 64 values,
+   an unaligned target or one outside the region keeps the branch opaque.
+
+   An **entry** is a block that code outside the region can enter. Entries are
+   image-wide, not a property of one lifted range: a chunk start is an entry
+   when the image entry is at its address, a call (`brsl`/`brasl`) targets it,
+   a direct branch from another region targets it, it is a return site, it is
+   an extra entry point, its address is materialised as an immediate anywhere
+   in the blob, or the address appears as an aligned 32-bit data word anywhere
+   in the blob. A block with a predecessor is an entry too: a call can land on
+   it, so its live atoms join the incoming state instead of being dropped.
+   Every other no-predecessor block is dead code or is reachable only through
+   a register-targeted transfer, which is either modelled exactly or covered
+   by `assumes`.
+3. **Call sites** (`"via": "call-sites"`), for a value still live-in: it is the
+   register the region was entered with, and the image's own callers prove it.
+   Every entry such a path came through must be provable: every reference to it
+   is a direct `brsl`/`brasl` inside the lifted ranges; it is not also
+   reachable indirectly (its address is not materialised as an immediate, does
+   not appear as an aligned 32-bit word anywhere in the blob, and is neither
+   the image entry nor an extra entry point, because an external caller could
+   supply any argument); and every call site sets the register with an
+   immediate in its own straight-line run — the same block-local resolver,
+   applied to the caller, one level only. A caller that computes the argument,
+   loads it, or received it from its own caller proves nothing, and callers'
+   callers are not followed. The call's own link register never proves an
+   argument: `brsl $rD, target` writes the return address into `$rD` before the
+   callee runs, so the caller snapshot drops it. The proven set must be
+   non-empty and agree with any constant the region's own paths produce.
+
+Each resolved site is one entry per command, with `count` 1 and `sites`
+holding the site. `callers` lists the `brsl`/`brasl` sites that prove a
+`call-sites` entry; same-block entries keep their original shape (no `via`, no
+`callers`), so the schema change is additive. Entries are sorted by command,
+then by `via` (`""` before `"call-sites"` before `"function"`).
+
+Everything not proven is listed under `unresolved` with its site and register
+and is still included in the channel-21 write count. `reason` keeps the
+block-local outcome, and `function` / `call_sites` say which later pass refused
+the site and why, as data:
+
+- `function` examples: `"two values: 0x20 at 0x7C4C, 0x40 at 0x7C44"`,
+  `"definition at 0x7D10 (lqd) is not a constant"`,
+  `"call at 0x7E20 clobbers $r14"`, `"opaque successor at 0x9A50: bi $r3"`,
+  `"no path from a region entry reaches the site"`, `"live-in"` or
+  `"live-in via $r7"`.
+- `call_sites` examples: `"entry 0x7C64 is materialised by ila at 0x7C50"`,
+  `"entry 0x7C64 appears as a data word at 0x94"`,
+  `"caller 0x7C4C passes a computed value"`,
+  `"entry 0x7C40 has no direct brsl/brasl caller"`; `"not reached"` means the
+  region pass had already refused.
+
+A field named `assumes` names an assumption a resolution rests on. Resolved
+entries carry `"assumes": "no-unmodelled-indirect-entry"` when the image
+contains a register-targeted transfer that the region pass did **not** model —
+a `bi` or conditional `biz`/`binz`/`bihz`/`bihnz` to a register other than
+`$r0`, a `$r0` target the generated code turns into a dispatch (including one
+the lifter's identity-move look-through finds), `bisl`/`bisled`, or `iret`.
+Such a transfer can enter a generated function at its start, a lifted chunk
+start in the middle of a block, or any instruction at all (a computed `biz`
+straight to the `wrch`, past the immediate the block set), without appearing
+among the call sites, so the resolution assumes it does not. Same-block entries
+carry the tag as well: a block-local outcome is never presented as
+unconditionally proven while an unmodelled transfer could land inside it. An
+image whose transfers
+are all modelled exactly by the `masked-pc-relative` rule (or that has none)
+carries no `assumes`. A rule that rested on the SPU ABI would be
+named `"spu-abi-callee-saved"`; no rule does — a call is modelled as writing
+every register, which is conservative. A dispatch through an `lqx`-loaded jump
+table is still opaque, so those sites stay unresolved; modelling its recovered
+targets would need a named completeness assumption, and the detector's
+recovered set is a heuristic. A resolution that used a modelled dispatch says
+so with `"dispatch": "masked-pc-relative"`.
+
+Resolution is deliberately conservative: a false "resolved" could hide an
+atomic or mailbox access, while an unresolved site is visible and reviewable.
+Command names mirror the `MFC_*_CMD` constants in
+`runtime/spu/spu_context.h`.
 
 `event_branches` names every instruction that transfers control on an SPU event
 or interrupt: `bisled`, `iret`, and any `bi`, `bisl`, `biz`, `binz`, `bihz` or
@@ -610,4 +731,28 @@ marker, and code carrying a GET, a PUT, a GETLLAR/PUTLLC pair and a mailbox
 write, plus one command write that is deliberately not statically resolvable.
 `build(..., variant=...)` additionally emits a `bisled`, a D-bit `bi` return
 (`bid`) or an `iret` at the end of that code for the event-branch tests; the
-default variant is unchanged. No SPU toolchain and no guest bytes are involved.
+`calls*` variants issue both transferred commands from one helper that takes the
+command word in `$r8`, with callers that pass an immediate, load the argument,
+materialise the helper's address, list it as an extra entry point or append it
+as a data word; `calls-forward*` instead pass the command in `$r7` and have the
+helper copy it with `ori $r14, $r7, 0`, so the proof has to keep the copy's
+provenance (and the computed variant loads the caller's argument instead); the
+`flow*` variants put a command immediate and its site in different blocks and
+chunks (a dominating preheader, a loop head behind a back edge, two constants on
+two paths, a definition on one path, a definition in a sibling branch, one
+behind a register-targeted transfer, and the PC-getter/masked-offset dispatch
+idiom in exact, register-mask, oversized-set and out-of-region target forms);
+`flow-loop-live` adds a live back edge that redefines the same constant, so the
+reaching state has to converge; `flow-tail-call` enters one helper by a direct
+call and by a tail branch; `flow-link-arg` calls through the register the
+helper reads, so the caller's block never set it; `flow-extra-entry` lists the
+site's chunk start as an extra entry point; `flow-ila-landing` seeds the site's
+chunk start through an `ila` and reaches it with two different commands;
+`flow-mid-landing` reaches the `wrch` itself through a computed `biz`; and
+`calls-dispatch` appends a register-targeted `bi $r5` (listed as an extra entry
+point) next to a resolvable site, for the `assumes` tag. `default-dispatch` and
+`flow-r0-identity` append their transfer past the default image's return (a
+`bi $r5`, and the `ila`/`ai`/`bi $r0` computed-dispatch idiom), listed as an
+extra entry point, so the block-local commands in the default code must carry
+that assumption too. The default variant is unchanged. No SPU toolchain and no
+guest bytes are involved.
