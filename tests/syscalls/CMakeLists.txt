@@ -56,6 +56,9 @@ if(NOT WIN32)
     add_executable(test_event_flag
         test_event_flag.c
         "${PS3RECOMP_ROOT}/runtime/syscalls/sys_event.c"
+        # sys_event.c includes spu_context.h, whose diagnostics log through ps3_log.
+        "${PS3RECOMP_ROOT}/runtime/diag/ps3_log.c"
+        "${PS3RECOMP_ROOT}/runtime/config/config.cpp"
         "${PS3RECOMP_ROOT}/runtime/diag/stop.cpp"
         "${PS3RECOMP_ROOT}/tests/sync_stress/test_shims.c"
         # sys_event.c's timed waits run on the monotonic budget of runtime/platform/host_wait.c.
@@ -88,6 +91,8 @@ endif()
 add_executable(test_event_delivery
     test_event_delivery.c
     "${PS3RECOMP_ROOT}/runtime/syscalls/sys_event.c"
+    "${PS3RECOMP_ROOT}/runtime/diag/ps3_log.c"
+    "${PS3RECOMP_ROOT}/runtime/config/config.cpp"
     "${PS3RECOMP_ROOT}/runtime/diag/stop.cpp"
     "${PS3RECOMP_ROOT}/tests/sync_stress/test_shims.c"
 )
