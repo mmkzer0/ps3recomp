@@ -313,7 +313,7 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
  * is a getter call per access on Mach-O. The counter stays thread-local, in a
  * cold function: inline, the compiler hoisted its address above the holder
  * test and paid the getter on every notify. */
-static int s_knob_putllc_why = -1;
+static int s_knob_putllc_why_coh = -1; /* own name: a test includes this file and spu_channels.c in one unit */
 static SPU_NOINLINE_COLD void spu_coh_resv_lost_report(const spu_context* c, uint32_t line)
 {
     static SPU_THREAD_LOCAL unsigned long long n;
@@ -339,7 +339,7 @@ void spu_coh_notify_write(uint32_t ea)
             /* SPU_PUTLLC_WHY=1: name the agent that killed it. A PUTLLC that
              * always fails for "no reservation" is useless without knowing who
              * took it away -- a peer SPU, or the PPU committing to the line. */
-            if (spu_diag_knob(&s_knob_putllc_why, "SPU_PUTLLC_WHY", 0))
+            if (spu_diag_knob(&s_knob_putllc_why_coh, "SPU_PUTLLC_WHY", 0))
                 spu_coh_resv_lost_report(c, line);
             g_spu_lr_raise++;
             /* The event_status store has to be visible before the wake. The
