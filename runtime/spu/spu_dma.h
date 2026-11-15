@@ -208,6 +208,61 @@ PS3_NORETURN static inline void mfc_dma_error(spu_context* spu, uint32_t cmd,
              f, sizeof f / sizeof f[0], &site);
 }
 
+/* SPU_DMA_RANGE=<lo>-<hi> (hex EAs), packed hi:lo; hi == 0 is off. The gates in
+ * this file are process-wide (spu_diag_knob): they run on every transfer, and
+ * a thread-local read is a getter call per access on Mach-O. All ones marks
+ * "not read yet"; a range that is itself all ones just reads the environment
+ * again. */
+static SPU_NOINLINE_COLD uint64_t spu_dma_range_read(int64_t* cache)
+{
+    uint32_t lo = 0, hi = 0;
+    const char* e = getenv("SPU_DMA_RANGE");
+    if (e) { char* d; lo = (uint32_t)strtoul(e, &d, 16); if (*d == '-') hi = (uint32_t)strtoul(d + 1, 0, 16); }
+    const uint64_t v = ((uint64_t)hi << 32) | lo;
+    SPU_RELAXED_STORE(cache, (int64_t)v);
+    return v;
+}
+static inline uint64_t spu_dma_range_knob(void)
+{
+    static int64_t cache = -1;
+    const int64_t v = SPU_RELAXED_LOAD(&cache);
+    return SPU_PORT_UNLIKELY(v == -1) ? spu_dma_range_read(&cache) : (uint64_t)v;
+}
+
+/* SPU_DMATRACE=<image id>|all: -1 unset, -3 all images. Says what it armed, so
+ * silence is never ambiguous. INT64_MIN marks "not read yet" (a LONG_MIN
+ * argument is nudged off it). Threads that race the first read may each say it. */
+static SPU_NOINLINE_COLD int64_t spu_dmatrace_only_read(int64_t* cache)
+{
+    const char* e = getenv("SPU_DMATRACE");
+    int64_t v = !e ? -1 : ((strcmp(e, "all") == 0 || strcmp(e, "ALL") == 0) ? -3 : (int64_t)strtol(e, 0, 0));
+    if (v == INT64_MIN) v++;
+    if (e) fprintf(stderr, "[DMA] SPU_DMATRACE armed for %s\n",
+                   v == -3 ? "ALL images" : "one image id "
+                             "(a bare number is an IMAGE ID, not on/off)");
+    SPU_RELAXED_STORE(cache, v);
+    return v;
+}
+static inline int64_t spu_dmatrace_only(void)
+{
+    static int64_t cache = INT64_MIN;
+    const int64_t v = SPU_RELAXED_LOAD(&cache);
+    return SPU_PORT_UNLIKELY(v == INT64_MIN) ? spu_dmatrace_only_read(&cache) : v;
+}
+
+/* The POISON-DMA line, out of line. Its first-12 counter is thread-local, and
+ * inline the compiler folded the cheap `hitregion || haspoison` test into one
+ * condition with it and fetched the counter's address (a getter call on
+ * Mach-O) on every PUT. */
+static SPU_NOINLINE_COLD void spu_dma_poison_report(const spu_context* spu, uint32_t e, uint32_t size,
+                                                    uint32_t lsa, int hitregion, int haspoison)
+{
+    static SPU_THREAD_LOCAL int _n = 0;
+    if (PS3_LOG_FIRST(_n, 12))
+        fprintf(stderr, "[POISON-DMA] img%u PUT ea=0x%08X size=0x%X lsa=0x%X hitregion=%d haspoison=%d\n",
+               spu->image_id, e, size, lsa, hitregion, haspoison);
+}
+
 /*
  * Execute a single DMA transfer between local store and main memory.
  * Returns 0 on success; a malformed transfer stops the process.
@@ -258,8 +313,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
      * bug, and it is invisible to the sampling traces -- YDKJ had an SPU job
      * writing over the title's own OPD table at 0x00530D78, which turned
      * every call through it into "code 0x00000000 not registered". */
-    { static _Thread_local long s_w = -1; if (s_w < 0) { const char* e = getenv("SPU_DMA_WATCH");
-        s_w = e && *e ? (long)strtoul(e, 0, 16) : 0; }
+    { static int64_t s_dma_watch = -1; const uint32_t s_w = (uint32_t)spu_diag_num(&s_dma_watch, "SPU_DMA_WATCH", 16);
       /* Treat the value as the END of a watched window starting at 0x10000:
        * the whole loaded ELF image. Any SPU DMA into the image is a bug, and
        * a single stray one is invisible to the sampling traces. */
@@ -272,9 +326,8 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                       (uint32_t)s_w); } }
     /* SPU_DMA_RANGE=<lo>-<hi> (hex EAs): log transfers touching [lo,hi), first
      * 64 -- who reads or writes a buffer the RSX shares with the SPUs. */
-    { static _Thread_local uint32_t s_lo = 1, s_hi;
-      if (s_lo == 1) { const char* e = getenv("SPU_DMA_RANGE"); s_lo = 0;
-          if (e) { char* d; s_lo = (uint32_t)strtoul(e, &d, 16); if (*d == '-') s_hi = (uint32_t)strtoul(d + 1, 0, 16); } }
+    { const uint64_t s_rng = spu_dma_range_knob();
+      const uint32_t s_lo = (uint32_t)s_rng, s_hi = (uint32_t)(s_rng >> 32);
       if (s_hi && (uint32_t)ea < s_hi && (uint32_t)ea + size > s_lo) {
           static SPU_THREAD_LOCAL int _n = 0;
           if (PS3_LOG_FIRST(_n, 64))
@@ -300,7 +353,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
      * SPU_DMA_LAX=1 skips these pre-transfer checks for fixtures that
      * deliberately stage misaligned or null-page descriptors. The hard MFC
      * limits below (size over 16 KiB, LS overrun, EA range) always apply. */
-    { static _Thread_local int s_lax = -1; if (s_lax < 0) s_lax = getenv("SPU_DMA_LAX") ? 1 : 0;
+    { static int s_lax_c = -1; const int s_lax = spu_diag_knob(&s_lax_c, "SPU_DMA_LAX", 0);
       if (!s_lax) {
           /* Zero bytes move nothing and are a completed command, not an MFC
            * error: RPCS3's process_mfc_cmd executes a transfer only when
@@ -320,7 +373,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
     /* SPU_DMACHK=1: report transfers that break the MFC rules the guest's own
      * dma.h asserts on -- size 0 or > 16 KB, size not a multiple of 16 for
      * transfers of 16+ bytes, or LSA/EA not sharing 16-byte alignment. */
-    { static _Thread_local int s_dc = -1; if (s_dc < 0) s_dc = getenv("SPU_DMACHK") ? 1 : 0;
+    { static int s_dc_c = -1; const int s_dc = spu_diag_knob(&s_dc_c, "SPU_DMACHK", 0);
       if (s_dc) { static SPU_THREAD_LOCAL int _n = 0;
           int bad = (size == 0) || (size > 0x4000)
                  || (size >= 16 && (size & 15))
@@ -334,7 +387,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
     /* SPU_GETHIST=1: the same accounting for GETs, on the SOURCE side. A solver
      * whose inputs read back as zeros produces zeros no matter how many
      * instructions it runs. */
-    { static _Thread_local int s_gh = -1; if (s_gh < 0) s_gh = getenv("SPU_GETHIST") ? 1 : 0;
+    { static int s_gh_c = -1; const int s_gh = spu_diag_knob(&s_gh_c, "SPU_GETHIST", 0);
       if (s_gh && mfc_is_get(cmd) && vm_base) {
           static SPU_THREAD_LOCAL uint32_t seen[48]; static SPU_THREAD_LOCAL int ns = 0;
           uint32_t k = (uint32_t)ea & ~0xFFFFu;
@@ -344,7 +397,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
               for (uint32_t i7 = 0; i7 < size && i7 < 0x4000u; i7 += 7) if (q[i7]) nzs++;
               fprintf(stderr, "[getea] spu=0x%X 0x%08X size=%u srcNonZero=%u%c",
                       spu->spu_id, (uint32_t)ea, size, nzs, 10); } } }
-    { static _Thread_local int s_ph = -1; if (s_ph < 0) s_ph = getenv("SPU_PUTHIST") ? 1 : 0;
+    { static int s_ph_c = -1; const int s_ph = spu_diag_knob(&s_ph_c, "SPU_PUTHIST", 0);
       if (s_ph) { static SPU_THREAD_LOCAL unsigned long long ngets, nputs, nother;
           if (mfc_is_get(cmd)) ngets++; else if (mfc_is_put(cmd)) nputs++; else nother++;
           if (((ngets + nputs + nother) % 5000) == 0)
@@ -390,8 +443,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
     /* SPU_MFC_TRACE: attribute silent DMA-poll loops (a wedged task whose
      * host thread samples "in ntdll" because VirtualQuery dominates). Prints
      * every 64k-th transfer per thread: enough to see the loop's pc/ea. */
-    { static _Thread_local int s_t = -1; if (s_t < 0) { const char* e = getenv("SPU_MFC_TRACE");
-        s_t = e ? atoi(e) : 0; if (e && !s_t) s_t = 1; }
+    { static int s_mt_c = -1; const int s_t = spu_diag_knob(&s_mt_c, "SPU_MFC_TRACE", 1);
       if (s_t) { static _Thread_local unsigned long long _n; ++_n;
         /* level 2+: also print each thread's first 192 transfers (setup DMAs
          * -- shows WHERE round configs/headers are fetched from). */
@@ -436,7 +488,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         } } }
     /* cellAudio port-ring window: log every guest write into it (rare, load-
      * bearing -- the audio OUTPUT path). Same env gate as the sampler. */
-    { static _Thread_local int s_pr = -1; if (s_pr < 0) s_pr = getenv("SPU_MFC_TRACE") ? 1 : 0;
+    { static int s_pr_c = -1; const int s_pr = spu_diag_knob(&s_pr_c, "SPU_MFC_TRACE", 0);
       if (s_pr && (cmd & 0x20) && !(cmd & 0x40) &&
           (((uint32_t)ea >= 0x01000000u && (uint32_t)ea < 0x01800000u) ||
            ((uint32_t)ea >= 0x00927D00u && (uint32_t)ea < 0x00928000u))) {
@@ -507,7 +559,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
      * -- a completion-write attempt -- and (b) any GET payload carrying a
      * 0xD00Cxxxx dword -- the completion EA arriving in a loaded job buffer.
      * Answers whether the EA ever reaches / is ever written by the SPU. */
-    { static _Thread_local int s_se = -1; if (s_se < 0) s_se = getenv("SPU_STACKEA_WATCH") ? 1 : 0;
+    { static int s_se_c = -1; const int s_se = spu_diag_knob(&s_se_c, "SPU_STACKEA_WATCH", 0);
       if (s_se) {
         uint32_t e32 = (uint32_t)ea;
         if ((e32 & 0xFF000000u) == 0xD0000000u ||   /* DMA targeting the PPU stack */
@@ -526,9 +578,10 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         fprintf(stderr, "[spu-dma] %s lsa=0x%05X ea=0x%08X size=%u\n",
                 mfc_is_get(cmd) ? "GET" : "PUT", lsa, (uint32_t)ea, size); }
 #endif
-    { static _Thread_local int s_t = -1; static _Thread_local int s_img = -2;
-      if (s_t < 0) s_t = getenv("SPU_DMATRACE_ALL") ? 1 : 0;
-      if (s_img == -2) { const char* e = getenv("YDKJ_DMA_IMG"); s_img = e ? atoi(e) : -1; }
+    { static int s_t_c = -1; static int64_t s_img_c = -1;
+      const int s_t = spu_diag_knob(&s_t_c, "SPU_DMATRACE_ALL", 0);
+      int s_img = -1;
+      if (s_t) { const int64_t im = spu_diag_num(&s_img_c, "YDKJ_DMA_IMG", 10); if (im) s_img = (int)(uint32_t)im; }
       /* YDKJ_DMA_IMG=N: trace ONLY image N, uncapped (the 300-cap otherwise fills
        * with the always-running PM's DMA and hides a late image entirely). */
       if (s_t) {
@@ -567,9 +620,8 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
      * from that address. Fixed BSS structures have the same address in a
      * reference run, so this is what a dump from real hardware diffs against. */
     if (mfc_is_get(cmd) && size && vm_base) {
-        static SPU_THREAD_LOCAL uint32_t s_dg = 0xFFFFFFFFu;
-        if (s_dg == 0xFFFFFFFFu) { const char* e = getenv("SPU_DUMP_GET");
-                                   s_dg = e ? (uint32_t)strtoul(e, 0, 0) : 0; }
+        static int64_t s_dump_get = -1;
+        const uint32_t s_dg = (uint32_t)spu_diag_num(&s_dump_get, "SPU_DUMP_GET", 0);
         if (s_dg && (uint32_t)ea == s_dg) {
             static SPU_THREAD_LOCAL int done = 0;
             if (!done) { done = 1;
@@ -592,10 +644,12 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
      * load; remember where it came from so the substitution below can name it.
      * That guest address is what a write-watch needs to find its producer. */
     static SPU_THREAD_LOCAL uint32_t s_desc_ea = 0;
-    if (mfc_is_get(cmd) && size == 368) s_desc_ea = (uint32_t)ea;
+    /* s_desc_ea is read only under SPU_DSP_IMAGE_EA, so it is written only
+     * under it: a 368-byte GET with the gate off touches no thread-local. */
+    static int s_dsp_image_ea = -1;
+    const int s_di = spu_diag_knob(&s_dsp_image_ea, "SPU_DSP_IMAGE_EA", 0);
+    if (s_di && mfc_is_get(cmd) && size == 368) s_desc_ea = (uint32_t)ea;
     if (mfc_is_get(cmd) && !(uint32_t)ea && size) {
-        static _Thread_local int s_di = -1;
-        if (s_di < 0) s_di = getenv("SPU_DSP_IMAGE_EA") ? 1 : 0;
         extern uint32_t g_spu_image_src_ea, g_spu_image_ls_start, g_spu_image_span;
         if (s_di && g_spu_image_src_ea) {
             static SPU_THREAD_LOCAL int _n = 0;
@@ -616,7 +670,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
      * event flag) vs still loops. If it progresses, the null buffers are tolerable
      * and our lift is DMAing where HW skips; if not, the buffers must be real. */
     if (mfc_is_get(cmd) && (uint32_t)ea < 0x10000u) {
-        static _Thread_local int s_skip = -1; if (s_skip < 0) s_skip = getenv("LBP_SKIP_NULL_DMA") ? 1 : 0;
+        static int s_skip_c = -1; const int s_skip = spu_diag_knob(&s_skip_c, "LBP_SKIP_NULL_DMA", 0);
         if (s_skip) {
             static SPU_THREAD_LOCAL int _n = 0; if (PS3_LOG_FIRST(_n, 20))
                 fprintf(stderr, "[nulldma] img%u GET ea=0x%08X size=%u -> ZEROED (skipped)\n",
@@ -631,7 +685,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
          * (32B from ~0x94Fxxx) then a large GET from a NULL source = the
          * overlay never loads. Dump the descriptor content to see where the
          * real source EA was dropped. */
-        { static _Thread_local int s_ovl = -1; if (s_ovl < 0) s_ovl = getenv("SPU_OVL_DIAG") ? 1 : 0;
+        { static int s_ovl_c = -1; const int s_ovl = spu_diag_knob(&s_ovl_c, "SPU_OVL_DIAG", 0);
           if (s_ovl) {
               /* overlay-load map: image-6 GET of a code-sized chunk into the
                * high LS overlay region, with its (now-correct) plugin source.
@@ -671,7 +725,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         memcpy(ls_ptr, ea_ptr, size);
         /* SPU_STACKEA_WATCH (b): scan the just-loaded payload for a 0xD00Cxxxx
          * dword = the completion-word EA arriving in a job buffer. */
-        { static _Thread_local int s_se = -1; if (s_se < 0) s_se = getenv("SPU_STACKEA_WATCH") ? 1 : 0;
+        { static int s_se_c = -1; const int s_se = spu_diag_knob(&s_se_c, "SPU_STACKEA_WATCH", 0);
           if (s_se && size >= 4) { static SPU_THREAD_LOCAL int _n = 0;
             for (uint32_t o = 0; o + 4 <= size && _n < 60; o += 4) {
                 uint32_t w = (ls_ptr[o]<<24)|(ls_ptr[o+1]<<16)|(ls_ptr[o+2]<<8)|ls_ptr[o+3];
@@ -683,11 +737,14 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                     fflush(stderr); } } } }
         /* SPU_SMC_WATCH: a DMA GET that lands inside the image's own code
          * segment is a code overlay = self-modification. */
-        { static _Thread_local int s = -2; static _Thread_local uint32_t lo, hi, img;
-          if (s == -2) { const char* e = getenv("SPU_SMC_WATCH");
-            s = e ? atoi(e) : -1; img = (uint32_t)s;
-            const char* l = getenv("SPU_SMC_LO"); lo = l ? (uint32_t)strtoul(l,0,0) : 0xA00;
-            const char* h = getenv("SPU_SMC_HI"); hi = h ? (uint32_t)strtoul(h,0,0) : 0x3700; }
+        { static int64_t s_smc_c = -1, s_smc_lo_c = -1, s_smc_hi_c = -1;
+          const int64_t smc = spu_diag_num(&s_smc_c, "SPU_SMC_WATCH", 10);
+          const int s = smc ? (int)(uint32_t)smc : -1;
+          const uint32_t img = (uint32_t)s;
+          uint32_t lo = 0, hi = 0;
+          if (s >= 0) {
+            const int64_t l = spu_diag_num(&s_smc_lo_c, "SPU_SMC_LO", 0), h = spu_diag_num(&s_smc_hi_c, "SPU_SMC_HI", 0);
+            lo = l ? (uint32_t)l : 0xA00; hi = h ? (uint32_t)h : 0x3700; }
           if (s >= 0 && (uint32_t)spu->image_id == img &&
               lsa < hi && lsa + size > lo) {
               static SPU_THREAD_LOCAL int _n = 0;
@@ -850,23 +907,20 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
         { uint32_t e = (uint32_t)ea;
           int hitregion = (e < 0x40005000u && e + size > 0x40003000u);
           int haspoison = 0;
-          static SPU_THREAD_LOCAL int s_poison_watch = -1;   /* lazy getenv cache: per thread, no race */
+          static int s_poison_c = -1;
           /* SPU_POISON_DMA_WATCH=1 (any value): scan every PUT payload for the
            * poison word and also log PUTs that carry it outside the region.
            * Unset, only PUTs into the region are scanned (their lines are
            * unchanged): the scan is a second pass over every byte of every PUT. */
-          if (s_poison_watch < 0) s_poison_watch = getenv("SPU_POISON_DMA_WATCH") ? 1 : 0;
+          const int s_poison_watch = spu_diag_knob(&s_poison_c, "SPU_POISON_DMA_WATCH", 0);
           if (hitregion || s_poison_watch)
           for (uint32_t o = 0; o + 4 <= size; o += 4) {
               uint32_t w; memcpy(&w, (const char*)ls_ptr + o, 4);
               if (w == 0x08C708C7u) { haspoison = 1; break; } /* 0xC708C708 BE in LS bytes */
           }
-          if (hitregion || haspoison) {
-              static SPU_THREAD_LOCAL int _n = 0;
-              if (PS3_LOG_FIRST(_n, 12))
-                  fprintf(stderr, "[POISON-DMA] img%u PUT ea=0x%08X size=0x%X lsa=0x%X hitregion=%d haspoison=%d\n",
-                          spu->image_id, e, size, lsa, hitregion, haspoison);
-          } }
+          if (hitregion || haspoison)
+              spu_dma_poison_report(spu, e, size, lsa, hitregion, haspoison);
+          }
     }
 
     /* One report per transfer that moved bytes, after they moved: a recorder reads them from
@@ -1083,7 +1137,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
     /* SPU_CMDHIST=1: every MFC command that reaches the engine, by opcode and
      * SPU image. Catches list DMAs (putl/getl) that never reach
      * mfc_do_transfer's per-element path. */
-    { static _Thread_local int s_ch = -1; if (s_ch < 0) s_ch = getenv("SPU_CMDHIST") ? 1 : 0;
+    { static int s_ch_c = -1; const int s_ch = spu_diag_knob(&s_ch_c, "SPU_CMDHIST", 0);
       if (s_ch) { static SPU_THREAD_LOCAL unsigned long long h[256][8]; static SPU_THREAD_LOCAL unsigned long long n;
           h[cmd & 0xFF][spu->image_id & 7]++;
           if ((++n % 300) == 0) {
@@ -1111,10 +1165,9 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      * Nothing in that module's code stores +0x88, so the consumer count is
      * written from outside -- an SPU DMA is the obvious candidate, and this
      * says outright whether that is true. Watch 0x002DF008. */
-    { static _Thread_local int s_we = -2; static _Thread_local uint32_t s_wa;
-      if (s_we == -2) { const char* e = getenv("SPU_WATCHEA");
-                        s_we = e ? 1 : 0;
-                        s_wa = e ? (uint32_t)strtoul(e, 0, 16) : 0u; }
+    { static int64_t s_we_c = -1;
+      const int64_t s_we = spu_diag_num(&s_we_c, "SPU_WATCHEA", 16);
+      const uint32_t s_wa = (uint32_t)s_we;
       if (s_we && vm_base && (uint32_t)ea <= s_wa && s_wa < (uint32_t)ea + size) {
           static SPU_THREAD_LOCAL unsigned long wn;
           /* SPU_WATCHEA_EVERY=<n> (default 64): print every nth hit. 1
@@ -1147,10 +1200,9 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      * writes that mirror back to a stale value AFTER the GETLLAR, and a DMA is
      * the only thing that can do it without going through spu_ls_write128.
      * Watch LS 0x10800. */
-    { static _Thread_local int s_wl = -2; static _Thread_local uint32_t s_wlsa;
-      if (s_wl == -2) { const char* e7 = getenv("SPU_WATCHLSA");
-                        s_wl = e7 ? 1 : 0;
-                        s_wlsa = e7 ? (uint32_t)strtoul(e7, 0, 16) : 0u; }
+    { static int64_t s_wl_c = -1;
+      const int64_t s_wl = spu_diag_num(&s_wl_c, "SPU_WATCHLSA", 16);
+      const uint32_t s_wlsa = (uint32_t)s_wl;
       if (s_wl && lsa <= s_wlsa && s_wlsa < lsa + size) {
           static SPU_THREAD_LOCAL unsigned long wl;
           if (++wl <= 12 || (wl % 256) == 0) {
@@ -1174,10 +1226,9 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      * covering it. Those cannot both be true as stated. Coverage per block over
      * a whole row says whether the row is fully written with wrong DATA, or
      * partly written, and those are completely different bugs. */
-    { static _Thread_local int s_rc = -2; static _Thread_local uint32_t s_rcb;
-      if (s_rc == -2) { const char* e8 = getenv("SPU_ROWCOV");
-                        s_rc = e8 ? 1 : 0;
-                        s_rcb = e8 ? (uint32_t)strtoul(e8, 0, 16) : 0u; }
+    { static int64_t s_rc_c = -1;
+      const int64_t s_rc = spu_diag_num(&s_rc_c, "SPU_ROWCOV", 16);
+      const uint32_t s_rcb = (uint32_t)s_rc;
       if (s_rc && vm_base && mfc_is_put(cmd) &&
           (uint32_t)ea < s_rcb + 2048u && (uint32_t)ea + size > s_rcb) {
           static SPU_THREAD_LOCAL unsigned long blk[32]; static SPU_THREAD_LOCAL unsigned long rn;
@@ -1218,8 +1269,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      * 0x004DC/0x00598 (Host2Local_Body) and none from the DrawRect/DrawEdge
      * range, which would mean no geometry is rasterised at all -- the missing
      * 3D. That was noticed from three sampled addresses, so count them all. */
-    { static _Thread_local int s_vp = -1;
-      if (s_vp < 0) s_vp = getenv("SPU_VRAMPC") ? 1 : 0;
+    { static int s_vp_c = -1; const int s_vp = spu_diag_knob(&s_vp_c, "SPU_VRAMPC", 0);
       if (s_vp && mfc_is_put(cmd) &&
           (uint32_t)ea >= 0x40600000u && (uint32_t)ea < 0x40700000u) {
           static SPU_THREAD_LOCAL unsigned long long b[8]; static SPU_THREAD_LOCAL unsigned long long n;
@@ -1275,8 +1325,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      *   LS holds real pixels   -> the destination comparison was wrong
      *
      * Host2Local_Body is LS 0x00350..0x00757 (from the firmware .symtab). */
-    { static _Thread_local int s_hs = -1;
-      if (s_hs < 0) s_hs = getenv("SPU_H2LSRC") ? 1 : 0;
+    { static int s_hs_c = -1; const int s_hs = spu_diag_knob(&s_hs_c, "SPU_H2LSRC", 0);
       if (s_hs && vm_base && mfc_is_put(cmd) && size >= 16u &&
           (uint32_t)ea >= 0x40600000u && (uint32_t)ea < 0x40700000u) {
           const uint32_t pc = (uint32_t)spu->pc & SPU_LS_MASK;
@@ -1304,7 +1353,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      * (RSX local + 0x400000). Buckets keep only 4 address bits, so that may be
      * an artifact of where RSX local memory actually sits; the full EA settles
      * it. */
-    { static _Thread_local int s_pe = -1; if (s_pe < 0) s_pe = getenv("SPU_PUTEA") ? 1 : 0;
+    { static int s_pe_c = -1; const int s_pe = spu_diag_knob(&s_pe_c, "SPU_PUTEA", 0);
       if (s_pe && (cmd & 0xFF) >= 0x20u && (cmd & 0xFF) <= 0x2Fu) {
           static SPU_THREAD_LOCAL int shown[8];
           const unsigned sp2 = spu->spu_id & 7u;
@@ -1322,7 +1371,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      * of VRAM decodes to correct game art -- so the rasteriser runs and the
      * asset upload works, and the question is what geometry these transfers
      * actually have. */
-    { static _Thread_local int s_ph = -1; if (s_ph < 0) s_ph = getenv("SPU_PUTHIST") ? 1 : 0;
+    { static int s_ph_c = -1; const int s_ph = spu_diag_knob(&s_ph_c, "SPU_PUTHIST", 0);
       if (s_ph && (cmd & 0xFF) >= 0x20u && (cmd & 0xFF) <= 0x2Fu) {
           static SPU_THREAD_LOCAL unsigned long long n[8][16], byt[8][16], nsz[8][8], tot;
           const unsigned sp = spu->spu_id & 7u;
@@ -1355,7 +1404,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      * instead of image-22's lift_pol (sys-service). The cri task (0x3000+) is
      * registered under both 22 and 23, so it still resolves after the switch. */
     if (lsa == 0xA00u && (uint32_t)ea == 0x30023680u) {
-        static _Thread_local int s_cc = -1; if (s_cc < 0) s_cc = getenv("YDKJ_CRI_CHAIN") ? 1 : 0;
+        static int s_cc_c = -1; const int s_cc = spu_diag_knob(&s_cc_c, "YDKJ_CRI_CHAIN", 0);
         if (s_cc) {
             spu->image_id = 23;
             fprintf(stderr, "[cri-chain] taskset policy DMA'd to LS 0xA00 -> SPU image -> 23\n");
@@ -1510,7 +1559,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      * can see the work-fetch GET (func_000040F0) that precedes the branch-to-0 and
      * whether its source EA holds valid work-queue data. Env SPU_DMATRACE_ALL. */
     {
-        static _Thread_local int64_t dt=-2; if (dt==-2){ const char* e=getenv("SPU_DMATRACE_ALL"); dt=e?1:0; }
+        static int s_dt_c = -1; const int dt = spu_diag_knob(&s_dt_c, "SPU_DMATRACE_ALL", 0);
         /* SPU_DMATRACE=<img> traces one image; SPU_DMATRACE_ALL keeps the old
          * hardcoded pair. Seeing a job's FIRST transfers is how you tell a bad
          * parameter block from a bad address computed later. */
@@ -1520,14 +1569,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
          * SPU issues no DMA at all". That produced a confidently wrong writeup
          * for Guitar Hero III, whose task is in fact busy. Accept "all", and
          * announce once what was armed so silence is never ambiguous. */
-        static _Thread_local int64_t only=-2;
-        if (only==-2){ const char* e=getenv("SPU_DMATRACE");
-            only = !e ? -1 : ((strcmp(e,"all")==0 || strcmp(e,"ALL")==0) ? -3
-                                                                        : strtol(e,0,0));
-            if (e) fprintf(stderr, "[DMA] SPU_DMATRACE armed for %s\n",
-                           only==-3 ? "ALL images" : "one image id "
-                                                     "(a bare number is an IMAGE ID, not on/off)");
-        }
+        const int64_t only = spu_dmatrace_only();
         if ((dt && (spu->image_id==22 || spu->image_id==23)) ||
             only==-3 || (only >= 0 && spu->image_id == only)) {
             static SPU_THREAD_LOCAL int _n=0; if (PS3_LOG_FIRST(_n, 160))
@@ -1586,7 +1628,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
      * SPURS job-queue kernel, never dispatching decode); if plane-sized PUTs
      * appear we learn where the decoded frame actually lands. Env SPU_DMATRACE_RAW. */
     {
-        static _Thread_local int64_t bt=-2; if (bt==-2){ const char* e=getenv("SPU_DMATRACE_RAW"); bt=e?1:0; }
+        static int s_bt_c = -1; const int bt = spu_diag_knob(&s_bt_c, "SPU_DMATRACE_RAW", 0);
         if (bt && spu->image_id==3) {
             uint32_t ea32 = (uint32_t)ea;
             int is_put   = ((cmd & 0x20) && !(cmd & 0x40));   /* PUT-family */
@@ -1747,7 +1789,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
     /* After a cri-task GET, dump the bytes it just read (the task context) so we
      * can tell if eaContext holds valid SPURS work data or garbage. */
     {
-        static _Thread_local int64_t dt2=-2; if (dt2==-2){ const char* e=getenv("SPU_DMATRACE_ALL"); dt2=e?1:0; }
+        static int s_dt2_c = -1; const int dt2 = spu_diag_knob(&s_dt2_c, "SPU_DMATRACE_ALL", 0);
         if (dt2 && spu->image_id==22 && cmd==0x40 /*GET*/ && size<=0x80) {
             static SPU_THREAD_LOCAL int _g=0; if (PS3_LOG_FIRST(_g, 6)) {
                 const uint8_t* p = spu->ls + (lsa & 0x3FFFF);
@@ -1847,8 +1889,7 @@ static inline void mfc_channel_write(mfc_engine* mfc, spu_context* spu,
          * RdTagStat must equal the mask EXACTLY (mask 2 = tag 1 =
          * kLoadJob_readBuffers). Log the inputs so we can see whether the tag
          * really is reported complete. Env SPU_TAGPROBE=1. */
-        { static _Thread_local int s_tp = -1;
-          if (s_tp < 0) { const char* e = getenv("SPU_TAGPROBE"); s_tp = e ? 1 : 0; }
+        { static int s_tp_c = -1; const int s_tp = spu_diag_knob(&s_tp_c, "SPU_TAGPROBE", 0);
           if (s_tp && spu->image_id == 2) { static SPU_THREAD_LOCAL int _n = 0; if (PS3_LOG_FIRST(_n, 40))
               fprintf(stderr, "[tagprobe] img=%d upd=%u mask=0x%X completed=0x%X -> RdTagStat=0x%X%s\n",
                       spu->image_id, value, spu->mfc_tag_mask, mfc->tag_completed,

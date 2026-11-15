@@ -308,6 +308,20 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
     }
 }
 
+/* SPU_PUTLLC_WHY, process-wide (spu_diag_knob): spu_coh_notify_write runs on
+ * every PUTLLC commit, PUTLLUC and PPU coherent store, and a thread-local gate
+ * is a getter call per access on Mach-O. The counter stays thread-local, in a
+ * cold function: inline, the compiler hoisted its address above the holder
+ * test and paid the getter on every notify. */
+static int s_knob_putllc_why = -1;
+static SPU_NOINLINE_COLD void spu_coh_resv_lost_report(const spu_context* c, uint32_t line)
+{
+    static SPU_THREAD_LOCAL unsigned long long n;
+    if ((++n % 200000) == 1)
+        fprintf(stderr, "[resv-lost] %llu: line 0x%08X taken from img=%d ctx=%p\n",
+                n, line, c->image_id, (const void*)c);
+}
+
 void spu_coh_notify_write(uint32_t ea)
 {
     uint32_t line = ea & ~127u;
@@ -325,12 +339,8 @@ void spu_coh_notify_write(uint32_t ea)
             /* SPU_PUTLLC_WHY=1: name the agent that killed it. A PUTLLC that
              * always fails for "no reservation" is useless without knowing who
              * took it away -- a peer SPU, or the PPU committing to the line. */
-            { static SPU_THREAD_LOCAL int s_w = -1;
-              if (s_w < 0) s_w = getenv("SPU_PUTLLC_WHY") ? 1 : 0;
-              if (s_w) { static SPU_THREAD_LOCAL unsigned long long n;
-                  if ((++n % 200000) == 1)
-                      fprintf(stderr, "[resv-lost] %llu: line 0x%08X taken from img=%d ctx=%p\n",
-                              n, line, c->image_id, (void*)c); } }
+            if (spu_diag_knob(&s_knob_putllc_why, "SPU_PUTLLC_WHY", 0))
+                spu_coh_resv_lost_report(c, line);
             g_spu_lr_raise++;
             /* The event_status store has to be visible before the wake. The
              * waiter re-polls its predicate on a timeout as well, so a
