@@ -1585,6 +1585,11 @@ if(PS3RECOMP_BUILD_TESTS)
                 COMMAND "${Python3_EXECUTABLE}"
                     "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_budget_twin.py")
             set_tests_properties(spu_budget_twin PROPERTIES LABELS "spu;t0" TIMEOUT 120)
+            # The liveness tool on hand-encoded images (docs/SPU_LIFTER.md "Liveness").
+            add_test(NAME spu_liveness
+                COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_liveness.py")
+            set_tests_properties(spu_liveness PROPERTIES LABELS "spu;t0" TIMEOUT 120)
         endif()
     endif()
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
