@@ -35,6 +35,13 @@ uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa);
  * return point of the drain the caller goes back to (spu_smc_microstep). */
 uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa);
 
+/* This thread's interpreter nesting depth: the number of spu_interp_run* calls live on its host stack.
+ * Only the outermost run (depth 1) may stop at an observer yield (spu_observe.h). A non-local exit
+ * (spu_halt to spu_run_with_halt) skips the decrement of every run it jumps over, so the landing pad
+ * saves the depth before it arms and restores it after a halt; nothing else needs these. */
+int  spu_interp_depth_get(void);
+void spu_interp_depth_set(int depth);
+
 /* The single dispatch point every computed branch routes through. If `target`
  * is a registered lifted entry, runs it; otherwise interprets from `target`.
  * The lifter emits `bi $reg` / unresolved indirect branches as a call here. */
