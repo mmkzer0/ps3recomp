@@ -49,6 +49,7 @@ void* volatile    g_pm_flow_ctx = 0;
 #include <stdlib.h>
 #include <stdio.h>
 #include "ps3emu/log_first.h"
+#include "ps3emu/ps3_log.h"
 
 /* Sync-model ring-drain: the wwsjob PM's job ring drains only when jobs mark
  * their record's "done" bit (0x8000 in the record's first halfword @LS 0xDF0).
@@ -143,7 +144,7 @@ void spu_direct_init(void)
      * so relaxed ordering is enough (SPU_DIRECT reads it relaxed too). */
     int unread = -1;
     if (__atomic_compare_exchange_n(&g_spu_direct, &unread, on, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED) && !on)
-        fprintf(stderr, "[spu] direct tail calls off (%s)\n", why);
+        PS3_LOG(PS3_LOG_INFO, "spu", "direct tail calls off (%s)\n", why);
 }
 
 static void spu_job_ls0_note(const spu_context* ctx)
@@ -218,11 +219,8 @@ static void spu_task_launch_slow(spu_context* ctx)
       if (s_t >= 0 && ctx->image_id == s_t) {
           if (s_from >= 0 && !s_armed &&
               ((uint32_t)ctx->pc & SPU_LS_MASK) == (uint32_t)s_from) s_armed = 1;
-          static SPU_THREAD_LOCAL int n = 0;
-          if ((s_from < 0 || s_armed) && PS3_LOG_FIRST(n, 40)) {
-              fprintf(stderr, "[step] pc=0x%05X r1=0x%05X r2=0x%08X r3=0x%08X r4=0x%08X\n",
-                      (uint32_t)ctx->pc & SPU_LS_MASK, ctx->gpr[1]._u32[0],
-                      ctx->gpr[2]._u32[0], ctx->gpr[3]._u32[0], ctx->gpr[4]._u32[0]);
+          if ((s_from < 0 || s_armed)) {
+              PS3_LOG_N(40, PS3_LOG_INFO, "step", "pc=0x%05X r1=0x%05X r2=0x%08X r3=0x%08X r4=0x%08X\n", (uint32_t)ctx->pc & SPU_LS_MASK, ctx->gpr[1]._u32[0], ctx->gpr[2]._u32[0], ctx->gpr[3]._u32[0], ctx->gpr[4]._u32[0]);
               fflush(stderr);
           }
       } }
@@ -257,9 +255,7 @@ static void spu_task_launch_slow(spu_context* ctx)
         r[2] = (uint8_t)(w >> 8);  r[3] = (uint8_t)w;
         marked++;
     }
-    static SPU_THREAD_LOCAL int _n = 0;
-    if (marked && PS3_LOG_FIRST(_n, 12))
-        fprintf(stderr, "[pm-jobdrain] ring-full spin: marked %d pending records done\n", marked);
+    if (marked) PS3_LOG_N(12, PS3_LOG_INFO, "pm-jobdrain", "ring-full spin: marked %d pending records done\n", marked);
 }
 
 /* Restore the active image after a lifted call bracket. The brsl/bisl emission
@@ -367,10 +363,7 @@ int spu_irq_regs_maybe_restore(spu_context* ctx)
                     ctx->irq_frame = f->prev;      /* returned to its loop the ordinary way */
                 if (f && ctx->host_depth > f->depth) {
                     { static SPU_THREAD_LOCAL int s_it = -1; if (s_it < 0) s_it = getenv("SPU_IRQTRACE") ? 1 : 0;
-                      static SPU_THREAD_LOCAL int _n = 0;
-                      if (s_it && PS3_LOG_FIRST(_n, 200))
-                          fprintf(stderr, "[irq] IRET at depth %u unwinds to taking frame depth %u (srr0=0x%05X)\n",
-                                  ctx->host_depth, f->depth, ctx->pc & SPU_LS_MASK); }
+                      if (s_it) PS3_LOG_N(200, PS3_LOG_INFO, "irq", "IRET at depth %u unwinds to taking frame depth %u (srr0=0x%05X)\n", ctx->host_depth, f->depth, ctx->pc & SPU_LS_MASK); }
                     SPU_LONGJMP(f->env, 1);
                 }
                 if (!f && ctx->host_depth > 0) {
@@ -378,10 +371,7 @@ int spu_irq_regs_maybe_restore(spu_context* ctx)
                      * keeps no frame: the driver's own restart re-enters at
                      * srr0 with the host stack empty, which is that frame. */
                     { static SPU_THREAD_LOCAL int s_it = -1; if (s_it < 0) s_it = getenv("SPU_IRQTRACE") ? 1 : 0;
-                      static SPU_THREAD_LOCAL int _n = 0;
-                      if (s_it && PS3_LOG_FIRST(_n, 200))
-                          fprintf(stderr, "[irq] IRET at depth %u unwinds to the driver (srr0=0x%05X)\n",
-                                  ctx->host_depth, ctx->pc & SPU_LS_MASK); }
+                      if (s_it) PS3_LOG_N(200, PS3_LOG_INFO, "irq", "IRET at depth %u unwinds to the driver (srr0=0x%05X)\n", ctx->host_depth, ctx->pc & SPU_LS_MASK); }
                     extern void spu_restart_dispatch(spu_context*);
                     spu_restart_dispatch(ctx);
                 }
@@ -423,10 +413,8 @@ void spu_irqwait_diag(spu_context* ctx)
                  p[0],p[1],p[2],p[3], p[4],p[5],p[6],p[7],
                  p[8],p[9],p[10],p[11], p[12],p[13],p[14],p[15]);
     }
-    fprintf(stderr, "[irq-wait] img=%d pc=0x%05X dispatches=%llu status=0x%X mask=0x%X "
-            "list_stall_mask=0x%X list_stall_stat=0x%X%s\n",
-            ctx->image_id, (unsigned)(ctx->pc & SPU_LS_MASK), s_n, ctx->event_status,
-            ctx->event_mask, ctx->list_stall_mask, ctx->list_stall_stat, extra);
+    PS3_LOG(PS3_LOG_INFO, "irq-wait", "img=%d pc=0x%05X dispatches=%llu status=0x%X mask=0x%X "
+            "list_stall_mask=0x%X list_stall_stat=0x%X%s\n", ctx->image_id, (unsigned)(ctx->pc & SPU_LS_MASK), s_n, ctx->event_status, ctx->event_mask, ctx->list_stall_mask, ctx->list_stall_stat, extra);
     fflush(stderr);
 }
 
@@ -459,26 +447,19 @@ void (*spu_take_interrupt(spu_context* ctx,
     ctx->int_enable = 0;
     spu_irq_regs_save(ctx);          /* hardware contract: handler preserves regs */
     { static SPU_THREAD_LOCAL int s_it = -1; if (s_it < 0) s_it = getenv("SPU_IRQTRACE") ? 1 : 0;
-      if (s_it) { static SPU_THREAD_LOCAL int _n = 0; if (PS3_LOG_FIRST(_n, 200))
-        fprintf(stderr, "[irq] TAKE srr0=0x%05X depth=%d r13=%08X r15=%08X\n",
-                ctx->srr0 & SPU_LS_MASK, ctx->host_depth,
-                ctx->gpr[13]._u32[0], ctx->gpr[15]._u32[0]); } }
+      if (s_it) { PS3_LOG_N(200, PS3_LOG_INFO, "irq", "TAKE srr0=0x%05X depth=%d r13=%08X r15=%08X\n", ctx->srr0 & SPU_LS_MASK, ctx->host_depth, ctx->gpr[13]._u32[0], ctx->gpr[15]._u32[0]); } }
     ctx->pc = target & SPU_LS_MASK;
-    { static SPU_THREAD_LOCAL int _n = 0;
-      if (PS3_LOG_FIRST(_n, 16)) {
+    {
+      {
           /* WWS Load->Run diagnosis: the job-manager interrupt handler advances
            * g_WwsJob_loadJobState kReadCommands(1)->kExecuteCommands(2) only if
            * (a) the ch25 stall mask has tag 0 (kLoadJob_readCommands) AND
            * (b) loadJobState's HALFWORDS compare equal to 1 (ceqhi).
            * Log both at interrupt entry so we can see which test fails. */
           const uint8_t* js = ctx->ls + 0x12A0;   /* g_WwsJob_loadJobState quadword */
-          fprintf(stderr, "[spu-int] TAKEN img=%d events=0x%X&0x%X vector->0x%05X "
+          PS3_LOG_N(16, PS3_LOG_INFO, "spu-int", "TAKEN img=%d events=0x%X&0x%X vector->0x%05X "
                   "(srr0=0x%05X) stallstat=0x%X parked=0x%X loadJobState@12A0=%02X%02X%02X%02X "
-                  "%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n", ctx->image_id,
-                  ctx->event_status, ctx->event_mask, ctx->pc, ctx->srr0,
-                  ctx->list_stall_stat, ctx->list_stall_mask,
-                  js[0],js[1],js[2],js[3], js[4],js[5],js[6],js[7],
-                  js[8],js[9],js[10],js[11], js[12],js[13],js[14],js[15]); } }
+                  "%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n", ctx->image_id, ctx->event_status, ctx->event_mask, ctx->pc, ctx->srr0, ctx->list_stall_stat, ctx->list_stall_mask, js[0], js[1], js[2], js[3], js[4], js[5], js[6], js[7], js[8], js[9], js[10], js[11], js[12], js[13], js[14], js[15]); } }
     return spu_indirect_branch;
 }
 

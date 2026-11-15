@@ -46,6 +46,7 @@ def main():
         for src, out in ((spu / "tests/test_dma_litmus_main.c", "test.o"),
                          (spu / "spu_vm_pagemap.c", "pagemap.o"),
                          (ROOT / "runtime/memory/label_window.c", "label_window.o"),
+                         (ROOT / "runtime/diag/ps3_log.c", "ps3_log.o"),
                          (ROOT / "runtime/platform/host_clock.c", "host_clock.o"),
                          (ROOT / "runtime/platform/host_wait.c", "host_wait.o"),
                          (ROOT / "runtime/platform/win32_compat.c", "compat.o")):
@@ -54,8 +55,7 @@ def main():
             objects.append(str(obj))
         # spu_dma.h calls the typed configuration and the named-stop runtime directly.
         for src, out in ((ROOT / "runtime/config/config.cpp", "config.o"),
-                         (ROOT / "runtime/diag/stop.cpp", "stop.o"),
-                         (ROOT / "tests/ps3_log_null.cpp", "ps3_log_null.o")):
+                         (ROOT / "runtime/diag/stop.cpp", "stop.o")):
             obj = tmp / out
             subprocess.run([cxx, *cxxflags, "-c", str(src), "-o", str(obj)], check=True)
             objects.append(str(obj))

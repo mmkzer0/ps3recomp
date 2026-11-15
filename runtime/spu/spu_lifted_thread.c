@@ -4,6 +4,7 @@
 #include "spu_coherency.h"
 #include "spu_context.h"
 #include "ps3emu/ps3_tprof.h"   /* PS3_TPROF: in-process thread samples */
+#include "ps3emu/ps3_log.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -112,8 +113,7 @@ void spu_lifted_thread_run(spu_context* ctx, spu_lifted_thread_result* out)
     memset(&r, 0, sizeof(r));
     if (!ctx) { if (out) *out = r; return; }
 
-    fprintf(stderr, "[SPU] tid=0x%X RUNNING lifted image entry=0x%05X (image %d)\n",
-            ctx->spu_id, ctx->pc, ctx->image_id);
+    PS3_LOG(PS3_LOG_INFO, "SPU", "tid=0x%X RUNNING lifted image entry=0x%05X (image %d)\n", ctx->spu_id, ctx->pc, ctx->image_id);
     fflush(stderr);
 
     ctx->status = SPU_STATUS_RUNNING;
@@ -145,10 +145,8 @@ void spu_lifted_thread_run(spu_context* ctx, spu_lifted_thread_result* out)
         r.faulted = 1;
     }
 
-    fprintf(stderr, "[SPU] tid=0x%X stopped (status=0x%X pc=0x%05X code=0x%X) "
-            "-> status=%d%s%s\n",
-            ctx->spu_id, ctx->status, ctx->pc, ctx->stop_code, r.exit_status,
-            r.group_exit ? " group-exit" : "", r.faulted ? " FAULT" : "");
+    PS3_LOG(PS3_LOG_INFO, "SPU", "tid=0x%X stopped (status=0x%X pc=0x%05X code=0x%X) "
+            "-> status=%d%s%s\n", ctx->spu_id, ctx->status, ctx->pc, ctx->stop_code, r.exit_status, r.group_exit ? " group-exit" : "", r.faulted ? " FAULT" : "");
     fflush(stderr);
 
     /* This thread run has ended; remove observer references and release its

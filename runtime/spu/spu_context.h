@@ -11,7 +11,7 @@
 #define SPU_CONTEXT_H
 
 #include "../../include/ps3emu/ps3types.h"
-#include "../../include/ps3emu/log_first.h"
+#include "../../include/ps3emu/ps3_log.h"
 #include "spu_effect_port.h"
 #include <stdint.h>
 #include <string.h>
@@ -814,11 +814,8 @@ static SPU_NOINLINE_COLD void spu_ls_read_probe(const spu_context* ctx, uint32_t
           for (int i = 0; i < n; i++) if (seen[i] == key) { known = 1; break; }
           if (!known && n < 24) {
               seen[n++] = key;
-              fprintf(stderr, "[spu-lowread] img=%d read LS 0x%03X at pc=0x%05X "
-                      "ctx=%p r1=0x%05X r2=0x%08X r3=0x%08X r4=0x%08X\n",
-                      ctx->image_id, lsa, (uint32_t)ctx->pc & SPU_LS_MASK,
-                      (const void*)ctx,                      ctx->gpr[1]._u32[0], ctx->gpr[2]._u32[0],
-                      ctx->gpr[3]._u32[0], ctx->gpr[4]._u32[0]);
+              PS3_LOG(PS3_LOG_INFO, "spu-lowread", "img=%d read LS 0x%03X at pc=0x%05X "
+                      "ctx=%p r1=0x%05X r2=0x%08X r3=0x%08X r4=0x%08X\n", ctx->image_id, lsa, (uint32_t)ctx->pc & SPU_LS_MASK, (const void*)ctx, ctx->gpr[1]._u32[0], ctx->gpr[2]._u32[0], ctx->gpr[3]._u32[0], ctx->gpr[4]._u32[0]);
               fflush(stderr);
           }
       } }
@@ -832,8 +829,7 @@ static SPU_NOINLINE_COLD void spu_ls_read_probe(const spu_context* ctx, uint32_t
         if (g_wws_read_probe < 48) {
             g_wws_read_probe++;
             uint32_t off = lsa - 0xDF0;
-            fprintf(stderr, "[wws-res] bufferSetArray read jobNum=%u logBufSet=%u off=0x%X\n",
-                    off >> 6, (off >> 2) & 0xF, off);
+            PS3_LOG(PS3_LOG_INFO, "wws-res", "bufferSetArray read jobNum=%u logBufSet=%u off=0x%X\n", off >> 6, (off >> 2) & 0xF, off);
         }
     }
 }
@@ -892,8 +888,7 @@ static SPU_NOINLINE_COLD void spu_ls_write_probe_pre(spu_context* ctx, uint32_t 
             /* GetLogicalBuffer keys the bufferSet on jobNum(=loadJobNum): row at
              * 0xDF0 + jobNum*64. Dump THAT row (and job0's) so we see which set
              * the code resolves from. codeLsa>>10 = the resolved page. */
-            fprintf(stderr, "[wws-code] codeLS=0x%05X (page 0x%X) loadJobNum=0x%X nextLoad=0x%X runJobNum=0x%X\n",
-                    codeLsa & 0x3FFFF, (codeLsa>>10)&0xFF, loadJob, nextLoad, runJob);
+            PS3_LOG(PS3_LOG_INFO, "wws-code", "codeLS=0x%05X (page 0x%X) loadJobNum=0x%X nextLoad=0x%X runJobNum=0x%X\n", codeLsa & 0x3FFFF, (codeLsa>>10)&0xFF, loadJob, nextLoad, runJob);
             uint32_t row = (loadJob <= 3) ? (0xDF0 + loadJob*64) : 0xDF0;
             const uint8_t* bs = &ctx->ls[row];
             fprintf(stderr, "  bufferSetArray[job=0x%X @0x%X]:", loadJob, row);
@@ -928,11 +923,8 @@ static SPU_NOINLINE_COLD void spu_ls_write_probe_smc(spu_context* ctx, uint32_t 
         const char* l = getenv("SPU_SMC_LO"); lo = l ? (uint32_t)strtoul(l,0,0) : 0xA00;
         const char* h = getenv("SPU_SMC_HI"); hi = h ? (uint32_t)strtoul(h,0,0) : 0x3700; }
       if (s >= 0 && (uint32_t)ctx->image_id == img && lsa >= lo && lsa < hi) {
-          static SPU_THREAD_LOCAL int _n = 0;   /* per worker: a shared counter would race */
-          if (PS3_LOG_FIRST(_n, 48))
-              fprintf(stderr, "[spu-SMC] img=%d WROTE CODE @0x%05X (pc=0x%05X) = %02X%02X%02X%02X\n",
-                      ctx->image_id, lsa, (uint32_t)ctx->pc & SPU_LS_MASK,
-                      p[0], p[1], p[2], p[3]);
+          /* per worker: a shared counter would race */
+          PS3_LOG_N(48, PS3_LOG_INFO, "spu-SMC", "img=%d WROTE CODE @0x%05X (pc=0x%05X) = %02X%02X%02X%02X\n", ctx->image_id, lsa, (uint32_t)ctx->pc & SPU_LS_MASK, p[0], p[1], p[2], p[3]);
       } }
 }
 
@@ -1200,7 +1192,7 @@ static inline void spu_pchist_tick(const spu_context* ctx)
     if ((++n % 4000000ull) == 0) {
         static const char* nm[8] = { "other", "BlockClear", "H2L_Body",
             "Host2Local", "Local2Local", "main", "DrawRect", "DrawEdge" };
-        fprintf(stderr, "[pchist] %llu hops\n", n);
+        PS3_LOG(PS3_LOG_INFO, "pchist", "%llu hops\n", n);
         for (unsigned q = 0; q < 8; q++) {
             int any = 0;
             for (int j = 0; j < 8; j++) if (b[q][j]) any = 1;

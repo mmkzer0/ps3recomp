@@ -111,7 +111,8 @@ def main():
         binary = tmp / "test_spu_trace_file"
         build(binary, [spu / "tests" / "test_spu_trace_file.c",
                        spu / "spu_channels.c",
-                       root / "runtime/memory/label_window.c"])
+                       root / "runtime/memory/label_window.c",
+                       root / "runtime/diag/ps3_log.c"])
         for _ in range(3):
             check_trace_init(binary, tmp)
         # Repeated because the lazy-open election is the property under test.
@@ -127,7 +128,8 @@ def main():
         tsan_ran = tsan_available(tmp)
         if tsan_ran:
             tsan_bin = tmp / "test_spu_pchist_race"
-            build(tsan_bin, [spu / "tests" / "test_spu_pchist_race.c"],
+            build(tsan_bin, [spu / "tests" / "test_spu_pchist_race.c",
+                             root / "runtime/diag/ps3_log.c"],
                   extra=("-fsanitize=thread",))
             p = run(tsan_bin, [], base_env, tmp)
             assert p.returncode == 0, (p.returncode, p.stdout, p.stderr[-3000:])

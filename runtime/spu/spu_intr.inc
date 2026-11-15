@@ -52,8 +52,7 @@ int ps3_intr_establish(uint32_t tag, uint64_t thread)
             s_intr[i].tag = tag;
             s_intr[i].thread = thread;
             s_intr[i].pending = 0;
-            fprintf(stderr, "[intr] tag 0x%08X -> ppu thread %llu\n",
-                    tag, (unsigned long long)thread);
+            PS3_LOG(PS3_LOG_INFO, "intr", "tag 0x%08X -> ppu thread %llu\n", tag, (unsigned long long)thread);
             return 0;
         }
     }
@@ -113,8 +112,7 @@ int ps3_intr_wait(uint64_t thread)
         if (ps3_intr_level(b->tag)) {
             static unsigned long _n = 0;
             if (++_n <= 8)
-                fprintf(stderr, "[intr] deliver tag 0x%08X -> thread %llu\n",
-                        b->tag, (unsigned long long)thread);
+                PS3_LOG(PS3_LOG_INFO, "intr", "deliver tag 0x%08X -> thread %llu\n", b->tag, (unsigned long long)thread);
             return 1;
         }
 #ifdef _WIN32

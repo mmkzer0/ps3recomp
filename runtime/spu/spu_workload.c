@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "ps3emu/log_first.h"
+#include "ps3emu/ps3_log.h"
 #include "ps3emu/stop.h"
 #include "../memory/vm.h"       /* vm_range_ok / vm_guest_limit: the guest arena rule */
 #include "ps3emu/ps3_env_once.h"   /* ps3_env_once: each switch looked up once */
@@ -108,8 +109,7 @@ void spu_workload_register_img(uint64_t fingerprint, spu_lifted_entry_fn fn,
         }
     }
     if (s_registry_count >= SPU_WORKLOAD_MAX) {
-        fprintf(stderr, "[spu_workload] registry full (%u); dropping '%s'\n",
-                SPU_WORKLOAD_MAX, name ? name : "?");
+        PS3_LOG(PS3_LOG_INFO, "spu_workload", "registry full (%u); dropping '%s'\n", SPU_WORKLOAD_MAX, name ? name : "?");
         return;
     }
     s_registry[s_registry_count].fp       = fingerprint;
@@ -150,8 +150,7 @@ void spu_workload_register_twin(uint64_t fingerprint, spu_lifted_entry_fn fn, in
      * fingerprint; one without a body to belong to is a registration error,
      * and an image id of 0 would match every image (spu_lookup). */
     if (!fn || image_id <= 0) {
-        fprintf(stderr, "[spu_workload] bad twin registration for 0x%016llX (image id %d)\n",
-                (unsigned long long)fingerprint, image_id);
+        PS3_LOG(PS3_LOG_INFO, "spu_workload", "bad twin registration for 0x%016llX (image id %d)\n", (unsigned long long)fingerprint, image_id);
         return;
     }
     for (unsigned i = 0; i < s_registry_count; i++)
@@ -160,8 +159,7 @@ void spu_workload_register_twin(uint64_t fingerprint, spu_lifted_entry_fn fn, in
             s_registry[i].twin_image_id = image_id;
             return;
         }
-    fprintf(stderr, "[spu_workload] twin registered for 0x%016llX, which has no registered body; dropped\n",
-            (unsigned long long)fingerprint);
+    PS3_LOG(PS3_LOG_INFO, "spu_workload", "twin registered for 0x%016llX, which has no registered body; dropped\n", (unsigned long long)fingerprint);
 }
 
 spu_lifted_entry_fn spu_workload_find_twin(uint64_t fingerprint, int* image_id_out)
@@ -182,9 +180,8 @@ void spu_workload_register_img_masked(uint64_t fingerprint, spu_lifted_entry_fn 
                                       uint32_t var_len)
 {
     if (!fn || !size || !var_len || var_off > size || var_len > size - var_off) {
-        fprintf(stderr, "[spu_workload] bad masked registration '%s' "
-                        "(size 0x%X, area 0x%X+0x%X)\n",
-                name ? name : "?", size, var_off, var_len);
+        PS3_LOG(PS3_LOG_INFO, "spu_workload", "bad masked registration '%s' "
+                        "(size 0x%X, area 0x%X+0x%X)\n", name ? name : "?", size, var_off, var_len);
         return;
     }
     spu_workload_register_img(fingerprint, fn, image_id, name);
@@ -235,7 +232,7 @@ void spu_workload_promote_img(uint64_t fingerprint)
     }
     /* The registry is generated, so a promotion of an image that is not in it is a generator or ordering
      * fault: say so, and promote nothing (the image would never have run lifted anyway). */
-    fprintf(stderr, "[spu_workload] promote-unregistered image=0x%016llX: no body is registered under that "
+    PS3_LOG(PS3_LOG_INFO, "spu_workload", "promote-unregistered image=0x%016llX: no body is registered under that "
                     "fingerprint; nothing promoted\n", (unsigned long long)fingerprint);
 }
 
@@ -271,8 +268,7 @@ void spu_workload_set_inventory(uint64_t fingerprint, uint32_t flags, uint32_t c
         }
     }
     if (s_inventory_count >= SPU_WORKLOAD_MAX) {
-        fprintf(stderr, "[spu_workload] inventory table full (%u); image 0x%016llX stays unknown\n",
-                SPU_WORKLOAD_MAX, (unsigned long long)fingerprint);
+        PS3_LOG(PS3_LOG_INFO, "spu_workload", "inventory table full (%u); image 0x%016llX stays unknown\n", SPU_WORKLOAD_MAX, (unsigned long long)fingerprint);
         return;
     }
     s_inventory[s_inventory_count].fp = fingerprint;
@@ -503,10 +499,8 @@ int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
     for (unsigned i = 0; i < s_registry_count; i++)
         if (s_registry[i].fp == fp) { fn = s_registry[i].fn; image_id = s_registry[i].image_id; break; }
     if (!fn) {
-        fprintf(stderr,
-            "[spu_workload] dispatch MISS fp=0x%016llX size=%u "
-            "(no lifted SPU binary registered for this image)\n",
-            (unsigned long long)fp, image_size);
+        PS3_LOG(PS3_LOG_INFO, "spu_workload", "dispatch MISS fp=0x%016llX size=%u "
+            "(no lifted SPU binary registered for this image)\n", (unsigned long long)fp, image_size);
         spu_workload_report_miss("sync", fp, image_size, args_ea);
         return 0;
     }
@@ -519,14 +513,12 @@ int spu_workload_dispatch(const uint8_t* image, uint32_t image_size,
 
     uint32_t entry = 0;
     if (!spu_elf_load_to_ls(image, image_size, ls, &entry)) {
-        fprintf(stderr, "[spu_workload] dispatch fp=0x%016llX: not a valid SPU ELF\n", (unsigned long long)fp);
+        PS3_LOG(PS3_LOG_INFO, "spu_workload", "dispatch fp=0x%016llX: not a valid SPU ELF\n", (unsigned long long)fp);
         free(ls);
         return 0;
     }
 
-    fprintf(stderr,
-        "[spu_workload] dispatch HIT fp=0x%016llX entry=0x%05X args=0x%08X image=%d -> running\n",
-        (unsigned long long)fp, entry, args_ea, image_id);
+    PS3_LOG(PS3_LOG_INFO, "spu_workload", "dispatch HIT fp=0x%016llX entry=0x%05X args=0x%08X image=%d -> running\n", (unsigned long long)fp, entry, args_ea, image_id);
 
     spu_run_lifted_job_img(fn, ls, args_ea, image_id);
 
@@ -553,12 +545,10 @@ static void spu_workload_report_miss(const char* path, uint64_t fp, uint32_t siz
     const char* fatal = ps3_env_once("SPU_MISS_FATAL");
     const int abort_on_miss = fatal && *fatal == '1';
     if (!first && !abort_on_miss) return;
-    fprintf(stderr,
-        "[spu_workload] ERROR: %s dispatch of an SPU program with no lifted image "
+    PS3_LOG(PS3_LOG_INFO, "spu_workload", "ERROR: %s dispatch of an SPU program with no lifted image "
         "(fp=0x%016llX size=%u owner=0x%08X) -- the program is DROPPED and will "
         "never run; anything waiting on it stalls. Lift and register this image "
-        "(build_spu_workloads --input). Reported once per program; SPU_MISS_FATAL=1 aborts.\n",
-        path, (unsigned long long)fp, size, owner_ea);
+        "(build_spu_workloads --input). Reported once per program; SPU_MISS_FATAL=1 aborts.\n", path, (unsigned long long)fp, size, owner_ea);
     fflush(stderr);
     if (abort_on_miss) abort();
 }
@@ -827,7 +817,7 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
         ps3_stop_spurs_task_halt("taskset-restart", taskset_ea, halt_t, halt_elf, halt_reason, NULL);
     }
     for (int i = 0; i < n_start; i++) {
-        fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X "
+        PS3_LOG(PS3_LOG_INFO, "taskset", "start task %u of taskset 0x%08X elf=0x%08X "
                         "(after task %u exited)\n", start_t[i], taskset_ea, start_elf[i], done_task);
         g_ydkj_real_taskset_ea = taskset_ea; g_ydkj_real_taskid = start_t[i];
         if (!spu_workload_dispatch_async(vm_base + start_elf[i], (uint32_t)start_sz[i], start_ctx[i])) {
@@ -868,10 +858,7 @@ static void spu_async_run(spu_async_job* j)
 #endif
         if (!ts_slot->ls) ts_slot->ls = (uint8_t*)calloc(1, SPU_LS_SIZE);
         ls = ts_slot->ls;
-        { static int _n = 0; if (PS3_LOG_FIRST(_n, 24))
-            fprintf(stderr, "[persist-ls] taskset=0x%08X task=%u image=%d %s\n",
-                    j->taskset_ea, j->taskid, j->image_id,
-                    ts_slot->loaded ? "REUSE (state retained)" : "first load"); fflush(stderr); }
+        { PS3_LOG_N(24, PS3_LOG_INFO, "persist-ls", "taskset=0x%08X task=%u image=%d %s\n", j->taskset_ea, j->taskid, j->image_id, ts_slot->loaded ? "REUSE (state retained)" : "first load"); fflush(stderr); }
     } else {
         ls = (uint8_t*)calloc(1, SPU_LS_SIZE);
     }
@@ -918,14 +905,14 @@ static void spu_async_run(spu_async_job* j)
                 p[0]=0; p[1]=0; p[2]=0; p[3]=0;                 /* hi32 of u64 */
                 p[4]=(uint8_t)(inst>>24); p[5]=(uint8_t)(inst>>16);
                 p[6]=(uint8_t)(inst>>8);  p[7]=(uint8_t)inst;   /* lo32 */
-                fprintf(stderr, "[cri] YDKJ_CRI_TASKSET: loaded taskset policy@0xA00, LS[0x1C0]=inst, running policy entry (img23)\n");
+                PS3_LOG(PS3_LOG_INFO, "cri", "YDKJ_CRI_TASKSET: loaded taskset policy@0xA00, LS[0x1C0]=inst, running policy entry (img23)\n");
                 fflush(stderr);
                 /* Run the taskset policy entry instead of the cri task entry.
                  * (Declared by spu_lifted_job.h -- a local extern re-declaration
                  * here conflicts with the header's static inline under clang.) */
                 int32_t prc = spu_run_lifted_job_abi(tsp_spu_func_00000A00, ls,
                                                      j->args_ea, 23, 1, j->have_r3 ? j->r3 : 0, 0);
-                fprintf(stderr, "[cri] taskset policy RETURNED rc=%d\n", prc);
+                PS3_LOG(PS3_LOG_INFO, "cri", "taskset policy RETURNED rc=%d\n", prc);
                 fflush(stderr);
                 free(ls); free(j); return;
             }
@@ -981,14 +968,13 @@ static void spu_async_run(spu_async_job* j)
                           LSBE32(0x27A0,v); LSBE32(0x27A4,v); LSBE32(0x27A8,v); LSBE32(0x27AC,v); }
                       if ((_e=ps3_env_once("YDKJ_G1_CTX")))   { uint32_t v=(uint32_t)strtoul(_e,0,0);
                           LSBE32(0x2798,v); LSBE32(0x279C,v); } }
-                    fprintf(stderr, "[cri] REAL SpursTasksetContext built from taskset 0x%08X task %u (elf=0x%llX)\n",
-                            g_ydkj_real_taskset_ea, g_ydkj_real_taskid, (unsigned long long)elf);
+                    PS3_LOG(PS3_LOG_INFO, "cri", "REAL SpursTasksetContext built from taskset 0x%08X task %u (elf=0x%llX)\n", g_ydkj_real_taskset_ea, g_ydkj_real_taskid, (unsigned long long)elf);
                 } else {
                     LSBE32(0x27C0, 0x100);     /* kernelMgmtAddr -> SPURS kernel ctx @LS 0x100 */
                     LSBE32(0x27C4, 0xA70);     /* syscallAddr -> HLE PM syscall trampoline (0xA70) */
                     LSBE32(0x2FB0, 0xFFFFFFFFu); LSBE32(0x2FB4, 0x400);
                     LSBE32(0x2FB8, 0x2700);      LSBE32(0x2FBC, 0x3000);
-                    fprintf(stderr, "[cri] HLE cri-task ctx (minimal plant): syscallAddr@0x27C4=0xA70\n");
+                    PS3_LOG(PS3_LOG_INFO, "cri", "HLE cri-task ctx (minimal plant): syscallAddr@0x27C4=0xA70\n");
                 }
                 #undef LSBE32
                 fflush(stderr);
@@ -1049,9 +1035,8 @@ static void spu_async_run(spu_async_job* j)
                  * both audio tasks run task 1's descriptor). */
                 if (j->taskset_ea) {
                     spurs_pm_build_context(ls, j->taskset_ea, j->taskid, 0, 0);
-                    fprintf(stderr, "[taskset] built SpursTasksetContext image=%d "
-                            "taskset=0x%08X task=%u\n", j->image_id,
-                            j->taskset_ea, j->taskid); fflush(stderr);
+                    PS3_LOG(PS3_LOG_INFO, "taskset", "built SpursTasksetContext image=%d "
+                            "taskset=0x%08X task=%u\n", j->image_id, j->taskset_ea, j->taskid); fflush(stderr);
                 }
             }
             /* ---- Bink-layer probe + real-policy A/B (image 3 = binkspu) ----
@@ -1106,14 +1091,11 @@ static void spu_async_run(spu_async_job* j)
                         spurs_ea = RDBE32(t, 0x64);
                         /* Why did the policy exit without dispatching? Dump the task
                          * bitsets it reads (task N = bit 127-N; task 2 = bit 125). */
-                        fprintf(stderr, "[taskset-bits] RUNNING=%08X%08X READY=%08X%08X ENABLED=%08X%08X SIGNALLED=%08X%08X WAITING=%08X%08X\n",
-                                RDBE32(t,0x00),RDBE32(t,0x04), RDBE32(t,0x10),RDBE32(t,0x14),
-                                RDBE32(t,0x30),RDBE32(t,0x34), RDBE32(t,0x40),RDBE32(t,0x44),
-                                RDBE32(t,0x50),RDBE32(t,0x54)); }
+                        PS3_LOG(PS3_LOG_INFO, "taskset-bits", "RUNNING=%08X%08X READY=%08X%08X ENABLED=%08X%08X SIGNALLED=%08X%08X WAITING=%08X%08X\n", RDBE32(t,0x00), RDBE32(t,0x04), RDBE32(t,0x10), RDBE32(t,0x14), RDBE32(t,0x30), RDBE32(t,0x34), RDBE32(t,0x40), RDBE32(t,0x44), RDBE32(t,0x50), RDBE32(t,0x54)); }
                     uint8_t real2700[0x180];
                     int st = spurs_run_taskset_policy_probe(ts, j->taskid, spurs_ea,
                                                             (uint64_t)ts, 3, real2700, sizeof real2700);
-                    fprintf(stderr, "[real-pm] status=0x%X -- LS 0x2700 diff (build_context vs real policy):\n", st);
+                    PS3_LOG(PS3_LOG_INFO, "real-pm", "status=0x%X -- LS 0x2700 diff (build_context vs real policy):\n", st);
                     for (uint32_t o = 0; o < sizeof real2700; o += 4) {
                         uint32_t bc = ((uint32_t)ls[0x2700+o]<<24)|((uint32_t)ls[0x2700+o+1]<<16)|
                                       ((uint32_t)ls[0x2700+o+2]<<8)|ls[0x2700+o+3];
@@ -1130,7 +1112,7 @@ static void spu_async_run(spu_async_job* j)
                      * build_context 0x100 kernel ctx (moduleId "TK") intact. */
                     if (ps3_env_once("LBP_POLICY_CTX")) {
                         memcpy(ls + 0x2700, real2700, sizeof real2700);
-                        fprintf(stderr, "[real-pm] OVERLAID policy ctx onto binkspu LS 0x2700 (LBP_POLICY_CTX)\n");
+                        PS3_LOG(PS3_LOG_INFO, "real-pm", "OVERLAID policy ctx onto binkspu LS 0x2700 (LBP_POLICY_CTX)\n");
                     }
                     fflush(stderr);
                 }
@@ -1163,12 +1145,12 @@ static void spu_async_run(spu_async_job* j)
                     rc = spu_run_lifted_job_abi(j->fn, ls, j->args_ea, j->image_id,
                                                 1, j->have_r3 ? j->r3 : 0, 0);
                     if (g_cri_video_dma) {
-                        fprintf(stderr, "[cri] RESUME: cri task DECODED real video (attempt %d)\n", attempt);
+                        PS3_LOG(PS3_LOG_INFO, "cri", "RESUME: cri task DECODED real video (attempt %d)\n", attempt);
                         break;
                     }
                 }
                 if (!g_cri_video_dma)
-                    fprintf(stderr, "[cri] RESUME: no work-ready after 400 polls (PPU never marked work)\n");
+                    PS3_LOG(PS3_LOG_INFO, "cri", "RESUME: no work-ready after 400 polls (PPU never marked work)\n");
                 fflush(stderr);
             }
             /* YDKJ_CRI_WAKE probe: on cri task (image 22) completion, wake any PPU
@@ -1177,7 +1159,7 @@ static void spu_async_run(spu_async_job* j)
             if (j->image_id == 22 && ps3_env_once("YDKJ_CRI_WAKE")) {
                 extern void ydkj_wake_all_event_flags(void);
                 ydkj_wake_all_event_flags();
-                fprintf(stderr, "[cri] YDKJ_CRI_WAKE: woke all event-flag waiters on cri completion\n");
+                PS3_LOG(PS3_LOG_INFO, "cri", "YDKJ_CRI_WAKE: woke all event-flag waiters on cri completion\n");
             }
             /* SPU_LS_DUMP=<prefix>: write this job's whole local store when it
              * ends. A reference dump from real hardware is a full local store,
@@ -1188,8 +1170,8 @@ static void spu_async_run(spu_async_job* j)
                   snprintf(path, sizeof path, "%s_img%d.bin", pfx, j->image_id);
                   FILE* f = fopen(path, "wb");
                   if (f) { fwrite(ls, 1, SPU_LS_SIZE, f); fclose(f);
-                      fprintf(stderr, "[spu_workload] wrote local store -> %s\n", path); } } }
-            fprintf(stderr, "[spu_workload] async image=%d RETURNED rc=%d "
+                      PS3_LOG(PS3_LOG_INFO, "spu_workload", "wrote local store -> %s\n", path); } } }
+            PS3_LOG(PS3_LOG_INFO, "spu_workload", "async image=%d RETURNED rc=%d "
                     "(job ran to completion, did not loop)\n", j->image_id, rc);
             spu_serial_release();
             if (j->taskset_ea) spu_taskset_task_exited(j->taskset_ea, j->taskid);
@@ -1216,7 +1198,7 @@ static void spu_async_forget_mfc_stack(void)
     const uintptr_t top = (uintptr_t)pthread_get_stackaddr_np(pthread_self());
     const size_t size = pthread_get_stacksize_np(pthread_self());
     if (!top || !size || size > top) {
-        fprintf(stderr, "[spu] cannot determine worker stack bounds for MFC cleanup\n");
+        PS3_LOG(PS3_LOG_INFO, "spu", "cannot determine worker stack bounds for MFC cleanup\n");
         abort();
     }
     lo = top - size;
@@ -1225,7 +1207,7 @@ static void spu_async_forget_mfc_stack(void)
     pthread_attr_t attr;
     int error = pthread_getattr_np(pthread_self(), &attr);
     if (error) {
-        fprintf(stderr, "[spu] cannot get worker stack attributes for MFC cleanup: %d\n", error);
+        PS3_LOG(PS3_LOG_INFO, "spu", "cannot get worker stack attributes for MFC cleanup: %d\n", error);
         abort();
     }
     void* base = NULL;
@@ -1234,7 +1216,7 @@ static void spu_async_forget_mfc_stack(void)
     pthread_attr_destroy(&attr);
     lo = (uintptr_t)base;
     if (error || !base || !size || size > UINTPTR_MAX - lo) {
-        fprintf(stderr, "[spu] cannot determine worker stack bounds for MFC cleanup: %d\n", error);
+        PS3_LOG(PS3_LOG_INFO, "spu", "cannot determine worker stack bounds for MFC cleanup: %d\n", error);
         abort();
     }
     hi = lo + size;
@@ -1242,7 +1224,7 @@ static void spu_async_forget_mfc_stack(void)
 #error "SPU worker stack bounds are required for MFC exit cleanup"
 #endif
     if (hi <= lo) {
-        fprintf(stderr, "[spu] invalid worker stack bounds for MFC cleanup\n");
+        PS3_LOG(PS3_LOG_INFO, "spu", "invalid worker stack bounds for MFC cleanup\n");
         abort();
     }
     spu_mfc_forget_range(lo, hi);
@@ -1289,8 +1271,7 @@ int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
          * and the logging itself distorts guest timing. */
         { static unsigned long long miss_n = 0;
           if (++miss_n <= 32 || miss_n % 100000 == 0)
-            fprintf(stderr, "[spurs-job] dispatch MISS fp=0x%016llX size=%u job=0x%08X (#%llu)\n",
-                    (unsigned long long)fp, image_size, job_ea, miss_n); }
+            PS3_LOG(PS3_LOG_INFO, "spurs-job", "dispatch MISS fp=0x%016llX size=%u job=0x%08X (#%llu)\n", (unsigned long long)fp, image_size, job_ea, miss_n); }
         spu_workload_report_miss("SPURS job", fp, image_size, job_ea);
         /* SPU_DUMP_MISS=<dir>: write the unrecognised image out so it can be
          * lifted and registered. SPURS job binaries are raw code+data blobs
@@ -1312,7 +1293,7 @@ int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
                   if (_f) {
                       fwrite(image, 1, image_size, _f);
                       fclose(_f);
-                      fprintf(stderr, "[spurs-job] dumped -> %s\n", _path);
+                      PS3_LOG(PS3_LOG_INFO, "spurs-job", "dumped -> %s\n", _path);
                   }
               }
           } }
@@ -1325,8 +1306,7 @@ int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
      * the per-job pair is verbose-only. */
     int verbose = ps3_log_verbose();
     if (verbose) {
-        fprintf(stderr, "[spurs-job] dispatch HIT fp=0x%016llX image=%d job=0x%08X\n",
-                (unsigned long long)fp, image_id, job_ea);
+        PS3_LOG(PS3_LOG_INFO, "spurs-job", "dispatch HIT fp=0x%016llX image=%d job=0x%08X\n", (unsigned long long)fp, image_id, job_ea);
         fflush(stderr);
     }
     /* SPU_JOBPROF=<secs>: host time spent per job image, printed every <secs>.
@@ -1345,14 +1325,13 @@ int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
         if (now - last >= s_prof) {
             last = now;
             for (unsigned i = 0; i < 64; i++) if (cnt[i]) {
-                fprintf(stderr, "[jobprof] image=%u n=%u total=%.2fs avg=%.2fms\n",
-                        i, cnt[i], acc[i], acc[i] * 1e3 / cnt[i]);
+                PS3_LOG(PS3_LOG_INFO, "jobprof", "image=%u n=%u total=%.2fs avg=%.2fms\n", i, cnt[i], acc[i], acc[i] * 1e3 / cnt[i]);
                 acc[i] = 0; cnt[i] = 0;
             }
         }
     }
     if (verbose) {
-        fprintf(stderr, "[spurs-job] job 0x%08X RETURNED rc=%d\n", job_ea, rc);
+        PS3_LOG(PS3_LOG_INFO, "spurs-job", "job 0x%08X RETURNED rc=%d\n", job_ea, rc);
         fflush(stderr);
     }
     return 1;
@@ -1654,9 +1633,7 @@ void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
      * lock-line and take s_sig_lock, so lock-line must never nest inside it. */
     spu_signalled_update(taskset_ea, taskId, 1);
     spu_taskset_wake_written(NULL);
-    { static int _n = 0; if (PS3_LOG_FIRST(_n, 24))
-        fprintf(stderr, "[spu_workload] signal task %u (taskset 0x%08X)\n",
-                taskId, taskset_ea); fflush(stderr); }
+    { PS3_LOG_N(24, PS3_LOG_INFO, "spu_workload", "signal task %u (taskset 0x%08X)\n", taskId, taskset_ea); fflush(stderr); }
     /* SPU_SIG_STATS=1: signals per second per (taskset, task, caller). */
     { static int s_on = -1; if (s_on < 0) s_on = ps3_env_once("SPU_SIG_STATS") ? 1 : 0;
       if (s_on) {
@@ -1672,8 +1649,7 @@ void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
           if (!t0) t0 = now;
           if (now - t0 >= 5000) {
               for (int i = 0; i < 32 && ts[i]; i++) {
-                  fprintf(stderr, "[sig-stats] taskset=0x%08X task=%u caller=%p %.1f/s\n",
-                          ts[i], tk[i], (void*)ca[i], cnt[i] * 1000.0 / (now - t0));
+                  PS3_LOG(PS3_LOG_INFO, "sig-stats", "taskset=0x%08X task=%u caller=%p %.1f/s\n", ts[i], tk[i], (void*)ca[i], cnt[i] * 1000.0 / (now - t0));
                   cnt[i] = 0; ts[i] = 0;
               }
               t0 = now;
@@ -1781,9 +1757,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
     { extern unsigned long long ps3_ms_now(void);
       unsigned long long _now = ps3_ms_now();
       static unsigned _n = 0; if (_n++ < 200 || (_n % 500) == 0)   /* unsigned: periodic, wrapping is defined */
-        fprintf(stderr, "[spu_workload] WAIT_SIGNAL#%u enter task=%u taskset=0x%08X ran=%llums\n",
-                _n, taskId, taskset_ea,
-                s_wait_exit_ms ? (_now - s_wait_exit_ms) : 0ull); }
+        PS3_LOG(PS3_LOG_INFO, "spu_workload", "WAIT_SIGNAL#%u enter task=%u taskset=0x%08X ran=%llums\n", _n, taskId, taskset_ea, s_wait_exit_ms ? (_now - s_wait_exit_ms) : 0ull); }
     /* LBP_SYNC_ACK: taskset sync-lane bookkeeping. On real SPURS the taskset
      * POLICY MODULE advances the per-SPU progress lanes (sync+0x40+16*row:
      * ticket u16 @+0, consumer lanes @+2..) as tasks are processed; our HLE
@@ -1809,8 +1783,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
                     }
                 }
             }
-            { static int _a = 0; if (PS3_LOG_FIRST(_a, 8))
-                fprintf(stderr, "[sync-ack] lanes advanced to tickets (sync=0x%08X)\n", b); }
+            { PS3_LOG_N(8, PS3_LOG_INFO, "sync-ack", "lanes advanced to tickets (sync=0x%08X)\n", b); }
         }
     }
     unsigned secs = 0;
@@ -1841,7 +1814,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
             if (!SleepConditionVariableSRW(&s_sig_cv, &s_sig_lock, 1000, 0)) {
                 static int _n = 0;
                 if (++secs && _n < 16) { _n++;
-                    fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) sleeping "
+                    PS3_LOG(PS3_LOG_INFO, "spu_workload", "task %u (taskset 0x%08X) sleeping "
                             "%us in WAIT_SIGNAL\n", taskId, taskset_ea, secs); fflush(stderr); }
                 if (drain && secs >= drain) drained = 1;
             }
@@ -1865,7 +1838,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
             if (rc == ETIMEDOUT) {
                 static int _n = 0;
                 if (++secs && _n < 16) { _n++;
-                    fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) sleeping "
+                    PS3_LOG(PS3_LOG_INFO, "spu_workload", "task %u (taskset 0x%08X) sleeping "
                             "%us in WAIT_SIGNAL\n", taskId, taskset_ea, secs); fflush(stderr); }
                 if (drain && secs >= drain) drained = 1;
             }
@@ -1883,8 +1856,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
     spu_taskset_parked_del(taskset_ea, taskId);
     if (!drained) spu_signalled_update(taskset_ea, taskId, 0);
     SPU_WORKLOAD_TEST_HOOK("spu.wait_signal.after_clear", taskset_ea);
-    if (drained) { static int _d = 0; if (PS3_LOG_FIRST(_d, 24))
-        fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) WS_DRAIN resume "
+    if (drained) { PS3_LOG_N(24, PS3_LOG_INFO, "spu_workload", "task %u (taskset 0x%08X) WS_DRAIN resume "
                 "after %us (no signal)\n", taskId, taskset_ea, secs); fflush(stderr); }
     spu_serial_acquire();       /* resume: re-take the serial lock */
     { extern unsigned long long ps3_ms_now(void);
@@ -1921,11 +1893,10 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
                            _dir, (unsigned long long)fp, image_size);
                   FILE* _f = fopen(_path, "wb");
                   if (_f) { fwrite(image, 1, image_size, _f); fclose(_f);
-                      fprintf(stderr, "[spu_workload] wrote %s\n", _path); }
+                      PS3_LOG(PS3_LOG_INFO, "spu_workload", "wrote %s\n", _path); }
               }
           } }
-        fprintf(stderr, "[spu_workload] async dispatch MISS fp=0x%016llX size=%u\n",
-                (unsigned long long)fp, image_size);
+        PS3_LOG(PS3_LOG_INFO, "spu_workload", "async dispatch MISS fp=0x%016llX size=%u\n", (unsigned long long)fp, image_size);
         spu_workload_report_miss("async task", fp, image_size, args_ea);
         return 0;
     }
@@ -1958,9 +1929,7 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
         if ((j->r3[0] >> 16) == 0x40) j->have_r3 = 1;   /* valid marker */
     }
 
-    fprintf(stderr,
-        "[spu_workload] dispatch HIT (async) fp=0x%016llX args=0x%08X image=%d -> spawning thread\n",
-        (unsigned long long)fp, args_ea, image_id);
+    PS3_LOG(PS3_LOG_INFO, "spu_workload", "dispatch HIT (async) fp=0x%016llX args=0x%08X image=%d -> spawning thread\n", (unsigned long long)fp, args_ea, image_id);
     if (args_ea) { extern uint8_t* vm_base; const uint8_t* c = vm_base + args_ea;
         static int _d=0; if (PS3_LOG_FIRST(_d, 1)) {
             /* Dump a larger window of the task context buffer + scan for any word

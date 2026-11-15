@@ -14,6 +14,7 @@
 #define SPU_LIFTED_JOB_H
 
 #include "spu_context.h"
+#include "../../include/ps3emu/ps3_log.h"
 #include "spu_interp.h"
 #include "spu_coherency.h"        /* spu_interp_run — un-lifted SPU images */
 #include <string.h>
@@ -60,8 +61,7 @@ static inline int32_t spu_run_interp_job(uint8_t* local_store, uint32_t entry_pc
      * probe sees contexts only once they reserve. */
     { static int s_cl = -1;
       if (s_cl < 0) s_cl = getenv("SPU_CTX_LOG") ? 1 : 0;
-      if (s_cl) { fprintf(stderr, "[spu-ctx] new job context %p image=%d entry=0x%05X\n",
-                          (void*)&ctx, image_id, entry_pc); fflush(stderr); } }
+      if (s_cl) { PS3_LOG(PS3_LOG_INFO, "spu-ctx", "new job context %p image=%d entry=0x%05X\n", (void*)&ctx, image_id, entry_pc); fflush(stderr); } }
     ctx.image_id = image_id;
     ctx.gpr[1]._u32[0] = SPU_LS_SIZE - 0x10;       /* SPU stack top, 16B aligned */
     if (local_store) memcpy(ctx.ls, local_store, SPU_LS_SIZE);
@@ -165,8 +165,7 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
     spu_context_init(&ctx, 0);
     { static int s_cl = -1;
       if (s_cl < 0) s_cl = getenv("SPU_CTX_LOG") ? 1 : 0;
-      if (s_cl) { fprintf(stderr, "[spu-ctx] new job context %p image=%d\n",
-                          (void*)&ctx, image_id); fflush(stderr); } }
+      if (s_cl) { PS3_LOG(PS3_LOG_INFO, "spu-ctx", "new job context %p image=%d\n", (void*)&ctx, image_id); fflush(stderr); } }
     ctx.image_id = image_id;     /* select this image's indirect-branch table */
     if (opts) {
         ctx.spu_id              = opts->spu_id;
@@ -291,10 +290,8 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
     }
     #undef _LB
     if (taskset_ctx && getenv("SPURS_TASKSET_TRACE")) {
-        fprintf(stderr, "[taskset] run image=%d r3=%08X %08X %08X %08X "
-                "r4=%08X %08X %08X %08X\n", image_id,
-                ctx.gpr[3]._u32[0], ctx.gpr[3]._u32[1], ctx.gpr[3]._u32[2], ctx.gpr[3]._u32[3],
-                ctx.gpr[4]._u32[0], ctx.gpr[4]._u32[1], ctx.gpr[4]._u32[2], ctx.gpr[4]._u32[3]);
+        PS3_LOG(PS3_LOG_INFO, "taskset", "run image=%d r3=%08X %08X %08X %08X "
+                "r4=%08X %08X %08X %08X\n", image_id, ctx.gpr[3]._u32[0], ctx.gpr[3]._u32[1], ctx.gpr[3]._u32[2], ctx.gpr[3]._u32[3], ctx.gpr[4]._u32[0], ctx.gpr[4]._u32[1], ctx.gpr[4]._u32[2], ctx.gpr[4]._u32[3]);
         fflush(stderr);
     }
     int _halted = 0;
@@ -305,13 +302,8 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
      * and the difference between "parked at its idle poll" and "fell over after
      * three instructions" is invisible without this. */
     if (opts && getenv("SPU_WORKER_TRACE")) {
-        fprintf(stderr, "[worker] spu=0x%X halted=%d steps=%llu status=0x%X pc=0x%05X "
-                "inmbox(n=%u) outmbox(n=%u v=0x%08X) outintr(n=%u v=0x%08X)\n",
-                ctx.spu_id, _halted, (unsigned long long)ctx.steps, (unsigned)ctx.status,
-                (unsigned)(ctx.pc & SPU_LS_MASK),
-                (unsigned)ctx.ch_in_mbox.count,
-                (unsigned)ctx.ch_out_mbox.count, ctx.ch_out_mbox.value,
-                (unsigned)ctx.ch_out_intr_mbox.count, ctx.ch_out_intr_mbox.value);
+        PS3_LOG(PS3_LOG_INFO, "worker", "spu=0x%X halted=%d steps=%llu status=0x%X pc=0x%05X "
+                "inmbox(n=%u) outmbox(n=%u v=0x%08X) outintr(n=%u v=0x%08X)\n", ctx.spu_id, _halted, (unsigned long long)ctx.steps, (unsigned)ctx.status, (unsigned)(ctx.pc & SPU_LS_MASK), (unsigned)ctx.ch_in_mbox.count, (unsigned)ctx.ch_out_mbox.count, ctx.ch_out_mbox.value, (unsigned)ctx.ch_out_intr_mbox.count, ctx.ch_out_intr_mbox.value);
         fflush(stderr);
     }
 

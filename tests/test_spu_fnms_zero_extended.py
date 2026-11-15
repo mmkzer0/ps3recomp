@@ -29,7 +29,12 @@ def main():
         env={k:v for k,v in os.environ.items() if not k.startswith(("SPU_","SPURS_","YDKJ_"))}
         cmd=[os.environ.get("CC","cc"),"-std=gnu17","-O2","-fsanitize=undefined","-fno-sanitize-recover=all","-UNDEBUG"]
         cmd += ["-I"+str(x) for x in (temp,ROOT/"runtime",ROOT/"include",ROOT/"runtime/spu")]
-        cmd += [str(ROOT/"tests/test_spu_fnms_zero_extended.c"),str(ROOT/"runtime/spu/spu_interp.c"),"-lm","-o",str(temp/"fixture")]
+        # spu_interp.c logs through ps3_log; its configure path (config.cpp/stop.cpp) is unreferenced
+        # here, so section GC drops it and the logger links without the C++ runtime.
+        cmd += ["-ffunction-sections","-fdata-sections",
+                "-Wl,-dead_strip" if sys.platform=="darwin" else "-Wl,--gc-sections"]
+        cmd += [str(ROOT/"tests/test_spu_fnms_zero_extended.c"),str(ROOT/"runtime/spu/spu_interp.c"),
+                str(ROOT/"runtime/diag/ps3_log.c"),"-lm","-o",str(temp/"fixture")]
         subprocess.run(cmd,env=env,check=True,timeout=60)
         return subprocess.run([str(temp/"fixture")],env=env,timeout=15).returncode
 if __name__=="__main__":

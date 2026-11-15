@@ -281,6 +281,12 @@ static void test_concurrent_taskset_registration(void)
 /* Runtime functions outside the path under test. */
 static ps3_config s_test_config;
 const ps3_config* ps3_config_get(void) { return &s_test_config; }
+/* ps3_log_configure (runtime/diag/ps3_log.c) installs the stop mirror; this fixture never configures
+ * a log, so the hook stays empty. */
+void ps3_stop_set_mirror(ps3_stop_quiesce_fn quiesce, ps3_stop_mirror_fn mirror)
+{
+    (void)quiesce; (void)mirror;
+}
 
 uint64_t ppu_store_window;
 int ps3_label_window_overlaps(uint64_t ea, uint32_t size) { (void)ea; (void)size; return 0; }

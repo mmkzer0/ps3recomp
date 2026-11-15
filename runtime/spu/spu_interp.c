@@ -10,6 +10,7 @@
 #include "spu_interp.h"
 #include "spu_helpers.h"
 #include "spu_observe.h"
+#include "ps3emu/ps3_log.h"
 #include <stdio.h>
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -470,7 +471,7 @@ void spu_trace_call(uint32_t from, uint32_t to) {
 }
 void spu_trace_dump(uint32_t at) {
     if (!getenv("SPU_CALLTRACE")) return;
-    fprintf(stderr, "[SPU-TRACE] halt at LS 0x%05X; last %d calls (from->to):\n", at, SPU_TRACE_N);
+    PS3_LOG(PS3_LOG_INFO, "SPU-TRACE", "halt at LS 0x%05X; last %d calls (from->to):\n", at, SPU_TRACE_N);
     unsigned n = s_trace_i < SPU_TRACE_N ? s_trace_i : SPU_TRACE_N;
     for (unsigned k = 0; k < n; k++) {
         unsigned idx = (s_trace_i - n + k) % SPU_TRACE_N;
@@ -579,7 +580,7 @@ static void interp_stats_step(const spu_context* ctx)
     unsigned long long now = (unsigned long long)ts.tv_sec * 1000ull + (unsigned long long)ts.tv_nsec / 1000000ull;
     if (!s_is_t0) { s_is_t0 = now; return; }
     if (now - s_is_t0 < (unsigned long long)s_is * 1000ull) return;
-    fprintf(stderr, "[spu-interp] %.1fM steps/s over %lds\n", s_is_tot / 1e6 / (double)s_is, s_is);
+    PS3_LOG(PS3_LOG_INFO, "spu-interp", "%.1fM steps/s over %lds\n", s_is_tot / 1e6 / (double)s_is, s_is);
     interp_stats_top("pages (steps)", s_is_img, s_is_page, s_is_cnt, 6);
     interp_stats_top("entries (calls)", s_ie_img, s_ie_pc, s_ie_cnt, 8);
     s_is_tot = 0; s_is_t0 = now;
@@ -622,7 +623,7 @@ static void interp_opstats_report(FILE* out)
     ops_row* rows = (ops_row*)malloc((size_t)SPU_OP_COUNT * sizeof *rows);
     char* buf = (char*)malloc(cap);
     if (!rows || !buf) {
-        fprintf(stderr, "[spu-ops] out of memory building the report\n");
+        PS3_LOG(PS3_LOG_INFO, "spu-ops", "out of memory building the report\n");
         free(rows); free(buf);
         return;
     }
@@ -840,10 +841,7 @@ static uint32_t spu_interp_run_inner(spu_context* ctx, uint32_t start_lsa,
             else if (dg->g1in) {
                 dg->g1in = 0;
                 #define GLB(o) (((uint32_t)ctx->ls[(o)]<<24)|((uint32_t)ctx->ls[(o)+1]<<16)|((uint32_t)ctx->ls[(o)+2]<<8)|ctx->ls[(o)+3])
-                fprintf(stderr,"[gate1] func_00026E80 ret r3=%08X | LS2FB0=%08X LS2FB4=%08X LS2FB8=%08X | LS1E0=%08X LS1E4=%08X LS1E8=%08X | r1=%05X r29=%08X r32=%08X r16=%08X r22=%08X r8=%08X r6=%08X\n",
-                    ctx->gpr[3]._u32[0], GLB(0x2FB0),GLB(0x2FB4),GLB(0x2FB8), GLB(0x1E0),GLB(0x1E4),GLB(0x1E8),
-                    ctx->gpr[1]._u32[0], ctx->gpr[29]._u32[0], ctx->gpr[32]._u32[0],
-                    ctx->gpr[16]._u32[0], ctx->gpr[22]._u32[0], ctx->gpr[8]._u32[0], ctx->gpr[6]._u32[0]);
+                PS3_LOG(PS3_LOG_INFO, "gate1", "func_00026E80 ret r3=%08X | LS2FB0=%08X LS2FB4=%08X LS2FB8=%08X | LS1E0=%08X LS1E4=%08X LS1E8=%08X | r1=%05X r29=%08X r32=%08X r16=%08X r22=%08X r8=%08X r6=%08X\n", ctx->gpr[3]._u32[0], GLB(0x2FB0), GLB(0x2FB4), GLB(0x2FB8), GLB(0x1E0), GLB(0x1E4), GLB(0x1E8), ctx->gpr[1]._u32[0], ctx->gpr[29]._u32[0], ctx->gpr[32]._u32[0], ctx->gpr[16]._u32[0], ctx->gpr[22]._u32[0], ctx->gpr[8]._u32[0], ctx->gpr[6]._u32[0]);
                 #undef GLB
                 fflush(stderr); dg->g1--;
             }
@@ -861,8 +859,7 @@ static uint32_t spu_interp_run_inner(spu_context* ctx, uint32_t start_lsa,
             /* dump the LS 0x2700 SpursTasksetContext the poll reads -- compare to the
              * working RPCS3 SPU0 dump (RUNNING/READY/ENABLED=0x80000000, SIGNALLED=0). */
             #define LB(o) (((uint32_t)ctx->ls[(o)]<<24)|((uint32_t)ctx->ls[(o)+1]<<16)|((uint32_t)ctx->ls[(o)+2]<<8)|ctx->ls[(o)+3])
-            fprintf(stderr,"[spu-trace] LS ctx: RUN=%08X READY=%08X PEND=%08X ENA=%08X SIG=%08X WAIT=%08X | 2790=%08X 2794=%08X 27D8=%08X 2FB0=%08X\n",
-                LB(0x2700),LB(0x2710),LB(0x2720),LB(0x2730),LB(0x2740),LB(0x2750),LB(0x2790),LB(0x2794),LB(0x27D8),LB(0x2FB0));
+            PS3_LOG(PS3_LOG_INFO, "spu-trace", "LS ctx: RUN=%08X READY=%08X PEND=%08X ENA=%08X SIG=%08X WAIT=%08X | 2790=%08X 2794=%08X 27D8=%08X 2FB0=%08X\n", LB(0x2700), LB(0x2710), LB(0x2720), LB(0x2730), LB(0x2740), LB(0x2750), LB(0x2790), LB(0x2794), LB(0x27D8), LB(0x2FB0));
             #undef LB
             fflush(stderr); dg->tr--; SPU_RELAXED_STORE(&g_spu_interp_steps, steps); return 0x2000u;
         }

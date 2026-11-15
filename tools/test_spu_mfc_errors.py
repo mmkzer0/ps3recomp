@@ -51,6 +51,7 @@ def main():
                 (spu / "tests/test_mfc_errors_main.c", cflags, "fixture.o"),
                 (spu / "spu_vm_pagemap.c", cflags, "pagemap.o"),
                 (ROOT / "runtime/memory/label_window.c", cflags, "label_window.o"),
+                (ROOT / "runtime/diag/ps3_log.c", cflags, "ps3_log.o"),
                 (ROOT / "runtime/platform/host_clock.c", cflags, "host_clock.o"),
                 (ROOT / "runtime/platform/host_wait.c", cflags, "host_wait.o"),
                 (ROOT / "runtime/platform/win32_compat.c", cflags, "compat.o")):
@@ -58,8 +59,7 @@ def main():
             subprocess.run([cc, *flags, "-c", str(src), "-o", str(obj)], check=True)
             objects.append(str(obj))
         for src, out in ((ROOT / "runtime/config/config.cpp", "config.o"),
-                         (ROOT / "runtime/diag/stop.cpp", "stop.o"),
-                         (ROOT / "tests/ps3_log_null.cpp", "ps3_log_null.o")):
+                         (ROOT / "runtime/diag/stop.cpp", "stop.o")):
             obj = tmp / out
             subprocess.run([cxx, *cxxflags, "-c", str(src), "-o", str(obj)], check=True)
             objects.append(str(obj))

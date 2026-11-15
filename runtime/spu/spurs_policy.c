@@ -30,7 +30,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "ps3emu/log_first.h"
+#include "ps3emu/ps3_log.h"
 
 extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
 
@@ -209,20 +209,15 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
          * makes correct multi-SPU execution look like duplicated state. */
         { static SPU_THREAD_LOCAL int s_cl = -1;
           if (s_cl < 0) s_cl = getenv("SPU_CTX_LOG") ? 1 : 0;
-          if (s_cl) fprintf(stderr, "[spu-ctx] new POLICY context %p wid=%u spu_num=%u\n",
-                            (void*)ctx, wid, spu_num); }
+          if (s_cl) PS3_LOG(PS3_LOG_INFO, "spu-ctx", "new POLICY context %p wid=%u spu_num=%u\n", (void*)ctx, wid, spu_num); }
         memset(ctx, 0, sizeof(*ctx));
         spu_context_init(ctx, 0);
     } else if (s_fresh || resident->data != wkl_data ||
                resident->pm != pm_host || resident->size != pm_size ||
                resident->entry != entry || resident->image_id != image_id) {
         if (!s_fresh) {
-            static SPU_THREAD_LOCAL int _n = 0;
-            if (PS3_LOG_FIRST(_n, 8))
-                fprintf(stderr, "[spurs-pm] wid=%u spu=%u workload data changed "
-                        "0x%llX -> 0x%llX: fresh PM context\n", wid, spu_num,
-                        (unsigned long long)resident->data,
-                        (unsigned long long)wkl_data);
+            PS3_LOG_N(8, PS3_LOG_INFO, "spurs-pm", "wid=%u spu=%u workload data changed "
+                        "0x%llX -> 0x%llX: fresh PM context\n", wid, spu_num, (unsigned long long)resident->data, (unsigned long long)wkl_data);
         }
         first = 1;
         spu_coh_unregister(ctx);
@@ -308,8 +303,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     unsigned long runno = ++s_runs;
     int log_this = s_trace && (runno <= 64 || (runno & 0xFFF) == 0);
     if (log_this) {
-        fprintf(stderr, "[spurs-pm] RUN#%lu wid=%u data=0x%llX spurs=0x%08X image=%d entry=0xA00 size=%u\n",
-                runno, wid, (unsigned long long)wkl_data, spurs_ea, image_id, pm_size);
+        PS3_LOG(PS3_LOG_INFO, "spurs-pm", "RUN#%lu wid=%u data=0x%llX spurs=0x%08X image=%d entry=0xA00 size=%u\n", runno, wid, (unsigned long long)wkl_data, spurs_ea, image_id, pm_size);
         fflush(stderr);
     }
 
@@ -354,9 +348,8 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     if (tracing) {
         g_pm_flow_n = 0;
         s_flow_arm_ms = ps3_ms_now();
-        { static SPU_THREAD_LOCAL int _a = 0; if (PS3_LOG_FIRST(_a, 8)) {
-            fprintf(stderr, "[pm-flow] ARM wid=%u spu=%u (watch=0x%08X)\n",
-                    wid, spu_num, g_barrier_sync_watch); fflush(stderr); } }
+        { {
+            PS3_LOG_N(8, PS3_LOG_INFO, "pm-flow", "ARM wid=%u spu=%u (watch=0x%08X)\n", wid, spu_num, g_barrier_sync_watch); fflush(stderr); } }
         /* Watchdog: the traced run has been observed to HANG the jobmanager
          * kernel thread (the claim run never returns -> no later dispatch can
          * report). A detached thread dumps the partial trail after 5s; the
@@ -415,17 +408,11 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
         unsigned claims = g_spu_putllc_sync_hit - claim_before;
         unsigned stages = g_wws_batch_gets - batch_before;
         if (claims || stages) {
-            static SPU_THREAD_LOCAL unsigned s_cl = 0;
-            if (PS3_LOG_FIRST(s_cl, 64)) {
+            {
                 const uint8_t* L = ctx->ls;
                 #define W(o)  ((L[(o)]<<24)|(L[(o)+1]<<16)|(L[(o)+2]<<8)|L[(o)+3])
-                fprintf(stderr, "[pm-claim] wid=%u spu=%u first=%d claims=%u stages=%u%s halt_pc=0x%05X "
-                        "nextLoad=0x%X loadJob=0x%X runJob=0x%X storeJob=0x%X q13F0=%08X q14E0=%08X\n",
-                        wid, spu_num, first, claims, stages,
-                        (claims && !stages) ? " <-- CLAIM EATEN" : "",
-                        ctx->pc & SPU_LS_MASK,
-                        W(0x12C0), W(0x12D0), W(0x12E0), W(0x12F0),
-                        W(0x13F0), W(0x14E0));
+                PS3_LOG_N(64, PS3_LOG_INFO, "pm-claim", "wid=%u spu=%u first=%d claims=%u stages=%u%s halt_pc=0x%05X "
+                        "nextLoad=0x%X loadJob=0x%X runJob=0x%X storeJob=0x%X q13F0=%08X q14E0=%08X\n", wid, spu_num, first, claims, stages, (claims && !stages) ? " <-- CLAIM EATEN" : "", ctx->pc & SPU_LS_MASK, W(0x12C0), W(0x12D0), W(0x12E0), W(0x12F0), W(0x13F0), W(0x14E0));
                 fflush(stderr);
                 #undef W
             }
@@ -442,12 +429,9 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
             const uint8_t* L = ctx->ls;
             #define HW(o) ((L[(o)+2]<<8)|L[(o)+3])
             #define W(o)  ((L[(o)]<<24)|(L[(o)+1]<<16)|(L[(o)+2]<<8)|L[(o)+3])
-            fprintf(stderr, "[pm-pipe] wid=%u run#%lu first=%d halt_pc=0x%05X "
+            PS3_LOG(PS3_LOG_INFO, "pm-pipe", "wid=%u run#%lu first=%d halt_pc=0x%05X "
                     "loadState=%u->%u nextLoad=0x%X loadJob=0x%X runJob=0x%X storeJob=0x%X "
-                    "lastStore=0x%X\n",
-                    wid, s_pn, first, ctx->pc & SPU_LS_MASK,
-                    st_before, HW(0x12A0), W(0x12C0), W(0x12D0), W(0x12E0),
-                    W(0x12F0), W(0x1300));
+                    "lastStore=0x%X\n", wid, s_pn, first, ctx->pc & SPU_LS_MASK, st_before, HW(0x12A0), W(0x12C0), W(0x12D0), W(0x12E0), W(0x12F0), W(0x1300));
             /* WHY-NO-JOB1 probe: AllocateJob (via TryChangeFreeToLoadJob) stores
              * its result at g_WwsJob_jobHeader(0x1420) + g_WwsJob_jobIndex(0x1410).
              * jobHeader low-hword: 0=none(PPU hasn't published)/1=exists/3=nop.
@@ -534,8 +518,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     }
 
     if (log_this) {
-        fprintf(stderr, "[spurs-pm] END wid=%u status=0x%X pc=0x%05X polls=%u exited=%u\n",
-                wid, ctx->status, ctx->pc, g_spurs_pm_polls, g_spurs_pm_exited);
+        PS3_LOG(PS3_LOG_INFO, "spurs-pm", "END wid=%u status=0x%X pc=0x%05X polls=%u exited=%u\n", wid, ctx->status, ctx->pc, g_spurs_pm_polls, g_spurs_pm_exited);
         fflush(stderr);
     }
 
@@ -576,7 +559,7 @@ static DWORD WINAPI spurs_pm_flow_watchdog(LPVOID p)
     extern void* volatile g_pm_flow_ctx;
     Sleep(5000);
     spu_context* ctx = (spu_context*)g_pm_flow_ctx;
-    if (!ctx) { fprintf(stderr, "[pm-flow] watchdog: run returned (no hang)\n"); return 0; }
+    if (!ctx) { PS3_LOG(PS3_LOG_INFO, "pm-flow", "watchdog: run returned (no hang)\n"); return 0; }
     unsigned n = g_pm_flow_n; if (n > 8192) n = 8192;
     fprintf(stderr, "[pm-flow] HUNG-RUN PARTIAL: %u transfers, live pc=0x%05X "
             "LS12A0=%02X%02X LS12C0=%02X%02X LS12F0=%02X%02X%02X%02X LS1300=%02X%02X:",
@@ -665,14 +648,12 @@ int spurs_run_taskset_policy_probe(uint32_t taskset_ea, uint32_t taskid,
 
     g_spurs_pm_polls = 0; g_spurs_pm_exited = 0;
 
-    fprintf(stderr, "[real-pm] RUN taskset=0x%08X task=%u spurs=0x%08X wkl=0x%llX wid=%u\n",
-            taskset_ea, taskid, spurs_ea, (unsigned long long)wkl_data, wid);
+    PS3_LOG(PS3_LOG_INFO, "real-pm", "RUN taskset=0x%08X task=%u spurs=0x%08X wkl=0x%llX wid=%u\n", taskset_ea, taskid, spurs_ea, (unsigned long long)wkl_data, wid);
     fflush(stderr);
 
     spu_run_with_halt(tsp_spu_func_00000A00, ctx);
 
-    fprintf(stderr, "[real-pm] END status=0x%X pc=0x%05X polls=%u exited=%u\n",
-            ctx->status, ctx->pc, g_spurs_pm_polls, g_spurs_pm_exited);
+    PS3_LOG(PS3_LOG_INFO, "real-pm", "END status=0x%X pc=0x%05X polls=%u exited=%u\n", ctx->status, ctx->pc, g_spurs_pm_polls, g_spurs_pm_exited);
     fflush(stderr);
 
     if (out_2700 && out_len) {

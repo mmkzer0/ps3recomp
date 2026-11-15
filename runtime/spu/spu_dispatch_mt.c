@@ -14,6 +14,7 @@
  * image-23 cri hack, lookup miss diagnostics) falls back to the full resolver.
  */
 #include "spu_context.h"
+#include "../../include/ps3emu/ps3_log.h"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -35,10 +36,8 @@ void spu_indirect_branch_mt(spu_context* ctx)
           static _Thread_local uint32_t ring[8];
           ring[n & 7] = pc;
           if ((++n & 0x3FFFFFu) == 0)
-              fprintf(stderr, "[spu-pcwatch] image=%d %lluM dispatches; recent pc:"
-                      " %05X %05X %05X %05X %05X %05X %05X %05X\n",
-                      ctx->image_id, n >> 20, ring[0], ring[1], ring[2], ring[3],
-                      ring[4], ring[5], ring[6], ring[7]);
+              PS3_LOG(PS3_LOG_INFO, "spu-pcwatch", "image=%d %lluM dispatches; recent pc:"
+                      " %05X %05X %05X %05X %05X %05X %05X %05X\n", ctx->image_id, n >> 20, ring[0], ring[1], ring[2], ring[3], ring[4], ring[5], ring[6], ring[7]);
       } }
     /* Policy modules MUST use this fast path for ordinary branches too: the
      * lib resolver's plain `fn(ctx)` cannot tail under MSVC, so routing every

@@ -12,6 +12,9 @@ import sys
 import tempfile
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import spu_fixture_link
+
 if os.name == "nt":
     print("SKIP: fixture currently requires a POSIX C compiler")
     sys.exit(0)
@@ -23,10 +26,11 @@ base_env = {k: v for k, v in os.environ.items()
 
 with tempfile.TemporaryDirectory(prefix="spu-smc-gate-") as tmp:
     binary = Path(tmp) / "test_spu_smc_gate"
-    subprocess.run([os.environ.get("CC", "cc"), "-std=gnu17", "-O1", "-g", "-UNDEBUG",
-                    "-fsanitize=thread", "-I" + str(root / "include"), "-I" + str(spu),
-                    str(spu / "tests" / "test_spu_smc_gate.c"), "-pthread", "-o", str(binary)],
-                   check=True)
+    spu_fixture_link.build([spu / "tests" / "test_spu_smc_gate.c",
+                            root / "runtime/diag/ps3_log.c"], binary,
+                           ["-std=gnu17", "-O1", "-g", "-UNDEBUG", "-fsanitize=thread",
+                            "-I" + str(root / "include"), "-I" + str(spu)], tmp,
+                           runtime_c=False)
     for mode, extra in (("off", {}),
                         ("on", {"SPU_SMC_WATCH": "5", "SPU_SMC_LO": "0x1000", "SPU_SMC_HI": "0x1100"})):
         env = dict(base_env, **extra)

@@ -1003,7 +1003,10 @@ if(PS3RECOMP_BUILD_TESTS)
         # The interpreter's op/immediate decode at the opcode-width and
         # immediate-form boundaries, against ISA-layout encodings.
         add_executable(test_spu_decode
-            runtime/spu/tests/test_spu_decode.c)
+            runtime/spu/tests/test_spu_decode.c
+            runtime/diag/ps3_log.c
+            runtime/config/config.cpp
+            runtime/diag/stop.cpp)
         target_include_directories(test_spu_decode PRIVATE include runtime/spu)
         target_compile_options(test_spu_decode PRIVATE -UNDEBUG)
         target_link_libraries(test_spu_decode PRIVATE m)
@@ -1018,7 +1021,9 @@ if(PS3RECOMP_BUILD_TESTS)
             add_executable(test_spu_group_lifecycle
                 runtime/spu/tests/test_spu_group_lifecycle.c
                 runtime/platform/host_clock.c
-                runtime/platform/host_wait.c)
+                runtime/platform/host_wait.c
+                runtime/diag/ps3_log.c
+                runtime/config/config.cpp)
             target_include_directories(test_spu_group_lifecycle PRIVATE
                 "${CMAKE_CURRENT_SOURCE_DIR}/include"
                 "${CMAKE_CURRENT_SOURCE_DIR}/runtime"
@@ -1076,7 +1081,8 @@ if(PS3RECOMP_BUILD_TESTS)
             runtime/spu/spu_interp.c
             runtime/platform/win32_compat.c
             runtime/platform/host_clock.c
-            runtime/platform/host_wait.c)
+            runtime/platform/host_wait.c
+            runtime/diag/ps3_log.c)
         target_include_directories(test_spu_report_hold PRIVATE
             include runtime runtime/spu runtime/platform)
         target_compile_definitions(test_spu_report_hold PRIVATE PS3_SYNC_TEST_HOOKS)
@@ -1090,7 +1096,10 @@ if(PS3RECOMP_BUILD_TESTS)
         # the elected printer; unset, nothing is counted (one process per mode:
         # the env is read once per thread).
         add_executable(test_spu_opstats
-            runtime/spu/tests/test_spu_opstats.c)
+            runtime/spu/tests/test_spu_opstats.c
+            runtime/diag/ps3_log.c
+            runtime/config/config.cpp
+            runtime/diag/stop.cpp)
         target_include_directories(test_spu_opstats PRIVATE include runtime/spu)
         target_compile_options(test_spu_opstats PRIVATE -UNDEBUG)
         target_link_libraries(test_spu_opstats PRIVATE m Threads::Threads)
@@ -1104,7 +1113,10 @@ if(PS3RECOMP_BUILD_TESTS)
         # the step/last-pc diagnostics, across the 0xA70 HLE hook, the 0x110
         # event stop and an image change mid-run.
         add_executable(test_spu_interp_loop
-            runtime/spu/tests/test_spu_interp_loop.c)
+            runtime/spu/tests/test_spu_interp_loop.c
+            runtime/diag/ps3_log.c
+            runtime/config/config.cpp
+            runtime/diag/stop.cpp)
         target_include_directories(test_spu_interp_loop PRIVATE include runtime/spu)
         target_compile_options(test_spu_interp_loop PRIVATE -UNDEBUG)
         target_link_libraries(test_spu_interp_loop PRIVATE m Threads::Threads)
@@ -1112,7 +1124,10 @@ if(PS3RECOMP_BUILD_TESTS)
         set_tests_properties(spu_interp_loop PROPERTIES LABELS "spu;t0" TIMEOUT 60)
 
         add_executable(test_spu_lockline_wait
-            runtime/spu/tests/test_spu_lockline_wait.c)
+            runtime/spu/tests/test_spu_lockline_wait.c
+            runtime/diag/ps3_log.c
+            runtime/config/config.cpp
+            runtime/diag/stop.cpp)
         target_include_directories(test_spu_lockline_wait PRIVATE include)
         target_compile_options(test_spu_lockline_wait PRIVATE -UNDEBUG)
         target_link_libraries(test_spu_lockline_wait PRIVATE Threads::Threads)
@@ -1187,6 +1202,11 @@ if(PS3RECOMP_BUILD_TESTS)
         endfunction()
         ps3recomp_add_spu_helper_test(spu_helpers test_spu_helpers.c)
         ps3recomp_add_spu_helper_test(spu_helpers_scalar test_spu_helpers.c DEFINES SPU_SCALAR_HELPERS)
+        # spu_unsupported (spu_helpers.h) logs through ps3_log; the two helpers fixtures call it.
+        target_sources(test_spu_helpers PRIVATE runtime/diag/ps3_log.c
+            runtime/config/config.cpp runtime/diag/stop.cpp)
+        target_sources(test_spu_helpers_scalar PRIVATE runtime/diag/ps3_log.c
+            runtime/config/config.cpp runtime/diag/stop.cpp)
         ps3recomp_add_spu_helper_test(spu_shufb test_spu_shufb.c)
         ps3recomp_add_spu_helper_test(spu_shufb_scalar test_spu_shufb.c DEFINES SPU_SCALAR_HELPERS)
         ps3recomp_add_spu_helper_test(spu_numeric_semantics test_spu_numeric_semantics.c)

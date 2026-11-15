@@ -37,6 +37,7 @@ functions = '\n'.join(function(name) for name in
 tables = source[source.index('#define TS_TRACK '):
                 source.index('static uint8_t* ts_running(')]
 fixture = (root / 'runtime/spu/tests/test_spu_taskset_elf_flags.c').read_text()
+fixture = '#include "ps3emu/ps3_log.h"\n' + fixture
 fixture = fixture.replace('/* PRODUCTION_FUNCTIONS */', tables + functions)
 env = {k: v for k, v in os.environ.items()
        if not k.startswith(('SPU_', 'SPURS_', 'YDKJ_', 'LBP_', 'GH3_'))}
@@ -47,9 +48,14 @@ with tempfile.TemporaryDirectory(prefix='spu-taskset-elf-flags-') as tmp:
     c.write_text(fixture)
     subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG', '-I' + str(root / 'runtime'),
                     '-Wall', '-Wextra', '-I' + str(root / 'include'), '-c', str(c), '-o', str(tmp / 'test.o')], check=True)
+    subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG', '-I' + str(root / 'include'),
+                    '-c', str(root / 'runtime/diag/ps3_log.c'), '-o', str(tmp / 'ps3_log.o')], check=True)
     subprocess.run([os.environ.get('CXX', 'c++'), '-std=c++20', '-O1', '-I' + str(root / 'include'),
                     '-c', str(root / 'runtime/diag/stop.cpp'), '-o', str(tmp / 'stop.o')], check=True)
-    subprocess.run([os.environ.get('CXX', 'c++'), str(tmp / 'test.o'), str(tmp / 'stop.o'), '-o', str(binary)], check=True)
+    subprocess.run([os.environ.get('CXX', 'c++'), '-std=c++20', '-O1', '-I' + str(root / 'include'),
+                    '-c', str(root / 'runtime/config/config.cpp'), '-o', str(tmp / 'config.o')], check=True)
+    subprocess.run([os.environ.get('CXX', 'c++'), str(tmp / 'test.o'), str(tmp / 'ps3_log.o'),
+                    str(tmp / 'stop.o'), str(tmp / 'config.o'), '-pthread', '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True, timeout=5, env=env, cwd=tmp)
     for mode, reason, elf in (('bad-elf', 'not-an-spu-elf', '0x00030000'), ('null-elf', 'null-elf', '0x00000000'),
                               ('segment', 'segment-outside-task-area', '0x00030000'),

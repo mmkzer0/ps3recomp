@@ -30,6 +30,7 @@
 #include "spu_context.h"
 #include "spu_workload.h"
 #include "spu_lifted_job.h"
+#include "ps3emu/ps3_log.h"
 #include "../syscalls/lv2_syscall_table.h"
 #include "../../include/ps3emu/error_codes.h"
 #include "ps3emu/nid.h"      /* ps3_compute_nid */
@@ -175,8 +176,7 @@ static void raw_out_mbox_hook(uint32_t group, uint32_t spu_id, int is_intr, uint
         if (s->int_stat & s->int_mask) ps3_intr_raise(s->intrtag);
         publish(s);
         if (dbg())
-            fprintf(stderr, "[spu-raw] spu%u out%s mbox = 0x%08X\n",
-                    spu_id, is_intr ? "-intr" : "", v);
+            PS3_LOG(PS3_LOG_INFO, "spu-raw", "spu%u out%s mbox = 0x%08X\n", spu_id, is_intr ? "-intr" : "", v);
         return;
     }
     if (s_prev_out_hook) s_prev_out_hook(group, spu_id, is_intr, v);
@@ -220,10 +220,8 @@ void spu_raw_note_image(uint32_t src_ea, uint32_t entry)
     s_pending_image_id  = image_id;
     s_pending_elf_entry = entry;
 
-    fprintf(stderr, "[spu-raw] image_import src=0x%08X len=%u entry=0x%05X "
-                    "fp=0x%016llX -> %s\n",
-            src_ea, len, entry, (unsigned long long)fp,
-            fn ? "lifted entry registered" : "NO LIFTED IMAGE (SPU will not run)");
+    PS3_LOG(PS3_LOG_INFO, "spu-raw", "image_import src=0x%08X len=%u entry=0x%05X "
+                    "fp=0x%016llX -> %s\n", src_ea, len, entry, (unsigned long long)fp, fn ? "lifted entry registered" : "NO LIFTED IMAGE (SPU will not run)");
     fflush(stderr);
 }
 
@@ -264,8 +262,7 @@ static void raw_spu_run(raw_spu* s)
     if (c->stop_request) {
         c->status = SPU_STATUS_STOPPED;
         publish(s);
-        fprintf(stderr, "[spu-raw] spu%u stopped by RunCntl at pc=0x%05X\n",
-                (unsigned)(s - s_spu), (unsigned)(c->pc & SPU_LS_MASK));
+        PS3_LOG(PS3_LOG_INFO, "spu-raw", "spu%u stopped by RunCntl at pc=0x%05X\n", (unsigned)(s - s_spu), (unsigned)(c->pc & SPU_LS_MASK));
         fflush(stderr);
         spu_coh_unregister(c);
         spu_mfc_release(c);
@@ -290,15 +287,9 @@ static void raw_spu_run(raw_spu* s)
     spu_mfc_release(c);
     RAW_XCHG(&s->started, 0);
 
-    fprintf(stderr, "[spu-raw] spu%u stopped: halted=%d pc=0x%05X lr=0x%05X "
+    PS3_LOG(PS3_LOG_INFO, "spu-raw", "spu%u stopped: halted=%d pc=0x%05X lr=0x%05X "
                     "steps=%llu stop_code=0x%X outmbox(n=%u v=0x%08X) "
-                    "outintr(n=%u v=0x%08X) inmbox(n=%u)\n",
-            (unsigned)(s - s_spu), halted, (unsigned)(c->pc & SPU_LS_MASK),
-            (unsigned)(c->gpr[0]._u32[0] & SPU_LS_MASK),
-            (unsigned long long)c->steps, c->stop_code,
-            (unsigned)c->ch_out_mbox.count, c->ch_out_mbox.value,
-            (unsigned)c->ch_out_intr_mbox.count, c->ch_out_intr_mbox.value,
-            (unsigned)c->ch_in_mbox.count);
+                    "outintr(n=%u v=0x%08X) inmbox(n=%u)\n", (unsigned)(s - s_spu), halted, (unsigned)(c->pc & SPU_LS_MASK), (unsigned)(c->gpr[0]._u32[0] & SPU_LS_MASK), (unsigned long long)c->steps, c->stop_code, (unsigned)c->ch_out_mbox.count, c->ch_out_mbox.value, (unsigned)c->ch_out_intr_mbox.count, c->ch_out_intr_mbox.value, (unsigned)c->ch_in_mbox.count);
     fflush(stderr);
 }
 
@@ -326,9 +317,8 @@ static void raw_spu_stop(raw_spu* s)
 #endif
     }
     if (s->started)
-        fprintf(stderr, "[spu-raw] spu%u did not stop on RunCntl = 0 (pc=0x%05X): "
-                        "it is not reaching a channel operation\n",
-                (unsigned)(s - s_spu), (unsigned)(c->pc & SPU_LS_MASK));
+        PS3_LOG(PS3_LOG_INFO, "spu-raw", "spu%u did not stop on RunCntl = 0 (pc=0x%05X): "
+                        "it is not reaching a channel operation\n", (unsigned)(s - s_spu), (unsigned)(c->pc & SPU_LS_MASK));
     else
         c->status = SPU_STATUS_STOPPED;
 }
@@ -369,10 +359,7 @@ static void raw_spu_start(raw_spu* s)
         if (entry && masked_fp)
             snprintf(how, sizeof how, " (fp=0x%016llX with its parameter area zeroed)",
                      (unsigned long long)masked_fp);
-        fprintf(stderr, "[spu-raw] spu%u proxy-loaded LS 0x%05X..0x%05X fp=0x%016llX npc=0x%05X -> %s%s\n",
-                n, s->get_lo[r], s->get_hi[r], (unsigned long long)fp,
-                be32_load(s->base + SPU_RAW_NPC) & ~3u,
-                entry ? "lifted entry registered" : "no match", how);
+        PS3_LOG(PS3_LOG_INFO, "spu-raw", "spu%u proxy-loaded LS 0x%05X..0x%05X fp=0x%016llX npc=0x%05X -> %s%s\n", n, s->get_lo[r], s->get_hi[r], (unsigned long long)fp, be32_load(s->base + SPU_RAW_NPC) & ~3u, entry ? "lifted entry registered" : "no match", how);
         /* SPU_RAW_DUMP_DIR=<dir>: write an unmatched run out as
          * rawspu_<fp>_<lo>.bin -- the bytes exactly as they sit in local store
          * at <lo>, which is the base to lift them at. */
@@ -385,7 +372,7 @@ static void raw_spu_start(raw_spu* s)
               if (f) {
                   fwrite(vm_base + s->base + s->get_lo[r], 1, s->get_hi[r] - s->get_lo[r], f);
                   fclose(f);
-                  fprintf(stderr, "[spu-raw] dumped -> %s\n", path);
+                  PS3_LOG(PS3_LOG_INFO, "spu-raw", "dumped -> %s\n", path);
               }
           } }
     }
@@ -397,14 +384,14 @@ static void raw_spu_start(raw_spu* s)
         image_id = s->ctx->image_id;
     }
     if (!entry) {
-        fprintf(stderr, "[spu-raw] spu%u run requested but no lifted image is "
+        PS3_LOG(PS3_LOG_INFO, "spu-raw", "spu%u run requested but no lifted image is "
                         "registered -- the SPU cannot run. Lift the image and "
                         "register it (see a port's src/spu_images.c).\n", n);
         fflush(stderr);
         return;
     }
     if (RAW_CAS(&s->started, 1, 0) != 0) {        /* already up */
-        fprintf(stderr, "[spu-raw] spu%u run requested while it is still running: "
+        PS3_LOG(PS3_LOG_INFO, "spu-raw", "spu%u run requested while it is still running: "
                         "ignored\n", n);
         fflush(stderr);
         return;
@@ -435,12 +422,9 @@ static void raw_spu_start(raw_spu* s)
     { const uint8_t* l = s->ctx->ls;
       uint32_t nz = 0, pc = s->ctx->pc & SPU_LS_MASK;
       for (uint32_t i = 0; i < SPU_LS_SIZE; i += 64) if (l[i]) nz++;
-      fprintf(stderr, "[spu-raw] spu%u START pc=0x%05X ls=guest:0x%08X image=%d  "
+      PS3_LOG(PS3_LOG_INFO, "spu-raw", "spu%u START pc=0x%05X ls=guest:0x%08X image=%d  "
                       "LS[0..7]=%02X%02X%02X%02X%02X%02X%02X%02X  "
-                      "entry=%02X%02X%02X%02X  nonzero lines=%u/4096\n",
-              n, pc, s->base, s->ctx->image_id,
-              l[0],l[1],l[2],l[3],l[4],l[5],l[6],l[7],
-              l[pc],l[pc+1],l[pc+2],l[pc+3], nz); }
+                      "entry=%02X%02X%02X%02X  nonzero lines=%u/4096\n", n, pc, s->base, s->ctx->image_id, l[0], l[1], l[2], l[3], l[4], l[5], l[6], l[7], l[pc], l[pc+1], l[pc+2], l[pc+3], nz); }
     fflush(stderr);
 
 #ifdef _WIN32
@@ -469,9 +453,7 @@ void spu_raw_reg_store(uint32_t ea, uint32_t val, int width)
     if (!s) return;
 
     if (dbg())
-        fprintf(stderr, "[spu-raw] W spu%u +0x%05X = 0x%08X (w%d) from lr=0x%08X\n",
-                (unsigned)(s - s_spu), off, val, width,
-                g_active_ctx ? (uint32_t)g_active_ctx->lr : 0);
+        PS3_LOG(PS3_LOG_INFO, "spu-raw", "W spu%u +0x%05X = 0x%08X (w%d) from lr=0x%08X\n", (unsigned)(s - s_spu), off, val, width, g_active_ctx ? (uint32_t)g_active_ctx->lr : 0);
 
     switch (off) {
     case SPU_RAW_RUNCNTL:
@@ -577,8 +559,7 @@ void spu_raw_reg_store(uint32_t ea, uint32_t val, int width)
         }
         else if (cmd & 0x20u) memcpy(vm_base + ea, ls, size);   /* PUT: LS -> EA */
         if (dbg())
-            fprintf(stderr, "[spu-raw] spu%u proxy cmd=0x%02X lsa=0x%05X ea=0x%08X size=0x%X\n",
-                    (unsigned)(s - s_spu), cmd, lsa, ea, size);
+            PS3_LOG(PS3_LOG_INFO, "spu-raw", "spu%u proxy cmd=0x%02X lsa=0x%05X ea=0x%08X size=0x%X\n", (unsigned)(s - s_spu), cmd, lsa, ea, size);
         be32_store(s->base + SPU_RAW_MFC_CLASS_CMD, 0);         /* CMDStatus: success */
         break;
     }
@@ -616,12 +597,8 @@ int spu_raw_reg_load(uint32_t ea, uint32_t* out)
          * load never reaches memory), so report the SPU side of a long spin. */
         { static PPU_THREAD_LOCAL unsigned n;
           if (++n % 20000000u == 0)
-              fprintf(stderr, "[spu-raw] PPU spinning on spu%u Mbox_Stat: spu pc=0x%05X "
-                              "status=0x%X steps=%llu out=%u in=%u lr=0x%08X\n",
-                      (unsigned)(s - s_spu), (unsigned)(s->ctx->pc & SPU_LS_MASK),
-                      s->ctx->status, (unsigned long long)s->ctx->steps,
-                      (unsigned)s->ctx->ch_out_mbox.count, (unsigned)s->ctx->ch_in_mbox.count,
-                      g_active_ctx ? (uint32_t)g_active_ctx->lr : 0); }
+              PS3_LOG(PS3_LOG_INFO, "spu-raw", "PPU spinning on spu%u Mbox_Stat: spu pc=0x%05X "
+                              "status=0x%X steps=%llu out=%u in=%u lr=0x%08X\n", (unsigned)(s - s_spu), (unsigned)(s->ctx->pc & SPU_LS_MASK), s->ctx->status, (unsigned long long)s->ctx->steps, (unsigned)s->ctx->ch_out_mbox.count, (unsigned)s->ctx->ch_in_mbox.count, g_active_ctx ? (uint32_t)g_active_ctx->lr : 0); }
         *out = MBOX_STATUS(s->ctx->ch_out_mbox.count,
                            SPU_IN_MBOX_FREE(s->ctx->ch_in_mbox.count),
                            s->ctx->ch_out_intr_mbox.count);
@@ -633,8 +610,7 @@ int spu_raw_reg_load(uint32_t ea, uint32_t* out)
         uint32_t v = spu_channel_read(&s->ctx->ch_out_mbox);
         publish(s);
         if (dbg())
-            fprintf(stderr, "[spu-raw] R spu%u OUT_MBOX -> 0x%08X\n",
-                    (unsigned)(s - s_spu), v);
+            PS3_LOG(PS3_LOG_INFO, "spu-raw", "R spu%u OUT_MBOX -> 0x%08X\n", (unsigned)(s - s_spu), v);
         *out = v;
         return 1;
     }
@@ -665,8 +641,7 @@ static int64_t sc_raw_spu_create(ppu_context* ctx)
             g_spu_out_mbox_hook = raw_out_mbox_hook;
         }
         if (id_ea) be32_store(id_ea, n);
-        fprintf(stderr, "[spu-raw] create -> raw spu %u, window 0x%08X\n",
-                n, s_spu[n].base);
+        PS3_LOG(PS3_LOG_INFO, "spu-raw", "create -> raw spu %u, window 0x%08X\n", n, s_spu[n].base);
         fflush(stderr);
         return CELL_OK;
     }
@@ -708,8 +683,7 @@ static int64_t sc_raw_spu_set_int_mask(ppu_context* ctx)
      * has to poll. If it stopped polling, the message sits unread and the SPUs
      * spin. This prints enough to tell those apart. */
     { static int _d = -1; if (_d < 0) _d = getenv("SPU_DBG_MBOX") ? 1 : 0;
-      if (_d) fprintf(stderr, "[spu-mask] spu%u class=%llu mask=0x%llX\n",
-              n, (unsigned long long)ctx->gpr[4], (unsigned long long)ctx->gpr[5]); }
+      if (_d) PS3_LOG(PS3_LOG_INFO, "spu-mask", "spu%u class=%llu mask=0x%llX\n", n, (unsigned long long)ctx->gpr[4], (unsigned long long)ctx->gpr[5]); }
     return CELL_OK;
 }
 
@@ -760,7 +734,7 @@ static int64_t sc_raw_spu_read_puint_mb(ppu_context* ctx)
     if (out_ea) be32_store(out_ea, v);
     publish(&s_spu[n]);
     if (dbg())
-        fprintf(stderr, "[spu-raw] read_puint_mb spu%u -> 0x%08X\n", n, v);
+        PS3_LOG(PS3_LOG_INFO, "spu-raw", "read_puint_mb spu%u -> 0x%08X\n", n, v);
     return CELL_OK;
 }
 
@@ -803,7 +777,7 @@ static void hle_raw_spu_image_load(ppu_context* ctx)
     }
     be32_store(base + SPU_RAW_NPC, entry);
 
-    fprintf(stderr, "[spu-raw] image_load spu%u: %u segments, %u bytes into LS, "
+    PS3_LOG(PS3_LOG_INFO, "spu-raw", "image_load spu%u: %u segments, %u bytes into LS, "
                     "NPC=0x%05X\n", n, nsegs, copied, entry);
     fflush(stderr);
     ctx->gpr[3] = CELL_OK;

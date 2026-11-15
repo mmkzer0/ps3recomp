@@ -2,8 +2,12 @@
 """Run the real interpreter's immediate-load vector semantics and existing self-test."""
 import os
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import spu_fixture_link
 
 if os.name == 'nt':
     print('SKIP: fixture currently requires a POSIX C compiler')
@@ -15,8 +19,8 @@ env = {k: v for k, v in os.environ.items()
 with tempfile.TemporaryDirectory(prefix='spu-ilh-') as tmp:
     for name in ['test_spu_interpreter_ilh', 'spu_interp_selftest']:
         binary = Path(tmp) / name
-        subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG',
-                        '-I'+str(root/'include'), '-I'+str(spu),
-                        str(spu/'tests'/f'{name}.c'), str(spu/'spu_interp.c'),
-                        '-lm', '-o', str(binary)], check=True)
+        spu_fixture_link.build([spu/'tests'/f'{name}.c', spu/'spu_interp.c',
+                                root/'runtime/diag/ps3_log.c'], binary,
+                               ['-std=gnu17', '-O1', '-UNDEBUG',
+                                '-I'+str(root/'include'), '-I'+str(spu)], tmp, runtime_c=False)
         subprocess.run([str(binary)], check=True, timeout=5, env=env, cwd=tmp)

@@ -34,8 +34,7 @@ failed = []
 with tempfile.TemporaryDirectory(prefix='spu-context-registry-') as tmp:
     tmp = Path(tmp)
     runtime_objects = []
-    for src in (root / 'runtime/config/config.cpp', root / 'runtime/diag/stop.cpp',
-                root / 'tests/ps3_log_null.cpp'):
+    for src in (root / 'runtime/config/config.cpp', root / 'runtime/diag/stop.cpp'):
         obj = tmp / (src.stem + '.o')
         subprocess.run([cxx, *cxxflags, '-c', str(src), '-o', str(obj)], check=True)
         runtime_objects.append(str(obj))
@@ -52,7 +51,7 @@ with tempfile.TemporaryDirectory(prefix='spu-context-registry-') as tmp:
     for name in [v for v in variants if not sys.argv[1:] or v in sys.argv[1:]]:
         tag = name
         binary = tmp / tag
-        sources = [str(spu / 'tests' / (name + '.c'))]
+        sources = [str(spu / 'tests' / (name + '.c')), str(root / 'runtime/diag/ps3_log.c')]
         link_flags = []
         if name != 'test_spu_coherency':
             extra = [str(spu / c) for c in common if not
@@ -67,7 +66,12 @@ with tempfile.TemporaryDirectory(prefix='spu-context-registry-') as tmp:
             subprocess.run([cxx, *objects, *runtime_objects, *sanitize, '-pthread', '-lm',
                             '-o', str(binary)], check=True)
         else:
-            subprocess.run([cc, *cflags, *sources, *sanitize,
+            coh_objects = []
+            for index, src in enumerate(sources):
+                obj = tmp / f'{tag}-{index}.o'
+                subprocess.run([cc, *cflags, *sanitize, '-c', src, '-o', str(obj)], check=True)
+                coh_objects.append(str(obj))
+            subprocess.run([cxx, *coh_objects, *runtime_objects, *sanitize, '-pthread', '-lm',
                             '-o', str(binary)], check=True)
         if name == 'test_spu_registry_allocation':
             env = {k: v for k, v in os.environ.items()
