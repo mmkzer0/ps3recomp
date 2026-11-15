@@ -126,11 +126,14 @@ a tweak has no rule and yields `malformed` / `not-comparable`.
   not checked against the staged bytes.
 - **Finding the fingerprint is cheap; a cache hit is a claim, not a proof.**
   Hashing the staged bytes byte by byte costs about a millisecond for a large
-  image, so two places remember a result by address and size and reuse it
+  image, so three places remember a result by address and size and reuse it
   while a word-wise content hash of the bytes still matches: the dispatcher
-  (eight slots, `spu_workload.c:347-380`) and, for traces, the per-worker table
+  (eight slots, `spu_workload.c:347-380`); for traces, the per-worker table
   of `identify_image` (`executor.cpp:1119-1137`), which runs only while a
-  trace is recorded (`:1170-1173`, `:1198`). The content hash is a change
+  trace is recorded (`:1170-1173`, `:1198`); and, while fixtures are
+  captured, a per-worker cache of the last four contents at each address
+  (`xdiff_capture.cpp`, `seen_content`), so a loader that alternates buffers
+  is fingerprinted once per buffer. The content hash is a change
   detector, never an identity (`spu_workload.h:42-45`, `spu_workload.c:332-346`):
   it is 64 bits of a non-cryptographic fold. A hit says the bytes are
   probably the ones the fingerprint was taken from; it does not say they are.
@@ -505,9 +508,14 @@ the start of the file), `u64 bytes`.
   the zstd frame magic by name (`fixture-format`); the corpus driver decodes
   such a file first, as the trace tools do (`docs/TOOLS.md:1015-1026`). The
   extents already remove most of the two 256 KiB stores.
-- **Writing.** To `<path>.partial`, then renamed, as the toolkit's other
-  artefacts are (`include/ps3emu/ps3_ftrace.h:26-28`). The name is
-  `<fingerprint as 16 hex digits>-q<queue>-s<seq>.spujob`.
+- **Writing.** To a temporary file of the process and the attempt,
+  `<path>.<pid>.<n>.partial`, created exclusively, then renamed, as the
+  toolkit's other artefacts are (`include/ps3emu/ps3_ftrace.h:26-28`): two
+  processes sharing a directory never write into one file, and a reader sees
+  one writer's complete bytes or none. A rename over an existing fixture
+  replaces it. The name is
+  `<fingerprint as 16 hex digits>-q<queue>-s<seq>.spujob`, where the queue is
+  the process-wide creation number of the queue.
 
 ### 7.3 `IDEN`: `spu_xdiff_identity`, 80 bytes
 
@@ -568,7 +576,7 @@ recomputes it and answers `malformed` / `fixture-identity` on a mismatch.
 | 72 | `stack_bytes` | the stack's size |
 | 76 | `r1` | the stack pointer at entry |
 | 80 | `ctx_ls` | the `CellSpursJobContext2` |
-| 84 | `origin_queue` | queue index; `origin_*` join the fixture with the trace of its run and are 0 for a synthetic fixture |
+| 84 | `origin_queue` | the queue's creation number in the process, as in the file name; the trace's queue index is the same number up to 255 and saturates there. `origin_*` join the fixture with the trace of its run and are 0 for a synthetic fixture |
 | 88 | `origin_worker` | worker index |
 | 92 | `origin_seq` | the job's per-queue sequence number |
 | 96 | `origin_descriptor_ea` | the descriptor's guest EA |
@@ -1373,11 +1381,11 @@ settles it:
 | Claim | Measurement | Where |
 |---|---|---|
 | the real path is unchanged by the seam | the channel, `dma` and `atomic` rows of the SPU operation benchmark, lifted and interpreted, before and after commit 4; fastest of 25 runs each, as the bench already takes (`tests/bench/spu/README.md:21-39`) against `results/2026-10-06-m1pro-baseline.csv` | measured with commit 4 (`tests/bench/spu/run_spu_bench.sh`, 6 alternating rounds against `dev`): every row within its spread (section 5.6) |
-| identifying the staged image is cheap | the kind-29 spans of an existing play trace, per image: mean and p95 against the job's own span | `ftrace_report.py`, before commit 6 |
+| identifying the staged image is cheap | the kind-29 spans of an existing play trace, per image: mean and p95 against the job's own span | measured before commit 6 on one title's first 110 s (four images, 79 589 jobs, `PS3_FTRACE_MIN_US=0`, 1 µs resolution, `ftrace_report.py` for the job spans): per image the identification takes 1.9 to 3.1 µs on average, p95 2 to 4 µs, p99 4 to 8 µs, worst 40 to 63 µs, against mean job spans of 20 to 69 µs. That is 3.5 to 9.5 % of a job, the most for the shortest job (20 µs); on the queue that waits on its jobs it is 4 % of the blocking wait. Cheap against a frame, not against a short job: commit 6 must not add a second pass over the bytes |
 | recording costs a few percent of a job | job spans with `xdiff=off` against `xdiff=all`, same scene, same build; and kind 32 spans; the byte-serial check of a sampled job's image is part of this cost | after commit 10b |
 | a fixture is about 100 KiB | sizes of a captured corpus, raw and zstd | after commit 10a |
 | the budgeted twin is close to the production object | the SPU bench over both objects | commit 9 |
-| T0 under an instruction observer is fast enough to shadow | interpreter steps per second with and without the counting observer | commit 8 |
+| T0 under an instruction observer is fast enough to shadow | interpreter steps per second with and without the counting observer | measured after commit 8 (Apple M4 Pro, Apple clang 21, `-O2`; a 20-instruction ALU, load/store and branch loop of 2 000 001 steps with no channel operations; fastest of 25 after 3 warm-ups, 5 alternating rounds, two sessions on a shared host): no observer 0.88 to 0.93 ns per step; a counting observer 3.1 to 3.7 ns; the budget observer of the replay 3.3 to 3.8 ns, 3.6 to 4.1 times the fast path, because any observer moves the run onto the general path (`spu_interp.c:773-776`). A job of 1 ms on the SPU executes at most 3.2 M instructions *[inference: one per cycle at 3.2 GHz]*, so its T0 replay takes about 10 ms before effect serving: enough for offline replay and sampled shadows, not for shadowing every job |
 
 ## 19. References
 

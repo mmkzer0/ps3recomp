@@ -118,6 +118,33 @@ PS3_CFG_BOOL(spu, mfc_lookup_cache, 1,
     "reference path, every lookup under the lock. Timing only: both paths hand a "
     "context the same engine. Read once, at the first MFC access.")
 
+PS3_CFG_STR(spu, xdiff_dir, "", 1023, PS3_CFG_V_NONE,
+    "The directory SPU job fixtures (docs/SPU_XDIFF.md, ps3recomp.spujob/1) are written into, "
+    "one file per job, named <image fingerprint>-q<queue>-s<seq>.spujob. Empty (the default) "
+    "writes none. The directory must exist and be writable: the runtime does not create it, "
+    "and a fixture that cannot be written is one named diagnostic line "
+    "([jq2-xdiff] capture-failed, with the image, the reason and the detail) while the job and "
+    "the run go on. Only spu.xdiff_capture makes anything write here today.")
+
+PS3_CFG_U32(spu, xdiff_capture, 0, 0, 4294967295,
+    "Record the first N jobs of each registered SPU job image into spu.xdiff_dir, for a corpus "
+    "an offline replay can compare tiers on (JobQueue2 workers; docs/SPU_XDIFF.md section 11, "
+    "commit 10a). 0 (the default) records nothing and the job path is unchanged. Only an image "
+    "whose registration carries an effects inventory with no event branches is recorded, and "
+    "only while the body that runs is the interpreter or the body registered for the image; "
+    "any other job, including one of an image registered without an inventory, is counted "
+    "ineligible and named once per address, size and reason, never recorded. A worker remembers "
+    "the last four contents staged at an address. Unresolved MFC command sites do not refuse an image "
+    "(same-program replay does not depend on a command's class); the fixtures of such an image "
+    "are counted apart. The recorder is a tap on the effect port: it copies every effect and "
+    "the entry and end local store on the worker that runs the job and adds the cost of those "
+    "copies and one file write per fixture, but changes nothing the job reads or writes. A "
+    "fixture's payload is bounded (64 MiB): a job that passes it is a counted capture-limit "
+    "failure and the run goes on. The two options are read once, when the first JobQueue2 queue "
+    "is created: with N > 0 and an empty or unusable spu.xdiff_dir (missing, not a directory, "
+    "not writable) one line says so and nothing is recorded for the process. Recording perturbs "
+    "timing: benchmarks run with 0.")
+
 /* ---- gcm ---------------------------------------------------------------- */
 
 PS3_CFG_U32(gcm, wait_timeout_ms, 10000, 1, 3600000,

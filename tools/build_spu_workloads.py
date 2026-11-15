@@ -30,6 +30,12 @@ extra_entry_points?}. Their registration fingerprint is the FNV-1a-64 over the
 whole staged blob (exactly what the runtime hashes), and the inventory reports
 the channels and MFC commands the lifted code contains.
 
+The pipeline's effects inventory of a raw image reaches the runtime through the registration: a
+`spu_workload_set_inventory` call carrying whether the image has event branches or unresolved
+`wrch MFC_Cmd` sites, its lift's code_end and (when the pipeline recorded one) its lift options
+hash. An image the pipeline gave no inventory (an ELF image, an inventory from before event-branch
+detection) gets no call and stays unknown to the runtime, which does not record or shadow it.
+
 Example:
   python tools/build_spu_workloads.py \
       --images <port>/spu/images --lifted <port>/spu \
@@ -232,7 +238,31 @@ def main():
         sys.exit(f"[build_spu_workloads] {error}")
 
 
+# Bits of spu_workload_inventory.flags (runtime/spu/spu_workload.h), with the names the registry uses.
+INVENTORY_FLAGS = ((1, "SPU_WORKLOAD_INV_EVENT_BRANCHES"), (2, "SPU_WORKLOAD_INV_UNRESOLVED_MFC"))
+
+def registration_inventory(program):
+    """(flags, code_end, lift_options) for the compact inventory of a registration, from the
+    pipeline's record of the image (the entry of inventory.json); None when there is none.
+
+    A record is an inventory only when it carries the effects object with both lists the runtime
+    acts on: an absent `event_branches` (an inventory from before commit 3b) does not mean no event
+    branches, so it is no inventory. None is not "clean": the runtime refuses an image it has no
+    inventory for, which is the safe side of the same doubt."""
+    effects = program.get("effects") if program else None
+    if not isinstance(effects, dict):
+        return None
+    event_branches, unresolved = effects.get("event_branches"), effects.get("unresolved")
+    if not isinstance(event_branches, list) or not isinstance(unresolved, list):
+        return None
+    flags = (1 if event_branches else 0) | (2 if unresolved else 0)
+    code_end = program.get("code_end") or 0
+    lift_options = program.get("lift_options")
+    return flags, code_end, int(lift_options, 16) if lift_options else 0
+
+
 def write_registry(args, imgs, text_fps, image_ids=None):
+    programs = getattr(args, "programs", None) or {}
     # Every path here may reuse code instead of lifting it: an existing
     # spu_recomp.c, --skip-lift, a caller-supplied --lifter, or the pipeline's
     # staged output. Validate before a registry exists, so a pre-stamp image
@@ -274,6 +304,12 @@ def write_registry(args, imgs, text_fps, image_ids=None):
         L.append(f"    spu_workload_register_img(0x{fp:016X}ULL, {prefix}spu_func_{ent:08X}, {i}, \"{img}\");")
         if text_fps.get(img):  # same entry, keyed by the text segment (raw SPU proxy-DMA load)
             L.append(f"    spu_workload_register_img(0x{text_fps[img]:016X}ULL, {prefix}spu_func_{ent:08X}, {i}, \"{img}.text\");")
+        inventory = registration_inventory(programs.get(img))
+        if inventory:  # no record: the image is unknown to the runtime, which refuses to record or shadow it
+            flags, code_end, lift_options = inventory
+            names = [name for bit, name in INVENTORY_FLAGS if flags & bit]
+            L.append(f"    spu_workload_set_inventory(0x{fp:016X}ULL, {' | '.join(names) or '0u'}, "
+                     f"0x{code_end:X}u, 0x{lift_options:016X}ULL);")
     L.append("    spu_begin_image(0);")
     L.append("}")
     if args.constructor:

@@ -85,6 +85,38 @@ spu_lifted_entry_fn spu_workload_find_img_masked(const void* data, size_t n,
                                                  uint64_t* fp_out,
                                                  int* image_id_out);
 
+/* The static effects inventory of a registered image, in compact form (docs/SPU_XDIFF.md
+ * section 12.3). The pipeline's inventory.json says it per image for tools; a registration
+ * carries what a run needs to decide about an image before its first job: whether the image
+ * has event branches (bisled, the E or D bi forms, iret: the event facility without a channel
+ * read), which refuses it, and whether it has `wrch MFC_Cmd` sites whose command word the
+ * pipeline could not resolve, which refuses nothing (same-program replay does not depend on
+ * a command's class) and is kept for reports; and the lift's `--code-end` and options hash,
+ * which a fixture's authority body id records.
+ *
+ * An inventory is an upper bound on a run and never excuses a check at run time. An image
+ * with no inventory (an older registration, an ELF image the pipeline does not inventory)
+ * is UNKNOWN, which is not the same as clean: recording and shadowing refuse it. Flag bits
+ * this build does not know are kept and also make the image ineligible. */
+#define SPU_WORKLOAD_INV_EVENT_BRANCHES 0x1u   /* event_branches is not empty */
+#define SPU_WORKLOAD_INV_UNRESOLVED_MFC 0x2u   /* unresolved `wrch MFC_Cmd` sites */
+
+typedef struct spu_workload_inventory {
+    uint32_t flags;         /* SPU_WORKLOAD_INV_*; 0: nothing the pipeline flags */
+    uint32_t code_end;      /* the lifter's --code-end, an LS address; 0: none */
+    uint64_t lift_options;  /* FNV-1a-64 of the lifter's canonical option string; 0: not recorded */
+} spu_workload_inventory;
+
+/* Attach an inventory to the image registered (or to be registered) under `fingerprint`.
+ * Called by the generated registration next to spu_workload_register_img, at init and before
+ * any job runs: lookups take no lock. Idempotent on fingerprint (the later call wins). A
+ * full table is reported on stderr and the image stays UNKNOWN. */
+void spu_workload_set_inventory(uint64_t fingerprint, uint32_t flags, uint32_t code_end,
+                                uint64_t lift_options);
+
+/* The inventory of `fingerprint`: 1 and *out filled, or 0 (UNKNOWN) and *out untouched. */
+int spu_workload_find_inventory(uint64_t fingerprint, spu_workload_inventory* out);
+
 /* Run a SPURS policy module (raw PM binary loaded at LS 0xA00) under the HLE'd
  * kernel handoff: kernel context at LS 0x100, entry ABI of
  * cellSpursModuleEntry(context, ea) with the workload's u64 data in r4.

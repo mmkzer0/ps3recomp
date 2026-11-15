@@ -12,6 +12,7 @@
 #include "jq2/pool.hpp"
 #include "jq2/port.hpp"
 #include "jq2/sched.hpp"
+#include "jq2/xdiff_capture.hpp"
 
 #ifdef _WIN32
 #include <process.h> /* _beginthreadex: the workers need a stack size std::thread cannot set */
@@ -413,6 +414,8 @@ public:
     std::uint32_t ea() const { return ea_; }
     std::uint8_t index() const { return index_; }
     void set_index(std::uint8_t index) { index_ = index; }
+    std::uint32_t number() const { return number_; }
+    void set_number(std::uint32_t number) { number_ = number; }
     std::uint32_t ft_who(unsigned worker) const { return std::uint32_t{index_} << 8 | worker; }
     std::uint32_t max_descriptor() const { return max_descriptor_; }
     GuestRing& ring() { return *ring_; }
@@ -988,6 +991,7 @@ private:
      * barrier on that tag. All of these are diagnostics only: written and read under mu_, and only while
      * PS3_FT_ON(). */
     std::uint8_t index_ = 0;
+    std::uint32_t number_ = 0; /* the queue's creation number, unsaturated: the q of a fixture's name */
     std::uint32_t next_seq_ = 0;
     std::uint32_t pending_jobs_ = 0; /* jobs pushed and not yet admitted */
     std::vector<std::uint32_t> slot_seq_;
@@ -1165,17 +1169,26 @@ void Queue::run_job(const JobStart& js, const std::optional<jq2_job_observer>& o
     t_job_hooks = &hooks_;
     int rc;
     ImageStamp stamp;
+    const CaptureJob cap{&js, number_, body.entry, body.entry == &interpreter_entry};
     if (!obs) {
         /* The loader runs the body and calls `end` with the finished context,
-         * where the job's ending is classified (require_normal_return). */
+         * where the job's ending is classified (require_normal_return). The
+         * capture tap (xdiff_capture.hpp) is off unless spu.xdiff_capture is set. */
+        struct Plain {
+            ImageStamp* stamp; /* null while tracing is off */
+            CaptureJob cap;
+        } p{ft.t0 != 0 ? &stamp : nullptr, cap};
         spu_job_hooks hooks{};
-        hooks.end = [](void*, spu_context* ctx) { require_normal_return(ctx); };
-        if (ft.t0 != 0) {
-            hooks.user = &stamp;
-            hooks.start = [](void* user, spu_context* ctx, const spu_job_layout* l) {
-                identify_image(*static_cast<ImageStamp*>(user), ctx, l);
-            };
-        }
+        hooks.user = &p;
+        hooks.start = [](void* user, spu_context* ctx, const spu_job_layout* l) {
+            auto& pl = *static_cast<Plain*>(user);
+            if (pl.stamp != nullptr) identify_image(*pl.stamp, ctx, l);
+            capture_job_start(pl.cap, ctx, l);
+        };
+        hooks.end = [](void*, spu_context* ctx) {
+            capture_job_end(ctx); /* before the policy: a job that stops the process still leaves its fixture */
+            require_normal_return(ctx);
+        };
         rc = spu_run_jq2_job(body.entry, body.image_id, js.descriptor_ea, js.descriptor.data(), js.size, &env,
                              &hooks);
     } else {
@@ -1185,7 +1198,8 @@ void Queue::run_job(const JobStart& js, const std::optional<jq2_job_observer>& o
             const jq2_job_observer* obs;
             jq2_job_info info;
             ImageStamp* stamp; /* null while tracing is off */
-        } o{&*obs, {}, ft.t0 != 0 ? &stamp : nullptr};
+            CaptureJob cap;
+        } o{&*obs, {}, ft.t0 != 0 ? &stamp : nullptr, cap};
         o.info.queue = js.queue_ea;
         o.info.port = js.port_ea;
         o.info.descriptor_ea = js.descriptor_ea;
@@ -1217,8 +1231,10 @@ void Queue::run_job(const JobStart& js, const std::optional<jq2_job_observer>& o
             i.r1 = l->r1;
             i.ctx_ls = l->ctx_ls;
             if (ob.obs->job_start != nullptr) ob.obs->job_start(ob.obs->user, ctx, &i);
+            capture_job_start(ob.cap, ctx, l);
         };
         hooks.end = [](void* user, spu_context* ctx) {
+            capture_job_end(ctx); /* before the policy: a job that stops the process still leaves its fixture */
             require_normal_return(ctx);
             auto& ob = *static_cast<Observed*>(user);
             if (ob.obs->job_end != nullptr) ob.obs->job_end(ob.obs->user, ctx, ctx->gpr[3]._u32[0], &ob.info);
@@ -1661,6 +1677,9 @@ int32_t jq2_queue_create(uint32_t revision, uint32_t sdk_version, uint32_t spurs
         ps3_stop_guest_range("jq2_queue_create", "command_ring", command_ring, ring_size, jq2_guest_limit());
     }
 
+    /* The capture options are read here, once, before any worker exists; a bad directory is found now. */
+    capture_configure();
+
     ExecutorHooks hooks;
     {
         std::lock_guard<std::mutex> lk(g_hooks_mu);
@@ -1718,6 +1737,7 @@ int32_t jq2_queue_create(uint32_t revision, uint32_t sdk_version, uint32_t spurs
         created = g_queues_created;
         /* (std::min): vm.h brings in <windows.h>, whose min macro would expand a bare std::min( */
         q->set_index(static_cast<std::uint8_t>((std::min)(created, 255u)));
+        q->set_number(created); /* the unsaturated number: fixture names must not collide past 255 */
         if (!g_queues.emplace(queue, q).second) {
             q->destroy_flags();
             return JQ2_ERR_STAT;
