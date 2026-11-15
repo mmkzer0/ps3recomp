@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """ftrace_report: frame binning, import call sites, split, cadence, drawables, label-store waits, jq2 job queues, image identity and critical path, audio ring, bad input."""
 import contextlib
+import hashlib
 import io
 import json
 import subprocess
@@ -1114,6 +1115,213 @@ with tempfile.TemporaryDirectory() as tmp:
     rc, out, err = run(tmp, jq2_trace(barrier + ["J 9 zz 00100000 4"]))
     check(rc == 2 and "not an image line" in err and "Traceback" not in err,
           "malformed J line: exit 2, no traceback")
+
+# Kinds 32 (JQ2_BODY) and 33 (JQ2_XDIFF), docs/SPU_XDIFF.md section 14: who = q << 8 | w, a = seq;
+# kind 32 b = tier | disposition << 8 | sat(lift_miss, 255) << 16; kind 33 b = verdict | reason << 8
+# | subject tier << 16. Both join kind 29 on (who, a). The reason ids are the tool's table, which
+# lists the reasons in the order of the design's table (section 8.3).
+sys.path.insert(0, str(TOOL.parent))
+import ftrace_report as fr
+
+JQ2_BODY, JQ2_XDIFF = 32, 33
+EQUAL, DIFFER, VOID = 0, 4, 5                     # a verdict is the offline runner's exit status
+RID = {name: i for i, (_, name) in fr.XDIFF_REASONS.items()}
+LEGACY_TEXT_SHA256 = "c458db9ade410ea618f01e43e11b3945d50fc37a16f11862ce25f06eff6db278"
+LEGACY_JSON_SHA256 = "9a3e50b29c818111a701ae164213272bb383e3e63f04b3077416d024793ab841"
+
+
+def body(q, w, seq, tier, disposition, miss, t):
+    return span(JQ2_BODY, qword(q, w), seq, tier | disposition << 8 | miss << 16, t, t)
+
+
+def xverdict(q, w, seq, verdict, reason, t):
+    return span(JQ2_XDIFF, qword(q, w), seq, verdict | reason << 8 | 1 << 16, t, t + 0.5)
+
+
+def xd_rows(r, q=None):
+    imgs = r["jq2"]["images"]
+    rows = imgs["overall"] if q is None else next(p for p in imgs["per_queue"] if p["q"] == q)["rows"]
+    return {x["fingerprint"]: x for x in rows}
+
+
+check(fr.AUDIO_RING_VIEW == 31 and fr.JQ2_BODY == 32 and fr.JQ2_XDIFF == 33,
+      "kinds 32 and 33 follow the last kind in use")
+check(fr.XDIFF_REASONS[0] == ("equal", "none") and fr.XDIFF_REASONS[16] == ("differ", "effect-kind") and
+      fr.XDIFF_REASONS[22] == ("differ", "end-regs") and fr.XDIFF_REASONS[23] == ("differ", "end-ls") and
+      fr.XDIFF_REASONS[25] == ("differ", "epoch-writes") and fr.XDIFF_REASONS[32] == ("void", "budget") and
+      fr.XDIFF_REASONS[37] == ("void", "depth-guard") and fr.XDIFF_REASONS[38] == ("void", "capture-limit") and
+      fr.XDIFF_REASONS[48] == ("malformed", "fixture-format") and
+      fr.XDIFF_REASONS[64] == ("not-found", "no-fixture") and
+      fr.XDIFF_REASONS[65] == ("not-found", "no-body") and len(fr.XDIFF_REASONS) == 23 and
+      RID["end-regs"] == 22 and RID["budget"] == 32,
+      "reason ids are the stable values of spu_xdiff.h, not table positions")
+
+# q0: A ran seq 1, 2, 4; X seq 3; seq 5 has no image (table full). q1: A ran seq 1.
+XD_BASE = [span(FLIP_REQ, 1, 0, 0, t, t) for t in (0, 100, 200)]
+XD_BASE += [
+    span(JQ2_JOB, qword(0, 0), 1, 1000, 1, 2), span(JQ2_IMAGE, qword(0, 0), 1, 0, 1.1, 1.2),
+    span(JQ2_JOB, qword(0, 0), 2, 1000, 3, 4), span(JQ2_IMAGE, qword(0, 0), 2, 0, 3.1, 3.2),
+    span(JQ2_JOB, qword(0, 1), 3, 1000, 2, 3), span(JQ2_IMAGE, qword(0, 1), 3, 1, 2.1, 2.2),
+    span(JQ2_JOB, qword(0, 0), 4, 1000, 7, 8), span(JQ2_IMAGE, qword(0, 0), 4, 0, 7.1, 7.2),
+    span(JQ2_JOB, qword(0, 1), 5, 1000, 5, 6), span(JQ2_IMAGE, qword(0, 1), 5, 0xFFFFFFFF, 5.1, 5.2),
+    span(JQ2_JOB, qword(1, 0), 1, 1000, 1, 2), span(JQ2_IMAGE, qword(1, 0), 1, 0, 1.1, 1.2),
+    f"J 0 {FP_A} 00100000 4096",
+    f"J 1 {FP_X} 00200000 2048",
+]
+XD_BODY = [
+    body(0, 0, 1, 1, 1, 3, 2),        # A: lifted, queued, 3 misses
+    body(0, 0, 2, 1, 0, 0, 4),        # A: lifted, not sampled
+    body(0, 1, 3, 0, 3, 0, 3),        # X: interp, not eligible
+    body(0, 0, 4, 2, 2, 255, 8),      # A: partial, dropped, saturated
+    body(0, 1, 5, 3, 0, 0x1FF, 6),    # unknown image: native; a field above 255 reads as 255
+    body(1, 0, 1, 0, 1, 1, 2),        # q1 A: interp, queued, 1 miss
+]
+XD_VERDICT = [
+    xverdict(0, 0, 1, EQUAL, RID["none"], 2.1),
+    xverdict(1, 0, 1, DIFFER, RID["end-regs"], 2.1),
+    xverdict(0, 0, 4, VOID, RID["budget"], 8.1),
+    xverdict(0, 1, 3, EQUAL, RID["end-regs"], 3.1),   # a reason that belongs to another verdict
+    xverdict(0, 1, 5, DIFFER, 99, 6.1),               # a reason id the table does not know
+    xverdict(0, 1, 77, DIFFER, RID["end-ls"], 9),     # no JOB and no IMAGE span for this one
+    xverdict(0, 1, 78, 9, 0, 9.5),                    # an unknown verdict
+]
+XD_FULL = XD_BASE + XD_BODY + XD_VERDICT
+
+
+def xd_text_without_columns(out):
+    """The report with the three per-image xdiff lines removed."""
+    return "".join(l for l in out.splitlines(True)
+                   if not l.startswith(("        tiers: ", "        sampled ", "        verdicts: ")))
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    rc, out, err = run(tmp, jq2_trace(XD_FULL, header=IMG_HEADER), "--json")
+    check(rc == 0, f"xdiff: exit 0: {err}")
+    r = json.loads(out)
+    check(r["jq2"]["xdiff_records"] == {"body": 6, "xdiff": 7}, "xdiff: record counts")
+
+    a = xd_rows(r, 0)[FP_A]
+    check(a["jobs"] == 3 and a["body"]["tiers"] == {"interp": 0, "lifted": 2, "partial": 1, "native": 0} and
+          a["body"]["other_tier"] == 0 and a["body"]["records"] == 3,
+          f"xdiff q0 image A: jobs per tier {a['body']}")
+    check(a["body"]["sampled"] == 2 and a["body"]["queued"] == 1 and a["body"]["dropped"] == 1 and
+          a["body"]["not_eligible"] == 0 and close(a["body"]["sampled_share"], 2 / 3),
+          f"xdiff q0 image A: sampled, dropped, not eligible and the share {a['body']}")
+    check(a["body"]["resolver_misses"] == 3 + 255 and a["body"]["resolver_miss_saturated"] == 1,
+          f"xdiff q0 image A: resolver misses sum, one job saturated {a['body']}")
+    check(a["verdicts"]["total"] == 2 and a["verdicts"]["by_verdict"] == {"equal": 1, "void": 1} and
+          [(e["verdict"], e["reason"], e["count"]) for e in a["verdicts"]["by_reason"]] ==
+          [("equal", "none", 1), ("void", "budget", 1)],
+          f"xdiff q0 image A: verdicts by verdict and reason {a['verdicts']}")
+
+    x = xd_rows(r, 0)[FP_X]
+    check(x["jobs"] == 1 and x["body"]["tiers"]["interp"] == 1 and x["body"]["sampled"] == 0 and
+          x["body"]["not_eligible"] == 1 and x["body"]["queued"] == 0 and x["body"]["dropped"] == 0 and
+          close(x["body"]["sampled_share"], 0.0),
+          f"xdiff q0 image X: not eligible is counted on its own, not as sampled {x['body']}")
+    check([(e["verdict"], e["reason"]) for e in x["verdicts"]["by_reason"]] ==
+          [("equal", "unknown reason 22")],
+          f"xdiff: a reason under another verdict is unknown, not a crash {x['verdicts']}")
+
+    u = xd_rows(r, 0)[None]
+    check(u["unknown"] is True and u["jobs"] == 1 and u["body"]["tiers"]["native"] == 1 and
+          u["body"]["sampled"] == 0 and close(u["body"]["sampled_share"], 0.0),
+          f"xdiff: the job without an image is the unknown row {u['body']}")
+    check(u["body"]["resolver_misses"] == 255 and u["body"]["resolver_miss_saturated"] == 1,
+          f"xdiff: a miss field above 255 saturates at 255 {u['body']}")
+    check(u["verdicts"]["total"] == 3 and
+          [(e["verdict"], e["reason"], e["count"]) for e in u["verdicts"]["by_reason"]] ==
+          [("differ", "end-ls", 1), ("differ", "unknown reason 99", 1),
+           ("unknown verdict 9", "unknown reason 0", 1)],
+          f"xdiff: kind 33 without a kind 29 match, an unknown reason and verdict are counted {u['verdicts']}")
+
+    a1 = xd_rows(r, 1)[FP_A]
+    check(a1["jobs"] == 1 and a1["body"]["tiers"]["interp"] == 1 and a1["body"]["resolver_misses"] == 1 and
+          [(e["verdict"], e["reason"]) for e in a1["verdicts"]["by_reason"]] == [("differ", "end-regs")],
+          f"xdiff q1: joined on (who, seq), not seq alone {a1['body']}")
+
+    oa = xd_rows(r)[FP_A]
+    check(oa["jobs"] == 4 and oa["queues"] == [0, 1] and
+          oa["body"]["tiers"] == {"interp": 1, "lifted": 2, "partial": 1, "native": 0} and
+          oa["body"]["sampled"] == 3 and oa["body"]["queued"] == 2 and oa["body"]["dropped"] == 1 and
+          close(oa["body"]["sampled_share"], 0.75) and oa["body"]["resolver_misses"] == 259 and
+          oa["verdicts"]["total"] == 3 and
+          [e["verdict"] for e in oa["verdicts"]["by_reason"]] == ["equal", "differ", "void"],
+          f"xdiff overall image A: the queues add up {oa['body']} {oa['verdicts']}")
+
+    rc, out, err = run(tmp, jq2_trace(XD_FULL, header=IMG_HEADER))
+    check(rc == 0, f"xdiff text: exit 0: {err}")
+    check(out.count("        tiers: interp 0, lifted 2, partial 1, native 0; resolver misses 258"
+                    " (lower bound: 1 job(s) at 255)\n") == 1 and
+          out.count("        sampled 2 (share 66.7 % of 3 jobs), queued 1, dropped 1, not eligible 0\n") == 1 and
+          out.count("        verdicts: equal/none 1, void/budget 1\n") == 1,
+          "xdiff text: q0 image A columns")
+    check(out.count("        tiers: interp 1, lifted 2, partial 1, native 0; resolver misses 259"
+                    " (lower bound: 1 job(s) at 255)\n") == 1 and
+          out.count("        sampled 3 (share 75.0 % of 4 jobs), queued 2, dropped 1, not eligible 0\n") == 1 and
+          out.count("        verdicts: equal/none 1, differ/end-regs 1, void/budget 1\n") == 1,
+          "xdiff text: overall image A columns")
+    check(out.count("        sampled 0 (share 0.0 % of 1 jobs), queued 0, dropped 0, not eligible 1\n") == 2 and
+          out.count("        verdicts: equal/unknown reason 22 1\n") == 2 and
+          out.count("        verdicts: differ/end-ls 1, differ/unknown reason 99 1,"
+                    " unknown verdict 9/unknown reason 0 1\n") == 2,
+          "xdiff text: image X and the unknown row, per queue and overall")
+
+    # Partial presence: what is there is shown, the other kind's columns are absent.
+    only32 = [l for l in XD_FULL if not l.startswith("33 ")]
+    rc, out, err = run(tmp, jq2_trace(only32, header=IMG_HEADER), "--json")
+    r32 = json.loads(out)
+    check(rc == 0 and all(x["body"] is not None and x["verdicts"] is None for x in xd_rows(r32).values()) and
+          r32["jq2"]["xdiff_records"] == {"body": 6, "xdiff": 0},
+          "xdiff: kind 32 without 33 shows the body columns and no verdicts")
+    rc, out, err = run(tmp, jq2_trace(only32, header=IMG_HEADER))
+    check(rc == 0 and "        verdicts: -\n" in out and "        verdicts: equal" not in out and
+          "        tiers: interp 0, lifted 2" in out,
+          "xdiff text: kind 32 without 33 prints verdicts as -")
+    only33 = [l for l in XD_FULL if not l.startswith("32 ")]
+    rc, out, err = run(tmp, jq2_trace(only33, header=IMG_HEADER), "--json")
+    r33 = json.loads(out)
+    check(rc == 0 and all(x["body"] is None and x["verdicts"] is not None for x in xd_rows(r33).values()),
+          "xdiff: kind 33 without 32 shows the verdicts and no body columns")
+    rc, out, err = run(tmp, jq2_trace(only33, header=IMG_HEADER))
+    check(rc == 0 and "        tiers: interp -, lifted -, partial -, native -; resolver misses -\n" in out and
+          "        sampled - (share -), queued -, dropped -, not eligible -\n" in out and
+          "        verdicts: equal/none 1, void/budget 1\n" in out,
+          "xdiff text: kind 33 without 32 prints the body columns as -")
+
+    # Neither kind: the columns are absent (null, `-`), never 0, and the rest of the report is
+    # what it was. The digests are of the output of the tool before kinds 32 and 33 existed, on
+    # this trace, with the new per-image lines (and in JSON the new keys) taken out.
+    legacy = [l for l in XD_FULL if not l.startswith(("32 ", "33 "))]
+    rc, out, err = run(tmp, jq2_trace(legacy, header=IMG_HEADER), "--json")
+    rl = json.loads(out)
+    check(rc == 0 and all(x["body"] is None and x["verdicts"] is None
+                          for x in list(xd_rows(rl).values()) + list(xd_rows(rl, 0).values()) +
+                          list(xd_rows(rl, 1).values())) and rl["jq2"]["xdiff_records"] is None,
+          "xdiff: a trace without kinds 32 and 33 has null columns")
+    for rows in [rl["jq2"]["images"]["overall"]] + [p["rows"] for p in rl["jq2"]["images"]["per_queue"]]:
+        for x in rows:
+            del x["body"], x["verdicts"]
+    del rl["jq2"]["xdiff_records"]
+    check(hashlib.sha256(json.dumps(rl, sort_keys=True).encode()).hexdigest() == LEGACY_JSON_SHA256,
+          "xdiff: a trace without kinds 32 and 33 has the same JSON as before")
+    rc, out, err = run(tmp, jq2_trace(legacy, header=IMG_HEADER))
+    check(rc == 0 and out.count("        tiers: interp -, lifted -, partial -, native -; resolver misses -\n") == 7 and
+          out.count("        verdicts: -\n") == 7 and "tiers: interp 0" not in out,
+          "xdiff text: a trace without kinds 32 and 33 prints every column as -")
+    check(hashlib.sha256(xd_text_without_columns(out).encode()).hexdigest() == LEGACY_TEXT_SHA256,
+          "xdiff text: a trace without kinds 32 and 33 has the same report as before, byte for byte")
+
+    # Without kind 29 there is no image to attribute to: the records are counted, not lost.
+    no29 = [l for l in XD_FULL if not l.startswith(("29 ", "J "))]
+    rc, out, err = run(tmp, jq2_trace(no29, header=IMG_HEADER), "--json")
+    r29 = json.loads(out)
+    check(rc == 0 and r29["jq2"]["images"] is None and r29["jq2"]["xdiff_records"] == {"body": 6, "xdiff": 7},
+          "xdiff: without kind 29 the records are counted and not attributed")
+    rc, out, err = run(tmp, jq2_trace(no29, header=IMG_HEADER))
+    check(rc == 0 and out.count("no image identity in this trace (kind 29)") == 1 and
+          "6 kind 32 and 7 kind 33 record(s) cannot be attributed to an image without kind 29" in out,
+          "xdiff text: without kind 29 one line says the records cannot be attributed")
 
 # Kinds 30/31: both sides of the cellAudio port ring. a = tag << 8 | (nblock - 1) << 3 | port,
 # b = the filled mask (bit i set when block i holds a non-zero word); kind 30 is the mixer's

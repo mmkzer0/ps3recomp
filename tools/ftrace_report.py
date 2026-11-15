@@ -91,6 +91,17 @@ the run-length histogram rebuilt per port. A loss counter or a full image table
 marks the section INCOMPLETE. A trace without kind 29 prints one line saying it
 has no image identity and changes nothing else.
 
+A trace that also carries the xdiff kinds (32 JQ2_BODY, 33 JQ2_XDIFF; docs/SPU_XDIFF.md section
+14) adds to every image row, per queue and overall: the jobs per tier (interp, lifted, partial,
+native), how many were sampled (queued, dropped) and how many could not be sampled (not eligible),
+the sampled share of the row's jobs, the resolver misses (the sum of kind 32's lift_miss, which
+the recorder saturates at 255 per job, so a total with saturated jobs is a lower bound) and the
+verdicts by verdict and reason. Both kinds join kind 29 on (who, a); a record without a match
+is counted under the unknown image row. A column whose kind the trace lacks prints as `-`,
+never 0 (kind 32 gives tiers, sampled, dropped, not eligible, misses and the share; kind 33 the
+verdicts). An id the tool's tables do not know is named as unknown, not dropped. Kinds 32 and
+33 are never duration-filtered, like kind 29.
+
 A fourth section, audio ring (kinds 30-31), reads both sides of the cellAudio
 port ring, per port: the reads and the runs of blocks read empty (consecutive
 tags, after a read that was filled), the producer's lead at each read, the
@@ -130,7 +141,9 @@ import tempfile
  GPU_ENCODE, GPU_WAIT, READBACK, GPU_EXEC, HLE, DRAWABLE, LABEL_WAIT,
  AUDIO_MIX, AUDIO_PACE, AUDIO_UNDERRUN, AUDIO_STALE,
  JQ2_PUSH, JQ2_JOB, JQ2_CREDIT, JQ2_SYNC_WAIT, JQ2_IDLE, JQ2_HELD, JQ2_BARRIER,
- JQ2_IMAGE, AUDIO_RING, AUDIO_RING_VIEW) = range(1, 32)
+ JQ2_IMAGE, AUDIO_RING, AUDIO_RING_VIEW, JQ2_BODY, JQ2_XDIFF) = range(1, 34)
+# Kinds 32 and 33 are numbered here until include/ps3emu/ps3_ftrace.h gets them with the xdiff
+# runtime commit; this tuple is then the one place the tool owns the numbers.
 # Labels are report keys that saved runs and scripts compare: keep them, append new reasons.
 AUDIO_PACE_REASON = {1: "queue full", 2: "clock pacing", 3: "backend wait", 4: "restart"}
 JQ2_FIBER_WAKE = 2       # wake field of a fiber wait or wake; it carries waiter 0xFF, so it cannot be joined
@@ -139,6 +152,27 @@ JQ2_PARK_REASONS = {0: "unrecorded", 1: "empty", 2: "unwritten", 3: "held", 4: "
 JQ2_DEPTH_BUCKETS = ("1", "2-4", "5-16", "17-64", "65+")  # PUSH depth, b >> 8
 JQ2_IDLE_DEPTH = 0xFFFFFF  # kind 26: depth at park | reason << 24
 JQ2_IMAGE_UNKNOWN = 0xFFFFFFFF  # kind 29 b: the image table was full, so the job has no J line
+JQ2_BODY_TIERS = {0: "interp", 1: "lifted", 2: "partial", 3: "native"}  # kind 32 b & 0xFF: T0..T3, SPU_XDIFF.md s3
+JQ2_BODY_DISPOSITIONS = {1: "queued", 2: "dropped", 3: "not_eligible"}  # kind 32 b >> 8 & 0xFF; 0 = not sampled
+JQ2_SAMPLED_DISPOSITIONS = (1, 2)  # a sample was taken; 3 is a job that could not be sampled
+JQ2_MISS_SAT = 255       # kind 32 b >> 16: the recorder's sat(lift_miss, 255)
+# Kind 33 b: verdict | reason << 8 | subject tier << 16. A verdict id is the offline runner's exit
+# status (SPU_XDIFF.md 8.3). The reason ids are the stable values of SPU_XDIFF_REASONS in
+# runtime/spu/spu_xdiff.h, each with the verdict it belongs to; a new situation gets a new id there
+# and a new row here. A reason under a verdict other than its own is reported as unknown.
+XDIFF_VERDICTS = {0: "equal", 2: "malformed", 3: "not-found", 4: "differ", 5: "void"}
+XDIFF_REASONS = {
+    0: ("equal", "none"),
+    16: ("differ", "effect-kind"), 17: ("differ", "effect-request"), 18: ("differ", "effect-payload"),
+    19: ("differ", "effect-extra"), 20: ("differ", "effect-missing"), 21: ("differ", "end-class"),
+    22: ("differ", "end-regs"), 23: ("differ", "end-ls"), 24: ("differ", "epoch-order"),
+    25: ("differ", "epoch-writes"),
+    32: ("void", "budget"), 33: ("void", "unsupported-effect"), 34: ("void", "uncovered-read"),
+    35: ("void", "unlifted-branch"), 36: ("void", "host-fault"), 37: ("void", "depth-guard"),
+    38: ("void", "capture-limit"),
+    48: ("malformed", "fixture-format"), 49: ("malformed", "fixture-identity"),
+    50: ("malformed", "not-comparable"),
+    64: ("not-found", "no-fixture"), 65: ("not-found", "no-body")}
 JQ2_WALK_LIMIT = 100000  # steps of the backward critical-path walk per wait, then the rest is unresolved
 JQ2_CP_CATEGORIES = ("credit_wake", "exec", "trace", "admission", "parked", "barrier_release",
                      "push", "unresolved")   # the partition of a wait's [S0, S1]
@@ -1653,21 +1687,82 @@ def jq2_exec_stats(walls):
             "p95_ms": nearest_rank(xs, 95) if xs else None}
 
 
-def jq2_image_rows(jobs, cp_exec, total_wait_ms):
+def jq2_body_counts(recs, jobs):
+    """One image's kind 32 records (their b values) as counters; `jobs` is the row's JOB count.
+
+    Disposition 0 is a job that was not sampled; 1 (queued) and 2 (dropped) are samples taken, so
+    `sampled` is their sum. Disposition 3 (not_eligible) is a job that could not be sampled, for
+    example because its image has event branches: it is counted on its own and is not in
+    `sampled` or the sampled share. A tier or disposition id the tables do not know is counted
+    apart (other_tier, other_disposition) and is in no tier and not in `sampled`. The recorder
+    saturates lift_miss at 255 per job, so resolver_misses is a lower bound when
+    resolver_miss_saturated is above 0.
+    """
+    c = {"records": len(recs), "tiers": dict.fromkeys(JQ2_BODY_TIERS.values(), 0), "other_tier": 0,
+         "sampled": 0, "queued": 0, "dropped": 0, "not_eligible": 0, "other_disposition": 0,
+         "resolver_misses": 0, "resolver_miss_saturated": 0}
+    for b in recs:
+        tier = JQ2_BODY_TIERS.get(b & 0xFF)
+        if tier is None:
+            c["other_tier"] += 1
+        else:
+            c["tiers"][tier] += 1
+        disposition = b >> 8 & 0xFF
+        if disposition in JQ2_BODY_DISPOSITIONS:
+            c[JQ2_BODY_DISPOSITIONS[disposition]] += 1
+            c["sampled"] += disposition in JQ2_SAMPLED_DISPOSITIONS
+        elif disposition:
+            c["other_disposition"] += 1
+        miss = min(b >> 16, JQ2_MISS_SAT)
+        c["resolver_misses"] += miss
+        c["resolver_miss_saturated"] += miss == JQ2_MISS_SAT
+    c["sampled_share"] = c["sampled"] / jobs if jobs else None
+    return c
+
+
+def jq2_verdict_counts(recs):
+    """One image's kind 33 records (their b values) by verdict and reason, in id order.
+
+    by_reason lists each (verdict, reason) seen with its ids and count; by_verdict sums the
+    reasons. An id outside the tables, or a reason that belongs to another verdict, is named
+    "unknown verdict N" / "unknown reason N" and counted, never dropped.
+    """
+    seen = collections.Counter((b & 0xFF, b >> 8 & 0xFF) for b in recs)
+    by_reason, by_verdict = [], {}
+    for (v, r), n in sorted(seen.items()):
+        verdict = XDIFF_VERDICTS.get(v, f"unknown verdict {v}")
+        owner, name = XDIFF_REASONS.get(r, (None, None))
+        reason = name if owner == verdict else f"unknown reason {r}"
+        by_reason.append({"verdict": verdict, "reason": reason, "verdict_id": v, "reason_id": r,
+                          "count": n})
+        by_verdict[verdict] = by_verdict.get(verdict, 0) + n
+    return {"total": len(recs), "by_verdict": by_verdict, "by_reason": by_reason}
+
+
+def jq2_image_rows(jobs, cp_exec, total_wait_ms, bodies=None, xdiffs=None):
     """The image table of one queue (or of all queues): jobs grouped by fingerprint.
 
     A fingerprint can run from more than one (ea, bytes) triple and on more than one queue;
     the rows list every variant and the queues the jobs were seen on. `cp_exec` is the exec
     time the walks charged to each fingerprint, so the share is of the blocking-wait time,
-    not of CPU: a short image that blocks a thread outranks a long one that blocks nobody.
+    not of CPU: a short image that blocked a thread outranks a long one that blocked nobody.
     The image identification span is already out of the exec wall (JOB minus IMAGE); CPU is
     JOB.b and does include it. Rows sort by critical path, then exec total; cp_rank follows
     that order and cpu_rank the CPU total, so the two are side by side.
+
+    `bodies` and `xdiffs` are the joined kind 32 and kind 33 records, (fp, (ea, bytes) or None,
+    q, b), or None when the trace has no such kind: the row's "body" and "verdicts" are then
+    None (absent), not zero counters. A record whose fingerprint has no job in `jobs` still
+    makes its row (with 0 jobs), so no record is lost.
     """
     groups = {}
+
+    def group(fp):
+        return groups.setdefault(fp, {"jobs": 0, "walls": [], "cpu": 0.0, "lat": [], "held": [],
+                                      "ready": [], "variants": set(), "queues": set(), "clamped": 0,
+                                      "bodies": [], "xdiffs": []})
     for j in jobs:
-        g = groups.setdefault(j["fp"], {"jobs": 0, "walls": [], "cpu": 0.0, "lat": [], "held": [],
-                                        "ready": [], "variants": set(), "queues": set(), "clamped": 0})
+        g = group(j["fp"])
         g["jobs"] += 1
         g["walls"].append(j["wall"])
         g["cpu"] += j["cpu"]
@@ -1681,6 +1776,13 @@ def jq2_image_rows(jobs, cp_exec, total_wait_ms):
         if j["variant"] is not None:
             g["variants"].add(j["variant"])
         g["queues"].add(j["q"])
+    for recs, key in ((bodies, "bodies"), (xdiffs, "xdiffs")):
+        for fp, variant, q, b in recs or ():
+            g = group(fp)
+            g[key].append(b)
+            g["queues"].add(q)
+            if variant is not None:
+                g["variants"].add(variant)
     rows = []
     for fp, g in groups.items():
         cp = cp_exec.get(fp, 0.0)
@@ -1695,6 +1797,8 @@ def jq2_image_rows(jobs, cp_exec, total_wait_ms):
             "ready_mean_ms": jq2_mean(g["ready"]), "ready_count": len(g["ready"]),
             "critical_path_ms": cp,
             "critical_path_share": cp / total_wait_ms if total_wait_ms > 0 else None,
+            "body": None if bodies is None else jq2_body_counts(g["bodies"], g["jobs"]),
+            "verdicts": None if xdiffs is None else jq2_verdict_counts(g["xdiffs"]),
         })
     rows.sort(key=lambda r: (-r["critical_path_ms"], -r["exec_wall_ms"]["total_ms"],
                              r["fingerprint"] or ""))
@@ -1909,6 +2013,10 @@ def jq2_section(spans, header, names=None, images=None):
     job its due credit names through the capacity, barrier-release and push links that kept
     it blocked, which is how an image is charged with the blocking time it caused rather than
     with the CPU it used. A trace without kind 29 prints no image sections.
+
+    Kinds 32 and 33 (xdiff, outside the 22-29 range that decides whether the section exists)
+    are joined to kind 29 on (who, a) and reach the image rows through jq2_image_rows; a trace
+    without a kind leaves that kind's columns None.
     """
     js = [s for s in spans if JQ2_PUSH <= s[0] <= JQ2_IMAGE]
     if not js:
@@ -1951,6 +2059,32 @@ def jq2_section(spans, header, names=None, images=None):
     # Kind 27 and 28 are what the decomposition rests on; a trace that predates them has neither, and its
     # section stays as it was plus one note line.
     has_decomp = any(k in (JQ2_HELD, JQ2_BARRIER) for k, _, _, _, _, _ in js)
+    # Kinds 32 (BODY) and 33 (XDIFF) join kind 29 on (who, a) = (q << 8 | w, seq). A record whose
+    # job has no IMAGE span, or whose image index has no J line, is the unknown image. A kind the
+    # trace lacks stays None so its columns print as absent. A queue that only these kinds name
+    # has no row of its own and shows in the overall rows.
+    body_recs, xdiff_recs = [], []
+    for k, who, a, b, _, _ in spans:
+        if k == JQ2_BODY:
+            body_recs.append((who, a, b))
+        elif k == JQ2_XDIFF:
+            xdiff_recs.append((who, a, b))
+    index_of = {}
+    for q, gq in by_q.items():
+        for w, seq, index, _, _ in gq["image"]:
+            index_of.setdefault((q << 8 | w, seq), index)
+
+    def join_images(recs):
+        out = collections.defaultdict(list)
+        for who, a, b in recs:
+            index = index_of.get((who, a))
+            entry = None if index is None or index == JQ2_IMAGE_UNKNOWN else img_table.get(index)
+            out[who >> 8].append((f"{entry[0]:016x}" if entry is not None else None,
+                                  (entry[1], entry[2]) if entry is not None else None, who >> 8, b))
+        return out
+    bodies_by_q, xdiffs_by_q = join_images(body_recs), join_images(xdiff_recs)
+    bodies_all = [r for v in bodies_by_q.values() for r in v] if body_recs else None
+    xdiffs_all = [r for v in xdiffs_by_q.values() for r in v] if xdiff_recs else None
     for q in sorted(by_q):
         g = by_q[q]
         pushes, jobs, credits = g["push"], g["job"], g["credit"]
@@ -2135,7 +2269,10 @@ def jq2_section(spans, header, names=None, images=None):
                 "held": None if hb is None else hb[2] - hb[1],
                 "ready": None if hb is None else max(0.0, jt0 - hb[2]),
                 "variant": (entry[1], entry[2]) if entry is not None else None, "q": q})
-        image_rows, image_clamped = jq2_image_rows(image_jobs, q_cp_exec, q_cp_total)
+        image_rows, image_clamped = jq2_image_rows(
+            image_jobs, q_cp_exec, q_cp_total,
+            bodies_by_q.get(q, []) if body_recs else None,
+            xdiffs_by_q.get(q, []) if xdiff_recs else None)
         images_per_queue.append({"q": q, "rows": image_rows})
         all_image_jobs.extend(image_jobs)
         image_clamped_total += image_clamped
@@ -2357,13 +2494,17 @@ def jq2_section(spans, header, names=None, images=None):
     result = {"dropped": dropped, "decomposition_available": has_decomp,
               "images_available": has_images, "jq2_images": header_jq2_images(header),
               "jq2_image_overflow": overflow, "incomplete": None, "critical_path": None,
-              "images": None, "audio_stale": None, "trace_cost": None, "queues": queues}
+              "images": None, "audio_stale": None, "trace_cost": None,
+              "xdiff_records": ({"body": len(body_recs), "xdiff": len(xdiff_recs)}
+                                if body_recs or xdiff_recs else None),
+              "queues": queues}
     if not has_images:
         return result
     # A loss counter or a full image table makes the image sections incomplete; saying so is
     # the only honest reading of a trace whose jobs or images are missing.
     result["incomplete"] = (dropped or 0) > 0 or (overflow or 0) > 0
-    overall_rows, _ = jq2_image_rows(all_image_jobs, overall_cp_exec, overall_cp_total)
+    overall_rows, _ = jq2_image_rows(all_image_jobs, overall_cp_exec, overall_cp_total,
+                                     bodies_all, xdiffs_all)
     result["critical_path"] = {"total_ms": overall_cp_total, "rows": cp_rows_all,
                                "per_queue": cp_queue_rows}
     result["images"] = {"exec_wall_clamped": image_clamped_total, "overall": overall_rows,
@@ -2394,6 +2535,39 @@ def _jq2_pct(x):
 
 def _jq2_ratio(x):
     return "n/a" if x is None else f"{x:.2f}"
+
+
+def jq2_xdiff_lines(r):
+    """The three xdiff lines of one image row: tiers and resolver misses, sampling, verdicts.
+
+    A column the trace has no kind for prints `-`, never 0.
+    """
+    body, verdicts = r["body"], r["verdicts"]
+    if body is None:
+        tiers = ", ".join(f"{name} -" for name in JQ2_BODY_TIERS.values()) + "; resolver misses -"
+        sampling = "sampled - (share -), queued -, dropped -, not eligible -"
+    else:
+        tiers = ", ".join(f"{name} {body['tiers'][name]}" for name in JQ2_BODY_TIERS.values())
+        if body["other_tier"]:
+            tiers += f", other tier {body['other_tier']}"
+        misses = f"{body['resolver_misses']}"
+        if body["resolver_miss_saturated"]:
+            misses += f" (lower bound: {body['resolver_miss_saturated']} job(s) at {JQ2_MISS_SAT})"
+        tiers += f"; resolver misses {misses}"
+        share = "n/a" if body["sampled_share"] is None else f"{100 * body['sampled_share']:.1f} %"
+        sampling = (f"sampled {body['sampled']} (share {share} of {r['jobs']} jobs),"
+                    f" queued {body['queued']}, dropped {body['dropped']},"
+                    f" not eligible {body['not_eligible']}")
+        if body["other_disposition"]:
+            sampling += f", other disposition {body['other_disposition']}"
+    if verdicts is None:
+        verdict_text = "-"
+    elif not verdicts["by_reason"]:
+        verdict_text = "none"
+    else:
+        verdict_text = ", ".join(f"{e['verdict']}/{e['reason']} {e['count']}"
+                                 for e in verdicts["by_reason"])
+    return [f"tiers: {tiers}", sampling, f"verdicts: {verdict_text}"]
 
 
 def print_jq2_critical_path(cp):
@@ -2432,6 +2606,8 @@ def print_jq2_images(images):
             print(f"        critical path {r['critical_path_ms']:.2f} ms"
                   f" = {_jq2_pct(r['critical_path_share'])} of the blocking wait"
                   f"  CP rank {r['cp_rank']}, CPU rank {r['cpu_rank']}")
+            for line in jq2_xdiff_lines(r):
+                print("        " + line)
             variants = ", ".join(f"ea 0x{v['ea']:08x} / {v['bytes']} B" for v in r["variants"])
             print(f"        image {variants or 'unknown'}; queues"
                   f" {', '.join(str(q) for q in r['queues']) or 'none'}")
@@ -2602,6 +2778,10 @@ def print_jq2_section(jq):
         print("  held/admissible decomposition needs kinds 27-28 (HELD, BARRIER); this trace has none")
     if not jq.get("images_available", False):
         print("  no image identity in this trace (kind 29)")
+        records = jq.get("xdiff_records")
+        if records:
+            print(f"  {records['body']} kind 32 and {records['xdiff']} kind 33 record(s) cannot be"
+                  " attributed to an image without kind 29")
         return
     print_jq2_critical_path(jq["critical_path"])
     print_jq2_images(jq["images"])
