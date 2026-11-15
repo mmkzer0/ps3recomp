@@ -100,6 +100,16 @@ static void print_options()
             std::printf("\"%s\"", ps3_cfg_title_elf_sha256());
         else if (!std::strcmp(o->section, "diag") && !std::strcmp(o->key, "dump_config"))
             std::printf("%s", ps3_cfg_diag_dump_config() ? "true" : "false");
+        else if (!std::strcmp(o->section, "log") && !std::strcmp(o->key, "file"))
+            std::printf("\"%s\"", ps3_cfg_log_file());
+        else if (!std::strcmp(o->section, "log") && !std::strcmp(o->key, "level"))
+            std::printf("\"%s\"", ps3_cfg_log_level());
+        else if (!std::strcmp(o->section, "log") && !std::strcmp(o->key, "mute"))
+            std::printf("\"%s\"", ps3_cfg_log_mute());
+        else if (!std::strcmp(o->section, "log") && !std::strcmp(o->key, "collapse"))
+            std::printf("\"%s\"", ps3_cfg_log_collapse());
+        else if (!std::strcmp(o->section, "log") && !std::strcmp(o->key, "max_mb"))
+            std::printf("%u", ps3_cfg_log_max_mb());
         else
             std::printf("<unhandled option>");
         std::printf(" %s\n", ps3_config_option_source(i));

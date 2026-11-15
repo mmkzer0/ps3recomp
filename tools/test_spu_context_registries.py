@@ -34,7 +34,8 @@ failed = []
 with tempfile.TemporaryDirectory(prefix='spu-context-registry-') as tmp:
     tmp = Path(tmp)
     runtime_objects = []
-    for src in (root / 'runtime/config/config.cpp', root / 'runtime/diag/stop.cpp'):
+    for src in (root / 'runtime/config/config.cpp', root / 'runtime/diag/stop.cpp',
+                root / 'tests/ps3_log_null.cpp'):
         obj = tmp / (src.stem + '.o')
         subprocess.run([cxx, *cxxflags, '-c', str(src), '-o', str(obj)], check=True)
         runtime_objects.append(str(obj))

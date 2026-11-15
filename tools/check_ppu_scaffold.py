@@ -107,6 +107,8 @@ LOADER_SUPPORT_SOURCES = [
     "runtime/diag/sha256.cpp",
     "runtime/config/config.cpp",
     "runtime/config/identity.cpp",
+    # config.cpp configures the run log; these fixtures leave it out (see the file).
+    "tests/ps3_log_null.cpp",
 ]
 
 

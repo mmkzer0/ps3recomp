@@ -13,7 +13,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 # Added to every fixture's own C sources.
 RUNTIME_C = [ROOT / 'runtime/memory/reservation.c', ROOT / 'runtime/memory/label_window.c']
-RUNTIME_CXX = [ROOT / 'runtime/config/config.cpp', ROOT / 'runtime/diag/stop.cpp']
+# ps3_log_null.cpp: config.cpp configures the run log, which these fixtures deliberately leave out.
+RUNTIME_CXX = [ROOT / 'runtime/config/config.cpp', ROOT / 'runtime/diag/stop.cpp',
+               ROOT / 'tests/ps3_log_null.cpp']
 
 
 def build(c_sources, out, cflags, tmp, ldflags=(), runtime_c=True, timeout=None):

@@ -22,6 +22,7 @@
 
 #include "ps3emu/config.h"
 #include "ps3emu/stop.h"
+#include "ps3emu/ps3_log.h"
 #include "../ppu/ppu_context.h"   /* PPU_VSCR_NJ */
 
 #include <algorithm>
@@ -287,6 +288,30 @@ std::string check_string(const Option& o, std::string& s)
         std::FILE* f = std::fopen(s.c_str(), "rb");
         if (!f) return "\"" + s + "\" cannot be read: " + std::strerror(errno);
         std::fclose(f);
+        return {};
+    }
+    case PS3_CFG_V_LOG_LEVEL:
+        if (s == "error" || s == "warn" || s == "info" || s == "debug") return {};
+        return "expected \"error\", \"warn\", \"info\" or \"debug\", found \"" + s + "\"";
+    case PS3_CFG_V_LOG_COLLAPSE:
+        if (s == "file" || s == "all" || s == "off") return {};
+        return "expected \"file\", \"all\" or \"off\", found \"" + s + "\"";
+    case PS3_CFG_V_LOG_TAGS: {
+        /* The tags ps3_log prints as "[tag] ": anything else in the list could never match one. */
+        if (s.empty()) return {};
+        size_t pos = 0;
+        for (;;) {
+            const size_t end = s.find(',', pos);
+            const std::string tok = s.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+            if (tok.empty()) return "empty tag in the list; expected comma-separated tags of A-Za-z0-9_.-";
+            for (char c : tok) {
+                const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                                c == '_' || c == '.' || c == '-';
+                if (!ok) return "tag '" + tok + "' has a character outside A-Za-z0-9_.-";
+            }
+            if (end == std::string::npos) break;
+            pos = end + 1;
+        }
         return {};
     }
     case PS3_CFG_V_VIDEO_RESOLUTIONS: {
@@ -757,6 +782,10 @@ State* load_locked(const char* title_path)
 
     State* published = st.release();   /* intentionally never freed: valid for the process */
     g_published.store(published, std::memory_order_release);
+    /* The log is configured once the config is public: it reads the finished configuration through the
+     * lock-free path above, and a stop it raises (host-log-file) finds a complete state. Every host gets its
+     * file here, whichever way the configuration was first loaded. */
+    ps3_log_configure();
     return published;
 }
 

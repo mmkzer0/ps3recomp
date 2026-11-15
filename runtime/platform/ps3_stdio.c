@@ -12,6 +12,7 @@
  */
 #include "ps3_stdio.h"
 #include "win32_compat.h"
+#include "ps3emu/ps3_log.h"   /* ps3_log_flush: the crash path also flushes the run log file */
 
 #include <signal.h>
 #include <stdio.h>
@@ -45,6 +46,10 @@ static DWORD WINAPI ps3_stdio_flusher(LPVOID arg)
         long want = __atomic_load_n(&s_flush_req, __ATOMIC_ACQUIRE);
         fflush(stdout);
         fflush(stderr);
+        /* Before the done flag: the crash path waits for it, and the log file is what a run without a terminal
+         * (iOS, a Windows GUI) has left. A thread that died holding the log's lock stalls this call, and the
+         * crash caller then gives up after its wait; stdout and stderr are already out by then. */
+        ps3_log_flush();
         __atomic_store_n(&s_flush_done, want, __ATOMIC_RELEASE);
     }
 }
@@ -53,6 +58,7 @@ void ps3_stdio_flush(void)
 {
     fflush(stdout);
     fflush(stderr);
+    ps3_log_flush();
 }
 
 void ps3_stdio_flush_crash(void)

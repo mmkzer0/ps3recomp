@@ -82,7 +82,8 @@ def build(tmp):
         obj = tmp / f"{index}.o"
         subprocess.run([cc, *cflags, "-c", str(src), "-o", str(obj)], check=True)
         objects.append(str(obj))
-    for src in (ROOT / "runtime/config/config.cpp", ROOT / "runtime/diag/stop.cpp"):
+    for src in (ROOT / "runtime/config/config.cpp", ROOT / "runtime/diag/stop.cpp",
+                ROOT / "tests/ps3_log_null.cpp"):
         obj = tmp / (src.stem + ".o")
         subprocess.run([cxx, *cxxflags, "-c", str(src), "-o", str(obj)], check=True)
         objects.append(str(obj))

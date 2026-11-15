@@ -31,7 +31,8 @@ with tempfile.TemporaryDirectory(prefix='spu-interp-handoff-') as tmp:
         subprocess.run([os.environ.get('CC', 'cc'), *cflags, '-c', str(src),
                         '-o', str(obj)], check=True)
         objects.append(str(obj))
-    for src in (root / 'runtime/config/config.cpp', root / 'runtime/diag/stop.cpp'):
+    for src in (root / 'runtime/config/config.cpp', root / 'runtime/diag/stop.cpp',
+                root / 'tests/ps3_log_null.cpp'):
         obj = tmp / (src.stem + '.o')
         subprocess.run([os.environ.get('CXX', 'c++'), *cxxflags, '-c', str(src),
                         '-o', str(obj)], check=True)

@@ -143,7 +143,9 @@ extern "C" {
     /* A host wait the host refused (not a timeout, not a wake) in a runtime thread that has no caller to tell. */ \
     X(HOST_WAIT_ERROR,          "host-wait-error")                                                         \
     /* An in-run xdiff shadow disagreed with the authority and spu.xdiff_on_divergence / spu.xdiff_on_latent says stop. */ \
-    X(SPU_XDIFF_DIVERGENCE,     "spu-xdiff-divergence")
+    X(SPU_XDIFF_DIVERGENCE,     "spu-xdiff-divergence")                                                    \
+    /* log.file cannot be rotated or created: a run whose log was asked for must not go on without it. */  \
+    X(HOST_LOG_FILE,            "host-log-file")
 
 /* A fixed underlying type in C++ makes a kind outside the list (a caller's bug,
  * which the stop still reports as "invalid-kind") a well-defined value rather
@@ -213,6 +215,21 @@ PS3_NORETURN static inline void ps3_stop_host_wait_error(const char* site, int e
              "A host primitive failed with the error shown: the process is in a state no run can trust. "
              "Report the line.",
              fields, 2, NULL);
+}
+
+/* log.file could not be rotated aside or created (ps3_log_configure). `op` is "rename" or "open"; `error` is
+ * the errno value, or GetLastError() for a rename on Windows; `path_len` is the length of the configured path.
+ * The path itself is never printed: it can hold anything the operator typed, and a stop line is parsed. */
+PS3_NORETURN static inline void ps3_stop_host_log_file(const char* op, int error, size_t path_len)
+{
+    char code[16], len[24];
+    snprintf(code, sizeof code, "%d", error);
+    snprintf(len, sizeof len, "%zu", path_len);
+    const ps3_stop_field fields[] = { {"op", op}, {"errno", code}, {"path_len", len} };
+    ps3_stop(PS3_STOP_HOST_LOG_FILE, "the run log file cannot be rotated or created",
+             "Fix or clear log.file (config key, docs/LOGGING.md): the path must name a regular file or nothing, "
+             "in a writable directory, and the old log must be movable to <file>.prev.",
+             fields, 3, NULL);
 }
 
 /* Host context failure; no guest site. Fields are defined by this helper. */
@@ -375,6 +392,16 @@ void ps3_stop_register_frontier(ps3_stop_frontier_fn fn);
 /* Runs every registered provider for `thread_id` and returns what they filled, without stopping. A fault
  * raised from a host-side handler asks this to name the handler before it builds its own stop. */
 void ps3_stop_query_frontier(uint64_t thread_id, ps3_stop_frontier* out);
+
+/* The run log's two hooks into a stop (ps3_log_quiesce and ps3_log_mirror, set by ps3_log_configure). They are
+ * hooks rather than calls so that stop.cpp, which about thirty fixtures compile on their own, does not depend
+ * on the log. `quiesce` runs first, under the stop lock and before the banner is composed or written: it lets
+ * the logging operations already in flight finish (their lines land before the banner, which stays the last
+ * thing on stderr) and refuses new ones. `mirror` runs after the banner went to stderr, with its bytes, and
+ * the process ends right after it returns. Neither may stop. NULL (the default) hooks nothing. */
+typedef void (*ps3_stop_quiesce_fn)(void);
+typedef void (*ps3_stop_mirror_fn)(const char* bytes, size_t n);
+void ps3_stop_set_mirror(ps3_stop_quiesce_fn quiesce, ps3_stop_mirror_fn mirror);
 
 /* A stop raised on this thread that must not end the process: an in-run xdiff shadow (docs/SPU_XDIFF.md
  * section 9) runs the subject tier on the audit thread, and whatever the subject reaches, a named stop
