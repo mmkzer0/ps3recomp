@@ -826,6 +826,15 @@ if(PS3RECOMP_BUILD_TESTS)
         target_link_libraries(test_host_wait_native PRIVATE Threads::Threads)
         add_test(NAME host_wait_native COMMAND test_host_wait_native)
         set_tests_properties(host_wait_native PROPERTIES LABELS "platform;t0;tsan" TIMEOUT 120)
+        # The host GPU gate (include/ps3emu/host_gpu_gate.h): a waiter parks while the gate is suspended and one
+        # resume releases it, the active path never parks, and the retry-or-stop decision of a failed allocation.
+        # Header-only, so nothing is linked but the threads.
+        add_executable(test_host_gpu_gate runtime/platform/tests/test_host_gpu_gate.c)
+        target_include_directories(test_host_gpu_gate PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+        target_compile_options(test_host_gpu_gate PRIVATE -Wall -Wextra)
+        target_link_libraries(test_host_gpu_gate PRIVATE Threads::Threads)
+        add_test(NAME host_gpu_gate COMMAND test_host_gpu_gate)
+        set_tests_properties(host_gpu_gate PROPERTIES LABELS "platform;t0;tsan" TIMEOUT 120)
         # The Win32 shim's waits on the same scripted clock and native waits: win32_compat.c itself is linked
         # against the fake backend, which is then also the only clock (HW_FAKE_DEFINES_HOST_CLOCK). Two cases
         # must be the first to touch the shim's multi-object condition variable, so each runs in its own process.
@@ -2204,7 +2213,7 @@ if(UNIX)
     # includes the engine and the backend and drives them with synthetic
     # method words (#62, #64). Skips (77) without a Metal device.
     if(APPLE AND PS3RECOMP_MSL_TRANSLATION)
-        foreach(gpu_test back_stencil window invalidate_l2)
+        foreach(gpu_test back_stencil window invalidate_l2 init_gate)
             add_executable(test_metal_${gpu_test}
                 libs/video/tests/test_metal_${gpu_test}.m
                 libs/video/rsx_shader_msl.cpp

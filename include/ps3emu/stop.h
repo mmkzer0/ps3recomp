@@ -143,7 +143,9 @@ extern "C" {
     /* A host wait the host refused (not a timeout, not a wake) in a runtime thread that has no caller to tell. */ \
     X(HOST_WAIT_ERROR,          "host-wait-error")                                                         \
     /* An in-run xdiff shadow disagreed with the authority and spu.xdiff_on_divergence / spu.xdiff_on_latent says stop. */ \
-    X(SPU_XDIFF_DIVERGENCE,     "spu-xdiff-divergence")
+    X(SPU_XDIFF_DIVERGENCE,     "spu-xdiff-divergence")                                                    \
+    /* The host GPU refused an allocation while the host allowed GPU use: the guest's frame cannot be built. */ \
+    X(HOST_GPU_ALLOC,           "host-gpu-alloc")
 
 /* A fixed underlying type in C++ makes a kind outside the list (a caller's bug,
  * which the stop still reports as "invalid-kind") a well-defined value rather

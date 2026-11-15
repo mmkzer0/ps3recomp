@@ -32,6 +32,7 @@
  * running; there are no SPU tasks here. */
 int spu_taskset_round_busy(uint32_t* ts, uint32_t* tid) { (void)ts; (void)tid; return 0; }
 #include <pthread.h>
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -220,12 +221,29 @@ static void* ppu_thread(void* arg)
     return NULL;
 }
 
+/* The host's pause clock (cellGcm_set_host_pause_clock), as the Metal backend on iOS supplies it while the app is
+ * inactive: until released, every millisecond since the start is a paused millisecond, so the walker's wait
+ * clock stands still; once released it is frozen at what had been paused, and the clock runs again. Every read
+ * is counted: the store's wait loop is the only reader, one read per poll, and its polls are what the test paces
+ * on instead of a sleep. */
+static _Atomic unsigned g_pause_polls;
+static _Atomic int g_pause_released;
+static unsigned long long g_pause_t0, g_pause_frozen_ms;
+static unsigned long long fixture_paused_ms(void)
+{
+    atomic_fetch_add(&g_pause_polls, 1u);
+    if (atomic_load(&g_pause_released)) return g_pause_frozen_ms;
+    return now_ms() - g_pause_t0;
+}
+#define PAUSE_POLLS 300u   /* well past the 100 ms timeout's worth of polls (64 yields, then one per millisecond) */
+
 int main(int argc, char** argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
     const char* mode = argc > 1 ? argv[1] : "ordered";
     if (argc > 2) g_timeout_ms = (unsigned)atoi(argv[2]);
-    const int no_walker = !strcmp(mode, "no-walker");
+    const int paused = !strcmp(mode, "paused");
+    const int no_walker = !strcmp(mode, "no-walker") || paused;
     g_mode_ordered = strcmp(mode, "control") != 0;
     const uint32_t vm_size = ppu_hle_inject_base + 0x10000u;
     vm_base = (uint8_t*)calloc(1, vm_size);
@@ -247,8 +265,19 @@ int main(int argc, char** argv)
           (ppu_store_window >> 32) == CELL_GCM_MAX_LABEL_COUNT * GCM_LABEL_STRIDE,
           "the first pass registered the store hook for the 256-label window");
 
+    if (paused) {
+        g_pause_t0 = now_ms();
+        cellGcm_set_host_pause_clock(fixture_paused_ms);
+    }
     pthread_t ppu;
     pthread_create(&ppu, NULL, ppu_thread, NULL);
+    if (paused) {
+        /* The store has waited PAUSE_POLLS polls, far longer than the timeout in wall time, and has not stopped. */
+        while (atomic_load(&g_pause_polls) < PAUSE_POLLS) sched_yield();
+        printf("[gcm_label_store paused] still waiting after %u polls\n", atomic_load(&g_pause_polls));
+        g_pause_frozen_ms = now_ms() - g_pause_t0;
+        atomic_store(&g_pause_released, 1);          /* the pause is over: the clock runs, and the wait expires */
+    }
     if (no_walker) {
         sleep(30);                                  /* the hook stops the process long before */
         puts("[FAIL] no stop");

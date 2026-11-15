@@ -3,11 +3,13 @@
 (libs/video/tests/test_gcm_label_store.c, which compiles cellGcmSys.c in).
 
 An equality ACQUIRE(N) on a label the title overwrites with N+1 as soon as it kicks the segment holding the
-ACQUIRE needs the RSX to read the kick first. Three runs of one fixture with a walker that is late on purpose:
+ACQUIRE needs the RSX to read the kick first. Four runs of one fixture with a walker that is late on purpose:
   control    a plain store: it overtakes the walker, which is held at ACQUIRE(N) (the failure, reproduced);
   ordered    the store goes through the hook the runtime registers: it waits for the walker, which passes
              ACQUIRE(N) against the old value, and the next frame's ACQUIRE(N+1) passes as well;
-  no-walker  nobody walks: gcm-wait-timeout what=rsx-walker-pass.
+  no-walker  nobody walks: gcm-wait-timeout what=rsx-walker-pass;
+  paused     nobody walks, and the host pause clock (cellGcm_set_host_pause_clock) holds the wait clock: the
+             store outlives the timeout many times over without stopping, and stops once the pause is over.
 """
 import os
 from pathlib import Path
@@ -29,13 +31,20 @@ with tempfile.TemporaryDirectory(prefix='gcm-label-store-') as tmp:
                     str(root / 'runtime/memory/label_window.c'),
                     str(root / 'libs/video/gcm_default_state.c'), *linker,
                     '-o', str(binary)], check=True)
-    for mode, timeout_ms, want in (('control', 2000, 0), ('ordered', 2000, 0), ('no-walker', 400, 70)):
+    for mode, timeout_ms, want in (('control', 2000, 0), ('ordered', 2000, 0), ('no-walker', 400, 70),
+                                   ('paused', 100, 70)):
         result = subprocess.run([str(binary), mode, str(timeout_ms)], timeout=60, capture_output=True, text=True)
         print(result.stdout.strip())
         if result.returncode != want:
             print(result.stderr[-2000:])
             raise SystemExit(f'test_gcm_label_store {mode}: exit {result.returncode}, want {want}')
-        if mode == 'no-walker' and ('what=rsx-walker-pass' not in result.stdout or
-                                    'func=cellGcm_label_store' not in result.stdout):
-            raise SystemExit('test_gcm_label_store no-walker: the stop does not name the label-store wait')
+        if mode in ('no-walker', 'paused') and ('what=rsx-walker-pass' not in result.stdout or
+                                                'func=cellGcm_label_store' not in result.stdout):
+            raise SystemExit(f'test_gcm_label_store {mode}: the stop does not name the label-store wait')
+        if mode == 'paused':
+            # The pause held the clock through PAUSE_POLLS polls (far more wall time than the 100 ms timeout):
+            # the fixture says so before the stop, and the stop only follows the pause's end.
+            still, stop = result.stdout.find('still waiting after'), result.stdout.find('[STOP]')
+            if still < 0 or stop < still:
+                raise SystemExit('test_gcm_label_store paused: the wait stopped while the host pause was held')
     print('[gcm_label_store] PASS')
