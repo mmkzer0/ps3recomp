@@ -46,7 +46,6 @@ namespace {
 constexpr auto kRelaxed = std::memory_order_relaxed;
 
 constexpr std::size_t kPoolFixtures = 4;                 /* fixture buffers kept for the workers */
-constexpr std::uint64_t kMaxFixturesPerImage = 16;       /* docs/SPU_XDIFF.md section 11 */
 constexpr unsigned kAuditStack = 8u << 20;               /* the shadow runs lifted code; as a worker's stack */
 
 /* ---- settings ---------------------------------------------------------------- */
@@ -155,6 +154,36 @@ void name_unfinished(ImageAudit& image, std::uint64_t fingerprint, std::uint32_t
 
 /* ---- the audit thread ------------------------------------------------------------------ */
 
+/* Writes the sample's fixture with its verdict record under the image's bound, which differences and void /
+ * unlifted-branch share; returns the path, or "none". The name is the sample's (section 7.2), so the fixture a void
+ * leaves replays offline to the same verdict at the same subject pc. */
+std::string write_fixture(const Settings& cfg, Sample& s, const spu_xdiff_verdict_record& rec)
+{
+    ImageAudit& image = *s.image;
+    if (cfg.dir.empty()) return "none";
+    if (image.fixtures.load(kRelaxed) >= kMaxFixturesPerImage) {
+        image.fixtures_over.fetch_add(1, kRelaxed);
+        return "none";
+    }
+
+    char name[64];
+    spu_xdiff_fixture_name(name, sizeof name, s.fingerprint, s.queue, s.seq);
+    std::string file = cfg.dir;
+    if (file.back() != '/') file += '/';
+    file += name;
+    s.fixture.has_verdict = 1;
+    s.fixture.verdict = rec;
+    spu_xdiff_error err{};
+    if (spu_xdiff_fixture_write(&s.fixture, file.c_str(), &err) == 0) {
+        image.fixtures.fetch_add(1, kRelaxed);
+        return file;
+    }
+    image.fixtures_failed.fetch_add(1, kRelaxed);
+    std::fprintf(stderr, "[jq2-xdiff] fixture-failed image=%s queue=%u seq=%u reason=%s detail=%s\n",
+                 fingerprint_text(s.fingerprint).c_str(), s.queue, s.seq, spu_xdiff_reason_id(err.reason), err.detail);
+    return "none";
+}
+
 /* A difference: the named line and the fixture. Returns the fixture's path, or "none". The verdict is counted and the
  * fixture written before any stop, so a stopped run leaves the same evidence as one that goes on. */
 std::string report_divergence(const Settings& cfg, Sample& s, const spu_xdiff_verdict_record& rec, std::uint32_t subject_tier)
@@ -164,30 +193,7 @@ std::string report_divergence(const Settings& cfg, Sample& s, const spu_xdiff_ve
     (klass == static_cast<std::uint32_t>(SPU_XDIFF_CLASS_LATENT) ? image.differ_latent : image.differ_visible)
         .fetch_add(1, kRelaxed);
 
-    std::string path = "none";
-    if (!cfg.dir.empty()) {
-        if (image.fixtures.load(kRelaxed) >= kMaxFixturesPerImage) {
-            image.fixtures_over.fetch_add(1, kRelaxed);
-        } else {
-            char name[64];
-            spu_xdiff_fixture_name(name, sizeof name, s.fingerprint, s.queue, s.seq);
-            std::string file = cfg.dir;
-            if (file.back() != '/') file += '/';
-            file += name;
-            s.fixture.has_verdict = 1;
-            s.fixture.verdict = rec;
-            spu_xdiff_error err{};
-            if (spu_xdiff_fixture_write(&s.fixture, file.c_str(), &err) == 0) {
-                image.fixtures.fetch_add(1, kRelaxed);
-                path = file;
-            } else {
-                image.fixtures_failed.fetch_add(1, kRelaxed);
-                std::fprintf(stderr, "[jq2-xdiff] fixture-failed image=%s queue=%u seq=%u reason=%s detail=%s\n",
-                             fingerprint_text(s.fingerprint).c_str(), s.queue, s.seq, spu_xdiff_reason_id(err.reason),
-                             err.detail);
-            }
-        }
-    }
+    const std::string path = write_fixture(cfg, s, rec);
 
     char effect[16] = "none", where[16] = "none";
     if (rec.effect_index != SPU_XDIFF_NO_EFFECT) std::snprintf(effect, sizeof effect, "%u", rec.effect_index);
@@ -201,6 +207,50 @@ std::string report_divergence(const Settings& cfg, Sample& s, const spu_xdiff_ve
                  path.c_str());
     std::fflush(stderr);
     return path;
+}
+
+/* A void / unlifted-branch: the subject reached a local store address no lifted code covers, which is the image's
+ * coverage frontier and the one void worth a fixture. The first address of an image is named by the reason's line (once
+ * per image and reason), every further distinct one by a line of its own, and each gets one fixture attempt -- at most
+ * one per address and kMaxFixturesPerImage per image across differences and voids. The set is bounded by the same
+ * number: an address past it can get no fixture, so it is not remembered, its sample is counted by the verdict's
+ * reason (and by fixtures_over once the image's fixture bound is spent), and one line per image says so. The audit
+ * thread alone reaches a replay verdict, so void_pcs is plain state. */
+void report_void_branch(const Settings& cfg, Sample& s, const spu_xdiff_verdict_record& rec)
+{
+    ImageAudit& image = *s.image;
+    VoidPcs& pcs = image.void_pcs;
+    if (pcs.count == pcs.pc.size()) {
+        /* The set is full, so this sample's address can be neither remembered nor compared with the remembered ones,
+         * and one fixture per address forbids writing for it. When the image's fixture bound is spent (the normal
+         * case: the set fills at the same number), the sample is counted as past the bound, as a difference would be. */
+        if (!cfg.dir.empty() && image.fixtures.load(kRelaxed) >= kMaxFixturesPerImage)
+            image.fixtures_over.fetch_add(1, kRelaxed);
+        if (!pcs.named_over) {
+            pcs.named_over = true;
+            std::fprintf(stderr,
+                         "[jq2-xdiff] void-pc-over image=%s reason=%s detail=%zu distinct subject pcs are already "
+                         "named for the image; further gaps are counted, not named\n",
+                         fingerprint_text(s.fingerprint).c_str(), spu_xdiff_reason_id(rec.reason), pcs.count);
+        }
+        return;
+    }
+    bool fresh = true;
+    for (std::size_t i = 0; i < pcs.count; ++i)
+        if (pcs.pc[i] == rec.subject_pc) fresh = false;
+    if (!fresh) return;
+    pcs.pc[pcs.count++] = rec.subject_pc;
+
+    if (!image.named_void[rec.reason].exchange(true, kRelaxed)) {
+        std::fprintf(stderr, "[jq2-xdiff] void image=%s queue=%u seq=%u reason=%s subject_pc=0x%05X\n",
+                     fingerprint_text(s.fingerprint).c_str(), s.queue, s.seq, spu_xdiff_reason_id(rec.reason),
+                     rec.subject_pc);
+    } else {
+        std::fprintf(stderr, "[jq2-xdiff] void-pc image=%s queue=%u seq=%u reason=%s subject_pc=0x%05X\n",
+                     fingerprint_text(s.fingerprint).c_str(), s.queue, s.seq, spu_xdiff_reason_id(rec.reason),
+                     rec.subject_pc);
+    }
+    write_fixture(cfg, s, rec);
 }
 
 /* True when the class of a difference is set to stop the run. */
@@ -259,6 +309,8 @@ void process(const Settings& cfg, spu_xdiff_shadow* shadow, Sample& s)
     if (verdict == static_cast<std::uint32_t>(SPU_XDIFF_DIFFER)) {
         fixture = report_divergence(cfg, s, rec, opt.subject_tier);
         stop = stops_run(cfg, rec, s.fixture.unit.profile);
+    } else if (verdict == static_cast<std::uint32_t>(SPU_XDIFF_VOID) && rec.reason == SPU_XDIFF_R_UNLIFTED_BRANCH) {
+        report_void_branch(cfg, s, rec); /* the coverage frontier: named by pc, with a fixture */
     } else if (verdict != static_cast<std::uint32_t>(SPU_XDIFF_EQUAL)) {
         name_unfinished(image, s.fingerprint, s.queue, s.seq, verdict, rec.reason, nullptr);
     }

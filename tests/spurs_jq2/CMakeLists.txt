@@ -257,6 +257,10 @@ if(NOT WIN32)
     #   jq2_exec_xdiff_audit_ineligible    no twin, no body, no inventory, event branches: counted, named once, never queued
     #   jq2_exec_xdiff_audit_host_fault    a named stop inside a shadow is void / host-fault and the run goes on
     #   jq2_exec_xdiff_audit_fixtures_cap  16 fixtures per image, the rest counted
+    #   jq2_exec_xdiff_audit_gap           a lifted shadow that ends at an address no lifted code covers: one fixture and
+    #                                      one named `subject_pc` per distinct address, the fixture replaying to the void
+    #   jq2_exec_xdiff_audit_gap_cap       more distinct addresses than the fixture bound: 16 fixtures and lines, one
+    #                                      `void-pc-over` line, the rest counted
     #   jq2_exec_xdiff_audit_baddir        an unusable directory: one line, differences named without a fixture
     #   jq2_exec_xdiff_audit_lifted        spu.job_body=lifted: the registered body is the authority, the interpreter the shadow
     #   jq2_exec_xdiff_audit_period        period 3 counts per image from its first job
@@ -267,8 +271,8 @@ if(NOT WIN32)
     #   jq2_exec_xdiff_audit_shared        capture and audit on: one identification, one recording
     #   jq2_exec_xdiff_audit_refused       a behaviour-changing knob refuses the audit
     foreach(mode audit-divergence audit-latent audit-stop audit-stop-latent audit-full audit-all audit-concurrent audit-oversize
-                  audit-shutdown audit-ineligible audit-host-fault audit-fixtures-cap audit-baddir audit-lifted audit-period
-                  audit-trace audit-trace-lifted audit-trace-none audit-shared audit-refused audit-ordinal audit-alloc-fail)
+                  audit-shutdown audit-ineligible audit-host-fault audit-fixtures-cap audit-gap audit-gap-cap audit-baddir audit-lifted
+                  audit-period audit-trace audit-trace-lifted audit-trace-none audit-shared audit-refused audit-ordinal audit-alloc-fail)
         string(REPLACE "audit-" "xdiff-audit-" mode_name "${mode}")
         string(REPLACE "-" "_" name "${mode_name}")
         add_test(NAME jq2_exec_${name} COMMAND test_jq2_executor ${mode})

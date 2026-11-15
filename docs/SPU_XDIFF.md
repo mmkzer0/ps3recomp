@@ -1145,8 +1145,23 @@ credit the job                     -- queue -->  build the shadow context
   much.
 - **The authority's result is always the one the guest sees.** A divergence
   never changes the run. It is reported with a named diagnostic, a counter
-  and, when `spu.xdiff_dir` is set, a fixture with a `VRDT` section; at most
-  16 fixtures per image are written, further divergences are counted.
+  and, when `spu.xdiff_dir` is set, a fixture with a `VRDT` section. A
+  `void` / `unlifted-branch` — the subject reached a local store address no
+  lifted code covers, while the authority finished — is the image's coverage
+  frontier and gets the same evidence: the sample's fixture (same name, same
+  writer, `VRDT` carrying the verdict, the reason and `subject_pc`), so the
+  frontier replays offline to the same void at the same address (section 13
+  prints it as `pc`). At most **16 fixtures per image** are written, across
+  divergences and these voids together, and further samples are counted;
+  within that bound at most **one fixture per (image, subject pc)**, so a job
+  loop that hits one gap writes one file however many jobs hit it. The
+  address is named too: the first such void of an image prints the reason's
+  line with `subject_pc=0x%05X`, each further distinct address a `void-pc`
+  line of its own. The set of addresses is bounded by the fixture bound (16),
+  because an address past it could have no fixture; a `void-pc-over` line,
+  once per image, says the remaining gaps are counted (by reason and by the
+  fixture counters) and not named. Every other `void` reason is counted and
+  named once per image and reason, and writes nothing.
 - **`stop`** ends the run on a `differ` with a new stop kind,
   `spu-xdiff-divergence`, from the audit thread and so after the job was
   credited. Fields: `image reason effect authority subject queue seq
