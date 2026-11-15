@@ -49,6 +49,35 @@ extern "C" {
  * removed, never for an addition. */
 #define PS3_CONFIG_SCHEMA_VERSION 2
 
+/* Platform defaults of ppu.host_stack_mb, spu.host_stack_mb and spu.dispatch_stack_mb (config_options.def). A macro,
+ * not a table row, because the registry takes the default as an expression and iOS differs from the other hosts.
+ *
+ * iOS: the app's address space is small (no extended-VA entitlement) and a 256 MB reservation per guest thread
+ * is refused 41-86 times a run and starves later Metal allocations; 32 MB left no refused reservation and no
+ * failed allocation in 3 of 3 device runs. PROVISIONAL: 32 is a measurement of what the host tolerates, not of
+ * what the guest needs; revisit it with the per-thread high-water report (PS3_HOST_STACK_HWM, docs/DIAGNOSTICS.md)
+ * from a device run. Every other host keeps the 256 MB reserve the runtime always had.
+ *
+ * spu.host_stack_mb is the stack of every thread that runs lifted SPU code: group members, raw SPUs, SPURS
+ * policy workers and job chains, JobQueue2 workers, the xdiff audit. Before it covered them they had 16 (group
+ * members), 8 (raw SPU, JobQueue2, audit) and 1 MB (SPURS workers and job chains). Desktop: 16 everywhere. iOS: 8,
+ * the size the JobQueue2 workers and raw SPUs always ran on, which keeps the worst case of one JobQueue2 queue (8
+ * workers), one SPURS instance (6 policy workers), 6 raw SPUs, 6 group members and the audit thread (27 threads)
+ * at about 216 MB of address space, what those threads reserved together before (about 214 MB); 16 would make it
+ * about 430 MB. A second queue or SPURS instance adds its own. Provisional like the others. */
+#if defined(__APPLE__)
+#  include <TargetConditionals.h>
+#endif
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+#  define PS3_CFG_PPU_HOST_STACK_MB_DEFAULT 32
+#  define PS3_CFG_SPU_DISPATCH_STACK_MB_DEFAULT 32   /* same reasoning and same provisional status as the PPU's */
+#  define PS3_CFG_SPU_HOST_STACK_MB_DEFAULT 8
+#else
+#  define PS3_CFG_PPU_HOST_STACK_MB_DEFAULT 256
+#  define PS3_CFG_SPU_DISPATCH_STACK_MB_DEFAULT 256  /* the Bink SPU decoder's brsl chains need it */
+#  define PS3_CFG_SPU_HOST_STACK_MB_DEFAULT 16
+#endif
+
 /* Validators for string options (see config_options.def). */
 enum {
     PS3_CFG_V_NONE = 0,
@@ -94,6 +123,17 @@ const ps3_config* ps3_config_get(void);
 #undef PS3_CFG_BOOL
 #undef PS3_CFG_U32
 #undef PS3_CFG_STR
+
+/* The host stack of a thread that runs guest code, in bytes: ppu.host_stack_mb for a thread that enters guest PPU
+ * code (guest PPU threads and the host threads that deliver guest callbacks), spu.host_stack_mb for one that runs
+ * SPU code, spu.dispatch_stack_mb for the SPURS async-dispatch threads. Every such thread takes its size from
+ * here and ends the run with ps3_stop_host_thread_stack (stop.h) when the host refuses it. */
+static inline size_t ps3_ppu_host_stack_bytes(void) { return (size_t)ps3_cfg_ppu_host_stack_mb() * 1024u * 1024u; }
+static inline size_t ps3_spu_host_stack_bytes(void) { return (size_t)ps3_cfg_spu_host_stack_mb() * 1024u * 1024u; }
+static inline size_t ps3_spu_dispatch_stack_bytes(void)
+{
+    return (size_t)ps3_cfg_spu_dispatch_stack_mb() * 1024u * 1024u;
+}
 
 /* Load the configuration: defaults, then the file, then the environment.
  * `path` is the title's own config file or NULL for none; PS3RECOMP_CONFIG,

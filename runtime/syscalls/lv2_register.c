@@ -14,6 +14,10 @@
 #include "ps3emu/nid.h"   /* ps3_compute_nid (static inline) */
 #include "lv2_syscall_table.h"
 #include "lv2_lock_line.h"
+#include "ps3emu/config.h"   /* spu.host_stack_mb */
+#include "ps3emu/stop.h"     /* ps3_stop_host_thread_stack */
+#include "ps3emu/host_stack.h"          /* ps3_host_pthread_create */
+#include "ps3emu/host_stack_report.h"   /* PS3_HOST_STACK_HWM: group members' high-water marks */
 #include "sys_ppu_thread.h"
 #include "sys_mutex.h"
 #include "sys_cond.h"
@@ -701,35 +705,23 @@ static int64_t sys_spu_thread_initialize_handler(ppu_context* ctx)
     return 0;
 }
 
-/* Reserved stack for an SPU host thread. Lifted SPU code turns a guest loop
- * into a chain of host calls, so a thread that gets the host default -- 512 KB
- * on Darwin against 16 MB on Windows -- dies inside code that has done nothing
- * wrong. SPU_HOST_STACK_BIG raises it further for chasing a runaway chain. */
-static size_t spu_host_stack_bytes(void)
-{
-    return getenv("SPU_HOST_STACK_BIG") ? (size_t)512 * 1024 * 1024
-                                   : (size_t)16 * 1024 * 1024;
-}
+/* Reserved stack for an SPU host thread (spu.host_stack_mb, ps3_spu_host_stack_bytes). Lifted SPU code turns a
+ * guest loop into a chain of host calls, so a thread that gets the host default -- 512 KB on Darwin against 16 MB
+ * on Windows -- dies inside code that has done nothing wrong. A host that refuses the reservation ends the run
+ * (host-thread-stack): the thread used to start on the host default instead, and the first deep chain of lifted
+ * calls then faulted far from the cause. */
+
+/* PS3_HOST_STACK_HWM: the group members' high-water marks, at their exit and in the process-exit summary. */
+static ps3_hs_reporter s_spu_hs = PS3_HS_REPORTER_INIT("spu");
+static void spu_hs_summary(void) { ps3_hs_summary(&s_spu_hs); }
 
 #ifndef _WIN32
-/* pthread_create with that stack, falling back to the host default if the size
- * is refused -- a thread with a small stack beats no thread at all. Returns the
- * errno of the attempt that failed, so a caller can tell the guest its start
- * did not happen instead of marking the thread running and joining a pthread_t
- * that pthread_create never wrote. */
-PS3_NODISCARD static int spu_spawn_host_thread(spu_thread_handle_t* out,
-                                               void* (*fn)(void*), void* arg)
+/* `tid` is the guest's id of the SPU thread, for the stop. */
+static void spu_spawn_host_thread(spu_thread_handle_t* out, void* (*fn)(void*), void* arg, uint32_t tid)
 {
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    int rc = EINVAL;
-    if (pthread_attr_setstacksize(&attr, spu_host_stack_bytes()) == 0) {
-        rc = pthread_create(out, &attr, fn, arg);
-    }
-    pthread_attr_destroy(&attr);
+    const int rc = ps3_host_pthread_create(out, ps3_spu_host_stack_bytes(), 0, fn, arg);
     if (rc != 0)
-        rc = pthread_create(out, NULL, fn, arg);
-    return rc;
+        ps3_stop_host_thread_stack("spu", tid, ps3_spu_host_stack_bytes(), rc);
 }
 #endif
 
@@ -771,6 +763,7 @@ static void* spu_exec_thread_proc(void* arg)
     spu_thread_t* t = (spu_thread_t*)arg;
     { const spu_group_t* g = spu_find_group(t->group_id);
       ps3_thread_name("spu %s:%u", g && g->name[0] ? g->name : "group", t->index); }
+    const int hs = ps3_hs_begin(&s_spu_hs, t->tid, ps3_spu_host_stack_bytes(), spu_hs_summary);
     spu_lifted_thread_result r;
     spu_lifted_thread_run(t->sctx, &r);
     t->exit_status = r.exit_status;
@@ -785,6 +778,8 @@ static void* spu_exec_thread_proc(void* arg)
             g->cause = SPU_GROUP_CAUSE_GROUP_EXIT;
         }
     }
+    /* The mark is read before the thread publishes its end: group_join may free the slot the moment it does. */
+    ps3_hs_end(&s_spu_hs, hs);
     spu_thread_finish(t);
 #ifdef _WIN32
     return 0;
@@ -806,6 +801,7 @@ static void* spu_fallback_thread_proc(void* arg)
     spu_thread_t* t = (spu_thread_t*)arg;
     { const spu_group_t* g = spu_find_group(t->group_id);
       ps3_thread_name("spu-hle %s:%u", g && g->name[0] ? g->name : "group", t->index); }
+    const int hs = ps3_hs_begin(&s_spu_hs, t->tid, ps3_spu_host_stack_bytes(), spu_hs_summary);
     int32_t rc = 0;
     if (t->fb_handler) {
         rc = t->fb_handler(t->tid, t->args_ea, t->args_size, t->fb_user);
@@ -822,6 +818,8 @@ static void* spu_fallback_thread_proc(void* arg)
         fprintf(stderr, "[SPU-DONE-EVT] tid=0x%X rc=0x%X -> queue=%u\n",
                 t->tid, rc, t->connected_queue);
     }
+    /* The mark is read before the thread publishes its end: group_join may free the slot the moment it does. */
+    ps3_hs_end(&s_spu_hs, hs);
     /* Mark complete and signal anyone waiting in group_join. */
     spu_thread_finish(t);
 #ifdef _WIN32
@@ -1109,28 +1107,16 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
                     t->finish_event = CreateEventA(NULL, TRUE, FALSE, NULL);
                 else
                     ResetEvent(t->finish_event);
-                t->host_thread = CreateThread(NULL, spu_host_stack_bytes(),
+                t->host_thread = CreateThread(NULL, ps3_spu_host_stack_bytes(),
                                               spu_exec_thread_proc, t,
                                               STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+                if (!t->host_thread)
+                    ps3_stop_host_thread_stack("spu", t->tid, ps3_spu_host_stack_bytes(), ps3_host_thread_error());
 #else
                 pthread_mutex_init(&t->finish_event.mu, NULL);
                 pthread_cond_init(&t->finish_event.cv, NULL);
                 t->finish_event.done = 0;
-                if (spu_spawn_host_thread(&t->host_thread, spu_exec_thread_proc, t) != 0) {
-                    /* The guest asked for the group to start and no host thread
-                     * runs this SPU: report the resource exhaustion the same way
-                     * sys_ppu_thread_create does. Leave t->running 0 so
-                     * group_join never waits on, or pthread_joins, a handle
-                     * pthread_create did not write. */
-                    pthread_mutex_destroy(&t->finish_event.mu);
-                    pthread_cond_destroy(&t->finish_event.cv);
-                    spu_thread_set_running(t, 0);
-                    fprintf(stderr, "[SPU] group_start id=0x%X tid=0x%X: "
-                            "host thread creation failed -> CELL_EAGAIN\n", id, t->tid);
-                    fflush(stderr);
-                    ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EAGAIN;
-                    return (int64_t)(int32_t)CELL_EAGAIN;
-                }
+                spu_spawn_host_thread(&t->host_thread, spu_exec_thread_proc, t, t->tid);
 #endif
                 fprintf(stderr, "[SPU] group_start id=0x%X tid=0x%X entry=0x%08X "
                         "args=0x%08X -> LIFTED SPU execution (image %d, "
@@ -1241,26 +1227,16 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
             t->finish_event = CreateEventA(NULL, TRUE, FALSE, NULL);
         else
             ResetEvent(t->finish_event);
-        t->host_thread = CreateThread(NULL, spu_host_stack_bytes(),
+        t->host_thread = CreateThread(NULL, ps3_spu_host_stack_bytes(),
                                       spu_fallback_thread_proc, t,
                                       STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+        if (!t->host_thread)
+            ps3_stop_host_thread_stack("spu", t->tid, ps3_spu_host_stack_bytes(), ps3_host_thread_error());
 #else
         pthread_mutex_init(&t->finish_event.mu, NULL);
         pthread_cond_init(&t->finish_event.cv, NULL);
         t->finish_event.done = 0;
-        if (spu_spawn_host_thread(&t->host_thread, spu_fallback_thread_proc, t) != 0) {
-            /* Same resource exhaustion as the lifted path above: tell the guest
-             * the group did not start and do not leave a thread marked running
-             * whose pthread_t group_join would later join. */
-            pthread_mutex_destroy(&t->finish_event.mu);
-            pthread_cond_destroy(&t->finish_event.cv);
-            spu_thread_set_running(t, 0);
-            fprintf(stderr, "[SPU] group_start id=0x%X tid=0x%X: "
-                    "host thread creation failed -> CELL_EAGAIN\n", id, t->tid);
-            fflush(stderr);
-            ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EAGAIN;
-            return (int64_t)(int32_t)CELL_EAGAIN;
-        }
+        spu_spawn_host_thread(&t->host_thread, spu_fallback_thread_proc, t, t->tid);
 #endif
         /* Start handshake for a persistent worker: do not let group_start
          * return until the worker has published its live context.

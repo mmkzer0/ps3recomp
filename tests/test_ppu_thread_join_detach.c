@@ -27,6 +27,7 @@ uint32_t vm_read32(uint64_t a) { uint32_t v; memcpy(&v, vm_base + (uint32_t)a, 4
 
 #define TEST_INITIAL_VSCR 0x00010000u
 uint32_t ps3_ppu_initial_vscr(void) { return TEST_INITIAL_VSCR; }
+#include "ppu_thread_config_stub.h"   /* ppu.host_stack_mb */
 _Noreturn void ps3_stop(ps3_stop_kind kind, const char* what, const char* remedy,
                         const ps3_stop_field* fields, size_t nfields,
                         const ps3_stop_site* site)

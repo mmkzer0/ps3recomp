@@ -85,6 +85,9 @@ def test_defaults_without_file_or_environment():
         "ppu.opd_swap_fixup": ("false", "default"),
         "ppu.null_page": ('"stop"', "default"),
         "ppu.precise_usleep": ("true", "default"),
+        "ppu.host_stack_mb": ("256", "default"),      # iOS: 32 (tools/test_host_stack_defaults.py)
+        "spu.host_stack_mb": ("16", "default"),
+        "spu.dispatch_stack_mb": ("256", "default"),      # iOS: 32 (tools/test_host_stack_defaults.py)
         "spu.dma_repeat_limit": ("256", "default"),
         "spu.dma_repeat_stop_secs": ("0", "default"),
         "spu.job_body": ('"interp"', "default"),
@@ -173,6 +176,33 @@ def test_park_grace_out_of_range_stops():
         assert f["key"] == "gcm.park_grace_ms" and "out of range" in f["detail"], (bad, f)
 
 
+def test_host_stack_sizes_come_from_file_and_environment():
+    # Typed keys, no environment knob of their own: SPU_HOST_STACK_BIG is not read any more.
+    with Cfg("schema = 2", "[ppu]", "host_stack_mb = 64", "[spu]", "host_stack_mb = 512",
+             "dispatch_stack_mb = 128") as c:
+        o = options(probe("--load", c.path, "get"))
+        assert o["ppu.host_stack_mb"] == ("64", f"file:{c.path}"), o
+        assert o["spu.host_stack_mb"] == ("512", f"file:{c.path}"), o
+        assert o["spu.dispatch_stack_mb"] == ("128", f"file:{c.path}"), o
+        o = options(probe("--load", c.path, "get", PS3RECOMP_PPU_HOST_STACK_MB="2048", PS3RECOMP_SPU_HOST_STACK_MB="1",
+                          PS3RECOMP_SPU_DISPATCH_STACK_MB="2048"))
+        assert o["ppu.host_stack_mb"] == ("2048", "env:PS3RECOMP_PPU_HOST_STACK_MB"), o
+        assert o["spu.host_stack_mb"] == ("1", "env:PS3RECOMP_SPU_HOST_STACK_MB"), o
+        assert o["spu.dispatch_stack_mb"] == ("2048", "env:PS3RECOMP_SPU_DISPATCH_STACK_MB"), o
+    o = options(probe("get", SPU_HOST_STACK_BIG="1"))
+    assert o["spu.host_stack_mb"] == ("16", "default"), o
+
+
+def test_host_stack_sizes_out_of_range_stop():
+    # PPU 1..2048 (the Windows thread API takes the size in 32 bits), SPU 1..1024, dispatch 1..2048.
+    for key, env, bads in (("ppu.host_stack_mb", "PS3RECOMP_PPU_HOST_STACK_MB", ("0", "2049", "4294967295")),
+                           ("spu.host_stack_mb", "PS3RECOMP_SPU_HOST_STACK_MB", ("0", "1025", "4294967295")),
+                           ("spu.dispatch_stack_mb", "PS3RECOMP_SPU_DISPATCH_STACK_MB", ("0", "2049", "4294967295"))):
+        for bad in bads:
+            f = config_invalid(probe("get", **{env: bad}))
+            assert f["key"] == key and "out of range" in f["detail"], (key, bad, f)
+
+
 def test_ps3recomp_config_names_the_file_and_beats_the_title_path():
     with Cfg("schema = 2", "[ppu]", "vscr_nj = false") as title, \
          Cfg("schema = 2", "[diag]", "dump_config = false") as operator:
@@ -200,6 +230,9 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
             "ppu.opd_swap_fixup": "default",
             "ppu.null_page": "default",
             "ppu.precise_usleep": "default",
+            "ppu.host_stack_mb": "default",
+            "spu.host_stack_mb": "default",
+            "spu.dispatch_stack_mb": "default",
             "spu.dma_repeat_limit": "default",
             "spu.dma_repeat_stop_secs": "default",
             "spu.job_body": "default",
@@ -244,8 +277,9 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
             doc = tomllib.loads(p.stdout)
             assert doc == {"schema": 2,
                            "ppu": {"vscr_nj": False, "opd_swap_fixup": False, "null_page": "stop",
-                                   "precise_usleep": True},
-                           "spu": {"dma_repeat_limit": 256, "dma_repeat_stop_secs": 0,
+                                   "precise_usleep": True, "host_stack_mb": 256},
+                           "spu": {"host_stack_mb": 16, "dispatch_stack_mb": 256, "dma_repeat_limit": 256,
+                                   "dma_repeat_stop_secs": 0,
                                    "job_body": "interp", "xdiff_dir": "",
                                    "xdiff_capture": 0, "xdiff": "off", "xdiff_period": 64,
                                    "xdiff_on_divergence": "report", "xdiff_on_latent": "report",

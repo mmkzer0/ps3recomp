@@ -61,7 +61,9 @@
 #include <timeapi.h>
 #endif
 
-#include "ps3emu/config.h"   /* ps3_config_load */
+#include "ps3emu/config.h"   /* ps3_config_load, ppu.host_stack_mb */
+#include "ps3emu/host_stack.h"   /* ps3_host_pthread_create */
+#include "ps3emu/stop.h"         /* ps3_stop_host_thread_stack */
 
 /* ---------------------------------------------------------------------------
  * What the scaffold gives this file
@@ -397,7 +399,7 @@ static void harness_guest_caller(uint32_t opd, uint64_t a0, uint64_t a1,
  * frame clock blocked in its first rsx_backend_init, no vblank or flip was
  * ever delivered and the FIFO never drained. A title that waits for a flip
  * hangs there. So the guest runs on a thread of its own, with the same
- * 256 MB host stack every guest thread gets (sys_ppu_thread.c), and the
+ * host stack every guest thread gets (ppu.host_stack_mb, sys_ppu_thread.c), and the
  * main thread turns the run loop until ppu_run returns. Headless runs never
  * touch the main queue, which is why CI does not see the difference. */
 struct guest_run { uint32_t entry, stack_top; int rc; volatile int done; };
@@ -415,16 +417,11 @@ static int run_guest(uint32_t entry, uint32_t stack_top)
 {
     static guest_run g;
     g.entry = entry; g.stack_top = stack_top; g.rc = 0; g.done = 0;
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr, 256u * 1024u * 1024u);
     pthread_t th;
-    int err = pthread_create(&th, &attr, guest_thread, &g);
-    pthread_attr_destroy(&attr);
-    if (err != 0) {
-        fprintf(stderr, "[boot] could not start the guest thread (%d)\n", err);
-        return -1;
-    }
+    const size_t bytes = ps3_ppu_host_stack_bytes();
+    const int err = ps3_host_pthread_create(&th, bytes, 0, guest_thread, &g);
+    if (err != 0)
+        ps3_stop_host_thread_stack("ppu", 0, bytes, err);   /* the guest's own thread: no guest id yet */
     /* Short slices: CFRunLoopStop only ends a run that is already going. */
     while (!__atomic_load_n(&g.done, __ATOMIC_ACQUIRE))
         CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, false);

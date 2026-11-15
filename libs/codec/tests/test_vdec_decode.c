@@ -30,9 +30,31 @@
  *                          held until EndSeq.
  * CODEC: avc | mpeg2.
  */
+#ifndef _WIN32
+#include <pthread.h>
+#include <sched.h>
+#endif
+#include "../vdec_ffmpeg.h"
+static int test_concurrent;
+static int idle_creates;
+#ifndef _WIN32
+static int count_attr_init(pthread_attr_t* attr)
+{
+    __atomic_add_fetch(&idle_creates, 1, __ATOMIC_RELAXED);
+    return pthread_attr_init(attr);
+}
+#define PS3_HOST_THREAD_ATTR_INIT count_attr_init
+#endif
+static VdecFf* test_ff_open(uint32_t codec);
+#define vdec_ff_open test_ff_open
 #include "../cellVdec.c"
+#undef vdec_ff_open
 #include "../vdec_ffmpeg.c"
 #include "../ffmpeg_runtime.c"
+static VdecFf* test_ff_open(u32 codec)
+{
+    return test_concurrent ? (VdecFf*)(uintptr_t)1 : vdec_ff_open(codec);
+}
 
 #include <math.h>
 #include <stdlib.h>
@@ -47,6 +69,11 @@ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
 void spu_coh_notify_write(uint32_t a) { (void)a; }
 void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
+/* ppu.host_stack_mb, for the idle thread's stack, and the stop of a host that refuses it. */
+const ps3_config* ps3_config_get(void) { static ps3_config c = { .ppu_host_stack_mb = 16 }; return &c; }
+_Noreturn void ps3_stop(ps3_stop_kind kind, const char* what, const char* remedy, const ps3_stop_field* fields,
+                        size_t nfields, const ps3_stop_site* site)
+{ (void)kind; (void)what; (void)remedy; (void)fields; (void)nfields; (void)site; abort(); }
 
 #define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); exit(1); } } while (0)
 
@@ -517,6 +544,32 @@ static int mode_idle(int argc, char** argv)
     return 0;
 }
 
+#ifndef _WIN32
+static int open_ready, open_go;
+static void* concurrent_open(void* arg)
+{
+    const u32 output = G_HANDLE + 0x100u + (u32)(uintptr_t)arg * 4u;
+    __atomic_add_fetch(&open_ready, 1, __ATOMIC_RELEASE);
+    while (!__atomic_load_n(&open_go, __ATOMIC_ACQUIRE)) sched_yield();
+    CHECK(cellVdecOpen((const CellVdecType*)(uintptr_t)G_TYPE, NULL, NULL,
+                      (CellVdecHandle*)(uintptr_t)output) == CELL_OK);
+    return NULL;
+}
+static int mode_once(void)
+{
+    test_concurrent = 1;
+    setenv("VDEC_IDLE_DRAIN_MS", "0", 1);
+    pthread_t callers[4];
+    for (unsigned i = 0; i < 4; ++i) CHECK(!pthread_create(&callers[i], NULL, concurrent_open, (void*)(uintptr_t)i));
+    while (__atomic_load_n(&open_ready, __ATOMIC_ACQUIRE) != 4) sched_yield();
+    __atomic_store_n(&open_go, 1, __ATOMIC_RELEASE);
+    for (unsigned i = 0; i < 4; ++i) pthread_join(callers[i], NULL);
+    CHECK(__atomic_load_n(&idle_creates, __ATOMIC_RELAXED) == 1);
+    puts("concurrent opens: one idle worker");
+    return 0;
+}
+#endif
+
 int main(int argc, char** argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -524,6 +577,9 @@ int main(int argc, char** argv)
     CHECK(vm_base);
     ppu_vm_size = MEM_SIZE;
     const char* mode = argc > 1 ? argv[1] : "stub";
+#ifndef _WIN32
+    if (strcmp(mode, "once") == 0) return mode_once();
+#endif
     if (strcmp(mode, "stub") == 0)   return mode_stub(argc, argv);
     if (strcmp(mode, "decode") == 0) return mode_decode(argc, argv);
     if (strcmp(mode, "rgba") == 0)   return mode_rgba(argc, argv);

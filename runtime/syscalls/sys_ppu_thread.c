@@ -1,3 +1,7 @@
+/* pthread_getattr_np (PS3_HOST_STACK_HWM) is a GNU extension. */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 /*
  * ps3recomp - PPU thread management syscalls (implementation)
  */
@@ -32,14 +36,10 @@ _Static_assert(PPU_THREAD_MAX == PPU_THREAD_SLOTS, "a thread id carries its slot
 #include <stdlib.h>   /* getenv (else return value truncated to int on x64) */
 #include "ps3emu/log_first.h"
 #include "ps3emu/thread_name.h"
-#ifndef _WIN32
 #include <errno.h>
-#endif
+#include "ps3emu/host_stack.h"   /* PS3_HOST_STACK_HWM: the stack bounds and its high-water mark */
+#include "ps3emu/config.h"   /* ppu.host_stack_mb */
 
-/* Host stack reserved per guest thread, for pthread_attr_setstacksize. The
- * same 256 MB the Win32 branch hands _beginthreadex a few hundred lines
- * down; keep the two in step so a stack-depth bug reproduces on both. */
-#define PPU_HOST_STACK_BYTES  (256u * 1024u * 1024u)
 
 #ifdef _WIN32
 #include <process.h>   /* _beginthreadex: CRT-aware thread creation (raw CreateThread
@@ -282,6 +282,127 @@ static void wait_first_block(const ppu_thread_info* t, uint64_t tid)
 }
 
 /* ---------------------------------------------------------------------------
+ * Host stack high-water mark (PS3_HOST_STACK_HWM=1, off by default)
+ *
+ * ppu.host_stack_mb is a guess until somebody measures what a guest thread's chain of lifted calls really uses.
+ * With the variable set, each created thread reports how deep its host stack went, once, at its exit, and the
+ * process-exit summary reports the threads still running. Nothing is pre-filled (that would commit the whole
+ * reservation) and nothing runs per call, so the default run pays nothing and a gated run pays one scan per
+ * thread exit.
+ *
+ * The measurement itself (ps3emu/host_stack.h) is exact to one host page, and a lower bound where the host can
+ * take a touched page away (iOS compresses cold pages).
+ * -----------------------------------------------------------------------*/
+static int      s_hs_gate = -1;      /* -1 unread; read once, under the table lock, by the first create */
+static unsigned s_hs_reported;       /* measurements printed (atomic) */
+static size_t   s_hs_max;            /* the largest of them (atomic) */
+static ppu_thread_host_stack_hook_fn s_hs_hook;
+
+static int host_stack_hwm_enabled(void)
+{
+    return __atomic_load_n(&s_hs_gate, __ATOMIC_RELAXED) > 0;
+}
+
+static ppu_thread_host_stack_hook_fn host_stack_hook_load(void)
+{
+#if defined(_MSC_VER) && !defined(__clang__)
+    return (ppu_thread_host_stack_hook_fn)InterlockedCompareExchangePointer((PVOID volatile*)&s_hs_hook, NULL, NULL);
+#else
+    return __atomic_load_n(&s_hs_hook, __ATOMIC_ACQUIRE);
+#endif
+}
+
+void ppu_thread_set_host_stack_hook(ppu_thread_host_stack_hook_fn fn)
+{
+#if defined(_MSC_VER) && !defined(__clang__)
+    InterlockedExchangePointer((PVOID volatile*)&s_hs_hook, (PVOID)fn);
+#else
+    __atomic_store_n(&s_hs_hook, fn, __ATOMIC_RELEASE);
+#endif
+}
+
+/* One measurement: a stderr line, the process-wide counters, the test hook. */
+static void host_stack_publish(uint64_t tid, const char* name, size_t reserved, int known, size_t high_water, int live)
+{
+    if (known)
+        fprintf(stderr, "[HOSTSTACK] tid=%llu name=\"%s\" %s reserved=%zu high_water=%zu (%.1f%%)\n",
+                (unsigned long long)tid, name, live ? "live" : "exited", reserved, high_water,
+                reserved ? 100.0 * (double)high_water / (double)reserved : 0.0);
+    else
+        fprintf(stderr, "[HOSTSTACK] tid=%llu name=\"%s\" %s reserved=%zu high_water=unknown\n",
+                (unsigned long long)tid, name, live ? "live" : "exited", reserved);
+    if (known) {
+        size_t seen = __atomic_load_n(&s_hs_max, __ATOMIC_RELAXED);
+        while (high_water > seen &&
+               !__atomic_compare_exchange_n(&s_hs_max, &seen, high_water, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+    }
+    __atomic_fetch_add(&s_hs_reported, 1u, __ATOMIC_RELAXED);
+    ppu_thread_host_stack_hook_fn hook = host_stack_hook_load();
+    if (hook) hook(tid, reserved, known ? high_water : 0, known, live);
+}
+
+/* The thread's own start, when the gate is on: remember where its host stack is, for the exit report and for
+ * the summary, which reads it from another thread. */
+static void host_stack_record_self(ppu_thread_info* t)
+{
+    if (!host_stack_hwm_enabled()) return;
+    uintptr_t lo;
+    size_t size;
+    if (!host_stack_range_self(&lo, &size)) return;
+    table_lock();
+    t->host_stack_lo   = lo;
+    t->host_stack_size = size;
+    table_unlock();
+}
+
+/* The thread's own exit, before it publishes its end: the stack and the slot are still its own. */
+static void host_stack_report_exit(const ppu_thread_info* t)
+{
+    if (!host_stack_hwm_enabled() || !t->host_stack_lo) return;
+    size_t hw = 0;
+    const int known = host_stack_high_water(t->host_stack_lo, t->host_stack_size, &hw);
+    host_stack_publish(t->ctx.thread_id, t->name, t->host_stack_req, known, hw, 0);
+}
+
+/* atexit and at_quick_exit (a guest exit goes through quick_exit): the threads still running, then one line for
+ * the process. The table lock keeps a slot from being reaped, and so its stack from being unmapped, while it is
+ * read. */
+static void host_stack_summary(void)
+{
+    table_lock();
+    for (int i = 1; i < PPU_THREAD_MAX; i++) {
+        const ppu_thread_info* t = &g_ppu_threads[i];
+        if (t->state != PPU_THREAD_STATE_RUNNING || !t->host_stack_lo) continue;
+        size_t hw = 0;
+        const int known = host_stack_high_water(t->host_stack_lo, t->host_stack_size, &hw);
+        host_stack_publish(t->ctx.thread_id, t->name, t->host_stack_req, known, hw, 1);
+    }
+    table_unlock();
+    fprintf(stderr, "[HOSTSTACK] summary: threads=%u max_high_water=%zu ppu.host_stack_mb=%u\n",
+            __atomic_load_n(&s_hs_reported, __ATOMIC_RELAXED), __atomic_load_n(&s_hs_max, __ATOMIC_RELAXED),
+            (unsigned)ps3_cfg_ppu_host_stack_mb());
+    fflush(stderr);
+}
+
+/* Read the gate once. Under the table lock, from sys_ppu_thread_create: every thread the gate concerns is made
+ * after this, so its reads of s_hs_gate are ordered after the write. */
+static void host_stack_gate_init_locked(void)
+{
+    if (__atomic_load_n(&s_hs_gate, __ATOMIC_RELAXED) >= 0) return;
+    /* PS3_HOST_STACK_HWM=1: report each created guest PPU thread's host-stack high-water mark (the span from the top
+     * of its stack to the lowest page it touched) as "[HOSTSTACK] tid=.. reserved=.. high_water=.." when the thread
+     * ends, and the threads still running plus one "[HOSTSTACK] summary" line at process exit; the SPU async-dispatch
+     * threads (runtime/spu/spu_workload.c) report the same way as "[HOSTSTACK] spu-dispatch ...". Unset, nothing is
+     * measured. Size ppu.host_stack_mb and spu.dispatch_stack_mb from it. */
+    const int on = getenv("PS3_HOST_STACK_HWM") != NULL;
+    if (on) {
+        atexit(host_stack_summary);
+        at_quick_exit(host_stack_summary);
+    }
+    __atomic_store_n(&s_hs_gate, on, __ATOMIC_RELAXED);
+}
+
+/* ---------------------------------------------------------------------------
  * Host thread entry point
  * -----------------------------------------------------------------------*/
 #ifdef _WIN32
@@ -292,6 +413,7 @@ static void* ppu_host_thread_proc(void* param)
 {
     ppu_thread_info* info = (ppu_thread_info*)param;
     ps3_thread_name("ppu %s", info->name);
+    host_stack_record_self(info);
 
 #ifdef _WIN32
     /* Reserve stack for the STACK_OVERFLOW handler, same as main() does for the
@@ -349,6 +471,7 @@ static void* ppu_host_thread_proc(void* param)
                 (unsigned long long)info->ctx.thread_id);
     }
 
+    host_stack_report_exit(info);
     ps3_tprof_thread_exit();
     /* Publish the end. The last access to `info` is under the table lock: once it is released a join or detach
      * may reap the slot (and a create reuse it) while this thread is still on its way out, so nothing below
@@ -622,6 +745,8 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
     t->stack_addr = stack_addr;
     t->stack_size = stack_size;
     t->entry_addr = entry;
+    t->host_stack_req = ps3_ppu_host_stack_bytes();
+    host_stack_gate_init_locked();
 
     /* Copy thread name if provided */
     if (name_addr != 0) {
@@ -685,20 +810,23 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
         return CELL_OK;
     }
 
-    /* Create the host thread. Give it a large RESERVED stack: each recompiled
-     * guest call is a real host call, so deep guest call chains nest deeply on
-     * the host stack and overflow the 1 MB default. Reserve 256 MB (committed
-     * lazily by the OS via STACK_SIZE_PARAM_IS_A_RESERVATION). */
+    /* Create the host thread. Give it a large RESERVED stack (ppu.host_stack_mb): each recompiled guest call is
+     * a real host call, so deep guest call chains nest deeply on the host stack and overflow the host default
+     * (1 MB on Windows, 512 KB on Darwin). It is address space, committed lazily by the OS. A host that refuses
+     * it ends the run (host-thread-stack): the thread used to start on the default stack, where a deep chain
+     * faulted far from the cause, and on iOS that fallback ran 41-86 times a run. */
 #ifdef _WIN32
     if (g_gate_on < 0) g_gate_on = getenv("PPU_THREADGATE") ? 1 : 0;
     /* Gate only guest worker threads (game .text entry), never libsre/system threads. */
     unsigned _initflag = STACK_SIZE_PARAM_IS_A_RESERVATION;
     int _gate_this = (g_gate_on > 0 && entry >= 0x10000 && entry < 0x10000000);
     if (_gate_this) _initflag |= CREATE_SUSPENDED;
-    t->host_thread = (HANDLE)_beginthreadex(NULL, 256u * 1024 * 1024,
+    t->host_thread = (HANDLE)_beginthreadex(NULL, (unsigned)t->host_stack_req,
                                   (unsigned (__stdcall*)(void*))ppu_host_thread_proc, t,
                                   _initflag, (unsigned*)&t->host_tid);
     if (t->host_thread == NULL) {
+        const int err = errno;
+        const size_t requested = t->host_stack_req;
         t->state = PPU_THREAD_STATE_FREE;
         CloseHandle(t->finish_event);
         if (t->stack_addr) {
@@ -707,7 +835,10 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
             t->stack_size = 0;
         }
         table_unlock();
-        return (int64_t)(int32_t)CELL_EAGAIN;
+#ifdef PS3_PPU_STACK_REFUSAL_HOOK
+        PS3_PPU_STACK_REFUSAL_HOOK();
+#endif
+        ps3_stop_host_thread_stack("ppu", thread_id, requested, err);
     }
     if (_gate_this && g_gate_n < 256) g_gate_pending[g_gate_n++] = t->host_thread;
     /* The guest's top priorities (0 is highest, 3071 lowest) are its audio and
@@ -720,35 +851,11 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
     if (priority < 256)
         SetThreadPriority(t->host_thread, THREAD_PRIORITY_ABOVE_NORMAL);
 #else
-    /* Same reservation, for the same reason. This is the HOST stack the
-     * recompiled C frames run on, not the guest stack (allocated above out of
-     * guest VM), and the default is nowhere near enough: 512 KB on Darwin,
-     * where a recompiled call chain that spills a whole ppu_context per frame
-     * overflows in a few hundred frames. Like the Win32 branch it is a
-     * reservation, not a commitment -- the pages are mapped lazily. */
-    int rc;
-    {
-        pthread_attr_t attr;
-        pthread_attr_init(&attr);
-        if (pthread_attr_setstacksize(&attr, PPU_HOST_STACK_BYTES) == 0) {
-            rc = pthread_create(&t->host_thread, &attr, ppu_host_thread_proc, t);
-        } else {
-            rc = EINVAL;
-        }
-        pthread_attr_destroy(&attr);
-        /* A host that will not hand out that much address space (a strict
-         * overcommit policy, a low RLIMIT_AS) gets the thread anyway on the
-         * default stack. A shallow guest thread runs fine there, and a deep
-         * one crashing beats not starting at all. */
-        if (rc != 0) {
-            fprintf(stderr, "[SYS] tid=%llu: no %zu MB host stack (%d), "
-                            "falling back to the default\n",
-                    (unsigned long long)thread_id,
-                    (size_t)(PPU_HOST_STACK_BYTES / (1024 * 1024)), rc);
-            rc = pthread_create(&t->host_thread, NULL, ppu_host_thread_proc, t);
-        }
-    }
+    /* This is the HOST stack the recompiled C frames run on, not the guest stack (allocated above out of guest
+     * VM). Like the Win32 branch it is a reservation, not a commitment: the pages are mapped lazily. */
+    int rc = ps3_host_pthread_create(&t->host_thread, t->host_stack_req, 0, ppu_host_thread_proc, t);
     if (rc != 0) {
+        const size_t requested = t->host_stack_req;
         t->state = PPU_THREAD_STATE_FREE;
         pthread_mutex_destroy(&t->finish_mutex);
         pthread_cond_destroy(&t->finish_cond);
@@ -758,7 +865,10 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
             t->stack_size = 0;
         }
         table_unlock();
-        return (int64_t)(int32_t)CELL_EAGAIN;
+#ifdef PS3_PPU_STACK_REFUSAL_HOOK
+        PS3_PPU_STACK_REFUSAL_HOOK();
+#endif
+        ps3_stop_host_thread_stack("ppu", thread_id, requested, rc);
     }
 #endif
 

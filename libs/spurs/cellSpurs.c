@@ -24,6 +24,13 @@
 #include "ps3emu/log_first.h"
 #include "ps3emu/ps3_log.h"
 #include "ps3emu/stop.h"
+#include "ps3emu/config.h"      /* spu.host_stack_mb */
+#include "ps3emu/host_stack.h"  /* ps3_host_thread_error */
+#include "ps3emu/host_stack_report.h"
+static ps3_hs_reporter s_pm_hs = PS3_HS_REPORTER_INIT("spu-pm");
+static ps3_hs_reporter s_jc_hs = PS3_HS_REPORTER_INIT("spu-jobchain");
+static void pm_hs_summary(void) { ps3_hs_summary(&s_pm_hs); }
+static void jc_hs_summary(void) { ps3_hs_summary(&s_jc_hs); }
 #include "../../runtime/memory/vm.h"   /* vm_range_ok / vm_guest_limit: the guest arena rule */
 extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;   /* the calling guest thread, for a stop's site */
 
@@ -2313,6 +2320,7 @@ static u32 spurs_idle_max(void)
 static DWORD WINAPI spurs_pm_worker(LPVOID p)
 {
     struct SpursPmSlot* slot = (struct SpursPmSlot*)p;
+    const int hs = ps3_hs_begin(&s_pm_hs, slot->spu_num, ps3_spu_host_stack_bytes(), pm_hs_summary);
     ps3_thread_name("spurs pm");
     struct SpursInst* si = slot->instance;
 #ifdef _WIN32
@@ -2342,6 +2350,7 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
     }
     ReleaseSRWLockExclusive(&si->lock);
     ps3_tprof_thread_exit();
+    ps3_hs_end(&s_pm_hs, hs);
     return 0;
 }
 
@@ -2442,8 +2451,12 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
         struct SpursPmSlot* slot = &si->slots[sn];
         memset(slot, 0, sizeof(*slot));
         slot->instance = si; slot->spu_num = sn;
-        slot->thread = CreateThread(NULL, 1u << 20, spurs_pm_worker, slot, 0, NULL);
-        if (!slot->thread) goto failed;
+        /* The policy-module worker runs lifted SPU code: spu.host_stack_mb (it had 1 MiB, which a deep chain
+         * outgrew). A refused stack ends the run (host-thread-stack). */
+        slot->thread = CreateThread(NULL, ps3_spu_host_stack_bytes(), spurs_pm_worker, slot,
+                                    STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+        if (!slot->thread)
+            ps3_stop_host_thread_stack("spu-pm", sn, ps3_spu_host_stack_bytes(), ps3_host_thread_error());
     }
     si->coordinator = CreateThread(NULL, 1u << 20, spurs_kernel_thread, si, 0, NULL);
     if (!si->coordinator) goto failed;
@@ -3412,6 +3425,7 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
 static DWORD WINAPI jc_thread(LPVOID p)
 {
     int slot = (int)(intptr_t)p;
+    const int hs = ps3_hs_begin(&s_jc_hs, slot, ps3_spu_host_stack_bytes(), jc_hs_summary);
     ps3_thread_name("spurs jc %d", slot);
     /* TIMING PROBE (SPURS_JC_DELAY=ms): the real jm2 chain walker is async and
      * picks up jobs as the PPU appends them + fills their descriptors. Our walk
@@ -3426,6 +3440,7 @@ static DWORD WINAPI jc_thread(LPVOID p)
     /* Tell the application the chain is done. Without this the walk finishes
      * in silence and a thread waiting on the attached queue never runs again. */
     jc_signal_done(s_jobchains[slot].jc_ea, -1);
+    ps3_hs_end(&s_jc_hs, hs);
     return 0;
 }
 
@@ -3458,9 +3473,14 @@ static s32 jc_start(u64 jc_ea, const char* who)
         if (s_off || !s_jobchains[i].entry_ea) return CELL_OK;
         /* Coalesce: a chain already being walked must not start twice. */
         if (_InterlockedCompareExchange(&s_jobchains[i].running, 1, 0) == 0) {
-            HANDLE th = CreateThread(NULL, 1u << 20, jc_thread, (LPVOID)(intptr_t)i, 0, NULL);
-            if (th) CloseHandle(th);
-            else s_jobchains[i].running = 0;
+            /* The walker runs SPU jobs on this thread (spu_workload_dispatch_job): spu.host_stack_mb. A refused
+             * stack ends the run (host-thread-stack) rather than starting it on the host default. */
+            HANDLE th = CreateThread(NULL, ps3_spu_host_stack_bytes(), jc_thread, (LPVOID)(intptr_t)i,
+                                     STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+            if (!th)
+                ps3_stop_host_thread_stack("spu-jobchain", (u32)i, ps3_spu_host_stack_bytes(),
+                                           ps3_host_thread_error());
+            CloseHandle(th);
         }
         return CELL_OK;
     }

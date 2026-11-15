@@ -1203,9 +1203,10 @@ static void thread_probe_entry(ppu_context* ctx)
 }
 
 /* A guest thread is worth starting only if its host stack can hold a deep
- * recompiled call chain. 64 MB is well under the 256 MB reserved and well
- * over any default, so it separates "the reservation was applied" from "the
- * host handed out whatever it felt like" without pinning the exact number. */
+ * recompiled call chain. 64 MB is well under the 256 MB ppu.host_stack_mb
+ * default and well over any host default, so it separates "the reservation
+ * was applied" from "the host handed out whatever it felt like" without
+ * pinning the exact number. */
 #define HOST_STACK_FLOOR  (64u * 1024u * 1024u)
 
 static int run_thread_check(void)

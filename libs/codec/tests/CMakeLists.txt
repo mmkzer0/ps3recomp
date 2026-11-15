@@ -12,6 +12,11 @@ target_include_directories(test_vdec_stub PRIVATE "${PROJECT_SOURCE_DIR}/include
 target_link_libraries(test_vdec_stub PRIVATE ${VDEC_TEST_LIBS})
 add_test(NAME vdec_stub COMMAND test_vdec_stub stub)
 set_tests_properties(vdec_stub PROPERTIES LABELS "codec;t0")
+if(UNIX)
+    target_link_libraries(test_vdec_stub PRIVATE Threads::Threads)
+    add_test(NAME vdec_once COMMAND test_vdec_stub once)
+    set_tests_properties(vdec_once PROPERTIES LABELS "codec;t0;tsan")
+endif()
 
 if(NOT PS3RECOMP_FFMPEG_RUNTIME)
     return()

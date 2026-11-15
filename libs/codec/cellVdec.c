@@ -18,6 +18,12 @@
 #include "ps3emu/guest_call.h" /* g_ps3_guest_caller -- cbFunc is a GUEST OPD */
 #include "../../runtime/memory/vm.h"     /* VM_HLE_INJECT_BASE */
 #include "../../runtime/ps3_log.h"       /* ps3_log_verbose */
+#include "ps3emu/config.h"     /* ppu.host_stack_mb */
+#include "ps3emu/host_stack.h" /* ps3_host_pthread_create */
+#include "ps3emu/host_stack_report.h"
+static ps3_hs_reporter s_idle_hs = PS3_HS_REPORTER_INIT("ppu-vdec-idle");
+static void idle_hs_summary(void) { ps3_hs_summary(&s_idle_hs); }
+#include "ps3emu/stop.h"       /* ps3_stop_host_thread_stack */
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -194,7 +200,11 @@ static void* vdec_idle_thread(void* arg)
     (void)arg;
     const char* e = getenv("VDEC_IDLE_DRAIN_MS");
     const u64 idle_ms = e ? (u64)strtoull(e, NULL, 0) : 1500u;
-    if (!idle_ms) return NULL;
+    const int hs = ps3_hs_begin(&s_idle_hs, 0, ps3_ppu_host_stack_bytes(), idle_hs_summary);
+    if (!idle_ms) {
+        ps3_hs_end(&s_idle_hs, hs);
+        return NULL;
+    }
     for (;;) {
 #ifdef _WIN32
         Sleep(50);
@@ -229,17 +239,29 @@ static DWORD WINAPI vdec_idle_thread_w32(LPVOID arg) { vdec_idle_thread(arg); re
 
 static void vdec_idle_thread_start(void)
 {
-    static int started = 0;
-    if (started) return;
-    started = 1;
+    static volatile long started = 0; /* 0 idle, 1 starting, 2 started */
+    if (!ps3_env_once_claim(&started)) return;
+    /* The thread drains idle decoders and announces the pictures to the guest's callback (vdec_notify_new_pics),
+     * so it runs guest PPU code on ppu.host_stack_mb of stack. A host that refuses it ends the run
+     * (host-thread-stack, role=ppu-vdec-idle). */
 #ifdef _WIN32
-    HANDLE t = CreateThread(NULL, 0, vdec_idle_thread_w32, NULL, 0, NULL);
-    if (t) CloseHandle(t);
+    HANDLE t = CreateThread(NULL, ps3_ppu_host_stack_bytes(), vdec_idle_thread_w32, NULL,
+                            STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+    if (!t) {
+        const int error = ps3_host_thread_error();
+        ps3_env_once_publish(&started, 0);
+        ps3_stop_host_thread_stack("ppu-vdec-idle", 0, ps3_ppu_host_stack_bytes(), error);
+    }
+    CloseHandle(t);
 #else
     pthread_t t;
-    if (pthread_create(&t, NULL, vdec_idle_thread, NULL) == 0)
-        pthread_detach(t);
+    const int rc = ps3_host_pthread_create(&t, ps3_ppu_host_stack_bytes(), 1, vdec_idle_thread, NULL);
+    if (rc != 0) {
+        ps3_env_once_publish(&started, 0);
+        ps3_stop_host_thread_stack("ppu-vdec-idle", 0, ps3_ppu_host_stack_bytes(), rc);
+    }
 #endif
+    ps3_env_once_publish(&started, 2);
 }
 
 /* ---------------------------------------------------------------------------
@@ -283,25 +305,27 @@ s32 cellVdecOpen(const CellVdecType* type, const CellVdecResource* res,
     if (!type || !handle)
         return (s32)CELL_VDEC_ERROR_ARG;
 
+    VDEC_LOCK();
     for (int i = 0; i < MAX_VDEC; i++) {
         if (!s_vdec[i].in_use) {
-            VDEC_LOCK();
             memset(&s_vdec[i], 0, sizeof(VdecSlot));
             s_vdec[i].in_use = 1;
             s_vdec[i].codecType = codec_type;
             s_vdec[i].cbFunc = cb_ea ? vm_read32(cb_ea + 0) : 0;
             s_vdec[i].cbArg  = cb_ea ? vm_read32(cb_ea + 4) : 0;
             s_vdec[i].ff = vdec_ff_open(codec_type);
+            const int has_decoder = s_vdec[i].ff != NULL;
             VDEC_UNLOCK();
             vm_write32((u32)(uintptr_t)handle, (u32)VDEC_HANDLE_OF(i));
             printf("[cellVdec] Open -> handle=%u\n", (u32)VDEC_HANDLE_OF(i));
-            if (s_vdec[i].ff) {
+            if (has_decoder) {
                 printf("[cellVdec] decoding with libavcodec\n");
                 vdec_idle_thread_start();
             }
             return CELL_OK;
         }
     }
+    VDEC_UNLOCK();
     return (s32)CELL_VDEC_ERROR_BUSY;
 }
 

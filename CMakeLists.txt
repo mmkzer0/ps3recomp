@@ -1022,8 +1022,7 @@ if(PS3RECOMP_BUILD_TESTS)
                 runtime/spu/tests/test_spu_group_lifecycle.c
                 runtime/platform/host_clock.c
                 runtime/platform/host_wait.c
-                runtime/diag/ps3_log.c
-                runtime/config/config.cpp)
+                runtime/diag/ps3_log.c)
             target_include_directories(test_spu_group_lifecycle PRIVATE
                 "${CMAKE_CURRENT_SOURCE_DIR}/include"
                 "${CMAKE_CURRENT_SOURCE_DIR}/runtime"
@@ -1063,6 +1062,29 @@ if(PS3RECOMP_BUILD_TESTS)
             target_link_libraries(test_spu_group_destroy_race PRIVATE m Threads::Threads)
             add_test(NAME spu_group_destroy_race COMMAND test_spu_group_destroy_race)
             set_tests_properties(spu_group_destroy_race PROPERTIES LABELS "spu;t0;tsan" TIMEOUT 120)
+
+            # spu.host_stack_mb for a thread-group member: the PS3_HOST_STACK_HWM exit and live reports against a known
+            # recursion depth, and the host-thread-stack stop when pthread_attr_init, pthread_attr_setstacksize or the
+            # reservation is refused (each in a forked child, since a stop ends the process).
+            add_executable(test_spu_group_host_stack
+                runtime/spu/tests/test_spu_group_host_stack.c)
+            target_include_directories(test_spu_group_host_stack PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}/include"
+                "${CMAKE_CURRENT_SOURCE_DIR}/runtime"
+                "${CMAKE_CURRENT_SOURCE_DIR}/runtime/syscalls"
+                "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu"
+                "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
+            target_compile_definitions(test_spu_group_host_stack PRIVATE _GNU_SOURCE)
+            target_compile_options(test_spu_group_host_stack PRIVATE -UNDEBUG)
+            if(APPLE)
+                target_link_options(test_spu_group_host_stack PRIVATE "-Wl,-dead_strip")
+            else()
+                target_compile_options(test_spu_group_host_stack PRIVATE -ffunction-sections -fdata-sections)
+                target_link_options(test_spu_group_host_stack PRIVATE "-Wl,--gc-sections")
+            endif()
+            target_link_libraries(test_spu_group_host_stack PRIVATE m Threads::Threads)
+            add_test(NAME spu_group_host_stack COMMAND test_spu_group_host_stack)
+            set_tests_properties(spu_group_host_stack PROPERTIES LABELS "spu;t0;tsan" TIMEOUT 120)
         endif()
         # Report-hold round state, signal-bit synchronization, and concurrent
         # taskset registration in the SPU workload registry.
@@ -1812,6 +1834,28 @@ if(PS3RECOMP_BUILD_TESTS)
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_thread_stack_recycle.py")
         set_tests_properties(ppu_thread_stack_recycle PROPERTIES LABELS "runtime;t0;tsan" TIMEOUT 300)
+        # The host stack of a created guest thread: the high-water report (PS3_HOST_STACK_HWM) against a computed
+        # depth, the default run's silence, and the stop host-thread-stack for a stack the host refuses.
+        add_test(NAME ppu_host_stack
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_host_stack.py")
+        set_tests_properties(ppu_host_stack PROPERTIES LABELS "runtime;t0;tsan" TIMEOUT 300)
+        # The platform defaults of ppu.host_stack_mb (32 on iOS, 256 elsewhere), spu.host_stack_mb (8 on iOS, 16)
+        # and spu.dispatch_stack_mb (32, 256): a compile-time check with the build's own C compiler (cl, clang-cl,
+        # clang or gcc, each with its own syntax-only flag), and per Apple SDK on macOS.
+        add_test(NAME host_stack_defaults
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_host_stack_defaults.py"
+                --cc "${CMAKE_C_COMPILER}" --variant "${CMAKE_C_COMPILER_FRONTEND_VARIANT}")
+        set_tests_properties(host_stack_defaults PROPERTIES LABELS "config;t0" TIMEOUT 300)
+        # A raw SPU started by SPU_RunCntl runs on its own host thread (spu.host_stack_mb), and a refused stack stops
+        # with host-thread-stack, role=spu-raw (a forked child: a stop ends the process).
+        if(UNIX)
+            add_test(NAME spu_raw_start
+                COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_raw_start.py")
+            set_tests_properties(spu_raw_start PROPERTIES LABELS "spu;t0" TIMEOUT 120)
+        endif()
         # The lv2 join/detach state machine and the worker epilogue's last access to its slot, ordered by a hook.
         add_test(NAME ppu_thread_join_detach
             COMMAND "${Python3_EXECUTABLE}"

@@ -104,6 +104,9 @@ int main(int argc, char** argv)
         int k = std::atoi(argv[2]);
         ps3_stop((ps3_stop_kind)k, "a kind probe", "none", nullptr, 0, nullptr);
     }
+    if (!std::strcmp(scenario, "host-thread-stack")) {
+        ps3_stop_host_thread_stack(argc == 3 ? argv[2] : "ppu", 130, (size_t)256 * 1024 * 1024, 35);
+    }
     if (!std::strcmp(scenario, "kinds")) {
         for (int k = 0; k < PS3_STOP_KIND_COUNT; ++k) std::printf("%s\n", ps3_stop_kind_id((ps3_stop_kind)k));
         return 0;

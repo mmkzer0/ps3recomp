@@ -30,6 +30,11 @@ int64_t lv2_spu_lock_line_classify(uint32_t a, uint64_t f) { (void)a; (void)f; r
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
 void SetLastError(DWORD e) { (void)e; }
+/* spu.host_stack_mb, and the stop of a host that refuses an SPU thread's stack (not reached here). */
+const ps3_config* ps3_config_get(void) { static ps3_config c = { .spu_host_stack_mb = 16 }; return &c; }
+_Noreturn void ps3_stop(ps3_stop_kind kind, const char* what, const char* remedy,
+                        const ps3_stop_field* fields, size_t nfields, const ps3_stop_site* site)
+{ (void)kind; (void)what; (void)remedy; (void)fields; (void)nfields; (void)site; abort(); }
 /* Link stubs for what lv2_register.c references and the rest of the runtime supplies; none is reached below, except
  * spu_lifted_thread_run, which a lifted thread's proc calls and which here runs nothing and reports no group exit. */
 uint32_t g_spu_interp_last_pc;

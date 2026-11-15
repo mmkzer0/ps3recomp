@@ -659,8 +659,8 @@ succeeding). `ExecutorHooks::on_push_blocked` reports a parked pusher to a
 test. A fiber whose `WaitSignal` is refused, or one that cannot be signalled,
 is `jq2-wake` with `reason=push-room-wait` / `push-room-notify`.
 
-**Workers.** `worker_count` host threads (8 MB stacks: the loader keeps a whole
-`spu_context` on the stack) are the scheduler's instances, one job slot each.
+**Workers.** `worker_count` host threads (`spu.host_stack_mb` stacks, 8 MB on iOS and 16 MB elsewhere: the loader
+keeps a whole `spu_context` on the stack; a host that refuses the reservation is `host-thread-stack`, `role=spu-jq2`) are the scheduler's instances, one job slot each.
 A worker runs `Scheduler::intake_pass` under the queue lock over `GuestRing`
 (`sched.hpp`'s `RingStore`, see below), takes the descriptor of the JOB it
 admitted from guest memory right there (contract S2) and runs the job outside

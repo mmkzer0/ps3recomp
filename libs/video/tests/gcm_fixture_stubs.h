@@ -69,6 +69,18 @@ PS3_NORETURN void ps3_stop_rsx_unknown_method(const char* cls, uint32_t method, 
     exit(70);
 }
 
+/* The generic stop: cellGcmSys.c ends in it through the inline named stops of stop.h (host-thread-stack when the
+ * host refuses the GCM interrupt thread's stack). A fixture that reaches it has a bug: say which, end with 70. */
+PS3_NORETURN void ps3_stop(ps3_stop_kind kind, const char* what, const char* remedy, const ps3_stop_field* fields,
+                           size_t nfields, const ps3_stop_site* site)
+{
+    (void)remedy; (void)site;
+    printf("[FAIL] stop kind %d: %s", (int)kind, what);
+    for (size_t i = 0; i < nfields; i++) printf(" %s=%s", fields[i].key, fields[i].value);
+    printf("\n");
+    exit(70);
+}
+
 /* The draw engine ends an unresolvable flip in this (test_gcm_class_routing.c compiles the engine in). */
 #define RSX_STUB_OWN_CONFIG   /* ps3_fixture_config() above is the effective configuration */
 #include "rsx_driver_stop_stub.h"

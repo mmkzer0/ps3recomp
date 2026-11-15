@@ -50,6 +50,12 @@ spu_lifted_entry_fn spu_workload_find_img(uint64_t fp, int* id) { (void)fp; (voi
 uint64_t spu_workload_fingerprint(const void* d, size_t n) { (void)d; (void)n; return 0; }
 void sys_event_queue_push_from_kernel(uint32_t q, uint64_t s, uint64_t d1, uint64_t d2, uint64_t d3, const char* who)
 { (void)q; (void)s; (void)d1; (void)d2; (void)d3; (void)who; }
+/* spu.host_stack_mb, and the stop of a host that refuses an SPU thread's stack (nothing here starts a host thread).
+ * The stub config also serves ps3_log.c; config.cpp is not linked, so the run log is never configured here. */
+const ps3_config* ps3_config_get(void) { static ps3_config c = { .spu_host_stack_mb = 16 }; return &c; }
+_Noreturn void ps3_stop(ps3_stop_kind kind, const char* what, const char* remedy,
+                        const ps3_stop_field* fields, size_t nfields, const ps3_stop_site* site)
+{ (void)kind; (void)what; (void)remedy; (void)fields; (void)nfields; (void)site; abort(); }
 #endif
 uint32_t spurs_port_queue(uint32_t port) { (void)port; return 0; }
 int64_t sys_event_flag_set(ppu_context* c) { (void)c; return 0; }
