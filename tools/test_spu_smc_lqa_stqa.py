@@ -55,6 +55,7 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t a, uint32_t b)
 { (void)ctx; (void)a; (void)b; return 0; }
 spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)   /* #266's rejoin check */
 { (void)ctx; (void)lsa; return NULL; }
+const char* spu_diag_tag(void) { return ""; }   /* the shadow-run tag of spu_interp.c; never a shadow here */
 
 %s
 
