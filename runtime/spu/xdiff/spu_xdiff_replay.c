@@ -18,6 +18,7 @@
 #include "../spurs_job.h"
 #include "spu_xdiff_census.h"
 #include "ps3emu/lifter_abi.h"
+#include "ps3emu/ps3_log.h"
 #include "ps3emu/stop.h"
 
 #include <errno.h>
@@ -538,8 +539,7 @@ static uint32_t replay_core(const spu_xdiff_fixture* f, const spu_xdiff_replay_o
     /* Another census is reported, not refused: the replay stays sound while the port ABI and the carried members
      * are unchanged (section 9), and a difference of members is the census test's to catch. */
     if (f->identity.context_census != spu_xdiff_context_census() && !(poison && poison->runs > 1))
-        fprintf(stderr, "[spu-xdiff] the fixture was recorded under spu_context census 0x%08X; this build's is 0x%08X\n",
-                (unsigned)f->identity.context_census, (unsigned)spu_xdiff_context_census());
+        PS3_LOG(PS3_LOG_INFO, "spu-xdiff", "the fixture was recorded under spu_context census 0x%08X; this build's is 0x%08X\n", (unsigned)f->identity.context_census, (unsigned)spu_xdiff_context_census());
     const uint32_t match = spu_xdiff_match_for(f->identity.authority.tier, opt->subject_tier);
     out->match = match;
     /* Contract matching (a pair with native code) is not built here: no pair of this runner has it, and a
@@ -612,9 +612,8 @@ static uint32_t replay_core(const spu_xdiff_fixture* f, const spu_xdiff_replay_o
     /* A served context that reached the runtime below the seam has broken the design's central claim
      * (section 9): a defect of the runtime, not a verdict about the subject. */
     if (ctx->coh_listed != 0 || spu_mfc_has_engine(ctx)) {
-        fprintf(stderr, "[spu-xdiff] shadow context %p reached the runtime below the effect port "
-                        "(coh_listed=%d mfc_engine=%d) -- aborting\n",
-                (void*)ctx, ctx->coh_listed, spu_mfc_has_engine(ctx));
+        PS3_LOG(PS3_LOG_INFO, "spu-xdiff", "shadow context %p reached the runtime below the effect port "
+                        "(coh_listed=%d mfc_engine=%d) -- aborting\n", (void*)ctx, ctx->coh_listed, spu_mfc_has_engine(ctx));
         fflush(stderr);
         abort();
     }
@@ -710,7 +709,7 @@ static uint32_t poison_once(const spu_xdiff_fixture* f, const spu_xdiff_replay_o
     poison_reset(p, apply);
     const uint32_t v = replay_core(f, opt, s, out, p);
     if (v == (uint32_t)SPU_XDIFF_EQUAL && p->overflow) {
-        fprintf(stderr, "[spu-xdiff] the poison run tracks at most %u open calls of listed functions\n", POISON_STACK_CAP);
+        PS3_LOG(PS3_LOG_INFO, "spu-xdiff", "the poison run tracks at most %u open calls of listed functions\n", POISON_STACK_CAP);
         return verdict_of(out, SPU_XDIFF_R_CAPTURE_LIMIT);
     }
     return v;
@@ -811,7 +810,7 @@ uint32_t spu_xdiff_replay_poison(const spu_xdiff_fixture* f, const spu_xdiff_rep
     }
     poison_run p;
     if (poison_init(&p, plan) != 0) {
-        fprintf(stderr, "[spu-xdiff] out of memory for the poison run\n");
+        PS3_LOG(PS3_LOG_INFO, "spu-xdiff", "out of memory for the poison run\n");
         blank_record(out, opt, f);
         return verdict_of(out, SPU_XDIFF_R_HOST_FAULT);
     }

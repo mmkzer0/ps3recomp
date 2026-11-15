@@ -18,6 +18,7 @@ with tempfile.TemporaryDirectory(prefix='spu-workload-masked-') as tmp:
     # spu_workload.c raises named stops (spurs-task-halt, spurs-dispatch-miss),
     # so the fixture links the named-stop and typed-configuration runtime.
     spu_fixture_link.build([root / 'runtime/spu/tests/test_spu_workload_masked.c',
+                            root / 'runtime/diag/ps3_log.c',
                             root / 'runtime/platform/win32_compat.c',
                             root / 'runtime/platform/host_clock.c',
                             root / 'runtime/platform/host_wait.c'], binary,

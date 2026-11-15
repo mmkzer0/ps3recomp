@@ -70,6 +70,7 @@ def main():
         sources += [spu / name for name in runtime]
         sources += [ROOT / "runtime/memory/reservation.c",
                     ROOT / "runtime/memory/label_window.c",
+                    ROOT / "runtime/diag/ps3_log.c",
                     ROOT / "runtime/platform/win32_compat.c", ROOT / "runtime/platform/host_clock.c", ROOT / "runtime/platform/host_wait.c"]
         objects = []
         for index, src in enumerate(sources):
@@ -77,8 +78,7 @@ def main():
             subprocess.run([cc, *cflags, "-c", str(src), "-o", str(obj)], check=True)
             objects.append(str(obj))
         for src, out in ((ROOT / "runtime/config/config.cpp", "config.o"),
-                         (ROOT / "runtime/diag/stop.cpp", "stop.o"),
-                         (ROOT / "tests/ps3_log_null.cpp", "ps3_log_null.o")):
+                         (ROOT / "runtime/diag/stop.cpp", "stop.o")):
             obj = tmp / out
             subprocess.run([cxx, *cxxflags, "-c", str(src), "-o", str(obj)], check=True)
             objects.append(str(obj))

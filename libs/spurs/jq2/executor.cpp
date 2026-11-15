@@ -13,6 +13,7 @@
 #include "jq2/port.hpp"
 #include "jq2/sched.hpp"
 #include "jq2/xdiff_capture.hpp"
+#include "ps3emu/ps3_log.h"
 
 #ifdef _WIN32
 #include <process.h> /* _beginthreadex: the workers need a stack size std::thread cannot set */
@@ -1976,10 +1977,9 @@ int32_t jq2_queue_create(uint32_t revision, uint32_t sdk_version, uint32_t spurs
         }
         ++g_queues_created;
     }
-    std::fprintf(stderr, "[jq2] queue q=%u ea=0x%08X workers=%u depth=%u\n", static_cast<unsigned>(q->index()),
-                 queue, worker_count, command_depth);
+    PS3_LOG(PS3_LOG_INFO, "jq2", "queue q=%u ea=0x%08X workers=%u depth=%u\n", static_cast<unsigned>(q->index()), queue, worker_count, command_depth);
     if (created > 255)
-        std::fprintf(stderr, "[jq2] queue q saturated at 255: ea=0x%08X is queue number %u\n", queue, created + 1);
+        PS3_LOG(PS3_LOG_INFO, "jq2", "queue q saturated at 255: ea=0x%08X is queue number %u\n", queue, created + 1);
     if (!q->start()) {
         stop_with(PS3_STOP_JQ2_STATE, "a JobQueue2 worker thread could not be started",
                   "The host refused a thread; check the process's thread limit.",

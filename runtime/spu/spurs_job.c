@@ -52,6 +52,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "ps3emu/log_first.h"
+#include "ps3emu/ps3_log.h"
 #include "ps3emu/stop.h"
 
 /* A test builds this file with SPURS_JOB_LS_TEST and supplies the function, to
@@ -564,8 +565,7 @@ static int run_spurs_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_e
             job_dma_stop(&jd, -1, ea_bin, (uint64_t)n_cache_raw * 8u, 0, 0, "cache-count");
     }
     if (size_bin > SPU_LS_SIZE) {
-        fprintf(stderr, "[spurs-job] job 0x%08X: bad sizeBinary=%u -- not run\n",
-                job_ea, size_bin);
+        PS3_LOG(PS3_LOG_INFO, "spurs-job", "job 0x%08X: bad sizeBinary=%u -- not run\n", job_ea, size_bin);
         return -1;
     }
 
@@ -861,15 +861,10 @@ static int run_spurs_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_e
     ls32(ls, ctx_ls + JC_EA_JOB_DESCRIPTOR,     0);
     ls32(ls, ctx_ls + JC_EA_JOB_DESCRIPTOR + 4, job_ea);
 
-    { static SPURS_JOB_TLS int _n = 0;
-      if (PS3_LOG_FIRST(_n, 4))
-          fprintf(stderr,
-              "[spurs-job] job 0x%08X: bin 0x%08X+%u -> LS 0x%X | io=0x%05X(%u, %u dma, %u used)"
+    {
+      PS3_LOG_N(4, PS3_LOG_INFO, "spurs-job", "job 0x%08X: bin 0x%08X+%u -> LS 0x%X | io=0x%05X(%u, %u dma, %u used)"
               " out=0x%05X(%u) scratch=0x%05X(%u) stack_top=0x%05X(%u) cache=%u"
-              " ctx=0x%05X desc=0x%05X(%u)\n",
-              job_ea, ea_bin, size_bin, base, io_ls, size_io, n_dma, io_used,
-              out_ls, size_out, s_ls, size_scr, stack_top, size_stk, n_cache,
-              ctx_ls, desc_ls, dsz); }
+              " ctx=0x%05X desc=0x%05X(%u)\n", job_ea, ea_bin, size_bin, base, io_ls, size_io, n_dma, io_used, out_ls, size_out, s_ls, size_scr, stack_top, size_stk, n_cache, ctx_ls, desc_ls, dsz); }
 
     /* SPURS_JOB_DESCDUMP=1: hexdump the guest job descriptor. The SPU derives
      * its DMA and atomic EAs from these words, so when a job spins on a
@@ -908,11 +903,7 @@ static int run_spurs_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_e
     if (ps3_env_once("SPURS_JOB_DUMP")) {
         uint64_t ud  = dv64(&dv, JH_SIZE);           /* desc+0x30 */
         uint32_t cmd = (uint32_t)ud;                 /* low word = EA */
-        fprintf(stderr, "[spurs-job] job 0x%08X userdata: %016llX %016llX %016llX %016llX\n",
-                job_ea, (unsigned long long)ud,
-                (unsigned long long)dv64(&dv, JH_SIZE + 8),
-                (unsigned long long)dv64(&dv, JH_SIZE + 16),
-                (unsigned long long)dv64(&dv, JH_SIZE + 24));
+        PS3_LOG(PS3_LOG_INFO, "spurs-job", "job 0x%08X userdata: %016llX %016llX %016llX %016llX\n", job_ea, (unsigned long long)ud, (unsigned long long)dv64(&dv, JH_SIZE + 8), (unsigned long long)dv64(&dv, JH_SIZE + 16), (unsigned long long)dv64(&dv, JH_SIZE + 24));
         if (cmd && cmd < 0x50000000u) {
             dump_cmd = cmd;
             fprintf(stderr, "[spurs-job]   cmdblock @0x%08X:", cmd);
@@ -1000,11 +991,8 @@ static int run_spurs_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_e
         hooks->start(hooks->user, &ctx, &layout);
     }
     /* After the start hook: a hook may choose the body and write the context's image id. */
-    { static SPURS_JOB_TLS int _n = 0;
-      if (PS3_LOG_FIRST(_n, 4))
-          fprintf(stderr, "[spurs-job] ENTER r3=%08X r4=%08X r1=%08X entry-fn image=%d\n",
-                  ctx.gpr[3]._u32[0], ctx.gpr[4]._u32[0], ctx.gpr[1]._u32[0],
-                  ctx.image_id); }
+    {
+      PS3_LOG_N(4, PS3_LOG_INFO, "spurs-job", "ENTER r3=%08X r4=%08X r1=%08X entry-fn image=%d\n", ctx.gpr[3]._u32[0], ctx.gpr[4]._u32[0], ctx.gpr[1]._u32[0], ctx.image_id); }
     /* The runner's result (halted or returned) is not a completion test and is
      * not consulted here. A lifted job's normal return is itself reported as a
      * halt (the resolver halts the lifted run when the interpreted stub at the
@@ -1078,14 +1066,10 @@ static int run_spurs_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_e
     { uint32_t _cb = dv32(&dv, 0x4C);
       g_spurs_job_cmd = (_cb && guest_range_ok(_cb, 4)) ? (g32(_cb) >> 16) : 0; }
     { const int s_t = ps3_env_once("SPURS_JOB_MBOX") ? 1 : 0;
-      static SPURS_JOB_TLS int n = 0;
-      if (s_t && PS3_LOG_FIRST(n, 16) && g_spurs_job_mbox_valid)
-          fprintf(stderr, "[spurs-job] job 0x%08X posted mbox=0x%08X intr=0x%08X\n",
-                  job_ea, g_spurs_job_mbox, g_spurs_job_mbox_intr); }
+      if (s_t && g_spurs_job_mbox_valid) PS3_LOG_N(16, PS3_LOG_INFO, "spurs-job", "job 0x%08X posted mbox=0x%08X intr=0x%08X\n", job_ea, g_spurs_job_mbox, g_spurs_job_mbox_intr); }
 
     if (ps3_env_once("SPURS_JOB_DUMP")) {
-        fprintf(stderr, "[spurs-job] job 0x%08X exit: status=0x%X stop=0x%X pc=0x%05X\n",
-                job_ea, ctx.status, ctx.stop_code, ctx.pc);
+        PS3_LOG(PS3_LOG_INFO, "spurs-job", "job 0x%08X exit: status=0x%X stop=0x%X pc=0x%05X\n", job_ea, ctx.status, ctx.stop_code, ctx.pc);
         /* Post-run view of the same command block: the game polls result/status
          * fields the job writes back -- a before/after diff shows whether the
          * handler delivered its completion or the PPU waits on stale state. */

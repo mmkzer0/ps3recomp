@@ -45,6 +45,7 @@ HARNESS = r'''
 #include "spu_context.h"
 #include "spu_helpers.h"
 #include "spu_interp.h"
+#include "ps3emu/log_first.h"
 
 SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*);
 int g_spu_ls_watch_n = 0;   /* LS watch off */
@@ -126,10 +127,33 @@ with tempfile.TemporaryDirectory() as tmp:
     c_path = Path(tmp) / 'smc_lqa_stqa.c'
     exe = Path(tmp) / 'smc_lqa_stqa'
     c_path.write_text(HARNESS % func)
-    cmd = [cc, '-std=gnu17', '-O1', '-w',
-           '-I', str(root / 'runtime/spu'), '-I', str(root / 'runtime'),
-           '-I', str(root / 'include'), str(c_path), '-o', str(exe)]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    obj = Path(tmp) / 'harness.o'
+    r = subprocess.run([cc, '-std=gnu17', '-O1', '-w', '-I', str(root / 'runtime/spu'),
+                        '-I', str(root / 'runtime'), '-I', str(root / 'include'),
+                        '-c', str(c_path), '-o', str(obj)], capture_output=True, text=True)
+    if r.returncode:
+        print(r.stdout + r.stderr)
+        raise SystemExit('FAIL: harness did not compile')
+    # spu_unsupported (spu_helpers.h) and the extracted microstep log through ps3_log; the real logger
+    # needs the typed configuration and named-stop runtime.
+    cxx = os.environ.get('CXX', 'c++')
+    for src, name in ((root / 'runtime/diag/stop.cpp', 'stop.o'),
+                      (root / 'runtime/config/config.cpp', 'config.o')):
+        pr = subprocess.run([cxx, '-std=c++20', '-O1', '-I', str(root / 'include'), '-c', str(src),
+                             '-o', str(Path(tmp) / name)], capture_output=True, text=True, check=False)
+        if pr.returncode:
+            print(pr.stdout + pr.stderr)
+            raise SystemExit('FAIL: harness did not compile')
+    plog = Path(tmp) / 'ps3_log.o'
+    pr = subprocess.run([cc, '-std=gnu17', '-O1', '-I', str(root / 'include'), '-c',
+                         str(root / 'runtime/diag/ps3_log.c'), '-o', str(plog)],
+                        capture_output=True, text=True, check=False)
+    if pr.returncode:
+        print(pr.stdout + pr.stderr)
+        raise SystemExit('FAIL: harness did not compile')
+    r = subprocess.run([cxx, str(obj), str(plog), str(Path(tmp) / 'stop.o'),
+                        str(Path(tmp) / 'config.o'), '-pthread', '-o', str(exe)],
+                       capture_output=True, text=True, check=False)
     if r.returncode:
         print(r.stdout + r.stderr)
         raise SystemExit('FAIL: harness did not compile')

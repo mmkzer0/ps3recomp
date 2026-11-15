@@ -11,11 +11,12 @@ import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-# Added to every fixture's own C sources.
-RUNTIME_C = [ROOT / 'runtime/memory/reservation.c', ROOT / 'runtime/memory/label_window.c']
-# ps3_log_null.cpp: config.cpp configures the run log, which these fixtures deliberately leave out.
-RUNTIME_CXX = [ROOT / 'runtime/config/config.cpp', ROOT / 'runtime/diag/stop.cpp',
-               ROOT / 'tests/ps3_log_null.cpp']
+# Added to every fixture's own C sources. ps3_log.c is the real run log: the migrated stderr lines are
+# what the fixtures read, so they must come from the one implementation a title gets.
+RUNTIME_C = [ROOT / 'runtime/memory/reservation.c', ROOT / 'runtime/memory/label_window.c',
+             ROOT / 'runtime/diag/ps3_log.c']
+# config.cpp and stop.cpp satisfy ps3_log.c's ps3_config_get / ps3_stop references.
+RUNTIME_CXX = [ROOT / 'runtime/config/config.cpp', ROOT / 'runtime/diag/stop.cpp']
 
 
 def build(c_sources, out, cflags, tmp, ldflags=(), runtime_c=True, timeout=None):

@@ -22,6 +22,7 @@
  */
 
 #include "jq2/xdiff_capture.hpp"
+#include "ps3emu/ps3_log.h"
 
 #include <array>
 #include <atomic>
@@ -199,10 +200,8 @@ bool line_budget()
 {
     const std::uint32_t n = g_lines.fetch_add(1, kRelaxed);
     if (n == kMaxLines)
-        std::fprintf(stderr,
-                     "[jq2-xdiff] capture-lines-suppressed detail=more than %u capture-ineligible lines; "
-                     "the counters keep counting\n",
-                     kMaxLines);
+        PS3_LOG(PS3_LOG_INFO, "jq2-xdiff", "capture-lines-suppressed detail=more than %u capture-ineligible lines; "
+                     "the counters keep counting\n", kMaxLines);
     return n < kMaxLines;
 }
 
@@ -217,8 +216,7 @@ std::string fingerprint_text(std::uint64_t fingerprint)
 void fail(const WorkerCapture& w, ImageCapture& image, std::uint64_t fingerprint, std::uint32_t reason, const char* detail)
 {
     image.failed.fetch_add(1, kRelaxed);
-    std::fprintf(stderr, "[jq2-xdiff] capture-failed image=%s queue=%u seq=%u reason=%s detail=%s\n",
-                 fingerprint_text(fingerprint).c_str(), w.queue, w.seq, spu_xdiff_reason_id(reason), detail);
+    PS3_LOG(PS3_LOG_INFO, "jq2-xdiff", "capture-failed image=%s queue=%u seq=%u reason=%s detail=%s\n", fingerprint_text(fingerprint).c_str(), w.queue, w.seq, spu_xdiff_reason_id(reason), detail);
 }
 
 /* Names why the job at (address, size) is not recorded: once per worker, address and reason, then once per
@@ -235,8 +233,7 @@ void name_ineligible(AddrCache& a, Reason reason, const spu_job_layout* l, std::
         if (t.named.size() >= kMaxNamed || !t.named.insert(key).second) return;
     }
     if (!line_budget()) return;
-    std::fprintf(stderr, "[jq2-xdiff] capture-ineligible image=%s reason=%s ea=0x%08X bytes=%u\n",
-                 fingerprint_text(fingerprint).c_str(), kReasonText[reason], l->image_ea, l->image_bytes);
+    PS3_LOG(PS3_LOG_INFO, "jq2-xdiff", "capture-ineligible image=%s reason=%s ea=0x%08X bytes=%u\n", fingerprint_text(fingerprint).c_str(), kReasonText[reason], l->image_ea, l->image_bytes);
 }
 
 /* ---- the image of a job ---------------------------------------------------- */
@@ -366,15 +363,11 @@ void capture_configure()
             s->dir = ps3_cfg_spu_xdiff_dir();
             std::string why;
             if (s->dir.empty()) {
-                std::fprintf(stderr,
-                             "[jq2-xdiff] capture-off reason=no-dir detail=spu.xdiff_capture=%u but spu.xdiff_dir is empty; "
-                             "nothing is recorded\n",
-                             s->limit);
+                PS3_LOG(PS3_LOG_INFO, "jq2-xdiff", "capture-off reason=no-dir detail=spu.xdiff_capture=%u but spu.xdiff_dir is empty; "
+                             "nothing is recorded\n", s->limit);
                 s->limit = 0;
             } else if (!directory_is_usable(s->dir, why)) {
-                std::fprintf(stderr,
-                             "[jq2-xdiff] capture-off reason=bad-dir detail=spu.xdiff_dir %s %s; nothing is recorded\n",
-                             s->dir.c_str(), why.c_str());
+                PS3_LOG(PS3_LOG_INFO, "jq2-xdiff", "capture-off reason=bad-dir detail=spu.xdiff_dir %s %s; nothing is recorded\n", s->dir.c_str(), why.c_str());
                 s->limit = 0;
             }
         }
@@ -424,10 +417,8 @@ void capture_job_start(const CaptureJob& job, ::spu_context* ctx, const ::spu_jo
         /* The loader validated the layout; this names a loader that stopped doing so. It consumes no attempt,
          * so unlike the other failure lines it is budgeted. */
         if (line_budget())
-            std::fprintf(stderr,
-                         "[jq2-xdiff] capture-failed image=unknown queue=%u seq=%u reason=%s detail=staged image [0x%X, +%u) is "
-                         "outside local store\n",
-                         w.queue, js.seq, spu_xdiff_reason_id(SPU_XDIFF_R_FIXTURE_FORMAT), l->image_ls, l->image_bytes);
+            PS3_LOG(PS3_LOG_INFO, "jq2-xdiff", "capture-failed image=unknown queue=%u seq=%u reason=%s detail=staged image [0x%X, +%u) is "
+                         "outside local store\n", w.queue, js.seq, spu_xdiff_reason_id(SPU_XDIFF_R_FIXTURE_FORMAT), l->image_ls, l->image_bytes);
         return;
     }
     const std::uint64_t key = (static_cast<std::uint64_t>(l->image_ea) << 32) | l->image_bytes;
@@ -591,10 +582,8 @@ void capture_job_start(const CaptureJob& job, ::spu_context* ctx, const ::spu_jo
             audit_note_not_eligible(image.audit, fingerprint, ShadowCheck::ok);
             w.disposition = kNotEligible;
         }
-        std::fprintf(stderr,
-                     "[jq2-xdiff] capture-ineligible image=%s reason=fingerprint-collision ea=0x%08X bytes=%u "
-                     "detail=the staged bytes hash to %s, not to the remembered fingerprint; nothing recorded\n",
-                     fingerprint_text(fingerprint).c_str(), l->image_ea, l->image_bytes, fingerprint_text(actual).c_str());
+        PS3_LOG(PS3_LOG_INFO, "jq2-xdiff", "capture-ineligible image=%s reason=fingerprint-collision ea=0x%08X bytes=%u "
+                     "detail=the staged bytes hash to %s, not to the remembered fingerprint; nothing recorded\n", fingerprint_text(fingerprint).c_str(), l->image_ea, l->image_bytes, fingerprint_text(actual).c_str());
         return;
     }
     w.active = true;
@@ -643,8 +632,7 @@ bool capture_job_end(::spu_context* ctx)
         } else {
             image.captured.fetch_add(1, kRelaxed);
             if (w.unresolved) image.captured_unresolved.fetch_add(1, kRelaxed);
-            std::fprintf(stderr, "[jq2-xdiff] captured image=%s queue=%u seq=%u end=%s path=%s\n",
-                         fingerprint_text(w.fingerprint).c_str(), w.queue, w.seq, spu_xdiff_end_id(end.end_class), path.c_str());
+            PS3_LOG(PS3_LOG_INFO, "jq2-xdiff", "captured image=%s queue=%u seq=%u end=%s path=%s\n", fingerprint_text(w.fingerprint).c_str(), w.queue, w.seq, spu_xdiff_end_id(end.end_class), path.c_str());
         }
     }
     if (sample) {

@@ -36,6 +36,7 @@ with tempfile.TemporaryDirectory(prefix="spu-sdcrz-") as tmp:
     # a fixture that inlines mfc_submit() must link the typed configuration
     # and the named-stop runtime.
     c_sources = [spu / "tests/test_spu_sdcrz.c", *[spu / name for name in common],
+                 root / "runtime/diag/ps3_log.c",
                  root / "runtime/platform/win32_compat.c", root / "runtime/platform/host_clock.c", root / "runtime/platform/host_wait.c"]
     objects = []
     for index, src in enumerate(c_sources):
@@ -43,8 +44,7 @@ with tempfile.TemporaryDirectory(prefix="spu-sdcrz-") as tmp:
         subprocess.run([os.environ.get("CC", "cc"), *cflags, "-c", str(src),
                         "-o", str(obj)], check=True)
         objects.append(str(obj))
-    for src in (root / "runtime/config/config.cpp", root / "runtime/diag/stop.cpp",
-                root / "tests/ps3_log_null.cpp"):
+    for src in (root / "runtime/config/config.cpp", root / "runtime/diag/stop.cpp"):
         obj = tmp / (src.stem + ".o")
         subprocess.run([os.environ.get("CXX", "c++"), *cxxflags, "-c", str(src),
                         "-o", str(obj)], check=True)

@@ -14,6 +14,7 @@
 #define SPU_HELPERS_H
 
 #include "spu_context.h"
+#include "../../include/ps3emu/ps3_log.h"
 #include <string.h>
 #include <math.h>
 
@@ -189,7 +190,7 @@ static inline void spu_unsupported(uint32_t pc, const char* mnemonic)
     static SPU_THREAD_LOCAL int warned;
     if (warned < 64) {
         warned++;
-        fprintf(stderr, "[spu] UNSUPPORTED %s at LS 0x%05X -- executed, "
+        PS3_LOG(PS3_LOG_INFO, "spu", "UNSUPPORTED %s at LS 0x%05X -- executed, "
                         "result is wrong from here\n", mnemonic, pc);
         fflush(stderr);
     }

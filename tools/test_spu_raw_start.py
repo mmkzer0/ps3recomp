@@ -2,8 +2,12 @@
 """Raw SPU start through the real spu_raw.c: SPU_RunCntl runs the program on a host thread of its own."""
 import os
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import spu_fixture_link
 
 if os.name == 'nt':
     print('SKIP: fixture requires the POSIX compiler/linker')
@@ -13,8 +17,9 @@ spu = root / 'runtime/spu'
 env = {k: v for k, v in os.environ.items() if not k.startswith('SPU_')}
 with tempfile.TemporaryDirectory(prefix='spu-raw-start-') as tmp:
     binary = Path(tmp) / 'test'
-    subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG',
-                    '-I'+str(root/'include'), '-I'+str(spu), '-I'+str(root/'runtime/platform'),
-                    str(spu/'tests/test_spu_raw_start.c'), '-pthread', '-o', str(binary)], check=True)
+    spu_fixture_link.build([spu/'tests/test_spu_raw_start.c', root/'runtime/diag/ps3_log.c'], binary,
+                           ['-std=gnu17', '-O1', '-UNDEBUG',
+                            '-I'+str(root/'include'), '-I'+str(spu),
+                            '-I'+str(root/'runtime/platform')], tmp, runtime_c=False)
     subprocess.run([str(binary)], check=True, timeout=30, cwd=tmp, env=env,
                    stderr=subprocess.DEVNULL if os.environ.get('CI') else None)

@@ -16,6 +16,7 @@
 
 #include "memory/reservation.h"
 #include "ps3emu/endian.h"
+#include "ps3emu/ps3_log.h"
 
 namespace ps3recomp::spurs::jq2 {
 
@@ -53,7 +54,7 @@ int rmw(std::uint8_t* line, void* user)
         if (new_head != head_raw && new_tail != tail_raw) {
             /* No transition changes both doublewords (port.hpp), and two
              * separate stores would not be one update. */
-            std::fprintf(stderr, "[jq2-port] a transition changed both accounting doublewords\n");
+            PS3_LOG(PS3_LOG_INFO, "jq2-port", "a transition changed both accounting doublewords\n");
             std::abort();
         }
         /* The model's lock excludes every reported writer; the compare exchange

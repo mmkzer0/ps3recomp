@@ -22,6 +22,7 @@
 #include <string.h>
 #include <stdint.h>
 #include "ps3emu/log_first.h"
+#include "ps3emu/ps3_log.h"
 #include "ps3emu/stop.h"
 #include "../../runtime/memory/vm.h"   /* vm_range_ok / vm_guest_limit: the guest arena rule */
 extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;   /* the calling guest thread, for a stop's site */
@@ -175,7 +176,7 @@ static EventFlagSync* ef_sync_get(uint32_t ea)
     if (!s) {
         s = ef_sync_alloc(ea);
         if (s)
-            fprintf(stderr, "[cellSpurs] event flag 0x%08X used before Initialize "
+            PS3_LOG(PS3_LOG_INFO, "cellSpurs", "event flag 0x%08X used before Initialize "
                             "-- sync slot auto-allocated\n", ea);
     }
     return s;
@@ -340,7 +341,7 @@ static void spurs_ef_set_locked(uint32_t ea, u16 bits)
             uint32_t taskset_ea = (uint32_t)vm_read64(ea + EF_ADDR);
             u32 taskId = vm_read8(ea + EF_WAITING_TASK_ID + s);
             if (ps3_log_verbose())
-                fprintf(stderr, "[cellSpurs] EventFlagSet 0x%08X satisfies SPU task "
+                PS3_LOG(PS3_LOG_INFO, "cellSpurs", "EventFlagSet 0x%08X satisfies SPU task "
                         "slot %d (taskset=0x%08X task=%u)\n", ea, s, taskset_ea, taskId);
             spu_taskset_signal_task(taskset_ea, taskId);
         }
@@ -395,11 +396,8 @@ static void spurs_ef_set_locked(uint32_t ea, u16 bits)
                 extern void spu_taskset_latch_wake(uint32_t);
                 spu_taskset_latch_wake(taskset_ea);
             }
-            static int _n = 0;
-            if (woke && PS3_LOG_FIRST(_n, 12))
-                fprintf(stderr, "[cellSpurs] EventFlagSet 0x%08X woke %d parked "
-                                "task(s) on taskset 0x%08X (no wait slot)\n",
-                        ea, woke, taskset_ea);
+            if (woke) PS3_LOG_N(12, PS3_LOG_INFO, "cellSpurs", "EventFlagSet 0x%08X woke %d parked "
+                                "task(s) on taskset 0x%08X (no wait slot)\n", ea, woke, taskset_ea);
         }
     }
 }
@@ -1108,14 +1106,12 @@ static s32 spurs_create_taskset(const char* api, CellSpurs* spurs, CellSpursTask
     /* Args arrive as guest effective addresses (ps3_hle_call passes raw guest
      * register values); translate to host before dereferencing. */
     if (!spurs_ea || !taskset_ea) {
-        fprintf(stderr, "[cellSpurs] CreateTaskset REJECT null (spurs=0x%08X taskset=0x%08X)\n",
-                spurs_ea, taskset_ea);
+        PS3_LOG(PS3_LOG_INFO, "cellSpurs", "CreateTaskset REJECT null (spurs=0x%08X taskset=0x%08X)\n", spurs_ea, taskset_ea);
         return CELL_SPURS_TASK_ERROR_NULL_POINTER;
     }
 
     if (!spurs_inst_find(spurs_ea)) {
-        fprintf(stderr, "[cellSpurs] CreateTaskset REJECT unregistered spurs=0x%08X (taskset=0x%08X)\n",
-                spurs_ea, taskset_ea);
+        PS3_LOG(PS3_LOG_INFO, "cellSpurs", "CreateTaskset REJECT unregistered spurs=0x%08X (taskset=0x%08X)\n", spurs_ea, taskset_ea);
         return CELL_SPURS_CORE_ERROR_STAT;
     }
 
@@ -1402,7 +1398,7 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
     CellSpursTaskId* taskId_h = GUEST_PTR(taskId, CellSpursTaskId*);
 
     if (!taskset) {
-        fprintf(stderr, "[cellSpurs] CreateTask REJECT null taskset (elf=0x%08X)\n", elf_ea);
+        PS3_LOG(PS3_LOG_INFO, "cellSpurs", "CreateTask REJECT null taskset (elf=0x%08X)\n", elf_ea);
         return CELL_SPURS_TASK_ERROR_NULL_POINTER;
     }
 
@@ -1410,11 +1406,11 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
      * a null taskset or ELF is NULL_POINTER, and the ELF's address must be
      * 16-byte aligned (ALIGN) under either SDK branch. */
     if (!elf_ea) {
-        fprintf(stderr, "[cellSpurs] CreateTask REJECT null elf (taskset=0x%08X)\n", taskset_ea);
+        PS3_LOG(PS3_LOG_INFO, "cellSpurs", "CreateTask REJECT null elf (taskset=0x%08X)\n", taskset_ea);
         return CELL_SPURS_TASK_ERROR_NULL_POINTER;
     }
     if (elf_ea & 15u) {
-        fprintf(stderr, "[cellSpurs] CreateTask REJECT unaligned elf 0x%08X (taskset=0x%08X)\n", elf_ea, taskset_ea);
+        PS3_LOG(PS3_LOG_INFO, "cellSpurs", "CreateTask REJECT unaligned elf 0x%08X (taskset=0x%08X)\n", elf_ea, taskset_ea);
         return CELL_SPURS_TASK_ERROR_ALIGN;
     }
 
@@ -1429,32 +1425,27 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
     { const u32 sdk = ps3_process_sdk_version();
       const u32 ctx_mask = sdk > 0x27FFFFu ? 0x7Fu : 0x0Fu;
       if (context_ea & ctx_mask) {
-          fprintf(stderr, "[cellSpurs] CreateTask REJECT misaligned context 0x%08X (sdk 0x%08X mask 0x%X)\n",
-                  context_ea, sdk, ctx_mask);
+          PS3_LOG(PS3_LOG_INFO, "cellSpurs", "CreateTask REJECT misaligned context 0x%08X (sdk 0x%08X mask 0x%X)\n", context_ea, sdk, ctx_mask);
           return CELL_SPURS_TASK_ERROR_ALIGN;
       } }
     if (context_ea && sizeContext <= 0x3FFu) {
-        fprintf(stderr, "[cellSpurs] CreateTask REJECT context size %u (taskset=0x%08X)\n",
-                sizeContext, taskset_ea);
+        PS3_LOG(PS3_LOG_INFO, "cellSpurs", "CreateTask REJECT context size %u (taskset=0x%08X)\n", sizeContext, taskset_ea);
         return CELL_SPURS_TASK_ERROR_INVAL;
     }
 
     { const s32 hdr = spurs_task_elf_header_code(elf_ea, "cellSpursCreateTask");
       if (hdr) {
-          fprintf(stderr, "[cellSpurs] CreateTask REJECT task ELF header 0x%08X (taskset=0x%08X)\n",
-                  elf_ea, taskset_ea);
+          PS3_LOG(PS3_LOG_INFO, "cellSpurs", "CreateTask REJECT task ELF header 0x%08X (taskset=0x%08X)\n", elf_ea, taskset_ea);
           return hdr;
       } }
 
     if (lsPattern_ea && spurs_task_ls_pattern_bad(task_lsp, context_ea, sizeContext)) {
-        fprintf(stderr, "[cellSpurs] CreateTask REJECT lsPattern 0x%08X for context 0x%08X size %u\n",
-                lsPattern_ea, context_ea, sizeContext);
+        PS3_LOG(PS3_LOG_INFO, "cellSpurs", "CreateTask REJECT lsPattern 0x%08X for context 0x%08X size %u\n", lsPattern_ea, context_ea, sizeContext);
         return CELL_SPURS_TASK_ERROR_INVAL;
     }
 
     if (!g_ydkj_real_taskset_ea) { /* real-BE init flag (native ->initialized clobbered by BE layout) */
-        fprintf(stderr, "[cellSpurs] CreateTask REJECT no-init (taskset=0x%08X elf=0x%08X)\n",
-                taskset_ea, elf_ea);
+        PS3_LOG(PS3_LOG_INFO, "cellSpurs", "CreateTask REJECT no-init (taskset=0x%08X elf=0x%08X)\n", taskset_ea, elf_ea);
         return CELL_SPURS_TASK_ERROR_STAT;
     }
 
@@ -1534,7 +1525,7 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
                  * streams with null data buffers (fill gap). */
                 uint32_t ho = task_arg[2];
                 if (ho >= 0x10000 && ho < 0x50000000u) {
-                    fprintf(stderr, "[heapobj] 0x%08X count@+0xC8=0x%08X\n", ho, vm_read32(ho + 0xC8));
+                    PS3_LOG(PS3_LOG_INFO, "heapobj", "0x%08X count@+0xC8=0x%08X\n", ho, vm_read32(ho + 0xC8));
                     for (int o = 0; o < 0x160; o += 16)
                         fprintf(stderr, "  +%03X: %08X %08X %08X %08X\n", o,
                                 vm_read32(ho+o), vm_read32(ho+o+4), vm_read32(ho+o+8), vm_read32(ho+o+12));
@@ -1546,7 +1537,7 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
                 uint32_t d = task_arg[3];
                 if (d >= 0x10040 && d < 0x50000000u) {
                     uint32_t db = d - 64;   /* 0x0094F6C0 = v10+1344 */
-                    fprintf(stderr, "[descblk] v10+1344=0x%08X (a1[141]@+0x20, a1[140]@+0x24):\n", db);
+                    PS3_LOG(PS3_LOG_INFO, "descblk", "v10+1344=0x%08X (a1[141]@+0x20, a1[140]@+0x24):\n", db);
                     for (int o = 0; o < 0x40; o += 16)
                         fprintf(stderr, "  +%02X: %08X %08X %08X %08X\n", o,
                                 vm_read32(db+o), vm_read32(db+o+4), vm_read32(db+o+8), vm_read32(db+o+12));
@@ -1558,9 +1549,8 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
                  * one does). Only for task 0 (offset 628); task 1 uses +688. */
                 uint32_t a1 = (uint32_t)(uintptr_t)taskId - 628u;
                 if (a1 < 0x50000000u)
-                    fprintf(stderr, "[a1obj] a1=0x%08X  a1+0x230(dsp0)=0x%08X val=0x%08X  "
-                            "a1+0x234(dsp1)=0x%08X val=0x%08X\n", a1,
-                            a1+0x230, vm_read32(a1+0x230), a1+0x234, vm_read32(a1+0x234));
+                    PS3_LOG(PS3_LOG_INFO, "a1obj", "a1=0x%08X  a1+0x230(dsp0)=0x%08X val=0x%08X  "
+                            "a1+0x234(dsp1)=0x%08X val=0x%08X\n", a1, a1+0x230, vm_read32(a1+0x230), a1+0x234, vm_read32(a1+0x234));
                 fflush(stderr);
             }
 
@@ -1600,8 +1590,7 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
         }
     }
 
-    fprintf(stderr, "[cellSpurs] CreateTask: taskset 0x%08X has no free task id (all 128 enabled)\n",
-            taskset_ea);
+    PS3_LOG(PS3_LOG_INFO, "cellSpurs", "CreateTask: taskset 0x%08X has no free task id (all 128 enabled)\n", taskset_ea);
     /* 0x80410901: the creator retries its slot scan and gives up with AGAIN
      * (ori 0x901 at 0x02011F20), not NOMEM -- the firmware never builds
      * 0x80410904 there. */
@@ -2008,16 +1997,15 @@ static DWORD WINAPI pm_write_watch(LPVOID unused)
     for (int t = 0; t < 6000; t++) {          /* ~60s at 10ms */
         u32 exe = vm_read32(ea + 0xAF4), hot = vm_read32(ea + 0x7E4);
         if ((exe != last_exe && exe != 0) || (hot != last_hot && hot != 0xFFFFFFFFu)) {
-            fprintf(stderr, "[pm-watch] PM ASSEMBLED at ~%dms: exe@0x14f4 %08X->%08X hot@0x11e4 %08X->%08X\n",
-                    t * 10, last_exe, exe, last_hot, hot);
+            PS3_LOG(PS3_LOG_INFO, "pm-watch", "PM ASSEMBLED at ~%dms: exe@0x14f4 %08X->%08X hot@0x11e4 %08X->%08X\n", t * 10, last_exe, exe, last_hot, hot);
             FILE* pf = fopen("lbp_spu/pm_wwsjob_complete.bin", "wb");
             if (pf) { fwrite(vm_base + ea, 1, sz, pf); fclose(pf);
-                fprintf(stderr, "[pm-watch] wrote lbp_spu/pm_wwsjob_complete.bin (0x%X bytes)\n", sz); }
+                PS3_LOG(PS3_LOG_INFO, "pm-watch", "wrote lbp_spu/pm_wwsjob_complete.bin (0x%X bytes)\n", sz); }
             return 0;
         }
         Sleep(10);
     }
-    fprintf(stderr, "[pm-watch] PM NEVER assembled in 60s (exe@0x14f4=%08X hot@0x11e4=%08X) "
+    PS3_LOG(PS3_LOG_INFO, "pm-watch", "PM NEVER assembled in 60s (exe@0x14f4=%08X hot@0x11e4=%08X) "
             "-> assembly is HLE'd/external\n", vm_read32(ea + 0xAF4), vm_read32(ea + 0x7E4));
     return 0;
 }
@@ -2074,15 +2062,14 @@ s32 cellSpursAddWorkloadWithAttribute(CellSpurs* spurs,
             u32 exe = vm_read32(pm_ea + 0xAF4);          /* LS 0x14f4 executeStage */
             int zeros = 0; for (u32 o = 0xEE; o < 0x7B0; o += 4)
                 if (vm_read32(pm_ea + o) == 0) zeros += 4;
-            fprintf(stderr, "[pm-dump] wid-PM ea=0x%08X sz=0x%X exe@+0xAF4=%08X (want 24F880ED) "
-                    "holeZeros=%d/1730 -> %s\n", pm_ea, pm_sz, exe, zeros,
-                    (exe == 0x24F880EDu ? "COMPLETE (we assemble it)"
+            PS3_LOG(PS3_LOG_INFO, "pm-dump", "wid-PM ea=0x%08X sz=0x%X exe@+0xAF4=%08X (want 24F880ED) "
+                    "holeZeros=%d/1730 -> %s\n", pm_ea, pm_sz, exe, zeros, (exe == 0x24F880EDu ? "COMPLETE (we assemble it)"
                                         : zeros > 1000 ? "HOLEY (assembly skipped)" : "PARTIAL"));
             static int _dumped = 0;
             if (!_dumped) { _dumped = 1;
                 FILE* pf = fopen("lbp_spu/pm_wwsjob_runtime.bin", "wb");
                 if (pf) { fwrite(vm_base + pm_ea, 1, pm_sz, pf); fclose(pf);
-                    fprintf(stderr, "[pm-dump] wrote lbp_spu/pm_wwsjob_runtime.bin (0x%X bytes)\n", pm_sz); }
+                    PS3_LOG(PS3_LOG_INFO, "pm-dump", "wrote lbp_spu/pm_wwsjob_runtime.bin (0x%X bytes)\n", pm_sz); }
                 /* WRITE-WATCH: spawn a poller that reports if/when the PM's
                  * placeholder hot-loop (LS 0x11e4, currently 0xFFFFFFFF) and
                  * executeStage (LS 0x14f4, currently 0) get real code written by
@@ -2660,11 +2647,8 @@ s32 cellSpursEventFlagSet(CellSpursEventFlag* eventFlag, u16 bits)
         return CELL_SPURS_TASK_ERROR_STAT;
 
     { static unsigned _n=0; if (_n++ < 40 || (_n%1000)==0)   /* unsigned: periodic, wrapping is defined */
-        fprintf(stderr, "[cellSpurs] EventFlagSet#%u flagEA=0x%08X bits=0x%04X "
-                "events=0x%04X used=0x%04X pend=0x%04X mode=0x%04X\n",
-                _n, ea, (unsigned)bits,
-                vm_read16(ea + EF_EVENTS), vm_read16(ea + EF_SPU_USED_SLOTS),
-                vm_read16(ea + EF_SPU_PENDING_RECV), vm_read16(ea + EF_SPU_WAIT_MODE)); }
+        PS3_LOG(PS3_LOG_INFO, "cellSpurs", "EventFlagSet#%u flagEA=0x%08X bits=0x%04X "
+                "events=0x%04X used=0x%04X pend=0x%04X mode=0x%04X\n", _n, ea, (unsigned)bits, vm_read16(ea + EF_EVENTS), vm_read16(ea + EF_SPU_USED_SLOTS), vm_read16(ea + EF_SPU_PENDING_RECV), vm_read16(ea + EF_SPU_WAIT_MODE)); }
 
     ef_lock(sync);
     spurs_ef_set_locked(ea, bits);
@@ -2748,17 +2732,14 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
             if (++waits % 500 == 0) {
                 static int _n = 0;
                 if (_n < 24) { _n++;
-                    fprintf(stderr, "[cellSpurs] EventFlagWait BLOCKED tid=%lu %us on pattern 0x%04X "
+                    PS3_LOG(PS3_LOG_INFO, "cellSpurs", "EventFlagWait BLOCKED tid=%lu %us on pattern 0x%04X "
                                     "(mode=%s, bits=0x%04X) flagEA=0x%08X -- waiting for an SPU "
-                                    "workload to cellSpursEventFlagSet it\n",
-                            (unsigned long)GetCurrentThreadId(), waits / 500, pattern,
-                            mode == CELL_SPURS_EVENT_FLAG_AND ? "AND" : "OR",
-                            current, ea);
+                                    "workload to cellSpursEventFlagSet it\n", (unsigned long)GetCurrentThreadId(), waits / 500, pattern, mode == CELL_SPURS_EVENT_FLAG_AND ? "AND" : "OR", current, ea);
                     fflush(stderr);
                 }
             }
             if (s_force && waits >= 1000) {
-                fprintf(stderr, "[cellSpurs] EventFlagWait: SPURS_EF_FORCE -- faking pattern "
+                PS3_LOG(PS3_LOG_INFO, "cellSpurs", "EventFlagWait: SPURS_EF_FORCE -- faking pattern "
                                 "0x%04X (NOT real; A/B only)\n", pattern);
                 vm_write16(ea + EF_EVENTS, (u16)(current | pattern));
             }
@@ -2771,10 +2752,8 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
     vm_write16(bits_ea, current);
     u16 received = (mode == CELL_SPURS_EVENT_FLAG_AND) ? pattern
                                                        : (u16)(current & pattern);
-    { static int _n = 0; if (PS3_LOG_FIRST(_n, 40))
-        fprintf(stderr, "[cellSpurs] EventFlagWait WAKE tid=%lu flagEA=0x%08X "
-                "pattern=0x%04X got=0x%04X (waits=%u)\n",
-                (unsigned long)GetCurrentThreadId(), ea, pattern, current, waits); }
+    { PS3_LOG_N(40, PS3_LOG_INFO, "cellSpurs", "EventFlagWait WAKE tid=%lu flagEA=0x%08X "
+                "pattern=0x%04X got=0x%04X (waits=%u)\n", (unsigned long)GetCurrentThreadId(), ea, pattern, current, waits); }
     if (vm_read8(ea + EF_CLEAR_MODE) == CELL_SPURS_EVENT_FLAG_CLEAR_AUTO) {
         /* Clear from the CURRENT word: bits an SPU set since `current` was
          * read must survive. */

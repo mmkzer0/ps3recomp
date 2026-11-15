@@ -19,6 +19,7 @@ with tempfile.TemporaryDirectory(prefix='spurs-scheduler-') as tmp:
     # the fixture must link the typed configuration and the named-stop runtime.
     c_sources=[r/'tests/test_spurs_scheduler.c',
                *[r/'runtime/spu'/f'{u}.c' for u in units],
+               r/'runtime/diag/ps3_log.c',
                r/'runtime/memory/reservation.c', r/'runtime/memory/label_window.c',
                r/'runtime/platform/win32_compat.c', r/'runtime/platform/host_clock.c', r/'runtime/platform/host_wait.c']
     objects=[]
@@ -26,7 +27,7 @@ with tempfile.TemporaryDirectory(prefix='spurs-scheduler-') as tmp:
         obj=tmp/f'{index}.o'
         subprocess.run([os.environ.get('CC','cc'),*cflags,'-c',str(src),'-o',str(obj)],check=True)
         objects.append(str(obj))
-    for src in (r/'runtime/config/config.cpp', r/'runtime/diag/stop.cpp', r/'tests/ps3_log_null.cpp'):
+    for src in (r/'runtime/config/config.cpp', r/'runtime/diag/stop.cpp'):
         obj=tmp/(src.stem+'.o')
         subprocess.run([os.environ.get('CXX','c++'),*cxxflags,'-c',str(src),'-o',str(obj)],check=True)
         objects.append(str(obj))

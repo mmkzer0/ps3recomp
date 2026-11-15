@@ -8,6 +8,7 @@
  */
 
 #include "jq2/xdiff_audit.hpp"
+#include "ps3emu/ps3_log.h"
 
 #include <condition_variable>
 #include <cstdio>
@@ -147,9 +148,7 @@ void name_unfinished(ImageAudit& image, std::uint64_t fingerprint, std::uint32_t
                      std::uint32_t verdict, std::uint32_t reason, const char* detail)
 {
     if (reason >= kReasonSlots || image.named_void[reason].exchange(true, kRelaxed)) return;
-    std::fprintf(stderr, "[jq2-xdiff] %s image=%s queue=%u seq=%u reason=%s%s%s\n", spu_xdiff_verdict_id(verdict),
-                 fingerprint_text(fingerprint).c_str(), queue, seq, spu_xdiff_reason_id(reason),
-                 detail != nullptr ? " detail=" : "", detail != nullptr ? detail : "");
+    PS3_LOG(PS3_LOG_INFO, "jq2-xdiff", "%s image=%s queue=%u seq=%u reason=%s%s%s\n", spu_xdiff_verdict_id(verdict), fingerprint_text(fingerprint).c_str(), queue, seq, spu_xdiff_reason_id(reason), detail != nullptr ? " detail=" : "", detail != nullptr ? detail : "");
 }
 
 /* ---- the audit thread ------------------------------------------------------------------ */
@@ -179,8 +178,7 @@ std::string write_fixture(const Settings& cfg, Sample& s, const spu_xdiff_verdic
         return file;
     }
     image.fixtures_failed.fetch_add(1, kRelaxed);
-    std::fprintf(stderr, "[jq2-xdiff] fixture-failed image=%s queue=%u seq=%u reason=%s detail=%s\n",
-                 fingerprint_text(s.fingerprint).c_str(), s.queue, s.seq, spu_xdiff_reason_id(err.reason), err.detail);
+    PS3_LOG(PS3_LOG_INFO, "jq2-xdiff", "fixture-failed image=%s queue=%u seq=%u reason=%s detail=%s\n", fingerprint_text(s.fingerprint).c_str(), s.queue, s.seq, spu_xdiff_reason_id(err.reason), err.detail);
     return "none";
 }
 
@@ -199,12 +197,8 @@ std::string report_divergence(const Settings& cfg, Sample& s, const spu_xdiff_ve
     if (rec.effect_index != SPU_XDIFF_NO_EFFECT) std::snprintf(effect, sizeof effect, "%u", rec.effect_index);
     if (rec.where != SPU_XDIFF_NO_WHERE) std::snprintf(where, sizeof where, "0x%X", rec.where);
     /* One call, one line: the workers print too. */
-    std::fprintf(stderr,
-                 "[jq2-xdiff] differ image=%s queue=%u seq=%u reason=%s class=%s effect=%s where=%s authority=%s "
-                 "subject=%s fixture=%s\n",
-                 fingerprint_text(s.fingerprint).c_str(), s.queue, s.seq, spu_xdiff_reason_id(rec.reason),
-                 spu_xdiff_differ_class_id(klass), effect, where, tier_name(s.authority_tier), tier_name(subject_tier),
-                 path.c_str());
+    PS3_LOG(PS3_LOG_INFO, "jq2-xdiff", "differ image=%s queue=%u seq=%u reason=%s class=%s effect=%s where=%s authority=%s "
+                 "subject=%s fixture=%s\n", fingerprint_text(s.fingerprint).c_str(), s.queue, s.seq, spu_xdiff_reason_id(rec.reason), spu_xdiff_differ_class_id(klass), effect, where, tier_name(s.authority_tier), tier_name(subject_tier), path.c_str());
     std::fflush(stderr);
     return path;
 }
@@ -228,10 +222,8 @@ void report_void_branch(const Settings& cfg, Sample& s, const spu_xdiff_verdict_
             image.fixtures_over.fetch_add(1, kRelaxed);
         if (!pcs.named_over) {
             pcs.named_over = true;
-            std::fprintf(stderr,
-                         "[jq2-xdiff] void-pc-over image=%s reason=%s detail=%zu distinct subject pcs are already "
-                         "named for the image; further gaps are counted, not named\n",
-                         fingerprint_text(s.fingerprint).c_str(), spu_xdiff_reason_id(rec.reason), pcs.count);
+            PS3_LOG(PS3_LOG_INFO, "jq2-xdiff", "void-pc-over image=%s reason=%s detail=%zu distinct subject pcs are already "
+                         "named for the image; further gaps are counted, not named\n", fingerprint_text(s.fingerprint).c_str(), spu_xdiff_reason_id(rec.reason), pcs.count);
         }
         return;
     }
@@ -242,13 +234,9 @@ void report_void_branch(const Settings& cfg, Sample& s, const spu_xdiff_verdict_
     pcs.pc[pcs.count++] = rec.subject_pc;
 
     if (!image.named_void[rec.reason].exchange(true, kRelaxed)) {
-        std::fprintf(stderr, "[jq2-xdiff] void image=%s queue=%u seq=%u reason=%s subject_pc=0x%05X\n",
-                     fingerprint_text(s.fingerprint).c_str(), s.queue, s.seq, spu_xdiff_reason_id(rec.reason),
-                     rec.subject_pc);
+        PS3_LOG(PS3_LOG_INFO, "jq2-xdiff", "void image=%s queue=%u seq=%u reason=%s subject_pc=0x%05X\n", fingerprint_text(s.fingerprint).c_str(), s.queue, s.seq, spu_xdiff_reason_id(rec.reason), rec.subject_pc);
     } else {
-        std::fprintf(stderr, "[jq2-xdiff] void-pc image=%s queue=%u seq=%u reason=%s subject_pc=0x%05X\n",
-                     fingerprint_text(s.fingerprint).c_str(), s.queue, s.seq, spu_xdiff_reason_id(rec.reason),
-                     rec.subject_pc);
+        PS3_LOG(PS3_LOG_INFO, "jq2-xdiff", "void-pc image=%s queue=%u seq=%u reason=%s subject_pc=0x%05X\n", fingerprint_text(s.fingerprint).c_str(), s.queue, s.seq, spu_xdiff_reason_id(rec.reason), rec.subject_pc);
     }
     write_fixture(cfg, s, rec);
 }
@@ -334,8 +322,7 @@ void lower_priority()
     detail = "setpriority failed";
 #endif
     if (!ok)
-        std::fprintf(stderr, "[jq2-xdiff] audit-priority reason=not-lowered detail=%s; the audit runs at normal priority\n",
-                     detail);
+        PS3_LOG(PS3_LOG_INFO, "jq2-xdiff", "audit-priority reason=not-lowered detail=%s; the audit runs at normal priority\n", detail);
 }
 
 void audit_main(const Settings* cfg)
@@ -412,10 +399,8 @@ void audit_configure()
         s->budget = ps3_cfg_spu_xdiff_budget();
         if (s->mode != AuditMode::off) {
             if (const char* knob = spu_xdiff_refused_knob()) {
-                std::fprintf(stderr,
-                             "[jq2-xdiff] audit-off reason=refused-knob detail=%s is set; a shadow under it would compare "
-                             "another program, so nothing is shadowed\n",
-                             knob);
+                PS3_LOG(PS3_LOG_INFO, "jq2-xdiff", "audit-off reason=refused-knob detail=%s is set; a shadow under it would compare "
+                             "another program, so nothing is shadowed\n", knob);
                 s->mode = AuditMode::off;
             }
         }
@@ -423,21 +408,19 @@ void audit_configure()
             s->dir = ps3_cfg_spu_xdiff_dir();
             std::string why;
             if (!s->dir.empty() && !xdiff_dir_usable(s->dir, why)) {
-                std::fprintf(stderr,
-                             "[jq2-xdiff] fixtures-off reason=bad-dir detail=spu.xdiff_dir %s %s; differences are reported "
-                             "without a fixture\n",
-                             s->dir.c_str(), why.c_str());
+                PS3_LOG(PS3_LOG_INFO, "jq2-xdiff", "fixtures-off reason=bad-dir detail=spu.xdiff_dir %s %s; differences are reported "
+                             "without a fixture\n", s->dir.c_str(), why.c_str());
                 s->dir.clear();
             }
             /* The shadow context is allocated here, before the thread and before any producer: a host that cannot
              * allocate it never records a sample. */
             s->shadow = g_shadow_alloc_fail.load(kRelaxed) ? nullptr : spu_xdiff_shadow_new();
             if (s->shadow == nullptr) {
-                std::fprintf(stderr, "[jq2-xdiff] audit-off reason=no-memory detail=the shadow context could not be allocated; "
+                PS3_LOG(PS3_LOG_INFO, "jq2-xdiff", "audit-off reason=no-memory detail=the shadow context could not be allocated; "
                                      "nothing is shadowed\n");
                 s->mode = AuditMode::off;
             } else if (!start_thread(s)) {
-                std::fprintf(stderr, "[jq2-xdiff] audit-off reason=thread detail=the host refused the audit thread; nothing is shadowed\n");
+                PS3_LOG(PS3_LOG_INFO, "jq2-xdiff", "audit-off reason=thread detail=the host refused the audit thread; nothing is shadowed\n");
                 spu_xdiff_shadow_free(s->shadow);
                 s->shadow = nullptr;
                 s->mode = AuditMode::off;
@@ -563,17 +546,13 @@ void audit_note_not_eligible(ImageAudit& image, std::uint64_t fingerprint, Shado
     if (why == ShadowCheck::no_body) {
         image.no_body.fetch_add(1, kRelaxed);
         if (!image.named_no_body.exchange(true, kRelaxed))
-            std::fprintf(stderr,
-                         "[jq2-xdiff] audit-ineligible image=%s reason=no-body detail=the image has an inventory but no "
-                         "registered body to shadow the interpreter with\n",
-                         fingerprint_text(fingerprint).c_str());
+            PS3_LOG(PS3_LOG_INFO, "jq2-xdiff", "audit-ineligible image=%s reason=no-body detail=the image has an inventory but no "
+                         "registered body to shadow the interpreter with\n", fingerprint_text(fingerprint).c_str());
     } else if (why == ShadowCheck::no_twin) {
         image.no_twin.fetch_add(1, kRelaxed);
         if (!image.named_no_twin.exchange(true, kRelaxed))
-            std::fprintf(stderr,
-                         "[jq2-xdiff] audit-ineligible image=%s reason=no-twin detail=the registered body has no budgeted "
-                         "twin, and an unbounded lifted shadow could hang the audit thread\n",
-                         fingerprint_text(fingerprint).c_str());
+            PS3_LOG(PS3_LOG_INFO, "jq2-xdiff", "audit-ineligible image=%s reason=no-twin detail=the registered body has no budgeted "
+                         "twin, and an unbounded lifted shadow could hang the audit thread\n", fingerprint_text(fingerprint).c_str());
     }
 }
 

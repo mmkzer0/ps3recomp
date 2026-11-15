@@ -20,6 +20,10 @@ def raw_job_tools():
     from gen_test_raw_job import LS_BASE, build
     return LS_BASE, build
 INCLUDE = TOOLS.parent / 'include'
+# The runtime now logs through ps3_log; the log's configure path (config.cpp/stop.cpp) is unreferenced in
+# these C-only fixtures, so section GC drops it and the logger links without the C++ runtime.
+SECTION_FLAGS = ['-ffunction-sections', '-fdata-sections']
+GC_FLAGS = ['-Wl,-dead_strip'] if sys.platform == 'darwin' else ['-Wl,--gc-sections']
 
 
 def elf(value=7, *, bad_bounds=False, unsupported=False, multi=False, rodata=False):
@@ -271,9 +275,12 @@ class Pipeline(unittest.TestCase):
                 (self.root / 'overlap_control.c').write_text(control)
                 binary = self.root / ('overlap_control.exe' if sys.platform == 'win32' else 'overlap_control')
                 compiled = subprocess.run([cc, '-std=c11', '-I' + str(runtime), '-I' + str(INCLUDE),
+                                *SECTION_FLAGS, *GC_FLAGS,
                                 str(self.root / 'overlap_control.c'), str(self.root / 'workload.c'),
                                 str(self.root / 'registry.c'), str(output / 'registry.c'),
-                                str(output / 'sample' / 'spu_recomp.c'), '-o', str(binary)],
+                                str(output / 'sample' / 'spu_recomp.c'),
+                                str(TOOLS.parent / 'runtime' / 'diag' / 'ps3_log.c'),
+                                '-o', str(binary)],
                                capture_output=True, text=True)
                 self.assertEqual(compiled.returncode, 0, compiled.stderr + compiled.stdout)
                 subprocess.run([str(binary)], check=True)
@@ -319,7 +326,10 @@ class Pipeline(unittest.TestCase):
         cmake_source += f'set(PS3RECOMP_DIR "{TOOLS.parent.as_posix()}")\n'
         cmake_source += 'include("${PS3RECOMP_DIR}/cmake/PS3RecompSPU.cmake")\n'
         cmake_source += 'ps3recomp_generate_spu("${CMAKE_CURRENT_BINARY_DIR}/spu" "${CMAKE_CURRENT_SOURCE_DIR}/input.bin")\n'
-        cmake_source += 'add_executable(proof proof.c workload.c registry.c ${SPU_GENERATED_SOURCES})\n'
+        cmake_source += 'add_executable(proof proof.c workload.c registry.c ${SPU_GENERATED_SOURCES} "${PS3RECOMP_DIR}/runtime/diag/ps3_log.c")\n'
+        cmake_source += 'target_compile_options(proof PRIVATE -ffunction-sections -fdata-sections)\n'
+        cmake_source += ('target_link_options(proof PRIVATE -Wl,-dead_strip)\n' if sys.platform == 'darwin'
+                         else 'target_link_options(proof PRIVATE -Wl,--gc-sections)\n')
         cmake_source += f'target_include_directories(proof PRIVATE "{runtime.as_posix()}" "{INCLUDE.as_posix()}")\n'
         (self.root / 'CMakeLists.txt').write_text(cmake_source)
         build = self.root / 'build'
@@ -517,10 +527,13 @@ class Pipeline(unittest.TestCase):
             + '\n'.join(body) + '\n')
         binary = self.root / ('raw_proof.exe' if sys.platform == 'win32' else 'raw_proof')
         compiled = subprocess.run([cc, '-std=c11', '-I' + str(runtime), '-I' + str(INCLUDE),
+                                   *SECTION_FLAGS, *GC_FLAGS,
                                    str(self.root / 'proof.c'), str(self.root / 'workload.c'),
                                    str(self.root / 'registry.c'),
                                    str(self.output / 'spu_workloads.c'),
-                                   str(lifted / 'spu_recomp.c'), '-o', str(binary)],
+                                   str(lifted / 'spu_recomp.c'),
+                                   str(TOOLS.parent / 'runtime' / 'diag' / 'ps3_log.c'),
+                                   '-o', str(binary)],
                                   capture_output=True, text=True, check=False)
         self.assertEqual(compiled.returncode, 0, compiled.stderr + compiled.stdout)
         subprocess.run([str(binary)], check=True)

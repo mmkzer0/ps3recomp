@@ -21,7 +21,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
-#include "ps3emu/log_first.h"
+#include "ps3emu/ps3_log.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -152,7 +152,7 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
         unsigned cap = s_coh_cap ? s_coh_cap * 2u : 64u;
         spu_context** grown = (spu_context**)realloc(s_coh_ctxs, cap * sizeof(*grown));
         if (!grown) {
-            fprintf(stderr, "[spu-coh] cannot register reservation holder %p\n", (void*)ctx);
+            PS3_LOG(PS3_LOG_INFO, "spu-coh", "cannot register reservation holder %p\n", (void*)ctx);
             fflush(stderr);
             abort(); /* A missed holder loses invalidation events, including ABA. */
         }
@@ -232,10 +232,7 @@ void spu_coh_forget_range(uintptr_t lo, uintptr_t hi)
     for (unsigned i = 0; i < s_coh_n;) {
         uintptr_t c = (uintptr_t)s_coh_ctxs[i];
         if (c >= lo && c < hi) {
-            static SPU_THREAD_LOCAL int _n = 0;
-            if (PS3_LOG_FIRST(_n, 16))
-                fprintf(stderr, "[spu-coh] leaked ctx %p (img=%d) dropped at thread exit\n",
-                        (void*)c, s_coh_ctxs[i]->image_id);
+            PS3_LOG_N(16, PS3_LOG_INFO, "spu-coh", "leaked ctx %p (img=%d) dropped at thread exit\n", (void*)c, s_coh_ctxs[i]->image_id);
             s_coh_ctxs[i] = s_coh_ctxs[--s_coh_n];   /* re-check slot i */
         } else {
             i++;
@@ -318,8 +315,7 @@ static SPU_NOINLINE_COLD void spu_coh_resv_lost_report(const spu_context* c, uin
 {
     static SPU_THREAD_LOCAL unsigned long long n;
     if ((++n % 200000) == 1)
-        fprintf(stderr, "[resv-lost] %llu: line 0x%08X taken from img=%d ctx=%p\n",
-                n, line, c->image_id, (const void*)c);
+        PS3_LOG(PS3_LOG_INFO, "resv-lost", "%llu: line 0x%08X taken from img=%d ctx=%p\n", n, line, c->image_id, (const void*)c);
 }
 
 void spu_coh_notify_write(uint32_t ea)

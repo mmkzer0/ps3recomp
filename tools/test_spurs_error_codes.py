@@ -29,6 +29,7 @@ def build(tmp):
     c_sources = [ROOT / "tests/test_spurs_error_codes.c",
                  *[ROOT / "runtime/spu" / f"{u}.c" for u in UNITS],
                  ROOT / "libs/spurs/spurs_taskset.c",
+                 ROOT / "runtime/diag/ps3_log.c",
                  ROOT / "runtime/memory/reservation.c", ROOT / "runtime/memory/label_window.c",
                  ROOT / "runtime/platform/win32_compat.c", ROOT / "runtime/platform/host_clock.c", ROOT / "runtime/platform/host_wait.c"]
     objects = []
@@ -36,8 +37,7 @@ def build(tmp):
         obj = tmp / f"{index}.o"
         subprocess.run([cc, *cflags, "-c", str(src), "-o", str(obj)], check=True)
         objects.append(str(obj))
-    for src in (ROOT / "runtime/config/config.cpp", ROOT / "runtime/diag/stop.cpp",
-                ROOT / "tests/ps3_log_null.cpp"):
+    for src in (ROOT / "runtime/config/config.cpp", ROOT / "runtime/diag/stop.cpp"):
         obj = tmp / (src.stem + ".o")
         subprocess.run([cxx, *cxxflags, "-c", str(src), "-o", str(obj)], check=True)
         objects.append(str(obj))
