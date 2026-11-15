@@ -25,6 +25,7 @@
 #include <string.h>
 
 #include <dirent.h> /* the test is built on POSIX hosts only (CMakeLists.txt, NOT WIN32) */
+#include <unistd.h> /* getpid */
 
 /* Temp files of `path` the writer left in the current directory: `<path>.<pid>.<n>.partial`. */
 static int count_partials(const char* path)
@@ -682,7 +683,11 @@ static void test_name(void)
 
 static void test_files(void)
 {
-    const char* path = "test_spu_xdiff_fixture.spujob";
+    /* One name per process: ctest runs this binary as spu_xdiff_fixture and spu_xdiff_fixture_sweep, in
+     * parallel, in one directory; a shared name let one run remove the other's file. */
+    char path_buf[64];
+    snprintf(path_buf, sizeof path_buf, "test_spu_xdiff_fixture.%ld.spujob", (long)getpid());
+    const char* path = path_buf;
     spu_xdiff_fixture f, g;
     spu_xdiff_error err;
 
