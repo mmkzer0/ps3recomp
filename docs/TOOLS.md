@@ -920,6 +920,56 @@ queue's `JOB` time, because the identification is measured inside the job.
 `incomplete`, `critical_path` (per queue and tid), `images` (per queue and
 overall), `audio_stale` and `trace_cost`.
 
+**xdiff columns** (kinds 32 and 33, `docs/SPU_XDIFF.md` section 14). Kind 32
+`JQ2_BODY` is one per job that has a `JOB` span, `who = q << 8 | w`,
+`a = seq`, `b = tier | disposition << 8 | sat(lift_miss, 255) << 16`: tier 0
+interp, 1 lifted, 2 partial, 3 native; disposition 0 not sampled, 1 queued, 2
+dropped, 3 not eligible. Kind 33 `JQ2_XDIFF` is one per shadow run, `who` and
+`a` those of the job, `b = verdict | reason << 8 | subject tier << 16`. Both
+join kind 29 on `(who, a)`, so each record is charged to the job's image; a
+record with no match (no `IMAGE` span, or an index without a `J` line) goes to
+the unknown-image row, never dropped. Every image row, per queue and overall,
+gains:
+
+```text
+tiers: interp 3, lifted 5, partial 0, native 0; resolver misses 4
+sampled 3 (share 37.5 % of 8 jobs), queued 2, dropped 1, not eligible 1
+verdicts: equal/none 2, differ/end-regs 1
+```
+
+- **tiers**: the kind 32 records per tier. A tier id outside 0-3 is counted as
+  `other tier`, in no column.
+- **sampled**: dispositions 1 (queued) and 2 (dropped), the jobs a sample was
+  taken of. **Not eligible** (disposition 3) is a job that could not be
+  sampled, for example because its image has event branches; it is counted on
+  its own and is neither in `sampled` nor in the share. The **share** is
+  sampled divided by the row's `JOB` count, so a drop-when-full run shows how
+  much of a busy phase it did not check.
+- **resolver misses**: the sum of kind 32's `lift_miss`, which the recorder
+  saturates at 255 per job. A job at 255 is counted in
+  `resolver_miss_saturated` and the printed total says it is a lower bound.
+- **verdicts**: the kind 33 records by verdict and reason. The verdict ids are
+  the offline runner's exit statuses (0 equal, 2 malformed, 3 not-found, 4
+  differ, 5 void); a reason id is the stable value of `SPU_XDIFF_REASONS` in
+  `runtime/spu/spu_xdiff.h` (none 0; differ 16-25; void 32-38; malformed
+  48-50; not-found 64-65), kept with its verdict in the tool
+  (`XDIFF_REASONS`), which is also where
+  the kind numbers 32 and 33 live until `ps3_ftrace.h` defines them. An id the
+  tool does not know, or a reason listed under another verdict, is reported as
+  `unknown verdict N` / `unknown reason N`.
+
+A column whose kind the trace lacks prints as `-` (null in `--json`), never as
+0: kind 32 gives tiers, sampled, dropped, not eligible, resolver misses and the
+share; kind 33 gives the verdicts. A trace with only one of them shows what it
+has, and a trace with neither prints the rest of the report as it was. `--json`
+adds `body` and `verdicts` to every image row (`tiers`, `other_tier`,
+`sampled`, `queued`, `dropped`, `not_eligible`, `other_disposition`,
+`resolver_misses`, `resolver_miss_saturated`, `sampled_share`, `records`;
+`total`, `by_verdict`, `by_reason`) and the top-level `jq2.xdiff_records`
+(counts of both kinds, null when there are none). Without kind 29 the records
+cannot be attributed: the text says so in one line and `xdiff_records` still
+counts them.
+
 Limits: only event-flag waits are walked; a fiber wait (wake 2) carries no
 waiter id, so it is counted and excluded. The path is a model of the blocking
 chain built from the recorded spans, not a measurement of the host scheduler; a
@@ -1008,7 +1058,7 @@ carrying the items above, the first 20 runs in detail in `events`) and
 `incomplete`; a trace without kinds 30-31 prints one line for the section and
 the key is null.
 
-Both kinds are recorded whatever `PS3_FTRACE_MIN_US` says. Exit `0` on a
+Kinds 30-33 are recorded whatever `PS3_FTRACE_MIN_US` says. Exit `0` on a
 report, `2` on an unreadable, truncated, corrupt or malformed trace, a zstd
 trace with no decoder, bad arguments or fewer than three flip requests.
 
