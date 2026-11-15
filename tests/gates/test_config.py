@@ -88,6 +88,7 @@ def test_defaults_without_file_or_environment():
         "spu.dma_repeat_limit": ("256", "default"),
         "spu.dma_repeat_stop_secs": ("0", "default"),
         "spu.mfc_lookup_cache": ("true", "default"),
+        "spu.job_body": ('"interp"', "default"),
         "spu.xdiff_dir": ('""', "default"),
         "spu.xdiff_capture": ("0", "default"),
         "gcm.wait_timeout_ms": ("10000", "default"),
@@ -193,6 +194,7 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
             "spu.dma_repeat_limit": "default",
             "spu.dma_repeat_stop_secs": "default",
             "spu.mfc_lookup_cache": "default",
+            "spu.job_body": "default",
             "spu.xdiff_dir": "default",
             "spu.xdiff_capture": "default",
             "gcm.wait_timeout_ms": "default",
@@ -226,7 +228,8 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
                            "ppu": {"vscr_nj": False, "opd_swap_fixup": False, "null_page": "stop",
                                    "precise_usleep": True},
                            "spu": {"dma_repeat_limit": 256, "dma_repeat_stop_secs": 0,
-                                   "mfc_lookup_cache": True, "xdiff_dir": "", "xdiff_capture": 0},
+                                   "mfc_lookup_cache": True, "job_body": "interp", "xdiff_dir": "",
+                                   "xdiff_capture": 0},
                            "gcm": {"wait_timeout_ms": 10000, "park_resync": False, "park_grace_ms": 50,
                                    "handler_thread": False, "report_spu_hold_ms": 0},
                            "eng": {"depth_clamp": True, "depth_bounds": True},
@@ -330,6 +333,26 @@ def test_null_page_is_stop_or_drop_from_file_and_environment():
     with Cfg("schema = 1", "[ppu]", "null_page = true") as c:      # a bool is the wrong type
         f = config_invalid(probe("--load", c.path, "get"))
         assert f["key"] == "ppu.null_page" and f["line"] == "3", f
+
+
+def test_job_body_is_interp_or_lifted_from_file_and_environment():
+    with Cfg("schema = 1", "[spu]", "# run the registered lifted body of an image", 'job_body = "lifted"') as c:
+        o = options(probe("--load", c.path, "get"))
+        assert o["spu.job_body"] == ('"lifted"', f"file:{c.path}"), o
+        o = options(probe("--load", c.path, "get", PS3RECOMP_SPU_JOB_BODY="interp"))
+        assert o["spu.job_body"] == ('"interp"', "env:PS3RECOMP_SPU_JOB_BODY"), o
+    o = options(probe("get", PS3RECOMP_SPU_JOB_BODY="lifted"))
+    assert o["spu.job_body"] == ('"lifted"', "env:PS3RECOMP_SPU_JOB_BODY"), o
+    for bad in ("lift", "Lifted", "INTERP", "", "true"):
+        with Cfg("schema = 1", "[spu]", f'job_body = "{bad}"') as c:
+            f = config_invalid(probe("--load", c.path, "get"))
+            assert f["key"] == "spu.job_body" and f["line"] == "3", (bad, f)
+            assert '"interp" or "lifted"' in f["detail"], (bad, f)
+        f = config_invalid(probe("get", PS3RECOMP_SPU_JOB_BODY=bad))
+        assert f["env"] == "PS3RECOMP_SPU_JOB_BODY" and f["key"] == "spu.job_body", (bad, f)
+    with Cfg("schema = 1", "[spu]", "job_body = true") as c:      # a bool is the wrong type
+        f = config_invalid(probe("--load", c.path, "get"))
+        assert f["key"] == "spu.job_body" and f["line"] == "3", f
 
 
 def test_pad_trace_paths_are_checked_at_load():

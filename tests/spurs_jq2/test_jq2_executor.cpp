@@ -427,8 +427,18 @@ constexpr std::uint32_t END_REC = 0xE00000;
 struct EndRec {
     std::uint32_t count, end_class, stop_code, pc, status;
 };
-void hook_end(void*, const JobStart&, const spu_context*, const spu_job_end& e)
+/* The image id the context carried at the end of each job, by the job's serial (spu.job_body tests). */
+struct EndImages {
+    std::mutex mu;
+    std::map<std::uint32_t, std::int32_t> id;
+};
+EndImages g_end_images;
+void hook_end(void*, const JobStart& js, const spu_context* ctx, const spu_job_end& e)
 {
+    {
+        std::lock_guard<std::mutex> lk(g_end_images.mu);
+        g_end_images.id[serial_of(js)] = ctx->image_id;
+    }
     put32(END_REC + 4, e.end_class);
     put32(END_REC + 8, e.stop_code);
     put32(END_REC + 12, e.pc);
@@ -4009,6 +4019,440 @@ void mode_xdiff_nodir()
     CHECK(!capture_counters(fp).has_value(), "no directory, yet the image was counted");
 }
 
+/* ---- spu.job_body: a body chosen from the staged bytes (docs/SPU_XDIFF.md sections 4 and 16, commit 6) ---- */
+
+/* Two registered bodies that do the transform program's work (lifted_job) and say that they ran: which body, which
+ * job (the descriptor's serial) and the image id the loader's context carried into the body. A job that ran
+ * interpreted leaves no mark, so the mark is what tells the two apart; the guest-visible result is the same. */
+struct BodyRun {
+    int body;
+    std::uint32_t serial;
+    std::int32_t image_id;
+};
+struct BodyLog {
+    std::mutex mu;
+    std::vector<BodyRun> runs;
+};
+BodyLog g_body_log;
+
+void marked_body(spu_context* c, int body)
+{
+    const std::uint32_t serial = ls_word(c, c->gpr[4]._u32[0] + 0x3C);
+    {
+        std::lock_guard<std::mutex> lk(g_body_log.mu);
+        g_body_log.runs.push_back({body, serial, c->image_id});
+    }
+    lifted_job(c, false);
+}
+void marked_body_a(spu_context* c) { marked_body(c, 0); }
+void marked_body_b(spu_context* c) { marked_body(c, 1); }
+constexpr std::int32_t kImageIdA = 7, kImageIdB = 8;
+
+/* Registered and promoted: the pair a title's generated registration makes for an image its corpus proved. */
+void sel_register(std::uint64_t fp, spu_lifted_entry_fn fn, int image_id, const char* name)
+{
+    spu_workload_register_img(fp, fn, image_id, name);
+    spu_workload_promote_img(fp);
+}
+
+std::vector<BodyRun> body_runs()
+{
+    std::lock_guard<std::mutex> lk(g_body_log.mu);
+    return g_body_log.runs;
+}
+
+/* The serials of the jobs the body `body` ran, sorted, each with the image id it ran under checked. */
+std::vector<std::uint32_t> serials_of(int body, std::int32_t image_id)
+{
+    std::vector<std::uint32_t> serials;
+    for (const BodyRun& r : body_runs()) {
+        if (r.body != body) continue;
+        CHECK(r.image_id == image_id, "job %u ran body %d under image id %d, wanted %d", r.serial, body, r.image_id, image_id);
+        serials.push_back(r.serial);
+    }
+    std::sort(serials.begin(), serials.end());
+    return serials;
+}
+
+std::string serials_text(const std::vector<std::uint32_t>& v)
+{
+    std::string s;
+    for (const std::uint32_t x : v) s += (s.empty() ? "" : " ") + std::to_string(x);
+    return "[" + s + "]";
+}
+
+/* One identification per job, never two: `jobs` content hashes, and a byte-serial fingerprint only for the
+ * contents the workers had not seen. `before` is identify_counts() taken before the jobs. */
+void check_identified(const IdentifyCounts& before, std::uint64_t jobs, std::uint64_t fingerprints, const char* what)
+{
+    const IdentifyCounts now = identify_counts();
+    CHECK(now.content_hashes - before.content_hashes == jobs, "%s: %llu content hashes for %llu jobs", what,
+          (unsigned long long)(now.content_hashes - before.content_hashes), (unsigned long long)jobs);
+    CHECK(now.fingerprints - before.fingerprints == fingerprints, "%s: %llu fingerprints, wanted %llu", what,
+          (unsigned long long)(now.fingerprints - before.fingerprints), (unsigned long long)fingerprints);
+}
+
+/* The image id the context carried when each job's body ended (ExecutorHooks::on_end): the registration's id for a
+ * chosen body, -1 for a job that ran interpreted. `want(j)` is the id job j must have had. */
+void check_end_ids(std::uint32_t jobs, const std::function<std::int32_t(std::uint32_t)>& want, const char* what)
+{
+    std::lock_guard<std::mutex> lk(g_end_images.mu);
+    for (std::uint32_t j = 0; j < jobs; ++j) {
+        const auto it = g_end_images.id.find(j);
+        CHECK(it != g_end_images.id.end(), "%s: job %u has no end record", what, j);
+        if (it != g_end_images.id.end())
+            CHECK(it->second == want(j), "%s: job %u ended with image id %d, wanted %d", what, j, it->second, want(j));
+    }
+}
+
+/* A registered image runs its registered body under spu.job_body=lifted, with the registration's image id, and
+ * the guest sees what the interpreter leaves: the whole arena equals that of the same jobs in a child that runs
+ * with spu.job_body=interp, where the registered body never runs and nothing is identified. */
+void mode_select_lifted()
+{
+    constexpr std::uint32_t kJobs = 6;
+    build_image(IMAGE, Prog::transform);
+    sel_register(fp_at(IMAGE), &marked_body_a, kImageIdA, "sel-a");
+
+    /* The reference, forked before any thread exists and before the configuration is read. Four words in a page both
+     * share: the arena digest, the registered body's runs, the content hashes and the fingerprints taken. */
+    auto* ref = static_cast<std::uint64_t*>(mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0));
+    CHECK(ref != MAP_FAILED, "mmap");
+    if (ref == MAP_FAILED) return;
+    std::string child_log;
+    const int rc = run_child(
+        [ref] {
+            setenv("PS3RECOMP_SPU_JOB_BODY", "interp", 1);
+            xd_run(kJobs);
+            end_rec_clear(); /* on_end's note of how the body ended (pc, status): the host's, not the guest's */
+            ref[0] = xd_arena_digest();
+            ref[1] = body_runs().size();
+            ref[2] = identify_counts().content_hashes;
+            ref[3] = identify_counts().fingerprints;
+            if (g_fail != 0) _exit(1);
+        },
+        child_log);
+    CHECK(rc == 0, "the interpreted reference run failed (status %d): %s", rc, child_log.c_str());
+    CHECK(ref[1] == 0, "spu.job_body=interp ran the registered body %llu times", (unsigned long long)ref[1]);
+    CHECK(ref[2] == 0 && ref[3] == 0, "spu.job_body=interp identified %llu jobs, %llu fingerprints, with no trace and no capture",
+          (unsigned long long)ref[2], (unsigned long long)ref[3]);
+    std::memset(vm_base, 0, kMem); /* the arena as the child found it */
+
+    const IdentifyCounts before = identify_counts();
+    xd_run(kJobs);
+    end_rec_clear();
+    CHECK(xd_arena_digest() == ref[0], "guest memory after the lifted run differs from the interpreted run");
+    std::vector<std::uint32_t> all(kJobs);
+    for (std::uint32_t j = 0; j < kJobs; ++j) all[j] = j;
+    const std::vector<std::uint32_t> ran = serials_of(0, kImageIdA);
+    CHECK(ran == all, "the registered body ran jobs %s, wanted %s", serials_text(ran).c_str(), serials_text(all).c_str());
+    check_identified(before, kJobs, 1, "lifted");
+    check_end_ids(kJobs, [](std::uint32_t) { return kImageIdA; }, "lifted");
+}
+
+/* The image of a job is the bytes staged, not the address: other bytes at the same address and size run
+ * interpreted, restored bytes run the registered body again, and the same bytes at another address run it too. */
+void mode_select_other_bytes()
+{
+    constexpr std::uint32_t kJobs = 6, kImage2 = IMAGE + 0x1000;
+    build_variant(IMAGE, 0);
+    sel_register(fp_at(IMAGE), &marked_body_a, kImageIdA, "sel-a");
+    /* The bytes job j finds at IMAGE: the registered ones (0), two others, the registered ones again, a third. Job
+     * 5 is staged at another address with the registered bytes. */
+    constexpr std::uint8_t variant[kJobs] = {0, 1, 1, 0, 2, 0};
+    const IdentifyCounts before = identify_counts();
+    xd_run(
+        kJobs, 1, {}, [](std::uint32_t j) { return j == 5 ? kImage2 : std::uint32_t(IMAGE); },
+        [&](std::uint32_t j) {
+            vm_base[IMAGE + kTweak] = variant[j];
+            if (j == 5) build_variant(kImage2, 0);
+        });
+    const std::vector<std::uint32_t> want = {0, 3, 5};
+    const std::vector<std::uint32_t> ran = serials_of(0, kImageIdA);
+    CHECK(ran == want, "the registered body ran jobs %s, wanted %s", serials_text(ran).c_str(), serials_text(want).c_str());
+    /* Contents seen: (IMAGE, 0), (IMAGE, 1), (IMAGE, 2) and (kImage2, 0); job 2 and 3 are memory hits. */
+    check_identified(before, kJobs, 4, "other bytes");
+    check_end_ids(kJobs, [](std::uint32_t j) { return (j == 0 || j == 3 || j == 5) ? kImageIdA : -1; }, "other bytes");
+}
+
+/* spu.job_body=interp (the default): a registered body never runs, and a job that nothing else asks about is
+ * not identified at all. */
+void mode_select_interp()
+{
+    build_image(IMAGE, Prog::transform);
+    sel_register(fp_at(IMAGE), &marked_body_a, kImageIdA, "sel-a");
+    const IdentifyCounts before = identify_counts();
+    xd_run(4);
+    CHECK(body_runs().empty(), "the registered body ran %zu times under interp", body_runs().size());
+    check_identified(before, 0, 0, "interp");
+    check_end_ids(4, [](std::uint32_t) { return -1; }, "interp");
+}
+
+/* Per-image promotion: two images are registered (both bodies exist for capture and the offline runner) and only
+ * the first is promoted. Under lifted only the promoted image runs its body, the other runs interpreted; under
+ * interp neither runs. Promoting a fingerprint nothing is registered under is a named line and changes nothing. */
+void promoted_scenario(bool lifted)
+{
+    constexpr std::uint32_t kJobs = 8, kImageB = IMAGE + 0x1000;
+    build_image(IMAGE, Prog::transform);
+    build_variant(kImageB, 1);
+    sel_register(fp_at(IMAGE), &marked_body_a, kImageIdA, "sel-a");
+    spu_workload_register_img(fp_at(kImageB), &marked_body_b, kImageIdB, "sel-b"); /* registered, not promoted */
+    CHECK(spu_workload_is_promoted(fp_at(IMAGE)) == 1 && spu_workload_is_promoted(fp_at(kImageB)) == 0,
+          "promotion flags %d %d", spu_workload_is_promoted(fp_at(IMAGE)), spu_workload_is_promoted(fp_at(kImageB)));
+    const std::uint64_t bogus = 0x0123456789ABCDEFull;
+    const std::string log = capture_stderr([&] { spu_workload_promote_img(bogus); });
+    CHECK(log.find("promote-unregistered image=0x0123456789ABCDEF") != std::string::npos, "no named line:\n%s", log.c_str());
+    CHECK(spu_workload_is_promoted(bogus) == 0, "an unregistered fingerprint is promoted");
+
+    const IdentifyCounts before = identify_counts();
+    xd_run(kJobs, 1, {}, [](std::uint32_t j) { return (j % 2) != 0 ? kImageB : std::uint32_t(IMAGE); });
+    std::vector<std::uint32_t> even;
+    for (std::uint32_t j = 0; j < kJobs; j += 2) even.push_back(j);
+    if (lifted) {
+        const std::vector<std::uint32_t> ran_a = serials_of(0, kImageIdA);
+        CHECK(ran_a == even, "the promoted body ran jobs %s, wanted %s", serials_text(ran_a).c_str(), serials_text(even).c_str());
+        CHECK(serials_of(1, kImageIdB).empty(), "the unpromoted body ran");
+        check_identified(before, kJobs, 2, "promoted");
+        check_end_ids(kJobs, [](std::uint32_t j) { return (j % 2) == 0 ? kImageIdA : -1; }, "promoted"); /* B: the interpreted fallback */
+    } else {
+        CHECK(body_runs().empty(), "%zu registered bodies ran under interp", body_runs().size());
+        check_identified(before, 0, 0, "interp");
+        check_end_ids(kJobs, [](std::uint32_t) { return -1; }, "promoted interp");
+    }
+}
+void mode_select_promoted() { promoted_scenario(true); }
+void mode_select_promoted_interp() { promoted_scenario(false); }
+
+/* A forced body (the test seam of select_body, a title's own choice) wins over spu.job_body=lifted and is not
+ * checked against the bytes: the registered body does not run, and nothing is identified. */
+void mode_select_forced()
+{
+    g_lifted = kLiftedNormal;
+    build_image(IMAGE, Prog::transform);
+    sel_register(fp_at(IMAGE), &marked_body_a, kImageIdA, "sel-a");
+    const IdentifyCounts before = identify_counts();
+    xd_run(4);
+    CHECK(body_runs().empty(), "the registered body ran %zu times with a forced body", body_runs().size());
+    check_identified(before, 0, 0, "forced");
+    check_end_ids(4, [](std::uint32_t) { return -1; }, "forced");
+}
+
+/* The loader's observed path chooses the body too, and the observer still sees every job. */
+void mode_select_observer()
+{
+    constexpr std::uint32_t kJobs = 3;
+    build_image(IMAGE, Prog::transform);
+    sel_register(fp_at(IMAGE), &marked_body_a, kImageIdA, "sel-a");
+    const jq2_job_observer obs{nullptr, &obs_start, &obs_end};
+    const IdentifyCounts before = identify_counts();
+    xd_run(kJobs, 1, [&obs] { CHECK(jq2_set_job_observer(QUEUE, &obs) == 0, "install observer"); });
+    const std::vector<std::uint32_t> want = {0, 1, 2};
+    const std::vector<std::uint32_t> ran = serials_of(0, kImageIdA);
+    CHECK(ran == want, "the registered body ran jobs %s, wanted %s", serials_text(ran).c_str(), serials_text(want).c_str());
+    {
+        std::lock_guard<std::mutex> lk(g_obs.mu);
+        CHECK(g_obs.starts == int(kJobs) && g_obs.ends == int(kJobs), "observer start/end %d/%d", g_obs.starts, g_obs.ends);
+    }
+    check_identified(before, kJobs, 1, "observed");
+}
+
+/* Two workers, two images, alternating jobs, a barrier at admission so that both workers hold a job at once: each
+ * job runs the body of its own image, under its own image id. */
+void mode_select_concurrent()
+{
+    constexpr std::uint32_t kJobs = 24, kWorkers = 2, kImageB = IMAGE + 0x1000;
+    build_image(IMAGE, Prog::transform);
+    build_variant(kImageB, 1);
+    sel_register(fp_at(IMAGE), &marked_body_a, kImageIdA, "sel-a");
+    sel_register(fp_at(kImageB), &marked_body_b, kImageIdB, "sel-b");
+    CHECK(fp_at(IMAGE) != fp_at(kImageB), "the two images have one fingerprint");
+
+    struct Gate {
+        std::mutex mu;
+        std::condition_variable cv;
+        unsigned arrived = 0;
+    } gate;
+    const IdentifyCounts before = identify_counts();
+    xd_run(
+        kJobs, kWorkers,
+        [&gate] {
+            std::lock_guard<std::mutex> lk(g_probe.mu);
+            g_probe.on_admit = [&gate](const JobStart&) {
+                std::unique_lock<std::mutex> lk(gate.mu);
+                if (gate.arrived >= kWorkers) return;
+                ++gate.arrived;
+                gate.cv.notify_all();
+                gate.cv.wait(lk, [&gate] { return gate.arrived >= kWorkers; });
+            };
+        },
+        [](std::uint32_t j) { return (j % 2) != 0 ? kImageB : std::uint32_t(IMAGE); });
+    {
+        std::lock_guard<std::mutex> lk(g_probe.mu);
+        g_probe.on_admit = nullptr;
+    }
+    CHECK(gate.arrived == kWorkers, "the barrier saw %u workers", gate.arrived);
+    std::vector<std::uint32_t> even, odd;
+    for (std::uint32_t j = 0; j < kJobs; ++j) (j % 2 != 0 ? odd : even).push_back(j);
+    const std::vector<std::uint32_t> ran_a = serials_of(0, kImageIdA), ran_b = serials_of(1, kImageIdB);
+    CHECK(ran_a == even, "body A ran jobs %s, wanted %s", serials_text(ran_a).c_str(), serials_text(even).c_str());
+    CHECK(ran_b == odd, "body B ran jobs %s, wanted %s", serials_text(ran_b).c_str(), serials_text(odd).c_str());
+    const IdentifyCounts now = identify_counts();
+    CHECK(now.content_hashes - before.content_hashes == kJobs, "%llu content hashes for %u jobs",
+          (unsigned long long)(now.content_hashes - before.content_hashes), kJobs);
+    /* Each worker fingerprints each of the two contents at most once. */
+    CHECK(now.fingerprints - before.fingerprints >= 2 && now.fingerprints - before.fingerprints <= 2 * kWorkers,
+          "%llu fingerprints", (unsigned long long)(now.fingerprints - before.fingerprints));
+    check_end_ids(kJobs, [](std::uint32_t j) { return (j % 2) != 0 ? kImageIdB : kImageIdA; }, "concurrent");
+}
+
+/* The choice is a worker's own (t_chosen is thread-local): both workers hold a staged job with its body chosen
+ * before either job's entry runs, the gate being the observer's job_start, which the start hook calls after the
+ * choice and before the entry. Two images alternate; a choice shared between the workers would run one body for both. */
+struct StartGate {
+    std::mutex mu;
+    std::condition_variable cv;
+    unsigned arrived = 0;
+};
+StartGate g_start_gate;
+void gate_job_start(void*, spu_context*, const jq2_job_info*)
+{
+    std::unique_lock<std::mutex> lk(g_start_gate.mu);
+    if (g_start_gate.arrived >= 2) return;
+    ++g_start_gate.arrived;
+    g_start_gate.cv.notify_all();
+    g_start_gate.cv.wait(lk, [] { return g_start_gate.arrived >= 2; });
+}
+void mode_select_concurrent_hook()
+{
+    constexpr std::uint32_t kJobs = 12, kWorkers = 2, kImageB = IMAGE + 0x1000;
+    build_image(IMAGE, Prog::transform);
+    build_variant(kImageB, 1);
+    sel_register(fp_at(IMAGE), &marked_body_a, kImageIdA, "sel-a");
+    sel_register(fp_at(kImageB), &marked_body_b, kImageIdB, "sel-b");
+    const jq2_job_observer obs{nullptr, &gate_job_start, nullptr};
+    xd_run(
+        kJobs, kWorkers, [&obs] { CHECK(jq2_set_job_observer(QUEUE, &obs) == 0, "install observer"); },
+        [](std::uint32_t j) { return (j % 2) != 0 ? kImageB : std::uint32_t(IMAGE); });
+    CHECK(g_start_gate.arrived == kWorkers, "the gate saw %u workers", g_start_gate.arrived);
+    std::vector<std::uint32_t> even, odd;
+    for (std::uint32_t j = 0; j < kJobs; ++j) (j % 2 != 0 ? odd : even).push_back(j);
+    const std::vector<std::uint32_t> ran_a = serials_of(0, kImageIdA), ran_b = serials_of(1, kImageIdB);
+    CHECK(ran_a == even, "body A ran jobs %s, wanted %s", serials_text(ran_a).c_str(), serials_text(even).c_str());
+    CHECK(ran_b == odd, "body B ran jobs %s, wanted %s", serials_text(ran_b).c_str(), serials_text(odd).c_str());
+    check_end_ids(kJobs, [](std::uint32_t j) { return (j % 2) != 0 ? kImageIdB : kImageIdA; }, "concurrent hook");
+}
+
+/* A remembered fingerprint that is not the staged bytes' (a content-hash collision, section 4), under lifted + capture:
+ * the capture finds it, and the job still runs the right body, because the executor takes the byte-serial fingerprint
+ * of the staged bytes and chooses again before the entry runs. B's bytes are staged while the worker remembers A's
+ * fingerprint for them. The job is dropped from the capture and counted a collision; the worker's memory is repaired
+ * (one more fingerprint), so the next jobs on B take no fingerprint, run B's body and are recorded under B's. */
+void mode_xdiff_select_collision()
+{
+    constexpr std::uint32_t kJobs = kXdN, kImageB = IMAGE + 0x1000;
+    build_image(IMAGE, Prog::transform);
+    build_variant(kImageB, 1);
+    const std::uint64_t fpa = fp_at(IMAGE), fpb = fp_at(kImageB);
+    spu_workload_set_inventory(fpa, 0, 0, 0);
+    spu_workload_set_inventory(fpb, 0, 0, 0);
+    sel_register(fpa, &marked_body_a, kImageIdA, "sel-a");
+    sel_register(fpb, &marked_body_b, kImageIdB, "sel-b");
+    set_identify_fingerprint_override(fpa);
+    const IdentifyCounts before = identify_counts();
+    const std::string log = capture_stderr([&] {
+        const std::vector<JobSpec> specs = xd_run(kJobs, 1, {}, [](std::uint32_t) { return kImageB; });
+        CHECK(xd_files() == xd_names(fpb, 2, kJobs - 1), "fixtures: %s", join(xd_files()).c_str());
+        for (std::uint32_t seq = 2; seq <= kJobs; ++seq) {
+            Fx fx;
+            if (!xd_read(xd_name(fpb, 0, seq), fx)) continue;
+            xd_check_job(fx.f, specs[seq - 1], seq, SPU_TIER_LIFTED, kImageB);
+        }
+    });
+    CHECK(count_of(log, "reason=fingerprint-collision") == 1, "%zu collision lines:\n%s", count_of(log, "reason=fingerprint-collision"),
+          log.c_str());
+    std::vector<std::uint32_t> all(kJobs);
+    for (std::uint32_t j = 0; j < kJobs; ++j) all[j] = j;
+    CHECK(serials_of(0, kImageIdA).empty(), "A's body ran a job staged with B's bytes");
+    const std::vector<std::uint32_t> ran_b = serials_of(1, kImageIdB);
+    CHECK(ran_b == all, "B's body ran jobs %s, wanted %s", serials_text(ran_b).c_str(), serials_text(all).c_str());
+    check_end_ids(kJobs, [](std::uint32_t) { return kImageIdB; }, "collision");
+    /* The wrong fingerprint and its repair for job 0; jobs 1 and 2 hit the repaired memory. */
+    check_identified(before, kJobs, 2, "collision");
+    const auto a = capture_counters(fpa);
+    CHECK(a && a->ineligible_collision == 1, "%llu collisions counted on A", (unsigned long long)(a ? a->ineligible_collision : 0));
+    const auto b = capture_counters(fpb);
+    CHECK(b && b->captured == kJobs - 1 && b->failed == 0, "B: captured %llu", (unsigned long long)(b ? b->captured : 0));
+}
+
+/* spu.job_body=lifted with capture: the registered body is the authority T1 of every fixture, named with the
+ * registration's lift identity, the interpreter replays each transcript equal, and the one identification of a job
+ * serves the choice and the capture both. */
+void mode_xdiff_select_lifted()
+{
+    constexpr std::uint32_t kCodeEnd = 0x8000, kJobs = kXdN + 1;
+    constexpr std::uint64_t kOptions = 0x1122334455667788ull;
+    build_image(IMAGE, Prog::transform);
+    xd_register(0, kCodeEnd, kOptions);
+    sel_register(fp_at(IMAGE), &marked_body_a, kImageIdA, "sel-a");
+    const std::uint64_t fp = fp_at(IMAGE);
+    const IdentifyCounts before = identify_counts();
+    const std::uint64_t misses_before = capture_unattributed().fingerprint_cache_misses;
+    const std::vector<JobSpec> specs = xd_run(kJobs);
+    std::vector<std::uint32_t> all(kJobs);
+    for (std::uint32_t j = 0; j < kJobs; ++j) all[j] = j;
+    const std::vector<std::uint32_t> ran = serials_of(0, kImageIdA);
+    CHECK(ran == all, "the registered body ran jobs %s, wanted %s", serials_text(ran).c_str(), serials_text(all).c_str());
+    CHECK(xd_files() == xd_names(fp, 1, kXdN), "fixtures: %s", join(xd_files()).c_str());
+    const auto c = capture_counters(fp);
+    CHECK(c && c->captured == kXdN && c->failed == 0 && c->ineligible == 0 && c->ineligible_unknown_body == 0,
+          "counters: captured %llu ineligible %llu", (unsigned long long)(c ? c->captured : 0),
+          (unsigned long long)(c ? c->ineligible : 0));
+    for (std::uint32_t seq = 1; seq <= kXdN; ++seq) {
+        Fx fx;
+        if (!xd_read(xd_name(fp, 0, seq), fx)) continue;
+        xd_check_job(fx.f, specs[seq - 1], seq, SPU_TIER_LIFTED);
+        const spu_xdiff_body_id& b = fx.f.identity.authority;
+        CHECK(b.lifter_abi == SPU_RUNTIME_LIFTER_ABI && b.code_end == kCodeEnd && b.lift_options == kOptions,
+              "lift identity abi %u code_end 0x%X options 0x%llX", b.lifter_abi, b.code_end, (unsigned long long)b.lift_options);
+        CHECK(fx.f.end.end_class == SPU_XDIFF_END_RETURN, "end class %u", fx.f.end.end_class);
+        /* No replay on the interpreter: the registered body here is hand-written, and ends with other registers than
+         * the interpreter does. The transcript is what xd_check_job checked. */
+    }
+    check_identified(before, kJobs, 1, "lifted + capture");
+    CHECK(capture_unattributed().fingerprint_cache_misses - misses_before == 1, "the capture counted %llu fingerprints",
+          (unsigned long long)(capture_unattributed().fingerprint_cache_misses - misses_before));
+}
+
+/* All three consumers of a job's identity at once (spu.job_body=lifted, capture, kind-29 tracing): still one content
+ * hash a job and one fingerprint for the one content. The IMAGE span keeps measuring that identification; its mean and
+ * the JOB span's are printed for the report (nanoseconds). */
+void mode_xdiff_select_trace()
+{
+    constexpr std::uint32_t kJobs = kXdN + 3;
+    build_image(IMAGE, Prog::transform);
+    xd_register(0);
+    sel_register(fp_at(IMAGE), &marked_body_a, kImageIdA, "sel-a");
+    CHECK(PS3_FT_ON(), "tracing is on");
+    const IdentifyCounts before = identify_counts();
+    xd_run(kJobs);
+    const std::vector<std::uint32_t> idx = check_image_spans(0, kJobs);
+    for (std::uint32_t j = 0; j < kJobs; ++j) CHECK(idx[j] == idx[0], "job %u has image index %u, job 0 has %u", j, idx[j], idx[0]);
+    const ImageTable table = ft_images();
+    const ImageEntry* e = entry_of(table, idx[0]);
+    CHECK(table.size() == 1 && e != nullptr && e->fp == fp_at(IMAGE), "the image table");
+    check_identified(before, kJobs, 1, "lifted + capture + trace");
+    CHECK(serials_of(0, kImageIdA).size() == kJobs, "the registered body ran %zu of %u jobs", serials_of(0, kImageIdA).size(), kJobs);
+
+    unsigned long long image_sum = 0, job_sum = 0;
+    const SeqMap job = by_seq(PS3_FT_JQ2_JOB, 0), image = by_seq(PS3_FT_JQ2_IMAGE, 0);
+    for (const auto& kv : image)
+        for (const ps3_ft_rec& r : kv.second) image_sum += r.t1 - r.t0;
+    for (const auto& kv : job)
+        for (const ps3_ft_rec& r : kv.second) job_sum += r.t1 - r.t0;
+    std::printf("kind 29: %u jobs, mean IMAGE span %llu ns, mean JOB span %llu ns\n", kJobs, image_sum / kJobs, job_sum / kJobs);
+}
+
 /* The options of an xdiff mode, in the environment before anything reads the configuration. */
 void xd_prologue(const std::string& mode)
 {
@@ -4035,6 +4479,8 @@ void xd_prologue(const std::string& mode)
     setenv("PS3RECOMP_SPU_XDIFF_CAPTURE", std::to_string(n).c_str(), 1);
     if (dir.empty()) unsetenv("PS3RECOMP_SPU_XDIFF_DIR");
     else setenv("PS3RECOMP_SPU_XDIFF_DIR", dir.c_str(), 1);
+    /* Read at the first job, like the capture options. */
+    if (mode.rfind("xdiff-select-", 0) == 0) setenv("PS3RECOMP_SPU_JOB_BODY", "lifted", 1);
 }
 
 }  // namespace
@@ -4048,6 +4494,15 @@ int main(int argc, char** argv)
     guest_init();
     const std::string mode = argv[1];
     /* The recorder reads its window once, at the first hook: the trace modes say so before any hook runs. */
+    if (mode == "xdiff-select-trace") {
+        setenv("PS3_FTRACE", "0:100000:/dev/null", 1);
+        setenv("PS3_FTRACE_CAP", "65536", 1);
+    }
+    /* spu.job_body is read at the first job: the select modes set it first. */
+    if (mode.rfind("select-", 0) == 0) {
+        const bool interp = mode == "select-interp" || mode == "select-promoted-interp";
+        setenv("PS3RECOMP_SPU_JOB_BODY", interp ? "interp" : "lifted", 1);
+    }
     if (mode.rfind("trace-", 0) == 0) {
         if (mode == "trace-off" || mode == "trace-image-off") {
             unsetenv("PS3_FTRACE");
@@ -4145,6 +4600,18 @@ int main(int argc, char** argv)
     else if (mode == "xdiff-collision") mode_xdiff_collision();
     else if (mode == "xdiff-off") mode_xdiff_off();
     else if (mode == "xdiff-nodir") mode_xdiff_nodir();
+    else if (mode == "select-lifted") mode_select_lifted();
+    else if (mode == "select-other-bytes") mode_select_other_bytes();
+    else if (mode == "select-interp") mode_select_interp();
+    else if (mode == "select-promoted") mode_select_promoted();
+    else if (mode == "select-promoted-interp") mode_select_promoted_interp();
+    else if (mode == "select-forced") mode_select_forced();
+    else if (mode == "select-observer") mode_select_observer();
+    else if (mode == "select-concurrent") mode_select_concurrent();
+    else if (mode == "select-concurrent-hook") mode_select_concurrent_hook();
+    else if (mode == "xdiff-select-collision") mode_xdiff_select_collision();
+    else if (mode == "xdiff-select-lifted") mode_xdiff_select_lifted();
+    else if (mode == "xdiff-select-trace") mode_xdiff_select_trace();
     else {
         std::printf("unknown mode %s\n", mode.c_str());
         return 2;

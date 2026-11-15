@@ -36,6 +36,12 @@ The pipeline's effects inventory of a raw image reaches the runtime through the 
 hash. An image the pipeline gave no inventory (an ELF image, an inventory from before event-branch
 detection) gets no call and stays unknown to the runtime, which does not record or shadow it.
 
+Registration says an image's lifted body exists, which is enough to capture the image and to replay it
+offline (`--tier registered`). Promotion says a corpus proved it: a raw image whose pipeline program
+record has `promoted: true` gets a `spu_workload_promote_img` call right after its registration, and
+only a promoted image's body is run by a JobQueue2 worker under `spu.job_body=lifted`
+(docs/SPU_XDIFF.md section 12.4). An image without the key stays registered and runs interpreted.
+
 Example:
   python tools/build_spu_workloads.py \
       --images <port>/spu/images --lifted <port>/spu \
@@ -312,6 +318,13 @@ def registration_inventory(program):
     return flags, code_end, int(lift_options, 16) if lift_options else 0
 
 
+def program_promoted(program):
+    """True only for a program record whose `promoted` is the JSON true. Any other value (absent, a
+    string, 1) is not a promotion: a promoted image is run by spu.job_body=lifted in place of the
+    interpreter, so the safe reading of a doubtful record is the interpreter."""
+    return bool(program) and program.get("promoted") is True
+
+
 def write_registry(args, imgs, text_fps, image_ids=None, budget_twin=False):
     programs = getattr(args, "programs", None) or {}
     # Every path here may reuse code instead of lifting it: an existing
@@ -371,6 +384,8 @@ def write_registry(args, imgs, text_fps, image_ids=None, budget_twin=False):
             names = [name for bit, name in INVENTORY_FLAGS if flags & bit]
             L.append(f"    spu_workload_set_inventory(0x{fp:016X}ULL, {' | '.join(names) or '0u'}, "
                      f"0x{code_end:X}u, 0x{lift_options:016X}ULL);")
+        if program_promoted(programs.get(img)):  # the corpus proved this image: spu.job_body=lifted may run it
+            L.append(f"    spu_workload_promote_img(0x{fp:016X}ULL);")
         if budget_twin:
             t = twin_ids[img]
             L.append(f"    spu_begin_image({t}); {prefix}spu_recomp_register{TWIN_SUFFIX}();")

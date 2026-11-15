@@ -129,6 +129,17 @@ void spu_workload_set_inventory(uint64_t fingerprint, uint32_t flags, uint32_t c
 /* The inventory of `fingerprint`: 1 and *out filled, or 0 (UNKNOWN) and *out untouched. */
 int spu_workload_find_inventory(uint64_t fingerprint, spu_workload_inventory* out);
 
+/* Per-image promotion (docs/SPU_XDIFF.md section 12.4). Registration says a body EXISTS for an image, which is
+ * enough to capture it and to replay it offline; promotion says a corpus proved it, and only a promoted image's
+ * body is run by a JobQueue2 worker under spu.job_body=lifted. The generated registration calls
+ * spu_workload_promote_img after the image's spu_workload_register_img, at init and before any job runs:
+ * lookups take no lock. Idempotent. Promoting a fingerprint nothing is registered under is one named stderr
+ * line ([spu_workload] promote-unregistered) and promotes nothing. */
+void spu_workload_promote_img(uint64_t fingerprint);
+
+/* 1 when `fingerprint` is registered and promoted, else 0. */
+int spu_workload_is_promoted(uint64_t fingerprint);
+
 /* Run a SPURS policy module (raw PM binary loaded at LS 0xA00) under the HLE'd
  * kernel handoff: kernel context at LS 0x100, entry ABI of
  * cellSpursModuleEntry(context, ea) with the workload's u64 data in r4.

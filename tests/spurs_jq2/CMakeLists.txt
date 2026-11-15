@@ -198,6 +198,37 @@ if(NOT WIN32)
         add_test(NAME jq2_exec_${name} COMMAND test_jq2_executor ${mode})
         set_tests_properties(jq2_exec_${name} PROPERTIES LABELS "spurs;t0;tsan" TIMEOUT 300)
     endforeach()
+
+    # The body of a job chosen from its staged bytes (docs/SPU_XDIFF.md section 16, commit 6; spu.job_body). Each mode sets
+    # the option in its own environment before the configuration is first read. Bodies registered with
+    # spu_workload_register_img and promoted with spu_workload_promote_img say which job they ran (their own mark), so a
+    # job that ran interpreted leaves none.
+    #
+    #   jq2_exec_select_lifted        lifted: a registered image runs its body under the registration's image id; the whole arena
+    #                                 equals a run of the same jobs with interp; interp identifies nothing and runs no registered body
+    #   jq2_exec_select_other_bytes   other bytes at the same EA and size run interpreted, restored bytes and the same bytes at
+    #                                 another EA run the body; one content hash a job, one fingerprint per content
+    #   jq2_exec_select_interp        interp: a registered body never runs, and nothing is identified
+    #   jq2_exec_select_forced        a forced body (select_body) wins over lifted and is not checked against the bytes
+    #   jq2_exec_select_observer      the observed loader path chooses too
+    #   jq2_exec_select_concurrent    two workers, two images, alternating: each job runs its own image's body
+    #   jq2_exec_select_promoted      two registered images, one promoted: under lifted only the promoted one runs its body;
+    #                                 promoting an unregistered fingerprint is a named line
+    #   jq2_exec_select_promoted_interp  the same two images under interp: neither body runs
+    #   jq2_exec_xdiff_select_lifted  lifted + capture: fixtures name tier lifted with the registration's code_end and options;
+    #                                 one identification serves the choice and the capture
+    #   jq2_exec_xdiff_select_trace   lifted + capture + kind-29 trace: still one content hash a job
+    #   jq2_exec_select_concurrent_hook  two workers hold a chosen, not yet running body at once (a gate in the observer's
+    #                                 job_start): each job still runs its own image's body (the choice is thread-local)
+    #   jq2_exec_xdiff_select_collision  a remembered fingerprint that is not the staged bytes' (seam): the capture finds it,
+    #                                 the executor re-fingerprints and chooses again before the entry, the memory is repaired
+    foreach(mode select-lifted select-other-bytes select-interp select-forced select-observer select-concurrent
+                  select-concurrent-hook select-promoted select-promoted-interp xdiff-select-lifted xdiff-select-trace
+                  xdiff-select-collision)
+        string(REPLACE "-" "_" name "${mode}")
+        add_test(NAME jq2_exec_${name} COMMAND test_jq2_executor ${mode})
+        set_tests_properties(jq2_exec_${name} PROPERTIES LABELS "spurs;t0;tsan" TIMEOUT 300)
+    endforeach()
 endif()
 
 # cellSpursJq HLE surface: the 17 firmware imports through ps3_hle_call.

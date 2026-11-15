@@ -97,6 +97,17 @@ struct JobBody {
     int image_id = -1; /* the loader's image id; -1 selects no lifted image */
 };
 
+/* What one job's staged image bytes were found to be, computed ONCE per job from the bytes the loader left in
+ * local store (docs/SPU_XDIFF.md section 4) and shared by every consumer of the job's identity: the body
+ * selection of spu.job_body, the kind-29 trace span and the fixture capture. A worker remembers a result by
+ * address, size and content hash, so the byte-serial fingerprint is taken only for bytes it has not seen. */
+struct StagedImage {
+    std::uint64_t content = 0;     /* word-wise content hash: a change detector, never an identity */
+    std::uint64_t fingerprint = 0; /* FNV-1a-64 (spu_workload_fingerprint) of the staged bytes; a remembered one is a claim */
+    bool computed = false;         /* this job took the byte-serial pass: the worker had not seen these bytes */
+    bool stale = false;            /* set by a consumer that found `fingerprint` is not these bytes': the worker forgets it */
+};
+
 /* What a worker knows about a job it admitted. */
 struct JobStart {
     std::uint32_t queue_ea = 0;
@@ -117,8 +128,10 @@ struct JobStart {
  * without the queue lock held. */
 struct ExecutorHooks {
     void* user = nullptr;
-    /* Picks the body of a job; null (or an empty entry) selects the SPU
-     * interpreter. */
+    /* Forces the body of a job, before the job is staged: a returned body wins over everything and is not
+     * checked against the staged bytes (docs/SPU_XDIFF.md section 4); a test seam. Null (or an empty entry)
+     * leaves the choice to spu.job_body: the SPU interpreter, or under `lifted` the body registered for the
+     * fingerprint of the bytes the loader staged. */
     JobBody (*select_body)(void* user, const JobStart&) = nullptr;
     /* A job was admitted and its descriptor copied; the job has not started. */
     void (*on_admit)(void* user, const JobStart&) = nullptr;
@@ -153,6 +166,20 @@ void set_executor_hooks(const ExecutorHooks& hooks);
 /* The body that interprets the job image from LS 0. The executor accepts only a return to the job
  * manager from any body (pc just past the stop at the return address, for this one). */
 [[nodiscard]] JobBody interpreter_body() noexcept;
+
+/* How many content hashes and byte-serial fingerprints the workers have taken of staged images so far,
+ * process-wide (a test seam). Every identified job is one content hash; a fingerprint only on a miss of the
+ * worker's memory. Relaxed counters: read them once the workers are quiescent. */
+struct IdentifyCounts {
+    std::uint64_t content_hashes = 0;
+    std::uint64_t fingerprints = 0;
+};
+[[nodiscard]] IdentifyCounts identify_counts() noexcept;
+
+/* A test seam: the fingerprint every worker remembers for a staged content it has not seen is `fingerprint`
+ * instead of the one it takes (0: off), which is what a content-hash collision leaves in the worker's memory:
+ * a fingerprint that is not these bytes'. Process-wide; set it before the jobs. */
+void set_identify_fingerprint_override(std::uint64_t fingerprint) noexcept;
 
 /* The link address spu_run_spurs_job_snapshot plants for a job to return to:
  * the word there is 0, an SPU `stop 0`. */
