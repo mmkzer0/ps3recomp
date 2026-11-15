@@ -47,7 +47,7 @@ extern "C" {
 
 /* The `schema` a config file must declare. Bumped when an option is changed or
  * removed, never for an addition. */
-#define PS3_CONFIG_SCHEMA_VERSION 1
+#define PS3_CONFIG_SCHEMA_VERSION 2
 
 /* Validators for string options (see config_options.def). */
 enum {

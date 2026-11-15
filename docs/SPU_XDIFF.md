@@ -958,6 +958,11 @@ wait handles (`spu_context.h:393-394`), `irq_frame` (`:414`), `observer`
 (`:458`), `stop_request` (`:474`) and `coh_listed` (`:480`) are zero because
 the context is new, and `ls` points at its own store (`:542`).
 
+The appended `mfc_initialized` marker and inline `mfc` engine are zero at job
+entry, so the census classifies both as `ZERO`. Engine storage is by value in
+each context and cannot alias another context; shadows are still built from
+scratch and their served path must leave the marker clear.
+
 A whitelist goes stale in the other direction: someone adds a field to
 `spu_context` that a job's entry state does set, and a shadow starts without
 it. That is enforced, not remembered:
@@ -1250,10 +1255,11 @@ stop `lifter-abi`, `docs/STOPS.md:48`); a lift regenerated against a changed
   `runtime/spu/tests/out_*` (eleven directories whose `spu_recomp.h` stamps
   `SPU_LIFTER_ABI` and whose registration calls the check): with the old
   stamp each stops by `lifter-abi`, as does any title lift made before the
-  bump. `budget` is the last member of `spu_context`, behind
-  `coh_listed`, so none of the 14 members already pinned moves: the pin gains
-  one term and no existing offset changes (LP64 `0x38CBFC7B6255D14D`, Win64
-  `0x410F0D5C181549BD`).
+  bump. `budget` remains the last member addressed by generated code. The
+  appended MFC marker and engine change `sizeof(spu_context)` and the xdiff
+  census, but not any pinned member offset or size; generated code addresses
+  the pinned fields rather than depending on the overall context size. ABI 2
+  and both data-model pins therefore remain unchanged.
 
 ### 12.2 Raw job images in the pipeline
 

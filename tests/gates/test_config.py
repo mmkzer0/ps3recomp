@@ -87,7 +87,6 @@ def test_defaults_without_file_or_environment():
         "ppu.precise_usleep": ("true", "default"),
         "spu.dma_repeat_limit": ("256", "default"),
         "spu.dma_repeat_stop_secs": ("0", "default"),
-        "spu.mfc_lookup_cache": ("true", "default"),
         "spu.job_body": ('"interp"', "default"),
         "spu.xdiff_dir": ('""', "default"),
         "spu.xdiff_capture": ("0", "default"),
@@ -120,7 +119,7 @@ def test_defaults_without_file_or_environment():
 
 
 def test_valid_file_loads_and_names_its_source():
-    with Cfg("schema = 1", "[ppu]", "vscr_nj = false", "[title]", f'elf_sha256 = "{SHA_A}"') as c:
+    with Cfg("schema = 2", "[ppu]", "vscr_nj = false", "[title]", f'elf_sha256 = "{SHA_A}"') as c:
         o = options(probe("--load", c.path, "get"))
         assert o["ppu.vscr_nj"] == ("false", f"file:{c.path}")
         assert o["title.elf_sha256"] == (f'"{SHA_A}"', f"file:{c.path}")
@@ -128,12 +127,12 @@ def test_valid_file_loads_and_names_its_source():
 
 
 def test_dotted_keys_and_other_toml_spellings_are_accepted():
-    with Cfg("# a comment", "schema = 1", "ppu.vscr_nj = false", "diag = { dump_config = false }") as c:
+    with Cfg("# a comment", "schema = 2", "ppu.vscr_nj = false", "diag = { dump_config = false }") as c:
         assert options(probe("--load", c.path, "get"))["ppu.vscr_nj"][0] == "false"
 
 
 def test_environment_beats_file_beats_default():
-    with Cfg("schema = 1", "[ppu]", "vscr_nj = false", "[title]", f'elf_sha256 = "{SHA_A}"') as c:
+    with Cfg("schema = 2", "[ppu]", "vscr_nj = false", "[title]", f'elf_sha256 = "{SHA_A}"') as c:
         # the file beats the default; the environment beats the file
         o = options(probe("--load", c.path, "get", PS3RECOMP_PPU_VSCR_NJ="1"))
         assert o["ppu.vscr_nj"] == ("true", "env:PS3RECOMP_PPU_VSCR_NJ")
@@ -151,7 +150,7 @@ def test_environment_alone_sets_options():
 
 
 def test_park_resync_and_grace_come_from_file_and_environment():
-    with Cfg("schema = 1", "[gcm]", "park_resync = true", "park_grace_ms = 200") as c:
+    with Cfg("schema = 2", "[gcm]", "park_resync = true", "park_grace_ms = 200") as c:
         o = options(probe("--load", c.path, "get"))
         assert o["gcm.park_resync"] == ("true", f"file:{c.path}"), o
         assert o["gcm.park_grace_ms"] == ("200", f"file:{c.path}"), o
@@ -170,8 +169,8 @@ def test_park_grace_out_of_range_stops():
 
 
 def test_ps3recomp_config_names_the_file_and_beats_the_title_path():
-    with Cfg("schema = 1", "[ppu]", "vscr_nj = false") as title, \
-         Cfg("schema = 1", "[diag]", "dump_config = false") as operator:
+    with Cfg("schema = 2", "[ppu]", "vscr_nj = false") as title, \
+         Cfg("schema = 2", "[diag]", "dump_config = false") as operator:
         o = options(probe("get", PS3RECOMP_CONFIG=title.path))
         assert o["ppu.vscr_nj"] == ("false", f"file:{title.path}")
         o = options(probe("--load", title.path, "get", PS3RECOMP_CONFIG=operator.path))
@@ -187,7 +186,7 @@ def test_legacy_diagnostic_variables_are_not_typos():
 # ---- the effective-config dump ----------------------------------------------
 
 def test_dump_lists_every_key_value_and_source_as_valid_toml():
-    with Cfg("schema = 1", "[ppu]", "vscr_nj = false") as c:
+    with Cfg("schema = 2", "[ppu]", "vscr_nj = false") as c:
         p = probe("--load", c.path, "dump", PS3RECOMP_DIAG_DUMP_CONFIG="0", PS3RECOMP_TITLE_ELF_SHA256=SHA_A)
         assert p.returncode == 0, p.stderr
         src = dump_sources(p.stdout)
@@ -198,7 +197,6 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
             "ppu.precise_usleep": "default",
             "spu.dma_repeat_limit": "default",
             "spu.dma_repeat_stop_secs": "default",
-            "spu.mfc_lookup_cache": "default",
             "spu.job_body": "default",
             "spu.xdiff_dir": "default",
             "spu.xdiff_capture": "default",
@@ -234,11 +232,11 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
             tomllib = None
         if tomllib:
             doc = tomllib.loads(p.stdout)
-            assert doc == {"schema": 1,
+            assert doc == {"schema": 2,
                            "ppu": {"vscr_nj": False, "opd_swap_fixup": False, "null_page": "stop",
                                    "precise_usleep": True},
                            "spu": {"dma_repeat_limit": 256, "dma_repeat_stop_secs": 0,
-                                   "mfc_lookup_cache": True, "job_body": "interp", "xdiff_dir": "",
+                                   "job_body": "interp", "xdiff_dir": "",
                                    "xdiff_capture": 0, "xdiff": "off", "xdiff_period": 64,
                                    "xdiff_on_divergence": "report", "xdiff_on_latent": "report",
                                    "xdiff_budget": 268435456},
@@ -256,7 +254,7 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
 
 
 def test_dump_reloads_to_the_same_configuration():
-    with Cfg("schema = 1", "[ppu]", "vscr_nj = false",
+    with Cfg("schema = 2", "[ppu]", "vscr_nj = false",
              "[[hle.stub]]", "nid = 0x12345678", "ret = -1", 'reason = "quote \\" and \\\\ and tab \\t"',
              "[[lv2.stub]]", "num = 141", "ret = 0", 'reason = "sleeps are skippable"') as c:
         first = probe("--load", c.path, "dump")
@@ -271,43 +269,43 @@ def test_dump_reloads_to_the_same_configuration():
 def test_dump_config_option_prints_the_dump_when_loaded():
     p = probe("get", PS3RECOMP_DIAG_DUMP_CONFIG="1")
     assert p.returncode == 0
-    assert "schema = 1" in p.stderr and "dump_config = true  # source: env:PS3RECOMP_DIAG_DUMP_CONFIG" in p.stderr
+    assert "schema = 2" in p.stderr and "dump_config = true  # source: env:PS3RECOMP_DIAG_DUMP_CONFIG" in p.stderr
 
 
 # ---- invalid files -----------------------------------------------------------
 
 def test_typo_key_names_the_key_and_the_line():
-    with Cfg("schema = 1", "[ppu]", "# note", "vscr_nk = true") as c:
+    with Cfg("schema = 2", "[ppu]", "# note", "vscr_nk = true") as c:
         f = config_invalid(probe("--load", c.path, "get"))
         assert f["key"] == "ppu.vscr_nk" and f["file"] == c.path and f["line"] == "4", f
         assert "vscr_nj" in f["detail"]                     # the suggestion
 
 
 def test_unknown_section_and_top_level_key():
-    with Cfg("schema = 1", "[ppuu]", "vscr_nj = true") as c:
+    with Cfg("schema = 2", "[ppuu]", "vscr_nj = true") as c:
         f = config_invalid(probe("--load", c.path, "get"))
         assert f["key"] == "ppuu" and f["line"] == "2" and "'ppu'" in f["detail"], f
-    with Cfg("schema = 1", "oops = 1") as c:
+    with Cfg("schema = 2", "oops = 1") as c:
         f = config_invalid(probe("--load", c.path, "get"))
         assert f["key"] == "oops" and f["line"] == "2", f
 
 
 def test_wrong_type_stops_naming_key_expected_and_found():
-    with Cfg("schema = 1", "[ppu]", 'vscr_nj = "yes"') as c:
+    with Cfg("schema = 2", "[ppu]", 'vscr_nj = "yes"') as c:
         f = config_invalid(probe("--load", c.path, "get"))
         assert f["key"] == "ppu.vscr_nj" and f["line"] == "3", f
         assert "expected boolean, found string" in f["detail"]
-    with Cfg("schema = 1", "[title]", "elf_sha256 = 5") as c:
+    with Cfg("schema = 2", "[title]", "elf_sha256 = 5") as c:
         f = config_invalid(probe("--load", c.path, "get"))
         assert f["key"] == "title.elf_sha256" and "expected string, found integer" in f["detail"], f
-    with Cfg("schema = 1", "ppu = true") as c:
+    with Cfg("schema = 2", "ppu = true") as c:
         f = config_invalid(probe("--load", c.path, "get"))
         assert f["key"] == "ppu" and "expected a [ppu] table" in f["detail"], f
 
 
 def test_out_of_range_and_malformed_values_stop():
     for bad in ("abc", "g" * 64, "a" * 63, "a" * 65, "a" * 200):
-        with Cfg("schema = 1", "[title]", f'elf_sha256 = "{bad}"') as c:
+        with Cfg("schema = 2", "[title]", f'elf_sha256 = "{bad}"') as c:
             f = config_invalid(probe("--load", c.path, "get"))
             assert f["key"] == "title.elf_sha256" and f["line"] == "3", (bad, f)
 
@@ -315,20 +313,20 @@ def test_out_of_range_and_malformed_values_stop():
 def test_video_resolutions_normalise_and_reject_unknown_ids():
     for text, want in (("2", '"2"'), ("2,1", '"1,2"'), (" 5 , 2,2 ", '"2,5"'), ("13,10,4", '"4,10,13"'),
                        ("1,2,4,5,10,11,12,13", '"1,2,4,5,10,11,12,13"')):
-        with Cfg("schema = 1", "[video]", f'resolutions = "{text}"') as c:
+        with Cfg("schema = 2", "[video]", f'resolutions = "{text}"') as c:
             o = options(probe("--load", c.path, "get"))
             assert o["video.resolutions"] == (want, f"file:{c.path}"), (text, o)
     o = options(probe("get", PS3RECOMP_VIDEO_RESOLUTIONS="2"))
     assert o["video.resolutions"] == ('"2"', "env:PS3RECOMP_VIDEO_RESOLUTIONS"), o
     for bad in ("0", "3", "6", "14", "99", "abc", "2,", ",2", "2,,4", "-1", "720", "1 2"):
-        with Cfg("schema = 1", "[video]", f'resolutions = "{bad}"') as c:
+        with Cfg("schema = 2", "[video]", f'resolutions = "{bad}"') as c:
             f = config_invalid(probe("--load", c.path, "get"))
             assert f["key"] == "video.resolutions" and f["line"] == "3", (bad, f)
             assert "resolution id" in f["detail"], (bad, f)
 
 
 def test_null_page_is_stop_or_drop_from_file_and_environment():
-    with Cfg("schema = 1", "[ppu]", "# a title that reads page 0 on purpose", 'null_page = "drop"') as c:
+    with Cfg("schema = 2", "[ppu]", "# a title that reads page 0 on purpose", 'null_page = "drop"') as c:
         o = options(probe("--load", c.path, "get"))
         assert o["ppu.null_page"] == ('"drop"', f"file:{c.path}"), o
         o = options(probe("--load", c.path, "get", PS3RECOMP_PPU_NULL_PAGE="stop"))
@@ -336,19 +334,19 @@ def test_null_page_is_stop_or_drop_from_file_and_environment():
     o = options(probe("get", PS3RECOMP_PPU_NULL_PAGE="drop"))
     assert o["ppu.null_page"] == ('"drop"', "env:PS3RECOMP_PPU_NULL_PAGE"), o
     for bad in ("land", "Stop", "DROP", "", "true"):
-        with Cfg("schema = 1", "[ppu]", f'null_page = "{bad}"') as c:
+        with Cfg("schema = 2", "[ppu]", f'null_page = "{bad}"') as c:
             f = config_invalid(probe("--load", c.path, "get"))
             assert f["key"] == "ppu.null_page" and f["line"] == "3", (bad, f)
             assert '"stop" or "drop"' in f["detail"], (bad, f)
         f = config_invalid(probe("get", PS3RECOMP_PPU_NULL_PAGE=bad))
         assert f["env"] == "PS3RECOMP_PPU_NULL_PAGE" and f["key"] == "ppu.null_page", (bad, f)
-    with Cfg("schema = 1", "[ppu]", "null_page = true") as c:      # a bool is the wrong type
+    with Cfg("schema = 2", "[ppu]", "null_page = true") as c:      # a bool is the wrong type
         f = config_invalid(probe("--load", c.path, "get"))
         assert f["key"] == "ppu.null_page" and f["line"] == "3", f
 
 
 def test_job_body_is_interp_or_lifted_from_file_and_environment():
-    with Cfg("schema = 1", "[spu]", "# run the registered lifted body of an image", 'job_body = "lifted"') as c:
+    with Cfg("schema = 2", "[spu]", "# run the registered lifted body of an image", 'job_body = "lifted"') as c:
         o = options(probe("--load", c.path, "get"))
         assert o["spu.job_body"] == ('"lifted"', f"file:{c.path}"), o
         o = options(probe("--load", c.path, "get", PS3RECOMP_SPU_JOB_BODY="interp"))
@@ -356,20 +354,20 @@ def test_job_body_is_interp_or_lifted_from_file_and_environment():
     o = options(probe("get", PS3RECOMP_SPU_JOB_BODY="lifted"))
     assert o["spu.job_body"] == ('"lifted"', "env:PS3RECOMP_SPU_JOB_BODY"), o
     for bad in ("lift", "Lifted", "INTERP", "", "true"):
-        with Cfg("schema = 1", "[spu]", f'job_body = "{bad}"') as c:
+        with Cfg("schema = 2", "[spu]", f'job_body = "{bad}"') as c:
             f = config_invalid(probe("--load", c.path, "get"))
             assert f["key"] == "spu.job_body" and f["line"] == "3", (bad, f)
             assert '"interp" or "lifted"' in f["detail"], (bad, f)
         f = config_invalid(probe("get", PS3RECOMP_SPU_JOB_BODY=bad))
         assert f["env"] == "PS3RECOMP_SPU_JOB_BODY" and f["key"] == "spu.job_body", (bad, f)
-    with Cfg("schema = 1", "[spu]", "job_body = true") as c:      # a bool is the wrong type
+    with Cfg("schema = 2", "[spu]", "job_body = true") as c:      # a bool is the wrong type
         f = config_invalid(probe("--load", c.path, "get"))
         assert f["key"] == "spu.job_body" and f["line"] == "3", f
 
 
 def test_xdiff_enumerations_and_bounds_from_file_and_environment():
     # spu.xdiff and the two actions are enumerations (a validator each), the period and the budget are u32 >= 1.
-    with Cfg("schema = 1", "[spu]", 'xdiff = "sample"', "xdiff_period = 8", 'xdiff_on_divergence = "stop"',
+    with Cfg("schema = 2", "[spu]", 'xdiff = "sample"', "xdiff_period = 8", 'xdiff_on_divergence = "stop"',
              'xdiff_on_latent = "stop"', "xdiff_budget = 1000") as c:
         o = options(probe("--load", c.path, "get"))
         assert o["spu.xdiff"] == ('"sample"', f"file:{c.path}"), o
@@ -387,18 +385,18 @@ def test_xdiff_enumerations_and_bounds_from_file_and_environment():
             ("xdiff_on_divergence", "PS3RECOMP_SPU_XDIFF_ON_DIVERGENCE", '"report" or "stop"', ("halt", "Stop", "")),
             ("xdiff_on_latent", "PS3RECOMP_SPU_XDIFF_ON_LATENT", '"report" or "stop"', ("ignore", "REPORT", ""))):
         for bad in values:
-            with Cfg("schema = 1", "[spu]", f'{key} = "{bad}"') as c:
+            with Cfg("schema = 2", "[spu]", f'{key} = "{bad}"') as c:
                 f = config_invalid(probe("--load", c.path, "get"))
                 assert f["key"] == f"spu.{key}" and f["line"] == "3", (key, bad, f)
                 assert detail in f["detail"], (key, bad, f)
             f = config_invalid(probe("get", **{env: bad}))
             assert f["env"] == env and f["key"] == f"spu.{key}", (key, bad, f)
-        with Cfg("schema = 1", "[spu]", f"{key} = true") as c:      # a bool is the wrong type
+        with Cfg("schema = 2", "[spu]", f"{key} = true") as c:      # a bool is the wrong type
             f = config_invalid(probe("--load", c.path, "get"))
             assert f["key"] == f"spu.{key}" and f["line"] == "3", (key, f)
     for key in ("xdiff_period", "xdiff_budget"):
         for bad in ("0", "4294967296", "-1"):
-            with Cfg("schema = 1", "[spu]", f"{key} = {bad}") as c:
+            with Cfg("schema = 2", "[spu]", f"{key} = {bad}") as c:
                 f = config_invalid(probe("--load", c.path, "get"))
                 assert f["key"] == f"spu.{key}" and f["line"] == "3", (key, bad, f)
                 assert "out of range" in f["detail"], (key, bad, f)
@@ -412,7 +410,7 @@ def test_pad_trace_paths_are_checked_at_load():
         existing = os.path.join(d, "existing.trace")
         with open(existing, "w") as f:
             f.write("keep\n")
-        with Cfg("schema = 1", "[pad]", f"record = {toml_str(fresh)}", f"replay = {toml_str(existing)}") as c:
+        with Cfg("schema = 2", "[pad]", f"record = {toml_str(fresh)}", f"replay = {toml_str(existing)}") as c:
             o = options(probe("--load", c.path, "get"))
             assert o["pad.record"] == (f'"{fresh}"', f"file:{c.path}"), o
             assert o["pad.replay"] == (f'"{existing}"', f"file:{c.path}"), o
@@ -433,7 +431,7 @@ def test_pad_trace_paths_are_checked_at_load():
                     ("replay", secret, "cannot be read")]
         try:
             for key, path, needle in bad:
-                with Cfg("schema = 1", "[pad]", f"{key} = {toml_str(path)}") as c:
+                with Cfg("schema = 2", "[pad]", f"{key} = {toml_str(path)}") as c:
                     f = config_invalid(probe("--load", c.path, "get"))
                     assert f["key"] == f"pad.{key}" and f["line"] == "3", (key, path, f)
                     assert needle in f["detail"], (key, path, f)
@@ -446,9 +444,10 @@ def test_pad_trace_paths_are_checked_at_load():
 
 
 def test_schema_mismatch_missing_and_mistyped_stop():
-    for lines, line, needle in ((["schema = 2"], "1", "unsupported schema 2"),
+    for lines, line, needle in ((["schema = 1"], "1", "unsupported schema 1"),
+                                (["schema = 3"], "1", "unsupported schema 3"),
                                 (["schema = 0"], "1", "unsupported schema 0"),
-                                (['schema = "1"'], "1", "expected integer"),
+                                (['schema = "2"'], "1", "expected integer"),
                                 (["# no schema", "[ppu]", "vscr_nj = true"], None, "missing")):
         with Cfg(*lines) as c:
             f = config_invalid(probe("--load", c.path, "get"))
@@ -457,13 +456,13 @@ def test_schema_mismatch_missing_and_mistyped_stop():
 
 
 def test_schema_is_checked_before_anything_else_in_the_file():
-    with Cfg("[ppu]", "future_option = 1", "schema = 2") as c:
+    with Cfg("schema = 1", "[spu]", "mfc_lookup_cache = false") as c:
         f = config_invalid(probe("--load", c.path, "get"))
-        assert f["key"] == "schema", f
-
+        assert f["key"] == "schema" and f.get("line") == "1", f
+        assert f["detail"] == "unsupported schema 1; this runtime reads schema 2", f
 
 def test_toml_syntax_error_names_the_line():
-    with Cfg("schema = 1", "[ppu", "vscr_nj = true") as c:
+    with Cfg("schema = 2", "[ppu", "vscr_nj = true") as c:
         f = config_invalid(probe("--load", c.path, "get"))
         assert f["file"] == c.path and f["line"] == "2" and "TOML" in f["detail"], f
 
@@ -505,7 +504,7 @@ def test_first_bad_variable_reported_is_deterministic():
 # ---- u32 options -------------------------------------------------------------
 
 def test_u32_options_accept_in_range_file_and_environment():
-    with Cfg("schema = 1", "[spu]", "dma_repeat_limit = 1000", "dma_repeat_stop_secs = 86400") as c:
+    with Cfg("schema = 2", "[spu]", "dma_repeat_limit = 1000", "dma_repeat_stop_secs = 86400") as c:
         o = options(probe("--load", c.path, "get"))
         assert o["spu.dma_repeat_limit"] == ("1000", f"file:{c.path}"), o
         assert o["spu.dma_repeat_stop_secs"] == ("86400", f"file:{c.path}"), o
@@ -516,25 +515,11 @@ def test_u32_options_accept_in_range_file_and_environment():
     assert o["spu.dma_repeat_stop_secs"] == ("0", "env:PS3RECOMP_SPU_DMA_REPEAT_STOP_SECS"), o
 
 
-def test_mfc_lookup_cache_comes_from_file_and_environment():
-    # The default is on (#88), so the reference path is what a file or the
-    # environment has to ask for.
-    with Cfg("schema = 1", "[spu]", "mfc_lookup_cache = false") as c:
-        o = options(probe("--load", c.path, "get"))
-        assert o["spu.mfc_lookup_cache"] == ("false", f"file:{c.path}"), o
-        o = options(probe("--load", c.path, "get", PS3RECOMP_SPU_MFC_LOOKUP_CACHE="1"))
-        assert o["spu.mfc_lookup_cache"] == ("true", "env:PS3RECOMP_SPU_MFC_LOOKUP_CACHE"), o
-    o = options(probe("get", PS3RECOMP_SPU_MFC_LOOKUP_CACHE="0"))
-    assert o["spu.mfc_lookup_cache"] == ("false", "env:PS3RECOMP_SPU_MFC_LOOKUP_CACHE"), o
-    o = options(probe("get", PS3RECOMP_SPU_MFC_LOOKUP_CACHE="1"))
-    assert o["spu.mfc_lookup_cache"] == ("true", "env:PS3RECOMP_SPU_MFC_LOOKUP_CACHE"), o
-    f = config_invalid(probe("get", PS3RECOMP_SPU_MFC_LOOKUP_CACHE="yes"))
-    assert f["key"] == "spu.mfc_lookup_cache", f
 
 
 def test_adec_silence_fallback_comes_from_file_and_environment():
     # Off by default (#130): the silent block is an allow-list a title's config asks for.
-    with Cfg("schema = 1", "[adec]", "silence_fallback = true") as c:
+    with Cfg("schema = 2", "[adec]", "silence_fallback = true") as c:
         o = options(probe("--load", c.path, "get"))
         assert o["adec.silence_fallback"] == ("true", f"file:{c.path}"), o
         o = options(probe("--load", c.path, "get", PS3RECOMP_ADEC_SILENCE_FALLBACK="0"))
@@ -548,7 +533,7 @@ def test_adec_silence_fallback_comes_from_file_and_environment():
 def test_vk_draw_batch_comes_from_file_and_environment():
     # Off by default until the pixel diff of #129 is clean; the registry's names are PS3RECOMP_VK_*
     # (VK_DRAW_BATCH=1 was the unregistered switch this replaces).
-    with Cfg("schema = 1", "[vk]", "draw_batch = true", "draw_batch_max = 64") as c:
+    with Cfg("schema = 2", "[vk]", "draw_batch = true", "draw_batch_max = 64") as c:
         o = options(probe("--load", c.path, "get"))
         assert o["vk.draw_batch"] == ("true", f"file:{c.path}"), o
         assert o["vk.draw_batch_max"] == ("64", f"file:{c.path}"), o
@@ -571,7 +556,7 @@ def test_vk_draw_batch_max_is_bounded_by_the_descriptor_pool():
         assert f["env"] == "PS3RECOMP_VK_DRAW_BATCH_MAX" and f["key"] == "vk.draw_batch_max", (bad, f)
         assert "out of range" in f["detail"], (bad, f)
     for bad in ("0", "1025"):
-        with Cfg("schema = 1", "[vk]", f"draw_batch_max = {bad}") as c:
+        with Cfg("schema = 2", "[vk]", f"draw_batch_max = {bad}") as c:
             f = config_invalid(probe("--load", c.path, "get"))
             assert f["key"] == "vk.draw_batch_max" and f["line"] == "3", (bad, f)
             assert "out of range" in f["detail"], (bad, f)
@@ -581,7 +566,7 @@ def test_u32_out_of_range_file_values_stop():
     for key, bad in (("dma_repeat_limit", "0"), ("dma_repeat_limit", "4294967296"),
                      ("dma_repeat_limit", "-1"), ("dma_repeat_stop_secs", "86401"),
                      ("dma_repeat_stop_secs", "-1")):
-        with Cfg("schema = 1", "[spu]", f"{key} = {bad}") as c:
+        with Cfg("schema = 2", "[spu]", f"{key} = {bad}") as c:
             f = config_invalid(probe("--load", c.path, "get"))
             assert f["key"] == f"spu.{key}" and f["line"] == "3", (key, bad, f)
             assert "out of range" in f["detail"], (key, bad, f)
@@ -589,7 +574,7 @@ def test_u32_out_of_range_file_values_stop():
 
 def test_u32_wrong_type_file_values_stop():
     for bad, found in (('"256"', "string"), ("2.5", "float"), ("true", "boolean")):
-        with Cfg("schema = 1", "[spu]", f"dma_repeat_limit = {bad}") as c:
+        with Cfg("schema = 2", "[spu]", f"dma_repeat_limit = {bad}") as c:
             f = config_invalid(probe("--load", c.path, "get"))
             assert f["key"] == "spu.dma_repeat_limit" and f["line"] == "3", (bad, f)
             assert f"expected integer, found {found}" in f["detail"], (bad, f)
@@ -607,7 +592,7 @@ def test_u32_value_and_source_appear_in_the_dump():
     assert p.returncode == 0, p.stderr
     assert ("dma_repeat_limit = 512  # source: env:PS3RECOMP_SPU_DMA_REPEAT_LIMIT"
             in p.stdout), p.stdout
-    with Cfg("schema = 1", "[spu]", "dma_repeat_stop_secs = 30") as c:
+    with Cfg("schema = 2", "[spu]", "dma_repeat_stop_secs = 30") as c:
         p = probe("--load", c.path, "dump")
         assert p.returncode == 0, p.stderr
         assert f"dma_repeat_stop_secs = 30  # source: file:{c.path}" in p.stdout, p.stdout
@@ -615,7 +600,7 @@ def test_u32_value_and_source_appear_in_the_dump():
 
 # ---- structured sections: [[hle.stub]] and [[lv2.stub]] ---------------------
 
-STUBS = ["schema = 1",
+STUBS = ["schema = 2",
          "[[hle.stub]]", "nid = 0xDEADBEEF", "ret = 0x8002cb07", 'reason = "title tolerates the error"',
          "[[hle.stub]]", "nid = 16", "ret = -1", 'reason = "second"',
          "[[lv2.stub]]", "num = 1023", "ret = 0", 'reason = "never queried"']
@@ -647,30 +632,30 @@ def stub_case(lines, key, line, needle):
 
 
 def test_stub_missing_a_field_stops_naming_the_entry_and_field():
-    stub_case(["schema = 1", "[[hle.stub]]", "nid = 1", "ret = 0"], "hle.stub[0].reason", "2", "missing required field")
-    stub_case(["schema = 1", "[[hle.stub]]", "ret = 0", 'reason = "r"'], "hle.stub[0].nid", "2", "missing required field")
-    stub_case(["schema = 1", "[[hle.stub]]", "nid = 1", 'reason = "r"'], "hle.stub[0].ret", "2", "missing required field")
-    stub_case(["schema = 1", "[[lv2.stub]]", "num = 1", "ret = 0"], "lv2.stub[0].reason", "2", "missing required field")
-    stub_case(["schema = 1", "[[lv2.stub]]", "ret = 0", 'reason = "r"'], "lv2.stub[0].num", "2", "missing required field")
+    stub_case(["schema = 2", "[[hle.stub]]", "nid = 1", "ret = 0"], "hle.stub[0].reason", "2", "missing required field")
+    stub_case(["schema = 2", "[[hle.stub]]", "ret = 0", 'reason = "r"'], "hle.stub[0].nid", "2", "missing required field")
+    stub_case(["schema = 2", "[[hle.stub]]", "nid = 1", 'reason = "r"'], "hle.stub[0].ret", "2", "missing required field")
+    stub_case(["schema = 2", "[[lv2.stub]]", "num = 1", "ret = 0"], "lv2.stub[0].reason", "2", "missing required field")
+    stub_case(["schema = 2", "[[lv2.stub]]", "ret = 0", 'reason = "r"'], "lv2.stub[0].num", "2", "missing required field")
     # the second entry is the broken one
     stub_case(STUBS[:5] + ["[[hle.stub]]", "nid = 2", "ret = 0"], "hle.stub[1].reason", "6", "missing required field")
 
 
 def test_stub_reason_must_say_something():
-    stub_case(["schema = 1", "[[hle.stub]]", "nid = 1", "ret = 0", 'reason = ""'], "hle.stub[0].reason", "5", "blank")
-    stub_case(["schema = 1", "[[lv2.stub]]", "num = 1", "ret = 0", 'reason = "  \\t"'], "lv2.stub[0].reason", "5", "blank")
-    stub_case(["schema = 1", "[[hle.stub]]", "nid = 1", "ret = 0", "reason = 5"], "hle.stub[0].reason", "5", "expected string")
+    stub_case(["schema = 2", "[[hle.stub]]", "nid = 1", "ret = 0", 'reason = ""'], "hle.stub[0].reason", "5", "blank")
+    stub_case(["schema = 2", "[[lv2.stub]]", "num = 1", "ret = 0", 'reason = "  \\t"'], "lv2.stub[0].reason", "5", "blank")
+    stub_case(["schema = 2", "[[hle.stub]]", "nid = 1", "ret = 0", "reason = 5"], "hle.stub[0].reason", "5", "expected string")
 
 
 def test_stub_numbers_are_range_and_type_checked():
-    base = ["schema = 1", "[[hle.stub]]", 'reason = "r"']
+    base = ["schema = 2", "[[hle.stub]]", 'reason = "r"']
     stub_case(base + ["nid = 0x100000000", "ret = 0"], "hle.stub[0].nid", "4", "out of range")
     stub_case(base + ["nid = -1", "ret = 0"], "hle.stub[0].nid", "4", "out of range")
     stub_case(base + ["nid = 1", "ret = 0x100000000"], "hle.stub[0].ret", "5", "out of range")
     stub_case(base + ["nid = 1", "ret = -2147483649"], "hle.stub[0].ret", "5", "out of range")
     stub_case(base + ['nid = "1"', "ret = 0"], "hle.stub[0].nid", "4", "expected integer, found string")
     stub_case(base + ["nid = 1", "ret = 1.5"], "hle.stub[0].ret", "5", "expected integer, found float")
-    lv2 = ["schema = 1", "[[lv2.stub]]", 'reason = "r"']
+    lv2 = ["schema = 2", "[[lv2.stub]]", 'reason = "r"']
     stub_case(lv2 + ["num = 1024", "ret = 0"], "lv2.stub[0].num", "4", "out of range")
     stub_case(lv2 + ["num = -1", "ret = 0"], "lv2.stub[0].num", "4", "out of range")
 
@@ -678,16 +663,16 @@ def test_stub_numbers_are_range_and_type_checked():
 def test_stub_duplicates_and_unknown_fields_stop():
     stub_case(STUBS[:5] + ["[[hle.stub]]", "nid = 0xDEADBEEF", "ret = 0", 'reason = "again"'],
               "hle.stub[1].nid", "6", "duplicate")
-    stub_case(["schema = 1", "[[hle.stub]]", "nid = 1", "ret = 0", 'reason = "r"', 'why = "typo"'],
+    stub_case(["schema = 2", "[[hle.stub]]", "nid = 1", "ret = 0", 'reason = "r"', 'why = "typo"'],
               "hle.stub[0].why", "6", "unknown field")
-    stub_case(["schema = 1", "[[hle.stub]]", "num = 1", "nid = 1", "ret = 0", 'reason = "r"'],
+    stub_case(["schema = 2", "[[hle.stub]]", "num = 1", "nid = 1", "ret = 0", 'reason = "r"'],
               "hle.stub[0].num", "3", "unknown field")     # lv2's key in hle
-    stub_case(["schema = 1", "[[hle.stubs]]", "nid = 1"], "hle.stubs", "2", "unknown key")
+    stub_case(["schema = 2", "[[hle.stubs]]", "nid = 1"], "hle.stubs", "2", "unknown key")
 
 
 def test_stub_section_must_be_arrays_of_tables():
-    stub_case(["schema = 1", "[hle.stub]", "nid = 1", "ret = 0", 'reason = "r"'], "hle.stub", "2", "array of tables")
-    stub_case(["schema = 1", "hle = 3"], "hle", "2", "expected a table")
+    stub_case(["schema = 2", "[hle.stub]", "nid = 1", "ret = 0", 'reason = "r"'], "hle.stub", "2", "array of tables")
+    stub_case(["schema = 2", "hle = 3"], "hle", "2", "expected a table")
 
 
 # ---- lifetime ----------------------------------------------------------------
@@ -695,7 +680,7 @@ def test_stub_section_must_be_arrays_of_tables():
 def test_loading_after_use_is_a_stop_not_a_reload():
     f = config_invalid(probe("load-again"))
     assert "after the configuration was already" in f["detail"], f
-    with Cfg("schema = 1") as c:
+    with Cfg("schema = 2") as c:
         f = config_invalid(probe("--load", c.path, "load-again"))
         assert "after the configuration was already" in f["detail"], f
 
@@ -709,7 +694,7 @@ def test_concurrent_first_readers_share_one_configuration():
 # ---- ppu.opd_swap_fixup ----------------------------------------------------------
 
 def test_opd_swap_fixup_defaults_off_and_is_read_from_file_and_environment():
-    with Cfg("schema = 1", "[ppu]", "opd_swap_fixup = true") as c:
+    with Cfg("schema = 2", "[ppu]", "opd_swap_fixup = true") as c:
         o = options(probe("--load", c.path, "get"))
         assert o["ppu.opd_swap_fixup"] == ("true", f"file:{c.path}"), o
     o = options(probe("get", PS3RECOMP_PPU_OPD_SWAP_FIXUP="1"))
@@ -720,7 +705,7 @@ def test_opd_swap_fixup_defaults_off_and_is_read_from_file_and_environment():
 
 def test_precise_usleep_defaults_on_and_is_read_from_file_and_environment():
     # On by default: the reference nanosleep path is what a file or the environment asks for.
-    with Cfg("schema = 1", "[ppu]", "precise_usleep = false") as c:
+    with Cfg("schema = 2", "[ppu]", "precise_usleep = false") as c:
         o = options(probe("--load", c.path, "get"))
         assert o["ppu.precise_usleep"] == ("false", f"file:{c.path}"), o
         o = options(probe("--load", c.path, "get", PS3RECOMP_PPU_PRECISE_USLEEP="1"))
@@ -747,10 +732,10 @@ def test_new_context_starts_with_nj_set_by_default():
 def test_new_context_vscr_follows_the_option_whichever_source_sets_it():
     assert vscr(PS3RECOMP_PPU_VSCR_NJ="0")["init"] == "0x00000000"
     assert vscr(PS3RECOMP_PPU_VSCR_NJ="1")["init"] == "0x00010000"
-    with Cfg("schema = 1", "[ppu]", "vscr_nj = false") as c:
+    with Cfg("schema = 2", "[ppu]", "vscr_nj = false") as c:
         assert vscr("--load", c.path)["init"] == "0x00000000"
         assert vscr("--load", c.path, PS3RECOMP_PPU_VSCR_NJ="true")["init"] == "0x00010000"   # env beats file
-    with Cfg("schema = 1", "[ppu]", "vscr_nj = true") as c:
+    with Cfg("schema = 2", "[ppu]", "vscr_nj = true") as c:
         assert vscr("--load", c.path)["init"] == "0x00010000"
         assert vscr("--load", c.path, PS3RECOMP_PPU_VSCR_NJ="0")["init"] == "0x00000000"
 

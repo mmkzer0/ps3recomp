@@ -143,6 +143,25 @@ static inline void spu_ls_watch_hit(uint32_t lsa, int is_write, const uint8_t* p
 
 /* Maximum number of MFC tag groups */
 #define SPU_MFC_MAX_TAGS    32
+#define MFC_QUEUE_DEPTH 16
+
+/* The MFC engine is part of the virtual context, not of a host worker or a
+ * process-wide registry entry. */
+typedef struct mfc_cmd {
+    uint32_t lsa;       /* Local store address */
+    uint64_t ea;        /* Effective address */
+    uint32_t size;      /* Transfer size in bytes */
+    uint32_t tag;       /* Tag group ID */
+    uint32_t cmd;       /* Command opcode */
+    int active;         /* 1 = pending, 0 = completed/free */
+} mfc_cmd;
+
+typedef struct mfc_engine {
+    mfc_cmd queue[MFC_QUEUE_DEPTH];
+    uint32_t queue_count;
+    uint32_t tag_completed; /* bit N = tag N completed */
+} mfc_engine;
+
 
 /* Mailbox / signal capacities */
 #define SPU_MBOX_DEPTH      1    /* SPU write outbound mailbox depth */
@@ -570,11 +589,16 @@ typedef struct spu_context {
      * Only code compiled with SPU_LIFT_BUDGET reads or writes it (SPU_LIFT_BACKEDGE
      * below); the production object never touches it and a context built by
      * spu_context_init holds 0, so a twin run on a context nobody armed stops at
-     * its first transfer instead of running free. It is the LAST member on
-     * purpose: generated code addresses it, so it joins the pinned member list
-     * of include/ps3emu/lifter_abi.h, and behind every other member it moves
-     * none of them: the pin gains one term and no existing offset changes. */
+     * its first transfer instead of running free. This remains the last member
+     * addressed by generated code; runtime-only state follows without moving
+     * the pinned fields or changing the lifter ABI. */
     uint64_t budget;
+
+    /* The execution owner uses this inline engine for the context's lifetime.
+     * The atomic marker serves cross-thread diagnostics without publishing the
+     * engine through a shared lookup table. */
+    uint32_t mfc_initialized;
+    mfc_engine mfc;
 } spu_context;
 
 /* event_status is written from more than one host thread: the SPU's own
@@ -628,10 +652,10 @@ typedef struct spu_context {
 /* ---------------------------------------------------------------------------
  * Initialization
  * -----------------------------------------------------------------------*/
-/* Release private DMA state only when the execution owner has stopped using
- * the context. Pair with spu_coh_unregister before a reset or destruction. */
+/* Retire the engine only after the context's sole execution owner has stopped.
+ * The next first MFC access initializes fresh queue and tag state. */
 void spu_mfc_release(spu_context* ctx);
-int spu_mfc_has_engine(const spu_context* ctx);   /* a private MFC engine exists for ctx (a served context must have none) */
+int spu_mfc_has_engine(const spu_context* ctx);   /* an initialized engine is active (served contexts have none) */
 void spu_mfc_forget_range(uintptr_t lo, uintptr_t hi);
 int spu_float_rz_mode(void);   /* 1: SPU code runs in round toward zero (SPU_FLOAT_RZ, latched on first use) */
 

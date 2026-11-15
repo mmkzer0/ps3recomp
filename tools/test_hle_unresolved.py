@@ -42,7 +42,7 @@ def main():
         assert f['nid'] == '0xDEADBEEF' and f['caller_lr'] == '0x00010100' and f['tid'] == '1', f
 
         cfg = tmp / 'title.toml'
-        cfg.write_text('schema = 1\n[[hle.stub]]\nnid = 0xDEADBEEF\nret = 0x8002cb07\n'
+        cfg.write_text('schema = 2\n[[hle.stub]]\nnid = 0xDEADBEEF\nret = 0x8002cb07\n'
                        'reason = "synthetic test gap"\n[[hle.stub]]\nnid = 0x1234\nret = 0\nreason = "zero is a choice too"\n')
         p = run('0xDEADBEEF', cfg)
         assert p.returncode == 0 and 'RETURNED r3=0xFFFFFFFF8002CB07' in p.stdout, (p.stdout, p.stderr)

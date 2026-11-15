@@ -238,7 +238,7 @@ def main():
         g.expect_stop(run('syscall', '60'), 'unimplemented-syscall')
         # The allow-list wins over the firmware ENOSYS answer.
         cfg = tmp / 'title.toml'
-        cfg.write_text('schema = 1\n[[lv2.stub]]\nnum = 16\nret = 0x12345678\nreason = "synthetic test gap"\n')
+        cfg.write_text('schema = 2\n[[lv2.stub]]\nnum = 16\nret = 0x12345678\nreason = "synthetic test gap"\n')
         p = run('syscall', '16', cfg=cfg)
         assert p.returncode == 0 and 'RETURNED r3=0x12345678' in p.stdout, (p.stdout, p.stderr)
         assert 'ALLOW-LISTED unimplemented syscall 16' in p.stderr and 'synthetic test gap' in p.stderr
@@ -302,7 +302,7 @@ def main():
         assert 'r2 holds a lifted function' in f['hint'] and 'ppu.opd_swap_fixup' in f['hint'], f
         # ... and with the knob on, the r2 function runs (r3=5) instead of stopping
         opd_cfg = tmp / 'opd.toml'
-        opd_cfg.write_text('schema = 1\n[ppu]\nopd_swap_fixup = true\n')
+        opd_cfg.write_text('schema = 2\n[ppu]\nopd_swap_fixup = true\n')
         p = run('opdswap', '0x00020000', '0x10000', cfg=opd_cfg)
         assert p.returncode == 0 and 'RETURNED r3=0x5' in p.stdout, (p.stdout, p.stderr)
 
@@ -400,7 +400,7 @@ def main():
         # ppu.null_page = "drop": the legacy handling for a title that needs it. The
         # file carries the reason, as docs/CONFIG.md requires.
         drop_cfg = tmp / 'drop.toml'
-        drop_cfg.write_text('schema = 1\n[ppu]\n# synthetic test: stands in for a title that dereferences\n'
+        drop_cfg.write_text('schema = 2\n[ppu]\n# synthetic test: stands in for a title that dereferences\n'
                             '# page 0 on purpose\nnull_page = "drop"\n')
         p = run('nullread', '0x38', '4', cfg=drop_cfg)
         assert p.returncode == 0 and 'RETURNED r3=0xABABABAB' in p.stdout, (p.stdout, p.stderr)
@@ -419,7 +419,7 @@ def main():
         p = g.run([str(binary), 'nullread', '0x38', '4'], env=g.clean_env(PS3RECOMP_PPU_NULL_PAGE='drop'))
         assert p.returncode == 0 and 'RETURNED r3=0xABABABAB' in p.stdout, (p.stdout, p.stderr)
         bad_cfg = tmp / 'bad-null-page.toml'
-        bad_cfg.write_text('schema = 1\n[ppu]\nnull_page = "land"\n')
+        bad_cfg.write_text('schema = 2\n[ppu]\nnull_page = "land"\n')
         f = g.expect_stop(run('nullread', '0x38', '4', cfg=bad_cfg), 'config-invalid')
         assert f['key'] == 'ppu.null_page' and '"stop" or "drop"' in f['detail'], f
     print('PASS: unimplemented syscall, unlifted call, unresolved indirect call, dispatch depth, '

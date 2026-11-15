@@ -89,25 +89,8 @@ static inline int mfc_ea_range_committed(uint64_t ea, uint32_t size)
     return 1;
 }
 
-/* MFC queue depth */
-#define MFC_QUEUE_DEPTH     16
-
 /* Maximum DMA transfer size per element */
 #define MFC_MAX_DMA_SIZE    (16 * 1024)
-
-/* ---------------------------------------------------------------------------
- * MFC command entry
- * -----------------------------------------------------------------------*/
-typedef struct mfc_cmd {
-    uint32_t lsa;       /* Local store address */
-    uint64_t ea;        /* Effective (main memory) address: EAH << 32 | EAL */
-    uint32_t size;      /* Transfer size in bytes */
-    uint32_t tag;       /* Tag group ID (0-31) */
-    uint32_t cmd;       /* Command opcode (MFC_PUT_CMD, MFC_GET_CMD, etc.) */
-
-    /* Status */
-    int      active;    /* 1 = pending, 0 = completed/free */
-} mfc_cmd;
 
 /* DMA list element (used by PUTL/GETL) */
 typedef struct mfc_list_element {
@@ -120,17 +103,6 @@ typedef struct mfc_list_element {
     uint32_t size_and_flags;
     uint32_t eal;
 } mfc_list_element;
-
-/* ---------------------------------------------------------------------------
- * MFC DMA engine state
- * -----------------------------------------------------------------------*/
-typedef struct mfc_engine {
-    mfc_cmd     queue[MFC_QUEUE_DEPTH];
-    uint32_t    queue_count;
-
-    /* Per-tag completion tracking (bitmask: bit N = tag N completed) */
-    uint32_t    tag_completed;
-} mfc_engine;
 
 /* External: pointer to host mapping of PS3 main memory.
  * Must be set by the VM manager before any DMA. */

@@ -45,7 +45,7 @@ void spu_recomp_register(void);
 /* lifter_abi.c reads the PPU lift's ABI; this process links no PPU lift. */
 const uint32_t ppu_lifter_abi = PPU_RUNTIME_LIFTER_ABI;
 
-/* ---- the runtime surface outside the SPU runtime (as test_spu_mfc_slots.c) ---- */
+/* ---- the runtime surface outside the SPU runtime (as test_spu_mfc_contexts.c) ---- */
 uint8_t* vm_base = NULL;
 uint32_t ppu_vm_size = 0;
 void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }

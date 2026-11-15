@@ -97,6 +97,8 @@ static const spu_xdiff_member s_members[] = {
     M(stop_request,           HOST),    /* written by another host thread; init clears it */
     M(coh_listed,             HOST),    /* coherency registration, owned by the host; a built context is not listed */
     M(budget,                 HOST),    /* the budgeted twin's counter: the replay arms it for a twin subject, and no carried state reads it */
+    M(mfc_initialized,        ZERO),    /* no MFC engine is initialized at job entry */
+    M(mfc,                    ZERO),    /* private engine state is built on first access */
 };
 
 #undef M

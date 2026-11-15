@@ -453,39 +453,36 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
     return halted;
 }
 
-/* ===========================================================================
- * One private MFC engine per live virtual context. Persistent policy contexts
- * outnumber physical SPUs even when their scheduling quanta run sequentially.
- * Registry nodes have stable addresses and survive a quantum, including stalled
- * lists and tag state. The registry lock protects lookup/publication/removal;
- * the context's single execution owner protects its engine after lookup.
- * Release is permitted only after that owner has stopped using the context.
- * ===========================================================================*/
+/* One MFC engine belongs to its context. The context's single execution owner
+ * keeps it stable across scheduling quanta and retires it only after stopping.
+ * The optional diagnostic list exists only for SPU_PCSAMPLE; normal channel
+ * lookups never touch that list or its lock. */
 typedef struct spu_mfc_slot {
     spu_context* ctx;
-    mfc_engine mfc;
     struct spu_mfc_slot* next;
 } spu_mfc_slot;
 
-static spu_mfc_slot* s_mfc_slots;
-static SRWLOCK s_mfc_claim_lock = SRWLOCK_INIT;
+static spu_mfc_slot* s_mfc_pcsample_contexts;
+static SRWLOCK s_mfc_pcsample_lock = SRWLOCK_INIT;
+enum {
+    MFC_PCSAMPLE_UNSET,
+    MFC_PCSAMPLE_STARTING,
+    MFC_PCSAMPLE_OFF,
+    MFC_PCSAMPLE_ON
+};
+static atomic_int s_mfc_pcsample_state;
 
 /* SPU_PCSAMPLE=<secs>: every <secs>, print image and pc of every context
- * holding an MFC slot -- i.e. every live SPU that has done DMA. Answers
- * "which SPU task never returned, and where is it" without a debugger.
- * For an interpreting SPU the pc read here is the last one the interpreter
- * published: a taken branch's target or one of the out-of-line points listed
- * above spu_exec (spu_interp.c), not the instruction running now. Samples
- * therefore gather at basic-block starts; good for "which loop", not for a
- * hot instruction inside a block. */
+ * holding an initialized MFC engine. The list is protected only for this
+ * diagnostic so exit cleanup can safely retire stack-owned contexts. */
 static DWORD WINAPI spu_pcsample_thread(LPVOID p)
 {
     const DWORD ms = (DWORD)(uintptr_t)p;
     for (;;) {
         Sleep(ms);
         int i = 0;
-        AcquireSRWLockShared(&s_mfc_claim_lock);
-        for (spu_mfc_slot* slot = s_mfc_slots; slot; slot = slot->next, i++) {
+        AcquireSRWLockShared(&s_mfc_pcsample_lock);
+        for (spu_mfc_slot* slot = s_mfc_pcsample_contexts; slot; slot = slot->next, i++) {
             spu_context* c = slot->ctx;
             if (c) fprintf(stderr, "[pcsample] slot=%d img=%d spu=0x%X pc=0x%05X lr=0x%05X"
                                    " r3=0x%08X r81=0x%08X r84=0x%X r13=0x%08X r14=0x%08X\n",
@@ -493,67 +490,97 @@ static DWORD WINAPI spu_pcsample_thread(LPVOID p)
                            (unsigned)(c->gpr[0]._u32[0] & SPU_LS_MASK), c->gpr[3]._u32[0],
                            c->gpr[81]._u32[0], c->gpr[84]._u32[0], c->gpr[13]._u32[0], c->gpr[14]._u32[0]);
         }
-        ReleaseSRWLockShared(&s_mfc_claim_lock);
+        ReleaseSRWLockShared(&s_mfc_pcsample_lock);
         fflush(stderr);
     }
 }
 
-/* Memoization of the last virtual owner used by this host thread, enabled by
- * spu.mfc_lookup_cache (default on; off is the locked reference path, kept for
- * comparison and as the way back if a title ever needs it).
- * Engines remain registry-owned, not host-thread or physical-SPU-owned. A hit
- * borrows exactly the same pointer as the locked path; both require the owner
- * to stop before release/range cleanup. No context layout or memory is touched.
- *
- * Cleanup publishes a new generation before freeing any slot. A stale TLS
- * pointer is compared only after an acquire generation load and is never
- * dereferenced on mismatch. Other owners' cleanup conservatively drops hits.
- * Capture generations under the registry lock so a miss cannot bless an old
- * pointer with a generation published by concurrent cleanup. Saturation disables
- * hits permanently rather than permitting a generation-wrap ABA. */
-static _Atomic(uint64_t) s_mfc_cache_generation = 1;
-static SPU_TLS struct {
-    spu_context* ctx;
-    mfc_engine* engine;
-    uint64_t generation;
-} s_mfc_recent;
-static int spu_mfc_cache_enabled(void)
+/* Initialize the optional diagnostic once. The STARTING state keeps a racing
+ * first MFC context from missing its sample-list entry. */
+static int spu_mfc_pcsample_enabled(void)
 {
-    /* The typed configuration is immutable once loaded, so every thread that
-     * fills this in stores the same value. The first MFC access reads it;
-     * after that the hot path is one relaxed load, as it was for the
-     * environment knob this replaced. */
-    static atomic_int cached;
-    int value = atomic_load_explicit(&cached, memory_order_relaxed);
-    if (!value) {
-        value = ps3_cfg_spu_mfc_lookup_cache() ? 2 : 1;
-        atomic_store_explicit(&cached, value, memory_order_relaxed);
+    int state = atomic_load_explicit(&s_mfc_pcsample_state, memory_order_acquire);
+    if (state == MFC_PCSAMPLE_UNSET) {
+        int expected = MFC_PCSAMPLE_UNSET;
+        if (atomic_compare_exchange_strong_explicit(&s_mfc_pcsample_state, &expected,
+                                                    MFC_PCSAMPLE_STARTING,
+                                                    memory_order_acq_rel,
+                                                    memory_order_acquire)) {
+            const char* e = getenv("SPU_PCSAMPLE"); /* SPU_PCSAMPLE=<secs>: sample image, pc and registers for contexts with an active MFC engine. */
+            const int enabled = e != NULL;
+            if (enabled)
+                CreateThread(NULL, 0, spu_pcsample_thread,
+                             (LPVOID)(uintptr_t)(atoi(e) * 1000), 0, NULL);
+            state = enabled ? MFC_PCSAMPLE_ON : MFC_PCSAMPLE_OFF;
+            atomic_store_explicit(&s_mfc_pcsample_state, state, memory_order_release);
+            return enabled;
+        }
+        state = expected;
     }
-    return value == 2;
-}
-static void spu_mfc_cache_remember(spu_context* ctx, mfc_engine* engine)
-{
-    /* Caller holds either registry lock; removal cannot interleave here. */
-    s_mfc_recent.ctx = ctx;
-    s_mfc_recent.engine = engine;
-    s_mfc_recent.generation = atomic_load_explicit(&s_mfc_cache_generation, memory_order_relaxed);
-}
-static void spu_mfc_cache_invalidate(void)
-{
-    /* Caller holds the writer lock. Keep UINT64_MAX as a permanent slow mode. */
-    uint64_t generation = atomic_load_explicit(&s_mfc_cache_generation, memory_order_relaxed);
-    if (generation != UINT64_MAX)
-        atomic_store_explicit(&s_mfc_cache_generation, generation + 1, memory_order_release);
+    while (state == MFC_PCSAMPLE_STARTING)
+        state = atomic_load_explicit(&s_mfc_pcsample_state, memory_order_acquire);
+    return state == MFC_PCSAMPLE_ON;
 }
 
-/* SPU_MFC_STATS=<seconds>: running totals of how mfc_for resolves (calls,
- * cache hits, shared and exclusive registry locks), printed every <seconds>.
- * Profiled lock time alone cannot tell more lookups from costlier ones (#88);
- * these counts are the denominator. Counters are thread-local and folded into
- * the shared totals every 4096 events, so counting adds no cross-core traffic
- * of its own to the path it measures; the unfolded remainder (< 4096 per
- * thread and counter) is not in the printed totals. */
-enum { MFC_STAT_CALL, MFC_STAT_HIT, MFC_STAT_SHARED, MFC_STAT_EXCL, MFC_STAT_N };
+/* The stack-range cleanup runs after every MFC use on that host thread, so the
+ * sampling state must already be settled if it could contain a stack owner. */
+static int spu_mfc_pcsample_is_on(void)
+{
+    int state = atomic_load_explicit(&s_mfc_pcsample_state, memory_order_acquire);
+    while (state == MFC_PCSAMPLE_STARTING)
+        state = atomic_load_explicit(&s_mfc_pcsample_state, memory_order_acquire);
+    return state == MFC_PCSAMPLE_ON;
+}
+
+static void spu_mfc_pcsample_add(spu_context* ctx)
+{
+    spu_mfc_slot* slot = (spu_mfc_slot*)malloc(sizeof(*slot));
+    if (!slot) {
+        fprintf(stderr, "[SPU] cannot allocate PC sample entry for context %p\n", (void*)ctx);
+        fflush(stderr);
+        abort();
+    }
+    slot->ctx = ctx;
+    AcquireSRWLockExclusive(&s_mfc_pcsample_lock);
+    slot->next = s_mfc_pcsample_contexts;
+    s_mfc_pcsample_contexts = slot;
+    ReleaseSRWLockExclusive(&s_mfc_pcsample_lock);
+}
+
+static void spu_mfc_pcsample_remove(spu_context* ctx)
+{
+    AcquireSRWLockExclusive(&s_mfc_pcsample_lock);
+    for (spu_mfc_slot** link = &s_mfc_pcsample_contexts; *link; link = &(*link)->next) {
+        if ((*link)->ctx != ctx) continue;
+        spu_mfc_slot* slot = *link;
+        *link = slot->next;
+        free(slot);
+        break;
+    }
+    ReleaseSRWLockExclusive(&s_mfc_pcsample_lock);
+}
+
+static int spu_mfc_initialized_load(const spu_context* ctx)
+{
+#if defined(_MSC_VER)
+    return InterlockedCompareExchange((volatile LONG*)&ctx->mfc_initialized, 0, 0) != 0;
+#else
+    return __atomic_load_n(&ctx->mfc_initialized, __ATOMIC_ACQUIRE) != 0;
+#endif
+}
+
+static void spu_mfc_initialized_store(spu_context* ctx, uint32_t initialized)
+{
+#if defined(_MSC_VER)
+    InterlockedExchange((volatile LONG*)&ctx->mfc_initialized, (LONG)initialized);
+#else
+    __atomic_store_n(&ctx->mfc_initialized, initialized, __ATOMIC_RELEASE);
+#endif
+}
+
+/* SPU_MFC_STATS=<seconds>: report calls and first-use engine initializations.
+ * Counters are thread-local and folded into shared totals every 4096 events. */
+enum { MFC_STAT_CALL, MFC_STAT_INIT, MFC_STAT_N };
 static _Atomic(uint64_t) s_mfc_stat_total[MFC_STAT_N];
 static SPU_TLS uint32_t s_mfc_stat_local[MFC_STAT_N];
 static atomic_int s_mfc_stat_period = -1;   /* seconds; 0 = off, -1 = not read yet */
@@ -562,11 +589,9 @@ static DWORD WINAPI spu_mfc_stat_thread(LPVOID p)
     DWORD ms = (DWORD)(uintptr_t)p * 1000u;
     for (;;) {
         Sleep(ms);
-        fprintf(stderr, "[spu-mfc] calls=%llu hits=%llu shared=%llu exclusive=%llu\n",
+        fprintf(stderr, "[spu-mfc] calls=%llu initialized=%llu\n",
                 (unsigned long long)atomic_load_explicit(&s_mfc_stat_total[MFC_STAT_CALL], memory_order_relaxed),
-                (unsigned long long)atomic_load_explicit(&s_mfc_stat_total[MFC_STAT_HIT], memory_order_relaxed),
-                (unsigned long long)atomic_load_explicit(&s_mfc_stat_total[MFC_STAT_SHARED], memory_order_relaxed),
-                (unsigned long long)atomic_load_explicit(&s_mfc_stat_total[MFC_STAT_EXCL], memory_order_relaxed));
+                (unsigned long long)atomic_load_explicit(&s_mfc_stat_total[MFC_STAT_INIT], memory_order_relaxed));
         fflush(stderr);
     }
     return 0;
@@ -575,10 +600,9 @@ static int spu_mfc_stat_on(void)
 {
     int period = atomic_load_explicit(&s_mfc_stat_period, memory_order_relaxed);
     if (period < 0) {
-        const char* e = getenv("SPU_MFC_STATS");
+        const char* e = getenv("SPU_MFC_STATS"); /* SPU_MFC_STATS=<seconds>: count MFC lookups and first-use engine initializations. */
         int want = e && atoi(e) > 0 ? atoi(e) : 0;
         int expected = -1;
-        /* One thread wins the election and starts the printer exactly once. */
         if (atomic_compare_exchange_strong_explicit(&s_mfc_stat_period, &expected, want,
                                                     memory_order_relaxed, memory_order_relaxed) && want > 0)
             CreateThread(NULL, 0, spu_mfc_stat_thread, (LPVOID)(uintptr_t)want, 0, NULL);
@@ -595,106 +619,47 @@ static void spu_mfc_stat(int stat_on, int k)
 
 static mfc_engine* mfc_for(spu_context* ctx)
 {
-    int cache_enabled = spu_mfc_cache_enabled();
-    int stat_on = spu_mfc_stat_on();
+    const int stat_on = spu_mfc_stat_on();
     spu_mfc_stat(stat_on, MFC_STAT_CALL);
-    if (cache_enabled) {
-        uint64_t generation = atomic_load_explicit(&s_mfc_cache_generation, memory_order_acquire);
-        if (generation != UINT64_MAX && generation == s_mfc_recent.generation &&
-            ctx == s_mfc_recent.ctx) {
-            spu_mfc_stat(stat_on, MFC_STAT_HIT);
-            return s_mfc_recent.engine;
-        }
+    if (!spu_mfc_initialized_load(ctx)) {
+        mfc_engine_init(&ctx->mfc);
+        if (spu_mfc_pcsample_enabled()) spu_mfc_pcsample_add(ctx);
+        spu_mfc_initialized_store(ctx, 1);
+        spu_mfc_stat(stat_on, MFC_STAT_INIT);
     }
-    /* Looked up once. mfc_for runs on every MFC channel access, and with
-     * SPU_PCSAMPLE unset `started` never became 1, so every access paid a
-     * getenv: a tenth of all samples in a Twisted Metal profile. */
-    /* The fast check is a relaxed atomic load: SPU worker threads race here, and a plain read beside
-     * InterlockedExchange's atomic write is a data race (TSan, jq2_exec_*). */
-    { static volatile LONG checked = 0;
-      if (!__atomic_load_n(&checked, __ATOMIC_RELAXED) && !InterlockedExchange(&checked, 1)) {
-          const char* e = getenv("SPU_PCSAMPLE");
-          if (e) CreateThread(NULL, 0, spu_pcsample_thread, (LPVOID)(uintptr_t)(atoi(e) * 1000), 0, NULL);
-      } }
-    spu_mfc_stat(stat_on, MFC_STAT_SHARED);
-    AcquireSRWLockShared(&s_mfc_claim_lock);
-    for (spu_mfc_slot* slot = s_mfc_slots; slot; slot = slot->next) {
-        if (slot->ctx == ctx) {
-            if (cache_enabled) spu_mfc_cache_remember(ctx, &slot->mfc);
-            ReleaseSRWLockShared(&s_mfc_claim_lock);
-            return &slot->mfc;
-        }
-    }
-    ReleaseSRWLockShared(&s_mfc_claim_lock);
-
-    /* A concurrent miss may publish while the read lock is released. Recheck
-     * under the writer lock before creating this context's private engine. */
-    spu_mfc_stat(stat_on, MFC_STAT_EXCL);
-    AcquireSRWLockExclusive(&s_mfc_claim_lock);
-    for (spu_mfc_slot* slot = s_mfc_slots; slot; slot = slot->next) {
-        if (slot->ctx == ctx) {
-            if (cache_enabled) spu_mfc_cache_remember(ctx, &slot->mfc);
-            ReleaseSRWLockExclusive(&s_mfc_claim_lock);
-            return &slot->mfc;
-        }
-    }
-    spu_mfc_slot* slot = (spu_mfc_slot*)malloc(sizeof(*slot));
-    if (!slot) {
-        fprintf(stderr, "[SPU] cannot allocate private MFC engine for context %p\n", (void*)ctx);
-        fflush(stderr);
-        abort(); /* Shared fallback state would silently corrupt DMA completion. */
-    }
-    slot->ctx = ctx;
-    mfc_engine_init(&slot->mfc);
-    slot->next = s_mfc_slots;
-    s_mfc_slots = slot;
-    if (cache_enabled) spu_mfc_cache_remember(ctx, &slot->mfc);
-    ReleaseSRWLockExclusive(&s_mfc_claim_lock);
-    return &slot->mfc;
+    return &ctx->mfc;
 }
 
 void spu_mfc_release(spu_context* ctx)
 {
-    if (!ctx) return;
-    AcquireSRWLockExclusive(&s_mfc_claim_lock);
-    for (spu_mfc_slot** link = &s_mfc_slots; *link; link = &(*link)->next) {
-        if ((*link)->ctx != ctx) continue;
-        spu_mfc_slot* slot = *link;
-        *link = slot->next;
-        spu_mfc_cache_invalidate();
-        free(slot);
-        break;
-    }
-    ReleaseSRWLockExclusive(&s_mfc_claim_lock);
+    if (!ctx || !spu_mfc_initialized_load(ctx)) return;
+    if (spu_mfc_pcsample_is_on()) spu_mfc_pcsample_remove(ctx);
+    spu_mfc_initialized_store(ctx, 0);
 }
 
 int spu_mfc_has_engine(const spu_context* ctx)
 {
-    int found = 0;
-    AcquireSRWLockShared(&s_mfc_claim_lock);
-    for (const spu_mfc_slot* slot = s_mfc_slots; slot && !found; slot = slot->next)
-        found = slot->ctx == ctx;
-    ReleaseSRWLockShared(&s_mfc_claim_lock);
-    return found;
+    return ctx && spu_mfc_initialized_load(ctx);
 }
 
-/* Exit safety net for contexts unwound off a departing thread's stack.
- * Pointer comparisons suffice: the abandoned context need not be readable. */
+/* Exit safety net for a stack abandoned by an unwind. Compare the saved owner
+ * address only: the context may already be unreadable, and its inline engine
+ * needs no separate reclamation. */
 void spu_mfc_forget_range(uintptr_t lo, uintptr_t hi)
 {
-    AcquireSRWLockExclusive(&s_mfc_claim_lock);
-    for (spu_mfc_slot** link = &s_mfc_slots; *link;) {
+    if (!spu_mfc_pcsample_is_on()) return;
+    AcquireSRWLockExclusive(&s_mfc_pcsample_lock);
+    for (spu_mfc_slot** link = &s_mfc_pcsample_contexts; *link;) {
         spu_mfc_slot* slot = *link;
         uintptr_t owner = (uintptr_t)slot->ctx;
         if (owner >= lo && owner < hi) {
             *link = slot->next;
-            spu_mfc_cache_invalidate();
             free(slot);
         } else {
             link = &slot->next;
         }
     }
-    ReleaseSRWLockExclusive(&s_mfc_claim_lock);
+    ReleaseSRWLockExclusive(&s_mfc_pcsample_lock);
 }
 
 /* ===========================================================================
