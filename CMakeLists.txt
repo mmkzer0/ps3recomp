@@ -2314,6 +2314,17 @@ if(UNIX)
     add_test(NAME test_rsx_texture_epoch COMMAND test_rsx_texture_epoch)
     set_tests_properties(test_rsx_texture_epoch PROPERTIES LABELS "gcm;t0" TIMEOUT 120)
 
+    # The full texture change hash (rsx_texhash.h): a changed byte anywhere changes it. Header only,
+    # no engine. The old-against-new throughput bench is tests/bench/video/bench_texhash.c.
+    add_executable(test_rsx_texhash libs/video/tests/test_rsx_texhash.c)
+    target_include_directories(test_rsx_texhash PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
+    add_test(NAME test_rsx_texhash COMMAND test_rsx_texhash)
+    set_tests_properties(test_rsx_texhash PROPERTIES LABELS "gcm;t0" TIMEOUT 120)
+    # Old-against-new throughput; timing only, so no test, and not part of `all`:
+    # cmake --build <dir> --target bench_texhash && <dir>/bench_texhash
+    add_executable(bench_texhash EXCLUDE_FROM_ALL tests/bench/video/bench_texhash.c)
+    target_include_directories(bench_texhash PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
+
     # Which presents a frame dump writes and what it calls the file (PS3RECOMP_VK_DUMP_LIST / _RANGE).
     # Pure parsing and naming, so no GPU and no backend: the Vulkan backend links the same source.
     add_executable(test_rsx_frame_select
