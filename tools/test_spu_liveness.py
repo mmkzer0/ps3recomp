@@ -367,6 +367,76 @@ class Decoder(unittest.TestCase):
         self.assertEqual(L.describe(Ins("stqd", (0x24 << 24) | (1 << 7) | 6), set())[1:3], (bit(6) | bit(1), 0))
 
 
+class LinkBase(unittest.TestCase):
+    """A job image linked at 0 and staged at BASE holds image-relative addresses."""
+
+    @staticmethod
+    def main(pc):
+        # the leaf is called directly and its offset in the image is also formed: the code adds the
+        # load delta to that immediate before branching, so it is a second way in
+        return [G.brsl(0, pc, BASE + Image.SLOT), ila(9, Image.SLOT), G.wrch(28, 3), G.stop(STOP_END)]
+
+    def test_image_relative_immediate_takes_the_entry_address(self):
+        img = Image().put(0, self.main).put(1, leaf)
+        plain = img.analyze()[BASE + 0x40]
+        self.assertFalse(plain["unknown_callers"])
+        self.assertEqual(plain["unknown_reasons"], [])
+        linked = img.analyze(link_base=0)[BASE + 0x40]
+        self.assertTrue(linked["unknown_callers"])
+        self.assertEqual(linked["unknown_reasons"], ["address-taken"])
+        self.assertEqual(linked["live_out"], list(range(128)))
+        self.assertEqual(linked["dead_regs"], [])
+
+    def test_image_relative_data_word_takes_the_entry_address(self):
+        img = Image().put(0, call_then(G.wrch(28, 3))).put(1, leaf)
+        img.words[-1] = Image.SLOT          # a function pointer slot holding the offset
+        self.assertFalse(img.analyze()[BASE + 0x40]["unknown_callers"])
+        self.assertIn("address-taken", img.analyze(link_base=0)[BASE + 0x40]["unknown_reasons"])
+
+    def test_link_base_equal_to_base_changes_nothing(self):
+        img = Image().put(0, self.main).put(1, leaf)
+        self.assertEqual(img.analyze(link_base=BASE), img.analyze())
+
+    def test_a_link_base_past_the_image_base_is_refused(self):
+        img = Image().put(0, leaf)
+        for link_base in (BASE + 4, -16):
+            with self.assertRaises(ValueError):
+                L.analyze(img.data(), BASE, functions=img.bounds(), link_base=link_base)
+
+    def test_detected_bounds_follow_the_link_base(self):
+        # the generator's position-independent job: four table-relative jump cases and a function
+        # reached through an image-relative `ila`, none named by an absolute address
+        from gen_test_raw_job import build, pic_layout
+        blob = build(variant="pic-jump-table")
+        layout = pic_layout()
+        wanted = set(layout["cases"]) | {layout["pointer"]}
+        def entries(doc):
+            return {int(f["entry"], 16) for f in doc["functions"]}
+        self.assertEqual(wanted & entries(L.analyze(blob, BASE)), set())
+        doc = L.analyze(blob, BASE, link_base=0)
+        self.assertEqual(wanted - entries(doc), set())
+        pointer = next(f for f in doc["functions"] if int(f["entry"], 16) == layout["pointer"])
+        self.assertIn("address-taken", pointer["unknown_reasons"])
+        self.assertEqual(doc["image"]["link_base"], "0x00000")
+        self.assertNotIn("link_base", L.analyze(blob, BASE)["image"])
+
+    def test_cli_link_base(self):
+        from gen_test_raw_job import build, pic_layout
+        layout = pic_layout()
+        with tempfile.TemporaryDirectory(prefix="spu-liveness-") as tmp:
+            path = os.path.join(tmp, "pic.bin")
+            out = os.path.join(tmp, "live.json")
+            with open(path, "wb") as f:
+                f.write(build(variant="pic-jump-table"))
+            self.assertEqual(L.main([path, "--base", hex(BASE), "--link-base", "0", "-o", out]), 0)
+            with open(out, encoding="utf-8") as f:
+                doc = json.load(f)
+            self.assertIn(f"0x{layout['pointer']:05x}", {f["entry"] for f in doc["functions"]})
+            self.assertEqual(L.main([path, "--base", hex(BASE), "--link-base", hex(BASE + 16), "-o", out]), 1)
+            with self.assertRaises(SystemExit):   # an ELF carries its own base
+                L.main(["--elf", path, "--link-base", "0"])
+
+
 class Document(unittest.TestCase):
     def test_json_document_and_cli(self):
         with tempfile.TemporaryDirectory(prefix="spu-liveness-") as tmp:

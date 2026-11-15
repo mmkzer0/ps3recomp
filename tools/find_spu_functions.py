@@ -159,6 +159,81 @@ def pick_text(phs):
     raise SystemExit("No executable PT_LOAD segment found")
 
 
+def image_delta(ls_base, link_base):
+    """LS offset between where an image is staged and where it was linked.
+
+    A position-independent job image (JobQueue2) is linked at 0 and staged at
+    `ls_base`; its code reaches its own bytes as `imm + <load delta>`, so an
+    immediate that names an address holds `address - delta`. 0 when the image
+    declares no link base: every immediate is then an absolute LS address.
+    """
+    return 0 if link_base is None else ls_base - link_base
+
+
+def immediate_ls_addresses(value, delta):
+    """The LS addresses an immediate (or a data word) can name, as a tuple.
+
+    With no delta that is the value itself. With one it is the value read as
+    absolute AND as image-relative (`value + delta`): which reading a given
+    `ila` means is the code's business (`a $rD,$rS,$r126` adds the delta at run
+    time, a plain `bi` does not), and nothing here can tell. Callers that seed
+    function starts take both (an extra start only lifts more); a caller that
+    proves something about an address being unreachable by immediates must use
+    `immediate_values_naming`, which is the same relation read backwards.
+    """
+    if not delta:
+        return (value,)
+    return (value, (value + delta) & 0xFFFFFFFF)
+
+
+def immediate_values_naming(address, delta):
+    """Every immediate value that `immediate_ls_addresses` maps onto `address`."""
+    if not delta:
+        return (address,)
+    return (address, (address - delta) & 0xFFFFFFFF)
+
+
+UNDECODED = ".word"           # the disassembler's name for a word that is no instruction
+
+
+def starts_clean_run(start, insns_by_addr):
+    """Whether code at `start` decodes up to its first terminator (or the image end).
+
+    The lifter refuses an image that contains an undecodable word in a lifted
+    range, so a function start whose run reaches one is a start that cannot be
+    lifted at all: it is data (a table, the job header, the tail past the code).
+    """
+    pc = start
+    while True:
+        ins = insns_by_addr.get(pc)
+        if ins is None:
+            return True                    # ran off the image's end: nothing undecodable seen
+        if ins.mnemonic == UNDECODED:
+            return False
+        if is_return(ins) or (ins.mnemonic in _TERMINATORS_NO_FALLTHROUGH
+                              and not is_resuming_stop(ins)):
+            return True
+        pc += 4
+
+
+def relocated_code_addresses(value, delta, insns_by_addr):
+    """`immediate_ls_addresses` for a value that has to be CODE.
+
+    The image-relative reading is kept only where it starts a clean run
+    (`starts_clean_run`). Without that, `value + delta` of any small number (a
+    table offset, a count) reaches the job header, a jump table or the data
+    tail, and the lifter then reports every such word as an unsupported
+    instruction and refuses the whole image. The absolute reading keeps the
+    rule it always had: it is the caller's to filter.
+    """
+    if not delta:
+        return (value,)
+    moved = (value + delta) & 0xFFFFFFFF
+    if moved not in insns_by_addr or not starts_clean_run(moved, insns_by_addr):
+        return (value,)
+    return (value, moved)
+
+
 _BRANCH_MNEMONICS = {
     "brsl", "brasl",                          # direct calls (definitely functions)
     "br", "bra",                              # unconditional branches
@@ -293,7 +368,7 @@ def collect_computed_branch_targets(insns, window=8):
 
 
 def collect_jump_table_targets(insns, code, code_start, code_end,
-                               window=48, max_entries=32):
+                               window=48, max_entries=32, delta=0):
     """Targets reached through an in-code JUMP TABLE:
 
         ila  $r14, 0x1724C          <- TABLE base (an LS address in .text)
@@ -332,9 +407,18 @@ def collect_jump_table_targets(insns, code, code_start, code_end,
     while at least one interpretation is a 4-aligned VALID INSTRUCTION START
     (the first word where neither is — adjacent float/data constants —
     terminates the table); bases yielding fewer than 2 entries are ignored.
+
+    `delta` (image_delta) is non-zero for a position-independent image, whose
+    `ila` holds the table address minus the load delta (`ila $r14,0x100` ...
+    `a $r10,$r14,$r126` -> LS 0x7D00): the base is tried as written AND as
+    `imm + delta`. Table-relative entries then resolve against the relocated
+    base, which is the address the code adds. An entry word has a third
+    reading, `word + delta` (an image-relative handler offset), kept only where
+    it starts a clean run (`starts_clean_run`).
     """
     del window                       # kept in the signature for compatibility
-    valid_starts = {ins.addr for ins in insns}
+    by_addr = {ins.addr: ins for ins in insns}
+    valid_starts = set(by_addr)
     targets = set()
     seen_bases = set()
     for ins in insns:
@@ -345,43 +429,53 @@ def collect_jump_table_targets(insns, code, code_start, code_end,
             continue
         try:
             tok = wops[1]
-            tbl = int(tok, 16) if tok.lower().startswith(("0x", "-0x")) else int(tok, 10)
+            imm = int(tok, 16) if tok.lower().startswith(("0x", "-0x")) else int(tok, 10)
         except ValueError:
             continue
-        if tbl == 0 or (tbl & 3) or not (code_start <= tbl < code_end):
-            continue
-        if tbl in seen_bases:
-            continue
-        seen_bases.add(tbl)
-        off = tbl - code_start
-        entries = set()
-        for k in range(max_entries):
-            o = off + 4 * k
-            if o + 4 > len(code):
-                break
-            wrd = int.from_bytes(code[o:o + 4], "big")
-            if wrd & 3:
-                break
-            abs_ok = wrd in valid_starts
-            # SIGNED table-relative entries: Bink's dispatch table at LS 0xCC7C
-            # mixes positive and negative offsets (0xFFFFBF64 = -0x409C ->
-            # 0x8BE0). The unsigned add produced 0x100008BE0, failed
-            # validation, and ended the table walk one entry in -- masking to
-            # the 18-bit LS space is what the hardware add does anyway.
-            rel = (tbl + wrd) & 0x3FFFF
-            rel_ok = (rel & 3) == 0 and rel in valid_starts
-            if not abs_ok and not rel_ok:
-                break           # neither reading decodes as code -- table end
-            if abs_ok:
-                entries.add(wrd)
-            if rel_ok:
-                entries.add(rel)
-        if len(entries) >= 2:
-            targets.update(entries)
+        for tbl in immediate_ls_addresses(imm, delta):
+            if tbl == 0 or (tbl & 3) or not (code_start <= tbl < code_end):
+                continue
+            if tbl in seen_bases:
+                continue
+            seen_bases.add(tbl)
+            off = tbl - code_start
+            entries = set()
+            for k in range(max_entries):
+                o = off + 4 * k
+                if o + 4 > len(code):
+                    break
+                wrd = int.from_bytes(code[o:o + 4], "big")
+                if wrd & 3:
+                    break
+                abs_ok = wrd in valid_starts
+                # SIGNED table-relative entries: Bink's dispatch table at LS 0xCC7C
+                # mixes positive and negative offsets (0xFFFFBF64 = -0x409C ->
+                # 0x8BE0). The unsigned add produced 0x100008BE0, failed
+                # validation, and ended the table walk one entry in -- masking to
+                # the 18-bit LS space is what the hardware add does anyway.
+                rel = (tbl + wrd) & 0x3FFFF
+                rel_ok = (rel & 3) == 0 and rel in valid_starts
+                # IMAGE-RELATIVE entries (position-independent image only): the
+                # word is the handler's offset in the image and the code adds
+                # the load delta. Kept only where it starts a clean run, or a
+                # table-relative offset read this way would seed the job header.
+                moved = (wrd + delta) & 0xFFFFFFFF
+                moved_ok = bool(delta and wrd and (moved & 3) == 0 and moved in by_addr
+                                and starts_clean_run(moved, by_addr))
+                if not abs_ok and not rel_ok and not moved_ok:
+                    break           # no reading decodes as code -- table end
+                if abs_ok:
+                    entries.add(wrd)
+                if rel_ok:
+                    entries.add(rel)
+                if moved_ok:
+                    entries.add(moved)
+            if len(entries) >= 2:
+                targets.update(entries)
     return targets
 
 
-def collect_ila_continuation_targets(insns, code_start, code_end):
+def collect_ila_continuation_targets(insns, code_start, code_end, delta=0):
     """Continuation addresses materialised as plain immediates:
 
         6114:  ila $r29, 0x52D8      <- where the SUBROUTINE should return to
@@ -405,8 +499,13 @@ def collect_ila_continuation_targets(insns, code_start, code_end):
     decoding at an instruction boundary. Same cost argument as the jump-table
     scan above: a false positive only adds an entry point at a valid
     instruction boundary; a false negative loses an entire code region.
+
+    `delta` (image_delta) is non-zero for a position-independent image, whose
+    immediates hold image-relative addresses: each is tried as written and as
+    `imm + delta`.
     """
-    valid_starts = {ins.addr for ins in insns}
+    by_addr = {ins.addr: ins for ins in insns}
+    valid_starts = set(by_addr)
     targets = set()
     ilhu_val = {}                     # reg -> pending high halfword
     for ins in insns:
@@ -428,9 +527,10 @@ def collect_ila_continuation_targets(insns, code_start, code_end):
             cand = ilhu_val.pop(wops[0]) | (imm & 0xFFFF)
         if cand is None:
             continue
-        if cand and (cand & 3) == 0 and code_start <= cand < code_end \
-           and cand in valid_starts:
-            targets.add(cand)
+        for target in relocated_code_addresses(cand, delta, by_addr):
+            if target and (target & 3) == 0 and code_start <= target < code_end \
+               and target in valid_starts:
+                targets.add(target)
     return targets
 
 
@@ -492,7 +592,7 @@ def collect_duff_targets(insns, code_start, code_end, window=12, span=64):
 
 
 def collect_function_pointer_tables(buf, phs, code_start, code_end,
-                                    insns_by_addr, min_run=3, max_run=1024):
+                                    insns_by_addr, min_run=3, max_run=1024, delta=0):
     """Function-pointer tables that live in DATA, not .text.
 
     A program can dispatch through an array of code addresses: it loads an entry
@@ -519,29 +619,43 @@ def collect_function_pointer_tables(buf, phs, code_start, code_end,
     opcodes encode high bits far above code_end, and float/vector constants
     almost never form a 3+ aligned-in-range sequence. A distinct-value guard
     stops a filled/repeated constant region from seeding.
+
+    `delta` (image_delta) is non-zero for a position-independent image, whose
+    data words hold image-relative addresses: the scan also runs over
+    `word + delta`.
     """
     targets = set()
+    # Image-relative words (`delta` non-zero) are a second pass of the same
+    # scan: a run is one reading throughout, never a mix of the two.
+    shifts = (0, delta) if delta else (0,)
     for ph in phs:
         if ph.get("type") != 1:            # PT_LOAD only
             continue
         off, fsz, vaddr = ph["off"], ph["filesz"], ph["vaddr"]
         seg = buf[off:off + fsz]
         skew = (-vaddr) & 3                 # keep words on the LS 4-byte grid
-        run = []
-        def _flush(r):
-            if len(r) >= min_run and len(set(r)) >= 2:
-                targets.update(r)
-        i = skew
-        while i + 4 <= len(seg):
-            w = int.from_bytes(seg[i:i + 4], "big")
-            if (w & 3) == 0 and code_start <= w < code_end and w in insns_by_addr:
-                run.append(w)
-                if len(run) >= max_run:
+        for shift in shifts:
+            run = []
+            def _flush(r):
+                if len(r) >= min_run and len(set(r)) >= 2:
+                    targets.update(r)
+            i = skew
+            while i + 4 <= len(seg):
+                w = int.from_bytes(seg[i:i + 4], "big")
+                # A zero word is padding, not the image-relative address of its
+                # first byte; the shifted reading would turn every zero fill
+                # into the image base.
+                v = (w + shift) & 0xFFFFFFFF if w or not shift else None
+                if v is not None and (v & 3) == 0 and code_start <= v < code_end \
+                        and v in insns_by_addr \
+                        and not (shift and not starts_clean_run(v, insns_by_addr)):
+                    run.append(v)
+                    if len(run) >= max_run:
+                        _flush(run); run = []
+                else:
                     _flush(run); run = []
-            else:
-                _flush(run); run = []
-            i += 4
-        _flush(run)
+                i += 4
+            _flush(run)
     return targets
 
 
@@ -605,7 +719,14 @@ def find_end(start, insns_by_addr, sorted_starts, code_end):
     return min(next_start, code_end)
 
 
-def detect_functions(buf, base_override=None, verbose=True, raw=False):
+def detect_functions(buf, base_override=None, verbose=True, raw=False, link_base=None):
+    """Function bounds of an SPU ELF, or of a raw local-store image with `raw`.
+
+    `link_base` is for a raw image linked at one address and staged at another
+    (a position-independent job): its immediates are read as absolute LS
+    addresses AND as image-relative ones, `imm - link_base + base`. None keeps
+    every immediate absolute.
+    """
     if raw:
         # A raw local-store image: a SPURS job binary, which the title loads
         # from its own data files as a flat code+data blob rather than as an
@@ -651,12 +772,18 @@ def detect_functions(buf, base_override=None, verbose=True, raw=False):
     # a stub that returns via `bi $r0`). Require the target to be 4-byte aligned
     # AND to decode as an instruction, so a scratch use of $r0 that happens to
     # hold a small constant cannot seed a bogus function.
+    delta = image_delta(base, link_base)
     fptr_targets = collect_function_pointer_tables(
-        buf, elf["phs"], code_start, code_end, insns_by_addr)
-    for t in (collect_link_register_targets(insns)
-              | collect_computed_branch_targets(insns)
-              | collect_jump_table_targets(insns, code, code_start, code_end)
-              | collect_ila_continuation_targets(insns, code_start, code_end)
+        buf, elf["phs"], code_start, code_end, insns_by_addr, delta=delta)
+    # The $r0 and branch-register scans return the immediates themselves, so a
+    # position-independent image gets both readings of each here; the other
+    # collectors already return LS addresses.
+    immediates = (collect_link_register_targets(insns)
+                  | collect_computed_branch_targets(insns))
+    for t in (set().union(*(relocated_code_addresses(v, delta, insns_by_addr)
+                            for v in immediates))
+              | collect_jump_table_targets(insns, code, code_start, code_end, delta=delta)
+              | collect_ila_continuation_targets(insns, code_start, code_end, delta=delta)
               | collect_duff_targets(insns, code_start, code_end)
               | fptr_targets):
         if code_start <= t < code_end and (t & 3) == 0 and t in insns_by_addr:
@@ -728,12 +855,17 @@ def main():
                         "from the branch analysis")
     p.add_argument("--base", type=lambda x: int(x, 0), default=None,
                    help="Override the .text base address")
+    p.add_argument("--link-base", type=lambda x: int(x, 0), default=None,
+                   help="LS address the image was linked at, when it is staged "
+                        "elsewhere (a position-independent job image): its "
+                        "immediates are also read as image-relative")
     args = p.parse_args()
 
     with open(args.input, "rb") as f:
         buf = f.read()
 
-    funcs, (text_off, base, size) = detect_functions(buf, args.base, raw=args.raw)
+    funcs, (text_off, base, size) = detect_functions(buf, args.base, raw=args.raw,
+                                                     link_base=args.link_base)
 
     out_obj = [{"start": s, "end": e} for s, e in funcs]
     if args.out:

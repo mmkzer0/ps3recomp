@@ -26,7 +26,7 @@ the images the title passes to cellSpurs line up.
 A JobQueue2 job image has no ELF container: the PPU stages `sizeBinary << 4`
 bytes of guest memory at LS 0x7C00. Those blobs are supplied through
 --raw-images, a JSON list of {path, sha256, ls_base, code_end?,
-extra_entry_points?}. Their registration fingerprint is the FNV-1a-64 over the
+link_base?, extra_entry_points?}. Their registration fingerprint is the FNV-1a-64 over the
 whole staged blob (exactly what the runtime hashes), and the inventory reports
 the channels and MFC commands the lifted code contains.
 
@@ -145,7 +145,9 @@ def main():
                     help="JSON list of raw local-store job images (a JobQueue2 job blob is "
                          "not an ELF); usable alone or with --input. Each entry names path, "
                          "sha256, ls_base (0x7C00 for JobQueue2 jobs), optional code_end "
-                         "(passed to the lifter's --code-end) and optional "
+                         "(passed to the lifter's --code-end), optional link_base (the LS "
+                         "address a position-independent image was linked at, 0 for JobQueue2 "
+                         "jobs: immediates are then also read as image-relative) and optional "
                          "extra_entry_points. A blob whose sha256 does not match the "
                          "manifest fails the run.")
     ap.add_argument("--lifted", required=True, help="output dir for per-image lifted C (one subdir per image)")

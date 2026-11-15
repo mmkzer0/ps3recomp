@@ -44,13 +44,17 @@ Model
 
 Limits: a function entered through arithmetic on a table base (offset tables,
 halfword tables, `ila` plus `ai`) is not seen as address-taken; name such
-entries with --entry. Registers and stack bytes of a terminating `stop` are
+entries with --entry. An image linked at 0 and staged elsewhere (a position-
+independent job) adds its load delta to its immediates: --link-base makes every
+immediate and data word count as naming both `value` and `value - link_base +
+base`. Registers and stack bytes of a terminating `stop` are
 not part of any claim.
 
 Output: JSON `ps3recomp.spu-liveness/1`, one object per function (docs/SPU_LIFTER.md "Liveness").
 
 Usage:
-    spu_liveness.py IMAGE.bin --base 0x7C00 [--code-end N] [--entry N]... [--functions FILE] [-o live.json]
+    spu_liveness.py IMAGE.bin --base 0x7C00 [--code-end N] [--entry N]... [--functions FILE]
+                    [--link-base N] [-o live.json]
     spu_liveness.py --elf IMAGE.elf [-o live.json]
 """
 import argparse
@@ -65,6 +69,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from find_spu_functions import (
     LV2_RESUMING_STOPS,
     detect_functions,
+    image_delta,
+    immediate_ls_addresses,
     parse_elf,
     text_image,
 )
@@ -193,10 +199,11 @@ def describe(ins, computed_jumps):
 
 # ---- function bounds -----------------------------------------------------------------------
 
-def function_bounds(image, base, code_end=0, entries=(), functions=None):
+def function_bounds(image, base, code_end=0, entries=(), functions=None, link_base=None):
     """The lifter's bounds for a raw image: detect, split at `entries`, cap at `code_end`."""
     if functions is None:
-        bounds, _ = detect_functions(image, base_override=base, verbose=False, raw=True)
+        bounds, _ = detect_functions(image, base_override=base, verbose=False, raw=True,
+                                     link_base=link_base)
     else:
         bounds = [(int(s), int(e)) for s, e in functions]
     bset = sorted(set(bounds))
@@ -239,13 +246,16 @@ class _Fn:
         self.addrs = list(range(entry, end, 4))
 
 
-def _address_taken(image, entry_set, info, by_addr, fns):
-    """Entries whose address appears as an aligned word or as a constant a function materialises."""
+def _address_taken(image, entry_set, info, by_addr, fns, delta=0):
+    """Entries whose address appears as an aligned word or as a constant a function materialises.
+
+    With a load delta (a position-independent image) a word or constant names both itself and
+    `value + delta`.
+    """
     taken = set()
     for off in range(0, len(image) - 3, 4):
         value = int.from_bytes(image[off:off + 4], "big")
-        if value in entry_set:
-            taken.add(value)
+        taken.update(immediate_ls_addresses(value, delta))
     for fn in fns:
         high = {}   # register -> (value of an ilhu, instructions it stays pairable for)
         for a in fn.addrs:
@@ -254,25 +264,27 @@ def _address_taken(image, entry_set, info, by_addr, fns):
             rt, imm = raw & 0x7F, (raw >> 7) & 0xFFFF
             defs = info[a][2]
             if m == "ila":
-                taken.add((raw >> 7) & 0x3FFFF)
+                taken.update(immediate_ls_addresses((raw >> 7) & 0x3FFFF, delta))
             elif m == "il":
-                taken.add(imm)
-                taken.add(_sext(imm, 16) & 0xFFFFFFFF)
+                taken.update(immediate_ls_addresses(imm, delta))
+                taken.update(immediate_ls_addresses(_sext(imm, 16) & 0xFFFFFFFF, delta))
             elif m == "ilhu":
-                taken.add(imm << 16)
+                taken.update(immediate_ls_addresses(imm << 16, delta))
             elif m == "iohl" and rt in high:
-                taken.add(high[rt][0] | imm)
+                taken.update(immediate_ls_addresses(high[rt][0] | imm, delta))
             high = {r: (v, n - 1) for r, (v, n) in high.items() if n > 1 and not (defs >> r) & 1}
             if m == "ilhu":
                 high[rt] = (imm << 16, 8)
     return taken & entry_set
 
 
-def analyze(image, base, code_end=0, entries=(), functions=None):
+def analyze(image, base, code_end=0, entries=(), functions=None, link_base=None):
     """The liveness document for one raw image; see the module docstring."""
+    if link_base is not None and not 0 <= link_base <= base:
+        raise ValueError(f"link_base 0x{link_base:X} must be in [0, base 0x{base:X}]")
     entries = sorted(set(entries))
     code = image[:len(image) & ~3]   # a trailing partial word is not an instruction
-    bounds = function_bounds(code, base, code_end, entries, functions)
+    bounds = function_bounds(code, base, code_end, entries, functions, link_base)
     all_insns = disassemble_spu(code, base)
     by_addr = {i.addr: i for i in all_insns}
     jumps = compute_bi_r0_jumps(all_insns, bounds)
@@ -335,7 +347,7 @@ def analyze(image, base, code_end=0, entries=(), functions=None):
                 edge(fn, a, a + 4, kind not in (CALL, ICALL))
 
     entry_set = set(starts)
-    taken = _address_taken(code, entry_set, info, by_addr, fns)
+    taken = _address_taken(code, entry_set, info, by_addr, fns, image_delta(base, link_base))
     for fn in fns:
         r = reasons[fn.entry]
         if fn.entry in entries:
@@ -422,6 +434,7 @@ def analyze(image, base, code_end=0, entries=(), functions=None):
             "ls_base": f"0x{base:05x}",
             "bytes": len(image),
             "code_end": f"0x{code_end:05x}" if code_end else None,
+            **({"link_base": f"0x{link_base:05x}"} if link_base is not None else {}),
         },
         "functions": functions_doc,
     }
@@ -491,6 +504,10 @@ def main(argv=None):
                          "and the ELF entry as an entry point")
     ap.add_argument("--base", type=_int, default=0, help="LS address of the first byte (default 0; not with --elf)")
     ap.add_argument("--code-end", type=_int, default=0, help="where executable code ends (the lifter's --code-end)")
+    ap.add_argument("--link-base", type=_int, default=None,
+                    help="LS address the image was linked at, when --base is where it is staged (a "
+                         "position-independent job image linked at 0): immediates and data words also "
+                         "name `value - link_base + base`; must be at most --base")
     ap.add_argument("--entry", type=_int, action="append", default=[],
                     help="an extra entry point; its callers are unknown (repeatable)")
     ap.add_argument("--functions", metavar="FILE",
@@ -508,7 +525,7 @@ def main(argv=None):
     entries = list(args.entry)
     base = args.base
     if args.elf:
-        if args.functions or args.base:
+        if args.functions or args.base or args.link_base is not None:
             ap.error("--elf takes its bounds and base from the ELF")
         try:
             elf = parse_elf(image)
@@ -522,7 +539,7 @@ def main(argv=None):
         with open(args.functions, encoding="utf-8") as f:
             functions = [(int(str(e["start"]), 0), int(str(e["end"]), 0)) for e in json.load(f)]
     try:
-        doc = analyze(image, base, args.code_end, entries, functions)
+        doc = analyze(image, base, args.code_end, entries, functions, args.link_base)
     except ValueError as exc:
         print(f"spu_liveness: {exc}", file=sys.stderr)
         return 1

@@ -602,6 +602,137 @@ class Pipeline(unittest.TestCase):
         functions = {start: end for start, end in program['diagnostics']['functions']}
         self.assertEqual(functions[tail], RAW_BASE + len(blob))
 
+    def pic_lift(self, **overrides):
+        """Function starts and record of the position-independent synthetic image."""
+        _, build_raw_job = raw_job_tools()
+        blob = build_raw_job(variant='pic-jump-table')
+        result = self.run_raw([self.raw_entry(blob, name='raw-pic.bin', **overrides)])
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        program = self.manifest()['programs'][0]
+        self.assertEqual(program['status'], 'registered', program.get('reason'))
+        return {start for start, _ in program['diagnostics']['functions']}, program
+
+    def test_raw_link_base_lifts_the_pic_table_cases_and_pointer_target(self):
+        from gen_test_raw_job import pic_layout
+        layout = pic_layout()
+        wanted = set(layout['cases']) | {layout['pointer']}
+        # Every immediate in the image is image-relative: read as an LS address
+        # none of them names code, so the case bodies and the function the
+        # pointer reaches are not function starts.
+        plain, program = self.pic_lift()
+        self.assertEqual(wanted & plain, set())
+        self.assertIsNone(program['link_base'])
+        self.assertEqual(program['lift_options_string'], '')
+        linked, program = self.pic_lift(link_base='0x0')
+        self.assertEqual(wanted - linked, set())
+        self.assertLessEqual(plain, linked)
+        self.assertEqual(program['link_base'], 0)
+        self.assertEqual(program['lift_options_string'], 'link_base=0x0')
+        # The lift covers them: each one is a generated function.
+        source = (self.output / program['name'] / 'spu_recomp.c').read_text()
+        for address in sorted(wanted):
+            self.assertIn(f"{program['name']}_spu_func_{address:08X}(", source)
+
+    def test_raw_link_base_equal_to_ls_base_changes_no_reading(self):
+        RAW_BASE, _ = raw_job_tools()
+        plain, _ = self.pic_lift()
+        same, program = self.pic_lift(link_base=hex(RAW_BASE))
+        self.assertEqual(same, plain)
+        # The body is the same but the manifest said something different, and
+        # the options say so: they are a statement about the lift, not a diff.
+        self.assertEqual(program['lift_options_string'], f'link_base=0x{RAW_BASE:x}')
+
+    def test_raw_link_base_is_validated(self):
+        RAW_BASE, build_raw_job = raw_job_tools()
+        blob = build_raw_job()
+        cases = (('not-a-number', 'link_base is not an integer'),
+                 (True, 'link_base is not an integer'),
+                 (1.5, 'link_base is not an integer'),
+                 (hex(RAW_BASE - 8), 'must be a 16-byte-aligned'),
+                 (-16, 'must be a 16-byte-aligned'),
+                 (hex(RAW_BASE + 16), 'is after ls_base'))
+        for value, message in cases:
+            with self.subTest(link_base=value):
+                result = self.run_raw([self.raw_entry(blob, name='raw-link.bin', link_base=value)])
+                self.assertNotEqual(result.returncode, 0)
+                report = self.manifest()
+                self.assertFalse(report['complete'])
+                self.assertTrue(any('link_base' in error and message in error
+                                    for error in report['errors']), report['errors'])
+        # null is "no link base", like code_end; a valid value is recorded.
+        for value, want in ((None, None), (0, 0), (hex(RAW_BASE), RAW_BASE)):
+            with self.subTest(link_base=value):
+                result = self.run_raw([self.raw_entry(blob, name='raw-link.bin', link_base=value)])
+                self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+                self.assertEqual(self.manifest()['programs'][0]['link_base'], want)
+
+    def test_raw_link_base_must_agree_between_listings_of_the_same_bytes(self):
+        _, build_raw_job = raw_job_tools()
+        blob = build_raw_job()
+        result = self.run_raw([self.raw_entry(blob, name='raw-a.bin'),
+                               self.raw_entry(blob, name='raw-b.bin', link_base='0x0')])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(any('link_base' in error for error in self.manifest()['errors']))
+
+    def test_lift_options_string_names_link_base_only_when_present(self):
+        from spu_program_pipeline import lift_options_digest, lift_options_string
+        self.assertEqual(lift_options_string(None, [], False, link_base=0), 'link_base=0x0')
+        self.assertEqual(lift_options_string(0x16168, [0xB00], True, True, link_base=0x7C00),
+                         'code_end=0x16168;link_base=0x7c00;extra=0xb00;merge_chunks=1;return_entries=1')
+        # Absent: today's string, so every existing image keeps its digest.
+        self.assertEqual(lift_options_string(0x16168, [0xB00], True, True),
+                         'code_end=0x16168;extra=0xb00;merge_chunks=1;return_entries=1')
+        self.assertNotEqual(lift_options_digest(lift_options_string(None, [], False, link_base=0)),
+                            lift_options_digest(lift_options_string(None, [], False)))
+
+    def test_raw_link_base_refuses_call_sites_for_an_image_relative_address_taken_entry(self):
+        _, build_raw_job = raw_job_tools()
+        blob = build_raw_job(variant='calls-pic-materialised')
+        # `ila $r5, <helper - base>` is no LS address, so by itself it takes
+        # nothing's address: the callers still prove the helper's commands.
+        result = self.run_raw([self.raw_entry(blob, name='raw-pic-calls.bin')])
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        effects = self.manifest()['programs'][0]['effects']
+        self.assertEqual([(entry['command'], entry['via']) for entry in effects['mfc_commands']],
+                         [(0x20, 'call-sites'), (0x40, 'call-sites')])
+        # With the link base it is the helper's address: code adds the load
+        # delta and branches, so the helper has an entry no call site shows.
+        result = self.run_raw([self.raw_entry(blob, name='raw-pic-calls.bin', link_base='0x0')])
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        effects = self.manifest()['programs'][0]['effects']
+        self.assertEqual(effects['mfc_commands'], [])
+        [unresolved] = [entry for entry in effects['unresolved'] if entry['register'] == '$r8']
+        self.assertEqual(unresolved['function'], 'live-in')
+        self.assertRegex(unresolved['call_sites'],
+                         r'^entry 0x[0-9A-F]+ is materialised by ila at 0x[0-9A-F]+$')
+
+    def test_link_base_never_adds_a_resolution(self):
+        # The resolver's soundness rule is that no entry has an unseen way in.
+        # A link base only adds readings of an immediate or word, and every use
+        # of them refuses or cuts a run, so over the same function list the
+        # sites left unresolved with it include every site left unresolved
+        # without it, whatever the delta. Checked over every synthetic shape,
+        # two deltas, and both a single range and the detector's chunks (the
+        # chunks are what make a helper an entry the call-site pass looks at).
+        from find_spu_functions import detect_functions
+        from gen_test_raw_job import CALL_VARIANTS, CODE_START, FLOW_VARIANTS
+        from spu_program_pipeline import effects_inventory
+        base, build_raw_job = raw_job_tools()
+        stricter = 0
+        for variant in ('default', *CALL_VARIANTS, *FLOW_VARIANTS, 'pic-jump-table'):
+            blob = build_raw_job(variant=variant)
+            chunks, _ = detect_functions(blob, verbose=False, raw=True, base_override=base)
+            for functions in ([(base + CODE_START, base + len(blob))], chunks):
+                plain = effects_inventory(blob, base, functions, entry=base + CODE_START)
+                plain_open = {entry['site'] for entry in plain['unresolved']}
+                for link_base in (0, base - 16):
+                    linked = effects_inventory(blob, base, functions, entry=base + CODE_START,
+                                               link_base=link_base)
+                    linked_open = {entry['site'] for entry in linked['unresolved']}
+                    self.assertLessEqual(plain_open, linked_open, (variant, link_base))
+                    stricter += linked_open > plain_open
+        self.assertGreater(stricter, 0)
+
     def flow_effects(self, variant):
         """The inventory of one synthetic function range covering the whole code.
 

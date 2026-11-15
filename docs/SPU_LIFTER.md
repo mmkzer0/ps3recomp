@@ -94,7 +94,7 @@ lifted function's if nobody reads them. `tools/spu_liveness.py` says which, and
 the offline runner's poison run checks what it says.
 
 ```
-python3 tools/spu_liveness.py IMAGE.bin --base 0x7C00 [--code-end N] [--entry N]... [--functions FILE] -o live.json
+python3 tools/spu_liveness.py IMAGE.bin --base 0x7C00 [--code-end N] [--entry N]... [--functions FILE] [--link-base N] -o live.json
 python3 tools/spu_liveness.py --elf IMAGE.elf -o live.json          # the ELF's code, bounds and entry
 ```
 
@@ -140,7 +140,13 @@ constant, or an aligned word anywhere in the image (a function pointer table);
 a call lands inside it; or it is the return continuation of a call. What the
 tool does not see is an entry reached through arithmetic on a table base
 (offset tables, `ila` plus `ai`) or a halfword table: name such entries with
-`--entry`.
+`--entry`. A position-independent job (linked at 0, staged at `--base`) forms
+its addresses image-relative: `--link-base 0` makes every immediate and data
+word also name `value - link_base + base` (the same reading as the raw
+manifest's `link_base`, below), so a function whose image-relative address is
+formed or stored counts as address-taken. The detected bounds follow it too.
+`--link-base` must lie in `[0, --base]`; the output's `image` then carries
+`link_base`.
 
 `dead_stack` needs a forward analysis of `$r1` to prove a frame: the function
 lowers `$r1` only with `ai $r1,$r1,imm`, reaches no indirect branch, no
@@ -591,6 +597,7 @@ against the manifest's directory:
     "path": "images/audio-job.bin",
     "sha256": "0123…(64 hex)…cdef",
     "ls_base": "0x7C00",
+    "link_base": "0x0",
     "code_end": "0x16168",
     "extra_entry_points": ["0xA2C"],
     "return_entries": true,
@@ -611,6 +618,47 @@ against the manifest's directory:
   last one, leaving an embedded rodata/const tail undisassembled. It must be a
   4-byte-aligned address inside `(ls_base, ls_base + len(blob)]`; an address past
   the blob is a named error.
+- `link_base` is optional (absent: every immediate is an absolute LS address,
+  as before). It is for a **position-independent** job image: one linked at
+  `link_base` (0 for a JobQueue2 job) and staged at `ls_base`, whose code adds
+  the load delta `ls_base - link_base` (a `brsl $rN,.+4` PC-getter, the crt's
+  delta in `$r126`) to image-relative immediates: `ila $r14,0x100` ...
+  `a $r10,$r14,$r126` is a jump table at LS 0x7D00, whose words are
+  table-relative. The toolkit's readers take an immediate as an absolute LS
+  address, so such an image's jump-table case bodies and function-pointer
+  targets are not function starts: they are never lifted, and a lifted job that
+  reaches one interprets silently in production and is `void/unlifted-branch`
+  in a shadow. With `link_base` set, an immediate or data word that can name a
+  code or data address is read **both** as written and as `imm - link_base +
+  ls_base`; nothing local says which one a given `ila` means, so neither is
+  dropped. It must be an integer, 16-byte aligned, non-negative and at most
+  `ls_base`, or it is a named error; `null` is "absent". `extra_entry_points`
+  and `code_end` stay LS addresses.
+  What it changes, only for an image that sets it:
+  - The detector (`find_spu_functions.py`, `--link-base`) seeds function starts
+    from the image-relative reading too: jump-table bases (table-relative
+    entries resolve against the relocated base, so the case bodies appear),
+    `ila`/`il`/`ilhu`+`iohl` continuations, `$r0` and branch-register
+    immediates, and function-pointer words in data. An extra start only lifts
+    more, but a start that is data would be refused by the lifter, so an
+    image-relative seed is kept only where it begins a run that decodes up to
+    its first terminator: the job header's marker text, a jump table or the
+    data tail are not seeded. Expect extra starts that are not real functions
+    (words that decode, in the header or in data).
+  - The static effect inventory counts the same readings as address-taken. The
+    MFC resolver's rule is that an entry's address is never an immediate or a
+    data word; with `link_base` that also means `address - delta`, so an entry
+    that code reaches through `ila` plus the load delta is no longer resolved
+    through its call sites. The extra readings only refuse a resolution or
+    shorten a straight-line run, never make one: over the same function list
+    the sites left unresolved with `link_base` include every site left
+    unresolved without it (`tools/test_spu_program_pipeline.py`
+    `test_link_base_never_adds_a_resolution`). A table-relative jump table is
+    still not modelled: its targets stay covered by the
+    `no-unmodelled-indirect-entry` assumption.
+  - The lift's options carry `link_base` (below), because the same bytes lift
+    to a different body.
+  - `tools/spu_liveness.py --link-base` reads the image the same way.
 - `extra_entry_points` are optional LS addresses passed to `--extra-funcs`, for
   entries the branch analysis cannot see (interrupt vectors, jump-table
   handlers). They must be 4-byte aligned and below `code_end` when that is set.
@@ -640,16 +688,17 @@ assert the C and Python values agree.
 Each program record also carries the lift's options, as
 `lift_options_string` (the canonical form) and `lift_options` (its hash). The
 canonical string lists, in this fixed order, the options that change one image's
-generated code: `code_end`, `extra` (the sorted extra entry points the lifter
-received), `merge_chunks` and `return_entries`, lowercase hex, `;`-separated, an
-absent option omitted:
+generated code: `code_end`, `link_base`, `extra` (the sorted extra entry points
+the lifter received), `merge_chunks` and `return_entries`, lowercase hex,
+`;`-separated, an absent option omitted (an image without `link_base` keeps the
+string, and so the digest, it always had):
 
 ```text
-code_end=0x16168;extra=0xa2c,0xb00;merge_chunks=1;return_entries=1
+code_end=0x16168;link_base=0x0;extra=0xa2c,0xb00;merge_chunks=1;return_entries=1
 ```
 
 `lift_options` is the FNV-1a-64 of those ASCII bytes as 16 hex digits (the
-empty string for a lift that passed none of the four, which still hashes to a
+empty string for a lift that passed none of the five, which still hashes to a
 nonzero value, so the field never reads as "unknown lift"). It is what
 `spu_xdiff_body_id.lift_options` records and what the registration carries
 (`registration_inventory` formats it into `spu_workload_set_inventory`). The
@@ -659,7 +708,8 @@ image itself (the manifest or the ELF, the detector, the fingerprint) or only
 name paths. `promoted` is not part of it either: it records a port decision,
 not a generated body.
 
-Function discovery runs `find_spu_functions.py`'s `raw=True` mode at `ls_base`,
+Function discovery runs `find_spu_functions.py`'s `raw=True` mode at `ls_base`
+(with `link_base` when the manifest gives one),
 so every seed comes from the entry base and the branch/call analysis. The same
 post-lift gates as an ELF apply unchanged: no unsupported instructions, the
 entry function generated, every direct branch/call target backed by a generated
