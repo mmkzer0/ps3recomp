@@ -4615,12 +4615,14 @@ void au_register(std::uint32_t ea, spu_lifted_entry_fn body, spu_lifted_entry_fn
 
 /* What the audit hooks leave for a test, so that the audit thread and the workers are ordered by hooks and never by
  * sleeping. `hold` parks the audit thread at on_start; `started` counts the samples it took, `waiting` the workers that
- * found the queue full under `all`, `done` the verdicts. */
+ * found the queue full under `all`, `disposed` the samples a worker has seen counted queued or dropped, `done` the
+ * verdicts. A job's completion says nothing about its sample: the worker credits first and hands over after (docs/
+ * SPU_XDIFF.md section 11), so a read of queued / dropped taken while the rig runs waits for `disposed` first. */
 struct AuditProbe {
     std::mutex mu;
     std::condition_variable cv;
     bool hold = false;
-    unsigned started = 0, waiting = 0;
+    unsigned started = 0, waiting = 0, disposed = 0;
     struct Done {
         std::uint64_t fp;
         std::uint32_t queue, seq, verdict, reason;
@@ -4641,6 +4643,12 @@ void ap_wait(void*, const AuditEvent&)
 {
     std::lock_guard<std::mutex> lk(g_ap.mu);
     ++g_ap.waiting;
+    g_ap.cv.notify_all();
+}
+void ap_disposed(void*, const AuditEvent&, Disposition)
+{
+    std::lock_guard<std::mutex> lk(g_ap.mu);
+    ++g_ap.disposed;
     g_ap.cv.notify_all();
 }
 void ap_done(void*, const AuditEvent& ev, std::uint32_t verdict, std::uint32_t reason)
@@ -4669,6 +4677,8 @@ void ap_hold(bool on)
     g_ap.cv.notify_all();
 }
 void ap_wait_done(std::size_t n) { ap_wait_for([n] { return g_ap.done.size() >= n; }, "the verdicts"); }
+/* The samples of the first `n` handed-over jobs are counted queued or dropped. */
+void ap_wait_disposed(unsigned n) { ap_wait_for([n] { return g_ap.disposed >= n; }, "the samples to be counted"); }
 
 /* Hooks in place, the audit's seams installed. */
 void au_begin()
@@ -4682,6 +4692,7 @@ void au_begin()
     h.on_wait = &ap_wait;
     h.on_start = &ap_start;
     h.on_done = &ap_done;
+    h.on_disposed = &ap_disposed;
     set_audit_hooks(h);
 }
 
@@ -4919,8 +4930,10 @@ void mode_audit_full()
     specs.push_back(au_job(rig, 0));
     ap_wait_for([] { return g_ap.started >= 1; }, "the audit thread to take the first sample");
     for (std::uint32_t j = 1; j <= kQueue; ++j) specs.push_back(au_job(rig, j));
+    ap_wait_disposed(kQueue + 1); /* the first sample and the eight behind it */
     CHECK(audit_queued() == kQueue, "%zu samples queued, wanted %u", audit_queued(), kQueue);
     specs.push_back(au_job(rig, kQueue + 1)); /* the queue is full: this job completes, its sample is dropped */
+    ap_wait_disposed(kQueue + 2);
     AuditCounters c = au_counters(fp);
     CHECK(c.sampled == kQueue + 2 && c.queued == kQueue + 1 && c.dropped == 1 && c.shadowed == 0,
           "sampled %llu queued %llu dropped %llu shadowed %llu", (unsigned long long)c.sampled, (unsigned long long)c.queued,
@@ -4954,6 +4967,7 @@ void mode_audit_all()
     specs.push_back(au_job(rig, 0));
     ap_wait_for([] { return g_ap.started >= 1; }, "the audit thread to take the first sample");
     for (std::uint32_t j = 1; j <= kQueue; ++j) specs.push_back(au_job(rig, j));
+    ap_wait_disposed(kQueue + 1);
     CHECK(audit_queued() == kQueue, "%zu samples queued, wanted %u", audit_queued(), kQueue);
     specs.push_back(au_job(rig, kQueue + 1)); /* credited; its worker now waits for room */
     ap_wait_for([] { return g_ap.waiting >= 1; }, "the worker to wait for queue room");
@@ -5059,6 +5073,7 @@ void mode_audit_shutdown()
     specs.push_back(au_job(rig, 0));
     ap_wait_for([] { return g_ap.started >= 1; }, "the audit thread to take the first sample");
     for (std::uint32_t j = 1; j <= kQueue; ++j) specs.push_back(au_job(rig, j));
+    ap_wait_disposed(kQueue + 1);
     CHECK(audit_queued() == kQueue, "%zu samples queued", audit_queued());
     audit_shutdown(); /* returns although a shadow is held in flight */
     CHECK(audit_queued() == 0, "shutdown left %zu samples queued", audit_queued());
@@ -5066,6 +5081,7 @@ void mode_audit_shutdown()
     CHECK(c.queued == kQueue + 1 && c.shutdown_dropped == kQueue && c.shadowed == 0, "queued %llu shutdown-dropped %llu shadowed %llu",
           (unsigned long long)c.queued, (unsigned long long)c.shutdown_dropped, (unsigned long long)c.shadowed);
     specs.push_back(au_job(rig, kQueue + 1)); /* handed over after shutdown */
+    ap_wait_disposed(kQueue + 2);
     c = au_counters(fp);
     CHECK(c.dropped == 1 && c.queued == kQueue + 1, "dropped %llu queued %llu after shutdown", (unsigned long long)c.dropped,
           (unsigned long long)c.queued);
