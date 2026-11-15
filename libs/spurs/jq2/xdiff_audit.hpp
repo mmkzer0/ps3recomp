@@ -198,12 +198,16 @@ struct AuditEvent {
  *   on_wait   a worker found the queue full under `all` and is about to wait for room (runs without the queue lock;
  *             the audit thread alone can make room, so a test that holds it here knows the worker cannot go on);
  *   on_start  the audit thread took the sample and has not yet run the shadow;
- *   on_done   the verdict is counted and reported (and the fixture written), before the stop a divergence may raise. */
+ *   on_done   the verdict is counted and reported (and the fixture written), before the stop a divergence may raise;
+ *   on_disposed  a worker's sample is counted queued or dropped (kQueued / kDropped), after the counter moved and without
+ *             the queue lock. A worker credits its job before it hands the sample over, so a job's completion does not
+ *             say its sample is counted: a test that reads queued / dropped waits for this event first. */
 struct AuditHooks {
     void* user = nullptr;
     void (*on_wait)(void* user, const AuditEvent&) = nullptr;
     void (*on_start)(void* user, const AuditEvent&) = nullptr;
     void (*on_done)(void* user, const AuditEvent&, std::uint32_t verdict, std::uint32_t reason) = nullptr;
+    void (*on_disposed)(void* user, const AuditEvent&, Disposition) = nullptr;
 };
 void set_audit_hooks(const AuditHooks& hooks);
 

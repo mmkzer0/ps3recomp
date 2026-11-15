@@ -518,12 +518,12 @@ Disposition audit_submit(std::unique_ptr<Sample>& s)
     ImageAudit& image = *s->image;
     const std::size_t bytes = s->bytes;
     const AuditEvent ev{s->fingerprint, s->queue, s->seq};
+    const AuditHooks* hooks = g_hooks.load(std::memory_order_acquire);
     std::unique_lock<std::mutex> lk(st.mu);
     const auto has_room = [&st, bytes] {
         return st.items.size() < SPU_XDIFF_LIVE_QUEUE_SLOTS && st.bytes + bytes <= SPU_XDIFF_LIVE_QUEUE_BYTES;
     };
     if (!st.stopped && !has_room() && cfg != nullptr && cfg->mode == AuditMode::all) {
-        const AuditHooks* hooks = g_hooks.load(std::memory_order_acquire);
         if (hooks != nullptr && hooks->on_wait != nullptr) {
             lk.unlock();
             hooks->on_wait(hooks->user, ev);
@@ -531,17 +531,21 @@ Disposition audit_submit(std::unique_ptr<Sample>& s)
         }
         st.room.wait(lk, [&st, &has_room] { return st.stopped || has_room(); });
     }
+    Disposition disposition;
     if (st.stopped || !has_room()) {
         lk.unlock();
         image.dropped.fetch_add(1, kRelaxed);
-        return kDropped;
+        disposition = kDropped;
+    } else {
+        st.bytes += bytes;
+        st.items.push_back(std::move(s));
+        lk.unlock();
+        image.queued.fetch_add(1, kRelaxed);
+        st.work.notify_one();
+        disposition = kQueued;
     }
-    st.bytes += bytes;
-    st.items.push_back(std::move(s));
-    lk.unlock();
-    image.queued.fetch_add(1, kRelaxed);
-    st.work.notify_one();
-    return kQueued;
+    if (hooks != nullptr && hooks->on_disposed != nullptr) hooks->on_disposed(hooks->user, ev, disposition);
+    return disposition;
 }
 
 void audit_note_void(ImageAudit& image, std::uint64_t fingerprint, std::uint32_t queue, std::uint32_t seq,
