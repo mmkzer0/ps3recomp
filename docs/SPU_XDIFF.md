@@ -824,12 +824,22 @@ same (section 12.4).
 | private end state is not compared | the JobQueue2 loader destroys it | the profile retains local store |
 | registers and stack a native function leaves dead may differ (T2) | lifter liveness (section 17, question 10) | the poison run below changes the transcript |
 
-**The poison run** checks a "dead" claim instead of trusting it. Under the
-offline runner, T0 runs the fixture twice with an instruction observer
-(`spu_observe.h:53`). At the override's return address the second run
-overwrites every register and stack byte claimed dead with a second pattern.
-If its transcript or its remaining state differs from the first run, the
-claim is false for that fixture and the override is not comparable.
+**The poison run** checks a "dead" claim instead of trusting it
+(`spu_job_replay --tier interp --poison PLAN`, PLAN from
+`tools/spu_liveness.py`, `docs/SPU_LIFTER.md` "Liveness"). T0 runs the
+fixture twice under an instruction observer that keeps a shadow call stack:
+a `brsl`, `brasl` or `bisl` to a listed entry pushes its link, and the
+instruction after a `bi`-family branch on `$r0` to that link is the return.
+There, in the second run only, every register the plan calls dead gets four
+words of `0xDEADBEEF` and the frame below the call's stack pointer gets
+`0xA5`; `$r1` is never poisoned, and a plan that lists it is refused. A
+return whose `$r1` is not the call's, or a frame outside local store, is
+itself a false claim. Poison nobody read is masked out of the end-state
+compare; poison that reached a live value is not. If the poisoned run
+differs, the claim is false for that fixture: `differ` / `poison`, narrowed
+by further replays to the first function, then the lowest register or
+frame byte. An `equal` covers only the returns the run took (`poison.poisoned`
+in the JSON; zero means nothing was checked).
 
 A T2 body is judged twice: as a whole job under the contract, which is what
 makes it sound, and per overridden function with the masks, which is what
@@ -888,7 +898,7 @@ verdict (`SPU_XDIFF_REASONS`).
 | Verdict | Reasons |
 |---|---|
 | `equal` | `none` |
-| `differ` | `effect-kind`, `effect-request`, `effect-payload`, `effect-extra`, `effect-missing`, `end-class`, `end-regs`, `end-ls`; contract only: `epoch-order`, `epoch-writes` |
+| `differ` | `effect-kind`, `effect-request`, `effect-payload`, `effect-extra`, `effect-missing`, `end-class`, `end-regs`, `end-ls`; contract only: `epoch-order`, `epoch-writes`; poison run only: `poison` |
 | `void` | `budget`, `depth-guard`, `capture-limit`, `unsupported-effect`, `uncovered-read`, `unlifted-branch`, `host-fault` |
 | `malformed` | `fixture-format`, `fixture-identity`, `not-comparable` |
 | `not-found` | `no-fixture`, `no-body` |
@@ -1295,7 +1305,9 @@ spu_job_replay [--tier interp|registered] [--budget N] [--timeout S] [--json] FI
   unless `--tier interp`; `--budget` bounds a T0 subject in instructions and
   a registered body in transfers of its budgeted twin, which the runner uses
   when the title's registry holds one (without one the budget does not apply
-  to the registered body); `--timeout` (default 60 s) bounds the child.
+  to the registered body); `--timeout` (default 60 s) bounds the child;
+  `--poison PLAN` (with `--tier interp`) runs the poison run of section 8.2
+  and adds a `poison` member to the JSON.
   Standard output carries one JSON object, schema
   `ps3recomp.spujob-verdict/1`: `schema`, `tool`, `version`, `verdict`,
   `exit_code`, `reason`, `match`, `class` (section 8.4), `fixture {path,
@@ -1419,7 +1431,7 @@ then compare power and frame time with `xdiff=off`.
 | 7 | Fingerprint check | on the staged bytes, through the existing content-hash cache; a sampled job verifies the hit byte-serially, an unsampled one trusts it, an accepted and stated risk (section 4) | closed; its cost is read from existing traces |
 | 8 | Cost of the real path | one load and branch per operation, latch writes included; measured within noise on every channel, `dma` and `atomic` row (section 5.6) | closed by commit 4 |
 | 9 | Where xdiff records go | two trace kinds, 32 and 33; fixtures beside the trace, never in a bundle (section 14) | closed |
-| 10 | What T2 needs from the lifter | per function: the registers that may be read after each exit before they are written (live-out), over all callers, with an unknown caller meaning all; the extent of the stack below the entry pointer that is dead at exit; and a function as a fixture unit | open. Closes with that lifter pass and the poison run confirming its masks on a corpus |
+| 10 | What T2 needs from the lifter | per function: the registers that may be read after each exit before they are written (live-out), over all callers, with an unknown caller meaning all; the extent of the stack below the entry pointer that is dead at exit; and a function as a fixture unit | the pass and the run exist (`tools/spu_liveness.py`, `spu_job_replay --poison`); open until the poison run confirms the masks on a title corpus, and a function as a fixture unit is defined |
 
 ## 18. Measurements owed
 

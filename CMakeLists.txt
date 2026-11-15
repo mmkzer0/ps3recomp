@@ -1544,6 +1544,66 @@ if(PS3RECOMP_BUILD_TESTS)
             add_test(NAME spu_job_replay_usage COMMAND spu_job_replay)
             set_tests_properties(spu_job_replay_usage PROPERTIES LABELS "spu;t0" TIMEOUT 60
                 PASS_REGULAR_EXPRESSION "usage: ")
+            # The poison run (docs/SPU_XDIFF.md 8.2, docs/SPU_LIFTER.md "Liveness"): the claims of
+            # tools/spu_liveness.py on a synthetic caller and callee, checked against recorded jobs.
+            set(XDIFF_POISON_DIR "${CMAKE_BINARY_DIR}/spu_xdiff_poison")
+            set(XDIFF_POISON_JSONS "")
+            foreach(v ok frame copy nested unbalanced)
+                list(APPEND XDIFF_POISON_JSONS "${XDIFF_POISON_DIR}/xp_${v}.json")
+            endforeach()
+            add_custom_command(
+                OUTPUT "${XDIFF_POISON_DIR}/xdiff_poison_job.h" ${XDIFF_POISON_JSONS}
+                COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu/tests/gen_xdiff_poison_job.py" "${XDIFF_POISON_DIR}"
+                DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu/tests/gen_xdiff_poison_job.py"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tools/spu_liveness.py"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tools/find_spu_functions.py"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tools/spu_disasm.py"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tools/spu_elf.py"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tools/spu_lifter.py"
+                VERBATIM)
+            add_executable(test_spu_xdiff_poison
+                runtime/spu/tests/test_spu_xdiff_poison.c
+                runtime/spu/xdiff/spu_xdiff_replay.c
+                ${SPU_XDIFF_SOURCES}
+                ${XDIFF_REPLAY_RUNTIME}
+                "${XDIFF_POISON_DIR}/xdiff_poison_job.h")
+            target_include_directories(test_spu_xdiff_poison PRIVATE
+                include runtime runtime/spu runtime/platform "${XDIFF_POISON_DIR}")
+            target_link_libraries(test_spu_xdiff_poison PRIVATE m Threads::Threads)
+            # The test records each variant into DIR/xp_<variant>.spujob for the runner tests below.
+            add_test(NAME spu_xdiff_poison COMMAND test_spu_xdiff_poison "${XDIFF_POISON_DIR}")
+            set_tests_properties(spu_xdiff_poison PROPERTIES LABELS "spu;t0" TIMEOUT 120
+                FIXTURES_SETUP spu_xdiff_poison_fixture)
+            # A claim that is false on purpose, written without an image fingerprint.
+            file(WRITE "${XDIFF_POISON_DIR}/xp_wrong.json"
+                "{\"schema\":\"ps3recomp.spu-liveness/1\",\"functions\":[{\"entry\":\"0x40\",\"dead_regs\":[3,4]}]}\n")
+            add_test(NAME spu_job_replay_poison_equal
+                COMMAND spu_job_replay --tier interp --json --poison "${XDIFF_POISON_DIR}/xp_ok.json"
+                    "${XDIFF_POISON_DIR}/xp_ok.spujob")
+            set_tests_properties(spu_job_replay_poison_equal PROPERTIES LABELS "spu;t0" TIMEOUT 60
+                FIXTURES_REQUIRED spu_xdiff_poison_fixture
+                PASS_REGULAR_EXPRESSION "\"verdict\":\"equal\".*\"returns\":1,\"poisoned\":1,\"culprit\":null")
+            add_test(NAME spu_job_replay_poison_register
+                COMMAND spu_job_replay --tier interp --json --poison "${XDIFF_POISON_DIR}/xp_wrong.json"
+                    "${XDIFF_POISON_DIR}/xp_ok.spujob")
+            set_tests_properties(spu_job_replay_poison_register PROPERTIES LABELS "spu;t0" TIMEOUT 60
+                FIXTURES_REQUIRED spu_xdiff_poison_fixture
+                PASS_REGULAR_EXPRESSION "\"verdict\":\"differ\",\"exit_code\":4,\"reason\":\"poison\".*\"function\":\"0x00040\",\"kind\":\"register\",\"register\":3,\"below_sp\":null,\"exact\":null,\"underlying\":\"effect-request\"")
+            add_test(NAME spu_job_replay_poison_frame
+                COMMAND spu_job_replay --tier interp --poison "${XDIFF_POISON_DIR}/xp_frame.json"
+                    "${XDIFF_POISON_DIR}/xp_frame.spujob")
+            set_tests_properties(spu_job_replay_poison_frame PROPERTIES LABELS "spu;t0" TIMEOUT 60
+                FIXTURES_REQUIRED spu_xdiff_poison_fixture
+                PASS_REGULAR_EXPRESSION "^differ poison effect=[0-9]+ function=0x00040 below_sp=0x20 ")
+            add_test(NAME spu_job_replay_poison_usage
+                COMMAND spu_job_replay --poison "${XDIFF_POISON_DIR}/xp_ok.json" "${XDIFF_POISON_DIR}/xp_ok.spujob")
+            set_tests_properties(spu_job_replay_poison_usage PROPERTIES LABELS "spu;t0" TIMEOUT 60
+                PASS_REGULAR_EXPRESSION "needs --tier interp")
+            add_test(NAME spu_job_replay_poison_missing
+                COMMAND spu_job_replay --tier interp --poison "${XDIFF_POISON_DIR}/none.json" "${XDIFF_POISON_DIR}/xp_ok.spujob")
+            set_tests_properties(spu_job_replay_poison_missing PROPERTIES LABELS "spu;t0" TIMEOUT 60
+                PASS_REGULAR_EXPRESSION "cannot open")
             # The budgeted twin (row 9): loops without effects, lifted once and
             # compiled twice -- the production object, and the same source under
             # -DSPU_LIFT_BUDGET with renamed symbols -- replayed at the registered tier.
@@ -1585,6 +1645,11 @@ if(PS3RECOMP_BUILD_TESTS)
                 COMMAND "${Python3_EXECUTABLE}"
                     "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_budget_twin.py")
             set_tests_properties(spu_budget_twin PROPERTIES LABELS "spu;t0" TIMEOUT 120)
+            # The liveness tool on hand-encoded images (docs/SPU_LIFTER.md "Liveness").
+            add_test(NAME spu_liveness
+                COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_liveness.py")
+            set_tests_properties(spu_liveness PROPERTIES LABELS "spu;t0" TIMEOUT 120)
         endif()
     endif()
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)

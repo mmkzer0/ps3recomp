@@ -162,7 +162,9 @@ typedef enum spu_xdiff_verdict {
     /* The pair of tiers has no matching rule (a tweak). */                                         \
     X(NOT_COMPARABLE,    50, "not-comparable",     MALFORMED)                                       \
     X(NO_FIXTURE,        64, "no-fixture",         NOT_FOUND)                                       \
-    X(NO_BODY,           65, "no-body",            NOT_FOUND)
+    X(NO_BODY,           65, "no-body",            NOT_FOUND)                                       \
+    /* The offline runner's poison run (--poison): state a liveness claim called dead changed the run. */ \
+    X(POISON,            26, "poison",             DIFFER)
 
 typedef enum spu_xdiff_reason {
 #define SPU_XDIFF_REASON_ENUM(name, value, id, verdict) SPU_XDIFF_R_##name = value,

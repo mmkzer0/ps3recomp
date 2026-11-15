@@ -86,6 +86,110 @@ which defines `SPU_LIFT_BUDGET` and includes `spu_recomp.c`, and registers the
 twin beside the production entry with `spu_workload_register_twin`. A twin
 doubles the lifted code a title compiles, so it is off by default.
 
+## Liveness (what a T2 override may rely on)
+
+A native override of one function (tier T2, `docs/SPU_XDIFF.md` sections 8.2
+and 17 question 10) may leave registers and stack bytes different from the
+lifted function's if nobody reads them. `tools/spu_liveness.py` says which, and
+the offline runner's poison run checks what it says.
+
+```
+python3 tools/spu_liveness.py IMAGE.bin --base 0x7C00 [--code-end N] [--entry N]... [--functions FILE] -o live.json
+python3 tools/spu_liveness.py --elf IMAGE.elf -o live.json          # the ELF's code, bounds and entry
+```
+
+The functions are the lifter's: `find_spu_functions.py`'s `raw=True` bounds,
+split at each `--entry` and capped at `--code-end` exactly as `spu_lifter.py`
+does (`--functions` takes the lifter's own list, `--elf` the
+`--auto-functions` one). The output is `ps3recomp.spu-liveness/1`: the image
+(`sha256`, `fingerprint` in the registry's FNV form, `ls_base`, `bytes`,
+`code_end`) and, per function:
+
+| Member | Meaning |
+|---|---|
+| `entry`, `end` | the bound, LS addresses as hex strings |
+| `exits` | the `bi $r0` (and conditional `biz`..`bihnz $r0`) returns |
+| `tail_calls`, `tail_callers` | the other bounds it branches into; the branch sites that reach it |
+| `callers` | the `brsl`/`brasl` sites that call it |
+| `live_out` | registers some caller may read after the call before writing them; `$r1` always |
+| `dead_regs` | `$r0..$r127` minus `$r1` minus `live_out` |
+| `dead_stack` | `{"below_sp": n}`: the bytes `[entry_sp - n, entry_sp)` are dead at every return; or `null` |
+| `unknown_callers`, `unknown_reasons` | `true` makes `live_out` every register and `dead_regs` empty |
+
+**Model.** No register is assumed dead from the ABI; only what the analysis
+proves is claimed, and every doubt makes a register live. The analysis is a
+backward dataflow over every instruction of every bound, with exact defs and
+uses (an instruction the tool does not know reads every register and kills
+none; a test pins that every mnemonic the disassembler prints has a rule).
+A call to a function entry E is live-in of E minus the link register, plus
+live-in after the call: a callee never kills anything but the link. A call to
+anything else, an indirect call (`bisl`), a branch whose target the tool
+cannot see (`bi $rN`, a computed `bi $r0` as `spu_lifter.compute_bi_r0_jumps`
+classifies it, `iret`, `bisled`, a target outside the image) and a resuming
+`stop` (`find_spu_functions.LV2_RESUMING_STOPS`) read every register. A
+terminating `stop` reads nothing: the program ends there. `live_out` of a
+function is the union, over its call sites, of live-in after the call, plus
+`live_out` of every bound that branches or falls into it (a tail call returns
+to the caller's callers). Recursion and mutual calls are solved to a fixed
+point.
+
+A function has unknown callers, and every register live-out, when anything but
+a direct call or branch can reach it: it is an `--entry`; no call or branch in
+the image targets it; its address is an `ila`, an `il` or an `ilhu`+`iohl`
+constant, or an aligned word anywhere in the image (a function pointer table);
+a call lands inside it; or it is the return continuation of a call. What the
+tool does not see is an entry reached through arithmetic on a table base
+(offset tables, `ila` plus `ai`) or a halfword table: name such entries with
+`--entry`.
+
+`dead_stack` needs a forward analysis of `$r1` to prove a frame: the function
+lowers `$r1` only with `ai $r1,$r1,imm`, reaches no indirect branch, no
+paths disagree on the offset, every return and every branch out of it finds
+`$r1` at its entry value, and `n` is the deepest the pointer goes. Calls are
+assumed to return with `$r1` unchanged. A function with no frame, an
+unbalanced one, a mid-function entry or an indirect branch claims none. The
+claim is the function's own frame, not everything below the stack pointer
+(its callees' frames are dead too and are not claimed).
+
+**The poison run** (`spu_job_replay --tier interp --poison live.json FIXTURE`,
+`docs/SPU_XDIFF.md` section 8.2) checks the claims on one fixture. T0 replays
+it, then replays it again and, at every return of a listed function,
+overwrites what the plan calls dead. What is poisoned, and when:
+
+- *A call* is a `brsl`, `brasl` or `bisl` whose target is a listed entry; it
+  records the link and `$r1`. *A return* is the first instruction executed
+  after a `bi`/`biz`/`binz`/`bihz`/`bihnz` on `$r0` whose address is that link.
+  Poison goes in before that instruction runs, so the return has already read
+  `$r0`. A function entered by a jump or by the loader (no call seen) is never
+  poisoned.
+- Registers get four words of `0xDEADBEEF`; `$r1` never does and a plan that
+  lists it is refused. `$r0` may be poisoned, after the return consumed it.
+- The frame gets `0xA5` at `sp - k` for `k` in `1..n`, `sp` being `$r1` at the
+  call. A frame whose return finds `$r1` elsewhere, or that does not fit in
+  local store, makes the claim false: the claim said the frame is the `n`
+  bytes below the entry stack pointer.
+- Poison nobody read stays in the end state; registers and bytes still holding
+  the pattern take the fixture's value before the end states are compared, so
+  only state the poison reached elsewhere differs.
+
+A run that differs in a transcript record or in the remaining state, or whose
+frame claim fails, is `differ` / `poison`. The runner then narrows it with more
+replays: the first function (by entry) whose claims fail alone, the lowest dead
+register of it that fails alone, else the frame byte (the lowest one that
+matters; `exact` when poisoning that byte alone fails). The result names them;
+`underlying` is the reason the narrowest failing run would have had. A plan
+computed for another image (`fingerprint`) is `malformed` / `fixture-identity`.
+`equal` says the claims held on this fixture, for the returns the run poisoned
+(`poison.poisoned`, zero for a plan whose functions this job never calls); it
+is no proof for another input.
+
+`tools/test_spu_liveness.py` pins the analysis on hand-encoded images;
+`runtime/spu/tests/test_spu_xdiff_poison.c` (`spu_xdiff_poison`) records a
+caller and callee in four variants, takes the claims from the tool, and checks
+that they hold, that a deliberately wrong claim is found and named, and that a
+claim the analysis cannot see (the caller reading the callee's frame) is caught
+by the poison run.
+
 ## Relationship to the PPU fallback approach (read `SPU_FALLBACK.md` first)
 
 The project's **current** SPU strategy is *not* execution — it is the
