@@ -67,11 +67,13 @@ endif()
 # that generated code dereferences pinned to the ABI.
 gates_probe(probe_spu_lifter_abi_match probe_spu_lifter_abi.c stamp_lifter_abi.c)
 target_compile_definitions(probe_spu_lifter_abi_match PRIVATE
-    SPU_PROBE_ABI=1u PPU_PROBE_ABI=PPU_RUNTIME_LIFTER_ABI)
+    SPU_PROBE_ABI=SPU_RUNTIME_LIFTER_ABI PPU_PROBE_ABI=PPU_RUNTIME_LIFTER_ABI)
 
+# 1u is the stamp every lift made before the budgeted twin carries: the runtime
+# must refuse it.
 gates_probe(probe_spu_lifter_abi_mismatch probe_spu_lifter_abi.c stamp_lifter_abi.c)
 target_compile_definitions(probe_spu_lifter_abi_mismatch PRIVATE
-    SPU_PROBE_ABI=2u PPU_PROBE_ABI=PPU_RUNTIME_LIFTER_ABI)
+    SPU_PROBE_ABI=1u PPU_PROBE_ABI=PPU_RUNTIME_LIFTER_ABI)
 
 # Compile-only: the selected data-model pin must equal the context layout. The
 # gate test also cross-compiles this file for Windows x64, where it selects the

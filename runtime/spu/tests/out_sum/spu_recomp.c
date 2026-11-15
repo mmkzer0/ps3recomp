@@ -10,7 +10,7 @@ loc_00000008:
         ctx->gpr[6] = spu_rdch(ctx, SPU_RdInMbox);
         ctx->gpr[3] = spu_a(ctx->gpr[3], ctx->gpr[6]);
         ctx->gpr[4] = spu_ai(ctx->gpr[4], -1);
-        if (ctx->gpr[4]._u32[0] != 0) goto loc_00000008;
+        if (ctx->gpr[4]._u32[0] != 0) { SPU_LIFT_BACKEDGE(ctx); goto loc_00000008; }
         spu_wrch(ctx, SPU_WrOutMbox, ctx->gpr[3]);
         ctx->stop_code = 0x0u; ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;
 }

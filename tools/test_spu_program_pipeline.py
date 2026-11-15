@@ -607,9 +607,9 @@ class Pipeline(unittest.TestCase):
         source = output / 'sample' / 'spu_recomp.c'
         header_text = header.read_text()
         source_text = source.read_text()
-        self.assertIn('#define SPU_LIFTER_ABI 1u', header_text)
+        self.assertIn('#define SPU_LIFTER_ABI 2u', header_text)
         self.assertIn('ps3_spu_lifter_abi_check(SPU_LIFTER_ABI);', source_text)
-        header.write_text(header_text.replace('#define SPU_LIFTER_ABI 1u\n', ''))
+        header.write_text(header_text.replace('#define SPU_LIFTER_ABI 2u\n', ''))
         source.write_text(source_text.replace(
             '    ps3_spu_lifter_abi_check(SPU_LIFTER_ABI);\n', ''))
         for extra in ((), ('--skip-lift',)):

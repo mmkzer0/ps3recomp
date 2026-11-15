@@ -366,9 +366,18 @@ uint32_t spu_xdiff_replay(const spu_xdiff_fixture* f, const spu_xdiff_replay_opt
 
     void (*entry)(spu_context*) = entry_interp;
     int image_id = -1;   /* T0: -1 keeps the interpreter from rejoining a lifted function (section 9) */
+    int twin = 0;
     if ((opt->subject_tier & SPU_TIER_MASK) == (uint32_t)SPU_TIER_LIFTED) {
         entry = spu_workload_find_img(f->identity.image_fingerprint, &image_id);
         if (!entry) return verdict_of(out, SPU_XDIFF_R_NO_BODY);
+        /* A budget is a bound on the loops of the subject, and only the budgeted twin carries one (section 10).
+         * The twin has its own image id, so its indirect branches stay inside it. An image without a twin runs its
+         * production body unbounded, as before: the offline runner's timeout is its bound. */
+        if (opt->budget) {
+            int twin_id = 0;
+            spu_lifted_entry_fn t = spu_workload_find_twin(f->identity.image_fingerprint, &twin_id);
+            if (t) { entry = t; image_id = twin_id; twin = 1; }
+        }
     }
 
     /* The shadow is built, never copied: spu_context_init, then what a job's entry state sets (section 7.4). */
@@ -390,7 +399,10 @@ uint32_t spu_xdiff_replay(const spu_xdiff_fixture* f, const spu_xdiff_replay_opt
     s->port.tap = NULL;
     s->port.tap_user = NULL;
     spu_port_set(ctx, &s->port);
-    if (image_id < 0 && opt->budget) {
+    if (twin) {
+        ctx->budget = opt->budget;   /* the twin counts it down at every transfer that can close a loop */
+        out->budget = opt->budget;
+    } else if (image_id < 0 && opt->budget) {
         r->budget = opt->budget;
         out->budget = opt->budget;
         s->obs.user = r;
@@ -402,7 +414,13 @@ uint32_t spu_xdiff_replay(const spu_xdiff_fixture* f, const spu_xdiff_replay_opt
     }
 
     const int halted = spu_run_with_halt(entry, ctx);
-    out->budget_spent = r->spent;
+    /* The twin's own counter is the context's: what is left of the budget, and the unwind's status. */
+    if (twin) {
+        out->budget_spent = opt->budget - ctx->budget;
+        if (halted && ctx->status == SPU_STATUS_BUDGET_EXHAUSTED) r->over_budget = 1;
+    } else {
+        out->budget_spent = r->spent;
+    }
     out->subject_pc = ctx->pc;
 
     /* A served context that reached the runtime below the seam has broken the design's central claim

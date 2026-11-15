@@ -950,21 +950,48 @@ second T0 shadow on the same thread exhausts its budget and gets `void` /
 
 - **The transcript ends.** An effect past the last record is
   `effect-extra`; the serve table ends the run.
-- **Loops without effects need a budget.** *Decided for the mechanism; its
-  cost is owed (section 18).*
+- **Loops without effects need a budget.** *Landed for both tiers (row 9); the
+  twin's cost is measured in section 18.*
   - *T0 as subject:* the instruction observer. `on_insn` returning nonzero
     stops the outermost interpreter run with nothing consumed
     (`spu_observe.h:15-26`, `spu_interp.c:803-814`). A step counter there
     costs the production interpreter nothing, because an observer already
     moves a run off its fast path (`spu_interp.c:773-776`). The budget is in
     instructions.
-  - *T1 as subject:* a budgeted twin, added in commit 9. The current lifter
-    emits plain conditional and direct `goto`s at the back-edge sites
-    (`spu_lifter.py:1007`, `:1121`); commit 9 wraps these with
-    `SPU_LIFT_BACKEDGE(ctx)`. It expands to nothing in the production source;
-    the twin counts down `ctx->budget` at these sites, in `SPU_DIRECT`
-    (`spu_context.h:1124-1133`) and at drain hops (`:1084-1086`). The registry
-    carries both entries of an image. The budget is in backward transfers.
+  - *T1 as subject:* a budgeted twin (row 9). `SPU_LIFT_BACKEDGE(ctx)` stands
+    at every backward conditional or direct `goto` the lifter emits, at the
+    trampoline-setting indirect branches and returns (`bi`, `biz` and its
+    kin, `bisled`, `iret`, `SPU_RET`, `SPU_RET_REG` at host depth 0), in
+    `SPU_DIRECT` and in the `SPU_DRAIN` hop (`spu_context.h`). It expands to
+    an empty statement in the production source, and the object of a source
+    compiled without `SPU_LIFT_BUDGET` is the one it was before. The twin is
+    that same generated source compiled a second time with
+    `-DSPU_LIFT_BUDGET`, where the macro counts `ctx->budget` down and the
+    transfer that finds it at 0 calls `spu_lift_budget_exhausted`
+    (`spu_drain.c`): status `SPU_STATUS_BUDGET_EXHAUSTED`, then `spu_halt`.
+    The runtime's own drain loops (`spu_drain_call`, the one in
+    `spu_run_with_halt`) are not instrumented, and need not be: every
+    transfer they run was queued by one of the sites above, and a loop has a
+    backward edge. The unit is transfers that can close a loop: a
+    cross-function transfer counts although it need not go backward, so a
+    budget is a bound and not a measure of the loop's laps.
+  - *The twin's names and ids.* The generated header renames the twin's
+    symbols inside `#ifdef SPU_LIFT_BUDGET` (suffix `_budget`, `TWIN_SUFFIX`
+    in `tools/spu_lifter.py`), so both compilations link into one program.
+    The twin has its own image id: with the production id, an indirect
+    branch inside the twin would resolve to the production function and the
+    loop would run uncounted. `spu_workload_register_twin` attaches the twin
+    entry and its id to the fingerprint of the registered body;
+    `spu_workload_find_img` keeps answering with the production entry and
+    `spu_workload_find_twin` with the twin. `build_spu_workloads.py
+    --budget-twin` writes the per-image translation unit
+    (`spu_recomp_budget.c`), `budget_sources.cmake` and the registrations;
+    it is opt-in, because the twin doubles the compiled lifted code and the
+    function registry's entries. `spu_xdiff_replay` uses the twin when the
+    registered tier runs with a budget and one is registered, and reads
+    the exit from the status after the halt: `void` / `budget`, with the
+    budget spent in transfers. Without a twin the budget does not apply to
+    a registered body, and the offline runner's timeout is its bound.
   - **Depth guard:** `spu_depth_guard` calls `spu_halt` without setting an
     architectural status (`runtime/spu/spu_drain.c:487-523`). The shadow
     driver recognizes this runtime exit and reports `void` / `depth-guard`,
@@ -976,7 +1003,7 @@ second T0 shadow on the same thread exhausts its budget and gets `void` /
     (`tests/spurs_jq2/test_jq2_executor.cpp:35-39`, `:429-447`) under the
     ThreadSanitizer preset (`tests/spurs_jq2/CMakeLists.txt:128`, `:143`);
     the `asan` preset runs the same tier. Commit 8 restores the interpreter's
-    nesting depth at the landing pad after a halt (section 9); commit 9 adds
+    nesting depth at the landing pad after a halt (section 9); row 9 adds
     the budget unwind.
   - *Over budget on one side only is `void`, never `equal`.* The authority
     has no budget: it is the game's own run.
@@ -1087,7 +1114,7 @@ credit the job                     -- queue -->  build the shadow context
 stop `lifter-abi`, `docs/STOPS.md:48`); a lift regenerated against a changed
 `spu_context.h` no longer links and runs silently on the SPU side either.
 
-- The lifter writes `#define SPU_LIFTER_ABI 1u` into every generated header
+- The lifter writes `#define SPU_LIFTER_ABI 2u` into every generated header
   (`tools/spu_lifter.py:73`), and the generated `spu_recomp_register()` calls
   `ps3_spu_lifter_abi_check(SPU_LIFTER_ABI)` before its first
   `spu_register_function` (`:1186`). The runtime compares the value with
@@ -1103,9 +1130,10 @@ stop `lifter-abi`, `docs/STOPS.md:48`); a lift regenerated against a changed
 - **The layout is pinned next to the number.**
   `SPU_RUNTIME_LIFTER_CONTEXT_LAYOUT_SIGNATURE`
   (`include/ps3emu/lifter_abi.h:89`) is an integer constant expression over
-  the `offsetof` and `sizeof` of 14 members of `spu_context`: `gpr`, `pc`,
+  the `offsetof` and `sizeof` of 15 members of `spu_context`: `gpr`, `pc`,
   `status`, `stop_code`, `image_id`, `event_status`, `event_mask`, `srr0`,
-  `int_enable`, `host_depth`, `reloc_delta`, `ls`, `policy_mode` and `steps`.
+  `int_enable`, `host_depth`, `reloc_delta`, `ls`, `policy_mode`, `steps` and
+  `budget`.
   There is one pin per data model, LP64 and Win64 (`:45-46`), because
   `spu_channel.lock` is a `volatile long` (`spu_context.h:198`) and moves the
   later members where `long` is 32 bits; an unlisted model is a compile
@@ -1123,15 +1151,21 @@ stop `lifter-abi`, `docs/STOPS.md:48`); a lift regenerated against a changed
   jobs distinct ids.
 - The effect port's pointer, and `lift_miss`, are added behind `observer`
   (`spu_context.h:458`). None of the 14 pinned members lies behind that
-  offset, so commit 4 needs no ABI bump, and its acceptance is that the pin
-  is unchanged. `ctx->budget` is read by generated code of the budgeted
-  twin, and commit 9 therefore adds it to the member list, raises
-  `SPU_RUNTIME_LIFTER_ABI` and `SPU_LIFTER_ABI`, **recomputes both data-model
-  pins**, updates `EXPECTED_ABI` in `tests/gates/test_spu_lifter_abi.py`, and
-  regenerates the checked-in lifts `runtime/spu/tests/out_*` (eleven
-  directories whose `spu_recomp.h` stamps `SPU_LIFTER_ABI` and whose
-  registration calls the check): with the old stamp each would stop by
-  `lifter-abi`.
+  offset, so commit 4 needed no ABI bump, and its acceptance was that the pin
+  was unchanged. `ctx->budget` is read by generated code of the budgeted
+  twin, and row 9 therefore added it to the member list, raised
+  `SPU_RUNTIME_LIFTER_ABI` and `SPU_LIFTER_ABI` to 2, **recomputed both
+  data-model pins**, updated `EXPECTED_ABI` in
+  `tests/gates/test_spu_lifter_abi.py` and the gate probes (the matching
+  probe now takes `SPU_RUNTIME_LIFTER_ABI`, the refused one is stamp 1, what
+  every earlier lift carries), and regenerated the checked-in lifts
+  `runtime/spu/tests/out_*` (eleven directories whose `spu_recomp.h` stamps
+  `SPU_LIFTER_ABI` and whose registration calls the check): with the old
+  stamp each stops by `lifter-abi`, as does any title lift made before the
+  bump. `budget` is the last member of `spu_context`, behind
+  `coh_listed`, so none of the 14 members already pinned moves: the pin gains
+  one term and no existing offset changes (LP64 `0x38CBFC7B6255D14D`, Win64
+  `0x410F0D5C181549BD`).
 
 ### 12.2 Raw job images in the pipeline
 
@@ -1218,8 +1252,10 @@ spu_job_replay [--tier interp|registered] [--budget N] [--timeout S] [--json] FI
 ```
 
 - One fixture, one verdict. The subject is the image's registered body
-  unless `--tier interp`; `--budget` bounds a T0 subject in instructions
-  (commit 9 adds the T1 twin); `--timeout` (default 60 s) bounds the child.
+  unless `--tier interp`; `--budget` bounds a T0 subject in instructions and
+  a registered body in transfers of its budgeted twin, which the runner uses
+  when the title's registry holds one (without one the budget does not apply
+  to the registered body); `--timeout` (default 60 s) bounds the child.
   Standard output carries one JSON object, schema
   `ps3recomp.spujob-verdict/1`: `schema`, `tool`, `version`, `verdict`,
   `exit_code`, `reason`, `match`, `class` (section 8.4), `fixture {path,
@@ -1305,7 +1341,7 @@ standalone.
 | 6 | `jq2: select a job body by its staged bytes` | `libs/spurs/jq2/executor.{cpp,hpp}`, `include/ps3emu/config_options.def`, `include/ps3emu/config.h`, `runtime/config/`, `docs/CONFIG.md`, `docs/JQ2.md` | a registered image runs lifted under `spu.job_body=lifted`; other bytes staged from the same EA and size run interpreted; `interp` never runs a registered body | the executor tests; kind-29 cost reported from a synthetic trace; `gcc-16`; tsan |
 | 7 | **landed** as `b14aec61` (`spu: xdiff fixture format, its validating codec, the context census`; the whole header, since the decoder bounds-checks `VRDT`) and `2139acd1` (`spu: record a job's transcript and write its fixture`) | `runtime/spu/spu_xdiff.h` (new: the container, section, identity, unit, effect and end layouts of 7.1 to 7.6, and `spu_job_tier`), `runtime/spu/xdiff/` (new: fixture reader and writer, recorder tap), `spu_channels.c` (a query for the latched float mode), tests | a synthetic job with GET, PUT, a list, a stalled list resumed by `MFC_WrListStallAck`, GETLLAR/PUTLLC and a mailbox write records the expected transcript, the remaining list bytes at the ack included; the fixture reads back the expected record and payload bytes; each rejection of section 7.8 is reported as `fixture-format` (a `VRDT` section is bounds-checked only until commit 8) | the test, interpreted and lifted; `asan` preset over the reader with truncated and corrupt fixtures, among them one with a flipped header byte (the checksum covers the whole header); `gcc-16`; `SPU_XDIFF_LS_BYTES` equals `SPU_LS_SIZE` by static assertion |
 | 8 | **landed** as `01538f72` (`spu: replay port, shadow contexts and spu_job_replay`; the census and its test came with `b14aec61`; the corpus driver is `tools/spu_xdiff_corpus.py`, `dfcdef7d`) | `runtime/spu/spu_xdiff.h` (verdict, reason and match enums, `VRDT`), `runtime/spu/xdiff/` (replay serve table, shadow context, runner), `spu_channels.c` and `spu_interp.c` (`spu_run_with_halt` saves the interpreter's nesting depth before `setjmp` and restores it in the halt cases), `tools/test_spu_context_census.py` (new), `tools/spu_xdiff_corpus.py` (new), tests | T0 against the lift on the fixture of commit 7: `equal`; a lift with one changed instruction: `differ` naming the first effect; a lift that writes another tag mask before a wait and then overwrites the register: `differ` / `effect-request`; a lift that rewrites the remaining elements of a stalled list before the ack and later overwrites them: `differ` / `effect-request`; a stop inside a nested lifted call: `differ` (section 5.1); T0 over its budget by the instruction observer: `void`; a T0 shadow that ends by serve-halt, then a second T0 shadow on the same thread that exhausts its budget: `void` / `budget`, not an abort (section 9); a fixture whose `float_rz` is not the runner's mode: `malformed` / `fixture-identity`; a behaviour-changing knob set: exit status 1; a new `spu_context` member without a class: the census test fails | runner exit codes 0, 1, 2, 3, 4, 5; `gcc-16`; `asan` |
-| 9 | `spu_lifter: count backward transfers under SPU_LIFT_BUDGET` | `tools/spu_lifter.py`, `tools/build_spu_workloads.py` (twin entry), `runtime/spu/spu_context.h`, `spu_drain.c`, and the ABI bump of section 12.1: `budget` joins the member list of `include/ps3emu/lifter_abi.h`, `SPU_RUNTIME_LIFTER_ABI` and `SPU_LIFTER_ABI` go up, both data-model pins are recomputed, `EXPECTED_ABI` in `tests/gates/test_spu_lifter_abi.py` follows, and `runtime/spu/tests/out_*` are regenerated | a lifted loop without effects: `void` / `budget` and the process goes on; the same source without the definition contains no check (object comparison) | `asan` and `tsan` presets with `--repeat until-fail:10`; SPU bench unchanged for the production object; `tests/gates/test_spu_lifter_abi.py` and the SPU runtime tests over the regenerated lifts |
+| 9 | **landed**: `spu_lifter: count backward transfers under SPU_LIFT_BUDGET` | `tools/spu_lifter.py`, `tools/build_spu_workloads.py` (`--budget-twin`, the twin entry), `cmake/PS3RecompSPU.cmake`, `runtime/spu/spu_context.h` (`budget` is the last member), `spu_drain.c` (`spu_lift_budget_exhausted`), `spu_workload.c`/`.h` (`spu_workload_register_twin`, `spu_workload_find_twin`), `runtime/spu/xdiff/` (the replay uses the twin; census), and the ABI bump of section 12.1: `budget` joins the member list of `include/ps3emu/lifter_abi.h`, `SPU_RUNTIME_LIFTER_ABI` and `SPU_LIFTER_ABI` go to 2, both data-model pins are recomputed, `EXPECTED_ABI` in `tests/gates/test_spu_lifter_abi.py` and the gate probes follow, and `runtime/spu/tests/out_*` are regenerated | `spu_xdiff_budget`: a lifted loop without effects (a backward goto, cross-function transfers, an indirect branch) replayed at the registered tier: `void` / `budget` with the counter at the limit and the process goes on, `equal` under a large budget; `spu_budget_twin`: the registry writer; the same source without the definition contains no check (object comparison: `cmp` of the `.o` of the eleven checked-in lifts and a loop image, base-tree lifter and headers against this tree's, `-O0` and `-O2`, the stamp the one intended difference) | `asan` and `tsan` presets with `--repeat until-fail:10` on the xdiff tests; SPU bench unchanged for the production object (3 alternating rounds against the base commit: lifted rows within spread); `tests/gates/test_spu_lifter_abi.py` and the SPU runtime tests over the regenerated lifts |
 | 10a | `jq2: record an image's fixtures without a shadow` | `libs/spurs/jq2/` (start and end hooks record on the worker; fixtures written synchronously), the registration part of 3b, `include/ps3emu/config_options.def` and `include/ps3emu/config.h` (`spu.xdiff_dir`, `spu.xdiff_capture`), `docs/CONFIG.md` | a registered synthetic image run N+1 times under `spu.xdiff_capture=N` writes N fixtures, each with the job's identity, effects and end, and the guest-visible results are those of a run without capture; an image whose registration lists event branches writes none and is counted ineligible; a fixture that cannot be written is a named diagnostic and the run goes on | the jq2 executor tests; `spu_job_replay --tier interp` on each written fixture: `equal`; `tsan` preset `-R jq2_exec`; `gcc-16` |
 | 10b | `jq2: in-run xdiff with sampled shadows` | `libs/spurs/jq2/` (audit thread, queue), `runtime/spu/spurs_job.c` (staging store hand-over), `include/ps3emu/stop.h`, `docs/STOPS.md`, `tests/gates/test_stop.py`, `include/ps3emu/ps3_ftrace.h`, config keys, `docs/CONFIG.md` | a seeded divergence is reported, its fixture written and replayable, the guest-visible result unchanged; `stop` exits by `spu-xdiff-divergence`; a full queue drops and counts in `sample` and blocks in `all` (ordered by hooks, never by sleeps) | `tsan` preset `-R jq2_xdiff --repeat until-fail:10`; the stop gate; `gcc-16` |
 | 11 | **landed** `52c4c9f6`: `ftrace_report: per-image tier and xdiff counters` (the kind numbers live in the tool until `ps3_ftrace.h` gains them with 10b) | `tools/ftrace_report.py`, `tools/test_ftrace_report.py`, `docs/TOOLS.md` | a synthetic trace with kinds 32 and 33 yields the per-image counts and the sampled share; a trace without them reports the columns absent | the tool test; `ftrace_bundle.py verify` on a bundle with the new kinds |
@@ -1336,7 +1372,7 @@ then compare power and frame time with `xdiff=off`.
 | 2 | Contract matching for T2 and T3 | epoch rule and falsifiers in section 8.2 | proposed, and not a promotion gate until a synthetic peer-reservation test captures notification recipients and event order, then a T3 corpus replay confirms the relaxations |
 | 3 | Equivalence of T0 and T1 | every register, all of local store, the end class; the argument is in section 8.1 | closed |
 | 4 | Sanitising a shadow context | nothing is copied, so nothing is sanitised; the census test and the driver check enforce it (section 9) | closed |
-| 5 | Budget for lifted code | a back-edge macro that exists only in a second compilation; unwinding by the existing halt; evidence for `longjmp` under the sanitizers in section 10 | closed for soundness; the twin's cost is owed |
+| 5 | Budget for lifted code | a back-edge macro that exists only in a second compilation; unwinding by the existing halt; evidence for `longjmp` under the sanitizers in section 10 | closed (row 9); the twin's cost is in section 18 |
 | 6 | Audit thread | one thread; queue of 8 slots/32 MiB total, maximum 4 MiB per sample; `sample` drops and counts on queue pressure, `all` blocks for queue room; oversized samples are explicit `capture-limit` voids; drops and voids appear in counters, trace records and the report (section 11) | closed |
 | 7 | Fingerprint check | on the staged bytes, through the existing content-hash cache; a sampled job verifies the hit byte-serially, an unsampled one trusts it, an accepted and stated risk (section 4) | closed; its cost is read from existing traces |
 | 8 | Cost of the real path | one load and branch per operation, latch writes included; measured within noise on every channel, `dma` and `atomic` row (section 5.6) | closed by commit 4 |
@@ -1354,7 +1390,7 @@ settles it:
 | identifying the staged image is cheap | the kind-29 spans of an existing play trace, per image: mean and p95 against the job's own span | `ftrace_report.py`, before commit 6 |
 | recording costs a few percent of a job | job spans with `xdiff=off` against `xdiff=all`, same scene, same build; and kind 32 spans; the byte-serial check of a sampled job's image is part of this cost | after commit 10b |
 | a fixture is about 100 KiB | sizes of a captured corpus, raw and zstd | after commit 10a |
-| the budgeted twin is close to the production object | the SPU bench over both objects | commit 9 |
+| the budgeted twin is close to the production object | the SPU bench over both objects | **measured** with row 9 (lifted rows, `--no-interp`, fastest of 3 alternating rounds, a bench main that arms `ctx->budget`): median twin/production 0.999; rows whose body is loop control only (`nop`, `lnop`, branches to the next word, not-taken branches) 0.44, because each lap of their 32-op loop adds a counted back-edge; `brsl` call 1.03; channel and `dma` rows 0.99 to 1.02. The twin is a bound for audit runs, not the game's code |
 | T0 under an instruction observer is fast enough to shadow | interpreter steps per second with and without the counting observer | commit 8 |
 
 ## 19. References

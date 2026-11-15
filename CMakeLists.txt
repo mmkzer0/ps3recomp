@@ -1510,6 +1510,47 @@ if(PS3RECOMP_BUILD_TESTS)
             add_test(NAME spu_job_replay_usage COMMAND spu_job_replay)
             set_tests_properties(spu_job_replay_usage PROPERTIES LABELS "spu;t0" TIMEOUT 60
                 PASS_REGULAR_EXPRESSION "usage: ")
+            # The budgeted twin (row 9): loops without effects, lifted once and
+            # compiled twice -- the production object, and the same source under
+            # -DSPU_LIFT_BUDGET with renamed symbols -- replayed at the registered tier.
+            set(XDIFF_BUDGET_DIR "${CMAKE_BINARY_DIR}/spu_xdiff_budget")
+            add_custom_command(
+                OUTPUT "${XDIFF_BUDGET_DIR}/xdiff_budget_job.elf" "${XDIFF_BUDGET_DIR}/xdiff_budget_job.h"
+                COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu/tests/gen_xdiff_budget_job.py" "${XDIFF_BUDGET_DIR}"
+                DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu/tests/gen_xdiff_budget_job.py"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tools/wrap_spu_elf.py"
+                VERBATIM)
+            add_custom_command(
+                OUTPUT "${XDIFF_BUDGET_DIR}/lift/spu_recomp.c" "${XDIFF_BUDGET_DIR}/lift/spu_recomp.h"
+                COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/spu_lifter.py"
+                    --auto-functions "${XDIFF_BUDGET_DIR}/xdiff_budget_job.elf"
+                    --symbol-prefix xb_
+                    --output "${XDIFF_BUDGET_DIR}/lift"
+                DEPENDS "${XDIFF_BUDGET_DIR}/xdiff_budget_job.elf"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tools/spu_lifter.py"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tools/find_spu_functions.py"
+                VERBATIM)
+            add_executable(test_spu_xdiff_budget
+                runtime/spu/tests/test_spu_xdiff_budget.c
+                runtime/spu/tests/xdiff_budget_twin.c
+                runtime/spu/xdiff/spu_xdiff_replay.c
+                runtime/spu/xdiff/spu_job_replay.c
+                ${SPU_XDIFF_SOURCES}
+                "${XDIFF_BUDGET_DIR}/lift/spu_recomp.c"
+                ${XDIFF_REPLAY_RUNTIME})
+            # The twin's translation unit includes spu_recomp.c itself, from the lift directory.
+            target_include_directories(test_spu_xdiff_budget PRIVATE
+                include runtime runtime/spu runtime/platform "${XDIFF_BUDGET_DIR}" "${XDIFF_BUDGET_DIR}/lift")
+            target_link_libraries(test_spu_xdiff_budget PRIVATE m Threads::Threads)
+            add_test(NAME spu_xdiff_budget COMMAND test_spu_xdiff_budget)
+            set_tests_properties(spu_xdiff_budget PROPERTIES LABELS "spu;t0" TIMEOUT 120)
+            # The registry writer's twin output (build_spu_workloads.py --budget-twin).
+            add_test(NAME spu_budget_twin
+                COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_budget_twin.py")
+            set_tests_properties(spu_budget_twin PROPERTIES LABELS "spu;t0" TIMEOUT 120)
         endif()
     endif()
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)

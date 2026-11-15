@@ -117,7 +117,7 @@ void spu_func_000000F0(spu_context* ctx) {
 
 void spu_func_00000100(spu_context* ctx) {
         ctx->gpr[30] = spu_ai(ctx->gpr[30], 1);
-        ctx->pc = ctx->gpr[29]._u32[0]; g_spu_trampoline_fn = spu_indirect_branch; return;
+        SPU_LIFT_BACKEDGE(ctx); ctx->pc = ctx->gpr[29]._u32[0]; g_spu_trampoline_fn = spu_indirect_branch; return;
 }
 
 void spu_func_00000108(spu_context* ctx) {
@@ -130,7 +130,7 @@ void spu_func_00000108(spu_context* ctx) {
 void spu_func_00000114(spu_context* ctx) {
         ctx->gpr[20] = spu_ai(ctx->gpr[20], -1);
         if (ctx->gpr[20]._u32[0] == 0) { SPU_DIRECT(ctx, 0x120, spu_func_00000120); }
-        ctx->pc = ctx->gpr[21]._u32[0]; g_spu_trampoline_fn = spu_indirect_branch; return;
+        SPU_LIFT_BACKEDGE(ctx); ctx->pc = ctx->gpr[21]._u32[0]; g_spu_trampoline_fn = spu_indirect_branch; return;
 }
 
 void spu_func_00000120(spu_context* ctx) {

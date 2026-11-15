@@ -523,6 +523,24 @@ SPU_DRAIN_COLD void spu_depth_guard(spu_context* ctx)
     { extern void spu_halt(spu_context*); spu_halt(ctx); }
 }
 
+/* The budgeted twin found ctx->budget at 0 (SPU_LIFT_BACKEDGE, spu_context.h).
+ * Unwinds through spu_halt to the spu_run_with_halt landing pad, like the depth
+ * guard above; unlike it, it leaves a status the replay recognises, so the exit
+ * is neither an architectural end state nor a depth-guard void. Lifted code
+ * holds no resource a longjmp would leak (docs/SPU_XDIFF.md section 10). With no
+ * pad armed spu_halt returns, and going on would run the loop the budget is
+ * there to stop: the process ends instead. */
+SPU_DRAIN_COLD void spu_lift_budget_exhausted(spu_context* ctx)
+{
+    ctx->status = SPU_STATUS_BUDGET_EXHAUSTED;
+    spu_halt(ctx);
+    fprintf(stderr, "[spu-budget] context %p (image=%d pc=0x%05X) is out of budget and no halt landing pad is "
+                    "armed (run the budgeted twin under spu_run_with_halt) -- aborting\n",
+            (void*)ctx, ctx->image_id, (unsigned)(ctx->pc & SPU_LS_MASK));
+    fflush(stderr);
+    abort();
+}
+
 /* See spu_context.h. Env-gated: SPU_TAILRET=1. */
 int spu_tailret_enabled(void)
 {

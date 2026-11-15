@@ -4,12 +4,19 @@
 # PS3RECOMP_SPU_MERGE_CHUNKS=ON lifts with --merge-chunks: the chunks of one SPU
 # function become one C function, and branches between them gotos rather than
 # trampoline round trips through the drain loop.
+# PS3RECOMP_SPU_BUDGET_TWIN=ON also builds and registers each image's budgeted
+# twin (docs/SPU_XDIFF.md section 10): the same lifted source compiled a second
+# time, which spu_job_replay and the shadow driver bound with a budget. It doubles
+# the lifted code that is compiled, so it is off by default.
 function(ps3recomp_generate_spu output_dir)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
     set(command "${Python3_EXECUTABLE}" "${PS3RECOMP_DIR}/tools/build_spu_workloads.py"
         --lifted "${output_dir}" --out "${output_dir}/spu_workloads.c" --constructor)
     if(PS3RECOMP_SPU_MERGE_CHUNKS)
         list(APPEND command --merge-chunks)
+    endif()
+    if(PS3RECOMP_SPU_BUDGET_TWIN)
+        list(APPEND command --budget-twin)
     endif()
     foreach(input IN LISTS ARGN)
         get_filename_component(input "${input}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -26,6 +33,10 @@ function(ps3recomp_generate_spu output_dir)
         message(FATAL_ERROR "SPU generation incomplete. Inspect ${output_dir}/inventory.json.\n${output}\n${error}")
     endif()
     include("${output_dir}/sources.cmake")
+    if(PS3RECOMP_SPU_BUDGET_TWIN)
+        include("${output_dir}/budget_sources.cmake")
+        list(APPEND SPU_GENERATED_SOURCES ${SPU_BUDGET_TWIN_SOURCES})
+    endif()
     set(SPU_GENERATED_SOURCES "${SPU_GENERATED_SOURCES}" PARENT_SCOPE)
 endfunction()
 
@@ -52,6 +63,10 @@ function(ps3recomp_spu_prebuilt_sources out_var count_var spu_dir)
                 "Re-lift every image with this toolkit's tools/spu_lifter.py.")
         endif()
         list(APPEND sources ${lifted})
+        # A lift generated with --budget-twin leaves each twin's translation unit
+        # beside its spu_recomp.c, and the registry then names the twin's symbols.
+        file(GLOB twins CONFIGURE_DEPENDS "${spu_dir}/*/spu_recomp_budget.c")
+        list(APPEND sources ${twins})
         foreach(gen IN ITEMS spu_workloads.c jobmods_register.c taskset_policy_bytes.c)
             if(EXISTS "${spu_dir}/${gen}")
                 list(APPEND sources "${spu_dir}/${gen}")
