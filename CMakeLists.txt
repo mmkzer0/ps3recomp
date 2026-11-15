@@ -1396,6 +1396,16 @@ if(PS3RECOMP_BUILD_TESTS)
             target_link_libraries(test_spu_effect_port PRIVATE m Threads::Threads)
             add_test(NAME spu_effect_port COMMAND test_spu_effect_port)
             set_tests_properties(spu_effect_port PROPERTIES LABELS "spu;t0" TIMEOUT 120)
+            # The fixture codec on its own: round trips and every rejection of
+            # docs/SPU_XDIFF.md section 7.8, on crafted inputs (asan preset).
+            add_executable(test_spu_xdiff_fixture
+                runtime/spu/tests/test_spu_xdiff_fixture.c
+                runtime/spu/xdiff/spu_xdiff_fixture.c)
+            target_include_directories(test_spu_xdiff_fixture PRIVATE include runtime runtime/spu runtime/platform)
+            add_test(NAME spu_xdiff_fixture COMMAND test_spu_xdiff_fixture)
+            set_tests_properties(spu_xdiff_fixture PROPERTIES LABELS "spu;t0" TIMEOUT 120)
+            add_test(NAME spu_xdiff_fixture_sweep COMMAND test_spu_xdiff_fixture 20000)
+            set_tests_properties(spu_xdiff_fixture_sweep PROPERTIES LABELS "spu;stress" TIMEOUT 600)
         endif()
     endif()
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
