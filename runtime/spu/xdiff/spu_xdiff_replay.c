@@ -499,15 +499,28 @@ static uint32_t compare_end(const spu_xdiff_fixture* f, const spu_context* ctx, 
     return verdict_of(out, SPU_XDIFF_R_NONE);
 }
 
+/* The subject's body id. A lifted subject's lift identity is the one its registration declares, which is
+ * the image's inventory (the capture's rule, xdiff_capture.cpp): no inventory leaves code_end and
+ * lift_options 0, the documented "none" (spu_xdiff.h), and is also what T0 and T3 report. */
+static void set_subject_body(spu_xdiff_body_id* body, uint32_t tier, const spu_xdiff_fixture* f)
+{
+    body->tier = (uint8_t)tier;
+    if ((tier & SPU_TIER_MASK) != (uint32_t)SPU_TIER_LIFTED) return;
+    body->lifter_abi = SPU_RUNTIME_LIFTER_ABI;   /* every registered lift passed the ABI gate */
+    spu_workload_inventory inv;
+    if (spu_workload_find_inventory(f->identity.image_fingerprint, &inv)) {
+        body->code_end = inv.code_end;
+        body->lift_options = inv.lift_options;
+    }
+}
+
 /* One replay. `poison` is the poison run's state, NULL for a plain replay (spu_xdiff_replay). */
 static uint32_t replay_core(const spu_xdiff_fixture* f, const spu_xdiff_replay_options* opt, spu_xdiff_shadow* s,
                             spu_xdiff_verdict_record* out, poison_run* poison)
 {
     memset(out, 0, sizeof *out);
     out->effect_index = SPU_XDIFF_NO_EFFECT;
-    out->subject_body.tier = (uint8_t)opt->subject_tier;
-    if ((opt->subject_tier & SPU_TIER_MASK) == (uint32_t)SPU_TIER_LIFTED)
-        out->subject_body.lifter_abi = SPU_RUNTIME_LIFTER_ABI;   /* every registered lift passed the ABI gate */
+    set_subject_body(&out->subject_body, opt->subject_tier, f);
 
     /* Refused knobs are the caller's to report (spu_job_replay_main exits 1): no verdict. */
     if (spu_xdiff_refused_knob() != NULL) {
@@ -681,11 +694,12 @@ static void poison_reset(poison_run* p, int apply)
     memset(p->ls_touched, 0, (size_t)SPU_LS_SIZE / 8u);
 }
 
-static void blank_record(spu_xdiff_verdict_record* out, const spu_xdiff_replay_options* opt)
+static void blank_record(spu_xdiff_verdict_record* out, const spu_xdiff_replay_options* opt,
+                         const spu_xdiff_fixture* f)
 {
     memset(out, 0, sizeof *out);
     out->effect_index = SPU_XDIFF_NO_EFFECT;
-    out->subject_body.tier = (uint8_t)opt->subject_tier;
+    set_subject_body(&out->subject_body, opt->subject_tier, f);
 }
 
 /* One replay of the poison run. The shadow call stack holds every call of a listed function until it returns:
@@ -788,17 +802,17 @@ uint32_t spu_xdiff_replay_poison(const spu_xdiff_fixture* f, const spu_xdiff_rep
 {
     memset(report, 0, sizeof *report);
     if (opt->subject_tier != (uint32_t)SPU_TIER_INTERP) {
-        blank_record(out, opt);
+        blank_record(out, opt, f);
         return verdict_of(out, SPU_XDIFF_R_NOT_COMPARABLE);
     }
     if (plan->has_fingerprint && plan->image_fingerprint != f->identity.image_fingerprint) {
-        blank_record(out, opt);
+        blank_record(out, opt, f);
         return verdict_of(out, SPU_XDIFF_R_FIXTURE_IDENTITY);
     }
     poison_run p;
     if (poison_init(&p, plan) != 0) {
         fprintf(stderr, "[spu-xdiff] out of memory for the poison run\n");
-        blank_record(out, opt);
+        blank_record(out, opt, f);
         return verdict_of(out, SPU_XDIFF_R_HOST_FAULT);
     }
 

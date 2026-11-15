@@ -73,6 +73,9 @@ void xr_base_spu_func_00000400(spu_context*);
 #define LIFT_ENUM(n) L_##n,
 enum { LIFTS(LIFT_ENUM) L_COUNT };
 #define IMG_OF(l) (20 + (l))   /* image ids: not 1, which spu_run_with_halt traces */
+/* The inventory the base image's registration declares: the lift identity a lifted verdict reports. */
+#define XR_CODE_END     0x2F80u
+#define XR_LIFT_OPTIONS 0xC0FFEE0BADF00Dull
 typedef struct { const char* name; void (*entry)(spu_context*); } lift_row;
 #define LIFT_ROW(n) { #n, xr_##n##_spu_func_00000000 },
 static const lift_row g_lifts[] = { LIFTS(LIFT_ROW) };
@@ -234,13 +237,21 @@ static void t_equal(void)
     CHECK(F.end.end_class == SPU_XDIFF_END_STOP && F.end.stop_code == XR_STOP_CODE, "the base job ended as class %u code 0x%X",
           F.end.end_class, F.end.stop_code);
     use_lift(&F, L_base);
+    spu_workload_set_inventory(F.identity.image_fingerprint, 0, XR_CODE_END, XR_LIFT_OPTIONS);
     uint32_t r = replay(&F, SPU_TIER_LIFTED, 0, &v);
     expect_v("lift vs T0", r, &v, SPU_XDIFF_EQUAL, SPU_XDIFF_R_NONE);
     CHECK(v.match == SPU_XDIFF_MATCH_PROGRAM && v.effect_index == SPU_XDIFF_NO_EFFECT, "equal: match %u index 0x%X", v.match, v.effect_index);
     CHECK(v.subject_body.tier == SPU_TIER_LIFTED && v.subject_body.lifter_abi == SPU_RUNTIME_LIFTER_ABI,
           "the subject body is tier %u abi %u", v.subject_body.tier, v.subject_body.lifter_abi);
+    CHECK(v.subject_body.code_end == XR_CODE_END && v.subject_body.lift_options == XR_LIFT_OPTIONS,
+          "the subject's lift identity is code_end 0x%X lift_options 0x%016llX, expected the registration's inventory "
+          "(0x%X, 0x%016llX)", v.subject_body.code_end, (unsigned long long)v.subject_body.lift_options,
+          XR_CODE_END, (unsigned long long)XR_LIFT_OPTIONS);
     r = replay(&F, SPU_TIER_INTERP, 0, &v);
     expect_v("T0 vs T0", r, &v, SPU_XDIFF_EQUAL, SPU_XDIFF_R_NONE);
+    CHECK(v.subject_body.code_end == 0 && v.subject_body.lift_options == 0,
+          "T0 reports no lift identity: code_end 0x%X lift_options 0x%016llX", v.subject_body.code_end,
+          (unsigned long long)v.subject_body.lift_options);
 }
 
 static void t_size(void)
@@ -537,8 +548,14 @@ static void t_miss(void)
 {
     spu_xdiff_verdict_record v;
     spu_workload_register_img(FM.identity.image_fingerprint, xr_base_spu_func_00000400, IMG_OF(L_base), "miss");
+    spu_workload_inventory inv;
+    REQUIRE(spu_workload_find_inventory(FM.identity.image_fingerprint, &inv) == 0,
+            "the miss image has an inventory: the no-inventory case below would not test anything");
     uint32_t r = replay(&FM, SPU_TIER_LIFTED, 0, &v);
     expect_v("branch to unlifted code", r, &v, SPU_XDIFF_VOID, SPU_XDIFF_R_UNLIFTED_BRANCH);
+    CHECK(v.subject_body.tier == SPU_TIER_LIFTED && v.subject_body.code_end == 0 && v.subject_body.lift_options == 0,
+          "an image with no inventory reports no lift identity: code_end 0x%X lift_options 0x%016llX",
+          v.subject_body.code_end, (unsigned long long)v.subject_body.lift_options);
     r = replay(&FM, SPU_TIER_INTERP, 0, &v);
     expect_v("the interpreter runs the same bytes", r, &v, SPU_XDIFF_EQUAL, SPU_XDIFF_R_NONE);
 }

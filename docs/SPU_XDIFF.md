@@ -561,8 +561,11 @@ On `dev` the registration check stops a lift whose `SPU_LIFTER_ABI` differs
 from the runtime's (section 12.1), so every registered lifted body was
 generated for `SPU_RUNTIME_LIFTER_ABI`, and that is the value a recorder
 writes; the per-image value is not carried into registration. `code_end` and
-`lift_options` are known at lift time (section 12.2) and stay 0 until a
-registration carries them (section 12.3).
+`lift_options` are known at lift time (section 12.2) and reach the runtime
+with the image's inventory (`spu_workload_set_inventory`, section 12.3): the
+capture writes them for a lifted authority, and a replay or an in-run shadow
+writes them for a lifted subject. An image without an inventory, and the
+records of a replay that never ran (`host-fault`), carry 0.
 
 The image is not named by address here. The fingerprint covers bytes
 `[unit.image_ls, +unit.image_bytes)` of the entry local store; a reader
@@ -1300,13 +1303,14 @@ What is still missing, and what section 5.5 relies on:
   proposed), one entry per site with its mnemonic, and an image with a
   nonempty list is not eligible for xdiff; it may still run as an authority.
   Commit 3b.
-- **A compact inventory in the registration.** Today the report is a file
-  for tools, and a registration carries only fingerprint, entry and image
-  id. For the offline runner, which can read `inventory.json`, carrying it is
-  optional. For recording in a run and for in-run xdiff (commits 10a and
-  10b) it is required: the runtime can refuse an image before its first job
-  only for what its registration told it. The same record would give
-  `spu_xdiff_body_id` its `code_end` and `lift_options`.
+- **A compact inventory in the registration.** The generated registration
+  calls `spu_workload_set_inventory` beside each image's
+  `spu_workload_register_img` with the flags, `code_end` and `lift_options`
+  (commit 10a). The offline runner could read `inventory.json`; recording
+  in a run and in-run xdiff need it in the registration, because the
+  runtime can refuse an image before its first job only for what its
+  registration told it. The same record gives `spu_xdiff_body_id` its
+  `code_end` and `lift_options`.
 
 An inventory is an upper bound on a run. It never excuses a check at run
 time.
