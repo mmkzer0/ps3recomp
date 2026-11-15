@@ -85,8 +85,8 @@ int spu_xdiff_fixture_add_effect(spu_xdiff_fixture* f, const spu_xdiff_effect* e
  * rejects. */
 int spu_xdiff_fixture_encode(const spu_xdiff_fixture* f, uint8_t** out, size_t* out_bytes,
                              spu_xdiff_error* err);
-/* Encodes and writes `path` through `<path>.partial` and a rename, so a
- * reader never sees half a fixture. */
+/* Encodes and writes `path` through `<path>.<pid>.<n>.partial` (created exclusively, unique per
+ * process and attempt) and a rename, so a reader never sees half a fixture. */
 int spu_xdiff_fixture_write(const spu_xdiff_fixture* f, const char* path, spu_xdiff_error* err);
 
 /* Validates `bytes` against section 7.8 and fills `f` (which the call

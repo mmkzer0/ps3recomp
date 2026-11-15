@@ -505,9 +505,14 @@ the start of the file), `u64 bytes`.
   the zstd frame magic by name (`fixture-format`); the corpus driver decodes
   such a file first, as the trace tools do (`docs/TOOLS.md:1015-1026`). The
   extents already remove most of the two 256 KiB stores.
-- **Writing.** To `<path>.partial`, then renamed, as the toolkit's other
-  artefacts are (`include/ps3emu/ps3_ftrace.h:26-28`). The name is
-  `<fingerprint as 16 hex digits>-q<queue>-s<seq>.spujob`.
+- **Writing.** To a temporary file of the process and the attempt,
+  `<path>.<pid>.<n>.partial`, created exclusively, then renamed, as the
+  toolkit's other artefacts are (`include/ps3emu/ps3_ftrace.h:26-28`): two
+  processes sharing a directory never write into one file, and a reader sees
+  one writer's complete bytes or none. A rename over an existing fixture
+  replaces it. The name is
+  `<fingerprint as 16 hex digits>-q<queue>-s<seq>.spujob`, where the queue is
+  the process-wide creation number of the queue.
 
 ### 7.3 `IDEN`: `spu_xdiff_identity`, 80 bytes
 
