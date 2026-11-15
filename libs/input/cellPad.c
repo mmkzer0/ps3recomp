@@ -311,7 +311,12 @@ static void pad_rumble_levels(u8 small_on, u8 large, u16* lo, u16* hi)
  * keyboard state, which is kept current by whoever pumps SDL's events (in
  * practice the window of the video backend). PS3RECOMP_PAD_KEYBOARD_SDL selects
  * the SDL source on macOS too, which is how the keyboard test is built. */
-#if PAD_BACKEND_XINPUT
+#if TARGET_OS_IPHONE
+/* iOS has no host input in the PoC (pad_init_backend below): no keyboard source
+ * either, and CGEventSourceKeyState and NSApplication do not exist there. The pad
+ * stays the neutral virtual one it was before the keyboard fallback came in. */
+static void pad_poll_keyboard(void) {}
+#elif PAD_BACKEND_XINPUT
 static int pad_host_window_focused(void)
 {
     HWND fg = GetForegroundWindow();
@@ -399,6 +404,7 @@ static int pad_key_down(int key)
 #define PADKEY_TAB SDL_SCANCODE_TAB
 #endif
 
+#if !TARGET_OS_IPHONE
 static void pad_poll_keyboard(void)
 {
     static int off = -1;
@@ -445,6 +451,7 @@ static void pad_poll_keyboard(void)
           printf("[cellPad] keyboard fallback active on port 0 (no controller)\n");
           fflush(stdout); } }
 }
+#endif /* !TARGET_OS_IPHONE */
 
 /* ---------------------------------------------------------------------------
  * XInput backend
