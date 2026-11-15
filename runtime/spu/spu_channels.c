@@ -209,6 +209,57 @@ void spu_halt(spu_context* ctx)
     if (s_spu_halt_armed) { s_spu_halt_armed = 0; SPU_LONGJMP(s_spu_halt_env, 1); }
 }
 
+/* ===========================================================================
+ * Effect port (spu_effect_port.h; docs/SPU_XDIFF.md section 5)
+ * ===========================================================================*/
+
+/* spu_port_is_latch spells the five MFC parameter latches as channels 16 to 20
+ * because spu_effect_port.h is included where the channel names are not. These
+ * hold the spelling to the channels spu_wrch stores and returns from, and keep
+ * the two effects next to them (MFC_Cmd, MFC_WrTagMask) outside the range. */
+_Static_assert(MFC_LSA == 16 && MFC_EAH == 17 && MFC_EAL == 18 && MFC_Size == 19 && MFC_TagID == 20,
+               "spu_port_is_latch (spu_effect_port.h) spells the MFC latches as channels 16 to 20");
+_Static_assert(SPU_RdSRR0 == 15 && MFC_Cmd == 21 && MFC_WrTagMask == 22,
+               "the channels beside the MFC latches are effects: spu_port_is_latch must not cover them");
+
+void spu_port_set(spu_context* ctx, const spu_effect_port* port)
+{
+    const spu_effect_serve* sv = port ? port->serve : NULL;
+    if (sv && (!sv->wrch || !sv->rdch || !sv->rchcnt)) {
+        /* A missing member could only fall through to the runtime's own body,
+         * which is the leak a serve table exists to prevent. */
+        fprintf(stderr, "[spu-port] spu_port_set: serve table for context %p lacks%s%s%s; "
+                "a context must not run against the real world by accident -- aborting\n",
+                (void*)ctx, sv->wrch ? "" : " wrch", sv->rdch ? "" : " rdch", sv->rchcnt ? "" : " rchcnt");
+        fflush(stderr);
+        abort();
+    }
+    ctx->port = port;
+}
+
+const spu_effect_port* spu_port_get(const spu_context* ctx)
+{
+    return ctx->port;
+}
+
+void spu_port_report_xfer(spu_context* ctx, const spu_port_xfer* x)
+{
+    const spu_effect_port* port = ctx->port;
+    if (port && port->tap && port->tap->xfer) port->tap->xfer(port->tap_user, ctx, x);
+}
+
+void spu_port_serve_halt(spu_context* ctx, const char* reason)
+{
+    spu_halt(ctx);   /* leaves through the spu_run_with_halt landing pad while one is armed */
+    /* No pad: spu_halt returned. Going on would answer the context with a value
+     * nobody recorded, so the process ends here and names the context. */
+    fprintf(stderr, "[spu-port] served context %p (spu_id=%u image=%d pc=0x%05X) cannot go on: %s; "
+            "no halt landing pad is armed (run it under spu_run_with_halt) -- aborting\n",
+            (void*)ctx, (unsigned)ctx->spu_id, ctx->image_id, (unsigned)(ctx->pc & SPU_LS_MASK), reason);
+    fflush(stderr);
+    abort();
+}
+
 /* Diagnostic: dump the taskset-policy scheduler's working tables (LS 0x2700..)
  * at func_00000E60 entry, to reverse why it computes "no runnable task". Env
  * YDKJ_E60. Called from the lifted taskset policy. */
@@ -597,6 +648,16 @@ void spu_mfc_release(spu_context* ctx)
     ReleaseSRWLockExclusive(&s_mfc_claim_lock);
 }
 
+int spu_mfc_has_engine(const spu_context* ctx)
+{
+    int found = 0;
+    AcquireSRWLockShared(&s_mfc_claim_lock);
+    for (const spu_mfc_slot* slot = s_mfc_slots; slot && !found; slot = slot->next)
+        found = slot->ctx == ctx;
+    ReleaseSRWLockShared(&s_mfc_claim_lock);
+    return found;
+}
+
 /* Exit safety net for contexts unwound off a departing thread's stack.
  * Pointer comparisons suffice: the abandoned context need not be readable. */
 void spu_mfc_forget_range(uintptr_t lo, uintptr_t hi)
@@ -656,10 +717,22 @@ volatile unsigned g_spu_putllc_sync_hit = 0;
 /* Finish an atomic command: report the status MFC_RdAtomicStat now returns,
  * with the EA as the SPU staged it (same value on_mfc reported), then keep the
  * handler's "handled" answer. */
+static SPU_NOINLINE_COLD void spu_mfc_atomic_report(spu_context* ctx, uint32_t cmd)
+{
+    /* The line the command moved, as spu_mfc_atomic addressed it: both addresses
+     * with the low seven bits dropped. A GETLLAR that found no committed memory
+     * left a zeroed line in local store and still reports (status 4). */
+    spu_port_tap_xfer_cold(ctx, ((uint64_t)ctx->mfc_eah << 32) | (ctx->mfc_eal & ~(uint32_t)(MFC_ATOMIC_LINE - 1)),
+                           ctx->mfc_lsa & SPU_LS_MASK & ~(uint32_t)(MFC_ATOMIC_LINE - 1), MFC_ATOMIC_LINE,
+                           cmd, ctx->mfc_tag & 0x1Fu,
+                           cmd == MFC_GETLLAR_CMD ? SPU_XFER_TO_LS : SPU_XFER_FROM_LS, ctx->atomic_stat);
+}
+
 static int spu_mfc_atomic_done(spu_context* ctx, uint32_t cmd)
 {
     spu_obs_atomic(ctx, cmd, ((uint64_t)ctx->mfc_eah << 32) | ctx->mfc_eal,
                    ctx->atomic_stat);
+    if (SPU_PORT_UNLIKELY(ctx->port != NULL)) spu_mfc_atomic_report(ctx, cmd);
     return 1;
 }
 
@@ -1108,6 +1181,11 @@ static int channel_is_mfc(uint32_t ch)
 /* ===========================================================================
  * Channel write
  * ===========================================================================*/
+/* The port half of the write, and the runtime body behind the public entry
+ * point (docs/SPU_XDIFF.md section 5.5). */
+SPU_PORT_ALWAYS_INLINE void spu_wrch_real(spu_context* ctx, uint32_t channel, uint32_t v);
+SPU_PORT_NOINLINE int spu_wrch_ported(spu_context* ctx, const spu_effect_port* port, uint32_t channel, uint32_t v);
+
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
 {
     /* SPU_CHHIST=1: which channels a job actually touches, and how often. A
@@ -1122,6 +1200,14 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
                   fprintf(stderr, "   wrch ch%-3d %llu%c", i, w[i], 10); } } }
     uint32_t v = value._u32[0];  /* channel writes use the preferred slot */
     spu_obs_channel(ctx, 1, channel, v);
+    /* The one test the real path pays. It comes before the latches so the
+     * switch below stays one dispatch over every channel (a test between the
+     * latches and the body split it, and the non-latch rows of the SPU bench
+     * lost 20-29%). The port half returns 1 when a serve table took the
+     * write; latches never reach it, being context state. */
+    const spu_effect_port* port = ctx->port;
+    if (SPU_PORT_UNLIKELY(port != NULL) && !spu_port_is_latch(channel) && spu_wrch_ported(ctx, port, channel, v))
+        return;
 
     /* The MFC parameter channels only latch a value in the context (see
      * mfc_channel_write); the command write is what reaches the engine. Store
@@ -1133,28 +1219,49 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
     case MFC_EAL:       ctx->mfc_eal = v;         return;
     case MFC_Size:      ctx->mfc_size = v;        return;
     case MFC_TagID:     ctx->mfc_tag = v & 0x1F;  return;
+    /* An effect, unlike the latches: a port has seen it (spu_wrch_ported).
+     * Today's store stays inline and never reaches the MFC engine table's
+     * registry lock. */
     case MFC_WrTagMask: ctx->mfc_tag_mask = v;    return;
     default: break;
     }
+    spu_wrch_real(ctx, channel, v);
+}
 
+/* The MFC writes, out of line. Inlined, they gave spu_wrch a 1.2 KiB frame and
+ * a stack-protector check that every channel write paid (out here, the
+ * cheapest writes, latches and MFC_WrTagMask, measure up to 10% faster on the
+ * SPU bench). This is the one caller of spu_mfc_atomic and mfc_channel_write,
+ * so they stay inlined into it. */
+SPU_PORT_NOINLINE void spu_wrch_mfc(spu_context* ctx, uint32_t channel, uint32_t v)
+{
+    /* Atomic line ops (GETLLAR/PUTLLC/...) need real reservation semantics,
+     * not the plain GET/PUT the DMA engine would do. */
+    if (channel == MFC_Cmd && spu_mfc_atomic(ctx, v))
+        return;
+    mfc_channel_write(mfc_for(ctx), ctx, channel, v);
+    /* MFC tag-status-update EVENT producer (channel-stall milestone). Our
+     * DMA completes synchronously, so the instant the program arms tag
+     * notification (MFC_WrTagUpdate with a non-zero mode = any/all), the
+     * tags in MFC_WrTagMask are already complete -- pend the tag event
+     * (bit 0, MFC_TAG_STATUS_UPDATE_EVENT) when the SPU has it enabled, and
+     * wake any host thread blocked in rdch SPU_RdEventStat. This is the
+     * long-missing producer for event_status (previously only ever cleared
+     * via WrEventAck -> RdEventStat waits could never complete). */
+    if (channel == MFC_WrTagUpdate && v != 0 && (ctx->event_mask & 0x1u)) {
+        SPU_EVENT_SET(ctx, 0x1u);
+        spu_ch_wake(ctx);
+    }
+}
+
+/* The runtime's own write bodies. One call site only, like spu_rdch_real and
+ * spu_rchcnt_real: a second copy gave the helpers they inline a second caller,
+ * clang stopped inlining them, and the lifted GETLLAR rows of the SPU bench
+ * lost 4-5%. */
+SPU_PORT_ALWAYS_INLINE void spu_wrch_real(spu_context* ctx, uint32_t channel, uint32_t v)
+{
     if (channel_is_mfc(channel)) {
-        /* Atomic line ops (GETLLAR/PUTLLC/...) need real reservation semantics,
-         * not the plain GET/PUT the DMA engine would do. */
-        if (channel == MFC_Cmd && spu_mfc_atomic(ctx, v))
-            return;
-        mfc_channel_write(mfc_for(ctx), ctx, channel, v);
-        /* MFC tag-status-update EVENT producer (channel-stall milestone). Our
-         * DMA completes synchronously, so the instant the program arms tag
-         * notification (MFC_WrTagUpdate with a non-zero mode = any/all), the
-         * tags in MFC_WrTagMask are already complete -- pend the tag event
-         * (bit 0, MFC_TAG_STATUS_UPDATE_EVENT) when the SPU has it enabled, and
-         * wake any host thread blocked in rdch SPU_RdEventStat. This is the
-         * long-missing producer for event_status (previously only ever cleared
-         * via WrEventAck -> RdEventStat waits could never complete). */
-        if (channel == MFC_WrTagUpdate && v != 0 && (ctx->event_mask & 0x1u)) {
-            SPU_EVENT_SET(ctx, 0x1u);
-            spu_ch_wake(ctx);
-        }
+        spu_wrch_mfc(ctx, channel, v);
         return;
     }
 
@@ -1227,6 +1334,16 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
         /* Unknown / unhandled channel write -- ignore (matches a no-op SPU). */
         break;
     }
+}
+
+/* tap->wrch hears an effect before it acts; serve->wrch then answers it and
+ * the port half returns 1, or it returns 0 and spu_wrch runs its own body. */
+SPU_PORT_NOINLINE int spu_wrch_ported(spu_context* ctx, const spu_effect_port* port, uint32_t channel, uint32_t v)
+{
+    if (port->tap && port->tap->wrch) port->tap->wrch(port->tap_user, ctx, channel, v);
+    if (!port->serve) return 0;
+    port->serve->wrch(port->serve_user, ctx, channel, v);
+    return 1;
 }
 
 /* ===========================================================================
@@ -1382,7 +1499,38 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
 /* ===========================================================================
  * Channel read (returns value in the preferred word slot)
  * ===========================================================================*/
+/* The runtime's own read body; one call site only (see spu_wrch_real). */
+SPU_PORT_ALWAYS_INLINE u128 spu_rdch_real(spu_context* ctx, uint32_t channel);
+
+/* tap->rdch hears the value the SPU receives, after the read (which may block). */
+SPU_PORT_NOINLINE void spu_rdch_tell(spu_context* ctx, uint32_t channel, uint32_t v)
+{
+    const spu_effect_port* port = ctx->port;
+    if (port->tap && port->tap->rdch) port->tap->rdch(port->tap_user, ctx, channel, v);
+}
+
+/* serve->rdch answers; nothing below the seam runs. */
+SPU_PORT_NOINLINE u128 spu_rdch_served(spu_context* ctx, uint32_t channel)
+{
+    const spu_effect_port* port = ctx->port;
+    const uint32_t v = port->serve->rdch(port->serve_user, ctx, channel);
+    /* the runtime body calls the observer itself; a served read must be seen the same way */
+    spu_obs_channel(ctx, 0, channel, v);
+    spu_rdch_tell(ctx, channel, v);
+    return spu_make_preferred_u32(v);
+}
+
 u128 spu_rdch(spu_context* ctx, uint32_t channel)
+{
+    if (SPU_PORT_UNLIKELY(spu_port_serves(ctx))) return spu_rdch_served(ctx, channel);
+    const u128 r = spu_rdch_real(ctx, channel);
+    /* Reloaded, not kept live across a body that may block: the port changes
+     * only between runs. */
+    if (SPU_PORT_UNLIKELY(ctx->port != NULL)) spu_rdch_tell(ctx, channel, r._u32[0]);
+    return r;
+}
+
+SPU_PORT_ALWAYS_INLINE u128 spu_rdch_real(spu_context* ctx, uint32_t channel)
 {
     spu_honour_stop_request(ctx);
     { static SPU_THREAD_LOCAL int s_c = -1; if (s_c < 0) { const char* e = getenv("SPU_CHHIST"); s_c = e ? (atoi(e) > 0 ? atoi(e) : 2000) : 0; }
@@ -1481,7 +1629,32 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
 /* ===========================================================================
  * Channel count (rchcnt) -- how many entries can be read/written right now
  * ===========================================================================*/
+/* The runtime's own count body; one call site only (see spu_wrch_real). */
+SPU_PORT_ALWAYS_INLINE uint32_t spu_rchcnt_real(spu_context* ctx, uint32_t channel);
+
+SPU_PORT_NOINLINE void spu_rchcnt_tell(spu_context* ctx, uint32_t channel, uint32_t n)
+{
+    const spu_effect_port* port = ctx->port;
+    if (port->tap && port->tap->rchcnt) port->tap->rchcnt(port->tap_user, ctx, channel, n);
+}
+
+SPU_PORT_NOINLINE uint32_t spu_rchcnt_served(spu_context* ctx, uint32_t channel)
+{
+    const spu_effect_port* port = ctx->port;
+    const uint32_t n = port->serve->rchcnt(port->serve_user, ctx, channel);
+    spu_rchcnt_tell(ctx, channel, n);
+    return n;
+}
+
 uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
+{
+    if (SPU_PORT_UNLIKELY(spu_port_serves(ctx))) return spu_rchcnt_served(ctx, channel);
+    const uint32_t n = spu_rchcnt_real(ctx, channel);
+    if (SPU_PORT_UNLIKELY(ctx->port != NULL)) spu_rchcnt_tell(ctx, channel, n);
+    return n;
+}
+
+SPU_PORT_ALWAYS_INLINE uint32_t spu_rchcnt_real(spu_context* ctx, uint32_t channel)
 {
     spu_honour_stop_request(ctx);
     /* SPU_WHOPOLLS=<n>: rchcnt/park accounting PER SPU, printed every n calls
@@ -2818,6 +2991,36 @@ static int spu_smc_microstep(spu_context* ctx)
     return 0;
 }
 
+/* The branch resolver of a served context: the closed path of docs/SPU_XDIFF.md
+ * section 5.5. The full resolver below reaches kernel services, taskset
+ * syscalls, overlay matching and the interpreter for unlifted code, and
+ * diagnostics that print and stop; a served context must reach none of them.
+ * It resolves a lifted target, the planted job return and the job runtime
+ * area, and ends the run for anything else, interpreting nothing. */
+static void spu_indirect_branch_served(spu_context* ctx)
+{
+    spu_fn fn = spu_lifted_lookup(ctx, ctx->pc);
+    if (fn) {
+        spu_check_stack_reset(ctx, fn);
+#if defined(__clang__)
+        __attribute__((musttail)) return fn(ctx);
+#else
+        fn(ctx);
+        return;
+#endif
+    }
+    if (!ctx->policy_mode && ctx->pc == SPU_JOB_RETURN_LS)
+        spu_port_serve_halt(ctx, "the job returned through the planted link address");
+    if (!ctx->policy_mode && SPU_JOB_RT_HAS(ctx, ctx->pc)) {
+        spu_interp_run_until(ctx, ctx->pc, ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+        if (ctx->status & (SPU_STATUS_STOPPED_BY_STOP | SPU_STATUS_STOPPED_BY_HALT))
+            spu_port_serve_halt(ctx, "the job runtime area stopped");
+        return;
+    }
+    ctx->lift_miss++;
+    spu_port_serve_halt(ctx, "branch to local store with no lifted code");
+}
+
 void spu_indirect_branch(spu_context* ctx)
 {
     /* Real SPU bi/bisl mask the target to the 256 KB local store; the high bits
@@ -2826,6 +3029,14 @@ void spu_indirect_branch(spu_context* ctx)
      * and falls into branch-to-0. All lifted funcs live below SPU_LS_SIZE, so
      * masking is a no-op for already-valid targets. */
     ctx->pc &= SPU_LS_MASK;
+    if (spu_port_serves(ctx)) {
+#if defined(__clang__)
+        __attribute__((musttail)) return spu_indirect_branch_served(ctx);
+#else
+        spu_indirect_branch_served(ctx);
+        return;
+#endif
+    }
     /* Interrupt-return register restore (see spu_drain.c spu_irq_regs_save):
      * the WWS handler's save/restore shim lives at unlifted top-of-LS, so we
      * enforce the preserve-all-registers hardware contract here -- the first

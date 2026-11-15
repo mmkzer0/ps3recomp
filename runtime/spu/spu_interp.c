@@ -781,6 +781,15 @@ static uint32_t spu_interp_run_inner(spu_context* ctx, uint32_t start_lsa,
             uint32_t sc = ((uint32_t)ctx->ls[0x27C4]<<24)|((uint32_t)ctx->ls[0x27C5]<<16)
                         | ((uint32_t)ctx->ls[0x27C6]<<8) | ctx->ls[0x27C7];
             if (ctx->image_id == 22 || (ctx->policy_mode && sc == 0xA70u)) {
+                /* The HLE reaches the guest's taskset and the runtime below the effect port. A served
+                 * context has no such world: its run ends here, as a halt (the conditional halts' stop
+                 * code), the unsupported dispatch of docs/SPU_XDIFF.md section 5.5. */
+                if (spu_port_serves(ctx)) {
+                    ctx->stop_code = 0x1000;
+                    ctx->status = SPU_STATUS_STOPPED_BY_HALT;
+                    SPU_RELAXED_STORE(&g_spu_interp_steps, steps);
+                    return ctx->stop_code;
+                }
                 extern void spu_spurs_taskset_syscall(spu_context*);
                 int _save = ctx->image_id; ctx->image_id = 22;
                 spu_spurs_taskset_syscall(ctx);
@@ -855,7 +864,8 @@ static uint32_t spu_interp_run_inner(spu_context* ctx, uint32_t start_lsa,
              * in that structure and DMA their results to address 0.
              * Service it and keep running; with no event pending, fall through
              * to the old behaviour so nothing waits forever. */
-            if (ctx->stop_code == 0x110 && g_spu_pending_evt_valid) {
+            /* A served context takes no process-wide event: its stop ends the run (docs/SPU_XDIFF.md section 5.5). */
+            if (ctx->stop_code == 0x110 && g_spu_pending_evt_valid && !spu_port_serves(ctx)) {
                 spu_channel_read(&ctx->ch_out_mbox);      /* the SPU queue key */
                 ctx->rcv_evt[0] = 0;                      /* CELL_OK */
                 ctx->rcv_evt[1] = g_spu_pending_evt[0];

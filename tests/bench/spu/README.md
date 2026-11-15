@@ -13,6 +13,14 @@ tests/bench/spu/run_spu_bench.sh --no-barriers    # see what the compiler folds
 
 Output goes to `tests/bench/spu/out/` (or `$SPU_BENCH_OUT`).
 
+`gen_spu_bench.py` takes its instruction encodings from `OPCODES`. This tree
+carries `spu_ops.py`, the subset the loop control, the memory and branch rows
+and the channel, `dma` and `atomic` rows need; the register-operation rows
+(adds, shifts, floats, ...) exist only for the mnemonics listed there. Extend
+that table with the SPU ISA encodings to measure the rest. The harness is a
+single thread: use `--only dma,atomic,wrch,rdch,rchcnt` for the seam-relevant
+rows (the effect port adds one load and branch to each of them).
+
 ## What is measured
 
 `gen_spu_bench.py` writes one SPU image with a kernel per case: the operation

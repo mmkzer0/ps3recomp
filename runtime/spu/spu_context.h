@@ -12,6 +12,7 @@
 
 #include "../../include/ps3emu/ps3types.h"
 #include "../../include/ps3emu/log_first.h"
+#include "spu_effect_port.h"
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
@@ -457,6 +458,19 @@ typedef struct spu_context {
      * every existing context runs unobserved. Not copied or inherited. */
     const struct spu_observer* observer;
 
+    /* Effect port (spu_effect_port.h), NULL when off, which is every context
+     * spu_context_init makes. Not copied or inherited. Read once per channel
+     * operation by spu_channels.c. Behind `observer` on purpose: lifted code
+     * addresses the members up to `reloc_delta`, `ls`, `policy_mode` and
+     * `steps` (include/ps3emu/lifter_abi.h) and none of them moves. */
+    const struct spu_effect_port* port;
+
+    /* Branches a served context made to local store with no lifted code. The
+     * closed resolver path (spu_indirect_branch) counts one and ends the run
+     * without interpreting anything: a served context must never run code the
+     * lift does not hold. Zero for every context that has no serve table. */
+    uint32_t lift_miss;
+
     /* LS base of the SPURS job runtime area spurs_job.c planted (the code the
      * Ver14 jm interface points into), 0 when this context runs no such job.
      * Lifted code that branches into [job_rt_ls, +SPU_JOB_RT_SIZE) has no
@@ -534,6 +548,7 @@ typedef struct spu_context {
 /* Release private DMA state only when the execution owner has stopped using
  * the context. Pair with spu_coh_unregister before a reset or destruction. */
 void spu_mfc_release(spu_context* ctx);
+int spu_mfc_has_engine(const spu_context* ctx);   /* a private MFC engine exists for ctx (a served context must have none) */
 void spu_mfc_forget_range(uintptr_t lo, uintptr_t hi);
 
 static inline void spu_context_init(spu_context* ctx, uint32_t spu_id)
@@ -542,6 +557,34 @@ static inline void spu_context_init(spu_context* ctx, uint32_t spu_id)
     ctx->ls     = ctx->ls_store;   /* a raw SPU repoints this at guest memory */
     ctx->spu_id = spu_id;
     ctx->status = SPU_STATUS_STOPPED;
+}
+
+/* The context's channel operations are answered by a serve table, not by the
+ * runtime (spu_effect_port.h). */
+static inline int spu_port_serves(const spu_context* ctx)
+{
+    return ctx->port != NULL && ctx->port->serve != NULL;
+}
+
+/* Tell the context's tap about one completed transfer, from the runtime's two
+ * funnels (mfc_do_transfer in spu_dma.h, spu_mfc_atomic_done). With no port,
+ * one load and a branch; the report itself is out of line. */
+static SPU_NOINLINE_COLD void spu_port_tap_xfer_cold(spu_context* ctx, uint64_t ea, uint32_t lsa,
+                                                     uint32_t size, uint32_t cmd, uint32_t tag,
+                                                     uint32_t dir, uint32_t status)
+{
+    const spu_effect_port* port = ctx->port;
+    if (port->tap && port->tap->xfer) {
+        spu_port_xfer x;
+        x.ea = ea; x.lsa = lsa; x.size = size; x.cmd = cmd; x.tag = tag; x.dir = dir; x.status = status;
+        port->tap->xfer(port->tap_user, ctx, &x);
+    }
+}
+static inline void spu_port_tap_xfer(spu_context* ctx, uint64_t ea, uint32_t lsa, uint32_t size,
+                                     uint32_t cmd, uint32_t tag, uint32_t dir, uint32_t status)
+{
+    if (SPU_PORT_UNLIKELY(ctx->port != NULL))
+        spu_port_tap_xfer_cold(ctx, ea, lsa, size, cmd, tag, dir, status);
 }
 
 /* ---------------------------------------------------------------------------
