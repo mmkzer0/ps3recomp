@@ -599,20 +599,24 @@ static HANDLE create_thread(SIZE_T stack, PS3_THREAD_FN fn, unsigned (*fn_crt)(v
         return NULL;
     }
 
+    /* A refused attribute step fails the thread, as a refused pthread_create does: the thread used to start on the
+     * default stack when pthread_attr_setstacksize failed, and an attribute whose init failed was used and destroyed
+     * anyway. errno carries the host's answer for a caller that stops on it (ps3_stop_host_thread_stack). */
     pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    if (stack) {
-        /* Darwin rejects a size that is not a page multiple; both reject one
-         * under the minimum. */
-        size_t page = (size_t)sysconf(_SC_PAGESIZE);
-        if (page == 0) page = 4096;
-        size_t sz = (stack + page - 1) & ~(page - 1);
-        if (sz < (size_t)PTHREAD_STACK_MIN) sz = ((size_t)PTHREAD_STACK_MIN + page - 1) & ~(page - 1);
-        pthread_attr_setstacksize(&attr, sz);
+    int rc = pthread_attr_init(&attr);
+    if (rc == 0) {
+        rc = pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        if (rc == 0 && stack) {
+            /* Darwin rejects a size that is not a page multiple; both reject one under the minimum. */
+            size_t page = (size_t)sysconf(_SC_PAGESIZE);
+            if (page == 0) page = 4096;
+            size_t sz = (stack + page - 1) & ~(page - 1);
+            if (sz < (size_t)PTHREAD_STACK_MIN) sz = ((size_t)PTHREAD_STACK_MIN + page - 1) & ~(page - 1);
+            rc = pthread_attr_setstacksize(&attr, sz);
+        }
+        if (rc == 0) rc = pthread_create(&t->pt, &attr, thread_trampoline, t);
+        pthread_attr_destroy(&attr);
     }
-    int rc = pthread_create(&t->pt, &attr, thread_trampoline, t);
-    pthread_attr_destroy(&attr);
     if (rc != 0) {
         /* Through the release path: the record is already in the thread table
          * and, off Darwin, owns two semaphores. */
@@ -621,6 +625,7 @@ static HANDLE create_thread(SIZE_T stack, PS3_THREAD_FN fn, unsigned (*fn_crt)(v
         obj_release_locked(t);
         pthread_mutex_unlock(&s_lock);
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        errno = rc;
         return NULL;
     }
     return (HANDLE)t;

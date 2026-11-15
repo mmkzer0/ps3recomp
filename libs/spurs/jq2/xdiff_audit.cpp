@@ -34,6 +34,10 @@
 #include "ps3emu/config.h"
 #include "ps3emu/ps3_ftrace.h"
 #include "ps3emu/stop.h"
+#include "ps3emu/host_stack.h"
+#include "ps3emu/host_stack_report.h"
+static ps3_hs_reporter s_audit_hs = PS3_HS_REPORTER_INIT("spu-xdiff-audit");
+static void audit_hs_summary() { ps3_hs_summary(&s_audit_hs); }
 #include "ps3emu/thread_name.h"
 #include "spu/spu_context.h"
 #include "spu/spu_workload.h"
@@ -46,7 +50,6 @@ namespace {
 constexpr auto kRelaxed = std::memory_order_relaxed;
 
 constexpr std::size_t kPoolFixtures = 4;                 /* fixture buffers kept for the workers */
-constexpr unsigned kAuditStack = 8u << 20;               /* the shadow runs lifted code; as a worker's stack */
 
 /* ---- settings ---------------------------------------------------------------- */
 
@@ -363,34 +366,37 @@ void audit_main(const Settings* cfg)
 #ifdef _WIN32
 unsigned __stdcall audit_entry(void* p)
 {
+    const int hs = ps3_hs_begin(&s_audit_hs, 0, ps3_spu_host_stack_bytes(), audit_hs_summary);
     audit_main(static_cast<const Settings*>(p));
+    ps3_hs_end(&s_audit_hs, hs);
     return 0;
 }
 #else
 void* audit_entry(void* p)
 {
+    const int hs = ps3_hs_begin(&s_audit_hs, 0, ps3_spu_host_stack_bytes(), audit_hs_summary);
     audit_main(static_cast<const Settings*>(p));
+    ps3_hs_end(&s_audit_hs, hs);
     return nullptr;
 }
 #endif
 
-bool start_thread(const Settings* cfg)
+/* The audit thread runs the other tier's lifted code, so it has a worker's stack: spu.host_stack_mb. A host that
+ * refuses it ends the run (host-thread-stack, role=spu-xdiff-audit): the shadow was asked for, and a run that
+ * silently shadowed nothing (audit-off reason=thread) would pass a corpus it never checked. */
+void start_thread(const Settings* cfg)
 {
+    const std::size_t bytes = ps3_spu_host_stack_bytes();
 #ifdef _WIN32
     const auto t = reinterpret_cast<HANDLE>(
-        _beginthreadex(nullptr, kAuditStack, &audit_entry, const_cast<Settings*>(cfg), STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr));
-    if (!t) return false;
+        _beginthreadex(nullptr, static_cast<unsigned>(bytes), &audit_entry, const_cast<Settings*>(cfg),
+                       STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr));
+    if (!t) ps3_stop_host_thread_stack("spu-xdiff-audit", 0, bytes, errno);
     CloseHandle(t); /* never joined: a shadow in flight must not delay an exit */
-    return true;
 #else
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr, kAuditStack);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
     pthread_t t;
-    const int rc = pthread_create(&t, &attr, &audit_entry, const_cast<Settings*>(cfg));
-    pthread_attr_destroy(&attr);
-    return rc == 0;
+    const int rc = ps3_host_pthread_create(&t, bytes, 1, &audit_entry, const_cast<Settings*>(cfg));
+    if (rc != 0) ps3_stop_host_thread_stack("spu-xdiff-audit", 0, bytes, rc);
 #endif
 }
 
@@ -436,12 +442,8 @@ void audit_configure()
                 std::fprintf(stderr, "[jq2-xdiff] audit-off reason=no-memory detail=the shadow context could not be allocated; "
                                      "nothing is shadowed\n");
                 s->mode = AuditMode::off;
-            } else if (!start_thread(s)) {
-                std::fprintf(stderr, "[jq2-xdiff] audit-off reason=thread detail=the host refused the audit thread; nothing is shadowed\n");
-                spu_xdiff_shadow_free(s->shadow);
-                s->shadow = nullptr;
-                s->mode = AuditMode::off;
             } else {
+                start_thread(s);
                 std::atexit(&shutdown_at_exit);
 #ifndef _WIN32
                 at_quick_exit(&shutdown_at_exit);

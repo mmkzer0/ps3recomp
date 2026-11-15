@@ -39,6 +39,10 @@
 
 #include "memory/reservation.h"
 #include "ps3emu/config.h"
+#include "ps3emu/host_stack.h"
+#include "ps3emu/host_stack_report.h"
+static ps3_hs_reporter s_worker_hs = PS3_HS_REPORTER_INIT("spu-jq2");
+static void worker_hs_summary() { ps3_hs_summary(&s_worker_hs); }
 #include "ps3emu/endian.h"
 #include "ps3emu/stop.h"
 #include "spu/spu_context.h"
@@ -433,36 +437,36 @@ public:
 
     /* ---- workers ---- */
 
-    bool start()
+    /* Start the workers on spu.host_stack_mb of stack each. A host that refuses one ends the run
+     * (host-thread-stack, role=spu-jq2, guest_tid the worker number): this used to stop with jq2-state, and the
+     * other threads that run SPU code started on the host default instead. */
+    void start()
     {
+        const std::size_t bytes = ps3_spu_host_stack_bytes();
 #ifdef _WIN32
         for (unsigned i = 0; i < workers_; ++i) {
             auto* arg = new WorkerArg{this, i};
             const auto t = reinterpret_cast<HANDLE>(_beginthreadex(
-                nullptr, kWorkerStack, &Queue::worker_entry, arg, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr));
+                nullptr, static_cast<unsigned>(bytes), &Queue::worker_entry, arg, STACK_SIZE_PARAM_IS_A_RESERVATION,
+                nullptr));
             if (!t) {
+                const int error = errno;
                 delete arg;
-                return false;
+                ps3_stop_host_thread_stack("spu-jq2", i, bytes, error);
             }
             threads_.push_back(t);
         }
-        return true;
 #else
-        pthread_attr_t attr;
-        pthread_attr_init(&attr);
-        pthread_attr_setstacksize(&attr, kWorkerStack);
         for (unsigned i = 0; i < workers_; ++i) {
             auto* arg = new WorkerArg{this, i};
             pthread_t t;
-            if (pthread_create(&t, &attr, &Queue::worker_thunk, arg) != 0) {
+            const int rc = ps3_host_pthread_create(&t, bytes, 0, &Queue::worker_thunk, arg);
+            if (rc != 0) {
                 delete arg;
-                pthread_attr_destroy(&attr);
-                return false;
+                ps3_stop_host_thread_stack("spu-jq2", i, bytes, rc);
             }
             threads_.push_back(t);
         }
-        pthread_attr_destroy(&attr);
-        return true;
 #endif
     }
 
@@ -702,13 +706,12 @@ private:
         unsigned instance;
     };
 
-    /* The loader keeps a whole spu_context (256 KB of local store) on the worker's stack. */
-    static constexpr unsigned kWorkerStack = 8u << 20;
-
     static void* worker_thunk(void* p)
     {
         std::unique_ptr<WorkerArg> arg(static_cast<WorkerArg*>(p));
+        const int hs = ps3_hs_begin(&s_worker_hs, arg->instance, ps3_spu_host_stack_bytes(), worker_hs_summary);
         arg->q->worker_loop(arg->instance);
+        ps3_hs_end(&s_worker_hs, hs);
         return nullptr;
     }
 
@@ -1980,11 +1983,7 @@ int32_t jq2_queue_create(uint32_t revision, uint32_t sdk_version, uint32_t spurs
                  queue, worker_count, command_depth);
     if (created > 255)
         std::fprintf(stderr, "[jq2] queue q saturated at 255: ea=0x%08X is queue number %u\n", queue, created + 1);
-    if (!q->start()) {
-        stop_with(PS3_STOP_JQ2_STATE, "a JobQueue2 worker thread could not be started",
-                  "The host refused a thread; check the process's thread limit.",
-                  {hex("queue", queue), dec("workers", worker_count)});
-    }
+    q->start();
     return JQ2_OK;
 }
 

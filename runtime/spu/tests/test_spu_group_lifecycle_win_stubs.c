@@ -27,8 +27,10 @@ long long ppu_dump_guest_stack() { return 0; }
 long long ppu_guest_caller() { return 0; }
 long long ppu_guest_callstack() { return 0; }
 long long ppu_log_host_chain() { return 0; }
+long long ps3_config_get() { return 0; }
 long long ps3_hle_register_ctx() { return 0; }
 long long ps3_spu_image_source_ea() { return 0; }
+long long ps3_stop() { return 0; }
 long long spu_ch_wake() { return 0; }
 long long spu_coh_unregister() { return 0; }
 long long spu_have_function() { return 0; }

@@ -15,6 +15,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <time.h>
+#include <sys/wait.h>
 
 /* What the runtime would provide. */
 uint8_t* vm_base;
@@ -27,6 +28,20 @@ void spu_coh_unregister(spu_context* c) { (void)c; }
 void spu_mfc_release(spu_context* c) { (void)c; }
 void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*))
 { (void)nid; (void)name; (void)fn; }
+
+/* spu.host_stack_mb, and the stop of a host that refuses the stack: here a line on stderr and the status 70, which the
+ * parent of the child that provokes it reads. */
+static ps3_config g_cfg = { .spu_host_stack_mb = 16 };
+const ps3_config* ps3_config_get(void) { return &g_cfg; }
+_Noreturn void ps3_stop(ps3_stop_kind kind, const char* what, const char* remedy,
+                        const ps3_stop_field* fields, size_t nfields, const ps3_stop_site* site)
+{
+    (void)kind; (void)what; (void)site;
+    for (size_t i = 0; i < nfields; i++) fprintf(stderr, "%s=%s ", fields[i].key, fields[i].value);
+    fprintf(stderr, "remedy=\"%s\"\n", remedy);
+    fflush(stderr);
+    _exit(70);
+}
 
 /* The registry: FNV-1a-64 of the exact bytes, two programs. */
 uint64_t spu_workload_fingerprint(const void* data, size_t n)
@@ -189,6 +204,36 @@ int main(void)
               "restart ran A %d, B %d times", s_ran[0] - before_a, s_ran[1] - before_b);
         free(s_spu[i1].ctx);
         free(s_spu[i2].ctx);
+    }
+
+    /* 5. A host that refuses the raw SPU's stack (spu.host_stack_mb) ends the run with host-thread-stack, role=spu-raw
+     *    and the SPU number, where the start used to run the program on the host's default stack or not at all. The
+     *    stop ends the process, so a child does the start. */
+    {
+        int fds[2];
+        if (pipe(fds) != 0) { perror("pipe"); return 1; }
+        fflush(NULL);
+        const pid_t pid = fork();
+        if (pid == 0) {
+            dup2(fds[1], 2);
+            close(fds[0]); close(fds[1]);
+            g_cfg.spu_host_stack_mb = 0x7FFFFFF0u;                    /* ~2 PiB: no host holds it */
+            uint32_t r = create();
+            proxy_load(r, 0);
+            run(r);
+            _exit(0);                                                /* reached only if nothing refused */
+        }
+        close(fds[1]);
+        char out[2048];
+        size_t len = 0;
+        for (ssize_t n; (n = read(fds[0], out + len, sizeof out - 1 - len)) > 0;) len += (size_t)n;
+        out[len] = 0;
+        close(fds[0]);
+        int ws = 0;
+        waitpid(pid, &ws, 0);
+        CHECK(WIFEXITED(ws) && WEXITSTATUS(ws) == 70, "a refused raw SPU stack ends the run (status %d)", WIFEXITED(ws) ? WEXITSTATUS(ws) : -1);
+        CHECK(strstr(out, "role=spu-raw ") != NULL && strstr(out, "bytes=") != NULL, "the stop names the role and the bytes: %s", out);
+        CHECK(strstr(out, "spu.host_stack_mb") != NULL, "the remedy names spu.host_stack_mb: %s", out);
     }
 
     free(s_spu[a].ctx);

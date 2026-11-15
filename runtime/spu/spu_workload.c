@@ -18,6 +18,8 @@
 #include "ps3emu/log_first.h"
 #include "ps3emu/stop.h"
 #include "../memory/vm.h"       /* vm_range_ok / vm_guest_limit: the guest arena rule */
+#include "ps3emu/config.h"         /* spu.dispatch_stack_mb */
+#include "ps3emu/host_stack_report.h"   /* PS3_HOST_STACK_HWM, ps3_host_pthread_create */
 #include "ps3emu/ps3_env_once.h"   /* ps3_env_once: each switch looked up once */
 #ifdef _WIN32
 #include <windows.h>
@@ -1249,6 +1251,12 @@ static void spu_async_forget_mfc_stack(void)
 }
 #endif
 
+/* PS3_HOST_STACK_HWM (ps3emu/host_stack_report.h): the high-water mark of each async-dispatch thread
+ * (spu.dispatch_stack_mb, ps3_spu_dispatch_stack_bytes), at its exit and, for the persistent policy-module workers,
+ * in the process-exit summary. */
+static ps3_hs_reporter s_dispatch_hs = PS3_HS_REPORTER_INIT("spu-dispatch");
+static void dispatch_hs_summary(void) { ps3_hs_summary(&s_dispatch_hs); }
+
 #ifdef _WIN32
 static DWORD WINAPI spu_async_thread(LPVOID p) {
     ps3_thread_name("spu job");
@@ -1256,7 +1264,9 @@ static DWORD WINAPI spu_async_thread(LPVOID p) {
      * runaway brsl recursion) can actually reach the STACKOVERFLOW reporter
      * instead of killing the process silently with 0x80000001. */
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
+    const int hs = ps3_hs_begin(&s_dispatch_hs, 0, ps3_spu_dispatch_stack_bytes(), dispatch_hs_summary);
     spu_async_run((spu_async_job*)p);
+    ps3_hs_end(&s_dispatch_hs, hs);
     /* Nothing on this stack may stay in either cross-thread registry. */
     { ULONG_PTR lo, hi; GetCurrentThreadStackLimits(&lo, &hi);
       extern void spu_coh_forget_range(uintptr_t, uintptr_t);
@@ -1267,7 +1277,9 @@ static DWORD WINAPI spu_async_thread(LPVOID p) {
 #else
 static void* spu_async_thread(void* p)
 {
+    const int hs = ps3_hs_begin(&s_dispatch_hs, 0, ps3_spu_dispatch_stack_bytes(), dispatch_hs_summary);
     spu_async_run((spu_async_job*)p);
+    ps3_hs_end(&s_dispatch_hs, hs);
     spu_async_forget_mfc_stack();
     return NULL;
 }
@@ -1987,34 +1999,23 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
                 fprintf(stderr, "\n");
             } } }
 
+    /* spu.dispatch_stack_mb of RESERVED stack (not committed; 256 on desktop): the Bink SPU decoder's
+     * per-macroblock brsl chains are deep host call chains with fat lifted frames -- a 1MB stack blew the guard
+     * page (STATUS_GUARD_PAGE_VIOLATION 0x80000001, silent process death) the moment the real decode path first
+     * executed, and the Darwin default of 512 KB is half of that. A host that refuses the reservation ends the
+     * run (host-thread-stack, role=spu-dispatch): the thread used to start on the default stack, where a deep
+     * chain faulted far from the cause. */
 #ifdef _WIN32
-    /* 256MB RESERVE (not commit): the Bink SPU decoder's per-macroblock brsl
-     * chains are deep host call chains with fat lifted frames -- a 1MB stack
-     * blew the guard page (STATUS_GUARD_PAGE_VIOLATION 0x80000001, silent
-     * process death) the moment the real decode path first executed. */
-    HANDLE th = CreateThread(NULL, 256u << 20, spu_async_thread, j,
+    HANDLE th = CreateThread(NULL, ps3_spu_dispatch_stack_bytes(), spu_async_thread, j,
                              STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
-    if (!th) { free(j); return 0; }
+    if (!th)
+        ps3_stop_host_thread_stack("spu-dispatch", 0, ps3_spu_dispatch_stack_bytes(), ps3_host_thread_error());
     CloseHandle(th);   /* detached */
 #else
-    /* Same 256 MB reservation, for the same reason: pthread stacks are
-     * mmap'd and committed on touch, so this reserves address space rather
-     * than memory. The default is 512 KB on Darwin, half the 1 MB that blew
-     * the guard page above. */
     pthread_t th;
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    int prc = EINVAL;
-    if (pthread_attr_setstacksize(&attr, 256u << 20) == 0)
-        prc = pthread_create(&th, &attr, spu_async_thread, j);
-    pthread_attr_destroy(&attr);
-    /* A host that will not reserve that much still gets the thread, on the
-     * default stack: a shallow SPU job runs there, and a deep one dying
-     * beats never dispatching at all. */
+    const int prc = ps3_host_pthread_create(&th, ps3_spu_dispatch_stack_bytes(), 1, spu_async_thread, j);
     if (prc != 0)
-        prc = pthread_create(&th, NULL, spu_async_thread, j);
-    if (prc != 0) { free(j); return 0; }
-    pthread_detach(th);
+        ps3_stop_host_thread_stack("spu-dispatch", 0, ps3_spu_dispatch_stack_bytes(), prc);
 #endif
     return 1;
 }

@@ -23,6 +23,7 @@ void ppu_ctx_register(ppu_context* c) { (void)c; }
 int ps3_intr_is_handler(unsigned long long tid) { (void)tid; return 0; }
 int ps3_intr_wait(unsigned long long tid) { (void)tid; return 0; }
 uint32_t ps3_ppu_initial_vscr(void) { return 0; }
+#include "ppu_thread_config_stub.h"   /* ppu.host_stack_mb */
 PS3_NORETURN void ps3_stop(ps3_stop_kind kind, const char* what, const char* remedy,
                            const ps3_stop_field* fields, size_t nfields,
                            const ps3_stop_site* site)

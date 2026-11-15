@@ -13,7 +13,8 @@ spu = root / 'runtime/spu'
 env = {k: v for k, v in os.environ.items() if not k.startswith('SPU_')}
 with tempfile.TemporaryDirectory(prefix='spu-raw-start-') as tmp:
     binary = Path(tmp) / 'test'
-    subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG',
+    san = ['-fsanitize=thread', '-g'] if os.environ.get('PS3RECOMP_SANITIZE_THREAD') else []
+    subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG', *san,
                     '-I'+str(root/'include'), '-I'+str(spu), '-I'+str(root/'runtime/platform'),
                     str(spu/'tests/test_spu_raw_start.c'), '-pthread', '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True, timeout=30, cwd=tmp, env=env,

@@ -87,7 +87,42 @@ PS3_CFG_BOOL(ppu, precise_usleep, 1,
     "macOS: the Windows (waitable timer, QPC tail) and Linux (nanosleep) paths are unchanged "
     "and ignore it. Read once, at the first sleep.")
 
+PS3_CFG_U32(ppu, host_stack_mb, PS3_CFG_PPU_HOST_STACK_MB_DEFAULT, 1, 2048,
+    "Host stack, in MiB, reserved for every thread that runs guest PPU code on a host thread of its own: the "
+    "guest PPU threads the title creates (not the main thread), the GCM interrupt thread (guest vblank, flip and "
+    "queue handlers) and the video decoder's idle thread (cellVdec). Each "
+    "recompiled guest call is a real host call, so a deep guest call chain nests on this stack; it is address "
+    "space reserved up front and committed by the OS as the thread touches it. The default is 256 on macOS, "
+    "Linux and Windows and 32 on iOS, where the app's address space is small and 256 MiB per thread was refused "
+    "41-86 times a run and starved later Metal allocations; the iOS value is provisional until a device run's "
+    "per-thread high-water report (env PS3_HOST_STACK_HWM=1, docs/DIAGNOSTICS.md) says what the guest uses. A "
+    "thread that overflows a stack too small for it dies with a fault, so lower it only from a measured "
+    "high-water mark. A host that refuses the reservation ends the run with kind host-thread-stack; the thread "
+    "is never started on the host's default stack. Read when each thread is created.")
+
 /* ---- spu ---------------------------------------------------------------- */
+
+PS3_CFG_U32(spu, host_stack_mb, PS3_CFG_SPU_HOST_STACK_MB_DEFAULT, 1, 1024,
+    "Host stack, in MiB, reserved for every host thread that runs lifted SPU code except the async-dispatch "
+    "threads (spu.dispatch_stack_mb): SPU thread group members, raw SPUs, the SPURS policy-module workers and "
+    "job chains, the JobQueue2 workers and the xdiff audit thread. Lifted SPU code turns a guest loop into a "
+    "chain of host calls, so a thread on the host's default stack (512 KiB on Darwin) dies inside code that did "
+    "nothing wrong. The default is 16 on macOS, Linux and Windows and 8 on iOS: one SPURS instance, one JobQueue2 "
+    "queue, six raw SPUs and six group members is about 27 such threads, and 8 MiB each is the address space "
+    "the threads that used 1-8 MiB reserved before, where 16 MiB each would add about 215 MB to an app whose "
+    "address space is small. Raise it to chase a runaway chain: it replaces the environment variable "
+    "SPU_HOST_STACK_BIG (512 MiB), which is no longer read. A host that refuses the reservation ends the run "
+    "with kind host-thread-stack. Read when each thread is started.")
+
+PS3_CFG_U32(spu, dispatch_stack_mb, PS3_CFG_SPU_DISPATCH_STACK_MB_DEFAULT, 1, 2048,
+    "Host stack, in MiB, reserved for every async-dispatch thread: the host thread that runs a SPURS task or "
+    "workload policy module image through its lifted entry (runtime/spu/spu_workload.c). The Bink SPU decoder's "
+    "per-macroblock brsl chains are deep host call chains with fat lifted frames, and a 1 MiB stack blew the "
+    "guard page, so the default is the 256 on macOS, Linux and Windows that has always been reserved. On iOS "
+    "it is 32, for the same address-space reason as ppu.host_stack_mb, and provisional like it until a device "
+    "run's high-water report (env PS3_HOST_STACK_HWM=1, docs/DIAGNOSTICS.md) says what these threads use. A host "
+    "that refuses the reservation ends the run with kind host-thread-stack (role=spu-dispatch); the thread is "
+    "never started on the host's default stack. Read when each thread is created.")
 
 PS3_CFG_U32(spu, dma_repeat_limit, 256, 1, 4294967295,
     "How many identical MFC transfers (same EA and LSA, back to back) start the "

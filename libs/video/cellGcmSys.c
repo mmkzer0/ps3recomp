@@ -32,6 +32,7 @@ static u32 s_gcm_context_ea = 0;
 #include "ps3emu/log_first.h"
 #include "ps3emu/stop.h"
 #include "ps3emu/config.h"        /* gcm.wait_timeout_ms */
+#include "ps3emu/host_stack.h"    /* ps3_host_pthread_create */
 #include "../../runtime/ps3_log.h"   /* ps3_log_verbose: the per-call tile/zcull lines */
 #include "gcm_default_state.h"
 #include "rsx_capture.h"
@@ -1420,9 +1421,13 @@ static int gcm_handler_thread_on(void)
 #ifndef _WIN32
 #include <pthread.h>
 #endif
+#include "ps3emu/host_stack_report.h"
+static ps3_hs_reporter s_intr_hs = PS3_HS_REPORTER_INIT("ppu-gcm-intr");
+static void intr_hs_summary(void) { ps3_hs_summary(&s_intr_hs); }
 static DWORD WINAPI gcm_intr_main(LPVOID unused)
 {
     (void)unused;
+    (void)ps3_hs_begin(&s_intr_hs, 0, ps3_ppu_host_stack_bytes(), intr_hs_summary);
     s_gcm_intr_tid = (unsigned long)GetCurrentThreadId();
 #ifdef _WIN32
     for (;;) { ppu_gcm_pump(); Sleep(1); }
@@ -1447,12 +1452,22 @@ void ppu_gcm_pump(void)
     if (!s_gcm_pending && !gcm_user_ring_nonempty()) return;
     if (gcm_handler_thread_on() && (unsigned long)GetCurrentThreadId() != s_gcm_intr_tid) {
         static volatile long started = 0;
-        if (!started && InterlockedCompareExchange(&started, 1, 0) == 0)
+        if (!started && InterlockedCompareExchange(&started, 1, 0) == 0) {
+            /* The thread delivers the guest's vblank, flip and user handlers, so it runs guest PPU code on
+             * ppu.host_stack_mb of stack. A host that refuses it ends the run (host-thread-stack,
+             * role=ppu-gcm-intr): the handlers would otherwise never be delivered, since only this thread does. */
 #ifdef _WIN32
-            CreateThread(NULL, 1u << 20, gcm_intr_main, NULL, 0, NULL);
+            HANDLE th = CreateThread(NULL, ps3_ppu_host_stack_bytes(), gcm_intr_main, NULL,
+                                     STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+            if (!th)
+                ps3_stop_host_thread_stack("ppu-gcm-intr", 0, ps3_ppu_host_stack_bytes(), ps3_host_thread_error());
+            CloseHandle(th);
 #else
-        { pthread_t t; if (pthread_create(&t, NULL, gcm_intr_posix, NULL) == 0) pthread_detach(t); }
+            pthread_t t;
+            const int rc = ps3_host_pthread_create(&t, ps3_ppu_host_stack_bytes(), 1, gcm_intr_posix, NULL);
+            if (rc != 0) ps3_stop_host_thread_stack("ppu-gcm-intr", 0, ps3_ppu_host_stack_bytes(), rc);
 #endif
+        }
         return;   /* only the interrupt thread delivers */
     }
     if (!GCM_PUMP_TRY_ENTER()) return;

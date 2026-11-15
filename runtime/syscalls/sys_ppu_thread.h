@@ -67,6 +67,10 @@ typedef struct ppu_thread_info {
     uint64_t     tls_addr;
     uint32_t     prof_pc;      /* last syscall/HLE callsite (sampling profiler) */
     int          blocked;      /* reached a blocking call (ppu_thread_note_block); atomic access only */
+    size_t       host_stack_req;   /* bytes asked of the host for this thread's host stack (ppu.host_stack_mb); 0 for main */
+    uintptr_t    host_stack_lo;    /* PS3_HOST_STACK_HWM only: lowest address of the thread's host stack, recorded by the
+                                    * thread itself at start (0 until then or when off); under the table lock */
+    size_t       host_stack_size;  /* ... and its size */
 
 #ifdef _WIN32
     HANDLE       host_thread;
@@ -144,6 +148,14 @@ void ppu_thread_set_epilogue_hook(ppu_thread_epilogue_hook_fn fn);
  * bound. NULL (the default) calls nothing. */
 typedef void (*ppu_thread_prio_start_hook_fn)(uint64_t tid, int gave_up);
 void ppu_thread_set_prio_start_hook(ppu_thread_prio_start_hook_fn fn);
+
+/* Test seam for PS3_HOST_STACK_HWM=1 (docs/DIAGNOSTICS.md): called with each measurement the report prints, on the
+ * measured thread at its exit (live == 0) or on the exiting process's thread for a thread still running (live == 1,
+ * under the table lock). `reserved` is the bytes asked of the host, `high_water` the span from the top of the stack
+ * to the lowest page the thread has touched, rounded to host pages; known == 0 when the host would not say
+ * (`high_water` is then 0). NULL (the default) calls nothing. Set it before creating the threads it concerns. */
+typedef void (*ppu_thread_host_stack_hook_fn)(uint64_t tid, size_t reserved, size_t high_water, int known, int live);
+void ppu_thread_set_host_stack_hook(ppu_thread_host_stack_hook_fn fn);
 
 /* Registration */
 void sys_ppu_thread_init(lv2_syscall_table* tbl);

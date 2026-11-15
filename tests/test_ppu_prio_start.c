@@ -18,6 +18,7 @@ uint32_t ppu_vm_size;   /* main(): the arena covers the stack region the allocat
 void ppu_ctx_register(ppu_context* c) { (void)c; }
 /* ppu.vscr_nj comes from the runtime's config module and ps3_stop from the stop module; neither is linked here. */
 uint32_t ps3_ppu_initial_vscr(void) { return 0; }
+#include "ppu_thread_config_stub.h"   /* ppu.host_stack_mb */
 _Noreturn void ps3_stop(ps3_stop_kind kind, const char* what, const char* remedy,
                         const ps3_stop_field* fields, size_t nfields,
                         const ps3_stop_site* site)

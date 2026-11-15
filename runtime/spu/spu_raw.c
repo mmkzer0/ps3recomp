@@ -49,6 +49,9 @@ extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
 /* For attributing an MMIO store to the guest code that made it. */
 #include "../ppu/ppu_context.h"
 #include "ps3emu/thread_name.h"
+#include "ps3emu/config.h"           /* spu.host_stack_mb */
+#include "ps3emu/host_stack.h"       /* ps3_host_pthread_create */
+#include "ps3emu/stop.h"             /* ps3_stop_host_thread_stack */
 extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
 extern void ps3_hle_register_ctx(uint32_t nid, const char* name,
                                  void (*fn)(ppu_context*));
@@ -249,10 +252,14 @@ static inline long raw_cas(volatile long* p, long v, long c)
 #define RAW_CAS(p, v, c)  raw_cas((p), (v), (c))
 #endif
 
+#include "ps3emu/host_stack_report.h"
+static ps3_hs_reporter s_raw_hs = PS3_HS_REPORTER_INIT("spu-raw");
+static void raw_hs_summary(void) { ps3_hs_summary(&s_raw_hs); }
 static void raw_spu_run(raw_spu* s)
 {
     ps3_thread_name("raw spu");
     spu_context* c = s->ctx;
+    const int hs = ps3_hs_begin(&s_raw_hs, (uint64_t)(s - s_spu), ps3_spu_host_stack_bytes(), raw_hs_summary);
 
     c->status = SPU_STATUS_RUNNING;
     publish(s);
@@ -269,6 +276,7 @@ static void raw_spu_run(raw_spu* s)
         fflush(stderr);
         spu_coh_unregister(c);
         spu_mfc_release(c);
+        ps3_hs_end(&s_raw_hs, hs);
         RAW_XCHG(&s->started, 0);
         return;
     }
@@ -288,7 +296,6 @@ static void raw_spu_run(raw_spu* s)
     publish(s);
     /* The raw context is reset at the next start, after this owner stops. */
     spu_mfc_release(c);
-    RAW_XCHG(&s->started, 0);
 
     fprintf(stderr, "[spu-raw] spu%u stopped: halted=%d pc=0x%05X lr=0x%05X "
                     "steps=%llu stop_code=0x%X outmbox(n=%u v=0x%08X) "
@@ -300,6 +307,8 @@ static void raw_spu_run(raw_spu* s)
             (unsigned)c->ch_out_intr_mbox.count, c->ch_out_intr_mbox.value,
             (unsigned)c->ch_in_mbox.count);
     fflush(stderr);
+    ps3_hs_end(&s_raw_hs, hs);
+    RAW_XCHG(&s->started, 0); /* final context access precedes completion */
 }
 
 /* SPU_RunCntl = 0 on a running SPU. Hardware stops the core and the run bit
@@ -443,18 +452,20 @@ static void raw_spu_start(raw_spu* s)
               l[pc],l[pc+1],l[pc+2],l[pc+3], nz); }
     fflush(stderr);
 
+    /* spu.host_stack_mb of reserved stack (lifted SPU code recurses on the host stack). A host that refuses it ends
+     * the run (host-thread-stack): the start used to be dropped silently, `started` cleared, and the guest's RUN
+     * never took effect. */
 #ifdef _WIN32
-    s->thread = CreateThread(NULL, 1u << 20, raw_spu_thread, s, 0, NULL);
-    if (!s->thread) RAW_XCHG(&s->started, 0);
+    s->thread = CreateThread(NULL, ps3_spu_host_stack_bytes(), raw_spu_thread, s,
+                             STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+    if (!s->thread)
+        ps3_stop_host_thread_stack("spu-raw", n, ps3_spu_host_stack_bytes(), ps3_host_thread_error());
 #else
     {
         pthread_t t;
-        pthread_attr_t a;
-        pthread_attr_init(&a);
-        pthread_attr_setstacksize(&a, 8u << 20);   /* lifted SPU code recurses on the host stack */
-        if (pthread_create(&t, &a, raw_spu_thread, s) == 0) pthread_detach(t);
-        else RAW_XCHG(&s->started, 0);
-        pthread_attr_destroy(&a);
+        const int rc = ps3_host_pthread_create(&t, ps3_spu_host_stack_bytes(), 1, raw_spu_thread, s);
+        if (rc != 0)
+            ps3_stop_host_thread_stack("spu-raw", n, ps3_spu_host_stack_bytes(), rc);
     }
 #endif
 }

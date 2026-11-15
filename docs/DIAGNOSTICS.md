@@ -10,8 +10,8 @@ not changed while a title runs.
 
 | group | knobs |
 |---|---|
-| `SPU_*` | 111 |
-| `PS3_*` | 106 |
+| `SPU_*` | 110 |
+| `PS3_*` | 107 |
 | `RSX_*` | 63 |
 | `YDKJ_*` | 53 |
 | `PPU_*` | 37 |
@@ -799,6 +799,8 @@ not changed while a title runs.
   `runtime/ppu/ppu_hle.cpp:752`
 - **`PS3_HLE_TRACE`** — _(no description in source)_
   `runtime/ppu/ppu_hle.cpp:236`
+- **`PS3_HOST_STACK_HWM`** — Report host-stack high-water marks at exit and live stacks at process exit. Covers guest PPU threads and roles `ppu-gcm-intr`, `ppu-vdec-idle`, `spu`, `spu-raw`, `spu-pm`, `spu-jobchain`, `spu-jq2`, `spu-xdiff-audit`, `spu-dispatch`. Shared reporters retain 256 live entries (all supported group members); overflow is counted as `dropped` in the summary and warned on stderr. Size `ppu.host_stack_mb`, `spu.host_stack_mb` and `spu.dispatch_stack_mb` from measured marks. Unset, nothing is measured.
+  `runtime/syscalls/sys_ppu_thread.c:397`  _(+1 more sites)_
 - **`PS3_ICALL_GATE`** — _(no description in source)_
   `runtime/ppu/ppu_loader.cpp:2282`  _(+1 more sites)_
 - **`PS3_ICALL_TRACE`** — PS3_ICALL_TRACE=<tid>: also log every call on that guest thread, in order. */
@@ -1302,8 +1304,6 @@ requires the opt-in `spu.dma_repeat_stop_secs` (default 0 = never stop); see
   `runtime/spu/spu_dma.h:983`
 - **`SPU_HOST_DEPTH_MAX`** — _(no description in source)_
   `runtime/spu/spu_drain.c:308`
-- **`SPU_HOST_STACK_BIG`** — Lifted SPU loops can become deep C tail-call recursion; give SPU host threads a large stack (reserved). Bumped to 512 MB to diagnose whether the cri/taskset-policy dispatch chain overflows (env SPU_HOST_STACK_BIG). */
-  `runtime/syscalls/lv2_register.c:942`
 - **`SPU_IBCOV`** — SPU_IBCOV: image-3 (Bink SPU) PC-page coverage. Track which 0x1000-byte LS pages the task's indirect branches land in; dump the set periodically. If coverage stays in the kernel/wait region (~0x13xxx) the decode routine never runs; if it spans a wide high range, decode executes but doesn't output. */
   `runtime/spu/spu_channels.c:1622`
 - **`SPU_IMAGE_DIAG`** — SPU_IMAGE_DIAG=1: r6 is a caller-supplied guest buffer that differs on every call, which this handler ignores -- it points the segments at the source image instead. Show the segments written and what the caller's buffer holds, to establish whether the caller expects it to be filled. */

@@ -27,7 +27,7 @@ KINDS = ["identity-mismatch", "lifter-abi", "config-invalid", "unresolved-nid",
          "host-path-limit",
          "rsx-unknown-method", "np-trophy-unmodelled", "rsx-driver-method",
          "pad-trace", "fiber-host-context", "adec-no-decoder", "host-wait-error",
-         "spu-xdiff-divergence", "host-log-file"]
+         "spu-xdiff-divergence", "host-log-file", "host-thread-stack"]
 
 
 def probe(*args):
@@ -93,6 +93,42 @@ def test_missing_what_and_remedy_are_loud_not_silent():
     p = probe("bare")
     g.expect_stop(p, "unlifted-function")
     assert "bug in the caller" in p.stderr
+
+
+# Every thread that runs guest code stops with this kind, under the role that names it; the remedy names the key that
+# sizes that thread's host stack (include/ps3emu/stop.h, ps3_host_thread_stack_key).
+HOST_THREAD_STACK_ROLES = {
+    "ppu": "ppu.host_stack_mb",
+    "ppu-gcm-intr": "ppu.host_stack_mb",
+    "ppu-vdec-idle": "ppu.host_stack_mb",
+    "spu": "spu.host_stack_mb",
+    "spu-raw": "spu.host_stack_mb",
+    "spu-pm": "spu.host_stack_mb",
+    "spu-jobchain": "spu.host_stack_mb",
+    "spu-jq2": "spu.host_stack_mb",
+    "spu-xdiff-audit": "spu.host_stack_mb",
+    "spu-dispatch": "spu.dispatch_stack_mb",
+}
+
+
+def test_host_thread_stack_names_the_thread_the_bytes_and_the_errno():
+    p = probe("host-thread-stack")
+    f = g.expect_stop(p, "host-thread-stack")
+    assert list(f) == ["v", "kind", "role", "guest_tid", "bytes", "errno"], list(f)
+    assert (f["role"], f["guest_tid"], f["bytes"], f["errno"]) == ("ppu", "130", "268435456", "35"), f
+    assert "ppu.host_stack_mb" in p.stderr             # the remedy names the key
+
+
+def test_host_thread_stack_remedy_names_the_key_of_each_role():
+    keys = ("ppu.host_stack_mb", "spu.host_stack_mb", "spu.dispatch_stack_mb")
+    for role, key in HOST_THREAD_STACK_ROLES.items():
+        p = probe("host-thread-stack", role)
+        f = g.expect_stop(p, "host-thread-stack")
+        assert f["role"] == role, (role, f)
+        remedy = [line for line in p.stderr.splitlines() if line.strip().startswith("remedy")]
+        assert len(remedy) == 1, (role, p.stderr)
+        assert key in remedy[0], (role, remedy[0])
+        assert not [other for other in keys if other != key and other in remedy[0]], (role, remedy[0])
 
 
 def test_nested_stop_exits_at_once():

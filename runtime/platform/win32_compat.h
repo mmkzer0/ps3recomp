@@ -201,6 +201,9 @@ typedef struct {
 #define TIMERR_NOERROR         0u
 
 #define CREATE_SUSPENDED       0x00000004u
+/* CreateThread flag: the stack size is the reservation, not the initial commit. The POSIX shim reserves what it is
+ * asked for either way (a pthread stack is mapped lazily), so the flag changes nothing there. */
+#define STACK_SIZE_PARAM_IS_A_RESERVATION 0x00010000u
 #define CREATE_EVENT_MANUAL_RESET 0x00000001u
 #define CREATE_EVENT_INITIAL_SET  0x00000002u
 #define CONDITION_VARIABLE_LOCKMODE_SHARED 0x1u

@@ -40,6 +40,7 @@
 
 #include <stddef.h>
 #include <stdio.h>      /* snprintf: ps3_stop_host_wait_error */
+#include <string.h>     /* strcmp: ps3_host_thread_stack_key */
 #include <stdint.h>
 
 /* Marks a result that reports an error and must not be discarded: dropping one
@@ -145,7 +146,9 @@ extern "C" {
     /* An in-run xdiff shadow disagreed with the authority and spu.xdiff_on_divergence / spu.xdiff_on_latent says stop. */ \
     X(SPU_XDIFF_DIVERGENCE,     "spu-xdiff-divergence")                                                    \
     /* log.file cannot be rotated or created: a run whose log was asked for must not go on without it. */  \
-    X(HOST_LOG_FILE,            "host-log-file")
+    X(HOST_LOG_FILE,            "host-log-file")                                                           \
+    /* The host refused the stack reservation of a guest PPU or SPU thread (ppu.host_stack_mb, spu.host_stack_mb). */ \
+    X(HOST_THREAD_STACK,        "host-thread-stack")
 
 /* A fixed underlying type in C++ makes a kind outside the list (a caller's bug,
  * which the stop still reports as "invalid-kind") a well-defined value rather
@@ -230,6 +233,42 @@ PS3_NORETURN static inline void ps3_stop_host_log_file(const char* op, int error
              "Fix or clear log.file (config key, docs/LOGGING.md): the path must name a regular file or nothing, "
              "in a writable directory, and the old log must be movable to <file>.prev.",
              fields, 3, NULL);
+}
+
+/* The config key that sizes the host stack of a thread with this role: "spu-dispatch" is spu.dispatch_stack_mb, a
+ * role that starts with "ppu" (a guest PPU thread, or a host thread that delivers a guest callback) is
+ * ppu.host_stack_mb, and every other role (the threads that run SPU code) is spu.host_stack_mb. */
+static inline const char* ps3_host_thread_stack_key(const char* role)
+{
+    if (role && strcmp(role, "spu-dispatch") == 0) return "spu.dispatch_stack_mb";
+    if (role && strncmp(role, "ppu", 3) == 0) return "ppu.host_stack_mb";
+    return "spu.host_stack_mb";
+}
+
+/* The host would not create a thread that runs guest code with the host stack the configuration asks for
+ * (pthread_attr_init, pthread_attr_setstacksize, pthread_create or _beginthreadex failed: a refused reservation of
+ * the key's MiB, or the host's thread limit). The thread used to start on the host's default stack (512 KiB on
+ * Darwin), where a deep chain of lifted calls faults far from the cause; now the run ends here. `role` names the
+ * thread and so the key (ps3_host_thread_stack_key): "ppu" (a guest PPU thread), "ppu-gcm-intr", "ppu-vdec-idle",
+ * "spu" (a thread-group member), "spu-raw", "spu-pm", "spu-jobchain", "spu-jq2", "spu-xdiff-audit",
+ * "spu-dispatch". `guest_tid` is the id the guest knows the thread by (0 where there is none), `bytes` the stack
+ * requested, `error` the errno value the host gave. The thread's id goes in `guest_tid`, not in the site: the
+ * stopping thread is its creator, and the site's frontier would name the creator's position as the new thread's. */
+PS3_NORETURN static inline void ps3_stop_host_thread_stack(const char* role, uint64_t guest_tid, size_t bytes,
+                                                           int error)
+{
+    char tid[24], size[24], code[16], remedy[320];
+    snprintf(tid, sizeof tid, "%llu", (unsigned long long)guest_tid);
+    snprintf(size, sizeof size, "%llu", (unsigned long long)bytes);
+    snprintf(code, sizeof code, "%d", error);
+    snprintf(remedy, sizeof remedy,
+             "Lower %s so the reservation fits the process's address space, or free address space: on iOS without "
+             "the extended-virtual-addressing entitlement it is small. errno names the host's answer (ENOMEM or "
+             "EAGAIN for a refused reservation or a thread limit).",
+             ps3_host_thread_stack_key(role));
+    const ps3_stop_field fields[] = { {"role", role}, {"guest_tid", tid}, {"bytes", size}, {"errno", code} };
+    ps3_stop(PS3_STOP_HOST_THREAD_STACK, "the host refused to create a thread that runs guest code with its "
+             "configured host stack", remedy, fields, 4, NULL);
 }
 
 /* Host context failure; no guest site. Fields are defined by this helper. */
