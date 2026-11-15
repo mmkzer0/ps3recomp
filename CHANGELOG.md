@@ -1,6 +1,11 @@
 # Changelog
 
 ### Unreleased
+- **An SPU context carries its own MFC engine** (#141; `runtime/spu/spu_context.h`, `spu_channels.c`, `spu_workload.c`, `docs/SPU_CONTEXT_REGISTRIES.md`, `docs/CONFIG.md`): every channel access used to find the engine in the process-wide slot list under `s_mfc_claim_lock`, which serialised JobQueue2 workers. The engine is now a context member behind the lifter-pinned fields (no ABI change); the list remains for `SPU_PCSAMPLE` diagnostics only.
+  - **Removed:** `spu.mfc_lookup_cache`, which had nothing left to cache. **Breaking:** the config schema is 2; a schema-1 file is refused at the version check.
+  - **Measured.** A synthetic 13-worker GET/PUT benchmark: median worker CPU 10.97 s -> 0.232 s. In one title battle (three alternating runs each): the main thread's wait on the graphics queue went from 0.46 to 0.17 ms per frame, and the heaviest graphics job from 72 to 53 µs; frame times are vsync-bound and unchanged.
+  - **Checked against the old engine.** The title's 770 fixtures recorded under the old engine replay `equal` at both tiers, and an in-run audit shadowed 120 000 lifted jobs `equal`.
+  - **Tests.** `spu_mfc_context_engine`, `spu_mfc_registries` (contexts, engine presence, lifetime, local lookup); the config gate refuses schema 1; tsan `--repeat until-fail:10`.
 - **A lifted subject's verdict names its lift** (`runtime/spu/xdiff/spu_xdiff_replay.c`, `docs/SPU_XDIFF.md` sections 7 and 12.3): `subject_body.code_end` and `lift_options` were never filled, so every verdict, offline and in-run, reported 0 for both even when the registration declared them. The replay now takes them from the image's inventory; no inventory, and a replay that never ran, still report 0.
   - **Test.** `spu_xdiff_replay` checks both values with an inventory and 0 without; the positive check fails without the change.
 - **A SPURS/JobQueue2 job is staged straight into its context's local store** (`runtime/spu/spurs_job.c`): `run_spurs_job` passed the whole 256 KiB store three times per job (a calloc'd staging store, the context's memset, a copy into the context); a title profile put that setup at about 30 % of a lifted audio job. The context is initialised once the descriptor is validated and staged into directly; a descriptor that stops still leaves the store unwritten. Loader alone: 15.0 → 6.9 µs per job.
