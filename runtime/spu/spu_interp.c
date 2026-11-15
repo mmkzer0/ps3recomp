@@ -493,6 +493,12 @@ uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa) {
 #endif
 static SPU_INTERP_TLS int s_interp_depth;
 
+/* The nesting depth is read and restored by spu_run_with_halt (spu_channels.c): a halt longjmps over
+ * spu_interp_run_until and skips the decrement in it, so the landing pad has to put the depth back
+ * (docs/SPU_XDIFF.md section 9). Per thread, like the counter. */
+int spu_interp_depth_get(void) { return s_interp_depth; }
+void spu_interp_depth_set(int depth) { s_interp_depth = depth; }
+
 /* The diagnostic gates of spu_interp_run_inner, read from the environment on a
  * thread's first run (YDKJ_SPU_TRACE, SPU_STEPCAP, YDKJ_CRI_GATE1TRACE,
  * SPU_INTERP_STATS, SPU_INTERP_OPSTATS) and the counters that count down as

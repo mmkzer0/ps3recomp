@@ -306,8 +306,10 @@ void spu_stop(spu_context* ctx)
  * happen synchronously on a PPU thread (a workload dispatched from the PPU caller), whose
  * lifted floating point must keep round to nearest with denormals. Double precision restores
  * the default around itself inside a run. arm64 only; elsewhere the exact forms always run.
- * Returns the FPCR to restore, or ~0 when nothing was changed. */
-static uint64_t spu_float_mode_enter(void)
+ * The mode is latched on first use, process-wide: a fixture records the mode its run used
+ * (docs/SPU_XDIFF.md 7.3, `float_rz`), and a replay under another one would compare a
+ * different program (8.1). Returns 1 when SPU code runs in round toward zero. */
+int spu_float_rz_mode(void)
 {
 #if defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
     static int s_on = -1;
@@ -317,7 +319,17 @@ static uint64_t spu_float_mode_enter(void)
         on = e && e[0] == '1' && !e[1];
         __atomic_store_n(&s_on, on, __ATOMIC_RELAXED);
     }
-    if (!on) return ~0ull;
+    return on;
+#else
+    return 0;
+#endif
+}
+
+/* Returns the FPCR to restore, or ~0 when nothing was changed. */
+static uint64_t spu_float_mode_enter(void)
+{
+#if defined(__aarch64__) && defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
+    if (!spu_float_rz_mode()) return ~0ull;
     uint64_t v;
     __asm__ volatile("mrs %0, fpcr" : "=r"(v));
     if (v == SPU_FPCR_RZFZ) return ~0ull;   /* nested run: the outer one restores */
@@ -385,6 +397,12 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
      * stack-local job context skips its coherency unregister (GH3: crashes in
      * spu_coh_notify_write on a freed stack). */
     jmp_buf outer_env; const int outer_armed = s_spu_halt_armed;
+    /* A halt longjmps over every interpreter run between here and the pad, and each skips the
+     * decrement of its nesting depth. Left raised, the thread's next run of this kind is not the
+     * outermost one, and its first observer yield aborts the process (spu_observe.h). The depth is
+     * read before the setjmp and never changed after it, so it survives the jump. Both jump
+     * targets below restore it (docs/SPU_XDIFF.md section 9). */
+    const int interp_depth_outer = spu_interp_depth_get();
     if (outer_armed) memcpy(outer_env, s_spu_halt_env, sizeof(jmp_buf));
     s_spu_halt_armed = 1;
     g_spu_trampoline_fn = 0;                        /* no stale transfer pending */
@@ -395,10 +413,12 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
     yz_lockstep_register(ctx);
     switch (SPU_SETJMP(s_spu_halt_env)) {
     case 1:
+        spu_interp_depth_set(interp_depth_outer);
         halted = 1;
         g_spu_trampoline_fn = 0;
         break;
     case 2:
+        spu_interp_depth_set(interp_depth_outer);
         /* A one-way guest stack reset invalidates every lifted host caller.
          * Re-enter its target with the same guest state on the driver stack. */
         ctx->host_depth = 0;

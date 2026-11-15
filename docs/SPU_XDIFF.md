@@ -188,19 +188,27 @@ sets the same fields, calls `spu_stop` and then `return`s from the generated
 function (`spu_lifter.py:689-693`). `spu_stop` by default only sets `status`
 again; it longjmps to `spu_run_with_halt` only when `YDKJ_STOP_HALT` is set
 (`spu_channels.c:236-250`). A lifted stop therefore ends the run when it is
-executed in the entry function, and otherwise leaves one host frame and lets
-its caller go on. What the run ended on is read from the finished context. It
-is part of the end state (section 7.6), and neither `spu_stop` nor `spu_halt`
-needs a hook.
+executed in the entry function, and otherwise leaves one host frame. What
+the run ended on is read from the finished context. It is part of the end
+state (section 7.6), and neither `spu_stop` nor `spu_halt` needs a hook.
 
 **Known T0/T1 divergence: a stop inside a nested lifted call.** The
-interpreter ends its run at the stop; the lift returns into the caller and
-executes instructions, and possibly effects, the interpreter never reached.
-A comparison of such a pair reports `differ` (`effect-extra`, `end-class`,
-`end-regs` or `end-ls`), never a false `equal`: `[INFERENCE]` the lift's end
-state is that of a run that went on, and a continuation that ends in the
-same class with the same state would be the interpreter's own run. The
-class is documented, not fixed; commit 8 pins it with a synthetic job.
+interpreter ends its run at the stop. The lifted stop does not store `pc`,
+so the callee's return lands in `spu_drain_call`, which compares the
+context's last `pc` with the call's return address: when they are equal the
+caller goes on and executes instructions, and possibly effects, the
+interpreter never reached; when they differ the drain resumes at whatever
+lifted entry that stale `pc` names. Commit 8 pins both with synthetic jobs
+(`runtime/spu/tests/gen_xdiff_replay_jobs.py`, variant `nested`). A function
+called twice, returning normally the first time (`pc` is then the return
+address) and stopping the second, runs on to the caller's next `stop`:
+`differ` / `end-class`. The same stop on the first call resumes at the
+stale entry `pc` 0, which the jobchain loader takes as the job's completion,
+and the run ends in the interpreter's end state: `equal`, and rightly so,
+since nothing else was executed or seen. A comparison never reports a false
+`equal` here: a continuation that ends in the same class with the same
+state and the same effects is the interpreter's own run. The class is
+documented, not fixed.
 
 ### 5.2 Why the seam is the three functions and nothing lower
 
@@ -492,10 +500,11 @@ the start of the file), `u64 bytes`.
   comparing bytes, and reuses the offset. A retry loop that reads one line
   eight times stores it once. Nothing is deduplicated across fixtures: a
   fixture stays self-contained, and a corpus is compressed as a whole.
-- **Compression** is not part of the format. A reader accepts a file that
-  starts with the zstd frame magic and decodes it, as the trace tools do
-  (`docs/TOOLS.md:1015-1026`); the runtime writes plain files and needs no
-  library. The extents already remove most of the two 256 KiB stores.
+- **Compression** is not part of the format. The runtime writes plain files
+  and links no decompressor, so its reader refuses a file that starts with
+  the zstd frame magic by name (`fixture-format`); the corpus driver decodes
+  such a file first, as the trace tools do (`docs/TOOLS.md:1015-1026`). The
+  extents already remove most of the two 256 KiB stores.
 - **Writing.** To `<path>.partial`, then renamed, as the toolkit's other
   artefacts are (`include/ps3emu/ps3_ftrace.h:26-28`). The name is
   `<fingerprint as 16 hex digits>-q<queue>-s<seq>.spujob`.
@@ -644,8 +653,11 @@ or is misaligned; a required section is missing or duplicated; a section's
 size is not the one its type requires; an effect count exceeds
 `SPU_XDIFF_MAX_EFFECTS` or the blob exceeds `SPU_XDIFF_MAX_BLOB_BYTES`; an
 effect has an unknown kind, a nonzero unused field, a `blob + size` outside
-`BLOB`, or an `lsa + size` outside local store; an `XFER` has no command
-before it; an extent is unsorted, overlapping or outside local store.
+`BLOB`, or a local-store range outside local store (an `XFER` to or from
+local store, the remaining list of an `MFC_WrListStallAck` `WRCH`; an
+`MFC_CMD` keeps its latches verbatim, because atomics and barriers ignore a
+stale `MFC_Size`); an `XFER` has no command before it; an extent is
+unsorted, overlapping or outside local store.
 
 ### 7.9 Size
 
@@ -852,6 +864,35 @@ verdict (`SPU_XDIFF_REASONS`).
 | `malformed` | `fixture-format`, `fixture-identity`, `not-comparable` |
 | `not-found` | `no-fixture`, `no-body` |
 
+### 8.4 What a divergence may do
+
+*Decided.* A verdict says what happened; what it does to a run depends on
+how much of it anybody could see. Every `differ` has a class
+(`spu_xdiff_differ_class_of`, `spu_xdiff.h`), carried in the runner's JSON
+as `class` and in reports:
+
+| Class | Reasons | Meaning |
+|---|---|---|
+| `visible` | every `effect-*`, `end-class`, `epoch-*`; `end-regs` and `end-ls` under the jobchain profile | the world saw something else, or the loader keeps the state that differs |
+| `latent` | `end-regs`, `end-ls` under the JobQueue2 profile | only state the loader destroys differs (section 8.2, "What is observable") |
+
+A latent difference is not an accepted one. Under same-program matching both
+tiers execute the same instructions, so any register or local-store byte that
+differs is a defect of the lift that this input happens not to expose; the
+next input may read it. It therefore reports, is counted by reason, and
+blocks promotion (section 12.4) exactly like a visible one. What the class
+changes is only what a run may do about it: `spu.xdiff_on_divergence`
+applies to visible ones, `spu.xdiff_on_latent` to latent ones (section 11),
+so an audit can stop on what the game could see and still collect the rest.
+
+"The difference caused no trouble later" is not a class. It is an
+observation about one run, not a property of the job, and no comparison can
+decide it at the point of divergence. The relaxations that are sound are the
+ones a hardware guarantee licenses, each with a falsifier (section 8.2);
+everything else is either a `differ` or an experiment (section 11).
+
+`void` never acts on a run: it is counted, and it proves nothing either way.
+
 ## 9. Shadow contexts
 
 *Decided.* A shadow context is **built, never copied.** It is
@@ -961,7 +1002,8 @@ line there and one row in `docs/CONFIG.md` (`:63`, `:185-186`).
 | `spu.job_body` | `interp` \| `lifted` | `interp` | which tier is the authority: T0, or the image's registered body |
 | `spu.xdiff` | `off` \| `sample` \| `all` | `off` | whether the other tier shadows |
 | `spu.xdiff_period` | u32, 1.. | 64 | `sample`: every N-th job of an image, counted per image from its first job |
-| `spu.xdiff_on_divergence` | `report` \| `stop` | `report` | what a `differ` does to the run |
+| `spu.xdiff_on_divergence` | `report` \| `stop` | `report` | what a visible `differ` does to the run (section 8.4) |
+| `spu.xdiff_on_latent` | `report` \| `stop` | `report` | what a latent `differ` does to the run |
 | `spu.xdiff_budget` | u32, 1.. | 2^28 | the shadow's budget (section 10) |
 | `spu.xdiff_dir` | path or empty | empty | where fixtures are written; empty: none |
 | `spu.xdiff_capture` | u32 | 0 | also write the first N fixtures of each image, for a corpus; with `spu.xdiff=off` the worker records the authority and no shadow runs (commit 10a) |
@@ -973,6 +1015,13 @@ both. A `guarded` mode, which would commit the fast result only when both
 agree, is not built: under same-program matching it is observably the audit
 mode, and it buys no speed because both sides always run. It returns with a
 contract-matched consumer.
+
+**Experiments.** To see what the game does with a body that differs, make
+that body the authority: `spu.job_body=lifted` with `spu.xdiff=all` puts the
+registered body's results into the game and the interpreter in the shadow,
+so every divergence is reported loudly while the run goes on. A body that
+changes behaviour on purpose registers as a tweak (`SPU_TIER_TWEAK`) and is
+never compared (section 3). Neither is evidence for promotion.
 
 **One job, in a run:**
 
@@ -1162,20 +1211,25 @@ sets `spu.job_body=lifted` for an image:
 
 ## 13. Offline replay, synthetic worlds, corpora
 
-*Decided for the runner's contract; commit 8.*
+*Decided; landed with commit 8 (`runtime/spu/xdiff/spu_job_replay.c`).*
 
 ```
-spu_job_replay [--tier interp|registered] [--budget N] [--json] FIXTURE
+spu_job_replay [--tier interp|registered] [--budget N] [--timeout S] [--json] FIXTURE
 ```
 
-- One fixture, one verdict. Standard output carries one JSON object, schema
+- One fixture, one verdict. The subject is the image's registered body
+  unless `--tier interp`; `--budget` bounds a T0 subject in instructions
+  (commit 9 adds the T1 twin); `--timeout` (default 60 s) bounds the child.
+  Standard output carries one JSON object, schema
   `ps3recomp.spujob-verdict/1`: `schema`, `tool`, `version`, `verdict`,
-  `exit_code`, `reason`, `match`, `fixture {path, image_fingerprint,
-  authority_tier, effects, toolkit_commit}`, `subject {tier, lifter_abi,
-  code_end, lift_options, native_rev}`, `first {effect_index, authority,
-  subject, where, want, got}`, `budget {limit, spent}`, `seconds`.
-  Diagnostics go to standard error. The exit status is the verdict
-  (section 8.3); 1 is a usage error.
+  `exit_code`, `reason`, `match`, `class` (section 8.4), `fixture {path,
+  image_fingerprint, authority_tier, effects, toolkit_commit}`, `subject
+  {tier, lifter_abi, code_end, lift_options, native_rev}`, `first
+  {effect_index, authority, subject, where, want, got}`, `budget {limit,
+  spent}`, `seconds`. Addresses, identities and bytes are hex strings; a
+  field that does not apply is `null`. Diagnostics go to standard error. The
+  exit status is the verdict (section 8.3); 1 is a usage error or a refused
+  knob (section 8.1).
 - The CLI is a supervisor: it runs the subject in a child process and emits
   the JSON verdict after the child exits. A timeout or signal becomes `void`
   / `host-fault`; it does not kill the corpus driver.
@@ -1249,8 +1303,8 @@ standalone.
 | 4 | **landed** `1c8a6ea7`, merged as `245c2eaf`: `spu: effect port seam in the channel runtime` | `runtime/spu/spu_effect_port.h` (new: the draft without its `spu_effect_inventory` block), `runtime/spu/spu_context.h` (`port`, `lift_miss`), `spu_channels.c` (seam; `MFC_WrTagMask` below the port test, today's inline store kept for `port == NULL`; `spu_port_*` and `spu_port_serve_halt`; closed resolver path; the latch static assertions), `spu_dma.h`, `spu_interp.c`, `runtime/spu/tests/test_spu_effect_port.c` (new), `tests/bench/spu/` (driver) | `spu_effect_port`: a tap sees every effect of a synthetic job in order, list elements, an atomic and `MFC_WrTagMask` included; a served context completes with `vm_base == NULL` and no MFC engine created; a served context that branches to unlifted local store ends its run with `lift_miss == 1` and nothing interpreted; a serve callback that cannot answer ends the run under `spu_run_with_halt`, and with no landing pad armed the process aborts instead of continuing with a value (a child-process test) | the test, interpreted and lifted; all `spu` and `spurs` suites; the bench rows of section 18 within noise of the baseline; `tests/gates/test_spu_lifter_abi.py` green with the pin unchanged; with no port `MFC_WrTagMask` does not take the MFC registry lock |
 | 5 | **landed** `c26e5864`, merged as `db5decd2`: `jq2: classify a job's end without stopping` (`spu_job_classify_end`, `ExecutorHooks::on_end`) | `libs/spurs/jq2/executor.cpp`, `runtime/spu/spurs_job.c` (shared classifier), `tests/spurs_jq2/test_jq2_executor.cpp` | each end (return in both tiers, stop, halt, jm call) yields its class; the existing `jq2-job-end` and `jq2-jm-call` stop tests stay green | `ctest -R jq2_exec`; `--preset tsan -R jq2_exec` |
 | 6 | `jq2: select a job body by its staged bytes` | `libs/spurs/jq2/executor.{cpp,hpp}`, `include/ps3emu/config_options.def`, `include/ps3emu/config.h`, `runtime/config/`, `docs/CONFIG.md`, `docs/JQ2.md` | a registered image runs lifted under `spu.job_body=lifted`; other bytes staged from the same EA and size run interpreted; `interp` never runs a registered body | the executor tests; kind-29 cost reported from a synthetic trace; `gcc-16`; tsan |
-| 7 | `spu: record a job's transcript and write its fixture` | `runtime/spu/spu_xdiff.h` (new: the container, section, identity, unit, effect and end layouts of 7.1 to 7.6, and `spu_job_tier`), `runtime/spu/xdiff/` (new: fixture reader and writer, recorder tap), `spu_channels.c` (a query for the latched float mode), tests | a synthetic job with GET, PUT, a list, a stalled list resumed by `MFC_WrListStallAck`, GETLLAR/PUTLLC and a mailbox write records the expected transcript, the remaining list bytes at the ack included; the fixture reads back the expected record and payload bytes; each rejection of section 7.8 is reported as `fixture-format` (a `VRDT` section is bounds-checked only until commit 8) | the test, interpreted and lifted; `asan` preset over the reader with truncated and corrupt fixtures, among them one with a flipped header byte (the checksum covers the whole header); `gcc-16`; `SPU_XDIFF_LS_BYTES` equals `SPU_LS_SIZE` by static assertion |
-| 8 | `spu: replay port, shadow contexts and spu_job_replay` | `runtime/spu/spu_xdiff.h` (verdict, reason and match enums, `VRDT`), `runtime/spu/xdiff/` (replay serve table, shadow context, runner), `spu_channels.c` and `spu_interp.c` (`spu_run_with_halt` saves the interpreter's nesting depth before `setjmp` and restores it in the halt cases), `tools/test_spu_context_census.py` (new), `tools/spu_xdiff_corpus.py` (new), tests | T0 against the lift on the fixture of commit 7: `equal`; a lift with one changed instruction: `differ` naming the first effect; a lift that writes another tag mask before a wait and then overwrites the register: `differ` / `effect-request`; a lift that rewrites the remaining elements of a stalled list before the ack and later overwrites them: `differ` / `effect-request`; a stop inside a nested lifted call: `differ` (section 5.1); T0 over its budget by the instruction observer: `void`; a T0 shadow that ends by serve-halt, then a second T0 shadow on the same thread that exhausts its budget: `void` / `budget`, not an abort (section 9); a fixture whose `float_rz` is not the runner's mode: `malformed` / `fixture-identity`; a behaviour-changing knob set: exit status 1; a new `spu_context` member without a class: the census test fails | runner exit codes 0, 1, 2, 3, 4, 5; `gcc-16`; `asan` |
+| 7 | **landed** as `b14aec61` (`spu: xdiff fixture format, its validating codec, the context census`; the whole header, since the decoder bounds-checks `VRDT`) and `2139acd1` (`spu: record a job's transcript and write its fixture`) | `runtime/spu/spu_xdiff.h` (new: the container, section, identity, unit, effect and end layouts of 7.1 to 7.6, and `spu_job_tier`), `runtime/spu/xdiff/` (new: fixture reader and writer, recorder tap), `spu_channels.c` (a query for the latched float mode), tests | a synthetic job with GET, PUT, a list, a stalled list resumed by `MFC_WrListStallAck`, GETLLAR/PUTLLC and a mailbox write records the expected transcript, the remaining list bytes at the ack included; the fixture reads back the expected record and payload bytes; each rejection of section 7.8 is reported as `fixture-format` (a `VRDT` section is bounds-checked only until commit 8) | the test, interpreted and lifted; `asan` preset over the reader with truncated and corrupt fixtures, among them one with a flipped header byte (the checksum covers the whole header); `gcc-16`; `SPU_XDIFF_LS_BYTES` equals `SPU_LS_SIZE` by static assertion |
+| 8 | **landed** as `01538f72` (`spu: replay port, shadow contexts and spu_job_replay`; the census and its test came with `b14aec61`; the corpus driver is `tools/spu_xdiff_corpus.py`, `dfcdef7d`) | `runtime/spu/spu_xdiff.h` (verdict, reason and match enums, `VRDT`), `runtime/spu/xdiff/` (replay serve table, shadow context, runner), `spu_channels.c` and `spu_interp.c` (`spu_run_with_halt` saves the interpreter's nesting depth before `setjmp` and restores it in the halt cases), `tools/test_spu_context_census.py` (new), `tools/spu_xdiff_corpus.py` (new), tests | T0 against the lift on the fixture of commit 7: `equal`; a lift with one changed instruction: `differ` naming the first effect; a lift that writes another tag mask before a wait and then overwrites the register: `differ` / `effect-request`; a lift that rewrites the remaining elements of a stalled list before the ack and later overwrites them: `differ` / `effect-request`; a stop inside a nested lifted call: `differ` (section 5.1); T0 over its budget by the instruction observer: `void`; a T0 shadow that ends by serve-halt, then a second T0 shadow on the same thread that exhausts its budget: `void` / `budget`, not an abort (section 9); a fixture whose `float_rz` is not the runner's mode: `malformed` / `fixture-identity`; a behaviour-changing knob set: exit status 1; a new `spu_context` member without a class: the census test fails | runner exit codes 0, 1, 2, 3, 4, 5; `gcc-16`; `asan` |
 | 9 | `spu_lifter: count backward transfers under SPU_LIFT_BUDGET` | `tools/spu_lifter.py`, `tools/build_spu_workloads.py` (twin entry), `runtime/spu/spu_context.h`, `spu_drain.c`, and the ABI bump of section 12.1: `budget` joins the member list of `include/ps3emu/lifter_abi.h`, `SPU_RUNTIME_LIFTER_ABI` and `SPU_LIFTER_ABI` go up, both data-model pins are recomputed, `EXPECTED_ABI` in `tests/gates/test_spu_lifter_abi.py` follows, and `runtime/spu/tests/out_*` are regenerated | a lifted loop without effects: `void` / `budget` and the process goes on; the same source without the definition contains no check (object comparison) | `asan` and `tsan` presets with `--repeat until-fail:10`; SPU bench unchanged for the production object; `tests/gates/test_spu_lifter_abi.py` and the SPU runtime tests over the regenerated lifts |
 | 10a | `jq2: record an image's fixtures without a shadow` | `libs/spurs/jq2/` (start and end hooks record on the worker; fixtures written synchronously), the registration part of 3b, `include/ps3emu/config_options.def` and `include/ps3emu/config.h` (`spu.xdiff_dir`, `spu.xdiff_capture`), `docs/CONFIG.md` | a registered synthetic image run N+1 times under `spu.xdiff_capture=N` writes N fixtures, each with the job's identity, effects and end, and the guest-visible results are those of a run without capture; an image whose registration lists event branches writes none and is counted ineligible; a fixture that cannot be written is a named diagnostic and the run goes on | the jq2 executor tests; `spu_job_replay --tier interp` on each written fixture: `equal`; `tsan` preset `-R jq2_exec`; `gcc-16` |
 | 10b | `jq2: in-run xdiff with sampled shadows` | `libs/spurs/jq2/` (audit thread, queue), `runtime/spu/spurs_job.c` (staging store hand-over), `include/ps3emu/stop.h`, `docs/STOPS.md`, `tests/gates/test_stop.py`, `include/ps3emu/ps3_ftrace.h`, config keys, `docs/CONFIG.md` | a seeded divergence is reported, its fixture written and replayable, the guest-visible result unchanged; `stop` exits by `spu-xdiff-divergence`; a full queue drops and counts in `sample` and blocks in `all` (ordered by hooks, never by sleeps) | `tsan` preset `-R jq2_xdiff --repeat until-fail:10`; the stop gate; `gcc-16` |

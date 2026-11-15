@@ -167,6 +167,9 @@ file(GLOB_RECURSE RUNTIME_SOURCES
 list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/tests/|/runtime/ppu/|/runtime/host/|/spu_dispatch_mt\.c$")
 # Selected explicitly above, never pulled into other platform backends.
 list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/host_fiber_aarch64\\.c$")
+# The offline runner's main() (docs/SPU_XDIFF.md section 13): its own executable;
+# the replay itself is in the library, so a title links its own runner.
+list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/spu_job_replay_tool\\.c$")
 
 # ---------------------------------------------------------------------------
 # Static library
@@ -1396,6 +1399,117 @@ if(PS3RECOMP_BUILD_TESTS)
             target_link_libraries(test_spu_effect_port PRIVATE m Threads::Threads)
             add_test(NAME spu_effect_port COMMAND test_spu_effect_port)
             set_tests_properties(spu_effect_port PROPERTIES LABELS "spu;t0" TIMEOUT 120)
+            # xdiff (docs/SPU_XDIFF.md): the same synthetic job recorded into a
+            # fixture in both tiers (row 7).
+            set(SPU_XDIFF_RUNTIME_SOURCES
+                "${XDIFF_PORT_DIR}/lift/spu_recomp.c"
+                runtime/spu/spu_workload.c
+                runtime/spu/spurs_policy.c
+                runtime/spu/spurs_job.c
+                runtime/spu/spu_tsp_weak.c
+                runtime/spu/spurs_policy_blob_weak.c
+                runtime/spu/spu_channels.c
+                runtime/spu/spu_interp.c
+                runtime/spu/spu_coherency.c
+                runtime/spu/spu_lockstep.c
+                runtime/spu/spu_drain.c
+                runtime/spu/spu_vm_pagemap.c
+                runtime/memory/reservation.c
+                runtime/memory/label_window.c
+                runtime/platform/win32_compat.c
+                runtime/platform/host_clock.c
+                runtime/platform/host_wait.c
+                runtime/diag/lifter_abi.c
+                runtime/config/config.cpp
+                runtime/diag/stop.cpp)
+            set(SPU_XDIFF_SOURCES
+                runtime/spu/xdiff/spu_xdiff_fixture.c
+                runtime/spu/xdiff/spu_xdiff_census.c
+                runtime/spu/xdiff/spu_xdiff_recorder.c)
+            add_executable(test_spu_xdiff_record
+                runtime/spu/tests/test_spu_xdiff_record.c
+                ${SPU_XDIFF_SOURCES} ${SPU_XDIFF_RUNTIME_SOURCES})
+            target_include_directories(test_spu_xdiff_record PRIVATE
+                include runtime runtime/spu runtime/platform "${XDIFF_PORT_DIR}")
+            target_link_libraries(test_spu_xdiff_record PRIVATE m Threads::Threads)
+            add_test(NAME spu_xdiff_record COMMAND test_spu_xdiff_record)
+            set_tests_properties(spu_xdiff_record PROPERTIES LABELS "spu;t0" TIMEOUT 120)
+            # The fixture codec on its own: round trips and every rejection of
+            # docs/SPU_XDIFF.md section 7.8, on crafted inputs (asan preset).
+            add_executable(test_spu_xdiff_fixture
+                runtime/spu/tests/test_spu_xdiff_fixture.c
+                runtime/spu/xdiff/spu_xdiff_fixture.c)
+            target_include_directories(test_spu_xdiff_fixture PRIVATE include runtime runtime/spu runtime/platform)
+            add_test(NAME spu_xdiff_fixture COMMAND test_spu_xdiff_fixture)
+            set_tests_properties(spu_xdiff_fixture PROPERTIES LABELS "spu;t0" TIMEOUT 120)
+            add_test(NAME spu_xdiff_fixture_sweep COMMAND test_spu_xdiff_fixture 20000)
+            set_tests_properties(spu_xdiff_fixture_sweep PROPERTIES LABELS "spu;stress" TIMEOUT 600)
+            # xdiff replay (row 8): variants of the port job, each lifted with
+            # its own symbol prefix so they link into one test.
+            set(XDIFF_REPLAY_DIR "${CMAKE_BINARY_DIR}/spu_xdiff_replay")
+            set(XDIFF_REPLAY_VARIANTS base size mask stall latent nested)
+            set(XDIFF_REPLAY_ELFS "")
+            set(XDIFF_REPLAY_LIFTS "")
+            foreach(v IN LISTS XDIFF_REPLAY_VARIANTS)
+                list(APPEND XDIFF_REPLAY_ELFS "${XDIFF_REPLAY_DIR}/xr_${v}.elf")
+            endforeach()
+            add_custom_command(
+                OUTPUT ${XDIFF_REPLAY_ELFS} "${XDIFF_REPLAY_DIR}/xdiff_replay_jobs.h"
+                COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu/tests/gen_xdiff_replay_jobs.py" "${XDIFF_REPLAY_DIR}"
+                DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu/tests/gen_xdiff_replay_jobs.py"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu/tests/gen_xdiff_port_job.py"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tools/wrap_spu_elf.py"
+                VERBATIM)
+            foreach(v IN LISTS XDIFF_REPLAY_VARIANTS)
+                add_custom_command(
+                    OUTPUT "${XDIFF_REPLAY_DIR}/lift_${v}/spu_recomp.c" "${XDIFF_REPLAY_DIR}/lift_${v}/spu_recomp.h"
+                    COMMAND "${Python3_EXECUTABLE}"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tools/spu_lifter.py"
+                        --auto-functions "${XDIFF_REPLAY_DIR}/xr_${v}.elf"
+                        --symbol-prefix "xr_${v}_"
+                        --output "${XDIFF_REPLAY_DIR}/lift_${v}"
+                    DEPENDS "${XDIFF_REPLAY_DIR}/xr_${v}.elf"
+                            "${CMAKE_CURRENT_SOURCE_DIR}/tools/spu_lifter.py"
+                            "${CMAKE_CURRENT_SOURCE_DIR}/tools/find_spu_functions.py"
+                    VERBATIM)
+                list(APPEND XDIFF_REPLAY_LIFTS "${XDIFF_REPLAY_DIR}/lift_${v}/spu_recomp.c")
+            endforeach()
+            set(XDIFF_REPLAY_RUNTIME ${SPU_XDIFF_RUNTIME_SOURCES})
+            list(REMOVE_ITEM XDIFF_REPLAY_RUNTIME "${XDIFF_PORT_DIR}/lift/spu_recomp.c")
+            add_executable(test_spu_xdiff_replay
+                runtime/spu/tests/test_spu_xdiff_replay.c
+                runtime/spu/xdiff/spu_xdiff_replay.c
+                runtime/spu/xdiff/spu_job_replay.c
+                ${SPU_XDIFF_SOURCES}
+                ${XDIFF_REPLAY_LIFTS}
+                ${XDIFF_REPLAY_RUNTIME})
+            target_include_directories(test_spu_xdiff_replay PRIVATE
+                include runtime runtime/spu runtime/platform "${XDIFF_REPLAY_DIR}")
+            target_link_libraries(test_spu_xdiff_replay PRIVATE m Threads::Threads)
+            # The replay test writes its base fixture where the tool test reads it.
+            set(XDIFF_REPLAY_FIXTURE "${XDIFF_REPLAY_DIR}/t0_base.spujob")
+            add_test(NAME spu_xdiff_replay COMMAND test_spu_xdiff_replay "${XDIFF_REPLAY_FIXTURE}")
+            set_tests_properties(spu_xdiff_replay PROPERTIES LABELS "spu;t0" TIMEOUT 120
+                FIXTURES_SETUP spu_xdiff_replay_fixture)
+            # The toolkit's offline runner (docs/SPU_XDIFF.md section 13): T0 only,
+            # no lifted images; a title links its own with its registry.
+            add_executable(spu_job_replay
+                runtime/spu/xdiff/spu_job_replay_tool.c
+                runtime/spu/xdiff/spu_xdiff_replay.c
+                runtime/spu/xdiff/spu_job_replay.c
+                ${SPU_XDIFF_SOURCES}
+                ${XDIFF_REPLAY_RUNTIME})
+            target_include_directories(spu_job_replay PRIVATE include runtime runtime/spu runtime/platform)
+            target_link_libraries(spu_job_replay PRIVATE m Threads::Threads)
+            add_test(NAME spu_job_replay_tool
+                COMMAND spu_job_replay --tier interp --json "${XDIFF_REPLAY_FIXTURE}")
+            set_tests_properties(spu_job_replay_tool PROPERTIES LABELS "spu;t0" TIMEOUT 60
+                FIXTURES_REQUIRED spu_xdiff_replay_fixture
+                PASS_REGULAR_EXPRESSION "\"verdict\":\"equal\"")
+            add_test(NAME spu_job_replay_usage COMMAND spu_job_replay)
+            set_tests_properties(spu_job_replay_usage PROPERTIES LABELS "spu;t0" TIMEOUT 60
+                PASS_REGULAR_EXPRESSION "usage: ")
         endif()
     endif()
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
