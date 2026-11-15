@@ -46,8 +46,10 @@
  *   stack-max        sizeStack = 0xFFFF: spu-job-memory (region stack)
  *   cache-over       the cache buffer ends one byte past the runtime area: stop
  *   huge-io          sizeIn/Out = 0xFFFFFFFF: spu-job-memory (region io), no wrap
- *   dma-seam         the loader's local store (a substituted allocation, see below) holds the
- *                    staged ioBuffer after a run: the check behind every "no LS write" below
+ *   dma-seam         the loader stages straight into the context's own local store: staging
+ *                    begins once, on a store that is all zero, and that store is the one the
+ *                    job then runs on (no temporary store, no copy); the check behind every
+ *                    "no staging" below
  *   dma-lsa          1/2/4/8/16-byte elements with non-zero EAL low nibbles stage exactly as
  *                    the MFC list engine (mfc_run_list) stages them
  *   dma-lsa-edge     the same list, the last short element ending exactly at sizeInOrInOut
@@ -57,8 +59,8 @@
  *   dma-stall-zero   a zero-size stall marker (the wwsjob sentinel): the same
  *   dma-late-bad     a malformed LAST element after a valid list: no local-store byte written
  *
- * Every dma-* stop mode runs the loader in a forked child over a shared 0xA5-filled local
- * store and has the parent check the store untouched (stdout "LS-UNTOUCHED"), then exits 70.
+ * Every dma-* stop mode (and the other descriptor-validation stops) runs the loader in a forked
+ * child and has the parent check that staging never began (stdout "NO-STAGING"), then exits 70.
  */
 #include "../spu_context.h"
 #include "../spu_dma.h"      /* vm_base */
@@ -83,18 +85,24 @@ void spurs_job_set_spu_num(uint32_t n);
 
 static uint8_t g_mem[1u << 20];
 
-/* The loader's local store comes from here (spurs_job.c is built with
- * SPURS_JOB_LS_TEST). Armed, it is a store shared with the parent, filled with
- * a pattern, so a forked loader that stops can be asked what it wrote. */
-#define LS_PATTERN 0xA5
-static uint8_t* g_shared_ls;
-uint8_t* spurs_job_test_ls_alloc(void)
+/* The loader calls this when it starts writing the job into the context's local
+ * store (spurs_job.c is built with SPURS_JOB_LS_TEST). The record is shared
+ * memory, so a forked loader that stops can be asked whether staging began. */
+typedef struct stage_probe {
+    int            calls;
+    int            zero;      /* the store was all zero at the first call */
+    const uint8_t* ls;
+} stage_probe;
+static stage_probe* g_stage;
+static const uint8_t* g_entry_ls;     /* the store the job's entry saw */
+void spurs_job_test_stage_begin(const uint8_t* ls)
 {
-    return g_shared_ls ? g_shared_ls : (uint8_t*)calloc(1, SPU_LS_SIZE);
-}
-void spurs_job_test_ls_free(uint8_t* ls)
-{
-    if (ls != g_shared_ls) free(ls);
+    if (g_stage->calls++ == 0) {
+        g_stage->ls = ls;
+        g_stage->zero = 1;
+        for (uint32_t i = 0; i < SPU_LS_SIZE; i++)
+            if (ls[i]) { g_stage->zero = 0; break; }
+    }
 }
 
 /* ---- layout the loader promises, pinned independently of its macros ------ */
@@ -328,6 +336,7 @@ static const spu_observer g_obs = { 0, 0, 0, 0, on_channel };
 static void entry_interp(spu_context* ctx)
 {
     g_ran = 1;
+    g_entry_ls = ctx->ls;
     spu_observer_set(ctx, &g_obs);
     take(&g_start, ctx);
     spu_interp_run(ctx, 0);
@@ -554,14 +563,11 @@ static void mode_stop_cfg(const job_cfg* c)
     g_fail++;
 }
 
-/* Run the loader in a child over the shared pattern store; return the child's
- * wait status and how many store bytes differ from the pattern. */
-static int run_forked(uint32_t job_ea, size_t* touched)
+/* Run the loader in a child; return the child's wait status and how many times
+ * it began staging into local store. */
+static int run_forked(uint32_t job_ea, int* staged)
 {
-    g_shared_ls = (uint8_t*)mmap(NULL, SPU_LS_SIZE, PROT_READ | PROT_WRITE,
-                                 MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-    if (g_shared_ls == MAP_FAILED) { perror("mmap"); exit(2); }
-    memset(g_shared_ls, LS_PATTERN, SPU_LS_SIZE);
+    g_stage->calls = 0;
     fflush(stdout); fflush(stderr);
     const pid_t pid = fork();
     if (pid < 0) { perror("fork"); exit(2); }
@@ -571,21 +577,20 @@ static int run_forked(uint32_t job_ea, size_t* touched)
     }
     int st = 0;
     if (waitpid(pid, &st, 0) != pid) { perror("waitpid"); exit(2); }
-    *touched = 0;
-    for (uint32_t i = 0; i < SPU_LS_SIZE; i++) *touched += g_shared_ls[i] != LS_PATTERN;
+    *staged = g_stage->calls;
     return st;
 }
 
 /* A descriptor that must stop before any byte reaches local store. The child
- * stops (exit 70, its PS3STOP line on stderr); the parent checks the store and
- * ends with the same code, so the driver reads one stop. */
-static void expect_untouched_stop(uint32_t job_ea, const char* mode)
+ * stops (exit 70, its PS3STOP line on stderr); the parent checks that staging
+ * never began and ends with the same code, so the driver reads one stop. */
+static void expect_unstaged_stop(uint32_t job_ea, const char* mode)
 {
-    size_t touched;
-    const int st = run_forked(job_ea, &touched);
+    int staged;
+    const int st = run_forked(job_ea, &staged);
     CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 70, "the loader exited 0x%X, not with a stop", st);
-    CHECK(touched == 0, "%zu local-store bytes were written before the stop", touched);
-    if (!g_fail) printf("LS-UNTOUCHED: %s\n", mode);
+    CHECK(staged == 0, "staging into local store began %d time(s) before the stop", staged);
+    if (!g_fail) printf("NO-STAGING: %s\n", mode);
     fflush(stdout);
     _exit(g_fail ? 1 : 70);
 }
@@ -595,7 +600,7 @@ static void mode_dma_stop(const char* mode, const uint64_t* elems, uint32_t n, u
     job_cfg c = { "JOBCRT Ver14", 0, PROG_MAIN, 0, 0, 0, io_bytes };
     build_job(&c);
     patch_dma_list(elems, n);
-    expect_untouched_stop(JOB_EA, mode);
+    expect_unstaged_stop(JOB_EA, mode);
 }
 
 /* What the MFC list engine stages for `elems`, in a context of its own: the
@@ -676,21 +681,26 @@ static void mode_dma_stall(const char* mode, uint32_t stall_word, uint32_t stall
     CHECK(memcmp(g_ref.ls + 0x1000, g_mem + IO_EA, 0x10) == 0, "engine: element before the stall");
     CHECK(memcmp(g_ref.ls + 0x1020, g_mem + IO_EA + 0x20, 0x10) != 0,
           "engine: the element after the stall was staged");
-    expect_untouched_stop(JOB_EA, mode);
+    expect_unstaged_stop(JOB_EA, mode);
 }
 
-/* The loader's store is the one the substituted allocation hands out. */
+/* The loader stages into the context's own store: one staging pass, on a zeroed
+ * store, and that store is the one the job runs on. */
 static void mode_dma_seam(void)
 {
     job_cfg c = { "JOBCRT Ver14", 0, PROG_MAIN, 0, 0, 0, 0x90 };
     const uint64_t e[] = { dma_elem(0x80, IO_EA), dma_elem(0x10, IO_EA + 0x80) };
     build_job(&c);
     patch_dma_list(e, 2);
-    size_t touched;
-    const int st = run_forked(JOB_EA, &touched);
-    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0, "the job exited 0x%X", st);
-    CHECK(touched >= IMAGE_SIZE + 0x90, "only %zu store bytes were written", touched);
-    CHECK(memcmp(g_shared_ls + 0x1000, g_mem + IO_EA, 0x90) == 0, "ioBuffer in the shared store");
+    g_stage->calls = 0;
+    run_built(JOB_EA, entry_interp);
+    CHECK(g_ran, "the job did not run");
+    CHECK(g_stage->calls == 1, "staging began %d times, want 1", g_stage->calls);
+    CHECK(g_stage->zero, "the store was not all zero when staging began");
+    CHECK(g_stage->ls && g_stage->ls == g_entry_ls,
+          "staged into %p, but the job ran on the store at %p", (const void*)g_stage->ls,
+          (const void*)g_entry_ls);
+    CHECK(memcmp(g_start.ls + 0x1000, g_mem + IO_EA, 0x90) == 0, "ioBuffer in the job's store");
 }
 
 /* The list exactly fills sizeInOut: it must run, both elements in place. */
@@ -720,7 +730,7 @@ static void mode_dma_desc_range(const char* mode)
     build_job(&c);
     put16(g_mem + c.job_ea + 0x0A, 0x100);   /* 32 entries: 0xFFF30 + 0x100 > 1 MB */
     put32(g_mem + c.job_ea + 0x24, 0);       /* no cache list to read past it */
-    expect_untouched_stop(c.job_ea, mode);
+    expect_unstaged_stop(c.job_ea, mode);
 }
 
 /* eaBinary or sizeBinary zero: there is no binary to run. */
@@ -730,7 +740,7 @@ static void mode_bin_zero(const char* mode, int ea_zero)
     build_job(&c);
     if (ea_zero) put64(g_mem + JOB_EA, 0);
     else put16(g_mem + JOB_EA + 0x08, 0);
-    expect_untouched_stop(JOB_EA, mode);
+    expect_unstaged_stop(JOB_EA, mode);
 }
 
 /* The guest VM is g_mem followed by an inaccessible page, so a loader that
@@ -758,7 +768,7 @@ static void mode_desc_range(const char* mode)
     put16(g_mem + 0xFFF80 + 0x0A, 0);        /* no input list */
     put32(g_mem + 0xFFF80 + 0x24, 0);        /* no cache list */
     use_guarded_vm();
-    expect_untouched_stop(0xFFF80, mode);
+    expect_unstaged_stop(0xFFF80, mode);
 }
 
 /* A binary (bin) or a cache entry outside guest memory: a named stop before
@@ -778,7 +788,7 @@ static void mode_range(const char* mode, int bin)
         put64(d + 0x30, dma_elem(1, (uint32_t)sizeof g_mem));
     }
     use_guarded_vm();
-    expect_untouched_stop(JOB_EA, mode);
+    expect_unstaged_stop(JOB_EA, mode);
 }
 
 static void mode_stop(const char* crt, uint32_t bss_qw)
@@ -791,6 +801,9 @@ int main(int argc, char** argv)
 {
     vm_base = g_mem;
     ppu_vm_size = sizeof g_mem;
+    g_stage = (stage_probe*)mmap(NULL, sizeof *g_stage, PROT_READ | PROT_WRITE,
+                                 MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (g_stage == MAP_FAILED) { perror("mmap"); return 2; }
     if (argc < 2) { fprintf(stderr, "usage: %s mode [dump]\n", argv[0]); return 2; }
     const char* m = argv[1];
 

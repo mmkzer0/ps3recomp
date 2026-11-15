@@ -54,17 +54,14 @@
 #include "ps3emu/log_first.h"
 #include "ps3emu/stop.h"
 
-/* The job's local store comes from these two. A test builds this file with
- * SPURS_JOB_LS_TEST and supplies the functions, to see what is written to the
- * store and when (tools/test_spurs_job_crt.py). */
+/* A test builds this file with SPURS_JOB_LS_TEST and supplies the function, to
+ * see when staging into the context's local store begins and what the store
+ * holds at that moment (tools/test_spurs_job_crt.py). */
 #ifdef SPURS_JOB_LS_TEST
-extern uint8_t* spurs_job_test_ls_alloc(void);
-extern void spurs_job_test_ls_free(uint8_t* ls);
-#define SPURS_JOB_LS_ALLOC()  spurs_job_test_ls_alloc()
-#define SPURS_JOB_LS_FREE(p)  spurs_job_test_ls_free(p)
+extern void spurs_job_test_stage_begin(const uint8_t* ls);
+#define SPURS_JOB_STAGE_BEGIN(ls)  spurs_job_test_stage_begin(ls)
 #else
-#define SPURS_JOB_LS_ALLOC()  ((uint8_t*)calloc(1, SPU_LS_SIZE))
-#define SPURS_JOB_LS_FREE(p)  free(p)
+#define SPURS_JOB_STAGE_BEGIN(ls)  ((void)0)
 #endif
 #include "ps3emu/ps3_env_once.h"   /* ps3_env_once: each switch looked up once */
 
@@ -769,8 +766,17 @@ static int run_spurs_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_e
     const uint32_t io_used = (uint32_t)io_cursor;
 
     /* ---- the descriptor is valid: stage binary, cache, input list -------- */
-    uint8_t* ls = SPURS_JOB_LS_ALLOC();
-    if (!ls) { free(io_x); return -1; }
+    /* The staging target is the context's own local store. spu_context_init's
+     * memset is the one zeroing pass the job's view needs: image+bss past the
+     * binary, and every gap between regions, start as zero. Nothing above this
+     * line writes the store, so a descriptor that stops leaves it unwritten. */
+    spu_context ctx;
+    /* Every jq2 job gets spu_id 0 here, whichever worker runs it, so spu_id does
+     * not identify a worker on this path. The ftrace jq2 kinds carry the queue
+     * and worker index (q, w) instead; changing spu_id is tracked in #107. */
+    spu_context_init(&ctx, 0);
+    uint8_t* const ls = ctx.ls;
+    SPURS_JOB_STAGE_BEGIN(ls);
 
     /* binary at its base: LS 0 for a jobchain job (PIC, so delta 0 keeps the
      * lifted addresses), 0x7C00 for a JobQueue2 job. Only sizeBinary << 4 bytes
@@ -934,15 +940,10 @@ static int run_spurs_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_e
     }
 
     /* ---- enter the job -------------------------------------------------- */
-    spu_context ctx;
-    /* Every jq2 job gets spu_id 0 here, whichever worker runs it, so spu_id does
-     * not identify a worker on this path. The ftrace jq2 kinds carry the queue
-     * and worker index (q, w) instead; changing spu_id is tracked in #107. */
-    spu_context_init(&ctx, 0);
+    /* ctx was initialised and staged above. */
     ctx.image_id = image_id;
     ctx.job_rt_ls = q ? SPU_JQ2_JM_CALL_LS : (crt == 14 ? JOB_RT_LS : 0);
     ctx.job_rt_ls2 = q ? SPU_JQ2_JM_SWAP_LS : 0;
-    memcpy(ctx.ls, ls, SPU_LS_SIZE);
     if (q) {
         /* The PM's entry state (jq2 static ABI doc 1.4): everything zero, then
          * r0 = the link the executor's `stop 0` sentinel answers (the PM's own
@@ -1102,7 +1103,6 @@ static int run_spurs_job(spu_lifted_entry_fn entry, int image_id, uint32_t job_e
     spu_mfc_release(&ctx);
     spu_coh_unregister(&ctx);   /* stack local: out of the reserver set */
     { extern void spu_mfc_release(spu_context*); spu_mfc_release(&ctx); }
-    SPURS_JOB_LS_FREE(ls);
     return 0;
 }
 

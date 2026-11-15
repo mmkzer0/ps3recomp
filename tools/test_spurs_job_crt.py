@@ -22,9 +22,10 @@ hand-encoded SPU words over a deterministic junk pattern.
                  zero-size element; a size over 16 KB; a size that is not
                  1/2/4/8 or a 16-byte multiple; an unaligned 8-byte EA; a list
                  that leaves guest memory; eaBinary = 0; sizeBinary = 0
-  dma-seam       the local store the loader stages into is observable (the
-                 loader is built with SPURS_JOB_LS_TEST): the check behind the
-                 "no local-store byte written" assertions
+  dma-seam       the loader stages straight into the context's own local store:
+                 staging begins once, on an all-zero store, and that store is
+                 the one the job runs on (the loader is built with
+                 SPURS_JOB_LS_TEST); the check behind the "no staging" assertions
   dma-lsa, dma-lsa-edge, dma-lsa-over
                  1/2/4/8-byte elements with non-zero EAL low nibbles land at
                  the MFC's LSA (low nibble from EAL), byte for byte what the
@@ -37,8 +38,8 @@ hand-encoded SPU words over a deterministic junk pattern.
                  acknowledge it, so the loader stops (spu-job-dma-list,
                  reason stall-notify)
   dma-late-bad   a malformed LAST element after a valid list
-  every dma-* stop runs the loader over a shared 0xA5-filled local store and
-  asserts that no byte of it was written before the stop
+  every dma-* stop (and every other descriptor-validation stop) runs the loader
+  in a forked child and asserts that staging into local store never began
   ver13 (hash)   the Ver13 local store at entry, whole, equals the hash the
                  loader produced before Ver14 existed (GOLDEN_VER13_LS)
   fit            the last region (a cache buffer) ending exactly at the runtime
@@ -147,7 +148,7 @@ def main():
             p = run(mode)
             f = g.expect_stop(p, "spu-job-dma-list")
             assert "FAIL" not in p.stdout, (mode, p.stdout)
-            assert f"LS-UNTOUCHED: {mode}" in p.stdout, (mode, p.stdout)
+            assert f"NO-STAGING: {mode}" in p.stdout, (mode, p.stdout)
             want = {"job": job, "image": "7", "index": str(index),
                     "ea": hexs(ea), "size": hexs(size), "ls": f"0x{ls:05X}",
                     "cumulative": hexs(cumulative), "capacity": hexs(capacity),
