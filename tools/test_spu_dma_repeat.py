@@ -69,7 +69,8 @@ def main():
             subprocess.run([cc, *flags, "-c", str(src), "-o", str(obj)], check=True)
             objects.append(str(obj))
         for src, out in ((ROOT / "runtime/config/config.cpp", "config.o"),
-                         (ROOT / "runtime/diag/stop.cpp", "stop.o")):
+                         (ROOT / "runtime/diag/stop.cpp", "stop.o"),
+                         (ROOT / "tests/ps3_log_null.cpp", "ps3_log_null.o")):
             obj = tmp / out
             subprocess.run([cxx, *cxxflags, "-c", str(src), "-o", str(obj)], check=True)
             objects.append(str(obj))
@@ -84,7 +85,7 @@ def main():
         # fixture then hits its 10 s bound and exits 3, not 70.
         archive = tmp / "libps3recomp_runtime.a"
         subprocess.run([os.environ.get("AR", "ar"), "rcs", str(archive),
-                        str(tmp / "config.o"), str(tmp / "stop.o"),
+                        str(tmp / "config.o"), str(tmp / "stop.o"), str(tmp / "ps3_log_null.o"),
                         str(tmp / "label_window.o")], check=True)
         partial = tmp / "test_dma_repeat_archive"
         subprocess.run([cxx, str(tmp / "test.o"), str(tmp / "pagemap.o"),
@@ -142,7 +143,8 @@ def repeat_log_fixture(cc, cxx, cflags, cxxflags, env):
             obj = tmp / f"{index}-{src.stem}.o"
             subprocess.run([cc, *flags, "-c", str(src), "-o", str(obj)], check=True)
             objects.append(str(obj))
-        for src in (ROOT / "runtime/config/config.cpp", ROOT / "runtime/diag/stop.cpp"):
+        for src in (ROOT / "runtime/config/config.cpp", ROOT / "runtime/diag/stop.cpp",
+                    ROOT / "tests/ps3_log_null.cpp"):
             obj = tmp / (src.stem + ".o")
             subprocess.run([cxx, *cxxflags, "-c", str(src), "-o", str(obj)], check=True)
             objects.append(str(obj))

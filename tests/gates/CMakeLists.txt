@@ -36,6 +36,12 @@ endfunction()
 gates_probe(probe_stop probe_stop.cpp)
 gates_py_test(stop "runtime;tsan" test_stop.py $<TARGET_FILE:probe_stop>)
 
+# ps3_log (docs/LOGGING.md): one scenario per process, because the log is configured once from the
+# environment. The concurrent-writer case is its own test so it carries the tsan label.
+gates_probe(probe_log probe_log.c)
+gates_py_test(ps3_log diag test_log.py $<TARGET_FILE:probe_log>)
+gates_py_test(ps3_log_threads "diag;tsan" test_log.py $<TARGET_FILE:probe_log> threads)
+
 gates_probe(probe_sha256 probe_sha256.cpp)
 gates_py_test(sha256 runtime test_sha256.py $<TARGET_FILE:probe_sha256>)
 

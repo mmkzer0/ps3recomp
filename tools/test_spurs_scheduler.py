@@ -26,7 +26,7 @@ with tempfile.TemporaryDirectory(prefix='spurs-scheduler-') as tmp:
         obj=tmp/f'{index}.o'
         subprocess.run([os.environ.get('CC','cc'),*cflags,'-c',str(src),'-o',str(obj)],check=True)
         objects.append(str(obj))
-    for src in (r/'runtime/config/config.cpp', r/'runtime/diag/stop.cpp'):
+    for src in (r/'runtime/config/config.cpp', r/'runtime/diag/stop.cpp', r/'tests/ps3_log_null.cpp'):
         obj=tmp/(src.stem+'.o')
         subprocess.run([os.environ.get('CXX','c++'),*cxxflags,'-c',str(src),'-o',str(obj)],check=True)
         objects.append(str(obj))

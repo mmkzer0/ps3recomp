@@ -115,6 +115,11 @@ def test_defaults_without_file_or_environment():
         "pad.replay": ('""', "default"),
         "title.elf_sha256": ('""', "default"),
         "diag.dump_config": ("false", "default"),
+        "log.file": ('""', "default"),
+        "log.level": ('"info"', "default"),
+        "log.mute": ('""', "default"),
+        "log.collapse": ('"file"', "default"),
+        "log.max_mb": ("256", "default"),
     }, o
 
 
@@ -225,6 +230,11 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
             "pad.replay": "default",
             "title.elf_sha256": "env:PS3RECOMP_TITLE_ELF_SHA256",
             "diag.dump_config": "env:PS3RECOMP_DIAG_DUMP_CONFIG",
+            "log.file": "default",
+            "log.level": "default",
+            "log.mute": "default",
+            "log.collapse": "default",
+            "log.max_mb": "default",
         }, src
         try:
             import tomllib
@@ -250,7 +260,9 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
                            "video": {"resolutions": "", "rsx_capture": False, "rsx_capture_dir": "",
                                      "rsx_capture_frames": 0},
                            "pad": {"record": "", "replay": ""},
-                           "title": {"elf_sha256": SHA_A}, "diag": {"dump_config": False}}, doc
+                           "title": {"elf_sha256": SHA_A}, "diag": {"dump_config": False},
+                           "log": {"file": "", "level": "info", "mute": "", "collapse": "file",
+                                   "max_mb": 256}}, doc
 
 
 def test_dump_reloads_to_the_same_configuration():
@@ -746,6 +758,20 @@ def test_vscr_nj_value_and_source_appear_in_the_dump():
         p = probe("dump", **({"PS3RECOMP_PPU_VSCR_NJ": env} if env else {}))
         assert p.returncode == 0, p.stderr
         assert f"vscr_nj = {value}  # source: {source}" in p.stdout, p.stdout
+
+
+def test_log_file_is_configured_by_a_config_only_consumer():
+    # probe_config only reads the configuration: it names no logger symbol. Loading the config must still
+    # open log.file, so an unusable path stops it (host-log-file) instead of being ignored, and a usable
+    # one is created. A weak no-op in config.cpp used to satisfy the call and leave this silently unconfigured.
+    with tempfile.TemporaryDirectory(prefix="ps3cfg-log-") as d:
+        f = g.expect_stop(probe("get", PS3RECOMP_LOG_FILE=os.path.join(d, "no", "such", "run.log")),
+                          "host-log-file")
+        assert f["op"] == "open", f
+        path = os.path.join(d, "run.log")
+        p = probe("get", PS3RECOMP_LOG_FILE=path)
+        assert p.returncode == 0, p.stderr
+        assert os.path.isfile(path)
 
 
 if __name__ == "__main__":

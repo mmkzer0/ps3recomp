@@ -17,7 +17,7 @@
  *   - PS3_STDIO_UNBUFFERED=1: a line is in the pipe as soon as printf returns.
  *
  * Build (any POSIX host):
- *   cc -std=gnu17 -Wall -Wextra -I runtime/platform -o test_stdio_flush \
+ *   cc -std=gnu17 -Wall -Wextra -I include -I runtime/platform -o test_stdio_flush \
  *      runtime/platform/tests/test_stdio_flush.c runtime/platform/ps3_stdio.c \
  *      runtime/platform/win32_compat.c -lpthread
  *
@@ -39,6 +39,9 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+
+/* ps3_stdio.c flushes the run log too; this test links without it. */
+void ps3_log_flush(void) {}
 
 static int g_pass, g_fail;
 #define CHECK(cond) do { if (cond) g_pass++; else { g_fail++; \

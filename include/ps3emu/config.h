@@ -60,6 +60,9 @@ enum {
     PS3_CFG_V_XDIFF_ACTION,      /* "report" or "stop" */
     PS3_CFG_V_PAD_RECORD_PATH,   /* "" or a path that does not exist, in a writable directory */
     PS3_CFG_V_PAD_REPLAY_PATH,   /* "" or a readable regular file */
+    PS3_CFG_V_LOG_LEVEL,         /* "error", "warn", "info" or "debug" */
+    PS3_CFG_V_LOG_TAGS,          /* "" or a comma-separated list of tags of [A-Za-z0-9_.-] */
+    PS3_CFG_V_LOG_COLLAPSE,      /* "file", "all" or "off" */
 };
 
 /* ---- typed storage ------------------------------------------------------- */

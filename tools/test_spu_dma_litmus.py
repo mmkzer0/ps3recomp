@@ -54,7 +54,8 @@ def main():
             objects.append(str(obj))
         # spu_dma.h calls the typed configuration and the named-stop runtime directly.
         for src, out in ((ROOT / "runtime/config/config.cpp", "config.o"),
-                         (ROOT / "runtime/diag/stop.cpp", "stop.o")):
+                         (ROOT / "runtime/diag/stop.cpp", "stop.o"),
+                         (ROOT / "tests/ps3_log_null.cpp", "ps3_log_null.o")):
             obj = tmp / out
             subprocess.run([cxx, *cxxflags, "-c", str(src), "-o", str(obj)], check=True)
             objects.append(str(obj))

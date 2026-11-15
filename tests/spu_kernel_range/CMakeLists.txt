@@ -21,6 +21,7 @@ add_executable(test_spu_kernel_range
     "${PROJECT_SOURCE_DIR}/runtime/platform/host_clock.c"
     "${PROJECT_SOURCE_DIR}/runtime/platform/host_wait.c"
     # spu_dma.h calls the typed configuration and the named-stop runtime directly.
+    "${PROJECT_SOURCE_DIR}/runtime/diag/ps3_log.c"
     "${PROJECT_SOURCE_DIR}/runtime/config/config.cpp"
     "${PROJECT_SOURCE_DIR}/runtime/diag/stop.cpp"
 )

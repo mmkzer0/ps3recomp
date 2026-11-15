@@ -382,6 +382,35 @@ PS3_CFG_BOOL(diag, dump_config, 0,
     "Print the effective configuration (every key, its value and where the value "
     "came from) to stderr once it is loaded.")
 
+/* ---- log ---------------------------------------------------------------- */
+
+PS3_CFG_STR(log, file, "", 1023, PS3_CFG_V_NONE,
+    "The run log file (docs/LOGGING.md). Empty (the default) writes none. Set, the runtime moves an "
+    "existing file to <file>.prev (replacing an older .prev, so exactly one previous run survives) and "
+    "creates a fresh one; every line the runtime prints through ps3_log goes into it as "
+    "\"<seconds> <thread> <E|W|I|D> <line as on stderr>\", with what only a file can hold: collapsed "
+    "repeats, what a per-site cap swallowed and the stop banner. stderr is unchanged. A path that "
+    "cannot be rotated or created, or that names a directory, ends the run with kind host-log-file.")
+
+PS3_CFG_STR(log, level, "info", 5, PS3_CFG_V_LOG_LEVEL,
+    "The most verbose level that is printed, on stderr and in the file: \"error\", \"warn\", \"info\" "
+    "(the default) or \"debug\". Call sites migrated from fprintf are info, so the default hides "
+    "nothing that printed before.")
+
+PS3_CFG_STR(log, mute, "", 255, PS3_CFG_V_LOG_TAGS,
+    "Comma-separated tags (the text inside [..] at the start of a line, characters A-Za-z0-9_.-) "
+    "whose lines are not printed on stderr. The file keeps them. Empty mutes nothing.")
+
+PS3_CFG_STR(log, collapse, "file", 4, PS3_CFG_V_LOG_COLLAPSE,
+    "Consecutive identical lines from one call site: \"file\" (the default) writes the first and then "
+    "one \"[log] previous line repeated N times\" line to the file only, stderr prints every line; "
+    "\"all\" collapses stderr the same way (stderr is then no longer byte-identical to the "
+    "unmigrated output); \"off\" collapses nothing.")
+
+PS3_CFG_U32(log, max_mb, 256, 1, 65535,
+    "Size cap of the log file in MiB. At the cap the file gets one \"size cap reached\" line at exit "
+    "and nothing else; stderr is unaffected. Protects device storage.")
+
 /* ---- legacy environment variables --------------------------------------- */
 /*
  * Existing diagnostic knobs that read PS3RECOMP_* straight from the environment

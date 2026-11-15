@@ -38,6 +38,10 @@ std::atomic<ps3_stop_frontier_fn> g_providers[kMaxProviders];
 std::mutex g_stop_lock;
 thread_local bool t_stopping = false;
 
+/* The run log's hooks (ps3_stop_set_mirror); null when no log is configured. Constant-initialised. */
+std::atomic<ps3_stop_quiesce_fn> g_quiesce{nullptr};
+std::atomic<ps3_stop_mirror_fn> g_mirror{nullptr};
+
 /* The calling thread's divert (ps3_stop_divert_begin): null when none is installed. */
 thread_local ps3_stop_divert_fn t_divert_fn = nullptr;
 thread_local void* t_divert_user = nullptr;
@@ -146,6 +150,12 @@ const char* ps3_stop_kind_id(ps3_stop_kind kind)
     return (unsigned)kind < (unsigned)PS3_STOP_KIND_COUNT ? kKindIds[kind] : "invalid-kind";
 }
 
+void ps3_stop_set_mirror(ps3_stop_quiesce_fn quiesce, ps3_stop_mirror_fn mirror)
+{
+    g_quiesce.store(quiesce, std::memory_order_release);
+    g_mirror.store(mirror, std::memory_order_release);
+}
+
 void ps3_stop_register_frontier(ps3_stop_frontier_fn fn)
 {
     if (!fn) return;
@@ -203,6 +213,10 @@ void ps3_stop(ps3_stop_kind kind, const char* what, const char* remedy,
     }
     t_stopping = true;
     g_stop_lock.lock();
+
+    // The run log's operations in flight finish first, so their lines are in the streams flushed below and
+    // the banner stays the last thing on stderr.
+    if (ps3_stop_quiesce_fn quiesce = g_quiesce.load(std::memory_order_acquire)) quiesce();
 
     // Whatever the guest or the runtime had buffered, on either stream, goes
     // out before the frontier providers run, so the log leading up to the stop
@@ -265,8 +279,10 @@ void ps3_stop(ps3_stop_kind kind, const char* what, const char* remedy,
         out += '\n';
     }
     out += rule + "\n" + line + "\n";
-
     write_all(out);
+    // The run log (ps3_log.c) keeps the banner too, so a run whose terminal is gone (iOS, a Windows GUI)
+    // still records why it ended. After the stderr write, which stays the authoritative output.
+    if (ps3_stop_mirror_fn mirror = g_mirror.load(std::memory_order_acquire)) mirror(out.data(), out.size());
     exit_stopped();
 }
 

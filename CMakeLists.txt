@@ -1142,6 +1142,7 @@ if(PS3RECOMP_BUILD_TESTS)
             runtime/platform/win32_compat.c
             runtime/platform/host_clock.c
             runtime/platform/host_wait.c
+            runtime/diag/ps3_log.c
             runtime/config/config.cpp
             runtime/diag/stop.cpp)
         target_include_directories(test_spu_coh_peers PRIVATE
@@ -1424,6 +1425,7 @@ if(PS3RECOMP_BUILD_TESTS)
                 runtime/platform/host_clock.c
                 runtime/platform/host_wait.c
                 runtime/diag/lifter_abi.c
+                runtime/diag/ps3_log.c
                 runtime/config/config.cpp
                 runtime/diag/stop.cpp)
             target_include_directories(test_spu_effect_port PRIVATE
@@ -1452,6 +1454,7 @@ if(PS3RECOMP_BUILD_TESTS)
                 runtime/platform/host_clock.c
                 runtime/platform/host_wait.c
                 runtime/diag/lifter_abi.c
+                runtime/diag/ps3_log.c
                 runtime/config/config.cpp
                 runtime/diag/stop.cpp)
             set(SPU_XDIFF_SOURCES
@@ -1838,6 +1841,7 @@ if(PS3RECOMP_BUILD_TESTS)
         add_executable(test_game_host_paths
             libs/system/tests/test_game_host_paths.c
             runtime/diag/stop.cpp
+            runtime/diag/ps3_log.c       # config.cpp configures the run log
             runtime/config/config.cpp)   # game.free_space_raw
         target_include_directories(test_game_host_paths PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/include"
