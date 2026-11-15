@@ -747,6 +747,27 @@ class TestLanesumCompare(unittest.TestCase):
 
 
 # ------------------------------------------------------------------------------------------------ dry run
+def log_runtime_objects(workdir):
+    """Objects for the run log the host driver's PS3_LOG sites need.
+
+    host/host_interp.c includes runtime/spu/spu_interp.c, whose migrated diagnostics call ps3_log_*;
+    runtime/diag/ps3_log.c is the one implementation (a null stub would test a path a title never
+    runs). It calls ps3_config_get, ps3_stop and ps3_stop_set_mirror, which config.cpp and stop.cpp
+    provide, so the driver is linked with c++ rather than cc."""
+    cflags = ["-std=gnu11", "-O1", "-w", "-I", os.path.join(REPO, "include"),
+              "-I", os.path.join(REPO, "runtime/spu"), "-I", os.path.join(REPO, "runtime/platform")]
+    cxxflags = ["-std=c++20", "-O1", "-UNDEBUG", "-I", os.path.join(REPO, "include")]
+    sources = ((os.path.join(REPO, "runtime", "diag", "ps3_log.c"), "cc", cflags),
+               (os.path.join(REPO, "runtime", "config", "config.cpp"), os.environ.get("CXX", "c++"), cxxflags),
+               (os.path.join(REPO, "runtime", "diag", "stop.cpp"), os.environ.get("CXX", "c++"), cxxflags))
+    objs = []
+    for src, compiler, flags in sources:
+        obj = os.path.join(workdir, os.path.basename(src) + ".o")
+        subprocess.run([compiler, *flags, "-c", src, "-o", obj], check=True, capture_output=True)
+        objs.append(obj)
+    return objs
+
+
 def build_dry_run(workdir, mutant=False):
     """Builds the SPU ELF (make, native toolchain only) and the host driver; returns (elf, host_binary).
 
@@ -784,7 +805,8 @@ def build_dry_run(workdir, mutant=False):
         subprocess.run(["cc", "-std=gnu11", "-O1", "-Wno-unused-function", "-Wno-unused-variable", "-c", os.path.join(PROBE, src), "-o", o] + extra,
                        check=True, capture_output=True)
         objs.append(o)
-    subprocess.run(["cc"] + objs + ["-pthread", "-lm", "-o", host], check=True, capture_output=True)
+    objs += log_runtime_objects(workdir)
+    subprocess.run([os.environ.get("CXX", "c++")] + objs + ["-pthread", "-lm", "-o", host], check=True, capture_output=True)
     return elf, host
 
 
@@ -1158,7 +1180,8 @@ class TestHostWithoutConsole(unittest.TestCase):
                             os.path.join(PROBE, src), "-o", o] + extra, check=True, capture_output=True)
             objs.append(o)
         cls.host = os.path.join(cls.work, "spuexh_host")
-        subprocess.run(["cc"] + objs + ["-pthread", "-lm", "-o", cls.host], check=True, capture_output=True)
+        objs += log_runtime_objects(cls.work)
+        subprocess.run([os.environ.get("CXX", "c++")] + objs + ["-pthread", "-lm", "-o", cls.host], check=True, capture_output=True)
         # the outdir validator alone, exercised with the same core source the console build compiles
         probe_src = os.path.join(cls.work, "outdir_probe.c")
         with open(probe_src, "w") as f:

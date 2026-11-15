@@ -25,6 +25,11 @@ def build(tree, bench, out, tmp):
     srcs = [bench, t / 'tests/sync_stress/test_shims.c', t / 'runtime/syscalls/sys_event.c',
             t / 'runtime/syscalls/sys_semaphore.c', t / 'runtime/syscalls/sys_cond.c',
             t / 'runtime/syscalls/sys_mutex.c', t / 'runtime/platform/win32_compat.c']
+    # sys_event.c reaches spu_context.h, whose diagnostics log through ps3_log. An older tree used for
+    # comparison predates the log and does not have it.
+    has_log = (t / 'runtime/diag/ps3_log.c').exists()
+    if has_log:
+        srcs.append(t / 'runtime/diag/ps3_log.c')
     for extra in ('host_clock.c', 'host_wait.c'):
         if (t / 'runtime/platform' / extra).exists():
             srcs.append(t / 'runtime/platform' / extra)
@@ -40,6 +45,11 @@ def build(tree, bench, out, tmp):
     subprocess.run([os.environ.get('CXX', 'c++'), '-std=c++20', '-O1', '-w', '-I' + str(t / 'include'), '-c',
                     str(t / 'runtime/diag/stop.cpp'), '-o', str(o)], check=True)
     objs.append(str(o))
+    if has_log:
+        o = Path(tmp) / f'{out.name}-config.o'
+        subprocess.run([os.environ.get('CXX', 'c++'), '-std=c++20', '-O1', '-w', '-I' + str(t / 'include'), '-c',
+                        str(t / 'runtime/config/config.cpp'), '-o', str(o)], check=True)
+        objs.append(str(o))
     subprocess.run([os.environ.get('CXX', 'c++'), *objs, '-Wl,-dead_strip' if sys.platform == 'darwin' else '-Wl,--gc-sections',
                     '-pthread', '-lm', '-o', str(out)], check=True)
 

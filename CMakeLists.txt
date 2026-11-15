@@ -968,8 +968,13 @@ if(PS3RECOMP_BUILD_TESTS)
 
     if(NOT WIN32)
         # The vector single-precision ops against the exact per-lane references.
+        # spu_helpers.h's references reach spu_unsupported, which logs through ps3_log; without the
+        # implementation GNU ld leaves ps3_log_site_admit undefined (Mach-O's dead_strip hid it).
         add_executable(test_spu_float_exact
-            runtime/spu/tests/test_spu_float_exact.c)
+            runtime/spu/tests/test_spu_float_exact.c
+            runtime/diag/ps3_log.c
+            runtime/config/config.cpp
+            runtime/diag/stop.cpp)
         target_include_directories(test_spu_float_exact PRIVATE include runtime/spu)
         target_compile_options(test_spu_float_exact PRIVATE -UNDEBUG)
         target_link_libraries(test_spu_float_exact PRIVATE m)
@@ -977,7 +982,10 @@ if(PS3RECOMP_BUILD_TESTS)
         set_tests_properties(spu_float_exact PROPERTIES TIMEOUT 300)
         # The vector forms against the scalar per-lane forms, directly.
         add_executable(test_spu_float_vector_scalar
-            runtime/spu/tests/test_spu_float_vector_scalar.c)
+            runtime/spu/tests/test_spu_float_vector_scalar.c
+            runtime/diag/ps3_log.c
+            runtime/config/config.cpp
+            runtime/diag/stop.cpp)
         target_include_directories(test_spu_float_vector_scalar PRIVATE include runtime/spu)
         target_compile_options(test_spu_float_vector_scalar PRIVATE -UNDEBUG)
         target_link_libraries(test_spu_float_vector_scalar PRIVATE m)
@@ -993,7 +1001,10 @@ if(PS3RECOMP_BUILD_TESTS)
         # fi and cflts (NEON on ARM64) against their scalar references, in the
         # default FPCR and under round-toward-zero plus flush-to-zero.
         add_executable(test_spu_fi_cflts_neon
-            runtime/spu/tests/test_spu_fi_cflts_neon.c)
+            runtime/spu/tests/test_spu_fi_cflts_neon.c
+            runtime/diag/ps3_log.c
+            runtime/config/config.cpp
+            runtime/diag/stop.cpp)
         target_include_directories(test_spu_fi_cflts_neon PRIVATE include runtime/spu)
         target_compile_options(test_spu_fi_cflts_neon PRIVATE -UNDEBUG)
         target_link_libraries(test_spu_fi_cflts_neon PRIVATE m)
@@ -1494,7 +1505,11 @@ if(PS3RECOMP_BUILD_TESTS)
             # docs/SPU_XDIFF.md section 7.8, on crafted inputs (asan preset).
             add_executable(test_spu_xdiff_fixture
                 runtime/spu/tests/test_spu_xdiff_fixture.c
-                runtime/spu/xdiff/spu_xdiff_fixture.c)
+                runtime/spu/xdiff/spu_xdiff_fixture.c
+                # spu_context.h's copy probe logs through ps3_log; GNU ld needs the implementation.
+                runtime/diag/ps3_log.c
+                runtime/config/config.cpp
+                runtime/diag/stop.cpp)
             target_include_directories(test_spu_xdiff_fixture PRIVATE include runtime runtime/spu runtime/platform)
             add_test(NAME spu_xdiff_fixture COMMAND test_spu_xdiff_fixture)
             set_tests_properties(spu_xdiff_fixture PROPERTIES LABELS "spu;t0" TIMEOUT 120)

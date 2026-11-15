@@ -41,6 +41,12 @@ void ps3_stop_spu_label_window(const char* func,uint32_t cmd,uint64_t ea,uint32_
                                uint32_t tag,uint64_t count,const ps3_stop_site* site)
 { (void)func;(void)cmd;(void)ea;(void)size;(void)tag;(void)count;(void)site;
   fprintf(stdout,"FAIL: spu-label-window stop\n");exit(2); }
+/* Runtime functions outside the path under test. ps3_log_configure (runtime/diag/ps3_log.c) reads
+ * the configuration and installs the stop mirror; this fixture never configures a log. */
+static ps3_config s_test_config;
+const ps3_config* ps3_config_get(void) { return &s_test_config; }
+void ps3_stop_set_mirror(ps3_stop_quiesce_fn quiesce, ps3_stop_mirror_fn mirror)
+{ (void)quiesce; (void)mirror; }
 
 static void check(int ok,const char* what)
 { if(!ok){fprintf(stdout,"FAIL: %s\n",what);exit(2);} }

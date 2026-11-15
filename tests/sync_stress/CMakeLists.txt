@@ -60,12 +60,14 @@ add_executable(sync_stress
     "${RUNTIME_SYNC_DIR}/sys_semaphore.c"
     "${RUNTIME_SYNC_DIR}/sys_event.c"
     "${RUNTIME_SYNC_DIR}/sys_rwlock.c"
-    # sys_event.c reports a lost internal delivery through ps3_stop. The stop
-    # implementation is not part of the sync code under test, so it comes from
-    # the real tree even when PS3RECOMP_TREE_ROOT is a seeded-bug mirror.
+    # sys_event.c reports a lost internal delivery through ps3_stop and reaches spu_context.h, whose
+    # copy diagnostics log through ps3_log. Neither is part of the sync code under test, so they come
+    # from the real tree even when PS3RECOMP_TREE_ROOT is a seeded-bug mirror.
+    "${PS3RECOMP_ROOT}/runtime/diag/ps3_log.c"
+    "${PS3RECOMP_ROOT}/runtime/config/config.cpp"
     "${PS3RECOMP_ROOT}/runtime/diag/stop.cpp"
 )
-# sys_event.c now reaches ps3_stop, whose implementation is C++.
+# sys_event.c now reaches ps3_stop and ps3_log, whose implementations are C++.
 set_target_properties(sync_stress PROPERTIES LINKER_LANGUAGE CXX)
 if(NOT WIN32)
     # The Win32 handle, wait and thread API the harness drives.
@@ -204,7 +206,9 @@ endif()
 add_executable(test_event_queue_destroy
     test_event_queue_destroy.c test_shims.c
     "${RUNTIME_SYNC_DIR}/sys_event.c"
-    # sys_event.c reaches ps3_stop (see sync_stress above); its implementation is C++.
+    # sys_event.c reaches ps3_stop and ps3_log (see sync_stress above).
+    "${PS3RECOMP_ROOT}/runtime/diag/ps3_log.c"
+    "${PS3RECOMP_ROOT}/runtime/config/config.cpp"
     "${PS3RECOMP_ROOT}/runtime/diag/stop.cpp")
 target_compile_definitions(test_event_queue_destroy PRIVATE PS3_SYNC_TEST_HOOKS)
 set_target_properties(test_event_queue_destroy PROPERTIES LINKER_LANGUAGE CXX)
@@ -252,6 +256,8 @@ if(NOT WIN32)
             "${RUNTIME_SYNC_DIR}/sys_cond.c"
             "${RUNTIME_SYNC_DIR}/sys_semaphore.c"
             "${RUNTIME_SYNC_DIR}/sys_event.c"
+            "${PS3RECOMP_ROOT}/runtime/diag/ps3_log.c"
+            "${PS3RECOMP_ROOT}/runtime/config/config.cpp"
             "${PS3RECOMP_ROOT}/runtime/diag/stop.cpp"
             "${PS3RECOMP_TREE_ROOT}/runtime/platform/tests/host_wait_fake.c")
         set_target_properties(test_timeout_monotonic_${_be} PROPERTIES LINKER_LANGUAGE CXX)
@@ -270,6 +276,8 @@ if(NOT WIN32)
             test_timer_monotonic.c test_shims.c
             "${RUNTIME_SYNC_DIR}/sys_timer.c"
             "${RUNTIME_SYNC_DIR}/sys_event.c"
+            "${PS3RECOMP_ROOT}/runtime/diag/ps3_log.c"
+            "${PS3RECOMP_ROOT}/runtime/config/config.cpp"
             "${PS3RECOMP_ROOT}/runtime/diag/stop.cpp"
             "${PS3RECOMP_TREE_ROOT}/runtime/platform/win32_compat.c"
             "${PS3RECOMP_TREE_ROOT}/runtime/platform/tests/host_wait_fake.c")

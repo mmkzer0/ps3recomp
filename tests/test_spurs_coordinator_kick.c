@@ -4,6 +4,7 @@
  * libs/spurs/cellSpurs.c; no timing is measured: a missing wake leaves the
  * waiter below asleep forever and the driver's timeout fails the test. */
 #include <ps3emu/ps3types.h>
+#include <ps3emu/config.h>
 #include "../libs/spurs/cellSpurs.c"
 #include <assert.h>
 
@@ -16,6 +17,17 @@ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (vo
 void ppu_resv_break_store(uint64_t ea) { (void)ea; }
 void sys_event_queue_cancel_by_id(u32 id) { (void)id; }
 void sys_event_queue_uncancel_by_id(u32 id) { (void)id; }
+/* Runtime functions outside the path under test. cellSpurs.c's page is compiled in but its
+ * diagnostics are never reached; ps3_log_configure installs the stop mirror and reads the
+ * configuration only when a log is configured. */
+static ps3_config s_test_config;
+const ps3_config* ps3_config_get(void) { return &s_test_config; }
+void ps3_stop_set_mirror(ps3_stop_quiesce_fn quiesce, ps3_stop_mirror_fn mirror)
+{ (void)quiesce; (void)mirror; }
+PS3_NORETURN void ps3_stop(ps3_stop_kind kind, const char* what, const char* remedy,
+                           const ps3_stop_field* fields, size_t nfields, const ps3_stop_site* site)
+{ (void)kind; (void)remedy; (void)fields; (void)nfields; (void)site;
+  fprintf(stderr, "unexpected stop: %s\n", what); abort(); }
 
 extern void (*g_spu_line_commit_hook)(uint32_t);
 
