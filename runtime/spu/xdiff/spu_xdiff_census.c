@@ -96,6 +96,7 @@ static const spu_xdiff_member s_members[] = {
     M(job_rt_ls2,             CARRIED), /* UNIT.job_rt_ls2 (spurs_job.c:944) */
     M(stop_request,           HOST),    /* written by another host thread; init clears it */
     M(coh_listed,             HOST),    /* coherency registration, owned by the host; a built context is not listed */
+    M(budget,                 HOST),    /* the budgeted twin's counter: the replay arms it for a twin subject, and no carried state reads it */
 };
 
 #undef M

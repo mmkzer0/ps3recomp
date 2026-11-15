@@ -284,6 +284,9 @@ typedef struct spu_context {
      * the taskset-PM emulation must read the code, not just halt. */
     uint32_t stop_code;
     #define SPU_STATUS_SINGLE_STEP  0x10
+    /* Not a hardware status: the budgeted twin ran out of budget and unwound
+     * (spu_lift_budget_exhausted). The replay reads it after the halt. */
+    #define SPU_STATUS_BUDGET_EXHAUSTED 0x20
 
     /* SPU thread identification */
     uint32_t spu_id;
@@ -545,6 +548,17 @@ typedef struct spu_context {
      * lock; read by the context's own thread and by the fixtures that assert
      * registration. */
     int coh_listed;
+
+    /* Back-edge budget of the budgeted twin (docs/SPU_XDIFF.md section 10): the
+     * number of backward or cross-function transfers the twin may still make.
+     * Only code compiled with SPU_LIFT_BUDGET reads or writes it (SPU_LIFT_BACKEDGE
+     * below); the production object never touches it and a context built by
+     * spu_context_init holds 0, so a twin run on a context nobody armed stops at
+     * its first transfer instead of running free. It is the LAST member on
+     * purpose: generated code addresses it, so it joins the pinned member list
+     * of include/ps3emu/lifter_abi.h, and behind every other member it moves
+     * none of them: the pin gains one term and no existing offset changes. */
+    uint64_t budget;
 } spu_context;
 
 /* event_status is written from more than one host thread: the SPU's own
@@ -1160,6 +1174,28 @@ static inline void spu_pchist_tick(const spu_context* ctx)
     }
 }
 
+/* The budget of the budgeted twin (docs/SPU_XDIFF.md section 10). The twin is
+ * the lifter's own source compiled a second time with -DSPU_LIFT_BUDGET; in
+ * the production compilation this macro is an empty statement and the object
+ * carries no trace of it. Under the definition every transfer that can close
+ * a loop counts one off ctx->budget -- a backward goto, a cross-function
+ * transfer (SPU_DIRECT), a return or indirect branch that goes through the
+ * trampoline, a drain hop -- and the transfer that finds it at 0 unwinds
+ * through spu_halt (spu_drain.c) with SPU_STATUS_BUDGET_EXHAUSTED. A loop has
+ * a backward edge, so no loop in the twin can run free. The runtime's own
+ * drain loops are not instrumented, and need not be: every transfer they run
+ * was queued by one of the sites above. */
+SPU_PORT_NORETURN void spu_lift_budget_exhausted(spu_context* ctx);   /* spu_drain.c */
+#ifdef SPU_LIFT_BUDGET
+#define SPU_LIFT_BACKEDGE(ctx) do {                                       \
+        if (SPU_PORT_UNLIKELY((ctx)->budget == 0))                        \
+            spu_lift_budget_exhausted(ctx);                               \
+        (ctx)->budget--;                                                  \
+    } while (0)
+#else
+#define SPU_LIFT_BACKEDGE(ctx) ((void)0)
+#endif
+
 /* Drain the pending trampoline chain: run each queued transfer target until
  * none remain. The one central hook site for the faithful execution model. */
 #define SPU_DRAIN(ctx) do {                                    \
@@ -1180,6 +1216,7 @@ static inline void spu_pchist_tick(const spu_context* ctx)
             }                                                              \
             void (*_tf)(spu_context*) = g_spu_trampoline_fn;    \
             g_spu_trampoline_fn = 0;                            \
+            SPU_LIFT_BACKEDGE(ctx);                             \
             spu_drain_hop((ctx), _tf);                          \
             if ((ctx)->int_enable &&                            \
                 ((ctx)->event_status & (ctx)->event_mask))      \
@@ -1219,6 +1256,7 @@ void spu_direct_init(void);
 #endif
 #ifdef SPU_DIRECT_TAILCALLS
 #define SPU_DIRECT(ctx, PC, FN) do {                                          \
+        SPU_LIFT_BACKEDGE(ctx);                                               \
         const uint32_t _dpc = (uint32_t)(PC);                                 \
         (ctx)->pc = _dpc;                                                     \
         if (__builtin_expect(__atomic_load_n(&g_spu_direct, __ATOMIC_RELAXED) > 0, 1) && (_dpc & SPU_LS_MASK) && \
@@ -1230,6 +1268,7 @@ void spu_direct_init(void);
     } while (0)
 #else
 #define SPU_DIRECT(ctx, PC, FN) do {                                          \
+        SPU_LIFT_BACKEDGE(ctx);                                               \
         (ctx)->pc = (PC);                                                     \
         g_spu_trampoline_fn = FN;                                             \
         return;                                                               \
@@ -1239,11 +1278,14 @@ void spu_direct_init(void);
 /* Depth-aware SPU link return (`bi $r0`): host `return` while a matched
  * brsl/bisl frame is live (host_depth>0); at 0 the frame was destroyed (task
  * resume / restack unwind) so dispatch to the link register instead -- faithful
- * to CBEA `bi` (branch to word 0 of RA). pc set unconditionally. */
+ * to CBEA `bi` (branch to word 0 of RA). pc set unconditionally. A host
+ * return is no loop edge; the dispatch is, and counts. */
 #define SPU_RET(ctx) do {                                      \
         (ctx)->pc = (ctx)->gpr[0]._u32[0];                     \
-        if ((ctx)->host_depth == 0)                            \
+        if ((ctx)->host_depth == 0) {                          \
+            SPU_LIFT_BACKEDGE(ctx);                            \
             g_spu_trampoline_fn = spu_indirect_branch;         \
+        }                                                      \
         return;                                                \
     } while (0)
 
@@ -1253,7 +1295,14 @@ void spu_direct_init(void);
  * the guest is going, and spu_drain_call's return-address check can then
  * never match -- it restarts dispatch from r0's stale value instead. Same
  * host-frame return as SPU_RET, publishing the register actually branched. */
-#define SPU_RET_REG(ctx, n) do {                                       (ctx)->pc = (ctx)->gpr[n]._u32[0];                             if ((ctx)->host_depth == 0)                                        g_spu_trampoline_fn = spu_indirect_branch;                 return;                                                    } while (0)
+#define SPU_RET_REG(ctx, n) do {                               \
+        (ctx)->pc = (ctx)->gpr[n]._u32[0];                     \
+        if ((ctx)->host_depth == 0) {                          \
+            SPU_LIFT_BACKEDGE(ctx);                            \
+            g_spu_trampoline_fn = spu_indirect_branch;         \
+        }                                                      \
+        return;                                                \
+    } while (0)
 
 #ifdef __cplusplus
 } /* extern "C" */

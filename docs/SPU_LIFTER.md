@@ -47,7 +47,8 @@ ABI, and generated ABI. The pinned layout signature in
 `include/ps3emu/lifter_abi.h` covers the fields accessed by generated code and
 its inline helpers/macros: `gpr`, `pc`, `status`, `stop_code`, `image_id`,
 `event_status`, `event_mask`, `srr0`, `int_enable`, `host_depth`, `reloc_delta`,
-`ls`, `policy_mode`, and `steps`. A changed member offset or size requires
+`ls`, `policy_mode`, `steps`, and `budget` (the last member of the context; ABI 2).
+A changed member offset or size requires
 updating the signature pin and bumping the runtime ABI together;
 `tests/gates/test_spu_lifter_abi.py` enforces the pin.
 
@@ -68,6 +69,22 @@ writing a registry, which covers an existing `spu_recomp.c`, `--skip-lift`,
 `--relift` and a caller-supplied `--lifter`; the template's `SPU_DIR` helper
 runs it at configure time. A lift from before the gate therefore fails the
 build instead of linking without a check.
+
+## The budgeted twin
+
+Every back-edge site the lifter emits (a backward `goto`, a cross-function
+`SPU_DIRECT`, a return or indirect branch through the trampoline) carries
+`SPU_LIFT_BACKEDGE(ctx)`, which is an empty statement unless the source is
+compiled with `-DSPU_LIFT_BUDGET`: the production object is unchanged. With
+the definition the macro counts `ctx->budget` down, and a lift that finds it at
+0 unwinds through `spu_halt` with `SPU_STATUS_BUDGET_EXHAUSTED`
+(`docs/SPU_XDIFF.md` section 10). The generated header renames the twin's
+symbols (suffix `_budget`) inside the same `#ifdef`, so both compilations link
+into one program. `tools/build_spu_workloads.py --budget-twin` (CMake:
+`PS3RECOMP_SPU_BUDGET_TWIN=ON`) writes each image's `spu_recomp_budget.c`,
+which defines `SPU_LIFT_BUDGET` and includes `spu_recomp.c`, and registers the
+twin beside the production entry with `spu_workload_register_twin`. A twin
+doubles the lifted code a title compiles, so it is off by default.
 
 ## Relationship to the PPU fallback approach (read `SPU_FALLBACK.md` first)
 

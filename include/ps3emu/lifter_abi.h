@@ -42,9 +42,9 @@ void ps3_spu_lifter_abi_check(uint32_t got);
  * Windows' LLP64, which moves every pinned field after the channels. Each
  * supported model has its own measured pin; an unlisted model is a compile
  * error, never a guess. */
-#define SPU_RUNTIME_LIFTER_LP64_CONTEXT_LAYOUT_SIGNATURE_PIN UINT64_C(0x8B375EA16245430D)
-#define SPU_RUNTIME_LIFTER_WIN64_CONTEXT_LAYOUT_SIGNATURE_PIN UINT64_C(0x918F8F23859E16E5)
-#define SPU_RUNTIME_LIFTER_ABI 1u
+#define SPU_RUNTIME_LIFTER_LP64_CONTEXT_LAYOUT_SIGNATURE_PIN UINT64_C(0x38CBFC7B6255D14D)
+#define SPU_RUNTIME_LIFTER_WIN64_CONTEXT_LAYOUT_SIGNATURE_PIN UINT64_C(0x410F0D5C181549BD)
+#define SPU_RUNTIME_LIFTER_ABI 2u
 #if defined(_WIN32)
 #  if !defined(_WIN64)
 #    error "SPU lifter ABI: no verified spu_context layout pin for 32-bit Windows"
@@ -90,10 +90,12 @@ void ps3_spu_lifter_abi_check(uint32_t got);
     PS3EMU_SPULIFTER_LAYOUT_MEMBER( \
         PS3EMU_SPULIFTER_LAYOUT_MEMBER( \
             PS3EMU_SPULIFTER_LAYOUT_MEMBER( \
-                SPU_RUNTIME_LIFTER_CONTEXT_LAYOUT_SIGNATURE_BASE(type), \
-                type, ls), \
-            type, policy_mode), \
-        type, steps)
+                PS3EMU_SPULIFTER_LAYOUT_MEMBER( \
+                    SPU_RUNTIME_LIFTER_CONTEXT_LAYOUT_SIGNATURE_BASE(type), \
+                    type, ls), \
+                type, policy_mode), \
+            type, steps), \
+        type, budget)
 
 /* Compare the ABI the linked lift was generated for (the `ppu_lifter_abi`
  * symbol its source defines) with PPU_RUNTIME_LIFTER_ABI. Returns when they

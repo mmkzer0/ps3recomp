@@ -78,6 +78,11 @@ typedef struct {
     /* Masked registrations only (var_len != 0): the image is `size` bytes and
      * its fingerprint takes [var_off, var_off + var_len) as zero. */
     uint32_t            size, var_off, var_len;
+    /* The budgeted twin of `fn` (spu_workload_register_twin), NULL when the
+     * image has none. It has its own image id: its indirect branches must
+     * resolve to the twin's functions, never back into the production body. */
+    spu_lifted_entry_fn twin_fn;
+    int                 twin_image_id;
 } spu_workload_entry;
 
 static spu_workload_entry s_registry[SPU_WORKLOAD_MAX];
@@ -92,6 +97,7 @@ void spu_workload_register_img(uint64_t fingerprint, spu_lifted_entry_fn fn,
             s_registry[i].fn       = fn;
             s_registry[i].image_id = image_id;
             s_registry[i].name     = name;
+            s_registry[i].twin_fn  = NULL;         /* a twin belongs to the body it was registered for */
             return;
         }
     }
@@ -127,6 +133,38 @@ spu_lifted_entry_fn spu_workload_find_img(uint64_t fingerprint, int* image_id_ou
         if (s_registry[i].fp == fingerprint) {
             if (image_id_out) *image_id_out = s_registry[i].image_id;
             return s_registry[i].fn;
+        }
+    if (image_id_out) *image_id_out = 0;
+    return NULL;
+}
+
+void spu_workload_register_twin(uint64_t fingerprint, spu_lifted_entry_fn fn, int image_id)
+{
+    /* The twin is registered after its production body, under the same
+     * fingerprint; one without a body to belong to is a registration error,
+     * and an image id of 0 would match every image (spu_lookup). */
+    if (!fn || image_id <= 0) {
+        fprintf(stderr, "[spu_workload] bad twin registration for 0x%016llX (image id %d)\n",
+                (unsigned long long)fingerprint, image_id);
+        return;
+    }
+    for (unsigned i = 0; i < s_registry_count; i++)
+        if (s_registry[i].fp == fingerprint) {
+            s_registry[i].twin_fn       = fn;
+            s_registry[i].twin_image_id = image_id;
+            return;
+        }
+    fprintf(stderr, "[spu_workload] twin registered for 0x%016llX, which has no registered body; dropped\n",
+            (unsigned long long)fingerprint);
+}
+
+spu_lifted_entry_fn spu_workload_find_twin(uint64_t fingerprint, int* image_id_out)
+{
+    for (unsigned i = 0; i < s_registry_count; i++)
+        if (s_registry[i].fp == fingerprint) {
+            if (!s_registry[i].twin_fn) break;
+            if (image_id_out) *image_id_out = s_registry[i].twin_image_id;
+            return s_registry[i].twin_fn;
         }
     if (image_id_out) *image_id_out = 0;
     return NULL;

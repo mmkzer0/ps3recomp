@@ -31,7 +31,9 @@ void              spu_xdiff_shadow_free(spu_xdiff_shadow* s);
 
 typedef struct spu_xdiff_replay_options {
     uint32_t subject_tier; /* SPU_TIER_INTERP, or SPU_TIER_LIFTED for the image's registered body */
-    uint64_t budget;       /* T0: instructions before `void` / `budget`; 0: none */
+    uint64_t budget;       /* before `void` / `budget`; 0: none. T0: instructions. A registered body: backward and
+                            * cross-function transfers of the image's budgeted twin when one is registered
+                            * (spu_workload_find_twin), else the budget does not apply to it */
 } spu_xdiff_replay_options;
 
 /* Replays `f` into `s` and returns the verdict; `out` holds the whole record

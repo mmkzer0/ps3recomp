@@ -63,6 +63,18 @@ spu_lifted_entry_fn spu_workload_find(uint64_t fingerprint);
 /* As spu_workload_find, but also returns the image's indirect-branch table id. */
 spu_lifted_entry_fn spu_workload_find_img(uint64_t fingerprint, int* image_id_out);
 
+/* The budgeted twin of a registered body (docs/SPU_XDIFF.md section 10): the
+ * image's generated source compiled a second time with -DSPU_LIFT_BUDGET, with
+ * its own entry and its own indirect-branch table id (the id its registration
+ * ran under spu_begin_image). It belongs to the entry registered under
+ * `fingerprint`; spu_workload_find_img keeps answering with the production
+ * body, and registering that fingerprint again drops the twin. A twin whose
+ * body is not registered, or whose id is not above 0, is refused with a
+ * diagnostic. spu_workload_find_twin returns NULL when the image has none and
+ * then leaves *image_id_out at 0. */
+void spu_workload_register_twin(uint64_t fingerprint, spu_lifted_entry_fn fn, int image_id);
+spu_lifted_entry_fn spu_workload_find_twin(uint64_t fingerprint, int* image_id_out);
+
 /* Register an image whose loaded bytes include an area the loading code fills
  * in on every load: a parameter block of pointers and per-level values that
  * the PPU writes into the program before it DMAs it into a raw SPU. Its bytes

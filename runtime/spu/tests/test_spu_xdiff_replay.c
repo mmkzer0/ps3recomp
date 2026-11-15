@@ -760,7 +760,11 @@ static void t_runner(void)
     check_json_fields("equal", g_run.out);
     out_has("equal", "\"verdict\":\"equal\""); out_has("equal", "\"exit_code\":0"); out_has("equal", "\"reason\":\"none\"");
     out_has("equal", "\"class\":\"none\""); out_has("equal", "\"first\":{\"effect_index\":null");
-    out_has("equal", "\"subject\":{\"tier\":1,\"lifter_abi\":1");
+    {
+        char want[64];
+        snprintf(want, sizeof want, "\"subject\":{\"tier\":1,\"lifter_abi\":%u", (unsigned)SPU_RUNTIME_LIFTER_ABI);
+        out_has("equal", want);
+    }
     runner("equal, one line", 0, pbase, NULL, NULL, NULL);
     CHECK(!strncmp(g_run.out, "equal none ", 11) && strchr(g_run.out, '\n') == g_run.out + strlen(g_run.out) - 1, "the human line: %s", g_run.out);
 
