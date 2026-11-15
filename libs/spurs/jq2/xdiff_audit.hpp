@@ -52,7 +52,23 @@ enum Disposition : std::uint8_t {
 /* spu_xdiff_reason ids are below this (the largest is no-body, 65). */
 inline constexpr std::size_t kReasonSlots = 66;
 
-/* What the audit counts for one image. Nodes live as long as the process; the audit thread and the workers update them. */
+/* The most fixtures the audit writes for one image, differences and void / unlifted-branch together, and so the most
+ * distinct subject pcs of a void it remembers and names: one address that can be replayed, one fixture
+ * (docs/SPU_XDIFF.md section 11). */
+inline constexpr std::size_t kMaxFixturesPerImage = 16;
+
+/* The distinct local store addresses of a void / unlifted-branch seen for one image: the coverage frontier a lifted
+ * subject reached, where no lifted code covers the bytes the authority ran. Only the audit thread touches this --
+ * a replay verdict is reached on no other thread -- so it is plain state with no atomics. The bound is the fixture
+ * bound: an address past it could not have a fixture, and naming it would only grow the log. */
+struct VoidPcs {
+    std::array<std::uint32_t, kMaxFixturesPerImage> pc{};
+    std::size_t count = 0;
+    bool named_over = false; /* the one line that says further addresses are counted and not named */
+};
+
+/* What the audit counts for one image. Nodes live as long as the process; the audit thread and the workers update them
+ * (void_pcs is the audit thread's alone). */
 struct ImageAudit {
     std::atomic<std::uint64_t> jobs{0};          /* jobs of the image counted for the period: the first is job 0 */
     std::atomic<std::uint64_t> sampled{0};       /* chosen by the period (every job under `all`) */
@@ -67,11 +83,13 @@ struct ImageAudit {
     std::atomic<std::uint64_t> verdict_other{0}; /* a verdict id outside the table above */
     std::atomic<std::uint64_t> reason[kReasonSlots]{}; /* by spu_xdiff_reason id, of every verdict (equal is `none`) */
     std::atomic<std::uint64_t> differ_visible{0}, differ_latent{0};
-    std::atomic<std::uint64_t> fixtures{0};      /* difference fixtures written */
-    std::atomic<std::uint64_t> fixtures_over{0}; /* differences past the per-image bound of 16, counted and not written */
+    std::atomic<std::uint64_t> fixtures{0};      /* fixtures written: differences and void / unlifted-branch */
+    std::atomic<std::uint64_t> fixtures_over{0}; /* samples past the per-image bound of kMaxFixturesPerImage, counted
+                                                    and not written */
     std::atomic<std::uint64_t> fixtures_failed{0};
     std::atomic<bool> named_no_body{false}, named_no_twin{false};
     std::atomic<bool> named_void[kReasonSlots]{}; /* a void of this reason has been named for the image */
+    VoidPcs void_pcs; /* the audit thread's: the pcs of the image's void / unlifted-branch samples */
 };
 
 /* A plain copy of an ImageAudit, for a report or a test. */

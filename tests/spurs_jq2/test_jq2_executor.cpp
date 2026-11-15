@@ -4507,6 +4507,27 @@ void au_miss_body(spu_context* c)
     c->lift_miss = 300;
 }
 
+/* The local store address a gap body ends at: no lifted code covers it, so a lifted subject that ends here is the
+ * image's coverage frontier (void / unlifted-branch), and its pc is the address to name. */
+constexpr std::uint32_t kAuGap = 0x20000;
+
+/* A lift whose indirect branch lands on `kAuGap + 0x40 * (serial % mod)`, where no lifted function is registered: the
+ * served resolver counts the miss and ends the run there (spu_channels.c, spu_indirect_branch_served). With `mod` 0x100
+ * each job of an image of up to 256 jobs ends at an address of its own, with 2 all its even jobs share one and all its
+ * odd jobs another. */
+void au_gap_body(spu_context* c, std::uint32_t mod)
+{
+    const std::uint32_t d = c->gpr[4]._u32[0];
+    const std::uint32_t serial = ls_word(c, d + 0x3C);
+    c->pc = kAuGap + 0x40u * (serial % mod);
+    spu_indirect_branch(c); /* no lifted entry: lift_miss++ and the run halts, with pc where the job stood */
+}
+void au_gap_each(spu_context* c) { au_gap_body(c, 0x100); }
+void au_gap_pair(spu_context* c) { au_gap_body(c, 2); }
+
+/* The pc `au_gap_body` leaves for the job with `serial` and modulus `mod`. */
+std::uint32_t au_gap_pc(std::uint32_t serial, std::uint32_t mod) { return kAuGap + 0x40u * (serial % mod); }
+
 /* An image's registration the way a title's generated one makes it: its inventory (no flags: nothing refuses it), its
  * body, its budgeted twin (a lifted shadow needs one), and promotion for the images job_body=lifted may run. */
 void au_register(std::uint32_t ea, spu_lifted_entry_fn body, spu_lifted_entry_fn twin, std::int32_t id = 40, bool promote = false,
@@ -4631,6 +4652,24 @@ AuditCounters au_counters(std::uint64_t fp)
     const auto c = audit_counters(fp);
     CHECK(c.has_value(), "the audit counted nothing for image 0x%016llX", (unsigned long long)fp);
     return c.value_or(AuditCounters{});
+}
+
+/* A void / unlifted-branch fixture replayed the way the audit ran it: the image's registered twin, under a budget. The
+ * frontier is a property of the recording, so the offline run must reach the same verdict at the same address. */
+void au_replay_void(const spu_xdiff_fixture& f, std::uint32_t pc)
+{
+    spu_xdiff_shadow* shadow = spu_xdiff_shadow_new();
+    CHECK(shadow != nullptr, "shadow");
+    if (shadow == nullptr) return;
+    spu_xdiff_replay_options opt{};
+    opt.subject_tier = SPU_TIER_LIFTED;
+    opt.budget = 1u << 20;
+    spu_xdiff_verdict_record v{};
+    const std::uint32_t verdict = spu_xdiff_replay(&f, &opt, shadow, &v);
+    CHECK(verdict == SPU_XDIFF_VOID && v.reason == SPU_XDIFF_R_UNLIFTED_BRANCH && v.subject_pc == pc,
+          "replay: %s / %s pc 0x%05X, wanted void / unlifted-branch pc 0x%05X", spu_xdiff_verdict_id(verdict),
+          spu_xdiff_reason_id(v.reason), v.subject_pc, pc);
+    spu_xdiff_shadow_free(shadow);
 }
 
 constexpr std::uint32_t kAuRec = 0xE00100; /* what a forked child tells its parent, in the shared arena */
@@ -5096,6 +5135,126 @@ void mode_audit_baddir()
     CHECK(c.differ == 1 && c.fixtures == 0 && c.fixtures_over == 0, "differ %llu fixtures %llu", (unsigned long long)c.differ, (unsigned long long)c.fixtures);
 }
 
+/* A lifted subject that ends at a local store address no lifted code covers is void / unlifted-branch: the authority
+ * finished and the subject reached the image's coverage frontier. The sample's fixture is written with its verdict
+ * record, one per distinct address, and every distinct address is named with `subject_pc`. Four jobs on two addresses:
+ * two fixtures, the second job of an address writing nothing, each fixture replaying to the same void at the same pc. */
+void mode_audit_gap()
+{
+    constexpr std::uint32_t kJobs = 4, kMod = 2;
+    build_image(IMAGE, Prog::transform);
+    au_register(IMAGE, &au_interp_body, &au_gap_pair);
+    const std::uint64_t fp = fp_at(IMAGE);
+    std::vector<JobSpec> specs;
+    const std::string log = capture_stderr([&] {
+        au_begin();
+        Rig rig({128, 1, false});
+        for (std::uint32_t j = 0; j < kJobs; ++j) specs.push_back(au_job(rig, j));
+        ap_wait_done(kJobs);
+        rig.teardown();
+    });
+    for (const JobSpec& s : specs) CHECK(job_ok(s), "job %u: the authority's output", s.serial);
+
+    const AuditCounters c = au_counters(fp);
+    CHECK(c.shadowed == kJobs && c.voided == kJobs && c.reason[SPU_XDIFF_R_UNLIFTED_BRANCH] == kJobs && c.differ == 0,
+          "shadowed %llu void %llu unlifted-branch %llu differ %llu", (unsigned long long)c.shadowed,
+          (unsigned long long)c.voided, (unsigned long long)c.reason[SPU_XDIFF_R_UNLIFTED_BRANCH], (unsigned long long)c.differ);
+    CHECK(c.fixtures == kMod && c.fixtures_over == 0 && c.fixtures_failed == 0, "fixtures %llu over %llu failed %llu",
+          (unsigned long long)c.fixtures, (unsigned long long)c.fixtures_over, (unsigned long long)c.fixtures_failed);
+
+    /* One worker, the jobs in order: job j is seq j + 1. The first job of each address writes its fixture; the next
+     * job on the same address writes none, and its fixture name is not on disk. */
+    std::vector<std::string> want_files;
+    for (std::uint32_t j = 0; j < kMod; ++j) want_files.push_back(xd_name(fp, 0, j + 1));
+    std::sort(want_files.begin(), want_files.end());
+    CHECK(xd_files() == want_files, "fixtures: %s", join(xd_files()).c_str());
+    for (std::uint32_t j = kJobs; j > kMod; --j) {
+        const std::uint32_t at = j - 1;
+        CHECK(!fs::exists(g_xd_dir + "/" + xd_name(fp, 0, at + 1)),
+              "job %u wrote a second fixture for the address of job %u (0x%05X)", at, at - kMod, au_gap_pc(at, kMod));
+    }
+    for (std::uint32_t j = 0; j < kMod; ++j) {
+        const std::uint32_t pc = au_gap_pc(j, kMod);
+        Fx fx;
+        if (!xd_read(xd_name(fp, 0, j + 1), fx)) continue;
+        CHECK(fx.f.has_verdict == 1 && fx.f.verdict.verdict == SPU_XDIFF_VOID &&
+                  fx.f.verdict.reason == SPU_XDIFF_R_UNLIFTED_BRANCH,
+              "job %u: has_verdict %d verdict %u reason %u", j, fx.f.has_verdict, fx.f.verdict.verdict, fx.f.verdict.reason);
+        CHECK(fx.f.verdict.subject_pc == pc, "job %u: the verdict's pc is 0x%05X, wanted 0x%05X", j, fx.f.verdict.subject_pc, pc);
+        au_replay_void(fx.f, pc);
+    }
+
+    /* The first address is named by the reason's line, the second by a line of its own; neither prints again. */
+    const auto reason = au_lines(log, "[jq2-xdiff] void image=" + xd_fp_hex(fp) + " ");
+    CHECK(reason.size() == 1 && reason[0].find("reason=unlifted-branch subject_pc=0x20000") != std::string::npos,
+          "the reason's line:\n%s", log.c_str());
+    const auto pcs = au_lines(log, "[jq2-xdiff] void-pc ");
+    CHECK(pcs.size() == 1 && pcs[0].find("image=" + xd_fp_hex(fp)) != std::string::npos &&
+              pcs[0].find("subject_pc=0x20040") != std::string::npos,
+          "the second address's line:\n%s", log.c_str());
+    CHECK(au_lines(log, "void-pc-over").empty(), "an address was said to be past the bound:\n%s", log.c_str());
+}
+
+/* The fixture bound and the naming cap hold for voids too: 20 jobs on 20 distinct addresses write 16 fixtures, count
+ * the other four, name the 16 addresses the fixtures can replay and say once that the rest are not named. */
+void mode_audit_gap_cap()
+{
+    constexpr std::uint32_t kJobs = 20, kCap = 16;
+    build_image(IMAGE, Prog::transform);
+    au_register(IMAGE, &au_interp_body, &au_gap_each);
+    const std::uint64_t fp = fp_at(IMAGE);
+    std::vector<JobSpec> specs;
+    const std::string log = capture_stderr([&] {
+        au_begin();
+        Rig rig({128, 1, false});
+        for (std::uint32_t j = 0; j < kJobs; ++j) specs.push_back(au_job(rig, j));
+        ap_wait_done(kJobs);
+        rig.teardown();
+    });
+    for (const JobSpec& s : specs) CHECK(job_ok(s), "job %u: the authority's output", s.serial);
+
+    const AuditCounters c = au_counters(fp);
+    CHECK(c.shadowed == kJobs && c.voided == kJobs && c.reason[SPU_XDIFF_R_UNLIFTED_BRANCH] == kJobs && c.differ == 0,
+          "shadowed %llu void %llu unlifted-branch %llu", (unsigned long long)c.shadowed, (unsigned long long)c.voided,
+          (unsigned long long)c.reason[SPU_XDIFF_R_UNLIFTED_BRANCH]);
+    CHECK(c.fixtures == kCap && c.fixtures_over == kJobs - kCap && c.fixtures_failed == 0, "fixtures %llu over %llu failed %llu",
+          (unsigned long long)c.fixtures, (unsigned long long)c.fixtures_over, (unsigned long long)c.fixtures_failed);
+
+    std::vector<std::string> want_files;
+    for (std::uint32_t j = 0; j < kCap; ++j) want_files.push_back(xd_name(fp, 0, j + 1));
+    std::sort(want_files.begin(), want_files.end());
+    CHECK(xd_files() == want_files, "fixtures: %s", join(xd_files()).c_str());
+    for (std::uint32_t j = 0; j < kCap; ++j) {
+        const std::uint32_t pc = au_gap_pc(j, 0x100);
+        Fx fx;
+        if (!xd_read(xd_name(fp, 0, j + 1), fx)) continue;
+        CHECK(fx.f.has_verdict == 1 && fx.f.verdict.verdict == SPU_XDIFF_VOID &&
+                  fx.f.verdict.reason == SPU_XDIFF_R_UNLIFTED_BRANCH && fx.f.verdict.subject_pc == pc,
+              "job %u: has_verdict %d verdict %u reason %u pc 0x%05X, wanted 0x%05X", j, fx.f.has_verdict,
+              fx.f.verdict.verdict, fx.f.verdict.reason, fx.f.verdict.subject_pc, pc);
+        au_replay_void(fx.f, pc);
+    }
+    for (std::uint32_t j = kCap; j < kJobs; ++j)
+        CHECK(!fs::exists(g_xd_dir + "/" + xd_name(fp, 0, j + 1)), "job %u wrote a fixture past the bound", j);
+
+    /* The 16 addresses with a fixture are named exactly once each (the first by the reason's line); the 17th distinct
+     * address prints the one suppression line, and the four past the bound are not named at all. */
+    CHECK(au_lines(log, "[jq2-xdiff] void image=" + xd_fp_hex(fp) + " ").size() == 1, "the reason's line:\n%s", log.c_str());
+    CHECK(au_lines(log, "[jq2-xdiff] void-pc ").size() == kCap - 1, "the per-address lines:\n%s", log.c_str());
+    CHECK(au_lines(log, "[jq2-xdiff] void-pc-over image=" + xd_fp_hex(fp) + " ").size() == 1, "the suppression line:\n%s",
+          log.c_str());
+    std::string named;
+    for (const std::string& l : au_lines(log, "[jq2-xdiff] void")) named += l + "\n";
+    for (std::uint32_t j = 0; j < kJobs; ++j) {
+        char pc[24];
+        std::snprintf(pc, sizeof pc, "subject_pc=0x%05X", au_gap_pc(j, 0x100));
+        if (j < kCap) CHECK(named.find(pc) != std::string::npos, "address 0x%05X has a fixture but no line:\n%s",
+                            au_gap_pc(j, 0x100), log.c_str());
+        else CHECK(named.find(pc) == std::string::npos, "address 0x%05X past the bound is named:\n%s",
+                   au_gap_pc(j, 0x100), log.c_str());
+    }
+}
+
 /* The roles are symmetric: under spu.job_body=lifted the registered body is the authority and the interpreter the
  * shadow, with no twin needed. A body that differs puts ITS output into the guest and is reported with the tiers the
  * other way round; one that equals the interpreter is `equal`. */
@@ -5358,7 +5517,9 @@ void au_prologue(const std::string& mode)
     std::string period = "1", on_divergence = "report", on_latent = "report", job_body = "interp", capture = "0", dir = g_xd_dir;
     /* `sample` drops a sample while the audit thread lags and eight are queued, which a test with more samples than that
      * must not depend on: it runs under `all`, which waits for room. */
-    if (mode == "audit-all" || mode == "audit-concurrent" || mode == "audit-fixtures-cap") xdiff = "all";
+    if (mode == "audit-all" || mode == "audit-concurrent" || mode == "audit-fixtures-cap" || mode == "audit-gap" ||
+        mode == "audit-gap-cap")
+        xdiff = "all";
     else if (mode == "audit-shared") {
         xdiff = "all";
         capture = "1";
@@ -5562,6 +5723,8 @@ int main(int argc, char** argv)
     else if (mode == "audit-host-fault") mode_audit_host_fault();
     else if (mode == "audit-fixtures-cap") mode_audit_fixtures_cap();
     else if (mode == "audit-baddir") mode_audit_baddir();
+    else if (mode == "audit-gap") mode_audit_gap();
+    else if (mode == "audit-gap-cap") mode_audit_gap_cap();
     else if (mode == "audit-lifted") mode_audit_lifted();
     else if (mode == "audit-period") mode_audit_period();
     else if (mode == "audit-trace") mode_audit_trace();
