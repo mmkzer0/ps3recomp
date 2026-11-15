@@ -353,15 +353,24 @@ until then this is a known wart.
 ### 5.6 The real path
 
 With no port, each channel operation pays one load of `ctx->port` and one
-predictable branch; the five latch writes of every DMA
-(`spu_channels.c:1126-1135`) pay nothing, and `MFC_WrTagMask`, written once
-per tag wait, pays the branch and keeps its inline store (`:1136`), so the
-registry lock stays off the real path. The pointer
-sits behind `observer` (`spu_context.h:458`), which `spu_wrch` and `spu_rdch`
-already load (`spu_channels.c:1124`, `:1477`). `spu_rchcnt` does not use the
-observer, so its context-line cost is not covered by that argument. No field
-that lifted code addresses moves (section 12.1). All hot-path cost claims
-are `[INFERENCE]` until the bench rows in section 18 are measured.
+predictable branch, the latch writes included: the test sits before the
+latch `switch` in `spu_wrch`, because a test between the latches and the
+body split the compiler's single dispatch over channel numbers and cost
+the non-latch writes 20-29%. `MFC_WrTagMask`, written once per tag wait,
+keeps its inline store, so the registry lock stays off the real path. The
+pointer sits behind `observer` (`spu_context.h:458`), which `spu_wrch` and
+`spu_rdch` already load. No field that lifted code addresses moves
+(section 12.1).
+
+Each channel body has one call site. A port half that carried its own copy
+gave `spu_mfc_atomic` and `mfc_channel_write` a second caller, clang stopped
+inlining them, and the lifted GETLLAR rows lost 4-5%. The MFC write body is
+out of line in `spu_wrch_mfc`, their one caller; inlined, its 1.2 KiB frame
+and stack-protector check were paid by every channel write. Measured with
+commit 4 (fastest of 25, six alternating rounds against `dev`, arm64 macOS,
+clang `-O2`): every `wrch`, `rdch`, `rchcnt`, `dma` and `atomic` row is within its
+before-run spread; `MFC_Size`, `MFC_TagID` and `MFC_WrTagMask` writes are
+about 10% faster.
 
 ## 6. The transcript
 
@@ -1237,7 +1246,7 @@ standalone.
 | 2 | **landed** `1b4eac28`, merged as `fd3e043f`: `spu: gate lifted code with a pinned ABI` | `tools/spu_lifter.py`, `tools/build_spu_workloads.py`, `tools/check_spu_lifter_abi.py`, `include/ps3emu/lifter_abi.h`, `runtime/diag/{lifter_abi.c,stop.cpp}`, `include/ps3emu/stop.h`, `runtime/spu/spu_workload.c`, `cmake/PS3RecompSPU.cmake`, `runtime/spu/tests/out_*`, `docs/STOPS.md`, `docs/SPU_LIFTER.md` | `tests/gates/test_spu_lifter_abi.py`: a matching ABI runs; a mismatched one stops with `lifter-abi` during registration; the (ABI, pin) pair holds; the Win64 pin matches a cross-compiled layout | section 12.1 |
 | 3 | **landed** `3d4f0596`, merged as `682d040f`: `tools: register raw SPU job images from a manifest` | `tools/spu_program_pipeline.py`, `tools/build_spu_workloads.py`, `tools/find_spu_functions.py`, `tools/gen_test_raw_job.py`, `tools/test_spu_program_pipeline.py`, `docs/SPU_LIFTER.md` | `tools/test_spu_program_pipeline.py`: a synthetic raw image registers under its whole-blob fingerprint with its channel and MFC inventory; a wrong `sha256` and a `code_end` past the blob are named errors; `code_end` reaches the lifter | sections 12.2 and 12.3 |
 | 3b | **landed** `3f243c2e`, merged as `5c20c592`: `tools: spu_program_pipeline reports event branches` (the registration part waits for 10a) | `tools/spu_program_pipeline.py`, `tools/gen_test_raw_job.py` (variants), `tools/test_spu_program_pipeline.py`, `docs/SPU_LIFTER.md`; with commit 10a also `tools/build_spu_workloads.py` (registry writer) and `runtime/spu/spu_workload.{c,h}` (a compact inventory in the registration, with the lift's `code_end` and options hash) | a synthetic raw image with `bisled`, one with a bi-family E or D branch and one with `iret` each list the site under `event_branches`; an image with none lists none | the tool test; the raw-image tests of commit 3 unchanged; with the registration part, a registered image reports its flags to the runtime |
-| 4 | `spu: effect port seam in the channel runtime` | `runtime/spu/spu_effect_port.h` (new: the draft without its `spu_effect_inventory` block), `runtime/spu/spu_context.h` (`port`, `lift_miss`), `spu_channels.c` (seam; `MFC_WrTagMask` below the port test, today's inline store kept for `port == NULL`; `spu_port_*` and `spu_port_serve_halt`; closed resolver path; the latch static assertions), `spu_dma.h`, `spu_interp.c`, `runtime/spu/tests/test_spu_effect_port.c` (new), `tests/bench/spu/` (driver) | `spu_effect_port`: a tap sees every effect of a synthetic job in order, list elements, an atomic and `MFC_WrTagMask` included; a served context completes with `vm_base == NULL` and no MFC engine created; a served context that branches to unlifted local store ends its run with `lift_miss == 1` and nothing interpreted; a serve callback that cannot answer ends the run under `spu_run_with_halt`, and with no landing pad armed the process aborts instead of continuing with a value (a child-process test) | the test, interpreted and lifted; all `spu` and `spurs` suites; the bench rows of section 18 within noise of the baseline; `tests/gates/test_spu_lifter_abi.py` green with the pin unchanged; with no port `MFC_WrTagMask` does not take the MFC registry lock |
+| 4 | **landed** `1c8a6ea7`, merged as `245c2eaf`: `spu: effect port seam in the channel runtime` | `runtime/spu/spu_effect_port.h` (new: the draft without its `spu_effect_inventory` block), `runtime/spu/spu_context.h` (`port`, `lift_miss`), `spu_channels.c` (seam; `MFC_WrTagMask` below the port test, today's inline store kept for `port == NULL`; `spu_port_*` and `spu_port_serve_halt`; closed resolver path; the latch static assertions), `spu_dma.h`, `spu_interp.c`, `runtime/spu/tests/test_spu_effect_port.c` (new), `tests/bench/spu/` (driver) | `spu_effect_port`: a tap sees every effect of a synthetic job in order, list elements, an atomic and `MFC_WrTagMask` included; a served context completes with `vm_base == NULL` and no MFC engine created; a served context that branches to unlifted local store ends its run with `lift_miss == 1` and nothing interpreted; a serve callback that cannot answer ends the run under `spu_run_with_halt`, and with no landing pad armed the process aborts instead of continuing with a value (a child-process test) | the test, interpreted and lifted; all `spu` and `spurs` suites; the bench rows of section 18 within noise of the baseline; `tests/gates/test_spu_lifter_abi.py` green with the pin unchanged; with no port `MFC_WrTagMask` does not take the MFC registry lock |
 | 5 | **landed** `c26e5864`, merged as `db5decd2`: `jq2: classify a job's end without stopping` (`spu_job_classify_end`, `ExecutorHooks::on_end`) | `libs/spurs/jq2/executor.cpp`, `runtime/spu/spurs_job.c` (shared classifier), `tests/spurs_jq2/test_jq2_executor.cpp` | each end (return in both tiers, stop, halt, jm call) yields its class; the existing `jq2-job-end` and `jq2-jm-call` stop tests stay green | `ctest -R jq2_exec`; `--preset tsan -R jq2_exec` |
 | 6 | `jq2: select a job body by its staged bytes` | `libs/spurs/jq2/executor.{cpp,hpp}`, `include/ps3emu/config_options.def`, `include/ps3emu/config.h`, `runtime/config/`, `docs/CONFIG.md`, `docs/JQ2.md` | a registered image runs lifted under `spu.job_body=lifted`; other bytes staged from the same EA and size run interpreted; `interp` never runs a registered body | the executor tests; kind-29 cost reported from a synthetic trace; `gcc-16`; tsan |
 | 7 | `spu: record a job's transcript and write its fixture` | `runtime/spu/spu_xdiff.h` (new: the container, section, identity, unit, effect and end layouts of 7.1 to 7.6, and `spu_job_tier`), `runtime/spu/xdiff/` (new: fixture reader and writer, recorder tap), `spu_channels.c` (a query for the latched float mode), tests | a synthetic job with GET, PUT, a list, a stalled list resumed by `MFC_WrListStallAck`, GETLLAR/PUTLLC and a mailbox write records the expected transcript, the remaining list bytes at the ack included; the fixture reads back the expected record and payload bytes; each rejection of section 7.8 is reported as `fixture-format` (a `VRDT` section is bounds-checked only until commit 8) | the test, interpreted and lifted; `asan` preset over the reader with truncated and corrupt fixtures, among them one with a flipped header byte (the checksum covers the whole header); `gcc-16`; `SPU_XDIFF_LS_BYTES` equals `SPU_LS_SIZE` by static assertion |
@@ -1276,7 +1285,7 @@ then compare power and frame time with `xdiff=off`.
 | 5 | Budget for lifted code | a back-edge macro that exists only in a second compilation; unwinding by the existing halt; evidence for `longjmp` under the sanitizers in section 10 | closed for soundness; the twin's cost is owed |
 | 6 | Audit thread | one thread; queue of 8 slots/32 MiB total, maximum 4 MiB per sample; `sample` drops and counts on queue pressure, `all` blocks for queue room; oversized samples are explicit `capture-limit` voids; drops and voids appear in counters, trace records and the report (section 11) | closed |
 | 7 | Fingerprint check | on the staged bytes, through the existing content-hash cache; a sampled job verifies the hit byte-serially, an unsampled one trusts it, an accepted and stated risk (section 4) | closed; its cost is read from existing traces |
-| 8 | Cost of the real path | one load and branch per operation, none per latch write; `wrch`/`rdch` already read `observer`, `rchcnt` does not; line-placement and branch costs await measurement (section 5.6) | open until the bench rows are measured |
+| 8 | Cost of the real path | one load and branch per operation, latch writes included; measured within noise on every channel, `dma` and `atomic` row (section 5.6) | closed by commit 4 |
 | 9 | Where xdiff records go | two trace kinds, 32 and 33; fixtures beside the trace, never in a bundle (section 14) | closed |
 | 10 | What T2 needs from the lifter | per function: the registers that may be read after each exit before they are written (live-out), over all callers, with an unknown caller meaning all; the extent of the stack below the entry pointer that is dead at exit; and a function as a fixture unit | open. Closes with that lifter pass and the poison run confirming its masks on a corpus |
 
@@ -1287,7 +1296,7 @@ settles it:
 
 | Claim | Measurement | Where |
 |---|---|---|
-| the real path is unchanged by the seam | the channel, `dma` and `atomic` rows of the SPU operation benchmark, lifted and interpreted, before and after commit 4; fastest of 25 runs each, as the bench already takes (`tests/bench/spu/README.md:21-39`) against `results/2026-10-06-m1pro-baseline.csv` | commit 4. The driver script the README names is not in the tree; the commit restores one |
+| the real path is unchanged by the seam | the channel, `dma` and `atomic` rows of the SPU operation benchmark, lifted and interpreted, before and after commit 4; fastest of 25 runs each, as the bench already takes (`tests/bench/spu/README.md:21-39`) against `results/2026-10-06-m1pro-baseline.csv` | measured with commit 4 (`tests/bench/spu/run_spu_bench.sh`, 6 alternating rounds against `dev`): every row within its spread (section 5.6) |
 | identifying the staged image is cheap | the kind-29 spans of an existing play trace, per image: mean and p95 against the job's own span | `ftrace_report.py`, before commit 6 |
 | recording costs a few percent of a job | job spans with `xdiff=off` against `xdiff=all`, same scene, same build; and kind 32 spans; the byte-serial check of a sampled job's image is part of this cost | after commit 10b |
 | a fixture is about 100 KiB | sizes of a captured corpus, raw and zstd | after commit 10a |
