@@ -18,6 +18,7 @@ sys.path.insert(0, TOOLS)
 import find_spu_functions as F
 from gen_test_raw_job import (
     BI,
+    BRSL,
     CODE_START,
     IL,
     ILA,
@@ -49,7 +50,83 @@ def returning(value):
     return [_ri16(IL, value, 3), _rr(BI, 0, 0, 0)]
 
 
+def ri10(op8, immediate, ra, rt):
+    return (op8 << 24) | ((immediate & 0x3FF) << 14) | (ra << 7) | rt
+
+
 class Readings(unittest.TestCase):
+    def test_pc_getter_pic_delta_does_not_seed_its_fallthrough(self):
+        for opcode, base, immediate in ((BRSL, LS_BASE, 1), (0x062, 0, 2)):
+            with self.subTest(opcode=opcode, base=base):
+                blob = b"".join(_be32(word) for word in (
+                    _ri18(ILA, 8, 23), _ri16(opcode, immediate, 22),
+                    _rr(0x040, 22, 23, 79), _ri16(IL, 7, 23),
+                    _rr(BI, 0, 0, 0)))
+                insns = disassemble_spu(blob, base)
+                getter_target = (base + 8) & 0x3FFFF
+
+                self.assertEqual(F.collect_brsl_targets(insns), set())
+                self.assertNotIn(getter_target, F.collect_branch_targets(insns))
+                self.assertNotIn(
+                    getter_target,
+                    F.collect_ila_continuation_targets(
+                        insns, base, base + len(blob), delta=base))
+                bounds, _ = F.detect_functions(
+                    blob, verbose=False, raw=True, base_override=base,
+                    link_base=0)
+                self.assertEqual(bounds, [(base, base + len(blob))])
+
+                call_immediate = (-2 if opcode == BRSL
+                                  else (base + 8) // 4)
+                real_call = disassemble_spu(
+                    _be32(_ri16(opcode, call_immediate, 126)), base + 0x10)
+                self.assertIn(getter_target,
+                              F.collect_branch_targets(insns + real_call))
+
+    def test_pc_getter_loader_with_other_uses_remains_a_seed(self):
+        base = LS_BASE
+        fallthrough = base + 8
+        cases = {
+            "stored pointer": [
+                ri10(0x24, 0, 4, 23),       # stqd $r23, 0($r4)
+                _ri16(IL, 7, 23),
+                _rr(BI, 0, 0, 0),
+            ],
+            "moved pointer then indirect branch": [
+                ri10(0x1C, 0, 23, 24),      # ai $r24, $r23, 0
+                _rr(BI, 0, 24, 0),
+                _rr(BI, 0, 0, 0),
+            ],
+            "no proven arithmetic use": [
+                _ri16(IL, 7, 23),
+                _rr(BI, 0, 0, 0),
+            ],
+        }
+        for name, body in cases.items():
+            with self.subTest(name=name):
+                blob = b"".join(_be32(word) for word in (
+                    _ri18(ILA, 8, 23), _ri16(BRSL, 1, 22), *body))
+                insns = disassemble_spu(blob, base)
+                targets = F.collect_ila_continuation_targets(
+                    insns, base, base + len(blob), delta=base)
+                self.assertIn(fallthrough, targets)
+
+    def test_pc_getter_pic_delta_live_out_keeps_its_entry_seed(self):
+        base = LS_BASE
+        words = [0] * (0x64 // 4)
+        words[0x40 // 4] = _ri18(ILA, 0x48, 23)
+        words[0x44 // 4] = _ri16(BRSL, 1, 22)
+        words[0x48 // 4] = _rr(0x040, 22, 23, 79)
+        words[0x4C // 4] = _rr(BI, 0, 0, 0)
+        words[0x60 // 4] = _rr(BI, 0, 23, 0)
+        blob = b"".join(_be32(word) for word in words)
+        insns = disassemble_spu(blob, base)
+        target = base + 0x48
+
+        targets = F.collect_ila_continuation_targets(
+            insns, base, base + len(blob), delta=base)
+        self.assertIn(target, targets)
+        self.assertIn(target, starts(blob, link_base=0))
     def test_no_delta_is_the_value_itself(self):
         self.assertEqual(F.image_delta(LS_BASE, None), 0)
         self.assertEqual(F.immediate_ls_addresses(0x100, 0), (0x100,))
