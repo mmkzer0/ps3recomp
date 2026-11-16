@@ -2,7 +2,8 @@
 set -euo pipefail
 
 usage() {
-    printf 'Usage: %s <absolute-install-prefix>\n' "${0##*/}" >&2
+    printf 'Usage: [IOS_DEPLOYMENT_TARGET=<major.minor>] %s <absolute-install-prefix>\n' "${0##*/}" >&2
+    printf 'The libraries must be built for the app deployment target or older (default 17.0).\n' >&2
 }
 
 fail() {
@@ -23,7 +24,11 @@ done
 
 prefix=$(mkdir -p "$1" && cd "$1" && pwd -P)
 jobs=4
-deployment_target=17.0
+# Libraries built for a newer iOS than the app's deployment target link with warnings and can
+# import libc++ symbols an older OS lacks (a 16.0 app linked against 17.0 libraries imported
+# std::__libcpp_verbose_abort).
+deployment_target=${IOS_DEPLOYMENT_TARGET:-17.0}
+[[ "$deployment_target" =~ ^[0-9]+\.[0-9]+$ ]] || fail "IOS_DEPLOYMENT_TARGET must be <major.minor>: $deployment_target"
 platforms=(iphonesimulator iphoneos)
 simulator_prefix="$prefix/${platforms[0]}"
 device_prefix="$prefix/${platforms[1]}"
