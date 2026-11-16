@@ -1,14 +1,12 @@
 /* The Metal backend's BC1/2/3 emulation, through the backend's own texture hooks (eng_texture_create,
- * eng_texture_upload, the cube and 3D variants), under each rsx.bc_path the environment names:
+ * eng_texture_upload, the cube and 3D variants), under each rsx.bc_path value the first argument names (the
+ * argument, not the registry's environment override, so the fixture reads no environment knob of its own):
  *
- *   PS3RECOMP_RSX_BC_PATH = cpu | gpu | tiered   the texture is RGBA8Unorm and every level, cube face and 3D
- *                                                slice holds exactly what rsx_bc_decode makes of the blocks
- *                                                uploaded; the uploads ran on the tiers the contract says (cpu:
- *                                                all CPU; gpu: all GPU while the texture is fresh; tiered: GPU
- *                                                from rsx.bc_gpu_min_texels texels), and left one PS3_FTRACE
- *                                                BC_UPLOAD span each, saying so
- *   PS3RECOMP_RSX_BC_PATH = auto                 this Mac samples BC: the texture stays a BC texture, nothing is
- *                                                decoded, no span
+ *   cpu | gpu | tiered   the texture is RGBA8Unorm and every level, cube face and 3D slice holds exactly what
+ *                        rsx_bc_decode makes of the blocks uploaded; the uploads ran on the tiers the contract
+ *                        says (cpu: all CPU; gpu: all GPU while the texture is fresh; tiered: GPU from
+ *                        rsx.bc_gpu_min_texels texels), and left one PS3_FTRACE BC_UPLOAD span each, saying so
+ *   auto (or none)       this Mac samples BC: the texture stays a BC texture, nothing is decoded, no span
  *
  * The GPU tier's decode is read back by a blit committed on the backend's queue right after the upload with no
  * wait in between, as a draw's command buffer follows it: a queue that did not run them in order would read
@@ -230,7 +228,7 @@ static void scenario_exhaustive(void)
     rsx_bc_test_image_free(&bc3);
 }
 
-int main(void)
+int main(int argc, char** argv)
 {
     @autoreleasepool {
         id<MTLDevice> probe = MTLCreateSystemDefaultDevice();
@@ -239,11 +237,10 @@ int main(void)
         setenv("PS3_FTRACE", "0:100000:/dev/null", 1);
         if (rsx_metal_backend_init(64, 64, "bc emulation") != 0) { fprintf(stderr, "backend init failed\n"); return 1; }
 
-        /* What the draw engine would hand over from the registry (rsx.bc_path from the environment the registry
-         * reads; 1024 texels splits a 64x64 chain between the tiers), then the policy the first BC texture
-         * would read, now, so the run's tier is known up front. */
-        const char* want_path = getenv("PS3RECOMP_RSX_BC_PATH");
-        if (!want_path || !*want_path) want_path = "auto";
+        /* What the draw engine would hand over from the registry (rsx.bc_path; 1024 texels splits a 64x64 chain
+         * between the tiers), then the policy the first BC texture would read, now, so the run's tier is known
+         * up front. */
+        const char* want_path = argc > 1 && argv[1][0] ? argv[1] : "auto";
         eng_bc_set_policy(NULL, want_path, 1024);
         eng_bc_policy_read();
         s_emulating = s_eng_bc_emulate;

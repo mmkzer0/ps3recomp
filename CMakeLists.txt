@@ -2413,10 +2413,10 @@ if(UNIX)
             "-framework Metal" "-framework QuartzCore" "-framework AppKit")
         target_link_options(test_metal_bc_emulation PRIVATE "-Wl,-dead_strip")
         foreach(bc_path IN ITEMS auto cpu gpu tiered)
-            add_test(NAME metal_bc_emulation_${bc_path} COMMAND test_metal_bc_emulation)
+            add_test(NAME metal_bc_emulation_${bc_path} COMMAND test_metal_bc_emulation ${bc_path})
             set_tests_properties(metal_bc_emulation_${bc_path} PROPERTIES
                 LABELS "video;gpu;gcm;tsan;t0" SKIP_RETURN_CODE 77 TIMEOUT 120
-                ENVIRONMENT "PS3RECOMP_METAL_HEADLESS=1;PS3RECOMP_RSX_BC_PATH=${bc_path}")
+                ENVIRONMENT "PS3RECOMP_METAL_HEADLESS=1")
         endforeach()
 
         # The emulation fails closed: a forced rsx.bc_path on the vtable route is a named refusal, a GPU-tier decode
