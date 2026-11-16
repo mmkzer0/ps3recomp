@@ -30,6 +30,18 @@ def brsl(pc, target, rt=0):
     return ri16(0x066, (target - pc) // 4, rt)
 
 
+def image_with_refs():
+    words = [0] * (0x58 // 4)
+    words[0] = brsl(0x00, 0x40)
+    words[1] = rr(0x1A8, ra=0)
+    words[4] = ri16(0x042, (0x40 - 0x10) // 4, 3)  # brnz $r3, F
+    words[5] = rr(0x1A8, ra=0)
+    words[8] = ri16(0x064, (0x40 - 0x20) // 4, 0)  # tail branch to F
+    words[16] = rr(0x0C0, 4, 3, 5)
+    words[17] = rr(0x1A8, ra=0)
+    words[20] = rr(0x0C0, 4, 3, 5)
+    words[21] = rr(0x1A8, ra=0)
+    return b"".join(struct.pack(">I", word) for word in words)
 
 
 def run_lifter(image, bounds, overrides, out, extra_args=()):
@@ -105,8 +117,102 @@ int main(int argc, char** argv) {
 
 
 class NativeOverrides(unittest.TestCase):
+    def test_every_reference_uses_override_and_reference_body_remains(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out = root / "lift"
+            result = run_lifter(image_with_refs(),
+                                [(0, 8), (0x10, 0x18), (0x20, 0x24),
+                                 (0x40, 0x48), (0x50, 0x58)],
+                                ["0x40=native_f", "0x50=native_g"], out)
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            header = (out / "spu_recomp.h").read_text()
+            source = (out / "spu_recomp.c").read_text()
+            self.assertIn("void native_f(spu_context* ctx);", header)
+            self.assertIn("void native_g(spu_context* ctx);", header)
+            self.assertIn("void xfn_spu_func_00000040(spu_context* ctx)", source)
+            self.assertNotIn("xfn_spu_func_00000040(ctx);", source)
+            self.assertIn("ctx->host_depth++; native_f(ctx);", source)
+            self.assertGreaterEqual(source.count("SPU_DIRECT(ctx, 0x40, native_f)"), 2)
+            self.assertIn("{ 0x00000040u, native_f, xfn_spu_func_00000040, 1,", source)
+            self.assertIn("{ 0x00000050u, native_g, xfn_spu_func_00000050, 1,", source)
+            self.assertIn("spu_register_function_with_reference", source)
 
+    def test_nonleaf_call_is_refused_by_address_and_reason(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            words = [0] * (0x68 // 4)
+            words[0x40 // 4] = brsl(0x40, 0x60)
+            words[0x44 // 4] = rr(0x1A8, ra=0)
+            words[0x60 // 4] = rr(0x1A8, ra=0)
+            image = b"".join(struct.pack(">I", word) for word in words)
+            result = run_lifter(image, [(0x40, 0x48), (0x60, 0x64)],
+                                ["0x40=native_f"], root / "lift")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("--override 0x40 refuses non-leaf function", result.stderr)
+            self.assertRegex(result.stderr, r"call out via [a-z]+ at 0x40")
 
+    def test_arithmetic_r0_target_is_dispatched_and_refused_for_override(self):
+        words = [0] * (0x48 // 4)
+        words[0x40 // 4] = rr(0x0C0, rb=4, ra=3, rt=0)  # a $r0,$r3,$r4
+        words[0x44 // 4] = rr(0x1A8, ra=0)              # bi $r0
+        image = b"".join(struct.pack(">I", word) for word in words)
+        bounds = [(0x40, 0x48)]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = run_lifter(image, bounds, [], root / "reference")
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            source = (root / "reference" / "spu_recomp.c").read_text()
+            self.assertIn("ctx->pc = ctx->gpr[0]._u32[0];", source)
+            self.assertNotIn("SPU_RET(ctx)", source)
+
+            result = run_lifter(image, bounds, ["0x40=native_f"], root / "override")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("unproven $r0 write by a at 0x40", result.stderr)
+    def test_stack_link_restore_requires_matching_abi_slot(self):
+        invalid = (
+            ("other-base", [
+                ri10(0x34, 0, 3, 0),  # lqd $r0,0($r3)
+                rr(0x1A8, ra=0),
+            ]),
+            ("mismatched-offset", [
+                ri10(0x24, 1, 1, 0),  # stqd $r0,16($r1)
+                ri10(0x1C, -32, 1, 1),
+                ri10(0x1C, 32, 1, 1),
+                ri10(0x34, 0, 1, 0),  # lqd $r0,0($r1)
+                rr(0x1A8, ra=0),
+            ]),
+            ("save-not-dominating", [
+                ri16(0x040, 3, 3),  # brz $r3, 0x4C
+                ri10(0x24, 1, 1, 0),  # stqd $r0,16($r1)
+                ri16(0x064, 2, 0),  # br 0x50
+                ri16(0x064, 1, 0),  # br 0x50
+                ri10(0x34, 1, 1, 0),  # lqd $r0,16($r1)
+                rr(0x1A8, ra=0),
+            ]),
+            ("save-after-r0-write", [
+                rr(0x0C0, rb=4, ra=3, rt=0),  # a $r0,$r3,$r4
+                ri10(0x24, 1, 1, 0),  # stqd $r0,16($r1)
+                ri10(0x34, 1, 1, 0),  # lqd $r0,16($r1)
+                rr(0x1A8, ra=0),
+            ]),
+        )
+        for name, body in invalid:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                words = [0] * (0x40 // 4) + body
+                image = b"".join(struct.pack(">I", word) for word in words)
+                bounds = [(0x40, 0x40 + len(body) * 4)]
+                root = Path(tmp)
+                result = run_lifter(image, bounds, [], root / "reference")
+                self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+                source = (root / "reference" / "spu_recomp.c").read_text()
+                self.assertIn("ctx->pc = ctx->gpr[0]._u32[0];", source)
+                self.assertNotIn("SPU_RET(ctx)", source)
+
+                result = run_lifter(image, bounds, ["0x40=native_f"], root / "override")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertRegex(result.stderr,
+                                 r"unproven \$r0 write by lqd at 0x[0-9A-F]+")
 
     def test_pc_getter_preserves_the_frame_across_a_split(self):
         words = [rr(0x201)] * (0x58 // 4)
@@ -205,6 +311,39 @@ class NativeOverrides(unittest.TestCase):
         self.assertIn("spu_func_00000000(ctx)", source)
         self.assertIn("spu_link(0x0)", source)
 
+    def test_call_link_register_controls_saved_r0_admission(self):
+        for kind in ("brsl", "bisl"):
+            for link in (0, 4):
+                with self.subTest(kind=kind, link=link), tempfile.TemporaryDirectory() as tmp:
+                    words = [rr(0x201)] * (0x94 // 4)
+                    if kind == "brsl":
+                        words[0] = brsl(0, 0x80, link)
+                        words[1] = 0x1234
+                        caller_end = 8
+                    else:
+                        words[0] = ri16(0x081, 0x80, 9)
+                        words[1] = rr(0x1A9, ra=9, rt=link)
+                        words[2] = 0x1234
+                        caller_end = 12
+                    words[0x80 // 4:] = [
+                        ri10(0x24, 1, 1, 0), ri10(0x1C, -32, 1, 1),
+                        ri10(0x34, 3, 1, 0), ri10(0x1C, 32, 1, 1),
+                        rr(0x1A8, ra=0),
+                    ]
+                    image = b"".join(struct.pack(">I", word) for word in words)
+                    bounds = [(0, caller_end), (0x80, 0x94)]
+                    output = Path(tmp) / "reference"
+                    result = run_lifter(image, bounds, [], output)
+                    self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+                    report = json.loads((output / "lift.json").read_text())
+                    self.assertEqual(bool(report["r0_returns"]), link == 0)
+                    self.assertEqual(0x90 in {item["site"] for item in report["r0_dispatches"]},
+                                     link != 0)
+                    result = run_lifter(image, bounds, ["0x80=native_f"],
+                                        Path(tmp) / "override")
+                    self.assertEqual(result.returncode == 0, link == 0, result.stderr)
+                    if link != 0:
+                        self.assertIn("unproven $r0 write", result.stderr)
 
     def test_mixed_call_links_do_not_supply_a_universal_r0_link(self):
         words = [rr(0x201)] * (0x94 // 4)
@@ -234,7 +373,74 @@ class NativeOverrides(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
             self.assertIn("SPU_RET_REG(ctx, 4);", (output / "spu_recomp.c").read_text())
 
+    def test_spilled_stack_pointer_store_keeps_visible_private_slot_assumption(self):
+        body = [
+            ri10(0x24, 1, 1, 0), ri10(0x1C, -32, 1, 1),
+            ri10(0x1C, 48, 1, 5),  # form a pointer to the active link slot
+            ri16(0x041, 0x300 // 4, 5),  # stqa $r5, scratch
+            ri16(0x061, 0x300 // 4, 6),  # lqa $r6, scratch
+            ri16(0x081, 0, 4),
+            ri16(0x081, 0xA70, 7),
+            rr(0x144, rb=4, ra=6, rt=7),  # stqx through the reloaded pointer
+            ri10(0x34, 3, 1, 0), ri10(0x1C, 32, 1, 1), rr(0x1A8, ra=0),
+        ]
+        words = [rr(0x201)] * (0x40 // 4) + body
+        image = b"".join(struct.pack(">I", word) for word in words)
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "reference"
+            result = run_lifter(image, [(0x40, 0x40 + len(body) * 4)], [], output)
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            [entry] = json.loads((output / "lift.json").read_text())["r0_returns"]
+            self.assertIn("spu-abi-link-slot-private", entry["assumes"])
+            result = run_lifter(image, [(0x40, 0x40 + len(body) * 4)],
+                                ["0x40=native_f"], Path(tmp) / "override")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("spu-abi-link-slot-private", result.stderr)
 
+    def test_override_refuses_every_extra_return_assumption(self):
+        for assumption in ("spu-abi-link-slot", "spu-abi-link-slot-private",
+                           "spu-abi-callee-saved", "no-unmodelled-indirect-entry"):
+            with self.subTest(assumption=assumption), tempfile.TemporaryDirectory() as tmp:
+                words = [rr(0x201)] * (0xC4 // 4)
+                caller = [
+                    ri10(0x24, 1, 1, 0), ri10(0x1C, -32, 1, 1),
+                    brsl(0x48, 0xA0) if assumption == "spu-abi-callee-saved"
+                    else ri16(0x064, (0x80 - 0x48) // 4, 0),
+                ]
+                words[0x40 // 4:0x4C // 4] = caller
+                if assumption == "spu-abi-callee-saved":
+                    words[0x4C // 4] = ri16(0x064, (0x80 - 0x4C) // 4, 0)
+                epilogue = [ri10(0x34, 3, 1, 0), ri10(0x1C, 32, 1, 1),
+                            rr(0x1A8, ra=0)]
+                if assumption == "spu-abi-link-slot-private":
+                    epilogue = [
+                        ri10(0x34, 0, 3, 5), rr(0x144, rb=4, ra=5, rt=3),
+                    ] + epilogue
+                end = 0x80 + len(epilogue) * 4
+                words[0x80 // 4:end // 4] = epilogue
+                words[0xA0 // 4] = rr(0x1A8, ra=0)
+                words[0xC0 // 4] = rr(0x1A8, ra=9 if assumption ==
+                                         "no-unmodelled-indirect-entry" else 0)
+                bounds = [(0x40, 0x4C), (0x80, end), (0xA0, 0xA4), (0xC0, 0xC4)]
+                if assumption == "spu-abi-callee-saved":
+                    bounds.insert(1, (0x4C, 0x50))
+                image = b"".join(struct.pack(">I", word) for word in words)
+                output = Path(tmp) / "reference"
+                result = run_lifter(image, bounds, [], output)
+                self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+                report = json.loads((output / "lift.json").read_text())
+                [entry] = [item for item in report["r0_returns"] if item["site"] == end - 4]
+                tags = entry["assumes"]
+                tags = [tags] if isinstance(tags, str) else tags
+                self.assertIn(assumption, tags)
+                result = run_lifter(image, bounds, ["0x80=native_f"],
+                                    Path(tmp) / "override")
+                if assumption == "spu-abi-link-slot":
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("return proof requires", result.stderr)
+                    self.assertIn(assumption, result.stderr)
 
     def test_opaque_stores_distinguish_stack_and_nonstack_bases(self):
         for case in ("stack", "loaded-pointer", "copied-stack", "offset-stack", "sum-stack",
@@ -413,6 +619,27 @@ class NativeOverrides(unittest.TestCase):
                     self.assertIn("ctx->pc = ctx->gpr[0]._u32[0];", epilogue)
                     self.assertNotIn("SPU_RET(ctx)", epilogue)
 
+    def test_balanced_stack_link_restore_is_a_return(self):
+        body = [
+            ri10(0x24, 1, 1, 0),  # stqd $r0,16($r1)
+            ri10(0x1C, -32, 1, 1),
+            ri10(0x1C, 32, 1, 1),
+            ri10(0x34, 1, 1, 0),  # lqd $r0,16($r1)
+            rr(0x1A8, ra=0),
+        ]
+        words = [0] * (0x40 // 4) + body
+        image = b"".join(struct.pack(">I", word) for word in words)
+        bounds = [(0x40, 0x40 + len(body) * 4)]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = run_lifter(image, bounds, [], root / "reference")
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            source = (root / "reference" / "spu_recomp.c").read_text()
+            self.assertIn("SPU_RET(ctx)", source)
+            self.assertNotIn("ctx->pc = ctx->gpr[0]._u32[0];", source)
+
+            result = run_lifter(image, bounds, ["0x40=native_f"], root / "override")
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
 
     def test_stack_slot_uses_r1_delta_at_the_load(self):
         body = [
@@ -432,8 +659,34 @@ class NativeOverrides(unittest.TestCase):
             self.assertIn("SPU_RET(ctx)", source)
             self.assertNotIn("ctx->pc = ctx->gpr[0]._u32[0];", source)
 
+    def test_ori_from_other_register_is_not_a_link_preserving_move(self):
+        body = [ri10(0x04, 0, 3, 0), rr(0x1A8, ra=0)]
+        words = [0] * (0x40 // 4) + body
+        image = b"".join(struct.pack(">I", word) for word in words)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = run_lifter(image, [(0x40, 0x48)], [], root / "reference")
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            source = (root / "reference" / "spu_recomp.c").read_text()
+            self.assertIn("ctx->pc = ctx->gpr[0]._u32[0];", source)
+            self.assertNotIn("SPU_RET(ctx)", source)
+            result = run_lifter(image, [(0x40, 0x48)], ["0x40=native_f"],
+                                root / "override")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("unproven $r0 write by ori at 0x40", result.stderr)
 
 
+    def test_channel_instruction_is_refused_by_address_and_reason(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            words = [0] * 0x12
+            words[0x40 // 4] = (0x00D << 21) | (7 << 7) | 3  # rdch $r3, channel 7
+            words[0x44 // 4] = rr(0x1A8, ra=0)
+            image = b"".join(struct.pack(">I", word) for word in words)
+            result = run_lifter(image, [(0x40, 0x48)], ["0x40=native_f"], root / "lift")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("--override 0x40 refuses non-leaf function", result.stderr)
+            self.assertIn("channel instruction rdch", result.stderr)
     def test_lqx_is_never_an_abi_link_restore(self):
         body = [
             ri10(0x24, 1, 1, 0),  # stqd $r0,16($r1)

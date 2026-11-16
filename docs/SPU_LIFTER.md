@@ -88,6 +88,42 @@ which defines `SPU_LIFT_BUDGET` and includes `spu_recomp.c`, and registers the
 twin beside the production entry with `spu_workload_register_twin`. A twin
 doubles the lifted code a title compiles, so it is off by default.
 
+## Native overrides (T2 pilot)
+
+`--override 0xADDR=SYMBOL` is repeatable. `SYMBOL` is declared as
+`void SYMBOL(spu_context*)` in the generated header and defined by the
+consumer. The lifter keeps `spu_func_ADDR` as the T1 reference body, but
+retargets direct calls, cross-function `SPU_DIRECT` branches and the selected
+function-table entry to `SYMBOL`; the registry stores both selected and
+reference pointers (`tools/spu_lifter.py:1232-1245, 1278-1292,
+1498-1550`; `runtime/spu/spu_channels.c:1924-1967`).
+
+The pilot fails closed unless the decoded function is a leaf compute routine:
+no call out (`brsl`/`brasl`/`bisl`, excluding PC-getters), channel instruction,
+indirect branch other than `bi $r0` with the incoming link value preserved,
+stop/halt, cross-bound tail call or fall-through tail call. A stack reload
+qualifies only when its dominating save and matching slot are proved under
+`"spu-abi-link-slot"`. `override_leaf_problem` refuses any leaf/return proof requiring an additional
+assumption: `"spu-abi-link-slot-private"`, `"spu-abi-callee-saved"` or
+`"no-unmodelled-indirect-entry"`, and names that reason. The general lifter
+may still emit `SPU_RET` under those explicitly recorded assumptions; its
+whole-job replay and in-run audit are empirical checks, not T2 admission.
+The pipeline independently recomputes the leaf/return proof before registering
+an override, even if an alternate lifter subprocess omitted the gate
+(`tools/spu_lifter.py`: `override_leaf_problem`, `compute_bi_r0_jumps`;
+`tools/spu_program_pipeline.py`: registration gates).
+
+The raw-image manifest carries `overrides` as a list of `ADDR=SYMBOL` strings
+and a nonzero `native_rev`; the pipeline validates and canonicalizes them into
+`lift_options`, then the workload registry records `SPU_TIER_PARTIAL` and that
+revision (`tools/build_spu_workloads.py`; `runtime/spu/spu_workload.c`).
+
+For the pilot, whole-job replay remains strict bit-exact; the per-function
+unit masks only proven-dead registers and the function's dead stack extent.
+The unit capture/replay commands and their format are in
+[`SPU_XDIFF.md`](SPU_XDIFF.md), sections 7.4 and 8.2.
+
+
 ## Liveness (what a T2 override may rely on)
 
 A native override of one function (tier T2, `docs/SPU_XDIFF.md` sections 8.2
@@ -804,7 +840,8 @@ the site:
    range end, a gap or LS wrap, even equality transfers as an ordinary indirect
    call. The static proof uses the PC-getter fall-through only when its
    target proof establishes that guarded path. An unexpected entry therefore
-   cannot erase the fallback call.
+   cannot erase the fallback call. A `bisl` PC-getter proof in an image with
+   unresolved indirect entries is not admitted for T2 overrides.
 
    A return-entry continuation after a known in-image `brsl` or `bisl` instead
    receives its call site's frame fact, with live-`$r0` false, under
@@ -933,7 +970,8 @@ to an active frame's link-save slot. Consequently a store through an argument,
 loaded pointer or immediate-built address that is not a placeable `$r1`-relative
 address cannot modify that slot under this assumption. A pointer to the slot
 spilled to memory and reloaded violates the premise by construction: the
-classifier still lowers the return, but visibly records this assumption.
+classifier still lowers the return, but visibly records this assumption; T2
+override admission refuses it.
 
 The assumption follows the saved value through reloads and copies into another
 link slot, and is recorded on every same-function or inherited return that

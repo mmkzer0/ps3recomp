@@ -202,10 +202,91 @@ def _chan(token: str) -> str:
         return m.group(1)
     return token
 
+def parse_override_spec(spec: str) -> tuple[int, str]:
+    """Parse one --override value without accepting ambiguous C symbols or addresses."""
+    if not isinstance(spec, str) or spec.count("=") != 1:
+        raise ValueError(f"override {spec!r} must be ADDR=SYMBOL")
+    address_text, symbol = spec.split("=", 1)
+    try:
+        address = int(address_text, 0)
+    except ValueError as error:
+        raise ValueError(f"override {spec!r} has an invalid address") from error
+    if address < 0 or address >= 0x40000 or address & 3:
+        raise ValueError(f"override {spec!r} address must be a 4-byte-aligned local-store address")
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", symbol):
+        raise ValueError(f"override {spec!r} symbol must be a C identifier")
+    return address, symbol
 
 
+def parse_overrides(specs) -> dict[int, str]:
+    overrides = {}
+    for spec in specs:
+        address, symbol = parse_override_spec(spec)
+        previous = overrides.get(address)
+        if previous is not None and previous != symbol:
+            raise ValueError(f"override 0x{address:X} names both {previous!r} and {symbol!r}")
+        overrides[address] = symbol
+    return dict(sorted(overrides.items()))
 
 
+def override_leaf_problem(insns, start: int, end: int, computed_jumps=(),
+                          function_starts=()) -> str | None:
+    """Return why an override target is outside the pilot's leaf-call contract."""
+    body = [insn for insn in insns if start <= insn.addr < end]
+    has_return = False
+    for insn in body:
+        mn = insn.mnemonic
+        if insn.addr in getattr(computed_jumps, "pc_getters", ()):
+            if mn == "bisl" and getattr(computed_jumps, "unresolved_branches", ()):
+                return ("PC-getter proof requires no-unmodelled-indirect-entry at "
+                        f"0x{insn.addr:X}; not admitted for T2 overrides")
+            continue
+        if mn in ("brsl", "brasl", "bisl"):
+            return f"call out via {mn} at 0x{insn.addr:X}"
+        if mn in ("rdch", "wrch", "rchcnt"):
+            return f"channel instruction {mn} at 0x{insn.addr:X}"
+        if mn in ("stop", "stopd", "halt"):
+            return f"stop/halt instruction {mn} at 0x{insn.addr:X}"
+        ops = _ops(insn.operands)
+        if mn == "bi":
+            if ops and _reg(ops[0]) == "0":
+                link_restores = getattr(computed_jumps, "link_restores", {})
+                for writer in reversed(body):
+                    if writer.addr >= insn.addr or not _writes_r0(writer):
+                        continue
+                    if _is_identity_move(writer):
+                        continue
+                    if link_restores.get(insn.addr) == writer.addr:
+                        break
+                    return (f"unproven $r0 write by {writer.mnemonic} at "
+                            f"0x{writer.addr:X} before bi $r0")
+                if insn.addr not in computed_jumps:
+                    assumptions = getattr(computed_jumps, "return_assumptions", {}).get(
+                        insn.addr, ())
+                    if isinstance(assumptions, str):
+                        assumptions = [assumptions]
+                    extra = [name for name in assumptions if name != "spu-abi-link-slot"]
+                    if extra:
+                        return (f"return proof requires {', '.join(extra)} at "
+                                f"0x{insn.addr:X}; not admitted for T2 overrides")
+                    has_return = True
+                    continue
+            return f"indirect branch {mn} at 0x{insn.addr:X}"
+        if mn in ("bisl", "bisled", "iret", "biz", "binz", "bihz", "bihnz"):
+            return f"indirect branch {mn} at 0x{insn.addr:X}"
+        if mn in _COND_BR or mn in ("br", "bra"):
+            target = SPULifter._branch_target(insn)
+            if target is None:
+                return f"unresolved direct branch {mn} at 0x{insn.addr:X}"
+            if target == insn.addr:
+                return f"self-loop halt idiom at 0x{insn.addr:X}"
+            if not start <= target < end:
+                return f"tail call via {mn} to 0x{target:X} at 0x{insn.addr:X}"
+    if body and body[-1].mnemonic not in {"br", "bra", "bi", "iret", "stop", "stopd"} and end in function_starts:
+        return f"fall-through tail call to 0x{end:X}"
+    if not has_return:
+        return "no return through bi $r0"
+    return None
 
 
 
@@ -903,12 +984,13 @@ def compute_link_returns(insns, bounds) -> set:
 LV2_RESUMING_STOPS = {0x100, 0x110, 0x111}
 
 class SPULifter:
-    def __init__(self, trace: bool = False, prefix: str = ""):
+    def __init__(self, trace: bool = False, prefix: str = "", overrides=None):
         self.functions: list[LiftedFunction] = []
         self.call_targets: set[int] = set()
         self.branch_targets: set[int] = set()
         self.unsupported: dict[str, int] = {}
         self.trace = trace
+        self.overrides = dict(overrides or {})
         # Symbol prefix for all emitted spu_func_* / spu_recomp_register symbols.
         # Lets multiple lifted SPU images link into one binary without collisions
         # (every image otherwise exports spu_func_00000090 etc.). Empty = legacy.
@@ -939,6 +1021,8 @@ class SPULifter:
         # brsl->C-call nesting instead of branching to an unregistered PC.
         self.link_return: set = set()
 
+    def _function_symbol(self, addr: int) -> str:
+        return self.overrides.get(addr, f"{self.prefix}spu_func_{addr:08X}")
 
     # ------------------------------------------------------------------ #
     def lift_function(self, insns: list[SPUInstruction],
@@ -998,7 +1082,7 @@ class SPULifter:
                          and (last_insn.raw & 0x3FFF) in LV2_RESUMING_STOPS))
                 and end in getattr(self, "func_starts", set())):
             func.body_lines.append(
-                f"    {{ SPU_DIRECT(ctx, {self._pc(end)}, {self.prefix}spu_func_{end:08X}); }}")
+                f"    {{ SPU_DIRECT(ctx, {self._pc(end)}, {self._function_symbol(end)}); }}")
 
         # Infinite no-op self-loop (the SPU `br .` halt idiom): a function whose
         # whole body is nops + an unconditional branch back into itself does
@@ -1401,7 +1485,7 @@ class SPULifter:
                 # ctx->reloc_delta for itself; put this placement's back on return.
                 rs, rr = ("const int32_t _rd = ctx->reloc_delta; ", " ctx->reloc_delta = _rd;") if self.reloc else ("", "")
                 return (f"{link} {{ int32_t _si = (int32_t)ctx->image_id; {rs}"
-                        f"ctx->host_depth++; {self.prefix}spu_func_{tgt:08X}(ctx); "
+                        f"ctx->host_depth++; {self._function_symbol(tgt)}(ctx); "
                         f"spu_drain_call(ctx, {self._pc(addr + 4)}); ctx->host_depth--; spu_img_restore(ctx, _si);{rr} }}")
             return f"{link} /* TODO spu: brsl unresolved target */;"
         if mn in _COND_BR:
@@ -1422,7 +1506,7 @@ class SPULifter:
             # tail call when the drain has nothing to do on this step, else
             # the trampoline and unwind (SPU_DIRECT, spu_context.h).
             return (f"if ({cond}) {{ SPU_DIRECT(ctx, {self._pc(tgt)}, "
-                    f"{self.prefix}spu_func_{tgt:08X}); }}")
+                    f"{self._function_symbol(tgt)}); }}")
         # Interrupt enable/disable bits on the bi family (bie/bid, irete/iretd,
         # bisle(d)...): bit 0x40000 = E (enable), 0x80000 = D (disable), taking
         # effect when the branch is TAKEN. The WWS jobmanager's poll loop runs
@@ -1547,7 +1631,7 @@ class SPULifter:
         # drain has nothing to do on this step, else hand the target to the
         # trampoline and unwind so the enclosing SPU_DRAIN re-enters (no
         # host-stack growth either way; SPU_DIRECT, spu_context.h).
-        return (f"{{ SPU_DIRECT(ctx, {self._pc(tgt)}, {self.prefix}spu_func_{tgt:08X}); }}")
+        return (f"{{ SPU_DIRECT(ctx, {self._pc(tgt)}, {self._function_symbol(tgt)}); }}")
 
     # ------------------------------------------------------------------ #
     def twin_renames(self) -> list[str]:
@@ -1573,6 +1657,8 @@ class SPULifter:
         lines.append("")
         for f in self.functions:
             lines.append(f"void {f.name}(spu_context* ctx);")
+        for symbol in sorted(set(self.overrides.values())):
+            lines.append(f"void {symbol}(spu_context* ctx); /* native override */")
         defined = {f.start_addr for f in self.functions}
         for t in sorted(self.call_targets | self.branch_targets):
             if t not in defined:
@@ -1580,6 +1666,9 @@ class SPULifter:
         lines.append("")
         lines.append("/* Runtime glue (runtime/spu/spu_channels.c) */")
         lines.append("void spu_register_function(uint32_t addr, void (*fn)(spu_context*));")
+        if self.overrides:
+            lines.append("void spu_register_function_with_reference(uint32_t addr, "
+                         "void (*fn)(spu_context*), void (*reference)(spu_context*), int native_override);")
         lines.append("/* Call once at init to register this image's functions for")
         lines.append(" * indirect-branch dispatch (spu_indirect_branch). */")
         lines.append(f"void {self.prefix}spu_recomp_register(void);")
@@ -1617,17 +1706,28 @@ class SPULifter:
             lines.append("")
 
         lines.append("/* Function table */")
-        lines.append("typedef struct { uint32_t addr; void (*func)(spu_context*); const char* name; } spu_func_entry;")
+        lines.append("typedef struct { uint32_t addr; void (*func)(spu_context*); "
+                     "void (*reference)(spu_context*); int native_override; const char* name; } spu_func_entry;")
         lines.append("static const spu_func_entry spu_function_table[] = {")
         for f in self.functions:
-            lines.append(f'    {{ 0x{f.start_addr:08X}u, {f.name}, "{f.name}" }},')
-        lines.append("    { 0, NULL, NULL }")
+            selected = self._function_symbol(f.start_addr)
+            is_override = 1 if f.start_addr in self.overrides else 0
+            lines.append(f'    {{ 0x{f.start_addr:08X}u, {selected}, {f.name}, {is_override}, "{f.name}" }},')
+        lines.append("    { 0, NULL, NULL, 0, NULL }")
         lines.append("};")
         lines.append("")
         lines.append(f"void {self.prefix}spu_recomp_register(void) {{")
         lines.append("    ps3_spu_lifter_abi_check(SPU_LIFTER_ABI);")
-        lines.append("    for (const spu_func_entry* e = spu_function_table; e->func; ++e)")
-        lines.append("        spu_register_function(e->addr, e->func);")
+        if self.overrides:
+            lines.append("    for (const spu_func_entry* e = spu_function_table; e->func; ++e) {")
+            lines.append("        if (e->native_override)")
+            lines.append("            spu_register_function_with_reference(e->addr, e->func, e->reference, 1);")
+            lines.append("        else")
+            lines.append("            spu_register_function(e->addr, e->func);")
+            lines.append("    }")
+        else:
+            lines.append("    for (const spu_func_entry* e = spu_function_table; e->func; ++e)")
+            lines.append("        spu_register_function(e->addr, e->func);")
         lines.append("}")
         lines.append("")
         return "\n".join(lines)
@@ -1673,6 +1773,9 @@ def main() -> None:
                         "0x10F8,0x808) to add as boundaries -- for indirect-branch "
                         "targets that --auto-functions can't detect statically. "
                         "Splits the containing auto-detected function at each addr.")
+    p.add_argument("--override", action="append", default=[], metavar="ADDR=SYMBOL",
+                   help="Replace a decoded leaf function's references with a native "
+                        "void SYMBOL(spu_context*) supplied by the consumer. Repeatable.")
     p.add_argument("--return-entries", action="store_true",
                    help="Also make the return address of every call (brsl, "
                         "brasl, bisl, bisled) an entry point. Code that is "
@@ -1717,6 +1820,10 @@ def main() -> None:
                         "dispatched blocks later -- classified as a return, which "
                         "silently skipped every job-command handler).")
     args = p.parse_args()
+    try:
+        overrides = parse_overrides(args.override)
+    except ValueError as error:
+        p.error(str(error))
 
     independent_entries = set()
     if args.auto_functions:
@@ -1841,7 +1948,7 @@ def main() -> None:
                          % (ce, len(bounds), before))
 
 
-    lifter = SPULifter(trace=args.trace, prefix=args.symbol_prefix)
+    lifter = SPULifter(trace=args.trace, prefix=args.symbol_prefix, overrides=overrides)
     independent_entries.add(base)
     if args.extra_funcs:
         independent_entries.update(int(value, 0) for value in args.extra_funcs.split(",")
@@ -1897,6 +2004,23 @@ def main() -> None:
                                     entry_points=seeds)
         print(f"  {len(groups)} merged function group(s) "
               f"(--merge-chunks, max {args.max_group_insns} insns)")
+    if overrides:
+        ends = dict(bounds)
+        if set(overrides) - set(ends):
+            missing = min(set(overrides) - set(ends))
+            p.error(f"--override 0x{missing:X} is not a decoded function entry")
+        generated = {f"{lifter.prefix}spu_func_{start:08X}" for start, _ in bounds}
+        generated.add(f"{lifter.prefix}spu_recomp_register")
+        generated.update(f"{lifter.prefix}spu_func_{target:08X}"
+                         for target in lifter.call_targets | lifter.branch_targets)
+        for address, symbol in overrides.items():
+            if symbol in generated:
+                p.error(f"--override 0x{address:X} symbol {symbol!r} conflicts with a lifted symbol")
+            end = groups.get(address, ends[address])
+            problem = override_leaf_problem(insns, address, end, lifter.bi_r0_jump,
+                                            lifter.func_starts)
+            if problem:
+                p.error(f"--override 0x{address:X} refuses non-leaf function: {problem}")
 
     for s, e in bounds:
         lifter.lift_function(insns, s, groups.get(s, e))

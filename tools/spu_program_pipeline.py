@@ -18,6 +18,7 @@ import tempfile
 from spu_disasm import CHANNEL_NAMES, SPU_RR, disassemble_spu
 from find_spu_functions import image_delta, immediate_ls_addresses, immediate_values_naming
 from spu_elf import fnv1a64, scan_spu_candidates
+from spu_lifter import parse_overrides
 
 
 def sha256(buf):
@@ -157,6 +158,24 @@ def load_raw_images(manifest_path):
             if not (base <= point < limit) or point & 3:
                 raise ValueError(f'{source}: extra entry point 0x{point:X} is outside '
                                  'the code range')
+        overrides_value = entry.get('overrides', [])
+        if not isinstance(overrides_value, list):
+            raise TypeError(f'{source}: overrides must be a list of ADDR=SYMBOL strings')
+        try:
+            overrides_map = parse_overrides(overrides_value)
+        except ValueError as error:
+            raise ValueError(f'{source}: {error}') from error
+        for address in overrides_map:
+            if not (base <= address < limit):
+                raise ValueError(f'{source}: override 0x{address:X} is outside the raw code range')
+        native_rev_value = entry.get('native_rev')
+        native_rev = 0 if native_rev_value is None else _manifest_int(native_rev_value, 'native_rev', source)
+        if native_rev < 0 or native_rev > 0xFFFFFFFFFFFFFFFF:
+            raise ValueError(f'{source}: native_rev is outside the unsigned 64-bit range')
+        if overrides_map and native_rev == 0:
+            raise ValueError(f'{source}: native_rev must be nonzero when overrides are declared')
+        if not overrides_map and native_rev != 0:
+            raise ValueError(f'{source}: native_rev requires at least one override')
         # Both flags change what a port does with the image, so a truthy
         # non-boolean is a manifest mistake, never an implicit true.
         flags = {}
@@ -165,9 +184,11 @@ def load_raw_images(manifest_path):
             if type(value) is not bool:
                 raise ValueError(f'{source}: {field} must be a boolean')
             flags[field] = value
+        override_specs = [f'0x{address:x}={symbol}' for address, symbol in overrides_map.items()]
         out.append({'digest': digest, 'blob': blob, 'path': str(blob_path), 'size': len(blob),
                     'ls_base': base, 'code_end': code_end, 'link_base': link_base,
-                    'extra_entry_points': points,
+                    'extra_entry_points': points, 'overrides': override_specs,
+                    'native_rev': native_rev,
                     'return_entries': flags['return_entries'], 'promoted': flags['promoted']})
     return out
 
@@ -1256,18 +1277,16 @@ def effects_inventory(image, base, functions, entry=None, extra_entry_points=(),
 
 
 def lift_options_string(code_end, extra_entry_points, merge_chunks, return_entries=False,
-                        link_base=None):
+                        link_base=None, overrides=()):
     """The lifter options that change one image's generated code, canonically.
 
-    Fixed order, lowercase hex, sorted extra entry points, an absent option
-    omitted: two lifts of the same bytes with the same knobs hash equal, and
-    any knob that changes the generated code changes the digest. `--base`,
-    `--functions`, `--symbol-prefix`, `--report` and `--output` are not lift
-    options in this sense -- for one image they follow from its own bytes (the
-    manifest or the ELF, the detector, the fingerprint) or only name paths.
-    `link_base` is one: it changes the function starts the detector seeds from
-    the image's immediates, so the same bytes lifted with and without it are
-    different bodies.
+    Fixed order, lowercase hex, sorted extra entry points and overrides, an
+    absent option omitted: two lifts of the same bytes with the same knobs hash
+    equal, and any knob that changes generated code changes the digest.
+    `--base`, `--functions`, `--symbol-prefix`, `--report` and `--output` are
+    not lift options in this sense -- they follow from the image or only name
+    paths. `link_base` changes the function starts the detector seeds from its
+    immediates.
     """
     parts = []
     if code_end is not None:
@@ -1280,6 +1299,10 @@ def lift_options_string(code_end, extra_entry_points, merge_chunks, return_entri
         parts.append('merge_chunks=1')
     if return_entries:
         parts.append('return_entries=1')
+    if overrides:
+        mapping = overrides if isinstance(overrides, dict) else parse_overrides(overrides)
+        parts.append('overrides=' + ','.join(f'0x{address:x}={symbol}'
+                                             for address, symbol in sorted(mapping.items())))
     return ';'.join(parts)
 
 
@@ -1366,13 +1389,13 @@ def build_programs(args, registry_writer):
                     raise ValueError('raw image blobs must be outside the owned output directory')
                 previous = raw_specs.get(spec['digest'])
                 if previous is not None:
-                    if ((previous['ls_base'], previous['code_end'], previous['link_base'],
-                         previous['return_entries'], previous['promoted'])
-                            != (spec['ls_base'], spec['code_end'], spec['link_base'],
-                                spec['return_entries'], spec['promoted'])):
+                    option_fields = ('ls_base', 'code_end', 'link_base', 'return_entries',
+                                     'promoted', 'overrides', 'native_rev')
+                    conflicts = [field for field in option_fields
+                                 if previous[field] != spec[field]]
+                    if conflicts:
                         raise ValueError('raw image ' + spec['path'] + ': the same bytes are listed '
-                                         'with a different ls_base/code_end/link_base/'
-                                         'return_entries/promoted')
+                                         'with different image options: ' + ', '.join(conflicts))
                     previous['extra_entry_points'] = sorted(
                         set(previous['extra_entry_points']) | set(spec['extra_entry_points']))
                     previous['paths'].append(spec['path'])
@@ -1431,6 +1454,9 @@ def build_programs(args, registry_writer):
                  'link_base': spec['link_base'],
                  'extra_entry_points': spec['extra_entry_points'],
                  'return_entries': spec['return_entries'], 'promoted': spec['promoted']}
+            if spec['overrides']:
+                p['overrides'] = spec['overrides']
+                p['native_rev'] = spec['native_rev']
             unique[digest], blobs[digest] = p, spec['blob']
             report['programs'].append(p)
 
@@ -1509,9 +1535,10 @@ def build_programs(args, registry_writer):
                 # body even when generation fails.
                 merge_chunks = bool(getattr(args, 'merge_chunks', False))
                 return_entries = bool(program.get('return_entries', False))
+                overrides = program.get('overrides', [])
                 program['lift_options_string'] = lift_options_string(
                     code_end if raw else None, entries, merge_chunks, return_entries,
-                    program['link_base'] if raw else None)
+                    program['link_base'] if raw else None, overrides)
                 program['lift_options'] = lift_options_digest(program['lift_options_string'])
                 (outdir / 'code.bin').write_bytes(blob[offset:offset + size])
                 (outdir / 'functions.json').write_text(json.dumps([dict(start=s, end=e) for s, e in bounds]))
@@ -1528,6 +1555,8 @@ def build_programs(args, registry_writer):
                     command += ['--merge-chunks']
                 if return_entries:
                     command += ['--return-entries']
+                for override in overrides:
+                    command += ['--override', override]
                 result = subprocess.run(command, capture_output=True, text=True)
                 (outdir / 'lift.log').write_text(result.stdout + result.stderr)
                 if result.returncode:
@@ -1544,6 +1573,24 @@ def build_programs(args, registry_writer):
                     raise ValueError('generated function extends beyond executable ranges')
                 if (set(diagnostics['call_targets']) | set(diagnostics['branch_targets'])) - starts:
                     raise ValueError('direct branch/call targets lack generated function entries')
+                if overrides:
+                    from spu_lifter import compute_bi_r0_jumps, override_leaf_problem
+
+                    code = blob[offset:offset + size]
+                    decoded = disassemble_spu(code, base)
+                    generated_bounds = diagnostics['functions']
+                    classification = compute_bi_r0_jumps(
+                        decoded, generated_bounds, image=code, base=base,
+                        delta=image_delta(base, program['link_base'] if raw else None),
+                        entry_points=[program['entry'], *entries])
+                    ends = dict(generated_bounds)
+                    for address in parse_overrides(overrides):
+                        if address not in ends:
+                            raise ValueError(f'override 0x{address:X} is not a generated function')
+                        problem = override_leaf_problem(
+                            decoded, address, ends[address], classification, starts)
+                        if problem:
+                            raise ValueError(f'override 0x{address:X} refuses function: {problem}')
                 for filename in ['spu_recomp.c', 'spu_recomp.h']:
                     if not (outdir / filename).is_file():
                         raise ValueError('lifter output missing ' + filename)
@@ -1609,7 +1656,7 @@ def build_programs(args, registry_writer):
         print(f"[build_spu_workloads] {len(imgs) if usable else 0}/{len(report['programs'])} candidates registered; "
               f"complete={report['complete']}; report={destination / 'inventory.json'}")
         return 0 if usable else 1
-    except (ValueError, OSError) as error:
+    except (ValueError, TypeError, OSError) as error:
         report['complete'] = False
         report['errors'].append(str(error))
         for filename in [registry.name, 'sources.cmake']:
