@@ -8,7 +8,9 @@
  * thread touched: the lowest page mincore reports resident (POSIX) or committed (Windows: VirtualQuery). That is
  * exact to one host page, except where the host can take a touched page away: iOS compresses cold pages, a page
  * that is no longer resident is not counted, and the report is then a lower bound. Nothing is pre-filled (that
- * would commit the whole reservation).
+ * would commit the whole reservation). Linux transparent huge pages are the opposite case: one touch makes the
+ * whole 2 MiB around it resident, mincore says so, and the mark would be rounded up to 2 MiB steps;
+ * host_stack_measure_prepare turns them off for a measuring run.
  *
  * Linux needs _GNU_SOURCE before the first system header (pthread_getattr_np).
  */
@@ -18,13 +20,18 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <errno.h>
+#include <stdio.h>
 
 #ifdef _WIN32
 #  include <windows.h>
 #else
 #  include <pthread.h>
 #  include <sys/mman.h>
+#  include <stdlib.h>
 #  include <unistd.h>
+#  ifdef __linux__
+#    include <sys/prctl.h>
+#  endif
 #endif
 
 #if defined(__linux__) && !defined(_GNU_SOURCE) && !defined(__cplusplus)
@@ -63,6 +70,28 @@ static inline int host_stack_range_self(uintptr_t* lo, size_t* size)
     *lo = (uintptr_t)addr;
     *size = sz;
     return 1;
+#endif
+}
+
+/* A Linux kernel with transparent huge pages in `always` mode may back a thread stack with 2 MiB pages (glibc maps
+ * stacks with MAP_STACK, which kernels from 6.7 keep out of huge pages; older kernels and other allocators do
+ * not): one touched byte then makes the whole 2 MiB resident, mincore says so, and the mark comes out in 2 MiB
+ * steps (measured on a stack outside MAP_STACK: ~300 KB touched, 2 MiB reported). madvise on the stack at the
+ * thread's start is too late, since the top of the stack, where the thread's control block lives, is faulted by
+ * pthread_create before the thread runs. So a measuring run (PS3_HOST_STACK_HWM set) turns THP off for the
+ * process with PR_SET_THP_DISABLE before it creates a thread; the setting is the process's and applies to every
+ * later fault. A kernel before 3.15, or a filter that refuses prctl, is named once and the marks are then an upper
+ * bound in 2 MiB steps. Darwin and Windows have no such rounding. */
+static inline void host_stack_measure_prepare(void)
+{
+#if defined(__linux__) && defined(PR_SET_THP_DISABLE)
+    static int s_named;
+    if (getenv("PS3_HOST_STACK_HWM") == NULL) return;
+    if (prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0) != 0) {
+        const int err = errno;
+        if (!__atomic_exchange_n(&s_named, 1, __ATOMIC_RELAXED))
+            fprintf(stderr, "[HOSTSTACK] thp-disable-failed errno=%d: high-water marks may be rounded up to 2 MiB\n", err);
+    }
 #endif
 }
 
@@ -127,6 +156,7 @@ static inline int host_stack_high_water(uintptr_t lo, size_t size, size_t* high_
 static inline int ps3_host_pthread_create(pthread_t* t, size_t bytes, int detached, void* (*fn)(void*), void* arg)
 {
     pthread_attr_t attr;
+    host_stack_measure_prepare();
     int rc = PS3_HOST_THREAD_ATTR_INIT(&attr);
     if (rc != 0) return rc;
     rc = pthread_attr_setstacksize(&attr, bytes);
