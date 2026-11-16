@@ -2439,6 +2439,7 @@ if(UNIX)
             libs/video/rsx_vp_decompiler.c
             libs/video/rsx_fp_decompiler.c
             libs/video/rsx_tiling.c   # a C unit of its own: win32_compat.h clashes with the ObjC headers if included into the fixture
+            runtime/diag/host_exit.c  # ps3_ftrace.h registers its dump through ps3_host_at_quick_exit
         )
         set_source_files_properties(libs/video/tests/test_metal_bc_emulation.m
             PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
@@ -2471,6 +2472,7 @@ if(UNIX)
             libs/video/rsx_vp_decompiler.c
             libs/video/rsx_fp_decompiler.c
             libs/video/rsx_tiling.c   # a C unit of its own: win32_compat.h clashes with the ObjC headers if included into the fixture
+            runtime/diag/host_exit.c  # ps3_ftrace.h registers its dump through ps3_host_at_quick_exit
         )
         set_source_files_properties(libs/video/tests/test_metal_bc_failclosed.m
             PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
