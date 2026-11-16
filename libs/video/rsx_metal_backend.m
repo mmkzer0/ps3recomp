@@ -3121,6 +3121,18 @@ static unsigned eng_highest_apple_family(void)
     return 0;
 }
 
+/* Whether the device samples BC1-3 natively. The property exists from iOS 16.4; an older
+ * iOS has no such selector (calling it aborts), and its GPUs (A11 and older) lack BC. */
+static int eng_device_supports_bc(void)
+{
+#if TARGET_OS_IPHONE
+    if (@available(iOS 16.4, *)) return [s_dev supportsBCTextureCompression] ? 1 : 0;
+    return 0;
+#else
+    return 1;   /* macOS GPUs sample BC natively */
+#endif
+}
+
 /* The host GPU refused an allocation and the gate stood active across the call (and a bounded grace for the
  * host's notification), so it is the device's own refusal, not a lifecycle race; or the engine's own object table
  * (ENG_MAX_OBJECTS) has no slot for a texture the device did create (`table_full`). Either way carrying on would
@@ -3139,12 +3151,7 @@ static PS3_NORETURN void eng_alloc_stop(const char* what, MTLTextureDescriptor* 
     unsigned long long gpu, ws, avail;
     eng_gpu_numbers(&gpu, &ws, &avail);
     const char* pf_name = d.is_buffer ? "none" : eng_pixel_format_name(d.pixel_format);
-    const int bc_supported =
-#if TARGET_OS_IPHONE
-        (int)[s_dev supportsBCTextureCompression];
-#else
-        1;   /* macOS GPUs sample BC natively */
-#endif
+    const int bc_supported = eng_device_supports_bc();
     const unsigned family = eng_highest_apple_family();
     fprintf(stderr, "[RSX metal] rejected %s: type=%lu pixelFormat=%lu(%s) size=%lux%lux%lu mips=%lu array=%lu"
                     " samples=%lu usage=0x%lX storage=%lu bc_supported=%d apple_family=%u\n",
@@ -5509,7 +5516,7 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
             return -1;
         }
 #if TARGET_OS_IPHONE
-        s_ios_supports_bc = [s_dev supportsBCTextureCompression];
+        s_ios_supports_bc = eng_device_supports_bc();
         /* Apple's Metal feature table: border colour starts at Apple7. */
         s_ios_supports_border = [s_dev supportsFamily:MTLGPUFamilyApple7];
         fprintf(stderr, "[RSX metal] supportsBCTextureCompression=%d\n", (int)s_ios_supports_bc);
