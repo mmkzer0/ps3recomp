@@ -28,7 +28,7 @@ KINDS = ["identity-mismatch", "lifter-abi", "config-invalid", "unresolved-nid",
          "rsx-unknown-method", "np-trophy-unmodelled", "rsx-driver-method",
          "pad-trace", "fiber-host-context", "adec-no-decoder", "host-wait-error",
          "spu-xdiff-divergence", "host-log-file", "host-thread-stack", "host-gpu-alloc",
-         "host-gpu-command"]
+         "host-gpu-command", "spu-indirect-target-set"]
 
 
 def probe(*args):
@@ -46,6 +46,14 @@ def test_every_kind_stops_with_its_id():
     for i, kind in enumerate(KINDS):
         f = g.expect_stop(probe("kind", str(i)), kind)
         assert "pc" not in f and "tid" not in f, f
+
+
+def test_spu_indirect_target_set_stop_names_the_site_and_target():
+    f = g.expect_stop(probe("spu-indirect-target-set"), "spu-indirect-target-set")
+    assert f["image"] == "7"
+    assert f["target"] == "0x1234"
+    assert int(f["pc"], 0) == 0x48
+    assert f["tid"] == "3"
 
 
 def test_out_of_range_kind_still_stops():

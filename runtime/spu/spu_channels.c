@@ -3032,6 +3032,25 @@ static void spu_lift_miss(spu_context* ctx)
     if (ctx->image_id >= 0) ctx->lift_miss++;
 }
 
+void spu_indirect_target_set_mismatch(spu_context* ctx, uint32_t branch_pc,
+                                      uint32_t target)
+{
+    char image[16], target_text[16];
+    snprintf(image, sizeof image, "%d", ctx->image_id);
+    snprintf(target_text, sizeof target_text, "0x%05X", target & SPU_LS_MASK);
+    const ps3_stop_field fields[] = {
+        {"image", image}, {"target", target_text},
+    };
+    ps3_stop_site site = {
+        branch_pc & SPU_LS_MASK, ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->spu_id,
+    };
+    ps3_stop(PS3_STOP_SPU_INDIRECT_TARGET_SET,
+             "an SPU indirect branch left its static target set",
+             "Inspect the indirect branch and its table; update the lift only "
+             "when every possible target is proven.",
+             fields, sizeof fields / sizeof fields[0], &site);
+}
+
 void spu_indirect_branch(spu_context* ctx)
 {
     /* Real SPU bi/bisl mask the target to the 256 KB local store; the high bits
