@@ -9,7 +9,8 @@ Seeds the function set from four sources:
   1. ELF entry point (e_entry).
   2. Symbol table -- STT_FUNC entries (with their st_value/st_size if size
      is non-zero, which gives us *exact* boundaries when present).
-  3. All brsl/brasl targets the disassembler can resolve in the code.
+  3. All brsl/brasl targets the disassembler can resolve, except PC-getters
+     whose target is the fall-through address (pc + 4).
   4. Addresses loaded into $r0 by `il`/`ila` -- the link-register resume
      idiom (see collect_link_register_targets).
 
@@ -240,23 +241,35 @@ _BRANCH_MNEMONICS = {
     "brz", "brnz", "brhz", "brhnz",           # conditional branches
 }
 
+def _is_pc_getter(ins):
+    if ins.mnemonic not in ("brsl", "brasl"):
+        return False
+    operands = [token.strip() for token in ins.operands.split(",") if token.strip()]
+    if not operands or not operands[-1].startswith("0x"):
+        return False
+    try:
+        target = int(operands[-1], 16)
+    except ValueError:
+        return False
+    return target == ((ins.addr + 4) & 0x3FFFF)
+
 def collect_branch_targets(insns):
     """All branch targets the disassembler resolved within `insns`.
 
-    Includes calls (brsl/brasl) AND non-call branches (br/bra/brz/brnz/...).
-    Conditional / unconditional cross-function branches are common — without
-    seeding them, the lifter sees calls to functions the detector never
-    promoted, producing linker-unresolved spu_func_X symbols.
+    Includes calls (brsl/brasl) AND non-call branches (br/bra/brz/brnz/...),
+    except PC-getter targets (target == pc+4), which do not establish a
+    function entry. Conditional / unconditional cross-function branches are
+    common — without seeding them, the lifter sees unresolved function symbols.
     """
     targets = set()
     for ins in insns:
-        if ins.mnemonic not in _BRANCH_MNEMONICS:
+        if ins.mnemonic not in _BRANCH_MNEMONICS or _is_pc_getter(ins):
             continue
-        ops = [t.strip() for t in ins.operands.split(",") if t.strip()]
-        for t in ops:
-            if t.startswith("0x"):
+        for token in ins.operands.split(","):
+            token = token.strip()
+            if token.startswith("0x"):
                 try:
-                    targets.add(int(t, 16))
+                    targets.add(int(token, 16))
                 except ValueError:
                     pass
     return targets
@@ -475,6 +488,108 @@ def collect_jump_table_targets(insns, code, code_start, code_end,
     return targets
 
 
+_NO_DESTINATION = {
+    "br", "bra", "brz", "brnz", "brhz", "brhnz", "bi",
+    "biz", "binz", "bihz", "bihnz", "iret", "stop",
+    "stopd", "halt", "hbr", "hbra", "hbrr", "stqd", "stqa",
+    "stqr", "stqx", "wrch", "lnop", "nop", "sync", "syncc",
+    "dsync", "hgt", "hlgt", "heq", "hgti", "hlgti", "heqi",
+}
+
+
+def _register_number(token):
+    token = token.strip()
+    if not token.startswith("$r") or not token[2:].isdigit():
+        return None
+    return int(token[2:])
+
+
+def _registers_in_operand(operand):
+    registers = []
+    cursor = 0
+    while True:
+        start = operand.find("$r", cursor)
+        if start < 0:
+            return registers
+        end = start + 2
+        while end < len(operand) and operand[end].isdigit():
+            end += 1
+        if end > start + 2:
+            registers.append(int(operand[start + 2:end]))
+        cursor = end
+
+
+def _destination_register(insn):
+    if insn.mnemonic in _NO_DESTINATION:
+        return None
+    operands = [token.strip() for token in insn.operands.split(",") if token.strip()]
+    return _register_number(operands[0]) if operands else None
+
+
+def _source_registers(insn):
+    operands = [token.strip() for token in insn.operands.split(",") if token.strip()]
+    if _destination_register(insn) is not None:
+        operands = operands[1:]
+    return {register for operand in operands
+            for register in _registers_in_operand(operand)}
+
+
+def _pc_getter_loader_is_pic_delta(by_addr, loader, getter, branch_targets):
+    loader_ops = [token.strip() for token in loader.operands.split(",") if token.strip()]
+    getter_ops = [token.strip() for token in getter.operands.split(",") if token.strip()]
+    if len(loader_ops) != 2 or not getter_ops:
+        return False
+    loader_reg = _register_number(loader_ops[0])
+    link_reg = _register_number(getter_ops[0])
+    if loader_reg is None or link_reg is None or loader_reg == link_reg:
+        return False
+
+    arithmetic = {"a", "sf", "sfx", "ai"}
+    block_ends = {
+        "br", "bra", "brz", "brnz", "brhz", "brhnz",
+        "brsl", "brasl", "bi", "bisl", "bisled", "biz", "binz",
+        "bihz", "bihnz", "iret", "stop", "stopd", "halt",
+    }
+    used_in_pic_delta = False
+    previous = getter
+    address = (getter.addr + 4) & 0x3FFFF
+    for _ in range(len(by_addr)):
+        insn = by_addr.get(address)
+        if (insn is None or insn.addr in branch_targets
+                or (previous.mnemonic in block_ends and not _is_pc_getter(previous))):
+            return False
+        sources = _source_registers(insn)
+        destination = _destination_register(insn)
+        if loader_reg in sources:
+            if insn.mnemonic not in arithmetic or link_reg not in sources:
+                return False
+            used_in_pic_delta = True
+        if destination == loader_reg:
+            return used_in_pic_delta
+        if destination == link_reg:
+            return False
+        if insn.mnemonic in block_ends:
+            return False
+        previous = insn
+        address = (address + 4) & 0x3FFFF
+    return False
+
+
+def _pc_getter_pic_delta_loaders(insns):
+    by_addr = {ins.addr: ins for ins in insns}
+    branch_targets = collect_branch_targets(insns)
+    loaders = set()
+    for getter in insns:
+        if not _is_pc_getter(getter):
+            continue
+        loader = by_addr.get((getter.addr - 4) & 0x3FFFF)
+        if (loader is not None and loader.mnemonic in ("il", "ila")
+                and _pc_getter_loader_is_pic_delta(
+                    by_addr, loader, getter, branch_targets)):
+            loaders.add(loader.addr)
+    return loaders
+
+
 def collect_ila_continuation_targets(insns, code_start, code_end, delta=0):
     """Continuation addresses materialised as plain immediates:
 
@@ -495,10 +610,14 @@ def collect_ila_continuation_targets(insns, code_start, code_end, delta=0):
     Also pairs `ilhu $rN, hi` + `iohl $rN, lo` (the 32-bit two-step form —
     Bink builds 0xDE94 that way).
 
-    Seeds EVERY il/ila/ilhu+iohl immediate that is a 4-aligned in-code address
-    decoding at an instruction boundary. Same cost argument as the jump-table
-    scan above: a false positive only adds an entry point at a valid
-    instruction boundary; a false negative loses an entire code region.
+    Seeds every il/ila/ilhu+iohl immediate that is a 4-aligned in-code address
+    decoding at an instruction boundary. An `il`/`ila` immediately before a
+    direct PC-getter is suppressed only when register-use analysis proves it
+    participates in a same-basic-block arithmetic adjustment with that
+    getter's link register and the loaded register is killed in the block.
+    Any other use, a block exit with the register still live, or a use across a
+    basic-block boundary keeps the immediate as a possible entry. A separate
+    call or branch to the address still seeds it through `collect_branch_targets`.
 
     `delta` (image_delta) is non-zero for a position-independent image, whose
     immediates hold image-relative addresses: each is tried as written and as
@@ -507,6 +626,13 @@ def collect_ila_continuation_targets(insns, code_start, code_end, delta=0):
     by_addr = {ins.addr: ins for ins in insns}
     valid_starts = set(by_addr)
     targets = set()
+    pc_getter_loaders = _pc_getter_pic_delta_loaders(insns)
+    pc_getter_target_by_loader = {}
+    for getter in insns:
+        if _is_pc_getter(getter):
+            loader = by_addr.get(getter.addr - 4)
+            if loader is not None and loader.addr in pc_getter_loaders:
+                pc_getter_target_by_loader[loader.addr] = (getter.addr + 4) & 0x3FFFF
     ilhu_val = {}                     # reg -> pending high halfword
     for ins in insns:
         wops = [t.strip() for t in ins.operands.split(",") if t.strip()]
@@ -528,8 +654,9 @@ def collect_ila_continuation_targets(insns, code_start, code_end, delta=0):
         if cand is None:
             continue
         for target in relocated_code_addresses(cand, delta, by_addr):
-            if target and (target & 3) == 0 and code_start <= target < code_end \
-               and target in valid_starts:
+            if (target and (target & 3) == 0 and code_start <= target < code_end
+                    and target in valid_starts
+                    and target != pc_getter_target_by_loader.get(ins.addr)):
                 targets.add(target)
     return targets
 
@@ -661,10 +788,15 @@ def collect_function_pointer_tables(buf, phs, code_start, code_end,
 
 # Kept for backwards compatibility / call-only counting.
 def collect_brsl_targets(insns):
-    return {t for ins in insns if ins.mnemonic in ("brsl", "brasl")
-            for t in [int(tok.strip(), 16) for tok in ins.operands.split(",")
-                      if tok.strip().startswith("0x")]}
-
+    targets = set()
+    for ins in insns:
+        if ins.mnemonic not in ("brsl", "brasl") or _is_pc_getter(ins):
+            continue
+        for token in ins.operands.split(","):
+            token = token.strip()
+            if token.startswith("0x"):
+                targets.add(int(token, 16))
+    return targets
 
 # Mnemonics that end a function's fall-through region.
 _TERMINATORS_NO_FALLTHROUGH = {

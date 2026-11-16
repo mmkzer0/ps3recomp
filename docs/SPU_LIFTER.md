@@ -92,14 +92,14 @@ doubles the lifted code a title compiles, so it is off by default.
 
 `--override 0xADDR=SYMBOL` is repeatable. `SYMBOL` is declared as
 `void SYMBOL(spu_context*)` in the generated header and defined by the
-consumer. The lifter keeps `spu_func_ADDR` as the T1 reference body, but
-retargets direct calls, cross-function `SPU_DIRECT` branches and the selected
-function-table entry to `SYMBOL`; the registry stores both selected and
-reference pointers (`tools/spu_lifter.py:1232-1245, 1278-1292,
-1498-1550`; `runtime/spu/spu_channels.c:1924-1967`).
+consumer. Every `spu_func_ADDR` remains the lifted T1 reference body. The
+function-table entry at `E` selects `SYMBOL`; direct call and branch references
+from outside its unit also target it. References within an admitted unit stay
+directed at lifted member symbols for A/B. The registry stores both selected
+and reference pointers (`tools/spu_lifter.py`, `runtime/spu/spu_channels.c`).
 
 The pilot fails closed unless the decoded function is a leaf compute routine:
-no call out (`brsl`/`brasl`/`bisl`, excluding PC-getters), channel instruction,
+no call out (`brsl`/`brasl`/`bisl`/`bisled`, excluding PC-getters), channel instruction,
 indirect branch other than `bi $r0` with the incoming link value preserved,
 stop/halt, cross-bound tail call or fall-through tail call. A stack reload
 qualifies only when its dominating save and matching slot are proved under
@@ -108,10 +108,44 @@ assumption: `"spu-abi-link-slot-private"`, `"spu-abi-callee-saved"` or
 `"no-unmodelled-indirect-entry"`, and names that reason. The general lifter
 may still emit `SPU_RET` under those explicitly recorded assumptions; its
 whole-job replay and in-run audit are empirical checks, not T2 admission.
-The pipeline independently recomputes the leaf/return proof before registering
-an override, even if an alternate lifter subprocess omitted the gate
-(`tools/spu_lifter.py`: `override_leaf_problem`, `compute_bi_r0_jumps`;
-`tools/spu_program_pipeline.py`: registration gates).
+The pipeline recomputes the return proof and calls the lifter's same
+`override_unit_admission` gate before registration, even if an alternate
+lifter subprocess omitted the gate (`tools/spu_lifter.py`:
+`override_leaf_problem`, `override_unit_admission`, `compute_bi_r0_jumps`;
+`tools/spu_program_pipeline.py`: registration gate).
+
+An override may name a closed tail-call unit instead of one leaf. Starting at
+entry `E`, the unit is the transitive closure of sequential fall-through edges
+into detected function starts and direct `br`, `brz`, `brnz`, `brhz` or
+`brhnz` edges into detected function starts. Fall-through addresses use SPU
+local-store wrapping (`(pc + 4) & 0x3FFFC`), including a transfer from the end
+of local store to address zero. The single-function path retains its strict
+leaf check and also undergoes the reachable-exit proof below. For a chain, each
+member must pass that same check after only those exact tail edges are exempted;
+calls (`brsl`/`brasl`/`bisl`/`bisled`), channels, indirect branches, stops and
+unproven returns remain refused.
+
+Every reachable control-flow exit from every member must be either a proven
+`bi $r0` return or one of the unit's recorded tail edges. This includes both
+paths of conditional branches. An exit to a non-member, an undecoded gap, or
+past the decoded image is refused with its source address; infinite cycles
+inside the unit are allowed. At least one reachable member return must be
+proven, using only the already admitted `"spu-abi-link-slot"` assumption.
+
+The unit must have no known foreign call or branch (direct or statically
+resolved indirect) into any address in the unit except at `E`. This also
+checks sequential fall-through and return continuations after `brsl`, `brasl`,
+`bisl` or `bisled`. No independent entry point may land inside a member other
+than `E`; an unresolved indirect branch outside the unit also blocks admission
+because its target could enter a member. A refusal names the foreign source
+edge, unresolved site, or entry point. These checks establish the control-flow
+invariant needed for replacement: all known entries enter at `E`, and every
+non-return exit stays within the admitted closure until a proven return.
+Cycles among members add no escape from the unit. All lifted member functions
+remain emitted and registered, and references within the unit continue to
+target those lifted functions, so the T1 reference used for A/B stays wholly
+lifted while external references to `E` select the native function.
+
 
 The raw-image manifest carries `overrides` as a list of `ADDR=SYMBOL` strings
 and a nonzero `native_rev`; the pipeline validates and canonicalizes them into

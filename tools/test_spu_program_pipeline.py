@@ -1003,6 +1003,20 @@ class Pipeline(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         return (output / 'fn_override_job.bin').read_bytes()
 
+    def tail_chain_image(self, foreign_entry=False):
+        from gen_test_raw_job import BI, BR, BRSL, IL, NOP, _ri16, _rr
+
+        base, _ = raw_job_tools()
+        size = 0x54 if foreign_entry else 0x50
+        words = [_rr(NOP)] * (size // 4)
+        words[0] = _ri16(BR, 0x40 // 4)
+        words[0x40 // 4] = _ri16(BR, (0x48 - 0x40) // 4)
+        words[0x48 // 4] = _ri16(IL, 7, 3)
+        words[0x4C // 4] = _rr(BI, ra=0)
+        if foreign_entry:
+            words[0x50 // 4] = _ri16(BRSL, (0x48 - 0x50) // 4)
+        return base, b''.join(struct.pack('>I', word) for word in words)
+
     def test_raw_native_override_reaches_lifter_and_registration(self):
         raw_base, _ = raw_job_tools()
         function = raw_base + 0x70
@@ -1027,6 +1041,75 @@ class Pipeline(unittest.TestCase):
         registry = (self.output / 'spu_workloads.c').read_text()
         self.assertIn('SPU_TIER_PARTIAL', registry)
         self.assertIn('0x0000000000001234ULL', registry)
+    def test_raw_tail_chain_override_registers_through_pipeline(self):
+        base, blob = self.tail_chain_image()
+        entry = self.raw_entry(
+            blob, name='raw-tail-chain.bin', code_end=hex(base + len(blob)),
+            overrides=[f'{hex(base)}=native_chain'], native_rev='0x1234')
+        result = self.run_raw([entry])
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        program = self.manifest()['programs'][0]
+        self.assertEqual(program['status'], 'registered')
+        starts = {start for start, _end in program['diagnostics']['functions']}
+        self.assertEqual(starts, {base, base + 0x40, base + 0x48})
+        source = (self.output / program['name'] / 'spu_recomp.c').read_text()
+        prefix = program['name'] + '_'
+        self.assertIn(
+            f'{{ 0x{base:08X}u, native_chain, {prefix}spu_func_{base:08X}, 1,', source)
+        self.assertIn(f'SPU_DIRECT(ctx, 0x{base + 0x40:X}, '
+                      f'{prefix}spu_func_{base + 0x40:08X})', source)
+        self.assertIn(f'SPU_DIRECT(ctx, 0x{base + 0x48:X}, '
+                      f'{prefix}spu_func_{base + 0x48:08X})', source)
+        self.assertIn('native_chain', (self.output / 'spu_workloads.c').read_text())
+
+    def test_lifter_and_pipeline_share_foreign_chain_entry_refusal(self):
+        base, blob = self.tail_chain_image(foreign_entry=True)
+        foreign_entry = base + 0x50
+        member = base + 0x48
+        reason = (f'foreign call at 0x{foreign_entry:X} targets override member '
+                  f'0x{member:X}')
+        bounds = [(base, base + 4), (base + 0x40, base + 0x44),
+                  (member, base + 0x50), (foreign_entry, base + 0x54)]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_path = root / 'chain.bin'
+            functions_path = root / 'functions.json'
+            output = root / 'direct'
+            image_path.write_bytes(blob)
+            functions_path.write_text(json.dumps(
+                [{'start': start, 'end': end} for start, end in bounds]))
+            command = [
+                sys.executable, str(TOOLS / 'spu_lifter.py'), str(image_path),
+                '--base', hex(base), '--functions', str(functions_path),
+                '--symbol-prefix', 'chain_', '--output', str(output),
+                '--extra-funcs', hex(foreign_entry), '--code-end', hex(base + len(blob)),
+                '--override', f'{hex(base)}=native_chain',
+            ]
+            direct = subprocess.run(command, capture_output=True, text=True, check=False)
+            self.assertNotEqual(direct.returncode, 0)
+            self.assertIn(reason, direct.stderr)
+
+        alternate = self.root / 'unchecked_chain_lifter.py'
+        alternate.write_text(
+            'import subprocess, sys\n'
+            'args = list(sys.argv[1:])\n'
+            'while "--override" in args:\n'
+            '    index = args.index("--override")\n'
+            '    del args[index:index + 2]\n'
+            f'command = [sys.executable, {str(TOOLS / "spu_lifter.py")!r}, *args]\n'
+            'raise SystemExit(subprocess.run(command, check=False).returncode)\n')
+        entry = self.raw_entry(
+            blob, name='raw-tail-chain-foreign.bin',
+            code_end=hex(base + len(blob)),
+            extra_entry_points=[hex(foreign_entry)],
+            overrides=[f'{hex(base)}=native_chain'], native_rev='0x1234')
+        result = self.run_raw([entry], '--lifter', str(alternate))
+        self.assertNotEqual(result.returncode, 0)
+        program = self.manifest()['programs'][0]
+        self.assertEqual(program['status'], 'unsupported')
+        self.assertIn(reason, program['reason'])
+        self.assertFalse((self.output / 'spu_workloads.c').exists())
+
 
     def test_pipeline_rechecks_override_assumptions_before_registration(self):
         from gen_test_raw_job import AI, BI, BR, LQD, NOP, STQD, _ri10, _ri16, _rr

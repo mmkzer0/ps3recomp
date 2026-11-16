@@ -1574,23 +1574,24 @@ def build_programs(args, registry_writer):
                 if (set(diagnostics['call_targets']) | set(diagnostics['branch_targets'])) - starts:
                     raise ValueError('direct branch/call targets lack generated function entries')
                 if overrides:
-                    from spu_lifter import compute_bi_r0_jumps, override_leaf_problem
+                    from spu_lifter import compute_bi_r0_jumps, override_unit_admission
 
                     code = blob[offset:offset + size]
                     decoded = disassemble_spu(code, base)
                     generated_bounds = diagnostics['functions']
+                    admission_entries = [program['entry'], *entries,
+                                         *parse_overrides(overrides)]
                     classification = compute_bi_r0_jumps(
                         decoded, generated_bounds, image=code, base=base,
                         delta=image_delta(base, program['link_base'] if raw else None),
-                        entry_points=[program['entry'], *entries])
-                    ends = dict(generated_bounds)
+                        entry_points=admission_entries)
                     for address in parse_overrides(overrides):
-                        if address not in ends:
-                            raise ValueError(f'override 0x{address:X} is not a generated function')
-                        problem = override_leaf_problem(
-                            decoded, address, ends[address], classification, starts)
+                        _members, _tail_graph, problem = override_unit_admission(
+                            decoded, generated_bounds, address, classification,
+                            admission_entries)
                         if problem:
-                            raise ValueError(f'override 0x{address:X} refuses function: {problem}')
+                            raise ValueError(
+                                f'override 0x{address:X} refuses function: {problem}')
                 for filename in ['spu_recomp.c', 'spu_recomp.h']:
                     if not (outdir / filename).is_file():
                         raise ValueError('lifter output missing ' + filename)
