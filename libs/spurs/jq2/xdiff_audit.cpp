@@ -33,6 +33,7 @@
 
 #include "jq2/xdiff_capture.hpp"
 #include "ps3emu/config.h"
+#include "ps3emu/host_exit.h"
 #include "ps3emu/ps3_ftrace.h"
 #include "ps3emu/stop.h"
 #include "ps3emu/host_stack.h"
@@ -430,7 +431,7 @@ void audit_configure()
                 start_thread(s);
                 std::atexit(&shutdown_at_exit);
 #ifndef _WIN32
-                at_quick_exit(&shutdown_at_exit);
+                ps3_host_at_quick_exit(&shutdown_at_exit);
 #endif
                 capture_publish_audit_recording(); /* producers record from here on */
             }

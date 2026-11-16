@@ -762,7 +762,7 @@ if(PS3RECOMP_BUILD_TESTS)
     set_tests_properties(log_first PROPERTIES LABELS "runtime;t0")
     # The recorder's state reaches threads that did not initialise it (ps3_ft_recording's acquire).
     if(UNIX)
-        add_executable(test_ftrace_publish tests/test_ftrace_publish.c)
+        add_executable(test_ftrace_publish tests/test_ftrace_publish.c runtime/diag/host_exit.c)
         target_include_directories(test_ftrace_publish PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
         target_link_libraries(test_ftrace_publish PRIVATE Threads::Threads)
         add_test(NAME ftrace_publish COMMAND test_ftrace_publish)
@@ -771,7 +771,7 @@ if(PS3RECOMP_BUILD_TESTS)
         # scenario (the recorder reads its environment once); tests/run_ftrace_zst.py drives and inspects.
         find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
         if(Python3_Interpreter_FOUND)
-            add_executable(test_ftrace_zst tests/test_ftrace_zst.c)
+            add_executable(test_ftrace_zst tests/test_ftrace_zst.c runtime/diag/host_exit.c)
             target_include_directories(test_ftrace_zst PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
             target_compile_definitions(test_ftrace_zst PRIVATE _GNU_SOURCE)
             add_test(NAME ftrace_zst
@@ -951,6 +951,7 @@ if(PS3RECOMP_BUILD_TESTS)
             # sys_fs.c's migrated diagnostics call ps3_log_*, whose references to the typed
             # configuration come from config.cpp.
             runtime/diag/ps3_log.c
+            runtime/diag/host_exit.c
             runtime/config/config.cpp)
         target_include_directories(test_sys_fs_guest_range PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/include"
@@ -979,12 +980,27 @@ if(PS3RECOMP_BUILD_TESTS)
     target_link_libraries(test_quick_exit PRIVATE ps3recomp_runtime)
     set_target_properties(test_quick_exit PROPERTIES LINKER_LANGUAGE CXX)
 
+    # ps3_host_at_quick_exit() on the toolkit-owned table, the path an iOS 16 build takes because
+    # its libSystem has no at_quick_exit (runtime/diag/host_exit.c). The define forces the table on a
+    # host whose libc has the symbols; the fixture forks, so it is POSIX only.
+    if(NOT WIN32)
+        add_executable(test_host_at_quick_exit
+            tests/test_host_at_quick_exit.c
+            runtime/diag/host_exit.c)
+        target_include_directories(test_host_at_quick_exit PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+        target_compile_definitions(test_host_at_quick_exit PRIVATE PS3_HOST_EXIT_FORCE_TABLE=1)
+        target_link_libraries(test_host_at_quick_exit PRIVATE Threads::Threads)
+        add_test(NAME host_at_quick_exit COMMAND test_host_at_quick_exit)
+        set_tests_properties(host_at_quick_exit PROPERTIES LABELS "runtime;t0" TIMEOUT 60)
+    endif()
+
     if(NOT WIN32)
         # The vector single-precision ops against the exact per-lane references.
         # spu_helpers.h's references reach spu_unsupported, which logs through ps3_log; without the
         # implementation GNU ld leaves ps3_log_site_admit undefined (Mach-O's dead_strip hid it).
         add_executable(test_spu_float_exact
             runtime/spu/tests/test_spu_float_exact.c
+            runtime/diag/host_exit.c
             runtime/diag/ps3_log.c
             runtime/config/config.cpp
             runtime/diag/stop.cpp)
@@ -996,6 +1012,7 @@ if(PS3RECOMP_BUILD_TESTS)
         # The vector forms against the scalar per-lane forms, directly.
         add_executable(test_spu_float_vector_scalar
             runtime/spu/tests/test_spu_float_vector_scalar.c
+            runtime/diag/host_exit.c
             runtime/diag/ps3_log.c
             runtime/config/config.cpp
             runtime/diag/stop.cpp)
@@ -1015,6 +1032,7 @@ if(PS3RECOMP_BUILD_TESTS)
         # default FPCR and under round-toward-zero plus flush-to-zero.
         add_executable(test_spu_fi_cflts_neon
             runtime/spu/tests/test_spu_fi_cflts_neon.c
+            runtime/diag/host_exit.c
             runtime/diag/ps3_log.c
             runtime/config/config.cpp
             runtime/diag/stop.cpp)
@@ -1028,6 +1046,7 @@ if(PS3RECOMP_BUILD_TESTS)
         # immediate-form boundaries, against ISA-layout encodings.
         add_executable(test_spu_decode
             runtime/spu/tests/test_spu_decode.c
+            runtime/diag/host_exit.c
             runtime/diag/ps3_log.c
             runtime/config/config.cpp
             runtime/diag/stop.cpp)
@@ -1046,7 +1065,8 @@ if(PS3RECOMP_BUILD_TESTS)
                 runtime/spu/tests/test_spu_group_lifecycle.c
                 runtime/platform/host_clock.c
                 runtime/platform/host_wait.c
-                runtime/diag/ps3_log.c)
+                runtime/diag/ps3_log.c
+                runtime/diag/host_exit.c)
             target_include_directories(test_spu_group_lifecycle PRIVATE
                 "${CMAKE_CURRENT_SOURCE_DIR}/include"
                 "${CMAKE_CURRENT_SOURCE_DIR}/runtime"
@@ -1070,7 +1090,8 @@ if(PS3RECOMP_BUILD_TESTS)
             add_executable(test_spu_group_destroy_race
                 runtime/spu/tests/test_spu_group_destroy_race.c
                 # The fixture includes lv2_register.c, whose migrated lines call ps3_log_*.
-                runtime/diag/ps3_log.c)
+                runtime/diag/ps3_log.c
+                runtime/diag/host_exit.c)
             target_include_directories(test_spu_group_destroy_race PRIVATE
                 "${CMAKE_CURRENT_SOURCE_DIR}/include"
                 "${CMAKE_CURRENT_SOURCE_DIR}/runtime"
@@ -1095,7 +1116,8 @@ if(PS3RECOMP_BUILD_TESTS)
             add_executable(test_spu_group_host_stack
                 runtime/spu/tests/test_spu_group_host_stack.c
                 # The fixture includes lv2_register.c, whose migrated lines call ps3_log_*.
-                runtime/diag/ps3_log.c)
+                runtime/diag/ps3_log.c
+                runtime/diag/host_exit.c)
             target_include_directories(test_spu_group_host_stack PRIVATE
                 "${CMAKE_CURRENT_SOURCE_DIR}/include"
                 "${CMAKE_CURRENT_SOURCE_DIR}/runtime"
@@ -1132,7 +1154,8 @@ if(PS3RECOMP_BUILD_TESTS)
             runtime/platform/win32_compat.c
             runtime/platform/host_clock.c
             runtime/platform/host_wait.c
-            runtime/diag/ps3_log.c)
+            runtime/diag/ps3_log.c
+            runtime/diag/host_exit.c)
         target_include_directories(test_spu_report_hold PRIVATE
             include runtime runtime/spu runtime/platform)
         target_compile_definitions(test_spu_report_hold PRIVATE PS3_SYNC_TEST_HOOKS)
@@ -1147,6 +1170,7 @@ if(PS3RECOMP_BUILD_TESTS)
         # the env is read once per thread).
         add_executable(test_spu_opstats
             runtime/spu/tests/test_spu_opstats.c
+            runtime/diag/host_exit.c
             runtime/diag/ps3_log.c
             runtime/config/config.cpp
             runtime/diag/stop.cpp)
@@ -1164,6 +1188,7 @@ if(PS3RECOMP_BUILD_TESTS)
         # event stop and an image change mid-run.
         add_executable(test_spu_interp_loop
             runtime/spu/tests/test_spu_interp_loop.c
+            runtime/diag/host_exit.c
             runtime/diag/ps3_log.c
             runtime/config/config.cpp
             runtime/diag/stop.cpp)
@@ -1175,6 +1200,7 @@ if(PS3RECOMP_BUILD_TESTS)
 
         add_executable(test_spu_lockline_wait
             runtime/spu/tests/test_spu_lockline_wait.c
+            runtime/diag/host_exit.c
             runtime/diag/ps3_log.c
             runtime/config/config.cpp
             runtime/diag/stop.cpp)
@@ -1208,6 +1234,7 @@ if(PS3RECOMP_BUILD_TESTS)
             runtime/platform/win32_compat.c
             runtime/platform/host_clock.c
             runtime/platform/host_wait.c
+            runtime/diag/host_exit.c
             runtime/diag/ps3_log.c
             runtime/config/config.cpp
             runtime/diag/stop.cpp)
@@ -1253,9 +1280,9 @@ if(PS3RECOMP_BUILD_TESTS)
         ps3recomp_add_spu_helper_test(spu_helpers test_spu_helpers.c)
         ps3recomp_add_spu_helper_test(spu_helpers_scalar test_spu_helpers.c DEFINES SPU_SCALAR_HELPERS)
         # spu_unsupported (spu_helpers.h) logs through ps3_log; the two helpers fixtures call it.
-        target_sources(test_spu_helpers PRIVATE runtime/diag/ps3_log.c
+        target_sources(test_spu_helpers PRIVATE runtime/diag/ps3_log.c runtime/diag/host_exit.c
             runtime/config/config.cpp runtime/diag/stop.cpp)
-        target_sources(test_spu_helpers_scalar PRIVATE runtime/diag/ps3_log.c
+        target_sources(test_spu_helpers_scalar PRIVATE runtime/diag/ps3_log.c runtime/diag/host_exit.c
             runtime/config/config.cpp runtime/diag/stop.cpp)
         ps3recomp_add_spu_helper_test(spu_shufb test_spu_shufb.c)
         ps3recomp_add_spu_helper_test(spu_shufb_scalar test_spu_shufb.c DEFINES SPU_SCALAR_HELPERS)
@@ -1496,6 +1523,7 @@ if(PS3RECOMP_BUILD_TESTS)
                 runtime/platform/host_clock.c
                 runtime/platform/host_wait.c
                 runtime/diag/lifter_abi.c
+                runtime/diag/host_exit.c
                 runtime/diag/ps3_log.c
                 runtime/config/config.cpp
                 runtime/diag/stop.cpp)
@@ -1525,6 +1553,7 @@ if(PS3RECOMP_BUILD_TESTS)
                 runtime/platform/host_clock.c
                 runtime/platform/host_wait.c
                 runtime/diag/lifter_abi.c
+                runtime/diag/host_exit.c
                 runtime/diag/ps3_log.c
                 runtime/config/config.cpp
                 runtime/diag/stop.cpp)
@@ -1547,6 +1576,7 @@ if(PS3RECOMP_BUILD_TESTS)
                 runtime/spu/xdiff/spu_xdiff_fixture.c
                 # spu_context.h's copy probe logs through ps3_log; GNU ld needs the implementation.
                 runtime/diag/ps3_log.c
+                runtime/diag/host_exit.c
                 runtime/config/config.cpp
                 runtime/diag/stop.cpp)
             target_include_directories(test_spu_xdiff_fixture PRIVATE include runtime runtime/spu runtime/platform)
@@ -1954,7 +1984,7 @@ if(PS3RECOMP_BUILD_TESTS)
     # source and define the host stubs themselves.
     if(UNIX)
         function(ps3recomp_add_hle_check_test name source)
-            add_executable(${name} ${source} ${ARGN})
+            add_executable(${name} ${source} ${ARGN} runtime/diag/host_exit.c)
             target_include_directories(${name} PRIVATE
                 "${CMAKE_CURRENT_SOURCE_DIR}/include")
             # The fixtures compile HLE sources that reach win32_backtrace.h
@@ -1986,6 +2016,7 @@ if(PS3RECOMP_BUILD_TESTS)
         add_executable(test_game_host_paths
             libs/system/tests/test_game_host_paths.c
             runtime/diag/stop.cpp
+            runtime/diag/host_exit.c
             runtime/diag/ps3_log.c       # config.cpp configures the run log
             runtime/config/config.cpp)   # game.free_space_raw
         target_include_directories(test_game_host_paths PRIVATE
@@ -2058,6 +2089,7 @@ if(PS3RECOMP_BUILD_TESTS)
         add_executable(test_pad_trace
             libs/input/tests/test_pad_trace.c
             libs/input/pad_trace.c
+            runtime/diag/host_exit.c
             runtime/diag/stop.cpp)
         target_include_directories(test_pad_trace PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
         target_compile_definitions(test_pad_trace PRIVATE _GNU_SOURCE)
@@ -2138,6 +2170,7 @@ if(PS3RECOMP_BUILD_TESTS)
             add_executable(test_pad_replay
                 libs/input/tests/test_pad_replay.c
                 libs/input/pad_trace.c
+                runtime/diag/host_exit.c
                 runtime/diag/stop.cpp)
             target_include_directories(test_pad_replay PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
             target_compile_definitions(test_pad_replay PRIVATE _GNU_SOURCE)
@@ -2221,6 +2254,7 @@ if(UNIX)
             add_executable(test_metal_poly_offset
                 libs/video/tests/test_metal_poly_offset.m
                 libs/video/rsx_tiling.c
+                runtime/diag/host_exit.c
                 libs/video/rsx_shader_msl.cpp
                 libs/video/rsx_dispatch.c
                 libs/video/rsx_vertex_compact.c
@@ -2252,6 +2286,7 @@ if(UNIX)
                 libs/video/rsx_texture_layout.c
                 libs/video/rsx_vp_decompiler.c
                 libs/video/rsx_fp_decompiler.c
+                runtime/diag/host_exit.c
                 libs/video/rsx_tiling.c
             )
             set_source_files_properties(
@@ -2275,6 +2310,7 @@ if(UNIX)
                 libs/video/rsx_texture_layout.c
                 libs/video/rsx_vp_decompiler.c
                 libs/video/rsx_fp_decompiler.c
+                runtime/diag/host_exit.c
                 libs/video/rsx_tiling.c
             )
             set_source_files_properties(
@@ -2322,6 +2358,7 @@ if(UNIX)
             libs/video/tests/test_resc_present_metal.m
             libs/video/cellResc.c
             libs/video/resc_convert.c
+            runtime/diag/host_exit.c
             libs/video/rsx_shader_msl.cpp
             libs/video/rsx_vp_decompiler.c
             libs/video/rsx_fp_decompiler.c
@@ -2359,6 +2396,7 @@ if(UNIX)
                 libs/video/tests/test_metal_${gpu_test}.m
                 libs/video/rsx_shader_msl.cpp
                 libs/video/rsx_dispatch.c
+                runtime/diag/host_exit.c
                 libs/video/rsx_vertex_compact.c
                 libs/video/rsx_texture_layout.c
                 libs/video/rsx_vp_decompiler.c
@@ -2661,6 +2699,7 @@ if(UNIX)
         libs/video/tests/test_rsx_capture_walker.c
         libs/video/rsx_capture.cpp
         libs/video/gcm_default_state.c
+        runtime/diag/host_exit.c
         runtime/memory/label_window.c
         runtime/diag/stop.cpp
         runtime/diag/sha256.cpp)
@@ -2702,6 +2741,7 @@ if(UNIX)
         libs/video/rsx_dispatch.c
         libs/video/rsx_capture.cpp
         libs/video/gcm_default_state.c
+        runtime/diag/host_exit.c
         runtime/memory/label_window.c
         runtime/diag/stop.cpp
         runtime/diag/sha256.cpp)
@@ -2724,6 +2764,7 @@ if(UNIX)
         libs/video/rsx_dispatch.c
         libs/video/rsx_capture.cpp
         libs/video/gcm_default_state.c
+        runtime/diag/host_exit.c
         runtime/memory/label_window.c
         runtime/diag/stop.cpp
         runtime/diag/sha256.cpp)
@@ -2749,6 +2790,7 @@ if(UNIX)
         libs/video/tests/test_rsx_method_census.c
         libs/video/rsx_dispatch.c
         libs/video/gcm_default_state.c
+        runtime/diag/host_exit.c
         runtime/memory/label_window.c
         runtime/diag/stop.cpp)
     target_include_directories(test_rsx_method_census PRIVATE ${RSX_CAPTURE_FIXTURE_INCLUDES})
@@ -2791,6 +2833,7 @@ if(UNIX)
             libs/video/tests/test_depth_range_metal.m
             libs/video/rsx_dispatch.c
             libs/video/rsx_vertex_compact.c
+            runtime/diag/host_exit.c
             libs/video/rsx_texture_layout.c
             libs/video/rsx_vp_decompiler.c
             libs/video/rsx_fp_decompiler.c

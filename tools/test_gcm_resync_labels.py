@@ -19,6 +19,7 @@ with tempfile.TemporaryDirectory(prefix='gcm-resync-labels-') as tmp:
                     '-I' + str(root / 'include'), '-I' + str(root / 'libs/video'),
                     str(root / 'libs/video/tests/test_gcm_resync_labels.c'),
                     str(root / 'runtime/memory/label_window.c'),
+                    str(root / 'runtime/diag/host_exit.c'),
                     str(root / 'libs/video/gcm_default_state.c'), *linker,
                     '-o', str(binary)], check=True)
     # The fixture sets gcm.park_resync (Compatibility mode) in its stub configuration.

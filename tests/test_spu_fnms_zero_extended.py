@@ -34,7 +34,7 @@ def main():
         cmd += ["-ffunction-sections","-fdata-sections",
                 "-Wl,-dead_strip" if sys.platform=="darwin" else "-Wl,--gc-sections"]
         cmd += [str(ROOT/"tests/test_spu_fnms_zero_extended.c"),str(ROOT/"runtime/spu/spu_interp.c"),
-                str(ROOT/"runtime/diag/ps3_log.c"),"-lm","-o",str(temp/"fixture")]
+                str(ROOT/"runtime/diag/ps3_log.c"),str(ROOT/"runtime/diag/host_exit.c"),"-lm","-o",str(temp/"fixture")]
         subprocess.run(cmd,env=env,check=True,timeout=60)
         return subprocess.run([str(temp/"fixture")],env=env,timeout=15).returncode
 if __name__=="__main__":

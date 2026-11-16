@@ -23,7 +23,8 @@ def main():
         for i, src in enumerate([ROOT / 'tests/test_mmapper_hle_heap.c',
                                  ROOT / 'runtime/syscalls/sys_memory.c',
                                  ROOT / 'runtime/syscalls/sys_vm.c',
-                                 ROOT / 'runtime/diag/ps3_log.c']):
+                                 ROOT / 'runtime/diag/ps3_log.c',
+                                 ROOT / 'runtime/diag/host_exit.c']):
             obj = temp / f'c{i}.o'
             subprocess.run([cc, '-std=gnu17', '-O1', '-UNDEBUG', '-I', str(temp),
                             '-I', str(ROOT / 'include'), '-c', str(src), '-o', str(obj)],

@@ -5,7 +5,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
-from check_ppu_scaffold import loader_support_sources
+from check_ppu_scaffold import host_exit_object, loader_support_sources
 
 root=Path(__file__).resolve().parents[1]
 
@@ -20,7 +20,7 @@ def main():
         # root: the generated table includes libs/... headers by repository path.
         includes=['-I'+str(p) for p in (root,root/'include',root/'runtime/ppu',root/'runtime/syscalls',root/'libs/system',tmp)]
         subprocess.run([os.environ.get('CC','cc'),'-std=gnu17','-O1','-UNDEBUG',*includes,'-c',str(root/'libs/system/cellSysmodule.c'),'-o',str(tmp/'module.o')],check=True,timeout=30)
-        subprocess.run([os.environ.get('CXX','c++'),'-std=c++17','-O1','-UNDEBUG',*includes,str(root/'tests/test_sysmodule_unload_module_ex.cpp'),str(root/'runtime/ppu/ppu_hle.cpp'),*loader_support_sources(),str(tmp/'nids.cpp'),str(tmp/'module.o'),'-pthread','-o',str(tmp/'fixture')],check=True,timeout=45)
+        subprocess.run([os.environ.get('CXX','c++'),'-std=c++17','-O1','-UNDEBUG',*includes,str(root/'tests/test_sysmodule_unload_module_ex.cpp'),str(root/'runtime/ppu/ppu_hle.cpp'),*loader_support_sources(),host_exit_object(tmp),str(tmp/'nids.cpp'),str(tmp/'module.o'),'-pthread','-o',str(tmp/'fixture')],check=True,timeout=45)
         env={k:v for k,v in os.environ.items() if k in ('PATH','HOME','TMPDIR','SYSTEMROOT')}
         subprocess.run([str(tmp/'fixture')],env=env,check=True,timeout=10)
     return 0

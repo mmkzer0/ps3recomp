@@ -73,6 +73,7 @@ done
 "$CXX" -std=c++20 -O2 -I "$REPO/include" -c "$REPO/runtime/diag/stop.cpp" -o "$RT_DIR/stop.o"
 "$GCC" "${RTCFLAGS[@]}" -c "$REPO/runtime/diag/lifter_abi.c" -o "$RT_DIR/lifter_abi.o"
 "$GCC" "${RTCFLAGS[@]}" -c "$REPO/runtime/diag/ps3_log.c" -o "$RT_DIR/ps3_log.o"   # config.cpp configures it
+"$GCC" "${RTCFLAGS[@]}" -c "$REPO/runtime/diag/host_exit.c" -o "$RT_DIR/host_exit.o"   # ps3_log.c's quick-exit registration
 
 pass=0
 fail=0

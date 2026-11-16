@@ -19,7 +19,7 @@ def main():
         cc=os.environ.get('CC','cc'); cxx=os.environ.get('CXX','c++')
         objs=[]
         for i,src in enumerate([root/'tests/test_cellfs_vfs_root.c',root/'libs/filesystem/cellFs.c',
-                                root/'runtime/syscalls/sys_fs.c',root/'runtime/diag/ps3_log.c']):
+                                root/'runtime/syscalls/sys_fs.c',root/'runtime/diag/ps3_log.c',root/'runtime/diag/host_exit.c']):
             obj=tmp/f'c{i}.o'; objs.append(str(obj))
             subprocess.run([cc,'-std=gnu17','-D_GNU_SOURCE','-O1','-ffunction-sections','-fdata-sections',
                 '-I'+str(root/'include'),'-c',str(src),'-o',str(obj)],check=True,timeout=60)

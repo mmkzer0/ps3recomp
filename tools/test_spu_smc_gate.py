@@ -27,7 +27,7 @@ base_env = {k: v for k, v in os.environ.items()
 with tempfile.TemporaryDirectory(prefix="spu-smc-gate-") as tmp:
     binary = Path(tmp) / "test_spu_smc_gate"
     spu_fixture_link.build([spu / "tests" / "test_spu_smc_gate.c",
-                            root / "runtime/diag/ps3_log.c"], binary,
+                            root / "runtime/diag/ps3_log.c", root / "runtime/diag/host_exit.c"], binary,
                            ["-std=gnu17", "-O1", "-g", "-UNDEBUG", "-fsanitize=thread",
                             "-I" + str(root / "include"), "-I" + str(spu)], tmp,
                            runtime_c=False)

@@ -27,5 +27,6 @@ with tempfile.TemporaryDirectory(prefix='ppu-thread-stack-recycle-') as tmp:
                     '-ffunction-sections', '-fdata-sections',
                     '-I' + str(root / 'include'), '-I' + str(root / 'runtime'), '-I' + str(root / 'runtime/syscalls'),
                     str(root / 'tests/test_ppu_thread_stack_recycle.c'),
-                    str(root / 'runtime/diag/ps3_log.c'), *linker, '-o', str(binary)], check=True)
+                    str(root / 'runtime/diag/ps3_log.c'), str(root / 'runtime/diag/host_exit.c'),
+                    *linker, '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True, timeout=120, stderr=subprocess.DEVNULL if os.environ.get('CI') else None)

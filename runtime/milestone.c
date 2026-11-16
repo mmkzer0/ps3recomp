@@ -14,6 +14,7 @@
  */
 #include "ps3emu/milestone.h"
 
+#include "ps3emu/host_exit.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -113,7 +114,7 @@ static int ms_enabled(void)
                  * exit() for a harness whose entry function returned. Register
                  * on both; ps3_ms_dump() runs once. */
                 atexit(ps3_ms_dump);
-                at_quick_exit(ps3_ms_dump);
+                ps3_host_at_quick_exit(ps3_ms_dump);
                 e = 1;
             } else {
                 fprintf(stderr, "[milestone] cannot open %s -- log disabled\n", path);

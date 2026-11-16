@@ -83,7 +83,7 @@ def build_and_run(mirror, which, tmp):
         srcs = [m / 'tests/sync_stress/test_timer_monotonic.c', m / 'tests/sync_stress/test_shims.c',
                 m / 'runtime/platform/tests/host_wait_fake.c', m / 'runtime/platform/win32_compat.c'] + \
                [m / f'runtime/syscalls/{n}.c' for n in ('sys_timer', 'sys_event')] + \
-               [m / 'runtime/diag/ps3_log.c']
+               [m / 'runtime/diag/ps3_log.c', m / 'runtime/diag/host_exit.c']
         cxx = [m / 'runtime/diag/stop.cpp']
     elif which.startswith('seam'):
         srcs = [m / 'runtime/platform/tests/test_host_wait_monotonic.c', m / 'runtime/platform/tests/host_wait_fake.c']
@@ -94,7 +94,7 @@ def build_and_run(mirror, which, tmp):
         srcs = [m / 'tests/sync_stress/test_timeout_monotonic.c', m / 'tests/sync_stress/test_shims.c',
                 m / 'runtime/platform/tests/host_wait_fake.c'] + [m / f'runtime/syscalls/{n}.c' for n in
                 ('sys_mutex', 'sys_cond', 'sys_semaphore', 'sys_event')] + \
-               [m / 'runtime/diag/ps3_log.c']
+               [m / 'runtime/diag/ps3_log.c', m / 'runtime/diag/host_exit.c']
         cxx = [m / 'runtime/diag/stop.cpp']
     objs = []
     for i, s in enumerate(srcs):

@@ -64,6 +64,7 @@ add_executable(sync_stress
     # copy diagnostics log through ps3_log. Neither is part of the sync code under test, so they come
     # from the real tree even when PS3RECOMP_TREE_ROOT is a seeded-bug mirror.
     "${PS3RECOMP_ROOT}/runtime/diag/ps3_log.c"
+    "${PS3RECOMP_ROOT}/runtime/diag/host_exit.c"
     "${PS3RECOMP_ROOT}/runtime/config/config.cpp"
     "${PS3RECOMP_ROOT}/runtime/diag/stop.cpp"
 )
@@ -125,6 +126,7 @@ add_executable(test_sync_semantics
     # The migrated diagnostics of sys_mutex/sys_cond/sys_semaphore call ps3_log_*, whose
     # references to the typed configuration and the stop runtime come from config.cpp and stop.cpp.
     "${PS3RECOMP_ROOT}/runtime/diag/ps3_log.c"
+    "${PS3RECOMP_ROOT}/runtime/diag/host_exit.c"
     "${PS3RECOMP_ROOT}/runtime/config/config.cpp"
     "${PS3RECOMP_ROOT}/runtime/diag/stop.cpp")
 set_target_properties(test_sync_semantics PROPERTIES LINKER_LANGUAGE CXX)
@@ -176,6 +178,7 @@ add_executable(test_mutex_destroy
     "${RUNTIME_SYNC_DIR}/sys_cond.c"
     # sys_mutex/sys_cond report through ps3_log; config.cpp and stop.cpp complete it.
     "${PS3RECOMP_ROOT}/runtime/diag/ps3_log.c"
+    "${PS3RECOMP_ROOT}/runtime/diag/host_exit.c"
     "${PS3RECOMP_ROOT}/runtime/config/config.cpp"
     "${PS3RECOMP_ROOT}/runtime/diag/stop.cpp")
 set_target_properties(test_mutex_destroy PROPERTIES LINKER_LANGUAGE CXX)
@@ -205,6 +208,7 @@ if(WIN32)
         "${RUNTIME_SYNC_DIR}/sys_cond.c"
         # sys_mutex/sys_cond report through ps3_log; config.cpp and stop.cpp complete it.
         "${PS3RECOMP_ROOT}/runtime/diag/ps3_log.c"
+        "${PS3RECOMP_ROOT}/runtime/diag/host_exit.c"
         "${PS3RECOMP_ROOT}/runtime/config/config.cpp"
         "${PS3RECOMP_ROOT}/runtime/diag/stop.cpp")
     set_target_properties(test_cond_semantics PROPERTIES LINKER_LANGUAGE CXX)
@@ -224,6 +228,7 @@ add_executable(test_event_queue_destroy
     "${RUNTIME_SYNC_DIR}/sys_event.c"
     # sys_event.c reaches ps3_stop and ps3_log (see sync_stress above).
     "${PS3RECOMP_ROOT}/runtime/diag/ps3_log.c"
+    "${PS3RECOMP_ROOT}/runtime/diag/host_exit.c"
     "${PS3RECOMP_ROOT}/runtime/config/config.cpp"
     "${PS3RECOMP_ROOT}/runtime/diag/stop.cpp")
 target_compile_definitions(test_event_queue_destroy PRIVATE PS3_SYNC_TEST_HOOKS)
@@ -273,6 +278,7 @@ if(NOT WIN32)
             "${RUNTIME_SYNC_DIR}/sys_semaphore.c"
             "${RUNTIME_SYNC_DIR}/sys_event.c"
             "${PS3RECOMP_ROOT}/runtime/diag/ps3_log.c"
+            "${PS3RECOMP_ROOT}/runtime/diag/host_exit.c"
             "${PS3RECOMP_ROOT}/runtime/config/config.cpp"
             "${PS3RECOMP_ROOT}/runtime/diag/stop.cpp"
             "${PS3RECOMP_TREE_ROOT}/runtime/platform/tests/host_wait_fake.c")
@@ -293,6 +299,7 @@ if(NOT WIN32)
             "${RUNTIME_SYNC_DIR}/sys_timer.c"
             "${RUNTIME_SYNC_DIR}/sys_event.c"
             "${PS3RECOMP_ROOT}/runtime/diag/ps3_log.c"
+            "${PS3RECOMP_ROOT}/runtime/diag/host_exit.c"
             "${PS3RECOMP_ROOT}/runtime/config/config.cpp"
             "${PS3RECOMP_ROOT}/runtime/diag/stop.cpp"
             "${PS3RECOMP_TREE_ROOT}/runtime/platform/win32_compat.c"

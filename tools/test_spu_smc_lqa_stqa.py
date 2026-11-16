@@ -145,13 +145,15 @@ with tempfile.TemporaryDirectory() as tmp:
             print(pr.stdout + pr.stderr)
             raise SystemExit('FAIL: harness did not compile')
     plog = Path(tmp) / 'ps3_log.o'
-    pr = subprocess.run([cc, '-std=gnu17', '-O1', '-I', str(root / 'include'), '-c',
-                         str(root / 'runtime/diag/ps3_log.c'), '-o', str(plog)],
-                        capture_output=True, text=True, check=False)
-    if pr.returncode:
-        print(pr.stdout + pr.stderr)
-        raise SystemExit('FAIL: harness did not compile')
-    r = subprocess.run([cxx, str(obj), str(plog), str(Path(tmp) / 'stop.o'),
+    pexit = Path(tmp) / 'host_exit.o'
+    for src, obj_path in ((root / 'runtime/diag/ps3_log.c', plog), (root / 'runtime/diag/host_exit.c', pexit)):
+        pr = subprocess.run([cc, '-std=gnu17', '-O1', '-I', str(root / 'include'), '-c',
+                             str(src), '-o', str(obj_path)],
+                            capture_output=True, text=True, check=False)
+        if pr.returncode:
+            print(pr.stdout + pr.stderr)
+            raise SystemExit('FAIL: harness did not compile')
+    r = subprocess.run([cxx, str(obj), str(plog), str(pexit), str(Path(tmp) / 'stop.o'),
                         str(Path(tmp) / 'config.o'), '-pthread', '-o', str(exe)],
                        capture_output=True, text=True, check=False)
     if r.returncode:

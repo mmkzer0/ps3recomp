@@ -20,7 +20,7 @@ with tempfile.TemporaryDirectory(prefix='spu-ilh-') as tmp:
     for name in ['test_spu_interpreter_ilh', 'spu_interp_selftest']:
         binary = Path(tmp) / name
         spu_fixture_link.build([spu/'tests'/f'{name}.c', spu/'spu_interp.c',
-                                root/'runtime/diag/ps3_log.c'], binary,
+                                root/'runtime/diag/ps3_log.c', root/'runtime/diag/host_exit.c'], binary,
                                ['-std=gnu17', '-O1', '-UNDEBUG',
                                 '-I'+str(root/'include'), '-I'+str(spu)], tmp, runtime_c=False)
         subprocess.run([str(binary)], check=True, timeout=5, env=env, cwd=tmp)

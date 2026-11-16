@@ -38,7 +38,7 @@ C_SOURCES=("$HERE/spu_bench_main.c" "$S/spu_channels.c" "$S/spu_drain.c" "$S/spu
     "$S/spu_tsp_weak.c" "$S/spu_vm_pagemap.c" "$S/spurs_policy_blob_weak.c"
     "$S/spu_interp.c" "$REPO/runtime/platform/win32_compat.c"
     "$REPO/runtime/platform/host_clock.c" "$REPO/runtime/platform/host_wait.c"
-    "$REPO/runtime/diag/lifter_abi.c" "$REPO/runtime/diag/ps3_log.c")
+    "$REPO/runtime/diag/lifter_abi.c" "$REPO/runtime/diag/ps3_log.c" "$REPO/runtime/diag/host_exit.c")
 for src in "${C_SOURCES[@]}"; do
     "$CC" "${FLAGS[@]}" -c "$src" -o "$OUT/$(basename "${src%.c}").o"
 done

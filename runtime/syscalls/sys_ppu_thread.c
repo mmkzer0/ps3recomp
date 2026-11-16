@@ -29,6 +29,7 @@ static PPU_TLS int     s_exit_armed = 0;
 _Static_assert(PPU_THREAD_MAX == PPU_THREAD_SLOTS, "a thread id carries its slot in its low 6 bits");
 #include "../platform/win32_compat.h"   /* GetCurrentThreadId on POSIX */
 #include "ps3emu/ps3_ftrace.h"           /* PS3_FTRACE: thread names for the report */
+#include "ps3emu/host_exit.h"
 #include "ps3emu/stop.h"
 #include "ps3emu/ps3_tprof.h"            /* PS3_TPROF: in-process thread samples */
 #include <string.h>
@@ -397,7 +398,7 @@ static void host_stack_gate_init_locked(void)
     const int on = getenv("PS3_HOST_STACK_HWM") != NULL;
     if (on) {
         atexit(host_stack_summary);
-        at_quick_exit(host_stack_summary);
+        ps3_host_at_quick_exit(host_stack_summary);
     }
     __atomic_store_n(&s_hs_gate, on, __ATOMIC_RELAXED);
 }

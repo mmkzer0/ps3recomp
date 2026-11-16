@@ -131,7 +131,7 @@ with tempfile.TemporaryDirectory(prefix='spurs-taskset-size-') as name:
             '-I'+str(ROOT),'-I'+str(ROOT/'include'),'-I'+str(ROOT/'runtime/spu'),
             '-I'+str(ROOT/'runtime/platform')]
     objects=[]
-    for index,src in enumerate((fixture, ROOT/'libs/spurs/spurs_taskset.c', ROOT/'runtime/diag/ps3_log.c')):
+    for index,src in enumerate((fixture, ROOT/'libs/spurs/spurs_taskset.c', ROOT/'runtime/diag/ps3_log.c', ROOT/'runtime/diag/host_exit.c')):
         obj=tmp/f'{index}.o'
         subprocess.run([os.environ.get('CC','cc'),*cflags,'-c',str(src),'-o',str(obj)],check=True)
         objects.append(str(obj))

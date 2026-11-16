@@ -44,7 +44,8 @@ vm_shutdown();std::puts("PASS loader330/337 failure recovery, reservation bounds
   subprocess.run([cc,'-std=gnu17','-O1','-UNDEBUG','-c',str(root/'runtime/syscalls/sys_memory.c'),'-o',str(tmp/'memory.o')],check=True,timeout=30)
   # sys_memory.c's migrated diagnostics call ps3_log_*; config.cpp and stop.cpp complete it.
   subprocess.run([cc,'-std=gnu17','-O1','-UNDEBUG','-I'+str(root/'include'),'-c',str(root/'runtime/diag/ps3_log.c'),'-o',str(tmp/'log.o')],check=True,timeout=30)
-  subprocess.run([cxx,'-std=c++17','-O1','-UNDEBUG','-I'+str(root/'runtime/syscalls'),'-I'+str(root/'include'),str(tmp/'fixture.cpp'),str(tmp/'memory.o'),str(tmp/'log.o'),str(root/'runtime/config/config.cpp'),'-pthread','-o',str(tmp/'fixture')],check=True,timeout=120)
+  subprocess.run([cc,'-std=gnu17','-O1','-UNDEBUG','-I'+str(root/'include'),'-c',str(root/'runtime/diag/host_exit.c'),'-o',str(tmp/'exit.o')],check=True,timeout=30)
+  subprocess.run([cxx,'-std=c++17','-O1','-UNDEBUG','-I'+str(root/'runtime/syscalls'),'-I'+str(root/'include'),str(tmp/'fixture.cpp'),str(tmp/'memory.o'),str(tmp/'log.o'),str(tmp/'exit.o'),str(root/'runtime/config/config.cpp'),'-pthread','-o',str(tmp/'fixture')],check=True,timeout=120)
   subprocess.run([str(tmp/'fixture')],check=True,timeout=10)
  return 0
 if __name__=='__main__':raise SystemExit(main())

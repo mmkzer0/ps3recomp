@@ -127,7 +127,7 @@ with tempfile.TemporaryDirectory(prefix='spurs-exit-initialize-') as name:
         'extern "C" void register_exit_code_fixture(void) {\n'+
         '\n'.join(entries)+'\n}\n')
     fixture=tmp/'fixture.cpp'; fixture.write_text(FIXTURE)
-    obj=tmp/'spurs.o'; stop_obj=tmp/'stop.o'; log_obj=tmp/'ps3_log.o'; binary=tmp/'fixture'
+    obj=tmp/'spurs.o'; stop_obj=tmp/'stop.o'; log_obj=tmp/'ps3_log.o'; exit_obj=tmp/'host_exit.o'; binary=tmp/'fixture'
     common=['-O1','-UNDEBUG','-ffunction-sections','-fdata-sections',
             '-I'+str(ROOT),'-I'+str(ROOT/'include'),'-I'+str(ROOT/'runtime/ppu'),
             '-I'+str(ROOT/'runtime/spu')]
@@ -137,11 +137,13 @@ with tempfile.TemporaryDirectory(prefix='spurs-exit-initialize-') as name:
     # configuration and the stop runtime come from the real config.cpp/stop.cpp.
     subprocess.run([os.environ.get('CC','cc'),'-std=gnu17',*common,'-c',
                     str(ROOT/'runtime/diag/ps3_log.c'),'-o',str(log_obj)],check=True)
+    subprocess.run([os.environ.get('CC','cc'),'-std=gnu17',*common,'-c',
+                    str(ROOT/'runtime/diag/host_exit.c'),'-o',str(exit_obj)],check=True)
     subprocess.run([os.environ.get('CXX','c++'),'-std=c++20',*common,'-c',
                     str(ROOT/'runtime/diag/stop.cpp'),'-o',str(stop_obj)],check=True)
     linker=['-Wl,-dead_strip'] if platform.system()=='Darwin' else ['-Wl,--gc-sections']
     subprocess.run([os.environ.get('CXX','c++'),'-std=c++20',*common,
-        str(fixture),str(registration),str(obj),str(log_obj),str(stop_obj),
+        str(fixture),str(registration),str(obj),str(log_obj),str(exit_obj),str(stop_obj),
         str(ROOT/'runtime/config/config.cpp'),*linker,'-pthread','-lm','-o',str(binary)],check=True)
     p=subprocess.run([str(binary)],timeout=20,cwd=tmp,capture_output=True,text=True)
     print(p.stdout,end='')

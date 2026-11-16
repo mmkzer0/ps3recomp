@@ -13,7 +13,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from check_ppu_scaffold import loader_support_sources  # noqa: E402
+from check_ppu_scaffold import host_exit_object, loader_support_sources  # noqa: E402
 
 root = Path(__file__).resolve().parents[1]
 if os.name == 'nt':
@@ -40,6 +40,6 @@ with tempfile.TemporaryDirectory(prefix='sys-spu-printf-') as tmp:
     subprocess.run([os.environ.get('CXX', 'c++'), '-std=c++17', '-O1', '-UNDEBUG',
                     '-ffunction-sections', '-fdata-sections', '-pthread', *includes,
                     str(tmp / 'test.o'), str(root / 'runtime/ppu/ppu_hle.cpp'),
-                    *loader_support_sources(), str(tmp / 'nids.cpp'), str(tmp / 'shim.cpp'),
+                    *loader_support_sources(), host_exit_object(tmp), str(tmp / 'nids.cpp'), str(tmp / 'shim.cpp'),
                     *linker, '-o', str(binary)], check=True, timeout=300)
     subprocess.run([str(binary)], check=True, timeout=60)

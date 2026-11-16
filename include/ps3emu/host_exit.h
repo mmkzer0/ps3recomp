@@ -27,6 +27,13 @@ extern "C" {
  * guest threads are live goes through this. */
 PS3_NORETURN void ps3_host_exit(int status);
 
+/* at_quick_exit() for toolkit code: the handlers run LIFO from ps3_host_exit,
+ * before the process ends, with no static destructor and no atexit handler.
+ * Returns 0 on success, nonzero when the registration table is full (C11
+ * guarantees at least 32). Register here, never with libc's at_quick_exit:
+ * iOS 16's libSystem does not export it (see runtime/diag/host_exit.c). */
+int ps3_host_at_quick_exit(void (*fn)(void));
+
 #ifdef __cplusplus
 }
 #endif

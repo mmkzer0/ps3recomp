@@ -21,6 +21,7 @@ with tempfile.TemporaryDirectory(prefix='gcm-walker-prof-') as tmp:
                     '-I' + str(root / 'include'), '-I' + str(root / 'libs/video'),
                     str(root / 'libs/video/tests/test_gcm_walker_prof.c'),
                     str(root / 'runtime/memory/label_window.c'),
+                    str(root / 'runtime/diag/host_exit.c'),
                     str(root / 'libs/video/gcm_default_state.c'), *linker,
                     '-o', str(binary)], check=True)
     base = {k: v for k, v in os.environ.items() if not k.startswith('RSX_WALKER_PROF')}

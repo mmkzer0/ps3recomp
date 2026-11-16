@@ -280,6 +280,7 @@ class Pipeline(unittest.TestCase):
                                 str(self.root / 'registry.c'), str(output / 'registry.c'),
                                 str(output / 'sample' / 'spu_recomp.c'),
                                 str(TOOLS.parent / 'runtime' / 'diag' / 'ps3_log.c'),
+                                str(TOOLS.parent / 'runtime' / 'diag' / 'host_exit.c'),
                                 '-o', str(binary)],
                                capture_output=True, text=True)
                 self.assertEqual(compiled.returncode, 0, compiled.stderr + compiled.stdout)
@@ -326,7 +327,7 @@ class Pipeline(unittest.TestCase):
         cmake_source += f'set(PS3RECOMP_DIR "{TOOLS.parent.as_posix()}")\n'
         cmake_source += 'include("${PS3RECOMP_DIR}/cmake/PS3RecompSPU.cmake")\n'
         cmake_source += 'ps3recomp_generate_spu("${CMAKE_CURRENT_BINARY_DIR}/spu" "${CMAKE_CURRENT_SOURCE_DIR}/input.bin")\n'
-        cmake_source += 'add_executable(proof proof.c workload.c registry.c ${SPU_GENERATED_SOURCES} "${PS3RECOMP_DIR}/runtime/diag/ps3_log.c")\n'
+        cmake_source += 'add_executable(proof proof.c workload.c registry.c ${SPU_GENERATED_SOURCES} "${PS3RECOMP_DIR}/runtime/diag/ps3_log.c" "${PS3RECOMP_DIR}/runtime/diag/host_exit.c")\n'
         cmake_source += 'target_compile_options(proof PRIVATE -ffunction-sections -fdata-sections)\n'
         cmake_source += ('target_link_options(proof PRIVATE -Wl,-dead_strip)\n' if sys.platform == 'darwin'
                          else 'target_link_options(proof PRIVATE -Wl,--gc-sections)\n')
@@ -533,6 +534,7 @@ class Pipeline(unittest.TestCase):
                                    str(self.output / 'spu_workloads.c'),
                                    str(lifted / 'spu_recomp.c'),
                                    str(TOOLS.parent / 'runtime' / 'diag' / 'ps3_log.c'),
+                                   str(TOOLS.parent / 'runtime' / 'diag' / 'host_exit.c'),
                                    '-o', str(binary)],
                                   capture_output=True, text=True, check=False)
         self.assertEqual(compiled.returncode, 0, compiled.stderr + compiled.stdout)

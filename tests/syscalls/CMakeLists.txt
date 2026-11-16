@@ -58,6 +58,7 @@ if(NOT WIN32)
         "${PS3RECOMP_ROOT}/runtime/syscalls/sys_event.c"
         # sys_event.c includes spu_context.h, whose diagnostics log through ps3_log.
         "${PS3RECOMP_ROOT}/runtime/diag/ps3_log.c"
+        "${PS3RECOMP_ROOT}/runtime/diag/host_exit.c"
         "${PS3RECOMP_ROOT}/runtime/config/config.cpp"
         "${PS3RECOMP_ROOT}/runtime/diag/stop.cpp"
         "${PS3RECOMP_ROOT}/tests/sync_stress/test_shims.c"
@@ -92,6 +93,7 @@ add_executable(test_event_delivery
     test_event_delivery.c
     "${PS3RECOMP_ROOT}/runtime/syscalls/sys_event.c"
     "${PS3RECOMP_ROOT}/runtime/diag/ps3_log.c"
+    "${PS3RECOMP_ROOT}/runtime/diag/host_exit.c"
     "${PS3RECOMP_ROOT}/runtime/config/config.cpp"
     "${PS3RECOMP_ROOT}/runtime/diag/stop.cpp"
     "${PS3RECOMP_ROOT}/tests/sync_stress/test_shims.c"
@@ -249,6 +251,7 @@ add_executable(test_sys_fs
     # come from config.cpp.
     "${PS3RECOMP_ROOT}/runtime/diag/stop.cpp"
     "${PS3RECOMP_ROOT}/runtime/diag/ps3_log.c"
+    "${PS3RECOMP_ROOT}/runtime/diag/host_exit.c"
     "${PS3RECOMP_ROOT}/runtime/config/config.cpp"
 )
 set_target_properties(test_sys_fs PROPERTIES LINKER_LANGUAGE CXX)

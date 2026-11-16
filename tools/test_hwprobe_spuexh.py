@@ -758,6 +758,7 @@ def log_runtime_objects(workdir):
               "-I", os.path.join(REPO, "runtime/spu"), "-I", os.path.join(REPO, "runtime/platform")]
     cxxflags = ["-std=c++20", "-O1", "-UNDEBUG", "-I", os.path.join(REPO, "include")]
     sources = ((os.path.join(REPO, "runtime", "diag", "ps3_log.c"), "cc", cflags),
+               (os.path.join(REPO, "runtime", "diag", "host_exit.c"), "cc", cflags),
                (os.path.join(REPO, "runtime", "config", "config.cpp"), os.environ.get("CXX", "c++"), cxxflags),
                (os.path.join(REPO, "runtime", "diag", "stop.cpp"), os.environ.get("CXX", "c++"), cxxflags))
     objs = []

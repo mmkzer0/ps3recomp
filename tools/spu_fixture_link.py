@@ -12,9 +12,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 # Added to every fixture's own C sources. ps3_log.c is the real run log: the migrated stderr lines are
-# what the fixtures read, so they must come from the one implementation a title gets.
+# what the fixtures read, so they must come from the one implementation a title gets. host_exit.c is where
+# the log registers its quick-exit handler (ps3_host_at_quick_exit).
 RUNTIME_C = [ROOT / 'runtime/memory/reservation.c', ROOT / 'runtime/memory/label_window.c',
-             ROOT / 'runtime/diag/ps3_log.c']
+             ROOT / 'runtime/diag/ps3_log.c', ROOT / 'runtime/diag/host_exit.c']
 # config.cpp and stop.cpp satisfy ps3_log.c's ps3_config_get / ps3_stop references.
 RUNTIME_CXX = [ROOT / 'runtime/config/config.cpp', ROOT / 'runtime/diag/stop.cpp']
 

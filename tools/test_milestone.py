@@ -140,7 +140,7 @@ def build(driver_c, exe):
             f.write("@echo off\n")
             f.write('call "%s" >nul 2>nul\n' % vcvars)
             f.write('cd /d "%s"\n' % ROOT)
-            f.write('"%s" /nologo /W3 /I include /Fe:"%s" "%s" runtime\\milestone.c '
+            f.write('"%s" /nologo /W3 /I include /Fe:"%s" "%s" runtime\\milestone.c runtime\\diag\\host_exit.c '
                     '> "%s" 2>&1\n' % (clang, exe, driver_c, log))
         rc = subprocess.run(["cmd", "/c", bat], cwd=ROOT).returncode
         if rc != 0:
@@ -151,7 +151,8 @@ def build(driver_c, exe):
     if not cc:
         return False, "no C compiler found (set CC)"
     cp = subprocess.run([cc, "-O1", "-w", "-I", "include", "-o", exe, driver_c,
-                         os.path.join("runtime", "milestone.c"), "-lpthread"],
+                         os.path.join("runtime", "milestone.c"), os.path.join("runtime", "diag", "host_exit.c"),
+                         "-lpthread"],
                         cwd=ROOT, capture_output=True, text=True)
     if cp.returncode != 0:
         return False, cp.stdout + cp.stderr

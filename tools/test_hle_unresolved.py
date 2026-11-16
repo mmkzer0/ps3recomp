@@ -13,7 +13,7 @@ import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tests' / 'gates'))
-from check_ppu_scaffold import loader_support_sources  # noqa: E402
+from check_ppu_scaffold import host_exit_object, loader_support_sources  # noqa: E402
 import gates_common as g  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,7 +30,7 @@ def main():
         subprocess.run([os.environ.get('CXX', 'c++'), '-std=c++17', '-O1', '-w', '-I' + str(ROOT / 'include'),
                         '-I' + str(ROOT / 'runtime/ppu'), '-I' + str(tmp),
                         str(ROOT / 'tests/test_hle_unresolved.cpp'), str(ROOT / 'runtime/ppu/ppu_hle.cpp'),
-                        *loader_support_sources(), '-pthread', '-o', str(binary)], check=True, timeout=300)
+                        *loader_support_sources(), host_exit_object(tmp), '-pthread', '-o', str(binary)], check=True, timeout=300)
 
         def run(nid, cfg=None):
             env = g.clean_env(**({'PS3RECOMP_CONFIG': str(cfg)} if cfg else {}))
