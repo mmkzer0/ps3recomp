@@ -107,6 +107,19 @@ PS3STOP v=1 kind=config-invalid file=title.toml line=3 col=1 key=ppu.vscr_nk det
 
 The registry's `doc` strings are the authoritative description of each option.
 
+**`rsx.bc_path` and the Metal routes.** The emulation lives on the draw-engine route, the only one iOS has. The
+macOS vtable route (`PS3RECOMP_RSX_ENGINE=vtable`, or a draw engine that failed to start) has no decoder and holds BC
+natively, so a forced value there (`cpu`, `gpu`, `tiered`) would silently measure native BC: the backend refuses it
+when the route is chosen, with a `config-invalid` stop naming `rsx.bc_path`, its value and `route=vtable`. `auto`
+goes on natively on that route. A GPU-tier decode whose command buffer ends in an error is the `host-gpu-command`
+stop ([`STOPS.md`](STOPS.md)) at the next frame commit, naming the texture's format, size and level, never a frame
+presented on an undefined texture. The commit first waits for the decodes committed so far (the settle; a texture a
+frame samples must be written), for at most 8 s of active time (a suspended GPU gate does not run the bound down):
+a decode still pending then is `host-gpu-command` with `reason=decode-timeout`, naming it. The wait is the
+`BC_SETTLE` span (kind 35) of a `PS3_FTRACE` run. It is why `rsx.bc_gpu_min_texels` is 147456 (384x384), the size
+from which the GPU tier costs the RSX thread no more than the CPU tier even for an upload followed at once by a
+commit: the GPU's latency, about 0.1 ms on an Apple M4 Pro, is the floor of that cost.
+
 ## Allow-listed gaps: `[[hle.stub]]` and `[[lv2.stub]]`
 
 A gap the runtime would stop on (an unresolved firmware import, an unimplemented

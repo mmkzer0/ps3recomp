@@ -105,6 +105,8 @@ def test_defaults_without_file_or_environment():
         "gcm.report_spu_hold_ms": ("0", "default"),
         "eng.depth_clamp": ("true", "default"),
         "eng.depth_bounds": ("true", "default"),
+        "rsx.bc_path": ('"auto"', "default"),
+        "rsx.bc_gpu_min_texels": ("147456", "default"),
         "vk.draw_batch": ("false", "default"),
         "vk.draw_batch_max": ("512", "default"),
         "game.free_space_raw": ("false", "default"),
@@ -250,6 +252,8 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
             "gcm.report_spu_hold_ms": "default",
             "eng.depth_clamp": "default",
             "eng.depth_bounds": "default",
+            "rsx.bc_path": "default",
+            "rsx.bc_gpu_min_texels": "default",
             "vk.draw_batch": "default",
             "vk.draw_batch_max": "default",
             "game.free_space_raw": "default",
@@ -287,6 +291,7 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
                            "gcm": {"wait_timeout_ms": 10000, "park_resync": False, "park_grace_ms": 50,
                                    "handler_thread": False, "report_spu_hold_ms": 0},
                            "eng": {"depth_clamp": True, "depth_bounds": True},
+                           "rsx": {"bc_path": "auto", "bc_gpu_min_texels": 147456},
                            "vk": {"draw_batch": False, "draw_batch_max": 512},
                            "game": {"free_space_raw": False},
                            "trophy": {"register_wait_cap_vblanks": 1024},
@@ -409,6 +414,50 @@ def test_job_body_is_interp_or_lifted_from_file_and_environment():
     with Cfg("schema = 2", "[spu]", "job_body = true") as c:      # a bool is the wrong type
         f = config_invalid(probe("--load", c.path, "get"))
         assert f["key"] == "spu.job_body" and f["line"] == "3", f
+
+
+def test_rsx_bc_path_is_one_of_four_from_file_and_environment():
+    # The Metal backend's BC1/2/3 emulation: auto (native where the device samples BC) | cpu | gpu | tiered.
+    for good in ("auto", "cpu", "gpu", "tiered"):
+        with Cfg("schema = 2", "[rsx]", f'bc_path = "{good}"') as c:
+            o = options(probe("--load", c.path, "get"))
+            assert o["rsx.bc_path"] == (f'"{good}"', f"file:{c.path}"), (good, o)
+        o = options(probe("get", PS3RECOMP_RSX_BC_PATH=good))
+        assert o["rsx.bc_path"] == (f'"{good}"', "env:PS3RECOMP_RSX_BC_PATH"), (good, o)
+    with Cfg("schema = 2", "[rsx]", 'bc_path = "gpu"') as c:     # the environment beats the file
+        o = options(probe("--load", c.path, "get", PS3RECOMP_RSX_BC_PATH="cpu"))
+        assert o["rsx.bc_path"] == ('"cpu"', "env:PS3RECOMP_RSX_BC_PATH"), o
+    for bad in ("native", "GPU", "Tiered", "", "bc", "true"):
+        with Cfg("schema = 2", "[rsx]", f'bc_path = "{bad}"') as c:
+            f = config_invalid(probe("--load", c.path, "get"))
+            assert f["key"] == "rsx.bc_path" and f["line"] == "3", (bad, f)
+            assert '"auto", "cpu", "gpu" or "tiered"' in f["detail"], (bad, f)
+        f = config_invalid(probe("get", PS3RECOMP_RSX_BC_PATH=bad))
+        assert f["env"] == "PS3RECOMP_RSX_BC_PATH" and f["key"] == "rsx.bc_path", (bad, f)
+    with Cfg("schema = 2", "[rsx]", "bc_path = true") as c:      # a bool is the wrong type
+        f = config_invalid(probe("--load", c.path, "get"))
+        assert f["key"] == "rsx.bc_path" and f["line"] == "3", f
+    f = config_invalid(probe("get", PS3RECOMP_RSX_BC_PATHH="gpu"))   # a near miss of the key is a typo, not a no-op
+    assert "PS3RECOMP_RSX_BC_PATH" in f["detail"], f
+
+
+def test_rsx_bc_gpu_min_texels_is_a_positive_u32_from_file_and_environment():
+    with Cfg("schema = 2", "[rsx]", "bc_gpu_min_texels = 65536") as c:
+        o = options(probe("--load", c.path, "get"))
+        assert o["rsx.bc_gpu_min_texels"] == ("65536", f"file:{c.path}"), o
+    for text, want in (("1", "1"), ("0x4000", "16384"), ("4294967295", "4294967295")):
+        o = options(probe("get", PS3RECOMP_RSX_BC_GPU_MIN_TEXELS=text))
+        assert o["rsx.bc_gpu_min_texels"] == (want, "env:PS3RECOMP_RSX_BC_GPU_MIN_TEXELS"), (text, o)
+    for bad in ("0", "-1", "4294967296", "", "64k", " 7"):      # below 1, negative, above 32 bits, not a number
+        f = config_invalid(probe("get", PS3RECOMP_RSX_BC_GPU_MIN_TEXELS=bad))
+        assert f["env"] == "PS3RECOMP_RSX_BC_GPU_MIN_TEXELS" and f["key"] == "rsx.bc_gpu_min_texels", (bad, f)
+    for bad in ("0", "-5", "4294967296"):
+        with Cfg("schema = 2", "[rsx]", f"bc_gpu_min_texels = {bad}") as c:
+            f = config_invalid(probe("--load", c.path, "get"))
+            assert f["key"] == "rsx.bc_gpu_min_texels" and f["line"] == "3", (bad, f)
+    with Cfg("schema = 2", "[rsx]", 'bc_gpu_min_texels = "16384"') as c:     # a string is the wrong type
+        f = config_invalid(probe("--load", c.path, "get"))
+        assert f["key"] == "rsx.bc_gpu_min_texels" and f["line"] == "3", f
 
 
 def test_xdiff_enumerations_and_bounds_from_file_and_environment():
