@@ -2374,6 +2374,9 @@ if(UNIX)
             target_link_libraries(test_metal_${gpu_test} PRIVATE ps3recomp_msl_translation
                 "-framework Metal" "-framework QuartzCore" "-framework AppKit")
             target_link_options(test_metal_${gpu_test} PRIVATE "-Wl,-dead_strip")
+            # The fixtures check with assert(), some around calls with side effects (init_gate starts its
+            # thread inside one): under NDEBUG (release, asan presets) such a test would check nothing.
+            target_compile_options(test_metal_${gpu_test} PRIVATE -UNDEBUG)
             add_test(NAME metal_${gpu_test} COMMAND test_metal_${gpu_test})
             set_tests_properties(metal_${gpu_test} PROPERTIES
                 LABELS "video;gpu;t0" SKIP_RETURN_CODE 77 TIMEOUT 120
