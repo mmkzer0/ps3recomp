@@ -2384,6 +2384,70 @@ if(UNIX)
         endforeach()
         # The fixture of #64 is a gcm contract as well as a GPU one.
         set_property(TEST metal_invalidate_l2 APPEND PROPERTY LABELS gcm)
+
+        # The backend's BC1/2/3 emulation through its own texture hooks, once per rsx.bc_path (the fixture
+        # reads the value from the environment the registry would): cpu, gpu and tiered compare every level,
+        # face and slice against the CPU decoder and check the tier each upload took and its BC_UPLOAD span;
+        # auto, on this BC-capable Mac, checks that nothing is decoded. rsx_bc_decode.c is the fixture's own
+        # source: the backend reaches the decoder through a weak reference.
+        add_executable(test_metal_bc_emulation
+            libs/video/tests/test_metal_bc_emulation.m
+            libs/video/tests/rsx_bc_test_corpus.c
+            libs/video/rsx_bc_decode.c
+            libs/video/rsx_shader_msl.cpp
+            libs/video/rsx_dispatch.c
+            libs/video/rsx_vertex_compact.c
+            libs/video/rsx_texture_layout.c
+            libs/video/rsx_vp_decompiler.c
+            libs/video/rsx_fp_decompiler.c
+            libs/video/rsx_tiling.c   # a C unit of its own: win32_compat.h clashes with the ObjC headers if included into the fixture
+        )
+        set_source_files_properties(libs/video/tests/test_metal_bc_emulation.m
+            PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+        target_include_directories(test_metal_bc_emulation PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests"
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        )
+        target_link_libraries(test_metal_bc_emulation PRIVATE ps3recomp_msl_translation
+            "-framework Metal" "-framework QuartzCore" "-framework AppKit")
+        target_link_options(test_metal_bc_emulation PRIVATE "-Wl,-dead_strip")
+        foreach(bc_path IN ITEMS auto cpu gpu tiered)
+            add_test(NAME metal_bc_emulation_${bc_path} COMMAND test_metal_bc_emulation)
+            set_tests_properties(metal_bc_emulation_${bc_path} PROPERTIES
+                LABELS "video;gpu;gcm;tsan;t0" SKIP_RETURN_CODE 77 TIMEOUT 120
+                ENVIRONMENT "PS3RECOMP_METAL_HEADLESS=1;PS3RECOMP_RSX_BC_PATH=${bc_path}")
+        endforeach()
+
+        # The emulation fails closed: a forced rsx.bc_path on the vtable route is a named refusal, a GPU-tier decode
+        # that ends in an error stops the RSX thread before the frame's commit (a test hook compiled only into this
+        # fixture injects the failure), and a late completion across shutdown and re-init reaches no later run.
+        # Labelled tsan: the completion thread and the RSX thread must share nothing unsynchronised.
+        add_executable(test_metal_bc_failclosed
+            libs/video/tests/test_metal_bc_failclosed.m
+            libs/video/tests/rsx_bc_test_corpus.c
+            libs/video/rsx_shader_msl.cpp
+            libs/video/rsx_dispatch.c
+            libs/video/rsx_vertex_compact.c
+            libs/video/rsx_texture_layout.c
+            libs/video/rsx_vp_decompiler.c
+            libs/video/rsx_fp_decompiler.c
+            libs/video/rsx_tiling.c   # a C unit of its own: win32_compat.h clashes with the ObjC headers if included into the fixture
+        )
+        set_source_files_properties(libs/video/tests/test_metal_bc_failclosed.m
+            PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+        target_include_directories(test_metal_bc_failclosed PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests"
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        )
+        target_link_libraries(test_metal_bc_failclosed PRIVATE ps3recomp_msl_translation
+            "-framework Metal" "-framework QuartzCore" "-framework AppKit")
+        target_link_options(test_metal_bc_failclosed PRIVATE "-Wl,-dead_strip")
+        add_test(NAME metal_bc_failclosed COMMAND test_metal_bc_failclosed)
+        set_tests_properties(metal_bc_failclosed PROPERTIES
+            LABELS "video;gpu;gcm;tsan;t0" SKIP_RETURN_CODE 77 TIMEOUT 120
+            ENVIRONMENT "PS3RECOMP_METAL_HEADLESS=1")
     endif()
 
     # The RSX capture replay runner (docs/RSX_GRAPHICS.md, "Replay") reads ps3diff.rsx/1 and /2 captures
@@ -2463,6 +2527,67 @@ if(UNIX)
     add_test(NAME test_rsx_texture_epoch COMMAND test_rsx_texture_epoch)
     set_tests_properties(test_rsx_texture_epoch PROPERTIES LABELS "gcm;t0" TIMEOUT 120)
 
+    add_executable(test_rsx_bc_decode
+        libs/video/tests/test_rsx_bc_decode.c
+        libs/video/tests/rsx_bc_test_corpus.c
+        libs/video/rsx_bc_decode.c)
+    target_include_directories(test_rsx_bc_decode PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests")
+    add_test(NAME test_rsx_bc_decode COMMAND test_rsx_bc_decode)
+    set_tests_properties(test_rsx_bc_decode PROPERTIES LABELS "gcm;t0" TIMEOUT 120)
+
+    # Hardware readback is the authority for the host BC decode. The test uses
+    # only generated blocks and skips visibly when this Mac has no Metal GPU.
+    if(APPLE)
+        add_executable(test_rsx_bc_oracle_metal
+            libs/video/tests/test_rsx_bc_oracle_metal.m
+            libs/video/tests/rsx_bc_test_corpus.c
+            libs/video/rsx_bc_decode.c)
+        set_source_files_properties(libs/video/tests/test_rsx_bc_oracle_metal.m
+            PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+        target_include_directories(test_rsx_bc_oracle_metal PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests")
+        target_link_libraries(test_rsx_bc_oracle_metal PRIVATE
+            "-framework Metal" "-framework Foundation")
+        add_test(NAME rsx_bc_oracle_metal COMMAND $<TARGET_FILE:test_rsx_bc_oracle_metal>)
+        set_tests_properties(rsx_bc_oracle_metal PROPERTIES
+            LABELS "gcm;t0" SKIP_RETURN_CODE 77 TIMEOUT 120)
+
+        # The GPU tier (libs/video/rsx_metal_bc.m) must write the CPU decoder's bytes: the oracle's exhaustive
+        # sets, a seeded random corpus, every partial-block shape and mip, into 2D, cube and 3D destinations.
+        add_executable(test_rsx_bc_metal
+            libs/video/tests/test_rsx_bc_metal.m
+            libs/video/rsx_metal_bc.m
+            libs/video/tests/rsx_bc_test_corpus.c
+            libs/video/rsx_bc_decode.c)
+        set_source_files_properties(libs/video/tests/test_rsx_bc_metal.m libs/video/rsx_metal_bc.m
+            PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+        target_include_directories(test_rsx_bc_metal PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests")
+        target_link_libraries(test_rsx_bc_metal PRIVATE
+            "-framework Metal" "-framework Foundation")
+        add_test(NAME rsx_bc_metal COMMAND $<TARGET_FILE:test_rsx_bc_metal>)
+        set_tests_properties(rsx_bc_metal PROPERTIES
+            LABELS "gcm;tsan;t0" SKIP_RETURN_CODE 77 TIMEOUT 120)
+
+        # CPU decoder against the GPU tier by level size: wall time, and the submitting thread's CPU time.
+        # An opt-in measurement like bench_rsx_bc_decode: cmake --build <dir> --target bench_rsx_bc_gpu.
+        add_executable(bench_rsx_bc_gpu EXCLUDE_FROM_ALL
+            tests/bench/video/bench_rsx_bc_gpu.m
+            libs/video/rsx_metal_bc.m
+            libs/video/rsx_bc_decode.c)
+        set_source_files_properties(tests/bench/video/bench_rsx_bc_gpu.m libs/video/rsx_metal_bc.m
+            PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+        target_include_directories(bench_rsx_bc_gpu PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
+        target_compile_options(bench_rsx_bc_gpu PRIVATE -O3)
+        target_link_libraries(bench_rsx_bc_gpu PRIVATE
+            "-framework Metal" "-framework Foundation")
+    endif()
+
     # The full texture change hash (rsx_texhash.h): a changed byte anywhere changes it. Header only,
     # no engine. The old-against-new throughput bench is tests/bench/video/bench_texhash.c.
     add_executable(test_rsx_texhash libs/video/tests/test_rsx_texhash.c)
@@ -2473,6 +2598,17 @@ if(UNIX)
     # cmake --build <dir> --target bench_texhash && <dir>/bench_texhash
     add_executable(bench_texhash EXCLUDE_FROM_ALL tests/bench/video/bench_texhash.c)
     target_include_directories(bench_texhash PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
+    # BC decode throughput is an opt-in measurement, not part of default ctest or `all`.
+    add_executable(bench_rsx_bc_decode EXCLUDE_FROM_ALL
+        tests/bench/video/bench_rsx_bc_decode.c
+        libs/video/rsx_bc_decode.c)
+    target_include_directories(bench_rsx_bc_decode PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
+    if(MSVC)
+        target_compile_options(bench_rsx_bc_decode PRIVATE /O2)
+    else()
+        target_compile_options(bench_rsx_bc_decode PRIVATE -O3)
+    endif()
 
     # Which presents a frame dump writes and what it calls the file (PS3RECOMP_VK_DUMP_LIST / _RANGE).
     # Pure parsing and naming, so no GPU and no backend: the Vulkan backend links the same source.

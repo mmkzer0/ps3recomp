@@ -70,6 +70,8 @@ const ps3_config* ps3_config_get(void)
     cfg.gcm_wait_timeout_ms = 10000;
     cfg.eng_depth_clamp = true;
     cfg.eng_depth_bounds = true;
+    memcpy(cfg.rsx_bc_path, "auto", sizeof "auto");
+    cfg.rsx_bc_gpu_min_texels = 16384;
     return &cfg;
 }
 /* The backend's legacy vtable registration: this test drives the engine backend only. */

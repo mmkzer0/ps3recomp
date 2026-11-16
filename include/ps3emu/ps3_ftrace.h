@@ -184,6 +184,16 @@ enum ps3_ft_kind {
     PS3_FT_JQ2_XDIFF      = 33, /* audit thread, once per shadow run; the span is the subject's run; who = q << 8 | w of the
                               * job, a = seq, b = verdict | reason << 8 | subject tier << 16 (spu_xdiff_verdict and
                               * spu_xdiff_reason ids, spu_job_tier of the shadow) */
+    PS3_FT_BC_UPLOAD      = 34, /* Metal: one upload into an emulated BC1/2/3 texture (rsx.bc_path; one level of one face
+                              * or 3D slice), never filtered by PS3_FTRACE_MIN_US; who = format (1 BC1, 2 BC2,
+                              * 3 BC3), a = texels of the level (width * height), b = tier (1 CPU, 2 GPU). The span
+                              * is the RSX thread's time inside the upload: CPU tier, the decode and the texture
+                              * write; GPU tier, the staging copy, the encode and the commit, not the GPU's run */
+    PS3_FT_BC_SETTLE      = 35, /* Metal: the RSX thread's wait, before a frame commit, for the GPU-tier BC decodes committed
+                              * so far (eng_bc_settle), never filtered; one per commit while the GPU tier exists, so a
+                              * zero-length span is a settle that found nothing to wait for; who = 0, a = decodes in
+                              * flight when it began, b = 0 all done, 1 a decode had failed (the run stops), 2 the bound
+                              * ran out (the run stops) */
 };
 
 enum ps3_ft_audio_pace_reason {

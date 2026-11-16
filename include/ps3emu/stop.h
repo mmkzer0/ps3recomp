@@ -150,7 +150,9 @@ extern "C" {
     /* The host refused the stack reservation of a guest PPU or SPU thread (ppu.host_stack_mb, spu.host_stack_mb). */ \
     X(HOST_THREAD_STACK,        "host-thread-stack")                                                       \
     /* The host GPU refused an allocation while the host allowed GPU use: the guest's frame cannot be built. */ \
-    X(HOST_GPU_ALLOC,           "host-gpu-alloc")
+    X(HOST_GPU_ALLOC,           "host-gpu-alloc")                                                          \
+    /* A command buffer the toolkit committed for the guest's frame ended in an error: what it was to fill is undefined. */ \
+    X(HOST_GPU_COMMAND,         "host-gpu-command")
 
 /* A fixed underlying type in C++ makes a kind outside the list (a caller's bug,
  * which the stop still reports as "invalid-kind") a well-defined value rather

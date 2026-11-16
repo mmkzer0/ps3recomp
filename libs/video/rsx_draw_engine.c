@@ -4244,6 +4244,11 @@ static void sink_driver_unmodelled(void* user, const rsx_dispatch* r, u32 method
 void rsx_draw_engine_set_backend(const rsx_draw_backend* backend)
 {
     g.be = backend;
+    /* Not at init: a backend that ends up on a route without the engine (the Metal vtable route, after an
+     * engine that did not start or was not asked for) must still know what rsx.bc_path says, to refuse a
+     * forced mode it cannot honour. */
+    if (backend && backend->set_bc_policy)
+        backend->set_bc_policy(backend->user, ps3_cfg_rsx_bc_path(), ps3_cfg_rsx_bc_gpu_min_texels());
 }
 
 void rsx_draw_engine_set_default(int on)

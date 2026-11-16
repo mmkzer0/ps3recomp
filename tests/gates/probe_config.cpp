@@ -80,6 +80,10 @@ static void print_options()
             std::printf("%s", ps3_cfg_eng_depth_clamp() ? "true" : "false");
         else if (!std::strcmp(o->section, "eng") && !std::strcmp(o->key, "depth_bounds"))
             std::printf("%s", ps3_cfg_eng_depth_bounds() ? "true" : "false");
+        else if (!std::strcmp(o->section, "rsx") && !std::strcmp(o->key, "bc_path"))
+            std::printf("\"%s\"", ps3_cfg_rsx_bc_path());
+        else if (!std::strcmp(o->section, "rsx") && !std::strcmp(o->key, "bc_gpu_min_texels"))
+            std::printf("%u", ps3_cfg_rsx_bc_gpu_min_texels());
         else if (!std::strcmp(o->section, "vk") && !std::strcmp(o->key, "draw_batch"))
             std::printf("%s", ps3_cfg_vk_draw_batch() ? "true" : "false");
         else if (!std::strcmp(o->section, "vk") && !std::strcmp(o->key, "draw_batch_max"))

@@ -19,11 +19,15 @@
 #include "ps3emu/config.h"
 
 #include <stdlib.h>
+#include <string.h>
 
+/* The Metal backend reads rsx.bc_path and rsx.bc_gpu_min_texels at its first BC texture (docs/CONFIG.md). */
 static void rsx_engine_config_set_defaults(ps3_config* cfg)
 {
     cfg->eng_depth_clamp = true;
     cfg->eng_depth_bounds = true;
+    memcpy(cfg->rsx_bc_path, "auto", sizeof "auto");
+    cfg->rsx_bc_gpu_min_texels = 16384;
 }
 
 const ps3_config* ps3_config_get(void)
