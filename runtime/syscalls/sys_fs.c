@@ -6,6 +6,7 @@
 #include "../../libs/filesystem/edat.h"
 #include "../memory/vm.h"
 #include "ps3emu/stop.h"
+#include "../../include/ps3emu/ps3_log.h"
 #include "../platform/ps3_dev_flash.h"
 #include <string.h>
 #include <stdio.h>
@@ -368,7 +369,7 @@ int64_t sys_fs_open(ppu_context* ctx)
 
     { extern char* getenv(const char*); if (getenv("FLOW_TITLEOPEN") && ps3_path && strstr(ps3_path, "Titles")) {
         size_t _l = strlen(ps3_path);
-        fprintf(stderr, "[TITLEOPEN] path='%s' (len=%zu, ends_slash=%d) guest_lr=0x%08X\n",
+        PS3_LOG(PS3_LOG_INFO, "TITLEOPEN", "path='%s' (len=%zu, ends_slash=%d) guest_lr=0x%08X\n",
                 ps3_path, _l, (_l && ps3_path[_l-1]=='/')?1:0, (uint32_t)ctx->lr); fflush(stderr);
 #ifdef _WIN32
         { char* mb=(char*)GetModuleHandleA(0); void* bt[30]; unsigned short fr=RtlCaptureStackBackTrace(0,30,bt,0);
@@ -385,7 +386,7 @@ int64_t sys_fs_open(ppu_context* ctx)
         if (hl >= 8 && (strcmp(host_path + hl - 8, "Titles\\") == 0 || strcmp(host_path + hl - 8, "Titles/") == 0
                         || strcmp(host_path + hl - 7, "Titles\\") == 0 || strcmp(host_path + hl - 7, "Titles/") == 0)) {
             if (hl + 20 < sizeof(host_path)) { strcat(host_path, "Titles_English.xml");
-                fprintf(stderr, "[TITLEFIX] redirected empty-filename title open -> %s\n", host_path); fflush(stderr); }
+                PS3_LOG(PS3_LOG_INFO, "TITLEFIX", "redirected empty-filename title open -> %s\n", host_path); fflush(stderr); }
         }
     } }
 
@@ -481,7 +482,7 @@ int64_t sys_fs_open(ppu_context* ctx)
 #endif
             fp = fopen(host_path, mode);
         }
-        if (fp) fprintf(stderr, "[sys_fs] open recovered after retry: %s\n", host_path);
+        if (fp) PS3_LOG(PS3_LOG_INFO, "sys_fs", "open recovered after retry: %s\n", host_path);
     }
 
     /* If CREAT flag set and file doesn't exist, try creating it. Only when it
@@ -501,14 +502,14 @@ int64_t sys_fs_open(ppu_context* ctx)
     if (!fp) {
         struct stat _sd;
         if (stat(host_path, &_sd) == 0 && (_sd.st_mode & S_IFMT) == S_IFDIR) {
-            fprintf(stderr, "[sys_fs] open -> EISDIR (directory): %s\n", host_path);
+            PS3_LOG(PS3_LOG_INFO, "sys_fs", "open -> EISDIR (directory): %s\n", host_path);
             return (int64_t)(int32_t)CELL_EISDIR;
         }
     }
 
     if (!fp) {
         { struct stat _s2; int _ex = (stat(host_path,&_s2)==0);
-          fprintf(stderr, "[sys_fs] open FAILED: %s (errno=%d %s, exists=%d, size=%lld)\n",
+          PS3_LOG(PS3_LOG_INFO, "sys_fs", "open FAILED: %s (errno=%d %s, exists=%d, size=%lld)\n",
                   host_path, errno, strerror(errno), _ex, _ex?(long long)_s2.st_size:-1LL); }
         return (int64_t)(int32_t)CELL_ENOENT;
     }
@@ -532,7 +533,7 @@ int64_t sys_fs_open(ppu_context* ctx)
     f->active = 1;     /* published last */
     fs_slot_unlock();
 
-    fprintf(stderr, "[sys_fs] open OK: %s\n", host_path);
+    PS3_LOG(PS3_LOG_INFO, "sys_fs", "open OK: %s\n", host_path);
 
     /* FD is slot + 3 (reserve 0=stdin, 1=stdout, 2=stderr) */
     int32_t fd = slot + 3;
@@ -617,7 +618,7 @@ int64_t sys_fs_read(ppu_context* ctx)
                       s_ft = e ? (atoi(e) > 0 ? atoi(e) : 200) : 0; }
       if (s_ft) { static unsigned long fn;
           if ((++fn % (unsigned long)s_ft) == 0)
-              fprintf(stderr, "[fs] n=%lu fd=%d off=%ld size=%llu -> %llu\n",
+              PS3_LOG(PS3_LOG_INFO, "fs", "n=%lu fd=%d off=%ld size=%llu -> %llu\n",
                       fn, fd, pos_before, (unsigned long long)size,
                       (unsigned long long)nread); } }
 
@@ -628,7 +629,7 @@ int64_t sys_fs_read(ppu_context* ctx)
     { extern char* getenv(const char*);
       if (getenv("FLOW_FSDBG")) {
         const unsigned char* b = (const unsigned char*)buf;
-        fprintf(stderr, "[FSDBG] read fd=%d '%s' pos=%ld want=%llu got=%zu"
+        PS3_LOG(PS3_LOG_INFO, "FSDBG", "read fd=%d '%s' pos=%ld want=%llu got=%zu"
                         " head=%02X%02X%02X%02X lr=0x%08X\n",
                 fd, f->path, pos_before, (unsigned long long)size, nread,
                 nread > 0 ? b[0] : 0, nread > 1 ? b[1] : 0,
@@ -1156,7 +1157,7 @@ int64_t sys_fs_unlink(ppu_context* ctx)
             return (int64_t)(int32_t)CELL_ENOENT;
         if (S_ISDIR(st.st_mode))
             return (int64_t)(int32_t)CELL_EISDIR;
-        fprintf(stderr, "[sys_fs] unlink '%s' failed (host errno %d) -> EIO\n", host_path, e);
+        PS3_LOG(PS3_LOG_INFO, "sys_fs", "unlink '%s' failed (host errno %d) -> EIO\n", host_path, e);
         return (int64_t)(int32_t)CELL_EIO;
     }
 

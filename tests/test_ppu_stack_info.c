@@ -20,6 +20,11 @@ _Noreturn void ps3_stop(ps3_stop_kind kind, const char* what, const char* remedy
     fprintf(stderr, "ps3_stop called in test: kind=%d\n", (int)kind);
     abort();
 }
+
+/* The run log's mirror hook: ps3_log_configure installs it. These fixtures link the log for its
+ * emitters and never configure a log file. */
+void ps3_stop_set_mirror(ps3_stop_quiesce_fn quiesce, ps3_stop_mirror_fn mirror)
+{ (void)quiesce; (void)mirror; }
 int ps3_intr_is_handler(unsigned long long tid) { (void)tid; return 0; }
 int ps3_intr_wait(unsigned long long tid) { (void)tid; return 0; }
 

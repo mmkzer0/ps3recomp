@@ -16,6 +16,7 @@
 #include <stdio.h>                /* snprintf in the delivery diagnosis */
 #include "ps3emu/stop.h"
 #include "ps3emu/log_first.h"
+#include "../../include/ps3emu/ps3_log.h"
 #ifdef PS3_SYNC_TEST_HOOKS
 extern int ps3_sync_test_hook(const char* point, uint32_t id);
 #define EVT_TEST_HOOK(point, id) ((void)ps3_sync_test_hook((point), (id)))
@@ -252,7 +253,7 @@ uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size)
 
     evt_table_unlock();
 
-    fprintf(stderr, "[evt] queue_create_direct -> id=%d key=0x%llX size=%d\n",
+    PS3_LOG(PS3_LOG_INFO, "evt", "queue_create_direct -> id=%d key=0x%llX size=%d\n",
             slot + 1, (unsigned long long)key, size);
     return (uint32_t)(slot + 1);
 }
@@ -289,7 +290,7 @@ int64_t sys_event_queue_create(ppu_context* ctx)
     q->capacity = size;
     q->type     = SYS_PPU_QUEUE;
     s_have_last_evt[slot] = 0;
-    fprintf(stderr, "[evt] queue_create -> id=%d key=0x%llX size=%d\n",
+    PS3_LOG(PS3_LOG_INFO, "evt", "queue_create -> id=%d key=0x%llX size=%d\n",
             slot + 1, (unsigned long long)key, size);
 
     if (attr_addr != 0) {
@@ -426,7 +427,7 @@ void sys_event_queue_uncancel_by_id(uint32_t queue_id)
 #endif
     event_queue_end(queue_id);
     if (changed)
-        fprintf(stderr, "[evt] queue %u un-cancelled (producer attached again)\n", queue_id);
+        PS3_LOG(PS3_LOG_INFO, "evt", "queue %u un-cancelled (producer attached again)\n", queue_id);
 }
 
 void sys_event_queue_cancel_by_id(uint32_t queue_id)
@@ -452,7 +453,7 @@ void sys_event_queue_cancel_by_id(uint32_t queue_id)
 #endif
     event_queue_end(queue_id);
     if (changed)
-        fprintf(stderr, "[evt] queue %u cancelled (producer gone) -- waiters released\n",
+        PS3_LOG(PS3_LOG_INFO, "evt", "queue %u cancelled (producer gone) -- waiters released\n",
                 queue_id);
 }
 
@@ -469,7 +470,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     { extern void ydkj_release_pending_threads(void); ydkj_release_pending_threads(); }
     ppu_thread_note_block(ctx->thread_id);   /* PS3_PRIO_START */
     if (ps3_log_verbose())
-        fprintf(stderr, "[WAIT] event_queue_receive(q=%u timeout=%llu) tid=%llu cia=0x%08X lr=0x%08X\n",
+        PS3_LOG(PS3_LOG_INFO, "WAIT", "event_queue_receive(q=%u timeout=%llu) tid=%llu cia=0x%08X lr=0x%08X\n",
                 queue_id, (unsigned long long)timeout_us,
                 (unsigned long long)ctx->thread_id, (uint32_t)ctx->cia, (uint32_t)ctx->lr);
 
@@ -547,7 +548,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
             extern int spu_workload_dispatch_async(const uint8_t*, uint32_t, uint32_t);
             const uint8_t* elf = vm_base + 0x004F5F80u;
             size_t sz = spu_elf_image_size(elf, 2u * 1024 * 1024);
-            fprintf(stderr, "[ydkj] block on q=%u -> dispatch real SPU task runtime "
+            PS3_LOG(PS3_LOG_INFO, "ydkj", "block on q=%u -> dispatch real SPU task runtime "
                     "(img@0x4F5F80 sz=%zu ctx=0x%08X)\n", queue_id, sz, g_ydkj_spurs_ctx_ea);
             if (sz) spu_workload_dispatch_async(elf, (uint32_t)sz, g_ydkj_spurs_ctx_ea);
         }
@@ -575,7 +576,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
                 out[0] = bswap64(0x0000000000000000ULL); /* source/name */
                 out[1] = 0; out[2] = bswap64(d2); out[3] = 0;
             }
-            fprintf(stderr, "[ydkj] SPURS_READY: synthesized ready event on q=%u (#%d)\n",
+            PS3_LOG(PS3_LOG_INFO, "ydkj", "SPURS_READY: synthesized ready event on q=%u (#%d)\n",
                     queue_id, s_fire[queue_id]);
             return event_queue_finish(queue_id, CELL_OK);
         }
@@ -669,7 +670,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
                 q->waiters--;
                 LeaveCriticalSection(&q->lock);
                 { static int n = 0; if (n++ < 16)
-                    fprintf(stderr, "[evt] EVT_RECV_KICK: q=%u idle %lu ms -> re-delivered last event\n",
+                    PS3_LOG(PS3_LOG_INFO, "evt", "EVT_RECV_KICK: q=%u idle %lu ms -> re-delivered last event\n",
                             queue_id, (unsigned long)s_kms); }
                 ctx->gpr[4] = evt.source; ctx->gpr[5] = evt.data1;
                 ctx->gpr[6] = evt.data2;  ctx->gpr[7] = evt.data3;
@@ -812,8 +813,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     ctx->gpr[5] = evt.data1;
     ctx->gpr[6] = evt.data2;
     ctx->gpr[7] = evt.data3;
-    { static int _r=0; if (getenv("PS3_EVT_RECV_TRACE") && PS3_LOG_FIRST(_r, 60)) fprintf(stderr,
-        "[RECV] q=%u source=0x%llX data1=0x%llX data2=0x%llX\n", queue_id,
+    { if (getenv("PS3_EVT_RECV_TRACE")) PS3_LOG_N(60, PS3_LOG_INFO, "RECV", "q=%u source=0x%llX data1=0x%llX data2=0x%llX\n", queue_id,
         (unsigned long long)evt.source, (unsigned long long)evt.data1,
         (unsigned long long)evt.data2); }
 
@@ -838,9 +838,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
         if (_sel == -2) { const char* e = getenv("PS3_EVT_RECV");
                           _sel = !e ? 1 : (strcmp(e, "all") == 0 ? -1 : atoi(e)); }
     if (_sel == -1 || (int)queue_id == _sel) {
-        static int _r = 0;
-        if (PS3_LOG_FIRST(_r, 64))
-            fprintf(stderr, "[evt] q=%u receive RETURNED to tid=%llu: src=0x%llX d1=0x%llX d2=0x%llX d3=0x%llX (qcount now %u)\n",
+        PS3_LOG_N(64, PS3_LOG_INFO, "evt", "q=%u receive RETURNED to tid=%llu: src=0x%llX d1=0x%llX d2=0x%llX d3=0x%llX (qcount now %u)\n",
                     queue_id,
                     (unsigned long long)ctx->thread_id, (unsigned long long)evt.source,
                     (unsigned long long)evt.data1, (unsigned long long)evt.data2,
@@ -949,7 +947,7 @@ static int event_queue_push(sys_event_queue_info* q, const sys_event_t* evt)
      * find which producer feeds a queue when nothing logs a port_send. */
     { static int s_q = -1; if (s_q < 0) { const char* e = getenv("EVT_PUSHLOG"); s_q = e ? atoi(e) : 0; }
       if (s_q && q == &g_sys_event_queues[s_q - 1]) { static int s_n = 0;
-        if (s_n++ < 200) fprintf(stderr, "[evt-push] q=%d src=0x%llX d=0x%llX/0x%llX/0x%llX ra=%p\n",
+        if (s_n++ < 200) PS3_LOG(PS3_LOG_INFO, "evt-push", "q=%d src=0x%llX d=0x%llX/0x%llX/0x%llX ra=%p\n",
                 s_q, (unsigned long long)evt->source, (unsigned long long)evt->data1,
                 (unsigned long long)evt->data2, (unsigned long long)evt->data3, __builtin_return_address(0)); } }
     /* PS3_EVQSTAT=<n>: every n pushes, report each live queue's push count and
@@ -1057,7 +1055,7 @@ int64_t sys_event_port_create(ppu_context* ctx)
     p->connected_queue = 0;
 
     uint32_t port_id = (uint32_t)(slot + 1);
-    fprintf(stderr, "[evt] port_create -> id=%u type=%d name=0x%llX\n",
+    PS3_LOG(PS3_LOG_INFO, "evt", "port_create -> id=%u type=%d name=0x%llX\n",
             port_id, (int)port_type, (unsigned long long)name);
     if (id_out_addr != 0) {
         write_be32(id_out_addr, port_id);
@@ -1096,7 +1094,7 @@ int64_t sys_event_port_connect_local(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
     if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
-    fprintf(stderr, "[evt] port_connect(port=%u -> queue=%u)\n", port_id, queue_id);
+    PS3_LOG(PS3_LOG_INFO, "evt", "port_connect(port=%u -> queue=%u)\n", port_id, queue_id);
 
     evt_table_lock();
 
@@ -1123,7 +1121,7 @@ int64_t sys_event_port_connect_local(ppu_context* ctx)
      * takes 1,901 receives and delivers zero events; knowing whether any port
      * points at it is the difference between "no sender ran" and "no sender
      * exists". */
-    fprintf(stderr, "[evt] port_connect_local(port=%u -> q=%u)\n", port_id, queue_id);
+    PS3_LOG(PS3_LOG_INFO, "evt", "port_connect_local(port=%u -> q=%u)\n", port_id, queue_id);
     return CELL_OK;
 }
 
@@ -1325,7 +1323,7 @@ int64_t sys_event_port_send(ppu_context* ctx)
     if (s_send_stack) { static unsigned char seen[8]={0}; unsigned pk=port_id&7;
         if(!seen[pk]){ seen[pk]=1; extern void ppu_dump_guest_stack(ppu_context*,const char*);
             char tag[40]; snprintf(tag,sizeof tag,"port_send producer port=%u",port_id); ppu_dump_guest_stack(ctx,tag); } }
-    if (ps3_log_verbose()) fprintf(stderr, "[evt] port_send(port=%u data=0x%llX/0x%llX/0x%llX)\n",
+    if (ps3_log_verbose()) PS3_LOG(PS3_LOG_INFO, "evt", "port_send(port=%u data=0x%llX/0x%llX/0x%llX)\n",
             port_id, (unsigned long long)data1, (unsigned long long)data2, (unsigned long long)data3);
 
     if (port_id == 0 || port_id > SYS_EVENT_PORT_MAX)
@@ -1352,7 +1350,7 @@ int64_t sys_event_port_send(ppu_context* ctx)
         }
         evt_table_unlock();
         if (!inactive_port_route) {
-            fprintf(stderr, "[evt] port_send(port=%u): port NOT ACTIVE\n", port_id);
+            PS3_LOG(PS3_LOG_INFO, "evt", "port_send(port=%u): port NOT ACTIVE\n", port_id);
             return (int64_t)(int32_t)CELL_ESRCH;
         }
         sys_event_t routed_evt;
@@ -1362,7 +1360,7 @@ int64_t sys_event_port_send(ppu_context* ctx)
         routed_evt.data3 = data3;
         const int rc = event_queue_push(q, &routed_evt);
         event_queue_end((uint32_t)qidx);
-        fprintf(stderr, "[evt] port_send(port=%u): port inactive -> ROUTED real event to queue id=%u "
+        PS3_LOG(PS3_LOG_INFO, "evt", "port_send(port=%u): port inactive -> ROUTED real event to queue id=%u "
                         "(data=0x%llX/0x%llX/0x%llX) rc=%d\n",
                 port_id, (unsigned)qidx, (unsigned long long)data1,
                 (unsigned long long)data2, (unsigned long long)data3, rc);
@@ -1371,7 +1369,7 @@ int64_t sys_event_port_send(ppu_context* ctx)
 
     if (p->connected_queue == 0) {
         evt_table_unlock();
-        fprintf(stderr, "[evt] port_send(port=%u): NOT CONNECTED to any queue\n", port_id);
+        PS3_LOG(PS3_LOG_INFO, "evt", "port_send(port=%u): NOT CONNECTED to any queue\n", port_id);
         return (int64_t)(int32_t)CELL_ENOTCONN;
     }
     qidx = p->connected_queue;
@@ -1389,7 +1387,7 @@ int64_t sys_event_port_send(ppu_context* ctx)
     event_source = p->name;
     evt_table_unlock();
 
-    if (ps3_log_verbose()) fprintf(stderr, "[evt] port_send(port=%u) -> queue id=%d (source=0x%llX)\n",
+    if (ps3_log_verbose()) PS3_LOG(PS3_LOG_INFO, "evt", "port_send(port=%u) -> queue id=%d (source=0x%llX)\n",
             port_id, qidx, (unsigned long long)event_source);
 
     sys_event_t evt;
@@ -1417,7 +1415,7 @@ int64_t sys_event_port_send(ppu_context* ctx)
         event_queue_end((uint32_t)qidx);
         if (!active)
             return (int64_t)(int32_t)CELL_ESRCH;
-        fprintf(stderr, "[evt] port_send(port=%u): queue %d FULL -> EBUSY%c",
+        PS3_LOG(PS3_LOG_INFO, "evt", "port_send(port=%u): queue %d FULL -> EBUSY%c",
                 port_id, qidx, 10);
         return (int64_t)(int32_t)CELL_EBUSY;
     }
@@ -1505,7 +1503,7 @@ int64_t sys_event_flag_create(ppu_context* ctx)
     }
     { char nm[9]; memcpy(nm, f->name, 8); nm[8]=0;
       for(int i=0;i<8;i++) if(nm[i] && (nm[i]<32||nm[i]>126)) nm[i]='.';
-      fprintf(stderr, "[evt] flag_create id=%u name=\"%s\" init=0x%llX type=%u\n",
+      PS3_LOG(PS3_LOG_INFO, "evt", "flag_create id=%u name=\"%s\" init=0x%llX type=%u\n",
               flag_id, nm, (unsigned long long)init_pattern, f->type); }
 
     evt_table_unlock();
@@ -1584,11 +1582,11 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
     uint64_t bitpat     = LV2_ARG_U64(ctx, 1);
     uint32_t mode       = LV2_ARG_U32(ctx, 2);
     uint32_t result_addr = LV2_ARG_PTR(ctx, 3);
-    /* Diagnostics on a PPU syscall several threads issue: per-thread counters,
-     * so PS3_LOG_FIRST does not race and each thread logs its own first calls. */
-    { static _Thread_local int n=0; if(PS3_LOG_FIRST(n, 30)) fprintf(stderr,"[WAIT] event_flag_wait(flag=%u pat=0x%llX mode=%u)\n", flag_id,(unsigned long long)bitpat,mode); }
+    /* Diagnostics on a PPU syscall several threads issue: the PS3_LOG_N caps are process-wide,
+     * so a run prints the first 30 and 40 lines overall rather than per thread. */
+    { PS3_LOG_N(30, PS3_LOG_INFO, "WAIT", "event_flag_wait(flag=%u pat=0x%llX mode=%u)\n", flag_id,(unsigned long long)bitpat,mode); }
     uint64_t timeout_us = LV2_ARG_U64(ctx, 4);
-    { static _Thread_local int _w=0; if (PS3_LOG_FIRST(_w, 40)) fprintf(stderr, "[WAIT] event_flag_wait(flag=%u bits=0x%llX timeout=%llu)\n", flag_id, (unsigned long long)bitpat, (unsigned long long)timeout_us); }
+    { PS3_LOG_N(40, PS3_LOG_INFO, "WAIT", "event_flag_wait(flag=%u bits=0x%llX timeout=%llu)\n", flag_id, (unsigned long long)bitpat, (unsigned long long)timeout_us); }
     /* SPU-completion shim (targeted): the main thread spins in func_003319D0 until
      * *(r29+0x24) (a completion counter the SPU would increment) reaches the target
      * *(r29). Since we don't yet run the SPU workload, satisfy that counter so the
@@ -1601,15 +1599,14 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
         uint32_t obj = (uint32_t)ctx->gpr[29];
         uint8_t* tgt = (uint8_t*)vm_to_host(obj);
         uint8_t* cur = (uint8_t*)vm_to_host(obj + 0x24);
-        static _Thread_local int _n=0; if (PS3_LOG_FIRST(_n, 12))
-            fprintf(stderr, "[evt] SPU-completion shim: flag=%u r29=0x%08X target=%02X%02X%02X%02X cur=%02X%02X%02X%02X -> satisfied\n",
+        PS3_LOG_N(12, PS3_LOG_INFO, "evt", "SPU-completion shim: flag=%u r29=0x%08X target=%02X%02X%02X%02X cur=%02X%02X%02X%02X -> satisfied\n",
                     flag_id, obj, tgt[0],tgt[1],tgt[2],tgt[3], cur[0],cur[1],cur[2],cur[3]);
         cur[0]=tgt[0]; cur[1]=tgt[1]; cur[2]=tgt[2]; cur[3]=tgt[3];
         return CELL_OK;
     }
 
     if (flag_id == 0 || flag_id > SYS_EVENT_FLAG_MAX) {
-        { static _Thread_local int _e=0; if(PS3_LOG_FIRST(_e, 8)) fprintf(stderr,"[evt] flag_wait flag=%u OUT-OF-RANGE (max=%d) -> ESRCH\n", flag_id, SYS_EVENT_FLAG_MAX); }
+        { PS3_LOG_N(8, PS3_LOG_INFO, "evt", "flag_wait flag=%u OUT-OF-RANGE (max=%d) -> ESRCH\n", flag_id, SYS_EVENT_FLAG_MAX); }
         return (int64_t)(int32_t)CELL_ESRCH;
     }
 
@@ -1620,7 +1617,7 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
      * real render code. Diagnostic only; identifies whether the spin is the gate. */
     { static _Thread_local int s_f = -1; if (s_f < 0) s_f = getenv("PS3_EVF_OK_IF_MISSING") ? 1 : 0;
       if (s_f && !g_sys_event_flags[flag_id-1].active) {
-        static _Thread_local int _n=0; if(PS3_LOG_FIRST(_n, 4)) fprintf(stderr,"[evt] PS3_EVF_OK_IF_MISSING: flag=%u -> return CELL_OK (break spin)\n", flag_id);
+        PS3_LOG_N(4, PS3_LOG_INFO, "evt", "PS3_EVF_OK_IF_MISSING: flag=%u -> return CELL_OK (break spin)\n", flag_id);
         if (result_addr != 0) { write_be32(result_addr, (uint32_t)(bitpat>>32)); write_be32(result_addr+4, (uint32_t)bitpat); }
         return CELL_OK;
       } }
@@ -1649,7 +1646,7 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
     }
     /* No f->pattern here: it is guarded by f->lock and this diagnostic runs
      * unlocked, so two first-time waiters would race a concurrent set. */
-    { static _Thread_local int _a=0; if(PS3_LOG_FIRST(_a, 8)) fprintf(stderr,"[evt] flag_wait flag=%u ACTIVE, awaiting bits=0x%llX -> BLOCK\n", flag_id,(unsigned long long)bitpat); }
+    { PS3_LOG_N(8, PS3_LOG_INFO, "evt", "flag_wait flag=%u ACTIVE, awaiting bits=0x%llX -> BLOCK\n", flag_id,(unsigned long long)bitpat); }
 
     if (bitpat == 0)
         return (int64_t)(int32_t)CELL_EINVAL;
@@ -1661,8 +1658,7 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
      * identifies the gate. */
     { static _Thread_local int s_fe = -1; if (s_fe < 0) s_fe = getenv("PS3_EVF_FORCE") ? 1 : 0;
       if (s_fe && f->active && !flag_check(f->pattern, bitpat, mode)) {
-        static _Thread_local int _n = 0; if (PS3_LOG_FIRST(_n, 20))
-            fprintf(stderr, "[evt] PS3_EVF_FORCE: force-satisfy flag=%u bits=0x%llX mode=%u\n",
+        PS3_LOG_N(20, PS3_LOG_INFO, "evt", "PS3_EVF_FORCE: force-satisfy flag=%u bits=0x%llX mode=%u\n",
                     flag_id, (unsigned long long)bitpat, mode);
 #ifdef _WIN32
         EnterCriticalSection(&f->lock); f->pattern |= bitpat; LeaveCriticalSection(&f->lock);
@@ -1852,7 +1848,7 @@ int64_t sys_event_flag_set(ppu_context* ctx)
     uint32_t flag_id = LV2_ARG_U32(ctx, 0);
     uint64_t bitpat  = LV2_ARG_U64(ctx, 1);
 
-    { static _Thread_local int _n=0; if(PS3_LOG_FIRST(_n, 200)) fprintf(stderr,"[evt] flag_set(flag=%u bits=0x%llX)\n",
+    { PS3_LOG_N(200, PS3_LOG_INFO, "evt", "flag_set(flag=%u bits=0x%llX)\n",
         flag_id,(unsigned long long)bitpat); }
 
     if (flag_id == 0 || flag_id > SYS_EVENT_FLAG_MAX)

@@ -5,7 +5,7 @@
 #include "sys_memory.h"
 #include <stdio.h>
 #include <string.h>
-#include "../../include/ps3emu/log_first.h"   /* relative: tools/test_*memory*.py compile this file alone */
+#include "../../include/ps3emu/ps3_log.h"   /* relative: tools/test_*memory*.py compile this file alone */
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -146,7 +146,7 @@ static int64_t memory_allocate(const char* func, uint64_t requested, uint32_t fl
     if (ct) ct->used_size += size;
     if (addr + size > g_sys_mem_bump_ptr) g_sys_mem_bump_ptr = addr + size;
     bump_unlock();
-    fprintf(stderr, "[sys_memory] allocate(size=0x%X, flags=0x%X, cid=%u) -> 0x%08X\n", size, flags, cid, addr);
+    PS3_LOG(PS3_LOG_INFO, "sys_memory", "allocate(size=0x%X, flags=0x%X, cid=%u) -> 0x%08X\n", size, flags, cid, addr);
     if (addr_out) write_be32(addr_out, addr);
     return CELL_OK;
 }
@@ -208,7 +208,7 @@ int64_t sys_memory_get_user_memory_size(ppu_context* ctx)
 {
     uint32_t out_addr = LV2_ARG_PTR(ctx, 0);
 
-    fprintf(stderr, "[sys_memory] get_user_memory_size()\n");
+    PS3_LOG(PS3_LOG_INFO, "sys_memory", "get_user_memory_size()\n");
     if (out_addr != 0) {
         uint32_t total = SYS_MEM_USER_TOTAL;
         uint32_t avail = total - s_total_allocated;
@@ -535,8 +535,7 @@ int64_t sys_mmapper_allocate_memory(ppu_context* ctx)
     if (addr_out != 0)
         write_be32(addr_out, addr);
 
-    { static int n = 0; if (PS3_LOG_FIRST(n, 4))
-        fprintf(stderr, "[sys_memory] mmapper_allocate_memory size=0x%X -> 0x%08X\n",
+    { PS3_LOG_N(4, PS3_LOG_INFO, "sys_memory", "mmapper_allocate_memory size=0x%X -> 0x%08X\n",
                 size, addr); }
 
     return CELL_OK;

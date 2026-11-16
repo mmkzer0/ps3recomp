@@ -27,7 +27,8 @@ with tempfile.TemporaryDirectory(prefix='ppu-host-stack-') as tmp:
     subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-D_GNU_SOURCE', '-O1', '-UNDEBUG', *san,
                     '-ffunction-sections', '-fdata-sections',
                     '-I' + str(root / 'include'), '-I' + str(root / 'runtime'), '-I' + str(root / 'runtime/syscalls'),
-                    str(root / 'tests/test_ppu_host_stack.c'), *linker, '-o', str(binary)], check=True)
+                    str(root / 'tests/test_ppu_host_stack.c'), str(root / 'runtime/diag/ps3_log.c'),
+                    *linker, '-o', str(binary)], check=True)
     quiet = subprocess.DEVNULL if os.environ.get('CI') else None
     for mode in ('on', 'off'):
         subprocess.run([str(binary), mode], check=True, timeout=120, stderr=quiet)

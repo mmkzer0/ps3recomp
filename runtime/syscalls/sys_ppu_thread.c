@@ -34,7 +34,7 @@ _Static_assert(PPU_THREAD_MAX == PPU_THREAD_SLOTS, "a thread id carries its slot
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>   /* getenv (else return value truncated to int on x64) */
-#include "ps3emu/log_first.h"
+#include "../../include/ps3emu/ps3_log.h"
 #include "ps3emu/thread_name.h"
 #include <errno.h>
 #include "ps3emu/host_stack.h"   /* PS3_HOST_STACK_HWM: the stack bounds and its high-water mark */
@@ -276,7 +276,7 @@ static void wait_first_block(const ppu_thread_info* t, uint64_t tid)
         if (waited < PRIO_START_SPIN_MS) SwitchToThread();
         else                             Sleep(1);
     }
-    fprintf(stderr, "[SYS] PS3_PRIO_START: tid=%llu \"%s\" (prio %d) did not block within %d ms; its creator goes on\n",
+    PS3_LOG(PS3_LOG_INFO, "SYS", "PS3_PRIO_START: tid=%llu \"%s\" (prio %d) did not block within %d ms; its creator goes on\n",
             (unsigned long long)tid, t->name, t->priority, PRIO_START_TIMEOUT_MS);
     if (hook) hook(tid, 1);
 }
@@ -325,11 +325,11 @@ void ppu_thread_set_host_stack_hook(ppu_thread_host_stack_hook_fn fn)
 static void host_stack_publish(uint64_t tid, const char* name, size_t reserved, int known, size_t high_water, int live)
 {
     if (known)
-        fprintf(stderr, "[HOSTSTACK] tid=%llu name=\"%s\" %s reserved=%zu high_water=%zu (%.1f%%)\n",
+        PS3_LOG(PS3_LOG_INFO, "HOSTSTACK", "tid=%llu name=\"%s\" %s reserved=%zu high_water=%zu (%.1f%%)\n",
                 (unsigned long long)tid, name, live ? "live" : "exited", reserved, high_water,
                 reserved ? 100.0 * (double)high_water / (double)reserved : 0.0);
     else
-        fprintf(stderr, "[HOSTSTACK] tid=%llu name=\"%s\" %s reserved=%zu high_water=unknown\n",
+        PS3_LOG(PS3_LOG_INFO, "HOSTSTACK", "tid=%llu name=\"%s\" %s reserved=%zu high_water=unknown\n",
                 (unsigned long long)tid, name, live ? "live" : "exited", reserved);
     if (known) {
         size_t seen = __atomic_load_n(&s_hs_max, __ATOMIC_RELAXED);
@@ -378,7 +378,7 @@ static void host_stack_summary(void)
         host_stack_publish(t->ctx.thread_id, t->name, t->host_stack_req, known, hw, 1);
     }
     table_unlock();
-    fprintf(stderr, "[HOSTSTACK] summary: threads=%u max_high_water=%zu ppu.host_stack_mb=%u\n",
+    PS3_LOG(PS3_LOG_INFO, "HOSTSTACK", "summary: threads=%u max_high_water=%zu ppu.host_stack_mb=%u\n",
             __atomic_load_n(&s_hs_reported, __ATOMIC_RELAXED), __atomic_load_n(&s_hs_max, __ATOMIC_RELAXED),
             (unsigned)ps3_cfg_ppu_host_stack_mb());
     fflush(stderr);
@@ -457,7 +457,7 @@ static void* ppu_host_thread_proc(void* param)
         { extern int ps3_intr_is_handler(unsigned long long);
           extern int ps3_intr_wait(unsigned long long);
           if (ps3_intr_is_handler(info->ctx.thread_id)) {
-              fprintf(stderr, "[intr] thread %llu is an interrupt handler -- \n",
+              PS3_LOG(PS3_LOG_INFO, "intr", "thread %llu is an interrupt handler -- \n",
                       (unsigned long long)info->ctx.thread_id);
               while (ps3_intr_wait(info->ctx.thread_id)) {
                   s_exit_armed = 1;
@@ -523,7 +523,7 @@ void ydkj_release_pending_threads(void)
     int n = g_gate_n; g_gate_n = 0;
     for (int i = 0; i < n; i++) if (g_gate_pending[i]) ResumeThread(g_gate_pending[i]);
     table_unlock();
-    if (n) fprintf(stderr, "[THREADGATE] released %d pending worker thread(s) on first block\n", n);
+    if (n) PS3_LOG(PS3_LOG_INFO, "THREADGATE", "released %d pending worker thread(s) on first block\n", n);
 }
 #else
 void ydkj_release_pending_threads(void) {}
@@ -783,7 +783,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
         *out = be_id;
     }
 
-    fprintf(stderr, "[SYS] sys_ppu_thread_create tid=%llu name=\"%s\" entry=0x%08llX arg=0x%llX stack=0x%X prio=%d flags=0x%llX\n",
+    PS3_LOG(PS3_LOG_INFO, "SYS", "sys_ppu_thread_create tid=%llu name=\"%s\" entry=0x%08llX arg=0x%llX stack=0x%X prio=%d flags=0x%llX\n",
             (unsigned long long)thread_id, t->name, (unsigned long long)entry, (unsigned long long)arg,
             stack_size, priority, (unsigned long long)flags);
     /* YDKJ: dump the worker arg-object: func_000750A8 (thread body) does
@@ -793,7 +793,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
       if(a && a<0x50000000u && getenv("PPU_THREADARG")){
         #define RB(o) (((uint32_t)vm_base[(a+(o))&0x0FFFFFFFu]<<24)|((uint32_t)vm_base[(a+(o)+1)&0x0FFFFFFFu]<<16)|((uint32_t)vm_base[(a+(o)+2)&0x0FFFFFFFu]<<8)|vm_base[(a+(o)+3)&0x0FFFFFFFu])
         uint32_t self=RB(0x0), thisp=RB(0x8), vtbl=RB(0xC);
-        fprintf(stderr,"[THREADARG] arg=0x%08X [+0]=0x%08X this[+8]=0x%08X vtbl[+C]=0x%08X\n", a, self, thisp, vtbl);
+        PS3_LOG(PS3_LOG_INFO, "THREADARG", "arg=0x%08X [+0]=0x%08X this[+8]=0x%08X vtbl[+C]=0x%08X\n", a, self, thisp, vtbl);
         #undef RB
       } }
 
@@ -803,7 +803,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
      * cellSpursInitialize) keep running, to see how far it gets. The thread is
      * "created" (tid returned) but never spawned. */
     if (getenv("YDKJ_NOHDLR") && entry >= 0x30000000 && entry < 0x30040000) {
-        fprintf(stderr, "[SYS]   (suppressed libsre handler thread entry=0x%08llX)\n",
+        PS3_LOG(PS3_LOG_INFO, "SYS", "  (suppressed libsre handler thread entry=0x%08llX)\n",
                 (unsigned long long)entry);
         t->state = PPU_THREAD_STATE_RUNNING; /* leave it parked */
         table_unlock();
@@ -887,7 +887,7 @@ int64_t sys_ppu_thread_exit(ppu_context* ctx)
 {
     uint64_t status = LV2_ARG_U64(ctx, 0);
     uint64_t tid = ctx->thread_id;
-    fprintf(stderr, "[SYS] sys_ppu_thread_exit(tid=%llu status=%llu)\n",
+    PS3_LOG(PS3_LOG_INFO, "SYS", "sys_ppu_thread_exit(tid=%llu status=%llu)\n",
             (unsigned long long)tid, (unsigned long long)status);
 
     table_lock();
@@ -923,7 +923,7 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
 {
     uint64_t tid          = LV2_ARG_U64(ctx, 0);
     uint32_t status_addr  = LV2_ARG_PTR(ctx, 1);
-    { static PPU_TLS int n=0; if(PS3_LOG_FIRST(n, 30)) fprintf(stderr,"[WAIT] ppu_thread_join(tid=%llu)\n", (unsigned long long)tid); }
+    { PS3_LOG_N(30, PS3_LOG_INFO, "WAIT", "ppu_thread_join(tid=%llu)\n", (unsigned long long)tid); }
     ppu_thread_note_block(ctx->thread_id);   /* PS3_PRIO_START */
 
     /* Joining yourself is EDEADLK (it used to wait on its own finish event
@@ -1091,7 +1091,7 @@ int64_t sys_ppu_thread_yield(ppu_context* ctx)
           extern uint32_t vm_read32(uint64_t);
           const uint32_t r30 = (uint32_t)ctx->gpr[30];
           if (++n <= 6 || (n % 500000ul) == 0)
-              fprintf(stderr, "[spinwait] n=%lu lr=%08X ctr=%08X r2=%08X"
+              PS3_LOG(PS3_LOG_INFO, "spinwait", "n=%lu lr=%08X ctr=%08X r2=%08X"
                               " r30=%08X w0=%08X w88=%08X r31=%08X\n",
                       n, (uint32_t)ctx->lr, (uint32_t)ctx->ctr,
                       (uint32_t)ctx->gpr[2], r30,
@@ -1272,7 +1272,7 @@ int64_t sys_ppu_thread_yield(ppu_context* ctx)
                       if (!f0 && n0 < 8) seen_a0[n0++] = a0;
                       if (!f1 && n1 < 8) seen_a1[n1++] = a1;
                       if (++ln <= 8 || (ln % 20000) == 0) {
-                          fprintf(stderr, "[loopwatch] n=%lu pc=0x%08X"
+                          PS3_LOG(PS3_LOG_INFO, "loopwatch", "n=%lu pc=0x%08X"
                                           " a0=%08X a1=%08X a3=%08X"
                                           " distinct[a0=%d a1=%d]\n",
                                   ln, pc, a0, a1, a3, n0, n1);
@@ -1408,7 +1408,7 @@ int64_t sys_ppu_thread_yield(ppu_context* ctx)
               if (i < NB) cnt[i]++;
               ++total;
               if (total == 20000ul || (total % 200000ul) == 0) {
-                  fprintf(stderr, "[r3000pc] %lu yields from the interpreter;"
+                  PS3_LOG(PS3_LOG_INFO, "r3000pc", "%lu yields from the interpreter;"
                                   " hottest PS1 PC buckets:\n", total);
                   for (int k = 0; k < NB; k++) {
                       int best = -1; unsigned long bv = 0;
@@ -1648,7 +1648,7 @@ int64_t sys_ppu_thread_get_stack_information(ppu_context* ctx)
     static int s_log = -1;
     if (s_log < 0) s_log = getenv("PPU_STACKINFO_LOG") ? 1 : 0;
     if (s_log)
-        fprintf(stderr, "[ppu_thread] get_stack_information tid=%llu -> 0x%08X+0x%X\n",
+        PS3_LOG(PS3_LOG_INFO, "ppu_thread", "get_stack_information tid=%llu -> 0x%08X+0x%X\n",
                 (unsigned long long)tid, sa, ss);
 
     if (out_addr != 0) {

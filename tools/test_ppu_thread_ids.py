@@ -19,5 +19,6 @@ with tempfile.TemporaryDirectory(prefix='ppu-thread-ids-') as tmp:
     subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-D_GNU_SOURCE', '-O1', '-UNDEBUG', *san,
                     '-ffunction-sections', '-fdata-sections',
                     '-I' + str(root / 'include'), '-I' + str(root / 'runtime'), '-I' + str(root / 'runtime/syscalls'),
-                    str(root / 'tests/test_ppu_thread_ids.c'), *linker, '-o', str(binary)], check=True)
+                    str(root / 'tests/test_ppu_thread_ids.c'), str(root / 'runtime/diag/ps3_log.c'),
+                    *linker, '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True, timeout=120)

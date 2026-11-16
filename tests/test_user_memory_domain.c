@@ -5,6 +5,17 @@
 #include <string.h>
 #include <limits.h>
 #include "guest_range_catch.h"
+/* The rest of the stop runtime: config.cpp and ps3_log.c reference it; no path here raises one. */
+PS3_NORETURN void ps3_stop(ps3_stop_kind kind, const char* what, const char* remedy,
+                           const ps3_stop_field* fields, size_t nfields, const ps3_stop_site* site)
+{
+    (void)kind; (void)remedy; (void)fields; (void)nfields; (void)site;
+    fprintf(stderr, "unexpected ps3_stop in fixture: %s\n", what);
+    abort();
+}
+void ps3_stop_set_mirror(ps3_stop_quiesce_fn quiesce, ps3_stop_mirror_fn mirror)
+{ (void)quiesce; (void)mirror; }
+
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
 uint32_t ppu_hle_inject_base=0x20000000u;

@@ -244,8 +244,12 @@ add_executable(test_sys_fs
     test_sys_fs.c
     "${PS3RECOMP_ROOT}/runtime/syscalls/sys_fs.c"
     "${PS3RECOMP_ROOT}/runtime/platform/ps3_dev_flash.c"
-    # sys_fs.c raises hle-guest-range / commit-failed through ps3_stop (C++).
+    # sys_fs.c raises hle-guest-range / commit-failed through ps3_stop (C++), and its
+    # migrated diagnostics call ps3_log_*, whose references to the typed configuration
+    # come from config.cpp.
     "${PS3RECOMP_ROOT}/runtime/diag/stop.cpp"
+    "${PS3RECOMP_ROOT}/runtime/diag/ps3_log.c"
+    "${PS3RECOMP_ROOT}/runtime/config/config.cpp"
 )
 set_target_properties(test_sys_fs PROPERTIES LINKER_LANGUAGE CXX)
 target_include_directories(test_sys_fs PRIVATE

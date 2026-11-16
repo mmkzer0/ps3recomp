@@ -78,17 +78,23 @@ def build_and_run(mirror, which, tmp):
            '-I' + str(m / 'runtime/platform'), '-I' + str(m / 'tests')]
     flags = ['-std=gnu17', '-O1', '-w', '-D_GNU_SOURCE', '-ffunction-sections', '-DPS3_HW_RELATIVE=' + rel, '-DHW_FAKE_DEFINES_HOST_CLOCK=1', *inc]
     if which.startswith('timer'):
+        # The migrated diagnostics of the syscall sources call ps3_log_*; the log's configure
+        # path (the one that needs config.cpp) is unreferenced here and dropped by section GC.
         srcs = [m / 'tests/sync_stress/test_timer_monotonic.c', m / 'tests/sync_stress/test_shims.c',
                 m / 'runtime/platform/tests/host_wait_fake.c', m / 'runtime/platform/win32_compat.c'] + \
-               [m / f'runtime/syscalls/{n}.c' for n in ('sys_timer', 'sys_event')]
+               [m / f'runtime/syscalls/{n}.c' for n in ('sys_timer', 'sys_event')] + \
+               [m / 'runtime/diag/ps3_log.c']
         cxx = [m / 'runtime/diag/stop.cpp']
     elif which.startswith('seam'):
         srcs = [m / 'runtime/platform/tests/test_host_wait_monotonic.c', m / 'runtime/platform/tests/host_wait_fake.c']
         cxx = []
     else:
+        # The migrated diagnostics of the syscall sources call ps3_log_*; the log's configure
+        # path (the one that needs config.cpp) is unreferenced here and dropped by section GC.
         srcs = [m / 'tests/sync_stress/test_timeout_monotonic.c', m / 'tests/sync_stress/test_shims.c',
                 m / 'runtime/platform/tests/host_wait_fake.c'] + [m / f'runtime/syscalls/{n}.c' for n in
-                ('sys_mutex', 'sys_cond', 'sys_semaphore', 'sys_event')]
+                ('sys_mutex', 'sys_cond', 'sys_semaphore', 'sys_event')] + \
+               [m / 'runtime/diag/ps3_log.c']
         cxx = [m / 'runtime/diag/stop.cpp']
     objs = []
     for i, s in enumerate(srcs):

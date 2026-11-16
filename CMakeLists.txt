@@ -947,7 +947,11 @@ if(PS3RECOMP_BUILD_TESTS)
             runtime/syscalls/sys_fs.c
             runtime/platform/ps3_dev_flash.c
             libs/filesystem/edat.c
-            runtime/diag/stop.cpp)
+            runtime/diag/stop.cpp
+            # sys_fs.c's migrated diagnostics call ps3_log_*, whose references to the typed
+            # configuration come from config.cpp.
+            runtime/diag/ps3_log.c
+            runtime/config/config.cpp)
         target_include_directories(test_sys_fs_guest_range PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/include"
             "${CMAKE_CURRENT_SOURCE_DIR}/runtime"
@@ -1064,7 +1068,9 @@ if(PS3RECOMP_BUILD_TESTS)
             # #131: group_destroy against a host thread parked at its tail by the PS3_SYNC_TEST_HOOKS hook; `running`
             # is an acquire/release atomic cleared last. Under the tsan preset a weaker `running` is a reported race.
             add_executable(test_spu_group_destroy_race
-                runtime/spu/tests/test_spu_group_destroy_race.c)
+                runtime/spu/tests/test_spu_group_destroy_race.c
+                # The fixture includes lv2_register.c, whose migrated lines call ps3_log_*.
+                runtime/diag/ps3_log.c)
             target_include_directories(test_spu_group_destroy_race PRIVATE
                 "${CMAKE_CURRENT_SOURCE_DIR}/include"
                 "${CMAKE_CURRENT_SOURCE_DIR}/runtime"
@@ -1087,7 +1093,9 @@ if(PS3RECOMP_BUILD_TESTS)
             # recursion depth, and the host-thread-stack stop when pthread_attr_init, pthread_attr_setstacksize or the
             # reservation is refused (each in a forked child, since a stop ends the process).
             add_executable(test_spu_group_host_stack
-                runtime/spu/tests/test_spu_group_host_stack.c)
+                runtime/spu/tests/test_spu_group_host_stack.c
+                # The fixture includes lv2_register.c, whose migrated lines call ps3_log_*.
+                runtime/diag/ps3_log.c)
             target_include_directories(test_spu_group_host_stack PRIVATE
                 "${CMAKE_CURRENT_SOURCE_DIR}/include"
                 "${CMAKE_CURRENT_SOURCE_DIR}/runtime"
@@ -2055,6 +2063,8 @@ if(PS3RECOMP_BUILD_TESTS)
             ps3recomp_add_hle_check_test(test_audio_pace
                 libs/audio/tests/test_audio_pace.c
                 runtime/syscalls/sys_timer.c
+                # sys_timer.c's migrated diagnostics call ps3_log_*.
+                runtime/diag/ps3_log.c
                 runtime/platform/host_clock.c)
             set_tests_properties(test_audio_pace PROPERTIES LABELS "audio;t0")
             target_include_directories(test_audio_pace PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/runtime/syscalls")

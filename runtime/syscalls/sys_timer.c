@@ -14,6 +14,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include "ps3emu/log_first.h"
+#include "../../include/ps3emu/ps3_log.h"
 #ifdef __APPLE__
 #include <mach/mach_time.h>
 #include <errno.h>
@@ -180,7 +181,7 @@ static void precise_usleep_failed(const char* what, int err)
 {
     static _Atomic int warned;
     if (atomic_exchange_explicit(&warned, 1, memory_order_relaxed)) return;
-    fprintf(stderr, "[usleep] precise-usleep-fallback: %s failed (errno %d: %s); sleeping with nanosleep "
+    PS3_LOG(PS3_LOG_INFO, "usleep", "precise-usleep-fallback: %s failed (errno %d: %s); sleeping with nanosleep "
                     "instead, which oversleeps by the host's timer leeway. Later failures are not reported "
                     "(ppu.precise_usleep=false selects nanosleep on purpose).\n",
             what, err, strerror(err));
@@ -247,8 +248,7 @@ int64_t sys_timer_usleep(ppu_context* ctx)
     uint64_t usec = LV2_ARG_U64(ctx, 0);
     ppu_thread_note_block(ctx->thread_id);   /* PS3_PRIO_START */
     { extern unsigned long long ps3_qpc_us(void);
-      static int n=0; if (PS3_LOG_FIRST(n, 60))
-        fprintf(stderr, "[WAIT] t=%lluus timer_usleep(%llu us) lr=0x%08llX cia=0x%08llX\n", ps3_qpc_us(),
+      PS3_LOG_N(60, PS3_LOG_INFO, "WAIT", "t=%lluus timer_usleep(%llu us) lr=0x%08llX cia=0x%08llX\n", ps3_qpc_us(),
         (unsigned long long)usec, (unsigned long long)ctx->lr, (unsigned long long)ctx->cia); }
     /* PS3_POLLTOP=<seconds>: name the usleep poll sites.
      *

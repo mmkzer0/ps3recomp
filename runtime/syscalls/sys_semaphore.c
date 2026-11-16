@@ -13,6 +13,7 @@
 #include <string.h>
 #include <stdlib.h>      /* getenv (else the pointer return is truncated to int) */
 #include "ps3emu/log_first.h"
+#include "../../include/ps3emu/ps3_log.h"
 #ifdef PS3_SYNC_TEST_HOOKS
 extern int ps3_sync_test_hook(const char* point, uint32_t id);
 #define SEM_TEST_HOOK(point, id) ((void)ps3_sync_test_hook((point), (id)))
@@ -126,14 +127,14 @@ void lbp_hang_census(void)
         uint32_t sem  = read_be32(q + 0x30);
         /* the guest done flag is the BYTE at address q+0x34 = big-endian high byte */
         uint32_t done = (read_be32(q + 0x34) >> 24) & 0xFF;
-        fprintf(stderr, "[HANGCENSUS] q[%d]@mgr+0x%02X ptr=0x%08X count=%u cap=%u sem=%u done=%u base=0x%08X\n",
+        PS3_LOG(PS3_LOG_INFO, "HANGCENSUS", "q[%d]@mgr+0x%02X ptr=0x%08X count=%u cap=%u sem=%u done=%u base=0x%08X\n",
                 i, qoff[i], q, cnt, cap, sem, done, base);
         fprintf(stderr, "[HANGCENSUS]   raw:");
         for (uint32_t o = 0; o <= 0x34; o += 4) fprintf(stderr, " +%02X=%08X", o, read_be32(q + o));
         fprintf(stderr, "\n");
         if (sem >= 1 && sem <= SYS_SEMAPHORE_MAX) {
             sys_semaphore_info* qs = &g_sys_semaphores[sem - 1];
-            fprintf(stderr, "[HANGCENSUS]   sem=%u runtime: active=%d value=%d max=%d\n",
+            PS3_LOG(PS3_LOG_INFO, "HANGCENSUS", "  sem=%u runtime: active=%d value=%d max=%d\n",
                     sem, qs->active, qs->value, qs->max_value);
 #ifdef _WIN32
             /* POKESEM experiment: if the guest queue holds more items than the
@@ -145,7 +146,7 @@ void lbp_hang_census(void)
                 qs->value += deficit;
                 LeaveCriticalSection(&qs->value_lock);
                 ReleaseSemaphore(qs->sem_handle, deficit, NULL);
-                fprintf(stderr, "[HANGCENSUS]   *** POKED sem=%u by %d (count=%u > value) ***\n",
+                PS3_LOG(PS3_LOG_INFO, "HANGCENSUS", "  *** POKED sem=%u by %d (count=%u > value) ***\n",
                         sem, deficit, cnt);
             }
 #endif
@@ -164,7 +165,7 @@ void lbp_hang_census(void)
             sys_semaphore_info* ps = &g_sys_semaphores[id-1];
             EnterCriticalSection(&ps->value_lock); ps->value += 1; LeaveCriticalSection(&ps->value_lock);
             ReleaseSemaphore(ps->sem_handle, 1, NULL);
-            fprintf(stderr, "[HANGCENSUS] *** FORCE-POSTED sem=%d by 1 (POKE7 test) ***\n", id);
+            PS3_LOG(PS3_LOG_INFO, "HANGCENSUS", "*** FORCE-POSTED sem=%d by 1 (POKE7 test) ***\n", id);
           }
         }
       }
@@ -320,9 +321,7 @@ int64_t sys_semaphore_create(ppu_context* ctx)
     /* Identify every semaphore at birth: name + creator's guest LR. The
      * LBP movie stall was a 2369-waits/0-posts semaphore whose OWNER took
      * grep archaeology to guess -- the name would have said it instantly. */
-    { static int _n = 0;
-      if (PS3_LOG_FIRST(_n, 48))
-          fprintf(stderr, "[sem] create id=%u name='%.8s' init=%d max=%d id_out=0x%08X lr=0x%08X\n",
+    { PS3_LOG_N(48, PS3_LOG_INFO, "sem", "create id=%u name='%.8s' init=%d max=%d id_out=0x%08X lr=0x%08X\n",
                   sem_id, s->name, initial, max_val, id_out_addr, (uint32_t)ctx->lr); }
 
     sem_table_unlock();
@@ -407,16 +406,14 @@ int64_t sys_semaphore_wait(ppu_context* ctx)
     ppu_thread_note_block(ctx->thread_id);   /* PS3_PRIO_START */
     int64_t r = sys_semaphore_wait_impl(ctx);
     static int d = -1; if (d < 0) d = getenv("SEM_ERRDBG") ? 1 : 0;
-    if (d && r) { static int n = 0; if (PS3_LOG_FIRST(n, 12))
-        fprintf(stderr, "[sem] wait(sem=%u) -> %lld%c",
+    if (d && r) { PS3_LOG_N(12, PS3_LOG_INFO, "sem", "wait(sem=%u) -> %lld%c",
                 (unsigned)ctx->gpr[3], (long long)r, 10); }
     return r;
 }
 static int64_t sys_semaphore_wait_impl(ppu_context* ctx)
 {
     { static int _d = -1; if (_d < 0) _d = getenv("SEM_WAITDBG") ? 1 : 0;
-      if (_d) { static int _n = 0; if (PS3_LOG_FIRST(_n, 20))
-          fprintf(stderr, "[sem] wait(id=%u) tid=%llu%c", (unsigned)ctx->gpr[3],
+      if (_d) { PS3_LOG_N(20, PS3_LOG_INFO, "sem", "wait(id=%u) tid=%llu%c", (unsigned)ctx->gpr[3],
                   (unsigned long long)ctx->thread_id, 10); } }
     uint32_t sem_id     = LV2_ARG_U32(ctx, 0);
     uint64_t timeout_us = LV2_ARG_U64(ctx, 1);
@@ -435,7 +432,7 @@ static int64_t sys_semaphore_wait_impl(ppu_context* ctx)
                 (unsigned long long)ctx->thread_id, sem_id, (unsigned long long)timeout_us,
                 (unsigned)ctx->cia, (unsigned)ctx->lr);
       else if (!st && ps3_log_verbose())
-        fprintf(stderr, "[WAIT] semaphore_wait(sem=%u timeout=%llu)\n", sem_id, (unsigned long long)timeout_us); }
+        PS3_LOG(PS3_LOG_INFO, "WAIT", "semaphore_wait(sem=%u timeout=%llu)\n", sem_id, (unsigned long long)timeout_us); }
     /* PS3_BREADCRUMB: every 500th wait, dump the per-tid indirect-call breadcrumb
      * table. Fires reliably DURING the loader hang (respump spins sem16 waits),
      * so two consecutive [BC] lines reveal which worker's count is FROZEN = the
@@ -598,7 +595,7 @@ int64_t sys_semaphore_post(ppu_context* ctx)
         fprintf(stderr, "[WAKE tid=%llu] semaphore_post(sem=%u count=%d)\n",
                 (unsigned long long)ctx->thread_id, sem_id, count);
       else if (!st && _n < 40)
-        fprintf(stderr, "[WAKE] semaphore_post(sem=%u count=%d)\n", sem_id, count);
+        PS3_LOG(PS3_LOG_INFO, "WAKE", "semaphore_post(sem=%u count=%d)\n", sem_id, count);
       _n++; }
     /* SEMCHAIN: dump the guest call-chain at every sem=3 post (the sema the main
      * loading thread starves on) -- reveals which thread/loop produces it. */
@@ -629,8 +626,7 @@ int64_t sys_semaphore_post(ppu_context* ctx)
 #ifdef _WIN32
     EnterCriticalSection(&s->value_lock);
     if (s->value + count > s->max_value) {
-        if (getenv("PS3_SEMTRACE")) { static int _n=0; if(PS3_LOG_FIRST(_n, 6))
-            fprintf(stderr, "[SEMTRACE] post OVERFLOW id=%u value=%d+%d > max=%d\n",
+        if (getenv("PS3_SEMTRACE")) { PS3_LOG_N(6, PS3_LOG_INFO, "SEMTRACE", "post OVERFLOW id=%u value=%d+%d > max=%d\n",
                     sem_id, s->value, count, s->max_value); }
         LeaveCriticalSection(&s->value_lock);
         sem_operation_end(sem_id);
