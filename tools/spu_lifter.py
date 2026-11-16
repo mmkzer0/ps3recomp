@@ -48,6 +48,7 @@ import json
 import os
 import re
 import sys
+from bisect import bisect_right
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -317,15 +318,14 @@ def override_leaf_problem(insns, start: int, end: int, computed_jumps=(),
     return problem
 
 def override_unit_admission(insns, bounds, entry: int, computed_jumps=(),
-                            entry_points=()):
-    """Return (members, tail graph, refusal) for one leaf or closed tail chain."""
+                            override_entries=()):
+    """Return (members, tail graph, refusal) for a disjoint closed override unit."""
     ends = dict(bounds)
     if entry not in ends:
         return (), {}, "not a decoded function entry"
 
     ordered_bounds = sorted(ends.items())
     bodies = {start: [] for start, _end in ordered_bounds}
-    owner = {}
     ordered_insns = sorted(insns, key=lambda insn: insn.addr)
     bound_index = 0
     for insn in ordered_insns:
@@ -336,7 +336,6 @@ def override_unit_admission(insns, bounds, entry: int, computed_jumps=(),
             start, end = ordered_bounds[bound_index]
             if start <= insn.addr < end:
                 bodies[start].append(insn)
-                owner[insn.addr] = start
 
     successors = {start: set() for start in ends}
     allowed_tail_edges = {start: set() for start in ends}
@@ -368,67 +367,23 @@ def override_unit_admission(insns, bounds, entry: int, computed_jumps=(),
     tail_graph = {start: tuple(sorted(targets))
                   for start, targets in successors.items()}
 
-    if len(ordered_members) > 1:
-        for point in sorted(set(entry_points)):
-            if point == entry:
+    # Only E's dispatch entry is replaced. Foreign entries and unknown
+    # external indirects therefore need no exclusion proof. Another override
+    # cannot share any member: its selected entry would no longer be lifted.
+    for other in sorted(set(override_entries) - {entry}):
+        other_members = set()
+        pending = deque([other])
+        while pending:
+            member = pending.popleft()
+            if member in other_members:
                 continue
-            for member in ordered_members:
-                if member <= point < ends[member]:
-                    return (ordered_members, tail_graph,
-                            (f"foreign entry point 0x{point:X} enters member "
-                             f"0x{member:X} of the override unit"))
-        for insn in ordered_insns:
-            source = owner.get(insn.addr)
-            if source is None or source in members:
-                continue
-            mn = insn.mnemonic
-            pc_getter = False
-            if mn in _COND_BR | {"br", "bra", "brsl", "brasl"}:
-                target = SPULifter._branch_target(insn)
-                continuation = _ls_pc(insn.addr + 4)
-                pc_getter = (mn in ("brsl", "brasl")
-                             and target == continuation)
-                if target is not None and not pc_getter:
-                    for member in ordered_members:
-                        if member <= target < ends[member] and target != entry:
-                            kind = "call" if mn in ("brsl", "brasl") else "branch"
-                            return (ordered_members, tail_graph,
-                                    (f"foreign {kind} at 0x{insn.addr:X} targets override "
-                                     f"member 0x{target:X}"))
-            if _has_fallthrough(insn):
-                continuation = _ls_pc(insn.addr + 4)
-                for member in ordered_members:
-                    if member <= continuation < ends[member] and continuation != entry:
-                        kind = ("call return continuation"
-                                if mn in ("brsl", "brasl", "bisl", "bisled")
-                                and not pc_getter else "fall-through")
-                        return (ordered_members, tail_graph,
-                                (f"foreign {kind} at 0x{insn.addr:X} enters override "
-                                 f"member 0x{continuation:X}"))
-
-        resolved = getattr(computed_jumps, "resolved_branches", {})
-        if resolved:
-            instructions = {insn.addr: insn for insn in ordered_insns}
-            pc_getters = getattr(computed_jumps, "pc_getters", ())
-            for site, targets in resolved.items():
-                source = owner.get(site)
-                insn = instructions.get(site)
-                if (source is None or source in members or insn is None
-                        or (site in pc_getters and insn.mnemonic != "bisled")):
-                    continue
-                kind = "call" if insn.mnemonic in ("bisl", "bisled") else "branch"
-                for target in targets:
-                    for member in ordered_members:
-                        if member <= target < ends[member] and target != entry:
-                            return (ordered_members, tail_graph,
-                                    (f"foreign indirect {kind} at 0x{site:X} targets "
-                                     f"override member 0x{target:X}"))
-        for site in sorted(getattr(computed_jumps, "unresolved_branches", ())):
-            source = owner.get(site)
-            if source is not None and source not in members:
-                return (ordered_members, tail_graph,
-                        (f"unresolved indirect branch at 0x{site:X} outside the "
-                         "override unit prevents foreign-entry proof"))
+            other_members.add(member)
+            pending.extend(successors.get(member, ()))
+        shared = members & other_members
+        if shared:
+            return (ordered_members, tail_graph,
+                    (f"overlapping override units at 0x{entry:X} and 0x{other:X} "
+                     f"share member 0x{min(shared):X}"))
 
     has_return = False
     for member in ordered_members:
@@ -1351,10 +1306,21 @@ class SPULifter:
         # Members of an admitted chain must call their lifted counterparts so
         # the reference path remains entirely lifted for A/B comparisons.
         self.override_unit_by_member: dict[int, int] = {}
+        self.function_bounds: dict[int, int] = {}
+        self.function_bound_starts: list[int] = []
 
-    def _function_symbol(self, addr: int, caller: int | None = None) -> str:
-        if caller is not None:
-            unit = getattr(self, "override_unit_by_member", {}).get(caller)
+    def _member_start_for_pc(self, pc: int, fallback: int) -> int:
+        index = bisect_right(self.function_bound_starts, pc) - 1
+        if index >= 0:
+            start = self.function_bound_starts[index]
+            if pc < self.function_bounds[start]:
+                return start
+        return fallback
+
+    def _function_symbol(self, addr: int, source_pc: int | None = None) -> str:
+        if source_pc is not None:
+            source_member = self._member_start_for_pc(source_pc, source_pc)
+            unit = self.override_unit_by_member.get(source_member)
             if unit is not None and self.override_unit_by_member.get(addr) == unit:
                 return f"{self.prefix}spu_func_{addr:08X}"
         return self.overrides.get(addr, f"{self.prefix}spu_func_{addr:08X}")
@@ -1419,7 +1385,7 @@ class SPULifter:
                 and fallthrough in getattr(self, "func_starts", set())):
             func.body_lines.append(
                 f"    {{ SPU_DIRECT(ctx, {self._pc(fallthrough)}, "
-                f"{self._function_symbol(fallthrough, start)}); }}")
+                f"{self._function_symbol(fallthrough, last_insn.addr)}); }}")
 
         # Infinite no-op self-loop (the SPU `br .` halt idiom): a function whose
         # whole body is nops + an unconditional branch back into itself does
@@ -1831,7 +1797,7 @@ class SPULifter:
                 # ctx->reloc_delta for itself; put this placement's back on return.
                 rs, rr = ("const int32_t _rd = ctx->reloc_delta; ", " ctx->reloc_delta = _rd;") if self.reloc else ("", "")
                 return (f"{link} {{ int32_t _si = (int32_t)ctx->image_id; {rs}"
-                        f"ctx->host_depth++; {self._function_symbol(tgt, func.start_addr)}(ctx); "
+                        f"ctx->host_depth++; {self._function_symbol(tgt, addr)}(ctx); "
                         f"spu_drain_call(ctx, {self._pc(addr + 4)}); ctx->host_depth--; spu_img_restore(ctx, _si);{rr} }}")
             return f"{link} /* TODO spu: brsl unresolved target */;"
         if mn in _COND_BR:
@@ -1852,7 +1818,7 @@ class SPULifter:
             # tail call when the drain has nothing to do on this step, else
             # the trampoline and unwind (SPU_DIRECT, spu_context.h).
             return (f"if ({cond}) {{ SPU_DIRECT(ctx, {self._pc(tgt)}, "
-                    f"{self._function_symbol(tgt, func.start_addr)}); }}")
+                    f"{self._function_symbol(tgt, addr)}); }}")
         # Interrupt enable/disable bits on the bi family (bie/bid, irete/iretd,
         # bisle(d)...): bit 0x40000 = E (enable), 0x80000 = D (disable), taking
         # effect when the branch is TAKEN. The WWS jobmanager's poll loop runs
@@ -1996,7 +1962,7 @@ class SPULifter:
         # trampoline and unwind so the enclosing SPU_DRAIN re-enters (no
         # host-stack growth either way; SPU_DIRECT, spu_context.h).
         return (f"{{ SPU_DIRECT(ctx, {self._pc(tgt)}, "
-                f"{self._function_symbol(tgt, func.start_addr)}); }}")
+                f"{self._function_symbol(tgt, src)}); }}")
 
     # ------------------------------------------------------------------ #
     def twin_renames(self) -> list[str]:
@@ -2360,15 +2326,8 @@ def main() -> None:
               f"(`bi $rN` where rN is a brsl/bisl link reg): "
               f"{', '.join(f'0x{a:X}' for a in sorted(lifter.link_return))}")
     lifter.func_starts = {s for s, e in bounds}  # for fall-through tail-call chaining
-    groups = {}
-    if args.merge_chunks:
-        seeds = {base}
-        if args.extra_funcs:
-            seeds |= {int(x, 0) for x in args.extra_funcs.split(",") if x.strip()}
-        groups = merge_chunk_groups(insns, bounds, args.max_group_insns,
-                                    entry_points=seeds)
-        print(f"  {len(groups)} merged function group(s) "
-              f"(--merge-chunks, max {args.max_group_insns} insns)")
+    lifter.function_bounds = dict(bounds)
+    lifter.function_bound_starts = sorted(lifter.function_bounds)
     if overrides:
         ends = dict(bounds)
         if set(overrides) - set(ends):
@@ -2381,14 +2340,29 @@ def main() -> None:
         for address, symbol in overrides.items():
             if symbol in generated:
                 p.error(f"--override 0x{address:X} symbol {symbol!r} conflicts with a lifted symbol")
-            admission_entries = independent_entries | set(overrides)
             members, _tail_graph, problem = override_unit_admission(
-                insns, bounds, address, lifter.bi_r0_jump, admission_entries)
+                insns, bounds, address, lifter.bi_r0_jump, override_entries=overrides)
             if problem:
                 kind = "override unit" if len(members) > 1 else "non-leaf function"
                 p.error(f"--override 0x{address:X} refuses {kind}: {problem}")
             for member in members:
                 lifter.override_unit_by_member[member] = address
+    groups = {}
+    if args.merge_chunks:
+        seeds = {base}
+        if args.extra_funcs:
+            seeds |= {int(x, 0) for x in args.extra_funcs.split(",") if x.strip()}
+        # A merged C body may not span an override member boundary: branches
+        # from it must be classified by the member that owns the instruction.
+        for member in lifter.override_unit_by_member:
+            seeds.add(member)
+            member_end = lifter.function_bounds[member]
+            if member_end in lifter.function_bounds:
+                seeds.add(member_end)
+        groups = merge_chunk_groups(insns, bounds, args.max_group_insns,
+                                    entry_points=seeds)
+        print(f"  {len(groups)} merged function group(s) "
+              f"(--merge-chunks, max {args.max_group_insns} insns)")
 
     for s, e in bounds:
         lifter.lift_function(insns, s, groups.get(s, e))
