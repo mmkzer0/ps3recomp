@@ -3346,6 +3346,21 @@ void xd_register(std::uint32_t flags, std::uint32_t code_end = 0, std::uint64_t 
     spu_workload_set_inventory(fp_at(IMAGE), flags, code_end, lift_options);
 }
 
+/* Waits out every job pushed on `port` by polling it (Port2Sync mode 4, which registers no waiter). A blocking Sync
+ * leaves its registration in guest memory when it beats the credit: the wait kind in the port's A, the waiter id at
+ * +4 and the queue's waiter-bitmap sentinel (port.hpp, executor.cpp Queue::acquire_waiter). Whether it does depends
+ * on whether the worker or the Sync came first, so a test that compares the arenas of two runs must not take that
+ * path in one of them by chance. A poll that returns on the credit leaves nothing; the loop is ordered by the
+ * port's own completion, not by time. */
+void sync_completed(std::uint32_t port, std::uint32_t job)
+{
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    std::int32_t rc;
+    while ((rc = jq2_port_sync(port, 4)) == JQ2_ERR_AGAIN && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    CHECK(rc == 0, "sync after job %u: 0x%X", job, unsigned(rc));
+}
+
 /* `jobs` transform jobs, job j with seq j + 1, on a queue of `workers` workers. With one worker each job is pushed
  * and synced alone, so the sequence and the guest memory it leaves are deterministic; with more they are pushed in a
  * row and synced once. `image_ea` names job j's image (default IMAGE) and `before_job` runs before job j is described
@@ -3367,9 +3382,9 @@ std::vector<JobSpec> xd_run(std::uint32_t jobs, std::uint32_t workers = 1, const
         if (before_job) before_job(j);
         specs.push_back(spec(j, image_ea ? image_ea(j) : std::uint32_t(IMAGE)));
         rig.push_wait(specs.back().desc, 64, 0);
-        if (workers == 1) CHECK(jq2_port_sync(PORT, 0) == 0, "sync after job %u", j);
+        if (workers == 1) sync_completed(PORT, j);
     }
-    if (workers != 1) CHECK(jq2_port_sync(PORT, 0) == 0, "sync");
+    if (workers != 1) sync_completed(PORT, jobs);
     for (const JobSpec& s : specs) CHECK(job_ok(s), "job %u output", s.serial);
     const jq2_stats st = rig.stats();
     CHECK(st.dispatched == jobs && st.executed == jobs && st.credited == jobs, "counts %llu/%llu/%llu, wanted %u",
@@ -3380,6 +3395,23 @@ std::vector<JobSpec> xd_run(std::uint32_t jobs, std::uint32_t workers = 1, const
 
 /* All of guest memory, the one thing a job and its capture could share. */
 std::uint64_t xd_arena_digest() { return spu_workload_content_hash(vm_base, kMem); }
+
+/* The arena equals `ref` byte for byte; else the first words that differ are printed (guest offset, both values),
+ * which a digest cannot say. */
+bool arena_equals(const std::uint8_t* ref, const char* what)
+{
+    if (std::memcmp(vm_base, ref, kMem) == 0) return true;
+    unsigned shown = 0;
+    for (std::uint32_t o = 0; o < kMem && shown < 16; o += 4) {
+        if (std::memcmp(vm_base + o, ref + o, 4) == 0) continue;
+        std::uint32_t a, b;
+        std::memcpy(&a, ref + o, 4);
+        std::memcpy(&b, vm_base + o, 4);
+        std::printf("arena differs (%s) at 0x%06X: reference 0x%08X, run 0x%08X\n", what, o, be32(a), be32(b));
+        ++shown;
+    }
+    return false;
+}
 
 /* What the capture directory holds, sorted; empty when it is gone. */
 std::vector<std::string> xd_files()
@@ -4701,7 +4733,7 @@ JobSpec au_job(Rig& rig, std::uint32_t j, std::uint32_t ea = IMAGE)
 {
     const JobSpec s = spec(j, ea);
     rig.push_wait(s.desc, 64, 0);
-    CHECK(jq2_port_sync(PORT, 0) == 0, "sync after job %u", j);
+    sync_completed(PORT, j);
     return s;
 }
 
@@ -4761,19 +4793,20 @@ constexpr std::uint32_t kAuRec = 0xE00100; /* what a forked child tells its pare
  * offline, and the guest sees exactly what a run without xdiff leaves. */
 void mode_audit_divergence()
 {
-    auto* digest = static_cast<std::uint64_t*>(mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0));
-    CHECK(digest != MAP_FAILED, "mmap");
-    if (digest == MAP_FAILED) return;
+    /* The whole reference arena, not a digest of it: a difference is reported word by word. */
+    auto* ref = static_cast<std::uint8_t*>(mmap(nullptr, kMem, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0));
+    CHECK(ref != MAP_FAILED, "mmap");
+    if (ref == MAP_FAILED) return;
     std::string child_log;
     const int rc = run_child(
-        [digest] {
+        [ref] {
             setenv("PS3RECOMP_SPU_XDIFF", "off", 1); /* the same jobs with the audit off, before anything read the configuration */
             au_begin();
             build_image(IMAGE, Prog::transform);
             Rig rig({128, 1, false});
             au_job(rig, 0);
             rig.teardown();
-            *digest = xd_arena_digest();
+            std::memcpy(ref, vm_base, kMem);
             if (g_fail != 0) _exit(1);
         },
         child_log);
@@ -4794,7 +4827,7 @@ void mode_audit_divergence()
         rig.teardown();
     });
     CHECK(job_ok(s), "the guest sees the interpreter's output");
-    CHECK(xd_arena_digest() == *digest, "guest memory with the audit on differs from the run without it");
+    CHECK(arena_equals(ref, "audit on vs off"), "guest memory with the audit on differs from the run without it");
 
     const auto lines = au_lines(log, "[jq2-xdiff] differ ");
     CHECK(lines.size() == 1, "%zu differ lines, wanted one:\n%s", lines.size(), log.c_str());
