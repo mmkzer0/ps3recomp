@@ -1986,7 +1986,7 @@ def build_programs(args, registry_writer):
                     for address in parse_overrides(overrides):
                         _members, _tail_graph, problem = override_unit_admission(
                             decoded, generated_bounds, address, classification,
-                            admission_entries)
+                            override_entries=parse_overrides(overrides))
                         if problem:
                             raise ValueError(
                                 f'override 0x{address:X} refuses function: {problem}')

@@ -1062,12 +1062,28 @@ class Pipeline(unittest.TestCase):
                       f'{prefix}spu_func_{base + 0x48:08X})', source)
         self.assertIn('native_chain', (self.output / 'spu_workloads.c').read_text())
 
-    def test_lifter_and_pipeline_share_foreign_chain_entry_refusal(self):
+    def test_foreign_member_entry_registers_through_pipeline(self):
+        base, blob = self.tail_chain_image(foreign_entry=True)
+        entry = self.raw_entry(
+            blob, name='raw-foreign-member.bin', code_end=hex(base + len(blob)),
+            extra_entry_points=[hex(base + 0x50)],
+            overrides=[f'{hex(base)}=native_chain'], native_rev='0x1234')
+        result = self.run_raw([entry])
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        program = self.manifest()['programs'][0]
+        self.assertEqual(program['status'], 'registered')
+        source = (self.output / program['name'] / 'spu_recomp.c').read_text()
+        member_symbol = f'{program["name"]}_spu_func_{base + 0x48:08X}'
+        self.assertIn(f'ctx->host_depth++; {member_symbol}(ctx);', source)
+        self.assertIn(f'{{ 0x{base + 0x48:08X}u, {member_symbol}, {member_symbol}, 0,',
+                      source)
+
+    def test_lifter_and_pipeline_share_overlapping_unit_refusal(self):
         base, blob = self.tail_chain_image(foreign_entry=True)
         foreign_entry = base + 0x50
         member = base + 0x48
-        reason = (f'foreign call at 0x{foreign_entry:X} targets override member '
-                  f'0x{member:X}')
+        reason = (f'overlapping override units at 0x{base:X} and 0x{member:X} '
+                  f'share member 0x{member:X}')
         bounds = [(base, base + 4), (base + 0x40, base + 0x44),
                   (member, base + 0x50), (foreign_entry, base + 0x54)]
         with tempfile.TemporaryDirectory() as tmp:
@@ -1084,6 +1100,7 @@ class Pipeline(unittest.TestCase):
                 '--symbol-prefix', 'chain_', '--output', str(output),
                 '--extra-funcs', hex(foreign_entry), '--code-end', hex(base + len(blob)),
                 '--override', f'{hex(base)}=native_chain',
+                '--override', f'{hex(member)}=native_member',
             ]
             direct = subprocess.run(command, capture_output=True, text=True, check=False)
             self.assertNotEqual(direct.returncode, 0)
@@ -1102,7 +1119,8 @@ class Pipeline(unittest.TestCase):
             blob, name='raw-tail-chain-foreign.bin',
             code_end=hex(base + len(blob)),
             extra_entry_points=[hex(foreign_entry)],
-            overrides=[f'{hex(base)}=native_chain'], native_rev='0x1234')
+            overrides=[f'{hex(base)}=native_chain', f'{hex(member)}=native_member'],
+            native_rev='0x1234')
         result = self.run_raw([entry], '--lifter', str(alternate))
         self.assertNotEqual(result.returncode, 0)
         program = self.manifest()['programs'][0]

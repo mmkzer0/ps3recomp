@@ -132,19 +132,59 @@ past the decoded image is refused with its source address; infinite cycles
 inside the unit are allowed. At least one reachable member return must be
 proven, using only the already admitted `"spu-abi-link-slot"` assumption.
 
-The unit must have no known foreign call or branch (direct or statically
-resolved indirect) into any address in the unit except at `E`. This also
-checks sequential fall-through and return continuations after `brsl`, `brasl`,
-`bisl` or `bisled`. No independent entry point may land inside a member other
-than `E`; an unresolved indirect branch outside the unit also blocks admission
-because its target could enter a member. A refusal names the foreign source
-edge, unresolved site, or entry point. These checks establish the control-flow
-invariant needed for replacement: all known entries enter at `E`, and every
-non-return exit stays within the admitted closure until a proven return.
-Cycles among members add no escape from the unit. All lifted member functions
-remain emitted and registered, and references within the unit continue to
-target those lifted functions, so the T1 reference used for A/B stays wholly
-lifted while external references to `E` select the native function.
+### Entry-PC soundness contract
+
+Foreign entries into members are permitted. Only the function-table entry at
+`E` selects native code; every other member retains its lifted body, its own
+dispatch entry and its lifted reference pointer. Generated direct branches,
+fall-throughs and calls to a non-entry member therefore stay lifted. Direct
+edges between members, including a loop back to `E`, use lifted symbols
+(`SPULifter._function_symbol`). Distinct overrides may not share any member:
+that would replace a member dispatch entry with another native body.
+`--merge-chunks` preserves the same ownership boundary: it stops groups before
+and after every admitted member, so a lifted member body is never merged with
+foreign code. Branch lowering determines ownership from the original decoded
+member containing the branch PC, not the merged C function root.
+
+This is a **PC invariant, not an execution-history mode**. Dispatcher entry at
+`E` may select native code even after a lifted loop or interrupt return.
+Consequently a native body must be bit-exact for **any architectural state at
+`E`**, including every GPR, live `$r0`/`$r1`, LS, channel/event state and E/D.
+It may assume neither a call-site origin, stack alignment, nor that `$r0` is
+a caller's return address. Existing soft-ABI return-proof refusals remain.
+Native code may begin only at `E`, never at another member PC.
+
+The routing proof covers the ordinary and served dispatchers: `spu_lookup`
+and `spu_lifted_lookup` resolve an exact PC/image key, not the containing unit.
+Their caches retain that PC key. `SPU_DIRECT` either invokes its explicit
+lifted member pointer or queues that same pointer. `SPU_RET` publishes live
+`$r0`; `spu_drain_call` resumes registered PCs through the dispatcher.
+Interrupt entry records `srr0`, and interrupt return queues that dispatcher
+again. Thus resumption at a member other than `E` cannot start native code;
+resumption at `E` is sound under the any-state obligation above. An unregistered
+mid-block PC remains a normal resolver miss, never a containing-unit native
+entry. Unknown indirect branches elsewhere in the image therefore no longer
+need to be excluded; they do not change this address-to-body mapping.
+
+Function-unit replay explicitly selects the reference or native entry pointer,
+constructs GPRs/LS from the fixture, and runs with a live host frame
+(`spu_xdiff_replay_function_unit`, `spu_run_lifted_leaf`). Whole-job replay and
+the in-run audit construct a separate shadow and use the same served resolver
+and registration. They introduce no hidden native continuation at member PCs.
+The budgeted twin likewise has its own image identity, but an external native
+symbol is not automatically a separately instrumented budgeted implementation.
+
+**Future native pilot obligation:** preserve `SPU_LIFT_BACKEDGE` budget and
+trampoline/interrupt checkpoints, and use proven-return `SPU_RET` semantics on
+the live `$r0`, or a recorded tail edge with the complete architectural state
+published. Do not drain, block or retain a native C continuation in the middle
+of the unit. A checkpoint that yields at a non-entry member must return to the
+dispatcher/lifted member with exact state; it must not later resume native
+locals there. Re-entry at `E` starts a fresh exact native invocation. Budget
+exhaustion is the existing terminal unwind, not a resumable native checkpoint.
+Calls, channels and stops that would require a mid-unit continuation remain
+refused, as do indirect exits, unclosed edges and unproven returns. Admission
+checks the guest unit; it does not certify an arbitrary external C definition.
 
 
 The raw-image manifest carries `overrides` as a list of `ADDR=SYMBOL` strings
