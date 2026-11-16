@@ -48,6 +48,7 @@ import json
 import os
 import re
 import sys
+from collections import deque
 from dataclasses import dataclass, field
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -201,6 +202,94 @@ def _chan(token: str) -> str:
         return m.group(1)
     return token
 
+def parse_override_spec(spec: str) -> tuple[int, str]:
+    """Parse one --override value without accepting ambiguous C symbols or addresses."""
+    if not isinstance(spec, str) or spec.count("=") != 1:
+        raise ValueError(f"override {spec!r} must be ADDR=SYMBOL")
+    address_text, symbol = spec.split("=", 1)
+    try:
+        address = int(address_text, 0)
+    except ValueError as error:
+        raise ValueError(f"override {spec!r} has an invalid address") from error
+    if address < 0 or address >= 0x40000 or address & 3:
+        raise ValueError(f"override {spec!r} address must be a 4-byte-aligned local-store address")
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", symbol):
+        raise ValueError(f"override {spec!r} symbol must be a C identifier")
+    return address, symbol
+
+
+def parse_overrides(specs) -> dict[int, str]:
+    overrides = {}
+    for spec in specs:
+        address, symbol = parse_override_spec(spec)
+        previous = overrides.get(address)
+        if previous is not None and previous != symbol:
+            raise ValueError(f"override 0x{address:X} names both {previous!r} and {symbol!r}")
+        overrides[address] = symbol
+    return dict(sorted(overrides.items()))
+
+
+def override_leaf_problem(insns, start: int, end: int, computed_jumps=(),
+                          function_starts=()) -> str | None:
+    """Return why an override target is outside the pilot's leaf-call contract."""
+    body = [insn for insn in insns if start <= insn.addr < end]
+    has_return = False
+    for insn in body:
+        mn = insn.mnemonic
+        if insn.addr in getattr(computed_jumps, "pc_getters", ()):
+            if mn == "bisl" and getattr(computed_jumps, "unresolved_branches", ()):
+                return ("PC-getter proof requires no-unmodelled-indirect-entry at "
+                        f"0x{insn.addr:X}; not admitted for T2 overrides")
+            continue
+        if mn in ("brsl", "brasl", "bisl"):
+            return f"call out via {mn} at 0x{insn.addr:X}"
+        if mn in ("rdch", "wrch", "rchcnt"):
+            return f"channel instruction {mn} at 0x{insn.addr:X}"
+        if mn in ("stop", "stopd", "halt"):
+            return f"stop/halt instruction {mn} at 0x{insn.addr:X}"
+        ops = _ops(insn.operands)
+        if mn == "bi":
+            if ops and _reg(ops[0]) == "0":
+                link_restores = getattr(computed_jumps, "link_restores", {})
+                for writer in reversed(body):
+                    if writer.addr >= insn.addr or not _writes_r0(writer):
+                        continue
+                    if _is_identity_move(writer):
+                        continue
+                    if link_restores.get(insn.addr) == writer.addr:
+                        break
+                    return (f"unproven $r0 write by {writer.mnemonic} at "
+                            f"0x{writer.addr:X} before bi $r0")
+                if insn.addr not in computed_jumps:
+                    assumptions = getattr(computed_jumps, "return_assumptions", {}).get(
+                        insn.addr, ())
+                    if isinstance(assumptions, str):
+                        assumptions = [assumptions]
+                    extra = [name for name in assumptions if name != "spu-abi-link-slot"]
+                    if extra:
+                        return (f"return proof requires {', '.join(extra)} at "
+                                f"0x{insn.addr:X}; not admitted for T2 overrides")
+                    has_return = True
+                    continue
+            return f"indirect branch {mn} at 0x{insn.addr:X}"
+        if mn in ("bisl", "bisled", "iret", "biz", "binz", "bihz", "bihnz"):
+            return f"indirect branch {mn} at 0x{insn.addr:X}"
+        if mn in _COND_BR or mn in ("br", "bra"):
+            target = SPULifter._branch_target(insn)
+            if target is None:
+                return f"unresolved direct branch {mn} at 0x{insn.addr:X}"
+            if target == insn.addr:
+                return f"self-loop halt idiom at 0x{insn.addr:X}"
+            if not start <= target < end:
+                return f"tail call via {mn} to 0x{target:X} at 0x{insn.addr:X}"
+    if body and body[-1].mnemonic not in {"br", "bra", "bi", "iret", "stop", "stopd"} and end in function_starts:
+        return f"fall-through tail call to 0x{end:X}"
+    if not has_return:
+        return "no return through bi $r0"
+    return None
+
+
+
 # ---------------------------------------------------------------------------
 # Lifter
 # ---------------------------------------------------------------------------
@@ -252,6 +341,363 @@ def _dest_reg(insn) -> int:
         return (insn.raw >> 21) & 0x7F
     return insn.raw & 0x7F
 
+def _writes_r0(insn) -> bool:
+    return insn.mnemonic not in _NO_RT_WRITE and _dest_reg(insn) == 0
+
+
+class BiR0Classification(set):
+    """Computed bi-r0 dispatches plus return sites relying on the SPU ABI."""
+
+    def __init__(self, jumps=(), link_restores=()):
+        super().__init__(jumps)
+        self.link_restores = dict(link_restores)
+        self.assumes = "spu-abi-link-slot" if self.link_restores else None
+        self.inherited_returns = set()
+        self.callee_saved_returns = set()
+        self.private_slot_returns = set()
+        self.unresolved_branches = set()
+        self.link_returns = set()
+        self.pc_getters = set()
+        self.return_assumptions = {}
+        self.unproven = {}
+
+    def assumptions_for(self, site):
+        assumptions = []
+        if site in self.inherited_returns and self.unresolved_branches:
+            assumptions.append("no-unmodelled-indirect-entry")
+        if site in self.callee_saved_returns:
+            assumptions.append("spu-abi-callee-saved")
+        assumptions.append("spu-abi-link-slot")
+        if site in self.private_slot_returns:
+            assumptions.append("spu-abi-link-slot-private")
+        return assumptions[0] if len(assumptions) == 1 else assumptions
+
+
+def _stack_link_load_offset(insn):
+    if insn.mnemonic != "lqd":
+        return None
+    ops = _ops(insn.operands)
+    if len(ops) != 2 or _reg(ops[0]) != "0":
+        return None
+    offset, base = _disp_base(ops[1])
+    if base != "1":
+        return None
+    try:
+        return int(offset, 0)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_imm_int(token):
+    try:
+        return int(token, 0)
+    except ValueError:
+        return None
+
+
+def _r0_link_entry_inventory(insns, bounds, image, base, delta, entry_points):
+    """Known non-direct entries veto inheritance; exact dispatches share the pipeline evaluator."""
+    from find_spu_functions import (
+        collect_branch_targets,
+        collect_computed_branch_targets,
+        collect_duff_targets,
+        collect_ila_continuation_targets,
+        collect_jump_table_targets,
+        immediate_ls_addresses,
+    )
+
+    # Deferred: the pipeline imports this module's option parser. Sharing its
+    # exact evaluator keeps a resolved dispatch from becoming two conventions.
+    from spu_program_pipeline import _dispatch_targets, _pc_getter
+
+    starts = {s for s, _ in bounds}
+    low, high = min(starts), max(e for _, e in bounds)
+    independent = set(entry_points)
+    independent.update(collect_ila_continuation_targets(insns, low, high, delta))
+    independent.update(collect_computed_branch_targets(insns))
+    independent.update(collect_duff_targets(insns, low, high))
+    independent.update(collect_jump_table_targets(insns, image, base, base + len(image),
+                                                  delta=delta))
+    for offset in range(0, len(image) - 3, 4):
+        independent.update(immediate_ls_addresses(
+            int.from_bytes(image[offset:offset + 4], "big"), delta))
+    active = {address for start, end in bounds for address in range(start, end, 4)}
+    continuations = {}
+    call_links = {}  # entry -> bitset of link registers used by known call edges
+    direct_getters = {insn.addr for insn in insns if _pc_getter(insn)}
+    for insn in insns:
+        if insn.addr in direct_getters:
+            continue
+        if insn.mnemonic in ("brsl", "brasl", "bisl", "bisled"):
+            target = SPULifter._branch_target(insn)
+            if target is not None:
+                independent.add(target)
+                if insn.addr in active:
+                    call_links[target] = call_links.get(target, 0) | (1 << (insn.raw & 0x7F))
+            if insn.addr + 4 in starts:
+                if insn.addr in active and insn.mnemonic in ("brsl", "bisl"):
+                    continuations[insn.addr + 4] = insn.addr
+                else:
+                    independent.add(insn.addr + 4)
+        elif insn.addr not in active:
+            target = SPULifter._branch_target(insn)
+            if target is not None:
+                independent.add(target)
+
+    getter_targets = {insn.addr + 4 for insn in insns if insn.addr in direct_getters}
+    cuts = ((starts - getter_targets) | independent
+            | collect_branch_targets([insn for insn in insns if insn.addr not in direct_getters]))
+    addresses = {insn.addr for insn in insns}
+    while True:
+        resolved = {}
+        discovered = set()
+        pc_getters = set(direct_getters)
+        for i, insn in enumerate(insns):
+            if _bi_target_reg(insn) is not None or insn.mnemonic in ("bisl", "bisled"):
+                targets = _dispatch_targets(
+                    insns, i, cuts, addresses.__contains__,
+                    register=(insn.raw >> 7) & 0x7F)
+                if targets:
+                    resolved[insn.addr] = targets
+                    if _pc_getter(insn, targets):
+                        pc_getters.add(insn.addr)
+                    else:
+                        discovered.update(targets)
+        independent.update(discovered)
+        if discovered <= cuts:
+            for insn in insns:
+                if insn.addr in pc_getters:
+                    continuations.pop(insn.addr + 4, None)
+                    continue
+                if insn.addr in active and insn.mnemonic in ("bisl", "bisled"):
+                    for target in resolved.get(insn.addr, ()):
+                        call_links[target] = call_links.get(target, 0) | (
+                            1 << (insn.raw & 0x7F))
+            return independent, resolved, continuations, call_links, pc_getters
+        cuts.update(discovered)
+
+
+@dataclass(frozen=True)
+class _LinkState:
+    sp_delta: int | None
+    live_link: bool
+    slots: frozenset
+    inherited: bool = False
+    callee_saved: bool = False
+    stack_derived: int = 1 << 1
+    private_slots: frozenset = frozenset()
+    live_link_private: bool = False
+
+
+def _stack_derived_after(insn, derived):
+    """May-provenance: joins union it, so any stack-derived address stays a veto."""
+    if insn.mnemonic in _NO_RT_WRITE:
+        return derived
+    destination = _dest_reg(insn)
+    bit = 1 << destination
+    mn = insn.mnemonic
+    if mn in ("lqd", "lqx", "lqa", "lqr", "il", "ila", "ilh", "ilhu",
+              "fsmbi", "rdch", "rchcnt", "mfspr", "brsl", "brasl", "bisl", "bisled"):
+        value = False
+    else:
+        sources = re.findall(r"\$r(\d+)", ",".join(_ops(insn.operands)[1:]))
+        value = any(derived & (1 << int(reg)) for reg in sources)
+        if mn not in ("ori", "ai", "a", "sf", "sfi", "or"):
+            # Unmodelled arithmetic may read its old destination implicitly.
+            value = value or bool(derived & bit)
+    return ((derived | bit) if value else (derived & ~bit)) | (1 << 1)
+
+
+def _r0_link_restore_loads(insns, bounds, independent, continuations, call_links, pc_getters):
+    """Product-lattice must-save proof across direct and ABI-continuation edges."""
+    # A merged report may overlap its constituent chunks. The most specific
+    # start owns an instruction; inheritance still crosses every split start.
+    owner = {}
+    for start, end in sorted(bounds):
+        for address in range(start, end, 4):
+            owner[address] = start
+    fn = [insn for insn in insns if insn.addr in owner]
+    if not fn:
+        return set(), set(), set(), set(), {}
+    index = {insn.addr: i for i, insn in enumerate(fn)}
+    starts = {s for s, _ in bounds}
+    opaque_owners = set()
+    after_opaque = set()
+    for insn in fn:
+        if owner[insn.addr] in opaque_owners:
+            after_opaque.add(insn.addr)
+        if _bi_target_reg(insn) is not None or insn.mnemonic == "iret":
+            opaque_owners.add(owner[insn.addr])
+    successors = []
+    predecessors = [set() for _ in fn]
+    for i, insn in enumerate(fn):
+        next_i = index.get(insn.addr + 4)
+        mn = insn.mnemonic
+        target = SPULifter._branch_target(insn)
+        if mn in ("br", "bra"):
+            edges = [index[target]] if target in index else []
+        elif mn in _COND_BR:
+            edges = [] if next_i is None else [next_i]
+            if target in index:
+                edges.append(index[target])
+        elif mn in ("bi", "iret"):
+            edges = []
+        elif mn in ("stop", "stopd"):
+            from find_spu_functions import is_resuming_stop
+            edges = [next_i] if next_i is not None and is_resuming_stop(insn) else []
+        else:
+            edges = [] if next_i is None else [next_i]
+        successors.append(edges)
+        for successor in edges:
+            predecessors[successor].add(i)
+
+    # Roots start a new ABI link identity, never inherit another procedure's
+    # slot. A known external landing in the middle has no ABI entry state.
+    incoming = [None] * len(fn)
+    pending = deque()
+    queued = set()
+    for i, insn in enumerate(fn):
+        if insn.addr in starts and (insn.addr in independent or not predecessors[i]):
+            incoming[i] = _LinkState(
+                0, call_links.get(insn.addr, 1) == 1, frozenset())
+        elif insn.addr in independent:
+            incoming[i] = _LinkState(None, False, frozenset())
+        if incoming[i] is not None:
+            pending.append(i)
+            queued.add(i)
+
+    def matches_slot(state, insn):
+        offset = _stack_link_load_offset(insn)
+        return (offset is not None and state.sp_delta is not None
+                and state.sp_delta + offset in state.slots
+                and (state.inherited or insn.addr not in after_opaque))
+
+    def transfer(state, insn):
+        delta, link_value = state.sp_delta, state.live_link
+        slots, private_slots = state.slots, state.private_slots
+        live_private = state.live_link_private
+        mn = insn.mnemonic
+        ops = _ops(insn.operands)
+        if mn == "ai" and len(ops) == 3 and _reg(ops[0]) == "1":
+            immediate = _parse_imm_int(ops[2])
+            delta = (delta + immediate if _reg(ops[1]) == "1"
+                     and delta is not None and immediate is not None else None)
+        elif (mn not in _NO_RT_WRITE and _dest_reg(insn) == 1
+              and not _is_identity_move(insn)):
+            delta = None
+        if mn in ("stqd", "stqa", "stqr", "stqx"):
+            if mn == "stqd":
+                offset, reg = _disp_base(ops[1])
+                offset = _parse_imm_int(offset) if offset is not None else None
+                address_regs = () if reg is None else (int(reg),)
+            elif mn == "stqx":
+                offset, reg = None, None
+                address_regs = ((insn.raw >> 7) & 0x7F, (insn.raw >> 14) & 0x7F)
+            else:
+                offset, reg, address_regs = None, None, ()
+            stack_address = any(state.stack_derived & (1 << r) for r in address_regs)
+            if mn == "stqd" and reg == "1" and delta is not None and offset is not None:
+                address = delta + offset
+                saved = set(slots)
+                if _reg(ops[0]) == "0" and link_value:
+                    saved.add(address)
+                else:
+                    saved.discard(address)
+                slots = frozenset(saved)
+                private_slots = private_slots - {address}
+                if _reg(ops[0]) == "0" and link_value and live_private:
+                    private_slots = private_slots | {address}
+            elif stack_address:
+                # A stack-derived address that cannot be placed may overwrite
+                # any link slot. The private-slot assumption cannot excuse it.
+                slots, private_slots = frozenset(), frozenset()
+            else:
+                # ABI assumption: argument/loaded/global pointers do not alias
+                # a procedure's private link-save area.
+                private_slots = slots
+        if insn.addr in pc_getters:
+            if (insn.raw & 0x7F) == 0:
+                link_value, live_private = False, False
+        elif mn in ("brsl", "brasl", "bisl", "bisled"):
+            link_value, live_private = False, False
+        elif _writes_r0(insn) and not _is_identity_move(insn):
+            link_value = mn == "lqd" and matches_slot(state, insn)
+            live_private = (link_value and state.sp_delta + _stack_link_load_offset(insn)
+                            in state.private_slots)
+        return _LinkState(delta, link_value, slots, state.inherited, state.callee_saved,
+                          _stack_derived_after(insn, state.stack_derived), private_slots,
+                          live_private)
+
+    # First propagate rooted facts. Then give unrooted code an unknown state,
+    # so a dead/cyclic predecessor never counts as an agreeing incoming edge.
+    for seed_unknown in (False, True):
+        if seed_unknown:
+            for i in range(len(fn)):
+                if incoming[i] is None:
+                    incoming[i] = _LinkState(None, False, frozenset())
+                    pending.append(i)
+                    queued.add(i)
+        while pending:
+            i = pending.popleft()
+            queued.discard(i)
+            out = transfer(incoming[i], fn[i])
+            for successor in successors[i]:
+                address = fn[successor].addr
+                if address in independent:
+                    continue
+                crossing = owner[fn[i].addr] != owner[address]
+                abi_continuation = continuations.get(address) == fn[i].addr
+                carried = _LinkState(
+                    out.sp_delta, out.live_link, out.slots, out.inherited or crossing,
+                    out.callee_saved or abi_continuation, out.stack_derived, out.private_slots,
+                    out.live_link_private)
+                old = incoming[successor]
+                if old is None:
+                    merged = carried
+                else:
+                    # A call may destroy the live link without changing the
+                    # independently proven stack delta or saved-link contents.
+                    slots = old.slots & carried.slots
+                    merged = _LinkState(
+                        old.sp_delta if old.sp_delta == carried.sp_delta else None,
+                        old.live_link and carried.live_link, slots,
+                        old.inherited or carried.inherited,
+                        old.callee_saved or carried.callee_saved,
+                        old.stack_derived | carried.stack_derived,
+                        (old.private_slots | carried.private_slots) & slots,
+                        old.live_link and carried.live_link
+                        and (old.live_link_private or carried.live_link_private))
+                if merged != old:
+                    incoming[successor] = merged
+                    if successor not in queued:
+                        pending.append(successor)
+                        queued.add(successor)
+
+    loads, inherited_loads, callee_saved_loads, private_loads, refused = (
+        set(), set(), set(), set(), {})
+    for i, insn in enumerate(fn):
+        if insn.mnemonic != "lqd" or not _writes_r0(insn):
+            continue
+        state = incoming[i]
+        if state is not None and matches_slot(state, insn):
+            loads.add(insn.addr)
+            if state.inherited:
+                inherited_loads.add(insn.addr)
+            if state.callee_saved:
+                callee_saved_loads.add(insn.addr)
+            offset = _stack_link_load_offset(insn)
+            if state.sp_delta + offset in state.private_slots:
+                private_loads.add(insn.addr)
+        elif _stack_link_load_offset(insn) is None:
+            refused[insn.addr] = "non-stack-base"
+        elif state is None:
+            refused[insn.addr] = "no-proven-direct-entry"
+        elif state.sp_delta is None:
+            refused[insn.addr] = "unknown-or-conflicting-stack-delta"
+        else:
+            refused[insn.addr] = "no-dominating-matching-link-save"
+    return loads, inherited_loads, callee_saved_loads, private_loads, refused
+
 
 def _is_identity_move(insn) -> bool:
     """`ai $rX,$rX,0` / `ori $rX,$rX,0` -- writes rX but preserves its value.
@@ -268,73 +714,76 @@ def _is_identity_move(insn) -> bool:
     return len(ops) == 3 and ops[0] == ops[1] and ops[2].strip() in ("0", "0x0")
 
 
-def compute_bi_r0_jumps(insns, bounds) -> set:
-    """`bi $r0` (and conditional `biz/binz $r0`) is normally a function RETURN
-    (r0 = link register). But Sony's SPU code also uses it as a COMPUTED TAIL
-    JUMP after reloading r0 from memory -- e.g. the SPURS taskset launch
-    `lqa $r0, savedContextLr(0x2C80) ... bi $r0` jumps to the task entry
-    (0x3050), NOT back to the caller. Mistranslating that as `return;` makes
-    the launch fall through and the taskset dispatcher loop forever (same bug
-    class as the brsl mislifts). Detect it: within each function, a `bi $r0`
-    is a computed jump iff the NEAREST preceding write to r0 is an ABSOLUTE
-    load (lqa/lqr) or an IMMEDIATE load (il/ila). A genuine return restores the
-    link via a register/stack load (lqd/lqx) or never rewrites r0 -- those stay
-    returns. Returns the set of such bi addrs.
+def compute_bi_r0_jumps(insns, bounds, *, image=None, base=None, delta=0,
+                        entry_points=()) -> BiR0Classification:
+    """Classify register-targeted r0 branches not proven to return.
 
-    The il/ila case is the interrupt-window idiom: `bid $r0` (branch indirect
-    and disable interrupts -- we decode it as plain `bi $r0`, since the D/E bits
-    only gate interrupts and the branch is identical) after `ila $r0, <resume>`
-    JUMPS to the resume address; it does not return. Mislifting it as `return;`
-    unwinds to the caller and silently skips everything after the window. Found
-    in LBP's wwsjob SPURS policy module at 0x2D3C, where the sequence
-    `ila $r0,0x2D40 / ila $r2,0x2D38 / bie $r2 / ai $r0,$r0,0 / bid $r0` opens a
-    one-instruction window for a pending interrupt and resumes at 0x2D40."""
+    An unchanged caller link, identity move, or a proven ABI stack-slot reload
+    is a return. A memory load only qualifies when a dominating `stqd $r0,off(
+    $r1)` saved the entry link and the classifier tracks `$r1` through `ai`
+    adjustments to the matching `lqd`. Other writes dispatch the computed PC.
+
+    An `ila`/`il` target also covers the interrupt-window idiom: `bid $r0`
+    after `ila $r0,<resume>` resumes at that address, rather than returning.
+    """
     jumps = set()
+    link_restores = {}
     ordered = sorted(insns, key=lambda x: x.addr)
     idx_of = {ins.addr: i for i, ins in enumerate(ordered)}
-
-    def _writes_r0(w):
-        return w.mnemonic not in _NO_RT_WRITE and _dest_reg(w) == 0
+    if not bounds or not ordered:
+        return BiR0Classification()
+    if base is None:
+        base = ordered[0].addr
+    if image is None:
+        image = b"".join(insn.raw.to_bytes(4, "big") for insn in ordered)
+    independent, resolved, continuations, call_links, pc_getters = _r0_link_entry_inventory(
+        ordered, bounds, image, base, delta, entry_points)
+    valid_restore_loads, inherited_loads, callee_saved_loads, private_loads, refused_loads = (
+        _r0_link_restore_loads(
+            ordered, bounds, independent, continuations, call_links, pc_getters))
+    unproven = {}
 
     for (s, e) in bounds:
         fn = [i for i in ordered if s <= i.addr < e]
         for idx, insn in enumerate(fn):
             if _bi_target_reg(insn) != "0":
                 continue
-            # backward scan for the nearest instruction that writes r0.
-            # STOP at any unconditional flow break (bi/br/bra/iret/stop): code
-            # above it belongs to a DIFFERENT basic block -- when function
-            # bounds are coarse (extra seed entries shift the partition), the
-            # scan otherwise crosses into the preceding function's tail and a
-            # stray `lqa $r0` there flips a genuine return into a computed
-            # jump (observed: pm_wwsjob 0x3570's `bi $r0` vs the `lqa $r0 ;
-            # bi $r78` ending the function above it).
+            # Stop at unconditional flow breaks: with coarse bounds, code above
+            # such a break may belong to a different function's final block.
             decided = False
             only_identity = False
             for j in range(idx - 1, -1, -1):
                 w = fn[j]
                 if w.mnemonic in ("bi", "br", "bra", "iret", "stop", "stopd"):
-                    break                  # block boundary: r0 is a live-in here
+                    break
+                if w.addr in pc_getters and not _writes_r0(w):
+                    continue
+                if w.mnemonic in ("brsl", "brasl", "bisl", "bisled"):
+                    jumps.add(insn.addr)
+                    unproven[insn.addr] = "intervening-call"
+                    decided = True
+                    break
                 if not _writes_r0(w):
                     continue
                 if _is_identity_move(w):
-                    only_identity = True   # preserves r0; keep looking
+                    only_identity = True
                     continue
-                if w.mnemonic in ("lqa", "lqr", "il", "ila"):
+                if w.mnemonic != "lqd" or w.addr not in valid_restore_loads:
                     jumps.add(insn.addr)
+                    unproven[insn.addr] = refused_loads.get(
+                        w.addr, f"computed-r0-write:{w.mnemonic}")
+                else:
+                    link_restores[insn.addr] = w.addr
                 decided = True
-                break  # nearest real r0 writer found; classification decided
+                break
+            if not decided and call_links.get(s, 1) != 1:
+                jumps.add(insn.addr)
+                unproven[insn.addr] = "entry-link-register-not-r0"
+                continue
             if decided or not only_identity:
                 continue
-            # The ONLY r0 write in this function was an identity move, so r0 was
-            # set by the predecessor block. That is the interrupt-window idiom:
-            # `bie $rN` branches here, making this a function of its own, and the
-            # matching `ila $r0,<resume>` sits a few instructions back in LINEAR
-            # order (outside these bounds). Follow it, bounded, so `bid $r0`
-            # jumps to the resume address instead of unwinding to the caller.
-            # Gated on only_identity so a normal `brsl`-called function -- whose
-            # `bi $r0` genuinely returns and never touches r0 -- can never reach
-            # this scan and be misread as a jump.
+            # An identity-only block may be entered from the interrupt-enable
+            # predecessor, where an earlier `ila $r0` supplies the resume PC.
             g = idx_of[insn.addr]
             for j in range(g - 1, max(-1, g - 1 - 12), -1):
                 w = ordered[j]
@@ -342,8 +791,36 @@ def compute_bi_r0_jumps(insns, bounds) -> set:
                     continue
                 if w.mnemonic in ("il", "ila"):
                     jumps.add(insn.addr)
+                    unproven[insn.addr] = "predecessor-materialized-target"
                 break
-    return jumps
+    link_restores = {site: load for site, load in link_restores.items() if site not in jumps}
+    classification = BiR0Classification(jumps, link_restores)
+    classification.pc_getters = pc_getters
+    classification.unproven = unproven
+    classification.inherited_returns = {
+        site for site, load in link_restores.items() if load in inherited_loads
+    }
+    classification.callee_saved_returns = {
+        site for site, load in link_restores.items() if load in callee_saved_loads
+    }
+    classification.private_slot_returns = {
+        site for site, load in link_restores.items() if load in private_loads
+    }
+    link_returns = compute_link_returns(ordered, bounds)
+    classification.link_returns = link_returns
+    active = {address for start, end in bounds for address in range(start, end, 4)}
+    for insn in ordered:
+        if (insn.addr not in active or insn.addr in resolved or insn.addr in link_returns
+                or insn.addr in pc_getters):
+            continue
+        target = _bi_target_reg(insn)
+        if (insn.mnemonic in ("bisl", "bisled", "iret")
+                or target is not None and (target != "0" or insn.addr in jumps)):
+            classification.unresolved_branches.add(insn.addr)
+    classification.return_assumptions = {
+        site: classification.assumptions_for(site) for site in link_restores
+    }
+    return classification
 
 
 def merge_chunk_groups(insns, bounds, max_insns, entry_points=()) -> dict:
@@ -507,12 +984,13 @@ def compute_link_returns(insns, bounds) -> set:
 LV2_RESUMING_STOPS = {0x100, 0x110, 0x111}
 
 class SPULifter:
-    def __init__(self, trace: bool = False, prefix: str = ""):
+    def __init__(self, trace: bool = False, prefix: str = "", overrides=None):
         self.functions: list[LiftedFunction] = []
         self.call_targets: set[int] = set()
         self.branch_targets: set[int] = set()
         self.unsupported: dict[str, int] = {}
         self.trace = trace
+        self.overrides = dict(overrides or {})
         # Symbol prefix for all emitted spu_func_* / spu_recomp_register symbols.
         # Lets multiple lifted SPU images link into one binary without collisions
         # (every image otherwise exports spu_func_00000090 etc.). Empty = legacy.
@@ -534,15 +1012,17 @@ class SPULifter:
         # (links, lqr/stqr, transfer and return pcs) adds ctx->reloc_delta, which the
         # dispatcher sets to placement - canonical base on entry (spu_overlay_register_region_reloc).
         self.reloc = False
-        # Addresses of `bi/biz/... $r0` that are COMPUTED TAIL JUMPS (r0 reloaded
-        # via lqa/lqr), not function returns -- see compute_bi_r0_jumps(). Empty
-        # set => every `bi $r0` is a return (the prior behaviour).
+        # Computed transfers include every r0 write except an unchanged link or
+        # a stack-slot reload proven by compute_bi_r0_jumps().
         self.bi_r0_jump: set = set()
         # Addresses of `bi/biz/... $rN` (N != 0) that are LINK-REGISTER RETURNS
         # (rN is a non-r0 link register the caller set via brsl/bisl) -- see
         # compute_link_returns(). Emitted as `return;` so they compose with the
         # brsl->C-call nesting instead of branching to an unregistered PC.
         self.link_return: set = set()
+
+    def _function_symbol(self, addr: int) -> str:
+        return self.overrides.get(addr, f"{self.prefix}spu_func_{addr:08X}")
 
     # ------------------------------------------------------------------ #
     def lift_function(self, insns: list[SPUInstruction],
@@ -565,7 +1045,7 @@ class SPULifter:
         # each merged chunk entry hands back to the drain when one is pending.
         merged_starts = {a for a in getattr(self, "func_starts", ()) if start < a < end}
         last_insn = None
-        for insn in insns:
+        for index, insn in enumerate(insns):
             if insn.addr < start or insn.addr >= end:
                 continue
             if insn.addr in internal or insn.addr in merged_starts:
@@ -575,7 +1055,12 @@ class SPULifter:
                     f"    if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) "
                     f"{{ ctx->pc = {self._pc(insn.addr)}; g_spu_trampoline_fn = "
                     f"{self.prefix}spu_func_{insn.addr:08X}; return; }}")
-            c = self._translate(insn, func)
+            next_addr = None
+            if insn.mnemonic == "bisl" and index + 1 < len(insns):
+                candidate = insns[index + 1].addr
+                if start <= candidate < end:
+                    next_addr = candidate
+            c = self._translate(insn, func, next_addr)
             if c:
                 if self.trace:
                     func.body_lines.append(f"    spu_trace_pc(ctx, {self._pc(insn.addr)});")
@@ -597,7 +1082,7 @@ class SPULifter:
                          and (last_insn.raw & 0x3FFF) in LV2_RESUMING_STOPS))
                 and end in getattr(self, "func_starts", set())):
             func.body_lines.append(
-                f"    {{ SPU_DIRECT(ctx, {self._pc(end)}, {self.prefix}spu_func_{end:08X}); }}")
+                f"    {{ SPU_DIRECT(ctx, {self._pc(end)}, {self._function_symbol(end)}); }}")
 
         # Infinite no-op self-loop (the SPU `br .` halt idiom): a function whose
         # whole body is nops + an unconditional branch back into itself does
@@ -660,7 +1145,8 @@ class SPULifter:
         return None
 
     # ------------------------------------------------------------------ #
-    def _translate(self, insn: SPUInstruction, func: LiftedFunction) -> str:
+    def _translate(self, insn: SPUInstruction, func: LiftedFunction,
+                   next_addr=None) -> str:
         mn = insn.mnemonic
         ops = _ops(insn.operands)
         addr = insn.addr
@@ -999,7 +1485,7 @@ class SPULifter:
                 # ctx->reloc_delta for itself; put this placement's back on return.
                 rs, rr = ("const int32_t _rd = ctx->reloc_delta; ", " ctx->reloc_delta = _rd;") if self.reloc else ("", "")
                 return (f"{link} {{ int32_t _si = (int32_t)ctx->image_id; {rs}"
-                        f"ctx->host_depth++; {self.prefix}spu_func_{tgt:08X}(ctx); "
+                        f"ctx->host_depth++; {self._function_symbol(tgt)}(ctx); "
                         f"spu_drain_call(ctx, {self._pc(addr + 4)}); ctx->host_depth--; spu_img_restore(ctx, _si);{rr} }}")
             return f"{link} /* TODO spu: brsl unresolved target */;"
         if mn in _COND_BR:
@@ -1020,7 +1506,7 @@ class SPULifter:
             # tail call when the drain has nothing to do on this step, else
             # the trampoline and unwind (SPU_DIRECT, spu_context.h).
             return (f"if ({cond}) {{ SPU_DIRECT(ctx, {self._pc(tgt)}, "
-                    f"{self.prefix}spu_func_{tgt:08X}); }}")
+                    f"{self._function_symbol(tgt)}); }}")
         # Interrupt enable/disable bits on the bi family (bie/bid, irete/iretd,
         # bisle(d)...): bit 0x40000 = E (enable), 0x80000 = D (disable), taking
         # effect when the branch is TAKEN. The WWS jobmanager's poll loop runs
@@ -1062,17 +1548,25 @@ class SPULifter:
             # that: `bisl $0,$2` at LS 0x3598 calls selectWorkload through the
             # kernel context, and we jumped to 0x359C (its own link) instead.
             link_rt = insn.raw & 0x7F            # rt = bits 25-31 of the encoding
+            # Equality may use C fall-through only when that exact next
+            # instruction is represented here; range ends and LS wrap must
+            # still dispatch even when the target equals the link value.
             tgt_reg = _reg(ops[-1])
             # Indirect call: nested dispatch bracketed like brsl (host_depth +
             # SPU_DRAIN + image save/restore) so the callee's tail-chains drain
             # here and its `bi $r0` returns via host return.
             # read the target BEFORE writing the link: rt may be the same register as ra
             rs, rr = ("const int32_t _rd = ctx->reloc_delta; ", " ctx->reloc_delta = _rd;") if self.reloc else ("", "")
-            return (f"{{ uint32_t _tg = {g(tgt_reg)}._u32[0]; {g(link_rt)} = spu_link({self._pc((addr + 4) & 0x3FFFC)}); "
-                    f"int32_t _si = (int32_t)ctx->image_id; {rs}"
-                    f"{_ied}ctx->pc = _tg; ctx->host_depth++; "
-                    f"spu_indirect_branch(ctx); spu_drain_call(ctx, {self._pc(addr + 4)}); "
-                    f"ctx->host_depth--; spu_img_restore(ctx, _si);{rr} }}")
+            falls_through = next_addr == addr + 4 and addr + 4 < 0x40000
+            guard = "if (_tg != _ret) { " if falls_through else ""
+            guard_end = " }" if falls_through else ""
+            return (f"{{ uint32_t _tg = {g(tgt_reg)}._u32[0] & 0x3FFFCu; "
+                    f"const uint32_t _ret = {self._pc((addr + 4) & 0x3FFFC)}; "
+                    f"{g(link_rt)} = spu_link(_ret); {_ied}ctx->pc = _tg; "
+                    f"{guard}int32_t _si = (int32_t)ctx->image_id; {rs}"
+                    f"ctx->host_depth++; "
+                    f"spu_indirect_branch(ctx); spu_drain_call(ctx, _ret); "
+                    f"ctx->host_depth--; spu_img_restore(ctx, _si);{rr}{guard_end} }}")
         # bisled: set link, branch to RA only if an external event is pending.
         if mn in ("bisled",):
             link_rt = insn.raw & 0x7F            # rt = link
@@ -1137,7 +1631,7 @@ class SPULifter:
         # drain has nothing to do on this step, else hand the target to the
         # trampoline and unwind so the enclosing SPU_DRAIN re-enters (no
         # host-stack growth either way; SPU_DIRECT, spu_context.h).
-        return (f"{{ SPU_DIRECT(ctx, {self._pc(tgt)}, {self.prefix}spu_func_{tgt:08X}); }}")
+        return (f"{{ SPU_DIRECT(ctx, {self._pc(tgt)}, {self._function_symbol(tgt)}); }}")
 
     # ------------------------------------------------------------------ #
     def twin_renames(self) -> list[str]:
@@ -1163,6 +1657,8 @@ class SPULifter:
         lines.append("")
         for f in self.functions:
             lines.append(f"void {f.name}(spu_context* ctx);")
+        for symbol in sorted(set(self.overrides.values())):
+            lines.append(f"void {symbol}(spu_context* ctx); /* native override */")
         defined = {f.start_addr for f in self.functions}
         for t in sorted(self.call_targets | self.branch_targets):
             if t not in defined:
@@ -1170,6 +1666,9 @@ class SPULifter:
         lines.append("")
         lines.append("/* Runtime glue (runtime/spu/spu_channels.c) */")
         lines.append("void spu_register_function(uint32_t addr, void (*fn)(spu_context*));")
+        if self.overrides:
+            lines.append("void spu_register_function_with_reference(uint32_t addr, "
+                         "void (*fn)(spu_context*), void (*reference)(spu_context*), int native_override);")
         lines.append("/* Call once at init to register this image's functions for")
         lines.append(" * indirect-branch dispatch (spu_indirect_branch). */")
         lines.append(f"void {self.prefix}spu_recomp_register(void);")
@@ -1207,17 +1706,28 @@ class SPULifter:
             lines.append("")
 
         lines.append("/* Function table */")
-        lines.append("typedef struct { uint32_t addr; void (*func)(spu_context*); const char* name; } spu_func_entry;")
+        lines.append("typedef struct { uint32_t addr; void (*func)(spu_context*); "
+                     "void (*reference)(spu_context*); int native_override; const char* name; } spu_func_entry;")
         lines.append("static const spu_func_entry spu_function_table[] = {")
         for f in self.functions:
-            lines.append(f'    {{ 0x{f.start_addr:08X}u, {f.name}, "{f.name}" }},')
-        lines.append("    { 0, NULL, NULL }")
+            selected = self._function_symbol(f.start_addr)
+            is_override = 1 if f.start_addr in self.overrides else 0
+            lines.append(f'    {{ 0x{f.start_addr:08X}u, {selected}, {f.name}, {is_override}, "{f.name}" }},')
+        lines.append("    { 0, NULL, NULL, 0, NULL }")
         lines.append("};")
         lines.append("")
         lines.append(f"void {self.prefix}spu_recomp_register(void) {{")
         lines.append("    ps3_spu_lifter_abi_check(SPU_LIFTER_ABI);")
-        lines.append("    for (const spu_func_entry* e = spu_function_table; e->func; ++e)")
-        lines.append("        spu_register_function(e->addr, e->func);")
+        if self.overrides:
+            lines.append("    for (const spu_func_entry* e = spu_function_table; e->func; ++e) {")
+            lines.append("        if (e->native_override)")
+            lines.append("            spu_register_function_with_reference(e->addr, e->func, e->reference, 1);")
+            lines.append("        else")
+            lines.append("            spu_register_function(e->addr, e->func);")
+            lines.append("    }")
+        else:
+            lines.append("    for (const spu_func_entry* e = spu_function_table; e->func; ++e)")
+            lines.append("        spu_register_function(e->addr, e->func);")
         lines.append("}")
         lines.append("")
         return "\n".join(lines)
@@ -1236,6 +1746,9 @@ def main() -> None:
     p.add_argument("--source-name", default="spu_recomp.c")
     p.add_argument("--base", type=lambda x: int(x, 0), default=0,
                    help="Base local-store address")
+    p.add_argument("--link-base", type=lambda x: int(x, 0), default=None,
+                   help="Linked image base for the return-proof entry veto inventory only; "
+                        "omitted means no relocation, explicit 0 means linked at zero.")
     p.add_argument("--offset", type=lambda x: int(x, 0), default=0)
     p.add_argument("--length", type=lambda x: int(x, 0), default=0)
     p.add_argument("--functions", metavar="FILE",
@@ -1260,6 +1773,9 @@ def main() -> None:
                         "0x10F8,0x808) to add as boundaries -- for indirect-branch "
                         "targets that --auto-functions can't detect statically. "
                         "Splits the containing auto-detected function at each addr.")
+    p.add_argument("--override", action="append", default=[], metavar="ADDR=SYMBOL",
+                   help="Replace a decoded leaf function's references with a native "
+                        "void SYMBOL(spu_context*) supplied by the consumer. Repeatable.")
     p.add_argument("--return-entries", action="store_true",
                    help="Also make the return address of every call (brsl, "
                         "brasl, bisl, bisled) an entry point. Code that is "
@@ -1304,7 +1820,12 @@ def main() -> None:
                         "dispatched blocks later -- classified as a return, which "
                         "silently skipped every job-command handler).")
     args = p.parse_args()
+    try:
+        overrides = parse_overrides(args.override)
+    except ValueError as error:
+        p.error(str(error))
 
+    independent_entries = set()
     if args.auto_functions:
         from find_spu_functions import detect_functions, parse_elf, pick_text, text_image
         with open(args.auto_functions, "rb") as f:
@@ -1314,6 +1835,11 @@ def main() -> None:
         if args.base != 0:
             base = args.base  # caller override
         bounds = funcs
+        from find_spu_functions import read_symbols
+        elf_info = parse_elf(elf_buf)
+        independent_entries.add(elf_info["entry"])
+        independent_entries.update(symbol["addr"]
+                                   for symbol in read_symbols(elf_buf, elf_info["shs"]))
     else:
         with open(args.input, "rb") as f:
             data = f.read()
@@ -1344,13 +1870,20 @@ def main() -> None:
             # No boundary info: treat the whole image as one function.
             bounds = [(base, base + len(data))]
 
+    from find_spu_functions import image_delta
+    insns = disassemble_spu(data, base)
     # Call return addresses as entries (--return-entries): split the bound that
     # contains each one. Not merge-group seeds -- see the option's help.
     if args.return_entries:
         hi = args.code_end or (base + len(data))
-        rets = sorted({i.addr + 4 for i in disassemble_spu(data, base)
+        getters = set()
+        if bounds:
+            *_, getters = _r0_link_entry_inventory(
+                insns, bounds, data, base, image_delta(base, args.link_base),
+                [base, *independent_entries])
+        rets = sorted({i.addr + 4 for i in insns
                        if i.mnemonic in ("brsl", "brasl", "bisl", "bisled")
-                       and i.addr + 4 < hi})
+                       and i.addr not in getters and i.addr + 4 < hi})
         newb = []
         for (s0, e0) in sorted(set(bounds)):
             cuts = [a for a in rets if s0 < a < e0]
@@ -1414,21 +1947,44 @@ def main() -> None:
                          "data tail left un-disassembled\n"
                          % (ce, len(bounds), before))
 
-    insns = disassemble_spu(data, base)
 
-    lifter = SPULifter(trace=args.trace, prefix=args.symbol_prefix)
-    lifter.reloc = args.reloc
-    lifter.bi_r0_jump = compute_bi_r0_jumps(insns, bounds)
+    lifter = SPULifter(trace=args.trace, prefix=args.symbol_prefix, overrides=overrides)
+    independent_entries.add(base)
+    if args.extra_funcs:
+        independent_entries.update(int(value, 0) for value in args.extra_funcs.split(",")
+                                   if value.strip())
+    lifter.bi_r0_jump = compute_bi_r0_jumps(
+        insns, bounds, image=data, base=base, delta=image_delta(base, args.link_base),
+        entry_points=independent_entries)
     if lifter.bi_r0_jump:
         print(f"  {len(lifter.bi_r0_jump)} `bi $r0` computed-jump site(s) "
-              f"(r0 set by lqa/lqr/il/ila, not a link): "
+              f"(not proven caller links): "
               f"{', '.join(f'0x{a:X}' for a in sorted(lifter.bi_r0_jump))}")
+    if lifter.bi_r0_jump.link_restores:
+        for site, load in sorted(lifter.bi_r0_jump.link_restores.items()):
+            assumptions = json.dumps(lifter.bi_r0_jump.return_assumptions[site])
+            print(f"  `bi $r0` return 0x{site:X} (lqd 0x{load:X}): "
+                  f"assumes={assumptions}")
     lifter.link_return = compute_link_returns(insns, bounds)
     if args.force_indirect:
         forced = {int(x, 0) for x in args.force_indirect.split(",") if x.strip()}
         dropped = lifter.link_return & forced
         lifter.link_return -= forced
-        lifter.bi_r0_jump |= forced          # also force `bi $r0` sites if listed
+        lifter.bi_r0_jump |= forced
+        lifter.bi_r0_jump.link_restores = {
+            site: load for site, load in lifter.bi_r0_jump.link_restores.items()
+            if site not in forced
+        }
+        lifter.bi_r0_jump.assumes = (
+            "spu-abi-link-slot" if lifter.bi_r0_jump.link_restores else None)
+        lifter.bi_r0_jump.inherited_returns -= forced
+        lifter.bi_r0_jump.callee_saved_returns -= forced
+        lifter.bi_r0_jump.private_slot_returns -= forced
+        lifter.bi_r0_jump.unresolved_branches |= forced
+        lifter.bi_r0_jump.return_assumptions = {
+            site: lifter.bi_r0_jump.assumptions_for(site)
+            for site in lifter.bi_r0_jump.link_restores
+        }
         sys.stderr.write("[spu_lifter] forced indirect dispatch at: %s%s\n" %
                          (", ".join("0x%X" % a for a in sorted(forced)),
                           " (was link-return: %s)" %
@@ -1448,6 +2004,24 @@ def main() -> None:
                                     entry_points=seeds)
         print(f"  {len(groups)} merged function group(s) "
               f"(--merge-chunks, max {args.max_group_insns} insns)")
+    if overrides:
+        ends = dict(bounds)
+        if set(overrides) - set(ends):
+            missing = min(set(overrides) - set(ends))
+            p.error(f"--override 0x{missing:X} is not a decoded function entry")
+        generated = {f"{lifter.prefix}spu_func_{start:08X}" for start, _ in bounds}
+        generated.add(f"{lifter.prefix}spu_recomp_register")
+        generated.update(f"{lifter.prefix}spu_func_{target:08X}"
+                         for target in lifter.call_targets | lifter.branch_targets)
+        for address, symbol in overrides.items():
+            if symbol in generated:
+                p.error(f"--override 0x{address:X} symbol {symbol!r} conflicts with a lifted symbol")
+            end = groups.get(address, ends[address])
+            problem = override_leaf_problem(insns, address, end, lifter.bi_r0_jump,
+                                            lifter.func_starts)
+            if problem:
+                p.error(f"--override 0x{address:X} refuses non-leaf function: {problem}")
+
     for s, e in bounds:
         lifter.lift_function(insns, s, groups.get(s, e))
 
@@ -1464,7 +2038,20 @@ def main() -> None:
             json.dump({"functions": [[f.start_addr, f.end_addr] for f in lifter.functions],
                        "unsupported": lifter.unsupported,
                        "call_targets": sorted(lifter.call_targets),
-                       "branch_targets": sorted(lifter.branch_targets)}, report, indent=2)
+                       "branch_targets": sorted(lifter.branch_targets),
+                       "r0_returns": [
+                           {"site": site, "load": load,
+                            "inherited": site in lifter.bi_r0_jump.inherited_returns,
+                            "assumes": lifter.bi_r0_jump.return_assumptions[site]}
+                           for site, load in sorted(lifter.bi_r0_jump.link_restores.items())
+                       ],
+                       "unresolved_register_branches": sorted(
+                           lifter.bi_r0_jump.unresolved_branches),
+                       "r0_dispatches": [
+                           {"site": site, "reason": lifter.bi_r0_jump.unproven.get(
+                               site, "unproven-target")}
+                           for site in sorted(lifter.bi_r0_jump)
+                       ]}, report, indent=2)
 
     print(f"Wrote {hp}")
     print(f"Wrote {sp}")

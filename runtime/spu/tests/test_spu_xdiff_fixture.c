@@ -411,6 +411,34 @@ static void build_full(spu_xdiff_fixture* f, int with_verdict)
     if (with_verdict) set_verdict(f);
 }
 
+/* A function unit reuses the state sections and carries only its liveness in FMAS. */
+static void build_function_fixture(spu_xdiff_fixture* f)
+{
+    REQUIRE(spu_xdiff_fixture_init(f) == 0, "function fixture init");
+    pattern(f->ls0 + IMG_LS, IMG_BYTES, 0x31);
+    pattern(f->ls0 + 0x2000, 32, 0x45);
+    memcpy(f->ls1, f->ls0, SPU_XDIFF_LS_BYTES);
+    f->ls1[0x2000] ^= 0x80;
+    pattern(f->reg0, SPU_XDIFF_REG_BYTES, 0x15);
+    pattern(f->reg1, SPU_XDIFF_REG_BYTES, 0x25);
+    f->identity.image_fingerprint = fnv64(FNV64_BASIS, f->ls0 + IMG_LS, IMG_BYTES);
+    f->identity.authority.tier = (uint8_t)SPU_TIER_INTERP;
+    f->identity.effect_port_abi = SPU_EFFECT_PORT_ABI;
+    f->identity.context_census = 0xC0FFEE01u;
+    f->identity.host_arch = SPU_XDIFF_HOST_ARM64;
+    f->identity.host_isa = SPU_XDIFF_ISA_SCALAR;
+    f->identity.float_rz = 1;
+    f->unit.kind = SPU_XDIFF_UNIT_FUNCTION;
+    f->unit.entry_pc = IMG_LS + 0x40u;
+    f->unit.return_ls = IMG_LS + 0x44u;
+    f->unit.image_ls = IMG_LS;
+    f->unit.image_bytes = IMG_BYTES;
+    f->unit.r1 = 0x3000u;
+    f->function_mask.live_out[0] = (1ULL << 1) | (1ULL << 5);
+    f->function_mask.dead_stack_bytes = 16;
+    f->end.end_class = SPU_XDIFF_END_RETURN;
+}
+
 /* ---- comparisons -------------------------------------------------------- */
 
 static void compare_fixtures(const spu_xdiff_fixture* a, const spu_xdiff_fixture* b)
@@ -418,6 +446,7 @@ static void compare_fixtures(const spu_xdiff_fixture* a, const spu_xdiff_fixture
     REQUIRE(memcmp(&a->identity, &b->identity, sizeof a->identity) == 0, "IDEN differs");
     REQUIRE(memcmp(&a->unit, &b->unit, sizeof a->unit) == 0, "UNIT differs");
     REQUIRE(memcmp(a->reg0, b->reg0, SPU_XDIFF_REG_BYTES) == 0, "REG0 differs");
+    REQUIRE(memcmp(&a->function_mask, &b->function_mask, sizeof a->function_mask) == 0, "FMAS differs");
     REQUIRE(memcmp(a->reg1, b->reg1, SPU_XDIFF_REG_BYTES) == 0, "REG1 differs");
     REQUIRE(memcmp(&a->end, &b->end, sizeof a->end) == 0, "END_ differs");
     REQUIRE(a->effect_count == b->effect_count, "effect count %u != %u", a->effect_count,
@@ -541,6 +570,27 @@ static void roundtrip(int with_verdict)
     spu_xdiff_fixture_free(&f);
     spu_xdiff_fixture_free(&g);
     printf("ok roundtrip (%s)\n", with_verdict ? "with VRDT" : "no VRDT");
+}
+
+static void function_roundtrip(void)
+{
+    spu_xdiff_fixture f, g;
+    spu_xdiff_error err;
+    uint8_t* bytes = NULL;
+    size_t n = 0;
+    uint64_t mask_bytes = 0;
+    build_function_fixture(&f);
+    REQUIRE(spu_xdiff_fixture_encode(&f, &bytes, &n, &err) == 0, "function encode: %s", err.detail);
+    check_container(bytes, n);
+    (void)section_bytes(bytes, SPU_XDIFF_SEC_FMASK, &mask_bytes);
+    REQUIRE(mask_bytes == sizeof(spu_xdiff_function_mask), "FMAS size %llu",
+            (unsigned long long)mask_bytes);
+    REQUIRE(spu_xdiff_fixture_decode(bytes, n, &g, &err) == 0, "function decode: %s", err.detail);
+    compare_fixtures(&f, &g);
+    free(bytes);
+    spu_xdiff_fixture_free(&f);
+    spu_xdiff_fixture_free(&g);
+    printf("ok function unit roundtrip\n");
 }
 
 /* An empty transcript and an empty payload store are legal (section 7.2). */
@@ -804,6 +854,44 @@ static uint8_t* encode_full(size_t* n)
     return p;
 }
 
+static void test_v1_job_compatibility(void)
+{
+    spu_xdiff_fixture original, decoded;
+    spu_xdiff_error err;
+    size_t bytes_count = 0;
+    build_minimal(&original);
+    uint8_t* bytes = encode_of(&original, &bytes_count);
+    wr32(bytes + offsetof(spu_xdiff_file_header, version), SPU_XDIFF_VERSION_V1);
+    fix_checksum(bytes, bytes_count);
+    memset(&decoded, 0, sizeof decoded);
+    REQUIRE(spu_xdiff_fixture_decode(bytes, bytes_count, &decoded, &err) == 0,
+            "version-1 job fixture did not decode: %s", err.detail);
+    REQUIRE(decoded.unit.kind == SPU_XDIFF_UNIT_JOB, "version-1 fixture kind changed");
+    compare_fixtures(&original, &decoded);
+    free(bytes);
+    spu_xdiff_fixture_free(&original);
+    spu_xdiff_fixture_free(&decoded);
+}
+
+static void test_v1_reader_rejects_v2_function_fixture(void)
+{
+    spu_xdiff_fixture function_fixture, decoded;
+    spu_xdiff_error err;
+    size_t bytes_count = 0;
+    build_function_fixture(&function_fixture);
+    uint8_t* bytes = encode_of(&function_fixture, &bytes_count);
+    memset(&decoded, 0, sizeof decoded);
+    REQUIRE(spu_xdiff_fixture_decode_max_version(bytes, bytes_count, SPU_XDIFF_VERSION_V1,
+                                                 &decoded, &err) == -1,
+            "version-1 reader accepted a version-2 function fixture");
+    REQUIRE(err.reason == SPU_XDIFF_R_UNSUPPORTED_VERSION &&
+                strstr(err.detail, "version 2") != NULL,
+            "old reader did not name the unsupported version: %s", err.detail);
+    free(bytes);
+    spu_xdiff_fixture_free(&function_fixture);
+    spu_xdiff_fixture_free(&decoded);
+}
+
 static void test_rejects(void)
 {
     /* A zstd frame is refused by name, before anything is read as a header. */
@@ -827,9 +915,9 @@ static void test_rejects(void)
     {
         size_t n;
         uint8_t* p = encode_minimal(&n);
-        wr32(p + 8, 2);
+        wr32(p + offsetof(spu_xdiff_file_header, version), SPU_XDIFF_VERSION + 1u);
         fix_checksum(p, n);
-        expect_reject("version", p, n, SPU_XDIFF_R_FIXTURE_FORMAT, "header");
+        expect_reject("unsupported version", p, n, SPU_XDIFF_R_UNSUPPORTED_VERSION, "version");
     }
     {
         size_t n;
@@ -1227,57 +1315,98 @@ static void test_truncations(void)
     printf("ok %zu truncations refused as fixture-format\n", n);
 }
 
-/* A deterministic sweep of one-byte mutations with the checksum re-fixed, so
- * each mutation reaches the check it breaks: every result either decodes and
- * re-encodes, or is refused with a reason and a detail. Nothing may crash or
- * leave a half fixture behind (the sweep runs under ASan too). Each decode
- * allocates two whole local stores, so the t0 run takes a short prefix of the
- * sequence and the stress run (a count on the command line) the long one. */
+static void mutation_result(const uint8_t* bytes, size_t size, int index, size_t at,
+                            uint32_t* accepted, uint32_t* refused)
+{
+    spu_xdiff_fixture f;
+    spu_xdiff_error err;
+    memset(&err, 0, sizeof err);
+    memset(&f, 0, sizeof f);
+    if (spu_xdiff_fixture_decode(bytes, size, &f, &err) == 0) {
+        uint8_t* again = NULL;
+        size_t again_n = 0;
+        REQUIRE(spu_xdiff_fixture_encode(&f, &again, &again_n, &err) == 0,
+                "mutation %d at 0x%zx decoded but does not encode: %s", index, at, err.detail);
+        REQUIRE(again != NULL && again_n != 0, "mutation %d re-encoded to nothing", index);
+        free(again);
+        spu_xdiff_fixture_free(&f);
+        (*accepted)++;
+    } else {
+        REQUIRE(err.reason == SPU_XDIFF_R_FIXTURE_FORMAT ||
+                    err.reason == SPU_XDIFF_R_FIXTURE_IDENTITY ||
+                    err.reason == SPU_XDIFF_R_UNSUPPORTED_VERSION,
+                "mutation %d at 0x%zx answered %s: %s", index, at,
+                spu_xdiff_reason_id(err.reason), err.detail);
+        REQUIRE(err.detail[0] != 0, "mutation %d at 0x%zx has no detail", index, at);
+        (*refused)++;
+    }
+}
+
+static void function_mask_mutations(void)
+{
+    spu_xdiff_fixture f;
+    spu_xdiff_error err;
+    uint8_t* base = NULL;
+    size_t size = 0;
+    uint64_t mask_bytes = 0;
+    uint32_t accepted = 0, refused = 0;
+    build_function_fixture(&f);
+    REQUIRE(spu_xdiff_fixture_encode(&f, &base, &size, &err) == 0,
+            "function mutation base encode: %s", err.detail);
+    uint8_t* mutation = (uint8_t*)malloc(size);
+    REQUIRE(mutation != NULL, "function mask mutation buffer");
+    uint8_t* mask = section_bytes(base, SPU_XDIFF_SEC_FMASK, &mask_bytes);
+    const size_t offset = (size_t)(mask - base);
+    for (uint32_t i = 0; i < mask_bytes; i++) {
+        memcpy(mutation, base, size);
+        mutation[offset + i] ^= (uint8_t)(1u << (i & 7u));
+        fix_checksum(mutation, size);
+        mutation_result(mutation, size, (int)i, offset + i, &accepted, &refused);
+    }
+    free(mutation);
+    free(base);
+    spu_xdiff_fixture_free(&f);
+    printf("ok %llu FMAS byte mutations: %u decoded, %u refused\n",
+           (unsigned long long)mask_bytes, accepted, refused);
+}
+
+/* The fixed random sequence alternates job and function units; FMAS bytes are
+ * also exhaustively mutated above so the small section is always exercised. */
 static void test_mutation_sweep(int mutations)
 {
-    size_t n = 0;
-    uint8_t* const base = encode_full(&n);
-    uint8_t* const p = (uint8_t*)malloc(n);
-    REQUIRE(p != NULL, "malloc");
+    size_t job_bytes = 0, function_bytes = 0;
+    uint8_t* job_base = encode_full(&job_bytes);
+    spu_xdiff_fixture function_fixture;
+    spu_xdiff_error err;
+    uint8_t* function_base = NULL;
+    build_function_fixture(&function_fixture);
+    REQUIRE(spu_xdiff_fixture_encode(&function_fixture, &function_base, &function_bytes, &err) == 0,
+            "function mutation encode: %s", err.detail);
+    spu_xdiff_fixture_free(&function_fixture);
+    uint8_t* const mutation = (uint8_t*)malloc(job_bytes > function_bytes ? job_bytes : function_bytes);
+    REQUIRE(mutation != NULL, "mutation buffer");
     uint32_t seed = 0x784F2D31u; /* fixed: the sweep is the same on every host */
     uint32_t accepted = 0, refused = 0;
+    function_mask_mutations();
 
     for (int i = 0; i < mutations; i++) {
-        memcpy(p, base, n);
+        const uint8_t* base = (i & 1) ? function_base : job_base;
+        const size_t size = (i & 1) ? function_bytes : job_bytes;
+        memcpy(mutation, base, size);
         seed ^= seed << 13;
         seed ^= seed >> 17;
         seed ^= seed << 5;
-        const size_t at = (size_t)(seed % n);
+        const size_t at = (size_t)(seed % size);
         seed ^= seed << 13;
         seed ^= seed >> 17;
         seed ^= seed << 5;
-        p[at] ^= (uint8_t)(1u + (seed >> 24)); /* never a no-op mutation */
-        fix_checksum(p, n);
-
-        spu_xdiff_fixture f;
-        spu_xdiff_error err;
-        memset(&err, 0, sizeof err);
-        memset(&f, 0, sizeof f);
-        if (spu_xdiff_fixture_decode(p, n, &f, &err) == 0) {
-            uint8_t* again = NULL;
-            size_t again_n = 0;
-            REQUIRE(spu_xdiff_fixture_encode(&f, &again, &again_n, &err) == 0,
-                    "mutation %d at 0x%zx decoded but does not encode: %s", i, at, err.detail);
-            REQUIRE(again != NULL && again_n != 0, "mutation %d re-encoded to nothing", i);
-            free(again);
-            spu_xdiff_fixture_free(&f);
-            accepted++;
-        } else {
-            REQUIRE(err.reason == SPU_XDIFF_R_FIXTURE_FORMAT ||
-                        err.reason == SPU_XDIFF_R_FIXTURE_IDENTITY,
-                    "mutation %d at 0x%zx answered %s: %s", i, at,
-                    spu_xdiff_reason_id(err.reason), err.detail);
-            REQUIRE(err.detail[0] != 0, "mutation %d at 0x%zx has no detail", i, at);
-            refused++;
-        }
+        mutation[at] ^= (uint8_t)(1u + (seed >> 24)); /* never a no-op mutation */
+        fix_checksum(mutation, size);
+        mutation_result(mutation, size, i, at, &accepted, &refused);
     }
-    free(p);
-    free(base);
+    free(mutation);
+    free(function_base);
+    free(job_base);
     printf("ok %d mutations: %u decoded and re-encoded, %u refused\n", mutations, accepted, refused);
 }
 
@@ -1288,6 +1417,9 @@ int main(int argc, char** argv)
     test_fingerprint_known_answers();
     roundtrip(0);
     roundtrip(1);
+    function_roundtrip();
+    test_v1_job_compatibility();
+    test_v1_reader_rejects_v2_function_fixture();
     test_empty_transcript();
     test_payload_store();
     test_clear();

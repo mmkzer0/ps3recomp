@@ -1612,6 +1612,49 @@ if(PS3RECOMP_BUILD_TESTS)
             add_test(NAME spu_job_replay_usage COMMAND spu_job_replay)
             set_tests_properties(spu_job_replay_usage PROPERTIES LABELS "spu;t0" TIMEOUT 60
                 PASS_REGULAR_EXPRESSION "usage: ")
+            # T2's strict, per-function judgement and native override wiring.
+            set(XDIFF_FUNCTION_DIR "${CMAKE_BINARY_DIR}/spu_xdiff_function")
+            set(XDIFF_FUNCTION_IMAGE "${XDIFF_FUNCTION_DIR}/fn_override_job.bin")
+            set(XDIFF_FUNCTIONS "${XDIFF_FUNCTION_DIR}/functions.json")
+            set(XDIFF_FUNCTION_PLAN "${XDIFF_FUNCTION_DIR}/liveness.json")
+            add_custom_command(
+                OUTPUT "${XDIFF_FUNCTION_IMAGE}" "${XDIFF_FUNCTIONS}" "${XDIFF_FUNCTION_PLAN}"
+                COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu/tests/gen_xdiff_function_job.py"
+                    "${XDIFF_FUNCTION_DIR}"
+                DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu/tests/gen_xdiff_function_job.py"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tools/spu_liveness.py"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tools/spu_disasm.py"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tools/find_spu_functions.py"
+                VERBATIM)
+            set(XDIFF_FUNCTION_LIFT_DIR "${XDIFF_FUNCTION_DIR}/lift")
+            set(XDIFF_FUNCTION_LIFT "${XDIFF_FUNCTION_LIFT_DIR}/spu_recomp.c")
+            add_custom_command(
+                OUTPUT "${XDIFF_FUNCTION_LIFT}" "${XDIFF_FUNCTION_LIFT_DIR}/spu_recomp.h"
+                COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/spu_lifter.py"
+                    "${XDIFF_FUNCTION_IMAGE}" --base 0x7c00 --functions "${XDIFF_FUNCTIONS}"
+                    --symbol-prefix xfn_ --override 0x7c70=test_fn_override
+                    --output "${XDIFF_FUNCTION_LIFT_DIR}"
+                DEPENDS "${XDIFF_FUNCTION_IMAGE}" "${XDIFF_FUNCTIONS}"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tools/spu_lifter.py"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tools/spu_disasm.py"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tools/find_spu_functions.py"
+                VERBATIM)
+            add_executable(test_spu_xdiff_function
+                runtime/spu/tests/test_spu_xdiff_function.c
+                runtime/spu/xdiff/spu_xdiff_replay.c
+                runtime/spu/xdiff/spu_job_replay.c
+                ${SPU_XDIFF_SOURCES}
+                "${XDIFF_FUNCTION_LIFT}"
+                ${XDIFF_REPLAY_RUNTIME})
+            target_include_directories(test_spu_xdiff_function PRIVATE
+                include runtime runtime/spu runtime/platform
+                "${XDIFF_FUNCTION_DIR}" "${XDIFF_FUNCTION_LIFT_DIR}")
+            target_link_libraries(test_spu_xdiff_function PRIVATE m Threads::Threads)
+            add_test(NAME spu_xdiff_function
+                COMMAND test_spu_xdiff_function "${XDIFF_FUNCTION_IMAGE}" "${XDIFF_FUNCTION_PLAN}"
+                    "${XDIFF_FUNCTION_DIR}/t0.spujob" "${XDIFF_FUNCTION_DIR}/units")
+            set_tests_properties(spu_xdiff_function PROPERTIES LABELS "spu;t0" TIMEOUT 120)
             # The poison run (docs/SPU_XDIFF.md 8.2, docs/SPU_LIFTER.md "Liveness"): the claims of
             # tools/spu_liveness.py on a synthetic caller and callee, checked against recorded jobs.
             set(XDIFF_POISON_DIR "${CMAKE_BINARY_DIR}/spu_xdiff_poison")

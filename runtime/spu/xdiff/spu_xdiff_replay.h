@@ -51,6 +51,22 @@ typedef struct spu_xdiff_replay_options {
 uint32_t spu_xdiff_replay(const spu_xdiff_fixture* f, const spu_xdiff_replay_options* opt,
                           spu_xdiff_shadow* s, spu_xdiff_verdict_record* out);
 
+typedef struct spu_xdiff_function_result {
+    uint32_t verdict;
+    uint32_t reason;
+    uint32_t match;
+    uint32_t dead_registers; /* number of dead registers differing from the authority */
+    uint32_t where;          /* register index, LS address, expected return PC, or SPU_XDIFF_NO_WHERE */
+    uint8_t  want[16];
+    uint8_t  got[16];
+} spu_xdiff_function_result;
+
+/* Replays a kind-FUNCTION unit through the registered original lift or its
+ * native override, then compares the return PC, live-out registers and LS
+ * outside FMAS. */
+uint32_t spu_xdiff_replay_function_unit(const spu_xdiff_fixture* f, int native_override,
+                                        spu_xdiff_function_result* out);
+
 /* The name of a set behaviour-changing knob (section 8.1), or NULL when none
  * is set. A replay under one would compare a different program. */
 const char* spu_xdiff_refused_knob(void);
@@ -98,6 +114,13 @@ typedef struct spu_xdiff_poison_plan {
 int  spu_xdiff_poison_plan_parse(const char* text, size_t bytes, spu_xdiff_poison_plan* out, char* err, size_t err_bytes);
 int  spu_xdiff_poison_plan_load(const char* path, spu_xdiff_poison_plan* out, char* err, size_t err_bytes);
 void spu_xdiff_poison_plan_free(spu_xdiff_poison_plan* plan);
+
+/* Replay a T0 job fixture with its instruction observer and write at most the
+ * first 64 calls of `entry` as deterministic kind-FUNCTION fixtures in out_dir. */
+int spu_xdiff_capture_function_units(const spu_xdiff_fixture* f,
+                                    const spu_xdiff_poison_plan* plan, uint32_t entry,
+                                    const char* out_dir, uint32_t* captured,
+                                    char* err, size_t err_bytes);
 
 typedef enum spu_xdiff_poison_kind {
     SPU_XDIFF_POISON_UNKNOWN  = 0, /* no single register or frame byte explains the difference */

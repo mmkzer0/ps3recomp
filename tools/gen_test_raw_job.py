@@ -45,6 +45,7 @@ BIZ = 0x128
 RDCH = 0x00D
 WRCH = 0x10D
 LQD = 0x034
+STQD = 0x024
 ORI = 0x004
 ANDI = 0x014
 AI = 0x01C
@@ -169,26 +170,27 @@ def _call_body(base, variant):
     """
     second_arg = (_ri10(LQD, 0, 3, 8) if variant == 'calls-computed'
                   else _ri16(IL, MFC_PUT, 8))
-    main = [_ri16(IL, MFC_GET, 8), 0, second_arg, 0]
+    main = [_ri10(AI, -1, 1, 1), _ri10(STQD, 0, 1, 0),
+            _ri16(IL, MFC_GET, 8), 0, second_arg, 0]
     if variant in ('calls-materialised', 'calls-pic-materialised'):
         main.append(0)                                  # ila $r5, <helper>
     main += [_ri16(IL, 0x1234, 10), _channel(WRCH, SPU_WrOutMbox, 10)]
     main += [_ri10(LQD, 0, 0, 11), _channel(WRCH, MFC_Cmd, 11)]
-    main.append(_rr(BI, 0, 0, 0))                       # main returns first
+    main += [_ri10(LQD, 0, 1, 0), _ri10(AI, 1, 1, 1), _rr(BI, 0, 0, 0)]
     helper = _dma_helper()
     if variant == 'calls-rewrite':
         helper.insert(0, _ri10(LQD, 0, 3, 8))           # the helper redefines $r8
     helper.append(_rr(BI, 0, 0, 0))
     address = base + CODE_START + 4 * len(main)
     code_start = base + CODE_START
-    main[1] = _ri16(BRSL, (address - (code_start + 4)) // 4, 0)
     main[3] = _ri16(BRSL, (address - (code_start + 12)) // 4, 0)
+    main[5] = _ri16(BRSL, (address - (code_start + 20)) // 4, 0)
     if variant == 'calls-materialised':
-        main[4] = _ri18(ILA, address, 5)
+        main[6] = _ri18(ILA, address, 5)
     elif variant == 'calls-pic-materialised':
         # Linked at 0: the immediate is the helper's offset in the image, and
         # the code adds the load delta (`a $r5,$r5,$r126`) before it branches.
-        main[4] = _ri18(ILA, address - base, 5)
+        main[6] = _ri18(ILA, address - base, 5)
     return main, helper, address
 
 
@@ -202,10 +204,11 @@ def _forward_body(base, variant):
     """
     second_arg = (_ri10(LQD, 0, 3, 7) if variant == 'calls-forward-computed'
                   else _ri16(IL, MFC_PUT, 7))
-    main = [_ri16(IL, MFC_GET, 7), 0, second_arg, 0]
+    main = [_ri10(AI, -1, 1, 1), _ri10(STQD, 0, 1, 0),
+            _ri16(IL, MFC_GET, 7), 0, second_arg, 0]
     main += [_ri16(IL, 0x1234, 10), _channel(WRCH, SPU_WrOutMbox, 10)]
     main += [_ri10(LQD, 0, 0, 11), _channel(WRCH, MFC_Cmd, 11)]
-    main.append(_rr(BI, 0, 0, 0))                       # main returns first
+    main += [_ri10(LQD, 0, 1, 0), _ri10(AI, 1, 1, 1), _rr(BI, 0, 0, 0)]
     helper = [_ri10(ORI, 0, 7, 14)]                     # ori $r14, $r7, 0
     helper += [_ri16(IL, 0, 3), _ri16(IL, 0, 4), _ri16(IL, 0x800, 5),
                _ri16(IL, 128, 6), _ri16(IL, 0, 10)]
@@ -215,8 +218,8 @@ def _forward_body(base, variant):
     helper.append(_rr(BI, 0, 0, 0))
     address = base + CODE_START + 4 * len(main)
     code_start = base + CODE_START
-    main[1] = _ri16(BRSL, (address - (code_start + 4)) // 4, 0)
     main[3] = _ri16(BRSL, (address - (code_start + 12)) // 4, 0)
+    main[5] = _ri16(BRSL, (address - (code_start + 20)) // 4, 0)
     return main, helper, address
 
 
@@ -430,7 +433,7 @@ def _flow_body(variant, base):
         emit(_ri16(IL, MFC_GET, 8), (BRSL, 'helper', 8))
         emit(_rr(BI, 0, 0, 0))
         label('helper')
-        emit(_channel(WRCH, MFC_Cmd, 8), _rr(BI, 0, 0, 0))
+        emit(_channel(WRCH, MFC_Cmd, 8), _rr(BI, ra=8))
     elif variant == 'flow-extra-entry':
         # The site's chunk start is a manifest extra entry point: code can
         # enter there without the preceding immediate running.

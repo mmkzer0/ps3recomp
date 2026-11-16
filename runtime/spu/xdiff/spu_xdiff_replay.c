@@ -26,6 +26,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+#include <direct.h>
+#define XDIFF_MKDIR(path) _mkdir(path)
+#else
+#include <sys/stat.h>
+#define XDIFF_MKDIR(path) mkdir(path, 0777)
+#endif
+
 int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx);
 
 /* The image id the interpreter's 0xA70 taskset hook is tied to (spu_interp.c); with policy_mode it is
@@ -97,6 +105,7 @@ static void copy16(uint8_t* dst, const uint8_t* src, uint32_t avail)
 /* ---- the replay state ----------------------------------------------------- */
 
 struct poison_run;
+struct function_capture;
 
 typedef struct replay {
     const spu_xdiff_fixture* f;
@@ -108,7 +117,8 @@ typedef struct replay {
     uint64_t budget;     /* T0 instruction budget; 0: none */
     uint64_t spent;
     int      over_budget;
-    struct poison_run* poison;   /* the poison run's state, NULL for a plain replay */
+    struct poison_run* poison;       /* the poison run's state, NULL for a plain replay */
+    struct function_capture* capture; /* captures per-call entry/exit states during T0 */
 } replay;
 
 struct spu_xdiff_shadow {
@@ -294,6 +304,41 @@ typedef struct poison_run {
     uint8_t*             ls_touched;    /* one bit per byte of local store that was poisoned */
 } poison_run;
 
+#define FUNCTION_CAPTURE_UNIT_CAP 64u
+#define FUNCTION_CAPTURE_STACK_CAP 65536u
+
+typedef struct function_call_frame {
+    uint32_t target;
+    uint32_t ret;
+    uint32_t link_reg;
+    uint32_t slot; /* FUNCTION_CAPTURE_UNIT_CAP when this call is not captured */
+    int entered;
+} function_call_frame;
+
+typedef struct function_capture_state {
+    uint8_t registers[SPU_XDIFF_REG_BYTES];
+    uint8_t* local_store;
+    uint32_t r1;
+} function_capture_state;
+
+typedef struct function_capture {
+    const spu_xdiff_fixture* source;
+    const spu_xdiff_poison_fn* plan_function;
+    uint32_t entry;
+    const char* out_dir;
+    function_call_frame* stack;
+    uint32_t depth;
+    uint32_t after_return;
+    uint32_t return_reg;
+    uint32_t started;
+    uint32_t written;
+    int overflow;
+    int failed;
+    char error[256];
+    function_capture_state states[FUNCTION_CAPTURE_UNIT_CAP];
+    spu_xdiff_fixture fixture;
+} function_capture;
+
 static uint32_t ls_word(const spu_context* ctx, uint32_t a)
 {
     return be32(ctx->ls + (a & (uint32_t)SPU_LS_MASK & ~3u));
@@ -394,6 +439,155 @@ static void poison_step(poison_run* p, spu_context* ctx, uint32_t pc)
     if ((op11 == 0x1A8u || (op11 >= 0x128u && op11 <= 0x12Bu)) && ((w >> 7) & 0x7Fu) == 0) p->after_return = 1;
 }
 
+static void function_capture_fail(function_capture* capture, const char* message)
+{
+    if (capture->failed) return;
+    capture->failed = 1;
+    snprintf(capture->error, sizeof capture->error, "%s", message ? message : "function capture failed");
+}
+
+static void function_capture_write(function_capture* capture, uint32_t slot, spu_context* ctx,
+                                   uint32_t return_pc)
+{
+    function_capture_state* state = &capture->states[slot];
+    spu_xdiff_fixture* f = &capture->fixture;
+    spu_xdiff_error error;
+    if (!state->local_store) {
+        function_capture_fail(capture, "function entry state was not captured");
+        return;
+    }
+    spu_xdiff_fixture_clear(f);
+    f->identity = capture->source->identity;
+    f->unit.kind = (uint32_t)SPU_XDIFF_UNIT_FUNCTION;
+    f->unit.entry_pc = capture->entry;
+    f->unit.return_ls = return_pc;
+    f->unit.image_ls = capture->source->unit.image_ls;
+    f->unit.image_bytes = capture->source->unit.image_bytes;
+    f->unit.r1 = state->r1;
+    f->function_mask.live_out[0] = ~capture->plan_function->dead[0];
+    f->function_mask.live_out[1] = ~capture->plan_function->dead[1];
+    f->function_mask.dead_stack_bytes = capture->plan_function->stack_to;
+    memcpy(f->reg0, state->registers, sizeof f->reg0);
+    memcpy(f->ls0, state->local_store, SPU_LS_SIZE);
+    for (uint32_t reg = 0; reg < 128u; reg++)
+        gpr_to_guest(&ctx->gpr[reg], f->reg1 + 16u * reg);
+    memcpy(f->ls1, ctx->ls, SPU_LS_SIZE);
+    f->end.end_class = (uint32_t)SPU_XDIFF_END_RETURN;
+
+    const size_t dir_bytes = strlen(capture->out_dir);
+    if (dir_bytes > SIZE_MAX - 64u) {
+        function_capture_fail(capture, "capture output path is too long");
+        return;
+    }
+    char* path = (char*)malloc(dir_bytes + 64u);
+    if (!path) {
+        function_capture_fail(capture, "out of memory for the function fixture path");
+        return;
+    }
+    const char* separator = dir_bytes &&
+        (capture->out_dir[dir_bytes - 1] == '/' || capture->out_dir[dir_bytes - 1] == '\\') ? "" : "/";
+    const int n = snprintf(path, dir_bytes + 64u, "%s%s%016llx-f%08x-c%02u.spujob",
+                           capture->out_dir, separator,
+                           (unsigned long long)f->identity.image_fingerprint,
+                           capture->entry, slot);
+    if (n < 0 || (size_t)n >= dir_bytes + 64u) {
+        free(path);
+        function_capture_fail(capture, "capture output path is too long");
+        return;
+    }
+    if (spu_xdiff_fixture_write(f, path, &error) != 0) {
+        snprintf(capture->error, sizeof capture->error, "%s", error.detail);
+        capture->failed = 1;
+    } else {
+        capture->written++;
+    }
+    free(path);
+}
+
+static void function_capture_enter(function_capture* capture, function_call_frame* frame,
+                                   spu_context* ctx)
+{
+    if (frame->target != capture->entry || capture->started >= FUNCTION_CAPTURE_UNIT_CAP) return;
+    const uint32_t slot = capture->started++;
+    function_capture_state* state = &capture->states[slot];
+    if (!state->local_store) state->local_store = (uint8_t*)malloc(SPU_LS_SIZE);
+    if (!state->local_store) {
+        function_capture_fail(capture, "out of memory for the function entry local store");
+        return;
+    }
+    state->r1 = ctx->gpr[1]._u32[0];
+    for (uint32_t reg = 0; reg < 128u; reg++)
+        gpr_to_guest(&ctx->gpr[reg], state->registers + 16u * reg);
+    memcpy(state->local_store, ctx->ls, SPU_LS_SIZE);
+    frame->slot = slot;
+}
+
+/* The instruction observer supplies function boundaries only after a call has
+ * transferred to its target and after a link-register branch returned. */
+static void function_capture_step(function_capture* capture, spu_context* ctx, uint32_t pc)
+{
+    if (capture->failed) return;
+    pc &= (uint32_t)SPU_LS_MASK & ~3u;
+    if (capture->after_return) {
+        capture->after_return = 0;
+        for (uint32_t k = capture->depth; k > 0; k--) {
+            function_call_frame* frame = &capture->stack[k - 1];
+            if (frame->ret != pc || frame->link_reg != capture->return_reg) continue;
+            const uint32_t slot = frame->slot;
+            capture->depth = k - 1;
+            if (slot < FUNCTION_CAPTURE_UNIT_CAP)
+                function_capture_write(capture, slot, ctx, pc);
+            break;
+        }
+    }
+    if (capture->depth) {
+        function_call_frame* frame = &capture->stack[capture->depth - 1];
+        if (!frame->entered && frame->target == pc) {
+            frame->entered = 1;
+            function_capture_enter(capture, frame, ctx);
+        }
+    }
+
+    const uint32_t w = ls_word(ctx, pc);
+    const uint32_t op9 = w >> 23;
+    const uint32_t link_reg = w & 0x7Fu;
+    const int32_t rel = (int32_t)(int16_t)((w >> 7) & 0xFFFFu) * 4;
+    uint32_t target = 0;
+    int call = 0;
+    if (op9 == 0x066u) {
+        target = (uint32_t)((int32_t)pc + rel);
+        call = 1;
+    } else if (op9 == 0x062u) {
+        target = (uint32_t)rel;
+        call = 1;
+    } else if ((w >> 21) == 0x1A9u) {
+        target = ctx->gpr[(w >> 7) & 0x7Fu]._u32[0];
+        call = 1;
+    }
+    if (call) {
+        target &= (uint32_t)SPU_LS_MASK & ~3u;
+        if (target != ((pc + 4u) & (uint32_t)SPU_LS_MASK)) {
+            if (capture->depth >= FUNCTION_CAPTURE_STACK_CAP) {
+                capture->overflow = 1;
+                function_capture_fail(capture, "observer call stack exceeds 65536 frames");
+            } else {
+                function_call_frame* frame = &capture->stack[capture->depth++];
+                frame->target = target;
+                frame->ret = (pc + 4u) & (uint32_t)SPU_LS_MASK;
+                frame->link_reg = link_reg;
+                frame->slot = FUNCTION_CAPTURE_UNIT_CAP;
+                frame->entered = 0;
+            }
+        }
+        return;
+    }
+    const uint32_t op11 = w >> 21;
+    if (op11 == 0x1A8u || (op11 >= 0x128u && op11 <= 0x12Bu)) {
+        capture->after_return = 1;
+        capture->return_reg = (w >> 7) & 0x7Fu;
+    }
+}
+
 /* The state a run leaves is the fixture's, except where poison nobody read is still sitting: those
  * registers and bytes still hold the pattern, and take the fixture's value for the comparison. State the
  * poison reached anywhere else has no such value and differs. */
@@ -421,6 +615,7 @@ static int observe_insn(void* user, spu_context* ctx, uint32_t pc)
         r->spent++;
     }
     if (r->poison) poison_step(r->poison, ctx, pc);
+    if (r->capture) function_capture_step(r->capture, ctx, pc);
     return 0;
 }
 
@@ -500,28 +695,37 @@ static uint32_t compare_end(const spu_xdiff_fixture* f, const spu_context* ctx, 
     return verdict_of(out, SPU_XDIFF_R_NONE);
 }
 
-/* The subject's body id. A lifted subject's lift identity is the one its registration declares, which is
- * the image's inventory (the capture's rule, xdiff_capture.cpp): no inventory leaves code_end and
- * lift_options 0, the documented "none" (spu_xdiff.h), and is also what T0 and T3 report. */
-static void set_subject_body(spu_xdiff_body_id* body, uint32_t tier, const spu_xdiff_fixture* f)
+/* The subject's body id comes from the image registration, including the T2 native revision. */
+static uint32_t set_subject_body(spu_xdiff_body_id* body, uint32_t tier, const spu_xdiff_fixture* f)
 {
     body->tier = (uint8_t)tier;
-    if ((tier & SPU_TIER_MASK) != (uint32_t)SPU_TIER_LIFTED) return;
-    body->lifter_abi = SPU_RUNTIME_LIFTER_ABI;   /* every registered lift passed the ABI gate */
-    spu_workload_inventory inv;
-    if (spu_workload_find_inventory(f->identity.image_fingerprint, &inv)) {
-        body->code_end = inv.code_end;
-        body->lift_options = inv.lift_options;
+    if ((tier & SPU_TIER_MASK) == (uint32_t)SPU_TIER_LIFTED) {
+        uint8_t registered_tier = 0;
+        uint64_t native_rev = 0;
+        if (spu_workload_find_body_identity(f->identity.image_fingerprint, &registered_tier, &native_rev)) {
+            body->tier = registered_tier;
+            body->native_rev = native_rev;
+        }
     }
+    const uint32_t body_tier = body->tier & SPU_TIER_MASK;
+    if (body_tier == (uint32_t)SPU_TIER_LIFTED || body_tier == (uint32_t)SPU_TIER_PARTIAL) {
+        body->lifter_abi = SPU_RUNTIME_LIFTER_ABI;   /* every registered lift passed the ABI gate */
+        spu_workload_inventory inv;
+        if (spu_workload_find_inventory(f->identity.image_fingerprint, &inv)) {
+            body->code_end = inv.code_end;
+            body->lift_options = inv.lift_options;
+        }
+    }
+    return body->tier;
 }
 
-/* One replay. `poison` is the poison run's state, NULL for a plain replay (spu_xdiff_replay). */
-static uint32_t replay_core(const spu_xdiff_fixture* f, const spu_xdiff_replay_options* opt, spu_xdiff_shadow* s,
-                            spu_xdiff_verdict_record* out, poison_run* poison)
+static uint32_t replay_core(const spu_xdiff_fixture* f, const spu_xdiff_replay_options* opt,
+                            spu_xdiff_shadow* s, spu_xdiff_verdict_record* out,
+                            poison_run* poison, function_capture* capture)
 {
     memset(out, 0, sizeof *out);
     out->effect_index = SPU_XDIFF_NO_EFFECT;
-    set_subject_body(&out->subject_body, opt->subject_tier, f);
+    const uint32_t subject_tier = set_subject_body(&out->subject_body, opt->subject_tier, f);
 
     /* Refused knobs are the caller's to report (spu_job_replay_main exits 1): no verdict. */
     if (spu_xdiff_refused_knob() != NULL) {
@@ -540,10 +744,9 @@ static uint32_t replay_core(const spu_xdiff_fixture* f, const spu_xdiff_replay_o
      * are unchanged (section 9), and a difference of members is the census test's to catch. */
     if (f->identity.context_census != spu_xdiff_context_census() && !(poison && poison->runs > 1))
         PS3_LOG(PS3_LOG_INFO, "spu-xdiff", "the fixture was recorded under spu_context census 0x%08X; this build's is 0x%08X\n", (unsigned)f->identity.context_census, (unsigned)spu_xdiff_context_census());
-    const uint32_t match = spu_xdiff_match_for(f->identity.authority.tier, opt->subject_tier);
+    const uint32_t match = spu_xdiff_match_for(f->identity.authority.tier, subject_tier);
     out->match = match;
-    /* Contract matching (a pair with native code) is not built here: no pair of this runner has it, and a
-     * same-program verdict for it would be a false answer. */
+    /* T3 contract matching is not built here; no pair of this runner has it. */
     if (match != (uint32_t)SPU_XDIFF_MATCH_PROGRAM) return verdict_of(out, SPU_XDIFF_R_NOT_COMPARABLE);
 
     void (*entry)(spu_context*) = entry_interp;
@@ -585,9 +788,10 @@ static uint32_t replay_core(const spu_xdiff_fixture* f, const spu_xdiff_replay_o
     if (twin) {
         ctx->budget = opt->budget;   /* the twin counts it down at every transfer that can close a loop */
         out->budget = opt->budget;
-    } else if (image_id < 0 && (opt->budget || poison)) {
+    } else if (image_id < 0 && (opt->budget || poison || capture)) {
         r->budget = opt->budget;
         r->poison = poison;
+        r->capture = capture;
         if (opt->budget) out->budget = opt->budget;
         s->obs.user = r;
         s->obs.on_insn = observe_insn;
@@ -647,7 +851,7 @@ static uint32_t replay_core(const spu_xdiff_fixture* f, const spu_xdiff_replay_o
 uint32_t spu_xdiff_replay(const spu_xdiff_fixture* f, const spu_xdiff_replay_options* opt,
                           spu_xdiff_shadow* s, spu_xdiff_verdict_record* out)
 {
-    return replay_core(f, opt, s, out, NULL);
+    return replay_core(f, opt, s, out, NULL, NULL);
 }
 
 /* ---- the poison run ----------------------------------------------------------------- */
@@ -707,7 +911,7 @@ static uint32_t poison_once(const spu_xdiff_fixture* f, const spu_xdiff_replay_o
                             spu_xdiff_verdict_record* out, poison_run* p, int apply)
 {
     poison_reset(p, apply);
-    const uint32_t v = replay_core(f, opt, s, out, p);
+    const uint32_t v = replay_core(f, opt, s, out, p, NULL);
     if (v == (uint32_t)SPU_XDIFF_EQUAL && p->overflow) {
         PS3_LOG(PS3_LOG_INFO, "spu-xdiff", "the poison run tracks at most %u open calls of listed functions\n", POISON_STACK_CAP);
         return verdict_of(out, SPU_XDIFF_R_CAPTURE_LIMIT);
@@ -1229,5 +1433,226 @@ int spu_xdiff_poison_plan_load(const char* path, spu_xdiff_poison_plan* out, cha
     }
     free(text);
     fclose(f);
+    return rc;
+}
+
+static uint32_t function_result_reason(spu_xdiff_function_result* out, uint32_t reason)
+{
+    out->reason = reason;
+    out->verdict = spu_xdiff_reason_verdict(reason);
+    return out->verdict;
+}
+
+uint32_t spu_xdiff_replay_function_unit(const spu_xdiff_fixture* f, int native_override,
+                                        spu_xdiff_function_result* out)
+{
+    if (!out) return (uint32_t)SPU_XDIFF_MALFORMED;
+    memset(out, 0, sizeof *out);
+    out->where = SPU_XDIFF_NO_WHERE;
+    out->match = (uint32_t)SPU_XDIFF_MATCH_PROGRAM;
+    if (!f || !f->ls0 || !f->ls1 || native_override < 0 || native_override > 1 ||
+        f->unit.kind != (uint32_t)SPU_XDIFF_UNIT_FUNCTION || f->effect_count || f->blob_bytes ||
+        (f->unit.return_ls & 3u) || f->unit.return_ls > SPU_XDIFF_LS_BYTES - 4u ||
+        f->end.end_class != (uint32_t)SPU_XDIFF_END_RETURN ||
+        f->function_mask.reserved ||
+        (f->function_mask.live_out[0] & (1ULL << 1)) == 0 ||
+        f->function_mask.dead_stack_bytes > f->unit.r1 ||
+        f->unit.r1 > SPU_XDIFF_LS_BYTES)
+        return function_result_reason(out, SPU_XDIFF_R_FIXTURE_FORMAT);
+    if ((f->identity.float_rz != 0) != (spu_float_rz_mode() != 0) ||
+        f->identity.effect_port_abi != SPU_EFFECT_PORT_ABI)
+        return function_result_reason(out, SPU_XDIFF_R_FIXTURE_IDENTITY);
+    if (!f->unit.image_bytes ||
+        (uint64_t)f->unit.image_ls + f->unit.image_bytes > SPU_XDIFF_LS_BYTES)
+        return function_result_reason(out, SPU_XDIFF_R_FIXTURE_FORMAT);
+    if (spu_workload_fingerprint(f->ls0 + f->unit.image_ls, f->unit.image_bytes) !=
+        f->identity.image_fingerprint)
+        return function_result_reason(out, SPU_XDIFF_R_FIXTURE_IDENTITY);
+
+    int image_id = 0;
+    if (!spu_workload_find_img(f->identity.image_fingerprint, &image_id))
+        return function_result_reason(out, SPU_XDIFF_R_NO_BODY);
+    uint8_t registered_tier = (uint8_t)SPU_TIER_LIFTED;
+    (void)spu_workload_find_body_identity(f->identity.image_fingerprint, &registered_tier, NULL);
+    if (native_override && (registered_tier & SPU_TIER_MASK) != (uint32_t)SPU_TIER_PARTIAL)
+        return function_result_reason(out, SPU_XDIFF_R_NO_BODY);
+    const uint32_t subject_tier = native_override ? (uint32_t)SPU_TIER_PARTIAL
+                                                   : (uint32_t)SPU_TIER_LIFTED;
+    out->match = spu_xdiff_match_for(f->identity.authority.tier, subject_tier);
+    if (out->match != (uint32_t)SPU_XDIFF_MATCH_PROGRAM)
+        return function_result_reason(out, SPU_XDIFF_R_NOT_COMPARABLE);
+    spu_lifted_fn entry = spu_registered_function_variant(f->unit.entry_pc, image_id, native_override);
+
+    if (!entry) return function_result_reason(out, SPU_XDIFF_R_NO_BODY);
+    spu_xdiff_shadow* shadow = spu_xdiff_shadow_new();
+    if (!shadow) return function_result_reason(out, SPU_XDIFF_R_CAPTURE_LIMIT);
+    spu_context* ctx = &shadow->ctx;
+    spu_context_init(ctx, 0);
+    for (uint32_t reg = 0; reg < 128u; reg++)
+        gpr_from_guest(&ctx->gpr[reg], f->reg0 + 16u * reg);
+    memcpy(ctx->ls, f->ls0, SPU_LS_SIZE);
+    ctx->pc = f->unit.entry_pc;
+    ctx->image_id = image_id;
+
+    spu_run_lifted_leaf(entry, ctx);
+
+    uint8_t actual[16];
+    for (uint32_t reg = 0; reg < 128u; reg++) {
+        gpr_to_guest(&ctx->gpr[reg], actual);
+        const int live = (int)((f->function_mask.live_out[reg >> 6] >> (reg & 63u)) & 1u);
+        if (live && out->reason == (uint32_t)SPU_XDIFF_R_NONE &&
+            memcmp(actual, f->reg1 + 16u * reg, sizeof actual) != 0) {
+            out->where = reg;
+            memcpy(out->want, f->reg1 + 16u * reg, sizeof out->want);
+            memcpy(out->got, actual, sizeof out->got);
+            function_result_reason(out, SPU_XDIFF_R_END_REGS);
+        } else if (!live && reg != 1u &&
+                   memcmp(actual, f->reg1 + 16u * reg, sizeof actual) != 0) {
+            out->dead_registers++;
+        }
+    }
+
+    const uint32_t return_pc = ctx->pc & (uint32_t)SPU_LS_MASK;
+    if (out->reason == (uint32_t)SPU_XDIFF_R_NONE && return_pc != f->unit.return_ls) {
+        const uint32_t want = f->unit.return_ls;
+        out->where = want;
+        for (uint32_t byte = 0; byte < 4u; byte++) {
+            const uint32_t shift = 24u - 8u * byte;
+            out->want[byte] = (uint8_t)(want >> shift);
+            out->got[byte] = (uint8_t)(return_pc >> shift);
+        }
+        function_result_reason(out, SPU_XDIFF_R_END_PC);
+    }
+    if (out->reason == (uint32_t)SPU_XDIFF_R_NONE) {
+        const uint32_t dead_begin = f->unit.r1 - f->function_mask.dead_stack_bytes;
+        for (uint32_t at = 0; at < SPU_LS_SIZE; at++) {
+            if (at >= dead_begin && at < f->unit.r1) continue;
+            if (ctx->ls[at] != f->ls1[at]) {
+                out->where = at;
+                copy16(out->want, f->ls1 + at, SPU_LS_SIZE - at);
+                copy16(out->got, ctx->ls + at, SPU_LS_SIZE - at);
+                function_result_reason(out, SPU_XDIFF_R_END_LS);
+                break;
+            }
+        }
+    }
+    spu_xdiff_shadow_free(shadow);
+    if (out->reason == (uint32_t)SPU_XDIFF_R_NONE) out->verdict = (uint32_t)SPU_XDIFF_EQUAL;
+    return out->verdict;
+}
+
+static const spu_xdiff_poison_fn* function_plan_find(const spu_xdiff_poison_plan* plan, uint32_t entry)
+{
+    uint32_t lo = 0, hi = plan->count;
+    while (lo < hi) {
+        const uint32_t mid = lo + (hi - lo) / 2;
+        if (plan->fn[mid].entry < entry) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo < plan->count && plan->fn[lo].entry == entry ? &plan->fn[lo] : NULL;
+}
+
+static void function_capture_free(function_capture* capture)
+{
+    if (!capture) return;
+    for (uint32_t i = 0; i < FUNCTION_CAPTURE_UNIT_CAP; i++)
+        free(capture->states[i].local_store);
+    free(capture->stack);
+    spu_xdiff_fixture_free(&capture->fixture);
+    free(capture);
+}
+
+int spu_xdiff_capture_function_units(const spu_xdiff_fixture* f,
+                                    const spu_xdiff_poison_plan* plan, uint32_t entry,
+                                    const char* out_dir, uint32_t* captured,
+                                    char* err, size_t err_bytes)
+{
+    if (captured) *captured = 0;
+    if (err && err_bytes) err[0] = 0;
+    if (!f || !f->ls0 || !f->ls1 || !plan || !out_dir || !*out_dir || !captured) {
+        if (err && err_bytes) snprintf(err, err_bytes, "function capture needs a fixture, plan, output directory, and count");
+        return -1;
+    }
+    if (f->unit.kind != (uint32_t)SPU_XDIFF_UNIT_JOB ||
+        (f->identity.authority.tier & SPU_TIER_MASK) != (uint32_t)SPU_TIER_INTERP) {
+        if (err && err_bytes) snprintf(err, err_bytes, "function capture requires a T0 job fixture");
+        return -1;
+    }
+    if (!plan->has_fingerprint) {
+        if (err && err_bytes) snprintf(err, err_bytes, "liveness plan has no image fingerprint");
+        return -1;
+    }
+    if (plan->image_fingerprint != f->identity.image_fingerprint) {
+        if (err && err_bytes) snprintf(err, err_bytes, "liveness plan fingerprint does not match the job fixture");
+        return -1;
+    }
+    if (plan->count && !plan->fn) {
+        if (err && err_bytes) snprintf(err, err_bytes, "liveness plan has a function count but no function records");
+        return -1;
+    }
+    if ((entry & 3u) || entry > SPU_XDIFF_LS_BYTES - 4u) {
+        if (err && err_bytes) snprintf(err, err_bytes, "function entry 0x%x is not a word address in local store",
+                                       (unsigned)entry);
+        return -1;
+    }
+    const spu_xdiff_poison_fn* fn = function_plan_find(plan, entry);
+    if (!fn) {
+        if (err && err_bytes) snprintf(err, err_bytes, "liveness plan has no function at 0x%x", (unsigned)entry);
+        return -1;
+    }
+    if ((fn->dead[0] & (1ULL << 1)) || fn->stack_to > SPU_XDIFF_LS_BYTES) {
+        if (err && err_bytes) snprintf(err, err_bytes, "liveness plan for 0x%x has an invalid dead mask",
+                                       (unsigned)entry);
+        return -1;
+    }
+    if (XDIFF_MKDIR(out_dir) != 0 && errno != EEXIST) {
+        if (err && err_bytes) snprintf(err, err_bytes, "%s: cannot create output directory: %s",
+                                       out_dir, strerror(errno));
+        return -1;
+    }
+
+    function_capture* capture = (function_capture*)calloc(1, sizeof *capture);
+    if (!capture) {
+        if (err && err_bytes) snprintf(err, err_bytes, "out of memory for function capture");
+        return -1;
+    }
+    capture->source = f;
+    capture->plan_function = fn;
+    capture->entry = entry;
+    capture->out_dir = out_dir;
+    capture->stack = (function_call_frame*)calloc(FUNCTION_CAPTURE_STACK_CAP, sizeof *capture->stack);
+    if (!capture->stack || spu_xdiff_fixture_init(&capture->fixture) != 0) {
+        if (err && err_bytes) snprintf(err, err_bytes, "out of memory for the function capture state");
+        function_capture_free(capture);
+        return -1;
+    }
+
+    spu_xdiff_shadow* shadow = spu_xdiff_shadow_new();
+    if (!shadow) {
+        if (err && err_bytes) snprintf(err, err_bytes, "out of memory for the T0 capture context");
+        function_capture_free(capture);
+        return -1;
+    }
+    spu_xdiff_replay_options options = { (uint32_t)SPU_TIER_INTERP, 0 };
+    spu_xdiff_verdict_record verdict;
+    const uint32_t replay_verdict = replay_core(f, &options, shadow, &verdict, NULL, capture);
+    spu_xdiff_shadow_free(shadow);
+
+    int rc = 0;
+    if (capture->failed) {
+        if (err && err_bytes) snprintf(err, err_bytes, "%s", capture->error);
+        rc = -1;
+    } else if (replay_verdict != (uint32_t)SPU_XDIFF_EQUAL) {
+        if (err && err_bytes)
+            snprintf(err, err_bytes, "T0 source replay is %s / %s",
+                     spu_xdiff_verdict_id(replay_verdict), spu_xdiff_reason_id(verdict.reason));
+        rc = -1;
+    } else if (capture->started != capture->written) {
+        if (err && err_bytes) snprintf(err, err_bytes, "one or more captured calls did not return");
+        rc = -1;
+    } else {
+        *captured = capture->written;
+    }
+    function_capture_free(capture);
     return rc;
 }

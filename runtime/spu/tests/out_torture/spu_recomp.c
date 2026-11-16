@@ -141,27 +141,27 @@ void spu_func_00000120(spu_context* ctx) {
 }
 
 /* Function table */
-typedef struct { uint32_t addr; void (*func)(spu_context*); const char* name; } spu_func_entry;
+typedef struct { uint32_t addr; void (*func)(spu_context*); void (*reference)(spu_context*); int native_override; const char* name; } spu_func_entry;
 static const spu_func_entry spu_function_table[] = {
-    { 0x00000000u, spu_func_00000000, "spu_func_00000000" },
-    { 0x00000018u, spu_func_00000018, "spu_func_00000018" },
-    { 0x00000024u, spu_func_00000024, "spu_func_00000024" },
-    { 0x0000003Cu, spu_func_0000003C, "spu_func_0000003C" },
-    { 0x00000048u, spu_func_00000048, "spu_func_00000048" },
-    { 0x00000060u, spu_func_00000060, "spu_func_00000060" },
-    { 0x0000006Cu, spu_func_0000006C, "spu_func_0000006C" },
-    { 0x00000084u, spu_func_00000084, "spu_func_00000084" },
-    { 0x00000090u, spu_func_00000090, "spu_func_00000090" },
-    { 0x000000B0u, spu_func_000000B0, "spu_func_000000B0" },
-    { 0x000000BCu, spu_func_000000BC, "spu_func_000000BC" },
-    { 0x000000DCu, spu_func_000000DC, "spu_func_000000DC" },
-    { 0x000000E8u, spu_func_000000E8, "spu_func_000000E8" },
-    { 0x000000F0u, spu_func_000000F0, "spu_func_000000F0" },
-    { 0x00000100u, spu_func_00000100, "spu_func_00000100" },
-    { 0x00000108u, spu_func_00000108, "spu_func_00000108" },
-    { 0x00000114u, spu_func_00000114, "spu_func_00000114" },
-    { 0x00000120u, spu_func_00000120, "spu_func_00000120" },
-    { 0, NULL, NULL }
+    { 0x00000000u, spu_func_00000000, spu_func_00000000, 0, "spu_func_00000000" },
+    { 0x00000018u, spu_func_00000018, spu_func_00000018, 0, "spu_func_00000018" },
+    { 0x00000024u, spu_func_00000024, spu_func_00000024, 0, "spu_func_00000024" },
+    { 0x0000003Cu, spu_func_0000003C, spu_func_0000003C, 0, "spu_func_0000003C" },
+    { 0x00000048u, spu_func_00000048, spu_func_00000048, 0, "spu_func_00000048" },
+    { 0x00000060u, spu_func_00000060, spu_func_00000060, 0, "spu_func_00000060" },
+    { 0x0000006Cu, spu_func_0000006C, spu_func_0000006C, 0, "spu_func_0000006C" },
+    { 0x00000084u, spu_func_00000084, spu_func_00000084, 0, "spu_func_00000084" },
+    { 0x00000090u, spu_func_00000090, spu_func_00000090, 0, "spu_func_00000090" },
+    { 0x000000B0u, spu_func_000000B0, spu_func_000000B0, 0, "spu_func_000000B0" },
+    { 0x000000BCu, spu_func_000000BC, spu_func_000000BC, 0, "spu_func_000000BC" },
+    { 0x000000DCu, spu_func_000000DC, spu_func_000000DC, 0, "spu_func_000000DC" },
+    { 0x000000E8u, spu_func_000000E8, spu_func_000000E8, 0, "spu_func_000000E8" },
+    { 0x000000F0u, spu_func_000000F0, spu_func_000000F0, 0, "spu_func_000000F0" },
+    { 0x00000100u, spu_func_00000100, spu_func_00000100, 0, "spu_func_00000100" },
+    { 0x00000108u, spu_func_00000108, spu_func_00000108, 0, "spu_func_00000108" },
+    { 0x00000114u, spu_func_00000114, spu_func_00000114, 0, "spu_func_00000114" },
+    { 0x00000120u, spu_func_00000120, spu_func_00000120, 0, "spu_func_00000120" },
+    { 0, NULL, NULL, 0, NULL }
 };
 
 void spu_recomp_register(void) {

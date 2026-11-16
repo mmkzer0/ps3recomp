@@ -43,10 +43,10 @@ void spu_func_00000000(spu_context* ctx) {
 }
 
 /* Function table */
-typedef struct { uint32_t addr; void (*func)(spu_context*); const char* name; } spu_func_entry;
+typedef struct { uint32_t addr; void (*func)(spu_context*); void (*reference)(spu_context*); int native_override; const char* name; } spu_func_entry;
 static const spu_func_entry spu_function_table[] = {
-    { 0x00000000u, spu_func_00000000, "spu_func_00000000" },
-    { 0, NULL, NULL }
+    { 0x00000000u, spu_func_00000000, spu_func_00000000, 0, "spu_func_00000000" },
+    { 0, NULL, NULL, 0, NULL }
 };
 
 void spu_recomp_register(void) {

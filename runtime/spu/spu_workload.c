@@ -9,6 +9,7 @@
 #define _GNU_SOURCE
 #endif
 #include "spu_workload.h"
+#include "spu_xdiff.h"       /* SPU_TIER_LIFTED default and registered tier ids */
 #include "spu_lifted_job.h"   /* spu_run_lifted_job */
 #include "../ps3_log.h"      /* ps3_log_verbose */
 #include <stdio.h>
@@ -81,6 +82,8 @@ typedef struct {
     spu_lifted_entry_fn fn;
     int                 image_id;
     const char*         name;
+    uint8_t             body_tier;  /* spu_job_tier; default is SPU_TIER_LIFTED */
+    uint64_t            native_rev; /* the revision of a T2/T3 body; otherwise 0 */
     /* Masked registrations only (var_len != 0): the image is `size` bytes and
      * its fingerprint takes [var_off, var_off + var_len) as zero. */
     uint32_t            size, var_off, var_len;
@@ -102,10 +105,12 @@ void spu_workload_register_img(uint64_t fingerprint, spu_lifted_entry_fn fn,
     if (!fn) return;
     for (unsigned i = 0; i < s_registry_count; i++) {
         if (s_registry[i].fp == fingerprint) {     /* idempotent on fingerprint */
-            s_registry[i].fn       = fn;
-            s_registry[i].image_id = image_id;
-            s_registry[i].name     = name;
-            s_registry[i].twin_fn  = NULL;         /* a twin belongs to the body it was registered for */
+            s_registry[i].fn        = fn;
+            s_registry[i].image_id  = image_id;
+            s_registry[i].name      = name;
+            s_registry[i].body_tier = (uint8_t)SPU_TIER_LIFTED;
+            s_registry[i].native_rev = 0;
+            s_registry[i].twin_fn   = NULL;        /* a twin belongs to the body it was registered for */
             s_registry[i].promoted = 0;            /* so does the evidence that promoted it */
             return;
         }
@@ -114,11 +119,36 @@ void spu_workload_register_img(uint64_t fingerprint, spu_lifted_entry_fn fn,
         PS3_LOG(PS3_LOG_INFO, "spu_workload", "registry full (%u); dropping '%s'\n", SPU_WORKLOAD_MAX, name ? name : "?");
         return;
     }
-    s_registry[s_registry_count].fp       = fingerprint;
-    s_registry[s_registry_count].fn       = fn;
-    s_registry[s_registry_count].image_id = image_id;
-    s_registry[s_registry_count].name     = name;
+    s_registry[s_registry_count].fp        = fingerprint;
+    s_registry[s_registry_count].fn        = fn;
+    s_registry[s_registry_count].image_id  = image_id;
+    s_registry[s_registry_count].name      = name;
+    s_registry[s_registry_count].body_tier = (uint8_t)SPU_TIER_LIFTED;
+    s_registry[s_registry_count].native_rev = 0;
     s_registry_count++;
+}
+
+void spu_workload_set_body_identity(uint64_t fingerprint, uint8_t tier, uint64_t native_rev)
+{
+    for (unsigned i = 0; i < s_registry_count; i++)
+        if (s_registry[i].fp == fingerprint) {
+            s_registry[i].body_tier = tier;
+            s_registry[i].native_rev = native_rev;
+            return;
+        }
+    fprintf(stderr, "[spu_workload] body identity for unregistered image 0x%016llX\n",
+            (unsigned long long)fingerprint);
+}
+
+int spu_workload_find_body_identity(uint64_t fingerprint, uint8_t* tier, uint64_t* native_rev)
+{
+    for (unsigned i = 0; i < s_registry_count; i++)
+        if (s_registry[i].fp == fingerprint) {
+            if (tier) *tier = s_registry[i].body_tier;
+            if (native_rev) *native_rev = s_registry[i].native_rev;
+            return 1;
+        }
+    return 0;
 }
 
 void spu_workload_register(uint64_t fingerprint, spu_lifted_entry_fn fn,

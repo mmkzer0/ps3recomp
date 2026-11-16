@@ -100,7 +100,7 @@ class Pipeline(unittest.TestCase):
         workload = workload[workload.index('uint64_t spu_workload_fingerprint('):
                             workload.index('/* ---- dispatch')]
         (self.root / 'workload.c').write_text(
-            '#include "spu_workload.h"\n#include "ps3emu/lifter_abi.h"\n'
+            '#include "spu_workload.h"\n#include "spu_xdiff.h"\n#include "ps3emu/lifter_abi.h"\n'
             '#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n'
             'void ps3_spu_lifter_abi_check(uint32_t got) { '
             'if (got != SPU_RUNTIME_LIFTER_ABI) abort(); }\n' + workload)
@@ -109,7 +109,7 @@ class Pipeline(unittest.TestCase):
                             channels.index('/* Which image registered')]
         # SPU_TLS is defined earlier in spu_channels.c, outside the extracted block.
         tls = '#if defined(_MSC_VER)\n#define SPU_TLS __declspec(thread)\n#else\n#define SPU_TLS __thread\n#endif\n'
-        (self.root / 'registry.c').write_text('#include "spu_context.h"\n#include <stdio.h>\n' + tls + channels)
+        (self.root / 'registry.c').write_text('#include "spu_interp.h"\n#include <stdio.h>\n' + tls + channels)
         return runtime
 
     def test_exact_dedup_and_same_address_isolation(self):
@@ -697,6 +697,12 @@ class Pipeline(unittest.TestCase):
                          'code_end=0x16168;extra=0xb00;merge_chunks=1;return_entries=1')
         self.assertNotEqual(lift_options_digest(lift_options_string(None, [], False, link_base=0)),
                             lift_options_digest(lift_options_string(None, [], False)))
+        self.assertEqual(
+            lift_options_string(None, [], False, overrides=['0x200=second', '0x40=first']),
+            'overrides=0x40=first,0x200=second')
+        self.assertNotEqual(lift_options_digest(lift_options_string(None, [], False)),
+                            lift_options_digest(lift_options_string(
+                                None, [], False, overrides=['0x40=first'])))
 
     def test_raw_link_base_refuses_call_sites_for_an_image_relative_address_taken_entry(self):
         _, build_raw_job = raw_job_tools()
@@ -952,7 +958,7 @@ class Pipeline(unittest.TestCase):
         from gen_test_raw_job import CODE_START
         RAW_BASE, build_raw_job = raw_job_tools()
         blob = build_raw_job(variant='calls')
-        returns = [RAW_BASE + CODE_START + 8, RAW_BASE + CODE_START + 16]
+        returns = [RAW_BASE + CODE_START + 16, RAW_BASE + CODE_START + 24]
 
         def lift(**overrides):
             result = self.run_raw([self.raw_entry(blob, name='raw-return-entries.bin',
@@ -987,6 +993,88 @@ class Pipeline(unittest.TestCase):
                                              return_entries=False)])
         self.assertEqual(self.manifest()['programs'][0]['return_entries'], False)
 
+    def function_raw_image(self):
+        generator = TOOLS.parent / 'runtime' / 'spu' / 'tests' / 'gen_xdiff_function_job.py'
+        output = self.root / 'function-source'
+        result = subprocess.run([sys.executable, str(generator), str(output)],
+                                capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        return (output / 'fn_override_job.bin').read_bytes()
+
+    def test_raw_native_override_reaches_lifter_and_registration(self):
+        raw_base, _ = raw_job_tools()
+        function = raw_base + 0x70
+        blob = self.function_raw_image()
+        entry = self.raw_entry(blob, name='raw-native.bin',
+                               extra_entry_points=[hex(raw_base + 0x40)],
+                               overrides=[f'{hex(function)}=test_fn_override'],
+                               native_rev='0x1234')
+        result = self.run_raw([entry])
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        program = self.manifest()['programs'][0]
+        self.assertEqual(program['overrides'], [f'0x{function:x}=test_fn_override'])
+        self.assertEqual(program['native_rev'], 0x1234)
+        self.assertEqual(program['lift_options_string'],
+                         f'extra=0x{raw_base + 0x40:x};overrides=0x{function:x}=test_fn_override')
+        starts = {start for start, _end in program['diagnostics']['functions']}
+        self.assertIn(function, starts)
+        source = (self.output / program['name'] / 'spu_recomp.c').read_text()
+        self.assertIn('test_fn_override(ctx)', source)
+        self.assertIn('test_fn_override,', source)
+        self.assertIn('spu_func_00007C70', source)
+        registry = (self.output / 'spu_workloads.c').read_text()
+        self.assertIn('SPU_TIER_PARTIAL', registry)
+        self.assertIn('0x0000000000001234ULL', registry)
+
+    def test_pipeline_rechecks_override_assumptions_before_registration(self):
+        from gen_test_raw_job import AI, BI, BR, LQD, NOP, STQD, _ri10, _ri16, _rr
+
+        base, _ = raw_job_tools()
+        words = [_rr(NOP)] * (0x5C // 4)
+        words[0] = _ri16(BR, 0x40 // 4)
+        words[0x40 // 4:] = [
+            _ri10(STQD, 1, 1, 0), _ri10(AI, -32, 1, 1),
+            _ri10(LQD, 0, 3, 5), _rr(0x144, rb=4, ra=5, rt=7),
+            _ri10(LQD, 3, 1, 0), _ri10(AI, 32, 1, 1), _rr(BI, ra=0),
+        ]
+        blob = b''.join(struct.pack('>I', word) for word in words)
+        # An alternate generator omits the override admission gate. Registration
+        # must enforce the toolkit's contract independently of that subprocess.
+        alternate = self.root / 'unchecked_lifter.py'
+        alternate.write_text(
+            'import subprocess, sys\n'
+            'args = list(sys.argv[1:])\n'
+            'while "--override" in args:\n'
+            '    index = args.index("--override")\n'
+            '    del args[index:index + 2]\n'
+            f'command = [sys.executable, {str(TOOLS / "spu_lifter.py")!r}, *args]\n'
+            'raise SystemExit(subprocess.run(command, check=False).returncode)\n')
+        result = self.run_raw([self.raw_entry(
+            blob, name='private-link.bin', extra_entry_points=[hex(base + 0x40)],
+            overrides=[f'{hex(base + 0x40)}=native_private'], native_rev='0x1234')],
+            '--lifter', str(alternate))
+        self.assertNotEqual(result.returncode, 0)
+        program = self.manifest()['programs'][0]
+        self.assertEqual(program['status'], 'unsupported')
+        self.assertIn('return proof requires spu-abi-link-slot-private', program['reason'])
+        self.assertFalse((self.output / 'spu_workloads.c').exists())
+
+    def test_raw_override_requires_native_revision(self):
+        raw_base, _ = raw_job_tools()
+        function = raw_base + 0x70
+        blob = self.function_raw_image()
+        cases = [
+            ({'overrides': [f'{hex(function)}=native_fn']}, 'native_rev must be nonzero'),
+            ({'native_rev': '0x1234'}, 'native_rev requires at least one override'),
+            ({'overrides': 'not-a-list'}, 'overrides must be a list'),
+        ]
+        for fields, message in cases:
+            with self.subTest(fields=fields):
+                result = self.run_raw([self.raw_entry(blob, name='raw-native-invalid.bin', **fields)])
+                self.assertNotEqual(result.returncode, 0)
+                report = self.manifest()
+                self.assertTrue(any(message in error for error in report['errors']), report['errors'])
+
     def test_raw_manifest_flags_must_be_booleans(self):
         _, build_raw_job = raw_job_tools()
         blob = build_raw_job()
@@ -1001,12 +1089,61 @@ class Pipeline(unittest.TestCase):
                     self.assertTrue(any(field in error and 'must be a boolean' in error
                                         for error in report['errors']), report['errors'])
 
+    def test_raw_link_base_vetoes_relative_epilogue_immediates(self):
+        from gen_test_raw_job import (
+            AI,
+            BI,
+            BR,
+            IL,
+            LQD,
+            LS_BASE,
+            NOP,
+            STQD,
+            _ri10,
+            _ri16,
+            _rr,
+        )
+        for link_base in (0, 0x1000):
+            with self.subTest(link_base=link_base):
+                words = [_rr(NOP)] * (0x78 // 4)
+                words[0] = _ri16(BR, 0x40 // 4)
+                words[0x40 // 4:0x40 // 4 + 3] = [
+                    _ri10(STQD, 1, 1, 0), _ri10(AI, -32, 1, 1),
+                    _ri16(BR, (0x60 - 0x48) // 4),
+                ]
+                words[0x60 // 4:0x60 // 4 + 3] = [
+                    _ri10(LQD, 3, 1, 0), _ri10(AI, 32, 1, 1), _rr(BI, ra=0),
+                ]
+                words[0x70 // 4:0x70 // 4 + 2] = [
+                    _ri16(IL, link_base + 0x60, 3), _rr(BI, ra=0),
+                ]
+                blob = b''.join(struct.pack('>I', word) for word in words)
+                site = LS_BASE + 0x68
+                # With no linked-base metadata the immediate cannot name the
+                # epilogue. The positive control proves direct inheritance.
+                result = self.run_raw([self.raw_entry(blob, name='split-frame.bin')])
+                self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+                program = self.manifest()['programs'][0]
+                returns = {item['site']: item for item in program['diagnostics']['r0_returns']}
+                self.assertTrue(returns[site]['inherited'])
+
+                result = self.run_raw([self.raw_entry(
+                    blob, name='split-frame.bin', link_base=hex(link_base))])
+                self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+                program = self.manifest()['programs'][0]
+                dispatched = {item['site'] for item in program['diagnostics']['r0_dispatches']}
+                self.assertIn(site, dispatched)
+                source = (self.output / program['name'] / 'spu_recomp.c').read_text()
+                function = source.split(
+                    f'spu_func_{LS_BASE + 0x60:08X}(spu_context* ctx) {{', 1)[1].split('}', 1)[0]
+                self.assertIn('ctx->pc = ctx->gpr[0]._u32[0];', function)
+
     def test_raw_indirect_dispatch_names_the_assumption(self):
         _, build_raw_job = raw_job_tools()
         from gen_test_raw_job import dispatch_entry
-        cases = (('calls', {}, None),
+        cases = (('calls', {}, 'spu-abi-link-slot'),
                  ('calls-dispatch', {'extra_entry_points': [hex(dispatch_entry())]},
-                  'no-unmodelled-indirect-entry'))
+                  ['no-unmodelled-indirect-entry', 'spu-abi-link-slot']))
         for variant, overrides, assumes in cases:
             with self.subTest(variant=variant):
                 result = self.run_raw([self.raw_entry(build_raw_job(variant=variant),

@@ -27,6 +27,13 @@ typedef void (*spu_lifted_fn)(spu_context*);
  * same resolver used by indirect dispatch. NULL ctx retains wildcard lookup. */
 spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa);
 
+/* The function-unit replay can select the original lifted reference or the
+ * native override registered for one image/address pair. */
+spu_lifted_fn spu_registered_function_variant(uint32_t lsa, int image_id, int native_override);
+
+/* Invoke a decoded leaf as a host callee, preserving SPU return semantics. */
+void spu_run_lifted_leaf(spu_lifted_fn entry, spu_context* ctx);
+
 /* Interpret from `start_lsa` until the SPU stops (`stop`/`stopd`/halt) or a
  * host-fatal decode. Handles all control flow internally. Returns the stop
  * code (0 if none). ctx->pc holds the address that stopped execution. */

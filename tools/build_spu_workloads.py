@@ -65,7 +65,7 @@ import argparse, glob, os, re, subprocess, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from check_spu_lifter_abi import image_problems
-from spu_lifter import TWIN_SUFFIX
+from spu_lifter import TWIN_SUFFIX, parse_overrides
 
 # ---- SPU ELF sizing + fingerprint (must match runtime/spu/spu_workload.c) ----
 
@@ -147,8 +147,9 @@ def main():
                          "sha256, ls_base (0x7C00 for JobQueue2 jobs), optional code_end "
                          "(passed to the lifter's --code-end), optional link_base (the LS "
                          "address a position-independent image was linked at, 0 for JobQueue2 "
-                         "jobs: immediates are then also read as image-relative) and optional "
-                         "extra_entry_points. A blob whose sha256 does not match the "
+                         "jobs: immediates are then also read as image-relative), optional "
+                         "extra_entry_points, and optional overrides (ADDR=SYMBOL strings) "
+                         "plus a nonzero native_rev. A blob whose sha256 does not match the "
                          "manifest fails the run.")
     ap.add_argument("--lifted", required=True, help="output dir for per-image lifted C (one subdir per image)")
     ap.add_argument("--out", required=True, help="output registration C file")
@@ -349,6 +350,12 @@ def write_registry(args, imgs, text_fps, image_ids=None, budget_twin=False):
     # resolve to its functions and never leave it for the production body;
     # ids above every production id cannot collide with a pinned one.
     twin_ids = {img: max(ids.values()) + n for n, (img, _p, _f, _e) in enumerate(imgs, 1)} if budget_twin else {}
+    entry_symbols = {}
+    entry_overridden = {}
+    for img, prefix, _fp, ent in imgs:
+        override_map = parse_overrides(programs.get(img, {}).get("overrides", []))
+        entry_overridden[img] = ent in override_map
+        entry_symbols[img] = override_map.get(ent, f"{prefix}spu_func_{ent:08X}")
     if budget_twin:
         write_twin_sources(lift_root, imgs)
     L = []
@@ -361,39 +368,49 @@ def write_registry(args, imgs, text_fps, image_ids=None, budget_twin=False):
     L.append(" * Build note: add <repo>/runtime/spu to this target's include dirs (the lifted")
     L.append(' * sources use bare #include "spu_context.h" etc.). */')
     L.append('#include "spu_workload.h"')
+    if any(programs.get(img, {}).get("overrides") for img, _prefix, _fp, _ent in imgs):
+        L.append('#include "spu_xdiff.h"')
     L.append("")
     L.append("extern void spu_begin_image(int image_id);")
     L.append("")
-    L.append("/* per-image extern decls (prefixed entry fn + recomp_register) */")
-    for img, prefix, fp, ent in imgs:
-        L.append(f"extern void {prefix}spu_func_{ent:08X}(spu_context*);")
+    L.append("/* per-image extern decls (selected entry fn + recomp_register) */")
+    for img, prefix, _fp, _ent in imgs:
+        L.append(f"extern void {entry_symbols[img]}(spu_context*);")
         L.append(f"extern void {prefix}spu_recomp_register(void);")
         if budget_twin:
-            L.append(f"extern void {prefix}spu_func_{ent:08X}{TWIN_SUFFIX}(spu_context*);")
+            twin_entry = entry_symbols[img] if entry_overridden[img] else entry_symbols[img] + TWIN_SUFFIX
+            L.append(f"extern void {twin_entry}(spu_context*);")
             L.append(f"extern void {prefix}spu_recomp_register{TWIN_SUFFIX}(void);")
     L.append("")
     L.append(f"void {args.register_fn}(void)")
     L.append("{")
     for index, (img, prefix, fp, ent) in enumerate(imgs, 1):
         i = ids[img]
+        entry = entry_symbols[img]
+        program = programs.get(img)
         L.append(f"    spu_begin_image({i}); {prefix}spu_recomp_register();")
-        L.append(f"    spu_workload_register_img(0x{fp:016X}ULL, {prefix}spu_func_{ent:08X}, {i}, \"{img}\");")
+        L.append(f"    spu_workload_register_img(0x{fp:016X}ULL, {entry}, {i}, \"{img}\");")
         if text_fps.get(img):  # same entry, keyed by the text segment (raw SPU proxy-DMA load)
-            L.append(f"    spu_workload_register_img(0x{text_fps[img]:016X}ULL, {prefix}spu_func_{ent:08X}, {i}, \"{img}.text\");")
-        inventory = registration_inventory(programs.get(img))
-        if inventory:  # no record: the image is unknown to the runtime, which refuses to record or shadow it
+            L.append(f"    spu_workload_register_img(0x{text_fps[img]:016X}ULL, {entry}, {i}, \"{img}.text\");")
+        if program and program.get("overrides"):
+            native_rev = int(program['native_rev'])
+            L.append(f"    spu_workload_set_body_identity(0x{fp:016X}ULL, SPU_TIER_PARTIAL, "
+                     f"0x{native_rev:016X}ULL);")
+        inventory = registration_inventory(program)
+        if inventory:  # no record: the image is unknown to the runtime, which refuses to record or shadow
             flags, code_end, lift_options = inventory
             names = [name for bit, name in INVENTORY_FLAGS if flags & bit]
             L.append(f"    spu_workload_set_inventory(0x{fp:016X}ULL, {' | '.join(names) or '0u'}, "
                      f"0x{code_end:X}u, 0x{lift_options:016X}ULL);")
-        if program_promoted(programs.get(img)):  # the corpus proved this image: spu.job_body=lifted may run it
+        if program_promoted(program):  # the corpus proved this image: spu.job_body=lifted may run it
             L.append(f"    spu_workload_promote_img(0x{fp:016X}ULL);")
         if budget_twin:
             t = twin_ids[img]
+            twin_entry = entry if entry_overridden[img] else entry + TWIN_SUFFIX
             L.append(f"    spu_begin_image({t}); {prefix}spu_recomp_register{TWIN_SUFFIX}();")
-            L.append(f"    spu_workload_register_twin(0x{fp:016X}ULL, {prefix}spu_func_{ent:08X}{TWIN_SUFFIX}, {t});")
+            L.append(f"    spu_workload_register_twin(0x{fp:016X}ULL, {twin_entry}, {t});")
             if text_fps.get(img):
-                L.append(f"    spu_workload_register_twin(0x{text_fps[img]:016X}ULL, {prefix}spu_func_{ent:08X}{TWIN_SUFFIX}, {t});")
+                L.append(f"    spu_workload_register_twin(0x{text_fps[img]:016X}ULL, {twin_entry}, {t});")
     L.append("    spu_begin_image(0);")
     L.append("}")
     if args.constructor:

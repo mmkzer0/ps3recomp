@@ -474,25 +474,33 @@ void capture_job_start(const CaptureJob& job, ::spu_context* ctx, const ::spu_jo
     const std::uint64_t ordinal = audit_on ? image.audit.jobs.fetch_add(1, kRelaxed) : 0;
     if (!audit_on && image.attempted.load(kRelaxed) >= limit) return; /* this image has its N and nothing else wants a recording */
 
-    /* The body that runs is the authority the fixture names: T0 for the interpreter, T1 only for the
-     * body registered under this fingerprint (section 3), with the lift identity of its registration. */
+    /* The body that runs is the authority the fixture names: T0 for the interpreter, otherwise the
+     * registered image's declared tier and revision (section 7.3). */
     spu_xdiff_body_id authority{};
     if (job.interpreted) {
         authority.tier = static_cast<std::uint8_t>(SPU_TIER_INTERP);
-    } else if (job.entry != nullptr && spu_workload_find_img(fingerprint, nullptr) == job.entry) {
-        authority.tier = static_cast<std::uint8_t>(SPU_TIER_LIFTED);
-        authority.lifter_abi = SPU_RUNTIME_LIFTER_ABI;
-        authority.code_end = inv.code_end;
-        authority.lift_options = inv.lift_options;
     } else {
-        image.ineligible.fetch_add(1, kRelaxed);
-        image.unknown_body.fetch_add(1, kRelaxed);
-        name_ineligible(addr, kUnknownBody, l, fingerprint);
-        if (audit_on) {
-            audit_note_not_eligible(image.audit, fingerprint, ShadowCheck::ok);
-            w.disposition = kNotEligible;
+        std::uint8_t tier = 0;
+        std::uint64_t native_rev = 0;
+        if (job.entry == nullptr || spu_workload_find_img(fingerprint, nullptr) != job.entry ||
+            !spu_workload_find_body_identity(fingerprint, &tier, &native_rev)) {
+            image.ineligible.fetch_add(1, kRelaxed);
+            image.unknown_body.fetch_add(1, kRelaxed);
+            name_ineligible(addr, kUnknownBody, l, fingerprint);
+            if (audit_on) {
+                audit_note_not_eligible(image.audit, fingerprint, ShadowCheck::ok);
+                w.disposition = kNotEligible;
+            }
+            return;
         }
-        return;
+        authority.tier = tier;
+        authority.native_rev = native_rev;
+        if ((tier & SPU_TIER_MASK) == SPU_TIER_LIFTED ||
+            (tier & SPU_TIER_MASK) == SPU_TIER_PARTIAL) {
+            authority.lifter_abi = SPU_RUNTIME_LIFTER_ABI;
+            authority.code_end = inv.code_end;
+            authority.lift_options = inv.lift_options;
+        }
     }
     w.authority_tier = authority.tier;
 
