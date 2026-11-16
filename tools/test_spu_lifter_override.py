@@ -30,6 +30,10 @@ def brsl(pc, target, rt=0):
     return ri16(0x066, (target - pc) // 4, rt)
 
 
+def br(pc, target):
+    return ri16(0x064, (target - pc) // 4, 0)
+
+
 def image_with_refs():
     words = [0] * (0x58 // 4)
     words[0] = brsl(0x00, 0x40)
@@ -151,6 +155,293 @@ class NativeOverrides(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("--override 0x40 refuses non-leaf function", result.stderr)
             self.assertRegex(result.stderr, r"call out via [a-z]+ at 0x40")
+    def test_closed_tail_call_cycle_keeps_all_reference_members_lifted(self):
+        words = [rr(0x201)] * (0x58 // 4)
+        words[0x40 // 4:0x4C // 4] = [
+            ri16(0x040, 2, 3),       # brz $r3, 0x48
+            rr(0x1A8, ra=0),         # bi $r0
+            br(0x48, 0x40),          # cycle back to the entry member
+        ]
+        image = b"".join(struct.pack(">I", word) for word in words)
+        bounds = [(0x40, 0x48), (0x48, 0x4C)]
+
+        from spu_disasm import disassemble_spu
+        from spu_lifter import override_unit_admission
+
+        members, graph, problem = override_unit_admission(
+            disassemble_spu(image, 0), bounds, 0x40)
+        self.assertIsNone(problem)
+        self.assertEqual(members, (0x40, 0x48))
+        self.assertEqual(graph[0x40], (0x48,))
+        self.assertEqual(graph[0x48], (0x40,))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "lift"
+            result = run_lifter(image, bounds, ["0x40=native_f"], output)
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            source = (output / "spu_recomp.c").read_text()
+            self.assertIn("{ 0x00000040u, native_f, xfn_spu_func_00000040, 1,", source)
+            self.assertIn("{ 0x00000048u, xfn_spu_func_00000048,", source)
+            self.assertIn("SPU_DIRECT(ctx, 0x48, xfn_spu_func_00000048)", source)
+            self.assertIn("SPU_DIRECT(ctx, 0x40, xfn_spu_func_00000040)", source)
+            self.assertNotIn("SPU_DIRECT(ctx, 0x40, native_f)", source)
+
+    def test_tail_cycle_without_a_proven_return_is_refused(self):
+        words = [rr(0x201)] * (0x50 // 4)
+        words[0x40 // 4] = br(0x40, 0x48)
+        words[0x48 // 4] = br(0x48, 0x40)
+        image = b"".join(struct.pack(">I", word) for word in words)
+        bounds = [(0x40, 0x44), (0x48, 0x4C)]
+
+        from spu_disasm import disassemble_spu
+        from spu_lifter import override_unit_admission
+
+        members, _graph, problem = override_unit_admission(
+            disassemble_spu(image, 0), bounds, 0x40)
+        self.assertEqual(members, (0x40, 0x48))
+        self.assertEqual(problem, "override unit has no proven return through bi $r0")
+
+    def test_fallthrough_tail_chain_is_admitted(self):
+        words = [rr(0x201)] * (0x50 // 4)
+        words[0x40 // 4:0x4C // 4] = [
+            ri16(0x081, 7, 3),
+            rr(0x201),
+            rr(0x1A8, ra=0),
+        ]
+        image = b"".join(struct.pack(">I", word) for word in words)
+        bounds = [(0x40, 0x48), (0x48, 0x4C)]
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "lift"
+            result = run_lifter(image, bounds, ["0x40=native_f"], output)
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            source = (output / "spu_recomp.c").read_text()
+            self.assertIn("SPU_DIRECT(ctx, 0x48, xfn_spu_func_00000048)", source)
+
+    def test_chain_refuses_a_foreign_direct_call_with_its_site(self):
+        words = [rr(0x201)] * (0x58 // 4)
+        words[0x40 // 4] = br(0x40, 0x48)
+        words[0x48 // 4:0x50 // 4] = [
+            ri16(0x081, 7, 3),
+            rr(0x1A8, ra=0),
+        ]
+        words[0x50 // 4] = brsl(0x50, 0x48)
+        image = b"".join(struct.pack(">I", word) for word in words)
+        bounds = [(0x40, 0x44), (0x48, 0x50), (0x50, 0x54)]
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_lifter(image, bounds, ["0x40=native_f"], Path(tmp) / "lift")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "--override 0x40 refuses override unit: foreign call at 0x50 "
+                "targets override member 0x48", result.stderr)
+    def test_chain_refuses_a_foreign_direct_branch_with_its_site(self):
+        words = [rr(0x201)] * (0x58 // 4)
+        words[0x40 // 4] = br(0x40, 0x48)
+        words[0x48 // 4:0x50 // 4] = [
+            ri16(0x081, 7, 3),
+            rr(0x1A8, ra=0),
+        ]
+        words[0x50 // 4] = br(0x50, 0x48)
+        image = b"".join(struct.pack(">I", word) for word in words)
+        bounds = [(0x40, 0x44), (0x48, 0x50), (0x50, 0x54)]
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_lifter(image, bounds, ["0x40=native_f"], Path(tmp) / "lift")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "--override 0x40 refuses override unit: foreign branch at 0x50 "
+                "targets override member 0x48", result.stderr)
+
+    def test_chain_refuses_foreign_fallthrough_into_a_member(self):
+        words = [rr(0x201)] * (0x60 // 4)
+        words[0x40 // 4] = br(0x40, 0x50)
+        words[0x50 // 4] = rr(0x1A8, ra=0)
+        image = b"".join(struct.pack(">I", word) for word in words)
+        bounds = [(0x40, 0x44), (0x48, 0x50), (0x50, 0x54)]
+
+        from spu_disasm import disassemble_spu
+        from spu_lifter import override_unit_admission
+
+        members, _graph, problem = override_unit_admission(
+            disassemble_spu(image, 0), bounds, 0x40, entry_points=(0x40, 0x48))
+        self.assertEqual(members, (0x40, 0x50))
+        self.assertEqual(
+            problem,
+            "foreign fall-through at 0x4C enters override member 0x50")
+
+    def test_chain_refuses_a_foreign_call_return_continuation(self):
+        words = [rr(0x201)] * (0x68 // 4)
+        words[0x40 // 4] = br(0x40, 0x50)
+        words[0x4C // 4] = brsl(0x4C, 0x60)
+        words[0x50 // 4] = rr(0x1A8, ra=0)
+        words[0x60 // 4] = rr(0x1A8, ra=0)
+        image = b"".join(struct.pack(">I", word) for word in words)
+        bounds = [(0x40, 0x44), (0x48, 0x50), (0x50, 0x54), (0x60, 0x64)]
+
+        from spu_disasm import disassemble_spu
+        from spu_lifter import override_unit_admission
+
+        members, _graph, problem = override_unit_admission(
+            disassemble_spu(image, 0), bounds, 0x40)
+        self.assertEqual(members, (0x40, 0x50))
+        self.assertEqual(
+            problem,
+            "foreign call return continuation at 0x4C enters override member 0x50")
+
+    def test_bisled_return_continuation_is_a_foreign_call_entry(self):
+        words = [rr(0x201)] * (0x68 // 4)
+        words[0x40 // 4] = br(0x40, 0x50)
+        words[0x48 // 4] = ri16(0x081, 0x60, 2)   # il $r2, 0x60
+        words[0x4C // 4] = rr(0x1AB, ra=2, rt=6) # bisled $r6, $r2
+        words[0x50 // 4] = rr(0x1A8, ra=0)
+        words[0x60 // 4] = rr(0x1A8, ra=6)
+        image = b"".join(struct.pack(">I", word) for word in words)
+        bounds = [(0x40, 0x44), (0x48, 0x50), (0x50, 0x54), (0x60, 0x64)]
+
+        from spu_disasm import disassemble_spu
+        from spu_lifter import override_unit_admission
+
+        members, _graph, problem = override_unit_admission(
+            disassemble_spu(image, 0), bounds, 0x40)
+        self.assertEqual(members, (0x40, 0x50))
+        self.assertEqual(
+            problem,
+            "foreign call return continuation at 0x4C enters override member 0x50")
+
+    def test_bisled_inside_a_chain_member_is_refused_as_a_call(self):
+        words = [rr(0x201)] * (0x60 // 4)
+        words[0x40 // 4] = br(0x40, 0x48)
+        words[0x48 // 4] = rr(0x1AB, ra=2, rt=6)
+        words[0x50 // 4] = rr(0x1A8, ra=0)
+        image = b"".join(struct.pack(">I", word) for word in words)
+        bounds = [(0x40, 0x44), (0x48, 0x50), (0x50, 0x54)]
+
+        from spu_disasm import disassemble_spu
+        from spu_lifter import override_unit_admission
+
+        members, _graph, problem = override_unit_admission(
+            disassemble_spu(image, 0), bounds, 0x40)
+        self.assertEqual(members, (0x40, 0x48, 0x50))
+        self.assertEqual(problem, "call out via bisled at 0x48")
+
+    def test_singleton_refuses_a_reachable_fallthrough_past_its_bound(self):
+        words = [rr(0x201)] * (0x4C // 4)
+        words[0x40 // 4] = ri16(0x042, 2, 3)  # brnz $r3, 0x48
+        words[0x44 // 4] = rr(0x1A8, ra=0)
+        words[0x48 // 4] = rr(0x201)
+        image = b"".join(struct.pack(">I", word) for word in words)
+
+        from spu_disasm import disassemble_spu
+        from spu_lifter import override_unit_admission
+
+        members, _graph, problem = override_unit_admission(
+            disassemble_spu(image, 0), [(0x40, 0x4C)], 0x40)
+        self.assertEqual(members, (0x40,))
+        self.assertEqual(
+            problem,
+            "reachable fall-through at 0x48 exits member 0x40 to 0x4C "
+            "outside the override unit")
+
+    def test_chain_refuses_a_reachable_fallthrough_past_the_image(self):
+        words = [rr(0x201)] * (0x54 // 4)
+        words[0x40 // 4] = br(0x40, 0x48)
+        words[0x48 // 4] = ri16(0x042, 2, 3)  # brnz $r3, 0x50
+        words[0x4C // 4] = rr(0x1A8, ra=0)
+        words[0x50 // 4] = rr(0x201)
+        image = b"".join(struct.pack(">I", word) for word in words)
+        bounds = [(0x40, 0x44), (0x48, 0x54)]
+
+        from spu_disasm import disassemble_spu
+        from spu_lifter import override_unit_admission
+
+        members, _graph, problem = override_unit_admission(
+            disassemble_spu(image, 0), bounds, 0x40)
+        self.assertEqual(members, (0x40, 0x48))
+        self.assertEqual(
+            problem,
+            "reachable fall-through at 0x50 exits member 0x48 to 0x54 "
+            "outside the override unit")
+
+    def test_chain_fallthrough_wrap_dispatches_to_function_at_zero(self):
+        from spu_disasm import spu_decode
+        from spu_lifter import SPULifter, override_unit_admission
+
+        instructions = [
+            spu_decode(ri16(0x040, -6, 3), 0),  # brz $r3, 0x3FFE8
+            spu_decode(rr(0x1A8, ra=0), 4),
+        ]
+        high_member = [
+            spu_decode(rr(0x201), pc) for pc in range(0x3FFE8, 0x40000, 4)
+        ]
+        insns = instructions + high_member
+        bounds = [(0, 8), (0x3FFE8, 0x40000)]
+        members, graph, problem = override_unit_admission(
+            insns, bounds, 0, entry_points=(0,))
+        self.assertIsNone(problem)
+        self.assertEqual(members, (0, 0x3FFE8))
+        self.assertEqual(graph[0x3FFE8], (0,))
+
+        lifter = SPULifter()
+        lifter.func_starts = set(members)
+        lifted = lifter.lift_function(high_member, 0x3FFE8, 0x40000)
+        self.assertIn(
+            "    { SPU_DIRECT(ctx, 0x0, spu_func_00000000); }",
+            lifted.body_lines)
+
+    def test_call_out_from_a_chain_member_remains_refused(self):
+        words = [rr(0x201)] * (0x68 // 4)
+        words[0x40 // 4:0x48 // 4] = [
+            brsl(0x40, 0x60),
+            br(0x44, 0x48),
+        ]
+        words[0x48 // 4] = rr(0x1A8, ra=0)
+        words[0x60 // 4] = rr(0x201)  # the call is refused before callee semantics matter
+        image = b"".join(struct.pack(">I", word) for word in words)
+        bounds = [(0x40, 0x48), (0x48, 0x4C), (0x60, 0x64)]
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_lifter(image, bounds, ["0x40=native_f"], Path(tmp) / "lift")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "--override 0x40 refuses override unit: call out via brsl at 0x40",
+                result.stderr)
+
+    def test_chain_refuses_an_independent_entry_into_a_member(self):
+        words = [rr(0x201)] * (0x50 // 4)
+        words[0x40 // 4] = br(0x40, 0x48)
+        words[0x48 // 4:0x50 // 4] = [
+            ri16(0x081, 7, 3),
+            rr(0x1A8, ra=0),
+        ]
+        image = b"".join(struct.pack(">I", word) for word in words)
+        bounds = [(0x40, 0x44), (0x48, 0x50)]
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_lifter(image, bounds, ["0x40=native_f"], Path(tmp) / "lift",
+                                ["--extra-funcs", "0x48"])
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("foreign entry point 0x48 enters member 0x48", result.stderr)
+    def test_chain_refuses_a_resolved_foreign_indirect_branch(self):
+        words = [rr(0x201)] * (0x70 // 4)
+        words[0x40 // 4] = br(0x40, 0x48)
+        words[0x48 // 4:0x50 // 4] = [
+            ri16(0x081, 7, 3),
+            rr(0x1A8, ra=0),
+        ]
+        words[0x60 // 4] = (0x021 << 25) | (0x48 << 7) | 3  # ila $r3, 0x48
+        words[0x64 // 4] = rr(0x1A8, ra=3)                  # bi $r3
+        image = b"".join(struct.pack(">I", word) for word in words)
+        bounds = [(0x40, 0x44), (0x48, 0x50), (0x60, 0x68)]
+
+        from spu_disasm import disassemble_spu
+        from spu_lifter import compute_bi_r0_jumps, override_unit_admission
+
+        insns = disassemble_spu(image, 0)
+        proof = compute_bi_r0_jumps(insns, bounds, image=image, base=0)
+        members, _graph, problem = override_unit_admission(
+            insns, bounds, 0x40, proof)
+        self.assertEqual(members, (0x40, 0x48))
+        self.assertEqual(
+            problem,
+            "foreign indirect branch at 0x64 targets override member 0x48")
+
+
 
     def test_arithmetic_r0_target_is_dispatched_and_refused_for_override(self):
         words = [0] * (0x48 // 4)

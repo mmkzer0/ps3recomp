@@ -229,24 +229,41 @@ def parse_overrides(specs) -> dict[int, str]:
     return dict(sorted(overrides.items()))
 
 
-def override_leaf_problem(insns, start: int, end: int, computed_jumps=(),
-                          function_starts=()) -> str | None:
-    """Return why an override target is outside the pilot's leaf-call contract."""
+def _ls_pc(address: int) -> int:
+    return address & 0x3FFFC
+
+
+def _has_fallthrough(insn) -> bool:
+    if insn.mnemonic in {"br", "bra", "bi", "iret", "stopd", "halt"}:
+        return False
+    if insn.mnemonic == "stop":
+        return (insn.raw & 0x3FFF) in LV2_RESUMING_STOPS
+    return True
+
+
+def _override_leaf_check(insns, start: int, end: int, computed_jumps=(),
+                         function_starts=(), allowed_tail_edges=(),
+                         require_return=True) -> tuple[str | None, bool]:
     body = [insn for insn in insns if start <= insn.addr < end]
     has_return = False
+
+    def refuse(reason):
+        return reason, has_return
+
     for insn in body:
         mn = insn.mnemonic
-        if insn.addr in getattr(computed_jumps, "pc_getters", ()):
+        if (insn.addr in getattr(computed_jumps, "pc_getters", ())
+                and mn in ("brsl", "brasl", "bisl")):
             if mn == "bisl" and getattr(computed_jumps, "unresolved_branches", ()):
-                return ("PC-getter proof requires no-unmodelled-indirect-entry at "
-                        f"0x{insn.addr:X}; not admitted for T2 overrides")
+                return refuse("PC-getter proof requires no-unmodelled-indirect-entry at "
+                              f"0x{insn.addr:X}; not admitted for T2 overrides")
             continue
-        if mn in ("brsl", "brasl", "bisl"):
-            return f"call out via {mn} at 0x{insn.addr:X}"
+        if mn in ("brsl", "brasl", "bisl", "bisled"):
+            return refuse(f"call out via {mn} at 0x{insn.addr:X}")
         if mn in ("rdch", "wrch", "rchcnt"):
-            return f"channel instruction {mn} at 0x{insn.addr:X}"
+            return refuse(f"channel instruction {mn} at 0x{insn.addr:X}")
         if mn in ("stop", "stopd", "halt"):
-            return f"stop/halt instruction {mn} at 0x{insn.addr:X}"
+            return refuse(f"stop/halt instruction {mn} at 0x{insn.addr:X}")
         ops = _ops(insn.operands)
         if mn == "bi":
             if ops and _reg(ops[0]) == "0":
@@ -258,8 +275,8 @@ def override_leaf_problem(insns, start: int, end: int, computed_jumps=(),
                         continue
                     if link_restores.get(insn.addr) == writer.addr:
                         break
-                    return (f"unproven $r0 write by {writer.mnemonic} at "
-                            f"0x{writer.addr:X} before bi $r0")
+                    return refuse(f"unproven $r0 write by {writer.mnemonic} at "
+                                  f"0x{writer.addr:X} before bi $r0")
                 if insn.addr not in computed_jumps:
                     assumptions = getattr(computed_jumps, "return_assumptions", {}).get(
                         insn.addr, ())
@@ -267,26 +284,221 @@ def override_leaf_problem(insns, start: int, end: int, computed_jumps=(),
                         assumptions = [assumptions]
                     extra = [name for name in assumptions if name != "spu-abi-link-slot"]
                     if extra:
-                        return (f"return proof requires {', '.join(extra)} at "
-                                f"0x{insn.addr:X}; not admitted for T2 overrides")
+                        return refuse(f"return proof requires {', '.join(extra)} at "
+                                      f"0x{insn.addr:X}; not admitted for T2 overrides")
                     has_return = True
                     continue
-            return f"indirect branch {mn} at 0x{insn.addr:X}"
-        if mn in ("bisl", "bisled", "iret", "biz", "binz", "bihz", "bihnz"):
-            return f"indirect branch {mn} at 0x{insn.addr:X}"
+            return refuse(f"indirect branch {mn} at 0x{insn.addr:X}")
+        if mn in ("bisl", "iret", "biz", "binz", "bihz", "bihnz"):
+            return refuse(f"indirect branch {mn} at 0x{insn.addr:X}")
         if mn in _COND_BR or mn in ("br", "bra"):
             target = SPULifter._branch_target(insn)
             if target is None:
-                return f"unresolved direct branch {mn} at 0x{insn.addr:X}"
+                return refuse(f"unresolved direct branch {mn} at 0x{insn.addr:X}")
             if target == insn.addr:
-                return f"self-loop halt idiom at 0x{insn.addr:X}"
-            if not start <= target < end:
-                return f"tail call via {mn} to 0x{target:X} at 0x{insn.addr:X}"
-    if body and body[-1].mnemonic not in {"br", "bra", "bi", "iret", "stop", "stopd"} and end in function_starts:
-        return f"fall-through tail call to 0x{end:X}"
+                return refuse(f"self-loop halt idiom at 0x{insn.addr:X}")
+            if not start <= target < end and (insn.addr, target) not in allowed_tail_edges:
+                return refuse(f"tail call via {mn} to 0x{target:X} at 0x{insn.addr:X}")
+    fallthrough = _ls_pc(end)
+    if (body and body[-1].mnemonic not in {"br", "bra", "bi", "iret", "stop", "stopd"}
+            and fallthrough in function_starts
+            and (body[-1].addr, fallthrough) not in allowed_tail_edges):
+        return refuse(f"fall-through tail call to 0x{fallthrough:X}")
+    if require_return and not has_return:
+        return refuse("no return through bi $r0")
+    return None, has_return
+
+
+def override_leaf_problem(insns, start: int, end: int, computed_jumps=(),
+                          function_starts=()) -> str | None:
+    """Return why an override target is outside the strict leaf contract."""
+    problem, _has_return = _override_leaf_check(
+        insns, start, end, computed_jumps, function_starts)
+    return problem
+
+def override_unit_admission(insns, bounds, entry: int, computed_jumps=(),
+                            entry_points=()):
+    """Return (members, tail graph, refusal) for one leaf or closed tail chain."""
+    ends = dict(bounds)
+    if entry not in ends:
+        return (), {}, "not a decoded function entry"
+
+    ordered_bounds = sorted(ends.items())
+    bodies = {start: [] for start, _end in ordered_bounds}
+    owner = {}
+    ordered_insns = sorted(insns, key=lambda insn: insn.addr)
+    bound_index = 0
+    for insn in ordered_insns:
+        while (bound_index < len(ordered_bounds)
+               and insn.addr >= ordered_bounds[bound_index][1]):
+            bound_index += 1
+        if bound_index < len(ordered_bounds):
+            start, end = ordered_bounds[bound_index]
+            if start <= insn.addr < end:
+                bodies[start].append(insn)
+                owner[insn.addr] = start
+
+    successors = {start: set() for start in ends}
+    allowed_tail_edges = {start: set() for start in ends}
+    for start, end in ordered_bounds:
+        body = bodies[start]
+        for insn in body:
+            if insn.mnemonic not in _COND_BR and insn.mnemonic not in ("br", "bra"):
+                continue
+            target = SPULifter._branch_target(insn)
+            if (target is not None and not start <= target < end
+                    and target in ends):
+                successors[start].add(target)
+                allowed_tail_edges[start].add((insn.addr, target))
+        if body and _has_fallthrough(body[-1]) and body[-1].addr + 4 == end:
+            target = _ls_pc(end)
+            if target in ends:
+                successors[start].add(target)
+                allowed_tail_edges[start].add((body[-1].addr, target))
+
+    members = {entry}
+    pending = deque([entry])
+    while pending:
+        member = pending.popleft()
+        for target in sorted(successors[member]):
+            if target not in members:
+                members.add(target)
+                pending.append(target)
+    ordered_members = tuple(sorted(members))
+    tail_graph = {start: tuple(sorted(targets))
+                  for start, targets in successors.items()}
+
+    if len(ordered_members) > 1:
+        for point in sorted(set(entry_points)):
+            if point == entry:
+                continue
+            for member in ordered_members:
+                if member <= point < ends[member]:
+                    return (ordered_members, tail_graph,
+                            f"foreign entry point 0x{point:X} enters member "
+                            f"0x{member:X} of the override unit")
+        for insn in ordered_insns:
+            source = owner.get(insn.addr)
+            if source is None or source in members:
+                continue
+            mn = insn.mnemonic
+            pc_getter = False
+            if mn in _COND_BR | {"br", "bra", "brsl", "brasl"}:
+                target = SPULifter._branch_target(insn)
+                continuation = _ls_pc(insn.addr + 4)
+                pc_getter = (mn in ("brsl", "brasl")
+                             and target == continuation)
+                if target is not None and not pc_getter:
+                    for member in ordered_members:
+                        if member <= target < ends[member] and target != entry:
+                            kind = "call" if mn in ("brsl", "brasl") else "branch"
+                            return (ordered_members, tail_graph,
+                                    f"foreign {kind} at 0x{insn.addr:X} targets override "
+                                    f"member 0x{target:X}")
+            if _has_fallthrough(insn):
+                continuation = _ls_pc(insn.addr + 4)
+                for member in ordered_members:
+                    if member <= continuation < ends[member] and continuation != entry:
+                        kind = ("call return continuation"
+                                if mn in ("brsl", "brasl", "bisl", "bisled")
+                                and not pc_getter else "fall-through")
+                        return (ordered_members, tail_graph,
+                                f"foreign {kind} at 0x{insn.addr:X} enters override "
+                                f"member 0x{continuation:X}")
+
+        resolved = getattr(computed_jumps, "resolved_branches", {})
+        if resolved:
+            instructions = {insn.addr: insn for insn in ordered_insns}
+            pc_getters = getattr(computed_jumps, "pc_getters", ())
+            for site, targets in resolved.items():
+                source = owner.get(site)
+                insn = instructions.get(site)
+                if (source is None or source in members or insn is None
+                        or (site in pc_getters and insn.mnemonic != "bisled")):
+                    continue
+                kind = "call" if insn.mnemonic in ("bisl", "bisled") else "branch"
+                for target in targets:
+                    for member in ordered_members:
+                        if member <= target < ends[member] and target != entry:
+                            return (ordered_members, tail_graph,
+                                    f"foreign indirect {kind} at 0x{site:X} targets "
+                                    f"override member 0x{target:X}")
+        for site in sorted(getattr(computed_jumps, "unresolved_branches", ())):
+            source = owner.get(site)
+            if source is not None and source not in members:
+                return (ordered_members, tail_graph,
+                        f"unresolved indirect branch at 0x{site:X} outside the "
+                        "override unit prevents foreign-entry proof")
+
+    has_return = False
+    for member in ordered_members:
+        problem, member_returns = _override_leaf_check(
+            insns, member, ends[member], computed_jumps, set(ends),
+            allowed_tail_edges[member], require_return=not successors[member])
+        if problem:
+            return ordered_members, tail_graph, problem
+        has_return = has_return or member_returns
     if not has_return:
-        return "no return through bi $r0"
-    return None
+        return (ordered_members, tail_graph,
+                "override unit has no proven return through bi $r0")
+
+    reachable_return = False
+    for member in ordered_members:
+        body_by_addr = {insn.addr: insn for insn in bodies[member]}
+        seen = set()
+        worklist = [member]
+        while worklist:
+            address = worklist.pop()
+            if address in seen:
+                continue
+            seen.add(address)
+            insn = body_by_addr.get(address)
+            if insn is None:
+                return (ordered_members, tail_graph,
+                        f"reachable control flow at 0x{address:X} enters an "
+                        f"undecoded gap in member 0x{member:X}")
+            mn = insn.mnemonic
+            ops = _ops(insn.operands)
+            if (mn == "bi" and ops and _reg(ops[0]) == "0"
+                    and address not in computed_jumps):
+                reachable_return = True
+                continue
+
+            def follow(target, edge):
+                if member <= target < ends[member]:
+                    if target not in body_by_addr:
+                        return (f"reachable {edge} at 0x{insn.addr:X} enters "
+                                f"an undecoded gap at 0x{target:X}")
+                    worklist.append(target)
+                elif ((insn.addr, target) in allowed_tail_edges[member]
+                      and target in members):
+                    return None
+                else:
+                    return (f"reachable {edge} at 0x{insn.addr:X} exits member "
+                            f"0x{member:X} to 0x{target:X} outside the override unit")
+                return None
+
+            if mn in _COND_BR | {"br", "bra"}:
+                target = SPULifter._branch_target(insn)
+                if target is None:
+                    return (ordered_members, tail_graph,
+                            f"unresolved reachable branch at 0x{insn.addr:X}")
+                problem = follow(target, "branch")
+                if problem:
+                    return ordered_members, tail_graph, problem
+                if mn in _COND_BR:
+                    problem = follow(_ls_pc(insn.addr + 4), "fall-through")
+                    if problem:
+                        return ordered_members, tail_graph, problem
+            elif _has_fallthrough(insn):
+                problem = follow(_ls_pc(insn.addr + 4), "fall-through")
+                if problem:
+                    return ordered_members, tail_graph, problem
+
+    if not reachable_return:
+        return (ordered_members, tail_graph,
+                "override unit has no reachable proven return through bi $r0")
+    return ordered_members, tail_graph, None
 
 
 
@@ -358,6 +570,7 @@ class BiR0Classification(set):
         self.unresolved_branches = set()
         self.link_returns = set()
         self.pc_getters = set()
+        self.resolved_branches = {}
         self.return_assumptions = {}
         self.unproven = {}
 
@@ -795,6 +1008,7 @@ def compute_bi_r0_jumps(insns, bounds, *, image=None, base=None, delta=0,
                 break
     link_restores = {site: load for site, load in link_restores.items() if site not in jumps}
     classification = BiR0Classification(jumps, link_restores)
+    classification.resolved_branches = resolved
     classification.pc_getters = pc_getters
     classification.unproven = unproven
     classification.inherited_returns = {
@@ -1020,8 +1234,15 @@ class SPULifter:
         # compute_link_returns(). Emitted as `return;` so they compose with the
         # brsl->C-call nesting instead of branching to an unregistered PC.
         self.link_return: set = set()
+        # Members of an admitted chain must call their lifted counterparts so
+        # the reference path remains entirely lifted for A/B comparisons.
+        self.override_unit_by_member: dict[int, int] = {}
 
-    def _function_symbol(self, addr: int) -> str:
+    def _function_symbol(self, addr: int, caller: int | None = None) -> str:
+        if caller is not None:
+            unit = getattr(self, "override_unit_by_member", {}).get(caller)
+            if unit is not None and self.override_unit_by_member.get(addr) == unit:
+                return f"{self.prefix}spu_func_{addr:08X}"
         return self.overrides.get(addr, f"{self.prefix}spu_func_{addr:08X}")
 
     # ------------------------------------------------------------------ #
@@ -1076,13 +1297,15 @@ class SPULifter:
         # into the next sequential function. Emit a tail-call so the chain isn't
         # truncated (this was silently dropping execution mid-job).
         _TERMINATORS = {"br", "bra", "bi", "iret", "stop", "stopd"}
+        fallthrough = _ls_pc(end)
         if (last_insn is not None
                 and (last_insn.mnemonic not in _TERMINATORS
                      or (last_insn.mnemonic == "stop"
                          and (last_insn.raw & 0x3FFF) in LV2_RESUMING_STOPS))
-                and end in getattr(self, "func_starts", set())):
+                and fallthrough in getattr(self, "func_starts", set())):
             func.body_lines.append(
-                f"    {{ SPU_DIRECT(ctx, {self._pc(end)}, {self._function_symbol(end)}); }}")
+                f"    {{ SPU_DIRECT(ctx, {self._pc(fallthrough)}, "
+                f"{self._function_symbol(fallthrough, start)}); }}")
 
         # Infinite no-op self-loop (the SPU `br .` halt idiom): a function whose
         # whole body is nops + an unconditional branch back into itself does
@@ -1485,7 +1708,7 @@ class SPULifter:
                 # ctx->reloc_delta for itself; put this placement's back on return.
                 rs, rr = ("const int32_t _rd = ctx->reloc_delta; ", " ctx->reloc_delta = _rd;") if self.reloc else ("", "")
                 return (f"{link} {{ int32_t _si = (int32_t)ctx->image_id; {rs}"
-                        f"ctx->host_depth++; {self._function_symbol(tgt)}(ctx); "
+                        f"ctx->host_depth++; {self._function_symbol(tgt, func.start_addr)}(ctx); "
                         f"spu_drain_call(ctx, {self._pc(addr + 4)}); ctx->host_depth--; spu_img_restore(ctx, _si);{rr} }}")
             return f"{link} /* TODO spu: brsl unresolved target */;"
         if mn in _COND_BR:
@@ -1506,7 +1729,7 @@ class SPULifter:
             # tail call when the drain has nothing to do on this step, else
             # the trampoline and unwind (SPU_DIRECT, spu_context.h).
             return (f"if ({cond}) {{ SPU_DIRECT(ctx, {self._pc(tgt)}, "
-                    f"{self._function_symbol(tgt)}); }}")
+                    f"{self._function_symbol(tgt, func.start_addr)}); }}")
         # Interrupt enable/disable bits on the bi family (bie/bid, irete/iretd,
         # bisle(d)...): bit 0x40000 = E (enable), 0x80000 = D (disable), taking
         # effect when the branch is TAKEN. The WWS jobmanager's poll loop runs
@@ -1631,7 +1854,8 @@ class SPULifter:
         # drain has nothing to do on this step, else hand the target to the
         # trampoline and unwind so the enclosing SPU_DRAIN re-enters (no
         # host-stack growth either way; SPU_DIRECT, spu_context.h).
-        return (f"{{ SPU_DIRECT(ctx, {self._pc(tgt)}, {self._function_symbol(tgt)}); }}")
+        return (f"{{ SPU_DIRECT(ctx, {self._pc(tgt)}, "
+                f"{self._function_symbol(tgt, func.start_addr)}); }}")
 
     # ------------------------------------------------------------------ #
     def twin_renames(self) -> list[str]:
@@ -1774,7 +1998,7 @@ def main() -> None:
                         "targets that --auto-functions can't detect statically. "
                         "Splits the containing auto-detected function at each addr.")
     p.add_argument("--override", action="append", default=[], metavar="ADDR=SYMBOL",
-                   help="Replace a decoded leaf function's references with a native "
+                   help="Replace a proven leaf or closed tail-call unit with a native "
                         "void SYMBOL(spu_context*) supplied by the consumer. Repeatable.")
     p.add_argument("--return-entries", action="store_true",
                    help="Also make the return address of every call (brsl, "
@@ -2016,11 +2240,14 @@ def main() -> None:
         for address, symbol in overrides.items():
             if symbol in generated:
                 p.error(f"--override 0x{address:X} symbol {symbol!r} conflicts with a lifted symbol")
-            end = groups.get(address, ends[address])
-            problem = override_leaf_problem(insns, address, end, lifter.bi_r0_jump,
-                                            lifter.func_starts)
+            admission_entries = independent_entries | set(overrides)
+            members, _tail_graph, problem = override_unit_admission(
+                insns, bounds, address, lifter.bi_r0_jump, admission_entries)
             if problem:
-                p.error(f"--override 0x{address:X} refuses non-leaf function: {problem}")
+                kind = "override unit" if len(members) > 1 else "non-leaf function"
+                p.error(f"--override 0x{address:X} refuses {kind}: {problem}")
+            for member in members:
+                lifter.override_unit_by_member[member] = address
 
     for s, e in bounds:
         lifter.lift_function(insns, s, groups.get(s, e))
