@@ -375,8 +375,8 @@ def override_unit_admission(insns, bounds, entry: int, computed_jumps=(),
             for member in ordered_members:
                 if member <= point < ends[member]:
                     return (ordered_members, tail_graph,
-                            f"foreign entry point 0x{point:X} enters member "
-                            f"0x{member:X} of the override unit")
+                            (f"foreign entry point 0x{point:X} enters member "
+                             f"0x{member:X} of the override unit"))
         for insn in ordered_insns:
             source = owner.get(insn.addr)
             if source is None or source in members:
@@ -393,8 +393,8 @@ def override_unit_admission(insns, bounds, entry: int, computed_jumps=(),
                         if member <= target < ends[member] and target != entry:
                             kind = "call" if mn in ("brsl", "brasl") else "branch"
                             return (ordered_members, tail_graph,
-                                    f"foreign {kind} at 0x{insn.addr:X} targets override "
-                                    f"member 0x{target:X}")
+                                    (f"foreign {kind} at 0x{insn.addr:X} targets override "
+                                     f"member 0x{target:X}"))
             if _has_fallthrough(insn):
                 continuation = _ls_pc(insn.addr + 4)
                 for member in ordered_members:
@@ -403,8 +403,8 @@ def override_unit_admission(insns, bounds, entry: int, computed_jumps=(),
                                 if mn in ("brsl", "brasl", "bisl", "bisled")
                                 and not pc_getter else "fall-through")
                         return (ordered_members, tail_graph,
-                                f"foreign {kind} at 0x{insn.addr:X} enters override "
-                                f"member 0x{continuation:X}")
+                                (f"foreign {kind} at 0x{insn.addr:X} enters override "
+                                 f"member 0x{continuation:X}"))
 
         resolved = getattr(computed_jumps, "resolved_branches", {})
         if resolved:
@@ -421,14 +421,14 @@ def override_unit_admission(insns, bounds, entry: int, computed_jumps=(),
                     for member in ordered_members:
                         if member <= target < ends[member] and target != entry:
                             return (ordered_members, tail_graph,
-                                    f"foreign indirect {kind} at 0x{site:X} targets "
-                                    f"override member 0x{target:X}")
+                                    (f"foreign indirect {kind} at 0x{site:X} targets "
+                                     f"override member 0x{target:X}"))
         for site in sorted(getattr(computed_jumps, "unresolved_branches", ())):
             source = owner.get(site)
             if source is not None and source not in members:
                 return (ordered_members, tail_graph,
-                        f"unresolved indirect branch at 0x{site:X} outside the "
-                        "override unit prevents foreign-entry proof")
+                        (f"unresolved indirect branch at 0x{site:X} outside the "
+                         "override unit prevents foreign-entry proof"))
 
     has_return = False
     for member in ordered_members:
@@ -455,8 +455,8 @@ def override_unit_admission(insns, bounds, entry: int, computed_jumps=(),
             insn = body_by_addr.get(address)
             if insn is None:
                 return (ordered_members, tail_graph,
-                        f"reachable control flow at 0x{address:X} enters an "
-                        f"undecoded gap in member 0x{member:X}")
+                        (f"reachable control flow at 0x{address:X} enters an "
+                         f"undecoded gap in member 0x{member:X}"))
             mn = insn.mnemonic
             ops = _ops(insn.operands)
             if (mn == "bi" and ops and _reg(ops[0]) == "0"
@@ -464,7 +464,9 @@ def override_unit_admission(insns, bounds, entry: int, computed_jumps=(),
                 reachable_return = True
                 continue
 
-            def follow(target, edge):
+            # Defaults bind this iteration's state; follow runs only inside it.
+            def follow(target, edge, insn=insn, member=member,
+                       body_by_addr=body_by_addr, worklist=worklist):
                 if member <= target < ends[member]:
                     if target not in body_by_addr:
                         return (f"reachable {edge} at 0x{insn.addr:X} enters "
