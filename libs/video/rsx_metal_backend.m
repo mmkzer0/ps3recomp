@@ -5467,7 +5467,7 @@ int rsx_metal_backend_capture_environment(rsx_capture_environment* env)
         snprintf(os_version, sizeof os_version, "%s",
                  [[[NSProcessInfo processInfo] operatingSystemVersionString] UTF8String]);
         snprintf(driver, sizeof driver, "n/a");
-        if (@available(macOS 14.0, *))
+        if (@available(macOS 14.0, iOS 17.0, *))
             snprintf(driver, sizeof driver, "%s", [[[s_dev architecture] name] UTF8String]);
     }
     env->os = "macOS";
