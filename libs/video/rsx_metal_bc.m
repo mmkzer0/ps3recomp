@@ -92,6 +92,14 @@ typedef struct { uint32_t width, height, blocks_w, blocks_h, format; } RsxBcPara
 @implementation RsxMetalBcSlot
 @end
 
+/* One decode committed and not yet completed: what it fills (for a timeout's report) and the texture it writes. */
+@interface RsxMetalBcPending : NSObject
+@property(nonatomic, copy) NSString* what;
+@property(nonatomic, strong) id<MTLTexture> texture;
+@end
+@implementation RsxMetalBcPending
+@end
+
 /* Decodes in flight. A decode holds up to a level's blocks plus four times that in RGBA; capping them bounds
  * the staging a texture-heavy scene can pin on a 3 GB device. */
 enum { RSX_METAL_BC_SLOTS = 4 };
@@ -117,7 +125,8 @@ static uint64_t monotonic_ms(void)
     dispatch_semaphore_t _slots;
     pthread_mutex_t _lock;                  /* _free, the failure record and the test hooks */
     NSMutableArray<RsxMetalBcSlot*>* _free;
-    NSMutableArray<NSString*>* _pending;    /* decodes committed and not yet completed, for a timeout's report */
+    NSMutableArray<RsxMetalBcPending*>* _pending;   /* decodes committed and not yet completed: a timeout's report and the
+                                                     * textures a CPU write must not overlap */
     unsigned _failures;
     NSString* _failureTexture;              /* the first failed decode: what it was filling ... */
     NSString* _failureError;                /* ... and what Metal said */
@@ -286,7 +295,10 @@ static uint64_t monotonic_ms(void)
     pthread_mutex_unlock(&_lock);
 #endif
     pthread_mutex_lock(&_lock);
-    [_pending addObject:what];
+    RsxMetalBcPending* entry = [RsxMetalBcPending new];
+    entry.what = what;
+    entry.texture = texture;
+    [_pending addObject:entry];
     pthread_mutex_unlock(&_lock);
     [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
 #ifdef RSX_METAL_BC_TEST_HOOKS
@@ -312,7 +324,7 @@ static uint64_t monotonic_ms(void)
          * decoder (the caller's completion block aside). */
         pthread_mutex_lock(&self->_lock);
         if (failed) [self recordFailureLockedOf:what error:why];
-        { const NSUInteger at = [self->_pending indexOfObject:what];   /* one entry: equal levels can be pending twice */
+        { const NSUInteger at = [self->_pending indexOfObjectIdenticalTo:entry];   /* by identity: equal levels can be pending twice */
           if (at != NSNotFound) [self->_pending removeObjectAtIndex:at]; }
         pthread_mutex_unlock(&self->_lock);
 #ifdef RSX_METAL_BC_TEST_HOOKS
@@ -372,7 +384,7 @@ static uint64_t monotonic_ms(void)
         if (at_deadline) at_deadline();
 #endif
         pthread_mutex_lock(&_lock);
-        if ([_pending count]) pending = [_pending componentsJoinedByString:@"; "];
+        if ([_pending count]) pending = [[_pending valueForKey:@"what"] componentsJoinedByString:@"; "];
         pthread_mutex_unlock(&_lock);
         break;
     }
@@ -399,6 +411,16 @@ static uint64_t monotonic_ms(void)
     const unsigned n = (unsigned)[_pending count];
     pthread_mutex_unlock(&_lock);
     return n;
+}
+
+- (BOOL)hasPendingDecodeFor:(id<MTLTexture>)texture
+{
+    BOOL any = NO;
+    pthread_mutex_lock(&_lock);
+    for (RsxMetalBcPending* e in _pending)
+        if (e.texture == texture) { any = YES; break; }
+    pthread_mutex_unlock(&_lock);
+    return any;
 }
 
 - (NSString*)failureTexture

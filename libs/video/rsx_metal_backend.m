@@ -2796,6 +2796,12 @@ static u32 s_eng_dropped;
  * creation point (commit serial, records so far) says whether a draw can have been recorded against the
  * texture since: records only grow between commits, and a commit changes the serial. */
 #define ENG_BC_EMULATED 0x80u
+#define ENG_BC_GPU_TIER 0x40u   /* set with EMULATED: every upload of this texture takes the GPU tier while it is fresh */
+#define ENG_BC_FORMAT_MASK 0x3Fu
+#ifdef RSX_METAL_BC_TEST_HOOKS
+static unsigned s_test_bc_guard_waits;          /* CPU writes that found a decode pending for their texture and waited */
+static unsigned s_test_bc_cpu_write_hazards;    /* CPU writes done while a decode of their texture was still pending */
+#endif
 static u8  s_eng_bc[ENG_MAX_OBJECTS];
 static u32 s_eng_bc_serial[ENG_MAX_OBJECTS];
 static u32 s_eng_bc_records[ENG_MAX_OBJECTS];
@@ -3855,22 +3861,46 @@ static MTLPixelFormat eng_texture_format(rsx_be_format fmt, u8* bc_tag)
     return s_eng_bc_emulate ? MTLPixelFormatRGBA8Unorm : eng_pixel_format(fmt);
 }
 
-static void eng_bc_note_created(u32 handle, u8 bc_tag)
+/* The tier of a texture is decided once, at its creation, from its largest level (the creation size: level 0 of
+ * a 2D, cube or 3D texture, width times height): under tiered, a texture whose largest level has at least
+ * rsx.bc_gpu_min_texels texels decodes every level, face and slice on the GPU, any smaller one every level on
+ * the CPU; gpu is all GPU, cpu all CPU. A texture never mixes the tiers in the normal case, so a CPU write
+ * never meets a GPU decode of the same texture (eng_bc_cpu_write_guard is for the cases that do). */
+static void eng_bc_note_created(u32 handle, u8 bc_tag, u32 w, u32 h)
 {
     if (!handle) return;
+    if ((bc_tag & ENG_BC_EMULATED) &&
+        (s_eng_bc_path == ENG_BC_PATH_GPU || (s_eng_bc_path == ENG_BC_PATH_TIERED && (u64)w * h >= s_eng_bc_min_texels)))
+        bc_tag |= ENG_BC_GPU_TIER;
     s_eng_bc[handle - 1] = bc_tag;
     s_eng_bc_serial[handle - 1] = s_eng_commit_serial;
     s_eng_bc_records[handle - 1] = s_eng_rec_count;
 }
 
-/* 1 CPU tier, 2 GPU tier (the values of PS3_FT_BC_UPLOAD's b). */
-static int eng_bc_pick_tier(u32 handle, u32 texels)
+/* 1 CPU tier, 2 GPU tier (the values of PS3_FT_BC_UPLOAD's b), for one upload into the texture. The GPU tier only
+ * for a texture created for it and while it is fresh (no draw recorded against it, no commit since); a refresh
+ * of any other kind is CPU. */
+static int eng_bc_pick_tier(u32 handle)
 {
-    if (s_eng_bc_path == ENG_BC_PATH_CPU) return 1;
-    if (s_eng_bc_path == ENG_BC_PATH_TIERED && texels < s_eng_bc_min_texels) return 1;
+    if (!(s_eng_bc[handle - 1] & ENG_BC_GPU_TIER)) return 1;
     const int fresh = s_eng_bc_serial[handle - 1] == s_eng_commit_serial &&
                       s_eng_bc_records[handle - 1] == s_eng_rec_count;
     return fresh && eng_bc_gpu() ? 2 : 1;
+}
+
+/* No CPU write (replaceRegion) may overlap a GPU write to the same texture: Metal leaves a CPU access to a
+ * resource the GPU may be writing undefined, and on a device whose CPU writes go through a shadow copy (the
+ * paravirtual device of a CI runner) it overwrote the GPU's level. A texture whose tier is chosen as above never
+ * gets here with a decode pending; one that does (a level whose GPU decode was refused, a refresh after a draw
+ * was recorded) first waits for the decodes committed so far, exactly as a frame commit does (eng_bc_settle:
+ * bounded, and a failed or hung decode ends the run there). */
+static void eng_bc_cpu_write_guard(id<MTLTexture> t)
+{
+    if (![s_eng_bc_gpu hasPendingDecodeFor:t]) return;
+#ifdef RSX_METAL_BC_TEST_HOOKS
+    s_test_bc_guard_waits++;
+#endif
+    eng_bc_settle();
 }
 
 static u8* s_eng_bc_rgba;
@@ -3884,7 +3914,7 @@ static void eng_bc_upload(u32 handle, u32 face, u32 mip, u32 z, int volume,
                           u32 w, u32 h, const void* src, u32 row_bytes)
 {
     id<MTLTexture> t = eng_obj(handle);
-    const rsx_bc_format fmt = (rsx_bc_format)(s_eng_bc[handle - 1] & ~ENG_BC_EMULATED);
+    const rsx_bc_format fmt = (rsx_bc_format)(s_eng_bc[handle - 1] & ENG_BC_FORMAT_MASK);
     const u32 blocks_w = (w + 3u) / 4u, blocks_h = (h + 3u) / 4u;
     const size_t block_bytes = fmt == RSX_BC_FORMAT_BC1 ? 8u : 16u;
     if (row_bytes != blocks_w * block_bytes)
@@ -3894,7 +3924,7 @@ static void eng_bc_upload(u32 handle, u32 face, u32 mip, u32 z, int volume,
     const u32 texels = w * h;
     const uint64_t ft0 = PS3_FT_ON() ? ps3_ft_now() : 0;
 
-    int tier = eng_bc_pick_tier(handle, texels);
+    int tier = eng_bc_pick_tier(handle);
     if (tier == 2 &&
         ![s_eng_bc_gpu decodeBlocks:src size:bytes format:fmt width:w height:h into:t
                               slice:volume ? 0 : face level:mip z:volume ? z : 0
@@ -3913,6 +3943,10 @@ static void eng_bc_upload(u32 handle, u32 face, u32 mip, u32 z, int volume,
         if (!eng_bc_decode_cpu((const uint8_t*)src, bytes, w, h, fmt, s_eng_bc_rgba, pitch))
             eng_bc_stop("bc-decode-rejected", "rsx_bc_decode refused a BC level",
                         "the level's size and block bytes disagree (report this line)");
+        eng_bc_cpu_write_guard(t);
+#ifdef RSX_METAL_BC_TEST_HOOKS
+        if ([s_eng_bc_gpu hasPendingDecodeFor:t]) s_test_bc_cpu_write_hazards++;   /* checked at the write, apart from the guard */
+#endif
         if (volume)
             [t replaceRegion:MTLRegionMake3D(0, 0, z, w, h, 1) mipmapLevel:mip slice:0
                    withBytes:s_eng_bc_rgba bytesPerRow:pitch bytesPerImage:need];
@@ -3947,7 +3981,7 @@ static u32 eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
         swizzle_sel(sel[1]), swizzle_sel(sel[2]),
         swizzle_sel(sel[3]), swizzle_sel(sel[0]));
     const u32 handle = eng_obj_add(eng_new_texture(td, "texture allocation"));
-    eng_bc_note_created(handle, bc_tag);
+    eng_bc_note_created(handle, bc_tag, w, h);
     return handle;
 }
 
@@ -3992,7 +4026,7 @@ static u32 eng_texture_create_3d(void* user, rsx_be_format fmt, u32 w, u32 h,
         swizzle_sel(sel[1]), swizzle_sel(sel[2]),
         swizzle_sel(sel[3]), swizzle_sel(sel[0]));
     const u32 handle = eng_obj_add(eng_new_texture(td, "3D texture allocation"));
-    eng_bc_note_created(handle, bc_tag);
+    eng_bc_note_created(handle, bc_tag, w, h);
     return handle;
 }
 
