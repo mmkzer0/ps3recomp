@@ -113,6 +113,14 @@ the same partition over all of that tid's view-to-view gaps (the base rate). A
 header `dropped > 0` marks the section INCOMPLETE; a trace without the kinds
 prints one line.
 
+A BC-upload section (kind 34, BC_UPLOAD; rsx.bc_path) appears only in a trace that has the kind: one span per
+upload into an emulated BC1/2/3 texture (one level of one face or 3D slice), per format and tier (cpu, gpu):
+the uploads, their texels, the RSX thread's time inside them (the CPU tier's decode and texture write; the GPU
+tier's staging copy, encode and commit, never the GPU's run), the mean ns per texel and the per-upload p50, p99
+and max; per flip request when the trace dropped nothing. A trace without the kind prints and reports nothing
+about it, and the per-frame RSX rows gain "bc upload (cpu)" / "bc upload (gpu)" only when it has them. The
+uploads run inside the RSX thread's drain spans, so those rows overlap "drain", as the encode rows do.
+
 A BC-settle section (kind 35, BC_SETTLE) likewise appears only in a trace that has the kind: one span per frame
 commit while the Metal backend's GPU BC tier exists, the RSX thread's wait for the decodes committed so far
 (`a` = decodes in flight when it began, `b` = 0 done, 1 a decode had failed, 2 the bound ran out). It reports the
@@ -147,8 +155,8 @@ import tempfile
  GPU_ENCODE, GPU_WAIT, READBACK, GPU_EXEC, HLE, DRAWABLE, LABEL_WAIT,
  AUDIO_MIX, AUDIO_PACE, AUDIO_UNDERRUN, AUDIO_STALE,
  JQ2_PUSH, JQ2_JOB, JQ2_CREDIT, JQ2_SYNC_WAIT, JQ2_IDLE, JQ2_HELD, JQ2_BARRIER,
- JQ2_IMAGE, AUDIO_RING, AUDIO_RING_VIEW, JQ2_BODY, JQ2_XDIFF) = range(1, 34)
-# The numbers mirror include/ps3emu/ps3_ftrace.h (PS3_FT_*, 32 and 33 included); the tool reads text
+ JQ2_IMAGE, AUDIO_RING, AUDIO_RING_VIEW, JQ2_BODY, JQ2_XDIFF, BC_UPLOAD, BC_SETTLE) = range(1, 36)
+# The numbers mirror include/ps3emu/ps3_ftrace.h (PS3_FT_*, 32 to 35 included); the tool reads text
 # traces without the header, so a new kind is added in both places.
 # Labels are report keys that saved runs and scripts compare: keep them, append new reasons.
 AUDIO_PACE_REASON = {1: "queue full", 2: "clock pacing", 3: "backend wait", 4: "restart"}
@@ -190,6 +198,8 @@ AUDIO_STALE_BANDS = ((1, 1, "1"), (2, 2, "2"), (3, 4, "3-4"), (5, 8, "5-8"), (9,
 AUDIO_GET_PORT_CONFIG_NID = 0x74A66AF0  # cellAudioGetPortConfig: the producer's own view is not "other HLE"
 AUDIO_RING_ATTRIBUTION = ("usleep", "jq2 sync wait", "other HLE", "other")  # one instant charged once
 GPU_WAIT_KIND = {0: "gpu wait (flush)", 1: "gpu wait (present)", 2: "gpu wait (in-flight)"}
+BC_FORMATS = {1: "BC1", 2: "BC2", 3: "BC3"}   # kind 34 who: the rsx_bc_format
+BC_TIERS = {1: "cpu", 2: "gpu"}                # kind 34 b
 GPU_WAIT_INFLIGHT = 2
 SPINS_SLEEPING = 64      # cellGcmSys.c yields for 64 spins, then sleeps 1 ms per spin
 ATTRIBUTION = ("drawable", "gpu wait (in-flight)", "encode", "present", "drain", "rest")
@@ -422,6 +432,8 @@ def frame_key(k, who, a, b):
         return ("rsx", "encode (present)" if a else "encode (flush)")
     if k == GPU_WAIT:
         return ("rsx", GPU_WAIT_KIND.get(a, "gpu wait"))
+    if k == BC_UPLOAD:
+        return ("rsx", f"bc upload ({BC_TIERS.get(b, 'tier ' + str(b))})")
     if k == BC_SETTLE:
         return ("rsx", "bc settle")
     if k == READBACK:
@@ -2801,6 +2813,34 @@ def print_jq2_section(jq):
     print_jq2_trace_cost(jq["trace_cost"])
 
 
+def bc_upload_section(spans, flip_requests, dropped):
+    """Kind 34: the uploads into emulated BC textures, per format and tier. None when the trace has none.
+
+    A span is the RSX thread's time inside one upload (a level of one face or slice), so `ms` is thread time,
+    not GPU time. Per-flip rates are sums over the whole trace divided by the flip requests, and only for a
+    trace that dropped nothing."""
+    uploads = [s for s in spans if s[0] == BC_UPLOAD]
+    if not uploads:
+        return None
+    groups = collections.defaultdict(list)
+    for _, fmt, texels, tier, t0, t1 in uploads:
+        groups[(fmt, tier)].append((texels, t1 - t0))
+    rates = dropped == 0 and flip_requests > 0
+    rows = []
+    for (fmt, tier), v in sorted(groups.items()):
+        ms = sorted(x[1] for x in v)
+        texels = sum(x[0] for x in v)
+        total = sum(ms)
+        rows.append({
+            "format": BC_FORMATS.get(fmt, f"unknown {fmt}"), "tier": BC_TIERS.get(tier, f"unknown {tier}"),
+            "uploads": len(v), "texels": texels, "ms": total,
+            "ns_per_texel": total * 1e6 / texels if texels else None,
+            "upload_ms": {"p50": nearest_rank(ms, 50), "p99": nearest_rank(ms, 99), "max": ms[-1]},
+            "uploads_per_flip": len(v) / flip_requests if rates else None,
+            "ms_per_flip": total / flip_requests if rates else None})
+    return {"uploads": len(uploads), "rows": rows}
+
+
 def bc_settle_section(spans, flip_requests, dropped):
     """Kind 35: the RSX thread's wait for GPU-tier BC decodes before each frame commit. None when absent.
 
@@ -2843,6 +2883,9 @@ def build_report(header, names, spans, images, split=None, cad=(None, None), gap
     report["audio"] = audio_section(spans, header_dropped(header), name_of)
     report["jq2"] = jq2_section(spans, header, names, images)
     report["audio_ring"] = audio_ring_section(spans, header, names)
+    bc = bc_upload_section(spans, len(flips), header_dropped(header))
+    if bc is not None:   # absent, not null, so a trace without kind 34 reports exactly what it did before
+        report["bc_upload"] = bc
     bs = bc_settle_section(spans, len(flips), header_dropped(header))
     if bs is not None:   # absent when the trace has no kind 35, like bc_upload
         report["bc_settle"] = bs
@@ -2855,6 +2898,19 @@ def build_report(header, names, spans, images, split=None, cad=(None, None), gap
 
 def report_json(report):
     return json.dumps(report, indent=1, sort_keys=True) + "\n"
+
+
+def print_bc_upload_section(sec):
+    if sec is None:
+        return
+    print(f"\nBC uploads (emulated BC1/2/3 textures, kind 34; {sec['uploads']} upload(s); time is the RSX thread's):")
+    for r in sec["rows"]:
+        ns = f"{r['ns_per_texel']:.2f} ns/texel" if r["ns_per_texel"] is not None else "n/a"
+        flip = (f"  {r['uploads_per_flip']:.2f} uploads and {r['ms_per_flip']:.2f} ms per flip"
+                if r["ms_per_flip"] is not None else "")
+        u = r["upload_ms"]
+        print(f"  {r['format']} {r['tier']:3s} {r['uploads']:6d} uploads {r['texels']:11d} texels {r['ms']:9.2f} ms"
+              f"  {ns}  p50 {u['p50']:.3f} p99 {u['p99']:.3f} max {u['max']:.3f} ms{flip}")
 
 
 def print_bc_settle_section(sec):
@@ -2915,6 +2971,7 @@ def main():
     print_audio_section(report["audio"])
     print_jq2_section(report["jq2"])
     print_audio_ring_section(report["audio_ring"])
+    print_bc_upload_section(report.get("bc_upload"))
     print_bc_settle_section(report.get("bc_settle"))
     if "cadence" in report:
         c = report["cadence"]

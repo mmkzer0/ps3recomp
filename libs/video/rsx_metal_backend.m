@@ -93,6 +93,16 @@
 #include "rsx_capture.h"
 #include "ps3emu/stop.h"
 #include "ps3emu/host_gpu_gate.h"
+#include "rsx_bc_decode.h"
+/* The BC emulation lives in this translation unit, not in sources a fixture would have to name: the fixtures that
+ * include this file have fixed link lines (and a static undefined symbol cannot be made weak with this linker).
+ * The CPU tier's decoder (rsx_bc_decode.c, also built on its own for the tests) gets a private name here, so
+ * the test that includes this file and the decoder's own object never collide and a test's reference decode is
+ * never this copy. */
+#define rsx_bc_decode eng_bc_decode_cpu
+#include "rsx_bc_decode.c"
+#undef rsx_bc_decode
+#include "rsx_metal_bc.m"    /* the GPU tier (see rsx_metal_bc.h) */
 #include <time.h>
 #include <dlfcn.h>
 /* The capture module is optional in a link (tests build this file without it):
@@ -146,6 +156,48 @@ static unsigned long long eng_host_paused_ms(void)
     return v;
 }
 
+/* The last command buffer committed on s_queue, which every commit of the backend uses (the frame's, a fence, a
+ * readback blit, and the BC decoder's through rsx_metal_bc_host.commit). Commits go through eng_commit, which
+ * holds s_last_commit_lock across the commit and the record, so the record is the last one in the queue's order
+ * whichever thread committed. Buffers of one queue are scheduled in the order they were committed, so waiting for
+ * the last one covers every earlier one. Dropped at shutdown. */
+static pthread_mutex_t s_last_commit_lock = PTHREAD_MUTEX_INITIALIZER;
+static id<MTLCommandBuffer> s_last_committed;
+#ifdef RSX_METAL_BC_TEST_HOOKS
+/* What the lifecycle drain waited on: the buffer, its status afterwards, and how many times it waited. */
+static id<MTLCommandBuffer> s_test_scheduled_buffer;
+static long s_test_scheduled_status;
+static unsigned s_test_scheduled_waits;
+#endif
+
+static void eng_commit(id<MTLCommandBuffer> cb)
+{
+    pthread_mutex_lock(&s_last_commit_lock);
+    [cb commit];
+    s_last_committed = cb;
+    pthread_mutex_unlock(&s_last_commit_lock);
+}
+
+/* A buffer that is committed but not yet scheduled when the app goes inactive can be refused by the OS and end
+ * in an error (Apple, "Preparing your Metal app to run in the background": previously committed command buffers
+ * must be scheduled before the app returns to the background, waitUntilScheduled being the call for it). The
+ * gate's drain only waits for the CPU sections, which end at the commit, so this waits for the scheduling of the
+ * last buffer on the queue; the earlier ones are scheduled before it, in commit order. Scheduling is not
+ * completion: the GPU may still run them, which the OS allows in the background. */
+static void eng_wait_last_scheduled(void)
+{
+    pthread_mutex_lock(&s_last_commit_lock);
+    id<MTLCommandBuffer> last = s_last_committed;
+    pthread_mutex_unlock(&s_last_commit_lock);
+    if (!last) return;
+    [last waitUntilScheduled];
+#ifdef RSX_METAL_BC_TEST_HOOKS
+    s_test_scheduled_buffer = last;
+    s_test_scheduled_status = (long)[last status];
+    s_test_scheduled_waits++;
+#endif
+}
+
 void rsx_metal_backend_gpu_suspend(void)
 {
     pthread_mutex_lock(&s_pause_lock);
@@ -156,9 +208,13 @@ void rsx_metal_backend_gpu_suspend(void)
      * only dispatch_sync to it, ps3recomp_metal_ios_configure_layer, runs from backend init, outside any
      * section), so the drain is not a deadlock; the bound is for a section that is merely slow. */
     if (!host_gpu_gate_suspend(&s_gpu_gate, ENG_GATE_DRAIN_NS))
+        /* A section is still open, so a commit may follow: no wait here (the main thread must not block on a
+         * section that is stuck); the commit that follows is the host's to refuse, as logged. */
         fprintf(stderr, "[RSX metal] !!!! app inactive: a GPU section was still open after %llu ms; its commit may "
                         "follow will-resign-active (and be refused by the host)\n",
                 (unsigned long long)(ENG_GATE_DRAIN_NS / 1000000ull));
+    else
+        eng_wait_last_scheduled();   /* no section is open and none opens while the gate is closed: nothing commits after */
 }
 
 void rsx_metal_backend_gpu_resume(void)
@@ -1458,15 +1514,31 @@ static int guest_programs_for(const rsx_state* st, MtlDraw* d)
 }
 
 /* ---- guest textures ------------------------------------------------------ */
+/* The native BC pixel formats exist from iOS 16.4 (macOS 10.11); the deployment target is 16.0, so the enum
+ * names are only ever referenced under @available. `bc` is 1 (BC1), 2 or 3; Invalid where the OS lacks them,
+ * which is where eng_device_supports_bc() is 0 and nothing asks for a native BC texture. */
+static MTLPixelFormat bc_native_format(int bc)
+{
+    if (@available(iOS 16.4, macOS 10.11, *)) {
+        switch (bc) {
+        case 1: return MTLPixelFormatBC1_RGBA;
+        case 2: return MTLPixelFormatBC2_RGBA;
+        case 3: return MTLPixelFormatBC3_RGBA;
+        default: break;
+        }
+    }
+    return MTLPixelFormatInvalid;
+}
+
 
 static MTLPixelFormat texfmt_to_metal(rsx_texfmt f)
 {
     switch (f) {
     case RSX_TEXFMT_R8G8:     return MTLPixelFormatRG8Unorm;
     case RSX_TEXFMT_R8G8B8A8: return MTLPixelFormatRGBA8Unorm;
-    case RSX_TEXFMT_BC1:      return MTLPixelFormatBC1_RGBA;
-    case RSX_TEXFMT_BC2:      return MTLPixelFormatBC2_RGBA;
-    case RSX_TEXFMT_BC3:      return MTLPixelFormatBC3_RGBA;
+    case RSX_TEXFMT_BC1:      return bc_native_format(1);
+    case RSX_TEXFMT_BC2:      return bc_native_format(2);
+    case RSX_TEXFMT_BC3:      return bc_native_format(3);
     case RSX_TEXFMT_R16:      return MTLPixelFormatR16Unorm;
     case RSX_TEXFMT_R16G16:   return MTLPixelFormatRG16Unorm;
     case RSX_TEXFMT_R16G16F:  return MTLPixelFormatRG16Float;
@@ -2719,6 +2791,28 @@ static EngRecord s_eng_rec[ENG_MAX_RECORDS];
 static u32 s_eng_rec_count;
 static u32 s_eng_dropped;
 
+/* BC1/2/3 emulation bookkeeping (see "BC texture emulation" below). Per object slot: 0 for anything that is not
+ * a guest BC texture, else the format (1..3) with 0x80 set when the texture is RGBA8 filled by our decoder. The
+ * creation point (commit serial, records so far) says whether a draw can have been recorded against the
+ * texture since: records only grow between commits, and a commit changes the serial. */
+#define ENG_BC_EMULATED 0x80u
+static u8  s_eng_bc[ENG_MAX_OBJECTS];
+static u32 s_eng_bc_serial[ENG_MAX_OBJECTS];
+static u32 s_eng_bc_records[ENG_MAX_OBJECTS];
+static u32 s_eng_commit_serial;
+/* The tier policy: what rsx.bc_path asked for (set_bc_policy), what it came to on this device (read once, at
+ * the first BC texture: eng_bc_policy_read), and the GPU tier's decoder. */
+enum { ENG_BC_PATH_AUTO = 1, ENG_BC_PATH_CPU, ENG_BC_PATH_GPU, ENG_BC_PATH_TIERED };
+static int s_eng_bc_requested, s_eng_bc_policy_read, s_eng_bc_emulate, s_eng_bc_path, s_eng_bc_gpu_unavailable;
+static u32 s_eng_bc_min_texels;
+static RsxMetalBc* s_eng_bc_gpu;
+static u32 s_eng_bc_tier_uploads[3];   /* uploads per tier since init: [1] CPU, [2] GPU (the fixture reads them) */
+/* eng_bc_settle's bound (see there; a test shortens it) and what the waits added up to. */
+#define ENG_BC_SETTLE_BUDGET_MS 8000u
+static u64 s_eng_bc_settle_budget_ms = ENG_BC_SETTLE_BUDGET_MS;
+static u32 s_eng_bc_settles;
+static u64 s_eng_bc_settle_ns, s_eng_bc_settle_max_ns;
+
 static u8* s_eng_stage;
 static u32 s_eng_stage_used, s_eng_stage_cap;
 /* The staging arena is the contents of a shared MTLBuffer, handed to the
@@ -3303,6 +3397,7 @@ static u32 eng_obj_add(id<MTLTexture> t)
         slot = s_eng_obj_count++;
     }
     s_eng_obj[slot] = t;
+    s_eng_bc[slot] = 0;
     return slot + 1;
 }
 
@@ -3347,9 +3442,9 @@ static MTLPixelFormat eng_pixel_format(rsx_be_format f)
     case RSX_BE_FMT_R8:              return MTLPixelFormatR8Unorm;
     case RSX_BE_FMT_R8G8:            return MTLPixelFormatRG8Unorm;
     case RSX_BE_FMT_R8G8B8A8:        return MTLPixelFormatRGBA8Unorm;
-    case RSX_BE_FMT_BC1:             return MTLPixelFormatBC1_RGBA;
-    case RSX_BE_FMT_BC2:             return MTLPixelFormatBC2_RGBA;
-    case RSX_BE_FMT_BC3:             return MTLPixelFormatBC3_RGBA;
+    case RSX_BE_FMT_BC1:             return bc_native_format(1);
+    case RSX_BE_FMT_BC2:             return bc_native_format(2);
+    case RSX_BE_FMT_BC3:             return bc_native_format(3);
     case RSX_BE_FMT_R16:             return MTLPixelFormatR16Unorm;
     case RSX_BE_FMT_R16G16:          return MTLPixelFormatRG16Unorm;
     case RSX_BE_FMT_R16G16F:         return MTLPixelFormatRG16Float;
@@ -3479,6 +3574,22 @@ static id<MTLBuffer> s_eng_depth_staging;
 static void eng_shutdown(void* user)
 {
     (void)user;
+    /* A decode still in flight owns buffers and, when it fails, writes the decoder's failure record from a Metal
+     * thread: wait for it before anything is reset, so a late completion can never reach a later run (the decoder
+     * object is dropped below, and a new run makes its own: the record is per decoder, which is the scope). */
+    if (s_eng_bc_gpu) {
+        NSString* pending = [s_eng_bc_gpu waitIdleWithin:s_eng_bc_settle_budget_ms];
+        if (pending)
+            fprintf(stderr, "[rsx engine/metal] shutdown: BC decode(s) never completed (%s); abandoned\n",
+                    [pending UTF8String]);
+        if ([s_eng_bc_gpu failureCount])
+            fprintf(stderr, "[rsx engine/metal] shutdown: %u BC decode(s) had failed\n", [s_eng_bc_gpu failureCount]);
+        if (s_eng_bc_settles)
+            fprintf(stderr, "[rsx engine/metal] BC settle: %u commit(s) waited %.3f ms in all, %.3f ms at most\n",
+                    s_eng_bc_settles, (double)s_eng_bc_settle_ns / 1e6, (double)s_eng_bc_settle_max_ns / 1e6);
+    }
+    s_eng_bc_settles = 0;
+    s_eng_bc_settle_ns = s_eng_bc_settle_max_ns = 0;
     for (u32 i = 0; i < s_eng_obj_count; i++) s_eng_obj[i] = nil;
     for (u32 i = 0; i < s_eng_pipe_count; i++) {
         s_eng_pipe[i].pso = nil;
@@ -3518,6 +3629,10 @@ static void eng_shutdown(void* user)
     s_eng_shown = nil;
     rsx_display_reset(&s_eng_display);
     s_eng_depth_staging = nil;
+    memset(s_eng_bc, 0, sizeof s_eng_bc);
+    s_eng_bc_gpu = nil;
+    s_eng_bc_policy_read = s_eng_bc_gpu_unavailable = 0;
+    memset(s_eng_bc_tier_uploads, 0, sizeof s_eng_bc_tier_uploads);
 }
 
 static u32 s_ft_flush_reason;   /* PS3_FTRACE: why the commit in progress was asked for */
@@ -3531,7 +3646,6 @@ static void eng_submit_and_wait(void* user, u32 reason)
 /* ---- resources ----------------------------------------------------------- */
 
 #if TARGET_OS_IPHONE
-static BOOL s_ios_supports_bc;
 static BOOL s_ios_supports_border;
 
 static PS3_NORETURN void eng_ios_feature_stop(const char* what, const char* remedy,
@@ -3539,26 +3653,278 @@ static PS3_NORETURN void eng_ios_feature_stop(const char* what, const char* reme
 {
     eng_stop_standalone(PS3_STOP_GCM_UNMODELLED, "gcm-unmodelled", what, remedy, fields, count);
 }
+#endif
 
-static void eng_require_bc(void* user, u32 format, u32 location, u32 offset, u32 size)
+/* ---- BC texture emulation ------------------------------------------------
+ *
+ * A device that cannot sample BC (A11 and older), or rsx.bc_path asking for it (cpu, gpu and tiered also apply
+ * on a BC-capable Mac, for measurement), holds a guest BC1/2/3 texture as RGBA8Unorm that our decoder fills. The
+ * view swizzle from the crossbar, the mip chain, the cube faces and the 3D slices are the native texture's; only
+ * the pixel format and what an upload writes differ. Every guest BC format is emulated, so nothing is left for a
+ * "device cannot sample BC" stop.
+ *
+ * Tiers (rsx.bc_path): cpu = rsx_bc_decode into a scratch on the RSX thread, then replaceRegion; gpu = the
+ * compute kernel of rsx_metal_bc.m; tiered = gpu for a level of rsx.bc_gpu_min_texels texels or more, else cpu;
+ * auto = native where the device samples BC, else tiered. The size is that of one upload: one level of one face
+ * or slice. The GPU tier writes exactly the bytes the CPU tier writes (test_rsx_bc_metal.m).
+ *
+ * Why a GPU decode runs before every draw that samples its texture. (1) The engine only records draws; the
+ * frame's command buffer does not exist until eng_encode_and_commit_section creates it, and a texture is
+ * uploaded while the draw that needs it is being recorded. So the decode's command buffer is created and
+ * committed first, inside its own gate section like every commit (the gate hooks below). (2) s_queue is the one
+ * queue every command buffer here goes through, and a queue runs command buffers in the order they are enqueued;
+ * a buffer is enqueued by -commit (nothing in this file calls -enqueue), and the frame's buffer is created and
+ * committed in one section, after the decode's commit returned. (3) The texture was created by this upload
+ * (eng_bc_fresh: no commit and no record since), so no draw recorded earlier can sample it, and the decode
+ * overwrites nothing an earlier draw reads. A rewrite of an existing texture, which Metal never asks for
+ * (this backend leaves texture_upload_ordered at 0, so the engine creates a new texture instead), would be a
+ * write-after-read hazard against draws already recorded: it takes the CPU tier, like any texture not fresh. */
+
+static PS3_NORETURN void eng_bc_stop(const char* feature, const char* reason, const char* remedy)
+{
+    const ps3_stop_field fields[] = { {"func", "eng_bc_upload"}, {"feature", feature}, {"reason", reason} };
+    eng_stop_standalone(PS3_STOP_GCM_UNMODELLED, "gcm-unmodelled",
+                        "a guest BC texture cannot be decoded for the Metal device", remedy,
+                        fields, sizeof fields / sizeof fields[0]);
+}
+
+/* rsx.bc_path and rsx.bc_gpu_min_texels, handed over by the engine at its init (rsx_draw_backend.set_bc_policy;
+ * the engine reads the registry, so this file links against nothing of it). The registry has validated the
+ * string; anything else is a fixture's own mistake and stops by name. */
+static void eng_bc_set_policy(void* user, const char* path, u32 gpu_min_texels)
 {
     (void)user;
-    if (s_ios_supports_bc) return;
-    char fmt[16], loc[16], off[16], bytes[16];
-    snprintf(fmt, sizeof fmt, "0x%02X", format);
-    snprintf(loc, sizeof loc, "%u", location);
-    snprintf(off, sizeof off, "0x%08X", offset);
-    snprintf(bytes, sizeof bytes, "0x%08X", size);
-    const ps3_stop_field fields[] = {
-        {"func", "eng_texture_upload"}, {"feature", "bc-texture-unsupported"},
-        {"format", fmt}, {"location", loc}, {"offset", off}, {"size", bytes},
-        {"reason", "device-lacks-bc-textures"}
+    if (!path || !strcmp(path, "auto")) s_eng_bc_requested = ENG_BC_PATH_AUTO;
+    else if (!strcmp(path, "cpu"))      s_eng_bc_requested = ENG_BC_PATH_CPU;
+    else if (!strcmp(path, "gpu"))      s_eng_bc_requested = ENG_BC_PATH_GPU;
+    else if (!strcmp(path, "tiered"))   s_eng_bc_requested = ENG_BC_PATH_TIERED;
+    else
+        eng_bc_stop("bc-path", "rsx.bc_path is not auto, cpu, gpu or tiered",
+                    "set rsx.bc_path through the configuration registry");
+    s_eng_bc_min_texels = gpu_min_texels;
+    s_eng_bc_policy_read = 0;
+}
+
+/* Decide, at the first BC texture, whether this device holds BC decoded and by which path. */
+static void eng_bc_policy_read(void)
+{
+    if (s_eng_bc_policy_read) return;
+    if (!s_eng_bc_requested)
+        eng_bc_stop("bc-policy-unset", "no rsx.bc_path reached the backend before a BC texture",
+                    "the draw engine hands it over at init (rsx_draw_backend.set_bc_policy)");
+    s_eng_bc_policy_read = 1;
+    const int native = eng_device_supports_bc();
+    s_eng_bc_emulate = s_eng_bc_requested != ENG_BC_PATH_AUTO || !native;
+    s_eng_bc_path = s_eng_bc_requested == ENG_BC_PATH_AUTO ? ENG_BC_PATH_TIERED : s_eng_bc_requested;
+    static const char* const kNames[] = { "", "auto", "cpu", "gpu", "tiered" };
+    fprintf(stderr, "[RSX metal] BC1-3 textures: %s (rsx.bc_path=%s, device samples BC=%d, "
+                    "rsx.bc_gpu_min_texels=%u)\n",
+            s_eng_bc_emulate ? "decoded to RGBA8" : "native", kNames[s_eng_bc_requested], native,
+            s_eng_bc_min_texels);
+}
+
+static id<MTLBuffer> eng_bc_host_buffer(void* user, NSUInteger length)
+{
+    (void)user;
+    return eng_new_buffer(length, "BC decode staging");
+}
+static void eng_bc_host_enter(void* user) { (void)user; host_gpu_gate_enter(&s_gpu_gate); }
+static void eng_bc_host_checkpoint(void* user) { (void)user; host_gpu_gate_checkpoint(&s_gpu_gate); }
+static void eng_bc_host_leave(void* user) { (void)user; host_gpu_gate_leave(&s_gpu_gate); }
+static void eng_bc_host_commit(void* user, id<MTLCommandBuffer> cb) { (void)user; eng_commit(cb); }
+/* The clock the decoder's bounded wait is charged against: monotonic time less the time the gate has held the
+ * RSX thread (eng_host_paused_ms: suspend starts counting before it closes the gate). */
+static uint64_t eng_bc_host_active_ms(void* user)
+{
+    (void)user;
+    /* One reading of the monotonic clock under the pause lock: `monotonic - paused` from two separate readings
+     * stepped back by a millisecond now and then while paused, which a waiter charged as 2^64 ms. Paused, the
+     * clock stands still at (pause start - paused before it). */
+    pthread_mutex_lock(&s_pause_lock);
+    const unsigned long long v = (s_pausing ? s_pause_since_ms : eng_monotonic_ms()) - s_pause_total_ms;
+    pthread_mutex_unlock(&s_pause_lock);
+    return v;
+}
+
+/* The decoder, made at the first GPU-tier upload; nil (once, loudly) when the kernel cannot be built. */
+static RsxMetalBc* eng_bc_gpu(void)
+{
+    if (s_eng_bc_gpu || s_eng_bc_gpu_unavailable) return s_eng_bc_gpu;
+    static const rsx_metal_bc_host host = {
+        NULL, eng_bc_host_buffer, eng_bc_host_enter, eng_bc_host_checkpoint, eng_bc_host_leave,
+        eng_bc_host_active_ms, eng_bc_host_commit
     };
-    eng_ios_feature_stop("the Metal device cannot sample the guest's BC texture",
-        "use a device with BC texture support or implement BC decoding to RGBA",
-        fields, sizeof fields / sizeof fields[0]);
+    NSError* err = nil;
+    s_eng_bc_gpu = [[RsxMetalBc alloc] initWithDevice:s_dev host:&host error:&err];
+    if (!s_eng_bc_gpu) {
+        s_eng_bc_gpu_unavailable = 1;
+        fprintf(stderr, "[RSX metal] the GPU BC decoder is unavailable (%s); the CPU tier decodes every level\n",
+                [[err localizedDescription] UTF8String] ?: "no error");
+    }
+    return s_eng_bc_gpu;
+}
+
+/* Before every frame commit: wait (outside the gate, like the in-flight semaphore) for the GPU-tier decodes
+ * committed so far, and stop if one ended in an error. Its texture is undefined and a draw of the frame about to
+ * be committed may sample it; presenting that frame as a success is the one thing not allowed, and a Metal thread
+ * cannot stop the RSX thread's frame, so the RSX thread looks. The wait is the decodes' own GPU time: they sit
+ * ahead of the frame in the queue anyway, and with none outstanding it is four uncontended semaphore operations.
+ * Only this thread reads the outcome; the Metal threads write it under the decoder's own lock.
+ *
+ * The wait is bounded, in active time (eng_host_paused_ms is taken out, so a suspended gate, the app inactive,
+ * does not run it down): a decode whose command buffer never ends would otherwise hold the RSX thread for good,
+ * and its callback, the thing that records an error, would never run. A decode takes tens of microseconds to
+ * a millisecond of GPU time (bench_rsx_bc_gpu, 2048^2: 0.6 ms). The bound sits above Metal's own command-buffer
+ * watchdog [INFERENCE: seconds, not measured here], after which the buffer completes with an error that the
+ * failure path names, and below gcm.wait_timeout_ms (10 s), so a hang is reported as this decode and not as a
+ * guest wait that timed out behind it; the host GPU gate's own drain is 5 s. Time spent here is the PS3_FTRACE
+ * span BC_SETTLE (kind 35) and the counters below. */
+
+static void eng_bc_settle(void)
+{
+    RsxMetalBc* bc = s_eng_bc_gpu;
+    if (!bc) return;
+    const uint64_t t0 = ps3_ft_now();
+    const unsigned inflight = [bc inFlight];
+    NSString* pending = [bc waitIdleWithin:s_eng_bc_settle_budget_ms];
+    NSString* texture = [bc failureTexture];
+    const uint64_t t1 = ps3_ft_now();
+    s_eng_bc_settles++;
+    s_eng_bc_settle_ns += t1 - t0;
+    if (t1 - t0 > s_eng_bc_settle_max_ns) s_eng_bc_settle_max_ns = t1 - t0;
+    if (PS3_FT_ON()) ps3_ft_span(PS3_FT_BC_SETTLE, 0, inflight, texture ? 1u : pending ? 2u : 0u, t0, t1);
+    /* The failure record decides first, in every branch (a nil return and a timeout alike): a decode that ended in
+     * an error is a decode-error even when another decode is still pending, and a decode that finished as the
+     * budget ran out (waitIdleWithin returned nil with a slot still on its way back) is read here, where its
+     * outcome is already final. Only then is a pending decode a timeout. */
+    if (texture) {
+        const ps3_stop_field fields[] = {
+            {"func", "eng_bc_settle"}, {"command", "bc-decode"}, {"reason", "decode-error"},
+            {"texture", [texture UTF8String]}, {"error", [[bc failureError] UTF8String]}
+        };
+        eng_stop_standalone(PS3_STOP_HOST_GPU_COMMAND, "host-gpu-command",
+                            "a BC decode command buffer ended in an error, so a texture the next frame may sample "
+                            "is undefined",
+                            "the error is the device's own; rsx.bc_path = cpu decodes without the GPU",
+                            fields, sizeof fields / sizeof fields[0]);
+    }
+    if (!pending) return;
+    char waited[24];
+    snprintf(waited, sizeof waited, "%llu", (unsigned long long)s_eng_bc_settle_budget_ms);
+    const ps3_stop_field fields[] = {
+        {"func", "eng_bc_settle"}, {"command", "bc-decode"}, {"reason", "decode-timeout"},
+        {"pending", [pending UTF8String]}, {"waited_ms", waited}
+    };
+    eng_stop_standalone(PS3_STOP_HOST_GPU_COMMAND, "host-gpu-command",
+                        "a BC decode command buffer did not complete within the bound, so a texture the next "
+                        "frame may sample is not known to be written",
+                        "`pending` names the decodes; rsx.bc_path = cpu decodes without the GPU",
+                        fields, sizeof fields / sizeof fields[0]);
+}
+
+#if !TARGET_OS_IPHONE
+/* The vtable route (PS3RECOMP_RSX_ENGINE=vtable, or a draw engine that failed to start) creates native BC
+ * textures and has no decoder: a forced rsx.bc_path (cpu, gpu, tiered) cannot be honoured there, and running on
+ * as `auto` would make a measurement of a tier into one of native BC. The engine handed the policy over when the
+ * backend was set (rsx_draw_engine_set_backend), which is before this route is chosen. `auto` stays native. */
+static void eng_bc_refuse_vtable_route(void)
+{
+    if (!s_eng_bc_requested || s_eng_bc_requested == ENG_BC_PATH_AUTO) return;
+    static const char* const kNames[] = { "", "auto", "cpu", "gpu", "tiered" };
+    const ps3_stop_field fields[] = {
+        {"key", "rsx.bc_path"}, {"value", kNames[s_eng_bc_requested]}, {"route", "vtable"},
+        {"detail", "a forced BC path needs the draw-engine route; the vtable route holds BC natively"}
+    };
+    eng_stop_standalone(PS3_STOP_CONFIG_INVALID, "config-invalid",
+                        "invalid configuration: rsx.bc_path forces BC decoding, which the Metal vtable route "
+                        "does not do",
+                        "set rsx.bc_path to auto, or run the draw-engine route (no PS3RECOMP_RSX_ENGINE=vtable, "
+                        "and a draw engine that starts)",
+                        fields, sizeof fields / sizeof fields[0]);
 }
 #endif
+
+/* The format of a texture the guest asked for, and the tag eng_bc_note_created files under its handle. */
+static MTLPixelFormat eng_texture_format(rsx_be_format fmt, u8* bc_tag)
+{
+    const int bc = fmt == RSX_BE_FMT_BC1 ? 1 : fmt == RSX_BE_FMT_BC2 ? 2 : fmt == RSX_BE_FMT_BC3 ? 3 : 0;
+    *bc_tag = 0;
+    if (!bc) return eng_pixel_format(fmt);
+    eng_bc_policy_read();
+    *bc_tag = (u8)(bc | (s_eng_bc_emulate ? ENG_BC_EMULATED : 0));
+    return s_eng_bc_emulate ? MTLPixelFormatRGBA8Unorm : eng_pixel_format(fmt);
+}
+
+static void eng_bc_note_created(u32 handle, u8 bc_tag)
+{
+    if (!handle) return;
+    s_eng_bc[handle - 1] = bc_tag;
+    s_eng_bc_serial[handle - 1] = s_eng_commit_serial;
+    s_eng_bc_records[handle - 1] = s_eng_rec_count;
+}
+
+/* 1 CPU tier, 2 GPU tier (the values of PS3_FT_BC_UPLOAD's b). */
+static int eng_bc_pick_tier(u32 handle, u32 texels)
+{
+    if (s_eng_bc_path == ENG_BC_PATH_CPU) return 1;
+    if (s_eng_bc_path == ENG_BC_PATH_TIERED && texels < s_eng_bc_min_texels) return 1;
+    const int fresh = s_eng_bc_serial[handle - 1] == s_eng_commit_serial &&
+                      s_eng_bc_records[handle - 1] == s_eng_rec_count;
+    return fresh && eng_bc_gpu() ? 2 : 1;
+}
+
+static u8* s_eng_bc_rgba;
+static size_t s_eng_bc_rgba_cap;
+
+/* One upload into an emulated BC texture: the level (or 3D slice) `src` holds as tight rows of 4x4 blocks, the
+ * shape rsx_texture_decode and eng_unvtc_3d_slice leave in the engine's staging. The engine reads the bytes
+ * through its own staging, which is reused as soon as this returns, so the GPU tier copies the blocks first
+ * (RsxMetalBc) and the CPU tier is done when it returns. */
+static void eng_bc_upload(u32 handle, u32 face, u32 mip, u32 z, int volume,
+                          u32 w, u32 h, const void* src, u32 row_bytes)
+{
+    id<MTLTexture> t = eng_obj(handle);
+    const rsx_bc_format fmt = (rsx_bc_format)(s_eng_bc[handle - 1] & ~ENG_BC_EMULATED);
+    const u32 blocks_w = (w + 3u) / 4u, blocks_h = (h + 3u) / 4u;
+    const size_t block_bytes = fmt == RSX_BC_FORMAT_BC1 ? 8u : 16u;
+    if (row_bytes != blocks_w * block_bytes)
+        eng_bc_stop("bc-row-pitch", "a BC level arrived with rows that are not tight block rows",
+                    "the engine hands BC levels over as rsx_texture_decode leaves them (report this line)");
+    const size_t bytes = (size_t)row_bytes * blocks_h;
+    const u32 texels = w * h;
+    const uint64_t ft0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+
+    int tier = eng_bc_pick_tier(handle, texels);
+    if (tier == 2 &&
+        ![s_eng_bc_gpu decodeBlocks:src size:bytes format:fmt width:w height:h into:t
+                              slice:volume ? 0 : face level:mip z:volume ? z : 0
+                              queue:s_queue completion:nil])
+        tier = 1;   /* a refused staging buffer or command buffer: the CPU tier still produces the texture */
+    if (tier == 1) {
+        const size_t pitch = (size_t)w * 4u, need = pitch * h;
+        if (need > s_eng_bc_rgba_cap) {
+            u8* grown = (u8*)realloc(s_eng_bc_rgba, need);
+            if (!grown)
+                eng_bc_stop("bc-cpu-staging", "the host refused the RGBA scratch for a BC level",
+                            "free memory");
+            s_eng_bc_rgba = grown;
+            s_eng_bc_rgba_cap = need;
+        }
+        if (!eng_bc_decode_cpu((const uint8_t*)src, bytes, w, h, fmt, s_eng_bc_rgba, pitch))
+            eng_bc_stop("bc-decode-rejected", "rsx_bc_decode refused a BC level",
+                        "the level's size and block bytes disagree (report this line)");
+        if (volume)
+            [t replaceRegion:MTLRegionMake3D(0, 0, z, w, h, 1) mipmapLevel:mip slice:0
+                   withBytes:s_eng_bc_rgba bytesPerRow:pitch bytesPerImage:need];
+        else
+            [t replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:mip slice:face
+                   withBytes:s_eng_bc_rgba bytesPerRow:pitch bytesPerImage:0];
+    }
+    s_eng_bc_tier_uploads[tier]++;
+    if (ft0) ps3_ft_span(PS3_FT_BC_UPLOAD, (uint32_t)fmt, texels, (uint32_t)tier, ft0, ps3_ft_now());
+}
+
+/* ---- resources ----------------------------------------------------------- */
 
 static u32 eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
                               u32 mips, u32 faces, u32 remap, u32 rsx_fmt)
@@ -3567,7 +3933,8 @@ static u32 eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
     if (!s_dev || !w || !h) return 0;
     MTLTextureDescriptor* td = [MTLTextureDescriptor new];
     td.textureType      = (faces == 6) ? MTLTextureTypeCube : MTLTextureType2D;
-    td.pixelFormat      = eng_pixel_format(fmt);
+    u8 bc_tag;
+    td.pixelFormat      = eng_texture_format(fmt, &bc_tag);
     td.width            = w;
     td.height           = h;
     td.mipmapLevelCount = mips ? mips : 1;
@@ -3579,7 +3946,9 @@ static u32 eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
     td.swizzle = MTLTextureSwizzleChannelsMake(
         swizzle_sel(sel[1]), swizzle_sel(sel[2]),
         swizzle_sel(sel[3]), swizzle_sel(sel[0]));
-    return eng_obj_add(eng_new_texture(td, "texture allocation"));
+    const u32 handle = eng_obj_add(eng_new_texture(td, "texture allocation"));
+    eng_bc_note_created(handle, bc_tag);
+    return handle;
 }
 
 static void eng_texture_upload(void* user, u32 handle, u32 face, u32 mip,
@@ -3589,6 +3958,10 @@ static void eng_texture_upload(void* user, u32 handle, u32 face, u32 mip,
     (void)user; (void)rows;
     id<MTLTexture> t = eng_obj(handle);
     if (!t || !src || !row_bytes) return;
+    if (s_eng_bc[handle - 1] & ENG_BC_EMULATED) {
+        eng_bc_upload(handle, face, mip, 0, 0, w, h, src, row_bytes);
+        return;
+    }
     [t replaceRegion:MTLRegionMake2D(0, 0, w, h)
          mipmapLevel:mip
                slice:face
@@ -3606,7 +3979,8 @@ static u32 eng_texture_create_3d(void* user, rsx_be_format fmt, u32 w, u32 h,
     if (!s_dev || !w || !h || !depth) return 0;
     MTLTextureDescriptor* td = [MTLTextureDescriptor new];
     td.textureType      = MTLTextureType3D;
-    td.pixelFormat      = eng_pixel_format(fmt);
+    u8 bc_tag;
+    td.pixelFormat      = eng_texture_format(fmt, &bc_tag);
     td.width            = w;
     td.height           = h;
     td.depth            = depth;
@@ -3617,7 +3991,9 @@ static u32 eng_texture_create_3d(void* user, rsx_be_format fmt, u32 w, u32 h,
     td.swizzle = MTLTextureSwizzleChannelsMake(
         swizzle_sel(sel[1]), swizzle_sel(sel[2]),
         swizzle_sel(sel[3]), swizzle_sel(sel[0]));
-    return eng_obj_add(eng_new_texture(td, "3D texture allocation"));
+    const u32 handle = eng_obj_add(eng_new_texture(td, "3D texture allocation"));
+    eng_bc_note_created(handle, bc_tag);
+    return handle;
 }
 
 static void eng_texture_upload_3d(void* user, u32 handle, u32 z, u32 mip,
@@ -3626,10 +4002,12 @@ static void eng_texture_upload_3d(void* user, u32 handle, u32 z, u32 mip,
     (void)user;
     id<MTLTexture> t = eng_obj(handle);
     if (!t || !src || !row_bytes) return;
-    /* A block-compressed slice is rows of 4x4 blocks. */
-    const MTLPixelFormat pf = [t pixelFormat];
-    const int bc = pf == MTLPixelFormatBC1_RGBA || pf == MTLPixelFormatBC2_RGBA ||
-                   pf == MTLPixelFormatBC3_RGBA;
+    const u8 bc = s_eng_bc[handle - 1];
+    if (bc & ENG_BC_EMULATED) {
+        eng_bc_upload(handle, 0, mip, z, 1, w, h, src, row_bytes);
+        return;
+    }
+    /* A native block-compressed slice is rows of 4x4 blocks. */
     const u32 rows = bc ? (h + 3u) / 4u : h;
     [t replaceRegion:MTLRegionMake3D(0, 0, z, w, h, 1)
          mipmapLevel:mip
@@ -5084,12 +5462,12 @@ static void eng_encode_and_commit_section(id<MTLTexture> present_dst)
             }];
             eng_stage_hand_off(cb, stage);
             host_gpu_gate_checkpoint(&s_gpu_gate);   /* the encode took time: nothing is submitted while closed */
-            [cb commit];
+            eng_commit(cb);
         } else {
             const uint64_t ft_w0 = PS3_FT_ON() ? ps3_ft_now() : 0;
             eng_stage_hand_off(cb, stage);
             host_gpu_gate_checkpoint(&s_gpu_gate);
-            [cb commit];
+            eng_commit(cb);
             host_gpu_gate_leave(&s_gpu_gate);   /* the GPU's time is not counted: only the CPU work up to the commit is */
             [cb waitUntilCompleted];
             host_gpu_gate_enter(&s_gpu_gate);   /* the bookkeeping below is inside again; blocks while inactive */
@@ -5122,6 +5500,7 @@ static void eng_encode_and_commit_section(id<MTLTexture> present_dst)
             s_eng_dropped = 0;
         }
         s_eng_rec_count  = 0;
+        s_eng_commit_serial++;   /* a texture created before this commit is no longer fresh (eng_bc_pick_tier) */
         s_eng_stage_used = 0;
         eng_collect_retired_objects();
     }
@@ -5132,6 +5511,7 @@ static void eng_encode_and_commit_section(id<MTLTexture> present_dst)
  * arrives while the section is open waits for it to leave. */
 static void eng_encode_and_commit(id<MTLTexture> present_dst)
 {
+    eng_bc_settle();
     host_gpu_gate_enter(&s_gpu_gate);
     eng_encode_and_commit_section(present_dst);
     host_gpu_gate_leave(&s_gpu_gate);
@@ -5286,7 +5666,7 @@ static void eng_dump_frame(id<MTLTexture> src, const rsx_frame_identity* fid)
         host_gpu_gate_enter(&s_gpu_gate);   /* the fence is a commit of its own */
         id<MTLCommandBuffer> fence = [s_queue commandBuffer];
         host_gpu_gate_checkpoint(&s_gpu_gate);
-        [fence commit];
+        eng_commit(fence);
         host_gpu_gate_leave(&s_gpu_gate);
         [fence waitUntilCompleted];
     }
@@ -5391,7 +5771,7 @@ static int eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
          destinationBytesPerRow:copy_pitch destinationBytesPerImage:copy_pitch * h];
         [blit endEncoding];
         host_gpu_gate_checkpoint(&s_gpu_gate);
-        [cb commit];
+        eng_commit(cb);
         host_gpu_gate_leave(&s_gpu_gate);
         [cb waitUntilCompleted];
         const int ok = [cb status] == MTLCommandBufferStatusCompleted && ![cb error];
@@ -5414,10 +5794,8 @@ static const rsx_draw_backend s_engine_backend = {
     .texture_create       = eng_texture_create,
     .texture_upload       = eng_texture_upload,
     .texture_release      = eng_obj_release,
-#if TARGET_OS_IPHONE
-    .require_bc           = eng_require_bc,
-#endif
     .texture_create_3d    = eng_texture_create_3d,
+    .set_bc_policy        = eng_bc_set_policy,
     .texture_upload_3d    = eng_texture_upload_3d,
     .color_target_create  = eng_color_target_create,
     .color_target_release = eng_obj_release,
@@ -5516,10 +5894,9 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
             return -1;
         }
 #if TARGET_OS_IPHONE
-        s_ios_supports_bc = eng_device_supports_bc();
         /* Apple's Metal feature table: border colour starts at Apple7. */
         s_ios_supports_border = [s_dev supportsFamily:MTLGPUFamilyApple7];
-        fprintf(stderr, "[RSX metal] supportsBCTextureCompression=%d\n", (int)s_ios_supports_bc);
+        fprintf(stderr, "[RSX metal] supportsBCTextureCompression=%d\n", eng_device_supports_bc());
         fprintf(stderr, "[RSX metal] supports32BitFloatFiltering=%d supportsFamilyApple9=%d\n",
                 (int)[s_dev supports32BitFloatFiltering],
                 (int)[s_dev supportsFamily:MTLGPUFamilyApple9]);
@@ -5620,20 +5997,19 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
          * it stays that way until the vtable path has nothing left to say. */
         rsx_draw_engine_set_default(1);
 #if TARGET_OS_IPHONE
-        /* The BC and border-sampler guards live on the engine path only. The
-         * vtable path would hand a BC texture to a device that cannot hold it
-         * and end in a Metal validation abort, so on iOS it is not an option,
-         * neither by PS3RECOMP_RSX_ENGINE=vtable nor as a fallback. */
+        /* The border-sampler guard lives on the engine path only, and the vtable path has no BC emulation: it
+         * would hand a BC texture to a device that cannot hold it and end in a Metal validation abort, so on
+         * iOS it is not an option, neither by PS3RECOMP_RSX_ENGINE=vtable nor as a fallback. */
         if (!rsx_draw_engine_enabled()) {
             fprintf(stderr, "[RSX metal] PS3RECOMP_RSX_ENGINE selects the vtable path, which "
-                            "has no BC or border-sampler guard; iOS runs the draw engine only\n");
+                            "has no BC emulation or border-sampler guard; iOS runs the draw engine only\n");
             s_ready = 0;
             rsx_draw_engine_set_backend(NULL);
             return -1;
         }
         if (rsx_draw_engine_init(s_width, s_height) != 0) {
             fprintf(stderr, "[RSX metal] draw engine init failed; iOS has no vtable fallback "
-                            "(it has no BC or border-sampler guard)\n");
+                            "(it has no BC emulation or border-sampler guard)\n");
             s_ready = 0;
             rsx_draw_engine_set_backend(NULL);
             return -1;
@@ -5644,6 +6020,7 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
             rsx_draw_engine_init(s_width, s_height) == 0) {
             s_eng_active = 1;
         } else {
+            eng_bc_refuse_vtable_route();
             rsx_set_backend(&s_backend_vtable);
         }
 #endif
@@ -5713,6 +6090,9 @@ void rsx_metal_backend_shutdown(void)
         s_offscreen = nil;
         s_depth     = nil;
         s_queue     = nil;
+        pthread_mutex_lock(&s_last_commit_lock);
+        s_last_committed = nil;     /* a buffer of the queue just dropped */
+        pthread_mutex_unlock(&s_last_commit_lock);
         s_dev       = nil;
         s_ready     = 0;
     }
@@ -5904,7 +6284,7 @@ static void legacy_present_section(void)
         if (s_headless) {
             /* The readback below must see a completed frame. */
             host_gpu_gate_checkpoint(&s_gpu_gate);
-            [cb commit];
+            eng_commit(cb);
             host_gpu_gate_leave(&s_gpu_gate);
             [cb waitUntilCompleted];
             host_gpu_gate_enter(&s_gpu_gate);
@@ -5917,7 +6297,7 @@ static void legacy_present_section(void)
                 dispatch_semaphore_signal(sem);
             }];
             host_gpu_gate_checkpoint(&s_gpu_gate);
-            [cb commit];        /* no wait: the CPU goes on to the next frame */
+            eng_commit(cb);     /* no wait: the CPU goes on to the next frame */
         }
 
         if (s_dropped_records) {

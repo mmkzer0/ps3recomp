@@ -296,6 +296,9 @@ std::string check_string(const Option& o, std::string& s)
     case PS3_CFG_V_LOG_COLLAPSE:
         if (s == "file" || s == "all" || s == "off") return {};
         return "expected \"file\", \"all\" or \"off\", found \"" + s + "\"";
+    case PS3_CFG_V_BC_PATH:
+        if (s == "auto" || s == "cpu" || s == "gpu" || s == "tiered") return {};
+        return "expected \"auto\", \"cpu\", \"gpu\" or \"tiered\", found \"" + s + "\"";
     case PS3_CFG_V_LOG_TAGS: {
         /* The tags ps3_log prints as "[tag] ": anything else in the list could never match one. */
         if (s.empty()) return {};

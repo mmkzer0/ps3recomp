@@ -748,6 +748,44 @@ static void test_bc_capability(void)
     engine_down();
 }
 
+/* The engine reads rsx.bc_path and rsx.bc_gpu_min_texels and hands them to a backend that asks, when the backend
+ * is set (before init, and whether or not the engine then starts): a backend with no link dependency on the
+ * registry (the Metal fixtures' fixed link lines) still sees them, and can refuse a forced mode on a route
+ * without the engine. The fixture's registry (rsx_engine_config_stub.h) holds the registry's defaults. */
+static struct { int calls; char path[16]; u32 min_texels; } bc_policy;
+
+static void stub_set_bc_policy(void* user, const char* path, u32 gpu_min_texels)
+{
+    (void)user;
+    bc_policy.calls++;
+    snprintf(bc_policy.path, sizeof bc_policy.path, "%s", path);
+    bc_policy.min_texels = gpu_min_texels;
+}
+
+static void test_bc_policy_handover(void)
+{
+    printf("-- BC policy reaches the backend when it is set\n");
+    rsx_draw_backend backend = g_stub_backend;
+    backend.set_bc_policy = stub_set_bc_policy;
+    memset(&bc_policy, 0, sizeof bc_policy);
+    rsx_draw_engine_set_backend(&backend);
+    CHECK(bc_policy.calls == 1 && strcmp(bc_policy.path, "auto") == 0 && bc_policy.min_texels == 16384u,
+          "set_backend hands rsx.bc_path and rsx.bc_gpu_min_texels over without starting the engine (%d, '%s', %u)",
+          bc_policy.calls, bc_policy.path, bc_policy.min_texels);
+    rsx_draw_engine_set_backend(NULL);
+    memset(&bc_policy, 0, sizeof bc_policy);
+    engine_up_with(&backend);
+    CHECK(bc_policy.calls == 1 && strcmp(bc_policy.path, "auto") == 0 && bc_policy.min_texels == 16384u,
+          "the backend gets rsx.bc_path and rsx.bc_gpu_min_texels (%d call(s), '%s', %u)", bc_policy.calls,
+          bc_policy.path, bc_policy.min_texels);
+    draw_triangle();
+    CHECK(bc_policy.calls == 1, "the policy is handed over once, not per draw");
+    engine_down();
+    engine_up();
+    CHECK(bc_policy.calls == 1, "a backend without the hook is not asked");
+    engine_down();
+}
+
 /* The cache remembers where each key was last found. Two keys that share a
  * remembered slot (these two offsets do, with every other field equal) must
  * still each find their own entry, however their binds interleave. */
@@ -2797,6 +2835,7 @@ int main(void)
     test_mrt_set();
     test_texture_cache();
     test_bc_capability();
+    test_bc_policy_handover();
     test_texture_lookup_memo();
     test_texture_sparse_rehash();
     test_compressed_volume();

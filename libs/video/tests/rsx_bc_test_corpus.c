@@ -146,6 +146,41 @@ int rsx_bc_test_make_bc3_alpha_image(rsx_bc_test_image *image)
     return block_index == image->block_count;
 }
 
+static uint32_t random_next(uint32_t *state)
+{
+    uint32_t x = *state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = x;
+    return x;
+}
+
+int rsx_bc_test_make_random_image(rsx_bc_test_image *image, rsx_bc_format format,
+                                  uint32_t width, uint32_t height, uint32_t *rng)
+{
+    if (!image || !rng || !width || !height ||
+        (format != RSX_BC_FORMAT_BC1 && format != RSX_BC_FORMAT_BC2 &&
+         format != RSX_BC_FORMAT_BC3))
+        return 0;
+    memset(image, 0, sizeof(*image));
+    image->width = width;
+    image->height = height;
+    image->blocks_w = width / 4u + (width % 4u != 0u);
+    image->blocks_h = height / 4u + (height % 4u != 0u);
+    image->block_bytes = format == RSX_BC_FORMAT_BC1 ? 8u : 16u;
+    if (image->blocks_w > SIZE_MAX / image->block_bytes) return 0;
+    image->row_bytes = (size_t)image->blocks_w * image->block_bytes;
+    if (image->blocks_h > SIZE_MAX / image->row_bytes) return 0;
+    image->size = image->row_bytes * image->blocks_h;
+    image->block_count = image->blocks_w * image->blocks_h;
+    image->bytes = malloc(image->size);
+    if (!image->bytes) return 0;
+    for (size_t i = 0; i < image->size; ++i)
+        image->bytes[i] = (uint8_t)(random_next(rng) >> 24);
+    return 1;
+}
+
 void rsx_bc_test_make_partial_block(uint8_t block[16], rsx_bc_format format,
                                     unsigned mip_level)
 {

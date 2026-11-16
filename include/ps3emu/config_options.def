@@ -290,6 +290,34 @@ PS3_CFG_BOOL(eng, depth_bounds, 1,
     "discarded outside the bounds. False ignores the test, as before. On by default; a kill switch for "
     "diagnosing a title that enables the test with bounds it does not mean (v0.19.0 #694).")
 
+/* ---- rsx (the RSX backends' own policies; PS3RECOMP_RSX_*) -------------- */
+
+PS3_CFG_STR(rsx, bc_path, "auto", 6, PS3_CFG_V_BC_PATH,
+    "How the Metal backend holds a guest BC1/2/3 (DXT1-5) texture. \"auto\" (the default): as BC where the "
+    "device samples BC, otherwise decoded to RGBA8 by the toolkit (an iOS device whose GPU reports no BC "
+    "sampling, MTLDevice.supportsBCTextureCompression; the iPhone X is the floor). The other values decode on every device, a BC-capable "
+    "Mac included, which is what measuring a tier and the end-to-end frame comparison need: \"cpu\" decodes "
+    "each level on the RSX thread (libs/video/rsx_bc_decode.c); \"gpu\" decodes each level of a texture "
+    "created by the upload with a compute kernel, in a command buffer committed before the frame's (a "
+    "texture an upload only refreshes takes the CPU tier); \"tiered\" is cpu below rsx.bc_gpu_min_texels "
+    "texels of one level and gpu from there on. Both tiers write exactly the texels the Apple GPU's own BC "
+    "decode produces, so the choice changes only where the time goes, not a pixel (docs/CONFIG.md). Decoded "
+    "textures are 8x (BC1) or 4x (BC2, BC3) larger. Exception: the Metal vtable route (macOS only: "
+    "PS3RECOMP_RSX_ENGINE=vtable, or a draw engine that did not start) has no decoder and holds BC natively, so "
+    "a forced value (cpu, gpu, tiered) there ends the run with kind config-invalid naming this key and the "
+    "route; \"auto\" goes on natively. A GPU-tier decode whose command buffer fails ends the run with kind "
+    "host-gpu-command at the next frame commit; so does one still pending after the commit's wait of "
+    "8 s of active time (reason=decode-timeout). Read once, at the first BC texture.")
+
+PS3_CFG_U32(rsx, bc_gpu_min_texels, 147456, 1, 4294967295,
+    "With rsx.bc_path = \"tiered\" (and \"auto\" where it decodes): the number of texels of one level, "
+    "width times height, from which the GPU tier decodes it. A smaller level costs the RSX thread less to "
+    "decode itself than to stage, submit and wait for before the frame commits (the GPU's latency, about "
+    "0.1 ms on an M4 Pro, is the floor). PROVISIONAL: the first size where the GPU tier is cheaper on the "
+    "RSX thread counting that wait, measured on an Apple M4 Pro (tests/bench/video/bench_rsx_bc_gpu.m), not "
+    "yet on an iPhone X; revisit with the PS3_FTRACE BC_UPLOAD and BC_SETTLE spans (kinds 34, 35) of a device "
+    "run. Ignored by \"cpu\" and \"gpu\". Read once, at the first BC texture.")
+
 /* ---- vk (the Vulkan backend; PS3RECOMP_VK_*) ---------------------------- */
 
 PS3_CFG_BOOL(vk, draw_batch, 0,

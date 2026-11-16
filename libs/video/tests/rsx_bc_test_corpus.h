@@ -21,6 +21,8 @@ typedef struct {
 int rsx_bc_test_make_color_image(rsx_bc_test_image *image);
 int rsx_bc_test_make_bc2_alpha_image(rsx_bc_test_image *image);
 int rsx_bc_test_make_bc3_alpha_image(rsx_bc_test_image *image);
+int rsx_bc_test_make_random_image(rsx_bc_test_image *image, rsx_bc_format format,
+                                  uint32_t width, uint32_t height, uint32_t *rng);
 void rsx_bc_test_make_partial_block(uint8_t block[16], rsx_bc_format format,
                                     unsigned mip_level);
 void rsx_bc_test_image_free(rsx_bc_test_image *image);

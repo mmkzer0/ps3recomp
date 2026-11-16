@@ -321,6 +321,14 @@ typedef struct rsx_draw_backend {
      * NULL preserves the backend's existing assumption of BC support. */
     void (*require_bc)(void* user, u32 format, u32 location, u32 offset, u32 size);
 
+    /* Optional. Called by rsx_draw_engine_set_backend (so before the backend is initialised, and whether or not the
+     * engine goes on to start) with the typed options rsx.bc_path ("auto", "cpu", "gpu" or "tiered") and
+     * rsx.bc_gpu_min_texels (docs/CONFIG.md), for a backend that holds a guest BC texture decoded when the device
+     * cannot sample BC, or that must refuse a forced mode on a route that cannot honour it. The strings live for
+     * the process. The engine reads the registry so that a backend carries no link dependency on it (the fixtures
+     * that include the Metal backend name their sources one by one). */
+    void (*set_bc_policy)(void* user, const char* path, u32 gpu_min_texels);
+
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */

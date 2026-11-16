@@ -181,34 +181,6 @@ static int check_image(rsx_bc_format format, const rsx_bc_test_image *image,
     return 1;
 }
 
-static uint32_t random_next(uint32_t *state)
-{
-    uint32_t x = *state;
-    x ^= x << 13;
-    x ^= x >> 17;
-    x ^= x << 5;
-    *state = x;
-    return x;
-}
-
-static int make_random_image(rsx_bc_test_image *image, rsx_bc_format format,
-                             uint32_t width, uint32_t height, uint32_t *rng)
-{
-    memset(image, 0, sizeof(*image));
-    image->width = width;
-    image->height = height;
-    image->blocks_w = width / 4u + (width % 4u != 0u);
-    image->blocks_h = height / 4u + (height % 4u != 0u);
-    image->block_bytes = format == RSX_BC_FORMAT_BC1 ? 8u : 16u;
-    image->block_count = image->blocks_w * image->blocks_h;
-    image->row_bytes = (size_t)image->blocks_w * image->block_bytes;
-    image->size = image->row_bytes * image->blocks_h;
-    image->bytes = malloc(image->size);
-    if (!image->bytes) return 0;
-    for (size_t i = 0; i < image->size; ++i)
-        image->bytes[i] = (uint8_t)(random_next(rng) >> 24);
-    return 1;
-}
 
 static void test_invalid_arguments(void)
 {
@@ -277,7 +249,8 @@ int main(void)
     uint32_t rng = 0x6D2B79F5u;
     for (unsigned f = 1u; f <= 3u; ++f) {
         rsx_bc_test_image random = { 0 };
-        CHECK(make_random_image(&random, (rsx_bc_format)f, 127u, 129u, &rng),
+        CHECK(rsx_bc_test_make_random_image(&random, (rsx_bc_format)f,
+                                             127u, 129u, &rng),
               "create seeded random BC block corpus");
         if (random.bytes) {
             check_image((rsx_bc_format)f, &random, "seeded random BC blocks");

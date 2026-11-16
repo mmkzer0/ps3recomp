@@ -92,6 +92,7 @@ enum {
     PS3_CFG_V_LOG_LEVEL,         /* "error", "warn", "info" or "debug" */
     PS3_CFG_V_LOG_TAGS,          /* "" or a comma-separated list of tags of [A-Za-z0-9_.-] */
     PS3_CFG_V_LOG_COLLAPSE,      /* "file", "all" or "off" */
+    PS3_CFG_V_BC_PATH,           /* "auto", "cpu", "gpu" or "tiered" */
 };
 
 /* ---- typed storage ------------------------------------------------------- */
