@@ -528,6 +528,405 @@ def _dispatch_targets(code, index, cuts, contains, register=None):
     return frozenset(targets)
 
 
+def _table_block_start(code, index, cuts):
+    start = index
+    crossed_guard = False
+    while start > 0:
+        previous = code[start - 1]
+        if previous.addr + 4 != code[start].addr or code[start].addr in cuts:
+            break
+        if previous.mnemonic in _CONTROL_FLOW and not _pc_getter(previous):
+            if not crossed_guard and previous.mnemonic in _CONDITIONAL_BRANCHES:
+                crossed_guard = True
+            else:
+                break
+        start -= 1
+    return start
+
+
+def _table_register_values(code, start, end):
+    """Track constants and one indexed in-code table load in a straight-line block."""
+    values = {}
+    for ins in code[start:end]:
+        mn = ins.mnemonic
+        if mn in _LINK_WRITE:
+            link = ins.raw & 0x7F
+            if _pc_getter(ins):
+                values[link] = frozenset({ins.addr + 4})
+            else:
+                values.clear()
+            continue
+        destination = _written_register(ins)
+        if destination is None:
+            continue
+        ops = [token.strip() for token in ins.operands.split(',') if token.strip()]
+        value = None
+        if mn == 'il':
+            value = frozenset({_il_value(ins)})
+        elif mn == 'ila':
+            value = frozenset({(ins.raw >> 7) & 0x3FFFF})
+        elif mn == 'ilhu':
+            value = frozenset({((ins.raw >> 7) & 0xFFFF) << 16})
+        elif mn == 'iohl':
+            old = values.get(destination)
+            if isinstance(old, frozenset):
+                value = frozenset({(item | ((ins.raw >> 7) & 0xFFFF)) & 0xFFFFFFFF
+                                   for item in old})
+        elif mn in ('ori', 'ai') and len(ops) == 3:
+            source = values.get((ins.raw >> 7) & 0x7F)
+            if mn == 'ori' and ops[2] in ('0', '0x0'):
+                value = source
+            elif mn == 'ai' and isinstance(source, frozenset):
+                amount = (ins.raw >> 14) & 0x3FF
+                amount = (amount - 0x400 if amount & 0x200 else amount) & 0xFFFFFFFF
+                value = _value_sum(source, frozenset({amount}))
+        elif mn in ('a', 'sf'):
+            left = values.get((ins.raw >> 7) & 0x7F)
+            right = values.get((ins.raw >> 14) & 0x7F)
+            if isinstance(left, frozenset) and isinstance(right, frozenset):
+                if mn == 'a':
+                    value = _value_sum(left, right)
+                elif len(left) * len(right) <= _DISPATCH_VALUES:
+                    value = frozenset((b - a) & 0xFFFFFFFF for a in left for b in right)
+            if mn == 'a':
+                if isinstance(left, tuple) and left[0] == 'scaled' \
+                        and isinstance(right, frozenset) and len(right) == 1:
+                    value = ('address', next(iter(right)), left)
+                elif isinstance(right, tuple) and right[0] == 'scaled' \
+                        and isinstance(left, frozenset) and len(left) == 1:
+                    value = ('address', next(iter(left)), right)
+                elif isinstance(left, tuple) and left[0] == 'table-word' \
+                        and isinstance(right, frozenset) and len(right) == 1:
+                    value = ('table-target', left[1], left[2], next(iter(right)))
+                elif isinstance(right, tuple) and right[0] == 'table-word' \
+                        and isinstance(left, frozenset) and len(left) == 1:
+                    value = ('table-target', right[1], right[2], next(iter(left)))
+        elif mn == 'andi':
+            mask = (ins.raw >> 14) & 0x3FF
+            mask = (mask - 0x400 if mask & 0x200 else mask) & 0xFFFFFFFF
+            source = values.get((ins.raw >> 7) & 0x7F)
+            value = _masked_values(source if isinstance(source, frozenset) else None, mask)
+        elif mn == 'shli':
+            source_reg = (ins.raw >> 7) & 0x7F
+            source = values.get(source_reg)
+            amount = (ins.raw >> 14) & 0x7F
+            amount = amount - 0x80 if amount & 0x40 else amount
+            if isinstance(source, frozenset):
+                value = _shifted_values(source, 'shli', amount)
+            elif source is None and 0 <= amount < 32:
+                value = ('scaled', source_reg, 1 << amount)
+            elif isinstance(source, tuple) and source[0] == 'scaled' \
+                    and 0 <= amount < 32 and source[2] << amount <= 0x3FFFF:
+                value = ('scaled', source[1], source[2] << amount)
+        elif mn == 'lqx':
+            base_values = values.get((ins.raw >> 7) & 0x7F)
+            offset = values.get((ins.raw >> 14) & 0x7F)
+            if isinstance(base_values, frozenset) and len(base_values) == 1 \
+                    and (isinstance(offset, frozenset)
+                         or isinstance(offset, tuple) and offset[0] == 'scaled'):
+                value = ('vector', next(iter(base_values)), offset)
+        elif mn == 'lqd' and len(ops) == 2:
+            displacement = re.fullmatch(
+                r'(-?(?:0x[0-9A-Fa-f]+|[0-9]+))\(\$r([0-9]+)\)', ops[1])
+            if displacement:
+                base_values = values.get(int(displacement.group(2)))
+                if isinstance(base_values, frozenset) and len(base_values) == 1:
+                    address = (next(iter(base_values)) + int(displacement.group(1), 0)) & 0x3FFFF
+                    value = ('vector', address, frozenset({0}))
+        elif mn == 'rotqby':
+            source = values.get((ins.raw >> 7) & 0x7F)
+            rotation = values.get((ins.raw >> 14) & 0x7F)
+            if isinstance(source, tuple) and source[0] == 'vector':
+                table_base, offset = source[1], source[2]
+                if isinstance(rotation, tuple) and rotation == ('address', table_base, offset):
+                    value = ('table-word', table_base, offset)
+                elif isinstance(offset, frozenset) and isinstance(rotation, frozenset):
+                    addresses = frozenset((table_base + item) & 0x3FFFF for item in offset)
+                    if rotation == addresses:
+                        value = ('table-word', table_base, offset)
+        if value is None:
+            values.pop(destination, None)
+        else:
+            values[destination] = value
+    return values
+
+
+def _direct_branch_target(ins):
+    addresses = _operand_addresses(ins)
+    return addresses[-1] if addresses else None
+
+
+def _direct_flow_reaches(insns, start, goal):
+    by_addr = {ins.addr: ins for ins in insns}
+    pending, visited = [start], set()
+    while pending:
+        address = pending.pop()
+        if address == goal:
+            return True
+        if address in visited:
+            continue
+        visited.add(address)
+        ins = by_addr.get(address)
+        if ins is None:
+            continue
+        mn = ins.mnemonic
+        target = _direct_branch_target(ins)
+        if mn in _DIRECT_CALLS or mn in ('bisl', 'bisled'):
+            if not _pc_getter(ins):
+                return True
+        if mn in _UNCONDITIONAL_BRANCHES:
+            if target is not None:
+                pending.append(target)
+        elif mn in _CONDITIONAL_BRANCHES:
+            if target is None:
+                return True
+            pending.extend((target, address + 4))
+        elif mn in ('bi', 'biz', 'binz', 'bihz', 'bihnz', 'iret'):
+            return True
+        elif mn in ('stop', 'stopd'):
+            from find_spu_functions import is_resuming_stop
+            if is_resuming_stop(ins):
+                pending.append(address + 4)
+        elif mn != 'halt':
+            pending.append(address + 4)
+    return False
+
+
+def _guarded_table_index_values(code, start, site_index, selector):
+    for branch_index in range(site_index - 1, start - 1, -1):
+        branch = code[branch_index]
+        if branch.mnemonic != 'brnz':
+            continue
+        target = _direct_branch_target(branch)
+        if target is None or _direct_flow_reaches(code, target, code[site_index].addr):
+            continue
+        flag_reg = branch.raw & 0x7F
+        compare_index = None
+        for index in range(branch_index - 1, start - 1, -1):
+            if _written_register(code[index]) == flag_reg:
+                compare_index = index
+                break
+        if compare_index is None:
+            continue
+        compare = code[compare_index]
+        if compare.mnemonic != 'clgti' or (compare.raw >> 7) & 0x7F != selector:
+            continue
+        if any(_written_register(ins) in (flag_reg, selector)
+               for ins in code[compare_index + 1:branch_index]):
+            continue
+        if any(ins.mnemonic in _CONTROL_FLOW and not _pc_getter(ins)
+               for ins in code[compare_index + 1:branch_index]):
+            continue
+        immediate = (compare.raw >> 14) & 0x3FF
+        immediate = immediate - 0x400 if immediate & 0x200 else immediate
+        if immediate < 0 or immediate + 1 > _DISPATCH_VALUES:
+            continue
+        if any(ins.mnemonic in _CONTROL_FLOW and not _pc_getter(ins)
+               for ins in code[branch_index + 1:site_index]):
+            continue
+        if any(_written_register(ins) == selector
+               for ins in code[branch_index + 1:site_index]):
+            continue
+        return frozenset(range(immediate + 1)), f'clgti at 0x{compare.addr:X}'
+    return None, None
+
+
+def _store_may_overlap_table(insns, table_start, table_size, cuts, delta):
+    table_end = table_start + table_size
+    get_commands = {command for command, name in MFC_COMMAND_NAMES.items()
+                    if name.startswith('GET')}
+    instruction_addresses = {ins.addr for ins in insns}
+
+    def overlaps(address):
+        start = (address & 0x3FFFF) & ~0xF
+        ranges = ((start, min(start + 16, 0x40000)),)
+        if start + 16 > 0x40000:
+            ranges += ((0, start + 16 - 0x40000),)
+        return any(a < table_end and table_start < b for a, b in ranges)
+
+    for index, ins in enumerate(insns):
+        mn = ins.mnemonic
+        if mn in ('bisl', 'bisled') and not _pc_getter(ins):
+            return f'possible indirect call at 0x{ins.addr:X} may write the table'
+        if mn in ('brsl', 'brasl') and not _pc_getter(ins):
+            target = _direct_branch_target(ins)
+            if target not in instruction_addresses:
+                return f'possible external call at 0x{ins.addr:X} may write the table'
+        if mn == 'wrch':
+            operands = [token.strip() for token in ins.operands.split(',') if token.strip()]
+            if len(operands) == 2 and operands[0] == 'MFC_Cmd':
+                source = re.fullmatch(r'\$r([0-9]+)', operands[1])
+                start = _table_block_start(insns, index, cuts)
+                values = _table_register_values(insns, start, index)
+                commands = (values.get(int(source.group(1))) if source else None)
+                if (not isinstance(commands, frozenset)
+                        or any((command & 0xFF) in get_commands for command in commands)):
+                    return (f'possible MFC GET at 0x{ins.addr:X} has an unresolved '
+                            'local-store destination')
+            continue
+        if mn not in ('stqd', 'stqx', 'stqa', 'stqr'):
+            continue
+        addresses = None
+        if mn in ('stqa', 'stqr'):
+            named = _operand_addresses(ins)
+            if named:
+                addresses = frozenset(address for value in named
+                                      for address in immediate_ls_addresses(value, delta))
+        else:
+            start = _table_block_start(insns, index, cuts)
+            values = _table_register_values(insns, start, index)
+            if mn == 'stqd':
+                operands = [token.strip() for token in ins.operands.split(',') if token.strip()]
+                displacement = re.fullmatch(
+                    r'(-?(?:0x[0-9A-Fa-f]+|[0-9]+))\(\$r([0-9]+)\)', operands[1])
+                if displacement:
+                    bases = values.get(int(displacement.group(2)))
+                    if isinstance(bases, frozenset) and len(bases) <= _DISPATCH_VALUES:
+                        offset = int(displacement.group(1), 0)
+                        addresses = frozenset((item + offset) & 0x3FFFF for item in bases)
+            else:
+                bases = values.get((ins.raw >> 7) & 0x7F)
+                offsets = values.get((ins.raw >> 14) & 0x7F)
+                if isinstance(bases, frozenset) and isinstance(offsets, frozenset) \
+                        and len(bases) * len(offsets) <= _DISPATCH_VALUES:
+                    addresses = frozenset((a + b) & 0x3FFFF for a in bases for b in offsets)
+        if addresses is None or not addresses:
+            return f'possible writer at 0x{ins.addr:X} has an unresolved address'
+        for address in addresses:
+            if overlaps(address):
+                return (f'store at 0x{ins.addr:X} may overwrite table '
+                        f'0x{table_start:X}..0x{table_end:X}')
+    return None
+
+
+def _table_branch_proof(insns, index, cuts, image, base, bounds, delta=0,
+                        register=None):
+    """Resolve one in-image lqx/rotqby function table, retaining its proof status."""
+    ins = insns[index]
+    if register is None:
+        register = _bi_register(ins)
+    if register is None:
+        return None
+    start = _table_block_start(insns, index, cuts)
+    values = _table_register_values(insns, start, index)
+    target_value = values.get(register)
+    if not isinstance(target_value, tuple) or target_value[0] not in (
+            'table-word', 'table-target'):
+        return None
+    if target_value[0] == 'table-word':
+        table_start, offsets, relative_base = target_value[1], target_value[2], None
+    else:
+        table_start, offsets, relative_base = target_value[1], target_value[2], target_value[3]
+    if table_start & 3 or not (base <= table_start < base + len(image)):
+        return None
+
+    scale = None
+    selector = None
+    if isinstance(offsets, tuple) and offsets[0] == 'scaled':
+        selector, scale = offsets[1], offsets[2]
+        if scale != 4:
+            return None
+        # A symbolic index denotes the value at the shift, not a later value
+        # of the same register. A later compare cannot bound the old value.
+        shifts = [position for position in range(start, index)
+                  if insns[position].mnemonic == 'shli'
+                  and (insns[position].raw >> 7) & 0x7F == selector]
+        if not shifts or any(_written_register(item) == selector
+                             for item in insns[shifts[0]:index]):
+            return None
+        index_values = values.get(selector)
+        index_proof = 'constant index values' if isinstance(index_values, frozenset) else None
+        if not isinstance(index_values, frozenset):
+            index_values, index_proof = _guarded_table_index_values(
+                insns, start, index, selector)
+    elif isinstance(offsets, frozenset):
+        if any(value & 3 for value in offsets):
+            return None
+        scale = 4
+        index_values = frozenset(value // 4 for value in offsets)
+        index_proof = 'constant byte offsets'
+    else:
+        return None
+    control_flow = [item for item in insns[start:index]
+                    if item.mnemonic in _CONTROL_FLOW and not _pc_getter(item)]
+    control_flow_reason = None
+    if control_flow:
+        guarded_values = None
+        if len(control_flow) == 1 and control_flow[0].mnemonic == 'brnz':
+            guarded_values, _proof = _guarded_table_index_values(
+                insns, start, index, selector)
+        if guarded_values is None:
+            control_flow_reason = (
+                f'unproven control flow at 0x{control_flow[0].addr:X}')
+
+    starts = {function_start for function_start, _ in bounds}
+    decoded = {item.addr for item in insns if item.mnemonic != '.word'}
+    bounded = isinstance(index_values, frozenset) and bool(index_values)
+    if not bounded and selector is None:
+        return None
+    scan_truncated = False
+    if bounded:
+        if any(value < 0 or value >= _DISPATCH_VALUES for value in index_values):
+            return None
+        table_count = max(index_values) + 1
+        indices = sorted(index_values)
+    else:
+        table_count = 0
+        indices = []
+        for candidate in range(_DISPATCH_VALUES):
+            entry = table_start + candidate * 4
+            if entry < base or entry + 4 > base + len(image):
+                break
+            word = int.from_bytes(image[entry - base:entry - base + 4], 'big')
+            target = ((relative_base + word) & 0x3FFFF
+                      if relative_base is not None else word)
+            if target & 3 or target not in starts or target not in decoded:
+                break
+            indices.append(candidate)
+            table_count = candidate + 1
+        else:
+            scan_truncated = True
+        if not indices:
+            return None
+
+    if table_count <= 0 or table_start + table_count * 4 > base + len(image):
+        return None
+    targets = set()
+    for entry_index in indices:
+        entry = table_start + entry_index * 4
+        if entry < base or entry + 4 > base + len(image):
+            return None
+        word = int.from_bytes(image[entry - base:entry - base + 4], 'big')
+        target = (relative_base + word) & 0x3FFFF if relative_base is not None else word
+        if target & 3 or target not in starts or target not in decoded:
+            return None
+        targets.add(target)
+    if not targets:
+        return None
+
+    reason = None if bounded else f'unbounded index register $r{selector}'
+    if control_flow_reason:
+        reason = f'{reason}; {control_flow_reason}' if reason else control_flow_reason
+    if scan_truncated:
+        reason = f'{reason}; table scan reached {_DISPATCH_VALUES}-entry limit'
+    writer = _store_may_overlap_table(
+        insns, table_start, table_count * 4, cuts, delta)
+    if writer:
+        reason = f'{reason}; {writer}' if reason else writer
+
+    return {
+        'targets': tuple(sorted(targets)),
+        'classification': 'GUARANTEED' if reason is None else 'BOUNDED',
+        'reason': reason,
+        'table_start': table_start,
+        'table_entries': table_count,
+        'index_register': selector,
+        'index_scale': scale,
+        'index_values': tuple(sorted(index_values)) if bounded else None,
+        'index_proof': index_proof,
+    }
+
+
 def _indirect_dispatch(insns, modelled=(), computed_jumps=()):
     """Whether the image contains an unmodelled register-targeted transfer.
 

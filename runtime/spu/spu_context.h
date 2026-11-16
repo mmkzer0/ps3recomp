@@ -1098,6 +1098,8 @@ static inline int spu_channel_has_data(const spu_channel* ch)
 /* Indirect-branch dispatcher (spu_channels.c): resolves ctx->pc to a lifted
  * function in the active image and runs it. Referenced by SPU_RET/SPU_DRAIN. */
 void spu_indirect_branch(spu_context* ctx);
+/* Generated indirect-target guards fail closed before dispatch. */
+void spu_indirect_target_set_mismatch(spu_context* ctx, uint32_t site, uint32_t target);
 
 /* Pending cross-function transfer target; NULL when none. Thread-local: each
  * spu_context is pinned to one host thread for its lifetime. */

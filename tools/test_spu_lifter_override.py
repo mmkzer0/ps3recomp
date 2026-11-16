@@ -63,6 +63,68 @@ def run_lifter(image, bounds, overrides, out, extra_args=()):
     return subprocess.run(command, capture_output=True, text=True, check=False)
 
 
+def table_dispatch_fixture(mode="mask", overlap=False):
+    from gen_test_raw_job import (
+        A, ANDI, BI, BRNZ, BRSL, ILA, LQX, NOP, ORI, ROTQBY, SHLI,
+        _ri10, _ri16, _ri18, _ri7, _rr,
+    )
+
+    words = [_rr(NOP)] * (0xD4 // 4)
+    code = []
+    if overlap:
+        code += [_ri18(ILA, 0x80, 10), _ri10(0x024, 0, 10, 2)]
+    if mode == "pic":
+        code += [
+            _ri16(BRSL, 1, 126),                 # PC getter at the next word
+            _ri18(ILA, 0x1044, 12),
+            _rr(0x040, rb=126, ra=12, rt=126),  # sf r126,r12,r126 -> -0x1000
+            _ri18(ILA, 0x1090, 11),
+            _rr(A, rb=126, ra=11, rt=5),        # relocated table base 0x80
+        ]
+    else:
+        code.append(_ri18(ILA, 0x80, 5))
+    if mode in ("mask", "pic"):
+        code.append(_ri10(ANDI, 1, 3, 8))
+    else:
+        code.append(_ri10(ORI, 0, 3, 8))
+    code += [
+        _ri7(SHLI, 2, 8, 7),
+        _rr(LQX, 7, 5, 6),
+        _rr(A, 7, 5, 4),
+        _rr(ROTQBY, 4, 6, 3),
+    ]
+    if mode == "pic":
+        code.append(_rr(A, rb=5, ra=3, rt=3))  # table-relative entries
+    if mode in ("compare", "unproven-branch"):
+        code += [_ri10(0x05C, 1, 8, 2)]
+        branch_addr = 0x40 + len(code) * 4
+        target_addr = 0x40 + (len(code) + 2) * 4
+        branch_opcode = 0x040 if mode == "unproven-branch" else BRNZ
+        code.append(_ri16(branch_opcode, (target_addr - branch_addr) // 4, 2))
+    code.append(_rr(BI, ra=3))
+
+    start = 0x40
+    for offset, word in enumerate(code):
+        words[start // 4 + offset] = word
+    site = start + (len(code) - 1) * 4
+    end = start + len(code) * 4
+    stop = None
+    if mode == "compare":
+        stop = end
+        words[stop // 4] = 0                 # stop 0: the out-of-range arm cannot re-enter
+        end += 4
+    entries = (0x30, 0x40, 0x1234) if mode == "pic" else (0xC0, 0xD0, 0x1234)
+    table = 0x90 if mode == "pic" else 0x80
+    words[table // 4:(table + 12) // 4] = entries
+    return (b"".join(struct.pack(">I", word) for word in words),
+            [(start, end - 4 if stop is not None else end)]
+            + ([(stop, stop + 4)] if stop is not None else [])
+            + [(0xC0, 0xC4), (0xD0, 0xD4)],
+            site)
+
+
+
+
 BISL_DRIVER = r"""
 #include "spu_helpers.h"
 #include "spu_ls_watch_fixture.h"
@@ -504,6 +566,393 @@ class NativeOverrides(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertRegex(result.stderr,
                                  r"unproven \$r0 write by lqd at 0x[0-9A-F]+")
+
+    def test_constant_register_stack_adjustment_proves_link_restore(self):
+        body = [
+            ri16(0x081, -32, 56),                 # il $r56,-32
+            rr(0x0C0, rb=56, ra=1, rt=1),        # a $r1,$r1,$r56
+            ri10(0x24, 1, 1, 0),                 # stqd $r0,16($r1)
+            ri10(0x34, 1, 1, 0),                 # lqd $r0,16($r1)
+            ri16(0x081, 32, 56),
+            rr(0x0C0, rb=56, ra=1, rt=1),
+            rr(0x1A8, ra=0),
+        ]
+        image = b"".join(struct.pack(">I", word) for word in [0] * 16 + body)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "reference"
+            result = run_lifter(image, [(0x40, 0x5C)], [], root)
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            source = (root / "spu_recomp.c").read_text()
+            self.assertIn("SPU_RET(ctx)", source)
+            report = json.loads((root / "lift.json").read_text())
+            [entry] = report["r0_returns"]
+            self.assertEqual((entry["site"], entry["load"]), (0x58, 0x4C))
+
+    def test_unknown_register_stack_adjustment_does_not_prove_return(self):
+        body = [
+            rr(0x0C0, rb=3, ra=1, rt=1),         # a $r1,$r1,$r3 (unknown)
+            ri10(0x24, 1, 1, 0),                 # stqd $r0,16($r1)
+            ri10(0x34, 1, 1, 0),                 # lqd $r0,16($r1)
+            rr(0x1A8, ra=0),
+        ]
+        image = b"".join(struct.pack(">I", word) for word in [0] * 16 + body)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "reference"
+            result = run_lifter(image, [(0x40, 0x50)], [], root)
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            source = (root / "spu_recomp.c").read_text()
+            self.assertNotIn("SPU_RET(ctx)", source)
+            report = json.loads((root / "lift.json").read_text())
+            [entry] = report["r0_dispatches"]
+            self.assertEqual((entry["site"], entry["reason"]),
+                             (0x4C, "unknown-or-conflicting-stack-delta"))
+
+    def test_table_targets_require_a_bound_and_a_read_only_table(self):
+        from spu_disasm import disassemble_spu
+        from spu_lifter import compute_bi_r0_jumps
+
+        cases = (
+            ("mask", False, "GUARANTEED", None),
+            ("pic", False, "GUARANTEED", None),
+            ("compare", False, "GUARANTEED", None),
+            ("unproven-branch", False, "BOUNDED", "unproven control flow"),
+            ("unbounded", False, "BOUNDED", "unbounded index"),
+            ("mask", True, "BOUNDED", "store at 0x44"),
+        )
+        for mode, overlap, classification, reason in cases:
+            with self.subTest(mode=mode, overlap=overlap):
+                image, bounds, site = table_dispatch_fixture(mode, overlap)
+                insns = disassemble_spu(image, 0)
+                proof = compute_bi_r0_jumps(insns, bounds, image=image, base=0)
+                entry = proof.table_proofs[site]
+                self.assertEqual(entry["classification"], classification)
+                self.assertEqual(entry["targets"], (0xC0, 0xD0))
+                if reason:
+                    self.assertIn(reason, entry["reason"])
+                self.assertEqual(proof.indirect_target_guards[site]["targets"],
+                                 (0xC0, 0xD0))
+                if classification == "BOUNDED":
+                    self.assertIn(site, proof.unresolved_branches)
+                else:
+                    self.assertNotIn(site, proof.unresolved_branches)
+
+    def test_invalid_compare_guards_keep_foreign_table_targets_unresolved(self):
+        from gen_test_raw_job import A, BI, BRNZ, ILA, LQX, ROTQBY, SHLI, _ri7
+        from spu_disasm import disassemble_spu
+        from spu_lifter import compute_bi_r0_jumps, override_unit_admission
+
+        for unrelated in (True, False):
+            with self.subTest(unrelated_branch_register=unrelated):
+                words = [0] * (0x254 // 4)
+                code = [
+                    (ILA << 25) | (0x180 << 7) | 5,
+                    ri10(0x05C, 2, 8, 2),                 # clgti r2,r8,2
+                    ri16(BRNZ, 0x82, 9 if unrelated else 2),
+                ]
+                if not unrelated:
+                    code.append(ri10(0x01C, 1, 8, 8))    # ai r8,r8,1
+                code += [
+                    _ri7(SHLI, 2, 8, 7), rr(LQX, rb=7, ra=5, rt=6),
+                    rr(A, rb=7, ra=5, rt=4),
+                    rr(ROTQBY, rb=4, ra=6, rt=3), rr(BI, ra=3),
+                ]
+                site = 0x40 + 4 * (len(code) - 1)
+                words[0x40 // 4:0x40 // 4 + len(code)] = code
+                words[0x100 // 4] = br(0x100, 0x110)
+                for target in (0x110, 0x1C0, 0x1D0, 0x1E0):
+                    words[target // 4] = rr(BI, ra=0)
+                words[0x180 // 4:0x190 // 4] = (0x1C0, 0x1D0, 0x1E0, 0x110)
+                image = b"".join(struct.pack(">I", word) for word in words)
+                bounds = [(0x40, site + 4), (0x100, 0x104), (0x110, 0x114),
+                          (0x1C0, 0x1C4), (0x1D0, 0x1D4), (0x1E0, 0x1E4),
+                          (0x250, 0x254)]
+                insns = disassemble_spu(image, 0)
+                proof = compute_bi_r0_jumps(insns, bounds, image=image, base=0)
+                self.assertEqual(proof.table_proofs[site]["classification"], "BOUNDED")
+                self.assertIn(0x110, proof.indirect_target_guards[site]["targets"])
+                self.assertIn(site, proof.unresolved_branches)
+                members, _graph, problem = override_unit_admission(
+                    insns, bounds, 0x100, proof)
+                self.assertEqual(members, (0x100, 0x110))
+                self.assertIn(f"foreign indirect branch at 0x{site:X}", problem)
+                self.assertIn("0x110", problem)
+
+    @unittest.skipUnless(shutil.which("cc"), "no C compiler")
+    def test_bisled_acquire_samples_after_link_publication(self):
+        from spu_disasm import spu_decode
+        from spu_lifter import BiR0Classification, LiftedFunction, SPULifter
+
+        lifter = SPULifter()
+        lifter.bi_r0_jump = BiR0Classification()
+        lifter.bi_r0_jump.indirect_target_guards[0x40] = {"targets": (0x80,)}
+        instruction = spu_decode(rr(0x1AB, ra=0, rt=0) | 0x40000, 0x40)
+        statement = lifter._translate(
+            instruction, LiftedFunction(start_addr=0x40, end_addr=0x48), 0x44)
+        driver = r"""
+#define SPU_LIFT_BUDGET 1
+#include "spu_helpers.h"
+#include "spu_ls_watch_fixture.h"
+#include <assert.h>
+#include <stdlib.h>
+static spu_context context;
+static unsigned raise_event, loads, fell_through;
+SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*);
+void spu_indirect_branch(spu_context* ctx) { (void)ctx; abort(); }
+void spu_lift_budget_exhausted(spu_context* ctx) { (void)ctx; abort(); }
+void spu_indirect_target_set_mismatch(spu_context* ctx, uint32_t pc, uint32_t target) {
+    (void)ctx; (void)pc; (void)target; abort();
+}
+static uint32_t event_load(uint32_t* address, int order) {
+    assert(address == &context.event_status && order == __ATOMIC_ACQUIRE);
+    assert(context.gpr[0]._u32[0] == 0x44);
+    assert(context.gpr[0]._u32[1] == 0);
+    loads++;
+    if (raise_event) SPU_EVENT_SET(&context, 1);
+    return __atomic_load_n(address, order);
+}
+/* This seam fires at the generated acquire load, after the link assignment. */
+#define __atomic_load_n(address, order) event_load(address, order)
+static void lifted(spu_context* ctx) {
+__STATEMENT__
+    fell_through++;
+}
+#undef __atomic_load_n
+int main(int argc, char** argv) {
+    assert(argc == 2);
+    raise_event = (unsigned)strtoul(argv[1], 0, 0);
+    context.gpr[0]._u32[0] = 0x80; /* target aliases link */
+    context.gpr[0]._u32[1] = 0xDEADBEEF;
+    context.pc = 0x1350;
+    context.event_mask = 1;
+    context.budget = 7;
+    lifted(&context);
+    assert(loads == 1 && context.gpr[0]._u32[0] == 0x44);
+    assert(context.gpr[0]._u32[1] == 0);
+    if (raise_event) {
+        assert(!fell_through && context.pc == 0x80 && context.int_enable == 1);
+        assert(context.budget == 6 && g_spu_trampoline_fn == spu_indirect_branch);
+    } else {
+        assert(fell_through == 1 && context.pc == 0x1350 && context.int_enable == 0);
+        assert(context.budget == 7 && !g_spu_trampoline_fn);
+    }
+    return 0;
+}
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            source, binary = Path(tmp) / "event_order.c", Path(tmp) / "event_order"
+            source.write_text(driver.replace("__STATEMENT__", statement))
+            root = TOOLS.parent
+            compiled = subprocess.run(
+                ["cc", "-std=gnu17", "-O1", "-I", str(root / "include"),
+                 "-I", str(root / "runtime/spu"), "-I", str(root / "tests"),
+                 str(source), "-lm", "-o", str(binary)],
+                capture_output=True, text=True, check=False)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            for event in (0, 1):
+                executed = subprocess.run([str(binary), str(event)], capture_output=True,
+                                          text=True, check=False)
+                self.assertEqual(executed.returncode, 0, executed.stderr)
+
+    @unittest.skipUnless(shutil.which("cc"), "no C compiler")
+    def test_indirect_call_mismatch_preserves_prebranch_stop_state(self):
+        from spu_disasm import disassemble_spu
+        from spu_lifter import SPULifter, compute_bi_r0_jumps
+
+        for opcode in (0x1A9, 0x1AB):          # bisl and bisled, link r0
+            with self.subTest(opcode=opcode), tempfile.TemporaryDirectory() as tmp:
+                image, bounds, site = table_dispatch_fixture("unbounded")
+                image = bytearray(image)
+                image[site:site + 4] = struct.pack(">I", rr(opcode, ra=3) | 0x40000)
+                insns = disassemble_spu(image, 0)
+                lifter = SPULifter()
+                lifter.bi_r0_jump = compute_bi_r0_jumps(
+                    insns, bounds, image=image, base=0)
+                lifter.func_starts = {start for start, _end in bounds}
+                body = "\n".join(lifter.lift_function(insns, *bounds[0]).body_lines)
+                driver = r"""
+#include "spu_helpers.h"
+#include "spu_ls_watch_fixture.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*);
+void spu_indirect_branch(spu_context* ctx) { (void)ctx; abort(); }
+void spu_drain_call(spu_context* ctx, uint32_t pc) { (void)ctx; (void)pc; abort(); }
+void spu_img_restore(spu_context* ctx, int32_t image) { (void)ctx; (void)image; abort(); }
+void spu_indirect_target_set_mismatch(spu_context* ctx, uint32_t site, uint32_t target) {
+    fprintf(stderr, "snapshot:lr=%x:pc=%x:ie=%u\n",
+            ctx->gpr[0]._u32[0], ctx->pc, ctx->int_enable);
+    exit(site == 0x58 && target == 0x1234 &&
+         ctx->gpr[0]._u32[0] == 0xBEEF && ctx->pc == 0x1350 &&
+         ctx->int_enable == 0 ? 77 : 78);
+}
+static uint8_t local_store[SPU_LS_SIZE];
+static spu_context context;
+static void lifted(spu_context* ctx) {
+__BODY__
+}
+int main(void) {
+    static const uint8_t image[] = {__IMAGE__};
+    context.ls = local_store;
+    memcpy(context.ls, image, sizeof image);
+    context.gpr[3]._u32[0] = 2;
+    context.gpr[0]._u32[0] = 0xBEEF;
+    context.pc = 0x1350;
+    context.event_status = context.event_mask = 1;
+    lifted(&context);
+    return 79;
+}
+"""
+                root = TOOLS.parent
+                source, binary = Path(tmp) / "snapshot.c", Path(tmp) / "snapshot"
+                source.write_text(driver.replace("__BODY__", body).replace(
+                    "__IMAGE__", ",".join(str(byte) for byte in image)))
+                compiled = subprocess.run(
+                    ["cc", "-std=gnu17", "-O1", "-ffunction-sections", "-fdata-sections",
+                     "-Wl,-dead_strip" if sys.platform == "darwin" else "-Wl,--gc-sections",
+                     "-I", str(root / "include"), "-I", str(root / "runtime/spu"),
+                     "-I", str(root / "tests"), str(source),
+                     str(root / "runtime/diag/ps3_log.c"),
+                     str(root / "runtime/diag/host_exit.c"), "-lm", "-o", str(binary)],
+                    capture_output=True, text=True, check=False)
+                self.assertEqual(compiled.returncode, 0, compiled.stderr)
+                executed = subprocess.run([str(binary)], capture_output=True, text=True,
+                                          check=False)
+                self.assertEqual(executed.returncode, 77, executed.stderr)
+                self.assertIn("snapshot:lr=beef:pc=1350:ie=0", executed.stderr)
+
+    def test_mask_after_scaling_bounds_table_byte_offsets(self):
+        from spu_disasm import disassemble_spu
+        from spu_lifter import compute_bi_r0_jumps
+        from gen_test_raw_job import ANDI, SHLI, _ri7
+
+        image, bounds, site = table_dispatch_fixture("unbounded")
+        changed = bytearray(image)
+        # Replace the selector copy with its scale, then mask byte offsets.
+        changed[0x44:0x4C] = struct.pack(
+            ">II", _ri7(SHLI, 2, 3, 7), ri10(ANDI, 4, 7, 7))
+        proof = compute_bi_r0_jumps(
+            disassemble_spu(changed, 0), bounds, image=changed, base=0)
+        self.assertEqual(proof.table_proofs[site]["classification"], "GUARANTEED")
+        self.assertEqual(proof.table_proofs[site]["targets"], (0xC0, 0xD0))
+
+    def test_rewritten_selector_does_not_bound_an_earlier_table_load(self):
+        from spu_disasm import disassemble_spu
+        from spu_lifter import compute_bi_r0_jumps
+
+        image, bounds, site = table_dispatch_fixture("unbounded")
+        changed = bytearray(image)
+        changed[site:site + 8] = struct.pack(">II", ri16(0x081, 1, 8),
+                                                    rr(0x1A8, ra=3))
+        bounds[0] = (bounds[0][0], bounds[0][1] + 4)
+        proof = compute_bi_r0_jumps(
+            disassemble_spu(changed, 0), bounds, image=changed, base=0)
+        self.assertNotIn(site + 4, proof.table_proofs)
+        self.assertIn(site + 4, proof.unresolved_branches)
+
+    @unittest.skipUnless(shutil.which("cc"), "no C compiler")
+    def test_bounded_table_dispatch_stops_on_an_out_of_set_runtime_target(self):
+        from spu_disasm import disassemble_spu
+        from spu_lifter import SPULifter, compute_bi_r0_jumps
+
+        image, bounds, site = table_dispatch_fixture("unbounded")
+        insns = disassemble_spu(image, 0)
+        proof = compute_bi_r0_jumps(insns, bounds, image=image, base=0)
+        self.assertEqual(proof.table_proofs[site]["classification"], "BOUNDED")
+        lifter = SPULifter()
+        lifter.bi_r0_jump = proof
+        lifter.func_starts = {start for start, _ in bounds}
+        body = "\n".join(lifter.lift_function(insns, *bounds[0]).body_lines)
+        image_bytes = ", ".join(f"0x{byte:02X}" for byte in image)
+        driver = r"""
+#include "spu_helpers.h"
+#include "spu_ls_watch_fixture.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*) = 0;
+void spu_indirect_branch(spu_context* ctx) { (void)ctx; }
+void spu_indirect_branch_mt(spu_context* ctx) { (void)ctx; }
+void spu_indirect_target_set_mismatch(spu_context* ctx, uint32_t site, uint32_t target)
+{
+    (void)ctx;
+    fprintf(stderr, "guard:%x:%x\n", site, target);
+    exit(77);
+}
+static const uint8_t image_bytes[] = {__IMAGE__};
+static spu_context context;
+static uint8_t local_store[SPU_LS_SIZE];
+static void lifted(spu_context* ctx)
+{
+__BODY__
+}
+int main(int argc, char** argv)
+{
+    if (argc != 2) return 2;
+    const unsigned index = (unsigned)strtoul(argv[1], 0, 0);
+    context.ls = local_store;
+    memcpy(context.ls, image_bytes, sizeof image_bytes);
+    if (index == 3) context.ls[0x83] = 0xC3; /* architectural word alignment */
+    context.gpr[3]._u32[0] = index == 3 ? 0 : index;
+    lifted(&context);
+    const uint32_t expected = index == 0 || index == 3 ? 0xC0u : 0xD0u;
+    return context.pc == expected && g_spu_trampoline_fn == spu_indirect_branch
+        ? 0 : 4;
+}
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "table_guard.c"
+            source.write_text(driver.replace("__IMAGE__", image_bytes)
+                              .replace("__BODY__", body))
+            binary = source.with_suffix("")
+            root = TOOLS.parent
+            compiled = subprocess.run(
+                ["cc", "-std=gnu17", "-O1", "-ffunction-sections", "-fdata-sections",
+                 "-Wl,-dead_strip" if sys.platform == "darwin" else "-Wl,--gc-sections",
+                 "-I", str(root / "include"),
+                 "-I", str(root / "runtime/spu"), "-I", str(root / "tests"),
+                 str(source), str(root / "runtime/diag/ps3_log.c"),
+                 str(root / "runtime/diag/host_exit.c"), "-lm", "-o", str(binary)],
+                capture_output=True, text=True, check=False)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            for index in (0, 1, 3):
+                executed = subprocess.run(
+                    [str(binary), str(index)], capture_output=True, text=True, check=False)
+                self.assertEqual(executed.returncode, 0, executed.stderr)
+            refused = subprocess.run(
+                [str(binary), "2"], capture_output=True, text=True, check=False)
+            self.assertEqual(refused.returncode, 77, refused.stderr)
+            self.assertIn("guard:58:1234", refused.stderr)
+
+    def test_stack_delta_join_requires_equal_values_on_every_path(self):
+        for other_adjustment, proven in ((-32, True), (-64, False)):
+            with self.subTest(other_adjustment=other_adjustment), tempfile.TemporaryDirectory() as tmp:
+                body = [
+                    ri10(0x24, 1, 1, 0),                       # save link at entry SP+16
+                    ri16(0x040, (0x54 - 0x44) // 4, 3),        # brz $r3, alternate
+                    ri16(0x081, -32, 56),
+                    rr(0x0C0, rb=56, ra=1, rt=1),
+                    br(0x50, 0x5C),
+                    ri16(0x081, other_adjustment, 57),
+                    rr(0x0C0, rb=57, ra=1, rt=1),
+                    ri10(0x34, 3, 1, 0),                       # lqd $r0,48($r1)
+                    rr(0x1A8, ra=0),
+                ]
+                image = b"".join(struct.pack(">I", word) for word in [0] * 16 + body)
+                output = Path(tmp) / "reference"
+                result = run_lifter(image, [(0x40, 0x64)], [], output)
+                self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+                source = (output / "spu_recomp.c").read_text()
+                report = json.loads((output / "lift.json").read_text())
+                self.assertEqual("SPU_RET(ctx)" in source, proven)
+                if proven:
+                    [entry] = report["r0_returns"]
+                    self.assertEqual((entry["site"], entry["load"]), (0x60, 0x5C))
+                else:
+                    [entry] = report["r0_dispatches"]
+                    self.assertEqual(
+                        (entry["site"], entry["reason"]),
+                        (0x60, "unknown-or-conflicting-stack-delta"))
 
     def test_pc_getter_preserves_the_frame_across_a_split(self):
         words = [rr(0x201)] * (0x58 // 4)

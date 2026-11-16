@@ -100,6 +100,13 @@ int main(int argc, char** argv)
         };
         ps3_stop(PS3_STOP_CONFIG_INVALID, "w", "r", f, 6, nullptr);
     }
+    if (!std::strcmp(scenario, "spu-indirect-target-set")) {
+        ps3_stop_field fields[] = { {"image", "7"}, {"target", "0x1234"} };
+        ps3_stop_site site = { 0x48, 0x40, 3 };
+        ps3_stop(PS3_STOP_SPU_INDIRECT_TARGET_SET,
+                 "an SPU indirect branch left its static target set",
+                 "inspect the branch target", fields, 2, &site);
+    }
     if (!std::strcmp(scenario, "kind") && argc == 3) {
         int k = std::atoi(argv[2]);
         ps3_stop((ps3_stop_kind)k, "a kind probe", "none", nullptr, 0, nullptr);
