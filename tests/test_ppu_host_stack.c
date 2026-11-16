@@ -82,6 +82,24 @@ const char* ps3_stop_kind_id(ps3_stop_kind kind)
 
 static int g_fails;
 #define CHECK(cond) do { if (!(cond)) { g_fails++; fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #cond); } } while (0)
+/* A check whose failure should carry the numbers: a failing CI run has nothing else to go on. */
+#define CHECK_V(cond, ...) do { if (!(cond)) { g_fails++; fprintf(stderr, "FAIL line %d: %s: ", __LINE__, #cond); \
+                                               fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } } while (0)
+
+/* A run that measures stacks takes the process out of transparent huge pages before it creates a thread (host_stack.h
+ * host_stack_measure_prepare): with THP=always a thread stack outside MAP_STACK is backed by 2 MiB pages and the mark
+ * comes out in 2 MiB steps. A run that does not measure leaves the process as it was. A host whose prctl does not
+ * answer (qemu-user) skips the probe, visibly. */
+static void check_thp_off(int want)
+{
+#if defined(__linux__) && defined(PR_GET_THP_DISABLE)
+    const int now = prctl(PR_GET_THP_DISABLE, 0, 0, 0, 0);
+    if (now < 0) { fprintf(stderr, "SKIP thp probe: PR_GET_THP_DISABLE errno=%d\n", errno); return; }
+    CHECK_V(now == want, "PR_GET_THP_DISABLE is %d, wanted %d", now, want);
+#else
+    (void)want;
+#endif
+}
 
 /* ---- what the threads do ------------------------------------------------ */
 
@@ -266,6 +284,7 @@ int main(int argc, char** argv)
     if (!on) {
         /* The default run: nothing recorded, nothing reported, and the slot's stack range stays unset. */
         const uint64_t tid = run_thread(0, 4);
+        check_thp_off(0);
         size_t r, hw; int known;
         CHECK(g_res[0].known);                                   /* the helpers themselves work */
         CHECK(events_for(tid, 0, &r, &hw, &known) == 0);
@@ -292,21 +311,22 @@ int main(int argc, char** argv)
         CHECK(r->known);
         CHECK(events_for(tids[i], 0, &rsv, &hw, &known) == 1);   /* once, at the exit */
         CHECK(known && rsv == reserved);
-        CHECK(hw == r->hw);                                      /* the exit report sees what the thread saw */
+        CHECK_V(hw == r->hw, "thread %u: exit report %zu, in-thread %zu", i, hw, r->hw);   /* the exit report sees what the thread saw */
         if (i < 2) {
             /* The chain's lowest live address is r->fp; the report counts from the page-aligned top down to the
              * page that address is in, so it is the exact distance and at most one page more. */
             const size_t exact = (size_t)(r->end - r->fp);
-            CHECK(r->hw >= exact);
-            CHECK(r->hw <= exact + pg);
-            CHECK(r->hw >= (i == 0 ? 8u : 24u) * FRAME);
+            CHECK_V(r->hw >= exact, "thread %u: hw %zu, exact %zu", i, r->hw, exact);
+            CHECK_V(r->hw <= exact + pg, "thread %u: hw %zu, exact %zu, page %zu", i, r->hw, exact, pg);
+            CHECK_V(r->hw >= (i == 0 ? 8u : 24u) * FRAME, "thread %u: hw %zu", i, r->hw);
         } else {
             /* A thread that did nothing: below the shallowest recursing thread. Not zero: glibc puts the
              * thread's TLS block at the top of its stack, a hundred KB or more, and Darwin puts nothing there. */
-            CHECK(r->hw < 8u * FRAME);
+            CHECK_V(r->hw < 8u * FRAME, "thread %u: hw %zu", i, r->hw);
         }
     }
-    CHECK(g_res[1].hw > g_res[0].hw);
+    CHECK_V(g_res[1].hw > g_res[0].hw, "hw %zu (24 frames) vs %zu (8 frames)", g_res[1].hw, g_res[0].hw);
+    check_thp_off(1);
 
     /* 4. A thread still running is reported live by the exit summary, and again at its exit. */
     g_nev = 0;
@@ -318,13 +338,14 @@ int main(int argc, char** argv)
         size_t rsv = 0, hw = 0; int known = 0;
         CHECK(events_for(tid_d, 1, &rsv, &hw, &known) == 1);
         CHECK(known && rsv == reserved);
-        CHECK(hw == g_res[3].hw && hw >= 8u * FRAME);
+        CHECK_V(hw == g_res[3].hw && hw >= 8u * FRAME, "live report hw %zu, in-thread %zu", hw, g_res[3].hw);
     }
     __atomic_store_n(&g_release, 1, __ATOMIC_RELEASE);
     join_thread(tid_d);
     {
         size_t rsv = 0, hw = 0; int known = 0;
-        CHECK(events_for(tid_d, 0, &rsv, &hw, &known) == 1 && known && hw == g_res[3].hw);
+        CHECK_V(events_for(tid_d, 0, &rsv, &hw, &known) == 1 && known && hw == g_res[3].hw,
+                "exit report: known %d, hw %zu, in-thread %zu", known, hw, g_res[3].hw);
     }
 
     /* 5. A host that refuses the stack: the create stops, naming the thread, the bytes and the errno. */

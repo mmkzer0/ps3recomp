@@ -30,6 +30,17 @@ with tempfile.TemporaryDirectory(prefix='ppu-host-stack-') as tmp:
                     str(root / 'tests/test_ppu_host_stack.c'), str(root / 'runtime/diag/ps3_log.c'),
                     str(root / 'runtime/diag/host_exit.c'),
                     *linker, '-o', str(binary)], check=True)
-    quiet = subprocess.DEVNULL if os.environ.get('CI') else None
+    # Under CI the fixture's log (every thread's start and end line) stays off the success path, but a failing run
+    # names its mode and prints what it said, which carries the failing CHECK's line.
+    ci = bool(os.environ.get('CI'))
     for mode in ('on', 'off'):
-        subprocess.run([str(binary), mode], check=True, timeout=120, stderr=quiet)
+        run = subprocess.run([str(binary), mode], timeout=120, stderr=subprocess.PIPE if ci else None, text=True)
+        if run.returncode != 0:
+            print(f'FAIL: fixture mode `{mode}` exited {run.returncode}', file=sys.stderr)
+            if ci and run.stderr:
+                print(run.stderr, file=sys.stderr, end='')
+            # What a stack's residency can depend on, for a run that cannot be repeated.
+            thp = Path('/sys/kernel/mm/transparent_hugepage/enabled')
+            print(f'host: {os.uname().sysname} {os.uname().release} {os.uname().machine}; THP enabled: '
+                  f'{thp.read_text().strip() if thp.exists() else "n/a"}', file=sys.stderr)
+            raise SystemExit(1)
