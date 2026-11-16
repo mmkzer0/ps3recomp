@@ -512,6 +512,59 @@ static void test_suspend_waits_for_scheduling(void)
     CHECK(s_last_committed == nil, "shutdown dropped the record of the dropped queue");
 }
 
+/* No CPU write to a texture with a GPU decode pending. A two-level texture's level 0 goes to the GPU (fresh, path
+ * gpu), then a commit's worth of staleness (the serial moves, as a commit does) makes the upload of level 1 a
+ * CPU-tier refresh of the same texture: it must wait for the pending decode before its replaceRegion. `hold`
+ * keeps the decode pending for good (the guard's settle runs out its bound and stops, the CPU write never
+ * happens); without it the decode is only late (100 ms) and the write goes through after the wait. The counters
+ * (test hooks of the backend) say whether a write met a pending decode, not what a device did with it, so the
+ * test fails on any device when the guard is gone. */
+static void test_cpu_write_waits_for_pending_decode(int hold)
+{
+    setup_policy("gpu", 1, 0);
+    CHECK(backend_init() == 0, "init");
+    uint32_t rng = 0xC0FFEE11u;
+    RsxMetalBc* bc = eng_bc_gpu();
+    s_test_bc_guard_waits = s_test_bc_cpu_write_hazards = 0;
+    const u32 tex = eng_texture_create(NULL, RSX_BE_FMT_BC3, 64, 64, 2, 1, 0xAAE4, 0xA8);
+    CHECK(tex != 0, "create a two-level texture");
+    rsx_bc_test_image l0, l1;
+    CHECK(rsx_bc_test_make_random_image(&l0, RSX_BC_FORMAT_BC3, 64, 64, &rng), "level 0 image");
+    CHECK(rsx_bc_test_make_random_image(&l1, RSX_BC_FORMAT_BC3, 32, 32, &rng), "level 1 image");
+    if (hold) { s_eng_bc_settle_budget_ms = TEST_BUDGET_MS; [bc testHoldNextDecodeCompletion]; }
+    else      [bc testInjectNextDecodeFailure:NO delayMicroseconds:100000];
+    eng_texture_upload(NULL, tex, 0, 0, 64, 64, l0.bytes, (u32)l0.row_bytes, l0.blocks_h);
+    CHECK(s_eng_bc_tier_uploads[2] == 1 && [bc hasPendingDecodeFor:eng_obj(tex)],
+          "level 0 took the GPU tier and its decode is pending (GPU uploads %u)", s_eng_bc_tier_uploads[2]);
+    s_eng_commit_serial++;   /* what a commit does: the texture is no longer fresh, its next upload is a CPU refresh */
+    const unsigned cpu_before = s_eng_bc_tier_uploads[1];
+    const int stopped = STOPS_IN(eng_texture_upload(NULL, tex, 0, 1, 32, 32, l1.bytes, (u32)l1.row_bytes, l1.blocks_h));
+    CHECK(s_test_bc_cpu_write_hazards == 0, "no CPU write met the pending decode (%u)", s_test_bc_cpu_write_hazards);
+    CHECK(s_test_bc_guard_waits == 1, "the CPU write waited for the pending decode (%u waits)", s_test_bc_guard_waits);
+    if (hold) {
+        CHECK(stopped && s_stop.kind == PS3_STOP_HOST_GPU_COMMAND && !strcmp(stop_field("reason"), "decode-timeout") &&
+              strstr(stop_field("pending"), "BC3 64x64 level 0 slice 0 z 0") != NULL,
+              "the wait for a decode that never ends is the settle's decode-timeout (stopped %d, reason '%s')", stopped,
+              stop_field("reason"));
+        CHECK(s_eng_bc_tier_uploads[1] == cpu_before, "the CPU write did not happen");
+        [bc testReleaseHeldCompletion];
+        CHECK([bc waitIdleWithin:5000] == nil, "released");
+        s_eng_bc_settle_budget_ms = ENG_BC_SETTLE_BUDGET_MS;
+        eng_texture_upload(NULL, tex, 0, 1, 32, 32, l1.bytes, (u32)l1.row_bytes, l1.blocks_h);
+        CHECK(s_test_bc_guard_waits == 1 && s_test_bc_cpu_write_hazards == 0,
+              "with nothing pending the CPU write goes through with no wait (%u waits, %u hazards)", s_test_bc_guard_waits,
+              s_test_bc_cpu_write_hazards);
+    } else {
+        CHECK(!stopped, "a late decode is waited for, not a stop");
+        CHECK([bc inFlight] == 0, "the decode had completed before the CPU write");
+    }
+    CHECK(s_eng_bc_tier_uploads[1] == cpu_before + 1, "level 1 took the CPU tier (%u)", s_eng_bc_tier_uploads[1]);
+    rsx_bc_test_image_free(&l0);
+    rsx_bc_test_image_free(&l1);
+    eng_obj_release(NULL, tex);
+    rsx_metal_backend_shutdown();
+}
+
 /* One BC_SETTLE span per commit while the GPU tier exists, with the decodes in flight and the outcome. */
 static void test_settle_spans(void)
 {
@@ -562,6 +615,8 @@ int main(void)
         test_settle_waits_out_a_suspended_gate();
         test_suspend_waits_for_scheduling();
         test_settle_spans();
+        test_cpu_write_waits_for_pending_decode(1);
+        test_cpu_write_waits_for_pending_decode(0);
         printf("[metal_bc_failclosed] failures=%u\n", s_failures);
     }
     return s_failures ? 1 : 0;

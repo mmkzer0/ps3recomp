@@ -86,6 +86,10 @@ typedef struct rsx_metal_bc_host {
 /* Decodes committed and not yet completed. */
 - (unsigned)inFlight;
 
+/* Whether a decode committed and not yet completed writes `texture`. The host must not write that texture from
+ * the CPU (replaceRegion) while this is YES: the GPU may be writing it, and the two overlap undefined. */
+- (BOOL)hasPendingDecodeFor:(id<MTLTexture>)texture;
+
 /* The first decode whose command buffer ended in an error, since init: what it was filling ("BC3 64x64 level 2
  * slice 0 z 0") and what Metal said; nil when none failed. The texture it was to fill is undefined. Valid
  * after waitIdleWithin returned nil; safe from any thread. */

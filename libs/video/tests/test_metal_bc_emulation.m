@@ -4,8 +4,9 @@
  *
  *   cpu | gpu | tiered   the texture is RGBA8Unorm and every level, cube face and 3D slice holds exactly what
  *                        rsx_bc_decode makes of the blocks uploaded; the uploads ran on the tiers the contract
- *                        says (cpu: all CPU; gpu: all GPU while the texture is fresh; tiered: GPU from
- *                        rsx.bc_gpu_min_texels texels), and left one PS3_FTRACE BC_UPLOAD span each, saying so
+ *                        says (cpu: all CPU; gpu: all GPU while the texture is fresh; tiered: every level of a
+ *                        texture whose largest level has rsx.bc_gpu_min_texels texels or more on the GPU, every
+ *                        level of a smaller one on the CPU), and left one PS3_FTRACE BC_UPLOAD span each, saying so
  *   auto (or none)       this Mac samples BC: the texture stays a BC texture, nothing is decoded, no span
  *
  * The GPU tier's decode is read back by a blit committed on the backend's queue right after the upload with no
@@ -13,6 +14,7 @@
  * the texture before the decode wrote it. A texture that has seen a commit since its creation takes the CPU
  * tier even under `gpu` (a rewrite would race the draws recorded against it). Synthetic blocks only. Skips (77)
  * without a Metal device. */
+#define RSX_METAL_BC_TEST_HOOKS 1   /* the counters of CPU writes against pending GPU decodes */
 #include "../rsx_metal_backend.m"
 #include "rsx_bc_test_corpus.h"
 
@@ -63,17 +65,19 @@ static unsigned s_expect_n;
 static int s_emulating;
 static int s_path;   /* ENG_BC_PATH_* of the run; 0 = auto on this Mac */
 
-static u32 expect_tier(u32 texels, int fresh)
+/* The tier is a property of the texture: its largest level (the creation size) decides it for every level, face
+ * and slice. A texture that has seen a commit since its creation is CPU whatever the path says. */
+static u32 expect_tier(u32 texture_texels, int fresh)
 {
     if (s_path == ENG_BC_PATH_CPU || !fresh) return 1;
-    if (s_path == ENG_BC_PATH_TIERED && texels < 1024u) return 1;
+    if (s_path == ENG_BC_PATH_TIERED && texture_texels < 1024u) return 1;
     return 2;
 }
 
-static void note_upload(const fmt_row* f, u32 w, u32 h, int fresh)
+static void note_upload(const fmt_row* f, u32 texture_texels, u32 w, u32 h, int fresh)
 {
     if (!s_emulating) return;
-    s_expect[s_expect_n++] = (expected_upload){ (u32)f->bc, w * h, expect_tier(w * h, fresh) };
+    s_expect[s_expect_n++] = (expected_upload){ (u32)f->bc, w * h, expect_tier(texture_texels, fresh) };
 }
 
 static uint8_t* read_back(id<MTLTexture> t, NSUInteger slice, NSUInteger level, NSUInteger z, u32 w, u32 h)
@@ -137,7 +141,7 @@ static void scenario_2d(const fmt_row* f, u32 w, u32 h, uint32_t* rng)
         const u32 lw = w >> m ? w >> m : 1u, lh = h >> m ? h >> m : 1u;
         CHECK(rsx_bc_test_make_random_image(&im[m], f->bc, lw, lh, rng), "level image");
         eng_texture_upload(NULL, handle, 0, m, lw, lh, im[m].bytes, (u32)im[m].row_bytes, im[m].blocks_h);
-        note_upload(f, lw, lh, 1);
+        note_upload(f, w * h, lw, lh, 1);
     }
     for (u32 m = 0; m < levels; ++m) {
         expect_level("2D", t, 0, m, 0, &im[m], f->bc);
@@ -161,7 +165,7 @@ static void scenario_cube(const fmt_row* f, u32 side, uint32_t* rng)
             CHECK(rsx_bc_test_make_random_image(&im[face][m], f->bc, l, l, rng), "cube image");
             eng_texture_upload(NULL, handle, face, m, l, l, im[face][m].bytes, (u32)im[face][m].row_bytes,
                                im[face][m].blocks_h);
-            note_upload(f, l, l, 1);
+            note_upload(f, side * side, l, l, 1);
         }
     }
     for (u32 face = 0; face < 6; ++face)
@@ -186,7 +190,7 @@ static void scenario_3d(const fmt_row* f, u32 w, u32 h, u32 depth, uint32_t* rng
         for (u32 z = 0; z < d; ++z) {
             CHECK(rsx_bc_test_make_random_image(&im[m][z], f->bc, lw, lh, rng), "slice image");
             eng_texture_upload_3d(NULL, handle, z, m, lw, lh, im[m][z].bytes, (u32)im[m][z].row_bytes);
-            note_upload(f, lw, lh, 1);
+            note_upload(f, w * h, lw, lh, 1);
         }
     }
     d = depth;
@@ -207,7 +211,7 @@ static void scenario_stale(const fmt_row* f, uint32_t* rng)
     rsx_bc_test_image im;
     CHECK(rsx_bc_test_make_random_image(&im, f->bc, 64, 64, rng), "stale image");
     eng_texture_upload(NULL, handle, 0, 0, 64, 64, im.bytes, (u32)im.row_bytes, im.blocks_h);
-    note_upload(f, 64, 64, 0);
+    note_upload(f, 64u * 64u, 64, 64, 0);
     expect_level("stale", eng_obj(handle), 0, 0, 0, &im, f->bc);
     rsx_bc_test_image_free(&im);
     eng_obj_release(NULL, handle);
@@ -222,7 +226,7 @@ static void scenario_exhaustive(void)
     const u32 handle = eng_texture_create(NULL, f->be, bc3.width, bc3.height, 1, 1, 0xAAE4, f->rsx_fmt);
     CHECK(handle != 0, "create exhaustive");
     eng_texture_upload(NULL, handle, 0, 0, bc3.width, bc3.height, bc3.bytes, (u32)bc3.row_bytes, bc3.blocks_h);
-    note_upload(f, bc3.width, bc3.height, 1);
+    note_upload(f, bc3.width * bc3.height, bc3.width, bc3.height, 1);
     expect_level("exhaustive BC3 alpha", eng_obj(handle), 0, 0, 0, &bc3, f->bc);
     eng_obj_release(NULL, handle);
     rsx_bc_test_image_free(&bc3);
@@ -291,6 +295,9 @@ int main(int argc, char** argv)
         }
         CHECK(spans == s_expect_n, "%u BC_UPLOAD spans for %u emulated uploads", spans, s_expect_n);
         CHECK([s_eng_bc_gpu failureCount] == 0, "a GPU decode failed");
+        CHECK(s_test_bc_cpu_write_hazards == 0 && s_test_bc_guard_waits == 0,
+              "no CPU write met a pending GPU decode of its texture (hazards %u, guard waits %u)",
+              s_test_bc_cpu_write_hazards, s_test_bc_guard_waits);
         CHECK(!__atomic_load_n(&s_eng_encoding_failed, __ATOMIC_RELAXED), "the backend marked itself failed");
 
         printf("[metal_bc_emulation] path=%s emulating=%d uploads cpu=%u gpu=%u spans=%u failures=%u\n", want_path,
