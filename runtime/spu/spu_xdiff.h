@@ -10,8 +10,8 @@
  *   - the tiers and the two configuration choices (which tier is the
  *     authority, whether the other one shadows it);
  *   - the verdict vocabulary and its stable reason ids;
- *   - the layout of a fixture, schema `ps3recomp.spujob/1`: one job's entry
- *     state, its transcript and its authoritative end state.
+ *   - the layout of a version-2 fixture (and version-1 job fixtures): a job's
+ *     entry/transcript/end state or one function call's entry/exit state and masks.
  *
  * Design, matching rules and the evidence each choice rests on:
  * docs/SPU_XDIFF.md. Nothing here records, replays or compares; the only
@@ -87,16 +87,16 @@ typedef enum spu_xdiff_match {
 } spu_xdiff_match;
 
 /* The rule for a pair of stored tiers, or 0 when the pair is not comparable.
- * T0 and T1 execute the same SPU instructions, so they are held to the same
- * program; a pair with native code in it is held to the contract; a tweak is
- * different on purpose. */
+ * T0/T1 execute the same instructions. T2's pilot keeps that strict rule;
+ * only T3 uses the relaxed contract, and a tweak has no comparison rule. */
 static inline uint32_t spu_xdiff_match_for(uint32_t authority_tier, uint32_t subject_tier)
 {
     const uint32_t a = authority_tier & SPU_TIER_MASK, s = subject_tier & SPU_TIER_MASK;
     if ((authority_tier | subject_tier) & SPU_TIER_TWEAK) return 0;
     if (a > (uint32_t)SPU_TIER_NATIVE || s > (uint32_t)SPU_TIER_NATIVE) return 0;
-    return (a <= (uint32_t)SPU_TIER_LIFTED && s <= (uint32_t)SPU_TIER_LIFTED) ? (uint32_t)SPU_XDIFF_MATCH_PROGRAM
-                                                                              : (uint32_t)SPU_XDIFF_MATCH_CONTRACT;
+    return (a <= (uint32_t)SPU_TIER_PARTIAL && s <= (uint32_t)SPU_TIER_PARTIAL)
+               ? (uint32_t)SPU_XDIFF_MATCH_PROGRAM
+               : (uint32_t)SPU_XDIFF_MATCH_CONTRACT;
 }
 
 /* ---- verdicts ------------------------------------------------------------ */
@@ -129,7 +129,7 @@ typedef enum spu_xdiff_verdict {
  * The differ reasons are in the order a same-program replay meets them: an
  * effect of another kind or channel, the same effect with other arguments, a
  * write of other bytes, an effect past the transcript's end, a transcript
- * left unfinished, then the end state. The first one met is the verdict. */
+ * left unfinished, then the end state including its return destination. */
 #define SPU_XDIFF_REASONS(X)                                                                        \
     X(NONE,               0, "none",               EQUAL)                                           \
     X(EFFECT_KIND,       16, "effect-kind",        DIFFER)                                          \
@@ -140,6 +140,7 @@ typedef enum spu_xdiff_verdict {
     X(END_CLASS,         21, "end-class",          DIFFER)                                          \
     X(END_REGS,          22, "end-regs",           DIFFER)                                          \
     X(END_LS,            23, "end-ls",             DIFFER)                                          \
+    X(END_PC,            27, "end-pc",             DIFFER)                                          \
     /* Contract matching only: a write or signal ahead of its epoch; an epoch whose bytes differ. */ \
     X(EPOCH_ORDER,       24, "epoch-order",        DIFFER)                                          \
     X(EPOCH_WRITES,      25, "epoch-writes",       DIFFER)                                          \
@@ -157,6 +158,8 @@ typedef enum spu_xdiff_verdict {
     /* The authority exceeded the bounded live capture buffer; the comparison was not attempted. */ \
     X(CAPTURE_LIMIT,    38, "capture-limit",     VOID)                                            \
     X(FIXTURE_FORMAT,    48, "fixture-format",     MALFORMED)                                       \
+    /* The file is well-formed but this reader does not implement its version. */                    \
+    X(UNSUPPORTED_VERSION, 51, "unsupported-version", MALFORMED)                                     \
     /* A well-formed fixture of another image, or of an effect vocabulary this build cannot replay. */ \
     X(FIXTURE_IDENTITY,  49, "fixture-identity",   MALFORMED)                                       \
     /* The pair of tiers has no matching rule (a tweak). */                                         \
@@ -302,11 +305,14 @@ typedef struct spu_xdiff_effect {
 } spu_xdiff_effect;
 static_assert(sizeof(spu_xdiff_effect) == 40, "spu_xdiff_effect is a file record");
 
-/* ---- fixture: ps3recomp.spujob/1 ------------------------------------------ */
-
-#define SPU_XDIFF_SCHEMA  "ps3recomp.spujob/1"
-#define SPU_XDIFF_VERSION 1u
-/* The first eight bytes of a fixture file. */
+/* ---- fixture: ps3recomp.spujob/2 ------------------------------------------
+ *
+ * The reader accepts version-1 job fixtures and version-2 job or function
+ * fixtures. Writers emit version 2. */
+#define SPU_XDIFF_SCHEMA_V1 "ps3recomp.spujob/1"
+#define SPU_XDIFF_SCHEMA    "ps3recomp.spujob/2"
+#define SPU_XDIFF_VERSION_V1 1u
+#define SPU_XDIFF_VERSION  2u
 #define SPU_XDIFF_MAGIC   "SPUJOB\r\n"
 
 /* Bounds a reader enforces before it trusts a count or an offset; a fixture
@@ -346,7 +352,7 @@ static_assert(sizeof(spu_xdiff_section) == 24, "spu_xdiff_section is a file reco
 #define SPU_XDIFF_FOURCC(a, b, c, d) \
     ((uint32_t)(uint8_t)(a) | (uint32_t)(uint8_t)(b) << 8 | (uint32_t)(uint8_t)(c) << 16 | (uint32_t)(uint8_t)(d) << 24)
 
-/* Required, once each: */
+/* Required once for a job unit; FMAS is required only for a function unit. */
 #define SPU_XDIFF_SEC_IDENTITY SPU_XDIFF_FOURCC('I', 'D', 'E', 'N') /* spu_xdiff_identity */
 #define SPU_XDIFF_SEC_UNIT     SPU_XDIFF_FOURCC('U', 'N', 'I', 'T') /* spu_xdiff_unit */
 #define SPU_XDIFF_SEC_REG0     SPU_XDIFF_FOURCC('R', 'E', 'G', '0') /* entry registers, SPU_XDIFF_REG_BYTES */
@@ -356,6 +362,7 @@ static_assert(sizeof(spu_xdiff_section) == 24, "spu_xdiff_section is a file reco
 #define SPU_XDIFF_SEC_REG1     SPU_XDIFF_FOURCC('R', 'E', 'G', '1') /* the authority's end registers */
 #define SPU_XDIFF_SEC_LS1      SPU_XDIFF_FOURCC('L', 'S', '_', '1') /* its end local store: extents over LS0 */
 #define SPU_XDIFF_SEC_END      SPU_XDIFF_FOURCC('E', 'N', 'D', '_') /* spu_xdiff_end */
+#define SPU_XDIFF_SEC_FMASK    SPU_XDIFF_FOURCC('F', 'M', 'S', 'K') /* function live-out and dead-stack masks */
 /* Optional, at most once: the verdict that made the runtime write this
  * fixture. A reader that replays ignores it. */
 #define SPU_XDIFF_SEC_VERDICT  SPU_XDIFF_FOURCC('V', 'R', 'D', 'T') /* spu_xdiff_verdict_record */
@@ -409,7 +416,8 @@ typedef struct spu_xdiff_identity {
 static_assert(sizeof(spu_xdiff_identity) == 80, "spu_xdiff_identity is a file record");
 
 typedef enum spu_xdiff_unit_kind {
-    SPU_XDIFF_UNIT_JOB = 1 /* one job, from the loader's entry state to the end of its run */
+    SPU_XDIFF_UNIT_JOB = 1,      /* one job, from the loader's entry state to the end of its run */
+    SPU_XDIFF_UNIT_FUNCTION = 2  /* one function call, with its liveness masks */
 } spu_xdiff_unit_kind;
 
 /* Which loader staged the unit, and so which end classification applies. */
@@ -430,7 +438,7 @@ typedef struct spu_xdiff_unit {
     uint32_t kind;       /* spu_xdiff_unit_kind */
     uint32_t profile;    /* spu_xdiff_profile */
     uint32_t entry_pc;   /* ctx->pc at entry */
-    uint32_t return_ls;  /* the link the loader planted; a branch there is the normal return */
+    uint32_t return_ls;  /* job: loader-planted link; function: authority's return PC */
     uint32_t job_rt_ls;  /* ctx->job_rt_ls */
     uint32_t job_rt_ls2; /* ctx->job_rt_ls2 */
     uint32_t image_ea, image_ls, image_bytes, bss_bytes;
@@ -447,6 +455,15 @@ typedef struct spu_xdiff_unit {
     uint32_t reserved;
 } spu_xdiff_unit;
 static_assert(sizeof(spu_xdiff_unit) == 104, "spu_xdiff_unit is a file record");
+
+/* Section FMAS, required for UNIT kind FUNCTION: live-out registers and the
+ * dead frame extent below UNIT.r1. Bits use register numbers 0..127. */
+typedef struct spu_xdiff_function_mask {
+    uint64_t live_out[2];       /* bit r is 1 when $rN is live at any function exit */
+    uint32_t dead_stack_bytes;  /* [UNIT.r1 - dead_stack_bytes, UNIT.r1) is dead */
+    uint32_t reserved;          /* 0 */
+} spu_xdiff_function_mask;
+static_assert(sizeof(spu_xdiff_function_mask) == 24, "spu_xdiff_function_mask is a file record");
 
 /* Sections REG0, REG1: registers 0..127, 16 bytes each, in guest byte order:
  * byte k of register r is the byte a `stqd` of r stores at offset k. That is

@@ -36,24 +36,39 @@
 
 typedef struct runner_args {
     const char* path;
-    uint32_t    tier;       /* SPU_TIER_INTERP or SPU_TIER_LIFTED */
+    const char* fn_unit;      /* --fn-unit: function fixture path */
+    const char* fn_symbol;    /* --fn-symbol: lifted or native */
+    const char* capture_fn;   /* --capture-fn: liveness plan */
+    const char* out_dir;      /* --out: function capture directory */
+    uint32_t    function_entry;
+    uint32_t    tier;         /* SPU_TIER_INTERP or SPU_TIER_LIFTED */
     uint64_t    budget;
     unsigned    timeout_s;
     int         json;
-    const char* poison;     /* --poison: the liveness plan's path, or NULL */
+    int         has_function_entry;
+    int         function_mode;
+    int         capture_mode;
+    int         native_override;
+    const char* poison;       /* --poison: the liveness plan's path, or NULL */
     const spu_xdiff_poison_plan* plan;   /* that plan, loaded */
 } runner_args;
 
-/* What the replay child hands back: the verdict record, and the poison run's report (zero without --poison). */
+/* What the replay child hands back: the whole-job verdict, poison report, and
+ * optional per-function verdict. */
 typedef struct child_reply {
     spu_xdiff_verdict_record v;
     spu_xdiff_poison_report  poison;
+    spu_xdiff_function_result function;
 } child_reply;
 
 static int usage(const char* argv0, const char* why)
 {
     if (why) fprintf(stderr, "%s: %s\n", argv0, why);
-    fprintf(stderr, "usage: %s [--tier interp|registered] [--budget N] [--timeout S] [--poison PLAN] [--json] FIXTURE\n", argv0);
+    fprintf(stderr, "usage: %s [--tier interp|registered] [--budget N] [--timeout S] "
+                    "[--poison PLAN] [--json] FIXTURE\n"
+                    "       %s --tier interp --capture-fn PLAN --fn ADDR --out DIR FIXTURE\n"
+                    "       %s --fn-unit UNIT --fn-symbol lifted|native\n",
+            argv0, argv0, argv0);
     return 1;
 }
 
@@ -69,40 +84,57 @@ static int parse_u64(const char* s, uint64_t* out)
     return 1;
 }
 
-/* 0 on success, 1 (printed) on a usage error. The default tier is the registered body: the tool exists to
- * compare the other tier with a fixture, and a fixture's own tier needs no replay. */
+/* 0 on success, 1 (printed) on a usage error. The default tier is the registered body. */
 static int parse_args(int argc, char** argv, runner_args* a)
 {
     const char* argv0 = argc > 0 && argv[0] ? argv[0] : "spu_job_replay";
-    a->path = NULL;
+    memset(a, 0, sizeof *a);
     a->tier = (uint32_t)SPU_TIER_LIFTED;
-    a->budget = 0;
     a->timeout_s = 60;
-    a->json = 0;
-    a->poison = NULL;
-    a->plan = NULL;
     for (int i = 1; i < argc; i++) {
         const char* o = argv[i];
         if (!strcmp(o, "--json")) {
             a->json = 1;
-        } else if (!strcmp(o, "--poison")) {
+        } else if (!strcmp(o, "--poison") || !strcmp(o, "--capture-fn")) {
             if (i + 1 >= argc) return usage(argv0, "an option lacks its value");
-            a->poison = argv[++i];
+            if (!strcmp(o, "--poison")) a->poison = argv[++i];
+            else a->capture_fn = argv[++i];
+        } else if (!strcmp(o, "--fn-unit") || !strcmp(o, "--fn-symbol") ||
+                   !strcmp(o, "--fn") || !strcmp(o, "--out")) {
+            if (i + 1 >= argc) return usage(argv0, "an option lacks its value");
+            const char* value = argv[++i];
+            if (!strcmp(o, "--fn-unit")) a->fn_unit = value;
+            else if (!strcmp(o, "--fn-symbol")) {
+                if (strcmp(value, "lifted") && strcmp(value, "native"))
+                    return usage(argv0, "--fn-symbol is lifted or native");
+                a->fn_symbol = value;
+                a->native_override = !strcmp(value, "native");
+            } else if (!strcmp(o, "--out")) {
+                a->out_dir = value;
+            } else {
+                uint64_t address = 0;
+                if (!parse_u64(value, &address) || address > SPU_XDIFF_LS_BYTES - 4u ||
+                    (address & 3u))
+                    return usage(argv0, "--fn must be an aligned local-store address");
+                a->function_entry = (uint32_t)address;
+                a->has_function_entry = 1;
+            }
         } else if (!strcmp(o, "--tier") || !strcmp(o, "--budget") || !strcmp(o, "--timeout")) {
             if (i + 1 >= argc) return usage(argv0, "an option lacks its value");
-            const char* v = argv[++i];
-            uint64_t n = 0;
+            const char* value = argv[++i];
+            uint64_t number = 0;
             if (!strcmp(o, "--tier")) {
-                if (!strcmp(v, "interp")) a->tier = (uint32_t)SPU_TIER_INTERP;
-                else if (!strcmp(v, "registered")) a->tier = (uint32_t)SPU_TIER_LIFTED;
+                if (!strcmp(value, "interp")) a->tier = (uint32_t)SPU_TIER_INTERP;
+                else if (!strcmp(value, "registered")) a->tier = (uint32_t)SPU_TIER_LIFTED;
                 else return usage(argv0, "--tier is interp or registered");
-            } else if (!parse_u64(v, &n)) {
+            } else if (!parse_u64(value, &number)) {
                 return usage(argv0, "a number is expected after --budget and --timeout");
             } else if (!strcmp(o, "--budget")) {
-                a->budget = n;
+                a->budget = number;
             } else {
-                if (n == 0 || n > 86400u) return usage(argv0, "--timeout is 1 to 86400 seconds");
-                a->timeout_s = (unsigned)n;
+                if (number == 0 || number > 86400u)
+                    return usage(argv0, "--timeout is 1 to 86400 seconds");
+                a->timeout_s = (unsigned)number;
             }
         } else if (o[0] == '-' && o[1] != 0) {
             return usage(argv0, "unknown option");
@@ -112,6 +144,22 @@ static int parse_args(int argc, char** argv, runner_args* a)
             a->path = o;
         }
     }
+    if (a->fn_unit) {
+        if (a->path || a->capture_fn || a->poison || a->out_dir || a->has_function_entry ||
+            !a->fn_symbol || a->budget)
+            return usage(argv0, "--fn-unit needs only --fn-symbol lifted|native and optional --timeout");
+        a->function_mode = 1;
+        return 0;
+    }
+    if (a->fn_symbol) return usage(argv0, "--fn-symbol requires --fn-unit");
+    if (a->capture_fn) {
+        if (!a->path || !a->has_function_entry || !a->out_dir || a->poison ||
+            a->tier != (uint32_t)SPU_TIER_INTERP)
+            return usage(argv0, "--capture-fn needs --tier interp, --fn, --out, and a job fixture");
+        a->capture_mode = 1;
+        return 0;
+    }
+    if (a->has_function_entry || a->out_dir) return usage(argv0, "--fn and --out require --capture-fn");
     if (!a->path) return usage(argv0, "no fixture");
     if (a->poison && a->tier != (uint32_t)SPU_TIER_INTERP)
         return usage(argv0, "--poison is T0's observer: it needs --tier interp");
@@ -145,21 +193,33 @@ static uint32_t fault_record(spu_xdiff_verdict_record* v, uint32_t tier, uint32_
 
 /* ---- running the replay ----------------------------------------------------------- */
 
-/* Returns the verdict, or SPU_XDIFF_VERDICT_INVALID when the replay itself refused a knob. `report` is the poison
- * run's (zero when there is none). */
-static uint32_t replay_here(const spu_xdiff_fixture* f, const runner_args* a, spu_xdiff_verdict_record* v,
-                            spu_xdiff_poison_report* report)
+/* Returns the verdict, or SPU_XDIFF_VERDICT_INVALID when the replay itself refused a knob. */
+static uint32_t replay_here(const spu_xdiff_fixture* f, const runner_args* a,
+                            spu_xdiff_verdict_record* v, spu_xdiff_poison_report* report,
+                            spu_xdiff_function_result* function)
 {
+    memset(report, 0, sizeof *report);
+    if (a->function_mode) {
+        const uint32_t verdict = spu_xdiff_replay_function_unit(f, a->native_override, function);
+        blank_record(v, a->native_override ? (uint32_t)SPU_TIER_PARTIAL : (uint32_t)SPU_TIER_LIFTED);
+        v->match = function->match;
+        v->verdict = function->verdict;
+        v->reason = function->reason;
+        v->where = function->where;
+        memcpy(v->want, function->want, sizeof v->want);
+        memcpy(v->got, function->got, sizeof v->got);
+        return verdict;
+    }
     spu_xdiff_replay_options opt;
     spu_xdiff_shadow* s = spu_xdiff_shadow_new();
-    memset(report, 0, sizeof *report);
     if (!s) {
         fprintf(stderr, "spu_job_replay: out of memory for the shadow context\n");
         return fault_record(v, a->tier, spu_xdiff_match_for(f->identity.authority.tier, a->tier));
     }
     opt.subject_tier = a->tier;
     opt.budget = a->budget;
-    const uint32_t r = a->plan ? spu_xdiff_replay_poison(f, &opt, a->plan, s, v, report) : spu_xdiff_replay(f, &opt, s, v);
+    const uint32_t r = a->plan ? spu_xdiff_replay_poison(f, &opt, a->plan, s, v, report)
+                               : spu_xdiff_replay(f, &opt, s, v);
     spu_xdiff_shadow_free(s);
     return r;
 }
@@ -185,9 +245,18 @@ static int64_t mono_ms(void)
     return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-static uint32_t host_fault(const runner_args* a, spu_xdiff_verdict_record* v, uint32_t match, const char* what, int detail)
+static uint32_t host_fault(const runner_args* a, spu_xdiff_verdict_record* v,
+                           spu_xdiff_function_result* function, uint32_t match,
+                           const char* what, int detail)
 {
     fprintf(stderr, "spu_job_replay: the replay child %s %d\n", what, detail);
+    if (a->function_mode && function) {
+        memset(function, 0, sizeof *function);
+        function->verdict = (uint32_t)SPU_XDIFF_VOID;
+        function->reason = (uint32_t)SPU_XDIFF_R_HOST_FAULT;
+        function->match = match;
+        function->where = SPU_XDIFF_NO_WHERE;
+    }
     return fault_record(v, a->tier, match);
 }
 
@@ -196,15 +265,17 @@ static uint32_t host_fault(const runner_args* a, spu_xdiff_verdict_record* v, ui
  * signal, an abort, a nonzero exit), is void / host-fault. A subject that runs away or crashes costs only the
  * child. Whenever fewer than a whole reply arrived the child is killed before it is waited for: a child that is
  * hung after a poll or read error must not block the supervisor. */
-static uint32_t replay_supervised(const spu_xdiff_fixture* f, const runner_args* a, spu_xdiff_verdict_record* v,
-                                  spu_xdiff_poison_report* report)
+static uint32_t replay_supervised(const spu_xdiff_fixture* f, const runner_args* a,
+                                  spu_xdiff_verdict_record* v, spu_xdiff_poison_report* report,
+                                  spu_xdiff_function_result* function)
 {
     const uint32_t match = v->match;
     memset(report, 0, sizeof *report);
+    if (function) memset(function, 0, sizeof *function);
     int fds[2];
     if (pipe(fds) != 0) {
         fprintf(stderr, "spu_job_replay: pipe failed: errno %d\n", errno);
-        return fault_record(v, a->tier, match);
+        return host_fault(a, v, function, match, "could not create its pipe, errno", errno);
     }
     fflush(NULL);   /* the child must not flush the parent's buffered output a second time */
     const pid_t pid = fork();
@@ -212,7 +283,7 @@ static uint32_t replay_supervised(const spu_xdiff_fixture* f, const runner_args*
         fprintf(stderr, "spu_job_replay: fork failed: errno %d\n", errno);
         close(fds[0]);
         close(fds[1]);
-        return fault_record(v, a->tier, match);
+        return host_fault(a, v, function, match, "could not fork, errno", errno);
     }
     if (pid == 0) {
         struct rlimit nocore = { 0, 0 };
@@ -220,7 +291,7 @@ static uint32_t replay_supervised(const spu_xdiff_fixture* f, const runner_args*
         close(fds[0]);
         memset(&reply, 0, sizeof reply);
         setrlimit(RLIMIT_CORE, &nocore);   /* a crashing subject is reported, not dumped */
-        replay_here(f, a, v, &reply.poison);
+        replay_here(f, a, v, &reply.poison, &reply.function);
         reply.v = *v;
         _exit(write_all(fds[1], &reply, sizeof reply) == 0 ? 0 : 71);
     }
@@ -251,20 +322,24 @@ static uint32_t replay_supervised(const spu_xdiff_fixture* f, const runner_args*
 
     if (timed_out) {
         fprintf(stderr, "spu_job_replay: the replay child did not finish within %u s and was killed\n", a->timeout_s);
-        return fault_record(v, a->tier, match);
+        return host_fault(a, v, function, match, "timed out", (int)a->timeout_s);
     }
     if (got == sizeof rep && WIFEXITED(st) && WEXITSTATUS(st) == 0) {
         if (rec->verdict == (uint32_t)SPU_XDIFF_VERDICT_INVALID) { *v = *rec; return rec->verdict; }
         if (spu_xdiff_reason_verdict(rec->reason) != rec->verdict)
-            return host_fault(a, v, match, "wrote an inconsistent verdict, reason", (int)rec->reason);
+            return host_fault(a, v, function, match, "wrote an inconsistent verdict, reason", (int)rec->reason);
+        if (a->function_mode &&
+            (rep.function.verdict != rec->verdict || rep.function.reason != rec->reason))
+            return host_fault(a, v, function, match, "wrote an inconsistent function verdict", (int)rep.function.reason);
         *v = *rec;
         *report = rep.poison;
+        if (function) *function = rep.function;
         return v->verdict;
     }
-    if (WIFSIGNALED(st)) return host_fault(a, v, match, "was killed by signal", WTERMSIG(st));
+    if (WIFSIGNALED(st)) return host_fault(a, v, function, match, "was killed by signal", WTERMSIG(st));
     if (!WIFEXITED(st) || WEXITSTATUS(st) != 0)
-        return host_fault(a, v, match, "exited with status", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
-    return host_fault(a, v, match, "ended without a verdict record after bytes:", (int)got);
+        return host_fault(a, v, function, match, "exited with status", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+    return host_fault(a, v, function, match, "ended without a verdict record after bytes:", (int)got);
 }
 
 #endif /* !_WIN32 */
@@ -324,7 +399,7 @@ static int has_bytes(uint32_t reason)
 {
     return reason == (uint32_t)SPU_XDIFF_R_EFFECT_REQUEST || reason == (uint32_t)SPU_XDIFF_R_EFFECT_PAYLOAD ||
            reason == (uint32_t)SPU_XDIFF_R_END_CLASS || reason == (uint32_t)SPU_XDIFF_R_END_REGS ||
-           reason == (uint32_t)SPU_XDIFF_R_END_LS;
+           reason == (uint32_t)SPU_XDIFF_R_END_PC || reason == (uint32_t)SPU_XDIFF_R_END_LS;
 }
 
 static int all_zero(const uint8_t* p, size_t n)
@@ -449,6 +524,34 @@ static void print_line(FILE* o, const runner_args* a, const spu_xdiff_fixture* f
     fputc('\n', o);
 }
 
+static void print_function_bytes(FILE* o, const uint8_t bytes[16])
+{
+    fputs("0x", o);
+    for (uint32_t i = 0; i < 16u; i++) fprintf(o, "%02x", bytes[i]);
+}
+
+static void print_function_result(FILE* o, const spu_xdiff_function_result* result)
+{
+    fprintf(o, "%s %s", spu_xdiff_verdict_id(result->verdict), spu_xdiff_reason_id(result->reason));
+    if (result->reason == (uint32_t)SPU_XDIFF_R_END_REGS) {
+        fprintf(o, " register=$r%u want=", (unsigned)result->where);
+        print_function_bytes(o, result->want);
+        fputs(" got=", o);
+        print_function_bytes(o, result->got);
+    } else if (result->reason == (uint32_t)SPU_XDIFF_R_END_PC) {
+        fprintf(o, " return-pc=0x%05X want=", (unsigned)result->where);
+        print_function_bytes(o, result->want);
+        fputs(" got=", o);
+        print_function_bytes(o, result->got);
+    } else if (result->reason == (uint32_t)SPU_XDIFF_R_END_LS) {
+        fprintf(o, " local-store=0x%05X want=", (unsigned)result->where);
+        print_function_bytes(o, result->want);
+        fputs(" got=", o);
+        print_function_bytes(o, result->got);
+    }
+    fprintf(o, " dead-registers=%u\n", (unsigned)result->dead_registers);
+}
+
 static double now_seconds(void)
 {
     struct timespec ts;
@@ -461,6 +564,7 @@ int spu_job_replay_main(int argc, char** argv)
     runner_args a;
     spu_xdiff_poison_plan plan;
     spu_xdiff_poison_report report;
+    spu_xdiff_function_result function;
     if (parse_args(argc, argv, &a) != 0) return 1;
 
     const char* knob = spu_xdiff_refused_knob();
@@ -470,19 +574,21 @@ int spu_job_replay_main(int argc, char** argv)
                 knob);
         return 1;
     }
-    /* A plan that cannot be read is a usage error, not a verdict: nothing was compared. */
     memset(&plan, 0, sizeof plan);
     memset(&report, 0, sizeof report);
-    if (a.poison) {
+    memset(&function, 0, sizeof function);
+    const char* plan_path = a.capture_mode ? a.capture_fn : a.poison;
+    if (plan_path) {
         char why[256];
-        if (spu_xdiff_poison_plan_load(a.poison, &plan, why, sizeof why) != 0) {
-            fprintf(stderr, "spu_job_replay: %s: %s\n", a.poison, why);
+        if (spu_xdiff_poison_plan_load(plan_path, &plan, why, sizeof why) != 0) {
+            fprintf(stderr, "spu_job_replay: %s: %s\n", plan_path, why);
             return 1;
         }
         a.plan = &plan;
     }
 
     const double t0 = now_seconds();
+    const char* fixture_path = a.function_mode ? a.fn_unit : a.path;
     spu_xdiff_fixture f;
     spu_xdiff_error err;
     spu_xdiff_verdict_record v;
@@ -491,25 +597,56 @@ int spu_job_replay_main(int argc, char** argv)
     memset(&err, 0, sizeof err);
     blank_record(&v, a.tier);
 
-    if (spu_xdiff_fixture_read(a.path, &f, &err) != 0) {
-        fprintf(stderr, "spu_job_replay: %s: %s: %s\n", a.path, spu_xdiff_reason_id(err.reason), err.detail);
-        /* An out-of-memory decode (CAPTURE_LIMIT, spu_xdiff_fixture.h) is the host's failure, not a malformed fixture. */
+    if (spu_xdiff_fixture_read(fixture_path, &f, &err) != 0) {
+        fprintf(stderr, "spu_job_replay: %s: %s: %s\n",
+                fixture_path, spu_xdiff_reason_id(err.reason), err.detail);
         if (err.reason == (uint32_t)SPU_XDIFF_R_CAPTURE_LIMIT)
             fault_record(&v, a.tier, 0);
-        else if (err.reason == (uint32_t)SPU_XDIFF_R_NO_FIXTURE || err.reason == (uint32_t)SPU_XDIFF_R_FIXTURE_IDENTITY)
+        else if (err.reason == (uint32_t)SPU_XDIFF_R_NO_FIXTURE ||
+                 err.reason == (uint32_t)SPU_XDIFF_R_FIXTURE_IDENTITY)
             set_reason(&v, err.reason);
         else
             set_reason(&v, SPU_XDIFF_R_FIXTURE_FORMAT);
+        function.verdict = v.verdict;
+        function.reason = v.reason;
+        function.where = SPU_XDIFF_NO_WHERE;
     } else {
         loaded = 1;
-        v.match = spu_xdiff_match_for(f.identity.authority.tier, a.tier);
+        if (a.capture_mode) {
+            uint32_t captured = 0;
+            char why[256];
+            if (spu_xdiff_capture_function_units(&f, a.plan, a.function_entry, a.out_dir,
+                                                 &captured, why, sizeof why) != 0) {
+                fprintf(stderr, "spu_job_replay: function capture failed: %s\n", why);
+                spu_xdiff_fixture_free(&f);
+                spu_xdiff_poison_plan_free(&plan);
+                return 1;
+            }
+            printf("captured %u function unit(s) at 0x%X in %s\n",
+                   captured, (unsigned)a.function_entry, a.out_dir);
+            spu_xdiff_fixture_free(&f);
+            spu_xdiff_poison_plan_free(&plan);
+            return 0;
+        }
+        if (a.function_mode) {
+            const uint32_t subject_tier = a.native_override ? (uint32_t)SPU_TIER_PARTIAL
+                                                            : (uint32_t)SPU_TIER_LIFTED;
+            v.match = spu_xdiff_match_for(f.identity.authority.tier, subject_tier);
 #ifdef _WIN32
-        /* No fork on Windows: the replay runs in this process, so a subject that hangs or faults takes the
-         * runner with it. A corpus driver on Windows supervises the runner itself. */
-        replay_here(&f, &a, &v, &report);
+            replay_here(&f, &a, &v, &report, &function);
 #else
-        replay_supervised(&f, &a, &v, &report);
+            replay_supervised(&f, &a, &v, &report, &function);
 #endif
+        } else {
+            v.match = spu_xdiff_match_for(f.identity.authority.tier, a.tier);
+#ifdef _WIN32
+            /* No fork on Windows: the replay runs in this process, so a subject that hangs or faults takes the
+             * runner with it. A corpus driver on Windows supervises the runner itself. */
+            replay_here(&f, &a, &v, &report, &function);
+#else
+            replay_supervised(&f, &a, &v, &report, &function);
+#endif
+        }
         if (v.verdict == (uint32_t)SPU_XDIFF_VERDICT_INVALID) {
             const char* k = spu_xdiff_refused_knob();
             fprintf(stderr, "spu_job_replay: the replay refused to run%s%s set\n", k ? ": " : "", k ? k : "");
@@ -517,8 +654,21 @@ int spu_job_replay_main(int argc, char** argv)
             spu_xdiff_poison_plan_free(&plan);
             return 1;
         }
+        if (a.function_mode && v.reason == (uint32_t)SPU_XDIFF_R_HOST_FAULT) {
+            function.verdict = (uint32_t)SPU_XDIFF_VOID;
+            function.reason = (uint32_t)SPU_XDIFF_R_HOST_FAULT;
+            function.match = v.match;
+            function.where = SPU_XDIFF_NO_WHERE;
+        }
     }
 
+    if (a.function_mode) {
+        print_function_result(stdout, &function);
+        fflush(stdout);
+        if (loaded) spu_xdiff_fixture_free(&f);
+        spu_xdiff_poison_plan_free(&plan);
+        return (int)function.verdict;
+    }
     if (a.json) print_json(stdout, &a, loaded ? &f : NULL, &v, &report, now_seconds() - t0);
     else print_line(stdout, &a, loaded ? &f : NULL, &v, &report);
     fflush(stdout);

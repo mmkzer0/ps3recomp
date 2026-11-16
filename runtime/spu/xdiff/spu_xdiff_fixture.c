@@ -56,7 +56,7 @@ static_assert(SPU_XDIFF_REG_BYTES == sizeof(((spu_context*)0)->gpr),
 
 enum {
     SEC_IDEN = 0, SEC_UNIT, SEC_REG0, SEC_LS0, SEC_EFCT, SEC_BLOB,
-    SEC_REG1, SEC_LS1, SEC_END, SEC_VRDT, SEC_KINDS
+    SEC_REG1, SEC_LS1, SEC_END, SEC_FMASK, SEC_VRDT, SEC_KINDS
 };
 
 typedef struct section_kind {
@@ -74,6 +74,7 @@ static const section_kind s_kind[SEC_KINDS] = {
     { SPU_XDIFF_SEC_REG1,     "REG1" },
     { SPU_XDIFF_SEC_LS1,      "LS_1" },
     { SPU_XDIFF_SEC_END,      "END_" },
+    { SPU_XDIFF_SEC_FMASK,    "FMAS" },
     { SPU_XDIFF_SEC_VERDICT,  "VRDT" },
 };
 
@@ -444,23 +445,38 @@ static int walk_extents(const char* sec, const uint8_t* p, uint64_t bytes, uint8
 
 /* ---- fixed-record structure --------------------------------------------- */
 
-/* UNIT names the entry state, and a recorder that failed before its loader
- * filled it leaves zeros (section 7.4): a reader refuses those rather than
- * replay a context whose entry it cannot describe. entry_pc must name an
- * instruction in local store and image_bytes must be non-zero, or the identity
- * check below passes over no bytes (section 7.3). */
+/* UNIT describes one supported entry state; kind selects which fields apply. */
 static int check_unit(const uint8_t* p, spu_xdiff_error* err)
 {
     spu_xdiff_unit u;
     memcpy(&u, p, sizeof u);
-    if (u.kind != (uint32_t)SPU_XDIFF_UNIT_JOB)
-        return fail(err, SPU_XDIFF_R_FIXTURE_FORMAT, "UNIT: kind is %u, not 1 (one job)",
-                    (unsigned)u.kind);
-    if (u.profile != (uint32_t)SPU_XDIFF_PROFILE_JOBCHAIN &&
-        u.profile != (uint32_t)SPU_XDIFF_PROFILE_JQ2)
+    if (u.kind == (uint32_t)SPU_XDIFF_UNIT_JOB) {
+        if (u.profile != (uint32_t)SPU_XDIFF_PROFILE_JOBCHAIN &&
+            u.profile != (uint32_t)SPU_XDIFF_PROFILE_JQ2)
+            return fail(err, SPU_XDIFF_R_FIXTURE_FORMAT,
+                        "UNIT: profile is %u, not 1 (jobchain loader) or 2 (JobQueue2 loader)",
+                        (unsigned)u.profile);
+    } else if (u.kind == (uint32_t)SPU_XDIFF_UNIT_FUNCTION) {
+        if (u.profile != 0)
+            return fail(err, SPU_XDIFF_R_FIXTURE_FORMAT,
+                        "UNIT: function profile is %u, not 0", (unsigned)u.profile);
+        if (u.job_rt_ls || u.job_rt_ls2 || u.image_ea || u.bss_bytes ||
+            u.desc_ls || u.desc_bytes || u.io_ls || u.io_bytes || u.out_ls || u.out_bytes ||
+            u.scratch_ls || u.scratch_bytes || u.stack_bytes || u.ctx_ls || u.origin_queue ||
+            u.origin_worker || u.origin_seq || u.origin_descriptor_ea || u.reserved)
+            return fail(err, SPU_XDIFF_R_FIXTURE_FORMAT,
+                        "UNIT: function unit has a nonzero job-only field");
+        if (u.r1 > SPU_XDIFF_LS_BYTES)
+            return fail(err, SPU_XDIFF_R_FIXTURE_FORMAT,
+                        "UNIT: function entry r1 0x%x is outside local store", (unsigned)u.r1);
+        if ((u.return_ls & 3u) || u.return_ls > SPU_XDIFF_LS_BYTES - 4u)
+            return fail(err, SPU_XDIFF_R_FIXTURE_FORMAT,
+                        "UNIT: function return PC 0x%x is not a word address in local store",
+                        (unsigned)u.return_ls);
+    } else {
         return fail(err, SPU_XDIFF_R_FIXTURE_FORMAT,
-                    "UNIT: profile is %u, not 1 (jobchain loader) or 2 (JobQueue2 loader)",
-                    (unsigned)u.profile);
+                    "UNIT: kind is %u, not 1 (job) or 2 (function)", (unsigned)u.kind);
+    }
     if ((u.entry_pc & 3u) != 0)
         return fail(err, SPU_XDIFF_R_FIXTURE_FORMAT,
                     "UNIT: entry_pc 0x%x is not 4-byte aligned", (unsigned)u.entry_pc);
@@ -470,6 +486,24 @@ static int check_unit(const uint8_t* p, spu_xdiff_error* err)
     if (u.image_bytes == 0)
         return fail(err, SPU_XDIFF_R_FIXTURE_FORMAT,
                     "UNIT: image_bytes is 0, so the image fingerprint covers no bytes");
+    return 0;
+}
+
+static int check_function_mask(const uint8_t* p, const spu_xdiff_unit* unit,
+                               spu_xdiff_error* err)
+{
+    spu_xdiff_function_mask mask;
+    memcpy(&mask, p, sizeof mask);
+    if (mask.reserved)
+        return fail(err, SPU_XDIFF_R_FIXTURE_FORMAT,
+                    "FMAS: reserved is %u, not 0", (unsigned)mask.reserved);
+    if ((mask.live_out[0] & (1ULL << 1)) == 0)
+        return fail(err, SPU_XDIFF_R_FIXTURE_FORMAT,
+                    "FMAS: live_out omits $r1, which the liveness plan always keeps live");
+    if (mask.dead_stack_bytes > unit->r1 || mask.dead_stack_bytes > SPU_XDIFF_LS_BYTES)
+        return fail(err, SPU_XDIFF_R_FIXTURE_FORMAT,
+                    "FMAS: dead stack extent %u is larger than entry r1 0x%x",
+                    mask.dead_stack_bytes, unit->r1);
     return 0;
 }
 
@@ -503,7 +537,8 @@ typedef struct fixture_layout {
 /* Section 7.8, in the order a reader can answer it without trusting a count or
  * an offset: the header, the checksum (which covers the header), the table's
  * tags and declared sizes, then every span, then the sections' contents. */
-static int parse_file(const uint8_t* bytes, size_t n, fixture_layout* lay, spu_xdiff_error* err)
+static int parse_file(const uint8_t* bytes, size_t n, uint32_t reader_version,
+                      fixture_layout* lay, spu_xdiff_error* err)
 {
     const size_t hdr_bytes = sizeof(spu_xdiff_file_header);
     const size_t sec_bytes = sizeof(spu_xdiff_section);
@@ -527,10 +562,11 @@ static int parse_file(const uint8_t* bytes, size_t n, fixture_layout* lay, spu_x
     if (memcmp(h.magic, SPU_XDIFF_MAGIC, sizeof h.magic) != 0)
         return fail(err, SPU_XDIFF_R_FIXTURE_FORMAT,
                     "header: magic is not \"SPUJOB\\r\\n\"");
-    if (h.version != SPU_XDIFF_VERSION)
-        return fail(err, SPU_XDIFF_R_FIXTURE_FORMAT,
-                    "header: version is %u, this reader reads %u",
-                    (unsigned)h.version, (unsigned)SPU_XDIFF_VERSION);
+    if ((h.version != SPU_XDIFF_VERSION_V1 && h.version != SPU_XDIFF_VERSION) ||
+        h.version > reader_version)
+        return fail(err, SPU_XDIFF_R_UNSUPPORTED_VERSION,
+                    "header: version %u is not supported by reader version %u",
+                    (unsigned)h.version, (unsigned)reader_version);
     if (h.header_bytes != hdr_bytes)
         return fail(err, SPU_XDIFF_R_FIXTURE_FORMAT,
                     "header: header_bytes is %u, the section table starts at %zu",
@@ -599,7 +635,7 @@ static int parse_file(const uint8_t* bytes, size_t n, fixture_layout* lay, spu_x
     }
 
     for (int k = 0; k < SEC_KINDS; k++)
-        if (k != SEC_VRDT && !lay->part[k].present)
+        if (k != SEC_VRDT && k != SEC_FMASK && !lay->part[k].present)
             return fail(err, SPU_XDIFF_R_FIXTURE_FORMAT,
                         "%s: required section is missing", s_kind[k].name);
 
@@ -612,6 +648,7 @@ static int parse_file(const uint8_t* bytes, size_t n, fixture_layout* lay, spu_x
             { SEC_REG0, SPU_XDIFF_REG_BYTES },
             { SEC_REG1, SPU_XDIFF_REG_BYTES },
             { SEC_END,  sizeof(spu_xdiff_end) },
+            { SEC_FMASK, sizeof(spu_xdiff_function_mask) },
             { SEC_VRDT, sizeof(spu_xdiff_verdict_record) },
         };
         for (size_t i = 0; i < sizeof fixed / sizeof fixed[0]; i++) {
@@ -677,7 +714,32 @@ static int parse_file(const uint8_t* bytes, size_t n, fixture_layout* lay, spu_x
     {
         const fixture_part* ls0 = &lay->part[SEC_LS0];
         const fixture_part* ls1 = &lay->part[SEC_LS1];
-        if (check_unit(bytes + lay->part[SEC_UNIT].offset, err)) return -1;
+        const uint8_t* unit_bytes = bytes + lay->part[SEC_UNIT].offset;
+        spu_xdiff_unit unit;
+        spu_xdiff_end end;
+        if (check_unit(unit_bytes, err)) return -1;
+        memcpy(&unit, unit_bytes, sizeof unit);
+        if (h.version == SPU_XDIFF_VERSION_V1 &&
+            (unit.kind == (uint32_t)SPU_XDIFF_UNIT_FUNCTION || lay->part[SEC_FMASK].present))
+            return fail(err, SPU_XDIFF_R_UNSUPPORTED_VERSION,
+                        "header: version 1 does not define function units or FMAS");
+        if (unit.kind == (uint32_t)SPU_XDIFF_UNIT_FUNCTION) {
+            if (!lay->part[SEC_FMASK].present)
+                return fail(err, SPU_XDIFF_R_FIXTURE_FORMAT,
+                            "FMAS: required for UNIT kind function");
+            if (lay->part[SEC_EFCT].bytes || lay->part[SEC_BLOB].bytes)
+                return fail(err, SPU_XDIFF_R_FIXTURE_FORMAT,
+                            "EFCT/BLOB: function units cannot carry job effects");
+            if (check_function_mask(bytes + lay->part[SEC_FMASK].offset, &unit, err)) return -1;
+            memcpy(&end, bytes + lay->part[SEC_END].offset, sizeof end);
+            if (end.end_class != (uint32_t)SPU_XDIFF_END_RETURN)
+                return fail(err, SPU_XDIFF_R_FIXTURE_FORMAT,
+                            "END_: function unit end_class is %u, not return",
+                            (unsigned)end.end_class);
+        } else if (lay->part[SEC_FMASK].present) {
+            return fail(err, SPU_XDIFF_R_FIXTURE_FORMAT,
+                        "FMAS: present for a non-function unit");
+        }
         if (check_end(bytes + lay->part[SEC_END].offset, err)) return -1;
         if (walk_extents("LS_0", bytes + ls0->offset, ls0->bytes, NULL, err)) return -1;
         if (walk_extents("LS_1", bytes + ls1->offset, ls1->bytes, NULL, err)) return -1;
@@ -1115,6 +1177,8 @@ int spu_xdiff_fixture_encode(const spu_xdiff_fixture* f, uint8_t** out, size_t* 
     size[SEC_LS1] = extent_section_bytes(&ls1);
     present[SEC_END] = 1;
     size[SEC_END] = sizeof(spu_xdiff_end);
+    present[SEC_FMASK] = f->unit.kind == (uint32_t)SPU_XDIFF_UNIT_FUNCTION;
+    size[SEC_FMASK] = present[SEC_FMASK] ? sizeof(spu_xdiff_function_mask) : 0;
     present[SEC_VRDT] = f->has_verdict ? 1 : 0;
     size[SEC_VRDT] = f->has_verdict ? sizeof(spu_xdiff_verdict_record) : 0;
 
@@ -1184,6 +1248,8 @@ int spu_xdiff_fixture_encode(const spu_xdiff_fixture* f, uint8_t** out, size_t* 
     memcpy(buf + off[SEC_REG1], f->reg1, SPU_XDIFF_REG_BYTES);
     write_extents(buf + off[SEC_LS1], &ls1, f->ls1);
     memcpy(buf + off[SEC_END], &f->end, sizeof f->end);
+    if (present[SEC_FMASK])
+        memcpy(buf + off[SEC_FMASK], &f->function_mask, sizeof f->function_mask);
     if (f->has_verdict) memcpy(buf + off[SEC_VRDT], &f->verdict, sizeof f->verdict);
 
     {
@@ -1199,7 +1265,7 @@ int spu_xdiff_fixture_encode(const spu_xdiff_fixture* f, uint8_t** out, size_t* 
      * one reason spu_xdiff_fixture.h gives for encode, with the decoder's own
      * detail naming the section, record or offset. */
     fixture_layout lay;
-    if (parse_file(buf, (size_t)file_bytes, &lay, err)) {
+    if (parse_file(buf, (size_t)file_bytes, SPU_XDIFF_VERSION, &lay, err)) {
         free(buf);
         return encode_refuse(err);
     }
@@ -1220,6 +1286,8 @@ static int decode_fill(const uint8_t* bytes, const fixture_layout* lay, spu_xdif
 
     memcpy(&f->identity, bytes + lay->part[SEC_IDEN].offset, sizeof f->identity);
     memcpy(&f->unit, bytes + lay->part[SEC_UNIT].offset, sizeof f->unit);
+    if (lay->part[SEC_FMASK].present)
+        memcpy(&f->function_mask, bytes + lay->part[SEC_FMASK].offset, sizeof f->function_mask);
     memcpy(f->reg0, bytes + lay->part[SEC_REG0].offset, SPU_XDIFF_REG_BYTES);
     memcpy(f->reg1, bytes + lay->part[SEC_REG1].offset, SPU_XDIFF_REG_BYTES);
     memcpy(&f->end, bytes + lay->part[SEC_END].offset, sizeof f->end);
@@ -1279,20 +1347,27 @@ static int decode_fill(const uint8_t* bytes, const fixture_layout* lay, spu_xdif
     return 0;
 }
 
-int spu_xdiff_fixture_decode(const uint8_t* bytes, size_t n, spu_xdiff_fixture* f,
-                             spu_xdiff_error* err)
+int spu_xdiff_fixture_decode_max_version(const uint8_t* bytes, size_t n, uint32_t max_version,
+                                         spu_xdiff_fixture* f, spu_xdiff_error* err)
 {
     spu_xdiff_error local;
     if (!err) err = &local;
     if (!f) return fail(err, SPU_XDIFF_R_FIXTURE_FORMAT, "decode: no fixture to fill");
-    /* A failure leaves an empty fixture that free() may see, never a partial
-     * one the caller could mistake for a run. */
     memset(f, 0, sizeof *f);
+    if (max_version < SPU_XDIFF_VERSION_V1 || max_version > SPU_XDIFF_VERSION)
+        return fail(err, SPU_XDIFF_R_UNSUPPORTED_VERSION,
+                    "reader version %u is not supported by this build", (unsigned)max_version);
     if (!bytes) return fail(err, SPU_XDIFF_R_FIXTURE_FORMAT, "header: no bytes");
 
     fixture_layout lay;
-    if (parse_file(bytes, n, &lay, err)) return -1;
+    if (parse_file(bytes, n, max_version, &lay, err)) return -1;
     return decode_fill(bytes, &lay, f, err);
+}
+
+int spu_xdiff_fixture_decode(const uint8_t* bytes, size_t n, spu_xdiff_fixture* f,
+                             spu_xdiff_error* err)
+{
+    return spu_xdiff_fixture_decode_max_version(bytes, n, SPU_XDIFF_VERSION, f, err);
 }
 
 /* ---- files -------------------------------------------------------------- */

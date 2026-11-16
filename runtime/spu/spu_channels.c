@@ -452,6 +452,22 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
     spu_float_mode_leave(fpcr_outer);
     return halted;
 }
+/* Function-unit replay calls a leaf as a host callee. Keeping a live host
+ * frame makes bi $r0 return to the caller instead of dispatching the saved
+ * guest link through the top-level job trampoline. */
+void spu_run_lifted_leaf(void (*entry)(spu_context*), spu_context* ctx)
+{
+    const uint64_t fpcr_outer = spu_float_mode_enter();
+    const uint32_t host_depth_outer = ctx->host_depth;
+    if (__atomic_load_n(&g_spu_direct, __ATOMIC_RELAXED) < 0) spu_direct_init();
+    ctx->steps = 0;
+    ctx->host_depth = host_depth_outer + 1u;
+    g_spu_trampoline_fn = 0;
+    entry(ctx);
+    SPU_DRAIN(ctx);
+    ctx->host_depth = host_depth_outer;
+    spu_float_mode_leave(fpcr_outer);
+}
 
 /* One MFC engine belongs to its context. The context's single execution owner
  * keeps it stable across scheduling quanta and retires it only after stopping.
@@ -1862,7 +1878,9 @@ typedef void (*spu_fn)(spu_context*);
 typedef struct {
     uint32_t addr;
     spu_fn   fn;
-    int      image_id;   /* which recompiled image this function belongs to */
+    spu_fn   reference_fn; /* the unmodified lifted function, for function-unit comparisons */
+    int      native_override;
+    int      image_id;     /* which recompiled image this function belongs to */
 } spu_reg_entry;
 
 /* One entry per lifted SPU function across EVERY registered image, and a game
@@ -1919,8 +1937,10 @@ static inline uint32_t spu_fn_hash(uint32_t addr)
 static int s_reg_image = 0;
 void spu_begin_image(int image_id) { s_reg_image = image_id; }
 
-void spu_register_function(uint32_t addr, spu_fn fn)
+void spu_register_function_with_reference(uint32_t addr, spu_fn fn, spu_fn reference,
+                                          int native_override)
 {
+    if (!fn || !reference) return;
     if (s_registry_count >= SPU_FN_REGISTRY_MAX) {
         /* Silent truncation here dropped whole late-registered SPU images and
          * cost a multi-round hunt (the branch-to-0 looked like a lifter/overlay
@@ -1942,6 +1962,8 @@ void spu_register_function(uint32_t addr, spu_fn fn)
     uint32_t i = s_registry_count;
     s_registry[i].addr = addr;
     s_registry[i].fn = fn;
+    s_registry[i].reference_fn = reference;
+    s_registry[i].native_override = native_override != 0;
     s_registry[i].image_id = s_reg_image;
     uint32_t h = spu_fn_hash(addr);
     s_hash_next[i] = 0;
@@ -1953,6 +1975,11 @@ void spu_register_function(uint32_t addr, spu_fn fn)
     /* Published after the entry is linked: the dispatch cache keys its entries
      * by this count, so a lookup that sees the new count also finds the entry. */
     __atomic_store_n(&s_registry_count, i + 1, __ATOMIC_RELEASE);
+}
+
+void spu_register_function(uint32_t addr, spu_fn fn)
+{
+    spu_register_function_with_reference(addr, fn, fn, 0);
 }
 
 /* Report a CROSS-IMAGE match: the registry served a function some other image
@@ -2007,6 +2034,19 @@ spu_fn spu_lookup(uint32_t addr, int image_id)   /* exported: clang-built fast-p
                 spu_report_cross_image(addr, image_id, e->image_id);
             return e->fn;
         }
+    }
+    return NULL;
+}
+
+spu_lifted_fn spu_registered_function_variant(uint32_t addr, int image_id, int native_override)
+{
+    if (native_override != 0 && native_override != 1) return NULL;
+    for (uint32_t n = s_hash_head[spu_fn_hash(addr)]; n; n = s_hash_next[n - 1]) {
+        const spu_reg_entry* e = &s_registry[n - 1];
+        if (e->addr == addr &&
+            (image_id == 0 || e->image_id == 0 || e->image_id == image_id))
+            return native_override ? (e->native_override ? (spu_lifted_fn)e->fn : NULL)
+                                   : (spu_lifted_fn)e->reference_fn;
     }
     return NULL;
 }

@@ -57,6 +57,12 @@ void spu_workload_register(uint64_t fingerprint, spu_lifted_entry_fn fn,
 void spu_workload_register_img(uint64_t fingerprint, spu_lifted_entry_fn fn,
                                int image_id, const char* name);
 
+/* The body registered for this image: T1 by default, T2 for a generated lift
+ * with native function overrides. Registration writes this beside the entry
+ * before jobs run; xdiff records the same tier and revision in IDEN. */
+void spu_workload_set_body_identity(uint64_t fingerprint, uint8_t tier, uint64_t native_rev);
+int spu_workload_find_body_identity(uint64_t fingerprint, uint8_t* tier, uint64_t* native_rev);
+
 /* Look up a lifted entry by fingerprint; NULL if none registered. */
 spu_lifted_entry_fn spu_workload_find(uint64_t fingerprint);
 

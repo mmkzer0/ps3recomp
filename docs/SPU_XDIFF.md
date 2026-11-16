@@ -83,7 +83,7 @@ produced. That is what the rest of this document builds.
 |---|---|---|---|
 | T0 | the SPU interpreter | nothing: it runs any bytes | same program |
 | T1 | the whole image, lifted by `tools/spu_lifter.py` | image fingerprint | same program |
-| T2 | T1 with native overrides of single functions | image fingerprint; each override by its LS entry | contract |
+| T2 | T1 with native overrides of single functions | image fingerprint; each override by its LS entry | same program (strict pilot) |
 | T3 | a native reimplementation of the whole job | image fingerprint | contract |
 | tweak | any body that changes behaviour on purpose | as its base tier, flag `SPU_TIER_TWEAK` | never: not comparable |
 
@@ -106,9 +106,9 @@ short, not a job that ran (section 9). The fixture's `authority.tier` names the
 same body (sections 4 and 7.1).
 
 `spu_xdiff_match_for(authority, subject)` is the whole rule for which
-comparison applies: T0 and T1 execute the same SPU instructions and are held
-to the same program; a pair with native code in it is held to the contract;
-a tweak has no rule and yields `malformed` / `not-comparable`.
+comparison applies: T0, T1 and the T2 pilot use the strict same-program
+compare; only T3 uses the contract. A tweak has no rule and yields
+`malformed` / `not-comparable`.
 
 ## 4. Identity
 
@@ -459,12 +459,13 @@ reports through the outbound mailbox:
 10 WRCH     28  0x1                                       out mailbox
 ```
 
-## 7. The fixture: `ps3recomp.spujob/1`
+## 7. The fixture: `ps3recomp.spujob/2`
 
-*Decided.* All types are in `runtime/spu/spu_xdiff.h` (a draft on the branch
-`m4/xdiff-design`, landing with commits 7 and 8), with their sizes
-asserted there. All integers are little-endian. Guest data (register and
-local-store bytes, payloads) is stored in guest byte order, untouched.
+*Decided.* All types are in `runtime/spu/spu_xdiff.h`, with their sizes
+asserted there. New writers emit version 2 for jobs and functions. The reader
+continues to accept version-1 job fixtures; v1 did not define function units
+or `FMAS`. All integers are little-endian. Guest data (register and local-store
+bytes, payloads) is stored in guest byte order, untouched.
 
 ### 7.1 Container
 
@@ -477,7 +478,7 @@ in any order, each at an 8-byte boundary, none overlapping, padding zero.
 | Off | Type | Field | Meaning |
 |---|---|---|---|
 | 0 | `u8[8]` | `magic` | `"SPUJOB\r\n"` |
-| 8 | `u32` | `version` | 1 |
+| 8 | `u32` | `version` | 2; the reader also accepts v1 job fixtures |
 | 12 | `u32` | `header_bytes` | 40; the section table starts here |
 | 16 | `u32` | `section_count` | at most 32 |
 | 20 | `u32` | `section_bytes` | 24 |
@@ -500,6 +501,7 @@ the start of the file), `u64 bytes`.
 | `REG1` | the authority's end registers | yes |
 | `LS_1` | the authority's end local store, extents over the entry state | yes |
 | `END_` | `spu_xdiff_end` | yes |
+| `FMAS` | `spu_xdiff_function_mask`: live-out registers and dead stack extent | function UNIT only |
 | `VRDT` | `spu_xdiff_verdict_record`: the verdict that made the runtime write the fixture | no |
 
 - **Registers** are in guest byte order: byte *k* of register *r* is the byte
@@ -575,36 +577,48 @@ recomputes it and answers `malformed` / `fixture-identity` on a mismatch.
 
 | Off | Field | Meaning |
 |---|---|---|
-| 0 | `kind` | 1: one job |
-| 4 | `profile` | 1 jobchain loader, 2 JobQueue2 loader; selects the end classification |
-| 8 | `entry_pc` | `ctx->pc` at entry |
-| 12 | `return_ls` | the link the loader planted (`spurs_job.c:921`, `:949`) |
-| 16 | `job_rt_ls` | `ctx->job_rt_ls` (`spurs_job.c:910`) |
-| 20 | `job_rt_ls2` | `ctx->job_rt_ls2` (`spurs_job.c:911`) |
-| 24 | `image_ea` | guest EA the image was staged from |
-| 28 | `image_ls` | LS base of the staged image |
-| 32 | `image_bytes` | staged bytes: the descriptor's `sizeBinary << 4` |
-| 36 | `bss_bytes` | the `eaBinary` high word x 16 |
-| 40, 44 | `desc_ls`, `desc_bytes` | the descriptor copy |
-| 48, 52 | `io_ls`, `io_bytes` | the in/out buffer |
-| 56, 60 | `out_ls`, `out_bytes` | the out buffer |
-| 64, 68 | `scratch_ls`, `scratch_bytes` | the scratch block |
-| 72 | `stack_bytes` | the stack's size |
-| 76 | `r1` | the stack pointer at entry |
-| 80 | `ctx_ls` | the `CellSpursJobContext2` |
-| 84 | `origin_queue` | the queue's creation number in the process, as in the file name; the trace's queue index is the same number up to 255 and saturates there. `origin_*` join the fixture with the trace of its run and are 0 for a synthetic fixture |
-| 88 | `origin_worker` | worker index |
-| 92 | `origin_seq` | the job's per-queue sequence number |
-| 96 | `origin_descriptor_ea` | the descriptor's guest EA |
+| 0 | `kind` | 1: one job; 2: one function call |
+| 4 | `profile` | job: 1 jobchain, 2 JobQueue2; function: 0 |
+| 8 | `entry_pc` | `ctx->pc` at job or function entry |
+| 12 | `u32` | `return_ls` | job: loader-planted link; function: authority's return PC |
+| 16 | `job_rt_ls` | job: `ctx->job_rt_ls`; function: 0 |
+| 20 | `job_rt_ls2` | job: `ctx->job_rt_ls2`; function: 0 |
+| 24 | `image_ea` | job: guest EA the image was staged from; function: 0 |
+| 28 | `image_ls` | job: LS base of the staged image; function: code image base |
+| 32 | `image_bytes` | job: staged bytes; function: image span used to verify IDEN |
+| 36 | `bss_bytes` | job: the `eaBinary` high word x 16; function: 0 |
+| 40, 44 | `desc_ls`, `desc_bytes` | job: descriptor copy; function: 0 |
+| 48, 52 | `io_ls`, `io_bytes` | job: in/out buffer; function: 0 |
+| 56, 60 | `out_ls`, `out_bytes` | job: out buffer; function: 0 |
+| 64, 68 | `scratch_ls`, `scratch_bytes` | job: scratch block; function: 0 |
+| 72 | `stack_bytes` | job: stack size; function: 0 |
+| 76 | `r1` | stack pointer at job entry or function-call entry |
+| 80 | `ctx_ls` | job: `CellSpursJobContext2`; function: 0 |
+| 84 | `origin_queue` | job: queue creation number; function: 0 |
+| 88 | `origin_worker` | job: worker index; function: 0 |
+| 92 | `origin_seq` | job: per-queue sequence number; function: 0 |
+| 96 | `origin_descriptor_ea` | job: descriptor EA; function: 0 |
 | 100 | `reserved` | 0 |
 
 Offsets 24 to 80 are `spu_job_layout`, its 15 members in order, as the
-loader's start hook received it (`spu_workload.h:132-146`).
+loader's start hook received it (`spu_workload.h:132-146`). For a function
+unit those job-only members are zero, `return_ls` is the continuation reached
+after the call, and `image_ls`/`image_bytes` name the code image in LS.
 
-This section is complete on purpose. A job context at entry is
-`spu_context_init`, then `image_id`, `job_rt_ls`, `job_rt_ls2`, local store,
-registers and `pc` (`spurs_job.c:908-936`). Everything else is zero. That is
-what lets a replaying context be built from a fixture (section 9).
+**Function `FMAS`, 24 bytes.** Required exactly when `UNIT.kind` is 2:
+
+| Off | Type | Field | Meaning |
+|---|---|---|---|
+| 0 | `u64[2]` | `live_out` | bit *r* is set when `$rN` is live at any function exit |
+| 16 | `u32` | `dead_stack_bytes` | the dead extent `[UNIT.r1 - n, UNIT.r1)` |
+| 20 | `u32` | `reserved` | 0 |
+
+The function unit carries the whole entry state in `REG0`/`LS_0` and the
+authority's exit state in `REG1`/`LS_1`; `EFCT` and `BLOB` are empty, `END_`
+is `return`, `UNIT.return_ls` is the authority's return destination, and
+`IDEN.float_rz` is the entry float mode. `LS_0` reconstructs the entire store
+over zero; `LS_1` overlays its exact exit bytes. Replay compares the return
+destination, live-out registers and every LS byte outside the dead stack extent.
 
 ### 7.5 `EFCT`: `spu_xdiff_effect`, 40 bytes
 
@@ -669,19 +683,28 @@ offline runner regenerates it from the fixture.
 
 ### 7.8 What a reader rejects
 
+An unsupported header version is `malformed` / `unsupported-version`, not a
+format error. Version-1 fixtures are job units only; a version-1 function
+unit or `FMAS` section is also `unsupported-version`. A v1 reader sees the v2
+header first and refuses it as unsupported, before inspecting the new sections.
+
 A fixture is an input file: it may be truncated, corrupt or hostile. A reader
-answers `malformed` / `fixture-format` and reads no further when: the magic,
-version or sizes are not the ones above; `file_bytes` is not the file's
-size; the checksum fails; a section lies outside the file, overlaps another
-or is misaligned; a required section is missing or duplicated; a section's
-size is not the one its type requires; an effect count exceeds
-`SPU_XDIFF_MAX_EFFECTS` or the blob exceeds `SPU_XDIFF_MAX_BLOB_BYTES`; an
-effect has an unknown kind, a nonzero unused field, a `blob + size` outside
-`BLOB`, or a local-store range outside local store (an `XFER` to or from
-local store, the remaining list of an `MFC_WrListStallAck` `WRCH`; an
-`MFC_CMD` keeps its latches verbatim, because atomics and barriers ignore a
-stale `MFC_Size`); an `XFER` has no command before it; an extent is
-unsorted, overlapping or outside local store.
+answers `malformed` / `fixture-format` and reads no further when the magic,
+sizes or checksum fail; `file_bytes` is not the file's size; a section lies
+outside the file, overlaps another or is misaligned; a required section is
+missing or duplicated; a section's size is not the one its type requires; an
+effect count exceeds `SPU_XDIFF_MAX_EFFECTS` or the blob exceeds
+`SPU_XDIFF_MAX_BLOB_BYTES`; an effect has an unknown kind, a nonzero unused
+field, a `blob + size` outside `BLOB`, or a local-store range outside local
+store (an `XFER` to or from local store, the remaining list of an
+`MFC_WrListStallAck` `WRCH`; an `MFC_CMD` keeps its latches verbatim, because
+atomics and barriers ignore a stale `MFC_Size`); an `XFER` has no command
+before it; or an extent is unsorted, overlapping or outside local store.
+
+For `UNIT.kind` 2, `FMAS` is required, `EFCT`/`BLOB` are empty, `END_` is
+`return`, and job-only `UNIT` fields are zero. `return_ls` is the aligned
+authority return PC in local store. `live_out` includes `$r1`;
+`dead_stack_bytes` cannot extend below LS 0 or past the entry stack pointer.
 
 ### 7.9 Size
 
@@ -773,9 +796,17 @@ fixture identity then carries the ones that matter.
 
 ### 8.2 Contract: a pair with native code
 
-*Proposed; built with the first T2 or T3 consumer.* A native body need not
-issue the authority's commands, use its local-store addresses or wait where
-it waited. What it owes is the job's observable behaviour.
+*Proposed for T3 and any later, explicitly approved relaxed T2.* A native
+body need not issue the authority's commands, use its local-store addresses or
+wait where it waited. What it owes is the job's observable behaviour.
+
+**T2 pilot rule.** The pilot does not use the relaxations below: a T0 fixture
+replays the registered image under the strict same-program rule, comparing
+every effect, register and local-store byte. Per-function units add a second
+judgement: the return destination, every live-out register and every byte
+outside the plan's dead stack extent must match bit for bit. This bit-exact rule
+is the promotion gate for the pilot, not a claim that the proposed T3 contract
+is implemented.
 
 **What is observable.** A job's writes to the world and its signals, in an
 order the hardware would have guaranteed, and how it ended. For the
@@ -839,7 +870,7 @@ same (section 12.4).
 | writes of one epoch may be reordered | no order within a tag group without a fence, a barrier or a wait | two writes of the epoch overlap; or the job never waits, so the whole run is one epoch: both are matched in order |
 | a stable byte may be read at another time | all recorded reads of it agree, in at least two epochs | two recorded reads of the byte disagree |
 | private end state is not compared | the JobQueue2 loader destroys it | the profile retains local store |
-| registers and stack a native function leaves dead may differ (T2) | lifter liveness (section 17, question 10) | the poison run below changes the transcript |
+| registers and stack bytes may differ in a future relaxed T2 | liveness (section 17, question 10) | the poison run below changes the transcript; not used by the bit-exact pilot |
 
 **The poison run** checks a "dead" claim instead of trusting it
 (`spu_job_replay --tier interp --poison PLAN`, PLAN from
@@ -858,10 +889,18 @@ by further replays to the first function, then the lowest register or
 frame byte. An `equal` covers only the returns the run took (`poison.poisoned`
 in the JSON; zero means nothing was checked).
 
-A T2 body is judged twice: as a whole job under the contract, which is what
-makes it sound, and per overridden function with the masks, which is what
-says where it went wrong. The second needs a function as a unit; `kind` in
-`UNIT` leaves room for it and version 1 does not define it.
+A T2 body is judged twice in the pilot: as a whole job under the strict
+same-program rule, and per overridden function with a kind-2 `UNIT` and its
+`FMAS` liveness masks. `spu_job_replay --tier interp --capture-fn PLAN --fn
+ADDR --out DIR JOB` requires a present `image.fingerprint` matching the job,
+then replays its T0 fixture through the observer and writes one function unit
+per call (first 64, in call order). `UNIT.return_ls` records the authority's
+return destination. `--fn-unit UNIT --fn-symbol lifted|native` replays either
+registered function-table variant in a fresh context. A successful T1
+reference replay is the harness's sanity check; the subject must match the
+return destination, every live-out register and every LS byte outside the dead
+stack extent. The verdict names a wrong return PC, first register (16 want/got
+bytes) or first LS address. Differing dead registers are counted, not failed.
 
 **Open, before any T2/T3 promotion:** an MFC PUT can also invalidate a
 reservation held by a peer context. Plain PUT calls
@@ -915,9 +954,9 @@ verdict (`SPU_XDIFF_REASONS`).
 | Verdict | Reasons |
 |---|---|
 | `equal` | `none` |
-| `differ` | `effect-kind`, `effect-request`, `effect-payload`, `effect-extra`, `effect-missing`, `end-class`, `end-regs`, `end-ls`; contract only: `epoch-order`, `epoch-writes`; poison run only: `poison` |
+| `differ` | `effect-kind`, `effect-request`, `effect-payload`, `effect-extra`, `effect-missing`, `end-class`, `end-pc`, `end-regs`, `end-ls`; contract only: `epoch-order`, `epoch-writes`; poison run only: `poison` |
 | `void` | `budget`, `depth-guard`, `capture-limit`, `unsupported-effect`, `uncovered-read`, `unlifted-branch`, `host-fault` |
-| `malformed` | `fixture-format`, `fixture-identity`, `not-comparable` |
+| `malformed` | `fixture-format`, `unsupported-version`, `fixture-identity`, `not-comparable` |
 | `not-found` | `no-fixture`, `no-body` |
 
 ### 8.4 What a divergence may do
@@ -929,7 +968,7 @@ as `class` and in reports:
 
 | Class | Reasons | Meaning |
 |---|---|---|
-| `visible` | every `effect-*`, `end-class`, `epoch-*`; `end-regs` and `end-ls` under the jobchain profile | the world saw something else, or the loader keeps the state that differs |
+| `visible` | every `effect-*`, `end-class`, `end-pc`, `epoch-*`; `end-regs` and `end-ls` under the jobchain profile | the world saw something else, or the loader keeps the state that differs |
 | `latent` | `end-regs`, `end-ls` under the JobQueue2 profile | only state the loader destroys differs (section 8.2, "What is observable") |
 
 A latent difference is not an accepted one. Under same-program matching both
@@ -1482,7 +1521,7 @@ then compare power and frame time with `xdiff=off`.
 | # | Question | Answer | State |
 |---|---|---|---|
 | 1 | Fixture encoding | one self-contained file; header, section table, typed sections; extents for local store; payloads deduplicated inside a fixture; no compression in the format, zstd accepted around it (section 7) | closed |
-| 2 | Contract matching for T2 and T3 | epoch rule and falsifiers in section 8.2 | proposed; the recipients and their order are pinned (`spu_coh_peers`, section 8.2). Not a promotion gate until the transcript carries them and a T3 corpus replay confirms the relaxations |
+| 2 | Contract matching for T3 and future relaxed T2 | epoch rule and falsifiers in section 8.2 | proposed for T3; the T2 pilot uses strict same-program matching |
 | 3 | Equivalence of T0 and T1 | every register, all of local store, the end class; the argument is in section 8.1 | closed |
 | 4 | Sanitising a shadow context | nothing is copied, so nothing is sanitised; the census test and the driver check enforce it (section 9) | closed |
 | 5 | Budget for lifted code | a back-edge macro that exists only in a second compilation; unwinding by the existing halt; evidence for `longjmp` under the sanitizers in section 10 | closed (row 9); the twin's cost is in section 18 |
@@ -1490,7 +1529,7 @@ then compare power and frame time with `xdiff=off`.
 | 7 | Fingerprint check | on the staged bytes, through the existing content-hash cache; a sampled job verifies the hit byte-serially, an unsampled one trusts it, an accepted and stated risk (section 4) | closed; its cost is read from existing traces |
 | 8 | Cost of the real path | one load and branch per operation, latch writes included; measured within noise on every channel, `dma` and `atomic` row (section 5.6) | closed by commit 4 |
 | 9 | Where xdiff records go | two trace kinds, 32 and 33; fixtures beside the trace, never in a bundle (section 14) | closed |
-| 10 | What T2 needs from the lifter | per function: the registers that may be read after each exit before they are written (live-out), over all callers, with an unknown caller meaning all; the extent of the stack below the entry pointer that is dead at exit; and a function as a fixture unit | the pass and the run exist (`tools/spu_liveness.py`, `spu_job_replay --poison`). On one title's first corpus (two raw images, 394 and 496 functions, 8.6 to 9.0 dead registers per function on average, 128 captured jobs) every poison run is `equal`, with 13 to 168 poisoned returns per job: the masks hold there. Open until a function as a fixture unit is defined, and for images the corpus has not exercised |
+| 10 | What T2 needs from the lifter | per function: registers live-out at any exit, the dead frame extent below entry `$r1`, and a kind-2 `UNIT` carrying entry/exit state, return PC and `FMAS` masks | `tools/spu_liveness.py` supplies the masks; an unresolved indirect call/branch conservatively makes every function's callers unknown and all registers live. `spu_job_replay --capture-fn PLAN --fn ADDR --out DIR JOB` requires a present, matching image fingerprint and captures calls through the T0 observer; `--fn-unit UNIT --fn-symbol lifted|native` checks the return destination and each state judgment. The pilot's whole-job replay is strict bit-exact; per-function replay ignores only dead registers and declared dead stack bytes | closed for the leaf-compute pilot; claims remain fixture/input-specific |
 
 ## 18. Measurements owed
 

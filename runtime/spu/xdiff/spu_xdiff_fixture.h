@@ -1,11 +1,12 @@
 /*
  * ps3recomp - an xdiff fixture in memory, and its file form
  *
- * A fixture is one job's entry state, the transcript of its effects and the
- * authority's end state (docs/SPU_XDIFF.md section 7; layouts in
- * spu_xdiff.h). This module owns the in-memory form, the payload store, the
- * encoder and the validating decoder. It runs no SPU code: the recorder fills
- * a fixture (spu_xdiff_recorder.h), the replay reads one (spu_xdiff_replay.h).
+ * A fixture is a job's entry state, effects and end state, or one function
+ * call's entry/exit state and liveness masks (docs/SPU_XDIFF.md section 7;
+ * layouts in spu_xdiff.h). This module owns the in-memory form, the payload
+ * store, the encoder and the validating decoder. It runs no SPU code: the
+ * recorder fills a fixture (spu_xdiff_recorder.h), the replay reads one
+ * (spu_xdiff_replay.h).
  *
  * A fixture file is an input like any other and may be truncated, corrupt or
  * hostile. The decoder checks everything section 7.8 lists before it trusts a
@@ -31,6 +32,7 @@ struct spu_xdiff_blob_index; /* the encoder-side payload table; private */
 typedef struct spu_xdiff_fixture {
     spu_xdiff_identity identity;
     spu_xdiff_unit     unit;
+    spu_xdiff_function_mask function_mask; /* FMAS, for function units */
     uint8_t            reg0[SPU_XDIFF_REG_BYTES]; /* entry registers */
     uint8_t*           ls0;                       /* entry local store, owned */
     spu_xdiff_effect*  effects;                   /* the transcript, owned */
@@ -91,11 +93,17 @@ int spu_xdiff_fixture_encode(const spu_xdiff_fixture* f, uint8_t** out, size_t* 
 int spu_xdiff_fixture_write(const spu_xdiff_fixture* f, const char* path, spu_xdiff_error* err);
 
 /* Validates `bytes` against section 7.8 and fills `f` (which the call
- * initialises). On failure `f` is freed, `err->reason` is FIXTURE_FORMAT, or
- * FIXTURE_IDENTITY when a well-formed fixture's image bytes do not hash to its
- * `image_fingerprint`, and the call returns -1. A zstd frame is refused by
+ * initialises). On failure `f` is empty and `err->reason` is FIXTURE_FORMAT,
+ * UNSUPPORTED_VERSION, or FIXTURE_IDENTITY when a well-formed fixture's image
+ * bytes do not hash to its `image_fingerprint`. A zstd frame is refused by
  * name: the runtime links no decompressor; the corpus driver decodes. */
 int spu_xdiff_fixture_decode(const uint8_t* bytes, size_t n, spu_xdiff_fixture* f, spu_xdiff_error* err);
+
+/* Compatibility probe: decode only files no newer than `max_version`. A
+ * version-1 reader uses 1 and reports a version-2 file as unsupported before
+ * interpreting its sections. The normal decoder accepts versions 1 and 2. */
+int spu_xdiff_fixture_decode_max_version(const uint8_t* bytes, size_t n, uint32_t max_version,
+                                         spu_xdiff_fixture* f, spu_xdiff_error* err);
 /* Reads and decodes a file. A file that cannot be opened is NO_FIXTURE. */
 int spu_xdiff_fixture_read(const char* path, spu_xdiff_fixture* f, spu_xdiff_error* err);
 
