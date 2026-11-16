@@ -2407,6 +2407,35 @@ if(UNIX)
     add_test(NAME test_rsx_texture_epoch COMMAND test_rsx_texture_epoch)
     set_tests_properties(test_rsx_texture_epoch PROPERTIES LABELS "gcm;t0" TIMEOUT 120)
 
+    add_executable(test_rsx_bc_decode
+        libs/video/tests/test_rsx_bc_decode.c
+        libs/video/tests/rsx_bc_test_corpus.c
+        libs/video/rsx_bc_decode.c)
+    target_include_directories(test_rsx_bc_decode PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests")
+    add_test(NAME test_rsx_bc_decode COMMAND test_rsx_bc_decode)
+    set_tests_properties(test_rsx_bc_decode PROPERTIES LABELS "gcm;t0" TIMEOUT 120)
+
+    # Hardware readback is the authority for the host BC decode. The test uses
+    # only generated blocks and skips visibly when this Mac has no Metal GPU.
+    if(APPLE)
+        add_executable(test_rsx_bc_oracle_metal
+            libs/video/tests/test_rsx_bc_oracle_metal.m
+            libs/video/tests/rsx_bc_test_corpus.c
+            libs/video/rsx_bc_decode.c)
+        set_source_files_properties(libs/video/tests/test_rsx_bc_oracle_metal.m
+            PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+        target_include_directories(test_rsx_bc_oracle_metal PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests")
+        target_link_libraries(test_rsx_bc_oracle_metal PRIVATE
+            "-framework Metal" "-framework Foundation")
+        add_test(NAME rsx_bc_oracle_metal COMMAND $<TARGET_FILE:test_rsx_bc_oracle_metal>)
+        set_tests_properties(rsx_bc_oracle_metal PROPERTIES
+            LABELS "gcm;t0" SKIP_RETURN_CODE 77 TIMEOUT 120)
+    endif()
+
     # The full texture change hash (rsx_texhash.h): a changed byte anywhere changes it. Header only,
     # no engine. The old-against-new throughput bench is tests/bench/video/bench_texhash.c.
     add_executable(test_rsx_texhash libs/video/tests/test_rsx_texhash.c)
@@ -2417,6 +2446,17 @@ if(UNIX)
     # cmake --build <dir> --target bench_texhash && <dir>/bench_texhash
     add_executable(bench_texhash EXCLUDE_FROM_ALL tests/bench/video/bench_texhash.c)
     target_include_directories(bench_texhash PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
+    # BC decode throughput is an opt-in measurement, not part of default ctest or `all`.
+    add_executable(bench_rsx_bc_decode EXCLUDE_FROM_ALL
+        tests/bench/video/bench_rsx_bc_decode.c
+        libs/video/rsx_bc_decode.c)
+    target_include_directories(bench_rsx_bc_decode PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
+    if(MSVC)
+        target_compile_options(bench_rsx_bc_decode PRIVATE /O2)
+    else()
+        target_compile_options(bench_rsx_bc_decode PRIVATE -O3)
+    endif()
 
     # Which presents a frame dump writes and what it calls the file (PS3RECOMP_VK_DUMP_LIST / _RANGE).
     # Pure parsing and naming, so no GPU and no backend: the Vulkan backend links the same source.
