@@ -380,10 +380,14 @@ def _identity_source(ins):
     return (ins.raw >> 7) & 0x7F
 
 
-def _pc_getter(ins):
-    """Whether a call only loads its link (`brsl $rN, .+4`)."""
-    return (ins.mnemonic in _DIRECT_CALLS
-            and _operand_addresses(ins) == [ins.addr + 4])
+def _pc_getter(ins, targets=None):
+    """Whether a link-writing branch only loads PC and falls through without wrapping."""
+    next_pc = (ins.addr + 4) & 0x3FFFC
+    if next_pc != ins.addr + 4:
+        return False  # Wrapped code at zero is a transfer, never C fall-through.
+    if ins.mnemonic in _DIRECT_CALLS:
+        return _operand_addresses(ins) == [next_pc]
+    return ins.mnemonic == 'bisl' and targets is not None and set(targets) == {next_pc}
 
 
 def _value_sum(left, right):
@@ -428,7 +432,7 @@ def _shifted_values(source, mnemonic, amount):
     return frozenset(values) if len(values) <= _DISPATCH_VALUES else None
 
 
-def _dispatch_targets(code, index, cuts, contains):
+def _dispatch_targets(code, index, cuts, contains, register=None):
     """Exact targets of the register-directed branch at `code[index]`, or None.
 
     The branch register is evaluated over the straight-line run ending at the
@@ -443,7 +447,8 @@ def _dispatch_targets(code, index, cuts, contains):
     unknown; an empty set, one larger than `_DISPATCH_VALUES`, an unaligned
     target, or a target outside the region keeps the branch opaque.
     """
-    register = _bi_register(code[index])
+    if register is None:
+        register = _bi_register(code[index])
     if register is None:
         return None
     start = index
@@ -596,13 +601,16 @@ class _FlowRegion:
         # The lifter's own computed-jump set, so a branch it dispatches but
         # this pass cannot evaluate is still a transfer with unknown targets.
         self.computed_jump = set(computed_jumps)
+        self.link_returns = set(getattr(computed_jumps, 'link_returns', ()))
+        self.pc_getters = set(getattr(computed_jumps, 'pc_getters', ()))
         # A dispatch whose register this pass can evaluate exactly becomes a
         # set of known successors; every other one stays opaque.
         self.dispatch_targets = {}
         cut_addresses = set(cuts)
         for index, ins in enumerate(self.code):
             register = _bi_register(ins)
-            if register is None or (register == 0 and ins.addr not in self.computed_jump):
+            if (register is None or ins.addr in self.link_returns
+                    or (register == 0 and ins.addr not in self.computed_jump)):
                 continue
             targets = _dispatch_targets(self.code, index, cut_addresses,
                                         position.__contains__)
@@ -660,6 +668,8 @@ class _FlowRegion:
         if mnemonic in ('hbr', 'hbra', 'hbrr'):         # hints are no-ops
             return (fall,) if fall is not None else ()
         if mnemonic == 'bi' or mnemonic in _CONDITIONAL_BI:
+            if last.addr in self.link_returns:
+                return (fall,) if mnemonic != 'bi' and fall is not None else ()
             if last.addr in self.dispatch_targets:
                 edges = {self.block_of[address]
                          for address in self.dispatch_targets[last.addr]}
@@ -755,7 +765,7 @@ class _FlowRegion:
         state = dict(state)
         for ins in self.blocks[index][:upto]:
             if ins.mnemonic in _LINK_WRITE:
-                if _pc_getter(ins):
+                if _pc_getter(ins) or ins.addr in self.pc_getters:
                     # `brsl $rN, .+4` only loads the link: the generated code
                     # calls nothing, so no other register changes.
                     if (ins.raw & 0x7F) in state:
@@ -1196,7 +1206,10 @@ def effects_inventory(image, base, functions, entry=None, extra_entry_points=(),
     # dispatches but this pass cannot evaluate has unknown successors even
     # when a linear scan would read the register as an ABI return.
     from spu_lifter import compute_bi_r0_jumps
-    computed_jumps = compute_bi_r0_jumps(insns, [list(span) for span in functions])
+    computed_jumps = compute_bi_r0_jumps(
+        insns, [list(span) for span in functions], image=image, base=base,
+        delta=image_delta(base, link_base),
+        entry_points=([entry] if entry is not None else []) + list(extra_entry_points))
     modelled = set()
     if entry is not None and unresolved:
         resolved, unresolved, modelled = _resolve_sites(
@@ -1211,14 +1224,23 @@ def effects_inventory(image, base, functions, entry=None, extra_entry_points=(),
     block_entries = [{'command': value, 'name': MFC_COMMAND_NAMES.get(value),
                       'count': len(sites), 'sites': sites}
                      for value, sites in sorted(commands.items())]
-    if _indirect_dispatch(insns, modelled, computed_jumps):
+    assumptions = []
+    known = modelled | computed_jumps.link_returns | computed_jumps.pc_getters
+    if _indirect_dispatch(insns, known, computed_jumps):
         # A register-targeted transfer elsewhere in the image can enter a
         # generated function at its start without appearing in call_sites, and
-        # can land mid-block, past the immediate a block-local result rests on
-        # (a computed `biz` to the `wrch` itself); every resolution therefore
-        # rests on the named assumption.
+        # can land mid-block, past the immediate a block-local result rests on.
+        assumptions.append('no-unmodelled-indirect-entry')
+    if computed_jumps.callee_saved_returns:
+        assumptions.append('spu-abi-callee-saved')
+    if computed_jumps.assumes:
+        assumptions.append(computed_jumps.assumes)
+    if computed_jumps.private_slot_returns:
+        assumptions.append('spu-abi-link-slot-private')
+    if assumptions:
+        value = assumptions[0] if len(assumptions) == 1 else assumptions
         for item in resolved + block_entries:
-            item['assumes'] = 'no-unmodelled-indirect-entry'
+            item['assumes'] = value
     mfc_commands = block_entries + resolved
     # Same-block entries keep today's shape (no `via`); resolved entries follow
     # them for the same command so every evidence path stays visible.
@@ -1500,6 +1522,8 @@ def build_programs(args, registry_writer):
                     command += ['--extra-funcs', ','.join(hex(a) for a in entries)]
                 if raw and code_end is not None:
                     command += ['--code-end', str(code_end)]
+                if raw and program['link_base'] is not None:
+                    command += ['--link-base', str(program['link_base'])]
                 if merge_chunks:
                     command += ['--merge-chunks']
                 if return_entries:

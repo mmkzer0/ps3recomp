@@ -30,7 +30,9 @@ Model
   can reach it: a given entry point, no direct caller at all, its address
   materialised as a constant (`ila`, `il`, `ilhu`+`iohl`) or stored as an
   aligned word anywhere in the image, a call landing inside it, or the return
-  continuation of a call. Its live_out is then every register.
+  continuation of a call. An unresolved indirect call/branch has no proven
+  target set, so every function entry is conservatively treated as a possible
+  target and receives all-register liveness.
 * Terminating `stop` (any code outside find_spu_functions.LV2_RESUMING_STOPS)
   ends the program: nothing is live after it. A resuming stop uses every
   register, as does any branch whose target the tool cannot see (`bi $rN`,
@@ -42,13 +44,14 @@ Model
   assumed to return with $r1 unchanged; the poison run checks that at every
   return it poisons. No frame: null.
 
-Limits: a function entered through arithmetic on a table base (offset tables,
-halfword tables, `ila` plus `ai`) is not seen as address-taken; name such
-entries with --entry. An image linked at 0 and staged elsewhere (a position-
-independent job) adds its load delta to its immediates: --link-base makes every
-immediate and data word count as naming both `value` and `value - link_base +
-base`. Registers and stack bytes of a terminating `stop` are
-not part of any claim.
+Limits: arithmetic offset tables and halfword tables are not resolved. If an
+image contains an unresolved indirect call or branch, all function entries
+receive unknown callers and no dead-register claims. `--entry` still adds
+function bounds the detector missed, but does not prove an indirect target set.
+An image linked at 0 and staged elsewhere (a position-independent job) adds
+its load delta to its immediates: `--link-base` makes every immediate and data
+word count as naming both `value` and `value - link_base + base`. Registers and
+stack bytes of a terminating `stop` are not part of any claim.
 
 Output: JSON `ps3recomp.spu-liveness/1`, one object per function (docs/SPU_LIFTER.md "Liveness").
 
@@ -167,6 +170,8 @@ def describe(ins, computed_jumps):
         return PLAIN, _bit(rt) | _bit(ra), 0, None
     if m in _NO_REGS:
         return PLAIN, 0, 0, None
+    if addr in getattr(computed_jumps, "pc_getters", ()):
+        return PLAIN, (_bit(ra) if m == "bisl" else 0), _bit(rt), None
     if m == "br":
         return JUMP, 0, 0, (addr + 4 * i16) & LS_MASK
     if m == "bra":
@@ -287,7 +292,10 @@ def analyze(image, base, code_end=0, entries=(), functions=None, link_base=None)
     bounds = function_bounds(code, base, code_end, entries, functions, link_base)
     all_insns = disassemble_spu(code, base)
     by_addr = {i.addr: i for i in all_insns}
-    jumps = compute_bi_r0_jumps(all_insns, bounds)
+    jumps = compute_bi_r0_jumps(
+        all_insns, bounds, image=image, base=base,
+        delta=0 if link_base is None else base - link_base,
+        entry_points=[base, *entries])
     fns = [_Fn(s, e, i) for i, (s, e) in enumerate(bounds)]
     starts = [f.entry for f in fns]
     entry_index = {f.entry: f.index for f in fns}
@@ -310,6 +318,7 @@ def analyze(image, base, code_end=0, entries=(), functions=None, link_base=None)
     has_indirect = {f.entry: False for f in fns}
     exits = {f.entry: [] for f in fns}
     tail_targets = {f.entry: set() for f in fns}
+    has_unresolved_indirect = False
 
     def edge(src, a, target, tail_ok):
         dst = fn_of(target) if target in info else None
@@ -328,8 +337,9 @@ def analyze(image, base, code_end=0, entries=(), functions=None, link_base=None)
     for fn in fns:
         for a in fn.addrs:
             kind, _uses, _defs, target = info[a]
-            if kind in (IJUMP, CIJUMP):
+            if kind in (ICALL, IJUMP, CIJUMP):
                 has_indirect[fn.entry] = True
+                has_unresolved_indirect = True
             if kind in (RET, CRET):
                 exits[fn.entry].append(a)
             if kind == CALL:
@@ -346,6 +356,13 @@ def analyze(image, base, code_end=0, entries=(), functions=None, link_base=None)
             if kind in _FALLS:
                 edge(fn, a, a + 4, kind not in (CALL, ICALL))
 
+
+    # An unresolved indirect transfer may target any entry not proven
+    # unreachable. The offset-table case is not visible to _address_taken, so
+    # one such site makes every function's caller set unknown.
+    if has_unresolved_indirect:
+        for fn in fns:
+            reasons[fn.entry].add("unresolved-indirect-caller")
     entry_set = set(starts)
     taken = _address_taken(code, entry_set, info, by_addr, fns, image_delta(base, link_base))
     for fn in fns:

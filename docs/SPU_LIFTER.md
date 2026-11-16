@@ -135,20 +135,20 @@ function is the union, over its call sites, of live-in after the call, plus
 to the caller's callers). Recursion and mutual calls are solved to a fixed
 point.
 
-A function has unknown callers, and every register live-out, when anything but
-a direct call or branch can reach it: it is an `--entry`; no call or branch in
-the image targets it; its address is an `ila`, an `il` or an `ilhu`+`iohl`
-constant, or an aligned word anywhere in the image (a function pointer table);
-a call lands inside it; or it is the return continuation of a call. What the
-tool does not see is an entry reached through arithmetic on a table base
-(offset tables, `ila` plus `ai`) or a halfword table: name such entries with
-`--entry`. A position-independent job (linked at 0, staged at `--base`) forms
-its addresses image-relative: `--link-base 0` makes every immediate and data
-word also name `value - link_base + base` (the same reading as the raw
-manifest's `link_base`, below), so a function whose image-relative address is
-formed or stored counts as address-taken. The detected bounds follow it too.
-`--link-base` must lie in `[0, --base]`; the output's `image` then carries
-`link_base`.
+An entry has unknown callers, and every register live-out, when an
+`--entry` reaches it, no direct call or branch targets it, its address is
+materialised or stored in an aligned word, a call lands inside it, or it is a
+call continuation. In addition, any unresolved indirect call/branch leaves
+its target set unknown: every function entry could be reached, so each gets
+`unresolved-indirect-caller` and no dead-register claims. This covers arithmetic
+offset tables and halfword tables the analyzer does not resolve. `--entry`
+adds missing function bounds but does not narrow that possible target set.
+An image linked at 0 and staged at `--base` forms its addresses image-relative:
+`--link-base 0` makes every immediate and data word also name
+`value - link_base + base` (the same reading as the raw manifest's `link_base`,
+below), so a function whose image-relative address is formed or stored counts
+as address-taken. The detected bounds follow it too. `--link-base` must lie
+in `[0, --base]`; the output's `image` then carries `link_base`.
 
 `dead_stack` needs a forward analysis of `$r1` to prove a frame: the function
 lowers `$r1` only with `ai $r1,$r1,imm`, reaches no indirect branch, no
@@ -765,19 +765,63 @@ the site:
    provenance, so a copy of the function's argument is still the caller's
    register. A call may write any caller-visible register, so every tracked
    value is unknown at the return. A direct branch out of the region leaves it;
-   `bi $r0` and the conditional `biz`/`binz`/`bihz`/`bihnz ... $r0` are the ABI
-   returns the generated code emits as host returns, unless the generated code
-   emits an indirect dispatch for that address (the lifter's
-   `compute_bi_r0_jumps`: the nearest preceding write to `$r0` materialised the
-   address). That set is computed over the whole image, not one region, and it
-   looks through identity moves, so the interrupt-window idiom (`ila $r0,
-   <resume>`, `ai $r0, $r0, 0`, `bid $r0`) is an indirect dispatch even where
-   this pass cannot enumerate its target set. Branch hints are no-ops; a
-   non-resuming stop ends the path; `iret` and every other register-targeted
-   branch are indirect dispatches with unknown successors. The step resolves
-   only when every path arrives with one constant. Two constants on two paths,
-   a non-constant definition, or a reachable indirect dispatch keep the site
-   unresolved.
+   `bi $r0` and the conditional `biz`/`binz`/`bihz`/`bihnz ... $r0` are ABI
+   returns unless the generated code emits an indirect dispatch for that
+   address. `compute_bi_r0_jumps` also accepts a saved-link restore only for
+   `lqd $r0,off($r1)` when a dominating `stqd $r0,off2($r1)` stores the entry
+   link before any `$r0` write on every path, and `$r1` adjustments tracked
+   through `ai` prove `off + delta == off2`. Other bases, `lqx`, mismatched
+   offsets, or a path that bypasses the save are computed transfers. This
+   return classification rests on the named `"spu-abi-link-slot"` assumption.
+   The proof follows non-linking direct branches and fall-through across
+   finder-created split functions. Its product-lattice join keeps equal stack
+   deltas, intersects saved-link slots, and ANDs the predicate that `$r0` still
+   holds the entry link. Losing the live-register predicate cannot erase an
+   independently proven saved slot; a reload needs only that slot and a
+   matching delta. A call target, image/extra entry, immediate or data-word
+   reference, recovered dispatch-table member or resolved indirect target
+   prevents inheritance. Calls never donate their caller's frame to their
+   target.
+   At a call-target entry, `$r0` is a live link only when every known call edge
+   supplies its continuation in `$r0`. A `brsl $r4` or resolved `bisl $r4`
+   therefore cannot turn a saved/reloaded `$r0` into a return link; mixed link
+   registers also fail that proof. Non-`$r0` returns remain the responsibility
+   of the existing link-register classifier.
+
+   A non-wrapping branch-and-link whose target is its own next instruction is
+   a PC-getter, not a call. The shared pipeline `_pc_getter` recognizer compares
+   LS-masked PCs but excludes wrapping from the last word to address zero.
+   Direct `brsl $rN,.+4` and resolved `bisl` targets of that shape fall through,
+   write only their link register and preserve the frame. Such an edge
+   does not create a call target or return-entry root. It also does not supply a
+   `spu-abi-callee-saved` assumption. A nonzero link register on a PC-getter
+   cannot invalidate the still-live `$r0`.
+   Emitted `bisl` reads and masks its target before writing the link, captures
+   the return PC, and publishes `ctx->pc` on both paths. `_tg != _ret` is guarded
+   only when the sequential next instruction is represented in the same lifted
+   function: equality then falls through without a host call; inequality
+   retains ordinary indirect-call/drain/image-restore semantics. At a lifted
+   range end, a gap or LS wrap, even equality transfers as an ordinary indirect
+   call. The static proof uses the PC-getter fall-through only when its
+   target proof establishes that guarded path. An unexpected entry therefore
+   cannot erase the fallback call.
+
+   A return-entry continuation after a known in-image `brsl` or `bisl` instead
+   receives its call site's frame fact, with live-`$r0` false, under
+   `"spu-abi-callee-saved"`. Both normal return and a context-restoring dispatch
+   preserve the caller's `$r1` and stack frame. The call site's delta and saved
+   slot must be known; another independent way into that continuation still
+   vetoes the fact. Conflicting call-site/body-path deltas remain unproven.
+   Identity moves are looked through, so the interrupt-window idiom
+   (`ila $r0,<resume>`, `ai $r0,$r0,0`, `bid $r0`) remains an indirect dispatch
+   even where this pass cannot enumerate its target set. Branch hints are
+   no-ops; a non-resuming stop ends the path. The inventory uses the same
+   `compute_link_returns` classification as emitted `SPU_RET_REG` for known
+   non-`$r0` returns. `iret` and other unclassified register-targeted branches
+   remain indirect dispatches with unknown successors.
+   The step resolves only when every path arrives with one constant. Two
+   constants on two paths, a non-constant definition, or a reachable indirect
+   dispatch keep the site unresolved.
 
    A register-directed `bi`/conditional branch is **modelled exactly** when its
    target register is built only from a `brsl $rN, .+4` link constant,
@@ -845,27 +889,70 @@ the site and why, as data:
   `"entry 0x7C40 has no direct brsl/brasl caller"`; `"not reached"` means the
   region pass had already refused.
 
-A field named `assumes` names an assumption a resolution rests on. Resolved
-entries carry `"assumes": "no-unmodelled-indirect-entry"` when the image
-contains a register-targeted transfer that the region pass did **not** model —
-a `bi` or conditional `biz`/`binz`/`bihz`/`bihnz` to a register other than
-`$r0`, a `$r0` target the generated code turns into a dispatch (including one
-the lifter's identity-move look-through finds), `bisl`/`bisled`, or `iret`.
-Such a transfer can enter a generated function at its start, a lifted chunk
-start in the middle of a block, or any instruction at all (a computed `biz`
-straight to the `wrch`, past the immediate the block set), without appearing
-among the call sites, so the resolution assumes it does not. Same-block entries
-carry the tag as well: a block-local outcome is never presented as
-unconditionally proven while an unmodelled transfer could land inside it. An
-image whose transfers
-are all modelled exactly by the `masked-pc-relative` rule (or that has none)
-carries no `assumes`. A rule that rested on the SPU ABI would be
-named `"spu-abi-callee-saved"`; no rule does — a call is modelled as writing
-every register, which is conservative. A dispatch through an `lqx`-loaded jump
-table is still opaque, so those sites stay unresolved; modelling its recovered
-targets would need a named completeness assumption, and the detector's
-recovered set is a heuristic. A resolution that used a modelled dispatch says
-so with `"dispatch": "masked-pc-relative"`.
+A field named `assumes` names an assumption a resolution rests on. A single
+assumption is a string; multiple assumptions form an ordered list of
+strings. Resolved entries carry `"assumes": "no-unmodelled-indirect-entry"`
+when the image contains a register-targeted transfer that the region pass did
+**not** model — a `bi` or conditional `biz`/`binz`/`bihz`/`bihnz` that is not
+a known link return, a `$r0` target the generated code turns into a dispatch
+(including one the lifter's identity-move look-through finds), a non-PC-getter
+`bisl`/`bisled`, or `iret`. Such a transfer can enter a generated function at its start, a
+lifted chunk start in the middle of a block, or any instruction at all (a
+computed `biz` straight to the `wrch`, past the immediate the block set),
+without appearing among the call sites, so the resolution assumes it does not.
+Same-block entries carry the tag as well: a block-local outcome is never
+presented as unconditionally proven while an unmodelled transfer could land
+inside it.
+
+When the lifter accepts an `lqd` as a saved-link restore, effect resolutions
+also carry `"assumes": "spu-abi-link-slot"`: `compute_bi_r0_jumps` relies on
+the caller's link being saved to the matching stack slot, using the `$r1`
+adjustments it can track through `ai` (`tools/spu_lifter.py`). If both this
+rule and an unmodelled transfer apply, both names are present in the ordered
+list. An image whose transfers are all modelled exactly by the
+`masked-pc-relative` rule (or that has none) carries no
+`no-unmodelled-indirect-entry` assumption. A dispatch through an `lqx`-loaded
+jump table is still opaque, so those sites stay unresolved; modelling its
+recovered targets would need a named completeness assumption, and the
+detector's recovered set is a heuristic. A resolution that used a modelled
+dispatch says so with `"dispatch": "masked-pc-relative"`.
+
+Inherited saved-link returns use the same completeness assumption: an opaque
+register-targeted transfer elsewhere in the image could enter a split
+epilogue or land after its save without appearing in the direct predecessor
+graph. Each inherited return therefore records
+`"no-unmodelled-indirect-entry"` when any register-target branch remains
+unresolved, alongside `"spu-abi-link-slot"`. Return-entry facts also name
+`"spu-abi-callee-saved"` when used. With no unresolved branch the completeness
+assumption is absent. These are assumptions, not proof that unknown indirect
+targets are absent; whole-job differential replay and the T0 audit remain the
+empirical checks.
+
+`"spu-abi-link-slot-private"` assumes compiled guest code never forms a pointer
+to an active frame's link-save slot. Consequently a store through an argument,
+loaded pointer or immediate-built address that is not a placeable `$r1`-relative
+address cannot modify that slot under this assumption. A pointer to the slot
+spilled to memory and reloaded violates the premise by construction: the
+classifier still lowers the return, but visibly records this assumption.
+
+The assumption follows the saved value through reloads and copies into another
+link slot, and is recorded on every same-function or inherited return that
+uses it. A store through `$r1` with a known displacement is checked against the
+slot exactly. An unplaceable stack-derived store (`stqx` with a stack-derived
+base or index, or a copied/offset stack pointer) still kills the slot. Stack
+derivation propagates through copies and arithmetic such as `ori`, `ai`, `a`
+and `sf`, and joins by union. The privacy assumption never excuses a store
+the classifier knows may be an unplaceable stack-relative overwrite.
+
+`spu_lifter.py --report` records these decisions per site in `r0_returns`
+(`site`, `load`, `inherited`, `assumes`), rejected sites and reasons in
+`r0_dispatches`, and the image's `unresolved_register_branches`. The pipeline
+passes the raw manifest's existing `link_base` to the lifter as `--link-base`
+for this entry-veto inventory only: omitted means no relocation; an explicit
+value uses `ls_base - link_base` for relative immediates and table members.
+It does not change emitted addresses or the canonical `lift_options` string,
+which already records the manifest field. The finder, lifter and liveness
+thus use the same relocation convention, including explicit `link_base: 0`.
 
 Resolution is deliberately conservative: a false "resolved" could hide an
 atomic or mailbox access, while an unresolved site is visible and reviewable.

@@ -171,7 +171,8 @@ class UnknownCallers(unittest.TestCase):
             return [ila(9, BASE + Image.SLOT), bisl(0, 9), G.wrch(28, 3), G.stop(STOP_END)]
         f = Image().put(0, main).put(1, leaf).analyze()[BASE + 0x40]
         self.assert_all_live(f)
-        self.assertEqual(f["unknown_reasons"], ["address-taken", "no-caller"])
+        self.assertEqual(f["unknown_reasons"],
+                         ["address-taken", "no-caller", "unresolved-indirect-caller"])
 
     def test_address_materialised_with_ilhu_and_iohl(self):
         base = 0x20000
@@ -220,6 +221,67 @@ class UnknownCallers(unittest.TestCase):
         f = Image().put(0, main).put(1, leaf).analyze()[BASE + 0x40]
         self.assertEqual(f["dead_regs"], [])
 
+    def test_offset_table_indirect_caller_makes_live_out_conservative(self):
+        table = BASE + 0x180
+
+        def direct(pc):
+            return [G.brsl(0, pc, BASE + Image.SLOT), G.wrch(28, 5), G.stop(STOP_END)]
+
+        def indirect(pc):
+            # Load an image-relative function offset from a table, add the
+            # staged image base, then call the computed target through bisl.
+            return [
+                ila(9, table),
+                G.lqd(8, 9, 0),
+                ila(10, BASE),
+                word((0x0C0 << 21) | (10 << 14) | (8 << 7) | 8),  # a $r8,$r8,$r10
+                bisl(0, 8),
+                G.wrch(28, 6),
+                G.stop(STOP_END),
+            ]
+
+        img = Image(slots=8).put(0, direct).put(1, leaf).put(2, indirect)
+        img.words[0x180 // 4] = Image.SLOT  # target offset, not an absolute LS address
+        f = img.analyze()[BASE + Image.SLOT]
+        self.assertEqual(f["callers"], [f"0x{BASE:05x}"])
+        self.assertNotIn("no-caller", f["unknown_reasons"])
+        self.assertTrue(f["unknown_callers"])
+        self.assertEqual(f["live_out"], list(range(128)))
+        self.assertEqual(f["dead_regs"], [])
+        self.assertIn("unresolved-indirect-caller", f["unknown_reasons"])
+
+    def test_unproven_lqd_r0_branch_is_an_unresolved_caller(self):
+        def main(pc):
+            return [G.brsl(0, pc, BASE + Image.SLOT),
+                    G.wrch(28, 3), G.stop(STOP_END)]
+
+        def malformed_return(pc):
+            return [G.lqd(0, 3, 0), G.bi(0)]
+
+        docs = (Image().put(0, main).put(1, leaf).put(2, malformed_return)
+                .analyze())
+        target = docs[BASE + Image.SLOT]
+        self.assertTrue(target["unknown_callers"])
+        self.assertEqual(target["dead_regs"], [])
+        self.assertIn("unresolved-indirect-caller", target["unknown_reasons"])
+
+    def test_shared_epilogue_restore_remains_a_return_for_liveness(self):
+        def main(pc):
+            return [G.brsl(0, pc, BASE + Image.SLOT),
+                    G.wrch(28, 3), G.stop(STOP_END)]
+
+        def prologue(pc):
+            return [G.stqd(0, 1, 1), G.ai(1, 1, -32),
+                    br(pc + 8, BASE + 2 * Image.SLOT)]
+
+        def epilogue(pc):
+            return [G.lqd(0, 1, 3), G.ai(1, 1, 32), G.bi(0)]
+
+        docs = Image().put(0, main).put(1, prologue).put(2, epilogue).analyze()
+        self.assertNotIn("unresolved-indirect-caller",
+                         docs[BASE + Image.SLOT]["unknown_reasons"])
+        self.assertEqual(docs[BASE + 2 * Image.SLOT]["live_out"], [1, 3])
+
 
 class Callers(unittest.TestCase):
     def test_two_callers_union_of_their_uses(self):
@@ -255,9 +317,18 @@ class Callers(unittest.TestCase):
 
     def test_recursion_reaches_a_fixed_point(self):
         def rec(pc):
-            return [G.il(3, 1), brz(2, pc + 4, pc + 12), G.brsl(0, pc + 8, pc), G.bi(0)]
+            return [
+                G.ai(1, 1, -16),
+                G.stqd(0, 1, 0),
+                G.il(3, 1),
+                brz(2, pc + 12, pc + 20),
+                G.brsl(0, pc + 16, pc),
+                G.lqd(0, 1, 0),
+                G.ai(1, 1, 16),
+                G.bi(0),
+            ]
         docs = Image().put(0, call_then(G.wrch(28, 3))).put(1, rec).analyze()
-        self.assertEqual(docs[BASE + 0x40]["live_out"], [0, 1, 3])
+        self.assertEqual(docs[BASE + 0x40]["live_out"], [1, 3])
 
 
 class Stops(unittest.TestCase):
@@ -337,6 +408,19 @@ class Frame(unittest.TestCase):
 
 
 class Decoder(unittest.TestCase):
+    def test_pc_getter_is_a_definition_not_a_call(self):
+        image = (G.brsl(126, BASE, BASE + 4).to_bytes(4, "big")
+                 + G.bi(0).to_bytes(4, "big"))
+        insns = spu_disasm.disassemble_spu(image, BASE)
+        classified = L.compute_bi_r0_jumps(
+            insns, [(BASE, BASE + 4), (BASE + 4, BASE + 8)], image=image, base=BASE)
+        self.assertEqual(L.describe(insns[0], classified),
+                         (L.PLAIN, 0, 1 << 126, None))
+        docs = L.analyze(image, BASE, functions=[(BASE, BASE + 4), (BASE + 4, BASE + 8)])
+        continuation = docs["functions"][1]
+        self.assertEqual(continuation["callers"], [])
+        self.assertNotIn("return-continuation", continuation["unknown_reasons"])
+
     def test_every_mnemonic_has_a_rule(self):
         seen = set()
         for shift, width in ((28, 4), (25, 7), (24, 8), (23, 9), (22, 10), (21, 11)):
