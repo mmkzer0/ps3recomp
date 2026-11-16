@@ -726,9 +726,30 @@ against the manifest's directory:
     shorten a straight-line run, never make one: over the same function list
     the sites left unresolved with `link_base` include every site left
     unresolved without it (`tools/test_spu_program_pipeline.py`
-    `test_link_base_never_adds_a_resolution`). A table-relative jump table is
-    still not modelled: its targets stay covered by the
-    `no-unmodelled-indirect-entry` assumption.
+    `test_link_base_never_adds_a_resolution`). The MFC effect resolver still
+    treats table-relative tables as `no-unmodelled-indirect-entry`; it does
+    not rely on the lifter's separate register-branch analysis.
+  - The lifter resolves an in-image `lqx`/`rotqby` table only when it can
+    derive the table address, branch target expression and index domain.
+    `GUARANTEED` additionally requires every reachable index to be bounded,
+    every target to be a detected function entry, and no possible store or
+    MFC GET to overlap the table. Bounds come from a finite value set, a mask,
+    or a `clgti`/`brnz` escape that cannot re-enter the dispatch. The branch
+    must test that comparison's destination, and the selector must remain
+    unchanged from comparison through dispatch. A selector overwritten after
+    scaling cannot bound its earlier value. An unbounded
+    index, unproven control flow or possible writer yields `BOUNDED`: the
+    generated branch checks its word-aligned 18-bit target and stops with
+    `spu-indirect-target-set` if it leaves the enumerated candidates. A
+    `BOUNDED` site remains unresolved for native-override admission.
+    A mismatch stops before interrupt-enable or PC writes. `bisl` validates
+    before writing its link. `bisled` writes its link before the acquire event
+    sample, matching the interpreter; a taken mismatch restores the old link
+    before stopping, retaining the pre-branch state in the stop snapshot.
+    The `GUARANTEED` claim is sound because every reachable selector value
+    chooses an enumerated in-image word, all such words name registered
+    entries, and the writer scan found no store that can change those bytes.
+    `BOUNDED` guards detect an escape but do not prove the table immutable.
   - The lift's options carry `link_base` (below), because the same bytes lift
     to a different body.
   - `tools/spu_liveness.py --link-base` reads the image the same way.

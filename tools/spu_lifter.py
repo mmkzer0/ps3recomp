@@ -573,6 +573,8 @@ class BiR0Classification(set):
         self.link_returns = set()
         self.pc_getters = set()
         self.resolved_branches = {}
+        self.table_proofs = {}
+        self.indirect_target_guards = {}
         self.return_assumptions = {}
         self.unproven = {}
 
@@ -623,7 +625,7 @@ def _r0_link_entry_inventory(insns, bounds, image, base, delta, entry_points):
 
     # Deferred: the pipeline imports this module's option parser. Sharing its
     # exact evaluator keeps a resolved dispatch from becoming two conventions.
-    from spu_program_pipeline import _dispatch_targets, _pc_getter
+    from spu_program_pipeline import _dispatch_targets, _pc_getter, _table_branch_proof
 
     starts = {s for s, _ in bounds}
     low, high = min(starts), max(e for _, e in bounds)
@@ -666,12 +668,19 @@ def _r0_link_entry_inventory(insns, bounds, image, base, delta, entry_points):
     while True:
         resolved = {}
         discovered = set()
+        table_proofs = {}
         pc_getters = set(direct_getters)
         for i, insn in enumerate(insns):
+            register = (insn.raw >> 7) & 0x7F
             if _bi_target_reg(insn) is not None or insn.mnemonic in ("bisl", "bisled"):
                 targets = _dispatch_targets(
-                    insns, i, cuts, addresses.__contains__,
-                    register=(insn.raw >> 7) & 0x7F)
+                    insns, i, cuts, addresses.__contains__, register=register)
+                if not targets:
+                    proof = _table_branch_proof(
+                        insns, i, cuts, image, base, bounds, delta, register)
+                    if proof:
+                        targets = frozenset(proof["targets"])
+                        table_proofs[insn.addr] = proof
                 if targets:
                     resolved[insn.addr] = targets
                     if _pc_getter(insn, targets):
@@ -688,8 +697,94 @@ def _r0_link_entry_inventory(insns, bounds, image, base, delta, entry_points):
                     for target in resolved.get(insn.addr, ()):
                         call_links[target] = call_links.get(target, 0) | (
                             1 << (insn.raw & 0x7F))
-            return independent, resolved, continuations, call_links, pc_getters
+            return (independent, resolved, continuations, call_links,
+                    table_proofs, pc_getters)
         cuts.update(discovered)
+
+
+def _signed_u32(value):
+    value &= 0xFFFFFFFF
+    return value - 0x100000000 if value & 0x80000000 else value
+
+
+def _stack_delta_after(insn, delta, constants):
+    """Track SP deltas through immediate and path-invariant register adjustments."""
+    mn = insn.mnemonic
+    ops = _ops(insn.operands)
+    if not ops or _reg(ops[0]) != "1" or mn in _NO_RT_WRITE or _is_identity_move(insn):
+        return delta
+    if mn == "ai" and len(ops) == 3 and _reg(ops[1]) == "1":
+        immediate = _parse_imm_int(ops[2])
+        return delta + immediate if delta is not None and immediate is not None else None
+    if mn == "a" and len(ops) == 3:
+        left, right = _reg(ops[1]), _reg(ops[2])
+        if left == "1" and right != "1":
+            value = constants.get(int(right))
+            return delta + _signed_u32(value) if delta is not None and value is not None else None
+        if right == "1" and left != "1":
+            value = constants.get(int(left))
+            return delta + _signed_u32(value) if delta is not None and value is not None else None
+    # SPU `sf rt,ra,rb` computes `rb-ra`; only SP minus a known constant stays relative.
+    if mn == "sf" and len(ops) == 3:
+        left, right = _reg(ops[1]), _reg(ops[2])
+        if right == "1" and left != "1":
+            value = constants.get(int(left))
+            return delta - _signed_u32(value) if delta is not None and value is not None else None
+    return None
+
+
+def _constant_registers_after(insn, constants, pc_getters):
+    """Keep only scalar constants proven across every incoming path."""
+    values = dict(constants)
+    mn = insn.mnemonic
+    if mn in ("brsl", "brasl", "bisl", "bisled"):
+        link = insn.raw & 0x7F
+        if insn.addr in pc_getters:
+            if link != 1:
+                values[link] = (insn.addr + 4) & 0x3FFFF
+        else:
+            values.clear()
+        return values
+    if mn in _NO_RT_WRITE:
+        return values
+    destination = _dest_reg(insn)
+    if destination == 1:
+        values.pop(destination, None)
+        return values
+    old_value = values.get(destination)
+    value = None
+    if mn == "il":
+        value = _signed_u32((insn.raw >> 7) & 0xFFFF
+                            | (0xFFFF0000 if (insn.raw >> 22) & 1 else 0))
+    elif mn == "ila":
+        value = (insn.raw >> 7) & 0x3FFFF
+    elif mn == "ilhu":
+        value = ((insn.raw >> 7) & 0xFFFF) << 16
+    elif mn == "iohl" and old_value is not None:
+        value = old_value | ((insn.raw >> 7) & 0xFFFF)
+    elif mn == "ai":
+        source = (insn.raw >> 7) & 0x7F
+        immediate = _parse_imm_int(_ops(insn.operands)[2])
+        if source in values and immediate is not None:
+            value = (values[source] + immediate) & 0xFFFFFFFF
+    elif mn in ("a", "sf"):
+        left, right = (insn.raw >> 7) & 0x7F, (insn.raw >> 14) & 0x7F
+        if left in values and right in values:
+            value = ((values[left] + values[right]) if mn == "a"
+                     else (values[right] - values[left])) & 0xFFFFFFFF
+    elif mn == "ori" and ((insn.raw >> 14) & 0x3FF) == 0:
+        value = values.get((insn.raw >> 7) & 0x7F)
+    if value is None:
+        values.pop(destination, None)
+    else:
+        values[destination] = value & 0xFFFFFFFF
+    return values
+
+
+def _constant_map_intersection(left, right):
+    right = dict(right)
+    return tuple(sorted((register, value) for register, value in left
+                        if right.get(register) == value))
 
 
 @dataclass(frozen=True)
@@ -702,6 +797,7 @@ class _LinkState:
     stack_derived: int = 1 << 1
     private_slots: frozenset = frozenset()
     live_link_private: bool = False
+    constants: tuple = ()
 
 
 def _stack_derived_after(insn, derived):
@@ -793,13 +889,8 @@ def _r0_link_restore_loads(insns, bounds, independent, continuations, call_links
         live_private = state.live_link_private
         mn = insn.mnemonic
         ops = _ops(insn.operands)
-        if mn == "ai" and len(ops) == 3 and _reg(ops[0]) == "1":
-            immediate = _parse_imm_int(ops[2])
-            delta = (delta + immediate if _reg(ops[1]) == "1"
-                     and delta is not None and immediate is not None else None)
-        elif (mn not in _NO_RT_WRITE and _dest_reg(insn) == 1
-              and not _is_identity_move(insn)):
-            delta = None
+        delta = _stack_delta_after(insn, delta, dict(state.constants))
+        constants = _constant_registers_after(insn, state.constants, pc_getters)
         if mn in ("stqd", "stqa", "stqr", "stqx"):
             if mn == "stqd":
                 offset, reg = _disp_base(ops[1])
@@ -841,7 +932,7 @@ def _r0_link_restore_loads(insns, bounds, independent, continuations, call_links
                             in state.private_slots)
         return _LinkState(delta, link_value, slots, state.inherited, state.callee_saved,
                           _stack_derived_after(insn, state.stack_derived), private_slots,
-                          live_private)
+                          live_private, tuple(sorted(constants.items())))
 
     # First propagate rooted facts. Then give unrooted code an unknown state,
     # so a dead/cyclic predecessor never counts as an agreeing incoming edge.
@@ -865,7 +956,7 @@ def _r0_link_restore_loads(insns, bounds, independent, continuations, call_links
                 carried = _LinkState(
                     out.sp_delta, out.live_link, out.slots, out.inherited or crossing,
                     out.callee_saved or abi_continuation, out.stack_derived, out.private_slots,
-                    out.live_link_private)
+                    out.live_link_private, out.constants)
                 old = incoming[successor]
                 if old is None:
                     merged = carried
@@ -873,6 +964,9 @@ def _r0_link_restore_loads(insns, bounds, independent, continuations, call_links
                     # A call may destroy the live link without changing the
                     # independently proven stack delta or saved-link contents.
                     slots = old.slots & carried.slots
+                    # A constant survives a join only when every incoming edge
+                    # carries the same value; conflicting values stay unknown.
+                    constants = _constant_map_intersection(old.constants, carried.constants)
                     merged = _LinkState(
                         old.sp_delta if old.sp_delta == carried.sp_delta else None,
                         old.live_link and carried.live_link, slots,
@@ -881,7 +975,8 @@ def _r0_link_restore_loads(insns, bounds, independent, continuations, call_links
                         old.stack_derived | carried.stack_derived,
                         (old.private_slots | carried.private_slots) & slots,
                         old.live_link and carried.live_link
-                        and (old.live_link_private or carried.live_link_private))
+                        and (old.live_link_private or carried.live_link_private),
+                        constants)
                 if merged != old:
                     incoming[successor] = merged
                     if successor not in queued:
@@ -934,9 +1029,11 @@ def compute_bi_r0_jumps(insns, bounds, *, image=None, base=None, delta=0,
     """Classify register-targeted r0 branches not proven to return.
 
     An unchanged caller link, identity move, or a proven ABI stack-slot reload
-    is a return. A memory load only qualifies when a dominating `stqd $r0,off(
-    $r1)` saved the entry link and the classifier tracks `$r1` through `ai`
-    adjustments to the matching `lqd`. Other writes dispatch the computed PC.
+    is a return. A memory load only qualifies when a dominating
+    `stqd $r0,off($r1)` saved the entry link and the classifier tracks `$r1`
+    through immediate `ai` and `a`/`sf` adjustments whose register operands
+    agree on every incoming path to the matching `lqd`. Other writes dispatch
+    the computed PC.
 
     An `ila`/`il` target also covers the interrupt-window idiom: `bid $r0`
     after `ila $r0,<resume>` resumes at that address, rather than returning.
@@ -951,8 +1048,8 @@ def compute_bi_r0_jumps(insns, bounds, *, image=None, base=None, delta=0,
         base = ordered[0].addr
     if image is None:
         image = b"".join(insn.raw.to_bytes(4, "big") for insn in ordered)
-    independent, resolved, continuations, call_links, pc_getters = _r0_link_entry_inventory(
-        ordered, bounds, image, base, delta, entry_points)
+    (independent, resolved, continuations, call_links, table_proofs, pc_getters) = (
+        _r0_link_entry_inventory(ordered, bounds, image, base, delta, entry_points))
     valid_restore_loads, inherited_loads, callee_saved_loads, private_loads, refused_loads = (
         _r0_link_restore_loads(
             ordered, bounds, independent, continuations, call_links, pc_getters))
@@ -1024,6 +1121,18 @@ def compute_bi_r0_jumps(insns, bounds, *, image=None, base=None, delta=0,
     }
     link_returns = compute_link_returns(ordered, bounds)
     classification.link_returns = link_returns
+    classification.table_proofs = table_proofs
+    for site, targets in resolved.items():
+        if site in pc_getters or site in link_returns:
+            continue
+        proof = table_proofs.get(site)
+        if proof is None:
+            proof = {
+                "targets": tuple(sorted(targets)),
+                "classification": "GUARANTEED",
+                "reason": None,
+            }
+        classification.indirect_target_guards[site] = proof
     active = {address for start, end in bounds for address in range(start, end, 4)}
     for insn in ordered:
         if (insn.addr not in active or insn.addr in resolved or insn.addr in link_returns
@@ -1033,6 +1142,9 @@ def compute_bi_r0_jumps(insns, bounds, *, image=None, base=None, delta=0,
         if (insn.mnemonic in ("bisl", "bisled", "iret")
                 or target is not None and (target != "0" or insn.addr in jumps)):
             classification.unresolved_branches.add(insn.addr)
+    for site, proof in table_proofs.items():
+        if proof["classification"] != "GUARANTEED":
+            classification.unresolved_branches.add(site)
     classification.return_assumptions = {
         site: classification.assumptions_for(site) for site in link_restores
     }
@@ -1336,6 +1448,15 @@ class SPULifter:
         if self.reloc:
             return f"((0x{a:X}u + (uint32_t)ctx->reloc_delta) & 0x3FFFFu)"
         return f"0x{a:X}"
+
+    def _indirect_target_guard(self, site: int, before_stop: str = "") -> str:
+        proof = getattr(self.bi_r0_jump, "indirect_target_guards", {}).get(site)
+        if not proof:
+            return ""
+        targets = proof["targets"]
+        allowed = " && ".join(f"_tg != {self._pc(target)}" for target in targets)
+        return (f"if ({allowed}) {{ {before_stop}"
+                f"spu_indirect_target_set_mismatch(ctx, {self._pc(site)}, _tg); }} ")
 
     @staticmethod
     def _branch_target(insn: SPUInstruction):
@@ -1758,7 +1879,12 @@ class SPULifter:
                 if tgt_reg != "0":
                     return f"{_ied}SPU_RET_REG(ctx, {tgt_reg});"
                 return f"{_ied}SPU_RET(ctx);"
-            # Computed indirect tail: set pc + trampoline to the dispatcher, unwind.
+            # Computed indirect tail: guard known targets, then transfer to the dispatcher.
+            target_guard = self._indirect_target_guard(addr)
+            if target_guard:
+                return (f"{{ const uint32_t _tg = {g(tgt_reg)}._u32[0] & 0x3FFFCu; "
+                        f"{target_guard}SPU_LIFT_BACKEDGE(ctx); {_ied}ctx->pc = _tg; "
+                        f"g_spu_trampoline_fn = spu_indirect_branch; return; }}")
             return (f"SPU_LIFT_BACKEDGE(ctx); {_ied}ctx->pc = {g(tgt_reg)}._u32[0]; "
                     f"g_spu_trampoline_fn = spu_indirect_branch; return;")
         # iret: interrupt return -> branch to the saved interrupt PC (SRR0).
@@ -1782,12 +1908,13 @@ class SPULifter:
             # here and its `bi $r0` returns via host return.
             # read the target BEFORE writing the link: rt may be the same register as ra
             rs, rr = ("const int32_t _rd = ctx->reloc_delta; ", " ctx->reloc_delta = _rd;") if self.reloc else ("", "")
+            target_guard = self._indirect_target_guard(addr)
             falls_through = next_addr == addr + 4 and addr + 4 < 0x40000
             guard = "if (_tg != _ret) { " if falls_through else ""
             guard_end = " }" if falls_through else ""
             return (f"{{ uint32_t _tg = {g(tgt_reg)}._u32[0] & 0x3FFFCu; "
                     f"const uint32_t _ret = {self._pc((addr + 4) & 0x3FFFC)}; "
-                    f"{g(link_rt)} = spu_link(_ret); {_ied}ctx->pc = _tg; "
+                    f"{target_guard}{g(link_rt)} = spu_link(_ret); {_ied}ctx->pc = _tg; "
                     f"{guard}int32_t _si = (int32_t)ctx->image_id; {rs}"
                     f"ctx->host_depth++; "
                     f"spu_indirect_branch(ctx); spu_drain_call(ctx, _ret); "
@@ -1796,9 +1923,16 @@ class SPULifter:
         if mn in ("bisled",):
             link_rt = insn.raw & 0x7F            # rt = link
             tgt_reg = (insn.raw >> 7) & 0x7F     # ra = target (the disassembler's last operand is rb, not the target)
-            # read the target before writing the link: rt may alias ra
-            return (f"{{ uint32_t _tg = {g(tgt_reg)}._u32[0]; {g(link_rt)} = spu_link({self._pc((addr + 4) & 0x3FFFC)}); "
-                    f"if ((ctx->event_status & ctx->event_mask) != 0) {{ "
+            guarded = addr in getattr(self.bi_r0_jump, "indirect_target_guards", {})
+            save_link = f"const u128 _old_link = {g(link_rt)}; " if guarded else ""
+            target_guard = self._indirect_target_guard(
+                addr, f"{g(link_rt)} = _old_link; ")
+            # Match the interpreter: acquire-sample events after publishing the
+            # link. A rejected target restores that link for the stop snapshot.
+            return (f"{{ const uint32_t _tg = {g(tgt_reg)}._u32[0] & 0x3FFFCu; "
+                    f"{save_link}{g(link_rt)} = spu_link({self._pc((addr + 4) & 0x3FFFC)}); "
+                    f"if ((__atomic_load_n(&ctx->event_status, __ATOMIC_ACQUIRE) "
+                    f"& ctx->event_mask) != 0) {{ {target_guard}"
                     f"{_ied}ctx->pc = _tg; SPU_LIFT_BACKEDGE(ctx); "
                     f"g_spu_trampoline_fn = spu_indirect_branch; return; }} }}")
         # biz/binz/bihz/bihnz: ops[0] = condition reg, ops[1] = target reg.
@@ -1815,6 +1949,11 @@ class SPULifter:
                 if tgt_reg != "0":
                     return f"if ({cond}) {{ {_ied}SPU_RET_REG(ctx, {tgt_reg}); }}"
                 return f"if ({cond}) {{ {_ied}SPU_RET(ctx); }}"
+            target_guard = self._indirect_target_guard(addr)
+            if target_guard:
+                return (f"if ({cond}) {{ uint32_t _tg = {g(tgt_reg)}._u32[0] & 0x3FFFCu; "
+                        f"{target_guard}SPU_LIFT_BACKEDGE(ctx); {_ied}ctx->pc = _tg; "
+                        f"g_spu_trampoline_fn = spu_indirect_branch; return; }}")
             return (f"if ({cond}) {{ SPU_LIFT_BACKEDGE(ctx); {_ied}ctx->pc = {g(tgt_reg)}._u32[0]; "
                     f"g_spu_trampoline_fn = spu_indirect_branch; return; }}")
 
@@ -2276,6 +2415,11 @@ def main() -> None:
                        ],
                        "unresolved_register_branches": sorted(
                            lifter.bi_r0_jump.unresolved_branches),
+                       "indirect_target_guards": [
+                           {"site": site, **proof}
+                           for site, proof in sorted(
+                               lifter.bi_r0_jump.indirect_target_guards.items())
+                       ],
                        "r0_dispatches": [
                            {"site": site, "reason": lifter.bi_r0_jump.unproven.get(
                                site, "unproven-target")}
