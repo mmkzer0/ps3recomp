@@ -1060,7 +1060,32 @@ carrying the items above, the first 20 runs in detail in `events`) and
 `incomplete`; a trace without kinds 30-31 prints one line for the section and
 the key is null.
 
-Kinds 30-33 are recorded whatever `PS3_FTRACE_MIN_US` says. Exit `0` on a
+**BC uploads** (kind 34 `BC_UPLOAD`, `rsx.bc_path` in `docs/CONFIG.md`). One
+span per upload into a BC1/2/3 texture the Metal backend decodes itself (one
+level of one face or 3D slice): `who` is the format (1 BC1, 2 BC2, 3 BC3), `a`
+the level's texels, `b` the tier (1 CPU, 2 GPU); the span is the RSX thread's
+time inside the upload (the CPU tier's decode and texture write; the GPU
+tier's staging copy, encode and commit, never the GPU's run). The report adds a
+section, per format and tier: uploads, texels, thread ms, mean ns per texel,
+the per-upload p50, p99 and max, and per flip request when nothing was
+dropped; the per-frame RSX rows gain `bc upload (cpu)` / `bc upload (gpu)`
+(inside the drain, so overlapping `drain`). `--json` adds the top-level key
+`bc_upload` (`uploads`, `rows`) only to a trace that has the kind, so every
+other trace reports what it always did.
+
+**BC settle** (kind 35 `BC_SETTLE`). One span per frame commit while the Metal
+backend's GPU BC tier exists: the RSX thread's wait, inside `eng_bc_settle`,
+for the GPU-tier decodes committed so far (a zero-length span found nothing to
+wait for). `a` is the decodes in flight when it began, `b` the outcome (0 done,
+1 a decode had failed, 2 the bound ran out; the last two end the run with
+`host-gpu-command`). The report adds a section: commits, those with a decode in
+flight, total, mean, p50, p99 and max wait, the commits that ended the run, and
+ms per flip request when nothing was dropped; the per-frame RSX rows gain
+`bc settle`. `--json` adds the top-level key `bc_settle` (`commits`, `waited`,
+`total_ms`, `mean_ms`, `wait_ms`, `failed`, `timed_out`, `ms_per_flip`) only to
+a trace that has the kind.
+
+Kinds 30-35 are recorded whatever `PS3_FTRACE_MIN_US` says. Exit `0` on a
 report, `2` on an unreadable, truncated, corrupt or malformed trace, a zstd
 trace with no decoder, bad arguments or fewer than three flip requests.
 

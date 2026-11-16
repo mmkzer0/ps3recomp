@@ -113,6 +113,12 @@ the same partition over all of that tid's view-to-view gaps (the base rate). A
 header `dropped > 0` marks the section INCOMPLETE; a trace without the kinds
 prints one line.
 
+A BC-settle section (kind 35, BC_SETTLE) likewise appears only in a trace that has the kind: one span per frame
+commit while the Metal backend's GPU BC tier exists, the RSX thread's wait for the decodes committed so far
+(`a` = decodes in flight when it began, `b` = 0 done, 1 a decode had failed, 2 the bound ran out). It reports the
+commits, how many had a decode in flight, the total, mean, p50, p99 and max wait, the commits that ended the run,
+and ms per flip request when nothing was dropped; the per-frame RSX rows gain "bc settle".
+
 Without --json it then draws a few frames as a timeline (one column per
 --ms-per-col ms):
   PPU   '#' running   '.' usleep poll   's' other blocking syscall
@@ -416,6 +422,8 @@ def frame_key(k, who, a, b):
         return ("rsx", "encode (present)" if a else "encode (flush)")
     if k == GPU_WAIT:
         return ("rsx", GPU_WAIT_KIND.get(a, "gpu wait"))
+    if k == BC_SETTLE:
+        return ("rsx", "bc settle")
     if k == READBACK:
         return ("rsx", "readback")
     return None
@@ -2793,6 +2801,24 @@ def print_jq2_section(jq):
     print_jq2_trace_cost(jq["trace_cost"])
 
 
+def bc_settle_section(spans, flip_requests, dropped):
+    """Kind 35: the RSX thread's wait for GPU-tier BC decodes before each frame commit. None when absent.
+
+    A span is one commit's wait; a = decodes in flight when it began, b = 0 done, 1 a decode had failed,
+    2 the bound ran out. Rates per flip request only for a trace that dropped nothing."""
+    settles = [s for s in spans if s[0] == BC_SETTLE]
+    if not settles:
+        return None
+    ms = sorted(s[5] - s[4] for s in settles)
+    total = sum(ms)
+    rates = dropped == 0 and flip_requests > 0
+    return {"commits": len(settles), "waited": sum(1 for s in settles if s[2] > 0), "total_ms": total,
+            "mean_ms": total / len(settles),
+            "wait_ms": {"p50": nearest_rank(ms, 50), "p99": nearest_rank(ms, 99), "max": ms[-1]},
+            "failed": sum(1 for s in settles if s[3] == 1), "timed_out": sum(1 for s in settles if s[3] == 2),
+            "ms_per_flip": total / flip_requests if rates else None}
+
+
 def build_report(header, names, spans, images, split=None, cad=(None, None), gap=20.0):
     """The summary dict `--json` prints (without --split/--cadence by default); BadInput when the
     trace has fewer than 3 flip requests. cad = (NID, TID or None); a None NID adds no cadence."""
@@ -2817,6 +2843,9 @@ def build_report(header, names, spans, images, split=None, cad=(None, None), gap
     report["audio"] = audio_section(spans, header_dropped(header), name_of)
     report["jq2"] = jq2_section(spans, header, names, images)
     report["audio_ring"] = audio_ring_section(spans, header, names)
+    bs = bc_settle_section(spans, len(flips), header_dropped(header))
+    if bs is not None:   # absent when the trace has no kind 35, like bc_upload
+        report["bc_settle"] = bs
     cad_nid, cad_tid = cad
     if cad_nid is not None:
         report["cadence"] = {"nid": f"{cad_nid:08X}", "import": name_of(cad_nid),
@@ -2826,6 +2855,18 @@ def build_report(header, names, spans, images, split=None, cad=(None, None), gap
 
 def report_json(report):
     return json.dumps(report, indent=1, sort_keys=True) + "\n"
+
+
+def print_bc_settle_section(sec):
+    if sec is None:
+        return
+    t = sec["wait_ms"]
+    flip = f"  {sec['ms_per_flip']:.3f} ms per flip" if sec["ms_per_flip"] is not None else ""
+    print(f"\nBC settle (the RSX thread waiting for GPU-tier BC decodes before a frame commit, kind 35):")
+    print(f"  {sec['commits']} commit(s), {sec['waited']} with a decode in flight, {sec['total_ms']:.3f} ms in all,"
+          f" mean {sec['mean_ms']:.3f}, p50 {t['p50']:.3f} p99 {t['p99']:.3f} max {t['max']:.3f} ms{flip}")
+    if sec["failed"] or sec["timed_out"]:
+        print(f"  ENDED THE RUN: {sec['failed']} with a failed decode, {sec['timed_out']} past the bound")
 
 
 def main():
@@ -2874,6 +2915,7 @@ def main():
     print_audio_section(report["audio"])
     print_jq2_section(report["jq2"])
     print_audio_ring_section(report["audio_ring"])
+    print_bc_settle_section(report.get("bc_settle"))
     if "cadence" in report:
         c = report["cadence"]
         print(f"\nCadence of {c['import']} ({c['nid']}):")

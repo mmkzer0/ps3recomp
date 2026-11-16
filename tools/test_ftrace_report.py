@@ -1731,5 +1731,28 @@ with tempfile.TemporaryDirectory() as tmp:
                            capture_output=True, text=True, timeout=60, check=False)
         check(q.returncode == 0 and q.stdout == want, f"zstd: the command line reads a zstd trace ({q.stderr})")
 
+# Kind 35 (BC_SETTLE): who = 0, a = decodes in flight when the wait began, b = 0 done / 1 failed / 2 timed out; the
+# span is the RSX thread's wait before one frame commit. Four flip requests again.
+BC_SETTLE = 35
+setlines = [span(FLIP_REQ, 1, 0, 0, t, t) for t in (0, 20, 40, 60)]
+setlines += [span(BC_SETTLE, 0, 0, 0, 5, 5),          # nothing in flight: zero length
+             span(BC_SETTLE, 0, 2, 0, 25, 25.4),      # two decodes, 0.4 ms
+             span(BC_SETTLE, 0, 1, 0, 45, 45.2),      # one, 0.2 ms
+             span(BC_SETTLE, 0, 1, 2, 50, 58)]        # one that ran the bound out: the run ends here
+with tempfile.TemporaryDirectory() as tmp:
+    rc, out, err = run(tmp, trace(setlines), "--json")
+    s = json.loads(out)["bc_settle"]
+    check(rc == 0 and s["commits"] == 4 and s["waited"] == 3 and s["failed"] == 0 and s["timed_out"] == 1,
+          "bc settle: commits, those with a decode in flight, and the one that timed out")
+    check(abs(s["total_ms"] - 8.6) < 1e-6 and abs(s["mean_ms"] - 2.15) < 1e-6 and abs(s["wait_ms"]["max"] - 8.0) < 1e-6 and
+          abs(s["ms_per_flip"] - 8.6 / 4) < 1e-9, "bc settle: total, mean, max and ms per flip")
+    check("bc settle" in json.loads(out)["all"]["rsx"], "bc settle: the per-frame RSX rows carry it")
+    rc, out, err = run(tmp, trace(setlines))
+    check(rc == 0 and "BC settle (" in out and "4 commit(s), 3 with a decode in flight" in out and
+          "ENDED THE RUN: 0 with a failed decode, 1 past the bound" in out, "bc settle: the text report has the section")
+    rc, out, err = run(tmp, trace(setlines[:4]), "--json")
+    check(rc == 0 and "bc_settle" not in json.loads(out) and "bc settle" not in json.loads(out)["all"]["rsx"],
+          "bc settle: a trace without kind 35 reports nothing about it")
+
 print("ftrace_report: %s" % ("ok" if not failures else "%d failed" % failures))
 sys.exit(1 if failures else 0)
