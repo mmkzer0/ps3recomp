@@ -28,5 +28,6 @@ with tempfile.TemporaryDirectory(prefix='ppu-thread-join-detach-') as tmp:
                     str(root / 'tests/test_ppu_thread_join_detach.c'),
                     str(root / 'runtime/syscalls/lv2_enosys_bitmap.c'),
                     str(root / 'runtime/diag/ps3_log.c'),
+                    str(root / 'runtime/diag/host_exit.c'),
                     *linker, '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True, timeout=120, stderr=subprocess.DEVNULL if os.environ.get('CI') else None)

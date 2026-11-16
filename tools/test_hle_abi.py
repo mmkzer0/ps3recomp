@@ -17,7 +17,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from check_ppu_scaffold import loader_support_sources  # noqa: E402
+from check_ppu_scaffold import host_exit_object, loader_support_sources  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -42,7 +42,7 @@ def main():
                         '-Wall', '-Wextra', *includes,
                         str(ROOT / 'runtime/ppu/tests/test_hle.cpp'),
                         str(ROOT / 'runtime/ppu/ppu_hle.cpp'),
-                        *loader_support_sources(), str(sheap_o),
+                        *loader_support_sources(), host_exit_object(tmp), str(sheap_o),
                         '-pthread', '-o', str(binary)], check=True, timeout=300)
 
         p = subprocess.run([str(binary)], capture_output=True, text=True, timeout=60)

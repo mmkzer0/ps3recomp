@@ -30,6 +30,9 @@ def build(tree, bench, out, tmp):
     has_log = (t / 'runtime/diag/ps3_log.c').exists()
     if has_log:
         srcs.append(t / 'runtime/diag/ps3_log.c')
+    # ps3_log.c registers its quick-exit handler through host_exit.c; a tree from before that has neither need.
+    if (t / 'runtime/diag/host_exit.c').exists():
+        srcs.append(t / 'runtime/diag/host_exit.c')
     for extra in ('host_clock.c', 'host_wait.c'):
         if (t / 'runtime/platform' / extra).exists():
             srcs.append(t / 'runtime/platform' / extra)

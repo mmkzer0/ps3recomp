@@ -20,5 +20,6 @@ with tempfile.TemporaryDirectory(prefix='ppu-thread-ids-') as tmp:
                     '-ffunction-sections', '-fdata-sections',
                     '-I' + str(root / 'include'), '-I' + str(root / 'runtime'), '-I' + str(root / 'runtime/syscalls'),
                     str(root / 'tests/test_ppu_thread_ids.c'), str(root / 'runtime/diag/ps3_log.c'),
+                    str(root / 'runtime/diag/host_exit.c'),
                     *linker, '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True, timeout=120)

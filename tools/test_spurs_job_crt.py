@@ -89,7 +89,7 @@ def build(tmp):
     sources = ["spu_channels.c", "spu_interp.c", "spu_coherency.c", "spu_lockstep.c",
                "spu_drain.c", "spu_vm_pagemap.c", "spurs_job.c"]
     c_sources = [spu / "tests/test_spurs_job_crt_main.c", *[spu / s for s in sources],
-                 ROOT / "runtime/diag/ps3_log.c",
+                 ROOT / "runtime/diag/ps3_log.c", ROOT / "runtime/diag/host_exit.c",
                  ROOT / "runtime/memory/reservation.c",
                  ROOT / "runtime/memory/label_window.c",
                  ROOT / "runtime/platform/win32_compat.c", ROOT / "runtime/platform/host_clock.c", ROOT / "runtime/platform/host_wait.c"]

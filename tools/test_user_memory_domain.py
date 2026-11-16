@@ -13,7 +13,7 @@ def main():
   cc=os.environ.get('CC','cc'); cxx=os.environ.get('CXX','c++')
   objs=[]
   for i,src in enumerate([root/'tests/test_user_memory_domain.c',root/'runtime/syscalls/sys_memory.c',
-                          root/'runtime/diag/ps3_log.c']):
+                          root/'runtime/diag/ps3_log.c',root/'runtime/diag/host_exit.c']):
    obj=tmp/f'c{i}.o'; objs.append(str(obj))
    subprocess.run([cc,'-std=gnu17','-O1','-UNDEBUG','-I'+str(root/'include'),'-c',str(src),'-o',str(obj)],check=True,timeout=30)
   # sys_memory.c's migrated diagnostics call ps3_log_*; config.cpp completes it, and the

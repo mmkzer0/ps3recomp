@@ -30,6 +30,7 @@ with tempfile.TemporaryDirectory(prefix='gcm-class-routing-') as tmp:
                     str(video / 'rsx_vp_decompiler.c'),
                     str(video / 'rsx_fp_decompiler.c'),
                     str(root / 'runtime/memory/label_window.c'),
+                    str(root / 'runtime/diag/host_exit.c'),
                     str(video / 'gcm_default_state.c'), *linker,
                     '-o', str(binary)], check=True)
     # The methods the legacy state machine takes, from the real rsx_commands.c (the same probe that bounds
@@ -38,7 +39,8 @@ with tempfile.TemporaryDirectory(prefix='gcm-class-routing-') as tmp:
     subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG',
                     '-I' + str(root / 'include'), '-I' + str(video),
                     str(video / 'tests/test_rsx_legacy_effect_methods.c'),
-                    str(video / 'rsx_commands.c'), *([] if sys.platform == 'darwin' else ['-lm']),
+                    str(video / 'rsx_commands.c'), str(root / 'runtime/diag/host_exit.c'),
+                    *([] if sys.platform == 'darwin' else ['-lm']),
                     '-o', str(probe)], check=True)
     listing = subprocess.run([str(probe), '--handled'], timeout=60, capture_output=True, text=True)
     handled = Path(tmp) / 'legacy_handled.txt'

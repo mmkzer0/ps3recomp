@@ -47,6 +47,7 @@ def main():
                          (spu / "spu_vm_pagemap.c", "pagemap.o"),
                          (ROOT / "runtime/memory/label_window.c", "label_window.o"),
                          (ROOT / "runtime/diag/ps3_log.c", "ps3_log.o"),
+                         (ROOT / "runtime/diag/host_exit.c", "host_exit.o"),
                          (ROOT / "runtime/platform/host_clock.c", "host_clock.o"),
                          (ROOT / "runtime/platform/host_wait.c", "host_wait.o"),
                          (ROOT / "runtime/platform/win32_compat.c", "compat.o")):

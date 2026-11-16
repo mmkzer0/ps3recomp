@@ -32,6 +32,7 @@
 #endif
 #include "ps3emu/ps3_log.h"
 #include "ps3emu/config.h"
+#include "ps3emu/host_exit.h"
 #include "ps3emu/stop.h"
 
 #include <errno.h>
@@ -777,7 +778,7 @@ void ps3_log_configure(void)
     ps3_stop_set_mirror(ps3_log_quiesce, ps3_log_mirror);
     /* ps3_host_exit ends every guest exit with quick_exit, which runs these and not the atexit ones. */
     atexit(at_exit);
-    at_quick_exit(at_exit);
+    ps3_host_at_quick_exit(at_exit);
 }
 
 /* A spent site is the common case on a hot path (the old PS3_LOG_FIRST was a thread-local increment there):

@@ -139,9 +139,19 @@ LOADER_SUPPORT_C_SOURCES = [
 ]
 
 
+def host_exit_object(tmp) -> str:
+    """runtime/diag/host_exit.c as an object. ps3_log.c and the header-only ps3_ftrace.h / host_stack_report.h
+    register their quick-exit handlers through it (ps3_host_at_quick_exit). It is C only (stdatomic, weak
+    imports), so it cannot ride in the fixtures' C++ command line the way ps3_log.c does."""
+    obj = os.path.join(str(tmp), "host_exit.c.o")
+    subprocess.run([os.environ.get("CC", "cc"), "-std=gnu17", "-O1", "-I", os.path.join(ROOT, "include"), "-c",
+                    os.path.join(ROOT, "runtime/diag/host_exit.c"), "-o", obj], check=True)
+    return obj
+
+
 def loader_support_objects(tmp) -> list:
     cc = os.environ.get("CC", "cc")
-    objects = []
+    objects = [host_exit_object(tmp)]
     for rel in LOADER_SUPPORT_C_SOURCES:
         obj = os.path.join(str(tmp), os.path.basename(rel) + ".o")
         subprocess.run([cc, "-std=gnu17", "-O1", "-c", os.path.join(ROOT, rel), "-o", obj],

@@ -21,6 +21,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "ps3emu/host_exit.h"
 #include "ps3emu/host_stack.h"
 #include "ps3emu/ps3_env_once.h"
 
@@ -98,7 +99,7 @@ static inline int ps3_hs_begin(ps3_hs_reporter* r, uint64_t id, size_t reserved,
     if (!r->registered) {
         r->registered = 1;
         atexit(summary);
-        at_quick_exit(summary);
+        ps3_host_at_quick_exit(summary);
     }
     for (int i = 0; i < PS3_HS_LIVE; i++)
         if (!r->live[i].lo) {

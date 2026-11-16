@@ -19,6 +19,6 @@ with tempfile.TemporaryDirectory(prefix='spurs-coordinator-kick-') as tmp:
         '-I'+str(root/'include'),'-I'+str(root/'runtime/spu'),'-I'+str(root/'runtime/platform'),
         str(root/'tests/test_spurs_coordinator_kick.c'),
         *[str(root/'runtime/spu'/f'{u}.c') for u in units],
-        str(root/'runtime/diag/ps3_log.c'),
+        str(root/'runtime/diag/ps3_log.c'),str(root/'runtime/diag/host_exit.c'),
         str(root/'runtime/platform/win32_compat.c'),str(root/'runtime/platform/host_clock.c'),str(root/'runtime/platform/host_wait.c'),'-pthread','-lm','-o',str(out)],check=True)
     subprocess.run([str(out)],check=True,timeout=15)

@@ -50,11 +50,13 @@ with tempfile.TemporaryDirectory(prefix='spu-taskset-elf-flags-') as tmp:
                     '-Wall', '-Wextra', '-I' + str(root / 'include'), '-c', str(c), '-o', str(tmp / 'test.o')], check=True)
     subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG', '-I' + str(root / 'include'),
                     '-c', str(root / 'runtime/diag/ps3_log.c'), '-o', str(tmp / 'ps3_log.o')], check=True)
+    subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG', '-I' + str(root / 'include'),
+                    '-c', str(root / 'runtime/diag/host_exit.c'), '-o', str(tmp / 'host_exit.o')], check=True)
     subprocess.run([os.environ.get('CXX', 'c++'), '-std=c++20', '-O1', '-I' + str(root / 'include'),
                     '-c', str(root / 'runtime/diag/stop.cpp'), '-o', str(tmp / 'stop.o')], check=True)
     subprocess.run([os.environ.get('CXX', 'c++'), '-std=c++20', '-O1', '-I' + str(root / 'include'),
                     '-c', str(root / 'runtime/config/config.cpp'), '-o', str(tmp / 'config.o')], check=True)
-    subprocess.run([os.environ.get('CXX', 'c++'), str(tmp / 'test.o'), str(tmp / 'ps3_log.o'),
+    subprocess.run([os.environ.get('CXX', 'c++'), str(tmp / 'test.o'), str(tmp / 'ps3_log.o'), str(tmp / 'host_exit.o'),
                     str(tmp / 'stop.o'), str(tmp / 'config.o'), '-pthread', '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True, timeout=5, env=env, cwd=tmp)
     for mode, reason, elf in (('bad-elf', 'not-an-spu-elf', '0x00030000'), ('null-elf', 'null-elf', '0x00000000'),

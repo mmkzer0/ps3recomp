@@ -31,6 +31,7 @@ with tempfile.TemporaryDirectory(prefix='gcm-park-modes-') as tmp:
                     '-I' + str(root / 'include'), '-I' + str(root / 'libs/video'),
                     str(root / 'libs/video/tests/test_gcm_park_modes.c'),
                     str(root / 'runtime/memory/label_window.c'),
+                    str(root / 'runtime/diag/host_exit.c'),
                     str(root / 'libs/video/gcm_default_state.c'), *linker,
                     '-o', str(binary)], check=True)
 

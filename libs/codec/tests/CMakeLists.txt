@@ -7,7 +7,7 @@ endif()
 include("${CMAKE_CURRENT_SOURCE_DIR}/adec_tests.cmake")
 
 # The callback-only decoder, as every build without FFmpeg has it.
-add_executable(test_vdec_stub test_vdec_decode.c)
+add_executable(test_vdec_stub test_vdec_decode.c "${PROJECT_SOURCE_DIR}/runtime/diag/host_exit.c")
 target_include_directories(test_vdec_stub PRIVATE "${PROJECT_SOURCE_DIR}/include")
 target_link_libraries(test_vdec_stub PRIVATE ${VDEC_TEST_LIBS})
 add_test(NAME vdec_stub COMMAND test_vdec_stub stub)
@@ -22,7 +22,7 @@ if(NOT PS3RECOMP_FFMPEG_RUNTIME)
     return()
 endif()
 
-add_executable(test_vdec_ffmpeg test_vdec_decode.c)
+add_executable(test_vdec_ffmpeg test_vdec_decode.c "${PROJECT_SOURCE_DIR}/runtime/diag/host_exit.c")
 target_include_directories(test_vdec_ffmpeg PRIVATE
     "${PROJECT_SOURCE_DIR}/include" "${PS3RECOMP_FFMPEG_INCLUDE_DIR}")
 target_compile_definitions(test_vdec_ffmpeg PRIVATE PS3RECOMP_FFMPEG_RUNTIME)

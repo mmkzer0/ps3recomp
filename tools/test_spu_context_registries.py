@@ -51,7 +51,8 @@ with tempfile.TemporaryDirectory(prefix='spu-context-registry-') as tmp:
     for name in [v for v in variants if not sys.argv[1:] or v in sys.argv[1:]]:
         tag = name
         binary = tmp / tag
-        sources = [str(spu / 'tests' / (name + '.c')), str(root / 'runtime/diag/ps3_log.c')]
+        sources = [str(spu / 'tests' / (name + '.c')), str(root / 'runtime/diag/ps3_log.c'),
+                   str(root / 'runtime/diag/host_exit.c')]
         link_flags = []
         if name != 'test_spu_coherency':
             extra = [str(spu / c) for c in common if not

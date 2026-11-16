@@ -29,6 +29,7 @@ with tempfile.TemporaryDirectory(prefix='gcm-label-store-') as tmp:
                     '-I' + str(root / 'include'), '-I' + str(root / 'libs/video'),
                     str(root / 'libs/video/tests/test_gcm_label_store.c'),
                     str(root / 'runtime/memory/label_window.c'),
+                    str(root / 'runtime/diag/host_exit.c'),
                     str(root / 'libs/video/gcm_default_state.c'), *linker,
                     '-o', str(binary)], check=True)
     for mode, timeout_ms, want in (('control', 2000, 0), ('ordered', 2000, 0), ('no-walker', 400, 70),

@@ -61,6 +61,7 @@ typedef pthread_mutex_t trace_lock;
 #  define trace_lock_release(l)    pthread_mutex_unlock(l)
 #endif
 
+#include "ps3emu/host_exit.h"
 #include "ps3emu/stop.h"
 
 /* ---------------------------------------------------------------------------
@@ -701,7 +702,7 @@ PadTrace* pad_trace_global(const PadTraceOptions* o)
         g_opened = 1;
         if (g_trace) {
             atexit(exit_hook);
-            at_quick_exit(exit_hook);
+            ps3_host_at_quick_exit(exit_hook);
         }
     }
     t = g_trace;

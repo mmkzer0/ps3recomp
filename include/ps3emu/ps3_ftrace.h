@@ -34,6 +34,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "ps3emu/host_exit.h"
 #ifdef _WIN32
 #  include <windows.h>
 #else
@@ -531,7 +532,7 @@ static inline int ps3_ft_init(void)
                      * exit() for a harness that returned from main. The dump only
                      * runs on the one that happens. */
                     atexit(ps3_ft_dump_at_exit);
-                    at_quick_exit(ps3_ft_dump_at_exit);
+                    ps3_host_at_quick_exit(ps3_ft_dump_at_exit);
                     fprintf(stderr, "[ftrace] recording %.1f s from t=%.1f s into %s\n", secs, start, s->path);
                     on = 2;
                 }
