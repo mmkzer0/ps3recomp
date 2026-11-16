@@ -65,8 +65,22 @@ def run_lifter(image, bounds, overrides, out, extra_args=()):
 
 def table_dispatch_fixture(mode="mask", overlap=False):
     from gen_test_raw_job import (
-        A, ANDI, BI, BRNZ, BRSL, ILA, LQX, NOP, ORI, ROTQBY, SHLI,
-        _ri10, _ri16, _ri18, _ri7, _rr,
+        ANDI,
+        BI,
+        BRNZ,
+        BRSL,
+        ILA,
+        LQX,
+        NOP,
+        ORI,
+        ROTQBY,
+        SHLI,
+        A,
+        _ri7,
+        _ri10,
+        _ri16,
+        _ri18,
+        _rr,
     )
 
     words = [_rr(NOP)] * (0xD4 // 4)
@@ -637,7 +651,7 @@ class NativeOverrides(unittest.TestCase):
                     self.assertNotIn(site, proof.unresolved_branches)
 
     def test_invalid_compare_guards_keep_foreign_table_targets_unresolved(self):
-        from gen_test_raw_job import A, BI, BRNZ, ILA, LQX, ROTQBY, SHLI, _ri7
+        from gen_test_raw_job import BI, BRNZ, ILA, LQX, ROTQBY, SHLI, A, _ri7
         from spu_disasm import disassemble_spu
         from spu_lifter import compute_bi_r0_jumps, override_unit_admission
 
@@ -822,9 +836,9 @@ int main(void) {
                 self.assertIn("snapshot:lr=beef:pc=1350:ie=0", executed.stderr)
 
     def test_mask_after_scaling_bounds_table_byte_offsets(self):
+        from gen_test_raw_job import ANDI, SHLI, _ri7
         from spu_disasm import disassemble_spu
         from spu_lifter import compute_bi_r0_jumps
-        from gen_test_raw_job import ANDI, SHLI, _ri7
 
         image, bounds, site = table_dispatch_fixture("unbounded")
         changed = bytearray(image)

@@ -671,9 +671,8 @@ def _direct_flow_reaches(insns, start, goal):
             continue
         mn = ins.mnemonic
         target = _direct_branch_target(ins)
-        if mn in _DIRECT_CALLS or mn in ('bisl', 'bisled'):
-            if not _pc_getter(ins):
-                return True
+        if (mn in _DIRECT_CALLS or mn in ('bisl', 'bisled')) and not _pc_getter(ins):
+            return True
         if mn in _UNCONDITIONAL_BRANCHES:
             if target is not None:
                 pending.append(target)
