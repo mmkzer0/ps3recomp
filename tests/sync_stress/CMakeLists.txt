@@ -121,7 +121,13 @@ add_executable(test_sync_semantics
     "${RUNTIME_SYNC_DIR}/sys_mutex.c"
     "${RUNTIME_SYNC_DIR}/sys_cond.c"
     "${RUNTIME_SYNC_DIR}/sys_semaphore.c"
-    "${RUNTIME_SYNC_DIR}/sys_rwlock.c")
+    "${RUNTIME_SYNC_DIR}/sys_rwlock.c"
+    # The migrated diagnostics of sys_mutex/sys_cond/sys_semaphore call ps3_log_*, whose
+    # references to the typed configuration and the stop runtime come from config.cpp and stop.cpp.
+    "${PS3RECOMP_ROOT}/runtime/diag/ps3_log.c"
+    "${PS3RECOMP_ROOT}/runtime/config/config.cpp"
+    "${PS3RECOMP_ROOT}/runtime/diag/stop.cpp")
+set_target_properties(test_sync_semantics PROPERTIES LINKER_LANGUAGE CXX)
 target_compile_definitions(test_sync_semantics PRIVATE PS3_SYNC_TEST_HOOKS)
 if(NOT WIN32)
     target_sources(test_sync_semantics PRIVATE
@@ -167,7 +173,12 @@ set_tests_properties(cellsync_mutex PROPERTIES LABELS "runtime;sync" TIMEOUT 20)
 add_executable(test_mutex_destroy
     test_mutex_destroy.c test_shims.c
     "${RUNTIME_SYNC_DIR}/sys_mutex.c"
-    "${RUNTIME_SYNC_DIR}/sys_cond.c")
+    "${RUNTIME_SYNC_DIR}/sys_cond.c"
+    # sys_mutex/sys_cond report through ps3_log; config.cpp and stop.cpp complete it.
+    "${PS3RECOMP_ROOT}/runtime/diag/ps3_log.c"
+    "${PS3RECOMP_ROOT}/runtime/config/config.cpp"
+    "${PS3RECOMP_ROOT}/runtime/diag/stop.cpp")
+set_target_properties(test_mutex_destroy PROPERTIES LINKER_LANGUAGE CXX)
 if(NOT WIN32)
     target_sources(test_mutex_destroy PRIVATE
         "${PS3RECOMP_TREE_ROOT}/runtime/platform/win32_compat.c"
@@ -191,7 +202,12 @@ if(WIN32)
     add_executable(test_cond_semantics
         test_cond_semantics.c test_shims.c
         "${RUNTIME_SYNC_DIR}/sys_mutex.c"
-        "${RUNTIME_SYNC_DIR}/sys_cond.c")
+        "${RUNTIME_SYNC_DIR}/sys_cond.c"
+        # sys_mutex/sys_cond report through ps3_log; config.cpp and stop.cpp complete it.
+        "${PS3RECOMP_ROOT}/runtime/diag/ps3_log.c"
+        "${PS3RECOMP_ROOT}/runtime/config/config.cpp"
+        "${PS3RECOMP_ROOT}/runtime/diag/stop.cpp")
+    set_target_properties(test_cond_semantics PROPERTIES LINKER_LANGUAGE CXX)
     target_include_directories(test_cond_semantics PRIVATE
         "${PS3RECOMP_TREE_ROOT}" "${PS3RECOMP_TREE_ROOT}/include")
     target_compile_definitions(test_cond_semantics PRIVATE _CRT_SECURE_NO_WARNINGS)

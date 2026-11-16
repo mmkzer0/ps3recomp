@@ -30,6 +30,11 @@ _Noreturn void ps3_stop(ps3_stop_kind kind, const char* what, const char* remedy
     abort();
 }
 
+/* The run log's mirror hook: ps3_log_configure installs it. These fixtures link the log for its
+ * emitters and never configure a log file. */
+void ps3_stop_set_mirror(ps3_stop_quiesce_fn quiesce, ps3_stop_mirror_fn mirror)
+{ (void)quiesce; (void)mirror; }
+
 static int g_fails;
 #define EXPECT_EQ(got, want) do { \
     long long g_ = (long long)(got), w_ = (long long)(want); \

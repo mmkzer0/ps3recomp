@@ -70,6 +70,11 @@ _Noreturn void ps3_stop(ps3_stop_kind kind, const char* what, const char* remedy
     }
     longjmp(g_stop_jmp, 1);
 }
+
+/* The run log's mirror hook: ps3_log_configure installs it. These fixtures link the log for its
+ * emitters and never configure a log file. */
+void ps3_stop_set_mirror(ps3_stop_quiesce_fn quiesce, ps3_stop_mirror_fn mirror)
+{ (void)quiesce; (void)mirror; }
 const char* ps3_stop_kind_id(ps3_stop_kind kind)
 {
     return kind == PS3_STOP_HOST_THREAD_STACK ? "host-thread-stack" : "other";

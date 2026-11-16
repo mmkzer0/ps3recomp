@@ -13,6 +13,7 @@
 
 #include "../ppu/ppu_context.h"
 #include "../../include/ps3emu/error_codes.h"
+#include "../../include/ps3emu/ps3_log.h"
 
 #include <stdint.h>
 #include <stddef.h>
@@ -280,7 +281,7 @@ extern lv2_syscall_table g_lv2_syscalls;
 static inline int64_t lv2_syscall_unimplemented(ppu_context* ctx)
 {
     uint32_t num = (uint32_t)ctx->gpr[11];
-    fprintf(stderr, "[LV2] unimplemented syscall %u (0x%X)\n", num, num);
+    PS3_LOG(PS3_LOG_INFO, "LV2", "unimplemented syscall %u (0x%X)\n", num, num);
     return (int64_t)(int32_t)CELL_ENOSYS;
 }
 

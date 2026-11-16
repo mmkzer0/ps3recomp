@@ -33,6 +33,11 @@ PS3_NORETURN void ps3_stop(ps3_stop_kind kind, const char* what, const char* rem
     abort();
 }
 
+/* The run log's mirror hook: ps3_log_configure installs it. These fixtures link the log for its
+ * emitters and never configure a log file. */
+void ps3_stop_set_mirror(ps3_stop_quiesce_fn quiesce, ps3_stop_mirror_fn mirror)
+{ (void)quiesce; (void)mirror; }
+
 static uint64_t g_hold_id;             /* the thread with this id waits in its entry until it is cleared */
 static void guest_entry(ppu_context* ctx)
 {

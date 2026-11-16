@@ -10,6 +10,7 @@ def main():
  src=(root/'runtime/ppu/ppu_loader.cpp').read_text()
  body=src[src.index('    case 330: {'):src.index('    case 403: {',src.index('    case 330: {'))]
  pre='''#include "sys_memory.h"
+#include "ps3emu/stop.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -17,6 +18,9 @@ extern "C" {
 uint8_t* vm_base; uint32_t ppu_vm_size; uint32_t ppu_hle_inject_base=0x20000000u;
 /* sys_memory.c names this stop for an out-pointer outside guest memory; no case here passes one. */
 [[noreturn]] void ps3_stop_guest_range(const char*,const char*,uint64_t,uint64_t,uint64_t){std::abort();}
+/* config.cpp and ps3_log.c reference the stop runtime; no case here raises one. */
+[[noreturn]] void ps3_stop(ps3_stop_kind,const char*,const char*,const ps3_stop_field*,size_t,const ps3_stop_site*){std::abort();}
+void ps3_stop_set_mirror(ps3_stop_quiesce_fn,ps3_stop_mirror_fn){}
 }
 uint32_t vm_read32(uint64_t a){auto p=vm_base+a;return (uint32_t(p[0])<<24)|(uint32_t(p[1])<<16)|(uint32_t(p[2])<<8)|p[3];}
 void vm_write32(uint64_t a,uint32_t x){auto p=vm_base+a;p[0]=x>>24;p[1]=x>>16;p[2]=x>>8;p[3]=x;}
@@ -36,8 +40,11 @@ vm_shutdown();std::puts("PASS loader330/337 failure recovery, reservation bounds
 '''
  with tempfile.TemporaryDirectory(prefix='ps3-loader-memory-') as tmp:
   tmp=Path(tmp);(tmp/'fixture.cpp').write_text(pre+body+post)
-  subprocess.run([os.environ.get('CC','cc'),'-std=gnu17','-O1','-UNDEBUG','-c',str(root/'runtime/syscalls/sys_memory.c'),'-o',str(tmp/'memory.o')],check=True,timeout=30)
-  subprocess.run([os.environ.get('CXX','c++'),'-std=c++17','-O1','-UNDEBUG','-I'+str(root/'runtime/syscalls'),str(tmp/'fixture.cpp'),str(tmp/'memory.o'),'-pthread','-o',str(tmp/'fixture')],check=True,timeout=30)
+  cc=os.environ.get('CC','cc'); cxx=os.environ.get('CXX','c++')
+  subprocess.run([cc,'-std=gnu17','-O1','-UNDEBUG','-c',str(root/'runtime/syscalls/sys_memory.c'),'-o',str(tmp/'memory.o')],check=True,timeout=30)
+  # sys_memory.c's migrated diagnostics call ps3_log_*; config.cpp and stop.cpp complete it.
+  subprocess.run([cc,'-std=gnu17','-O1','-UNDEBUG','-I'+str(root/'include'),'-c',str(root/'runtime/diag/ps3_log.c'),'-o',str(tmp/'log.o')],check=True,timeout=30)
+  subprocess.run([cxx,'-std=c++17','-O1','-UNDEBUG','-I'+str(root/'runtime/syscalls'),'-I'+str(root/'include'),str(tmp/'fixture.cpp'),str(tmp/'memory.o'),str(tmp/'log.o'),str(root/'runtime/config/config.cpp'),'-pthread','-o',str(tmp/'fixture')],check=True,timeout=120)
   subprocess.run([str(tmp/'fixture')],check=True,timeout=10)
  return 0
 if __name__=='__main__':raise SystemExit(main())

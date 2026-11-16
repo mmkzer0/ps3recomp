@@ -6,6 +6,7 @@
 #ifndef _WIN32
 #include <errno.h>                   /* ETIMEDOUT */
 #include "../platform/host_wait.h"   /* the monotonic timed lock */
+#include "../../include/ps3emu/ps3_log.h"
 #endif
 #include "sys_timer.h"   /* lv2_usec_deadline: sub-ms timed waits */
 #include "../memory/vm.h"
@@ -176,7 +177,7 @@ int64_t sys_mutex_destroy(ppu_context* ctx)
     if (m->lock_count > 0 || __atomic_load_n(&m->waiters, __ATOMIC_SEQ_CST) > 0) {
         static int n = 0;
         if (n++ < 16)
-            fprintf(stderr, "[mutex] destroy of mutex %u '%.8s' refused: owner tid=%llu "
+            PS3_LOG(PS3_LOG_INFO, "mutex", "destroy of mutex %u '%.8s' refused: owner tid=%llu "
                     "count=%d waiters=%d (EBUSY)\n", mutex_id, m->name,
                     (unsigned long long)m->owner_tid, m->lock_count,
                     __atomic_load_n(&m->waiters, __ATOMIC_SEQ_CST));
@@ -220,7 +221,7 @@ static void* mutex_watch_reporter(void* arg)
             long waited = (long)(now.tv_sec - s_mw[i].t0.tv_sec);
             if (waited < 5) continue;
             const sys_mutex_info* m = &g_sys_mutexes[s_mw[i].id - 1];
-            fprintf(stderr, "[mutex] tid=%llu blocked %lds on mutex %u '%.8s' lr=0x%08X; "
+            PS3_LOG(PS3_LOG_INFO, "mutex", "tid=%llu blocked %lds on mutex %u '%.8s' lr=0x%08X; "
                     "owner tid=%llu count=%d\n",
                     (unsigned long long)s_mw[i].tid, waited, s_mw[i].id, m->name,
                     s_mw[i].lr, (unsigned long long)m->owner_tid, m->lock_count);
@@ -325,7 +326,7 @@ int64_t sys_mutex_lock(ppu_context* ctx)
                 return (int64_t)(int32_t)CELL_EFAULT;
             }
             waited += 5;
-            fprintf(stderr, "[mutex] tid=%llu waiting %us on mutex %u '%.8s' "
+            PS3_LOG(PS3_LOG_INFO, "mutex", "tid=%llu waiting %us on mutex %u '%.8s' "
                     "owner tid=%llu count=%u lr=0x%08X\n",
                     (unsigned long long)caller_tid, waited, mutex_id, m->name,
                     (unsigned long long)m->owner_tid, (unsigned)m->lock_count,
