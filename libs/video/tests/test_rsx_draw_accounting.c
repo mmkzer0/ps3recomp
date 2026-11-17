@@ -200,8 +200,9 @@ static void cap_frame(const rsx_cap_frame* f)
 }
 
 /* A flip is one present, at its head word, and it names that flip. The queue word presents nothing, and
- * a host present while the flip is held shows the same image and names the same flip (#78, corrected by
- * #101: the scanout changes at the head, not at the queue word). */
+ * a host present while the flip is held would show the same image and name the same flip (#78,
+ * corrected by #101: the scanout changes at the head, not at the queue word) -- so #144 skips it: the
+ * head already showed that frame, and the identity stays the head's. */
 static void test_present_names_shown_flip(void)
 {
     printf("-- a present names the flip whose scanout it shows\n");
@@ -215,7 +216,6 @@ static void test_present_names_shown_flip(void)
     rsx_draw_engine_set_capture_sink(&sink);
 
     rsx_frame_identity h, held;
-    u32 seq = 0;
     for (u32 k = 0; k < 3; k++) {
         const int before = stub.n_present;
         sm(M_GCM_QUEUE_FLIP, bufs[k]);
@@ -225,27 +225,28 @@ static void test_present_names_shown_flip(void)
               stub.n_present - before);
         CHECK(rsx_draw_engine_frame_identity(&h) == 1, "flip %u: the head present has an identity", k);
         rsx_draw_engine_present();
-        CHECK(rsx_draw_engine_frame_identity(&held) == 1, "flip %u: a held present has an identity", k);
+        CHECK(stub.n_present == before + 1, "flip %u: the host present of the shown flip is skipped "
+              "(#144, one present per flip)", k);
+        CHECK(rsx_draw_engine_frame_identity(&held) == 1, "flip %u: the identity stays published", k);
 
         CHECK(h.flip_id == k && held.flip_id == k,
-              "flip %u: the head and a held present both name it (%u/%u)", k, h.flip_id, held.flip_id);
+              "flip %u: the head and the held identity both name it (%u/%u)", k, h.flip_id, held.flip_id);
         CHECK(h.guest_frame == k && held.guest_frame == k,
               "flip %u: and the same guest frame (%u/%u)", k, h.guest_frame, held.guest_frame);
         CHECK(h.display_buffer == bufs[k] && held.display_buffer == bufs[k],
               "flip %u: and the same buffer %u (%u/%u)", k, bufs[k], h.display_buffer, held.display_buffer);
-        /* Two presents per flip: the head, and the held one the host adds. */
-        CHECK(h.present_seq == seq && held.present_seq == seq + 1,
-              "flip %u: presents %u and %u keep their own ordinals (%u/%u)", k, seq, seq + 1,
-              h.present_seq, held.present_seq);
-        seq += 2;
+        /* One present per flip: the head's present is the flip's only ordinal. */
+        CHECK(h.present_seq == k && held.present_seq == k,
+              "flip %u: the one present keeps the flip's ordinal (%u/%u)", k, h.present_seq,
+              held.present_seq);
     }
 
-    /* The capture's frame is the flip head's present: one per flip, at the head's present_seq. The head
-     * used to be the second of three presents (seq 3k+1); it is the first of two now (seq 2k). */
+    /* The capture's frame is the flip head's present: one per flip, at the head's present_seq, which is
+     * now the flip's own ordinal (one present per flip, #144). */
     CHECK(g_n_cap == 3, "the capture saw one frame per flip (%d)", g_n_cap);
     for (int k = 0; k < 3 && k < g_n_cap; k++)
         CHECK(g_cap[k].flip == (u32)k && g_cap[k].guest == (u32)k &&
-              g_cap[k].buffer == bufs[k] && g_cap[k].seq == (u32)(2 * k),
+              g_cap[k].buffer == bufs[k] && g_cap[k].seq == (u32)k,
               "capture frame %d: flip %u guest %u buffer %u present_seq %u", k,
               g_cap[k].flip, g_cap[k].guest, g_cap[k].buffer, g_cap[k].seq);
 

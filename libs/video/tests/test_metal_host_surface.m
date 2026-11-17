@@ -28,7 +28,8 @@ void rsx_draw_engine_set_default(int on) { (void)on; }
 int  rsx_draw_engine_enabled(void) { return 1; }
 int  rsx_draw_engine_init(u32 w, u32 h) { return eng_init(NULL, w, h); }
 void rsx_draw_engine_shutdown(void) { eng_shutdown(NULL); }
-void rsx_draw_engine_present(void) {}
+int  rsx_draw_engine_present(void) { return 1; }   /* the stub engine always presents */
+void rsx_draw_engine_require_represent(void) {}
 u32  rsx_draw_engine_readback_center(void) { return 0; }
 u32  rsx_draw_engine_guest_draws(void) { return 0; }
 int  cellGcmOffsetIsDisplay(u32 off) { (void)off; return 1; }

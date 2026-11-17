@@ -2212,6 +2212,9 @@ static void vk_swapchain_lost(void)
     const int r = vk_create_swapchain();
     s_vk_resized = r > 0;     /* the surface is 0x0 before SDL reports the window minimized */
     if (r < 0) vk_window_drop("the swapchain could not be recreated");
+    /* A fresh swapchain has no picture on screen: the draw engine's next host present must re-blit it
+     * (#144) rather than skip it as a duplicate of the flip the head already showed. */
+    if (r == 0) rsx_draw_engine_require_represent();
 }
 
 /* Where the frame goes in the swapchain image: the largest rectangle of the frame's aspect ratio, centred. The rest
@@ -4749,10 +4752,14 @@ int rsx_vulkan_backend_pump_messages(void)
             if (SDL_SetWindowFullscreen(s_vk.window, full ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP) == 0)
                 SDL_ShowCursor(full ? SDL_ENABLE : SDL_DISABLE);
             s_vk_resized = 1;
+            /* The swapchain is recreated before the next acquire: the image on screen is stale, so the
+             * draw engine's next host present must re-blit it (#144) rather than skip it as a duplicate. */
+            rsx_draw_engine_require_represent();
         } else if (e.type == SDL_WINDOWEVENT &&
                    (e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED || e.window.event == SDL_WINDOWEVENT_RESTORED ||
                     e.window.event == SDL_WINDOWEVENT_MAXIMIZED)) {
             s_vk_resized = 1;
+            rsx_draw_engine_require_represent();   /* resize: the next host present must re-blit (#144) */
         }
     }
     return quit ? -1 : 0;
@@ -4768,7 +4775,7 @@ void rsx_vulkan_backend_present_begin(void)
 {
     if (!s_vk.device) return;
     s_vk.present_split = 1;
-    if (s_vk.eng_active) rsx_draw_engine_present();
+    if (s_vk.eng_active) (void)rsx_draw_engine_present();   /* 0 = skipped duplicate (#144); this backend has no present span */
     else                 vk_cb_present(&s_vk, 0);
     s_vk.present_split = 0;
 }

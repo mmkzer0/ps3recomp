@@ -2567,7 +2567,7 @@ if(UNIX)
     # 3a-3e, 3g). Driven through rsx_draw_engine_method() against a recording
     # stub backend: no GPU, no host API, no game content. Same source set the
     # CI workflows compile ad hoc.
-    foreach(engine_test test_rsx_draw_accounting test_rsx_draw_dump_names)
+    foreach(engine_test test_rsx_draw_accounting test_rsx_draw_dump_names test_rsx_present_once)
         add_executable(${engine_test}
             libs/video/tests/${engine_test}.c
             libs/video/rsx_draw_engine.c

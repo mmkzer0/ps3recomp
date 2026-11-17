@@ -373,17 +373,38 @@ void rsx_draw_engine_flush(void);
  * engine has rendered nothing at that buffer's address, presents nothing. With
  * no display buffer registered at all (a host that never described its scanout:
  * the harness, the boot smoke title) the only surface it can show is the
- * current render target. Never a fallback for a FIFO flip (see sink_flip). */
-void rsx_draw_engine_present(void);
+ * current render target. Never a fallback for a FIFO flip (see sink_flip).
+ *
+ * A title whose FIFO carries the flip head words has already had that frame
+ * presented at its head word, so this call is skipped unless a re-present is
+ * needed (#144, one present per guest flip): the skip never fires for a title
+ * that has not flipped through a head word (this call is its only present),
+ * for a flip the engine did not present itself (rsx_draw_engine_note_flip), or
+ * after the backend reported a resize, recreation, background return or missed
+ * present (rsx_draw_engine_require_represent). Returns 1 when the backend's
+ * present ran and 0 when the call was skipped (a #144 duplicate, or a pacing
+ * call with nothing rendered at the buffer's address): the backends use it to
+ * keep their timed present span on real presents. */
+int  rsx_draw_engine_present(void);
 /* A runner retiring a queued flip names the buffer explicitly. With display
  * buffers registered, a buffer that is unregistered or has no rendered surface
  * stops (rsx-driver-method, method 0); with none registered it is the current
- * target, as for rsx_draw_engine_present(). */
+ * target, as for rsx_draw_engine_present(). The same one-present-per-flip
+ * skip as rsx_draw_engine_present() applies. */
 void rsx_draw_engine_present_buffer(u32 buffer_id);
 /* A flip the engine never sees as a head word (a 0xFEAD driver word or the
  * SetFlip HLE, both handled by cellGcmSys): remember the buffer for the host's
- * next rsx_draw_engine_present() without presenting now. */
+ * next rsx_draw_engine_present() without presenting now. It also re-enables a
+ * host present the #144 skip would otherwise drop (the engine did not present
+ * that flip itself); the note cellGcmSys emits for a flip-head word the engine
+ * did present is recognised and changes nothing. */
 void rsx_draw_engine_note_flip(u32 buffer_id);
+/* A host event that can make the screen's picture stale without a new flip (a
+ * drawable or swapchain resize or recreation, returning from the iOS GPU gate,
+ * a present that missed its drawable or blit): bumps the re-present epoch so
+ * the host's next present is not skipped as a duplicate of the frame the flip
+ * head already showed (#144). The backends call it; titles do not. */
+void rsx_draw_engine_require_represent(void);
 /* Diagnostics for the backend's PS3_FTRACE drawable span, valid only inside
  * the backend's present callback on the presenting thread, else 0:
  * bits 0-1 entry path (1 queue present, 2 FIFO head, 3 host present),
@@ -454,8 +475,11 @@ u32 rsx_draw_engine_pipeline_failures(rsx_pipeline_failure* out, u32 max);
 /* The engine's present counter and the GCM's flip counter are not one
  * counter: a flip is one present, at its head word (0xE924 / 0xE920; the queue
  * word 0xE944 records the buffer and does not present), and the host's own
- * presents (rsx_draw_engine_present) add more, so the identity records both
- * numbers instead of deriving either from the other.
+ * presents (rsx_draw_engine_present: the only present of a title that does not
+ * flip through head words, and of every 0xFEAD / SetFlip-HLE flip) add more,
+ * so the identity records both numbers instead of deriving either from the
+ * other. A host present of a flip its head word already showed is skipped
+ * (#144), so a title whose FIFO carries the flip words presents once per flip.
  *
  *   flip_id        0-based ordinal of the most recent GCM flip head -- the
  *                  same ordinal cellGcmSys counts for GCM_DRV_EVENT_FLIP_HEAD,
