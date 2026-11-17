@@ -43,6 +43,13 @@ PS3_NORETURN void ps3_stop_guest_range(const char* func, const char* arg,
     fflush(stderr);
     _Exit(PS3_STOP_EXIT_CODE);
 }
+/* ps3_log.c references the stop runtime and the quick-exit table; this fixture configures no log and
+ * takes no stop beyond the guest-range one above. */
+void ps3_stop_set_mirror(ps3_stop_quiesce_fn, ps3_stop_mirror_fn) {}
+PS3_NORETURN void ps3_stop(ps3_stop_kind, const char*, const char*, const ps3_stop_field*,
+                           size_t, const ps3_stop_site*)
+{ _Exit(PS3_STOP_EXIT_CODE); }
+int ps3_host_at_quick_exit(void (*fn)(void)) { (void)fn; return 0; }
 }
 ps3_guest_caller_fn g_ps3_guest_caller = nullptr;
 const char* edat_resolve(const char* host_path, char* buf, size_t cap) { (void)buf; (void)cap; return host_path; }

@@ -38,6 +38,16 @@ HARNESS = r'''
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include "ps3emu/ps3_log.h"
+#include "ps3emu/stop.h"
+/* ps3_log.c (the extracted function's migrated [ppu] line) references the stop runtime and the
+ * quick-exit table; this harness configures no log and raises no stop. */
+extern "C" {
+void ps3_stop_set_mirror(ps3_stop_quiesce_fn, ps3_stop_mirror_fn) {}
+PS3_NORETURN void ps3_stop(ps3_stop_kind, const char*, const char*, const ps3_stop_field*,
+                           size_t, const ps3_stop_site*) { _Exit(PS3_STOP_EXIT_CODE); }
+int ps3_host_at_quick_exit(void (*fn)(void)) { (void)fn; return 0; }
+}
 #define PPU_TLS_IMG %s
 static uint8_t* vm_base;
 static uint32_t ppu_vm_size = 0x20000000u;
@@ -69,7 +79,9 @@ with tempfile.TemporaryDirectory(prefix='ppu-tls-') as tmp:
     c = Path(tmp) / 'tls.cpp'
     exe = Path(tmp) / 'tls'
     c.write_text(HARNESS % (tls_img, func))
-    subprocess.run([os.environ.get('CXX', 'c++'), '-std=c++17', '-O1', str(c), '-o', str(exe)], check=True)
+    subprocess.run([os.environ.get('CXX', 'c++'), '-std=c++17', '-O1', '-I', str(root / 'include'),
+                    str(c), str(root / 'runtime/diag/ps3_log.c'), str(root / 'runtime/config/config.cpp'),
+                    '-o', str(exe)], check=True)
     r = subprocess.run([str(exe)], timeout=10)
     print('PASS' if r.returncode == 0 else 'FAIL')
     raise SystemExit(r.returncode)

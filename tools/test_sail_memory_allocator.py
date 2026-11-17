@@ -23,7 +23,7 @@ def main():
         includes=['-I'+str(p) for p in (root,root/'include',root/'runtime/ppu',tmp)]
         subprocess.run([os.environ.get('CC','cc'),'-std=gnu17','-O1','-UNDEBUG',*includes,'-c',str(root/'libs/codec/cellSail.c'),'-o',str(tmp/'sail.o')],check=True,timeout=30)
         subprocess.run([os.environ.get('CC','cc'),'-std=gnu17','-O1','-UNDEBUG','-I'+str(root/'include'),'-c',str(root/'runtime/diag/host_exit.c'),'-o',str(tmp/'host_exit.o')],check=True,timeout=30)
-        subprocess.run([os.environ.get('CXX','c++'),'-std=c++17','-O1','-UNDEBUG',*includes,str(root/'tests/test_sail_memory_allocator.cpp'),str(root/'runtime/ppu/ppu_hle.cpp'),str(root/'runtime/config/config.cpp'),str(root/'runtime/diag/stop.cpp'),str(root/'tests/ps3_log_null.cpp'),str(tmp/'host_exit.o'),str(tmp/'nids.cpp'),str(tmp/'sail.o'),'-o',str(tmp/'fixture')],check=True,timeout=45)
+        subprocess.run([os.environ.get('CXX','c++'),'-std=c++17','-O1','-UNDEBUG',*includes,str(root/'tests/test_sail_memory_allocator.cpp'),str(root/'runtime/ppu/ppu_hle.cpp'),str(root/'runtime/config/config.cpp'),str(root/'runtime/diag/stop.cpp'),str(root/'runtime/diag/ps3_log.c'),str(tmp/'host_exit.o'),str(tmp/'nids.cpp'),str(tmp/'sail.o'),'-o',str(tmp/'fixture')],check=True,timeout=45)
         env={k:v for k,v in os.environ.items() if k in ('PATH','HOME','TMPDIR','SYSTEMROOT')}
         subprocess.run([str(tmp/'fixture')],env=env,check=True,timeout=10)
     return 0

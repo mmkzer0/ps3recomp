@@ -34,6 +34,11 @@ def _cc():
             or shutil.which("gcc"))
 
 
+def _cxx():
+    return (shutil.which(os.environ.get("CXX", "c++")) or shutil.which("clang++")
+            or shutil.which("g++"))
+
+
 def main():
     cc = _cc()
     if cc is None:
@@ -42,11 +47,32 @@ def main():
             return 1
         print("skip test_edat_guest_klicensee: no C compiler")
         return 0
+    cxx = _cxx()
+    if cxx is None:
+        if os.environ.get("CI"):
+            print("FAIL: no C++ compiler found")
+            return 1
+        print("skip test_edat_guest_klicensee: no C++ compiler")
+        return 0
     with tempfile.TemporaryDirectory() as td:
         exe = os.path.join(td, "test_edat_guest_klicensee")
-        cmd = [cc, "-std=gnu17", "-w", "-I" + os.path.join(ROOT, "include"),
-               "-o", exe] + SOURCES
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        # edat.c's migrated diagnostics call ps3_log_*, whose references to the stop runtime, the
+        # quick-exit table and the typed configuration come from ps3_log.c, host_exit.c, stop.cpp
+        # and config.cpp; the fixtures themselves only used to include edat.c and sceNp.c.
+        objs = []
+        for i, src in enumerate(SOURCES + [os.path.join(ROOT, "runtime/diag/ps3_log.c"),
+                                           os.path.join(ROOT, "runtime/diag/host_exit.c")]):
+            obj = os.path.join(td, f"c{i}.o")
+            subprocess.run([cc, "-std=gnu17", "-w", "-I" + os.path.join(ROOT, "include"),
+                            "-c", src, "-o", obj], check=True)
+            objs.append(obj)
+        for i, src in enumerate([os.path.join(ROOT, "runtime/config/config.cpp"),
+                                 os.path.join(ROOT, "runtime/diag/stop.cpp")]):
+            obj = os.path.join(td, f"cxx{i}.o")
+            subprocess.run([cxx, "-std=c++20", "-O1", "-w", "-I" + os.path.join(ROOT, "include"),
+                            "-c", src, "-o", obj], check=True)
+            objs.append(obj)
+        r = subprocess.run([cxx, "-o", exe, *objs], capture_output=True, text=True)
         if r.returncode != 0:
             print("FAIL: fixture did not build")
             print((r.stdout + r.stderr)[-4000:])

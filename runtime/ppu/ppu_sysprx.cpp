@@ -25,7 +25,7 @@
 #ifndef _WIN32
 #include "../platform/host_clock.h"   /* host_monotonic_ns; sys_timer.h is not included, its lv2 headers redefine ppu_context */
 #endif
-#include "ps3emu/log_first.h"
+#include "ps3emu/ps3_log.h"   /* PS3_LOG: tagged lines, stderr bytes unchanged */
 
 extern "C" uint8_t* vm_base;
 extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
@@ -56,7 +56,7 @@ static void sys_initialize_tls(ppu_context* ctx)
 
     ctx->gpr[13] = block + 0x7000u;   /* thread pointer; TLS data at r13-0x7000 */
     ctx->gpr[3]  = 0;                  /* CELL_OK */
-    fprintf(stderr, "[crt] sys_initialize_tls: block 0x%08X, r13=0x%08X (seg 0x%X+%u, mem %u)\n",
+    PS3_LOG(PS3_LOG_INFO, "crt", "sys_initialize_tls: block 0x%08X, r13=0x%08X (seg 0x%X+%u, mem %u)\n",
             block, (uint32_t)ctx->gpr[13], seg_addr, seg_size, mem_size);
 }
 
@@ -130,7 +130,7 @@ static void sys_mmapper_allocate_memory(ppu_context* ctx)
     uint32_t mem_id_ptr = (uint32_t)ctx->gpr[5];
     uint32_t id         = mmapper_new_id(size);
     if (getenv("PS3_MEMTRACE"))
-        fprintf(stderr, "[mmapper] allocate_memory(size=0x%X flags=0x%llX id_ptr=0x%X) -> id 0x%X\n",
+        PS3_LOG(PS3_LOG_INFO, "mmapper", "allocate_memory(size=0x%X flags=0x%llX id_ptr=0x%X) -> id 0x%X\n",
                 size, (unsigned long long)ctx->gpr[4], mem_id_ptr, id);
     if (mem_id_ptr) vm_write32(mem_id_ptr, id);
     ctx->gpr[3] = 0;
@@ -144,7 +144,7 @@ static void sys_mmapper_allocate_memory_from_container(ppu_context* ctx)
     uint32_t mem_id_ptr = (uint32_t)ctx->gpr[6];
     uint32_t id = mmapper_new_id(size);
     if (getenv("PS3_MEMTRACE"))
-        fprintf(stderr, "[mmapper] alloc_from_container(size=0x%X cid=0x%X flags=0x%llX id_ptr=0x%X) -> id 0x%X\n",
+        PS3_LOG(PS3_LOG_INFO, "mmapper", "alloc_from_container(size=0x%X cid=0x%X flags=0x%llX id_ptr=0x%X) -> id 0x%X\n",
                 size, (uint32_t)ctx->gpr[4], (unsigned long long)ctx->gpr[5], mem_id_ptr, id);
     if (mem_id_ptr) vm_write32(mem_id_ptr, id);
     ctx->gpr[3] = 0;
@@ -222,7 +222,7 @@ static void hle_cellGcmInitBody(ppu_context* ctx)
     uint32_t cmdSize = (uint32_t)ctx->gpr[4];
     uint32_t ioSize  = (uint32_t)ctx->gpr[5];
     uint32_t ioAddr  = (uint32_t)ctx->gpr[6];
-    fprintf(stderr, "[HLE] _cellGcmInitBody(ctx_out=0x%08X, cmdSize=0x%X, ioSize=0x%X, ioAddr=0x%X)\n",
+    PS3_LOG(PS3_LOG_INFO, "HLE", "_cellGcmInitBody(ctx_out=0x%08X, cmdSize=0x%X, ioSize=0x%X, ioAddr=0x%X)\n",
             ctx_out, cmdSize, ioSize, ioAddr);
     /* 0 = the firmware's argument validation failed (CELL_GCM_ERROR_FAILURE, 0x802100FF) */
     ctx->gpr[3] = cellGcmSetupContext(ctx_out, cmdSize, ioSize, ioAddr, gcm_guest_alloc, gcm_guest_write32)
@@ -342,12 +342,12 @@ static void hle_sys_spu_image_import(ppu_context* ctx)
 {
     uint32_t img_ea = (uint32_t)ctx->gpr[3];
     uint32_t src_ea = (uint32_t)ctx->gpr[4];
-    fprintf(stderr, "[HLE] _sys_spu_image_import(img=0x%08X src=0x%08X r5=0x%08X r6=0x%08X)\n",
+    PS3_LOG(PS3_LOG_INFO, "HLE", "_sys_spu_image_import(img=0x%08X src=0x%08X r5=0x%08X r6=0x%08X)\n",
             img_ea, src_ea, (uint32_t)ctx->gpr[5], (uint32_t)ctx->gpr[6]);
     if (!img_ea || !src_ea || !vm_base) { ctx->gpr[3] = 0; return; }
     const uint8_t* e = vm_base + src_ea;
     if (!(e[0]==0x7F && e[1]=='E' && e[2]=='L' && e[3]=='F')) {
-        fprintf(stderr, "[HLE] _sys_spu_image_import: src not an ELF -> no-op\n");
+        PS3_LOG(PS3_LOG_WARN, "HLE", "_sys_spu_image_import: src not an ELF -> no-op\n");
         fflush(stderr); ctx->gpr[3] = 0; return;
     }
     uint16_t machine = (uint16_t)((e[0x12] << 8) | e[0x13]);   /* 23 = SPU */
@@ -406,7 +406,7 @@ static void hle_sys_spu_image_import(ppu_context* ctx)
     vm_write32(img_ea + 0x04, entry);
     vm_write32(img_ea + 0x08, nsegs ? segs_ea : 0);
     vm_write32(img_ea + 0x0C, (uint32_t)nsegs);
-    fprintf(stderr, "[HLE] _sys_spu_image_import -> entry=0x%05X nsegs=%d machine=%u (SPU=23)\n",
+    PS3_LOG(PS3_LOG_INFO, "HLE", "_sys_spu_image_import -> entry=0x%05X nsegs=%d machine=%u (SPU=23)\n",
             entry, nsegs, machine);
     /* SPU_IMAGE_DIAG=1: r6 is a caller-supplied guest buffer that differs on
      * every call, which this handler ignores -- it points the segments at the
@@ -529,15 +529,13 @@ static void sys_spinlock_lock(ppu_context* ctx)
         if (n == 200000) {
             unsigned long owner = spin_owner_of(ea);
             unsigned long me    = GetCurrentThreadId();
-            static int reported = 0;
-            if (PS3_LOG_FIRST(reported, 8))
-                fprintf(stderr,
-                        "[spinlock] STUCK on 0x%08X after 200k spins: guest lr=0x%08X, "
-                        "held by tid %lu, this is tid %lu%s\n",
-                        ea, (uint32_t)ctx->lr, owner, me,
-                        (owner && owner == me)
-                          ? "  <== SELF-DEADLOCK: this thread already holds it"
-                          : (owner ? "" : "  (holder unknown -- released without us seeing it?)"));
+            PS3_LOG_N(8, PS3_LOG_WARN, "spinlock",
+                    "STUCK on 0x%08X after 200k spins: guest lr=0x%08X, "
+                    "held by tid %lu, this is tid %lu%s\n",
+                    ea, (uint32_t)ctx->lr, owner, me,
+                    (owner && owner == me)
+                      ? "  <== SELF-DEADLOCK: this thread already holds it"
+                      : (owner ? "" : "  (holder unknown -- released without us seeing it?)"));
         }
     }
     spin_note_acquire(ea);
