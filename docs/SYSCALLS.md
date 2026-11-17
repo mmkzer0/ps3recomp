@@ -342,7 +342,7 @@ A **producer handle** that connects to a queue. Sending an event through a port 
 ## Event Flags (sys_event_flag)
 
 **File:** `runtime/syscalls/sys_event.c`
-**Syscall numbers:** 139–146
+**Syscall numbers:** 82–83, 85–87, 118, 132, 139
 
 ### Design
 
@@ -354,14 +354,14 @@ A 64-bit bitmask that threads can wait on. Supports AND/OR wait modes:
 
 | # | Name | Description |
 |---|------|-------------|
-| 139 | `sys_event_flag_create` | Create with initial value and wait mode. |
-| 140 | `sys_event_flag_destroy` | Destroy. |
-| 141 | `sys_event_flag_wait` | Block until condition met. Supports timeout. |
-| 142 | `sys_event_flag_trywait` | Non-blocking wait. |
-| 143 | `sys_event_flag_set` | Set bits (OR them into the current value). |
-| 144 | `sys_event_flag_clear` | Clear bits (AND with complement). |
-| 145 | `sys_event_flag_cancel` | Cancel all waiting threads. |
-| 146 | `sys_event_flag_get` | Read current flag value. |
+| 82 | `sys_event_flag_create` | Create with initial value and wait mode. |
+| 83 | `sys_event_flag_destroy` | Destroy. |
+| 85 | `sys_event_flag_wait` | Block until condition met. Supports timeout. |
+| 86 | `sys_event_flag_trywait` | Non-blocking wait. |
+| 87 | `sys_event_flag_set` | Set bits (OR them into the current value). |
+| 118 | `sys_event_flag_clear` | Clear bits (AND with complement). |
+| 132 | `sys_event_flag_cancel` | Cancel all waiting threads. |
+| 139 | `sys_event_flag_get` | Read current flag value. |
 
 ---
 
