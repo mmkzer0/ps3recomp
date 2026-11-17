@@ -1791,30 +1791,29 @@ static void test_code_decoder_rejects(void)
         both[1].data = zeros;
         both[1].bytes = sizeof zeros;
 
-        expect_reject("CODE without STAG",
-                      retable(base, n, SPU_XDIFF_VERSION, SPU_XDIFF_SEC_STAGED, 0, NULL, 0, &m), m,
-                      SPU_XDIFF_R_FIXTURE_FORMAT, "STAG");
-        expect_reject("STAG without CODE",
-                      retable(base, n, SPU_XDIFF_VERSION, SPU_XDIFF_SEC_CODE, 0, NULL, 0, &m), m,
-                      SPU_XDIFF_R_FIXTURE_FORMAT, "CODE");
+        /* retable() writes m, so it runs in its own statement: the order in which
+         * a call's arguments are evaluated is unspecified, and gcc on x86_64 read
+         * m before retable() had set it. */
+        uint8_t* q = retable(base, n, SPU_XDIFF_VERSION, SPU_XDIFF_SEC_STAGED, 0, NULL, 0, &m);
+        expect_reject("CODE without STAG", q, m, SPU_XDIFF_R_FIXTURE_FORMAT, "STAG");
+        q = retable(base, n, SPU_XDIFF_VERSION, SPU_XDIFF_SEC_CODE, 0, NULL, 0, &m);
+        expect_reject("STAG without CODE", q, m, SPU_XDIFF_R_FIXTURE_FORMAT, "CODE");
 
         build_function_fixture(&fx);
         uint8_t* v2fn = encode_of(&fx, &fn);
-        expect_reject("v3 function unit without CODE",
-                      retable(v2fn, fn, SPU_XDIFF_VERSION, 0, 0, NULL, 0, &m), m,
-                      SPU_XDIFF_R_FIXTURE_FORMAT, "CODE");
-        expect_reject("v2 function unit with CODE",
-                      retable(v2fn, fn, SPU_XDIFF_VERSION_V2, 0, 0, both, 2, &m), m,
-                      SPU_XDIFF_R_UNSUPPORTED_VERSION, "CODE");
+        q = retable(v2fn, fn, SPU_XDIFF_VERSION, 0, 0, NULL, 0, &m);
+        expect_reject("v3 function unit without CODE", q, m, SPU_XDIFF_R_FIXTURE_FORMAT, "CODE");
+        q = retable(v2fn, fn, SPU_XDIFF_VERSION_V2, 0, 0, both, 2, &m);
+        expect_reject("v2 function unit with CODE", q, m, SPU_XDIFF_R_UNSUPPORTED_VERSION, "CODE");
         free(v2fn);
         spu_xdiff_fixture_free(&fx);
 
         build_minimal(&fx);
         uint8_t* job = encode_of(&fx, &fn);
-        expect_reject("CODE on a job unit", retable(job, fn, SPU_XDIFF_VERSION, 0, 0, both, 2, &m), m,
-                      SPU_XDIFF_R_FIXTURE_FORMAT, "CODE");
-        expect_reject("STAG on a job unit", retable(job, fn, SPU_XDIFF_VERSION, 0, 0, both + 1, 1, &m), m,
-                      SPU_XDIFF_R_FIXTURE_FORMAT, "STAG");
+        q = retable(job, fn, SPU_XDIFF_VERSION, 0, 0, both, 2, &m);
+        expect_reject("CODE on a job unit", q, m, SPU_XDIFF_R_FIXTURE_FORMAT, "CODE");
+        q = retable(job, fn, SPU_XDIFF_VERSION, 0, 0, both + 1, 1, &m);
+        expect_reject("STAG on a job unit", q, m, SPU_XDIFF_R_FIXTURE_FORMAT, "STAG");
         /* a v3 job fixture without CODE is a job fixture: it keeps the whole-span check */
         {
             spu_xdiff_fixture g;
