@@ -19,10 +19,12 @@ real named-stop runtime (runtime/diag/stop.cpp), then:
 Each run is bounded, so a regression to "halt silently" or "never stop" fails
 instead of hanging the suite.
 
-Then drives the watchdog's timing schedule and its reporting through the
+Then drives the watchdog's back-off schedule and its reporting through the
 synthetic fixture runtime/spu/tests/test_spu_dma_repeat.c (a test-owned
-millisecond clock): at the default spu.dma_repeat_stop_secs (0) the episode
-yields, backs off and never halts or stops, even past 30 s; and
+millisecond clock; the fixture counts the yields and sleeps the watchdog
+issues rather than timing them, #146): at the default
+spu.dma_repeat_stop_secs (0) the episode yields, backs off and never halts or
+stops, even past 30 s; and
 SPU_DMA_REPEAT_LOG=<n> must name the repeated transfer, its size included, and
 only when it is set.
 """
@@ -120,9 +122,9 @@ def main():
 def repeat_log_fixture(cc, cxx, cflags, cxxflags, env):
     """The watchdog's own schedule, then SPU_DMA_REPEAT_LOG reporting.
 
-    Default mode: the 2 ms yield window and the 1 ms per-repeat back-off, with
-    no halt and no stop at the default spu.dma_repeat_stop_secs (0), even past
-    30 s of the test-owned clock.
+    Default mode: the 2 ms yield window and the 1 ms per-repeat back-off,
+    counted as yields and sleeps, with no halt and no stop at the default
+    spu.dma_repeat_stop_secs (0), even past 30 s of the test-owned clock.
 
     Log mode: one episode, one line, naming the repeated transfer.
 

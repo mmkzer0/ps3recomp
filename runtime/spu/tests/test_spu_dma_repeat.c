@@ -5,13 +5,21 @@
  *   ./fixture log     one repeat episode for SPU_DMA_REPEAT_LOG to report
  *
  * tools/test_spu_dma_repeat.py runs both: the schedule mode checks stdout, the
- * log mode checks the SPU_DMA_REPEAT_LOG lines on stderr. */
+ * log mode checks the SPU_DMA_REPEAT_LOG lines on stderr.
+ *
+ * The schedule is checked by counting which back-off the watchdog took, not by
+ * timing it: a wall-time bound failed on loaded CI runners (toolkit #146). The
+ * host compat header is included first, so its SwitchToThread and Sleep are
+ * already defined; the macros below then replace the engine's calls only. */
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
+#include "../../platform/win32_compat.h"
+static unsigned long g_yields, g_sleeps;
+#define SwitchToThread() (++g_yields, 1)
+#define Sleep(ms) ((void)(ms), (void)++g_sleeps)
 static uint8_t guest[1u << 20];
 uint8_t* vm_base = guest;
 uint32_t ppu_vm_size;
@@ -22,23 +30,19 @@ unsigned long long ps3_ms_now(void) { return s_fake_ms; }
 
 static spu_context spu;
 
-static double host_ms(void)
-{
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec / 1e6;
-}
 static void get(uint32_t ea, uint32_t lsa, uint32_t size)
 {
     spu.mfc_eah = 0; spu.mfc_eal = ea; spu.mfc_lsa = lsa;
     spu.mfc_size = size; spu.mfc_tag = 3;
     assert(mfc_submit(mfc_for(&spu), &spu, 0x40) == 0);   /* MFC_GET */
 }
-/* Host time for n further repeats of the current transfer. */
-static double repeats_ms(unsigned n)
+/* n further repeats of the current transfer; the back-offs they took. */
+static void repeats(unsigned n, unsigned long* yields, unsigned long* sleeps)
 {
-    const double t0 = host_ms();
+    const unsigned long y0 = g_yields, s0 = g_sleeps;
     for (unsigned i = 0; i < n; i++) get(0x20000, 0x1000, 16);
-    return host_ms() - t0;
+    *yields = g_yields - y0;
+    *sleeps = g_sleeps - s0;
 }
 
 int main(int argc, char** argv)
@@ -59,36 +63,39 @@ int main(int argc, char** argv)
         return 0;
     }
 
+    unsigned long y, s;
     /* Below the limit: plain transfers, no back-off at all. */
-    assert(repeats_ms(255) < 250.0);
+    repeats(255, &y, &s);
+    assert(y == 0 && s == 0);
 
     /* The yield window is a fixed 2 ms of the episode (spu_dma.h). With the
-     * clock held at the episode start, 1000 repeats past the limit take
-     * nowhere near the >= 1000 ms that a 1 ms sleep per repeat costs. */
-    const double yield_ms = repeats_ms(1000);
-    printf("1000 repeats inside the yield window: %.1f ms\n", yield_ms);
-    assert(yield_ms < 250.0);
+     * clock held at the episode start, the repeats past the limit yield and
+     * never sleep. */
+    repeats(1000, &y, &s);
+    printf("1000 repeats inside the yield window: %lu yields, %lu sleeps\n", y, s);
+    assert(y >= 990 && y <= 1000 && s == 0);
 
-    /* Past the window it backs off 1 ms per repeat. */
+    /* Past the window it backs off 1 ms (one Sleep(1)) per repeat. */
     s_fake_ms += 2;
-    const double sleep_ms = repeats_ms(20);
-    printf("20 repeats past the yield window: %.1f ms\n", sleep_ms);
-    assert(sleep_ms >= 15.0);
+    repeats(20, &y, &s);
+    printf("20 repeats past the yield window: %lu yields, %lu sleeps\n", y, s);
+    assert(y == 0 && s == 20);
 
     /* Our contract: spu.dma_repeat_stop_secs defaults to 0, so elapsed time
      * never halts the episode or stops the process. Cross the 30 s at which
      * upstream's fixture halted and re-armed: the episode is still open here,
-     * so the next repeats keep backing off about 1 ms each. A re-arm would
+     * so the next repeats keep backing off, one sleep each. A re-arm would
      * make them plain transfers, and a stop would end the run with kind
      * spu-dma-repeat (exit 70) before the PASS line. */
     s_fake_ms += 30u * 1000u;
-    const double open_ms = repeats_ms(20);
-    printf("20 repeats 30 s into the episode: %.1f ms\n", open_ms);
-    assert(open_ms >= 15.0);
+    repeats(20, &y, &s);
+    printf("20 repeats 30 s into the episode: %lu yields, %lu sleeps\n", y, s);
+    assert(y == 0 && s == 20);
 
     /* A different transfer ends the episode; the new one starts a fresh count. */
     get(0x20100, 0x2000, 128);
-    assert(repeats_ms(255) < 250.0);
+    repeats(255, &y, &s);
+    assert(y == 0 && s == 0);
 
     spu_mfc_release(&spu);
     puts("PASS: the default never halts or stops; it yields, then backs off, "
