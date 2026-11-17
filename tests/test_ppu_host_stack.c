@@ -40,6 +40,7 @@ static void reuse_refused_slot(void);
 #include "../runtime/syscalls/sys_ppu_thread.c"
 #include <assert.h>
 #include <sched.h>
+#include <fcntl.h>
 
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
@@ -101,6 +102,88 @@ static void check_thp_off(int want)
 #endif
 }
 
+static size_t page_size(void) { return (size_t)sysconf(_SC_PAGESIZE); }
+
+/* One line on a stack's residency, read independently of host_stack_high_water: the pages mincore holds resident as
+ * runs (offset from the stack's low end in KiB, length in KiB), and on Linux the smaps entry of the mapping that
+ * holds the stack (Rss, huge pages, flags). A flake that reports a whole stack resident is told apart from a wrong
+ * range by this. */
+static void stack_snapshot_locked(char* out, size_t cap, uintptr_t lo, size_t size)
+{
+    const size_t pg = page_size();
+    const uintptr_t base = (lo + pg - 1) & ~(uintptr_t)(pg - 1), end = (lo + size) & ~(uintptr_t)(pg - 1);
+    size_t n = 0;
+    n += (size_t)snprintf(out + n, cap - n, "range [%#lx,%#lx) %zu pages;", (unsigned long)base, (unsigned long)end, (size_t)((end - base) / pg));
+    /* static, not on the stack being measured; never thread-local, which glibc places in the stack mapping.
+     * mincore's vector is char on Darwin and unsigned char elsewhere, as in host_stack.h. */
+#if defined(__APPLE__)
+    static char vec[1u << 15];
+#else
+    static unsigned char vec[1u << 15];
+#endif
+    const size_t pages = (end - base) / pg;
+    if (pages == 0 || pages > sizeof vec || mincore((void*)base, pages * pg, vec) != 0) {
+        snprintf(out + n, cap - n, " mincore failed errno=%d", errno);
+        return;
+    }
+    size_t resident = 0, runs = 0;
+    for (size_t i = 0; i < pages; i++) resident += vec[i] & 1;
+    n += (size_t)snprintf(out + n, cap - n, " resident %zu pages; runs(KiB off+len):", resident);
+    for (size_t i = 0; i < pages;) {
+        if (!(vec[i] & 1)) { i++; continue; }
+        size_t j = i;
+        while (j < pages && (vec[j] & 1)) j++;
+        if (++runs <= 6 && n < cap)
+            n += (size_t)snprintf(out + n, cap - n, " %zu+%zu", i * pg / 1024, (j - i) * pg / 1024);
+        i = j;
+    }
+    if (runs > 6 && n < cap) n += (size_t)snprintf(out + n, cap - n, " ...(%zu runs)", runs);
+#ifdef __linux__
+    /* pagemap tells a page a thread wrote (present, exclusively mapped) from one it only read (the shared zero
+     * page: present, not exclusive), which mincore cannot. Readable without privilege: flags only. */
+    static uint64_t pm[1u << 15];
+    int fd = open("/proc/self/pagemap", O_RDONLY);
+    if (fd >= 0 && pread(fd, pm, pages * sizeof pm[0], (off_t)((base / pg) * sizeof pm[0])) == (ssize_t)(pages * sizeof pm[0])) {
+        size_t excl = 0, shared = 0, swapped = 0, file = 0;
+        for (size_t i = 0; i < pages; i++) {
+            if (pm[i] >> 62 & 1) swapped++;
+            else if (pm[i] >> 63 & 1) { if (pm[i] >> 61 & 1) file++; else if (pm[i] >> 56 & 1) excl++; else shared++; }
+        }
+        n += (size_t)snprintf(out + n, cap - n, " pagemap excl=%zu shared/zero=%zu swapped=%zu file=%zu;", excl, shared, swapped, file);
+    }
+    if (fd >= 0) close(fd);
+    FILE* f = fopen("/proc/self/smaps", "r");
+    char line[256];
+    int in = 0;
+    while (f && n < cap && fgets(line, sizeof line, f)) {
+        unsigned long a, b;
+        char perms[8];
+        if (sscanf(line, "%lx-%lx %7s", &a, &b, perms) == 3) {
+            in = base >= a && base < b;
+            if (in) { line[strcspn(line, "\n")] = 0; n += (size_t)snprintf(out + n, cap - n, " | vma %.40s", line); }
+        } else if (in && (!strncmp(line, "Rss:", 4) || !strncmp(line, "AnonHugePages:", 14) || !strncmp(line, "THPeligible:", 12) ||
+                          !strncmp(line, "VmFlags:", 8))) {
+            line[strcspn(line, "\n")] = 0;
+            char* v = line;
+            while (*v && *v != ':') v++;
+            v++;
+            while (*v == ' ') v++;
+            n += (size_t)snprintf(out + n, cap - n, " %.*s=%s", (int)strcspn(line, ":"), line, v);
+        }
+    }
+    if (f) fclose(f);
+#endif
+}
+
+/* Several threads snapshot (their own start and recursion, the exit hook), and the vectors above are shared. */
+static void stack_snapshot(char* out, size_t cap, uintptr_t lo, size_t size)
+{
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&lock);
+    stack_snapshot_locked(out, cap, lo, size);
+    pthread_mutex_unlock(&lock);
+}
+
 /* ---- what the threads do ------------------------------------------------ */
 
 #define FRAME  32768u          /* each recursion level reserves this much and touches every page of it */
@@ -128,12 +211,12 @@ typedef struct {
     size_t    hw;         /* the high-water mark measured by the thread itself, after the recursion returned */
     int       known;
     int       done;
+    char      diag[3][1024];      /* stack_snapshot at the thread's start, after its recursion, and once released */
 } thread_result;
 
 static thread_result g_res[4];
 static volatile int g_parked, g_release;
 
-static size_t page_size(void) { return (size_t)sysconf(_SC_PAGESIZE); }
 
 static void guest_entry(ppu_context* ctx)
 {
@@ -144,11 +227,14 @@ static void guest_entry(ppu_context* ctx)
     size_t size = 0;
     r->known = host_stack_range_self(&lo, &size);
     r->end = (lo + size) & ~(uintptr_t)(page_size() - 1);
+    if (r->known) stack_snapshot(r->diag[0], sizeof r->diag[0], lo, size);   /* before it recurses */
     r->fp = depth == NO_RECURSION ? 0 : recurse(depth);
     r->known = r->known && host_stack_high_water(lo, size, &r->hw);
+    if (r->known) stack_snapshot(r->diag[1], sizeof r->diag[1], lo, size);
     if (arg & PARK) {
         __atomic_store_n(&g_parked, 1, __ATOMIC_RELEASE);
         while (!__atomic_load_n(&g_release, __ATOMIC_ACQUIRE)) sched_yield();
+        if (r->known) stack_snapshot(r->diag[2], sizeof r->diag[2], lo, size);
     }
     r->done = 1;
     ctx->gpr[3] = 0;
@@ -157,15 +243,35 @@ static void guest_entry(ppu_context* ctx)
 /* ---- the report hook ---------------------------------------------------- */
 
 static pthread_mutex_t g_ev_mu = PTHREAD_MUTEX_INITIALIZER;
-static struct { uint64_t tid; size_t reserved, hw; int known, live; } g_ev[16];
+static struct { uint64_t tid; size_t reserved, hw; int known, live; char diag[1536]; } g_ev[16];
 static int g_nev;
 
 static void hook(uint64_t tid, size_t reserved, size_t hw, int known, int live)
 {
+    /* An exit report runs on the reported thread itself: look at its stack again with a second, independent
+     * reader, so a mark that disagrees with the thread's own says what the kernel held at that moment. */
+    char diag[sizeof g_ev[0].diag] = "";
+    if (!live) {
+        uintptr_t lo; size_t size;
+        if (host_stack_range_self(&lo, &size)) {
+            stack_snapshot(diag, sizeof diag, lo, size);
+            /* The same measure again, a few times, a yield apart: a residency that was a moment's differs from one
+             * that stays. */
+            size_t n = strlen(diag);
+            n += (size_t)snprintf(diag + n, sizeof diag - n, " | remeasured:");
+            for (int i = 0; i < 6 && n < sizeof diag; i++) {
+                size_t again = 0;
+                const int ok = host_stack_high_water(lo, size, &again);
+                n += (size_t)snprintf(diag + n, sizeof diag - n, " %s%zu", ok ? "" : "unknown/", again);
+                sched_yield();
+            }
+        }
+    }
     pthread_mutex_lock(&g_ev_mu);
     if (g_nev < 16) {
         g_ev[g_nev].tid = tid; g_ev[g_nev].reserved = reserved; g_ev[g_nev].hw = hw;
         g_ev[g_nev].known = known; g_ev[g_nev].live = live;
+        memcpy(g_ev[g_nev].diag, diag, sizeof diag);
         g_nev++;
     }
     pthread_mutex_unlock(&g_ev_mu);
@@ -181,6 +287,57 @@ static int events_for(uint64_t tid, int live, size_t* reserved, size_t* hw, int*
         }
     pthread_mutex_unlock(&g_ev_mu);
     return n;
+}
+
+/* Counters of /proc/vmstat that bear on whether a page can become resident without a thread touching it: transparent
+ * huge pages (faults, collapses, splits, the huge zero page) and the zero page. Empty elsewhere than Linux. */
+struct vmstat_entry { char name[40]; long long v; };
+static struct vmstat_entry g_vm0[48];
+static int vmstat_read(struct vmstat_entry* out, int cap)
+{
+    int n = 0;
+#ifdef __linux__
+    FILE* f = fopen("/proc/vmstat", "r");
+    char line[128];
+    while (f && n < cap && fgets(line, sizeof line, f)) {
+        char name[40];
+        long long v;
+        if (sscanf(line, "%39s %lld", name, &v) == 2 && (!strncmp(name, "thp_", 4) || !strncmp(name, "nr_anon_transparent", 19) ||
+                                                         !strncmp(name, "zero_page", 9) || !strncmp(name, "nr_zero", 7))) {
+            memcpy(out[n].name, name, sizeof name);
+            out[n].v = v;
+            n++;
+        }
+    }
+    if (f) fclose(f);
+#endif
+    if (n < cap) out[n].name[0] = 0;
+    return n;
+}
+
+/* What a failing run knows about each thread's stack: at its start, after its recursion, when it was released, and
+ * at its exit report. */
+static void dump_diagnostics(void)
+{
+    static const char* const phase[3] = { "start", "recursed", "released" };
+    for (unsigned s = 0; s < 4; s++)
+        for (unsigned p = 0; p < 3; p++)
+            if (g_res[s].diag[p][0])
+                fprintf(stderr, "DIAG slot %u %s: %s\n", s, phase[p], g_res[s].diag[p]);
+    pthread_mutex_lock(&g_ev_mu);
+    for (int i = 0; i < g_nev; i++)
+        if (g_ev[i].diag[0])
+            fprintf(stderr, "DIAG tid %llu exit report hw %zu: %s\n", (unsigned long long)g_ev[i].tid, g_ev[i].hw, g_ev[i].diag);
+    pthread_mutex_unlock(&g_ev_mu);
+    /* The kernel's own huge-page and zero-page counters, system-wide, as they moved over this run. */
+    static struct vmstat_entry now[48];
+    const int n = vmstat_read(now, 48);
+    fprintf(stderr, "DIAG vmstat deltas since start:");
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < 48 && g_vm0[j].name[0]; j++)
+            if (!strcmp(now[i].name, g_vm0[j].name) && now[i].v != g_vm0[j].v)
+                fprintf(stderr, " %s%+lld", now[i].name, (long long)(now[i].v - g_vm0[j].v));
+    fprintf(stderr, "\n");
 }
 
 /* ---- driving sys_ppu_thread_create -------------------------------------- */
@@ -266,6 +423,7 @@ static void reuse_refused_slot(void)
 int main(int argc, char** argv)
 {
     const int on = !(argc > 1 && !strcmp(argv[1], "off"));
+    vmstat_read(g_vm0, 48);
     if (on) setenv("PS3_HOST_STACK_HWM", "1", 1);
     else    unsetenv("PS3_HOST_STACK_HWM");
 
@@ -394,5 +552,6 @@ int main(int argc, char** argv)
     }
 
     printf("%s\n", g_fails ? "FAILED" : "ok");
+    if (g_fails) dump_diagnostics();
     return g_fails ? 1 : 0;
 }
