@@ -210,6 +210,22 @@ python3 tools/spu_liveness.py IMAGE.bin --base 0x7C00 [--code-end N] [--entry N]
 python3 tools/spu_liveness.py --elf IMAGE.elf -o live.json          # the ELF's code, bounds and entry
 ```
 
+For an admitted native unit, add `--capture-unit E` (repeatable). This invokes
+the same `override_unit_admission` as registration and adds `unit_pcs` to E's
+function record: every instruction address in its admitted member bounds.
+It refuses a unit the native gate refuses; there is no second admission rule.
+The function capturer uses this optional field to recognize arrivals at E
+from outside the member set, including tail branches and dispatcher entry.
+Internal back edges do not start another unit. A complete preserved-r0 return
+out of the unit writes a function fixture with every register and LS byte
+live. Interrupts, budget exhaustion and other incomplete exits discard the
+unit and increment `discarded-yield`; modified member code increments
+`unit-code-modified`. Neither is a successful pair. Without `unit_pcs`,
+call-target capture and its existing liveness masks are unchanged.
+CODE-bearing capture also requires trusted registration of that admitted
+entry's membership, staged LS base and image byte count. An analysis plan alone
+cannot authorize code coverage or placement, even for a reference-only entry.
+
 The functions are the lifter's: `find_spu_functions.py`'s `raw=True` bounds,
 split at each `--entry` and capped at `--code-end` exactly as `spu_lifter.py`
 does (`--functions` takes the lifter's own list, `--elf` the

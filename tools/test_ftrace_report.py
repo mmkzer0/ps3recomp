@@ -1150,9 +1150,10 @@ check(fr.XDIFF_REASONS[0] == ("equal", "none") and fr.XDIFF_REASONS[16] == ("dif
       fr.XDIFF_REASONS[22] == ("differ", "end-regs") and fr.XDIFF_REASONS[23] == ("differ", "end-ls") and
       fr.XDIFF_REASONS[25] == ("differ", "epoch-writes") and fr.XDIFF_REASONS[32] == ("void", "budget") and
       fr.XDIFF_REASONS[37] == ("void", "depth-guard") and fr.XDIFF_REASONS[38] == ("void", "capture-limit") and
+      fr.XDIFF_REASONS[39] == ("void", "unit-code-modified") and
       fr.XDIFF_REASONS[48] == ("malformed", "fixture-format") and
       fr.XDIFF_REASONS[64] == ("not-found", "no-fixture") and
-      fr.XDIFF_REASONS[65] == ("not-found", "no-body") and len(fr.XDIFF_REASONS) == 23 and
+      fr.XDIFF_REASONS[65] == ("not-found", "no-body") and len(fr.XDIFF_REASONS) == 24 and
       RID["end-regs"] == 22 and RID["budget"] == 32,
       "reason ids are the stable values of spu_xdiff.h, not table positions")
 

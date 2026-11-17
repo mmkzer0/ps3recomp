@@ -99,6 +99,7 @@ typedef struct spu_xdiff_poison_fn {
     uint32_t stack_to;    /* 0: no dead frame */
     uint32_t reserved;
     uint64_t dead[2];     /* bit r of dead[r >> 6]: $rN is dead at return; never $r1 */
+    uint8_t* unit_pcs;    /* optional 8192-byte bitmap: admitted unit instruction addresses */
 } spu_xdiff_poison_fn;
 
 typedef struct spu_xdiff_poison_plan {
@@ -115,11 +116,20 @@ int  spu_xdiff_poison_plan_parse(const char* text, size_t bytes, spu_xdiff_poiso
 int  spu_xdiff_poison_plan_load(const char* path, spu_xdiff_poison_plan* out, char* err, size_t err_bytes);
 void spu_xdiff_poison_plan_free(spu_xdiff_poison_plan* plan);
 
-/* Replay a T0 job fixture with its instruction observer and write at most the
- * first 64 calls of `entry` as deterministic kind-FUNCTION fixtures in out_dir. */
+typedef struct spu_xdiff_capture_report {
+    uint32_t captured;
+    uint32_t discarded_yield; /* incomplete entry-PC units: interrupt, budget or other exit */
+    uint32_t discarded_code_modified; /* staged member code differs at unit entry */
+} spu_xdiff_capture_report;
+
+/* Replay a T0 job fixture and attempt at most 64 captures of `entry`.
+ * With unit_pcs, capture outside arrivals at E through the unit's return;
+ * otherwise capture calls as before. budget is T0 instructions (0: unlimited).
+ * Discarded unit counts remain available on failure; incomplete source replay
+ * is an error, never a successful fixture pair. */
 int spu_xdiff_capture_function_units(const spu_xdiff_fixture* f,
-                                    const spu_xdiff_poison_plan* plan, uint32_t entry,
-                                    const char* out_dir, uint32_t* captured,
+                                    const spu_xdiff_poison_plan* plan, uint32_t entry, uint64_t budget,
+                                    const char* out_dir, spu_xdiff_capture_report* report,
                                     char* err, size_t err_bytes);
 
 typedef enum spu_xdiff_poison_kind {

@@ -56,6 +56,33 @@ def image_words():
     return words
 
 
+def tail_image(patch_member=False):
+    words = [0] * (0x100 // 4)
+    main = [
+        (0x21 << 25) | ((BASE + 0xE0) << 7) | 2,
+        ri10(0x34, 0, 2, 4),  # load a quadword of data
+        (0x21 << 25) | ((FUNCTION if patch_member else BASE + 0xF0) << 7) | 2,
+        ri10(0x24, 0, 2, 4),  # patch an unreachable member byte, or ordinary image data
+        (0x21 << 25) | ((MAIN + 28) << 7),
+        ri16(0x081, 3, 3),
+        ri16(0x064, (FUNCTION - (MAIN + 24)) // 4, 0),
+        (0x21 << 25) | ((MAIN + 40) << 7),
+        ri16(0x081, 2, 3),
+        ri16(0x064, (FUNCTION - (MAIN + 36)) // 4, 0),
+        0,
+    ]
+    member = [
+        ri10(0x1C, -1, 3, 3),
+        ri16(0x042, -1, 3),
+        rr(0x1A8, ra=0),
+        rr(0x201),  # unreachable nop, still in the replaced member range
+    ]
+    words[0x40 // 4:0x40 // 4 + len(main)] = main
+    words[0x70 // 4:0x80 // 4] = member
+    words[0xE0 // 4:0xF0 // 4] = [*member[:-1], member[-1] ^ (1 if patch_member else 0)]
+    return b"".join(word.to_bytes(4, "big") for word in words)
+
+
 def main():
     out = Path(sys.argv[1]).resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -73,6 +100,15 @@ def main():
                                 [(item["start"], item["end"]) for item in bounds])
     plan_path = out / "liveness.json"
     plan_path.write_text(json.dumps(plan, indent=1) + "\n", encoding="utf-8")
+    for name, patch in (("tail_unit", False), ("tail_code_unit", True)):
+        image = tail_image(patch)
+        (out / f"{name}.bin").write_bytes(image)
+        tail_bounds = [{"start": MAIN, "end": FUNCTION}, {"start": FUNCTION, "end": BASE + 0x80}]
+        (out / f"{name}_functions.json").write_text(json.dumps(tail_bounds) + "\n", encoding="utf-8")
+        plan = spu_liveness.analyze(
+            image, BASE, functions=[(MAIN, FUNCTION), (FUNCTION, BASE + 0x80)],
+            capture_units=(FUNCTION,))
+        (out / f"{name}.json").write_text(json.dumps(plan, indent=1) + "\n", encoding="utf-8")
     print(f"wrote {image_path}, {functions_path}, {plan_path}")
 
 

@@ -356,6 +356,9 @@ def write_registry(args, imgs, text_fps, image_ids=None, budget_twin=False):
         override_map = parse_overrides(programs.get(img, {}).get("overrides", []))
         entry_overridden[img] = ent in override_map
         entry_symbols[img] = override_map.get(ent, f"{prefix}spu_func_{ent:08X}")
+        units = programs.get(img, {}).get("override_units", [])
+        if set(override_map) != {u["entry"] for u in units} or len(units) != len(override_map):
+            raise ValueError(f"{img}: overrides lack complete admission-derived unit membership")
     if budget_twin:
         write_twin_sources(lift_root, imgs)
     L = []
@@ -370,6 +373,7 @@ def write_registry(args, imgs, text_fps, image_ids=None, budget_twin=False):
     L.append('#include "spu_workload.h"')
     if any(programs.get(img, {}).get("overrides") for img, _prefix, _fp, _ent in imgs):
         L.append('#include "spu_xdiff.h"')
+        L.append('#include <stdlib.h>')
     L.append("")
     L.append("extern void spu_begin_image(int image_id);")
     L.append("")
@@ -382,6 +386,21 @@ def write_registry(args, imgs, text_fps, image_ids=None, budget_twin=False):
             L.append(f"extern void {twin_entry}(spu_context*);")
             L.append(f"extern void {prefix}spu_recomp_register{TWIN_SUFFIX}(void);")
     L.append("")
+    for img, prefix, _fp, _ent in imgs:
+        units = programs.get(img, {}).get("override_units", [])
+        for unit in units:
+            symbol = f"{prefix}override_{unit['entry']:08X}_ranges"
+            L.append(f"static const spu_workload_code_range {symbol}[] = {{")
+            for r in unit['ranges']:
+                L.append(f"    {{ 0x{r['ls']:X}u, 0x{r['bytes']:X}u }},")
+            L.append("};")
+        if units:
+            L.append(f"static const spu_workload_override_unit {prefix}override_units[] = {{")
+            for unit in units:
+                symbol = f"{prefix}override_{unit['entry']:08X}_ranges"
+                L.append(f"    {{ 0x{unit['entry']:X}u, {len(unit['ranges'])}u, "
+                         f"0x{unit['image_ls']:X}u, 0x{unit['image_bytes']:X}u, {symbol} }},")
+            L.append("};")
     L.append(f"void {args.register_fn}(void)")
     L.append("{")
     for index, (img, prefix, fp, ent) in enumerate(imgs, 1):
@@ -396,6 +415,12 @@ def write_registry(args, imgs, text_fps, image_ids=None, budget_twin=False):
             native_rev = int(program['native_rev'])
             L.append(f"    spu_workload_set_body_identity(0x{fp:016X}ULL, SPU_TIER_PARTIAL, "
                      f"0x{native_rev:016X}ULL);")
+            unit_symbol = f"{prefix}override_units"
+            unit_count = len(program['override_units'])
+            for key in dict.fromkeys([fp, text_fps.get(img)]):
+                if key is not None:
+                    L.append(f"    if (!spu_workload_register_override_units(0x{key:016X}ULL, "
+                             f"{unit_symbol}, {unit_count}u)) abort();")
         inventory = registration_inventory(program)
         if inventory:  # no record: the image is unknown to the runtime, which refuses to record or shadow
             flags, code_end, lift_options = inventory

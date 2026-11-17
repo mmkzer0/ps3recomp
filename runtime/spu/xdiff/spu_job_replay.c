@@ -613,17 +613,22 @@ int spu_job_replay_main(int argc, char** argv)
     } else {
         loaded = 1;
         if (a.capture_mode) {
-            uint32_t captured = 0;
+            spu_xdiff_capture_report capture = {0};
             char why[256];
-            if (spu_xdiff_capture_function_units(&f, a.plan, a.function_entry, a.out_dir,
-                                                 &captured, why, sizeof why) != 0) {
+            if (spu_xdiff_capture_function_units(&f, a.plan, a.function_entry, a.budget, a.out_dir,
+                                                 &capture, why, sizeof why) != 0) {
                 fprintf(stderr, "spu_job_replay: function capture failed: %s\n", why);
+                fprintf(stderr, "discarded-yield %u entry-PC unit(s)\n"
+                                "unit-code-modified %u entry-PC unit(s)\n",
+                        capture.discarded_yield, capture.discarded_code_modified);
                 spu_xdiff_fixture_free(&f);
                 spu_xdiff_poison_plan_free(&plan);
                 return 1;
             }
             printf("captured %u function unit(s) at 0x%X in %s\n",
-                   captured, (unsigned)a.function_entry, a.out_dir);
+                   capture.captured, (unsigned)a.function_entry, a.out_dir);
+            printf("discarded-yield %u entry-PC unit(s)\n", capture.discarded_yield);
+            printf("unit-code-modified %u entry-PC unit(s)\n", capture.discarded_code_modified);
             spu_xdiff_fixture_free(&f);
             spu_xdiff_poison_plan_free(&plan);
             return 0;
