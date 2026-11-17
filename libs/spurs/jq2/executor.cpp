@@ -28,10 +28,12 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <initializer_list>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <utility>
@@ -180,13 +182,19 @@ Kv text(const char* key, const char* v)
     return kv;
 }
 
-[[noreturn]] void stop_with(ps3_stop_kind kind, const char* what, const char* remedy, std::initializer_list<Kv> kvs,
-                            const ps3_stop_site* site = nullptr)
+[[noreturn]] void stop_with_fields(ps3_stop_kind kind, const char* what, const char* remedy, const Kv* kvs,
+                                   std::size_t count, const ps3_stop_site* site = nullptr)
 {
     std::vector<ps3_stop_field> fields;
-    fields.reserve(kvs.size());
-    for (const Kv& kv : kvs) fields.push_back({kv.key, kv.value});
+    fields.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) fields.push_back({kvs[i].key, kvs[i].value});
     ps3_stop(kind, what, remedy, fields.data(), fields.size(), site);
+}
+
+[[noreturn]] void stop_with(ps3_stop_kind kind, const char* what, const char* remedy,
+                            std::initializer_list<Kv> kvs, const ps3_stop_site* site = nullptr)
+{
+    stop_with_fields(kind, what, remedy, kvs.begin(), kvs.size(), site);
 }
 
 /* ---- LV2 event flags --------------------------------------------------- */
@@ -1526,13 +1534,58 @@ void Queue::wake(const Wakeup& w, const JobStart& js)
         /* The PM updates the fiber's state word directly (LS 0x0B28..0x0EBC); the
          * same transition as SendSignal's, so the fiber wakes whether or not it
          * has reached cellFiberPpuWaitSignal yet. */
-        const ps3_fiber_notify_status st = ps3_fiber_notify(w.id);
+        ps3_fiber_notify_diagnostic diagnostic;
+        const ps3_fiber_notify_status st = ps3_fiber_notify_with_diagnostics(w.id, &diagnostic);
         if (st == PS3_FIBER_NOTIFY_OK) return;
-        stop_with(PS3_STOP_JQ2_WAKE, "a registered Port2Sync fiber waiter cannot be signalled",
-                  "The port's waiter word is not a live fiber (null, misaligned, unknown, finished or never "
-                  "created); the line was written by something else, or the fiber was destroyed while waiting.",
-                  {hex("queue", ea_), hex("port", js.port_ea), dec("kind", w.kind), hex("fiber", w.id),
-                   text("reason", "fiber-notify"), dec("status", static_cast<std::uint32_t>(st))});
+
+        std::array<Kv, 19 + 3 * PS3_FIBER_DIAG_EVENT_CAPACITY> fields{};
+        std::array<std::array<char, 24>, 3 * PS3_FIBER_DIAG_EVENT_CAPACITY> event_keys{};
+        std::size_t count = 0;
+        auto add = [&](Kv field) { fields[count++] = field; };
+        add(hex("queue", ea_));
+        add(hex("port", js.port_ea));
+        add(dec("kind", w.kind));
+        add(hex("fiber", w.id));
+        add(text("reason", "fiber-notify"));
+        add(dec("status", static_cast<std::uint32_t>(st)));
+        add(hex("port_a_before", w.completion_before));
+        add(hex("port_a_after", w.completion_after));
+        add(hex("port_waiter", w.id));
+        add(dec("port_wait_kind", (w.completion_before & kWaitKindMask) >> kWaitKindShift));
+        add(hex("notifier_thread_hash", static_cast<std::uint64_t>(
+                                             std::hash<std::thread::id>{}(std::this_thread::get_id()))));
+        add(dec("fiber_found", diagnostic.found));
+        add(dec("fiber_host_state", diagnostic.host_state));
+        add(hex("fiber_word", diagnostic.observed_state));
+        add(dec("fiber_generation", diagnostic.generation));
+        add(dec("fiber_create_seq", diagnostic.create_sequence));
+        add(dec("fiber_finish_seq", diagnostic.finish_sequence));
+        add(dec("fiber_event_count", diagnostic.event_count));
+        for (std::uint32_t i = 0; i < diagnostic.event_count; ++i) {
+            const ps3_fiber_lifecycle_event& event = diagnostic.events[i];
+            char* const seq_key = event_keys[3 * i].data();
+            char* const ids_key = event_keys[3 * i + 1].data();
+            char* const state_key = event_keys[3 * i + 2].data();
+            std::snprintf(seq_key, event_keys[3 * i].size(), "fiber_evt%u_seqgen", i);
+            std::snprintf(ids_key, event_keys[3 * i + 1].size(), "fiber_evt%u_ids", i);
+            std::snprintf(state_key, event_keys[3 * i + 2].size(), "fiber_evt%u_state", i);
+            Kv seqgen{seq_key, {}};
+            std::snprintf(seqgen.value, sizeof seqgen.value, "s=%llX g=%llX",
+                          static_cast<unsigned long long>(event.sequence),
+                          static_cast<unsigned long long>(event.generation));
+            Kv ids{ids_key, {}};
+            std::snprintf(ids.value, sizeof ids.value, "ea=%X cur=%X", event.fiber_ea, event.current_ea);
+            Kv state{state_key, {}};
+            std::snprintf(state.value, sizeof state.value, "k=%u h=%u word=%X",
+                          event.kind, event.host_state, event.guest_state);
+            add(seqgen);
+            add(ids);
+            add(state);
+        }
+        stop_with_fields(PS3_STOP_JQ2_WAKE, "a registered Port2Sync fiber waiter cannot be signalled",
+                         "The port's waiter word is not a live fiber (null, misaligned, unknown, finished or never "
+                         "created); the line was written by something else, or the fiber was destroyed while waiting.",
+                         fields.data(), count);
     }
     if (event_flag) {
         stop_with(PS3_STOP_JQ2_WAKE, "a registered Port2Sync waiter cannot be woken",
@@ -1766,6 +1819,7 @@ struct PortWait {
     /* One SYNC_WAIT per Sync: the first block() starts the span (a wake that finds the line still waiting
      * loops in sync() and blocks again), release() ends it. Zero: tracing was off, or the Sync did not block. */
     std::uint64_t ft0 = 0;
+    bool port_wait_recorded = false;
     Waiter acquire()
     {
         const auto self = static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(cellFiberPpuSelf()));
@@ -1775,6 +1829,10 @@ struct PortWait {
     void block(const Waiter& w)
     {
         if (ft0 == 0 && PS3_FT_ON()) ft0 = ps3_ft_now();
+        if (w.kind == WaitKind::fiber && !port_wait_recorded) {
+            ps3_fiber_note_port_wait(w.id);
+            port_wait_recorded = true;
+        }
         if (w.kind == WaitKind::event_flag) {
             q.block_on(w.id);
             return;

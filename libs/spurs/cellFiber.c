@@ -68,7 +68,7 @@ struct Fiber {
     Sched* sched;
     Runner* runner;
     u32 ea, opd, stack_ea, stack_size;
-    u64 arg;
+    u64 arg, generation, create_sequence, finish_sequence;
     int state, pinned, executing;
     u32 join_ea;
     s32 status;
@@ -100,6 +100,9 @@ static _Atomic u32 s_tls_offset = UINT32_MAX;
 static PPU_THREAD_LOCAL Fiber* t_cur;
 static void (*s_worker_exit_hook)(void*, u32);
 static void* s_worker_exit_user;
+static u64 s_lifecycle_sequence, s_fiber_generation;
+static u32 s_lifecycle_next, s_lifecycle_count;
+static ps3_fiber_lifecycle_event s_lifecycle_events[PS3_FIBER_DIAG_EVENT_CAPACITY];
 #ifdef _WIN32
 static SRWLOCK s_lock = SRWLOCK_INIT;
 static CONDITION_VARIABLE s_cv = CONDITION_VARIABLE_INIT;
@@ -115,6 +118,41 @@ static pthread_cond_t s_cv = PTHREAD_COND_INITIALIZER;
 #define WAIT() pthread_cond_wait(&s_cv, &s_lock)
 #define WAKE() pthread_cond_broadcast(&s_cv)
 #endif
+static u64 lifecycle_record_locked(Fiber* f, u32 fiber_ea, u32 current_ea, u32 kind, u32 guest_state)
+{
+    const u64 sequence = ++s_lifecycle_sequence;
+    ps3_fiber_lifecycle_event* event = &s_lifecycle_events[s_lifecycle_next];
+    event->sequence = sequence;
+    event->generation = f ? f->generation : 0;
+    event->fiber_ea = fiber_ea;
+    event->current_ea = current_ea;
+    event->kind = kind;
+    event->host_state = f ? (u32)f->state : ~(u32)0;
+    event->guest_state = guest_state;
+    s_lifecycle_next = (s_lifecycle_next + 1) % PS3_FIBER_DIAG_EVENT_CAPACITY;
+    if (s_lifecycle_count < PS3_FIBER_DIAG_EVENT_CAPACITY) ++s_lifecycle_count;
+    return sequence;
+}
+static void lifecycle_snapshot_locked(ps3_fiber_notify_diagnostic* diagnostic, u32 fiber_ea,
+                                      const Fiber* f, u32 observed_state)
+{
+    memset(diagnostic, 0, sizeof *diagnostic);
+    diagnostic->fiber_ea = fiber_ea;
+    diagnostic->found = f != NULL;
+    diagnostic->host_state = f ? (u32)f->state : ~(u32)0;
+    diagnostic->observed_state = observed_state;
+    if (f) {
+        diagnostic->generation = f->generation;
+        diagnostic->create_sequence = f->create_sequence;
+        diagnostic->finish_sequence = f->finish_sequence;
+    }
+    diagnostic->event_count = s_lifecycle_count;
+    for (u32 i = 0; i < s_lifecycle_count; ++i) {
+        const u32 slot = (s_lifecycle_next + PS3_FIBER_DIAG_EVENT_CAPACITY - s_lifecycle_count + i) %
+                         PS3_FIBER_DIAG_EVENT_CAPACITY;
+        diagnostic->events[i] = s_lifecycle_events[slot];
+    }
+}
 static PS3_NORETURN void unsupported(const char* api, u32 ea, const char* field, const char* reason)
 {
     char address[16]; snprintf(address, sizeof address, "0x%X", ea);
@@ -194,6 +232,16 @@ static Fiber* find_fiber(u32 ea)
 {
     for (Fiber* f = s_fibers; f; f = f->next) if (f->ea == ea) return f;
     return NULL;
+}
+void ps3_fiber_note_port_wait(u32 fiber_ea)
+{
+    LOCK();
+    Fiber* f = find_fiber(fiber_ea);
+    const u32 guest_state = fiber_ea && !(fiber_ea & 127) && vm_range_ok(fiber_ea, CELL_FIBER_PPU_SIZE)
+                                ? ld32(fiber_ea)
+                                : 0;
+    lifecycle_record_locked(f, fiber_ea, t_cur ? t_cur->ea : 0, PS3_FIBER_EVENT_PORT_WAIT, guest_state);
+    UNLOCK();
 }
 static int all_done(const Sched* s)
 {
@@ -319,6 +367,7 @@ static void finish_locked(Fiber* f, s32 status)
 {
     f->status = status; f->state = F_DONE;
     st32(f->ea, 0x40); lifetime_remove(f);
+    f->finish_sequence = lifecycle_record_locked(f, f->ea, f->ea, PS3_FIBER_EVENT_FINISH, ld32(f->ea));
     for (Fiber* g = s_fibers; g; g = g->next) {
         if (g->state == F_WAIT_JOIN && g->join_ea == f->ea) {
             g->state = F_READY; bits32(g->ea, 0x20, 1); enqueue(g);
@@ -522,6 +571,7 @@ static s32 create_fiber(u32 scheduler, u32 fiber, u32 entry, u64 arg, u32 priori
     if (!f) { UNLOCK(); return (s32)CELL_FIBER_ERROR_NOMEM; }
     f->ea = fiber; f->opd = entry; f->arg = arg; f->stack_ea = stack; f->stack_size = size;
     f->state = F_READY; f->sched = s; f->ctx.vscr = ps3_ppu_initial_vscr();
+    f->generation = ++s_fiber_generation;
     f->ctx.gpr[13] = g_active_ctx->gpr[13];
     f->ctx.thread_id = g_active_ctx->thread_id;
     f->active_ctx = &f->ctx;
@@ -532,6 +582,7 @@ static s32 create_fiber(u32 scheduler, u32 fiber, u32 entry, u64 arg, u32 priori
     vm_write32(fiber + 0x300, entry); vm_write64(fiber + 0x308, arg); vm_write32(fiber + 0x328, fiber);
     if (utility && (!attr || ld32(attr + 8) > 0x26FFFF)) { vm_write32(fiber + 0x10, 1); vm_write64(fiber + 0x18, scheduler); }
     st32(fiber, 1); lifetime_add(f); enqueue(f);
+    f->create_sequence = lifecycle_record_locked(f, fiber, 0, PS3_FIBER_EVENT_CREATE, ld32(fiber));
     /* A worker already asleep in RunFibers must see a fiber created later. The
      * firmware's creation path is not decoded far enough to name how it wakes
      * them, so this is the same notification Wakeup gives (an inference). */
@@ -568,12 +619,13 @@ s32 cellFiberPpuRunFibers(CellFiberPpuScheduler* scheduler)
     }
     --s->running; st8(ea + 0x40, 0); UNLOCK(); return CELL_OK;
 }
-typedef struct SignalOp { u32 ea; int wait, transition, invalid; } SignalOp;
+typedef struct SignalOp { u32 ea; int wait, transition, invalid; u32 observed, result; } SignalOp;
 static int signal_rmw(u8* line, void* user)
 {
     SignalOp* op = user;
     _Atomic u32* p = (_Atomic u32*)(line + (op->ea & 127));
     u32 state = ps3_bswap32(atomic_load_explicit(p, memory_order_relaxed));
+    op->observed = state; op->result = state;
     if (!state || (state & 0x40)) { op->invalid = 1; return 0; }
     if (op->wait) {
         if (state & 0x10) state &= ~0x10u;
@@ -582,6 +634,7 @@ static int signal_rmw(u8* line, void* user)
         if (state & 8) { state = (state & ~8u) | 1; op->transition = 1; }
         else state |= 0x10;
     }
+    op->result = state;
     atomic_store_explicit(p, ps3_bswap32(state), memory_order_release);
     return 1;
 }
@@ -593,32 +646,48 @@ s32 cellFiberPpuWaitSignal(void)
     /* fw libfiber 0x02003BC8 */
     if (!f) return (s32)CELL_FIBER_ERROR_PERM;
     LOCK();
-    SignalOp op = {f->ea, 1, 0, 0};
+    SignalOp op = {f->ea, 1, 0, 0, 0, 0};
     resv_host_rmw(f->ea, signal_rmw, &op);
     /* Not a firmware check: the FW 4.93 WaitSignal core (0x020034A4..0x02003574) has no STAT exit, it
      * retries the atomic update (loop head 0x020034C0). A consistency guard: HLE-only, counted. */
     if (op.invalid) { PS3_FW_DIVERGENCE("F23-wait-invalid"); UNLOCK(); return (s32)CELL_FIBER_ERROR_STAT; }
     if (op.transition) f->state = F_WAIT_SIGNAL;
+    lifecycle_record_locked(f, f->ea, f->ea, PS3_FIBER_EVENT_WAIT_SIGNAL, op.result);
     UNLOCK();
     if (op.transition) host_yield(f);
     return CELL_OK;
 }
-static ps3_fiber_notify_status signal_locked(u32 ea)
+static ps3_fiber_notify_status signal_locked(u32 ea, ps3_fiber_notify_diagnostic* diagnostic)
 {
     Fiber* f = find_fiber(ea);
-    if (!f) return PS3_FIBER_NOTIFY_STATE;
-    SignalOp op = {ea, 0, 0, 0};
+    if (!f) {
+        if (diagnostic) {
+            const u32 observed = ld32(ea);
+            lifecycle_record_locked(NULL, ea, t_cur ? t_cur->ea : 0, PS3_FIBER_EVENT_NOTIFY_REJECT, observed);
+            lifecycle_snapshot_locked(diagnostic, ea, NULL, observed);
+        }
+        return PS3_FIBER_NOTIFY_STATE;
+    }
+    SignalOp op = {ea, 0, 0, 0, 0, 0};
     resv_host_rmw(ea, signal_rmw, &op);
-    if (op.invalid) return PS3_FIBER_NOTIFY_STATE;
+    if (op.invalid) {
+        if (diagnostic) {
+            lifecycle_record_locked(f, ea, t_cur ? t_cur->ea : 0, PS3_FIBER_EVENT_NOTIFY_REJECT, op.observed);
+            lifecycle_snapshot_locked(diagnostic, ea, f, op.observed);
+        }
+        return PS3_FIBER_NOTIFY_STATE;
+    }
     if (op.transition) { f->state = F_READY; enqueue(f); }
+    if (diagnostic)
+        lifecycle_record_locked(f, ea, t_cur ? t_cur->ea : 0, PS3_FIBER_EVENT_SIGNAL, op.result);
     return PS3_FIBER_NOTIFY_OK;
 }
-static s32 public_signal(u32 ea, u32 out)
+static s32 public_signal(u32 ea, u32 out, ps3_fiber_notify_diagnostic* diagnostic)
 {
     if (!ea) return (s32)CELL_FIBER_ERROR_NULL_POINTER;
     if (ea & 127) return (s32)CELL_FIBER_ERROR_ALIGN;
     range("SendSignal", "fiber", ea, CELL_FIBER_PPU_SIZE);
-    LOCK(); const ps3_fiber_notify_status status = signal_locked(ea);
+    LOCK(); const ps3_fiber_notify_status status = signal_locked(ea, diagnostic);
     u32 owner = 0, count = 0;
     if (status == PS3_FIBER_NOTIFY_OK) {
         const u32 scheduler = ld32(ea + 8);
@@ -629,19 +698,40 @@ static s32 public_signal(u32 ea, u32 out)
     UNLOCK();
     if (status != PS3_FIBER_NOTIFY_OK) return (s32)CELL_FIBER_ERROR_STAT;
     WAKE();
-    if (owner) return cellFiberPpuUtilWorkerControlWakeup(owner);
+    if (owner) {
+        const s32 rc = cellFiberPpuUtilWorkerControlWakeup(owner);
+        if (rc != CELL_OK && diagnostic) {
+            LOCK();
+            Fiber* f = find_fiber(ea);
+            const u32 observed = ld32(ea);
+            lifecycle_record_locked(f, ea, t_cur ? t_cur->ea : 0, PS3_FIBER_EVENT_NOTIFY_REJECT, observed);
+            lifecycle_snapshot_locked(diagnostic, ea, f, observed);
+            UNLOCK();
+        }
+        return rc;
+    }
     if (out) { range("SendSignal", "output", out, 4); vm_write32(out, count); }
     return CELL_OK;
 }
-ps3_fiber_notify_status ps3_fiber_notify(u32 ea)
+ps3_fiber_notify_status ps3_fiber_notify_with_diagnostics(u32 ea, ps3_fiber_notify_diagnostic* diagnostic)
 {
-    if (!ea) return PS3_FIBER_NOTIFY_NULL;
-    if (ea & 127) return PS3_FIBER_NOTIFY_ALIGN;
-    const s32 rc = public_signal(ea, 0);
+    if (!ea) {
+        if (diagnostic) memset(diagnostic, 0, sizeof *diagnostic);
+        return PS3_FIBER_NOTIFY_NULL;
+    }
+    if (ea & 127) {
+        if (diagnostic) memset(diagnostic, 0, sizeof *diagnostic);
+        return PS3_FIBER_NOTIFY_ALIGN;
+    }
+    const s32 rc = public_signal(ea, 0, diagnostic);
     return rc == CELL_OK ? PS3_FIBER_NOTIFY_OK : PS3_FIBER_NOTIFY_STATE;
 }
-s32 cellFiberPpuSendSignal(CellFiberPpu* f, u32* out) { return public_signal((u32)(uintptr_t)f, (u32)(uintptr_t)out); }
-s32 cellFiberPpuUtilWorkerControlSendSignal(u32 f, u32 out) { return public_signal(f, out); }
+ps3_fiber_notify_status ps3_fiber_notify(u32 ea)
+{
+    return ps3_fiber_notify_with_diagnostics(ea, NULL);
+}
+s32 cellFiberPpuSendSignal(CellFiberPpu* f, u32* out) { return public_signal((u32)(uintptr_t)f, (u32)(uintptr_t)out, NULL); }
+s32 cellFiberPpuUtilWorkerControlSendSignal(u32 f, u32 out) { return public_signal(f, out, NULL); }
 s32 cellFiberPpuYield(void)
 {
     Fiber* f = t_cur; if (!f) return (s32)CELL_FIBER_ERROR_PERM;

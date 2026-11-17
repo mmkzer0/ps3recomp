@@ -701,6 +701,33 @@ void expect_stop(const std::function<void()>& child, std::initializer_list<const
         if (out.find(needle) == std::string::npos) std::fprintf(stderr, "missing %s in:\n%s\n", needle, out.c_str());
     }
 }
+/* A completed, formerly live waiter still fails closed. Its first wait is real;
+ * the second port line is deliberately stale so the stop report proves the
+ * fiber's create, registration, signal and finish ordering. */
+void stop_finished_waiter()
+{
+    expect_stop([] {
+        boot(1);
+        CHECK(set_intake_paused(QUEUE, true));
+        build_job(0);
+        const uint32_t fiber = make_fiber(arg_of(R_SYNC, 0));
+        start_workers(1);
+        CHECK(until([&] { return waiting() && (rd(fiber) & 0x08); }));
+        CHECK(set_intake_paused(QUEUE, false));
+        CHECK(until([&] { return fibers_done == 1 && (rd(fiber) & 0x40); }));
+        CHECK(rd(PORT + 0x10) == 0);
+
+        build_job(1);
+        wr(PORT, 0x9FFFFFFFu);
+        wr(PORT + 4, fiber);
+        CHECK(call(PUSH, port_ea(0), desc_of(1), 64, 0, 1) == 0);
+        for (;;) std::this_thread::yield();
+    }, {"reason=fiber-notify", "status=3", "port_a_before=0x9FFFFFFF", "port_a_after=0x0",
+        "port_waiter=0x20000", "port_wait_kind=0", "notifier_thread_hash=", "fiber_found=1",
+        "fiber_host_state=4", "fiber_word=0x40", "fiber_generation=1", "fiber_create_seq=1",
+        "fiber_finish_seq=", "fiber_event_count=6", "fiber_evt1_ids=", "fiber_evt1_state=", "fiber_evt4_state="});
+}
+
 /* A fiber whose state word is zero cannot wait: WaitSignal answers STAT, and
  * the executor stops rather than loop on bit 31 or invent a wake. */
 void stop_wait()
@@ -791,6 +818,7 @@ int main(int argc, char** argv)
     else if (mode == "race") race();
     else if (mode == "shutdown") shutdown();
     else if (mode == "c4") c4();
+    else if (mode == "stop-stale-waiter") stop_finished_waiter();
     else if (mode == "stop-wait") stop_wait();
     else if (mode == "push-full") push_full();
     else if (mode == "stop-push-wait") stop_push_wait();

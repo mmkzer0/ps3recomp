@@ -13,6 +13,7 @@
 #   jq2_fiber_stop_push_wait  a fiber that cannot WaitSignal cannot wait on a full ring: jq2-wake
 #   jq2_fiber_trace      the ftrace spans of a fiber's blocked Sync and its credit: waiter 0xFF, wake 2
 #   jq2_fiber_c4         B5's producer property: job output, Sync, GetCount/Release, Acquire
+#   jq2_fiber_stop_stale_waiter  a finished former waiter stays fail-closed and reports lifecycle evidence
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 set(JQ2_FIBER_GEN "${CMAKE_CURRENT_BINARY_DIR}/gen")
 add_custom_command(
@@ -43,7 +44,7 @@ target_include_directories(jq2_fiber PRIVATE "${JQ2_FIBER_GEN}" "${PROJECT_SOURC
     "${PROJECT_SOURCE_DIR}/libs/video" "${PROJECT_SOURCE_DIR}/include")
 target_link_libraries(jq2_fiber PRIVATE ps3recomp_runtime Threads::Threads)
 set_target_properties(jq2_fiber PROPERTIES LINKER_LANGUAGE CXX)
-foreach(mode kind0 spurious mixed race shutdown c4 stop-wait push-full stop-push-wait trace)
+foreach(mode kind0 spurious mixed race shutdown c4 stop-stale-waiter stop-wait push-full stop-push-wait trace)
     string(REPLACE "-" "_" name "${mode}")
     add_test(NAME jq2_fiber_${name} COMMAND jq2_fiber "${mode}")
     set_tests_properties(jq2_fiber_${name} PROPERTIES LABELS "spurs;fiber;t0;tsan" TIMEOUT 120)
