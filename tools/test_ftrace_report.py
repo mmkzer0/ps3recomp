@@ -4,6 +4,7 @@ import contextlib
 import hashlib
 import io
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -92,6 +93,48 @@ with tempfile.TemporaryDirectory() as tmp:
     check(rc == 2 and "hex NID" in err, "bad --cadence: usage error")
     q = subprocess.run([sys.executable, str(TOOL), str(Path(tmp) / "missing.txt")], capture_output=True, text=True)
     check(q.returncode == 2 and "Traceback" not in q.stderr, "missing file: exit 2, no traceback")
+
+# Frame-time tail and usleep calls per frame (PACER-DESIGN 3.2): 100 intervals, 96 of 16.7 ms and then 17.9, 18.2,
+# 18.4, 33.0. Nearest rank: p95 is the 95th smallest (16.7), p99 the 99th (18.4); 3 of 100 are over 18 ms.
+gaps_ms = [16.7] * 96 + [17.9, 18.2, 18.4, 33.0]
+edges = [0.0]
+for g_ms in gaps_ms:
+    edges.append(round(edges[-1] + g_ms, 3))
+tlines = [span(FLIP_REQ, 1, 0, 0, t, t) for t in edges]
+POLL_LR, OTHER_LR = 0x00AB1234, 0x1000
+for f0 in edges[:-1]:
+    tlines.append(span(USLEEP, 1, 40, POLL_LR, f0 + 2, f0 + 12))       # 40 polls merged into one span, every frame
+tlines.append(span(USLEEP, 1, 5, POLL_LR, edges[0] + 13, edges[0] + 14))      # 5 more in frame 0
+for f0 in edges[0:100:2]:
+    tlines.append(span(USLEEP, 2, 2, OTHER_LR, f0 + 1, f0 + 2))         # another thread, every second frame
+
+with tempfile.TemporaryDirectory() as tmp:
+    rc, out, err = run(tmp, trace(tlines), "--json")
+    check(rc == 0, f"tail trace: exit 0: {err}")
+    r = json.loads(out)
+    fr = r["frames"]
+    check(fr["count"] == 100 and abs(fr["median_ms"] - 16.7) < 1e-6, "tail trace: 100 frames, median 16.7")
+    check(abs(fr["p95_ms"] - 16.7) < 1e-6, f"p95 is the 95th smallest interval, got {fr['p95_ms']}")
+    check(abs(fr["p99_ms"] - 18.4) < 1e-6, f"p99 is the 99th smallest interval, got {fr['p99_ms']}")
+    check(abs(fr["over_18ms"] - 0.03) < 1e-9, f"3 of 100 intervals are over 18 ms, got {fr['over_18ms']}")
+    sites = {(t["tid"], s["site"]): s for t in r["all"]["ppu_blocked"] for s in t["sites"]}
+    pacer = sites[(1, f"{POLL_LR:08X}")]
+    check(abs(pacer["calls_per_frame"] - 40.05) < 1e-9, f"calls per frame at the pacer site: {pacer['calls_per_frame']}")
+    check(abs(pacer["ms"] - 10.01) < 1e-6, f"ms per frame at the pacer site: {pacer['ms']}")
+    check(abs(sites[(2, f"{OTHER_LR:08X}")]["calls_per_frame"] - 1.0) < 1e-9, "calls per frame of a site hit every second frame")
+    rc, out, err = run(tmp, trace(tlines))
+    check(rc == 0 and "p95 16.70 ms, p99 18.40 ms, 3.00 % of frames over 18 ms" in out, "text report names the tail")
+    check(re.search(rf"usleep@{POLL_LR:08X} 10\.0 \(40\.\d calls\)", out) is not None,
+          "text report names usleep calls per frame")
+
+# A merged usleep span that crosses a frame edge shares its calls out like its time (the main trace above:
+# one call, 3 ms before the 20 ms edge and 2 ms after, over three frames).
+with tempfile.TemporaryDirectory() as tmp:
+    rc, out, err = run(tmp, trace(lines), "--json")
+    r = json.loads(out)
+    s3000 = next(s for t in r["all"]["ppu_blocked"] if t["tid"] == 1 for s in t["sites"] if s["site"] == "00003000")
+    check(abs(s3000["calls_per_frame"] - 1 / 3) < 1e-9, f"one call over a frame edge: {s3000['calls_per_frame']}")
+    check(abs(s3000["ms"] - 5 / 3) < 1e-6, "its time is unchanged")
 
 # Drawables and label-store waits: four flip requests (0, 20, 40, 60 ms), so every rate divides by 4.
 DRAIN, GPU_ENCODE, GPU_WAIT, DRAWABLE, LABEL_WAIT = 7, 11, 12, 16, 17
@@ -1190,9 +1233,11 @@ XD_FULL = XD_BASE + XD_BODY + XD_VERDICT
 
 
 def xd_text_without_columns(out):
-    """The report with the three per-image xdiff lines removed."""
-    return "".join(l for l in out.splitlines(True)
-                   if not l.startswith(("        tiers: ", "        sampled ", "        verdicts: ")))
+    """The report with the three per-image xdiff lines, the frame-tail line and the usleep call counts removed."""
+    return re.sub(r" \(\d+\.\d calls\)", "",
+                  "".join(l for l in out.splitlines(True)
+                          if not l.startswith(("        tiers: ", "        sampled ", "        verdicts: ",
+                                               "  p95 "))))
 
 
 with tempfile.TemporaryDirectory() as tmp:
@@ -1310,6 +1355,11 @@ with tempfile.TemporaryDirectory() as tmp:
         for x in rows:
             del x["body"], x["verdicts"]
     del rl["jq2"]["xdiff_records"]
+    for k in ("p95_ms", "p99_ms", "over_18ms"):   # the frame tail and the usleep call counts postdate the digest too
+        del rl["frames"][k]
+    for t in rl["all"]["ppu_blocked"]:
+        for s in t["sites"]:
+            s.pop("calls_per_frame", None)
     check(hashlib.sha256(json.dumps(rl, sort_keys=True).encode()).hexdigest() == LEGACY_JSON_SHA256,
           "xdiff: a trace without kinds 32 and 33 has the same JSON as before")
     rc, out, err = run(tmp, jq2_trace(legacy, header=IMG_HEADER))
