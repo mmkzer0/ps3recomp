@@ -41,6 +41,7 @@ static void reuse_refused_slot(void);
 #include <assert.h>
 #include <sched.h>
 #include <fcntl.h>
+#include <dirent.h>
 
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
@@ -104,6 +105,11 @@ static void check_thp_off(int want)
 
 static size_t page_size(void) { return (size_t)sysconf(_SC_PAGESIZE); }
 
+/* Pages mapped to the shared zero page that some snapshot found in a measured stack while the fixture was not mapping
+ * them itself (the READ_LOW thread does, and sets g_zero_expected from then until its join). */
+static size_t g_zero_seen;
+static int g_zero_expected;
+
 /* One line on a stack's residency, read independently of host_stack_high_water: the pages mincore holds resident as
  * runs (offset from the stack's low end in KiB, length in KiB), and on Linux the smaps entry of the mapping that
  * holds the stack (Rss, huge pages, flags). A flake that reports a whole stack resident is told apart from a wrong
@@ -150,6 +156,7 @@ static void stack_snapshot_locked(char* out, size_t cap, uintptr_t lo, size_t si
             else if (pm[i] >> 63 & 1) { if (pm[i] >> 61 & 1) file++; else if (pm[i] >> 56 & 1) excl++; else shared++; }
         }
         n += (size_t)snprintf(out + n, cap - n, " pagemap excl=%zu shared/zero=%zu swapped=%zu file=%zu;", excl, shared, swapped, file);
+        if (shared && !__atomic_load_n(&g_zero_expected, __ATOMIC_ACQUIRE)) __atomic_fetch_add(&g_zero_seen, shared, __ATOMIC_RELAXED);
     }
     if (fd >= 0) close(fd);
     FILE* f = fopen("/proc/self/smaps", "r");
@@ -184,11 +191,103 @@ static void stack_snapshot(char* out, size_t cap, uintptr_t lo, size_t size)
     pthread_mutex_unlock(&lock);
 }
 
+/* ---- a timeline of when stack pages that nobody wrote appear --------------------------------------------------- */
+
+/* dev-ci 44067826552 found pages of a reused thread stack mapped to the shared zero page (read, never written) at a
+ * thread's start. This watcher polls the pagemap of the first measured stack and records every change of the zero /
+ * written page counts next to marks the threads leave at their own steps, so a failing run shows what step the zero
+ * pages first appeared after. Linux only; it reads and never touches the stack. */
+#ifdef __linux__
+#include <time.h>
+struct tl_rec { uint64_t ns; char what[32]; long a, b, c, d; };
+static struct tl_rec g_tl[2048];
+static unsigned g_tl_n;
+static uintptr_t g_watch_lo;
+static size_t g_watch_size;
+static int g_watch_stop;
+static pthread_t g_watcher;
+static int g_watcher_on;
+
+static void mark(const char* what, long a, long b, long c, long d)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    const unsigned i = __atomic_fetch_add(&g_tl_n, 1u, __ATOMIC_RELAXED);
+    if (i >= sizeof g_tl / sizeof g_tl[0]) return;
+    g_tl[i].ns = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    snprintf(g_tl[i].what, sizeof g_tl[i].what, "%s", what);
+    g_tl[i].a = a; g_tl[i].b = b; g_tl[i].c = c; g_tl[i].d = d;
+}
+
+static void* watcher_main(void* unused)
+{
+    (void)unused;
+    static uint64_t pm[1u << 15];
+    long last_zero = -1, last_excl = -1;
+    const size_t pg = page_size();
+    int fd = open("/proc/self/pagemap", O_RDONLY);
+    while (!__atomic_load_n(&g_watch_stop, __ATOMIC_ACQUIRE)) {
+        const uintptr_t lo = __atomic_load_n(&g_watch_lo, __ATOMIC_ACQUIRE);
+        const size_t size = g_watch_size;
+        if (!lo || fd < 0) { sched_yield(); continue; }
+        const uintptr_t base = (lo + pg - 1) & ~(uintptr_t)(pg - 1), end = (lo + size) & ~(uintptr_t)(pg - 1);
+        const size_t pages = (end - base) / pg;
+        if (pages == 0 || pages > (1u << 15) || pread(fd, pm, pages * 8, (off_t)((base / pg) * 8)) != (ssize_t)(pages * 8)) { sched_yield(); continue; }
+        long zero = 0, excl = 0, first = -1, lastz = -1;
+        for (size_t i = 0; i < pages; i++)
+            if (pm[i] >> 63 & 1) {
+                if (pm[i] >> 56 & 1) excl++;
+                else { zero++; if (first < 0) first = (long)i; lastz = (long)i; }
+            }
+        if (zero != last_zero || excl != last_excl) {
+            mark("watch zero/excl/lo/hi(KiB)", zero, excl, first < 0 ? -1 : first * (long)pg / 1024, lastz < 0 ? -1 : (lastz + 1) * (long)pg / 1024);
+            last_zero = zero; last_excl = excl;
+        }
+        sched_yield();
+    }
+    if (fd >= 0) close(fd);
+    return NULL;
+}
+
+static void watcher_start(void)
+{
+    if (pthread_create(&g_watcher, NULL, watcher_main, NULL) == 0) g_watcher_on = 1;
+}
+static void watcher_stop(void)
+{
+    if (!g_watcher_on) return;
+    __atomic_store_n(&g_watch_stop, 1, __ATOMIC_RELEASE);
+    pthread_join(g_watcher, NULL);
+    g_watcher_on = 0;
+}
+static void watch_stack(uintptr_t lo, size_t size)
+{
+    if (__atomic_load_n(&g_watch_lo, __ATOMIC_ACQUIRE)) return;
+    g_watch_size = size;
+    __atomic_store_n(&g_watch_lo, lo, __ATOMIC_RELEASE);
+}
+static void dump_timeline(void)
+{
+    const unsigned n = g_tl_n < sizeof g_tl / sizeof g_tl[0] ? g_tl_n : (unsigned)(sizeof g_tl / sizeof g_tl[0]);
+    for (unsigned i = 0; i < n; i++)
+        fprintf(stderr, "TL %+9.3f ms %s %ld %ld %ld %ld\n", n ? (double)(g_tl[i].ns - g_tl[0].ns) / 1e6 : 0.0, g_tl[i].what,
+                g_tl[i].a, g_tl[i].b, g_tl[i].c, g_tl[i].d);
+    if (g_tl_n > n) fprintf(stderr, "TL ... %u more\n", g_tl_n - n);
+}
+#else
+static void mark(const char* w, long a, long b, long c, long d) { (void)w; (void)a; (void)b; (void)c; (void)d; }
+static void watcher_start(void) {}
+static void watcher_stop(void) {}
+static void watch_stack(uintptr_t lo, size_t size) { (void)lo; (void)size; }
+static void dump_timeline(void) {}
+#endif
+
 /* ---- what the threads do ------------------------------------------------ */
 
 #define FRAME  32768u          /* each recursion level reserves this much and touches every page of it */
 #define NO_RECURSION 0xFFFFu   /* arg low half: run no recursion at all */
 #define PARK         0x10000u  /* arg bit 16: park at the bottom until released, for the live report */
+#define READ_LOW     0x20000u  /* arg bit 17 (Linux): read the low 2 MiB of the stack before running, writing nothing */
 
 static uintptr_t probe_fp(void) __attribute__((noinline));
 static uintptr_t probe_fp(void) { return (uintptr_t)__builtin_frame_address(0); }
@@ -212,30 +311,51 @@ typedef struct {
     int       known;
     int       done;
     char      diag[3][1024];      /* stack_snapshot at the thread's start, after its recursion, and once released */
+    size_t    low_resident;       /* READ_LOW: pages mincore reports resident in the 2 MiB it read */
 } thread_result;
 
-static thread_result g_res[4];
+static thread_result g_res[5];
 static volatile int g_parked, g_release;
-
 
 static void guest_entry(ppu_context* ctx)
 {
     const unsigned arg = (unsigned)ctx->gpr[3];
-    thread_result* r = &g_res[(arg >> 20) & 3];
+    const unsigned slot = (arg >> 20) & 7;
+    thread_result* r = &g_res[slot];
     const unsigned depth = arg & 0xFFFFu;
     uintptr_t lo = 0;
     size_t size = 0;
     r->known = host_stack_range_self(&lo, &size);
     r->end = (lo + size) & ~(uintptr_t)(page_size() - 1);
+    watch_stack(lo, size);
+    mark("thread start", (long)slot, (long)depth, 0, 0);
     if (r->known) stack_snapshot(r->diag[0], sizeof r->diag[0], lo, size);   /* before it recurses */
+    mark("start snapshot done", (long)slot, 0, 0, 0);
+#ifdef __linux__
+    if ((arg & READ_LOW) && r->known) {
+        /* Map the low 2 MiB of this stack to the shared zero page by reading it and writing nothing, the state the
+         * CI run found: mincore reports those pages resident, and no thread has used them. */
+        const size_t pg = page_size();
+        const uintptr_t lowest = (lo + pg - 1) & ~(uintptr_t)(pg - 1);
+        __atomic_store_n(&g_zero_expected, 1, __ATOMIC_RELEASE);
+        for (uintptr_t a = lowest; a < lowest + ((size_t)2 << 20); a += pg) (void)*(volatile const char*)a;
+        static unsigned char vec[512];
+        r->low_resident = 0;
+        if (mincore((void*)lowest, (size_t)2 << 20, vec) == 0)
+            for (size_t i = 0; i < ((size_t)2 << 20) / pg; i++) r->low_resident += vec[i] & 1;
+    }
+#endif
     r->fp = depth == NO_RECURSION ? 0 : recurse(depth);
+    mark("recursed", (long)slot, 0, 0, 0);
     r->known = r->known && host_stack_high_water(lo, size, &r->hw);
     if (r->known) stack_snapshot(r->diag[1], sizeof r->diag[1], lo, size);
+    mark("recursed snapshot done", (long)slot, (long)(r->hw / 1024), 0, 0);
     if (arg & PARK) {
         __atomic_store_n(&g_parked, 1, __ATOMIC_RELEASE);
         while (!__atomic_load_n(&g_release, __ATOMIC_ACQUIRE)) sched_yield();
         if (r->known) stack_snapshot(r->diag[2], sizeof r->diag[2], lo, size);
     }
+    mark("thread returns", (long)slot, 0, 0, 0);
     r->done = 1;
     ctx->gpr[3] = 0;
 }
@@ -251,6 +371,7 @@ static void hook(uint64_t tid, size_t reserved, size_t hw, int known, int live)
     /* An exit report runs on the reported thread itself: look at its stack again with a second, independent
      * reader, so a mark that disagrees with the thread's own says what the kernel held at that moment. */
     char diag[sizeof g_ev[0].diag] = "";
+    mark("hook enter", (long)tid, live, (long)(hw / 1024), 0);
     if (!live) {
         uintptr_t lo; size_t size;
         if (host_stack_range_self(&lo, &size)) {
@@ -267,6 +388,7 @@ static void hook(uint64_t tid, size_t reserved, size_t hw, int known, int live)
             }
         }
     }
+    mark("hook done", (long)tid, live, 0, 0);
     pthread_mutex_lock(&g_ev_mu);
     if (g_nev < 16) {
         g_ev[g_nev].tid = tid; g_ev[g_nev].reserved = reserved; g_ev[g_nev].hw = hw;
@@ -315,12 +437,65 @@ static int vmstat_read(struct vmstat_entry* out, int cap)
     return n;
 }
 
+/* Which mappings of the process hold pages mapped to the shared zero page (read, never written), and which threads
+ * and tracer the process has: a scanner that read every region would leave them everywhere, one that read the stacks
+ * only would not, and a thread of ours would be listed here. */
+static void process_census(void)
+{
+#ifdef __linux__
+    static uint64_t pm[4096];
+    FILE* st = fopen("/proc/self/status", "r");
+    char line[512];
+    while (st && fgets(line, sizeof line, st))
+        if (!strncmp(line, "TracerPid:", 10) || !strncmp(line, "Threads:", 8) || !strncmp(line, "Seccomp:", 8)) {
+            line[strcspn(line, "\n")] = 0;
+            fprintf(stderr, "DIAG status %s\n", line);
+        }
+    if (st) fclose(st);
+    DIR* d = opendir("/proc/self/task");
+    struct dirent* e;
+    fprintf(stderr, "DIAG tasks:");
+    while (d && (e = readdir(d)))
+        if (e->d_name[0] != '.') {
+            char path[320], comm[32] = "?";
+            snprintf(path, sizeof path, "/proc/self/task/%s/comm", e->d_name);
+            FILE* c = fopen(path, "r");
+            if (c && fgets(comm, sizeof comm, c)) comm[strcspn(comm, "\n")] = 0;
+            if (c) fclose(c);
+            fprintf(stderr, " %s=%s", e->d_name, comm);
+        }
+    if (d) closedir(d);
+    fprintf(stderr, "\n");
+    const size_t pg = page_size();
+    FILE* maps = fopen("/proc/self/maps", "r");
+    int fd = open("/proc/self/pagemap", O_RDONLY);
+    while (maps && fd >= 0 && fgets(line, sizeof line, maps)) {
+        unsigned long a, b;
+        char perms[8];
+        if (sscanf(line, "%lx-%lx %7s", &a, &b, perms) != 3 || perms[0] != 'r' || perms[1] != 'w') continue;
+        size_t zero = 0, excl = 0;
+        for (unsigned long p = a; p < b; p += 4096 * pg) {
+            const size_t n = (b - p) / pg < 4096 ? (b - p) / pg : 4096;
+            if (pread(fd, pm, n * 8, (off_t)((p / pg) * 8)) != (ssize_t)(n * 8)) break;
+            for (size_t i = 0; i < n; i++)
+                if (pm[i] >> 63 & 1) { if (pm[i] >> 56 & 1) excl++; else zero++; }
+        }
+        if (zero) {
+            line[strcspn(line, "\n")] = 0;
+            fprintf(stderr, "DIAG vma with zero pages: zero=%zu excl=%zu %.80s\n", zero, excl, line);
+        }
+    }
+    if (fd >= 0) close(fd);
+    if (maps) fclose(maps);
+#endif
+}
+
 /* What a failing run knows about each thread's stack: at its start, after its recursion, when it was released, and
  * at its exit report. */
 static void dump_diagnostics(void)
 {
     static const char* const phase[3] = { "start", "recursed", "released" };
-    for (unsigned s = 0; s < 4; s++)
+    for (unsigned s = 0; s < 5; s++)
         for (unsigned p = 0; p < 3; p++)
             if (g_res[s].diag[p][0])
                 fprintf(stderr, "DIAG slot %u %s: %s\n", s, phase[p], g_res[s].diag[p]);
@@ -338,6 +513,7 @@ static void dump_diagnostics(void)
             if (!strcmp(now[i].name, g_vm0[j].name) && now[i].v != g_vm0[j].v)
                 fprintf(stderr, " %s%+lld", now[i].name, (long long)(now[i].v - g_vm0[j].v));
     fprintf(stderr, "\n");
+    process_census();
 }
 
 /* ---- driving sys_ppu_thread_create -------------------------------------- */
@@ -353,7 +529,9 @@ static int64_t create_thread(uint64_t arg, uint64_t* tid_out)
     ctx.gpr[7] = 0x10000;               /* guest stack size */
     ctx.gpr[8] = 1;                     /* joinable */
     ctx.gpr[9] = 0;                     /* name */
+    mark("main: create", (long)arg, 0, 0, 0);
     const int64_t rc = sys_ppu_thread_create(&ctx);
+    mark("main: created", (long)rc, 0, 0, 0);
     if (rc == 0 && tid_out) {
         uint64_t be;
         memcpy(&be, vm_base + 0x100, 8);
@@ -367,7 +545,9 @@ static void join_thread(uint64_t tid)
     ppu_context ctx;
     memset(&ctx, 0, sizeof ctx);
     ctx.gpr[3] = tid;
+    mark("main: join", (long)tid, 0, 0, 0);
     CHECK(sys_ppu_thread_join(&ctx) == 0);
+    mark("main: joined", (long)tid, 0, 0, 0);
 }
 
 /* Run one thread to its end and return its tid. */
@@ -424,6 +604,7 @@ int main(int argc, char** argv)
 {
     const int on = !(argc > 1 && !strcmp(argv[1], "off"));
     vmstat_read(g_vm0, 48);
+    if (on) watcher_start();
     if (on) setenv("PS3_HOST_STACK_HWM", "1", 1);
     else    unsetenv("PS3_HOST_STACK_HWM");
 
@@ -551,7 +732,38 @@ int main(int argc, char** argv)
         CHECK(tid > tid_d);
     }
 
+#ifdef __linux__
+    /* 9. Pages that were only read are not stack the thread used. The thread maps the low 2 MiB of its stack to the
+     * shared zero page by reading it (mincore then reports them resident, as in dev-ci 44067826552), and writes only
+     * its own 8-frame recursion near the top (deeper than the TLS block glibc puts there): the mark is that
+     * recursion's depth, not the span down to the read pages. */
+    {
+        const uint64_t tid = run_thread(4, 8 | READ_LOW);
+        __atomic_store_n(&g_zero_expected, 0, __ATOMIC_RELEASE);
+        const thread_result* r = &g_res[4];
+        size_t rsv = 0, hw = 0; int known = 0;
+        CHECK(events_for(tid, 0, &rsv, &hw, &known) == 1 && known);
+        if (r->low_resident < ((size_t)2 << 20) / pg / 2) {
+            fprintf(stderr, "SKIP zero-page probe: mincore reports %zu of %zu read pages resident\n", r->low_resident, ((size_t)2 << 20) / pg);
+        } else {
+            const size_t exact = (size_t)(r->end - r->fp);
+            CHECK_V(r->hw >= exact && r->hw <= exact + pg, "in-thread mark %zu, recursion %zu, page %zu, read pages resident %zu",
+                    r->hw, exact, pg, r->low_resident);
+            CHECK_V(hw == r->hw, "exit report %zu, in-thread %zu", hw, r->hw);
+        }
+    }
+#endif
+
     printf("%s\n", g_fails ? "FAILED" : "ok");
-    if (g_fails) dump_diagnostics();
+    watcher_stop();
+    if (g_fails) { dump_diagnostics(); dump_timeline(); }
+    else if (__atomic_load_n(&g_zero_seen, __ATOMIC_RELAXED)) {
+        /* Not a failure: the marks above no longer count such pages. But something read a measured stack the
+         * fixture did not, and the run that saw it keeps the evidence, which the python driver prints under CI. */
+        fprintf(stderr, "NOTE %zu pages of a measured stack were mapped to the zero page by something other than this fixture\n",
+                __atomic_load_n(&g_zero_seen, __ATOMIC_RELAXED));
+        dump_diagnostics();
+        dump_timeline();
+    }
     return g_fails ? 1 : 0;
 }

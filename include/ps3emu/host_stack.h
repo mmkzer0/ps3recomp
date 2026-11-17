@@ -5,9 +5,11 @@
  * PPU threads, runtime/spu/spu_workload.c for the async-dispatch threads) build in fixtures that link neither.
  *
  * The stack grows down, so the high-water mark is the span from the top of the stack to the lowest page the
- * thread touched: the lowest page mincore reports resident (POSIX) or committed (Windows: VirtualQuery). That is
- * exact to one host page, except where the host can take a touched page away: iOS compresses cold pages, a page
- * that is no longer resident is not counted, and the report is then a lower bound. Nothing is pre-filled (that
+ * thread touched: the lowest page mincore reports resident (POSIX) or committed (Windows: VirtualQuery); on Linux
+ * only a page that was written counts, since mincore also reports a page that was merely read (the shared zero
+ * page), see host_stack_high_water. That is exact to one host page, except where the host can take a touched page
+ * away: iOS compresses cold pages, a page that is no longer resident is not counted, and the report is then a lower
+ * bound. Nothing is pre-filled (that
  * would commit the whole reservation). Linux transparent huge pages are the opposite case: one touch makes the
  * whole 2 MiB around it resident, mincore says so, and the mark would be rounded up to 2 MiB steps;
  * host_stack_measure_prepare turns them off for a measuring run.
@@ -27,6 +29,7 @@
 #else
 #  include <pthread.h>
 #  include <sys/mman.h>
+#  include <fcntl.h>
 #  include <stdlib.h>
 #  include <unistd.h>
 #  ifdef __linux__
@@ -95,9 +98,47 @@ static inline void host_stack_measure_prepare(void)
 #endif
 }
 
+#if !defined(_WIN32) && defined(__linux__)
+/* The lowest address in [from, end) whose page was written, or is file-backed or swapped (see host_stack_high_water);
+ * `end` when there is none. A pagemap that cannot be read answers with the first page it could not read, so the page
+ * mincore found stays counted. Entry bits (Documentation/admin-guide/mm/pagemap.rst): 63 present, 62 swapped,
+ * 61 file or shared-anon, 56 exclusively mapped. */
+static inline uintptr_t host_stack_first_used(uintptr_t from, uintptr_t end, size_t pg)
+{
+    const int fd = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return from;
+    uint64_t pm[512];
+    uintptr_t a = from;
+    while (a < end) {
+        size_t n = (size_t)((end - a) / pg);
+        if (n > sizeof pm / sizeof pm[0]) n = sizeof pm / sizeof pm[0];
+        if (pread(fd, pm, n * sizeof pm[0], (off_t)((a / pg) * sizeof pm[0])) != (ssize_t)(n * sizeof pm[0])) break;
+        for (size_t i = 0; i < n; i++) {
+            const uint64_t e = pm[i];
+            if ((e >> 63 & 1) ? ((e >> 56 & 1) || (e >> 61 & 1)) : (e >> 62 & 1)) {
+                close(fd);
+                return a + i * pg;
+            }
+        }
+        a += n * pg;
+    }
+    close(fd);
+    return a;
+}
+#endif
+
 /* The span from the top of [lo, lo + size) down to the lowest page that was touched, rounded to host pages.
  * Returns 0 (and leaves *high_water unset) when the host would not say. May run on any thread: only the range is
- * read, so the stack must still be mapped. */
+ * read, so the stack must still be mapped.
+ *
+ * "Touched" is "written" on Linux, which mincore alone does not say: a page that was only READ is mapped to the
+ * shared zero page and mincore reports it resident, though no thread's stack ever held anything there. dev-ci run
+ * 44067826552 (x86_64, kernel 7.0.0-1017-azure) found hundreds of such pages, in windows of 0.3 to 1.5 MiB that grew
+ * while a thread ran, at the low end of a reused 16 MiB glibc stack (pagemap: present, not exclusive, Rss unchanged),
+ * and the marks came out as 16 MiB for a thread that had used 300 KiB. No code of this repository that was read for
+ * it reads those pages and the reader was not identified. The measurement must not depend on it, so a page counts only when pagemap
+ * (flags only, readable without privilege) says it is exclusively mapped, file-backed or swapped. A forked child's
+ * pages are shared until written, so its marks are lower bounds; pagemap unreadable: mincore's answer stands. */
 static inline int host_stack_high_water(uintptr_t lo, size_t size, size_t* high_water)
 {
 #ifdef _WIN32
@@ -131,7 +172,11 @@ static inline int host_stack_high_water(uintptr_t lo, size_t size, size_t* high_
         if (mincore((void*)a, n * pg, vec) != 0) return 0;
         for (size_t i = 0; i < n; i++) {
             if (vec[i] & 1) {                    /* MINCORE_INCORE */
-                *high_water = (size_t)(end - (a + i * pg));
+                uintptr_t first = a + i * pg;
+#  ifdef __linux__
+                first = host_stack_first_used(first, end, pg);
+#  endif
+                *high_water = (size_t)(end - first);
                 return 1;
             }
         }
