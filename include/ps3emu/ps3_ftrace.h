@@ -204,7 +204,10 @@ enum ps3_ft_kind {
     PS3_FT_ENG_PRESENT    = 37, /* instant (t0 == t1): the draw engine's present of a frame returned (eng_present, so a flip
                               * the FIFO resolved and a host-driven present both count; a present that was skipped for
                               * lack of a surface does not), on the presenting thread, never filtered; who = 0,
-                              * a = present sequence number (the engine's present ordinal, first present 0), b = 0.
+                              * a = present sequence number (the engine's present ordinal, first present 0), b = the flip id
+                              * this present shows (RSX_FRAME_NO_FLIP when no head has retired). A guest flip can be
+                              * presented more than once (toolkit #144), so a consumer pairs an input edge only with a
+                              * present whose flip id differs from the previous present's -- the first present of a frame.
                               * Not PS3_FT_PRESENT (10): that kind is the Metal backend's timed span around a host-driven
                               * present and the report keeps it as the RSX "present" row */
 };

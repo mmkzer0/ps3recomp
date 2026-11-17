@@ -2882,7 +2882,18 @@ def pad_latency_section(spans, dropped):
     edges = sorted(s[4] for s in spans if s[0] == PAD_EDGE)
     if not edges:
         return None
-    presents = sorted(s[4] for s in spans if s[0] == ENG_PRESENT)
+    # One guest flip can be presented twice (toolkit #144), and only the first present of a flip can show a frame
+    # built from a new pad read. The flip id travels in b; a trace written before that field existed has b == 0
+    # everywhere and keeps the old one-present-per-sample behaviour.
+    raw = sorted((s[4], s[3]) for s in spans if s[0] == ENG_PRESENT)
+    if raw and all(flip == 0 for _t, flip in raw):
+        presents = [t for t, _flip in raw]
+    else:
+        presents, last_flip = [], None
+        for t0, flip in raw:
+            if flip != last_flip:
+                presents.append(t0)
+                last_flip = flip
     flips = sorted(s[4] for s in spans if s[0] == FLIP_REQ)
     lat, behind, no_present, no_flip = [], collections.Counter(), 0, 0
     for e in edges:

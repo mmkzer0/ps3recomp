@@ -4171,8 +4171,13 @@ static void eng_present(u32 buffer_id, u32 target)
     t_present_path = 0;
     /* The one place every present of a frame passes (a flip the FIFO resolved, a host-driven present):
      * the end of the input-to-present latency measurement. After the backend returned, so a drawable
-     * wait is inside the interval; g.frames is this present's ordinal, the identity's present_seq. */
-    if (PS3_FT_ON()) { const uint64_t t = ps3_ft_now(); ps3_ft_span(PS3_FT_ENG_PRESENT, 0, g.frames, 0, t, t); }
+     * wait is inside the interval; g.frames is this present's ordinal, and b is the flip the present
+     * shows, because a guest flip can be presented more than once (toolkit #144) and only the first
+     * present of a flip can show a frame built from a new pad read. */
+    if (PS3_FT_ON()) {
+        const uint64_t t = ps3_ft_now();
+        ps3_ft_span(PS3_FT_ENG_PRESENT, 0, g.frames, fid.flip_id, t, t);
+    }
     /* The capture's frame is the flip head's: one frame per retired flip,
      * recorded at the first present that names it. A host present after the
      * head names the same flip and is not a frame. */

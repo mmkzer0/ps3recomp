@@ -1845,5 +1845,23 @@ with tempfile.TemporaryDirectory() as tmp:
     rc, out, err = run(tmp, trace(padlines[:13] + padlines[17:]))
     check(rc == 0 and "Pad latency" not in out, "pad latency: a trace without kind 36 prints no section")
 
+# A guest flip presented twice (toolkit #144): only the first present of a flip is a new frame. Flip k is presented
+# at 16.7k (flip id k) and again 0.3 ms later with the same id. The edge at 16.9 ms sits after flip 1's first
+# present and before its duplicate, so the consuming present must be flip 2's first present at 33.4 ms (16.5 ms),
+# not the duplicate at 17.0 ms (0.1 ms).
+dup = []
+for k in range(1, 4):
+    dup.append(span(ENG_PRESENT, 0, 2 * k - 1, k, 16.7 * k, 16.7 * k))
+    dup.append(span(ENG_PRESENT, 0, 2 * k, k, 16.7 * k + 0.3, 16.7 * k + 0.3))
+dup.append(span(PAD_EDGE, 0, 1, 0xAB, 16.9, 16.9))
+dup += [span(FLIP_REQ, 1, 0, 0, t, t) for t in (2, 30, 105)]   # the report needs three flip requests
+with tempfile.TemporaryDirectory() as tmp:
+    rc, out, err = run(tmp, trace(dup), "--json")
+    p = json.loads(out)["pad_latency"]
+    check(rc == 0 and p["presents"] == 3 and p["edges"] == 1 and abs(p["latency_ms"]["max"] - 16.5) < 1e-9,
+          "pad latency: a duplicate present of the same flip is not a new frame")
+    check("latency p50 16.500" in run(tmp, trace(dup))[1],
+          "pad latency: the text report pairs with the new frame, not the duplicate")
+
 print("ftrace_report: %s" % ("ok" if not failures else "%d failed" % failures))
 sys.exit(1 if failures else 0)
