@@ -23,6 +23,7 @@
 #include "ps3emu/yz_runtime_config.h"
 #include "ps3emu/yz_frontier_trace.h"
 #include "ps3emu/log_first.h"
+#include "ps3emu/ps3_log.h"   /* PS3_LOG: tagged lines, stderr bytes unchanged */
 #include "ps3emu/stop.h"
 
 #if !defined(_WIN32)
@@ -781,8 +782,7 @@ static void ld_present_measure_dump(void)
         }
     }
     fclose(f);
-    fprintf(stderr,
-            "[present-qpc] preserved %llu successful presents at %lld Hz in %s\n",
+    PS3_LOG(PS3_LOG_INFO, "present-qpc", "preserved %llu successful presents at %lld Hz in %s\n",
             (unsigned long long)(g_ld_present_total - first + 1u),
             g_ld_qpc_frequency, path);
 }
@@ -816,8 +816,7 @@ static void ld_drain_info_queue(const char* where)
         if (!message) break;
         if (SUCCEEDED(g_ld_info_queue->lpVtbl->GetMessage(
                 g_ld_info_queue, i, message, &bytes))) {
-            fprintf(stderr,
-                    "[d3d-debug] where=%s frame=%u severity=%s id=%u %s\n",
+            PS3_LOG(PS3_LOG_INFO, "d3d-debug", "where=%s frame=%u severity=%s id=%u %s\n",
                     where, g_ld_frames,
                     ld_d3d_severity_name(message->Severity),
                     (unsigned)message->ID,
@@ -835,8 +834,7 @@ static void ld_dump_recent_draws(void)
     const u64 first =
         g_ld_recent_draw_total > LD_RECENT_DRAW_CAP
             ? g_ld_recent_draw_total - LD_RECENT_DRAW_CAP + 1u : 1u;
-    fprintf(stderr,
-            "[draw-history] total=%llu retained=%llu..%llu\n",
+    PS3_LOG(PS3_LOG_INFO, "draw-history", "total=%llu retained=%llu..%llu\n",
             (unsigned long long)g_ld_recent_draw_total,
             (unsigned long long)first,
             (unsigned long long)g_ld_recent_draw_total);
@@ -844,8 +842,7 @@ static void ld_dump_recent_draws(void)
         const ld_recent_draw* draw =
             &g_ld_recent_draws[(serial - 1u) & (LD_RECENT_DRAW_CAP - 1u)];
         if (draw->serial != serial) continue;
-        fprintf(stderr,
-                "[draw-history] serial=%llu frame=%u key=%016llX "
+        PS3_LOG(PS3_LOG_INFO, "draw-history", "serial=%llu frame=%u key=%016llX "
                 "vp=%u+%u fp=%u:0x%X+%u ctrl=0x%X "
                 "mask{tex=%04X cube=%04X vtex=%04X txl=%04X} "
                 "prim=%u verts=%u target=%u z=%u "
@@ -888,7 +885,7 @@ static void ld_enable_dred(void)
     const HRESULT hr = D3D12GetDebugInterface(
         &IID_ID3D12DeviceRemovedExtendedDataSettings, (void**)&settings);
     if (FAILED(hr) || !settings) {
-        fprintf(stderr, "[dred] settings unavailable hr=0x%08lX\n",
+        PS3_LOG(PS3_LOG_WARN, "dred", "settings unavailable hr=0x%08lX\n",
                 (unsigned long)hr);
         return;
     }
@@ -897,7 +894,7 @@ static void ld_enable_dred(void)
     settings->lpVtbl->SetPageFaultEnablement(
         settings, D3D12_DRED_ENABLEMENT_FORCED_ON);
     settings->lpVtbl->Release(settings);
-    fprintf(stderr, "[dred] auto-breadcrumbs and page-fault tracking enabled\n");
+    PS3_LOG(PS3_LOG_INFO, "dred", "auto-breadcrumbs and page-fault tracking enabled\n");
 }
 
 static void ld_enable_debug_layer(void)
@@ -907,15 +904,14 @@ static void ld_enable_debug_layer(void)
     const HRESULT hr = D3D12GetDebugInterface(
         &IID_ID3D12Debug, (void**)&debug);
     if (FAILED(hr) || !debug) {
-        fprintf(stderr,
-                "[d3d-debug] validation layer unavailable hr=0x%08lX\n",
+        PS3_LOG(PS3_LOG_WARN, "d3d-debug", "validation layer unavailable hr=0x%08lX\n",
                 (unsigned long)hr);
         return;
     }
     debug->lpVtbl->EnableDebugLayer(debug);
     debug->lpVtbl->Release(debug);
     g_ld_debug_layer_enabled = 1;
-    fprintf(stderr, "[d3d-debug] validation layer enabled\n");
+    PS3_LOG(PS3_LOG_INFO, "d3d-debug", "validation layer enabled\n");
 }
 
 static void ld_open_info_queue(void)
@@ -924,8 +920,7 @@ static void ld_open_info_queue(void)
     const HRESULT hr = g.dev->lpVtbl->QueryInterface(
         g.dev, &IID_ID3D12InfoQueue, (void**)&g_ld_info_queue);
     if (FAILED(hr) || !g_ld_info_queue) {
-        fprintf(stderr,
-                "[d3d-debug] info queue unavailable hr=0x%08lX\n",
+        PS3_LOG(PS3_LOG_WARN, "d3d-debug", "info queue unavailable hr=0x%08lX\n",
                 (unsigned long)hr);
         return;
     }
@@ -942,8 +937,7 @@ static void ld_open_info_queue(void)
         g_ld_info_queue, &filter);
     g_ld_info_queue->lpVtbl->SetMessageCountLimit(
         g_ld_info_queue, 65536u);
-    fprintf(stderr,
-            "[d3d-debug] info queue attached (warning/error/corruption)\n");
+    PS3_LOG(PS3_LOG_INFO, "d3d-debug", "info queue attached (warning/error/corruption)\n");
 }
 
 static void ld_dump_dred(const char* where, HRESULT trigger_hr)
@@ -952,8 +946,7 @@ static void ld_dump_dred(const char* where, HRESULT trigger_hr)
     ld_drain_info_queue(where);
     ld_dump_recent_draws();
     const HRESULT removed = g.dev->lpVtbl->GetDeviceRemovedReason(g.dev);
-    fprintf(stderr,
-            "[dred] trigger=%s hr=0x%08lX removed=0x%08lX frame=%u "
+    PS3_LOG(PS3_LOG_INFO, "dred", "trigger=%s hr=0x%08lX removed=0x%08lX frame=%u "
             "surfaces=%u zetas=%u textures=%u psos=%u\n",
             where, (unsigned long)trigger_hr, (unsigned long)removed,
             g_ld_frames, g.n_surfaces, g.n_zdepths, g.n_textures, g.n_psos);
@@ -962,14 +955,14 @@ static void ld_dump_dred(const char* where, HRESULT trigger_hr)
     HRESULT hr = g.dev->lpVtbl->QueryInterface(
         g.dev, &IID_ID3D12DeviceRemovedExtendedData1, (void**)&dred);
     if (FAILED(hr) || !dred) {
-        fprintf(stderr, "[dred] query failed hr=0x%08lX\n",
+        PS3_LOG(PS3_LOG_WARN, "dred", "query failed hr=0x%08lX\n",
                 (unsigned long)hr);
         return;
     }
 
     D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT1 breadcrumbs = {0};
     hr = dred->lpVtbl->GetAutoBreadcrumbsOutput1(dred, &breadcrumbs);
-    fprintf(stderr, "[dred] breadcrumbs hr=0x%08lX\n", (unsigned long)hr);
+    PS3_LOG(PS3_LOG_INFO, "dred", "breadcrumbs hr=0x%08lX\n", (unsigned long)hr);
     if (SUCCEEDED(hr)) {
         const D3D12_AUTO_BREADCRUMB_NODE1* node =
             breadcrumbs.pHeadAutoBreadcrumbNode;
@@ -977,8 +970,7 @@ static void ld_dump_dred(const char* where, HRESULT trigger_hr)
              node = node->pNext, node_index++) {
             const u32 last = node->pLastBreadcrumbValue
                 ? *node->pLastBreadcrumbValue : 0;
-            fprintf(stderr,
-                    "[dred] node=%u list=%s queue=%s count=%u last=%u\n",
+            PS3_LOG(PS3_LOG_INFO, "dred", "node=%u list=%s queue=%s count=%u last=%u\n",
                     node_index,
                     node->pCommandListDebugNameA
                         ? node->pCommandListDebugNameA : "<unnamed>",
@@ -992,8 +984,7 @@ static void ld_dump_dred(const char* where, HRESULT trigger_hr)
                 end = node->BreadcrumbCount - 1;
             for (u32 i = first; i <= end; i++) {
                 const D3D12_AUTO_BREADCRUMB_OP op = node->pCommandHistory[i];
-                fprintf(stderr,
-                        "[dred]   op[%u]%s=%u(%s)\n",
+                PS3_LOG(PS3_LOG_INFO, "dred", "  op[%u]%s=%u(%s)\n",
                         i, i == last ? "*" : "",
                         (unsigned)op, ld_dred_op_name(op));
             }
@@ -1002,8 +993,7 @@ static void ld_dump_dred(const char* where, HRESULT trigger_hr)
 
     D3D12_DRED_PAGE_FAULT_OUTPUT1 fault = {0};
     hr = dred->lpVtbl->GetPageFaultAllocationOutput1(dred, &fault);
-    fprintf(stderr,
-            "[dred] page-fault hr=0x%08lX va=0x%016llX\n",
+    PS3_LOG(PS3_LOG_INFO, "dred", "page-fault hr=0x%08lX va=0x%016llX\n",
             (unsigned long)hr,
             (unsigned long long)fault.PageFaultVA);
     if (SUCCEEDED(hr)) {
@@ -1016,8 +1006,7 @@ static void ld_dump_dred(const char* where, HRESULT trigger_hr)
             const D3D12_DRED_ALLOCATION_NODE1* allocation = lists[list];
             for (u32 i = 0; allocation && i < 16;
                  allocation = allocation->pNext, i++) {
-                fprintf(stderr,
-                        "[dred] %s[%u] type=%u name=%s object=%p\n",
+                PS3_LOG(PS3_LOG_INFO, "dred", "%s[%u] type=%u name=%s object=%p\n",
                         labels[list], i, (unsigned)allocation->AllocationType,
                         allocation->ObjectNameA
                             ? allocation->ObjectNameA : "<unnamed>",
@@ -1214,8 +1203,7 @@ static u32 g_ld_a010_camera_bits[16];
 
 static void ld_movement_camera_snapshot(LONG phase)
 {
-    fprintf(stderr,
-            "[movement-frontier-rsx] phase=%ld frame=%u root=%ld "
+    PS3_LOG(PS3_LOG_INFO, "movement-frontier-rsx", "phase=%ld frame=%u root=%ld "
             "reference_active=%ld camera_ready=%ld\n",
             phase, g_ld_frames,
             InterlockedCompareExchange(&g_yz_a010_root_active, 0, 0),
@@ -1223,8 +1211,7 @@ static void ld_movement_camera_snapshot(LONG phase)
                 &g_yz_a010_reference_camera_active, 0, 0),
             InterlockedCompareExchange(&g_ld_a010_camera_ready, 0, 0));
     for (u32 row = 0; row < 4u; ++row) {
-        fprintf(stderr,
-                "[movement-frontier-rsx-camera] phase=%ld row=%u "
+        PS3_LOG(PS3_LOG_INFO, "movement-frontier-rsx-camera", "phase=%ld row=%u "
                 "constant=%08X/%08X/%08X/%08X "
                 "fallback=%08X/%08X/%08X/%08X\n",
                 phase, row,
@@ -1745,8 +1732,7 @@ static void ld_flush(ld_flush_reason reason)
 #endif
     const HRESULT close_hr = g.list->lpVtbl->Close(g.list);
     if (FAILED(close_hr)) {
-        fprintf(stderr,
-                "[d3d-fail] command-list Close hr=0x%08lX frame=%u\n",
+        PS3_LOG(PS3_LOG_INFO, "d3d-fail", "command-list Close hr=0x%08lX frame=%u\n",
                 (unsigned long)close_hr, g_ld_frames);
         ld_dump_dred("Close", close_hr);
         g.ready = 0;
@@ -1758,8 +1744,7 @@ static void ld_flush(ld_flush_reason reason)
     const HRESULT signal_hr =
         g.queue->lpVtbl->Signal(g.queue, g.fence, v);
     if (FAILED(signal_hr)) {
-        fprintf(stderr,
-                "[d3d-fail] queue Signal hr=0x%08lX frame=%u\n",
+        PS3_LOG(PS3_LOG_INFO, "d3d-fail", "queue Signal hr=0x%08lX frame=%u\n",
                 (unsigned long)signal_hr, g_ld_frames);
         ld_dump_dred("Signal", signal_hr);
         g.ready = 0;
@@ -1773,8 +1758,7 @@ static void ld_flush(ld_flush_reason reason)
             g.fence->lpVtbl->SetEventOnCompletion(
                 g.fence, v, g.fence_event);
         if (FAILED(event_hr)) {
-            fprintf(stderr,
-                    "[d3d-fail] fence SetEventOnCompletion "
+            PS3_LOG(PS3_LOG_INFO, "d3d-fail", "fence SetEventOnCompletion "
                     "hr=0x%08lX frame=%u\n",
                     (unsigned long)event_hr, g_ld_frames);
             ld_dump_dred("SetEventOnCompletion", event_hr);
@@ -2129,7 +2113,7 @@ static u64 texture_content_hash(const rsx_dsp_texture* t, int* readable)
           char head[80]; int hn = 0;
           for (u32 q = 0; q < 16 && q < span; q++)
               hn += snprintf(head + hn, sizeof head - hn, "%02X", src[q]);
-          fprintf(stderr, "[tex-src] loc=%u off=0x%08X %ux%u fmt=0x%02X mips=%u"
+          PS3_LOG(PS3_LOG_INFO, "tex-src", "loc=%u off=0x%08X %ux%u fmt=0x%02X mips=%u"
                           " remap=0x%08X filter=0x%08X head=%s"
                           " span=%u nonzero=%u\n",
                   t->location, t->offset, t->width, t->height,
@@ -2334,7 +2318,7 @@ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
                   for (u32 yy = 0; yy < mh; yy++)
                       fwrite(level_src + (size_t)yy * pitch, 1, mw, pf);
                   fclose(pf);
-                  fprintf(stderr, "[plane-dump] %s linear=%d\n", fn, linear);
+                  PS3_LOG(PS3_LOG_INFO, "plane-dump", "%s linear=%d\n", fn, linear);
               }
               pdn++;
           } }
@@ -2382,7 +2366,7 @@ static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
                       fwrite(rgba[n] + (size_t)q * 4, 1, 3, tf);
                   fclose(tf);
               }
-              fprintf(stderr, "[tex-rgba] %s fmt=0x%02X remap=0x%04X linear=%d"
+              PS3_LOG(PS3_LOG_INFO, "tex-rgba", "%s fmt=0x%02X remap=0x%04X linear=%d"
                               " pitch=%u nonblack=%llu/%u alpha>0x1A=%llu\n",
                       fn, base_fmt, remap, linear, pitch,
                       (unsigned long long)nb, mw * mh, (unsigned long long)na);
@@ -2513,8 +2497,7 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
                   checks++;
                   if (r2 && again != hash) torn++;
                   if ((checks % 256) == 0)
-                      fprintf(stderr,
-                              "[tex-race] src=%u:0x%08X %ux%u  torn %llu/%llu reads"
+                      PS3_LOG(PS3_LOG_INFO, "tex-race", "src=%u:0x%08X %ux%u  torn %llu/%llu reads"
                               " (%.1f%%)\n",
                               t->location, t->offset, t->width, t->height,
                               (unsigned long long)torn,
@@ -2537,7 +2520,7 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
                   if (!readable) unread++;
                   if (readable && hash != entry->content_hash) changed++;
                   if ((checks % 64) == 0 || checks < 4)
-                      fprintf(stderr, "[fbdbg] ps1fb checks=%llu unreadable=%llu"
+                      PS3_LOG(PS3_LOG_INFO, "fbdbg", "ps1fb checks=%llu unreadable=%llu"
                                       " changed=%llu span=%u %ux%u pitch=%u\n",
                               checks, unread, changed,
                               texture_source_span(t), t->width, t->height,
@@ -2556,8 +2539,7 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
                     static u32 refresh_count = 0;
                     refresh_count++;
                     if (refresh_count <= 64 || (refresh_count & 255) == 0)
-                        fprintf(stderr,
-                                "[tex-refresh] n=%u frame=%u unit-src=%u:0x%08X "
+                        PS3_LOG(PS3_LOG_INFO, "tex-refresh", "n=%u frame=%u unit-src=%u:0x%08X "
                                 "fmt=0x%02X %ux%u\n",
                                 refresh_count, g_ld_frames, t->location, t->offset,
                                 t->format, t->width, t->height);
@@ -2593,8 +2575,7 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
         g_ld_texture_cache_evictions++;
         if (g_ld_texture_cache_full <= 16 ||
             (g_ld_texture_cache_full & (g_ld_texture_cache_full - 1)) == 0)
-            fprintf(stderr,
-                    "[texture-cache] FULL cap=%u lru-evictions=%llu\n",
+            PS3_LOG(PS3_LOG_INFO, "texture-cache", "FULL cap=%u lru-evictions=%llu\n",
                     MAX_TEXTURES,
                     (unsigned long long)g_ld_texture_cache_evictions);
     }
@@ -2628,8 +2609,7 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
         g_ld_texture_decode_fail++;
         if (g_ld_texture_decode_fail <= 16 ||
             (g_ld_texture_decode_fail & (g_ld_texture_decode_fail - 1)) == 0)
-            fprintf(stderr,
-                    "[texture-cache] decode failed n=%llu src=%u:0x%08X "
+            PS3_LOG(PS3_LOG_WARN, "texture-cache", "decode failed n=%llu src=%u:0x%08X "
                     "fmt=0x%02X %ux%u pitch=%u\n",
                     (unsigned long long)g_ld_texture_decode_fail,
                     t->location, t->offset, t->format, t->width, t->height,
@@ -2699,10 +2679,7 @@ static u32 vertex_texture_mask(void)
             mask |= 1u << u;
         } else {
             g_ld_vtex_unsupported++;
-            static u32 warned = 0;
-            if (PS3_LOG_FIRST(warned, 16) && vertex_texture_trace_enabled())
-                fprintf(stderr,
-                        "[vtex] enabled but unsupported unit=%u off=0x%08X "
+            if (vertex_texture_trace_enabled()) PS3_LOG_N(16, PS3_LOG_INFO, "vtex", "enabled but unsupported unit=%u off=0x%08X "
                         "fmt=0x%02X dim=%u cube=%u %ux%u pitch=%u ctl=0x%08X\n",
                         u, vt.offset, vt.format, vt.dimension, vt.cubemap,
                         vt.width, vt.height, vt.pitch, vt.control0);
@@ -2843,8 +2820,7 @@ static u32 vertex_texture_srv_slot(const rsx_dsp_vertex_texture* vt)
         write_vertex_texture_srv(index, e->tex);
         g_ld_vtex_uploads++;
         if (vertex_texture_trace_enabled())
-            fprintf(stderr,
-                    "[vtex] upload unit-data %u:0x%08X fmt=0x%02X %ux%u pitch=%u\n",
+            PS3_LOG(PS3_LOG_INFO, "vtex", "upload unit-data %u:0x%08X fmt=0x%02X %ux%u pitch=%u\n",
                     vt->location, vt->offset, vt->format,
                     vt->width, vt->height, vt->pitch);
     }
@@ -2896,10 +2872,7 @@ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
      * resource.  Preserve the prior surface so diagnostics can capture the
      * actual world pass while the bad command link is isolated. */
     if (want_w > 8192u || want_h > 8192u) {
-        static u32 invalid_surface_logs = 0;
-        if (PS3_LOG_FIRST(invalid_surface_logs, 32u))
-            fprintf(stderr,
-                    "[surface-guard] rejected implausible surface 0x%X "
+        PS3_LOG_N(32u, PS3_LOG_WARN, "surface-guard", "rejected implausible surface 0x%X "
                     "%ux%u; preserving slot=%s\n",
                     offset, want_w, want_h,
                     slot < MAX_SURFACES ? "existing" : "none");
@@ -2908,17 +2881,14 @@ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     if (g.n_surfaces >= MAX_SURFACES) {
         /* Out of slots is now the only way a surface can be lost, so say so
          * once rather than silently returning an invalid handle. */
-        static u32 full_logs = 0;
-        if (PS3_LOG_FIRST(full_logs, 8))
-            fprintf(stderr, "[surfsz] surface table full (%u); dropping "
+        PS3_LOG_N(8, PS3_LOG_INFO, "surfsz", "surface table full (%u); dropping "
                             "%u:0x%X %ux%u\n",
                     (unsigned)MAX_SURFACES, location, offset, want_w, want_h);
         return LD_INVALID_SURFACE;
     }
     slot = g.n_surfaces;
-    { static u32 new_logs = 0;
-      if (PS3_LOG_FIRST(new_logs, 24))
-          fprintf(stderr, "[surfsz] new live surface %u:0x%X %ux%u (slot %u)\n",
+    {
+      PS3_LOG_N(24, PS3_LOG_INFO, "surfsz", "new live surface %u:0x%X %ux%u (slot %u)\n",
                   location, offset, want_w, want_h, slot); }
     D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC rd = {0};
@@ -2937,8 +2907,7 @@ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
         static u32 surface_fail_logs = 0;
         if (PS3_LOG_FIRST(surface_fail_logs, 32)) {
             const HRESULT removed = g.dev->lpVtbl->GetDeviceRemovedReason(g.dev);
-            fprintf(stderr,
-                    "[surface-fail] color %u:0x%X %ux%u hr=0x%08lX "
+            PS3_LOG(PS3_LOG_INFO, "surface-fail", "color %u:0x%X %ux%u hr=0x%08lX "
                     "removed=0x%08lX slot=%u count=%u\n",
                     location, offset, want_w, want_h,
                     (unsigned long)create_hr, (unsigned long)removed,
@@ -2994,7 +2963,7 @@ static int ld_swin_on(void)
 {
     static int on = -1;
     if (on < 0) { const char* e = getenv("LD_SWIN"); on = (e && e[0] == '0') ? 0 : 1;
-                  fprintf(stderr, "[swin] %s (LD_SWIN)\n", on ? "on" : "off"); }
+                  PS3_LOG(PS3_LOG_INFO, "swin", "%s (LD_SWIN)\n", on ? "on" : "off"); }
     return on;
 }
 /* Guest bytes per texel of a texture format (modifier bits ignored); 0 = compressed or not listed. */
@@ -3025,7 +2994,7 @@ static int surface_window(u32 si, const rsx_dsp_texture* t, int dbg)
         if (dbg) {
             static u32 n_keep;
             if (n_keep++ < 24)
-                fprintf(stderr, "[alias-subrect] keep whole surface: tex %u:0x%08X fmt=0x%02X %ux%u pitch=%u "
+                PS3_LOG(PS3_LOG_INFO, "alias-subrect", "keep whole surface: tex %u:0x%08X fmt=0x%02X %ux%u pitch=%u "
                         "(%u B/texel) vs surface[%u] %ux%u pitch=%u (%u B/texel)\n", t->location, t->offset,
                         t->format, w, h, t->pitch, tb, si, s->w, s->h, s->pitch, sb);
         }
@@ -3052,7 +3021,7 @@ static int surface_window(u32 si, const rsx_dsp_texture* t, int dbg)
                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, NULL, &IID_ID3D12Resource, (void**)&wt))) {
             static u32 n_fail;
             if (n_fail++ < 8)
-                fprintf(stderr, "[swin] create failed %u:0x%X %ux%u: whole surface bound\n", s->location, s->offset,
+                PS3_LOG(PS3_LOG_WARN, "swin", "create failed %u:0x%X %ux%u: whole surface bound\n", s->location, s->offset,
                         w, h);
             return -1;
         }
@@ -3061,13 +3030,13 @@ static int surface_window(u32 si, const rsx_dsp_texture* t, int dbg)
         srv_write(SRV_SURF_WIN_BASE + si * LD_SWIN_PER + k, wt);
         static u32 n_log;
         if (n_log++ < 16)
-            fprintf(stderr, "[swin] %u:0x%X surface %ux%u pitch=%u -> window %ux%u (slot %u.%u)\n",
+            PS3_LOG(PS3_LOG_INFO, "swin", "%u:0x%X surface %ux%u pitch=%u -> window %ux%u (slot %u.%u)\n",
                     s->location, s->offset, s->w, s->h, s->pitch, w, h, si, k);
     }
     if (dbg) {
         static u32 n_hit;
         if (n_hit++ < 24)
-            fprintf(stderr, "[alias-subrect] tex %u:0x%08X fmt=0x%02X %ux%u pitch=%u -> surface[%u] %ux%u "
+            PS3_LOG(PS3_LOG_INFO, "alias-subrect", "tex %u:0x%08X fmt=0x%02X %ux%u pitch=%u -> surface[%u] %ux%u "
                     "texels [0,%u)x[0,%u) (window %u)\n", t->location, t->offset, t->format, w, h, t->pitch, si,
                     s->w, s->h, w, h, k);
     }
@@ -3097,7 +3066,7 @@ static int surface_window(u32 si, const rsx_dsp_texture* t, int dbg)
         g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
         s->swin[k].wgen = s->swin_wgen;
         if ((++g_ld_swin_copies & 0x3FFFu) == 1u)
-            fprintf(stderr, "[swin] copies=%llu frame=%u\n", (unsigned long long)g_ld_swin_copies, g_ld_frames);
+            PS3_LOG(PS3_LOG_INFO, "swin", "copies=%llu frame=%u\n", (unsigned long long)g_ld_swin_copies, g_ld_frames);
     }
     return (int)(SRV_SURF_WIN_BASE + si * LD_SWIN_PER + k);
 }
@@ -3296,9 +3265,7 @@ static int ld_downsample(u32 si, u32 sx, u32 sy, u32 k,
         if (vsb) vsb->lpVtbl->Release(vsb);
         if (psb) psb->lpVtbl->Release(psb);
         if (FAILED(hr) || !pso) {
-            static u32 fail_logs = 0;
-            if (PS3_LOG_FIRST(fail_logs, 8))
-                fprintf(stderr, "[live-draw] downsample pipeline for format %u failed hr=0x%08lX\n",
+            PS3_LOG_N(8, PS3_LOG_WARN, "live-draw", "downsample pipeline for format %u failed hr=0x%08lX\n",
                         (unsigned)fmt, (unsigned long)hr);
             return 0;
         }
@@ -3403,7 +3370,7 @@ static ID3D12PipelineState* ld_scaled_blit_pso(DXGI_FORMAT fmt)
     ID3DBlob* vs = NULL; ID3DBlob* ps = NULL; ID3DBlob* err = NULL;
     if (FAILED(D3DCompile(src, sizeof(src) - 1u, "scaled_blit", NULL, NULL, "vs", "vs_5_0", 0, 0, &vs, &err)) ||
         FAILED(D3DCompile(src, sizeof(src) - 1u, "scaled_blit", NULL, NULL, "ps", "ps_5_0", 0, 0, &ps, &err))) {
-        fprintf(stderr, "[scaled-blit] shader compile failed: %s\n",
+        PS3_LOG(PS3_LOG_WARN, "scaled-blit", "shader compile failed: %s\n",
                 err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "?");
         if (err) err->lpVtbl->Release(err);
         if (vs) vs->lpVtbl->Release(vs);
@@ -3425,7 +3392,7 @@ static ID3D12PipelineState* ld_scaled_blit_pso(DXGI_FORMAT fmt)
     ID3D12PipelineState* pso = NULL;
     HRESULT hr = g.dev->lpVtbl->CreateGraphicsPipelineState(g.dev, &pd, &IID_ID3D12PipelineState, (void**)&pso);
     vs->lpVtbl->Release(vs); ps->lpVtbl->Release(ps);
-    if (FAILED(hr)) { fprintf(stderr, "[scaled-blit] PSO failed hr=0x%08lX\n", (unsigned long)hr); return NULL; }
+    if (FAILED(hr)) { PS3_LOG(PS3_LOG_WARN, "scaled-blit", "PSO failed hr=0x%08lX\n", (unsigned long)hr); return NULL; }
     for (int i = 0; i < 4; i++)
         if (!g_sblit_pso[i].pso) { g_sblit_pso[i].fmt = fmt; g_sblit_pso[i].pso = pso; break; }
     return pso;
@@ -3477,7 +3444,7 @@ static int ld_scaled_blit(u32 si, float sx, float sy, float sw, float sh,
     g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
     ld_surface_note_write(di, LD_SURFACE_WRITE_COPY);
     { static int n = 0; if (n++ < 4)
-        fprintf(stderr, "[scaled-blit] surf %u (%.0f,%.0f %.0fx%.0f) -> surf %u (%u,%u %ux%u)\n",
+        PS3_LOG(PS3_LOG_INFO, "scaled-blit", "surf %u (%.0f,%.0f %.0fx%.0f) -> surf %u (%u,%u %ux%u)\n",
                 si, sx, sy, sw, sh, di, dx, dy, dw, dh); }
     return 1;
 }
@@ -3582,7 +3549,7 @@ void rsx_live_draw_note_resolve(u32 src_loc, u32 src_abs, u32 dst_loc, u32 dst_a
             const surface_t* s = &g.surfaces[i];
             if (s->tex && s->location == src_loc && s->offset == src_abs) {
                 if (d->resolve_src != (int)i + 1)
-                    fprintf(stderr, "[live-draw] display buffer %u resolves from surface %u (0x%X)\n",
+                    PS3_LOG(PS3_LOG_INFO, "live-draw", "display buffer %u resolves from surface %u (0x%X)\n",
                             b, i, s->offset);
                 d->resolve_src = (int)i + 1;
                 return;
@@ -3672,7 +3639,7 @@ static int honor_zeta_track(void)
     if (!initialized) {
         initialized = 1;
         enabled = getenv("RSX_NO_ZETA_TRACK") ? 0 : 1;
-        fprintf(stderr, "[zetatrack] live per-zeta depth %s\n",
+        PS3_LOG(PS3_LOG_INFO, "zetatrack", "live per-zeta depth %s\n",
                 enabled ? "ON" : "OFF (legacy shared target)");
     }
     return enabled;
@@ -3716,11 +3683,11 @@ static void zdepth_grow_snapshot(u32 i, u32 rt_w, u32 rt_h)
             g.dev, &hp, D3D12_HEAP_FLAG_NONE, &rd,
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NULL,
             &IID_ID3D12Resource, (void**)&snap))) {
-        fprintf(stderr, "[zetatrack] snapshot grow failed %u:0x%X %ux%u\n",
+        PS3_LOG(PS3_LOG_WARN, "zetatrack", "snapshot grow failed %u:0x%X %ux%u\n",
                 z->location, z->offset, nw, nh);
         return;
     }
-    fprintf(stderr, "[zetatrack] snapshot %u:0x%X grown %ux%u -> %ux%u\n",
+    PS3_LOG(PS3_LOG_INFO, "zetatrack", "snapshot %u:0x%X grown %ux%u -> %ux%u\n",
             z->location, z->offset, z->snapshot_w, z->snapshot_h, nw, nh);
     /* The open command list may still read the old one. */
     retire_texture(z->snapshot);
@@ -3761,7 +3728,7 @@ static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
     }
     if (slot == MAX_SURFACES) {
         if (g.n_zdepths >= MAX_SURFACES) {
-            fprintf(stderr, "[zetatrack] live cache full; shared fallback\n");
+            PS3_LOG(PS3_LOG_INFO, "zetatrack", "live cache full; shared fallback\n");
             return 0;
         }
         slot = g.n_zdepths;
@@ -3769,8 +3736,7 @@ static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
         zdepth_t* old = &g.zdepths[slot];
         if (want_w < old->w) want_w = old->w;
         if (want_h < old->h) want_h = old->h;
-        fprintf(stderr,
-                "[zetatrack] live zeta %u:0x%X outgrown %ux%u -> %ux%u\n",
+        PS3_LOG(PS3_LOG_INFO, "zetatrack", "live zeta %u:0x%X outgrown %ux%u -> %ux%u\n",
                 location, offset, old->w, old->h, want_w, want_h);
         if (old->tex) {
             /* Draws already recorded in the open command list may still
@@ -3808,8 +3774,7 @@ static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
             D3D12_RESOURCE_STATE_DEPTH_WRITE, &cv,
             &IID_ID3D12Resource, (void**)&z->tex);
     if (FAILED(create_hr)) {
-        fprintf(stderr,
-                "[zetatrack] live create failed %u:0x%X hr=0x%08lX; shared fallback\n",
+        PS3_LOG(PS3_LOG_WARN, "zetatrack", "live create failed %u:0x%X hr=0x%08lX; shared fallback\n",
                 location, offset, (unsigned long)create_hr);
         z->tex = NULL;
         return 0;
@@ -3848,8 +3813,7 @@ static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NULL,
             &IID_ID3D12Resource, (void**)&z->snapshot);
     if (FAILED(snapshot_hr)) {
-        fprintf(stderr,
-                "[zetatrack] live snapshot create failed %u:0x%X "
+        PS3_LOG(PS3_LOG_WARN, "zetatrack", "live snapshot create failed %u:0x%X "
                 "%ux%u hr=0x%08lX; guest fallback\n",
                 location, offset, z->snapshot_w, z->snapshot_h,
                 (unsigned long)snapshot_hr);
@@ -3865,8 +3829,7 @@ static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
         D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
         1.0f, 0, 0, NULL);
     z->cleared = 1;
-    fprintf(stderr,
-            "[zetatrack] live new #%u %u:0x%X backing=%ux%u "
+    PS3_LOG(PS3_LOG_INFO, "zetatrack", "live new #%u %u:0x%X backing=%ux%u "
             "clip=%ux%u canvas=%ux%u\n",
             slot, location, offset, want_w, want_h,
             rt_w, rt_h, g.width, g.height);
@@ -3891,8 +3854,7 @@ static int zdepth_snapshot(u32 slot)
     D3D12_GPU_DESCRIPTOR_HANDLE source_table, destination_table;
     if (!depth_snapshot_descriptors(
             slot - 1u, &source_table, &destination_table)) {
-        fprintf(stderr,
-                "[zetatrack] depth snapshot descriptor ring exhausted "
+        PS3_LOG(PS3_LOG_INFO, "zetatrack", "depth snapshot descriptor ring exhausted "
                 "at frame %u\n",
                 g_ld_frames);
         return z->snapshot_valid;
@@ -3989,8 +3951,7 @@ static void shader_disk_cache_progress(u64 value)
 {
     if (value > 4u && (value & (value - 1u)) != 0u)
         return;
-    fprintf(stderr,
-            "[shader-disk-cache] hits{vs=%llu ps=%llu} "
+    PS3_LOG(PS3_LOG_INFO, "shader-disk-cache", "hits{vs=%llu ps=%llu} "
             "misses{vs=%llu ps=%llu} writes{vs=%llu ps=%llu} "
             "rejects=%llu\n",
             (unsigned long long)g_ld_shader_disk_hits[0],
@@ -4008,7 +3969,7 @@ static int shader_disk_cache_prepare(void)
         return g_ld_shader_disk_ready;
     g_ld_shader_disk_ready = 0;
     if (getenv("RSX_NO_SHADER_DISK_CACHE")) {
-        fprintf(stderr, "[shader-disk-cache] disabled\n");
+        PS3_LOG(PS3_LOG_INFO, "shader-disk-cache", "disabled\n");
         return 0;
     }
 
@@ -4027,8 +3988,7 @@ static int shader_disk_cache_prepare(void)
 
     if (!CreateDirectoryA(g_ld_shader_disk_dir, NULL) &&
         GetLastError() != ERROR_ALREADY_EXISTS) {
-        fprintf(stderr,
-                "[shader-disk-cache] cannot create '%s' error=%lu\n",
+        PS3_LOG(PS3_LOG_INFO, "shader-disk-cache", "cannot create '%s' error=%lu\n",
                 g_ld_shader_disk_dir, (unsigned long)GetLastError());
         return 0;
     }
@@ -4038,7 +3998,7 @@ static int shader_disk_cache_prepare(void)
         return 0;
 
     g_ld_shader_disk_ready = 1;
-    fprintf(stderr, "[shader-disk-cache] enabled dir='%s' version=%u\n",
+    PS3_LOG(PS3_LOG_INFO, "shader-disk-cache", "enabled dir='%s' version=%u\n",
             g_ld_shader_disk_dir, SHADER_DISK_CACHE_VERSION);
     return 1;
 }
@@ -4443,7 +4403,6 @@ static ID3D12PipelineState* build_pso(
 {
     ID3DBlob *vs = NULL, *ps = NULL, *err = NULL;
     static u32 compile_fail_logs = 0;
-    static u32 create_fail_logs = 0;
     const u32 vs_length = (u32)strlen(vs_hlsl);
     const u32 ps_length = (u32)strlen(ps_hlsl);
     const u64 vs_hash = fnv1a(
@@ -4510,7 +4469,7 @@ static ID3D12PipelineState* build_pso(
         if (PS3_LOG_FIRST(compile_fail_logs, 32)) {
             const char* msg = err ? (const char*)err->lpVtbl->GetBufferPointer(err)
                                   : "no compiler diagnostic";
-            fprintf(stderr, "[pso-fail] vertex compile: %.768s\n", msg);
+            PS3_LOG(PS3_LOG_INFO, "pso-fail", "vertex compile: %.768s\n", msg);
         }
         if (err) err->lpVtbl->Release(err); return NULL;
     }
@@ -4572,7 +4531,7 @@ static ID3D12PipelineState* build_pso(
         if (PS3_LOG_FIRST(compile_fail_logs, 32)) {
             const char* msg = err ? (const char*)err->lpVtbl->GetBufferPointer(err)
                                   : "no compiler diagnostic";
-            fprintf(stderr, "[pso-fail] pixel compile: %.768s\n", msg);
+            PS3_LOG(PS3_LOG_INFO, "pso-fail", "pixel compile: %.768s\n", msg);
         }
         if (err) err->lpVtbl->Release(err);
         vs->lpVtbl->Release(vs); return NULL;
@@ -4623,9 +4582,7 @@ static ID3D12PipelineState* build_pso(
 #endif
     if (FAILED(hr)) {
         const HRESULT removed = g.dev->lpVtbl->GetDeviceRemovedReason(g.dev);
-        if (PS3_LOG_FIRST(create_fail_logs, 32))
-            fprintf(stderr,
-                    "[pso-fail] create hr=0x%08lX removed=0x%08lX "
+        PS3_LOG_N(32, PS3_LOG_INFO, "pso-fail", "create hr=0x%08lX removed=0x%08lX "
                     "depth{test=%u write=%u func=%u} blend=%u "
                     "cull{enable=%u face=%u}\n",
                     (unsigned long)hr, (unsigned long)removed,
@@ -4669,7 +4626,7 @@ static void ld_pso_bail(int* said, const char* reason)
     if (dbg < 0) dbg = getenv("LD_PSO_DBG") ? 1 : 0;
     if (!dbg || *said) return;
     *said = 1;
-    fprintf(stderr, "[pso-bail] %s\n", reason);
+    PS3_LOG(PS3_LOG_INFO, "pso-bail", "%s\n", reason);
     fflush(stderr);
 }
 #define LD_PSO_BAIL(reason) \
@@ -4699,8 +4656,7 @@ static ID3D12PipelineState* get_pso(
         static int said = 0;
         if (!said && getenv("LD_PSO_DBG")) {
             said = 1;
-            fprintf(stderr,
-                    "[pso-bail] fragment program size reads as zero: "
+            PS3_LOG(PS3_LOG_INFO, "pso-bail", "fragment program size reads as zero: "
                     "reg=0x%08X -> loc=%u off=0x%08X, first words "
                     "%08X %08X %08X %08X\n",
                     rsx_dsp_reg(&g.rsx, 0x08E4 /* M_FP_ACTIVE_PROGRAM */), fp_loc, fp_off,
@@ -4716,12 +4672,12 @@ static ID3D12PipelineState* get_pso(
                 u32 i = 0;
                 if (q) { while (i < 0x10000u && !q[i]) i++; }
                 if (!q)
-                    fprintf(stderr, "[pso-bail]   (64 KB window not mapped)\n");
+                    PS3_LOG(PS3_LOG_INFO, "pso-bail", "  (64 KB window not mapped)\n");
                 else if (i == 0x10000u)
-                    fprintf(stderr, "[pso-bail]   64 KB from here is entirely "
+                    PS3_LOG(PS3_LOG_INFO, "pso-bail", "  64 KB from here is entirely "
                                     "zero -- nothing ever wrote this buffer\n");
                 else
-                    fprintf(stderr, "[pso-bail]   first non-zero byte at "
+                    PS3_LOG(PS3_LOG_INFO, "pso-bail", "  first non-zero byte at "
                                     "+0x%X -- the region is populated, the "
                                     "offset is wrong\n", i);
             }
@@ -4755,15 +4711,13 @@ static ID3D12PipelineState* get_pso(
         g_ld_vtex_missing_for_txl++;
         static u32 warned = 0;
         if (PS3_LOG_FIRST(warned, 32) && vertex_texture_trace_enabled()) {
-            fprintf(stderr,
-                    "[vtex] TXL shader has no supported binding txl=0x%X "
+            PS3_LOG(PS3_LOG_INFO, "vtex", "TXL shader has no supported binding txl=0x%X "
                     "bound=0x%X start=%u instrs=%u\n",
                     txl_mask, vtex_mask, start, vp_instrs);
             for (u32 u = 0; u < RSX_DSP_NUM_VERTEX_TEXTURES; u++) {
                 if (!((txl_mask >> u) & 1u)) continue;
                 const u32 base = 0x0900 + u * 0x20;
-                fprintf(stderr,
-                        "[vtex] raw u%u off=%08X fmt=%08X wrap=%08X "
+                PS3_LOG(PS3_LOG_INFO, "vtex", "raw u%u off=%08X fmt=%08X wrap=%08X "
                         "ctl0=%08X ctl3=%08X filter=%08X rect=%08X\n",
                         u, rsx_dsp_reg(&g.rsx, base),
                         rsx_dsp_reg(&g.rsx, base + 4),
@@ -4942,9 +4896,8 @@ static ID3D12PipelineState* get_pso(
         if (fi > 0) {
             const int np = rsx_fp_apply_unnorm_scale(
                 ps_hlsl, sizeof(ps_hlsl), unnorm_mask, unnorm_dim, cube_mask, 0u);
-            { static int n = 0;
-              if (PS3_LOG_FIRST(n, 8))
-                  fprintf(stderr, "[unnorm] mask=0x%X cube=0x%X dim0=%ux%u"
+            {
+              PS3_LOG_N(8, PS3_LOG_INFO, "unnorm", "mask=0x%X cube=0x%X dim0=%ux%u"
                                   " patched=%d\n",
                           unnorm_mask, cube_mask, unnorm_dim[0][0],
                           unnorm_dim[0][1], np); }
@@ -5633,8 +5586,7 @@ void rsx_live_draw_a010_probe_begin(void)
     g_ld_a010_probe_touched = 0;
     InterlockedExchange(&g_ld_a010_world_ready, 0);
     InterlockedExchange(&g_ld_a010_probe_active, 1);
-    fprintf(stderr,
-            "[a010-probe] BEGIN live_frame=%u surfaces=%u packets=%llu groups=%llu\n",
+    PS3_LOG(PS3_LOG_INFO, "a010-probe", "BEGIN live_frame=%u surfaces=%u packets=%llu groups=%llu\n",
             g_ld_frames, g.n_surfaces, g_ld_stats.packets_seen,
             g_ld_stats.groups_seen);
     fflush(stderr);
@@ -5726,8 +5678,7 @@ static void ld_profile_present(u32 frame)
             g_ld_profile.adapter->lpVtbl->QueryVideoMemoryInfo(
                 g_ld_profile.adapter, 0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL,
                 &memory);
-        fprintf(stderr,
-                "[rsx-perf] frame=%u dt_ms=%.3f "
+        PS3_LOG(PS3_LOG_INFO, "rsx-perf", "frame=%u dt_ms=%.3f "
                 "pso{look=%llu hit=%llu miss=%llu miss_total=%llu "
                 "probes=%llu full=%llu cached=%u capacity=%u mem_kb=%.1f} "
                 "reject{requests=%llu unique=%u "
@@ -5856,8 +5807,7 @@ static void ld_profile_present(u32 frame)
                 (double)memory.CurrentUsage / (1024.0 * 1024.0),
                 (double)memory.Budget / (1024.0 * 1024.0),
                 (double)memory.CurrentReservation / (1024.0 * 1024.0));
-        fprintf(stderr,
-                "[shader-cache-perf] frame=%u "
+        PS3_LOG(PS3_LOG_INFO, "shader-cache-perf", "frame=%u "
                 "vs{count=%u capacity=%u lookups=%llu hits=%llu "
                 "misses=%llu inserts=%llu full_rejects=%llu "
                 "compile_calls=%llu lookup_ms=%.3f compile_ms=%.3f "
@@ -5907,9 +5857,7 @@ static void ld_profile_present(u32 frame)
                 ? g_ld_profile.n_ps_exact_source_hashes -
                       g_ld_profile.n_ps_constant_specialized_hashes
                 : 0;
-        fprintf(
-            stderr,
-            "[fp-constant-perf] frame=%u mode=%s "
+        PS3_LOG(PS3_LOG_WARN, "fp-constant-perf", "frame=%u mode=%s "
             "variants{exact_source=%u constant_specialized=%u "
             "canonical=%u collapsed_constants=%u collapsed_alpha=%u "
             "tracking_overflow=%llu} "
@@ -5968,8 +5916,7 @@ static void ld_trace_target(const char* event, u32 target, u32 mask)
     if (!ld_target_trace_enabled()) return;
     rsx_dsp_surface sf;
     rsx_dsp_get_surface(&g.rsx, &sf);
-    fprintf(stderr,
-            "[rsx-target] frame=%u event=%s target=%u loc=%u off=0x%08X "
+    PS3_LOG(PS3_LOG_INFO, "rsx-target", "frame=%u event=%s target=%u loc=%u off=0x%08X "
             "fmt=0x%X pitch=%u clip=%u,%u+%ux%u mask=0x%02X\n",
             g_ld_frames, event, target, sf.color_location[0], sf.color_offset[0],
             sf.color_format, sf.color_pitch[0], sf.clip_x, sf.clip_y,
@@ -6078,8 +6025,7 @@ static void ld_profile_note_rejected_pso(void)
         const u32 surface_offset = target < g.n_surfaces
             ? g.surfaces[target].offset
             : 0;
-        fprintf(stderr,
-                "[pso-capacity] reached count=%u capacity=%u "
+        PS3_LOG(PS3_LOG_WARN, "pso-capacity", "reached count=%u capacity=%u "
                 "movie=%d orphanage_world_ready=%d "
                 "first_rejected_key=%016llx class=%u "
                 "surface=0x%08X frame_locator=%u\n",
@@ -6135,7 +6081,7 @@ static int ld_movie_overlay_ensure(void)
             g.dev, &hp, D3D12_HEAP_FLAG_NONE, &bd,
             D3D12_RESOURCE_STATE_COPY_DEST, NULL,
             &IID_ID3D12Resource, (void**)&g.movie_overlay_readback))) {
-        fprintf(stderr, "[movie-ui] readback allocation failed\n");
+        PS3_LOG(PS3_LOG_WARN, "movie-ui", "readback allocation failed\n");
         return 0;
     }
     g.movie_overlay_rgba = (u8*)malloc((size_t)g.width * g.height * 4);
@@ -6147,7 +6093,7 @@ static int ld_movie_overlay_ensure(void)
         g.movie_overlay_mask = NULL;
         g.movie_overlay_readback->lpVtbl->Release(g.movie_overlay_readback);
         g.movie_overlay_readback = NULL;
-        fprintf(stderr, "[movie-ui] CPU overlay allocation failed\n");
+        PS3_LOG(PS3_LOG_WARN, "movie-ui", "CPU overlay allocation failed\n");
         return 0;
     }
 
@@ -6166,7 +6112,7 @@ static int ld_movie_overlay_ensure(void)
         g.movie_overlay_mask = NULL;
         g.movie_overlay_readback->lpVtbl->Release(g.movie_overlay_readback);
         g.movie_overlay_readback = NULL;
-        fprintf(stderr, "[movie-ui] host upload allocation failed\n");
+        PS3_LOG(PS3_LOG_WARN, "movie-ui", "host upload allocation failed\n");
         return 0;
     }
     D3D12_RANGE no_read = {0, 0};
@@ -6180,7 +6126,7 @@ static int ld_movie_overlay_ensure(void)
         g.movie_overlay_mask = NULL;
         g.movie_overlay_readback->lpVtbl->Release(g.movie_overlay_readback);
         g.movie_overlay_readback = NULL;
-        fprintf(stderr, "[movie-ui] host upload map failed\n");
+        PS3_LOG(PS3_LOG_WARN, "movie-ui", "host upload map failed\n");
         return 0;
     }
     return 1;
@@ -6204,7 +6150,7 @@ static void ld_movie_overlay_begin(void)
     }
     if (g.n_surfaces) ld_flush(LD_FLUSH_MOVIE);
     ld_movie_reset_rings();
-    fprintf(stderr, "[movie-ui] compositor armed (%ux%u, %u guest surfaces)\n",
+    PS3_LOG(PS3_LOG_INFO, "movie-ui", "compositor armed (%ux%u, %u guest surfaces)\n",
             g.width, g.height, g.n_surfaces);
     fflush(stderr);
 }
@@ -6322,8 +6268,7 @@ static void ld_movie_capture_overlay(void)
     if (g.movie_overlay_frames <= 16 ||
         (g.movie_overlay_frames & 63) == 0 ||
         (!g.movie_overlay_valid && glyph_pixels)) {
-        fprintf(stderr,
-                "[movie-ui] overlay=%llu glyphs=%llu/%llu %s\n",
+        PS3_LOG(PS3_LOG_INFO, "movie-ui", "overlay=%llu glyphs=%llu/%llu %s\n",
                 (unsigned long long)g.movie_overlay_frames,
                 (unsigned long long)glyph_pixels,
                 (unsigned long long)band_pixels,
@@ -6522,9 +6467,9 @@ static void live_draw_csv_emit(u32 prim, u32 n_tri, const char* outcome)
                     "attr8_hash,attr9_hash,attr10_hash,attr11_hash,"
                     "attr12_hash,attr13_hash,attr14_hash,attr15_hash,"
                     "active_attr_mask,used_attr_mask,tex\n");
-                fprintf(stderr, "[live-diff] RSX_DRAW_CSV armed: %s\n", path);
+                PS3_LOG(PS3_LOG_INFO, "live-diff", "RSX_DRAW_CSV armed: %s\n", path);
             } else {
-                fprintf(stderr, "[live-diff] cannot open RSX_DRAW_CSV: %s\n",
+                PS3_LOG(PS3_LOG_INFO, "live-diff", "cannot open RSX_DRAW_CSV: %s\n",
                         path);
             }
             fflush(stderr);
@@ -6677,8 +6622,7 @@ static void live_a010_geom_trace(u32 prim, u32 n_tri)
      * only clears and fullscreen post-processing draws.
      */
     if (InterlockedCompareExchange(&g_ld_a010_world_ready, 1, 0) == 0) {
-        fprintf(stderr,
-                "[a010-world-ready] frame=%u surface=0x%X "
+        PS3_LOG(PS3_LOG_INFO, "a010-world-ready", "frame=%u surface=0x%X "
                 "pso=%016llx vertices=%u\n",
                 g_ld_frames, surf, (unsigned long long)key, n_tri);
         fflush(stderr);
@@ -6720,8 +6664,7 @@ static void live_a010_geom_trace(u32 prim, u32 n_tri)
     rsx_dsp_get_vertex_attr(&g.rsx, 0, &a0);
     rsx_dsp_get_vertex_attr(&g.rsx, 7, &a7);
 
-    fprintf(stderr,
-        "[a010-geom] match=%u frame=%u fetched=%u expanded=%u cuts=%u "
+    PS3_LOG(PS3_LOG_INFO, "a010-geom", "match=%u frame=%u fetched=%u expanded=%u cuts=%u "
         "pos=[%.6g %.6g %.6g %.6g]-[%.6g %.6g %.6g %.6g] nan=%u "
         "decoded_hash=%016llx\n",
         logged, g_ld_frames, dc.n_verts, n_tri, dc.n_cuts,
@@ -6735,8 +6678,7 @@ static void live_a010_geom_trace(u32 prim, u32 n_tri)
                 ? (u32)((u64)dc.n_verts * dc.layout.stride)
                 : (u32)((u64)dc.n_verts * sizeof(vtx_t)),
             1469598103934665603ull));
-    fprintf(stderr,
-        "[a010-geom] base=0x%X base_index=%u "
+    PS3_LOG(PS3_LOG_INFO, "a010-geom", "base=0x%X base_index=%u "
         "idx(loc=%u off=0x%X u32=%u first=%u count=%u) "
         "a0(type=%u size=%u stride=%u loc=%u off=0x%X freq=%u) "
         "a7(type=%u size=%u stride=%u loc=%u off=0x%X freq=%u)\n",
@@ -6751,8 +6693,7 @@ static void live_a010_geom_trace(u32 prim, u32 n_tri)
         const u32* c = rsx_dsp_constant(&g.rsx, slot);
         union { u32 u; float f; } v[4];
         for (u32 k = 0; k < 4; k++) v[k].u = c[k];
-        fprintf(stderr,
-            "[a010-geom] c%u=(%.6g %.6g %.6g %.6g) "
+        PS3_LOG(PS3_LOG_INFO, "a010-geom", "c%u=(%.6g %.6g %.6g %.6g) "
             "raw=%08X/%08X/%08X/%08X\n",
             slot, v[0].f, v[1].f, v[2].f, v[3].f,
             v[0].u, v[1].u, v[2].u, v[3].u);
@@ -6761,8 +6702,7 @@ static void live_a010_geom_trace(u32 prim, u32 n_tri)
         const u32* c = rsx_dsp_constant(&g.rsx, 467);
         union { u32 u; float f; } v[4];
         for (u32 k = 0; k < 4; k++) v[k].u = c[k];
-        fprintf(stderr,
-            "[a010-geom] c467=(%.6g %.6g %.6g %.6g)\n",
+        PS3_LOG(PS3_LOG_INFO, "a010-geom", "c467=(%.6g %.6g %.6g %.6g)\n",
             v[0].f, v[1].f, v[2].f, v[3].f);
     }
     {
@@ -6845,8 +6785,7 @@ static void live_a010_geom_trace(u32 prim, u32 n_tri)
                 sy >= 0.0f && sy < (float)vp.h)
                 in_view++;
         }
-        fprintf(stderr,
-                "[a010-clip] frame=%u finite=%u/%u front=%u view=%u "
+        PS3_LOG(PS3_LOG_INFO, "a010-clip", "frame=%u finite=%u/%u front=%u view=%u "
                 "screen=[%.3f %.3f]-[%.3f %.3f] w=[%.6g %.6g] "
                 "viewport=%ux%u\n",
                 g_ld_frames, finite, dc.n_verts, in_front, in_view,
@@ -7130,8 +7069,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
             static u64 repairs = 0;
             repairs++;
             if (repairs <= 16 || (repairs & (repairs - 1)) == 0) {
-                fprintf(stderr,
-                        "[a010-rsx-camera-repair] n=%llu frame=%u "
+                PS3_LOG(PS3_LOG_INFO, "a010-rsx-camera-repair", "n=%llu frame=%u "
                         "c108=%08X/%08X/%08X/%08X\n",
                         (unsigned long long)repairs, g_ld_frames,
                         g.rsx.constants[108][0], g.rsx.constants[108][1],
@@ -7298,7 +7236,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
       if (tk && live_legacy_pso_key() == tk && tn >= 3) {
           static u32 every;
           if (dc.inl && (++every % 60) == 0)
-              fprintf(stderr, "[pso-trace] frame=%u col=%02X%02X%02X%02X\n", g_ld_frames,
+              PS3_LOG(PS3_LOG_INFO, "pso-trace", "frame=%u col=%02X%02X%02X%02X\n", g_ld_frames,
                       dc.inl[16], dc.inl[17], dc.inl[18], dc.inl[19]);
       }
       /* LD_TRACE_PSO_FROM=<frame>: the first three draws at or after that
@@ -7330,21 +7268,21 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
           /* The raw array registers and base (the attrN lines above print the
            * decoded offset only), and the constant colour a disabled attr3
            * feeds -- the two things a draw that vanishes is usually missing. */
-          fprintf(stderr, "[pso-trace] vdata base_offset=0x%X base_index=%u raw attr0 off=0x%08X fmt=0x%08X\n",
+          PS3_LOG(PS3_LOG_INFO, "pso-trace", "vdata base_offset=0x%X base_index=%u raw attr0 off=0x%08X fmt=0x%08X\n",
                   rsx_dsp_vertex_data_base_offset(&g.rsx), rsx_dsp_vertex_data_base_index(&g.rsx),
                   rsx_dsp_reg(&g.rsx, 0x1680), rsx_dsp_reg(&g.rsx, 0x1740));
           { float d3[4]; rsx_dsp_vertex_default(&g.rsx, 3, d3);
-            fprintf(stderr, "[pso-trace] attr3 const=%g %g %g %g\n", d3[0], d3[1], d3[2], d3[3]); }
+            PS3_LOG(PS3_LOG_INFO, "pso-trace", "attr3 const=%g %g %g %g\n", d3[0], d3[1], d3[2], d3[3]); }
           /* Every non-zero transform constant (raw words), so the VS can be
            * evaluated offline against exactly what this draw saw. */
           for (u32 q = 0; q < 512; q++) {
               const u32* w = g.rsx.constants[q];
               if (!(w[0] | w[1] | w[2] | w[3])) continue;
-              fprintf(stderr, "[pso-const] %u %08X %08X %08X %08X\n", q, w[0], w[1], w[2], w[3]);
+              PS3_LOG(PS3_LOG_INFO, "pso-const", "%u %08X %08X %08X %08X\n", q, w[0], w[1], w[2], w[3]);
           }
           for (u32 ai = 0; ai < 16; ai++) {   /* the constant value each attribute falls back to */
               float d[4]; rsx_dsp_vertex_default(&g.rsx, ai, d);
-              fprintf(stderr, "[pso-vdef] %u %g %g %g %g\n", ai, d[0], d[1], d[2], d[3]);
+              PS3_LOG(PS3_LOG_INFO, "pso-vdef", "%u %g %g %g %g\n", ai, d[0], d[1], d[2], d[3]);
           }
           { u32 fl = 0; const u32 fo = rsx_dsp_fragment_program(&g.rsx, &fl);
             const u8* fp = guest_ptr(fl, fo, 16 * 16);
@@ -7531,7 +7469,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
               static unsigned long n = 0;
               if (PS3_LOG_FIRST(n, 4)) {
                   const u32 vbase = rsx_dsp_vertex_data_base_offset(&g.rsx);
-                  fprintf(stderr, "[uvdbg] unit=%u ps1fb %ux%u pitch=%u fmt=0x%02X"
+                  PS3_LOG(PS3_LOG_INFO, "uvdbg", "unit=%u ps1fb %ux%u pitch=%u fmt=0x%02X"
                                   " base=0x%X target=%u\n",
                           u, t.width, t.height, t.pitch, t.format,
                           vbase, target);
@@ -7540,7 +7478,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
                    * these is throwing the fragments away. */
                   { const u32 sch = rsx_dsp_reg(&g.rsx, M_SCISSOR_HORIZONTAL);
                     const u32 scv = rsx_dsp_reg(&g.rsx, M_SCISSOR_VERTICAL);
-                    fprintf(stderr, "[uvdbg]   vp=(%u,%u %ux%u) scale=(%.2f %.2f)"
+                    PS3_LOG(PS3_LOG_INFO, "uvdbg", "  vp=(%u,%u %ux%u) scale=(%.2f %.2f)"
                                     " xlate=(%.2f %.2f) scissor=(%u+%u, %u+%u)"
                                     " depth_test=%u zwrite=%u zfunc=0x%X"
                                     " colmask=0x%08X blend=%u cull=%u/%u"
@@ -7569,7 +7507,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
                      * So the output depends entirely on those two constants.
                      * Wrong or absent, it produces exactly the repeating stripe
                      * pattern the composite currently shows. */
-                    fprintf(stderr, "[uvdbg]   fp_const count=%u mode=%c"
+                    PS3_LOG(PS3_LOG_INFO, "uvdbg", "  fp_const count=%u mode=%c"
                                     " c0=(%.6f %.6f %.6f %.6f)"
                                     " c1=(%.6f %.6f %.6f %.6f)\n",
                             g.fp_constants.count, g.fp_constant_mode,
@@ -7586,7 +7524,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
                       float pos[4] = {0,0,0,1}, tc[4] = {0,0,0,1};
                       const int okp = fetch_attr(0, vbase, vi, 0, pos);
                       const int okt = fetch_attr(8, vbase, vi, 0, tc);
-                      fprintf(stderr, "[uvdbg]   v%u pos%s(%.1f %.1f) tc%s(%.4f %.4f)\n",
+                      PS3_LOG(PS3_LOG_INFO, "uvdbg", "  v%u pos%s(%.1f %.1f) tc%s(%.4f %.4f)\n",
                               vi, okp ? "" : "!", pos[0], pos[1],
                               okt ? "" : "!", tc[0], tc[1]);
                   }
@@ -7619,9 +7557,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
             static int alias_dbg = -1;
             if (alias_dbg < 0) alias_dbg = getenv("LD_ALIAS_DBG") != NULL;
             if (alias_dbg) {
-                static u32 n_hit = 0;
-                if (PS3_LOG_FIRST(n_hit, 24))
-                    fprintf(stderr, "[alias-hit] tex %u:0x%08X fmt=0x%02X %ux%u "
+                PS3_LOG_N(24, PS3_LOG_INFO, "alias-hit", "tex %u:0x%08X fmt=0x%02X %ux%u "
                             "-> surface[%d] %u:0x%08X %ux%u" "\n",
                             t.location, t.offset, t.format, t.width, t.height,
                             sampled, g.surfaces[sampled].location,
@@ -7656,8 +7592,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
                             if (!g.zdepths[i].reject_logged &&
                                 rsx_live_draw_a010_probe_active()) {
                                 g.zdepths[i].reject_logged = 1;
-                                fprintf(stderr,
-                                    "[zetatrack] a010 reject #%u %u:0x%X "
+                                PS3_LOG(PS3_LOG_INFO, "zetatrack", "a010 reject #%u %u:0x%X "
                                     "draws=%llu dtest=%llu dwrite=%llu "
                                     "both=%llu snapshot=%d\n",
                                     i, g.zdepths[i].location,
@@ -7961,8 +7896,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
                          i, off);
                 ld_dump_surface_ppm(path, &g.surfaces[i]);
             }
-            fprintf(stderr,
-                    "[a010-eager-dump] sample=%u groups=%llu surfaces=%u\n",
+            PS3_LOG(PS3_LOG_INFO, "a010-eager-dump", "sample=%u groups=%llu surfaces=%u\n",
                     eager_sample,
                     (unsigned long long)g_ld_stats.groups_executed,
                     g.n_surfaces);
@@ -8008,8 +7942,7 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
          * emitted above. */
         if (g_ld_stats.clears <= 256 || (g_ld_stats.clears & 1023) == 0) {
             const u32 z = rsx_dsp_clear_zstencil(&g.rsx);
-            fprintf(stderr,
-                    "[rsx-clear] frame=%u n=%llu target=%u mask=0x%02X "
+            PS3_LOG(PS3_LOG_INFO, "rsx-clear", "frame=%u n=%llu target=%u mask=0x%02X "
                     "argb=0x%08X z24=0x%06X stencil=0x%02X\n",
                     g_ld_frames, g_ld_stats.clears, target, mask,
                     rsx_dsp_clear_color(&g.rsx), z >> 8, z & 0xFF);
@@ -8212,8 +8145,7 @@ static int make_depth_snapshot_pipeline(void)
         "main", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
         &shader, &errors);
     if (FAILED(hr)) {
-        fprintf(stderr,
-                "[zetatrack] depth snapshot shader compile failed "
+        PS3_LOG(PS3_LOG_WARN, "zetatrack", "depth snapshot shader compile failed "
                 "hr=0x%08lX: %s\n",
                 (unsigned long)hr,
                 errors ? (const char*)errors->lpVtbl->GetBufferPointer(errors)
@@ -8247,8 +8179,7 @@ static int make_depth_snapshot_pipeline(void)
         &description, D3D_ROOT_SIGNATURE_VERSION_1,
         &serialized, &signature_errors);
     if (FAILED(hr)) {
-        fprintf(stderr,
-                "[zetatrack] depth snapshot root signature failed "
+        PS3_LOG(PS3_LOG_WARN, "zetatrack", "depth snapshot root signature failed "
                 "hr=0x%08lX: %s\n",
                 (unsigned long)hr,
                 signature_errors
@@ -8313,16 +8244,12 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
                       _stricmp(requested, "buffered") == 0))
                 mode = 'B';
             else
-                fprintf(
-                    stderr,
-                    "[rsx-fp-constants] unknown "
+                PS3_LOG(PS3_LOG_INFO, "rsx-fp-constants", "unknown "
                     "RSX_FP_CONSTANT_MODE='%s'; using buffered\n",
                     requested);
         }
         g.fp_constant_mode = mode;
-        fprintf(
-            stderr,
-            "[rsx-fp-constants] mode=%s (startup-selected) "
+        PS3_LOG(PS3_LOG_INFO, "rsx-fp-constants", "mode=%s (startup-selected) "
             "d3dcompile_flags1=0x0 d3dcompile_flags2=0x0\n",
             ld_fp_constant_mode_name());
     }
@@ -8352,8 +8279,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
                 LD_VERTEX_COMPACT_PAYLOAD;
             break;
         default:
-            fprintf(stderr,
-                    "[rsx-vertex] unknown RSX_VERTEX_MODE='%s'; "
+            PS3_LOG(PS3_LOG_INFO, "rsx-vertex", "unknown RSX_VERTEX_MODE='%s'; "
                     "using C\n",
                     requested ? requested : "");
             mode = 'C';
@@ -8372,8 +8298,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
             g.vertex_diag_dir[sizeof(g.vertex_diag_dir) - 1u] = '\0';
         }
 #endif
-        fprintf(stderr,
-                "[rsx-vertex] mode=%s features=0x%X "
+        PS3_LOG(PS3_LOG_INFO, "rsx-vertex", "mode=%s features=0x%X "
                 "(startup-selected)\n",
                 ld_vertex_mode_name(), g.vertex_features);
     }
@@ -8513,7 +8438,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
      * shader-visible/CPU descriptor heap didn't create -- e.g. an over-limit
      * sampler heap would return NULL here and fault in sampler_table. */
     if (!g.srv_cpu_heap || !g.srv_heap || !g.smp_cpu_heap || !g.smp_heap) {
-        fprintf(stderr, "[live-draw] descriptor heap alloc failed "
+        PS3_LOG(PS3_LOG_WARN, "live-draw", "descriptor heap alloc failed "
                 "(srv_cpu=%p srv=%p smp_cpu=%p smp=%p)\n",
                 (void*)g.srv_cpu_heap, (void*)g.srv_heap,
                 (void*)g.smp_cpu_heap, (void*)g.smp_heap);
@@ -8603,8 +8528,7 @@ void rsx_live_draw_set_display_buffer(
     display->height = height;
     display->valid = width && height;
     display->resolve_src = 0;
-    fprintf(stderr,
-            "[live-draw] display buffer %u = loc%u:0x%08X pitch=%u %ux%u\n",
+    PS3_LOG(PS3_LOG_INFO, "live-draw", "display buffer %u = loc%u:0x%08X pitch=%u %ux%u\n",
             buffer_id, location, offset, pitch, width, height);
 }
 
@@ -8627,8 +8551,7 @@ void rsx_live_draw_method(u32 method, u32 arg)
             canonical >= 0x1740u && canonical < 0x1780u;
         const int frequency_divider = canonical == 0x1FC0u;
         if (vertex_texture || vertex_format || frequency_divider) {
-            fprintf(stderr,
-                    "[rsx-vstate] frame=%u raw=0x%04X sub=%u canonical=0x%04X "
+            PS3_LOG(PS3_LOG_INFO, "rsx-vstate", "frame=%u raw=0x%04X sub=%u canonical=0x%04X "
                     "arg=0x%08X\n",
                     g_ld_frames, method & 0xFFFFu, (method >> 13) & 7u,
                     canonical, arg);
@@ -8695,8 +8618,7 @@ void rsx_live_draw_set_movie_mode(int on)
     const int composite = ld_movie_composite_ui_enabled();
     const int serialized = composite || g_ld_debug_layer_enabled;
     if (on && rsx_live_draw_a010_probe_active()) {
-        fprintf(stderr,
-                "[a010-probe] END movie-mode live_frame=%u elapsed_frames=%u "
+        PS3_LOG(PS3_LOG_INFO, "a010-probe", "END movie-mode live_frame=%u elapsed_frames=%u "
                 "surfaces=%u samples=%u touched=0x%016llX\n",
                 g_ld_frames, g_ld_frames - g_ld_a010_probe_start_frame,
                 g.n_surfaces, g_ld_a010_probe_sample,
@@ -8730,15 +8652,14 @@ void rsx_live_draw_set_movie_mode(int on)
             if (g.n_surfaces) ld_flush(LD_FLUSH_MOVIE);
             ld_movie_reset_rings();
             InterlockedExchange((volatile LONG*)&g_ld_movie_mode, 0);
-            fprintf(stderr, "[movie-ui] compositor disarmed after %llu guest overlays\n",
+            PS3_LOG(PS3_LOG_INFO, "movie-ui", "compositor disarmed after %llu guest overlays\n",
                     (unsigned long long)g.movie_overlay_frames);
             fflush(stderr);
         } else {
             g_ld_movie_mode = 0;
         }
         if (!composite && g_ld_movie_track_rsx > 0) {
-            fprintf(stderr,
-                    "[live-draw] movie handoff: tracked RSX state, suppressed %llu guest draw packets\n",
+            PS3_LOG(PS3_LOG_INFO, "live-draw", "movie handoff: tracked RSX state, suppressed %llu guest draw packets\n",
                     g_ld_stats.packets_movie - suppressed_at_start);
             fflush(stderr);
         }
@@ -8960,8 +8881,7 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h)
         if (SUCCEEDED(present_hr))
             ld_present_measure_record(g_ld_frames);
         else {
-            fprintf(stderr,
-                    "[d3d-fail] movie Present hr=0x%08lX frame=%u\n",
+            PS3_LOG(PS3_LOG_INFO, "d3d-fail", "movie Present hr=0x%08lX frame=%u\n",
                     (unsigned long)present_hr, g_ld_frames);
             ld_dump_dred("MoviePresent", present_hr);
             g.ready = 0;
@@ -9077,7 +8997,7 @@ static u64 ld_dump_surface_ppm(const char* path, const surface_t* surface)
             }
             if (f != g_ld_record_to) {
                 fclose(f);
-                fprintf(stderr, "[live-draw] wrote %s\n", path);
+                PS3_LOG(PS3_LOG_INFO, "live-draw", "wrote %s\n", path);
             }
         } else {
             for (u32 y = 0; y < height; y++) {
@@ -9116,9 +9036,7 @@ static void ld_parity_capture_surface(
         buffer_id, target, surface->last_write_generation,
         surface->last_write_kind);
     const u64 nonblack = ld_dump_surface_ppm(path, surface);
-    fprintf(
-        stderr,
-        "[parity-capture] phase=%s serial=%u flip=%llu buffer=%u "
+    PS3_LOG(PS3_LOG_INFO, "parity-capture", "phase=%s serial=%u flip=%llu buffer=%u "
         "surface=%u resource=%u write=%u kind=%u draw=%u clear=%u "
         "copy=%u blit=%u resolve=%u other=%u guest_blit=%u "
         "present_copy=%u get=%08X put=%08X cb=%u vb=%u srv=%u "
@@ -9156,16 +9074,14 @@ int rsx_live_draw_debug_dump_surface(
             continue;
         const u64 nonblack = ld_dump_surface_ppm(path, surface);
         if (nonblack == UINT64_MAX) return -1;
-        fprintf(stderr,
-                "[live-replay-boundary] surface=%u:%08X index=%u "
+        PS3_LOG(PS3_LOG_INFO, "live-replay-boundary", "surface=%u:%08X index=%u "
                 "size=%ux%u fmt=%d nonblack=%llu path=%s\n",
                 location, offset, i, surface->w, surface->h, (int)surface->fmt,
                 (unsigned long long)nonblack, path);
         fflush(stderr);
         return 0;
     }
-    fprintf(stderr,
-            "[live-replay-boundary] missing surface=%u:%08X path=%s\n",
+    PS3_LOG(PS3_LOG_INFO, "live-replay-boundary", "missing surface=%u:%08X path=%s\n",
             location, offset, path);
     return 1;
 }
@@ -9211,8 +9127,7 @@ static void ld_vertex_diag_emit(const char* reason, int dump_surface)
 #else
     const u64 pso_lookups = 0, pso_hits = 0, pso_misses = 0, pso_full = 0;
 #endif
-    fprintf(stderr,
-            "[rsx-vertex-state] reason=%s mode=%s frame=%u "
+    PS3_LOG(PS3_LOG_INFO, "rsx-vertex-state", "reason=%s mode=%s frame=%u "
             "flip{requested=%llu last_req=%u consumed=%llu last_cons=%u} "
             "surface{present=%u off=0x%08X size=%ux%u current=%u} "
             "draw{packets=%llu groups=%llu exec=%llu "
@@ -9259,8 +9174,7 @@ static void ld_vertex_diag_emit(const char* reason, int dump_surface)
             g.vertex_diag_dir);
         const u64 nonblack =
             ld_dump_surface_ppm(path, presented_surface);
-        fprintf(stderr,
-                "[rsx-vertex-surface] mode=%s target=%u "
+        PS3_LOG(PS3_LOG_INFO, "rsx-vertex-surface", "mode=%s target=%u "
                 "pixels=%llu nonblack=%s%llu path=%s\n",
                 ld_vertex_mode_name(), presented,
                 (unsigned long long)presented_surface->w *
@@ -9308,7 +9222,7 @@ void rsx_live_draw_present(u32 buffer_id)
                        sd, g_ld_frames, i, g.surfaces[i].offset,
                        g.surfaces[i].w, g.surfaces[i].h);
               const u64 nb = ld_dump_surface_ppm(path, &g.surfaces[i]);
-              fprintf(stderr, "[surf-dump] slot=%u %u:0x%08X %ux%u nonblack=%llu"
+              PS3_LOG(PS3_LOG_INFO, "surf-dump", "slot=%u %u:0x%08X %ux%u nonblack=%llu"
                               " draw_gen=%u clear_gen=%u\n",
                       i, g.surfaces[i].location, g.surfaces[i].offset,
                       g.surfaces[i].w, g.surfaces[i].h,
@@ -9344,15 +9258,12 @@ void rsx_live_draw_present(u32 buffer_id)
     u32 target = ld_display_target(buffer_id);
     if (target == LD_INVALID_SURFACE) {
         target = current_surface();
-        static u32 fallback_logs = 0;
-        if (PS3_LOG_FIRST(fallback_logs, 32))
-            fprintf(stderr,
-                    "[live-draw] flip %u has no registered/rendered scanout; "
+        PS3_LOG_N(32, PS3_LOG_INFO, "live-draw", "flip %u has no registered/rendered scanout; "
                     "falling back to current surface %u\n",
                     buffer_id, target);
     }
     if (target == LD_INVALID_SURFACE) {
-        fprintf(stderr, "[live-draw] frame present skipped: no color surface\n");
+        PS3_LOG(PS3_LOG_INFO, "live-draw", "frame present skipped: no color surface\n");
         return;
     }
     g_ld_last_present_target = target;
@@ -9360,7 +9271,7 @@ void rsx_live_draw_present(u32 buffer_id)
         char path[MAX_PATH * 2];
         snprintf(path, sizeof(path), "%s\\frame_%06u.ppm", dump_dir, dump_n - 1u);
         const u64 nb = ld_dump_surface_ppm(path, &g.surfaces[target]);
-        fprintf(stderr, "[frame-dump] %s %ux%u nonblack=%llu\n", path,
+        PS3_LOG(PS3_LOG_INFO, "frame-dump", "%s %ux%u nonblack=%llu\n", path,
                 g.surfaces[target].w, g.surfaces[target].h,
                 (unsigned long long)(nb == UINT64_MAX ? 0 : nb));
         fflush(stderr);
@@ -9383,7 +9294,7 @@ void rsx_live_draw_present(u32 buffer_id)
                        "-vf \"scale=trunc(iw/2)*2:trunc(ih/2)*2\" -pix_fmt yuv420p "
                        "-movflags frag_keyframe+empty_moov \"%s\"", out);
               rec = _popen(cmd, "wb");
-              fprintf(stderr, "[record] %s -> %s\n", rec ? "ffmpeg" : "FAILED to start ffmpeg", out);
+              PS3_LOG(PS3_LOG_INFO, "record", "%s -> %s\n", rec ? "ffmpeg" : "FAILED to start ffmpeg", out);
           }
       }
       if (rec) {
@@ -9410,8 +9321,7 @@ void rsx_live_draw_present(u32 buffer_id)
                * as offset, so several exist at once and "we present the wrong
                * one" is a live possibility -- the PS1 composite is 720x512 and
                * the PS3 output 1280x720. */
-              fprintf(stderr,
-                      "[present] %llu/%llu presents showed a surface cleared "
+              PS3_LOG(PS3_LOG_INFO, "present", "%llu/%llu presents showed a surface cleared "
                       "after its last draw (%.1f%%); target=%u %u:0x%X %ux%u"
                       " draw_gen=%u clear_gen=%u\n",
                       (unsigned long long)blank, (unsigned long long)n,
@@ -9490,8 +9400,7 @@ void rsx_live_draw_present(u32 buffer_id)
         if (SUCCEEDED(present_hr))
             ld_present_measure_record(g_ld_frames + 1u);
         else {
-            fprintf(stderr,
-                    "[d3d-fail] Present hr=0x%08lX frame=%u "
+            PS3_LOG(PS3_LOG_INFO, "d3d-fail", "Present hr=0x%08lX frame=%u "
                     "target=%u size=%ux%u window=%ux%u\n",
                     (unsigned long)present_hr, g_ld_frames,
                     target, g.surfaces[target].w, g.surfaces[target].h,
@@ -9515,8 +9424,7 @@ void rsx_live_draw_present(u32 buffer_id)
                 g.vertex_diag_dir);
             const u64 nonblack =
                 ld_dump_surface_ppm(path, &g.surfaces[target]);
-            fprintf(stderr,
-                    "[rsx-vertex-surface] reason=post-movie-32 "
+            PS3_LOG(PS3_LOG_INFO, "rsx-vertex-surface", "reason=post-movie-32 "
                     "mode=%s target=%u pixels=%llu "
                     "nonblack=%s%llu path=%s\n",
                     ld_vertex_mode_name(), target,
@@ -9587,9 +9495,7 @@ void rsx_live_draw_present(u32 buffer_id)
                   elapsed >= 300000ull) || elapsed >= 420000ull)) {
                 if (g_ld_frame_vertex_constant_ring_recycles != 0) {
                     dialogue_armed = 1;
-                    fprintf(
-                        stderr,
-                        "[parity-diag] DIALOGUE HIGH-DRAW TRIGGER "
+                    PS3_LOG(PS3_LOG_INFO, "parity-diag", "DIALOGUE HIGH-DRAW TRIGGER "
                         "elapsed_ms=%llu frame_recycles=%u total_recycles=%llu "
                         "drop_ring=%llu frame=%u flip=%llu\n",
                         (unsigned long long)elapsed,
@@ -9612,9 +9518,7 @@ void rsx_live_draw_present(u32 buffer_id)
                     dialogue_targets &&
                     (dialogue_targets & (dialogue_targets - 1u)) != 0) {
                     dialogue_armed = 1;
-                    fprintf(
-                        stderr,
-                        "[parity-diag] DIALOGUE TRIGGER elapsed_ms=%llu "
+                    PS3_LOG(PS3_LOG_INFO, "parity-diag", "DIALOGUE TRIGGER elapsed_ms=%llu "
                         "stable=%u targets=%016llX drop_ring=%llu "
                         "frame=%u flip=%llu\n",
                         (unsigned long long)elapsed, dialogue_stable,
@@ -9632,9 +9536,7 @@ void rsx_live_draw_present(u32 buffer_id)
                 if (capture == 16u) {
                     dialogue_armed = 0;
                     yz_frontier_trace_dump(5u);
-                    fprintf(
-                        stderr,
-                        "[parity-diag] DIALOGUE COMPLETE captures=16 "
+                    PS3_LOG(PS3_LOG_INFO, "parity-diag", "DIALOGUE COMPLETE captures=16 "
                         "frame=%u flip=%llu\n",
                         g_ld_frames,
                         (unsigned long long)g_ld_flip_requested);
@@ -9653,9 +9555,7 @@ void rsx_live_draw_present(u32 buffer_id)
                 }
                 if (movement_frames == 120u) {
                     yz_frontier_trace_dump(7u);
-                    fprintf(
-                        stderr,
-                        "[parity-diag] MOVEMENT 120 COMPLETE "
+                    PS3_LOG(PS3_LOG_INFO, "parity-diag", "MOVEMENT 120 COMPLETE "
                         "captures=16 frame=%u flip=%llu groups=%llu "
                         "drop_ring=%llu\n",
                         g_ld_frames,
@@ -9728,8 +9628,7 @@ void rsx_live_draw_present(u32 buffer_id)
                     {
                         const u64 nonblack =
                             ld_dump_surface_ppm(path, &g.surfaces[target]);
-                        fprintf(stderr,
-                                "[movement-proof] frontier-probe serial=%u "
+                        PS3_LOG(PS3_LOG_INFO, "movement-proof", "frontier-probe serial=%u "
                                 "elapsed_ms=%llu frame=%u nonblack=%s%llu "
                                 "path=%s\n",
                                 serial, (unsigned long long)elapsed,
@@ -9762,8 +9661,7 @@ void rsx_live_draw_present(u32 buffer_id)
                 {
                     const u64 nonblack =
                         ld_dump_surface_ppm(path, &g.surfaces[target]);
-                    fprintf(stderr,
-                            "[movement-proof] capture phase=%ld frame=%u "
+                    PS3_LOG(PS3_LOG_INFO, "movement-proof", "capture phase=%ld frame=%u "
                             "flip=%llu nonblack=%s%llu path=%s\n",
                             phase, g_ld_frames,
                             (unsigned long long)g_ld_flip_requested,
@@ -9776,8 +9674,7 @@ void rsx_live_draw_present(u32 buffer_id)
                 InterlockedCompareExchange(
                     &g_yz_movement_proof_phase, next_phase, phase);
                 if (next_phase == 6) {
-                    fprintf(stderr,
-                            "[movement-proof] COMPLETE sustained_ms=60000 "
+                    PS3_LOG(PS3_LOG_INFO, "movement-proof", "COMPLETE sustained_ms=60000 "
                             "camera_ms=5000 frame=%u\n", g_ld_frames);
                     fflush(stderr);
                 }
@@ -9811,8 +9708,7 @@ void rsx_live_draw_present(u32 buffer_id)
         if (validation_capture && validation_origin == UINT64_MAX &&
             InterlockedCompareExchange(&g_yz_a010_root_active, 0, 0) != 0) {
             validation_origin = g_ld_flip_requested;
-            fprintf(stderr,
-                    "[validation-capture] a010 origin flip=%llu frame=%u\n",
+            PS3_LOG(PS3_LOG_INFO, "validation-capture", "a010 origin flip=%llu frame=%u\n",
                     (unsigned long long)validation_origin, g_ld_frames);
         }
         if (validation_capture && validation_origin != UINT64_MAX) {
@@ -9836,8 +9732,7 @@ void rsx_live_draw_present(u32 buffer_id)
                              (unsigned long long)requested);
                     const u64 nonblack =
                         ld_dump_surface_ppm(path, &g.surfaces[target]);
-                    fprintf(stderr,
-                            "[validation-capture] label=%s requested_flip=%llu "
+                    PS3_LOG(PS3_LOG_INFO, "validation-capture", "label=%s requested_flip=%llu "
                             "actual_flip=%llu frame=%u target=%u "
                             "nonblack=%s%llu path=%s\n",
                             labels[i], (unsigned long long)requested,
@@ -9857,8 +9752,7 @@ void rsx_live_draw_present(u32 buffer_id)
      * making the TRUE frame count measurable from the log. (The old hard cap
      * at 32 made "stalls at frame ~32" unfalsifiable from the .err alone.) */
     if (g_ld_frames <= 32 || (g_ld_frames & 31) == 0)
-        fprintf(stderr,
-                "[live-draw] frame %u packets[seen=%llu queued=%llu movie=%llu qfull=%llu] "
+        PS3_LOG(PS3_LOG_WARN, "live-draw", "frame %u packets[seen=%llu queued=%llu movie=%llu qfull=%llu] "
                 "groups[seen=%llu exec=%llu empty=%llu drop{fetch=%llu degen=%llu prim=%llu "
                 "alloc=%llu pso=%llu ring=%llu surface=%llu}] clears[guest=%llu badsurf=%llu implicitZ=%llu] "
                 "textures[cached=%u/%u full=%llu decodefail=%llu depthSRV=%llu rejectZ=%llu] "
@@ -9969,7 +9863,7 @@ void rsx_live_draw_present(u32 buffer_id)
                  * the interpreter spins without executing. These are the fields
                  * it works from, so a frozen run says WHICH state it froze in
                  * rather than just that it froze. */
-                fprintf(stderr, "[ps1] pc=0x%08X(chg=%u) exited=%u total=%u"
+                PS3_LOG(PS3_LOG_INFO, "ps1", "pc=0x%08X(chg=%u) exited=%u total=%u"
                                 " cost=%u budget=%d reason=%d evhead=0x%08X"
                                 " ring[off=0x%08X] pub[%06X %06X %06X %06X]"
                                 " done[%06X %06X %06X %06X]\n",
@@ -10003,15 +9897,15 @@ void rsx_live_draw_present(u32 buffer_id)
                   { static int shown = 0;
                     extern uint8_t* vm_base;
                     if (!shown && fb && vm_base) { shown = 1;
-                        fprintf(stderr, "[ps1] VRAM guest EA = 0x%08X\n",
+                        PS3_LOG(PS3_LOG_INFO, "ps1", "VRAM guest EA = 0x%08X\n",
                                 (u32)(size_t)(fb - vm_base)); } }
-                  if (!fb) fprintf(stderr, "[ps1] vram: not mapped\n");
+                  if (!fb) PS3_LOG(PS3_LOG_INFO, "ps1", "vram: not mapped\n");
                   else {
                       u32 nz = 0, first = 0xFFFFFFFFu, n = 1024u * 512u / 2u;
                       const u32* w32 = (const u32*)fb;
                       for (u32 i = 0; i < n; i++)
                           if (w32[i]) { nz++; if (first == 0xFFFFFFFFu) first = i * 4u; }
-                      fprintf(stderr, "[ps1] vram nonzero=%u/%u first=+0x%X\n",
+                      PS3_LOG(PS3_LOG_INFO, "ps1", "vram nonzero=%u/%u first=+0x%X\n",
                               nz, n, first == 0xFFFFFFFFu ? 0u : first);
                       /* PS1_EVENTS=1: the three kernel events the BIOS polls.
                        *
@@ -10036,7 +9930,7 @@ void rsx_live_draw_present(u32 buffer_id)
                             #define PS1LE(a) __builtin_bswap32(vm_read32((ram) + (u32)(a)))
                             const u32 tot_evcb = PS1LE(0x0120);
                             const u32 tot_size = PS1LE(0x0124);
-                            fprintf(stderr, "[ps1ev] ram=0x%08X  EvCB tbl=0x%08X size=%u\n",
+                            PS3_LOG(PS3_LOG_INFO, "ps1ev", "ram=0x%08X  EvCB tbl=0x%08X size=%u\n",
                                     ram, tot_evcb, tot_size);
                             /* All FIVE slots CdInit fills, not just the three
                              * the poll loop reads: -0x4de8/-0x4de4/-0x4de0/
@@ -10075,13 +9969,13 @@ void rsx_live_draw_present(u32 buffer_id)
                                   const u32 st  = PS1LE(cb + 4);
                                   if (!cls && !st) continue;
                                   live++;
-                                  fprintf(stderr, "[ps1ev]   EvCB[%2u] class=0x%08X"
+                                  PS3_LOG(PS3_LOG_INFO, "ps1ev", "  EvCB[%2u] class=0x%08X"
                                                   " status=0x%08X spec=0x%08X"
                                                   " mode=0x%08X func=0x%08X\n",
                                           i, cls, st, PS1LE(cb + 8),
                                           PS1LE(cb + 12), PS1LE(cb + 16));
                               }
-                              fprintf(stderr, "[ps1ev]   %u of %u EvCB entries in use\n",
+                              PS3_LOG(PS3_LOG_INFO, "ps1ev", "  %u of %u EvCB entries in use\n",
                                       live, n); }
                             #undef PS1LE
                         } }
@@ -10126,7 +10020,7 @@ void rsx_live_draw_present(u32 buffer_id)
                                 for (u32 q = 0; q < 58u; q++) {
                                     const u32 w = vm_read32(pk + 0x10u + q * 4u);
                                     if ((w >> 24) != 0x02u) continue;
-                                    fprintf(stderr, "[gp0fill] pkt+0x%X"
+                                    PS3_LOG(PS3_LOG_INFO, "gp0fill", "pkt+0x%X"
                                                     " cmd=%08X xy=%08X wh=%08X\n",
                                             0x10u + q * 4u, w,
                                             vm_read32(pk + 0x14u + q * 4u),
@@ -10214,7 +10108,7 @@ void rsx_live_draw_present(u32 buffer_id)
                   } }
                 (void)hi; (void)rbase;
             } }
-          fprintf(stderr, "[fps] %.1f (frames %u..%u over %.1fs)\n",
+          PS3_LOG(PS3_LOG_INFO, "fps", "%.1f (frames %u..%u over %.1fs)\n",
                   (g_ld_frames - fps_f0) * 1000.0 / (double)(now - fps_t0),
                   fps_f0, g_ld_frames, (now - fps_t0) / 1000.0);
           fps_t0 = now; fps_f0 = g_ld_frames;
@@ -10285,8 +10179,7 @@ void rsx_live_draw_present(u32 buffer_id)
             } else if (cur < 64) {
                 mask |= 1ull << cur;
             }
-            fprintf(stderr,
-                    "[a010-probe] SAMPLE n=%u live_frame=%u elapsed=%u "
+            PS3_LOG(PS3_LOG_INFO, "a010-probe", "SAMPLE n=%u live_frame=%u elapsed=%u "
                     "present=%u current=%u buffer=%u touched=0x%016llX "
                     "surfaces=%u targeted=%d\n",
                     g_ld_a010_probe_sample, g_ld_frames, elapsed, target, cur,
@@ -10301,8 +10194,7 @@ void rsx_live_draw_present(u32 buffer_id)
                          g_ld_a010_probe_sample, g_ld_frames, i,
                          g.surfaces[i].offset);
                 ld_dump_surface_ppm(path, &g.surfaces[i]);
-                fprintf(stderr,
-                        "[a010-probe] SURFACE sample=%u index=%u location=%u "
+                PS3_LOG(PS3_LOG_INFO, "a010-probe", "SURFACE sample=%u index=%u location=%u "
                         "offset=0x%08X size=%ux%u role=%s\n",
                         g_ld_a010_probe_sample, i, g.surfaces[i].location,
                         g.surfaces[i].offset, g.surfaces[i].w,
@@ -10327,8 +10219,7 @@ void rsx_live_draw_present(u32 buffer_id)
         }
         if (elapsed >= 640 &&
             (!capture_once || g_ld_a010_probe_sample != 0u)) {
-            fprintf(stderr,
-                    "[a010-probe] END frame-cap live_frame=%u samples=%u\n",
+            PS3_LOG(PS3_LOG_INFO, "a010-probe", "END frame-cap live_frame=%u samples=%u\n",
                     g_ld_frames, g_ld_a010_probe_sample);
             fflush(stderr);
             InterlockedExchange(&g_ld_a010_probe_active, 0);
@@ -10359,8 +10250,7 @@ void rsx_live_draw_shutdown(void)
      * reclaims.) */
     ld_flush(LD_FLUSH_SHUTDOWN);
 #if defined(YZ_PERF_PROFILE)
-    fprintf(stderr,
-            "[rsx-perf-summary] frames=%u "
+    PS3_LOG(PS3_LOG_INFO, "rsx-perf-summary", "frames=%u "
             "pso{look=%llu hit=%llu miss=%llu probes=%llu full=%llu "
             "cached=%u capacity=%u mem_kb=%.1f} "
             "reject{requests=%llu unique=%u "
@@ -10462,8 +10352,7 @@ void rsx_live_draw_shutdown(void)
             (double)g_ld_profile.total_upload_high / (1024.0 * 1024.0),
             (double)g_ld_profile.total_vb_high / (1024.0 * 1024.0),
             g_ld_profile.total_retired_high);
-    fprintf(stderr,
-            "[shader-cache-summary] "
+    PS3_LOG(PS3_LOG_INFO, "shader-cache-summary", ""
             "vs{count=%u capacity=%u lookups=%llu hits=%llu "
             "misses=%llu inserts=%llu full_rejects=%llu "
             "compile_calls=%llu lookup_ms=%.3f compile_ms=%.3f "
@@ -10504,9 +10393,7 @@ void rsx_live_draw_shutdown(void)
                 g_ld_profile.total.ps_post_boundary_repeats,
             (unsigned long long)g.ps_blobs.retained_source_bytes,
             (unsigned long long)g.ps_blobs.retained_blob_bytes);
-    fprintf(
-        stderr,
-        "[fp-constant-summary] mode=%s "
+    PS3_LOG(PS3_LOG_WARN, "fp-constant-summary", "mode=%s "
         "variants{exact_source=%u constant_specialized=%u canonical=%u "
         "collapsed_constants=%u collapsed_alpha=%u "
         "tracking_overflow=%llu} "
@@ -10547,8 +10434,7 @@ void rsx_live_draw_shutdown(void)
     fflush(stderr);
 #endif
     if (g_ld_shader_disk_ready > 0) {
-        fprintf(stderr,
-                "[shader-disk-cache-summary] hits{vs=%llu ps=%llu} "
+        PS3_LOG(PS3_LOG_INFO, "shader-disk-cache-summary", "hits{vs=%llu ps=%llu} "
                 "misses{vs=%llu ps=%llu} writes{vs=%llu ps=%llu} "
                 "rejects=%llu\n",
                 (unsigned long long)g_ld_shader_disk_hits[0],

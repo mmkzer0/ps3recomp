@@ -1,5 +1,6 @@
 /* The GPU tier of the BC1/2/3 emulation; see rsx_metal_bc.h. */
 #include "rsx_metal_bc.h"
+#include "../../include/ps3emu/ps3_log.h"   /* PS3_LOG: tagged lines, stderr bytes unchanged */
 
 #include <pthread.h>
 #include <stdio.h>
@@ -315,7 +316,7 @@ static uint64_t monotonic_ms(void)
                            : [NSString stringWithFormat:@"%@ (code %ld)",
                               [[done error] localizedDescription] ?: @"no error object",
                               (long)[[done error] code]];
-            fprintf(stderr, "[rsx engine/metal] BC decode command buffer failed: %s: %s\n",
+            PS3_LOG(PS3_LOG_WARN, "rsx engine/metal", "BC decode command buffer failed: %s: %s\n",
                     [what UTF8String], [why UTF8String]);
         }
         /* The outcome is published in one critical section: the failure record and the end of the pending entry

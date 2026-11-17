@@ -137,5 +137,8 @@ is deleted with the last one.
 `runtime/config/config.cpp` calls `ps3_log_configure()`, so everything that links `config.cpp` links
 `runtime/diag/ps3_log.c` too: a title and `rsx_replay` get it from `libps3recomp_runtime.a` (the strong
 reference pulls the member in), CMake fixtures list it beside `config.cpp`, and a standalone fixture
-built by a Python tool or script compiles it with the other sources. `stop.cpp` does not depend on the
-log at all: it calls the hooks set by `ps3_stop_set_mirror`, which `ps3_log_configure` installs.
+built by a Python tool or script compiles it with the other sources. A fixture that stubs the stop
+runtime itself cannot also link `stop.cpp`; it answers the log's reference with
+`tests/ps3_log_mirror_stub.c` (a weak `ps3_config_get`/`ps3_stop` let the fixture's own definitions
+win). `stop.cpp` does not depend on the log at all: it calls the hooks set by
+`ps3_stop_set_mirror`, which `ps3_log_configure` installs.

@@ -90,6 +90,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "ps3emu/log_first.h"
+#include "ps3emu/ps3_log.h"   /* PS3_LOG: tagged lines, stderr bytes unchanged */
 #include "rsx_capture.h"
 #include "ps3emu/stop.h"
 #include "ps3emu/host_gpu_gate.h"
@@ -210,7 +211,7 @@ void rsx_metal_backend_gpu_suspend(void)
     if (!host_gpu_gate_suspend(&s_gpu_gate, ENG_GATE_DRAIN_NS))
         /* A section is still open, so a commit may follow: no wait here (the main thread must not block on a
          * section that is stuck); the commit that follows is the host's to refuse, as logged. */
-        fprintf(stderr, "[RSX metal] !!!! app inactive: a GPU section was still open after %llu ms; its commit may "
+        PS3_LOG(PS3_LOG_WARN, "RSX metal", "!!!! app inactive: a GPU section was still open after %llu ms; its commit may "
                         "follow will-resign-active (and be refused by the host)\n",
                 (unsigned long long)(ENG_GATE_DRAIN_NS / 1000000ull));
     else
@@ -344,7 +345,7 @@ static void fps_start(void)
         pthread_mutex_unlock(&session->lock);
         window.title=[NSString stringWithFormat:@"%@ | display %.1f FPS | guest %.1f FPS | %.1f ms avg / %.1f p95 / %.1f max | age %.1f s",
             title,r.display_fps,r.guest_fps,r.average_ms,r.p95_ms,r.worst_ms,r.age_seconds];
-        fprintf(stderr,"[RSX FPS] display=%.2f guest=%.2f avg_ms=%.2f p95_ms=%.2f max_ms=%.2f age_s=%.2f\n",
+        PS3_LOG(PS3_LOG_INFO, "RSX FPS", "display=%.2f guest=%.2f avg_ms=%.2f p95_ms=%.2f max_ms=%.2f age_s=%.2f\n",
             r.display_fps,r.guest_fps,r.average_ms,r.p95_ms,r.worst_ms,r.age_seconds);
     });
     dispatch_resume(s_fps_timer);
@@ -640,7 +641,7 @@ static void mtl_set_render_target(void* ud, const rsx_state* state)
     s_width = w; s_height = h;
     if (s_layer) s_layer.drawableSize = CGSizeMake((CGFloat)w, (CGFloat)h);
     if (s_depth && create_depth() != 0)
-        fprintf(stderr, "[RSX metal] depth/stencil resize to %ux%u failed; "
+        PS3_LOG(PS3_LOG_WARN, "RSX metal", "depth/stencil resize to %ux%u failed; "
                         "the old buffer stays bound\n", w, h);
 }
 
@@ -770,7 +771,7 @@ static IOSurfaceRef host_lookup_surface(mach_port_t port)
 static void host_note_gone(const char* why)
 {
     if (atomic_exchange(&s_closed, 1)) return;
-    fprintf(stderr, "[RSX metal] host window gone (%s)\n", why);
+    PS3_LOG(PS3_LOG_INFO, "RSX metal", "host window gone (%s)\n", why);
 }
 
 /* The launcher closes its window by setting `closed` and sending SIGTERM. A
@@ -784,7 +785,7 @@ static void host_watch_launcher(pid_t pid)
     void (^gone)(void) = ^{
         host_note_gone("launcher exited");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), q, ^{
-            fprintf(stderr, "[RSX metal] no window left; terminating\n");
+            PS3_LOG(PS3_LOG_WARN, "RSX metal", "no window left; terminating\n");
             kill(getpid(), SIGTERM);
         });
     };
@@ -812,7 +813,7 @@ static int host_attach(u32 w, u32 h)
     if (s_host_port == MACH_PORT_NULL) {
         kr = bootstrap_look_up(bootstrap_port, name, &s_host_port);
         if (kr != KERN_SUCCESS) {
-            fprintf(stderr, "[RSX metal] host window '%s' not found: %s\n", name,
+            PS3_LOG(PS3_LOG_WARN, "RSX metal", "host window '%s' not found: %s\n", name,
                     bootstrap_strerror(kr));
             s_host_port = MACH_PORT_NULL;
             return -1;
@@ -838,7 +839,7 @@ static int host_attach(u32 w, u32 h)
                       10000, MACH_PORT_NULL);
     mach_port_mod_refs(mach_task_self(), reply, MACH_PORT_RIGHT_RECEIVE, -1);
     if (kr != KERN_SUCCESS) {
-        fprintf(stderr, "[RSX metal] host window '%s' did not answer: %s\n", name,
+        PS3_LOG(PS3_LOG_INFO, "RSX metal", "host window '%s' did not answer: %s\n", name,
                 mach_error_string(kr));
         return -1;
     }
@@ -877,7 +878,7 @@ static int host_attach(u32 w, u32 h)
     mach_msg_destroy(&in.m.header);         /* the mapping and the textures hold their own references */
     if (!ok) {
         if (addr) vm_deallocate(mach_task_self(), addr, RSX_HOST_CONTROL_BYTES);
-        fprintf(stderr, "[RSX metal] host window '%s' sent an unusable reply\n", name);
+        PS3_LOG(PS3_LOG_INFO, "RSX metal", "host window '%s' sent an unusable reply\n", name);
         return -1;
     }
     if (s_host_ctl) vm_deallocate(mach_task_self(), (vm_address_t)s_host_ctl, RSX_HOST_CONTROL_BYTES);
@@ -886,7 +887,7 @@ static int host_attach(u32 w, u32 h)
     s_host_w = rw; s_host_h = rh; s_host_gen = gen;
     atomic_store(&ctl->producer_pid, (int32_t)getpid());
     host_watch_launcher(ctl->launcher_pid);
-    fprintf(stderr, "[RSX metal] host window '%s': %d surfaces %ux%u (generation %u)\n",
+    PS3_LOG(PS3_LOG_INFO, "RSX metal", "host window '%s': %d surfaces %ux%u (generation %u)\n",
             name, RSX_HOST_SLOTS, rw, rh, gen);
     return 0;
 }
@@ -1276,12 +1277,12 @@ static id<MTLFunction> compile_guest_function(const char* msl, const char* what)
                                              options:guest_compile_options()
                                                error:&err];
     if (!lib) {
-        fprintf(stderr, "[RSX metal] %s: MSL compile failed: %s\n", what,
+        PS3_LOG(PS3_LOG_WARN, "RSX metal", "%s: MSL compile failed: %s\n", what,
                 [[err localizedDescription] UTF8String]);
         return nil;
     }
     id<MTLFunction> fn = [lib newFunctionWithName:@"main0"];
-    if (!fn) fprintf(stderr, "[RSX metal] %s: no main0 in the compiled MSL\n", what);
+    if (!fn) PS3_LOG(PS3_LOG_INFO, "RSX metal", "%s: no main0 in the compiled MSL\n", what);
     return fn;
 }
 
@@ -1315,20 +1316,20 @@ static int vp_slot_for(const rsx_state* st, u32 vtex_mask)
     id<MTLFunction> fn = nil;
     const int ni = rsx_vp_decompile_ex(uc, len, vtex_mask, s_hlsl, sizeof s_hlsl);
     if (ni <= 0) {
-        fprintf(stderr, "[RSX metal] %s: decompile failed (%d)\n", name, ni);
+        PS3_LOG(PS3_LOG_WARN, "RSX metal", "%s: decompile failed (%d)\n", name, ni);
     } else {
         snprintf(name, sizeof name, "vp_%08x.hlsl", hash); dump_shader(name, s_hlsl);
         if (rsx_hlsl_to_msl(s_hlsl, RSX_SHADER_STAGE_VERTEX, s_msl, sizeof s_msl,
                             s_log, sizeof s_log) != 0) {
-            fprintf(stderr, "[RSX metal] vertex program %08X: %s\n", hash, s_log);
+            PS3_LOG(PS3_LOG_INFO, "RSX metal", "vertex program %08X: %s\n", hash, s_log);
         } else {
             snprintf(name, sizeof name, "vp_%08x.msl", hash); dump_shader(name, s_msl);
             snprintf(name, sizeof name, "vertex program %08X", hash);
             fn = compile_guest_function(s_msl, name);
         }
     }
-    { static int n = 0; if (PS3_LOG_FIRST(n, 32))
-        fprintf(stderr, "[RSX metal] vertex program %08X: %d instrs -> %s\n",
+    {
+        PS3_LOG_N(32, PS3_LOG_INFO, "RSX metal", "vertex program %08X: %d instrs -> %s\n",
                 hash, ni, fn ? "ok" : "FAILED (built-in shader instead)"); }
 
     const int slot = (int)s_vp_count++;
@@ -1410,14 +1411,14 @@ static int fp_slot_for(const rsx_state* st, const u8** uc, u32 cube_mask)
         rsx_fp_apply_alpha_test_buffered(s_hlsl, sizeof s_hlsl, st->alpha_func) < 0)
         ni = -1;
     if (ni <= 0) {
-        fprintf(stderr, "[RSX metal] fragment program %016llX: decompile failed (%d)\n",
+        PS3_LOG(PS3_LOG_WARN, "RSX metal", "fragment program %016llX: decompile failed (%d)\n",
                 (unsigned long long)key, ni);
     } else {
         snprintf(name, sizeof name, "fp_%016llx.hlsl", (unsigned long long)key);
         dump_shader(name, s_hlsl);
         if (rsx_hlsl_to_msl(s_hlsl, RSX_SHADER_STAGE_FRAGMENT, s_msl, sizeof s_msl,
                             s_log, sizeof s_log) != 0) {
-            fprintf(stderr, "[RSX metal] fragment program %016llX: %s\n",
+            PS3_LOG(PS3_LOG_INFO, "RSX metal", "fragment program %016llX: %s\n",
                     (unsigned long long)key, s_log);
         } else {
             snprintf(name, sizeof name, "fp_%016llx.msl", (unsigned long long)key);
@@ -1426,8 +1427,8 @@ static int fp_slot_for(const rsx_state* st, const u8** uc, u32 cube_mask)
             fn = compile_guest_function(s_msl, name);
         }
     }
-    { static int n = 0; if (PS3_LOG_FIRST(n, 32))
-        fprintf(stderr, "[RSX metal] fragment program %016llX: %d instrs, %u constants -> %s\n",
+    {
+        PS3_LOG_N(32, PS3_LOG_INFO, "RSX metal", "fragment program %016llX: %d instrs, %u constants -> %s\n",
                 (unsigned long long)key, ni, nconst,
                 fn ? "ok" : (shadow_mask ? "FAILED (depth comparison draw rejected)" :
                                              "FAILED (built-in shader instead)")); }
@@ -1740,8 +1741,8 @@ static int tex_slot_for(const rsx_texture_state* t)
 
     id<MTLTexture> tex = upload_texture(vm_base + ea, w, h, fmt, t->control1,
                                         levels, pitch, cube);
-    { static int n = 0; if (PS3_LOG_FIRST(n, 16))
-        fprintf(stderr, "[RSX metal] texture %ux%u fmt 0x%02X %u level(s)%s at 0x%08X (%s) -> %s\n",
+    {
+        PS3_LOG_N(16, PS3_LOG_INFO, "RSX metal", "texture %ux%u fmt 0x%02X %u level(s)%s at 0x%08X (%s) -> %s\n",
                 w, h, fmt, levels ? levels : 1u, cube ? " cube" : "", ea,
                 (t->format & 3u) == 1u ? "local" : "main",
                 tex ? "ok" : "FAILED"); }
@@ -1935,8 +1936,8 @@ static int surface_get(u32 off, u32 w, u32 h, u32 fmt)
     td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead |
                MTLTextureUsagePixelFormatView;
     id<MTLTexture> tex = [s_dev newTextureWithDescriptor:td];
-    { static int n = 0; if (PS3_LOG_FIRST(n, 16))
-        fprintf(stderr, "[RSX metal] surface 0x%08X %ux%u fmt 0x%02X -> %s\n",
+    {
+        PS3_LOG_N(16, PS3_LOG_INFO, "RSX metal", "surface 0x%08X %ux%u fmt 0x%02X -> %s\n",
                 off, w, h, fmt & 0x1Fu, tex ? "ok" : "FAILED"); }
 
     MtlSurface* s = &s_surf[slot];
@@ -2058,8 +2059,8 @@ static void textures_for(const rsx_state* st, MtlDraw* d)
         if (surf >= 0) {
             d->samp[u] = samp_slot_for(t);
             if (rt_is_own_target(d, t->offset)) {
-                { static int n = 0; if (PS3_LOG_FIRST(n, 1))
-                    fprintf(stderr, "[RSX metal] unit %u samples the surface the pass "
+                {
+                    PS3_LOG_N(1, PS3_LOG_INFO, "RSX metal", "unit %u samples the surface the pass "
                                     "draws into (0x%08X); reading the zero texture\n",
                             u, t->offset); }
                 continue;                 /* leaves the unit on the zero texture */
@@ -2431,7 +2432,7 @@ static id<MTLRenderPipelineState> pso_for(const MtlDraw* d, MTLPixelFormat color
     id<MTLRenderPipelineState> pso =
         [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
     if (!pso) {
-        fprintf(stderr, "[RSX metal] pipeline state failed (vs %d, fs %d): %s\n",
+        PS3_LOG(PS3_LOG_WARN, "RSX metal", "pipeline state failed (vs %d, fs %d): %s\n",
                 d->vs_idx, d->fs_idx, [[err localizedDescription] UTF8String]);
         return nil;
     }
@@ -2915,7 +2916,7 @@ static void eng_post_options(void)
         s_eng_fxaa = (e && !strcasecmp(e, "fxaa"));
         s_eng_smaa = (e && !strcasecmp(e, "smaa"));
         if (e && *e && !s_eng_fxaa && !s_eng_smaa && strcasecmp(e, "off") && strcmp(e, "0"))
-            fprintf(stderr, "[RSX metal] PS3_AA=%s unknown (fxaa, smaa); off\n", e);
+            PS3_LOG(PS3_LOG_INFO, "RSX metal", "PS3_AA=%s unknown (fxaa, smaa); off\n", e);
     }
     if (s_eng_sharpen < 0.0f) s_eng_sharpen = eng_sharpen_from(getenv("PS3_SHARPEN"));
     if (s_eng_vibrance < -1.0f) s_eng_vibrance = eng_vibrance_from(getenv("PS3_VIBRANCE"));
@@ -2923,7 +2924,7 @@ static void eng_post_options(void)
     static int logged;
     if (!logged++ && (s_eng_fxaa || s_eng_smaa || s_eng_sharpen > 0.0f ||
                       s_eng_vibrance != 0.0f || s_eng_contrast != 1.0f))
-        fprintf(stderr, "[RSX metal] present: AA %s, sharpen %.2f, vibrance %.2f, contrast %.2f\n",
+        PS3_LOG(PS3_LOG_INFO, "RSX metal", "present: AA %s, sharpen %.2f, vibrance %.2f, contrast %.2f\n",
                 s_eng_fxaa ? "FXAA" : s_eng_smaa ? "SMAA" : "off", (double)s_eng_sharpen,
                 (double)s_eng_vibrance, (double)s_eng_contrast);
 }
@@ -3165,7 +3166,7 @@ static void eng_alloc_failed(const char* what, NSUInteger w, NSUInteger h)
     if (!PS3_LOG_FIRST(logs, 16) && (n & (n - 1))) return;   /* first 16, then powers of two */
     unsigned long long gpu, ws, avail;
     eng_gpu_numbers(&gpu, &ws, &avail);
-    fprintf(stderr, "[RSX metal] %s failed (%lux%lu): count=%u objects=%u free=%u"
+    PS3_LOG(PS3_LOG_WARN, "RSX metal", "%s failed (%lux%lu): count=%u objects=%u free=%u"
                     " gpu_allocated=%llu MiB working_set=%llu MiB proc_available=%llu MiB\n",
             what, (unsigned long)w, (unsigned long)h, n, s_eng_obj_count, s_eng_obj_free_count, gpu, ws, avail);
 }
@@ -3253,7 +3254,7 @@ static PS3_NORETURN void eng_alloc_stop(const char* what, MTLTextureDescriptor* 
     const char* pf_name = d.is_buffer ? "none" : eng_pixel_format_name(d.pixel_format);
     const int bc_supported = eng_device_supports_bc();
     const unsigned family = eng_highest_apple_family();
-    fprintf(stderr, "[RSX metal] rejected %s: type=%lu pixelFormat=%lu(%s) size=%lux%lux%lu mips=%lu array=%lu"
+    PS3_LOG(PS3_LOG_WARN, "RSX metal", "rejected %s: type=%lu pixelFormat=%lu(%s) size=%lux%lux%lu mips=%lu array=%lu"
                     " samples=%lu usage=0x%lX storage=%lu bc_supported=%d apple_family=%u\n",
             d.is_buffer ? "buffer" : "descriptor", (unsigned long)d.type, (unsigned long)d.pixel_format, pf_name,
             (unsigned long)d.w, (unsigned long)d.h, (unsigned long)d.depth, (unsigned long)d.mips,
@@ -3556,7 +3557,7 @@ static int eng_init(void* user, u32 width, u32 height)
     NSError* err = nil;
     s_eng_helper_lib = [s_dev newLibraryWithSource:kEngHelperMSL options:nil error:&err];
     if (!s_eng_helper_lib) {
-        fprintf(stderr, "[rsx engine/metal] helper shader compile failed: %s\n",
+        PS3_LOG(PS3_LOG_WARN, "rsx engine/metal", "helper shader compile failed: %s\n",
                 [[err localizedDescription] UTF8String]);
         return -1;
     }
@@ -3586,12 +3587,12 @@ static void eng_shutdown(void* user)
     if (s_eng_bc_gpu) {
         NSString* pending = [s_eng_bc_gpu waitIdleWithin:s_eng_bc_settle_budget_ms];
         if (pending)
-            fprintf(stderr, "[rsx engine/metal] shutdown: BC decode(s) never completed (%s); abandoned\n",
+            PS3_LOG(PS3_LOG_WARN, "rsx engine/metal", "shutdown: BC decode(s) never completed (%s); abandoned\n",
                     [pending UTF8String]);
         if ([s_eng_bc_gpu failureCount])
-            fprintf(stderr, "[rsx engine/metal] shutdown: %u BC decode(s) had failed\n", [s_eng_bc_gpu failureCount]);
+            PS3_LOG(PS3_LOG_WARN, "rsx engine/metal", "shutdown: %u BC decode(s) had failed\n", [s_eng_bc_gpu failureCount]);
         if (s_eng_bc_settles)
-            fprintf(stderr, "[rsx engine/metal] BC settle: %u commit(s) waited %.3f ms in all, %.3f ms at most\n",
+            PS3_LOG(PS3_LOG_INFO, "rsx engine/metal", "BC settle: %u commit(s) waited %.3f ms in all, %.3f ms at most\n",
                     s_eng_bc_settles, (double)s_eng_bc_settle_ns / 1e6, (double)s_eng_bc_settle_max_ns / 1e6);
     }
     s_eng_bc_settles = 0;
@@ -3723,7 +3724,7 @@ static void eng_bc_policy_read(void)
     s_eng_bc_emulate = s_eng_bc_requested != ENG_BC_PATH_AUTO || !native;
     s_eng_bc_path = s_eng_bc_requested == ENG_BC_PATH_AUTO ? ENG_BC_PATH_TIERED : s_eng_bc_requested;
     static const char* const kNames[] = { "", "auto", "cpu", "gpu", "tiered" };
-    fprintf(stderr, "[RSX metal] BC1-3 textures: %s (rsx.bc_path=%s, device samples BC=%d, "
+    PS3_LOG(PS3_LOG_INFO, "RSX metal", "BC1-3 textures: %s (rsx.bc_path=%s, device samples BC=%d, "
                     "rsx.bc_gpu_min_texels=%u)\n",
             s_eng_bc_emulate ? "decoded to RGBA8" : "native", kNames[s_eng_bc_requested], native,
             s_eng_bc_min_texels);
@@ -3764,7 +3765,7 @@ static RsxMetalBc* eng_bc_gpu(void)
     s_eng_bc_gpu = [[RsxMetalBc alloc] initWithDevice:s_dev host:&host error:&err];
     if (!s_eng_bc_gpu) {
         s_eng_bc_gpu_unavailable = 1;
-        fprintf(stderr, "[RSX metal] the GPU BC decoder is unavailable (%s); the CPU tier decodes every level\n",
+        PS3_LOG(PS3_LOG_WARN, "RSX metal", "the GPU BC decoder is unavailable (%s); the CPU tier decodes every level\n",
                 [[err localizedDescription] UTF8String] ?: "no error");
     }
     return s_eng_bc_gpu;
@@ -4155,7 +4156,7 @@ static u32 eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
         NSError* err = nil;
         s_eng_depth_pso = eng_new_pso(pd, &err);
         if (!s_eng_depth_pso) {
-            fprintf(stderr, "[rsx engine/metal] depth resolve pipeline failed: %s\n",
+            PS3_LOG(PS3_LOG_WARN, "rsx engine/metal", "depth resolve pipeline failed: %s\n",
                     [[err localizedDescription] UTF8String]);
             return 0;
         }
@@ -4196,7 +4197,7 @@ static u32 eng_depth_as_color(void* user, u32 depth, u32 w, u32 h, u32 rsx_fmt)
         pd.colorAttachments[0].pixelFormat = formats[k];
         if (lib) s_eng_depth_color_pso[k] = eng_new_pso(pd, &err);
         if (!s_eng_depth_color_pso[k]) {
-            fprintf(stderr, "[rsx engine/metal] depth-as-colour pipeline failed: %s\n",
+            PS3_LOG(PS3_LOG_WARN, "rsx engine/metal", "depth-as-colour pipeline failed: %s\n",
                     [[err localizedDescription] UTF8String]);
             s_eng_depth_color_failed = 1;
             return 0;
@@ -4236,7 +4237,7 @@ static id<MTLFunction> eng_function(const char* hlsl, int stage,
     snprintf(name, sizeof name, "%s_%016llx.hlsl", what, (unsigned long long)hash);
     dump_shader(name, hlsl);
     if (rsx_hlsl_to_msl(hlsl, stage, s_msl, sizeof s_msl, s_log, sizeof s_log) != 0) {
-        fprintf(stderr, "[rsx engine/metal] %s %016llx: %s\n", what,
+        PS3_LOG(PS3_LOG_INFO, "rsx engine/metal", "%s %016llx: %s\n", what,
                 (unsigned long long)hash, s_log);
     } else {
         snprintf(name, sizeof name, "%s_%016llx.msl", what, (unsigned long long)hash);
@@ -4340,7 +4341,7 @@ static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
     NSError* err = nil;
     id<MTLRenderPipelineState> pso = eng_new_pso(pd, &err);
     if (!pso) {
-        fprintf(stderr, "[rsx engine/metal] pipeline state failed: %s\n",
+        PS3_LOG(PS3_LOG_WARN, "rsx engine/metal", "pipeline state failed: %s\n",
                 [[err localizedDescription] UTF8String]);
         return 0;
     }
@@ -4424,7 +4425,7 @@ static int eng_aniso(void)
     static int a = -1;
     if (a < 0) {
         a = eng_aniso_from(getenv("PS3_ANISO"));
-        if (a) fprintf(stderr, "[RSX metal] anisotropic filtering %dx (PS3_ANISO)\n", a);
+        if (a) PS3_LOG(PS3_LOG_INFO, "RSX metal", "anisotropic filtering %dx (PS3_ANISO)\n", a);
     }
     return a;
 }
@@ -4813,7 +4814,7 @@ static id<MTLRenderPipelineState> eng_clear_pipeline(MTLPixelFormat fmt, int dep
     NSError* err = nil;
     id<MTLRenderPipelineState> pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];   /* in the commit section */
     if (!pso) {
-        fprintf(stderr, "[rsx engine/metal] rectangle clear pipeline failed: %s\n",
+        PS3_LOG(PS3_LOG_WARN, "rsx engine/metal", "rectangle clear pipeline failed: %s\n",
                 [[err localizedDescription] UTF8String]);
         return nil;
     }
@@ -5143,7 +5144,7 @@ static id<MTLTexture> eng_fxaa(id<MTLCommandBuffer> cb, id<MTLTexture> src)
         NSError* err = nil;
         s_eng_fxaa_pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];   /* in the commit section */
         if (!s_eng_fxaa_pso) {
-            fprintf(stderr, "[rsx engine/metal] FXAA pipeline failed (FXAA off): %s\n",
+            PS3_LOG(PS3_LOG_WARN, "rsx engine/metal", "FXAA pipeline failed (FXAA off): %s\n",
                     [[err localizedDescription] UTF8String]);
             s_eng_fxaa = 0;
             return nil;
@@ -5188,7 +5189,7 @@ static id<MTLRenderPipelineState> eng_smaa_pso(NSString* vs, NSString* fs, MTLPi
     pd.colorAttachments[0].pixelFormat = fmt;
     NSError* err = nil;
     id<MTLRenderPipelineState> p = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];   /* in the commit section */
-    if (!p) fprintf(stderr, "[rsx engine/metal] SMAA pipeline %s failed (SMAA off): %s\n",
+    if (!p) PS3_LOG(PS3_LOG_WARN, "rsx engine/metal", "SMAA pipeline %s failed (SMAA off): %s\n",
                     [fs UTF8String], [[err localizedDescription] UTF8String]);
     return p;
 }
@@ -5240,7 +5241,7 @@ static id<MTLTexture> eng_smaa(id<MTLCommandBuffer> cb, id<MTLTexture> src)
         NSError* err = nil;
         s_eng_smaa_lib = [s_dev newLibraryWithSource:@(kSmaaMSL) options:nil error:&err];
         if (!s_eng_smaa_lib) {
-            fprintf(stderr, "[rsx engine/metal] SMAA shaders failed to compile (SMAA off): %s\n",
+            PS3_LOG(PS3_LOG_WARN, "rsx engine/metal", "SMAA shaders failed to compile (SMAA off): %s\n",
                     [[err localizedDescription] UTF8String]);
             s_eng_smaa = 0;
             return nil;
@@ -5301,7 +5302,7 @@ static int eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
         NSError* err = nil;
         s_eng_blit_pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];   /* in the commit section */
         if (!s_eng_blit_pso) {
-            fprintf(stderr, "[rsx engine/metal] present pipeline failed: %s\n",
+            PS3_LOG(PS3_LOG_WARN, "rsx engine/metal", "present pipeline failed: %s\n",
                     [[err localizedDescription] UTF8String]);
             return 0;
         }
@@ -5365,7 +5366,7 @@ static void eng_sync_drawable_size(void)
     const CGSize cur = s_layer.drawableSize;
     if (ww && wh && ((u32)cur.width != ww || (u32)cur.height != wh)) {
         s_layer.drawableSize = CGSizeMake((CGFloat)ww, (CGFloat)wh);
-        fprintf(stderr, "[RSX metal] drawable %ux%u (window)\n", ww, wh);
+        PS3_LOG(PS3_LOG_INFO, "RSX metal", "drawable %ux%u (window)\n", ww, wh);
     }
 }
 
@@ -5521,15 +5522,13 @@ static void eng_encode_and_commit_section(id<MTLTexture> present_dst)
              * with an error and nothing says so; the next frame then renders
              * on a device that may have been lost. Name it, with its code. */
             if ([cb status] == MTLCommandBufferStatusError) {
-                static int n;
-                if (PS3_LOG_FIRST(n, 8))
-                    fprintf(stderr, "[rsx engine/metal] command buffer failed: %s (code %ld)\n",
+                PS3_LOG_N(8, PS3_LOG_WARN, "rsx engine/metal", "command buffer failed: %s (code %ld)\n",
                             [[[cb error] localizedDescription] UTF8String], (long)[[cb error] code]);
             }
         }
 
         if (s_eng_dropped) {
-            fprintf(stderr, "[rsx engine/metal] dropped %u record(s) (cap %d)\n",
+            PS3_LOG(PS3_LOG_INFO, "rsx engine/metal", "dropped %u record(s) (cap %d)\n",
                     s_eng_dropped, ENG_MAX_RECORDS);
             s_eng_dropped = 0;
         }
@@ -5687,7 +5686,7 @@ static void eng_dump_frame(id<MTLTexture> src, const rsx_frame_identity* fid)
         const unsigned long long n =
             atomic_fetch_add_explicit(&s_fdump_errors, 1, memory_order_relaxed) + 1;
         if (!(n & (n - 1)))
-            fprintf(stderr, "[rsx frame-dump] unsupported format=%lu s=%u flip=%s"
+            PS3_LOG(PS3_LOG_INFO, "rsx frame-dump", "unsupported format=%lu s=%u flip=%s"
                             " count=%llu\n",
                     (unsigned long)[src pixelFormat], fid->present_seq, flip, n);
         return;
@@ -5719,7 +5718,7 @@ static void eng_dump_frame(id<MTLTexture> src, const rsx_frame_identity* fid)
         }
         fclose(f);
         atomic_fetch_add_explicit(&s_fdump_written, 1, memory_order_relaxed);
-        fprintf(stderr, "[rsx frame-dump] s=%u flip=%s surface=%u to %s\n",
+        PS3_LOG(PS3_LOG_INFO, "rsx frame-dump", "s=%u flip=%s surface=%u to %s\n",
                 fid->present_seq, flip, fid->display_buffer, path);
     }
     free(rgba);
@@ -5916,7 +5915,7 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
          * headless run. Refuse it by name, as every init failure here does. */
         if (s_headless) {
             s_headless = 0;
-            fprintf(stderr, "[RSX metal] PS3RECOMP_METAL_HEADLESS is set, but iOS has no "
+            PS3_LOG(PS3_LOG_INFO, "RSX metal", "PS3RECOMP_METAL_HEADLESS is set, but iOS has no "
                             "offscreen path; unset it\n");
             return -1;
         }
@@ -5924,14 +5923,14 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
 
         s_dev = MTLCreateSystemDefaultDevice();
         if (!s_dev) {
-            fprintf(stderr, "[RSX metal] no Metal device available\n");
+            PS3_LOG(PS3_LOG_INFO, "RSX metal", "no Metal device available\n");
             return -1;
         }
 #if TARGET_OS_IPHONE
         /* Apple's Metal feature table: border colour starts at Apple7. */
         s_ios_supports_border = [s_dev supportsFamily:MTLGPUFamilyApple7];
-        fprintf(stderr, "[RSX metal] supportsBCTextureCompression=%d\n", eng_device_supports_bc());
-        fprintf(stderr, "[RSX metal] supports32BitFloatFiltering=%d supportsFamilyApple9=%d\n",
+        PS3_LOG(PS3_LOG_INFO, "RSX metal", "supportsBCTextureCompression=%d\n", eng_device_supports_bc());
+        PS3_LOG(PS3_LOG_INFO, "RSX metal", "supports32BitFloatFiltering=%d supportsFamilyApple9=%d\n",
                 (int)[s_dev supports32BitFloatFiltering],
                 (int)[s_dev supportsFamily:MTLGPUFamilyApple9]);
         unsigned apple_family = 0;
@@ -5945,7 +5944,7 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
         mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
         const kern_return_t memory_status = task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
                                                       (task_info_t)&memory, &count);
-        fprintf(stderr, "[RSX metal] borderColor=%d gpuFamilyApple=%u gpuFamilyMac2=%d"
+        PS3_LOG(PS3_LOG_INFO, "RSX metal", "borderColor=%d gpuFamilyApple=%u gpuFamilyMac2=%d"
                         " vm_base=%p resident_bytes=%llu memory_status=%d\n",
                 (int)s_ios_supports_border, apple_family,
                 (int)[s_dev supportsFamily:MTLGPUFamilyMac2], (void*)vm_base,
@@ -5955,7 +5954,7 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
         /* A section of its own, retried across a lifecycle race: an app started in the background (or one that
          * went inactive during init) waits for the gate here instead of failing init for good. */
         if (eng_gated_step(^int{ s_queue = [s_dev newCommandQueue]; return s_queue ? 0 : -1; }) != 0) {
-            fprintf(stderr, "[RSX metal] could not create command queue\n");
+            PS3_LOG(PS3_LOG_WARN, "RSX metal", "could not create command queue\n");
             return -1;
         }
 
@@ -5974,35 +5973,35 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
         if (s_host) {
             atomic_store(&s_closed, 0);
             if (host_attach(s_width, s_height) != 0) {
-                fprintf(stderr, "[RSX metal] no host window; opening a window of our own\n");
+                PS3_LOG(PS3_LOG_INFO, "RSX metal", "no host window; opening a window of our own\n");
                 host_detach();
             }
         }
         rc = s_headless ? eng_gated_step(^int{ return create_offscreen(); }) : s_host ? 0 : create_window(title);
 #endif
         if (rc != 0) {
-            fprintf(stderr, "[RSX metal] surface creation failed\n");
+            PS3_LOG(PS3_LOG_WARN, "RSX metal", "surface creation failed\n");
             return -1;
         }
         if (eng_gated_step(^int{ return create_depth(); }) != 0) {
-            fprintf(stderr, "[RSX metal] depth/stencil buffer creation failed\n");
+            PS3_LOG(PS3_LOG_WARN, "RSX metal", "depth/stencil buffer creation failed\n");
             return -1;
         }
         if (eng_gated_step(^int{ return create_placeholders(); }) != 0) {
-            fprintf(stderr, "[RSX metal] placeholder texture creation failed\n");
+            PS3_LOG(PS3_LOG_WARN, "RSX metal", "placeholder texture creation failed\n");
             return -1;
         }
 
         s_verts = (MtlVertex*)malloc(sizeof(MtlVertex) * MTL_MAX_VERTS);
         if (!s_verts) {
-            fprintf(stderr, "[RSX metal] vertex staging alloc failed\n");
+            PS3_LOG(PS3_LOG_WARN, "RSX metal", "vertex staging alloc failed\n");
             return -1;
         }
 
         NSError* serr = nil;
         s_shader_lib = [s_dev newLibraryWithSource:kBuiltinMSL options:nil error:&serr];
         if (!s_shader_lib) {
-            fprintf(stderr, "[RSX metal] built-in shader compile failed: %s\n",
+            PS3_LOG(PS3_LOG_WARN, "RSX metal", "built-in shader compile failed: %s\n",
                     [[serr localizedDescription] UTF8String]);
             return -1;
         }
@@ -6015,7 +6014,7 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
 
         s_inflight = dispatch_semaphore_create(MTL_MAX_INFLIGHT);
         if (!s_inflight) {
-            fprintf(stderr, "[RSX metal] semaphore creation failed\n");
+            PS3_LOG(PS3_LOG_WARN, "RSX metal", "semaphore creation failed\n");
             return -1;
         }
 
@@ -6035,14 +6034,14 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
          * would hand a BC texture to a device that cannot hold it and end in a Metal validation abort, so on
          * iOS it is not an option, neither by PS3RECOMP_RSX_ENGINE=vtable nor as a fallback. */
         if (!rsx_draw_engine_enabled()) {
-            fprintf(stderr, "[RSX metal] PS3RECOMP_RSX_ENGINE selects the vtable path, which "
+            PS3_LOG(PS3_LOG_INFO, "RSX metal", "PS3RECOMP_RSX_ENGINE selects the vtable path, which "
                             "has no BC emulation or border-sampler guard; iOS runs the draw engine only\n");
             s_ready = 0;
             rsx_draw_engine_set_backend(NULL);
             return -1;
         }
         if (rsx_draw_engine_init(s_width, s_height) != 0) {
-            fprintf(stderr, "[RSX metal] draw engine init failed; iOS has no vtable fallback "
+            PS3_LOG(PS3_LOG_WARN, "RSX metal", "draw engine init failed; iOS has no vtable fallback "
                             "(it has no BC emulation or border-sampler guard)\n");
             s_ready = 0;
             rsx_draw_engine_set_backend(NULL);
@@ -6065,7 +6064,7 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
             (void)rsx_metal_backend_capture_environment(&env);
             rsx_capture_install_from_config(&env);
         }
-        fprintf(stderr, "[RSX metal] %s on %s (%ux%u), guest shaders %s, %s path\n",
+        PS3_LOG(PS3_LOG_INFO, "RSX metal", "%s on %s (%ux%u), guest shaders %s, %s path\n",
                 s_headless ? "headless" : s_host ? "host-surface" : "windowed",
                 [[s_dev name] UTF8String], s_width, s_height,
                 s_guest_shaders ? "on" : (rsx_hlsl_to_msl_available() ? "off (env)" : "off (translator not built)"),
@@ -6335,7 +6334,7 @@ static void legacy_present_section(void)
         }
 
         if (s_dropped_records) {
-            fprintf(stderr, "[RSX metal] dropped %u record(s) this frame (cap %d records / %u verts)\n",
+            PS3_LOG(PS3_LOG_INFO, "RSX metal", "dropped %u record(s) this frame (cap %d records / %u verts)\n",
                     s_dropped_records, MTL_MAX_RECORDS, MTL_MAX_VERTS);
             s_dropped_records = 0;
         }
@@ -6347,7 +6346,7 @@ static void legacy_present_section(void)
         /* The frame's records are gone, so slots may move now. The command
          * buffer keeps its own references to whatever it still runs. */
         if (s_caches_full) {
-            fprintf(stderr, "[RSX metal] cache full (%u VP, %u FP, %u PSO, %u textures,"
+            PS3_LOG(PS3_LOG_INFO, "RSX metal", "cache full (%u VP, %u FP, %u PSO, %u textures,"
                             " %u surface views); cleared\n",
                     s_vp_count, s_fp_count, s_pso_count, s_tex_count, s_rtview_count);
             clear_caches();

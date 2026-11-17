@@ -402,7 +402,7 @@ jobs:
           # register file the colour export comes from, and how many
           # SV_TARGETs a program that writes more than one export gets. It
           # had rotted to the point of not compiling while nothing ran it.
-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -o /tmp/test_fp_decompiler libs/video/tests/test_fp_decompiler.c libs/video/rsx_fp_decompiler.c
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -o /tmp/test_fp_decompiler libs/video/tests/test_fp_decompiler.c libs/video/rsx_fp_decompiler.c runtime/diag/ps3_log.c runtime/diag/host_exit.c tests/ps3_log_mirror_stub.c
           /tmp/test_fp_decompiler
           # The D3D12 device order (adapter preference, software adapters
           # skipped, default adapter, WARP, RSX_D3D12_WARP) as pure logic.
@@ -416,30 +416,30 @@ jobs:
           # holding still while constants change, and restart cuts bounding
           # every topology expansion. No GPU and no host graphics API, so this
           # is where those get checked at all.
-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_rsx_draw_engine libs/video/tests/test_rsx_draw_engine.c libs/video/rsx_draw_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_rsx_draw_engine libs/video/tests/test_rsx_draw_engine.c libs/video/rsx_draw_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c runtime/diag/ps3_log.c runtime/diag/host_exit.c tests/ps3_log_mirror_stub.c
           /tmp/test_rsx_draw_engine
           # The vertex fetch plan's stable ranges against the per-attribute
           # walk they are now computed without.
-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -O2 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_vertex_fetch_plan libs/video/tests/test_vertex_fetch_plan.c libs/video/rsx_vertex_compact.c libs/video/rsx_dispatch.c
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -O2 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_vertex_fetch_plan libs/video/tests/test_vertex_fetch_plan.c libs/video/rsx_vertex_compact.c libs/video/rsx_dispatch.c runtime/diag/ps3_log.c runtime/diag/host_exit.c tests/ps3_log_mirror_stub.c
           /tmp/test_vertex_fetch_plan
           # Preserve explicitly written current colors, including black,
           # while keeping the unwritten ATTR3 compatibility default.
-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -O2 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_vertex_current_color libs/video/tests/test_vertex_current_color.c libs/video/rsx_vertex_compact.c libs/video/rsx_dispatch.c
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -O2 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_vertex_current_color libs/video/tests/test_vertex_current_color.c libs/video/rsx_vertex_compact.c libs/video/rsx_dispatch.c runtime/diag/ps3_log.c runtime/diag/host_exit.c tests/ps3_log_mirror_stub.c
           /tmp/test_vertex_current_color
-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -I libs/video/tests -o /tmp/test_color_feedback_engine libs/video/tests/test_color_feedback_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -I libs/video/tests -o /tmp/test_color_feedback_engine libs/video/tests/test_color_feedback_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c runtime/diag/ps3_log.c runtime/diag/host_exit.c tests/ps3_log_mirror_stub.c
           /tmp/test_color_feedback_engine
           # The NV4097 method decoder on its own: the vertex-constant window is
           # 32 dwords and the registers after it are not constants.
-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_rsx_transform_constants libs/video/tests/test_rsx_transform_constants.c libs/video/rsx_commands.c
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_rsx_transform_constants libs/video/tests/test_rsx_transform_constants.c libs/video/rsx_commands.c runtime/diag/ps3_log.c runtime/diag/host_exit.c tests/ps3_log_mirror_stub.c
           /tmp/test_rsx_transform_constants
           # Vertex-program microcode and constant runs taken in one call leave the
           # state exactly as the same words do one by one.
-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_rsx_vp_run libs/video/tests/test_rsx_vp_run.c libs/video/rsx_commands.c
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_rsx_vp_run libs/video/tests/test_rsx_vp_run.c libs/video/rsx_commands.c runtime/diag/ps3_log.c runtime/diag/host_exit.c tests/ps3_log_mirror_stub.c
           /tmp/test_rsx_vp_run
           # Texture offsets are 31 bits; bit 31 is not an address bit.
-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_rsx_texture_offset libs/video/tests/test_rsx_texture_offset.c libs/video/rsx_dispatch.c
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_rsx_texture_offset libs/video/tests/test_rsx_texture_offset.c libs/video/rsx_dispatch.c runtime/diag/ps3_log.c runtime/diag/host_exit.c tests/ps3_log_mirror_stub.c
           /tmp/test_rsx_texture_offset
-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_rsx_command_texture_offset libs/video/tests/test_rsx_command_texture_offset.c libs/video/rsx_commands.c
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_rsx_command_texture_offset libs/video/tests/test_rsx_command_texture_offset.c libs/video/rsx_commands.c runtime/diag/ps3_log.c runtime/diag/host_exit.c tests/ps3_log_mirror_stub.c
           /tmp/test_rsx_command_texture_offset
 
       # The Win32 shim every POSIX host runs the runtime through: interlocked

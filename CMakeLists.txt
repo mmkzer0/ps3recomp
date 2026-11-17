@@ -1334,7 +1334,11 @@ if(PS3RECOMP_BUILD_TESTS)
     add_executable(test_vertex_current_color
         libs/video/tests/test_vertex_current_color.c
         libs/video/rsx_vertex_compact.c
-        libs/video/rsx_dispatch.c)
+        libs/video/rsx_dispatch.c
+        runtime/diag/ps3_log.c
+        runtime/config/config.cpp
+        runtime/diag/stop.cpp
+        runtime/diag/host_exit.c)
     target_include_directories(test_vertex_current_color PRIVATE include libs/video)
     add_test(NAME vertex_current_color COMMAND test_vertex_current_color)
 
@@ -2264,7 +2268,10 @@ if(UNIX)
             libs/video/rsx_shader_msl.cpp
             libs/video/rsx_vp_decompiler.c
             libs/video/rsx_fp_decompiler.c
-        )
+            runtime/diag/ps3_log.c
+            runtime/config/config.cpp
+            runtime/diag/stop.cpp
+            runtime/diag/host_exit.c)
         target_include_directories(test_shader_msl PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
             "${CMAKE_CURRENT_SOURCE_DIR}/include"
@@ -2284,7 +2291,8 @@ if(UNIX)
                 libs/video/rsx_texture_layout.c
                 libs/video/rsx_vp_decompiler.c
                 libs/video/rsx_fp_decompiler.c
-            )
+                runtime/diag/ps3_log.c
+                tests/ps3_log_mirror_stub.c)
             set_source_files_properties(
                 "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests/test_metal_poly_offset.m"
                 PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
@@ -2311,7 +2319,8 @@ if(UNIX)
                 libs/video/rsx_fp_decompiler.c
                 runtime/diag/host_exit.c
                 libs/video/rsx_tiling.c
-            )
+                runtime/diag/ps3_log.c
+                tests/ps3_log_mirror_stub.c)
             set_source_files_properties(
                 "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests/test_metal_depth_bounds.m"
                 PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
@@ -2335,7 +2344,8 @@ if(UNIX)
                 libs/video/rsx_fp_decompiler.c
                 runtime/diag/host_exit.c
                 libs/video/rsx_tiling.c
-            )
+                runtime/diag/ps3_log.c
+                tests/ps3_log_mirror_stub.c)
             set_source_files_properties(
                 "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests/test_metal_depth_clamp.m"
                 PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
@@ -2389,7 +2399,8 @@ if(UNIX)
             libs/video/rsx_dispatch.c
             libs/video/rsx_vertex_compact.c
             libs/video/rsx_tiling.c   # a C unit of its own: win32_compat.h clashes with the ObjC headers if included into the fixture
-        )
+            runtime/diag/ps3_log.c
+            tests/ps3_log_mirror_stub.c)
         set_source_files_properties(libs/video/tests/test_resc_present_metal.m
             PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
         target_include_directories(test_resc_present_metal PRIVATE
@@ -2425,7 +2436,8 @@ if(UNIX)
                 libs/video/rsx_vp_decompiler.c
                 libs/video/rsx_fp_decompiler.c
                 libs/video/rsx_tiling.c   # a C unit of its own: win32_compat.h clashes with the ObjC headers if included into the fixture
-            )
+                runtime/diag/ps3_log.c
+                tests/ps3_log_mirror_stub.c)
             set_source_files_properties(libs/video/tests/test_metal_${gpu_test}.m
                 PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
             target_include_directories(test_metal_${gpu_test} PRIVATE
@@ -2463,7 +2475,8 @@ if(UNIX)
             libs/video/rsx_fp_decompiler.c
             libs/video/rsx_tiling.c   # a C unit of its own: win32_compat.h clashes with the ObjC headers if included into the fixture
             runtime/diag/host_exit.c  # ps3_ftrace.h registers its dump through ps3_host_at_quick_exit
-        )
+            runtime/diag/ps3_log.c
+            tests/ps3_log_mirror_stub.c)
         set_source_files_properties(libs/video/tests/test_metal_bc_emulation.m
             PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
         target_include_directories(test_metal_bc_emulation PRIVATE
@@ -2496,7 +2509,8 @@ if(UNIX)
             libs/video/rsx_fp_decompiler.c
             libs/video/rsx_tiling.c   # a C unit of its own: win32_compat.h clashes with the ObjC headers if included into the fixture
             runtime/diag/host_exit.c  # ps3_ftrace.h registers its dump through ps3_host_at_quick_exit
-        )
+            runtime/diag/ps3_log.c
+            tests/ps3_log_mirror_stub.c)
         set_source_files_properties(libs/video/tests/test_metal_bc_failclosed.m
             PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
         target_include_directories(test_metal_bc_failclosed PRIVATE
@@ -2562,7 +2576,9 @@ if(UNIX)
             libs/video/rsx_texture_layout.c
             libs/video/rsx_vp_decompiler.c
             libs/video/rsx_fp_decompiler.c
-        )
+            runtime/diag/ps3_log.c
+            tests/ps3_log_mirror_stub.c
+            runtime/diag/host_exit.c)
         target_include_directories(${engine_test} PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
             "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests"
@@ -2581,7 +2597,9 @@ if(UNIX)
         libs/video/rsx_texture_layout.c
         libs/video/rsx_vp_decompiler.c
         libs/video/rsx_fp_decompiler.c
-    )
+        runtime/diag/ps3_log.c
+        tests/ps3_log_mirror_stub.c
+        runtime/diag/host_exit.c)
     target_include_directories(test_rsx_texture_epoch PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests"
@@ -2624,12 +2642,17 @@ if(UNIX)
             libs/video/tests/test_rsx_bc_metal.m
             libs/video/rsx_metal_bc.m
             libs/video/tests/rsx_bc_test_corpus.c
-            libs/video/rsx_bc_decode.c)
+            libs/video/rsx_bc_decode.c
+            runtime/diag/ps3_log.c
+            runtime/config/config.cpp
+            runtime/diag/stop.cpp
+            runtime/diag/host_exit.c)
         set_source_files_properties(libs/video/tests/test_rsx_bc_metal.m libs/video/rsx_metal_bc.m
             PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
         target_include_directories(test_rsx_bc_metal PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
-            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests")
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests"
+            "${CMAKE_CURRENT_SOURCE_DIR}/include")
         target_link_libraries(test_rsx_bc_metal PRIVATE
             "-framework Metal" "-framework Foundation")
         add_test(NAME rsx_bc_metal COMMAND $<TARGET_FILE:test_rsx_bc_metal>)
@@ -2641,11 +2664,16 @@ if(UNIX)
         add_executable(bench_rsx_bc_gpu EXCLUDE_FROM_ALL
             tests/bench/video/bench_rsx_bc_gpu.m
             libs/video/rsx_metal_bc.m
-            libs/video/rsx_bc_decode.c)
+            libs/video/rsx_bc_decode.c
+            runtime/diag/ps3_log.c
+            runtime/config/config.cpp
+            runtime/diag/stop.cpp
+            runtime/diag/host_exit.c)
         set_source_files_properties(tests/bench/video/bench_rsx_bc_gpu.m libs/video/rsx_metal_bc.m
             PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
         target_include_directories(bench_rsx_bc_gpu PRIVATE
-            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
+            "${CMAKE_CURRENT_SOURCE_DIR}/include")
         target_compile_options(bench_rsx_bc_gpu PRIVATE -O3)
         target_link_libraries(bench_rsx_bc_gpu PRIVATE
             "-framework Metal" "-framework Foundation")
@@ -2694,7 +2722,8 @@ if(UNIX)
         libs/video/rsx_vp_decompiler.c
         libs/video/rsx_fp_decompiler.c
         runtime/diag/stop.cpp
-    )
+        runtime/diag/ps3_log.c
+        runtime/diag/host_exit.c)
     target_include_directories(test_rsx_flip_semantics PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests"
@@ -2727,6 +2756,7 @@ if(UNIX)
         runtime/diag/host_exit.c
         runtime/memory/label_window.c
         runtime/diag/stop.cpp
+        runtime/diag/ps3_log.c
         runtime/diag/sha256.cpp)
     add_executable(test_rsx_capture_engine
         libs/video/tests/test_rsx_capture_engine.c
@@ -2738,7 +2768,9 @@ if(UNIX)
         libs/video/rsx_vp_decompiler.c
         libs/video/rsx_fp_decompiler.c
         runtime/diag/stop.cpp
-        runtime/diag/sha256.cpp)
+        runtime/diag/sha256.cpp
+        runtime/diag/ps3_log.c
+        runtime/diag/host_exit.c)
     foreach(t test_rsx_capture_walker test_rsx_capture_engine)
         target_include_directories(${t} PRIVATE ${RSX_CAPTURE_FIXTURE_INCLUDES})
         target_compile_definitions(${t} PRIVATE _GNU_SOURCE)
@@ -2769,7 +2801,8 @@ if(UNIX)
         runtime/diag/host_exit.c
         runtime/memory/label_window.c
         runtime/diag/stop.cpp
-        runtime/diag/sha256.cpp)
+        runtime/diag/sha256.cpp
+        runtime/diag/ps3_log.c)
     target_include_directories(test_gcm_nv0039 PRIVATE ${RSX_CAPTURE_FIXTURE_INCLUDES})
     target_compile_definitions(test_gcm_nv0039 PRIVATE _GNU_SOURCE)
     target_link_libraries(test_gcm_nv0039 PRIVATE Threads::Threads)
@@ -2792,7 +2825,8 @@ if(UNIX)
         runtime/diag/host_exit.c
         runtime/memory/label_window.c
         runtime/diag/stop.cpp
-        runtime/diag/sha256.cpp)
+        runtime/diag/sha256.cpp
+        runtime/diag/ps3_log.c)
     target_include_directories(test_gcm_nv308a PRIVATE ${RSX_CAPTURE_FIXTURE_INCLUDES})
     target_compile_definitions(test_gcm_nv308a PRIVATE _GNU_SOURCE)
     target_link_libraries(test_gcm_nv308a PRIVATE Threads::Threads)
@@ -2817,7 +2851,8 @@ if(UNIX)
         libs/video/gcm_default_state.c
         runtime/diag/host_exit.c
         runtime/memory/label_window.c
-        runtime/diag/stop.cpp)
+        runtime/diag/stop.cpp
+        runtime/diag/ps3_log.c)
     target_include_directories(test_rsx_method_census PRIVATE ${RSX_CAPTURE_FIXTURE_INCLUDES})
     target_compile_definitions(test_rsx_method_census PRIVATE _GNU_SOURCE)
     target_link_libraries(test_rsx_method_census PRIVATE Threads::Threads)
@@ -2839,7 +2874,10 @@ if(UNIX)
         libs/video/rsx_vertex_compact.c
         libs/video/rsx_texture_layout.c
         libs/video/rsx_vp_decompiler.c
-        libs/video/rsx_fp_decompiler.c)
+        libs/video/rsx_fp_decompiler.c
+        runtime/diag/ps3_log.c
+        tests/ps3_log_mirror_stub.c
+        runtime/diag/host_exit.c)
     target_include_directories(test_rsx_depth_range PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video"
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/tests"
@@ -2865,7 +2903,9 @@ if(UNIX)
             libs/video/rsx_tiling.c   # a C unit of its own: win32_compat.h clashes with the ObjC headers if included into the fixture
             libs/video/rsx_capture.cpp
             libs/video/rsx_shader_msl.cpp
-            runtime/diag/sha256.cpp)
+            runtime/diag/sha256.cpp
+            runtime/diag/ps3_log.c
+            tests/ps3_log_mirror_stub.c)
         set_source_files_properties(libs/video/tests/test_depth_range_metal.m
             PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
         target_include_directories(test_depth_range_metal PRIVATE ${RSX_CAPTURE_FIXTURE_INCLUDES})
@@ -2902,6 +2942,8 @@ if(UNIX)
         set_tests_properties(metal_sampler_policy PROPERTIES LABELS "video;t0" TIMEOUT 30)
         add_executable(test_metal_frame_dump_list
             libs/video/tests/test_metal_frame_dump_list.m
+            runtime/diag/ps3_log.c
+            runtime/diag/host_exit.c
             runtime/diag/stop.cpp)
         set_source_files_properties(libs/video/tests/test_metal_frame_dump_list.m
             PROPERTIES COMPILE_OPTIONS "-fobjc-arc")

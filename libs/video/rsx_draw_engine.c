@@ -26,6 +26,7 @@
 #include <time.h>
 #include <stdatomic.h>
 #include "ps3emu/log_first.h"
+#include "ps3emu/ps3_log.h"   /* PS3_LOG: tagged lines, stderr bytes unchanged */
 #include "ps3emu/stop.h"
 #include "ps3emu/config.h"
 #include "rsx_capture.h"
@@ -296,7 +297,7 @@ static void eng_drop(rsx_drop_reason reason)
 {
     const unsigned long long n = eng_pow2_bump(&s_dropped[reason]);
     if (eng_is_pow2(n))
-        fprintf(stderr, "[rsx-drop] reason=%s count=%llu\n",
+        PS3_LOG(PS3_LOG_INFO, "rsx-drop", "reason=%s count=%llu\n",
                 rsx_drop_reason_name(reason), n);
     eng_cap_draw(0, (u32)reason);
 }
@@ -348,7 +349,7 @@ static void eng_pipeline_failed(u64 fp_hash)
             continue;
         const unsigned long long n = eng_pow2_bump(&s_pipe_fail[i].count);
         if (eng_is_pow2(n))
-            fprintf(stderr, "[rsx-pipeline-fail] fp=%016llx count=%llu\n",
+            PS3_LOG(PS3_LOG_INFO, "rsx-pipeline-fail", "fp=%016llx count=%llu\n",
                     (unsigned long long)fp_hash, n);
         return;
     }
@@ -357,12 +358,12 @@ static void eng_pipeline_failed(u64 fp_hash)
     if (slot < ENG_MAX_PIPE_FAILURES) {
         atomic_store_explicit(&s_pipe_fail[slot].hash, fp_hash, memory_order_relaxed);
         atomic_store_explicit(&s_pipe_fail[slot].count, 1, memory_order_relaxed);
-        fprintf(stderr, "[rsx-pipeline-fail] fp=%016llx count=1\n",
+        PS3_LOG(PS3_LOG_INFO, "rsx-pipeline-fail", "fp=%016llx count=1\n",
                 (unsigned long long)fp_hash);
     } else {
         const unsigned long long n = eng_pow2_bump(&s_pipe_fail_other);
         if (eng_is_pow2(n))
-            fprintf(stderr, "[rsx-pipeline-fail] other count=%llu\n", n);
+            PS3_LOG(PS3_LOG_INFO, "rsx-pipeline-fail", "other count=%llu\n", n);
     }
 }
 
@@ -1025,7 +1026,7 @@ static u32 eng_oldest_slot(const char* what, const u32* last_use, size_t stride,
     }
     static u32 evict_logs = 0, full_logs = 0;
     if (best != ENG_INVALID ? PS3_LOG_FIRST(evict_logs, 4) : PS3_LOG_FIRST(full_logs, 8))
-        fprintf(stderr, "[rsx engine] %s table full: %s\n", what,
+        PS3_LOG(PS3_LOG_INFO, "rsx engine", "%s table full: %s\n", what,
                 best == ENG_INVALID ? "every entry was used this frame or the last, none evicted"
                                     : "evicting the least recently used");
     return best;
@@ -1070,9 +1071,7 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     /* Never destroy a usable render target because one malformed command
      * decoded a guest pointer as clip dimensions. */
     if (want_w > ENG_MAX_SURFACE_DIM || want_h > ENG_MAX_SURFACE_DIM) {
-        static u32 logs = 0;
-        if (PS3_LOG_FIRST(logs, 8))
-            fprintf(stderr, "[rsx engine] rejected implausible surface 0x%X %ux%u;"
+        PS3_LOG_N(8, PS3_LOG_WARN, "rsx engine", "rejected implausible surface 0x%X %ux%u;"
                             " keeping the %s target\n", offset, want_w, want_h,
                     slot < ENG_MAX_SURFACES ? "existing" : "absent");
         return slot < ENG_MAX_SURFACES ? slot : ENG_INVALID;
@@ -1263,7 +1262,7 @@ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 
     const u32 slot = eng_surface_at(location, offset, pitch, &xb, &y);
     if (slot == ENG_INVALID) {
         if (eng_coherence_log())
-            fprintf(stderr, "[rsx engine] guest_read %u:0x%08X %ux%u: no surface\n",
+            PS3_LOG(PS3_LOG_INFO, "rsx engine", "guest_read %u:0x%08X %ux%u: no surface\n",
                     location, offset, w, h);
         return;
     }
@@ -1282,7 +1281,7 @@ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 
     g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
     g.be->readback(g.be->user, s->handle, x, y, n, h, rows, n * bpp);
     if (eng_coherence_log())
-        fprintf(stderr, "[rsx engine] guest_read %u:0x%08X %ux%u <- surface 0x%08X (%u bpp) at %u,%u:"
+        PS3_LOG(PS3_LOG_INFO, "rsx engine", "guest_read %u:0x%08X %ux%u <- surface 0x%08X (%u bpp) at %u,%u:"
                         " %u non-zero pixels\n", location, offset, w, h, s->offset, bpp, x, y,
                 eng_nonzero_pixels(rows, n * h, bpp));
     const int rgba = rsx_texture_argb_is_rgba();
@@ -1312,7 +1311,7 @@ void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32
     /* color_target_write takes R,G,B,A bytes: an A8R8G8B8 surface only. */
     if (slot == ENG_INVALID || g.surfaces[slot].fmt != RSX_BE_FMT_R8G8B8A8) {
         if (eng_coherence_log())
-            fprintf(stderr, "[rsx engine] guest_wrote %u:0x%08X %ux%u: no A8R8G8B8 surface\n",
+            PS3_LOG(PS3_LOG_INFO, "rsx engine", "guest_wrote %u:0x%08X %ux%u: no A8R8G8B8 surface\n",
                     location, offset, w, h);
         return;
     }
@@ -1329,7 +1328,7 @@ void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32
         eng_row_convert(rows + (size_t)r * w * 4u, src, w, rgba, 0);
     }
     if (eng_coherence_log())
-        fprintf(stderr, "[rsx engine] guest_wrote %u:0x%08X %ux%u -> surface 0x%08X at %u,%u:"
+        PS3_LOG(PS3_LOG_INFO, "rsx engine", "guest_wrote %u:0x%08X %ux%u -> surface 0x%08X at %u,%u:"
                         " %u non-zero pixels\n", location, offset, w, h, s->offset, x, y,
                 eng_nonzero_pixels(rows, w * h, 4u));
     g.be->color_target_write(g.be->user, s->handle, x, y, w, h, rows, w * 4u);
@@ -2034,7 +2033,7 @@ static int eng_zdepth_to_guest(u32 slot)
     z->guest_dirty = 0;
     eng_textures_touch(z->location, z->offset, z->pitch * h);
     if (eng_coherence_log())
-        fprintf(stderr, "[rsx engine] depth 0x%08X (%s, pitch %u) %ux%u stored to guest memory\n",
+        PS3_LOG(PS3_LOG_INFO, "rsx engine", "depth 0x%08X (%s, pitch %u) %ux%u stored to guest memory\n",
                 z->offset, bpp == 2u ? "Z16" : "Z24S8", z->pitch, w, h);
     return 1;
 }
@@ -2352,12 +2351,12 @@ static int eng_debug_fp(u64 fp_hash, u32 pipeline)
     for (u32 i = 0; i < n_dump; i++) {
         if (dump[i] != fp_hash || (dumped & (1u << i))) continue;
         dumped |= 1u << i;
-        fprintf(stderr, "[rsx regdump] fp %016llx pipe %u frame %u begin\n",
+        PS3_LOG(PS3_LOG_INFO, "rsx regdump", "fp %016llx pipe %u frame %u begin\n",
                 (unsigned long long)fp_hash, pipeline, g.frames);
         for (u32 r = 0; r < RSX_DSP_NUM_REGS; r++)
             if (g.rsx.regs[r])
-                fprintf(stderr, "[rsx regdump] 0x%04X = 0x%08X\n", r * 4u, g.rsx.regs[r]);
-        fprintf(stderr, "[rsx regdump] fp %016llx end\n", (unsigned long long)fp_hash);
+                PS3_LOG(PS3_LOG_INFO, "rsx regdump", "0x%04X = 0x%08X\n", r * 4u, g.rsx.regs[r]);
+        PS3_LOG(PS3_LOG_INFO, "rsx regdump", "fp %016llx end\n", (unsigned long long)fp_hash);
     }
     for (u32 i = 0; i < n_skip; i++)
         if (skip[i] == fp_hash) return 1;
@@ -2446,9 +2445,7 @@ static void eng_depth_bounds_prepare(u32 zslot, const rsx_be_render_state* rs)
         if (!((busy >> u) & 1u)) unit = u;
     eng_zdepth* z = &g.zdepths[zslot];
     if (unit < 0 || !z->handle) {
-        static u32 said;
-        if (PS3_LOG_FIRST(said, 4))
-            fprintf(stderr, "[rsx engine] depth bounds %.4f..%.4f not applied: %s\n",
+        PS3_LOG_N(4, PS3_LOG_INFO, "rsx engine", "depth bounds %.4f..%.4f not applied: %s\n",
                     mn, mx, unit < 0 ? "no free texture unit" : "no depth target");
         return;
     }
@@ -2609,9 +2606,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                                          sizeof s_vs_hlsl);
         if (vi > 0 && ucp && rsx_vp_apply_user_clip(s_vs_hlsl, sizeof s_vs_hlsl, ucp) < 0) {
             vi = -1;
-            static u32 said;
-            if (PS3_LOG_FIRST(said, 8))
-                fprintf(stderr, "[rsx engine] user clip planes 0x%06X: vertex program text not in the"
+            PS3_LOG_N(8, PS3_LOG_INFO, "rsx engine", "user clip planes 0x%06X: vertex program text not in the"
                                 " decompiler's form, draw skipped\n", rsx_dsp_reg(&g.rsx, 0x1478u));
         }
         fi = rsx_fp_decompile_buffered_shadow_color_expand_vol_ex(fp_uc, fp_size, fp_ctrl, cube_mask, vol_mask,
@@ -2636,9 +2631,8 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
             if (rsx_fp_apply_depth_bounds(s_ps_hlsl, sizeof s_ps_hlsl, dbz - 1u) > 0) {
                 dbz_bit = 1u << (dbz - 1u);   /* read with Load: no rsx_samp[] names it */
             } else {
-                static u32 said;   /* drawn unbounded rather than dropped */
-                if (PS3_LOG_FIRST(said, 8))
-                    fprintf(stderr, "[rsx engine] depth bounds not applied to a fragment program"
+                /* drawn unbounded rather than dropped */
+                PS3_LOG_N(8, PS3_LOG_INFO, "rsx engine", "depth bounds not applied to a fragment program"
                                     " (unexpected text)\n");
             }
         }
@@ -2678,8 +2672,8 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
             }
         }
     }
-    { static u32 logs = 0; if (PS3_LOG_FIRST(logs, 32))
-        fprintf(stderr, "[rsx engine] pipeline %016llx: %s vp %d, fp %d,"
+    {
+        PS3_LOG_N(32, PS3_LOG_INFO, "rsx engine", "pipeline %016llx: %s vp %d, fp %d,"
                         " %u constants, fp %016llx -> %s\n",
                 (unsigned long long)key, fixed ? "built-in" : "guest",
                 vi, fi, nconst, (unsigned long long)fp_hash,
@@ -3047,11 +3041,9 @@ static int eng_color_feedback_compatible(const eng_surface* s,
 static u32 eng_color_feedback_failure(u32 unit, const eng_surface* s,
                                        const rsx_dsp_texture* t)
 {
-    static u32 logs;
     rsx_dsp_surface sf;
     rsx_dsp_get_surface(&g.rsx, &sf);
-    if (PS3_LOG_FIRST(logs, 8))
-        fprintf(stderr, "[rsx engine] rejected colour feedback unit %u: "
+    PS3_LOG_N(8, PS3_LOG_WARN, "rsx engine", "rejected colour feedback unit %u: "
                 "target %ux%u fmt%u pitch%u, texture %ux%u fmt%02X pitch%u "
                 "dim%u levels%u cube%u color%u raster%u\n", unit, s->w, s->h, (u32)s->fmt,
                 s->pitch, t->width, t->height, t->format, t->pitch,
@@ -3341,7 +3333,7 @@ static void pd_write_surface(u32 slot, const char* path)
          * logged, never skipped in silence. */
         const unsigned long long n = eng_pow2_bump(&s_dump_errors);
         if (eng_is_pow2(n))
-            fprintf(stderr, "[rsx-pass-dump] unsupported format=%d surface=%u"
+            PS3_LOG(PS3_LOG_INFO, "rsx-pass-dump", "unsupported format=%d surface=%u"
                             " seq=%u count=%llu\n",
                     (int)s->fmt, slot, s_pd.frame_seq, n);
         return;
@@ -3451,7 +3443,7 @@ static void pd_close_pass(void)
         s_pd.index = NULL;
         if (s_pd.draws_log) { fclose(s_pd.draws_log); s_pd.draws_log = NULL; }
         s_pd.state = 3;
-        fprintf(stderr, "[rsx engine] pass dump: %u passes written to %s\n",
+        PS3_LOG(PS3_LOG_INFO, "rsx engine", "pass dump: %u passes written to %s\n",
                 s_pd.pass, s_pd.dir);
     }
 }
@@ -3654,9 +3646,7 @@ static int eng_clear_rect(const rsx_dsp_surface* sf, u32 w, u32 h, u32 out[4])
 
 static void eng_log_rect_clear(const char* what, const u32 rc[4], u32 w, u32 h)
 {
-    static u32 logs = 0;
-    if (PS3_LOG_FIRST(logs, 8))
-        fprintf(stderr, "[rsx engine] %s clear limited to %u,%u %ux%u of a %ux%u target\n",
+    PS3_LOG_N(8, PS3_LOG_INFO, "rsx engine", "%s clear limited to %u,%u %ux%u of a %ux%u target\n",
                 what, rc[0], rc[1], rc[2], rc[3], w, h);
 }
 
@@ -4164,10 +4154,10 @@ static void eng_present(u32 buffer_id, u32 target)
         u32 current = eng_current_surface();
         /* The identity is appended, not inserted: existing parsers read the
          * frame=/buffer=/selected=/draws= fields by position. */
-        fprintf(stderr, "[rsx capture] frame=%u buffer=%u selected=%u current=%u draws=%u surfaces=%u flip=%s\n",
+        PS3_LOG(PS3_LOG_INFO, "rsx capture", "frame=%u buffer=%u selected=%u current=%u draws=%u surfaces=%u flip=%s\n",
                 g.frames, buffer_id, target, current, g.guest_draws, g.n_surfaces, flip);
         for (u32 i = 0; i < g.n_surfaces; ++i)
-            fprintf(stderr, "[rsx capture] surface %u loc=%u offset=%08X size=%ux%u handle=%u\n",
+            PS3_LOG(PS3_LOG_INFO, "rsx capture", "surface %u loc=%u offset=%08X size=%ux%u handle=%u\n",
                     i, g.surfaces[i].location, g.surfaces[i].offset,
                     g.surfaces[i].w, g.surfaces[i].h, g.surfaces[i].handle);
     }
@@ -4316,7 +4306,7 @@ int rsx_draw_engine_init(u32 width, u32 height)
     atomic_store_explicit(&s_identity_seq, 0, memory_order_relaxed);
     /* Display buffers the title registered before the backend came up. */
     cellGcm_replay_display_buffers_to_engine();
-    fprintf(stderr, "[rsx engine] register-file draw engine up (%ux%u)\n",
+    PS3_LOG(PS3_LOG_INFO, "rsx engine", "register-file draw engine up (%ux%u)\n",
             g.width, g.height);
     return 0;
 }
@@ -4409,9 +4399,7 @@ static void eng_host_present(u32 buffer_id, int explicit_buffer)
             ps3_stop_rsx_driver_method(PS3_STOP_RSX_NONE, PS3_STOP_RSX_NONE, buffer_id, buffer_id,
                                        g.display_buffers[buffer_id].valid ? "unmodelled-scanout"
                                                                            : "unregistered-buffer");
-        static u32 skipped;
-        if (PS3_LOG_FIRST(skipped, 4))
-            fprintf(stderr, "[rsx engine] host present of display buffer %u skipped: "
+        PS3_LOG_N(4, PS3_LOG_INFO, "rsx engine", "host present of display buffer %u skipped: "
                             "no surface has been rendered at its address\n", buffer_id);
         return;
     }
