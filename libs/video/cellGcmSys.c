@@ -721,6 +721,33 @@ u32 gcm_user_ring_drops(void)
     return atomic_load(&s_user_ring_drops);
 }
 
+/* User-handler deliveries: how many times ppu_gcm_pump called the guest's cellGcmSetUserHandler handler. Counts
+ * the delivery, not the retirement (gcm_driver_event_count(GCM_DRV_EVENT_USER_COMMAND) is that), so a run that
+ * moves where the pump runs can show the same number of commands reaching the handler. */
+static atomic_uint s_user_handler_deliveries;
+u32 gcm_user_handler_deliveries(void)
+{
+    return atomic_load_explicit(&s_user_handler_deliveries, memory_order_relaxed);
+}
+
+/* Pumps that had work to deliver and found another thread delivering (the guard held), which left their work for
+ * that thread or for the re-notification at the end of its pump. A diagnostic, and the test's gate. */
+static atomic_uint s_pump_contended;
+u32 gcm_pump_contended(void)
+{
+    return atomic_load_explicit(&s_pump_contended, memory_order_relaxed);
+}
+
+#ifndef _WIN32
+/* Test seam: called by ppu_gcm_pump after its last delivery and before it releases the guard, the one window in
+ * which a post cannot be seen by the pump that holds the guard. Null in a title; a test parks a pump there. */
+static _Atomic(void (*)(void)) s_pump_tail_hook;
+void gcm_set_pump_tail_hook(void (*hook)(void))
+{
+    atomic_store_explicit(&s_pump_tail_hook, hook, memory_order_release);
+}
+#endif
+
 /* Driver events, in the order the RSX retires the methods (the walker is the only producer, so
  * `seq` is a total order). C3 compares event sequences against the recorded run: one flip head
  * per frame, every user command, queue-flip before its flip head. Counted always; an observer
@@ -1316,6 +1343,7 @@ static volatile LONG s_gcm_pending = 0;    /* bit0 = vblank, bit1 = flip */
 static HANDLE s_gcm_pump_ev = NULL;
 static void gcm_pump_wake(void) { if (s_gcm_pump_ev) SetEvent(s_gcm_pump_ev); }
 #define GCM_PENDING_SET(bits)  (InterlockedOr(&s_gcm_pending, (bits)), gcm_pump_wake())
+#define gcm_work_posted() gcm_pump_wake()
 #define GCM_PENDING_TAKE()     InterlockedExchange(&s_gcm_pending, 0)
 static volatile LONG s_gcm_vblank_pending = 0;   /* vblanks raised since the last pump */
 #define GCM_VBLANK_POST()      InterlockedIncrement(&s_gcm_vblank_pending)
@@ -1326,7 +1354,33 @@ static volatile LONG s_gcm_pumping = 0;
 #else
 #include <stdatomic.h>
 static atomic_int s_gcm_pending = 0;
-#define GCM_PENDING_SET(bits)  atomic_fetch_or(&s_gcm_pending, (bits))
+/* The runtime's usleep seam (ps3_usleep_site_register, runtime/syscalls/sys_timer.h) sleeps a guest thread for a
+ * whole frame in one wait. It installs a waker here so a notification posted meanwhile ends that wait and the
+ * handler is delivered at once, as it would be to a thread polling usleep(30). Null until a seam sleeps, so the
+ * common path costs one acquire load. cellGcmSys.c holds no reference to the runtime's symbol: the fixtures that
+ * compile this file in do not link sys_timer.c. */
+static _Atomic(void (*)(void)) s_gcm_wake_hook;
+void ppu_gcm_set_wake_hook(void (*hook)(void))
+{
+    atomic_store_explicit(&s_gcm_wake_hook, hook, memory_order_release);
+}
+/* Every poster (a vblank/flip pending bit, a user command on the ring) bumps this after it published, and then
+ * wakes; a pump reads it before it takes anything and compares after it released the guard (ppu_gcm_pump), so
+ * the pump that held the guard knows whether anything was posted behind its back. */
+static atomic_uint s_gcm_work_gen;
+/* Wake whoever sleeps (the hook fences before it looks for a sleeper, so a sleeper that has not yet seen the work
+ * is woken and one that has is not). No generation bump: the pump's own re-notification uses this. */
+static void gcm_pump_wake(void)
+{
+    void (*hook)(void) = atomic_load_explicit(&s_gcm_wake_hook, memory_order_acquire);
+    if (hook) hook();
+}
+static void gcm_work_posted(void)
+{
+    atomic_fetch_add_explicit(&s_gcm_work_gen, 1u, memory_order_seq_cst);
+    gcm_pump_wake();
+}
+#define GCM_PENDING_SET(bits)  (atomic_fetch_or(&s_gcm_pending, (bits)), gcm_work_posted())
 #define GCM_PENDING_TAKE()     atomic_exchange(&s_gcm_pending, 0)
 static atomic_int s_gcm_vblank_pending = 0;   /* vblanks raised since the last pump */
 #define GCM_VBLANK_POST()      atomic_fetch_add(&s_gcm_vblank_pending, 1)
@@ -1471,7 +1525,16 @@ void ppu_gcm_pump(void)
         }
         return;   /* only the interrupt thread delivers */
     }
-    if (!GCM_PUMP_TRY_ENTER()) return;
+#ifndef _WIN32
+    atomic_thread_fence(memory_order_seq_cst);   /* pairs with the fence after GCM_PUMP_LEAVE below */
+#endif
+    if (!GCM_PUMP_TRY_ENTER()) {
+        atomic_fetch_add_explicit(&s_pump_contended, 1u, memory_order_relaxed);
+        return;
+    }
+#ifndef _WIN32
+    const unsigned gen0 = atomic_load_explicit(&s_gcm_work_gen, memory_order_seq_cst);   /* before anything is taken */
+#endif
     long p = (long)GCM_PENDING_TAKE();
     /* AM-27: the user commands the RSX retired, delivered below in that order */
     /* GCM_PUMP_DBG=1: how often each guest handler is actually delivered. */
@@ -1479,8 +1542,9 @@ void ppu_gcm_pump(void)
       if (d < 0) d = getenv("GCM_PUMP_DBG") ? 1 : 0;
       if (d) { calls++; if (p & 1) nv++; if (p & 2) nf++;
                if ((calls % 20000) == 0)
-                   PS3_LOG(PS3_LOG_INFO, "gcm-pump", "calls=%u vblank=%u flip=%u vcount=%u%c",
-                           calls, nv, nf, atomic_load_explicit(&s_vblank_count, memory_order_relaxed), 10); } }
+                   PS3_LOG(PS3_LOG_INFO, "gcm-pump", "calls=%u vblank=%u flip=%u user=%u vcount=%u%c",
+                           calls, nv, nf, atomic_load_explicit(&s_user_handler_deliveries, memory_order_relaxed),
+                           atomic_load_explicit(&s_vblank_count, memory_order_relaxed), 10); } }
     if (p & 1) {
         /* One call per vblank the driver raised since the last pump, not one for however many are pending: the
          * console's interrupt posts each vblank to the handler (RPCS3's vblank thread queues one handler call per
@@ -1516,10 +1580,28 @@ void ppu_gcm_pump(void)
         }
     }
     for (u32 cmd; gcm_user_ring_pop(&cmd);) {
-        if (s_user_handler_opd && g_ps3_guest_caller)
+        if (s_user_handler_opd && g_ps3_guest_caller) {
+            atomic_fetch_add_explicit(&s_user_handler_deliveries, 1u, memory_order_relaxed);
             g_ps3_guest_caller(s_user_handler_opd, (uint64_t)cmd, 0, 0, 0, 0, 0, 0, 0);
+        }
     }
+#ifndef _WIN32
+    { void (*tail)(void) = atomic_load_explicit(&s_pump_tail_hook, memory_order_acquire);
+      if (tail) tail(); }
+#endif
     GCM_PUMP_LEAVE();
+#ifndef _WIN32
+    /* Work posted after this pump started, or while another thread's pump found the guard held and left (a
+     * usleep-seam sleeper woken by that very post), may be undelivered with nobody on the way to it: the poster has
+     * already woken its sleeper once and the sleeper does not wake again. Say so again, now that the guard is free.
+     * "Posted after this pump started" is the shared work generation moving: every poster (a pending bit or a ring
+     * command) bumps it after publishing, and this pump read it before it took anything. The ring's own tail is
+     * advisory and says nothing about ordering, so it is not consulted. The fence pairs with the one before
+     * TRY_ENTER: a pump that failed the guard either sees its poster's bump here or this pump sees the poster. A
+     * bump this pump already delivered costs one spurious wake. */
+    atomic_thread_fence(memory_order_seq_cst);
+    if (atomic_load_explicit(&s_gcm_work_gen, memory_order_seq_cst) != gen0) gcm_pump_wake();
+#endif
 }
 
 /* Back-compat: the old direct entry points now just mark a tick pending (so any
@@ -6204,9 +6286,7 @@ void cellGcmQueueUserCommand(u32 cmd)
 {
     GCM_USER_STORE(cmd);
     gcm_user_ring_push(cmd);
-#ifdef _WIN32
-    gcm_pump_wake();
-#endif
+    gcm_work_posted();   /* wakes a usleep-seam sleeper (once it installed a waker); Windows: wakes a semaphore wait */
 }
 
 /* Invalidate a tile region (unbind + clear) */

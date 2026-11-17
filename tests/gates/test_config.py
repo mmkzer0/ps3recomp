@@ -85,6 +85,8 @@ def test_defaults_without_file_or_environment():
         "ppu.opd_swap_fixup": ("false", "default"),
         "ppu.null_page": ('"stop"', "default"),
         "ppu.precise_usleep": ("true", "default"),
+        "ppu.poll_sleep_coalesce": ("false", "default"),
+        "ppu.poll_sleep_spin_us": ("100", "default"),
         "ppu.host_stack_mb": ("256", "default"),      # iOS: 32 (tools/test_host_stack_defaults.py)
         "spu.host_stack_mb": ("16", "default"),
         "spu.dispatch_stack_mb": ("256", "default"),      # iOS: 32 (tools/test_host_stack_defaults.py)
@@ -232,6 +234,8 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
             "ppu.opd_swap_fixup": "default",
             "ppu.null_page": "default",
             "ppu.precise_usleep": "default",
+            "ppu.poll_sleep_coalesce": "default",
+            "ppu.poll_sleep_spin_us": "default",
             "ppu.host_stack_mb": "default",
             "spu.host_stack_mb": "default",
             "spu.dispatch_stack_mb": "default",
@@ -281,7 +285,8 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
             doc = tomllib.loads(p.stdout)
             assert doc == {"schema": 2,
                            "ppu": {"vscr_nj": False, "opd_swap_fixup": False, "null_page": "stop",
-                                   "precise_usleep": True, "host_stack_mb": 256},
+                                   "precise_usleep": True, "poll_sleep_coalesce": False,
+                                   "poll_sleep_spin_us": 100, "host_stack_mb": 256},
                            "spu": {"host_stack_mb": 16, "dispatch_stack_mb": 256, "dma_repeat_limit": 256,
                                    "dma_repeat_stop_secs": 0,
                                    "job_body": "interp", "xdiff_dir": "",
@@ -809,6 +814,21 @@ def test_precise_usleep_defaults_on_and_is_read_from_file_and_environment():
     assert o["ppu.precise_usleep"] == ("false", "env:PS3RECOMP_PPU_PRECISE_USLEEP"), o
     f = config_invalid(probe("get", PS3RECOMP_PPU_PRECISE_USLEEP="yes"))
     assert f["key"] == "ppu.precise_usleep", f
+
+
+# ---- ppu.poll_sleep_coalesce / ppu.poll_sleep_spin_us ------------------------------
+
+def test_poll_sleep_options_default_off_and_are_range_checked():
+    # Off by default: a site a title registers is ignored until the file or the environment asks for it.
+    with Cfg("schema = 2", "[ppu]", "poll_sleep_coalesce = true", "poll_sleep_spin_us = 0") as c:
+        o = options(probe("--load", c.path, "get"))
+        assert o["ppu.poll_sleep_coalesce"] == ("true", f"file:{c.path}"), o
+        assert o["ppu.poll_sleep_spin_us"] == ("0", f"file:{c.path}"), o
+    o = options(probe("get", PS3RECOMP_PPU_POLL_SLEEP_COALESCE="1", PS3RECOMP_PPU_POLL_SLEEP_SPIN_US="2000"))
+    assert o["ppu.poll_sleep_coalesce"] == ("true", "env:PS3RECOMP_PPU_POLL_SLEEP_COALESCE"), o
+    assert o["ppu.poll_sleep_spin_us"] == ("2000", "env:PS3RECOMP_PPU_POLL_SLEEP_SPIN_US"), o
+    f = config_invalid(probe("get", PS3RECOMP_PPU_POLL_SLEEP_SPIN_US="2001"))
+    assert f["key"] == "ppu.poll_sleep_spin_us", f
 
 
 # ---- ppu.vscr_nj ---------------------------------------------------------------

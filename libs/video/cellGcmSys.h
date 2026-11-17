@@ -467,6 +467,20 @@ void cellGcmSetUserCommand(u32 cmd);
  * ppu_gcm_pump to deliver (AM-27). gcm_user_ring_drops counts commands lost to a full ring. */
 void cellGcmQueueUserCommand(u32 cmd);
 u32  gcm_user_ring_drops(void);
+/* Times ppu_gcm_pump called the guest's user handler (cellGcmSetUserHandler): the deliveries, as opposed to the
+ * commands the walker retired. */
+u32  gcm_user_handler_deliveries(void);
+/* Pumps that found another thread's pump holding the delivery guard (their work is left to it). */
+u32  gcm_pump_contended(void);
+#ifndef _WIN32
+/* Test seam: `hook` runs in ppu_gcm_pump after its last delivery, before it releases the delivery guard. */
+void gcm_set_pump_tail_hook(void (*hook)(void));
+#endif
+#ifndef _WIN32
+/* Install the function every new vblank/flip/user-command notification calls after publishing it (null removes
+ * it). The runtime's usleep seam uses it to end a long sleep early; it must be quick and must not pump. */
+void ppu_gcm_set_wake_hook(void (*hook)(void));
+#endif
 
 /* Driver events the FIFO walker retires, for C3's event comparison. `seq` counts from 1 in
  * retirement order. The observer runs on the walker thread, inside the drain; it must not block. */

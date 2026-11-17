@@ -40,6 +40,10 @@ static void print_options()
             std::printf("\"%s\"", ps3_cfg_ppu_null_page());
         else if (!std::strcmp(o->section, "ppu") && !std::strcmp(o->key, "precise_usleep"))
             std::printf("%s", ps3_cfg_ppu_precise_usleep() ? "true" : "false");
+        else if (!std::strcmp(o->section, "ppu") && !std::strcmp(o->key, "poll_sleep_coalesce"))
+            std::printf("%s", ps3_cfg_ppu_poll_sleep_coalesce() ? "true" : "false");
+        else if (!std::strcmp(o->section, "ppu") && !std::strcmp(o->key, "poll_sleep_spin_us"))
+            std::printf("%u", ps3_cfg_ppu_poll_sleep_spin_us());
         else if (!std::strcmp(o->section, "ppu") && !std::strcmp(o->key, "host_stack_mb"))
             std::printf("%u", ps3_cfg_ppu_host_stack_mb());
         else if (!std::strcmp(o->section, "spu") && !std::strcmp(o->key, "host_stack_mb"))

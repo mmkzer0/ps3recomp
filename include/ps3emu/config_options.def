@@ -87,6 +87,26 @@ PS3_CFG_BOOL(ppu, precise_usleep, 1,
     "macOS: the Windows (waitable timer, QPC tail) and Linux (nanosleep) paths are unchanged "
     "and ignore it. Read once, at the first sleep.")
 
+PS3_CFG_BOOL(ppu, poll_sleep_coalesce, 0,
+    "Honour the usleep-site seams a title registers (ps3_usleep_site_register, runtime/syscalls/sys_timer.h): a "
+    "guest that paces itself with a loop of short usleep calls against a deadline the title can compute (the "
+    "frame limiter's usleep(30) poll, 350-400 calls and ~26000 host wakeups a frame) sleeps once to that "
+    "deadline instead, spinning the last ppu.poll_sleep_spin_us. The guest's own branches, loads and stores "
+    "are unchanged; what changes is how many times it reads the clock and the instant the loop ends, which "
+    "no longer overshoots by the poll's own 17 us (a frame limiter then ticks 0.1 % faster). A sleep never "
+    "runs past the bound the title registered, a deadline that is past, zero or beyond the bound takes the "
+    "ordinary usleep, and a pending GCM notification ends the sleep early (the handler is delivered as soon as "
+    "a poll would deliver it, then the sleep resumes). Off by default, and with it off a registered site is ignored. "
+    "POSIX hosts only: Windows keeps the ordinary path, because its guest clock has a different base. Read "
+    "once, at the first sleep.")
+
+PS3_CFG_U32(ppu, poll_sleep_spin_us, 100, 0, 2000,
+    "With ppu.poll_sleep_coalesce: how many microseconds before the deadline the sleep ends and the thread "
+    "spins on the host clock to it. A kernel timer wakes 20-50 us late (p95 66 us on an M4 Pro), so a sleep "
+    "to the deadline itself exits after it; the spin trades that jitter for CPU (about 80 us a frame at "
+    "100). 0 is a pure sleep. The wake latency of a small core is not measured: raise it there. Read "
+    "once, at the first sleep.")
+
 PS3_CFG_U32(ppu, host_stack_mb, PS3_CFG_PPU_HOST_STACK_MB_DEFAULT, 1, 2048,
     "Host stack, in MiB, reserved for every thread that runs guest PPU code on a host thread of its own: the "
     "guest PPU threads the title creates (not the main thread), the GCM interrupt thread (guest vblank, flip and "
