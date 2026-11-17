@@ -100,34 +100,29 @@ int main(void)
     stub_begin_end(RSX_PRIMITIVE_TRIANGLES);       /* guest_draws = 1 */
 
     /* Present 0 (flip 0's head) arms the dump (the arming present writes no
-     * image). A flip is one present, at its head word. Presents 1, 2 and 3
-     * follow with no draw pass between them: under the old naming all three
-     * wrote one file. */
+     * image). A flip is one present, at its head word: the two host presents
+     * that follow flip 1's head are duplicates of the shown flip and are
+     * skipped (#144), so they write no file and take no ordinal. */
     stub_flip(1);                                  /* 0: flip 0's head */
     stub_flip(0);                                  /* 1: flip 1's head */
-    rsx_draw_engine_present();                     /* 2: held on flip 1 */
-    rsx_draw_engine_present();                     /* 3: held again */
+    rsx_draw_engine_present();                     /* skipped: flip 1 is already shown */
+    rsx_draw_engine_present();                     /* skipped again */
     stub_begin_end(RSX_PRIMITIVE_TRIANGLES);       /* a pass after them */
-    stub_flip(1);                                  /* 4: flip 2's head closes the pass */
+    stub_flip(1);                                  /* 2: flip 2's head closes the pass */
     stub_engine_down();
 
     /* A present is named by the flip whose scanout it shows: the head that
-     * retires a flip, and the host presents that hold it. */
+     * retires a flip, one present per flip. Present 0 (flip 0's head) only
+     * arms the dump and writes no image. */
     CHECK(file_exists(dir, "present_s00001_f00001.ppm"),
           "present 1 is named by its own sequence and the flip its head retired (1)");
-    CHECK(file_exists(dir, "present_s00002_f00001.ppm"),
-          "present 2 is a second file and names the flip it holds (1)");
-    CHECK(file_exists(dir, "present_s00003_f00001.ppm"),
-          "present 3 is a third file for the same held flip");
-    CHECK(file_exists(dir, "present_s00004_f00002.ppm"),
-          "present 4 exists after the pass and names the flip its head retired (2)");
-    CHECK(count_prefix(dir, "present_s00001_") + count_prefix(dir, "present_s00002_") +
-          count_prefix(dir, "present_s00003_") == 3,
-          "the three presents between the passes are three files");
-    CHECK(count_prefix(dir, "present_s") == 4,
-          "four present images in all (%d)", count_prefix(dir, "present_s"));
+    CHECK(file_exists(dir, "present_s00002_f00002.ppm"),
+          "present 2 exists after the pass and names the flip its head retired (2)");
+    CHECK(count_prefix(dir, "present_s") == 2,
+          "two present images in all, the skipped host presents wrote none (%d)",
+          count_prefix(dir, "present_s"));
     /* A pass is named by the last head counted when it opened. */
-    CHECK(file_exists(dir, "s00004_f00001_pass000_t0.ppm"),
+    CHECK(file_exists(dir, "s00002_f00001_pass000_t0.ppm"),
           "the pass image carries the frame's present sequence and the head it follows");
 
     char* text = slurp(dir);
@@ -135,7 +130,7 @@ int main(void)
           "the index names each present by its own sequence");
     CHECK(text && strstr(text, "flip=00000") && strstr(text, "flip=00001"),
           "the index lines carry the flip ordinal");
-    CHECK(text && strstr(text, "s=4 flip=00001"),
+    CHECK(text && strstr(text, "s=2 flip=00001"),
           "the pass line carries the frame identity");
     free(text);
 

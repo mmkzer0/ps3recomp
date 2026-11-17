@@ -352,8 +352,21 @@ its scanout (the harness, the boot smoke title), the current render target is th
 shows. `rsx_draw_engine_present_buffer()` names a buffer: with display buffers registered, an unregistered or
 unrendered one stops (`method=none head=none`, there being no FIFO word).
 
+A guest flip presented twice before #144: the head word presented through the engine's own sink, and the host's
+frame clock re-presented the same frame, repeating the encode, the blit and the commit (and a drawable acquisition,
+a refresh wait at 60 Hz) every guest frame. The engine now skips the host present when the frame it would show --
+the same flip id, the same buffer -- was already presented, so a title whose FIFO carries the flip words presents
+exactly once per flip. The skip never fires for a title that has not flipped through a head word (the host call is
+its only present), for a flip the engine did not present itself (the 0xFEAD marker, the SetFlip HLE, reported by
+`rsx_draw_engine_note_flip`), or after the backend signalled that the screen is stale
+(`rsx_draw_engine_require_represent`: a drawable or swapchain resize or recreation, a return from the iOS GPU gate,
+a present that missed its drawable or blit). The guest-frame counter (`rsx_metal_backend_note_guest_frame`) counts
+each `eng_present`, so it stays one per guest flip. Presenting twice was never harmless for cost: the engine keeps
+no per-present state that would make the second present a no-op.
+
 **Frame identity.** The engine's present counter and the GCM's flip counter are separate: a guest flip is one present, at
-its head word, and the host's own presents add more.
+its head word, and the host's own presents add more (a title that does not flip through head words, every 0xFEAD /
+SetFlip-HLE flip, every re-present the conditions above force; a duplicate host present is skipped).
 `rsx_draw_engine_frame_identity()` returns `{flip_id, present_seq, display_buffer}` for the last present:
 
 | field | meaning |
@@ -362,7 +375,7 @@ its head word, and the host's own presents add more.
 | `present_seq` | 0-based engine present ordinal: the number the dump files are named by. |
 | `display_buffer` | the display buffer this present showed (0..7): what the head word resolved to; for a host present, the guest's last flip. |
 
-No counter is derived from the other, and no flip id is invented for a present that precedes the first head. `guest_frame` is the ordinal of the last head-1 queue word (`0xE944`) when the head presented; an explicit-nibble head still reports it. The RSX capture records one frame per head, read back at the head's present from the display buffer's surface (not from the bound target), so its `present_seq` is the head's. Before #101 a head was the second of about three presents (`present_seq` 3k+1 for flip k); it is the first of the flip's FIFO presents now.
+No counter is derived from the other, and no flip id is invented for a present that precedes the first head. `guest_frame` is the ordinal of the last head-1 queue word (`0xE944`) when the head presented; an explicit-nibble head still reports it. The RSX capture records one frame per head, read back at the head's present from the display buffer's surface (not from the bound target), so its `present_seq` is the head's. Before #101 a head was the second of about three presents (`present_seq` 3k+1 for flip k); before #144 it was the first of the flip's two presents (the host's re-present followed it); since #144 the head's present is the flip's only one, `present_seq` k for flip k, for a title whose FIFO carries the flip words.
 
 **Draw accounting.** Every `BEGIN_END` group is one *submitted* draw. It is either *executed* or dropped
 for exactly one reason from `rsx_drop_reason` (no packets, fetch failed, mixed sources, needs expansion,

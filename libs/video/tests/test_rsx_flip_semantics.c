@@ -245,9 +245,14 @@ static void sc_queue_keeps_scanout(void)
           "before its head, the queued buffer 1 is not shown: a host present shows buffer 0 and names no flip");
     sm(M_FLIP1, LAST_QUEUED);
     sm(M_QUEUE1, 2u);
+    const int before = stub.n_present;
     rsx_draw_engine_present();
-    CHECK(stub.last_present_surface == g_handle[1] && ident(&id) && id.flip_id == 0 && id.display_buffer == 1,
-          "after flip 0 and before flip 1's head, a host present still shows buffer 1 and names flip 0");
+    /* Flip 0's head already showed buffer 1: the host present of the same frame is skipped (#144), and
+     * what is on screen -- and the published identity -- stay the head's. */
+    CHECK(stub.n_present == before && stub.last_present_surface == g_handle[1] && ident(&id) &&
+          id.flip_id == 0 && id.display_buffer == 1,
+          "after flip 0 and before flip 1's head, a host present of the shown frame is skipped; the "
+          "screen still shows buffer 1 and names flip 0 (%d presents)", stub.n_present - before);
 }
 
 /* The host present is pacing, not a flip (#94): with display buffers registered and nothing rendered

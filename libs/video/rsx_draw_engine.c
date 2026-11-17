@@ -420,6 +420,41 @@ static u32 eng_last_flip_id(void)
     return s_flip_heads ? s_flip_heads - 1u : RSX_FRAME_NO_FLIP;
 }
 
+/* ---- one present per guest flip (#144) -----------------------------------
+ *
+ * A host-driven present (rsx_draw_engine_present / rsx_draw_engine_present_buffer) is skipped when the
+ * FIFO's flip head already presented the exact frame it would show and nothing since requires a
+ * re-present. Before, every guest flip presented twice -- once at its head word, once from the host's
+ * frame clock -- repeating the encode, the blit and the commit, and possibly a drawable acquisition,
+ * every guest frame (two presents per 16.7 ms frame fit a 120 Hz display, which is why a ProMotion
+ * iPad hid it while a 60 Hz display held the guest to half refresh).
+ *
+ * The skip is conservative; every way the screen can be stale re-enables the present.
+ *   - A title that never flips through a head word (s_flip_heads == 0) has the host call as its only
+ *     present, so it always presents.
+ *   - The frame differs from the one last shown: a new flip, or a host call that names another buffer.
+ *   - rsx_draw_engine_note_flip named a flip the engine did not present (the 0xFEAD marker, the SetFlip
+ *     HLE): that flip's frame must be shown.
+ *   - The backend bumped s_rep_epoch (rsx_draw_engine_require_represent): a drawable or swapchain
+ *     resize or recreation, returning from the iOS GPU gate, a present that missed its drawable or blit.
+ *
+ * The walker's head presents run on the RSX thread (the FIFO walker feeding rsx_draw_engine_method,
+ * cellGcmSys.c) and the host's call on the title's frame-clock thread (a dedicated host thread), so the
+ * three words below are atomics: the writer publishes the buffer and the epoch with relaxed stores and
+ * the flip id last with a release store, and the reader takes the flip id first with an acquire load --
+ * a reader that sees the new flip id already sees its buffer and epoch, and a reader that still sees the
+ * old flip id does not match the frame and presents. s_flip_heads and g.last_flip_buffer are the
+ * engine's existing plain counters, whose stale reads can only fail the match too. A race only ever
+ * adds a present, never drops one. */
+static _Atomic u32 s_shown_flip = RSX_FRAME_NO_FLIP;   /* the flip id of the last present */
+static _Atomic u32 s_shown_buffer;                     /* its display buffer */
+static _Atomic u32 s_shown_epoch;                      /* s_rep_epoch when it ran */
+static _Atomic u32 s_rep_epoch;                        /* bumped by every event that requires a re-present */
+/* buffer + 1 of a bit-31 head-1 flip word whose cellGcmSys echo (rsx_draw_engine_note_flip for the very
+ * same word) is still due; 0 none. Those words are exactly the ones cellGcmSys reports through
+ * gcm_set_current_display_buffer, so every armed value gets exactly one echo. */
+static _Atomic u32 s_note_echo;
+
 static void eng_identity_publish(u32 flip_id, u32 guest_frame, u32 present_seq, u32 buffer)
 {
     const unsigned s = atomic_load_explicit(&s_identity_seq, memory_order_relaxed);
@@ -4149,6 +4184,14 @@ static void eng_present(u32 buffer_id, u32 target)
     fid.present_seq = g.frames;
     fid.display_buffer = buffer_id & 7u;
     eng_identity_publish(fid.flip_id, fid.guest_frame, fid.present_seq, fid.display_buffer);
+    /* What this present shows, published before the backend runs: a backend that misses (a nil drawable,
+     * a blit that bailed out) bumps s_rep_epoch during the call, and that bump must survive this present
+     * so the host's call for the same frame presents again (#144). The flip id goes last and release:
+     * the host's acquire load of it publishes the buffer and epoch with it. */
+    atomic_store_explicit(&s_shown_buffer, buffer_id & 7u, memory_order_relaxed);
+    atomic_store_explicit(&s_shown_epoch, atomic_load_explicit(&s_rep_epoch, memory_order_relaxed),
+                          memory_order_relaxed);
+    atomic_store_explicit(&s_shown_flip, fid.flip_id, memory_order_release);
     char flip[16];
     eng_fmt_flip(flip, sizeof flip, fid.flip_id);
     if (getenv("PS3RECOMP_METAL_FRAME_DUMP") && g.frames % 120 == 0) {
@@ -4230,6 +4273,12 @@ static void sink_flip(void* user, const rsx_dispatch* r, u32 head, u32 arg)
     g.last_flip_buffer = buffer;
     t_present_path = ENG_PRESENT_PATH_HEAD;
     eng_present(buffer, target);
+    /* cellGcmSys's own handling of this same word calls rsx_draw_engine_note_flip with this buffer: arm
+     * the echo slot so the engine knows that note names the flip just presented (already shown), not a
+     * flip it did not present. A word cellGcmSys reports differently (never, or with another buffer)
+     * leaves the slot clear or mismatched, and its note bumps the re-present epoch instead. */
+    if (head == 1u && (arg & 0x80000000u))
+        atomic_store_explicit(&s_note_echo, (buffer & 7u) + 1u, memory_order_relaxed);
 }
 
 static void sink_driver_unmodelled(void* user, const rsx_dispatch* r, u32 method, u32 arg)
@@ -4310,6 +4359,11 @@ int rsx_draw_engine_init(u32 width, u32 height)
     s_flip_heads = 0;
     s_queue_flips = 0;
     s_head_guest_frame = RSX_FRAME_NO_FLIP;
+    atomic_store_explicit(&s_shown_flip, RSX_FRAME_NO_FLIP, memory_order_relaxed);
+    atomic_store_explicit(&s_shown_buffer, 0, memory_order_relaxed);
+    atomic_store_explicit(&s_shown_epoch, atomic_load_explicit(&s_rep_epoch, memory_order_relaxed),
+                          memory_order_relaxed);
+    atomic_store_explicit(&s_note_echo, 0, memory_order_relaxed);
     s_cap_last_flip = RSX_FRAME_NO_FLIP;
     s_cap_fixed = 0;
     atomic_store_explicit(&s_identity_valid, 0, memory_order_relaxed);
@@ -4398,10 +4452,24 @@ void rsx_draw_engine_flush(void)
  *     memory), and an explicit request stops, because the runner asked for exactly that buffer.
  *   - none registered: a host that never described its scanout (the harness, the boot smoke title, a
  *     single-surface test) has only the current target to show, as before. */
-static void eng_host_present(u32 buffer_id, int explicit_buffer)
+static int eng_host_present(u32 buffer_id, int explicit_buffer)
 {
-    if (!g.ready) return;
+    if (!g.ready) return 0;
     t_present_path = explicit_buffer ? ENG_PRESENT_PATH_QUEUE : ENG_PRESENT_PATH_HOST;
+    /* #144: a host present that would put the frame the flip head just showed back on screen is skipped;
+     * the state above lists the conditions that re-enable it. The flip id is acquired first: a match
+     * publishes the buffer and the epoch stored before it. */
+    const u32 b = buffer_id & 7u;
+    const u32 shown_flip = atomic_load_explicit(&s_shown_flip, memory_order_acquire);
+    if (s_flip_heads > 0 && eng_last_flip_id() == shown_flip &&
+        b == atomic_load_explicit(&s_shown_buffer, memory_order_relaxed) &&
+        atomic_load_explicit(&s_rep_epoch, memory_order_relaxed) ==
+        atomic_load_explicit(&s_shown_epoch, memory_order_relaxed)) {
+        t_present_path = 0;
+        PS3_LOG_N(4, PS3_LOG_INFO, "rsx engine", "host present of flip %u buffer %u skipped: "
+                  "the flip head already showed it\n", eng_last_flip_id(), b);
+        return 0;
+    }
     const u32 target = eng_host_present_surface(buffer_id);
     if (target == ENG_INVALID && eng_any_display_buffer()) {
         t_present_path = 0;
@@ -4411,30 +4479,53 @@ static void eng_host_present(u32 buffer_id, int explicit_buffer)
                                                                            : "unregistered-buffer");
         PS3_LOG_N(4, PS3_LOG_INFO, "rsx engine", "host present of display buffer %u skipped: "
                             "no surface has been rendered at its address\n", buffer_id);
-        return;
+        return 0;
     }
     eng_present(buffer_id, target);
+    return 1;
 }
 
-void rsx_draw_engine_present(void)
+int rsx_draw_engine_present(void)
 {
     /* A host that drives the flip itself gets whichever buffer the guest's own last flip named, and
      * display buffer 0 before there has been one: a runner that both consumes the FIFO's flip words and
-     * calls here would otherwise re-present a double-buffered title's OTHER scanout. Presenting twice is
-     * harmless either way -- the engine never clears the surface, so a second present just blits the
-     * same image again. */
-    eng_host_present(g.last_flip_buffer, 0);
+     * calls here would otherwise re-present a double-buffered title's OTHER scanout. For a title whose
+     * FIFO carries the flip head words, the head word already presented that frame and this call is
+     * skipped (#144). Presenting twice was never harmless: the engine keeps no per-present state that
+     * would make the second present a no-op, so it repeated the encode, the blit and the commit -- and
+     * possibly a drawable acquisition, a refresh wait -- every guest frame, and the duplicate's
+     * drawable wait held a 60 Hz display's guest to half refresh. The skip keeps one present per guest
+     * flip; every condition that can make the screen stale (a title that never flips through a head
+     * word, a flip the engine did not present, a resize or recreation, a background return, a missed
+     * present) still presents. */
+    return eng_host_present(g.last_flip_buffer, 0);
 }
 
 void rsx_draw_engine_present_buffer(u32 buffer_id)
 {
     g.last_flip_buffer = buffer_id & 7u;
-    eng_host_present(g.last_flip_buffer, 1);
+    (void)eng_host_present(g.last_flip_buffer, 1);
 }
 
 void rsx_draw_engine_note_flip(u32 buffer_id)
 {
-    g.last_flip_buffer = buffer_id & 7u;
+    const u32 b = buffer_id & 7u;
+    /* cellGcmSys's echo of a flip-head word the engine just presented: that flip is already on screen,
+     * so the note names nothing new. Any other note (the 0xFEAD marker, the SetFlip HLE) names a flip
+     * the engine did not present, whose frame only the host's next present can show: bump the re-present
+     * epoch so it is not skipped as a duplicate (#144). */
+    if (atomic_exchange_explicit(&s_note_echo, 0, memory_order_relaxed) != b + 1u)
+        atomic_fetch_add_explicit(&s_rep_epoch, 1, memory_order_relaxed);
+    g.last_flip_buffer = b;
+}
+
+void rsx_draw_engine_require_represent(void)
+{
+    /* A host event that can make the screen's picture stale without a new flip (a drawable or swapchain
+     * resize or recreation, returning from the iOS GPU gate, a present that missed its drawable or
+     * blit): the backends call it, so the host's next present is not skipped as a duplicate (#144).
+     * Cheap and idempotent enough that calling it twice for one event is fine. */
+    atomic_fetch_add_explicit(&s_rep_epoch, 1, memory_order_relaxed);
 }
 
 u32 rsx_draw_engine_guest_draws(void)

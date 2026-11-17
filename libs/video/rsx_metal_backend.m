@@ -118,6 +118,11 @@ __attribute__((weak_import)) void cellGcm_set_host_pause_clock(unsigned long lon
  * The UIKit lifecycle observers (rsx_metal_ios_display.m) suspend and resume it; macOS never does. */
 static host_gpu_gate s_gpu_gate = HOST_GPU_GATE_INIT;
 
+/* The draw engine's re-present signal (rsx_draw_engine.h, included further down): the backend bumps it
+ * when a resize, a background return or a missed present makes the picture on screen stale (#144), so
+ * the engine's next host present is not skipped as a duplicate. */
+void rsx_draw_engine_require_represent(void);
+
 /* How long suspend() waits for the sections open at will-resign-active to leave, and how long an allocation that
  * failed with the gate steady waits for the host's notification before it calls the refusal the device's. Both are
  * bounds, not expectations.
@@ -224,6 +229,11 @@ void rsx_metal_backend_gpu_resume(void)
     if (s_pausing) { s_pausing = 0; s_pause_total_ms += eng_monotonic_ms() - s_pause_since_ms; }
     pthread_mutex_unlock(&s_pause_lock);
     host_gpu_gate_resume(&s_gpu_gate);
+    /* While the gate was closed the host may have invalidated the layer's drawable (iOS: the app was
+     * backgrounded), so the picture on screen is stale: the draw engine's next host present must
+     * re-blit it (#144) rather than skip it as a duplicate. Harmless at shutdown, where the engine is
+     * about to go down. */
+    rsx_draw_engine_require_represent();
 }
 
 /* ------------------------------------------------------------------------- */
@@ -5477,11 +5487,13 @@ static void eng_encode_and_commit_section(id<MTLTexture> present_dst)
             eng_sync_drawable_size();
             view = eng_display_view();
             /* #94: [CAMetalLayer nextDrawable] waits for a display refresh, so a present that would put the picture
-             * already on the layer back on it costs the walker a refresh for nothing. The host's frame clock presents
-             * once more after every flip head; that second acquisition (two per guest flip, three before #101) held
-             * the guest to 30 fps at 60 Hz (measured). When the surface, its records, the layer geometry and the
-             * gamma are all as at the last shown blit, there is no drawable, no blit, no presentDrawable, and no
-             * wait on the in-flight semaphore either, since nothing is submitted.
+             * already on the layer back on it costs the walker a refresh for nothing. Since #144 the draw engine
+             * skips the host's duplicate present of a flip its head word already showed, so the layer path sees one
+             * present per guest flip in the common case; this check remains for every re-present the engine still
+             * makes (a resize, a background return, a missed drawable) and for any path that presents the same
+             * surface twice. When the surface, its records, the layer geometry and the gamma are all as at the last
+             * shown blit, there is no drawable, no blit, no presentDrawable, and no wait on the in-flight semaphore
+             * either, since nothing is submitted.
              *
              * Only host drawable work is skipped. The draw engine publishes the present's identity before it calls
              * the backend and counts the present and records the capture frame after it, neither depending on the
@@ -5514,6 +5526,9 @@ static void eng_encode_and_commit_section(id<MTLTexture> present_dst)
             } else if (s_host) {
                 host_slot = host_acquire();
                 if (host_slot < 0) {       /* every surface busy; skip */
+                    /* The frame was not handed to the launcher: the draw engine's next host present
+                     * must show it rather than skip it as a duplicate (#144). */
+                    rsx_draw_engine_require_represent();
                     dispatch_semaphore_signal(s_inflight);
                     return;
                 }
@@ -5544,6 +5559,7 @@ static void eng_encode_and_commit_section(id<MTLTexture> present_dst)
         if (!cb || (s_eng_stage_used && !stage)) {
             s_eng_encoding_failed = 1;
             if (layer_present) rsx_display_note_missed(&s_eng_display);
+            else rsx_draw_engine_require_represent();   /* host-surface mode: the frame was not shown (#144) */
             host_frame_done(host_slot, host_gen, 0);
             if (windowed_present) dispatch_semaphore_signal(s_inflight);
             return;
@@ -5809,6 +5825,10 @@ static void eng_present(void* user, u32 surface)
     id<MTLTexture> src = eng_obj(surface);
     if (!src) { eng_encode_and_commit(nil); return; }
     eng_encode_and_commit(src);
+    /* A present that did not reach the screen (a nil drawable, a blit that bailed out, an encode that
+     * failed -- rsx_display_note_missed cleared `reached`) must be shown again: without this the draw
+     * engine's #144 skip of the host's duplicate present would drop the frame for good. */
+    if (!s_eng_display.reached) rsx_draw_engine_require_represent();
     rsx_frame_identity fid;
     if (rsx_draw_engine_frame_identity(&fid))
         eng_dump_frame(src, &fid);
@@ -6241,8 +6261,15 @@ static int pump_messages_impl(void)
         if (s_window) {
             NSView* v = [s_window contentView];
             const NSSize px = [v convertSizeToBacking:[v bounds].size];
-            s_win_px_w = (u32)px.width;
-            s_win_px_h = (u32)px.height;
+            const u32 w = (u32)px.width, h = (u32)px.height;
+            /* A window resize (or a move to a display with another scale) makes the image on the layer
+             * stale, so the draw engine's next host present must re-blit it (#144) rather than skip it
+             * as a duplicate of the flip the head already showed. */
+            if (w && h && (w != s_win_px_w || h != s_win_px_h)) {
+                s_win_px_w = w;
+                s_win_px_h = h;
+                rsx_draw_engine_require_represent();
+            }
         }
     }
 #endif
@@ -6275,8 +6302,9 @@ void rsx_metal_backend_present(void)
      * whose FIFO carries 0xE944 presents through the engine's own sink. */
     if (s_eng_active) {
         const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
-        rsx_draw_engine_present();
-        if (ft_t0) ps3_ft_span(PS3_FT_PRESENT, 0, 0, 0, ft_t0, ps3_ft_now());
+        /* The span times presents, not host calls: a #144 duplicate that the engine skipped emits none. */
+        if (rsx_draw_engine_present() && ft_t0)
+            ps3_ft_span(PS3_FT_PRESENT, 0, 0, 0, ft_t0, ps3_ft_now());
         return;
     }
     /* The vtable path: its own commit and drawable, one section. */
