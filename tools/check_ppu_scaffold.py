@@ -108,7 +108,7 @@ LOADER_SUPPORT_SOURCES = [
     "runtime/config/config.cpp",
     "runtime/config/identity.cpp",
     # config.cpp configures the run log, and the syscall sources these fixtures compile
-    # log through it: the real one, not the configure-only stub in tests/ps3_log_null.cpp.
+    # log through it.
     "runtime/diag/ps3_log.c",
 ]
 

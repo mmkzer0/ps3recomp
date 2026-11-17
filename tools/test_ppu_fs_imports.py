@@ -55,7 +55,11 @@ def main():
         exe = os.path.join(td, "test_fs_imports")
         cmd = [cxx, "-std=gnu++17", "-w", "-I" + td]
         cmd += ["-I" + os.path.join(ROOT, d) for d in INCLUDE_DIRS]
-        cmd += ["-o", exe, FIXTURE]
+        # ppu_fs.cpp's migrated diagnostics call ps3_log_*; config.cpp answers ps3_config_get.
+        # The fixture stubs the stop runtime and the quick-exit hook (its link stubs).
+        cmd += ["-o", exe, FIXTURE,
+                os.path.join(ROOT, "runtime/diag/ps3_log.c"),
+                os.path.join(ROOT, "runtime/config/config.cpp")]
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
             print("FAIL: fixture did not build")

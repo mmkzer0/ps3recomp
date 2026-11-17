@@ -19,7 +19,16 @@ HARNESS = r'''
 #include <cstring>
 #include <cstdlib>
 #include "win32_compat.h"
-#include "ps3emu/log_first.h"
+#include "ps3emu/ps3_log.h"
+#include "ps3emu/stop.h"
+/* ps3_log.c (the extracted helpers' migrated [spinlock] line) references the stop runtime and the
+ * quick-exit table; this harness configures no log and never reaches the stuck report. */
+extern "C" {
+void ps3_stop_set_mirror(ps3_stop_quiesce_fn, ps3_stop_mirror_fn) {}
+PS3_NORETURN void ps3_stop(ps3_stop_kind, const char*, const char*, const ps3_stop_field*,
+                           size_t, const ps3_stop_site*) { _Exit(PS3_STOP_EXIT_CODE); }
+int ps3_host_at_quick_exit(void (*fn)(void)) { (void)fn; return 0; }
+}
 
 alignas(8) static uint8_t memory[512];
 static uint8_t* vm_base = memory;
@@ -111,6 +120,7 @@ def main():
         subprocess.run([cxx, '-std=c++17', '-O2', '-pthread',
                         '-I', str(ROOT / 'runtime/platform'),
                         '-I', str(ROOT / 'include'), str(cpp),
+                        str(ROOT / 'runtime/diag/ps3_log.c'), str(ROOT / 'runtime/config/config.cpp'),
                         '-o', str(exe)], check=True)
         subprocess.run([str(exe)], check=True, timeout=10)
 

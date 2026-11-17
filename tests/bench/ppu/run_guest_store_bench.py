@@ -32,14 +32,20 @@ def build(root: Path, tmp: Path, name: str) -> Path:
     flags = ['-Wl,-dead_strip'] if sys.platform == 'darwin' else ['-Wl,--gc-sections', '-pthread', '-ldl']
     objects = []
     cc = os.environ.get('CC', 'cc')
-    for rel in ('runtime/memory/reservation.c', 'runtime/memory/label_window.c',
-                'runtime/syscalls/sdk_version_weak.c', 'runtime/syscalls/lv2_enosys_bitmap.c'):
+    # ps3_log.c's quick-exit registration comes from host_exit.c, which is C only (stdatomic): each tree's
+    # loader may reference the log, so both builds take the logger and its exit table from the tree under
+    # test (they are identical in every tree that has the log).
+    for src_root, rel in ((root, 'runtime/memory/reservation.c'), (root, 'runtime/memory/label_window.c'),
+                          (root, 'runtime/syscalls/sdk_version_weak.c'), (root, 'runtime/syscalls/lv2_enosys_bitmap.c'),
+                          (NEW_ROOT, 'runtime/diag/host_exit.c')):
         obj = work / (os.path.basename(rel) + '.o')
-        subprocess.run([cc, '-std=gnu17', '-O3', '-DNDEBUG', '-c', str(root / rel), '-o', str(obj)], check=True)
+        subprocess.run([cc, '-std=gnu17', '-O3', '-DNDEBUG', '-I', str(NEW_ROOT / 'include'),
+                        '-c', str(src_root / rel), '-o', str(obj)], check=True)
         objects.append(str(obj))
     support = [str(root / p) for p in ('runtime/diag/stop.cpp', 'runtime/diag/sha256.cpp', 'runtime/config/config.cpp',
                                        'runtime/config/identity.cpp', 'runtime/diag/lifter_abi.c')]
-    support.append(str(NEW_ROOT / 'tests/ps3_log_null.cpp'))
+    # The loader's migrated diagnostics call ps3_log_*, so the real logger is linked.
+    support.append(str(NEW_ROOT / 'runtime/diag/ps3_log.c'))
     subprocess.run([os.environ.get('CXX', 'c++'), '-std=c++17', '-O3', '-DNDEBUG', '-w',
                     '-ffunction-sections', '-fdata-sections',
                     '-I' + str(work), '-I' + str(root / 'include'), '-I' + str(root / 'runtime/platform'),

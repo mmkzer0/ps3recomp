@@ -39,6 +39,7 @@
 #include "ppu_recomp.h"
 #include "ps3emu/ps3_ftrace.h"   /* PS3_FTRACE timeline */
 #include "ps3emu/stop.h"         /* ps3_stop, ps3_stop_register_frontier */
+#include "ps3emu/ps3_log.h"      /* PS3_LOG: tagged lines, stderr bytes unchanged */
 #include "ps3emu/config.h"       /* ps3_ppu_initial_vscr */
 #include "ps3emu/identity.h"     /* ps3_identity_check_image */
 #include "ps3emu/lifter_abi.h"   /* ps3_lifter_abi_check */
@@ -151,7 +152,7 @@ extern "C" void ps3_install_guest_ptr_trap(void)
         if (VirtualAlloc((void*)a, len, MEM_RESERVE, PAGE_NOACCESS)) got += len;
     }
     AddVectoredExceptionHandler(1, ps3_guest_ptr_veh);
-    fprintf(stderr, "[ps3] guest-pointer trap armed (%zu MB of the low 4 GB reserved)\n",
+    PS3_LOG(PS3_LOG_INFO, "ps3", "guest-pointer trap armed (%zu MB of the low 4 GB reserved)\n",
             got >> 20);
 }
 #else  /* POSIX */
@@ -275,7 +276,7 @@ extern "C" void ps3_install_guest_ptr_trap(void)
     /* 0 MB is the expected answer on macOS, for the __PAGEZERO reason above,
      * and does not mean the trap is off: the fault lands on __PAGEZERO instead
      * of on a reservation and si_addr is the same either way. */
-    fprintf(stderr, "[ps3] guest-pointer trap armed (%zu MB of the low 4 GB reserved)\n",
+    PS3_LOG(PS3_LOG_INFO, "ps3", "guest-pointer trap armed (%zu MB of the low 4 GB reserved)\n",
             got >> 20);
 }
 
@@ -353,7 +354,7 @@ static void sc_trace(uint64_t num, ppu_context* ctx, uint64_t a3, uint64_t a4,
           got++;
       }
       if (!got) snprintf(who, sizeof who, "?"); }
-    fprintf(stderr, "[sc] %llu(0x%llX, 0x%llX, 0x%llX, 0x%llX) -> 0x%llX tid=%u glr=0x%08X from %s\n",
+    PS3_LOG(PS3_LOG_INFO, "sc", "%llu(0x%llX, 0x%llX, 0x%llX, 0x%llX) -> 0x%llX tid=%u glr=0x%08X from %s\n",
             (unsigned long long)num, (unsigned long long)a3, (unsigned long long)a4,
             (unsigned long long)a5, (unsigned long long)a6,
             (unsigned long long)rv, (unsigned)ctx->thread_id,
@@ -430,7 +431,7 @@ static void samp_build_map(void)
     qsort(s_samp_map, (size_t)s_samp_n, sizeof(SampHG), [](const void* a, const void* b) -> int {
         uintptr_t x = ((const SampHG*)a)->h, y = ((const SampHG*)b)->h;
         return x < y ? -1 : (x > y ? 1 : 0); });
-    fprintf(stderr, "[samp] map: %llu PPU + %u SPU entries\n",
+    PS3_LOG(PS3_LOG_INFO, "samp", "map: %llu PPU + %u SPU entries\n",
             (unsigned long long)function_table_count, nspu);
 }
 
@@ -573,7 +574,7 @@ static void samp_rva_hit(uintptr_t rip)
 
 static void samp_report(void)
 {
-    fprintf(stderr, "[samp] %llu samples, %llu in guest code (%.1f%%)\n",
+    PS3_LOG(PS3_LOG_INFO, "samp", "%llu samples, %llu in guest code (%.1f%%)\n",
             (unsigned long long)s_samp_total, (unsigned long long)s_samp_guest,
             s_samp_total ? 100.0 * (double)s_samp_guest / (double)s_samp_total : 0.0);
     for (int rank = 0; rank < 12; rank++) {
@@ -581,7 +582,7 @@ static void samp_report(void)
         for (int k = 0; k < SAMP_SLOTS; k++)
             if (s_samp_ct[k] > best) { best = s_samp_ct[k]; bi = k; }
         if (bi < 0 || !best) break;
-        fprintf(stderr, "[samp]   %5.1f%%  %s%08X  (%llu)\n",
+        PS3_LOG(PS3_LOG_INFO, "samp", "  %5.1f%%  %s%08X  (%llu)\n",
                 s_samp_guest ? 100.0 * (double)best / (double)s_samp_guest : 0.0,
                 (s_samp_fn[bi] & 0x80000000u) ? "spu_LS_" : "func_",
                 s_samp_fn[bi] & 0x7FFFFFFFu, (unsigned long long)best);
@@ -592,7 +593,7 @@ static void samp_report(void)
         for (int k = 0; k < SAMP_MODS; k++)
             if (s_mod_ct[k] > best) { best = s_mod_ct[k]; bi = k; }
         if (bi < 0 || !best) break;
-        fprintf(stderr, "[samp] host %5.1f%%  %-30s (%llu)\n",
+        PS3_LOG(PS3_LOG_INFO, "samp", "host %5.1f%%  %-30s (%llu)\n",
                 s_samp_total ? 100.0 * (double)best / (double)s_samp_total : 0.0,
                 s_mod_name[bi], (unsigned long long)best);
         s_mod_ct[bi] = 0;
@@ -602,7 +603,7 @@ static void samp_report(void)
         for (int k = 0; k < SAMP_TIDS; k++)
             if (s_tid_ct[k] > best) { best = s_tid_ct[k]; bi = k; }
         if (bi < 0 || !best) break;
-        fprintf(stderr, "[samp] guest-tid %u: %llu samples (%5.1f%% of guest)\n",
+        PS3_LOG(PS3_LOG_INFO, "samp", "guest-tid %u: %llu samples (%5.1f%% of guest)\n",
                 s_tid_id[bi], (unsigned long long)best,
                 s_samp_guest ? 100.0 * (double)best / (double)s_samp_guest : 0.0);
         s_tid_ct[bi] = 0;
@@ -610,7 +611,7 @@ static void samp_report(void)
     for (int k = 0; k < SAMP_TIDS2; k++) {
         uint64_t tot = s_t2_guest[k] + s_t2_ntdll[k] + s_t2_other[k];
         if (tot < 20) continue;
-        fprintf(stderr, "[samp] tid %-6u guest=%-5llu ntdll=%-5llu other=%-5llu\n",
+        PS3_LOG(PS3_LOG_INFO, "samp", "tid %-6u guest=%-5llu ntdll=%-5llu other=%-5llu\n",
                 s_t2_id[k], (unsigned long long)s_t2_guest[k],
                 (unsigned long long)s_t2_ntdll[k], (unsigned long long)s_t2_other[k]);
     }
@@ -619,7 +620,7 @@ static void samp_report(void)
         for (int k = 0; k < SAMP_RVAS; k++)
             if (s_rva_ct[k] > best) { best = s_rva_ct[k]; bi = k; }
         if (bi < 0 || !best) break;
-        fprintf(stderr, "[samp] rva 0x%08X %5.1f%% (%llu)\n", (s_rva_key[bi] - 1) << 4,
+        PS3_LOG(PS3_LOG_INFO, "samp", "rva 0x%08X %5.1f%% (%llu)\n", (s_rva_key[bi] - 1) << 4,
                 s_samp_total ? 100.0 * (double)best / (double)s_samp_total : 0.0,
                 (unsigned long long)best);
         s_rva_ct[bi] = 0;
@@ -739,7 +740,7 @@ static DWORD WINAPI samp_thread(LPVOID p)
             }
             Sleep(period);
             if (GetTickCount64() >= next_report) {
-                fprintf(stderr, "[samp] --- report at t=%llums ---\n",
+                PS3_LOG(PS3_LOG_INFO, "samp", "--- report at t=%llums ---\n",
                         (unsigned long long)(GetTickCount64() - t0));
                 samp_report();
                 samp_rva_flush();
@@ -783,7 +784,7 @@ static DWORD WINAPI samp_thread(LPVOID p)
         }
         Sleep(period);
         if (GetTickCount64() >= next_report) {
-            fprintf(stderr, "[samp] --- report at t=%llums ---\n",
+            PS3_LOG(PS3_LOG_INFO, "samp", "--- report at t=%llums ---\n",
                     (unsigned long long)(GetTickCount64() - t0));
             samp_report();
             samp_rva_flush();
@@ -816,7 +817,7 @@ static DWORD WINAPI poke_thread(LPVOID p)
     { const char* e = getenv("PPU_POKE_VAL"); if (e) val = (uint32_t)strtoul(e, 0, 16);
       const char* m = getenv("PPU_POKE_MS");  if (m) { ms = (unsigned)atoi(m); if (!ms) ms = 1; } }
     const uint32_t be = __builtin_bswap32(val);
-    fprintf(stderr, "[poke] writing 0x%08X to guest 0x%08X every %ums (FABRICATED state)\n",
+    PS3_LOG(PS3_LOG_INFO, "poke", "writing 0x%08X to guest 0x%08X every %ums (FABRICATED state)\n",
             val, ea, ms);
     fflush(stderr);
     for (;;) {
@@ -852,14 +853,14 @@ void ps3_sampler_start(void)
     if (s_samp_n) {
         DWORD64 img = 0;
         RUNTIME_FUNCTION* rf = RtlLookupFunctionEntry((DWORD64)s_samp_map[0].h, &img, NULL);
-        fprintf(stderr, "[samp] pdata self-check: func_%08X at %p -> %s\n",
+        PS3_LOG(PS3_LOG_INFO, "samp", "pdata self-check: func_%08X at %p -> %s\n",
                 s_samp_map[0].g, (void*)s_samp_map[0].h,
                 rf ? ((uintptr_t)(img + rf->BeginAddress) == s_samp_map[0].h
                       ? "resolves, start MATCHES" : "resolves, start differs")
                    : "NO .pdata entry -- exact mode cannot see guest code");
     }
     CreateThread(NULL, 0, samp_thread, (LPVOID)(uintptr_t)ms, 0, NULL);
-    fprintf(stderr, "[samp] sampling every %u ms\n", ms);
+    PS3_LOG(PS3_LOG_INFO, "samp", "sampling every %u ms\n", ms);
 }
 #else
 void ps3_sampler_start(void) {}
@@ -928,7 +929,7 @@ extern "C" void ppu_report_guest_lrs(void)
     for (long i = 0; i < n; i++) {
         ppu_context* c = g_ppu_ctxs[i];
         if (!c) continue;
-        fprintf(stderr, "[WATCHDOG]   guest-tid %-3u lr=0x%08X  r3=0x%08X sp=0x%08X\n",
+        PS3_LOG(PS3_LOG_INFO, "WATCHDOG", "  guest-tid %-3u lr=0x%08X  r3=0x%08X sp=0x%08X\n",
                 (unsigned)c->thread_id, (uint32_t)c->lr,
                 (uint32_t)c->gpr[3], (uint32_t)c->gpr[1]);
         /* With BCTRL_RING armed, follow it with that thread's recent INDIRECT
@@ -976,7 +977,7 @@ static LONG WINAPI ppu_guard_veh(EXCEPTION_POINTERS* ep)
             char* mbase = (char*)GetModuleHandleA(NULL);
             { extern uint32_t ppu_prof_resolve_host(void*);
               uint32_t gfn = ppu_prof_resolve_host((void*)ep->ContextRecord->Rip);
-              fprintf(stderr, "[GUARD] WRITE guest=0x%08X from RIP rva=0x%llX guest-fn=0x%08X%s\n",
+              PS3_LOG(PS3_LOG_INFO, "GUARD", "WRITE guest=0x%08X from RIP rva=0x%llX guest-fn=0x%08X%s\n",
                       guest, (unsigned long long)((char*)ep->ContextRecord->Rip - mbase), gfn,
                       (guest == s_guard_ea) ? "  <<< watched addr!" : ""); }
             /* On the watched word specifically, dump the guest call stack: with a
@@ -996,7 +997,7 @@ static LONG WINAPI ppu_guard_veh(EXCEPTION_POINTERS* ep)
                      * of the watched word; a fill with any other value (-1 is
                      * the common one) left the range invisible. */
                     if (g_active_ctx)
-                        fprintf(stderr, "[GUARD]   live ctx r3=0x%08X r4=0x%08X r5=0x%08X"
+                        PS3_LOG(PS3_LOG_INFO, "GUARD", "  live ctx r3=0x%08X r4=0x%08X r5=0x%08X"
                                         " r6=0x%08X r30=0x%08X r31=0x%08X lr=0x%08X\n",
                                 (uint32_t)g_active_ctx->gpr[3], (uint32_t)g_active_ctx->gpr[4],
                                 (uint32_t)g_active_ctx->gpr[5], (uint32_t)g_active_ctx->gpr[6],
@@ -1008,7 +1009,7 @@ static LONG WINAPI ppu_guard_veh(EXCEPTION_POINTERS* ep)
                      * are what identify the range. */
                     if (_cs == 1 && g_active_ctx) {
                         for (int r = 0; r < 32; r += 8)
-                            fprintf(stderr, "[GUARD]   r%-2d: %08X %08X %08X %08X"
+                            PS3_LOG(PS3_LOG_INFO, "GUARD", "  r%-2d: %08X %08X %08X %08X"
                                             " %08X %08X %08X %08X\n", r,
                                     (uint32_t)g_active_ctx->gpr[r + 0],
                                     (uint32_t)g_active_ctx->gpr[r + 1],
@@ -1037,14 +1038,14 @@ static LONG WINAPI ppu_guard_veh(EXCEPTION_POINTERS* ep)
           if (s_guard_pre && !nowv) {
               static int _z = 0;
               if (PS3_LOG_FIRST(_z, 3)) {
-                  fprintf(stderr, "[GUARD] CLEARED 0x%08X: 0x%08X -> 0\n",
+                  PS3_LOG(PS3_LOG_INFO, "GUARD", "CLEARED 0x%08X: 0x%08X -> 0\n",
                           s_guard_ea, s_guard_pre);
                   /* The guard fires INSIDE the clearing routine, so the live guest
                    * context still holds its arguments: for a memset that is
                    * (dst, value, length) in r3/r4/r5. That is the range being
                    * zeroed, which is the whole question here. */
                   if (g_active_ctx) {
-                      fprintf(stderr, "[GUARD]   live ctx r3=0x%08X r4=0x%08X r5=0x%08X"
+                      PS3_LOG(PS3_LOG_INFO, "GUARD", "  live ctx r3=0x%08X r4=0x%08X r5=0x%08X"
                                       " r6=0x%08X r30=0x%08X r31=0x%08X\n",
                               (uint32_t)g_active_ctx->gpr[3], (uint32_t)g_active_ctx->gpr[4],
                               (uint32_t)g_active_ctx->gpr[5], (uint32_t)g_active_ctx->gpr[6],
@@ -1079,7 +1080,7 @@ extern "C" void ppu_guard_page(uint32_t guest_ea)
     VirtualAlloc((void*)(s_guard_page & ~(uintptr_t)0xFFFF), 0x10000, MEM_COMMIT, PAGE_READWRITE);
     DWORD old;
     VirtualProtect((void*)s_guard_page, 0x1000, PAGE_READONLY, &old);
-    fprintf(stderr, "[GUARD] armed on guest 0x%08X (host page %p)\n", guest_ea, (void*)s_guard_page);
+    PS3_LOG(PS3_LOG_INFO, "GUARD", "armed on guest 0x%08X (host page %p)\n", guest_ea, (void*)s_guard_page);
     fflush(stderr);
 }
 #else
@@ -1119,7 +1120,7 @@ static int vm_oob_report(uint32_t a, uint32_t n)
     {
         static int logged = 0;
         if (logged < 40) {
-            fprintf(stderr, "[vm] OOB access 0x%08X (+%u)\n", a, n);
+            PS3_LOG(PS3_LOG_WARN, "vm", "OOB access 0x%08X (+%u)\n", a, n);
 #ifdef _WIN32
             /* one-shot backtrace on the first OOB so the lifted caller is known */
             static int bt = 0;
@@ -1134,7 +1135,7 @@ static int vm_oob_report(uint32_t a, uint32_t n)
                     GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)fr[i], &mm);
                     if (mm == self)
-                        fprintf(stderr, "[vm-oob]   #%-2u rva=0x%llX\n", i,
+                        PS3_LOG(PS3_LOG_WARN, "vm-oob", "  #%-2u rva=0x%llX\n", i,
                                 (unsigned long long)((char*)fr[i] - (char*)self));
                 }
             }
@@ -1289,11 +1290,11 @@ static int vm_null_store_report(uint32_t a, uint32_t v, int width, void* ra)
       enum { NW_MAX = 8 };
       long i = n++;
       if (i < NW_MAX)
-          fprintf(stderr, "[null-write] guest wrote%d 0x%X to 0x%08X (NULL+0x%X)"
+          PS3_LOG(PS3_LOG_WARN, "null-write", "guest wrote%d 0x%X to 0x%08X (NULL+0x%X)"
                           " by guest-fn=0x%08X -- DROPPED\n",
                   width * 8, v, a, a, ppu_prof_resolve_host(ra));
       else if (i == NW_MAX)
-          fprintf(stderr, "[null-write] further stores into the null page are"
+          PS3_LOG(PS3_LOG_WARN, "null-write", "further stores into the null page are"
                           " dropped without a word\n");
       /* and the guest call chain on the first one: the sampled guest-fn is a
        * memset/memcpy nine times out of ten, which says nothing about WHICH
@@ -1346,7 +1347,7 @@ static int vm_null_sweep(uint32_t a)
     g_null_sweep_hi = 0;                /* pattern broken: it is over */
     { static int said = 0;
       if (!said) { said = 1;
-          fprintf(stderr, "[null-write] sweep contained, ended at 0x%08X\n",
+          PS3_LOG(PS3_LOG_INFO, "null-write", "sweep contained, ended at 0x%08X\n",
                   g_null_sweep_last); fflush(stderr); } }
     return 0;
 }
@@ -1532,7 +1533,7 @@ static __attribute__((noinline)) void ppu_rwatch_hit_slow(uint32_t a, int width,
             uint32_t t = 0; memcpy(&t, vm_base + a, (size_t)width);
             v = __builtin_bswap32(t) >> ((4 - width) * 8);
         }
-        fprintf(stderr, "[rwatch] n=%lu read%d 0x%08X = 0x%X guest-fn=0x%08X\n",
+        PS3_LOG(PS3_LOG_INFO, "rwatch", "n=%lu read%d 0x%08X = 0x%X guest-fn=0x%08X\n",
                 rn, width, a, v, ppu_prof_resolve_host(ra));
     }
     /* ...and the guest call chain on the first hit, as PPU_WWATCH does. The
@@ -1569,7 +1570,7 @@ static inline void ppu_null_read_report(uint32_t a, int width, void* ra)
     static long s_n = 0;
     if (!PS3_LOG_FIRST(s_n, 16)) return;
     const uint32_t fn = ppu_prof_resolve_host(ra);
-    fprintf(stderr, "[null-read] guest read%d from 0x%08X (NULL+0x%X) by guest-fn=0x%08X%s" "\n",
+    PS3_LOG(PS3_LOG_WARN, "null-read", "guest read%d from 0x%08X (NULL+0x%X) by guest-fn=0x%08X%s" "\n",
             width * 8, a, a, fn, s_n == 16 ? "  [further NULL reads not reported]" : "");
     /* PS3_NULL_READ_STACK=1: guest-fn is the nearest host symbol, which can
      * name a neighbour; the guest call chain names the reader. Once for each
@@ -1687,7 +1688,7 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch
     if (g_pt_val>=0 && g_last_rd_val==(uint32_t)g_pt_val) {
         for (int i=0;i<g_pt_n;i++) if (g_pt_live[i] && g_pt_addr[i]==(uint32_t)a) {
             static int _rn=0; if (PS3_LOG_FIRST(_rn, 6)) { char rb[300]; pt_bt(rb,300);
-                fprintf(stderr,"[PT-HIT] persistent trunc [0x%08X]=0x%08X\n  TRUNCATED-BY:%s\n  READ-BACK-BY:%s\n",
+                PS3_LOG(PS3_LOG_INFO, "PT-HIT", "persistent trunc [0x%08X]=0x%08X\n  TRUNCATED-BY:%s\n  READ-BACK-BY:%s\n",
                         (uint32_t)a,(uint32_t)g_pt_val, g_pt_bt[i], rb); }
             g_pt_live[i]=0; break; } }
 #endif
@@ -1806,9 +1807,7 @@ extern "C" uint32_t g_ww_lo = 0, g_ww_hi = 0;
 
 extern "C" void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width)
 {
-    static int n = 0;
-    if (!PS3_LOG_FIRST(n, 64)) return;
-    fprintf(stderr, "[ww-hle] 0x%08X <- 0x%llX (w%d) from an HLE (libs/)\n",
+    PS3_LOG_N(64, PS3_LOG_INFO, "ww-hle", "0x%08X <- 0x%llX (w%d) from an HLE (libs/)\n",
             addr, (unsigned long long)val, width);
     fflush(stderr);
 }
@@ -1892,7 +1891,7 @@ static __attribute__((noinline)) void barrier_watch_hit_slow(uint32_t a, uint32_
           (!s_wvg || GetFileAttributesA(s_wvg) != INVALID_FILE_ATTRIBUTES)) {
           static int _n = 0;
           if (PS3_LOG_FIRST(_n, 24)) {
-              fprintf(stderr, "[wv] 0x%08X <- 0x%X (w%d) guest-fn=0x%08X\n",
+              PS3_LOG(PS3_LOG_INFO, "wv", "0x%08X <- 0x%X (w%d) guest-fn=0x%08X\n",
                       a, v, width, ppu_prof_resolve_host(ra));
               extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
               extern void ppu_dump_guest_stack(ppu_context*, const char*);
@@ -1933,7 +1932,7 @@ static __attribute__((noinline)) void barrier_watch_hit_slow(uint32_t a, uint32_
             if (_g && v && a == s_ww) {
                 static int _armed = 0;
                 if (!_armed) { _armed = 1;
-                    fprintf(stderr, "[GUARD] arming after first set of 0x%08X = 0x%X\n", a, v);
+                    PS3_LOG(PS3_LOG_INFO, "GUARD", "arming after first set of 0x%08X = 0x%X\n", a, v);
                     ppu_guard_page(a); }
             } }
 
@@ -1958,7 +1957,7 @@ static __attribute__((noinline)) void barrier_watch_hit_slow(uint32_t a, uint32_
                * as three different guest functions. ctx->lr is written by the
                * lifter at every direct call site, so it names the real caller. */
               extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
-              fprintf(stderr, "[ww] 0x%08X <- 0x%X (w%d) guest-fn=0x%08X"
+              PS3_LOG(PS3_LOG_INFO, "ww", "0x%08X <- 0x%X (w%d) guest-fn=0x%08X"
                               " lr=0x%08X tid=%u\n",
                       a, v, width, ppu_prof_resolve_host(ra),
                       g_active_ctx ? (uint32_t)g_active_ctx->lr : 0u,
@@ -1968,7 +1967,7 @@ static __attribute__((noinline)) void barrier_watch_hit_slow(uint32_t a, uint32_
               extern void ppu_dump_guest_stack(ppu_context*, const char*);
               if (_i == 1 && g_active_ctx) ppu_dump_guest_stack(g_active_ctx, "ww");
           } else if (_i == _cap + 1) {
-              fprintf(stderr, "[ww] --- print cap %ld reached; further writes to "
+              PS3_LOG(PS3_LOG_INFO, "ww", "--- print cap %ld reached; further writes to "
                               "this window are NOT shown (raise PPU_WWATCH_MAX, "
                               "0 = unlimited) ---\n", _cap);
               fflush(stderr);
@@ -1977,10 +1976,8 @@ static __attribute__((noinline)) void barrier_watch_hit_slow(uint32_t a, uint32_
     uint32_t b = g_barrier_sync_watch;
     if (!b) return;
     if (a >= b + 0x40 && a < b + 0xC0) {
-        static int _n = 0;
-        if (PS3_LOG_FIRST(_n, 48))
-            fprintf(stderr, "[sync-write] +0x%02X <- 0x%X (w%d) guest-fn=0x%08X\n",
-                    a - b, v, width, ppu_prof_resolve_host(ra));
+        PS3_LOG_N(48, PS3_LOG_INFO, "sync-write", "+0x%02X <- 0x%X (w%d) guest-fn=0x%08X\n",
+                a - b, v, width, ppu_prof_resolve_host(ra));
     }
 }
 
@@ -2043,9 +2040,8 @@ extern "C" int ppu_stwcx32(ppu_context* ctx, uint64_t ea, uint32_t val)
     { static int64_t s_cw = -2;
       if (s_cw == -2) { const char* e = getenv("PPU_CASWATCH"); s_cw = e ? (int64_t)(strtoul(e, 0, 16) & ~127u) : -1; }
       if (ok && s_cw >= 0 && (a & ~127u) == (uint32_t)s_cw) {
-          static int n; if (PS3_LOG_FIRST(n, 200))
-              fprintf(stderr, "[caswatch] 0x%08X %08X -> %08X lr=0x%08X tid=%u\n", a, expected, val,
-                      (uint32_t)ctx->lr, (unsigned)ctx->thread_id); } }
+          PS3_LOG_N(200, PS3_LOG_INFO, "caswatch", "0x%08X %08X -> %08X lr=0x%08X tid=%u\n", a, expected, val,
+                  (uint32_t)ctx->lr, (unsigned)ctx->thread_id); } }
     /* PPU_CAS_FAIL=1: histogram the EAs whose store-conditional keeps FAILING.
      *
      * A lwarx/stwcx. retry loop that never succeeds is a livelock, and it is
@@ -2064,14 +2060,14 @@ extern "C" int ppu_stwcx32(ppu_context* ctx, uint64_t ea, uint32_t val)
           if (i == cf_used && cf_used < CF_N) { cf_ea[cf_used] = a; cf_used++; }
           if (i < CF_N) cf_n[i]++;
           if ((++cf_total % 200000) == 0) {
-              fprintf(stderr, "[cas-fail] %ld failed store-conditionals; top EAs:\n",
+              PS3_LOG(PS3_LOG_WARN, "cas-fail", "%ld failed store-conditionals; top EAs:\n",
                       cf_total);
               for (int k = 0; k < 5; k++) {
                   int best = -1;
                   for (int j = 0; j < cf_used; j++)
                       if (cf_n[j] && (best < 0 || cf_n[j] > cf_n[best])) best = j;
                   if (best < 0) break;
-                  fprintf(stderr, "[cas-fail]   0x%08X  x%u\n", cf_ea[best], cf_n[best]);
+                  PS3_LOG(PS3_LOG_WARN, "cas-fail", "  0x%08X  x%u\n", cf_ea[best], cf_n[best]);
                   cf_n[best] = 0;
               }
               fflush(stderr);
@@ -2265,9 +2261,9 @@ void flow_lookup_alloc(unsigned int p) {
         const flow_alloc_rec& r = g_alloc_ring[i];
         if (r.ptr && p >= r.ptr && p < r.ptr + r.size) { if (!best || r.id > best->id) best = &r; }
     }
-    if (best) fprintf(stderr, "[alloc-tag] garbage obj 0x%08X is in alloc 0x%08X size=%u off=0x%X allocLR=0x%08X id=%u\n",
+    if (best) PS3_LOG(PS3_LOG_INFO, "alloc-tag", "garbage obj 0x%08X is in alloc 0x%08X size=%u off=0x%X allocLR=0x%08X id=%u\n",
                       p, best->ptr, best->size, p - best->ptr, best->lr, best->id);
-    else      fprintf(stderr, "[alloc-tag] garbage obj 0x%08X is in NO live alloc -> use-after-free or pool/untracked\n", p);
+    else      PS3_LOG(PS3_LOG_INFO, "alloc-tag", "garbage obj 0x%08X is in NO live alloc -> use-after-free or pool/untracked\n", p);
 }
 
 /* Cross-fragment trampoline pointer (matches the lifted header's TLS decl). */
@@ -2319,10 +2315,8 @@ extern "C" void ppu_register_function(uint64_t addr, ppu_fn fn)
                               __atomic_fetch_add(&g_fn_gen, 1u, __ATOMIC_RELEASE); return; }
         i = (i + 1) & PPU_HASH_MASK;
     }
-    static int warned = 0;
-    if (PS3_LOG_FIRST(warned, 4))
-        fprintf(stderr, "[ppu] function table full (%u/%u) -- raise PPU_HASH_BITS; "
-                "0x%08X dropped\n", g_fn_count, (unsigned)PPU_HASH_SIZE, a);
+    PS3_LOG_N(4, PS3_LOG_WARN, "ppu", "function table full (%u/%u) -- raise PPU_HASH_BITS; "
+            "0x%08X dropped\n", g_fn_count, (unsigned)PPU_HASH_SIZE, a);
 }
 
 /* Host-RA -> guest-function resolver for the sampling profiler. The lifted
@@ -2421,9 +2415,8 @@ extern "C" void ydkj_memmove_0036FA74(ppu_context* ctx)
     if (vm_base && dst <= 0x400240A8u && 0x400240A8u < dst + n) {
         uint32_t soff = 0x400240A8u - dst + src;
         uint32_t sval = __builtin_bswap32(*(volatile uint32_t*)(vm_base + soff));
-        static int _n=0; if(PS3_LOG_FIRST(_n, 8))
-            fprintf(stderr,"[memfix] copy dst=0x%08X src=0x%08X n=0x%X -> 0x400240A8 gets src[0x%08X]=0x%08X\n",
-                    dst, src, n, soff, sval);
+        PS3_LOG_N(8, PS3_LOG_INFO, "memfix", "copy dst=0x%08X src=0x%08X n=0x%X -> 0x400240A8 gets src[0x%08X]=0x%08X\n",
+                dst, src, n, soff, sval);
     }
     if (n && vm_base) memmove(vm_base + dst, vm_base + src, n);
     /* r3 (dst) is preserved as the return value. */
@@ -2438,7 +2431,7 @@ extern "C" void ppu_recomp_register(void)
     /* Override the mis-lifted optimized memmove with a correct native one. */
     if (getenv("YDKJ_MEMFIX")) {
         ppu_register_function(0x0036FA74u, ydkj_memmove_0036FA74);
-        fprintf(stderr, "[ppu] YDKJ_MEMFIX: overrode func_0036FA74 with native memmove\n");
+        PS3_LOG(PS3_LOG_INFO, "ppu", "YDKJ_MEMFIX: overrode func_0036FA74 with native memmove\n");
     }
 }
 
@@ -2733,7 +2726,7 @@ static void icall_hist(ppu_context* ctx, uint32_t tgt, int phase)
                     uint32_t b = 0; int bi = -1;
                     for (int i = 0; i < N; i++) if (cnt[i] > b) { b = cnt[i]; bi = i; }
                     if (bi < 0) break;
-                    fprintf(stderr, "[icall] tid=%u target=0x%08X calls=%u ret0=%u\n",
+                    PS3_LOG(PS3_LOG_INFO, "icall", "tid=%u target=0x%08X calls=%u ret0=%u\n",
                             tid[bi], key[bi], cnt[bi], zero[bi]);
                     cnt[bi] = 0;
                 }
@@ -2747,7 +2740,7 @@ static void icall_hist(ppu_context* ctx, uint32_t tgt, int phase)
     const uint32_t t = (uint32_t)ctx->thread_id, z = (uint32_t)ctx->gpr[3] == 0;
     /* PS3_ICALL_TRACE=<tid>: also log every call on that guest thread, in order. */
     { static int tt = -2; if (tt == -2) { const char* e = getenv("PS3_ICALL_TRACE"); tt = e ? atoi(e) : -1; }
-      if (tt >= 0 && (uint32_t)tt == t) fprintf(stderr, "[ict] %08X %u\n", tgt, (uint32_t)ctx->gpr[3]); }
+      if (tt >= 0 && (uint32_t)tt == t) PS3_LOG(PS3_LOG_INFO, "ict", "%08X %u\n", tgt, (uint32_t)ctx->gpr[3]); }
     AcquireSRWLockExclusive(&lk);
     for (uint32_t i = (tgt * 2654435761u + t) % N, n = 0; n < N; n++, i = (i + 1) % N) {
         if (key[i] == tgt && tid[i] == t) { cnt[i]++; zero[i] += z; break; }
@@ -2933,14 +2926,14 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
          * setScreenRenderTarget(this, NULL) exactly once and the caller is the
          * only way to find where that null config came from. */
         char _fromw[64]; ppu_guest_caller(_fromw, sizeof _fromw);
-        fprintf(stderr,"[CALL] -> 0x%08X r3=0x%08X r4=0x%08X r5=%lld lr=0x%08X from=%s tid=%llu\n",
+        PS3_LOG(PS3_LOG_INFO, "CALL", "-> 0x%08X r3=0x%08X r4=0x%08X r5=%lld lr=0x%08X from=%s tid=%llu\n",
                 addr,(uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[4],
                 (long long)(int32_t)ctx->gpr[5], (uint32_t)ctx->lr, _fromw,
                 (unsigned long long)ctx->thread_id);
         /* r28-r31 usually hold the caller's object pointers; for a virtual
          * call with a null argument they are the only handle on WHICH object
          * supplied it. */
-        fprintf(stderr,"[CALL]    r28=0x%08X r29=0x%08X r30=0x%08X r31=0x%08X\n",
+        PS3_LOG(PS3_LOG_INFO, "CALL", "   r28=0x%08X r29=0x%08X r30=0x%08X r31=0x%08X\n",
                 (uint32_t)ctx->gpr[28],(uint32_t)ctx->gpr[29],
                 (uint32_t)ctx->gpr[30],(uint32_t)ctx->gpr[31]); } }
       /* FLOW_FORCE_RTCFG=1: flOw calls PCoreGcmRenderInterface::
@@ -2967,7 +2960,7 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
           if (_ff) {
               uint32_t obj = (uint32_t)ctx->gpr[29];
               uint32_t cfg = obj ? __builtin_bswap32(*(volatile uint32_t*)(vm_base + obj + 0x18F4)) : 0;
-              fprintf(stderr, "[FLOW-RTCFG] obj=0x%08X read cfg=0x%08X\n", obj, cfg);
+              PS3_LOG(PS3_LOG_INFO, "FLOW-RTCFG", "obj=0x%08X read cfg=0x%08X\n", obj, cfg);
               /* Whole-object dump: distinguishes a targeted store from a memset
                * of the live object -- the watch cannot see host-side writes. */
               { char b[256]; int m = 0;
@@ -2980,10 +2973,10 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
               fflush(stderr);
               if (!cfg && _fixed) {
                   cfg = _fixed;
-                  fprintf(stderr, "[FLOW-RTCFG] field was 0; using supplied 0x%08X\n", cfg);
+                  PS3_LOG(PS3_LOG_INFO, "FLOW-RTCFG", "field was 0; using supplied 0x%08X\n", cfg);
               }
               if (cfg) {
-                  fprintf(stderr, "[FLOW-RTCFG] supplying config 0x%08X (from 0x%08X+0x18F4)\n",
+                  PS3_LOG(PS3_LOG_INFO, "FLOW-RTCFG", "supplying config 0x%08X (from 0x%08X+0x18F4)\n",
                           cfg, obj);
                   fflush(stderr);
                   ctx->gpr[4] = cfg;
@@ -3013,9 +3006,7 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
             if (_rec && _opd && vm_base) {
                 uint32_t _c = __builtin_bswap32(*(volatile uint32_t*)(vm_base + _opd));
                 if (_c && (_c & 3) == 0) {
-                    static PPU_THREAD_LOCAL int _n2 = 0;
-                    if (PS3_LOG_FIRST(_n2, 8))
-                        fprintf(stderr, "[ppu] OPD-RECOVER: ctr=0 -> dispatching opd[0]=0x%08X\n", _c);
+                    PS3_LOG_N(8, PS3_LOG_INFO, "ppu", "OPD-RECOVER: ctr=0 -> dispatching opd[0]=0x%08X\n", _c);
                     addr = _c;
                 }
             }
@@ -3028,7 +3019,7 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
      * confirm libsre receives the correct struct pointer. Env SPURS_TRACE. */
     if (addr >= 0x30031200u && addr < 0x30031900u) {
         static PPU_THREAD_LOCAL int64_t st=-2; if (st==-2){ const char* e=getenv("SPURS_TRACE"); st=e?1:0; }
-        if (st) fprintf(stderr, "[SPURSTRACE] call libsre 0x%08X  r3=0x%08X r4=0x%08X r5=0x%08X\n",
+        if (st) PS3_LOG(PS3_LOG_INFO, "SPURSTRACE", "call libsre 0x%08X  r3=0x%08X r4=0x%08X r5=0x%08X\n",
             addr, (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[5]);
     }
 
@@ -3045,7 +3036,7 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
             if (!found && nseen<1024) {
                 seen[nseen++]=addr;
                 const char* tag = addr==0x30014DC4u?" <CreateTaskset>" : addr==0x30012520u?" <CreateTask>" : "";
-                fprintf(stderr, "[LIBTRACE] #%d libsre 0x%08X r3=0x%08X r4=0x%08X r5=0x%08X%s\n",
+                PS3_LOG(PS3_LOG_INFO, "LIBTRACE", "#%d libsre 0x%08X r3=0x%08X r4=0x%08X r5=0x%08X%s\n",
                     nseen, addr, (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[5], tag);
             }
         }
@@ -3063,8 +3054,7 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
             uint32_t toc_reg = (uint32_t)ctx->gpr[2];
             ppu_fn fn2 = ppu_lookup(toc_reg);
             if (fn2) {
-                static PPU_THREAD_LOCAL int _n = 0;
-                if (PS3_LOG_FIRST(_n, 8)) fprintf(stderr, "[ppu] OPD-swap fixup: ctr=0x%08X not a func, using r2=0x%08X\n", addr, toc_reg);
+                PS3_LOG_N(8, PS3_LOG_INFO, "ppu", "OPD-swap fixup: ctr=0x%08X not a func, using r2=0x%08X\n", addr, toc_reg);
                 ctx->gpr[2] = addr;        /* callee TOC = the (TOC) value from the code slot */
                 addr = toc_reg; ctx->ctr = toc_reg;
                 fn = fn2;
@@ -3121,7 +3111,7 @@ static void ps3_indirect_call_impl(ppu_context* ctx)
          * equals this, pinning the exact virtual method that produces the poison. */
         { static PPU_THREAD_LOCAL int64_t rw=-2; if(rw==-2){const char*e=getenv("PPU_RETWATCH"); rw=e?(int64_t)strtoul(e,0,16):-1;}
           if(rw>=0 && (uint32_t)ctx->gpr[3]==(uint32_t)rw){ static PPU_THREAD_LOCAL int _n=0; if(PS3_LOG_FIRST(_n, 8)){
-            fprintf(stderr,"[RETWATCH] vcall -> func_%08X returned r3=0x%08X\n", addr, (uint32_t)rw);
+            PS3_LOG(PS3_LOG_INFO, "RETWATCH", "vcall -> func_%08X returned r3=0x%08X\n", addr, (uint32_t)rw);
 #ifdef _WIN32
             void* bt[16]; unsigned short fr=RtlCaptureStackBackTrace(0,16,bt,0);
             char ln[760]; int p=snprintf(ln,sizeof ln,"      RET-hostbt:");
@@ -3280,7 +3270,7 @@ extern "C" void lv2_syscall(ppu_context* ctx)
         void* ra=__builtin_return_address(0); char* mb=(char*)GetModuleHandleA(0);
         uintptr_t tgt=(uintptr_t)ra; uint32_t bg=0; uintptr_t bh=0;
         for(uint64_t k=0;k<function_table_count;k++){ uintptr_t h=(uintptr_t)function_table[k].func; if(h<=tgt&&h>bh){bh=h;bg=function_table[k].addr;} }
-        fprintf(stderr,"[sc-caller] flag=100 syscall from func_%08X+0x%llX (r5/mode=0x%08X r7/timeout=0x%08X lr=0x%08X)\n",
+        PS3_LOG(PS3_LOG_INFO, "sc-caller", "flag=100 syscall from func_%08X+0x%llX (r5/mode=0x%08X r7/timeout=0x%08X lr=0x%08X)\n",
                 bg,(unsigned long long)(tgt-bh),(uint32_t)ctx->gpr[5],(uint32_t)ctx->gpr[7],(uint32_t)ctx->lr); } }
     /* Trace the port_send(port=1) sender (the cri kick): who sends it + the data
      * (data=0 seen -> is the decode-job payload null? a real uninit field?). */
@@ -3288,7 +3278,7 @@ extern "C" void lv2_syscall(ppu_context* ctx)
         void* ra=__builtin_return_address(0); char* mb=(char*)GetModuleHandleA(0);
         uintptr_t tgt=(uintptr_t)ra; uint32_t bg=0; uintptr_t bh=0;
         for(uint64_t k=0;k<function_table_count;k++){ uintptr_t h=(uintptr_t)function_table[k].func; if(h<=tgt&&h>bh){bh=h;bg=function_table[k].addr;} }
-        fprintf(stderr,"[sc-caller] port_send(port=1) from func_%08X+0x%llX data=0x%08X/0x%08X/0x%08X\n",
+        PS3_LOG(PS3_LOG_INFO, "sc-caller", "port_send(port=1) from func_%08X+0x%llX data=0x%08X/0x%08X/0x%08X\n",
                 bg,(unsigned long long)(tgt-bh),(uint32_t)ctx->gpr[4],(uint32_t)ctx->gpr[5],(uint32_t)ctx->gpr[6]); } }
     switch (num) {
     case 352: {   /* sys_memory_get_user_memory_size(sys_memory_info_t* info)
@@ -3335,7 +3325,7 @@ extern "C" void lv2_syscall(ppu_context* ctx)
         uint32_t wlen = len;
         if (wlen > 0x4000u) {   /* guard against garbage len (divergence dumps memory) */
             static int n = 0;
-            if (n < 20) { fprintf(stderr, "[tty] suspicious len=%u (buf=0x%08X) clamped\n", len, buf); n++; }
+            if (n < 20) { PS3_LOG(PS3_LOG_WARN, "tty", "suspicious len=%u (buf=0x%08X) clamped\n", len, buf); n++; }
             wlen = 0x4000u;
         }
         /* Collapse a repeating line. A title that logs an error from inside a
@@ -3464,7 +3454,7 @@ extern "C" void lv2_syscall(ppu_context* ctx)
          * matching exit names the call that blocked. */
         { static int _se = -1; if (_se < 0) _se = getenv("PS3_SCENTER") ? 1 : 0;
           if (_se) { static unsigned long _n = 0;
-            fprintf(stderr, "[sc-enter] #%lu num=%llu tid=%u a3=0x%llX a4=0x%llX lr=0x%08X\n",
+            PS3_LOG(PS3_LOG_INFO, "sc-enter", "#%lu num=%llu tid=%u a3=0x%llX a4=0x%llX lr=0x%08X\n",
                     ++_n, (unsigned long long)num, (unsigned)ctx->thread_id,
                     (unsigned long long)ctx->gpr[3], (unsigned long long)ctx->gpr[4],
                     (unsigned)ctx->lr);
@@ -3483,7 +3473,7 @@ extern "C" void lv2_syscall(ppu_context* ctx)
                 void* ra=__builtin_return_address(0);
                 uintptr_t tgt=(uintptr_t)ra; uint32_t bg=0; uintptr_t bh=0;
                 for(uint64_t k=0;k<function_table_count;k++){ uintptr_t h=(uintptr_t)function_table[k].func; if(h<=tgt&&h>bh){bh=h;bg=function_table[k].addr;} }
-                fprintf(stderr,"[BLOCK] syscall %llu blocked %llums  caller=func_%08X+0x%llX  queue=%08X evbuf=%08X timeout=%08X -> ret=%08X tid=%u\n",
+                PS3_LOG(PS3_LOG_INFO, "BLOCK", "syscall %llu blocked %llums  caller=func_%08X+0x%llX  queue=%08X evbuf=%08X timeout=%08X -> ret=%08X tid=%u\n",
                     (unsigned long long)num,(unsigned long long)_dt,bg,(unsigned long long)(tgt-bh),
                     _a3,_a4,_a5,_rv,(unsigned)ctx->thread_id);
                 }
@@ -3491,7 +3481,7 @@ extern "C" void lv2_syscall(ppu_context* ctx)
             if (s_win==0) s_win=_t0;
             if (_t0 - s_win >= 2000) {
                 for (int n=0;n<1024;n++) if (s_acc[n]>=300)
-                    fprintf(stderr,"[BLOCKSUM] syscall %d: %llums total over %u calls (last 2s)\n",n,(unsigned long long)s_acc[n],s_cnt[n]);
+                    PS3_LOG(PS3_LOG_INFO, "BLOCKSUM", "syscall %d: %llums total over %u calls (last 2s)\n",n,(unsigned long long)s_acc[n],s_cnt[n]);
                 for (int n=0;n<1024;n++){s_acc[n]=0;s_cnt[n]=0;} s_win=_t0;
             }
             if (_ok) { sc_trace(num, ctx, _a3, _a4, _a5, 0); return; }
@@ -3520,7 +3510,7 @@ extern "C" void lv2_syscall(ppu_context* ctx)
               static std::atomic<uint64_t> reported[16];   /* bitmap over 0..1023 */
               const uint64_t bit = 1ull << (num & 63);
               if (num < 1024 && !(reported[num >> 6].fetch_or(bit) & bit))
-                  fprintf(stderr, "[ppu] ALLOW-LISTED unimplemented syscall %llu returns 0x%08X: %s (%s:%u)\n",
+                  PS3_LOG(PS3_LOG_WARN, "ppu", "ALLOW-LISTED unimplemented syscall %llu returns 0x%08X: %s (%s:%u)\n",
                           (unsigned long long)num, s->ret, s->reason,
                           ps3_config_file() ? ps3_config_file() : "?", s->line);
               ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)s->ret;
@@ -3542,7 +3532,7 @@ extern "C" void lv2_syscall(ppu_context* ctx)
                   static std::atomic<uint64_t> reported[16];
                   const uint64_t bit = 1ull << (num & 63);
                   if (!(reported[num >> 6].fetch_or(bit) & bit))
-                      fprintf(stderr, "[ppu] lv2 ENOSYS slot %llu answered 0x%08X "
+                      PS3_LOG(PS3_LOG_INFO, "ppu", "lv2 ENOSYS slot %llu answered 0x%08X "
                               "(FW 4.93 stock lv2_kernel)\n",
                               (unsigned long long)num, (unsigned)CELL_ENOSYS);
               }
@@ -3596,10 +3586,10 @@ extern "C" uint32_t ppu_load_elf(const char* path)
 
     g_ppu_primary_priority = 1001;
     FILE* f = fopen(path, "rb");
-    if (!f) { fprintf(stderr, "[ppu] cannot open %s\n", path); return 0; }
+    if (!f) { PS3_LOG(PS3_LOG_ERROR, "ppu", "cannot open %s\n", path); return 0; }
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
-    if (sz < 0) { fclose(f); fprintf(stderr, "[ppu] cannot size %s\n", path); return 0; }
+    if (sz < 0) { fclose(f); PS3_LOG(PS3_LOG_ERROR, "ppu", "cannot size %s\n", path); return 0; }
     fseek(f, 0, SEEK_SET);
     uint8_t* file = (uint8_t*)malloc(sz ? (size_t)sz : 1);   /* an empty file must still reach the identity check */
     if (!file || fread(file, 1, sz, f) != (size_t)sz) { fclose(f); free(file); return 0; }
@@ -3611,7 +3601,7 @@ extern "C" uint32_t ppu_load_elf(const char* path)
     ps3_identity_check_image(path, file, (size_t)sz, ppu_lift_image_sha256());
 
     if (sz < 64 || memcmp(file, "\x7F""ELF", 4) != 0 || file[4] != 2 /*ELFCLASS64*/ || file[5] != 2 /*MSB*/) {
-        fprintf(stderr, "[ppu] not a 64-bit big-endian ELF\n"); free(file); return 0;
+        PS3_LOG(PS3_LOG_ERROR, "ppu", "not a 64-bit big-endian ELF\n"); free(file); return 0;
     }
     uint64_t fsz = (uint64_t)sz;
     uint32_t entry = (uint32_t)be64(file + 24);
@@ -3634,7 +3624,7 @@ extern "C" uint32_t ppu_load_elf(const char* path)
             g_tls_vaddr  = (uint32_t)be64(ph + 16);
             g_tls_filesz = (uint32_t)be64(ph + 32);
             g_tls_memsz  = (uint32_t)be64(ph + 40);
-            fprintf(stderr, "[ppu] PT_TLS template vaddr=0x%08X filesz=0x%X memsz=0x%X\n",
+            PS3_LOG(PS3_LOG_INFO, "ppu", "PT_TLS template vaddr=0x%08X filesz=0x%X memsz=0x%X\n",
                     g_tls_vaddr, g_tls_filesz, g_tls_memsz);
             continue;
         }
@@ -3648,7 +3638,7 @@ extern "C" uint32_t ppu_load_elf(const char* path)
             if (po <= fsz && pf <= fsz && po + pf <= fsz && pf >= 0x10 &&
                 be32(file + po + 4) == 0x13BCC5F6u) {
                 g_ps3_sdk_version = be32(file + po + 12);
-                fprintf(stderr, "[ppu] PROC_PARAM sdk_version 0x%08X\n", g_ps3_sdk_version);
+                PS3_LOG(PS3_LOG_INFO, "ppu", "PROC_PARAM sdk_version 0x%08X\n", g_ps3_sdk_version);
                 /* The primary thread's priority (the word after the SDK version): the words are size, magic,
                  * version, SDK version, primary priority, stack size, malloc page size and PPC segment, big
                  * endian. Taken only from a full, self-consistent parameter block (declared size within the
@@ -3659,11 +3649,11 @@ extern "C" uint32_t ppu_load_elf(const char* path)
                     const int32_t priority = (int32_t)be32(param + 0x10);
                     if (declared >= 0x20 && declared <= pf && priority >= 0 && priority <= 3071) {
                         g_ppu_primary_priority = priority;
-                        fprintf(stderr, "[ppu] primary thread priority %d\n", priority);
+                        PS3_LOG(PS3_LOG_INFO, "ppu", "primary thread priority %d\n", priority);
                     }
                 }
             } else {
-                fprintf(stderr, "[ppu] PROC_PARAM segment %u is malformed (offset 0x%llX size 0x%llX), "
+                PS3_LOG(PS3_LOG_WARN, "ppu", "PROC_PARAM segment %u is malformed (offset 0x%llX size 0x%llX), "
                         "keeping the default SDK version 0x%08X\n", i, (unsigned long long)po,
                         (unsigned long long)pf, g_ps3_sdk_version);
             }
@@ -3680,13 +3670,13 @@ extern "C" uint32_t ppu_load_elf(const char* path)
          * guest VM (ppu_vm_size==0 = unchecked, matching the vm accessors).
          * Skip malformed/oversized segments rather than overflowing the host. */
         if (p_offset > fsz || p_filesz > fsz || p_offset + p_filesz > fsz) {
-            fprintf(stderr, "[ppu] segment %u file range 0x%llX+0x%llX exceeds ELF (0x%llX), skipped\n",
+            PS3_LOG(PS3_LOG_WARN, "ppu", "segment %u file range 0x%llX+0x%llX exceeds ELF (0x%llX), skipped\n",
                     i, (unsigned long long)p_offset, (unsigned long long)p_filesz, (unsigned long long)fsz);
             continue;
         }
         if (ppu_vm_size && (p_vaddr > ppu_vm_size || p_memsz > ppu_vm_size ||
                             p_vaddr + p_memsz > ppu_vm_size)) {
-            fprintf(stderr, "[ppu] segment %u vaddr 0x%llX+0x%llX exceeds VM (0x%X), skipped\n",
+            PS3_LOG(PS3_LOG_WARN, "ppu", "segment %u vaddr 0x%llX+0x%llX exceeds VM (0x%X), skipped\n",
                     i, (unsigned long long)p_vaddr, (unsigned long long)p_memsz, ppu_vm_size);
             continue;
         }
@@ -3697,7 +3687,7 @@ extern "C" uint32_t ppu_load_elf(const char* path)
         loaded++;
     }
     free(file);
-    fprintf(stderr, "[ppu] loaded %d PT_LOAD segments, entry OPD 0x%08X\n", loaded, entry);
+    PS3_LOG(PS3_LOG_INFO, "ppu", "loaded %d PT_LOAD segments, entry OPD 0x%08X\n", loaded, entry);
 
     /* Arm PPU_GUARD_EA here as well as in lv2_syscall. The syscall path only
      * runs once the guest CRT is already going, which misses anything the CRT
@@ -3732,7 +3722,7 @@ extern "C" uint32_t ppu_load_elf(const char* path)
               ea8[n8] = (uint32_t)strtoul(c, (char**)&c, 16);
               if (*c == ':') c++;
               v8[n8]  = (uint8_t)strtoul(c, (char**)&c, 16);
-              fprintf(stderr, "[poke8] holding 0x%08X = 0x%02X%c", ea8[n8], v8[n8], 10);
+              PS3_LOG(PS3_LOG_INFO, "poke8", "holding 0x%08X = 0x%02X%c", ea8[n8], v8[n8], 10);
               n8++;
               while (*c == ',' || *c == ' ') c++;
           }
@@ -3759,7 +3749,7 @@ extern "C" uint32_t ppu_load_elf(const char* path)
               ea[n]  = (uint32_t)strtoul(c, (char**)&c, 16);
               if (*c == ':') c++;
               val[n] = (uint32_t)strtoul(c, (char**)&c, 16);
-              fprintf(stderr, "[poke] holding 0x%08X = 0x%X%c", ea[n], val[n], 10);
+              PS3_LOG(PS3_LOG_INFO, "poke", "holding 0x%08X = 0x%X%c", ea[n], val[n], 10);
               n++;
               while (*c == ',' || *c == ' ') c++;
           }
@@ -3783,14 +3773,13 @@ extern "C" uint32_t ppu_load_elf(const char* path)
               if (keep) {
                   memcpy(keep, vm_base + kea, klen);
                   keep_ea = kea; keep_len = klen;
-                  fprintf(stderr, "[keep] snapshotting 0x%08X..0x%08X and restoring it%c",
+                  PS3_LOG(PS3_LOG_INFO, "keep", "snapshotting 0x%08X..0x%08X and restoring it%c",
                           kea, kea + klen, 10);
                   struct R { static DWORD WINAPI go(LPVOID) {
                       for (;;) {
                           if (memcmp(vm_base + keep_ea, keep, keep_len)) {
                               memcpy(vm_base + keep_ea, keep, keep_len);
-                              static int n = 0;
-                              if (PS3_LOG_FIRST(n, 8)) fprintf(stderr, "[keep] restored 0x%08X%c", keep_ea, 10);
+                              PS3_LOG_N(8, PS3_LOG_INFO, "keep", "restored 0x%08X%c", keep_ea, 10);
                           }
                           Sleep(2);
                       } } };
@@ -3860,7 +3849,7 @@ static uint32_t ppu_tls_new_block(void)
     if (base + total > lim) {                   /* out of room: share, as before */
         static int s_warned = 0;
         if (!__atomic_exchange_n(&s_warned, 1, __ATOMIC_RELAXED))
-            fprintf(stderr, "[ppu] TLS window full after %u thread blocks: later "
+            PS3_LOG(PS3_LOG_WARN, "ppu", "TLS window full after %u thread blocks: later "
                     "threads share the main thread's TLS\n", (unsigned)(off / total));
         return 0;
     }
@@ -3879,7 +3868,7 @@ static void ppu_thread_entry_trampoline(ppu_context* ctx)
                          ctx->gpr[13] = tp ? tp : PPU_TLS_TP; }
     ppu_fn fn = ppu_lookup(code);
     if (!fn) {
-        fprintf(stderr, "[ppu] thread entry 0x%08X (cia=0x%08X) not registered\n",
+        PS3_LOG(PS3_LOG_WARN, "ppu", "thread entry 0x%08X (cia=0x%08X) not registered\n",
                 code, (uint32_t)ctx->cia);
         return;
     }
@@ -4306,7 +4295,7 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
     uint32_t code = 0, toc = 0;
     ppu_opd_resolve(entry_opd, &code, &toc);
     ppu_fn fn = ppu_lookup(code);
-    if (!fn) { fprintf(stderr, "[ppu] entry code 0x%08X not registered\n", code); return -1; }
+    if (!fn) { PS3_LOG(PS3_LOG_ERROR, "ppu", "entry code 0x%08X not registered\n", code); return -1; }
 
     ppu_context ctx;
     memset(&ctx, 0, sizeof(ctx));
@@ -4354,7 +4343,7 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
         if (g_tls_memsz > g_tls_filesz)
             memset(vm_base + PPU_TLS_IMG + g_tls_filesz, 0, g_tls_memsz - g_tls_filesz);
         ctx.gpr[13] = PPU_TLS_TP;
-        fprintf(stderr, "[ppu] TLS image 0x%08X (r13/TP=0x%08X)\n", PPU_TLS_IMG, PPU_TLS_TP);
+        PS3_LOG(PS3_LOG_INFO, "ppu", "TLS image 0x%08X (r13/TP=0x%08X)\n", PPU_TLS_IMG, PPU_TLS_TP);
     }
     /* Guest command line (argc/argv). The PS3 LV2 loader passes argv[0] = the boot
      * path; ppu_run previously left r3/r4 zeroed, so the guest read a garbage argv[0]
@@ -4410,13 +4399,13 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
         uint64_t top = stack_top & ~uint64_t(0x1F);
         uint64_t vm_end = ppu_vm_size ? ppu_vm_size : 0x100000000ull;
         if (reserve > 0x10000 || top > vm_end || top < VM_MAIN_MEM_BASE + reserve) {
-            fprintf(stderr, "[ppu] invalid entry argument stack reservation\n");
+            PS3_LOG(PS3_LOG_ERROR, "ppu", "invalid entry argument stack reservation\n");
             return -1;
         }
         uint32_t entry_sp = (uint32_t)(top - reserve);
         for (const auto& range : g_ppu_image_ranges) {
             if (entry_sp < range.end && top > range.begin) {
-                fprintf(stderr, "[ppu] entry argument stack overlaps loaded image\n");
+                PS3_LOG(PS3_LOG_ERROR, "ppu", "entry argument stack overlaps loaded image\n");
                 return -1;
             }
         }
@@ -4453,11 +4442,11 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
             char rb[80]; uint32_t k = 0;
             for (; k < 79; k++) { rb[k] = (char)vm_base[pa + k]; if (!rb[k]) break; }
             rb[79] = 0;
-            fprintf(stderr, "[ppu] argv[%u] @0x%08X = \"%s\"\n", a, pa, rb);
+            PS3_LOG(PS3_LOG_INFO, "ppu", "argv[%u] @0x%08X = \"%s\"\n", a, pa, rb);
         }
-        fprintf(stderr, "[ppu] argc=%u argv=0x%08X\n", argc_n, argv_base);
+        PS3_LOG(PS3_LOG_INFO, "ppu", "argc=%u argv=0x%08X\n", argc_n, argv_base);
     }
-    fprintf(stderr, "[ppu] run: code 0x%08X, toc 0x%08X, sp 0x%08X\n", code, toc, (uint32_t)ctx.gpr[1]);
+    PS3_LOG(PS3_LOG_INFO, "ppu", "run: code 0x%08X, toc 0x%08X, sp 0x%08X\n", code, toc, (uint32_t)ctx.gpr[1]);
     g_active_ctx = &ctx;
     ppu_ctx_register(&ctx);    /* main/entry thread: the watchdog lists it too */
     fn(&ctx);
