@@ -45,6 +45,40 @@ uint64_t sys_timer_usleep_precise_count(void);
  * (ppu.precise_usleep, 20 us and up) without counting as a guest usleep;
  * otherwise nanosleep, resumed after a signal. */
 void ps3_host_sleep_ns(uint64_t ns);
+
+/* Sleep to `deadline_ns` on host_monotonic_ns: a timer sleep (as ps3_host_sleep_ns) to `deadline_ns - spin_ns`,
+ * then a spin on the host clock to the deadline. A kernel timer wakes 20-50 us late on an M4 Pro, so a sleep to
+ * the deadline itself ends after it; the spin buys the exact end for spin_ns of CPU. spin_ns 0 is a pure sleep.
+ * Returns at once for a deadline that has passed. Not interruptible: the usleep seam's sleep also ends early to
+ * deliver a GCM notification, this one does not. */
+void ps3_host_sleep_until_ns(uint64_t deadline_ns, uint64_t spin_ns);
+
+/* ---- usleep-site seam (ppu.poll_sleep_coalesce, default off) ----------------------------------------------
+ * A title whose frame limiter polls usleep against a deadline it can compute registers the poll's syscall site; a
+ * sys_timer_usleep from that site with the option on then sleeps once, to the deadline, instead of the guest's
+ * request. POSIX hosts only: Windows keeps the poll (its guest clock has its own base, ppu_sysprx.cpp).
+ *
+ * `deadline` runs on every usleep whose guest return address is `lr`, on the calling guest thread, and returns the
+ * absolute time on host_monotonic_ns at which the poll's own exit test would pass, or 0 for "no opinion" (guard
+ * words not as expected, nothing to wait for). It must be quick and must not block or call into the guest. The
+ * seam takes the deadline only if it lies in (now, now + max_sleep_ns]; 0, a deadline that has passed and one
+ * beyond the bound all take the ordinary usleep(r3), and a deadline beyond the bound is logged once
+ * ([usleep] poll-sleep-bound). While the seam sleeps, a pending GCM notification ends the wait early, is
+ * delivered on that thread and the sleep resumes.
+ *
+ * One caller at a time: the whole seam, every registered site together, serves one sleeping call at a time in the
+ * process (a title's limiter is one thread). A call that arrives while another sleeps, or one the delivered handler
+ * makes from inside the sleep, takes the ordinary usleep(r3) without running its callback, and the first such call
+ * is logged ([usleep] poll-sleep-contended).
+ *
+ * Register from one thread before the first guest thread runs (the table is read without a lock afterwards).
+ * Returns 0, or -1 for an lr or bound of 0, a null callback, a duplicate lr or a full table (8 sites); nothing is
+ * registered then. */
+typedef uint64_t (*ps3_usleep_deadline_fn)(ppu_context* ctx);
+int ps3_usleep_site_register(uint32_t lr, uint64_t max_sleep_ns, ps3_usleep_deadline_fn deadline);
+
+/* sys_timer_usleep calls the seam slept to a deadline, for tests and diagnostics. */
+uint64_t sys_timer_usleep_site_count(void);
 #endif
 
 #ifdef _WIN32

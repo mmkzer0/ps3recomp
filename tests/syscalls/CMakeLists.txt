@@ -239,6 +239,49 @@ if(NOT WIN32 AND TARGET ps3recomp_runtime)
     endforeach()
 endif()
 
+# The usleep-site seam (ppu.poll_sleep_coalesce, ppu.poll_sleep_spin_us): a registered site sleeps once to its
+# deadline, the bound and the ordinary path, the wake on a GCM notification (the test supplies the fake GCM side
+# through the runtime's weak references), the option off, the spin. `site` and `register` are the TSan runs.
+# Only `timing` is a stress-tier measurement; the spin runs compare thread CPU time with wide margins.
+if(NOT WIN32 AND TARGET ps3recomp_runtime)
+    add_executable(test_usleep_site
+        test_usleep_site.c
+        "${PS3RECOMP_ROOT}/runtime/host/host_stubs.c"
+    )
+    target_include_directories(test_usleep_site PRIVATE
+        "${PS3RECOMP_ROOT}/runtime/syscalls"
+        "${PS3RECOMP_ROOT}/runtime"
+        "${PS3RECOMP_ROOT}/runtime/ppu"
+        "${PS3RECOMP_ROOT}/include"
+        "${PS3RECOMP_ROOT}/libs/video"
+    )
+    target_compile_options(test_usleep_site PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    target_link_libraries(test_usleep_site PRIVATE ps3recomp_runtime)
+    set_target_properties(test_usleep_site PROPERTIES LINKER_LANGUAGE CXX)
+
+    foreach(_m IN ITEMS site wake guard guard-ring contract off spin0 spin2000 register)
+        add_test(NAME usleep_site_${_m} COMMAND test_usleep_site ${_m})
+    endforeach()
+    add_test(NAME usleep_site_timing COMMAND test_usleep_site timing 200)
+    set_tests_properties(usleep_site_site usleep_site_wake usleep_site_guard usleep_site_guard-ring
+        usleep_site_contract usleep_site_register PROPERTIES LABELS "runtime;syscalls;t0;tsan" TIMEOUT 60)
+    set_tests_properties(usleep_site_off usleep_site_spin0 usleep_site_spin2000
+        PROPERTIES LABELS "runtime;syscalls;t0" TIMEOUT 60)
+    set_tests_properties(usleep_site_timing PROPERTIES LABELS "runtime;syscalls;stress" TIMEOUT 120)
+    # Every run states both options, so what CTest inherited cannot change it (plain ENVIRONMENT: the project's
+    # CMake floor is 3.20, ENVIRONMENT_MODIFICATION needs 3.22). The spin is stated at its default except where a
+    # run is about it.
+    set_tests_properties(usleep_site_off usleep_site_register PROPERTIES ENVIRONMENT
+        "PS3RECOMP_PPU_POLL_SLEEP_COALESCE=0;PS3RECOMP_PPU_POLL_SLEEP_SPIN_US=100")
+    set_tests_properties(usleep_site_site usleep_site_wake usleep_site_guard usleep_site_guard-ring
+        usleep_site_contract usleep_site_timing PROPERTIES ENVIRONMENT
+        "PS3RECOMP_PPU_POLL_SLEEP_COALESCE=1;PS3RECOMP_PPU_POLL_SLEEP_SPIN_US=100")
+    set_tests_properties(usleep_site_spin0 PROPERTIES ENVIRONMENT
+        "PS3RECOMP_PPU_POLL_SLEEP_COALESCE=1;PS3RECOMP_PPU_POLL_SLEEP_SPIN_US=0")
+    set_tests_properties(usleep_site_spin2000 PROPERTIES ENVIRONMENT
+        "PS3RECOMP_PPU_POLL_SLEEP_COALESCE=1;PS3RECOMP_PPU_POLL_SLEEP_SPIN_US=2000")
+endif()
+
 # The raw filesystem syscalls (open flags, seek, mkdir/unlink/rmdir codes,
 # readdir, fd-table limits and concurrency) against real files in a temporary
 # directory. Links sys_fs.c alone.

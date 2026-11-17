@@ -17,9 +17,12 @@
 #include "../../include/ps3emu/ps3_log.h"
 #ifdef __APPLE__
 #include <mach/mach_time.h>
-#include <errno.h>
-#include <stdatomic.h>
 #include <sys/event.h>
+#endif
+#ifndef _WIN32
+#include <errno.h>
+#include <fcntl.h>
+#include <stdatomic.h>
 #endif
 #include "ps3emu/thread_name.h"
 #ifndef _WIN32
@@ -237,6 +240,290 @@ void ps3_host_sleep_ns(uint64_t ns)
 }
 #endif
 
+#ifndef _WIN32
+/* ---------------------------------------------------------------------------
+ * Usleep-site seam (ppu.poll_sleep_coalesce)
+ *
+ * A guest limiter that polls usleep(30) against a deadline pays one syscall, two GCM pumps, one clock read and
+ * one kernel timer per poll: 350-400 a frame, ~26000 host wakeups a second. The title can compute the deadline
+ * the poll ends at; the toolkit cannot (it sees the sleeps, not the loop's exit test). The title registers the
+ * return address of the poll's syscall with a callback that returns that deadline, and the toolkit sleeps to it
+ * once. Everything the guest does around the sleep stays guest code: the branch that skips the wait on a late
+ * frame, the exit test, the stamp it stores. Only the number of clock reads and the instant the loop ends move.
+ *
+ * Bounded by construction: a deadline is taken only inside (now, now + max_sleep_ns]. A wrong callback (a stale
+ * or garbled word read from guest memory) then costs at most one bounded sleep, never a hang, and is reported.
+ *
+ * The deadline is on host_monotonic_ns, the clock every POSIX guest clock derives from. Windows keeps the poll:
+ * its guest clock is QueryPerformanceCounter with a base of its own (ppu_sysprx.cpp), which a title cannot turn
+ * into a host deadline without a base this file does not export. That is a documented gap, not a faked seam.
+ * -----------------------------------------------------------------------*/
+enum { USLEEP_SITES_MAX = 8 };
+typedef struct {
+    uint32_t               lr;
+    uint64_t               max_sleep_ns;
+    ps3_usleep_deadline_fn deadline;
+} usleep_site;
+/* Written by the registering thread before any guest thread runs, then read-only; the count is published with
+ * release so a reader that sees a slot sees it whole. */
+static usleep_site s_sites[USLEEP_SITES_MAX];
+static atomic_uint s_site_count;
+static atomic_uint_fast64_t s_site_sleeps;
+
+int ps3_usleep_site_register(uint32_t lr, uint64_t max_sleep_ns, ps3_usleep_deadline_fn deadline)
+{
+    if (!lr || !max_sleep_ns || !deadline) return -1;
+    const unsigned n = atomic_load_explicit(&s_site_count, memory_order_relaxed);
+    if (n >= USLEEP_SITES_MAX) return -1;
+    for (unsigned i = 0; i < n; i++) if (s_sites[i].lr == lr) return -1;
+    s_sites[n].lr = lr;
+    s_sites[n].max_sleep_ns = max_sleep_ns;
+    s_sites[n].deadline = deadline;
+    atomic_store_explicit(&s_site_count, n + 1, memory_order_release);
+    return 0;
+}
+
+uint64_t sys_timer_usleep_site_count(void)
+{
+    return (uint64_t)atomic_load_explicit(&s_site_sleeps, memory_order_relaxed);
+}
+
+/* The pump the lv2 dispatcher runs at a usleep syscall (ppu_loader.cpp) and the waker's installer, both in
+ * cellGcmSys.c when it is linked. Weak, as ppu_hle.cpp holds ppu_gcm_pump: a link without GCM has nothing to pump
+ * and nothing that posts. */
+extern void ppu_gcm_pump(void) __attribute__((weak));
+extern void ppu_gcm_set_wake_hook(void (*hook)(void)) __attribute__((weak));
+
+static void site_pump(void)
+{
+    if (ppu_gcm_pump) ppu_gcm_pump();
+}
+
+static void site_wait_failed(const char* what, int err)
+{
+    PS3_LOG_N(1, PS3_LOG_INFO, "usleep", "poll-sleep-wait-failed: %s failed (errno %d: %s); the seam sleeps this "
+              "call without waking for GCM notifications, which are then delivered at the thread's next HLE call "
+              "or syscall.\n", what, err, strerror(err));
+}
+
+static inline void cpu_relax(void)
+{
+#if defined(__aarch64__)
+    __asm__ volatile("yield");
+#elif defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#endif
+}
+
+static void spin_until_ns(uint64_t deadline_ns)
+{
+    while (host_monotonic_ns() < deadline_ns) cpu_relax();
+}
+
+void ps3_host_sleep_until_ns(uint64_t deadline_ns, uint64_t spin_ns)
+{
+    const uint64_t sleep_to = deadline_ns > spin_ns ? deadline_ns - spin_ns : 0;
+    const uint64_t now = host_monotonic_ns();
+    if (now < sleep_to) ps3_host_sleep_ns(sleep_to - now);
+    spin_until_ns(deadline_ns);
+}
+
+/* ---- the interruptible wait ----------------------------------------------------------------------------------
+ * The seam sleeps a frame in one wait, so a GCM notification (vblank, flip, user command: ~128 user commands a
+ * second in the title this was built for) posted meanwhile must end it, or its handler would wait for the next
+ * HLE call on any thread instead of at most 35 us. The poster calls usleep_wake (installed into cellGcmSys.c);
+ * the sleeper pumps and sleeps on to its deadline.
+ *
+ * No lost wake, on either host: the sleeper announces itself, fences, then pumps once; the poster publishes,
+ * fences, then looks for a sleeper. Whichever side the fences order first, either the sleeper's pump sees the
+ * work or the poster sees the sleeper and wakes it. A wake is an edge: the sleeper never loops on "something is
+ * pending", because with gcm.handler_thread the pump leaves it pending for the interrupt thread to take.
+ *
+ * Both waits return 0 once the clock has passed `until_ns`, or -1 with nothing slept and no wake armed, in which
+ * case the caller sleeps plainly. */
+#ifdef __APPLE__
+/* One kqueue, made at the first wait: an EVFILT_USER that the poster triggers, plus the NOTE_CRITICAL timer of
+ * sleep_critical_timer (the only timer the kernel does not coalesce). A kqueue per sleep, as the guest's plain
+ * usleep does, would give the poster nothing to trigger. It has one sleeper at a time (s_site_busy). */
+enum { WAKE_USER_IDENT = 1, WAKE_TIMER_IDENT = 2 };
+static atomic_int  s_wake_kq = -1;
+
+static atomic_int  s_wake_waiting;
+
+static int wake_kq(void)
+{
+    int kq = atomic_load_explicit(&s_wake_kq, memory_order_acquire);
+    if (kq >= 0) return kq;
+    kq = kqueue();
+    if (kq < 0) { site_wait_failed("kqueue", errno); return -1; }
+    (void)fcntl(kq, F_SETFD, FD_CLOEXEC);
+    struct kevent ch;
+    EV_SET(&ch, WAKE_USER_IDENT, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
+    if (kevent(kq, &ch, 1, NULL, 0, NULL) < 0) { site_wait_failed("kevent", errno); close(kq); return -1; }
+    atomic_store_explicit(&s_wake_kq, kq, memory_order_release);   /* only the flag's owner gets here */
+    return kq;
+}
+
+static void usleep_wake(void)
+{
+    atomic_thread_fence(memory_order_seq_cst);
+    if (!atomic_load_explicit(&s_wake_waiting, memory_order_relaxed)) return;
+    struct kevent ch;
+    EV_SET(&ch, WAKE_USER_IDENT, EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL);
+    (void)kevent(atomic_load_explicit(&s_wake_kq, memory_order_acquire), &ch, 1, NULL, 0, NULL);
+}
+
+static int wake_sleep_until(uint64_t until_ns)
+{
+    const int kq = wake_kq();   /* one sleeper at a time: usleep_site_sleep holds s_site_busy around this */
+    if (kq < 0) return -1;
+    atomic_store_explicit(&s_wake_waiting, 1, memory_order_seq_cst);
+    atomic_thread_fence(memory_order_seq_cst);
+    site_pump();
+    int rc = 0, armed = 0;
+    for (;;) {
+        const uint64_t now = host_monotonic_ns();
+        if (now >= until_ns) break;
+        const uint64_t left = until_ns - now;
+        if (left < (uint64_t)USLEEP_PRECISE_MIN_US * 1000u) { ps3_host_sleep_ns(left); break; }
+        const uint64_t chunk = left > (uint64_t)USLEEP_PRECISE_MAX_US * 1000u ? (uint64_t)USLEEP_PRECISE_MAX_US * 1000u : left;
+        struct kevent ch, ev;
+        EV_SET(&ch, WAKE_TIMER_IDENT, EVFILT_TIMER, EV_ADD | EV_ONESHOT, NOTE_NSECONDS | NOTE_CRITICAL, (intptr_t)chunk, NULL);
+        armed = 1;
+        const int n = kevent(kq, &ch, 1, &ev, 1, NULL);
+        if (n == 1 && (ev.flags & EV_ERROR)) { site_wait_failed("kevent", (int)ev.data); rc = -1; break; }
+        if (n == 1 && ev.filter == EVFILT_TIMER) armed = 0;
+        else if (n == 1) site_pump();           /* the poster's trigger: deliver, then sleep on to the deadline */
+        else if (n < 0 && errno != EINTR) { site_wait_failed("kevent", errno); rc = -1; break; }
+    }
+    if (armed) {   /* left on a wake with the timer still armed: it must not fire into the next sleep */
+        struct kevent del;
+        EV_SET(&del, WAKE_TIMER_IDENT, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
+        (void)kevent(kq, &del, 1, NULL, 0, NULL);
+    }
+    atomic_store_explicit(&s_wake_waiting, 0, memory_order_relaxed);
+    return rc;
+}
+#else
+/* Linux and other POSIX hosts: a monotonic condition variable. Their timer leeway is the 50 us timerslack, which
+ * the spin margin absorbs, so a timed condition wait is accurate enough and there is nothing to coalesce. */
+static pthread_mutex_t s_wake_mx = PTHREAD_MUTEX_INITIALIZER;
+PS3_STATIC_MONOTONIC_COND(wake_cv)
+static uint64_t   s_wake_seq;       /* guarded by s_wake_mx */
+static atomic_int s_wake_waiters;
+
+static void usleep_wake(void)
+{
+    atomic_thread_fence(memory_order_seq_cst);
+    if (!atomic_load_explicit(&s_wake_waiters, memory_order_relaxed)) return;
+    pthread_cond_t* cv = wake_cv();
+    if (!cv) return;   /* no waiter can exist: wake_sleep_until refuses without it */
+    pthread_mutex_lock(&s_wake_mx);
+    s_wake_seq++;
+    pthread_cond_broadcast(cv);
+    pthread_mutex_unlock(&s_wake_mx);
+}
+
+static int wake_sleep_until(uint64_t until_ns)
+{
+    pthread_cond_t* cv = wake_cv();
+    if (!cv) { site_wait_failed("pthread_cond_init", EINVAL); return -1; }
+    atomic_fetch_add_explicit(&s_wake_waiters, 1, memory_order_seq_cst);
+    atomic_thread_fence(memory_order_seq_cst);
+    pthread_mutex_lock(&s_wake_mx);
+    uint64_t seen = s_wake_seq;
+    pthread_mutex_unlock(&s_wake_mx);
+    site_pump();
+    int rc = 0;
+    for (;;) {
+        const uint64_t now = host_monotonic_ns();
+        if (now >= until_ns) break;
+        const ps3_wait_budget budget = ps3_wait_budget_ns(until_ns - now, 0);
+        int w = 0;
+        pthread_mutex_lock(&s_wake_mx);
+        while (s_wake_seq == seen && (w = ps3_cond_wait_monotonic(cv, &s_wake_mx, &budget)) == 0) {}
+        const int woken = s_wake_seq != seen;
+        seen = s_wake_seq;
+        pthread_mutex_unlock(&s_wake_mx);
+        if (w != 0 && w != ETIMEDOUT) { site_wait_failed("pthread_cond_timedwait", w); rc = -1; break; }
+        if (woken) site_pump();
+    }
+    atomic_fetch_sub_explicit(&s_wake_waiters, 1, memory_order_relaxed);
+    return rc;
+}
+#endif /* __APPLE__ */
+
+/* Sleeps to deadline_ns with the wake armed, then spins the last spin_ns. */
+static void site_sleep_until(uint64_t deadline_ns, uint64_t spin_ns)
+{
+    const uint64_t sleep_to = deadline_ns > spin_ns ? deadline_ns - spin_ns : 0;
+    if (wake_sleep_until(sleep_to) != 0) {
+        const uint64_t now = host_monotonic_ns();
+        if (now < sleep_to) ps3_host_sleep_ns(sleep_to - now);
+    }
+    spin_until_ns(deadline_ns);
+}
+
+/* The typed configuration is immutable once loaded: every thread stores the same values. State 0 = unread. */
+static atomic_int      s_seam_state;
+static atomic_uint_fast64_t s_seam_spin_ns;
+
+static int seam_enabled(void)
+{
+    int state = atomic_load_explicit(&s_seam_state, memory_order_acquire);
+    if (state) return state == 2;
+    const int on = ps3_cfg_ppu_poll_sleep_coalesce() ? 1 : 0;
+    atomic_store_explicit(&s_seam_spin_ns, (uint64_t)ps3_cfg_ppu_poll_sleep_spin_us() * 1000u, memory_order_relaxed);
+    if (on && ppu_gcm_set_wake_hook) ppu_gcm_set_wake_hook(usleep_wake);
+    atomic_store_explicit(&s_seam_state, on ? 2 : 1, memory_order_release);
+    return on;
+}
+
+/* One seam sleep at a time in the process (the contract of ps3_usleep_site_register): the interruptible wait is a
+ * single wake source that a second concurrent sleeper would either share unsafely or sit out of, deaf to the
+ * notifications the first one's wake is for. The title's limiter is one thread. A second caller that arrives while
+ * one sleeps, or one the delivered handler makes from inside the sleep, takes the ordinary usleep. The flag is
+ * taken before the deadline callback, so a callback only ever runs in the caller that may then sleep. */
+static atomic_flag s_site_busy = ATOMIC_FLAG_INIT;
+
+static int usleep_site_sleep_held(ppu_context* ctx, const usleep_site* site)
+{
+    const uint64_t deadline = site->deadline(ctx);
+    if (!deadline) return 0;
+    const uint64_t now = host_monotonic_ns();
+    if (deadline <= now) return 0;
+    if (deadline - now > site->max_sleep_ns) {
+        PS3_LOG_N(1, PS3_LOG_INFO, "usleep", "poll-sleep-bound: the site at lr=0x%08X asked for a deadline %llu us "
+                  "away, beyond its bound of %llu us; this call sleeps as usleep(%llu) does. Later calls are not "
+                  "reported.\n", site->lr, (unsigned long long)((deadline - now) / 1000u),
+                  (unsigned long long)(site->max_sleep_ns / 1000u), (unsigned long long)LV2_ARG_U64(ctx, 0));
+        return 0;
+    }
+    site_sleep_until(deadline, atomic_load_explicit(&s_seam_spin_ns, memory_order_relaxed));
+    atomic_fetch_add_explicit(&s_site_sleeps, 1, memory_order_relaxed);
+    return 1;
+}
+
+/* 1 when the call was a registered site's and was slept to its deadline. */
+static int usleep_site_sleep(ppu_context* ctx)
+{
+    const unsigned n = atomic_load_explicit(&s_site_count, memory_order_acquire);
+    const usleep_site* site = NULL;
+    for (unsigned i = 0; i < n; i++)
+        if (s_sites[i].lr == (uint32_t)ctx->lr) { site = &s_sites[i]; break; }
+    if (!site || !seam_enabled()) return 0;
+    if (atomic_flag_test_and_set_explicit(&s_site_busy, memory_order_acquire)) {
+        PS3_LOG_N(1, PS3_LOG_INFO, "usleep", "poll-sleep-contended: a second call at the site lr=0x%08X arrived while "
+                  "another seam sleep was running; it sleeps as usleep(%llu) does (the seam serves one caller at a "
+                  "time). Later calls are not reported.\n", site->lr, (unsigned long long)LV2_ARG_U64(ctx, 0));
+        return 0;
+    }
+    const int slept = usleep_site_sleep_held(ctx, site);
+    atomic_flag_clear_explicit(&s_site_busy, memory_order_release);
+    return slept;
+}
+#endif /* !_WIN32 */
+
 
 /* ---------------------------------------------------------------------------
  * sys_timer_usleep
@@ -350,6 +637,12 @@ int64_t sys_timer_usleep(ppu_context* ctx)
       if (_ps > 0 && usec == 1000) { _ps--;
         extern void ppu_log_host_chain(const char*);
         ppu_log_host_chain("usleep1ms"); } }
+
+#ifndef _WIN32
+    /* A registered poll site sleeps to its own deadline in one wait (ppu.poll_sleep_coalesce); anything the seam
+     * does not take falls through to the sleep below unchanged. */
+    if (usleep_site_sleep(ctx)) return CELL_OK;
+#endif
 
 #ifdef _WIN32
     /* Use high-resolution sleep via waitable timer for better precision */

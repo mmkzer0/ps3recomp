@@ -406,6 +406,23 @@ For `sys_time_get_current_time`:
 - Windows: `QueryPerformanceCounter` → convert to seconds/nanoseconds
 - POSIX: `clock_gettime(CLOCK_REALTIME, &ts)`
 
+### Usleep-site seam (`ppu.poll_sleep_coalesce`)
+
+A title whose limiter polls `usleep` against a deadline it can compute registers the poll's return address with
+`ps3_usleep_site_register(lr, max_sleep_ns, deadline_fn)` (`sys_timer.h`). With the option on, a `sys_timer_usleep`
+from that address sleeps once to the deadline the callback returns, on `host_monotonic_ns`, spinning the last
+`ppu.poll_sleep_spin_us`, instead of for the guest's own argument. The guest's loop, its exit test and its stores
+are untouched. A deadline of 0, one that has passed, or one beyond `max_sleep_ns` takes the ordinary path (the last
+logs `[usleep] poll-sleep-bound` once). While the seam sleeps, a pending GCM vblank, flip or user-command
+notification ends the wait early: `cellGcmSys.c` calls a waker (`ppu_gcm_set_wake_hook`) after publishing it, the
+sleeper runs `ppu_gcm_pump` on its own thread and sleeps on to the deadline (kqueue `EVFILT_USER` next to the
+`NOTE_CRITICAL` timer on macOS, a monotonic condition variable elsewhere). `gcm_user_handler_deliveries()` counts
+the user-handler calls the pump made. A pump that finds another thread's pump holding the delivery guard leaves its
+work to that pump, which re-notifies after it releases the guard if work is still pending (`gcm_pump_contended()`
+counts the failed attempts), so a woken sleeper is never left with undelivered work. The seam serves one sleeping
+call at a time in the process: a concurrent call, or one the delivered handler makes, takes the ordinary usleep and
+logs `[usleep] poll-sleep-contended` once. POSIX only: Windows keeps the poll because its guest clock has its own base.
+
 ---
 
 ## Memory Management (sys_memory)

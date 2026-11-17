@@ -633,6 +633,9 @@ static inline void ps3_ft_jq2_image(uint32_t index, uint64_t fp, uint32_t ea, ui
 
 /* sys_timer_usleep polls come tens of thousands a second; consecutive sleeps of
  * one thread from one call site within PS3_FTRACE_MERGE_US become one span.
+ * A call the usleep-site seam slept to a deadline (ppu.poll_sleep_coalesce) is one call here, so a seam site's
+ * span carries a = 1 or 2 where the polling loop's carried 350-400; tools/ftrace_report.py prints the mean calls
+ * per frame of each (thread, call site).
  * Only the sleeping thread touches its slot. */
 static inline void ps3_ft_usleep(uint32_t tid, uint32_t lr, uint64_t t0, uint64_t t1)
 {

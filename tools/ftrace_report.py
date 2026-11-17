@@ -477,6 +477,8 @@ def per_frame(spans, frames):
             o = overlap(t0, t1, frames[i][0], frames[i][1])
             if o > 0:
                 acc[i][key] += o
+                if k == USLEEP:   # `a` calls were merged into the span; a span over a frame edge shares them out
+                    acc[i][("calls",) + key] += a * o / (t1 - t0)
             i += 1
     return acc
 
@@ -488,12 +490,17 @@ def breakdown(acc, idx, names, name_of):
     for i in idx:
         for key, ms in acc[i].items():
             tot[key] += ms
+    calls = {(k[2], k[4]): v for k, v in tot.items() if k[0] == "calls"}
+    tot = {k: v for k, v in tot.items() if k[0] != "calls"}
     ppu = collections.defaultdict(list)
     hle = collections.defaultdict(list)
     spu, rsx = {}, {w: 0.0 for w in RSX_ROWS}
     for key, ms in tot.items():
         if key[0] == "ppu":
-            ppu[key[1]].append({"kind": key[2], "site": f"{key[3]:08X}", "ms": ms / n})
+            row = {"kind": key[2], "site": f"{key[3]:08X}", "ms": ms / n}
+            if key[2] == "usleep":   # mean usleep calls a frame at this site: the poll count the seam removes
+                row["calls_per_frame"] = calls.get((key[1], key[3]), 0.0) / n
+            ppu[key[1]].append(row)
         elif key[0] == "hle":
             hle[key[1]].append({"import": name_of(key[2]), "nid": f"{key[2]:08X}",
                                 "site": f"{key[3]:08X}", "ms": ms / n})
@@ -563,7 +570,9 @@ def print_breakdown(bd, title):
     print(f"\n{title} (mean over {bd['frames']} frames, ms):")
     print("  PPU threads (blocking syscalls and usleep polls, by kind and guest call site):")
     for r in bd["ppu_blocked"][:12]:
-        desc = ", ".join(f"{s['kind']}@{s['site']} {s['ms']:.1f}" for s in r["sites"][:4])
+        desc = ", ".join(f"{s['kind']}@{s['site']} {s['ms']:.1f}"
+                         + (f" ({s['calls_per_frame']:.1f} calls)" if "calls_per_frame" in s else "")
+                         for s in r["sites"][:4])
         print(f"    tid {r['tid']:3d} {r['name'][:28]:28s} blocked {r['ms']:5.1f}  ({desc})")
     print("  HLE imports (time inside, by thread, import and guest call site):")
     rows = [(s["ms"], r, s) for r in bd["hle"] for s in r["sites"]]
@@ -3000,7 +3009,10 @@ def build_report(header, names, spans, images, split=None, cad=(None, None), gap
     acc = per_frame(spans, frames)
     report = {"header": header,
               "frames": {"count": len(frames), "median_ms": statistics.median(durs),
-                         "min_ms": min(durs), "max_ms": max(durs)},
+                         "min_ms": min(durs), "max_ms": max(durs),
+                         # Nearest rank, an observed interval; over_18ms is a fraction of the intervals (0..1).
+                         "p95_ms": nearest_rank(sorted(durs), 95), "p99_ms": nearest_rank(sorted(durs), 99),
+                         "over_18ms": sum(1 for d in durs if d > 18.0) / len(durs)},
               "all": breakdown(acc, range(len(frames)), names, name_of)}
     if split is not None:
         fast = [i for i, d in enumerate(durs) if d < split]
@@ -3140,6 +3152,8 @@ def main():
     fr = report["frames"]
     print(f"{fr['count']} frames, median {fr['median_ms']:.1f} ms "
           f"({1000 / fr['median_ms']:.1f} fps), min {fr['min_ms']:.1f}, max {fr['max_ms']:.1f}")
+    print(f"  p95 {fr['p95_ms']:.2f} ms, p99 {fr['p99_ms']:.2f} ms, "
+          f"{100 * fr['over_18ms']:.2f} % of frames over 18 ms")
     print_breakdown(report["all"], "Per frame")
     if "split" in report:
         for part, rel in (("fast", "<"), ("slow", ">=")):
