@@ -44,3 +44,7 @@ with tempfile.TemporaryDirectory(prefix='ppu-host-stack-') as tmp:
             print(f'host: {os.uname().sysname} {os.uname().release} {os.uname().machine}; THP enabled: '
                   f'{thp.read_text().strip() if thp.exists() else "n/a"}', file=sys.stderr)
             raise SystemExit(1)
+        elif ci and run.stderr and '\nNOTE ' in '\n' + run.stderr:
+            # Not a failure, but the fixture saw something it cannot explain and kept the evidence for this log.
+            print(f'NOTE from fixture mode `{mode}`:', file=sys.stderr)
+            print(run.stderr, file=sys.stderr, end='')
