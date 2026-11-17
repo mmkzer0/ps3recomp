@@ -439,6 +439,45 @@ static void build_function_fixture(spu_xdiff_fixture* f)
     f->end.end_class = SPU_XDIFF_END_RETURN;
 }
 
+/* ---- the function unit with CODE ----------------------------------------- */
+
+#define CODE0_LS    (IMG_LS + 0x40u)
+#define CODE0_BYTES 0x20u
+#define CODE1_LS    (IMG_LS + 0x100u)
+#define CODE1_BYTES 0x40u
+#define DIRTY_LS    (IMG_LS + 0x200u) /* data the job wrote inside its own image span */
+
+/* The parent job's entry local store: its image span hashes to the fingerprint. */
+static uint8_t g_staged[SPU_XDIFF_LS_BYTES];
+
+static void code_ranges(spu_xdiff_code_range r[2])
+{
+    r[0].ls = CODE0_LS;
+    r[0].bytes = CODE0_BYTES;
+    r[1].ls = CODE1_LS;
+    r[1].bytes = CODE1_BYTES;
+}
+
+static uint64_t f_fingerprint_of(const uint8_t* encoded)
+{
+    return rd64(section_bytes((uint8_t*)encoded, SPU_XDIFF_SEC_IDENTITY, NULL));
+}
+
+/* build_function_fixture, entered after the job wrote data inside its image span: the staged store
+ * is what was built, the entry store has DIRTY_LS.. overwritten, and CODE names two ranges. */
+static void build_code_fixture(spu_xdiff_fixture* f)
+{
+    spu_xdiff_code_range r[2];
+    spu_xdiff_error err;
+    build_function_fixture(f);
+    memcpy(g_staged, f->ls0, SPU_XDIFF_LS_BYTES);
+    pattern(f->ls0 + DIRTY_LS, 0x80, 0x77);
+    memcpy(f->ls1, f->ls0, SPU_XDIFF_LS_BYTES);
+    f->ls1[0x2000] ^= 0x80;
+    code_ranges(r);
+    REQUIRE(spu_xdiff_fixture_set_code(f, r, 2, g_staged, &err) == 0, "set_code: %s", err.detail);
+}
+
 /* ---- comparisons -------------------------------------------------------- */
 
 static void compare_fixtures(const spu_xdiff_fixture* a, const spu_xdiff_fixture* b)
@@ -463,15 +502,20 @@ static void compare_fixtures(const spu_xdiff_fixture* a, const spu_xdiff_fixture
     REQUIRE(a->has_verdict == b->has_verdict, "VRDT presence differs");
     if (a->has_verdict)
         REQUIRE(memcmp(&a->verdict, &b->verdict, sizeof a->verdict) == 0, "VRDT differs");
+    REQUIRE(a->code.count == b->code.count &&
+                memcmp(&a->code, &b->code, sizeof a->code) == 0, "CODE differs");
+    REQUIRE(a->staged_bytes == b->staged_bytes &&
+                (a->staged_bytes == 0 || memcmp(a->staged, b->staged, a->staged_bytes) == 0),
+            "STAG differs");
 }
 
 /* The container as section 7.1 states it, parsed without the decoder. */
-static void check_container(const uint8_t* p, size_t n)
+static void check_container_v(const uint8_t* p, size_t n, uint32_t version)
 {
     spu_xdiff_file_header h;
     memcpy(&h, p, sizeof h);
     REQUIRE(memcmp(h.magic, "SPUJOB\r\n", 8) == 0, "magic");
-    REQUIRE(h.version == SPU_XDIFF_VERSION, "version %u", (unsigned)h.version);
+    REQUIRE(h.version == version, "version %u, want %u", (unsigned)h.version, (unsigned)version);
     REQUIRE(h.header_bytes == sizeof h, "header_bytes %u", (unsigned)h.header_bytes);
     REQUIRE(h.section_bytes == sizeof(spu_xdiff_section), "section_bytes %u",
             (unsigned)h.section_bytes);
@@ -511,6 +555,11 @@ static void check_container(const uint8_t* p, size_t n)
             REQUIRE(p[k] == 0, "padding at 0x%llx is not zero", (unsigned long long)k);
         if (s[i].bytes) at = s[i].offset + s[i].bytes;
     }
+}
+
+static void check_container(const uint8_t* p, size_t n)
+{
+    check_container_v(p, n, SPU_XDIFF_VERSION_V2);
 }
 
 /* ---- positive tests ----------------------------------------------------- */
@@ -849,6 +898,15 @@ static uint8_t* encode_full(size_t* n)
 {
     spu_xdiff_fixture f;
     build_full(&f, 1);
+    uint8_t* p = encode_of(&f, n);
+    spu_xdiff_fixture_free(&f);
+    return p;
+}
+
+static uint8_t* encode_code_fixture(size_t* n)
+{
+    spu_xdiff_fixture f;
+    build_code_fixture(&f);
     uint8_t* p = encode_of(&f, n);
     spu_xdiff_fixture_free(&f);
     return p;
@@ -1383,15 +1441,21 @@ static void test_mutation_sweep(int mutations)
     REQUIRE(spu_xdiff_fixture_encode(&function_fixture, &function_base, &function_bytes, &err) == 0,
             "function mutation encode: %s", err.detail);
     spu_xdiff_fixture_free(&function_fixture);
-    uint8_t* const mutation = (uint8_t*)malloc(job_bytes > function_bytes ? job_bytes : function_bytes);
+    size_t code_bytes = 0;
+    uint8_t* code_base = encode_code_fixture(&code_bytes);
+    size_t largest = job_bytes > function_bytes ? job_bytes : function_bytes;
+    if (code_bytes > largest) largest = code_bytes;
+    uint8_t* const mutation = (uint8_t*)malloc(largest);
     REQUIRE(mutation != NULL, "mutation buffer");
     uint32_t seed = 0x784F2D31u; /* fixed: the sweep is the same on every host */
     uint32_t accepted = 0, refused = 0;
     function_mask_mutations();
 
     for (int i = 0; i < mutations; i++) {
-        const uint8_t* base = (i & 1) ? function_base : job_base;
-        const size_t size = (i & 1) ? function_bytes : job_bytes;
+        const int use_function = i & 1;
+        const int use_code = use_function && (i & 2);
+        const uint8_t* base = use_code ? code_base : use_function ? function_base : job_base;
+        const size_t size = use_code ? code_bytes : use_function ? function_bytes : job_bytes;
         memcpy(mutation, base, size);
         seed ^= seed << 13;
         seed ^= seed >> 17;
@@ -1406,8 +1470,479 @@ static void test_mutation_sweep(int mutations)
     }
     free(mutation);
     free(function_base);
+    free(code_base);
     free(job_base);
     printf("ok %d mutations: %u decoded and re-encoded, %u refused\n", mutations, accepted, refused);
+}
+
+/* ---- CODE and STAG (docs/SPU_XDIFF.md 4 and 7.4) ------------------------- */
+
+typedef struct extra_section {
+    uint32_t       tag;
+    const uint8_t* data;
+    uint64_t       bytes;
+} extra_section;
+
+/* Rebuilds an encoded file with sections dropped and added, under `version`, with a valid
+ * container around them: the decoder's section rules are then what refuses it. */
+static uint8_t* retable(const uint8_t* p, size_t n, uint32_t version, uint32_t drop_a,
+                        uint32_t drop_b, const extra_section* extra, uint32_t extra_count,
+                        size_t* out_n)
+{
+    spu_xdiff_file_header h;
+    extra_section list[SPU_XDIFF_MAX_SECTIONS];
+    uint32_t count = 0;
+    memcpy(&h, p, sizeof h);
+    for (uint32_t i = 0; i < h.section_count; i++) {
+        const uint8_t* e = p + h.header_bytes + (size_t)i * h.section_bytes;
+        const uint32_t tag = rd32(e);
+        if (tag == drop_a || tag == drop_b) continue;
+        list[count].tag = tag;
+        list[count].data = p + rd64(e + 8);
+        list[count].bytes = rd64(e + 16);
+        count++;
+    }
+    for (uint32_t i = 0; i < extra_count; i++) list[count++] = extra[i];
+    REQUIRE(count <= SPU_XDIFF_MAX_SECTIONS, "retable: too many sections");
+    uint64_t cursor = (sizeof(spu_xdiff_file_header) + (uint64_t)count * sizeof(spu_xdiff_section) + 7u) & ~7ull;
+    uint64_t at[SPU_XDIFF_MAX_SECTIONS];
+    for (uint32_t i = 0; i < count; i++) {
+        at[i] = cursor;
+        cursor = (cursor + list[i].bytes + 7u) & ~7ull;
+    }
+    uint8_t* q = (uint8_t*)calloc(1, (size_t)cursor);
+    REQUIRE(q != NULL, "retable: calloc");
+    memcpy(q, p, sizeof h);
+    wr32(q + offsetof(spu_xdiff_file_header, version), version);
+    wr32(q + offsetof(spu_xdiff_file_header, section_count), count);
+    wr64(q + offsetof(spu_xdiff_file_header, file_bytes), cursor);
+    for (uint32_t i = 0; i < count; i++) {
+        uint8_t* e = q + sizeof(spu_xdiff_file_header) + (size_t)i * sizeof(spu_xdiff_section);
+        wr32(e, list[i].tag);
+        wr64(e + 8, at[i]);
+        wr64(e + 16, list[i].bytes);
+        memcpy(q + at[i], list[i].data, (size_t)list[i].bytes);
+    }
+    fix_checksum(q, (size_t)cursor);
+    (void)n;
+    *out_n = (size_t)cursor;
+    return q;
+}
+
+/* The byte of LS_0 that holds LS address `lsa` in an encoded file. */
+static uint8_t* ls0_byte(uint8_t* p, uint32_t lsa)
+{
+    uint64_t bytes = 0, at = 0;
+    uint8_t* s = section_bytes(p, SPU_XDIFF_SEC_LS0, &bytes);
+    while (at < bytes) {
+        const uint32_t start = rd32(s + at), len = rd32(s + at + 4);
+        if (lsa >= start && lsa - start < len) return s + at + 8 + (lsa - start);
+        at += 8 + (((uint64_t)len + 7u) & ~(uint64_t)7u);
+    }
+    REQUIRE(0, "LS_0 holds no byte at 0x%x", (unsigned)lsa);
+    return NULL;
+}
+
+static void test_code_roundtrip(void)
+{
+    spu_xdiff_fixture f, g;
+    spu_xdiff_error err;
+    uint8_t* bytes = NULL;
+    size_t n = 0;
+    uint64_t code_bytes = 0, stag_bytes = 0;
+
+    build_code_fixture(&f);
+    /* The job's own writes inside its image span: the whole-span hash no longer names the image. */
+    REQUIRE(fnv64(FNV64_BASIS, f.ls0 + IMG_LS, IMG_BYTES) != f.identity.image_fingerprint,
+            "the entry store was not dirtied");
+    REQUIRE(f.code.count == 2 && f.staged != NULL && f.staged_bytes == IMG_BYTES,
+            "set_code left count %u, staged %u bytes", (unsigned)f.code.count, (unsigned)f.staged_bytes);
+    bytes = encode_of(&f, &n);
+    check_container_v(bytes, n, SPU_XDIFF_VERSION);
+    (void)section_bytes(bytes, SPU_XDIFF_SEC_CODE, &code_bytes);
+    (void)section_bytes(bytes, SPU_XDIFF_SEC_STAGED, &stag_bytes);
+    REQUIRE(code_bytes == sizeof(spu_xdiff_code) && stag_bytes == IMG_BYTES,
+            "CODE is %llu bytes, STAG %llu", (unsigned long long)code_bytes,
+            (unsigned long long)stag_bytes);
+
+    REQUIRE(spu_xdiff_fixture_decode(bytes, n, &g, &err) == 0, "v3 function decode: %s", err.detail);
+    compare_fixtures(&f, &g);
+    REQUIRE(g.code.count == 2 && g.staged != NULL && g.staged_bytes == IMG_BYTES, "decoded CODE/STAG");
+    REQUIRE(memcmp(g.staged, g_staged + IMG_LS, IMG_BYTES) == 0, "STAG bytes differ from the staged image");
+    REQUIRE(g.ls0[DIRTY_LS] != g.staged[DIRTY_LS - IMG_LS],
+            "LS_0 outside the CODE ranges was expected to differ from the staged image");
+    {
+        uint8_t* again = NULL;
+        size_t again_n = 0;
+        REQUIRE(spu_xdiff_fixture_encode(&g, &again, &again_n, &err) == 0, "v3 re-encode: %s", err.detail);
+        REQUIRE(again_n == n && memcmp(again, bytes, n) == 0, "the v3 encoding is not stable");
+        free(again);
+    }
+    /* A version-2 reader refuses it by version, before it interprets a section. */
+    {
+        spu_xdiff_fixture old;
+        REQUIRE(spu_xdiff_fixture_decode_max_version(bytes, n, SPU_XDIFF_VERSION_V2, &old, &err) == -1,
+                "a version-2 reader accepted a version-3 fixture");
+        REQUIRE(err.reason == SPU_XDIFF_R_UNSUPPORTED_VERSION && strstr(err.detail, "version 3") != NULL,
+                "version-2 reader answered %s: %s", spu_xdiff_reason_id(err.reason), err.detail);
+    }
+    /* The staged store and the file are independent copies. */
+    spu_xdiff_fixture_clear(&f);
+    REQUIRE(f.staged == NULL && f.code.count == 0, "clear kept CODE/STAG");
+    free(bytes);
+    spu_xdiff_fixture_free(&f);
+    spu_xdiff_fixture_free(&g);
+    printf("ok v3 function unit with CODE roundtrip\n");
+}
+
+static void test_code_modified_refused(void)
+{
+    spu_xdiff_fixture f;
+    spu_xdiff_error err;
+    spu_xdiff_code_range r[2];
+    char want[32];
+
+    REQUIRE(SPU_XDIFF_R_UNIT_CODE_MODIFIED == 39 &&
+                strcmp(spu_xdiff_reason_id(SPU_XDIFF_R_UNIT_CODE_MODIFIED), "unit-code-modified") == 0 &&
+                spu_xdiff_reason_verdict(SPU_XDIFF_R_UNIT_CODE_MODIFIED) == (uint32_t)SPU_XDIFF_VOID,
+            "the reason's stable id, slug or verdict changed");
+    code_ranges(r);
+    build_function_fixture(&f);
+    memcpy(g_staged, f.ls0, SPU_XDIFF_LS_BYTES);
+
+    /* The first and the last byte of a range, then both ranges at once: the lowest address is named. */
+    static const uint32_t flips[][2] = {
+        { CODE0_LS, 0 }, { CODE0_LS + CODE0_BYTES - 1u, 0 }, { CODE1_LS, 0 },
+        { CODE1_LS + CODE1_BYTES - 1u, 0 }, { CODE1_LS + 8u, CODE0_LS + 4u },
+    };
+    for (size_t i = 0; i < sizeof flips / sizeof flips[0]; i++) {
+        const uint32_t first = flips[i][1] ? flips[i][1] : flips[i][0];
+        f.ls0[flips[i][0]] ^= 0x01;
+        if (flips[i][1]) f.ls0[flips[i][1]] ^= 0x10;
+        memset(&err, 0, sizeof err);
+        REQUIRE(spu_xdiff_fixture_set_code(&f, r, 2, g_staged, &err) == -1, "flip %zu was accepted", i);
+        REQUIRE(err.reason == SPU_XDIFF_R_UNIT_CODE_MODIFIED, "flip %zu answered %s: %s", i,
+                spu_xdiff_reason_id(err.reason), err.detail);
+        snprintf(want, sizeof want, "LS 0x%x ", (unsigned)first);
+        REQUIRE(strstr(err.detail, want) != NULL, "flip %zu: detail \"%s\" does not name 0x%x", i,
+                err.detail, (unsigned)first);
+        REQUIRE(f.code.count == 0 && f.staged == NULL, "a refused set_code changed the fixture");
+        f.ls0[flips[i][0]] ^= 0x01;
+        if (flips[i][1]) f.ls0[flips[i][1]] ^= 0x10;
+    }
+    /* A difference outside every range is the job's data, not its code. */
+    f.ls0[DIRTY_LS] ^= 0xFF;
+    REQUIRE(spu_xdiff_fixture_set_code(&f, r, 2, g_staged, &err) == 0, "data outside the ranges: %s",
+            err.detail);
+
+    /* The encoder holds the same line after the fact: the entry store drifting from STAG inside a
+     * range is refused, and a job unit never carries CODE. */
+    {
+        uint8_t* bytes = NULL;
+        size_t n = 0;
+        f.ls0[CODE1_LS + 4u] ^= 0x01;
+        REQUIRE(spu_xdiff_fixture_encode(&f, &bytes, &n, &err) == -1, "encode wrote a drifted fixture");
+        REQUIRE(err.reason == SPU_XDIFF_R_CAPTURE_LIMIT, "drifted encode answered %s",
+                spu_xdiff_reason_id(err.reason));
+        f.ls0[CODE1_LS + 4u] ^= 0x01;
+        f.unit.kind = SPU_XDIFF_UNIT_JOB;
+        f.unit.profile = SPU_XDIFF_PROFILE_JOBCHAIN;
+        REQUIRE(spu_xdiff_fixture_encode(&f, &bytes, &n, &err) == -1, "encode wrote CODE on a job unit");
+        REQUIRE(err.reason == SPU_XDIFF_R_CAPTURE_LIMIT, "job-with-CODE encode answered %s",
+                spu_xdiff_reason_id(err.reason));
+    }
+    spu_xdiff_fixture_free(&f);
+    printf("ok set_code refuses modified code at the first differing byte\n");
+}
+
+static void test_set_code_rejects_ranges(void)
+{
+    typedef struct { const char* name; uint32_t count; spu_xdiff_code_range r[17]; } rcase;
+    rcase cases[] = {
+        { "no ranges", 0, { { CODE0_LS, 4 } } },
+        { "empty range", 1, { { CODE0_LS, 0 } } },
+        { "unaligned start", 1, { { CODE0_LS + 2u, 8 } } },
+        { "unaligned length", 1, { { CODE0_LS, 6 } } },
+        { "unsorted", 2, { { CODE1_LS, CODE1_BYTES }, { CODE0_LS, CODE0_BYTES } } },
+        { "overlap", 2, { { CODE0_LS, 0x40 }, { CODE0_LS + 0x20u, 0x20 } } },
+        { "duplicate", 2, { { CODE0_LS, 8 }, { CODE0_LS, 8 } } },
+        { "before the image", 1, { { IMG_LS - 4u, 8 } } },
+        { "past the image", 1, { { IMG_LS + IMG_BYTES - 4u, 8 } } },
+        { "address wrap", 1, { { 0xFFFFFFFCu, 8 } } },
+        { "too many ranges", 17, { { IMG_LS, 4 } } },
+    };
+    for (uint32_t i = 0; i < 17; i++) { /* ascending and valid, so only the count is wrong */
+        cases[10].r[i].ls = IMG_LS + 8u * i;
+        cases[10].r[i].bytes = 4;
+    }
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        spu_xdiff_fixture f;
+        spu_xdiff_error err;
+        build_function_fixture(&f);
+        memcpy(g_staged, f.ls0, SPU_XDIFF_LS_BYTES);
+        memset(&err, 0, sizeof err);
+        REQUIRE(spu_xdiff_fixture_set_code(&f, cases[i].r, cases[i].count, g_staged, &err) == -1,
+                "%s: set_code accepted it", cases[i].name);
+        REQUIRE(err.reason == SPU_XDIFF_R_FIXTURE_FORMAT, "%s: answered %s: %s", cases[i].name,
+                spu_xdiff_reason_id(err.reason), err.detail);
+        REQUIRE(strstr(err.detail, "CODE") != NULL, "%s: detail \"%s\" does not name CODE",
+                cases[i].name, err.detail);
+        REQUIRE(f.code.count == 0 && f.staged == NULL, "%s: the fixture changed", cases[i].name);
+        spu_xdiff_fixture_free(&f);
+    }
+    /* The last word of the image and the full maximum count are fine. */
+    {
+        spu_xdiff_fixture f;
+        spu_xdiff_error err;
+        spu_xdiff_code_range last = { IMG_LS + IMG_BYTES - 4u, 4 };
+        build_function_fixture(&f);
+        memcpy(g_staged, f.ls0, SPU_XDIFF_LS_BYTES);
+        REQUIRE(spu_xdiff_fixture_set_code(&f, &last, 1, g_staged, &err) == 0, "last word: %s", err.detail);
+        REQUIRE(spu_xdiff_fixture_set_code(&f, cases[10].r, SPU_XDIFF_CODE_RANGES_MAX, g_staged, &err) == 0,
+                "maximum ranges: %s", err.detail);
+        REQUIRE(f.code.count == SPU_XDIFF_CODE_RANGES_MAX, "a second set_code did not replace the first");
+        spu_xdiff_fixture_free(&f);
+    }
+    /* A job unit has no CODE. */
+    {
+        spu_xdiff_fixture f;
+        spu_xdiff_error err;
+        spu_xdiff_code_range r[2];
+        code_ranges(r);
+        build_minimal(&f);
+        REQUIRE(spu_xdiff_fixture_set_code(&f, r, 2, f.ls0, &err) == -1 &&
+                    err.reason == SPU_XDIFF_R_FIXTURE_FORMAT,
+                "set_code on a job unit: %s", err.detail);
+        spu_xdiff_fixture_free(&f);
+    }
+    printf("ok set_code refuses %zu malformed range lists as fixture-format\n",
+           sizeof cases / sizeof cases[0]);
+}
+
+/* A v3 file `p` with the CODE field at byte `field` of the record set to `value`. */
+static uint8_t* with_code_u32(const uint8_t* base, size_t n, size_t field, uint32_t value)
+{
+    uint8_t* p = (uint8_t*)malloc(n);
+    REQUIRE(p != NULL, "malloc");
+    memcpy(p, base, n);
+    wr32(section_bytes(p, SPU_XDIFF_SEC_CODE, NULL) + field, value);
+    fix_checksum(p, n);
+    return p;
+}
+
+#define CODE_RANGE(i) (16u + 8u * (i)) /* offset of range i in the CODE record */
+
+static void test_code_decoder_rejects(void)
+{
+    size_t n = 0;
+    uint8_t* base = encode_code_fixture(&n);
+    uint8_t* p;
+
+    /* malformed CODE: fixture-format */
+    p = with_code_u32(base, n, 0, 0);
+    for (uint32_t i = 0; i < 2; i++) { /* no ranges at all, so only the count is wrong */
+        wr32(section_bytes(p, SPU_XDIFF_SEC_CODE, NULL) + CODE_RANGE(i), 0);
+        wr32(section_bytes(p, SPU_XDIFF_SEC_CODE, NULL) + CODE_RANGE(i) + 4, 0);
+    }
+    fix_checksum(p, n);
+    expect_reject("CODE count 0", p, n, SPU_XDIFF_R_FIXTURE_FORMAT, "CODE");
+    expect_reject("CODE count over the maximum", with_code_u32(base, n, 0, SPU_XDIFF_CODE_RANGES_MAX + 1u),
+                  n, SPU_XDIFF_R_FIXTURE_FORMAT, "CODE");
+    expect_reject("CODE ranges overlap", with_code_u32(base, n, CODE_RANGE(1), CODE0_LS + 4u), n,
+                  SPU_XDIFF_R_FIXTURE_FORMAT, "CODE");
+    expect_reject("CODE range unaligned", with_code_u32(base, n, CODE_RANGE(0), CODE0_LS + 2u), n,
+                  SPU_XDIFF_R_FIXTURE_FORMAT, "CODE");
+    expect_reject("CODE range before the image", with_code_u32(base, n, CODE_RANGE(0), IMG_LS - 4u), n,
+                  SPU_XDIFF_R_FIXTURE_FORMAT, "CODE");
+    expect_reject("CODE range past the image",
+                  with_code_u32(base, n, CODE_RANGE(1), IMG_LS + IMG_BYTES - 0x20u), n,
+                  SPU_XDIFF_R_FIXTURE_FORMAT, "CODE");
+    expect_reject("CODE range empty", with_code_u32(base, n, CODE_RANGE(1) + 4, 0), n,
+                  SPU_XDIFF_R_FIXTURE_FORMAT, "CODE");
+    expect_reject("CODE reserved", with_code_u32(base, n, 4, 1), n, SPU_XDIFF_R_FIXTURE_FORMAT, "CODE");
+    expect_reject("CODE reserved2 (the dropped fingerprint)", with_code_u32(base, n, 8, 1), n,
+                  SPU_XDIFF_R_FIXTURE_FORMAT, "CODE");
+    expect_reject("CODE unused range", with_code_u32(base, n, CODE_RANGE(5), 4), n,
+                  SPU_XDIFF_R_FIXTURE_FORMAT, "CODE");
+
+    /* STAG of another length than the image */
+    p = (uint8_t*)malloc(n);
+    REQUIRE(p != NULL, "malloc");
+    memcpy(p, base, n);
+    wr64(section_entry(p, SPU_XDIFF_SEC_STAGED) + 16, IMG_BYTES - 8u);
+    fix_checksum(p, n);
+    expect_reject("STAG shorter than the image", p, n, SPU_XDIFF_R_FIXTURE_FORMAT, "STAG");
+
+    /* the sections' presence against the version and the unit kind */
+    {
+        size_t m = 0;
+        size_t fn = 0;
+        spu_xdiff_fixture fx;
+        extra_section both[2];
+        uint8_t zeros[IMG_BYTES];
+        uint8_t code_record[sizeof(spu_xdiff_code)];
+        uint64_t cb = 0;
+        memcpy(code_record, section_bytes(base, SPU_XDIFF_SEC_CODE, &cb), sizeof code_record);
+        memset(zeros, 0, sizeof zeros);
+        both[0].tag = SPU_XDIFF_SEC_CODE;
+        both[0].data = code_record;
+        both[0].bytes = sizeof code_record;
+        both[1].tag = SPU_XDIFF_SEC_STAGED;
+        both[1].data = zeros;
+        both[1].bytes = sizeof zeros;
+
+        expect_reject("CODE without STAG",
+                      retable(base, n, SPU_XDIFF_VERSION, SPU_XDIFF_SEC_STAGED, 0, NULL, 0, &m), m,
+                      SPU_XDIFF_R_FIXTURE_FORMAT, "STAG");
+        expect_reject("STAG without CODE",
+                      retable(base, n, SPU_XDIFF_VERSION, SPU_XDIFF_SEC_CODE, 0, NULL, 0, &m), m,
+                      SPU_XDIFF_R_FIXTURE_FORMAT, "CODE");
+
+        build_function_fixture(&fx);
+        uint8_t* v2fn = encode_of(&fx, &fn);
+        expect_reject("v3 function unit without CODE",
+                      retable(v2fn, fn, SPU_XDIFF_VERSION, 0, 0, NULL, 0, &m), m,
+                      SPU_XDIFF_R_FIXTURE_FORMAT, "CODE");
+        expect_reject("v2 function unit with CODE",
+                      retable(v2fn, fn, SPU_XDIFF_VERSION_V2, 0, 0, both, 2, &m), m,
+                      SPU_XDIFF_R_UNSUPPORTED_VERSION, "CODE");
+        free(v2fn);
+        spu_xdiff_fixture_free(&fx);
+
+        build_minimal(&fx);
+        uint8_t* job = encode_of(&fx, &fn);
+        expect_reject("CODE on a job unit", retable(job, fn, SPU_XDIFF_VERSION, 0, 0, both, 2, &m), m,
+                      SPU_XDIFF_R_FIXTURE_FORMAT, "CODE");
+        expect_reject("STAG on a job unit", retable(job, fn, SPU_XDIFF_VERSION, 0, 0, both + 1, 1, &m), m,
+                      SPU_XDIFF_R_FIXTURE_FORMAT, "STAG");
+        /* a v3 job fixture without CODE is a job fixture: it keeps the whole-span check */
+        {
+            spu_xdiff_fixture g;
+            spu_xdiff_error err;
+            uint8_t* v3job = retable(job, fn, SPU_XDIFF_VERSION, 0, 0, NULL, 0, &m);
+            REQUIRE(spu_xdiff_fixture_decode(v3job, m, &g, &err) == 0, "v3 job without CODE: %s", err.detail);
+            spu_xdiff_fixture_free(&g);
+            free(v3job);
+        }
+        free(job);
+        spu_xdiff_fixture_free(&fx);
+    }
+
+    /* identity: well-formed, but it does not name this image or these bytes */
+    {
+        uint64_t sb = 0;
+        p = (uint8_t*)malloc(n);
+        REQUIRE(p != NULL, "malloc");
+        memcpy(p, base, n);
+        section_bytes(p, SPU_XDIFF_SEC_STAGED, &sb)[DIRTY_LS - IMG_LS] ^= 0x40;
+        fix_checksum(p, n);
+        expect_reject("STAG does not hash to the fingerprint", p, n, SPU_XDIFF_R_FIXTURE_IDENTITY, "STAG");
+
+        p = (uint8_t*)malloc(n);
+        REQUIRE(p != NULL, "malloc");
+        memcpy(p, base, n);
+        wr64(section_bytes(p, SPU_XDIFF_SEC_IDENTITY, NULL), f_fingerprint_of(base) ^ 1u);
+        fix_checksum(p, n);
+        expect_reject("fingerprint of another image", p, n, SPU_XDIFF_R_FIXTURE_IDENTITY, "STAG");
+
+        p = (uint8_t*)malloc(n);
+        REQUIRE(p != NULL, "malloc");
+        memcpy(p, base, n);
+        *ls0_byte(p, CODE0_LS + 4u) ^= 0x08;
+        fix_checksum(p, n);
+        expect_reject("LS_0 differs from STAG in a range", p, n, SPU_XDIFF_R_FIXTURE_IDENTITY, "0x1044");
+
+        /* and outside the ranges it is allowed to differ: this is the v3 point */
+        p = (uint8_t*)malloc(n);
+        REQUIRE(p != NULL, "malloc");
+        memcpy(p, base, n);
+        *ls0_byte(p, DIRTY_LS + 4u) ^= 0x08;
+        fix_checksum(p, n);
+        {
+            spu_xdiff_fixture g;
+            spu_xdiff_error err;
+            REQUIRE(spu_xdiff_fixture_decode(p, n, &g, &err) == 0,
+                    "data outside the CODE ranges must not matter: %s", err.detail);
+            spu_xdiff_fixture_free(&g);
+            free(p);
+        }
+    }
+    free(base);
+    printf("ok v3 decoder refusals\n");
+}
+
+/* Version-2 fixtures (everything without CODE) are written exactly as before: the version is 2, no
+ * CODE or STAG exists, and decode then encode is the identity on the bytes. The checksums pin the
+ * bytes of the three synthetic fixtures as the version-2 writer produced them before version 3. */
+static void test_v2_bytes_unchanged(void)
+{
+    spu_xdiff_fixture f[3], g;
+    spu_xdiff_error err;
+    /* build_minimal, build_full(1) and build_function_fixture as the writer before version 3 encoded them */
+    static const uint64_t golden[3] = { 0xE1672A53078250A8ULL, 0xCB7A94A3BE51DB18ULL, 0x0B51BDB57067AE83ULL };
+    build_minimal(&f[0]);
+    build_full(&f[1], 1);
+    build_function_fixture(&f[2]);
+    for (int i = 0; i < 3; i++) {
+        size_t n = 0;
+        uint8_t* bytes = encode_of(&f[i], &n);
+        check_container_v(bytes, n, SPU_XDIFF_VERSION_V2);
+        REQUIRE(section_entry(bytes, SPU_XDIFF_SEC_CODE) == NULL &&
+                    section_entry(bytes, SPU_XDIFF_SEC_STAGED) == NULL,
+                "fixture %d: a fixture without CODE grew a CODE or STAG section", i);
+        REQUIRE(rd64(bytes + HDR_CHECKSUM) == golden[i],
+                "fixture %d: checksum 0x%016llx, version 2 wrote 0x%016llx", i,
+                (unsigned long long)rd64(bytes + HDR_CHECKSUM), (unsigned long long)golden[i]);
+        REQUIRE(spu_xdiff_fixture_decode(bytes, n, &g, &err) == 0, "fixture %d decode: %s", i, err.detail);
+        REQUIRE(g.code.count == 0 && g.staged == NULL, "fixture %d decoded with CODE", i);
+        uint8_t* again = NULL;
+        size_t again_n = 0;
+        REQUIRE(spu_xdiff_fixture_encode(&g, &again, &again_n, &err) == 0, "fixture %d re-encode: %s", i,
+                err.detail);
+        REQUIRE(again_n == n && memcmp(again, bytes, n) == 0, "fixture %d: decode then encode changed bytes", i);
+        free(again);
+        free(bytes);
+        spu_xdiff_fixture_free(&g);
+        spu_xdiff_fixture_free(&f[i]);
+    }
+    printf("ok version-2 fixtures keep their bytes\n");
+}
+
+/* spu_xdiff_fixture_check_identity is the decoder's rule for a fixture held in memory. */
+static void test_check_identity_in_memory(void)
+{
+    spu_xdiff_fixture f;
+    spu_xdiff_error err;
+
+    build_code_fixture(&f);
+    REQUIRE(spu_xdiff_fixture_check_identity(&f, &err) == 0, "a captured CODE fixture: %s", err.detail);
+    f.ls0[CODE1_LS + 8u] ^= 1;
+    REQUIRE(spu_xdiff_fixture_check_identity(&f, &err) == -1 && err.reason == SPU_XDIFF_R_FIXTURE_IDENTITY &&
+                strstr(err.detail, "0x1108") != NULL,
+            "drifted code: %s %s", spu_xdiff_reason_id(err.reason), err.detail);
+    f.ls0[CODE1_LS + 8u] ^= 1;
+    f.staged[0] ^= 1;
+    REQUIRE(spu_xdiff_fixture_check_identity(&f, &err) == -1 && err.reason == SPU_XDIFF_R_FIXTURE_IDENTITY,
+            "STAG that does not hash: %s", spu_xdiff_reason_id(err.reason));
+    f.staged[0] ^= 1;
+    f.code.range[1].ls = f.code.range[0].ls;
+    REQUIRE(spu_xdiff_fixture_check_identity(&f, &err) == -1 && err.reason == SPU_XDIFF_R_FIXTURE_FORMAT,
+            "overlapping ranges: %s", spu_xdiff_reason_id(err.reason));
+    spu_xdiff_fixture_free(&f);
+
+    /* Without CODE the whole span is hashed, and a stray STAG is malformed. */
+    build_function_fixture(&f);
+    REQUIRE(spu_xdiff_fixture_check_identity(&f, &err) == 0, "whole-span fixture: %s", err.detail);
+    f.ls0[IMG_LS + 0x200u] ^= 1;
+    REQUIRE(spu_xdiff_fixture_check_identity(&f, &err) == -1 && err.reason == SPU_XDIFF_R_FIXTURE_IDENTITY,
+            "whole-span drift: %s", spu_xdiff_reason_id(err.reason));
+    f.ls0[IMG_LS + 0x200u] ^= 1;
+    f.staged = (uint8_t*)calloc(1, IMG_BYTES);
+    f.staged_bytes = IMG_BYTES;
+    REQUIRE(spu_xdiff_fixture_check_identity(&f, &err) == -1 && err.reason == SPU_XDIFF_R_FIXTURE_FORMAT,
+            "STAG without CODE: %s", spu_xdiff_reason_id(err.reason));
+    spu_xdiff_fixture_free(&f);
+    printf("ok in-memory identity check\n");
 }
 
 /* ---- main --------------------------------------------------------------- */
@@ -1429,6 +1964,12 @@ int main(int argc, char** argv)
     test_rejects();
     test_synthesized_header_bounds();
     test_truncations();
+    test_code_roundtrip();
+    test_code_modified_refused();
+    test_set_code_rejects_ranges();
+    test_code_decoder_rejects();
+    test_v2_bytes_unchanged();
+    test_check_identity_in_memory();
     test_mutation_sweep(argc > 1 ? atoi(argv[1]) : 1000);
     printf("PASS test_spu_xdiff_fixture\n");
     return 0;

@@ -183,7 +183,7 @@ XDIFF_REASONS = {
     25: ("differ", "epoch-writes"),
     32: ("void", "budget"), 33: ("void", "unsupported-effect"), 34: ("void", "uncovered-read"),
     35: ("void", "unlifted-branch"), 36: ("void", "host-fault"), 37: ("void", "depth-guard"),
-    38: ("void", "capture-limit"),
+    38: ("void", "capture-limit"), 39: ("void", "unit-code-modified"),
     48: ("malformed", "fixture-format"), 49: ("malformed", "fixture-identity"),
     50: ("malformed", "not-comparable"),
     64: ("not-found", "no-fixture"), 65: ("not-found", "no-body")}

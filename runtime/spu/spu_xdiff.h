@@ -157,6 +157,10 @@ typedef enum spu_xdiff_verdict {
     X(HOST_FAULT,        36, "host-fault",         VOID)                                            \
     /* The authority exceeded the bounded live capture buffer; the comparison was not attempted. */ \
     X(CAPTURE_LIMIT,    38, "capture-limit",     VOID)                                            \
+    /* A function unit's member code differs between the parent job's staged image and the unit's entry */ \
+    /* state: the fixture would not replay the code an override replaces. A capture refusal; no */         \
+    /* comparison was attempted. */                                                                      \
+    X(UNIT_CODE_MODIFIED, 39, "unit-code-modified", VOID)                                           \
     X(FIXTURE_FORMAT,    48, "fixture-format",     MALFORMED)                                       \
     /* The file is well-formed but this reader does not implement its version. */                    \
     X(UNSUPPORTED_VERSION, 51, "unsupported-version", MALFORMED)                                     \
@@ -305,14 +309,18 @@ typedef struct spu_xdiff_effect {
 } spu_xdiff_effect;
 static_assert(sizeof(spu_xdiff_effect) == 40, "spu_xdiff_effect is a file record");
 
-/* ---- fixture: ps3recomp.spujob/2 ------------------------------------------
+/* ---- fixture: ps3recomp.spujob/3 ------------------------------------------
  *
- * The reader accepts version-1 job fixtures and version-2 job or function
- * fixtures. Writers emit version 2. */
+ * The reader accepts version-1 job fixtures, version-2 job or function
+ * fixtures and version-3 function fixtures with a CODE section. A writer emits
+ * version 3 only for a function unit that carries CODE and version 2 for
+ * everything else, so a fixture without CODE stays byte-identical. */
 #define SPU_XDIFF_SCHEMA_V1 "ps3recomp.spujob/1"
-#define SPU_XDIFF_SCHEMA    "ps3recomp.spujob/2"
+#define SPU_XDIFF_SCHEMA_V2 "ps3recomp.spujob/2"
+#define SPU_XDIFF_SCHEMA    "ps3recomp.spujob/3"
 #define SPU_XDIFF_VERSION_V1 1u
-#define SPU_XDIFF_VERSION  2u
+#define SPU_XDIFF_VERSION_V2 2u
+#define SPU_XDIFF_VERSION  3u
 #define SPU_XDIFF_MAGIC   "SPUJOB\r\n"
 
 /* Bounds a reader enforces before it trusts a count or an offset; a fixture
@@ -366,6 +374,31 @@ static_assert(sizeof(spu_xdiff_section) == 24, "spu_xdiff_section is a file reco
 /* Optional, at most once: the verdict that made the runtime write this
  * fixture. A reader that replays ignores it. */
 #define SPU_XDIFF_SEC_VERDICT  SPU_XDIFF_FOURCC('V', 'R', 'D', 'T') /* spu_xdiff_verdict_record */
+/* Version 3, function units only, both or neither: the LS ranges the unit executes as code, and the
+ * parent job's staged image bytes, so a reader can tie the entry store to the image the identity names
+ * without the whole-span self-hash that the job's own data writes defeat. */
+#define SPU_XDIFF_SEC_CODE     SPU_XDIFF_FOURCC('C', 'O', 'D', 'E') /* spu_xdiff_code */
+#define SPU_XDIFF_SEC_STAGED   SPU_XDIFF_FOURCC('S', 'T', 'A', 'G') /* unit.image_bytes staged image bytes */
+#define SPU_XDIFF_CODE_RANGES_MAX 16u
+
+/* One LS range executed as code, 4-byte aligned. */
+typedef struct spu_xdiff_code_range {
+    uint32_t ls;
+    uint32_t bytes;
+} spu_xdiff_code_range;
+static_assert(sizeof(spu_xdiff_code_range) == 8, "spu_xdiff_code_range is a file record");
+
+/* Section CODE (FUNCTION units, v3): the LS ranges executed as code by the unit (an override unit's
+ * members), each inside [unit.image_ls, +unit.image_bytes), sorted and not overlapping. A reader
+ * requires LS_0 to equal STAG on every range: a T2 native override replaces only those bytes, so
+ * they, and not the data a job wrote around them, are the unit's identity. `reserved2` is 0. */
+typedef struct spu_xdiff_code {
+    uint32_t count;     /* 1..SPU_XDIFF_CODE_RANGES_MAX in a file; 0 in memory: absent */
+    uint32_t reserved;  /* 0 */
+    uint64_t reserved2; /* 0 */
+    spu_xdiff_code_range range[SPU_XDIFF_CODE_RANGES_MAX];
+} spu_xdiff_code;
+static_assert(sizeof(spu_xdiff_code) == 144, "spu_xdiff_code is a file record");
 
 /* Which body ran one side of a comparison. */
 typedef struct spu_xdiff_body_id {
@@ -400,7 +433,10 @@ typedef enum spu_xdiff_host_arch {
  * identity: one address holds different jobs over time, and one image is
  * staged from several EAs. The identity is the fingerprint of the bytes as
  * they were staged, which are bytes [unit.image_ls, +unit.image_bytes) of the
- * entry local store; a reader recomputes it and rejects a mismatch. */
+ * entry local store; a reader recomputes it and rejects a mismatch. A v3 function unit with CODE
+ * is the exception: a job writes data inside its own image span before the function is entered, so
+ * the entry store no longer hashes to the fingerprint. Its STAG section holds the staged bytes
+ * (which do hash to it) and LS_0 must agree with STAG on the CODE ranges. */
 typedef struct spu_xdiff_identity {
     uint64_t image_fingerprint;  /* spu_workload_fingerprint (FNV-1a-64) over the staged image */
     spu_xdiff_body_id authority; /* the body whose run this is */

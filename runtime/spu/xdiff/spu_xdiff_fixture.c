@@ -56,7 +56,7 @@ static_assert(SPU_XDIFF_REG_BYTES == sizeof(((spu_context*)0)->gpr),
 
 enum {
     SEC_IDEN = 0, SEC_UNIT, SEC_REG0, SEC_LS0, SEC_EFCT, SEC_BLOB,
-    SEC_REG1, SEC_LS1, SEC_END, SEC_FMASK, SEC_VRDT, SEC_KINDS
+    SEC_REG1, SEC_LS1, SEC_END, SEC_FMASK, SEC_VRDT, SEC_CODE, SEC_STAG, SEC_KINDS
 };
 
 typedef struct section_kind {
@@ -76,6 +76,8 @@ static const section_kind s_kind[SEC_KINDS] = {
     { SPU_XDIFF_SEC_END,      "END_" },
     { SPU_XDIFF_SEC_FMASK,    "FMAS" },
     { SPU_XDIFF_SEC_VERDICT,  "VRDT" },
+    { SPU_XDIFF_SEC_CODE,     "CODE" },
+    { SPU_XDIFF_SEC_STAGED,   "STAG" },
 };
 
 static int section_kind_of(uint32_t tag)
@@ -507,6 +509,58 @@ static int check_function_mask(const uint8_t* p, const spu_xdiff_unit* unit,
     return 0;
 }
 
+/* The ranges of CODE (section 7.4): what an override replaces. They must lie in the staged image
+ * (which is what STAG holds), word-aligned, ascending and disjoint, so a reader can compare each
+ * against the staged bytes without a bounds question. `ranges` has `count` entries. */
+static int validate_code_ranges(const spu_xdiff_code_range* ranges, uint32_t count,
+                                const spu_xdiff_unit* unit, spu_xdiff_error* err)
+{
+    if (count == 0 || count > SPU_XDIFF_CODE_RANGES_MAX)
+        return fail(err, SPU_XDIFF_R_FIXTURE_FORMAT,
+                    "CODE: %u ranges, a unit has 1..%u", (unsigned)count,
+                    (unsigned)SPU_XDIFF_CODE_RANGES_MAX);
+    const uint64_t span_end = (uint64_t)unit->image_ls + unit->image_bytes;
+    if (span_end > SPU_XDIFF_LS_BYTES)
+        return fail(err, SPU_XDIFF_R_FIXTURE_FORMAT,
+                    "UNIT: image at LS 0x%x + %u bytes is outside local store",
+                    (unsigned)unit->image_ls, unit->image_bytes);
+    uint64_t prev_end = unit->image_ls;
+    for (uint32_t i = 0; i < count; i++) {
+        const uint64_t at = ranges[i].ls, len = ranges[i].bytes;
+        if (len == 0)
+            return fail(err, SPU_XDIFF_R_FIXTURE_FORMAT, "CODE: range %u is empty", (unsigned)i);
+        if ((at & 3u) || (len & 3u))
+            return fail(err, SPU_XDIFF_R_FIXTURE_FORMAT,
+                        "CODE: range %u [0x%x, +%u) is not 4-byte aligned", (unsigned)i,
+                        (unsigned)ranges[i].ls, (unsigned)ranges[i].bytes);
+        if (at < prev_end)
+            return fail(err, SPU_XDIFF_R_FIXTURE_FORMAT,
+                        "CODE: range %u at LS 0x%x starts before 0x%llx (the previous range's end, "
+                        "or the image start): ranges are ascending, disjoint and inside the image",
+                        (unsigned)i, (unsigned)ranges[i].ls, (unsigned long long)prev_end);
+        if (at + len > span_end)
+            return fail(err, SPU_XDIFF_R_FIXTURE_FORMAT,
+                        "CODE: range %u [0x%x, +%u) runs past the image's end 0x%llx", (unsigned)i,
+                        (unsigned)ranges[i].ls, (unsigned)ranges[i].bytes,
+                        (unsigned long long)span_end);
+        prev_end = at + len;
+    }
+    return 0;
+}
+
+/* The CODE record as a file holds it: the ranges, and every unused field zero. */
+static int check_code(const spu_xdiff_code* c, const spu_xdiff_unit* unit, spu_xdiff_error* err)
+{
+    if (c->reserved || c->reserved2)
+        return fail(err, SPU_XDIFF_R_FIXTURE_FORMAT, "CODE: a reserved field is not 0");
+    if (c->count <= SPU_XDIFF_CODE_RANGES_MAX)
+        for (uint32_t i = c->count; i < SPU_XDIFF_CODE_RANGES_MAX; i++)
+            if (c->range[i].ls || c->range[i].bytes)
+                return fail(err, SPU_XDIFF_R_FIXTURE_FORMAT,
+                            "CODE: unused range %u is not zero", (unsigned)i);
+    return validate_code_ranges(c->range, c->count, unit, err);
+}
+
 /* END_'s class is what a comparison holds the subject to (section 7.6), so a
  * class outside the vocabulary is a recording that never classified its end. */
 static int check_end(const uint8_t* p, spu_xdiff_error* err)
@@ -562,7 +616,8 @@ static int parse_file(const uint8_t* bytes, size_t n, uint32_t reader_version,
     if (memcmp(h.magic, SPU_XDIFF_MAGIC, sizeof h.magic) != 0)
         return fail(err, SPU_XDIFF_R_FIXTURE_FORMAT,
                     "header: magic is not \"SPUJOB\\r\\n\"");
-    if ((h.version != SPU_XDIFF_VERSION_V1 && h.version != SPU_XDIFF_VERSION) ||
+    if ((h.version != SPU_XDIFF_VERSION_V1 && h.version != SPU_XDIFF_VERSION_V2 &&
+         h.version != SPU_XDIFF_VERSION) ||
         h.version > reader_version)
         return fail(err, SPU_XDIFF_R_UNSUPPORTED_VERSION,
                     "header: version %u is not supported by reader version %u",
@@ -635,7 +690,8 @@ static int parse_file(const uint8_t* bytes, size_t n, uint32_t reader_version,
     }
 
     for (int k = 0; k < SEC_KINDS; k++)
-        if (k != SEC_VRDT && k != SEC_FMASK && !lay->part[k].present)
+        if (k != SEC_VRDT && k != SEC_FMASK && k != SEC_CODE && k != SEC_STAG &&
+            !lay->part[k].present)
             return fail(err, SPU_XDIFF_R_FIXTURE_FORMAT,
                         "%s: required section is missing", s_kind[k].name);
 
@@ -649,6 +705,7 @@ static int parse_file(const uint8_t* bytes, size_t n, uint32_t reader_version,
             { SEC_REG1, SPU_XDIFF_REG_BYTES },
             { SEC_END,  sizeof(spu_xdiff_end) },
             { SEC_FMASK, sizeof(spu_xdiff_function_mask) },
+            { SEC_CODE, sizeof(spu_xdiff_code) },
             { SEC_VRDT, sizeof(spu_xdiff_verdict_record) },
         };
         for (size_t i = 0; i < sizeof fixed / sizeof fixed[0]; i++) {
@@ -740,6 +797,35 @@ static int parse_file(const uint8_t* bytes, size_t n, uint32_t reader_version,
             return fail(err, SPU_XDIFF_R_FIXTURE_FORMAT,
                         "FMAS: present for a non-function unit");
         }
+        if (h.version < SPU_XDIFF_VERSION &&
+            (lay->part[SEC_CODE].present || lay->part[SEC_STAG].present))
+            return fail(err, SPU_XDIFF_R_UNSUPPORTED_VERSION,
+                        "header: version %u does not define CODE or STAG", (unsigned)h.version);
+        if (unit.kind == (uint32_t)SPU_XDIFF_UNIT_FUNCTION) {
+            /* A version-3 function unit is identified by CODE and STAG (section 4): without them
+             * the writer would have emitted version 2, so the header and the sections disagree. */
+            if (h.version == SPU_XDIFF_VERSION &&
+                (!lay->part[SEC_CODE].present || !lay->part[SEC_STAG].present))
+                return fail(err, SPU_XDIFF_R_FIXTURE_FORMAT,
+                            "%s: required for a version-3 function unit",
+                            lay->part[SEC_CODE].present ? "STAG" : "CODE");
+        }
+        if (lay->part[SEC_CODE].present != lay->part[SEC_STAG].present)
+            return fail(err, SPU_XDIFF_R_FIXTURE_FORMAT, "%s: present without %s",
+                        lay->part[SEC_CODE].present ? "CODE" : "STAG",
+                        lay->part[SEC_CODE].present ? "STAG" : "CODE");
+        if (lay->part[SEC_CODE].present) {
+            spu_xdiff_code code;
+            if (unit.kind != (uint32_t)SPU_XDIFF_UNIT_FUNCTION)
+                return fail(err, SPU_XDIFF_R_FIXTURE_FORMAT,
+                            "CODE: present for a non-function unit");
+            memcpy(&code, bytes + lay->part[SEC_CODE].offset, sizeof code);
+            if (check_code(&code, &unit, err)) return -1;
+            if (lay->part[SEC_STAG].bytes != unit.image_bytes)
+                return fail(err, SPU_XDIFF_R_FIXTURE_FORMAT,
+                            "STAG: %llu bytes, UNIT.image_bytes is %u",
+                            (unsigned long long)lay->part[SEC_STAG].bytes, unit.image_bytes);
+        }
         if (check_end(bytes + lay->part[SEC_END].offset, err)) return -1;
         if (walk_extents("LS_0", bytes + ls0->offset, ls0->bytes, NULL, err)) return -1;
         if (walk_extents("LS_1", bytes + ls1->offset, ls1->bytes, NULL, err)) return -1;
@@ -796,6 +882,34 @@ static int check_identity(const uint8_t* ls, const spu_xdiff_unit* unit,
                     "0x%016llx",
                     (unsigned long long)id->image_fingerprint, unit->image_bytes,
                     (unsigned)unit->image_ls, (unsigned long long)got);
+    return 0;
+}
+
+/* The identity of a version-3 function unit with CODE. A job writes data inside its own image span
+ * before the function is entered, so LS_0 no longer hashes to the fingerprint over the whole span.
+ * STAG holds the staged bytes, which do; LS_0 then has to agree with them wherever the unit runs
+ * code. Both comparisons are exact, so there is one truth about what the code was. `code` has been
+ * through check_code, `staged` holds unit->image_bytes. */
+static int check_staged_identity(const uint8_t* ls0, const uint8_t* staged, const spu_xdiff_code* code,
+                                 const spu_xdiff_unit* unit, const spu_xdiff_identity* id,
+                                 spu_xdiff_error* err)
+{
+    const uint64_t got = fnv1a64(FNV64_BASIS, staged, unit->image_bytes);
+    if (got != id->image_fingerprint)
+        return fail(err, SPU_XDIFF_R_FIXTURE_IDENTITY,
+                    "IDEN: image fingerprint is 0x%016llx, the %u STAG bytes hash to 0x%016llx",
+                    (unsigned long long)id->image_fingerprint, unit->image_bytes,
+                    (unsigned long long)got);
+    for (uint32_t i = 0; i < code->count; i++) {
+        const uint32_t at = code->range[i].ls, len = code->range[i].bytes;
+        const uint8_t* want = staged + (at - unit->image_ls);
+        for (uint32_t k = 0; k < len; k++)
+            if (ls0[at + k] != want[k])
+                return fail(err, SPU_XDIFF_R_FIXTURE_IDENTITY,
+                            "CODE: range %u: LS_0 at 0x%x is 0x%02x, the staged image has 0x%02x",
+                            (unsigned)i, (unsigned)(at + k), (unsigned)ls0[at + k],
+                            (unsigned)want[k]);
+    }
     return 0;
 }
 
@@ -906,6 +1020,7 @@ void spu_xdiff_fixture_free(spu_xdiff_fixture* f)
     free(f->ls1);
     free(f->effects);
     free(f->blob);
+    free(f->staged);
     blob_index_free(f->blob_index);
     memset(f, 0, sizeof *f);
 }
@@ -923,6 +1038,7 @@ void spu_xdiff_fixture_clear(spu_xdiff_fixture* f)
     uint8_t* blob = f->blob;
     const uint32_t blob_cap = f->blob_cap;
     blob_index_free(f->blob_index);
+    free(f->staged);
     memset(f, 0, sizeof *f);
     f->ls0 = ls0;
     f->ls1 = ls1;
@@ -1124,6 +1240,59 @@ static int encode_refuse(spu_xdiff_error* err)
     return fail(err, SPU_XDIFF_R_CAPTURE_LIMIT, "%s", detail);
 }
 
+int spu_xdiff_fixture_set_code(spu_xdiff_fixture* f, const spu_xdiff_code_range* ranges, uint32_t count,
+                               const uint8_t* staged_ls, spu_xdiff_error* err)
+{
+    if (!f || !f->ls0 || !ranges || !staged_ls)
+        return fail(err, SPU_XDIFF_R_FIXTURE_FORMAT, "CODE: no fixture, ranges or staged store");
+    if (f->unit.kind != (uint32_t)SPU_XDIFF_UNIT_FUNCTION)
+        return fail(err, SPU_XDIFF_R_FIXTURE_FORMAT, "CODE: only a function unit carries it");
+    if (validate_code_ranges(ranges, count, &f->unit, err)) return -1;
+
+    /* The override replaces exactly these bytes, so they must be what the job was staged with; a
+     * job that rewrote its own code (an overlay, a patched stub) has no native counterpart. */
+    for (uint32_t i = 0; i < count; i++)
+        for (uint32_t k = 0; k < ranges[i].bytes; k++) {
+            const uint32_t at = ranges[i].ls + k;
+            if (f->ls0[at] != staged_ls[at])
+                return fail(err, SPU_XDIFF_R_UNIT_CODE_MODIFIED,
+                            "CODE: range %u: entry LS 0x%x is 0x%02x, the staged image has 0x%02x",
+                            (unsigned)i, (unsigned)at, (unsigned)f->ls0[at], (unsigned)staged_ls[at]);
+        }
+
+    uint8_t* staged = (uint8_t*)malloc(f->unit.image_bytes);
+    if (!staged)
+        return fail(err, SPU_XDIFF_R_CAPTURE_LIMIT, "CODE: out of memory for %u staged image bytes",
+                    (unsigned)f->unit.image_bytes);
+    memcpy(staged, staged_ls + f->unit.image_ls, f->unit.image_bytes);
+    free(f->staged);
+    f->staged = staged;
+    f->staged_bytes = f->unit.image_bytes;
+    memset(&f->code, 0, sizeof f->code);
+    f->code.count = count;
+    memcpy(f->code.range, ranges, (size_t)count * sizeof ranges[0]);
+    return 0;
+}
+
+int spu_xdiff_fixture_check_identity(const spu_xdiff_fixture* f, spu_xdiff_error* err)
+{
+    if (!f || !f->ls0)
+        return fail(err, SPU_XDIFF_R_FIXTURE_FORMAT, "identity: no fixture or no entry local store");
+    if (f->code.count == 0) {
+        if (f->staged)
+            return fail(err, SPU_XDIFF_R_FIXTURE_FORMAT, "STAG: present without CODE");
+        return check_identity(f->ls0, &f->unit, &f->identity, err);
+    }
+    if (f->unit.kind != (uint32_t)SPU_XDIFF_UNIT_FUNCTION)
+        return fail(err, SPU_XDIFF_R_FIXTURE_FORMAT, "CODE: only a function unit carries it");
+    if (!f->staged || f->staged_bytes != f->unit.image_bytes)
+        return fail(err, SPU_XDIFF_R_FIXTURE_FORMAT,
+                    "STAG: required with CODE, and UNIT.image_bytes (%u) bytes long",
+                    (unsigned)f->unit.image_bytes);
+    if (check_code(&f->code, &f->unit, err)) return -1;
+    return check_staged_identity(f->ls0, f->staged, &f->code, &f->unit, &f->identity, err);
+}
+
 int spu_xdiff_fixture_encode(const spu_xdiff_fixture* f, uint8_t** out, size_t* out_bytes,
                              spu_xdiff_error* err)
 {
@@ -1145,9 +1314,9 @@ int spu_xdiff_fixture_encode(const spu_xdiff_fixture* f, uint8_t** out, size_t* 
         return fail(err, SPU_XDIFF_R_CAPTURE_LIMIT, "BLOB: %u bytes, the bound is %u",
                     f->blob_bytes, (unsigned)SPU_XDIFF_MAX_BLOB_BYTES);
 
-    /* The identity check of decode, on the store the LS_0 extents are built
-     * from: any exact cover decodes to this store, so this is the file's. */
-    if (check_identity(f->ls0, &f->unit, &f->identity, err)) return encode_refuse(err);
+    /* The identity check of decode, on the store the LS_0 extents are built from: any exact cover
+     * decodes to this store, so this is the file's. */
+    if (spu_xdiff_fixture_check_identity(f, err)) return encode_refuse(err);
 
     extent_vec ls0 = { 0, 0, 0 }, ls1 = { 0, 0, 0 };
     if (ls_extents(f->ls0, NULL, LS0_ZERO_SPLIT, &ls0) ||
@@ -1181,6 +1350,9 @@ int spu_xdiff_fixture_encode(const spu_xdiff_fixture* f, uint8_t** out, size_t* 
     size[SEC_FMASK] = present[SEC_FMASK] ? sizeof(spu_xdiff_function_mask) : 0;
     present[SEC_VRDT] = f->has_verdict ? 1 : 0;
     size[SEC_VRDT] = f->has_verdict ? sizeof(spu_xdiff_verdict_record) : 0;
+    present[SEC_CODE] = present[SEC_STAG] = f->code.count != 0;
+    size[SEC_CODE] = present[SEC_CODE] ? sizeof(spu_xdiff_code) : 0;
+    size[SEC_STAG] = present[SEC_STAG] ? f->staged_bytes : 0;
 
     uint32_t count = 0;
     uint64_t off[SEC_KINDS] = { 0 };
@@ -1216,7 +1388,7 @@ int spu_xdiff_fixture_encode(const spu_xdiff_fixture* f, uint8_t** out, size_t* 
     spu_xdiff_file_header h;
     memset(&h, 0, sizeof h);
     memcpy(h.magic, SPU_XDIFF_MAGIC, sizeof h.magic);
-    h.version = SPU_XDIFF_VERSION;
+    h.version = present[SEC_CODE] ? SPU_XDIFF_VERSION : SPU_XDIFF_VERSION_V2;
     h.header_bytes = (uint32_t)sizeof h;
     h.section_count = count;
     h.section_bytes = (uint32_t)sizeof(spu_xdiff_section);
@@ -1251,6 +1423,10 @@ int spu_xdiff_fixture_encode(const spu_xdiff_fixture* f, uint8_t** out, size_t* 
     if (present[SEC_FMASK])
         memcpy(buf + off[SEC_FMASK], &f->function_mask, sizeof f->function_mask);
     if (f->has_verdict) memcpy(buf + off[SEC_VRDT], &f->verdict, sizeof f->verdict);
+    if (present[SEC_CODE]) {
+        memcpy(buf + off[SEC_CODE], &f->code, sizeof f->code);
+        memcpy(buf + off[SEC_STAG], f->staged, f->staged_bytes);
+    }
 
     {
         /* The checksum field is still zero, which is how a reader hashes it. */
@@ -1294,6 +1470,17 @@ static int decode_fill(const uint8_t* bytes, const fixture_layout* lay, spu_xdif
     if (lay->part[SEC_VRDT].present) {
         f->has_verdict = 1;
         memcpy(&f->verdict, bytes + lay->part[SEC_VRDT].offset, sizeof f->verdict);
+    }
+    if (lay->part[SEC_CODE].present) {
+        memcpy(&f->code, bytes + lay->part[SEC_CODE].offset, sizeof f->code);
+        f->staged = (uint8_t*)malloc(f->unit.image_bytes);
+        if (!f->staged) {
+            spu_xdiff_fixture_free(f);
+            return fail(err, SPU_XDIFF_R_CAPTURE_LIMIT,
+                        "decode: out of memory for %u staged image bytes", (unsigned)f->unit.image_bytes);
+        }
+        memcpy(f->staged, bytes + lay->part[SEC_STAG].offset, f->unit.image_bytes);
+        f->staged_bytes = f->unit.image_bytes;
     }
 
     {
@@ -1340,7 +1527,7 @@ static int decode_fill(const uint8_t* bytes, const fixture_layout* lay, spu_xdif
         return -1;
     }
 
-    if (check_identity(f->ls0, &f->unit, &f->identity, err)) {
+    if (spu_xdiff_fixture_check_identity(f, err)) {
         spu_xdiff_fixture_free(f);
         return -1;
     }

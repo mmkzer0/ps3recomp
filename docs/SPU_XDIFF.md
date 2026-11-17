@@ -138,6 +138,18 @@ compare; only T3 uses the contract. A tweak has no rule and yields
   `select_body` remains a test seam for forcing a body; production image
   selection uses the staged fingerprint. A forced test body is intentionally
   not checked against the staged bytes.
+- **A function unit is identified by the staged image and its member code.**
+  A function unit is cut out of a running job. The job writes data inside its
+  own image span (frames, scratch, copied descriptors) before it enters the
+  function, so the span of the entry store no longer hashes to the staged
+  fingerprint, and a T2 native override replaces only the code bytes of its
+  unit's members, not the data around them. The identity of a function
+  fixture (version 3) is therefore the parent's staged-image fingerprint
+  (`IDEN.image_fingerprint`, taken from the staged bytes, which the fixture
+  carries in `STAG`) plus the member code: the ranges in `CODE`, which must
+  equal the staged bytes exactly. Capture refuses a unit whose code at entry is
+  not the staged code (`unit-code-modified`, section 8.3). A job fixture keeps
+  the whole-span rule.
 - **Finding the fingerprint is cheap; a cache hit is a claim, not a proof.**
   Hashing the staged bytes byte by byte costs about a millisecond for a large
   image, so two places remember a result by address and size and reuse it
@@ -459,13 +471,16 @@ reports through the outbound mailbox:
 10 WRCH     28  0x1                                       out mailbox
 ```
 
-## 7. The fixture: `ps3recomp.spujob/2`
+## 7. The fixture: `ps3recomp.spujob/3`
 
 *Decided.* All types are in `runtime/spu/spu_xdiff.h`, with their sizes
-asserted there. New writers emit version 2 for jobs and functions. The reader
-continues to accept version-1 job fixtures; v1 did not define function units
-or `FMAS`. All integers are little-endian. Guest data (register and local-store
-bytes, payloads) is stored in guest byte order, untouched.
+asserted there. New writers emit version 3 for a function unit that carries
+`CODE` (section 7.4) and version 2 for every other fixture, so a job or a
+function fixture without `CODE` is byte-identical to what version 2 wrote.
+The reader continues to accept version-1 job fixtures; v1 did not define
+function units or `FMAS`; v2 did not define `CODE` or `STAG`. All integers are
+little-endian. Guest data (register and local-store bytes, payloads) is stored
+in guest byte order, untouched.
 
 ### 7.1 Container
 
@@ -478,7 +493,7 @@ in any order, each at an 8-byte boundary, none overlapping, padding zero.
 | Off | Type | Field | Meaning |
 |---|---|---|---|
 | 0 | `u8[8]` | `magic` | `"SPUJOB\r\n"` |
-| 8 | `u32` | `version` | 2; the reader also accepts v1 job fixtures |
+| 8 | `u32` | `version` | 3 for a function unit with `CODE`, else 2; the reader also accepts v1 job fixtures |
 | 12 | `u32` | `header_bytes` | 40; the section table starts here |
 | 16 | `u32` | `section_count` | at most 32 |
 | 20 | `u32` | `section_bytes` | 24 |
@@ -503,6 +518,8 @@ the start of the file), `u64 bytes`.
 | `END_` | `spu_xdiff_end` | yes |
 | `FMAS` | `spu_xdiff_function_mask`: live-out registers and dead stack extent | function UNIT only |
 | `VRDT` | `spu_xdiff_verdict_record`: the verdict that made the runtime write the fixture | no |
+| `CODE` | `spu_xdiff_code`: the LS ranges a function unit executes as code (version 3) | function UNIT with member code; with `STAG` |
+| `STAG` | the parent job's staged image bytes, `UNIT.image_bytes` of them (version 3) | with `CODE` |
 
 - **Registers** are in guest byte order: byte *k* of register *r* is the byte
   a `stqd` of *r* stores at offset *k*, the conversion `spu_ls_write128`
@@ -569,9 +586,14 @@ capture writes them for a lifted authority, and a replay or an in-run shadow
 writes them for a lifted subject. An image without an inventory, and the
 records of a replay that never ran (`host-fault`), carry 0.
 
-The image is not named by address here. The fingerprint covers bytes
+The image is not named by address here. For a job unit, and a function unit
+without `CODE`, the fingerprint covers bytes
 `[unit.image_ls, +unit.image_bytes)` of the entry local store; a reader
-recomputes it and answers `malformed` / `fixture-identity` on a mismatch.
+recomputes it and answers `malformed` / `fixture-identity` on a mismatch. A
+version-3 function unit with `CODE` does not meet that test: its `LS_0` holds
+the job's own writes inside the image span, so the fingerprint is that of the
+`STAG` section (the staged image) and `LS_0` has to agree with `STAG` on the
+`CODE` ranges (section 7.4).
 
 ### 7.4 `UNIT`: `spu_xdiff_unit`, 104 bytes, 26 x `u32`
 
@@ -585,7 +607,7 @@ recomputes it and answers `malformed` / `fixture-identity` on a mismatch.
 | 20 | `job_rt_ls2` | job: `ctx->job_rt_ls2`; function: 0 |
 | 24 | `image_ea` | job: guest EA the image was staged from; function: 0 |
 | 28 | `image_ls` | job: LS base of the staged image; function: code image base |
-| 32 | `image_bytes` | job: staged bytes; function: image span used to verify IDEN |
+| 32 | `image_bytes` | job: staged bytes; function: image span used to verify IDEN (version 2: hashed from `LS_0`; version 3 with `CODE`: the length of `STAG`) |
 | 36 | `bss_bytes` | job: the `eaBinary` high word x 16; function: 0 |
 | 40, 44 | `desc_ls`, `desc_bytes` | job: descriptor copy; function: 0 |
 | 48, 52 | `io_ls`, `io_bytes` | job: in/out buffer; function: 0 |
@@ -619,6 +641,33 @@ is `return`, `UNIT.return_ls` is the authority's return destination, and
 `IDEN.float_rz` is the entry float mode. `LS_0` reconstructs the entire store
 over zero; `LS_1` overlays its exact exit bytes. Replay compares the return
 destination, live-out registers and every LS byte outside the dead stack extent.
+
+**Function `CODE` and `STAG` (version 3).** A function unit written with
+member code is a version-3 file; every other fixture is still written as
+version 2, byte for byte as before. Both sections are present or neither is.
+
+`CODE`, `spu_xdiff_code`, 144 bytes: `u32 count` (1..16), `u32 reserved` (0),
+`u64 reserved2` (0), then 16 `spu_xdiff_code_range { u32 ls; u32 bytes; }`, of
+which the first `count` are used and the rest are zero. A range is the LS span
+the unit executes as code (an override unit's members): 4-byte aligned, not
+empty, ascending, not overlapping, and inside
+`[UNIT.image_ls, +UNIT.image_bytes)`. The code is compared byte for byte
+against `STAG`, so the record carries no hash of its own.
+
+`STAG`, `UNIT.image_bytes` bytes: the parent job's staged image, bytes
+`[UNIT.image_ls, +UNIT.image_bytes)` of its entry local store. It hashes to
+`IDEN.image_fingerprint`. `LS_0` equals it on every `CODE` range and may
+differ anywhere else in the span: that is the data the job wrote before the
+call.
+
+`spu_xdiff_fixture_set_code` attaches both: it validates the ranges, requires
+the fixture's `LS_0` to equal the staged store on every range (the first
+differing byte is `unit-code-modified`, section 8.3), and copies the staged
+image span.
+
+`spu_xdiff_fixture_check_identity` is the decoder's identity rule for a
+fixture held in memory (the decoder, the encoder and a replay of an in-memory
+fixture all call it), so no reader restates the range rules.
 
 ### 7.5 `EFCT`: `spu_xdiff_effect`, 40 bytes
 
@@ -687,6 +736,8 @@ An unsupported header version is `malformed` / `unsupported-version`, not a
 format error. Version-1 fixtures are job units only; a version-1 function
 unit or `FMAS` section is also `unsupported-version`. A v1 reader sees the v2
 header first and refuses it as unsupported, before inspecting the new sections.
+A v2 reader likewise refuses a version-3 file by its header, before it
+inspects the new sections.
 
 A fixture is an input file: it may be truncated, corrupt or hostile. A reader
 answers `malformed` / `fixture-format` and reads no further when the magic,
@@ -705,6 +756,20 @@ For `UNIT.kind` 2, `FMAS` is required, `EFCT`/`BLOB` are empty, `END_` is
 `return`, and job-only `UNIT` fields are zero. `return_ls` is the aligned
 authority return PC in local store. `live_out` includes `$r1`;
 `dead_stack_bytes` cannot extend below LS 0 or past the entry stack pointer.
+
+A `CODE` or `STAG` section in a version-1 or version-2 file is
+`unsupported-version`: those versions do not define them. In a version-3 file
+the pair is required for a function unit and refused for a job unit, and
+neither section may appear without the other (`fixture-format`). `CODE` is
+`fixture-format` when its count is 0 or above 16, a range is empty, not
+4-byte aligned, out of order, overlapping another, or outside
+`[UNIT.image_ls, +UNIT.image_bytes)`, or a reserved field or unused range is
+not zero; `STAG` is `fixture-format` when its length is not
+`UNIT.image_bytes`. A `STAG` that does not hash to `IDEN.image_fingerprint`,
+or an `LS_0` that differs from `STAG` on a `CODE` range, is `malformed` /
+`fixture-identity`, the message naming the first differing LS address. For
+these fixtures the whole-span hash of the entry store is not computed; a job
+fixture and a version-1 or version-2 function fixture keep it.
 
 ### 7.9 Size
 
@@ -902,6 +967,20 @@ return destination, every live-out register and every LS byte outside the dead
 stack extent. The verdict names a wrong return PC, first register (16 want/got
 bytes) or first LS address. Differing dead registers are counted, not failed.
 
+A function unit's fixture is identified as section 4 says: the parent job's
+staged-image fingerprint, plus the unit's member code. The pilot's per-function
+replay cuts the unit out of a running job, and a job writes data (its stack
+frames, scratch, a descriptor copy) inside its own image span before it enters
+the function, so the entry store no longer hashes to the staged fingerprint; a
+T2 override replaces only the code bytes of the unit's members, so those are
+the bytes whose identity matters. `CODE` (section 7.4) names the member
+ranges and `STAG` carries the staged image: the reader requires `STAG` to hash
+to `IDEN.image_fingerprint`, which a replay then matches to the registered
+image, and `LS_0` to equal `STAG` on every member range. Capture refuses a
+unit whose entry store already differs from the staged image on a member range
+(a job that rewrote its own code, an overlay): `void` / `unit-code-modified`,
+naming the first differing LS address, and no fixture is written.
+
 **Open, before any T2/T3 promotion:** an MFC PUT can also invalidate a
 reservation held by a peer context. Plain PUT calls
 `spu_coh_notify_write_except` per reserved line
@@ -955,7 +1034,7 @@ verdict (`SPU_XDIFF_REASONS`).
 |---|---|
 | `equal` | `none` |
 | `differ` | `effect-kind`, `effect-request`, `effect-payload`, `effect-extra`, `effect-missing`, `end-class`, `end-pc`, `end-regs`, `end-ls`; contract only: `epoch-order`, `epoch-writes`; poison run only: `poison` |
-| `void` | `budget`, `depth-guard`, `capture-limit`, `unsupported-effect`, `uncovered-read`, `unlifted-branch`, `host-fault` |
+| `void` | `budget`, `depth-guard`, `capture-limit`, `unit-code-modified`, `unsupported-effect`, `uncovered-read`, `unlifted-branch`, `host-fault` |
 | `malformed` | `fixture-format`, `unsupported-version`, `fixture-identity`, `not-comparable` |
 | `not-found` | `no-fixture`, `no-body` |
 
