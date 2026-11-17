@@ -22,6 +22,7 @@
 #include "ps3emu/log_first.h"
 #include "ps3emu/config.h"
 #include "pad_trace.h"
+#include "ps3emu/ps3_ftrace.h"
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
 #endif
@@ -218,6 +219,44 @@ static void pad_neutral_state(u32 port, PadTraceState* st)
     }
 }
 
+/* PS3_FT_PAD_EDGE: the start of an input-to-present latency sample. An edge is a poll whose guest-visible
+ * report (len and the 64 button words, as pad_trace compares them: PadTraceState) differs from the port's
+ * previous poll's. It is detected here, at the pad read, because that is the moment the title can first act
+ * on the input. A port's first poll has nothing to differ from and is not an edge. Off (PS3_FTRACE unset),
+ * the guard is the span API's own load and the report is not copied. */
+static struct { int have; PadTraceState st; } s_ft_last[CELL_PAD_MAX_PORT_NUM];
+static int s_ft_lock;            /* guards s_ft_last, s_ft_edges and the stamp: seq order is time order */
+static uint32_t s_ft_edges;
+
+static uint32_t pad_ft_digest(const PadTraceState* st)
+{
+    uint32_t h = 2166136261u;   /* FNV-1a 32 */
+    for (int i = 0; i < 4; i++) { h ^= ((uint32_t)st->len >> (8 * i)) & 0xFFu; h *= 16777619u; }
+    for (int i = 0; i < PAD_TRACE_MAX_WORDS; i++) {
+        h ^= st->words[i] & 0xFFu; h *= 16777619u;
+        h ^= (uint32_t)st->words[i] >> 8; h *= 16777619u;
+    }
+    return h;
+}
+
+static void pad_ft_edge(u32 port, s32 len, const u16* words)
+{
+    if (!PS3_FT_ON() || port >= CELL_PAD_MAX_PORT_NUM) return;
+    PadTraceState st;
+    st.len = len;
+    memcpy(st.words, words, sizeof st.words);
+    while (__atomic_exchange_n(&s_ft_lock, 1, __ATOMIC_ACQUIRE)) {}
+    const int edge = s_ft_last[port].have && (s_ft_last[port].st.len != st.len ||
+                     memcmp(s_ft_last[port].st.words, st.words, sizeof st.words) != 0);
+    s_ft_last[port].st = st;
+    s_ft_last[port].have = 1;
+    const uint32_t seq = edge ? ++s_ft_edges : 0;
+    const uint64_t t = edge ? ps3_ft_now() : 0;
+    __atomic_store_n(&s_ft_lock, 0, __ATOMIC_RELEASE);
+    /* Outside the lock: a span past the window ends the recording and writes the file. */
+    if (edge) ps3_ft_span(PS3_FT_PAD_EDGE, port, seq, pad_ft_digest(&st), t, t);
+}
+
 /* One replayed cellPadGetData. `fresh` is the replayer's answer to "does the
  * guest get a new packet": without it a held state would be a new packet on
  * every poll, and a title that drains the pad until len is 0 would never leave
@@ -231,6 +270,7 @@ static void pad_replay_get(PadTrace* tr, u32 port, CellPadData* data)
     pad_trace_poll(tr, port, &st, &neutral, &fresh);
     data->len = fresh ? st.len : 0;
     memcpy(data->button, st.words, sizeof data->button);
+    pad_ft_edge(port, st.len, st.words);
 }
 
 /* Which ports the info calls report connected. Port 0 is always one (the
@@ -1366,6 +1406,7 @@ emit:
         memcpy(st.words, data->button, sizeof st.words);
         pad_trace_poll(tr, port_no, &st, NULL, &fresh);
     }
+    pad_ft_edge(port_no, rec_len, data->button);
 store: ;
     {
         unsigned int ea = (unsigned int)(uintptr_t)data_guest;

@@ -127,6 +127,17 @@ commit while the Metal backend's GPU BC tier exists, the RSX thread's wait for t
 commits, how many had a decode in flight, the total, mean, p50, p99 and max wait, the commits that ended the run,
 and ms per flip request when nothing was dropped; the per-frame RSX rows gain "bc settle".
 
+A pad-latency section (kinds 36 PAD_EDGE and 37 ENG_PRESENT) appears only in a trace that has a PAD_EDGE: the time
+from a pad read that saw the guest-visible report change to the present of the frame that follows it, as a
+distribution. The edge is detected at the pad read; the consuming present is the first ENG_PRESENT with t0 >= the
+edge's t0, because the title polls the pad after its present, so the next present is the first that can show a
+frame built from that poll. Each edge gives one latency; the section reports the edges, the presents seen, the
+edges with no present after them, and p50/p90/p99/max (nearest rank). A second distribution, "frames in
+flight", counts the presents strictly between the edge and the present that follows the first FLIP_REQ after the
+edge (the flip of the frame the title built from that poll): 0 means the first present after the pad read already
+showed it, n that the title's frame sat behind n earlier presents. An edge with no FLIP_REQ after it, or no
+present after that flip, is counted apart from the histogram. A header `dropped > 0` marks the section INCOMPLETE.
+
 Without --json it then draws a few frames as a timeline (one column per
 --ms-per-col ms):
   PPU   '#' running   '.' usleep poll   's' other blocking syscall
@@ -155,8 +166,9 @@ import tempfile
  GPU_ENCODE, GPU_WAIT, READBACK, GPU_EXEC, HLE, DRAWABLE, LABEL_WAIT,
  AUDIO_MIX, AUDIO_PACE, AUDIO_UNDERRUN, AUDIO_STALE,
  JQ2_PUSH, JQ2_JOB, JQ2_CREDIT, JQ2_SYNC_WAIT, JQ2_IDLE, JQ2_HELD, JQ2_BARRIER,
- JQ2_IMAGE, AUDIO_RING, AUDIO_RING_VIEW, JQ2_BODY, JQ2_XDIFF, BC_UPLOAD, BC_SETTLE) = range(1, 36)
-# The numbers mirror include/ps3emu/ps3_ftrace.h (PS3_FT_*, 32 to 35 included); the tool reads text
+ JQ2_IMAGE, AUDIO_RING, AUDIO_RING_VIEW, JQ2_BODY, JQ2_XDIFF, BC_UPLOAD, BC_SETTLE,
+ PAD_EDGE, ENG_PRESENT) = range(1, 38)
+# The numbers mirror include/ps3emu/ps3_ftrace.h (PS3_FT_*, 32 to 37 included); the tool reads text
 # traces without the header, so a new kind is added in both places.
 # Labels are report keys that saved runs and scripts compare: keep them, append new reasons.
 AUDIO_PACE_REASON = {1: "queue full", 2: "clock pacing", 3: "backend wait", 4: "restart"}
@@ -2859,6 +2871,44 @@ def bc_settle_section(spans, flip_requests, dropped):
             "ms_per_flip": total / flip_requests if rates else None}
 
 
+def pad_latency_section(spans, dropped):
+    """Kinds 36/37: input-to-present latency, one sample per PAD_EDGE. None when the trace has no edge.
+
+    Times are ms. The latency is the first ENG_PRESENT with t0 >= the edge's t0 minus the edge's t0 (the pad is
+    polled after the title's present, so the next present is the first that can show the poll's input). An
+    edge with no present after it is counted in no_present and has no sample, never a made-up one. The
+    frames_in_flight histogram counts the presents from the edge up to, not including, the first present at or
+    after the first FLIP_REQ that follows the edge (that present shows the frame the poll produced)."""
+    edges = sorted(s[4] for s in spans if s[0] == PAD_EDGE)
+    if not edges:
+        return None
+    presents = sorted(s[4] for s in spans if s[0] == ENG_PRESENT)
+    flips = sorted(s[4] for s in spans if s[0] == FLIP_REQ)
+    lat, behind, no_present, no_flip = [], collections.Counter(), 0, 0
+    for e in edges:
+        i = bisect.bisect_left(presents, e)
+        if i == len(presents):
+            no_present += 1
+            continue
+        lat.append(presents[i] - e)
+        f = bisect.bisect_left(flips, e)
+        j = bisect.bisect_left(presents, flips[f]) if f < len(flips) else len(presents)
+        if j == len(presents):
+            no_flip += 1
+            continue
+        behind[j - i] += 1
+    lat.sort()
+    ahead = sorted(behind.elements())
+    return {"edges": len(edges), "presents": len(presents), "no_present": no_present,
+            "dropped": dropped,
+            "latency_ms": ({"p50": nearest_rank(lat, 50), "p90": nearest_rank(lat, 90),
+                            "p99": nearest_rank(lat, 99), "max": lat[-1]} if lat else None),
+            "frames_in_flight": {"matched": len(ahead), "unmatched": no_flip,
+                                 "histogram": {k: behind[k] for k in sorted(behind)},
+                                 "p50": nearest_rank(ahead, 50) if ahead else None,
+                                 "max": ahead[-1] if ahead else None}}
+
+
 def build_report(header, names, spans, images, split=None, cad=(None, None), gap=20.0):
     """The summary dict `--json` prints (without --split/--cadence by default); BadInput when the
     trace has fewer than 3 flip requests. cad = (NID, TID or None); a None NID adds no cadence."""
@@ -2889,6 +2939,9 @@ def build_report(header, names, spans, images, split=None, cad=(None, None), gap
     bs = bc_settle_section(spans, len(flips), header_dropped(header))
     if bs is not None:   # absent when the trace has no kind 35, like bc_upload
         report["bc_settle"] = bs
+    pl = pad_latency_section(spans, header_dropped(header))
+    if pl is not None:   # absent when the trace has no kind 36, like bc_upload
+        report["pad_latency"] = pl
     cad_nid, cad_tid = cad
     if cad_nid is not None:
         report["cadence"] = {"nid": f"{cad_nid:08X}", "import": name_of(cad_nid),
@@ -2923,6 +2976,26 @@ def print_bc_settle_section(sec):
           f" mean {sec['mean_ms']:.3f}, p50 {t['p50']:.3f} p99 {t['p99']:.3f} max {t['max']:.3f} ms{flip}")
     if sec["failed"] or sec["timed_out"]:
         print(f"  ENDED THE RUN: {sec['failed']} with a failed decode, {sec['timed_out']} past the bound")
+
+
+def print_pad_latency_section(sec):
+    if sec is None:
+        return
+    print("\nPad latency (kinds 36-37; pad read that saw the report change -> first present at or after it,"
+          " the title polls after its present):")
+    if sec["dropped"]:
+        print(f"  INCOMPLETE: the trace dropped {sec['dropped']} span(s)")
+    print(f"  {sec['edges']} edge(s), {sec['presents']} present(s), {sec['no_present']} edge(s) with no present after")
+    t = sec["latency_ms"]
+    if t:
+        print(f"  latency p50 {t['p50']:.3f} p90 {t['p90']:.3f} p99 {t['p99']:.3f} max {t['max']:.3f} ms")
+    f = sec["frames_in_flight"]
+    if f["matched"]:
+        hist = ", ".join(f"{k}: {v}" for k, v in f["histogram"].items())
+        print(f"  presents before the edge's frame (strictly between the edge and the present after its flip):"
+              f" {hist}; p50 {f['p50']}, max {f['max']}")
+    if f["unmatched"]:
+        print(f"  {f['unmatched']} edge(s) with a present but no flip request and present after it")
 
 
 def main():
@@ -2973,6 +3046,7 @@ def main():
     print_audio_ring_section(report["audio_ring"])
     print_bc_upload_section(report.get("bc_upload"))
     print_bc_settle_section(report.get("bc_settle"))
+    print_pad_latency_section(report.get("pad_latency"))
     if "cadence" in report:
         c = report["cadence"]
         print(f"\nCadence of {c['import']} ({c['nid']}):")

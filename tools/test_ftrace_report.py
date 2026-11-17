@@ -1791,5 +1791,59 @@ with tempfile.TemporaryDirectory() as tmp:
     check(rc == 0 and "bc_settle" not in json.loads(out) and "bc settle" not in json.loads(out)["all"]["rsx"],
           "bc settle: a trace without kind 35 reports nothing about it")
 
+# Kinds 36 (PAD_EDGE, who = port, a = sequence, b = digest) and 37 (ENG_PRESENT, who = 0, a = present ordinal).
+# Presents every 16.7 ms from 16.7 to 150.3 (nine). Edges at 0, 100, 140 and 200 ms; flip requests at 2, 30, 105
+# and 145 ms. The consuming present is the first at or after the edge:
+#   edge 0   -> 16.7  (latency 16.7)   flip 2   -> present 16.7:  0 presents before it
+#   edge 100 -> 100.2 (latency 0.2)    flip 105 -> present 116.9: 1 present before it (100.2)
+#   edge 140 -> 150.3 (latency 10.3)   flip 145 -> present 150.3: 0 presents before it
+#   edge 200 -> none after it: counted, no sample.
+# A PRESENT (kind 10) span at 141 ms must not count as a present of this section.
+PAD_EDGE, ENG_PRESENT = 36, 37
+padlines = [span(FLIP_REQ, 1, 0, 0, t, t) for t in (2, 30, 105, 145)]
+padlines += [span(ENG_PRESENT, 0, k, 0, 16.7 * k, 16.7 * k) for k in range(1, 10)]
+padlines += [span(PAD_EDGE, 0, n, 0xA0 + n, t, t) for n, t in enumerate((0, 100, 140, 200), 1)]
+padlines.append(span(PRESENT, 0, 0, 0, 141, 142))
+with tempfile.TemporaryDirectory() as tmp:
+    rc, out, err = run(tmp, trace(padlines), "--json")
+    check(rc == 0, f"pad latency: exit 0: {err}")
+    p = json.loads(out)["pad_latency"]
+    check(p["edges"] == 4 and p["presents"] == 9 and p["no_present"] == 1,
+          "pad latency: four edges, nine presents, the edge after the last present counted")
+    L = p["latency_ms"]
+    check(abs(L["p50"] - 10.3) < 1e-9 and abs(L["p90"] - 16.7) < 1e-9 and abs(L["p99"] - 16.7) < 1e-9 and
+          abs(L["max"] - 16.7) < 1e-9, "pad latency: nearest-rank p50 10.3, p90 16.7, p99 16.7, max 16.7 ms of 0.2/10.3/16.7")
+    F = p["frames_in_flight"]
+    check(F["matched"] == 3 and F["unmatched"] == 0 and F["histogram"] == {"0": 2, "1": 1} and F["p50"] == 0 and
+          F["max"] == 1, "pad latency: presents before the edge's frame: {0: 2, 1: 1}")
+    rc, out, err = run(tmp, trace(padlines))
+    check(rc == 0 and "Pad latency (kinds 36-37" in out and
+          "4 edge(s), 9 present(s), 1 edge(s) with no present after" in out and
+          "latency p50 10.300 p90 16.700 p99 16.700 max 16.700 ms" in out and "0: 2, 1: 1; p50 0, max 1" in out,
+          "pad latency: the text report has the section")
+    rc, out, err = run(tmp, trace(padlines, dropped=2))
+    check(rc == 0 and "INCOMPLETE: the trace dropped 2 span(s)" in out and json.loads(
+          run(tmp, trace(padlines, dropped=2), "--json")[1])["pad_latency"]["dropped"] == 2,
+          "pad latency: a trace that dropped spans says so")
+    # Edges and no present at all: counted, no sample, no crash.
+    rc, out, err = run(tmp, trace([l for l in padlines if not l.startswith("37 ")]), "--json")
+    p = json.loads(out)["pad_latency"]
+    check(rc == 0 and p["edges"] == 4 and p["presents"] == 0 and p["no_present"] == 4 and p["latency_ms"] is None and
+          p["frames_in_flight"]["matched"] == 0 and p["frames_in_flight"]["p50"] is None,
+          "pad latency: edges with no present at all are counted and reported without samples")
+    rc, out, err = run(tmp, trace([l for l in padlines if not l.startswith("37 ")]))
+    check(rc == 0 and "4 edge(s), 0 present(s), 4 edge(s) with no present after" in out and "latency p50" not in out,
+          "pad latency: the text report survives a trace with no present")
+    # A present after the edge but no flip request after it: a latency sample, kept out of the histogram.
+    rc, out, err = run(tmp, trace([l for l in padlines if not l.startswith("9 1 0 0 145")]), "--json")
+    p = json.loads(out)["pad_latency"]
+    check(rc == 0 and p["no_present"] == 1 and p["latency_ms"] is not None and
+          p["frames_in_flight"]["unmatched"] == 1 and p["frames_in_flight"]["matched"] == 2,
+          "pad latency: an edge with a present but no flip after it is counted apart")
+    rc, out, err = run(tmp, trace(padlines[:13] + padlines[17:]), "--json")   # flips, presents and the PRESENT only
+    check(rc == 0 and "pad_latency" not in json.loads(out), "pad latency: a trace without kind 36 reports nothing")
+    rc, out, err = run(tmp, trace(padlines[:13] + padlines[17:]))
+    check(rc == 0 and "Pad latency" not in out, "pad latency: a trace without kind 36 prints no section")
+
 print("ftrace_report: %s" % ("ok" if not failures else "%d failed" % failures))
 sys.exit(1 if failures else 0)

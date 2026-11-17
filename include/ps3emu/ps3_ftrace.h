@@ -195,6 +195,18 @@ enum ps3_ft_kind {
                               * zero-length span is a settle that found nothing to wait for; who = 0, a = decodes in
                               * flight when it began, b = 0 all done, 1 a decode had failed (the run stops), 2 the bound
                               * ran out (the run stops) */
+    PS3_FT_PAD_EDGE       = 36, /* instant (t0 == t1): a cellPadGetData whose guest-visible report differs from the port's
+                              * previous one (the decision pad_trace makes, taken after the host backend and every
+                              * injector; a port's first poll has nothing to differ from and is not one), never filtered;
+                              * who = port, a = edge sequence number (per run, all ports, first edge 1),
+                              * b = FNV-1a 32 over the report's len (4 bytes, little-endian) and its 64 button words
+                              * (2 bytes each, little-endian). The start of an input-to-present latency measurement */
+    PS3_FT_ENG_PRESENT    = 37, /* instant (t0 == t1): the draw engine's present of a frame returned (eng_present, so a flip
+                              * the FIFO resolved and a host-driven present both count; a present that was skipped for
+                              * lack of a surface does not), on the presenting thread, never filtered; who = 0,
+                              * a = present sequence number (the engine's present ordinal, first present 0), b = 0.
+                              * Not PS3_FT_PRESENT (10): that kind is the Metal backend's timed span around a host-driven
+                              * present and the report keeps it as the RSX "present" row */
 };
 
 enum ps3_ft_audio_pace_reason {

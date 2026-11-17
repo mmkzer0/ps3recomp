@@ -1085,7 +1085,22 @@ ms per flip request when nothing was dropped; the per-frame RSX rows gain
 `total_ms`, `mean_ms`, `wait_ms`, `failed`, `timed_out`, `ms_per_flip`) only to
 a trace that has the kind.
 
-Kinds 30-35 are recorded whatever `PS3_FTRACE_MIN_US` says. Exit `0` on a
+**Pad latency** (kind 36 `PAD_EDGE`, kind 37 `ENG_PRESENT`; toolkit issue #82, diagnostic only). `PAD_EDGE` is
+an instant emitted by `cellPadGetData` when the guest-visible report differs from the port's previous one (the
+decision `pad_trace` makes, after the host backend and every injector; a port's first poll is not an edge):
+`who` is the port, `a` a per-run edge sequence number, `b` an FNV-1a 32 digest of the report's `len` and 64
+button words. `ENG_PRESENT` is an instant emitted by the draw engine's `eng_present` when a present returned (a
+flip the FIFO resolved or a host-driven present; a skipped present emits none): `who` 0, `a` the engine's present
+ordinal, `b` 0. It is not kind 10 `PRESENT`, which stays the Metal backend's timed span. The report adds a
+section (only to a trace that has a `PAD_EDGE`): for each edge the latency to the first `ENG_PRESENT` at or after
+it (the pad is read after the title's present, so that is the first present that can show the poll's input), with
+the edges, presents, edges with no present after them, and p50/p90/p99/max in ms (nearest rank); and a
+`frames_in_flight` histogram, the presents from the edge up to the present that follows the first flip request
+after it (0: the first present already showed the frame). `--json` adds `pad_latency` (`edges`, `presents`,
+`no_present`, `dropped`, `latency_ms`, `frames_in_flight`) only to a trace that has the kind. Both kinds are
+emitted unconditionally and cost the span API's one load when `PS3_FTRACE` is unset.
+
+Kinds 30-37 are recorded whatever `PS3_FTRACE_MIN_US` says. Exit `0` on a
 report, `2` on an unreadable, truncated, corrupt or malformed trace, a zstd
 trace with no decoder, bad arguments or fewer than three flip requests.
 
