@@ -60,6 +60,7 @@
 #    include <sys/syscall.h>
 #  endif
 #endif
+#include "ps3emu/thread_name.h"
 
 #ifndef EISDIR
 #  define EISDIR 21   /* MSVC's errno.h has no EISDIR; the POSIX value, so stop lines agree across hosts */
@@ -603,6 +604,7 @@ static HANDLE g_fl_thread, g_fl_event;
 static DWORD WINAPI flusher_main(LPVOID arg)
 {
     (void)arg;
+    ps3_thread_name("log flush");
     while (WaitForSingleObject(g_fl_event, LOG_FLUSH_MS) == WAIT_TIMEOUT)
         if (!flusher_tick()) break;
     test_hook(PS3_LOG_TEST_FLUSHER_EXIT);
@@ -652,6 +654,7 @@ static void realtime_after(struct timespec* ts, uint64_t ns)
 static void* flusher_main(void* arg)
 {
     (void)arg;
+    ps3_thread_name("log flush");
     pthread_mutex_lock(&g_fl_mu);
     while (!__atomic_load_n(&g_flusher_stop, __ATOMIC_ACQUIRE)) {
         struct timespec ts;

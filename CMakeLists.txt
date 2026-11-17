@@ -760,8 +760,14 @@ if(PS3RECOMP_BUILD_TESTS)
     target_include_directories(test_log_first PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
     add_test(NAME log_first COMMAND test_log_first)
     set_tests_properties(log_first PROPERTIES LABELS "runtime;t0")
-    # The recorder's state reaches threads that did not initialise it (ps3_ft_recording's acquire).
     if(UNIX)
+        # ps3_thread_name names the caller only; Linux keeps 15 bytes.
+        add_executable(test_thread_name tests/test_thread_name.c)
+        target_include_directories(test_thread_name PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+        target_link_libraries(test_thread_name PRIVATE Threads::Threads)
+        add_test(NAME thread_name COMMAND test_thread_name)
+        set_tests_properties(thread_name PROPERTIES LABELS "runtime;t0" SKIP_RETURN_CODE 77)
+        # The recorder's state reaches threads that did not initialise it (ps3_ft_recording's acquire).
         add_executable(test_ftrace_publish tests/test_ftrace_publish.c runtime/diag/host_exit.c)
         target_include_directories(test_ftrace_publish PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
         target_link_libraries(test_ftrace_publish PRIVATE Threads::Threads)

@@ -34,6 +34,7 @@ static u32 s_gcm_context_ea = 0;
 #include "ps3emu/stop.h"
 #include "ps3emu/config.h"        /* gcm.wait_timeout_ms */
 #include "ps3emu/host_stack.h"    /* ps3_host_pthread_create */
+#include "ps3emu/thread_name.h"
 #include "../../runtime/ps3_log.h"   /* ps3_log_verbose: the per-call tile/zcull lines */
 #include "gcm_default_state.h"
 #include "rsx_capture.h"
@@ -1428,6 +1429,7 @@ static DWORD WINAPI gcm_intr_main(LPVOID unused)
     (void)unused;
     (void)ps3_hs_begin(&s_intr_hs, 0, ps3_ppu_host_stack_bytes(), intr_hs_summary);
     s_gcm_intr_tid = (unsigned long)GetCurrentThreadId();
+    ps3_thread_name("gcm intr");
 #ifdef _WIN32
     for (;;) { ppu_gcm_pump(); Sleep(1); }
 #else
