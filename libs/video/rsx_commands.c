@@ -21,6 +21,7 @@
 #include <string.h>
 #include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
 #include "ps3emu/log_first.h"
+#include "ps3emu/ps3_log.h"   /* PS3_LOG: tagged lines, stderr bytes unchanged */
 #include "rsx_method_class.h"
 
 /* ---------------------------------------------------------------------------
@@ -145,7 +146,7 @@ static int process_surface_method(rsx_state* state, u32 method, u32 data)
           static unsigned _seen[32]; static int _n = 0;
           if (_s) { int f = 0; for (int k = 0; k < _n; k++) if (_seen[k] == data) f = 1;
               if (!f && _n < 32) { _seen[_n++] = data;
-                  fprintf(stderr, "[SURF] color offset -> 0x%08X%c", data, 10); } } }
+                  PS3_LOG(PS3_LOG_INFO, "SURF", "color offset -> 0x%08X%c", data, 10); } } }
         state->surface_dirty = 1;
         return 0;
     case NV4097_SET_SURFACE_COLOR_BOFFSET:
@@ -165,8 +166,7 @@ static int process_surface_method(rsx_state* state, u32 method, u32 data)
         state->surface_dirty = 1;
         return 0;
     case NV4097_SET_SURFACE_COLOR_TARGET:
-        { static int _ct=0; if (PS3_LOG_FIRST(_ct, 24) && getenv("RTT_DUMP"))
-            fprintf(stderr, "[RSXCT] color_target=0x%X offA=0x%X offB=0x%X offC=0x%X offD=0x%X%s",
+        { if (getenv("RTT_DUMP")) PS3_LOG_N(24, PS3_LOG_INFO, "RSXCT", "color_target=0x%X offA=0x%X offB=0x%X offC=0x%X offD=0x%X%s",
                     data, state->surface_color_offset[0], state->surface_color_offset[1],
                     state->surface_color_offset[2], state->surface_color_offset[3], "\n"); }
         state->color_target = data;
@@ -376,10 +376,9 @@ static inline void rsx_vp_const_word(rsx_state* state, u32 reg_offset, u32 data)
           static int _n=0;
           static int _max=-1; if(_max<0){const char*m=getenv("TCONST_MAX");_max=m?atoi(m):64;}
           int _hit = _en && (getenv("TCONST_ALL") ? (_n<_max) : (slot>=12 && slot<=30 && _n<400));
-          if(_hit){ _n++; fprintf(stderr,"[TCONST] load=%u slot=%u lane=%u = %.4f\n", state->transform_constant_load, slot, lane, f); } }
+          if(_hit){ _n++; PS3_LOG(PS3_LOG_INFO, "TCONST", "load=%u slot=%u lane=%u = %.4f\n", state->transform_constant_load, slot, lane, f); } }
         state->vertex_constants[slot][lane] = f;
-        { static int _sq=0, _e=-1; if (_e < 0) _e = getenv("SEQ_DBG") ? 1 : 0; if (_e && slot==256 && lane==0 && PS3_LOG_FIRST(_sq, 500))
-            fprintf(stderr, "[SEQ] upload c256.x=%.4f (load=%u)\n", f, state->transform_constant_load); }
+        { static int _e=-1; if (_e < 0) _e = getenv("SEQ_DBG") ? 1 : 0; if (_e && slot==256 && lane==0) PS3_LOG_N(500, PS3_LOG_INFO, "SEQ", "upload c256.x=%.4f (load=%u)\n", f, state->transform_constant_load); }
         if (!state->vertex_constants_dirty) {
             state->vertex_constants_lo = slot;
             state->vertex_constants_hi = slot;
@@ -439,7 +438,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
      * the first real draw -- exactly the ones worth seeing -- were never traced. */
     { static int _rt=-1; if(_rt<0){ const char* e=getenv("RSX_TRACE");
         _rt = e ? (atoi(e) > 1 ? atoi(e) : 250) : 0; }
-      if(_rt){ static int _m=0; if(PS3_LOG_FIRST(_m, _rt)) fprintf(stderr,"[rsxm] method=0x%04X data=0x%08X\n", method, data); } }
+      if(_rt){ static int _m=0; if(PS3_LOG_FIRST(_m, _rt)) PS3_LOG(PS3_LOG_INFO, "rsxm", "method=0x%04X data=0x%08X\n", method, data); } }
     /* Vertex-program constants and microcode are most of a frame's method
      * stream (God of War HD: about 140k constant vec4s and 70k microcode
      * headers a second), and their handlers sat behind every check below.
@@ -461,8 +460,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
     }
     if (method == NV4097_SET_TRANSFORM_CONSTANT_LOAD) {
-        { static int _n=0, _e=-1; if (_e < 0) _e = getenv("LOAD_DBG") ? 1 : 0; if (_e && PS3_LOG_FIRST(_n, 200))
-            fprintf(stderr, "[LOAD] transform_constant_load = %u\n", data); }
+        { static int _e=-1; if (_e < 0) _e = getenv("LOAD_DBG") ? 1 : 0; if (_e) PS3_LOG_N(200, PS3_LOG_INFO, "LOAD", "transform_constant_load = %u\n", data); }
         state->transform_constant_load = data;
         return 0;
     }
@@ -510,7 +508,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
               extern unsigned long long ps3_ms_now(void);
               u32 ea = gcm_io_offset_to_ea(0x0F100000u + ((s_notify_ctx & 7u) ^ 7u) * 0x40u);
               { static int n = 0; if (n++ < 4)   /* TEMP */
-                  fprintf(stderr, "[RSX] NOTIFY slot %u -> ea 0x%08X\n", (s_notify_ctx & 7u) ^ 7u, ea); }
+                  PS3_LOG(PS3_LOG_INFO, "RSX", "NOTIFY slot %u -> ea 0x%08X\n", (s_notify_ctx & 7u) ^ 7u, ea); }
               if (ea) {
                   unsigned long long ts = ps3_ms_now() * 1000000ull;
                   vm_write32(ea, (u32)(ts >> 32)); vm_write32(ea + 4, (u32)ts);
@@ -522,7 +520,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     { static u32 s_sem_off = 0, s_sem_ctx = 0;
       if (method == 0x01A4) {
           if (data != s_sem_ctx) { static int _l = 0; if (_l++ < 8)
-              fprintf(stderr, "[RSX] semaphore context dma = 0x%08X\n", data); }
+              PS3_LOG(PS3_LOG_INFO, "RSX", "semaphore context dma = 0x%08X\n", data); }
           /* The context decides where 0x1D70/0x1D74 below put the label: storing it consumes it. */
           s_sem_ctx = data;
           return 0;
@@ -551,8 +549,8 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         { static u32 seen[64]; static int ns = 0; int k = 0;   /* TEMP: distinct release offsets */
           for (; k < ns; k++) if (seen[k] == s_sem_off) break;
           if (k == ns && ns < 64) { seen[ns++] = s_sem_off;
-              fprintf(stderr, "[RSX] first back-end release @off 0x%X val 0x%08X\n", s_sem_off, val); } }
-        { static int _l=0; if(PS3_LOG_FIRST(_l, 8)) fprintf(stderr,"[RSX] label write @0x%08X = 0x%08X (sync fence, raw 0x%08X)\n", VM_HLE_INJECT_BASE+(s_sem_off&0xFFFFFF), val, data); }
+              PS3_LOG(PS3_LOG_INFO, "RSX", "first back-end release @off 0x%X val 0x%08X\n", s_sem_off, val); } }
+        { PS3_LOG_N(8, PS3_LOG_INFO, "RSX", "label write @0x%08X = 0x%08X (sync fence, raw 0x%08X)\n", VM_HLE_INJECT_BASE+(s_sem_off&0xFFFFFF), val, data); }
         return 0;
       }
       if (method == 0x1D74) {
@@ -661,13 +659,13 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
     }
     if (method == NV4097_CLEAR_SURFACE) {
-        { static int _c=0; int _first = PS3_LOG_FIRST(_c, 12); if (_first) fprintf(stderr, "[RSX] CLEAR_SURFACE mask=0x%X color=0x%08X\n", data, state->color_clear_value);
+        { static int _c=0; int _first = PS3_LOG_FIRST(_c, 12); if (_first) PS3_LOG(PS3_LOG_INFO, "RSX", "CLEAR_SURFACE mask=0x%X color=0x%08X\n", data, state->color_clear_value);
           /* Each distinct mask once more, however late: a depth-only clear
            * first shows up long after the boot screens used up the 12. */
           static u32 seen[16]; static int ns = 0; int k = 0;
           while (k < ns && seen[k] != data) k++;
           if (k == ns && ns < 16) { seen[ns++] = data;
-              if (!_first) fprintf(stderr, "[RSX] CLEAR_SURFACE new mask=0x%X color=0x%08X\n",
+              if (!_first) PS3_LOG(PS3_LOG_INFO, "RSX", "CLEAR_SURFACE new mask=0x%X color=0x%08X\n",
                                    data, state->color_clear_value); } }
         if (s_backend && s_backend->clear) {
             float depth = (float)(state->zstencil_clear_value >> 8) / (float)0xFFFFFF;
@@ -831,7 +829,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         { static int _d = -1; if (_d < 0) _d = getenv("VDATA_DBG") ? 1 : 0;
           static int _n = 0;
           if (_d && _n < 400) { _n++;
-            fprintf(stderr, "[VDATA4F] attr=%u lane=%u = %.4f%c", idx, lane, f, 10); } }
+            PS3_LOG(PS3_LOG_INFO, "VDATA4F", "attr=%u lane=%u = %.4f%c", idx, lane, f, 10); } }
         return 0;
     }
 
@@ -911,8 +909,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         u32 first = data & 0xFFFFFF;
         u32 count = ((data >> 24) & 0xFF) + 1;
         { static int _d=0; if (PS3_LOG_FIRST(_d, 32)) fprintf(stderr, "[RSX] DRAW_ARRAYS prim=%u first=%u count=%u\n", state->primitive_type, first, count); }
-        { static int _sq=0, _e=-1; if (_e < 0) _e = getenv("SEQ_DBG") ? 1 : 0; if (_e && PS3_LOG_FIRST(_sq, 500))
-            fprintf(stderr, "[SEQ] DRAW surf0=0x%X c256.x=%.4f c257.y=%.4f\n",
+        { static int _e=-1; if (_e < 0) _e = getenv("SEQ_DBG") ? 1 : 0; if (_e) PS3_LOG_N(500, PS3_LOG_INFO, "SEQ", "DRAW surf0=0x%X c256.x=%.4f c257.y=%.4f\n",
                     state->surface_color_offset[0], state->vertex_constants[256][0],
                     state->vertex_constants[257][1]); }
         /* MVPDBG: dump every non-zero vertex-constant slot the FIRST time a
@@ -925,7 +922,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
                 for (int s = 0; s < RSX_MAX_VERTEX_CONSTANTS; s++) {
                     float* v = state->vertex_constants[s];
                     if (v[0]||v[1]||v[2]||v[3])
-                        fprintf(stderr, "[MVP] c[%3d] = %10.4f %10.4f %10.4f %10.4f\n",
+                        PS3_LOG(PS3_LOG_INFO, "MVP", "c[%3d] = %10.4f %10.4f %10.4f %10.4f\n",
                                 s, v[0], v[1], v[2], v[3]);
                 }
             }
@@ -937,8 +934,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     }
 
     if (method == NV4097_SET_SHADER_CONTROL) {
-        { static int _sc=0; if (PS3_LOG_FIRST(_sc, 12) && getenv("RTT_DUMP"))
-            fprintf(stderr, "[RSXSC] shader_control=0x%X\n", data); }
+        { if (getenv("RTT_DUMP")) PS3_LOG_N(12, PS3_LOG_INFO, "RSXSC", "shader_control=0x%X\n", data); }
         state->shader_control = data;
         state->shader_dirty = 1;
         return 0;
@@ -1004,7 +1000,7 @@ int rsx_process_command_buffer(rsx_state* state, const u32* buf, u32 size)
     u32 pos = 0;
     u32 count = size / 4; /* size in dwords */
 
-    { static int _c=0; if (count && PS3_LOG_FIRST(_c, 16)) fprintf(stderr, "[RSX] process_cmd_buffer words=%u first_hdr=0x%08X\n", count, buf[0]); }
+    { if (count) PS3_LOG_N(16, PS3_LOG_INFO, "RSX", "process_cmd_buffer words=%u first_hdr=0x%08X\n", count, buf[0]); }
     while (pos < count) {
         u32 header = buf[pos++];
         u32 type = (header >> 29) & 0x7;
@@ -1022,10 +1018,8 @@ int rsx_process_command_buffer(rsx_state* state, const u32* buf, u32 size)
                 /* SET_OBJECT (0) binds a class; this bounded parser has no binding table, the walker does. */
                 if (rsx_process_method(state, m, data) < 0 && m != 0 &&
                     !rsx_method_inert(RSX_CLASS_NV4097, m)) {
-                    static int n = 0;
                     state->unknown_methods++;
-                    if (PS3_LOG_FIRST(n, 16))
-                        fprintf(stderr, "[RSX] unknown method 0x%04X = 0x%08X (command buffer)\n", m, data);
+                    PS3_LOG_N(16, PS3_LOG_INFO, "RSX", "unknown method 0x%04X = 0x%08X (command buffer)\n", m, data);
                 }
                 methods_processed++;
             }

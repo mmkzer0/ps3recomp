@@ -50,7 +50,7 @@
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include "ps3emu/log_first.h"
+#include "ps3emu/ps3_log.h"   /* PS3_LOG: tagged lines, stderr bytes unchanged */
 
 #define M_DMA_COLOR1            0x018C
 #define M_DMA_COLOR0            0x0194
@@ -413,9 +413,7 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
      * "load constant 461" command header, i.e. FIFO words stored as shader
      * constants. Drop it, and say what it was. */
     if (idx >= RSX_DSP_NUM_REGS) {
-        static int n = 0;
-        if (PS3_LOG_FIRST(n, 8))
-            fprintf(stderr, "[rsx-dispatch] method 0x%05X (arg 0x%08X) out of range -- dropped\n",
+        PS3_LOG_N(8, PS3_LOG_INFO, "rsx-dispatch", "method 0x%05X (arg 0x%08X) out of range -- dropped\n",
                     method, arg);
         return;
     }
@@ -472,7 +470,7 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
           if (lo == -2) { const char* e = getenv("RSX_CONST_LOG"); lo = -1;
                           if (e) sscanf(e, "%d,%d", &lo, &hi); }
           if (lo >= 0 && (int)slot >= lo && (int)slot <= hi && n < 400) { n++;
-              fprintf(stderr, "[const-load] c[%u].%c = 0x%08X (method 0x%04X id=%u)\n", slot,
+              PS3_LOG(PS3_LOG_INFO, "const-load", "c[%u].%c = 0x%08X (method 0x%04X id=%u)\n", slot,
                       "xyzw"[word & 3], arg, method, rsx->regs[M_VP_UPLOAD_CONST_ID >> 2]); } }
         return;
     }

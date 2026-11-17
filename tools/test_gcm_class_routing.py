@@ -18,6 +18,17 @@ if os.name == 'nt':
 video = root / 'libs/video'
 with tempfile.TemporaryDirectory(prefix='gcm-class-routing-') as tmp:
     binary = Path(tmp) / 'test'
+    # cellGcmSys.c and the engine call ps3_log_* now; this fixture supplies ps3_config_get and the stops
+    # itself (gcm_fixture_stubs.h), so the log needs host_exit.c and the mirror stub.
+    # The legacy probe has no configuration of its own; the log reads it only when configured, which the
+    # probe never does.
+    (Path(tmp) / 'probe_stub.c').write_text(
+        '#include <stdlib.h>\n#include "ps3emu/config.h"\n#include "ps3emu/stop.h"\n'
+        'const ps3_config* ps3_config_get(void) { static ps3_config c; return &c; }\n'
+        'void ps3_stop_set_mirror(ps3_stop_quiesce_fn q, ps3_stop_mirror_fn m) { (void)q; (void)m; }\n'
+        'PS3_NORETURN void ps3_stop(ps3_stop_kind k, const char* w, const char* r, const ps3_stop_field* f,\n'
+        '                           size_t n, const ps3_stop_site* s)\n'
+        '        { (void)k; (void)w; (void)r; (void)f; (void)n; (void)s; _Exit(PS3_STOP_EXIT_CODE); }\n')
     linker = ['-Wl,-dead_strip'] if sys.platform == 'darwin' else ['-Wl,--gc-sections', '-pthread', '-lm']
     subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG',
                     '-ffunction-sections', '-fdata-sections',
@@ -31,6 +42,8 @@ with tempfile.TemporaryDirectory(prefix='gcm-class-routing-') as tmp:
                     str(video / 'rsx_fp_decompiler.c'),
                     str(root / 'runtime/memory/label_window.c'),
                     str(root / 'runtime/diag/host_exit.c'),
+                    str(root / 'runtime/diag/ps3_log.c'),
+                    str(root / 'tests/ps3_log_mirror_stub.c'),
                     str(video / 'gcm_default_state.c'), *linker,
                     '-o', str(binary)], check=True)
     # The methods the legacy state machine takes, from the real rsx_commands.c (the same probe that bounds
@@ -40,6 +53,7 @@ with tempfile.TemporaryDirectory(prefix='gcm-class-routing-') as tmp:
                     '-I' + str(root / 'include'), '-I' + str(video),
                     str(video / 'tests/test_rsx_legacy_effect_methods.c'),
                     str(video / 'rsx_commands.c'), str(root / 'runtime/diag/host_exit.c'),
+                    str(root / 'runtime/diag/ps3_log.c'), str(Path(tmp) / 'probe_stub.c'),
                     *([] if sys.platform == 'darwin' else ['-lm']),
                     '-o', str(probe)], check=True)
     listing = subprocess.run([str(probe), '--handled'], timeout=60, capture_output=True, text=True)

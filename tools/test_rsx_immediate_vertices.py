@@ -15,9 +15,19 @@ def main():
                "rsx_vp_decompiler.c", "rsx_fp_decompiler.c"]
     with tempfile.TemporaryDirectory(prefix="rsx-immediate-") as directory:
         binary = Path(directory) / "test_rsx_draw_engine"
+        # The engine's migrated lines call ps3_log_*; this fixture configures no log (its stub header answers
+        # ps3_config_get), so the stop the log refers to exists only to satisfy the link.
+        stub = Path(directory) / "log_stub.c"
+        stub.write_text('#include <stdlib.h>\n#include "ps3emu/stop.h"\n'
+                        'void ps3_stop_set_mirror(ps3_stop_quiesce_fn q, ps3_stop_mirror_fn m) { (void)q; (void)m; }\n'
+                        'PS3_NORETURN void ps3_stop(ps3_stop_kind k, const char* w, const char* r, const ps3_stop_field* f,\n'
+                        '                           size_t n, const ps3_stop_site* s)\n'
+                        '        { (void)k; (void)w; (void)r; (void)f; (void)n; (void)s; _Exit(PS3_STOP_EXIT_CODE); }\n')
         subprocess.run([os.environ.get("CC", "cc"), "-std=gnu17",
                         "-Iinclude", "-Ilibs/video", "-o", str(binary),
-                        *["libs/video/" + s for s in sources]], cwd=root, check=True)
+                        *["libs/video/" + s for s in sources],
+                        "runtime/diag/ps3_log.c", "runtime/diag/host_exit.c", str(stub)],
+                       cwd=root, check=True)
         subprocess.run([str(binary)], cwd=root, check=True)
 
 

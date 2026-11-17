@@ -3,6 +3,7 @@
  */
 #include "rsx_vertex_fetch.h"
 #include "rsx_vertex_formats.h"
+#include "ps3emu/ps3_log.h"   /* PS3_LOG: tagged lines, stderr bytes unchanged */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -119,7 +120,7 @@ void rsx_fetch_attrib(const rsx_state* st, int idx, u32 vi, float out[4])
         { static int t = -1; if (t < 0) t = getenv("VTX_TYPEDBG") ? 1 : 0;
           if (t) { static u32 seen = 0;
               if (!(seen & (1u << (a->type & 31)))) { seen |= 1u << (a->type & 31);
-                  fprintf(stderr, "[VTXTYPE] UNHANDLED type=%u attr=%d size=%u stride=%u\n",
+                  PS3_LOG(PS3_LOG_INFO, "VTXTYPE", "UNHANDLED type=%u attr=%d size=%u stride=%u\n",
                           a->type, idx, a->size, a->stride); } } }
         for (u32 k = 0; k < n; k++) out[k] = rsx_rd_bef(p + k * 4);
         break;

@@ -19,6 +19,6 @@ with tempfile.TemporaryDirectory(prefix='gcm-map-flags-') as tmp:
         # and #255's default of 512 would run past the 256 MB aperture.
         '-DCELL_GCM_MAX_IO_MAPPINGS=16',
         '-ffunction-sections','-fdata-sections','-I'+str(root/'include'),
-        str(root/'tests/test_gcm_map_flags.c'),*linker,'-o',str(binary)],check=True)
+        str(root/'tests/test_gcm_map_flags.c'),str(root/'runtime/diag/ps3_log.c'),str(root/'runtime/diag/host_exit.c'),str(root/'tests/ps3_log_mirror_stub.c'),*linker,'-o',str(binary)],check=True)
     subprocess.run([str(binary)],check=True,timeout=10,
         env={k:v for k,v in os.environ.items() if not k.startswith('A2O_')})

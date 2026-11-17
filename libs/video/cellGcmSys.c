@@ -30,6 +30,7 @@ static u32 s_gcm_context_ea = 0;
 #include <stdlib.h>
 #include <stdint.h>
 #include "ps3emu/log_first.h"
+#include "ps3emu/ps3_log.h"   /* PS3_LOG: tagged lines, stderr bytes unchanged */
 #include "ps3emu/stop.h"
 #include "ps3emu/config.h"        /* gcm.wait_timeout_ms */
 #include "ps3emu/host_stack.h"    /* ps3_host_pthread_create */
@@ -168,7 +169,7 @@ static void gcm_method_verdict(u32 subch, u32 m, u32 data, int handled, u32 fifo
             s_miss_tab[cls][idx].subch = (u8)subch;
             if (s_miss_logged < GCM_MISSING_LOG_MAX) {
                 s_miss_logged++;
-                fprintf(stderr, "[rsx-method] missing %s method 0x%04X = 0x%08X (%s; subchannel %u, fifo 0x%X)\n",
+                PS3_LOG(PS3_LOG_INFO, "rsx-method", "missing %s method 0x%04X = 0x%08X (%s; subchannel %u, fifo 0x%X)\n",
                         rsx_class_name(cls), m, data, rule ? rule->name : "no row", subch, fifo);
             }
         }
@@ -181,7 +182,7 @@ static void gcm_method_verdict(u32 subch, u32 m, u32 data, int handled, u32 fifo
         s_mc_tab[cls][idx].subch = (u8)subch;
         if (s_mc_logged < GCM_UNKNOWN_LOG_MAX) {
             s_mc_logged++;
-            fprintf(stderr, "[rsx-method] unknown %s method 0x%04X (subchannel %u, data 0x%08X)\n",
+            PS3_LOG(PS3_LOG_INFO, "rsx-method", "unknown %s method 0x%04X (subchannel %u, data 0x%08X)\n",
                     rsx_class_name(cls), m, subch, data);
         }
     }
@@ -540,7 +541,7 @@ static void ydkj_restore_handler_opd(u32 opd, u32 code) {
     extern u8* vm_base; if (!vm_base) return;
     if (vm_read32(opd) == 0) {
         u8* p = vm_base + opd; p[0]=(u8)(code>>24); p[1]=(u8)(code>>16); p[2]=(u8)(code>>8); p[3]=(u8)code;
-        static int _n=0; if(PS3_LOG_FIRST(_n, 6)) fprintf(stderr,"[HANDLERFIX] restored clobbered OPD 0x%08X code=0x%08X\n",opd,code);
+        PS3_LOG_N(6, PS3_LOG_INFO, "HANDLERFIX", "restored clobbered OPD 0x%08X code=0x%08X\n",opd,code);
     }
 }
 
@@ -1268,10 +1269,9 @@ void cellGcmSetFlipMode(u32 mode)
 /* NID: 0xB2E761D4 */
 void cellGcmResetFlipStatus(void)
 {
-    { static int n = 0;
+    {
       static int fd = -1; if (fd < 0) fd = getenv("FLIP_DBG") ? 1 : 0;
-      if (fd && PS3_LOG_FIRST(n, 12))
-          fprintf(stderr, "[FLIP] ResetFlipStatus%c", 10); }
+      if (fd) PS3_LOG_N(12, PS3_LOG_INFO, "FLIP", "ResetFlipStatus%c", 10); }
     FLIP_LOCK();
     s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
     s_flip_req_seq++;
@@ -1288,10 +1288,9 @@ u32 cellGcmGetFlipStatus(void)
      * beat) completes pending flips. The old self-completing version made
      * every wait-for-flip loop exit on its first poll, so titles ran
      * completely unpaced (wave: 95 fps with a fixed-dt simulation). */
-    { static int n = 0;
+    {
       static int fd = -1; if (fd < 0) fd = getenv("FLIP_DBG") ? 1 : 0;
-      if (fd && PS3_LOG_FIRST(n, 24))
-          fprintf(stderr, "[FLIP] GetFlipStatus -> %u (0=DONE 1=WAITING)%c",
+      if (fd) PS3_LOG_N(24, PS3_LOG_INFO, "FLIP", "GetFlipStatus -> %u (0=DONE 1=WAITING)%c",
                   s_flip_status, 10); }
     return s_flip_status;
 }
@@ -1478,7 +1477,7 @@ void ppu_gcm_pump(void)
       if (d < 0) d = getenv("GCM_PUMP_DBG") ? 1 : 0;
       if (d) { calls++; if (p & 1) nv++; if (p & 2) nf++;
                if ((calls % 20000) == 0)
-                   fprintf(stderr, "[gcm-pump] calls=%u vblank=%u flip=%u vcount=%u%c",
+                   PS3_LOG(PS3_LOG_INFO, "gcm-pump", "calls=%u vblank=%u flip=%u vcount=%u%c",
                            calls, nv, nf, atomic_load_explicit(&s_vblank_count, memory_order_relaxed), 10); } }
     if (p & 1) {
         /* One call per vblank the driver raised since the last pump, not one for however many are pending: the
@@ -1807,7 +1806,7 @@ static void gcm_stop_fifo_dump(const char* why, u32 hdr_io, u32 stop_io, gcm_sta
     }
     fprintf(out, "%s%u words, io=0x%08X..0x%08X\n", pre, words, lo, last);
     if (f) fclose(f);
-    fprintf(stderr, "[rsx-stop-fifo] %u words around the stop word io=0x%08X (put 0x%08X) written to %s\n", words, stop_io,
+    PS3_LOG(PS3_LOG_INFO, "rsx-stop-fifo", "%u words around the stop word io=0x%08X (put 0x%08X) written to %s\n", words, stop_io,
             put, f ? path : "stderr (above)");
 }
 
@@ -2590,7 +2589,7 @@ static void gcm_2d_state_log(u32 subch, u32 method, u32 data)
     char st[640];
     s_gcm2d.subch = subch; s_gcm2d.method = method; s_gcm2d.data = data;
     gcm_2d_state(st, sizeof st);
-    fprintf(stderr, "[nv308a] unknown method: %s\n", st);
+    PS3_LOG(PS3_LOG_INFO, "nv308a", "unknown method: %s\n", st);
 }
 
 /* Every NV308A stop outside the envelope RPCS3 covers is a stop on purpose: what the console does there
@@ -2599,7 +2598,7 @@ static PS3_NORETURN void gcm_nv308a_stop(const char* feature, const char* why)
 {
     char st[640], reason[1152];
     gcm_2d_state(st, sizeof st);
-    fprintf(stderr, "[nv308a] stop %s: %s (awaits hardware evidence, #63 stage B) | %s\n", feature, why, st);
+    PS3_LOG(PS3_LOG_INFO, "nv308a", "stop %s: %s (awaits hardware evidence, #63 stage B) | %s\n", feature, why, st);
     gcm_stop_fifo_dump(feature, s_2d_hdr_io, s_2d_word_io, gcm_2d_state);
     snprintf(reason, sizeof reason, "%s (awaits hardware evidence, #63 stage B) | %s", why, st);
     ps3_stop_gcm_unmodelled(GCM_2D_FN, feature, reason);
@@ -2831,9 +2830,7 @@ static volatile u32 s_ref_qhead = 0, s_ref_qtail = 0;   /* single producer+consu
  * never mapped, while put sat at 0x604. Stop at the bad word and say so. */
 static void gcm_fifo_bad_branch(const char* kind, u32 target, u32 word)
 {
-    static int n = 0;
-    if (PS3_LOG_FIRST(n, 8))
-        fprintf(stderr, "[cellGcmSys] FIFO %s to unmapped IO 0x%08X (word 0x%08X) "
+    PS3_LOG_N(8, PS3_LOG_INFO, "cellGcmSys", "FIFO %s to unmapped IO 0x%08X (word 0x%08X) "
                 "-- not taken, drain stops here\n", kind, target, word);
 }
 
@@ -2950,9 +2947,7 @@ static u32 gcm_spu_block_for_put(u32 put)
 static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
 {
     if (s_cap) s_cap->note(RSX_CAP_NOTE_RESYNC, *getoff, put, 0);
-    static int n = 0;
-    if (PS3_LOG_FIRST(n, 8))
-        fprintf(stderr, "[cellGcmSys] FIFO resync (%s) 0x%08X -> put 0x%08X\n",
+    PS3_LOG_N(8, PS3_LOG_INFO, "cellGcmSys", "FIFO resync (%s) 0x%08X -> put 0x%08X\n",
                 why, *getoff, put);
     /* If an SPU DMA'd a pushbuffer that ends just short of `put`, that is the
      * stream the RSX is being pointed at -- land at its START and walk it,
@@ -2962,8 +2957,8 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
      * by the backend as prim=0. */
     u32 land = gcm_spu_block_for_put(put);
     if (land == 0xFFFFFFFFu) land = put;
-    else { static int b = 0; if (PS3_LOG_FIRST(b, 8))
-        fprintf(stderr, "[cellGcmSys] resync landing on SPU pushbuffer "
+    else {
+        PS3_LOG_N(8, PS3_LOG_INFO, "cellGcmSys", "resync landing on SPU pushbuffer "
                 "0x%08X (put 0x%08X) instead of skipping to put\n", land, put); }
 
     /* Sweep only the range still being skipped; the walker will consume the
@@ -3027,8 +3022,8 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
             }
             io += 4 + count * 4;
         }
-        if (rescued || labels) { static int m = 0; if (PS3_LOG_FIRST(m, 8))
-            fprintf(stderr, "[cellGcmSys] resync rescued %u fence(s) and %u label"
+        if (rescued || labels) {
+            PS3_LOG_N(8, PS3_LOG_INFO, "cellGcmSys", "resync rescued %u fence(s) and %u label"
                     " write(s) from 0x%08X..0x%08X\n", rescued, labels, from, land); }
     }
     *getoff = land;
@@ -3046,14 +3041,14 @@ static void gcm_fifo_dump_around(u32 getoff)
         u32 k = (s_tr_i + t) % GCM_TRACE_N;
         if (!s_tr_w[k]) continue;
         u32 w = s_tr_w[k];
-        fprintf(stderr, "[FIFOSTEP] io=%08X w=%08X  type=%u method=0x%04X count=%u\n",
+        PS3_LOG(PS3_LOG_INFO, "FIFOSTEP", "io=%08X w=%08X  type=%u method=0x%04X count=%u\n",
                 s_tr_off[k], w, w >> 29, w & 0x1FFCu, (w >> 18) & 0x7FFu);
     }
     for (int k = -20; k <= 2; k++) {
         u32 io = getoff + (u32)(k * 4);
         u32 ea = gcm_io2ea(io);
         if (!ea) continue;
-        fprintf(stderr, "[FIFODUMP] %+3d io=%08X w=%08X%s\n",
+        PS3_LOG(PS3_LOG_INFO, "FIFODUMP", "%+3d io=%08X w=%08X%s\n",
                 k, io, vm_read32(ea), k ? "" : "   <-- bad word");
     }
 }
@@ -3062,12 +3057,11 @@ static void gcm_fifo_dump_around(u32 getoff)
 static void gcm_ref_push_at(u32 v, u32 getoff)
 {
     { static int _d = -1; if (_d < 0) _d = getenv("GCM_REFLOG") ? 1 : 0;
-      if (_d) fprintf(stderr, "[refq] drained fence 0x%X at getoff=%08X\n", v, getoff); }
+      if (_d) PS3_LOG(PS3_LOG_INFO, "refq", "drained fence 0x%X at getoff=%08X\n", v, getoff); }
     u32 t = s_ref_qtail;
     if (t - s_ref_qhead >= GCM_REF_QLEN) {   /* overflow: drop oldest (keeps liveness) */
         s_ref_qhead++;
-        static int _o = 0;
-        if (PS3_LOG_FIRST(_o, 4)) fprintf(stderr, "[cellGcmSys] fence queue overflow -- oldest dropped\n");
+        PS3_LOG_N(4, PS3_LOG_INFO, "cellGcmSys", "fence queue overflow -- oldest dropped\n");
     }
     s_ref_q[t % GCM_REF_QLEN] = v;
     s_ref_qtail = t + 1;
@@ -3094,7 +3088,7 @@ static void gcm_ref_publish_one(void)
      * timeline. Same stream = same ordering. */
     { static int _rd = -1; if (_rd < 0) _rd = getenv("GCM_REFPUB") ? 1 : 0;
       if (_rd) { static unsigned long _n = 0; if (++_n <= 24)
-        fprintf(stderr, "[refpub] t=%lluus #%lu wrote 0x%08X -> readback 0x%08X\n", ps3_qpc_us(), _n,
+        PS3_LOG(PS3_LOG_INFO, "refpub", "t=%lluus #%lu wrote 0x%08X -> readback 0x%08X\n", ps3_qpc_us(), _n,
                 s_ref_q[h % GCM_REF_QLEN], vm_read32(GCM_CONTROL_GUEST_ADDR + 8)); } }
     s_ref_qhead = h + 1;
 }
@@ -3258,19 +3252,19 @@ static void gcm_method_stats_report(void)
     t0 = now;
     GcmMethodStats st;
     gcm_method_stats(&st);
-    fprintf(stderr, "[rsx-method-stats] handled=%llu inert=%llu missing=%llu unknown=%llu unbound=%llu "
+    PS3_LOG(PS3_LOG_INFO, "rsx-method-stats", "handled=%llu inert=%llu missing=%llu unknown=%llu unbound=%llu "
                     "m2mf_copies=%llu\n",
             st.handled, st.inert, st.missing, st.unknown, st.unbound, st.m2mf_copies);
     for (u32 c = 0; c < RSX_CLASS_COUNT; c++)
         for (u32 i = 0; i < 0x800u; i++) {
             const unsigned long long n = atomic_load_explicit(&s_mc_tab[c][i].count, memory_order_relaxed);
-            if (n) fprintf(stderr, "[rsx-method-stats]   unknown %s 0x%04X x%llu (first: subchannel %u, data 0x%08X)\n",
+            if (n) PS3_LOG(PS3_LOG_INFO, "rsx-method-stats", "  unknown %s 0x%04X x%llu (first: subchannel %u, data 0x%08X)\n",
                            rsx_class_name((rsx_class_id)c), i << 2, n, s_mc_tab[c][i].subch, s_mc_tab[c][i].data);
         }
     for (u32 c = 0; c < RSX_CLASS_COUNT; c++)
         for (u32 i = 0; i < 0x800u; i++) {
             const unsigned long long n = atomic_load_explicit(&s_miss_tab[c][i].count, memory_order_relaxed);
-            if (n) fprintf(stderr, "[rsx-method-stats]   missing %s 0x%04X x%llu (first: subchannel %u, data 0x%08X)\n",
+            if (n) PS3_LOG(PS3_LOG_INFO, "rsx-method-stats", "  missing %s 0x%04X x%llu (first: subchannel %u, data 0x%08X)\n",
                            rsx_class_name((rsx_class_id)c), i << 2, n, s_miss_tab[c][i].subch, s_miss_tab[c][i].data);
         }
 }
@@ -3336,7 +3330,7 @@ static void* wprof_thread(void* arg)
     sa.sa_sigaction = wprof_handler; sa.sa_flags = SA_SIGINFO | SA_RESTART;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGPROF, &sa, NULL);
-    fprintf(stderr, "[walker prof] sampling for %d s\n", secs);
+    PS3_LOG(PS3_LOG_INFO, "walker prof", "sampling for %d s\n", secs);
     const u64 deadline = get_timestamp_ns() + (u64)secs * 1000000000ULL;
     do {
         pthread_kill(s_wprof_target, SIGPROF);
@@ -3368,7 +3362,7 @@ static void* wprof_thread(void* arg)
         }
         fclose(f);
     }
-    fprintf(stderr, "[walker prof] %d samples -> %s\n", n, out ? out : "(none)");
+    PS3_LOG(PS3_LOG_INFO, "walker prof", "%d samples -> %s\n", n, out ? out : "(none)");
     atomic_store(&s_wprof_state, 2);
     return NULL;
 }
@@ -3386,7 +3380,7 @@ static void wprof_note_walker(void)
     s_wprof_target = pthread_self();
     pthread_t t;
     if (pthread_create(&t, NULL, wprof_thread, NULL) != 0) {
-        fprintf(stderr, "[walker prof] sampler thread not started\n");
+        PS3_LOG(PS3_LOG_WARN, "walker prof", "sampler thread not started\n");
         atomic_store(&s_wprof_state, 2);
         return;
     }
@@ -3567,11 +3561,11 @@ static int gcm_report_hold(void)
         h_gaveup += (unsigned)gave_up;
         static int ln = 0;
         if (gave_up || PS3_LOG_FIRST(ln, 16))
-            fprintf(stderr, "[report-hold] #%u get=0x%08X held %llu ms%s (%u given up so far)\n",
+            PS3_LOG(PS3_LOG_INFO, "report-hold", "#%u get=0x%08X held %llu ms%s (%u given up so far)\n",
                     h_n, s_fifo_getoff, now - h_t0,
                     gave_up ? ", gave up with a task still busy" : "", h_gaveup);
         if (gave_up)
-            fprintf(stderr, "[report-hold]   busy: %d, first taskset 0x%08X task %u\n", busy, ts, tid);
+            PS3_LOG(PS3_LOG_INFO, "report-hold", "  busy: %d, first taskset 0x%08X task %u\n", busy, ts, tid);
     }
     h_t0 = 0;
     return 0;
@@ -3592,7 +3586,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
           unsigned long long now = ps3_ms_now();
           if (_t0 == 0) _t0 = now;
           if (now - _t0 >= 2000) {
-              fprintf(stderr, "[RATE] drains/sec=%.0f\n", _n * 1000.0 / (now - _t0));
+              PS3_LOG(PS3_LOG_INFO, "RATE", "drains/sec=%.0f\n", _n * 1000.0 / (now - _t0));
               _n = 0; _t0 = now;
           }
       } }
@@ -3647,7 +3641,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
         u32 cur = ptr ? vm_read32(ptr + 0x8) : 0;
         if (ptr != last_ptr || cur != last_cur) {
             last_ptr = ptr; last_cur = cur;
-            fprintf(stderr, "[CTX] gCellGcmCurrentContext@0x%08X -> 0x%08X  "
+            PS3_LOG(PS3_LOG_INFO, "CTX", "gCellGcmCurrentContext@0x%08X -> 0x%08X  "
                     "begin=%08X end=%08X current=%08X callback=%08X  (ours=0x%08X)\n",
                     s_gcm_ctx_out_ea, ptr,
                     ptr ? vm_read32(ptr + 0x0) : 0, ptr ? vm_read32(ptr + 0x4) : 0,
@@ -3684,12 +3678,12 @@ static void gcm_rsx_process_fifo_unlocked(void)
             u32 w = vm_read32(ea);
             if ((w & 0x1FFCu) == 0x0050u && (w >> 29) == 0) {
                 u32 dea = gcm_io2ea(io + 4);
-                fprintf(stderr, "[SCANREF] io=%08X w=%08X count=%u arg=%08X\n",
+                PS3_LOG(PS3_LOG_INFO, "SCANREF", "io=%08X w=%08X count=%u arg=%08X\n",
                         io, w, (w >> 18) & 0x7FFu, dea ? vm_read32(dea) : 0xDEADu);
                 found++;
             }
         }
-        fprintf(stderr, "[SCANREF] %u SET_REFERENCE in 0..%08X\n", found, put);
+        PS3_LOG(PS3_LOG_INFO, "SCANREF", "%u SET_REFERENCE in 0..%08X\n", found, put);
       } }
 
     /* GCM_FIFO_SNAP=N: dump N snapshots of the raw words at both ends of the
@@ -3702,11 +3696,11 @@ static void gcm_rsx_process_fifo_unlocked(void)
       if (snap < 0) { const char* e = getenv("GCM_FIFO_SNAP"); snap = e ? atoi(e) : 0; }
       if (snap > 0 && put) {
           snap--;
-          fprintf(stderr, "[SNAP] get=%08X put=%08X\n", s_fifo_getoff, put);
+          PS3_LOG(PS3_LOG_INFO, "SNAP", "get=%08X put=%08X\n", s_fifo_getoff, put);
           for (int k = 0; k < 16; k++) {
               u32 gio = s_fifo_getoff + (u32)(k * 4), pio = put + (u32)(k * 4);
               u32 gea = gcm_io2ea(gio), pea = gcm_io2ea(pio);
-              fprintf(stderr, "[SNAP]  get+%-3d io=%08X w=%08X   put+%-3d io=%08X w=%08X\n",
+              PS3_LOG(PS3_LOG_INFO, "SNAP", " get+%-3d io=%08X w=%08X   put+%-3d io=%08X w=%08X\n",
                       k * 4, gio, gea ? vm_read32(gea) : 0xDEADDEADu,
                       k * 4, pio, pea ? vm_read32(pea) : 0xDEADDEADu);
           }
@@ -3736,7 +3730,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
             if (s_fifo_getoff != last_bad || n < 4) {
                 last_bad = s_fifo_getoff;
                 if (PS3_LOG_FIRST(n, 16))
-                    fprintf(stderr, "[cellGcmSys] FIFO get=0x%08X has no IO "
+                    PS3_LOG(PS3_LOG_INFO, "cellGcmSys", "FIFO get=0x%08X has no IO "
                             "mapping -- resyncing to put=0x%08X\n",
                             s_fifo_getoff, put);
             }
@@ -3767,7 +3761,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
               if (!w && s_fifo_getoff < put) { static int mm = 0;
                   const u32 alias = s_fifo_getoff + 0x11000000u;
                   if (mm < 6 && ea != alias && vm_read32(alias)) { mm++;
-                      fprintf(stderr, "[io2ea-mismatch] io=%08X walker_ea=%08X (w=0) alias=%08X w=%08X\n",
+                      PS3_LOG(PS3_LOG_INFO, "io2ea-mismatch", "io=%08X walker_ea=%08X (w=0) alias=%08X w=%08X\n",
                               s_fifo_getoff, ea, alias, vm_read32(alias)); } }
               if (!w) nop++;
               else if ((w & 0xE0000003u) == 0x20000000u || (w & 3u) == 1u) jmp++;
@@ -3840,7 +3834,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
               if (dbg < 0) dbg = getenv("GCM_FLIPCOUNT") ? 1 : 0;
               ++flips;
               if (dbg && (flips <= 8ull || (flips % 200ull) == 0))
-                  fprintf(stderr, "[flipword] %llu FIFO flip words decoded%c",
+                  PS3_LOG(PS3_LOG_INFO, "flipword", "%llu FIFO flip words decoded%c",
                           flips, 10); }
             if (PS3_FT_ON()) { const uint64_t t = ps3_ft_now();
                                ps3_ft_span(PS3_FT_FLIP_FIFO, 0, w & 7u, 0, t, t); }
@@ -3878,7 +3872,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
 
         if (is_jump) {                         /* JUMP: 0x20000000 | offset, or offset | 1 */
             { static int _rd = -1; if (_rd < 0) _rd = getenv("GCM_RECDBG") ? 1 : 0;
-              if (_rd) fprintf(stderr, "[JMP] %08X -> %08X (put=%08X)\n",
+              if (_rd) PS3_LOG(PS3_LOG_INFO, "JMP", "%08X -> %08X (put=%08X)\n",
                                s_fifo_getoff, jump_tgt, put); }
             { u32 tgt = jump_tgt;
               if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("JUMP", tgt, w); gcm_fifo_dump_around(s_fifo_getoff); gcm_fifo_resync_why("unmapped-JUMP", &s_fifo_getoff, put); break; }
@@ -3922,7 +3916,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                                * resync, which would then jump over the
                                * commands it just wrote. */
                               vm_read32(gcm_io2ea(s_fifo_getoff)) == w) {
-                              fprintf(stderr, "[cellGcmSys] jump-park intervention: mode=compatibility grace=%u ms "
+                              PS3_LOG(PS3_LOG_INFO, "cellGcmSys", "jump-park intervention: mode=compatibility grace=%u ms "
                                       "park=0x%08X stood=%llu ms put=0x%08X: get follows put, the commands between "
                                       "are dropped (gcm.park_resync)\n",
                                       ps3_cfg_gcm_park_grace_ms(), s_fifo_getoff, now - park_since, put);
@@ -3988,9 +3982,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
                   hist[mi]++; tot[mi] += count;
                   static u64 seen = 0;
                   if (++seen == 200000ull && !dumped) { dumped = 1;
-                      fprintf(stderr, "[TCFIFO] method histogram (blocks, dwords):%c", 10);
+                      PS3_LOG(PS3_LOG_INFO, "TCFIFO", "method histogram (blocks, dwords):%c", 10);
                       for (u32 k = 0; k < 2048; k++) if (hist[k])
-                          fprintf(stderr, "[TCFIFO]   0x%04X  %8u blocks %10u dwords%c",
+                          PS3_LOG(PS3_LOG_INFO, "TCFIFO", "  0x%04X  %8u blocks %10u dwords%c",
                                   k << 2, hist[k], tot[k], 10);
                   }
               } }
@@ -4038,9 +4032,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     u32 v = vm_read32(dea);
                     u32 la = GCM_LABEL_GUEST_BASE + (s_sema_offset & 0xFFFFu);
                     const u32 lv = (m == 0x68u) ? gcm_cap_read32(s_sema_offset, la, RSX_CAP_READ_LABEL) : 0;
-                    { static int sn = 0, recdbg = -1; if (recdbg < 0) recdbg = getenv("GCM_RECDBG") ? 1 : 0;
-                      if (recdbg && PS3_LOG_FIRST(sn, 12))
-                        fprintf(stderr, "[SEMA] m=0x%02X v=0x%08X off=0x%X\n", m, v, s_sema_offset); }
+                    { static int recdbg = -1; if (recdbg < 0) recdbg = getenv("GCM_RECDBG") ? 1 : 0;
+                      if (recdbg) PS3_LOG_N(12, PS3_LOG_INFO, "SEMA", "m=0x%02X v=0x%08X off=0x%X\n", m, v, s_sema_offset); }
                     /* PS3_FTRACE: an acquire this walker sat on is satisfied now. */
                     if (m == 0x68u && s_ft_sema_t0 && lv == v) {
                         ps3_ft_span(PS3_FT_SEMA, 0, s_sema_offset, v, s_ft_sema_t0, ps3_ft_now());
@@ -4062,8 +4055,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                         atomic_thread_fence(memory_order_release);
                         vm_write32(la, v);
                         if (s_cap) s_cap->write(RSX_CAP_LOC_MAIN, s_sema_offset, la, vm_base + la, 4, RSX_CAP_WRITE_LABEL);
-                        { static int rn = 0; if (s_sema_offset != 0x400u && PS3_LOG_FIRST(rn, 40))   /* TEMP */
-                            fprintf(stderr, "[SEMA-REL] get=0x%08X off=0x%X val=0x%08X\n", s_fifo_getoff, s_sema_offset, v); }
+                        { if (s_sema_offset != 0x400u) PS3_LOG_N(40, PS3_LOG_INFO, "SEMA-REL", "get=0x%08X off=0x%X val=0x%08X\n", s_fifo_getoff, s_sema_offset, v); }
                     }
                     else if (m == 0x68u && lv != v) {
                         /* ACQUIRE stalls the RSX until the label holds the value; it consumes the
@@ -4164,10 +4156,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * is not a 2D method at all: it tells the RSX to raise a
                  * USER_CMD interrupt, which is what ps1_netemu's flip path
                  * blocks on. */
-                if (wdiag) { static int sd = -1; static unsigned long s7 = 0;
+                if (wdiag) { static int sd = -1;
                   if (sd < 0) sd = getenv("GCM_SUBCH7") ? 1 : 0;
-                  if (sd && subch == 7 && (PS3_LOG_FIRST(s7, 16)))
-                      fprintf(stderr, "[subch7] method=0x%04X data=0x%08X\n",
+                  if (sd && subch == 7) PS3_LOG_N(16, PS3_LOG_INFO, "subch7", "method=0x%04X data=0x%08X\n",
                               m, vm_read32(dea)); }
                 if (subch == 7 && m == 0x0B00u) {
                     extern void rsx_raise_user_cmd(u32 arg);
@@ -4367,8 +4358,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 { why = "flip"; s_acquire_blocked = 1; break; }
             continue;
         }
-        { static int _uw = 0; if (PS3_LOG_FIRST(_uw, 16) && getenv("RTT_DUMP"))
-            fprintf(stderr, "[FIFOUW] unknown word 0x%08X at getoff 0x%X\n", w, s_fifo_getoff); }
+        { if (getenv("RTT_DUMP")) PS3_LOG_N(16, PS3_LOG_INFO, "FIFOUW", "unknown word 0x%08X at getoff 0x%X\n", w, s_fifo_getoff); }
         if (s_cap) { gcm_cap_step(RSX_CAP_STEP_WORD, s_fifo_getoff, put, &w, 1, 0, 0, 0, 0); s_cap->step_end(); }
         s_fifo_getoff += 4;                    /* unknown word: skip */
     }
@@ -4405,7 +4395,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
           if (++burned >= passes) {
               static int n = 0;
               if (PS3_LOG_FIRST(n, 8))
-                  fprintf(stderr, "[cellGcmSys] FIFO walker circling (get=0x%08X, "
+                  PS3_LOG(PS3_LOG_INFO, "cellGcmSys", "FIFO walker circling (get=0x%08X, "
                           "put=0x%08X, full budget burned x%d) -- following the "
                           "write head\n", s_fifo_getoff, put, burned);
               /* What the walker circles in: the words at get, and where the
@@ -4413,12 +4403,12 @@ static void gcm_rsx_process_fifo_unlocked(void)
               if (n <= 3 && getenv("GCM_CIRCLE_DUMP"))
                   for (u32 t = 0; t < 8; t++) {
                       u32 q = (s_cf_i + t) % 8;
-                      if (s_cf_w[q]) fprintf(stderr, "[circle-jump] at io=%08X w=%08X\n", s_cf_off[q], s_cf_w[q]);
+                      if (s_cf_w[q]) PS3_LOG(PS3_LOG_INFO, "circle-jump", "at io=%08X w=%08X\n", s_cf_off[q], s_cf_w[q]);
                   }
               if (n <= 3 && getenv("GCM_CIRCLE_DUMP"))
                   for (int k = -8; k <= 24; k++) {
                       u32 io = s_fifo_getoff + (u32)(k * 4), ea = gcm_io2ea(io);
-                      if (ea) fprintf(stderr, "[circle] %+3d io=%08X ea=%08X w=%08X\n", k, io, ea, vm_read32(ea));
+                      if (ea) PS3_LOG(PS3_LOG_INFO, "circle", "%+3d io=%08X ea=%08X w=%08X\n", k, io, ea, vm_read32(ea));
                   }
               gcm_fifo_resync_why("circling", &s_fifo_getoff, put);
               burned = 0;
@@ -4452,7 +4442,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
     if (s_draindbg) {
         static int n2 = 0;
         if (n2++ % s_drain_every == 0)
-            fprintf(stderr, "[DRAINEND] %s: %08X -> %08X (%u bytes), put=%08X\n",
+            PS3_LOG(PS3_LOG_INFO, "DRAINEND", "%s: %08X -> %08X (%u bytes), put=%08X\n",
                     why, start_off, s_fifo_getoff, s_fifo_getoff - start_off, put);
     }
     /* Recycle the TITLE'S OWN command buffer when its callback will not.
@@ -4540,9 +4530,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * already at begin == put. God of War HD stopped for 2-4 s at
                  * random points in gameplay this way. */
                 s_fifo_back_jumps++;
-                static int n = 0;
-                if (PS3_LOG_FIRST(n, 8))
-                    fprintf(stderr, "[cellGcmSys] recycled the title's own ring "
+                PS3_LOG_N(8, PS3_LOG_INFO, "cellGcmSys", "recycled the title's own ring "
                             "(ctx=0x%08X begin=0x%08X end=0x%08X) -- its callback "
                             "does not%c", ctx, begin, end, 10);
             }
@@ -4655,7 +4643,7 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
     static int s_recdbg = -1;
     if (s_recdbg < 0) s_recdbg = getenv("GCM_RECDBG") ? 1 : 0;
     if (s_recdbg)
-        fprintf(stderr, "[REC>] tid=%u begin=%08X cur=%08X put=%08X get=%08X drained=%08X\n",
+        PS3_LOG(PS3_LOG_INFO, "REC>", "tid=%u begin=%08X cur=%08X put=%08X get=%08X drained=%08X\n",
                 (unsigned)GetCurrentThreadId(), begin, current,
                 vm_read32(GCM_CONTROL_GUEST_ADDR + 0),
                 vm_read32(GCM_CONTROL_GUEST_ADDR + 4),
@@ -4698,7 +4686,7 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
         if (s_fifo_getoff != last_get) { last_get = s_fifo_getoff; idle = 0; }
         else idle++;
         if (s_recdbg && spins % 1000 == 0)
-            fprintf(stderr, "[REC~] %d ms: walker get=%08X put=%08X back_jumps=%u\n",
+            PS3_LOG(PS3_LOG_INFO, "REC~", "%d ms: walker get=%08X put=%08X back_jumps=%u\n",
                     spins, s_fifo_getoff, vm_read32(GCM_CONTROL_GUEST_ADDR + 0),
                     s_fifo_back_jumps);
     }
@@ -4713,7 +4701,7 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
     s_fifo_recycle_waiting = 0;                          /* current no longer reads end */
 
     if (s_recdbg)
-        fprintf(stderr, "[REC<] tid=%u cur-now=%08X put=%08X get=%08X drained=%08X spins=%d\n",
+        PS3_LOG(PS3_LOG_INFO, "REC<", "tid=%u cur-now=%08X put=%08X get=%08X drained=%08X spins=%d\n",
                 (unsigned)GetCurrentThreadId(), vm_read32(ctx_ea + 0x8),
                 vm_read32(GCM_CONTROL_GUEST_ADDR + 0),
                 vm_read32(GCM_CONTROL_GUEST_ADDR + 4),
@@ -4821,7 +4809,7 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
           if (!t0) t0 = now;
           ++n;
           if (n <= 400ull || (n % 10ull) == 0)
-              fprintf(stderr, "[flip] %llu at %llu ms%c", n, now - t0, 10);
+              PS3_LOG(PS3_LOG_INFO, "flip", "%llu at %llu ms%c", n, now - t0, 10);
       } }
 
     /* GCM_FLIP_BT=<n>: dump the flipping thread's guest stack for the flips
@@ -4847,9 +4835,8 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
           }
       } }
 
-    { static int _n=0, _fd=-1; if (_fd < 0) _fd = getenv("FLIP_DBG") ? 1 : 0;
-      if (_fd && PS3_LOG_FIRST(_n, 20))
-        fprintf(stderr, "[FLIP] SetFlipCommand(buf=%u) set=%d\n",
+    { static int _fd=-1; if (_fd < 0) _fd = getenv("FLIP_DBG") ? 1 : 0;
+      if (_fd) PS3_LOG_N(20, PS3_LOG_INFO, "FLIP", "SetFlipCommand(buf=%u) set=%d\n",
                 bufferId, bufferId < CELL_GCM_MAX_DISPLAY_BUFFER_NUM ? s_display_buffer_set[bufferId] : -1); }
     if (bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM)
         return CELL_GCM_ERROR_INVALID_VALUE;
@@ -5304,8 +5291,8 @@ s32 cellGcmAddressToOffset(u32 address, u32* offset)
 
     printf("[cellGcmSys] WARNING: AddressToOffset failed for 0x%08X\n", address);
     { static int _d = -1; if (_d < 0) _d = getenv("A2O_FAILDBG") ? 1 : 0;
-      if (_d) { static int _n = 0; if (PS3_LOG_FIRST(_n, 12))
-          fprintf(stderr, "[A2O] FAILED ea=0x%08X (not in local or IO space)%c",
+      if (_d) {
+          PS3_LOG_N(12, PS3_LOG_WARN, "A2O", "FAILED ea=0x%08X (not in local or IO space)%c",
                   address, 10); } }
     return CELL_GCM_ERROR_FAILURE;
 
@@ -5633,7 +5620,7 @@ u32* cellGcmGetLabelAddress(u8 index)
      * type already bounds the index. The old `index >= 256` test could never
      * be true. */
     { static int n = 0; if (n++ < 32)   /* TEMP */
-        fprintf(stderr, "[cellGcmSys] GetLabelAddress(0x%X) -> 0x%08X\n", index,
+        PS3_LOG(PS3_LOG_INFO, "cellGcmSys", "GetLabelAddress(0x%X) -> 0x%08X\n", index,
                 GCM_LABEL_GUEST_BASE + (u32)index * GCM_LABEL_STRIDE); }
     return (u32*)(uintptr_t)(GCM_LABEL_GUEST_BASE + (u32)index * GCM_LABEL_STRIDE);
 }
@@ -5806,7 +5793,7 @@ u32 cellGcmGetTiledPitchSize(u32 size)
             if (s_valid_pitches[i] >= size) { r = s_valid_pitches[i]; break; }
         }
     }
-    { static int _n=0; if (PS3_LOG_FIRST(_n, 4)) fprintf(stderr, "[cellGcmSys] GetTiledPitchSize(0x%X) -> 0x%X\n", size, r); }
+    { PS3_LOG_N(4, PS3_LOG_INFO, "cellGcmSys", "GetTiledPitchSize(0x%X) -> 0x%X\n", size, r); }
     return r;
 }
 

@@ -24,12 +24,17 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def compile_fixture(tmp, extra):
     binary = tmp / ('test-' + ('tsan' if extra else 'plain'))
+    # cellGcmSys.c's migrated diagnostics call ps3_log_*; the fixture supplies ps3_config_get and the
+    # stops (gcm_fixture_stubs.h), so the log links with host_exit.c and the mirror stub.
     linker = ['-Wl,-dead_strip'] if sys.platform == 'darwin' else ['-Wl,--gc-sections', '-pthread', '-lm']
     subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG', '-D_GNU_SOURCE', *extra,
                     '-ffunction-sections', '-fdata-sections',
                     '-I' + str(ROOT / 'include'), '-I' + str(ROOT / 'libs/video'),
                     str(ROOT / 'libs/video/tests/test_gcm_handler_mask.c'),
                     str(ROOT / 'runtime/memory/label_window.c'),
+                    str(ROOT / 'runtime/diag/host_exit.c'),
+                    str(ROOT / 'runtime/diag/ps3_log.c'),
+                    str(ROOT / 'tests/ps3_log_mirror_stub.c'),
                     str(ROOT / 'libs/video/gcm_default_state.c'), *linker, '-o', str(binary)],
                    check=True, capture_output=True, text=True)
     return binary

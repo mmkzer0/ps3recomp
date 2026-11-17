@@ -25,6 +25,8 @@ GRACE_MS = 20        # gcm.park_grace_ms: a small fraction of the timeout
 
 with tempfile.TemporaryDirectory(prefix='gcm-park-modes-') as tmp:
     binary = Path(tmp) / 'test'
+    # cellGcmSys.c's migrated diagnostics call ps3_log_*; the fixture supplies ps3_config_get and the
+    # stops (gcm_fixture_stubs.h), so the log links with host_exit.c and the mirror stub.
     linker = ['-Wl,-dead_strip'] if sys.platform == 'darwin' else ['-Wl,--gc-sections', '-pthread', '-lm']
     subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG',
                     '-ffunction-sections', '-fdata-sections',
@@ -32,6 +34,8 @@ with tempfile.TemporaryDirectory(prefix='gcm-park-modes-') as tmp:
                     str(root / 'libs/video/tests/test_gcm_park_modes.c'),
                     str(root / 'runtime/memory/label_window.c'),
                     str(root / 'runtime/diag/host_exit.c'),
+                    str(root / 'runtime/diag/ps3_log.c'),
+                    str(root / 'tests/ps3_log_mirror_stub.c'),
                     str(root / 'libs/video/gcm_default_state.c'), *linker,
                     '-o', str(binary)], check=True)
 

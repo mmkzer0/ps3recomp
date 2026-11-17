@@ -1,5 +1,6 @@
 #import <stdio.h>
 #import "ps3emu/metal_ios_display.h"
+#import "ps3emu/ps3_log.h"   /* PS3_LOG: tagged lines, stderr bytes unchanged */
 #import "rsx_metal_backend.h"
 
 #import <QuartzCore/QuartzCore.h>
@@ -28,12 +29,12 @@ static void ps3recomp_observe_gpu_lifecycle(void)
     NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
     void (^suspend)(NSNotification *) = ^(NSNotification *note) {
         (void)note;
-        fprintf(stderr, "[RSX metal] app inactive: GPU work paused\n");
+        PS3_LOG(PS3_LOG_INFO, "RSX metal", "app inactive: GPU work paused\n");
         rsx_metal_backend_gpu_suspend();
     };
     void (^resume)(NSNotification *) = ^(NSNotification *note) {
         (void)note;
-        fprintf(stderr, "[RSX metal] app active: GPU work resumed\n");
+        PS3_LOG(PS3_LOG_INFO, "RSX metal", "app active: GPU work resumed\n");
         rsx_metal_backend_gpu_resume();
     };
     [center addObserverForName:UIApplicationWillResignActiveNotification
@@ -72,12 +73,12 @@ CAMetalLayer *ps3recomp_metal_ios_configure_layer(id<MTLDevice> device,
     __block CAMetalLayer *result = nil;
     void (^configure)(void) = ^{
         if (!s_view) {
-            fprintf(stderr, "[RSX metal] no UIKit view: the app must call "
+            PS3_LOG(PS3_LOG_INFO, "RSX metal", "no UIKit view: the app must call "
                             "ps3recomp_metal_ios_view on the main thread before the guest starts\n");
             return;
         }
         if (!device || !width || !height) {
-            fprintf(stderr, "[RSX metal] UIKit layer needs a device and a non-zero size "
+            PS3_LOG(PS3_LOG_INFO, "RSX metal", "UIKit layer needs a device and a non-zero size "
                             "(device %p, %ux%u)\n", (__bridge void *)device, width, height);
             return;
         }
