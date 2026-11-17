@@ -170,12 +170,19 @@ struct Waiter {
 
 /* The PM's release call after a credit that brought a registered waiter's A to
  * 0. `kind` is bits 30:29 of the line as the PM re-reads it (the PM's
- * release helper takes 0, 1, 2 or 3), `id` the word at +0x04. */
+ * release helper takes 0, 1, 2 or 3), `id` the word at +0x04. The completion
+ * snapshots retain the exact wait-kind word that produced a wake for failure
+ * diagnostics; normal wake behavior uses only due/kind/id. */
 struct Wakeup {
     bool due = false;
     std::uint32_t kind = 0;
     std::uint32_t id = 0;
-    friend bool operator==(const Wakeup&, const Wakeup&) = default;
+    std::uint32_t completion_before = 0;
+    std::uint32_t completion_after = 0;
+    friend constexpr bool operator==(const Wakeup& lhs, const Wakeup& rhs) noexcept
+    {
+        return lhs.due == rhs.due && lhs.kind == rhs.kind && lhs.id == rhs.id;
+    }
 };
 
 /* What one look at the line decided in a Sync (the firmware helper's single
@@ -219,13 +226,15 @@ struct PortWords {
     /* The PM's per-job credit: always stores. */
     constexpr Wakeup credit_completion() noexcept
     {
-        const std::int32_t a = sext29(completion);
-        const bool was_waiting = waiting();
+        const std::uint32_t completion_before = completion;
+        const std::uint32_t waiter_word = waiter;
+        const std::int32_t a = sext29(completion_before);
+        const bool was_waiting = (completion_before & kWaitingBit) != 0;
         const bool still_waiting = was_waiting && a != -1;
-        completion = (still_waiting ? kWaitingBit : 0u) | (completion & kWaitKindMask) |
+        completion = (still_waiting ? kWaitingBit : 0u) | (completion_before & kWaitKindMask) |
                      (static_cast<std::uint32_t>(a + 1) & kCreditMask);
         if (!(was_waiting && a == -1)) return {};
-        return {true, (completion & kWaitKindMask) >> kWaitKindShift, waiter};
+        return {true, (completion & kWaitKindMask) >> kWaitKindShift, waiter_word, completion_before, completion};
     }
 
     /* Sync, claim step: stores iff it returns ok, and then `submitted_out` is B

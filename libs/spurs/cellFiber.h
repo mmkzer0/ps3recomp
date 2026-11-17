@@ -101,12 +101,45 @@ s32 cellFiberPpuUtilWorkerControlFinalize(u32 control);
 
 /* Host notification and observer boundary, not firmware exports. Registry ->
  * reservation line; returns only after publication and worker notification.
- * Set the exit hook while no worker runs; it executes outside the registry
- * lock, before the exiting worker releases its guest slot/count. */
+ * Diagnostic events are a bounded, lock-protected history for fail-closed
+ * JobQueue2 wake reports; event kinds are internal and are not firmware ABI. */
+#define PS3_FIBER_DIAG_EVENT_CAPACITY 8
+typedef enum ps3_fiber_lifecycle_kind {
+    PS3_FIBER_EVENT_CREATE = 1,
+    PS3_FIBER_EVENT_PORT_WAIT,
+    PS3_FIBER_EVENT_WAIT_SIGNAL,
+    PS3_FIBER_EVENT_SIGNAL,
+    PS3_FIBER_EVENT_FINISH,
+    PS3_FIBER_EVENT_NOTIFY_REJECT
+} ps3_fiber_lifecycle_kind;
 typedef enum ps3_fiber_notify_status {
     PS3_FIBER_NOTIFY_OK, PS3_FIBER_NOTIFY_NULL, PS3_FIBER_NOTIFY_ALIGN, PS3_FIBER_NOTIFY_STATE
 } ps3_fiber_notify_status;
+typedef struct ps3_fiber_lifecycle_event {
+    u64 sequence;
+    u64 generation;
+    u32 fiber_ea;
+    u32 current_ea;
+    u32 kind;
+    u32 host_state;
+    u32 guest_state;
+} ps3_fiber_lifecycle_event;
+typedef struct ps3_fiber_notify_diagnostic {
+    u32 fiber_ea;
+    u32 found;
+    u32 host_state;
+    u32 observed_state;
+    u64 generation;
+    u64 create_sequence;
+    u64 finish_sequence;
+    u32 event_count;
+    ps3_fiber_lifecycle_event events[PS3_FIBER_DIAG_EVENT_CAPACITY];
+} ps3_fiber_notify_diagnostic;
 ps3_fiber_notify_status ps3_fiber_notify(u32 fiber);
+/* On success, diagnostic is untouched; a failed call fills it under the registry lock. */
+ps3_fiber_notify_status ps3_fiber_notify_with_diagnostics(u32 fiber, ps3_fiber_notify_diagnostic* diagnostic);
+/* Called after a fiber's Port2Sync waiter is published, before WaitSignal. */
+void ps3_fiber_note_port_wait(u32 fiber);
 void ps3_fiber_set_worker_exit_hook(void (*hook)(void*, u32), void* user);
 
 #ifdef __cplusplus
