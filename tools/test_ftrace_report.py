@@ -1862,6 +1862,97 @@ with tempfile.TemporaryDirectory() as tmp:
           "pad latency: a duplicate present of the same flip is not a new frame")
     check("latency p50 16.500" in run(tmp, trace(dup))[1],
           "pad latency: the text report pairs with the new frame, not the duplicate")
+# Kinds 38 (SHADER_COMPILE) and 39 (PIPELINE_CREATE): who 1 = the RSX/draw-engine thread, 0 = host. Presents
+# every 10 ms except 40->65 and 85->110 (25 ms) and 120->150 (30 ms), so the median gap is 10 and the threshold
+# 20. The builds on the RSX thread overlap the two 25 ms gaps (the longest one is reported), the 30 ms gap has
+# only a host-thread build and must not be a candidate, and the 39 who 0 in the first long gap must not either.
+SHADER_COMPILE, PIPELINE_CREATE = 38, 39
+shlines = [span(FLIP_REQ, 1, 0, 0, t, t) for t in (0, 20, 40, 60)]
+shlines += [span(ENG_PRESENT, 0, k, 0, t, t) for k, t in enumerate((0, 10, 20, 30, 40, 65, 75, 85, 110, 120, 150))]
+shlines += [span(SHADER_COMPILE, 1, 0xABC, 1234, 42, 64),       # 22 ms, in the 40->65 gap
+            span(PIPELINE_CREATE, 1, 0xDEF, 0, 41, 41.5),       # 0.5 ms, also in it
+            span(SHADER_COMPILE, 0, 0x111, 200, 25, 26),        # a host-thread compile
+            span(PIPELINE_CREATE, 1, 0x222, 0, 86, 109),        # 23 ms, in the 85->110 gap
+            span(SHADER_COMPILE, 1, 0x444, 50, 100, 100),       # an instant, also in it
+            span(PIPELINE_CREATE, 0, 0x333, 0, 87, 88),         # host thread, in the same gap
+            span(PIPELINE_CREATE, 0, 0x555, 0, 130, 149)]       # host thread only: the 120->150 gap is no candidate
+with tempfile.TemporaryDirectory() as tmp:
+    rc, out, err = run(tmp, trace(shlines), "--json")
+    check(rc == 0, f"shader pipeline: exit 0: {err}")
+    sp = json.loads(out)["shader_pipeline"]
+    rows = {(x["kind"], x["who"]): x for x in sp["kinds"]}
+    check(len(rows) == 4 and rows[(38, 1)]["count"] == 2 and abs(rows[(38, 1)]["total_ms"] - 22) < 1e-9 and
+          abs(rows[(38, 1)]["max_ms"] - 22) < 1e-9,
+          "shader pipeline: kind 38 who 1 counts two spans, 22 ms total, 22 ms max (the instant adds nothing)")
+    check(rows[(39, 1)]["count"] == 2 and abs(rows[(39, 1)]["total_ms"] - 23.5) < 1e-9 and
+          abs(rows[(39, 1)]["max_ms"] - 23) < 1e-9 and rows[(38, 0)]["count"] == 1 and rows[(39, 0)]["count"] == 2,
+          "shader pipeline: kind 39 who 1 and the host-thread rows are split out")
+    P = sp["presents"]
+    check(P["kind"] == 37 and P["count"] == 11 and P["gaps"] == 10 and abs(P["median_gap_ms"] - 10) < 1e-9 and
+          abs(P["threshold_ms"] - 20) < 1e-9, "shader pipeline: kind 37 presents, median gap 10 ms, threshold 20")
+    S = sp["stutter"]
+    check(S["count"] == 2 and len(S["worst"]) == 2, "shader pipeline: two gaps overlap an RSX-thread build")
+    w0, w1 = S["worst"]
+    check(w0["kind"] == 38 and abs(w0["gap_ms"] - 25) < 1e-9 and abs(w0["at_s"] - 0.040) < 1e-9 and
+          abs(w0["span_ms"] - 22) < 1e-9 and w0["spans"] == 2 and w0["a"] == "00000abc" and w0["b"] == 1234,
+          "shader pipeline: the worst gap names the longest overlapping span (kind 38, 22 ms of 25)")
+    check(w1["kind"] == 39 and abs(w1["gap_ms"] - 25) < 1e-9 and abs(w1["at_s"] - 0.085) < 1e-9 and
+          abs(w1["span_ms"] - 23) < 1e-9 and w1["spans"] == 2 and w1["a"] == "00000222",
+          "shader pipeline: the second gap names the kind-39 span; host-thread spans are not candidates")
+    rc, out, err = run(tmp, trace(shlines))
+    check(rc == 0 and "Shader and pipeline creation (kinds 38-39; who 1 = RSX thread, 0 = host):" in out and
+          "shader compile (38) who 1: 2 span(s), 22.000 ms, max 22.000 ms" in out and
+          "pipeline create (39) who 1: 2 span(s), 23.500 ms, max 23.000 ms" in out and
+          "present gaps (kind 37): 10, median 10.000 ms; stutter > 20.000 ms overlapping a build on the RSX thread: 2"
+          in out and
+          "25.000 ms gap at 0.040 s: shader compile (38) 22.000 ms a=0x00000abc b=1234 (2 build(s) overlap)" in out,
+          "shader pipeline: the text report has the kinds, the gaps and the worst candidate")
+    rc, out, err = run(tmp, trace(shlines, dropped=3), "--json")
+    check(rc == 0 and json.loads(out)["shader_pipeline"]["dropped"] == 3,
+          "shader pipeline: the header's dropped count is carried")
+    rc, out, err = run(tmp, trace(shlines, dropped=3))
+    check(rc == 0 and "INCOMPLETE: the trace dropped 3 span(s)" in out, "shader pipeline: a lossy trace says so")
+    # Kind 10 is the fallback when the trace has no ENG_PRESENT: gaps of 10/10/20 ms, so nothing exceeds twice the
+    # 10 ms median and there is no candidate.
+    k10 = [span(FLIP_REQ, 1, 0, 0, t, t) for t in (0, 20, 40)]
+    k10 += [span(PRESENT, 0, 0, 0, t, t + 1) for t in (0, 10, 20, 40)]
+    k10.append(span(SHADER_COMPILE, 1, 0x999, 10, 12, 13))
+    rc, out, err = run(tmp, trace(k10), "--json")
+    sp = json.loads(out)["shader_pipeline"]
+    check(rc == 0 and sp["presents"]["kind"] == 10 and sp["presents"]["gaps"] == 3 and
+          sp["stutter"]["count"] == 0,
+          "shader pipeline: without kind 37 the present gaps come from kind 10")
+    # Neither present kind: the section still reports the builds, with no gaps and no made-up median.
+    rc, out, err = run(tmp, trace(shlines[:4] + [span(SHADER_COMPILE, 1, 0x777, 8, 5, 6)]), "--json")
+    sp = json.loads(out).get("shader_pipeline")
+    check(rc == 0 and sp is not None and sp["presents"]["kind"] is None and sp["presents"]["gaps"] == 0 and
+          sp["presents"]["median_gap_ms"] is None and sp["stutter"]["count"] == 0,
+          "shader pipeline: no present at all leaves no gap, no median and no candidate")
+    rc, out, err = run(tmp, trace(shlines[:4] + [span(SHADER_COMPILE, 1, 0x777, 8, 5, 6)]))
+    check(rc == 0 and "present gaps: none (0 present(s))" in out, "shader pipeline: the text report survives no present")
+    # One guest flip presented twice (toolkit #144): the duplicate is 0.1 ms after its frame's first present. The
+    # gaps must stay per frame (20/20/20/40 ms), so the median is 20 and the threshold 40, and the build in the
+    # 40 ms gap is not a candidate. Counting the duplicates would make the median 0.1 ms and the threshold 0.2
+    # ms, and that build would be reported as a stutter.
+    dup_sh = [span(FLIP_REQ, 1, 0, 0, t, t) for t in (0, 20, 40, 60)]
+    for k, t in enumerate((0, 20, 40, 60, 100)):
+        dup_sh.append(span(ENG_PRESENT, 0, 2 * k, k, t, t))
+        dup_sh.append(span(ENG_PRESENT, 0, 2 * k + 1, k, t + 0.1, t + 0.1))
+    dup_sh.append(span(PIPELINE_CREATE, 1, 0x666, 0, 60, 61))
+    rc, out, err = run(tmp, trace(dup_sh), "--json")
+    sp = json.loads(out)["shader_pipeline"]
+    check(rc == 0 and sp["presents"]["count"] == 5 and sp["presents"]["gaps"] == 4 and
+          abs(sp["presents"]["median_gap_ms"] - 20) < 1e-9 and abs(sp["presents"]["threshold_ms"] - 40) < 1e-9 and
+          sp["stutter"]["count"] == 0,
+          "shader pipeline: a duplicate present of one flip is not a new frame; the median and threshold stay per frame")
+    rc, out, err = run(tmp, trace(dup_sh))
+    check(rc == 0 and "present gaps (kind 37): 4, median 20.000 ms; stutter > 40.000 ms" in out,
+          "shader pipeline: the text report's gaps are per frame")
+    # A trace without either kind reports and prints nothing about it, as the other optional sections do.
+    rc, out, err = run(tmp, trace(shlines[:4]), "--json")
+    check(rc == 0 and "shader_pipeline" not in json.loads(out), "shader pipeline: absent without kinds 38-39")
+    rc, out, err = run(tmp, trace(shlines[:4]))
+    check(rc == 0 and "Shader and pipeline creation" not in out, "shader pipeline: no section without the kinds")
 
 print("ftrace_report: %s" % ("ok" if not failures else "%d failed" % failures))
 sys.exit(1 if failures else 0)

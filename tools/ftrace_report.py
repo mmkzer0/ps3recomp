@@ -138,6 +138,14 @@ edge (the flip of the frame the title built from that poll): 0 means the first p
 showed it, n that the title's frame sat behind n earlier presents. An edge with no FLIP_REQ after it, or no
 present after that flip, is counted apart from the histogram. A header `dropped > 0` marks the section INCOMPLETE.
 
+A shader/pipeline-creation section (kinds 38 SHADER_COMPILE and 39 PIPELINE_CREATE) appears only in a trace that
+has one: count, total and max per kind, split by `who` (1 the RSX/draw-engine thread, the FIFO walker; 0 backend
+init, the vtable path or a host thread). A stutter candidate is every present gap longer than twice the run's
+median present gap that overlaps a kind-38 or kind-39 span on `who = 1`, reported as a count and the five worst
+gaps, each with the longest build that overlapped it. Presents are kind 37 ENG_PRESENT when the trace has it,
+else kind 10 PRESENT; the gaps run between new-frame presents (a flip presented twice counts once), and a trace
+with neither present kind has no gaps and no candidates, never a made-up median.
+
 Without --json it then draws a few frames as a timeline (one column per
 --ms-per-col ms):
   PPU   '#' running   '.' usleep poll   's' other blocking syscall
@@ -167,8 +175,8 @@ import tempfile
  AUDIO_MIX, AUDIO_PACE, AUDIO_UNDERRUN, AUDIO_STALE,
  JQ2_PUSH, JQ2_JOB, JQ2_CREDIT, JQ2_SYNC_WAIT, JQ2_IDLE, JQ2_HELD, JQ2_BARRIER,
  JQ2_IMAGE, AUDIO_RING, AUDIO_RING_VIEW, JQ2_BODY, JQ2_XDIFF, BC_UPLOAD, BC_SETTLE,
- PAD_EDGE, ENG_PRESENT) = range(1, 38)
-# The numbers mirror include/ps3emu/ps3_ftrace.h (PS3_FT_*, 32 to 37 included); the tool reads text
+ PAD_EDGE, ENG_PRESENT, SHADER_COMPILE, PIPELINE_CREATE) = range(1, 40)
+# The numbers mirror include/ps3emu/ps3_ftrace.h (PS3_FT_*, 32 to 39 included); the tool reads text
 # traces without the header, so a new kind is added in both places.
 # Labels are report keys that saved runs and scripts compare: keep them, append new reasons.
 AUDIO_PACE_REASON = {1: "queue full", 2: "clock pacing", 3: "backend wait", 4: "restart"}
@@ -212,6 +220,7 @@ AUDIO_RING_ATTRIBUTION = ("usleep", "jq2 sync wait", "other HLE", "other")  # on
 GPU_WAIT_KIND = {0: "gpu wait (flush)", 1: "gpu wait (present)", 2: "gpu wait (in-flight)"}
 BC_FORMATS = {1: "BC1", 2: "BC2", 3: "BC3"}   # kind 34 who: the rsx_bc_format
 BC_TIERS = {1: "cpu", 2: "gpu"}                # kind 34 b
+SHADER_KINDS = {38: "shader compile", 39: "pipeline create"}   # kinds 38/39; who 1 = RSX thread, 0 = host
 GPU_WAIT_INFLIGHT = 2
 SPINS_SLEEPING = 64      # cellGcmSys.c yields for 64 spins, then sleeps 1 ms per spin
 ATTRIBUTION = ("drawable", "gpu wait (in-flight)", "encode", "present", "drain", "rest")
@@ -2871,6 +2880,23 @@ def bc_settle_section(spans, flip_requests, dropped):
             "ms_per_flip": total / flip_requests if rates else None}
 
 
+def new_frame_presents(spans):
+    """The kind-37 present starts that showed a new frame, in time order.
+
+    A guest flip can be presented twice (toolkit #144), and only the first present of a flip can show a frame
+    built from new work. The flip id travels in b, so a second present carrying the previous id is the same
+    frame. A trace written before the field existed has b == 0 everywhere and keeps every present, as before."""
+    raw = sorted((s[4], s[3]) for s in spans if s[0] == ENG_PRESENT)
+    if raw and all(flip == 0 for _t, flip in raw):
+        return [t for t, _flip in raw]
+    presents, last = [], None
+    for t0, flip in raw:
+        if flip != last:
+            presents.append(t0)
+            last = flip
+    return presents
+
+
 def pad_latency_section(spans, dropped):
     """Kinds 36/37: input-to-present latency, one sample per PAD_EDGE. None when the trace has no edge.
 
@@ -2882,18 +2908,7 @@ def pad_latency_section(spans, dropped):
     edges = sorted(s[4] for s in spans if s[0] == PAD_EDGE)
     if not edges:
         return None
-    # One guest flip can be presented twice (toolkit #144), and only the first present of a flip can show a frame
-    # built from a new pad read. The flip id travels in b; a trace written before that field existed has b == 0
-    # everywhere and keeps the old one-present-per-sample behaviour.
-    raw = sorted((s[4], s[3]) for s in spans if s[0] == ENG_PRESENT)
-    if raw and all(flip == 0 for _t, flip in raw):
-        presents = [t for t, _flip in raw]
-    else:
-        presents, last_flip = [], None
-        for t0, flip in raw:
-            if flip != last_flip:
-                presents.append(t0)
-                last_flip = flip
+    presents = new_frame_presents(spans)
     flips = sorted(s[4] for s in spans if s[0] == FLIP_REQ)
     lat, behind, no_present, no_flip = [], collections.Counter(), 0, 0
     for e in edges:
@@ -2918,6 +2933,59 @@ def pad_latency_section(spans, dropped):
                                  "histogram": {k: behind[k] for k in sorted(behind)},
                                  "p50": nearest_rank(ahead, 50) if ahead else None,
                                  "max": ahead[-1] if ahead else None}}
+
+
+def shader_pipeline_section(spans, dropped):
+    """Kinds 38/39: one shader compile or pipeline creation, per kind and whose thread ran it. None when absent.
+
+    `who` is 1 on the RSX/draw-engine thread (the FIFO walker) and 0 on backend init, the vtable path or a host
+    thread. Times are ms. A stutter candidate is a present gap longer than twice the run's median present gap
+    that overlaps a kind-38 or kind-39 span on who = 1; the span reported with it is the longest one overlapping
+    it, so one gap is one candidate. The gaps run between new-frame presents (new_frame_presents: one per flip,
+    not one per present, when b carries the flip id); presents are kind 37 when the trace has any, else kind 10
+    (the Metal backend's timed present). A trace with neither has no gaps and no candidates, never a made-up
+    median."""
+    builds = [s for s in spans if s[0] in (SHADER_COMPILE, PIPELINE_CREATE)]
+    if not builds:
+        return None
+    groups = collections.defaultdict(list)
+    for s in builds:
+        groups[(s[0], s[1])].append(s[5] - s[4])
+    rows = [{"kind": k, "name": SHADER_KINDS[k], "who": who, "count": len(v),
+             "total_ms": sum(v), "max_ms": max(v)}
+            for (k, who), v in sorted(groups.items())]
+
+    if any(s[0] == ENG_PRESENT for s in spans):
+        kind, starts = ENG_PRESENT, new_frame_presents(spans)
+    elif any(s[0] == PRESENT for s in spans):
+        kind, starts = PRESENT, sorted(s[4] for s in spans if s[0] == PRESENT)
+    else:
+        kind, starts = None, []
+    gaps = [b - a for a, b in itertools.pairwise(starts)]
+    median = statistics.median(gaps) if gaps else None
+    threshold = 2 * median if median is not None else None
+
+    candidates = []
+    if threshold is not None:
+        worst = sorted(builds, key=lambda s: s[5] - s[4], reverse=True)
+        for g0, g1 in itertools.pairwise(starts):
+            if g1 - g0 <= threshold:
+                continue
+            hits = [s for s in worst
+                    if s[1] == 1 and (s[4] < g1 and s[5] > g0 or s[4] == s[5] and g0 <= s[4] < g1)]
+            if not hits:
+                continue
+            s = hits[0]
+            candidates.append({"gap_ms": g1 - g0, "at_s": g0 / 1000, "spans": len(hits),
+                               "kind": s[0], "name": SHADER_KINDS.get(s[0], f"kind {s[0]}"),
+                               "span_ms": s[5] - s[4], "who": s[1],
+                               "a": f"{s[2]:08x}", "b": s[3]})
+    candidates.sort(key=lambda c: (-c["gap_ms"], c["at_s"], c["kind"]))
+    return {"dropped": dropped,
+            "kinds": rows,
+            "presents": {"kind": kind, "count": len(starts), "gaps": len(gaps),
+                         "median_gap_ms": median, "threshold_ms": threshold},
+            "stutter": {"count": len(candidates), "worst": candidates[:5]}}
 
 
 def build_report(header, names, spans, images, split=None, cad=(None, None), gap=20.0):
@@ -2953,6 +3021,9 @@ def build_report(header, names, spans, images, split=None, cad=(None, None), gap
     pl = pad_latency_section(spans, header_dropped(header))
     if pl is not None:   # absent when the trace has no kind 36, like bc_upload
         report["pad_latency"] = pl
+    sp = shader_pipeline_section(spans, header_dropped(header))
+    if sp is not None:   # absent when the trace has neither kind 38 nor kind 39
+        report["shader_pipeline"] = sp
     cad_nid, cad_tid = cad
     if cad_nid is not None:
         report["cadence"] = {"nid": f"{cad_nid:08X}", "import": name_of(cad_nid),
@@ -2987,6 +3058,29 @@ def print_bc_settle_section(sec):
           f" mean {sec['mean_ms']:.3f}, p50 {t['p50']:.3f} p99 {t['p99']:.3f} max {t['max']:.3f} ms{flip}")
     if sec["failed"] or sec["timed_out"]:
         print(f"  ENDED THE RUN: {sec['failed']} with a failed decode, {sec['timed_out']} past the bound")
+
+
+def print_shader_pipeline_section(sec):
+    if sec is None:
+        return
+    print("\nShader and pipeline creation (kinds 38-39; who 1 = RSX thread, 0 = host):")
+    if sec["dropped"]:
+        print(f"  INCOMPLETE: the trace dropped {sec['dropped']} span(s)")
+    for r in sec["kinds"]:
+        print(f"  {r['name']} ({r['kind']}) who {r['who']}: {r['count']} span(s),"
+              f" {r['total_ms']:.3f} ms, max {r['max_ms']:.3f} ms")
+    p = sec["presents"]
+    if not p["gaps"]:
+        kind = f", kind {p['kind']}" if p["kind"] is not None else ""
+        print(f"  present gaps: none ({p['count']} present(s){kind})")
+        return
+    print(f"  present gaps (kind {p['kind']}): {p['gaps']}, median {p['median_gap_ms']:.3f} ms;"
+          f" stutter > {p['threshold_ms']:.3f} ms overlapping a build on the RSX thread:"
+          f" {sec['stutter']['count']}")
+    for c in sec["stutter"]["worst"]:
+        print(f"    {c['gap_ms']:7.3f} ms gap at {c['at_s']:.3f} s: {c['name']} ({c['kind']})"
+              f" {c['span_ms']:.3f} ms a=0x{c['a']} b={c['b']}"
+              f" ({c['spans']} build(s) overlap)")
 
 
 def print_pad_latency_section(sec):
@@ -3058,6 +3152,7 @@ def main():
     print_bc_upload_section(report.get("bc_upload"))
     print_bc_settle_section(report.get("bc_settle"))
     print_pad_latency_section(report.get("pad_latency"))
+    print_shader_pipeline_section(report.get("shader_pipeline"))
     if "cadence" in report:
         c = report["cadence"]
         print(f"\nCadence of {c['import']} ({c['nid']}):")

@@ -1100,7 +1100,24 @@ after it (0: the first present already showed the frame). `--json` adds `pad_lat
 `no_present`, `dropped`, `latency_ms`, `frames_in_flight`) only to a trace that has the kind. Both kinds are
 emitted unconditionally and cost the span API's one load when `PS3_FTRACE` is unset.
 
-Kinds 30-37 are recorded whatever `PS3_FTRACE_MIN_US` says. Exit `0` on a
+**Shader and pipeline creation** (kinds 38 `SHADER_COMPILE`, 39 `PIPELINE_CREATE`). One span per real build: a
+Metal library compiled from source (with the `newFunctionWithName` a site fetches at once) or a Vulkan
+`vkCreateShaderModule` for kind 38, and a `newRenderPipelineState…` / `newComputePipelineState…` or
+`vkCreateGraphicsPipelines` call for kind 39. A cache hit emits nothing; a failed build still emits its span.
+`who` is 1 on the RSX/draw-engine thread (the FIFO walker, the thread the engine's callbacks run on), else 0
+(backend init, the vtable path, a host thread); `a` is the program's or pipeline's cache key when the site has one,
+else an FNV-1a 32 hash of the source or of the descriptor fields that name it; `b` is the bytes handed to the
+compiler (the MSL text, the SPIR-V module) for kind 38 and 0 for kind 39. The report adds a section: count, total
+and max per kind, split by `who`; and the stutter candidates, every present gap longer than twice the run's median
+present gap that overlaps a kind-38 or kind-39 span on `who = 1`, as a count plus the five worst, each with the gap
+and the longest build that overlapped it. The gaps run between new-frame presents: a guest flip can be presented
+twice (toolkit #144), so only the first present of each kind-37 flip (the flip id in `b`) counts, and a trace whose
+`b` is always 0 keeps every present. Presents are kind 37 when the trace has it, else kind 10; a trace with neither
+has no gaps and no candidates. `--json` adds the top-level key `shader_pipeline` (`kinds`, `presents`,
+`stutter`, `dropped`) only to a trace that has a kind 38 or 39. Both kinds are emitted unconditionally and cost the
+span API's one load when `PS3_FTRACE` is unset.
+
+Kinds 30-39 are recorded whatever `PS3_FTRACE_MIN_US` says. Exit `0` on a
 report, `2` on an unreadable, truncated, corrupt or malformed trace, a zstd
 trace with no decoder, bad arguments or fewer than three flip requests.
 
