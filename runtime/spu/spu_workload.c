@@ -94,6 +94,8 @@ typedef struct {
     int                 twin_image_id;
     /* Set by spu_workload_promote_img at init, like an inventory: read without a lock afterwards. */
     int                 promoted;
+    const spu_workload_override_unit* override_units;
+    uint32_t override_unit_count;
 } spu_workload_entry;
 
 static spu_workload_entry s_registry[SPU_WORKLOAD_MAX];
@@ -112,6 +114,8 @@ void spu_workload_register_img(uint64_t fingerprint, spu_lifted_entry_fn fn,
             s_registry[i].native_rev = 0;
             s_registry[i].twin_fn   = NULL;        /* a twin belongs to the body it was registered for */
             s_registry[i].promoted = 0;            /* so does the evidence that promoted it */
+            s_registry[i].override_units = NULL;
+            s_registry[i].override_unit_count = 0;
             return;
         }
     }
@@ -126,6 +130,79 @@ void spu_workload_register_img(uint64_t fingerprint, spu_lifted_entry_fn fn,
     s_registry[s_registry_count].body_tier = (uint8_t)SPU_TIER_LIFTED;
     s_registry[s_registry_count].native_rev = 0;
     s_registry_count++;
+}
+
+static int override_registration_error(uint64_t fingerprint, const char* reason)
+{
+    PS3_LOG(PS3_LOG_INFO, "spu_workload", "override membership for 0x%016llX: %s\n",
+            (unsigned long long)fingerprint, reason);
+    return 0;
+}
+
+int spu_workload_register_override_units(uint64_t fingerprint,
+                                         const spu_workload_override_unit* units, uint32_t count)
+{
+    spu_workload_entry* image = NULL;
+    for (unsigned i = 0; i < s_registry_count; i++)
+        if (s_registry[i].fp == fingerprint) { image = &s_registry[i]; break; }
+    if (!image) return override_registration_error(fingerprint, "image is not registered");
+    if (image->override_units)
+        return override_registration_error(fingerprint, "duplicate membership registration");
+    if (!units || !count || count > SPU_LS_SIZE / 4u)
+        return override_registration_error(fingerprint, "invalid unit list");
+    for (uint32_t i = 0; i < count; i++) {
+        const spu_workload_override_unit* u = &units[i];
+        int contains_entry = 0;
+        uint64_t previous_end = 0;
+        const uint64_t image_end = (uint64_t)u->image_ls + u->image_bytes;
+        if ((u->image_ls & 3u) || !u->image_bytes || image_end > SPU_LS_SIZE)
+            return override_registration_error(fingerprint, "invalid image placement");
+        if ((u->entry & 3u) || u->entry >= SPU_LS_SIZE || !u->ranges ||
+            !u->range_count || u->range_count > SPU_LS_SIZE / 4u)
+            return override_registration_error(fingerprint, "invalid override entry or range list");
+        for (uint32_t r = 0; r < u->range_count; r++) {
+            const spu_workload_code_range* range = &u->ranges[r];
+            const uint64_t end = (uint64_t)range->ls + range->bytes;
+            if (range->ls < u->image_ls || end > image_end)
+                return override_registration_error(fingerprint, "membership range lies outside image placement");
+            if ((range->ls & 3u) || !range->bytes || (range->bytes & 3u) ||
+                (r && range->ls <= previous_end))
+                return override_registration_error(fingerprint, "ranges must be sorted, disjoint and merged");
+            contains_entry |= range->ls <= u->entry && u->entry < end;
+            previous_end = end;
+        }
+        if (!contains_entry)
+            return override_registration_error(fingerprint, "membership omits its override entry");
+        for (uint32_t j = 0; j < i; j++) {
+            const spu_workload_override_unit* other = &units[j];
+            if (u->entry == other->entry)
+                return override_registration_error(fingerprint, "duplicate override entry");
+            uint32_t a = 0, b = 0;
+            while (a < u->range_count && b < other->range_count) {
+                const spu_workload_code_range* x = &u->ranges[a];
+                const spu_workload_code_range* y = &other->ranges[b];
+                if (x->ls < (uint64_t)y->ls + y->bytes && y->ls < (uint64_t)x->ls + x->bytes)
+                    return override_registration_error(fingerprint, "overlapping override units");
+                if ((uint64_t)x->ls + x->bytes <= y->ls) a++;
+                else b++;
+            }
+        }
+    }
+    image->override_units = units;
+    image->override_unit_count = count;
+    return 1;
+}
+
+const spu_workload_override_unit* spu_workload_find_override_unit(uint64_t fingerprint, uint32_t entry)
+{
+    for (unsigned i = 0; i < s_registry_count; i++)
+        if (s_registry[i].fp == fingerprint) {
+            for (uint32_t j = 0; j < s_registry[i].override_unit_count; j++)
+                if (s_registry[i].override_units[j].entry == entry)
+                    return &s_registry[i].override_units[j];
+            break;
+        }
+    return NULL;
 }
 
 void spu_workload_set_body_identity(uint64_t fingerprint, uint8_t tier, uint64_t native_rev)

@@ -1983,13 +1983,23 @@ def build_programs(args, registry_writer):
                         decoded, generated_bounds, image=code, base=base,
                         delta=image_delta(base, program['link_base'] if raw else None),
                         entry_points=admission_entries)
+                    program['override_units'] = []
                     for address in parse_overrides(overrides):
-                        _members, _tail_graph, problem = override_unit_admission(
+                        members, _tail_graph, problem = override_unit_admission(
                             decoded, generated_bounds, address, classification,
                             override_entries=parse_overrides(overrides))
                         if problem:
                             raise ValueError(
                                 f'override 0x{address:X} refuses function: {problem}')
+                        ends = dict(generated_bounds)
+                        member_ranges = []
+                        for member in members:
+                            if member_ranges and member_ranges[-1]['ls'] + member_ranges[-1]['bytes'] == member:
+                                member_ranges[-1]['bytes'] += ends[member] - member
+                            else:
+                                member_ranges.append({'ls': member, 'bytes': ends[member] - member})
+                        program['override_units'].append({
+                            'entry': address, 'image_ls': base, 'image_bytes': size, 'ranges': member_ranges})
                 for filename in ['spu_recomp.c', 'spu_recomp.h']:
                     if not (outdir / filename).is_file():
                         raise ValueError('lifter output missing ' + filename)

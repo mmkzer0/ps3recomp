@@ -1657,6 +1657,10 @@ if(PS3RECOMP_BUILD_TESTS)
             set(XDIFF_FUNCTION_PLAN "${XDIFF_FUNCTION_DIR}/liveness.json")
             add_custom_command(
                 OUTPUT "${XDIFF_FUNCTION_IMAGE}" "${XDIFF_FUNCTIONS}" "${XDIFF_FUNCTION_PLAN}"
+                       "${XDIFF_FUNCTION_DIR}/tail_unit.bin" "${XDIFF_FUNCTION_DIR}/tail_unit.json"
+                       "${XDIFF_FUNCTION_DIR}/tail_code_unit.bin" "${XDIFF_FUNCTION_DIR}/tail_code_unit.json"
+                       "${XDIFF_FUNCTION_DIR}/tail_unit_functions.json"
+                       "${XDIFF_FUNCTION_DIR}/tail_code_unit_functions.json"
                 COMMAND "${Python3_EXECUTABLE}"
                     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/spu/tests/gen_xdiff_function_job.py"
                     "${XDIFF_FUNCTION_DIR}"
@@ -1678,12 +1682,29 @@ if(PS3RECOMP_BUILD_TESTS)
                         "${CMAKE_CURRENT_SOURCE_DIR}/tools/spu_disasm.py"
                         "${CMAKE_CURRENT_SOURCE_DIR}/tools/find_spu_functions.py"
                 VERBATIM)
+            set(XDIFF_TAIL_LIFTS "")
+            foreach(tail IN ITEMS tail_unit tail_code_unit)
+                set(tail_lift "${XDIFF_FUNCTION_DIR}/${tail}_lift")
+                add_custom_command(
+                    OUTPUT "${tail_lift}/spu_recomp.c" "${tail_lift}/spu_recomp.h"
+                    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/spu_lifter.py"
+                        "${XDIFF_FUNCTION_DIR}/${tail}.bin" --base 0x7c00
+                        --functions "${XDIFF_FUNCTION_DIR}/${tail}_functions.json"
+                        --symbol-prefix "x${tail}_" --output "${tail_lift}"
+                    DEPENDS "${XDIFF_FUNCTION_DIR}/${tail}.bin"
+                            "${XDIFF_FUNCTION_DIR}/${tail}_functions.json"
+                            "${CMAKE_CURRENT_SOURCE_DIR}/tools/spu_lifter.py"
+                            "${CMAKE_CURRENT_SOURCE_DIR}/tools/spu_disasm.py"
+                    VERBATIM)
+                list(APPEND XDIFF_TAIL_LIFTS "${tail_lift}/spu_recomp.c")
+            endforeach()
             add_executable(test_spu_xdiff_function
                 runtime/spu/tests/test_spu_xdiff_function.c
                 runtime/spu/xdiff/spu_xdiff_replay.c
                 runtime/spu/xdiff/spu_job_replay.c
                 ${SPU_XDIFF_SOURCES}
                 "${XDIFF_FUNCTION_LIFT}"
+                ${XDIFF_TAIL_LIFTS}
                 ${XDIFF_REPLAY_RUNTIME})
             target_include_directories(test_spu_xdiff_function PRIVATE
                 include runtime runtime/spu runtime/platform
@@ -1691,7 +1712,9 @@ if(PS3RECOMP_BUILD_TESTS)
             target_link_libraries(test_spu_xdiff_function PRIVATE m Threads::Threads)
             add_test(NAME spu_xdiff_function
                 COMMAND test_spu_xdiff_function "${XDIFF_FUNCTION_IMAGE}" "${XDIFF_FUNCTION_PLAN}"
-                    "${XDIFF_FUNCTION_DIR}/t0.spujob" "${XDIFF_FUNCTION_DIR}/units")
+                    "${XDIFF_FUNCTION_DIR}/t0.spujob" "${XDIFF_FUNCTION_DIR}/units"
+                    "${XDIFF_FUNCTION_DIR}/tail_unit.bin" "${XDIFF_FUNCTION_DIR}/tail_unit.json"
+                    "${XDIFF_FUNCTION_DIR}/tail_code_unit.bin" "${XDIFF_FUNCTION_DIR}/tail_code_unit.json")
             set_tests_properties(spu_xdiff_function PROPERTIES LABELS "spu;t0" TIMEOUT 120)
             # The poison run (docs/SPU_XDIFF.md 8.2, docs/SPU_LIFTER.md "Liveness"): the claims of
             # tools/spu_liveness.py on a synthetic caller and callee, checked against recorded jobs.

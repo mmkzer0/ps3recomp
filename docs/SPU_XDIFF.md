@@ -150,6 +150,15 @@ compare; only T3 uses the contract. A tweak has no rule and yields
   equal the staged bytes exactly. Capture refuses a unit whose code at entry is
   not the staged code (`unit-code-modified`, section 8.3). A job fixture keeps
   the whole-span rule.
+
+  Every function fixture carrying `CODE` must bind to trusted workload
+  registration for its image fingerprint and entry PC, whether or not a native
+  variant exists. The registration records the staged LS base and byte count
+  used by the lift, plus the complete admitted member ranges (adjacent ranges
+  merged). Replay requires both `UNIT.image_ls`/`image_bytes` and the merged
+  `CODE` ranges to match exactly before either variant runs. Missing registration
+  is `fixture-identity` ("CODE without registered membership"); placement or range
+  mismatches also fail identity. Version-1/2 fixtures retain their existing checks.
 - **Finding the fingerprint is cheap; a cache hit is a claim, not a proof.**
   Hashing the staged bytes byte by byte costs about a millisecond for a large
   image, so two places remember a result by address and size and reuse it
@@ -980,6 +989,15 @@ image, and `LS_0` to equal `STAG` on every member range. Capture refuses a
 unit whose entry store already differs from the staged image on a member range
 (a job that rewrote its own code, an overlay): `void` / `unit-code-modified`,
 naming the first differing LS address, and no fixture is written.
+
+Neither `CODE` nor `UNIT.image_ls` is its own identity authority. The pipeline
+obtains the complete unit from unchanged admission and registers its merged
+ranges together with the staged placement of the lifted image (not its optional
+PIC link base). CODE-bearing capture requires that registration and asserts
+the same placement and membership before writing. Every CODE-bearing replay
+checks them before either reference or native selection, including entries
+without a native variant; a shifted base cannot remap the staged code bytes.
+Data outside members remains ordinary state. No codec or format change is needed.
 
 **Open, before any T2/T3 promotion:** an MFC PUT can also invalidate a
 reservation held by a peer context. Plain PUT calls

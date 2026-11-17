@@ -79,7 +79,7 @@ from find_spu_functions import (
 )
 from spu_disasm import disassemble_spu
 from spu_elf import fnv1a64
-from spu_lifter import compute_bi_r0_jumps
+from spu_lifter import compute_bi_r0_jumps, override_unit_admission
 
 SCHEMA = "ps3recomp.spu-liveness/1"
 LS_MASK = 0x3FFFF
@@ -283,7 +283,7 @@ def _address_taken(image, entry_set, info, by_addr, fns, delta=0):
     return taken & entry_set
 
 
-def analyze(image, base, code_end=0, entries=(), functions=None, link_base=None):
+def analyze(image, base, code_end=0, entries=(), functions=None, link_base=None, capture_units=()):
     """The liveness document for one raw image; see the module docstring."""
     if link_base is not None and not 0 <= link_base <= base:
         raise ValueError(f"link_base 0x{link_base:X} must be in [0, base 0x{base:X}]")
@@ -296,6 +296,14 @@ def analyze(image, base, code_end=0, entries=(), functions=None, link_base=None)
         all_insns, bounds, image=image, base=base,
         delta=0 if link_base is None else base - link_base,
         entry_points=[base, *entries])
+    unit_pcs = {}
+    for entry in capture_units:
+        members, _edges, problem = override_unit_admission(all_insns, bounds, entry, jumps)
+        if problem:
+            raise ValueError(f"capture unit 0x{entry:X}: {problem}")
+        ends = dict(bounds)
+        unit_pcs[entry] = [f"0x{pc:05x}" for member in members
+                           for pc in range(member, ends[member], 4)]
     fns = [_Fn(s, e, i) for i, (s, e) in enumerate(bounds)]
     starts = [f.entry for f in fns]
     entry_index = {f.entry: f.index for f in fns}
@@ -430,6 +438,7 @@ def analyze(image, base, code_end=0, entries=(), functions=None, link_base=None)
             frame = _frame_bytes(fn, info, by_addr, fn_of)
         functions_doc.append({
             "entry": f"0x{fn.entry:05x}",
+            **({"unit_pcs": unit_pcs[fn.entry]} if fn.entry in unit_pcs else {}),
             "end": f"0x{fn.end:05x}",
             "exits": [f"0x{a:05x}" for a in exits[fn.entry]],
             "tail_calls": [f"0x{t:05x}" for t in sorted(tail_targets[fn.entry])],
@@ -529,6 +538,8 @@ def main(argv=None):
                     help="an extra entry point; its callers are unknown (repeatable)")
     ap.add_argument("--functions", metavar="FILE",
                     help="the lifter's function list ([{start, end}]) instead of detecting one")
+    ap.add_argument("--capture-unit", type=_int, action="append", default=[],
+                    help="add entry-PC capture membership from T2 admission (repeatable)")
     ap.add_argument("--output", "-o", metavar="FILE", help="write the JSON here instead of standard output")
     ap.add_argument("--summary", action="store_true", help="print a one-line summary to standard error")
     args = ap.parse_args(argv)
@@ -556,7 +567,7 @@ def main(argv=None):
         with open(args.functions, encoding="utf-8") as f:
             functions = [(int(str(e["start"]), 0), int(str(e["end"]), 0)) for e in json.load(f)]
     try:
-        doc = analyze(image, base, args.code_end, entries, functions, args.link_base)
+        doc = analyze(image, base, args.code_end, entries, functions, args.link_base, args.capture_unit)
     except ValueError as exc:
         print(f"spu_liveness: {exc}", file=sys.stderr)
         return 1

@@ -38,8 +38,14 @@ void spu_thread_publish_ctx(uint32_t tid, void* ctx) { (void)tid; (void)ctx; }
 
 void xfn_spu_recomp_register(void);
 void xfn_spu_func_00007C40(spu_context* ctx);
+void xtail_unit_spu_recomp_register(void);
+void xtail_unit_spu_func_00007C40(spu_context* ctx);
+void xtail_code_unit_spu_recomp_register(void);
+void xtail_code_unit_spu_func_00007C40(spu_context* ctx);
 int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx);
 void spu_begin_image(int image_id);
+static spu_workload_code_range g_override_range;
+static spu_workload_override_unit g_override_unit;
 
 static int g_native_mode;
 enum {
@@ -226,17 +232,142 @@ static void verify_function_unit(const char* unit_path, uint32_t expected_return
     spu_xdiff_fixture_free(&unit);
 }
 
+static void require_identity_refusal(const spu_xdiff_fixture* fixture, uint32_t where, const char* scenario)
+{
+    spu_xdiff_fixture decoded;
+    spu_xdiff_error error;
+    uint8_t* bytes = NULL;
+    size_t size = 0;
+    REQUIRE(spu_xdiff_fixture_encode(fixture, &bytes, &size, &error) == 0 &&
+            spu_xdiff_fixture_decode(bytes, size, &decoded, &error) == 0,
+            "%s must remain codec-valid: %s", scenario, error.detail);
+    free(bytes);
+    for (int native = 0; native < 2; native++) {
+        spu_xdiff_function_result result;
+        (void)spu_xdiff_replay_function_unit(&decoded, native, &result);
+        REQUIRE(result.reason == SPU_XDIFF_R_FIXTURE_IDENTITY && result.where == where,
+                "%s variant=%d: expected identity refusal at 0x%x, got %s at 0x%x",
+                scenario, native, where, spu_xdiff_reason_id(result.reason), result.where);
+    }
+    spu_xdiff_fixture_free(&decoded);
+}
+
+static void verify_registered_membership(const char* unit_path)
+{
+    spu_xdiff_fixture unit;
+    spu_xdiff_error error;
+    spu_xdiff_function_result result;
+    REQUIRE(spu_xdiff_fixture_read(unit_path, &unit, &error) == 0, "read membership unit: %s", error.detail);
+    const spu_xdiff_code_range full = {g_override_range.ls, g_override_range.bytes};
+    g_native_mode = NATIVE_CORRECT;
+    REQUIRE(spu_xdiff_fixture_set_code(&unit, &full, 1, unit.ls1, &error) == 0,
+            "set full membership: %s", error.detail);
+    REQUIRE(spu_xdiff_replay_function_unit(&unit, 1, &result) == SPU_XDIFF_EQUAL,
+            "complete registered membership was refused");
+    unit.unit.image_ls += 4u;
+    memcpy(unit.ls0 + full.ls, unit.staged + full.ls - unit.unit.image_ls, full.bytes);
+    require_identity_refusal(&unit, FN_OVERRIDE_BASE + 4u, "shifted staged-byte mapping");
+    unit.unit.image_ls -= 4u;
+    memcpy(unit.ls0 + full.ls, unit.staged + full.ls - unit.unit.image_ls, full.bytes);
+    unit.ls0[FN_OVERRIDE_BASE + 0x20u] ^= 1u;
+    unit.ls1[FN_OVERRIDE_BASE + 0x20u] ^= 1u;
+    REQUIRE(spu_xdiff_replay_function_unit(&unit, 1, &result) == SPU_XDIFF_EQUAL,
+            "ordinary data outside members was refused");
+    unit.ls0[FN_OVERRIDE_BASE + 0x20u] ^= 1u;
+    unit.ls1[FN_OVERRIDE_BASE + 0x20u] ^= 1u;
+
+    const spu_xdiff_code_range reduced = {FN_OVERRIDE_FUNCTION, 4u};
+    unit.ls0[FN_OVERRIDE_FUNCTION + 4u] ^= 1u;
+    REQUIRE(spu_xdiff_fixture_set_code(&unit, &reduced, 1, unit.ls1, &error) == 0,
+            "reduced-range fixture must be codec-valid: %s", error.detail);
+    require_identity_refusal(&unit, FN_OVERRIDE_FUNCTION + 4u, "reduced CODE");
+    unit.ls0[FN_OVERRIDE_FUNCTION + 4u] ^= 1u;
+    const spu_xdiff_code_range extra[] = {{FN_OVERRIDE_BASE + 0x20u, 4u}, full};
+    REQUIRE(spu_xdiff_fixture_set_code(&unit, extra, 2, unit.ls1, &error) == 0,
+            "extra-range fixture must be codec-valid: %s", error.detail);
+    require_identity_refusal(&unit, FN_OVERRIDE_BASE + 0x20u, "extra CODE");
+    const spu_xdiff_code_range split[] = {
+        {FN_OVERRIDE_FUNCTION, 4u}, {FN_OVERRIDE_FUNCTION + 4u, full.bytes - 4u}};
+    REQUIRE(spu_xdiff_fixture_set_code(&unit, split, 2, unit.ls1, &error) == 0 &&
+            spu_xdiff_replay_function_unit(&unit, 1, &result) == SPU_XDIFF_EQUAL,
+            "adjacent ranges must compare after merging");
+    unit.unit.entry_pc = FN_OVERRIDE_ENTRY;
+    const spu_xdiff_code_range unregistered = {FN_OVERRIDE_ENTRY, 4u};
+    REQUIRE(spu_registered_function_variant(FN_OVERRIDE_ENTRY, 17, 0) != NULL &&
+            spu_registered_function_variant(FN_OVERRIDE_ENTRY, 17, 1) == NULL,
+            "missing-membership test must target an existing reference-only entry");
+    REQUIRE(spu_xdiff_fixture_set_code(&unit, &unregistered, 1, unit.ls1, &error) == 0,
+            "set reference-only CODE: %s", error.detail);
+    require_identity_refusal(&unit, SPU_XDIFF_NO_WHERE, "CODE without registered membership");
+    spu_xdiff_fixture_free(&unit);
+}
+
+static void verify_registry_rejects_overlaps(uint64_t fingerprint)
+{
+    const uint64_t other_fp = fingerprint ^ UINT64_C(1);
+    static const spu_workload_code_range ranges[] = {{0x100u, 16u}, {0x108u, 16u}};
+    static const spu_workload_override_unit overlap[] = {
+        {0x100u, 1, 0x100u, 0x100u, &ranges[0]}, {0x108u, 1, 0x100u, 0x100u, &ranges[1]}};
+    static const spu_workload_override_unit duplicate[] = {
+        {0x100u, 1, 0x100u, 0x100u, &ranges[0]}, {0x100u, 1, 0x100u, 0x100u, &ranges[0]}};
+    static const spu_workload_override_unit outside[] = {
+        {0x100u, 1, 0x104u, 0x100u, &ranges[0]}, {0x100u, 1, 0x100u, 8u, &ranges[0]}};
+    spu_workload_register_img(other_fp, xfn_spu_func_00007C40, 17, "membership-negative");
+    REQUIRE(!spu_workload_register_override_units(other_fp, &outside[0], 1),
+            "registry accepted member bytes before the image base");
+    REQUIRE(!spu_workload_register_override_units(other_fp, &outside[1], 1),
+            "registry accepted member bytes beyond the image end");
+    REQUIRE(!spu_workload_register_override_units(other_fp, overlap, 2), "registry accepted overlapping units");
+    REQUIRE(!spu_workload_find_override_unit(other_fp, 0x100u), "failed registration attached a partial unit");
+    REQUIRE(!spu_workload_register_override_units(other_fp, duplicate, 2), "registry accepted duplicate entries");
+    REQUIRE(spu_workload_register_override_units(other_fp, overlap, 1), "valid membership was refused");
+    REQUIRE(!spu_workload_register_override_units(other_fp, overlap, 1), "duplicate registration was accepted");
+    REQUIRE(spu_workload_find_override_unit(other_fp, 0x100u) == &overlap[0],
+            "duplicate registration changed the valid membership");
+}
+
+static void verify_capture_membership(const spu_xdiff_fixture* fixture, const char* plan_path, const char* out_dir)
+{
+    spu_xdiff_poison_plan plan;
+    spu_xdiff_capture_report report;
+    char error[256];
+    REQUIRE(spu_xdiff_poison_plan_load(plan_path, &plan, error, sizeof error) == 0, "load capture plan");
+    for (uint32_t i = 0; i < plan.count; i++) {
+        if (plan.fn[i].entry != FN_OVERRIDE_FUNCTION) continue;
+        plan.fn[i].unit_pcs = calloc(SPU_LS_SIZE / 32u, 1);
+        REQUIRE(plan.fn[i].unit_pcs != NULL, "allocate test membership");
+        const uint32_t word = FN_OVERRIDE_FUNCTION >> 2;
+        plan.fn[i].unit_pcs[word >> 3] |= (uint8_t)(1u << (word & 7u));
+    }
+    REQUIRE(spu_xdiff_capture_function_units(fixture, &plan, FN_OVERRIDE_FUNCTION, 0,
+                                             out_dir, &report, error, sizeof error) != 0 &&
+            strstr(error, "membership") != NULL && report.captured == 0,
+            "capture accepted membership smaller than the registered override");
+    for (uint32_t i = 0; i < plan.count; i++) {
+        if (plan.fn[i].entry != FN_OVERRIDE_FUNCTION) continue;
+        for (uint32_t pc = g_override_range.ls; pc < g_override_range.ls + g_override_range.bytes; pc += 4u)
+            plan.fn[i].unit_pcs[(pc >> 2) >> 3] |= (uint8_t)(1u << ((pc >> 2) & 7u));
+    }
+    spu_xdiff_fixture shifted = *fixture;
+    shifted.unit.image_ls += 4u;
+    REQUIRE(spu_xdiff_capture_function_units(&shifted, &plan, FN_OVERRIDE_FUNCTION, 0,
+                                             out_dir, &report, error, sizeof error) != 0 &&
+            strstr(error, "placement") != NULL && report.captured == 0,
+            "capture accepted a staged-byte mapping different from the registration");
+    spu_xdiff_poison_plan_free(&plan);
+}
+
 static void verify_capture_requires_fingerprint(const spu_xdiff_fixture* fixture,
                                                 const char* plan_path, const char* out_dir)
 {
     spu_xdiff_poison_plan plan;
     char error[256];
-    uint32_t captured = 99;
+    spu_xdiff_capture_report captured = {0};
     memset(&plan, 0, sizeof plan);
     REQUIRE(spu_xdiff_poison_plan_load(plan_path, &plan, error, sizeof error) == 0,
             "load liveness plan: %s", error);
     plan.has_fingerprint = 0;
-    REQUIRE(spu_xdiff_capture_function_units(fixture, &plan, FN_OVERRIDE_FUNCTION,
+    REQUIRE(spu_xdiff_capture_function_units(fixture, &plan, FN_OVERRIDE_FUNCTION, 0,
                                              out_dir, &captured, error, sizeof error) != 0,
             "function capture accepted a plan without an image fingerprint");
     REQUIRE(strstr(error, "fingerprint") != NULL,
@@ -246,7 +377,7 @@ static void verify_capture_requires_fingerprint(const spu_xdiff_fixture* fixture
     REQUIRE(spu_xdiff_poison_plan_load(plan_path, &plan, error, sizeof error) == 0,
             "reload liveness plan: %s", error);
     plan.image_fingerprint ^= 1u;
-    REQUIRE(spu_xdiff_capture_function_units(fixture, &plan, FN_OVERRIDE_FUNCTION,
+    REQUIRE(spu_xdiff_capture_function_units(fixture, &plan, FN_OVERRIDE_FUNCTION, 0,
                                              out_dir, &captured, error, sizeof error) != 0,
             "function capture accepted a mismatched image fingerprint");
     REQUIRE(strstr(error, "fingerprint") != NULL,
@@ -296,9 +427,68 @@ static void verify_capture_cli_requires_fingerprint(const spu_xdiff_fixture* fix
     REQUIRE(mismatched_rc != 0, "--capture-fn accepted a mismatched image.fingerprint");
 }
 
+static void verify_tail_unit(const char* image_path, const char* plan_path, const char* out_dir, int modified)
+{
+    size_t size;
+    uint8_t* image = read_file(image_path, &size);
+    spu_xdiff_fixture fixture;
+    spu_xdiff_poison_plan plan;
+    spu_xdiff_capture_report report;
+    char error[256];
+    REQUIRE(image != NULL, "read tail unit image");
+    const int image_id = modified ? 19 : 18;
+    spu_begin_image(image_id);
+    if (modified) xtail_code_unit_spu_recomp_register();
+    else xtail_unit_spu_recomp_register();
+    spu_begin_image(0);
+    const uint64_t fp = spu_workload_fingerprint(image, size);
+    spu_workload_register_img(fp, modified ? xtail_code_unit_spu_func_00007C40 :
+                                             xtail_unit_spu_func_00007C40, image_id, "synthetic-tail-unit");
+    static const spu_workload_code_range member = {FN_OVERRIDE_FUNCTION, 16u};
+    static spu_workload_override_unit registrations[2];
+    registrations[modified] = (spu_workload_override_unit){
+        FN_OVERRIDE_FUNCTION, 1, FN_OVERRIDE_BASE, (uint32_t)size, &member};
+    REQUIRE(spu_workload_register_override_units(fp, &registrations[modified], 1),
+            "register tail unit placement and membership");
+    record_job(image, size, &fixture);
+    free(image);
+    REQUIRE(spu_xdiff_poison_plan_load(plan_path, &plan, error, sizeof error) == 0,
+            "tail unit plan: %s", error);
+    REQUIRE(spu_xdiff_capture_function_units(&fixture, &plan, FN_OVERRIDE_FUNCTION, 0,
+                                             out_dir, &report, error, sizeof error) == 0,
+            "tail unit capture: %s", error);
+    REQUIRE(report.captured == (modified ? 0u : 2u) && report.discarded_yield == 0 &&
+            report.discarded_code_modified == (modified ? 2u : 0u),
+            "outside entries must capture twice or name modified code: %u/%u/%u",
+            report.captured, report.discarded_yield, report.discarded_code_modified);
+    if (!modified) {
+        char path[1024];
+        const int n = snprintf(path, sizeof path, "%s/%016llx-f%08x-c00.spujob",
+                               out_dir, (unsigned long long)fp, FN_OVERRIDE_FUNCTION);
+        REQUIRE(n > 0 && (size_t)n < sizeof path, "tail unit path overflow");
+        spu_xdiff_fixture unit;
+        spu_xdiff_error codec_error;
+        spu_xdiff_function_result result;
+        REQUIRE(spu_xdiff_fixture_read(path, &unit, &codec_error) == 0,
+                "read reference-only CODE unit: %s", codec_error.detail);
+        REQUIRE(spu_xdiff_replay_function_unit(&unit, 0, &result) == SPU_XDIFF_EQUAL,
+                "registered reference-only CODE replay: %s", spu_xdiff_reason_id(result.reason));
+        spu_xdiff_fixture_free(&unit);
+    }
+    REQUIRE(spu_xdiff_capture_function_units(&fixture, &plan, FN_OVERRIDE_FUNCTION, 8,
+                                             out_dir, &report, error, sizeof error) != 0,
+            "budgeted T0 source must not report an equal complete replay");
+    REQUIRE(report.captured == 0 && report.discarded_yield == (modified ? 0u : 1u) &&
+            report.discarded_code_modified == (modified ? 1u : 0u),
+            "budget yield must not create a pair: %u/%u/%u",
+            report.captured, report.discarded_yield, report.discarded_code_modified);
+    spu_xdiff_poison_plan_free(&plan);
+    spu_xdiff_fixture_free(&fixture);
+}
+
 int main(int argc, char** argv)
 {
-    REQUIRE(argc == 5, "image plan job-fixture unit-directory arguments required");
+    REQUIRE(argc == 9, "image plan job-fixture unit-directory tail-image tail-plan code-image code-plan required");
     size_t image_bytes = 0;
     uint8_t* image = read_file(argv[1], &image_bytes);
     REQUIRE(image != NULL, "read synthetic image %s", argv[1]);
@@ -309,6 +499,13 @@ int main(int argc, char** argv)
     spu_begin_image(0);
     spu_workload_register_img(fingerprint, xfn_spu_func_00007C40, 17, "synthetic-t2-function");
     spu_workload_set_body_identity(fingerprint, (uint8_t)SPU_TIER_PARTIAL, 0x1234u);
+    g_override_range = (spu_workload_code_range){FN_OVERRIDE_FUNCTION,
+        (uint32_t)image_bytes - (FN_OVERRIDE_FUNCTION - FN_OVERRIDE_BASE)};
+    g_override_unit = (spu_workload_override_unit){
+        FN_OVERRIDE_FUNCTION, 1, FN_OVERRIDE_BASE, (uint32_t)image_bytes, &g_override_range};
+    REQUIRE(spu_workload_register_override_units(fingerprint, &g_override_unit, 1),
+            "register native membership");
+    verify_registry_rejects_overlaps(fingerprint);
 
     spu_xdiff_fixture fixture;
     record_job(image, image_bytes, &fixture);
@@ -355,7 +552,11 @@ int main(int argc, char** argv)
                              (unsigned)FN_OVERRIDE_FUNCTION, 1u);
     REQUIRE(unit_path_len > 0 && (size_t)unit_path_len < sizeof unit_path, "second unit path too long");
     verify_function_unit(unit_path, FN_OVERRIDE_ENTRY + 16u);
+    verify_registered_membership(unit_path);
+    verify_capture_membership(&fixture, argv[2], argv[4]);
 
+    verify_tail_unit(argv[5], argv[6], argv[4], 0);
+    verify_tail_unit(argv[7], argv[8], argv[4], 1);
     spu_xdiff_fixture_free(&fixture);
     printf("PASS test_spu_xdiff_function\n");
     return 0;

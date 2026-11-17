@@ -1030,6 +1030,9 @@ class Pipeline(unittest.TestCase):
         program = self.manifest()['programs'][0]
         self.assertEqual(program['overrides'], [f'0x{function:x}=test_fn_override'])
         self.assertEqual(program['native_rev'], 0x1234)
+        self.assertEqual(program['override_units'], [{
+            'entry': function, 'image_ls': raw_base, 'image_bytes': len(blob),
+            'ranges': [{'ls': function, 'bytes': len(blob) - (function - raw_base)}]}])
         self.assertEqual(program['lift_options_string'],
                          f'extra=0x{raw_base + 0x40:x};overrides=0x{function:x}=test_fn_override')
         starts = {start for start, _end in program['diagnostics']['functions']}
@@ -1041,6 +1044,8 @@ class Pipeline(unittest.TestCase):
         registry = (self.output / 'spu_workloads.c').read_text()
         self.assertIn('SPU_TIER_PARTIAL', registry)
         self.assertIn('0x0000000000001234ULL', registry)
+        self.assertIn('spu_workload_register_override_units(', registry)
+        self.assertIn('static const spu_workload_override_unit ', registry)
     def test_raw_tail_chain_override_registers_through_pipeline(self):
         base, blob = self.tail_chain_image()
         entry = self.raw_entry(
@@ -1052,6 +1057,12 @@ class Pipeline(unittest.TestCase):
         self.assertEqual(program['status'], 'registered')
         starts = {start for start, _end in program['diagnostics']['functions']}
         self.assertEqual(starts, {base, base + 0x40, base + 0x48})
+        # The finder excludes inter-function nop padding from each member.
+        self.assertEqual(program['override_units'], [{
+            'entry': base, 'image_ls': base, 'image_bytes': len(blob), 'ranges': [
+                {'ls': base, 'bytes': 4},
+                {'ls': base + 0x40, 'bytes': 4},
+                {'ls': base + 0x48, 'bytes': 8}]}])
         source = (self.output / program['name'] / 'spu_recomp.c').read_text()
         prefix = program['name'] + '_'
         self.assertIn(

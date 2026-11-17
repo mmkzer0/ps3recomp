@@ -326,12 +326,21 @@ typedef struct function_capture {
     const spu_xdiff_poison_fn* plan_function;
     uint32_t entry;
     const char* out_dir;
+    const spu_workload_override_unit* registered_unit;
     function_call_frame* stack;
     uint32_t depth;
     uint32_t after_return;
     uint32_t return_reg;
     uint32_t started;
     uint32_t written;
+    uint32_t discarded_yield;
+    uint32_t discarded_code_modified;
+    uint32_t unit_slot;
+    uint64_t unit_instructions;
+    int unit_active;
+    int previous_member;
+    uint32_t previous_pc;
+    int unit_return;
     int overflow;
     int failed;
     char error[256];
@@ -445,6 +454,96 @@ static void function_capture_fail(function_capture* capture, const char* message
     capture->failed = 1;
     snprintf(capture->error, sizeof capture->error, "%s", message ? message : "function capture failed");
 }
+static int unit_membership_difference(uint32_t entry, const char* kind,
+                                      uint32_t ls, uint32_t bytes, uint32_t* where)
+{
+    if (where) *where = ls;
+    PS3_LOG(PS3_LOG_INFO, "spu-xdiff", "override 0x%X CODE %s range [0x%X,+0x%X)\n",
+            entry, kind, ls, bytes);
+    return 0;
+}
+
+static int unit_placement_matches(const spu_workload_override_unit* unit,
+                                   uint32_t image_ls, uint32_t image_bytes, uint32_t* where)
+{
+    if (unit->image_ls == image_ls && unit->image_bytes == image_bytes) return 1;
+    if (where) *where = image_ls;
+    PS3_LOG(PS3_LOG_INFO, "spu-xdiff",
+            "CODE image placement mismatch for 0x%X: registered [0x%X,+0x%X), fixture [0x%X,+0x%X)\n",
+            unit->entry, unit->image_ls, unit->image_bytes, image_ls, image_bytes);
+    return 0;
+}
+
+static int unit_membership_matches(const spu_workload_override_unit* unit,
+                                    const spu_xdiff_code_range* ranges, uint32_t count,
+                                    uint32_t* where)
+{
+    uint32_t actual = 0;
+    for (uint32_t expected = 0; expected < unit->range_count || actual < count; expected++) {
+        if (expected == unit->range_count)
+            return unit_membership_difference(unit->entry, "extra", ranges[actual].ls,
+                                               ranges[actual].bytes, where);
+        const spu_workload_code_range* want = &unit->ranges[expected];
+        if (actual == count)
+            return unit_membership_difference(unit->entry, "missing", want->ls, want->bytes, where);
+        const uint32_t ls = ranges[actual].ls;
+        uint32_t bytes = ranges[actual++].bytes;
+        while (actual < count && (uint64_t)ls + bytes == ranges[actual].ls)
+            bytes += ranges[actual++].bytes;
+        if (want->ls < ls)
+            return unit_membership_difference(unit->entry, "missing", want->ls, want->bytes, where);
+        if (want->ls > ls)
+            return unit_membership_difference(unit->entry, "extra", ls, bytes, where);
+        if (want->bytes > bytes)
+            return unit_membership_difference(unit->entry, "missing", ls + bytes, want->bytes - bytes, where);
+        if (want->bytes < bytes)
+            return unit_membership_difference(unit->entry, "extra", ls + want->bytes, bytes - want->bytes, where);
+    }
+    return 1;
+}
+
+static int function_capture_code(function_capture* capture, const uint8_t* entry_ls)
+{
+    spu_xdiff_fixture* f = &capture->fixture;
+    spu_xdiff_error error;
+    spu_xdiff_code_range ranges[SPU_XDIFF_CODE_RANGES_MAX];
+    uint32_t count = 0;
+    f->identity = capture->source->identity;
+    f->unit.kind = SPU_XDIFF_UNIT_FUNCTION;
+    f->unit.entry_pc = capture->entry;
+    f->unit.image_ls = capture->source->unit.image_ls;
+    f->unit.image_bytes = capture->source->unit.image_bytes;
+    memcpy(f->ls0, entry_ls, SPU_LS_SIZE);
+    for (uint32_t pc = 0; pc < SPU_LS_SIZE; pc += 4u) {
+        const uint32_t word = pc >> 2;
+        if (!(capture->plan_function->unit_pcs[word >> 3] & (1u << (word & 7u))))
+            continue;
+        if (count && ranges[count - 1].ls + ranges[count - 1].bytes == pc) {
+            ranges[count - 1].bytes += 4u;
+        } else {
+            if (count == SPU_XDIFF_CODE_RANGES_MAX) {
+                function_capture_fail(capture, "admitted unit has too many code ranges");
+                return -1;
+            }
+            ranges[count++] = (spu_xdiff_code_range){pc, 4u};
+        }
+    }
+    if (!capture->registered_unit ||
+        !unit_placement_matches(capture->registered_unit, f->unit.image_ls, f->unit.image_bytes, NULL) ||
+        !unit_membership_matches(capture->registered_unit, ranges, count, NULL)) {
+        function_capture_fail(capture, "capture unit placement or membership differs from registration");
+        return -1;
+    }
+    if (spu_xdiff_fixture_set_code(f, ranges, count, capture->source->ls0, &error) != 0) {
+        if (error.reason == SPU_XDIFF_R_UNIT_CODE_MODIFIED)
+            capture->discarded_code_modified++;
+        else
+            function_capture_fail(capture, error.detail);
+        return -1;
+    }
+    return 0;
+}
+
 
 static void function_capture_write(function_capture* capture, uint32_t slot, spu_context* ctx,
                                    uint32_t return_pc)
@@ -473,6 +572,12 @@ static void function_capture_write(function_capture* capture, uint32_t slot, spu
         gpr_to_guest(&ctx->gpr[reg], f->reg1 + 16u * reg);
     memcpy(f->ls1, ctx->ls, SPU_LS_SIZE);
     f->end.end_class = (uint32_t)SPU_XDIFF_END_RETURN;
+    if (capture->plan_function->unit_pcs) {
+        if (function_capture_code(capture, state->local_store) != 0) return;
+        f->function_mask.live_out[0] = UINT64_MAX;
+        f->function_mask.live_out[1] = UINT64_MAX;
+        f->function_mask.dead_stack_bytes = 0;
+    }
 
     const size_t dir_bytes = strlen(capture->out_dir);
     if (dir_bytes > SIZE_MAX - 64u) {
@@ -519,7 +624,53 @@ static void function_capture_enter(function_capture* capture, function_call_fram
     for (uint32_t reg = 0; reg < 128u; reg++)
         gpr_to_guest(&ctx->gpr[reg], state->registers + 16u * reg);
     memcpy(state->local_store, ctx->ls, SPU_LS_SIZE);
+    if (capture->plan_function->unit_pcs &&
+        function_capture_code(capture, state->local_store) != 0) {
+        frame->slot = FUNCTION_CAPTURE_UNIT_CAP;
+        return;
+    }
     frame->slot = slot;
+}
+
+static int function_unit_contains(const function_capture* capture, uint32_t pc)
+{
+    const uint8_t* bits = capture->plan_function->unit_pcs;
+    const uint32_t word = (pc & (uint32_t)SPU_LS_MASK) >> 2;
+    return bits && ((bits[word >> 3] >> (word & 7u)) & 1u);
+}
+
+static void function_unit_step(function_capture* capture, spu_context* ctx, uint32_t pc)
+{
+    const int member = function_unit_contains(capture, pc);
+    if (member && !capture->previous_member)
+        PS3_LOG(PS3_LOG_INFO, "spu-xdiff", "unit-entry 0x%X -> 0x%X\n",
+                capture->previous_pc, pc);
+    if (capture->unit_active && !member) {
+        if (capture->unit_return) {
+            PS3_LOG(PS3_LOG_INFO, "spu-xdiff", "unit-run 0x%X instructions=%llu\n",
+                    capture->entry, (unsigned long long)capture->unit_instructions);
+            function_capture_write(capture, capture->unit_slot, ctx, pc);
+        } else
+            capture->discarded_yield++;
+        capture->unit_active = 0;
+    }
+    if (!capture->unit_active && pc == capture->entry && !capture->previous_member &&
+        capture->started < FUNCTION_CAPTURE_UNIT_CAP) {
+        function_call_frame frame = {0};
+        frame.slot = FUNCTION_CAPTURE_UNIT_CAP;
+        frame.target = capture->entry;
+        function_capture_enter(capture, &frame, ctx);
+        capture->unit_slot = frame.slot;
+        capture->unit_active = !capture->failed && frame.slot < FUNCTION_CAPTURE_UNIT_CAP;
+        capture->unit_instructions = 0;
+    }
+    if (capture->unit_active && member) capture->unit_instructions++;
+    capture->previous_member = member;
+    capture->previous_pc = pc;
+    capture->unit_return = capture->unit_active &&
+        (ls_word(ctx, pc) >> 21) == 0x1A8u &&
+        ((ls_word(ctx, pc) >> 7) & 127u) == 0 &&
+        !(ctx->int_enable && (ctx->event_status & ctx->event_mask));
 }
 
 /* The instruction observer supplies function boundaries only after a call has
@@ -528,6 +679,10 @@ static void function_capture_step(function_capture* capture, spu_context* ctx, u
 {
     if (capture->failed) return;
     pc &= (uint32_t)SPU_LS_MASK & ~3u;
+    if (capture->plan_function->unit_pcs) {
+        function_unit_step(capture, ctx, pc);
+        return;
+    }
     if (capture->after_return) {
         capture->after_return = 0;
         for (uint32_t k = capture->depth; k > 0; k--) {
@@ -1270,6 +1425,28 @@ static int plan_dead_stack(jp* j, spu_xdiff_poison_fn* fn)
     return 0;
 }
 
+static int plan_unit_pcs(jp* j, spu_xdiff_poison_fn* fn)
+{
+    if (fn->unit_pcs) return jp_fail(j, "unit_pcs given twice");
+    fn->unit_pcs = (uint8_t*)calloc(SPU_LS_SIZE / 32u, 1);
+    if (!fn->unit_pcs) return jp_fail(j, "out of memory");
+    if (jp_eat(j, '[') != 0) return -1;
+    if (jp_peek(j) == ']') return jp_fail(j, "unit_pcs is empty");
+    for (;;) {
+        uint64_t pc;
+        if (jp_address(j, &pc) != 0) return -1;
+        if (pc >= SPU_LS_SIZE || (pc & 3u))
+            return jp_fail(j, "unit PC is not a word address in local store");
+        const uint32_t word = (uint32_t)pc >> 2;
+        if (fn->unit_pcs[word >> 3] & (1u << (word & 7u)))
+            return jp_fail(j, "unit PC given twice");
+        fn->unit_pcs[word >> 3] |= (uint8_t)(1u << (word & 7u));
+        const int more = jp_next(j, ']');
+        if (more < 0) return -1;
+        if (more) return 0;
+    }
+}
+
 static int plan_function(jp* j, spu_xdiff_poison_fn* fn)
 {
     int have_entry = 0;
@@ -1286,6 +1463,8 @@ static int plan_function(jp* j, spu_xdiff_poison_fn* fn)
             if (v >= (uint64_t)SPU_LS_SIZE || (v & 3u)) return jp_fail(j, "an entry is not a word address in local store");
             fn->entry = (uint32_t)v;
             have_entry = 1;
+        } else if (!strcmp(key, "unit_pcs")) {
+            if (plan_unit_pcs(j, fn) != 0) return -1;
         } else if (!strcmp(key, "dead_regs")) {
             if (plan_dead_regs(j, fn) != 0) return -1;
         } else if (!strcmp(key, "dead_stack")) {
@@ -1316,8 +1495,11 @@ static int plan_functions(jp* j, spu_xdiff_poison_plan* plan)
             plan->fn = grown;
             cap = ncap;
         }
-        if (plan_function(j, &plan->fn[plan->count]) != 0) return -1;
-        plan->count++;
+        spu_xdiff_poison_fn* fn = &plan->fn[plan->count++];
+        if (plan_function(j, fn) != 0) return -1;
+        if (fn->unit_pcs && !(fn->unit_pcs[(fn->entry >> 2) >> 3] &
+                              (1u << ((fn->entry >> 2) & 7u))))
+            return jp_fail(j, "unit_pcs does not contain its entry");
         more = jp_next(j, ']');
         if (more < 0) return -1;
         if (more) return 0;
@@ -1389,6 +1571,7 @@ static int plan_document(jp* j, spu_xdiff_poison_plan* plan)
 
 void spu_xdiff_poison_plan_free(spu_xdiff_poison_plan* plan)
 {
+    for (uint32_t i = 0; i < plan->count; i++) free(plan->fn[i].unit_pcs);
     free(plan->fn);
     memset(plan, 0, sizeof *plan);
 }
@@ -1465,10 +1648,22 @@ uint32_t spu_xdiff_replay_function_unit(const spu_xdiff_fixture* f, int native_o
     if (!f->unit.image_bytes ||
         (uint64_t)f->unit.image_ls + f->unit.image_bytes > SPU_XDIFF_LS_BYTES)
         return function_result_reason(out, SPU_XDIFF_R_FIXTURE_FORMAT);
-    if (spu_workload_fingerprint(f->ls0 + f->unit.image_ls, f->unit.image_bytes) !=
-        f->identity.image_fingerprint)
-        return function_result_reason(out, SPU_XDIFF_R_FIXTURE_IDENTITY);
+    spu_xdiff_error identity_error;
+    if (spu_xdiff_fixture_check_identity(f, &identity_error) != 0)
+        return function_result_reason(out, identity_error.reason);
 
+    if (f->code.count) {
+        const spu_workload_override_unit* unit =
+            spu_workload_find_override_unit(f->identity.image_fingerprint, f->unit.entry_pc);
+        if (!unit) {
+            PS3_LOG(PS3_LOG_INFO, "spu-xdiff", "CODE without registered membership for 0x%X\n",
+                    f->unit.entry_pc);
+            return function_result_reason(out, SPU_XDIFF_R_FIXTURE_IDENTITY);
+        }
+        if (!unit_placement_matches(unit, f->unit.image_ls, f->unit.image_bytes, &out->where) ||
+            !unit_membership_matches(unit, f->code.range, f->code.count, &out->where))
+            return function_result_reason(out, SPU_XDIFF_R_FIXTURE_IDENTITY);
+    }
     int image_id = 0;
     if (!spu_workload_find_img(f->identity.image_fingerprint, &image_id))
         return function_result_reason(out, SPU_XDIFF_R_NO_BODY);
@@ -1563,13 +1758,13 @@ static void function_capture_free(function_capture* capture)
 }
 
 int spu_xdiff_capture_function_units(const spu_xdiff_fixture* f,
-                                    const spu_xdiff_poison_plan* plan, uint32_t entry,
-                                    const char* out_dir, uint32_t* captured,
+                                    const spu_xdiff_poison_plan* plan, uint32_t entry, uint64_t budget,
+                                    const char* out_dir, spu_xdiff_capture_report* report,
                                     char* err, size_t err_bytes)
 {
-    if (captured) *captured = 0;
+    if (report) memset(report, 0, sizeof *report);
     if (err && err_bytes) err[0] = 0;
-    if (!f || !f->ls0 || !f->ls1 || !plan || !out_dir || !*out_dir || !captured) {
+    if (!f || !f->ls0 || !f->ls1 || !plan || !out_dir || !*out_dir || !report) {
         if (err && err_bytes) snprintf(err, err_bytes, "function capture needs a fixture, plan, output directory, and count");
         return -1;
     }
@@ -1605,6 +1800,18 @@ int spu_xdiff_capture_function_units(const spu_xdiff_fixture* f,
                                        (unsigned)entry);
         return -1;
     }
+    const spu_workload_override_unit* registered_unit = NULL;
+    if (fn->unit_pcs) {
+        registered_unit = spu_workload_find_override_unit(f->identity.image_fingerprint, entry);
+        if (!registered_unit) {
+            if (err && err_bytes) snprintf(err, err_bytes, "CODE without registered membership");
+            return -1;
+        }
+        if (!unit_placement_matches(registered_unit, f->unit.image_ls, f->unit.image_bytes, NULL)) {
+            if (err && err_bytes) snprintf(err, err_bytes, "capture image placement differs from registration");
+            return -1;
+        }
+    }
     if (XDIFF_MKDIR(out_dir) != 0 && errno != EEXIST) {
         if (err && err_bytes) snprintf(err, err_bytes, "%s: cannot create output directory: %s",
                                        out_dir, strerror(errno));
@@ -1618,7 +1825,9 @@ int spu_xdiff_capture_function_units(const spu_xdiff_fixture* f,
     }
     capture->source = f;
     capture->plan_function = fn;
+    capture->registered_unit = registered_unit;
     capture->entry = entry;
+    capture->previous_pc = UINT32_MAX; /* dispatcher arrival, no previous guest instruction */
     capture->out_dir = out_dir;
     capture->stack = (function_call_frame*)calloc(FUNCTION_CAPTURE_STACK_CAP, sizeof *capture->stack);
     if (!capture->stack || spu_xdiff_fixture_init(&capture->fixture) != 0) {
@@ -1633,9 +1842,15 @@ int spu_xdiff_capture_function_units(const spu_xdiff_fixture* f,
         function_capture_free(capture);
         return -1;
     }
-    spu_xdiff_replay_options options = { (uint32_t)SPU_TIER_INTERP, 0 };
+    spu_xdiff_replay_options options = { (uint32_t)SPU_TIER_INTERP, budget };
     spu_xdiff_verdict_record verdict;
     const uint32_t replay_verdict = replay_core(f, &options, shadow, &verdict, NULL, capture);
+    if (capture->unit_active) {
+        capture->discarded_yield++;
+        capture->unit_active = 0;
+    }
+    report->discarded_yield = capture->discarded_yield;
+    report->discarded_code_modified = capture->discarded_code_modified;
     spu_xdiff_shadow_free(shadow);
 
     int rc = 0;
@@ -1647,11 +1862,12 @@ int spu_xdiff_capture_function_units(const spu_xdiff_fixture* f,
             snprintf(err, err_bytes, "T0 source replay is %s / %s",
                      spu_xdiff_verdict_id(replay_verdict), spu_xdiff_reason_id(verdict.reason));
         rc = -1;
-    } else if (capture->started != capture->written) {
+    } else if (capture->started != capture->written + capture->discarded_yield +
+                                   capture->discarded_code_modified) {
         if (err && err_bytes) snprintf(err, err_bytes, "one or more captured calls did not return");
         rc = -1;
     } else {
-        *captured = capture->written;
+        report->captured = capture->written;
     }
     function_capture_free(capture);
     return rc;
