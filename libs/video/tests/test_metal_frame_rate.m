@@ -120,6 +120,7 @@ static int log_display_environment(void) {
 void rsx_set_backend(rsx_backend* backend) { (void)backend; }
 void rsx_draw_engine_shutdown(void) {}
 void rsx_draw_engine_set_backend(const rsx_draw_backend* backend) { (void)backend; }
+void rsx_draw_engine_require_represent(void) {}
 static void* shutdown_worker(void* unused) {
  (void)unused;rsx_metal_backend_shutdown();return NULL;
 }
