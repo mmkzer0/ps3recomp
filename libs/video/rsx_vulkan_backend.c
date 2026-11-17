@@ -82,6 +82,7 @@ static void vk_mutex_unlock(vk_mutex* m)  { pthread_mutex_unlock(m); }
 #include "rsx_fp_decompiler.h"
 #include "rsx_shader_spirv.h"
 #include "rsx_draw_engine.h"
+#include "../../include/ps3emu/ps3_ftrace.h"   /* PS3_FT_SHADER_COMPILE / PS3_FT_PIPELINE_CREATE */
 #include "vulkan/rsx_vk_fallback_vert.spv.h"
 #include "vulkan/rsx_vk_fallback_frag.spv.h"
 
@@ -1188,11 +1189,28 @@ static int vk_create_render_pass(void)
     return 0;
 }
 
+/* ---- shader compile and pipeline create spans (PS3_FT_SHADER_COMPILE, PS3_FT_PIPELINE_CREATE) ----
+ * who = 1 on the draw engine's recording path, whose callbacks the FIFO walker (the RSX thread) runs, as kind 16
+ * tells engine presents apart from the legacy path; 0 on backend init or the vtable path. The guard's one load is
+ * the whole cost when ftrace is off. `a` names what was built, `b` the bytes handed to the compiler. */
+enum { VK_FT_WHO_HOST = 0, VK_FT_WHO_RSX = 1 };
+
+static u32 vk_ft_fold(u32 h, const void* data, size_t n)
+{
+    const u8* p = (const u8*)data;
+    for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 16777619u; }
+    return h;
+}
+
 static int vk_create_shader(const uint32_t* code, size_t bytes, VkShaderModule* out)
 {
     VkShaderModuleCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
                                     .codeSize = bytes, .pCode = code };
-    VK_CHECK(pvkCreateShaderModule(s_vk.device, &ci, NULL, out), "vkCreateShaderModule");
+    const uint64_t ft0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+    const VkResult ft_r = pvkCreateShaderModule(s_vk.device, &ci, NULL, out);
+    if (ft0) ps3_ft_span(PS3_FT_SHADER_COMPILE, VK_FT_WHO_HOST, vk_ft_fold(2166136261u, code, bytes),
+                         (uint32_t)bytes, ft0, ps3_ft_now());
+    VK_CHECK(ft_r, "vkCreateShaderModule");
     return 0;
 }
 
@@ -1310,7 +1328,9 @@ static VkPipeline vk_get_pipeline(int ztest, int zwrite, u32 cmp)
         .pDynamicState = &dy, .layout = s_vk.pipe_layout, .renderPass = s_vk.render_pass,
         .subpass = 0 };
     VkPipeline p = VK_NULL_HANDLE;
+    const uint64_t ft0 = PS3_FT_ON() ? ps3_ft_now() : 0;
     VkResult r = pvkCreateGraphicsPipelines(s_vk.device, VK_NULL_HANDLE, 1, &gci, NULL, &p);
+    if (ft0) ps3_ft_span(PS3_FT_PIPELINE_CREATE, VK_FT_WHO_HOST, slot, 0, ft0, ps3_ft_now());
     if (r != VK_SUCCESS) { VK_LOG("vkCreateGraphicsPipelines failed (%d)\n", (int)r); return VK_NULL_HANDLE; }
     s_vk.pipelines[slot] = p;
     return p;
@@ -1510,7 +1530,12 @@ static VkShaderModule vk_guest_module(const char* what, int stage)
     VkShaderModuleCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
                                     .codeSize = (size_t)n * 4u, .pCode = s_g.spv };
     VkShaderModule m = VK_NULL_HANDLE;
-    if (pvkCreateShaderModule(s_vk.device, &ci, NULL, &m) != VK_SUCCESS) {
+    const uint64_t ft0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+    const VkResult ft_r = pvkCreateShaderModule(s_vk.device, &ci, NULL, &m);
+    if (ft0) ps3_ft_span(PS3_FT_SHADER_COMPILE, VK_FT_WHO_HOST,
+                         vk_ft_fold(2166136261u, s_g.spv, ci.codeSize), (uint32_t)ci.codeSize,
+                         ft0, ps3_ft_now());
+    if (ft_r != VK_SUCCESS) {
         VK_LOG("%s: vkCreateShaderModule failed\n", what);
         return VK_NULL_HANDLE;
     }
@@ -1651,7 +1676,11 @@ static VkPipeline vk_guest_pipeline(int vs, int fs, int ztest, int zwrite, u32 c
         .pDynamicState = &dy, .layout = s_g.pipe_layout, .renderPass = s_vk.render_pass,
         .subpass = 0 };
     VkPipeline p = VK_NULL_HANDLE;
+    const uint64_t ft0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+    const u32 ft_key[3] = { (u32)vs, (u32)fs, dkey };   /* the cache key this creation was reached with */
+    const u32 ft_id = ft0 ? vk_ft_fold(2166136261u, ft_key, sizeof ft_key) : 0;
     VkResult r = pvkCreateGraphicsPipelines(s_vk.device, VK_NULL_HANDLE, 1, &gci, NULL, &p);
+    if (ft0) ps3_ft_span(PS3_FT_PIPELINE_CREATE, VK_FT_WHO_HOST, ft_id, 0, ft0, ps3_ft_now());
     if (r != VK_SUCCESS) {
         VK_LOG("guest pipeline: vkCreateGraphicsPipelines failed (%d)\n", (int)r);
         return VK_NULL_HANDLE;
@@ -3456,7 +3485,12 @@ static int vk_eng_translate(const char* hlsl, int stage, VkShaderModule* out)
     }
     VkShaderModuleCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
                                     .codeSize = (size_t)words * 4u, .pCode = s_g.spv };
-    return pvkCreateShaderModule(s_vk.device, &ci, NULL, out) == VK_SUCCESS ? 0 : -1;
+    const uint64_t ft0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+    const VkResult ft_r = pvkCreateShaderModule(s_vk.device, &ci, NULL, out);
+    if (ft0) ps3_ft_span(PS3_FT_SHADER_COMPILE, VK_FT_WHO_RSX,
+                         vk_ft_fold(2166136261u, s_g.spv, ci.codeSize), (uint32_t)ci.codeSize,
+                         ft0, ps3_ft_now());
+    return ft_r == VK_SUCCESS ? 0 : -1;
 }
 
 /* A pixel program with a cube unit declares all sixteen units one by one
@@ -3706,8 +3740,13 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
         .pViewportState = &vps, .pRasterizationState = &ras, .pMultisampleState = &ms,
         .pDepthStencilState = &ds, .pColorBlendState = &cb, .pDynamicState = &dy,
         .layout = layout, .renderPass = rp, .subpass = 0 };
-    if (pvkCreateGraphicsPipelines(s_vk.device, VK_NULL_HANDLE, 1, &gci, NULL,
-                                   &P->variant[topo_idx]) != VK_SUCCESS) {
+    const uint64_t ft0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+    const u32 ft_key[2] = { (u32)(P - s_epipe), topo_idx };   /* the pipeline table slot and topology */
+    const u32 ft_id = ft0 ? vk_ft_fold(2166136261u, ft_key, sizeof ft_key) : 0;
+    const VkResult ft_r = pvkCreateGraphicsPipelines(s_vk.device, VK_NULL_HANDLE, 1, &gci, NULL,
+                                                     &P->variant[topo_idx]);
+    if (ft0) ps3_ft_span(PS3_FT_PIPELINE_CREATE, VK_FT_WHO_RSX, ft_id, 0, ft0, ps3_ft_now());
+    if (ft_r != VK_SUCCESS) {
         VK_LOG("engine: vkCreateGraphicsPipelines failed\n");
         P->variant[topo_idx] = VK_NULL_HANDLE;
     }

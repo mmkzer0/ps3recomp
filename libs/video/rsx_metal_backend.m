@@ -701,6 +701,55 @@ static u64 fnv1a64(const void* data, u32 n, u64 h)
     return h;
 }
 
+/* ---- shader compile and pipeline create spans (PS3_FT_SHADER_COMPILE, PS3_FT_PIPELINE_CREATE) ----
+ * who = 1 where the span runs on the draw engine's recording path: those callbacks are the FIFO walker's own call
+ * chain, the RSX thread (kind 16 tells engine presents apart from the legacy path the same way); 0 on backend init,
+ * the vtable path and any host thread. A build is rare, so the guard's one load is the whole cost when ftrace is
+ * off. `a` names what was built: the program's cache key where the site has one, else FNV-1a 32 of the source or of
+ * the descriptor fields the site already holds. */
+enum { FT_WHO_HOST = 0, FT_WHO_RSX = 1 };
+
+static u32 ft_id_fields(const char* s0, const char* s1, const void* extra, u32 n)
+{
+    static const u8 sep = 0;              /* keeps "ab"+"c" from hashing as "a"+"bc" */
+    u64 h = 1469598103934665603ull;
+    h = fnv1a64(&sep, 1, h);
+    if (s0) h = fnv1a64(s0, (u32)strlen(s0), h);
+    h = fnv1a64(&sep, 1, h);
+    if (s1) h = fnv1a64(s1, (u32)strlen(s1), h);
+    if (extra && n) h = fnv1a64(extra, n, h);
+    return (u32)(h ^ (h >> 32));
+}
+
+static u32 ft_id_format(const char* s0, const char* s1, u32 fmt, u32 extra)
+{
+    const u32 v[2] = { fmt, extra };
+    return ft_id_fields(s0, s1, v, sizeof v);
+}
+
+/* One PS3_FT_SHADER_COMPILE span around a library built from source. `key` is the program's cache key, or 0 to
+ * hash the source. Only a real compile comes here; every caller has already missed its cache. */
+static id<MTLLibrary> ft_new_library(NSString* msl, MTLCompileOptions* opts, NSError** err, u32 key, u32 who)
+{
+    const uint64_t ft0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+    id<MTLLibrary> lib = [s_dev newLibraryWithSource:msl options:opts error:err];
+    if (ft0) {
+        const char* s = [msl UTF8String];
+        const u32 n = (u32)strlen(s);
+        ps3_ft_span(PS3_FT_SHADER_COMPILE, who, key ? key : fnv1a32((const u8*)s, n), n, ft0, ps3_ft_now());
+    }
+    return lib;
+}
+
+/* One PS3_FT_PIPELINE_CREATE span around a render pipeline state creation. */
+static id<MTLRenderPipelineState> ft_new_pso(MTLRenderPipelineDescriptor* pd, NSError** err, u32 key, u32 who)
+{
+    const uint64_t ft0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+    id<MTLRenderPipelineState> pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:err];
+    if (ft0) ps3_ft_span(PS3_FT_PIPELINE_CREATE, who, key, 0, ft0, ps3_ft_now());
+    return pso;
+}
+
 /* One depth/stencil texture for the display target, sized like the colour
  * attachment, shared by every pass the frame opens -- the D3D12 backend shares
  * one depth buffer the same way, because a PS3 title typically uses a single
@@ -1269,19 +1318,22 @@ static MTLCompileOptions* guest_compile_options(void)
 }
 
 /* MSL source -> its `main0` function, or nil with the compiler's diagnostic
- * on stderr. */
-static id<MTLFunction> compile_guest_function(const char* msl, const char* what)
+ * on stderr. `key` is the program's cache key and `who` its thread (kind 38's fields); the span covers the library
+ * build and the function fetched from it, because Metal can defer the program build to that second call. */
+static id<MTLFunction> compile_guest_function(const char* msl, const char* what, u32 key, u32 who)
 {
     NSError* err = nil;
+    const uint64_t ft0 = PS3_FT_ON() ? ps3_ft_now() : 0;
     id<MTLLibrary> lib = [s_dev newLibraryWithSource:[NSString stringWithUTF8String:msl]
                                              options:guest_compile_options()
                                                error:&err];
+    id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"main0"] : nil;
+    if (ft0) ps3_ft_span(PS3_FT_SHADER_COMPILE, who, key, (uint32_t)strlen(msl), ft0, ps3_ft_now());
     if (!lib) {
         PS3_LOG(PS3_LOG_WARN, "RSX metal", "%s: MSL compile failed: %s\n", what,
                 [[err localizedDescription] UTF8String]);
         return nil;
     }
-    id<MTLFunction> fn = [lib newFunctionWithName:@"main0"];
     if (!fn) PS3_LOG(PS3_LOG_INFO, "RSX metal", "%s: no main0 in the compiled MSL\n", what);
     return fn;
 }
@@ -1325,7 +1377,7 @@ static int vp_slot_for(const rsx_state* st, u32 vtex_mask)
         } else {
             snprintf(name, sizeof name, "vp_%08x.msl", hash); dump_shader(name, s_msl);
             snprintf(name, sizeof name, "vertex program %08X", hash);
-            fn = compile_guest_function(s_msl, name);
+            fn = compile_guest_function(s_msl, name, hash, FT_WHO_HOST);
         }
     }
     {
@@ -1424,7 +1476,7 @@ static int fp_slot_for(const rsx_state* st, const u8** uc, u32 cube_mask)
             snprintf(name, sizeof name, "fp_%016llx.msl", (unsigned long long)key);
             dump_shader(name, s_msl);
             snprintf(name, sizeof name, "fragment program %016llX", (unsigned long long)key);
-            fn = compile_guest_function(s_msl, name);
+            fn = compile_guest_function(s_msl, name, (u32)key, FT_WHO_HOST);
         }
     }
     {
@@ -2429,8 +2481,8 @@ static id<MTLRenderPipelineState> pso_for(const MtlDraw* d, MTLPixelFormat color
     }
 
     NSError* err = nil;
-    id<MTLRenderPipelineState> pso =
-        [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
+    const u32 ft_id = PS3_FT_ON() ? fnv1a32((const u8*)&key, (u32)sizeof key) : 0;
+    id<MTLRenderPipelineState> pso = ft_new_pso(pd, &err, ft_id, FT_WHO_HOST);
     if (!pso) {
         PS3_LOG(PS3_LOG_WARN, "RSX metal", "pipeline state failed (vs %d, fs %d): %s\n",
                 d->vs_idx, d->fs_idx, [[err localizedDescription] UTF8String]);
@@ -3368,11 +3420,11 @@ static id<MTLBuffer> eng_new_buffer(NSUInteger length, const char* what)
     }, 1, what, nil, length);
 }
 
-static id<MTLRenderPipelineState> eng_new_pso(MTLRenderPipelineDescriptor* pd, NSError* __strong * err)
+static id<MTLRenderPipelineState> eng_new_pso(MTLRenderPipelineDescriptor* pd, NSError* __strong * err, u32 key)
 {
     return (id<MTLRenderPipelineState>)eng_gated_create(^id{
         NSError* e = nil;
-        id<MTLRenderPipelineState> pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&e];
+        id<MTLRenderPipelineState> pso = ft_new_pso(pd, &e, key, FT_WHO_RSX);
         *err = e;
         return pso;
     }, 0, "pipeline", nil, 0);
@@ -3555,7 +3607,7 @@ static int eng_init(void* user, u32 width, u32 height)
     rsx_display_reset(&s_eng_display);
     if (!s_dev) return -1;
     NSError* err = nil;
-    s_eng_helper_lib = [s_dev newLibraryWithSource:kEngHelperMSL options:nil error:&err];
+    s_eng_helper_lib = ft_new_library(kEngHelperMSL, nil, &err, 0, FT_WHO_HOST);
     if (!s_eng_helper_lib) {
         PS3_LOG(PS3_LOG_WARN, "rsx engine/metal", "helper shader compile failed: %s\n",
                 [[err localizedDescription] UTF8String]);
@@ -4154,7 +4206,9 @@ static u32 eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
         pd.fragmentFunction = [s_eng_helper_lib newFunctionWithName:@"eng_depth_fs"];
         pd.colorAttachments[0].pixelFormat = MTLPixelFormatR32Float;
         NSError* err = nil;
-        s_eng_depth_pso = eng_new_pso(pd, &err);
+        const u32 ft_id = PS3_FT_ON()
+            ? ft_id_format("eng_fullscreen_vs", "eng_depth_fs", (u32)MTLPixelFormatR32Float, 0) : 0;
+        s_eng_depth_pso = eng_new_pso(pd, &err, ft_id);
         if (!s_eng_depth_pso) {
             PS3_LOG(PS3_LOG_WARN, "rsx engine/metal", "depth resolve pipeline failed: %s\n",
                     [[err localizedDescription] UTF8String]);
@@ -4188,14 +4242,23 @@ static u32 eng_depth_as_color(void* user, u32 depth, u32 w, u32 h, u32 rsx_fmt)
     static const MTLPixelFormat formats[2] = { MTLPixelFormatRGBA8Unorm, MTLPixelFormatR16Unorm };
     if (!s_eng_depth_color_pso[k]) {
         NSError* err = nil;
+        const uint64_t ft0 = PS3_FT_ON() ? ps3_ft_now() : 0;
         id<MTLLibrary> lib = [s_dev newLibraryWithSource:
                                  [NSString stringWithUTF8String:kEngDepthColorMSL]
                                                  options:nil error:&err];
         MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
         pd.vertexFunction   = [lib newFunctionWithName:@"eng_depth_color_vs"];
         pd.fragmentFunction = [lib newFunctionWithName:k ? @"eng_depth_d16_fs" : @"eng_depth_argb_fs"];
+        if (ft0) {
+            const u32 n = (uint32_t)strlen(kEngDepthColorMSL);
+            ps3_ft_span(PS3_FT_SHADER_COMPILE, FT_WHO_RSX,
+                        fnv1a32((const u8*)kEngDepthColorMSL, n), n, ft0, ps3_ft_now());
+        }
         pd.colorAttachments[0].pixelFormat = formats[k];
-        if (lib) s_eng_depth_color_pso[k] = eng_new_pso(pd, &err);
+        const u32 ft_id = PS3_FT_ON()
+            ? ft_id_format("eng_depth_color_vs", k ? "eng_depth_d16_fs" : "eng_depth_argb_fs",
+                           (u32)formats[k], (u32)k) : 0;
+        if (lib) s_eng_depth_color_pso[k] = eng_new_pso(pd, &err, ft_id);
         if (!s_eng_depth_color_pso[k]) {
             PS3_LOG(PS3_LOG_WARN, "rsx engine/metal", "depth-as-colour pipeline failed: %s\n",
                     [[err localizedDescription] UTF8String]);
@@ -4243,7 +4306,7 @@ static id<MTLFunction> eng_function(const char* hlsl, int stage,
         snprintf(name, sizeof name, "%s_%016llx.msl", what, (unsigned long long)hash);
         dump_shader(name, s_msl);
         snprintf(name, sizeof name, "%s %016llx", what, (unsigned long long)hash);
-        fn = compile_guest_function(s_msl, name);
+        fn = compile_guest_function(s_msl, name, (u32)hash, FT_WHO_RSX);
     }
     s_eng_func[s_eng_func_count].hash = hash;
     s_eng_func[s_eng_func_count].fn   = fn;
@@ -4339,7 +4402,12 @@ static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
     }
 
     NSError* err = nil;
-    id<MTLRenderPipelineState> pso = eng_new_pso(pd, &err);
+    u32 ft_id = 0;
+    if (PS3_FT_ON()) {
+        const u32 ft_fields[3] = { (u32)rt_fmt, rt_count, vertex_stride };
+        ft_id = ft_id_fields(vs_hlsl, ps_hlsl, ft_fields, sizeof ft_fields);
+    }
+    id<MTLRenderPipelineState> pso = eng_new_pso(pd, &err, ft_id);
     if (!pso) {
         PS3_LOG(PS3_LOG_WARN, "rsx engine/metal", "pipeline state failed: %s\n",
                 [[err localizedDescription] UTF8String]);
@@ -4812,7 +4880,9 @@ static id<MTLRenderPipelineState> eng_clear_pipeline(MTLPixelFormat fmt, int dep
         pd.colorAttachments[0].pixelFormat = fmt;
     }
     NSError* err = nil;
-    id<MTLRenderPipelineState> pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];   /* in the commit section */
+    const u32 ft_id = PS3_FT_ON() ? ft_id_format("eng_fullscreen_vs",
+        depth ? "eng_clear_depth_fs" : "eng_clear_fs", (u32)fmt, (u32)depth) : 0;
+    id<MTLRenderPipelineState> pso = ft_new_pso(pd, &err, ft_id, FT_WHO_RSX);   /* in the commit section */
     if (!pso) {
         PS3_LOG(PS3_LOG_WARN, "rsx engine/metal", "rectangle clear pipeline failed: %s\n",
                 [[err localizedDescription] UTF8String]);
@@ -5142,7 +5212,9 @@ static id<MTLTexture> eng_fxaa(id<MTLCommandBuffer> cb, id<MTLTexture> src)
         pd.fragmentFunction = [s_eng_helper_lib newFunctionWithName:@"eng_fxaa_fs"];
         pd.colorAttachments[0].pixelFormat = fmt;
         NSError* err = nil;
-        s_eng_fxaa_pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];   /* in the commit section */
+        const u32 ft_id = PS3_FT_ON()
+            ? ft_id_format("eng_fullscreen_vs", "eng_fxaa_fs", (u32)fmt, 0) : 0;
+        s_eng_fxaa_pso = ft_new_pso(pd, &err, ft_id, FT_WHO_RSX);   /* in the commit section */
         if (!s_eng_fxaa_pso) {
             PS3_LOG(PS3_LOG_WARN, "rsx engine/metal", "FXAA pipeline failed (FXAA off): %s\n",
                     [[err localizedDescription] UTF8String]);
@@ -5188,7 +5260,9 @@ static id<MTLRenderPipelineState> eng_smaa_pso(NSString* vs, NSString* fs, MTLPi
     pd.fragmentFunction = [s_eng_smaa_lib newFunctionWithName:fs];
     pd.colorAttachments[0].pixelFormat = fmt;
     NSError* err = nil;
-    id<MTLRenderPipelineState> p = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];   /* in the commit section */
+    const u32 ft_id = PS3_FT_ON()
+        ? ft_id_format([vs UTF8String], [fs UTF8String], (u32)fmt, 0) : 0;
+    id<MTLRenderPipelineState> p = ft_new_pso(pd, &err, ft_id, FT_WHO_RSX);   /* in the commit section */
     if (!p) PS3_LOG(PS3_LOG_WARN, "rsx engine/metal", "SMAA pipeline %s failed (SMAA off): %s\n",
                     [fs UTF8String], [[err localizedDescription] UTF8String]);
     return p;
@@ -5239,7 +5313,7 @@ static id<MTLTexture> eng_smaa(id<MTLCommandBuffer> cb, id<MTLTexture> src)
     const MTLPixelFormat fmt = [src pixelFormat];
     if (!s_eng_smaa_lib) {
         NSError* err = nil;
-        s_eng_smaa_lib = [s_dev newLibraryWithSource:@(kSmaaMSL) options:nil error:&err];
+        s_eng_smaa_lib = ft_new_library(@(kSmaaMSL), nil, &err, 0, FT_WHO_RSX);
         if (!s_eng_smaa_lib) {
             PS3_LOG(PS3_LOG_WARN, "rsx engine/metal", "SMAA shaders failed to compile (SMAA off): %s\n",
                     [[err localizedDescription] UTF8String]);
@@ -5300,7 +5374,9 @@ static int eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
         pd.fragmentFunction = [s_eng_helper_lib newFunctionWithName:@"eng_present_fs"];
         pd.colorAttachments[0].pixelFormat = [dst pixelFormat];
         NSError* err = nil;
-        s_eng_blit_pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];   /* in the commit section */
+        const u32 ft_id = PS3_FT_ON()
+            ? ft_id_format("eng_fullscreen_vs", "eng_present_fs", (u32)[dst pixelFormat], 0) : 0;
+        s_eng_blit_pso = ft_new_pso(pd, &err, ft_id, FT_WHO_RSX);   /* in the commit section */
         if (!s_eng_blit_pso) {
             PS3_LOG(PS3_LOG_WARN, "rsx engine/metal", "present pipeline failed: %s\n",
                     [[err localizedDescription] UTF8String]);
@@ -5999,7 +6075,7 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
         }
 
         NSError* serr = nil;
-        s_shader_lib = [s_dev newLibraryWithSource:kBuiltinMSL options:nil error:&serr];
+        s_shader_lib = ft_new_library(kBuiltinMSL, nil, &serr, 0, FT_WHO_HOST);
         if (!s_shader_lib) {
             PS3_LOG(PS3_LOG_WARN, "RSX metal", "built-in shader compile failed: %s\n",
                     [[serr localizedDescription] UTF8String]);

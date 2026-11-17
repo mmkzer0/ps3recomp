@@ -1,6 +1,7 @@
 /* The GPU tier of the BC1/2/3 emulation; see rsx_metal_bc.h. */
 #include "rsx_metal_bc.h"
-#include "../../include/ps3emu/ps3_log.h"   /* PS3_LOG: tagged lines, stderr bytes unchanged */
+#include "../../include/ps3emu/ps3_log.h"      /* PS3_LOG: tagged lines, stderr bytes unchanged */
+#include "../../include/ps3emu/ps3_ftrace.h"   /* PS3_FT_SHADER_COMPILE / PS3_FT_PIPELINE_CREATE */
 
 #include <pthread.h>
 #include <stdio.h>
@@ -161,10 +162,24 @@ static uint64_t monotonic_ms(void)
 #endif
     pthread_mutex_init(&_lock, NULL);
     if (_host.gate_enter) _host.gate_enter(_host.user);
+    /* PS3_FTRACE: the decoder is built on the RSX thread by the first GPU-tier upload, so its factory is who = 1
+     * (the backend's convention); a = the kernel's source hash, b = the MSL length for the compile and 0 for the
+     * pipeline. Both are only built on this path, so there is no cache hit to stay silent for. */
+    const uint64_t ft0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+    uint32_t ft_id = 0;
     id<MTLLibrary> lib = [device newLibraryWithSource:[NSString stringWithUTF8String:kRsxBcMSL]
                                               options:nil error:error];
     id<MTLFunction> fn = [lib newFunctionWithName:@"rsx_bc_decode"];
-    if (fn) _pso = [device newComputePipelineStateWithFunction:fn error:error];
+    if (ft0) {
+        const uint32_t n = (uint32_t)strlen(kRsxBcMSL);
+        for (uint32_t i = 0; i < n; i++) { ft_id ^= (uint8_t)kRsxBcMSL[i]; ft_id *= 16777619u; }
+        ps3_ft_span(PS3_FT_SHADER_COMPILE, 1, ft_id, n, ft0, ps3_ft_now());
+    }
+    if (fn) {
+        const uint64_t p0 = ft0 ? ps3_ft_now() : 0;
+        _pso = [device newComputePipelineStateWithFunction:fn error:error];
+        if (p0) ps3_ft_span(PS3_FT_PIPELINE_CREATE, 1, ft_id, 0, p0, ps3_ft_now());
+    }
     if (_host.gate_leave) _host.gate_leave(_host.user);
     if (!_pso) return nil;
     return self;

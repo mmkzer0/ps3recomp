@@ -210,6 +210,19 @@ enum ps3_ft_kind {
                               * present whose flip id differs from the previous present's -- the first present of a frame.
                               * Not PS3_FT_PRESENT (10): that kind is the Metal backend's timed span around a host-driven
                               * present and the report keeps it as the RSX "present" row */
+    PS3_FT_SHADER_COMPILE = 38, /* Metal: one shader compile, the newLibraryWithSource and, where the backend fetches
+                              * the function at once, the newFunctionWithName that follows it (Metal can defer the
+                              * program build to that call); Vulkan: one vkCreateShaderModule, never filtered by
+                              * PS3_FTRACE_MIN_US. who = 1 on the RSX/draw-engine thread (the FIFO walker), 0 on
+                              * backend init, the vtable path or a host thread; a = the program's cache key when the
+                              * site has one, else FNV-1a 32 of the source; b = the bytes handed to the compiler (the
+                              * MSL text, the SPIR-V module). Emitted only around a real compile: a cache hit emits
+                              * nothing, and a failed compile still emits its span */
+    PS3_FT_PIPELINE_CREATE = 39, /* Metal: one newRenderPipelineState… or newComputePipelineState… call, Vulkan: one
+                              * vkCreateGraphicsPipelines (or vkCreateComputePipelines where the backend has one),
+                              * never filtered; who as kind 38, a = the pipeline's cache key when the site has one,
+                              * else FNV-1a 32 of the descriptor fields that name it, b = 0. A cache hit emits
+                              * nothing */
 };
 
 enum ps3_ft_audio_pace_reason {
