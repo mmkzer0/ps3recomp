@@ -8,8 +8,8 @@ ACQUIRE needs the RSX to read the kick first. Four runs of one fixture with a wa
   ordered    the store goes through the hook the runtime registers: it waits for the walker, which passes
              ACQUIRE(N) against the old value, and the next frame's ACQUIRE(N+1) passes as well;
   no-walker  nobody walks: gcm-wait-timeout what=rsx-walker-pass;
-  paused     nobody walks, and the host pause clock (cellGcm_set_host_pause_clock) holds the wait clock: the
-             store outlives the timeout many times over without stopping, and stops once the pause is over.
+  paused     nobody walks, and the host active clock (cellGcm_set_host_active_clock) stands still: the store
+             outlives the timeout many times over without stopping, and stops once the clock runs again.
 """
 import os
 from pathlib import Path

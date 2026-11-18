@@ -62,7 +62,7 @@ u32  rsx_draw_engine_present_diag(void) { return 0; }
 void rsx_fetch_attrib(const rsx_state* st, int idx, u32 vi, float out[4])
 { (void)st; (void)idx; (void)vi; out[0] = out[1] = out[2] = 0.0f; out[3] = 1.0f; }
 int  rsx_capture_install_from_config(const rsx_capture_environment* env) { (void)env; return 0; }
-void cellGcm_set_host_pause_clock(unsigned long long (*paused_ms)(void)) { (void)paused_ms; }
+void cellGcm_set_host_active_clock(unsigned long long (*active_ms)(void)) { (void)active_ms; }
 
 /* ps3_stop, recorded and left by longjmp so the test can look at the stop and carry on. The backend finds it by
  * name (dlsym), so the volatile pointer keeps it from being dead-stripped. */

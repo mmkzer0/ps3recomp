@@ -261,11 +261,11 @@ void cellGcm_syscall_set_fifo(u32 put, u32 get);
 /* Hand the display buffers the title has registered so far to the draw
  * engine, for an engine that comes up after cellGcmSetDisplayBuffer ran. */
 void cellGcm_replay_display_buffers_to_engine(void);
-/* A host that can pause the RSX thread (the Metal backend on iOS while the app is inactive) registers the
- * milliseconds it has held it, on the clock of ps3_ms_now (CLOCK_MONOTONIC), including a pause in progress. The
- * gcm.wait_timeout_ms clocks then do not run while the walker is held, so a long screen lock does not end the run
- * in gcm-wait-timeout. NULL unregisters. */
-void cellGcm_set_host_pause_clock(unsigned long long (*paused_ms)(void));
+/* A host that can pause the RSX thread (the Metal backend on iOS while the app is inactive) registers its active
+ * clock: milliseconds on ps3_ms_now's clock (CLOCK_MONOTONIC) less the time it has held the RSX thread, from ONE
+ * reading, so it stands still while paused and never steps back. The gcm.wait_timeout_ms clocks then do not run
+ * while the walker is held, so a long screen lock does not end the run in gcm-wait-timeout. NULL unregisters. */
+void cellGcm_set_host_active_clock(unsigned long long (*active_ms)(void));
 
 /* NID: 0xA53D12AE */
 s32 cellGcmSetDisplayBuffer(u32 bufferId, u32 offset, u32 pitch,

@@ -110,7 +110,7 @@
  * a weak reference to its installer keeps this backend linking either way. */
 __attribute__((weak_import)) int rsx_capture_install_from_config(const rsx_capture_environment* env);
 /* Likewise the FIFO walker's wait clock (cellGcmSys.c): a link without it has no wait timeouts to pause. */
-__attribute__((weak_import)) void cellGcm_set_host_pause_clock(unsigned long long (*paused_ms)(void));
+__attribute__((weak_import)) void cellGcm_set_host_active_clock(unsigned long long (*active_ms)(void));
 
 /* While the host does not let this process use the GPU (iOS: the screen locked or dimmed, the app switcher, the
  * background), every path that allocates a resource or commits a command buffer for the guest waits here first
@@ -139,10 +139,10 @@ void rsx_draw_engine_require_represent(void);
 #define ENG_GATE_DRAIN_NS  5000000000ull
 #define ENG_GATE_GRACE_NS  1000000000ull
 
-/* How long the gate has held the RSX thread, for cellGcm_set_host_pause_clock: the guest's wait timeouts
- * (gcm.wait_timeout_ms) must not run while the walker cannot move. Milliseconds on CLOCK_MONOTONIC, the clock of
- * ps3_ms_now, with a pause in progress counted. A suspend starts the interval before it closes the gate and a
- * resume ends it before it opens the gate, so the clock never stands still while the gate is closed. */
+/* The RSX thread's active time, for cellGcm_set_host_active_clock and the BC decoder's bounded wait: the guest's
+ * wait timeouts (gcm.wait_timeout_ms) must not run while the walker cannot move. Milliseconds on CLOCK_MONOTONIC,
+ * the clock of ps3_ms_now, less the time the gate has held the RSX thread. A suspend starts the pause before it
+ * closes the gate and a resume ends it before it opens the gate, so the clock never runs while the gate is closed. */
 static pthread_mutex_t s_pause_lock = PTHREAD_MUTEX_INITIALIZER;
 static unsigned long long s_pause_total_ms, s_pause_since_ms;
 static int s_pausing;
@@ -154,10 +154,14 @@ static unsigned long long eng_monotonic_ms(void)
     return (unsigned long long)ts.tv_sec * 1000ull + (unsigned long long)ts.tv_nsec / 1000000ull;
 }
 
-static unsigned long long eng_host_paused_ms(void)
+/* One reading of the monotonic clock under the pause lock. `monotonic - paused` from two separate readings steps
+ * back while paused, by however long the reader was descheduled between them: the BC decoder's wait charged a
+ * millisecond of it as 2^64 ms, and the FIFO walker's acquire wait a 108 ms gap (gcm-wait-timeout with
+ * waited_ms=4294967188). Paused, the clock stands still at (pause start - paused before it). */
+static unsigned long long eng_host_active_ms(void)
 {
     pthread_mutex_lock(&s_pause_lock);
-    const unsigned long long v = s_pause_total_ms + (s_pausing ? eng_monotonic_ms() - s_pause_since_ms : 0ull);
+    const unsigned long long v = (s_pausing ? s_pause_since_ms : eng_monotonic_ms()) - s_pause_total_ms;
     pthread_mutex_unlock(&s_pause_lock);
     return v;
 }
@@ -3801,18 +3805,11 @@ static void eng_bc_host_enter(void* user) { (void)user; host_gpu_gate_enter(&s_g
 static void eng_bc_host_checkpoint(void* user) { (void)user; host_gpu_gate_checkpoint(&s_gpu_gate); }
 static void eng_bc_host_leave(void* user) { (void)user; host_gpu_gate_leave(&s_gpu_gate); }
 static void eng_bc_host_commit(void* user, id<MTLCommandBuffer> cb) { (void)user; eng_commit(cb); }
-/* The clock the decoder's bounded wait is charged against: monotonic time less the time the gate has held the
- * RSX thread (eng_host_paused_ms: suspend starts counting before it closes the gate). */
+/* The clock the decoder's bounded wait is charged against: the RSX thread's active time (eng_host_active_ms). */
 static uint64_t eng_bc_host_active_ms(void* user)
 {
     (void)user;
-    /* One reading of the monotonic clock under the pause lock: `monotonic - paused` from two separate readings
-     * stepped back by a millisecond now and then while paused, which a waiter charged as 2^64 ms. Paused, the
-     * clock stands still at (pause start - paused before it). */
-    pthread_mutex_lock(&s_pause_lock);
-    const unsigned long long v = (s_pausing ? s_pause_since_ms : eng_monotonic_ms()) - s_pause_total_ms;
-    pthread_mutex_unlock(&s_pause_lock);
-    return v;
+    return eng_host_active_ms();
 }
 
 /* The decoder, made at the first GPU-tier upload; nil (once, loudly) when the kernel cannot be built. */
@@ -3840,14 +3837,14 @@ static RsxMetalBc* eng_bc_gpu(void)
  * ahead of the frame in the queue anyway, and with none outstanding it is four uncontended semaphore operations.
  * Only this thread reads the outcome; the Metal threads write it under the decoder's own lock.
  *
- * The wait is bounded, in active time (eng_host_paused_ms is taken out, so a suspended gate, the app inactive,
- * does not run it down): a decode whose command buffer never ends would otherwise hold the RSX thread for good,
- * and its callback, the thing that records an error, would never run. A decode takes tens of microseconds to
- * a millisecond of GPU time (bench_rsx_bc_gpu, 2048^2: 0.6 ms). The bound sits above Metal's own command-buffer
- * watchdog [INFERENCE: seconds, not measured here], after which the buffer completes with an error that the
- * failure path names, and below gcm.wait_timeout_ms (10 s), so a hang is reported as this decode and not as a
- * guest wait that timed out behind it; the host GPU gate's own drain is 5 s. Time spent here is the PS3_FTRACE
- * span BC_SETTLE (kind 35) and the counters below. */
+ * The wait is bounded, in active time (eng_host_active_ms leaves the gate's pauses out, so a suspended gate, the
+ * app inactive, does not run it down): a decode whose command buffer never ends would otherwise hold the RSX
+ * thread for good, and its callback, the thing that records an error, would never run. A decode takes tens of
+ * microseconds to a millisecond of GPU time (bench_rsx_bc_gpu, 2048^2: 0.6 ms). The bound sits above Metal's own
+ * command-buffer watchdog [INFERENCE: seconds, not measured here], after which the buffer completes with an
+ * error that the failure path names, and below gcm.wait_timeout_ms (10 s), so a hang is reported as this decode
+ * and not as a guest wait that timed out behind it; the host GPU gate's own drain is 5 s. Time spent here is the
+ * PS3_FTRACE span BC_SETTLE (kind 35) and the counters below. */
 
 static void eng_bc_settle(void)
 {
@@ -6119,7 +6116,7 @@ int rsx_metal_backend_init(u32 width, u32 height, const char* title)
          * the path that uses it: the FIFO walker feeds both models, so leaving
          * both live would record every draw twice. */
         s_ready  = 1;
-        if (cellGcm_set_host_pause_clock) cellGcm_set_host_pause_clock(eng_host_paused_ms);
+        if (cellGcm_set_host_active_clock) cellGcm_set_host_active_clock(eng_host_active_ms);
         rsx_draw_engine_set_backend(&s_engine_backend);
         /* The engine is this backend's default now that every host mode
          * passes both ways. PS3RECOMP_RSX_ENGINE=vtable is the way back, and

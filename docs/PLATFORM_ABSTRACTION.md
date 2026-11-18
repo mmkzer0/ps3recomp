@@ -206,6 +206,25 @@ goes through `vm_read*`/`vm_write*`.
 | **Get frequency** | `QueryPerformanceFrequency(&li)` | Fixed: 1,000,000,000 (nanoseconds) |
 | **Convert to PS3 ticks** | `ticks = li.QuadPart * 79800000 / freq` | `ticks = ts.tv_sec * 79800000 + ts.tv_nsec * 79800000 / 1000000000` |
 
+`host_monotonic_ns()` (`runtime/platform/host_clock.h`) is the one POSIX clock every guest clock derives from (the
+timebase, `sys_time_get_system_time`, lv2 timer expirations and usleep deadlines, the cellAudio mixer's period
+clock). It is `CLOCK_MONOTONIC` on Linux and `mach_absolute_time` on Apple.
+
+**Pausing (Apple only).** iOS keeps mach time running while it suspends or deactivates the process, so a guest clock
+built on it would jump by the suspended duration on return. On Apple the clock is *active time*:
+`host_clock_pause()` / `host_clock_resume()` (idempotent, any thread) freeze it and let it continue from where it
+stood, and `host_clock_paused()` reads the state. `rsx_metal_ios_display.m` calls them on the lifecycle edges of
+the GPU gate (will-resign-active / did-enter-background pause, did-become-active resumes). While paused the mixer
+mixes no block and posts no audio event, the CoreAudio unit is stopped, and `cellGcm_vblank_signal` counts and
+posts nothing; on resume all three continue without a re-anchor or a burst. A reader takes the raw clock and the
+pause state from one stable interval of a seqlock, so time never steps back across a transition; the unpaused read
+costs the raw read plus a few atomic loads (measured 10.7 -> 12.3 ns per call on an Apple M-series Mac). Relative
+host waits (`host_wait`, which on Apple are relative condition-variable waits) are not paused: they still elapse,
+and a waiting thread wakes, re-checks its guest deadline against the frozen clock and sleeps again. A guest thread
+that spins on the clock spins until it moves. Other POSIX hosts have no pause API: `host_wait.c` hands
+`host_monotonic_ns()` to a `CLOCK_MONOTONIC` condition variable as an absolute deadline, so it must stay
+`CLOCK_MONOTONIC` there. Test: `host_clock_pause` (Apple).
+
 ### Wall Clock Time
 
 | Operation | Windows | POSIX |
@@ -257,6 +276,7 @@ Note: Windows `Sleep()` has millisecond granularity. For sub-millisecond sleeps,
 | Windows | WASAPI | SDL2 |
 | Linux | SDL2 | PulseAudio (potential future) |
 | macOS | SDL2 | CoreAudio (potential future) |
+| iOS | CoreAudio RemoteIO (`libs/audio/audio_coreaudio.m`) | none: no SDL on iOS; see "cellAudio on iOS" in [`MODULES_REFERENCE.md`](MODULES_REFERENCE.md) |
 
 ### WASAPI (Windows)
 
@@ -297,6 +317,7 @@ SDL_PauseAudioDevice(dev, 0);  // Start playback
 |----------|----------------|-------|
 | Windows | XInput | Native Xbox controller support; DS3 via DS3 drivers |
 | Linux/macOS | SDL2 GameController | Supports DualShock 3/4, Xbox, Switch Pro, etc. |
+| iOS | GameController | Native Apple framework (no SDL); DualShock 4/DualSense and Xbox pads |
 
 ### XInput (Windows)
 
@@ -321,6 +342,37 @@ if (gc) {
     // Map to PS3 pad data
 }
 ```
+
+### GameController (iOS)
+
+`libs/input/pad_gc.m` reads `GCExtendedGamepad` profiles; `libs/input/pad_gc_map.c`
+turns them into the same `PadHostState` the SDL2 and XInput paths fill, so the
+guest cannot tell which host produced a report. The mapping is the SDL2 path's:
+
+| GameController | PS3 |
+|----------------|-----|
+| A / B / X / Y | Cross / Circle / Square / Triangle |
+| Left/right shoulder | L1 / R1 |
+| Left/right stick click | L3 / R3 |
+| Menu / Options | START / SELECT |
+| D-pad (bits and axes) | UP / DOWN / LEFT / RIGHT |
+| L2 / R2 trigger `value` | L2 / R2, pressed above the SDL path's 3000/32767 of travel |
+| Stick `xAxis` / `yAxis` | Analog sticks; `y` is inverted (PS3's 0 is up) |
+| Button and D-pad `value` | Pressure words (`press_*`, 0..255) |
+
+Threading and hot-plug:
+
+- Connect, disconnect and every `valueChangedHandler` report run on one private
+  serial queue, so a value report cannot interleave with a disconnect. The
+  handler checks that the controller reporting is still the one bound to its
+  port; a report from an unbound controller is dropped. Without that, a button
+  held while a controller is switched off could be re-published after the port
+  was cleared — the stuck-pad defect `pad_host_release` documents.
+- A controller is bound to the lowest free port of the four, and its
+  `playerIndex` is set to match. A port with no controller reads released and
+  centred, as on every other backend.
+- Rumble is not implemented yet: `cellPadSetActDirect` keeps the levels but
+  nothing is sent to the controller (CoreHaptics is the later step).
 
 ---
 
