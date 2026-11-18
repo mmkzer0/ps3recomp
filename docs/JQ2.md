@@ -707,6 +707,14 @@ wakes only enough parked workers for released-tag jobs beyond active workers'
 next passes. This is the `r3 held` path; it is not a non-barrier pool or slot
 wait.
 
+Measured on one title's battle replay (2026-11-18, A/B against the
+wake-every-worker policy, 3+3 runs per device): on its audio queue (8 workers,
+~740 jobs/s) wakes per job fell from 12-13 to 1.0, on its graphics queue from
+1.2-1.7 to 0.43, on every device. Process CPU fell 18 % on an M4 Pro Mac, 14 %
+on an M4 iPad Pro and 4.6 % on an M1 iPad Pro; jobs per second and frame times
+were unchanged. Energy fell 7.4 % (CPU power) on the Mac; on iPadOS the Power
+Profiler's impact score did not resolve a saving of this size in this many runs.
+
 Pause/resume changes `paused_` under `mu_` and broadcasts because it changes
 whether every worker runs an intake pass. Paused pushes do not wake workers;
 resume does. Shutdown broadcasts when `stopping_` changes. A blocking observer,
