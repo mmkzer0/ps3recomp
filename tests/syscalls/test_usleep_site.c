@@ -505,21 +505,28 @@ static int run_spin(unsigned spin_us)
     register_sites();
     sleeper s; sleeper_init(&s);
     call(&s, SITE_LR, 30, deadline_in_us(1000));                /* warm the seam's first-use state */
-    uint64_t cpu_total = 0;
-    enum { N = 5 };
+    /* Thread CPU over a 10 ms sleep: a spin of S us costs about S us of it, a pure sleep almost none. Preemption
+     * on a loaded host only lowers a sample (dev-ci 44277410272, macos-15 release: a 5-sample mean of 295 us
+     * for a 2000 us spin), so a spin is proven by the largest sample and a pure sleep by the mean. */
+    uint64_t cpu_total = 0, cpu_max = 0;
+    enum { N = 10 };
     for (int i = 0; i < N; i++) {
         const uint64_t c0 = thread_cpu_ns();
         const uint64_t d = deadline_in_us(10000);
         call(&s, SITE_LR, 30, d);
-        cpu_total += thread_cpu_ns() - c0;
+        const uint64_t c = thread_cpu_ns() - c0;
+        cpu_total += c;
+        if (c > cpu_max) cpu_max = c;
         CHECK(host_monotonic_ns() >= d, "returned before the deadline");
     }
     const uint64_t cpu = cpu_total / N;
-    fprintf(stderr, "spin %u us: %.0f us of thread CPU per 10 ms sleep\n", spin_us, cpu / 1e3);
+    fprintf(stderr, "spin %u us: %.0f us mean, %.0f us max of thread CPU per 10 ms sleep\n", spin_us, cpu / 1e3,
+            cpu_max / 1e3);
     if (spin_us == 0)
         CHECK(cpu < 1500000u, "a pure sleep used %.0f us of CPU in 10 ms", cpu / 1e3);
     else
-        CHECK(cpu > 400000u, "a %u us spin used only %.0f us of CPU", spin_us, cpu / 1e3);
+        CHECK(cpu_max > 400000u, "a %u us spin used at most %.0f us of CPU in %d sleeps", spin_us, cpu_max / 1e3,
+              (int)N);
     return 0;
 }
 
