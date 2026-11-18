@@ -97,6 +97,7 @@ if(NOT WIN32)
     #   jq2_exec_sync       Port2Sync modes 0 and 4, BUSY, INVAL for every other mode
     #   jq2_exec_sync_concurrent  several PPU threads blocked in mode 0 at once, each woken by its own credits
     #   jq2_exec_join       Shutdown / Join with outstanding jobs (L1), caller-owned buffers (L2)
+    #   jq2_exec_shutdown_exit_wake  the last running job finishes after its sibling re-parks on Shutdown
     #   jq2_exec_stop_waiter_id, _waiter_alloc, _wait, _fiber_notify  jq2-wake: a waiter id above 63, a 64th blocked Sync, a failed wait, a kind-0 waiter that is no fiber
     #   jq2_exec_stop_push_shutdown, _copy_push_shutdown  jq2-state: a push that lands after Shutdown
     #   jq2_exec_desc_sizes  every descriptor size the firmware accepts (64, 128..896) through ring, admission and loader on a maxDescriptor 896 queue
@@ -120,7 +121,7 @@ if(NOT WIN32)
     target_link_libraries(test_jq2_executor PRIVATE ps3recomp_spurs_jq2 Threads::Threads)
     # The runtime carries C++ and Objective-C, so the C++ driver links.
     set_target_properties(test_jq2_executor PROPERTIES LINKER_LANGUAGE CXX)
-    foreach(mode premature copy credit wrap barrier sync join observer validate lifted layout layout-896 jm-wait heap-fit
+    foreach(mode premature copy credit wrap barrier sync join shutdown-exit-wake observer validate lifted layout layout-896 jm-wait heap-fit
                   stop-job stop-halt stop-jm stop-jm-lifted stop-heap stop-unmodelled stop-crt stop-ring
                   sync-concurrent waiter-fresh waiter-63 stop-waiter-id waiter-64-nowake stop-waiter-64-wake stop-wait stop-fiber-notify
                   stop-push-shutdown stop-copy-push-shutdown desc-sizes stop-push-size0 stop-copy-push-size0
@@ -132,10 +133,12 @@ if(NOT WIN32)
         set_tests_properties(jq2_exec_${name} PROPERTIES LABELS "spurs;t0;tsan" TIMEOUT 300)
     endforeach()
 
-    # The jq2 ftrace spans (ps3_ftrace.h kinds 22-28), read back from the recorder's buffer after the threads that
-    # write it are joined. The mode sets PS3_FTRACE itself (trace-off clears it): the recorder reads it once.
+    # The jq2 ftrace spans (ps3_ftrace.h kinds 22-29, 40), read back from the recorder's buffer after the threads that
+    # write it are joined. Trace modes set PS3_FTRACE themselves (trace-off clears it).
     #
     #   jq2_exec_trace_spans       PUSH/JOB/CREDIT per (q, seq), depth, thread CPU time, IDLE of parked workers
+    #   wake_bench                q0 37-job SYNC bursts; q1 12 spaced jobs/frame; reports CPU/wake counts
+    #   jq2_exec_wake_stress       16 parked/burst cycles, bounded and labelled stress/tsan
     #   jq2_exec_trace_sync        one SYNC_WAIT per blocking Port2Sync, keyed by waiter; none without blocking
     #   jq2_exec_trace_queues      q per queue in creation order, the creation line, q saturating at 255
     #   jq2_exec_trace_concurrent  four pushing threads: seq unique and gapless
@@ -146,6 +149,11 @@ if(NOT WIN32)
         add_test(NAME jq2_exec_${name} COMMAND test_jq2_executor ${mode})
         set_tests_properties(jq2_exec_${name} PROPERTIES LABELS "spurs;t0;tsan" TIMEOUT 300)
     endforeach()
+    # Synthetic burst benchmark; run explicitly because its timings do not belong in t0.
+    add_test(NAME wake_bench COMMAND test_jq2_executor trace-wake-bench)
+    set_tests_properties(wake_bench PROPERTIES LABELS "spurs;bench" TIMEOUT 300)
+    add_test(NAME jq2_exec_wake_stress COMMAND test_jq2_executor wake-stress)
+    set_tests_properties(jq2_exec_wake_stress PROPERTIES LABELS "spurs;stress;tsan" TIMEOUT 120)
 
     # Job image identity (kind 29 and the J table in the dump): the image of each job, fingerprinted from the bytes the
     # loader staged, in a process-wide table of (fingerprint, image EA, size).

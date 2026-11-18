@@ -137,7 +137,7 @@ inline void st16(std::uint32_t ea, std::uint16_t v)
 
 constexpr bool aligned(std::uint32_t ea, std::uint32_t to) { return (ea & (to - 1)) == 0; }
 
-/* ---- ftrace (ps3_ftrace.h kinds 22-28) ---------------------------------- */
+/* ---- ftrace (ps3_ftrace.h kinds 22-29, 40) ------------------------------- */
 
 /* The calling PPU thread's trace id, keyed as every other PPU kind (0: no guest thread). */
 inline std::uint32_t ft_tid() { return g_active_ctx ? ppu_tid_diag_index(g_active_ctx->thread_id) : 0u; }
@@ -410,10 +410,11 @@ public:
     Queue(std::uint32_t ea, std::uint32_t ring_ea, std::uint16_t depth, std::uint32_t max_descriptor,
           unsigned workers, const ExecutorHooks& hooks)
         : ea_(ea), ring_ea_(ring_ea), depth_(depth), max_descriptor_(max_descriptor), workers_(workers),
-          hooks_(hooks)
+          hooks_(hooks), worker_cv_(workers)
     {
         slot_seq_.assign(depth, 0);
         slot_push_ns_.assign(depth, 0);
+        worker_gen_.assign(workers, 0);
         parked_seen_.assign(workers, UINT64_MAX);
         auto ring = std::make_unique<GuestRing>(ea, ring_ea, depth);
         ring_ = ring.get();
@@ -479,14 +480,23 @@ public:
 #endif
     }
 
-    /* Workers re-examine the ring: a push or a completion happened. */
-    void kick()
+    /* A new entry wakes one worker only when its tag/SYNC can advance intake. */
+    void kick(const Entry& pushed)
     {
         {
             std::lock_guard<std::mutex> lk(mu_);
             ++gen_;
+            const std::uint16_t barred = sched_->barred_mask();
+            bool can_progress = false;
+            if (const auto* job = std::get_if<JobEntry>(&pushed))
+                can_progress = (barred & (1u << job->tag)) == 0;
+            else if (const auto* copy = std::get_if<CopyEntry>(&pushed))
+                can_progress = (barred & (1u << copy->tag)) == 0;
+            else if (const auto* sync = std::get_if<SyncEntry>(&pushed))
+                can_progress = (sync->mask & static_cast<std::uint16_t>(~barred)) != 0;
+            if (!paused_ && can_progress && sched_->outstanding() != 0) wake_one_worker();
         }
-        cv_.notify_all();
+        room_cv_.notify_all();
     }
 
     /* Refuse further pushes; the workers exit once the ring is drained. */
@@ -498,9 +508,10 @@ public:
             std::lock_guard<std::mutex> lk(mu_);
             stopping_ = true;
             ++gen_;
+            wake_all_workers();
             room = take_room_fibers(); /* a blocked pusher looks again and sees Shutdown */
         }
-        cv_.notify_all();
+        room_cv_.notify_all();
         signal_room_fibers(room);
         if (pool_) pool_->shutdown();
     }
@@ -603,8 +614,9 @@ public:
             std::lock_guard<std::mutex> lk(mu_);
             paused_ = paused;
             ++gen_;
+            wake_all_workers();
         }
-        cv_.notify_all();
+        room_cv_.notify_all();
     }
 
     QueueView view()
@@ -614,8 +626,8 @@ public:
         v.indices = ring_->indices();
         v.outstanding = sched_->outstanding();
         v.running = running_;
-        for (const std::uint64_t seen : parked_seen_)
-            if (seen == gen_) ++v.settled;
+        for (unsigned w = 0; w < workers_; ++w)
+            if (parked_seen_[w] == worker_gen_[w]) ++v.settled;
         v.barred = sched_->barred_mask();
         for (unsigned t = 0; t < kTagCount; ++t) v.inflight[t] = sched_->inflight(t);
         for (std::uint16_t i = 0; i < depth_; ++i)
@@ -763,7 +775,7 @@ private:
         if (first && hooks_.on_push_blocked != nullptr) hooks_.on_push_blocked(hooks_.user, port_ea);
         if (self == 0) {
             lk.lock();
-            cv_.wait(lk, [&] { return gen_ != seen; });
+            room_cv_.wait(lk, [&] { return gen_ != seen; });
             return;
         }
         const std::int32_t rc = cellFiberPpuWaitSignal();
@@ -777,14 +789,98 @@ private:
         }
     }
 
+    /* Called under mu_. Each runnable entry signals one settled worker; already
+     * signalled workers are excluded until their generation is observed. */
+    bool wake_one_worker()
+    {
+        for (unsigned offset = 0; offset < workers_; ++offset) {
+            const unsigned worker = (next_worker_to_wake_ + offset) % workers_;
+            if (parked_seen_[worker] == UINT64_MAX || parked_seen_[worker] != worker_gen_[worker]) continue;
+            ++worker_gen_[worker];
+            next_worker_to_wake_ = (worker + 1) % workers_;
+            worker_cv_[worker].notify_one();
+            return true;
+        }
+        return false;
+    }
+
+    /* Barrier release can make previously held jobs runnable without a new push. */
+    void wake_workers(unsigned count)
+    {
+        for (unsigned i = 0; i < count && wake_one_worker(); ++i) {}
+    }
+
+    /* A barrier release can make jobs of those tags runnable without a new push.
+     * Count at most one intake wave, using the scheduler's current ring/phase state. */
+    unsigned runnable_jobs_for_tags(std::uint16_t tags, unsigned limit) const
+    {
+        if (tags == 0 || limit == 0) return 0;
+        const std::uint16_t barred = sched_->barred_mask();
+        const RingIndices ix = ring_->indices();
+        const unsigned outstanding = ring_outstanding(ix, depth_);
+        unsigned runnable = 0;
+        for (unsigned k = 0; k < outstanding && runnable < limit; ++k) {
+            const std::uint32_t pos = std::uint32_t{ix.read} + k;
+            const auto index = static_cast<std::uint16_t>(pos % depth_);
+            const bool expected = ix.read_phase != (((pos / depth_) & 1u) != 0);
+            const Decoded decoded = decode(ring_->load(index));
+            if (!pm_accepts_phase(decoded.writer_bit, expected)) break;
+            if (ring_->out_of_order(index)) continue;
+            const JobEntry* job = std::get_if<JobEntry>(&decoded.entry);
+            std::uint8_t tag = 0;
+            bool is_job = false;
+            if (job != nullptr) {
+                tag = job->tag;
+                is_job = true;
+            } else if (const auto* copy = std::get_if<CopyEntry>(&decoded.entry)) {
+                tag = copy->tag;
+                is_job = true;
+            }
+            if (is_job && (tags & (1u << tag)) != 0 && (barred & (1u << tag)) == 0) ++runnable;
+        }
+        return runnable;
+    }
+
+    void wake_released_jobs(std::uint16_t tags)
+    {
+        const unsigned active = running_ + 1; /* running jobs plus this worker's next intake pass */
+        const unsigned runnable = runnable_jobs_for_tags(tags, workers_);
+        if (runnable > active) wake_workers(runnable - active);
+    }
+
+    /* Pause and Shutdown change control state for every worker, not just one runnable job. */
+    void wake_all_workers()
+    {
+        for (unsigned worker = 0; worker < workers_; ++worker) {
+            ++worker_gen_[worker];
+            worker_cv_[worker].notify_all();
+        }
+    }
+
+    void emit_wake_span(unsigned instance, std::uint64_t ft0, std::uint64_t cpu0, std::uint32_t jobs,
+                        bool progress, std::uint32_t reason)
+    {
+        if (ft0 == 0 || !PS3_FT_ON()) return;
+        const std::uint64_t ft1 = ps3_ft_now();
+        const std::uint64_t cpu1 = thread_cpu_ns();
+        const std::uint32_t fields = sat(jobs, 0xFFFFu) | (progress ? 1u << 16 : 0u) | reason << 24;
+        ps3_ft_span(PS3_FT_JQ2_WAKE, ft_who(instance), fields,
+                    sat((cpu1 >= cpu0 ? cpu1 - cpu0 : 0) / 1000, UINT32_MAX), ft0, ft1);
+    }
+
     void worker_loop(unsigned instance)
     {
         ps3_thread_name("jq2 q%u w%u", static_cast<unsigned>(index_), instance);
         spurs_job_set_spu_num(instance);
         std::vector<std::uint8_t> desc;
         std::unique_lock<std::mutex> lk(mu_);
+        std::uint64_t wake_ft0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+        std::uint64_t wake_cpu0 = wake_ft0 != 0 ? thread_cpu_ns() : 0;
+        std::uint32_t wake_jobs = 0;
+        bool wake_progress = false;
+        bool initial_interval = true;
         for (;;) {
-            const std::uint64_t seen = gen_;
+            const std::uint64_t seen = worker_gen_[instance];
             /* The pass of this iteration, kept for the IDLE reason byte; a paused worker runs none. */
             PassResult pass;
             bool ran_pass = false;
@@ -804,6 +900,10 @@ private:
                               {hex("queue", ea_), hex("read_index", pass.read_after), hex("ring_ea", at)});
                 }
                 if (pass.dispatched) {
+                    if (wake_ft0 != 0) {
+                        if (wake_jobs < 0xFFFFu) ++wake_jobs;
+                        wake_progress = true;
+                    }
                     const Dispatch d = *pass.dispatched;
                     const std::uint64_t ft0 = PS3_FT_ON() ? ps3_ft_now() : 0;
                     const JobTrace ft{ft0, ft0 != 0 ? thread_cpu_ns() : 0};
@@ -813,7 +913,7 @@ private:
                     ++running_;
                     counters_.dispatched.fetch_add(1);
                     ++gen_;
-                    cv_.notify_all(); /* the entries behind it may be runnable elsewhere */
+                    room_cv_.notify_all(); /* a pusher waiting on ring room rechecks its predicate */
                     /* The pass consumed this entry: a pusher waiting on a full ring has room. A thread
                      * pusher saw gen_ move; a fiber is signalled once the lock is released. */
                     const std::vector<std::uint32_t> room = take_room_fibers();
@@ -823,8 +923,9 @@ private:
                     lk.lock();
                     /* complete() releases the barriers it satisfies and zeroes their masks, so the masks of
                      * the barred tags are read first (BARRIER, ps3_ftrace.h kind 28). */
+                    const std::uint16_t barred_before_complete = sched_->barred_mask();
                     const bool ft_release = PS3_FT_ON();
-                    const std::uint16_t barred_at_release = ft_release ? sched_->barred_mask() : 0;
+                    const std::uint16_t barred_at_release = ft_release ? barred_before_complete : 0;
                     std::array<std::uint16_t, kTagCount> masks{};
                     if (ft_release)
                         for (unsigned t = 0; t < kTagCount; ++t)
@@ -836,16 +937,21 @@ private:
                     }
                     if (ft_release) note_released_barriers(instance, barred_at_release, masks);
                     --running_;
+                    const std::uint16_t released_tags =
+                        static_cast<std::uint16_t>(barred_before_complete & ~sched_->barred_mask());
+                    if (released_tags != 0) wake_released_jobs(released_tags);
                     ++gen_;
-                    cv_.notify_all();
+                    room_cv_.notify_all();
                     continue;
                 }
+                if (wake_ft0 != 0 && (pass.syncs_consumed != 0 || pass.read_after != pass.read_before))
+                    wake_progress = true;
                 if (pass.syncs_consumed != 0 || pass.read_after != pass.read_before) {
                     /* Consumed something and dispatched nothing (a SYNC, or entries
                      * behind a barrier): the next pass may dispatch, and a pusher
                      * waiting on a full ring may have room. */
                     ++gen_;
-                    cv_.notify_all();
+                    room_cv_.notify_all();
                     const std::vector<std::uint32_t> room = take_room_fibers();
                     if (!room.empty()) {
                         lk.unlock();
@@ -855,7 +961,13 @@ private:
                     continue;
                 }
             }
-            if (stopping_ && running_ == 0 && sched_->outstanding() == 0) break;
+            if (stopping_ && running_ == 0 && sched_->outstanding() == 0) {
+                /* The terminal predicate changed for every parked worker: each must get a chance to exit. */
+                wake_all_workers();
+                emit_wake_span(instance, wake_ft0, wake_cpu0, wake_jobs, wake_progress,
+                               initial_interval ? 0xFEu : 0xFFu);
+                break;
+            }
             /* Why this park: the pass of this iteration, first match wins (ps3_ftrace.h kind 26). */
             std::uint32_t reason = 15; /* unclassified: expected never */
             if (!ran_pass) reason = 5; /* paused: no pass ran */
@@ -863,14 +975,28 @@ private:
             else if (pass.outstanding == 0) reason = 1; /* empty */
             else if (pass.reached_unwritten) reason = 2;
             else if (pass.entries_retained != 0) reason = 3; /* every entry reached was held */
+            if (wake_ft0 != 0)
+                emit_wake_span(instance, wake_ft0, wake_cpu0, wake_jobs, wake_progress,
+                               initial_interval ? 0xFEu : reason);
             const std::uint64_t ft0 = PS3_FT_ON() ? ps3_ft_now() : 0;
             const std::uint32_t depth_at_park = sat(pending_jobs_, 0xFFFFFFu);
             parked_seen_[instance] = seen;
-            cv_.wait(lk, [&] { return gen_ != seen; });
+            worker_cv_[instance].wait(lk, [&] { return worker_gen_[instance] != seen; });
             parked_seen_[instance] = UINT64_MAX;
-            if (ft0 != 0)
+            if (ft0 != 0) {
+                const std::uint64_t wake_ns = ps3_ft_now();
+                const std::uint64_t wake_cpu = thread_cpu_ns();
                 ps3_ft_span(PS3_FT_JQ2_IDLE, ft_who(instance), depth_at_park | reason << 24, pending_jobs_, ft0,
-                            ps3_ft_now());
+                            wake_ns);
+                wake_ft0 = wake_ns;
+                wake_cpu0 = wake_cpu;
+            } else {
+                wake_ft0 = 0;
+                wake_cpu0 = 0;
+            }
+            wake_jobs = 0;
+            wake_progress = false;
+            initial_interval = false;
         }
     }
 
@@ -987,8 +1113,11 @@ private:
     GuestRing* ring_ = nullptr; /* owned by sched_ */
     std::optional<Scheduler> sched_;
     std::mutex mu_; /* sched_, gen_, paused_, stopping_, running_ */
-    std::condition_variable cv_;
-    std::uint64_t gen_ = 0;
+    std::condition_variable room_cv_; /* full-ring thread pushers wait for gen_ changes */
+    std::vector<std::condition_variable> worker_cv_; /* one wake target per SPU instance */
+    std::vector<std::uint64_t> worker_gen_; /* each wait predicate is sticky under mu_ */
+    std::uint64_t gen_ = 0; /* queue progress generation for full-ring pushers */
+    unsigned next_worker_to_wake_ = 0; /* round-robin starting point, under mu_ */
     bool paused_ = false;
     bool stopping_ = false;
     std::vector<std::uint32_t> room_fibers_; /* fibers parked in await_room, under mu_ */
@@ -1015,8 +1144,8 @@ private:
     std::array<std::uint32_t, kTagCount> tag_set_wait_{};
     std::array<std::uint64_t, kTagCount> tag_free_ns_{};
     std::array<std::uint16_t, kTagCount> tag_free_mask_{};
-    /* Per worker: the gen_ it parked on, or UINT64_MAX when it is not in the idle wait. Under mu_. A worker
-     * whose value equals gen_ stays parked until something bumps gen_ (QueueView::settled). */
+    /* Per worker: its wake generation, or UINT64_MAX when it is active. The parked value only changes under
+     * mu_; a targeted wake changes one worker's generation without invalidating unaffected sleepers. */
     std::vector<std::uint64_t> parked_seen_;
 
     Counters counters_;
@@ -1484,6 +1613,7 @@ void Queue::run_job(const JobStart& js, const std::optional<jq2_job_observer>& o
      * credited, so a Sync that returns also sees the slot free. */
     if (js.copy) pool_->release(js.descriptor_ea);
     credit(js);
+    if (hooks_.after_credit != nullptr) hooks_.after_credit(hooks_.user, js);
 
     /* The audit's sample goes to the audit thread only now: whatever it finds, the job is credited and the guest has
      * the authority's result (docs/SPU_XDIFF.md section 11). Kind 32 says what became of the sample. */
@@ -1748,7 +1878,7 @@ std::int32_t enqueue(Queue& q, std::uint32_t port_ea, const Entry& entry, bool a
     } else {
         rc = write();
     }
-    if (rc == 0) q.kick();
+    if (rc == 0) q.kick(entry);
     if (ft0 != 0 && job)
         ps3_ft_span(PS3_FT_JQ2_PUSH, ft_tid(), seq, q.index() | sat(depth, 0xFFFFFFu) << 8, ft0, ps3_ft_now());
     return static_cast<std::int32_t>(rc);
