@@ -854,6 +854,19 @@ if(PS3RECOMP_BUILD_TESTS)
         target_link_libraries(test_host_gpu_gate PRIVATE Threads::Threads)
         add_test(NAME host_gpu_gate COMMAND test_host_gpu_gate)
         set_tests_properties(host_gpu_gate PROPERTIES LABELS "platform;t0;tsan" TIMEOUT 120)
+        # The pausable host clock (runtime/platform/host_clock.h): frozen while paused, the paused span excluded
+        # after the resume, idempotent calls, and no reader sees time step back across thousands of transitions.
+        # Apple only: no other POSIX host has the pause API (host_monotonic_ns must stay CLOCK_MONOTONIC there).
+        if(APPLE)
+            add_executable(test_host_clock_pause
+                runtime/platform/tests/test_host_clock_pause.c
+                runtime/platform/host_clock.c)
+            target_include_directories(test_host_clock_pause PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/runtime/platform")
+            target_compile_options(test_host_clock_pause PRIVATE -Wall -Wextra)
+            target_link_libraries(test_host_clock_pause PRIVATE Threads::Threads)
+            add_test(NAME host_clock_pause COMMAND test_host_clock_pause)
+            set_tests_properties(host_clock_pause PROPERTIES LABELS "platform;t0;tsan" TIMEOUT 120)
+        endif()
         # The Win32 shim's waits on the same scripted clock and native waits: win32_compat.c itself is linked
         # against the fake backend, which is then also the only clock (HW_FAKE_DEFINES_HOST_CLOCK). Two cases
         # must be the first to touch the shim's multi-object condition variable, so each runs in its own process.
@@ -2193,11 +2206,14 @@ if(PS3RECOMP_BUILD_TESTS)
         set_tests_properties(test_pad_gc_map PROPERTIES LABELS "input;t0" TIMEOUT 60)
 
         if(SDL2_FOUND)
+            # cellAudio.c paces its mixer on host_monotonic_ns, so the fixtures that compile it in link the clock.
             ps3recomp_add_hle_check_test(hle_audio_ring
-                libs/audio/tests/test_audio_ring.c)
+                libs/audio/tests/test_audio_ring.c
+                runtime/platform/host_clock.c)
             # PS3_FTRACE kinds 30/31 over the real mixer; labelled audio so `ctest -L audio` runs it.
             ps3recomp_add_hle_check_test(hle_audio_ring_trace
-                libs/audio/tests/test_audio_ring_trace.c)
+                libs/audio/tests/test_audio_ring_trace.c
+                runtime/platform/host_clock.c)
             set_tests_properties(hle_audio_ring_trace PROPERTIES LABELS "audio;t0")
             ps3recomp_add_hle_check_test(test_audio_pace
                 libs/audio/tests/test_audio_pace.c

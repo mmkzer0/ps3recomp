@@ -416,7 +416,7 @@ or more it skips the period. The ring holds the 6-block mark plus one IO buffer 
 granted `IOBufferDuration` in milliseconds and frames, `outputLatency` and the output port type(s); a restart
 and an interruption have their own lines. A granted IO buffer above 1024 frames also logs a warning (below).
 `AUDIO_RATE=1` adds an `[audio-rate] ios` line every 5 s with the ring's underruns (events and frames), dropped
-frames, frames held back while inactive, starts and interruptions. With `PS3_FTRACE`, kind 20 marks a mix that
+frames, frames held back while inactive, starts, interruptions and host pauses. With `PS3_FTRACE`, kind 20 marks a mix that
 found the queue below one block and kind 19 with the catch-up subkind a restart of the cadence.
 
 **Interruptions and the app lifecycle.** The notification observers (interruption began and ended, media
@@ -432,6 +432,14 @@ may be reset only while the unit is stopped:
 - *App became active*: the same restart, but only when the output is down (iOS does not promise an
   interruption-ended). The notification also fires at launch and after Control Center or a banner took the focus
   without an interruption; a running unit is left alone there, so its queued audio is not dropped.
+- *Host pause* (the app resigned active, `host_clock_pause`, see `docs/PLATFORM_ABSTRACTION.md`): the mix thread
+  paces on `host_monotonic_ns`, which stands still, so it mixes no block and posts no audio event while paused;
+  `audio_ios_service` also stops the unit (log: `output unit stopped (host pause)`; counter `host pauses`), drops
+  any block that still arrives (counted as held), and starts no unit while paused (an app-active request that
+  arrives before the clock resumes waits for it). The first service turn after the clock runs again restarts the
+  unit (`output unit started (host pause ended)`) through the ordinary stop, ring reset, start path. The device
+  is empty then, so the pacer's low-queue rule restarts the cadence at once, by less than one period; the
+  suspended duration is never turned into dropped periods. `AUDIO_RATE`'s blocks/s is per active second.
 - *Media services reset*: the unit is disposed and rebuilt, the session configured again.
 
 **Bluetooth.** Not handled. A2DP adds well over 100 ms of output latency (`outputLatency` is logged), and the route

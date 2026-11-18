@@ -36,7 +36,10 @@ void audio_ios_close(void);
 
 /* Runs the work the observers requested: stop on an interruption, ring reset
  * and restart when it ends or the app becomes active, a rebuild after a media
- * services reset. Mix thread, once per loop turn; cheap when nothing is requested. */
+ * services reset. It also follows the host's pause of the guest clock
+ * (host_clock_paused): the unit is stopped while it is paused and restarted,
+ * ring reset first, on the first turn after it runs again; no start is made
+ * while paused. Mix thread, once per loop turn; cheap when nothing is requested. */
 void audio_ios_service(void);
 
 /* 1 while the unit runs and submitted blocks are queued; 0 otherwise (not open,
@@ -44,16 +47,18 @@ void audio_ios_service(void);
 int audio_ios_active(void);
 
 /* Producer only. Queues `frames` interleaved stereo float frames; what does not
- * fit is dropped and counted, never waited for. While inactive every block is
- * dropped (and counted as held), so the ring holds no stale audio when the unit
- * restarts and the mixer paces on the clock as it does with no device. */
+ * fit is dropped and counted, never waited for. While inactive, or while the
+ * host has paused the guest clock, every block is dropped (and counted as
+ * held), so the ring holds no stale audio when the unit restarts and the mixer
+ * paces on the clock as it does with no device. */
 void audio_ios_submit(const float* stereo, uint32_t frames);
 
 /* Frames in the ring: the queue audio_pace.h reads. 0 while inactive. */
 uint32_t audio_ios_queued_frames(void);
 
 /* One line of counters for the AUDIO_RATE diagnostic: the ring's underruns and
- * drops, frames held back while inactive, restarts and interruptions. */
+ * drops, frames held back while inactive, restarts, interruptions and host
+ * pauses that stopped the unit. */
 void audio_ios_rate_note(char* buf, size_t n);
 
 #ifdef __cplusplus

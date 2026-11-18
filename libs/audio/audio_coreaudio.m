@@ -21,6 +21,12 @@
  * the bits in audio_ios_service. While the unit is not running, audio_ios_submit
  * drops blocks instead of queuing them, so a restart does not play up to a ring
  * of stale audio, and the mixer, seeing no device, paces on the clock alone.
+ *
+ * Host pause: while the host has paused the guest clock (host_clock.h, from the app's resign-active edge to its
+ * become-active edge) the mixer's period clock, which is that clock, does not advance, so no block is mixed.
+ * audio_ios_service also stops the unit for the duration ("host pause"), submit drops anything that still
+ * arrives (counted as held), and the first service turn after the clock runs again restarts the unit through the
+ * same producer-side path as any other restart: stop, ring reset, start.
  */
 
 #import <AVFAudio/AVFAudio.h>
@@ -34,6 +40,7 @@
 #import "audio_pace.h"
 #import "audio_ring.h"
 #import "ps3emu/ps3_log.h"
+#import "../../runtime/platform/host_clock.h"   /* host_clock_paused: the app is paused, so is guest audio */
 
 #define IOS_RATE_HZ        48000
 #define IOS_BLOCK_FRAMES   256u      /* one guest audio period */
@@ -75,6 +82,9 @@ static int s_need_start;                 /* a start was requested and has not su
 static uint64_t s_next_try_ns;           /* earliest time of the next start attempt */
 static const char *s_start_why = "";
 static uint32_t s_starts;
+static int s_pause_halted;               /* the unit was stopped because the host paused the guest clock */
+static int s_pause_restart;              /* ...while it was running or about to start: unpausing restarts it */
+static uint32_t s_pauses;                /* host pauses that stopped the unit */
 
 static uint64_t now_ns(void)
 {
@@ -366,6 +376,9 @@ int audio_ios_open(void)
         s_need_start = 0;
         s_next_try_ns = 0;
         s_starts = 0;
+        s_pause_halted = 0;
+        s_pause_restart = 0;
+        s_pauses = 0;
 
         s_opened = 1;
         install_observers();
@@ -410,17 +423,39 @@ void audio_ios_service(void)
 {
     if (!s_opened)
         return;
+    /* The host paused the guest clock (host_clock.h): the app is inactive, and guest audio stands still with
+     * guest time. The mixer's period clock is that clock, so it mixes nothing while paused; what is left to do is
+     * not to leave the unit running on an empty ring (underrun silence for nothing, and audio the system may
+     * not allow an inactive app) and to bring it back, ring reset first, when the clock runs again. */
+    const int paused = host_clock_paused();
     const uint32_t req = __atomic_exchange_n(&s_requests, 0, __ATOMIC_ACQUIRE);
-    if (!req && !s_need_start)
+    if (!req && (!s_need_start || paused) && paused == s_pause_halted)
         return;
 
     @autoreleasepool {
+        if (paused && !s_pause_halted) {
+            s_pause_restart = __atomic_load_n(&s_active, __ATOMIC_ACQUIRE) || s_need_start;
+            s_pause_halted = 1;
+            s_pauses++;
+            halt_output("host pause");
+        } else if (!paused && s_pause_halted) {
+            s_pause_halted = 0;
+            if (s_pause_restart) {
+                s_need_start = 1;
+                s_next_try_ns = 0;
+                s_start_why = "host pause ended";
+            }
+            s_pause_restart = 0;
+        }
+
         if (req & (REQ_STOP | REQ_REBUILD))
             halt_output((req & REQ_REBUILD) ? "media services reset" : "interruption");
         if (req & REQ_REBUILD)
             dispose_unit();
-        if (req & REQ_STOP)
+        if (req & REQ_STOP) {
             s_need_start = 0;
+            s_pause_restart = 0;   /* the interruption owns the restart now */
+        }
         /* A missing interruption-ended (iOS does not promise one) leaves the unit stopped until the app is
          * active again; that is the case this restart is for. */
         if ((req & REQ_ENSURE) && !(req & REQ_STOP) && !__atomic_load_n(&s_active, __ATOMIC_ACQUIRE) &&
@@ -436,8 +471,11 @@ void audio_ios_service(void)
         }
 
         /* A start that fails (a call still holds the session) is tried again once a second until the
-         * interruption-ended or app-active request it was waiting for goes through, not on every loop turn. */
-        if (s_need_start) {
+         * interruption-ended or app-active request it was waiting for goes through, not on every loop turn.
+         * Never while the host has the clock paused: the app-active notification can reach the mix thread before
+         * the display observer has resumed the clock, and a unit started then would run on an empty ring until
+         * the clock moves. The request stays pending and goes through on the first turn after the unpause. */
+        if (s_need_start && !paused) {
             const uint64_t now = now_ns();
             if (now >= s_next_try_ns) {
                 if (start_output(s_start_why) == 0)
@@ -456,7 +494,9 @@ int audio_ios_active(void)
 
 void audio_ios_submit(const float *stereo, uint32_t frames)
 {
-    if (!__atomic_load_n(&s_active, __ATOMIC_ACQUIRE)) {
+    /* The paused check covers the turn between the pause and the service stopping the unit: no block queued
+     * for a restart, whose ring is reset anyway, counts as played. */
+    if (!__atomic_load_n(&s_active, __ATOMIC_ACQUIRE) || host_clock_paused()) {
         __atomic_store_n(&s_held_frames, __atomic_load_n(&s_held_frames, __ATOMIC_RELAXED) + frames,
                          __ATOMIC_RELAXED);
         return;
@@ -472,10 +512,10 @@ uint32_t audio_ios_queued_frames(void)
 void audio_ios_rate_note(char *buf, size_t n)
 {
     snprintf(buf, n, "ring short %llu events / %llu frames, dropped %llu frames, held %llu frames, "
-                     "starts %u, interruptions %u",
+                     "starts %u, interruptions %u, host pauses %u",
              (unsigned long long)audio_ring_short_events(&s_ring),
              (unsigned long long)audio_ring_short_frames(&s_ring),
              (unsigned long long)audio_ring_dropped_frames(&s_ring),
              (unsigned long long)__atomic_load_n(&s_held_frames, __ATOMIC_RELAXED),
-             s_starts, __atomic_load_n(&s_interruptions, __ATOMIC_RELAXED));
+             s_starts, __atomic_load_n(&s_interruptions, __ATOMIC_RELAXED), s_pauses);
 }

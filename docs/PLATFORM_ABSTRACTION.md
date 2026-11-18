@@ -206,6 +206,25 @@ goes through `vm_read*`/`vm_write*`.
 | **Get frequency** | `QueryPerformanceFrequency(&li)` | Fixed: 1,000,000,000 (nanoseconds) |
 | **Convert to PS3 ticks** | `ticks = li.QuadPart * 79800000 / freq` | `ticks = ts.tv_sec * 79800000 + ts.tv_nsec * 79800000 / 1000000000` |
 
+`host_monotonic_ns()` (`runtime/platform/host_clock.h`) is the one POSIX clock every guest clock derives from (the
+timebase, `sys_time_get_system_time`, lv2 timer expirations and usleep deadlines, the cellAudio mixer's period
+clock). It is `CLOCK_MONOTONIC` on Linux and `mach_absolute_time` on Apple.
+
+**Pausing (Apple only).** iOS keeps mach time running while it suspends or deactivates the process, so a guest clock
+built on it would jump by the suspended duration on return. On Apple the clock is *active time*:
+`host_clock_pause()` / `host_clock_resume()` (idempotent, any thread) freeze it and let it continue from where it
+stood, and `host_clock_paused()` reads the state. `rsx_metal_ios_display.m` calls them on the lifecycle edges of
+the GPU gate (will-resign-active / did-enter-background pause, did-become-active resumes). While paused the mixer
+mixes no block and posts no audio event, the CoreAudio unit is stopped, and `cellGcm_vblank_signal` counts and
+posts nothing; on resume all three continue without a re-anchor or a burst. A reader takes the raw clock and the
+pause state from one stable interval of a seqlock, so time never steps back across a transition; the unpaused read
+costs the raw read plus a few atomic loads (measured 10.7 -> 12.3 ns per call on an Apple M-series Mac). Relative
+host waits (`host_wait`, which on Apple are relative condition-variable waits) are not paused: they still elapse,
+and a waiting thread wakes, re-checks its guest deadline against the frozen clock and sleeps again. A guest thread
+that spins on the clock spins until it moves. Other POSIX hosts have no pause API: `host_wait.c` hands
+`host_monotonic_ns()` to a `CLOCK_MONOTONIC` condition variable as an absolute deadline, so it must stay
+`CLOCK_MONOTONIC` there. Test: `host_clock_pause` (Apple).
+
 ### Wall Clock Time
 
 | Operation | Windows | POSIX |

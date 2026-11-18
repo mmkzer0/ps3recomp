@@ -40,6 +40,12 @@ static u32 s_gcm_context_ea = 0;
 #include "rsx_capture.h"
 #include "rsx_method_class.h"
 #include <stdatomic.h>
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#if TARGET_OS_IPHONE
+#include "../../runtime/platform/host_clock.h"   /* host_clock_paused: cellGcm_vblank_signal */
+#endif
+#endif
 
 /* The RSX capture (rsx_capture.cpp), when one is open: NULL otherwise, so a run
  * with capture off costs one pointer test per hook. It is registered before the
@@ -1615,6 +1621,14 @@ void ppu_gcm_pump(void)
  * the head's ACQUIRE, so the present has to come first. cellGcmTickVBlank is the two in that order. */
 void cellGcm_vblank_signal(void)
 {
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+    /* The host paused the guest (app inactive, host_clock.h): guest time, audio and vblanks stand still together.
+     * A vblank counted or posted now would run a title's per-vblank logic (frame pacing, its vblank handler)
+     * against a clock that does not move, and the source's catch-up on resume would be a burst the title never
+     * saw on a console. iOS only: that is the one host that pauses, and the macOS fixtures that compile this file
+     * alone do not link the clock. */
+    if (host_clock_paused()) return;
+#endif
     atomic_fetch_add_explicit(&s_vblank_count, 1, memory_order_release);
     GCM_VBLANK_POST();
     GCM_PENDING_SET(1);
