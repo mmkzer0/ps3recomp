@@ -714,6 +714,29 @@ static void test_remap_force_zero_and_one(void)
     CHECK_EQ(m[B_], 2);
 }
 
+/* D8R8G8B8 and D1R5G5B5 read alpha 1 whatever the stored byte holds: a live
+ * render target sampled in these formats is a view of the surface, so only the
+ * remap can make its alpha constant. A8R8G8B8 keeps its stored alpha. */
+static void test_remap_d_formats_read_alpha_one(void)
+{
+    static const u32 fmts[2] = { FMT_D8R8G8B8, FMT_D1R5G5B5 };
+    for (int f = 0; f < 2; f++) {
+        u8 m[4];
+        rsx_texture_component_remap(0xAAE4u, fmts[f], m);
+        CHECK_EQ(m[A_], RSX_REMAP_ONE);
+        CHECK_EQ(m[R_], 0); CHECK_EQ(m[G_], 1); CHECK_EQ(m[B_], 2);
+        /* A crossbar that routes the A source to colour reads one there too. */
+        rsx_texture_component_remap(0xAA00u, fmts[f], m);
+        for (int i = 0; i < 4; i++) CHECK_EQ(m[i], RSX_REMAP_ONE);
+        /* The LN/swizzle bits of the format word do not change the rule. */
+        rsx_texture_component_remap(0xAAE4u, fmts[f] | FMT_LN, m);
+        CHECK_EQ(m[A_], RSX_REMAP_ONE);
+    }
+    u8 a[4];
+    rsx_texture_component_remap(0xAAE4u, FMT_A8R8G8B8, a);
+    CHECK_EQ(a[A_], 3);
+}
+
 /* G8B8 has two real channels, presented as {G,R,G,R}. */
 static void test_remap_g8b8_lanes(void)
 {
@@ -872,6 +895,7 @@ int main(void)
     test_remap_field_order_is_not_reversed();
     test_remap_force_zero_and_one();
     test_remap_g8b8_lanes();
+    test_remap_d_formats_read_alpha_one();
     test_remap_dxt_matches_argb();
     test_remap_depth_lanes();
     test_expand_mask();

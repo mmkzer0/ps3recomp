@@ -367,14 +367,25 @@ void rsx_texture_component_remap(u32 control1, u32 rsx_fmt, u8 out[4])
      * (RPCS3 VKFormats.cpp get_component_mapping: R,R,R,R): a retail title
      * reads its DEPTH16 shadow maps through crossbar 0xA900, R, G and B from A,
      * which through lanes_argb was the resource's opaque alpha -- every
-     * shadow compare saw depth 1.0. */
+     * shadow compare saw depth 1.0.
+     * D8R8G8B8 and D1R5G5B5 store an alpha byte/bit that is not a channel: the
+     * texture reads alpha 1 (RPCS3 d00d8023 TextureUtils.cpp lists both among
+     * its hardcoded-alpha formats; no primary RSX document). The decode forces
+     * it for an uploaded texture, but a live render target sampled in that
+     * format is a view of the surface and carries its stored alpha: a title
+     * that copies its scene into an offscreen pass and back with SRC_ALPHA
+     * blending, sampling the scene as D8R8G8B8, darkened the pass's scissor
+     * rectangle by 1 - s^2 + s^3. Presenting A as constant ONE covers every
+     * path (RPCS3 at that pin has the same defect on surface reads). */
     static const u8 lanes_argb[4]  = {3, 0, 1, 2};
+    static const u8 lanes_xrgb[4]  = {RSX_REMAP_ONE, 0, 1, 2};
     static const u8 lanes_g8b8[4]  = {1, 0, 1, 0};
     static const u8 lanes_b8[4]    = {RSX_REMAP_ONE, 0, 0, 0};
     static const u8 lanes_depth[4] = {0, 0, 0, 0};
     const u32 base = rsx_fmt & 0x9Fu;
     const u8* src2res = (base == 0x8Bu) ? lanes_g8b8
                       : (base == 0x81u || base == 0x94u) ? lanes_b8
+                      : (base == 0x9Du || base == 0x9Eu) ? lanes_xrgb
                       : (base >= 0x90u && base <= 0x93u) ? lanes_depth : lanes_argb;
 
     if (!(control1 & 0xFFFFu)) control1 = 0xAAE4u;   /* unset -> identity */
