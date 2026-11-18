@@ -297,6 +297,7 @@ SDL_PauseAudioDevice(dev, 0);  // Start playback
 |----------|----------------|-------|
 | Windows | XInput | Native Xbox controller support; DS3 via DS3 drivers |
 | Linux/macOS | SDL2 GameController | Supports DualShock 3/4, Xbox, Switch Pro, etc. |
+| iOS | GameController | Native Apple framework (no SDL); DualShock 4/DualSense and Xbox pads |
 
 ### XInput (Windows)
 
@@ -321,6 +322,37 @@ if (gc) {
     // Map to PS3 pad data
 }
 ```
+
+### GameController (iOS)
+
+`libs/input/pad_gc.m` reads `GCExtendedGamepad` profiles; `libs/input/pad_gc_map.c`
+turns them into the same `PadHostState` the SDL2 and XInput paths fill, so the
+guest cannot tell which host produced a report. The mapping is the SDL2 path's:
+
+| GameController | PS3 |
+|----------------|-----|
+| A / B / X / Y | Cross / Circle / Square / Triangle |
+| Left/right shoulder | L1 / R1 |
+| Left/right stick click | L3 / R3 |
+| Menu / Options | START / SELECT |
+| D-pad (bits and axes) | UP / DOWN / LEFT / RIGHT |
+| L2 / R2 trigger `value` | L2 / R2, pressed above the SDL path's 3000/32767 of travel |
+| Stick `xAxis` / `yAxis` | Analog sticks; `y` is inverted (PS3's 0 is up) |
+| Button and D-pad `value` | Pressure words (`press_*`, 0..255) |
+
+Threading and hot-plug:
+
+- Connect, disconnect and every `valueChangedHandler` report run on one private
+  serial queue, so a value report cannot interleave with a disconnect. The
+  handler checks that the controller reporting is still the one bound to its
+  port; a report from an unbound controller is dropped. Without that, a button
+  held while a controller is switched off could be re-published after the port
+  was cleared — the stuck-pad defect `pad_host_release` documents.
+- A controller is bound to the lowest free port of the four, and its
+  `playerIndex` is set to match. A port with no controller reads released and
+  centred, as on every other backend.
+- Rumble is not implemented yet: `cellPadSetActDirect` keeps the levels but
+  nothing is sent to the controller (CoreHaptics is the later step).
 
 ---
 

@@ -125,6 +125,9 @@ if(APPLE)
     list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_metal_backend.m")
     if(PS3RECOMP_IOS)
         list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_metal_ios_display.m")
+        # cellPad's iOS backend: GameController, one serial queue for
+        # connect/disconnect/value reports (libs/input/pad_gc.m).
+        list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/input/pad_gc.m")
     endif()
 endif()
 # The HLSL -> MSL translator is C++ (it drives glslang's C++ API) and compiles
@@ -327,8 +330,9 @@ else()
     target_link_libraries(ps3recomp_runtime PRIVATE Threads::Threads)
     if(PS3RECOMP_IOS)
         # Simulator builds use UIKit/Metal and do not link a macOS SDL2 binary.
-        # Host input and audio output are outside this rendering PoC.
-        message(STATUS "  SDL2:         skipped for iOS (no SDL-backed host input or audio output)")
+        # Host input and audio output are native Apple frameworks there: cellPad
+        # reads GameController (libs/input/pad_gc.m), cellAudio the audio unit.
+        message(STATUS "  SDL2:         skipped for iOS (input: GameController; audio: CoreAudio)")
     else()
         # cellPad and cellAudio select their SDL2 backends unconditionally off
         # Windows (see PAD_BACKEND_SDL2 / AUDIO_BACKEND_SDL2), so SDL2 is required
@@ -366,8 +370,13 @@ if(APPLE)
     # Objective-C++.
     if(PS3RECOMP_IOS)
         target_link_libraries(ps3recomp_runtime PUBLIC "-framework UIKit")
+        # cellPad's host pad backend (libs/input/pad_gc.m): GameController.
+        target_link_libraries(ps3recomp_runtime PUBLIC "-framework GameController")
         set_source_files_properties(
             "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_metal_ios_display.m"
+            PROPERTIES LANGUAGE OBJC COMPILE_OPTIONS "-fobjc-arc")
+        set_source_files_properties(
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/input/pad_gc.m"
             PROPERTIES LANGUAGE OBJC COMPILE_OPTIONS "-fobjc-arc")
     else()
         # AppKit for the window; ApplicationServices for cellPad's keyboard
@@ -2160,6 +2169,16 @@ if(PS3RECOMP_BUILD_TESTS)
         set_tests_properties(pad_trace_stop_record-io PROPERTIES
             PASS_REGULAR_EXPRESSION "PS3STOP v=1 kind=pad-trace role=record [^\n]*line=0 reason=io( |\n)"
             LABELS "input;t0" TIMEOUT 60)
+
+        # cellPad's iOS GameController profile -> PadHostState mapping: pure C,
+        # so it builds and runs on every host without the framework.
+        ps3recomp_add_hle_check_test(test_pad_gc_map
+            libs/input/tests/test_pad_gc_map.c
+            libs/input/pad_gc_map.c)
+        target_include_directories(test_pad_gc_map PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/input")
+        target_link_libraries(test_pad_gc_map PRIVATE m)   # lroundf
+        set_tests_properties(test_pad_gc_map PROPERTIES LABELS "input;t0" TIMEOUT 60)
 
         if(SDL2_FOUND)
             ps3recomp_add_hle_check_test(hle_audio_ring
