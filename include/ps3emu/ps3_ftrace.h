@@ -223,6 +223,9 @@ enum ps3_ft_kind {
                               * never filtered; who as kind 38, a = the pipeline's cache key when the site has one,
                               * else FNV-1a 32 of the descriptor fields that name it, b = 0. A cache hit emits
                               * nothing */
+    PS3_FT_JQ2_WAKE       = 40, /* worker, active interval from wake to re-park (startup/exit are marked separately);
+                              * who = q << 8 | w, a = jobs run (low 16) | made-progress (bit 16) | park reason
+                              * (top byte, with 0xFE startup and 0xFF exit), b = thread CPU time in us */
 };
 
 enum ps3_ft_audio_pace_reason {

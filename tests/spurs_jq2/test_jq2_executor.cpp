@@ -29,6 +29,8 @@
  *               port line unchanged
  *   join        Shutdown/Join: Join returns only after the outstanding jobs
  *               finished (L1); guest buffers stay the caller's (L2)
+ *   shutdown-exit-wake Shutdown while one credited job is held: the sibling
+ *               rechecks its exit predicate after completion
  *   observer    jq2_set_job_observer: the worker's spu_context and the loader's
  *               layout at job start, r3 at job end, nothing once removed
  *   validate    every guard and firmware status code of the surface
@@ -70,10 +72,12 @@
  *   push-nonblock  flags bit 2 on a full ring is AGAIN: nothing written, B rolled back
  *   push-flags  PushJob flags & ~7, CopyPush flags & ~3, PushSync flags & ~4: A02, first
  *   stop-push-block-shutdown  Shutdown while a pusher is parked: jq2-unmodelled
- *   trace-spans, trace-sync, trace-queues, trace-concurrent, trace-held, trace-off  the ftrace jq2 kinds 22-28
+ *   trace-spans, trace-sync, trace-queues, trace-concurrent, trace-held, trace-off  the ftrace jq2 kinds 22-29,40
  *               (ps3_ftrace.h): PUSH/JOB/CREDIT per (q, seq), SYNC_WAIT keyed by waiter, IDLE and its reason
  *               byte, HELD and BARRIER for a job a SYNC held, the q of each queue and its creation line, seq
  *               unique under concurrent pushers; nothing recorded with tracing off
+ *   trace-wake-bench  q0 37-job SYNC bursts; q1 12 spaced jobs/frame; 50 us bodies on 5/8 workers
+ *   wake-stress       repeated 8-worker bursts after all workers park; bounded on a missed wake
  *   trace-image-two, -same, -changed, -moved, -overflow, -concurrent, -off, -observer  the ftrace job image
  *               identity (kind 29, the J table): two images two entries, the same image the same index, bytes
  *               changed in place a new entry, the same bytes at a second EA the same fingerprint, the 1024-slot
@@ -225,6 +229,12 @@ bool wait_for(P pred, int ms = 60000)
         std::this_thread::sleep_for(std::chrono::microseconds(200));
     }
     return true;
+}
+[[noreturn]] void fail_fast(const char* message)
+{
+    std::fprintf(stderr, "FAIL %s\n", message);
+    std::fflush(stderr);
+    std::_Exit(1);
 }
 
 /* ---- SPU encoders ------------------------------------------------------------ */
@@ -419,9 +429,25 @@ void hook_admit(void*, const JobStart& js)
 }
 void hook_done(void*, const JobStart& js)
 {
-    std::lock_guard<std::mutex> lk(g_probe.mu);
-    g_probe.done[serial_of(js)] = ++g_probe.clock;
+    {
+        std::lock_guard<std::mutex> lk(g_probe.mu);
+        g_probe.done[serial_of(js)] = ++g_probe.clock;
+    }
+    g_probe.cv.notify_all();
 }
+
+std::size_t done_count()
+{
+    std::lock_guard<std::mutex> lk(g_probe.mu);
+    return g_probe.done.size();
+}
+
+bool wait_done_count(std::size_t count, int ms)
+{
+    std::unique_lock<std::mutex> lk(g_probe.mu);
+    return g_probe.cv.wait_for(lk, std::chrono::milliseconds(ms), [&] { return g_probe.done.size() >= count; });
+}
+
 
 /* What ExecutorHooks::on_end reported, in guest memory: the arena is MAP_SHARED, so the record of a job that
  * ended in a named stop (a forked child) is still there for the parent to read. One job per run. */
@@ -454,8 +480,9 @@ EndRec end_rec()
 void end_rec_clear() { std::memset(vm_base + END_REC, 0, 32); }
 
 /* The job bodies a test selects; 0 leaves the interpreter. */
-enum LiftedKind { kNoLifted = 0, kLiftedNormal, kLiftedHalt, kLiftedJmCall, kLiftedBusy };
+enum LiftedKind { kNoLifted = 0, kLiftedNormal, kLiftedHalt, kLiftedJmCall, kLiftedBusy, kLiftedWakeBench };
 int g_lifted = kNoLifted;
+bool g_wake_bench_barriers = false;
 
 /* A lifted-style body, written the way tools/spu_lifter.py emits code: channel
  * writes through the context, the halt-on-condition as `status = HALT;
@@ -526,6 +553,24 @@ void lifted_busy_entry(spu_context* c)
     }
 }
 
+void lifted_wake_delay_entry(spu_context* c, std::uint64_t delay_ns)
+{
+    timespec t0;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t0);
+    for (;;) {
+        timespec t;
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t);
+        if ((t.tv_sec - t0.tv_sec) * 1000000000ll + (t.tv_nsec - t0.tv_nsec) >=
+            static_cast<std::int64_t>(delay_ns))
+            break;
+    }
+    SPU_RET(c);
+}
+
+void lifted_wake_short_entry(spu_context* c) { lifted_wake_delay_entry(c, 50000); }
+void lifted_wake_gate_entry(spu_context* c) { lifted_wake_delay_entry(c, 1000000); }
+
+
 /* A lifted body that calls jm word 0 the way lifted code calls through a
  * register (the bisl bracket): the resolver finds no lifted function at 0x1500
  * and interprets the planted stop word. */
@@ -575,12 +620,16 @@ void lifted_miss_entry(spu_context* c)
     SPU_RET(c);
 }
 
-JobBody hook_select(void*, const JobStart&)
+JobBody hook_select(void*, const JobStart& js)
 {
     switch (g_lifted) {
     case kLiftedHalt: return JobBody{&lifted_halt_entry, -1};
     case kLiftedBusy: return JobBody{&lifted_busy_entry, -1};
     case kLiftedJmCall: return JobBody{&lifted_jm_call_entry, -1};
+    case kLiftedWakeBench:
+        return JobBody{g_wake_bench_barriers && serial_of(js) % 37 == 0 ? &lifted_wake_gate_entry
+                                                                       : &lifted_wake_short_entry,
+                       -1};
     default: return JobBody{&lifted_normal_entry, -1};
     }
 }
@@ -606,8 +655,25 @@ struct PushParked {
 };
 PushParked g_parked;
 void hook_push_blocked(void*, std::uint32_t) { g_parked.blocked.fetch_add(1); }
+struct CreditGate {
+    std::mutex mu;
+    std::condition_variable cv;
+    bool reached = false;
+    bool release = false;
+    bool timed_out = false;
+};
+CreditGate g_credit_gate;
 
-void install_hooks()
+void hook_after_credit(void*, const JobStart&)
+{
+    std::unique_lock<std::mutex> lk(g_credit_gate.mu);
+    g_credit_gate.reached = true;
+    g_credit_gate.cv.notify_all();
+    if (!g_credit_gate.cv.wait_for(lk, std::chrono::seconds(5), [] { return g_credit_gate.release; }))
+        g_credit_gate.timed_out = true;
+}
+
+void install_hooks(bool gate_after_credit = false)
 {
     ExecutorHooks h;
     h.on_admit = &hook_admit;
@@ -616,6 +682,7 @@ void install_hooks()
     h.on_done = &hook_done;
     h.on_end = &hook_end;
     if (g_lifted != kNoLifted) h.select_body = &hook_select;
+    if (gate_after_credit) h.after_credit = &hook_after_credit;
     set_executor_hooks(h);
 }
 
@@ -1105,6 +1172,81 @@ void mode_join()
     for (const JobSpec& m : more) CHECK(job_ok(m), "job %u output", m.serial);
 }
 
+/* A credit can wake the PPU before its worker reacquires mu_. Keep that worker running while Shutdown wakes
+ * the sibling; after the last completion, Join must wake the sibling again so it can pass the exit predicate. */
+void mode_shutdown_exit_wake()
+{
+    build_image(IMAGE, Prog::transform);
+    {
+        std::lock_guard<std::mutex> lk(g_credit_gate.mu);
+        g_credit_gate.reached = false;
+        g_credit_gate.release = false;
+        g_credit_gate.timed_out = false;
+    }
+    install_hooks(true);
+    Rig rig({128, 2, false});
+    const JobSpec job = spec(0);
+    rig.push_wait(job.desc, 64, 0);
+
+    if (!wait_for([] {
+            std::lock_guard<std::mutex> lk(g_credit_gate.mu);
+            return g_credit_gate.reached;
+        }, 3000))
+        fail_fast("worker did not reach the after-credit gate");
+    const auto active_and_parked = [] {
+        const auto v = observe_queue(QUEUE);
+        return v && v->running == 1 && v->outstanding == 0 && v->settled == 1;
+    };
+    if (!wait_for(active_and_parked, 3000))
+        fail_fast("expected one credited job held open and its sibling parked");
+    std::atomic<std::int32_t> sync_rc{JQ2_ERR_STAT};
+    std::thread syncer([&] { sync_rc = jq2_port_sync(PORT, 0); });
+    if (!wait_for([&] { return sync_rc != JQ2_ERR_STAT; }, 3000))
+        fail_fast("Port2Sync did not consume the completed credit");
+    syncer.join();
+    if (sync_rc != 0) fail_fast("Port2Sync failed after the completed credit");
+    if (jq2_port_destroy(PORT) != 0) fail_fast("port destroy before shutdown failed");
+    if (jq2_queue_shutdown(QUEUE) != 0) fail_fast("queue shutdown failed");
+    if (!wait_for(active_and_parked, 3000))
+        fail_fast("parked sibling did not consume Shutdown's wake and re-park");
+
+    {
+        std::lock_guard<std::mutex> lk(g_credit_gate.mu);
+        g_credit_gate.release = true;
+    }
+    g_credit_gate.cv.notify_all();
+
+    std::mutex join_mu;
+    std::condition_variable join_cv;
+    bool joined = false;
+    std::int32_t join_rc = JQ2_ERR_STAT;
+    std::uint32_t exit_value = 0xFFFFFFFFu;
+    std::thread joiner([&] {
+        const std::int32_t rc = jq2_queue_join(QUEUE, &exit_value);
+        {
+            std::lock_guard<std::mutex> lk(join_mu);
+            join_rc = rc;
+            joined = true;
+        }
+        join_cv.notify_all();
+    });
+    bool join_finished = false;
+    {
+        std::unique_lock<std::mutex> lk(join_mu);
+        join_finished = join_cv.wait_for(lk, std::chrono::seconds(3), [&] { return joined; });
+    }
+    if (!join_finished) {
+        joiner.detach();
+        fail_fast("queue join did not finish after the last worker completion");
+    }
+    joiner.join();
+    CHECK(join_rc == 0, "join rc 0x%X", unsigned(join_rc));
+    CHECK(job_ok(job), "job output");
+    {
+        std::lock_guard<std::mutex> lk(g_credit_gate.mu);
+        CHECK(!g_credit_gate.timed_out, "after-credit gate timed out");
+    }
+}
 /* The job observer: one worker's spu_context and the loader's layout at job
  * start, r3 at job end, and nothing at all once it is removed. */
 struct ObsState {
@@ -2538,7 +2680,7 @@ void mode_stop_push_block_shutdown()
         "jq2-unmodelled", {"reason=push-blocked-at-shutdown"});
 }
 
-/* ---- jq2 ftrace spans (ps3_ftrace.h kinds 22-28) ---------------------------- */
+/* ---- jq2 ftrace spans (ps3_ftrace.h kinds 22-29, 40) ------------------------ */
 
 /* The recorder is read after every thread that can emit has been joined (Rig::teardown joins the
  * workers; a test joins its own threads), so the records need no synchronisation. */
@@ -2616,9 +2758,191 @@ void check_credit_fields(const ps3_ft_rec& r)
     else CHECK(wake == 1 && waiter >= 1 && waiter < 64, "q%u seq %u: due but b=0x%X", ft_q(r), r.a, r.b);
 }
 
+/* Bursts match the measured queue rates: q0 has held tag-0 work behind a SYNC. */
+void mode_trace_wake_bench()
+{
+    constexpr std::uint32_t kFrames = 120, kQ0JobsPerFrame = 37, kQ1JobsPerFrame = 12;
+    constexpr std::uint32_t kQ0Jobs = kFrames * kQ0JobsPerFrame, kQ1Jobs = kFrames * kQ1JobsPerFrame;
+    constexpr auto kPeriod = std::chrono::microseconds(16667);
+    g_lifted = kLiftedWakeBench;
+    build_image(IMAGE, Prog::ret_only);
+    install_hooks();
+    {
+        std::lock_guard<std::mutex> lk(g_probe.mu);
+        g_probe.on_admit = nullptr;
+    }
+    ppu_context ppu{};
+    ppu.thread_id = ppu_tid_make(0, 0);
+    g_active_ctx = &ppu;
+    std::printf("synthetic JQ2 bursts: q0 37 jobs/frame + tag-0 SYNC; q1 12 spaced jobs/frame; %u frames\n",
+                kFrames);
+    std::printf("q workers jobs nominal_jobs/s wakes/job spurious held_reparks worker_cpu_us/job JQ2_JOB_cpu_us/job\n");
+
+    const auto run_queue = [&](std::uint32_t q, unsigned workers, std::uint32_t serial_base,
+                               std::uint32_t jobs_per_frame, bool barriers) {
+        const std::uint32_t total_jobs = kFrames * jobs_per_frame;
+        const std::size_t done_before = done_count();
+        g_wake_bench_barriers = barriers;
+        Rig rig({128, workers, false});
+        CHECK(wait_for([&] {
+                  const auto v = observe_queue(QUEUE);
+                  return v && v->settled == workers;
+              }, 10000),
+              "benchmark q%u: workers park before the bursts", q);
+        std::vector<JobSpec> specs;
+        specs.reserve(total_jobs);
+        for (std::uint32_t j = 0; j < total_jobs; ++j) specs.push_back(spec(serial_base + j));
+        const auto start = std::chrono::steady_clock::now();
+        std::uint32_t next = 0;
+        for (std::uint32_t frame = 0; frame < kFrames; ++frame) {
+            if (frame != 0) std::this_thread::sleep_until(start + kPeriod * frame);
+            if (barriers) {
+                const std::uint32_t frame_end = (frame + 1) * jobs_per_frame;
+                const JobSpec& gate = specs[next++];
+                CHECK(rig.push(gate.desc, 64, 0) == 0, "benchmark q%u gate push", q);
+                rig.sync_tags_wait(1u << 0);
+                while (next < frame_end) {
+                    const JobSpec& s = specs[next];
+                    CHECK(rig.push(s.desc, 64, 0) == 0, "benchmark q%u push %u", q, next);
+                    ++next;
+                }
+            } else {
+                for (std::uint32_t i = 0; i < jobs_per_frame; ++i) {
+                    if (i != 0)
+                        std::this_thread::sleep_until(start + kPeriod * frame + kPeriod * i / jobs_per_frame);
+                    const JobSpec& s = specs[next];
+                    CHECK(rig.push(s.desc, 64, next % 3) == 0, "benchmark q%u push %u", q, next);
+                    ++next;
+                }
+            }
+        }
+        bool completed = wait_done_count(done_before + total_jobs, 10000);
+        CHECK(completed, "benchmark q%u jobs complete before timeout", q);
+        if (!completed) {
+            CHECK(set_intake_paused(QUEUE, true), "benchmark timeout recovery pause");
+            CHECK(set_intake_paused(QUEUE, false), "benchmark timeout recovery resume");
+            completed = wait_done_count(done_before + total_jobs, 10000);
+            CHECK(completed, "benchmark q%u recovery completes", q);
+        }
+        CHECK(jq2_port_sync(PORT, 0) == 0, "benchmark q%u sync", q);
+        const jq2_stats stats = rig.stats();
+        CHECK(stats.dispatched == total_jobs && stats.executed == total_jobs && stats.credited == total_jobs,
+              "benchmark q%u dispatched/executed/credited %llu/%llu/%llu, want %u", q,
+              static_cast<unsigned long long>(stats.dispatched), static_cast<unsigned long long>(stats.executed),
+              static_cast<unsigned long long>(stats.credited), total_jobs);
+        rig.teardown();
+        g_wake_bench_barriers = false;
+
+        std::uint32_t jobs = 0, wakes = 0, spurious = 0, held_reparks = 0;
+        std::uint64_t worker_cpu_us = 0, job_cpu_us = 0;
+        for (const ps3_ft_rec& r : ft_kind(PS3_FT_JQ2_JOB)) {
+            if (ft_q(r) != q) continue;
+            ++jobs;
+            job_cpu_us += r.b;
+        }
+        for (const ps3_ft_rec& r : ft_kind(PS3_FT_JQ2_WAKE)) {
+            if (ft_q(r) != q) continue;
+            const std::uint32_t reason = r.a >> 24;
+            if (reason != 0xFFu) worker_cpu_us += r.b;
+            if (reason == 0xFEu || reason == 0xFFu) continue;
+            ++wakes;
+            if ((r.a & (1u << 16)) == 0 && reason != 5u) ++spurious;
+            if (reason == 3u) ++held_reparks;
+        }
+        CHECK(jobs == total_jobs, "benchmark q%u: recorded %u JOB spans, want %u", q, jobs, total_jobs);
+        CHECK(barriers ? held_reparks != 0 : held_reparks == 0,
+              "benchmark q%u: %u held re-parks for barriers=%d", q, held_reparks, barriers ? 1 : 0);
+        const double jobs_per_second = static_cast<double>(jobs_per_frame) * 1000000.0 / kPeriod.count();
+        std::printf("%u %u %u %.1f %.3f %u %u %.2f %.2f\n", q, workers, jobs, jobs_per_second,
+                    jobs != 0 ? static_cast<double>(wakes) / jobs : 0.0, spurious, held_reparks,
+                    jobs != 0 ? static_cast<double>(worker_cpu_us) / jobs : 0.0,
+                    jobs != 0 ? static_cast<double>(job_cpu_us) / jobs : 0.0);
+    };
+
+    run_queue(0, 5, 0, kQ0JobsPerFrame, true);
+    run_queue(1, 8, kQ0Jobs, kQ1JobsPerFrame, false);
+    g_active_ctx = nullptr;
+}
+
+/* Repeated parked-to-burst transitions fail within a bound if a queued job can be left asleep. */
+void mode_wake_stress()
+{
+    constexpr unsigned kWorkers = 8;
+    constexpr std::uint32_t kWaves = 16, kJobsPerWave = 64;
+    constexpr std::uint32_t kJobs = kWaves * kJobsPerWave;
+    g_lifted = kLiftedNormal;
+    build_image(IMAGE, Prog::transform);
+    install_hooks();
+    {
+        std::lock_guard<std::mutex> lk(g_probe.mu);
+        g_probe.on_admit = nullptr;
+    }
+    ppu_context ppu{};
+    ppu.thread_id = ppu_tid_make(0, 0);
+    g_active_ctx = &ppu;
+    const std::size_t done_before = done_count();
+    Rig rig({128, kWorkers, false});
+    CHECK(wait_for([&] {
+              const auto v = observe_queue(QUEUE);
+              return v && v->settled == kWorkers;
+          }, 10000),
+          "stress: workers park before the first burst");
+    std::vector<JobSpec> specs;
+    specs.reserve(kJobs);
+    for (std::uint32_t j = 0; j < kJobs; ++j) specs.push_back(spec(j));
+
+    std::uint32_t pushed = 0;
+    bool complete = true;
+    for (std::uint32_t wave = 0; wave < kWaves; ++wave) {
+        const bool parked = wait_for([&] {
+            const auto v = observe_queue(QUEUE);
+            return v && v->settled == kWorkers;
+        }, 5000);
+        CHECK(parked, "stress wave %u: workers settle before the burst", wave);
+        for (std::uint32_t i = 0; i < kJobsPerWave; ++i) {
+            const JobSpec& s = specs[wave * kJobsPerWave + i];
+            if (rig.push(s.desc, 64, s.serial % 3) == 0)
+                ++pushed;
+            else
+                CHECK(false, "stress wave %u: push %u refused", wave, i);
+        }
+        complete = wait_done_count(done_before + pushed, 5000);
+        if (!complete) {
+            CHECK(false, "stress wave %u: burst did not complete before timeout", wave);
+            CHECK(set_intake_paused(QUEUE, true), "stress recovery pause");
+            CHECK(set_intake_paused(QUEUE, false), "stress recovery resume");
+            complete = wait_done_count(done_before + pushed, 5000);
+            CHECK(complete, "stress recovery drains the timed-out burst");
+            if (!complete) std::exit(1);
+            break;
+        }
+        CHECK(jq2_port_sync(PORT, 0) == 0, "stress wave %u: sync", wave);
+    }
+    CHECK(jq2_port_sync(PORT, 0) == 0, "stress final sync");
+    const jq2_stats stats = rig.stats();
+    CHECK(stats.pushed == pushed && stats.dispatched == pushed && stats.executed == pushed &&
+              stats.credited == pushed,
+          "stress counts pushed=%llu dispatched=%llu executed=%llu credited=%llu expected=%u",
+          static_cast<unsigned long long>(stats.pushed), static_cast<unsigned long long>(stats.dispatched),
+          static_cast<unsigned long long>(stats.executed), static_cast<unsigned long long>(stats.credited), pushed);
+    for (std::uint32_t j = 0; j < pushed; ++j) CHECK(job_ok(specs[j]), "stress job %u output", j);
+    {
+        std::lock_guard<std::mutex> lk(g_probe.mu);
+        std::uint32_t previous = 0;
+        for (std::uint32_t j = 0; j < pushed; ++j) {
+            const auto it = g_probe.dispatch.find(j);
+            CHECK(it != g_probe.dispatch.end(), "stress job %u was not admitted", j);
+            if (it == g_probe.dispatch.end()) continue;
+            if (j != 0) CHECK(it->second > previous, "stress job %u admitted before ring predecessor", j);
+            previous = it->second;
+        }
+    }
+    rig.teardown();
+    g_active_ctx = nullptr;
+}
+
 /* Six jobs pushed while intake is paused, then released: ordered PUSH -> JOB -> CREDIT per (q, seq), the
- * depth each push saw, the thread CPU time of the job against its wall time, and the idle spans of workers
- * that had parked with work pending. */
+ * depth each push saw, the thread CPU time of the job against its wall time, and the two workers' IDLE spans. */
 void mode_trace_spans()
 {
     constexpr std::uint32_t kJobs = 6;
@@ -2641,12 +2965,12 @@ void mode_trace_spans()
         specs.push_back(spec(j));
         rig.push_wait(specs.back().desc, 64, j % 3);
     }
-    /* Parked on the generation of the last push: the workers wake for the first time when intake resumes. */
+    /* Paused entries stay in the ring without waking workers; verify the queue state before resume. */
     CHECK(wait_for([] {
               const auto v = observe_queue(QUEUE);
-              return v && v->settled == 2;
+              return v && v->settled == 2 && v->outstanding == kJobs;
           }),
-          "both workers park with the jobs pending");
+          "both workers park while all jobs remain pending");
     CHECK(set_intake_paused(QUEUE, false), "resume");
     CHECK(jq2_port_sync(PORT, 0) == 0, "sync");
     for (const JobSpec& s : specs) CHECK(job_ok(s), "job %u output", s.serial);
@@ -2668,12 +2992,12 @@ void mode_trace_spans()
 
     const std::vector<ps3_ft_rec> idle = ft_kind(PS3_FT_JQ2_IDLE);
     for (std::uint32_t w = 0; w < 2; ++w) {
-        bool parked_with_work = false;
+        bool saw_idle = false;
         for (const ps3_ft_rec& r : idle) {
             CHECK(r.who >> 8 == 0 && (r.who & 0xFFu) < 2 && r.t1 >= r.t0, "IDLE who 0x%X", r.who);
-            if (r.who == w) parked_with_work = parked_with_work || ((r.a & 0xFFFFFFu) == kJobs && r.b <= kJobs);
+            if (r.who == w) saw_idle = true;
         }
-        CHECK(parked_with_work, "worker %u: no IDLE span that began with %u jobs pending", w, kJobs);
+        CHECK(saw_idle, "worker %u: no IDLE span", w);
     }
     CHECK(ft_kind(PS3_FT_JQ2_SYNC_WAIT).size() <= 1, "at most the one blocking Sync");
 }
@@ -2962,6 +3286,13 @@ void mode_trace_held()
     CHECK(empty_park, "no IDLE span with reason 1 (empty) and depth 0 on the empty ring");
     CHECK(held_park, "no IDLE span with reason 3 (held) and depth > 0");
     CHECK(held_park_while_up, "the held park does not overlap the barrier");
+
+    unsigned empty_held_wakes = 0;
+    for (const ps3_ft_rec& r : ft_kind(PS3_FT_JQ2_WAKE))
+        if ((r.who >> 8) == 0 && (r.a >> 24) == 3 && (r.a & 0xFFFFu) == 0 && (r.a & (1u << 16)) == 0)
+            ++empty_held_wakes;
+    CHECK(empty_held_wakes == 0, "%u wakes found no work while the barrier held every pending job",
+          empty_held_wakes);
 
     for (const ps3_ft_rec& r : ft_kind(PS3_FT_JQ2_CREDIT)) check_credit_fields(r);
 }
@@ -4344,6 +4675,7 @@ void mode_select_concurrent()
         std::mutex mu;
         std::condition_variable cv;
         unsigned arrived = 0;
+        bool timed_out = false;
     } gate;
     const IdentifyCounts before = identify_counts();
     xd_run(
@@ -4355,7 +4687,11 @@ void mode_select_concurrent()
                 if (gate.arrived >= kWorkers) return;
                 ++gate.arrived;
                 gate.cv.notify_all();
-                gate.cv.wait(lk, [&gate] { return gate.arrived >= kWorkers; });
+                if (!gate.cv.wait_for(lk, std::chrono::seconds(3),
+                                      [&gate] { return gate.arrived >= kWorkers || gate.timed_out; })) {
+                    gate.timed_out = true;
+                    gate.cv.notify_all();
+                }
             };
         },
         [](std::uint32_t j) { return (j % 2) != 0 ? kImageB : std::uint32_t(IMAGE); });
@@ -4363,7 +4699,8 @@ void mode_select_concurrent()
         std::lock_guard<std::mutex> lk(g_probe.mu);
         g_probe.on_admit = nullptr;
     }
-    CHECK(gate.arrived == kWorkers, "the barrier saw %u workers", gate.arrived);
+    CHECK(!gate.timed_out && gate.arrived == kWorkers, "barrier saw %u workers (timeout=%d)", gate.arrived,
+          gate.timed_out);
     std::vector<std::uint32_t> even, odd;
     for (std::uint32_t j = 0; j < kJobs; ++j) (j % 2 != 0 ? odd : even).push_back(j);
     const std::vector<std::uint32_t> ran_a = serials_of(0, kImageIdA), ran_b = serials_of(1, kImageIdB);
@@ -4385,6 +4722,7 @@ struct StartGate {
     std::mutex mu;
     std::condition_variable cv;
     unsigned arrived = 0;
+    bool timed_out = false;
 };
 StartGate g_start_gate;
 void gate_job_start(void*, spu_context*, const jq2_job_info*)
@@ -4393,7 +4731,11 @@ void gate_job_start(void*, spu_context*, const jq2_job_info*)
     if (g_start_gate.arrived >= 2) return;
     ++g_start_gate.arrived;
     g_start_gate.cv.notify_all();
-    g_start_gate.cv.wait(lk, [] { return g_start_gate.arrived >= 2; });
+    if (!g_start_gate.cv.wait_for(lk, std::chrono::seconds(3),
+                                  [] { return g_start_gate.arrived >= 2 || g_start_gate.timed_out; })) {
+        g_start_gate.timed_out = true;
+        g_start_gate.cv.notify_all();
+    }
 }
 void mode_select_concurrent_hook()
 {
@@ -4406,7 +4748,8 @@ void mode_select_concurrent_hook()
     xd_run(
         kJobs, kWorkers, [&obs] { CHECK(jq2_set_job_observer(QUEUE, &obs) == 0, "install observer"); },
         [](std::uint32_t j) { return (j % 2) != 0 ? kImageB : std::uint32_t(IMAGE); });
-    CHECK(g_start_gate.arrived == kWorkers, "the gate saw %u workers", g_start_gate.arrived);
+    CHECK(!g_start_gate.timed_out && g_start_gate.arrived == kWorkers, "the gate saw %u workers (timeout=%d)",
+          g_start_gate.arrived, g_start_gate.timed_out);
     std::vector<std::uint32_t> even, odd;
     for (std::uint32_t j = 0; j < kJobs; ++j) (j % 2 != 0 ? odd : even).push_back(j);
     const std::vector<std::uint32_t> ran_a = serials_of(0, kImageIdA), ran_b = serials_of(1, kImageIdB);
@@ -5729,7 +6072,7 @@ int main(int argc, char** argv)
         } else {
             const std::string where = mode == "trace-image-overflow" ? overflow_trace_path() : "/dev/null";
             setenv("PS3_FTRACE", ("0:100000:" + where).c_str(), 1);
-            setenv("PS3_FTRACE_CAP", "65536", 1);
+            setenv("PS3_FTRACE_CAP", mode == "trace-wake-bench" ? "262144" : "65536", 1);
         }
     }
     /* The capture options are read when the first job starts and never again: the xdiff modes set them first. */
@@ -5786,6 +6129,8 @@ int main(int argc, char** argv)
     else if (mode == "push-flags") mode_push_flags();
     else if (mode == "stop-push-block-shutdown") mode_stop_push_block_shutdown();
     else if (mode == "trace-spans") mode_trace_spans();
+    else if (mode == "trace-wake-bench") mode_trace_wake_bench();
+    else if (mode == "wake-stress") mode_wake_stress();
     else if (mode == "trace-sync") mode_trace_sync();
     else if (mode == "trace-queues") mode_trace_queues();
     else if (mode == "trace-concurrent") mode_trace_concurrent();
@@ -5830,6 +6175,7 @@ int main(int argc, char** argv)
     else if (mode == "select-forced") mode_select_forced();
     else if (mode == "select-observer") mode_select_observer();
     else if (mode == "select-concurrent") mode_select_concurrent();
+    else if (mode == "shutdown-exit-wake") mode_shutdown_exit_wake();
     else if (mode == "select-concurrent-hook") mode_select_concurrent_hook();
     else if (mode == "xdiff-select-collision") mode_xdiff_select_collision();
     else if (mode == "xdiff-select-lifted") mode_xdiff_select_lifted();

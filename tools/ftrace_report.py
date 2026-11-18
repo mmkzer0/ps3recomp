@@ -2,7 +2,7 @@
 """Frame-by-frame report of a PS3_FTRACE timeline.
 
   tools/ftrace_report.py <trace.txt|trace.zst> [--frames N] [--ms-per-col F] [--threads a,b]
-                         [--split MS] [--cadence NID[@TID]] [--gap MS] [--json]
+                         [--split MS] [--cadence NID[@TID]] [--gap MS] [--energy-json PATH] [--json]
 
 The trace is read as text or as a zstd stream, told apart by the zstd frame magic and not by
 the file name; a zstd trace is decoded line by line, never unpacked to disk or read whole.
@@ -28,7 +28,8 @@ a job-queue sync). A span is shared out over the frames it overlaps.
                       --gap MS (default 20), what the thread was inside during
                       it, as a share of the gap time; the worst gaps are listed.
   --json              the summary (frames, breakdowns, drawables, label waits,
-                      cadence) as JSON on stdout instead of text; no timelines.
+                      cadence and JQ2 wake accounting) as JSON on stdout; no timelines.
+  --energy-json PATH  thread CPU rates from proc_energy.py, joined by JQ2 q/w
 
 Two sections count per flip request (summed over the trace and divided by the
 number of FLIP_REQ spans; a present runs behind the request that asked for it, so
@@ -175,8 +176,8 @@ import tempfile
  AUDIO_MIX, AUDIO_PACE, AUDIO_UNDERRUN, AUDIO_STALE,
  JQ2_PUSH, JQ2_JOB, JQ2_CREDIT, JQ2_SYNC_WAIT, JQ2_IDLE, JQ2_HELD, JQ2_BARRIER,
  JQ2_IMAGE, AUDIO_RING, AUDIO_RING_VIEW, JQ2_BODY, JQ2_XDIFF, BC_UPLOAD, BC_SETTLE,
- PAD_EDGE, ENG_PRESENT, SHADER_COMPILE, PIPELINE_CREATE) = range(1, 40)
-# The numbers mirror include/ps3emu/ps3_ftrace.h (PS3_FT_*, 32 to 39 included); the tool reads text
+ PAD_EDGE, ENG_PRESENT, SHADER_COMPILE, PIPELINE_CREATE, JQ2_WAKE) = range(1, 41)
+# The numbers mirror include/ps3emu/ps3_ftrace.h (PS3_FT_*, 32 to 40 included); the tool reads text
 # traces without the header, so a new kind is added in both places.
 # Labels are report keys that saved runs and scripts compare: keep them, append new reasons.
 AUDIO_PACE_REASON = {1: "queue full", 2: "clock pacing", 3: "backend wait", 4: "restart"}
@@ -1506,6 +1507,165 @@ def jq2_stats(xs):
     return {"count": len(s), "mean": sum(s) / len(s),
             "p50": nearest_rank(s, 50), "p95": nearest_rank(s, 95),
             "p99": nearest_rank(s, 99), "max": s[-1]}
+
+
+def jq2_wake_section(spans, header, energy=None):
+    """Worker parks, intake progress and CPU attribution; None when no wake span exists."""
+    idle_recs = [s for s in spans if s[0] == JQ2_IDLE]
+    wake_recs = [s for s in spans if s[0] == JQ2_WAKE]
+    job_recs = [s for s in spans if s[0] == JQ2_JOB]
+    if not idle_recs and not wake_recs:
+        return None
+
+    energy_by_q = collections.defaultdict(dict)
+    if energy is not None:
+        roles = energy.get("roles") if isinstance(energy, dict) else None
+        if not isinstance(roles, dict):
+            raise BadInput("energy JSON has no roles object")
+        for name, record in roles.items():
+            match = re.fullmatch(r"jq2 q(\d+) w(\d+)", name)
+            if match is None:
+                continue
+            cpu = record.get("cpu_ms_per_s") if isinstance(record, dict) else None
+            if isinstance(cpu, bool) or not isinstance(cpu, (int, float)) or not 0 <= cpu < float("inf"):
+                raise BadInput(f"energy JSON role {name!r} has invalid cpu_ms_per_s")
+            energy_by_q[int(match.group(1))][int(match.group(2))] = float(cpu)
+
+    by_q = collections.defaultdict(lambda: {"idle": [], "wake": [], "job": []})
+    for _, who, a, b, t0, t1 in idle_recs:
+        by_q[who >> 8]["idle"].append((who & 0xFF, a, t0, t1))
+    for _, who, a, b, t0, t1 in wake_recs:
+        by_q[who >> 8]["wake"].append((who & 0xFF, a, b, t0, t1))
+    for _, who, seq, cpu_us, t0, t1 in job_recs:
+        by_q[who >> 8]["job"].append((who & 0xFF, cpu_us, t0, t1))
+
+    header_range = header_window(header)
+    queues = []
+    for q in sorted(by_q):
+        idle, wakes, jobs = by_q[q]["idle"], by_q[q]["wake"], by_q[q]["job"]
+        if header_range is not None:
+            start, end = header_range
+            source = "header"
+        else:
+            times = [(r[2], r[3]) for r in idle]
+            times.extend((r[3], r[4]) for r in wakes)
+            times.extend((r[2], r[3]) for r in jobs)
+            start = min(t0 for t0, _ in times)
+            end = max(t1 for _, t1 in times)
+            source = "extent"
+        window_ms = end - start
+        window_s = window_ms / 1000.0
+        workers = collections.defaultdict(lambda: {
+            "jobs": 0, "job_cpu_us": 0, "idles": [], "wakes": [],
+            "spurious_wakes": 0, "active_cpu_us": 0})
+        for w, a, t0, t1 in idle:
+            workers[w]["idles"].append((a >> 24, t0, t1))
+        for w, a, cpu_us, t0, t1 in wakes:
+            row = workers[w]
+            reason = a >> 24
+            if reason != 0xFF:
+                row["active_cpu_us"] += cpu_us
+            if reason in (0xFE, 0xFF):
+                continue
+            row["wakes"].append((t1 - t0, reason))
+            if not (a & (1 << 16)) and reason != 5:
+                row["spurious_wakes"] += 1
+        for w, cpu_us, _, _ in jobs:
+            row = workers[w]
+            row["jobs"] += 1
+            row["job_cpu_us"] += cpu_us
+
+        energy_workers = energy_by_q.get(q, {})
+        worker_ids = sorted(set(workers) | set(energy_workers))
+        worker_rows = []
+        park_reasons = collections.Counter()
+        for row in workers.values():
+            park_reasons.update(reason for reason, _, _ in row["idles"])
+        job_count = len(jobs)
+        job_cpu_us = sum(cpu_us for _, cpu_us, _, _ in jobs)
+        job_cpu_ms_per_s = job_cpu_us / window_ms if window_ms > 0 else None
+        has_kind40 = bool(wakes)
+        for w in worker_ids:
+            row = workers[w]
+            n_jobs = row["jobs"]
+            n_parks = len(row["idles"])
+            active_wakes = len(row["wakes"])
+            reasons = collections.Counter(reason for reason, _, _ in row["idles"])
+            per_worker_job_cpu = row["job_cpu_us"] / window_ms if window_ms > 0 else None
+            active_cpu = row["active_cpu_us"] / window_ms if window_ms > 0 and wakes else None
+            energy_cpu = energy_workers.get(w)
+            thread_cpu = energy_cpu if energy_cpu is not None else active_cpu
+            cpu_source = "energy.json" if energy_cpu is not None else ("kind 40" if active_cpu is not None else None)
+            job_rate = n_jobs / window_s if window_s > 0 else None
+            worker_rows.append({
+                "w": w, "jobs": n_jobs, "jobs_per_s": job_rate,
+                "wake_intervals": active_wakes if has_kind40 else None,
+                "wake_intervals_per_job": active_wakes / n_jobs if has_kind40 and n_jobs else None,
+                "wakes": active_wakes if has_kind40 else n_parks,
+                "wakes_per_s": ((active_wakes if has_kind40 else n_parks) / window_s
+                                if window_s > 0 else None),
+                "wakes_per_job": ((active_wakes if has_kind40 else n_parks) / n_jobs if n_jobs else None),
+                "parks": n_parks, "parks_per_s": n_parks / window_s if window_s > 0 else None,
+                "parks_per_job": n_parks / n_jobs if n_jobs else None,
+                "park_reasons": [
+                    {"reason": reason, "name": JQ2_PARK_REASONS.get(reason, f"reason {reason}"),
+                     "count": count}
+                    for reason, count in sorted(reasons.items())],
+                "spurious_wakes": row["spurious_wakes"] if wakes else None,
+                "spurious_per_job": row["spurious_wakes"] / n_jobs if wakes and n_jobs else None,
+                "wake_to_repark_ms": jq2_stats([duration for duration, _ in row["wakes"]]) if wakes else None,
+                "active_cpu_ms_per_s": active_cpu,
+                "job_cpu_ms_per_s": per_worker_job_cpu,
+                "worker_cpu_ms_per_s": thread_cpu, "cpu_source": cpu_source,
+                "non_job_cpu_ms_per_s": (thread_cpu - per_worker_job_cpu
+                                          if thread_cpu is not None and per_worker_job_cpu is not None else None),
+                "job_cpu_share": (per_worker_job_cpu / thread_cpu
+                                  if thread_cpu is not None and thread_cpu > 0 and per_worker_job_cpu is not None
+                                  else None),
+                "worker_cpu_us_per_job": (thread_cpu * 1000.0 / job_rate
+                                          if thread_cpu is not None and job_rate else None),
+            })
+
+        parks = sum(len(row["idles"]) for row in workers.values())
+        jobs_per_s = job_count / window_s if window_s > 0 else None
+        wake_intervals = sum(len(row["wakes"]) for row in workers.values())
+        effective_wakes = wake_intervals if has_kind40 else parks
+        active_cpu_ms_per_s = sum(row["active_cpu_us"] for row in workers.values()) / window_ms \
+            if window_ms > 0 and has_kind40 else None
+        energy_complete = bool(worker_ids) and all(w in energy_workers for w in worker_ids)
+        worker_cpu_ms_per_s = (sum(energy_workers.values()) if energy_complete else active_cpu_ms_per_s)
+        cpu_source = "energy.json" if energy_complete else ("kind 40" if has_kind40 else None)
+        non_job_cpu_ms_per_s = (worker_cpu_ms_per_s - job_cpu_ms_per_s
+                                if worker_cpu_ms_per_s is not None and job_cpu_ms_per_s is not None else None)
+        queues.append({
+            "q": q, "window": {"start_ms": start, "end_ms": end, "ms": window_ms},
+            "window_source": source, "jobs": job_count, "jobs_per_s": jobs_per_s,
+            "wake_intervals": wake_intervals if has_kind40 else None,
+            "wake_intervals_per_job": wake_intervals / job_count if has_kind40 and job_count else None,
+            "wakes": effective_wakes, "wakes_per_s": effective_wakes / window_s if window_s > 0 else None,
+            "wakes_per_job": effective_wakes / job_count if job_count else None,
+            "parks": parks, "parks_per_s": parks / window_s if window_s > 0 else None,
+            "parks_per_job": parks / job_count if job_count else None,
+            "park_reasons": [
+                {"reason": reason, "name": JQ2_PARK_REASONS.get(reason, f"reason {reason}"),
+                 "count": count, "rate_per_s": count / window_s if window_s > 0 else None}
+                for reason, count in sorted(park_reasons.items())],
+            "spurious_wakes": (sum(row["spurious_wakes"] for row in workers.values()) if has_kind40 else None),
+            "wake_to_repark_ms": (jq2_stats([duration for row in workers.values()
+                                               for duration, _ in row["wakes"]]) if has_kind40 else None),
+            "active_cpu_ms_per_s": active_cpu_ms_per_s,
+            "job_cpu_ms_per_s": job_cpu_ms_per_s,
+            "worker_cpu_ms_per_s": worker_cpu_ms_per_s, "cpu_source": cpu_source,
+            "non_job_cpu_ms_per_s": non_job_cpu_ms_per_s,
+            "job_cpu_share": (job_cpu_ms_per_s / worker_cpu_ms_per_s
+                              if worker_cpu_ms_per_s is not None and worker_cpu_ms_per_s > 0 and
+                              job_cpu_ms_per_s is not None else None),
+            "worker_cpu_us_per_job": (worker_cpu_ms_per_s * 1000.0 / jobs_per_s
+                                      if worker_cpu_ms_per_s is not None and jobs_per_s else None),
+            "energy_workers": sum(1 for w in worker_ids if w in energy_workers),
+            "per_worker": worker_rows,
+        })
+    return {"queues": queues}
 
 
 def jq2_ranks(xs):
@@ -2842,6 +3002,59 @@ def print_jq2_section(jq):
     print_jq2_audio_stale(jq["audio_stale"])
     print_jq2_trace_cost(jq["trace_cost"])
 
+def print_jq2_wake_section(wake):
+    if wake is None:
+        return
+    print("\nJobQueue2 wake accounting (kind 26 IDLE; kind 40 adds progress and active CPU):")
+    for q in wake["queues"]:
+        if q["wake_intervals"] is None:
+            wake_counts = (f"{q['parks']} IDLE parks (legacy wake estimate; "
+                           f"{_jq2_ratio(q['parks_per_s'])}/s, {_jq2_ratio(q['parks_per_job'])}/job)")
+        else:
+            wake_counts = (f"{q['parks']} IDLE parks, {q['wake_intervals']} wake intervals "
+                           f"({_jq2_ratio(q['wakes_per_s'])}/s, "
+                           f"{_jq2_ratio(q['wake_intervals_per_job'])}/job)")
+        print(f"  queue {q['q']}: {q['jobs']} jobs ({_jq2_ratio(q['jobs_per_s'])}/s), {wake_counts}")
+        reasons = ", ".join(f"r{x['reason']} {x['name']} {x['count']}"
+                            for x in q["park_reasons"]) or "none"
+        print(f"    park reasons: {reasons}")
+        job_cpu = q["job_cpu_ms_per_s"]
+        job_cpu_text = "n/a" if job_cpu is None else f"{job_cpu:.1f}"
+        print(f"    JQ2_JOB CPU {job_cpu_text} ms/s")
+        if q["worker_cpu_ms_per_s"] is None:
+            print("    total worker CPU: n/a (need kind 40 or --energy-json)")
+        else:
+            non_job = q["non_job_cpu_ms_per_s"]
+            if non_job is None:
+                print(f"    total worker CPU {q['worker_cpu_ms_per_s']:.1f} ms/s ({q['cpu_source']})")
+            else:
+                print(f"    total worker CPU {q['worker_cpu_ms_per_s']:.1f} ms/s ({q['cpu_source']});"
+                      f" outside JQ2_JOB {non_job:.1f} ms/s")
+        if q["spurious_wakes"] is None:
+            print("    spurious wakes: n/a (kind 40 absent)")
+        else:
+            stat = q["wake_to_repark_ms"]
+            print(f"    spurious wakes {q['spurious_wakes']}; wake->repark mean {_jq2_ms(stat['mean'])} ms")
+        for row in q["per_worker"]:
+            reasons = ", ".join(f"r{x['reason']}={x['count']}" for x in row["park_reasons"]) or "none"
+            interval = row["wake_to_repark_ms"]
+            wake_latency = "n/a" if interval is None else _jq2_ms(interval["mean"])
+            wake_name = ("wake intervals" if row["wake_intervals"] is not None
+                         else "wake estimates from IDLE parks")
+            spurious = "n/a" if row["spurious_wakes"] is None else str(row["spurious_wakes"])
+            cpu = ""
+            if row["worker_cpu_ms_per_s"] is not None:
+                cpu = f", thread CPU {row['worker_cpu_ms_per_s']:.1f} ms/s"
+                job_cpu = row["job_cpu_ms_per_s"]
+                non_job = row["non_job_cpu_ms_per_s"]
+                if job_cpu is not None and non_job is not None:
+                    cpu += f", JQ2_JOB {job_cpu:.1f} ms/s, outside {non_job:.1f} ms/s"
+            print(f"    worker {row['w']}: {row['jobs']} jobs ({_jq2_ratio(row['jobs_per_s'])}/s),"
+                  f" {row['wakes']} {wake_name} ({_jq2_ratio(row['wakes_per_s'])}/s),"
+                  f" {row['parks']} parks ({_jq2_ratio(row['parks_per_s'])}/s), {reasons};"
+                  f" spurious {spurious}; wake->repark mean {wake_latency} ms{cpu}")
+
+
 
 def bc_upload_section(spans, flip_requests, dropped):
     """Kind 34: the uploads into emulated BC textures, per format and tier. None when the trace has none.
@@ -2997,7 +3210,7 @@ def shader_pipeline_section(spans, dropped):
             "stutter": {"count": len(candidates), "worst": candidates[:5]}}
 
 
-def build_report(header, names, spans, images, split=None, cad=(None, None), gap=20.0):
+def build_report(header, names, spans, images, split=None, cad=(None, None), gap=20.0, energy=None):
     """The summary dict `--json` prints (without --split/--cadence by default); BadInput when the
     trace has fewer than 3 flip requests. cad = (NID, TID or None); a None NID adds no cadence."""
     flips = [s[4] for s in spans if s[0] == FLIP_REQ]
@@ -3023,6 +3236,9 @@ def build_report(header, names, spans, images, split=None, cad=(None, None), gap
     report.update(drawable_label_sections(spans, len(flips), header_dropped(header)))
     report["audio"] = audio_section(spans, header_dropped(header), name_of)
     report["jq2"] = jq2_section(spans, header, names, images)
+    wake = jq2_wake_section(spans, header, energy)
+    if wake is not None:
+        report["jq2_wake"] = wake
     report["audio_ring"] = audio_ring_section(spans, header, names)
     bc = bc_upload_section(spans, len(flips), header_dropped(header))
     if bc is not None:   # absent, not null, so a trace without kind 34 reports exactly what it did before
@@ -3125,6 +3341,7 @@ def main():
     ap.add_argument("--cadence", metavar="NID[@TID]", help="gaps between calls of one import (hex NID)")
     ap.add_argument("--gap", type=float, default=20.0, metavar="MS", help="cadence gap threshold (default 20)")
     ap.add_argument("--json", action="store_true", help="summary as JSON, no timelines")
+    ap.add_argument("--energy-json", metavar="PATH", help="per-thread CPU rates from proc_energy.py for JQ2 queues")
     args = ap.parse_args()
     cad_nid = cad_tid = None
     if args.cadence:
@@ -3137,7 +3354,14 @@ def main():
 
     try:
         header, names, spans, images = load(args.trace)
-        report = build_report(header, names, spans, images, args.split, (cad_nid, cad_tid), args.gap)
+        energy = None
+        if args.energy_json:
+            try:
+                with open(args.energy_json, encoding="utf-8") as stream:
+                    energy = json.load(stream)
+            except (OSError, UnicodeError, json.JSONDecodeError) as e:
+                raise BadInput(f"cannot read energy JSON: {e}")
+        report = build_report(header, names, spans, images, args.split, (cad_nid, cad_tid), args.gap, energy)
     except BadInput as e:
         print(f"ftrace_report: {e}", file=sys.stderr)
         sys.exit(2)
@@ -3162,6 +3386,7 @@ def main():
     print_drawable_label(report)
     print_audio_section(report["audio"])
     print_jq2_section(report["jq2"])
+    print_jq2_wake_section(report.get("jq2_wake"))
     print_audio_ring_section(report["audio_ring"])
     print_bc_upload_section(report.get("bc_upload"))
     print_bc_settle_section(report.get("bc_settle"))

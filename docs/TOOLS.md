@@ -1117,7 +1117,23 @@ has no gaps and no candidates. `--json` adds the top-level key `shader_pipeline`
 `stutter`, `dropped`) only to a trace that has a kind 38 or 39. Both kinds are emitted unconditionally and cost the
 span API's one load when `PS3_FTRACE` is unset.
 
-Kinds 30-39 are recorded whatever `PS3_FTRACE_MIN_US` says. Exit `0` on a
+**JobQueue2 worker wake accounting** (kind 26 `JQ2_IDLE`, kind 40 `JQ2_WAKE`).
+Kind 26 records each parked interval: `who` is `q << 8 | worker`, `a` carries the
+park reason in its top byte, and the span ends at wake. The `jq2_wake` section
+reports IDLE parks and reason counts separately from kind-40 wake intervals;
+without kind 40, it labels the IDLE count as a legacy wake estimate. Rates and
+wakes/job use the trace header's window. Kind 23 `JQ2_JOB` supplies body CPU.
+Kind 40 records the active interval from wake to re-park: `a` has jobs run in
+bits 0-15, intake progress in bit 16, and the next park reason in bits 24-31;
+`0xFE` marks startup and `0xFF` exit. Its `b` is thread CPU in microseconds.
+With kind 40 the report distinguishes non-paused no-progress spurious wakes and
+wake-to-repark durations. `--energy-json PATH` joins `proc_energy.py`'s
+`roles["jq2 qN wN"].cpu_ms_per_s` values by queue and worker, so older traces
+without kind 40 still report total thread CPU and CPU outside kind 23. Without
+kind 40 or an energy file, total worker CPU is unavailable. `--json` adds the
+top-level `jq2_wake` key when kind 26 or 40 is present.
+
+Kinds 30-40 are recorded whatever `PS3_FTRACE_MIN_US` says. Exit `0` on a
 report, `2` on an unreadable, truncated, corrupt or malformed trace, a zstd
 trace with no decoder, bad arguments or fewer than three flip requests.
 

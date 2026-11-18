@@ -680,6 +680,75 @@ How a body ended is one shared classification (`spu_job_classify_end`,
 `ExecutorHooks::on_end` receives it with the finished context for every end,
 before the policy above stops the process for all but `return`.
 
+**Worker wake policy.** Worker state, scheduling state and per-worker
+generations are read or changed under `mu_`. Before waiting, a worker publishes
+its observed generation under that lock; the condition-variable predicate is
+`worker_gen_[w] != seen`. A successful ring write calls `Queue::kick` after the
+ring write lock is released. While not paused, it advances one settled worker's
+generation only for an unbarred JOB/COPY tag or a SYNC with a fresh tag. The
+generation is sticky if the push wins the lock before wait registration. A
+paused push or a JOB/COPY held by a barrier cannot make intake progress and
+does not wake an idle worker.
+
+A worker that dispatches a job stays active through `run_job` and its next
+intake pass. `running_` increments on dispatch; the worker itself frees its
+per-instance slot on completion and immediately checks the ring again. Thus a
+`PassEnd::no_free_slot` result belongs to a worker that still owns its slot; no
+other instance can free it. Completion also releases a COPY pool block while
+the worker is active. Pool waiters are signalled by the pool, and a producer
+that then writes a ring entry uses the normal `Queue::kick` path. Full-ring
+thread pushers use the separate room generation/condition variable; room fibers
+are signalled after intake, not through worker generations.
+
+`entries_retained` covers JOB/COPY tags barred by SYNC and SYNC entries whose
+mask is already barred. Only job completion can satisfy and clear that barrier;
+the completing worker scans the current ring phase and out-of-order marks, then
+wakes only enough parked workers for released-tag jobs beyond active workers'
+next passes. This is the `r3 held` path; it is not a non-barrier pool or slot
+wait.
+
+Pause/resume changes `paused_` under `mu_` and broadcasts because it changes
+whether every worker runs an intake pass. Paused pushes do not wake workers;
+resume does. Shutdown broadcasts when `stopping_` changes. A blocking observer,
+admission hook or job body runs outside `mu_` while its worker remains counted
+in `running_`. When a completion makes
+`stopping_ && running_ == 0 && outstanding == 0` true, the worker broadcasts
+before exiting: otherwise a sibling awakened earlier by Shutdown could have
+re-parked while `running_ != 0` and sleep past the last completion. Every worker
+must recheck the terminal predicate before it can exit.
+
+Therefore a newly runnable entry is covered by its push's sticky signal, an
+already-active worker's next pass, or the released-tag scan. Every state change
+that can make the shutdown predicate true is covered by the terminal broadcast;
+no runnable entry or exit condition can be left with all workers parked and no
+generation pending. Ring order, scheduler admission, port credits and guest
+fiber timing are unchanged. `QueueView::settled` remains per-worker.
+
+**Wake measurement.** `PS3_FT_JQ2_WAKE` (kind 40) spans each worker's active
+interval from a condition-variable wake to its next park. Its payload records
+jobs run, whether any ring entry was consumed, the next park reason and the
+worker's thread CPU time. Startup is marked separately; Shutdown's exit
+interval is excluded from wake counts and active-CPU totals. The report joins
+kind 23 `JQ2_JOB` CPU time to that total, so empty wake passes and job execution
+are distinguished in real `PS3_FTRACE` traces.
+
+`wake_bench` runs 120 frame groups at 60 Hz. q0 has 37 tag-0 jobs in a burst:
+a 1 ms gate job, a tag-0 SYNC, then held jobs (2220 nominal jobs/s, 5 workers).
+q1 has 12 short 50 µs jobs spaced through each frame group (720 jobs/s, 8
+workers). The table is the median of three invocations with broadcast wakeups
+and three with the per-worker notification policy:
+
+| queue/workers | nominal jobs/s | wakes/job before → after | spurious wakes before → after | held re-parks before → after | worker CPU µs/job before → after | kind-23 CPU µs/job before → after |
+|---|---:|---:|---:|---:|---:|---:|
+| q0 / 5 | 2220 | 1.865 → 0.220 | 7562 → 261 | 6364 → 375 | 106.98 → 100.91 | 91.46 → 93.69 |
+| q1 / 8 | 720 | 14.713 → 1.000 | 19752 → 0 | 0 → 0 | 108.63 → 76.72 | 75.87 → 70.98 |
+
+The non-kind-23 remainder fell from 15.52 to 7.22 µs/job on q0 and 32.76 to
+5.74 µs/job on q1. For older traces without kind 40, the
+`ftrace_report.py --energy-json` option joins per-thread CPU by the `jq2 qN wN`
+thread names; it still uses the ftrace header window for rates. Title-backed
+traces stay in the private recon repository.
+
 **Which body runs (`spu.job_body`).** `interp` (the default) runs the
 interpreter and never a registered body. `lifted` runs a registered body only
 for a **promoted** image (`spu_workload_promote_img`; the generated registration

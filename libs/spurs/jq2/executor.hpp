@@ -142,6 +142,11 @@ struct ExecutorHooks {
     void (*on_end)(void* user, const JobStart&, const ::spu_context* ctx, const ::spu_job_end& end) = nullptr;
     /* A job returned; nothing has been credited or released yet. */
     void (*on_done)(void* user, const JobStart&) = nullptr;
+    /* A job has been credited; runs before the worker reacquires the queue
+     * lock. Test seam for the credit/shutdown race (Port2Sync can return and
+     * Shutdown can run in this window). Null in production, where the cost is
+     * one null test per job. */
+    void (*after_credit)(void* user, const JobStart&) = nullptr;
     /* A push (job, copy or sync) has passed its checks and is about to take the
      * port-line update and the ring write; it runs on the pushing thread with no
      * queue or line lock held. A test seam: it lets a test hold a push at exactly
@@ -193,7 +198,7 @@ struct QueueView {
     RingIndices indices;
     unsigned outstanding = 0;
     unsigned running = 0;                           /* jobs admitted and not yet completed */
-    unsigned settled = 0;                           /* workers parked on the current generation: parked until a push, completion, pause change or Shutdown */
+    unsigned settled = 0;                           /* parked workers with no per-worker wake pending */
     std::uint16_t barred = 0;                       /* per-tag barrier set */
     std::array<unsigned, kTagCount> inflight{};     /* admitted and not yet completed, per tag */
     std::vector<std::uint16_t> out_of_order;        /* ring indices carrying the mark */

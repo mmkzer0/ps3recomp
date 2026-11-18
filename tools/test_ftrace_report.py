@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ftrace_report: frame binning, import call sites, split, cadence, drawables, label-store waits, jq2 job queues, image identity and critical path, audio ring, bad input."""
+"""ftrace_report: frame binning, imports, jq2 jobs/wakes and CPU, image identity, audio rings, zstd, bad input."""
 import contextlib
 import hashlib
 import io
@@ -710,8 +710,10 @@ with tempfile.TemporaryDirectory() as tmp:
 
     # A trace without kinds 27/28 keeps the old section and says the decomposition needs them.
     rc, out, err = run(tmp, jq2_trace(jq2))
-    check(rc == 0 and "held/admissible decomposition needs kinds 27-28" in out and "park reason" not in out,
-          "jq2 legacy text: one note line, no decomposition rows")
+    check(rc == 0 and "held/admissible decomposition needs kinds 27-28" in out and
+          "park reason  " not in out and "ready wait split:" not in out and
+          "JobQueue2 wake accounting" in out and "park reasons:" in out,
+          "jq2 legacy text: decomposition stays absent while kind-26 wake data is reported")
     rc, out, err = run(tmp, jq2_trace(jq2), "--json")
     legacy = json.loads(out)["jq2"]["queues"][0]
     check(legacy["decomposition_available"] is False and legacy["latency_decomposition"] is None and
@@ -2003,6 +2005,102 @@ with tempfile.TemporaryDirectory() as tmp:
     check(rc == 0 and "shader_pipeline" not in json.loads(out), "shader pipeline: absent without kinds 38-39")
     rc, out, err = run(tmp, trace(shlines[:4]))
     check(rc == 0 and "Shader and pipeline creation" not in out, "shader pipeline: no section without the kinds")
+
+
+# Kinds 26/40 and 23: parks provide baseline wake rates/reasons; kind 40 adds
+# exact intake progress and active CPU, while --energy-json supplies total CPU
+# for older traces that predate kind 40.
+def wake(q, w, jobs, progress, reason, cpu_us, t0, t1):
+    a = jobs | (int(progress) << 16) | (reason << 24)
+    return span(fr.JQ2_WAKE, qword(q, w), a, cpu_us, t0, t1)
+
+
+wake_lines = [span(FLIP_REQ, 1, 0, 0, t, t) for t in (0, 50, 100)]
+idles = [span(JQ2_IDLE, qword(0, 0), 1 << 24, 0, 0, 1),
+         span(JQ2_IDLE, qword(0, 0), 1 << 24, 0, 10, 11),
+         span(JQ2_IDLE, qword(0, 0), 1 << 24, 0, 20, 21),
+         span(JQ2_IDLE, qword(0, 0), 5 << 24, 0, 30, 31),
+         span(JQ2_IDLE, qword(0, 0), 1 << 24, 0, 40, 41),
+         span(JQ2_IDLE, qword(0, 1), 1 << 24, 0, 5, 6),
+         span(JQ2_IDLE, qword(0, 1), 3 << 24, 0, 8, 9)]
+jobs = [span(JQ2_JOB, qword(0, 0), 1, 1200, 1, 1.2),
+        span(JQ2_JOB, qword(0, 0), 2, 800, 2, 2.2),
+        span(JQ2_JOB, qword(0, 1), 3, 500, 5, 5.3)]
+wake_lines += idles + [
+    wake(0, 0, 0, False, 0xFE, 500, 0, 0.1),       # startup
+    wake(0, 0, 1, True, 1, 2000, 1, 1.1),          # job
+    wake(0, 0, 0, False, 1, 1000, 10, 10.2),       # empty/spurious
+    wake(0, 0, 0, True, 1, 500, 20, 20.1),         # consumed SYNC
+    wake(0, 0, 0, False, 5, 1000, 30, 30.2),       # pause, not spurious
+    wake(0, 0, 0, False, 0xFF, 100, 40, 40.1),      # exit
+    wake(0, 1, 1, True, 1, 1000, 5, 5.3),          # job
+    wake(0, 1, 0, False, 3, 200, 8, 8.1),           # held/spurious
+] + jobs
+WAKE_HEADER = "# ps3_ftrace start_us=0 end_us=100000 spans=0 dropped=0"
+with tempfile.TemporaryDirectory() as tmp:
+    rc, out, err = run(tmp, jq2_trace(wake_lines, header=WAKE_HEADER), "--json")
+    check(rc == 0, f"jq2 wake: exit 0: {err}")
+    r = json.loads(out)
+    q = r["jq2_wake"]["queues"][0]
+    w = {row["w"]: row for row in q["per_worker"]}
+    check(fr.JQ2_WAKE == 40 and q["window"]["ms"] == 100 and q["window_source"] == "header",
+          "jq2 wake: kind 40 and the trace window")
+    check(q["jobs"] == 3 and q["parks"] == 7 and q["wake_intervals"] == 6 and
+          q["spurious_wakes"] == 2 and close(q["parks_per_job"], 7 / 3) and
+          close(q["wake_intervals_per_job"], 2) and close(q["parks_per_s"], 70),
+          f"jq2 wake: aggregate parks and active wakes {q}")
+    check(q["park_reasons"] == [
+              {"reason": 1, "name": "empty", "count": 5, "rate_per_s": 50},
+              {"reason": 3, "name": "held", "count": 1, "rate_per_s": 10},
+              {"reason": 5, "name": "paused", "count": 1, "rate_per_s": 10}],
+          f"jq2 wake: park reason counts {q['park_reasons']}")
+    check(close(q["active_cpu_ms_per_s"], 62) and close(q["job_cpu_ms_per_s"], 25) and
+          close(q["non_job_cpu_ms_per_s"], 37) and close(q["job_cpu_share"], 25 / 62) and
+          close(q["worker_cpu_us_per_job"], 62 * 1000 / 30),
+          f"jq2 wake: total vs kind-23 CPU {q}")
+    check(w[0]["parks"] == 5 and w[0]["wake_intervals"] == 4 and w[0]["spurious_wakes"] == 1 and
+          close(w[0]["wake_to_repark_ms"]["mean"], 0.15) and
+          close(w[0]["active_cpu_ms_per_s"], 50) and close(w[0]["job_cpu_ms_per_s"], 20),
+          f"jq2 wake: worker 0 details {w.get(0)}")
+    check(w[1]["parks"] == 2 and w[1]["wake_intervals"] == 2 and w[1]["spurious_wakes"] == 1 and
+          close(w[1]["active_cpu_ms_per_s"], 12) and close(w[1]["job_cpu_ms_per_s"], 5),
+          f"jq2 wake: worker 1 details {w.get(1)}")
+    rc, out, err = run(tmp, jq2_trace(wake_lines, header=WAKE_HEADER))
+    check(rc == 0 and "JobQueue2 wake accounting (kind 26 IDLE; kind 40 adds progress" in out and
+          "3 jobs (30.00/s), 7 IDLE parks, 6 wake intervals (60.00/s, 2.00/job)" in out and
+          "park reasons: r1 empty 5, r3 held 1, r5 paused 1" in out and
+          "outside JQ2_JOB 37.0 ms/s" in out and
+          "worker 0: 2 jobs (20.00/s), 4 wake intervals (40.00/s)" in out and
+          "spurious 1; wake->repark mean 0.15 ms" in out and
+          "thread CPU 50.0 ms/s, JQ2_JOB 20.0 ms/s, outside 30.0 ms/s" in out,
+          "jq2 wake: text parks, reasons, per-worker wake timing and CPU")
+
+    energy_path = Path(tmp) / "energy.json"
+    energy_path.write_text(json.dumps({
+        "wall_s": 0.1,
+        "roles": {"jq2 q0 w0": {"threads": 1, "cpu_ms_per_s": 50},
+                  "jq2 q0 w1": {"threads": 1, "cpu_ms_per_s": 12}},
+    }))
+    old_trace = jq2_trace([*wake_lines[:3], *idles, *jobs], header=WAKE_HEADER)
+    rc, out, err = run(tmp, old_trace, "--json", "--energy-json", str(energy_path))
+    check(rc == 0, f"jq2 wake energy: exit 0: {err}")
+    old = json.loads(out)["jq2_wake"]["queues"][0]
+    check(old["parks"] == 7 and old["jobs"] == 3 and old["spurious_wakes"] is None and
+          old["wake_to_repark_ms"] is None and close(old["parks_per_s"], 70) and
+          close(old["worker_cpu_ms_per_s"], 62) and old["cpu_source"] == "energy.json" and
+          close(old["job_cpu_ms_per_s"], 25) and close(old["non_job_cpu_ms_per_s"], 37) and
+          old["energy_workers"] == 2,
+          f"jq2 wake energy: legacy kinds 23/26 plus per-thread CPU {old}")
+    rc, out, err = run(tmp, old_trace, "--energy-json", str(energy_path))
+    check(rc == 0 and "worker CPU 62.0 ms/s (energy.json)" in out and
+          "7 IDLE parks (legacy wake estimate; 70.00/s, 2.33/job)" in out and
+          "JobQueue2 wake accounting" in out,
+          "jq2 wake energy: text report labels legacy parks and total thread CPU")
+
+    rc, out, err = run(tmp, trace([span(FLIP_REQ, 1, 0, 0, t, t) for t in (0, 50, 100)]), "--json")
+    check(rc == 0 and "jq2_wake" not in json.loads(out),
+          "jq2 wake: optional section stays absent without kind 26 or 40")
+
 
 print("ftrace_report: %s" % ("ok" if not failures else "%d failed" % failures))
 sys.exit(1 if failures else 0)
