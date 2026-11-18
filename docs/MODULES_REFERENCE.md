@@ -373,6 +373,7 @@ port settings as in the recording. The other pad calls (`cellPadSetActDirect`, `
 
 **Backends:**
 - **Windows**: WASAPI (Windows Audio Session API) — low-latency exclusive mode
+- **iOS**: CoreAudio RemoteIO behind an AVAudioSession (`libs/audio/audio_coreaudio.m`), see below
 - **Cross-platform**: SDL2 Audio
 
 **Implementation:**
@@ -391,6 +392,52 @@ port settings as in the recording. The other pad calls (`cellPadSetActDirect`, `
 - `cellAudioSetNotifyEventQueue(queue)` — notify when a block is consumed
 - `cellAudioPortClose(port)` — close port
 - `cellAudioQuit()` — stop mixing thread, release audio device
+
+#### cellAudio on iOS
+
+`libs/audio/audio_coreaudio.m` (Objective-C, ARC; AudioToolbox and AVFAudio) is selected by `TARGET_OS_IPHONE`;
+`PS3RECOMP_AUDIO_USE_SDL2` still takes precedence. SDL is not used on iOS.
+
+| | |
+|---|---|
+| Session | `AVAudioSessionCategorySoloAmbient`: it honours the silent switch (an iPad without one has it in Control Center, so a silent test session is checked there first), mutes other apps' audio, and plays nothing in the background. |
+| Unit | RemoteIO with a render callback. The stream format on the input scope of bus 0 is 48 kHz, float32, interleaved stereo; the unit converts to the hardware rate. |
+| IO buffer | Requested at 256 frames (`setPreferredIOBufferDuration` 256/48000 s, one guest period, 5.333 ms); the system decides, and the granted value is logged, not assumed. |
+| Ring | `libs/audio/audio_ring.h`: a lock-free single-producer single-consumer ring of 4096 stereo frames (16 blocks). The render callback only reads it, without locks, allocation or Objective-C messaging; a read that finds too little is zero-filled (silence) and counted, a write that does not fit is dropped and counted. |
+
+**The clock.** The mix thread's monotonic clock leads: one block per guest period (`audio_pace.h`, unchanged). The
+ring's fill is the queue the pacer reads (`audio_backend_queued_samples`), so it guards only against the drift
+between the device's clock and the host's: below 2 blocks the mixer mixes now and restarts the cadence, at 6
+or more it skips the period. The ring holds the 6-block mark plus one IO buffer of up to 1024 frames.
+
+**Logging.** On open, on every restart and on every route change one line reports the granted `sampleRate`, the
+granted `IOBufferDuration` in milliseconds and frames, `outputLatency` and the output port type(s); a restart
+and an interruption have their own lines. A granted IO buffer above 1024 frames also logs a warning (below).
+`AUDIO_RATE=1` adds an `[audio-rate] ios` line every 5 s with the ring's underruns (events and frames), dropped
+frames, frames held back while inactive, starts and interruptions. With `PS3_FTRACE`, kind 20 marks a mix that
+found the queue below one block and kind 19 with the catch-up subkind a restart of the cadence.
+
+**Interruptions and the app lifecycle.** The notification observers (interruption began and ended, media
+services reset, app became active, route change) only set a request flag and log. The mix thread, the ring's
+producer, carries the request out, because only the consumer may advance the ring's read index and so the ring
+may be reset only while the unit is stopped:
+
+- *Interruption began* (a call, Siri, an alarm): the unit is stopped and the backend reports no device. While it is
+  inactive every block is dropped instead of queued, so no stale audio plays on return, and the mixer paces on the
+  clock alone, as with no device at all.
+- *Interruption ended*: the ring is reset, the session reactivated and the unit started. A start that fails (a call
+  still holds the session) is retried once a second.
+- *App became active*: the same restart, but only when the output is down (iOS does not promise an
+  interruption-ended). The notification also fires at launch and after Control Center or a banner took the focus
+  without an interruption; a running unit is left alone there, so its queued audio is not dropped.
+- *Media services reset*: the unit is disposed and rebuilt, the session configured again.
+
+**Bluetooth.** Not handled. A2DP adds well over 100 ms of output latency (`outputLatency` is logged), and the route
+may grant an IO buffer above 1024 frames. `audio_pace.h`'s fixed thresholds absorb at most 1024 frames: a model
+of the pacer against a consumer pulling one IO buffer per period gives 187.6 blocks/s and no underruns at 256, 512
+and 1024 frames, and 140.7 blocks/s with 468 restarts and 468 underruns at 2048 (the guest's audio clock 25 %
+slow). The warning above is the only reaction; scaling the thresholds and the ring to the granted buffer on a
+route change is deferred.
 
 ### cellVoice
 

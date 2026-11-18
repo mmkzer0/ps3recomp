@@ -7,6 +7,7 @@
  *
  * Backend selection:
  *   - Windows default: WASAPI (via mmdeviceapi)
+ *   - iOS: CoreAudio RemoteIO (libs/audio/audio_coreaudio.m)
  *   - Everywhere else / if PS3RECOMP_AUDIO_USE_SDL2 defined: SDL2 audio
  *
  * Define PS3RECOMP_AUDIO_USE_SDL2 to force SDL2 backend on Windows.
@@ -37,18 +38,26 @@
  * -----------------------------------------------------------------------*/
 
 #if defined(PS3RECOMP_AUDIO_USE_SDL2)
-  #define AUDIO_BACKEND_SDL2    1
-  #define AUDIO_BACKEND_WASAPI  0
+  #define AUDIO_BACKEND_SDL2       1
+  #define AUDIO_BACKEND_WASAPI     0
+  #define AUDIO_BACKEND_COREAUDIO  0
 #elif TARGET_OS_IPHONE
-  /* No host output: the POSIX mix loop supplies the audio-period clock. */
-  #define AUDIO_BACKEND_SDL2    0
-  #define AUDIO_BACKEND_WASAPI  0
+  /* RemoteIO drains a ring on the device's clock; the POSIX mix loop still supplies the audio-period clock. */
+  #define AUDIO_BACKEND_SDL2       0
+  #define AUDIO_BACKEND_WASAPI     0
+  #define AUDIO_BACKEND_COREAUDIO  1
 #elif defined(_WIN32)
-  #define AUDIO_BACKEND_SDL2    0
-  #define AUDIO_BACKEND_WASAPI  1
+  #define AUDIO_BACKEND_SDL2       0
+  #define AUDIO_BACKEND_WASAPI     1
+  #define AUDIO_BACKEND_COREAUDIO  0
 #else
-  #define AUDIO_BACKEND_SDL2    1
-  #define AUDIO_BACKEND_WASAPI  0
+  #define AUDIO_BACKEND_SDL2       1
+  #define AUDIO_BACKEND_WASAPI     0
+  #define AUDIO_BACKEND_COREAUDIO  0
+#endif
+
+#if AUDIO_BACKEND_COREAUDIO
+  #include "audio_host_ios.h"
 #endif
 
 #if AUDIO_BACKEND_WASAPI
@@ -232,6 +241,37 @@ static u32 audio_backend_queued_samples(void)
 }
 
 #endif /* AUDIO_BACKEND_SDL2 */
+
+#if AUDIO_BACKEND_COREAUDIO
+
+/* CoreAudio RemoteIO behind a ring (audio_coreaudio.m). The mix thread's clock leads; the ring's fill is the
+ * queue audio_pace.h reads. open runs on the cellAudioInit thread before the mix thread exists; every other
+ * call is the mix thread's. */
+static int audio_backend_init(void)
+{
+    if (audio_ios_open() != 0) {
+        printf("[cellAudio] iOS audio output failed to start\n");
+        return -1;
+    }
+    return 0;
+}
+
+static void audio_backend_shutdown(void)
+{
+    audio_ios_close();
+}
+
+static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
+{
+    audio_ios_submit(stereo_samples, num_samples);
+}
+
+static u32 audio_backend_queued_samples(void)
+{
+    return audio_ios_queued_frames();
+}
+
+#endif /* AUDIO_BACKEND_COREAUDIO */
 
 #if AUDIO_BACKEND_WASAPI
 
@@ -520,12 +560,14 @@ static inline int audio_backend_has_device(void)
     return s_sdl_audio_dev != 0;
 #elif AUDIO_BACKEND_WASAPI
     return s_wasapi_client != NULL;
+#elif AUDIO_BACKEND_COREAUDIO
+    return audio_ios_active();
 #else
     return 0;
 #endif
 }
 
-#if !AUDIO_BACKEND_SDL2 && !AUDIO_BACKEND_WASAPI
+#if !AUDIO_BACKEND_SDL2 && !AUDIO_BACKEND_WASAPI && !AUDIO_BACKEND_COREAUDIO
 /* No host output is requested; the mixer still delivers clock-paced events. */
 static int audio_backend_init(void)
 {
@@ -926,6 +968,11 @@ static void* audio_mix_thread_func(void* arg)
     audio_pace_init(&pacer, now_ns);
 
     while (s_mix_thread_running) {
+#if AUDIO_BACKEND_COREAUDIO
+        /* Interruption, app-active and media-services requests are carried out here, on the ring's producer, while
+         * the unit is stopped; the observers only record them. Before the clock read: a restart takes milliseconds. */
+        audio_ios_service();
+#endif
         clock_gettime(CLOCK_MONOTONIC, &clock);
         now_ns = (uint64_t)clock.tv_sec * ns_per_second + (uint64_t)clock.tv_nsec;
 
@@ -1003,6 +1050,10 @@ static void* audio_mix_thread_func(void* arg)
             else
                 fprintf(stderr, "[audio-rate] %.1f blocks/s (real time 187.5), device queue %u samples\n",
                         rate_blocks * (double)ns_per_second / (now_ns - rate_start_ns), depth_after);
+#if AUDIO_BACKEND_COREAUDIO
+            { char ring_note[192]; audio_ios_rate_note(ring_note, sizeof ring_note);
+              fprintf(stderr, "[audio-rate] ios %s\n", ring_note); }
+#endif
             rate_start_ns = now_ns;
             rate_blocks = 0;
         }

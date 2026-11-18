@@ -257,6 +257,7 @@ Note: Windows `Sleep()` has millisecond granularity. For sub-millisecond sleeps,
 | Windows | WASAPI | SDL2 |
 | Linux | SDL2 | PulseAudio (potential future) |
 | macOS | SDL2 | CoreAudio (potential future) |
+| iOS | CoreAudio RemoteIO (`libs/audio/audio_coreaudio.m`) | none: no SDL on iOS; see "cellAudio on iOS" in [`MODULES_REFERENCE.md`](MODULES_REFERENCE.md) |
 
 ### WASAPI (Windows)
 
