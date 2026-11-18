@@ -2195,6 +2195,14 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME test_audio_ring_spsc COMMAND test_audio_ring_spsc)
         set_tests_properties(test_audio_ring_spsc PROPERTIES LABELS "audio;t0;tsan" TIMEOUT 120)
 
+        # The RSX texture layout, decode and component remap (libs/video/rsx_texture_layout.c): pure C, no backend.
+        # Its regression net (crossbar field order, lane tables, the D-format alpha rule) never ran in CTest.
+        add_executable(test_texture_layout libs/video/tests/test_texture_layout.c libs/video/rsx_texture_layout.c)
+        target_include_directories(test_texture_layout PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
+        add_test(NAME test_texture_layout COMMAND test_texture_layout)
+        set_tests_properties(test_texture_layout PROPERTIES LABELS "video;t0" TIMEOUT 60)
+
         # cellPad's iOS GameController profile -> PadHostState mapping: pure C,
         # so it builds and runs on every host without the framework.
         ps3recomp_add_hle_check_test(test_pad_gc_map
