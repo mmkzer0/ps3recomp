@@ -6,13 +6,16 @@
  * Backend selection:
  *   - Windows default: XInput, loaded at run time from System32 (XInput1_4.dll,
  *     XInput1_3.dll, XInput9_1_0.dll); no XInput DLL means no pads
+ *   - iOS: the GameController framework (pad_gc.m), one serial queue for
+ *     connect/disconnect/value reports; no SDL there
  *   - Everywhere else / if PS3RECOMP_PAD_USE_SDL2 is defined: SDL2 GameController
  *
- * Define PS3RECOMP_PAD_USE_SDL2 to force SDL2 backend on Windows.
+ * Define PS3RECOMP_PAD_USE_SDL2 to force SDL2 backend on Windows (and on iOS).
  */
 
 #include <time.h>
 #include "cellPad.h"
+#include "pad_host_state.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,15 +50,19 @@ static double pad_clock(unsigned long long t0_ms)
 #if defined(PS3RECOMP_PAD_USE_SDL2)
   #define PAD_BACKEND_SDL2  1
   #define PAD_BACKEND_XINPUT 0
+  #define PAD_BACKEND_GC    0
 #elif TARGET_OS_IPHONE
   #define PAD_BACKEND_SDL2  0
   #define PAD_BACKEND_XINPUT 0
+  #define PAD_BACKEND_GC    1
 #elif defined(_WIN32)
   #define PAD_BACKEND_SDL2  0
   #define PAD_BACKEND_XINPUT 1
+  #define PAD_BACKEND_GC    0
 #else
   #define PAD_BACKEND_SDL2  1
   #define PAD_BACKEND_XINPUT 0
+  #define PAD_BACKEND_GC    0
 #endif
 
 #if PAD_BACKEND_XINPUT
@@ -74,33 +81,15 @@ static double pad_clock(unsigned long long t0_ms)
   #include <SDL2/SDL.h>
 #endif
 
+#if PAD_BACKEND_GC
+  #include "pad_gc.h"
+#endif
+
 /* ---------------------------------------------------------------------------
  * Internal state
  * -----------------------------------------------------------------------*/
 
 #define PAD_MAX_HOST_PORTS  4  /* XInput supports max 4; SDL may support more */
-
-typedef struct {
-    int  connected;
-    u16  buttons;           /* CELL_PAD_CTRL_* bitmask */
-    u8   analog_lx;         /* 0-255, center=128 */
-    u8   analog_ly;
-    u8   analog_rx;
-    u8   analog_ry;
-    u8   trigger_l2;        /* 0-255 */
-    u8   trigger_r2;        /* 0-255 */
-    /* Pressure-sensitive face buttons (0-255) */
-    u8   press_right;
-    u8   press_left;
-    u8   press_up;
-    u8   press_down;
-    u8   press_triangle;
-    u8   press_circle;
-    u8   press_cross;
-    u8   press_square;
-    u8   press_l1;
-    u8   press_r1;
-} PadHostState;
 
 static int           s_pad_initialized = 0;
 static u32           s_max_connect = 0;
@@ -352,9 +341,9 @@ static void pad_rumble_levels(u8 small_on, u8 large, u16* lo, u16* hi)
  * practice the window of the video backend). PS3RECOMP_PAD_KEYBOARD_SDL selects
  * the SDL source on macOS too, which is how the keyboard test is built. */
 #if TARGET_OS_IPHONE
-/* iOS has no host input in the PoC (pad_init_backend below): no keyboard source
- * either, and CGEventSourceKeyState and NSApplication do not exist there. The pad
- * stays the neutral virtual one it was before the keyboard fallback came in. */
+/* iOS has no keyboard fallback: CGEventSourceKeyState and NSApplication do not
+ * exist there, and a touch keyboard is not a pad. Controller input comes from
+ * pad_gc.m; with no controller the port stays the neutral virtual pad. */
 static void pad_poll_keyboard(void) {}
 #elif PAD_BACKEND_XINPUT
 static int pad_host_window_focused(void)
@@ -908,15 +897,25 @@ static void pad_shutdown_backend(void)
 
 #endif /* PAD_BACKEND_SDL2 */
 
-#if TARGET_OS_IPHONE
-/* Input is not part of the iOS PoC; cellPad's existing virtual pad remains
- * neutral so guest reads still follow the library contract. */
-static void pad_init_backend(void)
+#if PAD_BACKEND_GC
+/* GameController on iOS. pad_gc.m owns the controllers, its serial queue and
+ * the per-port snapshot; this file only reads that snapshot on the poll thread
+ * and maps it. A port with no bound controller is released and centred, the
+ * invariant every backend keeps (see pad_host_release). */
+_Static_assert(PAD_GC_PORTS == PAD_MAX_HOST_PORTS, "one GameController slot per host port");
+
+static void pad_poll_gc(void)
 {
-    fprintf(stderr, "[cellPad] host input disabled for the iOS PoC\n");
+    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
+        pad_gc_report report;
+        if (pad_gc_read((unsigned)i, &report)) pad_gc_map(&report, &s_host_state[i]);
+        else                                  pad_host_release(&s_host_state[i]);
+    }
 }
 
-static void pad_shutdown_backend(void) {}
+static void pad_init_backend(void) { pad_gc_start(); }
+
+static void pad_shutdown_backend(void) { pad_gc_stop(); }
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -966,6 +965,8 @@ static void pad_poll_backend(void)
     pad_poll_xinput();
 #elif PAD_BACKEND_SDL2
     pad_poll_sdl2();
+#elif PAD_BACKEND_GC
+    pad_poll_gc();
 #endif
     if (!s_host_state[0].connected) pad_poll_keyboard();
     pad_track_assign();

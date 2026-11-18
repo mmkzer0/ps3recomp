@@ -226,6 +226,8 @@ All filesystem operations translate PS3 paths (e.g., `/dev_hdd0/game/NPUA80001/`
 
 **Backends:**
 - **Windows**: XInput (Xbox controller API — maps naturally to DS3)
+- **iOS**: GameController framework (`libs/input/pad_gc.m`, mapping `libs/input/pad_gc_map.c`; see
+  [`PLATFORM_ABSTRACTION.md`](PLATFORM_ABSTRACTION.md), "GameController (iOS)")
 - **Cross-platform**: SDL2 GameController API
 
 **Features:**

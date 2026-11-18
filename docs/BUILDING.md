@@ -599,8 +599,10 @@ The iOS CMake search is restricted to `CMAKE_PREFIX_PATH`; it never falls
 back to Homebrew macOS libraries. For device builds use `iphoneos` instead
 of `iphonesimulator` with the same prefix. Signing belongs to the title app.
 The target keeps `SPVC_MSL_PLATFORM_IOS` and the same register-file renderer
-as macOS. SDL2 is omitted: input is neutral, and `cellAudio` plays through
-CoreAudio RemoteIO (`libs/audio/audio_coreaudio.m`, linked against
+as macOS. SDL2 is omitted: `cellPad` reads the GameController framework
+(`libs/input/pad_gc.m`; see "GameController (iOS)" in
+[`PLATFORM_ABSTRACTION.md`](PLATFORM_ABSTRACTION.md)), and `cellAudio` plays
+through CoreAudio RemoteIO (`libs/audio/audio_coreaudio.m`, linked against
 AudioToolbox and AVFAudio; see "cellAudio on iOS" in
 [`MODULES_REFERENCE.md`](MODULES_REFERENCE.md)).
 
