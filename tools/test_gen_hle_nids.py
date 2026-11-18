@@ -62,7 +62,7 @@ HOST_HELPERS = set("""
     cellGcm_rsx_replay_step
     cellGcm_rsx_process_fifo
     cellGcm_set_capture_sink
-    cellGcm_set_host_pause_clock
+    cellGcm_set_host_active_clock
     cellGcm_syscall_bringup
     cellGcm_syscall_iomap
     cellGcm_syscall_iounmap

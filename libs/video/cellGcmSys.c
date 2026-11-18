@@ -1692,26 +1692,31 @@ unsigned long long ps3_ms_now(void)
 #endif
 }
 
-/* The host's pause (iOS: the app is not active and the backend holds the RSX thread, host_gpu_gate.h), in
- * milliseconds on ps3_ms_now's clock, since the process began. The backend registers it; 0 forever without one. */
-static _Atomic(unsigned long long (*)(void)) s_host_paused_ms_fn;
+/* The host's active clock (iOS: monotonic time less the time the backend held the RSX thread while the app was
+ * not active, host_gpu_gate.h), in milliseconds on ps3_ms_now's clock. The backend registers it; without one the
+ * wait clock is ps3_ms_now itself. */
+static _Atomic(unsigned long long (*)(void)) s_host_active_ms_fn;
 
-void cellGcm_set_host_pause_clock(unsigned long long (*paused_ms)(void))
+void cellGcm_set_host_active_clock(unsigned long long (*active_ms)(void))
 {
-    atomic_store_explicit(&s_host_paused_ms_fn, paused_ms, memory_order_release);
+    atomic_store_explicit(&s_host_active_ms_fn, active_ms, memory_order_release);
 }
 
 /* The clock every gcm.wait_timeout_ms (and park grace) interval is measured on: ps3_ms_now() without the time the
  * host held the RSX thread. While the app is inactive the walker cannot consume the FIFO, so a guest thread
  * waiting for it (a label store waiting for a walker pass, the segment callback waiting for `get`) and the
  * walker's own acquire and park clocks would all run out during a long screen lock and end the run with
- * gcm-wait-timeout for a pause the host imposed. The paused time is subtracted from every reading, so an
- * interval measured across a pause does not contain it. */
+ * gcm-wait-timeout for a pause the host imposed.
+ *
+ * The host computes the difference from one reading of its clock. This side once read ps3_ms_now() and then the
+ * host's paused total, which counts a pause in progress up to its own, later reading: a thread descheduled
+ * between the two (likely while the app is inactive) saw the clock step back by that gap. An acquire wait that
+ * began there measured now - t0 as a wrapped negative, ~2^64 ms, and stopped at once in gcm-wait-timeout with
+ * waited_ms=4294967188, i.e. -108 (an iPad play session, the app inactive at the time). */
 static unsigned long long gcm_wait_clock_ms(void)
 {
-    unsigned long long (*paused)(void) = atomic_load_explicit(&s_host_paused_ms_fn, memory_order_acquire);
-    const unsigned long long paused_ms = paused ? paused() : 0ull;
-    return ps3_ms_now() - paused_ms;
+    unsigned long long (*active)(void) = atomic_load_explicit(&s_host_active_ms_fn, memory_order_acquire);
+    return active ? active() : ps3_ms_now();
 }
 
 static u32 s_sema_offset = 0;   /* NV406E semaphore offset (label window) */

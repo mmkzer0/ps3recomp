@@ -221,19 +221,18 @@ static void* ppu_thread(void* arg)
     return NULL;
 }
 
-/* The host's pause clock (cellGcm_set_host_pause_clock), as the Metal backend on iOS supplies it while the app is
- * inactive: until released, every millisecond since the start is a paused millisecond, so the walker's wait
- * clock stands still; once released it is frozen at what had been paused, and the clock runs again. Every read
- * is counted: the store's wait loop is the only reader, one read per poll, and its polls are what the test paces
- * on instead of a sleep. */
+/* The host's active clock (cellGcm_set_host_active_clock), as the Metal backend on iOS supplies it while the app is
+ * inactive: until released it stands still at the start, so the walker's wait clock does not run; once released it
+ * runs again, less the time it stood still. Every read is counted: the store's wait loop is the only reader, one
+ * read per poll, and its polls are what the test paces on instead of a sleep. */
 static _Atomic unsigned g_pause_polls;
 static _Atomic int g_pause_released;
 static unsigned long long g_pause_t0, g_pause_frozen_ms;
-static unsigned long long fixture_paused_ms(void)
+static unsigned long long fixture_active_ms(void)
 {
     atomic_fetch_add(&g_pause_polls, 1u);
-    if (atomic_load(&g_pause_released)) return g_pause_frozen_ms;
-    return now_ms() - g_pause_t0;
+    if (atomic_load(&g_pause_released)) return now_ms() - g_pause_frozen_ms;
+    return g_pause_t0;
 }
 #define PAUSE_POLLS 300u   /* well past the 100 ms timeout's worth of polls (64 yields, then one per millisecond) */
 
@@ -267,7 +266,7 @@ int main(int argc, char** argv)
 
     if (paused) {
         g_pause_t0 = now_ms();
-        cellGcm_set_host_pause_clock(fixture_paused_ms);
+        cellGcm_set_host_active_clock(fixture_active_ms);
     }
     pthread_t ppu;
     pthread_create(&ppu, NULL, ppu_thread, NULL);
