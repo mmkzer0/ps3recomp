@@ -423,6 +423,24 @@ counts the failed attempts), so a woken sleeper is never left with undelivered w
 call at a time in the process: a concurrent call, or one the delivered handler makes, takes the ordinary usleep and
 logs `[usleep] poll-sleep-contended` once. POSIX only: Windows keeps the poll because its guest clock has its own base.
 
+#### Flip-wait sites
+
+A guest loop that waits for a flip with `cellGcmGetFlipStatus` (or `cellRescGetFlipStatus`) and `usleep` until the
+status reads DONE has no deadline for the seam above to take. The title registers the poll's return address with
+`ps3_usleep_flip_wait_register(lr, cap_ns, guard_fn)` (`sys_timer.h`); `guard_fn` runs first on every usleep from that
+address and returns nonzero only for the loop the title identified (syscall number, argument), 0 for the ordinary
+usleep. With `ppu.poll_sleep_coalesce` on, the call then sleeps on the same wake source as the deadline seam until
+`ppu_gcm_flip_done()` (`cellGcmSys.c`: `s_flip_status == DONE`, read under the status lock) or `cap_ns`, and
+returns to the guest, which re-reads the status itself. The status turns DONE in `ppu_gcm_pump` after
+`cellGcmTickFlip` published the completion; the pump calls the waker when it changes it, so a completion made by
+any thread's pump (the interrupt thread with `gcm.handler_thread`, or another guest thread) ends the wait, and the
+sleeper pumps on every other GCM notification, so handlers are delivered as before. The sleeper looks at the
+status after each pump and before each sleep (announce, fence, pump, look), so a completion published before the sleep
+began is not lost. A flip already DONE returns at once. Writers of the status that are guest calls (init, terminate,
+`cellGcmSetPrepareFlip`, `cellGcmSetFlipStatus`) do not call the waker; a wait on one of them ends at the cap. The
+site table (8 entries), the one-sleeper rule and the Windows exclusion are shared with the deadline seam;
+`sys_timer_usleep_flip_wait_count()` counts the calls the seam took.
+
 ---
 
 ## Memory Management (sys_memory)

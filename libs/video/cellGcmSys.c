@@ -1329,6 +1329,16 @@ u32 cellGcmGetFlipStatus(void)
     return s_flip_status;
 }
 
+/* 1 once the flip status is DONE: what the runtime's flip-wait usleep seam (sys_timer.h) sleeps until. Read under
+ * the status lock, as every transition is made, so a completion is seen whole. */
+int ppu_gcm_flip_done(void)
+{
+    FLIP_LOCK();
+    const int done = s_flip_status == CELL_GCM_FLIP_STATUS_DONE;
+    FLIP_UNLOCK();
+    return done;
+}
+
 /* Host-side ticks. The game's host driver (e.g. flow main.cpp) calls
  * these periodically so registered guest handlers fire — that's what
  * drives the title-screen state machine for many games. */
@@ -1577,9 +1587,18 @@ void ppu_gcm_pump(void)
          * the flip handler, and hung with get == put on exactly that. Leave
          * the newer flip WAITING for the next tick. */
         FLIP_LOCK();
-        if (s_flip_tick_seq == s_flip_req_seq)
+        const int completed = s_flip_tick_seq == s_flip_req_seq;
+        const int changed = completed && s_flip_status != CELL_GCM_FLIP_STATUS_DONE;
+        if (completed)
             s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
         FLIP_UNLOCK();
+#ifndef _WIN32
+        /* The status is what a flip-wait usleep sleeps on (ppu_gcm_flip_done). The post that made this pump
+         * deliver already woke the sleeper, but this pump may be another thread's, or the interrupt thread's with
+         * gcm.handler_thread: the sleeper's own pump then found the guard held or nothing to take, and nothing
+         * else would tell it that the status has changed since. */
+        if (changed) gcm_pump_wake();
+#endif
         if (s_flip_handler_opd && g_ps3_guest_caller) {
             ydkj_restore_handler_opd(s_flip_handler_opd, s_flip_handler_code);
             g_ps3_guest_caller(s_flip_handler_opd, 1, 0, 0, 0, 0, 0, 0, 0);

@@ -23,17 +23,33 @@
  *   contract  the seam serves one sleeping call at a time: with one held inside its deadline callback, a second
  *             call at the site takes the ordinary usleep without running its callback and names the contention
  *             once; after the first returns the site works again.
- *   off       option off: a registered site is ignored, the callback never runs, nothing is pumped.
+ *   off       option off: a registered site, a flip-wait site included, is ignored: the callback and the guard never
+ *             run, nothing is pumped.
  *   spin0     option on, ppu.poll_sleep_spin_us=0: a pure sleep, whose thread CPU time stays far below the span.
  *   spin2000  spin 2000 us: the last 2 ms are spent spinning, so the thread CPU time is not far below it.
- *   register  the registration table's refusals (lr 0, bound 0, no callback, a duplicate, a ninth site).
+ *   register  the registration table's refusals (lr 0, bound 0, no callback, a duplicate, a ninth site), shared by
+ *             both kinds of site.
  *   timing    stress: 200 sleeps to a 16.68 ms deadline; overshoot printed, p90 bounded.
+ *
+ * The flip-wait sites (ps3_usleep_flip_wait_register: the wait ends when the GCM flip status is DONE, or at the
+ * site's cap). The guard accepts r11 = 0x8D and r3 = 30. A wait that was not woken shows as a call that returns
+ * seconds late (the long cap is 20 s); no case asserts a short bound.
+ *   fw-event     the flip's completion (cellGcmTickFlip, then the pump) ends the wait: 60 rounds with the event
+ *                published at varied instants after the call began, one published before it (the entry pump must
+ *                take it: no lost wakeup), and a status that is already DONE.
+ *   fw-notify    a vblank posted during the wait is delivered on the sleeping thread while the call is still
+ *                waiting; only the flip's completion ends it.
+ *   fw-cap       no event: the call returns at its 50 ms cap, the status still WAITING, three times.
+ *   fw-fallback  another lr, a guard that declines (r3 = 31, r11 = 0x8E), and a call that arrives while another seam
+ *                sleep holds the seam: the ordinary usleep, the guard not run for the last, the seam not counting.
+ *   fw-done-wake the status is completed by another thread's pump behind the sleeper's back (the interrupt-thread
+ *                shape of gcm.handler_thread): the pump's own wake ends the wait.
  *
  * The GCM side is the real one (cellGcmSys.c is in the runtime library): the test installs a guest caller and
  * handlers and posts with cellGcmQueueUserCommand and cellGcm_vblank_signal, so the waker and the pump the seam
  * uses are the ones a title runs.
  *
- * Usage: test_usleep_site <site|wake|guard|contract|off|spin0|spin2000|register|timing>; ctest sets the options in
+ * Usage: test_usleep_site <site|wake|guard|contract|off|spin0|spin2000|register|fw-*|timing>; ctest sets the options in
  * the environment (every test names them: the on-runs set them, the others unset them). */
 #define _DARWIN_C_SOURCE 1
 #ifndef _WIN32
@@ -167,10 +183,39 @@ static void warm_up(void)
     atomic_store(&g_cb_calls, 0);
 }
 
+/* A flip-wait site: the guard accepts the loop's own registers (r11 = 0x8D, the usleep syscall; r3 = 30), as a
+ * title's guard would, and counts its calls. FLIP_LR waits up to 20 s, so a lost wake shows as a call that returns
+ * seconds late and not as a passing test; FLIP_CAP_LR's 50 ms is the cap itself under test. */
+enum { FLIP_LR = 0x00123480u, FLIP_CAP_LR = 0x00123490u, FLIP_SYSCALL = 0x8Du, FLIP_ARG_US = 30 };
+#define FLIP_CAP_LONG_NS  20000000000ull
+#define FLIP_CAP_SHORT_NS 50000000ull
+#define FLIP_LATE_NS      10000000000ull   /* a call that took this long was not woken */
+static atomic_uint g_guard_calls;
+static atomic_int  g_guard_in;             /* the guard ran: the call holds the seam and is about to arm */
+
+static int flip_guard(ppu_context* ctx)
+{
+    atomic_fetch_add(&g_guard_calls, 1);
+    atomic_store(&g_guard_in, 1);
+    return ctx->gpr[11] == FLIP_SYSCALL && ctx->gpr[3] == FLIP_ARG_US;
+}
+
 static void register_sites(void)
 {
     CHECK(ps3_usleep_site_register(SITE_LR - 8u, 1000000u, site_deadline) == 0, "register a decoy");
     CHECK(ps3_usleep_site_register(SITE_LR, (uint64_t)SITE_BOUND_MS * 1000000u, site_deadline) == 0, "register");
+    CHECK(ps3_usleep_flip_wait_register(FLIP_LR, FLIP_CAP_LONG_NS, flip_guard) == 0, "register a flip-wait site");
+    CHECK(ps3_usleep_flip_wait_register(FLIP_CAP_LR, FLIP_CAP_SHORT_NS, flip_guard) == 0, "register a capped site");
+}
+
+/* usleep(r3) from `lr` with the syscall number the dispatcher leaves in r11. */
+static void fcall(sleeper* s, uint32_t lr, uint64_t r3, uint64_t r11)
+{
+    s->ctx.lr = lr;
+    s->ctx.gpr[3] = r3;
+    s->ctx.gpr[11] = r11;
+    const int64_t r = sys_timer_usleep(&s->ctx);
+    CHECK(r == 0, "sys_timer_usleep = %lld", (long long)r);
 }
 
 static int count_lines_with(FILE* f, const char* needle)
@@ -493,6 +538,15 @@ static int run_off(void)
     CHECK(sys_timer_usleep_site_count() == 0, "the seam slept with the option off");
     CHECK(gcm_user_handler_deliveries() == 0, "a handler was delivered with the option off");
     CHECK(atomic_load(&g_deliveries) == 0, "the seam pumped with the option off");
+    /* A flip-wait site is ignored too: the guard never runs and the wait is the guest's 30 us. */
+    CHECK(cellGcmSetFlipCommand(0) == CELL_OK, "cellGcmSetFlipCommand");
+    for (int i = 0; i < 3; i++) {
+        const uint64_t t0 = host_monotonic_ns();
+        fcall(&s, FLIP_LR, FLIP_ARG_US, FLIP_SYSCALL);
+        CHECK(host_monotonic_ns() - t0 >= 30000u, "usleep(30) at a flip-wait site slept less than 30 us");
+    }
+    CHECK(atomic_load(&g_guard_calls) == 0, "the guard ran %u times with the option off", atomic_load(&g_guard_calls));
+    CHECK(sys_timer_usleep_flip_wait_count() == 0, "a flip-wait was served with the option off");
     return 0;
 }
 
@@ -534,13 +588,229 @@ static int run_spin(unsigned spin_us)
 
 static int run_register(void)
 {
-    CHECK(ps3_usleep_site_register(0, 1000, site_deadline) == -1, "lr 0 accepted");
-    CHECK(ps3_usleep_site_register(0x100, 0, site_deadline) == -1, "a bound of 0 accepted");
-    CHECK(ps3_usleep_site_register(0x100, 1000, NULL) == -1, "a null callback accepted");
-    for (uint32_t i = 1; i <= 8; i++)
+    CHECK(ps3_usleep_flip_wait_register(0, 1000, flip_guard) == -1, "a flip-wait lr of 0 accepted");
+    CHECK(ps3_usleep_flip_wait_register(0x100, 0, flip_guard) == -1, "a cap of 0 accepted");
+    CHECK(ps3_usleep_flip_wait_register(0x100, 1000, NULL) == -1, "a null guard accepted");
+    CHECK(ps3_usleep_site_register(0x0F00, 1000, site_deadline) == 0, "a deadline site refused");
+    CHECK(ps3_usleep_flip_wait_register(0x0F00, 1000, flip_guard) == -1, "a flip-wait on a deadline site's lr accepted");
+    CHECK(ps3_usleep_flip_wait_register(0x0F04, 1000, flip_guard) == 0, "a flip-wait site refused");
+    CHECK(ps3_usleep_site_register(0x0F04, 1000, site_deadline) == -1, "a deadline site on a flip-wait lr accepted");
+    for (uint32_t i = 1; i <= 6; i++)
         CHECK(ps3_usleep_site_register(0x1000u + i * 4u, 1000, site_deadline) == 0, "site %u refused", i);
     CHECK(ps3_usleep_site_register(0x1004, 1000, site_deadline) == -1, "a duplicate lr accepted");
+    CHECK(ps3_usleep_flip_wait_register(0x2000, 1000, flip_guard) == -1, "a ninth site (flip-wait) accepted");
     CHECK(ps3_usleep_site_register(0x2000, 1000, site_deadline) == -1, "a ninth site accepted");
+    return 0;
+}
+
+/* ---- flip-wait ----------------------------------------------------------------------------------------------- */
+
+/* The state a guest's flip poll sees: a flip requested (status WAITING, one outstanding) and, once the walker has
+ * executed it, cellGcmTickFlip, which only publishes (pending bit 2 and the waker). The status turns DONE in the
+ * next pump, on whichever thread runs it. */
+static void flip_request(void)
+{
+    CHECK(cellGcmSetFlipCommand(0) == CELL_OK, "cellGcmSetFlipCommand");
+    CHECK(!ppu_gcm_flip_done(), "the status is DONE right after a flip request");
+}
+
+typedef struct { uint32_t spin; int do_tick; } flip_round_t;
+
+/* Starts once the seam call has begun, waits `spin` iterations to vary where in the call's start-up the event lands,
+ * and completes the flip. Nothing else ends the call before the 20 s cap. */
+static void* flip_poster(void* arg)
+{
+    flip_round_t* r = arg;
+    while (!atomic_load(&g_guard_in)) sched_yield();
+    for (uint32_t i = 0; i < r->spin; i++) __asm__ volatile("" ::: "memory");
+    if (r->do_tick) cellGcmTickFlip();
+    return NULL;
+}
+
+/* One flip wait. The event is published after the call began (pre 0) or before it (pre 1: published, not yet
+ * pumped, so the call's own entry pump must complete it). */
+static void flip_round(uint32_t spin, int pre, int idx)
+{
+    sleeper s; sleeper_init(&s);
+    flip_request();
+    atomic_store(&g_guard_in, 0);
+    flip_round_t r = { .spin = spin, .do_tick = !pre };
+    pthread_t th;
+    CHECK(pthread_create(&th, NULL, flip_poster, &r) == 0, "pthread_create");
+    if (pre) cellGcmTickFlip();
+    const uint64_t n0 = sys_timer_usleep_flip_wait_count();
+    const uint64_t t0 = host_monotonic_ns();
+    fcall(&s, FLIP_LR, FLIP_ARG_US, FLIP_SYSCALL);
+    const uint64_t t1 = host_monotonic_ns();
+    pthread_join(th, NULL);
+    CHECK(t1 - t0 < FLIP_LATE_NS, "round %d (%s, spin %u): the wait ran %llu ms, the completion did not wake it", idx,
+          pre ? "event before the call" : "event after it began", spin, (unsigned long long)((t1 - t0) / 1000000u));
+    CHECK(ppu_gcm_flip_done(), "round %d: the call returned with the flip still WAITING", idx);
+    CHECK(sys_timer_usleep_flip_wait_count() - n0 == 1, "round %d: the seam did not count the wait", idx);
+}
+
+static int run_fw_event(void)
+{
+    CHECK(ps3_cfg_ppu_poll_sleep_coalesce(), "ppu.poll_sleep_coalesce is off, the run expects on");
+    register_sites();
+    flip_round(0, 0, 0);
+    flip_round(0, 1, 1);                 /* published before the sleep started: nothing may be lost to the gap */
+    uint64_t rng = 0x9E3779B97F4A7C15ull;
+    for (int i = 2; i < 60; i++) {       /* varied instants of the call's start-up, Dekker's pairing as the target */
+        rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+        flip_round((uint32_t)((rng >> 8) % 100000u), 0, i);
+    }
+
+    /* DONE before the call: the first look at the status ends the wait, no event needed. */
+    sleeper s; sleeper_init(&s);
+    flip_request();
+    cellGcmTickFlip();
+    ppu_gcm_pump();
+    CHECK(ppu_gcm_flip_done(), "the pump did not complete the flip");
+    const uint64_t t0 = host_monotonic_ns();
+    fcall(&s, FLIP_LR, FLIP_ARG_US, FLIP_SYSCALL);
+    CHECK(host_monotonic_ns() - t0 < FLIP_LATE_NS, "a wait on a status that is already DONE ran to its cap");
+    return 0;
+}
+
+/* A GCM notification during the wait is delivered on the sleeping thread and the wait goes on: the flip is not
+ * complete yet, so the guest has nothing to re-read. Only the flip's completion ends it. */
+static void* notify_poster(void* arg)
+{
+    int* delivered = arg;
+    while (!atomic_load(&g_guard_in)) sched_yield();
+    const unsigned before = atomic_load(&g_vblanks);
+    cellGcm_vblank_signal();
+    while (atomic_load(&g_vblanks) == before && !atomic_load(&g_returned)) sched_yield();
+    *delivered = atomic_load(&g_vblanks) != before && !atomic_load(&g_returned);   /* handler ran, call still waiting */
+    cellGcmTickFlip();
+    return NULL;
+}
+
+static int run_fw_notify(void)
+{
+    CHECK(ps3_cfg_ppu_poll_sleep_coalesce(), "ppu.poll_sleep_coalesce is off, the run expects on");
+    register_sites();
+    sleeper s; sleeper_init(&s);
+    flip_request();
+    atomic_store(&g_guard_in, 0);
+    atomic_store(&g_returned, 0);
+    int delivered = 0;
+    pthread_t th;
+    CHECK(pthread_create(&th, NULL, notify_poster, &delivered) == 0, "pthread_create");
+    const uint64_t t0 = host_monotonic_ns();
+    fcall(&s, FLIP_LR, FLIP_ARG_US, FLIP_SYSCALL);
+    const uint64_t t1 = host_monotonic_ns();
+    atomic_store(&g_returned, 1);
+    pthread_join(th, NULL);
+    CHECK(delivered, "a vblank posted during the wait was not delivered while the call was still waiting");
+    CHECK(t1 - t0 < FLIP_LATE_NS && ppu_gcm_flip_done(), "the flip's completion did not end the wait");
+    return 0;
+}
+
+/* No event: the call returns at its cap with the status unchanged, and the guest polls again. */
+static int run_fw_cap(void)
+{
+    CHECK(ps3_cfg_ppu_poll_sleep_coalesce(), "ppu.poll_sleep_coalesce is off, the run expects on");
+    register_sites();
+    sleeper s; sleeper_init(&s);
+    flip_request();
+    for (int i = 0; i < 3; i++) {
+        const uint64_t n0 = sys_timer_usleep_flip_wait_count();
+        const uint64_t t0 = host_monotonic_ns();
+        fcall(&s, FLIP_CAP_LR, FLIP_ARG_US, FLIP_SYSCALL);
+        const uint64_t dt = host_monotonic_ns() - t0;
+        CHECK(dt >= FLIP_CAP_SHORT_NS, "wait %d ended %llu us before its 50 ms cap with no event", i,
+              (unsigned long long)((FLIP_CAP_SHORT_NS - dt) / 1000u));
+        CHECK(!ppu_gcm_flip_done(), "the status changed with no flip completion");
+        CHECK(sys_timer_usleep_flip_wait_count() - n0 == 1, "wait %d was not counted", i);
+    }
+    return 0;
+}
+
+/* What the seam must leave to the ordinary usleep: another lr, a guard that declines the registers, and a call
+ * that arrives while another seam sleep holds the seam. The status is WAITING throughout, so a seam that wrongly
+ * took one would wait to its cap; the counters say whether it did. */
+static int run_fw_fallback(void)
+{
+    CHECK(ps3_cfg_ppu_poll_sleep_coalesce(), "ppu.poll_sleep_coalesce is off, the run expects on");
+    register_sites();
+    sleeper s; sleeper_init(&s);
+    flip_request();
+    const uint64_t n0 = sys_timer_usleep_flip_wait_count();
+    uint64_t g0 = atomic_load(&g_guard_calls);
+    uint64_t t0 = host_monotonic_ns();
+    fcall(&s, OTHER_LR, FLIP_ARG_US, FLIP_SYSCALL);            /* a site nobody registered */
+    CHECK(host_monotonic_ns() - t0 >= 30000u, "usleep(30) from an unregistered lr slept less than 30 us");
+    CHECK(atomic_load(&g_guard_calls) == g0, "the guard ran for an unregistered lr");
+
+    t0 = host_monotonic_ns();
+    fcall(&s, FLIP_LR, 31, FLIP_SYSCALL);                      /* the registered lr, but not the loop's argument */
+    CHECK(host_monotonic_ns() - t0 >= 31000u, "usleep(31) after a declining guard slept less than 31 us");
+    t0 = host_monotonic_ns();
+    fcall(&s, FLIP_LR, FLIP_ARG_US, 0x8Eu);                    /* ... or not the usleep syscall */
+    CHECK(host_monotonic_ns() - t0 >= 30000u, "usleep(30) after a declining guard slept less than 30 us");
+    CHECK(atomic_load(&g_guard_calls) - g0 == 2, "the guard ran %u times for two calls at its lr",
+          atomic_load(&g_guard_calls) - (unsigned)g0);
+    CHECK(sys_timer_usleep_flip_wait_count() == n0, "the seam took a call its guard declined or another lr's");
+
+    /* One seam sleeper at a time, flip-waits included: a deadline site's call holds the seam inside its callback. */
+    atomic_store(&g_gate_on, 1);
+    pthread_t th;
+    CHECK(pthread_create(&th, NULL, held_thread, NULL) == 0, "pthread_create");
+    while (!atomic_load(&g_in_call)) sched_yield();
+    g0 = atomic_load(&g_guard_calls);
+    t0 = host_monotonic_ns();
+    fcall(&s, FLIP_LR, FLIP_ARG_US, FLIP_SYSCALL);
+    CHECK(host_monotonic_ns() - t0 >= 30000u, "usleep(30) of a flip-wait while the seam was held slept less than 30 us");
+    CHECK(atomic_load(&g_guard_calls) == g0, "the guard ran while another call held the seam");
+    CHECK(sys_timer_usleep_flip_wait_count() == n0, "a flip-wait was served while the seam was held");
+    atomic_store(&g_gate_on, 0);
+    pthread_join(th, NULL);
+    return 0;
+}
+
+/* The status changes in another thread's pump, behind the sleeper's back: A took the flip's notification and is
+ * delivering a vblank handler (the guard held, as the GCM interrupt thread does with gcm.handler_thread). The
+ * sleeper's pump finds nothing to take; no post follows. Only the pump's own wake, after it marks the flip DONE,
+ * can end the wait before its 20 s cap. */
+static void* fw_sleeper_thread(void* arg)
+{
+    uint64_t* dt = arg;
+    sleeper s; sleeper_init(&s);
+    const uint64_t t0 = host_monotonic_ns();
+    fcall(&s, FLIP_LR, FLIP_ARG_US, FLIP_SYSCALL);
+    *dt = host_monotonic_ns() - t0;
+    atomic_store(&g_returned, 1);
+    return NULL;
+}
+
+static int run_fw_done_wake(void)
+{
+    CHECK(ps3_cfg_ppu_poll_sleep_coalesce(), "ppu.poll_sleep_coalesce is off, the run expects on");
+    register_sites();
+    flip_request();
+    cellGcmTickFlip();                                          /* bit 2 pending ... */
+    atomic_store(&g_hold_vblank, 1);
+    cellGcm_vblank_signal();                                    /* ... with bit 1 */
+    pthread_t a, b;
+    CHECK(pthread_create(&a, NULL, pump_owner_thread, NULL) == 0, "pthread_create");
+    while (!atomic_load(&g_in_handler)) sched_yield();          /* A took both bits and sits in the vblank handler */
+    CHECK(!ppu_gcm_flip_done(), "the flip completed before A reached it");
+    uint64_t dt = 0;
+    atomic_store(&g_guard_in, 0);
+    atomic_store(&g_returned, 0);
+    CHECK(pthread_create(&b, NULL, fw_sleeper_thread, &dt) == 0, "pthread_create");
+    while (!atomic_load(&g_guard_in)) sched_yield();
+    /* Give B time to arm. A B that is late only completes without sleeping, which is not what this case is for;
+     * it cannot make a correct implementation fail. */
+    { struct timespec ts = { 0, 300 * 1000 * 1000 }; nanosleep(&ts, NULL); }
+    CHECK(!atomic_load(&g_returned), "the wait ended with the flip still undelivered");
+    atomic_store(&g_release, 1);
+    pthread_join(a, NULL);
+    pthread_join(b, NULL);
+    CHECK(dt < FLIP_LATE_NS, "the wait ran %llu ms: the flip A completed did not wake it", (unsigned long long)(dt / 1000000u));
+    CHECK(ppu_gcm_flip_done(), "the call returned with the flip still WAITING");
     return 0;
 }
 
@@ -574,10 +844,54 @@ static int run_timing(int n)
     return 0;
 }
 
+/* The flip-wait's wake latency: the time from the poster's cellGcmTickFlip to the call's return, with the event
+ * 0.1-2 ms into the wait (a flip is ~1.5 ms in the title this was built for). The guest's own 30 us poll sees a
+ * completion up to 35 us late (17 us on average); p90 under 2 ms is the stress-tier bound, an ordinary host sits
+ * two orders below it. */
+static atomic_ullong g_tick_ns;
+
+static void* timed_poster(void* arg)
+{
+    const uint64_t delay_us = *(const uint64_t*)arg;
+    while (!atomic_load(&g_guard_in)) sched_yield();
+    ps3_host_sleep_ns(delay_us * 1000u);
+    atomic_store(&g_tick_ns, host_monotonic_ns());
+    cellGcmTickFlip();
+    return NULL;
+}
+
+static int run_fw_timing(int n)
+{
+    register_sites();
+    uint64_t* lat = malloc((size_t)n * sizeof *lat);
+    sleeper s; sleeper_init(&s);
+    uint64_t rng = 0x9E3779B97F4A7C15ull;
+    for (int i = 0; i < n; i++) {
+        rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+        uint64_t delay_us = 100u + (rng >> 8) % 1900u;
+        flip_request();
+        atomic_store(&g_guard_in, 0);
+        pthread_t th;
+        CHECK(pthread_create(&th, NULL, timed_poster, &delay_us) == 0, "pthread_create");
+        fcall(&s, FLIP_LR, FLIP_ARG_US, FLIP_SYSCALL);
+        const uint64_t t = host_monotonic_ns();
+        pthread_join(th, NULL);
+        const uint64_t tick = atomic_load(&g_tick_ns);
+        lat[i] = t > tick ? t - tick : 0;
+    }
+    qsort(lat, (size_t)n, sizeof *lat, cmp_u64);
+    fprintf(stderr, "fw-timing: x %d: tick to return p50 %.1f us  p90 %.1f us  p99 %.1f us  max %.1f us\n", n,
+            lat[n / 2] / 1e3, lat[n * 9 / 10] / 1e3, lat[n * 99 / 100] / 1e3, lat[n - 1] / 1e3);
+    CHECK(lat[n * 9 / 10] < 2000000u, "p90 wake latency %.1f us is not under 2 ms", lat[n * 9 / 10] / 1e3);
+    free(lat);
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
     if (argc < 2) {
-        fprintf(stderr, "usage: %s <site|wake|guard|contract|off|spin0|spin2000|register|timing> [count]\n", argv[0]);
+        fprintf(stderr, "usage: %s <site|wake|guard|contract|off|spin0|spin2000|register|fw-event|fw-notify|fw-cap|"
+                "fw-fallback|fw-done-wake|timing|fw-timing> [count]\n", argv[0]);
         return 2;
     }
     vm_base = calloc(1, 1u << 20);
@@ -585,6 +899,7 @@ int main(int argc, char** argv)
     g_ps3_guest_caller = guest_caller;
     cellGcmSetUserHandler((CellGcmUserHandler)(uintptr_t)USER_OPD);
     cellGcmSetVBlankHandler((CellGcmVBlankHandler)(uintptr_t)VBLANK_OPD);
+    cellGcmSetDisplayBuffer(0, 0, 0x1400, 1280, 720);           /* a flip the flip-wait cases can request */
     const char* mode = argv[1];
     if      (!strcmp(mode, "site"))     run_site();
     else if (!strcmp(mode, "wake"))     run_wake();
@@ -595,7 +910,13 @@ int main(int argc, char** argv)
     else if (!strcmp(mode, "spin0"))    run_spin(0);
     else if (!strcmp(mode, "spin2000")) run_spin(2000);
     else if (!strcmp(mode, "register")) run_register();
+    else if (!strcmp(mode, "fw-event")) run_fw_event();
+    else if (!strcmp(mode, "fw-notify")) run_fw_notify();
+    else if (!strcmp(mode, "fw-cap"))   run_fw_cap();
+    else if (!strcmp(mode, "fw-fallback")) run_fw_fallback();
+    else if (!strcmp(mode, "fw-done-wake")) run_fw_done_wake();
     else if (!strcmp(mode, "timing"))   run_timing(argc > 2 ? atoi(argv[2]) : 200);
+    else if (!strcmp(mode, "fw-timing")) run_fw_timing(argc > 2 ? atoi(argv[2]) : 500);
     else { fprintf(stderr, "unknown mode %s\n", mode); return 2; }
     const int fails = atomic_load(&g_fails);
     fprintf(stderr, "%s %s: %s\n", argv[0], mode, fails ? "FAILED" : "ok");

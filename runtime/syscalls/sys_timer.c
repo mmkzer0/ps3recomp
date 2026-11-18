@@ -261,26 +261,41 @@ void ps3_host_sleep_ns(uint64_t ns)
 enum { USLEEP_SITES_MAX = 8 };
 typedef struct {
     uint32_t               lr;
-    uint64_t               max_sleep_ns;
-    ps3_usleep_deadline_fn deadline;
+    uint64_t               max_sleep_ns;   /* a deadline site's bound; a flip-wait site's cap */
+    ps3_usleep_deadline_fn deadline;       /* a deadline site: the poll's exit instant */
+    ps3_usleep_guard_fn    guard;          /* a flip-wait site: set, with deadline NULL */
 } usleep_site;
 /* Written by the registering thread before any guest thread runs, then read-only; the count is published with
  * release so a reader that sees a slot sees it whole. */
 static usleep_site s_sites[USLEEP_SITES_MAX];
 static atomic_uint s_site_count;
 static atomic_uint_fast64_t s_site_sleeps;
+static atomic_uint_fast64_t s_flip_wait_sleeps;
 
-int ps3_usleep_site_register(uint32_t lr, uint64_t max_sleep_ns, ps3_usleep_deadline_fn deadline)
+static int site_register(uint32_t lr, uint64_t max_sleep_ns, ps3_usleep_deadline_fn deadline,
+                         ps3_usleep_guard_fn guard)
 {
-    if (!lr || !max_sleep_ns || !deadline) return -1;
     const unsigned n = atomic_load_explicit(&s_site_count, memory_order_relaxed);
     if (n >= USLEEP_SITES_MAX) return -1;
     for (unsigned i = 0; i < n; i++) if (s_sites[i].lr == lr) return -1;
     s_sites[n].lr = lr;
     s_sites[n].max_sleep_ns = max_sleep_ns;
     s_sites[n].deadline = deadline;
+    s_sites[n].guard = guard;
     atomic_store_explicit(&s_site_count, n + 1, memory_order_release);
     return 0;
+}
+
+int ps3_usleep_site_register(uint32_t lr, uint64_t max_sleep_ns, ps3_usleep_deadline_fn deadline)
+{
+    if (!lr || !max_sleep_ns || !deadline) return -1;
+    return site_register(lr, max_sleep_ns, deadline, NULL);
+}
+
+int ps3_usleep_flip_wait_register(uint32_t lr, uint64_t cap_ns, ps3_usleep_guard_fn guard)
+{
+    if (!lr || !cap_ns || !guard) return -1;
+    return site_register(lr, cap_ns, NULL, guard);
 }
 
 uint64_t sys_timer_usleep_site_count(void)
@@ -288,10 +303,17 @@ uint64_t sys_timer_usleep_site_count(void)
     return (uint64_t)atomic_load_explicit(&s_site_sleeps, memory_order_relaxed);
 }
 
+uint64_t sys_timer_usleep_flip_wait_count(void)
+{
+    return (uint64_t)atomic_load_explicit(&s_flip_wait_sleeps, memory_order_relaxed);
+}
+
 /* The pump the lv2 dispatcher runs at a usleep syscall (ppu_loader.cpp) and the waker's installer, both in
  * cellGcmSys.c when it is linked. Weak, as ppu_hle.cpp holds ppu_gcm_pump: a link without GCM has nothing to pump
  * and nothing that posts. */
 extern void ppu_gcm_pump(void) __attribute__((weak));
+/* 1 once the flip status is CELL_GCM_FLIP_STATUS_DONE: what a flip-wait site sleeps until. */
+extern int ppu_gcm_flip_done(void) __attribute__((weak));
 extern void ppu_gcm_set_wake_hook(void (*hook)(void)) __attribute__((weak));
 
 static void site_pump(void)
@@ -339,8 +361,12 @@ void ps3_host_sleep_until_ns(uint64_t deadline_ns, uint64_t spin_ns)
  * work or the poster sees the sleeper and wakes it. A wake is an edge: the sleeper never loops on "something is
  * pending", because with gcm.handler_thread the pump leaves it pending for the interrupt thread to take.
  *
- * Both waits return 0 once the clock has passed `until_ns`, or -1 with nothing slept and no wake armed, in which
- * case the caller sleeps plainly. */
+ * Both waits return 0 once the clock has passed `until_ns` (or, for a flip-wait, once its `done` predicate holds),
+ * or -1 with no wake armed, in which case the caller sleeps plainly (a flip-wait takes the ordinary usleep). The
+ * predicate is read after every pump, never instead of one: what makes it true (a pump marking the flip DONE, in
+ * cellGcmSys.c) calls the waker itself, so a completion on any thread, the sleeper's own pump included, ends the
+ * wait. The sleeper's own pump leaves one stale trigger in the macOS kqueue; the next wait takes it as a spurious
+ * wake (one pump, one look at the predicate) and sleeps on. */
 #ifdef __APPLE__
 /* One kqueue, made at the first wait: an EVFILT_USER that the poster triggers, plus the NOTE_CRITICAL timer of
  * sleep_critical_timer (the only timer the kernel does not coalesce). A kqueue per sleep, as the guest's plain
@@ -373,7 +399,12 @@ static void usleep_wake(void)
     (void)kevent(atomic_load_explicit(&s_wake_kq, memory_order_acquire), &ch, 1, NULL, 0, NULL);
 }
 
-static int wake_sleep_until(uint64_t until_ns)
+/* `done`, when set, is the early exit of a flip-wait: looked at after every pump and before every sleep, so a
+ * state change published before the sleeper announced itself is seen by the first look and one published after
+ * it is seen by the poster, which then finds the sleeper (the two fences above). */
+typedef int (*wait_done_fn)(void);
+
+static int wake_sleep_until(uint64_t until_ns, wait_done_fn done)
 {
     const int kq = wake_kq();   /* one sleeper at a time: usleep_site_sleep holds s_site_busy around this */
     if (kq < 0) return -1;
@@ -382,6 +413,7 @@ static int wake_sleep_until(uint64_t until_ns)
     site_pump();
     int rc = 0, armed = 0;
     for (;;) {
+        if (done && done()) break;
         const uint64_t now = host_monotonic_ns();
         if (now >= until_ns) break;
         const uint64_t left = until_ns - now;
@@ -424,7 +456,9 @@ static void usleep_wake(void)
     pthread_mutex_unlock(&s_wake_mx);
 }
 
-static int wake_sleep_until(uint64_t until_ns)
+typedef int (*wait_done_fn)(void);   /* see the macOS wait: the flip-wait's early exit */
+
+static int wake_sleep_until(uint64_t until_ns, wait_done_fn done)
 {
     pthread_cond_t* cv = wake_cv();
     if (!cv) { site_wait_failed("pthread_cond_init", EINVAL); return -1; }
@@ -436,6 +470,7 @@ static int wake_sleep_until(uint64_t until_ns)
     site_pump();
     int rc = 0;
     for (;;) {
+        if (done && done()) break;
         const uint64_t now = host_monotonic_ns();
         if (now >= until_ns) break;
         const ps3_wait_budget budget = ps3_wait_budget_ns(until_ns - now, 0);
@@ -457,7 +492,7 @@ static int wake_sleep_until(uint64_t until_ns)
 static void site_sleep_until(uint64_t deadline_ns, uint64_t spin_ns)
 {
     const uint64_t sleep_to = deadline_ns > spin_ns ? deadline_ns - spin_ns : 0;
-    if (wake_sleep_until(sleep_to) != 0) {
+    if (wake_sleep_until(sleep_to, NULL) != 0) {
         const uint64_t now = host_monotonic_ns();
         if (now < sleep_to) ps3_host_sleep_ns(sleep_to - now);
     }
@@ -504,6 +539,18 @@ static int usleep_site_sleep_held(ppu_context* ctx, const usleep_site* site)
     return 1;
 }
 
+/* A flip-wait site: sleep until the flip status is DONE or the site's cap has passed. Returns 1 when the wait ran
+ * and the guest may re-read the status, 0 to take the ordinary usleep (the guard declined, there is no GCM module
+ * to ask or to wake us, or the host's wait failed: fail closed, the poll goes on exactly as without the seam). */
+static int usleep_flip_wait_held(ppu_context* ctx, const usleep_site* site)
+{
+    if (!site->guard(ctx)) return 0;
+    if (!ppu_gcm_flip_done || !ppu_gcm_set_wake_hook) return 0;
+    if (wake_sleep_until(host_monotonic_ns() + site->max_sleep_ns, ppu_gcm_flip_done) != 0) return 0;
+    atomic_fetch_add_explicit(&s_flip_wait_sleeps, 1, memory_order_relaxed);
+    return 1;
+}
+
 /* 1 when the call was a registered site's and was slept to its deadline. */
 static int usleep_site_sleep(ppu_context* ctx)
 {
@@ -518,7 +565,7 @@ static int usleep_site_sleep(ppu_context* ctx)
                   "time). Later calls are not reported.\n", site->lr, (unsigned long long)LV2_ARG_U64(ctx, 0));
         return 0;
     }
-    const int slept = usleep_site_sleep_held(ctx, site);
+    const int slept = site->guard ? usleep_flip_wait_held(ctx, site) : usleep_site_sleep_held(ctx, site);
     atomic_flag_clear_explicit(&s_site_busy, memory_order_release);
     return slept;
 }

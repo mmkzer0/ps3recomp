@@ -480,6 +480,11 @@ void gcm_set_pump_tail_hook(void (*hook)(void));
 /* Install the function every new vblank/flip/user-command notification calls after publishing it (null removes
  * it). The runtime's usleep seam uses it to end a long sleep early; it must be quick and must not pump. */
 void ppu_gcm_set_wake_hook(void (*hook)(void));
+/* 1 once the flip status is CELL_GCM_FLIP_STATUS_DONE (read under the status lock). The flip-wait usleep seam
+ * (ps3_usleep_flip_wait_register) sleeps until it holds; the pump's completion of a flip calls the waker above. The
+ * guest-side writers (init, terminate, SetPrepareFlip, SetFlipStatus) do not: a wait on one of those ends at the
+ * seam's cap. */
+int ppu_gcm_flip_done(void);
 #endif
 
 /* Driver events the FIFO walker retires, for C3's event comparison. `seq` counts from 1 in
