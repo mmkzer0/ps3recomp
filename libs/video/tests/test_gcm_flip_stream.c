@@ -22,6 +22,9 @@
  *   7. A flip requested outside the stream completes on the next beat, once.
  *   8. A flip in the stream puts ZSTENCIL_CLEAR_VALUE back to its reset value
  *      for every consumer of the methods, after the methods ahead of it.
+ *   9. The guest flip clock counts a request in the stream at the request,
+ *      where the present boundary waits for the drain; a refused buffer id
+ *      advances neither.
  *
  * cc -std=gnu17 -I include -I libs/video libs/video/tests/test_gcm_flip_stream.c
  *   libs/video/gcm_default_state.c -ffunction-sections -fdata-sections -Wl,--gc-sections -pthread
@@ -262,6 +265,36 @@ int main(void)
     check(g_n_zs_engine >= 1 && g_zs_engine[g_n_zs_engine - 1] == 0xFFFFFF00u,
           "the draw engine gets the flip's 0xFFFFFF00 too");
     g_engine_on = 0;
+
+    /* 9: the guest's flip clock counts the request on the calling thread. The present boundary
+     * (cellGcm_flip_request_count) counts a flip queued in the stream only when the walker drains its
+     * marker, which is the walker's pace, not the guest's. */
+    {
+        const u32 g0 = cellGcm_guest_flip_count(), r0 = cellGcm_flip_request_count();
+        const u32 cur6 = vm_read32(ctx + 8);
+        check(_cellGcmSetFlipCommandWithWaitLabel((void*)(uintptr_t)ctx, 1, LABEL, VALUE) == CELL_OK,
+              "a flip is queued in the stream");
+        check(cellGcm_guest_flip_count() == g0 + 1u, "the guest clock counts it at the request");
+        check(cellGcm_flip_request_count() == r0, "the present boundary waits for the drain");
+        vm_write32(GCM_CONTROL_GUEST_ADDR + 0, gcm_ea2io(cur6) + 20);
+        cellGcm_rsx_process_fifo();
+        check(cellGcm_flip_request_count() == r0 + 1u, "the drain reaching the marker is what advances the present boundary");
+        check(cellGcm_guest_flip_count() == g0 + 1u, "and the guest clock does not count the drain");
+        check(cellGcmSetFlipCommand(1) == CELL_OK, "an immediate flip is accepted");
+        check(cellGcm_guest_flip_count() == g0 + 2u && cellGcm_flip_request_count() == r0 + 2u,
+              "it counts on both clocks at the request");
+
+        const u32 g1 = cellGcm_guest_flip_count(), r1 = cellGcm_flip_request_count();
+        check(cellGcmSetFlipCommand(CELL_GCM_MAX_DISPLAY_BUFFER_NUM) == CELL_GCM_ERROR_INVALID_VALUE,
+              "a buffer id out of range is refused");
+        check(cellGcmSetPrepareFlip(NULL, CELL_GCM_MAX_DISPLAY_BUFFER_NUM) == CELL_GCM_ERROR_INVALID_VALUE,
+              "and so is one through SetPrepareFlip");
+        check(_cellGcmSetFlipCommandWithWaitLabel((void*)(uintptr_t)ctx, CELL_GCM_MAX_DISPLAY_BUFFER_NUM, LABEL, VALUE)
+                  == CELL_GCM_ERROR_INVALID_VALUE,
+              "and one queued in the stream for it");
+        check(cellGcm_guest_flip_count() == g1 && cellGcm_flip_request_count() == r1,
+              "a refused flip advances neither clock");
+    }
 
     printf("[gcm_flip_stream] %s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
     free(vm_base);

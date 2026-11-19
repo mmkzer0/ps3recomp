@@ -351,6 +351,18 @@ u32 cellGcm_flip_request_count(void)
 {
     return s_flip_request_count;
 }
+
+/* Flip requests as the guest made them, counted on the calling thread when the request passes its
+ * argument checks. The count above is the present loop's frame boundary, and for an in-FIFO flip the
+ * walker raises it when it drains the marker -- the walker's pace, which under host load drifts against
+ * the guest's own poll sequence (a pad trace keyed on it landed the same input on a different guest poll
+ * from run to run: libs/input/pad_trace.h). This one advances in guest program order. */
+static _Atomic uint32_t s_guest_flip_requests = 0;
+
+u32 cellGcm_guest_flip_count(void)
+{
+    return atomic_load_explicit(&s_guest_flip_requests, memory_order_acquire);
+}
 static u32  s_debug_level = CELL_GCM_DEBUG_LEVEL0;
 
 /* Display buffers */
@@ -5132,6 +5144,9 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
         s_flip_direct_pending = 1;
         gcm_walker_wake(GCM_WALKER_WAKE_WORK);  /* after the state it publishes: s_flip_pending */
     }
+    /* The guest's flip clock: at the request, on this thread, for the immediate and the in-FIFO form (the
+     * latter's s_flip_request_count waits for the drain). */
+    atomic_fetch_add_explicit(&s_guest_flip_requests, 1, memory_order_release);
     /* Flip requested but not yet shown: the status stays WAITING until the present thread's
      * cellGcmTickFlip marks it done (vsync). cellGcmSetWaitFlip does not look at it: its wait is the
      * RSX's, on label 0x10. */
@@ -5339,6 +5354,9 @@ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
     gcm_set_current_display_buffer(bufferId);
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
     s_flip_request_count++;
+    /* As in gcm_flip_request: the guest's flip clock advances at the request, whatever the present
+     * boundary above does. */
+    atomic_fetch_add_explicit(&s_guest_flip_requests, 1, memory_order_release);
     s_last_flip_time = get_timestamp_ns();
 
     /* Invoke the guest flip handler via OPD resolution -- s_flip_handler holds

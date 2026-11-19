@@ -56,6 +56,7 @@ HOST_HELPERS = set("""
     cellGcm_fifo_kick_wait
     cellGcm_fifo_recycle
     cellGcm_flip_request_count
+    cellGcm_guest_flip_count
     cellGcm_ref_on_poll
     cellGcm_replay_display_buffers_to_engine
     cellGcm_request_tick
