@@ -65,14 +65,19 @@ int main(void)
     printf("smallest decrementer step: %u ticks\n", min_step);
     CHECK(min_step < 40u);
 
-    /* Tracks a sleep: 50 ms is 3.99 M ticks. Allow for an oversleep. */
+    /* Tracks a sleep: 50 ms is 3.99 M ticks. Allow for an oversleep. The second channel read comes
+     * BEFORE the closing timestamp, so the measured interval spans both reads: a scheduler stall
+     * between them (a loaded runner slept 195 ms for a 50 ms request, and the gap added 0.7 ms of
+     * ticks nobody counted) otherwise leaves the count outside its own window. The +2 ms covers the
+     * millisecond floor of now_ms and the tick granularity. */
     wrdec(0xFFFFFFFFu);
     const uint32_t a = rddec();
     struct timespec ts = { 0, 50 * 1000000L };
     const uint64_t t0 = now_ms();
     nanosleep(&ts, NULL);
+    const uint32_t b = rddec();
     const uint64_t slept_ms = now_ms() - t0;
-    const uint32_t ticks = a - rddec();
+    const uint32_t ticks = a - b;
     printf("50 ms sleep (%llu ms measured): %u ticks\n", (unsigned long long)slept_ms, ticks);
     CHECK(ticks >= (uint32_t)(SPU_DECREMENTER_HZ / 1000u * 49u));
     CHECK(ticks <= (uint32_t)(SPU_DECREMENTER_HZ / 1000u * (slept_ms + 2u)));
