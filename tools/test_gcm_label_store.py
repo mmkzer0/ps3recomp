@@ -7,6 +7,10 @@ ACQUIRE needs the RSX to read the kick first. Four runs of one fixture with a wa
   control    a plain store: it overtakes the walker, which is held at ACQUIRE(N) (the failure, reproduced);
   ordered    the store goes through the hook the runtime registers: it waits for the walker, which passes
              ACQUIRE(N) against the old value, and the next frame's ACQUIRE(N+1) passes as well;
+  unrung     the ordered flow with no doorbell hook installed at all (a host that polls and never
+             rings): the pass the host's own loop runs LATE_MS later is what the store waits for, so a
+             lost ring costs that wait and nothing else -- the store completes and #17 still holds
+             (ACQUIRE(N) was evaluated against the label's old value);
   no-walker  nobody walks: gcm-wait-timeout what=rsx-walker-pass;
   paused     nobody walks, and the host active clock (cellGcm_set_host_active_clock) stands still: the store
              outlives the timeout many times over without stopping, and stops once the clock runs again.
@@ -36,8 +40,8 @@ with tempfile.TemporaryDirectory(prefix='gcm-label-store-') as tmp:
                     str(root / 'tests/ps3_log_mirror_stub.c'),
                     str(root / 'libs/video/gcm_default_state.c'), *linker,
                     '-o', str(binary)], check=True)
-    for mode, timeout_ms, want in (('control', 2000, 0), ('ordered', 2000, 0), ('no-walker', 400, 70),
-                                   ('paused', 100, 70)):
+    for mode, timeout_ms, want in (('control', 2000, 0), ('ordered', 2000, 0), ('unrung', 2000, 0),
+                                   ('no-walker', 400, 70), ('paused', 100, 70)):
         result = subprocess.run([str(binary), mode, str(timeout_ms)], timeout=60, capture_output=True, text=True)
         print(result.stdout.strip())
         if result.returncode != want:
@@ -46,6 +50,13 @@ with tempfile.TemporaryDirectory(prefix='gcm-label-store-') as tmp:
         if mode in ('no-walker', 'paused') and ('what=rsx-walker-pass' not in result.stdout or
                                                 'func=cellGcm_label_store' not in result.stdout):
             raise SystemExit(f'test_gcm_label_store {mode}: the stop does not name the label-store wait')
+        if mode == 'unrung':
+            # A host that installs no hook must reach every check the ordered flow does, with no ring at all:
+            # the pass that ends the store's wait is the one its own poll loop runs.
+            if 'rings store=0 pass=0 work=0' not in result.stdout:
+                raise SystemExit(f'test_gcm_label_store unrung: a ring was recorded with no hook installed\n{result.stdout}')
+            if 'PASS (0 failed)' not in result.stdout:
+                raise SystemExit(f'test_gcm_label_store unrung: {result.stdout}')
         if mode == 'paused':
             # The pause held the clock through PAUSE_POLLS polls (far more wall time than the 100 ms timeout):
             # the fixture says so before the stop, and the stop only follows the pause's end.

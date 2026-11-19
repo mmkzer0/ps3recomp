@@ -19,6 +19,9 @@
  *               waits for a pass rings PASS before it waits (the pass it waits for) and STORE after (the store
  *               lands after the wait); a store with nothing to wait for rings nothing. cellGcm_rsx_walker_pending
  *               is true for a `put` that moved, false parked at an ACQUIRE, true once the label holds the value.
+ *   unrung      the ordered flow with NO doorbell hook installed: a ring that is never delivered (here, a host
+ *               that only polls) costs the wait for the pass its own loop runs, and #17 still holds. Every
+ *               invariant of `ordered` is asserted, and every ring count must be zero.
  *   no-walker   nobody walks: the store stops with gcm-wait-timeout what=rsx-walker-pass.
  *
  * Run as tools/test_gcm_label_store.py does: `test <mode> <timeout ms>`; control and ordered must exit 0,
@@ -265,6 +268,12 @@ int main(int argc, char** argv)
     if (argc > 2) g_timeout_ms = (unsigned)atoi(argv[2]);
     const int paused = !strcmp(mode, "paused");
     const int no_walker = !strcmp(mode, "no-walker") || paused;
+    /* unrung: the ordered flow with no doorbell hook installed at all -- a host that polls and never rings. The
+     * store's pass still comes from the host's own loop (here, one LATE_MS after the kick), which is what a missed
+     * ring degrades to. Ordering is carried by the pass counters, never by the ring or by a sleep. */
+    const int unrung = !strcmp(mode, "unrung");
+    const unsigned want_store = unrung ? 0u : 1u, want_pass = unrung ? 0u : 1u;
+    const unsigned want_store_end = unrung ? 0u : 2u, want_pass_end = unrung ? 0u : 3u;
     g_mode_ordered = strcmp(mode, "control") != 0;
     const uint32_t vm_size = ppu_hle_inject_base + 0x10000u;
     vm_base = (uint8_t*)calloc(1, vm_size);
@@ -285,7 +294,7 @@ int main(int argc, char** argv)
     check((uint32_t)ppu_store_window == GCM_LABEL_GUEST_BASE &&
           (ppu_store_window >> 32) == GCM_CONTROL_GUEST_ADDR + GCM_CONTROL_REG_BYTES - GCM_LABEL_GUEST_BASE,
           "the first pass registered the store hook for the label area and the control register");
-    cellGcm_set_walker_wake_hook(test_wake);
+    if (!unrung) cellGcm_set_walker_wake_hook(test_wake);
 
     if (paused) {
         g_pause_t0 = now_ms();
@@ -337,10 +346,14 @@ int main(int argc, char** argv)
     check(now_ms() - t2 < LATE_MS / 2u, "ordered: a walker thread's own store does not wait");
 
     /* The doorbell, counted over the whole run (the walker's own stores above ring nothing). The label store that
-     * waited found the walker caught up, not parked on its label: it needs the pass (PASS), and nothing after. */
-    check(atomic_load(&g_rings[0]) == 1u, "doorbell: STORE rang for the guest's put store only");
-    check(atomic_load(&g_rings[1]) == 1u,
-          "doorbell: PASS rang once, for the label store that waited (the one with get at put rang nothing)");
+     * waited found the walker caught up, not parked on its label: it needs the pass (PASS), and nothing after.
+     * unrung installs no hook, so every count is zero and the invariants above had to hold without one. */
+    check(atomic_load(&g_rings[0]) == want_store,
+          unrung ? "doorbell: with no hook installed nothing rang STORE"
+                 : "doorbell: STORE rang for the guest's put store only");
+    check(atomic_load(&g_rings[1]) == want_pass,
+          unrung ? "doorbell: with no hook installed nothing rang PASS"
+                 : "doorbell: PASS rang once, for the label store that waited (the one with get at put rang nothing)");
     check(atomic_load(&g_rings[2]) == 0u, "doorbell: nothing rang WORK");
 
     /* cellGcm_rsx_walker_pending: what the host may sleep through. `put` is at end3, the last pass ended caught up
@@ -360,14 +373,68 @@ int main(int argc, char** argv)
         usleep(500);
     }
     pthread_join(st, NULL);
-    check(atomic_load(&g_rings[1]) == 3u, "doorbell: PASS rang for each of the two stores that waited");
-    check(atomic_load(&g_rings[0]) == 2u,
+    check(atomic_load(&g_rings[1]) == want_pass_end,
+          "doorbell: PASS rang for each of the two stores that waited");
+    check(atomic_load(&g_rings[0]) == want_store_end,
           "doorbell: STORE rang once more, for the store to the label the walker is parked on only");
     check(vm_read32(LABEL_EA) == N + 2u, "pending: the store to the parked label landed");
     cellGcm_rsx_process_fifo();
     check(vm_read32(g_ctrl + 4) == end3 && cellGcm_rsx_walker_pending() == 0, "pending: caught up, nothing to do");
 
-    printf("[gcm_label_store ordered] %s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
+    /* ---- the pending-state table: every way a pass can leave work, each in the one case a pass would act ---- */
+    {
+        /* A non-empty fence queue: a pass publishes exactly ONE queued fence, so two leave one behind for the next
+         * pass, and that pass empties it. get == put and no flip, so the queue is the only reason. */
+        u32 io = end3, v = 0x51u;
+        io = put_cmd(io, 0, 0x50u, 1, &v);          /* NV406E SET_REFERENCE */
+        v = 0x52u;
+        io = put_cmd(io, 0, 0x50u, 1, &v);
+        vm_write32(g_ctrl + 0, io);
+        cellGcm_rsx_process_fifo();
+        check(cellGcm_rsx_walker_pending() == 1, "pending: a fence is still queued for publication");
+        cellGcm_rsx_process_fifo();
+        check(cellGcm_rsx_walker_pending() == 0, "pending: the fence queue is empty and nothing else is due");
+
+        /* A flip head with commands behind it: the pass stops at the head (MORE) and the flip is pending, so the
+         * host comes back to present and to drain the rest. */
+        (void)cellGcmSetDisplayBuffer(0, 0x100000u, 1280u * 4u, 1280u, 720u);   /* the head resolves a buffer */
+        u32 qbuf = 0u;
+        io = put_cmd(io, 7, 0xE944u, 1, &qbuf);      /* GCM_DRIVER_QUEUE: the buffer the head flips to */
+        u32 arg = 0x8000010Fu;                       /* GCM_FLIP_HEAD, buffer 0 */
+        io = put_cmd(io, 7, 0xE924u, 1, &arg);
+        const u32 flip_end = put_cmd(io, 7, 0x0B00u, 1, &arg);   /* a probe behind the head: work left */
+        vm_write32(g_ctrl + 0, flip_end);
+        cellGcm_rsx_process_fifo();
+        check(cellGcm_rsx_walker_pending() == 1, "pending: a pass stopped behind a flip head with commands unread");
+        /* Drain the rest: now get == put and only the pending flip keeps the walker awake (the present). */
+        cellGcm_rsx_process_fifo();
+        check(vm_read32(g_ctrl + 4) == flip_end && cellGcm_rsx_walker_pending() == 1,
+              "pending: a flip to present is due with the commands drained");
+        check(cellGcm_take_flip_pending_synced() == 1, "pending: the due flip was taken for its present");
+        check(cellGcm_rsx_walker_pending() == 0, "pending: presented, drained, idle");
+
+        /* A self-JUMP park: the walker stops on it every pass and a guest patches it in ring memory, which no hook
+         * can see, so the host must keep polling at its cadence. */
+        const u32 park_io = flip_end, park_ea = IO_ADDR + park_io;
+        vm_write32(park_ea, 0x20000000u | park_io);  /* JUMP to itself */
+        s_fifo_getoff = park_io;
+        vm_write32(g_ctrl + 4, park_io);
+        vm_write32(g_ctrl + 0, park_io + 8u);        /* put beyond the park */
+        cellGcm_rsx_process_fifo();
+        check(s_fifo_getoff == park_io, "pending: the pass stopped at the self-JUMP");
+        check(cellGcm_rsx_walker_pending() == 1, "pending: a self-JUMP park is polled for its patch");
+        vm_write32(g_ctrl + 0, park_io);             /* put back at get: nothing left to do */
+        check(cellGcm_rsx_walker_pending() == 1,
+              "pending: the park is still the record until a pass runs again (poll, do not sleep)");
+        cellGcm_rsx_process_fifo();                  /* get == put: the pass ends caught up */
+        check(cellGcm_rsx_walker_pending() == 0, "pending: idle again, nothing to do");
+    }
+
+
+
+    printf("[gcm_label_store %s] %s (%d failed); rings store=%u pass=%u work=%u\n", mode,
+           fails ? "FAIL" : "PASS", fails, atomic_load(&g_rings[0]), atomic_load(&g_rings[1]),
+           atomic_load(&g_rings[2]));
     free(vm_base);
     return fails ? 1 : 0;
 }

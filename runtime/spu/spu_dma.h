@@ -494,9 +494,16 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
      * walker reads the ACQUIRE, and waiting for a walker pass would deadlock that producer. Or it may
      * overwrite a label the walker has not read yet: it has to land after a pass, as a PPU store does. The
      * runtime cannot tell the two apart, so it counts the PUT and stops by name (docs/STOPS.md,
-     * spu-label-window) instead of guessing. ps3_label_window_spu_puts() exposes the count to diagnostics. */
-    if (mfc_is_put(cmd) && ps3_label_window_maybe((uint32_t)ea, size) &&
-        ps3_label_window_overlaps(ea, size)) {
+     * spu-label-window) instead of guessing. ps3_label_window_spu_puts() exposes the count to diagnostics.
+     *
+     * The model's own control registers are the exception (ppu_set_control_span): a store there needs no
+     * ordering, only the model's attention -- it is the doorbell a command-stream producer rings -- so a PUT
+     * wholly inside that span is made, and the model is told after the bytes are in memory (below). A PUT
+     * that reaches the rest of the window (a label) still stops: that is where the ordering matters. */
+    const int in_window = mfc_is_put(cmd) && ps3_label_window_maybe((uint32_t)ea, size) &&
+                          ps3_label_window_overlaps(ea, size);
+    const int control_put = in_window && ps3_label_window_in_control(ea, size);
+    if (in_window && !control_put) {
         ps3_stop_site site = { (uint32_t)spu->pc & SPU_LS_MASK, 0, spu->spu_id };
         ps3_stop_spu_label_window("mfc_do_transfer", cmd, ea, size, tag,
                                   ps3_label_window_note_spu_put(), &site);
@@ -807,6 +814,10 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
          * lock-line lock is already released by spu_lockline_unlock; this
          * covers the copies that skip it. */
         __atomic_thread_fence(__ATOMIC_RELEASE);
+        /* A PUT into the model's control registers is the one SPU store it was waiting for: the bytes are in
+         * memory and released, so say so (the model rings its worker; the store needs no ordering). Nothing to
+         * say for any other PUT, and nothing for a GET. */
+        if (control_put) ps3_label_window_control_landed((uint32_t)ea);
         /* Tell whoever is listening where this PUT landed.
          *
          * A title whose SPUs build the RSX command stream never tells libgcm

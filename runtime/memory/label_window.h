@@ -54,6 +54,28 @@ void ps3_label_window_store(uint32_t ea, uint32_t n, uint32_t value);
  * transfer size in bytes. */
 int ps3_label_window_overlaps(uint64_t ea, uint32_t n);
 
+/* The model's own control registers, a sub-span of the window: a store there needs the
+ * model's hook (a doorbell), never the ordering. A store into a label has to be ordered
+ * after the model was handed it (the store hook above); a store into the model's control
+ * registers only tells the model there is work, and its value is its own protocol's. This
+ * is what lets an SPU MFC PUT wholly inside the control span land: the runtime cannot
+ * order an SPU store (waiting for the model would deadlock the producer), so a PUT that
+ * reaches a label still stops, while one that only kicks the model is made and the model
+ * is told it landed (`landed`, after the bytes are in memory). `landed` may be NULL, in
+ * which case the store is still allowed. The span must be inside the window; len 0
+ * registers none. Replaces the previous registration atomically. */
+typedef void (*ps3_label_window_landed_fn)(uint32_t ea);
+void ppu_set_control_span(uint32_t lo, uint32_t len, ps3_label_window_landed_fn landed);
+
+/* Is [ea, ea + n) wholly inside the control span? The caller has already established that
+ * the span overlaps the window; this is the exact test, in 64-bit arithmetic, and it is
+ * false when no control span is registered. n must be > 0. */
+int ps3_label_window_in_control(uint64_t ea, uint32_t n);
+
+/* The bytes of a store into the control span are in memory: run the model's landed hook,
+ * once. Called by the runtime's own store paths (an SPU PUT), after the copy. */
+void ps3_label_window_control_landed(uint32_t ea);
+
 /* Process-wide count of SPU PUT/PUTL and atomic put transfers whose span overlapped the
  * window. Bumped before the named stop, so it is observable from the first
  * such transfer on (the stop's `count` field, or this accessor). */

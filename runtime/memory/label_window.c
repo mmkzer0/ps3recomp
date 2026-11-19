@@ -3,8 +3,11 @@
  *
  * One window and one hook, process-wide: a device model registers it and every
  * guest store that overlaps it is ordered after what the model was handed. The
- * walker-pass counters live here too, because the hook's wait (and the walker's
- * own store exemption) are part of the same contract.
+ * model may mark a sub-span as its own control registers (ppu_set_control_span):
+ * a store there needs the hook, not the ordering, so an SPU store into it is
+ * allowed through instead of stopping. The walker-pass counters live here too,
+ * because the hook's wait (and the walker's own store exemption) are part of the
+ * same contract.
  */
 #include "label_window.h"
 
@@ -20,6 +23,8 @@
 uint64_t ppu_store_window;                  /* zero-initialised: no window */
 
 static _Atomic(ps3_label_window_fn) s_hook;
+static _Atomic uint64_t s_control_span;     /* lo | len << 32; len 0 = none */
+static _Atomic(ps3_label_window_landed_fn) s_landed;
 static _Atomic unsigned long long s_pass_begin, s_pass_end;
 static _Atomic unsigned long long s_spu_puts;
 static LW_TLS int t_walker;                 /* this thread has run a walker pass */
@@ -38,6 +43,14 @@ void ppu_set_store_hook(uint32_t lo, uint32_t len, ps3_label_window_fn fn)
     __atomic_store_n(&ppu_store_window, ((uint64_t)len << 32) | lo, __ATOMIC_RELEASE);
 }
 
+void ppu_set_control_span(uint32_t lo, uint32_t len, ps3_label_window_landed_fn landed)
+{
+    /* Same order as ppu_set_store_hook: the callback is published before the span
+     * that makes it reachable. */
+    atomic_store_explicit(&s_landed, landed, memory_order_release);
+    atomic_store_explicit(&s_control_span, len ? ((uint64_t)len << 32) | lo : 0u, memory_order_release);
+}
+
 void ps3_label_window_store(uint32_t ea, uint32_t n, uint32_t value)
 {
     const uint64_t w = __atomic_load_n(&ppu_store_window, __ATOMIC_ACQUIRE);
@@ -53,6 +66,20 @@ int ps3_label_window_overlaps(uint64_t ea, uint32_t n)
     const uint64_t w = __atomic_load_n(&ppu_store_window, __ATOMIC_ACQUIRE);
     const uint64_t lo = (uint32_t)w, len = w >> 32;
     return len && ea < lo + len && ea + n > lo;
+}
+
+int ps3_label_window_in_control(uint64_t ea, uint32_t n)
+{
+    if (!n) return 0;
+    const uint64_t c = atomic_load_explicit(&s_control_span, memory_order_acquire);
+    const uint64_t lo = (uint32_t)c, len = c >> 32;
+    return len && ea >= lo && ea + n <= lo + len;
+}
+
+void ps3_label_window_control_landed(uint32_t ea)
+{
+    const ps3_label_window_landed_fn fn = atomic_load_explicit(&s_landed, memory_order_acquire);
+    if (fn) fn(ea);
 }
 
 unsigned long long ps3_label_window_spu_puts(void)
