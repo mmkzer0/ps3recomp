@@ -79,6 +79,37 @@ int ps3_usleep_site_register(uint32_t lr, uint64_t max_sleep_ns, ps3_usleep_dead
 
 /* sys_timer_usleep calls the seam slept to a deadline, for tests and diagnostics. */
 uint64_t sys_timer_usleep_site_count(void);
+
+/* ---- flip-wait sites (same option, same table, same one-sleeper rule) ----------------------------------------
+ * A guest that waits for a flip with `do { status = cellGcmGetFlipStatus(); if (!status) break; usleep(n); }` has no
+ * deadline to compute: what ends the loop is the flip status the toolkit holds (CELL_GCM_FLIP_STATUS_DONE, which a
+ * GCM pump sets after the walker's cellGcmTickFlip). A title that has shown, from its binary, that a usleep site
+ * is that loop and nothing else registers it here; a sys_timer_usleep from `lr` with the option on then sleeps until
+ * the flip status is DONE or `cap_ns` has passed, whichever is first, instead of for the guest's argument, and
+ * returns to the guest, which re-reads the status itself exactly as after any usleep. Nothing the guest reads or
+ * writes is touched; what moves is the number of syscalls and the instant of the next read. The guest's next read
+ * is by construction behind a pump (every HLE call and every syscall pumps first), so a flip completion the pump
+ * would deliver is delivered before it.
+ *
+ * `guard` runs on every usleep whose guest return address is `lr`, on the calling guest thread, before anything
+ * else, and returns nonzero only when the registers say this call is the loop the registration is for (syscall
+ * number, the loop's own argument); 0 takes the ordinary usleep(r3). It must be quick, must not block and must not
+ * call into the guest; it is where a title fails closed on a state it did not expect.
+ *
+ * The wait is also ended by any GCM notification (vblank, flip, user command), which is pumped on the sleeping
+ * thread before the status is looked at again, so handlers are delivered as soon as a poll would deliver them; the
+ * status is looked at after every pump, so a completion is never waited out. `cap_ns` bounds one call (a wake
+ * that never comes, a host that stopped delivering flips, an app in the background) and is what keeps the guest
+ * polling at 1/cap instead of 1/n. A flip that completed before the call began returns at once. The seam needs the
+ * GCM module (the status and the waker): without it every such call takes the ordinary usleep.
+ *
+ * Returns 0, or -1 for an lr or cap of 0, a null guard, a duplicate lr or a full table (8 sites, shared with
+ * ps3_usleep_site_register). Register from one thread before the first guest thread runs. */
+typedef int (*ps3_usleep_guard_fn)(ppu_context* ctx);
+int ps3_usleep_flip_wait_register(uint32_t lr, uint64_t cap_ns, ps3_usleep_guard_fn guard);
+
+/* sys_timer_usleep calls a flip-wait site took, for tests and diagnostics. */
+uint64_t sys_timer_usleep_flip_wait_count(void);
 #endif
 
 #ifdef _WIN32

@@ -259,14 +259,18 @@ if(NOT WIN32 AND TARGET ps3recomp_runtime)
     target_link_libraries(test_usleep_site PRIVATE ps3recomp_runtime)
     set_target_properties(test_usleep_site PROPERTIES LINKER_LANGUAGE CXX)
 
-    foreach(_m IN ITEMS site wake guard guard-ring contract off spin0 spin2000 register)
+    foreach(_m IN ITEMS site wake guard guard-ring contract off spin0 spin2000 register
+                        fw-event fw-notify fw-cap fw-fallback fw-done-wake)
         add_test(NAME usleep_site_${_m} COMMAND test_usleep_site ${_m})
     endforeach()
     add_test(NAME usleep_site_timing COMMAND test_usleep_site timing 200)
+    add_test(NAME usleep_site_fw-timing COMMAND test_usleep_site fw-timing 500)
     set_tests_properties(usleep_site_site usleep_site_wake usleep_site_guard usleep_site_guard-ring
-        usleep_site_contract usleep_site_register PROPERTIES LABELS "runtime;syscalls;t0;tsan" TIMEOUT 60)
+        usleep_site_contract usleep_site_register usleep_site_fw-event usleep_site_fw-notify usleep_site_fw-cap
+        usleep_site_fw-fallback usleep_site_fw-done-wake PROPERTIES LABELS "runtime;syscalls;t0;tsan" TIMEOUT 60)
     set_tests_properties(usleep_site_off usleep_site_spin0 usleep_site_spin2000
         PROPERTIES LABELS "runtime;syscalls;t0" TIMEOUT 60)
+    set_tests_properties(usleep_site_fw-timing PROPERTIES LABELS "runtime;syscalls;stress" TIMEOUT 120)
     set_tests_properties(usleep_site_timing PROPERTIES LABELS "runtime;syscalls;stress" TIMEOUT 120)
     # Every run states both options, so what CTest inherited cannot change it (plain ENVIRONMENT: the project's
     # CMake floor is 3.20, ENVIRONMENT_MODIFICATION needs 3.22). The spin is stated at its default except where a
@@ -274,7 +278,8 @@ if(NOT WIN32 AND TARGET ps3recomp_runtime)
     set_tests_properties(usleep_site_off usleep_site_register PROPERTIES ENVIRONMENT
         "PS3RECOMP_PPU_POLL_SLEEP_COALESCE=0;PS3RECOMP_PPU_POLL_SLEEP_SPIN_US=100")
     set_tests_properties(usleep_site_site usleep_site_wake usleep_site_guard usleep_site_guard-ring
-        usleep_site_contract usleep_site_timing PROPERTIES ENVIRONMENT
+        usleep_site_contract usleep_site_timing usleep_site_fw-timing usleep_site_fw-event usleep_site_fw-notify
+        usleep_site_fw-cap usleep_site_fw-fallback usleep_site_fw-done-wake PROPERTIES ENVIRONMENT
         "PS3RECOMP_PPU_POLL_SLEEP_COALESCE=1;PS3RECOMP_PPU_POLL_SLEEP_SPIN_US=100")
     set_tests_properties(usleep_site_spin0 PROPERTIES ENVIRONMENT
         "PS3RECOMP_PPU_POLL_SLEEP_COALESCE=1;PS3RECOMP_PPU_POLL_SLEEP_SPIN_US=0")

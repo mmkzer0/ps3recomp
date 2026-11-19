@@ -96,7 +96,11 @@ PS3_CFG_BOOL(ppu, poll_sleep_coalesce, 0,
     "no longer overshoots by the poll's own 17 us (a frame limiter then ticks 0.1 % faster). A sleep never "
     "runs past the bound the title registered, a deadline that is past, zero or beyond the bound takes the "
     "ordinary usleep, and a pending GCM notification ends the sleep early (the handler is delivered as soon as "
-    "a poll would deliver it, then the sleep resumes). Off by default, and with it off a registered site is ignored. "
+    "a poll would deliver it, then the sleep resumes). A flip-wait site (ps3_usleep_flip_wait_register: a guest "
+    "loop that polls the GCM flip status with short usleep calls until it reads DONE) sleeps until that status "
+    "is DONE or the site's cap, whichever is first, then returns to the guest, which reads the status again "
+    "itself: nothing it reads or writes changes, only the number of syscalls and the instant of its next look. "
+    "Off by default, and with it off a registered site is ignored. "
     "POSIX hosts only: Windows keeps the ordinary path, because its guest clock has a different base. Read "
     "once, at the first sleep.")
 
