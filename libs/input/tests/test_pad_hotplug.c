@@ -26,6 +26,7 @@ void ppu_resv_break_store(uint64_t ea) { (void)ea; }
 void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
 int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
 u32 cellGcm_flip_request_count(void) { return 0; }   /* PAD_CLOCK=flips */
+u32 cellGcm_guest_flip_count(void) { return 0; }     /* the pad trace's clock */
 void spu_coh_notify_write(uint32_t a) { (void)a; }
 void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
