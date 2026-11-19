@@ -15,6 +15,10 @@
  *               passes ACQUIRE(N) against the old value; then the label becomes N+1, the next segment's
  *               ACQUIRE(N+1) passes too, and nothing stopped. Also: with `get` at `put` the store does not
  *               wait (no walker needed), and a walker thread's own store never waits.
+ *               The doorbell (cellGcm_set_walker_wake_hook): the guest's `put` store rings STORE; a store that
+ *               waits for a pass rings PASS before it waits (the pass it waits for) and STORE after (the store
+ *               lands after the wait); a store with nothing to wait for rings nothing. cellGcm_rsx_walker_pending
+ *               is true for a `put` that moved, false parked at an ACQUIRE, true once the label holds the value.
  *   no-walker   nobody walks: the store stops with gcm-wait-timeout what=rsx-walker-pass.
  *
  * Run as tools/test_gcm_label_store.py does: `test <mode> <timeout ms>`; control and ordered must exit 0,
@@ -190,6 +194,24 @@ static atomic_int g_ppu_done;
 static unsigned g_hook_wait_ms, g_early_ms;
 static int g_mode_ordered;
 
+/* The doorbell's ringer log: one counter per reason. */
+static atomic_uint g_rings[3];
+static void test_wake(unsigned reasons)
+{
+    for (unsigned i = 0; i < 3; i++)
+        if (reasons & (1u << i)) atomic_fetch_add(&g_rings[i], 1u);
+}
+
+/* A guest thread storing while the main thread walks: a label the walker is not parked on, then the one it is. */
+static void* store_thread(void* arg)
+{
+    (void)arg;
+    guest_store32(OTHER_EA, 5u);
+    guest_store32(LABEL_EA, N + 2u);
+    atomic_store(&g_ppu_done, 1);
+    return NULL;
+}
+
 static unsigned long long now_ms(void)
 {
     struct timespec ts;
@@ -209,7 +231,7 @@ static void* ppu_thread(void* arg)
     if (g_mode_ordered) {
         /* The next frame's segment, behind the first one, waits for N+1. */
         g_end2 = put_segment(g_end1, N + 1u, 2);
-        vm_write32(g_ctrl + 0, g_end2);
+        guest_store32(g_ctrl + 0, g_end2);                              /* the guest's kick, through the hook */
         for (unsigned long long d = now_ms() + 3000; atomic_load(&seen_n) < 2 && now_ms() < d;) usleep(500);
         /* Caught up (get == put): a store has nothing to wait for and needs no walker. */
         for (unsigned long long d = now_ms() + 3000; vm_read32(g_ctrl + 4) != g_end2 && now_ms() < d;) usleep(500);
@@ -261,8 +283,9 @@ int main(int argc, char** argv)
     vm_write32(g_ctrl + 0, CMD0);
     cellGcm_rsx_process_fifo();                     /* the first pass registers the store hook; put == get */
     check((uint32_t)ppu_store_window == GCM_LABEL_GUEST_BASE &&
-          (ppu_store_window >> 32) == CELL_GCM_MAX_LABEL_COUNT * GCM_LABEL_STRIDE,
-          "the first pass registered the store hook for the 256-label window");
+          (ppu_store_window >> 32) == GCM_CONTROL_GUEST_ADDR + GCM_CONTROL_REG_BYTES - GCM_LABEL_GUEST_BASE,
+          "the first pass registered the store hook for the label area and the control register");
+    cellGcm_set_walker_wake_hook(test_wake);
 
     if (paused) {
         g_pause_t0 = now_ms();
@@ -312,6 +335,37 @@ int main(int argc, char** argv)
     const unsigned long long t2 = now_ms();
     guest_store32(OTHER_EA, 9u);
     check(now_ms() - t2 < LATE_MS / 2u, "ordered: a walker thread's own store does not wait");
+
+    /* The doorbell, counted over the whole run (the walker's own stores above ring nothing). The label store that
+     * waited found the walker caught up, not parked on its label: it needs the pass (PASS), and nothing after. */
+    check(atomic_load(&g_rings[0]) == 1u, "doorbell: STORE rang for the guest's put store only");
+    check(atomic_load(&g_rings[1]) == 1u,
+          "doorbell: PASS rang once, for the label store that waited (the one with get at put rang nothing)");
+    check(atomic_load(&g_rings[2]) == 0u, "doorbell: nothing rang WORK");
+
+    /* cellGcm_rsx_walker_pending: what the host may sleep through. `put` is at end3, the last pass ended caught up
+     * with an older put. */
+    check(cellGcm_rsx_walker_pending() == 1, "pending: put moved since the pass");
+    cellGcm_rsx_process_fifo();
+    check(cellGcm_rsx_walker_pending() == 0, "pending: parked at an ACQUIRE the label does not satisfy");
+
+    /* Parked on LABEL_EA: a store to another label needs a pass and nothing more; the store to the label the walker
+     * is parked on rings STORE as well (it lands after the wait, and satisfies the ACQUIRE). The thread stores while
+     * this one walks. */
+    pthread_t st;
+    atomic_store(&g_ppu_done, 0);
+    pthread_create(&st, NULL, store_thread, NULL);
+    for (unsigned long long d = now_ms() + 5000; !atomic_load(&g_ppu_done) && now_ms() < d;) {
+        cellGcm_rsx_process_fifo();
+        usleep(500);
+    }
+    pthread_join(st, NULL);
+    check(atomic_load(&g_rings[1]) == 3u, "doorbell: PASS rang for each of the two stores that waited");
+    check(atomic_load(&g_rings[0]) == 2u,
+          "doorbell: STORE rang once more, for the store to the label the walker is parked on only");
+    check(vm_read32(LABEL_EA) == N + 2u, "pending: the store to the parked label landed");
+    cellGcm_rsx_process_fifo();
+    check(vm_read32(g_ctrl + 4) == end3 && cellGcm_rsx_walker_pending() == 0, "pending: caught up, nothing to do");
 
     printf("[gcm_label_store ordered] %s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
     free(vm_base);
