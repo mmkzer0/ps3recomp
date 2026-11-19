@@ -291,6 +291,10 @@ void ps3_stop_set_mirror(ps3_stop_quiesce_fn quiesce, ps3_stop_mirror_fn mirror)
 uint64_t ppu_store_window;
 int ps3_label_window_overlaps(uint64_t ea, uint32_t size) { (void)ea; (void)size; return 0; }
 unsigned long long ps3_label_window_note_spu_put(void) { return 0; }
+/* This fixture registers no window and links none of its state (runtime/memory/label_window.c): an SPU PUT
+ * is never wholly inside a control span here, and nothing is told that one landed. */
+int ps3_label_window_in_control(uint64_t ea, uint32_t size) { (void)ea; (void)size; return 0; }
+void ps3_label_window_control_landed(uint32_t ea) { (void)ea; }
 
 PS3_NORETURN void ps3_stop(ps3_stop_kind kind, const char* what, const char* remedy,
                            const ps3_stop_field* fields, size_t nfields,

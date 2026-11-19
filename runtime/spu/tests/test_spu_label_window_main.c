@@ -88,6 +88,8 @@ unsigned long long ps3_ms_now(void)
 enum {
     WINDOW_EA = 0x00020000,       /* 16-byte aligned, above the null-page PUT guard */
     WINDOW_LEN = 0x100,
+    CONTROL_EA = WINDOW_EA + 0x40, /* the model's control registers, a sub-span of the window */
+    CONTROL_LEN = 0x28,           /* not a multiple of 16: a 16-byte PUT can straddle its end */
     LINE_EA   = WINDOW_EA + 0x80, /* the 128-byte line overlapping the window's top half */
     OUTSIDE_LINE_EA = WINDOW_EA + WINDOW_LEN,  /* the line just past the window */
     LS_DATA   = 0x3000,
@@ -148,6 +150,27 @@ static int fail(const char* what)
  * side's overlap decision, not the PPU callback's ordering. */
 static void noop_hook(uint32_t ea, uint32_t value) { (void)ea; (void)value; }
 
+/* The model's "your control register landed" callback (ppu_set_control_span): what an
+ * SPU PUT of the model's doorbell has to produce, exactly once. */
+static int g_landed_calls;
+static uint32_t g_landed_ea;
+static void landed_hook(uint32_t ea)
+{
+    g_landed_calls++;
+    g_landed_ea = ea;
+    printf("LANDED: 0x%08X\n", ea);
+    fflush(stdout);
+}
+
+/* The same window, with its control span marked: a PUT wholly inside CONTROL is a
+ * doorbell and lands; anything that reaches the rest of the window is a label store and
+ * still stops. */
+static void window_with_control_span(void)
+{
+    ppu_set_store_hook(WINDOW_EA, WINDOW_LEN, noop_hook);
+    ppu_set_control_span(CONTROL_EA, CONTROL_LEN, landed_hook);
+}
+
 /* One MFC channel write as the SPU issues it: the preferred slot of the value
  * is what the channel sees (spu_dma.h, mfc_channel_write). MFC_Cmd enters the
  * production path, spu_wrch -> spu_mfc_atomic. */
@@ -189,7 +212,7 @@ static void atomic_mode(const char* mode, uint32_t ea)
         mfc_atomic_cmd(MFC_GETLLAR_CMD, ea);
         fill_line(LS_LINE);
         mfc_atomic_cmd(MFC_PUTLLC_CMD, ea);
-    } else if (!strcmp(mode, "putlluc")) {
+    } else if (!strcmp(mode, "putlluc") || !strcmp(mode, "putlluc-control")) {
         fill_line(LS_LINE);
         mfc_atomic_cmd(MFC_PUTLLUC_CMD, ea);
     } else {
@@ -246,7 +269,7 @@ static void expect_untouched_stop(const char* mode, uint32_t line_ea)
 int main(int argc, char** argv)
 {
     if (argc != 2) {
-        fprintf(stderr, "usage: %s <overlap|overlap-edge|overlap-list|outside|overlap-control|outside-covered|putllc|putlluc|putqlluc|putlluc-outside>\n",
+        fprintf(stderr, "usage: %s <overlap|overlap-edge|overlap-list|outside|overlap-control|outside-covered|control-put|control-label|control-straddle|putllc|putlluc|putqlluc|putlluc-control|putlluc-outside>\n",
                 argv[0]);
         return 2;
     }
@@ -290,6 +313,29 @@ int main(int argc, char** argv)
          * with a window that does cover it has to stop. */
         ppu_set_store_hook(WINDOW_EA - 16, 16, noop_hook);
         put(WINDOW_EA - 16);
+    } else if (!strcmp(mode, "control-put")) {
+        /* A PUT wholly inside the model's control span is its doorbell: it lands (the
+         * SPU cannot wait for a pass, and nothing needs ordering) and the model is told
+         * once, with the transfer's EA. It must not count as a stop's SPU put. */
+        window_with_control_span();
+        put(CONTROL_EA);
+        if (!landed(CONTROL_EA)) return fail("the control-register PUT did not land");
+        if (g_landed_calls != 1 || g_landed_ea != CONTROL_EA)
+            return fail("the control-register PUT did not reach the model exactly once");
+        if (ps3_label_window_spu_puts() != 0)
+            return fail("a control-register PUT was counted as a stopped SPU put");
+        printf("PASS: the control-register PUT landed and the model was told once; spu_puts=0\n");
+        return 0;
+    } else if (!strcmp(mode, "control-label")) {
+        /* The same registrations, the same command, aimed at a label: the ordering still
+         * matters there, so it still stops -- and the model is not told it landed. */
+        window_with_control_span();
+        put(WINDOW_EA + 0x20);
+    } else if (!strcmp(mode, "control-straddle")) {
+        /* Ending past the control span's last byte is not a doorbell: the PUT would write
+         * words the model did not register as its own, so it stops. */
+        window_with_control_span();
+        put(CONTROL_EA + CONTROL_LEN - 8);   /* 0x20060: 16 bytes end 8 past the span */
     } else if (!strcmp(mode, "putllc") || !strcmp(mode, "putlluc") ||
                !strcmp(mode, "putqlluc")) {
         /* The line the window's top half covers: the atomic form must stop
@@ -300,6 +346,12 @@ int main(int argc, char** argv)
         ppu_set_store_hook(WINDOW_EA, WINDOW_LEN, noop_hook);
         memset(g_mem + LINE_EA, 0x5A, MFC_ATOMIC_LINE);
         expect_untouched_stop(mode, LINE_EA);
+    } else if (!strcmp(mode, "putlluc-control")) {
+        /* An atomic line store is a whole-line overwrite, not a doorbell: the model's control
+         * span does not let it through even though the line starts inside the span. */
+        window_with_control_span();
+        memset(g_mem + CONTROL_EA, 0x5A, MFC_ATOMIC_LINE);
+        expect_untouched_stop(mode, CONTROL_EA);
     } else if (!strcmp(mode, "putlluc-outside")) {
         ppu_set_store_hook(WINDOW_EA, WINDOW_LEN, noop_hook);
         fill_line(LS_LINE);

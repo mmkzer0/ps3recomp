@@ -91,6 +91,11 @@ def main():
             ("overlap-edge",   "0x20020", "16", "7", "2"),
             ("overlap-list",   "0x20010", "16", "7", "2"),
             ("outside-covered", "0x1FFF0", "16", "7", "2"),
+            # The window's control span is [0x20040, 0x20068): a PUT into a label with the
+            # span registered still stops (0x20020), and one that starts inside the span but
+            # ends past it (0x20060 + 16 = 0x20070) is not a doorbell and stops too.
+            ("control-label",  "0x20020", "16", "7", "2"),
+            ("control-straddle", "0x20060", "16", "7", "2"),
         ]
         for mode, ea, size, tag, spu_id in cases:
             p = g.run([str(binary), mode], env=env, timeout=60)
@@ -100,31 +105,42 @@ def main():
             assert (f["ea"], f["size"], f["tag"]) == (ea, size, tag), (mode, f)
             assert f["count"] == "1", (mode, f)
             assert f["pc"] == "0x1234" and f["tid"] == spu_id, (mode, f)
+            # A stopped store is not a landed one.
+            assert "LANDED:" not in p.stdout, (mode, p.stdout)
 
         # The atomic line stores: the staged EAL sits at window+0xA0, inside a
         # line whose base (window+0x80) overlaps the window. The line's bytes
         # must be untouched, which the fixture checks in the parent after the
         # child's stop ("UNTOUCHED: <mode>").
         for mode, cmd in (("putllc", "0xB4"), ("putlluc", "0xB0"),
-                          ("putqlluc", "0xB8")):
+                          ("putqlluc", "0xB8"), ("putlluc-control", "0xB0")):
             p = g.run([str(binary), mode], env=env, timeout=60)
             f = g.expect_stop(p, "spu-label-window")
             assert f["func"] == "spu_mfc_atomic", (mode, f)
             assert f["cmd"] == cmd, (mode, f)
-            assert (f["ea"], f["size"], f["tag"]) == ("0x20080", "128", "7"), (mode, f)
+            # The three at the window's top half, and putlluc-control on the line that covers
+            # the model's control span (a line store is never a doorbell; its base is 0x20000).
+            want_ea = "0x20000" if mode == "putlluc-control" else "0x20080"
+            assert (f["ea"], f["size"], f["tag"]) == (want_ea, "128", "7"), (mode, f)
             assert f["count"] == "1", (mode, f)
             assert f["pc"] == "0x1234" and f["tid"] == "2", (mode, f)
             assert f"UNTOUCHED: {mode}" in p.stdout, (mode, p.stdout, p.stderr)
 
-        for mode in ("overlap-control", "outside", "putlluc-outside"):
+        for mode in ("overlap-control", "outside", "putlluc-outside", "control-put"):
             p = g.run([str(binary), mode], env=env, timeout=60)
             assert p.returncode == 0, (mode, p.returncode, p.stdout, p.stderr)
             assert "spu_puts=0" in p.stdout, (mode, p.stdout, p.stderr)
             assert "PASS:" in p.stdout, (mode, p.stdout, p.stderr)
+        # The control-span PUT is the one SPU store into the window that is made: it must
+        # reach the model's landed callback exactly once, with the transfer's EA.
+        p = g.run([str(binary), "control-put"], env=env, timeout=60)
+        assert p.stdout.count("LANDED: 0x00020040") == 1, (p.stdout, p.stderr)
     print("PASS: an SPU PUT/PUTL and the atomic line stores (PUTLLC, PUTLLUC, "
           "PUTQLLUC) into the registered window stop with kind spu-label-window, "
           "the command, EA, size, tag, SPU id and count, leaving the line "
-          "unmoved; a PUT and a PUTLLUC outside the window land")
+          "unmoved; a PUT and a PUTLLUC outside the window land; a PUT wholly "
+          "inside the model's control span lands and reaches its landed callback "
+          "once, while a PUT into a label or past the span still stops")
     return 0
 
 
