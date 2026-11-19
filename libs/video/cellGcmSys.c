@@ -344,12 +344,20 @@ static volatile int s_flip_lock;
  * keeps partially-drained frames off screen (the ticker otherwise presents on
  * a fixed 16ms clock, and a drain that catches the guest mid-frame -- e.g.
  * while it's blocked in the FIFO-wrap recycle callback -- would show a
- * clear+few-draws frame as a visible flicker). */
-static volatile u32 s_flip_request_count = 0;
+ * clear+few-draws frame as a visible flicker).
+ *
+ * _Atomic, relaxed: four paths add to it (a guest thread for the immediate and
+ * the SetPrepareFlip form, the walker for the 0xFEAD marker and the 0xE924
+ * driver word) and its readers only compare it with the flip they last
+ * presented or report it. No frame state is published through the count: the
+ * frame reaches a presenter through s_flip_pending and the FIFO pointers, each
+ * ordered at its own handoff, so a reader one request behind presents one frame
+ * later and never a torn frame. */
+static _Atomic uint32_t s_flip_request_count = 0;
 
 u32 cellGcm_flip_request_count(void)
 {
-    return s_flip_request_count;
+    return atomic_load_explicit(&s_flip_request_count, memory_order_relaxed);
 }
 
 /* Flip requests as the guest made them, counted on the calling thread when the request passes its
@@ -4123,7 +4131,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * guest-visible half of the request. */
                 gcm_set_current_display_buffer(w & 7u);
                 atomic_store_explicit(&s_flip_pending, 1, memory_order_relaxed);
-                s_flip_request_count++;
+                atomic_fetch_add_explicit(&s_flip_request_count, 1, memory_order_relaxed);
                 /* Not past `queued`: a resync may already have written off
                  * this flip. */
                 if (s_fifo_flips_reached != s_fifo_flips_queued) s_fifo_flips_reached++;
@@ -4609,7 +4617,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                          * half ran when the command was emitted (cellGcm_emit_flip_command). */
                         gcm_set_current_display_buffer(fbuf);
                         atomic_store_explicit(&s_flip_pending, 1, memory_order_relaxed);
-                        s_flip_request_count++;
+                        atomic_fetch_add_explicit(&s_flip_request_count, 1, memory_order_relaxed);
                         if (s_fifo_flips_reached != s_fifo_flips_queued) s_fifo_flips_reached++;
                         gcm_driver_event(GCM_DRV_EVENT_FLIP_HEAD, fbuf);
                         s_drv_flip_label_pending = 1;
@@ -5140,7 +5148,7 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
     if (!in_fifo) {
         gcm_set_current_display_buffer(bufferId);
         atomic_store_explicit(&s_flip_pending, 1, memory_order_relaxed);   /* ticker: present BEFORE the next drain */
-        s_flip_request_count++;
+        atomic_fetch_add_explicit(&s_flip_request_count, 1, memory_order_relaxed);
         s_flip_direct_pending = 1;
         gcm_walker_wake(GCM_WALKER_WAKE_WORK);  /* after the state it publishes: s_flip_pending */
     }
@@ -5353,7 +5361,7 @@ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
 
     gcm_set_current_display_buffer(bufferId);
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
-    s_flip_request_count++;
+    atomic_fetch_add_explicit(&s_flip_request_count, 1, memory_order_relaxed);
     /* As in gcm_flip_request: the guest's flip clock advances at the request, whatever the present
      * boundary above does. */
     atomic_fetch_add_explicit(&s_guest_flip_requests, 1, memory_order_release);
