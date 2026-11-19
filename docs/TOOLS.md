@@ -1091,7 +1091,7 @@ decision `pad_trace` makes, after the host backend and every injector; a port's 
 `who` is the port, `a` a per-run edge sequence number, `b` an FNV-1a 32 digest of the report's `len` and 64
 button words. `ENG_PRESENT` is an instant emitted by the draw engine's `eng_present` when a present returned (a
 flip the FIFO resolved or a host-driven present; a skipped present emits none): `who` 0, `a` the engine's present
-ordinal, `b` 0. It is not kind 10 `PRESENT`, which stays the Metal backend's timed span. The report adds a
+ordinal, `b` 0. It is not kind 10 `PRESENT`, the draw engine's timed span around the same presents. The report adds a
 section (only to a trace that has a `PAD_EDGE`): for each edge the latency to the first `ENG_PRESENT` at or after
 it (the pad is read after the title's present, so that is the first present that can show the poll's input), with
 the edges, presents, edges with no present after them, and p50/p90/p99/max in ms (nearest rank); and a

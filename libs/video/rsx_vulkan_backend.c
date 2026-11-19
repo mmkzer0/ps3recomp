@@ -4814,7 +4814,7 @@ void rsx_vulkan_backend_present_begin(void)
 {
     if (!s_vk.device) return;
     s_vk.present_split = 1;
-    if (s_vk.eng_active) (void)rsx_draw_engine_present();   /* 0 = skipped duplicate (#144); this backend has no present span */
+    if (s_vk.eng_active) (void)rsx_draw_engine_present();   /* 0 = skipped duplicate (#144); the engine's eng_present emits the PRESENT span */
     else                 vk_cb_present(&s_vk, 0);
     s_vk.present_split = 0;
 }

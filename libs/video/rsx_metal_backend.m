@@ -6298,10 +6298,9 @@ void rsx_metal_backend_present(void)
      * flip itself (the harness, the boot smoke title) calls here, and a title
      * whose FIFO carries 0xE944 presents through the engine's own sink. */
     if (s_eng_active) {
-        const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
-        /* The span times presents, not host calls: a #144 duplicate that the engine skipped emits none. */
-        if (rsx_draw_engine_present() && ft_t0)
-            ps3_ft_span(PS3_FT_PRESENT, 0, 0, 0, ft_t0, ps3_ft_now());
+        /* The engine's PRESENT span (kind 10) times every present path, the FIFO flip head's included;
+         * emitting one here as well would count a host present twice. */
+        (void)rsx_draw_engine_present();
         return;
     }
     /* The vtable path: its own commit and drawable, one section. */
