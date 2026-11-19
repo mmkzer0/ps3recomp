@@ -487,6 +487,27 @@ void ppu_gcm_set_wake_hook(void (*hook)(void));
 int ppu_gcm_flip_done(void);
 #endif
 
+/* The walker's doorbell, for a host that lets the thread calling cellGcm_rsx_process_fifo sleep between passes
+ * instead of polling it. `hook` (null removes it) is called with the OR of these bits, from any thread, after
+ * the toolkit has published something a pass would act on; it must be quick and non-blocking, must not call into
+ * the walker, and must order the ring like a seq_cst read-modify-write (the label store's wait for a pass relies on
+ * a walker that observes a ring beginning a pass the ringer's earlier load of the pass counter precedes). A host
+ * that never installs one keeps polling, and nothing here costs it more than an acquire load per ring.
+ *   STORE  a guest store the walker acts on (`put`, or a label the walker may be parked on) is about to land: the
+ *          hook runs before the store does, so a pass that follows may not see it. The host looks again briefly
+ *          (cellGcm_rsx_walker_pending) and, if the store is later than that, polls for a short while.
+ *   PASS   a guest thread is waiting for a walker pass that begins after this ring (a label store): no store is
+ *          imminent, the host need only run a pass.
+ *   WORK   state a pass acts on was published (an HLE store of `put`, a flip to present, a new context).
+ * See the comment above s_walker_wake_hook in cellGcmSys.c for every source and what the timeout must cover. */
+#define GCM_WALKER_WAKE_STORE  1u
+#define GCM_WALKER_WAKE_PASS   2u
+#define GCM_WALKER_WAKE_WORK   4u
+void cellGcm_set_walker_wake_hook(void (*hook)(unsigned reasons));
+/* After a pass, on the thread that ran it: would another pass act with no ring to prompt it (see its definition).
+ * Zero lets the host sleep until the next ring; nonzero asks for a pass at the host's polling cadence. */
+int  cellGcm_rsx_walker_pending(void);
+
 /* Driver events the FIFO walker retires, for C3's event comparison. `seq` counts from 1 in
  * retirement order. The observer runs on the walker thread, inside the drain; it must not block. */
 typedef enum GcmDriverEventKind {

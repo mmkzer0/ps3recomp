@@ -798,6 +798,47 @@ static volatile int s_drv_flip_label_pending;
  * that point has executed, so the flip is ready to present. */
 static volatile int s_acquire_blocked;
 
+/* ---- the walker's doorbell -----------------------------------------------------------------------------------
+ *
+ * A host that lets the walker sleep between passes, instead of polling it at a fixed rate, installs a hook
+ * (cellGcm_set_walker_wake_hook) and is rung from whatever thread changes something a pass would act on. The hook
+ * runs on guest threads, on the vblank clock and inside HLE calls: it must be quick, must not block and must not
+ * call into the walker. With no hook installed a ring is one acquire load.
+ *
+ * Every way a pass can have something to do, and what rings for it (the host's own timeout covers the rest, so a
+ * source missed here costs latency, never a hang and never an ordering):
+ *   - the guest stores `put`: the store window covers the control register (gcm_guest_label_store); the hook runs
+ *     BEFORE the store lands and rings STORE, so the host looks again for a moment after a STORE pass that found
+ *     nothing (cellGcm_rsx_walker_pending), and falls back to short polls if the store is later than that.
+ *   - HLE code stores `put` (gcm_segment_switch, cellGcm_fifo_recycle, cellGcm_syscall_set_fifo): WORK, after it.
+ *   - the guest stores a label while commands are unread: the label hook rings PASS before it waits for a pass
+ *     (the pass it waits for) and STORE when it is done, because the store lands only after the wait and the
+ *     walker may by then be parked at an ACQUIRE that the store satisfies.
+ *   - a flip requested outside the stream sets `s_flip_pending` (gcm_flip_request): WORK. The context, and the
+ *     syscall bring-up, ring WORK so that the first pass, which registers the store window, is not left to the
+ *     host's timeout.
+ *   - what the walker produced itself (a flip to present, a queued fence to publish, commands left behind a flip
+ *     head, a self-JUMP park a guest patches in ring memory no hook sees) is not an event: the pass records where
+ *     it stopped and cellGcm_rsx_walker_pending() says whether another pass would act without one.
+ * An SPU store into the window stops by name (spu-label-window); the vblank is the host's own event.
+ */
+static _Atomic(void (*)(unsigned)) s_walker_wake_hook;
+void cellGcm_set_walker_wake_hook(void (*hook)(unsigned reasons))
+{
+    atomic_store_explicit(&s_walker_wake_hook, hook, memory_order_release);
+}
+static void gcm_walker_wake(unsigned reasons)
+{
+    void (*hook)(unsigned) = atomic_load_explicit(&s_walker_wake_hook, memory_order_acquire);
+    if (hook) hook(reasons);
+}
+
+/* Where the last pass stopped, for cellGcm_rsx_walker_pending: written by the pass, read by the thread that ran it. */
+enum { GCM_WSTOP_CAUGHT_UP = 0, GCM_WSTOP_MORE, GCM_WSTOP_ACQUIRE, GCM_WSTOP_PARK };
+static _Atomic u32 s_wstop_kind = GCM_WSTOP_CAUGHT_UP;   /* also read, as a hint, by a label store (gcm_guest_label_store) */
+static _Atomic u32 s_wstop_label_ea;
+static u32 s_wstop_label_val;     /* GCM_WSTOP_ACQUIRE: the label and the value it must hold */
+
 /* New session: no event retired, no flip awaiting its handshake, no acquire standing. */
 static void gcm_driver_events_reset(void)
 {
@@ -1232,6 +1273,7 @@ u32 cellGcmSetupContext(u32 ctx_out_addr, u32 cmdSize, u32 ioSize, u32 ioAddress
         gwrite32(ctx_out_addr, cdata);          /* *context = &ctxdata */
     s_gcm_ctx_out_ea = ctx_out_addr;   /* the title's gCellGcmCurrentContext */
     s_gcm_context_ea = cdata;                   /* RSX drains commands from here */
+    gcm_walker_wake(GCM_WALKER_WAKE_WORK);      /* the first pass registers the label store window */
     return cdata;
 }
 
@@ -3265,12 +3307,25 @@ static void gcm_rsx_process_fifo_unlocked(void);
  * The one HLE path that stores a label on a guest thread, cellGcmSetFlipCommandWithWaitLabel, calls it itself.
  */
 
+/* The window is the label area and the control register, and nothing between (the page between them holds no
+ * guest-visible state). A store into the control register is how the guest kicks the walker (`put`); it needs no
+ * ordering, only the doorbell. The hook runs before the bytes land and a raw store carries no value, so it rings
+ * STORE: the walker can look before the store lands, and the host rechecks for a moment (see gcm_walker_wake). */
+#define GCM_LABEL_AREA_BYTES   (CELL_GCM_MAX_LABEL_COUNT * GCM_LABEL_STRIDE)
+#define GCM_CONTROL_REG_BYTES  0xCu                 /* put, get, ref */
+
 static void gcm_guest_label_store(u32 ea, u32 value)
 {
     if (ps3_label_window_on_walker()) return;
+    if (ea >= GCM_CONTROL_GUEST_ADDR) { gcm_walker_wake(GCM_WALKER_WAKE_STORE); return; }
+    if (ea >= GCM_LABEL_GUEST_BASE + GCM_LABEL_AREA_BYTES) return;
     if (vm_read32(GCM_CONTROL_GUEST_ADDR + 0) == vm_read32(GCM_CONTROL_GUEST_ADDR + 4)) return;
     /* The next pass to begin: it takes the lock after this load, so it reads a `put` this thread has published. */
     const unsigned long long target = ps3_label_window_next_pass();
+    /* Ring after the target is taken: a walker that wakes for this ring begins a pass with an id >= target. The
+     * ring is seq_cst on the host side and the target load is seq_cst here, so the walker cannot observe the ring
+     * and still begin a pass this load preceded. */
+    gcm_walker_wake(GCM_WALKER_WAKE_PASS);
     const unsigned long long t0 = gcm_wait_clock_ms();
     const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
     /* A pass already open does not count for this store (it began before the store was reached), so the wait is
@@ -3285,6 +3340,16 @@ static void gcm_guest_label_store(u32 ea, u32 value)
                                       vm_read32(ea), (u32)waited);
         Sleep(spin < 64u ? 0u : 1u);
     }
+    /* The store lands after this return, usually well after the pass. Only a walker parked at an ACQUIRE on THIS
+     * label can be waiting for it; any other walker reads the label afresh when it reaches an ACQUIRE, whenever
+     * that is, so ringing for it would cost the host a wake and a poll window for nothing. The stop record was
+     * written by the pass this thread has just seen end (the pass counter is seq_cst), or by a later one. What this
+     * leaves open: a later pass that parks on this label while the store is still to land, with no ring after it
+     * (the thread descheduled between this test and the store); only the host's timeout covers it. (The wait loop
+     * above sleeps a millisecond a turn once it has yielded 64 times, so the store is often a millisecond after the
+     * pass.) */
+    if (s_wstop_kind == GCM_WSTOP_ACQUIRE && (ea > s_wstop_label_ea ? ea - s_wstop_label_ea : s_wstop_label_ea - ea) < GCM_LABEL_STRIDE)
+        gcm_walker_wake(GCM_WALKER_WAKE_STORE);
     if (ft_t0) {
         /* Every wait, however short: the report divides the total by the flips, so a filter would bias it. */
         extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
@@ -3296,7 +3361,8 @@ static void gcm_guest_label_store(u32 ea, u32 value)
 
 static void gcm_register_label_store_hook(void)
 {
-    ppu_set_store_hook(GCM_LABEL_GUEST_BASE, CELL_GCM_MAX_LABEL_COUNT * GCM_LABEL_STRIDE, gcm_guest_label_store);
+    ppu_set_store_hook(GCM_LABEL_GUEST_BASE, GCM_CONTROL_GUEST_ADDR + GCM_CONTROL_REG_BYTES - GCM_LABEL_GUEST_BASE,
+                       gcm_guest_label_store);
 }
 
 /* Kick event: a game thread whose fence wait finds the queue DRY signals the
@@ -3530,6 +3596,27 @@ void cellGcm_rsx_process_fifo(void)
         const uint64_t t1 = ps3_ft_now();
         if (t1 - ft_t0 >= ps3_ft_min_ns())
             ps3_ft_span(PS3_FT_DRAIN, 0, s_ft_sema_t0 ? 1u : 0u, 0, ft_t0, t1);
+    }
+}
+
+/* Would another pass do something now, with no event to prompt it? Called by the thread that ran the last pass,
+ * right after it (and again, to settle, after a STORE ring: see gcm_walker_wake). A false answer is a
+ * promise to the host that it may sleep until it is rung or its own timeout runs out; a true one costs a pass.
+ * It reads the guest's words unlocked: a stale read is a late answer, which the next ring or the timeout repairs.
+ *   - a flip to present (s_flip_pending): the host presents before the next pass, as it always has;
+ *   - a queued fence (a pass publishes ONE per pass, so the fences' observable lifetime is the host's cadence);
+ *   - stopped at the end of the commands: only a `put` that has moved since;
+ *   - stopped at an ACQUIRE: only the label holding the value now. The writer is a guest store (rung twice, see
+ *     gcm_guest_label_store), or the host's own vblank completion, which runs a pass itself;
+ *   - anything else stopped with commands unread (behind a flip head, out of word budget) or at a self-JUMP park,
+ *     which a guest patches in the ring with no hook to see it: poll at the host's cadence, as before. */
+int cellGcm_rsx_walker_pending(void)
+{
+    if (s_flip_pending || s_ref_qhead != s_ref_qtail) return 1;
+    switch (s_wstop_kind) {
+    case GCM_WSTOP_CAUGHT_UP: return vm_read32(GCM_CONTROL_GUEST_ADDR + 0) != s_fifo_getoff;
+    case GCM_WSTOP_ACQUIRE:   return vm_read32(s_wstop_label_ea) == s_wstop_label_val;
+    default:                  return 1;
     }
 }
 
@@ -3834,6 +3921,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * short of `put` every tick is the signature of a FIFO that can never
      * catch up, and the reason is the whole diagnosis. */
     const char* why = "caught-up";
+    u32 wkind = GCM_WSTOP_CAUGHT_UP;           /* where this pass stops, published at its end (never a transient state) */
     /* A replayed step reports the PUT its live pass saw (the capture records it, the flip backlog test reads
      * it) but stops where the step left the walker, so one recorded step is one iteration. */
     const u32 stop = s_replay.on ? s_replay.end : put;
@@ -4056,6 +4144,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                       }
                   }
                   why = "parked";
+                  wkind = GCM_WSTOP_PARK;
                   s_park_pass = 1;
                   break;
               }
@@ -4205,6 +4294,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
                                 ps3_stop_gcm_wait_timeout("cellGcm_rsx_process_fifo", "semaphore-acquire",
                                                           s_sema_offset, v, lv, (u32)waited);
                             if (PS3_FT_ON() && !s_ft_sema_t0) s_ft_sema_t0 = ps3_ft_now();
+                            s_wstop_label_val = v;
+                            s_wstop_label_ea = la;                 /* before the kind, which is published at pass end */
+                            wkind = GCM_WSTOP_ACQUIRE;
                             sem_blocked = 1; break;
                         }
                     }
@@ -4484,6 +4576,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
         if (s_cap) { gcm_cap_step(RSX_CAP_STEP_WORD, s_fifo_getoff, put, &w, 1, 0, 0, 0, 0); s_cap->step_end(); }
         s_fifo_getoff += 4;                    /* unknown word: skip */
     }
+    if (wkind == GCM_WSTOP_CAUGHT_UP && s_fifo_getoff != stop)
+        wkind = GCM_WSTOP_MORE;               /* a flip head, the word budget, a bad branch: unread commands remain */
+    s_wstop_kind = wkind;
 
     /* Walker watchdog. Everything above recovers from a *recognised* stall --
      * a branch we cannot take, a park the title abandoned. A walker that stops
@@ -4707,6 +4802,7 @@ static void gcm_segment_switch(u32 ctx)
     if (cur_off != 0xFFFFFFFFu) {
         atomic_thread_fence(memory_order_release);
         vm_write32(GCM_CONTROL_GUEST_ADDR + 0, cur_off);                 /* flush: put = current */
+        gcm_walker_wake(GCM_WALKER_WAKE_WORK);
     }
     u32 start, segend;
     if (end == s_ib.last_end) {
@@ -4785,6 +4881,7 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
          * word at `current` before the jump lands there. */
         atomic_thread_fence(memory_order_release);
         vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_begin);        /* put = begin */
+        gcm_walker_wake(GCM_WALKER_WAKE_WORK);
     }
 
     /* Wait (bounded ~2s) for the walker to consume the tail + take the jump so
@@ -4974,6 +5071,7 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
         s_flip_pending = 1;   /* ticker: present BEFORE the next drain */
         s_flip_request_count++;
         s_flip_direct_pending = 1;
+        gcm_walker_wake(GCM_WALKER_WAKE_WORK);  /* after the state it publishes: s_flip_pending */
     }
     /* Flip requested but not yet shown: the status stays WAITING until the present thread's
      * cellGcmTickFlip marks it done (vsync). cellGcmSetWaitFlip does not look at it: its wait is the
@@ -6435,6 +6533,7 @@ u32 cellGcm_syscall_bringup(u32 local_size)
     if (local_size)
         s_config.localSize = local_size;
     s_gcm_syscall_mode = 1;
+    gcm_walker_wake(GCM_WALKER_WAKE_WORK);
     return s_config.localAddress;
 }
 
@@ -6477,4 +6576,5 @@ void cellGcm_syscall_set_fifo(u32 put, u32 get)
     vm_write32(GCM_CONTROL_GUEST_ADDR + 4, get);
     s_fifo_getoff  = get;
     s_fifo_calloff = 0;
+    gcm_walker_wake(GCM_WALKER_WAKE_WORK);
 }
