@@ -80,7 +80,9 @@ enum ps3_ft_kind {
     PS3_FT_DRAIN       = 7,  /* one RSX FIFO drain pass, a = 1 if it ended on an ACQUIRE */
     PS3_FT_FLIP_FIFO   = 8,  /* instant: the RSX reached a flip, a = buffer            */
     PS3_FT_FLIP_REQ    = 9,  /* instant: the guest asked for a flip, a = buffer        */
-    PS3_FT_PRESENT     = 10, /* the host presented a guest frame                       */
+    PS3_FT_PRESENT     = 10, /* one present of a guest frame, timed around the backend's present; emitted by the
+                              * draw engine's eng_present, so the FIFO's flip head, the host's pacing call and an
+                              * explicit buffer present all count, and a skipped duplicate emits none */
     PS3_FT_GPU_ENCODE  = 11, /* Metal: CPU encode of the recorded draws, a = 1 present / 0 flush, b = records */
     PS3_FT_GPU_WAIT    = 12, /* Metal: CPU waits for the GPU, a = 1 present / 0 flush / 2 in-flight bound, b = flush reason */
     PS3_FT_READBACK    = 13, /* Metal: render target read back to the CPU, a = w, b = h */
@@ -208,7 +210,7 @@ enum ps3_ft_kind {
                               * this present shows (RSX_FRAME_NO_FLIP when no head has retired). A guest flip can be
                               * presented more than once (toolkit #144), so a consumer pairs an input edge only with a
                               * present whose flip id differs from the previous present's -- the first present of a frame.
-                              * Not PS3_FT_PRESENT (10): that kind is the Metal backend's timed span around a host-driven
+                              * Not PS3_FT_PRESENT (10): that kind is the draw engine's timed span around every
                               * present and the report keeps it as the RSX "present" row */
     PS3_FT_SHADER_COMPILE = 38, /* Metal: one shader compile, the newLibraryWithSource and, where the backend fetches
                               * the function at once, the newFunctionWithName that follows it (Metal can defer the

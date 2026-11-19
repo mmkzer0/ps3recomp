@@ -383,8 +383,7 @@ void rsx_draw_engine_flush(void);
  * after the backend reported a resize, recreation, background return or missed
  * present (rsx_draw_engine_require_represent). Returns 1 when the backend's
  * present ran and 0 when the call was skipped (a #144 duplicate, or a pacing
- * call with nothing rendered at the buffer's address): the backends use it to
- * keep their timed present span on real presents. */
+ * call with nothing rendered at the buffer's address). */
 int  rsx_draw_engine_present(void);
 /* A runner retiring a queued flip names the buffer explicitly. With display
  * buffers registered, a buffer that is unregistered or has no rendered surface

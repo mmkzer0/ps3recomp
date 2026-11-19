@@ -4209,14 +4209,19 @@ static void eng_present(u32 buffer_id, u32 target)
     g.last_present_surface = target;
     t_present_diag = (t_present_path & 3u) | ((buffer_id & 7u) << 2) | ((target & 0xFFu) << 5) |
                      ((t_present_method & 7u) << 13) | ((g.surfaces[target].handle & 0xFFu) << 16);
+    /* The PRESENT span times every present of a guest frame at this one point: a flip the FIFO
+     * resolved, the host's pacing call and an explicit buffer present all reach it, and a skipped
+     * duplicate reaches neither. It was emitted by the Metal host entry point before #144, where a
+     * FIFO flip's only present (the flip head) had none. */
+    const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
     g.be->present(g.be->user, g.surfaces[target].handle);
+    if (ft_t0) ps3_ft_span(PS3_FT_PRESENT, 0, 0, 0, ft_t0, ps3_ft_now());
     t_present_diag = 0;
     t_present_path = 0;
-    /* The one place every present of a frame passes (a flip the FIFO resolved, a host-driven present):
-     * the end of the input-to-present latency measurement. After the backend returned, so a drawable
+    /* The end of the input-to-present latency measurement: after the backend returned, so a drawable
      * wait is inside the interval; g.frames is this present's ordinal, and b is the flip the present
-     * shows, because a guest flip can be presented more than once (toolkit #144) and only the first
-     * present of a flip can show a frame built from a new pad read. */
+     * shows. A flip can be presented more than once (a re-present a backend asked for, #144), and only
+     * the first present of a flip can show a frame built from a new pad read. */
     if (PS3_FT_ON()) {
         const uint64_t t = ps3_ft_now();
         ps3_ft_span(PS3_FT_ENG_PRESENT, 0, g.frames, fid.flip_id, t, t);

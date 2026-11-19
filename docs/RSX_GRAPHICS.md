@@ -361,8 +361,10 @@ its only present), for a flip the engine did not present itself (the 0xFEAD mark
 `rsx_draw_engine_note_flip`), or after the backend signalled that the screen is stale
 (`rsx_draw_engine_require_represent`: a drawable or swapchain resize or recreation, a return from the iOS GPU gate,
 a present that missed its drawable or blit). The guest-frame counter (`rsx_metal_backend_note_guest_frame`) counts
-each `eng_present`, so it stays one per guest flip. Presenting twice was never harmless for cost: the engine keeps
-no per-present state that would make the second present a no-op.
+each `eng_present`, so it stays one per guest flip. The `PS3_FT_PRESENT` span is emitted at that same point, so a
+trace counts one timed present per guest flip whichever path presented it (the Metal host entry point used to emit
+it, and after the skip that entry point presents nothing for a FIFO flip). Presenting twice was never harmless for
+cost: the engine keeps no per-present state that would make the second present a no-op.
 
 **Frame identity.** The engine's present counter and the GCM's flip counter are separate: a guest flip is one present, at
 its head word, and the host's own presents add more (a title that does not flip through head words, every 0xFEAD /
