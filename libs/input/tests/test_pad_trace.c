@@ -81,10 +81,10 @@ static int count_sub(const char* hay, const char* needle)
     return n;
 }
 
-#define HEADER "{\"format\":\"ps3recomp-pad-trace\",\"version\":1,\"ports\":7}\n"
-#define STATE_CROSS    "{\"flip\":3,\"poll\":0,\"port\":0,\"len\":8,\"words\":[0,116,0,64,128,128,128,128]}\n"
-#define STATE_RELEASED "{\"flip\":3,\"poll\":2,\"port\":0,\"len\":8,\"words\":[0,116,0,0,128,128,128,128]}\n"
-#define STATE_START    "{\"flip\":7,\"poll\":0,\"port\":0,\"len\":8,\"words\":[0,116,8,0,128,128,128,128]}\n"
+#define HEADER "{\"format\":\"ps3recomp-pad-trace\",\"version\":2,\"clock\":\"guest-flip-requests\",\"ports\":7}\n"
+#define STATE_CROSS    "{\"flip\":3,\"poll\":0,\"port\":0,\"len\":8,\"words\":[0,116,0,64,128,128,128,128],\"seq\":3}\n"
+#define STATE_RELEASED "{\"flip\":3,\"poll\":2,\"port\":0,\"len\":8,\"words\":[0,116,0,0,128,128,128,128],\"seq\":5}\n"
+#define STATE_START    "{\"flip\":7,\"poll\":0,\"port\":0,\"len\":8,\"words\":[0,116,8,0,128,128,128,128],\"seq\":8}\n"
 
 static PadTraceState mk(int len, unsigned d1, unsigned d2, unsigned lx)
 {
@@ -159,8 +159,9 @@ static void case_roundtrip(void)
     pad_trace_destroy(t);
 
     text = read_text(path);
-    CHECK(strncmp(text, HEADER, strlen(HEADER)) == 0, "the file starts with the version-1 header");
+    CHECK(strncmp(text, HEADER, strlen(HEADER)) == 0, "the file starts with the version-2 header");
     CHECK(count_sub(text, "\"poll\":") == 4, "one state record per change and per port's first poll, got %d", count_sub(text, "\"poll\":"));
+    CHECK(count_sub(text, "\"seq\":") == 4, "every state record carries its poll ordinal, got %d", count_sub(text, "\"seq\":"));
     CHECK(count_sub(text, "\"conn\":") == 2, "a connection record only when the connection changes, got %d", count_sub(text, "\"conn\":"));
     CHECK(strstr(text, "{\"end\":true,\"flip\":9}\n") != NULL, "the end record names the last flip");
     CHECK(strchr(text, '/') == NULL && strstr(text, g_dir) == NULL, "no host path in the file");
@@ -188,6 +189,9 @@ static void case_roundtrip(void)
           (unsigned long long)s.exact, (unsigned long long)s.held);
     CHECK(s.records == 4 && s.records_reached == 4, "records %llu reached %llu", (unsigned long long)s.records,
           (unsigned long long)s.records_reached);
+    CHECK(s.records_at_ordinal == 4 && !s.have_ordinal_div,
+          "the same poll sequence reaches each record at the ordinal it was written with (%llu, divergence %d)",
+          (unsigned long long)s.records_at_ordinal, s.have_ordinal_div);
     CHECK(s.first_div_flip == -1, "the same polls never diverge (flip %lld)", (long long)s.first_div_flip);
     pad_trace_destroy(t);
 }
@@ -231,6 +235,9 @@ static void case_lookup(void)
     { PadTraceState r = poll(t, 0, &any, &fresh); CHECK(same(&r, &k_neutral_marker), "and it stays neutral"); }
     pad_trace_stats(t, &s);
     CHECK(s.ended, "the trace is reported as ended");
+    CHECK(s.records == 3 && s.records_at_ordinal == 3 && !s.have_ordinal_div,
+          "every record was reached at its recorded poll ordinal (%llu/%llu, divergence %d)",
+          (unsigned long long)s.records_at_ordinal, (unsigned long long)s.records, s.have_ordinal_div);
     pad_trace_destroy(t);
 }
 
@@ -311,6 +318,7 @@ static void case_record_replay(void)
     const char* out = scratch("out.trace");
     const PadTraceState cross = mk(8, 0, 0x40, 128), released = mk(8, 0, 0, 128), start = mk(8, 0x08, 0, 128);
     const PadTraceState live = mk(8, 0xFF, 0xFF, 1);   /* what a host pad would say; must not be recorded */
+    PadTraceStats s;
     PadTrace* t;
 
     write_text(src, HEADER STATE_CROSS STATE_RELEASED STATE_START "{\"end\":true,\"flip\":9}\n");
@@ -328,6 +336,10 @@ static void case_record_replay(void)
     { PadTraceState r = poll(t, 0, &live, NULL); CHECK(same(&r, &released), "the release"); }
     g_flip = 7;
     { PadTraceState r = poll(t, 0, &live, NULL); CHECK(same(&r, &start), "START"); }
+    pad_trace_stats(t, &s);
+    CHECK(s.records == 3 && s.records_at_ordinal == 3 && !s.have_ordinal_div,
+          "the copy's records keep the ordinals the polls were recorded at (%llu/%llu, divergence %d)",
+          (unsigned long long)s.records_at_ordinal, (unsigned long long)s.records, s.have_ordinal_div);
     pad_trace_destroy(t);
 }
 
@@ -379,6 +391,42 @@ static void case_threads(void)
     pad_trace_destroy(t);
 }
 
+/* ---- the poll ordinal: what reached_exactly cannot see ----------------------------------------------- */
+
+/* A recording whose flip 5 held two polls and flip 6 one. Replayed with the flip clock one poll early,
+ * every record is still hit exactly, so `reached_exactly` reports nothing missing; the release is served
+ * to the poll before the one it was recorded from, which is what `seq` reports. */
+static void case_ordinal(void)
+{
+    const char* path = scratch("ordinal.trace");
+    const PadTraceState press = mk(8, 0, 0x40, 128), release = mk(8, 0, 0, 128);
+    const PadTraceState any = mk(8, 0xFF, 0xFF, 1);
+    PadTrace* t;
+    PadTraceStats s;
+
+    write_text(path,
+               HEADER
+               "{\"flip\":5,\"poll\":0,\"port\":0,\"len\":8,\"words\":[0,116,0,64,128,128,128,128],\"seq\":0}\n"
+               "{\"flip\":6,\"poll\":0,\"port\":0,\"len\":8,\"words\":[0,116,0,0,128,128,128,128],\"seq\":2}\n"
+               "{\"end\":true,\"flip\":6}\n");
+    t = open_trace(NULL, path);
+    g_flip = 5;
+    { PadTraceState r = poll(t, 0, &any, NULL); CHECK(same(&r, &press), "flip 5 poll 0 is the press"); }
+    g_flip = 6;   /* the recording had one more poll in flip 5 */
+    { PadTraceState r = poll(t, 0, &any, NULL); CHECK(same(&r, &release), "flip 6 poll 0 is the release"); }
+    pad_trace_stats(t, &s);
+    CHECK(s.records == 2 && s.records_reached == 2,
+          "reached_exactly reports nothing missing: both records were hit (%llu/%llu)",
+          (unsigned long long)s.records_reached, (unsigned long long)s.records);
+    CHECK(s.records_at_ordinal == 1, "only the press was reached at the poll ordinal it was recorded from (%llu)",
+          (unsigned long long)s.records_at_ordinal);
+    CHECK(s.have_ordinal_div && s.ord_flip == 6 && s.ord_port == 0 && s.ord_recorded == 2 && s.ord_served == 1,
+          "the first divergence is flip 6 port 0, recorded seq 2, served seq 1 (have %d %u:%u:%llu:%llu)",
+          s.have_ordinal_div, s.ord_flip, s.ord_port, (unsigned long long)s.ord_recorded,
+          (unsigned long long)s.ord_served);
+    pad_trace_destroy(t);
+}
+
 /* ---- malformed files -------------------------------------------------------------------------------------- */
 
 typedef struct {
@@ -391,28 +439,35 @@ typedef struct {
 static const Bad k_bad[] = {
     { "empty",           "", 1, "header" },
     { "garbage-header",  "hello\n", 1, "header" },
-    { "wrong-format",    "{\"format\":\"other\",\"version\":1,\"ports\":7}\n", 1, "header" },
-    { "bad-ports",       "{\"format\":\"ps3recomp-pad-trace\",\"version\":1,\"ports\":8}\n", 1, "header" },
-    { "version-2",       "{\"format\":\"ps3recomp-pad-trace\",\"version\":2,\"ports\":7}\n", 1, "version" },
+    { "wrong-format",    "{\"format\":\"other\",\"version\":2,\"clock\":\"guest-flip-requests\",\"ports\":7}\n", 1, "header" },
+    { "bad-ports",       "{\"format\":\"ps3recomp-pad-trace\",\"version\":2,\"clock\":\"guest-flip-requests\",\"ports\":8}\n", 1, "header" },
+    { "no-clock",        "{\"format\":\"ps3recomp-pad-trace\",\"version\":2,\"ports\":7}\n", 1, "header" },
+    { "wrong-clock",     "{\"format\":\"ps3recomp-pad-trace\",\"version\":2,\"clock\":\"wall-clock\",\"ports\":7}\n", 1, "header" },
+    { "version-1",       "{\"format\":\"ps3recomp-pad-trace\",\"version\":1,\"ports\":7}\n", 1, "version" },
+    { "version-3",       "{\"format\":\"ps3recomp-pad-trace\",\"version\":3,\"clock\":\"guest-flip-requests\",\"ports\":7}\n", 1, "version" },
     { "truncated",       HEADER "{\"flip\":1,\"poll\":0,\"port\":0,\"len\":8,\"words\":[0", 2, "truncated" },
     { "syntax",          HEADER "{\"flip\":1,\"poll\":0,\"port\":0,\"len\":8,\"words\":[0,1}\n", 2, "syntax" },
     { "blank-line",      HEADER "\n", 2, "syntax" },
     { "unknown-key",     HEADER "{\"flip\":1,\"colour\":3}\n", 2, "unknown-key" },
     { "duplicate-key",   HEADER "{\"flip\":1,\"flip\":2}\n", 2, "duplicate-key" },
-    { "value-len",       HEADER "{\"flip\":1,\"poll\":0,\"port\":0,\"len\":999,\"words\":[]}\n", 2, "value" },
-    { "value-word",      HEADER "{\"flip\":1,\"poll\":0,\"port\":0,\"len\":8,\"words\":[70000]}\n", 2, "value" },
+    { "value-len",       HEADER "{\"flip\":1,\"poll\":0,\"port\":0,\"len\":999,\"words\":[],\"seq\":0}\n", 2, "value" },
+    { "value-word",      HEADER "{\"flip\":1,\"poll\":0,\"port\":0,\"len\":8,\"words\":[70000],\"seq\":0}\n", 2, "value" },
     { "conn-length",     HEADER "{\"flip\":1,\"conn\":[1,0]}\n", 2, "value" },
     { "record-kind",     HEADER "{\"flip\":1,\"poll\":0}\n", 2, "record-kind" },
-    { "poll-backwards",  HEADER "{\"flip\":3,\"poll\":2,\"port\":0,\"len\":8,\"words\":[]}\n"
-                                "{\"flip\":3,\"poll\":1,\"port\":0,\"len\":8,\"words\":[]}\n", 3, "keys-backwards" },
-    { "same-key",        HEADER "{\"flip\":3,\"poll\":0,\"port\":0,\"len\":8,\"words\":[]}\n"
-                                "{\"flip\":3,\"poll\":0,\"port\":0,\"len\":8,\"words\":[]}\n", 3, "keys-backwards" },
-    { "flip-backwards",  HEADER "{\"flip\":5,\"poll\":0,\"port\":0,\"len\":8,\"words\":[]}\n"
-                                "{\"flip\":4,\"poll\":0,\"port\":1,\"len\":8,\"words\":[]}\n", 3, "keys-backwards" },
+    { "state-no-seq",    HEADER "{\"flip\":1,\"poll\":0,\"port\":0,\"len\":8,\"words\":[]}\n", 2, "value" },
+    { "state-bad-seq",   HEADER "{\"flip\":1,\"poll\":0,\"port\":0,\"len\":8,\"words\":[],\"seq\":-1}\n", 2, "syntax" },
+    { "poll-backwards",  HEADER "{\"flip\":3,\"poll\":2,\"port\":0,\"len\":8,\"words\":[],\"seq\":0}\n"
+                                "{\"flip\":3,\"poll\":1,\"port\":0,\"len\":8,\"words\":[],\"seq\":1}\n", 3, "keys-backwards" },
+    { "same-key",        HEADER "{\"flip\":3,\"poll\":0,\"port\":0,\"len\":8,\"words\":[],\"seq\":0}\n"
+                                "{\"flip\":3,\"poll\":0,\"port\":0,\"len\":8,\"words\":[],\"seq\":1}\n", 3, "keys-backwards" },
+    { "seq-backwards",   HEADER "{\"flip\":3,\"poll\":0,\"port\":0,\"len\":8,\"words\":[],\"seq\":5}\n"
+                                "{\"flip\":3,\"poll\":1,\"port\":0,\"len\":8,\"words\":[],\"seq\":5}\n", 3, "keys-backwards" },
+    { "flip-backwards",  HEADER "{\"flip\":5,\"poll\":0,\"port\":0,\"len\":8,\"words\":[],\"seq\":0}\n"
+                                "{\"flip\":4,\"poll\":0,\"port\":1,\"len\":8,\"words\":[],\"seq\":0}\n", 3, "keys-backwards" },
     { "step-backwards",  HEADER "{\"flip\":5,\"port\":0,\"polls\":2}\n{\"flip\":3,\"port\":0,\"polls\":0}\n", 3, "keys-backwards" },
-    { "end-backwards",   HEADER "{\"flip\":5,\"poll\":0,\"port\":0,\"len\":8,\"words\":[]}\n{\"end\":true,\"flip\":4}\n", 3, "keys-backwards" },
-    { "port-range",      "{\"format\":\"ps3recomp-pad-trace\",\"version\":1,\"ports\":2}\n"
-                         "{\"flip\":1,\"poll\":0,\"port\":2,\"len\":8,\"words\":[]}\n", 2, "port-range" },
+    { "end-backwards",   HEADER "{\"flip\":5,\"poll\":0,\"port\":0,\"len\":8,\"words\":[],\"seq\":0}\n{\"end\":true,\"flip\":4}\n", 3, "keys-backwards" },
+    { "port-range",      "{\"format\":\"ps3recomp-pad-trace\",\"version\":2,\"clock\":\"guest-flip-requests\",\"ports\":2}\n"
+                         "{\"flip\":1,\"poll\":0,\"port\":2,\"len\":8,\"words\":[],\"seq\":0}\n", 2, "port-range" },
     { "after-end",       HEADER "{\"end\":true,\"flip\":1}\n{\"flip\":2,\"conn\":[1,0,0,0,0,0,0]}\n", 3, "after-end" },
 };
 
@@ -429,6 +484,10 @@ static void case_errors(void)
         CHECK(e.role == PAD_TRACE_ROLE_REPLAY && e.line == k_bad[i].line && !strcmp(e.reason, k_bad[i].reason),
               "%s: wanted replay line %u %s, got role %d line %u %s (%s)", k_bad[i].name, k_bad[i].line, k_bad[i].reason,
               (int)e.role, e.line, e.reason, e.detail);
+        if (!strcmp(k_bad[i].name, "version-1"))
+            CHECK(strstr(e.detail, "walker") != NULL && strstr(e.detail, "re-record") != NULL,
+                  "a version-1 refusal says the old file keyed on the walker's count and must be re-recorded: %s",
+                  e.detail);
     }
 }
 
@@ -494,6 +553,7 @@ int main(int argc, char** argv)
     else if (!strcmp(argv[1], "lookup"))          case_lookup();
     else if (!strcmp(argv[1], "changes"))         case_changes();
     else if (!strcmp(argv[1], "poll-counts"))     case_poll_counts();
+    else if (!strcmp(argv[1], "ordinal"))         case_ordinal();
     else if (!strcmp(argv[1], "record-replay"))   case_record_replay();
     else if (!strcmp(argv[1], "threads"))         case_threads();
     else if (!strcmp(argv[1], "errors"))          case_errors();

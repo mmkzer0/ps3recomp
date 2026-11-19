@@ -24,6 +24,7 @@ void spu_coh_notify_write(uint32_t a){(void)a;}
 void spu_lockline_lock(void){}
 void spu_lockline_unlock(void){}
 u32 cellGcm_flip_request_count(void){return 0;}
+u32 cellGcm_guest_flip_count(void){return 0;}
 
 static int device,attached;
 static u16 device_buttons;

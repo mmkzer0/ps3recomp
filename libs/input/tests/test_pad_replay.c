@@ -38,7 +38,8 @@ void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
 
 static uint32_t g_flip;
-u32 cellGcm_flip_request_count(void) { return g_flip; }
+u32 cellGcm_flip_request_count(void) { return g_flip; }   /* PAD_CLOCK=flips */
+u32 cellGcm_guest_flip_count(void) { return g_flip; }     /* the pad trace's clock */
 
 static ps3_config g_cfg;
 const ps3_config* ps3_config_get(void) { return &g_cfg; }
@@ -114,9 +115,9 @@ static void case_control(void)
 static void case_replay(const char* path)
 {
     publish(path,
-            "{\"format\":\"ps3recomp-pad-trace\",\"version\":1,\"ports\":7}\n"
-            "{\"flip\":2,\"poll\":0,\"port\":0,\"len\":8,\"words\":[0,116,0,32,128,128,128,128]}\n"
-            "{\"flip\":4,\"poll\":0,\"port\":0,\"len\":8,\"words\":[0,116,0,0,128,128,128,128]}\n"
+            "{\"format\":\"ps3recomp-pad-trace\",\"version\":2,\"clock\":\"guest-flip-requests\",\"ports\":7}\n"
+            "{\"flip\":2,\"poll\":0,\"port\":0,\"len\":8,\"words\":[0,116,0,32,128,128,128,128],\"seq\":51}\n"
+            "{\"flip\":4,\"poll\":0,\"port\":0,\"len\":8,\"words\":[0,116,0,0,128,128,128,128],\"seq\":54}\n"
             "{\"end\":true,\"flip\":6}\n");
     snprintf(g_cfg.pad_replay, sizeof g_cfg.pad_replay, "%s", path);
     start();
@@ -152,12 +153,19 @@ static void case_replay(const char* path)
     cellPad_poll();   /* the host side keeps running; it must not reach the guest */
     g_flip = 8;
     CHECK(read_pad(0) > 0 && buttons() == 0, "host polling changes nothing: still a neutral pad");
+    {
+        PadTraceStats s;
+        pad_trace_stats(pad_trace_get(), &s);
+        CHECK(s.records == 2 && s.records_reached == 2 && s.records_at_ordinal == 2 && !s.have_ordinal_div,
+              "both records were served at the poll ordinal they were recorded from (%llu/%llu, divergence %d)",
+              (unsigned long long)s.records_at_ordinal, (unsigned long long)s.records, s.have_ordinal_div);
+    }
 }
 
 static void case_replay_info(const char* path)
 {
     publish(path,
-            "{\"format\":\"ps3recomp-pad-trace\",\"version\":1,\"ports\":7}\n"
+            "{\"format\":\"ps3recomp-pad-trace\",\"version\":2,\"clock\":\"guest-flip-requests\",\"ports\":7}\n"
             "{\"flip\":0,\"conn\":[1,1,0,0,0,0,0]}\n"
             "{\"flip\":2,\"conn\":[1,0,0,0,0,0,0]}\n"
             "{\"end\":true,\"flip\":3}\n");
@@ -240,13 +248,14 @@ static void case_record(const char* path)
     /* The recording replays to the words the guest read, poll for poll. */
     memset(&o, 0, sizeof o);
     o.replay_path = path;
-    o.flip = cellGcm_flip_request_count;
+    o.flip = cellGcm_guest_flip_count;
     memset(&e, 0, sizeof e);
     {
         PadTrace* rd = NULL;
         unsigned i = 0;
         CHECK(pad_trace_create(&o, &rd, &e) == 0 && rd, "the recording reads back: line %u %s %s", e.line, e.reason, e.detail);
         if (!rd) return;
+        PadTraceStats s;
         for (g_flip = 0; g_flip < 3; g_flip++) {
             for (unsigned k = 0; k < 20; k++, i++) {
                 PadTraceState st, neutral;
@@ -258,6 +267,10 @@ static void case_record(const char* path)
                       "poll %u (flip %u): the replayed state is what the guest read", i, seen[i].flip);
             }
         }
+        pad_trace_stats(rd, &s);
+        CHECK(s.records == 2 && s.records_at_ordinal == 2 && !s.have_ordinal_div,
+              "the real recording carries the ordinals its polls were taken at (%llu/%llu, divergence %d)",
+              (unsigned long long)s.records_at_ordinal, (unsigned long long)s.records, s.have_ordinal_div);
         pad_trace_destroy(rd);
     }
 }

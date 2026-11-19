@@ -2154,7 +2154,7 @@ if(PS3RECOMP_BUILD_TESTS)
         target_compile_definitions(test_pad_trace PRIVATE _GNU_SOURCE)
         target_link_libraries(test_pad_trace PRIVATE Threads::Threads)
         set_target_properties(test_pad_trace PROPERTIES LINKER_LANGUAGE CXX)
-        foreach(c roundtrip lookup changes poll-counts record-replay errors record-refusals)
+        foreach(c roundtrip lookup changes poll-counts ordinal record-replay errors record-refusals)
             add_test(NAME pad_trace_${c} COMMAND test_pad_trace ${c})
             set_tests_properties(pad_trace_${c} PROPERTIES LABELS "input;t0" TIMEOUT 60)
         endforeach()
@@ -2163,12 +2163,14 @@ if(PS3RECOMP_BUILD_TESTS)
         # name|line|reason of the replay file's first wrong line (the same table as k_bad in the test).
         foreach(row IN ITEMS
                 "empty|1|header" "garbage-header|1|header" "wrong-format|1|header" "bad-ports|1|header"
-                "version-2|1|version" "truncated|2|truncated" "syntax|2|syntax" "blank-line|2|syntax"
+                "no-clock|1|header" "wrong-clock|1|header" "version-1|1|version" "version-3|1|version"
+                "truncated|2|truncated" "syntax|2|syntax" "blank-line|2|syntax"
                 "unknown-key|2|unknown-key" "duplicate-key|2|duplicate-key" "value-len|2|value"
                 "value-word|2|value" "conn-length|2|value" "record-kind|2|record-kind"
-                "poll-backwards|3|keys-backwards" "same-key|3|keys-backwards" "flip-backwards|3|keys-backwards"
-                "step-backwards|3|keys-backwards" "end-backwards|3|keys-backwards" "port-range|2|port-range"
-                "after-end|3|after-end")
+                "state-no-seq|2|value" "state-bad-seq|2|syntax"
+                "poll-backwards|3|keys-backwards" "same-key|3|keys-backwards" "seq-backwards|3|keys-backwards"
+                "flip-backwards|3|keys-backwards" "step-backwards|3|keys-backwards" "end-backwards|3|keys-backwards"
+                "port-range|2|port-range" "after-end|3|after-end")
             string(REPLACE "|" ";" parts "${row}")
             list(GET parts 0 case_name)
             list(GET parts 1 case_line)
