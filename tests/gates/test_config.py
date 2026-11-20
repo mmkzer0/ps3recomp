@@ -120,6 +120,7 @@ def test_defaults_without_file_or_environment():
         "video.rsx_capture_frames": ("0", "default"),
         "pad.record": ('""', "default"),
         "pad.replay": ('""', "default"),
+        "pad.replay_repeat": ("1", "default"),
         "title.elf_sha256": ('""', "default"),
         "diag.dump_config": ("false", "default"),
         "log.file": ('""', "default"),
@@ -269,6 +270,7 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
             "video.rsx_capture_frames": "default",
             "pad.record": "default",
             "pad.replay": "default",
+            "pad.replay_repeat": "default",
             "title.elf_sha256": "env:PS3RECOMP_TITLE_ELF_SHA256",
             "diag.dump_config": "env:PS3RECOMP_DIAG_DUMP_CONFIG",
             "log.file": "default",
@@ -303,7 +305,7 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
                            "adec": {"silence_fallback": False},
                            "video": {"resolutions": "", "rsx_capture": False, "rsx_capture_dir": "",
                                      "rsx_capture_frames": 0},
-                           "pad": {"record": "", "replay": ""},
+                           "pad": {"record": "", "replay": "", "replay_repeat": 1},
                            "title": {"elf_sha256": SHA_A}, "diag": {"dump_config": False},
                            "log": {"file": "", "level": "info", "mute": "", "collapse": "file",
                                    "max_mb": 256}}, doc
@@ -541,6 +543,26 @@ def test_pad_trace_paths_are_checked_at_load():
             for p in (os.path.join(d, "ro"), os.path.join(d, "secret.trace")):
                 if os.path.exists(p):
                     os.chmod(p, 0o755)
+
+
+def test_pad_replay_repeat_is_bounded_and_comes_from_file_and_environment():
+    # k = 2 lets a recording made at one guest frame per 60 Hz tick feed a build that runs two guest
+    # frames per tick; bounding it keeps a typo from becoming an unbounded frame multiplier.
+    with Cfg("schema = 2", "[pad]", "replay_repeat = 2") as c:
+        o = options(probe("--load", c.path, "get"))
+        assert o["pad.replay_repeat"] == ("2", f"file:{c.path}"), o
+    o = options(probe("get", PS3RECOMP_PAD_REPLAY_REPEAT="8"))
+    assert o["pad.replay_repeat"] == ("8", "env:PS3RECOMP_PAD_REPLAY_REPEAT"), o
+    assert options(probe("get"))["pad.replay_repeat"] == ("1", "default")
+    for bad in ("0", "9", "4294967295"):
+        f = config_invalid(probe("get", PS3RECOMP_PAD_REPLAY_REPEAT=bad))
+        assert f["env"] == "PS3RECOMP_PAD_REPLAY_REPEAT" and f["key"] == "pad.replay_repeat", (bad, f)
+        assert "out of range" in f["detail"], (bad, f)
+    for bad in ("0", "9"):
+        with Cfg("schema = 2", "[pad]", f"replay_repeat = {bad}") as c:
+            f = config_invalid(probe("--load", c.path, "get"))
+            assert f["key"] == "pad.replay_repeat" and f["line"] == "3", (bad, f)
+            assert "out of range" in f["detail"], (bad, f)
 
 
 def test_schema_mismatch_missing_and_mistyped_stop():

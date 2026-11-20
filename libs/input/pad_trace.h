@@ -43,6 +43,27 @@
  * is neutral. A killed run has no end record, keeps serving the last record of
  * each port, and says so once at replay start.
  *
+ * pad.replay_repeat (PadTraceOptions.replay_repeat, default 1) serves each
+ * recorded frame k consecutive times, in the recording's own ordinal space and
+ * without the guest's flip clock (which drifts with host pace and load). Per
+ * port the replay keeps a virtual recorded ordinal v (from 0), the ordinal the
+ * current frame started at, and a repetition counter. Each guest poll is
+ * served exactly what the k = 1 path serves at ordinal v: the latest record at
+ * or before v, the neutral pad before the first record and from the end count
+ * on, and the held last record of a killed trace. A draining title polls until
+ * len is 0, so a poll served len 0 ends a frame: while the repetition is below
+ * k the repetition counter goes up and v returns to the frame's start ordinal;
+ * on the k-th the counter resets, the next frame starts at v + 1 and v moves
+ * there. A poll served len > 0 only moves v on. The trace stores only changes,
+ * so an ordinal with no record of its own serves the held state; after a len 0
+ * record each such poll is a one-poll frame, repeated k times like any other,
+ * and the recording's spacing between changes is kept. A trace whose served
+ * state stays len > 0 for FRAME_POLLS_MAX (64) polls of one frame while v is
+ * still inside the recording is not a drain loop: the replay stops with the
+ * named reason `repeat` instead of letting k do nothing. k = 1 is the ordinal
+ * path unchanged; only a version-3 trace can be repeated, because version-1 and
+ * version-2 records were keyed on a flip clock.
+ *
  * The module is self-contained: it depends on stop.h and the C library. The
  * flip clock comes in through PadTraceOptions, and cellPad.c does the config
  * reading and the hooks. The flip count is annotation only: it is read for the
@@ -75,6 +96,9 @@ extern "C" {
 #define PAD_TRACE_CLOCK      "guest-polls"
 #define PAD_TRACE_MAX_PORTS   7u    /* CELL_PAD_MAX_PORT_NUM */
 #define PAD_TRACE_MAX_WORDS   64u   /* CELL_PAD_MAX_CODES */
+/* pad.replay_repeat: how many times each recorded frame is served. The config
+ * registry's range for the option is 1..this. */
+#define PAD_TRACE_REPEAT_MAX  8u
 
 typedef enum PadTraceRole {
     PAD_TRACE_ROLE_RECORD = 0,
@@ -95,12 +119,19 @@ typedef struct PadTraceOptions {
     const char* record_path;      /* NULL or "" = not recording */
     const char* replay_path;      /* NULL or "" = not replaying */
     uint32_t  (*flip)(void);      /* cellGcm_guest_flip_count; for the annotation and the drift */
+    /* pad.replay_repeat: each recorded frame (the polls up to the first one
+     * served len 0, in the recording's ordinal space) is served this many
+     * times, so a recording made at one guest frame per 60 Hz tick keeps its
+     * input pacing in a build that runs two guest frames per tick (2). 1
+     * serves each recorded poll once, as recorded. Must be
+     * 1..PAD_TRACE_REPEAT_MAX; any other value is refused (reason "repeat"). */
+    uint32_t  replay_repeat;
 } PadTraceOptions;
 
 /* Why a trace could not be opened or read. `reason` is a stable id: header,
  * version, syntax, unknown-key, duplicate-key, value, record-kind,
- * keys-backwards, port-range, after-end, truncated, exists, io. `line` is the
- * 1-based line of the replay file, 0 when no line applies. */
+ * keys-backwards, port-range, after-end, truncated, exists, io, repeat.
+ * `line` is the 1-based line of the replay file, 0 when no line applies. */
 typedef struct PadTraceError {
     PadTraceRole role;
     uint32_t     line;
@@ -152,17 +183,25 @@ void pad_trace_flush(PadTrace* t);
 void pad_trace_close(PadTrace* t);
 void pad_trace_destroy(PadTrace* t);   /* close, then free */
 
-/* Replay bookkeeping. `reached_exactly` counts the records whose seq a poll
- * landed on; `flip_drift` is the smallest and largest (served flip - recorded
- * flip) over those records, the guest-time drift the ordinal key absorbs and
- * cannot remove. `end_seq` is the end record's per-port poll counts; a killed
- * run has no end record (`have_end` 0) and every entry stays 0. */
+/* Replay bookkeeping. `repeat` is the pad.replay_repeat factor the trace was
+ * opened with. `exact` counts the polls served a record at its own ordinal
+ * (each repetition counts); `records_reached` counts each recorded change
+ * once, at the poll that first serves it, so a replay that follows the
+ * recording reports `records_reached` equal to `records` whatever the factor.
+ * With repeat > 1, `frames` counts the recorded frames whose last repetition
+ * has been served, summed over the ports. `flip_drift` is the smallest and
+ * largest (served flip - recorded flip) over the first serve of each reached
+ * record, the guest-time drift the ordinal key absorbs and cannot remove.
+ * `end_seq` is the end record's per-port poll counts; a killed run has no end
+ * record (`have_end` 0) and every entry stays 0. */
 typedef struct PadTraceStats {
+    uint32_t repeat;           /* guest frames served per recorded frame (pad.replay_repeat) */
     uint64_t polls;            /* replayed polls */
-    uint64_t exact;            /* polls whose ordinal has a record of its own */
+    uint64_t exact;            /* polls served a record at its own ordinal */
     uint64_t held;             /* polls answered from an earlier record or neutral */
     uint64_t records;          /* state records in the file */
-    uint64_t records_reached;  /* of those, the ones a poll landed on */
+    uint64_t records_reached;  /* of those, the ones a poll first served */
+    uint64_t frames;           /* repeat > 1: recorded frames whose last repetition was served */
     int      have_drift;       /* a record was reached, so the drift is known */
     int64_t  drift_min;
     int64_t  drift_max;

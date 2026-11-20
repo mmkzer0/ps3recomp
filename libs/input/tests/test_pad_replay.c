@@ -89,6 +89,8 @@ static s32 read_pad(unsigned port)
 static u16 word(unsigned n) { return vm_read16(0x104 + n * 2); }
 static u16 buttons(void) { return (u16)(word(CELL_PAD_BTN_OFFSET_DIGITAL1) | (word(CELL_PAD_BTN_OFFSET_DIGITAL2) << 8)); }
 
+static int g_repeat = 1;
+
 static void start(void)
 {
     vm_base = mmap(NULL, 0x10000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
@@ -96,6 +98,7 @@ static void start(void)
     ppu_vm_size = 0x10000;
     s_pad_initialized = 1;
     s_max_connect = 7;
+    g_cfg.pad_replay_repeat = (uint32_t)g_repeat;   /* the registry's default; g_cfg is a zeroed stand-in */
     pad_trace_attach();
 }
 
@@ -154,6 +157,50 @@ static void case_replay(const char* path)
               "the replay's flips are the recorded ones (%lld:%lld)", (long long)s.drift_min, (long long)s.drift_max);
         CHECK(s.ended, "the trace is reported as ended");
     }
+}
+
+/* pad.replay_repeat through the real cellPadGetData: a drain-shaped recording served twice per recorded
+ * frame, in the recording's own ordinal space. Ordinals 0-1 are the packet (CIRCLE) and its drain, 2 and 3
+ * are unrecorded polls (the drain's len 0 held), 4-5 the release and its drain; the end count is 6. Four
+ * frames, each served twice, so a drain loop ends where the recording's did and the two unrecorded frames
+ * keep their place between the changes. The guest's flip clock is moved arbitrarily: it plays no part. */
+static void case_replay_repeat(const char* path)
+{
+    PadTraceStats s;
+    /* The 13th poll is past the end count: a neutral pad (len > 0, no buttons). */
+    static const int want_len[13] = { 8, 0, 8, 0,  0, 0, 0, 0,  8, 0, 8, 0,  -1 };
+    static const int want_circle[13] = { 1, 0, 1, 0,  0, 0, 0, 0,  0, 0, 0, 0,  0 };
+
+    publish(path,
+            "{\"format\":\"ps3recomp-pad-trace\",\"version\":3,\"clock\":\"guest-polls\",\"ports\":7}\n"
+            "{\"seq\":0,\"port\":0,\"len\":8,\"words\":[0,116,0,32,128,128,128,128],\"flip\":2}\n"
+            "{\"seq\":1,\"port\":0,\"len\":0,\"words\":[0,116,0,32,128,128,128,128],\"flip\":2}\n"
+            "{\"seq\":4,\"port\":0,\"len\":8,\"words\":[0,116,0,0,128,128,128,128],\"flip\":9}\n"
+            "{\"seq\":5,\"port\":0,\"len\":0,\"words\":[0,116,0,0,128,128,128,128],\"flip\":9}\n"
+            "{\"end\":true,\"seq\":[6,0,0,0,0,0,0]}\n");
+    snprintf(g_cfg.pad_replay, sizeof g_cfg.pad_replay, "%s", path);
+    g_repeat = 2;
+    start();
+
+    for (int i = 0; i < 13; i++) {
+        g_flip = 50u + (uint32_t)((i * 3) % 4);
+        {
+            const s32 len = read_pad(0);
+            CHECK(want_len[i] < 0 ? len > 0 : len == want_len[i], "guest poll %d: len %d, wanted %d", i, (int)len,
+                  want_len[i]);
+            /* A len 0 poll carries no new report: only the polls that return data are checked for buttons. */
+            if (len > 0)
+                CHECK((buttons() == CELL_PAD_CTRL_CIRCLE) == (want_circle[i] == 1),
+                      "guest poll %d: buttons 0x%04X, CIRCLE %s", i, buttons(), want_circle[i] ? "held" : "released");
+        }
+    }
+
+    pad_trace_stats(pad_trace_get(), &s);
+    CHECK(s.repeat == 2, "the trace reports the repeat (%u)", s.repeat);
+    CHECK(s.records == 4 && s.records_reached == 4, "each recorded change was first served once (%llu/%llu)",
+          (unsigned long long)s.records_reached, (unsigned long long)s.records);
+    CHECK(s.frames == 4, "four recorded frames were replayed (%llu)", (unsigned long long)s.frames);
+    CHECK(s.ended, "the trace is reported as ended");
 }
 
 static void case_replay_info(const char* path)
@@ -264,6 +311,7 @@ static void case_record(const char* path)
     memset(&o, 0, sizeof o);
     o.replay_path = path;
     o.flip = cellGcm_guest_flip_count;
+    o.replay_repeat = 1;
     memset(&e, 0, sizeof e);
     {
         PadTrace* rd = NULL;
@@ -312,9 +360,10 @@ int main(int argc, char** argv)
         setenv("PAD_STICK", "140,150,160,170", 1);
         if (strcmp(argv[1], "record")) setenv("PAD_AUTOPRESS", "1", 1);
     }
-    if      (!strcmp(argv[1], "control"))     case_control();
-    else if (!strcmp(argv[1], "replay"))      case_replay(argv[2]);
-    else if (!strcmp(argv[1], "replay-info")) case_replay_info(argv[2]);
+    if      (!strcmp(argv[1], "control"))       case_control();
+    else if (!strcmp(argv[1], "replay"))        case_replay(argv[2]);
+    else if (!strcmp(argv[1], "replay-repeat")) case_replay_repeat(argv[2]);
+    else if (!strcmp(argv[1], "replay-info"))   case_replay_info(argv[2]);
     else if (!strcmp(argv[1], "record"))      case_record(argv[2]);
     else { fprintf(stderr, "unknown case %s\n", argv[1]); return 2; }
     if (!g_fail) printf("PASS test_pad_replay %s\n", argv[1]);

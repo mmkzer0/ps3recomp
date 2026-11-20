@@ -107,9 +107,20 @@ static int same(const PadTraceState* a, const PadTraceState* b)
     return a->len == b->len && memcmp(a->words, b->words, sizeof a->words) == 0;
 }
 
+/* A replay with an explicit pad.replay_repeat; NULL (and *e filled) when the
+ * trace refuses it. */
+static PadTrace* open_trace_repeat(const char* path, uint32_t repeat, PadTraceError* e)
+{
+    PadTraceOptions o = { NULL, path, flip_now, repeat };
+    PadTrace* t = NULL;
+    memset(e, 0, sizeof *e);
+    if (pad_trace_create(&o, &t, e) != 0) return NULL;
+    return t;
+}
+
 static PadTrace* open_trace(const char* rec, const char* rep)
 {
-    PadTraceOptions o = { rec, rep, flip_now };
+    PadTraceOptions o = { rec, rep, flip_now, 1u };
     PadTrace* t = NULL;
     PadTraceError e;
     memset(&e, 0, sizeof e);
@@ -321,7 +332,7 @@ static void case_ends(void)
     write_text(killed, HEADER
                "{\"seq\":0,\"port\":0,\"len\":8,\"words\":[0,116,0,64,128,128,128,128],\"flip\":1}\n");
     {
-        PadTraceOptions o = { NULL, killed, flip_now };
+        PadTraceOptions o = { NULL, killed, flip_now, 1u };
         PadTraceError e;
         PadTrace* k = NULL;
         char* out;
@@ -386,6 +397,169 @@ static void case_lookup(void)
     CHECK(s.exact == 3, "three polls landed on a record of their own (%llu)", (unsigned long long)s.exact);
     CHECK(s.ended, "the trace is reported as ended");
     pad_trace_destroy(t);
+}
+
+/* ---- frame repeat (pad.replay_repeat) --------------------------------------------------------------- */
+
+/* Capture what closing a trace prints on stdout (its replay summary), then restore stdout. */
+static char* capture_close(PadTrace* t)
+{
+    const char* path = scratch("stdout.txt");
+    int saved = dup(fileno(stdout));
+    char* out;
+    fflush(stdout);
+    if (saved < 0 || !freopen(path, "wb", stdout)) { perror(path); exit(2); }
+    pad_trace_close(t);
+    fflush(stdout);
+    if (dup2(saved, fileno(stdout)) < 0) { perror("dup2"); exit(2); }
+    close(saved);
+    out = read_text(path);
+    return out;
+}
+
+/* Two recorded frames of a draining title: frame 0's changes are the packet
+ * (len 8) and its drain (len 0), frame 1's is the release. Only a change is
+ * written, but for a drain loop every poll of the frame is a change, so each
+ * group is the frame's full poll sequence. */
+static const char k_repeat_trace_text[] =
+    HEADER
+    "{\"seq\":0,\"port\":0,\"len\":8,\"words\":[0,116,0,64,128,128,128,128],\"flip\":10}\n"
+    "{\"seq\":1,\"port\":0,\"len\":0,\"words\":[0,116,0,64,128,128,128,128],\"flip\":10}\n"
+    "{\"seq\":2,\"port\":0,\"len\":8,\"words\":[0,116,0,0,128,128,128,128],\"flip\":11}\n"
+    "{\"end\":true,\"seq\":[3,0,0,0,0,0,0]}\n";
+
+/* The recording k = 2 is checked against: a 2-poll drain frame (ordinals 0-1: the packet and its len 0
+ * drain), then three polls with no record of their own (2-4: the held len 0), then a 1-poll frame whose
+ * single poll changed (5: len 0 with other words). The end count is 6. Five frames in all. */
+static const char k_gap_trace_text[] =
+    HEADER
+    "{\"seq\":0,\"port\":0,\"len\":8,\"words\":[0,116,0,64,128,128,128,128],\"flip\":10}\n"
+    "{\"seq\":1,\"port\":0,\"len\":0,\"words\":[0,116,0,64,128,128,128,128],\"flip\":10}\n"
+    "{\"seq\":5,\"port\":0,\"len\":0,\"words\":[0,116,0,0,128,128,128,128],\"flip\":40}\n"
+    "{\"end\":true,\"seq\":[6,0,0,0,0,0,0]}\n";
+
+static void case_repeat(void)
+{
+    const char* path = scratch("repeat.trace");
+    const PadTraceState press = mk(8, 0, 0x40, 128), release = mk(8, 0, 0, 128);
+    const PadTraceState any = mk(8, 0xFF, 0xFF, 1);
+    PadTraceState drain = press;
+    PadTrace* t;
+    PadTraceStats s;
+    PadTraceError e;
+    char* out;
+
+    drain.len = 0;   /* the frame's drained poll: the same words, len 0 */
+    write_text(path, k_repeat_trace_text);
+
+    /* k = 1: the recorded poll sequence, and the summary string this code printed
+     * before the option existed, byte for byte. */
+    t = open_trace(NULL, path);
+    g_flip = 10;
+    { PadTraceState r = poll(t, 0, &any); CHECK(same(&r, &press), "k=1 poll 0: the packet"); }
+    g_flip = 11;
+    { PadTraceState r = poll(t, 0, &any); CHECK(same(&r, &drain), "k=1 poll 1: the drain"); }
+    g_flip = 12;
+    { PadTraceState r = poll(t, 0, &any); CHECK(same(&r, &release), "k=1 poll 2: the release"); }
+    out = capture_close(t);
+    CHECK(!strcmp(out, "[cellPad] pad replay summary: polls=3 exact=3 held=0 recorded_changes=3 "
+                       "reached_exactly=3 flip_drift=0:1\n"),
+          "k=1 prints the unchanged summary, got: %s", out);
+    free(out);
+    pad_trace_destroy(t);
+
+    /* k = 2 over the gap trace: five frames, each served twice, in recorded order, and the timeline is not
+     * compressed. The flip clock is moved arbitrarily: it plays no part. */
+    write_text(path, k_gap_trace_text);
+    t = open_trace_repeat(path, 2u, &e);
+    CHECK(t != NULL, "k=2 opens the v3 trace: %s %s", e.reason, e.detail);
+    if (!t) return;
+    {
+        PadTraceState drain2 = release;   /* the changed frame's one poll: other words, len 0 */
+        const PadTraceState* want[13];
+        int first_changed = -1;
+        drain2.len = 0;
+        want[0] = &press;  want[1] = &drain;  want[2] = &press;  want[3] = &drain;    /* frame 0, twice */
+        want[4] = want[5] = want[6] = want[7] = want[8] = want[9] = &drain;           /* frames 1-3, twice */
+        want[10] = want[11] = &drain2;                                                /* frame 4, twice */
+        want[12] = &k_neutral_marker;                                                 /* past the end count */
+        for (int i = 0; i < 13; i++) {
+            PadTraceState r;
+            g_flip = 100u + (uint32_t)((i * 7) % 5);
+            r = poll(t, 0, &any);
+            CHECK(same(&r, want[i]), "k=2 poll %d: wrong state (len %d)", i, (int)r.len);
+            if (first_changed < 0 && same(&r, &drain2)) first_changed = i;
+        }
+        CHECK(first_changed == 10,
+              "the timeline is not compressed: the changed frame is first served at poll %d, wanted 10 "
+              "(2 polls x 2 for the drain frame, 3 x 2 for the unrecorded ones)", first_changed);
+    }
+    pad_trace_stats(t, &s);
+    CHECK(s.repeat == 2, "the stats name the repeat (%u)", s.repeat);
+    CHECK(s.polls == 13 && s.exact == 6 && s.held == 7,
+          "6 of 13 polls served a record at its own ordinal (%llu polls, %llu exact, %llu held)",
+          (unsigned long long)s.polls, (unsigned long long)s.exact, (unsigned long long)s.held);
+    CHECK(s.records == 3 && s.records_reached == 3, "each recorded change counts once, at its first serve (%llu/%llu)",
+          (unsigned long long)s.records_reached, (unsigned long long)s.records);
+    CHECK(s.frames == 5, "five recorded frames were replayed (%llu)", (unsigned long long)s.frames);
+    CHECK(s.have_drift, "the drift is read at the first serve of each change");
+    CHECK(s.ended, "the trace is reported as ended");
+    out = capture_close(t);
+    CHECK(strstr(out, "reached_exactly=3 ") != NULL && strstr(out, " repeat=2 frames=5\n") != NULL,
+          "the summary keeps reached_exactly and names the repeat and the frames: %s", out);
+    CHECK(strstr(out, "frames_short") == NULL && strstr(out, "polls_over") == NULL,
+          "the flip-based counters are gone: %s", out);
+    free(out);
+    pad_trace_destroy(t);
+
+    /* Past the recording nothing can end a frame, and nothing is required to: a killed trace holds its last
+     * record (len > 0 here) and a finished one serves the neutral pad, for any number of polls. */
+    write_text(path, HEADER L_STATE_0);
+    t = open_trace_repeat(path, 2u, &e);
+    if (!t) return;
+    for (int i = 0; i < 200; i++) {
+        PadTraceState r = poll(t, 0, &any);
+        CHECK(same(&r, &press), "killed trace, poll %d: the held last record", i);
+    }
+    pad_trace_destroy(t);
+    write_text(path, HEADER L_STATE_0 "{\"end\":true,\"seq\":[2,0,0,0,0,0,0]}\n");
+    t = open_trace_repeat(path, 2u, &e);
+    if (!t) return;
+    for (int i = 0; i < 200; i++) {
+        PadTraceState r = poll(t, 0, &any);
+        CHECK(same(&r, i < 2 ? &press : &k_neutral_marker), "finished trace, poll %d", i);
+    }
+    pad_trace_destroy(t);
+
+    /* k is bounded: 0 and 9 are refused, named, before any file is read. */
+    for (uint32_t bad = 0; bad <= 9u; bad += 9u) {
+        PadTrace* r = open_trace_repeat(path, bad, &e);
+        CHECK(r == NULL, "repeat %u must be refused", bad);
+        CHECK(e.role == PAD_TRACE_ROLE_REPLAY && e.line == 0 && !strcmp(e.reason, "repeat"),
+              "repeat %u: wanted replay line 0 repeat, got role %d line %u %s (%s)", bad, (int)e.role, e.line,
+              e.reason, e.detail);
+    }
+
+    /* No flip-based key exists in versions 1 and 2, so a repeat of either is
+     * refused with the version's own reason, and the detail says why. */
+    {
+        static const char* const versions[2] = {
+            "{\"format\":\"ps3recomp-pad-trace\",\"version\":1,\"ports\":7}\n",
+            "{\"format\":\"ps3recomp-pad-trace\",\"version\":2,\"clock\":\"guest-flip-requests\",\"ports\":7}\n",
+        };
+        for (int i = 0; i < 2; i++) {
+            const char* vpath = scratch("repeat-v.trace");
+            PadTrace* r;
+            write_text(vpath, versions[i]);
+            r = open_trace_repeat(vpath, 2u, &e);
+            CHECK(r == NULL, "version %d with repeat 2 must be refused", i + 1);
+            CHECK(e.role == PAD_TRACE_ROLE_REPLAY && e.line == 1 && !strcmp(e.reason, "version"),
+                  "version %d: wanted replay line 1 version, got role %d line %u %s (%s)", i + 1, (int)e.role,
+                  e.line, e.reason, e.detail);
+            CHECK(strstr(e.detail, "pad.replay_repeat 2") != NULL,
+                  "version %d's refusal names the repeat: %s", i + 1, e.detail);
+        }
+    }
 }
 
 /* ---- change-only writing ---------------------------------------------------------------------------- */
@@ -462,7 +636,7 @@ static void* worker(void* p)
 static void case_threads(void)
 {
     const char* path = scratch("threads.trace");
-    PadTraceOptions o = { path, NULL, flip_ticking };
+    PadTraceOptions o = { path, NULL, flip_ticking, 1u };
     PadTrace* t = NULL;
     PadTraceError e;
     pthread_t th[4];
@@ -534,7 +708,7 @@ static void case_errors(void)
 {
     for (size_t i = 0; i < sizeof k_bad / sizeof k_bad[0]; i++) {
         const char* path = scratch("bad.trace");
-        PadTraceOptions o = { NULL, path, flip_now };
+        PadTraceOptions o = { NULL, path, flip_now, 1u };
         PadTrace* t = NULL;
         PadTraceError e;
         memset(&e, 0, sizeof e);
@@ -551,7 +725,7 @@ static void case_errors(void)
         const char* path = scratch("nul.trace");
         static const char pre[] = "{\"seq\":0,\"port\":0,\"l";
         static const char post[] = "en\":8,\"words\":[],\"flip\":1}\n";
-        PadTraceOptions o = { NULL, path, flip_now };
+        PadTraceOptions o = { NULL, path, flip_now, 1u };
         PadTrace* t = NULL;
         PadTraceError e;
         FILE* f = fopen(path, "wb");
@@ -572,7 +746,7 @@ static void case_errors(void)
 static void case_record_refusals(void)
 {
     const char* path = scratch("exists.trace");
-    PadTraceOptions o = { path, NULL, flip_now };
+    PadTraceOptions o = { path, NULL, flip_now, 1u };
     PadTrace* t = NULL;
     PadTraceError e;
 
@@ -600,22 +774,38 @@ static void run_stop(const char* name)
         char path[96];
         snprintf(path, sizeof path, "pad_trace_stop_%s.trace", name);
         write_text(path, k_bad[i].text);
-        PadTraceOptions o = { NULL, path, flip_now };
+        PadTraceOptions o = { NULL, path, flip_now, 1u };
         pad_trace_open(&o);
         printf("[FAIL] %s: the malformed file did not stop the run\n", name);
         exit(1);
     }
     if (!strcmp(name, "record-exists")) {
         write_text("pad_trace_stop_record_exists.trace", "precious\n");
-        PadTraceOptions o = { "pad_trace_stop_record_exists.trace", NULL, flip_now };
+        PadTraceOptions o = { "pad_trace_stop_record_exists.trace", NULL, flip_now, 1u };
         pad_trace_open(&o);
         printf("[FAIL] record-exists: did not stop\n");
         exit(1);
     }
     if (!strcmp(name, "record-io")) {
-        PadTraceOptions o = { "pad_trace_no_such_dir/x.trace", NULL, flip_now };
+        PadTraceOptions o = { "pad_trace_no_such_dir/x.trace", NULL, flip_now, 1u };
         pad_trace_open(&o);
         printf("[FAIL] record-io: did not stop\n");
+        exit(1);
+    }
+    if (!strcmp(name, "repeat-no-drain")) {
+        /* A trace whose every recorded poll serves len 8 (the title never drains to len 0), replayed with
+         * k = 2: the 64th poll of the frame stops the run with reason `repeat`. */
+        const char* path = "pad_trace_stop_repeat_no_drain.trace";
+        PadTraceState st = mk(8, 0, 0, 128);
+        const PadTraceState neutral = st;
+        PadTrace* t;
+        write_text(path, HEADER L_STATE_0 "{\"end\":true,\"seq\":[200,0,0,0,0,0,0]}\n");
+        {
+            PadTraceOptions o = { NULL, path, flip_now, 2u };
+            t = pad_trace_open(&o);
+        }
+        for (int i = 0; i < 200; i++) pad_trace_poll(t, 0, &st, &neutral);
+        printf("[FAIL] repeat-no-drain: did not stop\n");
         exit(1);
     }
     printf("[FAIL] unknown stop case %s\n", name);
@@ -631,6 +821,7 @@ int main(int argc, char** argv)
     else if (!strcmp(argv[1], "catchup"))         case_catchup();
     else if (!strcmp(argv[1], "ends"))            case_ends();
     else if (!strcmp(argv[1], "lookup"))          case_lookup();
+    else if (!strcmp(argv[1], "repeat"))          case_repeat();
     else if (!strcmp(argv[1], "changes"))         case_changes();
     else if (!strcmp(argv[1], "record-replay"))   case_record_replay();
     else if (!strcmp(argv[1], "threads"))         case_threads();
