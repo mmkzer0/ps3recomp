@@ -1923,6 +1923,18 @@ if(PS3RECOMP_BUILD_TESTS)
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_lift.py")
         set_tests_properties(ppu_lift_conformance PROPERTIES LABELS "ppu;t0" TIMEOUT 600)
+        # --pc-counters (docs/TOOLS.md): the per-instruction execution counters. The emission test is
+        # lift-only; the run test lifts a raw loop, builds it with runtime/diag/pc_counters.c and checks
+        # the dump on both exit routes.
+        add_test(NAME lifter_pc_counters
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_lifter_pc_counters.py")
+        set_tests_properties(lifter_pc_counters PROPERTIES LABELS "tools;t0" TIMEOUT 120)
+        add_test(NAME ppu_pc_counters
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_pc_counters_run.py")
+        set_tests_properties(ppu_pc_counters PROPERTIES LABELS "ppu;t0" TIMEOUT 300
+            ENVIRONMENT "CC=${CMAKE_C_COMPILER};CXX=${CMAKE_CXX_COMPILER}")
         # The trace schema contract: event/1 converts losslessly, validation is
         # strict, and diff reports the first divergence per execution context.
         add_test(NAME ps3diff

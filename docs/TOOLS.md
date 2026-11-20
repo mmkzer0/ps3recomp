@@ -402,6 +402,79 @@ if (g_port_skip_wait) { /* nop */; } else { if (...) goto loc_00123464; }  /* in
   compare is the usual shape.
 - `note` is free text and ignored.
 
+### Per-instruction execution counters (`--pc-counters`)
+
+`--pc-counters FILE` counts how often chosen guest instructions execute, so a
+60 Hz run and a 120 Hz-step run of the same replay can be compared per PC (a
+ratio near 2 marks per-step state, near 1 event-driven code). `FILE` lists one
+hex guest address per line (`0x` optional, `#` starts a comment):
+
+```
+# the loop body and the branch that closes it
+0x00123454
+0x00123458  # bdnz
+```
+
+The sorted, deduplicated list defines the slots: slot `k` is the `k`-th
+address. Each listed instruction starts with
+
+```c
+__atomic_fetch_add(&ppu_pc_counter_slots[k], 1, __ATOMIC_RELAXED);
+```
+
+placed after the instruction's branch label, so a jump to the PC counts as
+well as a fall-through, loop iterations count each time, and the number is
+executions of that instruction, not entries of its function. The table chunk
+defines `ppu_pc_counter_slots[N]`, `ppu_pc_counter_pcs[N]` and a constructor
+that registers both with the runtime (`runtime/diag/pc_counters.c`). Without
+the flag no counter symbol is emitted and the output is unchanged.
+
+- A malformed line, a duplicate, a misaligned address, an address above 32
+  bits, an empty list, an address no lifted function covers, and an address in
+  code the lift proved unreachable (a literal pool after a `blr`) each stop the
+  lift with `FILE:LINE: PC 0x........ <reason>` and write nothing.
+- Every reachable aligned word of a lifted function is an instruction, so the only PCs
+  that cannot carry a counter are those in a function emitted without an
+  instruction body: an import stub is lifted as one `ps3_hle_call`, and a PC
+  inside one stops the lift.
+- A PC reached through two lifted copies (a function and its mid-function
+  tail entry) counts in both, which is one count per execution.
+- The counter sits on its own line, so a listed branch that follows its
+  compare keeps the compare's CR write; the compare+branch fusion pass does
+  not merge the pair (same behaviour, a few more host instructions).
+- Cost per hit: one relaxed atomic add. x86-64 `lock incq` (1 instruction);
+  AArch64 with LSE (Apple silicon) `ldadd` (1 instruction, plus the
+  `adrp`/`add`/`mov` that form the slot address and the constant 1, shared by
+  the counters of one function); an AArch64 without LSE compiles it to an
+  `ldxr`/`add`/`stxr` retry loop.
+- Not combinable with `--symbol-prefix`: the runtime reads the main image's
+  symbols only.
+
+Reading the counts (`include/ps3emu/pc_counters.h`):
+
+| Call | Meaning |
+|---|---|
+| `ps3_pc_counters_count()` | number of slots; 0 for a lift without counters |
+| `ps3_pc_counters_pc(k)` | guest PC of slot `k`; `UINT32_MAX` when `k` is out of range |
+| `ps3_pc_counters_read(out, n)` | copies `min(n, count)` slots, returns `count` |
+
+With `PS3_PC_COUNTERS_OUT=<path>` set when the process starts (a diagnostic, not
+a behaviour option), the counts are written when it ends, through `exit()` or
+through `ps3_host_exit()` (`quick_exit`) alike:
+
+```
+# ps3 pc counters N=3
+0x00123454 1500
+0x00123458 1500
+0x0012345C 12
+```
+
+A file that cannot be written is reported on stderr with its path. A process
+that ends through `_exit()` or a signal writes nothing. Tests:
+`tools/test_ppu_lifter_pc_counters.py` (emission, rejections),
+`tools/test_ppu_pc_counters_run.py` (a lifted loop run on both exit routes and
+under four threads).
+
 ---
 
 ## spu_disasm.py
