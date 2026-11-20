@@ -1410,6 +1410,18 @@ if(PS3RECOMP_BUILD_TESTS)
     target_include_directories(test_vertex_current_color PRIVATE include libs/video)
     add_test(NAME vertex_current_color COMMAND test_vertex_current_color)
 
+    # The per-method effect table of rsx_dispatch_method, pinned against the documented method
+    # numbers over the whole method space (no GPU, no guest memory).
+    add_executable(test_rsx_dispatch_special
+        libs/video/tests/test_rsx_dispatch_special.c
+        libs/video/rsx_dispatch.c
+        runtime/diag/ps3_log.c
+        tests/ps3_log_mirror_stub.c
+        runtime/diag/host_exit.c)
+    target_include_directories(test_rsx_dispatch_special PRIVATE include libs/video)
+    add_test(NAME rsx_dispatch_special COMMAND test_rsx_dispatch_special)
+    set_tests_properties(rsx_dispatch_special PROPERTIES LABELS "rsx;t0" TIMEOUT 120)
+
 
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
@@ -3071,6 +3083,11 @@ if(UNIX)
         add_test(NAME gcm_class_routing
             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_gcm_class_routing.py")
         set_tests_properties(gcm_class_routing PROPERTIES LABELS "gcm;t0" TIMEOUT 120)
+        # The run route for 3D-method packets serves the draw engine too: four streams (an unknown method mid-packet,
+        # one past the method field) give the same census, stop word and engine word order as the per-word route.
+        add_test(NAME gcm_run_route
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_gcm_run_route.py")
+        set_tests_properties(gcm_run_route PROPERTIES LABELS "gcm;t0" TIMEOUT 120)
         # #68: the handler mask word at driver_info+0x12C0 as libgcm_sys keeps it (dossier T6): start value 4 after
         # init, a per-bit read-modify-write in each setter, foreign bits surviving. `gcm_handler_mask_race` is the same
         # fixture with two threads registering at once, built with -fsanitize=thread where the compiler has it.

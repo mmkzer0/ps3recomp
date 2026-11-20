@@ -147,17 +147,44 @@ static void gcm_2d_state_log(u32 subch, u32 method, u32 data);   /* the 2D engin
 static void gcm_stop_fifo_dump(const char* why, u32 hdr_io, u32 stop_io, void (*state_fn)(char*, size_t));
 static void gcm_2d_state(char* out, size_t n);
 
-/* `handled` says a consumer took the method. Otherwise the (class, method) pair is looked up in the
+/* rsx_method_check with the row lookup remembered per (class, method): rsx_method_rule_find scans
+ * every row, and the words nothing consumed (a state the renderer ignores, written every draw) take
+ * this path each time they are seen. The memo is filled from rsx_method_rule_find itself, one entry
+ * at a time, so its answer is that function's; the value test after it is rsx_method_check's. A
+ * method past the 13-bit method field (an incrementing packet that ran off it) is not memoised.
+ * Walker thread only, like the counters it feeds. */
+_Static_assert(RSX_METHOD_RULE_COUNT < 0xFFFEu, "rule index must fit the memo's u16 entry");
+static u16 s_rule_memo[RSX_CLASS_COUNT][0x800];   /* 0 not looked up yet, 0xFFFF no row, else 1 + row */
+static rsx_method_verdict gcm_method_check(rsx_class_id cls, u32 m, u32 data, const rsx_method_rule** out_rule)
+{
+    const rsx_method_rule* r;
+    if (m < 0x2000u && (unsigned)cls < RSX_CLASS_COUNT) {
+        u16* slot = &s_rule_memo[cls][m >> 2];
+        if (!*slot) {
+            const rsx_method_rule* found = rsx_method_rule_find(cls, m);
+            *slot = found ? (u16)(1u + (unsigned)(found - rsx_method_rules)) : 0xFFFFu;
+        }
+        r = *slot == 0xFFFFu ? NULL : &rsx_method_rules[*slot - 1u];
+    } else {
+        r = rsx_method_rule_find(cls, m);
+    }
+    *out_rule = r;
+    if (!r) return RSX_METHOD_UNKNOWN;
+    if (r->verdict == RSX_METHOD_INERT && r->mask && (data & r->mask) != (r->data & r->mask))
+        return RSX_METHOD_MISSING;
+    return (rsx_method_verdict)r->verdict;
+}
+
+/* A word no consumer took (gcm_method_verdict below): the (class, method) pair is looked up in the
  * table (rsx_method_class.h): INERT when the write carries the value the row pins, MISSING when the
  * row is an S2 gap or the write differs from the pinned value, and UNKNOWN when no row covers the pair
  * at all -- the only case that stops. `fifo` is the IO offset of the packet header, `word` its data
  * word: the two positions that let an operator find the command again in a capture or a log. */
-static void gcm_method_verdict(u32 subch, u32 m, u32 data, int handled, u32 fifo, u32 word)
+static void gcm_method_verdict_unhandled(u32 subch, u32 m, u32 data, u32 fifo, u32 word)
 {
     const rsx_class_id cls = gcm_method_class(subch, m);
-    if (handled) { atomic_fetch_add_explicit(&s_mc_handled, 1, memory_order_relaxed); return; }
     const rsx_method_rule* rule = NULL;
-    const rsx_method_verdict v = rsx_method_check(cls, m, data, &rule);
+    const rsx_method_verdict v = gcm_method_check(cls, m, data, &rule);
     const u32 idx = (m >> 2) & 0x7FFu;
     if (v == RSX_METHOD_HANDLED) {
         /* The row names a consumer that is not on this configuration's path (the register-file engine
@@ -200,6 +227,14 @@ static void gcm_method_verdict(u32 subch, u32 m, u32 data, int handled, u32 fifo
     gcm_stop_fifo_dump("rsx-unknown-method", fifo, word,
                        (cls == RSX_CLASS_NV3062 || cls == RSX_CLASS_NV308A) ? gcm_2d_state : NULL);
     ps3_stop_rsx_unknown_method(rsx_class_name(cls), m, subch, fifo, word, data);
+}
+
+/* One verdict per word. A handled word is the common case and costs one counter bump, so it is
+ * decided inline; the class lookup and the table walk are only for a word nothing consumed. */
+static inline void gcm_method_verdict(u32 subch, u32 m, u32 data, int handled, u32 fifo, u32 word)
+{
+    if (handled) { atomic_fetch_add_explicit(&s_mc_handled, 1, memory_order_relaxed); return; }
+    gcm_method_verdict_unhandled(subch, m, data, fifo, word);
 }
 
 /* A method on a slot with no object bound reaches no engine: PFIFO has no class to decode it against
@@ -3738,18 +3773,26 @@ static int gcm_get_eq_put(void)
     return eq;
 }
 
-/* Any per-word FIFO switch set, or a mirrored draw engine on. Read once per
- * drain: the walker hands every data word through these checks, a million a
- * second in God of War HD gameplay, and it used to test each switch on its
- * own for every word. */
-static int gcm_word_diag(void)
+/* What makes the walker take the per-word route, read once: a diagnostic switch, the live-draw
+ * mirror, or the register-file draw engine. The first two read or log every word in ways only the
+ * per-word route has; the engine alone only needs each word handed to rsx_draw_engine_method before
+ * its verdict, which the run route in the walker does too, so it is a separate bit. The walker hands
+ * every data word through these checks, a million a second in God of War HD gameplay, and it used to
+ * test each switch on its own for every word. */
+enum { GCM_WD_SWITCH = 1u, GCM_WD_LIVE = 2u, GCM_WD_ENGINE = 4u };
+static unsigned gcm_word_diag(void)
 {
-    static int on = -1;
-    if (on < 0)
-        on = (getenv("GCM_SUBCH7") || getenv("GCM_OBJDBG") || getenv("GCM_SUBCH_GATE") || getenv("GCM_WORD_STATS") ||
-              getenv("GCM_VAL_WATCH") || getenv("GCM_METHOD_HIST") || getenv("RSX_LIVE_FEED_DBG") ||
-              rsx_live_draw_enabled() || rsx_draw_engine_enabled()) ? 1 : 0;
-    return on;
+    static int init;
+    static unsigned bits;
+    if (!init) {
+        if (getenv("GCM_SUBCH7") || getenv("GCM_OBJDBG") || getenv("GCM_SUBCH_GATE") || getenv("GCM_WORD_STATS") ||
+            getenv("GCM_VAL_WATCH") || getenv("GCM_METHOD_HIST") || getenv("RSX_LIVE_FEED_DBG"))
+            bits |= GCM_WD_SWITCH;
+        if (rsx_live_draw_enabled()) bits |= GCM_WD_LIVE;
+        if (rsx_draw_engine_enabled()) bits |= GCM_WD_ENGINE;
+        init = 1;
+    }
+    return bits;
 }
 
 /* One data word of a slot bound to NV4097, or a channel-control (NV406E) word,
@@ -3816,6 +3859,25 @@ static int gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
         }
     }
     return handled;
+}
+
+/* The methods gcm_3d_method answers "handled" for without touching anything: no legacy state
+ * machine (the caller checks legacy_state_live), no reference, report or notify side effect, and a
+ * row in the dispatcher's class table. The run route in the walker asks this table instead of
+ * calling gcm_3d_method for each word of a draw's state, which is nearly every word. Built once from
+ * the same predicates gcm_3d_method evaluates, so the two cannot disagree: a word the table does
+ * not mark goes through gcm_3d_method as before. Methods below 0x100 (channel control) and past
+ * 0x1FFC (an incrementing packet that ran off the method field) are never marked. */
+static u8 s_3d_plain[0x800];
+static int s_3d_plain_built;
+static void gcm_3d_plain_build(void)
+{
+    for (u32 i = 0x100u >> 2; i < 0x800u; i++) {
+        const u32 m = i << 2;
+        s_3d_plain[i] = !gcm_legacy_method_has_effect(m) && m != 0x1A8u && m != 0x1800u &&
+                        rsx_dsp_method_class(m) != RSX_DSP_CLASS_TODO;
+    }
+    s_3d_plain_built = 1;
 }
 
 
@@ -3889,7 +3951,11 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * by s_gcm_ctx_out_ea, which stays 0 on that path. */
     if (!s_gcm_context_ea && !s_gcm_syscall_mode) return;
     if (!s_inited) { rsx_state_init(&s_state); s_inited = 1; gcm_register_label_store_hook(); }
-    const int wdiag = gcm_word_diag();
+    const unsigned wbits = gcm_word_diag();
+    const int wdiag = wbits != 0;
+    /* The run route (below) serves every word the engine alone makes diagnostic. */
+    const int wfast = (wbits & ~GCM_WD_ENGINE) == 0;
+    const int weng = (wbits & GCM_WD_ENGINE) != 0;
     /* rsx_state feeds only the legacy vtable backend. With the draw engine
      * up and no vtable registered, the state it builds is never read, and the
      * only methods worth handing it are the ones with effects outside it
@@ -4400,22 +4466,49 @@ static void gcm_rsx_process_fifo_unlocked(void)
              * verdict, so the census (gcm_method_stats) counts the same words either way. The
              * capture step is closed here as it is at the end of the loop.
              * Never with a capture sink attached: the capture contract wants every consumed word a
-             * step, in executed order, so the per-word path runs then. */
-            if (!wdiag && !s_cap && count && method >= 0x100u && subch != 7 &&
+             * step, in executed order, so the per-word path runs then.
+             *
+             * The register-file draw engine is the one consumer the run serves word by word: the
+             * per-word loop hands it each word (rsx_draw_engine_method) before the word's verdict,
+             * and so does the run. With it on, the run is the whole route of a frame's state words,
+             * which is why it is not skipped for the engine (gcm_word_diag).
+             *
+             * An incrementing packet whose methods run past the 13-bit method field is left to the
+             * per-word loop: the plain-method table (s_3d_plain) covers the field only, and a word
+             * past it is a method the 3D engine does not have, which the per-word loop ends as
+             * unknown at that word like any other.
+             *
+             * The handled census is added once per packet, or before the first word nothing took:
+             * a counter bump per word was an atomic read-modify-write on the hot path. The order
+             * the stop reports (counts, then the unknown word) is the same. */
+            if (wfast && !s_cap && count && method >= 0x100u && subch != 7 &&
                 s_subch_class[subch & 7u] == RSX_CLASS_NV4097 &&
-                ((s_fifo_getoff + 4) >> 20) == ((s_fifo_getoff + count * 4) >> 20)) {
+                ((s_fifo_getoff + 4) >> 20) == ((s_fifo_getoff + count * 4) >> 20) &&
+                (type != 0 || method + (count - 1u) * 4u <= 0x1FFCu)) {
                 const u32 dea = gcm_io2ea(s_fifo_getoff + 4);
                 if (dea) {
-                    if (type == 0 && rsx_process_vp_run(&s_state, method, vm_base + dea, count)) {
+                    if (!weng && type == 0 && rsx_process_vp_run(&s_state, method, vm_base + dea, count)) {
                         /* Microcode and constant words: the state machine takes every one. */
                         atomic_fetch_add_explicit(&s_mc_handled, count, memory_order_relaxed);
                     } else {
+                        if (!s_3d_plain_built) gcm_3d_plain_build();
+                        /* gcm_3d_method's answer for a word with no side effect, from the table; with
+                         * the legacy state machine live every word must reach it. */
+                        const int plain_ok = !legacy_state_live;
                         u32 n_handled = 0;
                         for (u32 i = 0; i < count; i++) {
                             const u32 m1 = type == 0 ? method + i * 4 : method;
                             const u32 v1 = vm_read32(dea + i * 4);
-                            if (gcm_3d_method(&s_state, m1, v1, legacy_state_live)) n_handled++;
-                            else gcm_method_verdict(subch, m1, v1, 0, s_fifo_getoff, s_fifo_getoff + 4 + i * 4);
+                            if (weng) rsx_draw_engine_method(m1, v1);
+                            if (plain_ok && s_3d_plain[m1 >> 2]) n_handled++;
+                            else if (gcm_3d_method(&s_state, m1, v1, legacy_state_live)) n_handled++;
+                            else {
+                                if (n_handled) {
+                                    atomic_fetch_add_explicit(&s_mc_handled, n_handled, memory_order_relaxed);
+                                    n_handled = 0;
+                                }
+                                gcm_method_verdict(subch, m1, v1, 0, s_fifo_getoff, s_fifo_getoff + 4 + i * 4);
+                            }
                         }
                         if (n_handled) atomic_fetch_add_explicit(&s_mc_handled, n_handled, memory_order_relaxed);
                     }

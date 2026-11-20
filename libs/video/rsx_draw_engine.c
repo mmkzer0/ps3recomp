@@ -4480,13 +4480,16 @@ void rsx_draw_engine_method(u32 method, u32 arg)
      * (0xE9xx, 0xEBxx) encode the subchannel bits as part of the address;
      * preserve them with the wider mask. */
     u32 m = (method >= 0xE000u) ? (method & 0xFFFCu) : (method & 0x1FFCu);
-    if (m >= 0xE900u && m < 0xEA00u)    /* driver methods only: keep the draw path cheap */
+    /* Driver methods only: the thread-local is a getter call on Mach-O, so the draw path neither
+     * sets nor clears it. It is nonzero only inside a driver method's dispatch. */
+    const int driver = m >= 0xE900u && m < 0xEA00u;
+    if (driver)
         t_present_method = m == 0xE920u ? ENG_PRESENT_M_E920 : m == 0xE924u ? ENG_PRESENT_M_E924 :
                            m == 0xE940u ? ENG_PRESENT_M_E940 : m == 0xE944u ? ENG_PRESENT_M_E944 :
                                           ENG_PRESENT_M_OTHER;
     if (m == ENG_METHOD_INVALIDATE_L2) eng_tex_epoch_advance();
     rsx_dispatch_method(&g.rsx, m, arg);
-    t_present_method = 0;
+    if (driver) t_present_method = 0;
 }
 
 void rsx_draw_engine_set_display_buffer(u32 buffer_id, u32 location, u32 offset,
