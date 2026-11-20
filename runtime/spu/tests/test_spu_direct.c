@@ -131,7 +131,7 @@ int main(int argc, char** argv)
     printf("%s: halted=%d status=%X loops=%u steps=%u wrong=%u irq-at=%u ret-pc=0x%X tailcalls=%d\n",
            mode, halted, ctx.status, ctx.gpr[10]._u32[0], ctx.steps, ctx.gpr[21]._u32[0],
            ctx.gpr[23]._u32[0], ctx.gpr[22]._u32[0],
-#ifdef SPU_DIRECT_TAILCALLS
+#if SPU_HAVE_MUSTTAIL
            1
 #else
            0
@@ -139,7 +139,7 @@ int main(int argc, char** argv)
            );
     fflush(stdout);
     assert(halted == 1 && ctx.gpr[21]._u32[0] == 0);
-#ifdef SPU_DIRECT_TAILCALLS
+#if SPU_HAVE_MUSTTAIL
     const int direct = g_spu_direct > 0;
 #else
     const int direct = 0;

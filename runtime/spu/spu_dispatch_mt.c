@@ -1,4 +1,4 @@
-/* Clang-compiled musttail fast path for SPU indirect-branch dispatch.
+/* musttail fast path for SPU indirect-branch dispatch (clang, GCC 15+).
  *
  * The full resolver (spu_indirect_branch, runtime/spu/spu_channels.c) lives in
  * the MSVC-built ps3recomp_runtime.lib, where __attribute__((musttail)) is
@@ -8,10 +8,12 @@
  * thousand iterations into the first really-decoding movie frame (observed as
  * a silent STATUS_GUARD_PAGE_VIOLATION death).
  *
- * This TU is compiled by clang inside the game build: on a registry hit the
- * dispatch is a GUARANTEED tail call -- zero stack growth. Anything unusual
- * (policy-module service addresses, the taskset PM syscall at LS 0xA70, the
- * image-23 cri hack, lookup miss diagnostics) falls back to the full resolver.
+ * This TU is compiled inside the game build by a compiler that guarantees the
+ * tail call: clang (musttail since 13) or GCC 15+ (same attribute; see
+ * SPU_HAVE_MUSTTAIL in spu_context.h). On a registry hit the dispatch is a
+ * GUARANTEED tail call -- zero stack growth. Anything unusual (policy-module
+ * service addresses, the taskset PM syscall at LS 0xA70, the image-23 cri hack,
+ * lookup miss diagnostics) falls back to the full resolver.
  */
 #include "spu_context.h"
 #include "../../include/ps3emu/ps3_log.h"

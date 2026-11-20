@@ -128,9 +128,9 @@ elseif(PORT_ENABLE_SPU)
         message(STATUS "Lifted SPU:      ${SPU_IMAGE_COUNT} image(s)")
         # The musttail indirect-branch fast path. Excluded from the runtime
         # library on purpose (see the SDK root CMakeLists): it must be built
-        # here, by clang, or the tail call degrades to a plain call and a guest
-        # loop that branches indirectly walks the thread stack off its guard
-        # page a few thousand iterations in.
+        # here, by clang or GCC 15+, or the tail call degrades to a plain call
+        # and a guest loop that branches indirectly walks the thread stack off
+        # its guard page a few thousand iterations in.
         list(APPEND SPU_SOURCES ${SPU_PREBUILT_SOURCES}
              "${PS3RECOMP_DIR}/runtime/spu/spu_dispatch_mt.c")
     else()

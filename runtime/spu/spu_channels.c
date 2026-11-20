@@ -2987,7 +2987,7 @@ static void spu_indirect_branch_served(spu_context* ctx)
     spu_fn fn = spu_lifted_lookup(ctx, ctx->pc);
     if (fn) {
         spu_check_stack_reset(ctx, fn);
-#if defined(__clang__)
+#if SPU_HAVE_MUSTTAIL
         __attribute__((musttail)) return fn(ctx);
 #else
         fn(ctx);
@@ -3060,7 +3060,7 @@ void spu_indirect_branch(spu_context* ctx)
      * masking is a no-op for already-valid targets. */
     ctx->pc &= SPU_LS_MASK;
     if (spu_port_serves(ctx)) {
-#if defined(__clang__)
+#if SPU_HAVE_MUSTTAIL
         __attribute__((musttail)) return spu_indirect_branch_served(ctx);
 #else
         spu_indirect_branch_served(ctx);
@@ -3534,7 +3534,7 @@ void spu_indirect_branch(spu_context* ctx)
          * stack -- a plain call here leaked a resolver+callee frame per
          * iteration and blew the thread stack ~4k iterations into the first
          * really-decoding movie frame (silent 0x80000001 death). */
-#if defined(__clang__)
+#if SPU_HAVE_MUSTTAIL
         __attribute__((musttail)) return fn(ctx);
 #else
         fn(ctx);

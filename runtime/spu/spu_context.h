@@ -51,6 +51,25 @@ extern "C" {
 #  define SPU_RELAXED_OR8(p, v)   (*(p) |= (v))
 #endif
 
+/* SPU_HAVE_MUSTTAIL: this compiler guarantees that `return f(...)` is a tail
+ * call, so a lifted function may hand control to another one without growing
+ * the host stack. clang has had __attribute__((musttail)) since 13; GCC has the
+ * same attribute as a statement attribute since GCC 15 (spellings gnu::musttail,
+ * clang::musttail and bare musttail all parse), reports it through
+ * __has_attribute, and enforces it exactly as strictly: a call it cannot make
+ * a tail call is an error ("cannot tail-call: ..."), and a callable one is a
+ * jump even under -O2 -fno-optimize-sibling-calls. MSVC has no musttail, and
+ * the Windows runtime library is built with it, so the tests stay compiler-
+ * specific rather than trusting __has_attribute alone. */
+#if defined(__clang__) || defined(__GNUC__)
+#  if defined(__has_attribute) && __has_attribute(musttail)
+#    define SPU_HAVE_MUSTTAIL 1
+#  endif
+#endif
+#ifndef SPU_HAVE_MUSTTAIL
+#  define SPU_HAVE_MUSTTAIL 0
+#endif
+
 /* Out-of-line debug probes: keep them out of the hot path. MSVC C has no
  * __attribute__ spelling (CI covers Windows with clang-cl, which accepts
  * both), so the MSVC dialect is __declspec(noinline) and drops `cold`. */
@@ -1274,7 +1293,7 @@ SPU_PORT_NORETURN void spu_lift_budget_exhausted(spu_context* ctx);   /* spu_dra
  * not the run's first transfer (the LS 0 check counts steps from there), the
  * target is not in the stack-reset hint table, and no interrupt is pending
  * with interrupts enabled. Anything else takes the trampoline as before. Tail calls need
- * clang's musttail; other compilers always take the trampoline.
+ * musttail (clang, GCC 15+); other compilers always take the trampoline.
  * PS3_SPU_DIRECT=0 = always the trampoline; the diagnostics that watch each
  * drain step (SPU_LOCKSTEP, SPU_STEPTRACE, SPURS_PM_FLOW, ...) turn it off
  * too (spu_drain.c). */
@@ -1283,12 +1302,7 @@ SPU_PORT_NORETURN void spu_lift_budget_exhausted(spu_context* ctx);   /* spu_dra
 extern int g_spu_direct;
 extern uint8_t g_spu_stack_reset_hint[1024];     /* spu_channels.c, by (entry >> 2) & 1023 */
 void spu_direct_init(void);
-#if defined(__clang__) && defined(__has_attribute)
-#  if __has_attribute(musttail)
-#    define SPU_DIRECT_TAILCALLS 1
-#  endif
-#endif
-#ifdef SPU_DIRECT_TAILCALLS
+#if SPU_HAVE_MUSTTAIL
 #define SPU_DIRECT(ctx, PC, FN) do {                                          \
         SPU_LIFT_BACKEDGE(ctx);                                               \
         const uint32_t _dpc = (uint32_t)(PC);                                 \

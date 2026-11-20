@@ -12,11 +12,13 @@ void ps3_spu_lifter_abi_check(uint32_t got);
 /* Cross-function branch/loop = a guest tail-jump to another lifted function's
  * entry. It MUST reuse the current host frame, not nest one: SPURS task loops
  * iterate via these, so nesting overflows the host stack and silently kills the
- * process. clang's musttail guarantees the tail call (a jump); without it (or on
- * a non-clang compiler) we fall back to call+return, which only stays bounded if
- * the compiler happens to do sibling-call optimization. All lifted SPU functions
- * share the signature `void f(spu_context*)`, so the tail call is always valid. */
-#if defined(__clang__)
+ * process. musttail guarantees the tail call (a jump); a compiler without it
+ * falls back to call+return, which only stays bounded if the compiler happens
+ * to do sibling-call optimization. clang has it since 13, GCC since 15;
+ * SPU_HAVE_MUSTTAIL is the runtime's test for either (spu_context.h).
+ * All lifted SPU functions share the signature `void f(spu_context*)`, so the
+ * tail call is always valid. */
+#if SPU_HAVE_MUSTTAIL
 #  define SPU_TAILCALL(call) __attribute__((musttail)) return call
 #else
 #  define SPU_TAILCALL(call) do { call; return; } while (0)

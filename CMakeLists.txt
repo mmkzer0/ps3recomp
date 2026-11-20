@@ -165,9 +165,9 @@ file(GLOB_RECURSE RUNTIME_SOURCES
 #    docs/PPU_RECOMP.md.
 #  - spu_dispatch_mt.c: the musttail SPU indirect-branch fast path. It uses
 #    __attribute__((musttail)), which MSVC cannot parse, and it must be compiled
-#    *inside the game build* by clang so the tail call is guaranteed -- a plain
-#    call leaks one resolver frame per guest loop iteration. A port adds it to
-#    its own target; see templates/project/CMakeLists.txt.
+#    *inside the game build* by clang or GCC 15+ so the tail call is guaranteed
+#    -- a plain call leaks one resolver frame per guest loop iteration. A port
+#    adds it to its own target; see templates/project/CMakeLists.txt.
 list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/tests/|/runtime/ppu/|/runtime/host/|/spu_dispatch_mt\.c$")
 # Selected explicitly above, never pulled into other platform backends.
 list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/host_fiber_aarch64\\.c$")

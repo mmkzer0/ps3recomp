@@ -879,7 +879,7 @@ not changed while a title runs.
   `runtime/syscalls/sys_semaphore.c:540`
 - **`PS3_SHARPEN`** — _(no description in source)_
   `libs/video/rsx_metal_backend.m:2322`
-- **`PS3_SPU_DIRECT`** — PS3_SPU_DIRECT=0: run SPU code through the drain loop's per-step work instead of the direct tail-call path; the per-step diagnostics force it off as well. **behavioural, not in the typed registry (#55)**
+- **`PS3_SPU_DIRECT`** — PS3_SPU_DIRECT=0: run SPU code through the drain loop's per-step work instead of the direct tail-call path; the per-step diagnostics force it off as well. The direct path needs a compiler with `musttail` (clang, or GCC 15+); without one the run logs `direct tail calls off (no musttail in this compiler)` and stays on the drain loop. **behavioural, not in the typed registry (#55)**
   `runtime/spu/spu_drain.c:131`
 - **`PS3_SPU_PCWATCH`** — _(no description in source)_
   `runtime/spu/spu_dispatch_mt.c:32`

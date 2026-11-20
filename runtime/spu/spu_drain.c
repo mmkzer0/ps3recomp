@@ -136,7 +136,7 @@ void spu_direct_init(void)
         const char* d = getenv(diag[i]);
         if (d && *d && strcmp(d, "0")) { on = 0; why = diag[i]; }
     }
-#ifndef SPU_DIRECT_TAILCALLS
+#if !SPU_HAVE_MUSTTAIL
     on = 0; why = "no musttail in this compiler";
 #endif
     /* SPU worker threads reach this concurrently on their first run. Each computes the same value from the
