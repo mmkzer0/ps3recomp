@@ -2161,6 +2161,7 @@ if(PS3RECOMP_BUILD_TESTS)
             libs/input/tests/test_pad_trace.c
             libs/input/pad_trace.c
             runtime/diag/host_exit.c
+            runtime/diag/pc_counters.c
             runtime/diag/stop.cpp)
         target_include_directories(test_pad_trace PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
         target_compile_definitions(test_pad_trace PRIVATE _GNU_SOURCE)
@@ -2278,6 +2279,7 @@ if(PS3RECOMP_BUILD_TESTS)
                 libs/input/tests/test_pad_replay.c
                 libs/input/pad_trace.c
                 runtime/diag/host_exit.c
+                runtime/diag/pc_counters.c
                 runtime/diag/stop.cpp)
             target_include_directories(test_pad_replay PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
             target_compile_definitions(test_pad_replay PRIVATE _GNU_SOURCE)

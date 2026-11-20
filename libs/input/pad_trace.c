@@ -69,6 +69,7 @@ typedef pthread_mutex_t trace_lock;
 
 #include "ps3emu/host_exit.h"
 #include "ps3emu/stop.h"
+#include "ps3emu/pc_counters.h"
 
 /* ---------------------------------------------------------------------------
  * Types
@@ -802,6 +803,10 @@ static const Rec* replay_serve(PadTrace* t, uint32_t port, uint64_t ord, uint32_
             printf("[cellPad] pad replay: the trace ended (port 0 polled %llu times); holding a neutral pad. %s\n",
                    (unsigned long long)t->end_seq[0], sum);
             fflush(stdout);
+            /* The end of the input is the end of the measured scenario: a --pc-counters lift writes its
+             * PS3_PC_COUNTERS_OUT dump here, so two runs of one trace count the same input, and a
+             * headless run killed later by its timeout still leaves the file (no exit handler runs). */
+            ps3_pc_counters_dump_now();
         }
     } else {
         r = rec_at_or_before(t, port, ord, &idx);
