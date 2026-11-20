@@ -2154,7 +2154,7 @@ if(PS3RECOMP_BUILD_TESTS)
         target_compile_definitions(test_pad_trace PRIVATE _GNU_SOURCE)
         target_link_libraries(test_pad_trace PRIVATE Threads::Threads)
         set_target_properties(test_pad_trace PROPERTIES LINKER_LANGUAGE CXX)
-        foreach(c roundtrip catchup ends lookup changes record-replay errors record-refusals)
+        foreach(c roundtrip catchup ends lookup repeat changes record-replay errors record-refusals)
             add_test(NAME pad_trace_${c} COMMAND test_pad_trace ${c})
             set_tests_properties(pad_trace_${c} PROPERTIES LABELS "input;t0" TIMEOUT 60)
         endforeach()
@@ -2188,6 +2188,10 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME pad_trace_stop_record-io COMMAND test_pad_trace stop record-io)
         set_tests_properties(pad_trace_stop_record-io PROPERTIES
             PASS_REGULAR_EXPRESSION "PS3STOP v=1 kind=pad-trace role=record [^\n]*line=0 reason=io( |\n)"
+            LABELS "input;t0" TIMEOUT 60)
+        add_test(NAME pad_trace_stop_repeat-no-drain COMMAND test_pad_trace stop repeat-no-drain)
+        set_tests_properties(pad_trace_stop_repeat-no-drain PROPERTIES
+            PASS_REGULAR_EXPRESSION "PS3STOP v=1 kind=pad-trace role=replay [^\n]*line=0 reason=repeat( |\n)"
             LABELS "input;t0" TIMEOUT 60)
 
         # The host audio SPSC ring (libs/audio/audio_ring.h) is pure C17 and pthreads: no SDL2, no runtime.
@@ -2281,7 +2285,7 @@ if(PS3RECOMP_BUILD_TESTS)
                 target_compile_options(test_pad_replay PRIVATE -ffunction-sections -fdata-sections)
                 target_link_options(test_pad_replay PRIVATE "-Wl,--gc-sections")
             endif()
-            foreach(c control replay replay-info record)
+            foreach(c control replay replay-info record replay-repeat)
                 add_test(NAME pad_replay_${c} COMMAND test_pad_replay ${c} pad_replay_${c}.trace)
                 set_tests_properties(pad_replay_${c} PROPERTIES LABELS "input;t0" TIMEOUT 60)
             endforeach()

@@ -444,20 +444,39 @@ PS3_CFG_STR(pad, record, "", 1023, PS3_CFG_V_PAD_RECORD_PATH,
     "cellPadGetInfo/GetInfo2/cellPadPeriphGetInfo) into this file, as a ps3recomp-pad-trace the "
     "pad.replay option plays back (docs/MODULES_REFERENCE.md, \"cellPad: record and replay\"). "
     "The words are the ones stored to guest memory, after the host pad, the keyboard and the "
-    "PAD_SCRIPT, PAD_FILE, PAD_STICK and PAD_AUTOPRESS injectors, keyed by (flip, poll); only a "
-    "change of state is written. The file is created and never overwritten: a path that exists, "
-    "or one in a directory that is missing or not writable, is a config error. Empty (the "
-    "default) records nothing. May be set together with pad.replay to record the replayed input.")
+    "PAD_SCRIPT, PAD_FILE, PAD_STICK and PAD_AUTOPRESS injectors, keyed by the port's "
+    "cellPadGetData ordinal; only a change of state is written. The file is created and never "
+    "overwritten: a path that exists, or one in a directory that is missing or not writable, is a "
+    "config error. Empty (the default) records nothing. May be set together with pad.replay to "
+    "record the replayed input.")
 
 PS3_CFG_STR(pad, replay, "", 1023, PS3_CFG_V_PAD_REPLAY_PATH,
     "Play back a pad trace recorded with pad.record: every cellPadGetData answers with the "
-    "recorded state of the latest record at or before the poll's (flip, poll), a neutral pad "
-    "before the first record of a port and after the end of the trace, and the info calls report "
-    "the recorded connection. The host pad and every injector are ignored. A malformed file, an "
-    "unknown version or keys that go backwards end the run with kind pad-trace; a path that is "
-    "not a readable file is a config error. A summary of how closely the guest followed the "
-    "recording is printed at the end of the trace and at exit. Empty (the default) plays back "
-    "nothing.")
+    "recorded state of the latest record at or before the poll's ordinal (see pad.replay_repeat "
+    "for pacing a recording in a build that polls more often), a neutral pad before the first "
+    "record of a port and after the end of the trace, and the info calls report the recorded "
+    "connection. The host pad and every injector are ignored. A malformed file, an unknown "
+    "version or keys that go backwards end the run with kind pad-trace; a path that is not a "
+    "readable file is a config error. A summary of how closely the guest followed the recording "
+    "is printed at the end of the trace and at exit. Empty (the default) plays back nothing.")
+
+PS3_CFG_U32(pad, replay_repeat, 1, 1, 8,
+    "Serve each recorded frame of a version-3 pad trace this many times when pad.replay is set. "
+    "A frame is what a draining title polls up to and including the first poll served len 0. The "
+    "replay keeps a virtual recorded ordinal per port and serves each guest poll what pad.replay "
+    "alone would serve at that ordinal; a len 0 poll either returns to the frame's first ordinal "
+    "(until the frame has been served N times) or starts the next frame. So a recording made at "
+    "one guest frame per 60 Hz tick keeps its input pacing in a build that runs two guest frames "
+    "per tick (N = 2). Only changes are recorded, so an ordinal with no record of its own serves "
+    "the held state: after a len 0 record every unrecorded poll is a one-poll frame and is "
+    "repeated too, and the spacing between changes is kept. The guest's flip clock and poll count "
+    "take no part. 1 (the default) serves every recorded poll once, exactly as recorded, through "
+    "the poll-ordinal path. The replay summary names N and the frames replayed (repeat=N "
+    "frames=F) when N is not 1; reached_exactly still counts each recorded change once, when a "
+    "poll first serves it. A trace whose served state stays len > 0 for 64 polls of one frame, "
+    "inside the recording, is not a drain loop and ends the run with kind pad-trace reason "
+    "repeat. A version-1 or version-2 trace is refused with N > 1: its records are not keyed on "
+    "the poll ordinal. A value outside 1..8 is a config error.")
 
 /* ---- title -------------------------------------------------------------- */
 

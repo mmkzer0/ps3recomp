@@ -187,6 +187,7 @@ static void pad_trace_attach(void)
     o.record_path = ps3_cfg_pad_record();
     o.replay_path = ps3_cfg_pad_replay();
     o.flip = cellGcm_guest_flip_count;
+    o.replay_repeat = ps3_cfg_pad_replay_repeat();
     __atomic_store_n(&s_trace, pad_trace_global(&o), __ATOMIC_RELEASE);
 }
 

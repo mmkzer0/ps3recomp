@@ -80,6 +80,10 @@ typedef pthread_mutex_t trace_lock;
  * run loses at most this much. Checked at every poll, not only on a write. */
 #define FLUSH_INTERVAL_MS 100u
 #define LEN_MAX          256u
+/* pad.replay_repeat > 1: a frame is the polls up to and including the first one
+ * served len 0 (a draining title polls until then). A frame that serves len > 0
+ * this many polls in a row from the recording is not a drain loop. */
+#define FRAME_POLLS_MAX   64u
 
 typedef struct {
     uint64_t      seq;            /* the port's GetData ordinal: the record's key */
@@ -118,11 +122,24 @@ struct PadTrace {
     int             replaying;
     char*           replay_path;
     uint32_t        ports;        /* the header's */
+    /* pad.replay_repeat: > 1 serves each recorded frame that many times; 1
+     * replays by poll ordinal, as before. */
+    uint32_t        repeat;
     Rec*            recs[PAD_TRACE_MAX_PORTS];
     size_t          nrecs[PAD_TRACE_MAX_PORTS];
     size_t          caprecs[PAD_TRACE_MAX_PORTS];
     ConnRec*        conns;
     size_t          nconns, capconns;
+    /* Frame cursor per port (repeat > 1 only), all in the recording's ordinal
+     * space: v is the recorded ordinal the next poll is served from, f_start
+     * the ordinal the current frame began at, f_rep the repetition of that
+     * frame in progress (1..repeat; zero-initialised ports are set to 1 when
+     * the trace opens), f_polls the polls of the frame so far that served
+     * len > 0 from a record. */
+    uint64_t        v[PAD_TRACE_MAX_PORTS];
+    uint64_t        f_start[PAD_TRACE_MAX_PORTS];
+    uint32_t        f_rep[PAD_TRACE_MAX_PORTS];
+    uint32_t        f_polls[PAD_TRACE_MAX_PORTS];
     uint64_t        end_seq[PAD_TRACE_MAX_PORTS];  /* the end record's counts */
     int             have_end;
     int             end_logged;
@@ -451,11 +468,17 @@ static int replay_load(PadTrace* t, const char* path, PadTraceError* e)
             /* The version decides before the key set: version 1 had no `clock` key and version 2 named
              * another clock, so the reason to refuse either is its version, not the shape of its header. */
             if (!(L.seen & K_VERSION)) RFAIL(n, "header", "the header has no \"version\"");
-            if (L.version == 1u || L.version == 2u)
+            if (L.version == 1u || L.version == 2u) {
+                if (t->repeat > 1u)
+                    RFAIL(n, "version",
+                          "version %u keyed its records on the flip clock, not on the poll ordinal, so "
+                          "pad.replay_repeat %u cannot serve it; set pad.replay_repeat 1 or re-record it as "
+                          "version %u", L.version, t->repeat, PAD_TRACE_VERSION);
                 RFAIL(n, "version",
                       "version %u keyed its records on the flip clock, which moves between a recording and "
                       "its replay when the guest catches up wall time; re-record it as version %u",
                       L.version, PAD_TRACE_VERSION);
+            }
             if (L.version != PAD_TRACE_VERSION)
                 RFAIL(n, "version", "version %u; this runtime reads version %u", L.version, PAD_TRACE_VERSION);
             if (L.seen != MASK_HEADER)
@@ -548,6 +571,18 @@ static const Rec* rec_at_or_before(const PadTrace* t, uint32_t port, uint64_t se
     return &t->recs[port][lo - 1];
 }
 
+static void drift_note(PadTrace* t, uint32_t flip, const Rec* r)
+{
+    const int64_t d = (int64_t)flip - (int64_t)r->flip;
+    if (!t->stats.have_drift) {
+        t->stats.have_drift = 1;
+        t->stats.drift_min = t->stats.drift_max = d;
+    } else {
+        if (d < t->stats.drift_min) t->stats.drift_min = d;
+        if (d > t->stats.drift_max) t->stats.drift_max = d;
+    }
+}
+
 /* ---------------------------------------------------------------------------
  * Writer
  * -------------------------------------------------------------------------*/
@@ -618,6 +653,14 @@ static void summary(const PadTrace* t, char* b, size_t n)
              "polls=%llu exact=%llu held=%llu recorded_changes=%llu reached_exactly=%llu flip_drift=%s",
              (unsigned long long)t->stats.polls, (unsigned long long)t->stats.exact, (unsigned long long)t->stats.held,
              (unsigned long long)t->stats.records, (unsigned long long)t->stats.records_reached, drift);
+    /* k = 1 keeps the historical summary byte for byte; the repeat and the
+     * frames it replayed are named only when a repeat was asked for. */
+    if (t->repeat != 1u) {
+        const size_t used = strlen(b);
+        if (used < n)
+            snprintf(b + used, n - used, " repeat=%u frames=%llu", t->repeat,
+                     (unsigned long long)t->stats.frames);
+    }
 }
 
 /* ---------------------------------------------------------------------------
@@ -648,10 +691,18 @@ int pad_trace_create(const PadTraceOptions* o, PadTrace** out, PadTraceError* er
 
     *out = NULL;
     if (!rec && !rep) return 0;
+    if (o->replay_repeat < 1u || o->replay_repeat > PAD_TRACE_REPEAT_MAX) {
+        set_err(err, PAD_TRACE_ROLE_REPLAY, 0, "repeat", "pad.replay_repeat %u is outside 1..%u",
+                o->replay_repeat, PAD_TRACE_REPEAT_MAX);
+        return -1;
+    }
     t = (PadTrace*)calloc(1, sizeof *t);
     if (!t) { set_err(err, PAD_TRACE_ROLE_RECORD, 0, "io", "out of memory"); return -1; }
     trace_lock_init(&t->lock);
     t->flip_fn = o->flip;
+    t->repeat = o->replay_repeat;
+    t->stats.repeat = t->repeat;
+    for (unsigned p = 0; p < PAD_TRACE_MAX_PORTS; p++) t->f_rep[p] = 1u;
 
     if (rep) {
         t->replay_path = dup_str(o->replay_path);
@@ -732,6 +783,90 @@ PadTrace* pad_trace_global(const PadTraceOptions* o)
     return t;
 }
 
+/* What the ordinal replay serves a port at recorded ordinal `ord`: the latest
+ * record at or before it, a neutral pad before the port's first record, and a
+ * neutral pad from the end count on (said once). Returns the record the answer
+ * came from, NULL for the neutral pad. A record is counted reached, and its
+ * drift read, when a poll first serves it at its own ordinal. */
+static const Rec* replay_serve(PadTrace* t, uint32_t port, uint64_t ord, uint32_t flip, PadTraceState* st,
+                               const PadTraceState* neutral)
+{
+    size_t idx = 0;
+    const Rec* r = NULL;
+    if (t->have_end && ord >= t->end_seq[port]) {
+        if (!t->end_logged) {
+            char sum[384];
+            t->end_logged = 1;
+            t->stats.ended = 1;
+            summary(t, sum, sizeof sum);
+            printf("[cellPad] pad replay: the trace ended (port 0 polled %llu times); holding a neutral pad. %s\n",
+                   (unsigned long long)t->end_seq[0], sum);
+            fflush(stdout);
+        }
+    } else {
+        r = rec_at_or_before(t, port, ord, &idx);
+    }
+    if (r) {
+        *st = r->st;
+        if (r->seq == ord) {
+            t->stats.exact++;
+            /* The flip is annotation: how far it moved between the recording and this replay is the
+             * guest-time drift the ordinal key absorbs, and what the summary reports. */
+            if (!t->recs[port][idx].hit) {
+                t->recs[port][idx].hit = 1;
+                t->stats.records_reached++;
+                drift_note(t, flip, r);
+            }
+        }
+    } else {
+        *st = *neutral;
+    }
+    t->stats.held = t->stats.polls - t->stats.exact;
+    return r;
+}
+
+/* repeat > 1: one guest poll. The port is served what the ordinal replay would
+ * serve at its virtual recorded ordinal v. A draining title polls until len 0,
+ * so a poll that serves len 0 ends a frame: the frame is replayed from its
+ * start ordinal until it has been served `repeat` times, and then the next
+ * frame starts at the ordinal after it. A poll that serves len > 0 only moves
+ * v on. Ordinals with no record of their own serve the held state, so after a
+ * len 0 record every unrecorded poll is a one-poll frame and is repeated like
+ * any other: the recording's spacing between changes survives. Neither the
+ * guest's poll count nor its flip clock takes part. */
+static void replay_repeat_poll(PadTrace* t, uint32_t port, uint32_t flip, PadTraceState* st,
+                               const PadTraceState* neutral)
+{
+    const uint64_t v = t->v[port];
+    const size_t n = t->nrecs[port];
+    const Rec* r = replay_serve(t, port, v, flip, st, neutral);
+
+    if (st->len == 0) {
+        if (t->f_rep[port] < t->repeat) {
+            t->f_rep[port]++;
+            t->v[port] = t->f_start[port];
+        } else {
+            t->f_rep[port] = 1u;
+            t->v[port] = t->f_start[port] = v + 1u;
+            t->stats.frames++;
+        }
+        t->f_polls[port] = 0;
+        return;
+    }
+    t->v[port] = v + 1u;
+    /* Only an answer taken from the recording counts, and not a killed trace's held last record: past
+     * the last record nothing the recording says can end the frame, and the guest keeps what it had. */
+    if (r && !(!t->have_end && v > t->recs[port][n - 1].seq) && ++t->f_polls[port] >= FRAME_POLLS_MAX) {
+        char why[256];
+        snprintf(why, sizeof why,
+                 "port %u: %u polls in a row from recorded ordinal %llu serve len > 0 and none serves len 0, "
+                 "so pad.replay_repeat %u cannot tell where a frame ends: the title does not drain to len 0; "
+                 "set pad.replay_repeat 1",
+                 port, FRAME_POLLS_MAX, (unsigned long long)t->f_start[port], t->repeat);
+        trace_stop(t, PAD_TRACE_ROLE_REPLAY, 0, "repeat", why);
+    }
+}
+
 void pad_trace_poll(PadTrace* t, uint32_t port, PadTraceState* st, const PadTraceState* neutral)
 {
     uint64_t seq;
@@ -745,42 +880,9 @@ void pad_trace_poll(PadTrace* t, uint32_t port, PadTraceState* st, const PadTrac
     flip = t->flip_fn();
 
     if (t->replaying) {
-        size_t idx = 0;
-        const Rec* r = NULL;
         t->stats.polls++;
-        if (t->have_end && seq >= t->end_seq[port]) {
-            if (!t->end_logged) {
-                char sum[384];
-                t->end_logged = 1;
-                t->stats.ended = 1;
-                summary(t, sum, sizeof sum);
-                printf("[cellPad] pad replay: the trace ended (port 0 polled %llu times); holding a neutral pad. %s\n",
-                       (unsigned long long)t->end_seq[0], sum);
-                fflush(stdout);
-            }
-        } else {
-            r = rec_at_or_before(t, port, seq, &idx);
-        }
-        if (r) {
-            *st = r->st;
-            if (r->seq == seq) {
-                t->stats.exact++;
-                if (!t->recs[port][idx].hit) { t->recs[port][idx].hit = 1; t->stats.records_reached++; }
-                /* The flip is annotation: how far it moved between the recording and this replay is the
-                 * guest-time drift the ordinal key absorbs, and what the summary reports. */
-                const int64_t d = (int64_t)flip - (int64_t)r->flip;
-                if (!t->stats.have_drift) {
-                    t->stats.have_drift = 1;
-                    t->stats.drift_min = t->stats.drift_max = d;
-                } else {
-                    if (d < t->stats.drift_min) t->stats.drift_min = d;
-                    if (d > t->stats.drift_max) t->stats.drift_max = d;
-                }
-            }
-        } else {
-            *st = *neutral;
-        }
-        t->stats.held = t->stats.polls - t->stats.exact;
+        if (t->repeat > 1u) replay_repeat_poll(t, port, flip, st, neutral);
+        else replay_serve(t, port, seq, flip, st, neutral);
     }
 
     if (t->wf && !t->wclosed) {

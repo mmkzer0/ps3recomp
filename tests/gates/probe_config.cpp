@@ -110,6 +110,8 @@ static void print_options()
             std::printf("\"%s\"", ps3_cfg_pad_record());
         else if (!std::strcmp(o->section, "pad") && !std::strcmp(o->key, "replay"))
             std::printf("\"%s\"", ps3_cfg_pad_replay());
+        else if (!std::strcmp(o->section, "pad") && !std::strcmp(o->key, "replay_repeat"))
+            std::printf("%u", ps3_cfg_pad_replay_repeat());
         else if (!std::strcmp(o->section, "title") && !std::strcmp(o->key, "elf_sha256"))
             std::printf("\"%s\"", ps3_cfg_title_elf_sha256());
         else if (!std::strcmp(o->section, "diag") && !std::strcmp(o->key, "dump_config"))
