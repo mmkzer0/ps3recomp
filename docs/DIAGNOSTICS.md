@@ -841,8 +841,8 @@ not changed while a title runs.
   `runtime/ppu/ppu_loader.cpp:1388`
 - **`PS3_OPEN_PSID`** — _(no description in source)_
   `runtime/syscalls/lv2_register.c:449`
-- **`PS3_PC_COUNTERS_OUT`** — where --pc-counters counts are written at exit
-  `runtime/diag/pc_counters.c:64`
+- **`PS3_PC_COUNTERS_OUT`** — where --pc-counters counts are written
+  `runtime/diag/pc_counters.c:87`
 - **`PS3_POLLTOP`** — _(no description in source)_
   `runtime/syscalls/sys_timer.c:133`
 - **`PS3_PRIO_START`** — PS3_PRIO_START=1: a newly created higher-priority thread runs until its first blocking call before its creator resumes, modelling lv2 preemption; waits at most 200 ms. **behavioural, not in the typed registry (#55)**

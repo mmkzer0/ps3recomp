@@ -3,10 +3,13 @@
 // (a loop of r3 trips), prints what the counter API reports, then leaves the
 // process the way argv[1] says.
 //
-//   test_pc_counters <exit|quick> <threads> <trips>...
+//   test_pc_counters <exit|quick|dumpnow-exit|dumpnow-quick> <threads> <trips>...
 //
 // Every thread calls the function once per <trips> value, so a counter that
-// loses an update under contention shows up as a short count.
+// loses an update under contention shows up as a short count. The dumpnow-
+// modes call ps3_pc_counters_dump_now() after that first round, then run the
+// whole round again (the printed counts are the doubled ones) and leave
+// through exit() or ps3_host_exit(): the dump file must hold the first round.
 #include "ppu_recomp.h"
 #include "ps3emu/host_exit.h"
 #include "ps3emu/pc_counters.h"
@@ -31,23 +34,37 @@ static void* run(void* out_r4)
     return nullptr;
 }
 
+static uint64_t run_round(int threads)
+{
+    pthread_t t[64];
+    uint64_t r4[64] = {};
+    for (int i = 0; i < threads; i++) pthread_create(&t[i], nullptr, run, &r4[i]);
+    for (int i = 0; i < threads; i++) pthread_join(t[i], nullptr);
+    return r4[0];
+}
+
 int main(int argc, char** argv)
 {
-    if (argc < 4 || (strcmp(argv[1], "exit") && strcmp(argv[1], "quick")) || argc - 3 > 16) {
-        fprintf(stderr, "usage: %s <exit|quick> <threads> <trips>...\n", argv[0]);
+    const char* mode = argc > 1 ? argv[1] : "";
+    const bool dump_now = !strncmp(mode, "dumpnow-", 8);
+    const char* leave = dump_now ? mode + 8 : mode;
+    if (argc < 4 || (strcmp(leave, "exit") && strcmp(leave, "quick")) || argc - 3 > 16) {
+        fprintf(stderr, "usage: %s <exit|quick|dumpnow-exit|dumpnow-quick> <threads> <trips>...\n", argv[0]);
         return 2;
     }
     const int threads = atoi(argv[2]);
     g_ntrips = argc - 3;
     for (int i = 0; i < g_ntrips; i++) g_trips[i] = strtoull(argv[3 + i], nullptr, 0);
-
-    pthread_t t[64];
-    uint64_t r4[64] = {};
     if (threads < 1 || threads > 64) return 2;
-    for (int i = 0; i < threads; i++) pthread_create(&t[i], nullptr, run, &r4[i]);
-    for (int i = 0; i < threads; i++) pthread_join(t[i], nullptr);
 
-    printf("r4=%llu\n", (unsigned long long)r4[0]);
+    uint64_t r4 = run_round(threads);
+    if (dump_now) {
+        ps3_pc_counters_dump_now();
+        ps3_pc_counters_dump_now();   // a second call is a no-op: the first dump wins
+        r4 = run_round(threads);
+    }
+
+    printf("r4=%llu\n", (unsigned long long)r4);
     const size_t n = ps3_pc_counters_count();
     printf("slots=%zu\n", n);
     uint64_t counts[64] = {};
@@ -61,6 +78,6 @@ int main(int argc, char** argv)
     printf("pc_oob=0x%08X\n", (unsigned)ps3_pc_counters_pc(n));
     fflush(stdout);
 
-    if (!strcmp(argv[1], "quick")) ps3_host_exit(0);
+    if (!strcmp(leave, "quick")) ps3_host_exit(0);
     return 0;
 }

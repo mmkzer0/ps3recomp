@@ -470,10 +470,18 @@ through `ps3_host_exit()` (`quick_exit`) alike:
 ```
 
 A file that cannot be written is reported on stderr with its path. A process
-that ends through `_exit()` or a signal writes nothing. Tests:
+that ends through `_exit()` or a signal writes nothing at exit, which is how a
+headless run stopped by SIGTERM/SIGKILL ends; there, and wherever the
+measurement window should end (the end of a pad replay), call
+`void ps3_pc_counters_dump_now(void)`. It writes the same file immediately and
+shares the exit dump's once-flag: the first dump from any route wins and later
+ones (another `dump_now`, the exit handler) wait for it and do nothing more.
+It does nothing when no table is registered or `PS3_PC_COUNTERS_OUT` was unset
+when the process started, and it is not async-signal-safe (call it from a
+thread, not a signal handler). Tests:
 `tools/test_ppu_lifter_pc_counters.py` (emission, rejections),
-`tools/test_ppu_pc_counters_run.py` (a lifted loop run on both exit routes and
-under four threads).
+`tools/test_ppu_pc_counters_run.py` (a lifted loop run on both exit routes,
+under four threads, and with `dump_now` followed by more trips).
 
 ---
 

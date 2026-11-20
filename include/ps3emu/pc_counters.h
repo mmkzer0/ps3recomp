@@ -18,7 +18,8 @@
  * A file that cannot be written is reported on stderr with its path. Counts
  * read while guest threads still run are each a consistent u64, not a snapshot
  * of all slots at one instant. A process that ends through _exit() or a signal
- * writes nothing.
+ * (a headless run stopped by SIGTERM/SIGKILL) writes nothing at exit: call
+ * ps3_pc_counters_dump_now() where the measurement window ends instead.
  */
 
 #ifndef PS3EMU_PC_COUNTERS_H
@@ -46,6 +47,14 @@ uint32_t ps3_pc_counters_pc(size_t k);
 /* Copies min(n, count) slot values to out (each a relaxed atomic load) and
  * returns the slot count, so a result above n means out was too short. */
 size_t ps3_pc_counters_read(uint64_t* out, size_t n);
+
+/* Writes the PS3_PC_COUNTERS_OUT dump now, in the format above. It shares the
+ * exit dump's once-flag: the first dump from any route wins (a later
+ * dump_now() or the exit handler waits for it, then returns), so the file
+ * holds the counts at that first call. Does nothing when no table is
+ * registered or PS3_PC_COUNTERS_OUT was unset at registration. Not
+ * async-signal-safe: call it from a thread, not a signal handler. */
+void ps3_pc_counters_dump_now(void);
 
 #ifdef __cplusplus
 }

@@ -16,7 +16,9 @@ Counters sit on 0x10000 (before the loop), 0x10008 and 0x1000C (inside it). Chec
 2. the read API agrees with the dump, and an out-of-range slot or a short buffer is visible;
 3. four threads running the loop at once lose no update (the increments are atomic);
 4. a lift without counters links against the same runtime: no slots, no dump, even with the env set;
-5. an unwritable PS3_PC_COUNTERS_OUT is reported on stderr with its path.
+5. an unwritable PS3_PC_COUNTERS_OUT is reported on stderr with its path;
+6. ps3_pc_counters_dump_now() writes the counts at the call (more trips run after it, the exit dump
+   after it is a no-op), and does nothing without the env or without counters.
 
 Run: python tools/test_ppu_pc_counters_run.py
 """
@@ -149,6 +151,25 @@ def main():
             assert f"PS3_PC_COUNTERS_OUT={bad}" in r.stderr and "cannot open for writing" in r.stderr, \
                 (how, r.stderr)
         print("[PASS] an unwritable PS3_PC_COUNTERS_OUT is reported on stderr with its path")
+
+        # 6. dump_now: the file holds the counts at the first call; the exit dump after it is a no-op,
+        # and so is a second dump_now. The process keeps counting (the printed counts are doubled).
+        for how in ("dumpnow-exit", "dumpnow-quick"):
+            dump = tmp / f"dump_{how}.txt"
+            r = run(counted, how, 1, 7, 3, out=dump)
+            assert r.returncode == 0 and r.stderr == "", (how, r.stdout, r.stderr)
+            assert parse_dump(dump) == [(0x10000, 2), (0x10008, 10), (0x1000C, 10)], (how, dump.read_text())
+            assert "slot 0 pc=0x00010000 count=4" in r.stdout and "slot 1 pc=0x00010008 count=20" in r.stdout, \
+                r.stdout
+            print(f"[PASS] dump_now ({how}) writes the counts at the call; the exit dump after it changes nothing")
+        r = run(counted, "dumpnow-exit", 1, 7, 3)
+        assert r.returncode == 0 and r.stderr == "", (r.stdout, r.stderr)
+        r = run(plain, "dumpnow-quick", 1, 5, out=tmp / "dump_plain_now.txt")
+        assert r.returncode == 0 and r.stderr == "" and not (tmp / "dump_plain_now.txt").exists(), \
+            (r.stdout, r.stderr)
+        r = run(counted, "dumpnow-exit", 1, 2, out=bad)
+        assert r.stderr.count(f"PS3_PC_COUNTERS_OUT={bad}") == 1, r.stderr
+        print("[PASS] dump_now does nothing without the env or without counters, and reports an unwritable path once")
     print("PASS: --pc-counters counts executions per PC and dumps them on both exit routes")
 
 
