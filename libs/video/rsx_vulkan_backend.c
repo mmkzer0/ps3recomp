@@ -2153,8 +2153,15 @@ static int vk_create_swapchain(void)
     if (nf == 0) { VK_LOG("surface reports no formats\n"); return -1; }
     if (nf > 64) nf = 64;
     VkSurfaceFormatKHR fmts[64];
-    VK_CHECK(pvkGetPhysicalDeviceSurfaceFormatsKHR(s_vk.phys, s_vk.surface, &nf, fmts),
-             "vkGetPhysicalDeviceSurfaceFormatsKHR");
+    /* The first query reports every format the surface offers. Asking for only
+     * the first 64 when the surface has more returns VK_INCOMPLETE, which is
+     * not a failure: the array holds 64 usable entries. RADV on Wayland can
+     * report more than 64 (HDR formats). */
+    VkResult fr = pvkGetPhysicalDeviceSurfaceFormatsKHR(s_vk.phys, s_vk.surface, &nf, fmts);
+    if (fr != VK_SUCCESS && fr != VK_INCOMPLETE) {
+        VK_LOG("vkGetPhysicalDeviceSurfaceFormatsKHR failed (VkResult %d)\n", (int)fr);
+        return -1;
+    }
     /* UNORM, not SRGB: the offscreen target holds the guest's values as-is. */
     VkSurfaceFormatKHR fmt = fmts[0];
     if (nf == 1 && fmts[0].format == VK_FORMAT_UNDEFINED) {
