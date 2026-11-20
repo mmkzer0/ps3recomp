@@ -466,6 +466,27 @@ PS3_CFG_STR(title, elf_sha256, "", 64, PS3_CFG_V_SHA256_OR_EMPTY,
     "digits (either case). Checked in addition to the hash the lifter recorded "
     "in the lifted output, never instead of it. Empty means no pin.")
 
+/* ---- host (the host process's scheduling; PS3RECOMP_HOST_*) ------------- */
+
+PS3_CFG_BOOL(host, work_interval, 0,
+    "Tell the host's performance controller about the one thread on the serial path from a pad poll to the "
+    "present: the title's RSX walker joins an interval workgroup (ps3_host_work_interval_join, "
+    "include/ps3emu/host_work_interval.h), is put in the Mach time-constraint band (period 16683 us, "
+    "computation 4000 us, constraint 16000 us, preemptible) and wraps every FIFO pass in an interval whose "
+    "deadline is host.work_interval_us after its start. On Apple Silicon in High Power mode this holds the "
+    "thread's cluster at its top clock for the run, which shortens the pass and so the pad-to-present latency, "
+    "at the price of CPU power (the cluster no longer idles down between passes). Low Power mode caps the "
+    "clock and the option changes nothing there. macOS only, and links AudioToolbox: with the option on, a "
+    "host that has no interval workgroup, or one that refuses the join, ends the run with kind config-invalid "
+    "naming host.work_interval, because a run that asked for it must not silently run without it. Off (the "
+    "default) calls no host framework and changes nothing. Changes how the host schedules the runtime, never "
+    "what the guest sees. Read when the thread starts.")
+
+PS3_CFG_U32(host, work_interval_us, 500, 50, 16000,
+    "With host.work_interval: the deadline of each interval in microseconds, counted from its start. The "
+    "controller sizes the clock to finish the declared work by it, so a shorter deadline asks for a higher "
+    "clock. 500 us is what was measured; the range is one pass up to one frame (16.7 ms).")
+
 /* ---- diag --------------------------------------------------------------- */
 
 PS3_CFG_BOOL(diag, dump_config, 0,
