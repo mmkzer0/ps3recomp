@@ -2068,9 +2068,22 @@ static int vk_window_open(const char* title)
     /* SIGINT/SIGTERM stay the host's (see pad_init_backend in cellPad.c); a window close is still SDL_QUIT. */
     SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
     if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
-        char why[256];
-        snprintf(why, sizeof why, "SDL_InitSubSystem(SDL_INIT_VIDEO) failed: %s", SDL_GetError());
-        return vk_window_fail(why);
+        /* A caller may request x11; a pure Wayland session has no X server and
+         * that init fails. Retry once through Wayland before giving up. */
+        const char* requested = SDL_GetHint(SDL_HINT_VIDEODRIVER);
+        if (!requested || strcmp(requested, "x11") != 0) {
+            char why[256];
+            snprintf(why, sizeof why, "SDL_InitSubSystem(SDL_INIT_VIDEO) failed: %s", SDL_GetError());
+            return vk_window_fail(why);
+        }
+        SDL_SetHint(SDL_HINT_VIDEODRIVER, "wayland");
+        if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
+            char why[256];
+            snprintf(why, sizeof why, "SDL_InitSubSystem(SDL_INIT_VIDEO) failed for x11 and wayland: %s",
+                     SDL_GetError());
+            return vk_window_fail(why);
+        }
+        VK_LOG("window: x11 unavailable, fell back to SDL video driver '%s'\n", SDL_GetCurrentVideoDriver());
     }
     s_vk.windowed = 1;          /* SDL video must be cleaned up on every later failure */
 #ifdef __APPLE__
