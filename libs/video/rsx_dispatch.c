@@ -160,13 +160,27 @@ static u32 dma_to_location(u32 handle)
 
 /* The coverage classification is a property of the method number alone, so it is built once and every
  * dispatch instance copies it; rsx_dsp_method_class() lets a caller that owns no instance (the FIFO
- * walker) ask the same question. */
-typedef struct { u8 klass[RSX_DSP_NUM_REGS]; } dsp_class_table;
+ * walker) ask the same question. `special` is the other per-method fact, which rsx_dispatch_method
+ * reads for every word: whether the method has anything to do beyond storing the register. A state
+ * method (most of a frame's words) has none, and one byte answers that where a chain of range
+ * compares and a switch did. */
+#define DSP_F_FOLD    0x01u   /* a vertex attribute constant in one of its immediate encodings */
+#define DSP_F_IMM     0x02u   /* may complete an immediate-mode position */
+#define DSP_F_VPINST  0x04u   /* transform program upload window */
+#define DSP_F_VPCONST 0x08u   /* transform constant upload window */
+#define DSP_F_SWITCH  0x10u   /* execution method: has a case in rsx_dispatch_method's switch */
+typedef struct { u8 klass[RSX_DSP_NUM_REGS]; u8 special[RSX_DSP_NUM_REGS]; } dsp_class_table;
 
 static void mark_class(dsp_class_table* t, u32 method, u32 count, u8 klass)
 {
     for (u32 i = 0; i < count; i++)
         t->klass[(method >> 2) + i] = klass;
+}
+
+static void mark_special(dsp_class_table* t, u32 method, u32 count, u8 flag)
+{
+    for (u32 i = 0; i < count; i++)
+        t->special[(method >> 2) + i] |= flag;
 }
 
 static void dsp_fill_classes(dsp_class_table* t)
@@ -260,22 +274,56 @@ static void dsp_fill_classes(dsp_class_table* t)
      * without pretending they do anything. */
     mark_class(t, M_VTX_CACHE_INVALIDATE, 1, RSX_DSP_CLASS_EXEC);
     mark_class(t, M_NV4097_NOP,           1, RSX_DSP_CLASS_EXEC);
+
+    /* What rsx_dispatch_method does beyond the register store, by method. Each row is one of its
+     * branches; the ranges are the ones it used to compare against. */
+    mark_special(t, 0x1500, (0x1A00 - 0x1500) >> 2, DSP_F_FOLD);   /* DATA3F, DATA4F, DATA2F, DATA2S, DATA4UB, DATA4S */
+    mark_special(t, 0x1E40, (0x1E80 - 0x1E40) >> 2, DSP_F_FOLD);   /* DATA1F */
+    mark_special(t, 0x0A80, (0x0B00 - 0x0A80) >> 2, DSP_F_FOLD);   /* DATA_SCALED4S */
+    /* The word that completes an immediate position, per encoding: DATA3F Z, DATA4F W, DATA2F Y,
+     * DATA1F X, DATA2S and DATA4UB (one word), DATA4S and SCALED4S (second word). Only the float
+     * encodings used to count; a movie player that sends its quad as DATA2S positions drew nothing
+     * until the others did. */
+    static const u16 imm[] = { 0x1508, 0x1C0C, 0x1884, 0x1E40, 0x1900, 0x1940, 0x1984, 0x0A84 };
+    for (u32 i = 0; i < sizeof imm / sizeof imm[0]; i++)
+        mark_special(t, imm[i], 1, DSP_F_IMM);
+    mark_special(t, M_VP_UPLOAD_INST,  32, DSP_F_VPINST);
+    mark_special(t, M_VP_UPLOAD_CONST, 32, DSP_F_VPCONST);
+    mark_special(t, M_CLEAR_BUFFERS,   1, DSP_F_SWITCH);
+    mark_special(t, M_VERTEX_BEGIN_END, 1, DSP_F_SWITCH);
+    mark_special(t, M_INLINE_ARRAY,    1, DSP_F_SWITCH);
+    mark_special(t, M_VB_VERTEX_BATCH, 1, DSP_F_SWITCH);
+    mark_special(t, M_VB_INDEX_BATCH,  1, DSP_F_SWITCH);
+    mark_special(t, M_GCM_FLIP_HEAD_0, 2, DSP_F_SWITCH);           /* heads 0 and 1 */
+    mark_special(t, M_GCM_DRIVER_QUEUE_0, 8, DSP_F_SWITCH);        /* queue indices 0..7 (0xE940..0xE95C) */
 }
 
 static dsp_class_table s_classes;
 static atomic_int s_classes_state;   /* 0 unbuilt, 1 being built, 2 ready */
 
-static const dsp_class_table* dsp_classes(void)
+/* The build is once per process; every method word asks for the table, so the ready test is
+ * inline and the build is out of line (left to itself the compiler folds the fill into the
+ * accessor and calls it for every word). */
+#if defined(__GNUC__) || defined(__clang__)
+#  define DSP_BUILD_ATTR __attribute__((noinline, cold))
+#else
+#  define DSP_BUILD_ATTR
+#endif
+DSP_BUILD_ATTR static void dsp_classes_build(void)
 {
-    if (atomic_load_explicit(&s_classes_state, memory_order_acquire) != 2) {
-        int expected = 0;
-        if (atomic_compare_exchange_strong(&s_classes_state, &expected, 1)) {
-            dsp_fill_classes(&s_classes);
-            atomic_store_explicit(&s_classes_state, 2, memory_order_release);
-        } else {
-            while (atomic_load_explicit(&s_classes_state, memory_order_acquire) != 2) { }
-        }
+    int expected = 0;
+    if (atomic_compare_exchange_strong(&s_classes_state, &expected, 1)) {
+        dsp_fill_classes(&s_classes);
+        atomic_store_explicit(&s_classes_state, 2, memory_order_release);
+    } else {
+        while (atomic_load_explicit(&s_classes_state, memory_order_acquire) != 2) { }
     }
+}
+
+static inline const dsp_class_table* dsp_classes(void)
+{
+    if (atomic_load_explicit(&s_classes_state, memory_order_acquire) != 2)
+        dsp_classes_build();
     return &s_classes;
 }
 
@@ -420,8 +468,11 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
     }
     rsx->seen[idx]++;
     rsx->regs[idx] = arg;
-    if ((method >= 0x1500 && method < 0x1A00) || (method >= 0x1E40 && method < 0x1E80) ||
-        (method >= 0x0A80 && method < 0x0B00))
+    /* Most methods are plain register state: stored above, nothing more to do. */
+    const u8 f = dsp_classes()->special[idx];
+    if (!f)
+        return;
+    if (f & DSP_F_FOLD)
         vtx_const_fold(rsx, method, arg);
 
     /* Completing a position emits a register-based vertex: the last word of
@@ -432,21 +483,13 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
      * Only the float encodings used to count (DATA3F's Z, DATA4F's W).
      * Resistance's movie player sends its quad as DATA2S positions, so every
      * movie frame drew nothing and the cutscenes played on a black screen. */
-    if (rsx->in_begin_end && rsx->sink.immediate_vertex &&
-        (method == 0x1508 ||    /* DATA3F  Z            */
-         method == 0x1C0C ||    /* DATA4F  W            */
-         method == 0x1884 ||    /* DATA2F  Y            */
-         method == 0x1E40 ||    /* DATA1F  X            */
-         method == 0x1900 ||    /* DATA2S  (one word)   */
-         method == 0x1940 ||    /* DATA4UB (one word)   */
-         method == 0x1984 ||    /* DATA4S  second word  */
-         method == 0x0A84))     /* SCALED4S second word */
+    if ((f & DSP_F_IMM) && rsx->in_begin_end && rsx->sink.immediate_vertex)
         rsx->sink.immediate_vertex(rsx->sink.user, rsx);
 
     /* Transform program upload window: word goes to instruction slot
      * VP_UPLOAD_FROM_ID; the load pointer advances after every completed
      * vec4 (hardware auto-increment, confirmed against the RPCS3 oracle). */
-    if (method >= M_VP_UPLOAD_INST && method < M_VP_UPLOAD_INST + 32 * 4) {
+    if (f & DSP_F_VPINST) {
         const u32 lane = ((method - M_VP_UPLOAD_INST) >> 2) & 3;
         u32* load = &rsx->regs[M_VP_UPLOAD_FROM_ID >> 2];
         const u32 pos = *load * 4 + lane;
@@ -460,7 +503,7 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
     /* Transform constant upload window: word i of the burst writes
      * constants[VP_UPLOAD_CONST_ID + i/4][i%4]; the load pointer does NOT
      * advance. */
-    if (method >= M_VP_UPLOAD_CONST && method < M_VP_UPLOAD_CONST + 32 * 4) {
+    if (f & DSP_F_VPCONST) {
         const u32 word = (method - M_VP_UPLOAD_CONST) >> 2;
         const u32 slot = rsx->regs[M_VP_UPLOAD_CONST_ID >> 2] + (word >> 2);
         /* The epoch moves only for a write that lands: one that lands nowhere
