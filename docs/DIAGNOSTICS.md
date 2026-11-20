@@ -843,6 +843,8 @@ not changed while a title runs.
   `runtime/syscalls/lv2_register.c:449`
 - **`PS3_PC_COUNTERS_OUT`** — where --pc-counters counts are written
   `runtime/diag/pc_counters.c:87`
+- **`PS3_PC_COUNTERS_DUMP_AT`** — comma-separated recorded pad ordinals; with `PS3_PC_COUNTERS_OUT` set, a replay writes the --pc-counters table to `$PS3_PC_COUNTERS_OUT.at<ordinal>` when port 0 first reaches each (poll ordinal * pad.replay_repeat)
+  `libs/input/pad_trace.c`
 - **`PS3_POLLTOP`** — _(no description in source)_
   `runtime/syscalls/sys_timer.c:133`
 - **`PS3_PRIO_START`** — PS3_PRIO_START=1: a newly created higher-priority thread runs until its first blocking call before its creator resumes, modelling lv2 preemption; waits at most 200 ms. **behavioural, not in the typed registry (#55)**

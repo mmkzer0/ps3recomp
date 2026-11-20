@@ -56,6 +56,10 @@ size_t ps3_pc_counters_read(uint64_t* out, size_t n);
  * async-signal-safe: call it from a thread, not a signal handler. */
 void ps3_pc_counters_dump_now(void);
 
+/* Writes the counts now to `path`, outside the exit dump's once-flag: any number of snapshots can be taken while
+ * the process runs. Does nothing when no table is registered. Same format and caveats as the dump above. */
+void ps3_pc_counters_snapshot(const char* path);
+
 #ifdef __cplusplus
 }
 #endif

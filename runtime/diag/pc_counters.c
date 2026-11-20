@@ -26,12 +26,12 @@ static void report_write_failure(const char* path, const char* what, int err)
     fflush(stderr);
 }
 
-static void write_dump(void)
+static void write_dump_to(const char* path)
 {
     const size_t n = atomic_load_explicit(&s_n, memory_order_acquire);
-    FILE* f = fopen(s_out_path, "w");
+    FILE* f = fopen(path, "w");
     if (!f) {
-        report_write_failure(s_out_path, "cannot open for writing", errno);
+        report_write_failure(path, "cannot open for writing", errno);
         return;
     }
     fprintf(f, "# ps3 pc counters N=%zu\n", n);
@@ -41,7 +41,20 @@ static void write_dump(void)
     const int stream_bad = ferror(f);
     const int close_bad = fclose(f);
     if (stream_bad || close_bad)
-        report_write_failure(s_out_path, "cannot write", close_bad ? errno : 0);
+        report_write_failure(path, "cannot write", close_bad ? errno : 0);
+}
+
+static void write_dump(void)
+{
+    write_dump_to(s_out_path);
+}
+
+/* A mid-run snapshot to its own file: outside the exit dump's once-flag, so any number of them can be taken
+ * while the process runs (diagnostic: counts at one recorded ordinal in two runs). */
+void ps3_pc_counters_snapshot(const char* path)
+{
+    if (!atomic_load_explicit(&s_n, memory_order_acquire) || !path) return;
+    write_dump_to(path);
 }
 
 /* The first caller writes, whichever route it came by (dump_now, exit(),

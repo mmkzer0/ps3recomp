@@ -814,6 +814,38 @@ static const Rec* replay_serve(PadTrace* t, uint32_t port, uint64_t ord, uint32_
     return r;
 }
 
+/* Diagnostic: PS3_PC_COUNTERS_DUMP_AT=<ord>[,<ord>...] writes the --pc-counters table to
+ * "$PS3_PC_COUNTERS_OUT.at<ord>" when port 0 first reaches recorded ordinal <ord> (poll ord * repeat), so a base
+ * run and a repeat run count the same recorded input up to the same point, before they can diverge. Read once, at
+ * the first replayed poll; called under the trace lock. */
+#define DUMP_AT_MAX 64u
+static uint64_t g_dump_at[DUMP_AT_MAX];
+static size_t g_dump_at_n;
+static int g_dump_at_read;
+
+static void dump_at_check(const PadTrace* t, uint64_t seq)
+{
+    if (!g_dump_at_read) {
+        const char* v = getenv("PS3_PC_COUNTERS_DUMP_AT");
+        g_dump_at_read = 1;
+        while (v && *v && g_dump_at_n < DUMP_AT_MAX) {
+            char* end;
+            g_dump_at[g_dump_at_n++] = strtoull(v, &end, 10);
+            if (end == v) { g_dump_at_n--; break; }
+            v = *end == ',' ? end + 1 : end;
+            if (*end != ',') break;
+        }
+    }
+    if (seq % t->repeat) return;
+    for (size_t i = 0; i < g_dump_at_n; i++) {
+        const char* out = getenv("PS3_PC_COUNTERS_OUT");
+        char path[1024];
+        if (g_dump_at[i] != seq / t->repeat || !out || !*out) continue;
+        snprintf(path, sizeof path, "%s.at%llu", out, (unsigned long long)g_dump_at[i]);
+        ps3_pc_counters_snapshot(path);
+    }
+}
+
 void pad_trace_poll(PadTrace* t, uint32_t port, PadTraceState* st, const PadTraceState* neutral)
 {
     uint64_t seq;
@@ -828,6 +860,7 @@ void pad_trace_poll(PadTrace* t, uint32_t port, PadTraceState* st, const PadTrac
 
     if (t->replaying) {
         t->stats.polls++;
+        if (port == 0) dump_at_check(t, seq);
         /* pad.replay_repeat: for a title that polls once per simulation step, each recorded step is served
          * k guest steps. Poll p is answered exactly as the k = 1 replay answers recorded ordinal p / k:
          * an ordinal with no record of its own holds the latest state, the end count is reached when
