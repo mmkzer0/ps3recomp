@@ -159,17 +159,16 @@ static void case_replay(const char* path)
     }
 }
 
-/* pad.replay_repeat through the real cellPadGetData: a drain-shaped recording served twice per recorded
- * frame, in the recording's own ordinal space. Ordinals 0-1 are the packet (CIRCLE) and its drain, 2 and 3
- * are unrecorded polls (the drain's len 0 held), 4-5 the release and its drain; the end count is 6. Four
- * frames, each served twice, so a drain loop ends where the recording's did and the two unrecorded frames
- * keep their place between the changes. The guest's flip clock is moved arbitrarily: it plays no part. */
+/* pad.replay_repeat through the real cellPadGetData, k = 2: guest poll p is answered with what k = 1 serves at
+ * recorded ordinal floor(p / 2). Ordinals 0-1 are the packet (CIRCLE) and its len 0 poll, 2 and 3 are
+ * unrecorded (the len 0 held), 4-5 the release and its len 0 poll; the end count is 6. The guest's flip
+ * clock is moved arbitrarily: it plays no part. */
 static void case_replay_repeat(const char* path)
 {
     PadTraceStats s;
-    /* The 13th poll is past the end count: a neutral pad (len > 0, no buttons). */
-    static const int want_len[13] = { 8, 0, 8, 0,  0, 0, 0, 0,  8, 0, 8, 0,  -1 };
-    static const int want_circle[13] = { 1, 0, 1, 0,  0, 0, 0, 0,  0, 0, 0, 0,  0 };
+    /* The 13th poll is ordinal 6, the end count: a neutral pad (len > 0, no buttons). */
+    static const int want_len[13] = { 8, 8, 0, 0,  0, 0, 0, 0,  8, 8, 0, 0,  -1 };
+    static const int want_circle[13] = { 1, 1, 0, 0,  0, 0, 0, 0,  0, 0, 0, 0,  0 };
 
     publish(path,
             "{\"format\":\"ps3recomp-pad-trace\",\"version\":3,\"clock\":\"guest-polls\",\"ports\":7}\n"
@@ -199,7 +198,6 @@ static void case_replay_repeat(const char* path)
     CHECK(s.repeat == 2, "the trace reports the repeat (%u)", s.repeat);
     CHECK(s.records == 4 && s.records_reached == 4, "each recorded change was first served once (%llu/%llu)",
           (unsigned long long)s.records_reached, (unsigned long long)s.records);
-    CHECK(s.frames == 4, "four recorded frames were replayed (%llu)", (unsigned long long)s.frames);
     CHECK(s.ended, "the trace is reported as ended");
 }
 

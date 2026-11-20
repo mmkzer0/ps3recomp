@@ -461,22 +461,18 @@ PS3_CFG_STR(pad, replay, "", 1023, PS3_CFG_V_PAD_REPLAY_PATH,
     "is printed at the end of the trace and at exit. Empty (the default) plays back nothing.")
 
 PS3_CFG_U32(pad, replay_repeat, 1, 1, 8,
-    "Serve each recorded frame of a version-3 pad trace this many times when pad.replay is set. "
-    "A frame is what a draining title polls up to and including the first poll served len 0. The "
-    "replay keeps a virtual recorded ordinal per port and serves each guest poll what pad.replay "
-    "alone would serve at that ordinal; a len 0 poll either returns to the frame's first ordinal "
-    "(until the frame has been served N times) or starts the next frame. So a recording made at "
-    "one guest frame per 60 Hz tick keeps its input pacing in a build that runs two guest frames "
-    "per tick (N = 2). Only changes are recorded, so an ordinal with no record of its own serves "
-    "the held state: after a len 0 record every unrecorded poll is a one-poll frame and is "
-    "repeated too, and the spacing between changes is kept. The guest's flip clock and poll count "
-    "take no part. 1 (the default) serves every recorded poll once, exactly as recorded, through "
-    "the poll-ordinal path. The replay summary names N and the frames replayed (repeat=N "
-    "frames=F) when N is not 1; reached_exactly still counts each recorded change once, when a "
-    "poll first serves it. A trace whose served state stays len > 0 for 64 polls of one frame, "
-    "inside the recording, is not a drain loop and ends the run with kind pad-trace reason "
-    "repeat. A version-1 or version-2 trace is refused with N > 1: its records are not keyed on "
-    "the poll ordinal. A value outside 1..8 is a config error.")
+    "For a title that polls once per simulation step: serve each recorded poll of a version-3 pad "
+    "trace this many consecutive guest polls when pad.replay is set. Guest poll p of a port is "
+    "answered with exactly what pad.replay alone serves at recorded ordinal floor(p / N): the "
+    "latest record at or before it (an ordinal with no record of its own holds the latest "
+    "state), a neutral pad once floor(p / N) reaches the port's end count. A recording made at "
+    "one step per 60 Hz tick therefore replays with its wall-time pacing in a build that runs N "
+    "steps per tick. A title that drains several polls per step would see each drained report N "
+    "times; that is not supported. The guest's flip clock and poll pattern take no part. 1 (the "
+    "default) serves every recorded poll once, exactly as recorded. The replay summary names N "
+    "when it is not 1; reached_exactly still counts each recorded change once, when a poll first "
+    "serves it. A version-1 or version-2 trace is refused with N > 1: its records are not keyed "
+    "on the poll ordinal. A value outside 1..8 is a config error.")
 
 /* ---- title -------------------------------------------------------------- */
 

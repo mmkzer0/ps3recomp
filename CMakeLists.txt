@@ -2189,10 +2189,6 @@ if(PS3RECOMP_BUILD_TESTS)
         set_tests_properties(pad_trace_stop_record-io PROPERTIES
             PASS_REGULAR_EXPRESSION "PS3STOP v=1 kind=pad-trace role=record [^\n]*line=0 reason=io( |\n)"
             LABELS "input;t0" TIMEOUT 60)
-        add_test(NAME pad_trace_stop_repeat-no-drain COMMAND test_pad_trace stop repeat-no-drain)
-        set_tests_properties(pad_trace_stop_repeat-no-drain PROPERTIES
-            PASS_REGULAR_EXPRESSION "PS3STOP v=1 kind=pad-trace role=replay [^\n]*line=0 reason=repeat( |\n)"
-            LABELS "input;t0" TIMEOUT 60)
 
         # The host audio SPSC ring (libs/audio/audio_ring.h) is pure C17 and pthreads: no SDL2, no runtime.
         # `tsan` runs the two-thread stress under ThreadSanitizer. The cellAudio port ring is hle_audio_ring.
