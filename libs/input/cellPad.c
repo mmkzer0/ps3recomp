@@ -172,11 +172,11 @@ _Static_assert(CELL_PAD_MAX_PORT_NUM == PAD_TRACE_MAX_PORTS, "pad trace ports fo
 static PadTrace* s_trace;   /* published by cellPadInit; NULL when neither option is set */
 static int s_replay_conn[CELL_PAD_MAX_PORT_NUM];   /* 0 unseen, 1 off, 2 on: what GetInfo last said */
 
-/* The trace's clock: cellGcmSys.c counts guest flip requests at the request, in guest program order. The
- * count above (PAD_CLOCK=flips) is the present loop's frame boundary, and for an in-FIFO flip it moves
- * only when the RSX drain reaches the marker, so a trace keyed on it followed the walker's pace
- * (pad_trace.h). PAD_CLOCK=flips keeps that boundary: it schedules input against the frames the title
- * put on screen. */
+/* The trace's flip annotation and drift source: cellGcmSys.c counts guest flip requests at the request,
+ * in guest program order. The trace keys on the port's poll ordinal (pad_trace.h); the flip count is
+ * recorded per poll only so the replay summary can report how far the guest clock moved (flip_drift).
+ * PAD_CLOCK=flips still counts the present loop's frame boundary (cellGcm_flip_request_count above): it
+ * schedules input against the frames the title put on screen. */
 extern u32 cellGcm_guest_flip_count(void);
 
 static PadTrace* pad_trace_get(void) { return __atomic_load_n(&s_trace, __ATOMIC_ACQUIRE); }
@@ -253,20 +253,22 @@ static void pad_ft_edge(u32 port, s32 len, const u16* words)
     if (edge) ps3_ft_span(PS3_FT_PAD_EDGE, port, seq, pad_ft_digest(&st), t, t);
 }
 
-/* One replayed cellPadGetData. `fresh` is the replayer's answer to "does the
- * guest get a new packet": without it a held state would be a new packet on
- * every poll, and a title that drains the pad until len is 0 would never leave
- * its loop (see the emission contract at the end of cellPadGetData). */
+/* One replayed cellPadGetData: the recorded len and words are the guest's
+ * report, as they were read while recording. There is no freshness rule here;
+ * a record with len 0 is a poll the recording's host had no report for, and it
+ * is what ends the same drain loop in the replay. */
 static void pad_replay_get(PadTrace* tr, u32 port, CellPadData* data)
 {
     PadTraceState st, neutral;
-    int fresh = 1;
     pad_neutral_state(port, &neutral);
     st = neutral;
-    pad_trace_poll(tr, port, &st, &neutral, &fresh);
-    data->len = fresh ? st.len : 0;
+    pad_trace_poll(tr, port, &st, &neutral);
+    data->len = st.len;
     memcpy(data->button, st.words, sizeof data->button);
-    pad_ft_edge(port, st.len, st.words);
+    /* The ftrace edge is a change of the button words; its len is the port's
+     * packet length (the neutral report's), not the poll's freshness, or every
+     * drained poll would look like an edge. */
+    pad_ft_edge(port, neutral.len, st.words);
 }
 
 /* Which ports the info calls report connected. Port 0 is always one (the
@@ -1078,7 +1080,7 @@ s32 cellPadGetData(u32 port_no, CellPadData* data_guest)
     memset(data, 0, sizeof(CellPadData));
 
     PadTrace* const tr = pad_trace_get();
-    s32 rec_len = 0;   /* a connected port's packet length, whatever freshness does to data->len below */
+    s32 rec_len = 0;   /* a connected port's packet length, for the ftrace edge: it must not flap with freshness */
     if (tr && pad_trace_replaying(tr)) {
         pad_replay_get(tr, port_no, data);
         goto store;
@@ -1406,13 +1408,12 @@ emit:
      *
      * PAD_ALWAYS_CHANGE=1 restores the old always-a-packet behaviour. */
     if (tr && !pad_trace_replaying(tr)) {
-        /* Recorded after every source above, from the words that are stored below. len is the packet
-         * length, not data->len: whether a poll is fresh depends on the host's 4 ms report clock. */
+        /* The guest-visible report as it is stored below, len included: the replay hands back exactly
+         * this, so a draining title's len sequence, and with it the number of polls, replays as recorded. */
         PadTraceState st;
-        int fresh;
-        st.len = rec_len;
+        st.len = data->len;
         memcpy(st.words, data->button, sizeof st.words);
-        pad_trace_poll(tr, port_no, &st, NULL, &fresh);
+        pad_trace_poll(tr, port_no, &st, NULL);
     }
     pad_ft_edge(port_no, rec_len, data->button);
 store: ;

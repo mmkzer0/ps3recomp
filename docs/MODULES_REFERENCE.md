@@ -287,69 +287,71 @@ Record the controller of one run (`pad.record = "battle.padtrace"`), then replay
 (`pad.replay = "battle.padtrace"`); no person is needed at the controller. Both may be set at once to record
 while replaying, which gives a trace of what a replayed run was actually handed.
 
-**What is recorded.** The result of every `cellPadGetData`, per port, as the words stored to guest memory
-(host order, before the big-endian store), after the host backend, the keyboard and every injector
-(`PAD_SCRIPT`, `PAD_FILE`, `PAD_STICK`, `PAD_AUTOPRESS`). Each state record is keyed by `(flip, poll)`: `flip`
-is the guest's flip-request clock, `cellGcm_guest_flip_count()`, which counts every flip the guest asks for on
-the calling thread; `poll` is the ordinal of this port's `GetData` call since that count last changed; `seq`
-is the port's `GetData` ordinal since its first poll of the run. The clock is deliberately not
-`cellGcm_flip_request_count()`, the present loop's frame boundary: for a flip queued into the command stream
-that count advances only when the RSX drain reaches the flip marker, so it follows the walker's pace, and host
-load moves it relative to the guest's polls. Version 1 was keyed on it and put recorded input on other guest
-polls from run to run. A record is written when the state of a port differs from its last record, plus once
-for the first poll of each port, so a trace is a list of presses and releases. `len` is the packet length of a
-connected port (0 for one with no device), not whether that one poll was fresh: freshness follows the host's
-4 ms report clock, which differs from run to run. `cellPadGetInfo`, `GetInfo2` and `PeriphGetInfo` are recorded
-as the connection they reported, when it changes. The writer flushes within 100 ms of a record, at `cellPadEnd`
-and at exit (`atexit` and `at_quick_exit`, because a guest exit leaves through `quick_exit`), always at a line
-boundary, so a killed run loses only the last interval.
+**What is recorded.** The result of every `cellPadGetData`, per port, as the guest read it, after the host
+backend, the keyboard and every injector (`PAD_SCRIPT`, `PAD_FILE`, `PAD_STICK`, `PAD_AUTOPRESS`): `len` (0 for a
+poll the host had no new report for, which is what ends a drain loop) and the button words. The key is the port's
+0-based `GetData` ordinal, so poll n of a replay is handed exactly what the recording's poll n was handed. Nothing
+else can be the key: the flip clock moves between runs, because a title's step loop runs one to three steps per
+tick to catch up wall time, so how many polls happen inside one guest flip depends on the host. Version 2 keyed on
+`(flip, poll)`, and a one-step press recorded at `(F,0)->(F+1,0)` became a two-step press when a replay took a
+catch-up tick where the recording did not; version 1 keyed on the RSX walker's flip count, further from the
+guest. The flip at each record is kept as an annotation (`flip`), never as a key. A record is written for the first
+poll of each port and then whenever `len` or the words differ from the port's last record. `len` is part of the
+state, so a draining title writes about two records per fresh packet (the packet, then the poll that read `len` 0)
+and its exact len sequence replays; the trace is a list of input changes and len transitions that can be read and
+diffed. `cellPadGetInfo`, `GetInfo2` and `PeriphGetInfo` are recorded as the connection they reported, keyed by the
+info call's ordinal, when it changes. The writer flushes within 100 ms of a record, at `cellPadEnd` and at exit
+(`atexit` and `at_quick_exit`, because a guest exit leaves through `quick_exit`), always at a line boundary, so a
+killed run loses only the last interval.
 
-**Replay.** The host pad and every injector are ignored. A poll is answered with the state of the latest record of
-its port at or before its `(flip, poll)`; before the port's first record the answer is a neutral pad (port 0: the
-connected virtual pad with centred sticks, any other port: no device). A poll that hits a record's own
-`(flip, poll)` has its `seq` compared with the record's as well, which says whether that was the guest poll the
-record was taken from. The first poll of a port after a flip, and any poll whose state differs from the previous
-one it served, is a fresh packet (`len > 0`); the others report `len = 0` with the same words, which is what ends
-a title's `while (GetData(..) == OK && len > 0)` drain loop. The info calls report the recorded connection (port 0
-only until the trace says more) and flag a change with `CELL_PAD_STATUS_ASSIGN_CHANGES` once. Past the last flip of
-the recording the pad is neutral, and the end of the trace is logged once with the divergence summary.
+**Replay.** The host pad and every injector are ignored. Poll n of a port is answered with the latest record of
+that port whose `seq` is at or before n; before the port's first record the answer is a neutral pad (port 0: the
+connected virtual pad with centred sticks, any other port: no device). There is no freshness rule to apply: the
+recorded `len` is the guest's `len`, so a draining title's loop ends on exactly the poll it ended on while
+recording. The info calls report the recorded connection at or before their own ordinal (port 0 only until the
+trace says more) and flag a change with `CELL_PAD_STATUS_ASSIGN_CHANGES` once. The end record holds one poll count
+per port: a poll whose ordinal reaches its own port's count is past the recording and gets a neutral pad, and the
+end of the trace is logged once with the divergence summary. A port polled more or less often than port 0 is
+bounded by its own count, not port 0's. A killed run has no end record; every record in it is reachable and was
+really served, so opening it prints `the trace has no end record; the last state of each port is held` once and the
+replay keeps serving each port's last record (refusing would throw away a whole recording for a kill the recorder
+is built to survive).
 
-**Divergence.** A replayed run diverges when the guest polls differently from the recording. The summary
-(`[cellPad] pad replay: the trace ended at flip N; ... polls=.. exact=.. held=.. recorded_changes=..
-reached_exactly=.. first_poll_count_divergence=.. reached_at_ordinal=.. first_ordinal_divergence=..`, and again at
-exit) counts the polls whose `(flip, poll)` has a record of its own (`exact`) against the ones answered from an
-earlier record or the neutral pad (`held`; most polls, since only changes are recorded), the recorded changes the
-guest reached at exactly their poll (`reached_exactly`), the first flip whose poll count for some port differs from
-the recording, the subset of those changes reached at the poll ordinal they were recorded from
-(`reached_at_ordinal`), and the first change reached at another ordinal, as `flip:port:recorded:served` or `none`.
-That last field is what sees a flip clock that drifted under host load: the key still finds every record, so
-`reached_exactly` is full, but the release arrives on the guest poll before or after the one it was recorded from.
-It is a diagnostic, not a stop.
+**Divergence.** The summary (at the end of the trace and again at exit) is
+`polls=.. exact=.. held=.. recorded_changes=.. reached_exactly=.. flip_drift=<min>:<max>|none`. It counts the polls
+whose ordinal has a record of its own (`exact`) against the ones answered from an earlier record or the neutral pad
+(`held`; most polls, since only changes are recorded), the recorded changes (`recorded_changes`), the ones a poll
+landed on (`reached_exactly`), and `flip_drift`: the smallest and largest `served flip - recorded flip` over the
+reached records. The drift is the guest-time movement the ordinal key absorbs — a step loop that caught up wall
+time where the recording did not — and it is reported rather than removed: no input clock can make guest logic that
+is gated on wall time, or that waits on an asynchronous load, deterministic. It is a diagnostic, not a stop. A run
+that polls fewer times than the recording leaves later records unreached (`reached_exactly` below
+`recorded_changes`).
 
-**File format, version 2.** One JSON object per line, no host paths and no timestamps. Keys are exactly these;
+**File format, version 3.** One JSON object per line, no host paths and no timestamps. Keys are exactly these;
 anything else is refused.
 
 ```
-{"format":"ps3recomp-pad-trace","version":2,"clock":"guest-flip-requests","ports":7}   header, line 1
-{"flip":12,"poll":0,"port":0,"len":8,"words":[0,116,0,64,128,128,128,128],"seq":340}   state of a port from this poll on
-{"flip":12,"conn":[1,0,0,0,0,0,0]}                             ports the info calls reported connected
-{"flip":12,"port":0,"polls":3}                                 from flip 12 the port is polled 3 times per flip
-{"end":true,"flip":40}                                         last line: the last flip of the run
+{"format":"ps3recomp-pad-trace","version":3,"clock":"guest-polls","ports":7}   header, line 1
+{"seq":340,"port":0,"len":8,"words":[0,116,0,64,128,128,128,128],"flip":12}    what poll 340 of port 0 was handed
+{"info":7,"conn":[1,0,0,0,0,0,0]}                              ports the 8th info call reported connected
+{"end":true,"seq":[1024,0,0,0,0,0,0]}                         last line: each port's poll count
 ```
 
-`words` is `CellPadData.button` up to its last non-zero word. The poll-count steps (run-length: they hold until the
-next step of that port, `0` for flips the guest did not poll) only feed the divergence summary. A run that was
-killed has no end record and ends at its last record.
+`words` is `CellPadData.button` up to its last non-zero word. A state record holds until the next record of its
+port; only a change is written. The end record's `seq` has one count per port the header declares: it is the
+recording's length in polls per port, and a killed run has none.
 
-**Fail closed.** `flip` never decreases over state, connection and end records, and `(flip, poll)` and `seq`
-strictly increase per port. A malformed header, a header without `clock` or with another clock, a version other
-than 2, a malformed or truncated line, an unknown or repeated key, a state record without `seq`, keys that go
-backwards, a port the header does not declare or a line after the end record is the `pad-trace` stop (`role`,
-`path`, `line`, `reason`; `docs/STOPS.md`), raised when `cellPadInit` opens the file and not later. A version-1
-file is refused with `reason=version` and a detail saying so: its `flip` keys came from the walker's count and
-cannot be recovered, so it has to be recorded again. A record file that cannot be written is refused the same
-way. The config checks an existing record path, an unwritable directory and an unreadable replay file at load
-(`config-invalid`).
+**Fail closed.** `seq` strictly increases per port and `info` strictly increases. A malformed header, a header
+without `clock` or with another clock, a version other than 3, a malformed, truncated or NUL-carrying line, an
+unknown or repeated key, a state record without `seq` or without `flip` (or with `seq` as an array), a connection
+record without `info`, an end record without the per-port count array or with the wrong number of counts, a state
+record at or past its port's end count (a replay could never serve it), keys that go backwards, a port the header
+does not declare or a line after the end record is the `pad-trace` stop (`role`, `path`, `line`, `reason`;
+`docs/STOPS.md`), raised when `cellPadInit` opens the file and not later. Version-1 and version-2 files are refused
+with `reason=version` and a detail saying so: their keys came from a flip clock that cannot be re-derived, so the
+run has to be recorded again. A record file that cannot be written is refused the same way. The config checks an
+existing record path, an unwritable directory and an unreadable replay file at load (`config-invalid`).
 
 **Not covered.** The sensor and pressure words are recorded as they are, and replay assumes the title sets the same
 port settings as in the recording. The other pad calls (`cellPadSetActDirect`, `cellPadClearBuf`,

@@ -1,37 +1,35 @@
 /*
  * ps3recomp - pad trace writer, reader and lookup (see pad_trace.h)
  *
- * File format, version 2: UTF-8 text, one JSON object per line, no host paths
+ * File format, version 3: UTF-8 text, one JSON object per line, no host paths
  * and no timestamps.
  *
- *   {"format":"ps3recomp-pad-trace","version":2,"clock":"guest-flip-requests","ports":7}   header, line 1
- *   {"flip":F,"poll":P,"port":N,"len":L,"words":[...],"seq":S}      pad state
- *   {"flip":F,"conn":[c0,...,c6]}                                    connection
- *   {"flip":F,"port":N,"polls":C}                                    poll count
- *   {"end":true,"flip":F}                                            last line
+ *   {"format":"ps3recomp-pad-trace","version":3,"clock":"guest-polls","ports":7}   header, line 1
+ *   {"seq":S,"port":N,"len":L,"words":[...],"flip":F}      pad state
+ *   {"info":I,"conn":[c0,...,c6]}                            connection
+ *   {"end":true,"seq":S}                                     last line
  *
- * A state record gives the state of port N from poll P of flip F on, until the
- * next record of that port. `words` stops at its last non-zero word; the rest
- * are zero. `seq` is the port's GetData ordinal since its first poll of the run,
- * recorded so a replay can say whether the poll that hit this record was the
- * poll the recording took it from. A connection record says which ports GetInfo
- * reported connected. A poll-count record is a run-length step: from flip F,
- * port N is polled C times per flip until the next step of that port (C = 0 for
- * flips the guest did not poll). They exist so a replay can say where the
- * guest's polling stopped matching the recording; they never change what a poll
- * returns. The end record carries the last flip of the run; a killed run has
- * none and ends at its last record.
+ * A state record gives what poll S of port N was handed: `len` and `words`
+ * exactly as the guest read them, `len` = 0 for a poll the host had no new
+ * report for. It holds until the next record of that port, so a replay poll n
+ * is served the latest record of its port with seq <= n. `flip` is the guest
+ * flip count at that poll, for the summary's drift only: it is not a key.
+ * A connection record says which ports the info call with ordinal I reported
+ * connected. The end record carries port 0's poll count: a replay poll whose
+ * ordinal reaches it is past the recording and gets a neutral pad. A killed run
+ * has no end record and keeps serving the last record.
  *
- * `flip` is the guest's flip-request clock (cellGcm_guest_flip_count), not the
- * walker-side count: the latter advances when the drain reaches an in-FIFO flip
- * marker and so runs at the walker's pace. Version 1 keyed on the walker's
- * count and had no `clock` key; a version-1 file is refused, because its keys
- * cannot be re-derived.
+ * `seq` is the port's 0-based cellPadGetData ordinal, and the only key. The
+ * flip count cannot be one: a title's step loop runs one to three steps per
+ * tick to catch up wall time, so how many polls happen inside one flip depends
+ * on the host. Version 2 keyed on (flip, poll) and turned a one-step press
+ * recorded at (F,0)->(F+1,0) into a two-step press when a replay took a
+ * catch-up tick where the recording did not. Version 1 keyed on the walker's
+ * flip count, one step further from the guest. Both are refused: neither key
+ * can be re-derived from the other.
  *
- * Ordering: `flip` never decreases over state, connection and end records, and
- * (flip, poll) and `seq` strictly increase per port. Poll-count steps are
- * written when a flip is complete, so they are exempt from the first rule and
- * only increase in flip per port.
+ * Ordering: `seq` strictly increases per port and `info` strictly increases.
+ * `flip` is annotation, so the reader does not order on it.
  */
 
 /* Strict -std=c17 hides clock_gettime and pthread on glibc. Apple's headers go the other
@@ -84,26 +82,24 @@ typedef pthread_mutex_t trace_lock;
 #define LEN_MAX          256u
 
 typedef struct {
-    uint32_t      flip, poll;
-    uint64_t      seq;            /* the port's GetData ordinal the record was taken at */
-    uint8_t       hit;            /* a replayed poll matched this key exactly */
-    PadTraceState st;
+    uint64_t      seq;            /* the port's GetData ordinal: the record's key */
+    uint32_t      flip;           /* the flip clock at that poll, annotation only */
+    uint32_t      line;           /* the replay file's line, for a load error */
+    uint8_t       hit;            /* a replayed poll landed on this record's own seq */
+    PadTraceState st;             /* len and words exactly as the guest read them */
 } Rec;
 
-typedef struct { uint32_t flip; uint8_t on[PAD_TRACE_MAX_PORTS]; } ConnRec;
-typedef struct { uint32_t flip, polls; } Step;
-
-typedef struct { uint32_t cur_flip, cur_count; int any; } Tracker;
+typedef struct { uint64_t info; uint8_t on[PAD_TRACE_MAX_PORTS]; } ConnRec;
 
 struct PadTrace {
     trace_lock      lock;
     uint32_t      (*flip_fn)(void);
-    uint32_t        max_flip;     /* highest flip any call has seen */
-    Tracker         trk[PAD_TRACE_MAX_PORTS];
-    /* Each port's GetData ordinal since its first poll: the `seq` a record is
-     * written with, and what a replay compares a record's against. Both sides
-     * count every poll, so equal poll sequences give equal ordinals. */
+    /* Each port's GetData ordinal since its first poll, and the info-call
+     * ordinal: the key the next record is written with, and the ordinal a
+     * replay serves from. Both roles count every call, so equal call sequences
+     * give equal ordinals. */
     uint64_t        seq[PAD_TRACE_MAX_PORTS];
+    uint64_t        info_seq;
 
     /* writer */
     FILE*           wf;
@@ -117,8 +113,6 @@ struct PadTrace {
     uint8_t         w_have[PAD_TRACE_MAX_PORTS];
     uint8_t         w_conn[PAD_TRACE_MAX_PORTS];
     int             w_have_conn;
-    uint32_t        w_next[PAD_TRACE_MAX_PORTS];   /* first flip not yet accounted in a step */
-    uint32_t        w_rle[PAD_TRACE_MAX_PORTS];    /* count the last step declared */
 
     /* reader */
     int             replaying;
@@ -127,15 +121,10 @@ struct PadTrace {
     Rec*            recs[PAD_TRACE_MAX_PORTS];
     size_t          nrecs[PAD_TRACE_MAX_PORTS];
     size_t          caprecs[PAD_TRACE_MAX_PORTS];
-    Step*           steps[PAD_TRACE_MAX_PORTS];
-    size_t          nsteps[PAD_TRACE_MAX_PORTS];
-    size_t          capsteps[PAD_TRACE_MAX_PORTS];
     ConnRec*        conns;
     size_t          nconns, capconns;
-    uint32_t        end_flip;
-    uint32_t        r_next[PAD_TRACE_MAX_PORTS];   /* first flip not yet compared with the steps */
-    PadTraceState   served[PAD_TRACE_MAX_PORTS];
-    uint8_t         have_served[PAD_TRACE_MAX_PORTS];
+    uint64_t        end_seq[PAD_TRACE_MAX_PORTS];  /* the end record's counts */
+    int             have_end;
     int             end_logged;
     int             summary_logged;
     PadTraceStats   stats;
@@ -169,8 +158,6 @@ static uint64_t now_ms(void)
 #endif
 }
 
-static uint64_t key_of(uint32_t flip, uint32_t poll) { return ((uint64_t)flip << 32) | poll; }
-
 static int state_equal(const PadTraceState* a, const PadTraceState* b)
 {
     return a->len == b->len && memcmp(a->words, b->words, sizeof a->words) == 0;
@@ -203,23 +190,27 @@ static const char* role_name(PadTraceRole r) { return r == PAD_TRACE_ROLE_RECORD
  * -------------------------------------------------------------------------*/
 
 enum {
-    K_FORMAT = 1u << 0, K_VERSION = 1u << 1, K_PORTS = 1u << 2, K_CLOCK = 1u << 3,
-    K_FLIP   = 1u << 4, K_POLL    = 1u << 5, K_PORT  = 1u << 6, K_LEN = 1u << 7, K_WORDS = 1u << 8,
-    K_CONN   = 1u << 9, K_POLLS   = 1u << 10, K_END  = 1u << 11, K_SEQ = 1u << 12,
+    K_FORMAT = 1u << 0, K_VERSION = 1u << 1, K_CLOCK = 1u << 2, K_PORTS = 1u << 3,
+    K_SEQ    = 1u << 4, K_PORT    = 1u << 5, K_LEN   = 1u << 6, K_WORDS = 1u << 7,
+    K_FLIP   = 1u << 8, K_INFO    = 1u << 9, K_CONN  = 1u << 10, K_END  = 1u << 11,
 };
 
 #define MASK_HEADER (K_FORMAT | K_VERSION | K_CLOCK | K_PORTS)
-#define MASK_STATE  (K_FLIP | K_POLL | K_PORT | K_LEN | K_WORDS | K_SEQ)
-#define MASK_CONN   (K_FLIP | K_CONN)
-#define MASK_STEP   (K_FLIP | K_PORT | K_POLLS)
-#define MASK_END    (K_END | K_FLIP)
+#define MASK_STATE  (K_SEQ | K_PORT | K_LEN | K_WORDS | K_FLIP)
+#define MASK_CONN   (K_INFO | K_CONN)
+#define MASK_END    (K_END | K_SEQ)
 
 typedef struct {
     unsigned seen;
     char     format[32];
     char     clock[32];
-    uint32_t version, ports, flip, poll, port, len, polls;
-    uint64_t seq;
+    uint32_t version, ports, port, len, flip;
+    uint64_t seq, info;
+    /* `seq` is a scalar in a state record and the per-port poll-count array in
+     * the end record; the two are told apart by the shape the file uses. */
+    uint64_t seqv[PAD_TRACE_MAX_PORTS];
+    uint32_t nseq;
+    int      seq_array;
     uint32_t nwords;
     uint16_t words[PAD_TRACE_MAX_WORDS];
     uint32_t nconn;
@@ -307,6 +298,27 @@ static int parse_array(Cur* c, uint32_t* out, size_t cap, uint32_t max_val, uint
     return 0;
 }
 
+/* `cap` bounds the element count; the elements are poll counts, so u64. */
+static int parse_array_u64(Cur* c, uint64_t* out, size_t cap, uint32_t* n)
+{
+    uint32_t count = 0;
+    if (expect_ch(c, '[')) return -1;
+    skip_ws(c);
+    if (*c->p == ']') { c->p++; *n = 0; return 0; }
+    for (;;) {
+        uint64_t v;
+        if (parse_uint(c, &v, UINT64_MAX)) return -1;
+        if (count >= cap) PFAIL(c, "value", "array longer than %zu elements", cap);
+        out[count++] = v;
+        skip_ws(c);
+        if (*c->p == ',') { c->p++; continue; }
+        if (*c->p == ']') { c->p++; break; }
+        PFAIL(c, "syntax", "expected ',' or ']' at column %d", (int)(c->p - c->s) + 1);
+    }
+    *n = count;
+    return 0;
+}
+
 static int parse_line(const char* s, Line* L, PadTraceError* e)
 {
     Cur cur = { s, s, e };
@@ -318,20 +330,20 @@ static int parse_line(const char* s, Line* L, PadTraceError* e)
     for (;;) {
         char key[16];
         unsigned bit = 0;
-        enum { T_STR, T_U32, T_U64, T_WORDS, T_CONN, T_TRUE } type = T_U32;
+        enum { T_STR, T_U32, T_U64, T_SEQ, T_WORDS, T_CONN, T_TRUE } type = T_U32;
         uint32_t* dst = NULL;
+        uint64_t* dst64 = NULL;
         if (parse_string(c, key, sizeof key)) return -1;
         if (expect_ch(c, ':')) return -1;
         if      (!strcmp(key, "format"))  { bit = K_FORMAT;  type = T_STR; }
         else if (!strcmp(key, "version")) { bit = K_VERSION; dst = &L->version; }
         else if (!strcmp(key, "clock"))   { bit = K_CLOCK;   type = T_STR; }
         else if (!strcmp(key, "ports"))   { bit = K_PORTS;   dst = &L->ports; }
-        else if (!strcmp(key, "flip"))    { bit = K_FLIP;    dst = &L->flip; }
-        else if (!strcmp(key, "poll"))    { bit = K_POLL;    dst = &L->poll; }
+        else if (!strcmp(key, "seq"))     { bit = K_SEQ;     type = T_SEQ; }
         else if (!strcmp(key, "port"))    { bit = K_PORT;    dst = &L->port; }
         else if (!strcmp(key, "len"))     { bit = K_LEN;     dst = &L->len; }
-        else if (!strcmp(key, "polls"))   { bit = K_POLLS;   dst = &L->polls; }
-        else if (!strcmp(key, "seq"))     { bit = K_SEQ;     type = T_U64; }
+        else if (!strcmp(key, "flip"))    { bit = K_FLIP;    dst = &L->flip; }
+        else if (!strcmp(key, "info"))    { bit = K_INFO;    type = T_U64; dst64 = &L->info; }
         else if (!strcmp(key, "words"))   { bit = K_WORDS;   type = T_WORDS; }
         else if (!strcmp(key, "conn"))    { bit = K_CONN;    type = T_CONN; }
         else if (!strcmp(key, "end"))     { bit = K_END;     type = T_TRUE; }
@@ -348,7 +360,17 @@ static int parse_line(const char* s, Line* L, PadTraceError* e)
             if (parse_u32(c, dst)) return -1;
             break;
         case T_U64:
-            if (parse_uint(c, &L->seq, UINT64_MAX)) return -1;
+            if (parse_uint(c, dst64, UINT64_MAX)) return -1;
+            break;
+        case T_SEQ:
+            /* A state record keys one poll ordinal; the end record lists each port's poll count. */
+            skip_ws(c);
+            if (*c->p == '[') {
+                L->seq_array = 1;
+                if (parse_array_u64(c, L->seqv, PAD_TRACE_MAX_PORTS, &L->nseq)) return -1;
+            } else if (parse_uint(c, &L->seq, UINT64_MAX)) {
+                return -1;
+            }
             break;
         case T_WORDS: {
             uint32_t tmp[PAD_TRACE_MAX_WORDS];
@@ -390,11 +412,11 @@ static int replay_load(PadTrace* t, const char* path, PadTraceError* e)
 {
     FILE* f = fopen(path, "rb");
     char line[LINE_MAX_BYTES];
-    uint32_t n = 0, last_flip = 0;
-    uint64_t last_key[PAD_TRACE_MAX_PORTS] = {0};
-    uint8_t have_key[PAD_TRACE_MAX_PORTS] = {0};
+    uint32_t n = 0;
     uint64_t last_seq[PAD_TRACE_MAX_PORTS] = {0};
     uint8_t have_seq[PAD_TRACE_MAX_PORTS] = {0};
+    uint64_t last_info = 0;
+    int have_info = 0;
     int ended = 0;
     Line L;
 
@@ -407,6 +429,9 @@ static int replay_load(PadTrace* t, const char* path, PadTraceError* e)
         n++;
         if (len == 0 || line[len - 1] != '\n') {
             if (feof(f)) RFAIL(n, "truncated", "the last line has no newline: the file was cut off while it was written");
+            /* fgets stops at a newline or a full buffer, never at a NUL: a short read with no newline
+             * is a NUL byte, which is not text and not an over-long line. */
+            if (len < LINE_MAX_BYTES - 1u) RFAIL(n, "syntax", "a NUL byte at column %zu: the trace is text", len + 1u);
             RFAIL(n, "syntax", "line longer than %u bytes", LINE_MAX_BYTES - 1u);
         }
         line[--len] = 0;
@@ -423,13 +448,14 @@ static int replay_load(PadTrace* t, const char* path, PadTraceError* e)
         if (n == 1) {
             if (!(L.seen & K_FORMAT) || strcmp(L.format, PAD_TRACE_FORMAT) != 0)
                 RFAIL(n, "header", "the first line is not a {\"format\":\"" PAD_TRACE_FORMAT "\",...} header");
-            /* The version is decided before the key set: a version-1 header has no `clock` key, and
-             * the reason a version-1 file is refused is its clock, not its keys. */
+            /* The version decides before the key set: version 1 had no `clock` key and version 2 named
+             * another clock, so the reason to refuse either is its version, not the shape of its header. */
             if (!(L.seen & K_VERSION)) RFAIL(n, "header", "the header has no \"version\"");
-            if (L.version == 1u)
+            if (L.version == 1u || L.version == 2u)
                 RFAIL(n, "version",
-                      "version 1 keyed its records on the walker's flip count, which drifts with host "
-                      "scheduling; re-record it as version %u", PAD_TRACE_VERSION);
+                      "version %u keyed its records on the flip clock, which moves between a recording and "
+                      "its replay when the guest catches up wall time; re-record it as version %u",
+                      L.version, PAD_TRACE_VERSION);
             if (L.version != PAD_TRACE_VERSION)
                 RFAIL(n, "version", "version %u; this runtime reads version %u", L.version, PAD_TRACE_VERSION);
             if (L.seen != MASK_HEADER)
@@ -444,13 +470,9 @@ static int replay_load(PadTrace* t, const char* path, PadTraceError* e)
 
         if (L.seen == MASK_STATE) {
             Rec* r;
-            uint64_t key = key_of(L.flip, L.poll);
+            if (L.seq_array) RFAIL(n, "value", "a state record's \"seq\" is one poll ordinal, not an array");
             if (L.port >= t->ports) RFAIL(n, "port-range", "port %u, but the header declares %u ports", L.port, t->ports);
             if (L.len > LEN_MAX) RFAIL(n, "value", "len %u above %u", L.len, LEN_MAX);
-            if (L.flip < last_flip) RFAIL(n, "keys-backwards", "flip %u after flip %u", L.flip, last_flip);
-            if (have_key[L.port] && key <= last_key[L.port])
-                RFAIL(n, "keys-backwards", "port %u: (flip %u, poll %u) does not follow (flip %u, poll %u)", L.port,
-                      L.flip, L.poll, (uint32_t)(last_key[L.port] >> 32), (uint32_t)last_key[L.port]);
             if (have_seq[L.port] && L.seq <= last_seq[L.port])
                 RFAIL(n, "keys-backwards", "port %u: seq %llu does not follow seq %llu", L.port,
                       (unsigned long long)L.seq, (unsigned long long)last_seq[L.port]);
@@ -458,90 +480,72 @@ static int replay_load(PadTrace* t, const char* path, PadTraceError* e)
             if (!t->recs[L.port]) RFAIL(n, "io", "out of memory");
             r = &t->recs[L.port][t->nrecs[L.port]++];
             memset(r, 0, sizeof *r);
-            r->flip = L.flip; r->poll = L.poll; r->seq = L.seq;
+            r->seq = L.seq; r->flip = L.flip; r->line = n;
             r->st.len = (int32_t)L.len;
             memcpy(r->st.words, L.words, L.nwords * sizeof(uint16_t));
-            last_flip = L.flip; last_key[L.port] = key; have_key[L.port] = 1;
             last_seq[L.port] = L.seq; have_seq[L.port] = 1;
             t->stats.records++;
         } else if (L.seen == MASK_CONN) {
             ConnRec* c;
             if (L.nconn != t->ports) RFAIL(n, "value", "conn has %u entries, the header declares %u ports", L.nconn, t->ports);
-            if (L.flip < last_flip) RFAIL(n, "keys-backwards", "flip %u after flip %u", L.flip, last_flip);
+            if (have_info && L.info <= last_info)
+                RFAIL(n, "keys-backwards", "conn info %llu does not follow info %llu",
+                      (unsigned long long)L.info, (unsigned long long)last_info);
             t->conns = (ConnRec*)grow(t->conns, &t->capconns, t->nconns + 1, sizeof(ConnRec));
             if (!t->conns) RFAIL(n, "io", "out of memory");
             c = &t->conns[t->nconns++];
             memset(c, 0, sizeof *c);
-            c->flip = L.flip;
+            c->info = L.info;
             memcpy(c->on, L.conn, L.nconn);
-            last_flip = L.flip;
-        } else if (L.seen == MASK_STEP) {
-            Step* s;
-            if (L.port >= t->ports) RFAIL(n, "port-range", "port %u, but the header declares %u ports", L.port, t->ports);
-            if (t->nsteps[L.port] && L.flip <= t->steps[L.port][t->nsteps[L.port] - 1].flip)
-                RFAIL(n, "keys-backwards", "port %u: poll-count step at flip %u does not follow flip %u", L.port, L.flip,
-                      t->steps[L.port][t->nsteps[L.port] - 1].flip);
-            t->steps[L.port] = (Step*)grow(t->steps[L.port], &t->capsteps[L.port], t->nsteps[L.port] + 1, sizeof(Step));
-            if (!t->steps[L.port]) RFAIL(n, "io", "out of memory");
-            s = &t->steps[L.port][t->nsteps[L.port]++];
-            s->flip = L.flip; s->polls = L.polls;
-            if (L.flip > t->end_flip) t->end_flip = L.flip;
+            last_info = L.info; have_info = 1;
         } else if (L.seen == MASK_END) {
-            if (L.flip < last_flip) RFAIL(n, "keys-backwards", "end flip %u is before flip %u", L.flip, last_flip);
-            last_flip = L.flip;
+            if (!L.seq_array) RFAIL(n, "value", "the end record's \"seq\" is the array of per-port poll counts");
+            if (L.nseq != t->ports)
+                RFAIL(n, "value", "the end record has %u poll counts, the header declares %u ports", L.nseq, t->ports);
             ended = 1;
+            for (uint32_t p = 0; p < t->ports; p++) t->end_seq[p] = L.seqv[p];
+            t->have_end = 1;
         } else if ((L.seen | K_SEQ) == MASK_STATE) {
-            RFAIL(n, "value", "a state record without \"seq\": version 2 writes the port's poll ordinal");
+            RFAIL(n, "value", "a state record without \"seq\": version 3 keys on the port's poll ordinal");
+        } else if ((L.seen | K_FLIP) == MASK_STATE) {
+            RFAIL(n, "value", "a state record without \"flip\": version 3 writes the flip clock as an annotation");
+        } else if ((L.seen | K_INFO) == MASK_CONN) {
+            RFAIL(n, "value", "a connection record without \"info\": version 3 keys it on the info-call ordinal");
         } else {
             RFAIL(n, "record-kind", "the keys of this line match no record of the format");
         }
-        if (last_flip > t->end_flip) t->end_flip = last_flip;
     }
     if (ferror(f)) { set_err(e, PAD_TRACE_ROLE_REPLAY, n, "io", "read error: %s", strerror(errno)); goto fail; }
     if (n == 0) RFAIL(1, "header", "the file is empty");
+    /* The end record is last, so reachability is checked once all of it is known: a record at or past
+     * its port's end count can never be served by a replay. The error names the record's own line. */
+    if (t->have_end) {
+        for (uint32_t p = 0; p < t->ports; p++)
+            for (size_t i = 0; i < t->nrecs[p]; i++)
+                if (t->recs[p][i].seq >= t->end_seq[p])
+                    RFAIL(t->recs[p][i].line, "value",
+                          "port %u: the record at seq %llu is at or past the end count %llu and can never be reached",
+                          p, (unsigned long long)t->recs[p][i].seq, (unsigned long long)t->end_seq[p]);
+    }
     fclose(f);
-    t->stats.end_flip = t->end_flip;
+    memcpy(t->stats.end_seq, t->end_seq, sizeof t->end_seq);
+    t->stats.have_end = t->have_end;
     return 0;
 fail:
     fclose(f);
     return -1;
 }
 
-static const Rec* rec_at_or_before(const PadTrace* t, uint32_t port, uint64_t key, size_t* idx)
+static const Rec* rec_at_or_before(const PadTrace* t, uint32_t port, uint64_t seq, size_t* idx)
 {
-    size_t lo = 0, hi = t->nrecs[port];   /* first record with a key above `key` */
+    size_t lo = 0, hi = t->nrecs[port];   /* first record with a seq above `seq` */
     while (lo < hi) {
         size_t mid = lo + (hi - lo) / 2;
-        if (key_of(t->recs[port][mid].flip, t->recs[port][mid].poll) <= key) lo = mid + 1; else hi = mid;
+        if (t->recs[port][mid].seq <= seq) lo = mid + 1; else hi = mid;
     }
     if (lo == 0) return NULL;
     *idx = lo - 1;
     return &t->recs[port][lo - 1];
-}
-
-/* The poll count the recording had for `flip`. */
-static uint32_t expected_polls(const PadTrace* t, uint32_t port, uint32_t flip)
-{
-    size_t lo = 0, hi = t->nsteps[port];
-    while (lo < hi) {
-        size_t mid = lo + (hi - lo) / 2;
-        if (t->steps[port][mid].flip <= flip) lo = mid + 1; else hi = mid;
-    }
-    return lo ? t->steps[port][lo - 1].polls : 0;
-}
-
-/* The first flip in [a, b] with a non-zero recorded count, or -1. */
-static int64_t first_polled_flip(const PadTrace* t, uint32_t port, uint32_t a, uint32_t b)
-{
-    size_t lo = 0, hi = t->nsteps[port];
-    if (expected_polls(t, port, a)) return a;
-    while (lo < hi) {
-        size_t mid = lo + (hi - lo) / 2;
-        if (t->steps[port][mid].flip <= a) lo = mid + 1; else hi = mid;
-    }
-    for (; lo < t->nsteps[port] && t->steps[port][lo].flip <= b; lo++)
-        if (t->steps[port][lo].polls) return t->steps[port][lo].flip;
-    return -1;
 }
 
 /* ---------------------------------------------------------------------------
@@ -582,7 +586,7 @@ static void wline(PadTrace* t, const char* fmt, ...)
     t->wdirty = 1;
 }
 
-static void w_state(PadTrace* t, uint32_t port, uint32_t flip, uint32_t poll, uint64_t seq, const PadTraceState* st)
+static void w_state(PadTrace* t, uint64_t seq, uint32_t port, uint32_t flip, const PadTraceState* st)
 {
     char words[PAD_TRACE_MAX_WORDS * 6 + 4];
     size_t n = PAD_TRACE_MAX_WORDS, off = 0;
@@ -592,53 +596,8 @@ static void w_state(PadTrace* t, uint32_t port, uint32_t flip, uint32_t poll, ui
         off += (size_t)snprintf(words + off, sizeof words - off, i ? ",%u" : "%u", (unsigned)st->words[i]);
     words[off++] = ']';
     words[off] = 0;
-    wline(t, "{\"flip\":%u,\"poll\":%u,\"port\":%u,\"len\":%d,\"words\":%s,\"seq\":%llu}", flip, poll, port, (int)st->len,
-          words, (unsigned long long)seq);
-}
-
-static void w_poll_done(PadTrace* t, uint32_t port, uint32_t flip, uint32_t count)
-{
-    /* Flips between the last accounted one and this one had no polls. */
-    if (flip > t->w_next[port] && t->w_rle[port] != 0) {
-        wline(t, "{\"flip\":%u,\"port\":%u,\"polls\":0}", t->w_next[port], port);
-        t->w_rle[port] = 0;
-    }
-    if (count != t->w_rle[port]) {
-        wline(t, "{\"flip\":%u,\"port\":%u,\"polls\":%u}", flip, port, count);
-        t->w_rle[port] = count;
-    }
-    t->w_next[port] = flip + 1u;
-}
-
-/* A flip's polls for `port` are complete: account it for the file and for the
- * divergence report. `final` is the process ending: the replay side then has no
- * complete flip to compare. */
-static void flip_complete(PadTrace* t, uint32_t port, uint32_t flip, uint32_t count, int final)
-{
-    if (t->wf && !t->wclosed) w_poll_done(t, port, flip, count);
-    if (t->replaying && !final && flip <= t->end_flip) {
-        int64_t div = -1;
-        if (flip > t->r_next[port]) div = first_polled_flip(t, port, t->r_next[port], flip - 1u);
-        if (div < 0 && expected_polls(t, port, flip) != count) div = flip;
-        if (div >= 0 && t->stats.first_div_flip < 0) t->stats.first_div_flip = div;
-        t->r_next[port] = flip + 1u;
-    }
-}
-
-/* The ordinal of this call among the port's polls since the flip count last changed, and the port's
- * ordinal since its first poll of the run (`*seq`, the key's record field). */
-static uint32_t advance_poll(PadTrace* t, uint32_t port, uint32_t flip, uint64_t* seq)
-{
-    Tracker* k = &t->trk[port];
-    if (flip > t->max_flip) t->max_flip = flip;
-    if (!k->any || k->cur_flip != flip) {
-        if (k->any) flip_complete(t, port, k->cur_flip, k->cur_count, 0);
-        k->any = 1;
-        k->cur_flip = flip;
-        k->cur_count = 0;
-    }
-    *seq = t->seq[port]++;
-    return k->cur_count++;
+    wline(t, "{\"seq\":%llu,\"port\":%u,\"len\":%d,\"words\":%s,\"flip\":%u}", (unsigned long long)seq, port,
+          (int)st->len, words, flip);
 }
 
 static void flush_if_due(PadTrace* t)
@@ -652,18 +611,13 @@ static void flush_if_due(PadTrace* t)
 
 static void summary(const PadTrace* t, char* b, size_t n)
 {
-    char div[40], ord[96];
-    if (t->stats.first_div_flip < 0) snprintf(div, sizeof div, "none");
-    else snprintf(div, sizeof div, "flip %lld", (long long)t->stats.first_div_flip);
-    if (!t->stats.have_ordinal_div) snprintf(ord, sizeof ord, "none");
-    else snprintf(ord, sizeof ord, "%u:%u:%llu:%llu", t->stats.ord_flip, t->stats.ord_port,
-                  (unsigned long long)t->stats.ord_recorded, (unsigned long long)t->stats.ord_served);
+    char drift[48];
+    if (!t->stats.have_drift) snprintf(drift, sizeof drift, "none");
+    else snprintf(drift, sizeof drift, "%lld:%lld", (long long)t->stats.drift_min, (long long)t->stats.drift_max);
     snprintf(b, n,
-             "polls=%llu exact=%llu held=%llu recorded_changes=%llu reached_exactly=%llu first_poll_count_divergence=%s "
-             "reached_at_ordinal=%llu first_ordinal_divergence=%s",
+             "polls=%llu exact=%llu held=%llu recorded_changes=%llu reached_exactly=%llu flip_drift=%s",
              (unsigned long long)t->stats.polls, (unsigned long long)t->stats.exact, (unsigned long long)t->stats.held,
-             (unsigned long long)t->stats.records, (unsigned long long)t->stats.records_reached, div,
-             (unsigned long long)t->stats.records_at_ordinal, ord);
+             (unsigned long long)t->stats.records, (unsigned long long)t->stats.records_reached, drift);
 }
 
 /* ---------------------------------------------------------------------------
@@ -674,7 +628,7 @@ int pad_trace_replaying(const PadTrace* t) { return t && t->replaying; }
 
 static void destroy_storage(PadTrace* t)
 {
-    for (unsigned i = 0; i < PAD_TRACE_MAX_PORTS; i++) { free(t->recs[i]); free(t->steps[i]); }
+    for (unsigned i = 0; i < PAD_TRACE_MAX_PORTS; i++) free(t->recs[i]);
     free(t->conns);
     free(t->wbuf);
     free(t->record_path);
@@ -698,12 +652,19 @@ int pad_trace_create(const PadTraceOptions* o, PadTrace** out, PadTraceError* er
     if (!t) { set_err(err, PAD_TRACE_ROLE_RECORD, 0, "io", "out of memory"); return -1; }
     trace_lock_init(&t->lock);
     t->flip_fn = o->flip;
-    t->stats.first_div_flip = -1;
 
     if (rep) {
         t->replay_path = dup_str(o->replay_path);
         if (!t->replay_path || replay_load(t, o->replay_path, err)) goto fail;
         t->replaying = 1;
+        /* A killed run has no end record: the writer flushes at most 100 ms behind, so the last
+         * interval is lost, but every record in the file is reachable and was really served. Holding
+         * each port's last record is the recorded truth up to the kill; refusing would throw the whole
+         * recording away for a kill the recorder is built to survive. Say it once instead. */
+        if (!t->have_end) {
+            printf("[cellPad] pad replay: the trace has no end record; the last state of each port is held\n");
+            fflush(stdout);
+        }
     }
     if (rec) {
         char header[160];
@@ -771,65 +732,60 @@ PadTrace* pad_trace_global(const PadTraceOptions* o)
     return t;
 }
 
-void pad_trace_poll(PadTrace* t, uint32_t port, PadTraceState* st, const PadTraceState* neutral, int* fresh)
+void pad_trace_poll(PadTrace* t, uint32_t port, PadTraceState* st, const PadTraceState* neutral)
 {
-    uint32_t flip, poll;
     uint64_t seq;
-    *fresh = 1;
+    uint32_t flip;
     if (port >= PAD_TRACE_MAX_PORTS) {
         if (t->replaying) *st = *neutral;
         return;
     }
     trace_lock_acquire(&t->lock);
+    seq = t->seq[port]++;
     flip = t->flip_fn();
-    poll = advance_poll(t, port, flip, &seq);
 
     if (t->replaying) {
         size_t idx = 0;
         const Rec* r = NULL;
         t->stats.polls++;
-        if (flip > t->end_flip) {
+        if (t->have_end && seq >= t->end_seq[port]) {
             if (!t->end_logged) {
                 char sum[384];
                 t->end_logged = 1;
                 t->stats.ended = 1;
                 summary(t, sum, sizeof sum);
-                printf("[cellPad] pad replay: the trace ended at flip %u; holding a neutral pad. %s\n", t->end_flip, sum);
+                printf("[cellPad] pad replay: the trace ended (port 0 polled %llu times); holding a neutral pad. %s\n",
+                       (unsigned long long)t->end_seq[0], sum);
                 fflush(stdout);
             }
         } else {
-            r = rec_at_or_before(t, port, key_of(flip, poll), &idx);
+            r = rec_at_or_before(t, port, seq, &idx);
         }
         if (r) {
             *st = r->st;
-            if (r->flip == flip && r->poll == poll) {
+            if (r->seq == seq) {
                 t->stats.exact++;
                 if (!t->recs[port][idx].hit) { t->recs[port][idx].hit = 1; t->stats.records_reached++; }
-                /* The key landed on the record's own poll; `seq` says whether that poll was the one the
-                 * recording took the record from. A walker-paced flip clock moves the key between two
-                 * guest polls while every record is still reached, which only this comparison catches. */
-                if (r->seq == seq) {
-                    t->stats.records_at_ordinal++;
-                } else if (!t->stats.have_ordinal_div) {
-                    t->stats.have_ordinal_div = 1;
-                    t->stats.ord_flip = flip;
-                    t->stats.ord_port = port;
-                    t->stats.ord_recorded = r->seq;
-                    t->stats.ord_served = seq;
+                /* The flip is annotation: how far it moved between the recording and this replay is the
+                 * guest-time drift the ordinal key absorbs, and what the summary reports. */
+                const int64_t d = (int64_t)flip - (int64_t)r->flip;
+                if (!t->stats.have_drift) {
+                    t->stats.have_drift = 1;
+                    t->stats.drift_min = t->stats.drift_max = d;
+                } else {
+                    if (d < t->stats.drift_min) t->stats.drift_min = d;
+                    if (d > t->stats.drift_max) t->stats.drift_max = d;
                 }
             }
         } else {
             *st = *neutral;
         }
         t->stats.held = t->stats.polls - t->stats.exact;
-        *fresh = poll == 0 || !t->have_served[port] || !state_equal(&t->served[port], st);
-        t->served[port] = *st;
-        t->have_served[port] = 1;
     }
 
     if (t->wf && !t->wclosed) {
         if (!t->w_have[port] || !state_equal(&t->w_last[port], st)) {
-            w_state(t, port, flip, poll, seq, st);
+            w_state(t, seq, port, flip, st);
             t->w_last[port] = *st;
             t->w_have[port] = 1;
         }
@@ -840,15 +796,14 @@ void pad_trace_poll(PadTrace* t, uint32_t port, PadTraceState* st, const PadTrac
 
 void pad_trace_conn(PadTrace* t, uint8_t on[PAD_TRACE_MAX_PORTS])
 {
-    uint32_t flip;
+    uint64_t info;
     trace_lock_acquire(&t->lock);
-    flip = t->flip_fn();
-    if (flip > t->max_flip) t->max_flip = flip;
+    info = t->info_seq++;
     if (t->replaying && t->nconns) {
-        size_t lo = 0, hi = t->nconns;   /* first record above `flip` */
+        size_t lo = 0, hi = t->nconns;   /* first record above `info` */
         while (lo < hi) {
             size_t mid = lo + (hi - lo) / 2;
-            if (t->conns[mid].flip <= flip) lo = mid + 1; else hi = mid;
+            if (t->conns[mid].info <= info) lo = mid + 1; else hi = mid;
         }
         if (lo) memcpy(on, t->conns[lo - 1].on, t->ports);
     }
@@ -863,7 +818,7 @@ void pad_trace_conn(PadTrace* t, uint8_t on[PAD_TRACE_MAX_PORTS])
             }
             arr[off++] = ']';
             arr[off] = 0;
-            wline(t, "{\"flip\":%u,\"conn\":%s}", flip, arr);
+            wline(t, "{\"info\":%llu,\"conn\":%s}", (unsigned long long)info, arr);
             memcpy(t->w_conn, on, PAD_TRACE_MAX_PORTS);
             t->w_have_conn = 1;
         }
@@ -887,11 +842,16 @@ void pad_trace_close(PadTrace* t)
     if (!t) return;
     trace_lock_acquire(&t->lock);
     if (t->wf && !t->wclosed) {
-        uint32_t end = t->flip_fn();
-        if (end < t->max_flip) end = t->max_flip;
-        for (uint32_t p = 0; p < PAD_TRACE_MAX_PORTS; p++)
-            if (t->trk[p].any) flip_complete(t, p, t->trk[p].cur_flip, t->trk[p].cur_count, 1);
-        wline(t, "{\"end\":true,\"flip\":%u}", end);
+        /* The end marker is each port's poll count, the unit a replay counts in. */
+        char counts[PAD_TRACE_MAX_PORTS * 21 + 4];
+        size_t off = 0;
+        counts[off++] = '[';
+        for (unsigned i = 0; i < PAD_TRACE_MAX_PORTS; i++)
+            off += (size_t)snprintf(counts + off, sizeof counts - off, i ? ",%llu" : "%llu",
+                                    (unsigned long long)t->seq[i]);
+        counts[off++] = ']';
+        counts[off] = 0;
+        wline(t, "{\"end\":true,\"seq\":%s}", counts);
         wflush(t);
         t->wclosed = 1;
         fclose(t->wf);

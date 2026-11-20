@@ -16,8 +16,8 @@ PadTrace* pad_trace_global(const PadTraceOptions* o) { (void)o; return NULL; }
 int pad_trace_replaying(const PadTrace* t) { (void)t; return 0; }
 void pad_trace_flush(PadTrace* t) { (void)t; }
 /* cellPad.c reaches these only through a non-NULL trace. */
-void pad_trace_poll(PadTrace* t, uint32_t port, PadTraceState* st, const PadTraceState* neutral, int* fresh)
-{ (void)t; (void)port; (void)st; (void)neutral; (void)fresh; abort(); }
+void pad_trace_poll(PadTrace* t, uint32_t port, PadTraceState* st, const PadTraceState* neutral)
+{ (void)t; (void)port; (void)st; (void)neutral; abort(); }
 void pad_trace_conn(PadTrace* t, uint8_t on[PAD_TRACE_MAX_PORTS]) { (void)t; (void)on; abort(); }
 
 #endif
