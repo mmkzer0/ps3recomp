@@ -81,10 +81,11 @@ static int count_sub(const char* hay, const char* needle)
     return n;
 }
 
-#define HEADER "{\"format\":\"ps3recomp-pad-trace\",\"version\":2,\"clock\":\"guest-flip-requests\",\"ports\":7}\n"
-#define STATE_CROSS    "{\"flip\":3,\"poll\":0,\"port\":0,\"len\":8,\"words\":[0,116,0,64,128,128,128,128],\"seq\":3}\n"
-#define STATE_RELEASED "{\"flip\":3,\"poll\":2,\"port\":0,\"len\":8,\"words\":[0,116,0,0,128,128,128,128],\"seq\":5}\n"
-#define STATE_START    "{\"flip\":7,\"poll\":0,\"port\":0,\"len\":8,\"words\":[0,116,8,0,128,128,128,128],\"seq\":8}\n"
+#define HEADER "{\"format\":\"ps3recomp-pad-trace\",\"version\":3,\"clock\":\"guest-polls\",\"ports\":7}\n"
+/* A press at seq 0, the same words with the host's len 0 at seq 2, and the release at seq 5. */
+#define L_STATE_0 "{\"seq\":0,\"port\":0,\"len\":8,\"words\":[0,116,0,64,128,128,128,128],\"flip\":3}\n"
+#define L_STATE_2 "{\"seq\":2,\"port\":0,\"len\":0,\"words\":[0,116,0,64,128,128,128,128],\"flip\":3}\n"
+#define L_STATE_5 "{\"seq\":5,\"port\":0,\"len\":8,\"words\":[0,116,0,0,128,128,128,128],\"flip\":7}\n"
 
 static PadTraceState mk(int len, unsigned d1, unsigned d2, unsigned lx)
 {
@@ -122,12 +123,10 @@ static PadTrace* open_trace(const char* rec, const char* rep)
 static const PadTraceState k_neutral_marker = { 8, { 0xAAAA, 0xBBBB } };
 
 /* One poll of `port` at the current flip; returns what the guest gets. */
-static PadTraceState poll(PadTrace* t, uint32_t port, const PadTraceState* live, int* fresh)
+static PadTraceState poll(PadTrace* t, uint32_t port, const PadTraceState* live)
 {
     PadTraceState st = *live;
-    int f;
-    pad_trace_poll(t, port, &st, &k_neutral_marker, &f);
-    if (fresh) *fresh = f;
+    pad_trace_poll(t, port, &st, &k_neutral_marker);
     return st;
 }
 
@@ -141,58 +140,100 @@ static void case_roundtrip(void)
     PadTraceStats s;
     uint8_t on[PAD_TRACE_MAX_PORTS];
     char* text;
-    int fresh;
 
-    /* Record. */
+    /* Record: port 0 polls 5 times, port 1 twice, three info calls. */
     t = open_trace(path, NULL);
     g_flip = 5;
-    poll(t, 0, &A, NULL); poll(t, 0, &A, NULL); poll(t, 0, &B, NULL);
+    poll(t, 0, &A); poll(t, 0, &A); poll(t, 0, &B);
     memset(on, 0, sizeof on); on[0] = 1;
     pad_trace_conn(t, on); pad_trace_conn(t, on);
     g_flip = 6;
-    poll(t, 0, &B, NULL);
+    poll(t, 0, &B);
     g_flip = 9;
-    poll(t, 0, &C, NULL);
-    poll(t, 1, &D, NULL); poll(t, 1, &D, NULL);
+    poll(t, 0, &C);
+    poll(t, 1, &D); poll(t, 1, &D);
     on[1] = 1;
     pad_trace_conn(t, on);
     pad_trace_destroy(t);
 
     text = read_text(path);
-    CHECK(strncmp(text, HEADER, strlen(HEADER)) == 0, "the file starts with the version-2 header");
-    CHECK(count_sub(text, "\"poll\":") == 4, "one state record per change and per port's first poll, got %d", count_sub(text, "\"poll\":"));
-    CHECK(count_sub(text, "\"seq\":") == 4, "every state record carries its poll ordinal, got %d", count_sub(text, "\"seq\":"));
-    CHECK(count_sub(text, "\"conn\":") == 2, "a connection record only when the connection changes, got %d", count_sub(text, "\"conn\":"));
-    CHECK(strstr(text, "{\"end\":true,\"flip\":9}\n") != NULL, "the end record names the last flip");
+    CHECK(strncmp(text, HEADER, strlen(HEADER)) == 0, "the file starts with the version-3 header");
+    CHECK(count_sub(text, "\"seq\":") == 5, "four state records and the end record, got %d", count_sub(text, "\"seq\":"));
+    CHECK(count_sub(text, "\"info\":") == 2, "a connection record only when the connection changes, got %d", count_sub(text, "\"info\":"));
+    CHECK(count_sub(text, "\"polls\":") == 0, "no per-flip poll counts in version 3");
+    CHECK(strstr(text, "\"seq\":0,\"port\":0,\"len\":8,") != NULL, "a state record is keyed by the port's poll ordinal");
+    CHECK(strstr(text, "\"end\":true,\"seq\":5}") != NULL, "the end record names port 0's poll count");
     CHECK(strchr(text, '/') == NULL && strstr(text, g_dir) == NULL, "no host path in the file");
     free(text);
 
-    /* Replay answers every poll with what was recorded. */
+    /* Replay: the same poll sequence, the same flips. */
     t = open_trace(NULL, path);
     g_flip = 5;
-    { PadTraceState r = poll(t, 0, &D, &fresh); CHECK(same(&r, &A) && fresh, "flip 5 poll 0: A, fresh"); }
-    { PadTraceState r = poll(t, 0, &D, &fresh); CHECK(same(&r, &A) && !fresh, "flip 5 poll 1: A held, not fresh"); }
-    { PadTraceState r = poll(t, 0, &D, &fresh); CHECK(same(&r, &B) && fresh, "flip 5 poll 2: B, a change is fresh"); }
+    { PadTraceState r = poll(t, 0, &D); CHECK(same(&r, &A), "poll 0: A, the record's own seq"); }
+    { PadTraceState r = poll(t, 0, &D); CHECK(same(&r, &A), "poll 1: A held"); }
+    { PadTraceState r = poll(t, 0, &D); CHECK(same(&r, &B), "poll 2: B, the change"); }
     memset(on, 1, sizeof on);
     pad_trace_conn(t, on);
-    CHECK(on[0] == 1 && on[1] == 0 && on[6] == 0, "flip 5 connection is port 0 only");
-    g_flip = 6;
-    { PadTraceState r = poll(t, 0, &D, &fresh); CHECK(same(&r, &B) && fresh, "flip 6 poll 0: B, first poll of a flip is fresh"); }
-    g_flip = 9;
-    { PadTraceState r = poll(t, 0, &D, &fresh); CHECK(same(&r, &C), "flip 9 port 0: C"); }
-    { PadTraceState r = poll(t, 1, &A, &fresh); CHECK(same(&r, &D), "flip 9 port 1: the recorded empty packet"); }
+    CHECK(on[0] == 1 && on[1] == 0 && on[6] == 0, "info call 0 is port 0 only");
     memset(on, 0, sizeof on);
     pad_trace_conn(t, on);
-    CHECK(on[0] == 1 && on[1] == 1 && on[2] == 0, "flip 9 connection adds port 1");
+    CHECK(on[0] == 1 && on[1] == 0, "info call 1 holds it");
+    g_flip = 6;
+    { PadTraceState r = poll(t, 0, &D); CHECK(same(&r, &B), "poll 3: B held (no record at this ordinal)"); }
+    g_flip = 9;
+    { PadTraceState r = poll(t, 0, &D); CHECK(same(&r, &C), "poll 4: C"); }
+    { PadTraceState r = poll(t, 1, &A); CHECK(same(&r, &D), "port 1 poll 0: the recorded empty packet"); }
+    { PadTraceState r = poll(t, 1, &A); CHECK(same(&r, &D), "port 1 poll 1: held"); }
+    memset(on, 0, sizeof on);
+    pad_trace_conn(t, on);
+    CHECK(on[0] == 1 && on[1] == 1 && on[2] == 0, "info call 2 adds port 1");
     pad_trace_stats(t, &s);
-    CHECK(s.polls == 6 && s.exact == 4 && s.held == 2, "polls %llu exact %llu held %llu", (unsigned long long)s.polls,
+    CHECK(s.polls == 7 && s.exact == 4 && s.held == 3, "polls %llu exact %llu held %llu", (unsigned long long)s.polls,
           (unsigned long long)s.exact, (unsigned long long)s.held);
     CHECK(s.records == 4 && s.records_reached == 4, "records %llu reached %llu", (unsigned long long)s.records,
           (unsigned long long)s.records_reached);
-    CHECK(s.records_at_ordinal == 4 && !s.have_ordinal_div,
-          "the same poll sequence reaches each record at the ordinal it was written with (%llu, divergence %d)",
-          (unsigned long long)s.records_at_ordinal, s.have_ordinal_div);
-    CHECK(s.first_div_flip == -1, "the same polls never diverge (flip %lld)", (long long)s.first_div_flip);
+    CHECK(s.have_drift && s.drift_min == 0 && s.drift_max == 0,
+          "the same poll sequence under the same flips drifts by nothing (%lld:%lld)",
+          (long long)s.drift_min, (long long)s.drift_max);
+    CHECK(!s.ended && s.end_seq == 5, "not past the end yet (end seq %llu)", (unsigned long long)s.end_seq);
+    g_flip = 10;
+    { PadTraceState r = poll(t, 0, &D); CHECK(same(&r, &k_neutral_marker), "poll 5 is the end of the trace: neutral"); }
+    pad_trace_stats(t, &s);
+    CHECK(s.ended, "the trace is reported as ended");
+    pad_trace_destroy(t);
+}
+
+/* ---- the ordinal key across a different flip clock --------------------------------------------------- */
+
+/* A recording replayed with one more flip between two of its polls -- a step loop that caught up wall time
+ * where the recording did not. Every poll still gets the input the recording's poll got, and the summary
+ * reports how far the flip clock moved: the guest-time drift no input key can remove. */
+static void case_catchup(void)
+{
+    const char* path = scratch("catchup.trace");
+    const PadTraceState press = mk(8, 0, 0x40, 128), release = mk(8, 0, 0, 128);
+    PadTrace* t;
+    PadTraceStats s;
+
+    t = open_trace(path, NULL);
+    g_flip = 10; poll(t, 0, &press);     /* seq 0 */
+    g_flip = 11; poll(t, 0, &press);     /* seq 1, unchanged: not written */
+    g_flip = 12; poll(t, 0, &release);   /* seq 2 */
+    pad_trace_destroy(t);
+
+    /* The same three polls; the flip clock takes a catch-up tick between the second and the third. */
+    t = open_trace(NULL, path);
+    g_flip = 10;
+    { PadTraceState r = poll(t, 0, &release); CHECK(same(&r, &press), "poll 0 (flip 10): the press"); }
+    g_flip = 12;
+    { PadTraceState r = poll(t, 0, &release); CHECK(same(&r, &press), "poll 1 (flip 12): still the press"); }
+    g_flip = 13;
+    { PadTraceState r = poll(t, 0, &release); CHECK(same(&r, &release), "poll 2 (flip 13): the release"); }
+    pad_trace_stats(t, &s);
+    CHECK(s.records == 2 && s.records_reached == 2, "both records were reached (%llu/%llu)",
+          (unsigned long long)s.records_reached, (unsigned long long)s.records);
+    CHECK(s.have_drift && s.drift_min == 0 && s.drift_max == 1,
+          "the drift the key absorbed is reported (%lld:%lld)", (long long)s.drift_min, (long long)s.drift_max);
     pad_trace_destroy(t);
 }
 
@@ -201,43 +242,45 @@ static void case_roundtrip(void)
 static void case_lookup(void)
 {
     const char* path = scratch("lookup.trace");
-    const PadTraceState cross = mk(8, 0, 0x40, 128), released = mk(8, 0, 0, 128), start = mk(8, 0x08, 0, 128);
+    const PadTraceState press = mk(8, 0, 0x40, 128), release = mk(8, 0, 0, 128);
     const PadTraceState any = mk(8, 0xFF, 0xFF, 1);
     PadTrace* t;
     PadTraceStats s;
-    int fresh;
+    uint8_t on[PAD_TRACE_MAX_PORTS];
 
-    write_text(path, HEADER STATE_CROSS STATE_RELEASED STATE_START "{\"end\":true,\"flip\":9}\n");
+    write_text(path, HEADER L_STATE_0 L_STATE_2 L_STATE_5
+               "{\"info\":0,\"conn\":[1,1,0,0,0,0,0]}\n"
+               "{\"info\":2,\"conn\":[1,0,0,0,0,0,0]}\n"
+               "{\"end\":true,\"seq\":6}\n");
     t = open_trace(NULL, path);
 
-    for (g_flip = 0; g_flip < 3; g_flip++) {
-        PadTraceState r = poll(t, 0, &any, &fresh);
-        CHECK(same(&r, &k_neutral_marker), "flip %u is before port 0's first record: neutral", g_flip);
-    }
-    { PadTraceState r = poll(t, 1, &any, NULL); CHECK(same(&r, &k_neutral_marker), "a port with no record is neutral"); }
+    { PadTraceState r = poll(t, 0, &any); CHECK(same(&r, &press), "poll 0 is a record's own seq"); }
+    { PadTraceState r = poll(t, 0, &any); CHECK(same(&r, &press), "poll 1 holds the seq-0 record, len 8"); }
+    { PadTraceState r = poll(t, 0, &any);
+      CHECK(r.len == 0 && !memcmp(r.words, press.words, sizeof r.words), "poll 2 is the recorded drained poll: len 0, same words"); }
+    { PadTraceState r = poll(t, 0, &any);
+      CHECK(r.len == 0 && !memcmp(r.words, press.words, sizeof r.words), "poll 3 holds the drained record"); }
+    { PadTraceState r = poll(t, 0, &any);
+      CHECK(r.len == 0 && !memcmp(r.words, press.words, sizeof r.words), "poll 4 holds it"); }
+    { PadTraceState r = poll(t, 0, &any); CHECK(same(&r, &release), "poll 5 is the release"); }
+    { PadTraceState r = poll(t, 0, &any); CHECK(same(&r, &k_neutral_marker), "poll 6 is past the end: neutral"); }
+    { PadTraceState r = poll(t, 1, &any); CHECK(same(&r, &k_neutral_marker), "a port with no record is neutral"); }
 
-    g_flip = 3;
-    { PadTraceState r = poll(t, 0, &any, &fresh); CHECK(same(&r, &cross), "(3,0) is the record's own key"); }
-    { PadTraceState r = poll(t, 0, &any, &fresh); CHECK(same(&r, &cross) && !fresh, "(3,1) is held at the state at or before it"); }
-    { PadTraceState r = poll(t, 0, &any, &fresh); CHECK(same(&r, &released) && fresh, "(3,2) takes the release"); }
-    { PadTraceState r = poll(t, 0, &any, &fresh); CHECK(same(&r, &released) && !fresh, "(3,3) holds it"); }
-    g_flip = 4;
-    { PadTraceState r = poll(t, 0, &any, &fresh); CHECK(same(&r, &released) && fresh, "(4,0) holds it; the first poll of a flip is fresh"); }
-    g_flip = 7;
-    { PadTraceState r = poll(t, 0, &any, &fresh); CHECK(same(&r, &start), "(7,0) is START"); }
-    g_flip = 9;
-    { PadTraceState r = poll(t, 0, &any, &fresh); CHECK(same(&r, &start), "the end flip itself still holds the last state"); }
+    /* The connection is keyed on the info-call ordinal. */
+    memset(on, 0, sizeof on);
+    pad_trace_conn(t, on);
+    CHECK(on[0] == 1 && on[1] == 1, "info call 0: both ports");
+    memset(on, 0, sizeof on);
+    pad_trace_conn(t, on);
+    CHECK(on[0] == 1 && on[1] == 1, "info call 1 holds it");
+    memset(on, 0, sizeof on);
+    pad_trace_conn(t, on);
+    CHECK(on[0] == 1 && on[1] == 0, "info call 2 unplugs port 1");
     pad_trace_stats(t, &s);
-    CHECK(!s.ended && s.end_flip == 9, "not past the end yet (end_flip %u)", s.end_flip);
-    g_flip = 10;
-    { PadTraceState r = poll(t, 0, &any, &fresh); CHECK(same(&r, &k_neutral_marker), "after the end of the trace: neutral"); }
-    g_flip = 500;
-    { PadTraceState r = poll(t, 0, &any, &fresh); CHECK(same(&r, &k_neutral_marker), "and it stays neutral"); }
-    pad_trace_stats(t, &s);
+    CHECK(s.records == 3 && s.records_reached == 3, "all three records were reached (%llu/%llu)",
+          (unsigned long long)s.records_reached, (unsigned long long)s.records);
+    CHECK(s.exact == 3, "three polls landed on a record of their own (%llu)", (unsigned long long)s.exact);
     CHECK(s.ended, "the trace is reported as ended");
-    CHECK(s.records == 3 && s.records_at_ordinal == 3 && !s.have_ordinal_div,
-          "every record was reached at its recorded poll ordinal (%llu/%llu, divergence %d)",
-          (unsigned long long)s.records_at_ordinal, (unsigned long long)s.records, s.have_ordinal_div);
     pad_trace_destroy(t);
 }
 
@@ -247,67 +290,23 @@ static void case_changes(void)
 {
     const char* path = scratch("changes.trace");
     const PadTraceState a = mk(8, 0, 0, 128), b = mk(8, 0, 0x40, 128);
+    PadTraceState drained = a;
     PadTrace* t = open_trace(path, NULL);
     char* text;
 
-    for (g_flip = 0; g_flip < 5; g_flip++)
-        for (int k = 0; k < 3; k++) poll(t, 0, &a, NULL);
-    CHECK(count_sub(text = read_text(path), "\"poll\":") <= 1, "identical consecutive states write one record");
-    free(text);
-    poll(t, 0, &b, NULL);
-    poll(t, 0, &b, NULL);
-    poll(t, 0, &a, NULL);
+    drained.len = 0;   /* the same words, a poll the host had no report for */
+    for (g_flip = 0; g_flip < 3; g_flip++) poll(t, 0, &a);   /* one record */
+    poll(t, 0, &drained);   /* len changed */
+    poll(t, 0, &b);         /* words changed */
+    poll(t, 0, &drained);   /* len changed back */
     pad_trace_destroy(t);
     text = read_text(path);
-    CHECK(count_sub(text, "\"poll\":") == 3, "a, b, a is three records, got %d", count_sub(text, "\"poll\":"));
-    CHECK(strstr(text, "\"flip\":0,\"poll\":0,\"port\":0") != NULL, "the first poll of the port is a record");
-    CHECK(strstr(text, "\"flip\":5,\"poll\":0,\"port\":0") != NULL, "the change is keyed by the poll that saw it");
-    CHECK(strstr(text, "\"flip\":5,\"poll\":2,\"port\":0") != NULL, "and so is the change back");
+    CHECK(count_sub(text, "\"seq\":") == 5, "three unchanged polls, then len, words, len: four records and the end, got %d",
+          count_sub(text, "\"seq\":"));
+    CHECK(strstr(text, "\"seq\":0,\"port\":0,\"len\":8,") != NULL, "the first poll of the port is a record");
+    CHECK(strstr(text, "\"seq\":3,\"port\":0,\"len\":0,") != NULL, "a change of len alone is a record");
+    CHECK(strstr(text, "\"seq\":4,\"port\":0,\"len\":8,") != NULL, "a change of the words is a record");
     free(text);
-}
-
-/* ---- poll counts: what the writer says and what the replayer compares it with ------------------------- */
-
-static void polls_at(PadTrace* t, uint32_t flip, int n)
-{
-    const PadTraceState a = mk(8, 0, 0, 128);
-    g_flip = flip;
-    for (int i = 0; i < n; i++) poll(t, 0, &a, NULL);
-}
-
-static void case_poll_counts(void)
-{
-    const char* path = scratch("counts.trace");
-    PadTrace* t = open_trace(path, NULL);
-    PadTraceStats s;
-
-    /* 3 per flip, then 2, a gap of two flips with no polls, then 5. */
-    polls_at(t, 1, 3); polls_at(t, 2, 3); polls_at(t, 3, 2); polls_at(t, 4, 2); polls_at(t, 7, 5); polls_at(t, 8, 5);
-    pad_trace_destroy(t);
-
-    t = open_trace(NULL, path);   /* the same polling replays without divergence */
-    polls_at(t, 1, 3); polls_at(t, 2, 3); polls_at(t, 3, 2); polls_at(t, 4, 2); polls_at(t, 7, 5); polls_at(t, 8, 5);
-    pad_trace_stats(t, &s);
-    CHECK(s.first_div_flip == -1, "same polling: no divergence, got flip %lld", (long long)s.first_div_flip);
-    pad_trace_destroy(t);
-
-    t = open_trace(NULL, path);   /* one poll too few in flip 3 */
-    polls_at(t, 1, 3); polls_at(t, 2, 3); polls_at(t, 3, 1); polls_at(t, 4, 2);
-    pad_trace_stats(t, &s);
-    CHECK(s.first_div_flip == 3, "a short flip is reported at that flip, got %lld", (long long)s.first_div_flip);
-    pad_trace_destroy(t);
-
-    t = open_trace(NULL, path);   /* polling in a flip the recording skipped */
-    polls_at(t, 1, 3); polls_at(t, 2, 3); polls_at(t, 3, 2); polls_at(t, 4, 2); polls_at(t, 5, 1); polls_at(t, 7, 5);
-    pad_trace_stats(t, &s);
-    CHECK(s.first_div_flip == 5, "a poll in an unpolled flip is reported, got %lld", (long long)s.first_div_flip);
-    pad_trace_destroy(t);
-
-    t = open_trace(NULL, path);   /* starting later than the recording */
-    polls_at(t, 2, 3); polls_at(t, 3, 2); polls_at(t, 4, 2);
-    pad_trace_stats(t, &s);
-    CHECK(s.first_div_flip == 1, "a flip the recording polled and this run did not, got %lld", (long long)s.first_div_flip);
-    pad_trace_destroy(t);
 }
 
 /* ---- recording while replaying ------------------------------------------------------------------------ */
@@ -316,30 +315,22 @@ static void case_record_replay(void)
 {
     const char* src = scratch("src.trace");
     const char* out = scratch("out.trace");
-    const PadTraceState cross = mk(8, 0, 0x40, 128), released = mk(8, 0, 0, 128), start = mk(8, 0x08, 0, 128);
+    const PadTraceState press = mk(8, 0, 0x40, 128), release = mk(8, 0, 0, 128);
     const PadTraceState live = mk(8, 0xFF, 0xFF, 1);   /* what a host pad would say; must not be recorded */
-    PadTraceStats s;
     PadTrace* t;
 
-    write_text(src, HEADER STATE_CROSS STATE_RELEASED STATE_START "{\"end\":true,\"flip\":9}\n");
+    write_text(src, HEADER L_STATE_0
+               "{\"seq\":2,\"port\":0,\"len\":8,\"words\":[0,116,0,0,128,128,128,128],\"flip\":4}\n"
+               "{\"end\":true,\"seq\":4}\n");
     t = open_trace(out, src);
-    g_flip = 3;
-    poll(t, 0, &live, NULL); poll(t, 0, &live, NULL); poll(t, 0, &live, NULL);
-    g_flip = 7;
-    poll(t, 0, &live, NULL);
+    poll(t, 0, &live); poll(t, 0, &live); poll(t, 0, &live); poll(t, 0, &live);
     pad_trace_destroy(t);
 
     t = open_trace(NULL, out);
-    g_flip = 3;
-    { PadTraceState r = poll(t, 0, &live, NULL); CHECK(same(&r, &cross), "the copy has the replayed press, not the live state"); }
-    { PadTraceState r = poll(t, 0, &live, NULL); CHECK(same(&r, &cross), "held"); }
-    { PadTraceState r = poll(t, 0, &live, NULL); CHECK(same(&r, &released), "the release"); }
-    g_flip = 7;
-    { PadTraceState r = poll(t, 0, &live, NULL); CHECK(same(&r, &start), "START"); }
-    pad_trace_stats(t, &s);
-    CHECK(s.records == 3 && s.records_at_ordinal == 3 && !s.have_ordinal_div,
-          "the copy's records keep the ordinals the polls were recorded at (%llu/%llu, divergence %d)",
-          (unsigned long long)s.records_at_ordinal, (unsigned long long)s.records, s.have_ordinal_div);
+    { PadTraceState r = poll(t, 0, &live); CHECK(same(&r, &press), "the copy has the replayed press, not the live state"); }
+    { PadTraceState r = poll(t, 0, &live); CHECK(same(&r, &press), "held"); }
+    { PadTraceState r = poll(t, 0, &live); CHECK(same(&r, &release), "the release"); }
+    { PadTraceState r = poll(t, 0, &live); CHECK(same(&r, &release), "held to the end"); }
     pad_trace_destroy(t);
 }
 
@@ -356,15 +347,14 @@ static void* worker(void* p)
     for (unsigned i = 0; i < 4000; i++) {
         PadTraceState st = mk(8, i % 5 ? 0 : 0x08, 0, 100 + (i % 7));
         uint8_t on[PAD_TRACE_MAX_PORTS] = {1};
-        int fresh;
-        pad_trace_poll(w->t, w->port, &st, NULL, &fresh);
+        pad_trace_poll(w->t, w->port, &st, NULL);
         if (i % 50 == 0) pad_trace_conn(w->t, on);
     }
     return NULL;
 }
 
-/* A file written by threads polling at once must still read back: keys never go backwards because the
- * flip count is read inside the trace's lock. */
+/* A file written by threads polling at once must still read back: the ordinals are handed out under the
+ * trace's lock, so seq never repeats or goes backwards. */
 static void case_threads(void)
 {
     const char* path = scratch("threads.trace");
@@ -391,42 +381,6 @@ static void case_threads(void)
     pad_trace_destroy(t);
 }
 
-/* ---- the poll ordinal: what reached_exactly cannot see ----------------------------------------------- */
-
-/* A recording whose flip 5 held two polls and flip 6 one. Replayed with the flip clock one poll early,
- * every record is still hit exactly, so `reached_exactly` reports nothing missing; the release is served
- * to the poll before the one it was recorded from, which is what `seq` reports. */
-static void case_ordinal(void)
-{
-    const char* path = scratch("ordinal.trace");
-    const PadTraceState press = mk(8, 0, 0x40, 128), release = mk(8, 0, 0, 128);
-    const PadTraceState any = mk(8, 0xFF, 0xFF, 1);
-    PadTrace* t;
-    PadTraceStats s;
-
-    write_text(path,
-               HEADER
-               "{\"flip\":5,\"poll\":0,\"port\":0,\"len\":8,\"words\":[0,116,0,64,128,128,128,128],\"seq\":0}\n"
-               "{\"flip\":6,\"poll\":0,\"port\":0,\"len\":8,\"words\":[0,116,0,0,128,128,128,128],\"seq\":2}\n"
-               "{\"end\":true,\"flip\":6}\n");
-    t = open_trace(NULL, path);
-    g_flip = 5;
-    { PadTraceState r = poll(t, 0, &any, NULL); CHECK(same(&r, &press), "flip 5 poll 0 is the press"); }
-    g_flip = 6;   /* the recording had one more poll in flip 5 */
-    { PadTraceState r = poll(t, 0, &any, NULL); CHECK(same(&r, &release), "flip 6 poll 0 is the release"); }
-    pad_trace_stats(t, &s);
-    CHECK(s.records == 2 && s.records_reached == 2,
-          "reached_exactly reports nothing missing: both records were hit (%llu/%llu)",
-          (unsigned long long)s.records_reached, (unsigned long long)s.records);
-    CHECK(s.records_at_ordinal == 1, "only the press was reached at the poll ordinal it was recorded from (%llu)",
-          (unsigned long long)s.records_at_ordinal);
-    CHECK(s.have_ordinal_div && s.ord_flip == 6 && s.ord_port == 0 && s.ord_recorded == 2 && s.ord_served == 1,
-          "the first divergence is flip 6 port 0, recorded seq 2, served seq 1 (have %d %u:%u:%llu:%llu)",
-          s.have_ordinal_div, s.ord_flip, s.ord_port, (unsigned long long)s.ord_recorded,
-          (unsigned long long)s.ord_served);
-    pad_trace_destroy(t);
-}
-
 /* ---- malformed files -------------------------------------------------------------------------------------- */
 
 typedef struct {
@@ -439,36 +393,32 @@ typedef struct {
 static const Bad k_bad[] = {
     { "empty",           "", 1, "header" },
     { "garbage-header",  "hello\n", 1, "header" },
-    { "wrong-format",    "{\"format\":\"other\",\"version\":2,\"clock\":\"guest-flip-requests\",\"ports\":7}\n", 1, "header" },
-    { "bad-ports",       "{\"format\":\"ps3recomp-pad-trace\",\"version\":2,\"clock\":\"guest-flip-requests\",\"ports\":8}\n", 1, "header" },
-    { "no-clock",        "{\"format\":\"ps3recomp-pad-trace\",\"version\":2,\"ports\":7}\n", 1, "header" },
-    { "wrong-clock",     "{\"format\":\"ps3recomp-pad-trace\",\"version\":2,\"clock\":\"wall-clock\",\"ports\":7}\n", 1, "header" },
+    { "wrong-format",    "{\"format\":\"other\",\"version\":3,\"clock\":\"guest-polls\",\"ports\":7}\n", 1, "header" },
+    { "bad-ports",       "{\"format\":\"ps3recomp-pad-trace\",\"version\":3,\"clock\":\"guest-polls\",\"ports\":8}\n", 1, "header" },
+    { "no-clock",        "{\"format\":\"ps3recomp-pad-trace\",\"version\":3,\"ports\":7}\n", 1, "header" },
+    { "wrong-clock",     "{\"format\":\"ps3recomp-pad-trace\",\"version\":3,\"clock\":\"guest-flip-requests\",\"ports\":7}\n", 1, "header" },
     { "version-1",       "{\"format\":\"ps3recomp-pad-trace\",\"version\":1,\"ports\":7}\n", 1, "version" },
-    { "version-3",       "{\"format\":\"ps3recomp-pad-trace\",\"version\":3,\"clock\":\"guest-flip-requests\",\"ports\":7}\n", 1, "version" },
-    { "truncated",       HEADER "{\"flip\":1,\"poll\":0,\"port\":0,\"len\":8,\"words\":[0", 2, "truncated" },
-    { "syntax",          HEADER "{\"flip\":1,\"poll\":0,\"port\":0,\"len\":8,\"words\":[0,1}\n", 2, "syntax" },
+    { "version-2",       "{\"format\":\"ps3recomp-pad-trace\",\"version\":2,\"clock\":\"guest-flip-requests\",\"ports\":7}\n", 1, "version" },
+    { "version-4",       "{\"format\":\"ps3recomp-pad-trace\",\"version\":4,\"clock\":\"guest-polls\",\"ports\":7}\n", 1, "version" },
+    { "truncated",       HEADER "{\"seq\":1,\"port\":0,\"len\":8,\"words\":[0", 2, "truncated" },
+    { "syntax",          HEADER "{\"seq\":1,\"port\":0,\"len\":8,\"words\":[0,1}\n", 2, "syntax" },
     { "blank-line",      HEADER "\n", 2, "syntax" },
-    { "unknown-key",     HEADER "{\"flip\":1,\"colour\":3}\n", 2, "unknown-key" },
-    { "duplicate-key",   HEADER "{\"flip\":1,\"flip\":2}\n", 2, "duplicate-key" },
-    { "value-len",       HEADER "{\"flip\":1,\"poll\":0,\"port\":0,\"len\":999,\"words\":[],\"seq\":0}\n", 2, "value" },
-    { "value-word",      HEADER "{\"flip\":1,\"poll\":0,\"port\":0,\"len\":8,\"words\":[70000],\"seq\":0}\n", 2, "value" },
-    { "conn-length",     HEADER "{\"flip\":1,\"conn\":[1,0]}\n", 2, "value" },
-    { "record-kind",     HEADER "{\"flip\":1,\"poll\":0}\n", 2, "record-kind" },
-    { "state-no-seq",    HEADER "{\"flip\":1,\"poll\":0,\"port\":0,\"len\":8,\"words\":[]}\n", 2, "value" },
-    { "state-bad-seq",   HEADER "{\"flip\":1,\"poll\":0,\"port\":0,\"len\":8,\"words\":[],\"seq\":-1}\n", 2, "syntax" },
-    { "poll-backwards",  HEADER "{\"flip\":3,\"poll\":2,\"port\":0,\"len\":8,\"words\":[],\"seq\":0}\n"
-                                "{\"flip\":3,\"poll\":1,\"port\":0,\"len\":8,\"words\":[],\"seq\":1}\n", 3, "keys-backwards" },
-    { "same-key",        HEADER "{\"flip\":3,\"poll\":0,\"port\":0,\"len\":8,\"words\":[],\"seq\":0}\n"
-                                "{\"flip\":3,\"poll\":0,\"port\":0,\"len\":8,\"words\":[],\"seq\":1}\n", 3, "keys-backwards" },
-    { "seq-backwards",   HEADER "{\"flip\":3,\"poll\":0,\"port\":0,\"len\":8,\"words\":[],\"seq\":5}\n"
-                                "{\"flip\":3,\"poll\":1,\"port\":0,\"len\":8,\"words\":[],\"seq\":5}\n", 3, "keys-backwards" },
-    { "flip-backwards",  HEADER "{\"flip\":5,\"poll\":0,\"port\":0,\"len\":8,\"words\":[],\"seq\":0}\n"
-                                "{\"flip\":4,\"poll\":0,\"port\":1,\"len\":8,\"words\":[],\"seq\":0}\n", 3, "keys-backwards" },
-    { "step-backwards",  HEADER "{\"flip\":5,\"port\":0,\"polls\":2}\n{\"flip\":3,\"port\":0,\"polls\":0}\n", 3, "keys-backwards" },
-    { "end-backwards",   HEADER "{\"flip\":5,\"poll\":0,\"port\":0,\"len\":8,\"words\":[],\"seq\":0}\n{\"end\":true,\"flip\":4}\n", 3, "keys-backwards" },
-    { "port-range",      "{\"format\":\"ps3recomp-pad-trace\",\"version\":2,\"clock\":\"guest-flip-requests\",\"ports\":2}\n"
-                         "{\"flip\":1,\"poll\":0,\"port\":2,\"len\":8,\"words\":[],\"seq\":0}\n", 2, "port-range" },
-    { "after-end",       HEADER "{\"end\":true,\"flip\":1}\n{\"flip\":2,\"conn\":[1,0,0,0,0,0,0]}\n", 3, "after-end" },
+    { "unknown-key",     HEADER "{\"seq\":0,\"poll\":0,\"port\":0,\"len\":8,\"words\":[],\"flip\":1}\n", 2, "unknown-key" },
+    { "duplicate-key",   HEADER "{\"seq\":0,\"seq\":1}\n", 2, "duplicate-key" },
+    { "value-len",       HEADER "{\"seq\":0,\"port\":0,\"len\":999,\"words\":[],\"flip\":1}\n", 2, "value" },
+    { "value-word",      HEADER "{\"seq\":0,\"port\":0,\"len\":8,\"words\":[70000],\"flip\":1}\n", 2, "value" },
+    { "conn-length",     HEADER "{\"info\":0,\"conn\":[1,0]}\n", 2, "value" },
+    { "record-kind",     HEADER "{\"seq\":0,\"port\":0}\n", 2, "record-kind" },
+    { "state-no-seq",    HEADER "{\"port\":0,\"len\":8,\"words\":[],\"flip\":1}\n", 2, "value" },
+    { "state-no-flip",   HEADER "{\"seq\":0,\"port\":0,\"len\":8,\"words\":[]}\n", 2, "value" },
+    { "conn-no-info",    HEADER "{\"conn\":[1,0,0,0,0,0,0]}\n", 2, "value" },
+    { "seq-backwards",   HEADER "{\"seq\":5,\"port\":0,\"len\":8,\"words\":[],\"flip\":1}\n"
+                                "{\"seq\":5,\"port\":0,\"len\":0,\"words\":[],\"flip\":2}\n", 3, "keys-backwards" },
+    { "info-backwards",  HEADER "{\"info\":5,\"conn\":[1,0,0,0,0,0,0]}\n"
+                                "{\"info\":5,\"conn\":[0,0,0,0,0,0,0]}\n", 3, "keys-backwards" },
+    { "port-range",      "{\"format\":\"ps3recomp-pad-trace\",\"version\":3,\"clock\":\"guest-polls\",\"ports\":2}\n"
+                         "{\"seq\":0,\"port\":2,\"len\":8,\"words\":[],\"flip\":1}\n", 2, "port-range" },
+    { "after-end",       HEADER "{\"end\":true,\"seq\":1}\n{\"info\":1,\"conn\":[1,0,0,0,0,0,0]}\n", 3, "after-end" },
 };
 
 static void case_errors(void)
@@ -484,10 +434,9 @@ static void case_errors(void)
         CHECK(e.role == PAD_TRACE_ROLE_REPLAY && e.line == k_bad[i].line && !strcmp(e.reason, k_bad[i].reason),
               "%s: wanted replay line %u %s, got role %d line %u %s (%s)", k_bad[i].name, k_bad[i].line, k_bad[i].reason,
               (int)e.role, e.line, e.reason, e.detail);
-        if (!strcmp(k_bad[i].name, "version-1"))
-            CHECK(strstr(e.detail, "walker") != NULL && strstr(e.detail, "re-record") != NULL,
-                  "a version-1 refusal says the old file keyed on the walker's count and must be re-recorded: %s",
-                  e.detail);
+        if (!strncmp(k_bad[i].name, "version-", 8) && strcmp(k_bad[i].name, "version-4") != 0)
+            CHECK(strstr(e.detail, "re-record") != NULL,
+                  "the %s refusal says the old file must be re-recorded: %s", k_bad[i].name, e.detail);
     }
 }
 
@@ -550,10 +499,9 @@ int main(int argc, char** argv)
     if (argc != 2) { fprintf(stderr, "usage: test_pad_trace <case>\n"); return 2; }
     atexit(cleanup);
     if      (!strcmp(argv[1], "roundtrip"))       case_roundtrip();
+    else if (!strcmp(argv[1], "catchup"))         case_catchup();
     else if (!strcmp(argv[1], "lookup"))          case_lookup();
     else if (!strcmp(argv[1], "changes"))         case_changes();
-    else if (!strcmp(argv[1], "poll-counts"))     case_poll_counts();
-    else if (!strcmp(argv[1], "ordinal"))         case_ordinal();
     else if (!strcmp(argv[1], "record-replay"))   case_record_replay();
     else if (!strcmp(argv[1], "threads"))         case_threads();
     else if (!strcmp(argv[1], "errors"))          case_errors();

@@ -9,38 +9,50 @@
  *
  * What is recorded is the guest-visible result of each cellPadGetData, per port,
  * after the host backend and every injector (PAD_SCRIPT, PAD_FILE, PAD_STICK,
- * PAD_AUTOPRESS, keyboard) have been applied: the words that go to guest memory.
- * Each state record is keyed by (flip, poll). `flip` is cellGcm_guest_flip_count():
- * the guest's flip requests, counted on the calling thread where the guest makes
- * them. The walker-side count (cellGcm_flip_request_count) advances only when
- * the RSX drain reaches an in-FIFO flip marker, so it runs at the walker's pace,
- * and a trace keyed on it put the same recorded input on other guest polls from
- * run to run as host load moved that pace. `poll` is this port's GetData ordinal
- * since that count last changed; `seq` is the port's GetData ordinal since its
- * first poll of the run, so replay can check that a record was reached at the
- * poll it was recorded from. Only a change of state is written (plus the first
- * poll of a port), so a trace is a list of presses and releases that can be read
- * and diffed.
+ * PAD_AUTOPRESS, keyboard) have been applied: `len` and the words the guest
+ * reads. The key is the port's 0-based GetData ordinal, so poll n of a replay
+ * is handed exactly what the recording's poll n was handed.
  *
- * Replay is state-based: a poll is answered with the state of the latest record
- * of its port at or before the poll's key. The host pad and the injectors play
- * no part in what the guest sees. A poll that hits a record's own key also has
- * its `seq` compared with the record's; the first mismatch is reported, so a
- * clock that drifted is visible even when every record was reached.
+ * Nothing else can be the key. The flip clock moves between runs: a title's
+ * step loop runs one to three steps per tick to catch up wall time, so how many
+ * polls happen inside one guest flip depends on the host, and a (flip, poll)
+ * key (version 2) turned a one-step press recorded at (F,0)->(F+1,0) into a
+ * two-step press whenever a replay took a catch-up tick where the recording did
+ * not. Version 1 keyed on the RSX walker's flip count, one step further from
+ * the guest. Both are refused: neither key can be re-derived, so a run has to
+ * be recorded again.
+ *
+ * The ordinal key makes the recorded input stream exact in polls; it cannot
+ * make the guest deterministic in time. A title whose logic is gated on wall
+ * time, or that waits on an asynchronous load, still drifts by a few steps, and
+ * the flip at each record is kept as an annotation so the replay summary can
+ * report it: `flip_drift` is the min and max of (served flip - recorded flip)
+ * over the records a poll landed on, i.e. the guest-time drift the key absorbs.
+ *
+ * Only a change is written (the first poll of a port, then whenever len or the
+ * words differ), so a trace is a list of presses and releases that can be read
+ * and diffed. A draining title (poll until len == 0) records the len = 0 polls
+ * too, so a replay hands back its exact len sequence. The connection the
+ * cellPadGetInfo/GetInfo2/PeriphGetInfo calls report is keyed the same way, on
+ * the info-call ordinal.
+ *
+ * Replay is state-based: poll n of a port is answered with the latest record of
+ * that port whose seq is <= n. The host pad and the injectors play no part in
+ * what the guest sees. Past the end record's poll count the pad is neutral; a
+ * killed run has no end record and keeps serving the last record.
  *
  * The module is self-contained: it depends on stop.h and the C library. The
  * flip clock comes in through PadTraceOptions, and cellPad.c does the config
- * reading and the hooks.
+ * reading and the hooks. The flip count is annotation only: it is read for the
+ * record and for the drift report.
  *
  * Failure policy: a trace that cannot be written, or a replay file that is not
- * a well-formed version-2 trace, ends the run with the named stop `pad-trace`
- * (role, line, reason); nothing is guessed or skipped. A version-1 file is
- * refused: its keys came from the walker's count and cannot be re-derived, so
- * the run has to be recorded again.
+ * a well-formed version-3 trace, ends the run with the named stop `pad-trace`
+ * (role, line, reason); nothing is guessed or skipped.
  *
  * Threading: any guest thread may poll. One mutex per PadTrace guards every
- * field; the flip count is read inside it, so keys in the file never go
- * backwards.
+ * field, so the per-port ordinals are handed out in one order and the keys in
+ * the file never repeat or go backwards.
  */
 
 #ifndef PS3EMU_PAD_TRACE_H
@@ -54,10 +66,11 @@ extern "C" {
 #endif
 
 #define PAD_TRACE_FORMAT      "ps3recomp-pad-trace"
-#define PAD_TRACE_VERSION     2u
-/* What the `flip` key counts. Version 1 had no such key because its flip
- * count was the only one the format knew; it came from the RSX drain. */
-#define PAD_TRACE_CLOCK      "guest-flip-requests"
+#define PAD_TRACE_VERSION     3u
+/* What the `seq` key counts. Version 2 named a clock in this field; version 3
+ * keys on a count, so the header says which count, and a file recorded under
+ * another key cannot be mistaken for this one. */
+#define PAD_TRACE_CLOCK      "guest-polls"
 #define PAD_TRACE_MAX_PORTS   7u    /* CELL_PAD_MAX_PORT_NUM */
 #define PAD_TRACE_MAX_WORDS   64u   /* CELL_PAD_MAX_CODES */
 
@@ -67,11 +80,10 @@ typedef enum PadTraceRole {
 } PadTraceRole;
 
 /* One port's CellPadData as the guest reads it, in host order: `len` is the
- * packet length in bytes of a connected port's report (0 for a port with no
- * device), `words` the button[] array. Whether a given poll gets a fresh packet
- * (the guest sees len > 0) follows the host's report clock, which differs from
- * run to run, so it is not part of the state: replay decides it (see
- * pad_trace_poll). */
+ * guest-visible len of that poll (0 when the host had no new report, which is
+ * what ends a drain loop) and `words` the button[] array. This is the whole
+ * state: the replay hands it back exactly, so a poll sequence replays its own
+ * len sequence. */
 typedef struct PadTraceState {
     int32_t  len;
     uint16_t words[PAD_TRACE_MAX_WORDS];
@@ -80,7 +92,7 @@ typedef struct PadTraceState {
 typedef struct PadTraceOptions {
     const char* record_path;      /* NULL or "" = not recording */
     const char* replay_path;      /* NULL or "" = not replaying */
-    uint32_t  (*flip)(void);      /* cellGcm_guest_flip_count; required */
+    uint32_t  (*flip)(void);      /* cellGcm_guest_flip_count; for the annotation and the drift */
 } PadTraceOptions;
 
 /* Why a trace could not be opened or read. `reason` is a stable id: header,
@@ -112,56 +124,47 @@ PadTrace* pad_trace_global(const PadTraceOptions* o);
 
 int pad_trace_replaying(const PadTrace* t);
 
-/* One cellPadGetData of `port` (< PAD_TRACE_MAX_PORTS), at the current flip.
+/* One cellPadGetData of `port` (< PAD_TRACE_MAX_PORTS), at the port's next
+ * ordinal.
  *
- * Recording: `*st` is the state the guest is about to receive; it is recorded
- * if it differs from the port's last record.
- * Replaying: `*st` is replaced by the recorded state, or by `*neutral` when the
- * trace has none for this key (before the port's first record, or after the end
- * of the trace). The result is what a recording would see, so recording while
- * replaying writes the replayed state.
- *
- * `*fresh` (replay only, else set to 1) tells whether the guest gets a new
- * packet: the first poll of the port after a flip, or any poll whose state
- * differs from the previous one served. Later polls of an unchanged state are
- * len 0, as on the hardware, which is what ends a drain loop. */
-void pad_trace_poll(PadTrace* t, uint32_t port, PadTraceState* st,
-                    const PadTraceState* neutral, int* fresh);
+ * Recording: `*st` is what the guest is about to receive and is written if it
+ * differs from the port's last record (len or words).
+ * Replaying: `*st` is replaced by the record of `port` with the largest seq <=
+ * this call's ordinal, or by `*neutral` when there is none (before the port's
+ * first record, or past the end record's poll count). The result is what a
+ * recording would have served, so recording while replaying writes the
+ * replayed state. */
+void pad_trace_poll(PadTrace* t, uint32_t port, PadTraceState* st, const PadTraceState* neutral);
 
-/* One cellPadGetInfo/GetInfo2/PeriphGetInfo: which ports are connected, 1 or 0
- * per port. Recording: `on` is what the guest is told, written when it changes.
- * Replaying: `on` holds the default for a trace with no connection record yet,
- * and is replaced by the latest record at or before the current flip. */
+/* One cellPadGetInfo/GetInfo2/PeriphGetInfo, at the info call's ordinal: which
+ * ports are connected, 1 or 0 per port. Recording: `on` is what the guest is
+ * told, written when it changes. Replaying: `on` is replaced by the latest
+ * record at or before this call's ordinal (the default when there is none). */
 void pad_trace_conn(PadTrace* t, uint8_t on[PAD_TRACE_MAX_PORTS]);
 
 /* Push the written records to the file. */
 void pad_trace_flush(PadTrace* t);
 
-/* Finish: write the final poll counts and the end record, close the file, print
- * the replay summary. Idempotent. The object stays valid (replay keeps serving). */
+/* Finish: write the end record and close the file, print the replay summary.
+ * Idempotent. The object stays valid (replay keeps serving). */
 void pad_trace_close(PadTrace* t);
 void pad_trace_destroy(PadTrace* t);   /* close, then free */
 
-/* Replay bookkeeping. `first_div_flip` is the first flip whose poll count for
- * some port differs from the recording, -1 when none has. `records_at_ordinal`
- * is the subset of `records_reached` whose `seq` equals the poll's own ordinal;
- * a record reached at another ordinal is exactly a flip clock whose pace moved
- * the key between polls while every record still got hit, so the first one is
- * kept (flip, port, `seq` recorded, `seq` served). */
+/* Replay bookkeeping. `reached_exactly` counts the records whose seq a poll
+ * landed on; `flip_drift` is the smallest and largest (served flip - recorded
+ * flip) over those records, the guest-time drift the ordinal key absorbs and
+ * cannot remove. `end_seq` is the end record's poll count (0 when the run was
+ * killed and the file has none). */
 typedef struct PadTraceStats {
     uint64_t polls;            /* replayed polls */
-    uint64_t exact;            /* polls whose (flip, poll) has a record of its own */
+    uint64_t exact;            /* polls whose ordinal has a record of its own */
     uint64_t held;             /* polls answered from an earlier record or neutral */
     uint64_t records;          /* state records in the file */
-    uint64_t records_reached;  /* of those, the ones a poll hit exactly */
-    uint64_t records_at_ordinal; /* of records_reached, the ones whose seq matched */
-    int      have_ordinal_div;   /* some record was reached at another seq */
-    uint32_t ord_flip;           /* the poll's flip at the first such */
-    uint32_t ord_port;           /* and its port */
-    uint64_t ord_recorded;       /* the seq the record was written with */
-    uint64_t ord_served;         /* the seq of the poll that reached it */
-    int64_t  first_div_flip;
-    uint32_t end_flip;         /* last flip the recording covers */
+    uint64_t records_reached;  /* of those, the ones a poll landed on */
+    int      have_drift;       /* a record was reached, so the drift is known */
+    int64_t  drift_min;
+    int64_t  drift_max;
+    uint64_t end_seq;          /* the end record's poll count, 0 without one */
     int      ended;            /* a poll has gone past it */
 } PadTraceStats;
 
