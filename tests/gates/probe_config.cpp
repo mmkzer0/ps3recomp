@@ -112,6 +112,10 @@ static void print_options()
             std::printf("\"%s\"", ps3_cfg_pad_replay());
         else if (!std::strcmp(o->section, "title") && !std::strcmp(o->key, "elf_sha256"))
             std::printf("\"%s\"", ps3_cfg_title_elf_sha256());
+        else if (!std::strcmp(o->section, "host") && !std::strcmp(o->key, "work_interval"))
+            std::printf("%s", ps3_cfg_host_work_interval() ? "true" : "false");
+        else if (!std::strcmp(o->section, "host") && !std::strcmp(o->key, "work_interval_us"))
+            std::printf("%u", ps3_cfg_host_work_interval_us());
         else if (!std::strcmp(o->section, "diag") && !std::strcmp(o->key, "dump_config"))
             std::printf("%s", ps3_cfg_diag_dump_config() ? "true" : "false");
         else if (!std::strcmp(o->section, "log") && !std::strcmp(o->key, "file"))

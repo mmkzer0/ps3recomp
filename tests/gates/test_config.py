@@ -121,6 +121,8 @@ def test_defaults_without_file_or_environment():
         "pad.record": ('""', "default"),
         "pad.replay": ('""', "default"),
         "title.elf_sha256": ('""', "default"),
+        "host.work_interval": ("false", "default"),
+        "host.work_interval_us": ("500", "default"),
         "diag.dump_config": ("false", "default"),
         "log.file": ('""', "default"),
         "log.level": ('"info"', "default"),
@@ -283,6 +285,8 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
             "pad.record": "default",
             "pad.replay": "default",
             "title.elf_sha256": "env:PS3RECOMP_TITLE_ELF_SHA256",
+            "host.work_interval": "default",
+            "host.work_interval_us": "default",
             "diag.dump_config": "env:PS3RECOMP_DIAG_DUMP_CONFIG",
             "log.file": "default",
             "log.level": "default",
@@ -317,7 +321,9 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
                            "video": {"resolutions": "", "rsx_capture": False, "rsx_capture_dir": "",
                                      "rsx_capture_frames": 0},
                            "pad": {"record": "", "replay": ""},
-                           "title": {"elf_sha256": SHA_A}, "diag": {"dump_config": False},
+                           "title": {"elf_sha256": SHA_A},
+                           "host": {"work_interval": False, "work_interval_us": 500},
+                           "diag": {"dump_config": False},
                            "log": {"file": "", "level": "info", "mute": "", "collapse": "file",
                                    "max_mb": 256}}, doc
 
@@ -842,6 +848,19 @@ def test_poll_sleep_options_default_off_and_are_range_checked():
     assert o["ppu.poll_sleep_spin_us"] == ("2000", "env:PS3RECOMP_PPU_POLL_SLEEP_SPIN_US"), o
     f = config_invalid(probe("get", PS3RECOMP_PPU_POLL_SLEEP_SPIN_US="2001"))
     assert f["key"] == "ppu.poll_sleep_spin_us", f
+
+
+# ---- host.work_interval / host.work_interval_us ---------------------------------------
+
+def test_work_interval_options_default_off_and_deadline_is_range_checked():
+    o = options(probe("get", PS3RECOMP_HOST_WORK_INTERVAL="1", PS3RECOMP_HOST_WORK_INTERVAL_US="16000"))
+    assert o["host.work_interval"] == ("true", "env:PS3RECOMP_HOST_WORK_INTERVAL"), o
+    assert o["host.work_interval_us"] == ("16000", "env:PS3RECOMP_HOST_WORK_INTERVAL_US"), o
+    o = options(probe("get", PS3RECOMP_HOST_WORK_INTERVAL_US="50"))
+    assert o["host.work_interval_us"] == ("50", "env:PS3RECOMP_HOST_WORK_INTERVAL_US"), o
+    for bad in ("49", "16001", "0"):
+        f = config_invalid(probe("get", PS3RECOMP_HOST_WORK_INTERVAL_US=bad))
+        assert f["key"] == "host.work_interval_us" and "out of range" in f["detail"], (bad, f)
 
 
 # ---- ppu.vscr_nj ---------------------------------------------------------------

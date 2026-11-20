@@ -386,7 +386,10 @@ if(APPLE)
         # AppKit for the window; ApplicationServices for cellPad's keyboard
         # fallback (CGEventSourceKeyState). Neither framework exists on iOS.
         target_link_libraries(ps3recomp_runtime PUBLIC
-            "-framework AppKit" "-framework ApplicationServices")
+            "-framework AppKit" "-framework ApplicationServices"
+            # host_work_interval.c: the interval workgroup (AudioWorkIntervalCreate). The iOS branch above
+            # links it already.
+            "-framework AudioToolbox")
     endif()
     set_source_files_properties(
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_metal_backend.m"
@@ -813,6 +816,39 @@ if(PS3RECOMP_BUILD_TESTS)
         target_link_libraries(test_thread_qos PRIVATE Threads::Threads)
         add_test(NAME thread_qos COMMAND test_thread_qos)
         set_tests_properties(thread_qos PROPERTIES LABELS "runtime;t0;tsan" TIMEOUT 120)
+    endif()
+
+    # ps3_host_work_interval_* (include/ps3emu/host_work_interval.h, host.work_interval): the off path, the
+    # calls on a thread that never joined, the stop where the host has no interval workgroup, and the deadline's
+    # range. The macOS join itself is a run-time check against a title. One scenario per process: the
+    # configuration loads once, from the environment each test sets.
+    if(UNIX)
+        add_executable(test_host_work_interval
+            runtime/platform/tests/test_host_work_interval.c
+            runtime/platform/host_work_interval.c
+            runtime/config/config.cpp
+            runtime/diag/stop.cpp
+            runtime/diag/ps3_log.c
+            runtime/diag/host_exit.c)
+        target_include_directories(test_host_work_interval PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+        target_compile_options(test_host_work_interval PRIVATE $<$<COMPILE_LANGUAGE:C>:-Wall -Wextra>)
+        target_link_libraries(test_host_work_interval PRIVATE Threads::Threads)
+        if(APPLE)
+            target_link_libraries(test_host_work_interval PRIVATE "-framework AudioToolbox")
+        endif()
+        set_target_properties(test_host_work_interval PROPERTIES LINKER_LANGUAGE CXX)
+        function(ps3recomp_add_work_interval_test name env_value scenario)
+            add_test(NAME host_work_interval_${name} COMMAND test_host_work_interval ${scenario} ${ARGN})
+            set_tests_properties(host_work_interval_${name} PROPERTIES LABELS "runtime;config;t0" TIMEOUT 60
+                SKIP_RETURN_CODE 77 ENVIRONMENT "${env_value}")
+        endfunction()
+        ps3recomp_add_work_interval_test(off "" off)
+        ps3recomp_add_work_interval_test(unjoined "PS3RECOMP_HOST_WORK_INTERVAL=1" unjoined)
+        ps3recomp_add_work_interval_test(nohost "PS3RECOMP_HOST_WORK_INTERVAL=1" nohost)
+        ps3recomp_add_work_interval_test(edge_low "PS3RECOMP_HOST_WORK_INTERVAL_US=50" edge 50)
+        ps3recomp_add_work_interval_test(edge_high "PS3RECOMP_HOST_WORK_INTERVAL_US=16000" edge 16000)
+        ps3recomp_add_work_interval_test(below_range "PS3RECOMP_HOST_WORK_INTERVAL_US=49" bad)
+        ps3recomp_add_work_interval_test(above_range "PS3RECOMP_HOST_WORK_INTERVAL_US=16001" bad)
     endif()
 
     # Relative waits on the host monotonic clock (runtime/platform/host_wait.c, #128). The deterministic
