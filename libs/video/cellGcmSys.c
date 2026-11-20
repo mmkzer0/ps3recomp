@@ -6349,6 +6349,23 @@ u32 cellGcmGetVBlankCount(void)
     return atomic_load_explicit(&s_vblank_count, memory_order_acquire);
 }
 
+/* The rate the host raises vblanks at, packed num<<32|den so one reader never sees half of a pair. Not gcm state:
+ * a terminate/init cycle of the guest's GCM leaves the host's vblank thread, and so its rate, alone. */
+static _Atomic u64 s_vblank_rate = ((u64)60000u << 32) | 1001u;
+
+void cellGcm_set_vblank_rate(u32 hz_num, u32 hz_den)
+{
+    if (!hz_num || !hz_den) return;
+    atomic_store_explicit(&s_vblank_rate, ((u64)hz_num << 32) | hz_den, memory_order_release);
+}
+
+void cellGcm_vblank_rate(u32* hz_num, u32* hz_den)
+{
+    const u64 r = atomic_load_explicit(&s_vblank_rate, memory_order_acquire);
+    if (hz_num) *hz_num = (u32)(r >> 32);
+    if (hz_den) *hz_den = (u32)r;
+}
+
 /* Return tile info for a given index */
 CellGcmTileInfo* cellGcmGetTileInfo(u8 index)
 {

@@ -391,6 +391,14 @@ PS3_CFG_U32(trophy, register_wait_cap_vblanks, 1024, 1, 16777216,
     "event). A title that registers on the thread that does the polling hits the cap, "
     "and the events are then delivered by its later polls.")
 
+PS3_CFG_U32(trophy, pace_ms, 2000, 1, 600000,
+    "The minimum total time, in milliseconds, that sceNpTrophyRegisterContext takes to deliver its status "
+    "events. The firmware's own timing is wall-clock (the VSH installs the trophies); 2000 ms is RPCS3's "
+    "synthetic minimum, not a measured figure. The HLE counts it in vblanks, converted once per registration "
+    "at the rate the host raises them (cellGcm_set_vblank_rate): 120 vblanks at 59.94 Hz, 240 at 119.88 Hz, so "
+    "a host that runs its vblank grid faster than the video-out mode still waits the same wall time. A host "
+    "that never sets the rate gets the mode's 59.94 Hz.")
+
 /* ---- adec --------------------------------------------------------------- */
 
 PS3_CFG_BOOL(adec, silence_fallback, 0,

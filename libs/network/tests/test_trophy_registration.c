@@ -35,6 +35,8 @@
 #include <sched.h>
 #include <stdatomic.h>
 #include <string.h>
+/* The pace at the defaults (2000 ms at 59.94 Hz), in vblanks: what every case but pace_unit/fast_grid counts in. */
+#define TROPHY_PACE_TOTAL_VBLANKS 120u
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
 uint32_t g_ww_lo, g_ww_hi;
@@ -73,10 +75,16 @@ u32 cellGcmGetVBlankCount(void)
 static void vblank_tick(void) { atomic_fetch_add(&g_vblank, 1); }
 
 static _Atomic u32 g_cap_vblanks = 1024, g_gcm_timeout_ms = 10000;
+/* The vblank rate the host raises, and the pace option. Defaults: the video-out mode's 59.94 Hz and 2000 ms. */
+static _Atomic u32 g_rate_num = 60000u, g_rate_den = 1001u, g_pace_ms = 2000u;
+void cellGcm_vblank_rate(u32* hz_num, u32* hz_den)
+{ *hz_num = atomic_load(&g_rate_num); *hz_den = atomic_load(&g_rate_den); }
+
 const ps3_config* ps3_config_get(void)
 {
     static ps3_config cfg;
     cfg.trophy_register_wait_cap_vblanks = atomic_load(&g_cap_vblanks);
+    cfg.trophy_pace_ms = atomic_load(&g_pace_ms);
     cfg.gcm_wait_timeout_ms = atomic_load(&g_gcm_timeout_ms);
     return &cfg;
 }
@@ -825,7 +833,7 @@ static void case_rate_128(void)
     assert(!atomic_load(&r.done)); /* #37 condition requires subsequent poll + step */
 
     /* #37 return condition: one step (1 vblank for 256 events) plus later poll */
-    const u32 step = life_step_vblanks(N_EVENTS);
+    const u32 step = life_step_vblanks(N_EVENTS, TROPHY_PACE_TOTAL_VBLANKS);
     assert(step == 1);
     vblank_tick();
     poll_once();
@@ -876,7 +884,7 @@ static void case_rate_small(void)
 
     /* For 12 events, step = (120 + 12 - 1) / 12 = 10 vblanks.
      * During vblanks 111..119, elapsed since COMPLETE is < step (10), so r.done is provably false. */
-    const u32 step = life_step_vblanks(12);
+    const u32 step = life_step_vblanks(12, TROPHY_PACE_TOTAL_VBLANKS);
     assert(step == 10);
     for (u32 vb = 111; vb < 120; vb++) {
         vblank_tick();
@@ -905,6 +913,65 @@ static void case_rate_small(void)
     store_remove("NPWR00015");
 }
 
+/* The pace is wall time converted at the rate the host raises vblanks: 2000 ms is 120 vblanks at 59.94 Hz (the
+ * exact figure the registration always used), 240 at the 119.88 Hz grid, 100 at 50 Hz; a rate never set, or a
+ * zero one, is the mode's 59.94 Hz; the result is at least 1. */
+static void case_pace_unit(void)
+{
+    atomic_store(&g_rate_num, 60000u); atomic_store(&g_rate_den, 1001u);
+    assert(trophy_pace_vblanks() == 120u);
+    atomic_store(&g_rate_num, 120000u);
+    assert(trophy_pace_vblanks() == 240u);
+    atomic_store(&g_rate_num, 50u); atomic_store(&g_rate_den, 1u);
+    assert(trophy_pace_vblanks() == 100u);
+    atomic_store(&g_rate_num, 0u);
+    assert(trophy_pace_vblanks() == 120u);
+    atomic_store(&g_rate_num, 60000u); atomic_store(&g_rate_den, 1001u);
+    atomic_store(&g_pace_ms, 1u);
+    assert(trophy_pace_vblanks() == 1u);
+    atomic_store(&g_pace_ms, 2000u);
+}
+
+/* A host that raises 119.88 Hz vblanks gets the same 2 s: at 120 vblanks (1 s there) about half of the 256 events
+ * are delivered, at 240 all of them. */
+static void case_fast_grid(void)
+{
+    atomic_store(&g_rate_num, 120000u); atomic_store(&g_rate_den, 1001u);
+    store_remove("NPWR00014");
+    begin("NPWR00014");
+    Reg r; reg_start(&r);
+    wait_started();
+    const u32 start_vb = cellGcmGetVBlankCount();
+    poll_once();
+    consume();
+    for (u32 vb = 1; vb <= TROPHY_PACE_TOTAL_VBLANKS; vb++) {
+        vblank_tick();
+        poll_once();
+        consume();
+    }
+    /* due = 1 + 120 * 256 / 240 = 129 events by now, after the one inline status */
+    assert(atomic_load(&g_nlog) == 1 + 129);
+    for (u32 vb = TROPHY_PACE_TOTAL_VBLANKS + 1; vb <= 2 * TROPHY_PACE_TOTAL_VBLANKS; vb++) {
+        vblank_tick();
+        poll_once();
+        consume();
+    }
+    assert(atomic_load(&g_nlog) == 1 + N_EVENTS);
+    assert(g_last_valid_status == (int)SCE_NP_TROPHY_STATUS_PROCESSING_COMPLETE);
+    vblank_tick();
+    poll_once();
+    for (unsigned i = 0; !atomic_load(&r.done); i++) {
+        assert(i < 50000000u);
+        sched_yield();
+    }
+    reg_join(&r);
+    assert(r.rc == CELL_OK);
+    assert(cellGcmGetVBlankCount() - start_vb == 2 * TROPHY_PACE_TOTAL_VBLANKS + 1u);
+    end();
+    store_remove("NPWR00014");
+    atomic_store(&g_rate_num, 60000u);
+}
+
 
 int main(int argc, char** argv)
 {
@@ -914,7 +981,8 @@ int main(int argc, char** argv)
         {"samethread", case_samethread}, {"destroy", case_destroy},
         {"threads", case_threads}, {"novblank", case_novblank}, {"guards", case_guards},
         {"aborthandle", case_aborthandle}, {"rate_128", case_rate_128},
-        {"rate_small", case_rate_small},
+        {"rate_small", case_rate_small}, {"pace_unit", case_pace_unit},
+        {"fast_grid", case_fast_grid},
     };
     strcpy(g_root, "/tmp/ps3recomp-trophy-XXXXXX");
     assert(mkdtemp(g_root));

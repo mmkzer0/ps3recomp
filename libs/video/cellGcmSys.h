@@ -508,6 +508,13 @@ void cellGcm_set_walker_wake_hook(void (*hook)(unsigned reasons));
  * Zero lets the host sleep until the next ring; nonzero asks for a pass at the host's polling cadence. */
 int  cellGcm_rsx_walker_pending(void);
 
+/* The rate (num/den Hz) at which the host raises vblanks (cellGcm_vblank_signal). The host that owns the vblank
+ * thread sets it before the guest runs; until then it is the video-out mode's 60000/1001. A consumer that must
+ * express a wall-clock span in vblanks (sceNpTrophy's registration pace) reads it with cellGcm_vblank_rate. A
+ * zero num or den is ignored. */
+void cellGcm_set_vblank_rate(u32 hz_num, u32 hz_den);
+void cellGcm_vblank_rate(u32* hz_num, u32* hz_den);
+
 /* Driver events the FIFO walker retires, for C3's event comparison. `seq` counts from 1 in
  * retirement order. The observer runs on the walker thread, inside the drain; it must not block. */
 typedef enum GcmDriverEventKind {
