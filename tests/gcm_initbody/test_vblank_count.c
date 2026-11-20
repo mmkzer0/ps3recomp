@@ -166,6 +166,22 @@ static void test_threads(void)
           polls, cellGcmGetVBlankCount(), base + RAISED);
 }
 
+/* The host's vblank rate: the video-out mode's 60000/1001 until set, the pair last set after, and a zero part is
+ * ignored (the pair is never half-written). */
+static void test_rate(void)
+{
+    uint32_t n = 0, d = 0;
+    cellGcm_vblank_rate(&n, &d);
+    CHECK(n == 60000u && d == 1001u, "default rate %u/%u, want 60000/1001", n, d);
+    cellGcm_set_vblank_rate(120000u, 1001u);
+    cellGcm_vblank_rate(&n, &d);
+    CHECK(n == 120000u && d == 1001u, "set rate %u/%u, want 120000/1001", n, d);
+    cellGcm_set_vblank_rate(0u, 7u);
+    cellGcm_set_vblank_rate(7u, 0u);
+    cellGcm_vblank_rate(&n, &d);
+    CHECK(n == 120000u && d == 1001u, "a zero part changed the rate to %u/%u", n, d);
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -178,6 +194,7 @@ int main(void)
     test_one_per_vblank();
     test_handler_argument();
     test_threads();
+    test_rate();
 
     if (g_fail) { printf("%d check(s) failed\n", g_fail); return 1; }
     printf("GCM vblank count checks passed\n");

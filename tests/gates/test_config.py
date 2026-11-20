@@ -113,6 +113,7 @@ def test_defaults_without_file_or_environment():
         "vk.draw_batch_max": ("512", "default"),
         "game.free_space_raw": ("false", "default"),
         "trophy.register_wait_cap_vblanks": ("1024", "default"),
+        "trophy.pace_ms": ("2000", "default"),
         "adec.silence_fallback": ("false", "default"),
         "video.resolutions": ('""', "default"),
         "video.rsx_capture": ("false", "default"),
@@ -120,6 +121,7 @@ def test_defaults_without_file_or_environment():
         "video.rsx_capture_frames": ("0", "default"),
         "pad.record": ('""', "default"),
         "pad.replay": ('""', "default"),
+        "pad.replay_repeat": ("1", "default"),
         "title.elf_sha256": ('""', "default"),
         "host.work_interval": ("false", "default"),
         "host.work_interval_us": ("500", "default"),
@@ -277,6 +279,7 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
             "vk.draw_batch_max": "default",
             "game.free_space_raw": "default",
             "trophy.register_wait_cap_vblanks": "default",
+            "trophy.pace_ms": "default",
             "adec.silence_fallback": "default",
             "video.resolutions": "default",
             "video.rsx_capture": "default",
@@ -284,6 +287,7 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
             "video.rsx_capture_frames": "default",
             "pad.record": "default",
             "pad.replay": "default",
+            "pad.replay_repeat": "default",
             "title.elf_sha256": "env:PS3RECOMP_TITLE_ELF_SHA256",
             "host.work_interval": "default",
             "host.work_interval_us": "default",
@@ -316,11 +320,11 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
                            "rsx": {"bc_path": "auto", "bc_gpu_min_texels": 147456},
                            "vk": {"draw_batch": False, "draw_batch_max": 512},
                            "game": {"free_space_raw": False},
-                           "trophy": {"register_wait_cap_vblanks": 1024},
+                           "trophy": {"register_wait_cap_vblanks": 1024, "pace_ms": 2000},
                            "adec": {"silence_fallback": False},
                            "video": {"resolutions": "", "rsx_capture": False, "rsx_capture_dir": "",
                                      "rsx_capture_frames": 0},
-                           "pad": {"record": "", "replay": ""},
+                           "pad": {"record": "", "replay": "", "replay_repeat": 1},
                            "title": {"elf_sha256": SHA_A},
                            "host": {"work_interval": False, "work_interval_us": 500},
                            "diag": {"dump_config": False},
@@ -560,6 +564,26 @@ def test_pad_trace_paths_are_checked_at_load():
             for p in (os.path.join(d, "ro"), os.path.join(d, "secret.trace")):
                 if os.path.exists(p):
                     os.chmod(p, 0o755)
+
+
+def test_pad_replay_repeat_is_bounded_and_comes_from_file_and_environment():
+    # k = 2 lets a recording made at one guest frame per 60 Hz tick feed a build that runs two guest
+    # frames per tick; bounding it keeps a typo from becoming an unbounded frame multiplier.
+    with Cfg("schema = 2", "[pad]", "replay_repeat = 2") as c:
+        o = options(probe("--load", c.path, "get"))
+        assert o["pad.replay_repeat"] == ("2", f"file:{c.path}"), o
+    o = options(probe("get", PS3RECOMP_PAD_REPLAY_REPEAT="8"))
+    assert o["pad.replay_repeat"] == ("8", "env:PS3RECOMP_PAD_REPLAY_REPEAT"), o
+    assert options(probe("get"))["pad.replay_repeat"] == ("1", "default")
+    for bad in ("0", "9", "4294967295"):
+        f = config_invalid(probe("get", PS3RECOMP_PAD_REPLAY_REPEAT=bad))
+        assert f["env"] == "PS3RECOMP_PAD_REPLAY_REPEAT" and f["key"] == "pad.replay_repeat", (bad, f)
+        assert "out of range" in f["detail"], (bad, f)
+    for bad in ("0", "9"):
+        with Cfg("schema = 2", "[pad]", f"replay_repeat = {bad}") as c:
+            f = config_invalid(probe("--load", c.path, "get"))
+            assert f["key"] == "pad.replay_repeat" and f["line"] == "3", (bad, f)
+            assert "out of range" in f["detail"], (bad, f)
 
 
 def test_schema_mismatch_missing_and_mistyped_stop():

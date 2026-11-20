@@ -391,6 +391,14 @@ PS3_CFG_U32(trophy, register_wait_cap_vblanks, 1024, 1, 16777216,
     "event). A title that registers on the thread that does the polling hits the cap, "
     "and the events are then delivered by its later polls.")
 
+PS3_CFG_U32(trophy, pace_ms, 2000, 1, 600000,
+    "The minimum total time, in milliseconds, that sceNpTrophyRegisterContext takes to deliver its status "
+    "events. The firmware's own timing is wall-clock (the VSH installs the trophies); 2000 ms is RPCS3's "
+    "synthetic minimum, not a measured figure. The HLE counts it in vblanks, converted once per registration "
+    "at the rate the host raises them (cellGcm_set_vblank_rate): 120 vblanks at 59.94 Hz, 240 at 119.88 Hz, so "
+    "a host that runs its vblank grid faster than the video-out mode still waits the same wall time. A host "
+    "that never sets the rate gets the mode's 59.94 Hz.")
+
 /* ---- adec --------------------------------------------------------------- */
 
 PS3_CFG_BOOL(adec, silence_fallback, 0,
@@ -444,20 +452,35 @@ PS3_CFG_STR(pad, record, "", 1023, PS3_CFG_V_PAD_RECORD_PATH,
     "cellPadGetInfo/GetInfo2/cellPadPeriphGetInfo) into this file, as a ps3recomp-pad-trace the "
     "pad.replay option plays back (docs/MODULES_REFERENCE.md, \"cellPad: record and replay\"). "
     "The words are the ones stored to guest memory, after the host pad, the keyboard and the "
-    "PAD_SCRIPT, PAD_FILE, PAD_STICK and PAD_AUTOPRESS injectors, keyed by (flip, poll); only a "
-    "change of state is written. The file is created and never overwritten: a path that exists, "
-    "or one in a directory that is missing or not writable, is a config error. Empty (the "
-    "default) records nothing. May be set together with pad.replay to record the replayed input.")
+    "PAD_SCRIPT, PAD_FILE, PAD_STICK and PAD_AUTOPRESS injectors, keyed by the port's "
+    "cellPadGetData ordinal; only a change of state is written. The file is created and never "
+    "overwritten: a path that exists, or one in a directory that is missing or not writable, is a "
+    "config error. Empty (the default) records nothing. May be set together with pad.replay to "
+    "record the replayed input.")
 
 PS3_CFG_STR(pad, replay, "", 1023, PS3_CFG_V_PAD_REPLAY_PATH,
     "Play back a pad trace recorded with pad.record: every cellPadGetData answers with the "
-    "recorded state of the latest record at or before the poll's (flip, poll), a neutral pad "
-    "before the first record of a port and after the end of the trace, and the info calls report "
-    "the recorded connection. The host pad and every injector are ignored. A malformed file, an "
-    "unknown version or keys that go backwards end the run with kind pad-trace; a path that is "
-    "not a readable file is a config error. A summary of how closely the guest followed the "
-    "recording is printed at the end of the trace and at exit. Empty (the default) plays back "
-    "nothing.")
+    "recorded state of the latest record at or before the poll's ordinal (see pad.replay_repeat "
+    "for pacing a recording in a build that polls more often), a neutral pad before the first "
+    "record of a port and after the end of the trace, and the info calls report the recorded "
+    "connection. The host pad and every injector are ignored. A malformed file, an unknown "
+    "version or keys that go backwards end the run with kind pad-trace; a path that is not a "
+    "readable file is a config error. A summary of how closely the guest followed the recording "
+    "is printed at the end of the trace and at exit. Empty (the default) plays back nothing.")
+
+PS3_CFG_U32(pad, replay_repeat, 1, 1, 8,
+    "For a title that polls once per simulation step: serve each recorded poll of a version-3 pad "
+    "trace this many consecutive guest polls when pad.replay is set. Guest poll p of a port is "
+    "answered with exactly what pad.replay alone serves at recorded ordinal floor(p / N): the "
+    "latest record at or before it (an ordinal with no record of its own holds the latest "
+    "state), a neutral pad once floor(p / N) reaches the port's end count. A recording made at "
+    "one step per 60 Hz tick therefore replays with its wall-time pacing in a build that runs N "
+    "steps per tick. A title that drains several polls per step would see each drained report N "
+    "times; that is not supported. The guest's flip clock and poll pattern take no part. 1 (the "
+    "default) serves every recorded poll once, exactly as recorded. The replay summary names N "
+    "when it is not 1; reached_exactly still counts each recorded change once, when a poll first "
+    "serves it. A version-1 or version-2 trace is refused with N > 1: its records are not keyed "
+    "on the poll ordinal. A value outside 1..8 is a config error.")
 
 /* ---- title -------------------------------------------------------------- */
 

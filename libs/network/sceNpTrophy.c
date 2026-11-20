@@ -87,6 +87,7 @@ typedef struct {
     u32                      life_cb;
     u32                      life_arg;
     u32                      life_v0;
+    u32                      life_pace;     /* total pacing in vblanks, fixed when the lifecycle starts */
     u32                      life_posted;
     u32                      life_delivered;
     int                      life_complete_seen;
@@ -358,11 +359,13 @@ static int trophy_install_state(const SceNpCommunicationId* commId, u32* status)
  *    #37. A vblank edge alone is not enough: the completion can land a
  *    microsecond before one.
  *
- * Pacing is counted in vblanks (cellGcmGetVBlankCount), the guest-visible time
- * base, not in wall-clock time: a deterministic rendering of RPCS3's rules, so
- * a run and its replay do not depend on the host's speed. 2 s at the
- * console's 59.94 Hz is 120 vblanks over the events (one vblank a step with
- * the usual few hundred events); RPCS3's 50 ms grace is 3 vblanks.
+ * Pacing: the total is trophy.pace_ms of wall time (the firmware's own timing is wall-clock; the 2 s default is
+ * RPCS3's synthetic minimum, not a measured figure), converted ONCE per registration to vblanks at the rate the
+ * host emits them (cellGcm_vblank_rate), then counted in vblanks (cellGcmGetVBlankCount), the guest-visible
+ * time base, not in wall-clock time: a deterministic rendering of RPCS3's rules, so a run and its replay do not
+ * depend on the host's speed. 2 s at the console's 59.94 Hz is 120 vblanks over the events (one vblank a step
+ * with the usual few hundred events); a host that emits 119.88 Hz vblanks gets 240, the same 2 s. RPCS3's 50 ms
+ * grace is 3 vblanks.
  *
  * Mechanism: a queue and a clock, no thread of our own. posted counts the
  * events the "VSH" has queued: event k is due at vblank v0 + k * step, and
@@ -380,8 +383,19 @@ static int trophy_install_state(const SceNpCommunicationId* commId, u32* status)
  * -----------------------------------------------------------------------*/
 
 extern u32 cellGcmGetVBlankCount(void);
+extern void cellGcm_vblank_rate(u32* hz_num, u32* hz_den);
 
-#define TROPHY_PACE_TOTAL_VBLANKS   120u   /* RPCS3-oracle: 2 s minimum at 59.94 Hz */
+/* The pace in vblanks for the rate the host emits now: round(pace_ms * rate / 1000), at least 1. At the default
+ * 2000 ms and 59.94 Hz this is exactly 120. */
+static u32 trophy_pace_vblanks(void)
+{
+    u32 num = 0, den = 0;
+    cellGcm_vblank_rate(&num, &den);
+    if (!num || !den) { num = 60000u; den = 1001u; }
+    const u64 denom = (u64)den * 1000u;
+    const u64 v = ((u64)ps3_cfg_trophy_pace_ms() * num + denom / 2u) / denom;
+    return v ? (u32)v : 1u;
+}
 #define TROPHY_EVENT_QUEUE_CAP      127u   /* FW 4.93 sysutil event queue (A2.6) */
 #define TROPHY_WAIT_SLICE_US       4000u   /* re-check the vblank counter at least this often */
 
@@ -398,11 +412,11 @@ static void life_segments(u32 trophies, u32 seg[TROPHY_STATUS_SEGMENTS])
 }
 
 /* Step in vblanks for the #37 return condition after COMPLETE is delivered.
- * For <= 120 events this is ceil(120 / events); for > 120 events it clamps to 1. */
-static u32 life_step_vblanks(u32 events)
+ * For events <= pace this is ceil(pace / events) (120 events -> 1 at 59.94 Hz); for more events it clamps to 1. */
+static u32 life_step_vblanks(u32 events, u32 pace)
 {
     if (!events) return 1;
-    const u32 p = (TROPHY_PACE_TOTAL_VBLANKS + events - 1) / events;
+    const u32 p = (pace + events - 1) / events;
     return p ? p : 1;
 }
 
@@ -540,23 +554,23 @@ static s32 trophy_handle_abort_rc(SceNpTrophyHandle handle)
     return aborted ? (s32)SCE_NP_TROPHY_ERROR_ABORT : CELL_OK;
 }
 
-/* Pacing: 120 vblanks (~2.0 s at 59.94 Hz) minimum total register time.
+/* Pacing: trophy.pace_ms (default 2000, ~120 vblanks at 59.94 Hz) minimum total register time.
  * Evidence:
  *  - RPCS3 oracle: sceNpTrophy.cpp:766-832 @ d00d8023 (until_min = 2'000'000 / total_events).
  *  - Static firmware: libsysutil_np_trophy.sprx RegisterContext 0x02001614 sends IPC tag
  *    'i' (0x020018F8 -> vsh 0x001902A4) and blocks in PacketRead; VSH posts status events
  *    over sysutil slot 299 (dispatch_status 0x020005E4 -> 0x0200049C). PRX has no timing.
- * Paced by rate so all events are posted within TROPHY_PACE_TOTAL_VBLANKS (120):
- *  event k (1-based) is due when elapsed * events >= (k - 1) * 120, i.e.:
- *  due = 1 + elapsed * events / 120, clamped at events.
+ * Paced by rate so all events are posted within life_pace vblanks (trophy_pace_vblanks, 120 at the defaults):
+ *  event k (1-based) is due when elapsed * events >= (k - 1) * pace, i.e.:
+ *  due = 1 + elapsed * events / pace, clamped at events.
  * Event 1 is due immediately at elapsed=0. Event k=events (COMPLETE) is due when
- *  elapsed >= ceil((events - 1) * 120 / events) <= 120 vblanks. */
+ *  elapsed >= ceil((events - 1) * pace / events) <= pace vblanks. */
 static void life_post_locked(TrophyContext* c, u32 vb)
 {
     const u32 events = life_event_count(c->total_trophies);
     if (!events) return;
     const u32 elapsed = vb - c->life_v0;
-    u64 due = 1u + (u64)elapsed * (u64)events / TROPHY_PACE_TOTAL_VBLANKS;
+    u64 due = 1u + (u64)elapsed * (u64)events / c->life_pace;
     if (due > events) due = events;
     const u32 room = TROPHY_EVENT_QUEUE_CAP - (c->life_posted - c->life_delivered);
     u32 n = due > c->life_posted ? (u32)(due - c->life_posted) : 0;
@@ -666,7 +680,7 @@ static s32 trophy_run_lifecycle(s32 context, SceNpTrophyHandle handle, u64 seria
     c->life_wait_serial = serial;
     c->life_abort_hit = 0;
     const u32 events = life_event_count(c->total_trophies);
-    const u32 step = life_step_vblanks(events);
+    const u32 step = life_step_vblanks(events, c->life_pace);
     const u32 start_vb = cellGcmGetVBlankCount();
     u32 seen_vb = start_vb;
     u64 seen_at = trophy_clock_real();
@@ -1040,6 +1054,7 @@ s32 sceNpTrophyRegisterContext(SceNpTrophyContext context,
     s_contexts[context].life_cb = statusCb;
     s_contexts[context].life_arg = arg;
     s_contexts[context].life_v0 = cellGcmGetVBlankCount();
+    s_contexts[context].life_pace = trophy_pace_vblanks();
     life_unlock();
     if (cellSysutil_register_poll_hook(trophy_poll) != CELL_OK) {
         life_lock();

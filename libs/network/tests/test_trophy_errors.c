@@ -33,6 +33,7 @@ const ps3_config* ps3_config_get(void) { static ps3_config cfg; return &cfg; }
 #define E(n) ((s32)(0x800229u << 8 | (n)))
 
 u32 cellGcmGetVBlankCount(void) { return 0; }
+void cellGcm_vblank_rate(u32* hz_num, u32* hz_den) { *hz_num = 60000u; *hz_den = 1001u; }
 void ps3_stop_gcm_wait_timeout(const char* func, const char* what, uint32_t offset,
                                uint32_t value, uint32_t current, uint32_t waited_ms)
 { (void)func; (void)what; (void)offset; (void)value; (void)current; (void)waited_ms; abort(); }

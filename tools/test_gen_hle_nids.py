@@ -65,6 +65,7 @@ HOST_HELPERS = set("""
     cellGcm_rsx_walker_pending
     cellGcm_set_capture_sink
     cellGcm_set_host_active_clock
+    cellGcm_set_vblank_rate
     cellGcm_set_walker_wake_hook
     cellGcm_syscall_bringup
     cellGcm_syscall_iomap
@@ -73,6 +74,7 @@ HOST_HELPERS = set("""
     cellGcm_take_flip_pending
     cellGcm_take_flip_pending_synced
     cellGcm_vblank_flip_label
+    cellGcm_vblank_rate
     cellGcm_vblank_signal
     cellKb_keyEvent
     cellMouse_buttonEvent

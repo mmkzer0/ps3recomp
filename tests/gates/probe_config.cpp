@@ -96,6 +96,8 @@ static void print_options()
             std::printf("%s", ps3_cfg_game_free_space_raw() ? "true" : "false");
         else if (!std::strcmp(o->section, "trophy") && !std::strcmp(o->key, "register_wait_cap_vblanks"))
             std::printf("%u", ps3_cfg_trophy_register_wait_cap_vblanks());
+        else if (!std::strcmp(o->section, "trophy") && !std::strcmp(o->key, "pace_ms"))
+            std::printf("%u", ps3_cfg_trophy_pace_ms());
         else if (!std::strcmp(o->section, "adec") && !std::strcmp(o->key, "silence_fallback"))
             std::printf("%s", ps3_cfg_adec_silence_fallback() ? "true" : "false");
         else if (!std::strcmp(o->section, "video") && !std::strcmp(o->key, "resolutions"))
@@ -110,6 +112,8 @@ static void print_options()
             std::printf("\"%s\"", ps3_cfg_pad_record());
         else if (!std::strcmp(o->section, "pad") && !std::strcmp(o->key, "replay"))
             std::printf("\"%s\"", ps3_cfg_pad_replay());
+        else if (!std::strcmp(o->section, "pad") && !std::strcmp(o->key, "replay_repeat"))
+            std::printf("%u", ps3_cfg_pad_replay_repeat());
         else if (!std::strcmp(o->section, "title") && !std::strcmp(o->key, "elf_sha256"))
             std::printf("\"%s\"", ps3_cfg_title_elf_sha256());
         else if (!std::strcmp(o->section, "host") && !std::strcmp(o->key, "work_interval"))

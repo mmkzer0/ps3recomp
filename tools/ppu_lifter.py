@@ -872,6 +872,11 @@ _CRBR_RE = re.compile(
     r"^(?P<ind>\s*)if \((?P<neg>!)?\(+ctx->cr >> (?P<shift>\d+)\) & (?P<mask>0x[0-9A-Fa-f]+|\d+)\)+\) (?P<rest>.*)$")
 # A line PPULifter._patched_translate wrote; group 1 is its guard symbol.
 _INSN_PATCH_RE = re.compile(r"^if \(([A-Za-z_]\w*)\) \{ .* /\* insn patch 0x[0-9A-F]{8}: ")
+# The statement --pc-counters puts at the start of each listed instruction: a
+# relaxed atomic add on slot K of the table the table chunk defines.
+_PC_COUNT_STMT = "__atomic_fetch_add(&ppu_pc_counter_slots[{slot}], 1, __ATOMIC_RELAXED);"
+_PC_COUNT_RE = re.compile(
+    r"^\s*__atomic_fetch_add\(&ppu_pc_counter_slots\[(\d+)\], 1, __ATOMIC_RELAXED\);$")
 
 
 def load_insn_patches(path: str) -> dict[int, tuple[int, int, str]]:
@@ -895,6 +900,38 @@ def load_insn_patches(path: str) -> dict[int, tuple[int, int, str]]:
         out[addr] = (int(str(e["orig"]), 0) & 0xFFFFFFFF,
                      int(str(e["new"]), 0) & 0xFFFFFFFF, guard)
     return out
+
+
+def load_pc_counters(path: str) -> tuple[list[int], dict[int, int]]:
+    """Read a --pc-counters file: one hex guest PC per line (`0x` optional),
+    `#` starts a comment, blank lines are skipped. Any malformed, misaligned or
+    duplicate line stops the lift naming the line and the PC.
+
+    -> (PCs sorted ascending, {pc: line number}). Slot k of the emitted counter
+    table is the k-th PC of the sorted list."""
+    try:
+        with open(path) as f:
+            text = f.read()
+    except OSError as e:
+        sys.exit(f"[ppu_lifter] --pc-counters {path}: {e.strerror or e}")
+    lines: dict[int, int] = {}
+    for no, raw in enumerate(text.splitlines(), 1):
+        tok = raw.split("#", 1)[0].strip()
+        if not tok:
+            continue
+        if not re.fullmatch(r"(?:0[xX])?[0-9A-Fa-f]{1,8}", tok):
+            sys.exit(f"[ppu_lifter] {path}:{no}: malformed PC {raw.strip()!r} "
+                     f"(want one 32-bit hex guest address per line)")
+        pc = int(tok, 16)
+        if pc & 3:
+            sys.exit(f"[ppu_lifter] {path}:{no}: PC 0x{pc:08X} is not 4-byte aligned")
+        if pc in lines:
+            sys.exit(f"[ppu_lifter] {path}:{no}: duplicate PC 0x{pc:08X} "
+                     f"(first listed at line {lines[pc]})")
+        lines[pc] = no
+    if not lines:
+        sys.exit(f"[ppu_lifter] {path}: no PCs listed")
+    return sorted(lines), lines
 
 
 def _crval_to_c(val: str, mask: int, decl_a: str, a_expr: str, b_expr: str) -> str:
@@ -1067,7 +1104,8 @@ def _last_line_is_terminator(body_lines: list[str]) -> bool:
     must fall through to it."""
     for line in reversed(body_lines):
         s = line.strip()
-        if not s or s.endswith(":") or s.startswith("loc_") and s.endswith(": ;"):
+        if (not s or s.endswith(":") or s.startswith("loc_") and s.endswith(": ;")
+                or _PC_COUNT_RE.match(s)):
             continue
         if s.endswith(":"):
             continue
@@ -1180,6 +1218,10 @@ class PPULifter:
         # {addr -> (original word, replacement word, guard symbol)}. See
         # _patched_translate.
         self.insn_patches: dict[int, tuple[int, int, str]] = {}
+        # Per-instruction execution counters (--pc-counters): {guest PC -> slot}.
+        # Empty = off, and the output is then exactly what it was before the
+        # option existed.
+        self.pc_counter_slots: dict[int, int] = {}
         # addr(int) -> recovered name label (from Ghidra analysis). Emitted as a
         # comment above func_ADDR so dispatch stays address-based.
         self.name_map: dict[int, str] = {}
@@ -1330,6 +1372,10 @@ class PPULifter:
             if insn.addr in internal_targets:
                 func.body_lines.append(f"loc_{insn.addr:08X}:")
                 emitted_labels.add(insn.addr)
+            if self.pc_counter_slots:
+                slot = self.pc_counter_slots.get(insn.addr)
+                if slot is not None:
+                    func.body_lines.append("    " + _PC_COUNT_STMT.format(slot=slot))
             if c_line:
                 func.body_lines.append(f"    {c_line}")
                 goto_targets.update(int(m.group(1), 16) for m in _GOTO_RE.finditer(c_line))
@@ -4358,6 +4404,22 @@ class PPULifter:
         lines.append("    return (sh >= 64) ? (rs >> 63) : (rs >> sh);")
         lines.append("}")
         lines.append("")
+        if self.pc_counter_slots:
+            n = len(self.pc_counter_slots)
+            lines += [
+                "/* --pc-counters: slot k counts executions of guest PC ppu_pc_counter_pcs[k]. */",
+                "#include <stddef.h>",
+                "#ifdef __cplusplus",
+                'extern "C" {',
+                "#endif",
+                f"extern uint64_t ppu_pc_counter_slots[{n}];",
+                f"extern const uint32_t ppu_pc_counter_pcs[{n}];",
+                "void ps3_pc_counters_register(const uint32_t* pcs, uint64_t* slots, size_t n);",
+                "#ifdef __cplusplus",
+                "}",
+                "#endif",
+                "",
+            ]
         return lines
 
     def _emit_functions(self) -> list["LiftedFunction"]:
@@ -4518,6 +4580,19 @@ class PPULifter:
         lines.append(f'const char* {self.prefix}ppu_lift_image_sha256(void) '
                      f'{{ return "{self.image_sha256}"; }}')
         lines.append("")
+        if self.pc_counter_slots:
+            n = len(self.pc_counter_slots)
+            pcs = sorted(self.pc_counter_slots, key=self.pc_counter_slots.get)
+            lines.append("/* --pc-counters table (see ppu_lifter.py --pc-counters, docs/TOOLS.md). */")
+            lines.append(f"uint64_t ppu_pc_counter_slots[{n}];")
+            lines.append(f"const uint32_t ppu_pc_counter_pcs[{n}] = {{")
+            for i in range(0, n, 4):
+                lines.append("    " + ", ".join(f"0x{pc:08X}u" for pc in pcs[i:i + 4]) + ",")
+            lines.append("};")
+            lines.append("__attribute__((constructor)) static void ppu_pc_counters_init(void) {")
+            lines.append(f"    ps3_pc_counters_register(ppu_pc_counter_pcs, ppu_pc_counter_slots, {n});")
+            lines.append("}")
+            lines.append("")
         return lines
 
     def emit_source(self) -> str:
@@ -5236,7 +5311,7 @@ _WORKER_STATE: dict = {}
 
 def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
                  function_entries=None, code_lo=0, code_hi=None, jump_tables=None,
-                 toc_base=0, insn_patches=None):
+                 toc_base=0, insn_patches=None, pc_counter_slots=None):
     _WORKER_STATE["segs"] = segs
     _WORKER_STATE["be"] = big_endian
     _WORKER_STATE["names"] = name_map
@@ -5252,6 +5327,7 @@ def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
     _WORKER_STATE["code_hi"] = code_hi
     _WORKER_STATE["jump_tables"] = jump_tables or {}
     _WORKER_STATE["insn_patches"] = insn_patches or {}
+    _WORKER_STATE["pc_counter_slots"] = pc_counter_slots or {}
 
 
 def _worker_lift(task):
@@ -5268,6 +5344,7 @@ def _worker_lift(task):
     lifter.jump_tables = _WORKER_STATE.get("jump_tables", {})
     lifter.toc_base = _WORKER_STATE.get("toc_base", 0)
     lifter.insn_patches = _WORKER_STATE.get("insn_patches", {})
+    lifter.pc_counter_slots = _WORKER_STATE.get("pc_counter_slots", {})
     results = []
     for start, end in bounds:
         blob = b""
@@ -5303,7 +5380,7 @@ def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
                              lifter.hle_stub_nids, lifter.function_entries,
                              lifter.code_lo, lifter.code_hi, lifter.jump_tables,
                              getattr(lifter, "toc_base", 0),
-                             lifter.insn_patches))
+                             lifter.insn_patches, lifter.pc_counter_slots))
     try:
         for idx0, results, ct, bt in pool.imap_unordered(_worker_lift, tasks):
             results_by_idx[idx0] = results
@@ -5327,6 +5404,35 @@ def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
                 name=name, start_addr=s, end_addr=e, body_lines=body, calls=calls,
                 fallthrough_to=ft, traps=traps, dead=dead,
                 undecoded_targets=undecoded))
+
+
+def check_pc_counters(lifter: "PPULifter", path: str, line_of: dict[int, int]) -> None:
+    """Every listed PC must carry its counter in an emitted function; one that
+    does not (an address no lifted function covers, the middle of an
+    instruction-less gap, code the lift proved unreachable, an import stub)
+    would otherwise count nothing and read as zero executions."""
+    emitted = lifter._emit_functions()
+    pc_of = {k: pc for pc, k in lifter.pc_counter_slots.items()}
+    landed: set[int] = set()
+    for f in emitted:
+        for bl in f.body_lines:
+            m = _PC_COUNT_RE.match(bl)
+            if m:
+                landed.add(pc_of[int(m.group(1))])
+    errors = []
+    for pc in sorted(set(lifter.pc_counter_slots) - landed):
+        why = "is outside every lifted function"
+        for f in emitted:
+            if any(int(a, 16) <= pc <= int(b, 16) for a, b in f.dead):
+                why = (f"is unreachable from the entry of func_{f.start_addr:08X} "
+                       f"and was not lowered")
+                break
+            if f.start_addr <= pc < f.end_addr:
+                why = (f"is inside func_{f.start_addr:08X} but is not the start of an "
+                       f"instruction the lift emitted")
+        errors.append(f"[ppu_lifter] {path}:{line_of[pc]}: PC 0x{pc:08X} {why}")
+    if errors:
+        sys.exit("\n".join(errors))
 
 
 def main() -> None:
@@ -5397,6 +5503,16 @@ def main() -> None:
                              "is emitted as `if (guard) {new} else {orig}`, guard "
                              "being an int the port defines. The input must hold "
                              "`orig` at `addr` or the lift stops.")
+    parser.add_argument("--pc-counters", metavar="FILE", default=None,
+                        help="Count executions of guest instructions: FILE lists "
+                             "PCs (one hex address per line, # comments). Each "
+                             "listed instruction starts with a relaxed atomic "
+                             "increment of its slot in ppu_pc_counter_slots[]; "
+                             "the runtime reads them (ps3_pc_counters_*) and, "
+                             "with PS3_PC_COUNTERS_OUT=<path>, writes them at "
+                             "process exit. A PC that is not the start of an "
+                             "instruction in a lifted function stops the lift. "
+                             "Not combinable with --symbol-prefix.")
     args = parser.parse_args()
 
     # Load firmware-import stubs (addr -> NID) up front; applied to func_bounds
@@ -5956,6 +6072,13 @@ def main() -> None:
     if args.insn_patches:
         lifter.insn_patches = load_insn_patches(args.insn_patches)
         print(f"  insn-patches: {len(lifter.insn_patches)} from {args.insn_patches}")
+    if args.pc_counters:
+        if args.symbol_prefix:
+            sys.exit("[ppu_lifter] --pc-counters needs an unprefixed lift: the runtime "
+                     "reads the main image's ppu_pc_counter_* symbols only")
+        _pc_list, _pc_lines = load_pc_counters(args.pc_counters)
+        lifter.pc_counter_slots = {pc: k for k, pc in enumerate(_pc_list)}
+        print(f"  pc-counters: {len(_pc_list)} from {args.pc_counters}")
 
     # Optional: load a recovered-name map (from Ghidra analysis) to annotate
     # generated functions with meaningful names as comments.
@@ -6012,6 +6135,9 @@ def main() -> None:
         if missing:
             sys.exit("[ppu_lifter] insn patches at no lifted instruction: " +
                      ", ".join(f"0x{a:08X}" for a in missing))
+
+    if lifter.pc_counter_slots:
+        check_pc_counters(lifter, args.pc_counters, _pc_lines)
 
     os.makedirs(args.output, exist_ok=True)
 

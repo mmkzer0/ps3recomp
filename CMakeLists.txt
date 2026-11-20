@@ -1959,6 +1959,18 @@ if(PS3RECOMP_BUILD_TESTS)
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_lift.py")
         set_tests_properties(ppu_lift_conformance PROPERTIES LABELS "ppu;t0" TIMEOUT 600)
+        # --pc-counters (docs/TOOLS.md): the per-instruction execution counters. The emission test is
+        # lift-only; the run test lifts a raw loop, builds it with runtime/diag/pc_counters.c and checks
+        # the dump on both exit routes.
+        add_test(NAME lifter_pc_counters
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_lifter_pc_counters.py")
+        set_tests_properties(lifter_pc_counters PROPERTIES LABELS "tools;t0" TIMEOUT 120)
+        add_test(NAME ppu_pc_counters
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_pc_counters_run.py")
+        set_tests_properties(ppu_pc_counters PROPERTIES LABELS "ppu;t0" TIMEOUT 300
+            ENVIRONMENT "CC=${CMAKE_C_COMPILER};CXX=${CMAKE_CXX_COMPILER}")
         # The trace schema contract: event/1 converts losslessly, validation is
         # strict, and diff reports the first divergence per execution context.
         add_test(NAME ps3diff
@@ -2185,12 +2197,13 @@ if(PS3RECOMP_BUILD_TESTS)
             libs/input/tests/test_pad_trace.c
             libs/input/pad_trace.c
             runtime/diag/host_exit.c
+            runtime/diag/pc_counters.c
             runtime/diag/stop.cpp)
         target_include_directories(test_pad_trace PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
         target_compile_definitions(test_pad_trace PRIVATE _GNU_SOURCE)
         target_link_libraries(test_pad_trace PRIVATE Threads::Threads)
         set_target_properties(test_pad_trace PROPERTIES LINKER_LANGUAGE CXX)
-        foreach(c roundtrip catchup ends lookup changes record-replay errors record-refusals)
+        foreach(c roundtrip catchup ends lookup repeat changes record-replay errors record-refusals)
             add_test(NAME pad_trace_${c} COMMAND test_pad_trace ${c})
             set_tests_properties(pad_trace_${c} PROPERTIES LABELS "input;t0" TIMEOUT 60)
         endforeach()
@@ -2298,6 +2311,7 @@ if(PS3RECOMP_BUILD_TESTS)
                 libs/input/tests/test_pad_replay.c
                 libs/input/pad_trace.c
                 runtime/diag/host_exit.c
+                runtime/diag/pc_counters.c
                 runtime/diag/stop.cpp)
             target_include_directories(test_pad_replay PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
             target_compile_definitions(test_pad_replay PRIVATE _GNU_SOURCE)
@@ -2317,7 +2331,7 @@ if(PS3RECOMP_BUILD_TESTS)
                 target_compile_options(test_pad_replay PRIVATE -ffunction-sections -fdata-sections)
                 target_link_options(test_pad_replay PRIVATE "-Wl,--gc-sections")
             endif()
-            foreach(c control replay replay-info record)
+            foreach(c control replay replay-info record replay-repeat)
                 add_test(NAME pad_replay_${c} COMMAND test_pad_replay ${c} pad_replay_${c}.trace)
                 set_tests_properties(pad_replay_${c} PROPERTIES LABELS "input;t0" TIMEOUT 60)
             endforeach()

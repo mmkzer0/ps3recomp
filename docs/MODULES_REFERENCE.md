@@ -280,7 +280,7 @@ struct CellPadData {
 #### cellPad: record and replay
 
 **Files:** `libs/input/pad_trace.{h,c}` (format, writer, reader, lookup), the hooks in `libs/input/cellPad.c`.
-**Options:** `pad.record`, `pad.replay` (`docs/CONFIG.md`). Both empty, the default, costs one branch per poll.
+**Options:** `pad.record`, `pad.replay`, `pad.replay_repeat` (`docs/CONFIG.md`). Both paths empty, the default, costs one branch per poll.
 
 A battle is only comparable between two runs if the same input reaches the guest at the same point of the run.
 Record the controller of one run (`pad.record = "battle.padtrace"`), then replay it into later ones
@@ -317,16 +317,31 @@ really served, so opening it prints `the trace has no end record; the last state
 replay keeps serving each port's last record (refusing would throw away a whole recording for a kill the recorder
 is built to survive).
 
+**Repeating a recording (`pad.replay_repeat`).** For a title that polls a port once per simulation step. With
+`pad.replay_repeat = N`, N > 1, guest poll p of a port is answered with exactly what the `N = 1` replay serves at
+recorded ordinal floor(p / N): the latest record at or before it (an ordinal with no record of its own holds the
+latest state, so the recording's spacing between changes is stretched N times, not collapsed), a neutral pad before
+the first record and once floor(p / N) reaches the port's end count, a killed trace's held last record. A recording
+made at one step per 60 Hz tick therefore replays with its wall-time pacing in a build that runs N steps per tick.
+Neither the guest's flip clock (it drifts with host pace and load, which is why version 3 stopped keying on it) nor
+its poll pattern takes part. A title that drains several polls per step would see each drained report N times; that
+is not supported. `reached_exactly` counts each recorded change once, when a poll first serves it, so a replay that
+follows the recording reports `reached_exactly = recorded_changes` at any N; `flip_drift` is read at that first
+serve, so the repeat itself does not inflate it. `N = 1` (the default) replays by poll ordinal exactly as before and
+the summary then has no `repeat` field. A version-1 or version-2 trace cannot be repeated (its records are keyed on
+a flip clock, not on the poll ordinal) and is refused with `reason=version`.
+
 **Divergence.** The summary (at the end of the trace and again at exit) is
-`polls=.. exact=.. held=.. recorded_changes=.. reached_exactly=.. flip_drift=<min>:<max>|none`. It counts the polls
-whose ordinal has a record of its own (`exact`) against the ones answered from an earlier record or the neutral pad
-(`held`; most polls, since only changes are recorded), the recorded changes (`recorded_changes`), the ones a poll
-landed on (`reached_exactly`), and `flip_drift`: the smallest and largest `served flip - recorded flip` over the
-reached records. The drift is the guest-time movement the ordinal key absorbs — a step loop that caught up wall
-time where the recording did not — and it is reported rather than removed: no input clock can make guest logic that
-is gated on wall time, or that waits on an asynchronous load, deterministic. It is a diagnostic, not a stop. A run
-that polls fewer times than the recording leaves later records unreached (`reached_exactly` below
-`recorded_changes`).
+`polls=.. exact=.. held=.. recorded_changes=.. reached_exactly=.. flip_drift=<min>:<max>|none`; with
+`pad.replay_repeat` above 1 it ends `repeat=<N>`. It counts the polls whose served ordinal has a record of its own
+(`exact`; at `N > 1` each of the N polls of an ordinal counts) against the ones answered from an earlier record or
+the neutral pad (`held`; most polls, since only changes are recorded), the recorded changes (`recorded_changes`),
+the ones a poll first landed on (`reached_exactly`), and `flip_drift`: the smallest and largest
+`served flip - recorded flip` over the reached records (over their first serve). The drift is the guest-time
+movement the ordinal key absorbs — a step loop that caught up wall time where the recording did not — and it is
+reported rather than removed: no input clock can make guest logic that is gated on wall time, or that waits on an
+asynchronous load, deterministic. It is a diagnostic, not a stop. A run that polls fewer times than the recording
+leaves later records unreached (`reached_exactly` below `recorded_changes`).
 
 **File format, version 3.** One JSON object per line, no host paths and no timestamps. Keys are exactly these;
 anything else is refused.
@@ -350,8 +365,11 @@ record at or past its port's end count (a replay could never serve it), keys tha
 does not declare or a line after the end record is the `pad-trace` stop (`role`, `path`, `line`, `reason`;
 `docs/STOPS.md`), raised when `cellPadInit` opens the file and not later. Version-1 and version-2 files are refused
 with `reason=version` and a detail saying so: their keys came from a flip clock that cannot be re-derived, so the
-run has to be recorded again. A record file that cannot be written is refused the same way. The config checks an
-existing record path, an unwritable directory and an unreadable replay file at load (`config-invalid`).
+run has to be recorded again; the detail names `pad.replay_repeat` when it asked for more than 1, because such a
+file cannot be repeated. A `pad.replay_repeat` outside 1..8 is refused at `pad_trace_create` with `reason=repeat`
+(the config registry refuses the same range earlier as `config-invalid`). A record file that cannot be written is
+refused the same way. The config checks an existing record path, an unwritable directory and an unreadable replay
+file at load (`config-invalid`).
 
 **Not covered.** The sensor and pressure words are recorded as they are, and replay assumes the title sets the same
 port settings as in the recording. The other pad calls (`cellPadSetActDirect`, `cellPadClearBuf`,
