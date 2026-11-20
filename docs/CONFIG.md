@@ -26,9 +26,11 @@ built-in default  <  config file (TOML)  <  environment
   value); a sign, whitespace or trailing text is refused rather than wrapped.
 - **Typos are errors.** Any `PS3RECOMP_*` variable that is not an option is a stop
   and names the closest real one. The exceptions are `PS3RECOMP_CONFIG` and the
-  diagnostic variables that existing code still reads directly
+  diagnostic and host display variables that existing code still reads directly
   (`PS3_CFG_LEGACY_ENV` in the registry); moving one of those into the registry is
-  how it leaves that list.
+  how it leaves that list. `tests/gates/test_env_names.py` fails when a
+  `PS3RECOMP_*` literal read in `libs/` or `runtime/` is in neither the typed
+  keys nor that list.
 
 ## File format
 

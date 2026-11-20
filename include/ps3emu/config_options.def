@@ -503,18 +503,25 @@ PS3_CFG_U32(log, max_mb, 256, 1, 65535,
 
 /* ---- legacy environment variables --------------------------------------- */
 /*
- * Existing diagnostic knobs that read PS3RECOMP_* straight from the environment
- * and are not (yet) options. The environment loader treats every other
- * PS3RECOMP_* variable as a typo and stops, so each one that is still read
- * elsewhere has to be listed or running a title with it set would stop. Moving
- * one into the registry is how it leaves this list.
+ * Existing diagnostic and host display knobs that read PS3RECOMP_* straight
+ * from the environment and are not (yet) options. The environment loader treats
+ * every other PS3RECOMP_* variable as a typo and stops, so each one that is
+ * still read elsewhere has to be listed or running a title with it set would
+ * stop. Moving one into the registry is how it leaves this list.
  */
 
-/* runtime diagnostics and backends (libs/) */
+/* runtime diagnostics, host display and backends (libs/) */
+PS3_CFG_LEGACY_ENV("PS3RECOMP_ENG_BORDER")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_ENG_DEPTH_VIA_GUEST")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_ENG_POLY_OFFSET")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_ENG_RECT_CLEAR")
 PS3_CFG_LEGACY_ENV("PS3RECOMP_ENG_TEXHASH_FULL")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_ENG_USER_CLIP")
 PS3_CFG_LEGACY_ENV("PS3RECOMP_FFMPEG")
 PS3_CFG_LEGACY_ENV("PS3RECOMP_FFMPEG_AVCODEC")
 PS3_CFG_LEGACY_ENV("PS3RECOMP_FFMPEG_AVUTIL")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_FULLSCREEN")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_HOST_SURFACES")
 PS3_CFG_LEGACY_ENV("PS3RECOMP_METAL_FIXED_FUNCTION")
 PS3_CFG_LEGACY_ENV("PS3RECOMP_METAL_FPS")
 PS3_CFG_LEGACY_ENV("PS3RECOMP_METAL_FRAME_DUMP")
@@ -523,7 +530,10 @@ PS3_CFG_LEGACY_ENV("PS3RECOMP_METAL_FRAME_DUMP_RANGE")
 PS3_CFG_LEGACY_ENV("PS3RECOMP_METAL_HEADLESS")
 PS3_CFG_LEGACY_ENV("PS3RECOMP_METAL_MRT_MASK")
 PS3_CFG_LEGACY_ENV("PS3RECOMP_METAL_SHADER_DUMP")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_METAL_WINDOW")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_MSL_CACHE")
 PS3_CFG_LEGACY_ENV("PS3RECOMP_MSL_FAST")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_MSL_INVARIANT")
 PS3_CFG_LEGACY_ENV("PS3RECOMP_RSX_ENGINE")
 PS3_CFG_LEGACY_ENV("PS3RECOMP_SPIRV_CACHE")
 PS3_CFG_LEGACY_ENV("PS3RECOMP_VK_DEVICE")
@@ -534,7 +544,9 @@ PS3_CFG_LEGACY_ENV("PS3RECOMP_VK_DUMP_RANGE")
 PS3_CFG_LEGACY_ENV("PS3RECOMP_VK_FULLSCREEN")
 PS3_CFG_LEGACY_ENV("PS3RECOMP_VK_GUEST_PROGRAMS")
 PS3_CFG_LEGACY_ENV("PS3RECOMP_VK_HOLD")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_VK_MRT_MASK")
 PS3_CFG_LEGACY_ENV("PS3RECOMP_VK_WINDOW")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_WINDOW_STATE")
 /* tool-side (tools/): exported in the same shells that run a title */
 PS3_CFG_LEGACY_ENV("PS3RECOMP_DIR")
 PS3_CFG_LEGACY_ENV("PS3RECOMP_ARCHIVE_ROOT")

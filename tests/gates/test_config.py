@@ -222,6 +222,19 @@ def test_legacy_diagnostic_variables_are_not_typos():
     assert o["ppu.vscr_nj"] == ("true", "default")
 
 
+def test_host_display_and_diagnostic_variables_are_not_typos():
+    # Names the toolkit reads itself but #147 found absent from the legacy list: the gate stops on
+    # any PS3RECOMP_* name it does not know, so PS3RECOMP_FULLSCREEN=1 used to end the run.
+    o = options(probe("get",
+                      PS3RECOMP_FULLSCREEN="1", PS3RECOMP_METAL_WINDOW="1280x720",
+                      PS3RECOMP_WINDOW_STATE="0,0,1280,720,0", PS3RECOMP_HOST_SURFACES="ps3-host",
+                      PS3RECOMP_ENG_BORDER="0", PS3RECOMP_ENG_DEPTH_VIA_GUEST="1",
+                      PS3RECOMP_ENG_POLY_OFFSET="0", PS3RECOMP_ENG_RECT_CLEAR="0",
+                      PS3RECOMP_ENG_USER_CLIP="0", PS3RECOMP_MSL_CACHE="/tmp/msl",
+                      PS3RECOMP_MSL_INVARIANT="0", PS3RECOMP_VK_MRT_MASK="0"))
+    assert o["ppu.vscr_nj"] == ("true", "default")
+
+
 # ---- the effective-config dump ----------------------------------------------
 
 def test_dump_lists_every_key_value_and_source_as_valid_toml():
