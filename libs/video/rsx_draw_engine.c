@@ -68,6 +68,7 @@ static void eng_cap_draw(u32 executed, u32 reason);
 #define ENG_MAX_PIPELINES  8192
 #define ENG_PIPELINE_INDEX 16384u        /* open-addressed key index, 2x the table */
 #define ENG_VP_MEMO        8
+#define ENG_RS_MEMO        32            /* direct-mapped by seed, a power of two */
 #define ENG_MAX_BATCHES    256
 #define ENG_VERT_STRIDE    (RSX_DSP_NUM_VERTEX_ATTR * 16u)
 #define ENG_INVALID        0xFFFFFFFFu
@@ -196,6 +197,14 @@ typedef struct {
     u8 copy[RSX_DSP_VP_INSTR * 16u];
 } eng_vp_memo;
 
+/* rsx_draw_engine_hash_render_state of one render state under one seed, kept
+ * with the exact bytes it was computed from. */
+typedef struct {
+    int used;
+    u64 seed, hash;
+    rsx_be_render_state rs;
+} eng_rs_memo;
+
 typedef struct {
     u32 location, offset, pitch, width, height;
     int valid;
@@ -220,6 +229,7 @@ static struct {
     u16 pipeline_index[ENG_PIPELINE_INDEX];   /* pipelines[] slot + 1, 0 = empty */
     eng_vp_memo vp_memo[ENG_VP_MEMO];
     u32 vp_memo_next;
+    eng_rs_memo rs_memo[ENG_RS_MEMO];
     eng_display_buffer display_buffers[8];
 
     u32 frames;
@@ -234,6 +244,17 @@ static struct {
     u8* tex_staging;
     u32 tex_staging_cap;
     u8* vp_cb;
+    /* vp_cb is the VS constant block the backend is given: the transform
+     * constants, then the viewport epilogue. The constants half is a mirror
+     * of g.rsx.constants as of vp_cb_epoch (rsx.constants_epoch), refreshed
+     * only when that moved, because copying 8 KB per draw for a block that
+     * changes a few vectors a draw was a visible share of the walker.
+     * vp_cb_bound: the backend holds exactly vp_cb's present bytes, so a draw
+     * may ask it to keep them (reuse_vs_constants) instead of staging again;
+     * any edit of vp_cb clears it until the next bind. */
+    u64 vp_cb_epoch;
+    int vp_cb_mirrored;
+    int vp_cb_bound;
     u8* fp_cb;
     u32 fp_cb_cap;
     u32* indices;
@@ -838,6 +859,25 @@ u64 rsx_draw_engine_hash_render_state(const rsx_be_render_state* rs, u64 hash)
     ENG_HASH_FIELD(depth_clamp);
 #undef ENG_HASH_FIELD
     return hash;
+}
+
+/* rsx_draw_engine_hash_render_state for the pipeline lookup, which asks every
+ * draw: the hash is byte-serial (some 140 dependent multiplies) and a draw
+ * usually sits in the state its neighbour left. The result is a pure
+ * function of the struct's bytes and the seed, so a remembered one is exact
+ * whenever both match; a different seed or any changed byte (including the
+ * alpha reference the hash ignores) just recomputes. There is no register
+ * dirty signal to make the hash itself incremental. */
+static u64 eng_render_state_hash(const rsx_be_render_state* rs, u64 seed)
+{
+    eng_rs_memo* e = &g.rs_memo[(u32)((seed ^ (seed >> 32)) * 2654435761u >> 27) & (ENG_RS_MEMO - 1u)];
+    if (e->used && e->seed == seed && !memcmp(&e->rs, rs, sizeof *rs))
+        return e->hash;
+    e->used = 1;
+    e->seed = seed;
+    memcpy(&e->rs, rs, sizeof *rs);   /* not a struct copy: padding must match the compare */
+    e->hash = rsx_draw_engine_hash_render_state(rs, seed);
+    return e->hash;
 }
 
 /* ---- topology expansion -------------------------------------------------- */
@@ -2154,58 +2194,53 @@ static u32 eng_vtex_mask(void)
     return mask;
 }
 
-/* Units addressed in texels (RSX_TEX_FMT_UNNORM), with each one's size in
- * dim. No host sampling mode is unnormalised for these, so the fragment
- * program divides the coordinates instead, and the divisor makes the sizes
- * pipeline identity (rsx_live_draw.c keys them the same way). */
-static u32 eng_unnorm_units(u32 dim[RSX_DSP_NUM_TEXTURES][3])
-{
-    u32 mask = 0;
-    for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
-        rsx_dsp_texture t;
-        rsx_dsp_get_texture(&g.rsx, u, &t);
-        dim[u][0] = dim[u][1] = dim[u][2] = 0;
-        if (!t.enabled || !(t.format & RSX_TEX_FMT_UNNORM) || !t.width || !t.height)
-            continue;
-        mask |= 1u << u;
-        dim[u][0] = t.width;
-        dim[u][1] = t.height;
-        dim[u][2] = t.depth;
-    }
-    return mask;
-}
+/* What the pipeline identity and the program need to know about the sixteen
+ * fragment texture units, read in ONE sweep. Each rsx_dsp_get_texture is a
+ * memset and a dozen register reads, and the masks below used to take a
+ * sweep apiece (cube, volume, unnormalised, gamma, expand), so a draw paid
+ * for them five times over. There is no register-write epoch for the
+ * texture block to cache across draws with, so the sweep stays per lookup;
+ * the registers cannot change inside one. */
+typedef struct {
+    rsx_dsp_texture tex[RSX_DSP_NUM_TEXTURES];
+    u32 cube_mask;
+    u32 volume_mask;
+    /* Units addressed in texels (RSX_TEX_FMT_UNNORM), with each one's size
+     * in unnorm_dim. No host sampling mode is unnormalised for these, so the
+     * fragment program divides the coordinates instead, and the divisor makes
+     * the sizes pipeline identity (rsx_live_draw.c keys them the same way). */
+    u32 unnorm_mask;
+    u32 unnorm_dim[RSX_DSP_NUM_TEXTURES][3];
+} eng_tex_facts;
 
-/* Units bound to a 3D texture (SET_TEXTURE_FORMAT dimension 3 with a
- * depth), declared Texture3D and sampled with three coordinates. Only when
- * the backend can create one: otherwise the first slice stays a 2D texture
- * and the program samples it in 2D, as before. */
-static u32 eng_volume_mask(void)
+static void eng_tex_facts_get(eng_tex_facts* f)
 {
-    if (!g.be->texture_create_3d || !g.be->texture_upload_3d) return 0;
-    u32 mask = 0;
+    /* Units bound to a 3D texture (SET_TEXTURE_FORMAT dimension 3 with a
+     * depth) are declared Texture3D and sampled with three coordinates. Only
+     * when the backend can create one: otherwise the first slice stays a 2D
+     * texture and the program samples it in 2D, as before. */
+    const int volumes = g.be->texture_create_3d && g.be->texture_upload_3d;
+    f->cube_mask = f->volume_mask = f->unnorm_mask = 0;
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
-        rsx_dsp_texture t;
-        rsx_dsp_get_texture(&g.rsx, u, &t);
-        if (t.enabled && !t.cubemap && t.dimension == 3 && t.depth > 1 && t.width && t.height)
-            mask |= 1u << u;
-    }
-    return mask;
-}
-
-static u32 eng_cube_mask(void)
-{
-    u32 mask = 0;
-    for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
-        rsx_dsp_texture t;
-        rsx_dsp_get_texture(&g.rsx, u, &t);
+        const rsx_dsp_texture* t = &f->tex[u];
+        rsx_dsp_get_texture(&g.rsx, u, &f->tex[u]);
+        f->unnorm_dim[u][0] = f->unnorm_dim[u][1] = f->unnorm_dim[u][2] = 0;
+        if (!t->enabled) continue;
         /* A cube face is square by construction, so a non-square image
          * cannot be one; the fragment program is compiled against this mask
          * and a texturecube slot filled with a 2D texture is a validation
          * failure, not a wrong pixel. */
-        if (t.enabled && t.cubemap && t.width && t.width == t.height)
-            mask |= 1u << u;
+        if (t->cubemap && t->width && t->width == t->height)
+            f->cube_mask |= 1u << u;
+        if (volumes && !t->cubemap && t->dimension == 3 && t->depth > 1 && t->width && t->height)
+            f->volume_mask |= 1u << u;
+        if ((t->format & RSX_TEX_FMT_UNNORM) && t->width && t->height) {
+            f->unnorm_mask |= 1u << u;
+            f->unnorm_dim[u][0] = t->width;
+            f->unnorm_dim[u][1] = t->height;
+            f->unnorm_dim[u][2] = t->depth;
+        }
     }
-    return mask;
 }
 
 /* Are both of the guest's own programs resident? One answer, used by the
@@ -2475,7 +2510,9 @@ static void eng_depth_bounds_prepare(u32 zslot, const rsx_be_render_state* rs)
     if (!eng_guest_programs(&vp_uc, &vp_instrs, &fp_uc, &fp_size)) return;
     /* A unit the program neither samples nor has declared as a cube or a
      * volume (rsx_fp_apply_depth_bounds reads it as a Texture2D). */
-    const u32 busy = rsx_fp_texture_units(fp_uc, fp_size) | eng_cube_mask() | eng_volume_mask();
+    eng_tex_facts tf;
+    eng_tex_facts_get(&tf);
+    const u32 busy = rsx_fp_texture_units(fp_uc, fp_size) | tf.cube_mask | tf.volume_mask;
     int unit = -1;
     for (int u = RSX_BE_MAX_TEXTURES - 1; u >= 0 && unit < 0; u--)
         if (!((busy >> u) & 1u)) unit = u;
@@ -2515,8 +2552,10 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     const u32 srgb_output = !fixed && rsx_fp_srgb_output_enabled(
         rsx_dsp_reg(&g.rsx, 0x1FECu), fp_ctrl,
         rsx_dsp_reg(&g.rsx, 0x0208u) & 0x1Fu);
-    const u32 cube_mask = eng_cube_mask();
-    const u32 vol_mask = eng_volume_mask();
+    eng_tex_facts tf;
+    eng_tex_facts_get(&tf);
+    const u32 cube_mask = tf.cube_mask;
+    const u32 vol_mask = tf.volume_mask;
     const u32 vtex_mask = eng_vtex_mask();
     /* BRB/CLB outcomes are baked into the program: the branch bits are
      * identity only for a program that tests them. */
@@ -2530,16 +2569,15 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     const u32 sampled_units = fixed ? 0 : rsx_fp_texture_units(fp_uc, fp_size);
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
         if (!(sampled_units & (1u << u))) continue;
-        rsx_dsp_texture t;
-        rsx_dsp_get_texture(&g.rsx, u, &t);
-        rsx_fp_shadow_desc_from_texture(&shadow[u], t.format, t.dimension,
-            t.cubemap, t.mipmaps, t.filter, t.wrap, t.control0);
+        const rsx_dsp_texture* t = &tf.tex[u];
+        rsx_fp_shadow_desc_from_texture(&shadow[u], t->format, t->dimension,
+            t->cubemap, t->mipmaps, t->filter, t->wrap, t->control0);
         if (shadow[u].enabled) shadow_mask |= 1u << u;
     }
     u8 gamma_masks[RSX_DSP_NUM_TEXTURES] = {0};
     if (!fixed) for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; ++u) {
-        rsx_dsp_texture t; rsx_dsp_get_texture(&g.rsx, u, &t);
-        if (t.enabled) gamma_masks[u] = rsx_texture_gamma_mask(t.format, t.remap, t.filter, t.wrap);
+        const rsx_dsp_texture* t = &tf.tex[u];
+        if (t->enabled) gamma_masks[u] = rsx_texture_gamma_mask(t->format, t->remap, t->filter, t->wrap);
     }
     const u32 gamma_units = fixed ? 0 : rsx_fp_texture_gamma_units(fp_uc, fp_size, gamma_masks);
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; ++u)
@@ -2549,17 +2587,18 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
      * gamma: only units the program samples count. */
     u8 expand_masks[RSX_DSP_NUM_TEXTURES] = {0};
     if (!fixed) for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; ++u) {
-        rsx_dsp_texture t; rsx_dsp_get_texture(&g.rsx, u, &t);
-        if (t.enabled) expand_masks[u] = rsx_texture_expand_mask(t.format, t.remap, t.filter, t.wrap);
+        const rsx_dsp_texture* t = &tf.tex[u];
+        if (t->enabled) expand_masks[u] = rsx_texture_expand_mask(t->format, t->remap, t->filter, t->wrap);
     }
     const u32 expand_units = fixed ? 0 : rsx_fp_texture_expand_units(fp_uc, fp_size, expand_masks);
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; ++u)
         if (!(expand_units & (1u << u))) expand_masks[u] = 0;
 
     u32 unnorm_dim[RSX_DSP_NUM_TEXTURES][3];
+    memcpy(unnorm_dim, tf.unnorm_dim, sizeof unnorm_dim);
     /* Shadow helpers normalize against the bound resource themselves. Only
      * sampled ordinary UN units need baked dimensions or cache identity. */
-    const u32 unnorm_mask = eng_unnorm_units(unnorm_dim) &
+    const u32 unnorm_mask = tf.unnorm_mask &
         (fixed ? 0xFFFFu : sampled_units) & ~shadow_mask;
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++)
         if (!(unnorm_mask & (1u << u)))
@@ -2614,7 +2653,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     /* How many colour attachments the pass will have is pipeline identity:
      * a host API matches the two against each other. */
     key = eng_fnv1a(&rt_count, sizeof rt_count, key);
-    key = rsx_draw_engine_hash_render_state(rs, key);
+    key = eng_render_state_hash(rs, key);
 
     u32 slot = eng_pipeline_slot(key);
     for (; g.pipeline_index[slot]; slot = (slot + 1u) & (ENG_PIPELINE_INDEX - 1u)) {
@@ -3840,8 +3879,20 @@ static void sink_end(void* user, const rsx_dispatch* r)
         xf[5] = -((vp.translate[1] - Hv * 0.5f) / (Hv * 0.5f));
         xf[6] = vp.translate[2];
     }
-    memcpy(g.vp_cb, g.rsx.constants, RSX_DSP_NUM_CONSTANTS * 16u);
-    memcpy(g.vp_cb + RSX_DSP_NUM_CONSTANTS * 16u, xf, sizeof xf);
+    /* Bytes the backend is given for this draw: only what changed since the
+     * last draw is rewritten, and a draw that changed nothing is not staged
+     * again. The viewport epilogue is compared bit for bit (a float compare
+     * would call -0 and 0 equal and the GPU would see the other sign). */
+    if (!g.vp_cb_mirrored || g.vp_cb_epoch != g.rsx.constants_epoch) {
+        memcpy(g.vp_cb, g.rsx.constants, RSX_DSP_NUM_CONSTANTS * 16u);
+        g.vp_cb_epoch = g.rsx.constants_epoch;
+        g.vp_cb_mirrored = 1;
+        g.vp_cb_bound = 0;
+    }
+    if (memcmp(g.vp_cb + RSX_DSP_NUM_CONSTANTS * 16u, xf, sizeof xf)) {
+        memcpy(g.vp_cb + RSX_DSP_NUM_CONSTANTS * 16u, xf, sizeof xf);
+        g.vp_cb_bound = 0;
+    }
 
     /* The buffered fragment constants, then fp_alpha: the layout
      * rsx_fp_decompile_buffered_ex compiled the shader against. */
@@ -3885,7 +3936,13 @@ static void sink_end(void* user, const rsx_dispatch* r)
     for (u32 i = 0; i < n_targets; i++) handles[i] = g.surfaces[targets[i]].handle;
     g.be->bind_targets(g.be->user, handles, n_targets, depth_handle);
     g.be->bind_pipeline(g.be->user, pipeline);
-    g.be->bind_vs_constants(g.be->user, g.vp_cb, ENG_VP_CB_BYTES);
+    /* Cleared when vp_cb was edited above even if this draw was dropped
+     * before reaching here, so the next draw cannot reuse a stale binding. */
+    if (!g.vp_cb_bound || !g.be->reuse_vs_constants ||
+        !g.be->reuse_vs_constants(g.be->user)) {
+        g.be->bind_vs_constants(g.be->user, g.vp_cb, ENG_VP_CB_BYTES);
+        g.vp_cb_bound = 1;
+    }
     g.be->bind_ps_constants(g.be->user, g.fp_cb, fp_bytes);
     g.be->bind_textures(g.be->user, textures, samplers, tex_mask);
     g.be->bind_vertex_textures(g.be->user, vtextures, vsamplers, vtex_mask);
@@ -4298,6 +4355,7 @@ static void sink_driver_unmodelled(void* user, const rsx_dispatch* r, u32 method
 void rsx_draw_engine_set_backend(const rsx_draw_backend* backend)
 {
     g.be = backend;
+    g.vp_cb_bound = 0;   /* the new backend holds nothing of the last one's */
     /* Not at init: a backend that ends up on a route without the engine (the Metal vtable route, after an
      * engine that did not start or was not asked for) must still know what rsx.bc_path says, to refuse a
      * forced mode it cannot honour. */
@@ -4357,6 +4415,8 @@ int rsx_draw_engine_init(u32 width, u32 height)
     sink.flip             = sink_flip;
     sink.driver_unmodelled = sink_driver_unmodelled;
     rsx_dispatch_init(&g.rsx, &sink);
+    g.vp_cb_mirrored = 0;   /* a fresh dispatcher restarts its epoch at 0 */
+    g.vp_cb_bound = 0;
     g.ready = 1;
     /* A fresh engine starts at zero: the counters describe this run, not the
      * process. */

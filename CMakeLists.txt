@@ -2489,7 +2489,7 @@ if(UNIX)
     # includes the engine and the backend and drives them with synthetic
     # method words (#62, #64). Skips (77) without a Metal device.
     if(APPLE AND PS3RECOMP_MSL_TRANSLATION)
-        foreach(gpu_test back_stencil window invalidate_l2 init_gate)
+        foreach(gpu_test back_stencil window invalidate_l2 init_gate vs_reuse)
             add_executable(test_metal_${gpu_test}
                 libs/video/tests/test_metal_${gpu_test}.m
                 libs/video/rsx_shader_msl.cpp
@@ -2628,11 +2628,12 @@ if(UNIX)
     endif()
 
     # The register-file draw engine's accounting and dump naming (M3 gaps
-    # 3a-3e, 3g). Driven through rsx_draw_engine_method() against a recording
-    # stub backend: no GPU, no host API, no game content. Same source set the
-    # CI workflows compile ad hoc.
+    # 3a-3e, 3g), the fragment texture state's part in the pipeline identity,
+    # and the vertex constant block each draw reads. Driven through
+    # rsx_draw_engine_method() against a recording stub backend: no GPU, no
+    # host API, no game content. Same source set the CI workflows compile ad hoc.
     foreach(engine_test test_rsx_draw_accounting test_rsx_draw_dump_names test_rsx_present_once
-                        test_rsx_present_span)
+                        test_rsx_present_span test_engine_texture_facts test_engine_vs_constants)
         add_executable(${engine_test}
             libs/video/tests/${engine_test}.c
             libs/video/rsx_draw_engine.c

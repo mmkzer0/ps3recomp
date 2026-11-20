@@ -2888,6 +2888,15 @@ static u64 s_eng_bc_settle_ns, s_eng_bc_settle_max_ns;
 
 static u8* s_eng_stage;
 static u32 s_eng_stage_used, s_eng_stage_cap;
+/* Where the last bind_vs_constants block sits in the arena being recorded
+ * into (0 bytes: nowhere). The engine asks eng_reuse_vs_constants when the
+ * next draw's block is byte-identical, and that points the draw at this copy
+ * instead of staging 8 KB again. An offset names bytes only in the arena it
+ * was written to, and the arena's contents are not rewritten while it is
+ * being filled (a grow keeps them at their offsets), so the entry is good
+ * exactly until the arena is handed to a command buffer or restarted:
+ * eng_stage_hand_off, the reset at the end of a commit, and shutdown clear it. */
+static u32 s_eng_vs_stage_off, s_eng_vs_stage_bytes;
 /* The staging arena is the contents of a shared MTLBuffer, handed to the
  * command buffer that reads it instead of being copied into a new one at
  * every commit. A committed arena goes back to this pool when the GPU has
@@ -3568,6 +3577,7 @@ static void eng_stage_hand_off(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
     s_eng_stage_buf = nil;
     s_eng_stage = NULL;
     s_eng_stage_cap = 0;
+    s_eng_vs_stage_bytes = 0;
 }
 
 static int eng_stage_reserve(u32 bytes, u32* out_off)
@@ -3676,6 +3686,7 @@ static void eng_shutdown(void* user)
     s_eng_rec_count = 0;
     s_eng_stage_buf = nil; s_eng_stage = NULL;
     s_eng_stage_used = s_eng_stage_cap = 0;
+    s_eng_vs_stage_bytes = 0;
     pthread_mutex_lock(&s_eng_stage_pool_lock);
     [s_eng_stage_pool removeAllObjects];
     pthread_mutex_unlock(&s_eng_stage_pool_lock);
@@ -4609,6 +4620,19 @@ static void eng_bind_vs_constants(void* user, const void* data, u32 bytes)
     (void)user;
     if (!eng_stage_copy(data, bytes, &s_eng_pending.vs_cb_off)) bytes = 0;
     s_eng_pending.vs_cb_bytes = bytes;
+    /* Remembered after the copy: a copy that rolled the arena over has
+     * cleared the old entry and this one is in the new arena. */
+    s_eng_vs_stage_off = s_eng_pending.vs_cb_off;
+    s_eng_vs_stage_bytes = bytes;
+}
+
+static int eng_reuse_vs_constants(void* user)
+{
+    (void)user;
+    if (!s_eng_vs_stage_bytes) return 0;
+    s_eng_pending.vs_cb_off = s_eng_vs_stage_off;
+    s_eng_pending.vs_cb_bytes = s_eng_vs_stage_bytes;
+    return 1;
 }
 
 static void eng_bind_ps_constants(void* user, const void* data, u32 bytes)
@@ -5624,6 +5648,7 @@ static void eng_encode_and_commit_section(id<MTLTexture> present_dst)
         s_eng_rec_count  = 0;
         s_eng_commit_serial++;   /* a texture created before this commit is no longer fresh (eng_bc_pick_tier) */
         s_eng_stage_used = 0;
+        s_eng_vs_stage_bytes = 0;
         eng_collect_retired_objects();
     }
 }
@@ -5937,6 +5962,7 @@ static const rsx_draw_backend s_engine_backend = {
     .bind_targets         = eng_bind_targets,
     .bind_pipeline        = eng_bind_pipeline,
     .bind_vs_constants    = eng_bind_vs_constants,
+    .reuse_vs_constants   = eng_reuse_vs_constants,
     .bind_ps_constants    = eng_bind_ps_constants,
     .bind_textures        = eng_bind_textures,
     .bind_vertex_textures = eng_bind_vertex_textures,
