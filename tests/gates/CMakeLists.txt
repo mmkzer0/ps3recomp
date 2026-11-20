@@ -48,6 +48,11 @@ gates_py_test(sha256 runtime test_sha256.py $<TARGET_FILE:probe_sha256>)
 gates_probe(probe_config probe_config.cpp)
 gates_py_test(config "config;tsan" test_config.py $<TARGET_FILE:probe_config>)
 
+# Every PS3RECOMP_* literal the runtime or a library reads must be a typed option or in the
+# legacy list, or setting it ends the run as config-invalid (toolkit #147). Source-only, so it
+# needs no probe; the neighbours' "config;t0" labels are set by gates_py_test.
+gates_py_test(env_names config test_env_names.py "${PROJECT_SOURCE_DIR}")
+
 # The lifted-code ABI gate: the runtime's check against a lift stamped with its
 # ABI (runs), with another (stops lifter-abi), and with no stamp at all (link
 # error). One source, two stamps; the driver also builds the unstamped pair.
