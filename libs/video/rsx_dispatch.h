@@ -151,6 +151,11 @@ struct rsx_dispatch {
     u32 regs[RSX_DSP_NUM_REGS];       /* register file: regs[method >> 2]   */
     u32 vp[RSX_DSP_VP_WORDS];         /* transform (vertex) program words   */
     u32 constants[RSX_DSP_NUM_CONSTANTS][4]; /* vec4 f32 bit patterns       */
+    /* Advances on every write into constants[] (the upload window and the
+     * seeding call), the only two. A consumer that mirrors the block keeps the
+     * value it last copied at and skips the copy while it is unchanged.
+     * A direct store into constants[] bypasses it. */
+    u64 constants_epoch;
 
     rsx_dispatch_sink sink;
 

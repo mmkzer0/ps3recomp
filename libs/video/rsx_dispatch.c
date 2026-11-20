@@ -349,6 +349,7 @@ void rsx_dispatch_seed_transform_constants(rsx_dispatch* rsx, const u32* words, 
     if (count > max_words)
         count = max_words;
     memcpy(rsx->constants, words, count * sizeof(u32));
+    rsx->constants_epoch++;
 }
 
 /* Every NV4097_SET_VERTEX_DATA* variant writes the same constant ("current")
@@ -462,8 +463,12 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
     if (method >= M_VP_UPLOAD_CONST && method < M_VP_UPLOAD_CONST + 32 * 4) {
         const u32 word = (method - M_VP_UPLOAD_CONST) >> 2;
         const u32 slot = rsx->regs[M_VP_UPLOAD_CONST_ID >> 2] + (word >> 2);
-        if (slot < RSX_DSP_NUM_CONSTANTS)
+        /* The epoch moves only for a write that lands: one that lands nowhere
+         * changes nothing a mirror holds. */
+        if (slot < RSX_DSP_NUM_CONSTANTS) {
             rsx->constants[slot][word & 3] = arg;
+            rsx->constants_epoch++;
+        }
         /* RSX_CONST_LOG=<lo>,<hi>: every transform-constant upload into that
          * slot range (first 400) -- what a shader's constants really were. */
         { static int lo = -2, hi = 0, n = 0;

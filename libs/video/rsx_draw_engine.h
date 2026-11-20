@@ -204,6 +204,14 @@ typedef struct rsx_draw_backend {
     void (*bind_targets)(void* user, const u32* surfaces, u32 count, u32 depth);
     void (*bind_pipeline)(void* user, u32 pipeline);
     void (*bind_vs_constants)(void* user, const void* data, u32 bytes);
+    /* Optional. Asks the backend to keep the block the last bind_vs_constants
+     * was given for the next draw: the engine calls it instead of binding
+     * again when it knows the bytes are identical to that call's. The backend
+     * returns nonzero only if it still holds that copy where the draw can read
+     * it (a per-commit staging arena has not been recycled since), and the
+     * binding is then in force as if it had been bound again. Zero means it
+     * does not, and the engine binds the block as usual. NULL: always bind. */
+    int  (*reuse_vs_constants)(void* user);
     void (*bind_ps_constants)(void* user, const void* data, u32 bytes);
     void (*bind_textures)(void* user, const u32* textures,
                           const rsx_be_sampler_desc* samplers, u32 mask);
