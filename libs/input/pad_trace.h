@@ -30,16 +30,18 @@
  * over the records a poll landed on, i.e. the guest-time drift the key absorbs.
  *
  * Only a change is written (the first poll of a port, then whenever len or the
- * words differ), so a trace is a list of presses and releases that can be read
- * and diffed. A draining title (poll until len == 0) records the len = 0 polls
- * too, so a replay hands back its exact len sequence. The connection the
+ * words differ). `len` is part of the state, so a draining title writes about
+ * two records per fresh packet -- the packet (len > 0) and the poll that read
+ * len 0 -- and its exact len sequence replays. The connection the
  * cellPadGetInfo/GetInfo2/PeriphGetInfo calls report is keyed the same way, on
  * the info-call ordinal.
  *
  * Replay is state-based: poll n of a port is answered with the latest record of
  * that port whose seq is <= n. The host pad and the injectors play no part in
- * what the guest sees. Past the end record's poll count the pad is neutral; a
- * killed run has no end record and keeps serving the last record.
+ * what the guest sees. The end record holds each port's poll count; a poll
+ * whose ordinal reaches its own port's count is past the recording and the pad
+ * is neutral. A killed run has no end record, keeps serving the last record of
+ * each port, and says so once at replay start.
  *
  * The module is self-contained: it depends on stop.h and the C library. The
  * flip clock comes in through PadTraceOptions, and cellPad.c does the config
@@ -153,8 +155,8 @@ void pad_trace_destroy(PadTrace* t);   /* close, then free */
 /* Replay bookkeeping. `reached_exactly` counts the records whose seq a poll
  * landed on; `flip_drift` is the smallest and largest (served flip - recorded
  * flip) over those records, the guest-time drift the ordinal key absorbs and
- * cannot remove. `end_seq` is the end record's poll count (0 when the run was
- * killed and the file has none). */
+ * cannot remove. `end_seq` is the end record's per-port poll counts; a killed
+ * run has no end record (`have_end` 0) and every entry stays 0. */
 typedef struct PadTraceStats {
     uint64_t polls;            /* replayed polls */
     uint64_t exact;            /* polls whose ordinal has a record of its own */
@@ -164,8 +166,9 @@ typedef struct PadTraceStats {
     int      have_drift;       /* a record was reached, so the drift is known */
     int64_t  drift_min;
     int64_t  drift_max;
-    uint64_t end_seq;          /* the end record's poll count, 0 without one */
-    int      ended;            /* a poll has gone past it */
+    int      have_end;         /* the file has an end record */
+    uint64_t end_seq[PAD_TRACE_MAX_PORTS];   /* each port's poll count */
+    int      ended;            /* a poll has gone past its port's count */
 } PadTraceStats;
 
 void pad_trace_stats(PadTrace* t, PadTraceStats* out);

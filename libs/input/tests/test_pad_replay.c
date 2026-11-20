@@ -122,7 +122,7 @@ static void case_replay(const char* path)
             "{\"seq\":1,\"port\":0,\"len\":0,\"words\":[0,116,0,32,128,128,128,128],\"flip\":2}\n"
             "{\"seq\":2,\"port\":0,\"len\":8,\"words\":[0,116,0,0,128,128,128,128],\"flip\":4}\n"
             "{\"seq\":3,\"port\":0,\"len\":0,\"words\":[0,116,0,0,128,128,128,128],\"flip\":4}\n"
-            "{\"end\":true,\"seq\":4}\n");
+            "{\"end\":true,\"seq\":[4,0,0,0,0,0,0]}\n");
     snprintf(g_cfg.pad_replay, sizeof g_cfg.pad_replay, "%s", path);
     start();
     s_sdl_controllers[0] = (SDL_GameController*)&device;
@@ -164,7 +164,7 @@ static void case_replay_info(const char* path)
             "{\"format\":\"ps3recomp-pad-trace\",\"version\":3,\"clock\":\"guest-polls\",\"ports\":7}\n"
             "{\"info\":0,\"conn\":[1,1,0,0,0,0,0]}\n"
             "{\"info\":2,\"conn\":[1,0,0,0,0,0,0]}\n"
-            "{\"end\":true,\"seq\":0}\n");
+            "{\"end\":true,\"seq\":[0,0,0,0,0,0,0]}\n");
     snprintf(g_cfg.pad_replay, sizeof g_cfg.pad_replay, "%s", path);
     start();
 
@@ -257,7 +257,7 @@ static void case_record(const char* path)
           "the first record is the guest's words and len, injectors included");
     CHECK(count_sub(text, "\"len\":0") > 0, "the drained polls are recorded with len 0");
     CHECK(count_sub(text, "\"polls\":") == 0, "no per-flip poll counts in version 3");
-    CHECK(strstr(text, "{\"end\":true,\"seq\":48}") != NULL, "the end record is port 0's poll count");
+    CHECK(strstr(text, "{\"end\":true,\"seq\":[48,0,0,0,0,0,0]}") != NULL, "the end record holds each port's poll count");
     CHECK(strstr(text, "\"info\":0,\"conn\":[1,0,0,0,0,0,0]") != NULL, "GetInfo's connection is recorded, by call ordinal");
 
     /* The recording replays to the len and words the guest read, poll for poll: the same drain loops. */

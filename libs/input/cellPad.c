@@ -172,11 +172,11 @@ _Static_assert(CELL_PAD_MAX_PORT_NUM == PAD_TRACE_MAX_PORTS, "pad trace ports fo
 static PadTrace* s_trace;   /* published by cellPadInit; NULL when neither option is set */
 static int s_replay_conn[CELL_PAD_MAX_PORT_NUM];   /* 0 unseen, 1 off, 2 on: what GetInfo last said */
 
-/* The trace's clock: cellGcmSys.c counts guest flip requests at the request, in guest program order. The
- * count above (PAD_CLOCK=flips) is the present loop's frame boundary, and for an in-FIFO flip it moves
- * only when the RSX drain reaches the marker, so a trace keyed on it followed the walker's pace
- * (pad_trace.h). PAD_CLOCK=flips keeps that boundary: it schedules input against the frames the title
- * put on screen. */
+/* The trace's flip annotation and drift source: cellGcmSys.c counts guest flip requests at the request,
+ * in guest program order. The trace keys on the port's poll ordinal (pad_trace.h); the flip count is
+ * recorded per poll only so the replay summary can report how far the guest clock moved (flip_drift).
+ * PAD_CLOCK=flips still counts the present loop's frame boundary (cellGcm_flip_request_count above): it
+ * schedules input against the frames the title put on screen. */
 extern u32 cellGcm_guest_flip_count(void);
 
 static PadTrace* pad_trace_get(void) { return __atomic_load_n(&s_trace, __ATOMIC_ACQUIRE); }

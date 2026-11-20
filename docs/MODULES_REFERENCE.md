@@ -296,20 +296,26 @@ tick to catch up wall time, so how many polls happen inside one guest flip depen
 `(flip, poll)`, and a one-step press recorded at `(F,0)->(F+1,0)` became a two-step press when a replay took a
 catch-up tick where the recording did not; version 1 keyed on the RSX walker's flip count, further from the
 guest. The flip at each record is kept as an annotation (`flip`), never as a key. A record is written for the first
-poll of each port and then whenever `len` or the words differ from the port's last record, so a trace is a list of
-presses and releases that can be read and diffed. `cellPadGetInfo`, `GetInfo2` and `PeriphGetInfo` are recorded as
-the connection they reported, keyed by the info call's ordinal, when it changes. The writer flushes within 100 ms of
-a record, at `cellPadEnd` and at exit (`atexit` and `at_quick_exit`, because a guest exit leaves through
-`quick_exit`), always at a line boundary, so a killed run loses only the last interval.
+poll of each port and then whenever `len` or the words differ from the port's last record. `len` is part of the
+state, so a draining title writes about two records per fresh packet (the packet, then the poll that read `len` 0)
+and its exact len sequence replays; the trace is a list of input changes and len transitions that can be read and
+diffed. `cellPadGetInfo`, `GetInfo2` and `PeriphGetInfo` are recorded as the connection they reported, keyed by the
+info call's ordinal, when it changes. The writer flushes within 100 ms of a record, at `cellPadEnd` and at exit
+(`atexit` and `at_quick_exit`, because a guest exit leaves through `quick_exit`), always at a line boundary, so a
+killed run loses only the last interval.
 
 **Replay.** The host pad and every injector are ignored. Poll n of a port is answered with the latest record of
 that port whose `seq` is at or before n; before the port's first record the answer is a neutral pad (port 0: the
 connected virtual pad with centred sticks, any other port: no device). There is no freshness rule to apply: the
 recorded `len` is the guest's `len`, so a draining title's loop ends on exactly the poll it ended on while
 recording. The info calls report the recorded connection at or before their own ordinal (port 0 only until the
-trace says more) and flag a change with `CELL_PAD_STATUS_ASSIGN_CHANGES` once. A poll whose ordinal reaches the end
-record's poll count is past the recording and gets a neutral pad, and the end of the trace is logged once with the
-divergence summary; a killed run has no end record and keeps serving the last record.
+trace says more) and flag a change with `CELL_PAD_STATUS_ASSIGN_CHANGES` once. The end record holds one poll count
+per port: a poll whose ordinal reaches its own port's count is past the recording and gets a neutral pad, and the
+end of the trace is logged once with the divergence summary. A port polled more or less often than port 0 is
+bounded by its own count, not port 0's. A killed run has no end record; every record in it is reachable and was
+really served, so opening it prints `the trace has no end record; the last state of each port is held` once and the
+replay keeps serving each port's last record (refusing would throw away a whole recording for a kill the recorder
+is built to survive).
 
 **Divergence.** The summary (at the end of the trace and again at exit) is
 `polls=.. exact=.. held=.. recorded_changes=.. reached_exactly=.. flip_drift=<min>:<max>|none`. It counts the polls
@@ -329,22 +335,23 @@ anything else is refused.
 {"format":"ps3recomp-pad-trace","version":3,"clock":"guest-polls","ports":7}   header, line 1
 {"seq":340,"port":0,"len":8,"words":[0,116,0,64,128,128,128,128],"flip":12}    what poll 340 of port 0 was handed
 {"info":7,"conn":[1,0,0,0,0,0,0]}                              ports the 8th info call reported connected
-{"end":true,"seq":1024}                                       last line: port 0's poll count
+{"end":true,"seq":[1024,0,0,0,0,0,0]}                         last line: each port's poll count
 ```
 
 `words` is `CellPadData.button` up to its last non-zero word. A state record holds until the next record of its
-port; only a change is written. The end record's `seq` is the recording's length in polls, and a killed run has
-none.
+port; only a change is written. The end record's `seq` has one count per port the header declares: it is the
+recording's length in polls per port, and a killed run has none.
 
 **Fail closed.** `seq` strictly increases per port and `info` strictly increases. A malformed header, a header
-without `clock` or with another clock, a version other than 3, a malformed or truncated line, an unknown or
-repeated key, a state record without `seq` or without `flip`, a connection record without `info`, keys that go
-backwards, a port the header does not declare or a line after the end record is the `pad-trace` stop (`role`,
-`path`, `line`, `reason`; `docs/STOPS.md`), raised when `cellPadInit` opens the file and not later. Version-1 and
-version-2 files are refused with `reason=version` and a detail saying so: their keys came from a flip clock that
-cannot be re-derived, so the run has to be recorded again. A record file that cannot be written is refused the
-same way. The config checks an existing record path, an unwritable directory and an unreadable replay file at
-load (`config-invalid`).
+without `clock` or with another clock, a version other than 3, a malformed, truncated or NUL-carrying line, an
+unknown or repeated key, a state record without `seq` or without `flip` (or with `seq` as an array), a connection
+record without `info`, an end record without the per-port count array or with the wrong number of counts, a state
+record at or past its port's end count (a replay could never serve it), keys that go backwards, a port the header
+does not declare or a line after the end record is the `pad-trace` stop (`role`, `path`, `line`, `reason`;
+`docs/STOPS.md`), raised when `cellPadInit` opens the file and not later. Version-1 and version-2 files are refused
+with `reason=version` and a detail saying so: their keys came from a flip clock that cannot be re-derived, so the
+run has to be recorded again. A record file that cannot be written is refused the same way. The config checks an
+existing record path, an unwritable directory and an unreadable replay file at load (`config-invalid`).
 
 **Not covered.** The sensor and pressure words are recorded as they are, and replay assumes the title sets the same
 port settings as in the recording. The other pad calls (`cellPadSetActDirect`, `cellPadClearBuf`,
