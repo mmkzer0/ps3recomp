@@ -229,6 +229,20 @@ def main():
                     (on / n).read_bytes() == (off / n).read_bytes() for n in dumps(off))
                 check(same and "VkResult" not in out,
                       f"{name}, kick from {lo} on an idle GPU up to {hi}: frames are byte-identical to batching off")
+
+        # ---- the bench's per-draw CPU cost (--draws=N:S:W) hands each draw to the walker at once and changes no pixel
+        # of the steady frames (the first present of this host's frame loop depends on where the walker first meets
+        # the ring, with or without a cost, so the last present is the one compared)
+        for work in ("0", "20"):
+            d = fresh("work")
+            rc, out = run(host, d, "--draws=100:16:" + work, "--frames=4", PS3RECOMP_VK_DUMP=str(d / "f"),
+                          PS3RECOMP_VK_DUMP_RANGE="0-9", PS3RECOMP_VK_DRAW_BATCH="1")
+            ref = fresh("work-ref")
+            run(host, ref, "--draws=100:16", "--frames=4", PS3RECOMP_VK_DUMP=str(ref / "f"),
+                PS3RECOMP_VK_DUMP_RANGE="0-9", PS3RECOMP_VK_DRAW_BATCH="1")
+            same = len(dumps(d)) >= 3 and len(dumps(ref)) >= 3 and \
+                (d / dumps(d)[-1]).read_bytes() == (ref / dumps(ref)[-1]).read_bytes()
+            check(same, f"--draws=100:16:{work}: the last frame is the one without a per-draw CPU cost")
     print(f"failed {FAILED}" if FAILED else "all checks passed")
     return 1 if FAILED else 0
 
