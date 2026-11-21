@@ -179,6 +179,8 @@ typedef struct vk_image {
 
 #define VK_SAMPLER_CACHE 32
 #define VK_PIPELINE_SLOTS (2 * 2 * 8)   /* ztest x zwrite x compare op */
+/* vk.draw_batch: batches in flight at once (see "Draw batching"). */
+#define VK_EB_SLOTS 2u
 
 typedef struct vk_state {
     vk_lib_handle    lib;
@@ -228,8 +230,11 @@ typedef struct vk_state {
 
     vk_buffer        readback;
     VkCommandPool    pool;
-    VkCommandBuffer  cmd;
-    VkFence          fence;
+    VkCommandBuffer  cmd;             /* the buffer being recorded: cmd_sync, or a batch slot's */
+    VkCommandBuffer  cmd_sync;        /* one-shot work, submitted and waited for at once */
+    VkFence          fence;           /* ... and its fence */
+    VkCommandBuffer  batch_cmd[VK_EB_SLOTS];   /* draw batches, submitted without a wait */
+    VkFence          batch_fence[VK_EB_SLOTS];
 
     /* A present records and submits on its own pool, command buffer and
      * fences, so its second half can run on a host thread of its own while
@@ -711,22 +716,29 @@ static int vk_create_image(vk_image* im, VkFormat fmt, u32 w, u32 h,
 
 static void vk_present_wait_gpu(void);
 
-/* vk.draw_batch (vk_eng_draw): draws recorded into s_vk.cmd and not yet
- * submitted. Anything that records other work, destroys an object or reads
- * results flushes them first, so everything else keeps the invariant that
- * all earlier work has completed. */
+/* vk.draw_batch (vk_eng_draw): draws recorded into the open batch's command
+ * buffer (s_eb_pending of them) and batches already submitted that the GPU
+ * may still be running (s_eb_inflight). Work that only has to run after them
+ * is ordered by a barrier in its own command buffer and merely kicks the open
+ * batch; whatever destroys an object a batch may use, or reads results on the
+ * CPU, flushes: submits the open batch and waits for every submitted one. */
 static u32 s_eb_pending;
-static int vk_eng_flush(void);
+static u32 s_eb_inflight;
+#define VK_EB_BUSY() (s_eb_pending || s_eb_inflight)
+static int vk_eng_flush(void);       /* submit the open batch and wait until the GPU is done with all */
+static int vk_eng_kick(void);        /* submit the open batch, no wait */
 static int vk_eb_active(void);       /* batching decided on and on */
 static u32 vk_eb_max(void);
 static void vk_eb_recorded(void);   /* one more command in the open batch */
+static int vk_eb_begin(void);       /* open the next slot's command buffer: a batch's first operation */
+static void vk_eb_device_idled(void);   /* vkDeviceWaitIdle returned: no batch is in flight */
 static void vk_eb_release(void);    /* engine shutdown: rings and pool */
 static int vk_eb_upload(VkImage img, VkBufferImageCopy* region, const void* src, size_t tight,
                         u32 rows, u32 row_bytes);   /* -2: not batched, do it the old way */
 
 static void vk_destroy_image(vk_image* im)
 {
-    if (s_eb_pending) vk_eng_flush();
+    if (VK_EB_BUSY()) vk_eng_flush();
     /* Never under a present's copy that may still read it. */
     if (im->img) vk_present_wait_gpu();
     if (im->view) pvkDestroyImageView(s_vk.device, im->view, NULL);
@@ -789,7 +801,7 @@ static int vk_create_device_buffer(vk_buffer* b, VkDeviceSize size, VkBufferUsag
 
 static void vk_destroy_buffer(vk_buffer* b)
 {
-    if (s_eb_pending) vk_eng_flush();
+    if (VK_EB_BUSY()) vk_eng_flush();
     if (b->ptr) pvkUnmapMemory(s_vk.device, b->mem);
     if (b->buf) pvkDestroyBuffer(s_vk.device, b->buf, NULL);
     if (b->mem) pvkFreeMemory(s_vk.device, b->mem, NULL);
@@ -840,6 +852,7 @@ static int vk_device_idle(void)
         return -1;
     }
     atomic_store_explicit(&s_eng_submission_pending, 0, memory_order_release);
+    vk_eb_device_idled();
     return 0;
 }
 
@@ -862,31 +875,45 @@ static int vk_engine_check_result(VkResult r, const char* what)
     return -1;
 }
 
+/* Reset and begin `cb`. */
+static int vk_cmd_begin(VkCommandBuffer cb)
+{
+    if (vk_engine_check_result(pvkResetCommandBuffer(cb, 0), "vkResetCommandBuffer")) return -1;
+    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    if (vk_engine_check_result(pvkBeginCommandBuffer(cb, &bi), "vkBeginCommandBuffer")) return -1;
+    /* A present's copy may still be reading the surface this frame is about
+     * to draw over: order everything here after it. Set only by a present,
+     * which never runs alongside the walker's recording. */
+    if (s_vk.present_order) { vk_cmd_after_everything(cb); s_vk.present_order = 0; }
+    return 0;
+}
+
+/* One-shot work: records into cmd_sync, which vk_submit_and_wait submits. */
 static int vk_begin(void)
 {
     if (s_vk.eng_active && atomic_load_explicit(&s_eng_submission_pending, memory_order_acquire)) {
         vk_engine_latch_fault();
         return -1;
     }
-    if (s_eb_pending && vk_eng_flush()) return -1;
-    if (vk_engine_check_result(pvkResetCommandBuffer(s_vk.cmd, 0), "vkResetCommandBuffer")) return -1;
-    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
-    if (vk_engine_check_result(pvkBeginCommandBuffer(s_vk.cmd, &bi), "vkBeginCommandBuffer")) return -1;
-    /* A present's copy may still be reading the surface this frame is about
-     * to draw over: order everything here after it. Set only by a present,
-     * which never runs alongside the walker's recording. */
-    if (s_vk.present_order) { vk_cmd_after_everything(s_vk.cmd); s_vk.present_order = 0; }
+    /* The open batch goes to the queue first. Batches the GPU may still be
+     * running are not waited for: this buffer starts with a barrier on
+     * everything before it, the same order a wait used to give. */
+    if (s_eb_pending && vk_eng_kick()) return -1;
+    s_vk.cmd = s_vk.cmd_sync;
+    if (vk_cmd_begin(s_vk.cmd)) return -1;
+    if (s_eb_inflight) vk_cmd_after_everything(s_vk.cmd);
     return 0;
 }
 
-static int vk_submit_and_wait(void)
+/* End `cb` and queue it, signalling `fence`; the caller owns the wait. */
+static int vk_submit_cb(VkCommandBuffer cb, VkFence fence)
 {
     if (s_vk.eng_active && atomic_load_explicit(&s_eng_submission_pending, memory_order_acquire)) {
         vk_engine_latch_fault();
         return -1;
     }
-    if (vk_engine_check_result(pvkEndCommandBuffer(s_vk.cmd), "vkEndCommandBuffer")) return -1;
+    if (vk_engine_check_result(pvkEndCommandBuffer(cb), "vkEndCommandBuffer")) return -1;
 #if defined(PS3RECOMP_RSX_VULKAN_TEST_SEAMS)
     /* This seam fails after recording but before queue ownership, so the test
      * can exercise the frame latch without leaving GPU work in flight. */
@@ -897,19 +924,29 @@ static int vk_submit_and_wait(void)
     }
 #endif
     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                        .commandBufferCount = 1, .pCommandBuffers = &s_vk.cmd };
-    if (vk_engine_check_result(pvkResetFences(s_vk.device, 1, &s_vk.fence), "vkResetFences")) return -1;
-    if (vk_engine_check_result(vk_queue_submit(&si, s_vk.fence), "vkQueueSubmit")) return -1;
+                        .commandBufferCount = 1, .pCommandBuffers = &cb };
+    if (vk_engine_check_result(pvkResetFences(s_vk.device, 1, &fence), "vkResetFences")) return -1;
+    if (vk_engine_check_result(vk_queue_submit(&si, fence), "vkQueueSubmit")) return -1;
     s_stat.submits++;
-    const VkResult waited = vk_wait_fence(s_vk.fence);
-    if (waited != VK_SUCCESS) {
-        if (s_vk.eng_active)
-            atomic_store_explicit(&s_eng_submission_pending, 1, memory_order_release);
-        VK_LOG("vkWaitForFences failed (VkResult %d)\n", (int)waited);
-        vk_engine_latch_fault();
-        return -1;
-    }
     return 0;
+}
+
+/* A fence wait that did not succeed leaves accepted work potentially in
+ * flight: every later engine operation fails until the device is idled. */
+static int vk_fence_wait_failed(VkResult waited)
+{
+    if (s_vk.eng_active)
+        atomic_store_explicit(&s_eng_submission_pending, 1, memory_order_release);
+    VK_LOG("vkWaitForFences failed (VkResult %d)\n", (int)waited);
+    vk_engine_latch_fault();
+    return -1;
+}
+
+static int vk_submit_and_wait(void)
+{
+    if (vk_submit_cb(s_vk.cmd, s_vk.fence)) return -1;
+    const VkResult waited = vk_wait_fence(s_vk.fence);
+    return waited == VK_SUCCESS ? 0 : vk_fence_wait_failed(waited);
 }
 
 /* Order this command buffer's use of an image after everything submitted
@@ -2858,7 +2895,7 @@ static void vk_eng_snapshot_pool_drain(void);
 static void vk_eng_shutdown(void* user)
 {
     /* Retire an unresolved submission before releasing objects it may use. */
-    if (s_eb_pending) (void)vk_eng_flush();
+    if (VK_EB_BUSY()) (void)vk_eng_flush();
     if (atomic_load_explicit(&s_eng_submission_pending, memory_order_acquire))
         (void)vk_device_idle();
     vk_eng2_shutdown(user);
@@ -2871,8 +2908,8 @@ static void vk_eng_shutdown(void* user)
 
 static void vk_eng_submit_and_wait(void* user, u32 reason)
 {
-    (void)user; (void)reason;      /* every other submission has already completed */
-    if (s_eb_pending) (void)vk_eng_flush();
+    (void)user; (void)reason;      /* the contract is fully synchronous: wait for every batch too */
+    if (VK_EB_BUSY()) (void)vk_eng_flush();
     else if (atomic_load_explicit(&s_eng_submission_pending, memory_order_acquire))
         vk_engine_latch_fault();
 }
@@ -2956,7 +2993,7 @@ static void vk_eng_clear_color(void* user, u32 surface, const float rgba[4])
     vk_eng_obj* o = vk_eng_get(surface, VK_ENG_COLOR);
     if (!o) return;
     const int batched = vk_eb_active();
-    if (batched ? (!s_eb_pending && vk_begin()) : vk_begin()) return;
+    if (batched ? (!s_eb_pending && vk_eb_begin()) : vk_begin()) return;
     VkClearColorValue v;
     memcpy(v.float32, rgba, sizeof v.float32);
     VkImageSubresourceRange r = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
@@ -2976,7 +3013,7 @@ static void vk_eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
     if (flags & RSX_BE_CLEAR_STENCIL) aspect |= s_vk.depth_aspect & VK_IMAGE_ASPECT_STENCIL_BIT;
     if (!o || !aspect) return;
     const int batched = vk_eb_active();
-    if (batched ? (!s_eb_pending && vk_begin()) : vk_begin()) return;
+    if (batched ? (!s_eb_pending && vk_eb_begin()) : vk_begin()) return;
     VkClearDepthStencilValue d = { depth_value, stencil };
     VkImageSubresourceRange r = { aspect, 0, 1, 0, 1 };
     vk_barrier_image(o->im.img, s_vk.depth_aspect, VK_IMAGE_LAYOUT_GENERAL);
@@ -2991,7 +3028,8 @@ static void vk_eng_present(void* user, u32 surface)
 {
     (void)user;
     if (!s_vk.device) return;
-    if (s_eb_pending) vk_eng_flush();   /* the present records on its own buffer */
+    /* The present records on its own buffer, ordered after the batches by a barrier: submit the open one, do not wait. */
+    if (s_eb_pending) vk_eng_kick();
     vk_eng_obj* o = vk_eng_get(surface, VK_ENG_COLOR);
     vk_mutex_lock(&s_vk.present_mu);
     VkCommandBuffer cb = vk_present_record_begin();
@@ -3293,7 +3331,7 @@ static u32 vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
     }
     vk_buffer st = s_snap_st;
     const int batch = vk_eb_active();
-    int rc = (batch && s_eb_pending) ? 0 : vk_begin();
+    int rc = batch ? (s_eb_pending ? 0 : vk_eb_begin()) : vk_begin();
     if (!rc && batch) vk_cmd_after_everything(s_vk.cmd);
     if (!rc) {
         vk_barrier_image(z->im.img, s_vk.depth_aspect, VK_IMAGE_LAYOUT_GENERAL);
@@ -3313,7 +3351,7 @@ static u32 vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
         pvkCmdCopyBufferToImage(s_vk.cmd, st.buf, t->im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &in);
         if (batch) {
             vk_barrier_image(t->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
-            if (++s_eb_pending >= vk_eb_max()) vk_eng_flush();
+            if (++s_eb_pending >= vk_eb_max()) vk_eng_kick();
         } else
             rc = vk_submit_and_wait();
     }
@@ -3427,7 +3465,7 @@ static u32 s_esamp_count;
 
 static void vk_eng_drop_framebuffers(void)
 {
-    if (s_eb_pending) vk_eng_flush();
+    if (VK_EB_BUSY()) vk_eng_flush();
     for (u32 i = 0; i < s_e2.fb_count; i++)
         if (s_e2.fb[i].fb) pvkDestroyFramebuffer(s_vk.device, s_e2.fb[i].fb, NULL);
     s_e2.fb_count = 0;
@@ -3642,7 +3680,7 @@ static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* p
 static void vk_eng_pipeline_release(void* user, u32 pipeline)
 {
     (void)user;
-    if (s_eb_pending) vk_eng_flush();
+    if (VK_EB_BUSY()) vk_eng_flush();
     if (!pipeline || pipeline > VK_ENG_MAX_PIPE || !s_epipe[pipeline - 1].used) return;
     vk_eng_pipe* P = &s_epipe[pipeline - 1];
     for (u32 t = 0; t < VK_ENG_TOPOLOGIES; t++)
@@ -4019,28 +4057,48 @@ static VkImageView vk_eng_dummy_cube_view(void)
  * its time blocked on the GPU, the RSX ring drained one draw at a time and the
  * SPU geometry jobs waited for ring space. Batched, a draw takes slices of
  * three ring buffers and a descriptor set from a pool, records into the open
- * command buffer, and only s_eb_pending grows. vk_eng_flush() submits, waits
- * once, and resets the rings and the pool; vk_begin, every object destroy, the
- * present and the engine's own submit point call it first, so all other work
- * keeps seeing everything before it complete. Between batched draws a full
+ * command buffer, and only s_eb_pending grows. Between batched draws a full
  * memory barrier keeps render-to-texture ordering without tracking.
- * vk.draw_batch_max (default 512, at most VK_EB_MAX_SETS) caps the operations per submission.
- * Both keys are read once, in vk_eb_on's first call per engine run; nothing on a per-draw path
- * reads the registry.
+ *
+ * A full batch (vk.draw_batch_max operations, or a full ring) is only kicked:
+ * submitted without a wait, so the walker records the next while the GPU runs
+ * it. VK_EB_SLOTS batches can be in flight, each with its own command buffer
+ * and fence, its own slice of every ring and its own descriptor pool; a slot
+ * is waited for only when the walker comes round to it again, and then its
+ * slices and pool are reset. The queue runs batches in submission order, and
+ * every command buffer begins with (or, for a draw, carries) a barrier on
+ * everything before it, so what a later batch or one-shot reads is what the
+ * earlier ones wrote.
+ *
+ * Anything that needs the GPU finished flushes (vk_eng_flush: kick, then wait
+ * for every slot): the engine's own submit point, which precedes each
+ * readback, and every destroy of an object a batch may use. A one-shot
+ * (vk_begin .. vk_submit_and_wait) only kicks the open batch first.
+ * vk.draw_batch_max (default 512, at most VK_EB_MAX_SETS) caps the operations
+ * per submission, and so a slot's descriptor pool. Both keys are read once,
+ * in vk_eb_on's first call per engine run; nothing on a per-draw path reads
+ * the registry.
  * -------------------------------------------------------------------------*/
-#define VK_EB_VB_BYTES   (64u << 20)
+#define VK_EB_VB_BYTES   (64u << 20)   /* the rings, whole; a slot has 1/VK_EB_SLOTS of each */
 #define VK_EB_IB_BYTES   (16u << 20)
 #define VK_EB_UB_BYTES   (32u << 20)
 #define VK_EB_SB_BYTES   (64u << 20)   /* texture upload staging */
 #define VK_EB_MAX_SETS   1024u         /* the maximum of vk.draw_batch_max in config_options.def */
 
+typedef struct vk_eb_slot {
+    VkDescriptorPool pool;
+    u32              sets;
+    int              in_flight;        /* submitted, its fence not yet seen signalled */
+} vk_eb_slot;
+
 static struct {
     int              on;            /* -1 undecided, 0 off, 1 on */
     u32              max_draws;
     vk_buffer        vb, ib, ub, sb;
-    VkDeviceSize     vb_head, ib_head, ub_head, sb_head, ub_align;
-    VkDescriptorPool pool;
-    u32              sets;
+    VkDeviceSize     vb_head, ib_head, ub_head, sb_head, ub_align;   /* inside the current slot's slice */
+    vk_eb_slot       slot[VK_EB_SLOTS];
+    u32              cur;           /* the slot the next batch records into */
+    int              cur_ready;     /* ... and it is free of GPU work, its slices and pool reset */
     unsigned long long draws, flushes;
 } s_eb = { .on = -1 };
 
@@ -4060,24 +4118,27 @@ static int vk_eb_on(void)
     };
     VkDescriptorPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
                                        .maxSets = VK_EB_MAX_SETS, .poolSizeCount = 3, .pPoolSizes = ps };
-    if (vk_create_host_buffer(&s_eb.vb, VK_EB_VB_BYTES, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT) || !s_eb.vb.coherent ||
-        vk_create_host_buffer(&s_eb.ib, VK_EB_IB_BYTES, VK_BUFFER_USAGE_INDEX_BUFFER_BIT) || !s_eb.ib.coherent ||
-        vk_create_host_buffer(&s_eb.ub, VK_EB_UB_BYTES, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) || !s_eb.ub.coherent ||
-        vk_create_host_buffer(&s_eb.sb, VK_EB_SB_BYTES, VK_BUFFER_USAGE_TRANSFER_SRC_BIT) || !s_eb.sb.coherent ||
-        pvkCreateDescriptorPool(s_vk.device, &pci, NULL, &s_eb.pool) != VK_SUCCESS) {
+    int ok = !(vk_create_host_buffer(&s_eb.vb, VK_EB_VB_BYTES, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT) || !s_eb.vb.coherent ||
+               vk_create_host_buffer(&s_eb.ib, VK_EB_IB_BYTES, VK_BUFFER_USAGE_INDEX_BUFFER_BIT) || !s_eb.ib.coherent ||
+               vk_create_host_buffer(&s_eb.ub, VK_EB_UB_BYTES, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) || !s_eb.ub.coherent ||
+               vk_create_host_buffer(&s_eb.sb, VK_EB_SB_BYTES, VK_BUFFER_USAGE_TRANSFER_SRC_BIT) || !s_eb.sb.coherent);
+    for (u32 i = 0; ok && i < VK_EB_SLOTS; i++)
+        ok = pvkCreateDescriptorPool(s_vk.device, &pci, NULL, &s_eb.slot[i].pool) == VK_SUCCESS;
+    if (!ok) {
         VK_LOG("draw batching: no host-coherent ring memory, staying off\n");
         return 0;
     }
     VK_LOG("draw batching: on (up to %u draws per submission)\n", s_eb.max_draws);
+    VK_LOG("draw batching: %u submissions in flight, each with its own slice of the rings\n", VK_EB_SLOTS);
     s_eb.on = 1;
     return 1;
 }
 
-/* The rings and the pool live until the engine shuts down; a later vk_eb_on
+/* The rings and the pools live until the engine shuts down; a later vk_eb_on
  * decides again. Also frees what a failed vk_eb_on had already created. */
 static void vk_eb_release(void)
 {
-    if (s_eb_pending) vk_eng_flush();
+    if (VK_EB_BUSY()) vk_eng_flush();
     if (s_stat.submits)
         VK_LOG("submissions: %llu (%llu draws in %llu batches), walker fence waits %llu blocked %.2f ms, "
                "present wait %.2f ms over %u presents\n",
@@ -4087,16 +4148,110 @@ static void vk_eb_release(void)
     vk_destroy_buffer(&s_eb.ib);
     vk_destroy_buffer(&s_eb.ub);
     vk_destroy_buffer(&s_eb.sb);
-    if (s_eb.pool) pvkDestroyDescriptorPool(s_vk.device, s_eb.pool, NULL);
+    for (u32 i = 0; i < VK_EB_SLOTS; i++)
+        if (s_eb.slot[i].pool) pvkDestroyDescriptorPool(s_vk.device, s_eb.slot[i].pool, NULL);
     memset(&s_eb, 0, sizeof s_eb);
     s_eb.on = -1;
+    s_eb_pending = s_eb_inflight = 0;
 }
 
 static int vk_eb_active(void) { return s_eb.on == 1; }
 static u32 vk_eb_max(void) { return s_eb.max_draws; }
-static void vk_eb_recorded(void) { if (++s_eb_pending >= s_eb.max_draws) vk_eng_flush(); }
+static void vk_eb_recorded(void) { if (++s_eb_pending >= s_eb.max_draws) vk_eng_kick(); }
 
-static VkDeviceSize vk_eb_take(VkDeviceSize* head, VkDeviceSize cap, VkDeviceSize bytes, VkDeviceSize align);
+static void vk_eb_device_idled(void)
+{
+    for (u32 i = 0; i < VK_EB_SLOTS; i++) s_eb.slot[i].in_flight = 0;
+    s_eb_inflight = 0;
+}
+
+/* Block until slot `i`'s batch has finished on the GPU. */
+static int vk_eb_wait_slot(u32 i)
+{
+    const VkResult r = vk_wait_fence(s_vk.batch_fence[i]);
+    if (r != VK_SUCCESS) return vk_fence_wait_failed(r);
+    s_eb.slot[i].in_flight = 0;
+    s_eb_inflight--;
+    return 0;
+}
+
+/* Make the current slot ready to record into: wait for its previous batch if
+ * the GPU still has it (the only wait a batch pays), then reset its slices and
+ * its descriptor pool. Must come before any slice is taken. */
+static int vk_eb_acquire(void)
+{
+    if (s_eb.cur_ready) return 0;
+    if (s_vk.eng_active && atomic_load_explicit(&s_eng_submission_pending, memory_order_acquire)) {
+        vk_engine_latch_fault();
+        return -1;
+    }
+    vk_eb_slot* const sl = &s_eb.slot[s_eb.cur];
+    if (sl->in_flight && vk_eb_wait_slot(s_eb.cur)) return -1;
+    if (sl->sets) {
+        if (vk_engine_check_result(pvkResetDescriptorPool(s_vk.device, sl->pool, 0),
+                                   "vkResetDescriptorPool(draw batch)"))
+            return -1;
+        sl->sets = 0;
+    }
+    s_eb.vb_head = s_eb.ib_head = s_eb.ub_head = s_eb.sb_head = 0;
+    s_eb.cur_ready = 1;
+    return 0;
+}
+
+static int vk_eb_begin(void)
+{
+    if (vk_eb_acquire()) return -1;
+    s_vk.cmd = s_vk.batch_cmd[s_eb.cur];
+    return vk_cmd_begin(s_vk.cmd);
+}
+
+/* Submit the open batch without waiting. */
+static int vk_eng_kick(void)
+{
+    if (atomic_load_explicit(&s_eng_submission_pending, memory_order_acquire)) {
+        vk_engine_latch_fault();
+        return -1;
+    }
+    if (!s_eb_pending) return 0;
+    s_eb_pending = 0;               /* first: nothing below may record into this batch */
+    s_eb.cur_ready = 0;             /* the slot is full whether or not the queue takes it */
+    if ((++s_eb.flushes & 0x3FFFu) == 0)
+        VK_LOG("draw batching: %llu draws in %llu submissions\n", s_eb.draws, s_eb.flushes);
+    if (vk_submit_cb(s_vk.batch_cmd[s_eb.cur], s_vk.batch_fence[s_eb.cur]))
+        return -1;                  /* the GPU never owned it: the slot is reset when it is next taken */
+    s_eb.slot[s_eb.cur].in_flight = 1;
+    s_eb_inflight++;
+    s_eb.cur = (s_eb.cur + 1u) % VK_EB_SLOTS;
+    return 0;
+}
+
+/* Kick, then wait until the GPU is done with every batch. After a failed wait
+ * the GPU may still own accepted work: nothing is reset, and every later
+ * engine operation fails until the device is idled. */
+static int vk_eng_flush(void)
+{
+    if (atomic_load_explicit(&s_eng_submission_pending, memory_order_acquire)) {
+        vk_engine_latch_fault();
+        return -1;
+    }
+    int rc = s_eb_pending ? vk_eng_kick() : 0;
+    for (u32 n = 0; n < VK_EB_SLOTS; n++) {
+        const u32 i = (s_eb.cur + n) % VK_EB_SLOTS;      /* the oldest batch first */
+        if (s_eb.slot[i].in_flight && vk_eb_wait_slot(i)) return -1;
+    }
+    return rc;
+}
+
+/* A slice of ring `ring_bytes` for the current slot: the offset into the whole
+ * buffer, or -1 when the slot's share has no room left. */
+static VkDeviceSize vk_eb_take(VkDeviceSize* head, VkDeviceSize ring_bytes, VkDeviceSize bytes, VkDeviceSize align)
+{
+    const VkDeviceSize cap = ring_bytes / VK_EB_SLOTS;
+    const VkDeviceSize at = (*head + align - 1u) / align * align;
+    if (at + bytes > cap) return (VkDeviceSize)-1;
+    *head = at + bytes;
+    return (VkDeviceSize)s_eb.cur * cap + at;
+}
 
 /* A texture upload as one more batched operation: rows staged in the ring, the
  * copy recorded behind a full memory barrier (earlier draws of the batch may
@@ -4108,57 +4263,23 @@ static int vk_eb_upload(VkImage img, VkBufferImageCopy* region, const void* src,
 {
     if (!vk_eb_active()) return -2;
     const VkDeviceSize bytes = (VkDeviceSize)tight * rows;
-    if (!bytes || bytes > VK_EB_SB_BYTES) return -2;
+    if (!bytes || bytes > VK_EB_SB_BYTES / VK_EB_SLOTS) return -2;
+    if (vk_eb_acquire()) return -1;
     VkDeviceSize off = vk_eb_take(&s_eb.sb_head, VK_EB_SB_BYTES, bytes, 16u);
     if (off == (VkDeviceSize)-1) {
-        vk_eng_flush();
+        if (vk_eng_kick() || vk_eb_acquire()) return -1;
         off = vk_eb_take(&s_eb.sb_head, VK_EB_SB_BYTES, bytes, 16u);
         if (off == (VkDeviceSize)-1) return -2;
     }
     for (u32 y = 0; y < rows; y++)
         memcpy((u8*)s_eb.sb.ptr + off + (size_t)y * tight, (const u8*)src + (size_t)y * row_bytes, tight);
-    if (!s_eb_pending && vk_begin()) return -1;
+    if (!s_eb_pending && vk_eb_begin()) return -1;
     vk_cmd_after_everything(s_vk.cmd);
     region->bufferOffset = off;
     pvkCmdCopyBufferToImage(s_vk.cmd, s_eb.sb.buf, img, VK_IMAGE_LAYOUT_GENERAL, 1, region);
     vk_barrier_image(img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
-    if (++s_eb_pending >= s_eb.max_draws) vk_eng_flush();
+    if (++s_eb_pending >= s_eb.max_draws) vk_eng_kick();
     return 0;
-}
-
-static int vk_eng_flush(void)
-{
-    if (atomic_load_explicit(&s_eng_submission_pending, memory_order_acquire)) {
-        vk_engine_latch_fault();
-        return -1;
-    }
-    if (!s_eb_pending) return 0;
-    s_eb_pending = 0;               /* first: the submit below must not re-enter */
-    if (vk_submit_and_wait()) {
-        /* Do not rewind any ring head or pool state: the GPU may still own
-         * this batch. Later slices, if any, start after the abandoned data. */
-        if ((++s_eb.flushes & 0x3FFFu) == 0)
-            VK_LOG("draw batching: %llu draws in %llu submissions\n", s_eb.draws, s_eb.flushes);
-        return -1;
-    }
-    s_eb.vb_head = s_eb.ib_head = s_eb.ub_head = s_eb.sb_head = 0;
-    if (s_eb.sets) {
-        if (vk_engine_check_result(pvkResetDescriptorPool(s_vk.device, s_eb.pool, 0),
-                                   "vkResetDescriptorPool(draw batch)"))
-            return -1;
-        s_eb.sets = 0;
-    }
-    if ((++s_eb.flushes & 0x3FFFu) == 0)
-        VK_LOG("draw batching: %llu draws in %llu submissions\n", s_eb.draws, s_eb.flushes);
-    return 0;
-}
-
-static VkDeviceSize vk_eb_take(VkDeviceSize* head, VkDeviceSize cap, VkDeviceSize bytes, VkDeviceSize align)
-{
-    const VkDeviceSize at = (*head + align - 1u) / align * align;
-    if (at + bytes > cap) return (VkDeviceSize)-1;
-    *head = at + bytes;
-    return at;
 }
 
 static VkDescriptorSet vk_eng_write_descriptors_to(const vk_eng_pipe* P, VkDescriptorSet set,
@@ -4260,11 +4381,13 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     VkDeviceSize voff = 0, ioff = 0;
     VkDescriptorSet set = VK_NULL_HANDLE;
     const u32 vsb = s_e2.vs_bytes ? s_e2.vs_bytes : 16u, psb = s_e2.ps_bytes ? s_e2.ps_bytes : 16u;
-    int batched = vk_eb_on() && vbytes <= VK_EB_VB_BYTES && ibytes <= VK_EB_IB_BYTES;
+    int batched = vk_eb_on() && vbytes <= VK_EB_VB_BYTES / VK_EB_SLOTS && ibytes <= VK_EB_IB_BYTES / VK_EB_SLOTS;
     if (batched && P->cube_mask && !vk_eng_dummy_cube_view()) return;   /* may flush: before any slice */
+    /* The slot this draw records into must be free of GPU work before a slice or a set is taken from it. */
+    if (batched && vk_eb_acquire()) return;
     if (batched) {
-        /* Slices of the rings and a set from the pool; a full one flushes the
-         * batch (which empties them all) and the draw takes its slices again. */
+        /* Slices of the current slot's rings and a set from its pool; a full one kicks the
+         * batch and the draw takes its slices again from the next slot. */
         for (int tries = 0; tries < 2; tries++) {
             VkDeviceSize vh = s_eb.vb_head, ih = s_eb.ib_head, uh = s_eb.ub_head;
             voff = vk_eb_take(&vh, VK_EB_VB_BYTES, vbytes, 16u);
@@ -4272,13 +4395,13 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
             const VkDeviceSize uvs = vk_eb_take(&uh, VK_EB_UB_BYTES, vsb, s_eb.ub_align);
             const VkDeviceSize ups = uvs == (VkDeviceSize)-1 ? uvs : vk_eb_take(&uh, VK_EB_UB_BYTES, psb, s_eb.ub_align);
             if (voff != (VkDeviceSize)-1 && ioff != (VkDeviceSize)-1 && ups != (VkDeviceSize)-1 &&
-                s_eb.sets < VK_EB_MAX_SETS) {
+                s_eb.slot[s_eb.cur].sets < VK_EB_MAX_SETS) {
                 VkDescriptorSetLayout lay = P->cube_mask ? s_e2.split_layout : s_g.set_layout;
                 VkDescriptorSetAllocateInfo dai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-                                                    .descriptorPool = s_eb.pool, .descriptorSetCount = 1,
+                                                    .descriptorPool = s_eb.slot[s_eb.cur].pool, .descriptorSetCount = 1,
                                                     .pSetLayouts = &lay };
                 if (pvkAllocateDescriptorSets(s_vk.device, &dai, &set) == VK_SUCCESS) {
-                    s_eb.sets++;
+                    s_eb.slot[s_eb.cur].sets++;
                     s_eb.vb_head = vh; s_eb.ib_head = ih; s_eb.ub_head = uh;
                     memcpy((u8*)s_eb.ub.ptr + uvs, vk_eng_ucpu(), vsb);
                     memcpy((u8*)s_eb.ub.ptr + ups, vk_eng_ucpu() + s_g.ps_off, psb);
@@ -4288,7 +4411,8 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
                 set = VK_NULL_HANDLE;
             }
             if (tries || !s_eb_pending) { batched = 0; break; }
-            vk_eng_flush();
+            vk_eng_kick();      /* a failed submit is latched; the next slot is taken regardless */
+            if (vk_eb_acquire()) return;
         }
         if (batched && !set) batched = 0;
     }
@@ -4296,12 +4420,11 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
         memcpy((u8*)s_eb.vb.ptr + voff, vertices, (size_t)vbytes);
         if (ibytes) memcpy((u8*)s_eb.ib.ptr + ioff, indices, (size_t)ibytes);
         vbuf = s_eb.vb.buf; ibuf = s_eb.ib.buf;
-        if (!s_eb_pending && vk_begin()) return;
+        if (!s_eb_pending && vk_eb_begin()) return;
         /* Earlier draws of this batch may have rendered what this one samples
          * or blends over: order it after all of them. */
         vk_cmd_after_everything(s_vk.cmd);
     } else {
-        if (s_eb_pending) vk_eng_flush();
         if (vk_ensure_vertex_buffer(vbytes)) return;
         memcpy(s_vk.vertices.ptr, vertices, (size_t)vbytes);
         if (ibytes) {
@@ -4316,8 +4439,9 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
         if (!set) return;
         if (vk_begin()) return;
     }
-    /* Everything submitted before is complete (each submission is waited
-     * on); this orders memory for the surfaces this draw touches. */
+    /* A batch or one-shot before this may still be running; the barrier above (batched: the
+     * full memory barrier, one-shot: vk_begin's) ordered this command buffer after all of
+     * them, and this orders memory for the surfaces this draw touches. */
     for (u32 i = 0; i < n; i++)
         vk_barrier_image(s_eobj[s_eng_bound.rt[i]].im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
     VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
@@ -4357,7 +4481,7 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     pvkCmdEndRenderPass(s_vk.cmd);
     if (!batched) { vk_submit_and_wait(); return; }
     s_eb.draws++;
-    if (++s_eb_pending >= s_eb.max_draws) vk_eng_flush();
+    if (++s_eb_pending >= s_eb.max_draws) vk_eng_kick();
 }
 /* Capture calls this after its flush: atomic exchange reports and clears faults
  * from all engine submissions since the prior check; successes do not clear it. */
@@ -4606,9 +4730,16 @@ static int vk_init_all(u32 width, u32 height, const char* title)
                                         .commandPool = s_vk.pool,
                                         .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
                                         .commandBufferCount = 1 };
-    VK_CHECK(pvkAllocateCommandBuffers(s_vk.device, &cai, &s_vk.cmd), "vkAllocateCommandBuffers");
+    VK_CHECK(pvkAllocateCommandBuffers(s_vk.device, &cai, &s_vk.cmd_sync), "vkAllocateCommandBuffers");
+    s_vk.cmd = s_vk.cmd_sync;
     VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
     VK_CHECK(pvkCreateFence(s_vk.device, &fci, NULL, &s_vk.fence), "vkCreateFence");
+    /* One command buffer and fence per draw batch that can be in flight (vk.draw_batch). */
+    cai.commandBufferCount = VK_EB_SLOTS;
+    VK_CHECK(pvkAllocateCommandBuffers(s_vk.device, &cai, s_vk.batch_cmd), "vkAllocateCommandBuffers");
+    cai.commandBufferCount = 1;
+    for (u32 i = 0; i < VK_EB_SLOTS; i++)
+        VK_CHECK(pvkCreateFence(s_vk.device, &fci, NULL, &s_vk.batch_fence[i]), "vkCreateFence");
     /* The present's own (see vk_state). */
     VK_CHECK(pvkCreateCommandPool(s_vk.device, &pci, NULL, &s_vk.present_pool), "vkCreateCommandPool");
     cai.commandPool = s_vk.present_pool;
@@ -4810,6 +4941,8 @@ void rsx_vulkan_backend_shutdown(void)
         vk_destroy_buffer(&s_vk.vertices);
         vk_destroy_buffer(&s_vk.readback);
         if (s_vk.fence) pvkDestroyFence(s_vk.device, s_vk.fence, NULL);
+        for (u32 i = 0; i < VK_EB_SLOTS; i++)
+            if (s_vk.batch_fence[i]) pvkDestroyFence(s_vk.device, s_vk.batch_fence[i], NULL);
         if (s_vk.pool)  pvkDestroyCommandPool(s_vk.device, s_vk.pool, NULL);
         if (s_vk.present_fence) pvkDestroyFence(s_vk.device, s_vk.present_fence, NULL);
         if (s_vk.window_fence)  pvkDestroyFence(s_vk.device, s_vk.window_fence, NULL);
