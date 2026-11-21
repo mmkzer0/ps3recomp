@@ -645,6 +645,13 @@ static void emit_programs(const u8* vp, u32 vp_bytes, u32 fp_offset)
  * which happens to be right for these vertices and wrong for a real title's. */
 #define VTX_MAIN(off)  (0x80000000u | (u32)(off))
 
+/* --draws=N[:S]: the triangle is drawn N times per frame, each in a BEGIN/END pair of its own (the engine
+ * turns one pair into one backend draw), which loads a backend past its per-submission draw cap without a
+ * title. With :S the draws are scissored to an S x S corner, so the GPU's share of the frame is small and
+ * the host's recording cost shows. A frame of N draws is 24 * N bytes of the 64 KiB ring below the vertex
+ * data, so submit_frame wraps the ring with a JUMP to its start when the next frame would not fit. */
+static unsigned s_repeat_draws = 1, s_scissor_px = 0;
+
 static void emit_triangle_draw(void)
 {
     emit(NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 0 * 4, VTX_MAIN(VTX_OFFSET +  0));  /* position */
@@ -652,9 +659,15 @@ static void emit_triangle_draw(void)
     emit(NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 3 * 4, VTX_MAIN(VTX_OFFSET + 16));  /* colour   */
     emit(NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 3 * 4, VFMT(4, 32));
 
-    emit(NV4097_SET_BEGIN_END, 5u);                       /* TRIANGLES        */
-    emit(NV4097_DRAW_ARRAYS,   0u | ((3u - 1u) << 24));   /* first=0 count=3  */
-    emit(NV4097_SET_BEGIN_END, 0u);                       /* end              */
+    if (s_scissor_px) {
+        emit(NV4097_SET_SCISSOR_HORIZONTAL, s_scissor_px << 16);
+        emit(NV4097_SET_SCISSOR_VERTICAL,   s_scissor_px << 16);
+    }
+    for (unsigned i = 0; i < s_repeat_draws; i++) {
+        emit(NV4097_SET_BEGIN_END, 5u);                       /* TRIANGLES        */
+        emit(NV4097_DRAW_ARRAYS,   0u | ((3u - 1u) << 24));   /* first=0 count=3  */
+        emit(NV4097_SET_BEGIN_END, 0u);                       /* end              */
+    }
 }
 
 /* Bind a texture on unit 0 and draw the quad through a guest vertex program
@@ -1271,6 +1284,12 @@ static void emit_quad_draws(void)
  * overwrite the last one. */
 static void submit_frame(int with_draw)
 {
+    if (s_repeat_draws != 1 && g_fifo_len + 128u + 24u * s_repeat_draws > CMD_SIZE - 8u) {
+        guest_w32(IO_ADDR + g_fifo_len, 0x20000000u);   /* JUMP 0: the walker follows it to the start, where put now stands */
+        guest_w32(CTRL_ADDR + 0, 0);
+        cellGcm_rsx_process_fifo();
+        g_fifo_len = 0;
+    }
     /* The MRT modes clear twice, once per target set, and emit both clears
      * themselves so the display's lands after the offscreen pass rather than
      * in front of it. */
@@ -1579,6 +1598,10 @@ int main(int argc, char** argv)
     for (int i = 1; i < argc; i++) {
         if (strncmp(argv[i], "--frames=", 9) == 0) frames = atoi(argv[i] + 9);
         else if (strcmp(argv[i], "--draw") == 0)   do_draw = 1;
+        else if (strncmp(argv[i], "--draws=", 8) == 0) {
+            do_draw = 1;
+            if (sscanf(argv[i] + 8, "%u:%u", &s_repeat_draws, &s_scissor_px) < 1) s_repeat_draws = 0;
+        }
         /* --threads: no graphics at all, just the lv2 thread path. */
         else if (strcmp(argv[i], "--threads") == 0) {
             vm_base = host_vm_alloc();
@@ -1690,6 +1713,11 @@ int main(int argc, char** argv)
         else if (strcmp(argv[i], "--points") == 0) do_draw = 23;
         else if (strcmp(argv[i], "--points-edge") == 0) { do_draw = 24; s_point_dx = 3; }
         else if (strcmp(argv[i], "--points-miss") == 0) { do_draw = 25; s_point_dx = 6; }
+    }
+    if (s_repeat_draws != 1 && (s_repeat_draws < 1 || 128ull + 24ull * s_repeat_draws > CMD_SIZE - 8u)) {
+        fprintf(stderr, "[host] --draws=%u does not fit one frame in the %u-byte command ring\n",
+                s_repeat_draws, (unsigned)CMD_SIZE);
+        return 1;
     }
 #if !defined(__APPLE__)
     if (do_draw == 15) {
