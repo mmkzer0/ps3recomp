@@ -66,9 +66,12 @@
  * port's input clock is re-based so the next poll is served recorded ordinal S, and the clock continues from
  * there; the guest then meets the input that followed the event in the recording at the same distance from it.
  * Until the next pending event is reported the clock does not pass that event's S: input the recording made
- * after the event is not served before the guest has reached it (the replay waits for the guest). An event the
- * run reports out of order re-bases on its record and counts the pending records before it as missed; an event
- * with no pending record is ignored. Records of a port are in strictly increasing seq order. They need k = 1.
+ * after the event is not served before the guest has reached it (the replay waits for the guest). A re-base that
+ * moves the clock forward closes the gap only over idle input (no button, sticks at rest): it never skips a
+ * record, and a press or a stick deflection keeps its recorded length. An event the run reports out of order
+ * re-bases on its record and counts the pending records before it as missed, as long as it passes over at most
+ * PAD_TRACE_SYNC_SKIP_MAX of them; an event further ahead, or with no pending record, is ignored. Records of a
+ * port are in strictly increasing seq order. They need k = 1.
  *
  * The module is self-contained: it depends on stop.h and the C library. The
  * flip clock comes in through PadTraceOptions, and cellPad.c does the config
@@ -102,6 +105,7 @@ extern "C" {
 #define PAD_TRACE_CLOCK      "guest-polls"
 #define PAD_TRACE_MAX_PORTS   7u    /* CELL_PAD_MAX_PORT_NUM */
 #define PAD_TRACE_MAX_WORDS   64u   /* CELL_PAD_MAX_CODES */
+#define PAD_TRACE_SYNC_SKIP_MAX 3u   /* pending sync records one reported event may pass over */
 /* pad.replay_repeat: how many guest polls each recorded poll serves. The config
  * registry's range for the option is 1..this. */
 #define PAD_TRACE_REPEAT_MAX  8u

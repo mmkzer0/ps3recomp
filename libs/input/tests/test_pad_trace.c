@@ -838,17 +838,23 @@ static void case_sync(void)
     pad_trace_destroy(t);
 
     /* A guest that is early, and events that come out of order: event 200 first re-bases the clock forward and
-     * passes event 100 (missed); event 100 reported afterwards has no pending record and is ignored. */
+     * passes event 100 (missed); event 100 reported afterwards has no pending record and is ignored. The jump
+     * from recorded 12 to 32 does not skip what lies between: the press at 10..13 keeps its length, the idle
+     * stretch from 14 is cut to the next record, and the press at 30..33 is served whole before the clock
+     * reaches the re-based ordinal (poll p = recorded p + 20) at poll 20. */
     t = open_trace(NULL, path);
     for (uint64_t p = 0; p < 12; p++) {
         st = poll(t, 0, &live);
         CHECK(btn(&st) == want_btn(p), "early run, poll %llu: button %u", (unsigned long long)p, btn(&st));
     }
-    pad_trace_sync_event(t, PS3_REPLAY_SYNC_PIPELINE, 200, 0u);                /* next poll 12 is served recorded 32 */
-    for (uint64_t p = 12; p < 16; p++) {
-        st = poll(t, 0, &live);
-        CHECK(btn(&st) == want_btn(p + 20), "early run, poll %llu: recorded %llu, button %u", (unsigned long long)p,
-              (unsigned long long)(p + 20), btn(&st));
+    pad_trace_sync_event(t, PS3_REPLAY_SYNC_PIPELINE, 200, 0u);                /* re-based: poll p is recorded p + 20 */
+    {
+        static const uint64_t served[] = { 12, 13, 14, 30, 31, 32, 33, 34, 40, 41 };   /* polls 12..21 */
+        for (uint64_t p = 12; p < 22; p++) {
+            st = poll(t, 0, &live);
+            CHECK(btn(&st) == want_btn(served[p - 12]), "early run, poll %llu: recorded %llu, button %u",
+                  (unsigned long long)p, (unsigned long long)served[p - 12], btn(&st));
+        }
     }
     pad_trace_sync_event(t, PS3_REPLAY_SYNC_PIPELINE, 100, 0u);
     pad_trace_stats(t, &ps);
@@ -873,6 +879,63 @@ static void case_sync(void)
     }
     pad_trace_destroy(t);
     g_flip = 0;
+
+    /* A late report that moves the clock across a tap: the guest waits at event 7 (recorded 5) from poll 6, made
+     * the event's flip request at poll 2 and reports it at poll 10, so the re-based clock wants recorded 13 at
+     * poll 10. The tap at recorded 8..9 lies inside that jump; it is served for its two polls, the idle stretch
+     * after it absorbs the jump, and the press at 20..23 comes at the re-based distance (poll p = recorded p + 3). */
+    {
+        const char* tap_path = scratch("sync-tap.trace");
+        static const unsigned want[] = { 64, 64, 0, 0, 0, 0, 0, 32, 32, 32, 32, 0 };   /* polls 10..21 */
+        write_text(tap_path,
+            HEADER
+            "{\"seq\":0,\"port\":0,\"len\":8,\"words\":[0,116,0,0,128,128,128,128],\"flip\":0}\n"
+            "{\"sync\":\"pipeline\",\"key\":7,\"port\":0,\"seq\":5}\n"
+            "{\"seq\":8,\"port\":0,\"len\":8,\"words\":[0,116,0,64,128,128,128,128],\"flip\":8}\n"
+            "{\"seq\":10,\"port\":0,\"len\":8,\"words\":[0,116,0,0,128,128,128,128],\"flip\":10}\n"
+            "{\"seq\":20,\"port\":0,\"len\":8,\"words\":[0,116,0,32,128,128,128,128],\"flip\":20}\n"
+            "{\"seq\":24,\"port\":0,\"len\":8,\"words\":[0,116,0,0,128,128,128,128],\"flip\":24}\n"
+            "{\"end\":true,\"seq\":[40,0,0,0,0,0,0]}\n");
+        t = open_trace(NULL, tap_path);
+        for (uint64_t p = 0; p < 10; p++) {
+            g_flip = (uint32_t)p;
+            st = poll(t, 0, &live);
+        }
+        pad_trace_sync_event(t, PS3_REPLAY_SYNC_PIPELINE, 7, 2u);
+        for (uint64_t p = 10; p < 22; p++) {
+            g_flip = (uint32_t)p;
+            st = poll(t, 0, &live);
+            CHECK(btn(&st) == want[p - 10], "tap across the jump, poll %llu: button %u, want %u", (unsigned long long)p,
+                  btn(&st), want[p - 10]);
+        }
+        pad_trace_destroy(t);
+        g_flip = 0;
+    }
+
+    /* An event may pass over at most PAD_TRACE_SYNC_SKIP_MAX pending records: one four records ahead is taken for
+     * a key built again, not for the course, and changes nothing; one three ahead re-bases. */
+    {
+        const char* skip_path = scratch("sync-skip.trace");
+        write_text(skip_path,
+            HEADER
+            "{\"seq\":0,\"port\":0,\"len\":8,\"words\":[0,116,0,0,128,128,128,128],\"flip\":0}\n"
+            "{\"sync\":\"pipeline\",\"key\":1,\"port\":0,\"seq\":2}\n"
+            "{\"sync\":\"pipeline\",\"key\":2,\"port\":0,\"seq\":3}\n"
+            "{\"sync\":\"pipeline\",\"key\":3,\"port\":0,\"seq\":4}\n"
+            "{\"sync\":\"pipeline\",\"key\":4,\"port\":0,\"seq\":5}\n"
+            "{\"sync\":\"pipeline\",\"key\":5,\"port\":0,\"seq\":6}\n"
+            "{\"end\":true,\"seq\":[20,0,0,0,0,0,0]}\n");
+        t = open_trace(NULL, skip_path);
+        pad_trace_sync_event(t, PS3_REPLAY_SYNC_PIPELINE, 5, 0u);
+        pad_trace_stats(t, &ps);
+        CHECK(ps.sync_hits == 0 && ps.sync_missed == 0, "an event four pending records ahead is ignored: hits %llu missed %llu",
+              (unsigned long long)ps.sync_hits, (unsigned long long)ps.sync_missed);
+        pad_trace_sync_event(t, PS3_REPLAY_SYNC_PIPELINE, 4, 0u);
+        pad_trace_stats(t, &ps);
+        CHECK(ps.sync_hits == 1 && ps.sync_missed == 3, "an event three pending records ahead re-bases: hits %llu missed %llu",
+              (unsigned long long)ps.sync_hits, (unsigned long long)ps.sync_missed);
+        pad_trace_destroy(t);
+    }
 
     /* The re-based ordinal and pad.replay_repeat do not compose: the trace is refused. */
     memset(&e, 0, sizeof e);

@@ -145,6 +145,9 @@ struct PadTrace {
     size_t          capsyncs[PAD_TRACE_MAX_PORTS];
     size_t          sync_next[PAD_TRACE_MAX_PORTS];
     int64_t         sync_shift[PAD_TRACE_MAX_PORTS];
+    /* the lowest recorded ordinal no poll of the port has been served yet: a re-base never jumps over a record
+     * (sync_ordinal) */
+    uint64_t        sync_from[PAD_TRACE_MAX_PORTS];
     /* flip_poll[port][f - 1]: the polls the port had made when the guest made its f-th flip request. Kept only for
      * a trace with sync records: it turns "the frame the draw engine was working on" into a guest poll count. */
     uint64_t*       flip_poll[PAD_TRACE_MAX_PORTS];
@@ -184,6 +187,26 @@ static uint64_t now_ms(void)
 static int state_equal(const PadTraceState* a, const PadTraceState* b)
 {
     return a->len == b->len && memcmp(a->words, b->words, sizeof a->words) == 0;
+}
+
+/* Pad data words, as cellPad lays them out (libs/input/cellPad.h CELL_PAD_BTN_OFFSET_*): 2 and 3 the digital
+ * buttons, 4 to 7 the two sticks, 0x80 at centre. */
+enum { PAD_WORD_DIGITAL1 = 2, PAD_WORD_DIGITAL2 = 3, PAD_WORD_STICK_FIRST = 4, PAD_WORD_STICK_LAST = 7 };
+#define PAD_STICK_CENTRE 0x80
+/* A stick this close to centre is at rest: a hand-held stick sits a few counts off it. */
+#define PAD_STICK_REST 8
+
+/* No button down and both sticks at rest: an interval the replay may shorten without changing any input the
+ * guest acts on. */
+static int state_idle(const PadTraceState* s)
+{
+    if (s->len <= PAD_WORD_DIGITAL2) return 1;
+    if (s->words[PAD_WORD_DIGITAL1] || s->words[PAD_WORD_DIGITAL2]) return 0;
+    for (int i = PAD_WORD_STICK_FIRST; i <= PAD_WORD_STICK_LAST && i < s->len; i++) {
+        const int d = (int)s->words[i] - PAD_STICK_CENTRE;
+        if (d > PAD_STICK_REST || d < -PAD_STICK_REST) return 0;
+    }
+    return 1;
 }
 
 static char* dup_str(const char* s)
@@ -928,17 +951,40 @@ static void flip_note(PadTrace* t, uint32_t port, uint64_t seq, uint32_t flip)
 /* The recorded ordinal a poll of `port` is served when the port has sync records. The clock runs one ordinal per
  * poll from the last re-base on (recorded = ordinal - shift) and does not pass the ordinal of the next pending
  * event: the recording made the input after the event only once the event had happened, so the replay does not
- * hand it to a guest that has not got there. Called under the lock. */
+ * hand it to a guest that has not got there.
+ *
+ * A re-base can move the clock forward by many ordinals at once (the event is placed at the guest's flip request,
+ * before the poll that learns of it; or the guest got there before the recording did). Jumping would drop every
+ * record in between: a tap there is never pressed, a hold is cut. The clock therefore closes the gap only over
+ * idle input: inside a press or a stick deflection it advances one ordinal per poll, so the input keeps its
+ * length, and from an idle interval it jumps at most to the next record. Called under the lock. */
 static uint64_t sync_ordinal(PadTrace* t, uint32_t port, uint64_t seq, int* waiting)
 {
-    int64_t rec = (int64_t)seq - t->sync_shift[port];
+    int64_t target = (int64_t)seq - t->sync_shift[port];
     const size_t i = t->sync_next[port];
-    if (i < t->nsyncs[port] && rec > (int64_t)t->syncs[port][i].seq) {
-        rec = (int64_t)t->syncs[port][i].seq;
+    int held = 0;
+    if (i < t->nsyncs[port] && target > (int64_t)t->syncs[port][i].seq) {
+        target = (int64_t)t->syncs[port][i].seq;
+        held = 1;
+    }
+    uint64_t rec = target < 0 ? 0u : (uint64_t)target;
+    const uint64_t from = t->sync_from[port];
+    if (rec > from) {
+        size_t idx = 0;
+        const Rec* cur = from ? rec_at_or_before(t, port, from - 1u, &idx) : NULL;
+        if (cur && !state_idle(&cur->st)) {
+            rec = from;
+        } else {
+            const size_t next = cur ? idx + 1u : 0u;
+            if (next < t->nrecs[port] && t->recs[port][next].seq < rec) rec = t->recs[port][next].seq;
+        }
+    }
+    if (held && rec == (uint64_t)target) {
         *waiting = 1;
         t->stats.sync_waited++;
     }
-    return rec < 0 ? 0u : (uint64_t)rec;
+    if (rec + 1u > t->sync_from[port]) t->sync_from[port] = rec + 1u;
+    return rec;
 }
 
 void pad_trace_poll(PadTrace* t, uint32_t port, PadTraceState* st, const PadTraceState* neutral)
@@ -1021,9 +1067,12 @@ void pad_trace_sync_event(PadTrace* t, uint32_t kind, uint64_t key, uint32_t fra
     trace_lock_acquire(&t->lock);
     for (uint32_t p = 0; p < t->ports; p++) {
         const size_t n = t->nsyncs[p];
+        /* An event may pass over a few pending records whose events never came (a pipeline the run already had);
+         * one further ahead is far more likely the same key built again than the course jumping forward. */
+        const size_t lim = n - t->sync_next[p] > PAD_TRACE_SYNC_SKIP_MAX + 1u ? t->sync_next[p] + PAD_TRACE_SYNC_SKIP_MAX + 1u : n;
         size_t i = t->sync_next[p];
-        while (i < n && !(t->syncs[p][i].kind == kind && t->syncs[p][i].key == key)) i++;
-        if (i == n) continue;   /* not an event this port waits for (or already passed) */
+        while (i < lim && !(t->syncs[p][i].kind == kind && t->syncs[p][i].key == key)) i++;
+        if (i == lim) continue;   /* not an event this port waits for now (or already passed) */
         /* The guest event happened when the guest made its `frame`-th flip request: after the polls noted for it, or
          * just now when the guest has not polled since (or the frame is unknown). Not when this call arrives: the
          * draw engine reports a frame later than the guest made it, by as much as the engine lags the guest. */

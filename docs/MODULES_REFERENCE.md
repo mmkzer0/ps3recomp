@@ -344,9 +344,13 @@ a port, that port's input clock is re-based: its next poll is served the record'
 from there, so the guest meets the input that followed the event in the recording at the same distance from the
 event. Until the next pending event is reported the clock does not pass its `seq`: the replay does not hand the
 guest the input the recording made after an event before the guest has got there, it holds the state of that
-ordinal. An event reported out of order re-bases on its own record and counts the pending records before it as
-missed; an event with no pending record is ignored. Because the replay waits for a pending event, a run whose
-guest never reports it stops advancing its input and goes visibly off course rather than getting input for a
+ordinal. A re-base that moves the clock forward never skips a record: it closes the gap only over idle input (no
+button down, sticks within 8 of centre), so a press or a stick deflection keeps its recorded length and arrives
+late rather than not at all. An event reported out of order re-bases on its own record and counts the pending
+records before it as missed, if it passes over at most `PAD_TRACE_SYNC_SKIP_MAX` (3) of them; an event further
+ahead (more likely the same pipeline built again) or with no pending record is ignored. Because the replay
+waits for a pending event, a run whose guest never reports it stops advancing its input and goes visibly off
+course rather than getting input for a
 screen it never reached. `sync=<hit>/<records> sync_missed=<n> sync_waited=<polls>` is appended to the summary of
 a trace with sync records (nothing is appended otherwise), and each re-base prints a `pad replay sync` line with
 the shift in polls. Sync records need `pad.replay_repeat` 1.
