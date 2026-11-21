@@ -144,7 +144,7 @@ static void vk_mutex_unlock(vk_mutex* m)  { pthread_mutex_unlock(m); }
     X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdDraw) \
     X(vkCmdSetStencilReference) X(vkCmdSetDepthBounds) X(vkCmdSetBlendConstants) X(vkCmdSetDepthBias) \
     X(vkCmdBindIndexBuffer) X(vkCmdDrawIndexed) \
-    X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCmdBlitImage)
+    X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCmdBlitImage) X(vkCmdClearAttachments)
 /* Window-system entry points, loaded only when a window was requested, so a
  * headless run never depends on a driver that can present. */
 #define VK_WSI_INSTANCE_FNS(X) \
@@ -834,6 +834,31 @@ static u32 s_eb_inflight;
 #define VK_EB_BUSY() (s_eb_pending || s_eb_inflight)
 /* Bumped whenever a command buffer begins: a vk_hz of an older epoch is stale. Walker thread only. */
 static u32 s_hz_epoch = 1;
+/* vk.coalesce_passes: the render pass the open batch's command buffer is inside. Consecutive draws that resolve
+ * to the same render pass and framebuffer keep it open; everything that records outside a pass (barriers,
+ * clears, copies, uploads) and every submission ends it first (vk_pass_end). Walker thread only. */
+static struct {
+    int                open;
+    VkCommandBuffer    cb;
+    VkRenderPass       rp;
+    VkFramebuffer      fb;
+    u32                rt[RSX_BE_MAX_COLOR_TARGETS], nrt, depth, w, h;     /* what the framebuffer holds */
+    unsigned long long begun, folded;                     /* passes begun, clears recorded inside one */
+    unsigned long long ends[4];                           /* passes ended early, by VK_PASS_END_* */
+} s_pass;
+
+/* Why a pass ended before the draws that follow had their say: a barrier an access needed (a draw sampling an image
+ * written earlier, a conflict with a copy), a transfer (clear, upload, snapshot copy), another framebuffer, the
+ * submission. VK_PASS_END_DRAW is the one-pass-per-draw mode ending its pass: not a break, not counted. */
+enum { VK_PASS_END_HAZARD, VK_PASS_END_TRANSFER, VK_PASS_END_FRAMEBUFFER, VK_PASS_END_SUBMIT, VK_PASS_END_DRAW };
+
+static void vk_pass_end(int why)
+{
+    if (!s_pass.open) return;
+    pvkCmdEndRenderPass(s_pass.cb);
+    s_pass.open = 0;
+    if (why != VK_PASS_END_DRAW) s_pass.ends[why]++;
+}
 static int vk_eng_flush(void);       /* submit the open batch and wait until the GPU is done with all */
 static int vk_eng_kick(void);        /* submit the open batch, no wait */
 static int vk_eb_active(void);       /* batching decided on and on */
@@ -1334,6 +1359,7 @@ static int vk_cmd_begin(VkCommandBuffer cb)
                                     .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
     if (vk_engine_check_result(pvkBeginCommandBuffer(cb, &bi), "vkBeginCommandBuffer")) return -1;
     if (++s_hz_epoch == 0) s_hz_epoch = 1;      /* whatever the previous buffer tracked is stale */
+    s_pass.open = 0;                            /* a buffer begun again has no pass, whatever the last one did */
     /* A present's copy may still be reading the surface this frame is about
      * to draw over: order everything here after it. Set only by a present,
      * which never runs alongside the walker's recording. */
@@ -1362,6 +1388,11 @@ static int vk_begin(void)
 static int vk_submit_cb(VkCommandBuffer cb, VkFence fence)
 {
     if (s_vk.eng_active && atomic_load_explicit(&s_eng_submission_pending, memory_order_acquire)) {
+        vk_engine_latch_fault();
+        return -1;
+    }
+    if (s_pass.open && s_pass.cb == cb) {   /* every path that ends a batch ends its pass first */
+        VK_LOG("engine: a command buffer was about to end inside a render pass\n");
         vk_engine_latch_fault();
         return -1;
     }
@@ -1509,6 +1540,7 @@ static void vk_hz_use(vk_image* im, VkImageAspectFlags aspect, int kind)
             .image = im->img,
             .subresourceRange = { aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS },
         };
+        vk_pass_end(VK_PASS_END_HAZARD);  /* a pipeline barrier is not allowed inside a render pass */
         VK_OPS_ADD(s_ops.win, image_barriers);
         VK_OPS_ADD(s_ops.tot, image_barriers);
         pvkCmdPipelineBarrier(s_vk.cmd, src_stage, dst_stage, 0, 0, NULL, 0, NULL, 1, &b);
@@ -3939,6 +3971,37 @@ static void vk_eng_bind_targets(void* user, const u32* surfaces, u32 count, u32 
     s_eng_bound.depth = depth;
 }
 
+/* A clear of an attachment of the open pass, recorded inside it by vkCmdClearAttachments over the render area,
+ * which is the whole image when the image is the pass's size: ordered with the draws around it like one.
+ * Returns 0 when it does not apply (no pass, another image, a larger depth image) and the clear is a transfer. */
+static int vk_pass_clear_color(u32 surface, const vk_eng_obj* o, const VkClearColorValue* v)
+{
+    if (!s_pass.open || s_pass.cb != s_vk.cmd || o->w != s_pass.w || o->h != s_pass.h) return 0;
+    for (u32 i = 0; i < s_pass.nrt; i++) {
+        if (s_pass.rt[i] != surface) continue;
+        VkClearAttachment ca = { .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .colorAttachment = i };
+        ca.clearValue.color = *v;
+        VkClearRect cr = { .rect = { { 0, 0 }, { s_pass.w, s_pass.h } }, .baseArrayLayer = 0, .layerCount = 1 };
+        pvkCmdClearAttachments(s_vk.cmd, 1, &ca, 1, &cr);
+        s_pass.folded++;
+        return 1;
+    }
+    return 0;
+}
+
+static int vk_pass_clear_depth(u32 depth, const vk_eng_obj* o, VkImageAspectFlags aspect,
+                               const VkClearDepthStencilValue* d)
+{
+    if (!s_pass.open || s_pass.cb != s_vk.cmd || depth != s_pass.depth || o->w != s_pass.w || o->h != s_pass.h)
+        return 0;
+    VkClearAttachment ca = { .aspectMask = aspect };
+    ca.clearValue.depthStencil = *d;
+    VkClearRect cr = { .rect = { { 0, 0 }, { s_pass.w, s_pass.h } }, .baseArrayLayer = 0, .layerCount = 1 };
+    pvkCmdClearAttachments(s_vk.cmd, 1, &ca, 1, &cr);
+    s_pass.folded++;
+    return 1;
+}
+
 static void vk_eng_clear_color(void* user, u32 surface, const float rgba[4])
 {
     (void)user;
@@ -3953,6 +4016,8 @@ static void vk_eng_clear_color(void* user, u32 surface, const float rgba[4])
     if (batched ? (!s_eb_pending && vk_eb_begin()) : vk_begin()) return;
     VkClearColorValue v;
     memcpy(v.float32, rgba, sizeof v.float32);
+    if (batched && vk_pass_clear_color(surface, o, &v)) { vk_eb_recorded(); return; }
+    vk_pass_end(VK_PASS_END_TRANSFER);
     VkImageSubresourceRange r = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
     vk_hz_use(&o->im, VK_IMAGE_ASPECT_COLOR_BIT, VK_HZ_XFER_W);
     pvkCmdClearColorImage(s_vk.cmd, o->im.img, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &r);
@@ -3972,6 +4037,8 @@ static void vk_eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
     const int batched = vk_eb_active();
     if (batched ? (!s_eb_pending && vk_eb_begin()) : vk_begin()) return;
     VkClearDepthStencilValue d = { depth_value, stencil };
+    if (batched && vk_pass_clear_depth(depth, o, aspect, &d)) { vk_eb_recorded(); return; }
+    vk_pass_end(VK_PASS_END_TRANSFER);
     VkImageSubresourceRange r = { aspect, 0, 1, 0, 1 };
     vk_hz_use(&o->im, s_vk.depth_aspect, VK_HZ_XFER_W);
     pvkCmdClearDepthStencilImage(s_vk.cmd, o->im.img, VK_IMAGE_LAYOUT_GENERAL, &d, 1, &r);
@@ -4293,6 +4360,7 @@ static u32 vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
     const int batch = vk_eb_active();
     int rc = batch ? (s_eb_pending ? 0 : vk_eb_begin()) : vk_begin();
     if (!rc) {
+        vk_pass_end(VK_PASS_END_TRANSFER);
         vk_hz_use(&z->im, s_vk.depth_aspect, VK_HZ_XFER_R);
         vk_hz_use(&t->im, VK_IMAGE_ASPECT_COLOR_BIT, VK_HZ_XFER_W);
         /* The bounce buffer: a snapshot earlier in this command buffer has read it by its copy in, which
@@ -5191,6 +5259,7 @@ static struct {
     int              on;            /* -1 undecided, 0 off, 1 on */
     u32              max_draws;
     u32              min_draws;     /* vk.draw_batch_min, at most max_draws; 0 = the kick rule is the cap alone */
+    int              coalesce;      /* vk.coalesce_passes, only with batching */
     vk_buffer        vb, ib, ub, sb;
     VkDeviceSize     vb_head, ib_head, ub_head, sb_head, ub_align;   /* inside the current slot's slice */
     vk_eb_slot       slot[VK_EB_SLOTS];
@@ -5212,6 +5281,7 @@ static int vk_eb_on(void)
                s_eb.min_draws, s_eb.max_draws, s_eb.max_draws);
         s_eb.min_draws = s_eb.max_draws;
     }
+    s_eb.coalesce = ps3_cfg_vk_coalesce_passes();
     VkPhysicalDeviceProperties p;
     pvkGetPhysicalDeviceProperties(s_vk.phys, &p);
     s_eb.ub_align = p.limits.minUniformBufferOffsetAlignment ? p.limits.minUniformBufferOffsetAlignment : 256;
@@ -5237,6 +5307,8 @@ static int vk_eb_on(void)
     if (s_eb.min_draws)
         VK_LOG("draw batching: from %u draws a batch is also submitted whenever the GPU is idle "
                "(fence polled every %u operations)\n", s_eb.min_draws, VK_EB_POLL_OPS);
+    if (s_eb.coalesce)
+        VK_LOG("draw batching: a render pass stays open across draws into one framebuffer (vk.coalesce_passes)\n");
     s_eb.on = 1;
     return 1;
 }
@@ -5258,6 +5330,12 @@ static void vk_eb_release(void)
                "fence polls %llu, %.3f ms in total (%.0f ns each)\n",
                s_eb.kicks_full, s_eb.kicks_idle, s_eb.flushes - s_eb.kicks_full - s_eb.kicks_idle, s_eb.polls,
                (double)s_eb.poll_ns / 1e6, s_eb.polls ? (double)s_eb.poll_ns / (double)s_eb.polls : 0.0);
+    if (s_stat.submits && s_eb.coalesce)
+        VK_LOG("render passes: %llu batched draws in %llu passes, %llu clears recorded inside a pass; "
+               "passes ended by a hazard %llu, a transfer %llu, a framebuffer change %llu, a submission %llu\n",
+               s_eb.draws, s_pass.begun, s_pass.folded, s_pass.ends[VK_PASS_END_HAZARD],
+               s_pass.ends[VK_PASS_END_TRANSFER], s_pass.ends[VK_PASS_END_FRAMEBUFFER],
+               s_pass.ends[VK_PASS_END_SUBMIT]);
     vk_destroy_buffer(&s_eb.vb);
     vk_destroy_buffer(&s_eb.ib);
     vk_destroy_buffer(&s_eb.ub);
@@ -5369,6 +5447,7 @@ static int vk_eng_kick(void)
     if (!s_eb_pending) return 0;
     s_eb_pending = 0;               /* first: nothing below may record into this batch */
     s_eb.cur_ready = 0;             /* the slot is full whether or not the queue takes it */
+    vk_pass_end(VK_PASS_END_SUBMIT);       /* the batch's last pass ends before its command buffer does */
     if ((++s_eb.flushes & 0x3FFFu) == 0)
         VK_LOG("draw batching: %llu draws in %llu submissions\n", s_eb.draws, s_eb.flushes);
     if (s_eb.cur_gt) gt_end(s_vk.batch_cmd[s_eb.cur], s_gt.slot_pool[s_eb.cur]);
@@ -5433,6 +5512,7 @@ static int vk_eb_upload(vk_image* im, VkBufferImageCopy* region, const void* src
     for (u32 y = 0; y < rows; y++)
         memcpy((u8*)s_eb.sb.ptr + off + (size_t)y * tight, (const u8*)src + (size_t)y * row_bytes, tight);
     if (!s_eb_pending && vk_eb_begin()) return -1;
+    vk_pass_end(VK_PASS_END_TRANSFER);
     vk_hz_use(im, VK_IMAGE_ASPECT_COLOR_BIT, VK_HZ_XFER_W);
     region->bufferOffset = off;
     pvkCmdCopyBufferToImage(s_vk.cmd, s_eb.sb.buf, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, region);
@@ -5609,12 +5689,22 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     for (u32 i = 0; i < n; i++)
         vk_hz_use(&s_eobj[s_eng_bound.rt[i]].im, VK_IMAGE_ASPECT_COLOR_BIT, VK_HZ_ATT);
     vk_hz_use(dkey != 0xFFFFFFFFu ? &zo->im : &s_e2.scratch_depth, s_vk.depth_aspect, VK_HZ_ATT);
-    VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-                                  .renderPass = rp, .framebuffer = fb,
-                                  .renderArea = { { 0, 0 }, { w, h } } };
-    VK_OPS_ADD(s_ops.win, passes);
-    VK_OPS_ADD(s_ops.tot, passes);
-    pvkCmdBeginRenderPass(s_vk.cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+    /* vk.coalesce_passes: the pass stays open while consecutive draws resolve to the same render pass and
+     * framebuffer. Anything that records outside a pass, and any barrier this draw's accesses needed above,
+     * ended the open one already; a different framebuffer ends it here. */
+    if (!(s_pass.open && s_pass.cb == s_vk.cmd && s_pass.rp == rp && s_pass.fb == fb)) {
+        vk_pass_end(VK_PASS_END_FRAMEBUFFER);
+        VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+                                      .renderPass = rp, .framebuffer = fb,
+                                      .renderArea = { { 0, 0 }, { w, h } } };
+        VK_OPS_ADD(s_ops.win, passes);
+        VK_OPS_ADD(s_ops.tot, passes);
+        pvkCmdBeginRenderPass(s_vk.cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+        s_pass.open = 1; s_pass.cb = s_vk.cmd; s_pass.rp = rp; s_pass.fb = fb;
+        s_pass.w = w; s_pass.h = h; s_pass.nrt = n; s_pass.depth = dkey;
+        for (u32 i = 0; i < n; i++) s_pass.rt[i] = s_eng_bound.rt[i];
+        s_pass.begun++;
+    }
     pvkCmdBindPipeline(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     VkViewport vp = { 0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f };
     if (s_e2.have_vp && s_e2.vp[2] > 0.0f && s_e2.vp[3] > 0.0f) {
@@ -5647,7 +5737,7 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     } else {
         pvkCmdDraw(s_vk.cmd, vertex_count, 1, 0, 0);
     }
-    pvkCmdEndRenderPass(s_vk.cmd);
+    if (!(batched && s_eb.coalesce)) vk_pass_end(VK_PASS_END_DRAW);      /* otherwise it stays for the next draw */
     if (!batched) { vk_submit_and_wait_cause(VK_WAIT_UNBATCHED); return; }
     s_eb.draws++;
     vk_eb_recorded();

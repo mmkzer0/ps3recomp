@@ -419,6 +419,17 @@ PS3_CFG_U32(vk, draw_batch_min, 16, 0, 1024,
     "takes 28 and 19 ms at about as many submissions, and the pair with vk.draw_batch_max 128 29 and "
     "22 ms, so a device with costly submissions is for the Ally A/B to settle.")
 
+PS3_CFG_BOOL(vk, coalesce_passes, 0,
+    "With vk.draw_batch: keep one Vulkan render pass open across consecutive draws that resolve to the "
+    "same render pass and framebuffer (the same colour targets and zeta), instead of beginning and "
+    "ending a pass for each draw. A clear of an attachment of the open pass is recorded inside it "
+    "(vkCmdClearAttachments). The pass ends before anything that cannot sit inside one: a barrier (a draw "
+    "that samples an image an earlier draw wrote, a copy, an upload, a clear of another image), another "
+    "framebuffer, and a submission, so a pass never spans two batches and the passes a frame takes are "
+    "its target groups plus its submissions. Ignored without vk.draw_batch. It is meant to change how "
+    "the GPU is driven, not what is drawn; off by default until it is measured on the devices that "
+    "matter (recon out/M4/V1-SIZING-2026-11-21.md). Read once, when the draw engine first draws.")
+
 /* ---- game --------------------------------------------------------------- */
 
 PS3_CFG_BOOL(game, free_space_raw, 0,

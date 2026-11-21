@@ -31,6 +31,12 @@ of its own (the backend reads the registry once) and looks only at what the back
                                      several submission sizes report no validation or hazard error: every
                                      barrier the batch no longer records per draw was not needed; a skip says
                                      when the layer is missing.
+  vk.coalesce_passes                 off by default, said when on, ignored without batching, a malformed value is
+                                     the config-invalid stop; 100 draws into one framebuffer take a few passes,
+                                     a clear between draws of one framebuffer is recorded inside the pass (the
+                                     host scene `--draws=N:S:W:C`), and every scene above, at submission sizes of
+                                     1, 2, 64 and 512, presents the frames batching off does, and reports no
+                                     synchronization error where the validation layer is installed.
 
 The scene's own verdict (its exit code) is not looked at: it checks the draw path's pixels, not these.
 Exit 77: no usable Vulkan device or the draw engine path is not built (needs glslang), nothing to run."""
@@ -245,14 +251,54 @@ def main():
             print("[SKIP] the Khronos validation layer is not installed (VK_LAYER_PATH, the SDK or "
                   "vulkan-validationlayers): the batch's barriers are not checked here")
         else:
-            for scene in scenes + (("--draws=200:16", "--frames=4"),):
+            for scene in scenes + (("--draws=200:16", "--frames=4"), ("--draws=40:0:0:5", "--frames=3")):
                 name = " ".join(scene)
-                for lo, hi in (("0", "1"), ("0", "2"), ("16", "64"), ("16", "512")):
+                for lo, hi, coal in (("0", "1", "0"), ("0", "2", "0"), ("16", "64", "0"), ("16", "512", "0"),
+                                     ("0", "1", "1"), ("0", "2", "1"), ("16", "64", "1"), ("16", "512", "1")):
                     rc, out = run(host, fresh("layer"), *scene, PS3RECOMP_VK_DRAW_BATCH="1",
-                                  PS3RECOMP_VK_DRAW_BATCH_MIN=lo, PS3RECOMP_VK_DRAW_BATCH_MAX=hi, **sync)
+                                  PS3RECOMP_VK_DRAW_BATCH_MIN=lo, PS3RECOMP_VK_DRAW_BATCH_MAX=hi,
+                                  PS3RECOMP_VK_COALESCE_PASSES=coal, **sync)
                     bad = [ln for ln in out.splitlines() if "Validation Error" in ln or "SYNC-HAZARD" in ln]
-                    check(not bad, f"{name}, kick from {lo} up to {hi}: no validation or synchronization error"
-                                   + (f": {bad[0][:200]}" if bad else ""))
+                    check(not bad, f"{name}, kick from {lo} up to {hi}, coalescing {'on' if coal == '1' else 'off'}: "
+                                   "no validation or synchronization error" + (f": {bad[0][:200]}" if bad else ""))
+
+        # ---- vk.coalesce_passes: a render pass kept open across draws into one framebuffer ---------------------
+        rc, out = run(host, fresh("coal-default"), PS3RECOMP_VK_DRAW_BATCH="1")
+        check("render pass stays open" not in out and "render passes:" not in out, "pass coalescing is off by default")
+        rc, out = run(host, fresh("coal-on"), PS3RECOMP_VK_DRAW_BATCH="1", PS3RECOMP_VK_COALESCE_PASSES="1")
+        check("a render pass stays open across draws" in out, "PS3RECOMP_VK_COALESCE_PASSES=1 with batching: said")
+        rc, out = run(host, fresh("coal-nobatch"), PS3RECOMP_VK_COALESCE_PASSES="1")
+        check("render pass stays open" not in out and "render passes:" not in out,
+              "without vk.draw_batch it is ignored")
+        rc, out = run(host, fresh("coal-bad"), PS3RECOMP_VK_DRAW_BATCH="1", PS3RECOMP_VK_COALESCE_PASSES="maybe")
+        check(rc != 0 and "kind=config-invalid" in out and "env=PS3RECOMP_VK_COALESCE_PASSES" in out,
+              "a malformed PS3RECOMP_VK_COALESCE_PASSES is a config-invalid stop")
+        rc, out = run(host, fresh("coal-count"), "--draws=100:0", "--frames=4", PS3RECOMP_VK_DRAW_BATCH="1",
+                      PS3RECOMP_VK_DRAW_BATCH_MIN="0", PS3RECOMP_VK_COALESCE_PASSES="1")
+        m = re.search(r"render passes: (\d+) batched draws in (\d+) passes, (\d+) clears recorded inside a pass", out)
+        check(m is not None and int(m.group(1)) >= 300 and int(m.group(2)) * 10 <= int(m.group(1)),
+              "100 draws into one framebuffer are a few passes, not one each "
+              f"({m.group(0) if m else 'no pass line'})")
+        rc, out = run(host, fresh("coal-clears"), "--draws=40:0:0:5", "--frames=3", PS3RECOMP_VK_DRAW_BATCH="1",
+                      PS3RECOMP_VK_DRAW_BATCH_MIN="0", PS3RECOMP_VK_COALESCE_PASSES="1")
+        m = re.search(r"render passes: (\d+) batched draws in (\d+) passes, (\d+) clears recorded inside a pass", out)
+        check(m is not None and int(m.group(3)) > 0,
+              f"a clear between draws of one framebuffer is recorded inside the pass ({m.group(0) if m else 'no pass line'})")
+        for scene in scenes + (("--draws=200:16", "--frames=4"), ("--draws=40:0:0:5", "--frames=3"),
+                               ("--draws=60:0:0:3", "--frames=3")):
+            name = " ".join(scene)
+            off = fresh("coal-off")
+            run(host, off, *scene, PS3RECOMP_VK_DUMP=str(off / "f"), PS3RECOMP_VK_DUMP_RANGE="0-9")
+            check(len(dumps(off)) >= 2, f"{name}: batching off presents frames to compare: {dumps(off)}")
+            for lo, hi in (("0", "1"), ("0", "2"), ("0", "512"), ("16", "64")):
+                on = fresh("coal-on")
+                rc, out = run(host, on, *scene, PS3RECOMP_VK_DUMP=str(on / "f"), PS3RECOMP_VK_DUMP_RANGE="0-9",
+                              PS3RECOMP_VK_DRAW_BATCH="1", PS3RECOMP_VK_DRAW_BATCH_MIN=lo,
+                              PS3RECOMP_VK_DRAW_BATCH_MAX=hi, PS3RECOMP_VK_COALESCE_PASSES="1")
+                same = dumps(on) == dumps(off) and len(dumps(off)) >= 2 and all(
+                    (on / n).read_bytes() == (off / n).read_bytes() for n in dumps(off))
+                check(same and "VkResult" not in out,
+                      f"{name}, coalescing on, kick from {lo} up to {hi}: frames are byte-identical to batching off")
 
         # ---- the bench's per-draw CPU cost (--draws=N:S:W) hands each draw to the walker at once and changes no pixel
         # of the steady frames (the first present of this host's frame loop depends on where the walker first meets

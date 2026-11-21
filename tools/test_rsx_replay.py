@@ -163,6 +163,12 @@ def test_round_trip(tmp, live):
              "draw batching: on (up to 512 draws per submission)"),
             ("batch-1", {"PS3RECOMP_VK_DRAW_BATCH": "1", "PS3RECOMP_VK_DRAW_BATCH_MAX": "1"},
              "draw batching: on (up to 1 draws per submission)"),
+            ("coalesce-512", {"PS3RECOMP_VK_DRAW_BATCH": "1", "PS3RECOMP_VK_DRAW_BATCH_MAX": "512",
+                              "PS3RECOMP_VK_COALESCE_PASSES": "1"},
+             "a render pass stays open across draws"),
+            ("coalesce-1", {"PS3RECOMP_VK_DRAW_BATCH": "1", "PS3RECOMP_VK_DRAW_BATCH_MAX": "1",
+                            "PS3RECOMP_VK_COALESCE_PASSES": "1"},
+             "a render pass stays open across draws"),
         )
         manifests = []
         for name, env, log in variants:
@@ -175,8 +181,8 @@ def test_round_trip(tmp, live):
             manifests.append(manifest)
             compared, text = cli("rsx-compare", str(live / "capture.ndjson"), str(manifest))
             check(compared == 0 and "equal" in text, f"ps3diff rsx-compare live {name}: equal ({compared})")
-        check(manifests[0].read_bytes() == manifests[1].read_bytes() == manifests[2].read_bytes(),
-              "batching off, max 512 and max 1 write byte-identical replay manifests")
+        check(len({m.read_bytes() for m in manifests}) == 1,
+              "batching off, max 512 and max 1, and pass coalescing at 512 and 1, write byte-identical replay manifests")
 
     legacy = legacy_capture(live, Path(tmp) / "legacy")
     status, text = cli("validate", str(legacy / "capture.ndjson"))

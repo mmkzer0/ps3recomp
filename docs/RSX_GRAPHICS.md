@@ -279,8 +279,17 @@ adds no implicit dependency between two render passes on the same image; the bac
 `vk_hz_use` keeps, per `VkImage` (not per guest surface), which kinds of access the command buffer being recorded
 has made to it and which pairs a barrier already ordered, and emits a barrier only for a conflict that is not ordered
 yet. Whole-image granularity: a write to a second mip level of one texture is a conflict like a rewrite. Blending
-and depth tests inside one pass need nothing: rasterisation order. Nothing is recorded inside a render pass but
-draws.
+and depth tests inside one pass need nothing: rasterisation order.
+
+With `vk.coalesce_passes` a render pass stays open across draws whose render pass (colour format and count) and
+framebuffer (every colour target, the zeta or the scratch depth, the extent) are the same; viewport, scissor and
+the other dynamic state are set per draw inside it. Nothing but draws is recorded inside a pass: a barrier
+(`vk_hz_use` finds a draw sampling an image written earlier in the buffer, or a conflict with a copy), a
+transfer (a clear of another image, a batched upload, the depth snapshot's copies), another framebuffer and a
+submission each end it first, and the counters at shutdown name which. A pass never spans two command buffers,
+so a frame takes its target groups plus its submissions in passes. A clear of an attachment of the open pass, as
+large as the render area, is `vkCmdClearAttachments` inside it. A draw that samples an attachment of the open pass
+(the engine copies it first, so only a feedback it did not catch) is a hazard like any other and ends the pass.
 
 ---
 

@@ -645,15 +645,17 @@ static void emit_programs(const u8* vp, u32 vp_bytes, u32 fp_offset)
  * which happens to be right for these vertices and wrong for a real title's. */
 #define VTX_MAIN(off)  (0x80000000u | (u32)(off))
 
-/* --draws=N[:S[:W]]: the triangle is drawn N times per frame, each in a BEGIN/END pair of its own (the engine
+/* --draws=N[:S[:W[:C]]]: the triangle is drawn N times per frame, each in a BEGIN/END pair of its own (the engine
  * turns one pair into one backend draw), which loads a backend past its per-submission draw cap without a
  * title. With :S the draws are scissored to an S x S corner (0 = the whole target), so the GPU's share of the
  * frame is small and the host's recording cost shows, or large, the other regime. With :W each draw is followed
  * by W microseconds of busy CPU time on this thread, after it went to the walker, standing in for the engine
  * work a title does between draws: a frame is then as walker-bound as a title's. A frame of N draws is 24 * N
  * bytes of the 64 KiB ring below the vertex data, so submit_frame wraps the ring with a JUMP to its start when
- * the next frame would not fit. */
-static unsigned s_repeat_draws = 1, s_scissor_px = 0, s_work_us = 0;
+ * the next frame would not fit. With :C (after :W) the whole target, colour and zeta, is cleared again after
+ * every C draws of a frame but the last, so a backend that keeps a render pass open across draws meets a clear
+ * inside one; the last draws of the frame still show on top of it. */
+static unsigned s_repeat_draws = 1, s_scissor_px = 0, s_work_us = 0, s_clear_every = 0;
 
 static void bench_spin_us(unsigned us)
 {
@@ -683,6 +685,12 @@ static void emit_triangle_draw(void)
             guest_w32(CTRL_ADDR + 0, g_fifo_len);
             cellGcm_rsx_process_fifo();
             bench_spin_us(s_work_us);
+        }
+        if (s_clear_every && (i + 1) % s_clear_every == 0 && i + 1 < s_repeat_draws) {
+            /* A colour of its own each time, so a clear that did not run shows as another background. */
+            emit(NV4097_SET_COLOR_CLEAR_VALUE,    0xFF000000u | ((CLEAR_ARGB + (u32)(i + 1) * 0x00050301u) & 0x00FFFFFFu));
+            emit(NV4097_SET_ZSTENCIL_CLEAR_VALUE, 0xFFFFFF00u);   /* depth 1.0, stencil 0 */
+            emit(NV4097_CLEAR_SURFACE,            0xF3u);         /* colour, depth and stencil */
         }
     }
 }
@@ -1301,7 +1309,7 @@ static void emit_quad_draws(void)
  * overwrite the last one. */
 static void submit_frame(int with_draw)
 {
-    if (s_repeat_draws != 1 && g_fifo_len + 128u + 24u * s_repeat_draws > CMD_SIZE - 8u) {
+    if (s_repeat_draws != 1 && g_fifo_len + 128u + (s_clear_every ? 48u : 24u) * s_repeat_draws > CMD_SIZE - 8u) {
         guest_w32(IO_ADDR + g_fifo_len, 0x20000000u);   /* JUMP 0: the walker follows it to the start, where put now stands */
         guest_w32(CTRL_ADDR + 0, 0);
         cellGcm_rsx_process_fifo();
@@ -1617,7 +1625,8 @@ int main(int argc, char** argv)
         else if (strcmp(argv[i], "--draw") == 0)   do_draw = 1;
         else if (strncmp(argv[i], "--draws=", 8) == 0) {
             do_draw = 1;
-            if (sscanf(argv[i] + 8, "%u:%u:%u", &s_repeat_draws, &s_scissor_px, &s_work_us) < 1) s_repeat_draws = 0;
+            if (sscanf(argv[i] + 8, "%u:%u:%u:%u", &s_repeat_draws, &s_scissor_px, &s_work_us, &s_clear_every) < 1)
+                s_repeat_draws = 0;
         }
         /* --threads: no graphics at all, just the lv2 thread path. */
         else if (strcmp(argv[i], "--threads") == 0) {
