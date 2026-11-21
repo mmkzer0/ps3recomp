@@ -120,7 +120,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ~/apt-archives
-          key: apt-ubuntu-24.04-v2
+          key: apt-ubuntu-24.04-v3
       - name: Install dependencies
         id: apt-install
         # The runners' Ubuntu mirror is at times very slow or hangs: on
@@ -136,7 +136,7 @@ jobs:
           APT="$APT -o Dir::Cache::Archives=$HOME/apt-archives"
           PKGS="ninja-build libsdl2-dev libvulkan-dev clang lld g++-14 glslang-dev glslang-tools spirv-tools
                 libspirv-cross-c-shared-dev gcc-powerpc64-linux-gnu g++-powerpc64-linux-gnu
-                binutils-powerpc64-linux-gnu"
+                binutils-powerpc64-linux-gnu mesa-vulkan-drivers"
           ok=0
           for attempt in 1 2 3; do
             if sudo timeout 300 apt-get $APT update &&
@@ -153,12 +153,12 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ~/apt-archives
-          key: apt-ubuntu-24.04-v2
+          key: apt-ubuntu-24.04-v3
       - name: Configure
         # The synthetic synlib variants require the PowerPC64 cross toolchain
         # installed above: a missing one is a configure error here, never a
-        # silently skipped suite. The Vulkan backend has no CI GPU, so it is
-        # built only; its SPIR-V translator must not fall back to the stub.
+        # silently skipped suite. The Vulkan backend has no CI GPU; its SPIR-V
+        # translator must not fall back to the stub.
         run: >-
           CC=${{ matrix.cc }} CXX=${{ matrix.cxx }} cmake --preset dev
           -DPS3RECOMP_DIFF_SYNTHETIC_REQUIRED=ON
@@ -167,3 +167,15 @@ jobs:
         run: cmake --build --preset dev
       - name: Test
         run: ctest --preset t0
+      - name: Vulkan draw batching on lavapipe
+        # Mesa's CPU Vulkan driver runs the draw-batch and replay gates that a
+        # GPU-less runner would skip. Batches in flight reuse a slot only after
+        # its fence: removing that wait was caught on lavapipe and missed on
+        # Apple's Metal-backed drivers, so this run is the guard. A skip fails.
+        env:
+          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.json
+        # `! cmd` never trips bash -e, so the skip check is an explicit if.
+        run: |
+          ctest --preset t0 -R '^(vk_draw_batch|rsx_replay)$' --output-on-failure | tee vk.log
+          if grep -qE 'Not Run|Skipped' vk.log; then echo "::error::a Vulkan gate was skipped"; exit 1; fi
+          test "$(grep -cE 'Test +#[0-9]+: (vk_draw_batch|rsx_replay) .* Passed' vk.log)" = 2
