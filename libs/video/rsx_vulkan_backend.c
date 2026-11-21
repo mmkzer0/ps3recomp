@@ -291,6 +291,30 @@ static vk_state s_vk;
 static atomic_int s_eng_fault = ATOMIC_VAR_INIT(0);
 /* A failed fence wait leaves accepted work potentially in flight. */
 static atomic_int s_eng_submission_pending = ATOMIC_VAR_INIT(0);
+
+/* What the submission path costs, logged once at engine shutdown: the figures
+ * vk.draw_batch exists to move. `wait_ns` is the walker blocked in a fence wait;
+ * the present's own wait can run on a host thread, so it is counted apart. */
+static struct {
+    unsigned long long submits, waits, wait_ns;
+    atomic_ullong      present_wait_ns;
+} s_stat;
+
+static unsigned long long vk_now_ns(void)
+{
+    return (unsigned long long)((double)SDL_GetPerformanceCounter() * 1e9 /
+                                (double)SDL_GetPerformanceFrequency());
+}
+
+/* The walker's blocking fence wait, timed. */
+static VkResult vk_wait_fence(VkFence fence)
+{
+    const unsigned long long t0 = vk_now_ns();
+    const VkResult r = pvkWaitForFences(s_vk.device, 1, &fence, VK_TRUE, UINT64_MAX);
+    s_stat.waits++;
+    s_stat.wait_ns += vk_now_ns() - t0;
+    return r;
+}
 #if defined(PS3RECOMP_RSX_VULKAN_TEST_SEAMS)
 static atomic_uint s_test_fail_submissions = ATOMIC_VAR_INIT(0);
 static int vk_test_consume_submission_failure(void)
@@ -876,7 +900,8 @@ static int vk_submit_and_wait(void)
                         .commandBufferCount = 1, .pCommandBuffers = &s_vk.cmd };
     if (vk_engine_check_result(pvkResetFences(s_vk.device, 1, &s_vk.fence), "vkResetFences")) return -1;
     if (vk_engine_check_result(vk_queue_submit(&si, s_vk.fence), "vkQueueSubmit")) return -1;
-    const VkResult waited = pvkWaitForFences(s_vk.device, 1, &s_vk.fence, VK_TRUE, UINT64_MAX);
+    s_stat.submits++;
+    const VkResult waited = vk_wait_fence(s_vk.fence);
     if (waited != VK_SUCCESS) {
         if (s_vk.eng_active)
             atomic_store_explicit(&s_eng_submission_pending, 1, memory_order_release);
@@ -2464,7 +2489,9 @@ static void vk_present_wait_gpu(void)
 static void vk_present_complete_locked(void)
 {
     if (!s_vk.present_inflight) return;
+    const unsigned long long pw0 = vk_now_ns();
     pvkWaitForFences(s_vk.device, 1, &s_vk.present_fence, VK_TRUE, UINT64_MAX);
+    atomic_fetch_add_explicit(&s_stat.present_wait_ns, vk_now_ns() - pw0, memory_order_relaxed);
     __atomic_store_n(&s_vk.present_inflight, 0, __ATOMIC_RELEASE);
 
     vk_invalidate(&s_vk.readback);
@@ -4051,6 +4078,11 @@ static int vk_eb_on(void)
 static void vk_eb_release(void)
 {
     if (s_eb_pending) vk_eng_flush();
+    if (s_stat.submits)
+        VK_LOG("submissions: %llu (%llu draws in %llu batches), walker fence waits %llu blocked %.2f ms, "
+               "present wait %.2f ms over %u presents\n",
+               s_stat.submits, s_eb.draws, s_eb.flushes, s_stat.waits, (double)s_stat.wait_ns / 1e6,
+               (double)atomic_load_explicit(&s_stat.present_wait_ns, memory_order_relaxed) / 1e6, s_vk.presented);
     vk_destroy_buffer(&s_eb.vb);
     vk_destroy_buffer(&s_eb.ib);
     vk_destroy_buffer(&s_eb.ub);
@@ -4703,6 +4735,7 @@ void rsx_vulkan_backend_test_fail_next_engine_submissions(u32 count)
 
 int rsx_vulkan_backend_init(u32 width, u32 height, const char* title)
 {
+    memset(&s_stat, 0, sizeof s_stat);
     atomic_store_explicit(&s_eng_fault, 0, memory_order_relaxed);
     atomic_store_explicit(&s_eng_submission_pending, 0, memory_order_relaxed);
 #if defined(PS3RECOMP_RSX_VULKAN_TEST_SEAMS)
