@@ -170,6 +170,27 @@ def main():
                     (on / n).read_bytes() == (off / n).read_bytes() for n in dumps(off))
                 check(same and "VkResult" not in out,
                       f"{name}, {cap} operation(s) per submission: frames are byte-identical to batching off")
+
+        # ---- gpu timing: a diagnostic that changes no pixel, and says what it did --------------------------
+        scene = ("--draws=24", "--frames=4")
+        quiet = fresh("timing-off")
+        rc, out = run(host, quiet, *scene, PS3RECOMP_VK_DUMP=str(quiet / "f"), PS3RECOMP_VK_DUMP_RANGE="0-9",
+                      PS3RECOMP_VK_DRAW_BATCH="1")
+        check("gpu timing" not in out, "gpu timing is silent unless asked for")
+        timed = fresh("timing-on")
+        rc, out = run(host, timed, *scene, PS3RECOMP_VK_DUMP=str(timed / "f"), PS3RECOMP_VK_DUMP_RANGE="0-9",
+                      PS3RECOMP_VK_DRAW_BATCH="1", PS3RECOMP_VK_GPU_TIMING="2")
+        if "gpu timing: on" in out:
+            check("gpu timing (window)" in out and "gpu timing (total):" in out and "busy" in out,
+                  "PS3RECOMP_VK_GPU_TIMING=2: a window line every 2 presents and a total at shutdown")
+            check("pairs were not available" not in out, "every timestamp pair was available when read")
+        else:
+            check("gpu timing: not available" in out, "a queue without timestamps says so and measures nothing")
+        same = dumps(timed) == dumps(quiet) and len(dumps(quiet)) >= 2 and all(
+            (timed / n).read_bytes() == (quiet / n).read_bytes() for n in dumps(quiet))
+        check(same and "VkResult" not in out, "gpu timing on: frames are byte-identical to gpu timing off")
+        rc, out = run(host, fresh("timing-bad"), PS3RECOMP_VK_DRAW_BATCH="1", PS3RECOMP_VK_GPU_TIMING="often")
+        check("stays off" in out and "gpu timing: on" not in out, "a malformed PS3RECOMP_VK_GPU_TIMING keeps it off, said")
     print(f"failed {FAILED}" if FAILED else "all checks passed")
     return 1 if FAILED else 0
 
