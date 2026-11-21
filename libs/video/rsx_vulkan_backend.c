@@ -95,6 +95,9 @@ static void vk_mutex_unlock(vk_mutex* m)  { pthread_mutex_unlock(m); }
 #ifndef _WIN32
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_vulkan.h>
+#ifdef __APPLE__
+#  include <dispatch/dispatch.h>   /* the main queue, where Cocoa work runs (see "Optional window") */
+#endif
 #endif
 
 #include <stddef.h>
@@ -2382,12 +2385,216 @@ static void vk_cb_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
  * offscreen image, so readback and every test are unchanged; a present then
  * also blits that image into the next swapchain image. Runtime failures drop
  * back to headless; macOS reports an unavailable requested surface at init.
+ * On macOS every SDL window call runs on the main thread (see vk_on_main).
  * -------------------------------------------------------------------------*/
 static int vk_env_on(const char* name)
 {
     const char* v = getenv(name);
     return v && v[0] && v[0] != '0';
 }
+
+#ifndef _WIN32
+/* What the window shows now, as SDL has it. Called on the thread that owns the window, or on any thread where SDL
+ * allows it (everywhere but macOS, where vk_window_view below reads the main thread's copy). */
+static void vk_window_view_sdl(int* w, int* h, int* minimized)
+{
+    *w = *h = 0;
+    *minimized = (SDL_GetWindowFlags(s_vk.window) & SDL_WINDOW_MINIMIZED) != 0;
+    SDL_Vulkan_GetDrawableSize(s_vk.window, w, h);
+}
+
+/* Window events. VK_EV_RESIZED covers the size, restore, maximize and fullscreen changes that make the swapchain stale. */
+enum { VK_EV_QUIT = 1, VK_EV_RESIZED = 2 };
+
+/* Drains SDL's event queue. Called on the thread that owns the window. */
+static int vk_poll_events(void)
+{
+    int ev = 0;
+    SDL_Event e;
+    while (SDL_PollEvent(&e)) {
+        if (e.type == SDL_QUIT) ev |= VK_EV_QUIT;
+        else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) ev |= VK_EV_QUIT;
+        else if (e.type == SDL_KEYDOWN && !e.key.repeat && s_vk.window &&
+                 (e.key.keysym.sym == SDLK_F11 ||
+                  (e.key.keysym.sym == SDLK_RETURN && (e.key.keysym.mod & KMOD_ALT)))) {
+            /* Borderless fullscreen on the window's display, and back. */
+            const int full = (SDL_GetWindowFlags(s_vk.window) & SDL_WINDOW_FULLSCREEN_DESKTOP) != 0;
+            if (SDL_SetWindowFullscreen(s_vk.window, full ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP) == 0)
+                SDL_ShowCursor(full ? SDL_ENABLE : SDL_DISABLE);
+            ev |= VK_EV_RESIZED;
+        } else if (e.type == SDL_WINDOWEVENT &&
+                   (e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED || e.window.event == SDL_WINDOWEVENT_RESTORED ||
+                    e.window.event == SDL_WINDOWEVENT_MAXIMIZED)) {
+            ev |= VK_EV_RESIZED;
+        }
+    }
+    return ev;
+}
+
+#define VK_MAIN_STALL \
+    "the main thread did not serve the main queue within 10 s: a host that starts this backend off the main " \
+    "thread must keep the main thread running its CFRunLoop while it does"
+
+#ifdef __APPLE__
+/* Cocoa belongs to the main thread. SDL's Cocoa video driver refuses to initialise anywhere else (its
+ * Cocoa_CreateDevice returns NULL unless [NSThread isMainThread], which SDL_VideoInit reports as "No available video
+ * device"), and window creation, event pumping and the CAMetalLayer behind SDL_Vulkan_CreateSurface are main-thread
+ * work too. A host that starts the backend on a thread of its own (an RSX walker thread) keeps recording, submitting
+ * and presenting there -- vkQueuePresentKHR is not a main-thread call -- while every SDL window call is handed to the
+ * main queue and the window's events are pumped by a timer on that queue. Both need the host's main thread to be
+ * running a CFRunLoop; the hand-off gives up after VK_MAIN_TIMEOUT_NS rather than hang if it is not. A host that
+ * starts the backend on the main thread takes none of these paths. */
+#define VK_MAIN_TIMEOUT_NS  (10ull * NSEC_PER_SEC)
+#define VK_PUMP_PERIOD_NS   (8ull * NSEC_PER_MSEC)
+
+enum { VK_JOB_PENDING, VK_JOB_RUNNING, VK_JOB_ABANDONED };
+
+typedef struct vk_main_job {
+    void (*fn)(void*);
+    void* arg;
+    atomic_int state;
+    atomic_int refs;                 /* the caller's and the queued block's */
+    dispatch_semaphore_t done;
+} vk_main_job;
+
+static void vk_main_job_unref(vk_main_job* j)
+{
+    if (atomic_fetch_sub(&j->refs, 1) == 1) {
+        dispatch_release(j->done);
+        free(j);
+    }
+}
+
+/* On the main queue. A job its caller gave up on is skipped, so an abandoned `arg` (a stack object) is never touched. */
+static void vk_main_job_run(void* p)
+{
+    vk_main_job* j = (vk_main_job*)p;
+    int expect = VK_JOB_PENDING;
+    if (atomic_compare_exchange_strong(&j->state, &expect, VK_JOB_RUNNING)) {
+        j->fn(j->arg);
+        dispatch_semaphore_signal(j->done);
+    }
+    vk_main_job_unref(j);
+}
+
+/* Runs fn(arg) on the main thread and waits for it: directly when this is the main thread, else on the main queue.
+ * 0 once it has run; -1 when it did not and never will (no memory, or the main queue was not served in time). */
+static int vk_on_main(void (*fn)(void*), void* arg)
+{
+    if (pthread_main_np()) { fn(arg); return 0; }
+    vk_main_job* j = (vk_main_job*)calloc(1, sizeof *j);
+    if (!j) return -1;
+    j->done = dispatch_semaphore_create(0);
+    if (!j->done) { free(j); return -1; }
+    j->fn = fn;
+    j->arg = arg;
+    atomic_init(&j->state, VK_JOB_PENDING);
+    atomic_init(&j->refs, 2);
+    dispatch_async_f(dispatch_get_main_queue(), j, vk_main_job_run);
+    int rc = 0;
+    if (dispatch_semaphore_wait(j->done, dispatch_time(DISPATCH_TIME_NOW, (int64_t)VK_MAIN_TIMEOUT_NS)) != 0) {
+        int expect = VK_JOB_PENDING;
+        if (atomic_compare_exchange_strong(&j->state, &expect, VK_JOB_ABANDONED)) rc = -1;
+        else dispatch_semaphore_wait(j->done, DISPATCH_TIME_FOREVER);   /* it started, so it finishes */
+    }
+    vk_main_job_unref(j);
+    return rc;
+}
+
+static dispatch_source_t s_vk_pump_timer;    /* main queue only */
+static int s_vk_main_owned;                  /* the timer runs: events and the window's size come from it */
+static atomic_int s_vk_main_events;          /* VK_EV_* bits the timer saw and the pump has not taken */
+static atomic_ullong s_vk_main_view;         /* minimized << 60 | width << 30 | height, as the timer last saw it */
+
+static void vk_publish_view(void)
+{
+    int w, h, minimized;
+    vk_window_view_sdl(&w, &h, &minimized);
+    atomic_store(&s_vk_main_view, ((unsigned long long)(minimized != 0) << 60) |
+                                  ((unsigned long long)(w > 0 ? w : 0) << 30) | (unsigned long long)(h > 0 ? h : 0));
+}
+
+/* Main queue. The size goes out before the event bits, so a pump that sees "resized" also sees the new size. */
+static void vk_pump_tick(void* unused)
+{
+    (void)unused;
+    if (!s_vk.window) return;
+    const int ev = vk_poll_events();
+    vk_publish_view();
+    if (ev) atomic_fetch_or(&s_vk_main_events, ev);
+}
+
+static int vk_pump_timer_start(void)
+{
+    dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    if (!t) return -1;
+    dispatch_source_set_timer(t, dispatch_time(DISPATCH_TIME_NOW, 0), VK_PUMP_PERIOD_NS, NSEC_PER_MSEC);
+    dispatch_source_set_event_handler_f(t, vk_pump_tick);
+    s_vk_pump_timer = t;
+    atomic_store(&s_vk_main_events, 0);
+    s_vk_main_owned = 1;
+    dispatch_resume(t);
+    return 0;
+}
+
+static void vk_pump_timer_stop(void)         /* main queue: no tick is running, and a cancelled source starts none */
+{
+    if (!s_vk_pump_timer) return;
+    dispatch_source_cancel(s_vk_pump_timer);
+    dispatch_release(s_vk_pump_timer);
+    s_vk_pump_timer = NULL;
+}
+
+static void vk_window_view(int* w, int* h, int* minimized)
+{
+    if (!s_vk_main_owned) { vk_window_view_sdl(w, h, minimized); return; }
+    const unsigned long long v = atomic_load(&s_vk_main_view);
+    *minimized = (int)((v >> 60) & 1);
+    *w = (int)((v >> 30) & 0x3fffffffu);
+    *h = (int)(v & 0x3fffffffu);
+}
+#else
+static int vk_on_main(void (*fn)(void*), void* arg) { fn(arg); return 0; }
+
+static void vk_window_view(int* w, int* h, int* minimized) { vk_window_view_sdl(w, h, minimized); }
+#endif
+
+typedef struct { int ok; char err[256]; } vk_surface_job;
+
+static void vk_create_surface_cb(void* p)
+{
+    vk_surface_job* j = (vk_surface_job*)p;
+    j->ok = SDL_Vulkan_CreateSurface(s_vk.window, s_vk.instance, &s_vk.surface) != SDL_FALSE;
+    if (!j->ok) snprintf(j->err, sizeof j->err, "SDL_Vulkan_CreateSurface failed: %s", SDL_GetError());
+}
+
+/* 0 on success; -1 with the reason in why. */
+static int vk_create_surface(char* why, size_t why_size)
+{
+    vk_surface_job j = { 0, "" };
+    if (vk_on_main(vk_create_surface_cb, &j)) { snprintf(why, why_size, "%s", VK_MAIN_STALL); return -1; }
+    if (!j.ok) { snprintf(why, why_size, "%s", j.err); return -1; }
+    return 0;
+}
+
+/* The surface and everything SDL made for the window, in the order they depend on each other. */
+static void vk_window_teardown(void* unused)
+{
+    (void)unused;
+    if (s_vk.surface && s_vk.instance && pvkDestroySurfaceKHR)
+        pvkDestroySurfaceKHR(s_vk.instance, s_vk.surface, NULL);
+#ifdef __APPLE__
+    vk_pump_timer_stop();
+#endif
+    if (s_vk.window) SDL_DestroyWindow(s_vk.window);
+    if (s_vk.sdl_vulkan_loaded) {
+        SDL_Vulkan_UnloadLibrary();
+        s_vk.sdl_vulkan_loaded = 0;
+    }
+    if (s_vk.windowed) SDL_QuitSubSystem(SDL_INIT_VIDEO);
+    s_vk.window = NULL;
+}
+#endif /* !_WIN32: the Win32 window's own vk_window_view and vk_create_surface follow vk_window_open */
 
 static void vk_window_drop(const char* why)
 {
@@ -2403,21 +2610,22 @@ static void vk_window_drop(const char* why)
         if (s_vk.swapchain && pvkDestroySwapchainKHR)
             pvkDestroySwapchainKHR(s_vk.device, s_vk.swapchain, NULL);
     }
+#ifdef _WIN32
     if (s_vk.surface && s_vk.instance && pvkDestroySurfaceKHR)
         pvkDestroySurfaceKHR(s_vk.instance, s_vk.surface, NULL);
-#ifdef _WIN32
     if (s_vk.window) {
         if (s_vk.fullscreen) ShowCursor(TRUE);
         s_vk.fullscreen = 0;
         DestroyWindow(s_vk.window);
     }
 #else
-    if (s_vk.window) SDL_DestroyWindow(s_vk.window);
-    if (s_vk.sdl_vulkan_loaded) {
-        SDL_Vulkan_UnloadLibrary();
-        s_vk.sdl_vulkan_loaded = 0;
-    }
-    if (s_vk.windowed) SDL_QuitSubSystem(SDL_INIT_VIDEO);
+    /* A window that never came up (the main queue was not served) has nothing to tear down. */
+    if ((s_vk.surface || s_vk.window || s_vk.sdl_vulkan_loaded || s_vk.windowed) &&
+        vk_on_main(vk_window_teardown, NULL))
+        VK_LOG("the main thread did not run the window teardown; the window is left to process exit\n");
+#ifdef __APPLE__
+    s_vk_main_owned = 0;
+#endif
 #endif
     s_vk.window = NULL;
     s_vk.surface = VK_NULL_HANDLE;
@@ -2546,30 +2754,29 @@ static int vk_window_open(const char* title)
     return 0;
 }
 
-static int vk_create_window_surface(void)
+/* 0 on success; -1 with the reason in why. Same contract as the SDL path's, whose error text is SDL's
+ * thread-local one and so has to be taken where the surface is made. */
+static int vk_create_surface(char* why, size_t why_size)
 {
     PFN_vkCreateWin32SurfaceKHR create = (PFN_vkCreateWin32SurfaceKHR)
         pvkGetInstanceProcAddr(s_vk.instance, "vkCreateWin32SurfaceKHR");
-    if (!create) return -1;
     VkWin32SurfaceCreateInfoKHR info = { .sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR,
                                          .hinstance = GetModuleHandleA(NULL), .hwnd = s_vk.window };
-    return create(s_vk.instance, &info, NULL, &s_vk.surface) == VK_SUCCESS ? 0 : -1;
+    if (create && create(s_vk.instance, &info, NULL, &s_vk.surface) == VK_SUCCESS) return 0;
+    snprintf(why, why_size, "window surface creation failed: vkCreateWin32SurfaceKHR failed");
+    return -1;
 }
 
-static void vk_window_drawable_size(int* w, int* h)
+static void vk_window_view(int* w, int* h, int* minimized)
 {
     RECT r = { 0, 0, 0, 0 };
     GetClientRect(s_vk.window, &r);
     *w = (int)(r.right - r.left); *h = (int)(r.bottom - r.top);
+    *minimized = IsIconic(s_vk.window) != 0;
 }
-
-static int vk_window_minimized(void) { return IsIconic(s_vk.window) != 0; }
-
-static const char* vk_window_error(void) { return "vkCreateWin32SurfaceKHR failed"; }
 #else
-static int vk_window_open(const char* title)
+static int vk_window_open_main(const char* title)
 {
-    if (!vk_env_on("PS3RECOMP_VK_WINDOW")) return 0;
     /* SIGINT/SIGTERM stay the host's (see pad_init_backend in cellPad.c); a window close is still SDL_QUIT. */
     SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
     if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
@@ -2639,25 +2846,32 @@ static int vk_window_open(const char* title)
     s_vk.hold_seconds = hold ? atof(hold) : 0.0;
     VK_LOG("window: SDL video driver '%s', %u surface extension(s)\n",
            SDL_GetCurrentVideoDriver(), n);
+#ifdef __APPLE__
+    vk_publish_view();
+#endif
     return 0;
 }
 
-static int vk_create_window_surface(void)
+typedef struct { const char* title; int rc; } vk_open_args;
+
+static void vk_window_open_cb(void* p)
 {
-    return SDL_Vulkan_CreateSurface(s_vk.window, s_vk.instance, &s_vk.surface) ? 0 : -1;
+    vk_open_args* a = (vk_open_args*)p;
+    a->rc = vk_window_open_main(a->title);
 }
 
-static void vk_window_drawable_size(int* w, int* h)
+static int vk_window_open(const char* title)
 {
-    SDL_Vulkan_GetDrawableSize(s_vk.window, w, h);
+    if (!vk_env_on("PS3RECOMP_VK_WINDOW")) return 0;
+    vk_open_args a = { title, 0 };
+    if (vk_on_main(vk_window_open_cb, &a)) return vk_window_fail(VK_MAIN_STALL);
+#ifdef __APPLE__
+    /* Started off the main thread, the window's events are pumped from here on by a timer on the main queue. */
+    if (a.rc == 0 && s_vk.window && !pthread_main_np() && vk_pump_timer_start())
+        return vk_window_fail("could not create the main-queue timer that pumps the window's events");
+#endif
+    return a.rc;
 }
-
-static int vk_window_minimized(void)
-{
-    return (SDL_GetWindowFlags(s_vk.window) & SDL_WINDOW_MINIMIZED) != 0;
-}
-
-static const char* vk_window_error(void) { return SDL_GetError(); }
 #endif
 
 /* 0 on success, 1 when the window has no drawable area right now (the old swapchain is kept), -1 on failure. */
@@ -2704,8 +2918,8 @@ static int vk_create_swapchain(void)
 
     VkExtent2D ext = caps.currentExtent;
     if (ext.width == 0xFFFFFFFFu) {
-        int w = 0, hh = 0;
-        vk_window_drawable_size(&w, &hh);
+        int w = 0, hh = 0, minimized = 0;
+        vk_window_view(&w, &hh, &minimized);
         ext.width = (u32)w; ext.height = (u32)hh;
         if (ext.width  < caps.minImageExtent.width)  ext.width  = caps.minImageExtent.width;
         if (ext.height < caps.minImageExtent.height) ext.height = caps.minImageExtent.height;
@@ -2773,10 +2987,9 @@ static int s_vk_resized;
 /* Minimized, or no drawable area: nothing can be presented, and a swapchain cannot be created for it. */
 static int vk_window_hidden(void)
 {
-    int w = 0, h = 0;
-    if (vk_window_minimized()) return 1;
-    vk_window_drawable_size(&w, &h);
-    return w <= 0 || h <= 0;
+    int w = 0, h = 0, minimized = 0;
+    vk_window_view(&w, &h, &minimized);
+    return minimized || w <= 0 || h <= 0;
 }
 
 static void vk_swapchain_lost(void)
@@ -5256,11 +5469,10 @@ static int vk_init_all(u32 width, u32 height, const char* title)
         VK_LOG("enabled instance extension VK_KHR_portability_enumeration\n");
     if (vk_load_instance_functions()) return -1;
     if (s_vk.windowed) {
+        char why[256];
         if (vk_load_wsi_instance_functions()) {
             if (vk_window_fail("the driver has no Vulkan surface functions")) return -1;
-        } else if (vk_create_window_surface()) {
-            char why[256];
-            snprintf(why, sizeof why, "window surface creation failed: %s", vk_window_error());
+        } else if (vk_create_surface(why, sizeof why)) {
             if (vk_window_fail(why)) return -1;
         }
     }
@@ -5636,30 +5848,20 @@ int rsx_vulkan_backend_pump_messages(void)
     }
     return (quit || s_vk.window_closed) ? -1 : 0;
 #else
-    int quit = 0;
-    SDL_Event e;
-    while (SDL_PollEvent(&e)) {
-        if (e.type == SDL_QUIT) quit = 1;
-        else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) quit = 1;
-        else if (e.type == SDL_KEYDOWN && !e.key.repeat && s_vk.window &&
-                 (e.key.keysym.sym == SDLK_F11 ||
-                  (e.key.keysym.sym == SDLK_RETURN && (e.key.keysym.mod & KMOD_ALT)))) {
-            /* Borderless fullscreen on the window's display, and back. */
-            const int full = (SDL_GetWindowFlags(s_vk.window) & SDL_WINDOW_FULLSCREEN_DESKTOP) != 0;
-            if (SDL_SetWindowFullscreen(s_vk.window, full ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP) == 0)
-                SDL_ShowCursor(full ? SDL_ENABLE : SDL_DISABLE);
-            s_vk_resized = 1;
-            /* The swapchain is recreated before the next acquire: the image on screen is stale, so the
-             * draw engine's next host present must re-blit it (#144) rather than skip it as a duplicate. */
-            rsx_draw_engine_require_represent();
-        } else if (e.type == SDL_WINDOWEVENT &&
-                   (e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED || e.window.event == SDL_WINDOWEVENT_RESTORED ||
-                    e.window.event == SDL_WINDOWEVENT_MAXIMIZED)) {
-            s_vk_resized = 1;
-            rsx_draw_engine_require_represent();   /* resize: the next host present must re-blit (#144) */
-        }
+    int ev;
+#ifdef __APPLE__
+    /* The window is the main thread's: a timer on its queue drains SDL and leaves the result here. */
+    if (s_vk_main_owned) ev = atomic_exchange(&s_vk_main_events, 0);
+    else
+#endif
+    ev = vk_poll_events();
+    if (ev & VK_EV_RESIZED) {
+        s_vk_resized = 1;
+        /* The swapchain is recreated before the next acquire: the image on screen is stale, so the
+         * draw engine's next host present must re-blit it (#144) rather than skip it as a duplicate. */
+        rsx_draw_engine_require_represent();
     }
-    return quit ? -1 : 0;
+    return (ev & VK_EV_QUIT) ? -1 : 0;
 #endif
 }
 

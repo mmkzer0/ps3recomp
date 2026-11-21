@@ -321,7 +321,12 @@ example, MoltenVK needs portability enumeration and the portability subset
 device extension. No backend-selection or driver-selection switch is added
 to the toolkit. `PS3RECOMP_VK_WINDOW=1` requests an SDL2 window; macOS uses
 SDL's `VK_EXT_metal_surface` path and reports an initialization error if the
-surface path is unavailable instead of silently starting headless.
+surface path is unavailable instead of silently starting headless. Cocoa
+belongs to the main thread, so a host that starts the backend on a thread of
+its own must keep the main thread running its CFRunLoop meanwhile: the
+backend creates the window, the surface and the event pump on the main queue
+and stops with a named error if the main queue is not served within 10 s.
+Recording, submitting and presenting stay on the host's thread.
 
 On a portability-subset device the backend checks and enables the subset
 features it uses: `imageViewFormatSwizzle` for guest texture component
