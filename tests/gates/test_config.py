@@ -111,6 +111,7 @@ def test_defaults_without_file_or_environment():
         "rsx.bc_gpu_min_texels": ("147456", "default"),
         "vk.draw_batch": ("false", "default"),
         "vk.draw_batch_max": ("512", "default"),
+        "vk.draw_batch_min": ("0", "default"),
         "game.free_space_raw": ("false", "default"),
         "trophy.register_wait_cap_vblanks": ("1024", "default"),
         "trophy.pace_ms": ("2000", "default"),
@@ -277,6 +278,7 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
             "rsx.bc_gpu_min_texels": "default",
             "vk.draw_batch": "default",
             "vk.draw_batch_max": "default",
+            "vk.draw_batch_min": "default",
             "game.free_space_raw": "default",
             "trophy.register_wait_cap_vblanks": "default",
             "trophy.pace_ms": "default",
@@ -318,7 +320,7 @@ def test_dump_lists_every_key_value_and_source_as_valid_toml():
                                    "handler_thread": False, "report_spu_hold_ms": 0},
                            "eng": {"depth_clamp": True, "depth_bounds": True},
                            "rsx": {"bc_path": "auto", "bc_gpu_min_texels": 147456},
-                           "vk": {"draw_batch": False, "draw_batch_max": 512},
+                           "vk": {"draw_batch": False, "draw_batch_max": 512, "draw_batch_min": 0},
                            "game": {"free_space_raw": False},
                            "trophy": {"register_wait_cap_vblanks": 1024, "pace_ms": 2000},
                            "adec": {"silence_fallback": False},
@@ -690,6 +692,21 @@ def test_vk_draw_batch_comes_from_file_and_environment():
     assert o["vk.draw_batch_max"] == ("32", "env:PS3RECOMP_VK_DRAW_BATCH_MAX"), o
     f = config_invalid(probe("get", PS3RECOMP_VK_DRAW_BATCH="yes"))
     assert f["env"] == "PS3RECOMP_VK_DRAW_BATCH" and f["key"] == "vk.draw_batch", f
+    o = options(probe("get", PS3RECOMP_VK_DRAW_BATCH_MIN="0x10"))
+    assert o["vk.draw_batch_min"] == ("16", "env:PS3RECOMP_VK_DRAW_BATCH_MIN"), o
+    with Cfg("schema = 2", "[vk]", "draw_batch_min = 32") as c:
+        o = options(probe("--load", c.path, "get"))
+        assert o["vk.draw_batch_min"] == ("32", f"file:{c.path}"), o
+
+
+def test_vk_draw_batch_min_is_zero_or_within_the_pool():
+    # 0 is the fixed cap alone; the backend lowers a minimum above the maximum, so only the pool bounds it here.
+    for good in ("0", "1", "1024"):
+        o = options(probe("get", PS3RECOMP_VK_DRAW_BATCH_MIN=good))
+        assert o["vk.draw_batch_min"] == (good, "env:PS3RECOMP_VK_DRAW_BATCH_MIN"), (good, o)
+    for bad in ("1025", "4294967295", "-1"):
+        f = config_invalid(probe("get", PS3RECOMP_VK_DRAW_BATCH_MIN=bad))
+        assert f["env"] == "PS3RECOMP_VK_DRAW_BATCH_MIN" and f["key"] == "vk.draw_batch_min", (bad, f)
 
 
 def test_vk_draw_batch_max_is_bounded_by_the_descriptor_pool():

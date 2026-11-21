@@ -372,6 +372,15 @@ PS3_CFG_U32(vk, draw_batch_max, 512, 1, 1024,
     "submissions. Read once, with vk.draw_batch. "
     "Replaces the environment variable VK_DRAW_BATCH_MAX.")
 
+PS3_CFG_U32(vk, draw_batch_min, 0, 0, 1024,
+    "Adaptive kick: once a batched submission holds this many operations, submit it as soon as the GPU "
+    "is idle (the newest submission in flight has finished, or none is) instead of waiting for "
+    "vk.draw_batch_max, so the GPU starts a frame's first work early and later batches grow to what "
+    "the FIFO walker records while the GPU runs the one before. The GPU's state is polled "
+    "(vkGetFenceStatus) only at this count and then every 16 operations, so a late answer delays a "
+    "kick by at most that many. 0 keeps the fixed cap alone. A value above vk.draw_batch_max is "
+    "lowered to it, with a logged line. Read once, with vk.draw_batch.")
+
 /* ---- game --------------------------------------------------------------- */
 
 PS3_CFG_BOOL(game, free_space_raw, 0,

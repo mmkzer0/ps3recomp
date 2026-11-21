@@ -977,7 +977,7 @@ not changed while a title runs.
 - **`PS3RECOMP_VK_DUMP_RANGE`** — `<first>-<last>`: dump every present whose sequence number is in that inclusive span, named as for `PS3RECOMP_VK_DUMP_LIST`; a malformed or reversed range is a `config-invalid` stop at init.
   `libs/video/rsx_vulkan_backend.c:2025`
 - **`PS3RECOMP_VK_GPU_TIMING`** — `N` (a positive count): Vulkan backend GPU timestamps, off when unset or 0. Each draw batch and each present writes a start and an end timestamp; they are read without a wait once the batch's slot is reused (or the present completes), and the backend logs one `gpu timing (window)` line every `N` presents and a `gpu timing (total)` line at shutdown: batches per frame, GPU busy ms (the union of the batch spans), idle gaps ms between batches inside a frame, the span, first-start latency (the previous present's end to the first batch's start, on the device clock from `VK_EXT_calibrated_timestamps`; `n/a` without it) and the present's own GPU ms, all per frame. A queue that writes no timestamps (`timestampValidBits` 0) logs `gpu timing: not available` and measures nothing. Needs `PS3RECOMP_VK_DRAW_BATCH` for batch figures. The waits of the walker and of the present are also `GPU_WAIT` ftrace spans (`a` 2 slot reuse, 0 flush, 1 present). **diagnostic, not in the typed registry**
-  `libs/video/rsx_vulkan_backend.c:936`
+  `libs/video/rsx_vulkan_backend.c:940`
 - **`PS3RECOMP_VK_GUEST_PROGRAMS`** — _(no description in source)_
   `libs/video/rsx_vulkan_backend.c:1150`
 - **`PS3RECOMP_VK_HOLD`** — _(no description in source)_

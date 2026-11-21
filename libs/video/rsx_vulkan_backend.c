@@ -120,6 +120,7 @@ static void vk_mutex_unlock(vk_mutex* m)  { pthread_mutex_unlock(m); }
     X(vkCreateFence) X(vkDestroyFence) X(vkWaitForFences) X(vkResetFences) X(vkQueueSubmit) \
     X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) \
     X(vkGetQueryPoolResults) \
+    X(vkGetFenceStatus) \
     X(vkCreateRenderPass) X(vkDestroyRenderPass) X(vkCreateFramebuffer) X(vkDestroyFramebuffer) \
     X(vkCreateShaderModule) X(vkDestroyShaderModule) \
     X(vkCreateDescriptorSetLayout) X(vkDestroyDescriptorSetLayout) \
@@ -183,8 +184,12 @@ typedef struct vk_image {
 
 #define VK_SAMPLER_CACHE 32
 #define VK_PIPELINE_SLOTS (2 * 2 * 8)   /* ztest x zwrite x compare op */
-/* vk.draw_batch: batches in flight at once (see "Draw batching"). */
+/* vk.draw_batch: batches in flight at once (see "Draw batching"); each slot's slice of a ring is 1/n of it, so this is a
+ * compile-time choice (-DVK_EB_SLOTS=3 builds the three-slot variant). */
+#ifndef VK_EB_SLOTS
 #define VK_EB_SLOTS 2u
+#endif
+_Static_assert(VK_EB_SLOTS >= 2 && VK_EB_SLOTS <= 4, "VK_EB_SLOTS: 2 to 4 batches in flight");
 
 typedef struct vk_state {
     vk_lib_handle    lib;
@@ -740,8 +745,7 @@ static u32 s_eb_inflight;
 static int vk_eng_flush(void);       /* submit the open batch and wait until the GPU is done with all */
 static int vk_eng_kick(void);        /* submit the open batch, no wait */
 static int vk_eb_active(void);       /* batching decided on and on */
-static u32 vk_eb_max(void);
-static void vk_eb_recorded(void);   /* one more command in the open batch */
+static void vk_eb_recorded(void);   /* one more operation in the open batch: the kick rule */
 static int vk_eb_begin(void);       /* open the next slot's command buffer: a batch's first operation */
 static void vk_eb_device_idled(void);   /* vkDeviceWaitIdle returned: no batch is in flight */
 static void vk_eb_release(void);    /* engine shutdown: rings and pool */
@@ -3639,7 +3643,7 @@ static u32 vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
         pvkCmdCopyBufferToImage(s_vk.cmd, st.buf, t->im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &in);
         if (batch) {
             vk_barrier_image(t->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
-            if (++s_eb_pending >= vk_eb_max()) vk_eng_kick();
+            vk_eb_recorded();
         } else
             rc = vk_submit_and_wait();
     }
@@ -4358,6 +4362,14 @@ static VkImageView vk_eng_dummy_cube_view(void)
  * everything before it, so what a later batch or one-shot reads is what the
  * earlier ones wrote.
  *
+ * The kick rule, checked when an operation is recorded: kick when the batch holds vk.draw_batch_max operations, or
+ * (vk.draw_batch_min, 0 = off) holds that many and the GPU is idle, i.e. the newest batch in flight has signalled its
+ * fence or none is in flight. The first batch of a frame is thereby a small kickstart (the present just waited, the
+ * GPU is idle), and later ones grow to whatever the walker records while the GPU runs the one before. The fence
+ * is polled (vkGetFenceStatus, an ioctl on some drivers) only when the batch has reached the minimum and then every
+ * VK_EB_POLL_OPS operations; a poll that finds the GPU busy leaves the batch open, so a late answer costs at most
+ * that many operations of delay, never a wrong result.
+ *
  * Anything that needs the GPU finished flushes (vk_eng_flush: kick, then wait
  * for every slot): the engine's own submit point, which precedes each
  * readback, and every destroy of an object a batch may use. A one-shot
@@ -4372,6 +4384,10 @@ static VkImageView vk_eng_dummy_cube_view(void)
 #define VK_EB_UB_BYTES   (32u << 20)
 #define VK_EB_SB_BYTES   (64u << 20)   /* texture upload staging */
 #define VK_EB_MAX_SETS   1024u         /* the maximum of vk.draw_batch_max in config_options.def */
+/* A slot's share of ring `ring_bytes`: an equal part, rounded down to 64 KiB so that every slot's slice starts aligned
+ * for any use (uniform offsets need at most 256). */
+#define VK_EB_SLICE(ring_bytes)  (((VkDeviceSize)(ring_bytes) / VK_EB_SLOTS) & ~(VkDeviceSize)0xFFFF)
+#define VK_EB_POLL_OPS   16u           /* fence-status poll interval of the kick rule, in operations */
 
 typedef struct vk_eb_slot {
     VkDescriptorPool pool;
@@ -4385,13 +4401,14 @@ typedef struct vk_eb_slot {
 static struct {
     int              on;            /* -1 undecided, 0 off, 1 on */
     u32              max_draws;
+    u32              min_draws;     /* vk.draw_batch_min, at most max_draws; 0 = the kick rule is the cap alone */
     vk_buffer        vb, ib, ub, sb;
     VkDeviceSize     vb_head, ib_head, ub_head, sb_head, ub_align;   /* inside the current slot's slice */
     vk_eb_slot       slot[VK_EB_SLOTS];
     u32              cur;           /* the slot the next batch records into */
     int              cur_ready;     /* ... and it is free of GPU work, its slices and pool reset */
     int              cur_gt;        /* ... and its command buffer carries timestamps */
-    unsigned long long draws, flushes;
+    unsigned long long draws, flushes, kicks_full, kicks_idle, polls, poll_ns;
 } s_eb = { .on = -1 };
 
 static int vk_eb_on(void)
@@ -4400,6 +4417,12 @@ static int vk_eb_on(void)
     s_eb.on = 0;
     if (!ps3_cfg_vk_draw_batch() || !s_g.on) return 0;
     s_eb.max_draws = ps3_cfg_vk_draw_batch_max();
+    s_eb.min_draws = ps3_cfg_vk_draw_batch_min();
+    if (s_eb.min_draws > s_eb.max_draws) {
+        VK_LOG("draw batching: vk.draw_batch_min %u is above vk.draw_batch_max %u, using %u\n",
+               s_eb.min_draws, s_eb.max_draws, s_eb.max_draws);
+        s_eb.min_draws = s_eb.max_draws;
+    }
     VkPhysicalDeviceProperties p;
     pvkGetPhysicalDeviceProperties(s_vk.phys, &p);
     s_eb.ub_align = p.limits.minUniformBufferOffsetAlignment ? p.limits.minUniformBufferOffsetAlignment : 256;
@@ -4422,6 +4445,9 @@ static int vk_eb_on(void)
     }
     VK_LOG("draw batching: on (up to %u draws per submission)\n", s_eb.max_draws);
     VK_LOG("draw batching: %u submissions in flight, each with its own slice of the rings\n", VK_EB_SLOTS);
+    if (s_eb.min_draws)
+        VK_LOG("draw batching: from %u draws a batch is also submitted whenever the GPU is idle "
+               "(fence polled every %u operations)\n", s_eb.min_draws, VK_EB_POLL_OPS);
     s_eb.on = 1;
     return 1;
 }
@@ -4437,6 +4463,11 @@ static void vk_eb_release(void)
                "present wait %.2f ms over %u presents\n",
                s_stat.submits, s_eb.draws, s_eb.flushes, s_stat.waits, (double)s_stat.wait_ns / 1e6,
                (double)atomic_load_explicit(&s_stat.present_wait_ns, memory_order_relaxed) / 1e6, s_vk.presented);
+    if (s_stat.submits)
+        VK_LOG("batch kicks: %llu on a full batch, %llu on an idle GPU, %llu on a full ring, a present or a one-shot; "
+               "fence polls %llu, %.3f ms in total (%.0f ns each)\n",
+               s_eb.kicks_full, s_eb.kicks_idle, s_eb.flushes - s_eb.kicks_full - s_eb.kicks_idle, s_eb.polls,
+               (double)s_eb.poll_ns / 1e6, s_eb.polls ? (double)s_eb.poll_ns / (double)s_eb.polls : 0.0);
     vk_destroy_buffer(&s_eb.vb);
     vk_destroy_buffer(&s_eb.ib);
     vk_destroy_buffer(&s_eb.ub);
@@ -4449,8 +4480,36 @@ static void vk_eb_release(void)
 }
 
 static int vk_eb_active(void) { return s_eb.on == 1; }
-static u32 vk_eb_max(void) { return s_eb.max_draws; }
-static void vk_eb_recorded(void) { if (++s_eb_pending >= s_eb.max_draws) vk_eng_kick(); }
+
+/* Is the GPU done with everything submitted? The newest batch in flight has signalled its fence: batches run in
+ * submission order (each starts behind a barrier on all earlier work). Status not success, an error too, counts
+ * as busy; the wait that follows reports an error. Only the walker thread touches the slot fences. */
+static int vk_eb_gpu_idle(void)
+{
+    for (u32 k = 1; k < VK_EB_SLOTS; k++) {
+        const u32 i = (s_eb.cur + VK_EB_SLOTS - k) % VK_EB_SLOTS;
+        if (!s_eb.slot[i].in_flight) continue;
+        const unsigned long long t0 = vk_now_ns();
+        const VkResult r = pvkGetFenceStatus(s_vk.device, s_vk.batch_fence[i]);
+        s_eb.polls++;
+        s_eb.poll_ns += vk_now_ns() - t0;
+        return r == VK_SUCCESS;
+    }
+    return 1;
+}
+
+static void vk_eb_recorded(void)
+{
+    const u32 n = ++s_eb_pending;
+    if (n >= s_eb.max_draws) {
+        s_eb.kicks_full++;
+        vk_eng_kick();
+    } else if (s_eb.min_draws && n >= s_eb.min_draws && (n - s_eb.min_draws) % VK_EB_POLL_OPS == 0 &&
+               vk_eb_gpu_idle()) {
+        s_eb.kicks_idle++;
+        vk_eng_kick();
+    }
+}
 
 static void vk_eb_device_idled(void)
 {
@@ -4550,7 +4609,7 @@ static int vk_eng_flush(void)
  * buffer, or -1 when the slot's share has no room left. */
 static VkDeviceSize vk_eb_take(VkDeviceSize* head, VkDeviceSize ring_bytes, VkDeviceSize bytes, VkDeviceSize align)
 {
-    const VkDeviceSize cap = ring_bytes / VK_EB_SLOTS;
+    const VkDeviceSize cap = VK_EB_SLICE(ring_bytes);
     const VkDeviceSize at = (*head + align - 1u) / align * align;
     if (at + bytes > cap) return (VkDeviceSize)-1;
     *head = at + bytes;
@@ -4567,7 +4626,7 @@ static int vk_eb_upload(VkImage img, VkBufferImageCopy* region, const void* src,
 {
     if (!vk_eb_active()) return -2;
     const VkDeviceSize bytes = (VkDeviceSize)tight * rows;
-    if (!bytes || bytes > VK_EB_SB_BYTES / VK_EB_SLOTS) return -2;
+    if (!bytes || bytes > VK_EB_SLICE(VK_EB_SB_BYTES)) return -2;
     if (vk_eb_acquire()) return -1;
     VkDeviceSize off = vk_eb_take(&s_eb.sb_head, VK_EB_SB_BYTES, bytes, 16u);
     if (off == (VkDeviceSize)-1) {
@@ -4582,7 +4641,7 @@ static int vk_eb_upload(VkImage img, VkBufferImageCopy* region, const void* src,
     region->bufferOffset = off;
     pvkCmdCopyBufferToImage(s_vk.cmd, s_eb.sb.buf, img, VK_IMAGE_LAYOUT_GENERAL, 1, region);
     vk_barrier_image(img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
-    if (++s_eb_pending >= s_eb.max_draws) vk_eng_kick();
+    vk_eb_recorded();
     return 0;
 }
 
@@ -4685,7 +4744,7 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     VkDeviceSize voff = 0, ioff = 0;
     VkDescriptorSet set = VK_NULL_HANDLE;
     const u32 vsb = s_e2.vs_bytes ? s_e2.vs_bytes : 16u, psb = s_e2.ps_bytes ? s_e2.ps_bytes : 16u;
-    int batched = vk_eb_on() && vbytes <= VK_EB_VB_BYTES / VK_EB_SLOTS && ibytes <= VK_EB_IB_BYTES / VK_EB_SLOTS;
+    int batched = vk_eb_on() && vbytes <= VK_EB_SLICE(VK_EB_VB_BYTES) && ibytes <= VK_EB_SLICE(VK_EB_IB_BYTES);
     if (batched && P->cube_mask && !vk_eng_dummy_cube_view()) return;   /* may flush: before any slice */
     /* The slot this draw records into must be free of GPU work before a slice or a set is taken from it. */
     if (batched && vk_eb_acquire()) return;
@@ -4785,7 +4844,7 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     pvkCmdEndRenderPass(s_vk.cmd);
     if (!batched) { vk_submit_and_wait(); return; }
     s_eb.draws++;
-    if (++s_eb_pending >= s_eb.max_draws) vk_eng_kick();
+    vk_eb_recorded();
 }
 /* Capture calls this after its flush: atomic exchange reports and clears faults
  * from all engine submissions since the prior check; successes do not clear it. */
