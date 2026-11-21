@@ -167,3 +167,30 @@ jobs:
         run: cmake --build --preset dev
       - name: Test
         run: ctest --preset t0
+
+  linux-gcc15:
+    # GCC 15 made musttail a statement attribute, so a GCC 15 build takes the
+    # SPU direct tail-call path (SPU_HAVE_MUSTTAIL, runtime/spu/spu_context.h)
+    # that the gcc-14 job above compiles out. The official gcc image pins the
+    # compiler without a PPA. The Vulkan backend stays with the job above.
+    name: gcc:15 x86_64 (dev, SPU direct tail calls)
+    runs-on: ubuntu-24.04
+    container: gcc:15
+    timeout-minutes: 60
+    # CMake and the scripted suites (runtime/spu/tests/run_tests.sh defaults to
+    # clang) both compile with the image's GCC.
+    env:
+      CC: gcc
+      CXX: g++
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends cmake ninja-build libsdl2-dev
+      - name: Configure
+        run: cmake --preset dev
+      - name: Build
+        run: cmake --build --preset dev
+      - name: Test
+        run: ctest --preset t0
