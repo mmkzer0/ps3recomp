@@ -2502,7 +2502,8 @@ static int vk_on_main(void (*fn)(void*), void* arg)
 }
 
 static dispatch_source_t s_vk_pump_timer;    /* main queue only */
-static int s_vk_main_owned;                  /* the timer runs: events and the window's size come from it */
+static atomic_int s_vk_main_owned;           /* the timer runs: events and the window's size come from it. Set and
+                                              * cleared on the main queue, read by the walker's pump */
 static atomic_int s_vk_main_events;          /* VK_EV_* bits the timer saw and the pump has not taken */
 static atomic_ullong s_vk_main_view;         /* minimized << 60 | width << 30 | height, as the timer last saw it */
 
@@ -2532,7 +2533,7 @@ static int vk_pump_timer_start(void)
     dispatch_source_set_event_handler_f(t, vk_pump_tick);
     s_vk_pump_timer = t;
     atomic_store(&s_vk_main_events, 0);
-    s_vk_main_owned = 1;
+    atomic_store(&s_vk_main_owned, 1);
     dispatch_resume(t);
     return 0;
 }
@@ -2547,7 +2548,7 @@ static void vk_pump_timer_stop(void)         /* main queue: no tick is running, 
 
 static void vk_window_view(int* w, int* h, int* minimized)
 {
-    if (!s_vk_main_owned) { vk_window_view_sdl(w, h, minimized); return; }
+    if (!atomic_load(&s_vk_main_owned)) { vk_window_view_sdl(w, h, minimized); return; }
     const unsigned long long v = atomic_load(&s_vk_main_view);
     *minimized = (int)((v >> 60) & 1);
     *w = (int)((v >> 30) & 0x3fffffffu);
