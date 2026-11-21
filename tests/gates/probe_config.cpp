@@ -100,6 +100,8 @@ static void print_options()
             std::printf("%s", ps3_cfg_vk_draw_batch() ? "true" : "false");
         else if (!std::strcmp(o->section, "vk") && !std::strcmp(o->key, "draw_batch_max"))
             std::printf("%u", ps3_cfg_vk_draw_batch_max());
+        else if (!std::strcmp(o->section, "vk") && !std::strcmp(o->key, "draw_batch_min"))
+            std::printf("%u", ps3_cfg_vk_draw_batch_min());
         else if (!std::strcmp(o->section, "game") && !std::strcmp(o->key, "free_space_raw"))
             std::printf("%s", ps3_cfg_game_free_space_raw() ? "true" : "false");
         else if (!std::strcmp(o->section, "trophy") && !std::strcmp(o->key, "register_wait_cap_vblanks"))

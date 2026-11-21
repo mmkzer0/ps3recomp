@@ -21,10 +21,16 @@ of its own (the backend reads the registry once) and looks only at what the back
                                      over several frames, present the frames batching off does: a present,
                                      a one-shot or a slot's reuse never reads or overwrites what an earlier,
                                      unwaited batch has still to write.
+  vk.draw_batch_min                  the adaptive kick says so in its line, is lowered to the maximum when above
+                                     it, is silent at its default 0 (the fixed cap), and with a minimum of 1 or
+                                     16 and a small maximum the same scenes, and 200 scissored draws, present
+                                     the frames batching off does: a batch kicked on an idle GPU, with others
+                                     still in flight, is ordered as a full one is.
 
 The scene's own verdict (its exit code) is not looked at: it checks the draw path's pixels, not these.
 Exit 77: no usable Vulkan device or the draw engine path is not built (needs glslang), nothing to run."""
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -191,6 +197,38 @@ def main():
         check(same and "VkResult" not in out, "gpu timing on: frames are byte-identical to gpu timing off")
         rc, out = run(host, fresh("timing-bad"), PS3RECOMP_VK_DRAW_BATCH="1", PS3RECOMP_VK_GPU_TIMING="often")
         check("stays off" in out and "gpu timing: on" not in out, "a malformed PS3RECOMP_VK_GPU_TIMING keeps it off, said")
+
+        # ---- vk.draw_batch_min: the adaptive kick -------------------------------------------------------
+        rc, out = run(host, fresh("min-off"), PS3RECOMP_VK_DRAW_BATCH="1", PS3RECOMP_VK_DRAW_BATCH_MIN="0")
+        check("whenever the GPU is idle" not in out, "PS3RECOMP_VK_DRAW_BATCH_MIN=0 is the fixed cap: no adaptive line")
+        rc, out = run(host, fresh("min-on"), PS3RECOMP_VK_DRAW_BATCH="1", PS3RECOMP_VK_DRAW_BATCH_MIN="16")
+        check("from 16 draws a batch is also submitted whenever the GPU is idle" in out,
+              "PS3RECOMP_VK_DRAW_BATCH_MIN=16: said in the batching lines")
+        rc, out = run(host, fresh("min-hi"), PS3RECOMP_VK_DRAW_BATCH="1", PS3RECOMP_VK_DRAW_BATCH_MAX="4",
+                      PS3RECOMP_VK_DRAW_BATCH_MIN="9")
+        check("vk.draw_batch_min 9 is above vk.draw_batch_max 4, using 4" in out and "from 4 draws" in out,
+              "a minimum above the maximum is lowered to it, said")
+        rc, out = run(host, fresh("min-big"), PS3RECOMP_VK_DRAW_BATCH="1", PS3RECOMP_VK_DRAW_BATCH_MIN="1025")
+        check(rc != 0 and "kind=config-invalid" in out and "key=vk.draw_batch_min" in out,
+              "a minimum above the descriptor pool is a config-invalid stop")
+        rc, out = run(host, fresh("min-kick"), "--draws=200:16", "--frames=4", PS3RECOMP_VK_DRAW_BATCH="1",
+                      PS3RECOMP_VK_DRAW_BATCH_MIN="16")
+        m = re.search(r"batch kicks: (\d+) on a full batch, (\d+) on an idle GPU", out)
+        check(m is not None and int(m.group(2)) > 0,
+              "min 16 over 200 draws a frame: the GPU is idle when a frame starts, so a batch is kicked on it "
+              f"({m.group(0) if m else 'no kick line'})")
+        for scene in scenes + (("--draws=200:16", "--frames=4"),):
+            name = " ".join(scene)
+            off = fresh("adaptive-off")
+            run(host, off, *scene, PS3RECOMP_VK_DUMP=str(off / "f"), PS3RECOMP_VK_DUMP_RANGE="0-9")
+            for lo, hi in (("1", "512"), ("16", "64")):
+                on = fresh("adaptive-on")
+                rc, out = run(host, on, *scene, PS3RECOMP_VK_DUMP=str(on / "f"), PS3RECOMP_VK_DUMP_RANGE="0-9",
+                              PS3RECOMP_VK_DRAW_BATCH="1", PS3RECOMP_VK_DRAW_BATCH_MIN=lo, PS3RECOMP_VK_DRAW_BATCH_MAX=hi)
+                same = dumps(on) == dumps(off) and len(dumps(off)) >= 2 and all(
+                    (on / n).read_bytes() == (off / n).read_bytes() for n in dumps(off))
+                check(same and "VkResult" not in out,
+                      f"{name}, kick from {lo} on an idle GPU up to {hi}: frames are byte-identical to batching off")
     print(f"failed {FAILED}" if FAILED else "all checks passed")
     return 1 if FAILED else 0
 
