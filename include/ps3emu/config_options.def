@@ -383,14 +383,14 @@ PS3_CFG_BOOL(vk, draw_batch, 0,
     "rsx_vulkan_backend.c, \"Draw batching\"). The vertex, index and uniform data of every draw "
     "sit in host-coherent rings, and a full memory barrier between recorded draws keeps "
     "render-to-texture ordering. A full batch (vk.draw_batch_max operations or a full ring) is "
-    "submitted without a wait, and the next is recorded while the GPU runs it; two submissions are "
+    "submitted without a wait, and the next is recorded while the GPU runs it; three submissions are "
     "in flight, each with its own command buffer, fence, slice of the rings and descriptor pool, "
     "and the walker waits for the GPU only when it comes round to a slot the GPU still holds. "
     "A readback, an object destroy and the engine's submit point wait for every batch; a present "
     "or a one-shot submission is ordered after them by a barrier instead. It is meant to change only when "
     "work is submitted, not what is drawn; off by default until a pixel diff of presented frames, "
     "on against off, is clean (#129). The rings are 176 MiB of host-visible memory (vertex 64, "
-    "index 16, uniform 32, upload staging 64, half of each per submission in flight), and a device "
+    "index 16, uniform 32, upload staging 64, a third of each per submission in flight), and a device "
     "that cannot give host-coherent memory for them stays off with a logged line. Read once, when "
     "the draw engine first draws. Replaces the environment switch VK_DRAW_BATCH=1.")
 
@@ -402,14 +402,19 @@ PS3_CFG_U32(vk, draw_batch_max, 512, 1, 1024,
     "submissions. Read once, with vk.draw_batch. "
     "Replaces the environment variable VK_DRAW_BATCH_MAX.")
 
-PS3_CFG_U32(vk, draw_batch_min, 0, 0, 1024,
+PS3_CFG_U32(vk, draw_batch_min, 16, 0, 1024,
     "Adaptive kick: once a batched submission holds this many operations, submit it as soon as the GPU "
     "is idle (the newest submission in flight has finished, or none is) instead of waiting for "
     "vk.draw_batch_max, so the GPU starts a frame's first work early and later batches grow to what "
     "the FIFO walker records while the GPU runs the one before. The GPU's state is polled "
     "(vkGetFenceStatus) only at this count and then every 16 operations, so a late answer delays a "
     "kick by at most that many. 0 keeps the fixed cap alone. A value above vk.draw_batch_max is "
-    "lowered to it, with a logged line. Read once, with vk.draw_batch.")
+    "lowered to it, with a logged line. Read once, with vk.draw_batch. The default is the better of 16 "
+    "and 32 on an Apple M4 Pro (MoltenVK and KosmicKrisp, 1000 draws a frame, walker-bound and "
+    "GPU-bound, three submissions in flight): a frame takes 30-31 and 24-25 ms against 40-44 and 27-41 ms "
+    "with the fixed cap of 512 (recon out/M4/VK-FENCE-2026-11-21.md, section 7); a fixed cap of 64 "
+    "takes 28 and 19 ms at about as many submissions, and the pair with vk.draw_batch_max 128 29 and "
+    "22 ms, so a device with costly submissions is for the Ally A/B to settle.")
 
 /* ---- game --------------------------------------------------------------- */
 
