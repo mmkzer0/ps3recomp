@@ -26,6 +26,11 @@ of its own (the backend reads the registry once) and looks only at what the back
                                      16 and a small maximum the same scenes, and 200 scissored draws, present
                                      the frames batching off does: a batch kicked on an idle GPU, with others
                                      still in flight, is ordered as a full one is.
+  validation layer                   where VK_LAYER_KHRONOS_validation can be loaded (VK_LAYER_PATH, the SDK or
+                                     vulkan-validationlayers), the scenes under synchronization validation at
+                                     several submission sizes report no validation or hazard error: every
+                                     barrier the batch no longer records per draw was not needed; a skip says
+                                     when the layer is missing.
 
 The scene's own verdict (its exit code) is not looked at: it checks the draw path's pixels, not these.
 Exit 77: no usable Vulkan device or the draw engine path is not built (needs glslang), nothing to run."""
@@ -229,6 +234,25 @@ def main():
                     (on / n).read_bytes() == (off / n).read_bytes() for n in dumps(off))
                 check(same and "VkResult" not in out,
                       f"{name}, kick from {lo} on an idle GPU up to {hi}: frames are byte-identical to batching off")
+
+        # ---- the Khronos validation layer with synchronization validation, where it is installed ------------
+        # The ordering inside a batch (one barrier per hazard, not one per draw) is only provable there: the
+        # frames cannot tell a missing barrier from a lucky schedule on a software rasteriser.
+        sync = dict(VK_INSTANCE_LAYERS="VK_LAYER_KHRONOS_validation", VK_LAYER_VALIDATE_SYNC="1",
+                    VK_VALIDATION_VALIDATE_SYNC="1")
+        rc, out = run(host, fresh("layer-probe"), PS3RECOMP_VK_DRAW_BATCH="1", VK_LOADER_DEBUG="layer", **sync)
+        if 'Insert instance layer "VK_LAYER_KHRONOS_validation"' not in out:
+            print("[SKIP] the Khronos validation layer is not installed (VK_LAYER_PATH, the SDK or "
+                  "vulkan-validationlayers): the batch's barriers are not checked here")
+        else:
+            for scene in scenes + (("--draws=200:16", "--frames=4"),):
+                name = " ".join(scene)
+                for lo, hi in (("0", "1"), ("0", "2"), ("16", "64"), ("16", "512")):
+                    rc, out = run(host, fresh("layer"), *scene, PS3RECOMP_VK_DRAW_BATCH="1",
+                                  PS3RECOMP_VK_DRAW_BATCH_MIN=lo, PS3RECOMP_VK_DRAW_BATCH_MAX=hi, **sync)
+                    bad = [ln for ln in out.splitlines() if "Validation Error" in ln or "SYNC-HAZARD" in ln]
+                    check(not bad, f"{name}, kick from {lo} up to {hi}: no validation or synchronization error"
+                                   + (f": {bad[0][:200]}" if bad else ""))
 
         # ---- the bench's per-draw CPU cost (--draws=N:S:W) hands each draw to the walker at once and changes no pixel
         # of the steady frames (the first present of this host's frame loop depends on where the walker first meets

@@ -261,6 +261,27 @@ float4 main(PSInput i) : SV_TARGET { return i.col; }
 
 Additional shader definitions in `rsx_d3d12_shaders.h`: solid color fill, textured quad.
 
+### Vulkan Backend: ordering inside a draw batch (`vk.draw_batch`)
+
+The register-file draw engine's Vulkan path (`libs/video/rsx_vulkan_backend.c`) records draws, uploads, clears
+and depth snapshots into one command buffer per submission. Every colour and depth image is `GENERAL`, so Vulkan
+adds no implicit dependency between two render passes on the same image; the backend orders them itself, by need:
+
+| Hazard | Ordered by |
+|---|---|
+| a submission after the ones before it (and after a present's copy) | one `ALL_COMMANDS` memory barrier when the command buffer begins, only if a submission may still run |
+| attachment write, then attachment read/write in a later pass (blend, depth test, load) | a `VkSubpassDependency` `EXTERNAL` → 0 in every cached render pass (colour output and fragment tests) |
+| attachment or transfer write, then sampled | an image barrier on that image, recorded before the draw that samples it |
+| sampled, then attachment or transfer write | an image barrier (execution dependency) before the write |
+| transfer write or read against attachment, transfer, sampled | an image barrier on that image: clears, uploads, the depth snapshot's copies |
+| the depth snapshot's bounce buffer reused in one command buffer | a buffer barrier, copy out after the previous copy in |
+
+`vk_hz_use` keeps, per `VkImage` (not per guest surface), which kinds of access the command buffer being recorded
+has made to it and which pairs a barrier already ordered, and emits a barrier only for a conflict that is not ordered
+yet. Whole-image granularity: a write to a second mip level of one texture is a conflict like a rewrite. Blending
+and depth tests inside one pass need nothing: rasterisation order. Nothing is recorded inside a render pass but
+draws.
+
 ---
 
 ## Utility Headers

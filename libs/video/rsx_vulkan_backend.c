@@ -184,10 +184,16 @@ typedef struct vk_buffer {
     int            coherent;
 } vk_buffer;
 
+/* Access tracking of one image inside the command buffer being recorded (vk_hz_use): the kinds of access made
+ * to it since that buffer began, and the pairs a barrier has already ordered. Valid only while `epoch` is the
+ * current s_hz_epoch; any other value reads as "untouched". */
+typedef struct vk_hz { u32 epoch; u8 pend; u16 ok; } vk_hz;
+
 typedef struct vk_image {
     VkImage        img;
     VkDeviceMemory mem;
     VkImageView    view;
+    vk_hz          hz;
 } vk_image;
 
 #define VK_SAMPLER_CACHE 32
@@ -826,6 +832,8 @@ static void vk_present_wait_gpu(void);
 static u32 s_eb_pending;
 static u32 s_eb_inflight;
 #define VK_EB_BUSY() (s_eb_pending || s_eb_inflight)
+/* Bumped whenever a command buffer begins: a vk_hz of an older epoch is stale. Walker thread only. */
+static u32 s_hz_epoch = 1;
 static int vk_eng_flush(void);       /* submit the open batch and wait until the GPU is done with all */
 static int vk_eng_kick(void);        /* submit the open batch, no wait */
 static int vk_eb_active(void);       /* batching decided on and on */
@@ -833,7 +841,7 @@ static void vk_eb_recorded(void);   /* one more operation in the open batch: the
 static int vk_eb_begin(void);       /* open the next slot's command buffer: a batch's first operation */
 static void vk_eb_device_idled(void);   /* vkDeviceWaitIdle returned: no batch is in flight */
 static void vk_eb_release(void);    /* engine shutdown: rings and pool */
-static int vk_eb_upload(VkImage img, VkBufferImageCopy* region, const void* src, size_t tight,
+static int vk_eb_upload(vk_image* im, VkBufferImageCopy* region, const void* src, size_t tight,
                         u32 rows, u32 row_bytes);   /* -2: not batched, do it the old way */
 
 static void vk_destroy_image(vk_image* im)
@@ -1325,6 +1333,7 @@ static int vk_cmd_begin(VkCommandBuffer cb)
     VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                     .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
     if (vk_engine_check_result(pvkBeginCommandBuffer(cb, &bi), "vkBeginCommandBuffer")) return -1;
+    if (++s_hz_epoch == 0) s_hz_epoch = 1;      /* whatever the previous buffer tracked is stale */
     /* A present's copy may still be reading the surface this frame is about
      * to draw over: order everything here after it. Set only by a present,
      * which never runs alongside the walker's recording. */
@@ -1418,6 +1427,94 @@ static void vk_barrier_image_on(VkCommandBuffer cb, VkImage img, VkImageAspectFl
 static void vk_barrier_image(VkImage img, VkImageAspectFlags aspect, VkImageLayout old_layout)
 {
     vk_barrier_image_on(s_vk.cmd, img, aspect, old_layout);
+}
+
+/* ---------------------------------------------------------------------------
+ * Image hazards inside one command buffer (the draw engine path)
+ *
+ * What the per-draw ALL_COMMANDS barrier used to buy, by need. A command buffer begins ordered after everything
+ * submitted before it (vk_cmd_begin, vk_begin, vk_eb_begin), so only accesses recorded into this one can
+ * hazard. Each image keeps the kinds of access made to it since the buffer began (vk_hz); a barrier goes in
+ * when an access conflicts with an earlier one it was not yet ordered after, with the stages and accesses of
+ * that pair. Whole-image granularity: a second write to another mip level costs a barrier too.
+ *
+ * Attachment after attachment is not tracked here: the engine's render passes carry a subpass dependency
+ * (vk_eng_render_pass), the only ordering across passes since the images are GENERAL -> GENERAL and so have no
+ * implicit one; inside a pass blending and depth tests are ordered by rasterisation order.
+ * -------------------------------------------------------------------------*/
+enum { VK_HZ_ATT, VK_HZ_SAMPLE, VK_HZ_XFER_R, VK_HZ_XFER_W, VK_HZ_KINDS };
+
+static int vk_hz_writes(int kind) { return kind == VK_HZ_ATT || kind == VK_HZ_XFER_W; }
+
+/* The stages a kind of access runs in, its write accesses (the part a later access has to wait for and see) and
+ * all its accesses. Depth targets are tested in the fragment-test stages, colour targets blend in the output stage. */
+static void vk_hz_scope(int kind, int depth, VkPipelineStageFlags* stage, VkAccessFlags* writes,
+                        VkAccessFlags* all)
+{
+    switch (kind) {
+    case VK_HZ_ATT:
+        *stage  = depth ? (VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT)
+                        : VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        *writes = depth ? VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT : VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        *all    = *writes | (depth ? VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT
+                                   : VK_ACCESS_COLOR_ATTACHMENT_READ_BIT);
+        break;
+    case VK_HZ_SAMPLE:
+        *stage  = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        *writes = 0;
+        *all    = VK_ACCESS_SHADER_READ_BIT;
+        break;
+    case VK_HZ_XFER_R:
+        *stage  = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        *writes = 0;
+        *all    = VK_ACCESS_TRANSFER_READ_BIT;
+        break;
+    default:
+        *stage  = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        *writes = *all = VK_ACCESS_TRANSFER_WRITE_BIT;
+        break;
+    }
+}
+
+/* Record an access of `kind` to `im` into s_vk.cmd, outside any render pass: first the barrier it needs behind
+ * the earlier accesses of this buffer, if any, then the access itself in the image's tracking. `aspect` is the
+ * whole image's (depth and stencil together for a depth format). */
+static void vk_hz_use(vk_image* im, VkImageAspectFlags aspect, int kind)
+{
+    vk_hz* const hz = &im->hz;
+    if (hz->epoch != s_hz_epoch) { hz->epoch = s_hz_epoch; hz->pend = 0; hz->ok = 0; }
+    const int depth = (aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0;
+    VkPipelineStageFlags src_stage = 0, dst_stage = 0;
+    VkAccessFlags src_access = 0, dst_access = 0, unused = 0;
+    vk_hz_scope(kind, depth, &dst_stage, &unused, &dst_access);
+    for (int p = 0; p < VK_HZ_KINDS; p++) {
+        const unsigned bit = 1u << (p * VK_HZ_KINDS + kind);
+        if (!(hz->pend & (1u << p)) || (hz->ok & bit)) continue;
+        if (!vk_hz_writes(p) && !vk_hz_writes(kind)) continue;       /* read after read */
+        if (p == VK_HZ_ATT && kind == VK_HZ_ATT) continue;           /* the subpass dependency */
+        VkPipelineStageFlags s;
+        VkAccessFlags w, a;
+        vk_hz_scope(p, depth, &s, &w, &a);
+        src_stage |= s;
+        src_access |= w;                  /* an earlier read has no access to make available, only a stage */
+        hz->ok |= (u16)bit;
+    }
+    if (src_stage) {
+        VkImageMemoryBarrier b = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = src_access, .dstAccessMask = dst_access,
+            .oldLayout = VK_IMAGE_LAYOUT_GENERAL, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = im->img,
+            .subresourceRange = { aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS },
+        };
+        VK_OPS_ADD(s_ops.win, image_barriers);
+        VK_OPS_ADD(s_ops.tot, image_barriers);
+        pvkCmdPipelineBarrier(s_vk.cmd, src_stage, dst_stage, 0, 0, NULL, 0, NULL, 1, &b);
+    }
+    hz->pend |= (u8)(1u << kind);
+    hz->ok &= (u16)~(0xFu << (kind * VK_HZ_KINDS));     /* a new access of this kind is ordered after nothing yet */
 }
 
 /* ---------------------------------------------------------------------------
@@ -3594,7 +3691,7 @@ static vk_buffer* vk_stage_get(vk_buffer* b, VkDeviceSize size, VkBufferUsageFla
 
 /* Copy `rows` rows of `w` texels from host memory into a w x h rectangle at
  * (x, y) of one level / layer of an image that is in GENERAL. */
-static int vk_eng_upload_region(VkImage img, u32 layer, u32 mip, u32 x, u32 y,
+static int vk_eng_upload_region(vk_image* im, u32 layer, u32 mip, u32 x, u32 y,
                                 u32 w, u32 h, size_t tight, u32 rows,
                                 const void* src, u32 row_bytes)
 {
@@ -3605,7 +3702,7 @@ static int vk_eng_upload_region(VkImage img, u32 layer, u32 mip, u32 x, u32 y,
             .imageOffset = { (int32_t)x, (int32_t)y, 0 },
             .imageExtent = { w, h, 1 },
         };
-        const int b = vk_eb_upload(img, &region, src, tight, rows, row_bytes);
+        const int b = vk_eb_upload(im, &region, src, tight, rows, row_bytes);
         if (b != -2) return b;
     }
     /* Unbatched: #552's reused upload staging rather than a buffer created and
@@ -3616,29 +3713,29 @@ static int vk_eng_upload_region(VkImage img, u32 layer, u32 mip, u32 x, u32 y,
         memcpy((u8*)st->ptr + (size_t)y * tight, (const u8*)src + (size_t)y * row_bytes, tight);
     int rc = vk_begin();
     if (!rc) {
-        vk_barrier_image(img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+        vk_barrier_image(im->img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
         VkBufferImageCopy region = {
             .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, mip, layer, 1 },
             .imageOffset = { (int32_t)x, (int32_t)y, 0 },
             .imageExtent = { w, h, 1 },
         };
-        pvkCmdCopyBufferToImage(s_vk.cmd, st->buf, img, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+        pvkCmdCopyBufferToImage(s_vk.cmd, st->buf, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
         rc = vk_submit_and_wait_cause(VK_WAIT_UNBATCHED);
     }
     return rc;
 }
 
 /* The same into the whole of a level, from its origin. */
-static int vk_eng_upload_rows(VkImage img, u32 layer, u32 mip, u32 w, u32 h,
+static int vk_eng_upload_rows(vk_image* im, u32 layer, u32 mip, u32 w, u32 h,
                               size_t tight, u32 rows, const void* src, u32 row_bytes)
 {
-    return vk_eng_upload_region(img, layer, mip, 0, 0, w, h, tight, rows, src, row_bytes);
+    return vk_eng_upload_region(im, layer, mip, 0, 0, w, h, tight, rows, src, row_bytes);
 }
 
-static int vk_eng_upload(VkImage img, u32 layer, u32 mip, u32 w, u32 h, u32 bpp,
+static int vk_eng_upload(vk_image* im, u32 layer, u32 mip, u32 w, u32 h, u32 bpp,
                          const void* src, u32 row_bytes)
 {
-    return vk_eng_upload_rows(img, layer, mip, w, h, (size_t)w * bpp, h, src, row_bytes);
+    return vk_eng_upload_rows(im, layer, mip, w, h, (size_t)w * bpp, h, src, row_bytes);
 }
 
 /* NV4097 TEXTURE_CONTROL1 crossbar as a Vulkan component mapping: the shared
@@ -3804,7 +3901,7 @@ static u32 vk_eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 
     pvkCmdClearColorImage(s_vk.cmd, o->im.img, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &r);
     if (vk_submit_and_wait()) { vk_eng_release(user, hd); return 0; }
     if (seed && seed_row_bytes)
-        vk_eng_upload(o->im.img, 0, 0, w, h, bpp, seed, seed_row_bytes);
+        vk_eng_upload(&o->im, 0, 0, w, h, bpp, seed, seed_row_bytes);
     return hd;
 }
 
@@ -3857,7 +3954,7 @@ static void vk_eng_clear_color(void* user, u32 surface, const float rgba[4])
     VkClearColorValue v;
     memcpy(v.float32, rgba, sizeof v.float32);
     VkImageSubresourceRange r = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-    vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    vk_hz_use(&o->im, VK_IMAGE_ASPECT_COLOR_BIT, VK_HZ_XFER_W);
     pvkCmdClearColorImage(s_vk.cmd, o->im.img, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &r);
     if (batched) vk_eb_recorded();
     else vk_submit_and_wait_cause(VK_WAIT_CLEAR);
@@ -3876,7 +3973,7 @@ static void vk_eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
     if (batched ? (!s_eb_pending && vk_eb_begin()) : vk_begin()) return;
     VkClearDepthStencilValue d = { depth_value, stencil };
     VkImageSubresourceRange r = { aspect, 0, 1, 0, 1 };
-    vk_barrier_image(o->im.img, s_vk.depth_aspect, VK_IMAGE_LAYOUT_GENERAL);
+    vk_hz_use(&o->im, s_vk.depth_aspect, VK_HZ_XFER_W);
     pvkCmdClearDepthStencilImage(s_vk.cmd, o->im.img, VK_IMAGE_LAYOUT_GENERAL, &d, 1, &r);
     if (batched) vk_eb_recorded();
     else vk_submit_and_wait_cause(VK_WAIT_CLEAR);
@@ -3927,7 +4024,7 @@ static void vk_eng_color_target_write(void* user, u32 surface, u32 x, u32 y,
     vk_eng_obj* o = vk_eng_get(surface, VK_ENG_COLOR);
     if (!o || o->fmt != VK_FORMAT_R8G8B8A8_UNORM) return;   /* rows are R,G,B,A */
     if (!rows || !w || !h || x + w > o->w || y + h > o->h) return;
-    vk_eng_upload_region(o->im.img, 0, 0, x, y, w, h, (size_t)w * o->bpp, h, rows, row_bytes);
+    vk_eng_upload_region(&o->im, 0, 0, x, y, w, h, (size_t)w * o->bpp, h, rows, row_bytes);
 }
 
 static void vk_eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
@@ -4025,7 +4122,7 @@ static void vk_eng_texture_upload(void* user, u32 texture, u32 face, u32 mip, u3
     if (!o || !src || !row_bytes || !rows || face >= (o->cube ? 6u : 1u) || mip >= o->mips) return;
     /* A BC row is a row of 4x4 blocks; the engine's `rows` already counts them. */
     const size_t tight = o->block ? (size_t)((w + 3u) / 4u) * o->block : (size_t)w * o->bpp;
-    vk_eng_upload_rows(o->im.img, face, mip, w, h, tight, rows, src, row_bytes);
+    vk_eng_upload_rows(&o->im, face, mip, w, h, tight, rows, src, row_bytes);
 }
 
 /* A colour target sampled with a unit's crossbar: an extra view of the same
@@ -4068,6 +4165,7 @@ static u32 vk_eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_forma
 static struct { vk_image im; VkFormat fmt; u32 w, h; } s_snap_pool[VK_SNAP_POOL];
 static u32 s_snap_pool_n;
 static vk_buffer s_snap_st;         /* depth snapshot bounce buffer (vk_eng_depth_snapshot) */
+static u32 s_snap_hz;               /* the s_hz_epoch of the command buffer that last used it */
 
 static void vk_eng_snapshot_recycle(vk_eng_obj* o)
 {
@@ -4182,7 +4280,7 @@ static u32 vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
      * in 20 s of God of War: Ascension's first level. With draw batching the
      * copies join the open batch instead of a submission of their own; the
      * draws that sample the snapshot come after them in the same buffer, and
-     * each batched draw starts with a full memory barrier. */
+     * vk_hz_use orders them behind the copy. */
     const VkDeviceSize need = (VkDeviceSize)w * h * 4u;
     if (s_snap_st.size < need) {
         vk_destroy_buffer(&s_snap_st);                   /* flushes a pending batch first */
@@ -4194,10 +4292,21 @@ static u32 vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
     vk_buffer st = s_snap_st;
     const int batch = vk_eb_active();
     int rc = batch ? (s_eb_pending ? 0 : vk_eb_begin()) : vk_begin();
-    if (!rc && batch) vk_cmd_after_everything(s_vk.cmd);
     if (!rc) {
-        vk_barrier_image(z->im.img, s_vk.depth_aspect, VK_IMAGE_LAYOUT_GENERAL);
-        vk_barrier_image(t->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+        vk_hz_use(&z->im, s_vk.depth_aspect, VK_HZ_XFER_R);
+        vk_hz_use(&t->im, VK_IMAGE_ASPECT_COLOR_BIT, VK_HZ_XFER_W);
+        /* The bounce buffer: a snapshot earlier in this command buffer has read it by its copy in, which
+         * this copy out must not overtake. */
+        if (s_snap_hz == s_hz_epoch) {
+            VkBufferMemoryBarrier reuse = {
+                .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .buffer = st.buf, .offset = 0, .size = VK_WHOLE_SIZE };
+            pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                  0, 0, NULL, 1, &reuse, 0, NULL);
+        }
+        s_snap_hz = s_hz_epoch;
         VkBufferImageCopy out = { .imageSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 },
                                   .imageExtent = { w, h, 1 } };
         pvkCmdCopyImageToBuffer(s_vk.cmd, z->im.img, VK_IMAGE_LAYOUT_GENERAL, st.buf, 1, &out);
@@ -4211,10 +4320,9 @@ static u32 vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
         VkBufferImageCopy in = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
                                  .imageExtent = { w, h, 1 } };
         pvkCmdCopyBufferToImage(s_vk.cmd, st.buf, t->im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &in);
-        if (batch) {
-            vk_barrier_image(t->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+        if (batch)
             vk_eb_recorded();
-        } else
+        else
             rc = vk_submit_and_wait_cause(VK_WAIT_DEPTH_SNAPSHOT);
     }
     return rc ? 0 : snap;
@@ -4363,9 +4471,23 @@ static VkRenderPass vk_eng_render_pass(VkFormat cf, u32 n)
     VkSubpassDescription sub = { .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
                                  .colorAttachmentCount = n, .pColorAttachments = cref,
                                  .pDepthStencilAttachment = &dref };
+    /* Attachment after attachment across passes: the images stay GENERAL, so Vulkan adds no implicit dependency,
+     * and this is what orders one pass's colour and depth writes before the next pass's loads, blends and depth
+     * tests. The other accesses (sampled, transfer) are ordered by vk_hz_use. There is none out of the pass: a
+     * barrier after it names the stages and the image it needs. */
+    const VkPipelineStageFlags att_stages = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                            VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                                            VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    VkSubpassDependency dep = {
+        .srcSubpass = VK_SUBPASS_EXTERNAL, .dstSubpass = 0,
+        .srcStageMask = att_stages, .dstStageMask = att_stages,
+        .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                         VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT };
     VkRenderPassCreateInfo rci = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
                                    .attachmentCount = n + 1, .pAttachments = att,
-                                   .subpassCount = 1, .pSubpasses = &sub };
+                                   .subpassCount = 1, .pSubpasses = &sub,
+                                   .dependencyCount = 1, .pDependencies = &dep };
     if (pvkCreateRenderPass(s_vk.device, &rci, NULL, &s_e2.rp[fi][n]) != VK_SUCCESS)
         s_e2.rp[fi][n] = VK_NULL_HANDLE;
     return s_e2.rp[fi][n];
@@ -4965,6 +5087,20 @@ static VkImageView vk_eng_sample_view(u32 handle, int want_cube)
     return ((int)o->cube == want_cube) ? o->im.view : VK_NULL_HANDLE;
 }
 
+/* The image a bound handle is sampled from, for hazard tracking: what vk_eng_sample_view reads, resolved to the
+ * object that owns the VkImage (a view belongs to its surface). */
+static vk_image* vk_eng_sampled_image(u32 handle)
+{
+    if (!handle || handle >= VK_ENG_MAX_OBJ) return NULL;
+    vk_eng_obj* o = &s_eobj[handle];
+    if (o->kind == VK_ENG_VIEW) {
+        if (!o->surface || o->surface >= VK_ENG_MAX_OBJ) return NULL;
+        o = &s_eobj[o->surface];
+    }
+    if (o->kind != VK_ENG_TEXTURE && o->kind != VK_ENG_COLOR) return NULL;
+    return o->im.img ? &o->im : NULL;
+}
+
 /* What an engine draw samples on a unit with nothing bound: transparent black (0,0,0,0), the Metal backend's
  * placeholder, as a 1x1 2D texture and a 1x1 cube, each made on first use. A material that reads a unit the
  * title never binds then adds nothing, as it does on Metal; the magenta "not bound" colour it read before
@@ -5002,8 +5138,8 @@ static VkImageView vk_eng_dummy_2d_view(void)
  * its time blocked on the GPU, the RSX ring drained one draw at a time and the
  * SPU geometry jobs waited for ring space. Batched, a draw takes slices of
  * three ring buffers and a descriptor set from a pool, records into the open
- * command buffer, and only s_eb_pending grows. Between batched draws a full
- * memory barrier keeps render-to-texture ordering without tracking.
+ * command buffer, and only s_eb_pending grows. Between batched draws only the
+ * barriers the accesses need are recorded (vk_hz_use), not a full one each.
  *
  * A full batch (vk.draw_batch_max operations, or a full ring) is only kicked:
  * submitted without a wait, so the walker records the next while the GPU runs
@@ -5213,8 +5349,13 @@ static int vk_eb_begin(void)
 {
     if (vk_eb_acquire()) return -1;
     s_vk.cmd = s_vk.batch_cmd[s_eb.cur];
+    const int ordered = s_vk.present_order;     /* vk_cmd_begin then orders it after everything already */
     if (vk_cmd_begin(s_vk.cmd)) return -1;
     s_eb.cur_gt = gt_begin(s_vk.cmd, s_gt.slot_pool[s_eb.cur]);
+    /* Behind the batches the GPU may still be running, once per batch: queue order alone is not a dependency,
+     * and everything the batch's own barriers do not name (vk_hz_use, the render passes' subpass dependency)
+     * relies on this one. Not per draw. */
+    if (s_eb_inflight && !ordered) vk_cmd_after_everything(s_vk.cmd);
     return 0;
 }
 
@@ -5272,12 +5413,11 @@ static VkDeviceSize vk_eb_take(VkDeviceSize* head, VkDeviceSize ring_bytes, VkDe
     return (VkDeviceSize)s_eb.cur * cap + at;
 }
 
-/* A texture upload as one more batched operation: rows staged in the ring, the
- * copy recorded behind a full memory barrier (earlier draws of the batch may
- * still sample the old texels) and followed by one on the image (later draws
- * sample the new ones). Each used to allocate a host buffer and wait on its own
+/* A texture upload as one more batched operation: rows staged in the ring and the copy recorded as a transfer
+ * write to the image, ordered by vk_hz_use behind the earlier draws of the batch that sampled the old texels
+ * and before the later ones that sample the new. Each used to allocate a host buffer and wait on its own
  * submission, ~3000 times in 20 s of God of War: Ascension's first level. */
-static int vk_eb_upload(VkImage img, VkBufferImageCopy* region, const void* src, size_t tight,
+static int vk_eb_upload(vk_image* im, VkBufferImageCopy* region, const void* src, size_t tight,
                         u32 rows, u32 row_bytes)
 {
     if (!vk_eb_active()) return -2;
@@ -5293,10 +5433,9 @@ static int vk_eb_upload(VkImage img, VkBufferImageCopy* region, const void* src,
     for (u32 y = 0; y < rows; y++)
         memcpy((u8*)s_eb.sb.ptr + off + (size_t)y * tight, (const u8*)src + (size_t)y * row_bytes, tight);
     if (!s_eb_pending && vk_eb_begin()) return -1;
-    vk_cmd_after_everything(s_vk.cmd);
+    vk_hz_use(im, VK_IMAGE_ASPECT_COLOR_BIT, VK_HZ_XFER_W);
     region->bufferOffset = off;
-    pvkCmdCopyBufferToImage(s_vk.cmd, s_eb.sb.buf, img, VK_IMAGE_LAYOUT_GENERAL, 1, region);
-    vk_barrier_image(img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    pvkCmdCopyBufferToImage(s_vk.cmd, s_eb.sb.buf, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, region);
     vk_eb_recorded();
     return 0;
 }
@@ -5445,9 +5584,6 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
         if (ibytes) memcpy((u8*)s_eb.ib.ptr + ioff, indices, (size_t)ibytes);
         vbuf = s_eb.vb.buf; ibuf = s_eb.ib.buf;
         if (!s_eb_pending && vk_eb_begin()) return;
-        /* Earlier draws of this batch may have rendered what this one samples
-         * or blends over: order it after all of them. */
-        vk_cmd_after_everything(s_vk.cmd);
     } else {
         if (vk_ensure_vertex_buffer(vbytes)) return;
         memcpy(s_vk.vertices.ptr, vertices, (size_t)vbytes);
@@ -5463,11 +5599,16 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
         if (!set) return;
         if (vk_begin()) return;
     }
-    /* A batch or one-shot before this may still be running; the barrier above (batched: the
-     * full memory barrier, one-shot: vk_begin's) ordered this command buffer after all of
-     * them, and this orders memory for the surfaces this draw touches. */
+    /* This command buffer begins ordered after everything submitted before it (vk_begin, vk_eb_begin); what is
+     * left is its own earlier work. The images this draw samples first, then the ones it writes. */
+    for (u32 u = 0; u < RSX_MAX_TEXTURES; u++) {
+        if (!((s_e2.tex_mask >> u) & 1u)) continue;
+        vk_image* const im = vk_eng_sampled_image(s_e2.tex[u]);
+        if (im) vk_hz_use(im, VK_IMAGE_ASPECT_COLOR_BIT, VK_HZ_SAMPLE);
+    }
     for (u32 i = 0; i < n; i++)
-        vk_barrier_image(s_eobj[s_eng_bound.rt[i]].im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+        vk_hz_use(&s_eobj[s_eng_bound.rt[i]].im, VK_IMAGE_ASPECT_COLOR_BIT, VK_HZ_ATT);
+    vk_hz_use(dkey != 0xFFFFFFFFu ? &zo->im : &s_e2.scratch_depth, s_vk.depth_aspect, VK_HZ_ATT);
     VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
                                   .renderPass = rp, .framebuffer = fb,
                                   .renderArea = { { 0, 0 }, { w, h } } };
