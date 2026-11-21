@@ -60,10 +60,19 @@ extern "C" {
  * a tail call is an error ("cannot tail-call: ..."), and a callable one is a
  * jump even under -O2 -fno-optimize-sibling-calls. MSVC has no musttail, and
  * the Windows runtime library is built with it, so the tests stay compiler-
- * specific rather than trusting __has_attribute alone. */
+ * specific rather than trusting __has_attribute alone.
+ *
+ * GCC without optimization under -fsanitize=thread is the exception: it puts
+ * the sanitizer's function-exit call after the tail call and then refuses it
+ * ("cannot tail-call: return value changed after call", spu_indirect_branch's
+ * hand-off to the served resolver, gcc 15.3 x86-64; -O2 with TSan, and -O0
+ * with ASan or UBSan, compile). That build keeps the trampoline, as GCC did
+ * before 15. */
 #if defined(__clang__) || defined(__GNUC__)
 #  if defined(__has_attribute) && __has_attribute(musttail)
-#    define SPU_HAVE_MUSTTAIL 1
+#    if defined(__clang__) || !defined(__SANITIZE_THREAD__) || defined(__OPTIMIZE__)
+#      define SPU_HAVE_MUSTTAIL 1
+#    endif
 #  endif
 #endif
 #ifndef SPU_HAVE_MUSTTAIL
