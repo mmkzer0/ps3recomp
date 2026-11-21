@@ -337,23 +337,40 @@ enum {
 };
 
 static struct {
-    int on;                    /* -1 undecided, 0 off, 1 on */
-    u32 every_s;
     time_t t0_s;               /* start of the window being averaged */
     unsigned long long frames, draws, groups, breaks[ENG_V1_BREAK_COUNT];
     int open;                  /* a draw run is open */
     u32 n_targets, targets[RSX_BE_MAX_COLOR_TARGETS];
     u32 zloc, zoff;
 } s_v1;
+static atomic_uint s_v1_every_s = 0u;
+/* The gate is read lazily and the counters below can see a host-driven present
+ * on another thread (rsx_draw_engine.h), so the gate publishes with release and
+ * every update is under a spinlock. The lock is taken only when the gate is on. */
+static atomic_int s_v1_on = -1;
+static atomic_flag s_v1_lock = ATOMIC_FLAG_INIT;
+
+static void eng_v1_enter(void)
+{
+    while (atomic_flag_test_and_set_explicit(&s_v1_lock, memory_order_acquire)) { }
+}
+
+static void eng_v1_leave(void)
+{
+    atomic_flag_clear_explicit(&s_v1_lock, memory_order_release);
+}
 
 static int eng_v1_on(void)
 {
-    if (s_v1.on < 0) {
+    int on = atomic_load_explicit(&s_v1_on, memory_order_acquire);
+    if (on < 0) {
         const char* e = getenv("PS3RECOMP_ENG_FRAME_STATS");
-        s_v1.every_s = e ? (u32)strtoul(e, NULL, 10) : 0u;
-        s_v1.on = (e && *e && s_v1.every_s) ? 1 : 0;
+        const u32 every_s = e ? (u32)strtoul(e, NULL, 10) : 0u;
+        on = (e && *e && every_s) ? 1 : 0;
+        atomic_store_explicit(&s_v1_every_s, every_s, memory_order_relaxed);
+        atomic_store_explicit(&s_v1_on, on, memory_order_release);
     }
-    return s_v1.on;
+    return on;
 }
 
 /* One executed draw: extend the open run, or start a new one and count what
@@ -361,6 +378,7 @@ static int eng_v1_on(void)
  * non-draw operation (eng_v1_break) ended it since the last draw. */
 static void eng_v1_draw(const u32* targets, u32 n_targets, u32 zloc, u32 zoff)
 {
+    eng_v1_enter();
     s_v1.draws++;
     if (!s_v1.open) {
         s_v1.open = 1;
@@ -378,6 +396,7 @@ static void eng_v1_draw(const u32* targets, u32 n_targets, u32 zloc, u32 zoff)
     memcpy(s_v1.targets, targets, n_targets * sizeof(u32));
     s_v1.zloc = zloc;
     s_v1.zoff = zoff;
+    eng_v1_leave();
 }
 
 /* A non-draw operation that cannot be inside a render pass (a clear, a copy,
@@ -385,32 +404,46 @@ static void eng_v1_draw(const u32* targets, u32 n_targets, u32 zloc, u32 zoff)
  * break of its own, so the causes stay one per group boundary. */
 static void eng_v1_break(u32 cause)
 {
-    if (!s_v1.open) return;
-    s_v1.open = 0;
-    s_v1.breaks[cause]++;
+    eng_v1_enter();
+    if (s_v1.open) {
+        s_v1.open = 0;
+        s_v1.breaks[cause]++;
+    }
+    eng_v1_leave();
 }
 
 /* One presented frame: a present ends every pass, and every <every_s> seconds
- * the window's averages are printed and the counters reset. */
+ * the window's averages are printed and the counters reset. The print runs
+ * outside the lock so the walker is not held during fprintf. */
 static void eng_v1_frame(void)
 {
     const time_t now = time(NULL);
+    unsigned long long frames, draws, groups, breaks[ENG_V1_BREAK_COUNT];
+    double secs;
+    eng_v1_enter();
     s_v1.frames++;
     s_v1.open = 0;
-    if (!s_v1.t0_s) { s_v1.t0_s = now; return; }
-    const double secs = difftime(now, s_v1.t0_s);
-    if (secs < (double)s_v1.every_s) return;
-    const double f = (double)s_v1.frames;
-    PS3_LOG(PS3_LOG_INFO, "rsx-frame-stats",
-            "frames %llu in %.2f s (%.1f fps), %.2f draws/frame, %.2f target groups/frame; "
-            "breaks/frame colour %.2f zeta-only %.2f clear %.2f copy %.2f other %.2f\n",
-            s_v1.frames, secs, f / secs, (double)s_v1.draws / f, (double)s_v1.groups / f,
-            (double)s_v1.breaks[ENG_V1_BREAK_COLOUR] / f, (double)s_v1.breaks[ENG_V1_BREAK_ZETA] / f,
-            (double)s_v1.breaks[ENG_V1_BREAK_CLEAR] / f, (double)s_v1.breaks[ENG_V1_BREAK_COPY] / f,
-            (double)s_v1.breaks[ENG_V1_BREAK_OTHER] / f);
+    if (!s_v1.t0_s) { s_v1.t0_s = now; eng_v1_leave(); return; }
+    secs = difftime(now, s_v1.t0_s);
+    if (secs < (double)atomic_load_explicit(&s_v1_every_s, memory_order_relaxed)) {
+        eng_v1_leave(); return;
+    }
+    frames = s_v1.frames;
+    draws = s_v1.draws;
+    groups = s_v1.groups;
+    memcpy(breaks, s_v1.breaks, sizeof breaks);
     s_v1.frames = s_v1.draws = s_v1.groups = 0;
     memset(s_v1.breaks, 0, sizeof s_v1.breaks);
     s_v1.t0_s = now;
+    eng_v1_leave();
+    const double f = (double)frames;
+    PS3_LOG(PS3_LOG_INFO, "rsx-frame-stats",
+            "frames %llu in %.2f s (%.1f fps), %.2f draws/frame, %.2f target groups/frame; "
+            "breaks/frame colour %.2f zeta-only %.2f clear %.2f copy %.2f other %.2f\n",
+            frames, secs, f / secs, (double)draws / f, (double)groups / f,
+            (double)breaks[ENG_V1_BREAK_COLOUR] / f, (double)breaks[ENG_V1_BREAK_ZETA] / f,
+            (double)breaks[ENG_V1_BREAK_CLEAR] / f, (double)breaks[ENG_V1_BREAK_COPY] / f,
+            (double)breaks[ENG_V1_BREAK_OTHER] / f);
 }
 
 const char* rsx_drop_reason_name(rsx_drop_reason reason)
