@@ -14,7 +14,13 @@ of its own (the backend reads the registry once) and looks only at what the back
                                      presents named, a list beats a range, a malformed or over-long value is
                                      the config-invalid stop before any frame is written, and a dump with
                                      neither keeps writing one file;
-  batching on against off            the presented frames are byte-identical (what the dump is for).
+  batching on against off            the presented frames are byte-identical (what the dump is for);
+  batches in flight                  with a submission cap of 1 or 2 operations every batch is queued without
+                                     a wait and two are in flight at once, yet render-to-texture, feedback,
+                                     depth-as-texture, MRT, cube and texture scenes, and many full-frame draws
+                                     over several frames, present the frames batching off does: a present,
+                                     a one-shot or a slot's reuse never reads or overwrites what an earlier,
+                                     unwaited batch has still to write.
 
 The scene's own verdict (its exit code) is not looked at: it checks the draw path's pixels, not these.
 Exit 77: no usable Vulkan device or the draw engine path is not built (needs glslang), nothing to run."""
@@ -34,14 +40,14 @@ def check(cond, what):
         FAILED += 1
 
 
-def run(host, workdir, **env):
-    """One `--draw` scene run; returns (exit code, combined output)."""
+def run(host, workdir, *scene, **env):
+    """One host scene run (`--draw` unless `scene` says otherwise); returns (exit code, combined output)."""
     e = {k: v for k, v in os.environ.items()
          if not k.startswith("PS3RECOMP_") and k not in ("VK_DRAW_BATCH", "VK_DRAW_BATCH_MAX")}
     e["PS3RECOMP_VK_GUEST_PROGRAMS"] = "1"
     e.update(env)
-    p = subprocess.run([host, "--draw"], check=False, cwd=workdir, env=e, capture_output=True, text=True,
-                       timeout=120)
+    p = subprocess.run([host, *(scene or ("--draw",))], check=False, cwd=workdir, env=e, capture_output=True,
+                       text=True, timeout=120)
     return p.returncode, p.stdout + p.stderr
 
 
@@ -145,6 +151,25 @@ def main():
         for name in dumps(a):
             same = (a / name).read_bytes() == (b / name).read_bytes()
             check(same and (a / name).stat().st_size > 1000, f"{name}: batching on is byte-identical to off")
+
+        # ---- batches in flight: the same frames with every operation its own, unwaited submission ----------
+        rc, out = run(host, fresh("slots"), PS3RECOMP_VK_DRAW_BATCH="1")
+        check("submissions in flight" in out, "batching says how many submissions it keeps in flight")
+        scenes = (("--rtt",), ("--feedback",), ("--depthtex",), ("--mrt",), ("--cube",), ("--tex",),
+                  ("--draws=24", "--frames=4"))
+        for scene in scenes:
+            name = " ".join(scene)
+            off = fresh("flight-off")
+            run(host, off, *scene, PS3RECOMP_VK_DUMP=str(off / "f"), PS3RECOMP_VK_DUMP_RANGE="0-9")
+            check(len(dumps(off)) >= 2, f"{name}: batching off presents frames to compare: {dumps(off)}")
+            for cap in ("1", "2"):
+                on = fresh("flight-on")
+                rc, out = run(host, on, *scene, PS3RECOMP_VK_DUMP=str(on / "f"), PS3RECOMP_VK_DUMP_RANGE="0-9",
+                              PS3RECOMP_VK_DRAW_BATCH="1", PS3RECOMP_VK_DRAW_BATCH_MAX=cap)
+                same = dumps(on) == dumps(off) and all(
+                    (on / n).read_bytes() == (off / n).read_bytes() for n in dumps(off))
+                check(same and "VkResult" not in out,
+                      f"{name}, {cap} operation(s) per submission: frames are byte-identical to batching off")
     print(f"failed {FAILED}" if FAILED else "all checks passed")
     return 1 if FAILED else 0
 
