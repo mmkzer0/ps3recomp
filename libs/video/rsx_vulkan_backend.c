@@ -332,20 +332,67 @@ static struct {
     atomic_ullong      present_wait_ns;
 } s_stat;
 
+/* What a blocking wait was asked for. A flush or a slot's fence is one wait,
+ * but the operation that needed the GPU drained names the cost: a snapshot,
+ * a readback, a clear outside a batch, an unbatched fallback, the present's
+ * readback fence, or the batch machinery's own slot reuse. */
+enum {
+    VK_WAIT_PRESENT = 0,
+    VK_WAIT_COLOR_SNAPSHOT,
+    VK_WAIT_DEPTH_SNAPSHOT,
+    VK_WAIT_CLEAR,
+    VK_WAIT_READBACK,
+    VK_WAIT_UNBATCHED,
+    VK_WAIT_KICK_SLOT,
+    VK_WAIT_CAUSE_COUNT
+};
+
+static const char* const vk_wait_cause_name[VK_WAIT_CAUSE_COUNT] = {
+    "present", "colour-snapshot", "depth-snapshot", "clear", "readback", "unbatched", "kick-slot",
+};
+
+/* Per-frame counts behind PS3RECOMP_VK_GPU_TIMING: the operations a pass
+ * coalescing backend could merge (render passes, global and image barriers)
+ * and the waits split by cause. Every field is atomic because the present
+ * path may finish a frame on a host thread while the walker counts the next
+ * one; `win` is reset at each printed window, `tot` runs to shutdown. */
+typedef struct {
+    atomic_ullong frames, passes, global_barriers, image_barriers;
+    atomic_ullong waits[VK_WAIT_CAUSE_COUNT];
+} vk_ops;
+static struct { vk_ops win, tot; } s_ops;
+static u32 s_ops_every;      /* the VK_GPU_TIMING interval, 0 = the counters are off */
+
+/* The gate itself: no VK_GPU_TIMING, no counting. */
+#define VK_OPS_ON() (s_ops_every != 0u)
+#define VK_OPS_ADD(where, field) \
+    do { if (VK_OPS_ON()) atomic_fetch_add_explicit(&(where).field, 1, memory_order_relaxed); } while (0)
+
+static unsigned long long vk_ops_take(atomic_ullong* c) { return atomic_exchange_explicit(c, 0, memory_order_relaxed); }
+
+static void vk_count_wait(u32 cause)
+{
+    if (!VK_OPS_ON() || cause >= VK_WAIT_CAUSE_COUNT) return;
+    atomic_fetch_add_explicit(&s_ops.win.waits[cause], 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&s_ops.tot.waits[cause], 1, memory_order_relaxed);
+}
+
 /* ftrace's clock: monotonic on every host, and SDL is not linked on Windows. */
 static unsigned long long vk_now_ns(void) { return ps3_ft_now(); }
 
 /* The `a` of a PS3_FT_GPU_WAIT span, the kinds Metal's backend writes. */
 enum { VK_FT_WAIT_FLUSH = 0, VK_FT_WAIT_PRESENT = 1, VK_FT_WAIT_INFLIGHT = 2 };
 
-/* The walker's blocking fence wait, timed, and for ftrace a GPU wait of kind `ft_kind`. */
-static VkResult vk_wait_fence(VkFence fence, u32 ft_kind)
+/* The walker's blocking fence wait, timed, and for ftrace a GPU wait of kind `ft_kind`.
+ * `cause` names the operation in the wait split. */
+static VkResult vk_wait_fence(VkFence fence, u32 ft_kind, u32 cause)
 {
     const unsigned long long t0 = vk_now_ns();
     const uint64_t ft0 = PS3_FT_ON() ? ps3_ft_now() : 0;
     const VkResult r = pvkWaitForFences(s_vk.device, 1, &fence, VK_TRUE, UINT64_MAX);
     s_stat.waits++;
     s_stat.wait_ns += vk_now_ns() - t0;
+    vk_count_wait(cause);
     if (ft0) {
         const uint64_t ft1 = ps3_ft_now();
         if (ft1 - ft0 >= ps3_ft_min_ns()) ps3_ft_span(PS3_FT_GPU_WAIT, 0, ft_kind, 0, ft0, ft1);
@@ -894,6 +941,8 @@ static void vk_cmd_after_everything(VkCommandBuffer cb)
     VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
                            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
                            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT };
+    VK_OPS_ADD(s_ops.win, global_barriers);
+    VK_OPS_ADD(s_ops.tot, global_barriers);
     pvkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
 }
@@ -961,6 +1010,7 @@ static void gt_request(void)
         return;
     }
     s_gt.every = (u32)n;
+    s_ops_every = s_gt.every;   /* the same gate paces the pass/barrier/wait counters */
 }
 
 /* After the device and its functions exist: decide whether the queue can measure, and make the pools. */
@@ -1007,6 +1057,61 @@ static void gt_setup(void)
            "timestampComputeAndGraphics %d, first-start latency %s)\n", s_gt.every, s_gt.bits, s_gt.period_ns,
            (int)p.limits.timestampComputeAndGraphics,
            s_gt.calibrated ? "from the calibrated device clock" : "not available: no VK_EXT_calibrated_timestamps");
+}
+
+/* One window's averages, then reset: the same cadence as gpu timing, so the
+ * numbers line up with its windows. The window half (acquire, window fence,
+ * queue present) is its own line because it exists only with a window. */
+static void vk_ops_print_window(void)
+{
+    vk_ops* const w = &s_ops.win;
+    const unsigned long long frames = vk_ops_take(&w->frames);
+    const double f = frames ? (double)frames : 1.0;
+    const unsigned long long passes = vk_ops_take(&w->passes);
+    const unsigned long long glob = vk_ops_take(&w->global_barriers);
+    const unsigned long long image = vk_ops_take(&w->image_barriers);
+    unsigned long long waits[VK_WAIT_CAUSE_COUNT];
+    for (u32 c = 0; c < VK_WAIT_CAUSE_COUNT; c++) waits[c] = vk_ops_take(&w->waits[c]);
+    VK_LOG("frame ops (window): %llu frames, %.2f passes/frame, %.2f global barriers/frame, "
+           "%.2f image barriers/frame\n",
+           frames, (double)passes / f, (double)glob / f, (double)image / f);
+    VK_LOG("frame waits (window): present %.2f, colour-snapshot %.2f, depth-snapshot %.2f, "
+           "clear %.2f, readback %.2f, unbatched %.2f, kick-slot %.2f per frame\n",
+           (double)waits[VK_WAIT_PRESENT] / f, (double)waits[VK_WAIT_COLOR_SNAPSHOT] / f,
+           (double)waits[VK_WAIT_DEPTH_SNAPSHOT] / f, (double)waits[VK_WAIT_CLEAR] / f,
+           (double)waits[VK_WAIT_READBACK] / f, (double)waits[VK_WAIT_UNBATCHED] / f,
+           (double)waits[VK_WAIT_KICK_SLOT] / f);
+}
+
+/* The same over the whole run, without resetting: the frame ops, the wait
+ * split and the window half, per frame / per wait. */
+static void vk_ops_report_final(void)
+{
+    if (!VK_OPS_ON()) return;
+    const unsigned long long frames = atomic_load_explicit(&s_ops.tot.frames, memory_order_relaxed);
+    if (!frames) return;
+    const double f = (double)frames;
+    const unsigned long long passes = atomic_load_explicit(&s_ops.tot.passes, memory_order_relaxed);
+    const unsigned long long glob = atomic_load_explicit(&s_ops.tot.global_barriers, memory_order_relaxed);
+    const unsigned long long image = atomic_load_explicit(&s_ops.tot.image_barriers, memory_order_relaxed);
+    VK_LOG("frame ops (total): %llu frames, %.2f passes/frame, %.2f global barriers/frame, "
+           "%.2f image barriers/frame\n",
+           frames, (double)passes / f, (double)glob / f, (double)image / f);
+    VK_LOG("frame waits (total):");
+    for (u32 c = 0; c < VK_WAIT_CAUSE_COUNT; c++)
+        fprintf(stderr, " %s %.2f", vk_wait_cause_name[c],
+                (double)atomic_load_explicit(&s_ops.tot.waits[c], memory_order_relaxed) / f);
+    fprintf(stderr, " per frame\n");
+}
+
+/* One presented frame of the engine path. */
+static void vk_ops_frame_end(void)
+{
+    if (!VK_OPS_ON()) return;
+    atomic_fetch_add_explicit(&s_ops.win.frames, 1, memory_order_relaxed);
+    const unsigned long long total =
+        atomic_fetch_add_explicit(&s_ops.tot.frames, 1, memory_order_relaxed) + 1;
+    if (total % s_ops_every == 0) vk_ops_print_window();
 }
 
 static void gt_shutdown(void)
@@ -1239,18 +1344,22 @@ static int vk_fence_wait_failed(VkResult waited)
     return -1;
 }
 
-static int vk_submit_and_wait(void)
+static int vk_submit_and_wait_cause(u32 cause)
 {
     if (vk_submit_cb(s_vk.cmd, s_vk.fence)) return -1;
-    const VkResult waited = vk_wait_fence(s_vk.fence, VK_FT_WAIT_FLUSH);
+    const VkResult waited = vk_wait_fence(s_vk.fence, VK_FT_WAIT_FLUSH, cause);
     return waited == VK_SUCCESS ? 0 : vk_fence_wait_failed(waited);
 }
+
+static int vk_submit_and_wait(void) { return vk_submit_and_wait_cause(VK_WAIT_KICK_SLOT); }
 
 /* Order this command buffer's use of an image after everything submitted
  * before it; from UNDEFINED it is also the one-time move to GENERAL. */
 static void vk_barrier_image_on(VkCommandBuffer cb, VkImage img, VkImageAspectFlags aspect,
                                 VkImageLayout old_layout)
 {
+    VK_OPS_ADD(s_ops.win, image_barriers);
+    VK_OPS_ADD(s_ops.tot, image_barriers);
     VkImageMemoryBarrier b = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
         .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
@@ -2269,6 +2378,8 @@ static int vk_guest_draw(const rsx_state* st, u32 prim, u32 first, u32 count)
     VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
                                   .renderPass = s_vk.render_pass, .framebuffer = s_vk.framebuffer,
                                   .renderArea = { { 0, 0 }, { s_vk.width, s_vk.height } } };
+    VK_OPS_ADD(s_ops.win, passes);
+    VK_OPS_ADD(s_ops.tot, passes);
     pvkCmdBeginRenderPass(s_vk.cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
     pvkCmdBindPipeline(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     VkViewport vpt = { 0.0f, 0.0f, (float)s_vk.width, (float)s_vk.height, 0.0f, 1.0f };
@@ -2281,7 +2392,7 @@ static int vk_guest_draw(const rsx_state* st, u32 prim, u32 first, u32 count)
     pvkCmdBindVertexBuffers(s_vk.cmd, 0, 1, &s_g.vertices.buf, &off);
     pvkCmdDraw(s_vk.cmd, (u32)s_g.cpu_count, 1, 0, 0);
     pvkCmdEndRenderPass(s_vk.cmd);
-    if (vk_submit_and_wait()) return 0;
+    if (vk_submit_and_wait_cause(VK_WAIT_UNBATCHED)) return 0;
     s_g.draws++;
     return 1;
 }
@@ -2314,6 +2425,8 @@ static void vk_draw(u32 prim, u32 first, u32 count)
     VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
                                   .renderPass = s_vk.render_pass, .framebuffer = s_vk.framebuffer,
                                   .renderArea = { { 0, 0 }, { s_vk.width, s_vk.height } } };
+    VK_OPS_ADD(s_ops.win, passes);
+    VK_OPS_ADD(s_ops.tot, passes);
     pvkCmdBeginRenderPass(s_vk.cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
     pvkCmdBindPipeline(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     /* Whole target, as the null backend's ndc_to_px maps it. */
@@ -2329,7 +2442,7 @@ static void vk_draw(u32 prim, u32 first, u32 count)
     pvkCmdBindVertexBuffers(s_vk.cmd, 0, 1, &s_vk.vertices.buf, &off);
     pvkCmdDraw(s_vk.cmd, (u32)s_vk.cpu_count, 1, 0, 0);
     pvkCmdEndRenderPass(s_vk.cmd);
-    vk_submit_and_wait();
+    vk_submit_and_wait_cause(VK_WAIT_UNBATCHED);
 }
 
 static void vk_cb_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
@@ -2375,7 +2488,7 @@ static void vk_cb_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
         vk_barrier_image(s_vk.depth.img, s_vk.depth_aspect, VK_IMAGE_LAYOUT_GENERAL);
         pvkCmdClearDepthStencilImage(s_vk.cmd, s_vk.depth.img, VK_IMAGE_LAYOUT_GENERAL, &d, 1, &r);
     }
-    vk_submit_and_wait();
+    vk_submit_and_wait_cause(VK_WAIT_CLEAR);
 }
 
 /* ---------------------------------------------------------------------------
@@ -3207,6 +3320,7 @@ static void vk_present_complete_locked(void)
     const uint64_t ft0 = PS3_FT_ON() ? ps3_ft_now() : 0;
     pvkWaitForFences(s_vk.device, 1, &s_vk.present_fence, VK_TRUE, UINT64_MAX);
     atomic_fetch_add_explicit(&s_stat.present_wait_ns, vk_now_ns() - pw0, memory_order_relaxed);
+    vk_count_wait(VK_WAIT_PRESENT);
     if (ft0) {
         const uint64_t ft1 = ps3_ft_now();
         if (ft1 - ft0 >= ps3_ft_min_ns()) ps3_ft_span(PS3_FT_GPU_WAIT, 0, VK_FT_WAIT_PRESENT, 0, ft0, ft1);
@@ -3453,7 +3567,7 @@ static int vk_eng_upload_region(VkImage img, u32 layer, u32 mip, u32 x, u32 y,
             .imageExtent = { w, h, 1 },
         };
         pvkCmdCopyBufferToImage(s_vk.cmd, st->buf, img, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
-        rc = vk_submit_and_wait();
+        rc = vk_submit_and_wait_cause(VK_WAIT_UNBATCHED);
     }
     return rc;
 }
@@ -3690,7 +3804,7 @@ static void vk_eng_clear_color(void* user, u32 surface, const float rgba[4])
     vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
     pvkCmdClearColorImage(s_vk.cmd, o->im.img, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &r);
     if (batched) vk_eb_recorded();
-    else vk_submit_and_wait();
+    else vk_submit_and_wait_cause(VK_WAIT_CLEAR);
 }
 
 static void vk_eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
@@ -3709,7 +3823,7 @@ static void vk_eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
     vk_barrier_image(o->im.img, s_vk.depth_aspect, VK_IMAGE_LAYOUT_GENERAL);
     pvkCmdClearDepthStencilImage(s_vk.cmd, o->im.img, VK_IMAGE_LAYOUT_GENERAL, &d, 1, &r);
     if (batched) vk_eb_recorded();
-    else vk_submit_and_wait();
+    else vk_submit_and_wait_cause(VK_WAIT_CLEAR);
 }
 
 /* The named surface becomes the frame: blit it onto the display image, then
@@ -3745,6 +3859,7 @@ static void vk_eng_present(void* user, u32 surface)
     s_g.last_draws = s_g.draws;
     s_g.draws = 0;
     gt_frame_end();
+    vk_ops_frame_end();
 }
 
 /* Pixels a 2D transfer put into guest memory, pushed into the colour target
@@ -3783,7 +3898,7 @@ static void vk_eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
         };
         pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
                               0, 0, NULL, 1, &hb, 0, NULL);
-        if (!vk_submit_and_wait()) {
+        if (!vk_submit_and_wait_cause(VK_WAIT_READBACK)) {
             vk_invalidate(st);
             for (u32 row = 0; row < h; row++)
                 memcpy((u8*)out + (size_t)row * out_pitch, (const u8*)st->ptr + (size_t)row * tight, tight);
@@ -3838,7 +3953,7 @@ static u32 vk_eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
     /* UNDEFINED -> GENERAL for every level and face before the uploads arrive. */
     if (vk_begin()) goto fail;
     vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
-    if (vk_submit_and_wait()) goto fail;
+    if (vk_submit_and_wait_cause(VK_WAIT_UNBATCHED)) goto fail;
     return hd;
 fail:
     vk_destroy_image(&o->im);
@@ -3956,7 +4071,7 @@ static u32 vk_eng_color_snapshot(void* user, u32 surface)
                     o->im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
     /* The copy, made visible to whatever samples it next. */
     vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
-    if (vk_submit_and_wait()) { vk_eng_release(user, hd); return 0; }
+    if (vk_submit_and_wait_cause(VK_WAIT_COLOR_SNAPSHOT)) { vk_eng_release(user, hd); return 0; }
     return hd;
 }
 
@@ -4003,7 +4118,7 @@ static u32 vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
         z->surface = snap;
         if (vk_begin()) return 0;
         vk_barrier_image(t->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
-        if (vk_submit_and_wait()) return 0;
+        if (vk_submit_and_wait_cause(VK_WAIT_DEPTH_SNAPSHOT)) return 0;
     }
 
     /* The bounce buffer stays (device-local when the device has it, grown as
@@ -4044,7 +4159,7 @@ static u32 vk_eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
             vk_barrier_image(t->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
             vk_eb_recorded();
         } else
-            rc = vk_submit_and_wait();
+            rc = vk_submit_and_wait_cause(VK_WAIT_DEPTH_SNAPSHOT);
     }
     return rc ? 0 : snap;
 }
@@ -4077,7 +4192,7 @@ static int vk_eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32
         };
         pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
                               0, 0, NULL, 1, &hb, 0, NULL);
-        rc = vk_submit_and_wait();
+        rc = vk_submit_and_wait_cause(VK_WAIT_READBACK);
         if (!rc) {
             vk_invalidate(st);
             for (u32 row = 0; row < h; row++)
@@ -4940,6 +5055,7 @@ static void vk_eb_release(void)
 {
     if (VK_EB_BUSY()) vk_eng_flush();
     gt_report_final();
+    vk_ops_report_final();
     if (s_stat.submits)
         VK_LOG("submissions: %llu (%llu draws in %llu batches), walker fence waits %llu blocked %.2f ms, "
                "present wait %.2f ms over %u presents\n",
@@ -5000,9 +5116,9 @@ static void vk_eb_device_idled(void)
 }
 
 /* Block until slot `i`'s batch has finished on the GPU; `ft_kind` is what ftrace calls the wait. */
-static int vk_eb_wait_slot(u32 i, u32 ft_kind)
+static int vk_eb_wait_slot(u32 i, u32 ft_kind, u32 cause)
 {
-    const VkResult r = vk_wait_fence(s_vk.batch_fence[i], ft_kind);
+    const VkResult r = vk_wait_fence(s_vk.batch_fence[i], ft_kind, cause);
     if (r != VK_SUCCESS) return vk_fence_wait_failed(r);
     vk_eb_slot* const sl = &s_eb.slot[i];
     if (sl->gt_armed) {
@@ -5025,7 +5141,7 @@ static int vk_eb_acquire(void)
         return -1;
     }
     vk_eb_slot* const sl = &s_eb.slot[s_eb.cur];
-    if (sl->in_flight && vk_eb_wait_slot(s_eb.cur, VK_FT_WAIT_INFLIGHT)) return -1;
+    if (sl->in_flight && vk_eb_wait_slot(s_eb.cur, VK_FT_WAIT_INFLIGHT, VK_WAIT_KICK_SLOT)) return -1;
     if (sl->sets) {
         if (vk_engine_check_result(pvkResetDescriptorPool(s_vk.device, sl->pool, 0),
                                    "vkResetDescriptorPool(draw batch)"))
@@ -5073,7 +5189,7 @@ static int vk_eng_kick(void)
 /* Kick, then wait until the GPU is done with every batch. After a failed wait
  * the GPU may still own accepted work: nothing is reset, and every later
  * engine operation fails until the device is idled. */
-static int vk_eng_flush(void)
+static int vk_eng_flush_cause(u32 cause)
 {
     if (atomic_load_explicit(&s_eng_submission_pending, memory_order_acquire)) {
         vk_engine_latch_fault();
@@ -5082,10 +5198,12 @@ static int vk_eng_flush(void)
     int rc = s_eb_pending ? vk_eng_kick() : 0;
     for (u32 n = 0; n < VK_EB_SLOTS; n++) {
         const u32 i = (s_eb.cur + n) % VK_EB_SLOTS;      /* the oldest batch first */
-        if (s_eb.slot[i].in_flight && vk_eb_wait_slot(i, VK_FT_WAIT_FLUSH)) return -1;
+        if (s_eb.slot[i].in_flight && vk_eb_wait_slot(i, VK_FT_WAIT_FLUSH, cause)) return -1;
     }
     return rc;
 }
+
+static int vk_eng_flush(void) { return vk_eng_flush_cause(VK_WAIT_KICK_SLOT); }
 
 /* A slice of ring `ring_bytes` for the current slot: the offset into the whole
  * buffer, or -1 when the slot's share has no room left. */
@@ -5297,6 +5415,8 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
                                   .renderPass = rp, .framebuffer = fb,
                                   .renderArea = { { 0, 0 }, { w, h } } };
+    VK_OPS_ADD(s_ops.win, passes);
+    VK_OPS_ADD(s_ops.tot, passes);
     pvkCmdBeginRenderPass(s_vk.cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
     pvkCmdBindPipeline(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     VkViewport vp = { 0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f };
@@ -5331,7 +5451,7 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
         pvkCmdDraw(s_vk.cmd, vertex_count, 1, 0, 0);
     }
     pvkCmdEndRenderPass(s_vk.cmd);
-    if (!batched) { vk_submit_and_wait(); return; }
+    if (!batched) { vk_submit_and_wait_cause(VK_WAIT_UNBATCHED); return; }
     s_eb.draws++;
     vk_eb_recorded();
 }
