@@ -16,7 +16,7 @@ of its own (the backend reads the registry once) and looks only at what the back
                                      neither keeps writing one file;
   batching on against off            the presented frames are byte-identical (what the dump is for);
   batches in flight                  with a submission cap of 1 or 2 operations every batch is queued without
-                                     a wait and two are in flight at once, yet render-to-texture, feedback,
+                                     a wait and every slot is in flight at once, yet render-to-texture, feedback,
                                      depth-as-texture, MRT, cube and texture scenes, and many full-frame draws
                                      over several frames, present the frames batching off does: a present,
                                      a one-shot or a slot's reuse never reads or overwrites what an earlier,

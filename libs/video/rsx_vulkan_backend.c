@@ -185,9 +185,11 @@ typedef struct vk_image {
 #define VK_SAMPLER_CACHE 32
 #define VK_PIPELINE_SLOTS (2 * 2 * 8)   /* ztest x zwrite x compare op */
 /* vk.draw_batch: batches in flight at once (see "Draw batching"); each slot's slice of a ring is 1/n of it, so this is a
- * compile-time choice (-DVK_EB_SLOTS=3 builds the three-slot variant). */
+ * compile-time choice (-DVK_EB_SLOTS=2 builds the two-slot variant). Three, because the adaptive kick makes more, smaller
+ * batches and a third slot keeps the walker from coming round to one the GPU still holds (section 7 of recon
+ * out/M4/VK-FENCE-2026-11-21.md: walker wait with min 32 and a GPU-bound frame 5.7 ms at two slots, 0.2 at three). */
 #ifndef VK_EB_SLOTS
-#define VK_EB_SLOTS 2u
+#define VK_EB_SLOTS 3u
 #endif
 _Static_assert(VK_EB_SLOTS >= 2 && VK_EB_SLOTS <= 4, "VK_EB_SLOTS: 2 to 4 batches in flight");
 
