@@ -359,6 +359,8 @@ static const char* const vk_wait_cause_name[VK_WAIT_CAUSE_COUNT] = {
 typedef struct {
     atomic_ullong frames, passes, global_barriers, image_barriers;
     atomic_ullong waits[VK_WAIT_CAUSE_COUNT];
+    atomic_ullong acq_ns, fence_ns, queue_ns;      /* vkAcquireNextImageKHR, window fence, vkQueuePresentKHR */
+    atomic_ullong acq_n, fence_n, queue_n;
 } vk_ops;
 static struct { vk_ops win, tot; } s_ops;
 static u32 s_ops_every;      /* the VK_GPU_TIMING interval, 0 = the counters are off */
@@ -367,6 +369,13 @@ static u32 s_ops_every;      /* the VK_GPU_TIMING interval, 0 = the counters are
 #define VK_OPS_ON() (s_ops_every != 0u)
 #define VK_OPS_ADD(where, field) \
     do { if (VK_OPS_ON()) atomic_fetch_add_explicit(&(where).field, 1, memory_order_relaxed); } while (0)
+/* The window half's timings: ns and count in the window and the run totals. */
+#define VK_OPS_WINDOW(prefix, dt)                                                        \
+    do { if (VK_OPS_ON()) {                                                              \
+        atomic_fetch_add_explicit(&s_ops.win.prefix##_ns, (dt), memory_order_relaxed);    \
+        atomic_fetch_add_explicit(&s_ops.win.prefix##_n, 1, memory_order_relaxed);        \
+        atomic_fetch_add_explicit(&s_ops.tot.prefix##_ns, (dt), memory_order_relaxed);    \
+        atomic_fetch_add_explicit(&s_ops.tot.prefix##_n, 1, memory_order_relaxed); } } while (0)
 
 static unsigned long long vk_ops_take(atomic_ullong* c) { return atomic_exchange_explicit(c, 0, memory_order_relaxed); }
 
@@ -380,8 +389,21 @@ static void vk_count_wait(u32 cause)
 /* ftrace's clock: monotonic on every host, and SDL is not linked on Windows. */
 static unsigned long long vk_now_ns(void) { return ps3_ft_now(); }
 
-/* The `a` of a PS3_FT_GPU_WAIT span, the kinds Metal's backend writes. */
-enum { VK_FT_WAIT_FLUSH = 0, VK_FT_WAIT_PRESENT = 1, VK_FT_WAIT_INFLIGHT = 2 };
+/* One GPU-wait span, filtered like every other: `ft0` is 0 when ftrace is off. */
+static void vk_ft_wait_span(u32 sub, uint64_t ft0)
+{
+    if (!ft0) return;
+    const uint64_t ft1 = ps3_ft_now();
+    if (ft1 - ft0 >= ps3_ft_min_ns()) ps3_ft_span(PS3_FT_GPU_WAIT, 0, sub, 0, ft0, ft1);
+}
+
+/* The `a` of a PS3_FT_GPU_WAIT span. 0-2 are the Metal backend's and Vulkan's
+ * existing sub-ids; 3-5 are the window half's own waits, added beside them so
+ * no existing id moved. */
+enum {
+    VK_FT_WAIT_FLUSH = 0, VK_FT_WAIT_PRESENT = 1, VK_FT_WAIT_INFLIGHT = 2,
+    VK_FT_WAIT_ACQUIRE = 3, VK_FT_WAIT_WINDOW_FENCE = 4, VK_FT_WAIT_QUEUE_PRESENT = 5
+};
 
 /* The walker's blocking fence wait, timed, and for ftrace a GPU wait of kind `ft_kind`.
  * `cause` names the operation in the wait split. */
@@ -1072,6 +1094,9 @@ static void vk_ops_print_window(void)
     const unsigned long long image = vk_ops_take(&w->image_barriers);
     unsigned long long waits[VK_WAIT_CAUSE_COUNT];
     for (u32 c = 0; c < VK_WAIT_CAUSE_COUNT; c++) waits[c] = vk_ops_take(&w->waits[c]);
+    const unsigned long long acq_ns = vk_ops_take(&w->acq_ns), acq_n = vk_ops_take(&w->acq_n);
+    const unsigned long long fence_ns = vk_ops_take(&w->fence_ns), fence_n = vk_ops_take(&w->fence_n);
+    const unsigned long long queue_ns = vk_ops_take(&w->queue_ns), queue_n = vk_ops_take(&w->queue_n);
     VK_LOG("frame ops (window): %llu frames, %.2f passes/frame, %.2f global barriers/frame, "
            "%.2f image barriers/frame\n",
            frames, (double)passes / f, (double)glob / f, (double)image / f);
@@ -1081,6 +1106,11 @@ static void vk_ops_print_window(void)
            (double)waits[VK_WAIT_DEPTH_SNAPSHOT] / f, (double)waits[VK_WAIT_CLEAR] / f,
            (double)waits[VK_WAIT_READBACK] / f, (double)waits[VK_WAIT_UNBATCHED] / f,
            (double)waits[VK_WAIT_KICK_SLOT] / f);
+    VK_LOG("window half (window): acquire %.3f ms over %llu, window fence %.3f ms over %llu, "
+           "queue present %.3f ms over %llu\n",
+           acq_n ? (double)acq_ns / 1e6 / (double)acq_n : 0.0, acq_n,
+           fence_n ? (double)fence_ns / 1e6 / (double)fence_n : 0.0, fence_n,
+           queue_n ? (double)queue_ns / 1e6 / (double)queue_n : 0.0, queue_n);
 }
 
 /* The same over the whole run, without resetting: the frame ops, the wait
@@ -1094,6 +1124,12 @@ static void vk_ops_report_final(void)
     const unsigned long long passes = atomic_load_explicit(&s_ops.tot.passes, memory_order_relaxed);
     const unsigned long long glob = atomic_load_explicit(&s_ops.tot.global_barriers, memory_order_relaxed);
     const unsigned long long image = atomic_load_explicit(&s_ops.tot.image_barriers, memory_order_relaxed);
+    const unsigned long long acq_ns = atomic_load_explicit(&s_ops.tot.acq_ns, memory_order_relaxed);
+    const unsigned long long acq_n = atomic_load_explicit(&s_ops.tot.acq_n, memory_order_relaxed);
+    const unsigned long long fence_ns = atomic_load_explicit(&s_ops.tot.fence_ns, memory_order_relaxed);
+    const unsigned long long fence_n = atomic_load_explicit(&s_ops.tot.fence_n, memory_order_relaxed);
+    const unsigned long long queue_ns = atomic_load_explicit(&s_ops.tot.queue_ns, memory_order_relaxed);
+    const unsigned long long queue_n = atomic_load_explicit(&s_ops.tot.queue_n, memory_order_relaxed);
     VK_LOG("frame ops (total): %llu frames, %.2f passes/frame, %.2f global barriers/frame, "
            "%.2f image barriers/frame\n",
            frames, (double)passes / f, (double)glob / f, (double)image / f);
@@ -1102,6 +1138,11 @@ static void vk_ops_report_final(void)
         fprintf(stderr, " %s %.2f", vk_wait_cause_name[c],
                 (double)atomic_load_explicit(&s_ops.tot.waits[c], memory_order_relaxed) / f);
     fprintf(stderr, " per frame\n");
+    VK_LOG("window half (total): acquire %.3f ms over %llu, window fence %.3f ms over %llu, "
+           "queue present %.3f ms over %llu\n",
+           acq_n ? (double)acq_ns / 1e6 / (double)acq_n : 0.0, acq_n,
+           fence_n ? (double)fence_ns / 1e6 / (double)fence_n : 0.0, fence_n,
+           queue_n ? (double)queue_ns / 1e6 / (double)queue_n : 0.0, queue_n);
 }
 
 /* One presented frame of the engine path. */
@@ -3148,8 +3189,13 @@ static void vk_present_window(void)
     }
 
     u32 idx = 0;
+    const unsigned long long acq0 = vk_now_ns();
+    const uint64_t acq_ft0 = PS3_FT_ON() ? ps3_ft_now() : 0;
     VkResult r = pvkAcquireNextImageKHR(s_vk.device, s_vk.swapchain, UINT64_MAX,
                                         s_vk.sem_acquire, VK_NULL_HANDLE, &idx);
+    vk_ft_wait_span(VK_FT_WAIT_ACQUIRE, acq_ft0);
+    const unsigned long long acq_dt = vk_now_ns() - acq0;
+    VK_OPS_WINDOW(acq, acq_dt);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) { vk_swapchain_lost(); return; }
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
         VK_LOG("vkAcquireNextImageKHR failed (VkResult %d)\n", (int)r); return;
@@ -3209,14 +3255,24 @@ static void vk_present_window(void)
     if (vk_queue_submit(&si, s_vk.window_fence) != VK_SUCCESS) {
         VK_LOG("vkQueueSubmit (window) failed\n"); return;
     }
+    const unsigned long long fence0 = vk_now_ns();
+    const uint64_t fence_ft0 = PS3_FT_ON() ? ps3_ft_now() : 0;
     pvkWaitForFences(s_vk.device, 1, &s_vk.window_fence, VK_TRUE, UINT64_MAX);
+    vk_ft_wait_span(VK_FT_WAIT_WINDOW_FENCE, fence_ft0);
+    const unsigned long long fence_dt = vk_now_ns() - fence0;
+    VK_OPS_WINDOW(fence, fence_dt);
 
     VkPresentInfoKHR pi = {
         .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
         .waitSemaphoreCount = 1, .pWaitSemaphores = &s_vk.sc_done[idx],
         .swapchainCount = 1, .pSwapchains = &s_vk.swapchain, .pImageIndices = &idx,
     };
+    const unsigned long long queue0 = vk_now_ns();
+    const uint64_t queue_ft0 = PS3_FT_ON() ? ps3_ft_now() : 0;
     r = vk_queue_present(&pi);
+    vk_ft_wait_span(VK_FT_WAIT_QUEUE_PRESENT, queue_ft0);
+    const unsigned long long queue_dt = vk_now_ns() - queue0;
+    VK_OPS_WINDOW(queue, queue_dt);
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) vk_swapchain_lost();
     else if (r != VK_SUCCESS) VK_LOG("vkQueuePresentKHR failed (VkResult %d)\n", (int)r);
 }
