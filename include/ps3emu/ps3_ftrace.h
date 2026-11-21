@@ -84,7 +84,8 @@ enum ps3_ft_kind {
                               * draw engine's eng_present, so the FIFO's flip head, the host's pacing call and an
                               * explicit buffer present all count, and a skipped duplicate emits none */
     PS3_FT_GPU_ENCODE  = 11, /* Metal: CPU encode of the recorded draws, a = 1 present / 0 flush, b = records */
-    PS3_FT_GPU_WAIT    = 12, /* Metal: CPU waits for the GPU, a = 1 present / 0 flush / 2 in-flight bound, b = flush reason */
+    PS3_FT_GPU_WAIT    = 12, /* Metal and Vulkan: CPU waits for the GPU, a = 1 present / 0 flush / 2 in-flight bound
+                              * (Vulkan: a batch slot's fence before its reuse), b = flush reason (Metal) */
     PS3_FT_READBACK    = 13, /* Metal: render target read back to the CPU, a = w, b = h */
     PS3_FT_GPU_EXEC    = 14, /* Metal: a command buffer's own GPU time, ending when the CPU saw it
                               * complete; who = render passes, a = depth resolves | colour copies << 16,
