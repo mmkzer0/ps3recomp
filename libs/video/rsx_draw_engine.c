@@ -314,7 +314,7 @@ static int eng_is_pow2(unsigned long long n) { return n && !(n & (n - 1)); }
 
 /* ---- pass sizing (diagnostic) --------------------------------------------
  *
- * PS3RECOMP_ENG_FRAME_STATS=<seconds>: every <seconds> a `frame stats` line
+ * RSX_ENGINE_FRAME_STATS=<seconds>: every <seconds> a `frame stats` line
  * with per-frame averages of what the engine handed the backend. A target
  * group is a run of consecutive executed draws into one unchanged colour
  * target set and zeta -- upstream #814's pass definition, so the count is the
@@ -364,7 +364,7 @@ static int eng_v1_on(void)
 {
     int on = atomic_load_explicit(&s_v1_on, memory_order_acquire);
     if (on < 0) {
-        const char* e = getenv("PS3RECOMP_ENG_FRAME_STATS");
+        const char* e = getenv("RSX_ENGINE_FRAME_STATS");
         const u32 every_s = e ? (u32)strtoul(e, NULL, 10) : 0u;
         on = (e && *e && every_s) ? 1 : 0;
         atomic_store_explicit(&s_v1_every_s, every_s, memory_order_relaxed);

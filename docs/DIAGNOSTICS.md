@@ -12,12 +12,12 @@ not changed while a title runs.
 |---|---|
 | `SPU_*` | 110 |
 | `PS3_*` | 109 |
-| `RSX_*` | 63 |
+| `RSX_*` | 64 |
 | `YDKJ_*` | 53 |
 | `PPU_*` | 37 |
 | `LD_*` | 34 |
 | `GCM_*` | 28 |
-| `PS3RECOMP_*` | 44 |
+| `PS3RECOMP_*` | 43 |
 | `SPURS_*` | 23 |
 | `FP_*` | 14 |
 | `TEX_*` | 14 |
@@ -932,7 +932,7 @@ not changed while a title runs.
   `libs/video/tests/rsx_engine_config_stub.h:36`  _(+2 more sites)_
 - **`PS3RECOMP_ENG_DEPTH_VIA_GUEST`** — PS3RECOMP_ENG_DEPTH_VIA_GUEST=1: read a depth target through guest memory even when the backend can convert it on the GPU. **behavioural, not in the typed registry (#55)**
   `libs/video/rsx_draw_engine.c:3868`
-- **`PS3RECOMP_ENG_FRAME_STATS`** — `N` (seconds): the engine's pass-sizing counters, off when unset or 0. Every `N` seconds one `rsx-frame-stats` line gives per-frame averages: executed draws, target groups (a run of consecutive draws into one unchanged colour-target set and zeta, upstream #814's pass definition) and the breaks between groups by cause (colour set, zeta-only, clear, copy, other), plus fps. Diagnostic only; the counters are inside the gate (docs/CONFIG.md has the typed knobs).
+- **`RSX_ENGINE_FRAME_STATS`** — `N` (seconds): the engine's pass-sizing counters, off when unset or 0. Every `N` seconds one `rsx-frame-stats` line gives per-frame averages: executed draws, target groups (a run of consecutive draws into one unchanged colour-target set and zeta, upstream #814's pass definition) and the breaks between groups by cause (colour set, zeta-only, clear, copy, other), plus fps. Diagnostic only; the counters are inside the gate (docs/CONFIG.md has the typed knobs).
   `libs/video/rsx_draw_engine.c:305`
 - **`PS3RECOMP_ENG_POLY_OFFSET`** — PS3RECOMP_ENG_POLY_OFFSET=0: draw without the guest's polygon offset, the behaviour before it was honoured. **behavioural, not in the typed registry (#55)**
   `libs/video/rsx_draw_engine.c:3154`  _(+2 more sites)_
