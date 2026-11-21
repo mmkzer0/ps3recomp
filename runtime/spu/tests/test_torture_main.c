@@ -41,7 +41,7 @@ void spu_indirect_branch(spu_context* ctx) {
     uint32_t pc = ctx->pc & SPU_LS_MASK;
     for (int i = 0; i < g_nreg; i++) {
         if (g_reg[i].addr == pc) {
-#if defined(__clang__)
+#if SPU_HAVE_MUSTTAIL
             __attribute__((musttail)) return g_reg[i].fn(ctx);
 #else
             g_reg[i].fn(ctx);
