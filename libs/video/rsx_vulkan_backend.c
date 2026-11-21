@@ -118,6 +118,8 @@ static void vk_mutex_unlock(vk_mutex* m)  { pthread_mutex_unlock(m); }
     X(vkCreateCommandPool) X(vkDestroyCommandPool) X(vkAllocateCommandBuffers) \
     X(vkBeginCommandBuffer) X(vkEndCommandBuffer) X(vkResetCommandBuffer) \
     X(vkCreateFence) X(vkDestroyFence) X(vkWaitForFences) X(vkResetFences) X(vkQueueSubmit) \
+    X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) \
+    X(vkGetQueryPoolResults) \
     X(vkCreateRenderPass) X(vkDestroyRenderPass) X(vkCreateFramebuffer) X(vkDestroyFramebuffer) \
     X(vkCreateShaderModule) X(vkDestroyShaderModule) \
     X(vkCreateDescriptorSetLayout) X(vkDestroyDescriptorSetLayout) \
@@ -148,6 +150,8 @@ static PFN_vkGetInstanceProcAddr pvkGetInstanceProcAddr;
 static PFN_vkEnumerateInstanceVersion pvkEnumerateInstanceVersion;
 static PFN_vkGetPhysicalDeviceFeatures2 pvkGetPhysicalDeviceFeatures2;
 static PFN_vkGetPhysicalDeviceProperties2 pvkGetPhysicalDeviceProperties2;
+/* Optional (VK_EXT_calibrated_timestamps), loaded only when the device was created with it. */
+static PFN_vkGetCalibratedTimestampsEXT pvkGetCalibratedTimestampsEXT;
 VK_GLOBAL_FNS(VK_DECLARE)
 VK_INSTANCE_FNS(VK_DECLARE)
 VK_DEVICE_FNS(VK_DECLARE)
@@ -311,13 +315,21 @@ static unsigned long long vk_now_ns(void)
                                 (double)SDL_GetPerformanceFrequency());
 }
 
-/* The walker's blocking fence wait, timed. */
-static VkResult vk_wait_fence(VkFence fence)
+/* The `a` of a PS3_FT_GPU_WAIT span, the kinds Metal's backend writes. */
+enum { VK_FT_WAIT_FLUSH = 0, VK_FT_WAIT_PRESENT = 1, VK_FT_WAIT_INFLIGHT = 2 };
+
+/* The walker's blocking fence wait, timed, and for ftrace a GPU wait of kind `ft_kind`. */
+static VkResult vk_wait_fence(VkFence fence, u32 ft_kind)
 {
     const unsigned long long t0 = vk_now_ns();
+    const uint64_t ft0 = PS3_FT_ON() ? ps3_ft_now() : 0;
     const VkResult r = pvkWaitForFences(s_vk.device, 1, &fence, VK_TRUE, UINT64_MAX);
     s_stat.waits++;
     s_stat.wait_ns += vk_now_ns() - t0;
+    if (ft0) {
+        const uint64_t ft1 = ps3_ft_now();
+        if (ft1 - ft0 >= ps3_ft_min_ns()) ps3_ft_span(PS3_FT_GPU_WAIT, 0, ft_kind, 0, ft0, ft1);
+    }
     return r;
 }
 #if defined(PS3RECOMP_RSX_VULKAN_TEST_SEAMS)
@@ -867,6 +879,272 @@ static void vk_cmd_after_everything(VkCommandBuffer cb)
                           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
 }
 
+/* ---------------------------------------------------------------------------
+ * GPU timestamps (PS3RECOMP_VK_GPU_TIMING=<presents per log line>; a diagnostic, off by default)
+ *
+ * What the GPU did with the walker's submissions, which the host clock cannot see. Each draw batch and each
+ * present writes a timestamp at its start and one at its end into a query pool of its own. Nothing waits for
+ * them: a batch's pair is read when its slot's fence was waited for on the way to reusing the slot (or at a
+ * flush), a present's when the present completes, so a frame's figures arrive a few batches late and the
+ * last ones after the final flush. The pool is reset by the command buffer that writes it, which only
+ * starts after the earlier results were read.
+ *
+ * Per frame (the span between two presents that has at least one batch): busy = the union of its batches'
+ * spans, idle = the gaps inside that union, first start = from the device clock read at the end of the
+ * previous present to the first batch's start (VK_EXT_calibrated_timestamps, device domain: the counter
+ * the queries read; without the extension only the GPU-side figures are reported). The present's own
+ * start-to-end is reported apart. One-shot submissions (resource creation, readbacks) carry no timestamps.
+ * A queue that writes none (timestampValidBits 0) is said so in one line and nothing is measured.
+ * -------------------------------------------------------------------------*/
+typedef struct gt_agg {
+    unsigned long long frames, batches, lat_frames;
+    double busy_ns, idle_ns, idle_max_ns, span_ns, lat_ns;
+} gt_agg;
+
+static struct {
+    int         mode;             /* 0 off, 1 recording, -1 asked for, not available */
+    int         reported;
+    u32         every;            /* presents per log line */
+    int         ext;              /* VK_EXT_calibrated_timestamps was enabled on the device */
+    int         calibrated;       /* ... and answers */
+    u32         bits;
+    u64         mask;
+    double      period_ns;
+    VkQueryPool slot_pool[VK_EB_SLOTS], present_pool;
+    int         present_armed;    /* the present's pair was recorded and submitted (present_mu) */
+    u64         frame;            /* presents so far: the frame a batch belongs to */
+    u64         t0;               /* device clock at the end of the previous present */
+    int         t0_valid;
+    struct { int open; u64 frame, t0, first, end; int t0_valid; unsigned batches; double busy, idle, idle_max; } acc;
+    gt_agg      win, tot;
+    atomic_ullong present_ns, presents, unavailable;   /* the present may finish on a host thread */
+    unsigned long long win_present_ns, win_presents;
+} s_gt;
+
+/* a - b on the queue's counter, in ns: the counter has `bits` valid bits and may wrap. */
+static double gt_dt_ns(u64 a, u64 b)
+{
+    const u64 d = (a - b) & s_gt.mask;
+    const u64 top = (u64)1 << (s_gt.bits - 1u);
+    const int64_t v = (d & top) ? (int64_t)(d | ~s_gt.mask) : (int64_t)d;
+    return (double)v * s_gt.period_ns;
+}
+
+/* Read before device creation: does the run ask for timestamps, and so for the calibration extension? */
+static void gt_request(void)
+{
+    const char* v = getenv("PS3RECOMP_VK_GPU_TIMING");
+    if (!v || !*v) return;
+    char* end = NULL;
+    const unsigned long n = strtoul(v, &end, 10);
+    if (*end || n > 1000000ul) {
+        VK_LOG("PS3RECOMP_VK_GPU_TIMING='%s' is not a count of presents per line: gpu timing stays off\n", v);
+        return;
+    }
+    s_gt.every = (u32)n;
+}
+
+/* After the device and its functions exist: decide whether the queue can measure, and make the pools. */
+static void gt_setup(void)
+{
+    if (!s_gt.every) return;
+    VkPhysicalDeviceProperties p;
+    pvkGetPhysicalDeviceProperties(s_vk.phys, &p);
+    u32 n = 0;
+    pvkGetPhysicalDeviceQueueFamilyProperties(s_vk.phys, &n, NULL);
+    VkQueueFamilyProperties fam[64];
+    s_gt.bits = 0;
+    if (n && n <= 64 && s_vk.queue_family < n) {
+        pvkGetPhysicalDeviceQueueFamilyProperties(s_vk.phys, &n, fam);
+        s_gt.bits = fam[s_vk.queue_family].timestampValidBits;
+    }
+    s_gt.period_ns = (double)p.limits.timestampPeriod;
+    if (!s_gt.bits || s_gt.bits > 64u || !(s_gt.period_ns > 0.0)) {
+        VK_LOG("gpu timing: not available: the graphics queue writes no timestamps (timestampValidBits %u, "
+               "timestampPeriod %g ns, timestampComputeAndGraphics %d)\n",
+               s_gt.bits, s_gt.period_ns, (int)p.limits.timestampComputeAndGraphics);
+        s_gt.mode = -1;
+        return;
+    }
+    s_gt.mask = s_gt.bits == 64u ? ~(u64)0 : (((u64)1 << s_gt.bits) - 1u);
+    VkQueryPoolCreateInfo qci = { .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                                  .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 2 };
+    int ok = 1;
+    for (u32 i = 0; ok && i < VK_EB_SLOTS; i++)
+        ok = pvkCreateQueryPool(s_vk.device, &qci, NULL, &s_gt.slot_pool[i]) == VK_SUCCESS;
+    if (ok) ok = pvkCreateQueryPool(s_vk.device, &qci, NULL, &s_gt.present_pool) == VK_SUCCESS;
+    if (!ok) {
+        VK_LOG("gpu timing: not available: vkCreateQueryPool failed\n");
+        s_gt.mode = -1;
+        return;
+    }
+    if (s_gt.ext) {
+        pvkGetCalibratedTimestampsEXT =
+            (PFN_vkGetCalibratedTimestampsEXT)pvkGetDeviceProcAddr(s_vk.device, "vkGetCalibratedTimestampsEXT");
+        s_gt.calibrated = pvkGetCalibratedTimestampsEXT != NULL;
+    }
+    s_gt.mode = 1;
+    VK_LOG("gpu timing: on, a line every %u presents (timestampValidBits %u, timestampPeriod %g ns, "
+           "timestampComputeAndGraphics %d, first-start latency %s)\n", s_gt.every, s_gt.bits, s_gt.period_ns,
+           (int)p.limits.timestampComputeAndGraphics,
+           s_gt.calibrated ? "from the calibrated device clock" : "not available: no VK_EXT_calibrated_timestamps");
+}
+
+static void gt_shutdown(void)
+{
+    if (s_vk.device) {
+        for (u32 i = 0; i < VK_EB_SLOTS; i++)
+            if (s_gt.slot_pool[i]) pvkDestroyQueryPool(s_vk.device, s_gt.slot_pool[i], NULL);
+        if (s_gt.present_pool) pvkDestroyQueryPool(s_vk.device, s_gt.present_pool, NULL);
+    }
+    memset(&s_gt, 0, sizeof s_gt);
+}
+
+/* Reset the pair and write its first timestamp; the buffer is begun and outside a render pass. */
+static int gt_begin(VkCommandBuffer cb, VkQueryPool pool)
+{
+    if (s_gt.mode <= 0 || !pool) return 0;
+    pvkCmdResetQueryPool(cb, pool, 0, 2);
+    pvkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, pool, 0);
+    return 1;
+}
+
+static void gt_end(VkCommandBuffer cb, VkQueryPool pool)
+{
+    if (s_gt.mode <= 0 || !pool) return;
+    pvkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, pool, 1);
+}
+
+/* Both timestamps of `pool`, or 0 when the GPU has not written them (nothing is made up). */
+static int gt_pair(VkQueryPool pool, u64* start, u64* end)
+{
+    u64 r[4] = { 0, 0, 0, 0 };   /* value, availability, value, availability */
+    const VkResult q = pvkGetQueryPoolResults(s_vk.device, pool, 0, 2, sizeof r, r, 2u * sizeof r[0],
+                                              VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+    if ((q != VK_SUCCESS && q != VK_NOT_READY) || !r[1] || !r[3]) {
+        atomic_fetch_add_explicit(&s_gt.unavailable, 1, memory_order_relaxed);
+        return 0;
+    }
+    *start = r[0] & s_gt.mask;
+    *end = r[2] & s_gt.mask;
+    return 1;
+}
+
+static void gt_acc_close(void)
+{
+    if (!s_gt.acc.open) return;
+    gt_agg* const to[2] = { &s_gt.win, &s_gt.tot };
+    for (int i = 0; i < 2; i++) {
+        gt_agg* const a = to[i];
+        a->frames++;
+        a->batches += s_gt.acc.batches;
+        a->busy_ns += s_gt.acc.busy;
+        a->idle_ns += s_gt.acc.idle;
+        if (s_gt.acc.idle_max > a->idle_max_ns) a->idle_max_ns = s_gt.acc.idle_max;
+        a->span_ns += gt_dt_ns(s_gt.acc.end, s_gt.acc.first);
+        if (s_gt.acc.t0_valid) { a->lat_frames++; a->lat_ns += gt_dt_ns(s_gt.acc.first, s_gt.acc.t0); }
+    }
+    s_gt.acc.open = 0;
+}
+
+/* One batch's result, in submission order (slots are read oldest first). */
+static void gt_batch(u64 frame, int t0_valid, u64 t0, u64 s, u64 e)
+{
+    if (s_gt.acc.open && s_gt.acc.frame != frame) gt_acc_close();
+    if (!s_gt.acc.open) {
+        s_gt.acc.open = 1; s_gt.acc.frame = frame; s_gt.acc.t0 = t0; s_gt.acc.t0_valid = t0_valid;
+        s_gt.acc.first = s; s_gt.acc.end = e; s_gt.acc.batches = 1;
+        s_gt.acc.busy = gt_dt_ns(e, s); s_gt.acc.idle = s_gt.acc.idle_max = 0.0;
+        return;
+    }
+    s_gt.acc.batches++;
+    const double gap = gt_dt_ns(s, s_gt.acc.end);
+    if (gap > 0.0) {                 /* the GPU sat idle between the previous batch's end and this one's start */
+        s_gt.acc.idle += gap;
+        if (gap > s_gt.acc.idle_max) s_gt.acc.idle_max = gap;
+        s_gt.acc.busy += gt_dt_ns(e, s);
+        s_gt.acc.end = e;
+    } else if (gt_dt_ns(e, s_gt.acc.end) > 0.0) {   /* overlapped: only the part past the union counts */
+        s_gt.acc.busy += gt_dt_ns(e, s_gt.acc.end);
+        s_gt.acc.end = e;
+    }
+}
+
+/* The fence of a batch is known signalled: read its pair. */
+static void gt_slot_read(u32 slot, u64 frame, int t0_valid, u64 t0)
+{
+    u64 s, e;
+    if (gt_pair(s_gt.slot_pool[slot], &s, &e)) gt_batch(frame, t0_valid, t0, s, e);
+}
+
+/* present_mu held, the present's fence waited for. */
+static void gt_present_read(void)
+{
+    if (!s_gt.present_armed) return;
+    s_gt.present_armed = 0;
+    u64 s, e;
+    if (!gt_pair(s_gt.present_pool, &s, &e)) return;
+    const double ns = gt_dt_ns(e, s);
+    atomic_fetch_add_explicit(&s_gt.present_ns, ns > 0.0 ? (unsigned long long)ns : 0ull, memory_order_relaxed);
+    atomic_fetch_add_explicit(&s_gt.presents, 1, memory_order_relaxed);
+}
+
+static void gt_print(const char* what, const gt_agg* a, unsigned long long presents, unsigned long long present_ns)
+{
+    const double pm = presents ? (double)present_ns / 1e6 / (double)presents : 0.0;
+    if (!a->frames) {
+        VK_LOG("gpu timing %s: no frame's batches were read back (%llu presents timed, %.3f ms each)\n",
+               what, presents, pm);
+        return;
+    }
+    const double f = (double)a->frames;
+    char lat[96];
+    if (a->lat_frames) snprintf(lat, sizeof lat, "%.3f ms", a->lat_ns / 1e6 / (double)a->lat_frames);
+    else               snprintf(lat, sizeof lat, "n/a (no clock calibration)");
+    VK_LOG("gpu timing %s: %llu frames, %.2f batches/frame, busy %.3f ms, idle gaps %.3f ms (longest %.3f), "
+           "span %.3f ms, first start %s after the previous present, present %.3f ms over %llu\n",
+           what, a->frames, (double)a->batches / f, a->busy_ns / 1e6 / f, a->idle_ns / 1e6 / f,
+           a->idle_max_ns / 1e6, a->span_ns / 1e6 / f, lat, pm, presents);
+}
+
+/* A present of the engine ended (the walker's thread): the next frame begins here. */
+static void gt_frame_end(void)
+{
+    if (s_gt.mode <= 0) return;
+    s_gt.frame++;
+    s_gt.t0_valid = 0;
+    if (s_gt.calibrated) {
+        VkCalibratedTimestampInfoEXT ci = { .sType = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT,
+                                            .timeDomain = VK_TIME_DOMAIN_DEVICE_EXT };
+        u64 ts = 0, dev = 0;
+        if (pvkGetCalibratedTimestampsEXT(s_vk.device, 1, &ci, &ts, &dev) == VK_SUCCESS) {
+            s_gt.t0 = ts & s_gt.mask;
+            s_gt.t0_valid = 1;
+        }
+    }
+    if (s_gt.every && s_gt.frame % s_gt.every == 0) {
+        const unsigned long long pn = atomic_load_explicit(&s_gt.present_ns, memory_order_relaxed);
+        const unsigned long long pc = atomic_load_explicit(&s_gt.presents, memory_order_relaxed);
+        gt_print("(window)", &s_gt.win, pc - s_gt.win_presents, pn - s_gt.win_present_ns);
+        memset(&s_gt.win, 0, sizeof s_gt.win);
+        s_gt.win_presents = pc;
+        s_gt.win_present_ns = pn;
+    }
+}
+
+/* After the final flush read the last batches. */
+static void gt_report_final(void)
+{
+    if (s_gt.mode <= 0 || s_gt.reported) return;
+    s_gt.reported = 1;
+    gt_acc_close();
+    gt_print("(total)", &s_gt.tot, atomic_load_explicit(&s_gt.presents, memory_order_relaxed),
+             atomic_load_explicit(&s_gt.present_ns, memory_order_relaxed));
+    if (atomic_load_explicit(&s_gt.unavailable, memory_order_relaxed))
+        VK_LOG("gpu timing: %llu timestamp pairs were not available when read and are not counted\n",
+               (unsigned long long)atomic_load_explicit(&s_gt.unavailable, memory_order_relaxed));
+}
+
 static int vk_engine_check_result(VkResult r, const char* what)
 {
     if (r == VK_SUCCESS) return 0;
@@ -945,7 +1223,7 @@ static int vk_fence_wait_failed(VkResult waited)
 static int vk_submit_and_wait(void)
 {
     if (vk_submit_cb(s_vk.cmd, s_vk.fence)) return -1;
-    const VkResult waited = vk_wait_fence(s_vk.fence);
+    const VkResult waited = vk_wait_fence(s_vk.fence, VK_FT_WAIT_FLUSH);
     return waited == VK_SUCCESS ? 0 : vk_fence_wait_failed(waited);
 }
 
@@ -2527,8 +2805,14 @@ static void vk_present_complete_locked(void)
 {
     if (!s_vk.present_inflight) return;
     const unsigned long long pw0 = vk_now_ns();
+    const uint64_t ft0 = PS3_FT_ON() ? ps3_ft_now() : 0;
     pvkWaitForFences(s_vk.device, 1, &s_vk.present_fence, VK_TRUE, UINT64_MAX);
     atomic_fetch_add_explicit(&s_stat.present_wait_ns, vk_now_ns() - pw0, memory_order_relaxed);
+    if (ft0) {
+        const uint64_t ft1 = ps3_ft_now();
+        if (ft1 - ft0 >= ps3_ft_min_ns()) ps3_ft_span(PS3_FT_GPU_WAIT, 0, VK_FT_WAIT_PRESENT, 0, ft0, ft1);
+    }
+    gt_present_read();
     __atomic_store_n(&s_vk.present_inflight, 0, __ATOMIC_RELEASE);
 
     vk_invalidate(&s_vk.readback);
@@ -2552,6 +2836,7 @@ static VkCommandBuffer vk_present_record_begin(void)
                                     .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
     if (pvkBeginCommandBuffer(cb, &bi) != VK_SUCCESS) return VK_NULL_HANDLE;
     vk_cmd_after_everything(cb);
+    (void)gt_begin(cb, s_gt.present_pool);
     return cb;
 }
 
@@ -2574,6 +2859,7 @@ static void vk_present_record_end(VkCommandBuffer cb)
     };
     pvkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
                           0, 0, NULL, 1, &host, 0, NULL);
+    gt_end(cb, s_gt.present_pool);
     if (pvkEndCommandBuffer(cb) != VK_SUCCESS) { VK_LOG("vkEndCommandBuffer (present) failed\n"); return; }
     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
                         .commandBufferCount = 1, .pCommandBuffers = &cb };
@@ -2581,6 +2867,7 @@ static void vk_present_record_end(VkCommandBuffer cb)
     if (vk_queue_submit(&si, s_vk.present_fence) != VK_SUCCESS) {
         VK_LOG("vkQueueSubmit (present) failed\n"); return;
     }
+    s_gt.present_armed = s_gt.mode > 0;
     __atomic_store_n(&s_vk.present_inflight, 1, __ATOMIC_RELEASE);
     s_vk.present_order = 1;
     if (!(s_vk.present_split && s_vk.eng_active)) vk_present_complete_locked();
@@ -3054,6 +3341,7 @@ static void vk_eng_present(void* user, u32 surface)
     vk_mutex_unlock(&s_vk.present_mu);
     s_g.last_draws = s_g.draws;
     s_g.draws = 0;
+    gt_frame_end();
 }
 
 /* Pixels a 2D transfer put into guest memory, pushed into the colour target
@@ -4089,6 +4377,9 @@ typedef struct vk_eb_slot {
     VkDescriptorPool pool;
     u32              sets;
     int              in_flight;        /* submitted, its fence not yet seen signalled */
+    int              gt_armed;         /* its timestamps were written: read them when the fence is waited for */
+    int              gt_t0_valid;
+    u64              gt_frame, gt_t0;  /* the frame it belongs to, and the device clock at that frame's start */
 } vk_eb_slot;
 
 static struct {
@@ -4099,6 +4390,7 @@ static struct {
     vk_eb_slot       slot[VK_EB_SLOTS];
     u32              cur;           /* the slot the next batch records into */
     int              cur_ready;     /* ... and it is free of GPU work, its slices and pool reset */
+    int              cur_gt;        /* ... and its command buffer carries timestamps */
     unsigned long long draws, flushes;
 } s_eb = { .on = -1 };
 
@@ -4139,6 +4431,7 @@ static int vk_eb_on(void)
 static void vk_eb_release(void)
 {
     if (VK_EB_BUSY()) vk_eng_flush();
+    gt_report_final();
     if (s_stat.submits)
         VK_LOG("submissions: %llu (%llu draws in %llu batches), walker fence waits %llu blocked %.2f ms, "
                "present wait %.2f ms over %u presents\n",
@@ -4165,12 +4458,17 @@ static void vk_eb_device_idled(void)
     s_eb_inflight = 0;
 }
 
-/* Block until slot `i`'s batch has finished on the GPU. */
-static int vk_eb_wait_slot(u32 i)
+/* Block until slot `i`'s batch has finished on the GPU; `ft_kind` is what ftrace calls the wait. */
+static int vk_eb_wait_slot(u32 i, u32 ft_kind)
 {
-    const VkResult r = vk_wait_fence(s_vk.batch_fence[i]);
+    const VkResult r = vk_wait_fence(s_vk.batch_fence[i], ft_kind);
     if (r != VK_SUCCESS) return vk_fence_wait_failed(r);
-    s_eb.slot[i].in_flight = 0;
+    vk_eb_slot* const sl = &s_eb.slot[i];
+    if (sl->gt_armed) {
+        sl->gt_armed = 0;
+        gt_slot_read(i, sl->gt_frame, sl->gt_t0_valid, sl->gt_t0);
+    }
+    sl->in_flight = 0;
     s_eb_inflight--;
     return 0;
 }
@@ -4186,7 +4484,7 @@ static int vk_eb_acquire(void)
         return -1;
     }
     vk_eb_slot* const sl = &s_eb.slot[s_eb.cur];
-    if (sl->in_flight && vk_eb_wait_slot(s_eb.cur)) return -1;
+    if (sl->in_flight && vk_eb_wait_slot(s_eb.cur, VK_FT_WAIT_INFLIGHT)) return -1;
     if (sl->sets) {
         if (vk_engine_check_result(pvkResetDescriptorPool(s_vk.device, sl->pool, 0),
                                    "vkResetDescriptorPool(draw batch)"))
@@ -4202,7 +4500,9 @@ static int vk_eb_begin(void)
 {
     if (vk_eb_acquire()) return -1;
     s_vk.cmd = s_vk.batch_cmd[s_eb.cur];
-    return vk_cmd_begin(s_vk.cmd);
+    if (vk_cmd_begin(s_vk.cmd)) return -1;
+    s_eb.cur_gt = gt_begin(s_vk.cmd, s_gt.slot_pool[s_eb.cur]);
+    return 0;
 }
 
 /* Submit the open batch without waiting. */
@@ -4217,9 +4517,13 @@ static int vk_eng_kick(void)
     s_eb.cur_ready = 0;             /* the slot is full whether or not the queue takes it */
     if ((++s_eb.flushes & 0x3FFFu) == 0)
         VK_LOG("draw batching: %llu draws in %llu submissions\n", s_eb.draws, s_eb.flushes);
+    if (s_eb.cur_gt) gt_end(s_vk.batch_cmd[s_eb.cur], s_gt.slot_pool[s_eb.cur]);
     if (vk_submit_cb(s_vk.batch_cmd[s_eb.cur], s_vk.batch_fence[s_eb.cur]))
         return -1;                  /* the GPU never owned it: the slot is reset when it is next taken */
-    s_eb.slot[s_eb.cur].in_flight = 1;
+    vk_eb_slot* const sl = &s_eb.slot[s_eb.cur];
+    sl->in_flight = 1;
+    sl->gt_armed = s_eb.cur_gt;
+    sl->gt_frame = s_gt.frame; sl->gt_t0 = s_gt.t0; sl->gt_t0_valid = s_gt.t0_valid;
     s_eb_inflight++;
     s_eb.cur = (s_eb.cur + 1u) % VK_EB_SLOTS;
     return 0;
@@ -4237,7 +4541,7 @@ static int vk_eng_flush(void)
     int rc = s_eb_pending ? vk_eng_kick() : 0;
     for (u32 n = 0; n < VK_EB_SLOTS; n++) {
         const u32 i = (s_eb.cur + n) % VK_EB_SLOTS;      /* the oldest batch first */
-        if (s_eb.slot[i].in_flight && vk_eb_wait_slot(i)) return -1;
+        if (s_eb.slot[i].in_flight && vk_eb_wait_slot(i, VK_FT_WAIT_FLUSH)) return -1;
     }
     return rc;
 }
@@ -4561,6 +4865,7 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     { const char* e = getenv("PS3RECOMP_VK_DUMP_EVERY");
       s_vk.dump_every = (e && atoi(e) > 0) ? (u32)atoi(e) : 1; }
     if (s_vk.dump_path) vk_dump_select_init();
+    gt_request();
 
     if (vk_load_library()) return -1;
     if (vk_window_open(title)) return -1;
@@ -4633,7 +4938,7 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     VkDeviceQueueCreateInfo qci = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
                                     .queueFamilyIndex = s_vk.queue_family,
                                     .queueCount = 1, .pQueuePriorities = &prio };
-    const char* dev_exts[3];
+    const char* dev_exts[4];
     u32 dev_ext_count = 0;
     if (s_vk.windowed) dev_exts[dev_ext_count++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
     if (s_vk.portability_subset) {
@@ -4644,6 +4949,8 @@ static int vk_init_all(u32 width, u32 height, const char* title)
         dev_exts[dev_ext_count++] = VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME;
         VK_LOG("enabling device extension VK_KHR_driver_properties\n");
     }
+    s_gt.ext = s_gt.every && vk_has_device_extension(s_vk.phys, VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) > 0;
+    if (s_gt.ext) dev_exts[dev_ext_count++] = VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME;
     /* DXT (BC1-3) is how PS3 titles ship most textures; Vulkan gates it
      * behind a feature, enabled only when the device reports it. */
     VkPhysicalDeviceFeatures have, want;
@@ -4721,6 +5028,7 @@ static int vk_init_all(u32 width, u32 height, const char* title)
         if (vk_window_fail("the driver has no Vulkan swapchain functions")) return -1;
     }
     pvkGetDeviceQueue(s_vk.device, s_vk.queue_family, 0, &s_vk.queue);
+    gt_setup();
 
     VkCommandPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
                                     .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
@@ -4921,6 +5229,7 @@ void rsx_vulkan_backend_shutdown(void)
     if (s_vk.windowed || s_vk.window) vk_window_drop(NULL);
     if (s_vk.device) {
         vk_device_idle();
+        gt_report_final();
         vk_guest_shutdown();
         for (int i = 0; i < VK_PIPELINE_SLOTS; i++)
             if (s_vk.pipelines[i]) pvkDestroyPipeline(s_vk.device, s_vk.pipelines[i], NULL);
@@ -4947,6 +5256,7 @@ void rsx_vulkan_backend_shutdown(void)
         if (s_vk.present_fence) pvkDestroyFence(s_vk.device, s_vk.present_fence, NULL);
         if (s_vk.window_fence)  pvkDestroyFence(s_vk.device, s_vk.window_fence, NULL);
         if (s_vk.present_pool)  pvkDestroyCommandPool(s_vk.device, s_vk.present_pool, NULL);
+        gt_shutdown();
         pvkDestroyDevice(s_vk.device, NULL);
     }
     if (s_vk.instance && pvkDestroyInstance) pvkDestroyInstance(s_vk.instance, NULL);
