@@ -331,6 +331,26 @@ serve, so the repeat itself does not inflate it. `N = 1` (the default) replays b
 the summary then has no `repeat` field. A version-1 or version-2 trace cannot be repeated (its records are keyed on
 a flip clock, not on the poll ordinal) and is refused with `reason=version`.
 
+**Syncing a replay to the guest's course (sync records).** The ordinal key makes the input stream exact in polls
+and leaves the guest's own course free to move in time: a load that finishes later, a scene that a slower backend
+reaches N polls after the recording did, and the recorded presses meet screens they were not made for (a press
+made for a menu arrives while the menu is still loading). A trace may therefore carry sync records, each naming
+an event of the guest's course and the poll count the recording had made when it happened. The recorder never
+writes them; they are added to a recording afterwards (a title's tooling derives them from the recording's own
+run). The one event the runtime reports today is `pipeline`: the draw engine built a pipeline, `key` the
+engine's 64-bit pipeline key (a content hash of the guest's programs and the state that shapes them, the same on
+every backend), so the event is the first draw that needs it. When the run reports an event the trace names for
+a port, that port's input clock is re-based: its next poll is served the record's `seq` and the clock runs on
+from there, so the guest meets the input that followed the event in the recording at the same distance from the
+event. Until the next pending event is reported the clock does not pass its `seq`: the replay does not hand the
+guest the input the recording made after an event before the guest has got there, it holds the state of that
+ordinal. An event reported out of order re-bases on its own record and counts the pending records before it as
+missed; an event with no pending record is ignored. Because the replay waits for a pending event, a run whose
+guest never reports it stops advancing its input and goes visibly off course rather than getting input for a
+screen it never reached. `sync=<hit>/<records> sync_missed=<n> sync_waited=<polls>` is appended to the summary of
+a trace with sync records (nothing is appended otherwise), and each re-base prints a `pad replay sync` line with
+the shift in polls. Sync records need `pad.replay_repeat` 1.
+
 **Divergence.** The summary (at the end of the trace and again at exit) is
 `polls=.. exact=.. held=.. recorded_changes=.. reached_exactly=.. flip_drift=<min>:<max>|none`; with
 `pad.replay_repeat` above 1 it ends `repeat=<N>`. It counts the polls whose served ordinal has a record of its own
@@ -350,6 +370,7 @@ anything else is refused.
 {"format":"ps3recomp-pad-trace","version":3,"clock":"guest-polls","ports":7}   header, line 1
 {"seq":340,"port":0,"len":8,"words":[0,116,0,64,128,128,128,128],"flip":12}    what poll 340 of port 0 was handed
 {"info":7,"conn":[1,0,0,0,0,0,0]}                              ports the 8th info call reported connected
+{"sync":"pipeline","key":13255790337474019531,"port":0,"seq":512}   optional: pipeline `key` built at poll 512
 {"end":true,"seq":[1024,0,0,0,0,0,0]}                         last line: each port's poll count
 ```
 
@@ -362,7 +383,9 @@ without `clock` or with another clock, a version other than 3, a malformed, trun
 unknown or repeated key, a state record without `seq` or without `flip` (or with `seq` as an array), a connection
 record without `info`, an end record without the per-port count array or with the wrong number of counts, a state
 record at or past its port's end count (a replay could never serve it), keys that go backwards, a port the header
-does not declare or a line after the end record is the `pad-trace` stop (`role`, `path`, `line`, `reason`;
+does not declare, a sync record that names an unknown event kind (`reason=sync-kind`), whose `seq` does not move
+forward among its port's sync records or is at or past the port's end count, or that comes with
+`pad.replay_repeat` above 1 (`reason=repeat`), or a line after the end record is the `pad-trace` stop (`role`, `path`, `line`, `reason`;
 `docs/STOPS.md`), raised when `cellPadInit` opens the file and not later. Version-1 and version-2 files are refused
 with `reason=version` and a detail saying so: their keys came from a flip clock that cannot be re-derived, so the
 run has to be recorded again; the detail names `pad.replay_repeat` when it asked for more than 1, because such a

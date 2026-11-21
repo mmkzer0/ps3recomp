@@ -19,5 +19,8 @@ void pad_trace_flush(PadTrace* t) { (void)t; }
 void pad_trace_poll(PadTrace* t, uint32_t port, PadTraceState* st, const PadTraceState* neutral)
 { (void)t; (void)port; (void)st; (void)neutral; abort(); }
 void pad_trace_conn(PadTrace* t, uint8_t on[PAD_TRACE_MAX_PORTS]) { (void)t; (void)on; abort(); }
+uint64_t pad_trace_sync_count(const PadTrace* t) { (void)t; abort(); }
+void pad_trace_sync_event(PadTrace* t, uint32_t kind, uint64_t key, uint32_t frame)
+{ (void)t; (void)kind; (void)key; (void)frame; abort(); }
 
 #endif

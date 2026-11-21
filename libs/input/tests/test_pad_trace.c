@@ -8,6 +8,7 @@
  * PS3STOP line), so ctest matches that line and each case names its own file.
  */
 #include "../pad_trace.h"
+#include "ps3emu/replay_sync.h"
 
 #include <pthread.h>
 #include <stdarg.h>
@@ -714,6 +715,15 @@ static const Bad k_bad[] = {
     { "port-range",      "{\"format\":\"ps3recomp-pad-trace\",\"version\":3,\"clock\":\"guest-polls\",\"ports\":2}\n"
                          "{\"seq\":0,\"port\":2,\"len\":8,\"words\":[],\"flip\":1}\n", 2, "port-range" },
     { "after-end",       HEADER "{\"end\":true,\"seq\":[1,0,0,0,0,0,0]}\n{\"info\":1,\"conn\":[1,0,0,0,0,0,0]}\n", 3, "after-end" },
+    { "sync-kind",       HEADER "{\"sync\":\"mystery\",\"key\":1,\"port\":0,\"seq\":3}\n", 2, "sync-kind" },
+    { "sync-no-key",     HEADER "{\"sync\":\"pipeline\",\"port\":0,\"seq\":3}\n", 2, "record-kind" },
+    { "sync-seq-array",  HEADER "{\"sync\":\"pipeline\",\"key\":1,\"port\":0,\"seq\":[3]}\n", 2, "value" },
+    { "sync-backwards",  HEADER "{\"sync\":\"pipeline\",\"key\":1,\"port\":0,\"seq\":5}\n"
+                                "{\"sync\":\"pipeline\",\"key\":2,\"port\":0,\"seq\":5}\n", 3, "keys-backwards" },
+    { "sync-unreachable", HEADER "{\"sync\":\"pipeline\",\"key\":1,\"port\":0,\"seq\":2}\n"
+                                 "{\"end\":true,\"seq\":[2,0,0,0,0,0,0]}\n", 2, "value" },
+    { "sync-port-range", "{\"format\":\"ps3recomp-pad-trace\",\"version\":3,\"clock\":\"guest-polls\",\"ports\":2}\n"
+                         "{\"sync\":\"pipeline\",\"key\":1,\"port\":2,\"seq\":3}\n", 2, "port-range" },
 };
 
 static void case_errors(void)
@@ -753,6 +763,121 @@ static void case_errors(void)
               "a NUL byte is a syntax error on its own line, not an over-long line: got line %u %s (%s)",
               e.line, e.reason, e.detail);
     }
+}
+
+/* ---- sync records ------------------------------------------------------------------------------------ */
+
+/* The press at recorded 10..13 and the press at 30..33 are what the guest must meet at the right distance from
+ * its own events: event 100 happened when the recording had made 20 polls, event 200 at 32. */
+static const char k_sync_trace_text[] =
+    HEADER
+    "{\"seq\":0,\"port\":0,\"len\":8,\"words\":[0,116,0,0,128,128,128,128],\"flip\":1}\n"
+    "{\"seq\":10,\"port\":0,\"len\":8,\"words\":[0,116,0,64,128,128,128,128],\"flip\":10}\n"
+    "{\"seq\":14,\"port\":0,\"len\":8,\"words\":[0,116,0,0,128,128,128,128],\"flip\":14}\n"
+    "{\"sync\":\"pipeline\",\"key\":100,\"port\":0,\"seq\":20}\n"
+    "{\"seq\":30,\"port\":0,\"len\":8,\"words\":[0,116,0,32,128,128,128,128],\"flip\":30}\n"
+    "{\"sync\":\"pipeline\",\"key\":200,\"port\":0,\"seq\":32}\n"
+    "{\"seq\":34,\"port\":0,\"len\":8,\"words\":[0,116,0,0,128,128,128,128],\"flip\":34}\n"
+    "{\"end\":true,\"seq\":[60,0,0,0,0,0,0]}\n";
+
+static unsigned btn(const PadTraceState* s) { return s->words[3]; }
+
+/* What the recording handed at recorded ordinal `ord`. */
+static unsigned want_btn(uint64_t ord) { return (ord >= 10 && ord <= 13) ? 64u : (ord >= 30 && ord <= 33) ? 32u : 0u; }
+
+static void case_sync(void)
+{
+    const char* path = scratch("sync.trace");
+    const PadTraceState live = mk(8, 0, 0, 128);
+    PadTraceState st;
+    PadTraceStats ps;
+    PadTraceError e;
+    PadTrace* t;
+    write_text(path, k_sync_trace_text);
+
+    /* A guest that is late: it has not reached event 100 when the recording had. The clock follows the poll
+     * ordinals up to the event's ordinal, holds there, and is re-based on the event when the run reports it. */
+    t = open_trace(NULL, path);
+    CHECK(pad_trace_sync_count(t) == 2, "the trace carries two sync records");
+    for (uint64_t p = 0; p < 25; p++) {
+        st = poll(t, 0, &live);
+        CHECK(btn(&st) == want_btn(p < 20 ? p : 20), "poll %llu before the event: button %u", (unsigned long long)p, btn(&st));
+    }
+    pad_trace_stats(t, &ps);
+    CHECK(ps.sync_waited == 4 && ps.exact == 3 && ps.sync_hits == 0,
+          "four polls waited at ordinal 20 and none counted as landing on a record: waited %llu exact %llu hits %llu",
+          (unsigned long long)ps.sync_waited, (unsigned long long)ps.exact, (unsigned long long)ps.sync_hits);
+    pad_trace_sync_event(t, PS3_REPLAY_SYNC_PIPELINE, 999, 0u);                /* not in the trace */
+    pad_trace_sync_event(t, PS3_REPLAY_SYNC_PIPELINE + 1u, 100, 0u);           /* another kind */
+    pad_trace_stats(t, &ps);
+    CHECK(ps.sync_hits == 0, "an event the trace does not name changes nothing");
+    pad_trace_sync_event(t, PS3_REPLAY_SYNC_PIPELINE, 100, 0u);                /* the next poll is ordinal 25 */
+    for (uint64_t p = 25; p < 40; p++) {
+        const uint64_t ord = p - 5 < 32 ? p - 5 : 32;                          /* shift 5, held at event 200's 32 */
+        st = poll(t, 0, &live);
+        CHECK(btn(&st) == want_btn(ord), "poll %llu after event 100: recorded %llu, button %u", (unsigned long long)p,
+              (unsigned long long)ord, btn(&st));
+    }
+    pad_trace_sync_event(t, PS3_REPLAY_SYNC_PIPELINE, 200, 0u);                /* the next poll is ordinal 40 */
+    for (uint64_t p = 40; p < 68; p++) {
+        st = poll(t, 0, &live);
+        CHECK(btn(&st) == want_btn(p - 8), "poll %llu after event 200: recorded %llu, button %u", (unsigned long long)p,
+              (unsigned long long)(p - 8), btn(&st));
+    }
+    st = poll(t, 0, &live);
+    CHECK(same(&st, &k_neutral_marker), "the re-based clock reaches the end count at poll 68 and then serves the neutral pad");
+    pad_trace_stats(t, &ps);
+    CHECK(ps.sync_hits == 2 && ps.sync_missed == 0 && ps.sync_waited == 6 && ps.sync_records == 2,
+          "both events hit, none missed, six polls waited: hits %llu missed %llu waited %llu", (unsigned long long)ps.sync_hits,
+          (unsigned long long)ps.sync_missed, (unsigned long long)ps.sync_waited);
+    {
+        char* out = capture_close(t);
+        CHECK(strstr(out, " sync=2/2 sync_missed=0 sync_waited=6\n") != NULL, "the summary names the sync counts: %s", out);
+        free(out);
+    }
+    pad_trace_destroy(t);
+
+    /* A guest that is early, and events that come out of order: event 200 first re-bases the clock forward and
+     * passes event 100 (missed); event 100 reported afterwards has no pending record and is ignored. */
+    t = open_trace(NULL, path);
+    for (uint64_t p = 0; p < 12; p++) {
+        st = poll(t, 0, &live);
+        CHECK(btn(&st) == want_btn(p), "early run, poll %llu: button %u", (unsigned long long)p, btn(&st));
+    }
+    pad_trace_sync_event(t, PS3_REPLAY_SYNC_PIPELINE, 200, 0u);                /* next poll 12 is served recorded 32 */
+    for (uint64_t p = 12; p < 16; p++) {
+        st = poll(t, 0, &live);
+        CHECK(btn(&st) == want_btn(p + 20), "early run, poll %llu: recorded %llu, button %u", (unsigned long long)p,
+              (unsigned long long)(p + 20), btn(&st));
+    }
+    pad_trace_sync_event(t, PS3_REPLAY_SYNC_PIPELINE, 100, 0u);
+    pad_trace_stats(t, &ps);
+    CHECK(ps.sync_hits == 1 && ps.sync_missed == 1 && ps.sync_waited == 0,
+          "one hit, event 100 passed over, no wait: hits %llu missed %llu waited %llu", (unsigned long long)ps.sync_hits,
+          (unsigned long long)ps.sync_missed, (unsigned long long)ps.sync_waited);
+    pad_trace_destroy(t);
+
+    /* An event reported late for an earlier frame: the guest made its 24th flip request after 24 polls, the draw
+     * engine reports at poll 30. The event is where the guest was (24), not where the report arrives (30), so the
+     * input after the event is not delayed by the engine's lag: shift 24 - 20 = 4. */
+    t = open_trace(NULL, path);
+    for (uint64_t p = 0; p < 30; p++) {
+        g_flip = (uint32_t)p;                                                  /* flip request f is made after f polls */
+        st = poll(t, 0, &live);
+    }
+    pad_trace_sync_event(t, PS3_REPLAY_SYNC_PIPELINE, 100, 24u);
+    for (uint64_t p = 30; p < 38; p++) {
+        g_flip = (uint32_t)p;
+        st = poll(t, 0, &live);
+        CHECK(btn(&st) == want_btn(p - 4 < 32 ? p - 4 : 32), "late report, poll %llu: button %u", (unsigned long long)p, btn(&st));
+    }
+    pad_trace_destroy(t);
+    g_flip = 0;
+
+    /* The re-based ordinal and pad.replay_repeat do not compose: the trace is refused. */
+    memset(&e, 0, sizeof e);
+    CHECK(open_trace_repeat(path, 2u, &e) == NULL && !strcmp(e.reason, "repeat") && e.line == 5,
+          "sync records with pad.replay_repeat 2 are refused on the first record: line %u %s (%s)", e.line, e.reason, e.detail);
 }
 
 static void case_record_refusals(void)
@@ -823,6 +948,7 @@ int main(int argc, char** argv)
     else if (!strcmp(argv[1], "threads"))         case_threads();
     else if (!strcmp(argv[1], "errors"))          case_errors();
     else if (!strcmp(argv[1], "record-refusals")) case_record_refusals();
+    else if (!strcmp(argv[1], "sync"))            case_sync();
     else { fprintf(stderr, "unknown case %s\n", argv[1]); return 2; }
     if (!g_fail) printf("PASS test_pad_trace %s\n", argv[1]);
     return g_fail ? 1 : 0;

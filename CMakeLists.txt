@@ -2354,7 +2354,7 @@ if(PS3RECOMP_BUILD_TESTS)
         target_compile_definitions(test_pad_trace PRIVATE _GNU_SOURCE)
         target_link_libraries(test_pad_trace PRIVATE Threads::Threads)
         set_target_properties(test_pad_trace PROPERTIES LINKER_LANGUAGE CXX)
-        foreach(c roundtrip catchup ends lookup repeat changes record-replay errors record-refusals)
+        foreach(c roundtrip catchup ends lookup repeat changes record-replay errors record-refusals sync)
             add_test(NAME pad_trace_${c} COMMAND test_pad_trace ${c})
             set_tests_properties(pad_trace_${c} PROPERTIES LABELS "input;t0" TIMEOUT 60)
         endforeach()
@@ -2371,7 +2371,9 @@ if(PS3RECOMP_BUILD_TESTS)
                 "state-no-seq|2|value" "state-no-flip|2|value" "conn-no-info|2|value"
                 "end-scalar|2|value" "end-length|2|value" "state-seq-array|2|value" "unreachable|2|value"
                 "seq-backwards|3|keys-backwards" "info-backwards|3|keys-backwards"
-                "port-range|2|port-range" "after-end|3|after-end")
+                "port-range|2|port-range" "after-end|3|after-end"
+                "sync-kind|2|sync-kind" "sync-no-key|2|record-kind" "sync-seq-array|2|value"
+                "sync-backwards|3|keys-backwards" "sync-unreachable|2|value" "sync-port-range|2|port-range")
             string(REPLACE "|" ";" parts "${row}")
             list(GET parts 0 case_name)
             list(GET parts 1 case_line)

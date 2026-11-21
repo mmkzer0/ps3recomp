@@ -56,6 +56,20 @@
  * path unchanged; only a version-3 trace can be repeated, because version-1 and
  * version-2 records were keyed on a flip clock.
  *
+ * Sync records (optional, replay only; the recorder never writes them). The ordinal key makes the input stream
+ * exact in polls and leaves the guest's own course free to move in time: a load that finishes later, or a step
+ * loop that catches up wall time, puts the guest's scene change N polls after the recording's, and a recorded
+ * press then meets a screen it was not made for. A sync record
+ *     {"sync":"pipeline","key":K,"port":P,"seq":S}
+ * says: the guest event named by (kind, key) happened when port P had made S polls in the recording. When the
+ * run reports that event (pad_trace_sync_event, from the code that sees it: include/ps3emu/replay_sync.h), the
+ * port's input clock is re-based so the next poll is served recorded ordinal S, and the clock continues from
+ * there; the guest then meets the input that followed the event in the recording at the same distance from it.
+ * Until the next pending event is reported the clock does not pass that event's S: input the recording made
+ * after the event is not served before the guest has reached it (the replay waits for the guest). An event the
+ * run reports out of order re-bases on its record and counts the pending records before it as missed; an event
+ * with no pending record is ignored. Records of a port are in strictly increasing seq order. They need k = 1.
+ *
  * The module is self-contained: it depends on stop.h and the C library. The
  * flip clock comes in through PadTraceOptions, and cellPad.c does the config
  * reading and the hooks. The flip count is annotation only: it is read for the
@@ -121,7 +135,8 @@ typedef struct PadTraceOptions {
 
 /* Why a trace could not be opened or read. `reason` is a stable id: header,
  * version, syntax, unknown-key, duplicate-key, value, record-kind,
- * keys-backwards, port-range, after-end, truncated, exists, io, repeat.
+ * keys-backwards, port-range, after-end, truncated, exists, io, repeat,
+ * sync-kind (a sync record names an event kind this runtime does not know).
  * `line` is the 1-based line of the replay file, 0 when no line applies. */
 typedef struct PadTraceError {
     PadTraceRole role;
@@ -166,6 +181,18 @@ void pad_trace_poll(PadTrace* t, uint32_t port, PadTraceState* st, const PadTrac
  * record at or before this call's ordinal (the default when there is none). */
 void pad_trace_conn(PadTrace* t, uint8_t on[PAD_TRACE_MAX_PORTS]);
 
+/* Number of sync records the replay file carries (0 when recording, or when the trace has none). */
+uint64_t pad_trace_sync_count(const PadTrace* t);
+
+/* The run reports one guest event (include/ps3emu/replay_sync.h) that belongs to the frame ending with the guest's
+ * `frame`-th flip request (1-based; 0 when the reporter does not know). Replaying: for every port that has a
+ * pending sync record for (kind, key), the event is placed where the guest was when it made that flip request,
+ * not when this call arrives (the draw engine reports a frame after the guest made it, by as much as the engine
+ * lags the guest, and a slow backend lags far more than the recording's); the port's input clock is re-based so a
+ * poll made at that moment is served the record's ordinal (see the header comment). A no-op when the trace has no
+ * pending record for the event. Any thread. */
+void pad_trace_sync_event(PadTrace* t, uint32_t kind, uint64_t key, uint32_t frame);
+
 /* Push the written records to the file. */
 void pad_trace_flush(PadTrace* t);
 
@@ -197,6 +224,10 @@ typedef struct PadTraceStats {
     int      have_end;         /* the file has an end record */
     uint64_t end_seq[PAD_TRACE_MAX_PORTS];   /* each port's poll count */
     int      ended;            /* a poll has gone past its port's count */
+    uint64_t sync_records;     /* sync records in the file (not part of `records`) */
+    uint64_t sync_hits;        /* of those, the ones the run's own event re-based the clock on */
+    uint64_t sync_missed;      /* pending records passed over by a later event of the same port */
+    uint64_t sync_waited;      /* polls served while the clock was held at a pending event's ordinal */
 } PadTraceStats;
 
 void pad_trace_stats(PadTrace* t, PadTraceStats* out);

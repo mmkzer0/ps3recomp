@@ -30,6 +30,7 @@
 #include "ps3emu/ps3_log.h"   /* PS3_LOG: tagged lines, stderr bytes unchanged */
 #include "ps3emu/stop.h"
 #include "ps3emu/config.h"
+#include "ps3emu/replay_sync.h"
 #include "rsx_capture.h"
 
 /* Guest memory and the RSX offset resolvers, declared the way every backend
@@ -2770,6 +2771,9 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                 (unsigned long long)key, fixed ? "built-in" : "guest",
                 vi, fi, nconst, (unsigned long long)fp_hash,
                 handle ? "ok" : "FAILED (draw dropped)"); }
+    /* A replay sync (include/ps3emu/replay_sync.h): the guest's own course reached the first draw that needs
+     * this pipeline, a point a pad replay re-bases its input clock on. A cache hit never gets here. */
+    ps3_replay_sync_event(PS3_REPLAY_SYNC_PIPELINE, (uint64_t)key);
     /* The log above stops at 32 lines; the failure count does not. It is per
      * fragment program, so a run can say which program never compiles. */
     if (!handle) eng_pipeline_failed(fp_hash);

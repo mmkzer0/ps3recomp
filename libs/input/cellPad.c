@@ -26,6 +26,7 @@
 #include "ps3emu/config.h"
 #include "pad_trace.h"
 #include "ps3emu/ps3_ftrace.h"
+#include "ps3emu/replay_sync.h"
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
 #endif
@@ -181,6 +182,17 @@ extern u32 cellGcm_guest_flip_count(void);
 
 static PadTrace* pad_trace_get(void) { return __atomic_load_n(&s_trace, __ATOMIC_ACQUIRE); }
 
+/* A replay trace with sync records waits for the guest events they name (pad_trace.h); the code that sees an
+ * event reports it through the sink below. Installed only when the trace has records, so every other run keeps
+ * the reporting side at one atomic load. */
+static void pad_sync_sink(uint32_t kind, uint64_t key)
+{
+    PadTrace* tr = pad_trace_get();
+    /* The draw engine reports from the FIFO walker while it works on the frame whose flip marker it has not yet
+     * drained: the guest request that ends that frame is the one after the walker's count. */
+    if (tr) pad_trace_sync_event(tr, kind, key, cellGcm_flip_request_count() + 1u);
+}
+
 static void pad_trace_attach(void)
 {
     PadTraceOptions o;
@@ -188,7 +200,9 @@ static void pad_trace_attach(void)
     o.replay_path = ps3_cfg_pad_replay();
     o.flip = cellGcm_guest_flip_count;
     o.replay_repeat = ps3_cfg_pad_replay_repeat();
-    __atomic_store_n(&s_trace, pad_trace_global(&o), __ATOMIC_RELEASE);
+    PadTrace* tr = pad_trace_global(&o);
+    __atomic_store_n(&s_trace, tr, __ATOMIC_RELEASE);
+    if (tr && pad_trace_sync_count(tr)) ps3_replay_sync_set_sink(pad_sync_sink);
 }
 
 /* What a connected pad that nothing touches reports, byte for byte as the live

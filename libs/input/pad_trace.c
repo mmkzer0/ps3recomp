@@ -8,6 +8,8 @@
  *   {"seq":S,"port":N,"len":L,"words":[...],"flip":F}      pad state
  *   {"info":I,"conn":[c0,...,c6]}                            connection
  *   {"end":true,"seq":S}                                     last line
+ *   {"sync":"pipeline","key":K,"port":N,"seq":S}             optional, replay only: a guest event and the poll
+ *                                                            count the recording had made when it happened
  *
  * A state record gives what poll S of port N was handed: `len` and `words`
  * exactly as the guest read them, `len` = 0 for a poll the host had no new
@@ -70,6 +72,7 @@ typedef pthread_mutex_t trace_lock;
 #include "ps3emu/host_exit.h"
 #include "ps3emu/stop.h"
 #include "ps3emu/pc_counters.h"
+#include "ps3emu/replay_sync.h"
 
 /* ---------------------------------------------------------------------------
  * Types
@@ -91,6 +94,9 @@ typedef struct {
 } Rec;
 
 typedef struct { uint64_t info; uint8_t on[PAD_TRACE_MAX_PORTS]; } ConnRec;
+
+/* A sync record: the guest event (kind, key) happened when the port had made `seq` polls in the recording. */
+typedef struct { uint64_t seq; uint64_t key; uint32_t kind; uint32_t line; } SyncRec;
 
 struct PadTrace {
     trace_lock      lock;
@@ -131,6 +137,19 @@ struct PadTrace {
     int             have_end;
     int             end_logged;
     int             summary_logged;
+    /* sync records (pad_trace.h): per port the pending-event list in seq order, the index of the first record
+     * the run has not reported yet, and the shift that maps the port's poll ordinal to the recorded ordinal
+     * (recorded = ordinal - shift) */
+    SyncRec*        syncs[PAD_TRACE_MAX_PORTS];
+    size_t          nsyncs[PAD_TRACE_MAX_PORTS];
+    size_t          capsyncs[PAD_TRACE_MAX_PORTS];
+    size_t          sync_next[PAD_TRACE_MAX_PORTS];
+    int64_t         sync_shift[PAD_TRACE_MAX_PORTS];
+    /* flip_poll[port][f - 1]: the polls the port had made when the guest made its f-th flip request. Kept only for
+     * a trace with sync records: it turns "the frame the draw engine was working on" into a guest poll count. */
+    uint64_t*       flip_poll[PAD_TRACE_MAX_PORTS];
+    size_t          nflip[PAD_TRACE_MAX_PORTS];
+    size_t          capflip[PAD_TRACE_MAX_PORTS];
     PadTraceStats   stats;
 };
 
@@ -197,19 +216,22 @@ enum {
     K_FORMAT = 1u << 0, K_VERSION = 1u << 1, K_CLOCK = 1u << 2, K_PORTS = 1u << 3,
     K_SEQ    = 1u << 4, K_PORT    = 1u << 5, K_LEN   = 1u << 6, K_WORDS = 1u << 7,
     K_FLIP   = 1u << 8, K_INFO    = 1u << 9, K_CONN  = 1u << 10, K_END  = 1u << 11,
+    K_SYNC   = 1u << 12, K_KEY    = 1u << 13,
 };
 
 #define MASK_HEADER (K_FORMAT | K_VERSION | K_CLOCK | K_PORTS)
 #define MASK_STATE  (K_SEQ | K_PORT | K_LEN | K_WORDS | K_FLIP)
 #define MASK_CONN   (K_INFO | K_CONN)
 #define MASK_END    (K_END | K_SEQ)
+#define MASK_SYNC   (K_SYNC | K_KEY | K_PORT | K_SEQ)
 
 typedef struct {
     unsigned seen;
     char     format[32];
     char     clock[32];
+    char     sync[24];
     uint32_t version, ports, port, len, flip;
-    uint64_t seq, info;
+    uint64_t seq, info, key;
     /* `seq` is a scalar in a state record and the per-port poll-count array in
      * the end record; the two are told apart by the shape the file uses. */
     uint64_t seqv[PAD_TRACE_MAX_PORTS];
@@ -351,13 +373,16 @@ static int parse_line(const char* s, Line* L, PadTraceError* e)
         else if (!strcmp(key, "words"))   { bit = K_WORDS;   type = T_WORDS; }
         else if (!strcmp(key, "conn"))    { bit = K_CONN;    type = T_CONN; }
         else if (!strcmp(key, "end"))     { bit = K_END;     type = T_TRUE; }
+        else if (!strcmp(key, "sync"))    { bit = K_SYNC;    type = T_STR; }
+        else if (!strcmp(key, "key"))     { bit = K_KEY;     type = T_U64; dst64 = &L->key; }
         else PFAIL(c, "unknown-key", "key \"%s\" is not part of the format", key);
         if (L->seen & bit) PFAIL(c, "duplicate-key", "key \"%s\" appears twice", key);
         skip_ws(c);
         switch (type) {
         case T_STR:
-            if (parse_string(c, bit == K_CLOCK ? L->clock : L->format,
-                             bit == K_CLOCK ? sizeof L->clock : sizeof L->format))
+            if (bit == K_CLOCK ? parse_string(c, L->clock, sizeof L->clock)
+                : bit == K_SYNC ? parse_string(c, L->sync, sizeof L->sync)
+                                : parse_string(c, L->format, sizeof L->format))
                 return -1;
             break;
         case T_U32:
@@ -419,6 +444,8 @@ static int replay_load(PadTrace* t, const char* path, PadTraceError* e)
     uint32_t n = 0;
     uint64_t last_seq[PAD_TRACE_MAX_PORTS] = {0};
     uint8_t have_seq[PAD_TRACE_MAX_PORTS] = {0};
+    uint64_t last_sync[PAD_TRACE_MAX_PORTS] = {0};
+    uint8_t have_sync[PAD_TRACE_MAX_PORTS] = {0};
     uint64_t last_info = 0;
     int have_info = 0;
     int ended = 0;
@@ -515,6 +542,28 @@ static int replay_load(PadTrace* t, const char* path, PadTraceError* e)
             ended = 1;
             for (uint32_t p = 0; p < t->ports; p++) t->end_seq[p] = L.seqv[p];
             t->have_end = 1;
+        } else if (L.seen == MASK_SYNC) {
+            SyncRec* s;
+            uint32_t kind = PS3_REPLAY_SYNC_NONE;
+            if (L.seq_array) RFAIL(n, "value", "a sync record's \"seq\" is one poll ordinal, not an array");
+            if (L.port >= t->ports) RFAIL(n, "port-range", "port %u, but the header declares %u ports", L.port, t->ports);
+            if (!strcmp(L.sync, PS3_REPLAY_SYNC_NAME_PIPELINE)) kind = PS3_REPLAY_SYNC_PIPELINE;
+            if (kind == PS3_REPLAY_SYNC_NONE)
+                RFAIL(n, "sync-kind", "sync event \"%s\" is not one this runtime reports (known: \"%s\")", L.sync,
+                      PS3_REPLAY_SYNC_NAME_PIPELINE);
+            /* A sync re-bases the input clock, and k > 1 serves an ordinal several polls: the two do not compose */
+            if (t->repeat > 1u)
+                RFAIL(n, "repeat", "sync records re-base the poll ordinal and cannot be combined with pad.replay_repeat %u",
+                      t->repeat);
+            if (have_sync[L.port] && L.seq <= last_sync[L.port])
+                RFAIL(n, "keys-backwards", "port %u: sync seq %llu does not follow sync seq %llu", L.port,
+                      (unsigned long long)L.seq, (unsigned long long)last_sync[L.port]);
+            t->syncs[L.port] = (SyncRec*)grow(t->syncs[L.port], &t->capsyncs[L.port], t->nsyncs[L.port] + 1, sizeof(SyncRec));
+            if (!t->syncs[L.port]) RFAIL(n, "io", "out of memory");
+            s = &t->syncs[L.port][t->nsyncs[L.port]++];
+            s->seq = L.seq; s->key = L.key; s->kind = kind; s->line = n;
+            last_sync[L.port] = L.seq; have_sync[L.port] = 1;
+            t->stats.sync_records++;
         } else if ((L.seen | K_SEQ) == MASK_STATE) {
             RFAIL(n, "value", "a state record without \"seq\": version 3 keys on the port's poll ordinal");
         } else if ((L.seen | K_FLIP) == MASK_STATE) {
@@ -536,6 +585,12 @@ static int replay_load(PadTrace* t, const char* path, PadTraceError* e)
                     RFAIL(t->recs[p][i].line, "value",
                           "port %u: the record at seq %llu is at or past the end count %llu and can never be reached",
                           p, (unsigned long long)t->recs[p][i].seq, (unsigned long long)t->end_seq[p]);
+        for (uint32_t p = 0; p < t->ports; p++)
+            for (size_t i = 0; i < t->nsyncs[p]; i++)
+                if (t->syncs[p][i].seq >= t->end_seq[p])
+                    RFAIL(t->syncs[p][i].line, "value",
+                          "port %u: the sync record at seq %llu is at or past the end count %llu and can never be reached",
+                          p, (unsigned long long)t->syncs[p][i].seq, (unsigned long long)t->end_seq[p]);
     }
     fclose(f);
     memcpy(t->stats.end_seq, t->end_seq, sizeof t->end_seq);
@@ -647,6 +702,14 @@ static void summary(const PadTrace* t, char* b, size_t n)
         if (used < n)
             snprintf(b + used, n - used, " repeat=%u", t->repeat);
     }
+    /* a trace without sync records keeps the summary byte for byte */
+    if (t->stats.sync_records) {
+        const size_t used = strlen(b);
+        if (used < n)
+            snprintf(b + used, n - used, " sync=%llu/%llu sync_missed=%llu sync_waited=%llu",
+                     (unsigned long long)t->stats.sync_hits, (unsigned long long)t->stats.sync_records,
+                     (unsigned long long)t->stats.sync_missed, (unsigned long long)t->stats.sync_waited);
+    }
 }
 
 /* ---------------------------------------------------------------------------
@@ -658,6 +721,8 @@ int pad_trace_replaying(const PadTrace* t) { return t && t->replaying; }
 static void destroy_storage(PadTrace* t)
 {
     for (unsigned i = 0; i < PAD_TRACE_MAX_PORTS; i++) free(t->recs[i]);
+    for (unsigned i = 0; i < PAD_TRACE_MAX_PORTS; i++) free(t->syncs[i]);
+    for (unsigned i = 0; i < PAD_TRACE_MAX_PORTS; i++) free(t->flip_poll[i]);
     free(t->conns);
     free(t->wbuf);
     free(t->record_path);
@@ -773,8 +838,8 @@ PadTrace* pad_trace_global(const PadTraceOptions* o)
  * neutral pad from the end count on (said once). Returns the record the answer
  * came from, NULL for the neutral pad. A record is counted reached, and its
  * drift read, when a poll first serves it at its own ordinal. */
-static const Rec* replay_serve(PadTrace* t, uint32_t port, uint64_t ord, uint32_t flip, PadTraceState* st,
-                               const PadTraceState* neutral)
+static const Rec* replay_serve(PadTrace* t, uint32_t port, uint64_t ord, int waiting, uint32_t flip,
+                               PadTraceState* st, const PadTraceState* neutral)
 {
     size_t idx = 0;
     const Rec* r = NULL;
@@ -797,7 +862,9 @@ static const Rec* replay_serve(PadTrace* t, uint32_t port, uint64_t ord, uint32_
     }
     if (r) {
         *st = r->st;
-        if (r->seq == ord) {
+        /* A poll served while the clock waits at a pending event holds the state at that ordinal again and
+         * again: it is not the poll that lands on the record, and it must not count as one. */
+        if (r->seq == ord && !waiting) {
             t->stats.exact++;
             /* The flip is annotation: how far it moved between the recording and this replay is the
              * guest-time drift the ordinal key absorbs, and what the summary reports. */
@@ -846,6 +913,34 @@ static void dump_at_check(const PadTrace* t, uint64_t seq)
     }
 }
 
+/* Note the flip requests the guest made since the port's last poll: each was made after `seq` polls of the port.
+ * Bounded, so a garbage flip count cannot ask for gigabytes; past the bound the table stops growing and an event
+ * for a later frame is taken at the poll that reports it. Called under the lock. */
+#define FLIP_NOTE_MAX (1u << 24)
+static void flip_note(PadTrace* t, uint32_t port, uint64_t seq, uint32_t flip)
+{
+    while (t->nflip[port] < flip && t->nflip[port] < FLIP_NOTE_MAX) {
+        t->flip_poll[port] = (uint64_t*)grow(t->flip_poll[port], &t->capflip[port], t->nflip[port] + 1, sizeof(uint64_t));
+        if (!t->flip_poll[port]) trace_stop(t, PAD_TRACE_ROLE_REPLAY, 0, "io", "out of memory");
+        t->flip_poll[port][t->nflip[port]++] = seq;
+    }
+}
+/* The recorded ordinal a poll of `port` is served when the port has sync records. The clock runs one ordinal per
+ * poll from the last re-base on (recorded = ordinal - shift) and does not pass the ordinal of the next pending
+ * event: the recording made the input after the event only once the event had happened, so the replay does not
+ * hand it to a guest that has not got there. Called under the lock. */
+static uint64_t sync_ordinal(PadTrace* t, uint32_t port, uint64_t seq, int* waiting)
+{
+    int64_t rec = (int64_t)seq - t->sync_shift[port];
+    const size_t i = t->sync_next[port];
+    if (i < t->nsyncs[port] && rec > (int64_t)t->syncs[port][i].seq) {
+        rec = (int64_t)t->syncs[port][i].seq;
+        *waiting = 1;
+        t->stats.sync_waited++;
+    }
+    return rec < 0 ? 0u : (uint64_t)rec;
+}
+
 void pad_trace_poll(PadTrace* t, uint32_t port, PadTraceState* st, const PadTraceState* neutral)
 {
     uint64_t seq;
@@ -857,6 +952,7 @@ void pad_trace_poll(PadTrace* t, uint32_t port, PadTraceState* st, const PadTrac
     trace_lock_acquire(&t->lock);
     seq = t->seq[port]++;
     flip = t->flip_fn();
+    if (t->replaying && t->nsyncs[port]) flip_note(t, port, seq, flip);
 
     if (t->replaying) {
         t->stats.polls++;
@@ -865,7 +961,12 @@ void pad_trace_poll(PadTrace* t, uint32_t port, PadTraceState* st, const PadTrac
          * k guest steps. Poll p is answered exactly as the k = 1 replay answers recorded ordinal p / k:
          * an ordinal with no record of its own holds the latest state, the end count is reached when
          * p / k >= end_seq, and a record is reached (its drift read) when a poll first serves it. */
-        replay_serve(t, port, seq / t->repeat, flip, st, neutral);
+        {
+            uint64_t ord = seq / t->repeat;
+            int waiting = 0;
+            if (t->nsyncs[port]) ord = sync_ordinal(t, port, seq, &waiting);
+            replay_serve(t, port, ord, waiting, flip, st, neutral);
+        }
     }
 
     if (t->wf && !t->wclosed) {
@@ -908,6 +1009,34 @@ void pad_trace_conn(PadTrace* t, uint8_t on[PAD_TRACE_MAX_PORTS])
             t->w_have_conn = 1;
         }
         flush_if_due(t);
+    }
+    trace_lock_release(&t->lock);
+}
+
+uint64_t pad_trace_sync_count(const PadTrace* t) { return t ? t->stats.sync_records : 0; }
+
+void pad_trace_sync_event(PadTrace* t, uint32_t kind, uint64_t key, uint32_t frame)
+{
+    if (!t || !t->replaying || !t->stats.sync_records) return;
+    trace_lock_acquire(&t->lock);
+    for (uint32_t p = 0; p < t->ports; p++) {
+        const size_t n = t->nsyncs[p];
+        size_t i = t->sync_next[p];
+        while (i < n && !(t->syncs[p][i].kind == kind && t->syncs[p][i].key == key)) i++;
+        if (i == n) continue;   /* not an event this port waits for (or already passed) */
+        /* The guest event happened when the guest made its `frame`-th flip request: after the polls noted for it, or
+         * just now when the guest has not polled since (or the frame is unknown). Not when this call arrives: the
+         * draw engine reports a frame later than the guest made it, by as much as the engine lags the guest. */
+        const uint64_t at = (frame >= 1u && frame <= t->nflip[p]) ? t->flip_poll[p][frame - 1u] : t->seq[p];
+        t->stats.sync_missed += i - t->sync_next[p];
+        t->sync_next[p] = i + 1u;
+        t->sync_shift[p] = (int64_t)at - (int64_t)t->syncs[p][i].seq;
+        t->stats.sync_hits++;
+        printf("[cellPad] pad replay sync: event %u key %016llx port %u at poll %llu (reported at %llu) re-based to "
+               "recorded poll %llu (shift %lld)\n",
+               kind, (unsigned long long)key, p, (unsigned long long)at, (unsigned long long)t->seq[p],
+               (unsigned long long)t->syncs[p][i].seq, (long long)t->sync_shift[p]);
+        fflush(stdout);
     }
     trace_lock_release(&t->lock);
 }
