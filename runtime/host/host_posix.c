@@ -626,12 +626,24 @@ static void emit_programs(const u8* vp, u32 vp_bytes, u32 fp_offset)
  * which happens to be right for these vertices and wrong for a real title's. */
 #define VTX_MAIN(off)  (0x80000000u | (u32)(off))
 
-/* --draws=N[:S]: the triangle is drawn N times per frame, each in a BEGIN/END pair of its own (the engine
+/* --draws=N[:S[:W]]: the triangle is drawn N times per frame, each in a BEGIN/END pair of its own (the engine
  * turns one pair into one backend draw), which loads a backend past its per-submission draw cap without a
- * title. With :S the draws are scissored to an S x S corner, so the GPU's share of the frame is small and
- * the host's recording cost shows. A frame of N draws is 24 * N bytes of the 64 KiB ring below the vertex
- * data, so submit_frame wraps the ring with a JUMP to its start when the next frame would not fit. */
-static unsigned s_repeat_draws = 1, s_scissor_px = 0;
+ * title. With :S the draws are scissored to an S x S corner (0 = the whole target), so the GPU's share of the
+ * frame is small and the host's recording cost shows, or large, the other regime. With :W each draw is followed
+ * by W microseconds of busy CPU time on this thread, after it went to the walker, standing in for the engine
+ * work a title does between draws: a frame is then as walker-bound as a title's. A frame of N draws is 24 * N
+ * bytes of the 64 KiB ring below the vertex data, so submit_frame wraps the ring with a JUMP to its start when
+ * the next frame would not fit. */
+static unsigned s_repeat_draws = 1, s_scissor_px = 0, s_work_us = 0;
+
+static void bench_spin_us(unsigned us)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    const uint64_t end = (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec + (uint64_t)us * 1000ull;
+    do clock_gettime(CLOCK_MONOTONIC, &t);
+    while ((uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec < end);
+}
 
 static void emit_triangle_draw(void)
 {
@@ -648,6 +660,11 @@ static void emit_triangle_draw(void)
         emit(NV4097_SET_BEGIN_END, 5u);                       /* TRIANGLES        */
         emit(NV4097_DRAW_ARRAYS,   0u | ((3u - 1u) << 24));   /* first=0 count=3  */
         emit(NV4097_SET_BEGIN_END, 0u);                       /* end              */
+        if (s_work_us) {                                      /* the walker takes the draw now, then the CPU cost */
+            guest_w32(CTRL_ADDR + 0, g_fifo_len);
+            cellGcm_rsx_process_fifo();
+            bench_spin_us(s_work_us);
+        }
     }
 }
 
@@ -1446,7 +1463,7 @@ int main(int argc, char** argv)
         else if (strcmp(argv[i], "--draw") == 0)   do_draw = 1;
         else if (strncmp(argv[i], "--draws=", 8) == 0) {
             do_draw = 1;
-            if (sscanf(argv[i] + 8, "%u:%u", &s_repeat_draws, &s_scissor_px) < 1) s_repeat_draws = 0;
+            if (sscanf(argv[i] + 8, "%u:%u:%u", &s_repeat_draws, &s_scissor_px, &s_work_us) < 1) s_repeat_draws = 0;
         }
         /* --threads: no graphics at all, just the lv2 thread path. */
         else if (strcmp(argv[i], "--threads") == 0) {
@@ -1679,15 +1696,28 @@ int main(int argc, char** argv)
     /* Flip loop, as cellGcmSetFlipCommand + the vblank ticker drive it. */
     cellGcmSetFlipCommand(0);
     int presented = 0;
+    uint64_t loop_t0 = 0;
+    int timed = 0;
     for (int i = 0; frames == 0 || i < frames; i++) {
+        if (i == 1 && s_repeat_draws != 1) {        /* the bench times the frames after the first: that one builds pipelines */
+            struct timespec t;
+            clock_gettime(CLOCK_MONOTONIC, &t);
+            loop_t0 = (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+        }
         if (host_backend_pump() < 0) { printf("[host] window closed\n"); break; }
         /* Re-submit every frame, as a title does: the backend records draws
          * per frame and clears the record when it presents. */
-        if (i > 0) submit_frame(do_draw);
+        if (i > 0) { submit_frame(do_draw); timed++; }
         cellGcmTickVBlank();
         cellGcmTickFlip();
         if (cellGcm_take_flip_pending_synced()) presented++;
         host_backend_present();
+    }
+    if (loop_t0 && timed) {
+        struct timespec t;
+        clock_gettime(CLOCK_MONOTONIC, &t);
+        const double ms = ((double)((uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec) - (double)loop_t0) / 1e6;
+        printf("[host] frame loop: %d frames after the first in %.2f ms (%.3f ms/frame)\n", timed, ms, ms / timed);
     }
     printf("[host] presented %d frame(s)\n", presented);
 
