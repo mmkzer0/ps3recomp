@@ -312,6 +312,107 @@ static unsigned long long eng_pow2_bump(_Atomic unsigned long long* c)
 
 static int eng_is_pow2(unsigned long long n) { return n && !(n & (n - 1)); }
 
+/* ---- pass sizing (diagnostic) --------------------------------------------
+ *
+ * PS3RECOMP_ENG_FRAME_STATS=<seconds>: every <seconds> a `frame stats` line
+ * with per-frame averages of what the engine handed the backend. A target
+ * group is a run of consecutive executed draws into one unchanged colour
+ * target set and zeta -- upstream #814's pass definition, so the count is the
+ * pass count a backend could reach by coalescing draws. The zeta is compared
+ * by its location and offset registers, as #814 does; a format-only change
+ * does not end a group. A break is counted against the first thing that ended
+ * the run: a colour-set change, a zeta-only change, a clear, a copy (a
+ * feedback/depth snapshot, a texture upload, a guest read or write) or any
+ * other operation, so groups - 1 == sum(breaks) inside a frame.
+ *
+ * Diagnostic only, and off unless asked for: the counters live behind the
+ * gate, so the default draw path does no counting. Walker thread only. */
+enum {
+    ENG_V1_BREAK_COLOUR = 0,   /* the colour target set changed */
+    ENG_V1_BREAK_ZETA,         /* the colour set held, the zeta did not */
+    ENG_V1_BREAK_CLEAR,
+    ENG_V1_BREAK_COPY,         /* a snapshot, an upload, a guest transfer */
+    ENG_V1_BREAK_OTHER,
+    ENG_V1_BREAK_COUNT
+};
+
+static struct {
+    int on;                    /* -1 undecided, 0 off, 1 on */
+    u32 every_s;
+    time_t t0_s;               /* start of the window being averaged */
+    unsigned long long frames, draws, groups, breaks[ENG_V1_BREAK_COUNT];
+    int open;                  /* a draw run is open */
+    u32 n_targets, targets[RSX_BE_MAX_COLOR_TARGETS];
+    u32 zloc, zoff;
+} s_v1;
+
+static int eng_v1_on(void)
+{
+    if (s_v1.on < 0) {
+        const char* e = getenv("PS3RECOMP_ENG_FRAME_STATS");
+        s_v1.every_s = e ? (u32)strtoul(e, NULL, 10) : 0u;
+        s_v1.on = (e && *e && s_v1.every_s) ? 1 : 0;
+    }
+    return s_v1.on;
+}
+
+/* One executed draw: extend the open run, or start a new one and count what
+ * ended the old one. A run is always open when a draw reaches here, unless a
+ * non-draw operation (eng_v1_break) ended it since the last draw. */
+static void eng_v1_draw(const u32* targets, u32 n_targets, u32 zloc, u32 zoff)
+{
+    s_v1.draws++;
+    if (!s_v1.open) {
+        s_v1.open = 1;
+        s_v1.groups++;
+    } else {
+        int colour = s_v1.n_targets != n_targets;
+        for (u32 k = 0; !colour && k < n_targets; k++) colour = s_v1.targets[k] != targets[k];
+        int zeta = s_v1.zloc != zloc || s_v1.zoff != zoff;
+        if (colour || zeta) {
+            s_v1.breaks[colour ? ENG_V1_BREAK_COLOUR : ENG_V1_BREAK_ZETA]++;
+            s_v1.groups++;
+        }
+    }
+    s_v1.n_targets = n_targets;
+    memcpy(s_v1.targets, targets, n_targets * sizeof(u32));
+    s_v1.zloc = zloc;
+    s_v1.zoff = zoff;
+}
+
+/* A non-draw operation that cannot be inside a render pass (a clear, a copy,
+ * an upload) ends the open run; the next draw starts the next group with no
+ * break of its own, so the causes stay one per group boundary. */
+static void eng_v1_break(u32 cause)
+{
+    if (!s_v1.open) return;
+    s_v1.open = 0;
+    s_v1.breaks[cause]++;
+}
+
+/* One presented frame: a present ends every pass, and every <every_s> seconds
+ * the window's averages are printed and the counters reset. */
+static void eng_v1_frame(void)
+{
+    const time_t now = time(NULL);
+    s_v1.frames++;
+    s_v1.open = 0;
+    if (!s_v1.t0_s) { s_v1.t0_s = now; return; }
+    const double secs = difftime(now, s_v1.t0_s);
+    if (secs < (double)s_v1.every_s) return;
+    const double f = (double)s_v1.frames;
+    PS3_LOG(PS3_LOG_INFO, "rsx-frame-stats",
+            "frames %llu in %.2f s (%.1f fps), %.2f draws/frame, %.2f target groups/frame; "
+            "breaks/frame colour %.2f zeta-only %.2f clear %.2f copy %.2f other %.2f\n",
+            s_v1.frames, secs, f / secs, (double)s_v1.draws / f, (double)s_v1.groups / f,
+            (double)s_v1.breaks[ENG_V1_BREAK_COLOUR] / f, (double)s_v1.breaks[ENG_V1_BREAK_ZETA] / f,
+            (double)s_v1.breaks[ENG_V1_BREAK_CLEAR] / f, (double)s_v1.breaks[ENG_V1_BREAK_COPY] / f,
+            (double)s_v1.breaks[ENG_V1_BREAK_OTHER] / f);
+    s_v1.frames = s_v1.draws = s_v1.groups = 0;
+    memset(s_v1.breaks, 0, sizeof s_v1.breaks);
+    s_v1.t0_s = now;
+}
+
 const char* rsx_drop_reason_name(rsx_drop_reason reason)
 {
     static const char* const names[RSX_DROP_REASON_COUNT] = {
@@ -1189,6 +1290,7 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     s->location = location; s->offset = offset;
     s->w = want_w; s->h = want_h; s->fmt = want_fmt; s->aa_grid = aa_grid;
     s->handle = handle;
+    if (eng_v1_on()) eng_v1_break(ENG_V1_BREAK_OTHER);   /* creation clears and seeds: a one-shot */
     s->color_serial = 0;
     s->guest_dirty = 0;
     s->last_use = g.frames;
@@ -1367,6 +1469,7 @@ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 
     if (!rows) return;
     g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
     g.be->readback(g.be->user, s->handle, x, y, n, h, rows, n * bpp);
+    if (eng_v1_on()) eng_v1_break(ENG_V1_BREAK_COPY);   /* a readback is a transfer of its own */
     if (eng_coherence_log())
         PS3_LOG(PS3_LOG_INFO, "rsx engine", "guest_read %u:0x%08X %ux%u <- surface 0x%08X (%u bpp) at %u,%u:"
                         " %u non-zero pixels\n", location, offset, w, h, s->offset, bpp, x, y,
@@ -1418,6 +1521,7 @@ void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32
         PS3_LOG(PS3_LOG_INFO, "rsx engine", "guest_wrote %u:0x%08X %ux%u -> surface 0x%08X at %u,%u:"
                         " %u non-zero pixels\n", location, offset, w, h, s->offset, x, y,
                 eng_nonzero_pixels(rows, w * h, 4u));
+    if (eng_v1_on()) eng_v1_break(ENG_V1_BREAK_COPY);   /* a 2D transfer into the target */
     g.be->color_target_write(g.be->user, s->handle, x, y, w, h, rows, w * 4u);
 }
 
@@ -1492,6 +1596,7 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
     z->location = location; z->offset = offset;
     z->w = want_w; z->h = want_h;
     z->handle = handle;
+    if (eng_v1_on()) eng_v1_break(ENG_V1_BREAK_OTHER);   /* creation clears the image on its own submission */
     z->snapshot = 0;
     z->cleared = 0;
     z->had_write = 0;
@@ -1528,6 +1633,7 @@ static u32 eng_zdepth_snapshot(u32 slot, u32 tex_w, u32 tex_h)
     if (!g.be->depth_snapshot) return 0;
     const u32 tex = g.be->depth_snapshot(g.be->user, z->handle, w, h);
     if (!tex) return 0;
+    if (eng_v1_on()) eng_v1_break(ENG_V1_BREAK_COPY);   /* the snapshot is its own copy/submission */
     /* The stale copy goes. A depth clear invalidates the snapshot and the
      * next read takes a new one, so a shadow map cleared and read every frame
      * used to leak one backend texture a frame per depth target, until the
@@ -1585,6 +1691,7 @@ static u32 eng_zdepth_as_color(u32 slot, const rsx_dsp_texture* t)
         const u32 tex = g.be->depth_as_color(g.be->user, z->handle, t->width, t->height,
                                              base_fmt);
         if (!tex) return 0;
+        if (eng_v1_on()) eng_v1_break(ENG_V1_BREAK_COPY);   /* GPU conversion into a new texture */
         if (z->conv) g.be->texture_release(g.be->user, z->conv);
         z->conv = tex;
         z->conv_w = t->width; z->conv_h = t->height; z->conv_fmt = base_fmt;
@@ -1830,6 +1937,7 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
             level_src += (size_t)tl->face_bytes * d;
             if (d > 1) d >>= 1;
         }
+        if (eng_v1_on()) eng_v1_break(ENG_V1_BREAK_COPY);   /* every level went up as a copy */
         return handle;
     }
     const u32 faces = cube ? 6u : 1u;
@@ -1862,6 +1970,7 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                                  g.tex_staging, tl->dst_row_bytes, tl->rows);
         }
     }
+    if (eng_v1_on()) eng_v1_break(ENG_V1_BREAK_COPY);   /* every level and face went up as a copy */
     return handle;
 }
 
@@ -2117,6 +2226,7 @@ static int eng_zdepth_to_guest(u32 slot)
         eng_depth_row_to_guest(row, s_depth_rows + (size_t)r * w, w, bpp);
         if (tiled) rsx_tiled_write(&s_eng_mem, z->location, z->offset + r * z->pitch, row, w * bpp);
     }
+    if (eng_v1_on()) eng_v1_break(ENG_V1_BREAK_COPY);   /* the depth readback waited for the GPU */
     z->guest_dirty = 0;
     eng_textures_touch(z->location, z->offset, z->pitch * h);
     if (eng_coherence_log())
@@ -3228,6 +3338,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
             if (!feedback[k]) {
                 const u32 copy = g.be->color_snapshot(g.be->user, s->handle);
                 if (!copy) return eng_color_feedback_failure(u, s, &t);
+                if (eng_v1_on()) eng_v1_break(ENG_V1_BREAK_COPY);   /* the feedback copy flushes the batch */
                 if (s->feedback) g.be->texture_release(g.be->user, s->feedback);
                 s->feedback = feedback[k] = copy;
             }
@@ -4009,12 +4120,17 @@ static void sink_end(void* user, const rsx_dispatch* r)
      * that never clears its shadow zeta still tests against something. */
     const u32 depth_handle = (zslot != ENG_INVALID) ? g.zdepths[zslot].handle : 0;
     if (zslot != ENG_INVALID && !g.zdepths[zslot].cleared) {
+        if (eng_v1_on()) eng_v1_break(ENG_V1_BREAK_CLEAR);
         g.be->clear_depth_stencil(g.be->user, depth_handle,
                                   RSX_BE_CLEAR_DEPTH | RSX_BE_CLEAR_STENCIL,
                                   1.0f, 0);
         g.zdepths[zslot].cleared = 1;
         g.zdepths[zslot].had_write = 0;
     }
+
+    /* Counted here, after the implicit clear above: the backend records that
+     * clear before this draw, so it ends the previous run first. */
+    if (eng_v1_on()) eng_v1_draw(targets, n_targets, sf.zeta_location, sf.zeta_offset);
 
     u32 handles[RSX_BE_MAX_COLOR_TARGETS];
     for (u32 i = 0; i < n_targets; i++) handles[i] = g.surfaces[targets[i]].handle;
@@ -4127,6 +4243,7 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
     u32 targets[RSX_BE_MAX_COLOR_TARGETS];
     const u32 n_targets = eng_current_target_set(targets);
     if (!n_targets) return;
+    if (eng_v1_on()) eng_v1_break(ENG_V1_BREAK_CLEAR);
     if (pd_capturing()) {
         rsx_dsp_surface zs;
         rsx_dsp_get_surface(&g.rsx, &zs);
@@ -4396,6 +4513,9 @@ static void eng_present(u32 buffer_id, u32 target)
     eng_tex_epoch_advance();
     g.last_guest_draws = g.guest_draws;
     g.guest_draws = 0;
+    /* After the backend's present: the frame's draws are done and a present
+     * ends every pass (#814), so the next draw starts a new target group. */
+    if (eng_v1_on()) eng_v1_frame();
 }
 
 /* GCM_DRIVER_QUEUE (0xE940 / 0xE944): the dispatcher recorded the head's buffer (rsx_dispatch.flip_queues);
