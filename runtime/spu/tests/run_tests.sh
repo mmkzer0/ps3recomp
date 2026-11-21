@@ -36,17 +36,18 @@ command -v "$PYTHON" >/dev/null || {
 # defines g_cri_video_dma, which the fixtures define too (spu_dma.h's inline
 # writes it in every TU), so the runtime copy is renamed as well.
 RT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/spu-tests-runtime.XXXXXX")
+# Under set -e a failed command in this EXIT trap becomes the script's exit
+# status, so a trash utility that refuses the directory (gio in a container:
+# "Trashing on system internal mounts is not supported") failed a run whose
+# tests all passed. Removing the objects is housekeeping: a refusal keeps them
+# and says so.
 cleanup()
 {
-    if command -v trash >/dev/null 2>&1; then
-        trash "$RT_DIR"
-    elif command -v trash-put >/dev/null 2>&1; then
-        trash-put "$RT_DIR"
-    elif command -v gio >/dev/null 2>&1; then
-        gio trash "$RT_DIR"
-    else
-        printf '[spu-tests] temporary runtime objects retained at %s (no trash utility)\n' "$RT_DIR" >&2
-    fi
+    if command -v trash >/dev/null 2>&1 && trash "$RT_DIR" 2>/dev/null; then return 0; fi
+    if command -v trash-put >/dev/null 2>&1 && trash-put "$RT_DIR" 2>/dev/null; then return 0; fi
+    if command -v gio >/dev/null 2>&1 && gio trash "$RT_DIR" 2>/dev/null; then return 0; fi
+    printf '[spu-tests] temporary runtime objects retained at %s (no trash utility took them)\n' "$RT_DIR" >&2
+    return 0
 }
 trap cleanup EXIT
 RTCFLAGS=(-std=gnu17 -O2 -w -pthread -I "$RUNTIME_SPU" -I "$REPO/include"
