@@ -1294,6 +1294,7 @@ static void cellFsAioWrite(ppu_context* ctx)
  * one fd alongside its plain reads. */
 static void fs_io_with_offset(ppu_context* ctx, int write)
 {
+    const char* api = write ? "cellFsWriteWithOffset" : "cellFsReadWithOffset";
     int      fd     = (int)(uint32_t)ctx->gpr[3];
     uint64_t offset = ctx->gpr[4];
     uint32_t buf    = (uint32_t)ctx->gpr[5];
@@ -1301,21 +1302,38 @@ static void fs_io_with_offset(ppu_context* ctx, int write)
     uint32_t n_ptr  = (uint32_t)ctx->gpr[7];
     FILE* f = fd_file(fd);
     if (!f) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EBADF; return; }
-    if (ppu_vm_size && (uint64_t)buf + size > ppu_vm_size) size = ppu_vm_size - buf;
+    /* The same rule as cellFsRead / cellFsWrite: every span the title chose is guest memory in full, or a named
+     * stop before anything is touched. `size` is never clamped to the arena: that read or wrote a prefix of what
+     * the title asked for and reported success, and a span past the arena would have underflowed. The count is
+     * written after the transfer, so its span is checked first too, not left to fault once the file has changed. */
+    if (!fs_range_ok(buf, size)) fs_range_stop(api, "buf", buf, size);
+    if (n_ptr && !fs_range_ok(n_ptr, 8)) fs_range_stop(api, "n", n_ptr, 8);
     fs_prefault(buf, size);   /* written by a read, read by a write: same reserved-page trap */
     size_t n = 0;
+    int write_failed = 0;
     HOST_LOCKFILE(f);
     const int64_t pos = (int64_t)HOST_FTELL64(f);
-    if (HOST_FSEEK64(f, offset) == 0)
-        n = write ? fwrite(vm_base + buf, 1, (size_t)size, f)
-                  : fread(vm_base + buf, 1, (size_t)size, f);
+    if (write) clearerr(f);   /* ferror() is sticky: an old failure would look like this write's */
+    if (HOST_FSEEK64(f, offset) == 0) {
+        if (write) {
+            n = fwrite(vm_base + buf, 1, (size_t)size, f);
+            /* Flushed under the lock so the failure is this write's, and before the seek back. */
+            write_failed = ps3_fs_write_failed(n, size, fflush(f) != 0 || ferror(f));
+        } else {
+            vm_note_write(buf, (size_t)size);   /* kernel write into guest memory */
+            n = fread(vm_base + buf, 1, (size_t)size, f);
+            vm_note_write_check(n < (size_t)size && ferror(f) && errno == EFAULT, api);
+        }
+    } else if (write) {
+        write_failed = ps3_fs_write_failed(0, size, 0);
+    }
     if (pos >= 0) HOST_FSEEK64(f, pos);
     HOST_UNLOCKFILE(f);
     if (ps3_env_once("PS3_FSLOG"))
         PS3_LOG(PS3_LOG_INFO, "fs", "%s@ fd=%d off=%llu size=%llu -> %zu\n", write ? "write" : "read",
                 fd, (unsigned long long)offset, (unsigned long long)size, n);
     if (n_ptr) vm_write64(n_ptr, n);
-    ctx->gpr[3] = CELL_OK;
+    ctx->gpr[3] = write_failed ? (uint64_t)(int64_t)CELL_FS_EIO : CELL_OK;
 }
 static void cellFsReadWithOffset(ppu_context* ctx)  { fs_io_with_offset(ctx, 0); }
 static void cellFsWriteWithOffset(ppu_context* ctx) { fs_io_with_offset(ctx, 1); }

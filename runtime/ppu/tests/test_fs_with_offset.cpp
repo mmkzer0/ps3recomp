@@ -9,7 +9,9 @@
  *   - WriteWithOffset writes at the offset and reports the count;
  *   - neither moves the fd's own position (a plain cellFsRead continues from it);
  *   - a read past the end returns CELL_OK with a count of 0;
- *   - a bad fd returns CELL_FS_EBADF.
+ *   - a bad fd returns CELL_FS_EBADF;
+ *   - a write on a read-only fd returns CELL_FS_EIO with the count 0;
+ *   - a buffer or count span that leaves guest memory is an hle-guest-range stop, with nothing clamped.
  *
  *   tools/test_ppu_fs_with_offset.py
  *   test_fs_with_offset [DIR]   (DIR: where the file goes; default the system temp directory)
@@ -18,6 +20,11 @@
 #include <vector>
 #ifdef _WIN32
 #  include <windows.h>
+#endif
+#include <string>
+#ifndef _WIN32
+#  include <sys/wait.h>
+#  include <unistd.h>
 #endif
 
 /* ---- link stubs: nothing on the paths this test drives calls them ---- */
@@ -29,6 +36,17 @@ void vm_write64(uint64_t a, uint64_t v) { uint64_t be = __builtin_bswap64(v); me
 void ppu_guest_caller(char* out, size_t n) { if (n) out[0] = 0; }
 void ps3_vfs_ps3game_fallback(char* path, size_t cap) { (void)path; (void)cap; }
 void ydkj_host_bt(const char* tag) { (void)tag; }
+/* The runtime's stop for an HLE handler handed a guest span outside guest memory. The fixture has no stop
+ * machinery, so it prints the same machine line and ends the process the same way: a refusal is then told from
+ * the handler transferring a clamped prefix (the child of a fork below). */
+PS3_NORETURN void ps3_stop_guest_range(const char* func, const char* arg,
+                                       uint64_t ea, uint64_t size, uint64_t limit)
+{
+    fprintf(stderr, "kind=hle-guest-range func=%s arg=%s ea=0x%llX size=0x%llX limit=0x%llX\n",
+            func, arg, (unsigned long long)ea, (unsigned long long)size, (unsigned long long)limit);
+    fflush(stderr);
+    _Exit(PS3_STOP_EXIT_CODE);
+}
 }
 /* ps3_dev_flash_path (runtime/platform), which host_path calls for /dev_flash: the real one, it needs nothing. */
 #include "../../platform/ps3_dev_flash.c"
@@ -139,6 +157,62 @@ int main(int argc, char** argv)
     CHECK(rc == (uint32_t)CELL_FS_EBADF, "ReadWithOffset on a bad fd returns 0x%08X (want CELL_FS_EBADF)", rc);
     rc = io(wr_off, 1000, 0, 0x640, 4, 0x508);
     CHECK(rc == (uint32_t)CELL_FS_EBADF, "WriteWithOffset on a bad fd returns 0x%08X (want CELL_FS_EBADF)", rc);
+
+    /* A write on an fd opened read-only fails in stdio: CELL_FS_EIO with the count 0, not CELL_OK and a short
+     * count the title cannot tell from success (ps3_fs_write_failed). */
+    {
+        memset(&ctx, 0, sizeof ctx); ctx.gpr[3] = 0x100; ctx.gpr[4] = CELL_FS_O_RDONLY; ctx.gpr[5] = 0x530;
+        cellFsOpen(&ctx);
+        const uint32_t rfd = rd32(0x530);
+        CHECK((uint32_t)ctx.gpr[3] == 0, "cellFsOpen(O_RDONLY) returns CELL_OK (fd %u)", rfd);
+        memset(mem + 0x538, 0xEE, 8);
+        rc = io(wr_off, rfd, 0, 0x620, 4, 0x538);
+        CHECK(rc == (uint32_t)CELL_FS_EIO && rd64(0x538) == 0,
+              "WriteWithOffset on a read-only fd returns 0x%08X, count %llu (want CELL_FS_EIO, 0)", rc,
+              (unsigned long long)rd64(0x538));
+        memset(&ctx, 0, sizeof ctx); ctx.gpr[3] = rfd;
+        cellFsClose(&ctx);
+    }
+
+#ifndef _WIN32
+    /* A span that leaves the arena is a named stop before the file or the count is touched, never a clamped
+     * transfer of the part that fits: the buffer's whole span, and the count's 8 bytes. */
+    {
+        const struct { const char* name; uint64_t buf; uint64_t size; uint32_t n_ptr; const char* arg; } cases[] = {
+            {"a buffer straddling the arena's end", sizeof mem - 2, 4, 0x508, "buf"},
+            {"a buffer at the arena's end", sizeof mem, 4, 0x508, "buf"},
+            {"a size that wraps the span", 0x600, ~0ull, 0x508, "buf"},
+            {"a count straddling the arena's end", 0x600, 4, (uint32_t)sizeof mem - 4, "n"},
+        };
+        for (const auto& c : cases) {
+            for (int op = 0; op < 2; ++op) {
+                const char* fn = op == 0 ? "cellFsReadWithOffset" : "cellFsWriteWithOffset";
+                int fds[2];
+                CHECK(pipe(fds) == 0, "pipe for %s", c.name);
+                const pid_t pid = fork();
+                if (pid == 0) {
+                    close(fds[0]); dup2(fds[1], STDERR_FILENO); close(fds[1]);
+                    io(op == 0 ? rd_off : wr_off, fd, 4, (uint32_t)c.buf, c.size, c.n_ptr);
+                    _exit(1);   /* returned: nothing was refused */
+                }
+                close(fds[1]);
+                std::string err;
+                char bytes[512];
+                ssize_t got;
+                while ((got = read(fds[0], bytes, sizeof bytes)) > 0) err.append(bytes, (size_t)got);
+                close(fds[0]);
+                int status = 0;
+                waitpid(pid, &status, 0);
+                CHECK(WIFEXITED(status) && WEXITSTATUS(status) == PS3_STOP_EXIT_CODE,
+                      "%s with %s stops instead of transferring (status 0x%X)", fn, c.name, status);
+                CHECK(err.find("kind=hle-guest-range") != std::string::npos &&
+                      err.find(std::string("func=") + fn) != std::string::npos &&
+                      err.find(std::string("arg=") + c.arg) != std::string::npos,
+                      "%s names itself and its %s in the stop (got: %s)", fn, c.arg, err.c_str());
+            }
+        }
+    }
+#endif
 
     memset(&ctx, 0, sizeof ctx); ctx.gpr[3] = fd;
     cellFsClose(&ctx);

@@ -64,13 +64,14 @@ def main():
         with open(os.path.join(td, "ppu_recomp.h"), "w") as fh:
             fh.write(_stub_header())
         exe = args.exe_out or os.path.join(td, "test_fs_with_offset")
-        # ppu_fs.cpp logs, reads the typed configuration and raises named stops (ps3_stop_guest_range).
+        # ppu_fs.cpp logs, reads the typed configuration and raises named stops; the fixture defines
+        # ps3_stop_guest_range itself, so the runtime adds the log and the configuration, not stop.cpp.
         mingw = "mingw" in os.path.basename(cxx)
         try:
             runtime_link.build([FIXTURE], exe, td, cxx=cxx, capture_output=True,
                                cxxflags=["-std=gnu++17", "-w", "-I" + td,
                                          *["-I" + os.path.join(ROOT, d) for d in INCLUDE_DIRS]],
-                               ldflags=["-static"] if mingw else [])
+                               ldflags=["-static"] if mingw else [], runtime=('log', 'config'))
         except subprocess.CalledProcessError as e:
             print("FAIL: fixture did not build")
             print((e.stdout + e.stderr)[-4000:])
