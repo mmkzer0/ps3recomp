@@ -684,19 +684,26 @@ static void cellFsRead(ppu_context* ctx)
      * the end of the log and look identical to reads that never happen.
      * FS_READ_ALL=1 logs every read; otherwise a per-fd first-read line plus a
      * periodic summary is enough to tell the two apart. */
-    { static uint64_t tot=0; static int _n=0;
-      static uint64_t per_fd[64]; static uint32_t cnt_fd[64];
-      tot+=n;
-      if (fd>=0 && fd<64) { per_fd[fd]+=n; cnt_fd[fd]++; }
-      int first_for_fd = (fd>=0 && fd<64 && cnt_fd[fd]==1);
-      if(PS3_LOG_FIRST(_n, 50) || first_for_fd || ps3_env_once("FS_READ_ALL"))
+    /* Any guest thread reads, so the counters are relaxed atomics: a diagnostic, but a plain static here is a data
+     * race between two reading threads (TSan, test_ppu_fs_sys_bridge --tsan). */
+    { static std::atomic<uint64_t> tot{0}; static std::atomic<uint32_t> reads{0};
+      static std::atomic<uint64_t> per_fd[64]; static std::atomic<uint32_t> cnt_fd[64];
+      const uint64_t total = tot.fetch_add(n, std::memory_order_relaxed) + n;
+      const uint32_t nread = reads.fetch_add(1, std::memory_order_relaxed) + 1;
+      uint32_t fd_reads = 0;
+      if (fd>=0 && fd<64) { per_fd[fd].fetch_add(n, std::memory_order_relaxed);
+                            fd_reads = cnt_fd[fd].fetch_add(1, std::memory_order_relaxed) + 1; }
+      const int first_for_fd = fd_reads == 1;
+      if(nread <= 50 || first_for_fd || ps3_env_once("FS_READ_ALL"))
         PS3_LOG(PS3_LOG_INFO, "fs", "read fd=%d nbytes=%llu -> %zu (magic=%02X%02X%02X%02X, total=%llu)%s\n",
                 fd,(unsigned long long)nbytes,n,vm_base[buf],vm_base[buf+1],vm_base[buf+2],vm_base[buf+3],
-                (unsigned long long)tot, first_for_fd?"  <= FIRST READ ON THIS FD":"");
+                (unsigned long long)total, first_for_fd?"  <= FIRST READ ON THIS FD":"");
       if (ps3_env_once("FS_READ_PATH") && fd>=0 && fd<64 && g_fd_path[fd][0])
           fprintf(stderr, "        from %s\n", g_fd_path[fd]);
-      if ((_n % 2000)==0) { fprintf(stderr,"[fs] read summary after %d reads:",_n);
-          for (int i=0;i<64;i++) if (cnt_fd[i]) fprintf(stderr," fd%d=%ux/%lluB",i,cnt_fd[i],(unsigned long long)per_fd[i]);
+      if ((nread % 2000)==0) { fprintf(stderr,"[fs] read summary after %u reads:",nread);
+          for (int i=0;i<64;i++) { const uint32_t c = cnt_fd[i].load(std::memory_order_relaxed);
+              if (c) fprintf(stderr," fd%d=%ux/%lluB",i,c,
+                             (unsigned long long)per_fd[i].load(std::memory_order_relaxed)); }
           fprintf(stderr,"\n"); } }
     if (ps3_env_once("PS3_FSLOG_TOC") && nbytes >= 50000) {  /* data.toc read -> who parses it? */
         PS3_LOG(PS3_LOG_INFO, "TOC", "data.toc read into buf=0x%08X n=%zu; lr=0x%08llX; guest-stack RAs:\n", buf, n, (unsigned long long)ctx->lr);
