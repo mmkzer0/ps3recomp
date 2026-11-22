@@ -372,7 +372,9 @@ void ps3_vfs_ps3game_fallback(char* path, size_t cap)
     }
     char alt[1024];
     size_t head = (size_t)(p - path);
-    if (head + 1 >= sizeof alt)
+    /* The whole candidate must fit, as in the two branches above: a cut one names another file, and the stat
+     * below would hand that one to the caller (an unlink would remove it). */
+    if (head + 1 + strlen(p + 10) >= sizeof alt)
         return;
     memcpy(alt, path, head);
     snprintf(alt + head, sizeof alt - head, "/%s", p + 10);

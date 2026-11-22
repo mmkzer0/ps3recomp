@@ -338,6 +338,46 @@ static void test_concurrent_open(void)
         if (seen[fd]) sc(sys_fs_close, (uint32_t)fd, 0, 0, 0, 0);
 }
 
+/* ps3_vfs_ps3game_fallback, the "<x>/PS3_GAME/<rest>" branch: a candidate "<x>/<rest>" that does not fit the
+ * 1024-byte scratch is not tried. It was cut at 1023 characters and handed back when the cut name existed, so a
+ * missing long path became a different, existing one (an unlink would have removed it). POSIX only: the guest
+ * path is 1033 characters, past the Win32 MAX_PATH. */
+#ifndef _WIN32
+void ps3_vfs_ps3game_fallback(char* path, size_t cap);
+static void test_ps3game_fallback_fit(void)
+{
+    /* rest = "./" pairs then "nn", sized so that "<root>/<rest>" is 1024 characters, one past the scratch; its first
+     * 1023 characters name "<root>/<pairs>n", the file "n" in the root. A leading "/" fixes the parity. The root is
+     * resolved first: macOS's temp area sits under the /var symlink, and resolving that pushed a 1023-character
+     * name past PATH_MAX (ENAMETOOLONG), so the cut name never existed and the case checked nothing. */
+    char root[1024];
+    if (!realpath(s_root, root)) { CHECK(0); return; }
+    char rest[1024];
+    const size_t want = 1024 - strlen(root) - 1;
+    size_t len = 0;
+    if ((want - 2) % 2) rest[len++] = '/';
+    while (len < want - 2) { rest[len++] = '.'; rest[len++] = '/'; }
+    rest[len++] = 'n'; rest[len++] = 'n'; rest[len] = '\0';
+    char path[4096], before[4096], cut[1024];
+    snprintf(path, sizeof path, "%s/PS3_GAME/%s", root, rest);
+    snprintf(before, sizeof before, "%s", path);
+    host_put("n", "cut");
+    struct stat st;
+    snprintf(cut, sizeof cut, "%s/%s", root, rest);   /* cut at 1023, as the old scratch did */
+    CHECK(stat(cut, &st) == 0);   /* the premise: the cut name exists, so a cut candidate would be taken */
+    ps3_vfs_ps3game_fallback(path, sizeof path);
+    CHECK(strcmp(path, before) == 0);   /* kept whole: the caller's stat or unlink misses it */
+
+    /* A candidate that fits is still taken. */
+    host_put("fits.bin", "x");
+    char want_path[1100];
+    snprintf(path, sizeof path, "%s/PS3_GAME/fits.bin", root);
+    snprintf(want_path, sizeof want_path, "%s/fits.bin", root);
+    ps3_vfs_ps3game_fallback(path, sizeof path);
+    CHECK(strcmp(path, want_path) == 0);
+}
+#endif
+
 int main(void)
 {
     /* A page-aligned arena: sys_fs.c commits every guest span it touches (vm_commit_or_stop), which needs real
@@ -372,13 +412,16 @@ int main(void)
     test_readdir();
     test_table_full();
     test_concurrent_open();
+#ifndef _WIN32
+    test_ps3game_fallback_fit();
+#endif
 
     /* Remove what the test made, by name, and then its directory (which only
      * goes if everything else is gone). */
     {
         static const char* const files[] = {
             "created.txt", "excl.txt", "seek.bin", "full.bin", "conc.bin",
-            "plain", "walk/a.txt", "walk/b.txt"
+            "plain", "walk/a.txt", "walk/b.txt", "n", "fits.bin"
         };
         char p[600];
         for (size_t i = 0; i < sizeof files / sizeof files[0]; i++) {
