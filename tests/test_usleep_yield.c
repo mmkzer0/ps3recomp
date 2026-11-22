@@ -28,6 +28,11 @@ uint8_t* vm_base;
 void ppu_thread_note_block(uint64_t tid) { (void)tid; }
 unsigned long long ps3_qpc_us(void) { return 0; }
 void ppu_log_host_chain(const char* tag) { (void)tag; }
+/* sys_timer.c holds these weakly for a build without cellGcmSys.c, but a Mach-O link still wants a
+ * definition: no GCM here, so nothing to pump, no flip ever done and no waker installed. */
+void ppu_gcm_pump(void) {}
+int ppu_gcm_flip_done(void) { return 0; }
+void ppu_gcm_set_wake_hook(void (*hook)(void)) { (void)hook; }
 
 static unsigned long s_nanosleeps, s_yields;
 
