@@ -1207,15 +1207,14 @@ static void emit_poly_offset_draw(void)
  *
  * The vertex sits at the centre of a pixel of the 1280x720 target, `s_point_dx`
  * pixels right of the one the harness reads (640, 360): x = (640.5 + dx) / 640
- * - 1 in NDC. NDC y is +0.5 / 360 above the centre line: that is the middle of
- * row 360 where +y is down the window (Vulkan), and 1 px above it where +y is
- * up (Metal), which an 8 px point covers either way.
+ * - 1 in NDC, y = -0.5 / 360, which is the middle of row 360 on both backends
+ * (Vulkan's vertex stage inverts Y, rsx_shader_spirv.cpp; Metal's NDC is +y up
+ * and RSX window y is down), so even a 1 px point lands on the pixel read.
  *   --points       dx = 0: the centre pixel is the point's.
  *   --points-edge  dx = 3: still inside an 8x8 point (centre 3 px away, edge at
- *                  4), so the centre pixel is lit. Metal only: the Vulkan shaders
- *                  declare no PointSize (RSX_POINT_SIZE_BUILTIN is Metal's, see
- *                  vk_eng_bind_vs_constants), so a Vulkan point's size is
- *                  undefined and the mode is skipped there.
+ *                  4), so the centre pixel is lit. Needs the point size to reach
+ *                  the device: [[point_size]] on Metal (#813), PointSize on
+ *                  Vulkan with largePoints.
  *   --points-miss  dx = 6: outside an 8x8 point and no 1 px point either, so the
  *                  centre pixel is the clear colour on both. */
 static int s_point_dx;
@@ -1223,7 +1222,7 @@ static int s_point_dx;
 #define HOST_NV4097_SET_POINT_SIZE 0x00001EE0u   /* float, pixels */
 static void upload_point_vertex(void)
 {
-    const float v[8] = { (640.5f + (float)s_point_dx) / 640.0f - 1.0f, 0.5f / 360.0f, 0.0f, 1.0f,
+    const float v[8] = { (640.5f + (float)s_point_dx) / 640.0f - 1.0f, -0.5f / 360.0f, 0.0f, 1.0f,
                          0.0f, 0.0f, 1.0f, 1.0f };               /* blue -> red through the FP */
     for (int k = 0; k < 8; k++)
         guest_f32(IO_ADDR + PTVX_OFFSET + (uint32_t)(k * 4), v[k]);
@@ -1692,13 +1691,6 @@ int main(int argc, char** argv)
         else if (strcmp(argv[i], "--points-edge") == 0) { do_draw = 24; s_point_dx = 3; }
         else if (strcmp(argv[i], "--points-miss") == 0) { do_draw = 25; s_point_dx = 6; }
     }
-#if !(defined(__APPLE__) && !defined(PS3RECOMP_RSX_VULKAN))
-    if (do_draw == 24) {
-        printf("[host] --points-edge: skipped, the %s backend's point size is not the guest's "
-               "(its shaders write no PointSize); Metal only\n", HOST_BACKEND_NAME);
-        return 0;
-    }
-#endif
 #if !defined(__APPLE__)
     if (do_draw == 15) {
         printf("[host] --border: the %s backend does not honour SET_TEXTURE_BORDER_COLOR yet; skipped\n",
