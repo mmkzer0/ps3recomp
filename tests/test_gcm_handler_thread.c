@@ -111,7 +111,7 @@ int main(void)
 
     s_main_tid = (unsigned long)GetCurrentThreadId();
     s_vblank_handler_opd = 0x1000;
-    GCM_PENDING_SET(1);
+    cellGcm_vblank_signal();   /* counts the vblank and marks it pending: the pump calls the handler once per vblank */
     ppu_gcm_pump();   /* not the interrupt thread: starts it and returns */
     for (int i = 0; i < 5000 && !atomic_load_explicit(&s_handler_done, memory_order_acquire); i++) usleep(1000);
 
