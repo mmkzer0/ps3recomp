@@ -58,7 +58,7 @@ The game interacts with the GPU through `cellGcmSys` — the PS3 SDK's RSX inter
 - `cellGcmSetFlipMode(mode)` — VSYNC or HSYNC.
 - `cellGcmSetFlipHandler(handler)` / `cellGcmSetVBlankHandler(handler)` — Callback registration. In recomp, these store guest function pointers but don't fire automatically (no real VBlank interrupt).
 - `cellGcmResetFlipStatus()` / `cellGcmGetFlipStatus()` — Flip state tracking.
-- `cellGcmGetLastFlipTime()` — Returns host timestamp via `QueryPerformanceCounter` (Windows) or `clock_gettime` (POSIX).
+- `cellGcmGetLastFlipTime()` — Returns the guest system time in microseconds (`ps3_system_time_us`, the clock `sys_time_get_system_time` returns) of the last flip that completed; it is stamped where the flip completes (the vblank beat or `cellGcmTickFlip`), not when it is requested.
 
 ### RESC output path (`cellResc`, `resc_convert.c`)
 A title that composes into an off-screen surface hands it to `cellRescSetSrc` and ends the frame with `cellRescSetConvertAndFlip`. The HLE appends the firmware's stream (`resc_emit_convert_stream`): state, a 4-vertex quad, the display buffer as the colour target, the source as texture unit 0, a vertex program, the fragment program binding and one draw. The draw engine runs it like any other pass: the source is a registered colour surface, so unit 0 samples that surface (render-to-texture), not guest memory.
@@ -638,7 +638,7 @@ method, like the header.
 | NV4097 | 0x02BC | `NV4097_SET_WINDOW_CLIP_TYPE` | inert | oracle-null | selects whether the window clip rectangles below discard or only clip; RPCS3 has no decoder for  any of the window-clip registers |
 | NV4097 | 0x02C0+15 | `NV4097_SET_WINDOW_CLIP_HORIZONTAL/VERTICAL[0:7]` | inert | oracle-null | eight window clip rectangles (0x2C0..0x2FC); RPCS3 decodes none of them; the engine clips with  the surface clip (rsx_dsp_get_surface) and the ... |
 | NV4097 | 0x0300 | `NV4097_SET_DITHER_ENABLE` | inert | oracle-value | enabled at reset (rsx_state::init 0x300=1). A dither matrix maps a value the ROP already holds  at the target's precision (8-bit for the A8R8G8B8 ... |
-| NV4097 | 0x031C | `NV4097_SET_BLEND_COLOR` | missing | missing | S2: the constant blend colour. The engine builds every blend from the factors and equation  and never binds a constant colour, so a draw whose factor ... |
+| NV4097 | 0x031C | `NV4097_SET_BLEND_COLOR` | handled | consumer | rsx_draw_engine.c sink_end: the per-draw set_blend_color (A8R8G8B8: R bits 16-23, G 8-15, B 0-7, A 24-31; half-float target: R, G as half floats), the constant the CONSTANT_COLOR / CONSTANT_ALPHA factors multiply by (#782) |
 | NV4097 | 0x032C | `NV4097_SET_STENCIL_MASK` | handled | consumer | rsx_draw_engine.c build_render_state: rs->s_write_mask (the front stencil write mask) |
 | NV4097 | 0x0348 | `NV4097_SET_TWO_SIDED_STENCIL_TEST_ENABLE` | handled | consumer | rsx_draw_engine.c build_render_state: rs->stencil_two_sided |
 | NV4097 | 0x034C | `NV4097_SET_BACK_STENCIL_MASK` | handled | consumer | rsx_draw_engine.c build_render_state: rs->bs_write_mask (the back-face stencil write mask under two-sided stencil) |
@@ -651,7 +651,7 @@ method, like the header.
 | NV4097 | 0x0370 | `NV4097_SET_COLOR_MASK_MRT` | handled | consumer | rsx_draw_engine.c build_render_state: rs->color_mask_mrt |
 | NV4097 | 0x0374 | `NV4097_SET_LOGIC_OP_ENABLE` | inert | oracle-value | logic op disabled at reset (enable 0); the engine has no logic-op stage (Metal has none either) |
 | NV4097 | 0x0378 | `NV4097_SET_LOGIC_OP` | inert | oracle-value | the logic operation itself (copy at reset); it cannot be applied while the enable above is 0,  and the row pins the reset value so a change is ... |
-| NV4097 | 0x037C | `NV4097_SET_BLEND_COLOR2` | inert | oracle-value | the second blend constant, 0 at reset; only a blend factor naming the constant-2 source reads  it, and the engine implements the factors the title ... |
+| NV4097 | 0x037C | `NV4097_SET_BLEND_COLOR2` | handled | consumer | rsx_draw_engine.c sink_end: the half-float target's B and A blend constants, handed to set_blend_color with SET_BLEND_COLOR's R and G (#782) |
 | NV4097 | 0x0380+2 | `NV4097_SET_DEPTH_BOUNDS_*` | handled | consumer | rsx_draw_engine.c build_render_state rs->depth_bounds_test and the per-draw set_depth_bounds  (0x0384/0x0388 as raw floats) |
 | NV4097 | 0x0394 | `NV4097_SET_CLIP_MIN` | handled | consumer | rsx_process_method rsx_state.clip_min / rsx_dsp_depth_range: the near end of the depth range  passed to the Metal viewport (rsx_draw_engine.c draw, ... |
 | NV4097 | 0x0398 | `NV4097_SET_CLIP_MAX` | handled | consumer | ...the far end, same consumers |
@@ -784,6 +784,5 @@ Tests: `rsx_depth_range` (host) and `depth_range_metal` (0.25/0.75 → depth buf
 
 ### Known gaps (S2)
 
-| State | What the renderer does today | S2 row |
-|---|---|---|
-| `NV4097_SET_BLEND_COLOR` (`0x031C`) | constant blend factors use the host default instead of the guest's colour | add the four floats to the pipeline/encoder state |
+No gap is open: the last one, `NV4097_SET_BLEND_COLOR` (`0x031C`), is consumed by the engine since #782
+(`set_blend_color`, dynamic state on Vulkan and encoder state on Metal).
