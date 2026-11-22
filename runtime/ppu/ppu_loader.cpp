@@ -27,6 +27,7 @@
 #include <vector>
 #include <string>
 #include <atomic>
+#include <mutex>
 #include "ppu_dispatch_state.h"
 #ifdef _WIN32
 #  include <windows.h>
@@ -891,16 +892,34 @@ extern "C" void spu_coh_notify_write(uint32_t addr);
  * rule does not use it: a reservation is the pair (line epoch, bits) held in
  * the thread's own context and validated by its store-conditional, so nothing
  * ever reaches into another thread's context. See runtime/memory/reservation.h.
+ *
+ * A context is listed once. sys_ppu_thread_create registers at every thread
+ * create and the contexts live in reused static slots, so a pointer that is
+ * registered again is the same thread slot, not a new thread: appending it
+ * again filled the table with copies and the report named one thread many
+ * times. The scan and the append are one step under the lock; the report
+ * reads without it, through the published count.
  * -----------------------------------------------------------------------*/
 extern "C" PPU_THREAD_LOCAL ppu_context* g_active_ctx;   /* fwd (defined below) */
 extern "C" void ppu_dump_guest_stack(ppu_context*, const char*);
 #define PPU_CTX_MAX 128
-static ppu_context* g_ppu_ctxs[PPU_CTX_MAX];
-static volatile LONG g_ppu_ctx_n = 0;
+static std::atomic<ppu_context*> g_ppu_ctxs[PPU_CTX_MAX];
+static std::atomic<long> g_ppu_ctx_n{0};
+static std::mutex g_ppu_ctx_mu;
 extern "C" void ppu_ctx_register(ppu_context* c)
 {
-    long i = _InterlockedExchangeAdd(&g_ppu_ctx_n, 1);
-    if (i < PPU_CTX_MAX) g_ppu_ctxs[i] = c;
+    if (!c) return;
+    std::lock_guard<std::mutex> lock(g_ppu_ctx_mu);
+    const long n = g_ppu_ctx_n.load(std::memory_order_relaxed);
+    for (long i = 0; i < n; i++)
+        if (g_ppu_ctxs[i].load(std::memory_order_relaxed) == c) return;
+    if (n >= PPU_CTX_MAX) {
+        PS3_LOG_N(1, PS3_LOG_WARN, "ppu", "thread registry full (%d contexts): the watchdog report omits later threads\n",
+                  PPU_CTX_MAX);
+        return;
+    }
+    g_ppu_ctxs[n].store(c, std::memory_order_release);
+    g_ppu_ctx_n.store(n + 1, std::memory_order_release);
 }
 /* Where every guest thread is, as a GUEST address.
  *
@@ -926,9 +945,9 @@ extern "C" void ppu_ctx_register(ppu_context* c)
  * last DIRECT call site and nothing more. */
 extern "C" void ppu_report_guest_lrs(void)
 {
-    long n = g_ppu_ctx_n; if (n > PPU_CTX_MAX) n = PPU_CTX_MAX;
+    const long n = g_ppu_ctx_n.load(std::memory_order_acquire);
     for (long i = 0; i < n; i++) {
-        ppu_context* c = g_ppu_ctxs[i];
+        ppu_context* c = g_ppu_ctxs[i].load(std::memory_order_acquire);
         if (!c) continue;
         PS3_LOG(PS3_LOG_INFO, "WATCHDOG", "  guest-tid %-3u lr=0x%08X  r3=0x%08X sp=0x%08X\n",
                 (unsigned)c->thread_id, (uint32_t)c->lr,
