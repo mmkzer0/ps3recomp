@@ -40,7 +40,13 @@ sys_event_flag_info  g_sys_event_flags[SYS_EVENT_FLAG_MAX];
 /* Table lock for allocation */
 #ifdef _WIN32
 static CRITICAL_SECTION s_evt_table_lock;
-static int              s_evt_table_lock_init = 0;
+static INIT_ONCE        s_evt_table_lock_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK evt_table_lock_init(PINIT_ONCE once, PVOID param, PVOID* ctx)
+{
+    (void)once; (void)param; (void)ctx;
+    InitializeCriticalSection(&s_evt_table_lock);
+    return TRUE;
+}
 #else
 static pthread_mutex_t  s_evt_table_lock = PTHREAD_MUTEX_INITIALIZER;
 #endif
@@ -48,10 +54,9 @@ static pthread_mutex_t  s_evt_table_lock = PTHREAD_MUTEX_INITIALIZER;
 static void evt_table_lock(void)
 {
 #ifdef _WIN32
-    if (!s_evt_table_lock_init) {
-        InitializeCriticalSection(&s_evt_table_lock);
-        s_evt_table_lock_init = 1;
-    }
+    /* Host producers (cellAudio's thread, SPURS, SPU groups) take this lock too, so the first use can race:
+     * initialise exactly once (upstream #804, b074d964). */
+    InitOnceExecuteOnce(&s_evt_table_lock_once, evt_table_lock_init, NULL, NULL);
     EnterCriticalSection(&s_evt_table_lock);
 #else
     pthread_mutex_lock(&s_evt_table_lock);
