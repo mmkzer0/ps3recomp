@@ -449,6 +449,7 @@ typedef enum {
     RSX_DROP_TEXTURE_FEEDBACK, /* a sampled target could not be resolved */
     RSX_DROP_INDEX_ALLOC_FAILED,
     RSX_DROP_CONSTANT_ALLOC_FAILED,
+    RSX_DROP_EMPTY_SCISSOR,    /* the guest scissor was written empty, or lies outside the target (#811) */
     RSX_DROP_REASON_COUNT
 } rsx_drop_reason;
 

@@ -317,7 +317,7 @@ const char* rsx_drop_reason_name(rsx_drop_reason reason)
         "needs-expansion", "unsupported-topology", "no-vertices",
         "topology-rebuild-failed", "no-indices", "no-targets",
         "pipeline-failed", "debug-skip", "texture-feedback",
-        "index-alloc-failed", "constant-alloc-failed",
+        "index-alloc-failed", "constant-alloc-failed", "empty-scissor",
     };
     if ((unsigned)reason >= RSX_DROP_REASON_COUNT) return "invalid";
     return names[reason];
@@ -3680,10 +3680,22 @@ static void pd_present(u32 presented, const rsx_frame_identity* fid)
 }
 
 /* The guest scissor intersected with a w x h target, as out[x, y, w, h] in
- * the target's sample grid. The nv40 reset is a full 4096x4096 window and a
- * never-written register reads 0 here, which the w == 0 test treats as no
- * scissor, so only a real game scissor narrows anything
- * (rsx_live_draw.c:6180-6197). */
+ * the target's sample grid. The nv40 reset is a full 4096x4096 window
+ * (RPCS3 6e4b784d1 rsx_methods.cpp:362, 0x10000000) and a never-written
+ * register reads 0 here, which is no scissor: only a real game scissor narrows
+ * anything (rsx_live_draw.c:6180-6197). A register the game WROTE with a zero
+ * width or height is a different thing, an empty scissor, and comes back as a
+ * zero-sized rectangle: the draw is dropped (sink_end) and a clear does nothing
+ * (eng_clear_rect), as RPCS3 skips draws whose scissor is empty or whose origin
+ * is outside the window clip (RSXGraphEngine.cpp:897-904, #811). A game's empty
+ * gauge fill (a long quad cut down to the gauge's value) is exactly that, and
+ * drawn unclipped it ran to the edge of the screen. The reset value cannot tell
+ * "written empty" from "never written", so this keys on the register's write
+ * count (rsx.seen[], cleared by rsx_dispatch_init, i.e. at every engine
+ * (re)init, DECISIONS F23). Only a register written with a zero dimension makes
+ * the scissor empty: a title that writes one register and never the other keeps
+ * drawing as before. A scissor wholly outside the target also leaves a
+ * zero-sized rectangle. */
 static void eng_scissor_rect(const rsx_dsp_surface* sf, u32 w, u32 h, u32 out[4])
 {
     u32 sx = 0, sy = 0, sw = w, sh = h;
@@ -3692,7 +3704,12 @@ static void eng_scissor_rect(const rsx_dsp_surface* sf, u32 w, u32 h, u32 out[4]
     /* The scissor is in pixels: scale it to the sample grid. */
     const u32 gx = (hr & 0xFFFFu) * sf->aa_sx, gw = (hr >> 16) * sf->aa_sx;
     const u32 gy = (vr & 0xFFFFu) * sf->aa_sy, gh = (vr >> 16) * sf->aa_sy;
-    if (gw > 0 && gh > 0) {
+    const int written_empty =
+        (gw == 0 && g.rsx.seen[M_SCISSOR_HORIZONTAL >> 2]) ||
+        (gh == 0 && g.rsx.seen[M_SCISSOR_VERTICAL >> 2]);
+    if (written_empty) {
+        sw = sh = 0;
+    } else if (gw > 0 && gh > 0) {
         u32 right = sx + sw, bottom = sy + sh;
         if (gx > sx) sx = gx;
         if (gy > sy) sy = gy;
@@ -3828,6 +3845,17 @@ static void sink_end(void* user, const rsx_dispatch* r)
     rsx_dsp_surface sf;
     rsx_dsp_viewport vp;
     rsx_dsp_get_surface(&g.rsx, &sf);
+
+    /* An empty scissor (eng_scissor_rect: written empty, or wholly outside the
+     * target) draws nothing. The backend reads a zero rectangle as "no
+     * scissor", so the draw is dropped here, before any texture is bound (a
+     * draw that samples its own target would copy the whole target first),
+     * instead of being handed one. */
+    {
+        u32 sc[4];
+        eng_scissor_rect(&sf, g.surfaces[target].w, g.surfaces[target].h, sc);
+        if (!sc[2] || !sc[3]) { eng_drop(RSX_DROP_EMPTY_SCISSOR); return; }
+    }
     rsx_dsp_get_viewport(&g.rsx, &vp);
     const u32 zslot = eng_zdepth_get(sf.zeta_location, sf.zeta_offset,
                                      sf.clip_w, sf.clip_h);

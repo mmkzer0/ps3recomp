@@ -1390,6 +1390,13 @@ static void test_scissor(void)
     draw_triangle();
     CHECK(stub.n_draw == before, "a written zero-width scissor draws nothing (%d draws)",
           stub.n_draw - before);
+    {   /* The drop is counted under its own reason: submitted == executed + dropped holds. */
+        rsx_draw_engine_stats st;
+        rsx_draw_engine_draw_stats(&st);
+        CHECK(st.by_reason[RSX_DROP_EMPTY_SCISSOR] == 1 && st.submitted == st.executed + st.dropped,
+              "the empty-scissor draw is counted as dropped (%llu, %llu submitted, %llu executed)",
+              st.by_reason[RSX_DROP_EMPTY_SCISSOR], st.submitted, st.executed);
+    }
 
     before = stub.n_draw;
     m(M_SCISSOR_H, (64u << 16) | 16u);
