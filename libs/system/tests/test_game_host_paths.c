@@ -113,6 +113,17 @@ static void permit_outside_guest_memory(void)
     cellGameContentPermit((char*)(uintptr_t)CIP_EA, (char*)(uintptr_t)(ARENA - 16));
 }
 
+static void delete_outside_guest_memory(void)
+{
+    cellGameDeleteGameData((const char*)(uintptr_t)ARENA);
+}
+
+static void delete_unterminated(void)
+{
+    memset(vm_base + ARENA - 8, 'd', 8);   /* 8 bytes up to the end of the arena, no NUL */
+    cellGameDeleteGameData((const char*)(uintptr_t)(ARENA - 8));
+}
+
 int main(void)
 {
     vm_base = calloc(1, ARENA);
@@ -180,6 +191,15 @@ int main(void)
                 "func=cellGame_set_content_path", set_overlong_root);
     expect_stop("a usrdirPath crossing the arena end", "hle-guest-range",
                 "arg=usrdirPath", permit_outside_guest_memory);
+    /* DeleteGameData still deletes nothing, answers PARAM for a null name, and a name outside guest memory or
+     * running off the arena's end is a named stop before anything reads it (#830). */
+    CHECK(cellGameDeleteGameData(NULL) == CELL_GAME_ERROR_PARAM, "DeleteGameData(NULL) is CELL_GAME_ERROR_PARAM");
+    CHECK(cellGameDeleteGameData((const char*)(uintptr_t)DIR_EA) == CELL_OK, "DeleteGameData(\"NODATA01\") is CELL_OK");
+    CHECK(dir_exists(game), "and the game directory is still there");
+    expect_stop("a DeleteGameData name outside guest memory", "hle-guest-range",
+                "arg=dirName", delete_outside_guest_memory);
+    expect_stop("a DeleteGameData name running off the arena's end", "hle-guest-range",
+                "arg=dirName", delete_unterminated);
 
     rmdir(usrdir); rmdir(game); rmdir(root); rmdir(base);
     *strrchr(base, '/') = '\0';

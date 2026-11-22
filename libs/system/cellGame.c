@@ -809,10 +809,20 @@ s32 cellGameCreateGameData(CellGameSetInitParams* init, char* tmp_contentInfoPat
 s32 cellGameDeleteGameData(const char* dirName)
 {
     uintptr_t raw = (uintptr_t)dirName;
-    const char* host_dir = (raw && raw < 0x100000000ull && vm_base)
-        ? (const char*)(vm_base + (uint32_t)raw)
-        : dirName;
-    printf("[cellGame] DeleteGameData(dir='%s')\n", host_dir ? host_dir : "<null>");
+    const int guest = raw && raw < 0x100000000ull && vm_base;
+    /* The directory name is a string the title chose, and the log below reads it: it must start in guest memory
+     * and end inside it (CELL_GAME_PATH_MAX bytes are looked at), or it is the named stop (hle-guest-range)
+     * before anything reads it, not a host fault on an address that happens to share the number. */
+    if (guest) {
+        for (uint32_t n = 0; n < CELL_GAME_PATH_MAX; n++) {
+            const uint64_t at = (uint64_t)raw + n;
+            if (at > UINT32_MAX || !vm_range_ok((uint32_t)at, 1))
+                ps3_stop_guest_range(__func__, "dirName", at, 1, vm_guest_limit());
+            if (!vm_base[at]) break;
+        }
+    }
+    const char* host_dir = guest ? (const char*)(vm_base + (uint32_t)raw) : dirName;
+    printf("[cellGame] DeleteGameData(dir='%.*s')\n", (int)CELL_GAME_PATH_MAX, host_dir ? host_dir : "<null>");
 
     if (!raw)
         return CELL_GAME_ERROR_PARAM;
