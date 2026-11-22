@@ -170,6 +170,17 @@ jobs:
         run: cmake --build --preset dev
       - name: Test
         run: ctest --preset t0
+      # The Win32 shim's threads on glibc, where a thread's static TLS is taken
+      # from its stack: create_thread asks for the caller's size plus glibc's
+      # overhead (ps3_host_thread_stack_size, #720), and the large-TLS case
+      # fails without it. On macOS the overhead is 0, so only these jobs test
+      # it. Upstream's linux.yml runs the same lines and is disabled here.
+      - name: Win32 compatibility layer
+        run: |
+          ${{ matrix.cc }} -std=gnu17 -Wall -Wextra -I runtime/platform -o "$RUNNER_TEMP/test_win32_compat" \
+            runtime/platform/tests/test_win32_compat.c runtime/platform/win32_compat.c \
+            runtime/platform/host_clock.c runtime/platform/host_wait.c -lpthread
+          "$RUNNER_TEMP/test_win32_compat"
 
   linux-gcc15:
     # GCC 15 made musttail a statement attribute, so a GCC 15 build takes the
