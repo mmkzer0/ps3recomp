@@ -53,7 +53,10 @@ int main() {
     ps3_hle_register_ctx(0xF0010103,"toc-context-clobber",clobber);
     setenv("YDKJ_TUNERFIX","1",1);
     unsigned cases=0,failures=0;
-    for(unsigned mode=0;mode<4;++mode) {
+    // Registered handlers only. Upstream's fourth mode called an unregistered NID and
+    // expected an error answer; dev stops on it (unresolved-nid), so there is no
+    // return to a caller whose TOC could matter.
+    for(unsigned mode=0;mode<3;++mode) {
         for(uint64_t slot: {UINT64_C(0),UINT64_C(0xDEADBEEFCAFEBABE)}) {
             std::memset(memory,0xA5,sizeof memory);
             ppu_context c;std::memset(&c,0x5A,sizeof c);
@@ -61,10 +64,9 @@ int main() {
             vm_write64(c.gpr[1]+0x28,slot);
             std::vector<uint8_t> before(memory,memory+sizeof memory);
             ppu_context expected=c;
-            expected.gpr[3]=mode==1?0x89ABCDEF:mode==3?
-                uint64_t(int64_t(int32_t(0x8001112E))):0x76543210;
+            expected.gpr[3]=mode==1?0x89ABCDEF:0x76543210;
             const unsigned start=calls;current=&c;errno=EDOM;
-            ps3_hle_call(mode==3?0xE0998DBFu:0xF0010101+mode,&c);
+            ps3_hle_call(0xF0010101+mode,&c);
             const bool live=c.gpr[2]==expected.gpr[2];
             const bool spill=vm_read64(0x8028)==expected.gpr[2];
             // Generated import callers execute ld r2,0x28(r1) after return.
@@ -73,7 +75,7 @@ int main() {
             const bool err=errno==EDOM;
             std::memcpy(before.data()+0x8028,memory+0x8028,8);
             const bool unchanged=std::memcmp(before.data(),memory,sizeof memory)==0;
-            const bool dispatch=calls-start==(mode==3?0u:1u);
+            const bool dispatch=calls-start==1u;
             const bool inflight=g_hle_inflight[1]==nullptr;
             const bool ok=live&&spill&&regs&&err&&unchanged&&dispatch&&inflight;
             ++cases;if(!ok)++failures;
