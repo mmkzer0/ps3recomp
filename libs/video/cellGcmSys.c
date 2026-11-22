@@ -1546,7 +1546,15 @@ void cellGcm_request_tick(void)
       if (need) {
           u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
           const int flip = s_fifo_getoff == put;
-          if (flip) { FLIP_LOCK(); s_flip_tick_seq = s_flip_req_seq; gcm_stamp_flip_time(); FLIP_UNLOCK(); }
+          if (flip) {
+              /* The last flip time is a COMPLETED flip's: only a beat that finds a flip requested and not yet
+               * completed (the sequence numbers differ) stamps it. With get == put and nothing outstanding
+               * the beat completes nothing, and stamping it moved the time on every vblank (#783). */
+              FLIP_LOCK();
+              if (s_flip_tick_seq != s_flip_req_seq) gcm_stamp_flip_time();
+              s_flip_tick_seq = s_flip_req_seq;
+              FLIP_UNLOCK();
+          }
           GCM_PENDING_SET(flip ? 3 : 1);
           return;
       } }

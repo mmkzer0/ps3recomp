@@ -24,8 +24,10 @@ with tempfile.TemporaryDirectory(prefix='gcm-last-flip-time-') as tmp:
                        cflags=['-std=gnu17', '-O1', '-UNDEBUG', '-ffunction-sections', '-fdata-sections',
                                '-I' + str(root / 'include'), '-I' + str(root / 'libs/video')],
                        ldflags=linker, runtime=('log', 'label_window'))
-    result = subprocess.run([str(binary)], timeout=60, capture_output=True, text=True)
-    print(result.stdout.strip())
-    if result.returncode:
-        print(result.stderr[-2000:])
-        raise SystemExit('test_gcm_last_flip_time failed')
+    # Twice: as shipped, and with GCM_FLIP_NEEDS_FIFO (the fixture sets it itself, so a fresh process).
+    for args in ([], ['needs-fifo']):
+        result = subprocess.run([str(binary), *args], timeout=60, capture_output=True, text=True)
+        print(result.stdout.strip())
+        if result.returncode:
+            print(result.stderr[-2000:])
+            raise SystemExit('test_gcm_last_flip_time failed')

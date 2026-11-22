@@ -34,9 +34,42 @@ static uint64_t now_us;
 uint64_t ps3_system_time_us(void) { return now_us; }
 /* What the drain does when it reaches a flip queued in the command stream. */
 static void flip_executed(void) { s_fifo_flips_reached++; }
-int main(void)
+int main(int argc, char** argv)
 {
     s_display_buffer_set[1] = 1;
+
+    if (argc > 1 && !strcmp(argv[1], "needs-fifo")) {
+        /* GCM_FLIP_NEEDS_FIFO=1: a beat completes the requested flips once the walker has consumed up to put
+         * (get == put here: nothing was ever put). The time is a completed flip's, so a beat with nothing
+         * outstanding does not stamp it. The switch is read once, at the first beat. */
+        setenv("GCM_FLIP_NEEDS_FIFO", "1", 1);
+        const uint32_t vm_size = ppu_hle_inject_base + 0x10000u;
+        vm_base = (uint8_t*)calloc(1, vm_size);
+        assert(vm_base);
+        ppu_vm_size = vm_size;
+
+        now_us = 1000;
+        cellGcm_request_tick();                    /* no flip outstanding */
+        ppu_gcm_pump();
+        assert(cellGcmGetLastFlipTime() == 0);
+
+        now_us = 2000;
+        assert(cellGcmSetFlipCommand(1) == CELL_OK);
+        assert(cellGcmGetLastFlipTime() == 0);     /* the request does not stamp */
+        now_us = 3000;
+        cellGcm_request_tick();                    /* completes it */
+        ppu_gcm_pump();
+        assert(cellGcmGetLastFlipTime() == 3000);
+        assert(cellGcmGetFlipStatus() == CELL_GCM_FLIP_STATUS_DONE);
+
+        now_us = 4000;
+        cellGcm_request_tick();                    /* nothing outstanding again */
+        ppu_gcm_pump();
+        assert(cellGcmGetLastFlipTime() == 3000);
+        free(vm_base);
+        puts("GCM last flip time checks passed (needs-fifo)");
+        return 0;
+    }
 
     /* A direct flip: the request does not stamp, the tick that shows it does. */
     now_us = 1000;
