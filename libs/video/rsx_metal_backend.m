@@ -2782,7 +2782,10 @@ static void release_surfaces(void)
 
 #include "rsx_draw_engine.h"
 
-#define ENG_MAX_OBJECTS  4096
+/* Textures share the table with targets, views and per-draw copies, and a released one keeps its slot until
+ * the command buffer that may use it is encoded: room for twice the engine's texture cache besides. 4096 at
+ * the default cache. */
+#define ENG_MAX_OBJECTS  (2048 + 2 * RSX_DRAW_ENGINE_TEXTURE_CACHE)
 #define ENG_MAX_PIPES    4096
 /* Draws, clears and copies recorded per submission; past it the frame so far is submitted and waited for
  * (eng_record_room), a stall mid-frame. A title with more defines a larger cap at build time (upstream #719:
