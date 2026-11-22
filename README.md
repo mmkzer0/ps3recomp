@@ -511,7 +511,7 @@ changes that are on by default are marked below.*
 
 **SPU and SPURS**
 - **SPURS**: workload `maxContention` from the guest stack (*@MatRanc*, #646;
-  in this fork the handler registration is pending, mmkzer0/ps3recomp#152),
+  the guest spans it touches are range-checked in this fork),
   the task attribute descriptor form auto-detected (#708), real workload
   shutdown bounded by `spurs.shutdown_wait_ms` (#711), `CellSpursQueue` at its SDK
   layout with `cellSpursQueuePopBody` (#832), and job `$sp` word 1 (#829). A
