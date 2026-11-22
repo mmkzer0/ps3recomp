@@ -71,8 +71,11 @@ jobs:
     runs-on: macos-15
     # A Metal fixture stuck in the runner's GPU stack ignores its own
     # subprocess timeout (seen on 2026-10-26, run 40297372432); bound the job
-    # instead of letting it hold a macOS runner for the 6 h default.
-    timeout-minutes: 20
+    # instead of letting it hold a macOS runner for the 6 h default. The bound
+    # is twice the suite: since v0.20.0 its 252 drivers take 19 min 47 s
+    # (run 45048604562), and the old 20 min cancelled that job 2 s before its
+    # end, after every driver had passed.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
