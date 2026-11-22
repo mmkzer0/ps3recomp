@@ -793,7 +793,8 @@ if(PS3RECOMP_BUILD_TESTS)
     add_test(NAME vm_write_watch COMMAND test_vm_write_watch)
     add_test(NAME vm_write_watch_off COMMAND test_vm_write_watch off)
     add_test(NAME vm_write_watch_strict COMMAND test_vm_write_watch strict)
-    set_tests_properties(vm_write_watch vm_write_watch_off vm_write_watch_strict PROPERTIES TIMEOUT 60)
+    set_tests_properties(vm_write_watch vm_write_watch_off vm_write_watch_strict
+        PROPERTIES LABELS "memory;t0" TIMEOUT 60)
     set_tests_properties(vm_write_watch_strict PROPERTIES WILL_FAIL TRUE)
     # Preservation sessions (copy on first write) of the write watch.
     add_executable(test_vm_preserve tests/test_vm_preserve.c runtime/memory/vm_watch.c)
@@ -802,7 +803,7 @@ if(PS3RECOMP_BUILD_TESTS)
         target_link_libraries(test_vm_preserve PRIVATE Threads::Threads)
     endif()
     add_test(NAME vm_preserve COMMAND test_vm_preserve)
-    set_tests_properties(vm_preserve PROPERTIES TIMEOUT 60)
+    set_tests_properties(vm_preserve PROPERTIES LABELS "memory;t0" TIMEOUT 60)
     # PS3_LOG_FIRST, the saturating counter behind the "first n times" log lines.
     add_executable(test_log_first tests/test_log_first.c)
     target_include_directories(test_log_first PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
@@ -1425,6 +1426,7 @@ if(PS3RECOMP_BUILD_TESTS)
     target_include_directories(test_rsx_fence_wait PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video")
     add_test(NAME rsx_fence_wait COMMAND test_rsx_fence_wait)
+    set_tests_properties(rsx_gpu_wait rsx_fence_wait PROPERTIES LABELS "rsx;t0")
 
     # vmx_fmaf (fused multiply-add without a libm call per lane) against fmaf.
     # Without -mfma it takes the double-rounding path; with it, the builtin.
@@ -1470,6 +1472,7 @@ if(PS3RECOMP_BUILD_TESTS)
         target_link_libraries(test_gcm_report_clock PRIVATE m)
     endif()
     add_test(NAME gcm_report_clock COMMAND test_gcm_report_clock)
+    set_tests_properties(gcm_report_clock PROPERTIES LABELS "gcm;t0")
 
 
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
@@ -1492,12 +1495,16 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME ppu_function_splice
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_function_splice.py")
+        # ppu_hle_toc builds the real dispatcher with the run log, configuration and stop runtime
+        # (tools/runtime_link.py); ppu_function_splice lifts and runs a synthetic image.
+        set_tests_properties(ppu_hle_toc ppu_function_splice PROPERTIES LABELS "ppu;t0" TIMEOUT 300)
         add_test(NAME check_public_tree
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_check_public_tree.py")
         add_test(NAME fetch_sdk_pins
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_fetch_sdk_pins.py")
+        set_tests_properties(check_public_tree fetch_sdk_pins PROPERTIES LABELS "tools;t0" TIMEOUT 120)
         add_test(NAME spinlock_word_width
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spinlock_word_width.py")
@@ -1616,12 +1623,14 @@ if(PS3RECOMP_BUILD_TESTS)
         add_test(NAME ppu_thread_syscall_slots
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_thread_syscall_slots.py")
+        set_tests_properties(ppu_thread_syscall_slots PROPERTIES LABELS "ppu;t0" TIMEOUT 300)
         add_test(NAME spu_lifter_invalid_dp
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_lifter_invalid_dp.py")
         add_test(NAME spu_lifter_cfl_scale
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_lifter_cfl_scale.py")
+        set_tests_properties(spu_lifter_invalid_dp spu_lifter_cfl_scale PROPERTIES LABELS "spu;tools;t0" TIMEOUT 120)
     endif()
     if(NOT WIN32)
         find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
@@ -1638,9 +1647,14 @@ if(PS3RECOMP_BUILD_TESTS)
             add_test(NAME spu_interpreter_xorbi
                 COMMAND "${Python3_EXECUTABLE}"
                     "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_interpreter_xorbi.py")
+            # Each driver builds the interpreter with the run log, configuration and stop runtime
+            # (tools/runtime_link.py), twice (three times for xorbi).
+            set_tests_properties(spu_interpreter_mpyui spu_interpreter_double_arithmetic spu_interpreter_rothmi
+                spu_interpreter_xorbi PROPERTIES LABELS "spu;t0" TIMEOUT 300)
             add_test(NAME ppu_ctr64
                 COMMAND "${Python3_EXECUTABLE}"
                     "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_ctr64.py")
+            set_tests_properties(ppu_ctr64 PROPERTIES LABELS "ppu;t0" TIMEOUT 120)
             add_test(NAME spu_fnms_zero_extended
                 COMMAND "${Python3_EXECUTABLE}"
                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_spu_fnms_zero_extended.py")
