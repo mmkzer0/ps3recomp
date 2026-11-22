@@ -323,6 +323,14 @@ jobs:
           # reads transparent black, blended over the clear: the clear colour
           # must come through, the texture behind the unit must not.
           PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --unbound
+          # CONSTANT_COLOR blend factor reads SET_BLEND_COLOR: red scaled by it.
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --blend-constant
+          # Polygon offset pulls an equal-depth triangle over the first.
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --poly-offset
+          # A point at SET_POINT_SIZE 8 covers the centre and 3 px around it, not 6.
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --points
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --points-edge
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --points-miss
           # Render-to-texture: a red triangle drawn into a colour surface of
           # the guest's own, then sampled by a full-screen quad through the
           # guest programs. The guest bytes behind that surface are green, so
@@ -775,15 +783,4 @@ jobs:
       # spu_num * 0x100000) move data between local stores: a GET reads the
       # peer SPU's local store and a PUT writes it, never guest memory.
       - name: Run the SPU thread local-store DMA test
-        run: |
-          clang -std=gnu17 -I include -I runtime/spu -I runtime/platform \
-            -o /tmp/test_spu_thread_ls_dma \
-            runtime/spu/tests/test_spu_thread_ls_dma.c \
-            runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
-            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
-            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
-            runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
-            runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
-            runtime/platform/win32_compat.c \
-            -lpthread -lm
-          /tmp/test_spu_thread_ls_dma
+        run: python3 tools/test_spu_thread_ls_dma.py
