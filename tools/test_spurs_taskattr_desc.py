@@ -54,6 +54,11 @@ int main() {
     unsetenv("SPURS_TASKATTR_LEGACY");
     vm_base = memory; ppu_vm_size = sizeof(memory);
     std::memset(memory, 0, sizeof memory);
+    /* The task image at eaElf 0x1234: the header the initializer checks (firmware 0x02010D3C:
+     * ELF32 big-endian, EM_SPU, e_entry above 0x2FFF), with no program headers. */
+    put32(0x1234, 0x7F454C46); put32(0x1238, 0x01020100);
+    memory[0x1234 + 0x12] = 0; memory[0x1234 + 0x13] = 23;
+    put32(0x1234 + 0x18, 0x3000);
 
     /* MLB Bink shape: r7 = descriptor, r8 = 0.  The context EA is a heap
      * address in 0x10..0x2F (here 0x200), the size a real save-area size. */
