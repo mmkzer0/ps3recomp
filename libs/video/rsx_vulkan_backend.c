@@ -4098,7 +4098,13 @@ static void vk_eng_set_blend_color(void* user, const float rgba[4])
  * Z24S8. On the D32F targets a Vulkan unit is 2^(e-23) for a primitive whose largest depth has exponent e:
  * 2^-24 over [0.5, 1), where nearly all of a perspective scene's depth sits, so Z24 units carry over as they
  * are and a Z16 unit is 256 of them (the Metal backend's conversion, eng_set_depth_bias). The engine offers
- * 0/0 while the guest's offset is off, so every draw sets it and none inherits the last one's. */
+ * 0/0 while the guest's offset is off, so every draw sets it and none inherits the last one's.
+ *
+ * [INFERENCE] The x256 for Z16 and the use of the enable that matches the primitive (point, line, fill: the
+ * engine's choice) rest on the Metal precedent and on arithmetic about the unit, not on an oracle. RPCS3
+ * 6e4b784d1 VK/VKDraw.cpp:215-236 applies the raw scale and bias for SET_POLY_OFFSET_FILL_ENABLE only,
+ * with no Z16 factor (its only factor is 0.5 on NVIDIA D24 fixed point), so a Z16 target or a point/line
+ * offset can differ from it. */
 static void vk_eng_set_depth_bias(void* user, float slope, float units, u32 depth_bits)
 {
     (void)user;

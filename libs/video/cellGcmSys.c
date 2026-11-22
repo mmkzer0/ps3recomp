@@ -683,7 +683,14 @@ static CellGcmSecondVHandler s_second_v_handler = NULL;
  * the clock must be the same as theirs (upstream #783: it was absolute host nanoseconds taken at the
  * request, which made that difference meaningless and every such limiter sleep its whole period).
  * Stamped where a flip completes (cellGcm_request_tick, cellGcmTickFlip) and at SetPrepareFlip,
- * which completes at once; written by the vblank thread and read by any PPU thread. */
+ * which completes at once; written by the vblank thread and read by any PPU thread.
+ *
+ * Evidence and a disagreement: RPCS3 6e4b784d1 stores `last_guest_flip_timestamp = get_system_time() -
+ * 1000000` (RSX/Core/RSXDisplayEngine.cpp:57, :205) and cellGcmGetLastFlipTime returns it
+ * (Cell/Modules/cellGcmSys.cpp:900): its value is one second BEHIND the system time at the flip. This
+ * stamps the unshifted time, as upstream #783 does (DECISIONS row 13); the one-second offset is
+ * unmodelled, and no firmware cite says which is right. A title's period - (now - this) limiter sees
+ * a flip 1 s older on RPCS3. */
 uint64_t ps3_system_time_us(void);   /* runtime/syscalls/sys_timer.c */
 static _Atomic u64 s_last_flip_time = 0;
 static void gcm_stamp_flip_time(void)
@@ -5498,6 +5505,10 @@ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
     /* As in gcm_flip_request: the guest's flip clock advances at the request, whatever the present
      * boundary above does. */
     atomic_fetch_add_explicit(&s_guest_flip_requests, 1, memory_order_release);
+    /* Stamped here, at the request, unlike cellGcmSetFlipCommand: in this runtime the path completes at once (the
+     * status is DONE above and no beat is awaited), so the request is the completion. RPCS3 differs: its
+     * gcmSetPrepareFlip only writes a GCM_FLIP_COMMAND into the command buffer (cellGcmSys.cpp:629-634, 6e4b784d1),
+     * and the flip, with its time, completes when the RSX drains it (RSXDisplayEngine.cpp:205). */
     gcm_stamp_flip_time();
 
     /* Invoke the guest flip handler via OPD resolution -- s_flip_handler holds
