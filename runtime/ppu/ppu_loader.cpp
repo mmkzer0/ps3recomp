@@ -3476,8 +3476,16 @@ extern "C" void lv2_syscall(ppu_context* ctx)
             ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ESRCH;
             return;
         }
-        /* vm::ptr is 32-bit on the console; the span is the 8-byte store below. */
+        /* vm::ptr is 32-bit on the console; the span is the 8-byte store below. A null pointer is CELL_EFAULT: RPCS3
+         * 6e4b784d1 sys_gpio.cpp:17-21 answers that when try_write(0) fails, and page 0 is never writable there. The
+         * device id is tested first (above), as RPCS3 does. A pointer outside guest memory is CELL_EFAULT there too;
+         * here it is the hle-guest-range stop, the repo rule for a span outside guest memory: a divergence, kept for
+         * the rule. */
         const uint32_t value = (uint32_t)ctx->gpr[4];
+        if (!value) {
+            ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EFAULT;
+            return;
+        }
         if (!vm_range_ok(value, 8))
             ps3_stop_guest_range("sys_gpio_get", "value", value, 8, vm_guest_limit());
         vm_write64(value, 0);

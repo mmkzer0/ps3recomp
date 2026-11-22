@@ -6,7 +6,8 @@
  *   device 1 (LED)         set -> CELL_OK,     get -> CELL_OK and *value = 0
  *   device 2 (DIP switch)  set -> CELL_EINVAL, get -> CELL_OK and *value = 0
  *   any other device id    set/get -> CELL_ESRCH, *value untouched
- * and a value pointer whose 8-byte span leaves guest memory ends in the hle-guest-range stop. */
+ * a null value pointer is CELL_EFAULT (device id first), and one whose 8-byte span leaves guest memory ends in the
+ * hle-guest-range stop. */
 #include "../runtime/memory/vm.h"
 #include "ppu_context.h"
 #include "guest_range_catch.h"
@@ -81,6 +82,16 @@ int main()
     CHECK(get_call(3, 0x2000) == k_esrch);
     CHECK(get_call(0, 0xFFFFFFF0u) == k_esrch);
     CHECK(mem[0x2000] == 0xA5 && mem[0x2007] == 0xA5);
+
+    /* a null value pointer is CELL_EFAULT for a real device (try_write fails on page 0 in RPCS3), after the id test:
+     * nothing is stored to page 0, and an unknown id still answers ESRCH. It used to store 8 zero bytes there. */
+    static const uint64_t k_efault = (uint64_t)(int64_t)(int32_t)CELL_EFAULT;
+    for (uint64_t dev = 1; dev <= 2; ++dev) {
+        std::memset(mem, 0xA5, sizeof mem);
+        CHECK(get_call(dev, 0) == k_efault);
+        for (int i = 0; i < 8; ++i) CHECK(mem[i] == 0xA5);
+    }
+    CHECK(get_call(0, 0) == k_esrch);
 
     /* the pointer's whole 8-byte span must be in guest memory: the last full slot is fine, one byte
      * past it and the limit itself stop, and the stop leaves memory alone. */
