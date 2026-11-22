@@ -641,9 +641,11 @@ static void cellFsClose(ppu_context* ctx)
     int fd = (int)(uint32_t)ctx->gpr[3];
     if (ps3_env_once("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
         PS3_LOG(PS3_LOG_INFO, "fs", "close fd=%d  (by %s)\n", fd, w); }
-    /* One fd space: a number this table does not hold may be a file opened through sys_fs. */
-    if (!fd_release_file(fd) && fd >= 0 && fd < FS_MAX) sys_fs_close_fd(fd, 0);
-    ctx->gpr[3] = CELL_OK;
+    /* One fd space: a number this table does not hold may be a file opened through sys_fs. A number neither table
+     * holds is CELL_EBADF: cellFsClose is sys_fs_close (RPCS3 6e4b784d1 cellFs.cpp:71-76, sys_fs.cpp:1667-1672). It
+     * answered CELL_OK for any number, a success for a close that did not happen. */
+    const bool closed = fd_release_file(fd) || (fd >= 0 && fd < FS_MAX && sys_fs_close_fd(fd, 0));
+    ctx->gpr[3] = closed ? CELL_OK : (uint64_t)(int64_t)CELL_FS_EBADF;
 }
 
 /* Pre-fault a guest range so the kernel can write into it.
@@ -1119,9 +1121,11 @@ static void cellFsGetDirectoryEntries(ppu_context* ctx)
 static void cellFsClosedir(ppu_context* ctx)
 {
     int fd = (int)(uint32_t)ctx->gpr[3];
-    /* One fd space: a number this table does not hold may be a directory opened through sys_fs. */
-    if (!fd_release_dir(fd) && fd >= 0 && fd < FS_MAX) sys_fs_close_fd(fd, 1);
-    ctx->gpr[3] = CELL_OK;
+    /* One fd space: a number this table does not hold may be a directory opened through sys_fs. A number neither
+     * table holds as a directory is CELL_EBADF: cellFsClosedir is sys_fs_closedir (RPCS3 cellFs.cpp:103-108,
+     * sys_fs.cpp:1976-1979). It answered CELL_OK for any number. */
+    const bool closed = fd_release_dir(fd) || (fd >= 0 && fd < FS_MAX && sys_fs_close_fd(fd, 1));
+    ctx->gpr[3] = closed ? CELL_OK : (uint64_t)(int64_t)CELL_FS_EBADF;
 }
 
 #ifdef _WIN32

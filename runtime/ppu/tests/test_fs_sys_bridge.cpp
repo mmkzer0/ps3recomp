@@ -227,6 +227,7 @@ static void test_cellfs_fd_through_sys_fs()
     CHECK(sfs(sys_fs_write, fd, s.buf(), 4, s.out() + 8) == 0 && rd64(s.out() + 8) == 4 &&
           host_bytes("bridge_a.bin", 0, 4) == "ZZZZ", "sys_fs_write reaches the host file");
     CHECK(sfs(sys_fs_ftruncate, fd, 64) == 0 && host_size("bridge_a.bin") == 64, "sys_fs_ftruncate shortens it");
+    CHECK(cfs(cellFsClosedir, fd) == EBADF_, "cellFsClosedir of a cellFs file is EBADF and leaves it open");
     CHECK(sfs(sys_fs_close, fd) == 0, "sys_fs_close closes a cellFs fd");
     CHECK(cfs(cellFsRead, fd, s.buf(), 4, s.out() + 8) == EBADF_, "the cellFs table no longer holds it");
     CHECK(sfs(sys_fs_close, fd) == EBADF_, "a second close is EBADF");
@@ -251,8 +252,13 @@ static void test_sys_fs_fd_through_cellfs()
     CHECK(cfs(cellFsWrite, fd, s.buf(), 4, s.out() + 8) == 0 && rd64(s.out() + 8) == 4 &&
           host_bytes("bridge_a.bin", 44, 4) == "QQQQ", "cellFsWrite reaches the host file at the position");
     CHECK(cfs(cellFsFtruncate, fd, 100) == 0 && host_size("bridge_a.bin") == 100, "cellFsFtruncate shortens it");
+    /* RPCS3: cellFsClosedir is sys_fs_closedir, which withdraws only a directory; a file is EBADF. */
+    CHECK(cfs(cellFsClosedir, fd) == EBADF_, "cellFsClosedir of a sys_fs file is EBADF and leaves it open");
     CHECK(cfs(cellFsClose, fd) == 0, "cellFsClose closes a sys_fs fd");
     CHECK(sfs(sys_fs_read, fd, s.buf(), 4, s.out() + 8) == EBADF_, "the sys_fs table no longer holds it");
+    /* RPCS3: cellFsClose is sys_fs_close, which answers EBADF for a number nobody holds (it was CELL_OK). */
+    CHECK(cfs(cellFsClose, fd) == EBADF_, "a second cellFsClose is EBADF");
+    CHECK(cfs(cellFsClose, 200) == EBADF_, "cellFsClose of a number nobody opened is EBADF");
     remove(host("bridge_a.bin").c_str());
 }
 
@@ -499,6 +505,8 @@ static void test_directories()
     /* cellFsOpendir, read and closed through sys_fs. */
     const int cd = cfs_opendir(s, "bridge_dir");
     CHECK(cd >= 3, "cellFsOpendir returns an fd (%d)", cd);
+    /* RPCS3: cellFsClose is sys_fs_close, which closes only a file; a directory is EBADF. */
+    CHECK(cfs(cellFsClose, cd) == EBADF_, "cellFsClose of a cellFs directory is EBADF and leaves it open");
     std::vector<int> types;
     const auto a = list_dir(s, [&] { return sfs(sys_fs_readdir, cd, s.dirent(), s.out() + 8); }, &types);
     CHECK(a == want, "sys_fs_readdir lists a cellFs directory");
@@ -512,6 +520,7 @@ static void test_directories()
     /* sys_fs_opendir, read and closed through cellFs. */
     const int sd = sys_opendir(s, "bridge_dir");
     CHECK(sd >= 3, "sys_fs_opendir returns an fd (%d)", sd);
+    CHECK(cfs(cellFsClose, sd) == EBADF_, "cellFsClose of a sys_fs directory is EBADF and leaves it open");
     types.clear();
     const auto b = list_dir(s, [&] { return cfs(cellFsReaddir, sd, s.dirent(), s.out() + 8); }, &types);
     CHECK(b == want, "cellFsReaddir lists a sys_fs directory");
@@ -519,6 +528,7 @@ static void test_directories()
     CHECK(types.size() == 4 && dirs == 2, "its entries are typed");
     CHECK(cfs(cellFsClosedir, sd) == 0, "cellFsClosedir closes a sys_fs directory");
     CHECK(sfs(sys_fs_readdir, sd, s.dirent(), s.out() + 8) == EBADF_, "the sys_fs table no longer holds it");
+    CHECK(cfs(cellFsClosedir, sd) == EBADF_, "a second cellFsClosedir is EBADF");
 
     /* cellFsGetDirectoryEntries on a sys_fs directory: 312-byte entries, a count of whole ones. */
     const int sd2 = sys_opendir(s, "bridge_dir");
