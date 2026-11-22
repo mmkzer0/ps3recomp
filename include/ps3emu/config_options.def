@@ -622,6 +622,8 @@ PS3_CFG_LEGACY_ENV("PS3RECOMP_VK_GUEST_PROGRAMS")
 PS3_CFG_LEGACY_ENV("PS3RECOMP_VK_HOLD")
 PS3_CFG_LEGACY_ENV("PS3RECOMP_VK_MRT_MASK")
 PS3_CFG_LEGACY_ENV("PS3RECOMP_VK_WINDOW")
+/* Read only by libs/video/rsx_present_thread.h, which is carried unwired with its test until the present thread is
+ * ported (fork #148): accepted so that the header's names pass the environment gate, and inert until then. */
 PS3_CFG_LEGACY_ENV("PS3RECOMP_RSX_PRESENT_THREAD")
 PS3_CFG_LEGACY_ENV("PS3RECOMP_RSX_PRESENT_THREAD_DEPTH")
 PS3_CFG_LEGACY_ENV("PS3RECOMP_RSX_PRESENT_THREAD_REPORT_S")
