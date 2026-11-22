@@ -56,7 +56,7 @@ static struct PmInstance {
     uint32_t snr_val[6][2];
     uint8_t  snr_set[6][2];
     struct PmSlot slots[32][6];
-    spu_context* running[6];   /* context last entered on each SPU (spu_thread_ls_peer) */
+    spu_context* running[6];   /* context last entered on each SPU (spu_thread_ls_copy) */
 } s_pm_instances[SPURS_PM_INSTANCES];
 static SRWLOCK s_pm_directory_lock = SRWLOCK_INIT;
 static CONDITION_VARIABLE s_pm_directory_wake;
@@ -168,7 +168,7 @@ int spurs_policy_release_workload(uint32_t ea, uint32_t wid)
             struct PmSlot* slot = &pi->slots[wid][n];
             if (slot->ctx) {
                 spu_coh_unregister(slot->ctx);spu_mfc_release(slot->ctx);
-                /* spu_thread_ls_peer must not hand out the context that is freed here. */
+                /* spu_thread_ls_copy must not reach the context that is freed here (it copies under the shared lock). */
                 if (pi->running[n] == slot->ctx) __atomic_store_n(&pi->running[n], NULL, __ATOMIC_RELEASE);
                 free(slot->ctx);slot->ctx = NULL;
             }
