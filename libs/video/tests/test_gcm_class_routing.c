@@ -310,7 +310,7 @@ int main(int argc, char** argv)
             n++;
             const rsx_method_rule* rule = NULL;
             static rsx_state st;   /* the stub state machine ignores it */
-            const int handled = gcm_3d_method(&st, m, 0u, /* legacy_state_live */ 0);
+            const int handled = gcm_3d_method(&st, m, 0u, /* legacy_state_live */ 0, /* end_off */ 0u);
             if (!handled && rsx_method_check(RSX_CLASS_NV4097, m, 0u, &rule) == RSX_METHOD_UNKNOWN) {
                 printf("[FAIL] legacy-handled NV4097 method 0x%04X is unknown with the engine on\n", m);
                 unknown++;

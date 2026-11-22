@@ -3798,10 +3798,20 @@ static unsigned gcm_word_diag(void)
 /* One data word of a slot bound to NV4097, or a channel-control (NV406E) word,
  * plus the methods whose answer the walker writes itself. Returns the verdict
  * the walker records (gcm_method_verdict): nonzero when a consumer took the
- * method. */
-static int gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
+ * method. `end_off`: the IO offset just past the command the word belongs to. */
+static int gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live, u32 end_off)
 {
     extern u32 g_rsx_last_reference;
+    /* NV4097 back-end write / texture-read semaphore release (upstream #797):
+     * the label lands inside rsx_process_method, so publish `get` past the
+     * command first, as for NV406E RELEASE. Resistance 3 waits on a label,
+     * snapshots `get` and spins until `put` equals it; with `get` still at the
+     * start of the pass its snapshot never matched. GCM_GET_EQ_PUT keeps its
+     * own get, as for NV406E. */
+    if ((m == 0x1D70u || m == 0x1D74u) && !gcm_get_eq_put()) {
+        vm_write32(GCM_CONTROL_GUEST_ADDR + 4, end_off);
+        atomic_thread_fence(memory_order_release);
+    }
     /* #466: rsx_state feeds only the legacy vtable backend. With the draw
      * engine up and no vtable registered, the state it builds is never read,
      * so only the methods with effects outside it are worth handing over.
@@ -4501,7 +4511,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
                             const u32 v1 = vm_read32(dea + i * 4);
                             if (weng) rsx_draw_engine_method(m1, v1);
                             if (plain_ok && s_3d_plain[m1 >> 2]) n_handled++;
-                            else if (gcm_3d_method(&s_state, m1, v1, legacy_state_live)) n_handled++;
+                            else if (gcm_3d_method(&s_state, m1, v1, legacy_state_live,
+                                                   s_fifo_getoff + 4 + count * 4)) n_handled++;
                             else {
                                 if (n_handled) {
                                     atomic_fetch_add_explicit(&s_mc_handled, n_handled, memory_order_relaxed);
@@ -4721,7 +4732,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
                         cellGcmSetFlipCommand(fbuf);
                     }
                 } else if (cls == RSX_CLASS_NV4097 || cls == RSX_CLASS_NV406E) {
-                    handled = gcm_3d_method(&s_state, m, vm_read32(dea), legacy_state_live);
+                    handled = gcm_3d_method(&s_state, m, vm_read32(dea), legacy_state_live,
+                                            s_fifo_getoff + 4 + count * 4);
                 } else if (cls == RSX_CLASS_NV3062 || cls == RSX_CLASS_NV308A ||
                            cls == RSX_CLASS_NV309E || cls == RSX_CLASS_NV3089) {
                     s_2d_hdr_io = s_fifo_getoff;                 /* where a stop inside this word reads its FIFO window */

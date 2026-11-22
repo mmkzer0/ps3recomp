@@ -187,7 +187,8 @@ int main(int argc, char** argv)
         check(sema4097_get[0] == end_be, "get is past an NV4097 back-end write release before its label");
         check(sema4097_get[1] == end_tex, "get is past an NV4097 texture-read release before its label");
     } else {
-        check(sema4097_get[0] == 0 && sema4097_get[1] == 0, "GCM_GET_EQ_PUT: an NV4097 release publishes nothing mid-pass");
+        check(sema4097_get[0] == CMD0 && sema4097_get[1] == CMD0,
+              "GCM_GET_EQ_PUT: an NV4097 release publishes nothing mid-pass");
     }
     check(vm_read32(ctrl + 4) == put, "after the pass, get is put");
 
