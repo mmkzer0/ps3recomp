@@ -123,22 +123,32 @@ int spurs_policy_post_snr(uint32_t ea, uint32_t spu_num, uint32_t num, uint32_t 
 /* Make `ctx` the slot's resident context (NULL withdraws it while it is being reset); a context taking over gets the
  * signals posted while there was none. Under the directory lock, so spurs_policy_post_snr sees either no context or
  * an initialized one: a signal written into a context about to be zeroed would count as delivered and be lost. A
- * withdrawn context also leaves running[]: spu_thread_ls_copy holds the shared lock while it copies, so once this
- * returns no copy reads the local store the caller is about to zero. */
+ * withdrawn context stays in running[]: see policy_reset_ctx. */
 static void policy_publish_ctx(struct PmSlot* slot, spu_context* ctx, uint32_t spu_num)
 {
     AcquireSRWLockExclusive(&s_pm_directory_lock);
-    spu_context* old = slot->ctx;
     slot->ctx = ctx;
     struct PmInstance* pi = slot->owner;
-    if (!ctx && old && pi && spu_num < 6 && __atomic_load_n(&pi->running[spu_num], __ATOMIC_RELAXED) == old)
-        __atomic_store_n(&pi->running[spu_num], NULL, __ATOMIC_RELEASE);
     if (ctx && pi && spu_num < 6)
         for (unsigned num = 0; num < 2; num++)
             if (pi->snr_set[spu_num][num]) {
                 spu_channel_write(&ctx->ch_sig_notify[num], pi->snr_val[spu_num][num]);
                 pi->snr_set[spu_num][num] = 0;
             }
+    ReleaseSRWLockExclusive(&s_pm_directory_lock);
+}
+
+/* Zero a withdrawn resident context for a policy-module reload. Under the exclusive directory lock, because the
+ * context stays in running[] while it reloads: spu_thread_ls_copy copies under the shared lock, so a peer SPU's
+ * transfer through the local-store window reads this SPU's local store before the reset or after it, never while it
+ * is being zeroed. Taking the context out of running[] instead made such a transfer find no local store and fall
+ * through to the guest-memory path, where the VM demand-commits the page under the window: a GET read zeroes and a
+ * PUT wrote into that page, data the SPU never had, although its local store stays mapped while its policy module
+ * reloads. */
+static void policy_reset_ctx(spu_context* ctx)
+{
+    AcquireSRWLockExclusive(&s_pm_directory_lock);
+    spu_context_init(ctx, 0);
     ReleaseSRWLockExclusive(&s_pm_directory_lock);
 }
 
@@ -322,8 +332,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
         policy_publish_ctx(resident, NULL, spu_num);
         spu_coh_unregister(ctx);
         spu_mfc_release(ctx);
-        memset(ctx, 0, sizeof(*ctx));
-        spu_context_init(ctx, 0);
+        policy_reset_ctx(ctx);
         policy_publish_ctx(resident, ctx, spu_num);
     }
     resident->data = wkl_data;

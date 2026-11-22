@@ -169,6 +169,23 @@ int main(void)
         CHECK(g_race_bad == 0);
         CHECK(spurs_policy_release_workload(SPURS_EA, 0) == 0);
     }
+    {   /* A policy-module reload (the workload's data changed) keeps SPU 1's local store in the window: the reader
+         * always finds a context (withdrawing it made the copy miss, and the transfer fell through to guest memory),
+         * and never one that is being zeroed (TSan: the copy against the reload's memset). */
+        pthread_t reader;
+        g_race_stop = 0;
+        g_race_copies = g_race_missed = g_race_bad = 0;   /* the first reader is joined */
+        spu_run_policy_module(race_entry, 1, k_pm, sizeof k_pm, 0, 0, SPURS_EA, 1);
+        CHECK(pthread_create(&reader, NULL, race_reader, NULL) == 0);
+        while (!__atomic_load_n(&g_race_copies, __ATOMIC_ACQUIRE)) sched_yield();
+        for (uint64_t data = 1; data <= 400; data++)   /* new workload data on every run: each one reloads */
+            spu_run_policy_module(race_entry, 1, k_pm, sizeof k_pm, data, 0, SPURS_EA, 1);
+        __atomic_store_n(&g_race_stop, 1, __ATOMIC_RELEASE);
+        pthread_join(reader, NULL);
+        CHECK(g_race_missed == 0);
+        CHECK(g_race_bad == 0);
+        CHECK(spurs_policy_release_workload(SPURS_EA, 0) == 0);
+    }
 #endif
 
     printf("%d passed, %d failed\n", g_pass, g_fail);
