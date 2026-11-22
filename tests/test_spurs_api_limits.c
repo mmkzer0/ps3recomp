@@ -3,6 +3,8 @@
 #include <assert.h>
 #include <stdatomic.h>
 #include "../runtime/spu/spu_coherency.h"
+#include <sys/wait.h>   /* the stop cases fork: the fixture is POSIX only (the driver skips elsewhere) */
+#include <unistd.h>
 
 void spu_indirect_branch(spu_context*);
 uint8_t* vm_base;
@@ -38,9 +40,54 @@ static void finalize(u32 ea)
     assert(!"finalize failed");
 }
 
+/* _cellSpursWorkloadAttributeInitialize through its context handler (upstream #646). */
+static ppu_context g_attr_ctx;
+static void attr_args(u32 attr, u32 prio, u32 sp)
+{
+    memset(&g_attr_ctx,0,sizeof g_attr_ctx);
+    g_attr_ctx.gpr[1]=sp; g_attr_ctx.gpr[3]=attr; g_attr_ctx.gpr[4]=1; g_attr_ctx.gpr[5]=0x00350001u;
+    g_attr_ctx.gpr[6]=0x9000; g_attr_ctx.gpr[7]=16; g_attr_ctx.gpr[8]=0; g_attr_ctx.gpr[9]=prio; g_attr_ctx.gpr[10]=1;
+}
+/* A refused span ends the process in the named stop hle-guest-range, so the call runs in a forked child (before any
+ * SPURS thread exists) and the parent reads the machine line the stop prints on stderr. */
+static void attr_init_stops(const char* arg)
+{
+    int fds[2];
+    assert(pipe(fds)==0);
+    fflush(stdout);
+    const pid_t pid=fork();
+    assert(pid>=0);
+    if (!pid) {
+        close(fds[0]); dup2(fds[1],STDERR_FILENO); close(fds[1]);
+        hle_workload_attribute_initialize(&g_attr_ctx);
+        _exit(1);   /* returned: the span was not refused */
+    }
+    close(fds[1]);
+    char out[4096]; size_t used=0; ssize_t n;
+    while (used<sizeof out-1 && (n=read(fds[0],out+used,sizeof out-1-used))>0) used+=(size_t)n;
+    out[used]=0; close(fds[0]);
+    int status=0;
+    waitpid(pid,&status,0);
+    char want[128];
+    snprintf(want,sizeof want,"func=_cellSpursWorkloadAttributeInitialize arg=%s",arg);
+    const char* line=strstr(out,"PS3STOP v=1");
+    if (!(WIFEXITED(status) && WEXITSTATUS(status)==PS3_STOP_EXIT_CODE && line &&
+          strstr(line,"kind=hle-guest-range") && strstr(line,want))) {
+        printf("FAIL %s: status 0x%X, stop line: %s\n",arg,status,line?line:"(none)");
+        exit(1);
+    }
+}
+
 int main(void)
 {
     vm_base=calloc(1,ppu_vm_size);assert(vm_base);
+
+    /* Each span the title chose stops when it leaves guest memory: the attribute, the priorities, and the stack slot
+     * the ninth argument comes from. */
+    attr_args(0x20000u-0x20u,0,0xD000); attr_init_stops("attr");                /* straddles the end */
+    attr_args(0xC000,0x20000u-4u,0xD000); attr_init_stops("priority");
+    attr_args(0xC000,0,0x20000u-112u-4u); attr_init_stops("maxContention");     /* r1 + 112 straddles the end */
+    puts("SPURS workload attribute spans outside guest memory stop PASS");
     memset(vm_base+0x9000,0x11,16);
     spu_workload_register_img(spu_workload_fingerprint(vm_base+0x9000,16),hold_policy,77,"api limits fixture");
     assert(cellSpursInitialize((CellSpurs*)0x1000,2,0,0,0)==0);
@@ -125,6 +172,23 @@ int main(void)
         assert((u32)cellSpursSetMaxContention((CellSpurs*)0x5000,32,1)==CELL_SPURS_CORE_ERROR_INVAL);
         assert(cellSpursSetMaxContention((CellSpurs*)0x5000,1,3)==0);
         assert(vm_read8(0x5000+SPURS_WKL_MAXCONT+1)==0x03);
+    }
+    /* The ninth argument of _cellSpursWorkloadAttributeInitialize comes from the caller's parameter save area (64-bit
+     * PowerPC ELF ABI: r1 + 48 + 8 * 8) and reaches the instance through AddWorkloadWithAttribute; the 8-GPR adapter
+     * stored 1. */
+    {
+        memset(vm_base+0xC100,1,8);
+        attr_args(0xC000,0xC100,0xD000);
+        vm_write64(0xD000+112,5);
+        hle_workload_attribute_initialize(&g_attr_ctx);
+        assert(g_attr_ctx.gpr[3]==0);
+        assert(vm_read32(0xC000+WKATTR_MAX_CONT)==5);
+        assert(cellSpursAddWorkloadWithAttribute((CellSpurs*)0x1000,(u32*)0x8200,
+                                                 (const CellSpursWorkloadAttribute*)0xC000)==0);
+        const u32 w=vm_read32(0x8200);
+        assert(w<16);
+        assert(vm_read8(0x1000+SPURS_WKL_MAXCONT+w)==5);
+        puts("SPURS workload attribute maxContention from the stack reaches the instance PASS");
     }
     /* Both instances run hold_policy (the same image at 0x9000), so an SPU of
      * either may sit in it; finalize answers BUSY until the gate lets it exit.

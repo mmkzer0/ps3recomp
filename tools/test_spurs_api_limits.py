@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""cellSpurs argument limits (maxContention clamp, RequestIdleSpu workload check, GetInfo's SPU thread ids)."""
+"""cellSpurs argument limits (maxContention clamp, RequestIdleSpu workload check, GetInfo's SPU thread ids) and the
+workload attribute's ninth argument (maxContention from the guest stack, #646) with its guest-range stops."""
 import os
 import platform
 import subprocess

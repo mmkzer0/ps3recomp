@@ -2234,6 +2234,14 @@ s32 _cellSpursWorkloadAttributeInitialize(u64 attr_ea, u32 revision, u32 sdkVers
 {
     /* 0x0200A000: null attribute 0x80410811, misalignment 0x80410810. */
     if (!attr_ea) return CELL_SPURS_POLICY_MODULE_ERROR_NULL_POINTER;
+    /* The stores below cover the attribute's first WKATTR_HOOK_ARG + 4 bytes and
+     * the priorities' 8, at EAs the title chose: both spans are bounded before
+     * the first access (HLE-only: lv2 would fault, there is no error code). */
+    if (attr_ea > UINT32_MAX || !spurs_guest_range_valid((u32)attr_ea, WKATTR_HOOK_ARG + 4u))
+        ps3_stop_guest_range("_cellSpursWorkloadAttributeInitialize", "attr", attr_ea, WKATTR_HOOK_ARG + 4u,
+                             vm_guest_limit());
+    if (prio_ea && (prio_ea > UINT32_MAX || !spurs_guest_range_valid((u32)prio_ea, 8u)))
+        ps3_stop_guest_range("_cellSpursWorkloadAttributeInitialize", "priority", prio_ea, 8u, vm_guest_limit());
     vm_write32((u32)attr_ea + WKATTR_REVISION,   revision);
     vm_write32((u32)attr_ea + WKATTR_SDKVERSION, sdkVersion);
     vm_write32((u32)attr_ea + WKATTR_PM,         (u32)pm_ea);
@@ -2257,7 +2265,8 @@ s32 _cellSpursWorkloadAttributeInitialize(u64 attr_ea, u32 revision, u32 sdkVers
  * adapter can't see it and the version above stores 1. That ran every WWS job
  * list on one SPU at a time: MLB The Show 16 sizes its mesh vertex rings for
  * several SPUs sharing a list, and with one they overflowed every frame and the
- * jobs waited on the GPU for ring space it could not free. */
+ * jobs waited on the GPU for ring space it could not free. (Upstream #646;
+ * ppu_sysprx_register() calls cellSpurs_register_ctx_handlers().) */
 #include "../../runtime/ppu/ppu_context.h"
 static void hle_workload_attribute_initialize(ppu_context* ctx)
 {
@@ -2265,7 +2274,15 @@ static void hle_workload_attribute_initialize(ppu_context* ctx)
                                                    ctx->gpr[6], (u32)ctx->gpr[7], ctx->gpr[8],
                                                    ctx->gpr[9], (u32)ctx->gpr[10]);
     if (rc == CELL_OK) {
-        u32 maxc = (u32)vm_read64((u32)ctx->gpr[1] + 112u);   /* first stack argument slot */
+        /* 64-bit PowerPC ELF ABI: the caller's parameter save area starts 48
+         * bytes above r1 and holds a doubleword per argument, r3..r10's eight
+         * first, so the ninth is at r1 + 112. The slot is read as guest memory
+         * like any other span the title chose. */
+        const u64 slot = (u64)(u32)ctx->gpr[1] + 112u;
+        if (slot > UINT32_MAX || !spurs_guest_range_valid((u32)slot, 8u))
+            ps3_stop_guest_range("_cellSpursWorkloadAttributeInitialize", "maxContention", slot, 8u,
+                                 vm_guest_limit());
+        u32 maxc = (u32)vm_read64((u32)slot);
         vm_write32((u32)ctx->gpr[3] + WKATTR_MAX_CONT, maxc);
     }
     ctx->gpr[3] = (u64)(s64)rc;
