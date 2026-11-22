@@ -1075,8 +1075,10 @@ static int host_grow_file(const char* path, uint64_t size)
  * size").
  *
  * This allocates; it never shrinks, and a file already long enough costs one
- * stat (LBP calls it repeatedly while it warms its cache). A missing file keeps
- * the previous answer, CELL_OK with nothing created. */
+ * stat (LBP calls it repeatedly while it warms its cache). A missing file is
+ * not created and answers CELL_ENOENT: RPCS3 6e4b784d1 returns sys_fs_truncate's
+ * answer for the path (cellFs.cpp:629-660, sys_fs.cpp:3038); CELL_OK here told
+ * the title its cache file existed. */
 static void cellFsAllocateFileAreaWithoutZeroFill(ppu_context* ctx)
 {
     char gpath[1024], hpath[1100];
@@ -1088,7 +1090,7 @@ static void cellFsAllocateFileAreaWithoutZeroFill(ppu_context* ctx)
         fprintf(stderr, "[fs] AllocateFileAreaWithoutZeroFill '%s' -> '%s' size=0x%llX (%s)\n",
                 gpath, hpath, (unsigned long long)size,
                 rc == 0 ? "OK" : rc > 0 ? "no such file" : "FAIL");
-    ctx->gpr[3] = rc < 0 ? (uint64_t)(int64_t)CELL_FS_EIO : CELL_OK;
+    ctx->gpr[3] = rc == 0 ? CELL_OK : (uint64_t)(int64_t)(rc > 0 ? CELL_FS_ENOENT : CELL_FS_EIO);
 }
 
 /* Free space for (path, u32* block_size, u64* free_block_count). Unregistered,

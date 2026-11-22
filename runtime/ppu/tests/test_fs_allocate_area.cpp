@@ -6,7 +6,7 @@
  * is short. Drives the handler through ppu_fs.cpp and checks:
  *   - a short file grows to the size, keeps its data, and reads the new space as zeroes;
  *   - a file already longer is left as it is;
- *   - a missing file is not created, and the call still returns CELL_OK.
+ *   - a missing file is not created, and the call answers CELL_ENOENT.
  *
  *   tools/test_ppu_fs_allocate_area.py [--exe-out PATH]
  *   test_fs_allocate_area [DIR]   (DIR: where the files go; default the system temp directory)
@@ -116,9 +116,10 @@ int main(int argc, char** argv)
     CHECK(rc == 0 && host_size(longer) == 10, "longer file: CELL_OK, size %lld (want 10)",
           (long long)host_size(longer));
 
-    /* A missing file is not created. */
+    /* A missing file is not created, and the call answers CELL_ENOENT (RPCS3; DECISIONS F19). */
     rc = allocate("/dev_hdd1/ps3recomp_fs_area_missing.bin", GROW);
-    CHECK(rc == 0 && host_size(missing) < 0, "missing file: CELL_OK, nothing created");
+    CHECK(rc == (uint32_t)CELL_FS_ENOENT && host_size(missing) < 0,
+          "missing file: CELL_ENOENT (0x%08X), nothing created", rc);
 
     remove(shorter);
     remove(longer);
