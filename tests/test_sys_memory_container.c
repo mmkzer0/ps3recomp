@@ -56,11 +56,13 @@ static int64_t user_memory(uint32_t* total,uint32_t* avail) {
 typedef struct { uint32_t out; unsigned ok, esrch, other; } racer;
 static atomic_uint s_race_cid;
 static atomic_int s_race_stop;
+static atomic_uint s_race_tries;   /* allocation calls the racers have started, all rounds */
 static void* alloc_racer(void* p) {
  racer* r=(racer*)p;
  while (!atomic_load_explicit(&s_race_stop,memory_order_acquire)) {
    const uint32_t cid=atomic_load_explicit(&s_race_cid,memory_order_acquire);
    if (!cid) { sched_yield(); continue; }
+   atomic_fetch_add_explicit(&s_race_tries,1,memory_order_relaxed);
    ppu_context c={0};c.gpr[3]=MB;c.gpr[4]=cid;c.gpr[5]=0x400;
    c.gpr[6]=r->out;
    const int64_t rc=sys_memory_allocate_from_container(&c);
@@ -80,8 +82,12 @@ static int race_allocate_against_destroy(void) {
  for (unsigned round=0;round<ROUNDS&&!bad;++round) {
    if (create(4*MB)!=CELL_OK) { bad=1; break; }
    const uint32_t cid=rd(OUT);
+   const unsigned tries=atomic_load_explicit(&s_race_tries,memory_order_relaxed);
    atomic_store_explicit(&s_race_cid,cid,memory_order_release);
-   sched_yield();
+   /* Published until a racer has started an allocation (bounded), so the round races. One sched_yield could pass
+    * with no racer scheduled, and the case then raced nothing and still passed. */
+   for (unsigned spin=0;spin<100000&&atomic_load_explicit(&s_race_tries,memory_order_relaxed)==tries;++spin)
+     sched_yield();
    atomic_store_explicit(&s_race_cid,0,memory_order_release);   /* no new allocation; those in flight race on */
    int64_t rc;
    while ((rc=destroy(cid))==(int64_t)(int32_t)CELL_EBUSY) sched_yield();
@@ -92,6 +98,7 @@ static int race_allocate_against_destroy(void) {
  for (unsigned i=0;i<THREADS;++i) { pthread_join(th[i],NULL); other+=rs[i].other; ok+=rs[i].ok; esrch+=rs[i].esrch; }
  printf("allocate vs destroy: %u rounds, %u allocations, %u ESRCH\n",(unsigned)ROUNDS,ok,esrch);
  CHECK(!bad); CHECK(other==0);
+ CHECK(ok+esrch>0);   /* some allocation met a live or a destroyed container: the case raced */
  uint32_t total,avail;
  CHECK(user_memory(&total,&avail)==CELL_OK); CHECK(total==USER_TOTAL&&avail==USER_TOTAL);
  return 0;
