@@ -92,6 +92,7 @@
 #define M_VERTEX_TEXTURE        0x0900  /* + unit * 0x20 (8-word unit block) */
 #define M_SCISSOR_HORIZONTAL    0x08C0  /* x[0:15] | width[16:31]; vertical at +4 */
 #define M_FREQ_DIVIDER_OP       0x1FC0
+#define M_POINT_SIZE            0x1EE0  /* f32, pixels */
 #define M_TRANSFORM_BRANCH_BITS 0x1FF8
 #define M_FP_ACTIVE_PROGRAM     0x08E4  /* offset | dma-context [1:0]        */
 #define M_FP_CONTROL            0x1D60
@@ -268,6 +269,8 @@ static void dsp_fill_classes(dsp_class_table* t)
     mark_class(t, M_VERTEX_TEXTURE, RSX_DSP_NUM_VERTEX_TEXTURES * 8, RSX_DSP_CLASS_STATE);
     mark_class(t, M_FREQ_DIVIDER_OP, 1, RSX_DSP_CLASS_STATE);
     mark_class(t, M_TRANSFORM_BRANCH_BITS, 1, RSX_DSP_CLASS_STATE);
+    /* 0x1EE0 point size            rsx_draw_engine.c eng_point_row: the vp_pointsize row's .x */
+    mark_class(t, M_POINT_SIZE, 1, RSX_DSP_CLASS_STATE);
 
     /* Explicit no-ops: the vertex cache invalidate hint and the reserved
      * NOP method carry no state the replay harness needs (there is no CPU

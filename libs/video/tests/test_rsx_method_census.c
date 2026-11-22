@@ -408,9 +408,10 @@ int main(void)
      * v0.19.0 (#693): SET_ZMIN_MAX_CONTROL (0x1D78) is read by the engine's render state (depth clamp), so
      * its row is a consumer, no longer an allow-listed value. One more since v0.20.0 (#782):
      * SET_BLEND_COLOR2 (0x037C) carries the blend constant's B and A on a half-float target, which the
-     * engine reads. */
-    check(st.handled == 45, "45 writes are consumed by a named consumer");
-    check(st.inert == 176, "176 writes are allow-listed for the value they carry");
+     * engine reads. One more since the Vulkan half of #813: SET_POINT_SIZE (0x1EE0) is the engine's
+     * vp_pointsize row (eng_point_row), a consumer at every value, no longer an inert pin at 1.0. */
+    check(st.handled == 46, "46 writes are consumed by a named consumer");
+    check(st.inert == 175, "175 writes are allow-listed for the value they carry");
     check(st.missing == 0, "no census write is a known gap: the S2 gaps the census once carried all have consumers");
     check(st.handled + st.inert + st.missing == 221, "...and the three classes cover every write (214 pairs + 7 binds)");
 

@@ -391,8 +391,10 @@ static const rsx_method_rule rsx_method_rules[] = {
     INERT_V(RSX_CLASS_NV4097, 0x1E98, 1, 0x01000000, 0xFFFFFFFF, RSX_EV_ORACLE_VALUE, "NV4097_SET_RENDER_ENABLE",
             "the VPE render-enable word; the engine runs the vertex program unconditionally (libgcm titles "
             "always bind one, and RPCS3's set_render_mode only tracks which pipe emits). Value = reset"),
-    INERT_V(RSX_CLASS_NV4097, 0x1EE0, 1, 0x3F800000, 0xFFFFFFFF, RSX_EV_ORACLE_VALUE, "NV4097_SET_POINT_SIZE",
-            "point size 1.0 at reset; the engine draws POINTS as 1-px points, which is 1.0"),
+    HANDLED(RSX_CLASS_NV4097, 0x1EE0, 1, RSX_EV_CONSUMER, "NV4097_SET_POINT_SIZE",
+            "rsx_draw_engine.c eng_point_row (sink_end): the f32 size in pixels, the vp_pointsize row's .x "
+            "that Metal ([[point_size]], #813) and Vulkan (PointSize) draw a point with; the vertex "
+            "program's own size replaces it when the output mask says it writes one"),
     INERT_V(RSX_CLASS_NV4097, 0x1EE4, 2, 0, 0xFFFFFFFF, RSX_EV_ORACLE_VALUE, "NV4097_SET_POINT_PARAMS_ENABLE",
             "point parameters/sprite enable, both 0 at reset; point sprites need a sprite coordinate the "
             "engine does not generate, and the reset value asks for none"),
