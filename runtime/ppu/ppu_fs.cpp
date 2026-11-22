@@ -168,6 +168,27 @@ static void guest_strcpy(char* dst, uint32_t gaddr, size_t cap)
  * translators. (extern "C" is ill-formed at block scope.) */
 extern "C" void ps3_vfs_ps3game_fallback(char* path, size_t cap);
 
+/* A host path that does not fit its buffer is a different path: unlink, open and mkdir would act on the cut one.
+ * There is no truncation that is safe, so it is the named stop (host-path-limit), as cellGame.c makes of its own.
+ * Every handler builds its host path through host_path below, so every handler is covered. */
+[[noreturn]] static void host_path_stop(int need, size_t cap)
+{
+    char need_s[16], limit_s[16];
+    snprintf(need_s, sizeof need_s, "%d", need);
+    snprintf(limit_s, sizeof limit_s, "%zu", cap - 1);
+    const ps3_stop_field f[] = { {"func", "host_path"}, {"need", need_s}, {"limit", limit_s} };
+    ps3_stop(PS3_STOP_HOST_PATH_LIMIT, "a cellFs host path does not fit its buffer",
+             "shorten the VFS root or the guest path", f, 3, nullptr);
+}
+/* `need` is what snprintf wanted: the path fits iff it is below the buffer size. */
+static inline void host_path_fit(int need, size_t cap)
+{
+    if (need < 0 || (size_t)need >= cap) host_path_stop(need, cap);
+}
+
+/* RPCS3's CELL_FS_MAX_FS_PATH_LENGTH: the longest guest path, in characters. */
+#define FS_PATH_LENGTH_MAX 1024
+
 /* Translate a guest path to a host path under ppu_vfs_root. Known PS3 mount
  * prefixes are stripped; the rest is appended to the root. */
 static void host_path(char* out, size_t cap, const char* guest)
@@ -190,7 +211,7 @@ static void host_path(char* out, size_t cap, const char* guest)
     static const char* hdd0_root = nullptr; static int hdd0_init = 0;
     if (!hdd0_init) { hdd0_root = ps3_env_once("PS3_HDD0_ROOT"); hdd0_init = 1; }
     if (hdd0_root && strncmp(guest, "/dev_hdd0/", 10) == 0) {
-        snprintf(out, cap, "%s/%s", hdd0_root, guest + 10);
+        host_path_fit(snprintf(out, cap, "%s/%s", hdd0_root, guest + 10), cap);
         for (char* p = out; *p; p++) if (*p == '\\') *p = '/';
         return;
     }
@@ -204,7 +225,7 @@ static void host_path(char* out, size_t cap, const char* guest)
     static const char* hdd1_root = nullptr; static int hdd1_init = 0;
     if (!hdd1_init) { hdd1_root = ps3_env_once("PS3_HDD1_ROOT"); hdd1_init = 1; }
     if (hdd1_root && *hdd1_root && strncmp(guest, "/dev_hdd1/", 10) == 0) {
-        snprintf(out, cap, "%s/%s", hdd1_root, guest + 10);
+        host_path_fit(snprintf(out, cap, "%s/%s", hdd1_root, guest + 10), cap);
         for (char* p = out; *p; p++) if (*p == '\\') *p = '/';
         return;
     }
@@ -218,6 +239,9 @@ static void host_path(char* out, size_t cap, const char* guest)
         const char* fw = ps3_env_once("PS3_DEV_FLASH");
         if (!fw || !*fw) fw = "D:/recomp/tools/rpcs3/dev_flash";
         ps3_dev_flash_path(out, cap, fw, guest + 11);
+        /* The helper formats the path itself and does not say how long it wanted: a result that fills the buffer
+         * may be cut, so it is refused too (one character short of the limit, never a different path). */
+        host_path_fit((int)strlen(out) + 1, cap);
         for (char* p = out; *p; p++) if (*p == '\\') *p = '/';
         return;
     }
@@ -248,7 +272,7 @@ static void host_path(char* out, size_t cap, const char* guest)
         }
     }
     if (rel == guest && guest[0] == '/') rel = guest + 1;   /* strip leading '/' */
-    snprintf(out, cap, "%s/%s", ppu_vfs_root, rel);
+    host_path_fit(snprintf(out, cap, "%s/%s", ppu_vfs_root, rel), cap);
     for (char* p = out; *p; p++) if (*p == '\\') *p = '/';
     ps3_vfs_ps3game_fallback(out, cap);
 }
@@ -1136,8 +1160,16 @@ static void cellFsUnlink(ppu_context* ctx)
      * never ends inside guest memory. */
     if (!address) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EFAULT; return; }
     if (!fs_range_ok(address, 1)) fs_range_stop("cellFsUnlink", "path", address, 1);
-    char guest[1024], host[1100];
-    guest_strcpy(guest, address, sizeof guest);
+    /* RPCS3 translate_to_str (sys_fs.cpp:1107-1130): up to CELL_FS_MAX_FS_PATH_LENGTH (1024) characters, and
+     * CELL_ENAMETOOLONG when no NUL is found in the first 1025 bytes. cellFsUnlink is sys_fs_unlink
+     * (cellFs.cpp:160-166). guest_strcpy would cut the string at its buffer and unlink a different file. */
+    char guest[FS_PATH_LENGTH_MAX + 1], host[1100];
+    for (size_t i = 0;; i++) {
+        if (i > FS_PATH_LENGTH_MAX) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ENAMETOOLONG; return; }
+        if (!fs_range_ok((uint64_t)address + i, 1)) fs_range_stop("cellFsUnlink", "path", (uint64_t)address + i, 1);
+        guest[i] = (char)vm_base[address + i];
+        if (!guest[i]) break;
+    }
     host_path(host, sizeof host, guest);
     /* The answer is sys_fs_unlink's (include/ps3emu/fs_unlink.h): ENOENT for a missing path, EISDIR for a
      * directory, EIO for any other refusal. */

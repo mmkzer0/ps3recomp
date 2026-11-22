@@ -381,6 +381,21 @@ void ps3_vfs_ps3game_fallback(char* path, size_t cap)
     snprintf(path, cap, "%s", alt);
 }
 
+/* A host path that does not fit its buffer is a different path: unlink, open and mkdir would act on the cut one.
+ * There is no truncation that is safe, so it is the named stop (host-path-limit), as cellGame.c makes of its own.
+ * `need` is what snprintf wanted: the path fits iff it is below the buffer size. Every sys_fs handler builds its
+ * host path through sys_fs_translate_path, so every handler is covered. */
+static void fs_host_fit(int need, int cap)
+{
+    if (need >= 0 && need < cap) return;
+    char need_s[16], limit_s[16];
+    snprintf(need_s, sizeof need_s, "%d", need);
+    snprintf(limit_s, sizeof limit_s, "%d", cap - 1);
+    const ps3_stop_field f[] = { {"func", "sys_fs_translate_path"}, {"need", need_s}, {"limit", limit_s} };
+    ps3_stop(PS3_STOP_HOST_PATH_LIMIT, "a sys_fs host path does not fit its buffer",
+             "shorten the VFS root or the guest path", f, 3, NULL);
+}
+
 void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size)
 {
     /* /dev/null / dev/null device mapping */
@@ -407,7 +422,7 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
         static const char* hdd0_root = NULL; static int hdd0_init = 0;
         if (!hdd0_init) { hdd0_root = getenv("PS3_HDD0_ROOT"); hdd0_init = 1; }
         if (hdd0_root && strncmp(ps3_path, "/dev_hdd0/", 10) == 0) {
-            snprintf(host_path, (size_t)host_path_size, "%s/%s", hdd0_root, ps3_path + 10);
+            fs_host_fit(snprintf(host_path, (size_t)host_path_size, "%s/%s", hdd0_root, ps3_path + 10), host_path_size);
             fs_normalize_sep(host_path);
             return;
         }
@@ -420,7 +435,7 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
         static const char* hdd1_root = NULL; static int hdd1_init = 0;
         if (!hdd1_init) { hdd1_root = getenv("PS3_HDD1_ROOT"); hdd1_init = 1; }
         if (hdd1_root && *hdd1_root && strncmp(ps3_path, "/dev_hdd1/", 10) == 0) {
-            snprintf(host_path, (size_t)host_path_size, "%s/%s", hdd1_root, ps3_path + 10);
+            fs_host_fit(snprintf(host_path, (size_t)host_path_size, "%s/%s", hdd1_root, ps3_path + 10), host_path_size);
             fs_normalize_sep(host_path);
             return;
         }
@@ -436,6 +451,9 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
         if (!fw_init) { fw = getenv("PS3_DEV_FLASH"); fw_init = 1; }
         if (fw && *fw && strncmp(ps3_path, "/dev_flash/", 11) == 0) {
             ps3_dev_flash_path(host_path, (size_t)host_path_size, fw, ps3_path + 11);
+            /* The helper formats the path itself and does not say how long it wanted: a result that fills the
+             * buffer may be cut, so it is refused too (one character short of the limit, never a different path). */
+            fs_host_fit((int)strlen(host_path) + 1, host_path_size);
             fs_normalize_sep(host_path);
             return;
         }
@@ -471,7 +489,7 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
          * "failed" on every boot. Opt-in so flattened trees keep the old path. */
         const char* ub = getenv("PS3_USRDIR_BASE");
         if (ub && *ub) {
-            snprintf(host_path, (size_t)host_path_size, "%s/%s", ub, usrp);
+            fs_host_fit(snprintf(host_path, (size_t)host_path_size, "%s/%s", ub, usrp), host_path_size);
             fs_normalize_sep(host_path);
             return;
         }
@@ -493,7 +511,7 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
         }
     }
 
-    snprintf(host_path, (size_t)host_path_size, "%s/%s", g_sys_fs_root, rel);
+    fs_host_fit(snprintf(host_path, (size_t)host_path_size, "%s/%s", g_sys_fs_root, rel), host_path_size);
     fs_normalize_sep(host_path);
     /* NOTE: do NOT stat() the direct path and fall back to the dev_hdd0 junction
      * on failure. stat() intermittently returns ENOENT for an existing file here
@@ -512,10 +530,10 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
         const char* usr = strstr(ps3_path, "/USRDIR/");
         if (usr) {
             char alt[1024];
-            snprintf(alt, sizeof(alt), "%s/extracted/USRDIR/%s", g_sys_fs_root, usr + 8);
+            const int alt_n = snprintf(alt, sizeof(alt), "%s/extracted/USRDIR/%s", g_sys_fs_root, usr + 8);
             fs_normalize_sep(alt);
-            if (stat(alt, &st) == 0)
-                snprintf(host_path, (size_t)host_path_size, "%s", alt);
+            if (alt_n >= 0 && (size_t)alt_n < sizeof(alt) && stat(alt, &st) == 0)
+                fs_host_fit(snprintf(host_path, (size_t)host_path_size, "%s", alt), host_path_size);
         }
     }
 
@@ -536,10 +554,11 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
      * absolute but still means "relative to my USRDIR". */
     if (stat(host_path, &st) != 0) {
         char alt2[1024];
-        snprintf(alt2, sizeof(alt2), "%s/USRDIR/%s", g_sys_fs_root, rel);
+        const int alt2_n = snprintf(alt2, sizeof(alt2), "%s/USRDIR/%s", g_sys_fs_root, rel);
         fs_normalize_sep(alt2);
-        if (stat(alt2, &st) == 0)
-            snprintf(host_path, (size_t)host_path_size, "%s", alt2);
+        /* A cut candidate names a different file, which stat may well find: only a whole one is tried. */
+        if (alt2_n >= 0 && (size_t)alt2_n < sizeof(alt2) && stat(alt2, &st) == 0)
+            fs_host_fit(snprintf(host_path, (size_t)host_path_size, "%s", alt2), host_path_size);
     }
     ps3_vfs_ps3game_fallback(host_path, (size_t)host_path_size);
 }
@@ -1325,6 +1344,18 @@ int64_t sys_fs_unlink(ppu_context* ctx)
     if (path_addr == 0)
         return (int64_t)(int32_t)CELL_EINVAL;
 
+    /* RPCS3 6e4b784d1 translate_to_str (sys_fs.cpp:1107-1130): up to CELL_FS_MAX_FS_PATH_LENGTH characters, and
+     * CELL_ENAMETOOLONG when no NUL is found in the first 1025 bytes. The string is read through its guest span
+     * byte by byte: one that leaves guest memory is the named stop, and a long one is refused whole, never cut. */
+    for (uint32_t i = 0;; i++) {
+        if (i > SYS_FS_PATH_LENGTH_MAX)
+            return (int64_t)(int32_t)CELL_ENAMETOOLONG;
+        const uint64_t at = (uint64_t)path_addr + i;
+        if (at > UINT32_MAX)
+            ps3_stop_guest_range("sys_fs_unlink", "path", at, 1, vm_guest_limit());
+        fs_check_span("sys_fs_unlink", "path", (uint32_t)at, 1);
+        if (!*(const char*)vm_to_host((uint32_t)at)) break;
+    }
     const char* ps3_path = (const char*)vm_to_host(path_addr);
     char host_path[1024];
     sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));

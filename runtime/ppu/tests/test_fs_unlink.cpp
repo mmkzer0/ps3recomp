@@ -32,16 +32,55 @@ PS3_NORETURN void ps3_stop_guest_range(const char* func, const char* arg,
     fflush(stderr);
     _Exit(PS3_STOP_EXIT_CODE);
 }
+/* The generic stop, for host_path's host-path-limit: the same machine-line idea, the kind as its number. */
+PS3_NORETURN void ps3_stop(ps3_stop_kind kind, const char*, const char*, const ps3_stop_field* fields,
+                           size_t nfields, const ps3_stop_site*)
+{
+    fprintf(stderr, "kind=%d", (int)kind);
+    for (size_t i = 0; i < nfields; i++) fprintf(stderr, " %s=%s", fields[i].key, fields[i].value);
+    fputc('\n', stderr);
+    fflush(stderr);
+    _Exit(PS3_STOP_EXIT_CODE);
 }
+}
+
+#ifndef _WIN32
+/* Run `body` in a forked child and report whether it ended in a stop (the fixture's stops exit with
+ * PS3_STOP_EXIT_CODE) and what it wrote to stderr. */
+struct ChildResult { bool stopped; std::string err; };
+template <class F> static ChildResult run_child(F body)
+{
+    int fds[2];
+    if (pipe(fds) != 0) return {false, {}};
+    const pid_t pid = fork();
+    if (pid == 0) {
+        close(fds[0]); dup2(fds[1], STDERR_FILENO); close(fds[1]);
+        body();
+        _exit(1);   /* returned: nothing was refused */
+    }
+    close(fds[1]);
+    std::string err;
+    char bytes[512];
+    ssize_t n;
+    while ((n = read(fds[0], bytes, sizeof bytes)) > 0) err.append(bytes, (size_t)n);
+    close(fds[0]);
+    int status = 0;
+    waitpid(pid, &status, 0);
+    return {WIFEXITED(status) && WEXITSTATUS(status) == PS3_STOP_EXIT_CODE, err};
+}
+#endif
 
 int main(int argc, char** argv)
 {
     if (argc != 2) return 90;
     const auto root = std::filesystem::path(argv[1]);
+    /* Relative, with the cwd at the root: the long-path cases below need a host path under any host's PATH_MAX. */
+    std::filesystem::create_directories(root);
+    std::filesystem::current_path(root);
 #ifdef _WIN32
-    _putenv_s("PS3_HDD1_ROOT", root.string().c_str());
+    _putenv_s("PS3_HDD1_ROOT", ".");
 #else
-    setenv("PS3_HDD1_ROOT", root.string().c_str(), 1);
+    setenv("PS3_HDD1_ROOT", ".", 1);
 #endif
     std::filesystem::create_directories(root / "cache");
     const auto stale = root / "cache/stale.idx";
@@ -63,26 +102,12 @@ int main(int argc, char** argv)
     /* A pointer outside guest memory, and a string that never ends inside it, are named stops: the console
      * faults on them, so there is no code to answer with (it was EFAULT for the first). */
     const auto stops = [&](uint32_t address, const char* arg) {
-        int fds[2];
-        if (pipe(fds) != 0) return false;
-        const pid_t pid = fork();
-        if (pid == 0) {
-            close(fds[0]); dup2(fds[1], STDERR_FILENO); close(fds[1]);
+        const auto r = run_child([&] {
             ppu_context child{};
             child.gpr[3] = address; cellFsUnlink(&child);
-            _exit(1);   /* returned: nothing was refused */
-        }
-        close(fds[1]);
-        std::string err;
-        char bytes[512];
-        ssize_t n;
-        while ((n = read(fds[0], bytes, sizeof bytes)) > 0) err.append(bytes, (size_t)n);
-        close(fds[0]);
-        int status = 0;
-        waitpid(pid, &status, 0);
-        return WIFEXITED(status) && WEXITSTATUS(status) == PS3_STOP_EXIT_CODE &&
-               err.find("kind=hle-guest-range") != std::string::npos &&
-               err.find(std::string("arg=") + arg) != std::string::npos;
+        });
+        return r.stopped && r.err.find("kind=hle-guest-range") != std::string::npos &&
+               r.err.find(std::string("arg=") + arg) != std::string::npos;
     };
     if (!stops(sizeof memory, "path")) return 45;
     memset(memory + sizeof memory - 8, 'a', 8);   /* 8 bytes up to the end of memory, no NUL */
@@ -94,6 +119,43 @@ int main(int argc, char** argv)
     ctx.gpr[3] = 256; cellFsUnlink(&ctx);
     if ((int32_t)ctx.gpr[3] != (int32_t)CELL_EISDIR || !std::filesystem::is_directory(root / "cache")) return 46;
     if (!std::filesystem::exists(original)) return 44;
+
+    /* RPCS3 translate_to_str (sys_fs.cpp:1107-1130): a path of up to 1024 characters is whole, one of 1025 is
+     * CELL_ENAMETOOLONG. The leaf is what tells: "./" padding is invisible to the host, so the file "nn" is the
+     * 1024-character path, and the 1023-character prefix of both long paths names the file "n". The cwd is the
+     * root and PS3_HDD1_ROOT is ".", so the host path stays short enough for any host's PATH_MAX. */
+    {
+        std::string pad;
+        for (int i = 0; i < 506; i++) pad += "./";
+        const std::string p1024 = "/dev_hdd1/" + pad + "nn", p1025 = "/dev_hdd1/" + pad + "nnn";
+        if (p1024.size() != 1024 || p1025.size() != 1025) return 60;
+        for (const char* name : {"n", "nn", "nnn"}) std::ofstream(root / name) << "x";
+        memcpy(memory + 512, p1024.c_str(), p1024.size() + 1);
+        ctx.gpr[3] = 512; cellFsUnlink(&ctx);
+        if (ctx.gpr[3] != CELL_OK || std::filesystem::exists(root / "nn")) return 61;   /* the whole path, not cut */
+        if (!std::filesystem::exists(root / "n")) return 62;                            /* the prefix was not unlinked */
+        std::ofstream(root / "nn") << "x";
+        memcpy(memory + 512, p1025.c_str(), p1025.size() + 1);
+        ctx.gpr[3] = 512; cellFsUnlink(&ctx);
+        if ((int32_t)ctx.gpr[3] != (int32_t)CELL_ENAMETOOLONG) return 63;
+        for (const char* name : {"n", "nn", "nnn"})
+            if (!std::filesystem::exists(root / name)) return 64;                       /* nothing was unlinked */
+        for (const char* name : {"n", "nn", "nnn"}) std::filesystem::remove(root / name);
+    }
+#ifndef _WIN32
+    /* A host path that does not fit its buffer is the named stop, from host_path itself, not a cut path. */
+    {
+        static std::string long_root(1100, 'r');
+        strcpy((char*)memory + 256, "/dev_bdvd/x");
+        const auto r = run_child([&] {
+            ppu_vfs_root = long_root.c_str();
+            ppu_context child{};
+            child.gpr[3] = 256; cellFsUnlink(&child);
+        });
+        if (!r.stopped || r.err.find("kind=" + std::to_string((int)PS3_STOP_HOST_PATH_LIMIT)) == std::string::npos ||
+            r.err.find("func=host_path") == std::string::npos) return 65;
+    }
+#endif
     puts("PASS: stale cache removed; missing/null paths report errors; unrelated file preserved");
     return 0;
 }

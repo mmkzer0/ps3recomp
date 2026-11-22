@@ -1031,13 +1031,15 @@ s32 cellFsUnlink(const char* path)
     }
 
     /* The path is a string the title chose: it must start in guest memory and end inside it before anything reads
-     * it as a host string; outside guest memory the console faults, so there is no code to answer with. */
+     * it as a host string; outside guest memory the console faults, so there is no code to answer with. RPCS3
+     * 6e4b784d1 translate_to_str (sys_fs.cpp:1107-1130) takes up to CELL_FS_MAX_FS_PATH_LENGTH characters and
+     * answers CELL_ENAMETOOLONG when no NUL is found in the first 1025 bytes; the string was read on past them. */
     {
         const uint32_t ea = (uint32_t)(uintptr_t)path;
         const char* host_str = gpath(path);
         for (uint32_t n = 0; host_str; n++) {
             const uint64_t at = (uint64_t)ea + n;
-            if (n >= CELL_FS_MAX_FS_PATH_LENGTH) break;
+            if (n > CELL_FS_MAX_FS_PATH_LENGTH) return (s32)CELL_ENAMETOOLONG;
             if (at > UINT32_MAX || !vm_range_ok((uint32_t)at, 1))
                 ps3_stop_guest_range("cellFsUnlink", "path", at, 1, vm_guest_limit());
             if (!host_str[n]) break;

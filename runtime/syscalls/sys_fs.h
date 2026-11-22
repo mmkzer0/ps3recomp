@@ -30,6 +30,8 @@ extern "C" {
 /* Maximum open file descriptors / directory descriptors */
 #define SYS_FS_FD_MAX   256
 #define SYS_FS_DIR_MAX  64
+/* RPCS3's CELL_FS_MAX_FS_PATH_LENGTH: the longest guest path, in characters (its NUL is the 1025th byte). */
+#define SYS_FS_PATH_LENGTH_MAX 1024
 
 /* CellFsStat structure layout (as written to guest memory, all big-endian):
  *   u32 mode        @ 0
