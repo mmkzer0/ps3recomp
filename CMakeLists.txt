@@ -804,6 +804,16 @@ if(PS3RECOMP_BUILD_TESTS)
     endif()
     add_test(NAME vm_preserve COMMAND test_vm_preserve)
     set_tests_properties(vm_preserve PROPERTIES LABELS "memory;t0" TIMEOUT 60)
+    # A preserved read against a release that starts between its wait and its state load (SYNC-9),
+    # ordered with the PS3_SYNC_TEST_HOOKS points of vm_watch.c. POSIX: pthreads and the fault signal.
+    if(NOT WIN32)
+        add_executable(test_vm_preserve_race tests/test_vm_preserve_race.c runtime/memory/vm_watch.c)
+        target_include_directories(test_vm_preserve_race PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+        target_compile_definitions(test_vm_preserve_race PRIVATE PS3_SYNC_TEST_HOOKS)
+        target_link_libraries(test_vm_preserve_race PRIVATE Threads::Threads)
+        add_test(NAME vm_preserve_race COMMAND test_vm_preserve_race)
+        set_tests_properties(vm_preserve_race PROPERTIES LABELS "memory;t0" TIMEOUT 60)
+    endif()
     # PS3_LOG_FIRST, the saturating counter behind the "first n times" log lines.
     add_executable(test_log_first tests/test_log_first.c)
     target_include_directories(test_log_first PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")

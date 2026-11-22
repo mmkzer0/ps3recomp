@@ -79,6 +79,15 @@ static vm_preserve_stats_t s_pstats;
 #define BUMP() __atomic_add_fetch(&s_global, 1, __ATOMIC_ACQ_REL)
 #define COUNT(f, n) __atomic_add_fetch(&s_stats.f, (n), __ATOMIC_RELAXED)
 
+/* Ordering points for the race tests (test_vm_preserve_race), compiled out
+ * otherwise. The release point runs in the fault handler. */
+#ifdef PS3_SYNC_TEST_HOOKS
+extern int ps3_sync_test_hook(const char* point, uint32_t value);
+#define VM_WATCH_TEST_HOOK(point, page) ((void)ps3_sync_test_hook((point), (uint32_t)(page)))
+#else
+#define VM_WATCH_TEST_HOOK(point, page) ((void)0)
+#endif
+
 static uintptr_t host_of(uint64_t ea) { return (uintptr_t)vm_base + (uintptr_t)ea; }
 
 static int protect(size_t first, size_t count, int writable)
@@ -154,6 +163,7 @@ static int release(size_t p)
     uint8_t st = LOAD8(&s_state[p]);
     while (st & WATCHED) {
         if (CAS8(&s_state[p], &st, (uint8_t)((st & ~(WATCHED | PRESERVE)) | BUSY | EVER))) {
+            VM_WATCH_TEST_HOOK("vm.release.after_claim", p);
             if (st & PRESERVE) preserve(p);
             protect(p, 1, 1);
             __atomic_store_n(&s_epoch[p], BUMP(), __ATOMIC_RELEASE);
@@ -627,7 +637,13 @@ int vm_preserve_read(int session, uint32_t ea, void* dst, uint32_t len, uint32_t
                 break;
             }
             wait_not_busy(p);
+            VM_WATCH_TEST_HOOK("vm.preserve_read.after_wait", p);
             const uint8_t st = LOAD8(&s_state[p]);
+            VM_WATCH_TEST_HOOK("vm.preserve_read.after_load", p);
+            /* A write fault can start a release after the wait: WATCHED is
+             * already clear, but its copy is not yet published. The next
+             * attempt waits that release out. */
+            if (st & BUSY) continue;
             const uint64_t arm = __atomic_load_n(&s_arm[p], __ATOMIC_ACQUIRE);
             if (!(st & WATCHED) || arm > e) {
                 /* Released meanwhile: its copy was published before the
