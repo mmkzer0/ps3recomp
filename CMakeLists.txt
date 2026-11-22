@@ -1592,6 +1592,15 @@ if(PS3RECOMP_BUILD_TESTS)
             set_tests_properties(spu_mfc_context_engine spu_mfc_registries
                 PROPERTIES ENVIRONMENT "SANITIZERS=thread")
         endif()
+        # The SPU thread local-store window (0xF0000000 + spu_num * 0x100000): a GET or PUT there moves data between
+        # local stores, and a copy never runs into a context that a workload removal frees (#800; the TSan case).
+        add_test(NAME spu_thread_ls_dma
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_spu_thread_ls_dma.py")
+        set_tests_properties(spu_thread_ls_dma PROPERTIES LABELS "spu;t0;tsan" TIMEOUT 600)
+        if(PS3RECOMP_SANITIZE_THREAD)
+            set_tests_properties(spu_thread_ls_dma PROPERTIES ENVIRONMENT "SANITIZERS=thread")
+        endif()
         # An SPU PUT/PUTL into the registered guest store window (the RSX label
         # window) is counted and stops by name; a PUT outside it is untouched.
         add_test(NAME spu_label_window
