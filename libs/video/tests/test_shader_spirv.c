@@ -16,6 +16,7 @@
  * POSIX only (mkdtemp). Needs no GPU.
  */
 #include "../rsx_shader_spirv.h"
+#include "../rsx_vp_decompiler.h"   /* the PointSize pieces of the decompilers' HLSL */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -82,6 +83,34 @@ static void only_file(const char* dir, char* out, size_t size)
     if (n != 1) out[0] = 0;
 }
 
+/* 1 when the module decorates something BuiltIn PointSize: OpDecorate (opcode 71: target, decoration, value) or
+ * OpMemberDecorate (72: type, member, decoration, value), decoration 11 = BuiltIn, value 1 = PointSize. */
+static int has_point_size(const u32* w, u32 n)
+{
+    for (u32 i = 5; i < n;) {
+        const u32 op = w[i] & 0xFFFFu, len = w[i] >> 16;
+        if (!len || i + len > n) return 0;
+        if (op == 71u && len >= 4u && w[i + 2] == 11u && w[i + 3] == 1u) return 1;
+        if (op == 72u && len >= 5u && w[i + 3] == 11u && w[i + 4] == 1u) return 1;
+        i += len;
+    }
+    return 0;
+}
+
+/* The decompilers' vertex shape: VSOutput with the PointSize member, VPConst with the vp_pointsize row and the
+ * store, all behind RSX_POINT_SIZE_BUILTIN (rsx_vp_decompiler.h). */
+static const char* kVSPoint =
+    "struct VOut {\n    float4 pos : SV_Position;\n"
+    RSX_VP_HLSL_PSIZE_MEMBER
+    "};\n"
+    "cbuffer VPConst : register(b0) {\n    float4 vp_posscale;\n"
+    RSX_VP_HLSL_PSIZE_ROW
+    "};\n"
+    RSX_VP_HLSL_PSIZE_FUNC
+    "VOut main(float4 p : ATTR0) {\n    VOut Out;\n    Out.pos = p * vp_posscale;\n"
+    RSX_VP_HLSL_PSIZE_STORE("1.0")
+    "    return Out;\n}\n";
+
 int main(void)
 {
     u32 na = 0, nb = 0;
@@ -121,6 +150,17 @@ int main(void)
     check("... and again (not cached)", translate("float4 main( {", RSX_SHADER_STAGE_FRAGMENT, g_a, &na) != 0);
     s = stats();
     check("... counted as no translation", s.translations == 4);
+
+    /* The vertex stage is translated with RSX_POINT_SIZE_BUILTIN defined, so its SPIR-V writes PointSize (Vulkan
+     * leaves a point's size undefined otherwise); the same text as a program without the member has none. */
+    {
+        u32 nv = 0, nk = 0;
+        check("point size: the decompilers' vertex shape translates",
+              translate(kVSPoint, RSX_SHADER_STAGE_VERTEX, g_a, &nv) == 0);
+        check("... and its SPIR-V decorates PointSize", has_point_size(g_a, nv));
+        check("a vertex program without the member does not",
+              translate(kVS, RSX_SHADER_STAGE_VERTEX, g_b, &nk) == 0 && !has_point_size(g_b, nk));
+    }
 
     /* Disk. */
     char dir[] = "/tmp/ps3recomp_spirv_cache_XXXXXX";

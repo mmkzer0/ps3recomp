@@ -17,14 +17,16 @@
 
 #include "ps3emu/ps3types.h"
 
-/* Point size, Metal only.
+/* Point size, Metal and Vulkan.
  *
  * Metal leaves a point's size undefined unless the vertex function writes
- * [[point_size]], and the decompiled VSOutput has no such member. The
- * pieces below add one behind RSX_POINT_SIZE_BUILTIN. Only the HLSL-to-MSL
- * translator defines it (a glslang preamble in rsx_shader_msl.cpp), so the
- * D3D12 and Vulkan paths compile the text exactly as before: no member and
- * no extra constant row.
+ * [[point_size]], and Vulkan does the same unless the last vertex stage writes
+ * PointSize; the decompiled VSOutput has no such member. The pieces below add
+ * one behind RSX_POINT_SIZE_BUILTIN. The HLSL-to-MSL translator
+ * (rsx_shader_msl.cpp) and the HLSL-to-SPIR-V translator's vertex stage
+ * (rsx_shader_spirv.cpp) define it with a glslang preamble, so those paths get
+ * the member and the extra constant row; the D3D12 path compiles the text
+ * exactly as before: no member and no extra constant row.
  *
  * glslang's HLSL front end does not map the PSIZE semantic to the PointSize
  * built-in by itself (checked on glslang 16.6); [[vk::builtin("PointSize")]]
@@ -38,8 +40,9 @@
  *       output, o[6].x), else 0
  *   .z  largest size drawn, in pixels (RSX_VP_POINT_SIZE_MAX)
  *   .w  unused
- * The draw engine fills the row; a backend binding the translated MSL
- * supplies it as part of VPConst.
+ * The draw engine fills the row; a backend binding the translated MSL or
+ * SPIR-V supplies it as part of VPConst (the Vulkan backend also lowers .z to
+ * what the device draws: 1 without largePoints).
  *
  * Where the numbers come from:
  *   - the registers: docs/rsxfifo.txt in this tree lists SET_POINT_SIZE at

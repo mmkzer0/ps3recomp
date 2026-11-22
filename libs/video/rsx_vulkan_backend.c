@@ -262,6 +262,7 @@ typedef struct vk_state {
     int              depth_bounds_ok; /* depthBounds enabled                */
     int              depth_clamp_ok;  /* depthClamp enabled                 */
     int              indep_blend_ok;  /* independentBlend: per-target MRT state */
+    float            max_point_size;  /* largest PointSize the device draws: 1 without largePoints */
     u32              max_dim;         /* maxImageDimension2D of the device  */
     int              windowed;
 #ifdef _WIN32
@@ -1460,7 +1461,11 @@ static int vk_ensure_vertex_buffer(VkDeviceSize bytes)
 #define VK_FP_MAX_BYTES  4096u              /* bound on a fragment program, as Metal/D3D12 */
 #define VK_HLSL_BYTES    (256u * 1024u)
 #define VK_SPV_WORDS     (256u * 1024u)
-#define VK_VPCONST_BYTES ((RSX_MAX_VERTEX_CONSTANTS + 2u) * 16u)
+/* The 512 transform constants, then vp_posscale, vp_posoffset and vp_pointsize (the VPConst block the
+ * decompilers emit with RSX_POINT_SIZE_BUILTIN, which rsx_shader_spirv.cpp defines for the vertex stage). It
+ * was two rows after the constants (8224 bytes) before the PointSize built-in; the engine's block
+ * (ENG_VP_CB_BYTES) has always had the third. */
+#define VK_VPCONST_BYTES ((RSX_MAX_VERTEX_CONSTANTS + 3u) * 16u)
 #define VK_GUEST_ATTRS   16u
 #define VK_GUEST_FLOATS  (VK_GUEST_ATTRS * 4u)   /* per vertex */
 
@@ -1866,6 +1871,15 @@ static int vk_guest_draw(const rsx_state* st, u32 prim, u32 first, u32 count)
     vpx[4] = vpx[5] = vpx[7] = 0.0f;
     if (st->viewport_scale[2] != 0.0f) { vpx[2] = st->viewport_scale[2]; vpx[6] = st->viewport_offset[2]; }
     else                                { vpx[2] = 1.0f;                  vpx[6] = 0.0f; }
+    {
+        /* vp_pointsize. This path keeps no SET_POINT_SIZE (rsx_commands.c does not track it), so a point is
+         * one pixel unless the vertex program writes o[6].x and the output mask says so, as on Metal. */
+        float* psz = (float*)(vpc + (RSX_MAX_VERTEX_CONSTANTS + 2u) * 16u);
+        psz[0] = 1.0f;
+        psz[1] = (st->vertex_attrib_output_mask & RSX_VP_OUTPUT_MASK_POINT_SIZE) ? 1.0f : 0.0f;
+        psz[2] = RSX_VP_POINT_SIZE_MAX < s_vk.max_point_size ? RSX_VP_POINT_SIZE_MAX : s_vk.max_point_size;
+        psz[3] = 0.0f;
+    }
     /* PSConstants: inline constants as host-order bit patterns, then fp_alpha. */
     u8* fpc = (u8*)s_g.ubo.ptr + s_g.ps_off;
     memset(fpc, 0, fp_len);
@@ -4001,12 +4015,13 @@ static void vk_eng_bind_vs_constants(void* user, const void* data, u32 bytes)
 {
     (void)user;
     if (!s_g.on || !data || !vk_eng_ucpu()) { s_e2.vs_bytes = 0; return; }
-    /* The engine's block ends in the Metal translator's vp_pointsize row (one
-     * float4), which this backend's shaders do not declare
-     * (RSX_POINT_SIZE_BUILTIN is not defined for them): never read, so it is
-     * dropped here. A block longer than that is still reported below. */
+    /* The engine's block is the transform constants, vp_posscale, vp_posoffset and the vp_pointsize row
+     * (ENG_VP_CB_BYTES): the whole of VPConst, which the vertex stage declares with its PointSize
+     * built-in. A longer one is still reported below. */
+    _Static_assert(VK_VPCONST_BYTES == (RSX_DSP_NUM_CONSTANTS + 3u) * 16u,
+                   "VPConst is the engine's vertex constant block");
     if (bytes > VK_VPCONST_BYTES) {
-        if (bytes > VK_VPCONST_BYTES + 16u && !(s_e2.warned & 2u)) {
+        if (!(s_e2.warned & 2u)) {
             VK_LOG("engine: VS constants truncated\n");
             s_e2.warned |= 2u;
         }
@@ -4016,6 +4031,18 @@ static void vk_eng_bind_vs_constants(void* user, const void* data, u32 bytes)
     if (bytes > cap) { bytes = cap; if (!(s_e2.warned & 2u)) { VK_LOG("engine: VS constants truncated\n"); s_e2.warned |= 2u; } }
     memcpy(s_e2.ucpu, data, bytes);
     s_e2.vs_bytes = bytes;
+    if (bytes == VK_VPCONST_BYTES) {
+        /* The largest size the device draws: Vulkan takes a PointSize other than 1 only with largePoints,
+         * and then only up to pointSizeRange[1]. The shader already clamps to this row's z; the guest's
+         * larger size is reported once, not silently drawn smaller. */
+        float* psz = (float*)(s_e2.ucpu + (RSX_MAX_VERTEX_CONSTANTS + 2u) * 16u);
+        if (psz[2] > s_vk.max_point_size) psz[2] = s_vk.max_point_size;
+        if (psz[0] > s_vk.max_point_size && !(s_e2.warned & 512u)) {
+            VK_LOG("engine: point size %g exceeds what the device draws (%g%s); clamped\n",
+                   (double)psz[0], (double)s_vk.max_point_size, s_vk.max_point_size <= 1.0f ? ", no largePoints" : "");
+            s_e2.warned |= 512u;
+        }
+    }
 }
 static void vk_eng_bind_ps_constants(void* user, const void* data, u32 bytes)
 {
@@ -4751,6 +4778,15 @@ static int vk_init_all(u32 width, u32 height, const char* title)
      * have their own); without it every target takes target A's. */
     want.independentBlend = have.independentBlend;
     s_vk.indep_blend_ok = have.independentBlend ? 1 : 0;
+    /* PointSize other than 1: the vertex stage writes it (rsx_shader_spirv.cpp). Optional in Vulkan; without
+     * largePoints every point is one pixel, and the engine clamps its request to this (vk_eng_bind_vs_constants). */
+    {
+        VkPhysicalDeviceProperties pp;
+        pvkGetPhysicalDeviceProperties(s_vk.phys, &pp);
+        want.largePoints = have.largePoints;
+        s_vk.max_point_size = (have.largePoints && pp.limits.pointSizeRange[1] > 1.0f)
+                                  ? pp.limits.pointSizeRange[1] : 1.0f;
+    }
 
     VkPhysicalDevicePortabilitySubsetFeaturesKHR subset_enabled = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR,

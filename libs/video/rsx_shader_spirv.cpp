@@ -4,7 +4,7 @@
  * See rsx_shader_spirv.h for the binding contract. The front end is driven
  * exactly as rsx_shader_msl.cpp drives it (C++ API for setEntryPoint, Vulkan
  * rules, auto-mapped bindings and locations, then mapIO, legalized SPIR-V),
- * with three differences, all because the output goes to a Vulkan driver
+ * with four differences, all because the output goes to a Vulkan driver
  * rather than to spirv-cross:
  *
  *   - Vulkan 1.0 client, SPIR-V 1.0: the backend creates a 1.0 instance and
@@ -13,6 +13,11 @@
  *   - Texture and sampler registers are shifted apart (setShiftBinding),
  *     because Vulkan has one binding namespace per set.
  *   - The vertex stage flips Y (setInvertY): D3D clip space is +y up.
+ *   - The vertex stage is translated with RSX_POINT_SIZE_BUILTIN defined, as
+ *     rsx_shader_msl.cpp does: the decompiled VSOutput then carries a PointSize
+ *     built-in and VPConst a vp_pointsize row (rsx_vp_decompiler.h). Vulkan
+ *     leaves a point's size undefined when the last vertex stage does not write
+ *     PointSize, so without it SET_POINT_SIZE never reached a point.
  *
  * Translations are cached. glslang takes 20-150 ms per shader, on the thread
  * that walks the FIFO, and the engine asks for the same HLSL again for every
@@ -62,6 +67,14 @@ bool glslang_ready()
     return true;
 }
 
+/* SPIR-V FragCoord.w is 1/w (FXC's SV_POSITION.w is w): tells the FP
+ * decompiler's _rsx_inv_w helper which one it gets. The vertex stage also
+ * gets the PointSize built-in (rsx_vp_decompiler.h); setPreamble keeps the
+ * pointer, so both texts are static. */
+const char kFragmentPreamble[] = "#define RSX_FRAGCOORD_W_IS_RCP 1\n";
+const char kVertexPreamble[] = "#define RSX_FRAGCOORD_W_IS_RCP 1\n"
+                               "#define RSX_POINT_SIZE_BUILTIN 1\n";
+
 int translate(const char* hlsl, int stage, std::vector<unsigned int>& spirv,
               char* log, u32 log_size)
 {
@@ -81,9 +94,7 @@ int translate(const char* hlsl, int stage, std::vector<unsigned int>& spirv,
     shader.setEnvInput(glslang::EShSourceHlsl, lang, glslang::EShClientVulkan, 100);
     shader.setEnvClient(glslang::EShClientVulkan, glslang::EShTargetVulkan_1_0);
     shader.setEnvTarget(glslang::EShTargetSpv, glslang::EShTargetSpv_1_0);
-    /* SPIR-V FragCoord.w is 1/w (FXC's SV_POSITION.w is w): tells the FP
-     * decompiler's _rsx_inv_w helper which one it gets. */
-    shader.setPreamble("#define RSX_FRAGCOORD_W_IS_RCP 1\n");
+    shader.setPreamble(lang == EShLangVertex ? kVertexPreamble : kFragmentPreamble);
     shader.setEntryPoint("main");
     shader.setAutoMapBindings(true);
     shader.setAutoMapLocations(true);
