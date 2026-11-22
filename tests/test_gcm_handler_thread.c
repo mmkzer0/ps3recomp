@@ -125,8 +125,11 @@ int main(void)
         fprintf(stderr, "FAIL: the handler ran on the main thread\n");
         fails++;
     }
+    /* The configured size, not merely at least it: the default (256 MB on a desktop) is larger than this fixture's
+     * 64 MB, so a thread that ignored ppu.host_stack_mb would pass a lower bound. 1 MB of slack covers a platform
+     * that rounds the size up or counts a guard area in it. */
     const size_t got = atomic_load_explicit(&s_handler_stack, memory_order_relaxed);
-    if (got < want) {
+    if (got < want || got - want > (size_t)1024u * 1024u) {
         fprintf(stderr, "FAIL: the interrupt thread has a %zu KB stack, want the %zu KB (ppu.host_stack_mb) a PPU "
                 "thread gets\n", got / 1024, want / 1024);
         fails++;
