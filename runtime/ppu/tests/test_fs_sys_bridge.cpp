@@ -84,6 +84,7 @@ int64_t sys_fs_opendir(ppu_context*);
 int64_t sys_fs_readdir(ppu_context*);
 int64_t sys_fs_closedir(ppu_context*);
 int64_t sys_fs_ftruncate(ppu_context*);
+int64_t sys_fs_unlink(ppu_context*);
 extern char g_sys_fs_root[512];
 }
 /* ps3_dev_flash_path (runtime/platform), which both tables call for /dev_flash: the real one, it needs nothing. */
@@ -417,6 +418,76 @@ static void test_read_write_order()
     remove(host("bridge_a.bin").c_str());
 }
 
+/* "/dev_bdvd/" + "./" repeated + a name of 'n's: a guest path `total` characters long (1024 or 1025). The path names
+ * the file "nn" (1024) or "nnn" (1025), and its first 1023 characters name "n". */
+static std::string long_guest_path(size_t total)
+{
+    const size_t name = total % 2 == 0 ? 2 : 3;
+    std::string p = "/dev_bdvd/";
+    for (size_t pairs = (total - 10 - name) / 2; pairs; --pairs) p += "./";
+    return p + std::string(name, 'n');
+}
+static uint32_t child_rc(const ChildResult& r)
+{
+    const size_t at = r.err.find("rc=");
+    unsigned v = 0xFFFFFFFFu;
+    if (at != std::string::npos) sscanf(r.err.c_str() + at + 3, "%x", &v);
+    return v;
+}
+
+/* The unlinks' guest path limit and their host buffers. A guest path is up to 1024 characters (RPCS3 6e4b784d1
+ * translate_to_str, sys_fs.cpp:1107-1130) and the host path is a root in front of it: the unlinks translate into a
+ * host-sized buffer (PS3_FS_HOST_PATH_MAX), so a legal path under a long root is not a host-path-limit stop, while a
+ * host path past that buffer still is. Both families, cellFsUnlink and sys_fs_unlink (which had no fixture). */
+static void test_unlink_limits()
+{
+    const uint32_t PATH = 0x40000;
+    for (const char* name : {"n", "nn", "nnn"}) {
+        FILE* f = fopen(host(name).c_str(), "wb");
+        if (f) { fputs("x", f); fclose(f); }
+    }
+    /* 1025 characters: ENAMETOOLONG, and nothing is unlinked (the 1023-character prefix names "n"). */
+    put(PATH, long_guest_path(1025).c_str());
+    for (int sys = 0; sys < 2; ++sys) {
+        const uint32_t rc = sys ? sfs(sys_fs_unlink, PATH) : cfs(cellFsUnlink, PATH);
+        CHECK(rc == (uint32_t)CELL_ENAMETOOLONG, "%s: a 1025-character path is ENAMETOOLONG (0x%08X)",
+              sys ? "sys_fs_unlink" : "cellFsUnlink", rc);
+        CHECK(host_size("n") == 1 && host_size("nn") == 1 && host_size("nnn") == 1, "%s: ... and no file went",
+              sys ? "sys_fs_unlink" : "cellFsUnlink");
+    }
+
+#ifndef _WIN32
+    /* 1024 characters under a root of 500 (sys_fs) or 1500 (cellFs) characters is a host path past the 1024 and 1100
+     * bytes the buffers used to be: it reaches the host, which has no such file: ENOENT, not a stop. */
+    put(PATH, long_guest_path(1024).c_str());
+    for (int sys = 0; sys < 2; ++sys) {
+        const std::string root(sys ? 500 : 1500, 'r');
+        const auto r = run_child([&] {
+            uint32_t rc;
+            if (sys) { snprintf(g_sys_fs_root, sizeof g_sys_fs_root, "%s", root.c_str()); rc = sfs(sys_fs_unlink, PATH); }
+            else { ppu_vfs_root = root.c_str(); rc = cfs(cellFsUnlink, PATH); }
+            fprintf(stderr, "rc=%08X\n", rc);
+        });
+        CHECK(!r.stopped && child_rc(r) == (uint32_t)CELL_ENOENT, "%s: a 1024-character path under a %zu-character root is not a stop (rc 0x%08X, stopped %d: %s)",
+              sys ? "sys_fs_unlink" : "cellFsUnlink", root.size(), child_rc(r), (int)r.stopped, r.err.c_str());
+    }
+
+    /* A host path past the host buffer is still the named stop, never a cut path: the mount root is 4100 characters
+     * (PS3_HDD0_ROOT for sys_fs, set in main; ppu_vfs_root for cellFs). */
+    put(PATH, "/dev_hdd0/f");
+    auto r = run_child([&] { sfs(sys_fs_unlink, PATH); });
+    const std::string kind = "kind=" + std::to_string((int)PS3_STOP_HOST_PATH_LIMIT);
+    CHECK(r.stopped && says(r, kind.c_str()) && says(r, "func=sys_fs_translate_path"),
+          "sys_fs_unlink: a host path past its buffer is host-path-limit (stopped %d: %s)", (int)r.stopped, r.err.c_str());
+    put(PATH, "/dev_bdvd/f");
+    const std::string big(4100, 'v');
+    r = run_child([&] { ppu_vfs_root = big.c_str(); cfs(cellFsUnlink, PATH); });
+    CHECK(r.stopped && says(r, kind.c_str()) && says(r, "func=host_path"),
+          "cellFsUnlink: a host path past its buffer is host-path-limit (stopped %d: %s)", (int)r.stopped, r.err.c_str());
+#endif
+    for (const char* name : {"n", "nn", "nnn"}) remove(host(name).c_str());
+}
+
 static void test_directories()
 {
     Scratch s{0x1000};
@@ -560,11 +631,15 @@ int main(int argc, char** argv)
     g_dir = dir;
     ppu_vfs_root = dir;
     snprintf(g_sys_fs_root, sizeof g_sys_fs_root, "%s", dir);
+    /* sys_fs_translate_path reads PS3_HDD0_ROOT once, at its first call, so the over-long mount root of
+     * test_unlink_limits is set before any test runs. Nothing else here opens under /dev_hdd0. */
+    setenv("PS3_HDD0_ROOT", std::string(4100, 'h').c_str(), 1);
 
     test_cellfs_fd_through_sys_fs();
     test_sys_fs_fd_through_cellfs();
     test_access_modes();
     test_read_write_order();
+    test_unlink_limits();
     test_directories();
     test_distinct_numbers();
     verbose = false;   /* the concurrent rounds report failures only */

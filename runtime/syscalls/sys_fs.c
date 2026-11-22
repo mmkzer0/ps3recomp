@@ -529,7 +529,7 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
     if (stat(host_path, &st) != 0) {
         const char* usr = strstr(ps3_path, "/USRDIR/");
         if (usr) {
-            char alt[1024];
+            char alt[PS3_FS_HOST_PATH_MAX];
             const int alt_n = snprintf(alt, sizeof(alt), "%s/extracted/USRDIR/%s", g_sys_fs_root, usr + 8);
             fs_normalize_sep(alt);
             if (alt_n >= 0 && (size_t)alt_n < sizeof(alt) && stat(alt, &st) == 0)
@@ -553,7 +553,7 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
      * reports Working Path "/" and opens "/Data/Resources/first.xml", which is
      * absolute but still means "relative to my USRDIR". */
     if (stat(host_path, &st) != 0) {
-        char alt2[1024];
+        char alt2[PS3_FS_HOST_PATH_MAX];
         const int alt2_n = snprintf(alt2, sizeof(alt2), "%s/USRDIR/%s", g_sys_fs_root, rel);
         fs_normalize_sep(alt2);
         /* A cut candidate names a different file, which stat may well find: only a whole one is tried. */
@@ -1357,7 +1357,7 @@ int64_t sys_fs_unlink(ppu_context* ctx)
         if (!*(const char*)vm_to_host((uint32_t)at)) break;
     }
     const char* ps3_path = (const char*)vm_to_host(path_addr);
-    char host_path[1024];
+    char host_path[PS3_FS_HOST_PATH_MAX];   /* a host buffer, not a guest-sized one: root + 1024 characters */
     sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
 
     /* Only a missing path is ENOENT. A directory is EISDIR (the host errno for that differs per OS, so the helper

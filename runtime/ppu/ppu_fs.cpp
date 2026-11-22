@@ -1171,7 +1171,8 @@ static void cellFsUnlink(ppu_context* ctx)
     /* RPCS3 translate_to_str (sys_fs.cpp:1107-1130): up to CELL_FS_MAX_FS_PATH_LENGTH (1024) characters, and
      * CELL_ENAMETOOLONG when no NUL is found in the first 1025 bytes. cellFsUnlink is sys_fs_unlink
      * (cellFs.cpp:160-166). guest_strcpy would cut the string at its buffer and unlink a different file. */
-    char guest[FS_PATH_LENGTH_MAX + 1], host[1100];
+    char guest[FS_PATH_LENGTH_MAX + 1];
+    char host[PS3_FS_HOST_PATH_MAX];   /* a host buffer, not a guest-sized one: root + 1024 characters */
     for (size_t i = 0;; i++) {
         if (i > FS_PATH_LENGTH_MAX) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ENAMETOOLONG; return; }
         if (!fs_range_ok((uint64_t)address + i, 1)) fs_range_stop("cellFsUnlink", "path", (uint64_t)address + i, 1);

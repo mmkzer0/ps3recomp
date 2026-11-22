@@ -19,6 +19,16 @@
 #  include <unistd.h>
 #endif
 
+/* The host buffer a guest path is translated into, for the unlinks. A guest path may be CELL_FS_MAX_FS_PATH_LENGTH
+ * (1024) characters, and the host path is the VFS root (or a mount's root) in front of it, so a host buffer of the
+ * guest's size cannot hold a legal path once the root is longer than a few characters, and the translators stop
+ * (host-path-limit) on a path that does not fit. 4096 is Linux's PATH_MAX, the longest path a host unlink takes
+ * there: a root of up to 511 characters (g_sys_fs_root) plus a 1024-character path fits with room to spare. Where the
+ * host's own limit is lower (macOS: 1024) the host refuses a path that long and the unlink answers as for any
+ * refusal. Lives here, not in sys_fs.h, because ppu_fs.cpp cannot include that one (its CELL_FS_O_* spellings
+ * differ) and this header is the one both unlinks already share. */
+#define PS3_FS_HOST_PATH_MAX 4096
+
 /* Delete `host_path`: CELL_OK, or the CELL_* code above. *host_errno (when given) is the host's errno for a
  * refusal that the code does not name (CELL_EIO), else 0, for the caller's log. */
 static inline uint32_t ps3_fs_unlink_host(const char* host_path, int* host_errno)

@@ -143,9 +143,10 @@ int main(int argc, char** argv)
         for (const char* name : {"n", "nn", "nnn"}) std::filesystem::remove(root / name);
     }
 #ifndef _WIN32
-    /* A host path that does not fit its buffer is the named stop, from host_path itself, not a cut path. */
+    /* A host path that does not fit its buffer is the named stop, from host_path itself, not a cut path. The unlink's
+     * buffer is a host one (PS3_FS_HOST_PATH_MAX), so only a VFS root past it can overflow. */
     {
-        static std::string long_root(1100, 'r');
+        static std::string long_root(PS3_FS_HOST_PATH_MAX + 4, 'r');
         strcpy((char*)memory + 256, "/dev_bdvd/x");
         const auto r = run_child([&] {
             ppu_vfs_root = long_root.c_str();
