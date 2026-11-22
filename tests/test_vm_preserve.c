@@ -60,12 +60,12 @@ struct stamper {
     volatile uint8_t* at;
     size_t bytes;
     uint8_t value;
-    volatile int* stop;
+    const int* stop;
 };
 static void* stamp(void* arg)
 {
     struct stamper* s = (struct stamper*)arg;
-    while (!*s->stop)
+    while (!__atomic_load_n(s->stop, __ATOMIC_ACQUIRE))
         for (size_t i = 0; i < s->bytes; i += 64) s->at[i] = s->value;
     return NULL;
 }
@@ -228,7 +228,7 @@ int main(void)
         assert(vm_watch_preserve(at(12), (uint32_t)(span_pages * page)));
         s = vm_preserve_begin();
         vm_preserve_seal(s);
-        volatile int stop = 0;
+        int stop = 0;
         pthread_t t[4];
         struct stamper w[4];
         for (int i = 0; i < 4; ++i) {
@@ -242,7 +242,7 @@ int main(void)
             assert(vm_preserve_read(s, at(12), buf, (uint32_t)(span_pages * page), &pages) == 0);
             assert(all(buf, (size_t)(span_pages * page), then));
         }
-        stop = 1;
+        __atomic_store_n(&stop, 1, __ATOMIC_RELEASE);
         for (int i = 0; i < 4; ++i) pthread_join(t[i], NULL);
         vm_preserve_end(s);
     }
