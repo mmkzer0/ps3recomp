@@ -130,7 +130,9 @@ int translate(const char* hlsl, int stage, std::vector<unsigned int>& spirv,
 
 /* ---- translation cache ------------------------------------------------- */
 
-const u32 kCacheFormat = 1;
+/* 2: a vertex stage key now translates with RSX_POINT_SIZE_BUILTIN (PointSize); a file written before that,
+ * from a build with the same compile stamp, would hand back a module without it. */
+const u32 kCacheFormat = 2;
 const u32 kCacheMagic = 0x56505352u;   /* "RSPV" */
 /* This file's compile time stands for translate()'s options and the binding
  * contract in rsx_shader_spirv.h: when either changes, this file is rebuilt,
