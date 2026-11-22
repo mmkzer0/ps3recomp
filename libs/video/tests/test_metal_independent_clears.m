@@ -4,6 +4,9 @@
 /* A full record array submits mid-frame (eng_record_room), which reaches
  * eng_blit_to_display's gamma; no display here. */
 float cellAvconfExt_display_gamma(void) { return 1.0f; }
+/* The mid-frame submission also reaches the present bookkeeping the draw engine owns; no engine here. */
+void rsx_draw_engine_require_represent(void) {}
+u32  rsx_draw_engine_present_diag(void) { return 0; }
 static id<MTLTexture> depth_texture(unsigned width,unsigned height) {
  MTLTextureDescriptor*d=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float_Stencil8 width:width height:height mipmapped:NO];
  d.usage=MTLTextureUsageRenderTarget;d.storageMode=MTLStorageModePrivate;

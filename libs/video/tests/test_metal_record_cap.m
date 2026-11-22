@@ -13,6 +13,9 @@
 #include <stdio.h>
 
 float cellAvconfExt_display_gamma(void) { return 1.0f; }
+/* The mid-frame submission also reaches the present bookkeeping the draw engine owns; no engine here. */
+void rsx_draw_engine_require_represent(void) {}
+u32  rsx_draw_engine_present_diag(void) { return 0; }
 
 /* A title whose frames record more defines a larger record cap at build
  * time; the workflow builds this test a second time with one. */
