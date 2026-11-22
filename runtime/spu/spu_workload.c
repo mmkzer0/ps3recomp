@@ -73,8 +73,13 @@ uint64_t spu_workload_fingerprint(const void* data, size_t n)
 
 /* ---- registry ---------------------------------------------------------- */
 
+/* Default 256 -> 4096 (upstream #787). A title that patches a task counter into each of its 1024 per-task image
+ * copies registers 1024 fingerprints for ONE lifted image on top of the normal set; at 256 the rest were dropped
+ * ("registry full") and those copies ran without their lifted entry. A define from the port's CMakeLists does not
+ * reach this file (source-file properties are directory-scoped and the runtime target lives in the SDK
+ * subdirectory), so this default is the knob. The static inventory table below is sized the same. */
 #ifndef SPU_WORKLOAD_MAX
-#define SPU_WORKLOAD_MAX 256
+#define SPU_WORKLOAD_MAX 4096
 #endif
 
 typedef struct {
