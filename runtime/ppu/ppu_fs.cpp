@@ -674,27 +674,29 @@ static void cellFsRead(ppu_context* ctx)
     uint32_t buf    = (uint32_t)ctx->gpr[4];
     uint64_t nbytes = ctx->gpr[5];
     uint32_t nread_ptr = (uint32_t)ctx->gpr[6];
+    /* The wrapper (RPCS3 6e4b784d1 cellFs.cpp:57-62) passes a temporary when the count pointer is null, so a null
+     * pointer is no error and nothing is stored. A pointer that is given has its 8-byte span checked before the file
+     * moves; the count is stored by every outcome below. Outside guest memory is the hle-guest-range stop (the repo
+     * rule for a span the title chose); RPCS3 only try_write()s the count and lets it fail, so the file would have
+     * advanced there: a divergence, kept for the stop. */
+    if (nread_ptr && !fs_range_ok(nread_ptr, 8)) fs_range_stop("cellFsRead", "nread", nread_ptr, 8);
+    /* sys_fs_read's order (sys_fs.cpp:1504-1520): a null buffer is EFAULT with count 0 before the fd is looked at,
+     * then a bad fd or a write-only file is EBADF with count 0 (:1517), then nbytes == 0 is CELL_OK with count 0. A
+     * buffer that leaves the arena is a different matter: see below. */
+    if (!buf) {
+        if (nread_ptr) vm_write64(nread_ptr, 0);
+        ctx->gpr[3] = 0x8001000Du; /* CELL_EFAULT */
+        return;
+    }
     FILE* f = fd_file(fd);
     const int flags = f ? fd_flags(fd) : -1;
-    /* RPCS3 6e4b784d1 sys_fs_read (:1498-1502), which cellFsRead wraps (cellFs.cpp:57-62): a read on a write-only
-     * file is EBADF with *nread = 0. The cellFs table kept no flags to check. */
     if (!f || (nbytes && flags >= 0 && (flags & CELL_FS_O_WRONLY))) {
-        if (nread_ptr && fs_range_ok(nread_ptr, 8)) vm_write64(nread_ptr, 0);
+        if (nread_ptr) vm_write64(nread_ptr, 0);
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EBADF;
         return;
     }
     uint64_t raw_nbytes = ctx->gpr[5];
     long fpos_before = ftell(f);
-    /* The firmware checks the null out pointer and the null buffer here and
-     * nowhere else (oracle RPCS3 sys_fs_read: `!nread` or `!buf` -> CELL_EFAULT),
-     * so both keep their code; the byte count is left at 0, which is a value a
-     * caller can act on. A buffer that leaves the arena is a different matter:
-     * see below. */
-    if (!nread_ptr || !buf) {
-        if (nread_ptr && fs_range_ok(nread_ptr, 8)) vm_write64(nread_ptr, 0);
-        ctx->gpr[3] = 0x8001000Du; /* CELL_EFAULT */
-        return;
-    }
     /* A buffer that is partly or wholly outside guest memory is NOT clamped to
      * the part inside it and NOT reported as "0 bytes, CELL_OK": the old
      * `ppu_vm_size - buf` underflowed when buf already lay past the arena, and
@@ -778,20 +780,26 @@ static void cellFsWrite(ppu_context* ctx)
     uint32_t buf    = (uint32_t)ctx->gpr[4];
     uint64_t nbytes = ctx->gpr[5];
     uint32_t nwr_ptr = (uint32_t)ctx->gpr[6];
-    FILE* f = fd_file(fd);
-    const int flags = f ? fd_flags(fd) : -1;
-    /* RPCS3 6e4b784d1 sys_fs_write (:1593-1597), which cellFsWrite wraps (cellFs.cpp:63-69): a file not opened for
-     * writing is EBADF with *nwrite = 0. It was EIO, from the host stream refusing the write; the cellFs table kept
-     * no flags to check. Read-only mounts (EROFS) are not modelled. */
-    if (!f || (nbytes && flags >= 0 && !(flags & CELL_FS_O_ACCMODE))) {
-        if (nwr_ptr && fs_range_ok(nwr_ptr, 8)) vm_write64(nwr_ptr, 0);
-        ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EBADF;
+    /* The wrapper (RPCS3 6e4b784d1 cellFs.cpp:63-69) passes a temporary when the count pointer is null, so a null
+     * pointer is no error and nothing is stored. A pointer that is given has its 8-byte span checked before the file
+     * moves; the count is stored by every outcome below. Outside guest memory is the hle-guest-range stop (the repo
+     * rule for a span the title chose); RPCS3 only try_write()s the count and lets it fail, so the file would have
+     * advanced there: a divergence, kept for the stop. */
+    if (nwr_ptr && !fs_range_ok(nwr_ptr, 8)) fs_range_stop("cellFsWrite", "nwrite", nwr_ptr, 8);
+    /* sys_fs_write's order (sys_fs.cpp:1585-1601): null buffer is EFAULT with count 0 before the fd is looked at,
+     * then a bad fd or a file not opened for writing is EBADF with count 0 (:1598; read-only mounts, EROFS, are not
+     * modelled), then nbytes == 0 is CELL_OK with count 0. It was EIO from the host stream, before the table kept
+     * flags to check. */
+    if (!buf) {
+        if (nwr_ptr) vm_write64(nwr_ptr, 0);
+        ctx->gpr[3] = 0x8001000Du; /* CELL_EFAULT */
         return;
     }
-    /* Oracle RPCS3 sys_fs_write: `!buf` -> CELL_EFAULT with bytes written 0. */
-    if (!buf) {
-        if (fs_range_ok(nwr_ptr, 8)) vm_write64(nwr_ptr, 0);
-        ctx->gpr[3] = 0x8001000Du; /* CELL_EFAULT */
+    FILE* f = fd_file(fd);
+    const int flags = f ? fd_flags(fd) : -1;
+    if (!f || (nbytes && flags >= 0 && !(flags & CELL_FS_O_ACCMODE))) {
+        if (nwr_ptr) vm_write64(nwr_ptr, 0);
+        ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EBADF;
         return;
     }
     /* Same rule as the read path: lv2 would read this span, so it must be guest

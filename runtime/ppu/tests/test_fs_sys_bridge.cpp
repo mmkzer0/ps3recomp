@@ -12,6 +12,8 @@
  *   4. the same under concurrency: threads open and close through both families at once, and each number held is
  *      held by one thread. This is the case to run under TSan: cellFsOpen against sys_fs_open raced on the two
  *      tables' ownership checks before one lock guarded the space.
+ *   5. cellFsRead / cellFsWrite answer in RPCS3's order (a null buffer is EFAULT before the fd is looked at, a null
+ *      count pointer is a temporary, a count span outside guest memory is a stop before the file moves).
  *
  *   tools/test_ppu_fs_sys_bridge.py [--tsan]
  *   test_fs_sys_bridge [DIR]   (DIR: where the files go; default the temp dir)
@@ -25,6 +27,7 @@
 #include <vector>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 /* ---- link stubs: nothing on the paths this test drives calls them ---- */
@@ -58,9 +61,16 @@ PS3_NORETURN void ps3_stop_commit_failed(const char* func, const char* arg, uint
 /* ps3_log.c references the stop runtime and the quick-exit table; this fixture configures no log and
  * takes no stop beyond the guest-range one above. */
 void ps3_stop_set_mirror(ps3_stop_quiesce_fn, ps3_stop_mirror_fn) {}
-PS3_NORETURN void ps3_stop(ps3_stop_kind, const char*, const char*, const ps3_stop_field*,
-                           size_t, const ps3_stop_site*)
-{ _Exit(PS3_STOP_EXIT_CODE); }
+/* The generic stop (host-path-limit): the same machine-line idea as the guest-range one, the kind as its number. */
+PS3_NORETURN void ps3_stop(ps3_stop_kind kind, const char*, const char*, const ps3_stop_field* fields,
+                           size_t nfields, const ps3_stop_site*)
+{
+    fprintf(stderr, "kind=%d", (int)kind);
+    for (size_t i = 0; i < nfields; i++) fprintf(stderr, " %s=%s", fields[i].key, fields[i].value);
+    fputc('\n', stderr);
+    fflush(stderr);
+    _Exit(PS3_STOP_EXIT_CODE);
+}
 int ps3_host_at_quick_exit(void (*fn)(void)) { (void)fn; return 0; }
 
 /* The sys_fs side, from sys_fs.c (linked). */
@@ -169,6 +179,33 @@ static std::string host_bytes(const char* name, long off, size_t n)
     fclose(f);
     return ok ? out : std::string();
 }
+
+#ifndef _WIN32
+/* Run `body` in a forked child and report whether it ended in a stop (the fixture's stops exit with
+ * PS3_STOP_EXIT_CODE) and what it wrote to stderr. */
+struct ChildResult { bool stopped; std::string err; };
+template <class F> static ChildResult run_child(F body)
+{
+    int fds[2];
+    if (pipe(fds) != 0) return {false, {}};
+    const pid_t pid = fork();
+    if (pid == 0) {
+        close(fds[0]); dup2(fds[1], STDERR_FILENO); close(fds[1]);
+        body();
+        _exit(1);   /* returned: nothing was refused */
+    }
+    close(fds[1]);
+    std::string err;
+    char bytes[512];
+    ssize_t n;
+    while ((n = read(fds[0], bytes, sizeof bytes)) > 0) err.append(bytes, (size_t)n);
+    close(fds[0]);
+    int status = 0;
+    waitpid(pid, &status, 0);
+    return {WIFEXITED(status) && WEXITSTATUS(status) == PS3_STOP_EXIT_CODE, err};
+}
+static bool says(const ChildResult& r, const char* text) { return r.err.find(text) != std::string::npos; }
+#endif
 
 /* A file opened with cellFsOpen, used through sys_fs_*. */
 static void test_cellfs_fd_through_sys_fs()
@@ -285,6 +322,98 @@ static void test_access_modes()
         }
     }
     CHECK(host_size("bridge_a.bin") == (long)PAT, "the file was not changed");
+    remove(host("bridge_a.bin").c_str());
+}
+
+/* cellFsRead / cellFsWrite answer in sys_fs_read / sys_fs_write's order (RPCS3 6e4b784d1 sys_fs.cpp:1504-1520 and
+ * :1585-1601, behind the wrapper of cellFs.cpp:57-69): a null buffer is EFAULT with the count 0 before the fd or the
+ * access mode is looked at, then a bad fd or a refused mode is EBADF with the count 0. The wrapper hands the syscall
+ * a temporary when the count pointer is null, so that is no error and nothing is stored (the syscalls themselves
+ * answer EFAULT to a null pointer, and are not asked here). A count span outside guest memory is a stop before the
+ * file moves. Fork issue #154, item 3: a write with a null buffer and a null count pointer stored to page 0. */
+static void test_read_write_order()
+{
+    Scratch s{0x1000};
+    make_pattern("bridge_a.bin");
+    const int rofd = cfs_open(s, "bridge_a.bin", CELL_FS_O_RDONLY);
+    const int wofd = cfs_open(s, "bridge_a.bin", CELL_FS_O_WRONLY);
+    const int rwfd = cfs_open(s, "bridge_a.bin", CELL_FS_O_RDWR);
+    CHECK(rofd >= 3 && wofd >= 3 && rwfd >= 3, "three fds open (%d %d %d)", rofd, wofd, rwfd);
+    const uint32_t EFAULT_ = (uint32_t)CELL_EFAULT;
+    const uint32_t cnt = s.out() + 8;
+    auto arm = [&] { memset(vm_base + cnt, 0xEE, 8); memset(vm_base, 0xEE, 16); };   /* the count, and guest page 0 */
+    auto page0_kept = [&] { for (int i = 0; i < 16; i++) if (vm_base[i] != 0xEE) return false; return true; };
+    auto read_via = [&](int cellfs, int fd, uint32_t buf, uint64_t n, uint32_t cp) {
+        return cellfs ? cfs(cellFsRead, fd, buf, n, cp) : sfs(sys_fs_read, fd, buf, n, cp);
+    };
+    auto write_via = [&](int cellfs, int fd, uint32_t buf, uint64_t n, uint32_t cp) {
+        return cellfs ? cfs(cellFsWrite, fd, buf, n, cp) : sfs(sys_fs_write, fd, buf, n, cp);
+    };
+    for (int cellfs = 1; cellfs >= 0; --cellfs) {
+        const char* via = cellfs ? "cellFs" : "sys_fs";
+        arm();
+        uint32_t rc = read_via(cellfs, wofd, 0, 4, cnt);
+        CHECK(rc == EFAULT_ && rd64(cnt) == 0, "%s read on a write-only fd with a null buffer is EFAULT, count 0 (0x%08X)", via, rc);
+        arm();
+        rc = write_via(cellfs, rofd, 0, 4, cnt);
+        CHECK(rc == EFAULT_ && rd64(cnt) == 0, "%s write on a read-only fd with a null buffer is EFAULT, count 0 (0x%08X)", via, rc);
+        arm();
+        rc = read_via(cellfs, 1000, 0, 4, cnt);
+        CHECK(rc == EFAULT_ && rd64(cnt) == 0, "%s read on a bad fd with a null buffer is EFAULT, count 0 (0x%08X)", via, rc);
+        arm();
+        rc = write_via(cellfs, 1000, 0, 4, cnt);
+        CHECK(rc == EFAULT_ && rd64(cnt) == 0, "%s write on a bad fd with a null buffer is EFAULT, count 0 (0x%08X)", via, rc);
+    }
+
+    /* A null count pointer: the wrapper's temporary, so the call is judged on its other arguments alone, and no store
+     * reaches page 0 (it used to: fs_range_ok(0, 8) holds). */
+    arm();
+    uint32_t rc = cfs(cellFsRead, rwfd, 0, 4, 0);
+    CHECK(rc == EFAULT_ && page0_kept(), "cellFsRead with a null buffer and a null count pointer is EFAULT, page 0 untouched (0x%08X)", rc);
+    arm();
+    rc = cfs(cellFsWrite, rwfd, 0, 4, 0);
+    CHECK(rc == EFAULT_ && page0_kept(), "cellFsWrite with a null buffer and a null count pointer is EFAULT, page 0 untouched (0x%08X)", rc);
+    arm();
+    rc = cfs(cellFsRead, 1000, s.buf(), 4, 0);
+    CHECK(rc == EBADF_ && page0_kept(), "cellFsRead on a bad fd with a null count pointer is EBADF, page 0 untouched (0x%08X)", rc);
+    arm();
+    rc = cfs(cellFsWrite, rofd, s.buf(), 4, 0);
+    CHECK(rc == EBADF_ && page0_kept(), "cellFsWrite on a read-only fd with a null count pointer is EBADF, page 0 untouched (0x%08X)", rc);
+    /* ... and a call that succeeds moves the file: the 4 bytes at 8, then the position is 12. */
+    sfs(sys_fs_lseek, rwfd, 8, CELL_FS_SEEK_SET, s.out() + 16);
+    memset(vm_base + s.buf(), 0, 4);
+    rc = cfs(cellFsRead, rwfd, s.buf(), 4, 0);
+    CHECK(rc == 0 && holds(s.buf(), 8, 4), "cellFsRead with a null count pointer reads (0x%08X)", rc);
+    CHECK(sfs(sys_fs_lseek, rwfd, 0, CELL_FS_SEEK_CUR, s.out() + 16) == 0 && rd64(s.out() + 16) == 12,
+          "... and the position moved");
+    sfs(sys_fs_lseek, rwfd, 8, CELL_FS_SEEK_SET, s.out() + 16);
+    memcpy(vm_base + s.buf(), "WXYZ", 4);   /* bytes the file does not hold at 8, so the check sees the write */
+    rc = cfs(cellFsWrite, rwfd, s.buf(), 4, 0);
+    CHECK(rc == 0 && host_bytes("bridge_a.bin", 8, 4) == "WXYZ",
+          "cellFsWrite with a null count pointer writes (0x%08X)", rc);
+    CHECK(sfs(sys_fs_lseek, rwfd, 0, CELL_FS_SEEK_CUR, s.out() + 16) == 0 && rd64(s.out() + 16) == 12,
+          "... and the position moved");
+
+    /* A count span outside guest memory is a stop before the file moves: the write below would have changed the
+     * file's first four bytes, and the host stream is flushed by the handler, so the file shows it. */
+    sfs(sys_fs_lseek, rwfd, 0, CELL_FS_SEEK_SET, s.out() + 16);
+    memcpy(vm_base + s.buf(), "ZZZZ", 4);
+    const struct { const char* name; const char* arg; bool write; } outside[] = {
+        {"cellFsRead", "nread", false},
+        {"cellFsWrite", "nwrite", true},
+    };
+    for (const auto& o : outside) {
+        const auto r = run_child([&] {
+            if (o.write) cfs(cellFsWrite, rwfd, s.buf(), 4, MEM_BYTES - 4);
+            else cfs(cellFsRead, rwfd, s.buf(), 4, MEM_BYTES - 4);
+        });
+        CHECK(r.stopped && says(r, "kind=hle-guest-range") && says(r, o.name) && says(r, o.arg),
+              "%s with a count span outside guest memory stops, arg %s (stopped %d: %s)", o.name, o.arg, (int)r.stopped,
+              r.err.c_str());
+    }
+    CHECK(host_bytes("bridge_a.bin", 0, 4) == std::string("\x00\x01\x02\x03", 4), "... and the file did not move");
+
+    cfs(cellFsClose, rofd); cfs(cellFsClose, wofd); cfs(cellFsClose, rwfd);
     remove(host("bridge_a.bin").c_str());
 }
 
@@ -435,6 +564,7 @@ int main(int argc, char** argv)
     test_cellfs_fd_through_sys_fs();
     test_sys_fs_fd_through_cellfs();
     test_access_modes();
+    test_read_write_order();
     test_directories();
     test_distinct_numbers();
     verbose = false;   /* the concurrent rounds report failures only */

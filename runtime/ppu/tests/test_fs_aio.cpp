@@ -375,7 +375,9 @@ int main(int argc, char** argv)
 
     /* 4. The null buffer is the one bad pointer the firmware itself answers:
      *    CELL_EFAULT, and the byte count is left at 0 (oracle RPCS3
-     *    sys_fs_read/sys_fs_write). It is not a stop. */
+     *    sys_fs_read/sys_fs_write). It is not a stop. A null byte-count
+     *    pointer is no error for cellFsRead: RPCS3's wrapper hands sys_fs_read a
+     *    temporary (cellFs.cpp:57-62), so the read happens. */
     {
         memset(&ctx, 0, sizeof ctx); ctx.gpr[3] = fd; ctx.gpr[4] = 0; ctx.gpr[5] = 0x100; ctx.gpr[6] = 0x210;
         wr64(0x210, 0xDEADBEEF);
@@ -384,8 +386,8 @@ int main(int argc, char** argv)
               "cellFsRead(null buffer) returns CELL_EFAULT and sets the byte count to 0");
         memset(&ctx, 0, sizeof ctx); ctx.gpr[3] = fd; ctx.gpr[4] = 0x100; ctx.gpr[5] = 4; ctx.gpr[6] = 0;
         cellFsRead(&ctx);
-        CHECK((uint32_t)ctx.gpr[3] == 0x8001000Du,
-              "cellFsRead(null byte-count pointer) returns CELL_EFAULT");
+        CHECK((uint32_t)ctx.gpr[3] == CELL_OK,
+              "cellFsRead(null byte-count pointer) reads, with no count to store");
     }
 
     memset(&ctx, 0, sizeof ctx); ctx.gpr[3] = fd;
