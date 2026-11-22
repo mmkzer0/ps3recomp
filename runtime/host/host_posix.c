@@ -506,6 +506,25 @@ static void upload_depth_bounds_triangles(void)
             guest_f32(IO_ADDR + BVTX_OFFSET + (uint32_t)(i * 32 + k * 4), v[i][k]);
 }
 
+/* --poly-offset: two full-viewport triangles at the SAME depth, z = 0.5, drawn
+ * through the guest programs of --shader (vertex colour blue comes out red,
+ * green stays green). Layout as upload_triangle's. */
+#define POVTX_OFFSET (VTX_OFFSET + 0x9000u)
+static void upload_poly_offset_triangles(void)
+{
+    static const float v[6][8] = {
+        { -1.0f, -1.0f, 0.5f, 1.0f,   0.0f, 0.0f, 1.0f, 1.0f },   /* blue -> red   */
+        {  3.0f, -1.0f, 0.5f, 1.0f,   0.0f, 0.0f, 1.0f, 1.0f },
+        { -1.0f,  3.0f, 0.5f, 1.0f,   0.0f, 0.0f, 1.0f, 1.0f },
+        { -1.0f, -1.0f, 0.5f, 1.0f,   0.0f, 1.0f, 0.0f, 1.0f },   /* green         */
+        {  3.0f, -1.0f, 0.5f, 1.0f,   0.0f, 1.0f, 0.0f, 1.0f },
+        { -1.0f,  3.0f, 0.5f, 1.0f,   0.0f, 1.0f, 0.0f, 1.0f },
+    };
+    for (int i = 0; i < 6; i++)
+        for (int k = 0; k < 8; k++)
+            guest_f32(IO_ADDR + POVTX_OFFSET + (uint32_t)(i * 32 + k * 4), v[i][k]);
+}
+
 /* --depthtex's first pass: one full-viewport triangle at DTEX_Z, drawn with
  * the depth test and depth writes on, so the zeta it is aimed at ends the
  * pass holding that one value everywhere.
@@ -727,6 +746,25 @@ static void emit_unbound_draw(void)
     emit(NV4097_SET_BLEND_FUNC_DFACTOR,  0x0303u | (0x0303u << 16));   /* ONE_MINUS_SRC_ALPHA */
     emit(NV4097_SET_BLEND_EQUATION,      0x8006u | (0x8006u << 16));   /* FUNC_ADD            */
     emit_textured_draw_unit(TEX_OFFSET, TEX_W, TEX_H, 0x85u | 0x20u, 0, TVTX_OFFSET, 0);
+}
+
+static void emit_shader_draw(void);   /* below, with --shader */
+
+/* --blend-constant: --shader's triangle (the fragment program writes red) with
+ * blend on, source factor CONSTANT_COLOR (0x8001) for colour and ONE for alpha,
+ * destination ZERO, and SET_BLEND_COLOR = A 0xFF, R 0x80, G 0x40, B 0x20. The
+ * pixel is the red scaled by the constant: R = 0x80, G = B = 0. A backend that
+ * draws the factor as ONE (what 0x8001 fell to) presents full red, and one
+ * that never binds the constant presents black (the default constant is 0). The
+ * destination factor is ZERO, so the clear colour cannot be what shows. */
+static void emit_blend_constant_draw(void)
+{
+    emit(NV4097_SET_BLEND_ENABLE,        1u);
+    emit(NV4097_SET_BLEND_FUNC_SFACTOR,  0x8001u | (0x0001u << 16));   /* CONSTANT_COLOR, ONE */
+    emit(NV4097_SET_BLEND_FUNC_DFACTOR,  0x0000u | (0x0000u << 16));   /* ZERO                */
+    emit(NV4097_SET_BLEND_EQUATION,      0x8006u | (0x8006u << 16));   /* FUNC_ADD            */
+    emit(NV4097_SET_BLEND_COLOR,         0xFF804020u);
+    emit_shader_draw();
 }
 
 /* The same quad on a cube map: SET_TEXTURE_FORMAT's bit 2 says cube, and the
@@ -1123,6 +1161,45 @@ static void emit_depth_bounds_draw(void)
     emit(NV4097_SET_DEPTH_BOUNDS_TEST_ENABLE, 0u);
 }
 
+/* --poly-offset: the first triangle writes red at z = 0.5 with the depth test
+ * LESS and depth writes on. The second, green, is at the very same depth, so
+ * LESS rejects it and the centre stays red -- unless the guest's polygon
+ * offset reaches the backend: SET_POLY_OFFSET_FILL_ENABLE with a bias of
+ * -4096 units pulls it nearer than the red, and green wins. The enable is
+ * cleared first so a frame does not inherit the last one's. Needs a
+ * backend that applies the offset (set_depth_bias on the draw engine path). */
+#define HOST_NV4097_SET_POLY_OFFSET_FILL_ENABLE 0x00000A68u
+#define HOST_NV4097_SET_POLYGON_OFFSET_SCALE    0x00000A78u   /* float */
+#define HOST_NV4097_SET_POLYGON_OFFSET_BIAS     0x00000A7Cu   /* float */
+static void emit_poly_offset_draw(void)
+{
+    u8 vp[32];
+    rsx_test_vp_mov_out(vp +  0, 0, RSX_TEST_VP_SWZ_IDENT, 0, 0);   /* MOV o0, v0      */
+    rsx_test_vp_mov_out(vp + 16, 3, RSX_TEST_VP_SWZ_IDENT, 1, 1);   /* MOV o1, v3, END */
+    emit_programs(vp, sizeof vp, FP_OFFSET);
+
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 0 * 4, VTX_MAIN(POVTX_OFFSET +  0));  /* position */
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 0 * 4, VFMT(4, 32));
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 3 * 4, VTX_MAIN(POVTX_OFFSET + 16));  /* colour   */
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 3 * 4, VFMT(4, 32));
+
+    emit(HOST_NV4097_SET_POLY_OFFSET_FILL_ENABLE, 0u);
+    emit(NV4097_SET_DEPTH_TEST_ENABLE, 1u);
+    emit(NV4097_SET_DEPTH_FUNC,        0x0201u);         /* GL_LESS */
+    emit(NV4097_SET_DEPTH_MASK,        1u);
+    emit(NV4097_SET_BEGIN_END, 5u);
+    emit(NV4097_DRAW_ARRAYS,   0u | ((3u - 1u) << 24));  /* red, z = 0.5            */
+    emit(NV4097_SET_BEGIN_END, 0u);
+
+    emit(HOST_NV4097_SET_POLYGON_OFFSET_SCALE, 0x00000000u);   /* 0.0                */
+    emit(HOST_NV4097_SET_POLYGON_OFFSET_BIAS,  0xC5800000u);   /* -4096.0            */
+    emit(HOST_NV4097_SET_POLY_OFFSET_FILL_ENABLE, 1u);
+    emit(NV4097_SET_BEGIN_END, 5u);
+    emit(NV4097_DRAW_ARRAYS,   3u | ((3u - 1u) << 24));  /* green, z = 0.5, offset  */
+    emit(NV4097_SET_BEGIN_END, 0u);
+    emit(HOST_NV4097_SET_POLY_OFFSET_FILL_ENABLE, 0u);
+}
+
 /* The pentagon, then the quad strip over it. Both are fixed-function, so
  * every backend can run this mode. */
 static void emit_quad_draws(void)
@@ -1155,7 +1232,7 @@ static void submit_frame(int with_draw)
      * in front of it. */
     if (with_draw != 9 && with_draw != 10) {
         emit(NV4097_SET_COLOR_CLEAR_VALUE, CLEAR_ARGB);
-        if (with_draw == 4 || with_draw == 12) {
+        if (with_draw == 4 || with_draw == 12 || with_draw == 22) {
             /* CLEAR_SURFACE bits: 0x01 depth, 0x02 stencil, 0xF0 the four
              * colour channels. ZSTENCIL_CLEAR_VALUE is Z24S8, so 0xFFFFFF00
              * is depth 1.0 and stencil 0 -- the nv40 reset values, and what a
@@ -1166,7 +1243,9 @@ static void submit_frame(int with_draw)
             emit(NV4097_CLEAR_SURFACE,            0xF0u);
         }
     }
-    if (with_draw == 20)     emit_unbound_draw();
+    if (with_draw == 22)     emit_poly_offset_draw();
+    else if (with_draw == 21) emit_blend_constant_draw();
+    else if (with_draw == 20) emit_unbound_draw();
     else if (with_draw == 15) emit_border_draw();
     else if (with_draw == 12) emit_depth_bounds_draw();
     else if (with_draw == 11) emit_cube_draw();
@@ -1410,7 +1489,8 @@ static int mode_needs_translator(int mode)
 {
     return mode == 3 || mode == 5 || mode == 6 || mode == 8 || mode == 14 ||
            mode == 9 || mode == 10 || mode == 11 || mode == 15 ||
-           mode == 16 || mode == 17 || mode == 18 || mode == 19 || mode == 20;
+           mode == 16 || mode == 17 || mode == 18 || mode == 19 || mode == 20 ||
+           mode == 21 || mode == 22;
 }
 
 /* ...and which ones must, on a backend that has a translator, have run the
@@ -1437,6 +1517,8 @@ static const char* mode_flag_name(int mode)
     case 18: return "--float-rt";
     case 19: return "--float-rt-r";
     case 20: return "--unbound";
+    case 21: return "--blend-constant";
+    case 22: return "--poly-offset";
     default: return "(mode)";
     }
 }
@@ -1553,6 +1635,9 @@ int main(int argc, char** argv)
         else if (strcmp(argv[i], "--float-rt-r") == 0) do_draw = 19;
         /* --unbound: see emit_unbound_draw. */
         else if (strcmp(argv[i], "--unbound") == 0) do_draw = 20;
+        /* --blend-constant / --poly-offset: see emit_blend_constant_draw, emit_poly_offset_draw. */
+        else if (strcmp(argv[i], "--blend-constant") == 0) do_draw = 21;
+        else if (strcmp(argv[i], "--poly-offset") == 0) do_draw = 22;
     }
 #if !defined(__APPLE__)
     if (do_draw == 15) {
@@ -1606,9 +1691,10 @@ int main(int argc, char** argv)
     if (do_draw == 1 || do_draw == 13) upload_triangle();
     if (do_draw == 2 || do_draw == 20) { upload_texture(); upload_textured_quad(); }
     if (do_draw == 15) { upload_texture(); upload_border_quad(); }
-    if (do_draw == 3 || do_draw == 16 || do_draw == 17) upload_shader_triangle();
+    if (do_draw == 3 || do_draw == 16 || do_draw == 17 || do_draw == 21) upload_shader_triangle();
     if (do_draw == 4) upload_depth_triangles();
     if (do_draw == 12) upload_depth_bounds_triangles();
+    if (do_draw == 22) upload_poly_offset_triangles();
     if (do_draw == 5) { upload_mip_texture(); upload_mip_quad(); }
     /* --rtt draws both: the triangle into the surface, the quad out of it. */
     if (do_draw == 6 || do_draw == 14) { upload_triangle(); upload_textured_quad(); upload_rtt_backing(); }
@@ -1735,6 +1821,8 @@ int main(int argc, char** argv)
                  : (do_draw == 17) ? 0xFFFF0000u  /* plane 1 keeps d >= 0        */
                  : (do_draw == 16) ? CLEAR_ARGB   /* plane 1 clipped it all      */
                  : (do_draw == 20) ? CLEAR_ARGB   /* unbound reads (0,0,0,0)     */
+                 : (do_draw == 21) ? 0xFF800000u  /* red * the blend constant    */
+                 : (do_draw == 22) ? 0xFF00FF00u  /* the offset pulled green over red */
                  : (do_draw == 18 || do_draw == 19) ? 0xFFFF0000u   /* only the surface holds red */
                  : (do_draw == 14) ? 0xFFFF0000u  /* the copy kept the triangle  */
                  : (do_draw == 6) ? 0xFFFF0000u   /* only the surface holds red  */
