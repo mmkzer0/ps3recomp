@@ -1058,7 +1058,10 @@ static void populate_offset_table(u32 ea, u32 io, u32 size)
 /* Clear offset table entries for an IO mapping */
 static void clear_offset_table(u32 ea, u32 io, u32 size)
 {
-    u32 pages = size >> 20;
+    /* Rounded up, as populate_offset_table mapped them: rounding down left the
+     * final partial page of an unmapped range (and every page of one under
+     * 1MB) translating, in the host tables and the guest's copy. */
+    u32 pages = (size + 0xFFFFFu) >> 20;
     u32 ea_page = ea >> 20;
     u32 io_page = io >> 20;
 
