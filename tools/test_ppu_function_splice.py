@@ -9,6 +9,7 @@ edit elsewhere that the splice must keep. The spliced lift is compiled with
 
 Run: python tools/test_ppu_function_splice.py
 """
+import hashlib
 import json
 import os
 import shutil
@@ -26,6 +27,9 @@ import ppu_function_splice as splice_tool  # noqa: E402
 
 ADDRS = [0x10000 + 0x40 * i for i in range(40)]
 NEW = 0x20000
+# The lifter refuses to write output without the lower-case hex SHA-256 of the file it lifted (the runtime's
+# identity gate). All three lifts here are of one synthetic image, as a base lift and its fix are of one executable.
+IMAGE_SHA256 = hashlib.sha256(b'ppu_function_splice synthetic image').hexdigest()
 
 
 def name(addr):
@@ -47,6 +51,7 @@ def bodies(fixed=False, todo=False):
 
 def write_lift(directory, functions, chunks):
     lifter = PPULifter()
+    lifter.image_sha256 = IMAGE_SHA256
     for addr in sorted(functions):
         lifter.functions.append(LiftedFunction(name=name(addr), start_addr=addr, end_addr=addr + 0x40,
                                                body_lines=functions[addr] + ['return;']))
