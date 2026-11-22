@@ -40,8 +40,10 @@ def main():
             cxxflags = [*cflags, '-std=c++17']
             ldflags = []
         try:
+            # The fixture defines ps3_stop_guest_range itself: the log and the configuration, not stop.cpp.
             runtime_link.build([fixture, dev_flash], binary, work, cflags=cflags, cxxflags=cxxflags,
-                               ldflags=ldflags, cxx=compiler, timeout=180, capture_output=True)
+                               ldflags=ldflags, cxx=compiler, timeout=180, capture_output=True,
+                               runtime=('log', 'config'))
         except subprocess.CalledProcessError as e:
             print(((e.stdout or '') + (e.stderr or ''))[-5000:])
             return e.returncode

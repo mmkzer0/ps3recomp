@@ -25,6 +25,7 @@
 #include "ps3emu/error_codes.h"
 #include "ps3emu/guest_call.h" /* ps3_invoke_guest: AIO completion is a guest OPD */
 #include "ps3emu/fs_write_check.h"
+#include "ps3emu/fs_unlink.h"
 #include "sdata_decrypt.h"   /* SDATA/EDAT (NPD) decryption for cellFsSdataOpen */
 #include <stdint.h>
 #include <stdio.h>
@@ -1084,30 +1085,20 @@ static void cellFsRmdir(ppu_context* ctx)  { ctx->gpr[3] = CELL_OK; }
 static void cellFsUnlink(ppu_context* ctx)
 {
     const uint32_t address = (uint32_t)ctx->gpr[3];
-    if (!address) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EINVAL; return; }
-    if (ppu_vm_size && address >= ppu_vm_size) {
-        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EFAULT; return;
-    }
+    /* RPCS3 6e4b784d1 translate_to_str: a null path is CELL_EFAULT. A pointer outside guest memory has no code the
+     * console gives (the kernel faults on it), so it is the named stop, as guest_strcpy makes of a string that
+     * never ends inside guest memory. */
+    if (!address) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EFAULT; return; }
+    if (!fs_range_ok(address, 1)) fs_range_stop("cellFsUnlink", "path", address, 1);
     char guest[1024], host[1100];
     guest_strcpy(guest, address, sizeof guest);
     host_path(host, sizeof host, guest);
-#ifdef _WIN32
-    const int result = _unlink(host);
-#else
-    const int result = unlink(host);
-#endif
-    uint32_t error = CELL_OK;
-    if (result != 0) {
-        switch (errno) {
-        case ENOENT:  error = CELL_ENOENT; break;
-        case ENOTDIR: error = CELL_ENOTDIR; break;
-        case EACCES:  error = CELL_EACCES; break;
-        case EPERM:   error = CELL_EPERM; break;
-        case EBUSY:   error = CELL_EBUSY; break;
-        case EISDIR:  error = CELL_EISDIR; break;
-        default:      error = CELL_EIO; break;
-        }
-    }
+    /* The answer is sys_fs_unlink's (include/ps3emu/fs_unlink.h): ENOENT for a missing path, EISDIR for a
+     * directory, EIO for any other refusal. */
+    int host_errno = 0;
+    const uint32_t error = ps3_fs_unlink_host(host, &host_errno);
+    if (error == CELL_EIO)
+        PS3_LOG(PS3_LOG_INFO, "fs", "unlink '%s' failed (host errno %d) -> EIO\n", host, host_errno);
     ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)error;
 }
 static void cellFsFsync(ppu_context* ctx)

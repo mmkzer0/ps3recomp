@@ -20,6 +20,7 @@
 #include "ps3emu/stop.h"
 #include "ps3emu/log_first.h"
 #include "ps3emu/fs_write_check.h"
+#include "ps3emu/fs_unlink.h"
 
 /* glibc's <sys/stat.h> exposes st_atime/st_mtime/st_ctime as macros that expand
  * to st_atim.tv_sec etc.  They collide with the identically named members of the
@@ -1023,19 +1024,37 @@ s32 cellFsRename(const char* from, const char* to)
 /* NID: 0x7F4677A8 */
 s32 cellFsUnlink(const char* path)
 {
-    printf("[cellFs] Unlink(path='%s')\n", gpath(path) ? gpath(path) : "<null>");
-
-    if (!path)
+    /* RPCS3 6e4b784d1 translate_to_str: a null path is CELL_EFAULT. */
+    if (!path) {
+        printf("[cellFs] Unlink(path='<null>')\n");
         return CELL_EFAULT;
+    }
+
+    /* The path is a string the title chose: it must start in guest memory and end inside it before anything reads
+     * it as a host string; outside guest memory the console faults, so there is no code to answer with. */
+    {
+        const uint32_t ea = (uint32_t)(uintptr_t)path;
+        const char* host_str = gpath(path);
+        for (uint32_t n = 0; host_str; n++) {
+            const uint64_t at = (uint64_t)ea + n;
+            if (n >= CELL_FS_MAX_FS_PATH_LENGTH) break;
+            if (at > UINT32_MAX || !vm_range_ok((uint32_t)at, 1))
+                ps3_stop_guest_range("cellFsUnlink", "path", at, 1, vm_guest_limit());
+            if (!host_str[n]) break;
+        }
+    }
+
+    printf("[cellFs] Unlink(path='%s')\n", gpath(path) ? gpath(path) : "<null>");
 
     char host_path[CELL_FS_MAX_FS_PATH_LENGTH];
     if (translate_path(gpath(path), host_path, sizeof(host_path)) != 0)
         return (s32)CELL_ENOENT;
 
-    if (remove(host_path) != 0) {
-        printf("[cellFs] Unlink: remove('%s') failed: %s\n", host_path, strerror(errno));
-        return (s32)CELL_ENOENT;
-    }
-
-    return CELL_OK;
+    /* The answer is sys_fs_unlink's: ENOENT for a missing path, EISDIR for a directory (remove() deleted an
+     * empty one), EIO for any other refusal. */
+    int host_errno = 0;
+    const uint32_t rc = ps3_fs_unlink_host(host_path, &host_errno);
+    if (rc == CELL_EIO)
+        printf("[cellFs] Unlink: unlink('%s') failed: %s\n", host_path, strerror(host_errno));
+    return (s32)rc;
 }

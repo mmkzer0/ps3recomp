@@ -7,6 +7,7 @@
 #include "../memory/vm.h"
 #include "ps3emu/stop.h"
 #include "../../include/ps3emu/ps3_log.h"
+#include "../../include/ps3emu/fs_unlink.h"   /* ps3_fs_unlink_host: the answer shared with cellFsUnlink */
 #include "../platform/ps3_dev_flash.h"
 #include "../memory/vm_watch_hooks.h"
 #include <errno.h>
@@ -1308,26 +1309,14 @@ int64_t sys_fs_unlink(ppu_context* ctx)
     char host_path[1024];
     sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
 
-#ifdef _WIN32
-    if (_unlink(host_path) != 0)
-#else
-    if (unlink(host_path) != 0)
-#endif
-    {
-        /* Only a missing path is ENOENT. A directory is EISDIR (the host errno
-         * for that differs per OS, so ask stat), and anything else the host
-         * refused is an I/O error. */
-        const int e = errno;
-        struct stat st;
-        if (stat(host_path, &st) != 0)
-            return (int64_t)(int32_t)CELL_ENOENT;
-        if (S_ISDIR(st.st_mode))
-            return (int64_t)(int32_t)CELL_EISDIR;
-        PS3_LOG(PS3_LOG_INFO, "sys_fs", "unlink '%s' failed (host errno %d) -> EIO\n", host_path, e);
-        return (int64_t)(int32_t)CELL_EIO;
-    }
-
-    return CELL_OK;
+    /* Only a missing path is ENOENT. A directory is EISDIR (the host errno for that differs per OS, so the helper
+     * asks stat), and anything else the host refused is an I/O error. cellFsUnlink answers the same
+     * (include/ps3emu/fs_unlink.h). */
+    int host_errno = 0;
+    const uint32_t rc = ps3_fs_unlink_host(host_path, &host_errno);
+    if (rc == CELL_EIO)
+        PS3_LOG(PS3_LOG_INFO, "sys_fs", "unlink '%s' failed (host errno %d) -> EIO\n", host_path, host_errno);
+    return (int64_t)(int32_t)rc;
 }
 
 /* ---------------------------------------------------------------------------
