@@ -3,11 +3,16 @@
  * Creating a container did not charge the default pool, so the free size a title read back for it did not drop;
  * allocations inside the container were also checked against the default pool, so a full default pool refused them.
  * A container with live allocations could be destroyed and its slot reused, and freeing the old allocation then
- * underflowed the new container's used_size. */
+ * underflowed the new container's used_size.
+ *
+ * The console golden (tests/syscalls/lv2conf/golden.csv, container.*) adds: a container is a whole number of MiB
+ * (smaller is CELL_ENOMEM, larger rounds down, the 64-bit size is judged whole), and the default pool's total as
+ * well as its available amount drops by a container's size. */
 #include "../runtime/syscalls/sys_memory.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "guest_range_catch.h"
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
 uint32_t ppu_hle_inject_base=0x20000000u;
@@ -19,7 +24,8 @@ static unsigned checks;
 #define DEFAULT_CID 0xFFFFFFFFu
 #define OUT 0x10000u
 static uint32_t rd(uint32_t a) { uint8_t* p=vm_base+a; return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3]; }
-static int64_t create(uint32_t size) { ppu_context c={0};c.gpr[3]=OUT;c.gpr[4]=size;return sys_memory_container_create(&c); }
+static int64_t create64(uint64_t size) { ppu_context c={0};c.gpr[3]=OUT;c.gpr[4]=size;return sys_memory_container_create(&c); }
+static int64_t create(uint32_t size) { return create64(size); }
 static int64_t destroy(uint32_t cid) { ppu_context c={0};c.gpr[3]=cid;return sys_memory_container_destroy(&c); }
 static int64_t alloc(uint32_t size) { ppu_context c={0};c.gpr[3]=size;c.gpr[4]=0x400;c.gpr[5]=OUT;return sys_memory_allocate(&c); }
 static int64_t alloc_in(uint32_t cid,uint32_t size) {
@@ -31,6 +37,11 @@ static int64_t size_of(uint32_t cid,uint32_t* total,uint32_t* avail) {
  ppu_context c={0};c.gpr[3]=OUT+8;c.gpr[4]=cid;int64_t rc=sys_memory_container_get_size(&c);
  *total=rd(OUT+8);*avail=rd(OUT+12);return rc;
 }
+/* The same pair, through sys_memory_get_user_memory_size (syscall 352). */
+static int64_t user_memory(uint32_t* total,uint32_t* avail) {
+ ppu_context c={0};c.gpr[3]=OUT+8;int64_t rc=sys_memory_get_user_memory_size(&c);
+ *total=rd(OUT+8);*avail=rd(OUT+12);return rc;
+}
 int main(void) {
  CHECK(vm_init()==CELL_OK);
  sys_memory_init(&table);
@@ -40,7 +51,7 @@ int main(void) {
  CHECK(size_of(DEFAULT_CID,&total,&avail)==CELL_OK); CHECK(total==USER_TOTAL&&avail==USER_TOTAL);
  CHECK(create(16*MB)==CELL_OK); uint32_t a=rd(OUT); CHECK(a!=0);
  CHECK(size_of(DEFAULT_CID,&total,&avail)==CELL_OK); CHECK(avail==USER_TOTAL-16*MB);
- { ppu_context c={0};c.gpr[3]=OUT+8;CHECK(sys_memory_get_user_memory_size(&c)==CELL_OK);CHECK(rd(OUT+12)==USER_TOTAL-16*MB); }
+ { ppu_context c={0};c.gpr[3]=OUT+8;CHECK(sys_memory_get_user_memory_size(&c)==CELL_OK);CHECK(rd(OUT+8)==USER_TOTAL-16*MB&&rd(OUT+12)==USER_TOTAL-16*MB); }
  CHECK(size_of(a,&total,&avail)==CELL_OK); CHECK(total==16*MB&&avail==16*MB);
 
  /* An allocation in the container is charged to it alone, not a second time to the default pool. */
@@ -73,6 +84,55 @@ int main(void) {
  CHECK(size_of(b,&total,&avail)==CELL_OK); CHECK(total==8*MB&&avail==8*MB);
  CHECK(destroy(b)==CELL_OK);
  CHECK(size_of(DEFAULT_CID,&total,&avail)==CELL_OK); CHECK(avail==USER_TOTAL);
+
+ /* The default pool's total is the user memory less its containers: it drops with a container's size and comes
+  * back with it, next to the available amount (golden container.changes_user_memory). */
+ CHECK(user_memory(&total,&avail)==CELL_OK); CHECK(total==USER_TOTAL&&avail==USER_TOTAL);
+ CHECK(create(4*MB)==CELL_OK); uint32_t c4=rd(OUT);
+ CHECK(user_memory(&total,&avail)==CELL_OK); CHECK(total==USER_TOTAL-4*MB&&avail==USER_TOTAL-4*MB);
+ CHECK(size_of(DEFAULT_CID,&total,&avail)==CELL_OK); CHECK(total==USER_TOTAL-4*MB&&avail==USER_TOTAL-4*MB);
+ CHECK(destroy(c4)==CELL_OK);
+ CHECK(user_memory(&total,&avail)==CELL_OK); CHECK(total==USER_TOTAL&&avail==USER_TOTAL);
+
+ /* A size below 1 MiB, 0 included, is nothing to create (CELL_ENOMEM): no id is written and nothing is taken
+  * (golden container.create_sizes). */
+ { const uint64_t small[]={0,1,MB-1};
+   for (unsigned i=0;i<3;++i) {
+     memset(vm_base+OUT,0x5A,4);
+     CHECK(create64(small[i])==(int64_t)(int32_t)CELL_ENOMEM); CHECK(rd(OUT)==0x5A5A5A5Au);
+     CHECK(user_memory(&total,&avail)==CELL_OK); CHECK(total==USER_TOTAL&&avail==USER_TOTAL);
+   } }
+
+ /* An accepted size rounds down to a whole number of MiB, and that is what the container holds and costs. */
+ { const uint64_t in[]={MB+1,MB+MB/2,2*MB+1}; const uint32_t out[]={MB,MB,2*MB};
+   for (unsigned i=0;i<3;++i) {
+     CHECK(create64(in[i])==CELL_OK); uint32_t id=rd(OUT);
+     CHECK(size_of(id,&total,&avail)==CELL_OK); CHECK(total==out[i]&&avail==out[i]);
+     CHECK(user_memory(&total,&avail)==CELL_OK); CHECK(total==USER_TOTAL-out[i]&&avail==USER_TOTAL-out[i]);
+     CHECK(destroy(id)==CELL_OK);
+   } }
+
+ /* More than the pool holds is CELL_ENOMEM, and the 64-bit size is judged whole: 4 GiB + 1 MiB is not 1 MiB. */
+ CHECK(create64(1ull<<30)==(int64_t)(int32_t)CELL_ENOMEM);
+ CHECK(create64(1ull<<32)==(int64_t)(int32_t)CELL_ENOMEM);
+ CHECK(create64((1ull<<32)+MB)==(int64_t)(int32_t)CELL_ENOMEM);
+ CHECK(user_memory(&total,&avail)==CELL_OK); CHECK(total==USER_TOTAL&&avail==USER_TOTAL);
+
+ /* With every slot taken a size the pool can cover is CELL_EAGAIN, but one it cannot (or 0) is CELL_ENOMEM first
+  * (RPCS3 6e4b784d1 sys_memory.cpp:436-460; the golden is silent). */
+ { uint32_t ids[SYS_MEMORY_CONTAINER_MAX];
+   for (unsigned i=0;i<SYS_MEMORY_CONTAINER_MAX;++i) { CHECK(create(MB)==CELL_OK); ids[i]=rd(OUT); }
+   CHECK(create(MB)==(int64_t)(int32_t)CELL_EAGAIN);
+   CHECK(create64(1ull<<30)==(int64_t)(int32_t)CELL_ENOMEM);
+   CHECK(create64(0)==(int64_t)(int32_t)CELL_ENOMEM);
+   for (unsigned i=0;i<SYS_MEMORY_CONTAINER_MAX;++i) CHECK(destroy(ids[i])==CELL_OK);
+ }
+ CHECK(user_memory(&total,&avail)==CELL_OK); CHECK(total==USER_TOTAL&&avail==USER_TOTAL);
+
+ /* The out pointer of the size query is a span the title chose: outside guest memory is the named stop. */
+ { ppu_context c={0}; c.gpr[3]=0xFFFFFFFCu;
+   GR_TRY(sys_memory_get_user_memory_size(&c));
+   CHECK(gr_named("sys_memory_get_user_memory_size","info")); }
 
  vm_shutdown();printf("PASS %u memory container checks\n",checks);return 0;
 }

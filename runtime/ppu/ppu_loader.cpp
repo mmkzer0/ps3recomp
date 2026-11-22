@@ -3308,14 +3308,6 @@ extern "C" void lv2_syscall(ppu_context* ctx)
         PS3_LOG(PS3_LOG_INFO, "sc-caller", "port_send(port=1) from func_%08X+0x%llX data=0x%08X/0x%08X/0x%08X\n",
                 bg,(unsigned long long)(tgt-bh),(uint32_t)ctx->gpr[4],(uint32_t)ctx->gpr[5],(uint32_t)ctx->gpr[6]); } }
     switch (num) {
-    case 352: {   /* sys_memory_get_user_memory_size(sys_memory_info_t* info)
-                   * info = { u32 total_user_memory; u32 available_user_memory } */
-        uint32_t info = (uint32_t)ctx->gpr[3];
-        if (info) { vm_write32(info + 0, 0x10000000u);   /* 256 MB total */
-                    vm_write32(info + 4, 0x0C000000u); } /* 192 MB available */
-        ctx->gpr[3] = 0;
-        return;
-    }
     case 330: {   /* sys_mmapper_allocate_address(u64 size, u64 flags,
                    * u64 alignment, u32* alloc_addr) -> reserve guest VA range */
         int64_t rc = sys_mmapper_allocate_address(ctx);

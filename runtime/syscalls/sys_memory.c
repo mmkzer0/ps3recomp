@@ -20,6 +20,7 @@ uint32_t g_sys_mem_bump_ptr = 0;
 
 /* Total user memory size (default 213 MB, after kernel reservation) */
 #define SYS_MEM_USER_TOTAL  (213 * 1024 * 1024)
+#define SYS_MEM_CONTAINER_GRANULE (1024 * 1024)   /* a container is a whole number of 1 MiB */
 #define SYS_MEMORY_CONTAINER_DEFAULT 0xFFFFFFFFu   /* SYS_MEMORY_CONTAINER_ID_INVALID: the default container */
 
 /* LV2 user memory and mapper reservations occupy separate address domains.
@@ -55,6 +56,17 @@ static pthread_mutex_t s_bump_mtx = PTHREAD_MUTEX_INITIALIZER;
 static void bump_lock(void)   { pthread_mutex_lock(&s_bump_mtx); }
 static void bump_unlock(void) { pthread_mutex_unlock(&s_bump_mtx); }
 #endif
+
+/* The default pool's total: the user memory less what the containers carved out of it, so creating a container
+ * lowers the total as well as the available amount (golden container.changes_user_memory; RPCS3 6e4b784d1
+ * sys_memory.cpp:387-393). Call with the allocator lock held. */
+static uint32_t default_pool_total_locked(void)
+{
+    uint32_t total = SYS_MEM_USER_TOTAL;
+    for (int i = 0; i < SYS_MEMORY_CONTAINER_MAX; i++)
+        if (g_sys_mem_containers[i].active) total -= g_sys_mem_containers[i].total_size;
+    return total;
+}
 
 static void write_be32(uint32_t addr, uint32_t val)
 {
@@ -213,9 +225,10 @@ int64_t sys_memory_get_user_memory_size(ppu_context* ctx)
 
     PS3_LOG(PS3_LOG_INFO, "sys_memory", "get_user_memory_size()\n");
     if (out_addr != 0) {
-        uint32_t total = SYS_MEM_USER_TOTAL;
+        memory_out_span("sys_memory_get_user_memory_size", "info", out_addr, 8);
         bump_lock();
-        uint32_t avail = total - s_total_allocated;
+        uint32_t total = default_pool_total_locked();
+        uint32_t avail = SYS_MEM_USER_TOTAL - s_total_allocated;
         bump_unlock();
         write_be32(out_addr + 0, total);
         write_be32(out_addr + 4, avail);
@@ -280,11 +293,22 @@ int64_t sys_memory_get_page_attribute(ppu_context* ctx)
 int64_t sys_memory_container_create(ppu_context* ctx)
 {
     uint32_t id_out_addr = LV2_ARG_PTR(ctx, 0);
-    uint32_t size        = LV2_ARG_U32(ctx, 1);
+    uint64_t size        = LV2_ARG_U64(ctx, 1);
+
+    /* The kernel rounds a container down to 1 MiB, so a size below that, 0 included, is nothing to create:
+     * the console answers CELL_ENOMEM for 0x0, 0x1 and 0xFFFFF, and a 64-bit size (1 << 32) is the whole
+     * size, not its low word (golden container.create_sizes, container.create_too_big). */
+    size &= ~(uint64_t)(SYS_MEM_CONTAINER_GRANULE - 1u);
+    if (!size) return (int64_t)(int32_t)CELL_ENOMEM;
 
     /* Before the lock: a stop must not leave the allocator lock held. */
     if (id_out_addr != 0) memory_out_span("sys_memory_container_create", "cid", id_out_addr, 4);
     bump_lock();
+    /* The pool is asked before the table: with the pool short the answer is ENOMEM whether or not a slot is
+     * free, and EAGAIN is only for a full table (RPCS3 6e4b784d1 sys_memory.cpp:446-460; the golden is silent). */
+    if (size > SYS_MEM_USER_TOTAL - s_total_allocated) {
+        bump_unlock(); return (int64_t)(int32_t)CELL_ENOMEM;
+    }
     int slot = -1;
     for (int i = 0; i < SYS_MEMORY_CONTAINER_MAX; i++) {
         if (!g_sys_mem_containers[i].active) { slot = i; break; }
@@ -292,15 +316,12 @@ int64_t sys_memory_container_create(ppu_context* ctx)
     if (slot < 0) {
         bump_unlock(); return (int64_t)(int32_t)CELL_EAGAIN;
     }
-    if (size > SYS_MEM_USER_TOTAL - s_total_allocated) {
-        bump_unlock(); return (int64_t)(int32_t)CELL_ENOMEM;
-    }
 
     sys_mem_container_info* c = &g_sys_mem_containers[slot];
     c->active     = 1;
-    c->total_size = size;
+    c->total_size = (uint32_t)size;
     c->used_size  = 0;
-    s_total_allocated += size;
+    s_total_allocated += (uint32_t)size;
     bump_unlock();
 
     uint32_t container_id = (uint32_t)(slot + 1);
@@ -363,9 +384,10 @@ int64_t sys_memory_container_get_size(ppu_context* ctx)
         if (out_addr != 0) {
             memory_out_span("sys_memory_container_get_size", "info", out_addr, 8);
             bump_lock();
+            const uint32_t total = default_pool_total_locked();
             const uint32_t avail = SYS_MEM_USER_TOTAL - s_total_allocated;
             bump_unlock();
-            write_be32(out_addr + 0, SYS_MEM_USER_TOTAL);
+            write_be32(out_addr + 0, total);
             write_be32(out_addr + 4, avail);
         }
         return CELL_OK;
