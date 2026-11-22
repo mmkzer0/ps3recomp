@@ -35,6 +35,21 @@ void spu_lockline_unlock(void) {}
 void spu_lockguard_check(spu_context* c, uint32_t ea, const uint8_t* p, uint32_t n, const char* what)
 { (void)c; (void)ea; (void)p; (void)n; (void)what; }
 void spu_ch_wake(spu_context* c) { (void)c; }
+/* Every transfer here is valid: an MFC error stop (spu_dma.h) is a failure of this test. */
+void ps3_stop(ps3_stop_kind k, const char* what, const char* remedy, const ps3_stop_field* f, size_t n,
+              const ps3_stop_site* site)
+{ (void)remedy; (void)f; (void)n; (void)site; fprintf(stdout, "FAIL: stop %d: %s\n", (int)k, what); exit(2); }
+/* No label window is registered here; a PUT into one is a failure of this test. */
+void ps3_stop_spu_label_window(const char* func, uint32_t cmd, uint64_t ea, uint32_t size,
+                               uint32_t tag, uint64_t count, const ps3_stop_site* site)
+{ (void)func; (void)cmd; (void)ea; (void)size; (void)tag; (void)count; (void)site;
+  fprintf(stdout, "FAIL: spu-label-window stop\n"); exit(2); }
+/* Runtime functions outside the path under test. ps3_log_configure (runtime/diag/ps3_log.c) reads the
+ * configuration and installs the stop mirror; this fixture never configures a log. */
+static ps3_config s_test_config;
+const ps3_config* ps3_config_get(void) { return &s_test_config; }
+void ps3_stop_set_mirror(ps3_stop_quiesce_fn quiesce, ps3_stop_mirror_fn mirror)
+{ (void)quiesce; (void)mirror; }
 
 static void check(int ok, const char* what)
 {
@@ -57,21 +72,21 @@ int main(void)
     for (unsigned i = 0; i < 0x200; i++) ctx->ls[0x1000 + i] = (uint8_t)(0x40 + i);
 
     /* 1: a PUT covering the word -> one report, and the bytes land. */
-    check(mfc_do_transfer(ctx, 0x1000, 0x20040, 16, MFC_PUT_CMD) == 0, "PUT covering");
+    check(mfc_do_transfer(ctx, 0x1000, 0x20040, 16, MFC_PUT_CMD, 0) == 0, "PUT covering");
     check(memcmp(memory + 0x20040, ctx->ls + 0x1000, 16) == 0, "PUT bytes");
     /* 2: a PUT ending just before the word -> nothing. */
-    check(mfc_do_transfer(ctx, 0x1000, 0x20000, 0x44, MFC_PUT_CMD) == 0, "PUT before");
+    check(mfc_do_transfer(ctx, 0x1000, 0x20000, 0x44, MFC_PUT_CMD, 0) == 0, "PUT before");
     /* 3: a PUT starting just after the word -> nothing. */
-    check(mfc_do_transfer(ctx, 0x1000, 0x20048, 16, MFC_PUT_CMD) == 0, "PUT after");
+    check(mfc_do_transfer(ctx, 0x1000, 0x20048, 16, MFC_PUT_CMD, 0) == 0, "PUT after");
     /* 4: a GET covering the word -> nothing (it does not write guest memory). */
-    check(mfc_do_transfer(ctx, 0x1100, 0x20040, 16, MFC_GET_CMD) == 0, "GET covering");
+    check(mfc_do_transfer(ctx, 0x1100, 0x20040, 16, MFC_GET_CMD, 0) == 0, "GET covering");
     /* 5: a two-element list PUT whose second element covers the word -> one report. */
     spu_ls_write32(ctx, 0x100, 16); spu_ls_write32(ctx, 0x104, 0x30000);
     spu_ls_write32(ctx, 0x108, 16); spu_ls_write32(ctx, 0x10C, 0x20040);
     check(mfc_run_list(ctx, 0x100, 2, 0x1000, 0, MFC_PUTL_CMD, 5) == 0, "list PUT");
     check(memcmp(memory + 0x20040, ctx->ls + 0x1010, 16) == 0, "list element bytes");
     /* 6: SDCRZ over the word's 128-byte block -> one report, word zeroed. */
-    check(mfc_do_transfer(ctx, 0, 0x20000, 128, MFC_SDCRZ_CMD) == 0, "SDCRZ covering");
+    check(mfc_do_transfer(ctx, 0, 0x20000, 128, MFC_SDCRZ_CMD, 0) == 0, "SDCRZ covering");
     check(memory[WATCH] == 0 && memory[WATCH + 3] == 0, "SDCRZ zeroed");
 
     free(ctx);

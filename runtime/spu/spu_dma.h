@@ -245,8 +245,11 @@ __attribute__((noinline, cold, unused))   /* unused: not every includer transfer
 static void spu_put_watch_hit(const spu_context* spu, uint32_t lsa, uint64_t ea, uint32_t size,
                               uint32_t cmd, uint32_t watch)
 {
-    static volatile LONG s_hits = 0;   /* saturates at the cap */
-    if (InterlockedIncrement(&s_hits) > 20000) { InterlockedExchange(&s_hits, 20001); return; }
+    static _Atomic int s_hits;   /* saturates at the cap; a count, so relaxed orders carry no other data */
+    if (atomic_fetch_add_explicit(&s_hits, 1, memory_order_relaxed) + 1 > 20000) {
+        atomic_store_explicit(&s_hits, 20001, memory_order_relaxed);
+        return;
+    }
     const uint32_t off = watch - (uint32_t)ea;
     const uint8_t* now = vm_base + watch;
     const uint32_t before = (uint32_t)now[0] << 24 | (uint32_t)now[1] << 16 | (uint32_t)now[2] << 8 | now[3];

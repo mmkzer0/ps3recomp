@@ -24,9 +24,14 @@ class SpuPutWatchTests(unittest.TestCase):
         cls.tmp = tempfile.TemporaryDirectory()
         cls.addClassCleanup(cls.tmp.cleanup)
         cls.exe = Path(cls.tmp.name) / ('put-watch.exe' if os.name == 'nt' else 'put-watch')
+        # The fixture stubs ps3_stop and the configuration; the real run log, label window and host clock
+        # come from the runtime, as for tools/test_mfc_resume_elements.py.
         cmd = [cc, '-std=gnu17', '-O2', '-I', str(ROOT / 'include'), '-I', str(ROOT / 'runtime/spu'),
                '-I', str(ROOT / 'runtime/platform'), str(ROOT / 'runtime/spu/tests/test_spu_put_watch.c'),
-               str(ROOT / 'runtime/platform/win32_compat.c'), '-o', str(cls.exe)]
+               str(ROOT / 'runtime/diag/ps3_log.c'), str(ROOT / 'runtime/diag/host_exit.c'),
+               str(ROOT / 'runtime/memory/label_window.c'), str(ROOT / 'runtime/platform/win32_compat.c'),
+               str(ROOT / 'runtime/platform/host_clock.c'), str(ROOT / 'runtime/platform/host_wait.c'),
+               '-o', str(cls.exe)]
         if os.name != 'nt':
             cmd.insert(1, '-pthread')
         subprocess.run(cmd, check=True, capture_output=True, text=True)
