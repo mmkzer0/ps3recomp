@@ -27,10 +27,10 @@ The stock map lists 632 slots with a real handler; 392 point at the shared ENOSY
 
 | verdict | slots |
 |---|---:|
-| `ok` | 164 |
+| `ok` | 167 |
 | `toolkit-handler-on-hw-enosys` | 0 |
 | `hw-enosys-unregistered` | 376 |
-| `hw-real-unregistered` | 468 |
+| `hw-real-unregistered` | 465 |
 | `conflict-4.93-vs-rpcs3` | 16 |
 | **total** | **1024** |
 
@@ -400,9 +400,9 @@ None.
 | 347 | enosys | enosys | null | none | hw-enosys-unregistered |
 | 348 | handler | handler | bind | handler | ok |
 | 349 | handler | handler | bind | handler | ok |
-| 350 | handler | handler | bind | none | hw-real-unregistered |
+| 350 | handler | handler | bind | handler | ok |
 | 351 | handler | handler | bind | handler | ok |
-| 352 | handler | handler | bind | loader-case | ok |
+| 352 | handler | handler | bind | handler | ok |
 | 353 | handler | handler | bind | none | hw-real-unregistered |
 | 354 | handler | handler | null | none | hw-real-unregistered |
 | 355 | handler | handler | null | none | hw-real-unregistered |
@@ -680,8 +680,8 @@ None.
 | 627 | handler | handler | bind | none | hw-real-unregistered |
 | 628 | enosys | enosys | null | none | hw-enosys-unregistered |
 | 629 | enosys | enosys | null | none | hw-enosys-unregistered |
-| 630 | handler | handler | bind | none | hw-real-unregistered |
-| 631 | handler | handler | bind | none | hw-real-unregistered |
+| 630 | handler | handler | bind | loader-case | ok |
+| 631 | handler | handler | bind | loader-case | ok |
 | 632 | enosys | enosys | null | none | hw-enosys-unregistered |
 | 633 | enosys | enosys | null | none | hw-enosys-unregistered |
 | 634 | enosys | enosys | null | none | hw-enosys-unregistered |
