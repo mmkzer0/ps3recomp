@@ -22,9 +22,8 @@
 #include "../platform/win32_compat.h"
 #include "../memory/vm.h"   /* VM_HLE_INJECT_BASE -- not platform-specific */
 #include "../syscalls/sys_lwsync.h"   /* ps3_lwsync_register */
-#ifndef _WIN32
-#include "../platform/host_clock.h"   /* host_monotonic_ns; sys_timer.h is not included, its lv2 headers redefine ppu_context */
-#endif
+/* sys_timer.h: not included, its lv2 headers redefine ppu_context. */
+extern "C" uint64_t ps3_system_time_us(void);   /* runtime/syscalls/sys_timer.c */
 #include "ps3emu/ps3_log.h"   /* PS3_LOG: tagged lines, stderr bytes unchanged */
 
 extern "C" uint8_t* vm_base;
@@ -66,23 +65,12 @@ static void sys_initialize_tls(ppu_context* ctx)
  * wall-time. LBP's Bink movie clock (sysGetSystemTime import 0x8461E528
  * lands here) paced the intro at ~1/10th speed: video decoded at <1 fps,
  * the audio preload threshold took forever to fill (movie stayed silent),
- * and every frontend animation timed off it crawled. */
+ * and every frontend animation timed off it crawled. The clock is
+ * ps3_system_time_us (sys_timer.c: from host boot on every host, #788, and the
+ * host clock the timebase uses), shared with cellGcmGetLastFlipTime (#783). */
 static void sys_time_get_system_time(ppu_context* ctx)
 {
-#ifdef _WIN32
-    /* From host boot (#788), as the POSIX clock below counts and as the console
-     * does: a per-process anchor made every launch start at 0 and so seed
-     * clock-derived RNGs identically. Split multiply keeps it overflow-safe. */
-    static LARGE_INTEGER s_freq;
-    if (!s_freq.QuadPart) QueryPerformanceFrequency(&s_freq);
-    LARGE_INTEGER now; QueryPerformanceCounter(&now);
-    const uint64_t d = (uint64_t)now.QuadPart, q = (uint64_t)s_freq.QuadPart;
-    ctx->gpr[3] = (d / q) * 1000000ull + (d % q) * 1000000ull / q;
-#else
-    /* The same host clock as the timebase (sys_timer.h), so guest code that
-     * mixes mftb and this stays consistent. */
-    ctx->gpr[3] = host_monotonic_ns() / 1000ull;
-#endif
+    ctx->gpr[3] = ps3_system_time_us();
 }
 
 /* sys_process_is_stack(u32 addr) -> 1 if addr is in the stack region. We model

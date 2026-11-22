@@ -22,6 +22,7 @@ int spu_taskset_round_busy(uint32_t* ts, uint32_t* tid) { (void)ts; (void)tid; r
 
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
+uint64_t ps3_system_time_us(void) { return 0; }   /* sys_timer.c */
 uint32_t g_ww_lo, g_ww_hi;
 void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; abort(); }
 int spu_coh_is_reserved(uint32_t addr) { (void)addr; return 0; }

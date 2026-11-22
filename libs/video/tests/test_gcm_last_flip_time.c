@@ -1,6 +1,8 @@
-/* clang -std=gnu17 -I include -I libs/video
- *   libs/video/tests/test_gcm_last_flip_time.c -Wl,-dead_strip -pthread
+/* cc -std=gnu17 -I include -I libs/video libs/video/tests/test_gcm_last_flip_time.c
+ *   runtime/memory/label_window.c runtime/diag/host_exit.c runtime/diag/ps3_log.c tests/ps3_log_mirror_stub.c
+ *   libs/video/gcm_default_state.c -ffunction-sections -fdata-sections -Wl,--gc-sections -pthread -lm
  *   -o /tmp/test_gcm_last_flip_time && /tmp/test_gcm_last_flip_time
+ *   (clang on macOS: -Wl,-dead_strip)   (tools/test_gcm_last_flip_time.py)
  *
  * cellGcmGetLastFlipTime is the guest system time (microseconds, the clock
  * sys_time_get_system_time returns) of the last flip that completed. Titles
@@ -9,13 +11,12 @@
  * requested. The system clock is faked here so each stamp is exact.
  */
 #include "../cellGcmSys.c"
+#include "gcm_fixture_stubs.h"   /* ps3_config_get and the named stops cellGcmSys.c ends in */
 #include "../rsx_tiling.c"
 #include <assert.h>
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
-int g_resv_store_active;
 uint32_t g_ww_lo, g_ww_hi;
-void ppu_resv_break_store(uint64_t ea) { (void)ea; }
 void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
 int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
 void spu_coh_notify_write(uint32_t a) { (void)a; }

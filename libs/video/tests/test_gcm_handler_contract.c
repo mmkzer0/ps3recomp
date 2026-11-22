@@ -31,6 +31,7 @@ int spu_taskset_round_busy(uint32_t* ts, uint32_t* tid) { (void)ts; (void)tid; r
 #include <sys/mman.h>
 
 uint8_t* vm_base;
+uint64_t ps3_system_time_us(void) { return 0; }   /* sys_timer.c */
 int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
 void spu_coh_notify_write(uint32_t a) { (void)a; }
 void spu_lockline_lock(void) {}

@@ -678,8 +678,18 @@ static CellGcmVBlankHandler  s_vblank_handler  = NULL;
 static CellGcmUserHandler    s_user_handler    = NULL;
 static CellGcmSecondVHandler s_second_v_handler = NULL;
 
-/* Flip timing */
-static u64 s_last_flip_time = 0;
+/* Flip timing: the guest system time (microseconds, sys_time_get_system_time's clock) of the last
+ * flip that completed. Titles pace their frames as period - (system time - this), so the unit and
+ * the clock must be the same as theirs (upstream #783: it was absolute host nanoseconds taken at the
+ * request, which made that difference meaningless and every such limiter sleep its whole period).
+ * Stamped where a flip completes (cellGcm_request_tick, cellGcmTickFlip) and at SetPrepareFlip,
+ * which completes at once; written by the vblank thread and read by any PPU thread. */
+uint64_t ps3_system_time_us(void);   /* runtime/syscalls/sys_timer.c */
+static _Atomic u64 s_last_flip_time = 0;
+static void gcm_stamp_flip_time(void)
+{
+    atomic_store_explicit(&s_last_flip_time, ps3_system_time_us(), memory_order_release);
+}
 
 /* VBlank counter: vblanks raised since init. Written by the vblank thread (cellGcm_request_tick,
  * cellGcm_vblank_signal) and read by any PPU thread (cellGcmGetVBlankCount) and by the handler pump. */
@@ -1177,7 +1187,7 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
     s_vblank_handler = NULL;
     s_user_handler = NULL;
     s_second_v_handler = NULL;
-    s_last_flip_time = get_timestamp_ns();
+    atomic_store_explicit(&s_last_flip_time, ps3_system_time_us(), memory_order_release);
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
     s_flip_mode = CELL_GCM_DISPLAY_VSYNC;
     s_debug_level = CELL_GCM_DEBUG_LEVEL0;
@@ -1536,7 +1546,7 @@ void cellGcm_request_tick(void)
       if (need) {
           u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
           const int flip = s_fifo_getoff == put;
-          if (flip) { FLIP_LOCK(); s_flip_tick_seq = s_flip_req_seq; FLIP_UNLOCK(); }
+          if (flip) { FLIP_LOCK(); s_flip_tick_seq = s_flip_req_seq; gcm_stamp_flip_time(); FLIP_UNLOCK(); }
           GCM_PENDING_SET(flip ? 3 : 1);
           return;
       } }
@@ -1548,7 +1558,7 @@ void cellGcm_request_tick(void)
      * are unaffected. The completion is stamped with the flip requested last
      * (see ppu_gcm_pump). */
     if (gcm_flip_executed_take()) {
-        FLIP_LOCK(); s_flip_tick_seq = s_flip_req_seq; FLIP_UNLOCK();
+        FLIP_LOCK(); s_flip_tick_seq = s_flip_req_seq; gcm_stamp_flip_time(); FLIP_UNLOCK();
         GCM_PENDING_SET(3);
     } else {
         GCM_PENDING_SET(1);
@@ -1790,7 +1800,7 @@ void cellGcmTickFlip(void)
      * not happened yet. */
     FLIP_LOCK();
     const int waiting = s_flip_status == CELL_GCM_FLIP_STATUS_WAITING && gcm_flip_executed_take();
-    if (waiting) s_flip_tick_seq = s_flip_req_seq;
+    if (waiting) { s_flip_tick_seq = s_flip_req_seq; gcm_stamp_flip_time(); }
     FLIP_UNLOCK();
     if (waiting) GCM_PENDING_SET(2);
 }
@@ -5270,7 +5280,8 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
     s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
     s_flip_req_seq++;
     FLIP_UNLOCK();
-    s_last_flip_time = get_timestamp_ns();
+    /* cellGcmGetLastFlipTime is stamped where the flip completes (the beat that shows it, in
+     * cellGcm_request_tick and cellGcmTickFlip), not here at the request. */
     if (PS3_FT_ON()) { const uint64_t t = ps3_ft_now();
                        ps3_ft_span(PS3_FT_FLIP_REQ, 0, bufferId, (uint32_t)in_fifo, t, t); }
 
@@ -5479,7 +5490,7 @@ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
     /* As in gcm_flip_request: the guest's flip clock advances at the request, whatever the present
      * boundary above does. */
     atomic_fetch_add_explicit(&s_guest_flip_requests, 1, memory_order_release);
-    s_last_flip_time = get_timestamp_ns();
+    gcm_stamp_flip_time();
 
     /* Invoke the guest flip handler via OPD resolution -- s_flip_handler holds
      * the raw guest OPD (e.g. 0x530D70); calling it as a host function pointer
@@ -5549,7 +5560,7 @@ void cellGcmSetUserHandler(CellGcmUserHandler handler)
 /* NID: 0x63387071 */
 u64 cellGcmGetLastFlipTime(void)
 {
-    return s_last_flip_time;
+    return atomic_load_explicit(&s_last_flip_time, memory_order_acquire);
 }
 
 /* ---------------------------------------------------------------------------
@@ -6407,7 +6418,7 @@ void cellGcmTerminate(void)
     memset(s_io_address_table, 0xFF, sizeof(s_io_address_table));
     memset(s_ea_address_table, 0xFF, sizeof(s_ea_address_table));
     s_current_display_buffer_id = 0;
-    s_last_flip_time = 0;
+    atomic_store_explicit(&s_last_flip_time, 0, memory_order_release);
 }
 
 /* Return remaining IO map space (256MB total IO space minus already mapped) */
