@@ -7,6 +7,9 @@ set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"
 RPCS3="${RPCS3_SRC:-$HERE/../../../../rpcs3}"
 OUT="$HERE/build_diff"
+# spu_interp.c includes ps3emu/ps3_log.h and logs through it; the differential compares results, so the log is the
+# stub in rpcs3_oracle/log_stub.c (it admits nothing), not the runtime's.
+REPO_INCLUDE="$HERE/../../../include"
 CC="${CC:-clang}"; CXX="${CXX:-clang++}"
 # Flags for the interpreter/lifter side (the thing under test): e.g. CFLAGS="-mavx2 -mfma", CFLAGS="-DSPU_SCALAR_HELPERS".
 CFLAGS="${CFLAGS:-}"
@@ -18,14 +21,15 @@ mkdir -p "$OUT"
 python3 "$HERE/rpcs3_oracle/extract.py" "$RPCS3" "$OUT/oracle_src.cpp"
 "$CXX" -std=gnu++20 -O2 -w -ffp-model=strict $ORACLE_ARCH -c -I"$HERE/rpcs3_oracle/shim" -I"$HERE/rpcs3_oracle" -I"$OUT" \
     -I"$RPCS3/rpcs3" -I"$RPCS3" -I"$RPCS3/3rdparty/asmjit/asmjit/src" "$OUT/oracle_src.cpp" -o "$OUT/oracle.o"
-"$CC" -std=gnu11 -O2 -w $CFLAGS -I"$HERE/.." -I"$HERE/rpcs3_oracle" -I"$OUT" -c "$HERE/spu_interp_diff_test.c" -o "$OUT/diff_test.o"
-"$CXX" "$OUT/diff_test.o" "$OUT/oracle.o" -o "$OUT/spu_interp_diff_test" -lm
+"$CC" -std=gnu11 -O2 -w -I"$REPO_INCLUDE" -c "$HERE/rpcs3_oracle/log_stub.c" -o "$OUT/log_stub.o"
+"$CC" -std=gnu11 -O2 -w $CFLAGS -I"$HERE/.." -I"$REPO_INCLUDE" -I"$HERE/rpcs3_oracle" -I"$OUT" -c "$HERE/spu_interp_diff_test.c" -o "$OUT/diff_test.o"
+"$CXX" "$OUT/diff_test.o" "$OUT/log_stub.o" "$OUT/oracle.o" -o "$OUT/spu_interp_diff_test" -lm
 echo "built $OUT/spu_interp_diff_test"
 # lifted mode: sample instruction words, lift each with tools/spu_lifter.py, compile that C into a second binary
 "$OUT/spu_interp_diff_test" --emit-cases "${CASE_SCALE:-1}" > "$OUT/cases.txt"
 python3 "$HERE/gen_lifted_cases.py" "$OUT/cases.txt" > "$OUT/lifted_cases.inc"
-"$CC" -std=gnu11 -O2 -fwrapv -w $CFLAGS -DLIFTED_CASES_INC=\"lifted_cases.inc\" -I"$HERE/.." -I"$HERE/rpcs3_oracle" -I"$OUT" -c "$HERE/spu_interp_diff_test.c" -o "$OUT/diff_test_lifted.o"
-"$CXX" "$OUT/diff_test_lifted.o" "$OUT/oracle.o" -o "$OUT/spu_lifted_diff_test" -lm
+"$CC" -std=gnu11 -O2 -fwrapv -w $CFLAGS -DLIFTED_CASES_INC=\"lifted_cases.inc\" -I"$HERE/.." -I"$REPO_INCLUDE" -I"$HERE/rpcs3_oracle" -I"$OUT" -c "$HERE/spu_interp_diff_test.c" -o "$OUT/diff_test_lifted.o"
+"$CXX" "$OUT/diff_test_lifted.o" "$OUT/log_stub.o" "$OUT/oracle.o" -o "$OUT/spu_lifted_diff_test" -lm
 echo "built $OUT/spu_lifted_diff_test  (run with --lifted)"
 # --run: both modes. The single-precision float ops and conversions are judged
 # against the SPU ISA (spu_float_referee.py, exact arithmetic) wherever RPCS3's
