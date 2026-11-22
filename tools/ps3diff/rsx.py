@@ -74,7 +74,7 @@ BLOB_OPTIONAL = frozenset({"offset", "kind"})
 DROP_REASONS = frozenset({
     "not-ready", "no-packets", "fetch-failed", "mixed-sources", "needs-expansion", "unsupported-topology",
     "no-vertices", "topology-rebuild-failed", "no-indices", "no-targets", "pipeline-failed", "debug-skip",
-    "texture-feedback", "index-alloc-failed", "constant-alloc-failed",
+    "texture-feedback", "index-alloc-failed", "constant-alloc-failed", "empty-scissor",
 })
 
 #: The readback formats the contract defines, and their bytes per pixel.
