@@ -3445,6 +3445,30 @@ extern "C" void lv2_syscall(ppu_context* ctx)
         ctx->gpr[3] = 0;
         return;
     }
+    /* sys_gpio_set / sys_gpio_get answer as RPCS3 6e4b784d1 rpcs3/Emu/Cell/lv2/sys_gpio.cpp:8-39 does: a retail
+     * console has neither the LED (device 1) nor the DIP switch (device 2), so nothing is stored and a read is
+     * always 0. No firmware RE of these two handlers exists, so RPCS3's answers stand. The cases follow
+     * sys_tty_write so the case 330..403 slice tools/test_loader_memory_domain.py runs stays unchanged. */
+    case 630: {   /* sys_gpio_set(u64 device_id, u64 mask, u64 value) */
+        uint32_t rc = CELL_ESRCH;
+        if (ctx->gpr[3] == 1) rc = CELL_OK;            /* LED: accepted, nothing to light */
+        else if (ctx->gpr[3] == 2) rc = CELL_EINVAL;   /* DIP switch: read-only */
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)rc;
+        return;
+    }
+    case 631: {   /* sys_gpio_get(u64 device_id, u64* value) */
+        if (ctx->gpr[3] != 1 && ctx->gpr[3] != 2) {
+            ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ESRCH;
+            return;
+        }
+        /* vm::ptr is 32-bit on the console; the span is the 8-byte store below. */
+        const uint32_t value = (uint32_t)ctx->gpr[4];
+        if (!vm_range_ok(value, 8))
+            ps3_stop_guest_range("sys_gpio_get", "value", value, 8, vm_guest_limit());
+        vm_write64(value, 0);
+        ctx->gpr[3] = 0;   /* CELL_OK */
+        return;
+    }
     default: {
         /* Consult the real lv2 syscall table (semaphore / mutex / cond /
          * rwlock / event / timer / memory / vm / fs / spu). Initialised by
