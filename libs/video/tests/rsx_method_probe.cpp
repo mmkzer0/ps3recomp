@@ -67,9 +67,12 @@ int main(int argc, char** argv)
         check(rsx_method_check(RSX_CLASS_NV4097, 0x0300, 1u, nullptr) == RSX_METHOD_INERT &&
               rsx_method_check(RSX_CLASS_NV4097, 0x0300, 0u, nullptr) == RSX_METHOD_MISSING,
               "the rule finder and the value check agree without an out-parameter");
-        check(rsx_method_check(RSX_CLASS_NV4097, 0x031C, 0u, nullptr) == RSX_METHOD_MISSING &&
-              rsx_method_check(RSX_CLASS_NV4097, 0x031C, 1u, nullptr) == RSX_METHOD_MISSING,
-              "an S2 gap is missing for every value (NV4097 0x031C blend colour)");
+        check(rsx_method_check(RSX_CLASS_NV308A, 0x02F8, 0u, nullptr) == RSX_METHOD_MISSING &&
+              rsx_method_check(RSX_CLASS_NV308A, 0x02F8, 1u, nullptr) == RSX_METHOD_MISSING,
+              "an S2 gap is missing for every value (NV308A 0x02F8 colour conversion)");
+        check(rsx_method_check(RSX_CLASS_NV4097, 0x031C, 0x80FF4020u, nullptr) == RSX_METHOD_HANDLED &&
+              rsx_method_check(RSX_CLASS_NV4097, 0x037C, 0x3C003C00u, nullptr) == RSX_METHOD_HANDLED,
+              "the blend constants are handled by the draw engine, not an S2 gap (NV4097 0x031C, 0x037C; #782)");
         const rsx_method_rule* l2 = nullptr;
         check(rsx_method_check(RSX_CLASS_NV4097, 0x1FD8, 0u, &l2) == RSX_METHOD_HANDLED && l2 &&
               has(l2->consumer, "rsx_draw_engine_method") &&

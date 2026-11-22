@@ -2865,6 +2865,8 @@ typedef struct {
     /* Polygon offset in Metal's terms (setDepthBias:slopeScale:clamp:),
      * dynamic encoder state like the stencil reference. */
     float depth_bias, depth_slope;
+    /* SET_BLEND_COLOR as r, g, b, a: what the constant blend factors multiply by (encoder state). */
+    float blend_color[4];
 } EngRecord;
 
 static EngRecord s_eng_rec[ENG_MAX_RECORDS];
@@ -4345,6 +4347,46 @@ static id<MTLFunction> eng_function(const char* hlsl, int stage,
     return fn;
 }
 
+/* The engine path's blend factor table: the vtable path's (blend_factor_to_metal) plus the four constant
+ * factors, which read the colour eng_set_blend_color bound. A value that is none of the RSX factors is not
+ * guessed at: it was drawn as ONE, a bloom or decal pass silently wrong, and now stops by name. RPCS3
+ * 6e4b784d1 maps exactly these fifteen and throws on any other (VK/VKGSRender.cpp:143-165), and only for a
+ * draw whose blend is on (:321), as here (DECISIONS F13). */
+static PS3_NORETURN void eng_blend_factor_stop(u32 factor)
+{
+    char value[16];
+    snprintf(value, sizeof value, "0x%04X", factor);
+    const ps3_stop_field fields[] = {
+        {"func", "eng_blend_factor_to_metal"}, {"feature", "blend-factor"},
+        {"reason", "unknown-factor"}, {"factor", value} };
+    eng_stop_standalone(PS3_STOP_GCM_UNMODELLED, "gcm-unmodelled",
+                        "the guest set a blend factor that is not an RSX blend factor",
+                        "the factors this renderer models are 0, 1, 0x0300..0x0308 and 0x8001..0x8004",
+                        fields, sizeof fields / sizeof fields[0]);
+}
+
+static MTLBlendFactor eng_blend_factor_to_metal(u32 f)
+{
+    switch (f) {
+    case 0x0000: return MTLBlendFactorZero;
+    case 0x0001: return MTLBlendFactorOne;
+    case 0x0300: return MTLBlendFactorSourceColor;
+    case 0x0301: return MTLBlendFactorOneMinusSourceColor;
+    case 0x0302: return MTLBlendFactorSourceAlpha;
+    case 0x0303: return MTLBlendFactorOneMinusSourceAlpha;
+    case 0x0304: return MTLBlendFactorDestinationAlpha;
+    case 0x0305: return MTLBlendFactorOneMinusDestinationAlpha;
+    case 0x0306: return MTLBlendFactorDestinationColor;
+    case 0x0307: return MTLBlendFactorOneMinusDestinationColor;
+    case 0x0308: return MTLBlendFactorSourceAlphaSaturated;
+    case 0x8001: return MTLBlendFactorBlendColor;
+    case 0x8002: return MTLBlendFactorOneMinusBlendColor;
+    case 0x8003: return MTLBlendFactorBlendAlpha;
+    case 0x8004: return MTLBlendFactorOneMinusBlendAlpha;
+    default:     eng_blend_factor_stop(f);
+    }
+}
+
 static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_hlsl,
                                const rsx_be_render_state* rs,
                                const rsx_vertex_layout_plan* layout,
@@ -4423,10 +4465,10 @@ static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
         ca.writeMask   = twm;
         if (tblend) {
             ca.blendingEnabled             = YES;
-            ca.sourceRGBBlendFactor        = blend_factor_to_metal(rs->sf_rgb);
-            ca.destinationRGBBlendFactor   = blend_factor_to_metal(rs->df_rgb);
-            ca.sourceAlphaBlendFactor      = blend_factor_to_metal(rs->sf_a);
-            ca.destinationAlphaBlendFactor = blend_factor_to_metal(rs->df_a);
+            ca.sourceRGBBlendFactor        = eng_blend_factor_to_metal(rs->sf_rgb);
+            ca.destinationRGBBlendFactor   = eng_blend_factor_to_metal(rs->df_rgb);
+            ca.sourceAlphaBlendFactor      = eng_blend_factor_to_metal(rs->sf_a);
+            ca.destinationAlphaBlendFactor = eng_blend_factor_to_metal(rs->df_a);
             ca.rgbBlendOperation           = blend_equation_to_metal(rs->eq_rgb);
             ca.alphaBlendOperation         = blend_equation_to_metal(rs->eq_a);
         }
@@ -4722,6 +4764,14 @@ static void eng_set_depth_bias(void* user, float slope, float units, u32 depth_b
     s_eng_pending.depth_bias  = depth_bits == 16u ? units * 256.0f : units;
 }
 
+/* The blend constant for the next draw (SET_BLEND_COLOR, decoded by the engine); encoder state, so it stays
+ * out of the pipeline key. */
+static void eng_set_blend_color(void* user, const float rgba[4])
+{
+    (void)user;
+    memcpy(s_eng_pending.blend_color, rgba, sizeof s_eng_pending.blend_color);
+}
+
 static void eng_draw(void* user, rsx_topology topology, const void* vertices,
                      u32 vertex_count, u32 stride, const u32* indices,
                      u32 index_count)
@@ -4823,6 +4873,8 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
     [enc setDepthClipMode:p->clip];
     [enc setStencilFrontReferenceValue:r->stencil_ref backReferenceValue:r->stencil_ref_back];
     [enc setDepthBias:r->depth_bias slopeScale:r->depth_slope clamp:0.0f];
+    [enc setBlendColorRed:r->blend_color[0] green:r->blend_color[1] blue:r->blend_color[2]
+                    alpha:r->blend_color[3]];
     MTLViewport vp = { r->vp[0], r->vp[1], r->vp[2], r->vp[3],
                        (double)r->vp_z[0], (double)r->vp_z[1] };
     [enc setViewport:vp];
@@ -5983,6 +6035,7 @@ static const rsx_draw_backend s_engine_backend = {
     .set_depth_range      = eng_set_depth_range,
     .set_scissor          = eng_set_scissor,
     .set_stencil_ref      = eng_set_stencil_ref,
+    .set_blend_color      = eng_set_blend_color,
     .set_depth_bias       = eng_set_depth_bias,
     .draw                 = eng_draw,
     .clear_color          = eng_clear_color,

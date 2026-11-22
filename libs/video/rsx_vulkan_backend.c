@@ -136,7 +136,7 @@ static void vk_mutex_unlock(vk_mutex* m)  { pthread_mutex_unlock(m); }
     X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass) X(vkCmdBindPipeline) \
     X(vkCmdBindVertexBuffers) X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) \
     X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdDraw) \
-    X(vkCmdSetStencilReference) X(vkCmdSetDepthBounds) \
+    X(vkCmdSetStencilReference) X(vkCmdSetDepthBounds) X(vkCmdSetBlendConstants) \
     X(vkCmdBindIndexBuffer) X(vkCmdDrawIndexed) \
     X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCmdBlitImage)
 /* Window-system entry points, loaded only when a window was requested, so a
@@ -3550,6 +3550,7 @@ static struct {
     int          have_vp, have_sc;
     u32          stencil_ref, stencil_ref_back;
     float        depth_bounds[2];     /* min, max for the next draw */
+    float        blend_color[4];      /* r, g, b, a blend constant for the next draw */
     vk_buffer    indices;
     u32          warned;
     /* The split set layout (vk_eng_split_layout) and its one set, made the
@@ -3611,6 +3612,17 @@ static VkRenderPass vk_eng_render_pass(VkFormat cf, u32 n)
 
 /* Tables carried from the Metal backend, itself copied from the D3D12 live
  * draw engine a title has shipped on. */
+
+/* A value that is none of the RSX blend factors is not guessed at: it was drawn as ONE, so a pass
+ * weighted by a factor this table lacked went in as a plain add. It stops by name. RPCS3 6e4b784d1 maps
+ * exactly the fifteen below and throws on any other (VK/VKGSRender.cpp:143-165), only for a draw whose
+ * blend is on (:321), which is when vk_eng_variant asks (DECISIONS F13). */
+static PS3_NORETURN void vk_blend_factor_stop(u32 f)
+{
+    char why[96];
+    snprintf(why, sizeof why, "blend factor 0x%04X is not an RSX blend factor", (unsigned)f);
+    ps3_stop_gcm_unmodelled("vk_eng_variant", "blend-factor", why);
+}
 static VkBlendFactor vk_gcm_blend_factor(u32 f)
 {
     switch (f) {
@@ -3625,7 +3637,12 @@ static VkBlendFactor vk_gcm_blend_factor(u32 f)
     case 0x0306: return VK_BLEND_FACTOR_DST_COLOR;
     case 0x0307: return VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR;
     case 0x0308: return VK_BLEND_FACTOR_SRC_ALPHA_SATURATE;
-    default:     return VK_BLEND_FACTOR_ONE;
+    /* The blend constant (vk_eng_set_blend_color). */
+    case 0x8001: return VK_BLEND_FACTOR_CONSTANT_COLOR;
+    case 0x8002: return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR;
+    case 0x8003: return VK_BLEND_FACTOR_CONSTANT_ALPHA;
+    case 0x8004: return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA;
+    default:     vk_blend_factor_stop(f);
     }
 }
 static VkBlendOp vk_gcm_blend_op(u32 e)
@@ -3909,22 +3926,24 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
         }
         cba[r] = (VkPipelineColorBlendAttachmentState){
             .blendEnable = tblend ? VK_TRUE : VK_FALSE,
-            .srcColorBlendFactor = vk_gcm_blend_factor(rs->sf_rgb),
-            .dstColorBlendFactor = vk_gcm_blend_factor(rs->df_rgb),
+            /* The factors are only read for a target whose blend is on. */
+            .srcColorBlendFactor = tblend ? vk_gcm_blend_factor(rs->sf_rgb) : VK_BLEND_FACTOR_ONE,
+            .dstColorBlendFactor = tblend ? vk_gcm_blend_factor(rs->df_rgb) : VK_BLEND_FACTOR_ZERO,
             .colorBlendOp = vk_gcm_blend_op(rs->eq_rgb),
-            .srcAlphaBlendFactor = vk_gcm_blend_factor(rs->sf_a),
-            .dstAlphaBlendFactor = vk_gcm_blend_factor(rs->df_a),
+            .srcAlphaBlendFactor = tblend ? vk_gcm_blend_factor(rs->sf_a) : VK_BLEND_FACTOR_ONE,
+            .dstAlphaBlendFactor = tblend ? vk_gcm_blend_factor(rs->df_a) : VK_BLEND_FACTOR_ZERO,
             .alphaBlendOp = vk_gcm_blend_op(rs->eq_a),
             .colorWriteMask = twm };
     }
     VkPipelineColorBlendStateCreateInfo cb = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
         .attachmentCount = P->rt_count, .pAttachments = cba };
-    VkDynamicState dyn[4] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
-                              VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_DEPTH_BOUNDS };
+    VkDynamicState dyn[5] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
+                              VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
+                              VK_DYNAMIC_STATE_DEPTH_BOUNDS };
     VkPipelineDynamicStateCreateInfo dy = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-        .dynamicStateCount = s_vk.depth_bounds_ok ? 4u : 3u, .pDynamicStates = dyn };
+        .dynamicStateCount = s_vk.depth_bounds_ok ? 5u : 4u, .pDynamicStates = dyn };
     VkGraphicsPipelineCreateInfo gci = {
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
         .stageCount = 2, .pStages = st, .pVertexInputState = &vi, .pInputAssemblyState = &ia,
@@ -4033,6 +4052,13 @@ static void vk_eng_set_scissor(void* user, u32 x, u32 y, u32 w, u32 h)
 }
 static void vk_eng_set_stencil_ref(void* user, u32 front, u32 back)
 { (void)user; s_e2.stencil_ref = front; s_e2.stencil_ref_back = back; }
+/* The blend constant for the next draw (the engine decodes SET_BLEND_COLOR). Dynamic state
+ * (VK_DYNAMIC_STATE_BLEND_CONSTANTS), so it stays out of the pipeline key. */
+static void vk_eng_set_blend_color(void* user, const float rgba[4])
+{
+    (void)user;
+    memcpy(s_e2.blend_color, rgba, sizeof s_e2.blend_color);
+}
 
 /* Vulkan wants the bounds inside [0, 1] without VK_EXT_depth_range_unrestricted;
  * a NaN clamps to the open end so a garbage register cannot reject a draw. */
@@ -4491,6 +4517,7 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     pvkCmdSetStencilReference(s_vk.cmd, VK_STENCIL_FACE_BACK_BIT, s_e2.stencil_ref_back & 0xFFu);
     if (s_vk.depth_bounds_ok)
         pvkCmdSetDepthBounds(s_vk.cmd, s_e2.depth_bounds[0], s_e2.depth_bounds[1]);
+    pvkCmdSetBlendConstants(s_vk.cmd, s_e2.blend_color);
     pvkCmdBindDescriptorSets(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
                              P->cube_mask ? s_e2.split_pipe_layout : s_g.pipe_layout,
                              0, 1, &set, 0, NULL);
@@ -4542,6 +4569,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
     .set_scissor          = vk_eng_set_scissor,
     .set_stencil_ref      = vk_eng_set_stencil_ref,
     .set_depth_bounds     = vk_eng_set_depth_bounds,
+    .set_blend_color      = vk_eng_set_blend_color,
     .draw                 = vk_eng_draw,
     .clear_color          = vk_eng_clear_color,
     .clear_depth_stencil  = vk_eng_clear_depth_stencil,

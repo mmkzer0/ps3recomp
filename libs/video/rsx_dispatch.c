@@ -147,6 +147,7 @@
 #define M_BACK_STENCIL_MASK     0x034C
 #define M_BACK_STENCIL_OPS      0x035C
 #define M_BLEND_ENABLE_MRT      0x036C
+#define M_BLEND_COLOR2          0x037C
 #define M_DEPTH_BOUNDS_ENABLE   0x0380
 #define M_SHADER_PACKER         0x1FEC
 
@@ -249,6 +250,7 @@ static void dsp_fill_classes(dsp_class_table* t)
     mark_class(t, M_BACK_STENCIL_MASK,   4, RSX_DSP_CLASS_STATE); /* MASK, FUNC, FUNC_REF, FUNC_MASK */
     mark_class(t, M_BACK_STENCIL_OPS,    3, RSX_DSP_CLASS_STATE); /* FAIL, ZFAIL, ZPASS */
     mark_class(t, M_BLEND_ENABLE_MRT,    1, RSX_DSP_CLASS_STATE);
+    mark_class(t, M_BLEND_COLOR2,        1, RSX_DSP_CLASS_STATE); /* the half-float target's B and A constants */
     mark_class(t, M_DEPTH_BOUNDS_ENABLE, 3, RSX_DSP_CLASS_STATE); /* ENABLE, MIN, MAX */
     mark_class(t, M_CLIP_MIN,            2, RSX_DSP_CLASS_STATE); /* CLIP_MIN, CLIP_MAX */
     mark_class(t, M_SHADER_PACKER,       1, RSX_DSP_CLASS_STATE);

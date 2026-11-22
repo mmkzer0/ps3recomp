@@ -222,10 +222,10 @@ static const rsx_method_rule rsx_method_rules[] = {
             "at the target's precision (8-bit for the A8R8G8B8 targets the title uses), so the 4x4 ordered "
             "table at 0x440 (also written by the default state) is the identity on it; RPCS3 models no "
             "dither either. The row pins enable=1, the only value written"),
-    MISSING(RSX_CLASS_NV4097, 0x031C, 1, "NV4097_SET_BLEND_COLOR",
-            "S2: the constant blend colour. The engine builds every blend from the factors and equation "
-            "and never binds a constant colour, so a draw whose factor names BLEND_CONSTANT uses the "
-            "host default instead of the guest's value"),
+    HANDLED(RSX_CLASS_NV4097, 0x031C, 1, RSX_EV_CONSUMER, "NV4097_SET_BLEND_COLOR",
+            "rsx_draw_engine.c sink_end: the per-draw set_blend_color (A8R8G8B8: R bits 16-23, G 8-15, B 0-7, "
+            "A 24-31; half-float target: R, G as half floats), the constant the CONSTANT_COLOR / "
+            "CONSTANT_ALPHA factors multiply by (#782)"),
     HANDLED(RSX_CLASS_NV4097, 0x032C, 1, RSX_EV_CONSUMER, "NV4097_SET_STENCIL_MASK",
             "rsx_draw_engine.c build_render_state: rs->s_write_mask (the front stencil write mask)"),
     HANDLED(RSX_CLASS_NV4097, 0x0348, 1, RSX_EV_CONSUMER, "NV4097_SET_TWO_SIDED_STENCIL_TEST_ENABLE",
@@ -254,10 +254,9 @@ static const rsx_method_rule rsx_method_rules[] = {
     INERT_V(RSX_CLASS_NV4097, 0x0378, 1, 0x00001503, 0xFFFFFFFF, RSX_EV_ORACLE_VALUE, "NV4097_SET_LOGIC_OP",
             "the logic operation itself (copy at reset); it cannot be applied while the enable above is 0, "
             "and the row pins the reset value so a change is reported"),
-    INERT_V(RSX_CLASS_NV4097, 0x037C, 1, 0, 0xFFFFFFFF, RSX_EV_ORACLE_VALUE, "NV4097_SET_BLEND_COLOR2",
-            "the second blend constant, 0 at reset; only a blend factor naming the constant-2 source reads "
-            "it, and the engine implements the factors the title uses from BLEND_FUNC_*; RPCS3 decodes it "
-            "but the value 0 makes it identical to the constant not being bound"),
+    HANDLED(RSX_CLASS_NV4097, 0x037C, 1, RSX_EV_CONSUMER, "NV4097_SET_BLEND_COLOR2",
+            "rsx_draw_engine.c sink_end: the half-float target's B and A blend constants, handed to "
+            "set_blend_color with SET_BLEND_COLOR's R and G (#782)"),
     HANDLED(RSX_CLASS_NV4097, 0x0380, 3, RSX_EV_CONSUMER, "NV4097_SET_DEPTH_BOUNDS_*",
             "rsx_draw_engine.c build_render_state rs->depth_bounds_test and the per-draw set_depth_bounds "
             "(0x0384/0x0388 as raw floats)"),

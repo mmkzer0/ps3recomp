@@ -1913,6 +1913,60 @@ static void test_polygon_offset(void)
     engine_down();
 }
 
+/* ---- blend constant ------------------------------------------------------ */
+
+#define M_BLEND_COLOR  0x031C
+#define M_BLEND_COLOR2 0x037C
+
+/* What the backend was told before the last draw. */
+static float bc_k[4] = { -9.0f, -9.0f, -9.0f, -9.0f };
+static u32 bc_calls;
+static void stub_set_blend_color(void* u, const float rgba[4])
+{ (void)u; memcpy(bc_k, rgba, sizeof bc_k); bc_calls++; }
+static int bc_is(float r, float g, float b, float a)
+{ return bc_k[0] == r && bc_k[1] == g && bc_k[2] == b && bc_k[3] == a; }
+
+/* SET_BLEND_COLOR reaches the backend as r, g, b, a before every draw: it is what the CONSTANT_COLOR and
+ * CONSTANT_ALPHA blend factors (0x8001..0x8004) multiply by. A8R8G8B8 keeps R in bits 16-23, G 8-15, B 0-7
+ * and A 24-31; a half-float target keeps four half floats, R and G in SET_BLEND_COLOR (low, high) and B and
+ * A in _COLOR2 (RPCS3 6e4b784d1 RSXCoreRenderer.cpp:85-104). Nothing handed it over before (#782), so a pass
+ * weighted by the constant went in as a plain add. */
+static void test_blend_constant(void)
+{
+    printf("-- blend constant\n");
+    engine_up();
+    static rsx_draw_backend be;
+    be = g_stub_backend;
+    be.set_blend_color = stub_set_blend_color;
+    rsx_draw_engine_set_backend(&be);
+    bc_calls = 0;
+
+    draw_triangle();
+    CHECK(stub.n_draw == 1 && bc_calls == 1 && bc_is(0.0f, 0.0f, 0.0f, 0.0f),
+          "never written: the backend is told (0,0,0,0) before the draw (%u calls, %g %g %g %g)",
+          bc_calls, bc_k[0], bc_k[1], bc_k[2], bc_k[3]);
+
+    m(M_BLEND_COLOR, 0x80FF4020u);                    /* A 0x80, R 0xFF, G 0x40, B 0x20 */
+    draw_triangle();
+    CHECK(bc_calls == 2 && bc_is(255.0f / 255.0f, 64.0f / 255.0f, 32.0f / 255.0f, 128.0f / 255.0f),
+          "A8R8G8B8: R, G, B, A from bits 16, 8, 0, 24 (%u calls, %g %g %g %g)",
+          bc_calls, bc_k[0], bc_k[1], bc_k[2], bc_k[3]);
+
+    m(M_BLEND_COLOR2, 0x3C003C00u);
+    draw_triangle();
+    CHECK(bc_calls == 3 && bc_is(255.0f / 255.0f, 64.0f / 255.0f, 32.0f / 255.0f, 128.0f / 255.0f),
+          "_COLOR2 means nothing to an 8-bit target (%g %g %g %g)", bc_k[0], bc_k[1], bc_k[2], bc_k[3]);
+
+    m(M_SURFACE_FORMAT, 0xBu);                        /* F_W16Z16Y16X16 */
+    m(M_BLEND_COLOR, 0x38003C00u);                    /* G 0.5, R 1.0 as half floats */
+    m(M_BLEND_COLOR2, 0xC0003400u);                   /* A -2.0, B 0.25 */
+    draw_triangle();
+    CHECK(bc_calls == 4 && bc_is(1.0f, 0.5f, 0.25f, -2.0f),
+          "half-float target: R, G from SET_BLEND_COLOR, B, A from _COLOR2, as half floats (%g %g %g %g)",
+          bc_k[0], bc_k[1], bc_k[2], bc_k[3]);
+    engine_down();
+}
+
 /* NV4097_INLINE_ARRAY: the vertices arrive IN the pushbuffer.
  *
  * Nothing consumed method 0x1818 at all, so a title that builds geometry this
@@ -2968,6 +3022,7 @@ int main(int argc, char** argv)
     test_readback();
     test_custom_guest_mapping();
     test_polygon_offset();
+    test_blend_constant();
     test_queued_flip_buffer();
     test_transfer_coherence();
     test_tiled_main_memory();

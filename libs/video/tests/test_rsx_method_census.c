@@ -401,14 +401,16 @@ int main(void)
            st.handled, st.inert, st.missing, st.unknown, st.unbound);
     check(st.unknown == 0, "no census pair is unknown: the frame is valid and the live stop does not fire");
     check(st.unbound == 0, "nothing is dropped: every subchannel the census used is bound");
-    /* 36 census pairs are consumed by a named consumer, plus the seven SET_OBJECT writes that bind the
+    /* 37 census pairs are consumed by a named consumer, plus the seven SET_OBJECT writes that bind the
      * slots (each is a method the walker consumes). The two NV308A pairs over the 34 of before are the
      * inline transfer's own state: SET_CONTEXT_SURFACE (0x019C) and SET_OPERATION (0x02FC), which
      * gcm_nv308a_color reads (#81) and which were allow-listed while no transfer existed. One more since
      * v0.19.0 (#693): SET_ZMIN_MAX_CONTROL (0x1D78) is read by the engine's render state (depth clamp), so
-     * its row is a consumer, no longer an allow-listed value. */
-    check(st.handled == 44, "44 writes are consumed by a named consumer");
-    check(st.inert == 177, "177 writes are allow-listed for the value they carry");
+     * its row is a consumer, no longer an allow-listed value. One more since v0.20.0 (#782):
+     * SET_BLEND_COLOR2 (0x037C) carries the blend constant's B and A on a half-float target, which the
+     * engine reads. */
+    check(st.handled == 45, "45 writes are consumed by a named consumer");
+    check(st.inert == 176, "176 writes are allow-listed for the value they carry");
     check(st.missing == 0, "no census write is a known gap: the S2 gaps the census once carried all have consumers");
     check(st.handled + st.inert + st.missing == 221, "...and the three classes cover every write (214 pairs + 7 binds)");
 

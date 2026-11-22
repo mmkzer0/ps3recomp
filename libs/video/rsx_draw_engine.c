@@ -91,7 +91,9 @@ static void eng_cap_draw(u32 executed, u32 reason);
 #define M_BLEND_ENABLE        0x0310
 #define M_BLEND_SFACTOR       0x0314
 #define M_BLEND_DFACTOR       0x0318
+#define M_BLEND_COLOR         0x031C
 #define M_BLEND_EQUATION      0x0320
+#define M_BLEND_COLOR2        0x037C
 #define M_COLOR_MASK          0x0324
 #define M_STENCIL_TEST_ENABLE 0x0328
 #define M_STENCIL_MASK        0x032C
@@ -3769,6 +3771,24 @@ static void eng_point_row(float row[RSX_VP_POINT_SIZE_ROW_FLOATS])
     row[3] = 0.0f;
 }
 
+/* A half float as a float, exactly: sign, 5-bit exponent, 10-bit mantissa, subnormals, infinity and NaN
+ * carried through (RPCS3 6e4b784d1 Utils/rsx_utils.h:548 decode_fp16). */
+static float eng_half_to_float(u16 h)
+{
+    const u32 sign = (u32)(h >> 15) << 31, e = (h >> 10) & 0x1Fu, m = h & 0x3FFu;
+    u32 bits;
+    if (e == 0x1Fu)  bits = sign | 0x7F800000u | (m << 13);
+    else if (e)      bits = sign | ((e + 112u) << 23) | (m << 13);
+    else if (!m)     bits = sign;
+    else {
+        const float v = (float)m * (1.0f / 16777216.0f);   /* subnormal: m * 2^-24 */
+        return sign ? -v : v;
+    }
+    float f;
+    memcpy(&f, &bits, sizeof f);
+    return f;
+}
+
 static void sink_end(void* user, const rsx_dispatch* r)
 {
     (void)user; (void)r;
@@ -4043,6 +4063,24 @@ static void sink_end(void* user, const rsx_dispatch* r)
         memcpy(&fmin, &lo, sizeof fmin);
         memcpy(&fmax, &hi, sizeof fmax);
         g.be->set_depth_bounds(g.be->user, fmin, fmax);
+    }
+    /* The blend constant, which the CONSTANT_COLOR / CONSTANT_ALPHA factors (0x8001..0x8004) multiply by.
+     * A8R8G8B8 targets keep it in SET_BLEND_COLOR (R bits 16-23, G 8-15, B 0-7, A 24-31); on a half-float
+     * target it is four half floats, R and G in SET_BLEND_COLOR (low, high) and B and A in _COLOR2 (RPCS3
+     * 6e4b784d1 RSXCoreRenderer.cpp:85-104, rsx_decode.h:3841-3905). A title fades decals and weights its
+     * bloom passes with it (upstream #782, God of War: Ascension). */
+    if (g.be->set_blend_color) {
+        const u32 c  = rsx_dsp_reg(&g.rsx, M_BLEND_COLOR);
+        const u32 c2 = rsx_dsp_reg(&g.rsx, M_BLEND_COLOR2);
+        float k[4];
+        if (rs.rt_fp16) {
+            k[0] = eng_half_to_float((u16)(c & 0xFFFFu));  k[1] = eng_half_to_float((u16)(c >> 16));
+            k[2] = eng_half_to_float((u16)(c2 & 0xFFFFu)); k[3] = eng_half_to_float((u16)(c2 >> 16));
+        } else {
+            k[0] = (float)((c >> 16) & 0xFFu) / 255.0f; k[1] = (float)((c >> 8) & 0xFFu) / 255.0f;
+            k[2] = (float)(c & 0xFFu) / 255.0f;         k[3] = (float)(c >> 24) / 255.0f;
+        }
+        g.be->set_blend_color(g.be->user, k);
     }
 
     /* Polygon offset: dynamic state, like the stencil reference. The
