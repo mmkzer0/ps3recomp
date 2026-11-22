@@ -2034,6 +2034,27 @@ if(PS3RECOMP_BUILD_TESTS)
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_user_memory_domain.py")
         set_tests_properties(loaded_image_memory loader_memory_domain
             mmapper_hle_heap user_memory_domain PROPERTIES LABELS "memory;t0")
+        # The loader's sys_gpio answers and its PPU context registry, cut out of ppu_loader.cpp into fixtures.
+        add_test(NAME sys_gpio
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_sys_gpio.py")
+        add_test(NAME ppu_ctx_registry
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_ctx_registry.py")
+        set_tests_properties(sys_gpio ppu_ctx_registry PROPERTIES LABELS "ppu;t0" TIMEOUT 120)
+        # One fd space for cellFs and sys_fs (sys_fs_open against cellFsOpen on eight threads), and allocation in
+        # a memory container racing its destroy: both are TSan cases.
+        add_test(NAME ppu_fs_sys_bridge
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ppu_fs_sys_bridge.py")
+        add_test(NAME sys_memory_container
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_sys_memory_container.py")
+        set_tests_properties(ppu_fs_sys_bridge PROPERTIES LABELS "runtime;t0;tsan" TIMEOUT 300)
+        set_tests_properties(sys_memory_container PROPERTIES LABELS "memory;t0;tsan" TIMEOUT 300)
+        if(PS3RECOMP_SANITIZE_THREAD)
+            set_tests_properties(ppu_fs_sys_bridge sys_memory_container PROPERTIES ENVIRONMENT "SANITIZERS=thread")
+        endif()
         add_test(NAME check_hygiene
             COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_check_hygiene.py")
