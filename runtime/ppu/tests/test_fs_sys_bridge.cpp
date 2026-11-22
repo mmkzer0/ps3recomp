@@ -401,6 +401,22 @@ static void test_read_write_order()
     CHECK(sfs(sys_fs_lseek, rwfd, 0, CELL_FS_SEEK_CUR, s.out() + 16) == 0 && rd64(s.out() + 16) == 12,
           "... and the position moved");
 
+    /* Zero bytes: the call is skipped after the fd checks and the buffer is never looked at (RPCS3 sys_fs.cpp
+     * :1523-1535 and :1604-1616), so a buffer past guest memory is CELL_OK with count 0, as sys_fs answers it. It
+     * was the range stop. */
+    for (int write = 0; write <= 1; ++write) {
+        const char* name = write ? "cellFsWrite" : "cellFsRead";
+        const auto r = run_child([&] {
+            memset(vm_base + cnt, 0xEE, 8);
+            const uint32_t zrc = write ? cfs(cellFsWrite, rwfd, MEM_BYTES + 0x1000, 0, cnt)
+                                       : cfs(cellFsRead, rwfd, MEM_BYTES + 0x1000, 0, cnt);
+            fprintf(stderr, "zero rc=%08x count=%llx\n", zrc, (unsigned long long)rd64(cnt));
+        });
+        CHECK(!r.stopped && says(r, "zero rc=00000000 count=0\n"),
+              "%s of zero bytes into a buffer past guest memory is CELL_OK, count 0 (stopped %d: %s)", name,
+              (int)r.stopped, r.err.c_str());
+    }
+
     /* A count span outside guest memory is a stop before the file moves: the write below would have changed the
      * file's first four bytes, and the host stream is flushed by the handler, so the file shows it. */
     sfs(sys_fs_lseek, rwfd, 0, CELL_FS_SEEK_SET, s.out() + 16);

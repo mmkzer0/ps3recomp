@@ -697,6 +697,11 @@ static void cellFsRead(ppu_context* ctx)
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EBADF;
         return;
     }
+    if (!nbytes) {   /* the whole call is skipped and buf never looked at (sys_fs.cpp:1523-1535) */
+        if (nread_ptr) vm_write64(nread_ptr, 0);
+        ctx->gpr[3] = CELL_OK;
+        return;
+    }
     uint64_t raw_nbytes = ctx->gpr[5];
     long fpos_before = ftell(f);
     /* A buffer that is partly or wholly outside guest memory is NOT clamped to
@@ -802,6 +807,11 @@ static void cellFsWrite(ppu_context* ctx)
     if (!f || (nbytes && flags >= 0 && !(flags & CELL_FS_O_ACCMODE))) {
         if (nwr_ptr) vm_write64(nwr_ptr, 0);
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EBADF;
+        return;
+    }
+    if (!nbytes) {   /* as in cellFsRead: skipped, buf never looked at (sys_fs.cpp:1604-1616) */
+        if (nwr_ptr) vm_write64(nwr_ptr, 0);
+        ctx->gpr[3] = CELL_OK;
         return;
     }
     /* Same rule as the read path: lv2 would read this span, so it must be guest
