@@ -25,6 +25,9 @@ void spu_coh_notify_write(uint32_t a) { (void)a; }
 void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
 ps3_guest_caller_fn g_ps3_guest_caller;
+/* cellGcmSetPrepareFlip names the buffer to the draw engine, which is not linked here. */
+int rsx_draw_engine_enabled(void) { return 0; }
+void rsx_draw_engine_note_flip(u32 id) { (void)id; }
 /* What the drain does when it reaches a flip queued in the command stream. */
 static void flip_executed(void) { s_fifo_flips_reached++; }
 static unsigned flips;
@@ -66,6 +69,19 @@ int main(void)
     cellGcmTickFlip();
     ppu_gcm_pump();
     assert(flips == 3 && cellGcmGetFlipStatus() == CELL_GCM_FLIP_STATUS_DONE);
+
+    /* cellGcmSetPrepareFlip answers with the buffer id, which a title keeps for
+     * cellGcmSetFlipImmediate (RPCS3 gcmSetPrepareFlip: not_an_error(id)). */
+    s_display_buffer_set[1] = 1;
+    assert(cellGcmSetPrepareFlip(NULL, 1) == 1);
+    assert(cellGcmGetCurrentDisplayBufferId() == 1);
+    /* An id above 7 is CELL_GCM_ERROR_FAILURE (RPCS3 cellGcmSys.cpp:615-618); upstream answered
+     * INVALID_VALUE, DECISIONS F22 follows RPCS3. A valid id with no display buffer set stays
+     * INVALID_VALUE, as before. */
+    assert(cellGcmSetPrepareFlip(NULL, 8) == (s32)CELL_GCM_ERROR_FAILURE);
+    assert(cellGcmSetPrepareFlip(NULL, 0xFFFFFFFFu) == (s32)CELL_GCM_ERROR_FAILURE);
+    assert(cellGcmSetPrepareFlip(NULL, 2) == (s32)CELL_GCM_ERROR_INVALID_VALUE);
+    assert(cellGcmGetCurrentDisplayBufferId() == 1);
 
     puts("GCM flip status checks passed");
 }

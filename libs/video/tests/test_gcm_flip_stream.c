@@ -288,8 +288,8 @@ int main(void)
         const u32 g1 = cellGcm_guest_flip_count(), r1 = cellGcm_flip_request_count();
         check(cellGcmSetFlipCommand(CELL_GCM_MAX_DISPLAY_BUFFER_NUM) == CELL_GCM_ERROR_INVALID_VALUE,
               "a buffer id out of range is refused");
-        check(cellGcmSetPrepareFlip(NULL, CELL_GCM_MAX_DISPLAY_BUFFER_NUM) == CELL_GCM_ERROR_INVALID_VALUE,
-              "and so is one through SetPrepareFlip");
+        check(cellGcmSetPrepareFlip(NULL, CELL_GCM_MAX_DISPLAY_BUFFER_NUM) == (s32)CELL_GCM_ERROR_FAILURE,
+              "and so is one through SetPrepareFlip (FAILURE, as RPCS3 answers an id above 7)");
         check(_cellGcmSetFlipCommandWithWaitLabel((void*)(uintptr_t)ctx, CELL_GCM_MAX_DISPLAY_BUFFER_NUM, LABEL, VALUE)
                   == CELL_GCM_ERROR_INVALID_VALUE,
               "and one queued in the stream for it");

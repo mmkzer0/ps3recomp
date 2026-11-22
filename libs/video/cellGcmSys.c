@@ -5454,13 +5454,19 @@ s32 cellGcmSetFlipCommandWithWaitLabel(u32 bufferId, u32 labelIndex, u32 labelVa
     return cellGcmSetFlipCommand(bufferId);
 }
 
-/* NID: 0x0B4B62D5 */
+/* NID: 0x0B4B62D5. Returns the buffer id: a title can keep it and pass it to
+ * cellGcmSetFlipImmediate later (upstream #703: MLB The Show 16 stores it in
+ * its flip queue and flips what was stored, so CELL_OK made every flip name
+ * buffer 0). RPCS3 6e4b784d1 cellGcmSys.cpp:611-636 ends gcmSetPrepareFlip in
+ * `not_an_error(id)` and answers CELL_GCM_ERROR_FAILURE for id > 7 (upstream
+ * answered INVALID_VALUE there; DECISIONS F22 follows RPCS3). An id that is
+ * in range but has no display buffer set stays INVALID_VALUE, as before. */
 s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
 {
     (void)ctx;  /* command buffer context -- not used in HLE */
 
     if (bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM)
-        return CELL_GCM_ERROR_INVALID_VALUE;
+        return CELL_GCM_ERROR_FAILURE;
 
     if (!s_display_buffer_set[bufferId])
         return CELL_GCM_ERROR_INVALID_VALUE;
@@ -5482,7 +5488,7 @@ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
     if (s_flip_handler_opd && g_ps3_guest_caller && !gcm_flipcb_on_tick_only())
         g_ps3_guest_caller(s_flip_handler_opd, 0, 0, 0, 0, 0, 0, 0, 0);
 
-    return CELL_OK;
+    return (s32)bufferId;
 }
 
 /* NID: 0x371674CF */

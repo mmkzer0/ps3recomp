@@ -289,6 +289,8 @@ void cellGcm_ctx_emit(u32 ctx, const u32* words, u32 n);
 s32  cellGcm_emit_flip_command(u32 ctx, u32 bufferId);
 s32  cellGcm_address_to_offset(u32 address, u32* offset_out);
 
+/* cellGcmSetPrepareFlip returns the buffer id (CELL_GCM_ERROR_FAILURE for an id above 7,
+ * CELL_GCM_ERROR_INVALID_VALUE for one with no display buffer set). */
 /* NID: 0x0B4B62D5 */
 s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId);
 
