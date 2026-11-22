@@ -272,7 +272,7 @@ PS3_CFG_BOOL(spurs, real_admission, 0,
     "ready count as the guest wrote it. Off (default): a nonzero ready count admits, the kernel consumes one "
     "ready unit per admission, and idle workloads are probed (spurs idle back-off), so work that arrives "
     "without a kick is still found. Guest-visible: the ready-count bytes a title reads differ between the "
-    "two. From upstream #711 (was SPURS_IDLE_PROBE=0). Read at every admission decision.")
+    "two. From upstream #756 (was SPURS_IDLE_PROBE=0). Read at every admission decision.")
 
 PS3_CFG_U32(spurs, shutdown_wait_ms, 2000, 1, 600000,
     "How long cellSpursWaitForWorkloadShutdown waits, in milliseconds, for the running policy modules of a "
