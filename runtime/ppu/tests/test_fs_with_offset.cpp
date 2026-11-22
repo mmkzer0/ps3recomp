@@ -10,7 +10,8 @@
  *   - neither moves the fd's own position (a plain cellFsRead continues from it);
  *   - a read past the end returns CELL_OK with a count of 0;
  *   - a bad fd returns CELL_FS_EBADF;
- *   - a write on a read-only fd returns CELL_FS_EIO with the count 0;
+ *   - a read on a write-only fd, a write on a read-only fd and a write on an append-mode fd return CELL_FS_EBADF
+ *     with the count 0 (the permitted opposites transfer);
  *   - a buffer or count span that leaves guest memory is an hle-guest-range stop, with nothing clamped.
  *
  *   tools/test_ppu_fs_with_offset.py
@@ -158,21 +159,41 @@ int main(int argc, char** argv)
     rc = io(wr_off, 1000, 0, 0x640, 4, 0x508);
     CHECK(rc == (uint32_t)CELL_FS_EBADF, "WriteWithOffset on a bad fd returns 0x%08X (want CELL_FS_EBADF)", rc);
 
-    /* A write on an fd opened read-only fails in stdio: CELL_FS_EIO with the count 0, not CELL_OK and a short
-     * count the title cannot tell from success (ps3_fs_write_failed). */
+    /* RPCS3 sys_fs.cpp:2498-2511 (the fcntl both calls are) and cellFs.cpp:471-474: a read on a write-only fd, a
+     * write on a read-only fd and a write on an append-mode fd are CELL_FS_EBADF with the count 0 (the read-only
+     * write was EIO, from stdio refusing it); the permitted opposite of each still transfers. */
     {
-        memset(&ctx, 0, sizeof ctx); ctx.gpr[3] = 0x100; ctx.gpr[4] = CELL_FS_O_RDONLY; ctx.gpr[5] = 0x530;
-        cellFsOpen(&ctx);
-        const uint32_t rfd = rd32(0x530);
-        CHECK((uint32_t)ctx.gpr[3] == 0, "cellFsOpen(O_RDONLY) returns CELL_OK (fd %u)", rfd);
-        memset(mem + 0x538, 0xEE, 8);
-        rc = io(wr_off, rfd, 0, 0x620, 4, 0x538);
-        CHECK(rc == (uint32_t)CELL_FS_EIO && rd64(0x538) == 0,
-              "WriteWithOffset on a read-only fd returns 0x%08X, count %llu (want CELL_FS_EIO, 0)", rc,
-              (unsigned long long)rd64(0x538));
-        memset(&ctx, 0, sizeof ctx); ctx.gpr[3] = rfd;
-        cellFsClose(&ctx);
+        const struct { const char* name; uint32_t flags; bool write; bool allowed; } cases[] = {
+            {"a write on a read-only fd", CELL_FS_O_RDONLY, true, false},
+            {"a read on a write-only fd", CELL_FS_O_WRONLY, false, false},
+            {"a write on an append-mode fd", CELL_FS_O_RDWR | CELL_FS_O_APPEND, true, false},
+            {"a read on a read-only fd", CELL_FS_O_RDONLY, false, true},
+            {"a write on a write-only fd", CELL_FS_O_WRONLY, true, true},
+        };
+        for (const auto& c : cases) {
+            memset(&ctx, 0, sizeof ctx); ctx.gpr[3] = 0x100; ctx.gpr[4] = c.flags; ctx.gpr[5] = 0x530;
+            cellFsOpen(&ctx);
+            const uint32_t afd = rd32(0x530);
+            CHECK((uint32_t)ctx.gpr[3] == 0, "cellFsOpen(flags 0x%X) returns CELL_OK (fd %u)", c.flags, afd);
+            memset(mem + 0x538, 0xEE, 8);
+            memcpy(mem + 0x620, "WXYZ", 4);
+            rc = io(c.write ? wr_off : rd_off, afd, 4, 0x620, 4, 0x538);
+            if (c.allowed)
+                CHECK(rc == 0 && rd64(0x538) == 4, "%s transfers (0x%08X, count %llu)", c.name, rc,
+                      (unsigned long long)rd64(0x538));
+            else
+                CHECK(rc == (uint32_t)CELL_FS_EBADF && rd64(0x538) == 0,
+                      "%s returns 0x%08X, count %llu (want CELL_FS_EBADF, 0)", c.name, rc,
+                      (unsigned long long)rd64(0x538));
+            memset(&ctx, 0, sizeof ctx); ctx.gpr[3] = afd;
+            cellFsClose(&ctx);
+        }
     }
+
+    /* A bad fd stores the count 0 as well (cellFs.cpp:471-474). */
+    memset(mem + 0x538, 0xEE, 8);
+    rc = io(rd_off, 1000, 0, 0x640, 4, 0x538);
+    CHECK(rc == (uint32_t)CELL_FS_EBADF && rd64(0x538) == 0, "ReadWithOffset on a bad fd stores count 0");
 
 #ifndef _WIN32
     /* A span that leaves the arena is a named stop before the file or the count is touched, never a clamped

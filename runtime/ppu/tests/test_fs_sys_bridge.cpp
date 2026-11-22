@@ -231,6 +231,63 @@ template <class F> static std::set<std::string> list_dir(const Scratch& s, F nex
     return names;
 }
 
+/* The access mode of a file is the flags it was opened with, whichever family opens it and whichever reads or writes
+ * it (RPCS3 6e4b784d1 sys_fs.cpp:1498-1502 and :1593-1597; cellFsRead / cellFsWrite wrap them, cellFs.cpp:57-69): a
+ * read on a write-only file and a write on a read-only file are EBADF with the count 0, where the permitted ones
+ * transfer, and a zero-byte call is not refused. All four open/use pairings: the cellFs table's own fds, the
+ * sys_fs table's own fds, and the two bridged ways. */
+static void test_access_modes()
+{
+    Scratch s{0x1000};
+    make_pattern("bridge_a.bin");
+    const struct { const char* name; uint32_t flags; bool can_read, can_write; } modes[] = {
+        {"read-only", CELL_FS_O_RDONLY, true, false},
+        {"write-only", CELL_FS_O_WRONLY, false, true},
+        {"read-write", CELL_FS_O_RDWR, true, true},
+    };
+    for (int opened_by_cellfs = 0; opened_by_cellfs < 2; ++opened_by_cellfs) {
+        for (const auto& m : modes) {
+            const int fd = opened_by_cellfs ? cfs_open(s, "bridge_a.bin", m.flags) : sys_open(s, "bridge_a.bin", m.flags);
+            CHECK(fd >= 3, "%s open of a %s file returns an fd (%d)", opened_by_cellfs ? "cellFs" : "sys_fs", m.name, fd);
+            for (int used_by_cellfs = 0; used_by_cellfs < 2; ++used_by_cellfs) {
+                const char* how = opened_by_cellfs ? (used_by_cellfs ? "cellFs fd through cellFs" : "cellFs fd through sys_fs")
+                                                   : (used_by_cellfs ? "sys_fs fd through cellFs" : "sys_fs fd through sys_fs");
+                /* read 4 bytes from offset 4 */
+                sfs(sys_fs_lseek, fd, 4, CELL_FS_SEEK_SET, s.out() + 16);
+                memset(vm_base + s.out() + 8, 0xEE, 8);
+                uint32_t rc = used_by_cellfs ? cfs(cellFsRead, fd, s.buf(), 4, s.out() + 8)
+                                             : sfs(sys_fs_read, fd, s.buf(), 4, s.out() + 8);
+                if (m.can_read)
+                    CHECK(rc == 0 && rd64(s.out() + 8) == 4 && holds(s.buf(), 4, 4), "read on a %s %s", m.name, how);
+                else
+                    CHECK(rc == EBADF_ && rd64(s.out() + 8) == 0, "read on a %s %s is EBADF, count 0 (0x%08X, %llu)",
+                          m.name, how, rc, (unsigned long long)rd64(s.out() + 8));
+                /* write the same four bytes back at offset 4, so the file is unchanged */
+                for (int i = 0; i < 4; i++) vm_base[s.buf() + i] = (uint8_t)(4 + i);
+                sfs(sys_fs_lseek, fd, 4, CELL_FS_SEEK_SET, s.out() + 16);
+                memset(vm_base + s.out() + 8, 0xEE, 8);
+                rc = used_by_cellfs ? cfs(cellFsWrite, fd, s.buf(), 4, s.out() + 8)
+                                    : sfs(sys_fs_write, fd, s.buf(), 4, s.out() + 8);
+                if (m.can_write)
+                    CHECK(rc == 0 && rd64(s.out() + 8) == 4, "write on a %s %s", m.name, how);
+                else
+                    CHECK(rc == EBADF_ && rd64(s.out() + 8) == 0, "write on a %s %s is EBADF, count 0 (0x%08X, %llu)",
+                          m.name, how, rc, (unsigned long long)rd64(s.out() + 8));
+                /* nothing to transfer: not refused on any mode */
+                memset(vm_base + s.out() + 8, 0xEE, 8);
+                rc = used_by_cellfs ? cfs(cellFsRead, fd, s.buf(), 0, s.out() + 8) : sfs(sys_fs_read, fd, s.buf(), 0, s.out() + 8);
+                CHECK(rc == 0 && rd64(s.out() + 8) == 0, "a zero-byte read on a %s %s is CELL_OK", m.name, how);
+                memset(vm_base + s.out() + 8, 0xEE, 8);
+                rc = used_by_cellfs ? cfs(cellFsWrite, fd, s.buf(), 0, s.out() + 8) : sfs(sys_fs_write, fd, s.buf(), 0, s.out() + 8);
+                CHECK(rc == 0 && rd64(s.out() + 8) == 0, "a zero-byte write on a %s %s is CELL_OK", m.name, how);
+            }
+            CHECK((opened_by_cellfs ? sfs(sys_fs_close, fd) : cfs(cellFsClose, fd)) == 0, "closed");
+        }
+    }
+    CHECK(host_size("bridge_a.bin") == (long)PAT, "the file was not changed");
+    remove(host("bridge_a.bin").c_str());
+}
+
 static void test_directories()
 {
     Scratch s{0x1000};
@@ -377,6 +434,7 @@ int main(int argc, char** argv)
 
     test_cellfs_fd_through_sys_fs();
     test_sys_fs_fd_through_cellfs();
+    test_access_modes();
     test_directories();
     test_distinct_numbers();
     verbose = false;   /* the concurrent rounds report failures only */

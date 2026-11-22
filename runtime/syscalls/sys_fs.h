@@ -146,11 +146,14 @@ int64_t sys_fs_ftruncate(ppu_context* ctx);
  *     cellFs allocators do), so a number is never handed out twice.
  *   - sys_fs_file_for_fd, sys_fs_close_fd, sys_fs_dir_next: what cellFs handlers call for an fd this table owns.
  *     sys_fs_dir_next with a NULL name only asks whether fd is a directory here (1) or not (-1); with a name
- *     it reads one entry: 1 an entry (name, and the host directory it is in), 0 end of directory, -1 not ours. */
+ *     it reads one entry: 1 an entry (name, and the host directory it is in), 0 end of directory, -1 not ours.
+ *   - sys_fs_file_flags(fd): the open flags of a file this table holds, or -1; cellFs checks the access mode with
+ *     it for an fd opened through sys_fs, as sys_fs_read / sys_fs_write do with the cellFs table's flags. */
 void  ps3_fs_fd_space_lock(void);
 void  ps3_fs_fd_space_unlock(void);
 int   sys_fs_fd_active(int fd);
 FILE* sys_fs_file_for_fd(int fd);
+int   sys_fs_file_flags(int fd);
 int   sys_fs_close_fd(int fd, int is_dir);
 int   sys_fs_dir_next(int fd, char* name, size_t name_cap, char* dir, size_t dir_cap);
 

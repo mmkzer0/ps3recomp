@@ -96,6 +96,8 @@ FS_PEER_FN(int, ppu_cellfs_close, (int fd, int is_dir), (void)fd; (void)is_dir; 
  * directory, -1 not its. */
 FS_PEER_FN(int, ppu_cellfs_dir_next, (int fd, char* name, size_t name_cap, char* dir, size_t dir_cap),
            (void)fd; (void)name; (void)name_cap; (void)dir; (void)dir_cap; return -1;)
+/* The open flags the cellFs table recorded for a file it holds, or -1 when it holds none under that number. */
+FS_PEER_FN(int, ppu_cellfs_file_flags, (int fd), (void)fd; return -1;)
 
 static FILE* sys_fs_bridge_file(int fd) { return ppu_cellfs_file_for_fd(fd); }
 
@@ -135,6 +137,20 @@ FILE* sys_fs_file_for_fd(int fd)
         fs_slot_unlock();
     }
     return fp;
+}
+
+/* The open flags of a file this table holds, or -1: what cellFs handlers check for an fd that was opened through
+ * sys_fs (RPCS3's cellFsRead / cellFsWrite are sys_fs_read / sys_fs_write, so the access mode is the same). */
+int sys_fs_file_flags(int fd)
+{
+    const int slot = fd - 3;
+    int flags = -1;
+    if (slot >= 0 && slot < SYS_FS_FD_MAX) {
+        fs_slot_lock();
+        if (g_sys_fs_fds[slot].active && g_sys_fs_fds[slot].fp) flags = g_sys_fs_fds[slot].flags;
+        fs_slot_unlock();
+    }
+    return flags;
 }
 
 /* Release a file / directory this table holds: 1 released, 0 not its. The number is free once the slot is
@@ -767,11 +783,13 @@ int64_t sys_fs_read(ppu_context* ctx)
     const int slot = fd - 3;
     sys_fs_fd_info* f = (slot >= 0 && slot < SYS_FS_FD_MAX) ? &g_sys_fs_fds[slot] : NULL;
     /* Own table first; otherwise the same fd opened through cellFs (one fd space on hardware; see the bridge note
-     * at the top of this file). The access mode is checked for a file this table opened: a cellFs file's flags are
-     * the other table's, and its stream's own mode makes a read it was not opened for come back empty. */
+     * at the top of this file). The access mode is the open flags of whichever table holds the file: RPCS3
+     * 6e4b784d1 sys_fs.cpp:1498-1502 answers EBADF with *nread = 0 for a read on a write-only file, and cellFsRead
+     * is a plain wrapper of it (cellFs.cpp:57-62). */
     const int own = f && f->active && f->fp;
     FILE* fp = own ? f->fp : sys_fs_bridge_file(fd);
-    if (!fp || (own && size && (f->flags & CELL_FS_O_WRONLY))) {
+    const int flags = own ? f->flags : (fp ? ppu_cellfs_file_flags(fd) : 0);
+    if (!fp || (size && flags >= 0 && (flags & CELL_FS_O_WRONLY))) {
         /* RPCS3 writes 0 with nread.try_write(0) (allowed to fail); the span
          * was bounded above, so the store cannot be the one that fails. */
         write_be64(nread_addr, 0);
@@ -871,11 +889,13 @@ int64_t sys_fs_write(ppu_context* ctx)
     const int slot = fd - 3;
     sys_fs_fd_info* f = (slot >= 0 && slot < SYS_FS_FD_MAX) ? &g_sys_fs_fds[slot] : NULL;
     /* Own table first; otherwise the same fd opened through cellFs (one fd space on hardware; see the bridge note
-     * at the top of this file). The access mode is checked for a file this table opened: a cellFs file's flags are
-     * the other table's, and its stream's own mode refuses a write it was not opened for. */
+     * at the top of this file). The access mode is the open flags of whichever table holds the file: RPCS3 6e4b784d1
+     * sys_fs.cpp:1593-1597 answers EBADF with *nwrite = 0 for a write on a file not opened for writing, and
+     * cellFsWrite is a plain wrapper of it (cellFs.cpp:63-69). Read-only mounts (EROFS) are not modelled. */
     const int own = f && f->active && f->fp;
     FILE* fp = own ? f->fp : sys_fs_bridge_file(fd);
-    if (!fp || (own && size && !(f->flags & CELL_FS_O_ACCMODE))) {
+    const int flags = own ? f->flags : (fp ? ppu_cellfs_file_flags(fd) : 0);
+    if (!fp || (size && flags >= 0 && !(flags & CELL_FS_O_ACCMODE))) {
         /* RPCS3 writes 0 with nwrite.try_write(0) (allowed to fail); the span
          * was bounded above, so the store cannot be the one that fails. */
         write_be64(nwritten_addr, 0);

@@ -257,6 +257,15 @@ static void host_path(char* out, size_t cap, const char* guest)
 #define FS_MAX 256
 static FILE* g_files[FS_MAX];
 static uint8_t g_fd_usm[FS_MAX];
+/* The open flags each file was opened with: the access mode cellFsRead / cellFsWrite / the WithOffset pair check
+ * (RPCS3's lv2_file::flags), and what sys_fs_read / sys_fs_write read for a file opened here. Written before the
+ * file's slot is published (release) and read after it is loaded (acquire), so a reader sees its file's flags; the
+ * accesses are atomic because a number closed and reopened by another thread is written while a stale reader may
+ * still load it. */
+#ifndef CELL_FS_O_ACCMODE
+#  define CELL_FS_O_ACCMODE  3
+#endif
+static uint32_t g_fd_flags[FS_MAX];
 static char    g_fd_path[FS_MAX][192];   /* guest path per fd (diagnostics) */   /* 1 if this fd is an open .usm movie (read tracker) */
 static DIR*  g_dirs[FS_MAX];
 /* Last transfer direction on each fd's stream: 0 none, 1 read, 2 write.
@@ -311,6 +320,8 @@ FS_PEER_FN(void, ps3_fs_fd_space_unlock, (void), g_fd_lock.unlock();)
 FS_PEER_FN(int, sys_fs_fd_active, (int fd), (void)fd; return 0;)
 /* The FILE* of a file sys_fs holds, or null. */
 FS_PEER_FN(FILE*, sys_fs_file_for_fd, (int fd), (void)fd; return nullptr;)
+/* The open flags of a file sys_fs holds, or -1. */
+FS_PEER_FN(int, sys_fs_file_flags, (int fd), (void)fd; return -1;)
 /* Close a file (is_dir 0) or directory (1) sys_fs holds: 1 closed, 0 not its. Takes the lock itself. */
 FS_PEER_FN(int, sys_fs_close_fd, (int fd, int is_dir), (void)fd; (void)is_dir; return 0;)
 /* One entry of a directory sys_fs holds: 1 an entry (name, and the host directory it is in), 0 end, -1 not its.
@@ -324,12 +335,13 @@ struct FdSpaceLock {
     FdSpaceLock(const FdSpaceLock&) = delete;
     FdSpaceLock& operator=(const FdSpaceLock&) = delete;
 };
-static int fd_alloc_file(FILE* f)
+static int fd_alloc_file(FILE* f, uint32_t flags)
 {
     FdSpaceLock hold;
     for (int i = 3; i < FS_MAX; i++)
         if (!g_files[i] && !g_dirs[i] && !sys_fs_fd_active(i)) {
             g_fd_dir[i] = 0;
+            __atomic_store_n(&g_fd_flags[i], flags, __ATOMIC_RELAXED);   /* published by the release below */
             __atomic_store_n(&g_files[i], f, __ATOMIC_RELEASE);
             return i;
         }
@@ -358,6 +370,13 @@ static FILE* fd_file(int fd)
     if (fd < 0 || fd >= FS_MAX) return nullptr;
     FILE* f = fd_file_own(fd);
     return f ? f : sys_fs_file_for_fd(fd);
+}
+/* The open flags of the file under `fd`, whichever table holds it, or -1: the access mode the read and write
+ * handlers check. */
+static int fd_flags(int fd)
+{
+    if (fd < 0 || fd >= FS_MAX) return -1;
+    return fd_file_own(fd) ? (int)__atomic_load_n(&g_fd_flags[fd], __ATOMIC_RELAXED) : sys_fs_file_flags(fd);
 }
 static DIR* fd_dir(int fd)
 {
@@ -416,6 +435,11 @@ extern "C" int ppu_cellfs_dir_next(int fd, char* name, size_t name_cap, char* di
     snprintf(name, name_cap, "%s", e->d_name);
     return 1;
 }
+/* The open flags this table recorded for a file it holds under `fd`, or -1. */
+extern "C" int ppu_cellfs_file_flags(int fd)
+{
+    return fd_file_own(fd) ? (int)__atomic_load_n(&g_fd_flags[fd], __ATOMIC_RELAXED) : -1;
+}
 
 /* ---- handlers ---- */
 static void cellFsOpen(ppu_context* ctx)
@@ -472,7 +496,7 @@ static void cellFsOpen(ppu_context* ctx)
         close(hfd);
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return;
     }
-    int fd = fd_alloc_file(f);
+    int fd = fd_alloc_file(f, flags);
     if (fd < 0) { fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EMFILE; return; }
     if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
     g_fd_usm[fd] = (strstr(gpath, ".usm") != nullptr) ? 1 : 0;
@@ -570,7 +594,7 @@ static void cellFsSdataOpen(ppu_context* ctx)
         }
         free(dec);
         rewind(tf);
-        int fd = fd_alloc_file(tf);
+        int fd = fd_alloc_file(tf, CELL_FS_O_RDONLY);   /* a decrypted copy to read, never to write */
         if (fd < 0) { fclose(tf); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EMFILE; return; }
         if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
         PS3_LOG(PS3_LOG_INFO, "fs", "SdataOpen '%s' -> fd %d (NPD decrypted, 0x%zX bytes, magic '%c%c%c%c')\n",
@@ -580,7 +604,7 @@ static void cellFsSdataOpen(ppu_context* ctx)
         ctx->gpr[3] = CELL_OK;
         return;
     }
-    int fd = fd_alloc_file(f);
+    int fd = fd_alloc_file(f, CELL_FS_O_RDONLY);   /* opened read-only above */
     if (fd < 0) { fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EMFILE; return; }
     if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
     PS3_LOG(PS3_LOG_INFO, "fs", "SdataOpen '%s' -> fd %d (magic %c%c%c%c)\n", gpath, fd,
@@ -627,7 +651,14 @@ static void cellFsRead(ppu_context* ctx)
     uint64_t nbytes = ctx->gpr[5];
     uint32_t nread_ptr = (uint32_t)ctx->gpr[6];
     FILE* f = fd_file(fd);
-    if (!f) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EBADF; return; }
+    const int flags = f ? fd_flags(fd) : -1;
+    /* RPCS3 6e4b784d1 sys_fs_read (:1498-1502), which cellFsRead wraps (cellFs.cpp:57-62): a read on a write-only
+     * file is EBADF with *nread = 0. The cellFs table kept no flags to check. */
+    if (!f || (nbytes && flags >= 0 && (flags & CELL_FS_O_WRONLY))) {
+        if (nread_ptr && fs_range_ok(nread_ptr, 8)) vm_write64(nread_ptr, 0);
+        ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EBADF;
+        return;
+    }
     uint64_t raw_nbytes = ctx->gpr[5];
     long fpos_before = ftell(f);
     /* The firmware checks the null out pointer and the null buffer here and
@@ -724,7 +755,15 @@ static void cellFsWrite(ppu_context* ctx)
     uint64_t nbytes = ctx->gpr[5];
     uint32_t nwr_ptr = (uint32_t)ctx->gpr[6];
     FILE* f = fd_file(fd);
-    if (!f) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EBADF; return; }
+    const int flags = f ? fd_flags(fd) : -1;
+    /* RPCS3 6e4b784d1 sys_fs_write (:1593-1597), which cellFsWrite wraps (cellFs.cpp:63-69): a file not opened for
+     * writing is EBADF with *nwrite = 0. It was EIO, from the host stream refusing the write; the cellFs table kept
+     * no flags to check. Read-only mounts (EROFS) are not modelled. */
+    if (!f || (nbytes && flags >= 0 && !(flags & CELL_FS_O_ACCMODE))) {
+        if (nwr_ptr && fs_range_ok(nwr_ptr, 8)) vm_write64(nwr_ptr, 0);
+        ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EBADF;
+        return;
+    }
     /* Oracle RPCS3 sys_fs_write: `!buf` -> CELL_EFAULT with bytes written 0. */
     if (!buf) {
         if (fs_range_ok(nwr_ptr, 8)) vm_write64(nwr_ptr, 0);
@@ -1393,14 +1432,26 @@ static void fs_io_with_offset(ppu_context* ctx, int write)
     uint32_t buf    = (uint32_t)ctx->gpr[5];
     uint64_t size   = ctx->gpr[6];
     uint32_t n_ptr  = (uint32_t)ctx->gpr[7];
+    /* The count is stored by every outcome below (0 for a refusal, RPCS3 6e4b784d1 cellFs.cpp:471-474), so its span
+     * is checked before the first store. */
+    if (n_ptr && !fs_range_ok(n_ptr, 8)) fs_range_stop(api, "n", n_ptr, 8);
     FILE* f = fd_file(fd);
-    if (!f) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EBADF; return; }
+    const int flags = f ? fd_flags(fd) : -1;
+    /* RPCS3 sys_fs.cpp:2498-2511 (the fcntl both calls are): a read on a write-only file, a write on a file not
+     * opened for writing and a write on an append-mode file are EBADF, count 0. A read-only mount (EROFS, :2513) is
+     * not modelled. */
+    const bool refused = !f || (flags >= 0 && (write ? (!(flags & CELL_FS_O_ACCMODE) || (flags & CELL_FS_O_APPEND))
+                                                      : (flags & CELL_FS_O_WRONLY) != 0));
+    if (refused) {
+        if (n_ptr) vm_write64(n_ptr, 0);
+        ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EBADF;
+        return;
+    }
     /* The same rule as cellFsRead / cellFsWrite: every span the title chose is guest memory in full, or a named
      * stop before anything is touched. `size` is never clamped to the arena: that read or wrote a prefix of what
      * the title asked for and reported success, and a span past the arena would have underflowed. The count is
      * written after the transfer, so its span is checked first too, not left to fault once the file has changed. */
     if (!fs_range_ok(buf, size)) fs_range_stop(api, "buf", buf, size);
-    if (n_ptr && !fs_range_ok(n_ptr, 8)) fs_range_stop(api, "n", n_ptr, 8);
     fs_prefault(buf, size);   /* written by a read, read by a write: same reserved-page trap */
     size_t n = 0;
     int write_failed = 0;
