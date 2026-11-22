@@ -1749,7 +1749,8 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch
               fprintf(stderr, "[HOTREAD] GCM control spin: put=0x%08X get=0x%08X "
                       "ref=0x%08X (addr 0x%08X)\n", pu, ge, rf, (uint32_t)a);
           } else fprintf(stderr, "[HOTREAD] spinning on 0x%08X (=0x%08X) guest cia=0x%08X lr=0x%08X\n", (uint32_t)a, __builtin_bswap32(v),
-          g_active_ctx?(uint32_t)g_active_ctx->cia:0, g_active_ctx?(uint32_t)g_active_ctx->lr:0); n=0;
+          g_active_ctx?(uint32_t)g_active_ctx->cia:0, g_active_ctx?(uint32_t)g_active_ctx->lr:0);
+          n=0; /* both branches: the counter restarts after either report */
 #ifdef _WIN32
         /* PPU_SPINBT=<addr>: one-shot host backtrace when the read32 hot spin
          * is on the watched address -- names the guest function containing the
