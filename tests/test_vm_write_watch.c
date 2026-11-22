@@ -165,7 +165,12 @@ int main(int argc, char** argv)
      * access error is fatal; this mode is expected to abort. */
     if (argc > 1 && !strcmp(argv[1], "strict")) {
         set_env("PS3RECOMP_VM_WRITE_WATCH_STRICT", "1");
-        /* The abort becomes an ordinary failing exit for the test runner. */
+        /* The abort becomes an ordinary failing exit for the test runner. The MSVC runtime would first report
+         * the abort (a "Debug Error" box in a debug build, Windows Error Reporting otherwise) and wait for an
+         * answer nobody gives in CI, so the runner timed out instead of seeing the handler's exit. */
+#ifdef _MSC_VER
+        _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#endif
         signal(SIGABRT, aborted);
         assert(vm_watch_enable());
         vm_note_write_check(0, "strict test: success");
