@@ -30,6 +30,9 @@ static void callback(u32 opd, u64 result, u64 user, u64 c, u64 d,
         assert(calls == 1);
     }
 }
+static unsigned pumps_a, pumps_b;
+static void osk_pump_a(void) { pumps_a++; }
+static void osk_pump_b(void) { pumps_b++; }
 int main(void)
 {
     vm_base = calloc(1, 65536); assert(vm_base);
@@ -86,6 +89,15 @@ int main(void)
     assert(!msg_offers_to_abort(""));
     assert(!msg_offers_to_abort(NULL));
 
+    /* The native OSK host's pump (libs/misc/osk_native.c) runs once per poll; a later install replaces it and
+     * NULL withdraws it. */
+    cellSysutilCheckCallback(); assert(!pumps_a && !pumps_b);
+    cellSysutil_set_osk_pump(osk_pump_a);
+    cellSysutilCheckCallback(); assert(pumps_a == 1 && !pumps_b);
+    cellSysutil_set_osk_pump(osk_pump_b);
+    cellSysutilCheckCallback(); assert(pumps_a == 1 && pumps_b == 1);
+    cellSysutil_set_osk_pump(NULL);
+    cellSysutilCheckCallback(); assert(pumps_a == 1 && pumps_b == 1);
 
     free(vm_base);
     puts("Deferred dialog and button-mask checks passed");

@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #ifdef __APPLE__
 #include <CoreFoundation/CoreFoundation.h>   /* the host UI language */
 #endif
@@ -254,9 +255,11 @@ int cellSysutil_pump_seen(void) { return s_pump_seen; }
 /* A native on-screen keyboard host (libs/misc/osk_native.c) installs its pump
  * with its first request, so sysutil never links against the OSK and builds
  * without one are unchanged. The pump turns host completions into queued
- * OSK events, which the drain below then delivers on this same poll. */
-static void (*volatile s_osk_pump)(void);
-void cellSysutil_set_osk_pump(void (*pump)(void)) { s_osk_pump = pump; }
+ * OSK events, which the drain below then delivers on this same poll. The
+ * pointer is published with release so the OSK state set up before the
+ * install is visible to the poll thread that acquires it. */
+static _Atomic(void (*)(void)) s_osk_pump;
+void cellSysutil_set_osk_pump(void (*pump)(void)) { atomic_store_explicit(&s_osk_pump, pump, memory_order_release); }
 
 s32 cellSysutilCheckCallback(void)
 {
@@ -270,7 +273,7 @@ s32 cellSysutilCheckCallback(void)
     /* A pending PSN terms-of-service answer (cellSysutilNpEula.c) joins the
      * completions, so this same poll runs the title's callback. */
     { extern void ps3_np_eula_tick(void); ps3_np_eula_tick(); }
-    { void (*pump)(void) = s_osk_pump; if (pump) pump(); }
+    { void (*pump)(void) = atomic_load_explicit(&s_osk_pump, memory_order_acquire); if (pump) pump(); }
     drain_guest_completions();
     run_poll_hooks();
     /* No cellMsgDialog_pump() here: #155 replaced that mechanism with
