@@ -95,6 +95,7 @@ FUNCTIONS = [
     "stub_sys_process_exit",
     "vblank_handler",              # cellGcmSetVBlankHandler's OPD
     "stub_cellGcmSetVBlankHandler",
+    "stub__cellSpursWorkloadAttributeInitialize",   # nine arguments: r3..r10 and the guest stack
 ]
 
 # The line each step prints through sys_tty_write. Indexed by the step id in
@@ -105,6 +106,7 @@ MARKERS = [
     "[smoke] entry: the loader resolved the entry OPD and dispatched _start",
     "[smoke] image: PT_LOAD data, the BSS tail and the TLS template are live",
     "[smoke] hle: _cellGcmInitBody dispatched through the NID bridge",
+    "[smoke] spurs: a nine-argument import reads its ninth argument off the guest stack",
     "[smoke] thread: sys_ppu_thread_create returned a thread id",
     "[smoke] thread: the guest thread body is running on its own host thread",
     "[smoke] thread: sys_ppu_thread_join handed back the thread's exit status",

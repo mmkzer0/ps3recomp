@@ -185,7 +185,7 @@ jobs:
             cmake --build build-bundle-template
             PS3RECOMP_METAL_HEADLESS=1 ./build-bundle-template/MyGameRecomp \
               build/smoke/smoke.elf > bundle-template.log 2>&1
-            grep -q "\[smoke\] OK: all 11 markers, in order" bundle-template.log
+            grep -q "\[smoke\] OK: all 12 markers, in order" bundle-template.log
             grep -q "\[smoke\] PASS" bundle-template.log
           fi
 

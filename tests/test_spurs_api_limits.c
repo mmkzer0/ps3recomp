@@ -3,6 +3,7 @@
 #include <assert.h>
 #include <stdatomic.h>
 #include "../runtime/spu/spu_coherency.h"
+#include <sys/mman.h>   /* vm_base is MAP_SHARED so a forked stop case's writes reach the parent */
 #include <sys/wait.h>   /* the stop cases fork: the fixture is POSIX only (the driver skips elsewhere) */
 #include <unistd.h>
 
@@ -42,16 +43,29 @@ static void finalize(u32 ea)
 
 /* _cellSpursWorkloadAttributeInitialize through its context handler (upstream #646). */
 static ppu_context g_attr_ctx;
-static void attr_args(u32 attr, u32 prio, u32 sp)
+static void attr_args(u64 attr, u64 prio, u32 sp)
 {
     memset(&g_attr_ctx,0,sizeof g_attr_ctx);
     g_attr_ctx.gpr[1]=sp; g_attr_ctx.gpr[3]=attr; g_attr_ctx.gpr[4]=1; g_attr_ctx.gpr[5]=0x00350001u;
     g_attr_ctx.gpr[6]=0x9000; g_attr_ctx.gpr[7]=16; g_attr_ctx.gpr[8]=0; g_attr_ctx.gpr[9]=prio; g_attr_ctx.gpr[10]=1;
 }
-/* A refused span ends the process in the named stop hle-guest-range, so the call runs in a forked child (before any
- * SPURS thread exists) and the parent reads the machine line the stop prints on stderr. */
-static void attr_init_stops(const char* arg)
+#define ATTR_SPAN (WKATTR_HOOK_ARG+4u)   /* the bytes the handler's stores cover, as the attribute check names them */
+#define SENTINEL 0xA5
+/* The part of the attribute at r3 (truncated to 32 bits, the alias a missing range check would write) that lies in
+ * guest memory. */
+static u32 attr_window(void)
 {
+    const u32 lo=(u32)g_attr_ctx.gpr[3];
+    return lo<ppu_vm_size ? (ppu_vm_size-lo<ATTR_SPAN ? ppu_vm_size-lo : ATTR_SPAN) : 0;
+}
+/* A refused span ends the process in the named stop hle-guest-range, so the call runs in a forked child (before any
+ * SPURS thread exists) and the parent reads the machine line the stop prints on stderr. vm_base is MAP_SHARED, so the
+ * parent also sees what the child wrote: with attr_untouched the attribute bytes must still hold the sentinel, i.e. the
+ * stop came before the first store. want_ea is the span start the stop must name (full width, no truncation). */
+static void attr_init_stops(const char* arg, u64 want_ea, int attr_untouched)
+{
+    const u32 lo=(u32)g_attr_ctx.gpr[3],win=attr_window();
+    if (attr_untouched) memset(vm_base+lo,SENTINEL,win);
     int fds[2];
     assert(pipe(fds)==0);
     fflush(stdout);
@@ -68,26 +82,63 @@ static void attr_init_stops(const char* arg)
     out[used]=0; close(fds[0]);
     int status=0;
     waitpid(pid,&status,0);
-    char want[128];
-    snprintf(want,sizeof want,"func=_cellSpursWorkloadAttributeInitialize arg=%s",arg);
+    char want[128],want_at[48];
+    snprintf(want,sizeof want,"func=_cellSpursWorkloadAttributeInitialize arg=%s ",arg);
+    snprintf(want_at,sizeof want_at," ea=0x%llX ",(unsigned long long)want_ea);
     const char* line=strstr(out,"PS3STOP v=1");
     if (!(WIFEXITED(status) && WEXITSTATUS(status)==PS3_STOP_EXIT_CODE && line &&
-          strstr(line,"kind=hle-guest-range") && strstr(line,want))) {
-        printf("FAIL %s: status 0x%X, stop line: %s\n",arg,status,line?line:"(none)");
+          strstr(line,"kind=hle-guest-range") && strstr(line,want) && strstr(line,want_at))) {
+        printf("FAIL %s ea=0x%llX: status 0x%X, stop line: %s\n",arg,(unsigned long long)want_ea,status,line?line:"(none)");
         exit(1);
     }
+    if (attr_untouched)
+        for (u32 i=0;i<win;i++)
+            if (vm_base[lo+i]!=SENTINEL) {
+                printf("FAIL %s: attribute byte +0x%X written before the stop\n",arg,i);
+                exit(1);
+            }
+}
+/* The accepted side of an edge: the handler returns CELL_OK and wrote the attribute. */
+static void attr_init_passes(void)
+{
+    const u32 lo=(u32)g_attr_ctx.gpr[3];
+    memset(vm_base+lo,SENTINEL,attr_window());
+    hle_workload_attribute_initialize(&g_attr_ctx);
+    assert(g_attr_ctx.gpr[3]==0);
+    assert(vm_read32(lo+WKATTR_REVISION)==1 && vm_read32(lo+WKATTR_HOOK_ARG)==0);
 }
 
 int main(void)
 {
-    vm_base=calloc(1,ppu_vm_size);assert(vm_base);
+    /* Shared, so what a forked stop case writes before it stops is visible to the parent. */
+    vm_base=mmap(NULL,ppu_vm_size,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANON,-1,0);assert(vm_base!=MAP_FAILED);
+    assert(vm_guest_limit()==ppu_vm_size);
+    const u32 limit=ppu_vm_size;
 
     /* Each span the title chose stops when it leaves guest memory: the attribute, the priorities, and the stack slot
-     * the ninth argument comes from. */
-    attr_args(0x20000u-0x20u,0,0xD000); attr_init_stops("attr");                /* straddles the end */
-    attr_args(0xC000,0x20000u-4u,0xD000); attr_init_stops("priority");
-    attr_args(0xC000,0,0x20000u-112u-4u); attr_init_stops("maxContention");     /* r1 + 112 straddles the end */
+     * the ninth argument comes from. The first two stop before the attribute's first store. */
+    attr_args(limit-0x20u,0,0xD000); attr_init_stops("attr",limit-0x20u,1);        /* straddles the end */
+    attr_args(0xC000,limit-4u,0xD000); attr_init_stops("priority",limit-4u,1);
+    attr_args(0xC000,0,limit-112u-4u); attr_init_stops("maxContention",limit-4u,0);   /* r1 + 112 straddles the end */
     puts("SPURS workload attribute spans outside guest memory stop PASS");
+
+    /* Exact edges: the last span that fits passes, one byte further stops. */
+    attr_args(limit-ATTR_SPAN,0,0xD000); attr_init_passes();
+    attr_args(limit-ATTR_SPAN+1u,0,0xD000); attr_init_stops("attr",limit-ATTR_SPAN+1u,1);
+    memset(vm_base+limit-8u,1,8);
+    attr_args(0xC000,limit-8u,0xD000); attr_init_passes();
+    attr_args(0xC000,limit-7u,0xD000); attr_init_stops("priority",limit-7u,1);
+    vm_write64(limit-8u,7);   /* the ninth argument of the last slot that fits */
+    attr_args(0xC000,0,limit-112u-8u); hle_workload_attribute_initialize(&g_attr_ctx);
+    assert(g_attr_ctx.gpr[3]==0 && vm_read32(0xC000+WKATTR_MAX_CONT)==7);
+    attr_args(0xC000,0,limit-112u-7u); attr_init_stops("maxContention",limit-7u,0);
+    puts("SPURS workload attribute spans stop at the exact edge of guest memory PASS");
+
+    /* An EA above 4 GiB must not be truncated to the alias it has below: the stop names it in full, and the alias
+     * (0xC000 for the attribute, where the sentinel sits) stays unwritten. */
+    attr_args(0x10000C000ull,0,0xD000); attr_init_stops("attr",0x10000C000ull,1);
+    attr_args(0xC000,0x10000C100ull,0xD000); attr_init_stops("priority",0x10000C100ull,1);
+    puts("SPURS workload attribute EAs above 4 GiB stop untruncated PASS");
     memset(vm_base+0x9000,0x11,16);
     spu_workload_register_img(spu_workload_fingerprint(vm_base+0x9000,16),hold_policy,77,"api limits fixture");
     assert(cellSpursInitialize((CellSpurs*)0x1000,2,0,0,0)==0);
@@ -196,5 +247,5 @@ int main(void)
     atomic_store(&gate,1);
     finalize(0x5000);   /* the CellSpurs2 coordinator must stop before exit */
     finalize(0x1000);
-    free(vm_base);return 0;
+    munmap(vm_base,ppu_vm_size);return 0;
 }

@@ -20,6 +20,9 @@
  *     trampoline is: a function whose whole body is ps3_hle_call(nid, ctx),
  *   - a guest thread via sys_ppu_thread_create, joined via
  *     sys_ppu_thread_join,
+ *   - a firmware import with nine arguments, the ninth read off the guest
+ *     stack: _cellSpursWorkloadAttributeInitialize, whose handler cellSpurs
+ *     registers by NID,
  *   - cellGcm brought up through _cellGcmInitBody, then three frames cleared
  *     and flipped through the FIFO -- the same command words
  *     runtime/host/host_posix.c writes, but emitted from guest code into
@@ -128,6 +131,14 @@ extern unsigned int cellGcm_flip_request_count(void);
 #define SMOKE_SC_EXITSTAT   (SMOKE_DATA_BASE + 0x2030u)
 #define SMOKE_SC_BSSPROBE   (SMOKE_DATA_BASE + 0x2040u)
 
+/* The workload attribute the cellSpurs step fills in (0x38 bytes) and the 8 priority bytes it reads. Both 8-byte
+ * aligned, in the BSS tail. The ninth argument's value is not 1, which is what the 8-GPR adapter would store. */
+#define SMOKE_SC_WKATTR     (SMOKE_DATA_BASE + 0x2100u)
+#define SMOKE_SC_WKPRIO     (SMOKE_DATA_BASE + 0x2180u)
+#define SMOKE_WKATTR_MAXCONT_OFF 0x24u                    /* the attribute's be u32 maxContention */
+#define SMOKE_WKATTR_MAXCONT 6u
+#define SMOKE_NINTH_ARG_OFF  112u                         /* r1 + 48 + 8 * 8 */
+
 /* The PS3 thread pointer sits 0x7000 above the thread's TLS block, which is
  * the offset ppu_run uses when it copies the PT_TLS template and sets r13. */
 #define SMOKE_TLS_TP_BIAS   0x7000u
@@ -159,6 +170,7 @@ extern unsigned int cellGcm_flip_request_count(void);
 #define NID_cellGcmSetVBlankHandler   0xA91B0402u
 #define NID_sys_process_exit          0xE6F2C1E7u
 #define NID_sys_ppu_thread_create     0x24A1EA07u
+#define NID__cellSpursWorkloadAttributeInitialize 0xEFEB2679u
 
 /* cellGcmSys.h's flip states. */
 #define SMOKE_FLIP_DONE     0
@@ -182,6 +194,7 @@ enum {
     SMOKE_STEP_ENTRY = 0,
     SMOKE_STEP_IMAGE,
     SMOKE_STEP_HLE,
+    SMOKE_STEP_SPURS,
     SMOKE_STEP_THREAD_CREATE,
     SMOKE_STEP_THREAD_BODY,
     SMOKE_STEP_THREAD_JOIN,
@@ -318,6 +331,8 @@ void func_00010800(ppu_context* ctx)
     atomic_fetch_add(&g_vblank_calls, 1u);
 }
 void func_00010900(ppu_context* ctx) { ps3_hle_call(NID_cellGcmSetVBlankHandler, ctx); return; }
+/* cellSpurs' workload-attribute initializer, which takes nine arguments. */
+void func_00010A00(ppu_context* ctx) { ps3_hle_call(NID__cellSpursWorkloadAttributeInitialize, ctx); return; }
 
 /* ---------------------------------------------------------------------------
  * The verdict.
@@ -330,7 +345,7 @@ void func_00010900(ppu_context* ctx) { ps3_hle_call(NID_cellGcmSetVBlankHandler,
  * instead; whichever exit runs, it reports once.
  * -----------------------------------------------------------------------*/
 static const char* const k_step_name[SMOKE_STEP_COUNT] = {
-    "entry", "image", "hle", "thread-create", "thread-body",
+    "entry", "image", "hle", "spurs", "thread-create", "thread-body",
     "thread-join", "frame-1", "frame-2", "frame-3", "vblank", "exit",
 };
 
@@ -516,6 +531,26 @@ void func_00010000(ppu_context* ctx)
                 "the GCM context does not begin at the command area (IO address + 0x1000)");
     smoke_mark(ctx, SMOKE_STEP_HLE);
 
+    /* A nine-argument import. _cellSpursWorkloadAttributeInitialize takes its ninth argument (maxContention) in the
+     * caller's parameter save area, a doubleword at r1 + 112 (64-bit PowerPC ELF ABI; the entry frame ppu_run reserves
+     * is 0x80 bytes). The generic 8-GPR adapter cannot see it and stores 1, so the value reaching the attribute proves
+     * the import ran through the handler cellSpurs registers by NID, not the adapter.
+     *   r3 = attr, r4 = revision, r5 = sdkVersion, r6 = pm, r7 = size, r8 = data, r9 = priority, r10 = minContention */
+    vm_write64(ctx->gpr[1] + SMOKE_NINTH_ARG_OFF, SMOKE_WKATTR_MAXCONT);
+    ctx->gpr[3]  = SMOKE_SC_WKATTR;
+    ctx->gpr[4]  = 1;
+    ctx->gpr[5]  = 0x00350001u;
+    ctx->gpr[6]  = SMOKE_TEXT_BASE;
+    ctx->gpr[7]  = 0x10;
+    ctx->gpr[8]  = 0;
+    ctx->gpr[9]  = SMOKE_SC_WKPRIO;
+    ctx->gpr[10] = 1;
+    func_00010A00(ctx); DRAIN_TRAMPOLINE(ctx);
+    smoke_check((int32_t)ctx->gpr[3] == 0, "_cellSpursWorkloadAttributeInitialize returned an error");
+    smoke_check(vm_read32(SMOKE_SC_WKATTR + SMOKE_WKATTR_MAXCONT_OFF) == SMOKE_WKATTR_MAXCONT,
+                "the attribute's maxContention is not the ninth argument off the guest stack");
+    smoke_mark(ctx, SMOKE_STEP_SPURS);
+
     /* A guest thread, through the sysPrxForUser import NID as a lifted title
      * does it. The entry is an OPD address, which the runtime's thread
      * trampoline resolves the same way ppu_run resolved ours. */
@@ -668,6 +703,7 @@ const func_entry function_table[] = {
     { 0x00010700ULL, func_00010700, "func_00010700" },
     { 0x00010800ULL, func_00010800, "func_00010800" },
     { 0x00010900ULL, func_00010900, "func_00010900" },
+    { 0x00010A00ULL, func_00010A00, "func_00010A00" },
     { 0, NULL, NULL }
 };
-const uint64_t function_table_count = 10;
+const uint64_t function_table_count = 11;
