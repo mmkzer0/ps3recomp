@@ -1200,6 +1200,51 @@ static void emit_poly_offset_draw(void)
     emit(HOST_NV4097_SET_POLY_OFFSET_FILL_ENABLE, 0u);
 }
 
+/* --points / --points-edge / --points-miss: one POINTS draw (SET_BEGIN_END 1,
+ * a single vertex) through --shader's guest programs, whose fragment program
+ * writes red from the blue vertex colour. SET_POINT_SIZE is 8.0 and the vertex
+ * program writes no point size, so the register is what sizes the point.
+ *
+ * The vertex sits at the centre of a pixel of the 1280x720 target, `s_point_dx`
+ * pixels right of the one the harness reads (640, 360): x = (640.5 + dx) / 640
+ * - 1 in NDC. NDC y is +0.5 / 360 above the centre line: that is the middle of
+ * row 360 where +y is down the window (Vulkan), and 1 px above it where +y is
+ * up (Metal), which an 8 px point covers either way.
+ *   --points       dx = 0: the centre pixel is the point's.
+ *   --points-edge  dx = 3: still inside an 8x8 point (centre 3 px away, edge at
+ *                  4), so the centre pixel is lit. Metal only: the Vulkan shaders
+ *                  declare no PointSize (RSX_POINT_SIZE_BUILTIN is Metal's, see
+ *                  vk_eng_bind_vs_constants), so a Vulkan point's size is
+ *                  undefined and the mode is skipped there.
+ *   --points-miss  dx = 6: outside an 8x8 point and no 1 px point either, so the
+ *                  centre pixel is the clear colour on both. */
+static int s_point_dx;
+#define PTVX_OFFSET (VTX_OFFSET + 0xA000u)
+#define HOST_NV4097_SET_POINT_SIZE 0x00001EE0u   /* float, pixels */
+static void upload_point_vertex(void)
+{
+    const float v[8] = { (640.5f + (float)s_point_dx) / 640.0f - 1.0f, 0.5f / 360.0f, 0.0f, 1.0f,
+                         0.0f, 0.0f, 1.0f, 1.0f };               /* blue -> red through the FP */
+    for (int k = 0; k < 8; k++)
+        guest_f32(IO_ADDR + PTVX_OFFSET + (uint32_t)(k * 4), v[k]);
+}
+static void emit_point_draw(void)
+{
+    u8 vp[32];
+    rsx_test_vp_mov_out(vp +  0, 0, RSX_TEST_VP_SWZ_IDENT, 0, 0);   /* MOV o0, v0      */
+    rsx_test_vp_mov_out(vp + 16, 3, RSX_TEST_VP_SWZ_IDENT, 1, 1);   /* MOV o1, v3, END */
+    emit_programs(vp, sizeof vp, FP_OFFSET);
+
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 0 * 4, VTX_MAIN(PTVX_OFFSET +  0));  /* position */
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 0 * 4, VFMT(4, 32));
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 3 * 4, VTX_MAIN(PTVX_OFFSET + 16));  /* colour   */
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 3 * 4, VFMT(4, 32));
+    emit(HOST_NV4097_SET_POINT_SIZE, 0x41000000u);                  /* 8.0 */
+    emit(NV4097_SET_BEGIN_END, 1u);                                 /* POINTS           */
+    emit(NV4097_DRAW_ARRAYS,   0u | ((1u - 1u) << 24));            /* first=0 count=1  */
+    emit(NV4097_SET_BEGIN_END, 0u);
+}
+
 /* The pentagon, then the quad strip over it. Both are fixed-function, so
  * every backend can run this mode. */
 static void emit_quad_draws(void)
@@ -1243,7 +1288,8 @@ static void submit_frame(int with_draw)
             emit(NV4097_CLEAR_SURFACE,            0xF0u);
         }
     }
-    if (with_draw == 22)     emit_poly_offset_draw();
+    if (with_draw >= 23 && with_draw <= 25) emit_point_draw();
+    else if (with_draw == 22) emit_poly_offset_draw();
     else if (with_draw == 21) emit_blend_constant_draw();
     else if (with_draw == 20) emit_unbound_draw();
     else if (with_draw == 15) emit_border_draw();
@@ -1490,7 +1536,7 @@ static int mode_needs_translator(int mode)
     return mode == 3 || mode == 5 || mode == 6 || mode == 8 || mode == 14 ||
            mode == 9 || mode == 10 || mode == 11 || mode == 15 ||
            mode == 16 || mode == 17 || mode == 18 || mode == 19 || mode == 20 ||
-           mode == 21 || mode == 22;
+           mode == 21 || mode == 22 || mode == 23 || mode == 24 || mode == 25;
 }
 
 /* ...and which ones must, on a backend that has a translator, have run the
@@ -1519,6 +1565,9 @@ static const char* mode_flag_name(int mode)
     case 20: return "--unbound";
     case 21: return "--blend-constant";
     case 22: return "--poly-offset";
+    case 23: return "--points";
+    case 24: return "--points-edge";
+    case 25: return "--points-miss";
     default: return "(mode)";
     }
 }
@@ -1638,7 +1687,18 @@ int main(int argc, char** argv)
         /* --blend-constant / --poly-offset: see emit_blend_constant_draw, emit_poly_offset_draw. */
         else if (strcmp(argv[i], "--blend-constant") == 0) do_draw = 21;
         else if (strcmp(argv[i], "--poly-offset") == 0) do_draw = 22;
+        /* --points / --points-edge / --points-miss: see emit_point_draw. */
+        else if (strcmp(argv[i], "--points") == 0) do_draw = 23;
+        else if (strcmp(argv[i], "--points-edge") == 0) { do_draw = 24; s_point_dx = 3; }
+        else if (strcmp(argv[i], "--points-miss") == 0) { do_draw = 25; s_point_dx = 6; }
     }
+#if !(defined(__APPLE__) && !defined(PS3RECOMP_RSX_VULKAN))
+    if (do_draw == 24) {
+        printf("[host] --points-edge: skipped, the %s backend's point size is not the guest's "
+               "(its shaders write no PointSize); Metal only\n", HOST_BACKEND_NAME);
+        return 0;
+    }
+#endif
 #if !defined(__APPLE__)
     if (do_draw == 15) {
         printf("[host] --border: the %s backend does not honour SET_TEXTURE_BORDER_COLOR yet; skipped\n",
@@ -1695,6 +1755,7 @@ int main(int argc, char** argv)
     if (do_draw == 4) upload_depth_triangles();
     if (do_draw == 12) upload_depth_bounds_triangles();
     if (do_draw == 22) upload_poly_offset_triangles();
+    if (do_draw >= 23 && do_draw <= 25) upload_point_vertex();
     if (do_draw == 5) { upload_mip_texture(); upload_mip_quad(); }
     /* --rtt draws both: the triangle into the surface, the quad out of it. */
     if (do_draw == 6 || do_draw == 14) { upload_triangle(); upload_textured_quad(); upload_rtt_backing(); }
@@ -1823,6 +1884,8 @@ int main(int argc, char** argv)
                  : (do_draw == 20) ? CLEAR_ARGB   /* unbound reads (0,0,0,0)     */
                  : (do_draw == 21) ? 0xFF800000u  /* red * the blend constant    */
                  : (do_draw == 22) ? 0xFF00FF00u  /* the offset pulled green over red */
+                 : (do_draw == 23 || do_draw == 24) ? 0xFFFF0000u   /* the point covers the centre */
+                 : (do_draw == 25) ? CLEAR_ARGB   /* the point is 6 px away      */
                  : (do_draw == 18 || do_draw == 19) ? 0xFFFF0000u   /* only the surface holds red */
                  : (do_draw == 14) ? 0xFFFF0000u  /* the copy kept the triangle  */
                  : (do_draw == 6) ? 0xFFFF0000u   /* only the surface holds red  */
