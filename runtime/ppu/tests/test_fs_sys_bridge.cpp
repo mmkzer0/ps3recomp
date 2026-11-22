@@ -270,7 +270,7 @@ template <class F> static std::set<std::string> list_dir(const Scratch& s, F nex
 }
 
 /* The access mode of a file is the flags it was opened with, whichever family opens it and whichever reads or writes
- * it (RPCS3 6e4b784d1 sys_fs.cpp:1498-1502 and :1593-1597; cellFsRead / cellFsWrite wrap them, cellFs.cpp:57-69): a
+ * it (RPCS3 6e4b784d1 sys_fs.cpp:1517 and :1598; cellFsRead / cellFsWrite wrap them, cellFs.cpp:57-69): a
  * read on a write-only file and a write on a read-only file are EBADF with the count 0, where the permitted ones
  * transfer, and a zero-byte call is not refused. All four open/use pairings: the cellFs table's own fds, the
  * sys_fs table's own fds, and the two bridged ways. */

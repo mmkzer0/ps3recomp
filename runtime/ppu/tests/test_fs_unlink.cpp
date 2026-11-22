@@ -99,8 +99,9 @@ int main(int argc, char** argv)
     ctx.gpr[3] = 0; cellFsUnlink(&ctx);
     if ((int32_t)ctx.gpr[3] != (int32_t)CELL_EFAULT) return 43;
 #ifndef _WIN32
-    /* A pointer outside guest memory, and a string that never ends inside it, are named stops: the console
-     * faults on them, so there is no code to answer with (it was EFAULT for the first). */
+    /* A pointer outside guest memory, and a string that never ends inside it, are named stops (the repo rule for a
+     * span outside guest memory); RPCS3's translate_to_str answers CELL_EFAULT for both, a divergence kept for the
+     * rule (it was EFAULT here for the first). */
     const auto stops = [&](uint32_t address, const char* arg) {
         const auto r = run_child([&] {
             ppu_context child{};

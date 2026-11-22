@@ -803,7 +803,7 @@ int64_t sys_fs_read(ppu_context* ctx)
     sys_fs_fd_info* f = (slot >= 0 && slot < SYS_FS_FD_MAX) ? &g_sys_fs_fds[slot] : NULL;
     /* Own table first; otherwise the same fd opened through cellFs (one fd space on hardware; see the bridge note
      * at the top of this file). The access mode is the open flags of whichever table holds the file: RPCS3
-     * 6e4b784d1 sys_fs.cpp:1498-1502 answers EBADF with *nread = 0 for a read on a write-only file, and cellFsRead
+     * 6e4b784d1 sys_fs.cpp:1517 answers EBADF with *nread = 0 for a read on a write-only file, and cellFsRead
      * is a plain wrapper of it (cellFs.cpp:57-62). */
     const int own = f && f->active && f->fp;
     FILE* fp = own ? f->fp : sys_fs_bridge_file(fd);
@@ -909,7 +909,7 @@ int64_t sys_fs_write(ppu_context* ctx)
     sys_fs_fd_info* f = (slot >= 0 && slot < SYS_FS_FD_MAX) ? &g_sys_fs_fds[slot] : NULL;
     /* Own table first; otherwise the same fd opened through cellFs (one fd space on hardware; see the bridge note
      * at the top of this file). The access mode is the open flags of whichever table holds the file: RPCS3 6e4b784d1
-     * sys_fs.cpp:1593-1597 answers EBADF with *nwrite = 0 for a write on a file not opened for writing, and
+     * sys_fs.cpp:1598 answers EBADF with *nwrite = 0 for a write on a file not opened for writing, and
      * cellFsWrite is a plain wrapper of it (cellFs.cpp:63-69). Read-only mounts (EROFS) are not modelled. */
     const int own = f && f->active && f->fp;
     FILE* fp = own ? f->fp : sys_fs_bridge_file(fd);
@@ -1346,7 +1346,9 @@ int64_t sys_fs_unlink(ppu_context* ctx)
 
     /* RPCS3 6e4b784d1 translate_to_str (sys_fs.cpp:1107-1130): up to CELL_FS_MAX_FS_PATH_LENGTH characters, and
      * CELL_ENAMETOOLONG when no NUL is found in the first 1025 bytes. The string is read through its guest span
-     * byte by byte: one that leaves guest memory is the named stop, and a long one is refused whole, never cut. */
+     * byte by byte and a long one is refused whole, never cut. One that leaves guest memory is the named stop (the
+     * repo rule: a span the title chose is guest memory or hle-guest-range); RPCS3 answers CELL_EFAULT there
+     * (vm::read_string fails), a divergence kept for the rule. */
     for (uint32_t i = 0;; i++) {
         if (i > SYS_FS_PATH_LENGTH_MAX)
             return (int64_t)(int32_t)CELL_ENAMETOOLONG;

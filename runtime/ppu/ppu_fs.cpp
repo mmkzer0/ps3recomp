@@ -1163,9 +1163,10 @@ static void cellFsRmdir(ppu_context* ctx)  { ctx->gpr[3] = CELL_OK; }
 static void cellFsUnlink(ppu_context* ctx)
 {
     const uint32_t address = (uint32_t)ctx->gpr[3];
-    /* RPCS3 6e4b784d1 translate_to_str: a null path is CELL_EFAULT. A pointer outside guest memory has no code the
-     * console gives (the kernel faults on it), so it is the named stop, as guest_strcpy makes of a string that
-     * never ends inside guest memory. */
+    /* RPCS3 6e4b784d1 translate_to_str: a null path is CELL_EFAULT, and so is a pointer or a string outside guest
+     * memory (vm::read_string fails, sys_fs.cpp:1107-1130). Here the latter is the named stop instead, the repo rule
+     * that a span the title chose is guest memory or hle-guest-range, as guest_strcpy makes of a string that never
+     * ends inside guest memory: a divergence from RPCS3's EFAULT, kept for the rule. */
     if (!address) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EFAULT; return; }
     if (!fs_range_ok(address, 1)) fs_range_stop("cellFsUnlink", "path", address, 1);
     /* RPCS3 translate_to_str (sys_fs.cpp:1107-1130): up to CELL_FS_MAX_FS_PATH_LENGTH (1024) characters, and
