@@ -18,6 +18,9 @@ import subprocess
 import sys
 import tempfile
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import runtime_link  # noqa: E402
+
 ROOT = Path(__file__).resolve().parents[1]
 if os.name == 'nt':
     print('SKIP: standalone fixture requires the POSIX C toolchain')
@@ -120,16 +123,12 @@ with tempfile.TemporaryDirectory(prefix='sysfs-bridge-') as name:
     tmp = Path(name)
     fixture = tmp / 'fixture.c'
     fixture.write_text(FIXTURE)
-    obj = tmp / 'sys_fs.o'
     binary = tmp / 'fixture'
-    common = ['-O1', '-UNDEBUG', '-ffunction-sections', '-fdata-sections',
-              '-I' + str(ROOT), '-I' + str(ROOT / 'include')]
-    subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', *common, '-c',
-                    str(ROOT / 'runtime/syscalls/sys_fs.c'), '-o', str(obj)],
-                   check=True)
-    linker = (['-Wl,-dead_strip'] if platform.system() == 'Darwin'
-              else ['-Wl,--gc-sections'])
-    subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', *common,
-                    str(fixture), str(obj), *linker, '-o', str(binary)],
-                   check=True)
+    # sys_fs.c range-checks guest pointers (ps3_stop_guest_range) and logs: the real log, configuration and stops.
+    runtime_link.build([fixture, ROOT / 'runtime/syscalls/sys_fs.c'], binary, tmp,
+                       cflags=['-std=gnu17', '-O1', '-UNDEBUG', '-ffunction-sections', '-fdata-sections',
+                               '-I' + str(ROOT), '-I' + str(ROOT / 'include')],
+                       ldflags=(['-Wl,-dead_strip'] if platform.system() == 'Darwin'
+                                else ['-Wl,--gc-sections']),
+                       timeout=120)
     subprocess.run([str(binary)], check=True, timeout=10, cwd=tmp)

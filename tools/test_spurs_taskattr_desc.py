@@ -18,6 +18,9 @@ import subprocess
 import sys
 import tempfile
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import runtime_link  # noqa: E402
+
 ROOT = Path(__file__).resolve().parents[1]
 if os.name == 'nt':
     print('SKIP: standalone fixture requires the POSIX C/C++ toolchain')
@@ -101,17 +104,14 @@ with tempfile.TemporaryDirectory(prefix='spurs-taskattr-desc-') as name:
     tmp = Path(name)
     fixture = tmp / 'fixture.cpp'
     fixture.write_text(FIXTURE)
-    obj = tmp / 'spurs.o'
     binary = tmp / 'fixture'
     common = ['-O1', '-UNDEBUG', '-ffunction-sections', '-fdata-sections',
               '-I' + str(ROOT), '-I' + str(ROOT / 'include'),
               '-I' + str(ROOT / 'runtime/spu')]
-    subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', *common, '-c',
-                    str(ROOT / 'libs/spurs/cellSpurs.c'), '-o', str(obj)],
-                   check=True)
     linker = (['-Wl,-dead_strip'] if platform.system() == 'Darwin'
               else ['-Wl,--gc-sections'])
-    subprocess.run([os.environ.get('CXX', 'c++'), '-std=c++20', *common,
-                    str(fixture), str(obj), *linker, '-pthread', '-lm',
-                    '-o', str(binary)], check=True)
+    # cellSpurs.c logs and ends refused calls in named stops: the real log, configuration and stops.
+    runtime_link.build([fixture, ROOT / 'libs/spurs/cellSpurs.c'], binary, tmp,
+                       cflags=['-std=gnu17', *common], cxxflags=['-std=c++20', *common],
+                       ldflags=linker, timeout=180)
     subprocess.run([str(binary)], check=True, timeout=10, cwd=tmp)

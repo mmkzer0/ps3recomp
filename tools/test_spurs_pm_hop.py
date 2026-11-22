@@ -15,8 +15,12 @@ import argparse
 import os
 import platform
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import runtime_link  # noqa: E402
 
 if os.name == 'nt':
     print('SKIP: POSIX fixture')
@@ -31,13 +35,14 @@ units = ['spu_channels', 'spu_drain', 'spu_lockstep', 'spu_coherency', 'spu_work
          'spurs_policy_blob_weak', 'spu_interp']
 with tempfile.TemporaryDirectory(prefix='spurs-pm-hop-') as tmp:
     out = Path(tmp) / 'bench'
-    subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-D_GNU_SOURCE', '-O2', '-UNDEBUG',
-                    '-ffunction-sections', '-fdata-sections',
-                    '-Wl,-dead_strip' if platform.system() == 'Darwin' else '-Wl,--gc-sections',
-                    '-I' + str(root / 'include'), '-I' + str(root / 'runtime/spu'), '-I' + str(root / 'runtime/platform'),
-                    str(root / 'tests/bench_spurs_pm_hop.c'),
-                    *[str(root / 'runtime/spu' / f'{u}.c') for u in units],
-                    str(root / 'runtime/platform/win32_compat.c'), '-pthread', '-lm', '-o', str(out)], check=True)
+    runtime_link.build([root / 'tests/bench_spurs_pm_hop.c',
+                        *[root / 'runtime/spu' / f'{u}.c' for u in units]], out, tmp,
+                       cflags=['-std=gnu17', '-D_GNU_SOURCE', '-O2', '-UNDEBUG',
+                               '-ffunction-sections', '-fdata-sections',
+                               '-I' + str(root / 'include'), '-I' + str(root / 'runtime/spu'),
+                               '-I' + str(root / 'runtime/platform')],
+                       ldflags=['-Wl,-dead_strip' if platform.system() == 'Darwin' else '-Wl,--gc-sections'],
+                       runtime=('diag', 'platform', 'label_window', 'reservation'))
     base = {k: v for k, v in os.environ.items() if not k.startswith(('PS3RECOMP_', 'PS3_', 'SPU_', 'SPURS_'))}
     failed = []
     for lanes in (1, 6):

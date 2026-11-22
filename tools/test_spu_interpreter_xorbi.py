@@ -2,8 +2,12 @@
 """Run the real interpreter's byte XOR immediate vector semantics and existing self-test."""
 import os
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import runtime_link  # noqa: E402
 
 if os.name == 'nt':
     print('SKIP: fixture currently requires a POSIX C compiler')
@@ -15,10 +19,9 @@ env = {k: v for k, v in os.environ.items()
 with tempfile.TemporaryDirectory(prefix='spu-xorbi-') as tmp:
     for name in ['test_spu_interpreter_xorbi', 'spu_interp_selftest']:
         binary = Path(tmp) / name
-        subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG',
-                        '-I'+str(root/'include'), '-I'+str(spu),
-                        str(spu/'tests'/f'{name}.c'), str(spu/'spu_interp.c'),
-                        '-lm', '-o', str(binary)], check=True)
+        # spu_interp.c logs through ps3_log, which needs the typed configuration and the stop runtime.
+        runtime_link.build([spu/'tests'/f'{name}.c', spu/'spu_interp.c'], binary, tmp,
+                           cflags=['-std=gnu17', '-O1', '-UNDEBUG', '-I'+str(root/'include'), '-I'+str(spu)])
         subprocess.run([str(binary)], check=True, timeout=5, env=env, cwd=tmp)
 
     # Real toolchain output: decode and lift all encoded cases, compile the
@@ -44,10 +47,9 @@ with tempfile.TemporaryDirectory(prefix='spu-xorbi-') as tmp:
     generated = Path(tmp) / 'xorbi_lifted.h'
     generated.write_text('\n'.join(source) + '\n')
     binary = Path(tmp) / 'xorbi_lifted'
-    subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG', '-DXORBI_LIFTED',
-                    '-I'+str(root/'include'), '-I'+str(spu), '-include', str(generated),
-                    str(spu/'tests/test_spu_interpreter_xorbi.c'), str(spu/'spu_interp.c'),
-                    '-lm', '-o', str(binary)], check=True)
+    runtime_link.build([spu/'tests/test_spu_interpreter_xorbi.c', spu/'spu_interp.c'], binary, tmp,
+                       cflags=['-std=gnu17', '-O1', '-UNDEBUG', '-DXORBI_LIFTED',
+                               '-I'+str(root/'include'), '-I'+str(spu), '-include', str(generated)])
     subprocess.run([str(binary)], check=True, timeout=5, env=env, cwd=tmp)
     regenerated = subprocess.check_output([os.environ.get('PYTHON', 'python3'), str(root/'tools/gen_spu_interp.py')])
     assert regenerated == (spu/'spu_interp_tables.inc').read_bytes()

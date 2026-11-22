@@ -25,6 +25,9 @@ import sys
 import tempfile
 
 TOOLS = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, TOOLS)
+import runtime_link  # noqa: E402
+
 ROOT = os.path.dirname(TOOLS)
 FIXTURE = os.path.join(ROOT, "runtime", "ppu", "tests", "test_fs_with_offset.cpp")
 INCLUDE_DIRS = ["include", "runtime/ppu", "runtime/memory", "runtime", "libs", "."]
@@ -61,15 +64,16 @@ def main():
         with open(os.path.join(td, "ppu_recomp.h"), "w") as fh:
             fh.write(_stub_header())
         exe = args.exe_out or os.path.join(td, "test_fs_with_offset")
-        cmd = [cxx, "-std=gnu++17", "-w", "-I" + td]
-        cmd += ["-I" + os.path.join(ROOT, d) for d in INCLUDE_DIRS]
-        cmd += ["-o", exe, FIXTURE]
-        if "mingw" in os.path.basename(cxx):
-            cmd += ["-static"]
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        if r.returncode != 0:
+        # ppu_fs.cpp logs, reads the typed configuration and raises named stops (ps3_stop_guest_range).
+        mingw = "mingw" in os.path.basename(cxx)
+        try:
+            runtime_link.build([FIXTURE], exe, td, cxx=cxx, capture_output=True,
+                               cxxflags=["-std=gnu++17", "-w", "-I" + td,
+                                         *["-I" + os.path.join(ROOT, d) for d in INCLUDE_DIRS]],
+                               ldflags=["-static"] if mingw else [])
+        except subprocess.CalledProcessError as e:
             print("FAIL: fixture did not build")
-            print((r.stdout + r.stderr)[-4000:])
+            print((e.stdout + e.stderr)[-4000:])
             return 1
         if args.build_only:
             print(f"built {exe}")
