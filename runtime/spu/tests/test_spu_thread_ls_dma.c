@@ -66,22 +66,28 @@ static void spu1_entry(spu_context* ctx)
 
 #ifndef _WIN32
 static int g_race_stop;
-static unsigned long g_race_copies, g_race_bad;
+static unsigned long g_race_copies, g_race_missed, g_race_bad;
 
-/* SPU 1 of workload 0, entered again after every removal: stamps its record. */
-static void race_entry(spu_context* ctx) { memcpy(&ctx->ls[PEER_LSA], k_spu1, sizeof k_spu1); }
+/* SPU 1 of workload 0, entered again after every removal or reload. It writes nothing: running[] is published before
+ * the entry runs, so a stamp written here would be unordered with the reader's copy, and the sanitizer would report
+ * the test's own stamp instead of the lifetime bugs these blocks are for. The reader accepts only the zeroes of a
+ * fresh context. */
+static void race_entry(spu_context* ctx) { (void)ctx; }
 
 static void* race_reader(void* arg)
 {
     static const uint8_t zero[16];
     uint8_t buf[16];
     (void)arg;
-    while (!__atomic_load_n(&g_race_stop, __ATOMIC_ACQUIRE))
+    while (!__atomic_load_n(&g_race_stop, __ATOMIC_ACQUIRE)) {
         if (spu_thread_ls_copy(g_other, 1, PEER_LSA, buf, 16, 0)) {
             __atomic_add_fetch(&g_race_copies, 1, __ATOMIC_RELEASE);
-            if (memcmp(buf, k_spu1, 16) != 0 && memcmp(buf, zero, 16) != 0)
+            if (memcmp(buf, zero, 16) != 0)
                 __atomic_add_fetch(&g_race_bad, 1, __ATOMIC_RELAXED);
+        } else {
+            __atomic_add_fetch(&g_race_missed, 1, __ATOMIC_RELAXED);
         }
+    }
     return NULL;
 }
 #endif
@@ -146,9 +152,9 @@ int main(void)
 
 #ifndef _WIN32
     {   /* The reader copies out of SPU 1's local store while the workload that owns it is removed and re-created:
-         * every copy either finds no context or reads a live one (the stamped record, or the zeroes before the
-         * stamp). The race is only visible to a sanitizer (TSan: the copy against the free in
-         * spurs_policy_release_workload; ASan: the freed context). */
+         * every copy either finds no context or reads a live one (the zeroes of a fresh context). The race is only
+         * visible to ThreadSanitizer (the tsan preset sets SANITIZERS=thread for this test): the copy against the
+         * free in spurs_policy_release_workload. */
         pthread_t reader;
         g_race_stop = 0;
         spu_run_policy_module(race_entry, 1, k_pm, sizeof k_pm, 0, 0, SPURS_EA, 1);
