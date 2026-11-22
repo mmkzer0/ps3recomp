@@ -1467,6 +1467,14 @@ static void fs_io_with_offset(ppu_context* ctx, int write)
     /* The count is stored by every outcome below (0 for a refusal, RPCS3 6e4b784d1 cellFs.cpp:471-474), so its span
      * is checked before the first store. */
     if (n_ptr && !fs_range_ok(n_ptr, 8)) fs_range_stop(api, "n", n_ptr, 8);
+    /* RPCS3 cellFs.cpp:488-492: a null write buffer is CELL_EFAULT with *nwrite = 0, before the fd is looked at (a
+     * bad fd with a null buffer is EFAULT, not EBADF). The write used to go through, copying guest page 0 into the
+     * file and answering CELL_OK. */
+    if (write && !buf) {
+        if (n_ptr) vm_write64(n_ptr, 0);
+        ctx->gpr[3] = 0x8001000Du;   /* CELL_EFAULT */
+        return;
+    }
     FILE* f = fd_file(fd);
     const int flags = f ? fd_flags(fd) : -1;
     /* RPCS3 sys_fs.cpp:2498-2511 (the fcntl both calls are): a read on a write-only file, a write on a file not
@@ -1483,6 +1491,13 @@ static void fs_io_with_offset(ppu_context* ctx, int write)
      * stop before anything is touched. `size` is never clamped to the arena: that read or wrote a prefix of what
      * the title asked for and reported success, and a span past the arena would have underflowed. The count is
      * written after the transfer, so its span is checked first too, not left to fault once the file has changed. */
+    /* A null read buffer with bytes to read: RPCS3 has no answer for it. cellFsReadWithOffset does no null check
+     * (cellFs.cpp:448-482) and the fcntl hands the buffer to lv2_file::op_read (sys_fs.cpp:756-786), whose fast path
+     * needs a writable page and whose fallback memcpy's into buf.get_ptr(): guest page 0 is not mapped on the
+     * console, so the read faults. There is no code to answer with, and a read into page 0 here would write guest
+     * memory the console never has: the named stop. With size 0 nothing is stored and the call succeeds with
+     * count 0, as RPCS3's loop does. */
+    if (!write && !buf && size) fs_range_stop(api, "buf", 0, size);
     if (!fs_range_ok(buf, size)) fs_range_stop(api, "buf", buf, size);
     fs_prefault(buf, size);   /* written by a read, read by a write: same reserved-page trap */
     size_t n = 0;

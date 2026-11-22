@@ -12,6 +12,8 @@
  *   - a bad fd returns CELL_FS_EBADF;
  *   - a read on a write-only fd, a write on a read-only fd and a write on an append-mode fd return CELL_FS_EBADF
  *     with the count 0 (the permitted opposites transfer);
+ *   - a null write buffer is CELL_EFAULT with the count 0 (before the fd check), a null read buffer with bytes to
+ *     read is an hle-guest-range stop, and with size 0 it is CELL_OK;
  *   - a buffer or count span that leaves guest memory is an hle-guest-range stop, with nothing clamped.
  *
  *   tools/test_ppu_fs_with_offset.py
@@ -195,18 +197,37 @@ int main(int argc, char** argv)
     rc = io(rd_off, 1000, 0, 0x640, 4, 0x538);
     CHECK(rc == (uint32_t)CELL_FS_EBADF && rd64(0x538) == 0, "ReadWithOffset on a bad fd stores count 0");
 
+    /* RPCS3 cellFs.cpp:488-492: a null write buffer is CELL_EFAULT with the count 0, before the fd is looked at
+     * (and with a size of 0 too); it used to copy guest page 0 into the file and answer CELL_OK. A null read buffer
+     * with nothing to read is not an error (RPCS3's read loop does not run): CELL_OK, count 0. */
+    memset(mem + 0x538, 0xEE, 8);
+    rc = io(wr_off, fd, 4, 0, 4, 0x538);
+    CHECK(rc == (uint32_t)CELL_EFAULT && rd64(0x538) == 0, "WriteWithOffset with a null buffer is EFAULT, count 0 (0x%08X)", rc);
+    memset(mem + 0x538, 0xEE, 8);
+    rc = io(wr_off, 1000, 4, 0, 4, 0x538);
+    CHECK(rc == (uint32_t)CELL_EFAULT && rd64(0x538) == 0, "... also with a bad fd (0x%08X)", rc);
+    memset(mem + 0x538, 0xEE, 8);
+    rc = io(wr_off, fd, 4, 0, 0, 0x538);
+    CHECK(rc == (uint32_t)CELL_EFAULT && rd64(0x538) == 0, "... and with a size of 0 (0x%08X)", rc);
+    memset(mem + 0x538, 0xEE, 8);
+    rc = io(rd_off, fd, 4, 0, 0, 0x538);
+    CHECK(rc == 0 && rd64(0x538) == 0, "ReadWithOffset with a null buffer and size 0 is CELL_OK, count 0 (0x%08X)", rc);
+
 #ifndef _WIN32
     /* A span that leaves the arena is a named stop before the file or the count is touched, never a clamped
      * transfer of the part that fits: the buffer's whole span, and the count's 8 bytes. */
     {
-        const struct { const char* name; uint64_t buf; uint64_t size; uint32_t n_ptr; const char* arg; } cases[] = {
-            {"a buffer straddling the arena's end", sizeof mem - 2, 4, 0x508, "buf"},
-            {"a buffer at the arena's end", sizeof mem, 4, 0x508, "buf"},
-            {"a size that wraps the span", 0x600, ~0ull, 0x508, "buf"},
-            {"a count straddling the arena's end", 0x600, 4, (uint32_t)sizeof mem - 4, "n"},
+        const struct { const char* name; uint64_t buf; uint64_t size; uint32_t n_ptr; const char* arg; bool read_only; } cases[] = {
+            {"a buffer straddling the arena's end", sizeof mem - 2, 4, 0x508, "buf", false},
+            {"a buffer at the arena's end", sizeof mem, 4, 0x508, "buf", false},
+            {"a size that wraps the span", 0x600, ~0ull, 0x508, "buf", false},
+            {"a count straddling the arena's end", 0x600, 4, (uint32_t)sizeof mem - 4, "n", false},
+            /* a null read buffer has no RPCS3 answer (its read would fault in page 0): the stop, not a read into it */
+            {"a null buffer with bytes to read", 0, 4, 0x508, "buf", true},
         };
         for (const auto& c : cases) {
             for (int op = 0; op < 2; ++op) {
+                if (c.read_only && op) continue;
                 const char* fn = op == 0 ? "cellFsReadWithOffset" : "cellFsWriteWithOffset";
                 int fds[2];
                 CHECK(pipe(fds) == 0, "pipe for %s", c.name);
