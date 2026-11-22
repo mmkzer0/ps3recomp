@@ -2733,7 +2733,11 @@ static void vk_cb_present(void* ud, u32 buffer_id)
  * Pipelines, draws and textures are the next stages; until then
  * pipeline_create reports 0, which the engine caches as "cannot build".
  * -------------------------------------------------------------------------*/
-#define VK_ENG_MAX_OBJ 2048          /* the engine's texture cache is 1024 */
+/* Textures share the table with colour targets, views and snapshots, so it grows with the engine's texture
+ * cache, which a title may enlarge at build time (-DRSX_DRAW_ENGINE_TEXTURE_CACHE=N, #798): 1024 slots for
+ * everything else, 2048 at the default cache of 1024 as before. With a fixed 2048 a larger cache filled the
+ * table and new textures silently came back as handle 0. */
+#define VK_ENG_MAX_OBJ (1024 + RSX_DRAW_ENGINE_TEXTURE_CACHE)
 
 enum { VK_ENG_FREE = 0, VK_ENG_COLOR, VK_ENG_DEPTH, VK_ENG_TEXTURE, VK_ENG_VIEW };
 
