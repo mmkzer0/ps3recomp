@@ -278,31 +278,56 @@ static void fs_set_dir(int fd, FILE* f, uint8_t dir)
 static char  g_dir_path[FS_MAX][1024];   /* host path per open dir (for readdir stat) */
 
 /* Guest threads open, read and close concurrently (FIOS media threads, audio
- * streamers). Allocation and release take this lock, so two opens can no longer
- * claim the same slot, and every handler reads its slot once (fd_file/fd_dir)
- * rather than re-reading a pointer another thread's close may have cleared. */
+ * streamers). Allocation and release take the fd-space lock, so two opens can
+ * no longer claim the same slot, and every handler reads its slot once
+ * (fd_file/fd_dir) rather than re-reading a pointer another thread's close may
+ * have cleared.
+ *
+ * runtime/syscalls/sys_fs.c keeps its own descriptor table, but on hardware
+ * cellFs and the raw sys_fs_* calls share ONE kernel fd space (the contract is
+ * in sys_fs.h): any call takes any fd, and a number is held by exactly one
+ * table. The lock is sys_fs.c's, so one lock guards the whole space and the
+ * two allocators cannot both pick a number; g_fd_lock is only the default for
+ * a build without that file. The functions below are defaults too, replaced by
+ * sys_fs.c's: a fixture that links ppu_fs.cpp alone sees an empty sys_fs table. */
 static std::mutex g_fd_lock;
-/* runtime/syscalls/sys_fs.c keeps its own descriptor table, but on hardware
- * cellFs and the raw sys_fs_* calls share ONE kernel fd space. Never hand out
- * a number the other table already owns; the bridge in sys_fs.c reads an fd
- * this table owns (MLB's Bink SDK does sys_fs_read on a cellFs fd). */
 #ifdef _MSC_VER
-extern "C" int sys_fs_fd_active_absent(int fd) { (void)fd; return 0; }
-extern "C" int sys_fs_fd_active(int fd);
 #  ifdef _M_IX86
-#    pragma comment(linker, "/alternatename:_sys_fs_fd_active=_sys_fs_fd_active_absent")
+#    define FS_PEER_SYM(x) "_" #x
 #  else
-#    pragma comment(linker, "/alternatename:sys_fs_fd_active=sys_fs_fd_active_absent")
+#    define FS_PEER_SYM(x) #x
 #  endif
+#  define FS_PEER_FN(ret, name, params, ...) \
+     extern "C" ret name##_absent params { __VA_ARGS__ } \
+     extern "C" ret name params; \
+     __pragma(comment(linker, "/alternatename:" FS_PEER_SYM(name) "=" FS_PEER_SYM(name##_absent)))
 #else
-extern "C" __attribute__((weak)) int sys_fs_fd_active(int fd) { (void)fd; return 0; }
+#  define FS_PEER_FN(ret, name, params, ...) extern "C" __attribute__((weak)) ret name params { __VA_ARGS__ }
 #endif
-static bool sys_fs_owns_fd(int fd) { return sys_fs_fd_active(fd) != 0; }
+FS_PEER_FN(void, ps3_fs_fd_space_lock, (void), g_fd_lock.lock();)
+FS_PEER_FN(void, ps3_fs_fd_space_unlock, (void), g_fd_lock.unlock();)
+/* Does sys_fs hold the number, as a file or a directory. Called under the lock. */
+FS_PEER_FN(int, sys_fs_fd_active, (int fd), (void)fd; return 0;)
+/* The FILE* of a file sys_fs holds, or null. */
+FS_PEER_FN(FILE*, sys_fs_file_for_fd, (int fd), (void)fd; return nullptr;)
+/* Close a file (is_dir 0) or directory (1) sys_fs holds: 1 closed, 0 not its. Takes the lock itself. */
+FS_PEER_FN(int, sys_fs_close_fd, (int fd, int is_dir), (void)fd; (void)is_dir; return 0;)
+/* One entry of a directory sys_fs holds: 1 an entry (name, and the host directory it is in), 0 end, -1 not its.
+ * A null name only asks whether fd is such a directory (1) or not (-1). */
+FS_PEER_FN(int, sys_fs_dir_next, (int fd, char* name, size_t name_cap, char* dir, size_t dir_cap),
+           (void)fd; (void)name; (void)name_cap; (void)dir; (void)dir_cap; return -1;)
+
+struct FdSpaceLock {
+    FdSpaceLock()  { ps3_fs_fd_space_lock(); }
+    ~FdSpaceLock() { ps3_fs_fd_space_unlock(); }
+    FdSpaceLock(const FdSpaceLock&) = delete;
+    FdSpaceLock& operator=(const FdSpaceLock&) = delete;
+};
 static int fd_alloc_file(FILE* f)
 {
-    std::lock_guard<std::mutex> hold(g_fd_lock);
+    FdSpaceLock hold;
     for (int i = 3; i < FS_MAX; i++)
-        if (!g_files[i] && !g_dirs[i] && !sys_fs_owns_fd(i)) {
+        if (!g_files[i] && !g_dirs[i] && !sys_fs_fd_active(i)) {
             g_fd_dir[i] = 0;
             __atomic_store_n(&g_files[i], f, __ATOMIC_RELEASE);
             return i;
@@ -311,28 +336,84 @@ static int fd_alloc_file(FILE* f)
 }
 static int fd_alloc_dir(DIR* d)
 {
-    std::lock_guard<std::mutex> hold(g_fd_lock);
+    FdSpaceLock hold;
     for (int i = 3; i < FS_MAX; i++)
-        if (!g_files[i] && !g_dirs[i] && !sys_fs_owns_fd(i)) {
+        if (!g_files[i] && !g_dirs[i] && !sys_fs_fd_active(i)) {
             __atomic_store_n(&g_dirs[i], d, __ATOMIC_RELEASE);
             return i;
         }
     return -1;
 }
-static FILE* fd_file(int fd)
+/* The file this table holds under `fd`. */
+static FILE* fd_file_own(int fd)
 {
     return fd >= 0 && fd < FS_MAX ? __atomic_load_n(&g_files[fd], __ATOMIC_ACQUIRE) : nullptr;
+}
+/* The file under `fd`, whichever table holds it: one kernel fd space on hardware, so a handler may be given an fd
+ * that was opened through sys_fs (MLB's Bink SDK opens with cellFsOpen and reads with sys_fs_read, and a title
+ * may as well do the reverse). An fd outside this table's range is cellFs's EBADF, as on the console. */
+static FILE* fd_file(int fd)
+{
+    if (fd < 0 || fd >= FS_MAX) return nullptr;
+    FILE* f = fd_file_own(fd);
+    return f ? f : sys_fs_file_for_fd(fd);
 }
 static DIR* fd_dir(int fd)
 {
     return fd >= 0 && fd < FS_MAX ? __atomic_load_n(&g_dirs[fd], __ATOMIC_ACQUIRE) : nullptr;
 }
-/* Bridged fd accessor for runtime/syscalls/sys_fs.c. One kernel fd space on
- * hardware: MLB's Bink SDK opens the .BIK with cellFs and then reads it with
- * sys_fs_read, which used to hit the empty sys_fs table and return EBADF. */
+/* Release the file / directory this table holds under `fd`: true when it held one. The number is free once the
+ * slot is cleared, under the lock; the stream or handle is closed after it. */
+static bool fd_release_file(int fd)
+{
+    FILE* f = nullptr;
+    if (fd >= 0 && fd < FS_MAX) {
+        FdSpaceLock hold;
+        f = g_files[fd];
+        if (f) {
+            if (g_fd_usm[fd] && ps3_env_once("PS3_FSLOG_READS")) PS3_LOG(PS3_LOG_INFO, "USMRD", "CLOSE usm fd=%d\n", fd);
+            __atomic_store_n(&g_files[fd], (FILE*)nullptr, __ATOMIC_RELEASE);
+            g_fd_usm[fd] = 0; g_fd_dir[fd] = 0;
+        }
+    }
+    if (f) fclose(f);
+    return f != nullptr;
+}
+static bool fd_release_dir(int fd)
+{
+    DIR* d = nullptr;
+    if (fd >= 0 && fd < FS_MAX) {
+        FdSpaceLock hold;
+        d = g_dirs[fd];
+        __atomic_store_n(&g_dirs[fd], (DIR*)nullptr, __ATOMIC_RELEASE);
+    }
+    if (d) closedir(d);
+    return d != nullptr;
+}
+/* What runtime/syscalls/sys_fs.c reaches for an fd this table holds (see sys_fs.h). */
 extern "C" FILE* ppu_cellfs_file_for_fd(int fd)
 {
-    return fd_file(fd);
+    return fd_file_own(fd);
+}
+extern "C" int ppu_cellfs_fd_owned(int fd)
+{
+    return fd >= 0 && fd < FS_MAX &&
+           (__atomic_load_n(&g_files[fd], __ATOMIC_ACQUIRE) || __atomic_load_n(&g_dirs[fd], __ATOMIC_ACQUIRE));
+}
+extern "C" int ppu_cellfs_close(int fd, int is_dir)
+{
+    return is_dir ? fd_release_dir(fd) : fd_release_file(fd);
+}
+extern "C" int ppu_cellfs_dir_next(int fd, char* name, size_t name_cap, char* dir, size_t dir_cap)
+{
+    DIR* d = fd_dir(fd);
+    if (!d) return -1;
+    if (!name) return 1;
+    struct dirent* e = readdir(d);
+    if (dir && dir_cap) snprintf(dir, dir_cap, "%s", g_dir_path[fd]);
+    if (!e) return 0;
+    snprintf(name, name_cap, "%s", e->d_name);
+    return 1;
 }
 
 /* ---- handlers ---- */
@@ -511,17 +592,8 @@ static void cellFsClose(ppu_context* ctx)
     int fd = (int)(uint32_t)ctx->gpr[3];
     if (ps3_env_once("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
         PS3_LOG(PS3_LOG_INFO, "fs", "close fd=%d  (by %s)\n", fd, w); }
-    FILE* f = nullptr;
-    if (fd >= 0 && fd < FS_MAX) {
-        std::lock_guard<std::mutex> hold(g_fd_lock);
-        f = g_files[fd];
-        if (f) {
-            if (g_fd_usm[fd] && ps3_env_once("PS3_FSLOG_READS")) PS3_LOG(PS3_LOG_INFO, "USMRD", "CLOSE usm fd=%d\n", fd);
-            __atomic_store_n(&g_files[fd], (FILE*)nullptr, __ATOMIC_RELEASE);
-            g_fd_usm[fd] = 0; g_fd_dir[fd] = 0;
-        }
-    }
-    if (f) fclose(f);
+    /* One fd space: a number this table does not hold may be a file opened through sys_fs. */
+    if (!fd_release_file(fd) && fd >= 0 && fd < FS_MAX) sys_fs_close_fd(fd, 0);
     ctx->gpr[3] = CELL_OK;
 }
 
@@ -867,21 +939,34 @@ static void cellFsReaddir(ppu_context* ctx)
     uint32_t dirent = (uint32_t)ctx->gpr[4];
     uint32_t nread_ptr = (uint32_t)ctx->gpr[5];
     DIR* d = fd_dir(fd);
-    if (!d) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EBADF; return; }
-    struct dirent* e = readdir(d);
-    if (!e) { if (nread_ptr) vm_write64(nread_ptr, 0); ctx->gpr[3] = CELL_OK; return; }
+    char bname[256], bdir[1100];
+    const char* name;
+    const char* dir_path;
+    if (d) {
+        struct dirent* e = readdir(d);
+        if (!e) { if (nread_ptr) vm_write64(nread_ptr, 0); ctx->gpr[3] = CELL_OK; return; }
+        name = e->d_name;
+        dir_path = g_dir_path[fd];
+    } else {
+        /* One fd space: a directory opened through sys_fs is read through its table. */
+        const int r = fd >= 3 && fd < FS_MAX ? sys_fs_dir_next(fd, bname, sizeof bname, bdir, sizeof bdir) : -1;
+        if (r < 0) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EBADF; return; }
+        if (r == 0) { if (nread_ptr) vm_write64(nread_ptr, 0); ctx->gpr[3] = CELL_OK; return; }
+        name = bname;
+        dir_path = bdir;
+    }
     char full[1300]; struct stat st;
-    snprintf(full, sizeof full, "%s/%s", g_dir_path[fd], e->d_name);
+    snprintf(full, sizeof full, "%s/%s", dir_path, name);
     /* "." and ".." are always directories: a title that walks a tree skips the
      * dot entries by type and name, and one typed as a file would be handed
      * to its file handler. Not left to stat("<dir>//.") resolving. */
-    const int dot = e->d_name[0] == '.' && (!e->d_name[1] || (e->d_name[1] == '.' && !e->d_name[2]));
+    const int dot = name[0] == '.' && (!name[1] || (name[1] == '.' && !name[2]));
     uint8_t type = (dot || (stat(full, &st) == 0 && (st.st_mode & S_IFDIR)))
                    ? CELL_FS_TYPE_DIR : CELL_FS_TYPE_REG;
-    size_t nl = strlen(e->d_name); if (nl > 255) nl = 255;
+    size_t nl = strlen(name); if (nl > 255) nl = 255;
     vm_base[dirent + 0] = type;
     vm_base[dirent + 1] = (uint8_t)nl;
-    for (size_t i = 0; i < nl; i++) vm_base[dirent + 2 + i] = (uint8_t)e->d_name[i];
+    for (size_t i = 0; i < nl; i++) vm_base[dirent + 2 + i] = (uint8_t)name[i];
     vm_base[dirent + 2 + nl] = 0;
     if (nread_ptr) vm_write64(nread_ptr, 0x102);
     ctx->gpr[3] = CELL_OK;
@@ -902,7 +987,9 @@ static void cellFsGetDirectoryEntries(ppu_context* ctx)
         return;
     }
     DIR* d = fd < 3 ? nullptr : fd_dir(fd);
-    if (!d) {
+    /* One fd space: a directory opened through sys_fs is read through its table. */
+    const bool bridged = !d && fd >= 3 && fd < FS_MAX && sys_fs_dir_next((int)fd, nullptr, 0, nullptr, 0) > 0;
+    if (!d && !bridged) {
         ctx->gpr[3] = 0x8001002Au; // CELL_EBADF
         return;
     }
@@ -910,13 +997,24 @@ static void cellFsGetDirectoryEntries(ppu_context* ctx)
     ctx->gpr[3] = CELL_OK;
     for (; count < bytes / 312; ++count) {
         errno = 0;
-        struct dirent* entry = readdir(d);
-        if (!entry) {
-            if (errno) ctx->gpr[3] = 0x8001002Bu; // CELL_EIO
-            break;
+        char bname[256], bdir[1100];
+        const char* name;
+        const char* dir_path;
+        if (d) {
+            struct dirent* entry = readdir(d);
+            if (!entry) {
+                if (errno) ctx->gpr[3] = 0x8001002Bu; // CELL_EIO
+                break;
+            }
+            name = entry->d_name;
+            dir_path = g_dir_path[fd];
+        } else {
+            if (sys_fs_dir_next((int)fd, bname, sizeof bname, bdir, sizeof bdir) <= 0) break;
+            name = bname;
+            dir_path = bdir;
         }
         char path[1300];
-        snprintf(path, sizeof path, "%s/%s", g_dir_path[fd], entry->d_name);
+        snprintf(path, sizeof path, "%s/%s", dir_path, name);
         struct stat st;
         if (stat(path, &st) != 0) {
             ctx->gpr[3] = 0x8001002Bu; // entry disappeared or cannot be inspected
@@ -930,11 +1028,11 @@ static void cellFsGetDirectoryEntries(ppu_context* ctx)
         vm_write64(out + 0x0C, uint64_t(st.st_atime));
         vm_write64(out + 0x14, uint64_t(st.st_mtime));
         vm_write64(out + 0x1C, uint64_t(st.st_ctime));
-        size_t length = strlen(entry->d_name);
+        size_t length = strlen(name);
         if (length > 255) length = 255;
         vm_base[out + 52] = directory ? CELL_FS_TYPE_DIR : CELL_FS_TYPE_REG;
         vm_base[out + 53] = uint8_t(length);
-        memcpy(vm_base + out + 54, entry->d_name, length);
+        memcpy(vm_base + out + 54, name, length);
     }
     vm_write32(count_ptr, count);
 }
@@ -942,13 +1040,8 @@ static void cellFsGetDirectoryEntries(ppu_context* ctx)
 static void cellFsClosedir(ppu_context* ctx)
 {
     int fd = (int)(uint32_t)ctx->gpr[3];
-    DIR* d = nullptr;
-    if (fd >= 0 && fd < FS_MAX) {
-        std::lock_guard<std::mutex> hold(g_fd_lock);
-        d = g_dirs[fd];
-        __atomic_store_n(&g_dirs[fd], (DIR*)nullptr, __ATOMIC_RELEASE);
-    }
-    if (d) closedir(d);
+    /* One fd space: a number this table does not hold may be a directory opened through sys_fs. */
+    if (!fd_release_dir(fd) && fd >= 0 && fd < FS_MAX) sys_fs_close_fd(fd, 1);
     ctx->gpr[3] = CELL_OK;
 }
 

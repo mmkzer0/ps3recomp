@@ -36,11 +36,12 @@ sys_fs_fd_info  g_sys_fs_fds[SYS_FS_FD_MAX];
 sys_fs_dir_info g_sys_fs_dirs[SYS_FS_DIR_MAX];
 char            g_sys_fs_root[512] = ".";
 
-/* fd and dir-fd slots are claimed and released under this lock. These
- * syscalls are live from several guest threads at once (one thread opens a
- * file while another is mid-read on its own), and the unlocked
- * find-a-free-slot-then-mark-it-active sequence let two concurrent opens pick
- * the same slot and share one FILE*. */
+/* The fd space shared with cellFs (see sys_fs.h). The file slots, the directory slots and the numbers the cellFs
+ * table holds are claimed and released under this one lock, by both sides: ppu_fs.cpp takes it through
+ * ps3_fs_fd_space_lock. These syscalls are live from several guest threads at once (one thread opens a file while
+ * another is mid-read on its own), and the unlocked find-a-free-slot-then-mark-it-active sequence let two
+ * concurrent opens pick the same slot and share one FILE*. Two tables that each look at the other's without a
+ * common lock still let a cellFsOpen and a sys_fs_open pick one number. */
 #ifdef _WIN32
 static SRWLOCK s_fs_slot_lock = SRWLOCK_INIT;
 static void fs_slot_lock(void)   { AcquireSRWLockExclusive(&s_fs_slot_lock); }
@@ -52,44 +53,172 @@ static void fs_slot_lock(void)   { pthread_mutex_lock(&s_fs_slot_lock); }
 static void fs_slot_unlock(void) { pthread_mutex_unlock(&s_fs_slot_lock); }
 #endif
 
+void ps3_fs_fd_space_lock(void)   { fs_slot_lock(); }
+void ps3_fs_fd_space_unlock(void) { fs_slot_unlock(); }
+
 /* ---- cellFs fd bridge -------------------------------------------------------
  *
  * On hardware, cellFsOpen and the raw sys_fs_* calls share ONE kernel fd
- * space: a title may open a file with cellFs and read it with sys_fs_read.
- * Our runtime has two tables (runtime/ppu/ppu_fs.cpp for cellFs, this file
- * for sys_fs), so that mix returned EBADF. MLB The Show 16's Bink SDK does
- * exactly this: the game opens the .BIK with cellFsOpen, the Bink IO then calls
- * sys_fs_lseek/sys_fs_read on that fd, and BinkOpen reported "Not a Bink file."
- * Bridge only when the fd is not ours; the sys_fs table stays authoritative
- * for its own descriptors.
+ * space: a title may open a file with cellFs and read it with sys_fs_read, or
+ * the reverse. Our runtime has two tables (runtime/ppu/ppu_fs.cpp for cellFs,
+ * this file for sys_fs), so that mix returned EBADF. MLB The Show 16's Bink SDK
+ * does exactly this: the game opens the .BIK with cellFsOpen, the Bink IO then
+ * calls sys_fs_lseek/sys_fs_read on that fd, and BinkOpen reported "Not a Bink
+ * file." Each call looks in its own table first and falls through to the
+ * other's, and neither allocator hands out a number the other table, or one of
+ * its own directories, holds. Files and directories draw from the same numbers.
  *
- * shortcut: each allocator checks the other's table without its lock, so two
- * opens racing through different tables can still pick one number; a shared
- * lock or one table is the real fix if a title hits it.
- *
- * A default, replaced by ppu_fs.cpp's, so a fixture that links this file
- * without it still links. */
+ * The peer's side is reached through the functions below. Each is a default,
+ * replaced by ppu_fs.cpp's, so a fixture that links this file without it still
+ * links and sees an empty cellFs table. */
 #ifdef _MSC_VER
-FILE* ppu_cellfs_file_for_fd_absent(int fd) { (void)fd; return NULL; }
-FILE* ppu_cellfs_file_for_fd(int fd);
 #  ifdef _M_IX86
-#    pragma comment(linker, "/alternatename:_ppu_cellfs_file_for_fd=_ppu_cellfs_file_for_fd_absent")
+#    define FS_PEER_SYM(x) "_" #x
 #  else
-#    pragma comment(linker, "/alternatename:ppu_cellfs_file_for_fd=ppu_cellfs_file_for_fd_absent")
+#    define FS_PEER_SYM(x) #x
 #  endif
+#  define FS_PEER_FN(ret, name, params, ...) \
+     ret name##_absent params { __VA_ARGS__ } \
+     ret name params; \
+     __pragma(comment(linker, "/alternatename:" FS_PEER_SYM(name) "=" FS_PEER_SYM(name##_absent)))
 #else
-__attribute__((weak)) FILE* ppu_cellfs_file_for_fd(int fd) { (void)fd; return NULL; }
+#  define FS_PEER_FN(ret, name, params, ...) __attribute__((weak)) ret name params { __VA_ARGS__ }
 #endif
+
+/* The FILE* of a file the cellFs table holds, or NULL. */
+FS_PEER_FN(FILE*, ppu_cellfs_file_for_fd, (int fd), (void)fd; return NULL;)
+/* Does the cellFs table hold the number, as a file or a directory. Safe under the fd-space lock. */
+FS_PEER_FN(int, ppu_cellfs_fd_owned, (int fd), (void)fd; return 0;)
+/* Close a file (is_dir 0) or directory (1) the cellFs table holds: 1 closed, 0 not its. Takes the lock itself. */
+FS_PEER_FN(int, ppu_cellfs_close, (int fd, int is_dir), (void)fd; (void)is_dir; return 0;)
+/* One entry of a directory the cellFs table holds: 1 an entry (name, and the host directory it is in), 0 end of
+ * directory, -1 not its. */
+FS_PEER_FN(int, ppu_cellfs_dir_next, (int fd, char* name, size_t name_cap, char* dir, size_t dir_cap),
+           (void)fd; (void)name; (void)name_cap; (void)dir; (void)dir_cap; return -1;)
 
 static FILE* sys_fs_bridge_file(int fd) { return ppu_cellfs_file_for_fd(fd); }
 
-/* Exposed to ppu_fs so its allocator does not hand out a number this table
- * already owns (and vice versa in sys_fs_open below): two live fds with one
- * number are exactly the split this bridge papers over. */
+/* The directory slot holding `fd`, or NULL. Caller holds the lock. */
+static sys_fs_dir_info* dir_by_fd_locked(int fd)
+{
+    for (int i = 0; i < SYS_FS_DIR_MAX; i++)
+        if (g_sys_fs_dirs[i].active && g_sys_fs_dirs[i].fd == fd) return &g_sys_fs_dirs[i];
+    return NULL;
+}
+
+/* Does this table hold the number, as a file's slot or a directory's. Exposed to ppu_fs, whose allocators call it
+ * under the fd-space lock so that it never hands out a number this table owns (and sys_fs_open and sys_fs_opendir
+ * below do the same against the cellFs table): two live fds with one number are exactly the split this bridge
+ * papers over. */
 int sys_fs_fd_active(int fd)
 {
-    int slot = fd - 3;
-    return slot >= 0 && slot < SYS_FS_FD_MAX && g_sys_fs_fds[slot].active;
+    const int slot = fd - 3;
+    if (slot >= 0 && slot < SYS_FS_FD_MAX && g_sys_fs_fds[slot].active) return 1;
+    return dir_by_fd_locked(fd) != NULL;
+}
+
+/* A number nobody holds, in either table. Caller holds the lock. */
+static int fd_number_free_locked(int fd)
+{
+    return !sys_fs_fd_active(fd) && !ppu_cellfs_fd_owned(fd);
+}
+
+/* The FILE* of a file this table holds, for cellFs handlers given an fd that was opened through sys_fs. */
+FILE* sys_fs_file_for_fd(int fd)
+{
+    const int slot = fd - 3;
+    FILE* fp = NULL;
+    if (slot >= 0 && slot < SYS_FS_FD_MAX) {
+        fs_slot_lock();
+        if (g_sys_fs_fds[slot].active) fp = g_sys_fs_fds[slot].fp;
+        fs_slot_unlock();
+    }
+    return fp;
+}
+
+/* Release a file / directory this table holds: 1 released, 0 not its. The number is free once the slot is
+ * released, under the lock; the stream or handle is closed after it, so no host call runs under the lock. */
+static int close_own_file(int fd)
+{
+    const int slot = fd - 3;
+    if (slot < 0 || slot >= SYS_FS_FD_MAX) return 0;
+    sys_fs_fd_info* f = &g_sys_fs_fds[slot];
+    fs_slot_lock();
+    const int owned = f->active;
+    FILE* fp = f->fp;
+    if (owned) { f->fp = NULL; f->active = 0; }
+    fs_slot_unlock();
+    if (owned && fp) fclose(fp);
+    return owned;
+}
+
+static int close_own_dir(int fd)
+{
+    fs_slot_lock();
+    sys_fs_dir_info* d = dir_by_fd_locked(fd);
+#ifdef _WIN32
+    HANDLE handle = d ? d->find_handle : INVALID_HANDLE_VALUE;
+#else
+    DIR* dp = d ? d->dp : NULL;
+#endif
+    if (d) d->active = 0;
+    fs_slot_unlock();
+    if (!d) return 0;
+#ifdef _WIN32
+    if (handle != INVALID_HANDLE_VALUE) FindClose(handle);
+#else
+    if (dp) closedir(dp);
+#endif
+    return 1;
+}
+
+int sys_fs_close_fd(int fd, int is_dir)
+{
+    return is_dir ? close_own_dir(fd) : close_own_file(fd);
+}
+
+/* The next entry of an open directory: 1 an entry, 0 the end. */
+static int dir_read_entry(sys_fs_dir_info* d, char* name, size_t cap, int* is_dir)
+{
+#ifdef _WIN32
+    if (d->first_read) {
+        d->first_read = 0;
+    } else if (!FindNextFileA(d->find_handle, &d->find_data)) {
+        return 0;
+    }
+    snprintf(name, cap, "%s", d->find_data.cFileName);
+    *is_dir = (d->find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? 1 : 0;
+    return 1;
+#else
+    struct dirent* entry = readdir(d->dp);
+    if (!entry) return 0;
+    snprintf(name, cap, "%s", entry->d_name);
+    *is_dir = (entry->d_type == DT_DIR) ? 1 : 0;
+    return 1;
+#endif
+}
+
+int sys_fs_dir_next(int fd, char* name, size_t name_cap, char* dir, size_t dir_cap)
+{
+    fs_slot_lock();
+    sys_fs_dir_info* d = dir_by_fd_locked(fd);
+    if (d && dir && dir_cap) snprintf(dir, dir_cap, "%s", d->path);
+    fs_slot_unlock();
+    if (!d) return -1;
+    if (!name) return 1;
+    int is_dir = 0;
+    return dir_read_entry(d, name, name_cap, &is_dir);
+}
+
+/* An entry's type from the host, for a directory read through the other table: "." and ".." are always
+ * directories, the rest are asked of the host (cellFs' readdir gives the same answer). */
+static int host_entry_is_dir(const char* dir, const char* name)
+{
+    if (name[0] == '.' && (!name[1] || (name[1] == '.' && !name[2]))) return 1;
+    char path[1700];
+    struct stat st;
+    snprintf(path, sizeof path, "%s/%s", dir, name);
+    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
 static void write_be32(uint32_t addr, uint32_t val)
@@ -571,13 +700,13 @@ int64_t sys_fs_open(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ENOENT;
     }
 
-    /* Claim a free fd slot (see fs_slot_lock). A full table is EMFILE. Skip
-     * numbers the cellFs table owns: one fd space on hardware, see the bridge
-     * note at the top of this file. */
+    /* Claim a free fd slot (see fs_slot_lock). A full table is EMFILE. A slot whose number the cellFs table, or one
+     * of this table's directories, already holds is skipped: one fd space on hardware, see the note at the top of
+     * this file. */
     fs_slot_lock();
     int slot = -1;
     for (int i = 0; i < SYS_FS_FD_MAX; i++) {
-        if (!g_sys_fs_fds[i].active && !sys_fs_bridge_file(i + 3)) { slot = i; break; }
+        if (!g_sys_fs_fds[i].active && fd_number_free_locked(i + 3)) { slot = i; break; }
     }
     if (slot < 0) {
         fs_slot_unlock();
@@ -636,8 +765,12 @@ int64_t sys_fs_read(ppu_context* ctx)
 
     const int slot = fd - 3;
     sys_fs_fd_info* f = (slot >= 0 && slot < SYS_FS_FD_MAX) ? &g_sys_fs_fds[slot] : NULL;
-    if (!f || !f->active || !f->fp ||
-        (size && (f->flags & CELL_FS_O_WRONLY))) {
+    /* Own table first; otherwise the same fd opened through cellFs (one fd space on hardware; see the bridge note
+     * at the top of this file). The access mode is checked for a file this table opened: a cellFs file's flags are
+     * the other table's, and its stream's own mode makes a read it was not opened for come back empty. */
+    const int own = f && f->active && f->fp;
+    FILE* fp = own ? f->fp : sys_fs_bridge_file(fd);
+    if (!fp || (own && size && (f->flags & CELL_FS_O_WRONLY))) {
         /* RPCS3 writes 0 with nread.try_write(0) (allowed to fail); the span
          * was bounded above, so the store cannot be the one that fails. */
         write_be64(nread_addr, 0);
@@ -661,9 +794,9 @@ int64_t sys_fs_read(ppu_context* ctx)
     vm_note_write(buf_addr, (size_t)size);   /* kernel write into guest memory (#727) */
 
     void* buf = vm_to_host(buf_addr);
-    long pos_before = ftell(f->fp);
-    size_t nread = fread(buf, 1, (size_t)size, f->fp);
-    vm_note_write_check(nread < (size_t)size && ferror(f->fp) && errno == EFAULT, "sys_fs read");
+    long pos_before = ftell(fp);
+    size_t nread = fread(buf, 1, (size_t)size, fp);
+    vm_note_write_check(nread < (size_t)size && ferror(fp) && errno == EFAULT, "sys_fs read");
 
 
     /* PS3_FSTRACE=<n>: every nth read, the fd and the file offset it came from.
@@ -692,7 +825,7 @@ int64_t sys_fs_read(ppu_context* ctx)
         const unsigned char* b = (const unsigned char*)buf;
         PS3_LOG(PS3_LOG_INFO, "FSDBG", "read fd=%d '%s' pos=%ld want=%llu got=%zu"
                         " head=%02X%02X%02X%02X lr=0x%08X\n",
-                fd, (f && f->active) ? f->path : "<cellFs fd>", pos_before,
+                fd, own ? f->path : "<cellFs fd>", pos_before,
                 (unsigned long long)size, nread,
                 nread > 0 ? b[0] : 0, nread > 1 ? b[1] : 0,
                 nread > 2 ? b[2] : 0, nread > 3 ? b[3] : 0,
@@ -736,8 +869,12 @@ int64_t sys_fs_write(ppu_context* ctx)
 
     const int slot = fd - 3;
     sys_fs_fd_info* f = (slot >= 0 && slot < SYS_FS_FD_MAX) ? &g_sys_fs_fds[slot] : NULL;
-    if (!f || !f->active || !f->fp ||
-        (size && !(f->flags & CELL_FS_O_ACCMODE))) {
+    /* Own table first; otherwise the same fd opened through cellFs (one fd space on hardware; see the bridge note
+     * at the top of this file). The access mode is checked for a file this table opened: a cellFs file's flags are
+     * the other table's, and its stream's own mode refuses a write it was not opened for. */
+    const int own = f && f->active && f->fp;
+    FILE* fp = own ? f->fp : sys_fs_bridge_file(fd);
+    if (!fp || (own && size && !(f->flags & CELL_FS_O_ACCMODE))) {
         /* RPCS3 writes 0 with nwrite.try_write(0) (allowed to fail); the span
          * was bounded above, so the store cannot be the one that fails. */
         write_be64(nwritten_addr, 0);
@@ -755,8 +892,8 @@ int64_t sys_fs_write(ppu_context* ctx)
     vm_commit_or_stop("sys_fs_write", "buf", buf_addr, size);
 
     const void* buf = vm_to_host(buf_addr);
-    size_t nwritten = fwrite(buf, 1, (size_t)size, f->fp);
-    fflush(f->fp);
+    size_t nwritten = fwrite(buf, 1, (size_t)size, fp);
+    fflush(fp);
 
     write_be64(nwritten_addr, (uint64_t)nwritten);
 
@@ -772,22 +909,12 @@ int64_t sys_fs_close(ppu_context* ctx)
 {
     int32_t fd = LV2_ARG_S32(ctx, 0);
 
-    int slot = fd - 3;
-    if (slot < 0 || slot >= SYS_FS_FD_MAX)
-        return (int64_t)(int32_t)CELL_EBADF;
-
-    sys_fs_fd_info* f = &g_sys_fs_fds[slot];
-    if (!f->active)
-        return (int64_t)(int32_t)CELL_EBADF;
-
-    if (f->fp)
-        fclose(f->fp);
-    fs_slot_lock();     /* hand the slot back once the stream is closed */
-    f->fp = NULL;
-    f->active = 0;
-    fs_slot_unlock();
-
-    return CELL_OK;
+    if (close_own_file(fd))
+        return CELL_OK;
+    /* One fd space: the same number may be a file opened through cellFs. */
+    if (ppu_cellfs_close(fd, 0))
+        return CELL_OK;
+    return (int64_t)(int32_t)CELL_EBADF;
 }
 
 /* ---------------------------------------------------------------------------
@@ -988,7 +1115,15 @@ int64_t sys_fs_opendir(ppu_context* ctx)
     for (int i = 0; i < SYS_FS_DIR_MAX; i++) {
         if (!g_sys_fs_dirs[i].active) { slot = i; break; }
     }
-    if (slot < 0) {
+    /* The number the guest holds comes from the same space as the file fds (one fd space on hardware, see the note
+     * at the top of this file): the lowest one nobody holds. It was slot + 1, which a file fd of 3..64 equalled. */
+    int32_t dir_fd = -1;
+    if (slot >= 0) {
+        for (int n = 3; n < 3 + SYS_FS_FD_MAX + SYS_FS_DIR_MAX; n++) {
+            if (fd_number_free_locked(n)) { dir_fd = n; break; }
+        }
+    }
+    if (slot < 0 || dir_fd < 0) {
         fs_slot_unlock();
 #ifdef _WIN32
         FindClose(find_handle);
@@ -1008,10 +1143,10 @@ int64_t sys_fs_opendir(ppu_context* ctx)
     d->dp = dp;
 #endif
     strncpy(d->path, host_path, sizeof(d->path) - 1);
+    d->fd = dir_fd;
     d->active = 1;     /* published last */
     fs_slot_unlock();
 
-    int32_t dir_fd = slot + 1;
     write_be32(fd_out, (uint32_t)dir_fd);
 
     return CELL_OK;
@@ -1031,44 +1166,32 @@ int64_t sys_fs_readdir(ppu_context* ctx)
     uint32_t dirent_addr = LV2_ARG_PTR(ctx, 1);
     uint32_t nread_addr  = LV2_ARG_PTR(ctx, 2);
 
-    if (dir_fd <= 0 || dir_fd > SYS_FS_DIR_MAX)
-        return (int64_t)(int32_t)CELL_EBADF;
+    char name[256];
+    int is_dir = 0, got;
 
-    sys_fs_dir_info* d = &g_sys_fs_dirs[dir_fd - 1];
-    if (!d->active)
-        return (int64_t)(int32_t)CELL_EBADF;
-
-    const char* name = NULL;
-    int is_dir = 0;
-
-#ifdef _WIN32
-    if (d->first_read) {
-        d->first_read = 0;
-        name = d->find_data.cFileName;
-        is_dir = (d->find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? 1 : 0;
+    fs_slot_lock();
+    sys_fs_dir_info* d = dir_by_fd_locked(dir_fd);
+    fs_slot_unlock();
+    if (d) {
+        got = dir_read_entry(d, name, sizeof name, &is_dir);
     } else {
-        if (!FindNextFileA(d->find_handle, &d->find_data)) {
-            /* End of directory */
-            if (nread_addr != 0) write_be64(nread_addr, 0);
-            return CELL_OK;
-        }
-        name = d->find_data.cFileName;
-        is_dir = (d->find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? 1 : 0;
+        /* One fd space: the same number may be a directory opened through cellFs. */
+        char dir[1100];
+        got = ppu_cellfs_dir_next(dir_fd, name, sizeof name, dir, sizeof dir);
+        if (got < 0)
+            return (int64_t)(int32_t)CELL_EBADF;
+        if (got)
+            is_dir = host_entry_is_dir(dir, name);
     }
-#else
-    struct dirent* entry = readdir(d->dp);
-    if (!entry) {
+    if (!got) {
+        /* End of directory */
         if (nread_addr != 0) write_be64(nread_addr, 0);
         return CELL_OK;
     }
-    name = entry->d_name;
-    is_dir = (entry->d_type == DT_DIR) ? 1 : 0;
-#endif
 
-    if (dirent_addr != 0 && name != NULL) {
+    if (dirent_addr != 0) {
         uint8_t* out = (uint8_t*)vm_to_host(dirent_addr);
-        uint8_t namlen = (uint8_t)strlen(name);
-        if (namlen > 255) namlen = 255;
+        uint8_t namlen = (uint8_t)strlen(name);   /* at most 255: name is a 256-byte buffer */
 
         out[0] = is_dir ? 1 : 2;  /* d_type: 1=dir, 2=regular */
         out[1] = namlen;
@@ -1079,7 +1202,7 @@ int64_t sys_fs_readdir(ppu_context* ctx)
     if (nread_addr != 0) {
         /* One entry is sizeof(CellFsDirent) = 0x102 bytes, whatever the name's
          * length; 0 marks the end of the directory. */
-        write_be64(nread_addr, (uint64_t)(name ? 0x102 : 0));
+        write_be64(nread_addr, 0x102);
     }
 
     return CELL_OK;
@@ -1094,24 +1217,12 @@ int64_t sys_fs_closedir(ppu_context* ctx)
 {
     int32_t dir_fd = LV2_ARG_S32(ctx, 0);
 
-    if (dir_fd <= 0 || dir_fd > SYS_FS_DIR_MAX)
-        return (int64_t)(int32_t)CELL_EBADF;
-
-    sys_fs_dir_info* d = &g_sys_fs_dirs[dir_fd - 1];
-    if (!d->active)
-        return (int64_t)(int32_t)CELL_EBADF;
-
-#ifdef _WIN32
-    if (d->find_handle != INVALID_HANDLE_VALUE)
-        FindClose(d->find_handle);
-#else
-    if (d->dp) closedir(d->dp);
-#endif
-
-    fs_slot_lock();     /* hand the slot back once the handle is closed */
-    d->active = 0;
-    fs_slot_unlock();
-    return CELL_OK;
+    if (close_own_dir(dir_fd))
+        return CELL_OK;
+    /* One fd space: the same number may be a directory opened through cellFs. */
+    if (ppu_cellfs_close(dir_fd, 1))
+        return CELL_OK;
+    return (int64_t)(int32_t)CELL_EBADF;
 }
 
 /* ---------------------------------------------------------------------------
@@ -1269,21 +1380,20 @@ int64_t sys_fs_ftruncate(ppu_context* ctx)
     uint64_t size = LV2_ARG_U64(ctx, 1);
 
     int slot = fd - 3;
-    if (slot < 0 || slot >= SYS_FS_FD_MAX)
+    sys_fs_fd_info* f = (slot >= 0 && slot < SYS_FS_FD_MAX) ? &g_sys_fs_fds[slot] : NULL;
+    /* Own table first; otherwise the same fd opened through cellFs (one fd space). */
+    FILE* fp = (f && f->active && f->fp) ? f->fp : sys_fs_bridge_file(fd);
+    if (!fp)
         return (int64_t)(int32_t)CELL_EBADF;
 
-    sys_fs_fd_info* f = &g_sys_fs_fds[slot];
-    if (!f->active || !f->fp)
-        return (int64_t)(int32_t)CELL_EBADF;
-
-    fflush(f->fp);
+    fflush(fp);
 
 #ifdef _WIN32
-    int fno = _fileno(f->fp);
+    int fno = _fileno(fp);
     if (_chsize_s(fno, (long long)size) != 0)
         return (int64_t)(int32_t)CELL_EINVAL;
 #else
-    int fno = fileno(f->fp);
+    int fno = fileno(fp);
     if (ftruncate(fno, (off_t)size) != 0)
         return (int64_t)(int32_t)CELL_EINVAL;
 #endif

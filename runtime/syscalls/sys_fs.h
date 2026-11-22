@@ -96,6 +96,7 @@ typedef struct sys_fs_fd_info {
 /* Directory descriptor entry */
 typedef struct sys_fs_dir_info {
     int    active;
+    int    fd;       /* the number the guest holds: drawn from the same space as the file fds */
     char   path[512];
 
 #ifdef _WIN32
@@ -133,6 +134,25 @@ int64_t sys_fs_rename(ppu_context* ctx);
 int64_t sys_fs_unlink(ppu_context* ctx);
 int64_t sys_fs_rmdir(ppu_context* ctx);
 int64_t sys_fs_ftruncate(ppu_context* ctx);
+
+/* The fd space shared with cellFs (runtime/ppu/ppu_fs.cpp).
+ *
+ * On hardware cellFsOpen, cellFsOpendir and the raw sys_fs_* calls draw from ONE kernel fd space and any call
+ * takes any fd, so a title may open with one family and use or close with the other (MLB The Show 16's Bink SDK
+ * opens with cellFsOpen and reads with sys_fs_read). The two tables stay, and these keep them one space:
+ *   - ps3_fs_fd_space_lock/unlock: the one lock both sides take to claim or release a number. ppu_fs.cpp takes
+ *     it too and carries a private default for a build without this file.
+ *   - sys_fs_fd_active(fd): does this table hold the number, file or directory. The caller holds the lock (the
+ *     cellFs allocators do), so a number is never handed out twice.
+ *   - sys_fs_file_for_fd, sys_fs_close_fd, sys_fs_dir_next: what cellFs handlers call for an fd this table owns.
+ *     sys_fs_dir_next with a NULL name only asks whether fd is a directory here (1) or not (-1); with a name
+ *     it reads one entry: 1 an entry (name, and the host directory it is in), 0 end of directory, -1 not ours. */
+void  ps3_fs_fd_space_lock(void);
+void  ps3_fs_fd_space_unlock(void);
+int   sys_fs_fd_active(int fd);
+FILE* sys_fs_file_for_fd(int fd);
+int   sys_fs_close_fd(int fd, int is_dir);
+int   sys_fs_dir_next(int fd, char* name, size_t name_cap, char* dir, size_t dir_cap);
 
 /* Registration */
 void sys_fs_init(lv2_syscall_table* tbl);
