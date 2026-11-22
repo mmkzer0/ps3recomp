@@ -15,9 +15,13 @@ def main():
   exe=Path(tmp)/'fixture'
   # sys_memory.c logs, reads the typed configuration and ends refused calls in named stops; the fixture catches
   # ps3_stop_guest_range itself (guest_range_catch.h), so the runtime adds the log and the configuration only.
+  # SANITIZERS=thread (the tsan ctest preset) instruments every object: the allocate-against-destroy case is
+  # for it.
+  sanitize=(['-fsanitize='+os.environ['SANITIZERS'],'-fno-sanitize-recover=all','-g']
+            if os.environ.get('SANITIZERS') else [])
   runtime_link.build([root/'tests/test_sys_memory_container.c',root/'runtime/syscalls/sys_memory.c'],exe,tmp,
-                     cflags=['-std=gnu17','-O1','-UNDEBUG','-I'+str(root/'include')],timeout=120,
+                     cflags=['-std=gnu17','-O1','-UNDEBUG','-I'+str(root/'include'),*sanitize],timeout=120,
                      runtime=('log','config'))
-  subprocess.run([str(exe)],check=True,timeout=15)
+  subprocess.run([str(exe)],check=True,timeout=120)
  return 0
 if __name__=='__main__':raise SystemExit(main())

@@ -13,6 +13,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include "guest_range_catch.h"
+#include <pthread.h>
+#include <sched.h>
+#include <stdatomic.h>
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
 uint32_t ppu_hle_inject_base=0x20000000u;
@@ -41,6 +44,57 @@ static int64_t size_of(uint32_t cid,uint32_t* total,uint32_t* avail) {
 static int64_t user_memory(uint32_t* total,uint32_t* avail) {
  ppu_context c={0};c.gpr[3]=OUT+8;int64_t rc=sys_memory_get_user_memory_size(&c);
  *total=rd(OUT+8);*avail=rd(OUT+12);return rc;
+}
+/* sys_memory_allocate_from_container on other threads while the container is destroyed and created again: the
+ * container is looked at under the allocator lock, so an allocation either lands in a live container (and holds
+ * its destroy off with CELL_EBUSY until it is freed) or answers CELL_ESRCH, and the pool balances afterwards. Run
+ * under TSan by the tsan preset (SANITIZERS=thread). Each thread has its own out word.
+ * The container is published for a while and withdrawn before its destroy, and a racer starts no allocation
+ * without one: allocations that started before the withdrawal still race the destroy, but the destroy is not
+ * starved. Racers that never stopped allocating kept some allocation live almost all the time, and on a 3-core
+ * CI runner the destroy's CELL_EBUSY retries outlasted the driver's timeout. */
+typedef struct { uint32_t out; unsigned ok, esrch, other; } racer;
+static atomic_uint s_race_cid;
+static atomic_int s_race_stop;
+static void* alloc_racer(void* p) {
+ racer* r=(racer*)p;
+ while (!atomic_load_explicit(&s_race_stop,memory_order_acquire)) {
+   const uint32_t cid=atomic_load_explicit(&s_race_cid,memory_order_acquire);
+   if (!cid) { sched_yield(); continue; }
+   ppu_context c={0};c.gpr[3]=MB;c.gpr[4]=cid;c.gpr[5]=0x400;
+   c.gpr[6]=r->out;
+   const int64_t rc=sys_memory_allocate_from_container(&c);
+   if (rc==CELL_OK) { ++r->ok; if (release(rd(r->out))!=CELL_OK) ++r->other; }
+   else if (rc==(int64_t)(int32_t)CELL_ESRCH) ++r->esrch;
+   else ++r->other;
+ }
+ return NULL;
+}
+static int race_allocate_against_destroy(void) {
+ enum { THREADS=3, ROUNDS=400 };
+ pthread_t th[THREADS]; racer rs[THREADS];
+ atomic_store(&s_race_cid,0); atomic_store(&s_race_stop,0);
+ for (unsigned i=0;i<THREADS;++i) { memset(&rs[i],0,sizeof rs[i]); rs[i].out=OUT+0x100+16*i;
+   CHECK(pthread_create(&th[i],NULL,alloc_racer,&rs[i])==0); }
+ int bad=0;
+ for (unsigned round=0;round<ROUNDS&&!bad;++round) {
+   if (create(4*MB)!=CELL_OK) { bad=1; break; }
+   const uint32_t cid=rd(OUT);
+   atomic_store_explicit(&s_race_cid,cid,memory_order_release);
+   sched_yield();
+   atomic_store_explicit(&s_race_cid,0,memory_order_release);   /* no new allocation; those in flight race on */
+   int64_t rc;
+   while ((rc=destroy(cid))==(int64_t)(int32_t)CELL_EBUSY) sched_yield();
+   if (rc!=CELL_OK) bad=1;
+ }
+ atomic_store_explicit(&s_race_stop,1,memory_order_release);
+ unsigned other=0,ok=0,esrch=0;
+ for (unsigned i=0;i<THREADS;++i) { pthread_join(th[i],NULL); other+=rs[i].other; ok+=rs[i].ok; esrch+=rs[i].esrch; }
+ printf("allocate vs destroy: %u rounds, %u allocations, %u ESRCH\n",(unsigned)ROUNDS,ok,esrch);
+ CHECK(!bad); CHECK(other==0);
+ uint32_t total,avail;
+ CHECK(user_memory(&total,&avail)==CELL_OK); CHECK(total==USER_TOTAL&&avail==USER_TOTAL);
+ return 0;
 }
 int main(void) {
  CHECK(vm_init()==CELL_OK);
@@ -128,6 +182,9 @@ int main(void) {
    for (unsigned i=0;i<SYS_MEMORY_CONTAINER_MAX;++i) CHECK(destroy(ids[i])==CELL_OK);
  }
  CHECK(user_memory(&total,&avail)==CELL_OK); CHECK(total==USER_TOTAL&&avail==USER_TOTAL);
+
+ /* Allocation in a container racing its destroy. */
+ CHECK(race_allocate_against_destroy()==0);
 
  /* The out pointer of the size query is a span the title chose: outside guest memory is the named stop. */
  { ppu_context c={0}; c.gpr[3]=0xFFFFFFFCu;
