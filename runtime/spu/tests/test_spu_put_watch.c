@@ -74,10 +74,11 @@ int main(void)
     /* 1: a PUT covering the word -> one report, and the bytes land. */
     check(mfc_do_transfer(ctx, 0x1000, 0x20040, 16, MFC_PUT_CMD, 0) == 0, "PUT covering");
     check(memcmp(memory + 0x20040, ctx->ls + 0x1000, 16) == 0, "PUT bytes");
-    /* 2: a PUT ending just before the word -> nothing. */
-    check(mfc_do_transfer(ctx, 0x1000, 0x20000, 0x44, MFC_PUT_CMD, 0) == 0, "PUT before");
+    /* 2: a PUT ending just before the word -> nothing. Sizes and alignments are ones the MFC accepts (1, 2, 4, 8
+     * or a multiple of 16, EA and LSA agreeing in their low four bits); an illegal one is a named stop. */
+    check(mfc_do_transfer(ctx, 0x1000, 0x20040, 4, MFC_PUT_CMD, 0) == 0, "PUT before");
     /* 3: a PUT starting just after the word -> nothing. */
-    check(mfc_do_transfer(ctx, 0x1000, 0x20048, 16, MFC_PUT_CMD, 0) == 0, "PUT after");
+    check(mfc_do_transfer(ctx, 0x1008, 0x20048, 8, MFC_PUT_CMD, 0) == 0, "PUT after");
     /* 4: a GET covering the word -> nothing (it does not write guest memory). */
     check(mfc_do_transfer(ctx, 0x1100, 0x20040, 16, MFC_GET_CMD, 0) == 0, "GET covering");
     /* 5: a two-element list PUT whose second element covers the word -> one report. */
