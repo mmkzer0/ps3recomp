@@ -111,7 +111,8 @@ extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, hle_ctx_fn 
 }
 
 /* Leaf imports that can finish without the dispatcher: no guest code, no
- * change to r2, no blocking. The module that implements one registers a fast
+ * change to r2, no blocking (the dispatcher still stores the caller's TOC
+ * slot, as the full path's guard does). The module that implements one registers a fast
  * form beside the full handler. ps3_hle_dispatch tries it first (so the
  * observer in ps3_hle_call still sees a fast call), and the fast form
  * returns 0 to take the full call instead (a contended lock that has to wait,
@@ -349,8 +350,14 @@ static void hle_top_note(uint32_t nid, const char* name, const ppu_context* ctx,
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
 extern "C" void ps3_hle_dispatch(uint32_t nid, ppu_context* ctx)   /* C linkage: the block-scope externs below rely on it */
 {
-    if (const hle_fast_fn f = hle_fast(nid))
-        if (f(ctx)) return;
+    if (const hle_fast_fn f = hle_fast(nid)) {
+        /* The lifted import stub does not save r2, but its caller still runs `ld r2,0x28(r1)` after the call.
+         * The full path's _TocGuard writes the caller's TOC to that slot; a completed fast form returns before
+         * the guard, so write it here, or a caller on a fresh stack reloads r2 = 0 and reads every TOC-relative
+         * global from the null page (upstream #805, 61978373). A declined form takes the full path and its guard. */
+        const uint64_t toc = ctx->gpr[2], sp = ctx->gpr[1];
+        if (f(ctx)) { ctx->gpr[2] = toc; vm_write64(sp + 0x28, toc); return; }
+    }
 
     /* HLE_BT_EVERY=<n>: dump the calling thread's guest stack every nth HLE
      * call it makes. WAITBT_EVERY only samples threads that are blocking on an
