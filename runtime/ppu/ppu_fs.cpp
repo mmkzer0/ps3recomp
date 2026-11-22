@@ -1159,6 +1159,10 @@ static void cellFsAioFinish(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
  * done", which is exactly true here. */
 static void cellFsAioCancel(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
 
+/* One id space for reads and writes: the completion callback and cellFsAioCancel tell requests apart by id alone,
+ * and with a counter each a read and a write in flight together could both be id 1 (upstream #700, c66cec6f). */
+static std::atomic<int32_t> s_aio_next_id{1};
+
 static void cellFsAioRead(ppu_context* ctx)
 {
     uint32_t aio    = (uint32_t)ctx->gpr[3];
@@ -1170,8 +1174,7 @@ static void cellFsAioRead(ppu_context* ctx)
     uint32_t buf    = guest_be32(aio + 0x10);
     uint64_t size   = guest_be64(aio + 0x18);
 
-    static std::atomic<int32_t> s_next_id{1};
-    int32_t id = s_next_id++;
+    const int32_t id = s_aio_next_id++;
     if (id_ptr) vm_write32(id_ptr, (uint32_t)id);
 
     size_t n = 0;
@@ -1240,8 +1243,7 @@ static void cellFsAioWrite(ppu_context* ctx)
     uint32_t buf    = guest_be32(aio + 0x10);
     uint64_t size   = guest_be64(aio + 0x18);
 
-    static std::atomic<int32_t> s_next_id{1};
-    int32_t id = s_next_id++;
+    const int32_t id = s_aio_next_id++;
     if (id_ptr) vm_write32(id_ptr, (uint32_t)id);
 
     size_t n = 0;
@@ -1257,6 +1259,9 @@ static void cellFsAioWrite(ppu_context* ctx)
             return;
         }
         if (!fs_range_ok(buf, size)) fs_range_stop("cellFsAioWrite", "buf", buf, size);
+        /* The kernel reads the source here, and a read of a reserved page fails where a guest load would fault it
+         * in: fwrite from pages the title has not touched wrote nothing (as cellFsWrite and cellFsAioRead). */
+        fs_prefault(buf, size);
         /* Absolute, like the read: leave the fd's own position where it was. */
         HOST_LOCKFILE(f);
         const int64_t pos = (int64_t)HOST_FTELL64(f);
