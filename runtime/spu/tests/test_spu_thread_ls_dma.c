@@ -6,6 +6,10 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#ifndef _WIN32
+#include <pthread.h>
+#include <sched.h>
+#endif
 
 static uint8_t guest_memory[1u << 20];
 uint8_t* vm_base = guest_memory;
@@ -53,12 +57,34 @@ static void other_entry(spu_context* ctx) { g_other = ctx; }
 static void spu1_entry(spu_context* ctx)
 {
     memcpy(&ctx->ls[PEER_LSA], k_spu1, sizeof k_spu1);
-    g_rc_peer_get = mfc_do_transfer(ctx, LOCAL_LSA, 0xF0000000u + PEER_LSA, 16, MFC_GET_CMD);
+    g_rc_peer_get = mfc_do_transfer(ctx, LOCAL_LSA, 0xF0000000u + PEER_LSA, 16, MFC_GET_CMD, 0);
     memcpy(g_got_peer, &ctx->ls[LOCAL_LSA], 16);
-    g_rc_self_get = mfc_do_transfer(ctx, LOCAL_LSA, 0xF0100000u + PEER_LSA, 16, MFC_GET_CMD);
+    g_rc_self_get = mfc_do_transfer(ctx, LOCAL_LSA, 0xF0100000u + PEER_LSA, 16, MFC_GET_CMD, 0);
     memcpy(g_got_self, &ctx->ls[LOCAL_LSA], 16);
-    g_rc_put = mfc_do_transfer(ctx, PEER_LSA, 0xF0000000u + PUT_LSA, 16, MFC_PUT_CMD);
+    g_rc_put = mfc_do_transfer(ctx, PEER_LSA, 0xF0000000u + PUT_LSA, 16, MFC_PUT_CMD, 0);
 }
+
+#ifndef _WIN32
+static int g_race_stop;
+static unsigned long g_race_copies, g_race_bad;
+
+/* SPU 1 of workload 0, entered again after every removal: stamps its record. */
+static void race_entry(spu_context* ctx) { memcpy(&ctx->ls[PEER_LSA], k_spu1, sizeof k_spu1); }
+
+static void* race_reader(void* arg)
+{
+    static const uint8_t zero[16];
+    uint8_t buf[16];
+    (void)arg;
+    while (!__atomic_load_n(&g_race_stop, __ATOMIC_ACQUIRE))
+        if (spu_thread_ls_copy(g_other, 1, PEER_LSA, buf, 16, 0)) {
+            __atomic_add_fetch(&g_race_copies, 1, __ATOMIC_RELEASE);
+            if (memcmp(buf, k_spu1, 16) != 0 && memcmp(buf, zero, 16) != 0)
+                __atomic_add_fetch(&g_race_bad, 1, __ATOMIC_RELAXED);
+        }
+    return NULL;
+}
+#endif
 
 /* ---------------------------------------------------------------------------
  * Link stubs: PPU memory hooks, diagnostics and title-specific SPURS hooks.
@@ -108,12 +134,36 @@ int main(void)
     }
 
     {   /* Removing a workload frees its contexts: SPU 1's "entered last" context was one of them. */
+        uint8_t buf[16];
         spu_run_policy_module(other_entry, 1, k_pm, sizeof k_pm, 0, 1, SPURS_EA, 0);
-        CHECK(g_other != NULL && spu_thread_ls_peer(g_other, 1) != NULL);
+        CHECK(g_other != NULL && spu_thread_ls_copy(g_other, 1, PEER_LSA, buf, 16, 0) == 1);
         CHECK(spurs_policy_release_workload(SPURS_EA, 0) == 0);
-        CHECK(spu_thread_ls_peer(g_other, 1) == NULL);           /* not the freed context */
-        CHECK(spu_thread_ls_peer(g_other, 0) == g_other);        /* its own SPU still reaches itself */
+        CHECK(spu_thread_ls_copy(g_other, 1, PEER_LSA, buf, 16, 0) == 0);   /* not the freed context */
+        CHECK(spu_thread_ls_copy(g_other, 0, PEER_LSA, buf, 16, 0) == 1);   /* its own SPU still reaches itself */
+        CHECK(spu_thread_ls_copy(g_other, 6, PEER_LSA, buf, 16, 0) == 0);   /* no such SPU */
+        CHECK(spu_thread_ls_copy(g_other, 0, SPU_LS_SIZE - 8, buf, 16, 0) == 0);   /* past the local store */
     }
+
+#ifndef _WIN32
+    {   /* The reader copies out of SPU 1's local store while the workload that owns it is removed and re-created:
+         * every copy either finds no context or reads a live one (the stamped record, or the zeroes before the
+         * stamp). The race is only visible to a sanitizer (TSan: the copy against the free in
+         * spurs_policy_release_workload; ASan: the freed context). */
+        pthread_t reader;
+        g_race_stop = 0;
+        spu_run_policy_module(race_entry, 1, k_pm, sizeof k_pm, 0, 0, SPURS_EA, 1);
+        CHECK(pthread_create(&reader, NULL, race_reader, NULL) == 0);
+        while (!__atomic_load_n(&g_race_copies, __ATOMIC_ACQUIRE)) sched_yield();   /* the reader is live */
+        for (int i = 0; i < 400; i++) {
+            CHECK(spurs_policy_release_workload(SPURS_EA, 0) == 0);
+            spu_run_policy_module(race_entry, 1, k_pm, sizeof k_pm, 0, 0, SPURS_EA, 1);
+        }
+        __atomic_store_n(&g_race_stop, 1, __ATOMIC_RELEASE);
+        pthread_join(reader, NULL);
+        CHECK(g_race_bad == 0);
+        CHECK(spurs_policy_release_workload(SPURS_EA, 0) == 0);
+    }
+#endif
 
     printf("%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

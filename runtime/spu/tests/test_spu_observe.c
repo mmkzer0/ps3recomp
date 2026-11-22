@@ -28,6 +28,11 @@ static uint8_t g_mem[0x40000];
 uint8_t* vm_base = g_mem;
 uint32_t ppu_vm_size = sizeof g_mem;
 
+/* The SPU-thread LS window (#800) lives in spurs_policy.c, which this fixture does not link; none is mapped. */
+int spu_thread_ls_copy(const spu_context* self, uint32_t spu_num, uint32_t off, uint8_t* local, uint32_t size,
+                       int to_peer)
+{ (void)self; (void)spu_num; (void)off; (void)local; (void)size; (void)to_peer; return 0; }
+
 static int g_fail;
 #define CHECK(cond, ...)                                                     \
     do {                                                                     \

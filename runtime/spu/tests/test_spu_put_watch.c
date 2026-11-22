@@ -8,7 +8,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include "../spu_dma.h"
-spu_context* spu_thread_ls_peer(const spu_context* self, uint32_t spu_num) { (void)self; (void)spu_num; return 0; }   /* #800 */
+/* #800: the SPU-thread LS window lives in spurs_policy.c, which this fixture does not link. */
+int spu_thread_ls_copy(const spu_context* self, uint32_t spu_num, uint32_t off, uint8_t* local, uint32_t size,
+                       int to_peer)
+{ (void)self; (void)spu_num; (void)off; (void)local; (void)size; (void)to_peer; return 0; }
 
 static uint8_t memory[0x40000];
 uint8_t* vm_base = memory;

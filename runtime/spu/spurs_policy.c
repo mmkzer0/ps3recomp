@@ -122,12 +122,17 @@ int spurs_policy_post_snr(uint32_t ea, uint32_t spu_num, uint32_t num, uint32_t 
 
 /* Make `ctx` the slot's resident context (NULL withdraws it while it is being reset); a context taking over gets the
  * signals posted while there was none. Under the directory lock, so spurs_policy_post_snr sees either no context or
- * an initialized one: a signal written into a context about to be zeroed would count as delivered and be lost. */
+ * an initialized one: a signal written into a context about to be zeroed would count as delivered and be lost. A
+ * withdrawn context also leaves running[]: spu_thread_ls_copy holds the shared lock while it copies, so once this
+ * returns no copy reads the local store the caller is about to zero. */
 static void policy_publish_ctx(struct PmSlot* slot, spu_context* ctx, uint32_t spu_num)
 {
     AcquireSRWLockExclusive(&s_pm_directory_lock);
+    spu_context* old = slot->ctx;
     slot->ctx = ctx;
     struct PmInstance* pi = slot->owner;
+    if (!ctx && old && pi && spu_num < 6 && __atomic_load_n(&pi->running[spu_num], __ATOMIC_RELAXED) == old)
+        __atomic_store_n(&pi->running[spu_num], NULL, __ATOMIC_RELEASE);
     if (ctx && pi && spu_num < 6)
         for (unsigned num = 0; num < 2; num++)
             if (pi->snr_set[spu_num][num]) {
@@ -209,14 +214,22 @@ void spurs_policy_release_instance(uint32_t ea)
     ReleaseSRWLockExclusive(&s_pm_directory_lock);
 }
 
-/* The context whose local store SPU spu_num of self's SPURS instance holds:
- * self when spu_num is self's own SPU, else the context that entered that SPU
- * last (contexts are per workload and SPU; one runs on an SPU at a time). */
-spu_context* spu_thread_ls_peer(const spu_context* self, uint32_t spu_num)
+/* Move `size` bytes between `local` and the local store of the context that SPU spu_num of self's SPURS instance
+ * holds, at LS offset `off` (to_peer: local -> peer, else peer -> local). That context is self when spu_num is
+ * self's own SPU, else the one that entered that SPU last (contexts are per workload and SPU; one runs on an SPU at
+ * a time). Returns 1 when the bytes moved; 0 when no context is registered there or the range leaves the local
+ * store, and nothing moved.
+ *
+ * The directory lock is held across the copy, not just the lookup: spurs_policy_release_workload and
+ * spurs_policy_release_instance free contexts under the exclusive lock, so a pointer returned out of the lock could
+ * be freed under the copy (the SPU-thread LS window of spu_dma.h, #800). */
+int spu_thread_ls_copy(const spu_context* self, uint32_t spu_num, uint32_t off, uint8_t* local, uint32_t size,
+                       int to_peer)
 {
-    if (spu_num >= 6) return NULL;
-    spu_context* peer = NULL;
+    if (spu_num >= 6 || off > SPU_LS_SIZE || size > SPU_LS_SIZE - off) return 0;
+    int moved = 0;
     AcquireSRWLockShared(&s_pm_directory_lock);
+    spu_context* peer = NULL;
     for (unsigned i = 0; i < SPURS_PM_INSTANCES && !peer; i++) {
         struct PmInstance* pi = &s_pm_instances[i];
         if (!pi->used) continue;
@@ -228,8 +241,13 @@ spu_context* spu_thread_ls_peer(const spu_context* self, uint32_t spu_num)
                     break;
                 }
     }
+    if (peer) {
+        if (to_peer) memmove(&peer->ls[off], local, size);
+        else         memmove(local, &peer->ls[off], size);
+        moved = 1;
+    }
     ReleaseSRWLockShared(&s_pm_directory_lock);
-    return peer;
+    return moved;
 }
 
 int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,

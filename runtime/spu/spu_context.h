@@ -691,9 +691,12 @@ int spu_float_rz_mode(void);   /* 1: SPU code runs in round toward zero (SPU_FLO
 #define SPU_THREAD_EA_BASE   0xF0000000u
 #define SPU_THREAD_EA_STRIDE 0x00100000u
 #define SPU_THREAD_LS_MAX    6u
-/* The context whose local store SPU spu_num of self's thread group holds, or
- * NULL (spurs_policy.c). */
-spu_context* spu_thread_ls_peer(const spu_context* self, uint32_t spu_num);
+/* Move size bytes between `local` and the local store of the context that SPU spu_num of self's thread group
+ * holds, at LS offset off (to_peer: local -> that store). 1 when moved; 0 when no context is registered there or
+ * the range leaves the local store, and nothing moved. The peer is never handed out: it could be freed under the
+ * caller, so the copy runs under the registry lock (spurs_policy.c). */
+int spu_thread_ls_copy(const spu_context* self, uint32_t spu_num, uint32_t off, uint8_t* local, uint32_t size,
+                       int to_peer);
 
 static inline void spu_context_init(spu_context* ctx, uint32_t spu_id)
 {

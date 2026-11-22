@@ -32,6 +32,11 @@ void spu_coh_notify_write(uint32_t ea) { (void)ea; }
 void spu_coh_notify_write_except(uint32_t ea, const void* self) { (void)ea; (void)self; }
 void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
+/* mfc_do_transfer's SPU-thread LS window (#800) lives in spurs_policy.c, which this fixture does not link; no
+ * policy context is registered, so no window is mapped. */
+int spu_thread_ls_copy(const spu_context* self, uint32_t spu_num, uint32_t off, uint8_t* local, uint32_t size,
+                       int to_peer)
+{ (void)self; (void)spu_num; (void)off; (void)local; (void)size; (void)to_peer; return 0; }
 /* The PUT path's lock-guard probe and write hook. Clang at -O1 prunes the PUT
  * branch of this GET-only fixture, GCC keeps it and needs the symbols. */
 void spu_lockguard_check(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint32_t size,

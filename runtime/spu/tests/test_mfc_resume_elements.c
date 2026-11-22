@@ -28,7 +28,9 @@ int spu_coh_is_reserved(uint32_t ea) { (void)ea;return 0; }
 void spu_coh_notify_write(uint32_t ea) { (void)ea; }
 void spu_coh_notify_write_except(uint32_t ea,const void* c) { (void)ea;(void)c; }
 void spu_lockline_lock(void) {}
-spu_context* spu_thread_ls_peer(const spu_context* self, uint32_t n) { (void)self; (void)n; return NULL; }
+int spu_thread_ls_copy(const spu_context* self, uint32_t spu_num, uint32_t off, uint8_t* local, uint32_t size,
+                       int to_peer)
+{ (void)self; (void)spu_num; (void)off; (void)local; (void)size; (void)to_peer; return 0; }
 void spu_lockline_unlock(void) {}
 void spu_lockguard_check(spu_context* c,uint32_t ea,const uint8_t* p,uint32_t n,const char* what)
 { (void)c;(void)ea;(void)p;(void)n;(void)what; }

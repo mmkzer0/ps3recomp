@@ -79,6 +79,11 @@
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
 
+/* The SPU-thread LS window (#800) lives in spurs_policy.c, which this fixture does not link; none is mapped. */
+int spu_thread_ls_copy(const spu_context* self, uint32_t spu_num, uint32_t off, uint8_t* local, uint32_t size,
+                       int to_peer)
+{ (void)self; (void)spu_num; (void)off; (void)local; (void)size; (void)to_peer; return 0; }
+
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value);
 u128 spu_rdch(spu_context* ctx, uint32_t channel);
 void spurs_job_set_spu_num(uint32_t n);
