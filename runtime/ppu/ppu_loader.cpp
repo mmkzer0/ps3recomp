@@ -893,6 +893,7 @@ extern "C" void spu_coh_notify_write(uint32_t addr);
  * ever reaches into another thread's context. See runtime/memory/reservation.h.
  * -----------------------------------------------------------------------*/
 extern "C" PPU_THREAD_LOCAL ppu_context* g_active_ctx;   /* fwd (defined below) */
+extern "C" void ppu_dump_guest_stack(ppu_context*, const char*);
 #define PPU_CTX_MAX 128
 static ppu_context* g_ppu_ctxs[PPU_CTX_MAX];
 static volatile LONG g_ppu_ctx_n = 0;
@@ -932,6 +933,10 @@ extern "C" void ppu_report_guest_lrs(void)
         PS3_LOG(PS3_LOG_INFO, "WATCHDOG", "  guest-tid %-3u lr=0x%08X  r3=0x%08X sp=0x%08X\n",
                 (unsigned)c->thread_id, (uint32_t)c->lr,
                 (uint32_t)c->gpr[3], (uint32_t)c->gpr[1]);
+        /* lr names only the last direct call site; the unwound guest stack names the whole chain the thread is
+         * parked in, which is what a wedge report needs (upstream #767, 61ef3e02). Read unlocked like the
+         * line above: a torn word costs a wrong frame in a diagnostic. */
+        ppu_dump_guest_stack(c, "watchdog");
         /* With BCTRL_RING armed, follow it with that thread's recent INDIRECT
          * targets. lr cannot see those (bctrl does not write it), so for a
          * thread looping on a vtable call the ring is the only record of where
@@ -1198,7 +1203,6 @@ static inline int vm_oob(uint32_t a, uint32_t n)
  * pointer plus a struct offset is what this is for; widen it if a title turns
  * out to scribble higher. Loads use the 64 KB bound (ppu_null_read_report). */
 extern "C" PPU_THREAD_LOCAL ppu_context* g_active_ctx;
-extern "C" void ppu_dump_guest_stack(ppu_context*, const char*);
 extern "C" uint32_t g_null_sweep_hi = 0;   /* 0 = not sweeping */
 static uint32_t g_null_sweep_last = 0;
 static unsigned g_null_sweep_tid = 0;
