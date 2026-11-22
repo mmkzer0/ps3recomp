@@ -588,7 +588,7 @@ static void test_cfl_stop_names_itself(void) {
         buf[n] = 0;
         fclose(tf);
         char want[200];
-        snprintf(want, sizeof want, "unmodelled cflts/cfltu lane (%s I8=%u lane=%d in=0x%08X, #126) (0x%08X) at LS 0x00108",
+        snprintf(want, sizeof want, "unmodelled cflts/cfltu lane (%s I8=%u lane=%d in=0x%08X) (0x%08X) at LS 0x00108",
                  cs->op == 0x1D8 ? "cflts" : "cfltu", cs->i8, cs->trap_lane, cs->in[cs->trap_lane],
                  ri8(cs->op, cs->i8, 2, 3));
         CHECK(strstr(buf, want) != NULL);

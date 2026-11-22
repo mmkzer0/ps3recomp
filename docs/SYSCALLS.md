@@ -110,9 +110,9 @@ PS3 PPU threads map 1:1 to host OS threads. Each thread gets its own `ppu_contex
 
 ### Syscalls
 
-#### `sys_ppu_thread_create` (NID, not a syscall-table slot)
+#### `sys_ppu_thread_create` (by NID, not a syscall-table slot)
 
-Creates a new PPU thread with its own register context and stack. lv2 creates threads with two syscalls, `_sys_ppu_thread_create` (52) and `sys_ppu_thread_start` (53), whose calling convention is not this function's; this handler is the sysPrxForUser-shaped one, reached through its import NID. It is deliberately not registered in the syscall table (slot 41 is [`sys_ppu_thread_exit`](#sys_ppu_thread_exit-41)).
+Creates a new PPU thread with its own register context and stack. lv2 creates threads with two syscalls, `_sys_ppu_thread_create` (52) and `sys_ppu_thread_start` (53), whose calling convention is not this function's; this handler is the sysPrxForUser-shaped one a title reaches through its import NID.
 
 **Arguments:**
 - `r3`: Pointer to store thread ID (`sys_ppu_thread_t*`)
@@ -137,7 +137,7 @@ Creates a new PPU thread with its own register context and stack. lv2 creates th
 
 #### `sys_ppu_thread_exit` (41)
 
-Terminates the calling thread. The exit code is in `r3`; the call never returns, and slot 42 is the stock kernel's ENOSYS stub, which answers `CELL_ENOSYS` and leaves the thread running.
+Terminates the calling thread. The exit code is in `r3`; the call never returns. Slot 42 is the stock kernel's ENOSYS stub, which answers `CELL_ENOSYS` and leaves the thread running.
 
 #### `sys_ppu_thread_yield` (43)
 
@@ -395,7 +395,7 @@ PS3 time is measured in **timebase ticks** at 79,800,000 Hz (79.8 MHz). This is 
 | 74 | `sys_timer_stop` | Stop timer. |
 | 75 | `sys_timer_connect_event_queue` | Connect timer to an event queue. |
 | 76 | `sys_timer_disconnect_event_queue` | Disconnect timer from queue. |
-| 141 | `sys_timer_usleep` | Sleep for N microseconds. |
+| 141 | `sys_timer_usleep` | Sleep for N microseconds. Windows spins sub-millisecond sleeps to a QPC deadline, or with `ppu.usleep_hires_wait_us=<n>` (off by default) waits on a high-resolution waitable timer for those of at least n microseconds; on POSIX, `ppu.usleep_spin_us=<n>` (off by default) makes sleeps shorter than n microseconds yield to a monotonic deadline instead of calling nanosleep. |
 | 142 | `sys_timer_sleep` | Sleep for N seconds. |
 | 145 | `sys_time_get_current_time` | Get current time (seconds + nanoseconds since epoch). |
 | 147 | `sys_time_get_timebase_frequency` | Returns 79,800,000. |

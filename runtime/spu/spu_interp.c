@@ -161,7 +161,7 @@ static inline uint32_t spu_fetch(const spu_context* ctx, uint32_t pc) {
     if ((uint32_t)(i8) <= 14u) { \
         const int cfl_lane_ = spu_cfl_unmodelled_lane((a), (int)(i8), (uns)); \
         if (cfl_lane_ >= 0) { \
-            fprintf(stderr, "%s[spu_interp] unmodelled cflts/cfltu lane (%s I8=%u lane=%d in=0x%08X, #126) (0x%08X) at LS 0x%05X\n", \
+            fprintf(stderr, "%s[spu_interp] unmodelled cflts/cfltu lane (%s I8=%u lane=%d in=0x%08X) (0x%08X) at LS 0x%05X\n", \
                     spu_diag_tag(), (opname), (unsigned)(i8), cfl_lane_, (unsigned)(a)._u32[cfl_lane_], insn, pc); \
             ctx->pc = pc; ctx->status = SPU_STATUS_STOPPED_BY_HALT; return 1; \
         } } } while (0)

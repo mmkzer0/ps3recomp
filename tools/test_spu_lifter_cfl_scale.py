@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
-"""cflts/cfltu lift with a per-lane stop at I8 <= 14 and bare at I8 >= 15.
+"""cflts/cfltu lift with a per-lane halt at I8 <= 14 and bare at I8 >= 15.
 
-At I8 <= 14 the conversion can reach the hardware's unmodelled shift region: with
+At I8 <= 14 the conversion can reach a region the model does not cover: with
 sh = be + 23 - I8, a lane with sh >= 264 (be >= 241 + I8) leaves the saturating
-path of a CBE SPU and the fit found no bit-exact rule (hwprobe `spuexh` lanes,
-CECHC04 4.81 REBUG, runs r014/r018/r019; issue #126); cfltu is modelled for a
-negative lane (0) and for sh == 264 (0xFFFFFFFF). Which lanes reach it depends on
-the data, so lifted code computes the conversion and first asks
-spu_cfl_unmodelled_lane(), the interpreter's check, and stops the same named way
+path of a CBE SPU and no rule reproduces what it returns (console probe,
+CECHC04 on FW 4.81; see spu__cfl_lane in runtime/spu/spu_helpers.h). cfltu is
+modelled for a negative lane (0) and for sh == 264 (0xFFFFFFFF). Which lanes
+reach it depends on the data, so lifted code computes the conversion and first
+asks spu_cfl_unmodelled_lane(), the interpreter's check, and halts the same way
 (op, scale, lane, input word, word, pc, image) when a lane does. I8 15 is the
-lowest scale that cannot reach it (max sh = 255 + 23 - 15 = 263) and lifts to the
-bare helper call.
+lowest scale that cannot reach it (max sh = 255 + 23 - 15 = 263) and lifts to
+the bare helper call.
 
-The text tests pin the shape; the run test compiles the emitted statement against
-the real helpers and executes it on words below, at and above the boundary.
+The text tests pin the shape; the run test compiles the emitted statement
+against the real helpers and executes it on words below, at and above the
+boundary.
 
 Usage:
     python3 tools/test_spu_lifter_cfl_scale.py
@@ -35,7 +36,7 @@ from spu_disasm import disassemble_spu
 from spu_lifter import SPULifter
 
 # RI8 format: opcd(10) | i8(8) | ra(7) | rt(7); cflts 0x1D8, cfltu 0x1D9
-# (tools/spu_disasm.py ri8_table, runtime/spu/spu_interp_tables.inc).
+# (tools/spu_disasm.py, runtime/spu/spu_interp_tables.inc).
 CFLTS, CFLTU = 0x1D8, 0x1D9
 PC = 0x12340
 
@@ -44,17 +45,18 @@ def word(op10, i8, ra=2, rt=3):
     return (op10 << 22) | ((i8 & 0xFF) << 14) | (ra << 7) | rt
 
 
-def lift_lines(w):
+def lift_lines(w, reloc=False):
     data = struct.pack(">I", w)
     insns = disassemble_spu(data, PC)
     lifter = SPULifter()
+    lifter.reloc = reloc
     lifter.func_starts = {PC, PC + 4}
     lifter.lift_function(insns, PC, PC + 4)
     return lifter.functions[0].body_lines
 
 
-def lift(w):
-    return "\n".join(lift_lines(w))
+def lift(w, reloc=False):
+    return "\n".join(lift_lines(w, reloc))
 
 
 class CflLaneStop(unittest.TestCase):
@@ -66,27 +68,33 @@ class CflLaneStop(unittest.TestCase):
                     body = lift(w)
                     check = f"spu_cfl_unmodelled_lane(ctx->gpr[2], {i8}, {uns})"
                     compute = f"ctx->gpr[3] = spu_{mn}(ctx->gpr[2], {i8});"
-                    # The conversion is still emitted (a modelled lane runs), after the
-                    # check, so the destination is not written when the stop is taken.
+                    # The conversion is still emitted (a modelled lane runs), after
+                    # the check, so the destination is not written when the halt is taken.
                     self.assertIn(check, body)
                     self.assertIn(compute, body)
                     self.assertLess(body.index(check), body.index(compute))
-                    # The stop: named with the op, the scale, the lane and its input
-                    # word, the word, its pc and the image, at the word's own pc,
-                    # through the same halt as #124's stops.
+                    # The halt: at the word's own pc, through the same spu_halt as a
+                    # taken halt-assertion, naming op, scale, lane, input word, word.
                     self.assertIn("SPU_STATUS_STOPPED_BY_HALT", body)
                     self.assertIn("spu_halt(ctx); return;", body)
-                    self.assertIn(f"ctx->pc = 0x{PC:X}u;", body)
+                    self.assertIn(f"ctx->pc = 0x{PC:X};", body)
                     self.assertIn(f"INVALID-OP {mn}", body)
-                    self.assertIn(f"unmodelled cflts/cfltu lane ({mn} I8={i8} lane=%d in=0x%08X, #126)", body)
+                    self.assertIn(f"unmodelled cflts/cfltu lane ({mn} I8={i8} lane=%d in=0x%08X)", body)
                     self.assertIn(f"0x{w:08X}u", body)
                     self.assertIn("ctx->gpr[2]._u32[cfl_l]", body)
 
     def test_the_check_reads_the_source_before_the_destination_is_written(self):
-        # rt == ra: the stop must see the unconverted source, so the check precedes the write.
+        # rt == ra: the halt must see the unconverted source, so the check precedes the write.
         body = lift(word(CFLTS, 3, ra=7, rt=7))
         self.assertLess(body.index("spu_cfl_unmodelled_lane(ctx->gpr[7], 3, 0)"),
                         body.index("ctx->gpr[7] = spu_cflts(ctx->gpr[7], 3);"))
+
+    def test_a_relocated_halt_records_the_placed_pc(self):
+        # Under --reloc the code runs at its canonical address plus ctx->reloc_delta, so
+        # the halt must record that pc, as every other pc the lifter emits does (_pc).
+        body = lift(word(CFLTS, 0), reloc=True)
+        self.assertIn(f"ctx->pc = ((0x{PC:X}u + (uint32_t)ctx->reloc_delta) & 0x3FFFFu);", body)
+        self.assertNotIn(f"ctx->pc = 0x{PC:X};", body)
 
     def test_modelled_scales_still_lift_to_their_helper(self):
         for mn, op10, helper in (("cflts", CFLTS, "spu_cflts"),
@@ -153,7 +161,7 @@ class CflLaneStopRuns(unittest.TestCase):
 
     # 0x3F800000 is 1.0 (modelled at every scale), 0x7F800000 / 0xFFFFFFFF exponent-255
     # words of either sign, 0x7F5BAACA / 0xFF66344D exponent 254.
-    def test_a_lane_in_the_unmodelled_region_stops_and_names_itself(self):
+    def test_a_lane_in_the_unmodelled_region_halts_and_names_itself(self):
         for mn, op10, i8, words, lane in (
                 ("cflts", CFLTS, 14, (0x3F800000, 0x7F800000, 0x3F800000, 0xFFFFFFFF), 1),
                 ("cflts", CFLTS, 0, (0x3F800000, 0x7878EB45, 0x3F800000, 0xFFABDE3D), 3),
@@ -163,7 +171,7 @@ class CflLaneStopRuns(unittest.TestCase):
                 w = word(op10, i8)
                 out, err = self.run_words(self.build(w), words)
                 self.assertIn("halted=1 status=1 out=00000000 00000000 00000000 00000000", out)   # no result written
-                self.assertIn(f"unmodelled cflts/cfltu lane ({mn} I8={i8} lane={lane} in=0x{words[lane]:08X}, #126) "
+                self.assertIn(f"unmodelled cflts/cfltu lane ({mn} I8={i8} lane={lane} in=0x{words[lane]:08X}) "
                               f"(0x{w:08X}) at LS 0x{PC:05X} img=9", err)
 
     def test_modelled_lanes_run_below_the_boundary(self):

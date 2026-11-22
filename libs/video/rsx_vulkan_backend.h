@@ -43,7 +43,7 @@
  *                             backend names its PS3RECOMP_METAL_FRAME_DUMP
  *                             files (rsx_frame_select.h). A malformed value is
  *                             a config-invalid stop at init.
- *   PS3RECOMP_VK_WINDOW=1     also show each presented frame in an SDL2
+ *   PS3RECOMP_VK_WINDOW=1     also show each presented frame in an SDL2 (Win32 on Windows)
  *                             window. Rendering and readback are unchanged, so
  *                             every test gives the same result with or without
  *                             it; if the window cannot be opened the run
@@ -77,7 +77,8 @@ int  rsx_vulkan_backend_init(u32 width, u32 height, const char* title);
 /* Unregister and destroy every Vulkan object, then unload the library. */
 void rsx_vulkan_backend_shutdown(void);
 
-/* Headless: always 0. Windowed: drains SDL's event queue; -1 once the
+/* Headless: always 0. Windowed: drains the window's events (SDL2, or the
+ * Win32 message queue of the thread that called init); -1 once the
  * window has been closed or Esc pressed. */
 int  rsx_vulkan_backend_pump_messages(void);
 

@@ -184,10 +184,8 @@ static long dp_under_rz(long n)
             if (it & 1) { a._u32[k & ~1] &= 0x800FFFFFu; }   /* denormal doubles */
             if (it & 2) { b._u32[k & ~1] = (b._u32[k & ~1] & 0x800FFFFFu) | 0x3FF00000u; }
         }
-        /* dfceq/dfcmeq/dfcgt/dfcmgt are not here: a retail CBE SPU raises an
-         * invalid-instruction error for them (hwprobe spuexh special A, issue
-         * #124), so nothing models them and there is no fast path to keep
-         * FPCR-clean. */
+        /* The double compares are not here: a CBE SPU raises an invalid-instruction error for
+         * them (console probe, CECHC04 on FW 4.81), so no helper exists to keep FPCR-clean. */
         u128 want[8], got[8];
         want[0] = spu_dfa(a, b); want[1] = spu_dfs(a, b); want[2] = spu_dfm(a, b);
         want[3] = spu_dfma(a, b, c); want[4] = spu_dfms(a, b, c); want[5] = spu_dfnms(a, b, c);

@@ -70,10 +70,14 @@ static void sys_initialize_tls(ppu_context* ctx)
 static void sys_time_get_system_time(ppu_context* ctx)
 {
 #ifdef _WIN32
-    static LARGE_INTEGER s_freq, s_base;
-    if (!s_freq.QuadPart) { QueryPerformanceFrequency(&s_freq); QueryPerformanceCounter(&s_base); }
+    /* From host boot (#788), as the POSIX clock below counts and as the console
+     * does: a per-process anchor made every launch start at 0 and so seed
+     * clock-derived RNGs identically. Split multiply keeps it overflow-safe. */
+    static LARGE_INTEGER s_freq;
+    if (!s_freq.QuadPart) QueryPerformanceFrequency(&s_freq);
     LARGE_INTEGER now; QueryPerformanceCounter(&now);
-    ctx->gpr[3] = (uint64_t)((now.QuadPart - s_base.QuadPart) * 1000000ull / (uint64_t)s_freq.QuadPart);
+    const uint64_t d = (uint64_t)now.QuadPart, q = (uint64_t)s_freq.QuadPart;
+    ctx->gpr[3] = (d / q) * 1000000ull + (d % q) * 1000000ull / q;
 #else
     /* The same host clock as the timebase (sys_timer.h), so guest code that
      * mixes mftb and this stays consistent. */

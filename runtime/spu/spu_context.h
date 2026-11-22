@@ -687,6 +687,14 @@ int spu_mfc_has_engine(const spu_context* ctx);   /* an initialized engine is ac
 void spu_mfc_forget_range(uintptr_t lo, uintptr_t hi);
 int spu_float_rz_mode(void);   /* 1: SPU code runs in round toward zero (SPU_FLOAT_RZ, latched on first use) */
 
+/* Effective-address window of the SPU thread group's local stores. */
+#define SPU_THREAD_EA_BASE   0xF0000000u
+#define SPU_THREAD_EA_STRIDE 0x00100000u
+#define SPU_THREAD_LS_MAX    6u
+/* The context whose local store SPU spu_num of self's thread group holds, or
+ * NULL (spurs_policy.c). */
+spu_context* spu_thread_ls_peer(const spu_context* self, uint32_t spu_num);
+
 static inline void spu_context_init(spu_context* ctx, uint32_t spu_id)
 {
     memset(ctx, 0, sizeof(*ctx));

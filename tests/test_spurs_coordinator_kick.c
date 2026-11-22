@@ -30,6 +30,9 @@ PS3_NORETURN void ps3_stop(ps3_stop_kind kind, const char* what, const char* rem
   fprintf(stderr, "unexpected stop: %s\n", what); abort(); }
 
 extern void (*g_spu_line_commit_hook)(uint32_t);
+/* Defined by libs/video/rsx_commands.c, which calls it after an RSX semaphore
+ * release into main memory (PS3RECOMP_RSX_RELEASE_LINE_WAKE=1). */
+void (*g_rsx_main_release_hook)(uint32_t line);
 
 #define SPURS_EA 0x10000u   /* 128-byte aligned, as CellSpurs is */
 
@@ -63,6 +66,14 @@ int main(void)
     g_spu_line_commit_hook = 0;
     assert(ef_sync_alloc(0x20000u));
     assert(g_spu_line_commit_hook == spurs_commit_hook);
+    assert(g_rsx_main_release_hook == spurs_line_committed);
+
+    /* An RSX release into the instance's first line kicks it, like a commit. */
+    g_rsx_main_release_hook(SPURS_EA);
+    assert(take_kick() == 1);
+    g_rsx_main_release_hook(SPURS_EA + 0x80u);
+    g_rsx_main_release_hook(0x20000u);
+    assert(take_kick() == 0);
 
     /* Only a commit to the instance's first line kicks it. */
     g_spu_line_commit_hook(SPURS_EA);
@@ -98,6 +109,6 @@ int main(void)
     CloseHandle(t);
     assert(woken);
 
-    puts("PASS: an SPU commit to the SPURS request line kicks and wakes the coordinator");
+    puts("PASS: an SPU commit or RSX release to the SPURS request line kicks and wakes the coordinator");
     return 0;
 }

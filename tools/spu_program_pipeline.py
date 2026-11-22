@@ -1932,7 +1932,9 @@ def build_programs(args, registry_writer):
                 # the command below passes, and they identify the generated
                 # body even when generation fails.
                 merge_chunks = bool(getattr(args, 'merge_chunks', False))
-                return_entries = bool(program.get('return_entries', False))
+                ret_entries = set(getattr(args, 'return_entries', []) or [])
+                want_ret = ('ALL' in ret_entries) or (name in ret_entries)
+                return_entries = bool(program.get('return_entries', False)) or want_ret
                 overrides = program.get('overrides', [])
                 program['lift_options_string'] = lift_options_string(
                     code_end if raw else None, entries, merge_chunks, return_entries,

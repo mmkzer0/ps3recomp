@@ -158,6 +158,7 @@ extern unsigned int cellGcm_flip_request_count(void);
 #define NID_cellGcmGetFlipStatus      0x72A577CEu
 #define NID_cellGcmSetVBlankHandler   0xA91B0402u
 #define NID_sys_process_exit          0xE6F2C1E7u
+#define NID_sys_ppu_thread_create     0x24A1EA07u
 
 /* cellGcmSys.h's flip states. */
 #define SMOKE_FLIP_DONE     0
@@ -515,9 +516,9 @@ void func_00010000(ppu_context* ctx)
                 "the GCM context does not begin at the command area (IO address + 0x1000)");
     smoke_mark(ctx, SMOKE_STEP_HLE);
 
-    /* A guest thread, through the sysPrxForUser import NID. The entry is an OPD
-     * address, which the runtime's thread trampoline resolves the same way
-     * ppu_run resolved ours. */
+    /* A guest thread, through the sysPrxForUser import NID as a lifted title
+     * does it. The entry is an OPD address, which the runtime's thread
+     * trampoline resolves the same way ppu_run resolved ours. */
     ctx->gpr[3]  = SMOKE_SC_TID;          /* u64* thread id (out) */
     ctx->gpr[4]  = SMOKE_OPD_THREAD;      /* entry OPD           */
     ctx->gpr[5]  = SMOKE_THREAD_ARG;      /* the new thread's r3 */

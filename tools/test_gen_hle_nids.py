@@ -87,8 +87,11 @@ HOST_HELPERS = set("""
     cellRtcSetTime_t
     cellSaveData_register_ctx_handlers
     cellSaveData_set_scratch_region
+    cellSpurs_post_snr
+    cellSpurs_register_ctx_handlers
     cellSysutil_pump_seen
     cellSysutil_register_poll_hook
+    cellSysutil_set_osk_pump
     cellUserInfoSelectUser_ListGet
     cellUserInfoSelectUser_ListSet
     cellVideoOut_refresh_rate

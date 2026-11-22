@@ -9,6 +9,7 @@
 #include <stdatomic.h>
 #include <sched.h>
 uint8_t* vm_base;
+uint64_t ps3_system_time_us(void) { return 0; }   /* sys_timer.c */
 uint32_t ppu_vm_size;
 uint32_t g_ww_lo, g_ww_hi;
 void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }

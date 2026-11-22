@@ -581,25 +581,20 @@ Instructions the lifter accepts but does not fully model:
 - **Double precision** (`dfa`, `dfs`, `dfm`, `dfma`, `dfms`, `dfnma`, `dfnms`,
   `fesd`, `frds`) is lifted to helpers in `runtime/spu/spu_helpers.h`; it is not
   a stub.
-- **`dfceq`, `dfcmeq`, `dfcgt`, `dfcmgt`, `dftsv`** are not lifted at all. A
-  retail CBE SPU raises an invalid-instruction error for each (hardware probe
-  `spuexh` special A, CECHC04 with 4.81 REBUG: the thread group ends with join
-  cause 4 and the stopped thread's exit status reads `0x8001000F`; issue #124),
-  so the interpreter decodes them as `.word` and the lifter emits the same stop
-  at the word's own PC instead of a helper call.
-- **`cflts`/`cfltu` at I8 <= 14** lift with a per-lane stop. With
-  `sh = be + 23 - I8`, a lane with `sh >= 264` (`be >= 241 + I8`, reachable only
-  at these scales) takes the conversion past the hardware's saturating path into
-  a region no fit models. Every lane with `sh < 264` follows the rule in
-  `spu__cfl_lane`, and the `cfltu` lanes at `sh == 264` and every negative
-  `cfltu` lane were measured as well (hardware probe `spuexh` lanes, CECHC04
-  with 4.81 REBUG, 129024 lanes; issue #126). Which lane reaches the path
-  depends on the data, so the lifter emits the conversion behind a runtime check
-  (`spu_cfl_unmodelled_lane`, the interpreter's own predicate): a lane that is
-  not covered stops the run at the word's own PC with
-  `unmodelled cflts/cfltu lane (op I8=N lane=L in=0x........, #126)`, and no
-  result is written. I8 >= 15 cannot reach the path (largest `sh` 263), is exact
-  over the whole input space and lifts to the bare helper call with no check.
+- **`dfceq`, `dfcmeq`, `dfcgt`, `dfcmgt`, `dftsv`** lift to a halt, not to a
+  helper. A CBE SPU raises an invalid-instruction error for each (console probe,
+  CECHC04 on FW 4.81: the thread group ends with join cause 4 and the stopped
+  thread's exit status reads `0x8001000F`), so the interpreter decodes them as
+  `.word` and the lifter emits the same halt at the word's own PC.
+- **`cflts` / `cfltu` at I8 <= 14**: the conversion shifts by
+  `sh = be + 23 - I8`, and a lane with `sh >= 264` (only reachable at these
+  scales) leaves the saturating path of a CBE SPU for a result nothing models
+  (console probe, CECHC04 on FW 4.81; `cfltu` is modelled for a negative lane
+  and for `sh == 264`). Interpreter and lifted code ask
+  `spu_cfl_unmodelled_lane()` first and halt at the word, naming the op, the
+  scale, the lane and its input word, rather than write a value the console
+  would not produce. I8 >= 15 cannot reach that region and lifts to the bare
+  helper call.
 
 ## Tracing (for §3 diff vs RPCS3)
 

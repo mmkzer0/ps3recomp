@@ -179,6 +179,7 @@ int spu_workload_is_promoted(uint64_t fingerprint);
 /* Retire resident policy contexts after the owning scheduler has joined. */
 void spurs_policy_release_instance(uint32_t spurs_ea);
 int spurs_policy_release_workload(uint32_t spurs_ea, uint32_t wid);
+int spurs_policy_post_snr(uint32_t spurs_ea, uint32_t spu_num, uint32_t num, uint32_t val);
 
 int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
                           const uint8_t* pm_host, uint32_t pm_size,

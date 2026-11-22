@@ -1545,50 +1545,43 @@ class SPULifter:
             return ("ctx->stop_code = 0x3FFFu; "
                     "ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;")
 
-        # dfceq, dfcmeq, dfcgt, dfcmgt, dftsv: the retail CBE SPU does not
-        # implement them (later additions to the SPU ISA [INFERENCE]); on the
-        # console executing one raises an SPU invalid-instruction error, the
-        # thread group ends with join cause 4 after terminate and the stopped
-        # thread's exit status reads 0x8001000F (CELL_ESTAT). Hardware, direct:
-        # the hwprobe `spuexh` special-A probe ran each word alone in its own
-        # thread group on a CECHC04 with 4.81 REBUG and none executed (issue
-        # #124). The interpreter decodes them as `.word` and stops at the word;
-        # lifted code must stop the same way, not call a helper and run on.
-        # This deliberately does NOT take the `.word` fallthrough at the end of
-        # this function: spu_unsupported tolerates data embedded in .text that
-        # never executes, while these are ISA-defined opcodes the console
-        # rejects, so any execution is a hard stop (fail closed), named with
-        # the word, its pc and the image.
+        # dfceq, dfcmeq, dfcgt, dfcmgt, dftsv: a CBE SPU does not implement them
+        # (PowerXCell 8i additions [INFERENCE]). Console probe, CECHC04 on FW 4.81:
+        # each word run alone in its own thread group did not execute; the group
+        # ended with join cause 4 and the stopped thread's exit status read
+        # 0x8001000F (CELL_ESTAT). The interpreter decodes them as `.word` and stops
+        # at the word (tools/gen_spu_interp.py); lifted code must stop the same way
+        # instead of calling a helper and running on. This does not fall through to
+        # spu_unsupported below, which tolerates data in .text that never executes:
+        # these are opcodes the console rejects, so reaching one is a hard stop.
         if mn in ("dfceq", "dfcmeq", "dfcgt", "dfcmgt", "dftsv"):
-            return (f"/* {mn}: invalid on the CBE SPU (hwprobe spuexh special A, issue #124) */ "
-                    f"{{ extern void spu_halt(spu_context*); ctx->pc = 0x{addr:X}u; "
-                    f"fprintf(stderr, \"[spu] INVALID-OP {mn} (0x%08X) at LS 0x%05X img=%d\\n\", "
-                    f"0x{insn.raw:08X}u, 0x{addr:05X}u, ctx->image_id); "
-                    f"ctx->status = SPU_STATUS_STOPPED_BY_HALT; spu_halt(ctx); return; }}")
+            return (f"ctx->pc = {self._pc(addr)}; "
+                    f"fprintf(stderr, \"[spu] INVALID-OP {mn} (0x%08X) at LS 0x%05X "
+                    f"img=%d\\n\", 0x{insn.raw:08X}u, (unsigned)ctx->pc, ctx->image_id); "
+                    f"ctx->status = SPU_STATUS_STOPPED_BY_HALT; "
+                    f"spu_halt(ctx); return;")
 
         # cflts/cfltu at I8 <= 14: the conversion shifts by sh = be + 23 - I8, and a
-        # lane with sh >= 264 (be >= 241 + I8, i.e. only at these scales) leaves the
-        # hardware's saturating path for a result that is not modelled (cflts at every
-        # such lane; cfltu except negative lanes and sh == 264, which were measured;
-        # hwprobe spuexh lanes, CECHC04 with 4.81 REBUG, runs r014/r018/r019, issue
-        # #126). Which lanes reach it depends on the data, so the lifted code computes
-        # the conversion and, first, asks spu_cfl_unmodelled_lane() (the interpreter's
-        # check, runtime/spu/spu_helpers.h): a lane that reaches the path stops the
-        # run the same fail-closed way (named with the op, the scale, the lane, its
-        # input word, the word, its pc and the image), not a value the console never
-        # produced. I8 >= 15 cannot reach it (max sh = 263), so it lifts to the bare
-        # helper call as before.
+        # lane with sh >= 264 (be >= 241 + I8, so only at these scales) leaves the
+        # console's saturating path for a result nothing models (cflts at every such
+        # lane; cfltu except negative lanes and sh == 264, which were measured;
+        # console probe, CECHC04 on FW 4.81, see spu__cfl_lane in spu_helpers.h).
+        # Which lanes reach it depends on the data, so the lifted code asks
+        # spu_cfl_unmodelled_lane(), the interpreter's check, before it writes the
+        # destination, and halts the same way when a lane does. I8 >= 15 cannot reach
+        # it (max sh = 263) and lifts to the bare helper call.
         if mn in ("cflts", "cfltu"):
             i8 = int(_imm(ops[2]), 0)
             if i8 <= 14:
                 uns = 1 if mn == "cfltu" else 0
                 src = g(ra())
                 return (f"{{ int cfl_l = spu_cfl_unmodelled_lane({src}, {i8}, {uns}); "
-                        f"if (cfl_l >= 0) {{ extern void spu_halt(spu_context*); ctx->pc = 0x{addr:X}u; "
-                        f"fprintf(stderr, \"[spu] INVALID-OP {mn}: unmodelled cflts/cfltu lane ({mn} I8={i8} lane=%d in=0x%08X, #126) "
+                        f"if (cfl_l >= 0) {{ ctx->pc = {self._pc(addr)}; "
+                        f"fprintf(stderr, \"[spu] INVALID-OP {mn}: unmodelled cflts/cfltu lane ({mn} I8={i8} lane=%d in=0x%08X) "
                         f"(0x%08X) at LS 0x%05X img=%d\\n\", "
-                        f"cfl_l, (unsigned){src}._u32[cfl_l], 0x{insn.raw:08X}u, 0x{addr:05X}u, ctx->image_id); "
-                        f"ctx->status = SPU_STATUS_STOPPED_BY_HALT; spu_halt(ctx); return; }} }} "
+                        f"cfl_l, (unsigned){src}._u32[cfl_l], 0x{insn.raw:08X}u, (unsigned)ctx->pc, ctx->image_id); "
+                        f"ctx->status = SPU_STATUS_STOPPED_BY_HALT; "
+                        f"spu_halt(ctx); return; }} }} "
                         f"{g(rt())} = spu_{mn}({src}, {i8});")
 
         # ---- integer arithmetic (register) ----
@@ -1605,8 +1598,7 @@ class SPULifter:
             "fi": "spu_fi",   # floating interpolate (reciprocal refine)
             "fceq": "spu_fceq", "fcgt": "spu_fcgt",
             "fcmeq": "spu_fcmeq", "fcmgt": "spu_fcmgt",
-            # double-precision (2 doubles/reg); the double compares are above:
-            # invalid on the CBE SPU, so they never reach a helper
+            # double-precision (2 doubles/reg); the double compares are above (invalid)
             "dfa": "spu_dfa", "dfs": "spu_dfs", "dfm": "spu_dfm",
             "mpyhhu": "spu_mpyhhu",
             "eqv": "spu_eqv", "absdb": "spu_absdb", "avgb": "spu_avgb",

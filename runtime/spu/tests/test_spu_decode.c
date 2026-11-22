@@ -10,7 +10,7 @@
 #include <stdio.h>
 #include <string.h>
 
-/* Decode-only test: nothing here executes, so the external hooks must never run. */
+/* The decode checks execute nothing: the external hooks must never run. */
 u128 spu_rdch(spu_context* c, uint32_t ch) { (void)c; (void)ch; abort(); }
 void spu_wrch(spu_context* c, uint32_t ch, u128 v) { (void)c; (void)ch; (void)v; abort(); }
 uint32_t spu_rchcnt(spu_context* c, uint32_t ch) { (void)c; (void)ch; abort(); }
@@ -204,6 +204,28 @@ static void test_handler_operands(void) {
     run1(i); all_lanes("selb", 9, (0xFF00FF00u & 0xFFFF0000u) | (0x0F0F0F0Fu & ~0xFFFF0000u), i);
 }
 
+/* The decode above is what makes the interpreter stop: run `il r2,5 / <word> / il r3,1 /
+ * stop 0` and check the SPU halts at the word's own pc with the following instructions
+ * unexecuted. Only CPU instructions run, so the external hooks above still never fire. */
+static spu_context run_ctx;
+static void put_word(uint32_t at, uint32_t w) {
+    run_ctx.ls[at] = (uint8_t)(w >> 24); run_ctx.ls[at + 1] = (uint8_t)(w >> 16);
+    run_ctx.ls[at + 2] = (uint8_t)(w >> 8); run_ctx.ls[at + 3] = (uint8_t)w;
+}
+static void check_stops_at_word(uint32_t op11) {
+    const uint32_t word = (op11 << 21) | (0x33u << 14) | (0x22u << 7) | 0x11u;
+    memset(&run_ctx, 0, sizeof run_ctx);
+    spu_context_init(&run_ctx, 0);
+    run_ctx.image_id = -1;                      /* interpret, no lifted-function lookup */
+    put_word(0x100, ri16(0x081, 5, 2));         /* il r2,5 */
+    put_word(0x104, word);
+    put_word(0x108, ri16(0x081, 1, 3));         /* il r3,1: must not run */
+    put_word(0x10C, 0);                         /* stop 0 */
+    (void)spu_interp_run(&run_ctx, 0x100);
+    CHECK(run_ctx.status == SPU_STATUS_STOPPED_BY_HALT && run_ctx.pc == 0x104, "halt at the word", word);
+    CHECK(run_ctx.gpr[2]._u32[0] == 5 && run_ctx.gpr[3]._u32[0] == 0, "nothing after the word ran", word);
+}
+
 int main(void) {
     /* RRR: shufb rt=5 rb=6 ra=7 rc=8. The destination is the high field, which
      * the interpreter calls rc; the low field is the third source (rt). */
@@ -326,23 +348,63 @@ int main(void) {
         CHECK(d.op == SPU_word && d.imm == 0 && d.tgt == 0, "invalid word", i);
     }
 
-    /* dfceq, dfcmeq, dfcgt, dfcmgt and dftsv decode as the same trap on this
-     * target: a retail CBE SPU raises an invalid-instruction error for each
-     * (hwprobe spuexh special A, CECHC04 4.81; issue #124), so the generator
-     * maps their RR prefixes to SPU_word even though spu_disasm.py still names
-     * them. Every register field at its extreme proves the decode does not
-     * look at one. The neighbouring DP op keeps its decode: dfa is 0x2CC. */
+    /* dfceq, dfcmeq, dfcgt, dfcmgt and dftsv decode as the same trap: a CBE SPU raises an
+     * invalid-instruction error for each (console probe, CECHC04 on FW 4.81: the thread group
+     * ended with join cause 4 and the stopped thread's exit status read 0x8001000F), so
+     * gen_spu_interp.py maps their RR prefixes to SPU_word even though spu_disasm.py still
+     * names them. Every register field at its extreme proves the decode does not look at one.
+     * The neighbouring DP op keeps its decode: dfa is 0x2CC. */
     {
         static const uint32_t op11[5] = { 0x3C3, 0x3CB, 0x2C3, 0x2CB, 0x3BF };
         for (unsigned k = 0; k < sizeof op11 / sizeof op11[0]; k++) {
             uint32_t i = (op11[k] << 21) | (0x7Fu << 14) | (0x7Fu << 7) | 0x7Fu;
             spu_ins d = dec(i, 0x40);
             CHECK(d.op == SPU_word && d.imm == 0 && d.tgt == 0, "CBE-invalid DP op", i);
+            check_stops_at_word(op11[k]);
         }
-        {
-            uint32_t i = ri7(0x2CC, 0x7F, 0x7F, 0x7F);   /* dfa (rb field = 0x7F) */
-            spu_ins d = dec(i, 0);
-            CHECK(d.op == SPU_dfa, "dfa still decodes", i);
+        uint32_t i = ri7(0x2CC, 0x7F, 0x7F, 0x7F); /* dfa */
+        spu_ins d = dec(i, 0);
+        CHECK(d.op == SPU_dfa, "dfa still decodes", i);
+    }
+
+    /* cflts/cfltu at I8 <= 14 halt on a lane in the unmodelled region (sh = be + 23 - I8 >= 264,
+     * spu_cfl_unmodelled_lane in spu_helpers.h; console probe, CECHC04 on FW 4.81) and write
+     * nothing; every modelled lane runs, and I8 >= 15 never halts. Words: 0x3F800000 is 1.0
+     * (modelled at every scale), 0x7F800000 / 0xFFFFFFFF are exponent-255 words of either sign,
+     * 0x7F5BAACA / 0xFF66344D exponent 254. */
+    {
+        static const struct { uint32_t op10; uint32_t i8; uint32_t in[4]; int lane; uint32_t want[4]; } c[] = {
+            /* halts: lane named, destination untouched */
+            { 0x1D8, 14, { 0x3F800000, 0x7F800000, 0x3F800000, 0xFFFFFFFF }, 1, {0} },
+            { 0x1D8, 0,  { 0x3F800000, 0x3F800000, 0x3F800000, 0xFFABDE3D }, 3, {0} },
+            { 0x1D9, 13, { 0x3F800000, 0x7F800000, 0x7F5BAACA, 0xFFFFFFFF }, 1, {0} },
+            { 0x1D9, 0,  { 0x79607710, 0x3F800000, 0x3F800000, 0x3F800000 }, 0, {0} },
+            /* runs: sh 263 (both ops), sh 264 for cfltu (+ -> all ones, - -> 0) */
+            { 0x1D8, 14, { 0x3F800000, 0x3F800000, 0x7F5BAACA, 0xFF66344D }, -1,
+              { 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x80000000 } },
+            { 0x1D9, 14, { 0x3F800000, 0x7F800000, 0x7F5BAACA, 0xFFFFFFFF }, -1,
+              { 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0 } },
+            /* I8 15 cannot reach sh 264: an exponent-255 NaN lane converts (console: sh = 263) */
+            { 0x1D8, 15, { 0x3F800000, 0x3F800000, 0x3F800000, 0xFFABDE3D }, -1,
+              { 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x80000000 } },
+        };
+        for (unsigned k = 0; k < sizeof c / sizeof c[0]; k++) {
+            const uint32_t word = ri8(c[k].op10, c[k].i8, 4, 3);
+            memset(&run_ctx, 0, sizeof run_ctx);
+            spu_context_init(&run_ctx, 0);
+            run_ctx.image_id = -1;
+            for (int l = 0; l < 4; l++) run_ctx.gpr[4]._u32[l] = c[k].in[l];
+            put_word(0x100, word);                      /* cflts/cfltu r3,r4,I8 */
+            put_word(0x104, ri16(0x081, 1, 5));         /* il r5,1: runs only if the word did */
+            put_word(0x108, 0);                         /* stop 0 */
+            (void)spu_interp_run(&run_ctx, 0x100);
+            if (c[k].lane >= 0) {
+                CHECK(run_ctx.status == SPU_STATUS_STOPPED_BY_HALT && run_ctx.pc == 0x100, "cfl halt at the word", word);
+                CHECK(run_ctx.gpr[3]._u32[0] == 0 && run_ctx.gpr[5]._u32[0] == 0, "cfl wrote nothing", word);
+            } else {
+                CHECK(run_ctx.status == SPU_STATUS_STOPPED_BY_STOP && run_ctx.gpr[5]._u32[0] == 1, "cfl ran on", word);
+                CHECK(!memcmp(run_ctx.gpr[3]._u32, c[k].want, 16), "cfl modelled lanes", word);
+            }
         }
     }
 

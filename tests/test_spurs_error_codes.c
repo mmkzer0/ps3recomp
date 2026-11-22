@@ -43,6 +43,7 @@
 uint8_t* vm_base;
 uint32_t ppu_vm_size = 0x20000;
 uint32_t g_ww_lo, g_ww_hi, g_barrier_sync_watch;
+void (*g_rsx_main_release_hook)(uint32_t line);   /* libs/video/rsx_commands.c (#729) */
 uint32_t g_spu_image_src_ea, g_spu_image_ls_start, g_spu_image_span;
 PPU_THREAD_LOCAL ppu_context* g_active_ctx;
 /* Reached only where a test starts a task, which none of these modes does: CreateTask returns

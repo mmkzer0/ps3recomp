@@ -21,8 +21,8 @@ extern "C" {
 
 #define CELL_PAD_MAX_PORT_NUM       7
 #define CELL_PAD_MAX_CODES          64
-/* RPCS3 pad_types.h: the pad table is 127 entries; only the first
- * CELL_PAD_MAX_PORT_NUM (7) are reported in CellPadInfo arrays. */
+/* The pad table has 127 entries (libio, RPCS3 pad_types.h); only the first
+ * CELL_PAD_MAX_PORT_NUM are reported in CellPadInfo arrays. */
 #define CELL_MAX_PADS               127
 
 /* Button bitmask constants (digital buttons, in button[2] low word) */

@@ -979,6 +979,24 @@ class Pipeline(unittest.TestCase):
         self.assertEqual(lifted['lift_options_string'], 'return_entries=1')
         self.assertNotEqual(lifted['lift_options'], plain['lift_options'])
 
+    def test_cli_return_entries_union_is_honoured(self):
+        # --return-entries IMAGE (cmake/PS3RecompSPU.cmake's
+        # PS3RECOMP_SPU_RETURN_ENTRIES) must arm the flag, never be silently
+        # ignored: 'ALL' or the program's own name arms it, unioned with the
+        # per-program manifest bit (F20, #831). Raw programs are named
+        # spu_<sha256>.
+        from gen_test_raw_job import CODE_START
+        RAW_BASE, build_raw_job = raw_job_tools()
+        blob = build_raw_job(variant='calls')
+        name = 'spu_' + hashlib.sha256(blob).hexdigest()
+        for cli, want in ((name, 'return_entries=1'), ('ALL', 'return_entries=1'),
+                          ('other', '')):
+            with self.subTest(cli=cli):
+                result = self.run_raw([self.raw_entry(blob, name='cli-return-entries.bin')],
+                                      '--return-entries', cli)
+                self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+                self.assertEqual(self.manifest()['programs'][0]['lift_options_string'], want)
+
     def test_raw_promoted_is_copied_to_the_record(self):
         _, build_raw_job = raw_job_tools()
         blob = build_raw_job()

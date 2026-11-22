@@ -255,7 +255,7 @@ default when this option is off:
 | Host | Backend | Source | Status |
 |------|---------|--------|--------|
 | Windows | **Direct3D 12** | `libs/video/rsx_d3d12_backend.c` | The default, and the path the upstream in-tree ports are developed against. It decodes draws itself and does not run on the shared register-file draw engine, so a title whose fixes live in the engine draws nothing visible on it: one title runs at 60 flips a second into a black window. Moving it onto the engine is planned in [`d3d12-draw-engine.md`](d3d12-draw-engine.md). |
-| Windows (opt-in) | Vulkan | `libs/video/rsx_vulkan_backend.c` | The same backend as on Linux, on the draw engine with guest programs on. See below. |
+| Windows (opt-in) | Vulkan | `libs/video/rsx_vulkan_backend.c` | The same backend as on Linux, on the draw engine with guest programs on, built beside D3D12; D3D12 stays the default. `vulkan-1.dll` is loaded at run time and the optional window is a plain Win32 one. See below. |
 | macOS | **Metal** | `libs/video/rsx_metal_backend.m` | The default. Linked against Metal / QuartzCore / Foundation / AppKit. |
 | macOS (opt-in) | Vulkan | `libs/video/rsx_vulkan_backend.c` | A test path selected for the whole build directory; host, replay and titles use Vulkan. |
 | iOS (Simulator PoC) | Metal in a UIKit `CAMetalLayer` view | `libs/video/rsx_metal_ios_display.m` | Experimental. The app owns UIKit; the RSX backend uses its drawable layer. |
@@ -330,7 +330,8 @@ stencil state. A missing required feature stops initialization with its name.
 
 **On Windows** the backend loads `vulkan-1.dll`, which the GPU driver
 installs. Building needs the Vulkan SDK, for the headers and for glslang and
-SPIRV-Tools, and SDL2, for the window. Both install without administrator
+SPIRV-Tools, and SDL2, for cellPad's controllers (the window is a plain Win32
+one, so this backend does not use SDL2 there). Both install without administrator
 rights through scoop, and both make themselves known to CMake: the SDK sets
 `VULKAN_SDK`, and SDL2 adds itself to `CMAKE_PREFIX_PATH`.
 
@@ -349,6 +350,16 @@ With SDL2 linked, `cellPad` reads controllers through SDL2's game controller
 API, as it does on Linux and macOS: XInput knows Xbox pads only, SDL2 also the
 DualShock 4 and DualSense. `cellAudio` stays on WASAPI.
 
+`ps3recomp_host` is POSIX-only, so `test_vulkan_backend_smoke` covers the
+Windows platform layer: it loads `vulkan-1.dll`, presents a few frames headless
+(or in the Win32 window with `PS3RECOMP_VK_WINDOW=1`), shuts down and comes up
+again.
+
+```bat
+cmake --build build --target test_vulkan_backend_smoke
+build\test_vulkan_backend_smoke.exe
+```
+
 | Environment variable | Effect |
 |---|---|
 | `PS3RECOMP_VK_DEVICE=<n>` | Use physical device *n* instead of the first non-CPU one |
@@ -356,7 +367,7 @@ DualShock 4 and DualSense. `cellAudio` stays on WASAPI.
 | `PS3RECOMP_VK_DUMP_EVERY=<n>` | With a dump: write only every *n*th presented frame (default 1). A full-frame write per present slows a running title noticeably |
 | `PS3RECOMP_VK_DUMP_LIST=<a,b,c>` | With a dump: write exactly those presents (present sequence numbers, at most 32), each to `<path>_s<present_seq>_f<flip_id>.ppm` (`fnone` before the first flip; a trailing `.ppm` on *path* is replaced), as the Metal backend names its `PS3RECOMP_METAL_FRAME_DUMP` files. The sequence is the draw engine's present count; on the fixed-function path, which has none, this backend's own. Beats `_RANGE`; a malformed or longer list is a `config-invalid` stop at start-up |
 | `PS3RECOMP_VK_DUMP_RANGE=<first>-<last>` | With a dump: the same, for every present in the inclusive range |
-| `PS3RECOMP_VK_WINDOW=1` | Also show frames in an SDL2 window; failures continue headless on Linux/Windows, while a macOS Vulkan build fails initialization with the SDL surface reason |
+| `PS3RECOMP_VK_WINDOW=1` | Also show frames in a window (SDL2; a plain Win32 one on Windows), resizable, with F11 or Alt+Enter for borderless full screen; failures continue headless on Linux/Windows, while a macOS Vulkan build fails initialization with the SDL surface reason |
 | `PS3RECOMP_VK_FULLSCREEN=1` | With a window: borderless full screen |
 | `PS3RECOMP_VK_HOLD=<sec>` | With a window: keep the last frame up for that long before exiting |
 

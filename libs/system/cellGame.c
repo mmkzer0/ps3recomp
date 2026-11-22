@@ -376,6 +376,28 @@ const char* cellGame_get_hdd_title_id(void)
     return s_game_type == CELL_GAME_GAMETYPE_HDD && s_title_id[0] ? s_title_id : NULL;
 }
 
+/* Whether the title was started as a game patch (CATEGORY GP over a disc
+ * game). The port boots the title itself, never a patch.
+ *
+ * libsysutil_game (FW 4.93) cellGamePatchCheck(size, reserved): a non-NULL
+ * `reserved` is PARAM (0x8002CB07), tested before anything else. `size` is not
+ * tested up front: the firmware looks at it only once the title is known to be
+ * a patch, to decide whether to write the sizes, so a NULL `size` changes
+ * nothing on a non-patch boot. RPCS3 does not test `reserved`. The non-patch
+ * answer stays the local NOTPATCH: the firmware's static non-patch literal
+ * (0x8002CB06, its INTERNAL value) was only proven on a successful lookup and
+ * the live boot value is unobserved, so that mapping awaits a console probe. */
+s32 cellGamePatchCheck(CellGameContentSize* size, u32 reserved)
+{
+    (void)size;
+    if (reserved) {
+        printf("[cellGame] PatchCheck(reserved=0x%X) -> PARAM\n", reserved);
+        return CELL_GAME_ERROR_PARAM;
+    }
+    printf("[cellGame] PatchCheck() -> not a patch\n");
+    return CELL_GAME_ERROR_NOTPATCH;
+}
+
 s32 cellGameBootCheck(u32* type, u32* attributes, CellGameContentSize* size,
                        char* dirName)
 {
@@ -500,20 +522,6 @@ s32 cellGameDataCheck(u32 type, const char* dirName, CellGameContentSize* size)
     if (size_ea)
         vm_write32(size_ea + 4, 0);   /* sizeKB = 0 (no data yet) */
     return CELL_GAME_RET_NONE;
-}
-
-/* cellGamePatchCheck (AM-11): a title asks whether it was booted as a patch of
- * another game. This runtime has no patch boot mode -- a title boots as a disc
- * or HDD game -- so the answer is NOTPATCH, which is also what a console answers
- * a non-patch boot. It was unimplemented before, which made it an unresolved NID
- * that returned CELL_OK, and CELL_OK here tells the title it IS a patch and has
- * a patch content size to read. `size` (written only on a patch boot) and the
- * reserved argument are validated first, as the firmware does. No environment
- * switch: if patch boots are ever supported it is a boot property, not a flag. */
-s32 cellGamePatchCheck(CellGameContentSize* size, void* reserved)
-{
-    if (reserved || !size) return CELL_GAME_ERROR_PARAM;
-    return CELL_GAME_ERROR_NOTPATCH;
 }
 
 /* cellGameDataCheckCreate2 (NID 0xC9645C41) -- check/prepare game data, invoking the
@@ -800,9 +808,13 @@ s32 cellGameCreateGameData(CellGameSetInitParams* init, char* tmp_contentInfoPat
 
 s32 cellGameDeleteGameData(const char* dirName)
 {
-    printf("[cellGame] DeleteGameData(dir='%s')\n", dirName ? dirName : "<null>");
+    uintptr_t raw = (uintptr_t)dirName;
+    const char* host_dir = (raw && raw < 0x100000000ull && vm_base)
+        ? (const char*)(vm_base + (uint32_t)raw)
+        : dirName;
+    printf("[cellGame] DeleteGameData(dir='%s')\n", host_dir ? host_dir : "<null>");
 
-    if (!dirName)
+    if (!raw)
         return CELL_GAME_ERROR_PARAM;
 
     /* We won't recursively delete host directories for safety.

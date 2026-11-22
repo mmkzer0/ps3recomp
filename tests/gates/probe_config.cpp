@@ -44,6 +44,10 @@ static void print_options()
             std::printf("%s", ps3_cfg_ppu_poll_sleep_coalesce() ? "true" : "false");
         else if (!std::strcmp(o->section, "ppu") && !std::strcmp(o->key, "poll_sleep_spin_us"))
             std::printf("%u", ps3_cfg_ppu_poll_sleep_spin_us());
+        else if (!std::strcmp(o->section, "ppu") && !std::strcmp(o->key, "usleep_spin_us"))
+            std::printf("%u", ps3_cfg_ppu_usleep_spin_us());
+        else if (!std::strcmp(o->section, "ppu") && !std::strcmp(o->key, "usleep_hires_wait_us"))
+            std::printf("%u", ps3_cfg_ppu_usleep_hires_wait_us());
         else if (!std::strcmp(o->section, "ppu") && !std::strcmp(o->key, "host_stack_mb"))
             std::printf("%u", ps3_cfg_ppu_host_stack_mb());
         else if (!std::strcmp(o->section, "spu") && !std::strcmp(o->key, "host_stack_mb"))
@@ -70,6 +74,10 @@ static void print_options()
             std::printf("\"%s\"", ps3_cfg_spu_xdiff_on_latent());
         else if (!std::strcmp(o->section, "spu") && !std::strcmp(o->key, "xdiff_budget"))
             std::printf("%u", ps3_cfg_spu_xdiff_budget());
+        else if (!std::strcmp(o->section, "spurs") && !std::strcmp(o->key, "real_admission"))
+            std::printf("%s", ps3_cfg_spurs_real_admission() ? "true" : "false");
+        else if (!std::strcmp(o->section, "spurs") && !std::strcmp(o->key, "shutdown_wait_ms"))
+            std::printf("%u", ps3_cfg_spurs_shutdown_wait_ms());
         else if (!std::strcmp(o->section, "gcm") && !std::strcmp(o->key, "wait_timeout_ms"))
             std::printf("%u", ps3_cfg_gcm_wait_timeout_ms());
         else if (!std::strcmp(o->section, "gcm") && !std::strcmp(o->key, "park_resync"))

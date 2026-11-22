@@ -39,6 +39,11 @@ uint64_t ppu_timebase_now(void);
  * the thread state is the same on both paths. 0 on every other host. */
 uint64_t sys_timer_usleep_precise_count(void);
 
+/* The guest's system time in microseconds: what sys_time_get_system_time
+ * returns. Every guest-visible time stamp that a title subtracts from it
+ * (cellGcmGetLastFlipTime) must come from this same clock. */
+uint64_t ps3_system_time_us(void);
+
 #ifndef _WIN32
 /* Sleep `ns` on the host for a runtime thread that keeps a cadence. On macOS
  * it takes the critical timer under the same rule as sys_timer_usleep

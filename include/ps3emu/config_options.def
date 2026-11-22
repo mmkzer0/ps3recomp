@@ -111,6 +111,20 @@ PS3_CFG_U32(ppu, poll_sleep_spin_us, 100, 0, 2000,
     "100). 0 is a pure sleep. The wake latency of a small core is not measured: raise it there. Read "
     "once, at the first sleep.")
 
+PS3_CFG_U32(ppu, usleep_spin_us, 0, 0, 100000,
+    "POSIX hosts: a guest usleep shorter than this many microseconds yields (sched_yield) until a "
+    "CLOCK_MONOTONIC deadline instead of calling nanosleep, which returns only after the kernel's timer slack "
+    "plus a wakeup, so a guest that polls a flag with usleep(1..10) sees it tens of microseconds late. Yielding "
+    "keeps the core free for the thread the guest waits on; longer sleeps still nanosleep. 0 (default) is off. "
+    "From upstream #725 (was PS3RECOMP_USLEEP_SPIN_US). Read on every call.")
+
+PS3_CFG_U32(ppu, usleep_hires_wait_us, 0, 0, 1000,
+    "Windows hosts: a sub-millisecond guest usleep of at least this many microseconds waits on a "
+    "high-resolution waitable timer instead of the QPC/SwitchToThread spin, which keeps a logical processor busy "
+    "for the whole sleep; for guests that poll with sleeps of several hundred microseconds and only need to wake "
+    "roughly on time. 0 (default) is off. Sleeps of 1 ms and more already use the ordinary waitable timer. "
+    "Ignored on other hosts. From upstream #628 (was PS3_USLEEP_WAIT_US). Read on every call.")
+
 PS3_CFG_U32(ppu, host_stack_mb, PS3_CFG_PPU_HOST_STACK_MB_DEFAULT, 1, 2048,
     "Host stack, in MiB, reserved for every thread that runs guest PPU code on a host thread of its own: the "
     "guest PPU threads the title creates (not the main thread), the GCM interrupt thread (guest vblank, flip and "
@@ -249,6 +263,22 @@ PS3_CFG_U32(spu, xdiff_budget, 268435456, 1, 4294967295,
     "interpreted instructions for a T0 shadow, backward and cross-function transfers of the "
     "image's budgeted twin for a lifted one. It bounds a loop with no effects, which no "
     "transcript ends. Read once, when the first JobQueue2 queue is created.")
+
+/* ---- spurs -------------------------------------------------------------- */
+
+PS3_CFG_BOOL(spurs, real_admission, 0,
+    "SPURS kernel admission as the real kernel does it: a policy module is admitted only for a ready count "
+    "above the workload's current contention, a signal bit or the workload flag, and the kernel leaves the "
+    "ready count as the guest wrote it. Off (default): a nonzero ready count admits, the kernel consumes one "
+    "ready unit per admission, and idle workloads are probed (spurs idle back-off), so work that arrives "
+    "without a kick is still found. Guest-visible: the ready-count bytes a title reads differ between the "
+    "two. From upstream #711 (was SPURS_IDLE_PROBE=0). Read at every admission decision.")
+
+PS3_CFG_U32(spurs, shutdown_wait_ms, 2000, 1, 600000,
+    "How long cellSpursWaitForWorkloadShutdown waits, in milliseconds, for the running policy modules of a "
+    "shut-down workload to drain; past it the call answers CELL_SPURS_POLICY_MODULE_ERROR_BUSY instead of "
+    "letting the title free memory a policy module still uses. From upstream #711 (was SPURS_SHUTDOWN_MS). "
+    "Read at each wait.")
 
 /* ---- gcm ---------------------------------------------------------------- */
 
@@ -579,6 +609,7 @@ PS3_CFG_LEGACY_ENV("PS3RECOMP_METAL_WINDOW")
 PS3_CFG_LEGACY_ENV("PS3RECOMP_MSL_CACHE")
 PS3_CFG_LEGACY_ENV("PS3RECOMP_MSL_FAST")
 PS3_CFG_LEGACY_ENV("PS3RECOMP_MSL_INVARIANT")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_OSK_INITIAL_TEXT")
 PS3_CFG_LEGACY_ENV("PS3RECOMP_RSX_ENGINE")
 PS3_CFG_LEGACY_ENV("PS3RECOMP_SPIRV_CACHE")
 PS3_CFG_LEGACY_ENV("PS3RECOMP_VK_DEVICE")
@@ -591,6 +622,16 @@ PS3_CFG_LEGACY_ENV("PS3RECOMP_VK_GUEST_PROGRAMS")
 PS3_CFG_LEGACY_ENV("PS3RECOMP_VK_HOLD")
 PS3_CFG_LEGACY_ENV("PS3RECOMP_VK_MRT_MASK")
 PS3_CFG_LEGACY_ENV("PS3RECOMP_VK_WINDOW")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_RSX_PRESENT_THREAD")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_RSX_PRESENT_THREAD_DEPTH")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_RSX_PRESENT_THREAD_REPORT_S")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_RSX_RELEASE_LINE_WAKE")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_SPU_PUT_WATCH")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_SPURS_STORE_WAKE")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_SPURS_WORKER_WAKE")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_VM_PRESERVE_POOL_MB")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_VM_WRITE_WATCH")
+PS3_CFG_LEGACY_ENV("PS3RECOMP_VM_WRITE_WATCH_STRICT")
 PS3_CFG_LEGACY_ENV("PS3RECOMP_WINDOW_STATE")
 /* tool-side (tools/): exported in the same shells that run a title */
 PS3_CFG_LEGACY_ENV("PS3RECOMP_DIR")

@@ -174,8 +174,18 @@ static u32 stub_surface_view(void* u, u32 surface, u32 remap, u32 fmt)
 static u32 stub_depth_create(void* u, u32 w, u32 h)
 { (void)u; (void)w; (void)h; stub.n_depth_create++; return stub_handle(); }
 
+/* Set by a test: the backend keeps one snapshot texture per depth target and
+ * hands the same handle back, refilled, while it is alive (as the Vulkan
+ * backend does). Otherwise every request returns a new texture. */
+static int g_snapshot_in_place;
+static u32 g_snapshot_kept;
 static u32 stub_depth_snapshot(void* u, u32 d, u32 w, u32 h)
-{ (void)u; (void)d; stub.snapshot_w = w; stub.snapshot_h = h; stub.n_depth_snapshot++; return stub_handle(); }
+{
+    (void)u; (void)d; stub.snapshot_w = w; stub.snapshot_h = h; stub.n_depth_snapshot++;
+    if (g_snapshot_in_place && g_snapshot_kept && stub.alive[g_snapshot_kept]) return g_snapshot_kept;
+    g_snapshot_kept = stub_handle();
+    return g_snapshot_kept;
+}
 
 static u32 stub_pipeline_create(void* u, const char* vs, const char* ps,
                                 const rsx_be_render_state* rs,
@@ -626,6 +636,11 @@ static void test_mrt_set(void)
 }
 
 /* ---- 3. the texture cache ------------------------------------------------ */
+
+#ifdef RSX_TEST_EXPECT_TEXTURE_CACHE
+_Static_assert(RSX_DRAW_ENGINE_TEXTURE_CACHE == RSX_TEST_EXPECT_TEXTURE_CACHE,
+               "the texture cache size given at build time is the one the engine uses");
+#endif
 
 static void test_texture_cache(void)
 {
@@ -1364,6 +1379,57 @@ static void test_scissor(void)
           "a scissor larger than the surface is clipped to it (%ux%u)",
           stub.scissor[2], stub.scissor[3]);
 
+    /* A scissor the game WROTE with a zero width or height is empty and clips
+     * everything. The backend reads a zero rectangle as "no scissor", so the
+     * engine must drop the draw rather than hand it one: a game's empty gauge
+     * fill is a long quad cut down to nothing, and drawn unclipped it ran
+     * across the screen. */
+    int before = stub.n_draw;
+    m(M_SCISSOR_H, (0u << 16) | 100u);
+    m(M_SCISSOR_V, (32u << 16) | 8u);
+    draw_triangle();
+    CHECK(stub.n_draw == before, "a written zero-width scissor draws nothing (%d draws)",
+          stub.n_draw - before);
+
+    before = stub.n_draw;
+    m(M_SCISSOR_H, (64u << 16) | 16u);
+    m(M_SCISSOR_V, (0u << 16) | 8u);
+    draw_triangle();
+    CHECK(stub.n_draw == before, "a written zero-height scissor draws nothing (%d draws)",
+          stub.n_draw - before);
+
+    before = stub.n_draw;
+    m(M_SCISSOR_H, (10u << 16) | 300u);   /* wholly right of the 256-wide target */
+    m(M_SCISSOR_V, (32u << 16) | 8u);
+    draw_triangle();
+    CHECK(stub.n_draw == before, "a scissor outside the target draws nothing (%d draws)",
+          stub.n_draw - before);
+
+    before = stub.n_draw;
+    m(M_SCISSOR_H, (64u << 16) | 16u);
+    m(M_SCISSOR_V, (32u << 16) | 8u);
+    draw_triangle();
+    CHECK(stub.n_draw == before + 1 && stub.scissor[2] == 64,
+          "a real scissor after an empty one draws again (%d draws, %u wide)",
+          stub.n_draw - before, stub.scissor[2]);
+    engine_down();
+
+    /* Never written is not empty: the register reads 0 and means no scissor. */
+    engine_up();
+    draw_triangle();
+    CHECK(stub.n_draw == 1 && stub.scissor[2] == 256 && stub.scissor[3] == 256,
+          "a never-written scissor still draws, over the whole surface (%d draws, %ux%u)",
+          stub.n_draw, stub.scissor[2], stub.scissor[3]);
+    engine_down();
+
+    /* One register written with a real size and the other never written: not
+     * an empty scissor, so the draw is kept (and unclipped, as before). */
+    engine_up();
+    m(M_SCISSOR_H, (64u << 16) | 16u);
+    draw_triangle();
+    CHECK(stub.n_draw == 1 && stub.scissor[2] == 256 && stub.scissor[3] == 256,
+          "only the horizontal scissor written, non-empty: still drawn (%d draws, %ux%u)",
+          stub.n_draw, stub.scissor[2], stub.scissor[3]);
     engine_down();
 }
 
@@ -2179,6 +2245,43 @@ static void test_depth_snapshot_release(void)
     engine_down();
 }
 
+/* The same clear, depth pass and read, against a backend that refills one
+ * texture per depth target in place: the handle it returns again is the one
+ * the engine already holds, and it has to stay alive for the draw that
+ * samples it. Releasing the previous snapshot without comparing handles
+ * releases the one just returned, so every second pass samples a released
+ * texture and the next request makes a new one. */
+static void test_depth_snapshot_refilled_in_place(void)
+{
+    printf("-- depth snapshot refilled in place stays alive\n");
+    engine_up();
+    g_snapshot_in_place = 1; g_snapshot_kept = 0;
+    m(M_CONTEXT_DMA_ZETA, DMA_LOCAL);
+    m(M_SURFACE_FORMAT, 8u | (2u << 5));
+    m(M_ZETA_PITCH, 256u * 4u);
+    m(M_COLOR_A_OFFSET, 0x90000u);
+
+    int taken = 0, dead = 0;
+    u32 first = 0;
+    for (int pass = 0; pass < 4; pass++) {
+        depth_pass();
+        const int before = stub.n_depth_snapshot;
+        const u32 snap = sample_depth();
+        if (stub.n_depth_snapshot != before + 1) continue;
+        taken++;
+        if (!first) first = snap;
+        if (!snap || snap != g_snapshot_kept || !stub.alive[snap]) dead++;
+    }
+    CHECK(taken == 4, "each pass after a clear asks for a snapshot (%d of 4)", taken);
+    CHECK(dead == 0, "every pass samples the live refilled snapshot (%d sampled a released one)",
+          dead);
+    CHECK(first && g_snapshot_kept == first && stub.n_released[first] == 0,
+          "one texture serves every pass and is never released (%u, %u, %d release calls)",
+          first, g_snapshot_kept, first ? stub.n_released[first] : -1);
+    g_snapshot_in_place = 0; g_snapshot_kept = 0;
+    engine_down();
+}
+
 /* depth_as_color: the zeta's bytes made on the GPU, no store to guest memory. */
 static int g_argb_calls, g_argb_fail;
 static u32 g_argb_w, g_argb_h, g_argb_fmt;
@@ -2745,6 +2848,14 @@ static void test_clear_rect(void)
     CHECK(g_rect.n_color == 1 && stub.n_clear_color == 1,
           "a scissor outside the surface clears nothing (%d rect, %d whole)",
           g_rect.n_color, stub.n_clear_color);
+
+    /* So does one written empty, and not as a whole-surface clear. */
+    m(M_SCISSOR_H, (0u << 16) | 16u);
+    m(M_SCISSOR_V, 256u << 16);
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    CHECK(g_rect.n_color == 1 && stub.n_clear_color == 1,
+          "a written zero-width scissor clears nothing (%d rect, %d whole)",
+          g_rect.n_color, stub.n_clear_color);
     engine_down();
 
     /* The co-op frame: player 1's view under a left-half scissor, then
@@ -2818,8 +2929,11 @@ static void test_clear_rect(void)
     engine_down();
 }
 
-int main(void)
+/* The (argc, argv) signature is kept for a harness that includes this file with main
+ * renamed and calls it that way (F26). */
+int main(int argc, char** argv)
 {
+    (void)argc; (void)argv;
     vm_base = (u8*)calloc(1, GUEST_BYTES);
     if (!vm_base) { printf("[FAIL] guest memory\n"); return 1; }
     ppu_vm_size = GUEST_BYTES;
@@ -2860,6 +2974,7 @@ int main(void)
     test_antialiased_wpos();
     test_depth_read_as_color();
     test_depth_snapshot_release();
+    test_depth_snapshot_refilled_in_place();
     test_depth_read_as_argb_on_gpu();
     test_z16_read_as_depth16_on_gpu();
     test_full_tables_evict_the_oldest();

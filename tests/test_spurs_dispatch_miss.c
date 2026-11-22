@@ -30,6 +30,7 @@
 uint8_t* vm_base;
 uint32_t ppu_vm_size = 0x40000;
 uint32_t g_ww_lo, g_ww_hi, g_barrier_sync_watch;
+void (*g_rsx_main_release_hook)(uint32_t line);   /* libs/video/rsx_commands.c (#729) */
 /* libsre 4.93 gates the context alignment on the SDK version (0x02011B78 asks
  * ps3_process_sdk_version, 0x02011B88/0x02011BD4 pick the mask). The runtime
  * answers from the title's PROC_PARAM; the fixture sets it per mode and starts

@@ -13,7 +13,8 @@
 #include "test_rsx_draw_engine.c"
 #undef main
 
-#define VS_BLOCK_BYTES ((RSX_DSP_NUM_CONSTANTS + 2u) * 16u)
+/* The constants, vp_posscale, vp_posoffset and the point-size row (rsx_vp_decompiler.h). */
+#define VS_BLOCK_BYTES ((RSX_DSP_NUM_CONSTANTS + 3u) * 16u)
 #define M_VP_TRANSLATE 0x0A20u
 #define M_VP_SCALE     0x0A30u
 

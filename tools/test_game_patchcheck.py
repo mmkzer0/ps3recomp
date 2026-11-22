@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and run libs/system/tests/test_game_patchcheck.c (cellGamePatchCheck, AM-11)."""
+"""Build and run libs/system/tests/test_game_patchcheck.c (cellGamePatchCheck argument checks)."""
 import os
 from pathlib import Path
 import subprocess

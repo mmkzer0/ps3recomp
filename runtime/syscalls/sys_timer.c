@@ -24,6 +24,9 @@
 #include <fcntl.h>
 #include <stdatomic.h>
 #endif
+#ifndef _WIN32
+#include <sched.h>    /* sched_yield: the opt-in short-usleep yield */
+#endif
 #include "ps3emu/thread_name.h"
 #ifndef _WIN32
 #include "../platform/host_wait.h"   /* the period wait of the timer thread */
@@ -68,7 +71,7 @@ int lv2_deadline_passed(int64_t deadline)
  * PPU timebase (mftb/mftbu) -- THE guest clock.
  *
  * One global monotonic counter scaled to the PS3 timebase (79.8 MHz),
- * anchored at first use. The old lifter emission was a per-call-site
+ * counted from host boot. The old lifter emission was a per-call-site
  * static that advanced 16667 ticks PER READ -- not a clock at all: every
  * guest timing loop (media pacers, throttles, profilers) computed garbage
  * from it, and each call site had a PRIVATE counter that only moved when
@@ -78,12 +81,14 @@ int lv2_deadline_passed(int64_t deadline)
 uint64_t ppu_timebase_now(void)
 {
 #ifdef _WIN32
-    static LONGLONG t0 = 0;
+    /* Counted from HOST boot, as the PS3 timebase counts from console boot
+     * and as the POSIX path below does. A per-process anchor made every
+     * launch start at 0, so the upper word read 0 for the first ~54 s and
+     * clock-derived seeds repeated run to run. */
     ensure_qpc_init();
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
-    if (!t0) t0 = now.QuadPart;   /* benign race: same anchor either way */
-    uint64_t d = (uint64_t)(now.QuadPart - t0);
+    uint64_t d = (uint64_t)now.QuadPart;
     uint64_t q = (uint64_t)s_qpc_freq.QuadPart;
     return (d / q) * PS3_TIMEBASE_FREQ + (d % q) * PS3_TIMEBASE_FREQ / q;
 #else
@@ -93,6 +98,27 @@ uint64_t ppu_timebase_now(void)
 #endif
 }
 
+/* Microseconds of guest system time (sys_time_get_system_time), counted from
+ * host boot on every host. cellGcmGetLastFlipTime stamps flips with it too:
+ * titles pace frames as period - (system time - last flip time), so the two
+ * must share clock and unit (the flip stamp used to be absolute QPC
+ * nanoseconds, which made that difference meaningless and every such limiter
+ * sleep its whole period). */
+uint64_t ps3_system_time_us(void)
+{
+#ifdef _WIN32
+    /* Time since host boot (#788), as on POSIX: anchoring at the first call
+     * gave every launch the same small values and so the same RNG seeds. */
+    ensure_qpc_init();
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    uint64_t d = (uint64_t)now.QuadPart;
+    uint64_t q = (uint64_t)s_qpc_freq.QuadPart;
+    return (d / q) * 1000000ull + (d % q) * 1000000ull / q;
+#else
+    return host_monotonic_ns() / 1000ull;
+#endif
+}
 
 static void write_be32(uint32_t addr, uint32_t val)
 {
@@ -712,7 +738,32 @@ int64_t sys_timer_usleep(ppu_context* ctx)
          * and busy-spins at full speed (so the wait is effectively a no-op).
          * Busy-wait to a precise QPC deadline, yielding inside the spin
          * (SwitchToThread) so a sibling host thread the guest may be waiting on
-         * still gets the core. Mirrors RPCS3's "Usleep Only" TSC busy-tail. */
+         * still gets the core. Mirrors RPCS3's "Usleep Only" TSC busy-tail.
+         *
+         * ppu.usleep_hires_wait_us (default 0, off): a sub-millisecond sleep
+         * of at least that many us waits on a high-resolution waitable timer
+         * instead. The spin keeps a logical processor busy for the whole
+         * sleep, and a thread that polls with ~800 us sleeps holds one all
+         * the time; such a poller only needs to wake roughly on time. The
+         * millisecond branch above keeps the ordinary waitable timer. */
+        const uint32_t wait_us = ps3_cfg_ppu_usleep_hires_wait_us();
+        if (wait_us > 0 && usec >= (uint64_t)wait_us) {
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+            static __declspec(thread) HANDLE t_timer;
+            if (!t_timer)
+                t_timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                                 TIMER_ALL_ACCESS);
+            if (t_timer) {
+                LARGE_INTEGER due;
+                due.QuadPart = -((LONGLONG)usec * 10);
+                if (SetWaitableTimer(t_timer, &due, 0, NULL, NULL, FALSE)) {
+                    WaitForSingleObject(t_timer, INFINITE);
+                    return CELL_OK;
+                }
+            }
+        }
         ensure_qpc_init();
         LARGE_INTEGER qpc_start, qpc_now;
         QueryPerformanceCounter(&qpc_start);
@@ -724,7 +775,27 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         } while (qpc_now.QuadPart < qpc_deadline);
     }
 #else
-    if (usec > 0) {
+    /* ppu.usleep_spin_us (default 0, off): a usleep shorter than that many
+     * microseconds yields to a CLOCK_MONOTONIC deadline instead of calling
+     * nanosleep, as the Windows branch above does for every sub-millisecond
+     * wait. Guests commonly poll a flag with usleep(1..10); a nanosleep that
+     * short returns only after the kernel's timer slack (50 us by default on
+     * Linux) plus a wakeup, so each poll sees the flag tens of microseconds
+     * late. Yielding keeps the core available to the sibling thread the guest
+     * is waiting on. Longer sleeps still nanosleep. CLOCK_MONOTONIC, not
+     * host_monotonic_ns: the wait is relative and must elapse while the guest
+     * clock is paused. */
+    const uint32_t spin_us = ps3_cfg_ppu_usleep_spin_us();
+    if (usec > 0 && usec < (uint64_t)spin_us) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        const uint64_t deadline = (uint64_t)now.tv_sec * 1000000000ull +
+                                  (uint64_t)now.tv_nsec + usec * 1000ull;
+        do {
+            sched_yield();
+            clock_gettime(CLOCK_MONOTONIC, &now);
+        } while ((uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec < deadline);
+    } else if (usec > 0) {
         struct timespec ts;
         ts.tv_sec  = (time_t)(usec / 1000000);
         ts.tv_nsec = (long)((usec % 1000000) * 1000);
@@ -935,12 +1006,16 @@ static void timer_send_event(sys_timer_info* t)
     if (t->event_queue_id <= 0 || t->event_queue_id > SYS_EVENT_QUEUE_MAX)
         return;
 
-    /* Queue admission pins the slot before advancing the expiration, so a
-     * destroy racing this periodic callback cannot reuse its native lock. */
-    extern int sys_event_queue_push_periodic_by_id(uint32_t queue_id, uint64_t source,
-                                                   uint64_t data1, uint64_t data2,
-                                                   uint64_t* next_expire,
-                                                   uint64_t period_usec);
+    /* lv2 (and RPCS3) deliver the connect's data1/data2 and, in data3, the
+     * EXPIRATION TIME -- which advances every period. It was 0 here, so a
+     * consumer that paces itself by the delta between ticks saw no time pass:
+     * Twisted Metal's BoomRangBuss audio driver wakes on this timer, derives
+     * how many blocks to service from data3, and serviced none, ever -- so
+     * brb_StartSession timed out and every later BRB request hung.
+     *
+     * Queue admission pins the slot before advancing the expiration (and a full
+     * queue drops the event): a destroy racing this periodic callback must not
+     * reuse the queue's native lock. */
     (void)sys_event_queue_push_periodic_by_id((uint32_t)t->event_queue_id, t->source,
                                                t->data1, t->data2, &t->next_expire,
                                                t->period_usec);

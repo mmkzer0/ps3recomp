@@ -15,6 +15,7 @@
 #include <assert.h>
 #include <sys/mman.h>
 #include <time.h>
+int64_t lv2_syscall_unimplemented(ppu_context* ctx) { (void)ctx; return (int64_t)(int32_t)CELL_ENOSYS; }   /* lv2_register.c */
 
 uint8_t* vm_base;
 uint32_t ppu_vm_size;

@@ -1011,7 +1011,7 @@ class TestDryRun(unittest.TestCase):
         self.assertEqual(len(done), 5)                            # the cflts@2 entry stops (call 0 of its first chunk holds a lane at sh >= 264).
         self.assertEqual(len(faults), 1)
         self.assertTrue(faults[0].startswith("LANES_FAULT,cflts@2,w32,0,0,"), faults)
-        self.assertIn("unmodelled cflts/cfltu lane (cflts I8=2 lane=1 in=0xFBAD11B4, #126)", p.stderr)   # the stop names op, scale, lane and word
+        self.assertIn("unmodelled cflts/cfltu lane (cflts I8=2 lane=1 in=0xFBAD11B4)", p.stderr)   # the stop names op, scale, lane and word
         self.assertEqual(sum(l.startswith("LANE,") for l in lines), 564)  # its 100 calls stop before a 64-row chunk commits.
         self.assertIn("META,lanes,6", lines)
         rc, text = run_lanes_compare(out)
@@ -1057,7 +1057,7 @@ class TestDryRun(unittest.TestCase):
         self.assertEqual(len(faults), 1, lines)
         self.assertTrue(faults[0].startswith("LANES_FAULT,cflts@14,w32,0,0,"), faults)
         self.assertEqual(sum(l.startswith("LANE,cflts@14,") for l in lines), 0)
-        self.assertIn("unmodelled cflts/cfltu lane (cflts I8=14 lane=3 in=0xFFABDE3D, #126)", p.stderr)
+        self.assertIn("unmodelled cflts/cfltu lane (cflts I8=14 lane=3 in=0xFFABDE3D)", p.stderr)
         self.assertNotIn("cfltu I8=14", p.stderr)
         rc, text = run_lanes_compare(out)
         self.assertEqual(rc, 0, text)

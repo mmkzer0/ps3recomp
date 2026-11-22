@@ -110,8 +110,10 @@ static void memory_out_span(const char* func, const char* arg, uint32_t ea, uint
 }
 
 /* sys_memory_allocate and sys_memory_allocate_from_container share this. cid 0
- * is the process's main pool; a container's allocations are also charged to
- * that container (its used_size), checked against its total. */
+ * is the process's main pool. A container's memory already came out of that
+ * pool when it was created, so its allocations are charged to the container
+ * alone (its used_size), checked against its total. The container is looked at
+ * under the allocator lock: sys_memory_container_destroy retires it there. */
 static int64_t memory_allocate(const char* func, uint64_t requested, uint32_t flags, uint32_t cid, uint32_t addr_out)
 {
     uint32_t alignment = (flags & SYS_MEMORY_PAGE_SIZE_1M) ? 0x100000u : 0x10000u;
@@ -121,15 +123,13 @@ static int64_t memory_allocate(const char* func, uint64_t requested, uint32_t fl
     uint32_t size = (uint32_t)rounded;
     if (addr_out) memory_out_span(func, "addr", addr_out, 4);
     bump_lock();
-    if (size > SYS_MEM_USER_TOTAL - s_total_allocated) {
-        bump_unlock(); return (int64_t)(int32_t)CELL_ENOMEM;
+    sys_mem_container_info* ct = cid ? &g_sys_mem_containers[cid - 1] : NULL;
+    if (ct && !ct->active) {
+        bump_unlock(); return (int64_t)(int32_t)CELL_ESRCH;
     }
-    sys_mem_container_info* ct = NULL;
-    if (cid) {
-        ct = &g_sys_mem_containers[cid - 1];
-        if (size > ct->total_size - ct->used_size) {
-            bump_unlock(); return (int64_t)(int32_t)CELL_ENOMEM;
-        }
+    if (ct ? size > ct->total_size - ct->used_size
+           : size > SYS_MEM_USER_TOTAL - s_total_allocated) {
+        bump_unlock(); return (int64_t)(int32_t)CELL_ENOMEM;
     }
     int slot = -1;
     for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; ++i)
@@ -142,8 +142,8 @@ static int64_t memory_allocate(const char* func, uint64_t requested, uint32_t fl
     sys_mem_alloc_info* a = &g_sys_mem_allocs[slot];
     a->active = 1; a->addr = addr; a->size = size;
     a->container_id = (int32_t)cid; a->page_size = alignment;
-    s_total_allocated += size;
     if (ct) ct->used_size += size;
+    else    s_total_allocated += size;
     if (addr + size > g_sys_mem_bump_ptr) g_sys_mem_bump_ptr = addr + size;
     bump_unlock();
     PS3_LOG(PS3_LOG_INFO, "sys_memory", "allocate(size=0x%X, flags=0x%X, cid=%u) -> 0x%08X\n", size, flags, cid, addr);
@@ -171,7 +171,7 @@ int64_t sys_memory_allocate_from_container(ppu_context* ctx)
     uint32_t cid = LV2_ARG_U32(ctx, 1);
     if (cid == SYS_MEMORY_CONTAINER_DEFAULT)
         return memory_allocate("sys_memory_allocate_from_container", LV2_ARG_U64(ctx, 0), LV2_ARG_U32(ctx, 2), 0, LV2_ARG_PTR(ctx, 3));
-    if (cid == 0 || cid > SYS_MEMORY_CONTAINER_MAX || !g_sys_mem_containers[cid - 1].active)
+    if (cid == 0 || cid > SYS_MEMORY_CONTAINER_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
     return memory_allocate("sys_memory_allocate_from_container", LV2_ARG_U64(ctx, 0), LV2_ARG_U32(ctx, 2), cid, LV2_ARG_PTR(ctx, 3));
 }
@@ -187,10 +187,13 @@ int64_t sys_memory_free(ppu_context* ctx)
     bump_lock();
     for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; i++) {
         if (g_sys_mem_allocs[i].active && g_sys_mem_allocs[i].addr == addr) {
-            s_total_allocated -= g_sys_mem_allocs[i].size;
+            /* The container is still active: one with live allocations
+             * cannot be destroyed. */
             const int32_t cid = g_sys_mem_allocs[i].container_id;
-            if (cid > 0 && cid <= SYS_MEMORY_CONTAINER_MAX && g_sys_mem_containers[cid - 1].active)
+            if (cid > 0 && cid <= SYS_MEMORY_CONTAINER_MAX)
                 g_sys_mem_containers[cid - 1].used_size -= g_sys_mem_allocs[i].size;
+            else
+                s_total_allocated -= g_sys_mem_allocs[i].size;
             g_sys_mem_allocs[i].active = 0;
             bump_unlock(); return CELL_OK;
         }
@@ -211,7 +214,9 @@ int64_t sys_memory_get_user_memory_size(ppu_context* ctx)
     PS3_LOG(PS3_LOG_INFO, "sys_memory", "get_user_memory_size()\n");
     if (out_addr != 0) {
         uint32_t total = SYS_MEM_USER_TOTAL;
+        bump_lock();
         uint32_t avail = total - s_total_allocated;
+        bump_unlock();
         write_be32(out_addr + 0, total);
         write_be32(out_addr + 4, avail);
     }
@@ -267,24 +272,36 @@ int64_t sys_memory_get_page_attribute(ppu_context* ctx)
  *
  * r3 = pointer to receive container ID (u32*)
  * r4 = size
+ *
+ * The container's memory is taken out of the default pool here, as LV2 does:
+ * what the title reads back as the default pool's free size drops by it, and
+ * the pool answers ENOMEM when it does not have that much left.
  * -----------------------------------------------------------------------*/
 int64_t sys_memory_container_create(ppu_context* ctx)
 {
     uint32_t id_out_addr = LV2_ARG_PTR(ctx, 0);
     uint32_t size        = LV2_ARG_U32(ctx, 1);
 
+    /* Before the lock: a stop must not leave the allocator lock held. */
+    if (id_out_addr != 0) memory_out_span("sys_memory_container_create", "cid", id_out_addr, 4);
+    bump_lock();
     int slot = -1;
     for (int i = 0; i < SYS_MEMORY_CONTAINER_MAX; i++) {
         if (!g_sys_mem_containers[i].active) { slot = i; break; }
     }
-    if (slot < 0)
-        return (int64_t)(int32_t)CELL_EAGAIN;
+    if (slot < 0) {
+        bump_unlock(); return (int64_t)(int32_t)CELL_EAGAIN;
+    }
+    if (size > SYS_MEM_USER_TOTAL - s_total_allocated) {
+        bump_unlock(); return (int64_t)(int32_t)CELL_ENOMEM;
+    }
 
-    if (id_out_addr != 0) memory_out_span("sys_memory_container_create", "cid", id_out_addr, 4);
     sys_mem_container_info* c = &g_sys_mem_containers[slot];
     c->active     = 1;
     c->total_size = size;
     c->used_size  = 0;
+    s_total_allocated += size;
+    bump_unlock();
 
     uint32_t container_id = (uint32_t)(slot + 1);
     if (id_out_addr != 0) {
@@ -298,6 +315,10 @@ int64_t sys_memory_container_create(ppu_context* ctx)
  * sys_memory_container_destroy
  *
  * r3 = container_id
+ *
+ * EBUSY while anything is still allocated in it, as on LV2: the slot would be
+ * reused, and freeing that allocation later would charge the new container.
+ * Otherwise its memory goes back to the default pool.
  * -----------------------------------------------------------------------*/
 int64_t sys_memory_container_destroy(ppu_context* ctx)
 {
@@ -306,11 +327,18 @@ int64_t sys_memory_container_destroy(ppu_context* ctx)
     if (container_id == 0 || container_id > SYS_MEMORY_CONTAINER_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
 
+    bump_lock();
     sys_mem_container_info* c = &g_sys_mem_containers[container_id - 1];
-    if (!c->active)
-        return (int64_t)(int32_t)CELL_ESRCH;
+    if (!c->active) {
+        bump_unlock(); return (int64_t)(int32_t)CELL_ESRCH;
+    }
+    if (c->used_size) {
+        bump_unlock(); return (int64_t)(int32_t)CELL_EBUSY;
+    }
 
     c->active = 0;
+    s_total_allocated -= c->total_size;
+    bump_unlock();
     return CELL_OK;
 }
 
@@ -346,13 +374,17 @@ int64_t sys_memory_container_get_size(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
 
     sys_mem_container_info* c = &g_sys_mem_containers[container_id - 1];
-    if (!c->active)
-        return (int64_t)(int32_t)CELL_ESRCH;
+    bump_lock();
+    if (!c->active) {
+        bump_unlock(); return (int64_t)(int32_t)CELL_ESRCH;
+    }
+    const uint32_t total = c->total_size, avail = c->total_size - c->used_size;
+    bump_unlock();
 
     if (out_addr != 0) {
         memory_out_span("sys_memory_container_get_size", "info", out_addr, 8);
-        write_be32(out_addr + 0, c->total_size);
-        write_be32(out_addr + 4, c->total_size - c->used_size);
+        write_be32(out_addr + 0, total);
+        write_be32(out_addr + 4, avail);
     }
 
     return CELL_OK;
