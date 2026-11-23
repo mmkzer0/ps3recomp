@@ -325,6 +325,7 @@ typedef struct vk_state {
 } vk_state;
 
 static vk_state s_vk;
+static atomic_int s_vk_window_drop_pending;   /* static zero-init is a valid atomic 0 (C17 7.17.2.1) */
 /* The capture check consumes this sticky fault bit; submissions never clear it. */
 static atomic_int s_eng_fault = ATOMIC_VAR_INIT(0);
 /* A failed fence wait leaves accepted work potentially in flight. */
@@ -974,7 +975,11 @@ static VkResult vk_queue_present(const VkPresentInfoKHR* pi)
     return r;
 }
 
-static int vk_device_idle(void)
+/* Wait for the queue only. For the window paths (resize, swapchain loss,
+ * window drop): a split presenter runs them while the walker records and
+ * submits, so they must not touch the walker's batch state. A slot left
+ * marked in flight costs one wait on an already-signalled fence. */
+static int vk_queue_idle(void)
 {
     if (!s_vk.device || !pvkDeviceWaitIdle) return 0;
     vk_mutex_lock(&s_vk.queue_mu);
@@ -984,6 +989,16 @@ static int vk_device_idle(void)
         VK_LOG("vkDeviceWaitIdle failed (VkResult %d)\n", (int)r);
         return -1;
     }
+    return 0;
+}
+
+/* Wait for the queue and retire every batch and the fault latch. Only where
+ * the walker cannot submit: on its own thread or once it has stopped. From
+ * another thread a batch submitted after the wait would be marked idle and
+ * its slot reused under the GPU. */
+static int vk_device_idle(void)
+{
+    if (vk_queue_idle()) return -1;
     atomic_store_explicit(&s_eng_submission_pending, 0, memory_order_release);
     vk_eb_device_idled();
     return 0;
@@ -2785,8 +2800,8 @@ static int vk_on_main(void (*fn)(void*), void* arg)
 }
 
 static dispatch_source_t s_vk_pump_timer;    /* main queue only */
-static atomic_int s_vk_main_owned;           /* the timer runs: events and the window's size come from it. Set and
-                                              * cleared on the main queue, read by the walker's pump */
+static atomic_int s_vk_main_owned;           /* The main-queue timer owns SDL event/view access. Keep this set
+                                              * through teardown; the next init resets it before opening a window. */
 static atomic_int s_vk_main_events;          /* VK_EV_* bits the timer saw and the pump has not taken */
 static atomic_ullong s_vk_main_view;         /* minimized << 60 | width << 30 | height, as the timer last saw it */
 
@@ -2883,17 +2898,25 @@ static void vk_window_teardown(void* unused)
 static void vk_window_drop(const char* why)
 {
     if (why) VK_LOG("window disabled, continuing headless: %s\n", why);
+    /* The split presenter can be using the swapchain while the walker drains. */
+    vk_mutex_lock(&s_vk.present_mu);
     if (s_vk.device && pvkDeviceWaitIdle) {
-        vk_device_idle();
+        vk_queue_idle();
         for (u32 i = 0; i < 8; i++)
             if (s_vk.sc_done[i]) {
                 pvkDestroySemaphore(s_vk.device, s_vk.sc_done[i], NULL);
                 s_vk.sc_done[i] = VK_NULL_HANDLE;
             }
-        if (s_vk.sem_acquire) pvkDestroySemaphore(s_vk.device, s_vk.sem_acquire, NULL);
+        if (s_vk.sem_acquire) {
+            pvkDestroySemaphore(s_vk.device, s_vk.sem_acquire, NULL);
+            s_vk.sem_acquire = VK_NULL_HANDLE;
+        }
         if (s_vk.swapchain && pvkDestroySwapchainKHR)
             pvkDestroySwapchainKHR(s_vk.device, s_vk.swapchain, NULL);
+        s_vk.swapchain = VK_NULL_HANDLE;
+        s_vk.sc_count = 0;
     }
+    vk_mutex_unlock(&s_vk.present_mu);
 #ifdef _WIN32
     if (s_vk.surface && s_vk.instance && pvkDestroySurfaceKHR)
         pvkDestroySurfaceKHR(s_vk.instance, s_vk.surface, NULL);
@@ -2905,19 +2928,27 @@ static void vk_window_drop(const char* why)
 #else
     /* A window that never came up (the main queue was not served) has nothing to tear down. */
     if ((s_vk.surface || s_vk.window || s_vk.sdl_vulkan_loaded || s_vk.windowed) &&
-        vk_on_main(vk_window_teardown, NULL))
-        VK_LOG("the main thread did not run the window teardown; the window is left to process exit\n");
-#ifdef __APPLE__
-    s_vk_main_owned = 0;
+        vk_on_main(vk_window_teardown, NULL)) {
+        VK_LOG("the main thread did not run the window teardown; preserving it for a later shutdown retry\n");
+        return;     /* Preserve ownership so a later shutdown can retry on the main queue. */
+    }
 #endif
-#endif
+    vk_mutex_lock(&s_vk.present_mu);
     s_vk.window = NULL;
     s_vk.surface = VK_NULL_HANDLE;
     s_vk.swapchain = VK_NULL_HANDLE;
     s_vk.sem_acquire = VK_NULL_HANDLE;
     s_vk.sc_count = 0;
     s_vk.windowed = 0;
+    vk_mutex_unlock(&s_vk.present_mu);
 }
+static int vk_window_drop_requested(void)
+{
+    if (!atomic_exchange_explicit(&s_vk_window_drop_pending, 0, memory_order_acq_rel)) return 0;
+    vk_window_drop("the swapchain could not be recreated");
+    return 1;
+}
+
 
 static int vk_window_fail(const char* why)
 {
@@ -2932,7 +2963,7 @@ static int vk_window_fail(const char* why)
 }
 
 #ifdef _WIN32
-static int s_vk_resized;   /* defined here on Windows: the window procedure sets it */
+static atomic_int s_vk_resized;   /* defined here on Windows: the window procedure sets it */
 
 /* Borderless fullscreen on the window's monitor, and back to the placement
  * the window had. */
@@ -2960,7 +2991,7 @@ static void vk_window_set_fullscreen(int on)
         ShowCursor(TRUE);
     }
     s_vk.fullscreen = on;
-    s_vk_resized = 1;
+    atomic_store_explicit(&s_vk_resized, 1, memory_order_release);
     /* The swapchain is recreated before the next acquire: the image on screen is stale, so the
      * draw engine's next host present must re-blit it (#144) rather than skip it as a duplicate. */
     rsx_draw_engine_require_represent();
@@ -2973,7 +3004,7 @@ static LRESULT CALLBACK vk_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         s_vk.window_closed = 1;
         return 0;   /* vk_window_drop destroys it on the backend's own terms */
     case WM_SIZE:
-        s_vk_resized = 1;
+        atomic_store_explicit(&s_vk_resized, 1, memory_order_release);
         rsx_draw_engine_require_represent();   /* resize: the next host present must re-blit (#144) */
         return 0;
     case WM_GETMINMAXINFO: {
@@ -3265,7 +3296,7 @@ static int vk_create_swapchain(void)
 /* The window changed size (or fullscreen state) since the swapchain was made: it is recreated before the next acquire.
  * Also set while the window is minimized, when there is no drawable area to make one for. */
 #ifndef _WIN32
-static int s_vk_resized;
+static atomic_int s_vk_resized;
 #endif
 
 /* Minimized, or no drawable area: nothing can be presented, and a swapchain cannot be created for it. */
@@ -3278,11 +3309,19 @@ static int vk_window_hidden(void)
 
 static void vk_swapchain_lost(void)
 {
-    if (vk_window_hidden()) { s_vk_resized = 1; return; }   /* recreated once it is shown again */
-    vk_device_idle();
+    (void)atomic_exchange_explicit(&s_vk_resized, 0, memory_order_acq_rel);
+    if (vk_window_hidden()) {
+        atomic_store_explicit(&s_vk_resized, 1, memory_order_release);
+        return;                 /* recreated once it is shown again */
+    }
+    vk_queue_idle();
     const int r = vk_create_swapchain();
-    s_vk_resized = r > 0;     /* the surface is 0x0 before SDL reports the window minimized */
-    if (r < 0) vk_window_drop("the swapchain could not be recreated");
+    if (r > 0) atomic_store_explicit(&s_vk_resized, 1, memory_order_release);
+    if (r < 0) {
+        atomic_store_explicit(&s_vk_resized, 1, memory_order_release);
+        /* Torn down by the window's own thread (rsx_vulkan_backend_pump_messages); no present uses it meanwhile. */
+        atomic_store_explicit(&s_vk_window_drop_pending, 1, memory_order_release);
+    }
     /* A fresh swapchain has no picture on screen: the draw engine's next host present must re-blit it
      * (#144) rather than skip it as a duplicate of the flip the head already showed. */
     if (r == 0) rsx_draw_engine_require_represent();
@@ -3311,10 +3350,11 @@ static vk_rect vk_window_fit(void)
 static void vk_present_window(void)
 {
     if (!s_vk.windowed || !s_vk.swapchain) return;
+    if (atomic_load_explicit(&s_vk_window_drop_pending, memory_order_acquire)) return;
     if (vk_window_hidden()) return;
-    if (s_vk_resized) {
+    if (atomic_load_explicit(&s_vk_resized, memory_order_acquire)) {
         vk_swapchain_lost();
-        if (!s_vk.windowed || s_vk_resized) return;
+        if (!s_vk.windowed || atomic_load_explicit(&s_vk_resized, memory_order_acquire)) return;
     }
 
     u32 idx = 0;
@@ -6139,6 +6179,14 @@ void rsx_vulkan_backend_test_fail_next_engine_submissions(u32 count)
 
 int rsx_vulkan_backend_init(u32 width, u32 height, const char* title)
 {
+    if (s_vk.device || s_vk.instance || s_vk.windowed || s_vk.window || s_vk.surface) {
+        VK_LOG("init refused: a previous backend shutdown did not finish its window teardown\n");
+        return -1;
+    }
+    atomic_store_explicit(&s_vk_window_drop_pending, 0, memory_order_relaxed);
+#ifdef __APPLE__
+    atomic_store_explicit(&s_vk_main_owned, 0, memory_order_relaxed);
+#endif
     memset(&s_stat, 0, sizeof s_stat);
     atomic_store_explicit(&s_eng_fault, 0, memory_order_relaxed);
     atomic_store_explicit(&s_eng_submission_pending, 0, memory_order_relaxed);
@@ -6196,7 +6244,12 @@ void rsx_vulkan_backend_shutdown(void)
             vk_present_window();         /* FIFO: paced by the display */
         }
     }
-    if (s_vk.windowed || s_vk.window) vk_window_drop(NULL);
+    if (!vk_window_drop_requested() && (s_vk.windowed || s_vk.window || s_vk.surface))
+        vk_window_drop(NULL);
+    if (s_vk.windowed || s_vk.window || s_vk.surface) {
+        VK_LOG("shutdown deferred: window teardown still belongs to the main thread\n");
+        return;
+    }
     if (s_vk.device) {
         vk_device_idle();
         gt_report_final();
@@ -6244,6 +6297,9 @@ void rsx_vulkan_backend_shutdown(void)
 int rsx_vulkan_backend_pump_messages(void)
 {
     if (!s_vk.windowed) return 0;
+    /* Here rather than on the presenting thread: the window belongs to this one (DestroyWindow fails on any
+     * other, and SDL's video calls are the video thread's), and so do the window fields read above. */
+    if (vk_window_drop_requested()) return 0;
 #ifdef _WIN32
     /* The message queue belongs to the thread that created the window: the
      * host pumps from that thread, as for the D3D12 backend. */
@@ -6264,7 +6320,7 @@ int rsx_vulkan_backend_pump_messages(void)
 #endif
     ev = vk_poll_events();
     if (ev & VK_EV_RESIZED) {
-        s_vk_resized = 1;
+        atomic_store_explicit(&s_vk_resized, 1, memory_order_release);
         /* The swapchain is recreated before the next acquire: the image on screen is stale, so the
          * draw engine's next host present must re-blit it (#144) rather than skip it as a duplicate. */
         rsx_draw_engine_require_represent();

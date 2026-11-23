@@ -81,7 +81,9 @@ void rsx_vulkan_backend_shutdown(void);
  * Win32 message queue of the thread that called init); -1 once the
  * window has been closed or Esc pressed. On macOS, when init ran off the
  * main thread, a timer on the main queue drains SDL's queue and this only
- * reports what that saw, so it may be called from the init thread. */
+ * reports what that saw, so it may be called from the init thread. A window
+ * whose swapchain could not be recreated is torn down here, on the window's
+ * thread, never by a present: until then presents skip it. */
 int  rsx_vulkan_backend_pump_messages(void);
 
 /* Read the frame back to host memory (and to PS3RECOMP_VK_DUMP if set), and
