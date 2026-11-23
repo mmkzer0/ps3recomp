@@ -1787,7 +1787,20 @@ int main(int argc, char** argv)
     printf("[host] gcm context data @ 0x%08X\n", cdata);
     cellGcmSetDisplayBuffer(0, 0, 1280 * 4, 1280, 720);
 
-    guest_w32(CTRL_ADDR + 4, 0);            /* get: start of ring */
+    /* Write where the RSX starts reading, as a title does: at the context's
+     * `current` (CellGcmContextData +8). cellGcmSetupContext lays the IO
+     * window out as the firmware's InitBody does, with the command buffer
+     * 0x1000 bytes in; a ring written from offset 0 sat behind `get`, so the
+     * first frame's commands were never walked. */
+    const u32 ring_start = guest_r32(cdata + 8);
+    if (ring_start < IO_ADDR || ring_start - IO_ADDR >= CMD_SIZE / 2u) {
+        fprintf(stderr, "[host] context current 0x%08X is outside the command buffer\n", ring_start);
+        host_backend_shutdown();
+        free(vm_base);
+        return 1;
+    }
+    g_fifo_len = ring_start - IO_ADDR;
+    guest_w32(CTRL_ADDR + 4, g_fifo_len);   /* get: start of ring */
     if (io_alias) {
         const u32 out = host_alloc(4, 4);
         cellGcmAddressToOffset(0xC0000000u + TEX_OFFSET, (u32*)(uintptr_t)out);
