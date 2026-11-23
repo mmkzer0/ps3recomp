@@ -5663,9 +5663,11 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     const u32 vsb = s_e2.vs_bytes ? s_e2.vs_bytes : 16u, psb = s_e2.ps_bytes ? s_e2.ps_bytes : 16u;
     int batched = vk_eb_on() && vbytes <= VK_EB_SLICE(VK_EB_VB_BYTES) && ibytes <= VK_EB_SLICE(VK_EB_IB_BYTES);
     /* The unbound-unit dummies are made on first use, which submits and may flush a batch: before any
-     * slice, and before either path records. */
-    if (P->cube_mask && !vk_eng_dummy_cube_view()) return;
+     * slice, and before either path records. The 2D one first: making the cube one then flushes the 2D
+     * upload, and the cube's own upload lands in this draw's batch, so --cube-unbound reaches the cube's
+     * barrier below as --unbound reaches the 2D one's. */
     if (!vk_eng_dummy_2d_view()) return;
+    if (P->cube_mask && !vk_eng_dummy_cube_view()) return;
     /* The slot this draw records into must be free of GPU work before a slice or a set is taken from it. */
     if (batched && vk_eb_acquire()) return;
     if (batched) {
@@ -5721,6 +5723,14 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     }
     /* This command buffer begins ordered after everything submitted before it (vk_begin, vk_eb_begin); what is
      * left is its own earlier work. The images this draw samples first, then the ones it writes. */
+    /* The descriptor writer binds these dummies for unbound and mismatched units. Their first upload can still
+     * be in this batch, so order its transfer write before a shader reads it. */
+    vk_image* const dummy_2d = vk_eng_sampled_image(s_e2.dummy_2d);
+    if (dummy_2d) vk_hz_use(dummy_2d, VK_IMAGE_ASPECT_COLOR_BIT, VK_HZ_SAMPLE);
+    if (P->cube_mask) {
+        vk_image* const dummy_cube = vk_eng_sampled_image(s_e2.dummy_cube);
+        if (dummy_cube) vk_hz_use(dummy_cube, VK_IMAGE_ASPECT_COLOR_BIT, VK_HZ_SAMPLE);
+    }
     for (u32 u = 0; u < RSX_MAX_TEXTURES; u++) {
         if (!((s_e2.tex_mask >> u) & 1u)) continue;
         vk_image* const im = vk_eng_sampled_image(s_e2.tex[u]);
