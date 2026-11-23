@@ -123,7 +123,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ~/apt-archives
-          key: apt-ubuntu-24.04-v3
+          key: apt-ubuntu-24.04-v4
       - name: Install dependencies
         id: apt-install
         # The runners' Ubuntu mirror is at times very slow or hangs: on
@@ -139,7 +139,7 @@ jobs:
           APT="$APT -o Dir::Cache::Archives=$HOME/apt-archives"
           PKGS="ninja-build libsdl2-dev libvulkan-dev clang lld g++-14 glslang-dev glslang-tools spirv-tools
                 libspirv-cross-c-shared-dev gcc-powerpc64-linux-gnu g++-powerpc64-linux-gnu
-                binutils-powerpc64-linux-gnu mesa-vulkan-drivers"
+                binutils-powerpc64-linux-gnu mesa-vulkan-drivers vulkan-validationlayers"
           ok=0
           for attempt in 1 2 3; do
             if sudo timeout 300 apt-get $APT update &&
@@ -156,7 +156,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ~/apt-archives
-          key: apt-ubuntu-24.04-v3
+          key: apt-ubuntu-24.04-v4
       - name: Configure
         # The synthetic synlib variants require the PowerPC64 cross toolchain
         # installed above: a missing one is a configure error here, never a
@@ -188,6 +188,7 @@ jobs:
         # Apple's Metal-backed drivers, so this run is the guard. A skip fails.
         env:
           VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.json
+          VK_DRAW_BATCH_REQUIRE_VALIDATION: "1"
         # `! cmd` never trips bash -e, so the skip check is an explicit if.
         run: |
           ctest --preset t0 -R '^(vk_draw_batch|rsx_replay)$' --output-on-failure | tee vk.log

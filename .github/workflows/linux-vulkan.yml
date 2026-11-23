@@ -6,10 +6,9 @@
 #   - without guest programs, the rsx_state vtable's fixed-function path: the
 #     same scenes the null-backend job checks, now through Vulkan;
 #   - with guest programs, the shared register-file draw engine (the path the
-#     Metal backend takes): all twelve draw scenes, including the ones only a
-#     translating backend can pass (--shader, --mip, --rtt, --depthtex, --mrt,
-#     --mrt-a, --cube), plus --depthbounds, which only this backend's engine
-#     implements, under the Khronos validation layer.
+#     Metal backend takes): the guest-program scenes, including render targets,
+#     feedback, 2D and cube dummy fallbacks, and depth bounds, under the Khronos
+#     validation layer.
 #
 # The second pass fails on any of: a scene's own check, a single validation
 # message, a scene that did not take the engine path, or one that reported
@@ -87,6 +86,7 @@ jobs:
         env:
           PS3RECOMP_VK_GUEST_PROGRAMS: "1"
           VK_INSTANCE_LAYERS: VK_LAYER_KHRONOS_validation
+          VK_VALIDATION_VALIDATE_SYNC: "1"
         run: |
           fail=0
           # --threads is not here: it checks guest thread stacks and returns
@@ -94,15 +94,25 @@ jobs:
           for m in "" "--draw" "--depth" "--quads" "--shader" \
                    "--tex" "--tex-io" "--mip" "--rtt" "--depthtex" "--mrt" "--mrt-a" "--cube" \
                    "--depthbounds" "--split-present" "--feedback" "--clip" "--clip-keep" \
-                   "--float-rt" "--float-rt-r" "--unbound" "--blend-constant" "--poly-offset" \
+                   "--float-rt" "--float-rt-r" "--unbound" "--cube-unbound" "--blend-constant" "--poly-offset" \
                    "--points" "--points-edge" "--points-miss"; do
             rc=0; ./build/ps3recomp_host $m > run.log 2>&1 || rc=$?
             name=${m:-default}
             echo "::group::ps3recomp_host $name -> exit $rc"; cat run.log; echo "::endgroup::"
             [ "$rc" -eq 0 ] || { echo "::error::$name: exit $rc"; fail=1; }
-            if grep -q "VUID" run.log; then echo "::error::$name: Vulkan validation messages"; fail=1; fi
+            if grep -qE "VUID|Validation Error|SYNC-HAZARD" run.log; then
+              echo "::error::$name: Vulkan validation messages"; fail=1
+            fi
             grep -q "register-file draw engine path" run.log || { echo "::error::$name: not on the draw engine"; fail=1; }
             if grep -q "nothing to check" run.log; then echo "::error::$name: skipped, not checked"; fail=1; fi
+            # The host compares the centre pixel only when the readback returned one:
+            # a scene without its verdict line exited 0 having checked nothing.
+            case "$name" in
+              --split-present) ;;   # its own shown/surface verdicts
+              --depthbounds) grep -qE "presented pixel:|skipped, no depth bounds test" run.log ||
+                               { echo "::error::$name: no pixel verdict"; fail=1; } ;;
+              *) grep -q "presented pixel:" run.log || { echo "::error::$name: no pixel verdict"; fail=1; } ;;
+            esac
             # The one scene that needs an optional device feature: lavapipe has no
             # depthBounds in every Mesa release, so its skip is a notice, not a
             # pass and not a failure.

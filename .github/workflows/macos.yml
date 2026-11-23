@@ -320,9 +320,11 @@ jobs:
             exit 1
           fi
           # A fragment program sampling a texture unit that is switched off
-          # reads transparent black, blended over the clear: the clear colour
-          # must come through, the texture behind the unit must not.
+          # reads the dummy's transparent black; with alpha masked the centre
+          # is opaque black, and the texture behind the unit must not show.
+          # --cube-unbound reaches the cube dummy through a rejected cube.
           PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --unbound
+          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --cube-unbound
           # CONSTANT_COLOR blend factor reads SET_BLEND_COLOR: red scaled by it.
           PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --blend-constant
           # Polygon offset pulls an equal-depth triangle over the first.
