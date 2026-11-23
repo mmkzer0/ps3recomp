@@ -657,6 +657,21 @@ static void emit_programs(const u8* vp, u32 vp_bytes, u32 fp_offset)
  * inside one; the last draws of the frame still show on top of it. */
 static unsigned s_repeat_draws = 1, s_scissor_px = 0, s_work_us = 0, s_clear_every = 0;
 
+/* :C's clear after draw i: a colour of its own each time, so a clear that did not run shows as another
+ * background. */
+static u32 mid_clear_argb(unsigned i)
+{
+    return 0xFF000000u | ((CLEAR_ARGB + (u32)(i + 1) * 0x00050301u) & 0x00FFFFFFu);
+}
+
+/* The clear colour the triangle modes leave set: the frame's own, or with :C the last mid-frame clear's. */
+static u32 last_clear_argb(void)
+{
+    for (unsigned i = s_repeat_draws; s_clear_every && i-- > 0;)
+        if ((i + 1) % s_clear_every == 0 && i + 1 < s_repeat_draws) return mid_clear_argb(i);
+    return CLEAR_ARGB;
+}
+
 static void bench_spin_us(unsigned us)
 {
     struct timespec t;
@@ -687,8 +702,7 @@ static void emit_triangle_draw(void)
             bench_spin_us(s_work_us);
         }
         if (s_clear_every && (i + 1) % s_clear_every == 0 && i + 1 < s_repeat_draws) {
-            /* A colour of its own each time, so a clear that did not run shows as another background. */
-            emit(NV4097_SET_COLOR_CLEAR_VALUE,    0xFF000000u | ((CLEAR_ARGB + (u32)(i + 1) * 0x00050301u) & 0x00FFFFFFu));
+            emit(NV4097_SET_COLOR_CLEAR_VALUE,    mid_clear_argb(i));
             emit(NV4097_SET_ZSTENCIL_CLEAR_VALUE, 0xFFFFFF00u);   /* depth 1.0, stencil 0 */
             emit(NV4097_CLEAR_SURFACE,            0xF3u);         /* colour, depth and stencil */
         }
@@ -772,18 +786,28 @@ static void emit_border_draw(void)
 
 /* --unbound: --tex's quad and fragment program with texture unit 0 switched
  * off (TEXTURE_CONTROL0 enable clear), so TEX r0 reads a unit with nothing
- * bound. That reads transparent black (0,0,0,0), as the Metal backend's
- * placeholder does, and blended SRC_ALPHA / ONE_MINUS_SRC_ALPHA over the
- * clear it leaves the clear colour. A coloured "not bound" texture shows
- * through instead, and so does the texture behind the disabled unit's offset
- * if a backend samples it anyway. */
+ * bound. The dummy reads transparent black. COLOR_MASK keeps the clear's
+ * alpha, so the centre is 0xFF000000: written as (0,0,0,0) the pixel would
+ * be 0, which the readback check takes for "no readback" and skips. A draw
+ * that was dropped leaves the clear colour, and a backend that samples the
+ * disabled unit's offset anyway shows the green guest texture behind it. */
 static void emit_unbound_draw(void)
 {
-    emit(NV4097_SET_BLEND_ENABLE,        1u);
-    emit(NV4097_SET_BLEND_FUNC_SFACTOR,  0x0302u | (0x0302u << 16));   /* SRC_ALPHA           */
-    emit(NV4097_SET_BLEND_FUNC_DFACTOR,  0x0303u | (0x0303u << 16));   /* ONE_MINUS_SRC_ALPHA */
-    emit(NV4097_SET_BLEND_EQUATION,      0x8006u | (0x8006u << 16));   /* FUNC_ADD            */
+    emit(NV4097_SET_COLOR_MASK, 0x00010101u);   /* R, G, B; not A */
     emit_textured_draw_unit(TEX_OFFSET, TEX_W, TEX_H, 0x85u | 0x20u, 0, TVTX_OFFSET, 0);
+}
+
+/* --cube-unbound: an enabled cube sampler of 4097x4097. Square, so the engine
+ * marks the unit as a cube and the fragment program samples a texturecube
+ * (a non-square cube is compiled as 2D and would reach the 2D dummy);
+ * above ENG_MAX_TEX_DIM (4096), so eng_texture_slot rejects it before any
+ * span or backend allocation, whatever the device's image limit. The cube
+ * dummy's transparent black then reaches the target, alpha masked as in
+ * --unbound. */
+static void emit_cube_unbound_draw(void)
+{
+    emit(NV4097_SET_COLOR_MASK, 0x00010101u);   /* R, G, B; not A */
+    emit_textured_draw_unit(CUBE_OFFSET, 4097u, 4097u, 0x85u | 0x20u, 1, CVTX_OFFSET, 1);
 }
 
 static void emit_shader_draw(void);   /* below, with --shader */
@@ -1335,6 +1359,7 @@ static void submit_frame(int with_draw)
     else if (with_draw == 22) emit_poly_offset_draw();
     else if (with_draw == 21) emit_blend_constant_draw();
     else if (with_draw == 20) emit_unbound_draw();
+    else if (with_draw == 26) emit_cube_unbound_draw();
     else if (with_draw == 15) emit_border_draw();
     else if (with_draw == 12) emit_depth_bounds_draw();
     else if (with_draw == 11) emit_cube_draw();
@@ -1579,7 +1604,8 @@ static int mode_needs_translator(int mode)
     return mode == 3 || mode == 5 || mode == 6 || mode == 8 || mode == 14 ||
            mode == 9 || mode == 10 || mode == 11 || mode == 15 ||
            mode == 16 || mode == 17 || mode == 18 || mode == 19 || mode == 20 ||
-           mode == 21 || mode == 22 || mode == 23 || mode == 24 || mode == 25;
+           mode == 21 || mode == 22 || mode == 23 || mode == 24 || mode == 25 ||
+           mode == 26;
 }
 
 /* ...and which ones must, on a backend that has a translator, have run the
@@ -1606,6 +1632,7 @@ static const char* mode_flag_name(int mode)
     case 18: return "--float-rt";
     case 19: return "--float-rt-r";
     case 20: return "--unbound";
+    case 26: return "--cube-unbound";
     case 21: return "--blend-constant";
     case 22: return "--poly-offset";
     case 23: return "--points";
@@ -1732,6 +1759,8 @@ int main(int argc, char** argv)
         else if (strcmp(argv[i], "--float-rt-r") == 0) do_draw = 19;
         /* --unbound: see emit_unbound_draw. */
         else if (strcmp(argv[i], "--unbound") == 0) do_draw = 20;
+        /* --cube-unbound: see emit_cube_unbound_draw. */
+        else if (strcmp(argv[i], "--cube-unbound") == 0) do_draw = 26;
         /* --blend-constant / --poly-offset: see emit_blend_constant_draw, emit_poly_offset_draw. */
         else if (strcmp(argv[i], "--blend-constant") == 0) do_draw = 21;
         else if (strcmp(argv[i], "--poly-offset") == 0) do_draw = 22;
@@ -1839,12 +1868,15 @@ int main(int argc, char** argv)
         upload_mrt_backing();
     }
     if (do_draw == 11) { upload_cube_texture(); upload_cube_quad(); }
+    if (do_draw == 26) upload_cube_quad();
     if (mode_runs_guest_programs(do_draw)) upload_fragment_programs();
     submit_frame(do_draw);
 
+    /* Only the triangle modes emit --draws' mid-frame clears. */
+    const u32 want_clear = (do_draw == 1 || do_draw == 13) ? last_clear_argb() : CLEAR_ARGB;
     u32 got = host_backend_color();
     printf("[host] clear colour through the FIFO: 0x%08X (expected 0x%08X) %s\n",
-           got, CLEAR_ARGB, got == CLEAR_ARGB ? "OK" : "MISMATCH");
+           got, want_clear, got == want_clear ? "OK" : "MISMATCH");
 
     if (do_draw == 13) {
 #if defined(PS3RECOMP_RSX_VULKAN)
@@ -1859,7 +1891,7 @@ int main(int argc, char** argv)
         rsx_vulkan_backend_present_finish();
         const u32 shown = rsx_vulkan_backend_presented_center();
         const u32 now = host_backend_center();
-        int rc = (got == CLEAR_ARGB) ? 0 : 2;
+        int rc = (got == want_clear) ? 0 : 2;
         printf("[host] --split-present: shown 0x%08X (expected 0xFFFF0000) %s\n", shown,
                (shown & 0x00FFFFFFu) == 0x00FF0000u ? "OK" : "MISMATCH");
         if ((shown & 0x00FFFFFFu) != 0x00FF0000u) rc = 3;
@@ -1909,7 +1941,7 @@ int main(int argc, char** argv)
     printf("[host] presented %d frame(s)\n", presented);
 
     u32 back = host_backend_center();
-    int rc = (got == CLEAR_ARGB) ? 0 : 2;
+    int rc = (got == want_clear) ? 0 : 2;
     if (back) {
         /* Headless: the drawable is ours, so verify what actually landed.
          * RSX ARGB -> Metal BGRA8Unorm keeps R, G and B in the same bytes. */
@@ -1941,8 +1973,10 @@ int main(int argc, char** argv)
          * the way up or the image was sampled as 2D. With --float-rt it is
          * red once more, out of an RGBA32F surface; --float-rt-r's R32F
          * surface has only a red channel, so only red is compared there.
-         * With --unbound it is the clear colour: the quad read a unit with
-         * nothing bound as transparent black and blended nothing over it.
+         * With --unbound it is opaque black: the dummy's transparent black
+         * overwrote the clear, and the uploaded green guest texture was not read.
+         * --cube-unbound must also be opaque black: its oversized enabled cube
+         * handle was rejected and the fragment program sampled the dummy.
          */
         u32 want = (do_draw == 15) ? BORDER_ARGB   /* the border, not the texture */
                  : (do_draw == 12) ? 0xFF0000FFu   /* blue, inside its bounds */
@@ -1953,7 +1987,7 @@ int main(int argc, char** argv)
                  : (do_draw == 7) ? 0xFFFF0000u   /* the quad strip over the polygon */
                  : (do_draw == 17) ? 0xFFFF0000u  /* plane 1 keeps d >= 0        */
                  : (do_draw == 16) ? CLEAR_ARGB   /* plane 1 clipped it all      */
-                 : (do_draw == 20) ? CLEAR_ARGB   /* unbound reads (0,0,0,0)     */
+                 : (do_draw == 20 || do_draw == 26) ? 0xFF000000u /* unbound dummy writes black */
                  : (do_draw == 21) ? 0xFF800000u  /* red * the blend constant    */
                  : (do_draw == 22) ? 0xFF00FF00u  /* the offset pulled green over red */
                  : (do_draw == 23 || do_draw == 24) ? 0xFFFF0000u   /* the point covers the centre */
@@ -1965,7 +1999,10 @@ int main(int argc, char** argv)
                  : (do_draw == 4) ? 0xFFFF0000u   /* near red beats far green    */
                  : (do_draw == 3) ? 0xFFFF0000u   /* blue vertices, FP swaps r/b */
                  : (do_draw == 2) ? TEX_ARGB
-                 : (do_draw == 1) ? 0xFFFF0000u
+                 /* --draws=N:S scissors to an S x S corner, which holds the centre (640, 360) only
+                  * with S > 640. The scissor also limits every later clear, :C's included, so
+                  * below that the centre keeps the first frame's clear. */
+                 : (do_draw == 1) ? ((s_scissor_px && s_scissor_px <= 640u) ? CLEAR_ARGB : 0xFFFF0000u)
                                   : CLEAR_ARGB;
         const u32 cmp = (do_draw == 19) ? 0x00FF0000u : 0x00FFFFFFu;
         printf("[host] presented pixel: 0x%08X (expected 0x%08X%s) %s\n",
