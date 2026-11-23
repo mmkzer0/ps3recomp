@@ -16,11 +16,13 @@ of its own (the backend reads the registry once) and looks only at what the back
                                      neither keeps writing one file;
   batching on against off            the presented frames are byte-identical (what the dump is for);
   batches in flight                  with a submission cap of 1 or 2 operations every batch is queued without
-                                     a wait and every slot is in flight at once, yet render-to-texture, feedback,
-                                     depth-as-texture, MRT, cube and texture scenes, and many full-frame draws
-                                     over several frames, present the frames batching off does: a present,
-                                     a one-shot or a slot's reuse never reads or overwrites what an earlier,
-                                     unwaited batch has still to write.
+                                     render-to-texture, feedback, depth-as-texture,
+                                     MRT, cube, texture and 2D/cube dummy-fallback
+                                     scenes, and many full-frame draws over
+                                     several frames, present the frames batching
+                                     off does: a present, a one-shot or a slot's
+                                     reuse never reads or overwrites what an
+                                     earlier, unwaited batch has still to write.
   vk.draw_batch_min                  the adaptive kick says so in its line, is lowered to the maximum when above
                                      it, is silent at its default 0 (the fixed cap), and with a minimum of 1 or
                                      16 and a small maximum the same scenes, and 200 scissored draws, present
@@ -30,7 +32,9 @@ of its own (the backend reads the registry once) and looks only at what the back
                                      vulkan-validationlayers), the scenes under synchronization validation at
                                      several submission sizes report no validation or hazard error: every
                                      barrier the batch no longer records per draw was not needed; a skip says
-                                     when the layer is missing.
+                                     when the layer is missing, and VK_DRAW_BATCH_REQUIRE_VALIDATION=1 makes
+                                     it a failure (not PS3RECOMP_*: that prefix is reserved for configuration,
+                                     and the other tests in the same ctest run would stop on it).
   vk.coalesce_passes                 off by default, said when on, ignored without batching, a malformed value is
                                      the config-invalid stop; 100 draws into one framebuffer take a few passes,
                                      a clear between draws of one framebuffer is recorded inside the pass (the
@@ -38,8 +42,9 @@ of its own (the backend reads the registry once) and looks only at what the back
                                      1, 2, 64 and 512, presents the frames batching off does, and reports no
                                      synchronization error where the validation layer is installed.
 
-The scene's own verdict (its exit code) is not looked at: it checks the draw path's pixels, not these.
-Exit 77: no usable Vulkan device or the draw engine path is not built (needs glslang), nothing to run."""
+Every ordinary scene must exit successfully before its logs or pixels count as evidence; deliberately invalid
+configuration cases assert their nonzero exit as part of the stop contract. Exit 77: no usable Vulkan device or
+the draw engine path is not built (needs glslang), nothing to run."""
 import os
 import re
 import subprocess
@@ -57,15 +62,22 @@ def check(cond, what):
         FAILED += 1
 
 
-def run(host, workdir, *scene, **env):
-    """One host scene run (`--draw` unless `scene` says otherwise); returns (exit code, combined output)."""
+def run(host, workdir, *scene, expected_rc=0, **env):
+    """One host scene run; returns (exit code, combined output)."""
     e = {k: v for k, v in os.environ.items()
          if not k.startswith("PS3RECOMP_") and k not in ("VK_DRAW_BATCH", "VK_DRAW_BATCH_MAX")}
     e["PS3RECOMP_VK_GUEST_PROGRAMS"] = "1"
     e.update(env)
-    p = subprocess.run([host, *(scene or ("--draw",))], check=False, cwd=workdir, env=e, capture_output=True,
-                       text=True, timeout=120)
-    return p.returncode, p.stdout + p.stderr
+    args = [host, *(scene or ("--draw",))]
+    p = subprocess.run(args, check=False, cwd=workdir, env=e, capture_output=True, text=True, timeout=120)
+    out = p.stdout + p.stderr
+    if expected_rc is not None and p.returncode != expected_rc:
+        check(False, f"{' '.join(args[1:])}: expected exit {expected_rc}, got {p.returncode}: {out[-500:]}")
+    if expected_rc == 0:
+        # The host compares the presented centre only when the readback returned a non-zero pixel; a run
+        # without its verdict line exited 0 without checking anything.
+        check("[host] presented pixel:" in out, f"{' '.join(args[1:])}: the host checked the presented pixel")
+    return p.returncode, out
 
 
 def dumps(directory):
@@ -91,7 +103,7 @@ def main():
 
         # Is there anything to test? A host with no Vulkan device, or built without the translator, never
         # reaches the engine path; that is a skip, not a pass.
-        rc, out = run(host, fresh("probe"))
+        rc, out = run(host, fresh("probe"), expected_rc=None)
         if "[host] backend: Vulkan" not in out or "register-file draw engine path" not in out:
             print("SKIP: no Vulkan device or no draw engine path here:\n" + out[-600:])
             return 77
@@ -114,14 +126,16 @@ def main():
         rc, out = run(host, fresh("old"), VK_DRAW_BATCH="1", VK_DRAW_BATCH_MAX="7")
         check("draw batching" not in out, "the old unregistered VK_DRAW_BATCH is not read")
 
-        rc, out = run(host, fresh("big"), PS3RECOMP_VK_DRAW_BATCH="1", PS3RECOMP_VK_DRAW_BATCH_MAX="1025")
+        rc, out = run(host, fresh("big"), expected_rc=None,
+                      PS3RECOMP_VK_DRAW_BATCH="1", PS3RECOMP_VK_DRAW_BATCH_MAX="1025")
         check(rc != 0 and "kind=config-invalid" in out and "key=vk.draw_batch_max" in out and "draw batching" not in out,
               "a maximum above the descriptor pool is a config-invalid stop, not a silent cap")
 
         # ---- the dump --------------------------------------------------------------------------------
         d = fresh("range")
         rc, out = run(host, d, PS3RECOMP_VK_DUMP=str(d / "f"), PS3RECOMP_VK_DUMP_RANGE="0-9")
-        check(dumps(d) == ["f_s00000_fnone.ppm", "f_s00001_fnone.ppm"], f"RANGE 0-9 writes the scene's two presents: {dumps(d)}")
+        check(dumps(d) == ["f_s00000_fnone.ppm", "f_s00001_fnone.ppm", "f_s00002_fnone.ppm"],
+              f"RANGE 0-9 writes the scene's three presents (the host's default --frames=3): {dumps(d)}")
 
         d = fresh("range1")
         rc, out = run(host, d, PS3RECOMP_VK_DUMP=str(d / "f"), PS3RECOMP_VK_DUMP_RANGE="1:1")
@@ -148,13 +162,14 @@ def main():
                                 ("PS3RECOMP_VK_DUMP_RANGE", "9-1", "PS3RECOMP_VK_DUMP_RANGE"),
                                 ("PS3RECOMP_VK_DUMP_RANGE", "5", "PS3RECOMP_VK_DUMP_RANGE")):
             d = fresh("bad")
-            rc, out = run(host, d, PS3RECOMP_VK_DUMP=str(d / "f"), **{env: value})
+            rc, out = run(host, d, expected_rc=None, PS3RECOMP_VK_DUMP=str(d / "f"), **{env: value})
             check(rc != 0 and "kind=config-invalid" in out and f"env={key}" in out and dumps(d) == [],
                   f"{env}={value[:24]!r} is a config-invalid stop naming it, and nothing is written (rc {rc})")
         d = fresh("long")
-        rc, out = run(host, d, PS3RECOMP_VK_DUMP=str(d / "f"),
+        rc, out = run(host, d, expected_rc=None, PS3RECOMP_VK_DUMP=str(d / "f"),
                       PS3RECOMP_VK_DUMP_LIST=",".join(str(i) for i in range(33)))
-        check("count=33" in out and "max=32" in out, "an over-long list names its count and the limit")
+        check(rc != 0 and "count=33" in out and "max=32" in out,
+              "an over-long list stops with its count and the limit")
 
         d = fresh("selectoff")
         rc, out = run(host, d, PS3RECOMP_VK_DUMP_LIST="abc")
@@ -164,7 +179,7 @@ def main():
         a, b = fresh("frames-off"), fresh("frames-on")
         run(host, a, PS3RECOMP_VK_DUMP=str(a / "f"), PS3RECOMP_VK_DUMP_RANGE="0-9")
         run(host, b, PS3RECOMP_VK_DUMP=str(b / "f"), PS3RECOMP_VK_DUMP_RANGE="0-9", PS3RECOMP_VK_DRAW_BATCH="1")
-        check(dumps(a) == dumps(b) and len(dumps(a)) == 2, f"the same presents were written: {dumps(a)} / {dumps(b)}")
+        check(dumps(a) == dumps(b) and len(dumps(a)) == 3, f"the same presents were written: {dumps(a)} / {dumps(b)}")
         for name in dumps(a):
             same = (a / name).read_bytes() == (b / name).read_bytes()
             check(same and (a / name).stat().st_size > 1000, f"{name}: batching on is byte-identical to off")
@@ -173,7 +188,7 @@ def main():
         rc, out = run(host, fresh("slots"), PS3RECOMP_VK_DRAW_BATCH="1")
         check("submissions in flight" in out, "batching says how many submissions it keeps in flight")
         scenes = (("--rtt",), ("--feedback",), ("--depthtex",), ("--mrt",), ("--cube",), ("--tex",),
-                  ("--draws=24", "--frames=4"))
+                  ("--unbound",), ("--cube-unbound",), ("--draws=24", "--frames=4"))
         for scene in scenes:
             name = " ".join(scene)
             off = fresh("flight-off")
@@ -219,7 +234,8 @@ def main():
                       PS3RECOMP_VK_DRAW_BATCH_MIN="9")
         check("vk.draw_batch_min 9 is above vk.draw_batch_max 4, using 4" in out and "from 4 draws" in out,
               "a minimum above the maximum is lowered to it, said")
-        rc, out = run(host, fresh("min-big"), PS3RECOMP_VK_DRAW_BATCH="1", PS3RECOMP_VK_DRAW_BATCH_MIN="1025")
+        rc, out = run(host, fresh("min-big"), expected_rc=None,
+                      PS3RECOMP_VK_DRAW_BATCH="1", PS3RECOMP_VK_DRAW_BATCH_MIN="1025")
         check(rc != 0 and "kind=config-invalid" in out and "key=vk.draw_batch_min" in out,
               "a minimum above the descriptor pool is a config-invalid stop")
         rc, out = run(host, fresh("min-kick"), "--draws=200:16", "--frames=4", PS3RECOMP_VK_DRAW_BATCH="1",
@@ -244,12 +260,14 @@ def main():
         # ---- the Khronos validation layer with synchronization validation, where it is installed ------------
         # The ordering inside a batch (one barrier per hazard, not one per draw) is only provable there: the
         # frames cannot tell a missing barrier from a lucky schedule on a software rasteriser.
-        sync = dict(VK_INSTANCE_LAYERS="VK_LAYER_KHRONOS_validation", VK_LAYER_VALIDATE_SYNC="1",
-                    VK_VALIDATION_VALIDATE_SYNC="1")
+        sync = dict(VK_INSTANCE_LAYERS="VK_LAYER_KHRONOS_validation", VK_VALIDATION_VALIDATE_SYNC="1")
         rc, out = run(host, fresh("layer-probe"), PS3RECOMP_VK_DRAW_BATCH="1", VK_LOADER_DEBUG="layer", **sync)
         if 'Insert instance layer "VK_LAYER_KHRONOS_validation"' not in out:
-            print("[SKIP] the Khronos validation layer is not installed (VK_LAYER_PATH, the SDK or "
-                  "vulkan-validationlayers): the batch's barriers are not checked here")
+            msg = ("the Khronos validation layer is not installed (VK_LAYER_PATH, the SDK or "
+                   "vulkan-validationlayers): the batch's barriers are not checked here")
+            print("[SKIP] " + msg)
+            if os.environ.get("VK_DRAW_BATCH_REQUIRE_VALIDATION") == "1":
+                check(False, msg)
         else:
             for scene in scenes + (("--draws=200:16", "--frames=4"), ("--draws=40:0:0:5", "--frames=3")):
                 name = " ".join(scene)
@@ -270,7 +288,8 @@ def main():
         rc, out = run(host, fresh("coal-nobatch"), PS3RECOMP_VK_COALESCE_PASSES="1")
         check("render pass stays open" not in out and "render passes:" not in out,
               "without vk.draw_batch it is ignored")
-        rc, out = run(host, fresh("coal-bad"), PS3RECOMP_VK_DRAW_BATCH="1", PS3RECOMP_VK_COALESCE_PASSES="maybe")
+        rc, out = run(host, fresh("coal-bad"), expected_rc=None,
+                      PS3RECOMP_VK_DRAW_BATCH="1", PS3RECOMP_VK_COALESCE_PASSES="maybe")
         check(rc != 0 and "kind=config-invalid" in out and "env=PS3RECOMP_VK_COALESCE_PASSES" in out,
               "a malformed PS3RECOMP_VK_COALESCE_PASSES is a config-invalid stop")
         rc, out = run(host, fresh("coal-count"), "--draws=100:0", "--frames=4", PS3RECOMP_VK_DRAW_BATCH="1",
