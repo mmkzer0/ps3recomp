@@ -380,22 +380,62 @@ static int pad_key_down(int key) { return (GetAsyncKeyState(key) & 0x8000) != 0;
 #define PADKEY_RETURN VK_RETURN
 #define PADKEY_TAB VK_TAB
 #elif defined(__APPLE__) && !defined(PS3RECOMP_PAD_KEYBOARD_SDL)
+#include <stdatomic.h>   /* only this branch needs it; keeps Windows/MSVC builds off C11 atomics */
 /* macOS: virtual key codes (Carbon HIToolbox/Events.h kVK_*), polled with CGEventSourceKeyState,
  * which needs no event tap and no window. "Focused" is NSApplication.isActive of this process,
  * queried through the Objective-C runtime so this file stays plain C. */
 /* The system headers are not included on purpose: ApplicationServices / objc.h clash with this
- * project's own `bool` and GetCurrentThread/GetCurrentProcess names, so the three entry points
- * are declared by hand (CGKeyCode is uint16_t, kCGEventSourceStateCombinedSessionState is 0). */
+ * project's own `bool` and GetCurrentThread/GetCurrentProcess names, so the entry points are
+ * declared by hand (CGKeyCode is uint16_t, kCGEventSourceStateCombinedSessionState is 0), and
+ * dispatch is declared by hand for the same reason. */
 extern unsigned char CGEventSourceKeyState(int stateID, unsigned short key);
 extern void* objc_getClass(const char* name);
 extern void* sel_registerName(const char* name);
 extern void objc_msgSend(void);
+/* The dispatch main queue without <dispatch/dispatch.h>: dispatch_get_main_queue
+ * is only a header inline returning &_dispatch_main_q, and dispatch_async_f is
+ * exported by libSystem, so this needs no explicit link against libdispatch
+ * (the SDK's tbds do not even export the function form of
+ * dispatch_get_main_queue, so a C link of it would need the private
+ * /usr/lib/system path). */
+extern struct dispatch_queue_s _dispatch_main_q;
+extern void dispatch_async_f(void* queue, void* context, void (*work)(void*));
+
+/* AppKit is main-thread-only (Xcode's Main Thread Checker flags every AppKit
+ * message off the main thread, and sharedApplication would even create NSApp
+ * there), but this poller runs on the guest thread. The focused state is
+ * cached: the poller reads s_host_focused and hands one refresh per poll to
+ * the main queue, where isActive is legal. The cache starts out unfocused, as
+ * the old query answered for a headless or not-yet-active process: until the
+ * main thread has answered, host keys must not reach the guest (a key the user
+ * holds in another app would leak into a replay). The template host turns its
+ * run loop while the guest runs, so the first refresh lands within one loop
+ * iteration. With no app the refresh stores 0, and NSApplication is only ever
+ * created on the main thread. */
+static _Atomic int s_host_focused = 0;
+static atomic_flag s_focus_refresh_queued = ATOMIC_FLAG_INIT;
+
+static void pad_focus_refresh_main(void* unused)
+{
+    (void)unused;
+    int focused = 0;
+    void* cls = objc_getClass("NSApplication");
+    if (cls) {
+        void* app = ((void* (*)(void*, void*))objc_msgSend)(cls, sel_registerName("sharedApplication"));
+        focused = app && ((signed char (*)(void*, void*))objc_msgSend)(app, sel_registerName("isActive"));
+    }
+    atomic_store_explicit(&s_host_focused, focused, memory_order_release);
+    atomic_flag_clear_explicit(&s_focus_refresh_queued, memory_order_release);
+}
+
 static int pad_host_window_focused(void)
 {
-    void* cls = objc_getClass("NSApplication");
-    if (!cls) return 0;
-    void* app = ((void* (*)(void*, void*))objc_msgSend)(cls, sel_registerName("sharedApplication"));
-    return app && ((signed char (*)(void*, void*))objc_msgSend)(app, sel_registerName("isActive"));
+    /* Single flight, re-armed by the refresh itself: each poll gets one
+     * refresh after the previous one landed, so the value the poller reads
+     * trails the real focus by at most one poll interval. */
+    if (!atomic_flag_test_and_set_explicit(&s_focus_refresh_queued, memory_order_acquire))
+        dispatch_async_f((void*)&_dispatch_main_q, NULL, pad_focus_refresh_main);
+    return atomic_load_explicit(&s_host_focused, memory_order_acquire);
 }
 static int pad_key_down(int key)
 {
