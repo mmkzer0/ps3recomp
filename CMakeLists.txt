@@ -2737,7 +2737,7 @@ if(UNIX)
     # includes the engine and the backend and drives them with synthetic
     # method words (#62, #64). Skips (77) without a Metal device.
     if(APPLE AND PS3RECOMP_MSL_TRANSLATION)
-        foreach(gpu_test back_stencil window invalidate_l2 init_gate vs_reuse)
+        foreach(gpu_test back_stencil window invalidate_l2 init_gate vs_reuse legacy_zeta)
             add_executable(test_metal_${gpu_test}
                 libs/video/tests/test_metal_${gpu_test}.m
                 libs/video/rsx_shader_msl.cpp

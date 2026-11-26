@@ -2542,11 +2542,17 @@ typedef struct {
     u32 nrt;                      /* bound colour attachments */
 } MtlPassState;
 
-/* Do two records belong in the same pass? Only the colour targets decide it:
- * everything else about a record is encoder or pipeline state. */
+/* Do two records belong in the same pass? The colour targets decide it, and so
+ * does the zeta buffer of an offscreen surface: begin_pass latches the depth
+ * attachment from the record that opens the pass, so a later record with the
+ * same colour targets but another zeta_off would otherwise depth-test and
+ * write the opener's surface. The display's depth is the one shared texture
+ * whatever zeta_off says, so it does not split a display pass. Everything else
+ * about a record is encoder or pipeline state. */
 static int target_same(const MtlTarget* a, const MtlTarget* b)
 {
-    return a->off == b->off && memcmp(a->mrt, b->mrt, sizeof a->mrt) == 0;
+    return a->off == b->off && memcmp(a->mrt, b->mrt, sizeof a->mrt) == 0 &&
+           (a->off == 0 || a->zeta_off == b->zeta_off);
 }
 
 /* What a unit binds, as one identity covering both sources: a surface view, an
